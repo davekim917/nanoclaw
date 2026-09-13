@@ -6,9 +6,24 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$SCRIPT_DIR/smoke-develop-gate.sh"
+REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+LEGACY_GATE_BASE=672f03a309a4f11f1ad194900d83a710c55765d6
 STATE_DIR="$(mktemp -d)"
-trap 'rm -rf "$STATE_DIR"' EXIT
+TEST_SHARED_ROOT="$(mktemp -d)"
+STUB_BIN="$(mktemp -d)"
+trap 'rm -rf "$STATE_DIR" "$TEST_SHARED_ROOT" "$STUB_BIN"' EXIT
 export SMOKE_GATE_STATE_DIR="$STATE_DIR"
+export SMOKE_GATE_SHARED_ROOT="$TEST_SHARED_ROOT"
+export SMOKE_GATE_LEASE_DIR="$TEST_SHARED_ROOT/qa-coordinator/leases"
+cat > "$STUB_BIN/mountpoint" <<'STUB'
+#!/usr/bin/env bash
+[ "${1:-}" = "-q" ] && [ "${2:-}" = "${SMOKE_GATE_SHARED_ROOT:-}" ]
+STUB
+chmod +x "$STUB_BIN/mountpoint"
+LEGACY_GATE="$STUB_BIN/legacy-smoke-pr-gate.sh"
+git -C "$REPO_ROOT" show "$LEGACY_GATE_BASE:container/skills/smoke-test/scripts/smoke-pr-gate.sh" >"$LEGACY_GATE"
+chmod +x "$LEGACY_GATE"
+export PATH="$STUB_BIN:$PATH"
 unset SMOKE_GATE_REPO SMOKE_GATE_BACKEND_SERVICE SMOKE_GATE_FRONTEND_SERVICE SMOKE_GATE_DEV_URL 2>/dev/null || true
 
 # 1. Missing config wakes once with the missing list...
@@ -54,8 +69,6 @@ bash "$GATE" progress run-x | jq -e '.ok == false and .activeRunId == null' >/de
 # --- Poll path against stubbed gh/curl -------------------------------------
 STATE_FILE="$STATE_DIR/develop-state.json"
 BUILD_SHA="$(printf 'b%.0s' $(seq 40))"
-STUB_BIN="$(mktemp -d)"
-trap 'rm -rf "$STATE_DIR" "$STUB_BIN"' EXIT
 cat > "$STUB_BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 # Advisory freeze notice: record every status POST so a test can assert which
@@ -1658,14 +1671,38 @@ fi
 # A run id not held by any task slot is unaffected by an unrelated one.
 bash "$GATE" claim run-c "$TASK_SLOT_SHA" | jq -e '.ok == true and .runId == "run-c"' >/dev/null
 
+# A finished task has no activeRunId, but its terminal run id still owns the
+# shared verdict key and cannot be reused by the develop gate.
+fresh_state
+printf '{"schemaVersion":1,"activeRunId":null,"activeSha":null,"completedRunId":"run-finished","completedSha":"%s"}\n' \
+  "$TASK_SLOT_SHA" > "$STATE_DIR2/task-run-finished-state.json"
+FINISHED_TASK_OUT="$(bash "$GATE" claim run-finished "$TASK_SLOT_SHA")"
+jq -e '.ok == false and .taskBinding == "completed" and (.error | test("finished"))' \
+  <<<"$FINISHED_TASK_OUT" >/dev/null || {
+  echo "60: claim took a finished task run id: $FINISHED_TASK_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR2/develop-state.json" ] ||
+  { echo "60: a refused finished-task claim wrote develop state" >&2; exit 1; }
+
+# task-release retains activeSha as its durable task binding. It is not an
+# active slot, but this gate still may not take the run id on any SHA.
+fresh_state
+printf '{"schemaVersion":1,"activeRunId":null,"activeSha":"%s","completedRunId":null,"completedSha":null}\n' \
+  "$TASK_SLOT_SHA" > "$STATE_DIR2/task-run-released-state.json"
+RELEASED_TASK_OUT="$(bash "$GATE" claim run-released "$TASK_SLOT_SHA")"
+jq -e '.ok == false and .taskBinding == "released" and (.error | test("released"))' \
+  <<<"$RELEASED_TASK_OUT" >/dev/null || {
+  echo "60: claim took a released task run id: $RELEASED_TASK_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR2/develop-state.json" ] ||
+  { echo "60: a refused released-task claim wrote develop state" >&2; exit 1; }
+
 # --- 60b. Shadow-review finding 1: the refusal above must not fail OPEN on
 # this run's own unreadable task-scoped state. `jq … 2>/dev/null` used to read
 # a malformed, chmod-000, or torn file the same as "no match", letting the
 # claim through onto a run id a task-scoped certification run might still
-# hold. An EMPTY file (never a real task-claim state) and a null `activeRunId`
-# (a released/finished task slot) are not evidence of anything and must NOT be
-# refused — only #748's own reciprocal check on the PR-gate side draws that
-# same line via its `-s` gate.
+# hold. An EMPTY file (never a real task-claim state) and a bare null
+# `activeRunId` with no retained SHA or completed run are not evidence of
+# anything and must NOT be refused. A released state retains activeSha and a
+# finished state retains completedRunId, both explicitly tested above.
 fresh_state
 BAD_SHA="$(printf '8%.0s' $(seq 40))"
 printf 'not json' > "$STATE_DIR2/task-run-malformed-state.json"
@@ -1721,5 +1758,52 @@ jq -e '.ok == false and .retryable == true and (.error | startswith("gate_lock_b
 bash "$GATE" claim run-lockheld "$LOCK_SHA" | jq -e '.ok == true and .runId == "run-lockheld"' >/dev/null ||
   { echo "60c: claim did not succeed once the control lock was free" >&2; exit 1; }
 
-echo "smoke develop gate tests passed"
+# --- 60d. Automatic develop poll is a claim producer too. Its generated run
+# id must consult the same shared task binding under the shared task lock before
+# develop-state.json can name it.
+fresh_state
+AUTO_DEV_SHA="$(printf '6%.0s' $(seq 40))"
+AUTO_DEV_LEGACY_SHA="$(printf '7%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$AUTO_DEV_SHA" SMOKE_GATE_RUN_PREFIX=bounddev
+export SMOKE_GATE_DEBOUNCE_SECONDS=10
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "debouncing_candidate"' >/dev/null
+export SMOKE_GATE_DEBOUNCE_SECONDS=0
+mkdir -p "$SMOKE_GATE_LEASE_DIR"
+AUTO_DEV_LEGACY_STATE="$STATE_DIR2/legacy-private"
+mkdir -p "$AUTO_DEV_LEGACY_STATE"
+AUTO_DEV_EPOCH="$(/usr/bin/date -u +%s)"
+AUTO_DEV_ISO="$(/usr/bin/date -u -d "@$AUTO_DEV_EPOCH" +%Y-%m-%dT%H:%M:%SZ)"
+AUTO_DEV_STAMP="$(/usr/bin/date -u -d "@$AUTO_DEV_EPOCH" +%Y%m%dT%H%M%SZ)"
+AUTO_DEV_RUN="bounddev-${AUTO_DEV_SHA:0:12}-$AUTO_DEV_STAMP"
+AUTO_DEV_DATE_BIN="$STUB_BIN/fixed-date-develop"
+mkdir -p "$AUTO_DEV_DATE_BIN"
+cat >"$AUTO_DEV_DATE_BIN/date" <<STUB
+#!/usr/bin/env bash
+if [ "\$*" = '-u +%s' ]; then printf '%s\n' '$AUTO_DEV_EPOCH'
+elif [ "\$*" = '-u +%Y-%m-%dT%H:%M:%SZ' ]; then printf '%s\n' '$AUTO_DEV_ISO'
+else exec /usr/bin/date "\$@"
+fi
+STUB
+chmod +x "$AUTO_DEV_DATE_BIN/date"
+TEST_PATH="$PATH"
+export PATH="$AUTO_DEV_DATE_BIN:$PATH"
+SMOKE_GATE_STATE_DIR="$AUTO_DEV_LEGACY_STATE" bash "$LEGACY_GATE" task-claim "$AUTO_DEV_RUN" "$AUTO_DEV_LEGACY_SHA" owner-legacy >/dev/null
+AUTO_DEV_OUT="$(bash "$GATE" poll)"
+export PATH="$TEST_PATH"
+jq -e '.ok == false and .wakeAgent == true and .data.trigger == "shared_task_binding_unavailable" and
+       (.data.detail.error | test("task-scoped"))' <<<"$AUTO_DEV_OUT" >/dev/null || {
+  echo "60d: automatic develop poll ignored shared task binding: $AUTO_DEV_OUT" >&2; exit 1; }
+jq -e '.activeRunId == null' "$STATE_DIR2/develop-state.json" >/dev/null
+jq -e --arg sha "$AUTO_DEV_LEGACY_SHA" '.deploySha == $sha and .terminal == null' \
+  "$SMOKE_GATE_LEASE_DIR/task-binding-$AUTO_DEV_RUN.json" >/dev/null
+unset SMOKE_GATE_RUN_PREFIX
 
+# The shared binding path must never be constructed from a traversal-shaped
+# manual run id; this gate historically accepted arbitrary ids before it had
+# any shared path keyed by them.
+UNSAFE_DEV_OUT="$(bash "$GATE" claim ../escaped "$AUTO_DEV_SHA")"
+jq -e '.ok == false and (.error | test("unsafe"))' <<<"$UNSAFE_DEV_OUT" >/dev/null || {
+  echo "60d: traversal-shaped develop run id reached shared storage: $UNSAFE_DEV_OUT" >&2; exit 1; }
+[ ! -e "$TEST_SHARED_ROOT/qa-coordinator/task-lease-escaped.lock" ]
+
+echo "smoke develop gate tests passed"

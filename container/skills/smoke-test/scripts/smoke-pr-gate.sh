@@ -219,6 +219,14 @@ LEASE_DIR_PREPARED=false
 LEASE_DIR_ERROR=""
 LIFECYCLE_FENCE_HELD=false
 FENCED_AUTHORITY_JSON=""
+TASK_BINDING_LOCK_HELD=false
+TASK_PRIOR_BINDING_JSON=null
+TASK_ACQUIRED_BINDING_JSON=null
+TASK_BINDING_CREATED=false
+FENCED_TASK_BINDING_JSON=null
+TASK_FINISH_COMPLETED_AT=""
+TASK_FINISH_VERDICT_DIGEST=""
+TASK_PR_RUN_LOCK_HELD=false
 
 new_owner_token() {
   local nonce token
@@ -608,27 +616,292 @@ rollback_poll_ownership() { # <pr> <runId> <owner> <prior-lease> <prior-authorit
 # script exists to enforce.
 #
 # Unlike a PR number, a task run id is never reused across builds — each
-# certification mints its own — so there is no PR-authority-style aliasing
-# risk to guard against and no separate binding file is needed: the run id
-# itself is already the unique key. What IS still needed, exactly as for a PR
-# campaign, is a lease that is visible to every CONTAINER (not just every
-# process on one), because the per-run flock below serializes invocations, not
-# containers. `deploySha` binds PERMANENTLY at claim and can never change,
-# even under --takeover: a different build gets a different run id, which
-# keeps this simpler than the PR case (there, the SAME PR legitimately
-# advances across many SHAs over a campaign; a task-scoped run certifies
-# exactly one immutable build).
+# certification mints its own. The retained binding and expiring lease both
+# live in the shared ownership namespace because private gate state differs by
+# container. `deploySha` binds permanently at claim and can never change, even
+# under --takeover: a different build gets a different run id. Release removes
+# only the lease; finish adds exact terminal facts to the retained binding.
+# The private task state remains a lifecycle slot and a compatibility source
+# for schema-v1 records, but it is not the cross-container identity authority.
 task_state_file()      { printf '%s/task-%s-state.json' "$STATE_DIR" "$1"; }
 task_lease_file()      { printf '%s/task-lease-%s.json' "$LEASE_DIR" "$1"; }
 task_lease_lock_file() { printf '%s/task-lease-%s.lock' "$LEASE_DIR" "$1"; }
+task_binding_file()    { printf '%s/task-binding-%s.json' "$LEASE_DIR" "$1"; }
+
+read_task_binding() { # <runId>: null | binding | {malformedTaskBinding:true,path}
+  local run="$1" f binding completed stamp
+  f="$(task_binding_file "$run")"
+  if [ ! -e "$f" ]; then
+    printf 'null'
+    return
+  fi
+  if ! binding="$(jq -ce --arg run "$run" '
+    def iso: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
+    def terminal_ok:
+      . == null or
+      (type == "object" and
+       (.verdict == "GO" or .verdict == "NO_GO" or .verdict == "HUMAN_DECISION" or .verdict == "BLOCKED") and
+       (.completedAt | iso) and
+       (.verdictDigest | type == "string" and test("^[0-9a-f]{64}$")));
+    select(type == "object" and .schemaVersion == 1 and .kind == "task-binding" and
+           .runId == $run and
+           (.deploySha | type == "string" and test("^[0-9a-f]{40}$")) and
+           (.boundAt | iso) and
+           (.terminal | terminal_ok))
+  ' "$f" 2>/dev/null)"; then
+    jq -cn --arg path "$f" '{malformedTaskBinding:true,path:$path}'
+    return
+  fi
+  for completed in boundAt terminal.completedAt; do
+    [ "$completed" = boundAt ] && stamp="$(jq -r '.boundAt' <<<"$binding")" ||
+      stamp="$(jq -r '.terminal.completedAt // empty' <<<"$binding")"
+    [ -z "$stamp" ] || [ "$(date -u -d "$stamp" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)" = "$stamp" ] || {
+      jq -cn --arg path "$f" '{malformedTaskBinding:true,path:$path}'
+      return
+    }
+  done
+  printf '%s' "$binding"
+}
+
+write_task_binding() { # <runId> <json>
+  local tmp
+  tmp="$(mktemp "$LEASE_DIR/.task-binding-$1.XXXXXX" 2>/dev/null)" || return 1
+  printf '%s\n' "$2" >"$tmp" 2>/dev/null &&
+    mv "$tmp" "$(task_binding_file "$1")" 2>/dev/null && return 0
+  rm -f "$tmp" 2>/dev/null || true
+  return 1
+}
+
+task_binding_lock_begin() { # <runId> <command>
+  local run="$1" command="$2"
+  if ! lease_dir_prepare; then emit_lease_dir_error "$run" "$command"; return 1; fi
+  if ! exec 7>"$(task_lease_lock_file "$run")"; then
+    jq -cn --arg run "$run" --arg cmd "$command" --arg dir "$LEASE_DIR" \
+      '{ok:false,error:("could not open shared task binding lock under " + $dir + " - refusing claim"),runId:$run,command:$cmd,leaseDir:$dir}'
+    return 1
+  fi
+  if ! flock -w "$LOCK_WAIT" 7; then
+    jq -cn --arg run "$run" --arg cmd "$command" \
+      '{ok:false,retryable:true,error:"gate_lock_busy: another invocation held this run identity lock - RETRY this same command in ~10s.",runId:$run,command:$cmd}'
+    exec 7>&-
+    return 1
+  fi
+  TASK_BINDING_LOCK_HELD=true
+}
+
+task_binding_lock_end() {
+  if [ "$TASK_PR_RUN_LOCK_HELD" = true ]; then
+    flock -u 6 2>/dev/null || true
+    exec 6>&-
+    TASK_PR_RUN_LOCK_HELD=false
+  fi
+  if [ "$TASK_BINDING_LOCK_HELD" = true ]; then
+    flock -u 7 2>/dev/null || true
+    exec 7>&-
+    TASK_BINDING_LOCK_HELD=false
+  fi
+}
+
+emit_task_binding_conflict() { # <run> <command> <binding> [pr]
+  local state_kind
+  state_kind="$(read_task_state_binding "$1" | jq -r '.binding')"
+  case "$state_kind" in active|released|completed) ;; *)
+    if jq -e '.terminal != null' <<<"$3" >/dev/null 2>&1; then state_kind=completed; else state_kind=active; fi ;;
+  esac
+  jq -cn --arg run "$1" --arg cmd "$2" --arg path "$(task_binding_file "$1")" --arg stateKind "$state_kind" \
+    --arg pr "${4:-}" --argjson binding "$3" \
+    '{ok:false,error:(if $binding.malformedTaskBinding == true
+                      then "shared task binding is malformed at " + $path + " - refusing claim"
+                      elif $binding.terminal != null
+                      then "run id already finished by a task-scoped run - terminal task run ids must remain unique across the gate"
+                      elif $stateKind == "released"
+                      then "run id remains bound to a released task-scoped run - run ids must remain unique across the gate"
+                      else "run id is already active or permanently bound to a task-scoped run - run ids must remain unique across the gate"
+                      end),runId:$run,command:$cmd,
+                      pr:(if $pr == "" then null else ($pr|tonumber) end),
+                      taskBindingFile:$path,taskBinding:$stateKind,sharedTaskBinding:$binding}'
+}
+
+task_binding_guard_absent_begin() { # <runId> <command> [pr]; success leaves fd 7 held
+  local run="$1" command="$2" binding pr="${3:-}"
+  task_binding_lock_begin "$run" "$command" || return 1
+  binding="$(ensure_task_binding_from_local "$run")"
+  if [ "$binding" != null ]; then
+    if jq -e '.malformedLegacyTaskState == true or .malformedLegacyTaskLease == true or .taskBindingWriteFailed == true' <<<"$binding" >/dev/null 2>&1; then
+      jq -cn --arg run "$run" --arg cmd "$command" --arg pr "$pr" --argjson detail "$binding" \
+        '{ok:false,error:"task-scoped state cannot be read or made durable - refusing claim",runId:$run,command:$cmd,
+          pr:(if $pr == "" then null else ($pr|tonumber) end),detail:$detail}'
+    else
+      emit_task_binding_conflict "$run" "$command" "$binding" "$pr"
+    fi
+    task_binding_lock_end
+    return 1
+  fi
+}
+
+# The task state is a private lifecycle record and a legacy compatibility
+# source. Empty files are allowed: no task-claim writes one, so they carry no
+# binding. Every nonempty record used for backfill must have the shape this
+# lifecycle writes; otherwise claim paths fail closed rather than guessing
+# which run it may have represented.
+read_task_state_binding() {  # <runId> -> {binding:none|active|released|completed,...}
+  local run="$1" f binding
+  f="$(task_state_file "$run")"
+  if [ ! -e "$f" ] || [ ! -s "$f" ]; then
+    jq -cn --arg path "$f" '{binding:"none",taskStateFile:$path}'
+    return
+  fi
+  if ! binding="$(jq -ce --arg run "$run" '
+    def valid_sha: type == "string" and test("^[0-9a-f]{40}$");
+    if type != "object" or .schemaVersion != 1 then error("not a task state object")
+    else
+      (if has("activeRunId") then .activeRunId else null end) as $active_run |
+      (if has("activeSha") then .activeSha else null end) as $active_sha |
+      (if has("completedRunId") then .completedRunId else null end) as $completed_run |
+      (if has("completedSha") then .completedSha else null end) as $completed_sha |
+      if ($active_run != null and $completed_run != null) then error("task state has active and completed runs")
+      elif ($active_run != null and (($active_run | type) != "string" or $active_run != $run)) then error("task state names another active run")
+      elif ($completed_run != null and (($completed_run | type) != "string" or $completed_run != $run)) then error("task state names another completed run")
+      elif $active_run != null then
+        if ($active_sha | valid_sha) then {binding:"active",deploySha:$active_sha}
+        else error("active task state has no valid deploy SHA") end
+      elif $completed_run != null then
+        if ($completed_sha | valid_sha) then {binding:"completed",deploySha:$completed_sha}
+        else error("completed task state has no valid deploy SHA") end
+      elif $active_sha != null then
+        if ($active_sha | valid_sha) and $completed_sha == null then {binding:"released",deploySha:$active_sha}
+        else error("released task state has an invalid binding") end
+      elif $completed_sha != null then error("task state has a completed SHA without a completed run")
+      else {binding:"none"}
+      end
+    end
+  ' "$f" 2>/dev/null)"; then
+    jq -cn --arg path "$f" '{binding:"malformed",taskStateFile:$path}'
+    return
+  fi
+  jq -cn --argjson binding "$binding" --arg path "$f" '$binding + {taskStateFile:$path}'
+}
+
+# Compatibility bridge for schema-v1 state written before the shared binding
+# existed. This runs only while task-lease-<run>.lock is held. A completed
+# state is migrated only when its private write-once verdict proves every
+# terminal fact; an all-null old release has no SHA to prove and remains none.
+ensure_task_binding_from_local() { # <runId> -> null | binding | malformed marker
+  local run="$1" binding state kind sha next verdict digest at verdict_kind terminal legacy_lease lease_sha state_sha
+  binding="$(read_task_binding "$run")"
+  if jq -e '.malformedTaskBinding == true' <<<"$binding" >/dev/null 2>&1; then
+    printf '%s' "$binding"
+    return
+  fi
+  state="$(read_task_state_binding "$run")"
+  kind="$(jq -r '.binding' <<<"$state")"
+  if [ "$kind" = malformed ]; then
+    jq -cn --arg path "$(jq -r '.taskStateFile' <<<"$state")" \
+      '{malformedLegacyTaskState:true,path:$path}'
+    return
+  fi
+  legacy_lease="$(read_task_lease "$run")"
+  if [ "$(lease_is_malformed "$legacy_lease")" = true ]; then
+    jq -cn --arg path "$(task_lease_file "$run")" \
+      '{malformedLegacyTaskLease:true,path:$path}'
+    return
+  fi
+  lease_sha="$(jq -r '.deploySha // empty' <<<"$legacy_lease")"
+  if [ "$binding" != null ] && [ "$legacy_lease" != null ] &&
+     [ "$(jq -r '.deploySha' <<<"$binding")" != "$lease_sha" ]; then
+    jq -cn --arg path "$(task_lease_file "$run")" --argjson binding "$binding" --argjson lease "$legacy_lease" \
+      '{malformedLegacyTaskLease:true,path:$path,reason:"shared task lease conflicts with shared task binding",taskBinding:$binding,taskLease:$lease}'
+    return
+  fi
+  state_sha="$(jq -r '.deploySha // empty' <<<"$state")"
+  if [ "$kind" != none ] && [ "$legacy_lease" != null ] && [ "$state_sha" != "$lease_sha" ]; then
+    jq -cn --arg path "$(task_lease_file "$run")" --argjson state "$state" --argjson lease "$legacy_lease" \
+      '{malformedLegacyTaskLease:true,path:$path,reason:"shared task lease conflicts with private task state",taskState:$state,taskLease:$lease}'
+    return
+  fi
+  if [ "$binding" != null ] && [ "$kind" != none ] &&
+     [ "$(jq -r '.deploySha' <<<"$binding")" != "$(jq -r '.deploySha' <<<"$state")" ]; then
+    jq -cn --arg path "$(jq -r '.taskStateFile' <<<"$state")" --argjson binding "$binding" --argjson state "$state" \
+      '{malformedLegacyTaskState:true,path:$path,reason:"private task state conflicts with shared task binding",taskBinding:$binding,taskState:$state}'
+    return
+  fi
+  if [ "$kind" = none ]; then
+    if [ "$binding" != null ]; then printf '%s' "$binding"; return; fi
+    if [ "$legacy_lease" = null ]; then printf 'null'; return; fi
+    next="$(jq -cn --arg run "$run" --arg sha "$lease_sha" --arg at "$(jq -r '.claimedAt' <<<"$legacy_lease")" \
+      '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:$at,terminal:null}')"
+    if ! write_task_binding "$run" "$next" || [ "$(read_task_binding "$run")" != "$next" ]; then
+      jq -cn --arg path "$(task_binding_file "$run")" '{taskBindingWriteFailed:true,path:$path}'
+      return
+    fi
+    printf '%s' "$next"
+    return
+  fi
+  sha="$(jq -r '.deploySha' <<<"$state")"
+  at="$(iso_now)"
+  verdict=null
+  if [ "$kind" = completed ] || [ -e "$(run_verdict_file "$run")" ]; then
+    verdict="$(jq -ce --arg run "$run" --arg sha "$sha" '
+      select(type == "object" and .runId == $run and .sha == $sha and
+             (.verdict == "GO" or .verdict == "NO_GO" or .verdict == "HUMAN_DECISION" or .verdict == "BLOCKED") and
+             (.finishedAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")))
+    ' "$(run_verdict_file "$run")" 2>/dev/null)" || {
+      jq -cn --arg path "$(run_verdict_file "$run")" \
+        '{malformedLegacyTaskState:true,path:$path}'
+      return
+    }
+    at="$(jq -r '.finishedAt' <<<"$verdict")"
+    [ "$(date -u -d "$at" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)" = "$at" ] || {
+      jq -cn --arg path "$(run_verdict_file "$run")" '{malformedLegacyTaskState:true,path:$path}'
+      return
+    }
+    digest="$(verdict_digest "$verdict")"
+    verdict_kind="$(jq -r '.verdict' <<<"$verdict")"
+    terminal="$(jq -cn --arg verdict "$verdict_kind" --arg at "$at" --arg digest "$digest" \
+      '{verdict:$verdict,completedAt:$at,verdictDigest:$digest}')"
+  else
+    terminal=null
+  fi
+  if [ "$binding" != null ]; then
+    if [ "$terminal" != null ]; then
+      if [ "$(jq -c '.terminal' <<<"$binding")" = null ]; then
+        next="$(jq -c --argjson terminal "$terminal" '.terminal=$terminal' <<<"$binding")"
+      elif [ "$(jq -c '.terminal' <<<"$binding")" = "$terminal" ]; then
+        printf '%s' "$binding"
+        return
+      else
+        jq -cn --arg path "$(run_verdict_file "$run")" --argjson binding "$binding" --argjson verdict "$verdict" \
+          '{malformedLegacyTaskState:true,path:$path,reason:"private verdict conflicts with shared terminal binding",taskBinding:$binding,privateVerdict:$verdict}'
+        return
+      fi
+    else
+      # A terminal binding paired with an active private state and no verdict is
+      # the supported crash cut after shared terminal commit. task-finish will
+      # reconstruct only the exact bound verdict; claim paths still refuse it.
+      printf '%s' "$binding"
+      return
+    fi
+  elif [ "$terminal" != null ]; then
+    next="$(jq -cn --arg run "$run" --arg sha "$sha" --arg at "$at" --argjson terminal "$terminal" \
+      '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:$at,terminal:$terminal}')"
+  else
+    next="$(jq -cn --arg run "$run" --arg sha "$sha" --arg at "$at" \
+      '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:$at,terminal:null}')"
+  fi
+  if ! write_task_binding "$run" "$next" || [ "$(read_task_binding "$run")" != "$next" ]; then
+    jq -cn --arg path "$(task_binding_file "$run")" '{taskBindingWriteFailed:true,path:$path}'
+    return
+  fi
+  printf '%s' "$next"
+}
 
 read_task_lease() {
   local f lease stamp field; f="$(task_lease_file "$1")"
   if [ ! -e "$f" ]; then
     printf 'null'
-  elif [ -s "$f" ] && jq -e '
+  elif [ -s "$f" ] && jq -e --arg run "$1" '
       type == "object" and .schemaVersion == 1 and .kind == "task" and
-      (.runId | type == "string" and length > 0) and
+      .runId == $run and
       (.deploySha | type == "string" and test("^[0-9a-f]{40}$")) and
       (.owner | type == "string" and length > 0) and
       (.claimedAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
@@ -662,8 +935,9 @@ write_task_lease() {  # <runId> <json>
 # verification after write, refuse-on-race. Three differences:
 #  - the permanently-bound field is `deploySha` here (`.pr` there);
 #  - a FINISHED run id is never re-claimable (the check right after the lock);
-#  - on SUCCESS it returns with fd 6 STILL HELD (#726 F1). Its one caller,
-#    `task-claim`, writes the private slot under this same lock, then ends it
+#  - on SUCCESS it returns with task fd 7 and PR-run fd 6 STILL HELD (#726 F1).
+#    Its one caller, `task-claim`, writes the private slot under these locks,
+#    then ends them
 #    with task_lease_fence_end — after restoring TASK_PRIOR_LEASE_JSON if the
 #    slot write failed. Releasing the lock between the lease write and the
 #    slot write let two concurrent --takeover claims leave the lease owned by
@@ -672,86 +946,121 @@ write_task_lease() {  # <runId> <json>
 # Sets TASK_PRIOR_LEASE_JSON (the lease as found, or null) and
 # TASK_ACQUIRED_LEASE_JSON (the lease re-read after the write). Call it
 # directly, never inside $(…): the lock and both globals would die with the
-# subshell. On refusal it prints the refusal JSON and releases fd 6.
+# subshell. On refusal it prints the refusal JSON and releases both locks.
 task_lease_acquire() {  # <runId> <owner> <deploySha>
   local run="$1" owner="$2" sha="$3" cur prior_claimed now next back
-  local verdict_file completed_run recorded completed
+  local shared_pr_lease binding state_binding state_kind new_binding cleanup
   TASK_PRIOR_LEASE_JSON=null
   TASK_ACQUIRED_LEASE_JSON=null
-  if ! lease_dir_prepare; then
-    emit_lease_dir_error "$run" "task-claim"
-    return 1
-  fi
-  if ! exec 6>"$(task_lease_lock_file "$run")"; then
-    jq -cn --arg run "$run" --arg dir "$LEASE_DIR" \
-      '{ok:false,error:("could not open shared task lease lock under " + $dir + " - refusing to run unleased"),runId:$run,leaseDir:$dir}'
+  TASK_PRIOR_BINDING_JSON=null
+  TASK_ACQUIRED_BINDING_JSON=null
+  TASK_BINDING_CREATED=false
+  task_binding_lock_begin "$run" task-claim || return 1
+
+  # PR claim/poll writes the shared run lease while holding this same task
+  # identity lock. Prove absence under the existing PR run lock and retain
+  # that lock through the task binding/private-slot transaction. PR release
+  # and finish hold it across lease removal and any rollback restoration, so
+  # their temporary absence can never be mistaken for a free identity.
+  if ! exec 6>"$(lease_lock_file "$run")"; then
+    jq -cn --arg run "$run" --arg path "$(lease_lock_file "$run")" \
+      '{ok:false,error:("could not open shared PR run lock at " + $path + " - task-claim refused"),runId:$run}'
+    task_binding_lock_end
     return 1
   fi
   if ! flock -w "$LOCK_WAIT" 6; then
     jq -cn --arg run "$run" \
-      '{ok:false,retryable:true,
-        error:"gate_lock_busy: another invocation held this task run'"'"'s lease lock — RETRY this same command in ~10s.",
-        runId:$run}'
+      '{ok:false,retryable:true,error:"gate_lock_busy: another invocation held this PR run identity lock - RETRY this same task-claim in ~10s.",runId:$run}'
     exec 6>&-
+    task_binding_lock_end
     return 1
   fi
-  # A FINISHED run id is terminal (#726 F3). task-finish removes the lease,
-  # the only record of the deploySha binding, so without this a re-claim on a
-  # different SHA passed the binding check below against a null lease, and the
-  # slot write rebuilt the state with completedRunId/completedVerdict/
-  # completedAt nulled: the run certified a second build and task-finish then
-  # came back reconciliation_required. Both terminal records are read here,
-  # under the lock task-finish holds from before its verdict write through its
-  # state commit (task_lease_fence_begin ... task_lease_fence_end in
-  # `task-finish`), so no finish can land between this check and the lease
-  # write below.
-  # One exception, same build only: a verdict for this SHA whose state never
-  # recorded completion is a task-finish that died between its verdict write
-  # and its state commit. Re-claiming it on that SHA is how its owner revives
-  # an expired lease so task-finish can resume (task_lease_fence_begin's own
-  # recovery hint); refusing that too would strand an active slot nothing can
-  # release.
-  verdict_file="$(run_verdict_file "$run")"
-  completed_run="$(jq -r '.completedRunId // empty' "$(task_state_file "$run")" 2>/dev/null || true)"
-  if [ "$completed_run" = "$run" ] || [ -e "$verdict_file" ]; then
-    recorded="$(jq -c '.' "$verdict_file" 2>/dev/null || true)"
-    completed=false; [ "$completed_run" = "$run" ] && completed=true
-    if [ "$completed" = true ] || [ -z "$recorded" ] ||
-       ! jq -e --arg sha "$sha" --arg run "$run" '.sha == $sha and .runId == $run' <<<"$recorded" >/dev/null 2>&1; then
-      jq -cn --arg run "$run" --arg owner "$owner" --arg sha "$sha" --arg path "$verdict_file" \
-        --argjson completed "$completed" \
-        --argjson recorded "$(if [ -n "$recorded" ]; then printf '%s' "$recorded"; elif [ -e "$verdict_file" ]; then printf '"unparseable"'; else printf 'null'; fi)" \
-        '{ok:false,
-          error:(if $completed
-                 then "this task run already finished — a finished run id is terminal and can never be re-claimed, for this build or any other; start a new run id"
-                 else "a verdict is already recorded for this task run on a different build, or cannot be read — it cannot be re-claimed for deploy " + $sha + "; start a new run id for a new build"
-                 end),
-          runId:$run,requestedBy:$owner,requestedSha:$sha,finished:$completed,
-          runVerdictFile:$path,recordedVerdict:$recorded}'
-      flock -u 6; exec 6>&-
-      return 1
-    fi
+  TASK_PR_RUN_LOCK_HELD=true
+  shared_pr_lease="$(read_lease "$run")"
+  if [ "$(lease_is_malformed "$shared_pr_lease")" = true ]; then
+    jq -cn --arg run "$run" --arg path "$(lease_file "$run")" \
+      '{ok:false,error:("shared PR run lease is malformed at " + $path + " - task-claim refused"),runId:$run,leaseFile:$path}'
+    task_binding_lock_end
+    return 1
   fi
+  if [ "$shared_pr_lease" != null ]; then
+    jq -cn --arg run "$run" --argjson lease "$shared_pr_lease" \
+      '{ok:false,error:"run id is already bound by a PR campaign in shared ownership - task-claim refused",runId:$run,activePr:$lease.pr,prLease:$lease}'
+    task_binding_lock_end
+    return 1
+  fi
+
   cur="$(read_task_lease "$run")"
   if [ "$(lease_is_malformed "$cur")" = true ]; then
     jq -cn --arg run "$run" --arg path "$(task_lease_file "$run")" \
       '{ok:false,error:("shared task lease is malformed at " + $path + " - refusing to overwrite or run unleased"),runId:$run,leaseFile:$path}'
-    flock -u 6; exec 6>&-
+    task_binding_lock_end
     return 1
   fi
-  # Permanently bound, no --takeover escape: a different build is a different
-  # run id, never a reclaim of this one. (See header comment above.)
-  if [ "$cur" != null ] && [ "$(jq -r '.deploySha // empty' <<<"$cur")" != "$sha" ]; then
-    jq -cn --arg run "$run" --arg owner "$owner" --arg sha "$sha" --argjson lease "$cur" \
+
+  binding="$(ensure_task_binding_from_local "$run")"
+  if jq -e '.malformedTaskBinding == true or .malformedLegacyTaskState == true or .malformedLegacyTaskLease == true or .taskBindingWriteFailed == true' <<<"$binding" >/dev/null 2>&1; then
+    jq -cn --arg run "$run" --argjson binding "$binding" \
+      '{ok:false,error:"task identity evidence is malformed or could not be made durable - task-claim refused",runId:$run,detail:$binding}'
+    task_binding_lock_end
+    return 1
+  fi
+  # A legacy shared task lease is authoritative evidence even when this
+  # caller's private state root has never seen the run. Backfill it before any
+  # takeover/recovery decision, still under the existing lease lock.
+  if [ "$binding" = null ] && [ "$cur" != null ]; then
+    new_binding="$(jq -cn --arg run "$run" --arg sha "$(jq -r '.deploySha' <<<"$cur")" --arg at "$(iso_now)" \
+      '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:$at,terminal:null}')"
+    if ! write_task_binding "$run" "$new_binding" || [ "$(read_task_binding "$run")" != "$new_binding" ]; then
+      jq -cn --arg run "$run" --arg path "$(task_binding_file "$run")" \
+        '{ok:false,error:("could not backfill shared task binding at " + $path + " - task-claim refused"),runId:$run,taskBindingFile:$path}'
+      task_binding_lock_end
+      return 1
+    fi
+    binding="$new_binding"
+  fi
+  if [ "$binding" != null ] && [ "$cur" != null ] &&
+     [ "$(jq -r '.deploySha' <<<"$binding")" != "$(jq -r '.deploySha' <<<"$cur")" ]; then
+    jq -cn --arg run "$run" --argjson binding "$binding" --argjson lease "$cur" \
+      '{ok:false,gateStatus:"reconciliation_required",error:"shared task binding conflicts with the task lease - refusing to choose one",runId:$run,taskBinding:$binding,taskLease:$lease}'
+    task_binding_lock_end
+    return 1
+  fi
+  if [ "$binding" != null ] && [ "$(jq -r '.terminal != null' <<<"$binding")" = true ]; then
+    jq -cn --arg run "$run" --arg owner "$owner" --arg sha "$sha" --argjson binding "$binding" \
+      '{ok:false,error:"this task run already finished - a terminal run id can never be re-claimed; start a new run id, or resume only the exact interrupted task-finish",runId:$run,requestedBy:$owner,requestedSha:$sha,finished:true,recordedVerdict:$binding.terminal,taskBinding:$binding}'
+    task_binding_lock_end
+    return 1
+  fi
+  if [ "$binding" != null ] && [ "$(jq -r '.deploySha' <<<"$binding")" != "$sha" ]; then
+    state_binding="$(read_task_state_binding "$run")"
+    state_kind="$(jq -r '.binding' <<<"$state_binding")"
+    case "$state_kind" in active|released) ;; *) state_kind=shared ;; esac
+    jq -cn --arg run "$run" --arg owner "$owner" --arg sha "$sha" --arg bindingKind "$state_kind" --argjson binding "$binding" \
       '{ok:false,
-        error:("this run id is permanently bound to deploy " + $lease.deploySha +
+        error:("this run id is permanently bound to deploy " + $binding.deploySha +
                " and cannot be reused for deploy " + $sha +
                " — a task-scoped run id is one build for its whole lifetime; start a new run id for a new build"),
         runId:$run,requestedBy:$owner,requestedSha:$sha,
-        leaseSha:$lease.deploySha,leaseOwner:$lease.owner,claimedAt:$lease.claimedAt,expiresAt:$lease.expiresAt}'
-    flock -u 6; exec 6>&-
+        boundSha:$binding.deploySha,binding:$bindingKind,taskBinding:$binding}'
+    task_binding_lock_end
     return 1
   fi
+  if [ "$binding" = null ]; then
+    new_binding="$(jq -cn --arg run "$run" --arg sha "$sha" --arg at "$(iso_now)" \
+      '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:$at,terminal:null}')"
+    if ! write_task_binding "$run" "$new_binding" || [ "$(read_task_binding "$run")" != "$new_binding" ]; then
+      jq -cn --arg run "$run" --arg path "$(task_binding_file "$run")" \
+        '{ok:false,error:("could not create permanent shared task binding at " + $path + " - task-claim refused"),runId:$run,taskBindingFile:$path}'
+      task_binding_lock_end
+      return 1
+    fi
+    TASK_BINDING_CREATED=true
+    binding="$new_binding"
+  fi
+  TASK_PRIOR_BINDING_JSON="$(if [ "$TASK_BINDING_CREATED" = true ]; then printf 'null'; else printf '%s' "$binding"; fi)"
+  TASK_ACQUIRED_BINDING_JSON="$binding"
+
   if [ "$(lease_is_live "$cur")" = true ] &&
      [ "$(jq -r '.owner // empty' <<<"$cur")" != "$owner" ]; then
     if [ "$TAKEOVER" != true ]; then
@@ -760,7 +1069,7 @@ task_lease_acquire() {  # <runId> <owner> <deploySha>
           error:("this task run is already held by " + $lease.owner + " until " + $lease.expiresAt +
                  " — STOP; another coordinator owns this run, or re-run with --takeover to force it"),
           runId:$run,requestedBy:$owner,leaseOwner:$lease.owner,claimedAt:$lease.claimedAt,expiresAt:$lease.expiresAt}'
-      flock -u 6; exec 6>&-
+      task_binding_lock_end
       return 1
     fi
   fi
@@ -772,25 +1081,35 @@ task_lease_acquire() {  # <runId> <owner> <deploySha>
     --arg claimed "${prior_claimed:-$now}" --arg exp "$(lease_expiry_from_now)" \
     '{schemaVersion:1,kind:"task",runId:$run,deploySha:$sha,owner:$owner,claimedAt:$claimed,renewedAt:$now,expiresAt:$exp}')"
   if ! write_task_lease "$run" "$next"; then
-    jq -cn --arg run "$run" --arg dir "$LEASE_DIR" \
+    cleanup=""
+    if [ "$TASK_BINDING_CREATED" = true ] &&
+       { ! rm -f "$(task_binding_file "$run")" 2>/dev/null || [ -e "$(task_binding_file "$run")" ]; }; then
+      cleanup="; the just-created shared task binding also could not be removed and requires reconciliation"
+    fi
+    jq -cn --arg run "$run" --arg dir "$LEASE_DIR" --arg cleanup "$cleanup" \
       '{ok:false,error:("could not write the task lease file under " + $dir +
-                        " - refusing to run unleased. Fix the shared lease dir and retry."),runId:$run,leaseDir:$dir}'
-    flock -u 6; exec 6>&-
+                        " - refusing to run unleased. Fix the shared lease dir and retry" + $cleanup),runId:$run,leaseDir:$dir}'
+    task_binding_lock_end
     return 1
   fi
   back="$(read_task_lease "$run")"
   if [ "$(jq -r '.owner // empty' <<<"$back")" != "$owner" ] ||
      [ "$(jq -r '.deploySha // empty' <<<"$back")" != "$sha" ] ||
      [ "$(lease_is_live "$back")" != true ]; then
-    jq -cn --arg run "$run" --arg owner "$owner" --argjson lease "$back" \
-      '{ok:false,error:"task lease write did not stick (raced by another claimant) — do NOT proceed; retry",
+    cleanup=""
+    if [ "$TASK_BINDING_CREATED" = true ] &&
+       { ! rm -f "$(task_binding_file "$run")" 2>/dev/null || [ -e "$(task_binding_file "$run")" ]; }; then
+      cleanup="; the just-created shared task binding could not be removed and requires reconciliation"
+    fi
+    jq -cn --arg run "$run" --arg owner "$owner" --arg cleanup "$cleanup" --argjson lease "$back" \
+      '{ok:false,error:("task lease write did not stick (raced by another claimant) — do NOT proceed; retry" + $cleanup),
         runId:$run,requestedBy:$owner,lease:$lease}'
-    flock -u 6; exec 6>&-
+    task_binding_lock_end
     return 1
   fi
   TASK_PRIOR_LEASE_JSON="$cur"
   TASK_ACQUIRED_LEASE_JSON="$back"
-  return 0  # fd 6 is still held — the caller ends it (see above)
+  return 0  # fd 7 is still held — the caller ends it (see above)
 }
 
 # Same contract as lease_fence_begin: hold the lease lock from owner
@@ -798,23 +1117,39 @@ task_lease_acquire() {  # <runId> <owner> <deploySha>
 # impossible. No PR lifecycle fence and no authority file — the run id is
 # already the whole key.
 task_lease_fence_begin() {  # <runId> <owner> <command>
-  local run="$1" owner="$2" command="$3" lease live lease_owner
-  if ! exec 6>"$(task_lease_lock_file "$run")"; then
-    jq -cn --arg run "$run" --arg dir "$LEASE_DIR" --arg cmd "$command" \
-      '{ok:false,error:("could not open shared task lease lock under " + $dir + " - refusing to continue unleased"),runId:$run,command:$cmd,leaseDir:$dir}'
-    return 1
-  fi
-  if ! flock -w "$LOCK_WAIT" 6; then
-    jq -cn --arg run "$run" --arg cmd "$command" \
-      '{ok:false,retryable:true,error:"gate_lock_busy: another invocation held this task run lease lock - RETRY this same command in ~10s.",runId:$run,command:$cmd}'
-    exec 6>&-
-    return 1
-  fi
+  local run="$1" owner="$2" command="$3" lease live lease_owner binding new_binding
+  task_binding_lock_begin "$run" "$command" || return 1
   lease="$(read_task_lease "$run")"
   if [ "$(lease_is_malformed "$lease")" = true ]; then
     jq -cn --arg run "$run" --arg cmd "$command" --arg path "$(task_lease_file "$run")" \
       '{ok:false,error:("shared task lease is malformed at " + $path + " - refusing lifecycle authority"),runId:$run,command:$cmd,leaseFile:$path}'
-    flock -u 6; exec 6>&-
+    task_binding_lock_end
+    return 1
+  fi
+  binding="$(ensure_task_binding_from_local "$run")"
+  if jq -e '.malformedTaskBinding == true or .malformedLegacyTaskState == true or .malformedLegacyTaskLease == true or .taskBindingWriteFailed == true' <<<"$binding" >/dev/null 2>&1; then
+    jq -cn --arg run "$run" --arg cmd "$command" --argjson detail "$binding" \
+      '{ok:false,error:"task identity evidence is malformed or could not be made durable - refusing lifecycle authority",runId:$run,command:$cmd,detail:$detail}'
+    task_binding_lock_end
+    return 1
+  fi
+  if [ "$binding" = null ] && [ "$lease" != null ]; then
+    new_binding="$(jq -cn --arg run "$run" --arg sha "$(jq -r '.deploySha' <<<"$lease")" --arg at "$(iso_now)" \
+      '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:$at,terminal:null}')"
+    if ! write_task_binding "$run" "$new_binding" || [ "$(read_task_binding "$run")" != "$new_binding" ]; then
+      jq -cn --arg run "$run" --arg cmd "$command" --arg path "$(task_binding_file "$run")" \
+        '{ok:false,error:("could not backfill shared task binding at " + $path + " - refusing lifecycle authority"),runId:$run,command:$cmd,taskBindingFile:$path}'
+      task_binding_lock_end
+      return 1
+    fi
+    binding="$new_binding"
+  fi
+  if [ "$binding" = null ] || [ "$lease" = null ] ||
+     [ "$(jq -r '.terminal != null' <<<"$binding")" = true ] ||
+     [ "$(jq -r '.deploySha' <<<"$binding")" != "$(jq -r '.deploySha // empty' <<<"$lease")" ]; then
+    jq -cn --arg run "$run" --arg cmd "$command" --argjson binding "$binding" --argjson lease "$lease" \
+      '{ok:false,error:"shared task binding and live lease do not prove one unfinished lifecycle - refusing",runId:$run,command:$cmd,taskBinding:$binding,taskLease:$lease}'
+    task_binding_lock_end
     return 1
   fi
   live="$(lease_is_live "$lease")"
@@ -822,15 +1157,88 @@ task_lease_fence_begin() {  # <runId> <owner> <command>
   if [ "$live" != true ] || [ "$lease_owner" != "$owner" ]; then
     jq -cn --arg run "$run" --arg owner "$owner" --arg cmd "$command" --argjson lease "$lease" --argjson live "$live" \
       '{ok:false,error:"live shared task lease does not belong to this lifecycle owner - STOP this run; if this is the original owner after expiry, recover with task-claim using the same run id, owner token and deploy SHA",runId:$run,command:$cmd,requestedBy:$owner,held:$live,leaseOwner:($lease.owner // null),expiresAt:($lease.expiresAt // null)}'
-    flock -u 6; exec 6>&-
+    task_binding_lock_end
     return 1
   fi
   FENCED_TASK_LEASE_JSON="$lease"
   return 0
 }
 
+task_finish_fence_begin() { # <run> <owner> <sha> <verdict> <completedAt> <digest> <hasPrivateVerdict>
+  local run="$1" owner="$2" sha="$3" verdict="$4" completed_at="$5" digest="$6"
+  local has_private_verdict="$7" binding lease new_binding expected_digest
+  TASK_FINISH_COMPLETED_AT="$completed_at"
+  TASK_FINISH_VERDICT_DIGEST="$digest"
+  task_binding_lock_begin "$run" task-finish || return 1
+  binding="$(ensure_task_binding_from_local "$run")"
+  lease="$(read_task_lease "$run")"
+  if jq -e '.malformedTaskBinding == true or .malformedLegacyTaskState == true or .malformedLegacyTaskLease == true or .taskBindingWriteFailed == true' <<<"$binding" >/dev/null 2>&1 ||
+     [ "$(lease_is_malformed "$lease")" = true ]; then
+    jq -cn --arg run "$run" --argjson binding "$binding" --argjson lease "$lease" \
+      '{ok:false,error:"task finish cannot reconcile malformed shared identity evidence",runId:$run,taskBinding:$binding,taskLease:$lease}'
+    task_binding_lock_end
+    return 1
+  fi
+  if [ "$binding" = null ] && [ "$lease" != null ]; then
+    new_binding="$(jq -cn --arg run "$run" --arg sha "$(jq -r '.deploySha' <<<"$lease")" --arg at "$(iso_now)" \
+      '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:$at,terminal:null}')"
+    if ! write_task_binding "$run" "$new_binding" || [ "$(read_task_binding "$run")" != "$new_binding" ]; then
+      jq -cn --arg run "$run" --arg path "$(task_binding_file "$run")" \
+        '{ok:false,error:("could not backfill shared task binding at " + $path + " - task-finish refused"),runId:$run,taskBindingFile:$path}'
+      task_binding_lock_end
+      return 1
+    fi
+    binding="$new_binding"
+  fi
+  if [ "$binding" = null ] || [ "$(jq -r '.deploySha // empty' <<<"$binding")" != "$sha" ]; then
+    jq -cn --arg run "$run" --arg sha "$sha" --argjson binding "$binding" \
+      '{ok:false,gateStatus:"reconciliation_required",error:"shared task binding does not match this finish - refusing",runId:$run,attemptedSha:$sha,taskBinding:$binding}'
+    task_binding_lock_end
+    return 1
+  fi
+  if [ "$(jq -r '.terminal != null' <<<"$binding")" = true ]; then
+    if [ "$has_private_verdict" != true ]; then
+      completed_at="$(jq -r '.terminal.completedAt' <<<"$binding")"
+      digest="$(jq -r '.terminal.verdictDigest' <<<"$binding")"
+      expected_digest="$(verdict_digest "$(verdict_payload "$sha" "$run" "$verdict" "$completed_at")")"
+      TASK_FINISH_COMPLETED_AT="$completed_at"
+      TASK_FINISH_VERDICT_DIGEST="$digest"
+    else
+      expected_digest="$digest"
+    fi
+    if [ "$expected_digest" != "$digest" ] ||
+       ! jq -e --arg verdict "$verdict" --arg at "$completed_at" --arg digest "$digest" \
+         '.terminal.verdict == $verdict and .terminal.completedAt == $at and .terminal.verdictDigest == $digest' <<<"$binding" >/dev/null 2>&1; then
+      jq -cn --arg run "$run" --arg verdict "$verdict" --arg at "$completed_at" --arg digest "$digest" --argjson binding "$binding" \
+        '{ok:false,gateStatus:"reconciliation_required",error:"shared task terminal facts conflict with this exact finish - nothing changed",runId:$run,taskBinding:$binding,attemptedTerminal:{verdict:$verdict,completedAt:$at,verdictDigest:$digest}}'
+      task_binding_lock_end
+      return 1
+    fi
+    if [ "$lease" != null ] && [ "$(jq -r '.owner // empty' <<<"$lease")" != "$owner" ]; then
+      jq -cn --arg run "$run" --arg owner "$owner" --argjson lease "$lease" \
+        '{ok:false,gateStatus:"reconciliation_required",error:"terminal task binding is paired with another lease owner - refusing reconciliation",runId:$run,requestedBy:$owner,taskLease:$lease}'
+      task_binding_lock_end
+      return 1
+    fi
+    FENCED_TASK_LEASE_JSON="$lease"
+    FENCED_TASK_BINDING_JSON="$binding"
+    return 0
+  fi
+  if [ "$lease" = null ] || [ "$(lease_is_live "$lease")" != true ] ||
+     [ "$(jq -r '.owner // empty' <<<"$lease")" != "$owner" ] ||
+     [ "$(jq -r '.deploySha // empty' <<<"$lease")" != "$sha" ]; then
+    jq -cn --arg run "$run" --arg owner "$owner" --argjson lease "$lease" \
+      '{ok:false,error:"live shared task lease does not belong to this unfinished finish owner",runId:$run,requestedBy:$owner,taskLease:$lease}'
+    task_binding_lock_end
+    return 1
+  fi
+  FENCED_TASK_LEASE_JSON="$lease"
+  FENCED_TASK_BINDING_JSON="$binding"
+  return 0
+}
+
 task_lease_fence_end() {
-  flock -u 6 2>/dev/null || true; exec 6>&-
+  task_binding_lock_end
 }
 
 task_lease_remove_fenced() {  # <runId>
@@ -1793,34 +2201,19 @@ if [ "$COMMAND" = "claim" ]; then
         pr:$pr,runId:$run,activePr:$otherPr}'
     exit 0
   fi
-  # ...nor one an active task-scoped run holds (#726 F2). `task-claim` refuses a
-  # run id any PR campaign holds; this is the other direction, which
-  # find_pr_for_run cannot see — it scans only pr-*-state.json. Without it a PR
-  # campaign could claim a run id a live certification already holds; both
-  # lifecycles then die in smoke-run-scaffold.sh's begin_active_run_fence
-  # (`count` == 2, "exactly one active slot") and share runs/<id>/verdict.json.
-  # `task-claim` writes its slot under this same CONTROL_LOCK, so this read
-  # cannot race it. A task state that exists but cannot be parsed fails closed.
-  TASK_OTHER_FILE="$(task_state_file "$RUN_ID")"
-  if [ -s "$TASK_OTHER_FILE" ]; then
-    TASK_OTHER_WHY=""
-    if ! TASK_OTHER_ACTIVE="$(jq -er '.activeRunId // ""' "$TASK_OTHER_FILE" 2>/dev/null)"; then
-      TASK_OTHER_WHY="task-scoped state for this run id exists but cannot be read — refusing; run ids must be unique across the gate"
-    elif [ "$TASK_OTHER_ACTIVE" = "$RUN_ID" ]; then
-      TASK_OTHER_WHY="run id already claimed by an active task-scoped run (task-claim) — run ids must be unique across the gate"
-    fi
-    if [ -n "$TASK_OTHER_WHY" ]; then
-      jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg err "$TASK_OTHER_WHY" --arg path "$TASK_OTHER_FILE" \
-        '{ok:false,error:$err,pr:$pr,runId:$run,taskStateFile:$path}'
-      exit 0
-    fi
-  fi
   exec 9>"$(pr_lock_file "$PR")"
   if ! flock -w "$LOCK_WAIT" 9; then
     emit_lock_busy "$COMMAND" "$PR"
     exit 0
   fi
   STATE="$(read_pr_state "$PR")"
+  # Lock order matches automatic poll: private PR state, then shared task
+  # identity, then PR lifecycle/run ownership. Hold the task lock until this
+  # PR's shared lease, authority and private slot all commit, so task-claim
+  # cannot pass between this read and the PR identity write.
+  if ! task_binding_guard_absent_begin "$RUN_ID" claim "$PR"; then
+    exit 0
+  fi
   ACTIVE_RUN="$(jq -r '.activeRunId // empty' <<<"$STATE")"
   TOOK_OVER=""
   if [ -n "$ACTIVE_RUN" ] && [ "$ACTIVE_RUN" != "$RUN_ID" ] &&
@@ -1962,6 +2355,7 @@ if [ "$COMMAND" = "claim" ]; then
     exit 1
   fi
   lease_fence_end
+  task_binding_lock_end
   jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg sha "$SHA" --arg took "$TOOK_OVER" \
     --argjson lease "$(jq -c '.lease' <<<"$LEASE_RESULT")" \
     --arg deadline "$(jq -r '.challengerDeadline' <<<"$STATE")" \
@@ -2016,7 +2410,11 @@ if [ "$COMMAND" = "lease-claim" ] || [ "$COMMAND" = "lease-renew" ] ||
         exit 2
       fi
     fi
+    if ! task_binding_guard_absent_begin "$RUN_ID" lease-claim "$LEASE_PR"; then
+      exit 0
+    fi
     lease_acquire "$RUN_ID" "$OWNER" "$LEASE_PR"
+    task_binding_lock_end
     exit 0
   fi
 
@@ -2255,13 +2653,33 @@ if [ "$COMMAND" = "task-claim" ]; then
       '{ok:false,error:"run id already claimed by a PR campaign — run ids must be unique across the gate",runId:$run,activePr:$otherPr}'
     exit 0
   fi
-  if [ -e "$STATE_DIR/develop-state.json" ] &&
-     [ "$(jq -r '.activeRunId // empty' "$STATE_DIR/develop-state.json" 2>/dev/null)" = "$RUN_ID" ]; then
-    jq -cn --arg run "$RUN_ID" \
-      '{ok:false,error:"run id already claimed by the develop campaign — run ids must be unique across the gate",runId:$run}'
-    exit 0
+  # The develop gate's own terminal state carries completedRunId after its
+  # active slot clears. It shares runs/<id>/verdict.json with task runs, so a
+  # completed develop identity is just as unavailable as an active one.
+  DEVELOP_STATE_FILE="$STATE_DIR/develop-state.json"
+  if [ -s "$DEVELOP_STATE_FILE" ]; then
+    if ! DEVELOP_BINDING="$(jq -er --arg run "$RUN_ID" '
+      if type != "object" then error("not a develop state object")
+      elif (.activeRunId // "") == $run then "active"
+      elif (.completedRunId // "") == $run then "completed"
+      else "none"
+      end
+    ' "$DEVELOP_STATE_FILE" 2>/dev/null)"; then
+      jq -cn --arg run "$RUN_ID" --arg path "$DEVELOP_STATE_FILE" \
+        '{ok:false,error:("develop state cannot be read at " + $path + " - task-claim refused to preserve run-id uniqueness"),runId:$run,developStateFile:$path}'
+      exit 0
+    fi
+    if [ "$DEVELOP_BINDING" != none ]; then
+      jq -cn --arg run "$RUN_ID" --arg binding "$DEVELOP_BINDING" --arg path "$DEVELOP_STATE_FILE" \
+        '{ok:false,error:(if $binding == "completed"
+                          then "run id already finished by the develop campaign — terminal run ids must be unique across the gate"
+                          else "run id already claimed by the develop campaign — run ids must be unique across the gate"
+                          end),runId:$run,developBinding:$binding,developStateFile:$path}'
+      exit 0
+    fi
   fi
-  # Returns holding the shared task lease lock (fd 6) — see task_lease_acquire.
+  # Returns holding the shared task identity/lease lock (fd 7) — see
+  # task_lease_acquire.
   # Called directly, never inside $(…), or the lock would die with the
   # subshell before the slot write below. It prints its own refusal.
   if ! task_lease_acquire "$RUN_ID" "$OWNER" "$SHA"; then
@@ -2277,13 +2695,18 @@ if [ "$COMMAND" = "task-claim" ]; then
     # `task-release` restore theirs: a live same-owner lease a running
     # coordinator still relies on, the owner a failed --takeover tried to
     # displace, or an expired lease that still carries this run's deploySha
-    # binding. Only a lease this claim created from nothing is removed. fd 6 is
-    # still held, so no other claimant can have changed it since the acquire.
+    # binding. Only a lease/binding this claim created from nothing is removed.
+    # fd 7 is still held, so no other claimant can have changed either record.
     CLEANUP=""
     if [ "$TASK_PRIOR_LEASE_JSON" = null ]; then
       task_lease_remove_fenced "$RUN_ID" || CLEANUP="; the just-acquired shared task lease also could not be removed"
     else
       write_task_lease "$RUN_ID" "$TASK_PRIOR_LEASE_JSON" || CLEANUP="; the preexisting shared task lease also could not be restored"
+    fi
+    if [ "$TASK_PRIOR_BINDING_JSON" = null ]; then
+      rm -f "$(task_binding_file "$RUN_ID")" 2>/dev/null &&
+        [ ! -e "$(task_binding_file "$RUN_ID")" ] ||
+        CLEANUP="$CLEANUP; the just-created shared task binding also could not be removed"
     fi
     task_lease_fence_end
     jq -cn --arg run "$RUN_ID" --arg owner "$OWNER" --arg cleanup "$CLEANUP" \
@@ -2356,7 +2779,10 @@ if [ "$COMMAND" = "task-release" ]; then
   if ! task_lease_fence_begin "$RUN_ID" "$OWNER" "$COMMAND"; then
     exit 0
   fi
-  STATE="$(jq -c '.activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null |
+  # Keep activeSha as this run's durable deploy binding after the active slot
+  # and lease are released. task-claim reads it under this same task lease
+  # fence: another SHA must use another run id, while this SHA may recover.
+  STATE="$(jq -c '.activeStartedAt=null | .activeRunId=null | .activeProgressAt=null |
      .activeLeaseOwner=null' <<<"$STATE")"
   if ! task_lease_remove_fenced "$RUN_ID"; then
     task_lease_fence_end
@@ -2427,6 +2853,10 @@ if [ "$COMMAND" = "task-finish" ]; then
       RUN_VERDICT_RESUMED=true
       if [ -s "$TASK_STATE_FILE" ] &&
          [ "$(jq -r '.completedRunId // empty' "$TASK_STATE_FILE" 2>/dev/null)" = "$RUN_ID" ]; then
+        if ! task_finish_fence_begin "$RUN_ID" "$OWNER" "$SHA" "$VERDICT" "$NOW" "$VERDICT_DIGEST" true; then
+          exit 0
+        fi
+        task_lease_fence_end
         jq -cn --argjson verdict "$EXISTING_VERDICT" --arg digest "$VERDICT_DIGEST" \
           '{ok:true,idempotent:true,
             note:"this run was already finished with these exact terminal facts — nothing re-recorded, no artifact rewritten",
@@ -2468,13 +2898,43 @@ if [ "$COMMAND" = "task-finish" ]; then
       '{ok:false,error:"caller owner does not match the owner recorded by task-claim - no terminal effect attempted",runId:$run,requestedBy:$owner,claimedBy:(if $stored == "" then null else $stored end)}'
     exit 0
   fi
-  if ! task_lease_fence_begin "$RUN_ID" "$OWNER" "$COMMAND"; then
-    exit 0
-  fi
-
   if [ "$RUN_VERDICT_RESUMED" != true ]; then
     NOW="$(iso_now)"
     VERDICT_DIGEST="$(verdict_digest "$(verdict_payload "$SHA" "$RUN_ID" "$VERDICT" "$NOW")")"
+  fi
+  if ! task_finish_fence_begin "$RUN_ID" "$OWNER" "$SHA" "$VERDICT" "$NOW" "$VERDICT_DIGEST" "$RUN_VERDICT_RESUMED"; then
+    exit 0
+  fi
+  NOW="$TASK_FINISH_COMPLETED_AT"
+  VERDICT_DIGEST="$TASK_FINISH_VERDICT_DIGEST"
+
+  if [ "${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}" != /workspace/workgroup ] &&
+     [ "${SMOKE_GATE_TEST_TASK_FINISH_EXIT_AFTER:-}" = before-binding ]; then
+    exit 96
+  fi
+
+  if [ "$(jq -r '.terminal != null' <<<"$FENCED_TASK_BINDING_JSON")" != true ]; then
+    TERMINAL_BINDING="$(jq -c --arg verdict "$VERDICT" --arg at "$NOW" --arg digest "$VERDICT_DIGEST" \
+      '.terminal={verdict:$verdict,completedAt:$at,verdictDigest:$digest}' <<<"$FENCED_TASK_BINDING_JSON")"
+    if ! write_task_binding "$RUN_ID" "$TERMINAL_BINDING" ||
+       [ "$(read_task_binding "$RUN_ID")" != "$TERMINAL_BINDING" ]; then
+      task_lease_fence_end
+      jq -cn --arg run "$RUN_ID" --arg path "$(task_binding_file "$RUN_ID")" \
+        '{ok:false,error:("could not commit exact shared terminal task binding at " + $path + " - lease and private slot remain held"),runId:$run,taskBindingFile:$path}'
+      exit 1
+    fi
+    FENCED_TASK_BINDING_JSON="$TERMINAL_BINDING"
+  fi
+
+  # The first durable terminal write is shared. A crash here leaves every
+  # container refusing the identity, while an exact task-finish retry rebuilds
+  # the private verdict from these immutable facts.
+  if [ "${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}" != /workspace/workgroup ] &&
+     [ "${SMOKE_GATE_TEST_TASK_FINISH_EXIT_AFTER:-}" = binding ]; then
+    exit 98
+  fi
+
+  if [ "$RUN_VERDICT_RESUMED" != true ]; then
     mkdir -p "$(run_dir "$RUN_ID")" 2>/dev/null
     RV_TMP="$(mktemp "$(run_dir "$RUN_ID")/.verdict.XXXXXX" 2>/dev/null)"
     if [ -z "$RV_TMP" ]; then
@@ -2507,11 +2967,21 @@ if [ "$COMMAND" = "task-finish" ]; then
     fi
   fi
 
-  if ! task_lease_remove_fenced "$RUN_ID"; then
+  # The test seam is accepted only off the production shared root.
+  if [ "${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}" != /workspace/workgroup ] &&
+     [ "${SMOKE_GATE_TEST_TASK_FINISH_EXIT_AFTER:-}" = verdict ]; then
+    exit 97
+  fi
+
+  if [ "$FENCED_TASK_LEASE_JSON" != null ] && ! task_lease_remove_fenced "$RUN_ID"; then
     task_lease_fence_end
     jq -cn --arg run "$RUN_ID" --arg dir "$LEASE_DIR" \
       '{ok:false,error:("could not remove the shared task lease under " + $dir + " - terminal state not committed"),runId:$run,leaseReleased:false}'
     exit 1
+  fi
+  if [ "${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}" != /workspace/workgroup ] &&
+     [ "${SMOKE_GATE_TEST_TASK_FINISH_EXIT_AFTER:-}" = lease-removal ]; then
+    exit 99
   fi
   STATE="$(jq -c --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
     '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
@@ -2520,7 +2990,9 @@ if [ "$COMMAND" = "task-finish" ]; then
   if [ -z "$tmp" ] || ! printf '%s\n' "$STATE" > "$tmp" 2>/dev/null || ! mv "$tmp" "$TASK_STATE_FILE" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null || true
     RESTORED=false
-    write_task_lease "$RUN_ID" "$FENCED_TASK_LEASE_JSON" && RESTORED=true
+    if [ "$FENCED_TASK_LEASE_JSON" != null ]; then
+      write_task_lease "$RUN_ID" "$FENCED_TASK_LEASE_JSON" && RESTORED=true
+    fi
     task_lease_fence_end
     jq -cn --arg run "$RUN_ID" --argjson restored "$RESTORED" \
       '{ok:false,error:"could not commit terminal task state - no success receipt returned and lease restoration attempted",runId:$run,leaseReleased:false,leaseRestored:$restored}'
@@ -3712,6 +4184,10 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
     exit 0
   fi
   LEASE_ERROR_FILE="$TMP_DIR/lease-error.json"
+  if ! task_binding_guard_absent_begin "$RUN_ID" poll "$W_PR" >"$LEASE_ERROR_FILE"; then
+    emit_poll_lease_failure "$(cat "$LEASE_ERROR_FILE")"
+    exit 0
+  fi
   if ! lease_lifecycle_begin "$W_PR" "$RUN_ID" "poll" >"$LEASE_ERROR_FILE"; then
     emit_poll_lease_failure "$(cat "$LEASE_ERROR_FILE")"
     exit 0
@@ -3794,6 +4270,7 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
     exit 0
   fi
   lease_fence_end
+  task_binding_lock_end
 
   jq -cn \
     --arg repo "$REPO" --arg branch "$BRANCH" --argjson pr "$W_PR" --arg runId "$RUN_ID" \

@@ -243,6 +243,178 @@ mkdir -p "$STATE_DIR"
 # because a scheduled-task runner may cap total wall clock.
 num_env LOCK_WAIT SMOKE_GATE_LOCK_WAIT_SECONDS 15
 
+# Task run identity is shared even though this gate's campaign state is
+# private. Use the same ownership root and the same per-run task lease lock as
+# smoke-pr-gate.sh; claim paths hold it until develop-state.json commits.
+SHARED_LEASE_ROOT="${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}"
+LEASE_DIR="${SMOKE_GATE_LEASE_DIR:-$SHARED_LEASE_ROOT/qa-coordinator/leases}"
+LEASE_DIR_PREPARED=false
+LEASE_DIR_ERROR=""
+TASK_BINDING_LOCK_HELD=false
+
+lease_dir_prepare() {
+  local root ancestor ancestor_real dir probe
+  if [ "$LEASE_DIR_PREPARED" = true ]; then return 0; fi
+  if [ ! -d "$SHARED_LEASE_ROOT" ]; then LEASE_DIR_ERROR="shared lease root $SHARED_LEASE_ROOT is missing"; return 1; fi
+  if ! command -v mountpoint >/dev/null 2>&1 || ! mountpoint -q "$SHARED_LEASE_ROOT"; then
+    LEASE_DIR_ERROR="shared lease root $SHARED_LEASE_ROOT is not a mounted filesystem"; return 1
+  fi
+  root="$(cd -P "$SHARED_LEASE_ROOT" 2>/dev/null && pwd -P)" || {
+    LEASE_DIR_ERROR="shared lease root $SHARED_LEASE_ROOT cannot be resolved"; return 1; }
+  case "$LEASE_DIR" in "$SHARED_LEASE_ROOT"/*) ;; *)
+    LEASE_DIR_ERROR="configured lease directory $LEASE_DIR is outside $SHARED_LEASE_ROOT"; return 1 ;; esac
+  ancestor="$LEASE_DIR"
+  while [ "$ancestor" != / ] && [ ! -e "$ancestor" ] && [ ! -L "$ancestor" ]; do ancestor="$(dirname "$ancestor")"; done
+  ancestor_real="$(cd -P "$ancestor" 2>/dev/null && pwd -P)" || {
+    LEASE_DIR_ERROR="configured lease directory has no resolvable ancestor: $ancestor"; return 1; }
+  case "$ancestor_real" in "$root"|"$root"/*) ;; *)
+    LEASE_DIR_ERROR="configured lease directory resolves through non-shared path $ancestor_real"; return 1 ;; esac
+  mkdir -p -- "$LEASE_DIR" 2>/dev/null || { LEASE_DIR_ERROR="could not create shared lease directory $LEASE_DIR"; return 1; }
+  dir="$(cd -P "$LEASE_DIR" 2>/dev/null && pwd -P)" || { LEASE_DIR_ERROR="could not resolve shared lease directory $LEASE_DIR"; return 1; }
+  case "$dir" in "$root"/*) ;; *) LEASE_DIR_ERROR="configured lease directory resolves outside shared root: $dir"; return 1 ;; esac
+  probe="$(mktemp "$dir/.lease-probe.XXXXXX" 2>/dev/null)" || { LEASE_DIR_ERROR="shared lease directory is not writable: $dir"; return 1; }
+  if ! printf 'probe\n' >"$probe" 2>/dev/null || ! rm -f "$probe" 2>/dev/null; then
+    rm -f "$probe" 2>/dev/null || true
+    LEASE_DIR_ERROR="shared lease directory cannot complete an atomic write: $dir"; return 1
+  fi
+  LEASE_DIR="$dir"
+  LEASE_DIR_PREPARED=true
+}
+
+task_binding_file() { printf '%s/task-binding-%s.json' "$LEASE_DIR" "$1"; }
+task_binding_lock_file() { printf '%s/task-lease-%s.lock' "$LEASE_DIR" "$1"; }
+task_lease_file() { printf '%s/task-lease-%s.json' "$LEASE_DIR" "$1"; }
+task_binding_run_id_ok() { printf '%s' "${1:-}" | grep -Eq '^[A-Za-z0-9._-]{1,200}$' && [ "${1:-}" != ".." ]; }
+
+read_task_binding() {
+  local run="$1" f binding field stamp
+  f="$(task_binding_file "$run")"
+  [ -e "$f" ] || { printf 'null'; return; }
+  if ! binding="$(jq -ce --arg run "$run" '
+    def iso: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
+    def terminal_ok: . == null or
+      (type == "object" and
+       (.verdict == "GO" or .verdict == "NO_GO" or .verdict == "HUMAN_DECISION" or .verdict == "BLOCKED") and
+       (.completedAt | iso) and (.verdictDigest | type == "string" and test("^[0-9a-f]{64}$")));
+    select(type == "object" and .schemaVersion == 1 and .kind == "task-binding" and .runId == $run and
+           (.deploySha | type == "string" and test("^[0-9a-f]{40}$")) and (.boundAt | iso) and (.terminal | terminal_ok))
+  ' "$f" 2>/dev/null)"; then
+    jq -cn --arg path "$f" '{malformedTaskBinding:true,path:$path}'
+    return
+  fi
+  for field in boundAt terminal.completedAt; do
+    [ "$field" = boundAt ] && stamp="$(jq -r '.boundAt' <<<"$binding")" || stamp="$(jq -r '.terminal.completedAt // empty' <<<"$binding")"
+    [ -z "$stamp" ] || [ "$(date -u -d "$stamp" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)" = "$stamp" ] || {
+      jq -cn --arg path "$f" '{malformedTaskBinding:true,path:$path}'; return; }
+  done
+  printf '%s' "$binding"
+}
+
+read_task_lease() {
+  local run="$1" f lease field stamp
+  f="$(task_lease_file "$run")"
+  if [ ! -e "$f" ]; then printf 'null'; return; fi
+  if ! lease="$(jq -ce --arg run "$run" '
+    select(type == "object" and .schemaVersion == 1 and .kind == "task" and .runId == $run and
+           (.deploySha | type == "string" and test("^[0-9a-f]{40}$")) and
+           (.owner | type == "string" and length > 0) and
+           (.claimedAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+           (.renewedAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+           (.expiresAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")))
+  ' "$f" 2>/dev/null)"; then
+    jq -cn --arg path "$f" '{malformedTaskLease:true,path:$path}'
+    return
+  fi
+  for field in claimedAt renewedAt expiresAt; do
+    stamp="$(jq -r --arg field "$field" '.[$field]' <<<"$lease")"
+    [ "$(date -u -d "$stamp" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)" = "$stamp" ] || {
+      jq -cn --arg path "$f" '{malformedTaskLease:true,path:$path}'; return; }
+  done
+  printf '%s' "$lease"
+}
+
+write_task_binding() {
+  local run="$1" value="$2" tmp
+  tmp="$(mktemp "$LEASE_DIR/.task-binding-$run.XXXXXX" 2>/dev/null)" || return 1
+  printf '%s\n' "$value" >"$tmp" 2>/dev/null && mv "$tmp" "$(task_binding_file "$run")" 2>/dev/null && return 0
+  rm -f "$tmp" 2>/dev/null || true
+  return 1
+}
+
+resolve_shared_task_binding() {
+  local run="$1" binding lease next
+  binding="$(read_task_binding "$run")"
+  lease="$(read_task_lease "$run")"
+  if jq -e '.malformedTaskBinding == true' <<<"$binding" >/dev/null 2>&1 ||
+     jq -e '.malformedTaskLease == true' <<<"$lease" >/dev/null 2>&1; then
+    jq -cn --argjson binding "$binding" --argjson lease "$lease" \
+      '{malformedSharedTaskIdentity:true,taskBinding:$binding,taskLease:$lease}'
+    return
+  fi
+  if [ "$binding" != null ] && [ "$lease" != null ] &&
+     [ "$(jq -r '.deploySha' <<<"$binding")" != "$(jq -r '.deploySha' <<<"$lease")" ]; then
+    jq -cn --argjson binding "$binding" --argjson lease "$lease" \
+      '{malformedSharedTaskIdentity:true,reason:"shared task lease conflicts with shared task binding",taskBinding:$binding,taskLease:$lease}'
+    return
+  fi
+  if [ "$binding" = null ] && [ "$lease" != null ]; then
+    next="$(jq -cn --arg run "$run" --arg sha "$(jq -r '.deploySha' <<<"$lease")" --arg at "$(jq -r '.claimedAt' <<<"$lease")" \
+      '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:$at,terminal:null}')"
+    if ! write_task_binding "$run" "$next" || [ "$(read_task_binding "$run")" != "$next" ]; then
+      jq -cn --arg path "$(task_binding_file "$run")" '{taskBindingWriteFailed:true,path:$path}'
+      return
+    fi
+    binding="$next"
+  fi
+  printf '%s' "$binding"
+}
+
+task_binding_lock_begin() {
+  local run="$1"
+  if ! task_binding_run_id_ok "$run"; then
+    jq -cn --arg run "$run" \
+      '{ok:false,error:"run id is unsafe for the shared task binding path - refusing develop claim",runId:$run}'
+    return 1
+  fi
+  if ! lease_dir_prepare; then
+    jq -cn --arg run "$run" --arg dir "$LEASE_DIR" --arg detail "$LEASE_DIR_ERROR" \
+      '{ok:false,error:("shared coordinator lease unavailable - " + $detail + "; refusing develop claim"),runId:$run,leaseDir:$dir}'
+    return 1
+  fi
+  if ! exec 7>"$(task_binding_lock_file "$run")"; then
+    jq -cn --arg run "$run" --arg dir "$LEASE_DIR" \
+      '{ok:false,error:("could not open shared task binding lock under " + $dir + " - refusing develop claim"),runId:$run,leaseDir:$dir}'
+    return 1
+  fi
+  if ! flock -w "$LOCK_WAIT" 7; then
+    jq -cn --arg run "$run" '{ok:false,retryable:true,error:"gate_lock_busy: another invocation held this run identity lock - RETRY this same command in ~10s.",runId:$run}'
+    exec 7>&-
+    return 1
+  fi
+  TASK_BINDING_LOCK_HELD=true
+}
+
+task_binding_lock_end() {
+  if [ "$TASK_BINDING_LOCK_HELD" = true ]; then flock -u 7 2>/dev/null || true; exec 7>&-; TASK_BINDING_LOCK_HELD=false; fi
+}
+
+task_binding_guard_absent_begin() {
+  local run="$1" binding
+  task_binding_lock_begin "$run" || return 1
+  binding="$(resolve_shared_task_binding "$run")"
+  if [ "$binding" != null ]; then
+    jq -cn --arg run "$run" --arg path "$(task_binding_file "$run")" --argjson binding "$binding" \
+      '{ok:false,error:(if $binding.malformedSharedTaskIdentity == true or $binding.taskBindingWriteFailed == true
+                        then "shared task identity is malformed or could not be made durable at " + $path + " - refusing develop claim"
+                        elif $binding.terminal != null
+                        then "run id already finished by a task-scoped certification run - terminal run ids are unique across the gate"
+                        else "run id remains bound to a task-scoped certification run - run ids are unique across the gate"
+                        end),runId:$run,taskBindingFile:$path,taskBinding:$binding}'
+    task_binding_lock_end
+    return 1
+  fi
+}
+
 # Losing the lock is NOT losing the slot, and the two must never look alike.
 #
 # The old shape emitted a bare `ok:false` with no `error` field, and the skill
@@ -978,9 +1150,16 @@ if [ "$COMMAND" = "claim" ]; then
     emit_lock_busy "claim-control-lock"
     exit 0
   fi
+  # Cross-container task identity lives in the shared ownership namespace.
+  # Keep its existing task-lease lock through the develop state write so a
+  # concurrent task-claim cannot pass between this check and our commit.
+  if ! task_binding_guard_absent_begin "$RUN_ID"; then
+    flock -u 8; exec 8>&-
+    exit 0
+  fi
   for _task_state_file in "$STATE_DIR"/task-*-state.json; do
     [ -e "$_task_state_file" ] || continue
-    _task_active_run_id=""
+    _task_binding="none"
     if [ "$_task_state_file" = "$STATE_DIR/task-$RUN_ID-state.json" ]; then
       # This run's OWN would-be task-scoped state. `jq … 2>/dev/null` used to
       # read a malformed or chmod-000 file here the same as "no such file" —
@@ -991,7 +1170,15 @@ if [ "$COMMAND" = "claim" ]; then
       # anything — `-s` mirrors smoke-pr-gate.sh's own reciprocal check
       # (`smoke-pr-gate.sh`'s `claim`, TASK_OTHER_FILE) — and is not refused.
       if [ -s "$_task_state_file" ] &&
-         ! _task_active_run_id="$(jq -er '.activeRunId // ""' "$_task_state_file" 2>/dev/null)"; then
+         ! _task_binding="$(jq -er --arg run "$RUN_ID" '
+           if type != "object" then error("not a task state object")
+           elif (.activeRunId // "") == $run then "active"
+           elif (.completedRunId // "") == $run then "completed"
+           elif (.activeRunId // null) == null and (.completedRunId // null) == null and
+                ((.activeSha // null) | type == "string" and test("^[0-9a-f]{40}$")) then "released"
+           else "none"
+           end
+         ' "$_task_state_file" 2>/dev/null)"; then
         jq -cn --arg run "$RUN_ID" --arg path "$_task_state_file" \
           '{ok:false,error:"this run id'"'"'s task-scoped state exists but cannot be read — refusing; run ids must be unique across the gate",runId:$run,taskStateFile:$path}'
         flock -u 8; exec 8>&-
@@ -1002,11 +1189,21 @@ if [ "$COMMAND" = "claim" ]; then
       # into both the filename and `.activeRunId`, so this file can never
       # legitimately record OUR run id — a bad file here must never block
       # THIS claim (another run's corrupt state is not our problem).
-      _task_active_run_id="$(jq -r '.activeRunId // empty' "$_task_state_file" 2>/dev/null)"
+      _task_binding="$(jq -r --arg run "$RUN_ID" '
+        if (.activeRunId // "") == $run then "active"
+        elif (.completedRunId // "") == $run then "completed"
+        else "none"
+        end
+      ' "$_task_state_file" 2>/dev/null || printf 'none')"
     fi
-    if [ "$_task_active_run_id" = "$RUN_ID" ]; then
-      jq -cn --arg run "$RUN_ID" --arg path "$_task_state_file" \
-        '{ok:false,error:"run id already claimed by a task-scoped certification run — run ids must be unique across the gate",runId:$run,taskStateFile:$path}'
+    if [ "$_task_binding" != none ]; then
+      jq -cn --arg run "$RUN_ID" --arg path "$_task_state_file" --arg binding "$_task_binding" \
+        '{ok:false,error:(if $binding == "completed"
+                          then "run id already finished by a task-scoped certification run — terminal run ids must be unique across the gate"
+                          elif $binding == "released"
+                          then "run id remains bound to a released task-scoped certification run — run ids must be unique across the gate"
+                          else "run id already claimed by a task-scoped certification run — run ids must be unique across the gate"
+                          end),runId:$run,taskStateFile:$path,taskBinding:$binding}'
       flock -u 8; exec 8>&-
       exit 0
     fi
@@ -1056,6 +1253,7 @@ if [ "$COMMAND" = "claim" ]; then
   # to disk; nothing below touches task-*-state.json or develop-state.json's
   # activeRunId, so release it here rather than holding it for the rest of
   # this command's advisory-notice and slot-file work.
+  task_binding_lock_end
   flock -u 8; exec 8>&-
   # A campaign that wants the build to keep moving (its own browser lanes are
   # blocked, a fix must land) opts out; the watcher is still suppressed either
@@ -2065,6 +2263,15 @@ while [ "$RUN_ID" = "$(jq -r '.activeRunId // empty' <<<"$STATE")" ] ||
   RUN_STAMP_EPOCH="$(( RUN_STAMP_EPOCH + 1 ))"
   RUN_ID="${SMOKE_GATE_RUN_PREFIX:-smoke}-${SOURCE_SHA:0:12}-$(date -u -d "@$RUN_STAMP_EPOCH" +%Y%m%dT%H%M%SZ)"
 done
+TASK_BINDING_ERROR="$(mktemp "$STATE_DIR/.task-binding-error.XXXXXX")"
+if ! task_binding_guard_absent_begin "$RUN_ID" >"$TASK_BINDING_ERROR"; then
+  TASK_BINDING_DETAIL="$(cat "$TASK_BINDING_ERROR" 2>/dev/null || printf '{"ok":false,"error":"shared task binding check failed without detail"}')"
+  rm -f "$TASK_BINDING_ERROR" 2>/dev/null || true
+  jq -cn --argjson detail "$TASK_BINDING_DETAIL" \
+    '{ok:false,wakeAgent:true,data:{schemaVersion:1,trigger:"shared_task_binding_unavailable",detail:$detail}}'
+  exit 0
+fi
+rm -f "$TASK_BINDING_ERROR" 2>/dev/null || true
 STATE="$(jq -c \
   --arg sha "$SOURCE_SHA" \
   --arg now "$NOW" \
@@ -2077,6 +2284,7 @@ STATE="$(jq -c \
    .candidateSha=null |
    .candidateFirstSeen=null' <<<"$STATE")"
 write_state "$STATE"
+task_binding_lock_end
 write_active_file "$RUN_ID" "$SOURCE_SHA" "$NOW" ""
 freeze_status "QA smoke run active on $BRANCH (${SOURCE_SHA:0:12}) — merging now voids it. Advisory only; you may merge."
 
