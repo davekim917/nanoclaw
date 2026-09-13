@@ -1009,10 +1009,19 @@ attribute — the app may expose none of those, leaving `buildSha` empty. It
 reads caller-provided `<run-dir>/contact-sheet/shots.json` (capped at 8; the
 script itself is generic, no product knowledge) and writes `sheet.png` +
 `manifest.json`. A failed screen is `failed: <reason>` plus a placeholder
-tile, never dropped. Post `sheet.png` with `send_file` right after kickoff
-and link it from the verdict. A deployment may also run a fresh, read-only
-design critic on the shot PNGs — shadow only, posted but never gating the
-verdict.
+tile, never dropped.
+
+Post a campaign contact sheet as **two ordered sends to the same named channel
+destination**: first send the text-only kickoff root with `send_message`, then
+call `send_file` for `sheet.png` with no caption. Do not combine the kickoff
+text and sheet in one `send_file` call. Slack uploads files before it posts a
+caption; before the root exists that upload has no `thread_ts`, so it becomes
+a second channel-root message. Delivery processes the two outbound rows in
+order and attaches the second one under the fresh root's thread. A scheduled
+campaign must reserve exactly one additional chat slot for that reply; it is
+not permission for progress narration. Link the sheet from the verdict. A
+deployment may also run a fresh, read-only design critic on the shot PNGs —
+shadow only, posted but never gating the verdict.
 
 **Every screen navigates in its own fresh `agent-browser` session** (never
 one shared session for the whole sheet), with the same saved auth state
