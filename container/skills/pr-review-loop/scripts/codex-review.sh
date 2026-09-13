@@ -17,7 +17,7 @@
 #   codex-review.sh ci-wait --head <sha> [--timeout <sec>]
 #                                             # wait for CI on exactly that head: 0 green, 29 red, 30 no run registered,
 #                                             # 31 the PR conflicts with its base, 11 timeout, 12 head moved
-#   codex-review.sh scope                     # risk-scoped repos: JSON {repo,pr,head,mode,verdict,labels,reason} for the current head
+#   codex-review.sh scope                     # risk-scoped repos: JSON {repo,pr,head,mode,verdict,labels,reason[,reviewClaims]} for the current head
 #   codex-review.sh request                   # risk-scoped repos: post `@codex review` for the current head when every rule allows it
 #   codex-review.sh merge-check [--head <sha>]
 #                                             # exit 0 only when merging exactly that head is allowed
@@ -506,8 +506,19 @@ RISK_LABEL_WORKFLOW='Risk label'
 CI_EXCLUDED_CONTEXTS='["Release policy","Release approval"]'
 # The request marker, hidden in the rendered comment. It is how `request`
 # dedupes per head and counts rounds, and how `merge-check` learns when THIS
-# head's review was asked for.
+# head's review was asked for. Its existing creation timestamp is also the
+# connector review's advisory claim start, so this marker stays unchanged.
 REQUEST_MARKER_RE='(^|\n)<!-- pr-review-loop:request head=(?<head>[0-9a-f]{40}) round=(?<round>[0-9]+) -->'
+# A local review must claim itself deliberately. GitHub comment authors are
+# not enough: this installation uses one account for several agent sessions,
+# so `owner` is a required bounded session/operator label. Comment claims are
+# advisory only -- they never authorize, refuse, or otherwise gate a merge.
+CLAIM_MARKER_RE='(^|\n)<!-- pr-review-loop:claim id=(?<id>[A-Za-z0-9._:-]{1,96}) repo=(?<repo>[^[:space:]]+) pr=(?<pr>[1-9][0-9]*) head=(?<head>[0-9a-f]{40}) owner=(?<owner>[A-Za-z0-9._:-]{1,64}) started=(?<started>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z) expires=(?<expires>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z) -->'
+# A receipt retires only the particular claim and owner it names. Another
+# review's same-head receipt must not hide a separate ongoing review.
+CLAIM_COMPLETE_MARKER_RE='(^|\n)<!-- pr-review-loop:claim-complete id=(?<id>[A-Za-z0-9._:-]{1,96}) owner=(?<owner>[A-Za-z0-9._:-]{1,64}) head=(?<head>[0-9a-f]{40}) -->'
+REVIEW_CLAIM_DEFAULT_TTL_MINUTES=45
+REVIEW_CLAIM_MAX_TTL_MINUTES=120
 # A substitute review's receipt (docs/review-policy.md, "Review availability").
 # When Codex cannot review, the latest receipt for exactly this head decides
 # instead. Only an author with write access counts: a receipt unlocks a merge,
@@ -856,6 +867,132 @@ request_markers() {
     | sort_by(.at)'
 }
 
+# Live review claims for one exact PR head. This is coordination visibility,
+# not review evidence: invalid or unreadable comments disappear from this
+# advisory view, and a failed read must never change a gate decision.
+live_review_claims() {
+  local head="$1" now="$2" comment_pages review_pages reaction_pages
+  comment_pages=$(paginate_connection comments comments_page) || return 1
+  review_pages=$(paginate_connection reviews reviews_page) || return 1
+  reaction_pages=$(paginate_connection reactions reactions_page) || return 1
+  printf '%s\n%s\n%s\n' "$comment_pages" "$review_pages" "$reaction_pages" | jq -cs \
+    --arg claimRe "$CLAIM_MARKER_RE" \
+    --arg requestRe "$REQUEST_MARKER_RE" \
+    --arg completeRe "$CLAIM_COMPLETE_MARKER_RE" \
+    --arg receiptRe "$RECEIPT_MARKER_RE" \
+    --arg repo "$REPO" --arg pr "$PR" --arg head "$head" --arg now "$now" \
+    --argjson defaultTtl "$REVIEW_CLAIM_DEFAULT_TTL_MINUTES" \
+    --argjson maxTtl "$REVIEW_CLAIM_MAX_TTL_MINUTES" '
+      def epoch: try fromdateiso8601 catch null;
+      ($now | epoch) as $nowEpoch
+      | if $nowEpoch == null then error("invalid current claim time") else . end
+      | [ .[] | .data.repository.pullRequest.comments.nodes[]? ] as $comments
+      | [ .[] | .data.repository.pullRequest.reviews.nodes[]? ] as $reviews
+      | [ .[] | .data.repository.pullRequest.reactions.nodes[]? ] as $reactions
+      | (
+          [ $comments[]
+            | (.body // "") as $body
+            | ((.author.login // "unknown") | tostring) as $actor
+            | (try ($body | capture($claimRe)) catch empty)
+            | select(.repo == $repo and .pr == $pr)
+            | {id, owner, head, started, expires, actor: $actor, kind: "explicit"}
+          ]
+          +
+          [ $comments[]
+            | (.body // "") as $body
+            | (.createdAt // "") as $at
+            | ((.author.login // "unknown") | tostring) as $actor
+            | (try ($body | capture($requestRe)) catch empty)
+            | $at as $started
+            | (try (($started | fromdateiso8601 + ($defaultTtl * 60)) | strftime("%Y-%m-%dT%H:%M:%SZ")) catch "") as $expires
+            | select($expires != "")
+            | {id: ("connector-" + .round + "-" + ($started | gsub("[^0-9]"; ""))),
+               owner: "connector", head, started: $started, expires: $expires, actor: $actor, kind: "connector"}
+          ]
+        ) as $claims
+      | [ $comments[]
+          | (.body // "") as $body
+          | (.createdAt // "") as $at
+          | (try ($body | capture($completeRe)) catch empty)
+          | . as $complete
+          | (try ($body | capture($receiptRe)) catch empty) as $receipt
+          | select($receipt.head == $complete.head)
+          | ($at | epoch) as $atEpoch
+          | select($atEpoch != null)
+          | {id, owner, head, atEpoch: $atEpoch}
+        ] as $completed
+      | [ $claims[]
+          | . as $claim
+          | ($claim.started | epoch) as $startedEpoch
+          | ($claim.expires | epoch) as $expiresEpoch
+          | select($claim.head == $head)
+          | select($startedEpoch != null and $expiresEpoch != null)
+          | select($startedEpoch <= $nowEpoch and $expiresEpoch > $startedEpoch)
+          | select(
+              ($expiresEpoch - $startedEpoch) <=
+                ((if $claim.kind == "connector" then $defaultTtl else $maxTtl end) * 60)
+              and $expiresEpoch > $nowEpoch
+            )
+          | . as $claim
+          | select(any($completed[]?;
+              .id == $claim.id and .owner == $claim.owner and .head == $claim.head and .atEpoch >= $startedEpoch
+            ) | not)
+          | select(
+              if $claim.kind == "connector" then
+                (
+                  any($reviews[]?;
+                    ((.author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
+                    and (.commit.oid // "") == $claim.head
+                    and ((.submittedAt | epoch) as $submittedEpoch | $submittedEpoch != null and $submittedEpoch > $startedEpoch)
+                  )
+                  or any($reactions[]?;
+                    ((.user.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
+                    and .content == "THUMBS_UP"
+                    and ((.createdAt | epoch) as $createdEpoch | $createdEpoch != null and $createdEpoch > $startedEpoch)
+                  )
+                ) | not
+              else true end
+            )
+        ]
+      | sort_by(.started, .id)'
+}
+
+current_live_review_claim_for_owner() {
+  local claims
+  claims=$(live_review_claims "$1" "$2") || return 1
+  printf '%s' "$claims" | jq -cer --arg owner "$3" '[ .[] | select(.owner == $owner) ] | last // empty'
+}
+
+review_claim_advisory() {
+  printf '%s' "$1" | jq -er --arg repo "$REPO" --arg pr "$PR" '
+    "review_claim=advisory repo=\($repo) pr=\($pr) head=\(.head) id=\(.id) owner=\(.owner) actor=\(.actor) started=\(.started) expires=\(.expires) kind=\(.kind)"'
+}
+
+review_claim_advisories() {
+  local claims="$1" prefix="${2:-}" suffix="${3:-}" claim
+  printf '%s' "$claims" | jq -e 'type == "array"' >/dev/null || return 1
+  while IFS= read -r claim; do
+    printf '%s%s%s\n' "$prefix" "$(review_claim_advisory "$claim")" "$suffix"
+  done < <(printf '%s' "$claims" | jq -c '.[]')
+}
+
+claim_now() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+claim_marker_fields() {
+  local owner="$1" ttl="$2" compact
+  CLAIM_STARTED=$(claim_now) || return 1
+  CLAIM_EXPIRES=$(date -u -d "$CLAIM_STARTED + $ttl minutes" +%Y-%m-%dT%H:%M:%SZ) || return 1
+  compact="${CLAIM_STARTED//[^0-9]/}"
+  CLAIM_ID="$owner-$compact"
+}
+
+explicit_claim_marker() {
+  printf '<!-- pr-review-loop:claim id=%s repo=%s pr=%s head=%s owner=%s started=%s expires=%s -->' \
+    "$CLAIM_ID" "$REPO" "$PR" "$1" "$2" "$CLAIM_STARTED" "$CLAIM_EXPIRES"
+}
+
 # The comments connection again, with the author's relationship to the repo,
 # which only receipts need.
 receipt_comments_page() {
@@ -1128,7 +1265,7 @@ ci_verdict() {
 # never read a defer as a pass. Its base is re-read first, since a base that
 # moved may have opted in since.
 merge_check_main() {
-  local want="" pr_text fix_link ci receipt_raw receipt receipt_reviewer notes markers since observation
+  local want="" pr_text fix_link ci receipt_raw receipt receipt_reviewer notes markers since observation claim_now_iso claims
   while [ $# -gt 0 ]; do
     case "$1" in
       --head)
@@ -1146,6 +1283,13 @@ merge_check_main() {
   if [ -n "$want" ] && [[ "$SCOPE_HEAD" != "$want"* ]]; then
     echo "merge=refused head=$SCOPE_HEAD: the PR head is not $want" >&2
     exit 24
+  fi
+  # A claim is only coordination evidence. Its read is best-effort and cannot
+  # alter this command's exit code or merge decision.
+  claim_now_iso=$(claim_now) || claim_now_iso=""
+  if [ -n "$claim_now_iso" ]; then
+    claims=$(live_review_claims "$SCOPE_HEAD" "$claim_now_iso") || claims="[]"
+    review_claim_advisories "$claims" >&2 || true
   fi
   # A fix PR names the PR it fixes, or says `none` (fix_link_state). Read at
   # merge time: the title and body can both change after the PR opens.
@@ -1433,7 +1577,7 @@ ci_wait_main() {
   done
 }
 
-case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci-wait|scope|request|merge-check|merge|audit|receipt}" in
+case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci-wait|scope|request|claim|merge-check|merge|audit|receipt}" in
   open)
     # thread_id  comment_id  file:line  outdated?  severity  title
     rounds_banner "$(rounds_count)"
@@ -1693,9 +1837,23 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
   scope)
     # The risk-scoped verdict for the PR's current head, as one JSON line.
     scope_eval || exit 1
-    jq -cn --arg repo "$REPO" --arg pr "$PR" --arg head "$SCOPE_HEAD" --arg mode "$SCOPE_MODE" \
-      --arg verdict "$SCOPE_VERDICT" --argjson labels "$SCOPE_LABELS" --arg reason "$SCOPE_REASON" \
-      '{repo: $repo, pr: ($pr | tonumber), head: $head, mode: $mode, verdict: $verdict, labels: $labels, reason: $reason}'
+    claim_now_iso=""
+    claims="[]"
+    if [ "$SCOPE_MODE" = risk-scoped ]; then
+      claim_now_iso=$(claim_now) || claim_now_iso=""
+      if [ -n "$claim_now_iso" ]; then
+        claims=$(live_review_claims "$SCOPE_HEAD" "$claim_now_iso") || claims="[]"
+      fi
+    fi
+    if printf '%s' "$claims" | jq -e 'length > 0' >/dev/null 2>&1; then
+      jq -cn --arg repo "$REPO" --arg pr "$PR" --arg head "$SCOPE_HEAD" --arg mode "$SCOPE_MODE" \
+        --arg verdict "$SCOPE_VERDICT" --argjson labels "$SCOPE_LABELS" --arg reason "$SCOPE_REASON" --argjson claims "$claims" \
+        '{repo: $repo, pr: ($pr | tonumber), head: $head, mode: $mode, verdict: $verdict, labels: $labels, reason: $reason, reviewClaims: $claims}'
+    else
+      jq -cn --arg repo "$REPO" --arg pr "$PR" --arg head "$SCOPE_HEAD" --arg mode "$SCOPE_MODE" \
+        --arg verdict "$SCOPE_VERDICT" --argjson labels "$SCOPE_LABELS" --arg reason "$SCOPE_REASON" \
+        '{repo: $repo, pr: ($pr | tonumber), head: $head, mode: $mode, verdict: $verdict, labels: $labels, reason: $reason}'
+    fi
     ;;
   request)
     # The only sanctioned way to ask for a round, and only in a risk-scoped
@@ -1732,14 +1890,69 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
       } >&2
       exit 23
     fi
+    round=$((requested + 1))
+    # See a local review before burning this PR-wide round budget, but never
+    # refuse: a crashed session cannot be allowed to strand the PR.
+    claim_now_iso=$(claim_now) || claim_now_iso=""
+    claims="[]"
+    if [ -n "$claim_now_iso" ]; then
+      claims=$(live_review_claims "$SCOPE_HEAD" "$claim_now_iso") || claims="[]"
+    fi
+    review_claim_advisories "$claims" "warning: " "; this request spends round $round/$cap" >&2 || true
     # A request starts a round, so the churn gate judges it as it judges a push:
     # committed history at the head the reviewer will read. Exit 3 propagates.
     run_gate --committed-only --head "$SCOPE_HEAD"
-    round=$((requested + 1))
     url=$(gh pr comment "$PR" --repo "$REPO" --body "@codex review
 
 <!-- pr-review-loop:request head=$SCOPE_HEAD round=$round -->")
     echo "requested: round=$round/$cap head=$SCOPE_HEAD $url"
+    ;;
+  claim)
+    # A reviewer starts a local/adversarial review by creating one bounded
+    # advisory marker. The shared GitHub account cannot identify that session,
+    # hence the explicit owner label.
+    shift
+    head="" owner="" ttl="$REVIEW_CLAIM_DEFAULT_TTL_MINUTES"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --head)
+          [ $# -ge 2 ] || { echo "claim: --head needs a full sha" >&2; exit 2; }
+          head="$2"; shift 2 ;;
+        --owner)
+          [ $# -ge 2 ] || { echo "claim: --owner needs a session label" >&2; exit 2; }
+          owner="$2"; shift 2 ;;
+        --ttl-minutes)
+          [ $# -ge 2 ] || { echo "claim: --ttl-minutes needs 1-$REVIEW_CLAIM_MAX_TTL_MINUTES" >&2; exit 2; }
+          ttl="$2"; shift 2 ;;
+        *) echo "claim: unknown argument $1" >&2; exit 2 ;;
+      esac
+    done
+    if ! [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "claim: --head must be the full 40-character SHA" >&2
+      exit 2
+    fi
+    if ! [[ "$owner" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$ ]]; then
+      echo "claim: --owner must be a 1-64 character session label ([A-Za-z0-9._:-])" >&2
+      exit 2
+    fi
+    if ! [[ "$ttl" =~ ^[1-9][0-9]*$ ]] || [ "$ttl" -gt "$REVIEW_CLAIM_MAX_TTL_MINUTES" ]; then
+      echo "claim: --ttl-minutes must be a whole number from 1 to $REVIEW_CLAIM_MAX_TTL_MINUTES" >&2
+      exit 2
+    fi
+    scope_eval || exit 1
+    if [ "$head" != "$SCOPE_HEAD" ]; then
+      echo "claim: --head $head is not the current PR head $SCOPE_HEAD" >&2
+      exit 2
+    fi
+    claim_now_iso=$(claim_now) || exit 1
+    claim=$(current_live_review_claim_for_owner "$SCOPE_HEAD" "$claim_now_iso" "$owner") || claim=""
+    if [ -n "$claim" ]; then
+      echo "claim: $(review_claim_advisory "$claim"); this owner already has a live marker"
+      exit 0
+    fi
+    claim_marker_fields "$owner" "$ttl" || exit 1
+    url=$(gh pr comment "$PR" --repo "$REPO" --body "$(explicit_claim_marker "$head" "$owner")")
+    echo "claim: id=$CLAIM_ID owner=$owner head=$head started=$CLAIM_STARTED expires=$CLAIM_EXPIRES $url"
     ;;
   merge-check)
     shift
@@ -2000,7 +2213,7 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
     # complete-diff and relevant-file scope and every finding with its
     # disposition. `merge-check` reads the marker this writes.
     shift
-    head="" outcome="" reviewer="" body_file=""
+    head="" outcome="" reviewer="" body_file="" claim_id="" claim_owner=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --head)
@@ -2009,6 +2222,12 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
         --outcome) outcome="${2:?--outcome needs approve or changes}"; shift 2 ;;
         --reviewer) reviewer="${2:?--reviewer needs the model and runtime}"; shift 2 ;;
         --body-file) body_file="${2:?--body-file needs a file}"; shift 2 ;;
+        --claim)
+          [ $# -ge 2 ] || { echo "receipt: --claim needs a claim id" >&2; exit 2; }
+          claim_id="$2"; shift 2 ;;
+        --claim-owner)
+          [ $# -ge 2 ] || { echo "receipt: --claim-owner needs the claim owner label" >&2; exit 2; }
+          claim_owner="$2"; shift 2 ;;
         *) echo "receipt: unknown argument $1" >&2; exit 2 ;;
       esac
     done
@@ -2022,6 +2241,18 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
     esac
     if [ -z "$reviewer" ] || [ -z "$body_file" ] || [ ! -s "$body_file" ]; then
       echo "receipt: needs --reviewer and a non-empty --body-file (scope, then every finding with its disposition)" >&2
+      exit 2
+    fi
+    if { [ -n "$claim_id" ] && [ -z "$claim_owner" ]; } || { [ -z "$claim_id" ] && [ -n "$claim_owner" ]; }; then
+      echo "receipt: --claim and --claim-owner must be supplied together" >&2
+      exit 2
+    fi
+    if [ -n "$claim_id" ] && ! [[ "$claim_id" =~ ^[A-Za-z0-9._:-]{1,96}$ ]]; then
+      echo "receipt: --claim must be a 1-96 character claim id ([A-Za-z0-9._:-])" >&2
+      exit 2
+    fi
+    if [ -n "$claim_owner" ] && ! [[ "$claim_owner" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$ ]]; then
+      echo "receipt: --claim-owner must be a 1-64 character session label ([A-Za-z0-9._:-])" >&2
       exit 2
     fi
     # merge-check re-reads --reviewer back out of the posted comment body via a
@@ -2052,6 +2283,11 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
         exit 2
         ;;
     esac
+    claim_completion=""
+    if [ -n "$claim_id" ]; then
+      claim_completion="
+<!-- pr-review-loop:claim-complete id=$claim_id owner=$claim_owner head=$head -->"
+    fi
     url=$(gh pr comment "$PR" --repo "$REPO" --body "### Substitute review receipt
 
 - **Head:** \`$head\`
@@ -2060,7 +2296,7 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
 
 $body
 
-<!-- pr-review-loop:substitute-receipt head=$head outcome=$outcome -->")
+<!-- pr-review-loop:substitute-receipt head=$head outcome=$outcome -->$claim_completion")
     echo "receipt: outcome=$outcome head=$head $url"
     ;;
   *) echo "unknown command: $1" >&2; exit 2 ;;
