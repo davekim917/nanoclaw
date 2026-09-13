@@ -1,7 +1,7 @@
 /**
  * Drift tripwire for container/skills/pr-review-loop/reviewer-models.txt: it is
- * generated from the tier config (container/agents/worker-{high,frontier}.md
- * `model:` frontmatter and CODEX_WORKER_TIERS), not hand-maintained. If a tier
+ * generated from the frontier config (container/agents/worker-frontier.md
+ * `model:` frontmatter and CODEX_WORKER_MODELS), not hand-maintained. If a tier
  * model changes without regenerating the file, the merge gate's reviewer
  * allowlist silently goes stale — this test fails the same way on the next
  * test run instead.
@@ -16,15 +16,11 @@
 import fs from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
-import {
-  computeReviewerModelIds,
-  REVIEWER_MODELS_OUTPUT_PATH,
-  renderReviewerModelsFile,
-} from './reviewer-models.js';
+import { computeReviewerModelIds, REVIEWER_MODELS_OUTPUT_PATH, renderReviewerModelsFile } from './reviewer-models.js';
 
 const REGEN_HINT = 'pnpm run reviewer-models -- --write';
 
-describe('reviewer-models.txt matches the tier config', () => {
+describe('reviewer-models.txt matches the frontier config', () => {
   it('the generated file is exactly what computeReviewerModelIds produces', () => {
     const ids = computeReviewerModelIds();
     const expected = renderReviewerModelsFile(ids);

@@ -102,6 +102,7 @@ const CONTAINER_CODEX_CONFIG_BASE = [
   'multi_agent = true',
   '',
   '[agents]',
+  'default_subagent_reasoning_effort = "medium"',
   'max_concurrent_threads_per_session = 15',
   '',
   ...['/workspace/agent', '/workspace/workgroup', '/workspace/worktrees', '/tmp'].flatMap((proj) => [

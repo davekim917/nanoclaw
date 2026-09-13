@@ -8,9 +8,9 @@ description: Run evidence-backed frontend and full-stack smoke testing against a
 Treat a smoke run as a bounded investigation of one immutable build, not an
 open-ended swarm. The result is a reproducible verdict with evidence, explicit
 gaps, and verified fixes when fix authority was granted. The default deployment
-uses two separately branded frontier parents: a **coordinator** that owns
-coverage and the verdict, and a **challenger** that independently tries to
-prove the result wrong. Their concrete identities — agent names, QA channel,
+uses two separately branded QA sides: a **coordinator** that publishes the
+sole verdict and a **challenger** that independently tries to prove it wrong.
+Each outer agent delegates substantive QA to its own retained frontier owner. Their concrete identities — agent names, QA channel,
 repo, environment, credential locations, and the coverage floor (§2) — are
 deployment configuration and live in the deploying group's standing
 instructions, never in this skill.
@@ -46,21 +46,72 @@ front of a headless Codex worker, or a Codex wrapper in front of a Claude worker
 
 | Role | Default runtime | Responsibility |
 |---|---|---|
-| Coordinator parent | Claude Opus 5, high effort | Visible run controller. Freezes the build, owns the coverage manifest, dispatches native Claude workers, reconciles evidence, and publishes the one consolidated verdict. |
-| Challenger parent | GPT-5.6 Sol, high effort | Visible independent challenger. Dispatches native Codex workers, attempts to falsify coverage and findings, and returns `CLEAR`, `DISSENT`, or additional evidence before the coordinator synthesizes. |
-| `qa-smoke-worker` under the coordinator | Claude Sonnet 5, xhigh effort | Executes bounded manifest slices and records evidence without seeing other workers' conclusions. |
-| `qa-smoke-worker` under the challenger | GPT-5.6 Luna, max effort | Independently replays and attacks claims, with multimodal browser evidence when applicable. |
+| Coordinator outer agent | Claude Sonnet 5, xhigh effort | Routes inputs, holds the run's gate authority, and publishes the retained owner's one consolidated verdict after the evidence barrier. |
+| Challenger outer agent | GPT-5.6 Terra, xhigh effort | Routes an independent assignment, checks the disposition barrier, and publishes its owner's one challenge reply. |
+| Retained `qa-smoke-worker` on Claude | Claude Fable 5.1, medium effort | Owns its assigned side's investigation, coverage, execution, findings, severity, and preliminary/disposition/synthesis. |
+| Retained `qa-smoke-worker` on Codex | GPT-6 Astra, medium effort | Owns the same responsibilities in a separate provider-native context. |
 
-The same role name intentionally resolves to a provider-native definition in
-each runtime. The coordinator asks the challenger for an independent pass; the
-challenger owns its native Codex worker tree. The coordinator never directly
-launches Codex through `worker-codex`.
+The same role name resolves to its provider-native definition. Use one retained
+technical owner per side and cohesive assignment; owners execute tools directly
+and never re-delegate. Keep the independent QA pair, not a worker tier ladder.
+The outer agents do brief logistical/mechanical work, not substantive source
+analysis or verdict adjudication. Throughout this skill, a side's testing and
+judgment duties belong to its retained owner; chat, routing and final gate
+publication remain the outer agent's responsibility. Technical owners may write
+their side's declared evidence and conclusions under the existing ownership
+rules. They do not send chat, file issues, mutate labels or finish the gate.
+The coordinator never launches the other provider through a wrapper; ask the
+paired challenger for the independent cross-family pass instead.
 
-Every worker records its conclusion before reading another worker's verdict.
-The coordinator and challenger then record their parent-level conclusions
-independently before cross-synthesis. Worker count, model confidence, and
-parent agreement are not evidence; reproductions, requests, source paths,
-tests, and immutable artifacts are evidence.
+**Dispatch and effort are runtime settings.** Start the owner with the installed
+native QA profile, or with the installed Bootstrap `frontier-worker.mjs` helper
+when explicit CLI effort/resume is needed. Read the installed `orchestrate`
+skill to resolve its helper path. Give a helper-started owner the full installed
+QA role body, this skill, standing instructions, exact scope and authority in
+its stdin brief; the helper does not select the QA role automatically.
+Use `--runtime claude --effort medium --model 'claude-fable-5-1[1m]'` or
+`--runtime codex --effort medium --model gpt-6-astra`, plus the actual working
+directory via `--cwd`. An explicit effort change uses the helper's `--effort`
+on the same CLI session's `--resume`, or a verified supported native runtime
+field. Claude native Agent has no effort input; use the installed medium
+profile or the helper's child-scoped `CLAUDE_CODE_EFFORT_LEVEL`. Do not set a
+fleet-wide environment override, describe effort only in prose, or silently
+switch models. The helper applies these flags in
+`/workspace/plugins/bootstrap/plugins/workflow-agents/scripts/frontier-worker.mjs`
+(`invocation`); it adds no permission bypass.
+
+Record default, requested and actual model/effort separately in the existing
+run record, plus transport, parent session, runtime home, owner handle, and
+assigned scope. Mark unavailable runtime metadata unverified. Retain the same
+owner for corrections and remaining work. Native handles resume only through
+the spawning parent; the helper accepts only its own CLI UUID with the same
+runtime home and accessible history. A matching home path in another container
+is insufficient: NanoClaw mounts per-session Claude project history
+(`src/session-claude-mounts.ts:56`), and provider session state may be isolated.
+Do not copy credentials or histories across those boundaries.
+
+When the task deliberately transfers from a scheduled session to a thread
+whose runtime cannot resume the owner, make an explicit handoff in the run
+record: old owner, why resume is unavailable, preserved preliminary/evidence,
+and exact remaining work. Start one replacement frontier owner for that
+remainder; do not restart completed lanes or pretend its inherited evidence is
+new. A failed resume is not authority to silently replay or switch transports.
+Other owner replacements require the same explicit, evidence-backed recovery
+decision and the existing run-ownership rules. No parallel duplicate owner.
+
+Each side starts with a context independent of the opposite side and of any
+artifact author/fixer. It records its own preliminary or disposition before
+reading the other's conclusion. Checks performed by one owner remain one
+source of evidence even when split into several manifest lanes; do not claim
+those lanes independently corroborate one another. The paired owner provides
+the fresh independent challenge, including purported passes. Record and
+disclose insufficient cross-family independence when actual owner models share
+a family on fallback. A nominal coordinator/challenger pairing is not proof
+of model diversity. Preserve independent-context results and apply the existing
+proof/verdict contract or its specifically recorded same-family exception;
+never silently certify full cross-family review. Worker count,
+model confidence and agreement are not evidence; reproducible checks and
+immutable artifacts are.
 
 Independence must survive a container or thread handoff. Conversation state is
 not the handoff surface.
@@ -212,10 +263,10 @@ its marker at whatever generation the contract carries when it writes — so bum
 *before* re-briefing, never after. The refusal above is what forces that
 ordering; it is not a substitute for it.
 
-The coordinator then runs `scripts/smoke-evidence-barrier.sh <run-dir> lanes`
-and writes `coordinator/preliminary.md`. The challenger writes
-`challenger/disposition.md` first. Neither parent reads the other file before
-its own conclusion is durable.
+The coordinator runs `scripts/smoke-evidence-barrier.sh <run-dir> lanes`
+and obtains its retained owner's `coordinator/preliminary.md`. The challenger
+owner writes `challenger/disposition.md` first. Neither side reads the other
+file before its own conclusion is durable.
 
 **The run thread is a contamination channel, and it is gated.** A disposition
 posted with a mention injects its full contents into the other parent's context
@@ -844,18 +895,18 @@ the browser lane.
 
 ## 3. Run the provider-native lanes
 
-Use different model families for diversity. The coordinator assigns bounded
-coverage slices to native Sonnet workers — one lane for the diff-derived
-manifest (backend and specification verifier), one for stated intent
-(acceptance verifier). The challenger assigns independent replays and attacks
-to native Luna workers (UI adversary). More workers usually add coordination
-cost before they add signal, so every assignment must name non-overlapping
-manifest IDs.
+Use different model families for diversity. The coordinator's retained frontier
+owner executes the diff-derived backend/specification lane and the separate
+stated-intent acceptance lane, keeping their manifest IDs and evidence distinct.
+The challenger's fresh retained frontier owner performs independent replays and
+attacks, including the UI adversary lane. A lane is a coverage contract, not a
+requirement to spawn a new worker. Retain the same owner for its side's work;
+never collapse the required lanes or their evidence to reduce worker count.
 
 ### UI adversary
 
-The challenger normally assigns this lane to a native GPT-5.6 Luna worker at
-max effort. Use the `agent-browser` skill.
+The challenger's retained frontier owner executes this lane at medium effort
+by default. Use the `agent-browser` skill.
 
 - Start from a clean browser state, then repeat important paths with saved auth.
 - Own the browser authentication lease. If another lane owns it, do not retry
@@ -981,8 +1032,8 @@ for you.
 
 ### Backend and specification verifier
 
-The coordinator normally assigns this lane to a native Claude Sonnet 5 worker
-at xhigh effort.
+The coordinator's retained frontier owner executes this lane at medium effort
+by default.
 
 - Trace the changed source and its production-relevant call path.
 - **Read the CI check-run result for the frozen SHA before re-running a suite
@@ -1015,8 +1066,8 @@ at xhigh effort.
 
 ### Acceptance verifier
 
-The coordinator normally assigns this lane to a native Claude Sonnet 5 worker
-at xhigh effort, the same tier as the backend lane. Declare it in the contract
+The coordinator's same retained frontier owner executes this lane at medium
+effort by default. Declare it separately in the contract
 like any other lane (e.g. `A1:acceptance:'Forecast column dash rendering'`) so
 its marker gates synthesis the same way every other lane's does.
 
@@ -1152,10 +1203,12 @@ merely untested, it is exactly the "nobody knows if this is safe" case
 claim quietly ship as `GO`. A low-stakes claim (a rarely hit empty state,
 cosmetic copy) can stay at `PASS_WITH_GAPS` without escalation.
 
-All three lanes may share specifications, never conclusions. Each writes its
-own evidence before seeing another lane's verdict. The challenger must also
-sample checks that passed — including acceptance claims marked `met` — not
-only reported failures; otherwise it cannot challenge false clears.
+All lanes preserve their own claim sources and evidence. One owner's lanes are
+not independent reviewers of one another. Across the coordinator/challenger
+boundary, share frozen specifications and raw evidence, never conclusions before
+each side's own conclusion is durable. The independent challenger must sample
+checks that passed — including acceptance claims marked `met` — not only
+reported failures; otherwise it cannot challenge false clears.
 
 ## 4. Challenge every candidate finding
 
@@ -1180,8 +1233,8 @@ repro_steps, evidence, code_path, challenger, verdict, confidence
 A disagreement is useful evidence, not a vote. Resolve it by tracing the request,
 state transition, specification, and current source.
 
-For a bounded finding on a dev-bound build, the coordinator is the decision
-owner. It chooses and records one of: a narrow fix, a correction to an
+For a bounded finding on a dev-bound build, the coordinator's retained frontier
+worker is the technical decision owner. It chooses and records one of: a narrow fix, a correction to an
 overstated claim or PR description, or a tracked deferral with a recommended
 default, owner, and re-entry condition. An unspecified behavior is evidence to
 reason from — current product patterns, user impact, and the frozen intent —
@@ -1199,21 +1252,23 @@ Use one frontier adjudicator only when at least one condition holds:
 - the fix crosses multiple subsystems or changes authorization/data semantics;
 - the proposed repair could mask the symptom without restoring the invariant.
 
-Outside those conditions, the coordinator decides the bounded disposition above
+Outside those conditions, the retained coordinator-side owner decides the bounded disposition above
 and continues with independent verification. A human decision is required only
 when the decision itself would commit a production, privacy, money,
 authorization, or irreversible external outcome that the evidence cannot safely
 choose. It is not a substitute for an agent choosing a reversible dev remedy or
 deferral.
 
-First raise the existing frontier parent's effort: the coordinator may use Opus
-xhigh and the challenger may use Sol xhigh. If the dispute remains
-cross-provider or specification authority is still unclear, the coordinator
-dispatches its native `qa-adjudicator` role — Claude Fable 5.1 at high effort —
-exactly once per dispute. The challenger requests adjudication through the
-coordinator; it never spawns the adjudicator itself. Do not run every frontier
-model routinely. Give the adjudicator the frozen run record, full finding
-evidence, relevant source, tests, and both parent arguments.
+When a listed condition holds, the outer coordinator dispatches one fresh
+provider-native `qa-adjudicator`: Fable 5.1 or GPT-6 Astra, medium by default,
+independent of both owners' sessions. This is a fresh review, not a higher tier;
+there is no prerequisite parent-effort increase or model ladder. Give it the
+frozen run record, full finding evidence, source, tests, and both owners'
+arguments. The challenger requests this through the coordinator and never
+spawns it itself. Return the review to the retained coordinator-side owner for
+source-backed resolution, preserving the challenger's dissent in publication.
+Any explicit effort override follows the supported transport above; it is not
+an automatic escalation step. Do not add routine duplicate adjudicators.
 
 Reject placeholder business math, spinners that merely hide missing completion
 barriers, route-only patches for user-scoped state bugs, and any repair that makes
@@ -1344,7 +1399,8 @@ screenshots:
 Run `<run_id>` · build `<sha12>`
 ```
 
-The coordinator synthesizes recorded evidence; it must not invent a result,
+The retained coordinator-side owner synthesizes recorded evidence; the outer
+coordinator publishes that decision. Neither may invent a result,
 suppress a challenger dissent, or upgrade another lane's confidence. The
 challenger posts exactly one pre-synthesis `CLEAR`/`DISSENT` disposition rather
 than a competing summary. The synthesis barrier is mandatory even for `BLOCKED`
@@ -2108,11 +2164,13 @@ is not implemented by this script; it is a separate, later decision.
 
 ## Cost controls
 
-- Two provider-native worker lanes by default: Sonnet/xhigh under the
-  coordinator and Luna/max under the challenger. The frontier parents stay
-  sparse: assign, challenge, synthesize.
-- Raise parent effort or add one `qa-adjudicator` pass only on the escalation
-  conditions above.
+- One retained frontier owner per QA side, Fable/Astra at medium by default.
+  Sonnet/Terra outer coordinators stay on logistics and gated publication.
+  Preserve every required coverage lane and the independent cross-family pair.
+- Resume the same owner for corrections; use a documented remaining-work
+  handoff only when the session boundary prevents valid resume.
+- Use one fresh `qa-adjudicator` only on the dispute conditions above. No cheap
+  worker tier, parent-effort ladder, or automatic model escalation.
 - Spawn fixers only for confirmed findings and give each a non-overlapping seam.
 - Use changed-surface runs per SHA; reserve full sweeps for release gates or a
   bounded schedule.

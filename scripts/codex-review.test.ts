@@ -419,7 +419,7 @@ function commitStatus(context: string, state: string, createdAt = '2026-09-05T00
   return { id: Date.parse(createdAt) / 1000, context, state, created_at: createdAt };
 }
 
-// `reviewer` defaults to an allowed worker-high model so existing approve-path
+// `reviewer` defaults to an allowed worker-frontier model so existing approve-path
 // fixtures keep passing the model-allowlist check merge-check now applies;
 // tests of the allowlist itself pass a disallowed (or omitted) reviewer.
 // `databaseId` is the comment's posting order, which receipts are ordered by;
@@ -429,7 +429,7 @@ function receiptComment(
   outcome: string,
   createdAt: string,
   authorAssociation = 'OWNER',
-  reviewer = 'claude-opus-5 (worker-high)',
+  reviewer = 'claude-fable-5-1 (worker-frontier)',
   // `null` reproduces a real GraphQL null fullDatabaseId (the nullable BigInt
   // case); a non-digit string reproduces a malformed one. Either must fail the
   // gate closed rather than sort as if it were "0".
@@ -2150,13 +2150,13 @@ describe('codex-review risk-scoped review requests', () => {
       '--outcome',
       'approve',
       '--reviewer',
-      'gpt-5.6-sol via codex exec',
+      'gpt-6-astra via codex exec',
       '--body-file',
       bodyFile,
     ]);
     expect(result.status).toBe(0);
     expect(result.posted).toContain(`- **Head:** \`${HEAD}\``);
-    expect(result.posted).toContain('- **Reviewer and runtime:** gpt-5.6-sol via codex exec');
+    expect(result.posted).toContain('- **Reviewer and runtime:** gpt-6-astra via codex exec');
     expect(result.posted).toContain('- **Outcome:** approve');
     expect(result.posted).toContain('No findings.');
     expect(result.posted).toMatch(
@@ -2238,7 +2238,7 @@ describe('codex-review risk-scoped review requests', () => {
       '--outcome',
       outcome,
       '--reviewer',
-      'gpt-5.6-sol via codex exec',
+      'gpt-6-astra via codex exec',
       '--body-file',
       bodyFile,
     ]);
@@ -2249,8 +2249,8 @@ describe('codex-review risk-scoped review requests', () => {
   it.each([
     ['an embedded newline (a\\nb)', 'a\nb'],
     ['an embedded newline (b\\na)', 'b\na'],
-    ['a trailing carriage return', 'claude-opus-5\r'],
-    ['an embedded carriage return', 'claude-opus-5\rmore'],
+    ['a trailing carriage return', 'claude-fable-5-1\r'],
+    ['an embedded carriage return', 'claude-fable-5-1\rmore'],
   ])('refuses a receipt whose --reviewer contains %s, posting nothing', (_case, reviewer) => {
     const root = tempRoot();
     const bodyFile = path.join(root, 'review.md');
@@ -2290,7 +2290,7 @@ describe('codex-review risk-scoped review requests', () => {
     // Mutation evidence for first-token-only matching: an allowed id appearing
     // ANYWHERE but the first word must still refuse — the documented receipt
     // format leads with the id, so this is not a legitimate reviewer string.
-    ['an allowed id mentioned after a disallowed first token', 'claude-sonnet-5 (fallback from claude-opus-5)'],
+    ['an allowed id mentioned after a disallowed first token', 'claude-sonnet-5 (fallback from claude-fable-5-1)'],
   ])('refuses a receipt whose --reviewer names %s, a non-allowlisted model, posting nothing', (_case, reviewer) => {
     const root = tempRoot();
     const bodyFile = path.join(root, 'review.md');
@@ -2322,7 +2322,7 @@ describe('codex-review risk-scoped review requests', () => {
     expect(ids.length).toBeGreaterThan(0);
 
     // Every plain listed id, plus one with the [1m] context-window suffix appended.
-    const reviewers = [...ids.map((id) => `${id} (worker-high)`), `${ids[0]}[1m] (worker-high)`];
+    const reviewers = [...ids.map((id) => `${id} (worker-frontier)`), `${ids[0]}[1m] (worker-frontier)`];
     for (const reviewer of reviewers) {
       const root = tempRoot();
       const bodyFile = path.join(root, 'review.md');
@@ -2362,7 +2362,7 @@ describe('codex-review risk-scoped review requests', () => {
     ['a bare grep --version flag token', '--version'],
     ['a grep --help flag token', 'claude-haiku-4-5 --help'],
     ['a grep -v flag token', 'claude-sonnet-5 -v x'],
-    ['an allowed id mentioned after a disallowed first token', 'claude-sonnet-5 (fallback from claude-opus-5)'],
+    ['an allowed id mentioned after a disallowed first token', 'claude-sonnet-5 (fallback from claude-fable-5-1)'],
   ])(
     'refuses a review-verdict head whose approving receipt reviewer is %s (mutation evidence for the grep-injection/first-token fix)',
     (_case, reviewer) => {
@@ -2375,6 +2375,20 @@ describe('codex-review risk-scoped review requests', () => {
       const result = runHelper(root, ['merge-check', '--head', HEAD]);
       expect(result.status, `reviewer "${reviewer}" was wrongly allowed: ${result.stdout}`).toBe(24);
       expect(result.stderr).toContain('disallowed reviewer');
+    },
+  );
+
+  it.each(['claude-opus-5 (prior worker-high)', 'gpt-5.6-sol via codex exec'])(
+    'preserves an existing exact-head approval from prior eligible reviewer %s',
+    (reviewer) => {
+      const root = tempRoot();
+      scopeFixture(root, {
+        labels: ['risk:high'],
+        comments: [marker(HEAD, 1), receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', reviewer)],
+      });
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`merge=allowed head=${HEAD}`);
     },
   );
 
@@ -2407,8 +2421,8 @@ describe('codex-review risk-scoped review requests', () => {
     [
       'approved, then asked for changes within the same second',
       [
-        receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '101'),
-        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
+        receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-fable-5-1 (worker-frontier)', '101'),
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-fable-5-1 (worker-frontier)', '100'),
       ],
       'receipt: changes',
     ],
@@ -2424,7 +2438,7 @@ describe('codex-review risk-scoped review requests', () => {
           'changes',
           '2026-09-05T00:20:00Z',
           'OWNER',
-          'claude-opus-5 (worker-high)',
+          'claude-fable-5-1 (worker-frontier)',
           '12345678901234567891',
         ),
         receiptComment(
@@ -2432,7 +2446,7 @@ describe('codex-review risk-scoped review requests', () => {
           'approve',
           '2026-09-05T00:20:00Z',
           'OWNER',
-          'claude-opus-5 (worker-high)',
+          'claude-fable-5-1 (worker-frontier)',
           '12345678901234567890',
         ),
       ],
@@ -2468,7 +2482,7 @@ describe('codex-review risk-scoped review requests', () => {
       1,
       connectionPage(
         'comments',
-        [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100')],
+        [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-fable-5-1 (worker-frontier)', '100')],
         true,
         'comments-2',
       ),
@@ -2478,7 +2492,7 @@ describe('codex-review risk-scoped review requests', () => {
       'comments',
       2,
       connectionPage('comments', [
-        receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', null),
+        receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-fable-5-1 (worker-frontier)', null),
       ]),
     );
 
@@ -2498,8 +2512,8 @@ describe('codex-review risk-scoped review requests', () => {
     scopeFixture(root, {
       labels: ['risk:high'],
       comments: [
-        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
-        receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', badId),
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-fable-5-1 (worker-frontier)', '100'),
+        receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-fable-5-1 (worker-frontier)', badId),
       ],
     });
 
@@ -3588,7 +3602,7 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
       'an approving receipt from an allowed reviewer, before the merge',
       { comments: [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z')] },
       0,
-      'an approving substitute receipt before the merge (claude-opus-5 (worker-high))',
+      'an approving substitute receipt before the merge (claude-fable-5-1 (worker-frontier))',
     ],
     [
       'a clean Codex review, requested and given before the merge',
@@ -3655,9 +3669,16 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
     [
       'a changes receipt posted in the same second as the approval was edited after the merge',
       [
-        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-fable-5-1 (worker-frontier)', '100'),
         {
-          ...receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '101'),
+          ...receiptComment(
+            HEAD,
+            'changes',
+            '2026-09-05T00:20:00Z',
+            'OWNER',
+            'claude-fable-5-1 (worker-frontier)',
+            '101',
+          ),
           lastEditedAt: '2026-09-05T02:00:00Z',
         },
       ],
@@ -3686,7 +3707,7 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
       1,
       connectionPage(
         'comments',
-        [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100')],
+        [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-fable-5-1 (worker-frontier)', '100')],
         true,
         'comments-2',
       ),
@@ -3696,7 +3717,7 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
       'comments',
       2,
       connectionPage('comments', [
-        receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', null),
+        receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-fable-5-1 (worker-frontier)', null),
       ]),
     );
 
@@ -3716,8 +3737,8 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
     auditFixture(root, {
       labels: ['risk:high'],
       comments: [
-        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
-        receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', badId),
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-fable-5-1 (worker-frontier)', '100'),
+        receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-fable-5-1 (worker-frontier)', badId),
       ],
     });
 
@@ -3747,7 +3768,7 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
           fullDatabaseId: 'abc',
           body: 'CI is green.',
         },
-        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-fable-5-1 (worker-frontier)', '100'),
       ],
     });
 
@@ -3763,7 +3784,7 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
     const root = tempRoot();
     auditFixture(root, {
       labels: ['risk:high'],
-      comments: [receiptComment(HEAD, 'approve', MERGED_AT, 'OWNER', 'claude-opus-5 (worker-high)', '100')],
+      comments: [receiptComment(HEAD, 'approve', MERGED_AT, 'OWNER', 'claude-fable-5-1 (worker-frontier)', '100')],
     });
 
     const result = runHelper(root, ['audit']);
@@ -3776,8 +3797,8 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
     auditFixture(root, {
       labels: ['risk:high'],
       comments: [
-        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
-        receiptComment(HEAD, 'changes', MERGED_AT, 'OWNER', 'claude-opus-5 (worker-high)', '101'),
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-fable-5-1 (worker-frontier)', '100'),
+        receiptComment(HEAD, 'changes', MERGED_AT, 'OWNER', 'claude-fable-5-1 (worker-frontier)', '101'),
       ],
     });
 
@@ -3791,7 +3812,7 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
     auditFixture(root, {
       labels: ['risk:high'],
       comments: [
-        receiptComment(HEAD, 'approve', '2026-09-05T00:59:59Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
+        receiptComment(HEAD, 'approve', '2026-09-05T00:59:59Z', 'OWNER', 'claude-fable-5-1 (worker-frontier)', '100'),
       ],
     });
 
@@ -3811,7 +3832,14 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
       labels: ['risk:high'],
       comments: [
         {
-          ...receiptComment(HEAD, 'approve', '2026-09-05T00:30:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
+          ...receiptComment(
+            HEAD,
+            'approve',
+            '2026-09-05T00:30:00Z',
+            'OWNER',
+            'claude-fable-5-1 (worker-frontier)',
+            '100',
+          ),
           lastEditedAt: MERGED_AT,
         },
       ],
@@ -3828,7 +3856,14 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
       labels: ['risk:high'],
       comments: [
         {
-          ...receiptComment(HEAD, 'approve', '2026-09-05T00:30:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
+          ...receiptComment(
+            HEAD,
+            'approve',
+            '2026-09-05T00:30:00Z',
+            'OWNER',
+            'claude-fable-5-1 (worker-frontier)',
+            '100',
+          ),
           lastEditedAt: '2026-09-05T00:59:59Z',
         },
       ],

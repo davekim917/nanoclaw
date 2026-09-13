@@ -1125,39 +1125,33 @@ describe('worker agent def sync (orchestrator roster)', async () => {
     // MANAGED_WORKER_DEFS, so if trunk dropped it, the prune must remove it).
     fs.mkdirSync(agentsDir, { recursive: true });
     fs.writeFileSync(path.join(agentsDir, 'custom-op.md'), 'operator-owned\n');
+    for (const retired of ['worker-fast.md', 'worker.md', 'worker-high.md', 'worker-opus.md', 'worker-codex.md']) {
+      fs.writeFileSync(path.join(agentsDir, retired), 'old managed definition\n');
+    }
+    fs.writeFileSync(path.join(agentsDir, 'impeccable-reviewer.md'), 'specialized definition\n');
 
     await buildMounts(ag, session('s-wd', ag.id), containerConfig(), 'claude', {});
 
     // Trunk roster copied byte-for-byte.
-    for (const def of ['worker-fast.md', 'worker.md', 'worker-high.md', 'worker-frontier.md', 'worker-codex.md']) {
+    for (const def of ['worker-frontier.md']) {
       expect(fs.readFileSync(path.join(agentsDir, def), 'utf-8')).toBe(
         fs.readFileSync(path.join(process.cwd(), 'container', 'agents', def), 'utf-8'),
       );
     }
     // Operator file untouched.
     expect(fs.readFileSync(path.join(agentsDir, 'custom-op.md'), 'utf-8')).toBe('operator-owned\n');
-    // Regression guard for the 1M-window fix (F4): opus worker must carry [1m],
-    // not a bare id that collapses to 200k under proxy auth. Reverting to
-    // `model: opus` or bare `claude-opus-5` fails here.
-    expect(fs.readFileSync(path.join(agentsDir, 'worker-high.md'), 'utf-8')).toContain('model: claude-opus-5[1m]');
-    // Same regression guard for the frontier tier: Fable 5.1 must carry [1m]
-    // too, and stay at medium effort (not inherit a stray high/xhigh).
+    for (const retired of ['worker-fast.md', 'worker.md', 'worker-high.md', 'worker-opus.md', 'worker-codex.md']) {
+      expect(fs.existsSync(path.join(agentsDir, retired))).toBe(false);
+    }
+    expect(fs.readFileSync(path.join(agentsDir, 'impeccable-reviewer.md'), 'utf8')).toBe('specialized definition\n');
+    // Fable must retain the 1M context suffix and explicit medium default.
     const frontierWorker = fs.readFileSync(path.join(agentsDir, 'worker-frontier.md'), 'utf-8');
     expect(frontierWorker).toContain('model: claude-fable-5-1[1m]');
     expect(frontierWorker).toContain('effort: medium');
-    const codexWorker = fs.readFileSync(path.join(agentsDir, 'worker-codex.md'), 'utf-8');
-    expect(codexWorker).toContain('Always run Codex in the foreground');
-    expect(codexWorker).toContain('`timeout` to `3600000`');
-    expect(codexWorker).toContain('never set `run_in_background` for the Codex call');
-    expect(codexWorker).toContain('the orchestrator owns continued monitoring');
-    expect(codexWorker).not.toContain('timeout to 600000');
-    // Acceptance criterion 4 (instruction-stack-prune L2): the
-    // orchestrator-workers.instructions.md fragment is retired — its
-    // tier-selection markers now live in the worker-def descriptions
-    // themselves (the field the Task tool surfaces at selection time), not
-    // in an always-on fragment.
-    expect(codexWorker).toContain('Invoke with `run_in_background: true`');
-    expect(codexWorker).toContain('keeps its own `codex exec` Bash call in the foreground');
+    expect(frontierWorker).toContain('including investigation, technical decisions');
+    expect(frontierWorker).toContain('do not spawn a wrapper agent');
+    expect(frontierWorker).toContain('foreground-attached for cancellation');
+    // The retired always-on roster fragment stays absent.
     expect(
       fs.existsSync(
         path.join(

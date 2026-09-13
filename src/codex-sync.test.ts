@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { discoverCodexAgentTargets, syncCodexLocalMarketplacePluginCache } from './codex-sync.js';
+import { discoverCodexAgentTargets, syncCodexLocalMarketplacePluginCache, syncCodexSubagents } from './codex-sync.js';
 
 let tmpDir: string;
 
@@ -204,5 +204,28 @@ describe('discoverCodexAgentTargets', () => {
     } finally {
       fs.rmSync(groupsDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('retired worker sync', () => {
+  it('removes source-retired managed workers but preserves unmanaged and specialized roles', () => {
+    const source = path.join(tmpDir, '.claude/agents');
+    const target = path.join(tmpDir, '.codex/agents');
+    fs.mkdirSync(source, { recursive: true });
+    fs.mkdirSync(target, { recursive: true });
+    for (const name of ['worker-fast', 'worker', 'worker-high', 'worker-codex']) {
+      fs.writeFileSync(path.join(target, `${name}.toml`), '# managed by nanoclaw codex-sync\n');
+    }
+    fs.writeFileSync(path.join(target, 'custom.toml'), 'name = "custom"\n');
+    fs.writeFileSync(
+      path.join(source, 'impeccable-reviewer.md'),
+      '---\nname: impeccable-reviewer\ndescription: Specialized review\n---\nReview.\n',
+    );
+    syncCodexSubagents();
+    for (const name of ['worker-fast', 'worker', 'worker-high', 'worker-codex']) {
+      expect(fs.existsSync(path.join(target, `${name}.toml`))).toBe(false);
+    }
+    expect(fs.readFileSync(path.join(target, 'custom.toml'), 'utf8')).toBe('name = "custom"\n');
+    expect(fs.existsSync(path.join(target, 'impeccable-reviewer.toml'))).toBe(true);
   });
 });

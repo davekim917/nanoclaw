@@ -117,6 +117,14 @@ describe('readClaims', () => {
     expect(readClaims('wg-a', NOW, dir)[0]).toMatchObject({ state: 'parked', staleMs: 3 * HOUR });
   });
 
+  it('keeps an explicit operator pause visible without turning it stale', () => {
+    const dir = root({
+      held: claim(100, { status: 'paused', paused_at: new Date(NOW - 30 * HOUR).toISOString() }),
+    });
+
+    expect(readClaims('wg-a', NOW, dir)[0]).toMatchObject({ state: 'paused', staleMs: 30 * HOUR });
+  });
+
   it('a park that nobody came back for decays to stale — parked is a waypoint, not a terminus', () => {
     const dir = root({
       // 30h parked, past the 24h grace: the handoff offer lapsed.
@@ -201,17 +209,30 @@ describe('renderClaims', () => {
       staleMs: 5 * HOUR,
       escalated: false,
     },
+    {
+      slug: 'held',
+      owner: 'ava',
+      note: 'explicit operator hold',
+      threadId: null,
+      state: 'paused',
+      staleMs: 5 * HOUR,
+      escalated: false,
+    },
   ];
 
   it('puts what needs a human first, parked next, and live work last', () => {
     const out = renderClaims(claims)
       .split('\n')
-      .filter((l) => l.startsWith('🔴') || l.startsWith('🅿️') || l.startsWith('🟡') || l.startsWith('🟢'));
+      .filter(
+        (l) =>
+          l.startsWith('🔴') || l.startsWith('⏸️') || l.startsWith('🅿️') || l.startsWith('🟡') || l.startsWith('🟢'),
+      );
 
     expect(out[0]).toContain('Stale');
-    expect(out[1]).toContain('Parked');
-    expect(out[2]).toContain('Past TTL');
-    expect(out[3]).toContain('Live');
+    expect(out[1]).toContain('Paused');
+    expect(out[2]).toContain('Parked');
+    expect(out[3]).toContain('Past TTL');
+    expect(out[4]).toContain('Live');
   });
 
   it('renders parked age as "parked <duration>", not past-TTL phrasing', () => {
@@ -219,6 +240,12 @@ describe('renderClaims', () => {
 
     expect(out).toContain('parked 5.0h');
     expect(out).not.toContain('5.0h past TTL');
+  });
+
+  it('renders an explicit hold as paused, not past-TTL work', () => {
+    const out = renderClaims(claims);
+
+    expect(out).toContain('paused 5.0h');
   });
 
   it('renders a thread link only when the claim recorded one', () => {

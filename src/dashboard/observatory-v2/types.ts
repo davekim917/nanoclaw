@@ -76,7 +76,7 @@ export interface SignalClaimDetail {
   owner: string;
   /** Source-provided note headline, not a generated task title or verified outcome. */
   note: string;
-  state: 'live' | 'expiring' | 'stale' | 'parked';
+  state: 'live' | 'expiring' | 'stale' | 'parked' | 'paused';
   /** Expiry delta (negative while live), or elapsed parked time; not creation age. */
   stale_ms: number;
   escalated: boolean;

@@ -13,18 +13,14 @@
  *   frontmatter.description → toml description
  *   markdown body           → toml developer_instructions (multiline `"""…"""`)
  *
- * Model tiering (`CODEX_WORKER_TIERS`): the tiered `worker*` defs exist to put
- * cheap work on a cheap model, and that intent does not survive a name-only
- * copy — a Codex role with no `model` silently inherits the parent's, so every
- * "tier" resolves to the same model while its description still claims
- * otherwise. Named workers therefore get an explicit Codex model + reasoning
- * effort, and their trailing "Runs on <Claude model>" sentence is rewritten to
- * name the Codex one. Unmapped agents keep the old inherit-from-parent
- * behavior, which is correct for roles that aren't tiers (codex-rescue, etc).
+ * The native frontier worker pins its Codex model. Effort stays out of the
+ * role file: [agents].default_subagent_reasoning_effort supplies medium and
+ * the native spawn reasoning_effort field can override it per task.
+ * Specialized agents continue inheriting their parent model.
  *
  * Dropped (no Codex equivalent or runtime-specific):
  *   frontmatter.model       — Claude model names differ; Codex model comes
- *                              from CODEX_WORKER_TIERS, not from frontmatter
+ *                              from CODEX_WORKER_MODELS, not from frontmatter
  *   frontmatter.tools       — Claude tool-restriction model; Codex uses
  *                              mcp_servers / skills.config at a coarser level
  *   frontmatter.color       — Claude UI only
@@ -39,25 +35,9 @@ export interface ClaudeAgent {
   body: string;
 }
 
-export interface CodexWorkerTier {
-  model: string;
-  effort: string;
-}
-
-/**
- * Codex equivalents of the tiered Claude workers. Cheaper models carry a
- * higher reasoning effort to compensate. worker-high uses Sol at high
- * effort. worker-frontier is the top rung: Astra
- * at high effort, for frontier-hard work or after worker-high has failed.
- * Only tiers belong here — a role that is a *kind* of worker rather than a
- * rung (worker-codex, codex-rescue) is left
- * to inherit.
- */
-export const CODEX_WORKER_TIERS: Record<string, CodexWorkerTier> = {
-  'worker-fast': { model: 'gpt-5.6-luna', effort: 'max' },
-  worker: { model: 'gpt-5.6-terra', effort: 'xhigh' },
-  'worker-high': { model: 'gpt-5.6-sol', effort: 'high' },
-  'worker-frontier': { model: 'gpt-6-astra', effort: 'high' },
+/** Only the native execution role has a provider-specific model mapping. */
+export const CODEX_WORKER_MODELS: Record<string, string> = {
+  'worker-frontier': 'gpt-6-astra',
 };
 
 /**
@@ -177,8 +157,8 @@ function tomlMultilineString(value: string): string {
  * output (and leave manually-authored TOMLs alone).
  */
 export function formatCodexAgentToml(agent: ClaudeAgent): string {
-  const tier = CODEX_WORKER_TIERS[agent.name];
-  const description = tier ? retargetRunsOnSentence(agent.description, tier) : agent.description;
+  const model = CODEX_WORKER_MODELS[agent.name];
+  const description = model ? retargetRunsOnSentence(agent.description, model) : agent.description;
   const lines: string[] = [
     MANAGED_MARKER,
     '',
@@ -191,16 +171,13 @@ export function formatCodexAgentToml(agent: ClaudeAgent): string {
       : `description = ${tomlBasicString(description)}`,
     `developer_instructions = ${tomlMultilineString(agent.body)}`,
   ];
-  if (tier) {
-    lines.push(`model = ${tomlBasicString(tier.model)}`);
-    lines.push(`model_reasoning_effort = ${tomlBasicString(tier.effort)}`);
-  }
+  if (model) lines.push(`model = ${tomlBasicString(model)}`);
   lines.push('');
   return lines.join('\n');
 }
 
 /**
- * Replace the Claude-model claim that ends a tiered worker's description
+ * Replace the Claude-model claim that ends the frontier worker's description
  * ("Runs on Sonnet at xhigh effort.") with the Codex model it actually runs
  * on. Left alone when the sentence isn't there — the description is a routing
  * signal, so a wrong model name in it actively mis-routes the orchestrator.
@@ -209,9 +186,9 @@ export function formatCodexAgentToml(agent: ClaudeAgent): string {
  * first — a model name with a version number ("Fable 5.1") contains its own
  * period, and `[^.]*` would stop there and leave the clause unstripped.
  */
-function retargetRunsOnSentence(description: string, tier: CodexWorkerTier): string {
+function retargetRunsOnSentence(description: string, model: string): string {
   const stripped = description.replace(/\s*Runs on [^\n]*\.\s*$/, '');
-  return `${stripped} Runs on ${tier.model} at ${tier.effort} reasoning.`;
+  return `${stripped} Runs on ${model} with medium reasoning by default; explicit spawn effort overrides the default.`;
 }
 
 /**

@@ -39,7 +39,7 @@ import {
 import { formatLocalTime } from './timezone.js';
 
 /** Past its TTL but inside the grace window — not yet an alert, already worth seeing. */
-export type ClaimState = 'live' | 'expiring' | 'stale' | 'parked';
+export type ClaimState = 'live' | 'expiring' | 'stale' | 'parked' | 'paused';
 
 export interface BoardClaim {
   slug: string;
@@ -215,6 +215,11 @@ export function readClaims(workgroupId: string, now: number, root: string = clai
       continue;
     }
 
+    // An explicit operator pause wins over every expiry path. Unlike a parked
+    // handoff, it is not an offer for another agent to pick up after a grace
+    // period: resumption requires a new explicit instruction.
+    const isPaused = typeof raw.status === 'string' && raw.status.trim().toLowerCase() === 'paused';
+
     // Parked wins over everything else: a parked note routinely says "not
     // done" (that's the point of leaving a note), and the finished-claim
     // filter below would otherwise have to guess whether that means finished
@@ -226,11 +231,15 @@ export function readClaims(workgroupId: string, now: number, root: string = clai
     // left on disk — rendering those as "nobody is coming back for these" is
     // both wrong and the loudest thing on the board. Same predicate the
     // escalation sweep uses, so the board and the alert agree by construction.
-    if (!isParked && declaresItselfFinished(raw)) continue;
+    if (!isPaused && !isParked && declaresItselfFinished(raw)) continue;
 
     let state: ClaimState;
     let staleMs: number;
-    if (isParked) {
+    if (isPaused) {
+      const pausedAt = typeof raw.paused_at === 'string' ? Date.parse(raw.paused_at) : NaN;
+      staleMs = Number.isFinite(pausedAt) ? now - pausedAt : 0;
+      state = 'paused';
+    } else if (isParked) {
       const parkedAt = typeof raw.parked_at === 'string' ? Date.parse(raw.parked_at) : NaN;
       staleMs = Number.isFinite(parkedAt) ? now - parkedAt : 0;
       // Parked is a WAYPOINT, not a terminus. It used to return here with no
@@ -275,6 +284,7 @@ function duration(ms: number): string {
 
 const SECTION: Record<ClaimState, { icon: string; label: string }> = {
   stale: { icon: '🔴', label: 'Stale — nobody is coming back for these' },
+  paused: { icon: '⏸️', label: 'Paused — explicit operator hold' },
   parked: { icon: '🅿️', label: 'Parked — needs an owner' },
   expiring: { icon: '🟡', label: 'Past TTL — still inside the grace window' },
   live: { icon: '🟢', label: 'Live' },
@@ -285,7 +295,7 @@ const SECTION: Record<ClaimState, { icon: string; label: string }> = {
  */
 export const PARK_GRACE_MS = 24 * 60 * 60 * 1000;
 
-const ORDER: ClaimState[] = ['stale', 'parked', 'expiring', 'live'];
+const ORDER: ClaimState[] = ['stale', 'paused', 'parked', 'expiring', 'live'];
 
 /**
  * One section per state, most urgent first, so the part that needs a human is
@@ -316,9 +326,11 @@ export function renderClaims(claims: BoardClaim[], linkFor: (threadId: string) =
       const age =
         c.state === 'live'
           ? `${duration(c.staleMs)} left`
-          : c.state === 'parked'
-            ? `parked ${duration(c.staleMs)}`
-            : `${duration(c.staleMs)} past TTL`;
+          : c.state === 'paused'
+            ? `paused ${duration(c.staleMs)}`
+            : c.state === 'parked'
+              ? `parked ${duration(c.staleMs)}`
+              : `${duration(c.staleMs)} past TTL`;
       const url = c.threadId ? linkFor(c.threadId) : null;
       const thread = url ? ` · [thread](${url})` : '';
       // An escalated claim has already been announced; marking it here stops a
