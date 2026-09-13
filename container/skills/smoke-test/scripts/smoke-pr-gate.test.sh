@@ -2482,6 +2482,38 @@ LEGACY = (lambda: SENSITIVE_GLOBS)()
 LEGACY.append("backend/billing/**")
 ' 'aliases'
 
+# Module-level binders other than assignment must pass through the same
+# reference-retention proof.  Each of these five reviewer-authored fixtures
+# executes successfully and widens the real policy while leaving its literal
+# assignment unchanged, so the real classifier CLI must fail closed.
+assert_runtime_widening_policy_refused for-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+for LEGACY in [SENSITIVE_GLOBS]:
+    LEGACY.append("backend/billing/**")
+' 'aliases through an iterable binding'
+
+assert_runtime_widening_policy_refused augassign-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = []
+LEGACY += [SENSITIVE_GLOBS]
+LEGACY[0].append("backend/billing/**")
+' 'aliases through augmented assignment'
+
+assert_runtime_widening_policy_refused match-capture-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+match SENSITIVE_GLOBS:
+    case LEGACY:
+        LEGACY.append("backend/billing/**")
+' 'aliases through a match capture'
+
+assert_runtime_widening_policy_refused for-destructured-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+for LEGACY, in [(SENSITIVE_GLOBS,)]:
+    LEGACY.append("backend/billing/**")
+' 'aliases through an iterable binding'
+
+assert_runtime_widening_policy_refused match-nested-capture-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+match [SENSITIVE_GLOBS]:
+    case [LEGACY]:
+        LEGACY.append("backend/billing/**")
+' 'aliases through a match capture'
+
 # A read is not an alias: `ALL = NAME + OTHER` builds a NEW list and leaves
 # the constant alone, so the same file with a derived read still classifies.
 # (Covered by the realistic fixture above; this is the one-line contrast.)
@@ -2582,6 +2614,12 @@ TUPLE_COPY = tuple(SENSITIVE_GLOBS)
 LIST_COPY.append("backend/billing/**")
 UNRELATED = list([])
 ALL_GLOBS = SENSITIVE_GLOBS + ["backend/legacy/**"]
+DIRECT_ITERATION = []
+for GLOB in SENSITIVE_GLOBS:
+    DIRECT_ITERATION.append(GLOB)
+COPY_ITERATION = []
+for GLOB in list(SENSITIVE_GLOBS):
+    COPY_ITERATION.append(GLOB)
 PY
 python3 - "$SAFE_COPY_MOD" <<'PY'
 import runpy
@@ -2592,6 +2630,10 @@ if policy["SENSITIVE_GLOBS"] != ["backend/permissions/**"]:
     raise SystemExit("safe copy mutated the runtime policy")
 if policy["LIST_COPY"] != ["backend/permissions/**", "backend/billing/**"]:
     raise SystemExit("safe copy control did not execute")
+if policy["DIRECT_ITERATION"] != ["backend/permissions/**"]:
+    raise SystemExit("safe scalar iteration did not execute")
+if policy["COPY_ITERATION"] != ["backend/permissions/**"]:
+    raise SystemExit("safe flat-copy iteration did not execute")
 PY
 SAFE_COPY_RULES="$STATE_DIR/fgf-safe-copy.json"
 cat > "$SAFE_COPY_RULES" <<JSON
@@ -2793,7 +2835,7 @@ match SENSITIVE_GLOBS:
         pass
 
 len(SENSITIVE_GLOBS)
-' 'could mutate|could not be parsed'
+' 'aliases through a match capture|could mutate|could not be parsed'
 
 # A star import binds names that cannot be enumerated, so no callee is
 # provably the builtin. The star import itself already refuses the whole file

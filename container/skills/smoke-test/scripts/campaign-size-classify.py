@@ -417,6 +417,16 @@ def _binding_value_aliases_name(value, name, bound):
     return _binding_result_reference(value, name, bound) != _REF_NONE
 
 
+def _match_pattern_binds(pattern):
+    """True when a match pattern captures any value under a new name."""
+    for sub in ast.walk(pattern):
+        if _MATCH_NAME_NODES and isinstance(sub, _MATCH_NAME_NODES) and sub.name:
+            return True
+        if _MATCH_REST_NODES and isinstance(sub, _MATCH_REST_NODES) and sub.rest:
+            return True
+    return False
+
+
 def _rebinding_use(node, name, bound):
     """How top-level statement `node` binds or mutates `name`, as a phrase,
     or None if it does neither. `bound` is every name module-level code binds
@@ -475,6 +485,41 @@ def _rebinding_use(node, name, bound):
             return "hands it to a call that could mutate"
         if isinstance(sub, (ast.Global, ast.Nonlocal)) and name in sub.names:
             return "declares a global/nonlocal binding for"
+        # Assignment is not the only way a new module name can retain this
+        # list.  A loop target receives values from its iterable.  Iterating
+        # NAME itself (or a proven flat copy) yields only the trusted immutable
+        # strings, but an iterable that MAY retain NAME can yield the list
+        # object itself, including through nested destructuring.
+        if (
+            isinstance(sub, (ast.For, ast.AsyncFor))
+            and _binding_result_reference(sub.iter, name, bound) == _REF_MAY_RETAIN
+        ):
+            return "aliases through an iterable binding"
+        # Augmented assignment may retain its RHS through the target's
+        # in-place operator.  Its target can be any user-defined object, so a
+        # reference-bearing RHS is refused rather than interpreting `__iadd__`
+        # (or the other augmented operators) as a particular builtin type.
+        if (
+            isinstance(sub, ast.AugAssign)
+            and _binding_value_aliases_name(sub.value, name, bound)
+        ):
+            return "aliases through augmented assignment"
+        # `with EXPR as TARGET` and its async form also bind a value derived
+        # from EXPR.  If EXPR retains NAME, the context-manager protocol does
+        # not prove that the bound value is independent of it.
+        if isinstance(sub, (ast.With, ast.AsyncWith)):
+            for item in sub.items:
+                if (
+                    item.optional_vars is not None
+                    and _binding_value_aliases_name(item.context_expr, name, bound)
+                ):
+                    return "aliases through a context-manager binding"
+        # A capture pattern can bind the whole subject or a nested value from
+        # it.  Reference-bearing subjects are therefore unsafe when any arm
+        # captures, without trying to execute Python's pattern semantics.
+        if isinstance(sub, ast.Match) and _binding_value_aliases_name(sub.subject, name, bound):
+            if any(_match_pattern_binds(case.pattern) for case in sub.cases):
+                return "aliases through a match capture"
         # `X = NAME`, destructuring a tuple that contains NAME, or binding a
         # conditional that can select NAME all preserve the one list object.
         # A mutation through the other binding then leaves the literal above
