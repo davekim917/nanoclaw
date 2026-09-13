@@ -12,6 +12,8 @@ export interface ReleaseShipScope {
 }
 
 const REPOSITORY_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/;
+// Intentionally reject ASCII controls, including those not covered by whitespace.
+// eslint-disable-next-line no-control-regex
 const BASE_RE = /^[^\s\x00-\x1F\x7F]{1,255}$/;
 const HEAD_RE = /^[a-f0-9]{40}$/;
 const KEYS = ['purpose', 'repository', 'pullRequest', 'base', 'headSha'] as const;

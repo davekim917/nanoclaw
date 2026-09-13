@@ -20,8 +20,8 @@
 - Third repository footprint: a fresh instructions worktree adds only the
   scoped release-card/recorder protocol. It requires the saved watcher prompt
   to reference that protocol before use, keeps ordinary decision cards generic,
-  and does not recreate develop-ship grants. No installation ID appears in
-  public source or instruction text.
+  and does not recreate develop-ship grants. Installation IDs remain in private
+  consumer/instruction repositories; none appears in public source.
 
 ## Ratchet disposition
 
@@ -55,3 +55,12 @@
 - No live database/card/task/service/status mutation, fabricated receipt, or
   human-click replay occurred. A genuine positive proof remains a post-deploy
   human click on a real scoped card.
+
+## PR #787 CI correction
+
+- The first remote correctness run stopped at ESLint's control-regex rule.
+  The base validator intentionally rejects ASCII controls, so its unchanged
+  expression now has a narrowly scoped, explained exception. No validation or
+  repository-wide lint rule was weakened.
+- Corrected the documentation boundary: private group instructions name the
+  installation's approvers; the public source does not contain those IDs.

@@ -117,6 +117,6 @@ A third, separately versioned group-instruction repository carries the release
 agent's scoped-card recorder protocol. It directs the saved watcher prompt to
 this protocol before a card-derived record is created, preserves generic
 product decision cards as non-release decisions, and explicitly retains the
-no-human-gate develop flow. Its text contains no installation identifiers; the
-private consumer alone owns those bindings. Updating live task text or
+no-human-gate develop flow. Installation-specific approvers and routing stay in
+the private consumer and private group instructions, never public source. Updating live task text or
 regenerating host instructions is a later, explicit activation step.
