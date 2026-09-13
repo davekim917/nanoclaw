@@ -302,6 +302,13 @@ cmd_park() {
   f="$(file_for "$slug")"
   IFS=$'\t' read -r state owner _ <<<"$(inspect "$f")"
 
+  # A pause is an explicit operator direction, not an owner-managed handoff.
+  # Preserve it until `resume` records the new instruction through cmd_take.
+  if [ "$state" = "paused" ]; then
+    echo "REFUSED — $slug is explicitly paused by the operator. Resume it only after a new explicit instruction; a pause cannot be parked." >&2
+    exit 3
+  fi
+
   if [ -f "$f" ] && [ "$owner" != "$(me)" ]; then
     if [ "$state" = "live" ]; then
       echo "REFUSED — $slug is held live by $owner. Park only your own claim." >&2
@@ -491,6 +498,14 @@ cmd_record_review_start() {
       [ "$existing_repo" = "$repo" ] && [ "$existing_pr" = "$pr" ] && [ "$existing_head" = "$head" ] || continue
       if review_lease_active "$existing" "$now_epoch"; then
         existing_reviewer="$(jq -r '.reviewer // "unknown"' "$existing")"
+        # --parallel is for a second independent reviewer, not a second
+        # execution of the same reviewer identity.  The lease key includes
+        # that identity, so admitting this case would overwrite its active
+        # lease and let one verdict erase another active review.
+        if [ "$existing_reviewer" = "$reviewer" ]; then
+          echo "REFUSED — $repo#$pr @$head already has an active review by $reviewer. Parallel review requires a distinct reviewer identity." >&2
+          exit 3
+        fi
         if [ -z "$parallel_reason" ]; then
           echo "REFUSED — $repo#$pr @$head already has an active review by $existing_reviewer. Reuse its receipt, or pass --parallel with the concrete independent risk." >&2
           exit 3
