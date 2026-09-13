@@ -155,6 +155,12 @@ jq -e '.status == "paused" and (.paused_at | endswith("Z"))' "$CLAIMS_DIR/acme-p
   || fail "paused claim was treated as takeable"
 NANOCLAW_ASSISTANT_NAME=bo bash "$CLAIM" take acme-pause 2 accidental resume >/dev/null 2>&1 \
   && fail "ordinary take resumed an explicit operator pause"
+# The owner cannot turn the operator's pause into a normal handoff either.
+# cmd_park must leave the durable pause intact until a deliberate resume.
+bash "$CLAIM" park acme-pause hiding the operator hold >/dev/null 2>&1 \
+  && fail "park converted an explicit operator pause into a handoff"
+jq -e '.status == "paused" and (.note | contains("explicit operator hold"))' "$CLAIMS_DIR/acme-pause.json" >/dev/null \
+  || fail "refused park rewrote the explicit operator pause"
 NANOCLAW_ASSISTANT_NAME=bo bash "$CLAIM" resume acme-pause 2 explicit operator resume >/dev/null
 jq -e '.owner == "bo" and .status != "paused" and (.note | startswith("resumed explicit operator pause from ava: "))' \
   "$CLAIMS_DIR/acme-pause.json" >/dev/null || fail "explicit resume did not record the prior hold"
@@ -276,6 +282,13 @@ tail -n1 "$CLAIMS_DIR/ledger.ndjson" | jq -e '
 ' >/dev/null || fail "parallel review did not record its reason"
 [ "$(find "$CLAIMS_DIR/review-leases" -name '*.json' -type f | wc -l)" = 2 ] \
   || fail "parallel reviews did not hold distinct leases"
+# A --parallel reason does not permit the same reviewer identity to create a
+# second overlapping execution.  That would overwrite its lease and let either
+# verdict make the other active review invisible.
+[ "$(bash "$CLAIM" record-review-start DEMO-REPO 43 def5678 reviewer-b --parallel "different tab" >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "same reviewer was allowed to overwrite an active parallel lease"
+[ "$(find "$CLAIMS_DIR/review-leases" -name '*.json' -type f | wc -l)" = 2 ] \
+  || fail "refused duplicate parallel review changed the active lease set"
 bash "$CLAIM" record-verdict DEMO-REPO 43 def5678 reviewer-a CLEAR >/dev/null
 [ "$(find "$CLAIMS_DIR/review-leases" -name '*.json' -type f | wc -l)" = 1 ] \
   || fail "first parallel verdict cleared the wrong lease"
