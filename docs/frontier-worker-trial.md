@@ -4,19 +4,20 @@ The managed general worker roster is only `worker-frontier`. Cross-provider
 transport invokes the Bootstrap CLI helper directly, without a wrapper agent. Specialized and operator-owned
 agents stay available. Fleet primary model settings are separate.
 
-Claude's frontier definition uses `claude-fable-5-1[1m]` with `effort: medium`.
+Claude's frontier definition uses `claude-opus-5[1m]` with `effort: high`.
 The installed SDK's native `AgentInput` has no per-call effort field. For an
 explicit task override, use Bootstrap's `scripts/frontier-worker.mjs` helper
 (discovered through its orchestrate skill) with `--runtime claude --effort`.
 It scopes `CLAUDE_CODE_EFFORT_LEVEL` to the foreground child invocation;
 writing an effort request in a prompt is insufficient.
 
-Codex's converted frontier role pins `gpt-6-astra` and deliberately omits
+Codex's converted frontier role pins `gpt-5.6-sol` and deliberately omits
 `model_reasoning_effort`. Both generated primary and companion configs set
-`[agents].default_subagent_reasoning_effort = "medium"`. This leaves native
+`[agents].default_subagent_reasoning_effort = "high"`. This leaves native
 spawn `reasoning_effort` available for an explicit task override. The default
-applies to otherwise unpinned specialized subagents too. The direct Codex CLI helper uses
-explicit `-m gpt-6-astra -c model_reasoning_effort="medium"` defaults.
+applies to otherwise unpinned specialized subagents too. Fable 5.1 / Astra 6 stay reachable as the judgment-shape escalation through a
+per-dispatch model override on the same `worker-frontier` name, never a second
+agent definition.
 
 Keep implementation, test, and correction in the same worker session. Resume
 an exact recorded ID; never use a global latest-session selector. Independent
@@ -56,7 +57,7 @@ host restart, fresh spawn, and observed runtime model/effort are separate proof.
 
 Verification covers generated config defaults, absence of an effort lock in
 the Codex role, managed roster retirement, preservation of custom/specialized
-agents, and reviewer-model allowlist generation. Prior Opus/Sol reviewer IDs
+agents, and reviewer-model allowlist generation. Prior Fable/Astra reviewer IDs
 remain eligible for receipt compatibility, including existing exact-head
 approvals; this does not reintroduce their retired dispatch roles. CLI argv/config checks do not
 prove a model inference ran. Roll back by restoring prior source definitions,

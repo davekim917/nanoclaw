@@ -139,25 +139,30 @@ Body line 2.
 });
 
 describe('native frontier worker conversion', () => {
-  test('pins Astra without an effort field that would override a native spawn request', () => {
+  test('pins Sol without an effort field that would override a native spawn request', () => {
     const source = fs.readFileSync(path.join(REPO_ROOT, 'container/agents/worker-frontier.md'), 'utf8');
     const out = formatCodexAgentToml(parseClaudeAgentMd(source)!);
-    expect(CODEX_WORKER_MODELS).toEqual({ 'worker-frontier': 'gpt-6-astra' });
-    expect(out).toContain('model = "gpt-6-astra"');
+    // One agent def, one name: the Claude frontmatter pins Opus 5 at high and
+    // this conversion swaps ONLY the model for the Codex twin. Astra/Fable stay
+    // reachable through a per-dispatch model override, never a second def.
+    expect(CODEX_WORKER_MODELS).toEqual({ 'worker-frontier': 'gpt-5.6-sol' });
+    expect(source).toContain('model: claude-opus-5[1m]');
+    expect(source).toContain('effort: high');
+    expect(out).toContain('model = "gpt-5.6-sol"');
     expect(out).not.toMatch(/^model_reasoning_effort\s*=/m);
-    expect(out).toContain('medium reasoning by default');
-    expect(out).not.toContain('Runs on Fable');
+    expect(out).toContain('high reasoning by default');
+    expect(out).not.toContain('Runs on Opus');
     expect(out).toContain('fresh independent context');
   });
 
   test('rewrites model names containing periods without stripping routing instructions', () => {
     const out = formatCodexAgentToml({
       name: 'worker-frontier',
-      description: 'Review in a fresh context. Runs on Fable 5.1 at medium effort.',
+      description: 'Review in a fresh context. Runs on Opus 5 at high effort.',
       body: 'b',
     });
-    expect(out).toContain('Review in a fresh context. Runs on gpt-6-astra');
-    expect(out).not.toContain('Fable');
+    expect(out).toContain('Review in a fresh context. Runs on gpt-5.6-sol');
+    expect(out).not.toContain('Opus');
   });
 
   test('leaves specialized roles inheriting their parent model', () => {

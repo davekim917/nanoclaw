@@ -76,7 +76,7 @@ export function buildContainerCodexConfig(): string {
     'multi_agent = true',
     '',
     '[agents]',
-    'default_subagent_reasoning_effort = "medium"',
+    'default_subagent_reasoning_effort = "high"',
     'max_concurrent_threads_per_session = 4',
     '',
     ...CONTAINER_TRUSTED_PROJECTS.flatMap((proj) => [`[projects."${proj}"]`, 'trust_level = "trusted"', '']),

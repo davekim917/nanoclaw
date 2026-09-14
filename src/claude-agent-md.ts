@@ -14,8 +14,9 @@
  *   markdown body           → toml developer_instructions (multiline `"""…"""`)
  *
  * The native frontier worker pins its Codex model. Effort stays out of the
- * role file: [agents].default_subagent_reasoning_effort supplies medium and
- * the native spawn reasoning_effort field can override it per task.
+ * role file: [agents].default_subagent_reasoning_effort supplies high
+ * (src/providers/codex.ts:79) and the native spawn reasoning_effort field can
+ * override it per task.
  * Specialized agents continue inheriting their parent model.
  *
  * Dropped (no Codex equivalent or runtime-specific):
@@ -37,7 +38,7 @@ export interface ClaudeAgent {
 
 /** Only the native execution role has a provider-specific model mapping. */
 export const CODEX_WORKER_MODELS: Record<string, string> = {
-  'worker-frontier': 'gpt-6-astra',
+  'worker-frontier': 'gpt-5.6-sol',
 };
 
 /**
@@ -188,7 +189,7 @@ export function formatCodexAgentToml(agent: ClaudeAgent): string {
  */
 function retargetRunsOnSentence(description: string, model: string): string {
   const stripped = description.replace(/\s*Runs on [^\n]*\.\s*$/, '');
-  return `${stripped} Runs on ${model} with medium reasoning by default; explicit spawn effort overrides the default.`;
+  return `${stripped} Runs on ${model} with high reasoning by default; explicit spawn effort overrides the default.`;
 }
 
 /**

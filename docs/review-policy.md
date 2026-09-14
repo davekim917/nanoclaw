@@ -54,11 +54,11 @@ an approving receipt whose first word isn't allowed does not unlock a merge.
 The reviewer reports its **exact model id from its own runtime** — a Claude
 subagent from its system prompt, Codex from the `-m` it ran with or
 `codex exec`'s session metadata — as that first word, and the receipt's `--reviewer`
-copies it verbatim, e.g. `claude-fable-5-1 (worker-frontier)` or
-`gpt-6-astra medium (codex exec)`. Nobody has to be free for this: the author
+copies it verbatim, e.g. `claude-opus-5 (worker-frontier)` or
+`gpt-5.6-sol high (codex exec)`. Nobody has to be free for this: the author
 may start that reviewer as a fresh process
-(`codex exec -m gpt-6-astra -c model_reasoning_effort=medium`, or
-`CLAUDE_CODE_EFFORT_LEVEL=medium claude -p --model 'claude-fable-5-1[1m]' --effort medium`) and hand it the inputs above.
+(`codex exec -m gpt-5.6-sol -c model_reasoning_effort=high`, or
+`CLAUDE_CODE_EFFORT_LEVEL=high claude -p --model 'claude-opus-5[1m]' --effort high`) and hand it the inputs above.
 
 Record a durable review receipt tied to the exact final SHA: reviewer and
 runtime, complete-diff and relevant-file scope, outcome, and every finding with
