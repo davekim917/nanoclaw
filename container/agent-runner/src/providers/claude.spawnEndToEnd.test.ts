@@ -47,7 +47,7 @@ function spawn(cfg: Record<string, unknown>, channel: { model?: string | null; e
     p.registerMemorySessionHook(MEMORY_SESSION_HOOK);
     cap = null;
     p.query({ prompt: 'x', cwd: '/tmp' });
-    return { env: kv, model: cap?.model, effort: cap?.effort };
+    return { env: kv, model: cap?.model, effort: cap?.effort, systemPrompt: cap?.systemPrompt };
   } finally {
     if (prevAlias === undefined) delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
     else process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = prevAlias;
@@ -85,6 +85,11 @@ describe('END-TO-END after the deletion', () => {
     console.log('  sonnet wiring -> model=', r.model, ' effort=', r.effort);
     expect(r.env.NANOCLAW_EFFORT_OVERRIDE).toBeUndefined();
     expect(r.effort).toBe('xhigh');
+    expect(r.systemPrompt).toMatchObject({
+      type: 'preset',
+      preset: 'claude_code',
+      append: expect.stringContaining('provider "claude", model "claude-sonnet-5", and reasoning effort "xhigh"'),
+    });
   });
 
   it('the ncl-configured pair still lands', () => {

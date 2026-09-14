@@ -1886,10 +1886,10 @@ export async function processQuery(
 
         // Flag-bearing messages (-m/-e/-f) are handled after admission, below:
         // stickies are persisted and live-capable settings are applied via
-        // provider control requests (query.applySettings). Ending the stream
-        // is the fallback when the provider has no live controls, the
-        // combination can't be expressed, or Codex's app-server-scoped fast
-        // service tier changed.
+        // provider control requests (query.applySettings). Providers with
+        // immutable runtime context defer the new batch until the current turn
+        // is idle, then reopen; ending an active Claude input stream cuts off
+        // its control channel while the current turn can still need tools.
 
         // Filtering on thread_id here caused deadlocks when the initial batch
         // and follow-ups had mismatched thread_ids (e.g. a host-generated welcome
@@ -1982,6 +1982,24 @@ export async function processQuery(
           // Codex fast mode is selected when its app-server starts. Even if a
           // provider supports live model/effort controls, a tier change must
           // end this query so the outer loop can respawn with new overrides.
+          if (query.requiresRestartForRuntimeContext && liveSettingsChanged) {
+            // Claude's system prompt is fixed when the SDK query starts. It
+            // cannot honestly accept a new model/effort until the next query,
+            // but end() is only safe between turns: closing streaming input
+            // while a turn runs also closes its control channel (#608/#610).
+            // Leave these rows pending and retry on the next idle poll.
+            if (!turnIdle || resultScopeOpen || query.hasQueuedWork?.()) {
+              log('Query settings changed but runtime context is immutable — deferring follow-up until the active query and result handling drain');
+              return;
+            }
+            log(
+              `Query settings changed (${liveSettings.model ?? 'default'} → ${fb.model ?? 'default'}) — ` +
+                'restarting at an idle boundary for a fresh runtime context; next query honors it',
+            );
+            endedForCommand = true;
+            query.end();
+            return;
+          }
           if (fastChanged || !query.applySettings) {
             log(
               `Query settings changed (${liveSettings.model ?? 'default'} → ${fb.model ?? 'default'}, ` +

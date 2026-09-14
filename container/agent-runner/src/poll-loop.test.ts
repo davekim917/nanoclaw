@@ -3604,6 +3604,120 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(efforts).toEqual(['medium', 'xhigh']);
   }, 15_000);
 
+  it('defers an immutable runtime-context restart until the active query is idle', async () => {
+    insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+    let firstResult = false;
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      // Several follow-up polls see occ-2 while this turn is still active.
+      // An eager end() would close Claude's live control channel here.
+      await Bun.sleep(1600);
+      firstResult = true;
+      yield { type: 'result', text: 'first fire', isError: true };
+      // The next poll reaches the idle boundary and can now end safely.
+      await Bun.sleep(1600);
+    }
+    let ended = false;
+    let endedAfterResult = false;
+    let applied = false;
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {
+        ended = true;
+        endedAfterResult = firstResult;
+      },
+      abort: () => {},
+      applySettings: async () => {
+        applied = true;
+      },
+      requiresRestartForRuntimeContext: true,
+      events: events(),
+    };
+
+    await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'xhigh',
+      ultracode: false,
+    });
+
+    expect(ended).toBe(true);
+    expect(endedAfterResult).toBe(true);
+    expect(applied).toBe(false);
+    expect(getPendingMessages().map((message) => message.id)).toContain('occ-2');
+  }, 15_000);
+
+  it('does not close immutable runtime context during asynchronous result handling', async () => {
+    insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+    let beginOutcome!: () => void;
+    const outcomeStarted = new Promise<void>((resolve) => {
+      beginOutcome = resolve;
+    });
+    let releaseOutcome!: () => void;
+    const outcomeReleased = new Promise<void>((resolve) => {
+      releaseOutcome = resolve;
+    });
+    let nudgePushed = false;
+    let ended = false;
+    let endedBeforeNudge = false;
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      // A task-run message block requires a corrective nudge, but its outcome
+      // write below intentionally holds result handling open first.
+      yield { type: 'result', text: '<message to="someone">not allowed for a task run</message>', answeredPrompts: ['p-initial'] };
+      await Bun.sleep(700);
+      yield { type: 'result', text: 'nudge handled', answeredPrompts: ['p-nudge'] };
+      await Bun.sleep(700);
+    }
+    const query: AgentQuery = {
+      initialPromptId: 'p-initial',
+      push: () => {
+        nudgePushed = true;
+        return 'p-nudge';
+      },
+      end: () => {
+        ended = true;
+        endedBeforeNudge = !nudgePushed;
+      },
+      abort: () => {},
+      applySettings: async () => {},
+      requiresRestartForRuntimeContext: true,
+      events: events(),
+    };
+
+    const run = processQuery(
+      query,
+      TASK_ROUTING,
+      ['occ-1'],
+      'claude',
+      undefined,
+      'p',
+      undefined,
+      { effort: 'xhigh', ultracode: false },
+      undefined,
+      undefined,
+      undefined,
+      'unknown',
+      async () => {
+        beginOutcome();
+        await outcomeReleased;
+      },
+    );
+
+    await outcomeStarted;
+    // The interval has a chance to observe the pending -e row, but must not
+    // close input before the held task outcome can lead to its corrective push.
+    await Bun.sleep(700);
+    expect(ended).toBe(false);
+    releaseOutcome();
+    await run;
+
+    expect(nudgePushed).toBe(true);
+    expect(ended).toBe(true);
+    expect(endedBeforeNudge).toBe(false);
+    expect(getPendingMessages().map((message) => message.id)).toContain('occ-2');
+  }, 15_000);
+
   it('a task admitted mid-turn does NOT retarget the running stream', async () => {
     // Round-5 P1, and the regression guard for this whole class.
     //

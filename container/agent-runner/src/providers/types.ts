@@ -357,13 +357,21 @@ export interface AgentQuery {
    * Returning the resolved model lets the caller attribute usage to what
    * actually ran; a provider that cannot report it may still return void.
    *
-   * providers without in-flight controls (codex/opencode are sticky-only)
-   * omit it and the poll-loop falls back to ending the stream so the next
-   * query picks the flags up. MUST throw when the requested combination
-   * can't be expressed live (e.g. the effortLevel control has no 'max') so
-   * the caller can use the same fallback.
+   * Providers without in-flight controls (codex/opencode are sticky-only),
+   * or with immutable query-start runtime context, omit this or set
+   * requiresRestartForRuntimeContext so the poll-loop opens a fresh query.
+   * MUST throw when the requested combination can't be expressed live (e.g.
+   * the effortLevel control has no 'max') so the caller can use that fallback.
    */
   applySettings?(settings: { model?: string; effort?: string; ultracode?: boolean }): Promise<void>;
+
+  /**
+   * True when the provider's runtime identity is installed in immutable
+   * query-start instructions. The poll-loop keeps a settings-bearing follow-up
+   * pending until the active query is idle, then ends and reopens rather than
+   * leave a later prompt with a stale identity statement.
+   */
+  readonly requiresRestartForRuntimeContext?: boolean;
 
   /**
    * The model this query is ACTUALLY running, resolved by the provider.

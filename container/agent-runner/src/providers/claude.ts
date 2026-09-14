@@ -20,6 +20,7 @@ import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/cont
 import { recordRateLimitSamples, type AccountIdentity, type RateLimitSample } from '../modules/mailbox/index.js';
 import { getCredentialSlot, setCredentialSlot } from '../modules/mailbox/session-state.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
+import { appendActiveRuntimeContext } from '../runtime-context.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { shimCwd } from './cwd-shim.js';
 import { attachTurnEffort } from './turn-effort.js';
@@ -2466,8 +2467,6 @@ export class ClaudeProvider implements AgentProvider {
     // queued work, as before, so a CLI without the events cannot pin a turn.
     let sessionStateSeen = false;
 
-    const instructions = input.systemContext?.instructions;
-
     // Per-turn input takes precedence over sticky config (A3).
     // Normalize bare opus → [1m] so the CLI's auto-compact window stays at 1M
     // regardless of auth path (see ensureOpus1mSuffix).
@@ -2506,6 +2505,11 @@ export class ClaudeProvider implements AgentProvider {
     // Safety clamp: drop to the family default when the resolved effort is
     // unsupported by the resolved model (would 400 at the API otherwise).
     const effort = clampEffortForModel(model, requestedEffort);
+    const instructions = appendActiveRuntimeContext(input.systemContext?.instructions, {
+      provider: 'claude',
+      model: model ?? 'claude:cli-default',
+      effort: effort ?? null,
+    });
     // ultracode is a session flag (xhigh + standing dynamic-workflow
     // orchestration), NOT an effort value — applied via the SDK control
     // request below. Effort is already forced to xhigh upstream when set.
@@ -3086,6 +3090,10 @@ export class ClaudeProvider implements AgentProvider {
       hasQueuedWork: () => sessionStateSeen && stream.outstanding.size > 0,
       end: () => stream.end(),
       events: translateEvents(),
+      // The SDK installs systemPrompt at query creation and exposes no control
+      // request to replace it. The poll-loop waits for an idle boundary before
+      // a live model/effort change opens a fresh authoritative query.
+      requiresRestartForRuntimeContext: true,
       // Live view of `activeModel`, which is the resolved creation model and
       // is reassigned by applySettings. A getter rather than a snapshot so
       // creation and mid-stream retarget cannot report different things.

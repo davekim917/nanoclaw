@@ -20,6 +20,7 @@ import { z } from 'zod';
 
 import { memoryContextForSessionStart, type MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
+import { appendActiveRuntimeContext } from '../runtime-context.js';
 import { setProviderHealthState, type ProviderHealthState } from '../modules/mailbox/index.js';
 import { formatCredentialRotationNotice } from '../credential-rotation-notice.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
@@ -1176,6 +1177,11 @@ export class CodexProvider implements AgentProvider {
     const effectiveModel = resolveQueryModel(input.model, this.model);
     const effectiveConfig = resolveQueryEffort(input.effort, this.stickyConfig);
     const effectiveFast = input.fast === true;
+    const runtimeInstructions = appendActiveRuntimeContext(input.systemContext?.instructions, {
+      provider: 'codex',
+      model: effectiveModel,
+      effort: effectiveConfig.reasoning_effort,
+    });
     // What this query's turns actually run at, for the turn_usage ledger.
     // `reasoning_effort` is what reaches the app-server as
     // `-c model_reasoning_effort`; the requested value is the raw `-e` before
@@ -1217,7 +1223,7 @@ export class CodexProvider implements AgentProvider {
         // lifecycle seam adds trusted static memory handling/write guidance;
         // canonical bytes arrive per turn only in paired untrusted recall.
         const memoryContext = memoryContextForSessionStart('startup');
-        const lifecycleInstructions = [input.systemContext?.instructions, memoryContext].filter(Boolean).join('\n\n');
+        const lifecycleInstructions = [runtimeInstructions, memoryContext].filter(Boolean).join('\n\n');
         const threadParams = {
           model: effectiveModel,
           cwd: input.cwd,
