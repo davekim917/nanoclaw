@@ -19,6 +19,7 @@ trap 'rm -rf "$WORK"' EXIT
 #   click <selector>       containing FAIL-CLICK  -> exit 1
 #   screenshot --full <p>  path containing FAIL-SHOT -> exit 1
 #   eval <js>               always prints a fixed stub build sha
+#   wait 1600              fails when AGENT_BROWSER_STUB_FAIL_MOBILE_SETTLE=1
 # Every other verb (state, set, find, wait, close) always succeeds.
 # ---------------------------------------------------------------------------
 STUB_BIN="$WORK/bin"
@@ -85,6 +86,10 @@ case "\$VERB" in
     esac
     ;;
   wait)
+    if [ "\${AGENT_BROWSER_STUB_FAIL_MOBILE_SETTLE:-}" = 1 ] && [ "\${1:-}" = 1600 ]; then
+      echo "stub: mobile viewport did not settle" >&2
+      exit 1
+    fi
     exit 0
     ;;
   close)
@@ -169,6 +174,19 @@ GRID_SHOT_LINE="$(grep -n -- "^--session $GRID_SESSION screenshot --full .*sheet
 [ -n "$GRID_OPEN_LINE" ] && [ -n "$GRID_VIEWPORT_LINE" ] && [ -n "$GRID_SHOT_LINE" ] &&
   [ "$GRID_OPEN_LINE" -lt "$GRID_VIEWPORT_LINE" ] && [ "$GRID_VIEWPORT_LINE" -lt "$GRID_SHOT_LINE" ] \
   || { echo "happy path: grid must open, set viewport, then screenshot in its cold session" >&2; exit 1; }
+
+# Resizing down to phone width can start an app's responsive drawer transition.
+# The mobile shot must wait through the fixed settle interval after that
+# viewport change; the network-idle wait earlier in the flow happens before
+# either viewport is changed and cannot cover this transition.
+MOBILE_SESSION="$(awk '$1=="--session" && $3=="set" && $4=="viewport" && $5=="390" && $6=="844"{print $2; exit}' "$STUB_LOG")"
+[ -n "$MOBILE_SESSION" ] || { echo "happy path: no mobile viewport call recorded" >&2; exit 1; }
+MOBILE_VIEWPORT_LINE="$(grep -n -- "^--session $MOBILE_SESSION set viewport 390 844$" "$STUB_LOG" | head -1 | cut -d: -f1)"
+MOBILE_SETTLE_LINE="$(grep -n -- "^--session $MOBILE_SESSION wait 1600$" "$STUB_LOG" | head -1 | cut -d: -f1)"
+MOBILE_SHOT_LINE="$(grep -n -- "^--session $MOBILE_SESSION screenshot --full .*390.png$" "$STUB_LOG" | head -1 | cut -d: -f1)"
+[ -n "$MOBILE_VIEWPORT_LINE" ] && [ -n "$MOBILE_SETTLE_LINE" ] && [ -n "$MOBILE_SHOT_LINE" ] &&
+  [ "$MOBILE_VIEWPORT_LINE" -lt "$MOBILE_SETTLE_LINE" ] && [ "$MOBILE_SETTLE_LINE" -lt "$MOBILE_SHOT_LINE" ] \
+  || { echo "happy path: mobile capture must wait for the post-resize settle interval" >&2; exit 1; }
 
 # the click step's text= shorthand must translate to find text ... click, not
 # a raw `click "text=..."` call agent-browser does not understand.
@@ -461,5 +479,21 @@ grep -q -- ' screenshot --full .*sheet.png$' "$STUB_LOG" \
   && { echo "grid viewport: must not screenshot a grid after viewport failure" >&2; exit 1; }
 
 echo "11/11 grid viewport failure is visible, no clipped sheet emitted"
+
+# --- 12. A failed mobile settle emits no potentially mid-transition screenshot
+RUN12="$(fresh_run_dir mobile-settle-failure)"
+cat >"$RUN12/contact-sheet/shots.json" <<'JSON'
+[{ "name": "home", "path": "/" }]
+JSON
+
+: >"$STUB_LOG"
+RESULT="$(AGENT_BROWSER_STUB_FAIL_MOBILE_SETTLE=1 bash "$SCRIPT" "$RUN12" "https://example.test" "$AUTH_STATE")"
+echo "$RESULT" | jq -e '.ok == true and .captured == 1 and .failed == 0' >/dev/null || { echo "mobile settle: expected a desktop-only partial capture: $RESULT" >&2; exit 1; }
+jq -e '.screens[0].status == "partial" and .screens[0].desktop.captured == true and .screens[0].mobile.captured == false
+       and (.screens[0].mobile.reason | test("settle"))' "$RUN12/contact-sheet/manifest.json" >/dev/null || { echo "mobile settle: expected the unsafely timed mobile capture to be recorded as missing" >&2; exit 1; }
+[ ! -e "$RUN12/contact-sheet/shots/00-home-390.png" ] || { echo "mobile settle: must not write a screenshot after the settle wait fails" >&2; exit 1; }
+grep -q -- ' screenshot --full .*00-home-390.png$' "$STUB_LOG" && { echo "mobile settle: must not invoke screenshot after the settle wait fails" >&2; exit 1; }
+
+echo "12/12 mobile settle failure stays visible, no timing-artifact screenshot emitted"
 
 echo "smoke contact sheet tests passed"

@@ -1031,6 +1031,12 @@ screen's leftover DOM/localStorage state (e.g. a nav drawer a prior screen's
 graded BROKEN as a pure capture artifact. Each screen's manifest entry
 carries `freshNavigation: true` as the record of this.
 
+**The phone capture waits for responsive transitions after its viewport
+resize.** Do not replace that settle step with a screenshot immediately after
+the 390px switch: a real PR campaign captured a drawer mid-slide and created a
+false visual finding. If the settle wait itself fails, the mobile entry is
+recorded as missing/partial instead of emitting timing-contaminated evidence.
+
 **Auth state is a live session token — never put it in the run dir or under
 the shared workgroup tree.** The script refuses both (`realpath`-checked
 against `<run-dir>` and `$SMOKE_WORKGROUP_ROOT`, default
