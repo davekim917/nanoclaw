@@ -155,6 +155,8 @@ import {
   persistResolvedWorkgroupAtSpawn,
   resolveWorkgroupIdAtSpawn,
   stripEnvEntry,
+  materializeDockerEnvironment,
+  removeDockerEnvironmentFile,
   wikiModelAuth,
   wakeContainer,
   killContainer,
@@ -972,6 +974,68 @@ describe('stripEnvEntry', () => {
     const args = ['-e', 'ANTHROPIC_API_KEY_2=x', '-e', 'ANTHROPIC_API_KEY=placeholder'];
     stripEnvEntry(args, 'ANTHROPIC_API_KEY', 'placeholder');
     expect(args).toEqual(['-e', 'ANTHROPIC_API_KEY_2=x']);
+  });
+});
+
+describe('Docker environment argument materialization', () => {
+  it('replaces all -e values with one owner-only env file while preserving duplicate-key order', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-docker-env-'));
+    fs.chmodSync(directory, 0o700);
+    try {
+      const stale = materializeDockerEnvironment(['run', '-e', 'TOKEN=stale'], directory, 'session-a');
+      const otherSession = materializeDockerEnvironment(['run', '-e', 'TOKEN=other'], directory, 'session-b');
+      const materialized = materializeDockerEnvironment(
+        ['run', '--name', 'agent', '-e', 'TOKEN=first', '-e', 'MODE=test', '-e', 'TOKEN=last', 'image:latest'],
+        directory,
+        'session-a',
+      );
+
+      expect(materialized.args).toEqual(['run', '--env-file', materialized.file, '--name', 'agent', 'image:latest']);
+      expect(materialized.file).toMatch(new RegExp(`^${directory}/\\.docker-env-`));
+      expect(fs.statSync(materialized.file!).mode & 0o777).toBe(0o600);
+      expect(fs.readFileSync(materialized.file!, 'utf8')).toBe('TOKEN=first\nMODE=test\nTOKEN=last\n');
+      expect(fs.existsSync(stale.file!)).toBe(false);
+      expect(fs.existsSync(otherSession.file!)).toBe(true);
+
+      removeDockerEnvironmentFile(materialized.file);
+      removeDockerEnvironmentFile(otherSession.file);
+      expect(fs.existsSync(materialized.file!)).toBe(false);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses malformed or multiline assignments rather than emitting an ambiguous env file', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-docker-env-'));
+    fs.chmodSync(directory, 0o700);
+    try {
+      expect(() => materializeDockerEnvironment(['run', '-e', 'BAD-KEY=value'], directory, 'session-a')).toThrow(
+        'Unsafe Docker',
+      );
+      expect(() => materializeDockerEnvironment(['run', '-e', 'TOKEN=line1\nline2'], directory, 'session-a')).toThrow(
+        'Unsafe Docker',
+      );
+      expect(fs.readdirSync(directory)).toEqual([]);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('removes a partially written credential file when durable writing fails', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-docker-env-'));
+    fs.chmodSync(directory, 0o700);
+    const fsync = vi.spyOn(fs, 'fsyncSync').mockImplementationOnce(() => {
+      throw new Error('disk full');
+    });
+    try {
+      expect(() => materializeDockerEnvironment(['run', '-e', 'TOKEN=secret'], directory, 'session-a')).toThrow(
+        'disk full',
+      );
+      expect(fs.readdirSync(directory)).toEqual([]);
+    } finally {
+      fsync.mockRestore();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
   });
 });
 

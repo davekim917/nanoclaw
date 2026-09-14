@@ -4,6 +4,7 @@
  * The container runs the v2 agent-runner which polls the session DB.
  */
 import { ChildProcess, exec, execFileSync, spawn } from 'child_process';
+import { createHash, randomUUID } from 'crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'fs';
 import os from 'os';
@@ -1870,6 +1871,18 @@ async function spawnContainer(
     mailboxEnvironment,
   );
 
+  // Build args intentionally accumulate credentials late, after provider and
+  // gateway resolution. Passing those values as `docker run -e KEY=value`
+  // exposes them to any host process reader via the Docker CLI command line.
+  // Keep the value-bearing surface in a 0600 host-only file instead; Docker
+  // receives only that pathname. It is removed when the CLI process exits.
+  // The per-agent `.context` directory is host-private: only this session's
+  // individual context FILE is mounted into the container. Do not use
+  // `<session>/.host`: its whole directory is mounted read-only at
+  // `/workspace/.host`, which would make an otherwise mode-0600 env file
+  // readable by the agent process.
+  const dockerEnvironmentDir = path.dirname(sessionContextPath(agentGroup.id, session.id));
+
   // Snapshot host capabilities into the session dir so the container can
   // read a static JSON (Phase 5.3). Refreshed every spawn so newly-mounted
   // credentials / plugins / channel registrations appear immediately.
@@ -1923,12 +1936,15 @@ async function spawnContainer(
   // takes the ordinary running-container path. `trackWake` settles it either
   // way.
   let channel: SupervisionChannel;
+  let dockerEnvironmentFile: string | null = null;
   const stderrTail: string[] = [];
   // ChildProcess emits `close` after `error`; finalize this exact channel once.
   let finalized = false;
   const finalizeContainer = (): void => {
     if (finalized) return;
     finalized = true;
+    removeDockerEnvironmentFile(dockerEnvironmentFile);
+    dockerEnvironmentFile = null;
     finalizeSession(session.id, channel, storageActivity, containerName);
   };
   try {
@@ -1951,7 +1967,9 @@ async function spawnContainer(
       if (guardRefusal !== null) {
         throw new Error(`Container spawn refused by its guard: ${guardRefusal}`);
       }
-      const child = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      const dockerEnvironment = materializeDockerEnvironment(args, dockerEnvironmentDir, session.id);
+      dockerEnvironmentFile = dockerEnvironment.file;
+      const child = spawn(CONTAINER_RUNTIME_BIN, dockerEnvironment.args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
       // The registry entry and the finalize fence below share this exact
       // channel object (`active.channel === channel` in finalizeSession).
@@ -2015,6 +2033,8 @@ async function spawnContainer(
       });
     }, 'wake guard at spawn');
   } catch (err) {
+    removeDockerEnvironmentFile(dockerEnvironmentFile);
+    dockerEnvironmentFile = null;
     // Every refusal in the block above happens with the claim already held and
     // no process to release it: hand it back here, or the next legitimate wake
     // for this session is fenced out by a spawn that never happened. This
@@ -5979,6 +5999,102 @@ export function selectedSkillNames(containerConfig: import('./container-config.j
       : containerConfig.skills;
 
   return [...new Set(requested)];
+}
+
+const DOCKER_ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const DOCKER_ENV_FILE = /^\.docker-env-[a-f0-9]{64}-\d+-[0-9a-f-]{36}$/;
+
+export interface DockerEnvironmentMaterialization {
+  /** Docker args with every value-bearing -e/--env argument replaced by one --env-file pathname. */
+  args: string[];
+  /** Host-private file that must be removed once the Docker CLI process exits. */
+  file: string | null;
+}
+
+/**
+ * Move every Docker environment assignment out of the process argument vector.
+ *
+ * A Docker `--env-file` is still visible to the daemon and the container — the
+ * host is the authority for both — but a local process listing sees only its
+ * opaque 0600 pathname, never OAuth tokens, API keys, proxy credentials or
+ * serialized MCP credentials. Preserve entry order so Docker's existing
+ * duplicate-key last-wins behavior is unchanged.
+ */
+export function materializeDockerEnvironment(
+  args: readonly string[],
+  directory: string,
+  sessionScope: string,
+): DockerEnvironmentMaterialization {
+  const environment: string[] = [];
+  const sanitized: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (argument !== '-e' && argument !== '--env') {
+      sanitized.push(argument);
+      continue;
+    }
+    const assignment = args[++index];
+    if (assignment === undefined) throw new Error(`Docker ${argument} is missing its environment assignment`);
+    const separator = assignment.indexOf('=');
+    const key = separator < 0 ? assignment : assignment.slice(0, separator);
+    const value = separator < 0 ? '' : assignment.slice(separator + 1);
+    if (!DOCKER_ENV_KEY.test(key) || /[\r\n]/.test(value)) {
+      throw new Error(`Unsafe Docker environment assignment for ${key || 'unknown key'}`);
+    }
+    environment.push(`${key}=${value}`);
+  }
+  if (environment.length === 0) return { args: sanitized, file: null };
+  if (sanitized[0] !== 'run') throw new Error('Docker environment materialization requires a docker run command');
+
+  assertRealDirectory(directory);
+  // One agent group's `.context` directory is shared by its sessions. Scope
+  // stale cleanup to this session so a new concurrent session can never unlink
+  // the env file that a different Docker CLI process is still starting with.
+  const scope = createHash('sha256').update(sessionScope).digest('hex');
+  const filenamePrefix = `.docker-env-${scope}-`;
+  // `docker run` reads the file during startup, so an old host may die after
+  // creating it but before its close handler can unlink it. A future spawn may
+  // remove only this session's opaque leaf names; unlink never follows a
+  // hostile symlink. The per-session run claim prevents two live spawns from
+  // sharing this scope.
+  for (const entry of fs.readdirSync(directory)) {
+    if (DOCKER_ENV_FILE.test(entry) && entry.startsWith(filenamePrefix)) fs.unlinkSync(path.join(directory, entry));
+  }
+  const filename = `${filenamePrefix}${process.pid}-${randomUUID()}`;
+  const file = path.join(directory, filename);
+  let descriptor: number | null = null;
+  try {
+    descriptor = fs.openSync(file, 'wx', 0o600);
+    fs.writeFileSync(descriptor, `${environment.join('\n')}\n`, 'utf8');
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = null;
+    fs.chmodSync(file, 0o600);
+  } catch (error) {
+    if (descriptor !== null) {
+      try {
+        fs.closeSync(descriptor);
+        // eslint-disable-next-line no-catch-all/no-catch-all -- retain the original write failure
+      } catch {
+        // The descriptor may have been closed by the operation that failed.
+      }
+    }
+    removeDockerEnvironmentFile(file);
+    throw error;
+  }
+  sanitized.splice(1, 0, '--env-file', file);
+  return { args: sanitized, file };
+}
+
+/** Best-effort cleanup for a file this process created under the host-only session-context directory. */
+export function removeDockerEnvironmentFile(file: string | null): void {
+  if (!file) return;
+  try {
+    fs.unlinkSync(file);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- cleanup must not mask container finalization
+  } catch {
+    // The next host-directory provenance sweep will surface an unexpected entry.
+  }
 }
 
 async function buildContainerArgs(
