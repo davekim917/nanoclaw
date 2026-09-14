@@ -595,10 +595,10 @@ function spawnOpencodeServer(
 // so that mount never fires and every group's own AGENTS.md already carries
 // the shared base + CLAUDE.local.md via composeGroupClaudeMd. No reach
 // regression — just dedup, same shape as the Codex per-turn duplication fix.
-// `systemInstructions` below is unrelated dynamic per-turn content (tone
-// profile, capability note, live destinations addendum — built in index.ts,
-// never present in AGENTS.md) with no other delivery path into OpenCode, so
-// that wrap stays.
+// `systemInstructions` below combines the trusted resolved runtime identity,
+// static memory guidance, and dynamic per-turn content (tone profile,
+// capability note, live destinations addendum — built in index.ts). Those
+// inputs have no other delivery path into OpenCode, so that wrap stays.
 function wrapPromptWithContext(text: string, systemInstructions?: string): string {
   let out = text;
   if (systemInstructions) {
@@ -1277,9 +1277,9 @@ export class OpenCodeProvider implements AgentProvider {
     // `effort` rebuilds the runtime config (it lives server-side); `model` is
     // applied per-prompt via body.model below so a switch needs no respawn and
     // keeps session continuity. The effective model = turn override → env
-    // default (host sets OPENCODE_MODEL from the DB default). effectiveModel is
-    // also injected into the prompt (wrapPromptWithContext) so the agent knows
-    // which model it's actually on.
+    // default (host sets OPENCODE_MODEL from the DB default). The resolved
+    // model and effort are injected into a trusted runtime block below so the
+    // agent knows what this turn is actually running on.
     const turn: OpenCodeTurnOverrides = { model: input.model, effort: input.effort };
     const effectiveModel = input.model ?? process.env.OPENCODE_MODEL;
     // What this query's turns actually run at, for the turn_usage ledger.
