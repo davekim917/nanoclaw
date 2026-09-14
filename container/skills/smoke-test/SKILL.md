@@ -421,10 +421,18 @@ bash /app/skills/smoke-test/scripts/smoke-pair-identity.sh check <run-dir> <labe
 bash /app/skills/smoke-test/scripts/smoke-pair-identity.sh finish <run-dir>
 ```
 
+For a PR-owned completion contract, those service ids must be the PR preview
+pair: `start`, `check`, and `finish` require both live commits to equal
+the contract's `sourceSha`. The shared develop ids in the wrapper env are not
+a safe fallback for a PR campaign; a source mismatch is exit 2 at `start`
+(nothing frozen) and exit 3 at `check`/`finish` (BLOCKED). Resolve the PR
+preview ids first rather than overriding or ignoring that refusal.
+
 Every run, from the coordinator freezing before dispatch: `start` before any
 lane runs; every lane (worker, challenger, coordinator) `check`s at its own
 start and end; the coordinator `finish`es before publication. `check`/`finish`
-exit 3 on drift — finish the run **BLOCKED**, never a scored verdict — exit 2
+exit 3 on drift or a PR-contract source mismatch — finish the run **BLOCKED**,
+never a scored verdict — exit 2
 means the identity itself is unreadable/invalid (refuse, do not proceed), and
 exit 4 from `start` means this run already froze an identity: never re-freeze
 by calling `start` again. Reachability checks (`smoke-build-identity.sh`'s
