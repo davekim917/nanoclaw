@@ -36,6 +36,9 @@
  */
 import type { RateLimitSample } from '../modules/mailbox/index.js';
 
+// Headroom left on a slot so the in-flight turn can finish before the wall. A wall mid-turn aborts and replays the whole query (SDK snapshots the token at spawn — see PR #811 body), which costs more than 5% of a weekly slot. Tune from measurement: slots resetting under 90% used → tighten; mid-turn walls still >2/day → widen.
+export const SLOT_PICK_HEADROOM = 0.05;
+
 export const OAUTH_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 export const OAUTH_BETA_HEADER = 'oauth-2025-04-20';
 
@@ -130,8 +133,9 @@ function windowUtilization(samples: RateLimitSample[], limitType: string): numbe
 /**
  * The rule. Utilizations are the 0-1 fractions the sample rows carry.
  *
- * Eligible: sampled, plan limits apply, `seven_day` present and < 1.0, and
- * `five_hour` (when reported) < 1.0. The five-hour exclusion is not in the
+ * Eligible: sampled, plan limits apply, `seven_day` present and below
+ * `1 - SLOT_PICK_HEADROOM`, and `five_hour` (when reported) < 1.0. The
+ * five-hour exclusion is not in the
  * plan row's wording, but a slot whose five-hour window is already full
  * 429s on its first request and the in-turn rotation then moves to ring
  * position +1 — not to the next-best slot by usage — so choosing it can only
@@ -149,7 +153,7 @@ export function pickSlotByUsage(readings: SlotUsageReading[]): SlotPick {
     const sevenDay = windowUtilization(samples, 'seven_day');
     const fiveHour = windowUtilization(samples, 'five_hour');
     if (sevenDay === null) return { name, sevenDay, fiveHour, skipped: 'no_seven_day' };
-    if (sevenDay >= 1) return { name, sevenDay, fiveHour, skipped: 'seven_day_exhausted' };
+    if (sevenDay >= 1 - SLOT_PICK_HEADROOM) return { name, sevenDay, fiveHour, skipped: 'seven_day_exhausted' };
     if (fiveHour !== null && fiveHour >= 1) return { name, sevenDay, fiveHour, skipped: 'five_hour_exhausted' };
     return { name, sevenDay, fiveHour, skipped: null };
   });

@@ -11,6 +11,7 @@ import { ClaudeProvider, usageResponseToSamples } from './claude.js';
 import {
   OAUTH_BETA_HEADER,
   OAUTH_USAGE_URL,
+  SLOT_PICK_HEADROOM,
   fetchSlotUsage,
   formatSlotRanking,
   pickSlotByUsage,
@@ -37,7 +38,7 @@ function reading(name: string, body: Record<string, unknown> | null): SlotUsageR
 const win = (utilization: number, resets_at = '2026-09-17T00:00:00Z') => ({ utilization, resets_at });
 
 describe('pickSlotByUsage — the rule', () => {
-  it('picks the highest seven_day utilization that is still below 1.0 (drain most-used first)', () => {
+  it('picks the highest seven_day utilization that is still below the headroom line (drain most-used first)', () => {
     const pick = pickSlotByUsage([
       reading('CLAUDE_CODE_OAUTH_TOKEN', { five_hour: win(10), seven_day: win(76) }),
       reading('CLAUDE_CODE_OAUTH_TOKEN_2', { five_hour: win(40), seven_day: win(87) }),
@@ -46,6 +47,24 @@ describe('pickSlotByUsage — the rule', () => {
       reading('CLAUDE_CODE_OAUTH_TOKEN_6', { five_hour: win(60), seven_day: win(18) }),
     ]);
     expect(pick.chosen).toBe('CLAUDE_CODE_OAUTH_TOKEN_3');
+  });
+
+  it('leaves SLOT_PICK_HEADROOM: a slot at 0.96 is skipped in favour of one at 0.90', () => {
+    expect(SLOT_PICK_HEADROOM).toBe(0.05);
+    const pick = pickSlotByUsage([
+      reading('A', { five_hour: win(1), seven_day: win(96) }),
+      reading('B', { five_hour: win(1), seven_day: win(90) }),
+    ]);
+    expect(pick.chosen).toBe('B');
+    expect(pick.ranking[0]).toMatchObject({ name: 'A', sevenDay: 0.96, skipped: 'seven_day_exhausted' });
+  });
+
+  it('a slot at 0.94 is still inside the headroom line and is picked over 0.90', () => {
+    const pick = pickSlotByUsage([
+      reading('A', { five_hour: win(1), seven_day: win(94) }),
+      reading('B', { five_hour: win(1), seven_day: win(90) }),
+    ]);
+    expect(pick.chosen).toBe('A');
   });
 
   it('tiebreaks equal seven_day on the highest five_hour below 1.0', () => {
