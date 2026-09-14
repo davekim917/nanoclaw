@@ -22,6 +22,12 @@ vi.mock('../../config.js', async (importOriginal) => ({
 // the async funnel opened between the snapshot/verdict and the cancel. Real
 // implementation otherwise, so every other case in this file is unaffected.
 const duringMailboxAcquire = vi.hoisted(() => ({ run: null as (() => void) | null }));
+// This hook fires exactly before execute's post-insert target-ownership proof
+// reads the target row. It lets the test model a row disappearing after
+// scheduleTask returns but before the move is allowed to claim success.
+const beforeTargetOwnershipRead = vi.hoisted(() => ({
+  run: null as ((sessionId: string, rowId: string) => void) | null,
+}));
 vi.mock('../../session-manager.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../session-manager.js')>();
   return {
@@ -30,6 +36,27 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
       const hook = duringMailboxAcquire.run;
       duringMailboxAcquire.run = null;
       hook?.();
+      if (agentGroupId === 'tgt-ag' && beforeTargetOwnershipRead.run) {
+        return actual.withExistingMailboxSession(
+          agentGroupId,
+          sessionId,
+          (mailbox) =>
+            (action as (target: unknown) => unknown)(
+              new Proxy(mailbox as object, {
+                get(target, property, receiver) {
+                  const value = Reflect.get(target, property, receiver);
+                  if (property !== 'getLiveTaskRowById' || typeof value !== 'function') return value;
+                  return (...args: unknown[]) => {
+                    const targetHook = beforeTargetOwnershipRead.run;
+                    beforeTargetOwnershipRead.run = null;
+                    targetHook?.(sessionId, String(args[0] ?? ''));
+                    return value.apply(target, args);
+                  };
+                },
+              }),
+            ) as never,
+        );
+      }
       return actual.withExistingMailboxSession(agentGroupId, sessionId, action);
     },
   };
@@ -218,6 +245,13 @@ function req(body: unknown): Request {
     headers: { 'Content-Type': 'application/json' },
   });
 }
+function malformedReq(): Request {
+  return new Request('http://x/m', {
+    method: 'POST',
+    body: '{',
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
 async function readJson(res: Response): Promise<Record<string, unknown>> {
   return (await res.json()) as Record<string, unknown>;
 }
@@ -228,6 +262,8 @@ beforeEach(async () => {
   await setupCentralDb();
   invalidateScheduledCache();
   _resetScheduledRateLimitForTesting();
+  duringMailboxAcquire.run = null;
+  beforeTargetOwnershipRead.run = null;
   _setMoveTestOptions({ dataDir: TEST_DIR, nowMs: NOW });
 });
 
@@ -273,6 +309,34 @@ function seedMoveFixture(opts?: {
 
 // ── D1: preview ────────────────────────────────────────────────────────────────
 describe('movePreviewHandler', () => {
+  it('uses the production data-root defaults when no test seam is configured', async () => {
+    const { key } = seedMoveFixture();
+    _setMoveTestOptions(null);
+    const res = (await movePreviewHandler(
+      req({ targetAgentGroupId: 'tgt-ag', targetMessagingGroupId: 'tgt-mg' }),
+      { key },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(res.status).toBe(200);
+  });
+
+  it('rejects malformed JSON before resolving a move key', async () => {
+    const { key } = seedMoveFixture();
+    const res = (await movePreviewHandler(malformedReq(), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(400);
+    expect((await readJson(res)).error).toBe('invalid_request');
+  });
+
+  it('does not disclose an invalid move locator', async () => {
+    seedMoveFixture();
+    const res = (await movePreviewHandler(
+      req({ targetAgentGroupId: 'tgt-ag', targetMessagingGroupId: 'tgt-mg' }),
+      { key: 'not-a-move-key' },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(res.status).toBe(404);
+  });
+
   it('test_preview_requires_mutation_tier', async () => {
     const { key } = seedMoveFixture();
     const scopes = { role: 'admin_of_group' as const, allowed_group_ids: ['src-ag'], no_filter: false };
@@ -332,6 +396,30 @@ describe('movePreviewHandler', () => {
     expect(body.environmentDeltaChecked).toBe(false);
     expect(body.scriptPresent).toBe(true);
     expect(typeof body.deltaHash).toBe('string');
+  });
+
+  it('treats a missing group container file as an empty per-group secret scope', async () => {
+    const { key } = seedMoveFixture();
+    fs.rmSync(path.join(TEST_DIR, 'groups', 'tgt-folder', 'container.json'));
+    const res = (await movePreviewHandler(
+      req({ targetAgentGroupId: 'tgt-ag', targetMessagingGroupId: 'tgt-mg' }),
+      { key },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(res.status).toBe(200);
+    expect((await readJson(res)).gains).toEqual([]);
+  });
+
+  it('treats malformed group configuration as an empty per-group secret scope', async () => {
+    const { key } = seedMoveFixture();
+    fs.writeFileSync(path.join(TEST_DIR, 'groups', 'tgt-folder', 'container.json'), '{');
+    const res = (await movePreviewHandler(
+      req({ targetAgentGroupId: 'tgt-ag', targetMessagingGroupId: 'tgt-mg' }),
+      { key },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(res.status).toBe(200);
+    expect((await readJson(res)).gains).toEqual([]);
   });
 
   it('test_preview_unwired_target', async () => {
@@ -500,6 +588,59 @@ describe('moveExecuteHandler', () => {
     expect(audit.actor).toBe('host');
   });
 
+  it('host task move refuses an unknown source without fabricating a dashboard error', async () => {
+    seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    await expect(
+      moveTaskAsHost({
+        sourceAgentGroupId: 'missing-source',
+        sourceSessionId: 'missing-session',
+        seriesId: 'missing-series',
+        targetAgentGroupId: 'tgt-ag',
+        targetMessagingGroupId: 'tgt-mg',
+      }),
+    ).rejects.toThrow('task move source or target was not found');
+  });
+
+  it('host task move reports target conflicts with its stable operator reason', async () => {
+    seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    addTaskSession('tgt-sess', 'tgt-ag');
+    insertRow(seedSession('tgt-ag', 'tgt-sess').inbound, { id: 'existing-target', series_id: 'ser-1' });
+
+    await expect(
+      moveTaskAsHost({
+        sourceAgentGroupId: 'src-ag',
+        sourceSessionId: 'src-sess',
+        seriesId: 'ser-1',
+        targetAgentGroupId: 'tgt-ag',
+        targetMessagingGroupId: 'tgt-mg',
+      }),
+    ).rejects.toThrow('task move failed: target_conflict');
+  });
+
+  it('leaves the move intent unresolved when the post-insert target ownership proof loses its row', async () => {
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    beforeTargetOwnershipRead.run = (sessionId, targetRowId) => {
+      const target = openInboundDb(path.join(TEST_DIR, 'v2-sessions', 'tgt-ag', sessionId, 'inbound.db'));
+      try {
+        // Keep a live same-series row so the later count-only invariant stays
+        // satisfied. This must fail on exact ownership, not merely count zero.
+        target.prepare("UPDATE messages_in SET id = 'unowned-target-row' WHERE id = ?").run(targetRowId);
+      } finally {
+        target.close();
+      }
+    };
+
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+
+    expect(res.status).toBe(500);
+    expect((await readJson(res)).reason).toBe('invariant_violated');
+    expect(liveRowsForSeries('tgt-ag', targetSessionId()!, 'ser-1')).toMatchObject([{ id: 'unowned-target-row' }]);
+    const intent = getRawDb().prepare("SELECT resolved_at FROM scheduled_audit WHERE action = 'move_intent'").get() as {
+      resolved_at: string | null;
+    };
+    expect(intent.resolved_at).toBeNull();
+  });
+
   it('preserves the complete source task envelope across a move', async () => {
     const content = JSON.stringify({
       prompt: 'do thing',
@@ -519,6 +660,48 @@ describe('moveExecuteHandler', () => {
     const target = liveRowsForSeries('tgt-ag', targetSessionId()!, 'ser-1');
     expect(target).toHaveLength(1);
     expect(target[0]!.content).toBe(content);
+  });
+
+  it('rejects malformed JSON before applying the interactive rate limit', async () => {
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    const res = (await moveExecuteHandler(malformedReq(), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(400);
+    expect((await readJson(res)).error).toBe('invalid_request');
+  });
+
+  it('requires both target identifiers and never treats a missing target as a stale delta', async () => {
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    const res = (await moveExecuteHandler(req({}), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(400);
+    expect((await readJson(res)).error).toBe('invalid_request');
+  });
+
+  it('refuses an invalid stored task pin before cancelling the source occurrence', async () => {
+    const { key } = seedMoveFixture({
+      sourceProcessAfter: isoIn(10 * 3600_000),
+      sourceContent: JSON.stringify({ prompt: 'do thing', flagIntent: { turnModel: 'not-a-real-model' } }),
+    });
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(409);
+    expect((await readJson(res)).reason).toBe('target_pin_invalid');
+    expect(liveRowsForSeries('src-ag', 'src-sess', 'ser-1')).toHaveLength(1);
+  });
+
+  it('does not disclose a missing target agent or messaging group', async () => {
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    const missingAgent = (await moveExecuteHandler(
+      req(await moveBody({ targetAgentGroupId: 'missing-agent' })),
+      { key },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(missingAgent.status).toBe(404);
+
+    const missingMessagingGroup = (await moveExecuteHandler(
+      req(await moveBody({ targetMessagingGroupId: 'missing-messaging-group' })),
+      { key },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(missingMessagingGroup.status).toBe(404);
   });
 
   // The move approves ONE occurrence and writes a move_intent naming that row
