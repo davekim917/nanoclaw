@@ -179,12 +179,41 @@ describe('fetchSlotUsage — the per-slot pull', () => {
     await expect(fetchSlotUsage('t', { fetchImpl, timeoutMs: 1000 })).rejects.toThrow('non-object');
   });
 
+  it('never lets the fetch layer’s message — which can quote the Authorization header — escape (PR #811 F1)', async () => {
+    const fetchImpl = (async () => {
+      throw new TypeError('Headers.append: "Bearer sk-live-SECRET" is an invalid header value');
+    }) as unknown as typeof fetch;
+    let thrown: unknown;
+    try {
+      await fetchSlotUsage('sk-live-SECRET', { fetchImpl, timeoutMs: 1000 });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    const message = (thrown as Error).message;
+    expect(message).toBe('usage pull transport error: TypeError');
+    expect(message).not.toContain('SECRET');
+    expect(String(thrown)).not.toContain('SECRET');
+  });
+
+  it('sanitizes a body-parse failure the same way', async () => {
+    const fetchImpl = (async () =>
+      new Response('not json sk-live-SECRET', { status: 200, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch;
+    await expect(fetchSlotUsage('sk-live-SECRET', { fetchImpl, timeoutMs: 1000 })).rejects.toThrow(
+      /^usage pull body unreadable: \w+$/,
+    );
+  });
+
   it('aborts a hung pull at the deadline', async () => {
     const fetchImpl = ((_url: unknown, init?: RequestInit) =>
       new Promise<Response>((_, reject) => {
         init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
       })) as unknown as typeof fetch;
-    await expect(fetchSlotUsage('t', { fetchImpl, timeoutMs: 20 })).rejects.toThrow('aborted');
+    // The reject only fires from the abort listener, so a rejection here still proves the
+    // deadline fired; the message itself is sanitized to the error's class name (PR #811 F1).
+    await expect(fetchSlotUsage('t', { fetchImpl, timeoutMs: 20 })).rejects.toThrow(
+      'usage pull transport error: Error',
+    );
   });
 });
 

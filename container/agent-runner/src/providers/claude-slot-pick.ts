@@ -68,23 +68,41 @@ export interface FetchSlotUsageOptions {
  *
  * `subscription_type` is null here: the CLI derives it from the OAuth
  * profile, not from this endpoint, and the pick does not need it.
+ *
+ * Every error leaving this function is built HERE from a status code or an
+ * error CLASS NAME — never from the fetch layer's `.message`. The token is
+ * the `Authorization` header value, and a malformed slot value (a stray
+ * newline, a non-ASCII byte) makes `fetch()` throw a TypeError whose message
+ * quotes the offending header value verbatim; the caller logs `.message`,
+ * so passing it through would put the credential in the container log.
+ * PR #811 review F1.
  */
 export async function fetchSlotUsage(token: string, opts: FetchSlotUsageOptions): Promise<OauthUsageResponse> {
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
   try {
-    const res = await fetchImpl(opts.url ?? OAUTH_USAGE_URL, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'anthropic-beta': OAUTH_BETA_HEADER,
-        Accept: 'application/json',
-      },
-      signal: controller.signal,
-    });
+    let res: Response;
+    try {
+      res = await fetchImpl(opts.url ?? OAUTH_USAGE_URL, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'anthropic-beta': OAUTH_BETA_HEADER,
+          Accept: 'application/json',
+        },
+        signal: controller.signal,
+      });
+    } catch (err) {
+      throw new Error(`usage pull transport error: ${sanitizedErrorName(err)}`);
+    }
     if (!res.ok) throw new Error(`usage pull HTTP ${res.status}`);
-    const body: unknown = await res.json();
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch (err) {
+      throw new Error(`usage pull body unreadable: ${sanitizedErrorName(err)}`);
+    }
     if (typeof body !== 'object' || body === null || Array.isArray(body)) {
       throw new Error('usage pull returned a non-object body');
     }
@@ -96,6 +114,11 @@ export async function fetchSlotUsage(token: string, opts: FetchSlotUsageOptions)
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** The error's class name only (`TypeError`, `AbortError`, …) — never its message. */
+function sanitizedErrorName(err: unknown): string {
+  return err instanceof Error && err.name ? err.name : 'unknown';
 }
 
 /** One ring slot's pull outcome. `samples: null` means the pull failed (unsampled). */
