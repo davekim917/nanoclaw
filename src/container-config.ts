@@ -626,15 +626,25 @@ export function validateGitIdentity(value: unknown): GitIdentity | undefined {
 }
 
 /**
+ * Smallest honoured `autoCompactWindow`. CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80
+ * fires at 80% of the window; below ~100k a large standing-instruction set
+ * (~14k tokens on the heaviest group) plus a few tool results would compact every handful
+ * of calls, and the session would lose more context to summaries than the
+ * window saves.
+ */
+export const MIN_AUTO_COMPACT_WINDOW = 100_000;
+
+/**
  * Validate the optional `autoCompactWindow` override. Absent means the fleet
- * default; anything present must be a positive integer token count. A typo
- * throws, like `validateContainerResources`, rather than silently reading as
- * the 1M default — a lowered window that quietly reverts is a fail-open.
+ * default; anything present must be an integer token count at or above
+ * `MIN_AUTO_COMPACT_WINDOW`. A typo throws, like `validateContainerResources`,
+ * rather than silently reading as the 1M default — a lowered window that
+ * quietly reverts is a fail-open.
  */
 export function validateAutoCompactWindow(value: unknown): number | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
-    throw new Error('autoCompactWindow must be a positive integer (tokens)');
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < MIN_AUTO_COMPACT_WINDOW) {
+    throw new Error(`autoCompactWindow must be an integer token count >= ${MIN_AUTO_COMPACT_WINDOW}`);
   }
   return value;
 }

@@ -14,6 +14,7 @@ import {
   readContainerConfigStrict,
   effectiveTimezone,
   honouredTimezoneOverride,
+  MIN_AUTO_COMPACT_WINDOW,
   resolveGroupTimezone,
   updateContainerConfig,
   writeContainerConfig,
@@ -741,5 +742,16 @@ describe('autoCompactWindow (quota-burn plan §0.5)', () => {
       writeGroupConfig('acw-bad', { autoCompactWindow: bad });
       expect(() => readContainerConfig('acw-bad')).toThrow(/autoCompactWindow/);
     }
+  });
+
+  it('refuses a window below the floor and accepts the floor itself', () => {
+    // 1000 is a positive integer and would pass a shape-only check, but at
+    // 80% it compacts every few tool calls (PR #810 review N3).
+    for (const low of [1000, MIN_AUTO_COMPACT_WINDOW - 1]) {
+      writeGroupConfig('acw-low', { autoCompactWindow: low });
+      expect(() => readContainerConfig('acw-low')).toThrow(new RegExp(`>= ${MIN_AUTO_COMPACT_WINDOW}`));
+    }
+    writeGroupConfig('acw-floor', { autoCompactWindow: MIN_AUTO_COMPACT_WINDOW });
+    expect(readContainerConfig('acw-floor').autoCompactWindow).toBe(MIN_AUTO_COMPACT_WINDOW);
   });
 });

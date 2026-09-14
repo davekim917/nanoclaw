@@ -9,7 +9,29 @@ import type { ContainerConfig } from './container-config.js';
  * decline to derive an effort — but with every model-dependent decision now
  * living where the model is chosen, the host has no reason to know it exists.
  */
-export type ClaudeSpawnConfig = Pick<ContainerConfig, 'model' | 'effort' | 'defaultModel' | 'defaultEffort'>;
+export type ClaudeSpawnConfig = Pick<
+  ContainerConfig,
+  'model' | 'effort' | 'defaultModel' | 'defaultEffort' | 'autoCompactWindow'
+>;
+
+/**
+ * Quota caps every Claude container receives (docs/specs/quota-burn/plan.md
+ * §Tier 0). One definition, emitted by `claudeSpawnEnv` for BOTH spawn
+ * branches in container-runner.ts (ordinary and wiki) and mirrored into each
+ * group's `.claude-shared/settings.json` by group-init.ts `REQUIRED_ENV`, so a
+ * settings pin can never disagree with the `-e` the spawn path sends.
+ *
+ * Auto-compact window default: Claude Code 2.1+ has a built-in window well
+ * under 200k even on a [1m] model; 1_000_000 matches the [1m] capacity so
+ * CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80 fires around 800k. A group lowers it via
+ * container.json `autoCompactWindow` (§0.5). Subagent caps: CLI defaults are
+ * depth 3 / concurrency 20; the orchestrate contract forbids workers
+ * re-delegating (depth 1 enforces it) and concurrency 3 bounds the
+ * five-hour-meter burst (§0.1/0.2).
+ */
+export const DEFAULT_CLAUDE_AUTO_COMPACT_WINDOW = 1_000_000;
+export const CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH = '1';
+export const CLAUDE_MAX_CONCURRENT_SUBAGENTS = '3';
 
 /** What the claude spawn branch will put in the container's environment. */
 export interface ClaudeSpawnDefaults {
@@ -168,5 +190,16 @@ export function claudeSpawnEnv(
     `ANTHROPIC_DEFAULT_HAIKU_MODEL=${DEFAULT_HAIKU_MODEL}`,
   ];
   if (resolved.effort) env.push('-e', `NANOCLAW_EFFORT_OVERRIDE=${resolved.effort}`);
+  // Quota caps ride the same primitive so the wiki spawn branch, which builds
+  // its own argv and returns before the ordinary branch's env block, cannot
+  // fall behind it (PR #810 review F1).
+  env.push(
+    '-e',
+    `CLAUDE_CODE_AUTO_COMPACT_WINDOW=${containerConfig.autoCompactWindow ?? DEFAULT_CLAUDE_AUTO_COMPACT_WINDOW}`,
+    '-e',
+    `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=${CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH}`,
+    '-e',
+    `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=${CLAUDE_MAX_CONCURRENT_SUBAGENTS}`,
+  );
   return env;
 }

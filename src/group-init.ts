@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import { CLAUDE_MAX_CONCURRENT_SUBAGENTS, CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH } from './claude-spawn-defaults.js';
 import { DATA_DIR, DEFAULT_AGENT_PROVIDER, GROUPS_DIR } from './config.js';
 import { stageGroupPersona, STANDING_INSTRUCTIONS_FILE } from './group-persona.js';
 import { log } from './log.js';
@@ -33,7 +34,13 @@ const REQUIRED_ENV: Record<string, string> = {
   CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '80',
   // CLAUDE_CODE_AUTO_COMPACT_WINDOW used to be pinned here at 1_000_000. It is
   // now per-group (container.json `autoCompactWindow`, default 1M) and passed
-  // via docker -e at spawn (container-runner.ts) — see DEPRECATED_ENV below.
+  // via docker -e at spawn (claudeSpawnEnv) — see DEPRECATED_ENV below.
+  // The subagent caps are fleet constants, so they CAN be pinned here: same
+  // value as the spawn `-e` (both read the constants in claude-spawn-defaults.ts),
+  // and managing them means a hand-edited settings.json cannot shadow the `-e`
+  // with a different number — the reconciler overwrites it on the next init.
+  CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH,
+  CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: CLAUDE_MAX_CONCURRENT_SUBAGENTS,
   // Disable adaptive thinking so the CLI emits visible `thinking` content
   // blocks (the older fixed-budget mode). The CLI's internal gate only
   // applies this to model ids containing "opus-4-6" or "sonnet-4-6"; for

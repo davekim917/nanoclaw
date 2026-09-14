@@ -6242,17 +6242,9 @@ async function buildContainerArgs(
   // timeout for ordinary Bash calls.
   args.push('-e', 'BASH_MAX_TIMEOUT_MS=3600000');
   args.push('-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80');
-  // Claude Code 2.1+ has a built-in auto-compact window default that is well
-  // under 200k even when the session uses a 1M-context model (claude-opus-4-7[1m]).
-  // Without this override, CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80 fires against the
-  // CLI's small default window — sessions compact far earlier than the model's
-  // actual capacity. Setting 1_000_000 matches the [1m] capacity so 80% fires
-  // around 800k tokens. For non-[1m] sessions the percentage-based trigger still
-  // fires at 80% of the model's own context window before this override matters.
-  // The CLI itself hints at this value: "override with CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000".
-  // A group may lower the floor via container.json `autoCompactWindow`
-  // (docs/specs/quota-burn/plan.md §0.5); anything else keeps the 1M default.
-  args.push('-e', `CLAUDE_CODE_AUTO_COMPACT_WINDOW=${containerConfig.autoCompactWindow ?? 1000000}`);
+  // CLAUDE_CODE_AUTO_COMPACT_WINDOW (paired with the percentage above) and the
+  // subagent caps are emitted by claudeSpawnEnv (src/claude-spawn-defaults.ts)
+  // so the wiki spawn branch above, which returns early, gets the same values.
   // (Removed 2026-06-10: CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 +
   // MAX_THINKING_TOKENS=127999. They forced the CLI's legacy fixed-budget
   // thinking mode for explicit 4-6 selections so thinking blocks stayed
@@ -6525,11 +6517,6 @@ async function buildContainerArgs(
   // v2's container reads env, not a settings.json mount point.
   args.push('-e', 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1');
   args.push('-e', 'CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1');
-  // Subagent caps (CLI defaults: depth 3, concurrency 20). The orchestrate
-  // contract forbids workers re-delegating; depth 1 enforces it. Concurrency
-  // 3 caps the five-hour-meter burst. docs/specs/quota-burn/plan.md §Tier 0.
-  args.push('-e', 'CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1');
-  args.push('-e', 'CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=3');
   args.push('-e', 'ENABLE_TOOL_SEARCH=true');
 
   // Forward CODEX_FALLBACK_HOMES when fallback codex auth dirs were mounted.
