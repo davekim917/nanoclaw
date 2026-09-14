@@ -1988,12 +1988,12 @@ export async function processQuery(
             // but end() is only safe between turns: closing streaming input
             // while a turn runs also closes its control channel (#608/#610).
             // Leave these rows pending and retry on the next idle poll.
-            if (!turnIdle || query.hasQueuedWork?.()) {
-              log('Query settings changed but runtime context is immutable — deferring follow-up until the active query drains');
+            if (!turnIdle || resultScopeOpen || query.hasQueuedWork?.()) {
+              log('Query settings changed but runtime context is immutable — deferring follow-up until the active query and result handling drain');
               return;
             }
             log(
-              `Query settings changed (${liveSettings.model ?? 'default'} → ${fb.model ?? 'default'}, ` +
+              `Query settings changed (${liveSettings.model ?? 'default'} → ${fb.model ?? 'default'}) — ` +
                 'restarting at an idle boundary for a fresh runtime context; next query honors it',
             );
             endedForCommand = true;
