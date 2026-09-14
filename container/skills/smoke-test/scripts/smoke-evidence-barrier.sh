@@ -141,12 +141,25 @@ invalid_reason() {
   ' "$marker_path" 2>/dev/null || printf 'not valid JSON'
 }
 
-# A `pass` says the lane has affirmative evidence. Requiring a nonempty,
-# regular file inside the run root makes that claim durable instead of letting
-# an empty evidence array, a future screenshot path, or a host path clear the
-# synthesis barrier. Non-pass markers deliberately do not use this check: a
-# concrete blocker or failure reason is a valid terminal result even when no
-# success evidence exists.
+# A pass says the lane has affirmative evidence. Requiring a nonempty, regular
+# file inside the run root makes that claim durable instead of letting an empty
+# evidence array, a future screenshot path, or a host path clear the synthesis
+# barrier. The one non-file form is the same well-formed clip-skipped line that
+# finding_clip_problem accepts for a confirmed finding: a recording failure is
+# an explicit account, not a promised file. Non-pass markers deliberately do
+# not use this check: a concrete blocker or failure reason is a valid terminal
+# result even when no success evidence exists.
+valid_clip_skip_entry() { # <marker-path> <evidence-entry>
+  jq -e --arg entry "$2" '
+    (.confirmedFindings | type == "array") and
+    any(.confirmedFindings[];
+      . as $finding |
+      type == "string" and length > 0 and
+      ($entry | startswith("clip-skipped: " + $finding + ": ")) and
+      ($entry | ltrimstr("clip-skipped: " + $finding + ": ") | length > 0))
+  ' "$1" >/dev/null 2>&1
+}
+
 pass_evidence_problem() {
   local marker_path="$1" evidence_path candidate run_root resolved
 
@@ -168,6 +181,13 @@ pass_evidence_problem() {
 
   while IFS= read -r evidence_path; do
     case "$evidence_path" in
+      clip-skipped:*)
+        if valid_clip_skip_entry "$marker_path" "$evidence_path"; then
+          continue
+        fi
+        printf 'pass marker clip-skipped evidence is not a nonempty skip reason for a confirmed finding: %s' "$evidence_path"
+        return
+        ;;
       /*|.|..|../*|*/../*|*/..)
         printf 'pass marker evidence path is absolute or escapes the run root: %s' "$evidence_path"
         return
@@ -339,7 +359,9 @@ floor_evidence_problem() {
   lane_declares_api_evidence "$lane_id" && return 0
 
   if ! jq -e --arg ext "$FLOOR_MEDIA_EXTENSIONS" '
-    any((.evidence // [])[]; test("\\.(" + $ext + ")$"; "i"))
+    any((.evidence // [])[];
+      (startswith("clip-skipped: ") | not) and
+      test("\\.(" + $ext + ")$"; "i"))
   ' "$marker_path" >/dev/null 2>&1; then
     printf 'floor pass without browser evidence'
   fi

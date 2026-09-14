@@ -234,8 +234,27 @@ bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$CLIP_DIR" lanes \
   | jq -e '.ready == true' >/dev/null || {
   echo "expected a stated clip-skipped reason to clear the barrier with no clip file" >&2; exit 1; }
 
+# A pass marker uses the same evidence array and must accept this exact
+# well-formed skip form too. Treating every evidence string as a file path
+# would reject this as a missing file before finding_clip_problem got to
+# recognize the stated recording exception.
+jq '.status = "pass"' "$CLIP_DIR/markers/B1.json" >"$CLIP_DIR/markers/.marker.json"
+mv "$CLIP_DIR/markers/.marker.json" "$CLIP_DIR/markers/B1.json"
+bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$CLIP_DIR" lanes \
+  | jq -e '.ready == true' >/dev/null || {
+  echo "expected a pass marker with a stated clip-skipped reason to clear the barrier" >&2; exit 1; }
+
+# Passing a magic-looking non-file string is never enough: it must name one of
+# this marker's confirmed findings with a nonempty reason.
+jq '.evidence = ["clip-skipped: F9: unrelated finding"]' "$CLIP_DIR/markers/B1.json" \
+  >"$CLIP_DIR/markers/.marker.json"
+mv "$CLIP_DIR/markers/.marker.json" "$CLIP_DIR/markers/B1.json"
+RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$CLIP_DIR" lanes || true)"
+echo "$RESULT" | jq -e '(.ready == false) and (.invalidReasons[0] | contains("clip-skipped evidence"))' >/dev/null || {
+  echo "expected an unconfirmed clip-skipped line on a pass marker to fail" >&2; echo "$RESULT" >&2; exit 1; }
+
 # An empty reason after the prefix does not count as "stated".
-jq '.evidence = ["clip-skipped: F1: "]' "$CLIP_DIR/markers/B1.json" >"$CLIP_DIR/markers/.marker.json"
+jq '.status = "fail" | .evidence = ["clip-skipped: F1: "]' "$CLIP_DIR/markers/B1.json" >"$CLIP_DIR/markers/.marker.json"
 mv "$CLIP_DIR/markers/.marker.json" "$CLIP_DIR/markers/B1.json"
 RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$CLIP_DIR" lanes || true)"
 echo "$RESULT" | jq -e '.ready == false' >/dev/null || {
@@ -371,10 +390,20 @@ bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FLOOR_DIR" lanes \
   | jq -e '.ready == true' >/dev/null || {
   echo "expected a floor pass with a real screenshot on disk to be ready" >&2; exit 1; }
 
+# A valid clip-skipped account is non-file evidence for a confirmed finding,
+# never visual proof of the floor journey itself. The reason deliberately ends
+# in .mp4 to prove a filename-looking suffix cannot manufacture browser media.
+jq '.confirmedFindings = ["F1"] | .evidence = ["clip-skipped: F1: recorder could not write clips/F1.mp4"]' \
+  "$FLOOR_DIR/markers/F1.json" >"$FLOOR_DIR/markers/.marker.json"
+mv "$FLOOR_DIR/markers/.marker.json" "$FLOOR_DIR/markers/F1.json"
+RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FLOOR_DIR" lanes || true)"
+echo "$RESULT" | jq -e '(.ready == false) and (.invalidReasons[0] | contains("floor pass without browser evidence"))' >/dev/null || {
+  echo "expected a clip-skipped line not to count as floor browser evidence" >&2; echo "$RESULT" >&2; exit 1; }
+
 # Naming a screenshot that does not exist is refused by pass_evidence_problem
 # already (evidence must be durable), and must stay refused for a floor lane
 # too — not silently reclassified as the floor-specific reason.
-jq '.evidence = ["evidence/missing-screenshot.png"]' "$FLOOR_DIR/markers/F1.json" >"$FLOOR_DIR/markers/.marker.json"
+jq 'del(.confirmedFindings) | .evidence = ["evidence/missing-screenshot.png"]' "$FLOOR_DIR/markers/F1.json" >"$FLOOR_DIR/markers/.marker.json"
 mv "$FLOOR_DIR/markers/.marker.json" "$FLOOR_DIR/markers/F1.json"
 RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FLOOR_DIR" lanes || true)"
 echo "$RESULT" | jq -e '(.ready == false) and (.invalidReasons[0] | contains("evidence file is missing"))' >/dev/null || {
