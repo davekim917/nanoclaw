@@ -440,10 +440,10 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     return db;
   }
 
-  function addTargetSession(db: Database.Database, id: string, ag: string, mg: string): void {
+  function addTargetSession(db: Database.Database, id: string, ag: string, seriesId: string, status = 'active'): void {
     db.prepare(
-      "INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status) VALUES (?, ?, ?, NULL, 'active')",
-    ).run(id, ag, mg);
+      'INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status) VALUES (?, ?, NULL, ?, ?)',
+    ).run(id, ag, taskThreadId(seriesId), status);
   }
 
   function seedInbound(agentGroupId: string, sessionId: string): string {
@@ -454,13 +454,29 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     return p;
   }
 
-  function insertLive(inboundPath: string, seriesId: string): void {
+  function insertLive(inboundPath: string, seriesId: string, opts: { id?: string; status?: string } = {}): void {
     const db = openInboundDb(inboundPath);
     const seq = (db.prepare('SELECT COALESCE(MAX(seq),0) AS m FROM messages_in').get() as { m: number }).m + 2;
     db.prepare(
       `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, recurrence, series_id, content)
-       VALUES (?, ?, 'task', datetime('now'), 'pending', ?, '0 9 * * *', ?, '{}')`,
-    ).run(`live-${seriesId}`, seq, new Date(NOW + 3600_000).toISOString(), seriesId);
+       VALUES (?, ?, 'task', datetime('now'), ?, ?, '0 9 * * *', ?, '{}')`,
+    ).run(
+      opts.id ?? `live-${seriesId}`,
+      seq,
+      opts.status ?? 'pending',
+      new Date(NOW + 3600_000).toISOString(),
+      seriesId,
+    );
+    db.close();
+  }
+
+  function writeCancellationReceipt(inboundPath: string, receiptId: string): void {
+    const db = openInboundDb(inboundPath);
+    const seq = (db.prepare('SELECT COALESCE(MAX(seq),0) AS m FROM messages_in').get() as { m: number }).m + 2;
+    db.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, content)
+       VALUES (?, ?, 'system', ?, 'completed', '{}')`,
+    ).run(receiptId, seq, new Date(NOW).toISOString());
     db.close();
   }
 
@@ -475,6 +491,9 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       noSnapshot?: boolean;
       targetAgentGroupId?: string;
       targetMessagingGroupId?: string;
+      targetRowId?: string;
+      sourceCancellationReceiptId?: string;
+      correlationId?: string;
     },
   ): void {
     const snapshot = opts.snapshot ?? {
@@ -492,6 +511,8 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     const detail: Record<string, unknown> = opts.noSnapshot ? {} : { snapshot };
     if (opts.targetAgentGroupId) detail.targetAgentGroupId = opts.targetAgentGroupId;
     if (opts.targetMessagingGroupId) detail.targetMessagingGroupId = opts.targetMessagingGroupId;
+    if (opts.targetRowId) detail.targetRowId = opts.targetRowId;
+    if (opts.sourceCancellationReceiptId) detail.sourceCancellationReceiptId = opts.sourceCancellationReceiptId;
     db.prepare(
       `INSERT INTO scheduled_audit (ts, actor, action, agent_group_id, session_id, series_id, detail_json, correlation_id)
        VALUES (?, 'owner', 'move_intent', ?, ?, ?, ?, ?)`,
@@ -501,7 +522,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       opts.sess,
       opts.seriesId,
       opts.noSnapshot ? null : JSON.stringify(detail),
-      `corr-${opts.seriesId}`,
+      opts.correlationId ?? `corr-${opts.seriesId}`,
     );
   }
 
@@ -818,11 +839,12 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     const srcInbound = seedInbound('src-ag', 'src-sess');
     // Target session exists but has NO live row (insert never landed).
     seedInbound('tgt-ag', 'tgt-sess');
-    addTargetSession(db, 'tgt-sess', 'tgt-ag', 'tgt-mg');
+    addTargetSession(db, 'tgt-sess', 'tgt-ag', 'ser-scoped');
     // An UNRELATED group has a live row reusing the SAME series_id — the exact
     // condition the bare-series_id fleet scan over-counted (M1 false-resolve).
     const unrelated = seedInbound('other-ag', 'other-sess');
     insertLive(unrelated, 'ser-scoped');
+    writeCancellationReceipt(srcInbound, 'scheduled-move-cancel:scoped');
 
     writeIntent(db, {
       seriesId: 'ser-scoped',
@@ -831,6 +853,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       tsMs: NOW - 2 * SWEEP_MS,
       targetAgentGroupId: 'tgt-ag',
       targetMessagingGroupId: 'tgt-mg',
+      sourceCancellationReceiptId: 'scheduled-move-cancel:scoped',
     });
 
     await recoverMoveIntents({ nowMs: NOW });
@@ -855,8 +878,8 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     const db = centralDb();
     const srcInbound = seedInbound('src-ag', 'src-sess'); // empty source
     const tgtInbound = seedInbound('tgt-ag', 'tgt-sess');
-    addTargetSession(db, 'tgt-sess', 'tgt-ag', 'tgt-mg');
-    insertLive(tgtInbound, 'ser-tgt'); // target carries the live row
+    addTargetSession(db, 'tgt-sess', 'tgt-ag', 'ser-tgt');
+    insertLive(tgtInbound, 'ser-tgt', { id: 'owned-target' }); // target carries this move's live row
 
     writeIntent(db, {
       seriesId: 'ser-tgt',
@@ -865,6 +888,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       tsMs: NOW - 2 * SWEEP_MS,
       targetAgentGroupId: 'tgt-ag',
       targetMessagingGroupId: 'tgt-mg',
+      targetRowId: 'owned-target',
     });
 
     await recoverMoveIntents({ nowMs: NOW });
@@ -878,6 +902,167 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       resolved_at: string | null;
     };
     expect(row.resolved_at).toBeTruthy();
+    db.close();
+  });
+
+  it('restores the source when only an unrelated target row exists after a collision', async () => {
+    const db = centralDb();
+    const srcInbound = seedInbound('src-ag', 'src-sess');
+    const tgtInbound = seedInbound('tgt-ag', 'tgt-sess');
+    addTargetSession(db, 'tgt-sess', 'tgt-ag', 'ser-collision');
+    insertLive(tgtInbound, 'ser-collision', { id: 'unrelated-target' });
+    writeIntent(db, {
+      seriesId: 'ser-collision',
+      ag: 'src-ag',
+      sess: 'src-sess',
+      tsMs: NOW - 2 * SWEEP_MS,
+      targetAgentGroupId: 'tgt-ag',
+      targetMessagingGroupId: 'tgt-mg',
+      targetRowId: 'reserved-move-row',
+    });
+
+    await recoverMoveIntents({ nowMs: NOW });
+
+    const source = openInboundDb(srcInbound)
+      .prepare(
+        "SELECT COUNT(*) AS c FROM messages_in WHERE series_id = 'ser-collision' AND status IN ('pending','paused')",
+      )
+      .get() as { c: number };
+    expect(source.c).toBe(1);
+    const target = openInboundDb(tgtInbound)
+      .prepare("SELECT id FROM messages_in WHERE series_id = 'ser-collision' AND status IN ('pending','paused')")
+      .get() as { id: string };
+    expect(target.id).toBe('unrelated-target');
+    const intent = db
+      .prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-collision'")
+      .get() as { resolved_at: string | null };
+    expect(intent.resolved_at).toBeTruthy();
+    db.close();
+  });
+
+  it('never restores a zero-touch losing move when a concurrent winner owns the source cancellation', async () => {
+    const db = centralDb();
+    const srcInbound = seedInbound('src-ag', 'src-sess');
+    const tgtInbound = seedInbound('tgt-ag', 'tgt-sess');
+    addTargetSession(db, 'tgt-sess', 'tgt-ag', 'ser-overlap');
+    insertLive(tgtInbound, 'ser-overlap', { id: 'winner-target-row' });
+    // The winner's mailbox transaction committed its source cancellation and
+    // receipt. The loser wrote an intent but reached no cancellation receipt
+    // before the host crashed.
+    writeCancellationReceipt(srcInbound, 'scheduled-move-cancel:winner');
+    writeIntent(db, {
+      seriesId: 'ser-overlap',
+      ag: 'src-ag',
+      sess: 'src-sess',
+      tsMs: NOW - 2 * SWEEP_MS,
+      targetAgentGroupId: 'tgt-ag',
+      targetMessagingGroupId: 'tgt-mg',
+      targetRowId: 'winner-target-row',
+      sourceCancellationReceiptId: 'scheduled-move-cancel:winner',
+      correlationId: 'winner-intent',
+    });
+    writeIntent(db, {
+      seriesId: 'ser-overlap',
+      ag: 'src-ag',
+      sess: 'src-sess',
+      tsMs: NOW - 2 * SWEEP_MS,
+      targetAgentGroupId: 'tgt-ag',
+      targetMessagingGroupId: 'tgt-mg',
+      targetRowId: 'loser-target-row',
+      sourceCancellationReceiptId: 'scheduled-move-cancel:loser',
+      correlationId: 'loser-intent',
+    });
+
+    await recoverMoveIntents({ nowMs: NOW });
+
+    const source = openInboundDb(srcInbound)
+      .prepare(
+        "SELECT COUNT(*) AS c FROM messages_in WHERE series_id = 'ser-overlap' AND status IN ('pending','paused')",
+      )
+      .get() as { c: number };
+    expect(source.c).toBe(0);
+    const target = openInboundDb(tgtInbound)
+      .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE id = 'winner-target-row' AND status = 'pending'")
+      .get() as { c: number };
+    expect(target.c).toBe(1);
+    const intents = db
+      .prepare(
+        "SELECT correlation_id, resolved_at FROM scheduled_audit WHERE correlation_id IN ('winner-intent', 'loser-intent') ORDER BY correlation_id",
+      )
+      .all() as Array<{ correlation_id: string; resolved_at: string | null }>;
+    expect(intents).toEqual([
+      { correlation_id: 'loser-intent', resolved_at: expect.any(String) },
+      { correlation_id: 'winner-intent', resolved_at: expect.any(String) },
+    ]);
+    db.close();
+  });
+
+  it('keeps an owned paused target paused when recovery follows an interrupted move', async () => {
+    const db = centralDb();
+    const srcInbound = seedInbound('src-ag', 'src-sess');
+    const tgtInbound = seedInbound('tgt-ag', 'tgt-sess');
+    addTargetSession(db, 'tgt-sess', 'tgt-ag', 'ser-paused-target');
+    insertLive(tgtInbound, 'ser-paused-target', { id: 'owned-paused-target', status: 'paused' });
+    writeIntent(db, {
+      seriesId: 'ser-paused-target',
+      ag: 'src-ag',
+      sess: 'src-sess',
+      tsMs: NOW - 2 * SWEEP_MS,
+      targetAgentGroupId: 'tgt-ag',
+      targetMessagingGroupId: 'tgt-mg',
+      targetRowId: 'owned-paused-target',
+    });
+
+    await recoverMoveIntents({ nowMs: NOW });
+
+    const source = openInboundDb(srcInbound)
+      .prepare(
+        "SELECT COUNT(*) AS c FROM messages_in WHERE series_id = 'ser-paused-target' AND status IN ('pending','paused')",
+      )
+      .get() as { c: number };
+    expect(source.c).toBe(0);
+    const target = openInboundDb(tgtInbound)
+      .prepare("SELECT status FROM messages_in WHERE id = 'owned-paused-target'")
+      .get() as { status: string };
+    expect(target.status).toBe('paused');
+    db.close();
+  });
+
+  it('recognizes a completed owned target in a closed task session and never recreates its source', async () => {
+    const db = centralDb();
+    const srcInbound = seedInbound('src-ag', 'src-sess');
+    const tgtInbound = seedInbound('tgt-ag', 'tgt-sess');
+    addTargetSession(db, 'tgt-sess', 'tgt-ag', 'ser-completed-target', 'closed');
+    // The moved recurring occurrence completed before recovery, then armed its
+    // successor. Its terminal row remains the durable move-ownership proof.
+    insertLive(tgtInbound, 'ser-completed-target', { id: 'owned-completed-target', status: 'completed' });
+    insertLive(tgtInbound, 'ser-completed-target', { id: 'target-successor' });
+    writeIntent(db, {
+      seriesId: 'ser-completed-target',
+      ag: 'src-ag',
+      sess: 'src-sess',
+      tsMs: NOW - 2 * SWEEP_MS,
+      targetAgentGroupId: 'tgt-ag',
+      targetMessagingGroupId: 'tgt-mg',
+      targetRowId: 'owned-completed-target',
+    });
+
+    await recoverMoveIntents({ nowMs: NOW });
+
+    const source = openInboundDb(srcInbound)
+      .prepare(
+        "SELECT COUNT(*) AS c FROM messages_in WHERE series_id = 'ser-completed-target' AND status IN ('pending','paused')",
+      )
+      .get() as { c: number };
+    expect(source.c).toBe(0);
+    const successor = openInboundDb(tgtInbound)
+      .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE id = 'target-successor' AND status = 'pending'")
+      .get() as { c: number };
+    expect(successor.c).toBe(1);
+    const intent = db
+      .prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-completed-target'")
+      .get() as { resolved_at: string | null };
+    expect(intent.resolved_at).toBeTruthy();
     db.close();
   });
 

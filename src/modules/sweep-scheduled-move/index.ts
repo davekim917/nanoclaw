@@ -18,7 +18,7 @@ import path from 'path';
 import { log } from '../../log.js';
 import { getDb } from '../../db/connection.js';
 import { withCentralSync } from '../../db/central-lease.js';
-import { withQuietInvalidationSync } from '../../db/sessions.js';
+import { taskThreadId, withQuietInvalidationSync } from '../../db/sessions.js';
 import { sessionsBaseDir } from '../../session-manager.js';
 import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
 // Move recovery resolves its source session through the seam, like every other
@@ -28,6 +28,7 @@ import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
 // than behaviour, and it is gone (mailbox seam PR 7 made the same change in
 // host-sweep.ts).
 import { withExistingMailboxSession } from '../../session-manager.js';
+import { readSessionInbound } from '../mailbox/index.js';
 import { type TaskRowSnapshot } from '../scheduling/db.js';
 import { countLiveRowsInSessions } from '../scheduling/live-count.js';
 import { purgeIntentBody } from '../../dashboard/api/scheduled-shared.js';
@@ -51,25 +52,37 @@ interface MoveRecoveryOptions {
 type MoveIntentSnapshot = TaskRowSnapshot;
 
 /**
- * Resolve the target channel-root session id (thread_id IS NULL, active) for a
- * (targetAgentGroupId, targetMessagingGroupId) pair from the central DB.
- * Defensive: returns null on any error (e.g. the `sessions` table is absent in a
- * minimal test DB, or no session exists yet because the move crashed before the
- * target insert). A null target session contributes 0 to the scoped count.
+ * Resolve every target per-series system session, including closed sessions.
+ * `scheduleTask` writes a move into `taskSeriesId(seriesId)`, not the
+ * channel-root session — checking the latter after a crash can mistake a
+ * successful target insert for zero live rows and restore the source on top of
+ * it. A completed target occurrence can have closed before recovery while its
+ * exact row remains durable, so active-only `findSystemSession()` is too weak
+ * for ownership proof. A database failure is UNKNOWN, not "no target":
+ * recovery must defer rather than compensate blindly.
  */
-async function resolveTargetSessionId(
+async function resolveTargetSessions(
   targetAgentGroupId: string,
-  targetMessagingGroupId: string,
-): Promise<string | null> {
+  seriesId: string,
+): Promise<{ sessions: Array<{ agentGroupId: string; sessionId: string; status: string }>; unreadable: boolean }> {
   try {
-    const row = await getDb().get<{ id: string }>(
-      "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'active' LIMIT 1",
+    const sessions = await getDb().all<{ id: string; status: string }>(
+      `SELECT id, status FROM sessions
+        WHERE agent_group_id = ? AND messaging_group_id IS NULL AND thread_id = ?
+        ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, created_at DESC`,
       targetAgentGroupId,
-      targetMessagingGroupId,
+      taskThreadId(seriesId),
     );
-    return row?.id ?? null;
+    return {
+      sessions: sessions.map((session) => ({
+        agentGroupId: targetAgentGroupId,
+        sessionId: session.id,
+        status: session.status,
+      })),
+      unreadable: false,
+    };
   } catch {
-    return null;
+    return { sessions: [], unreadable: true };
   }
 }
 
@@ -82,24 +95,83 @@ interface ParsedIntentDetail {
   snapshot: MoveIntentSnapshot | null;
   targetAgentGroupId: string | null;
   targetMessagingGroupId: string | null;
+  targetRowId: string | null;
+  sourceCancellationReceiptId: string | null;
 }
 
 function parseIntentDetail(detailJson: string | null): ParsedIntentDetail {
-  if (!detailJson) return { snapshot: null, targetAgentGroupId: null, targetMessagingGroupId: null };
+  if (!detailJson) {
+    return {
+      snapshot: null,
+      targetAgentGroupId: null,
+      targetMessagingGroupId: null,
+      targetRowId: null,
+      sourceCancellationReceiptId: null,
+    };
+  }
   try {
     const d = JSON.parse(detailJson) as {
       snapshot?: MoveIntentSnapshot;
       targetAgentGroupId?: string;
       targetMessagingGroupId?: string;
+      targetRowId?: string;
+      sourceCancellationReceiptId?: string;
     };
     return {
       snapshot: d.snapshot ?? null,
       targetAgentGroupId: typeof d.targetAgentGroupId === 'string' ? d.targetAgentGroupId : null,
       targetMessagingGroupId: typeof d.targetMessagingGroupId === 'string' ? d.targetMessagingGroupId : null,
+      targetRowId: typeof d.targetRowId === 'string' ? d.targetRowId : null,
+      sourceCancellationReceiptId:
+        typeof d.sourceCancellationReceiptId === 'string' ? d.sourceCancellationReceiptId : null,
     };
   } catch {
-    return { snapshot: null, targetAgentGroupId: null, targetMessagingGroupId: null };
+    return {
+      snapshot: null,
+      targetAgentGroupId: null,
+      targetMessagingGroupId: null,
+      targetRowId: null,
+      sourceCancellationReceiptId: null,
+    };
   }
+}
+
+/** Did this exact move, rather than an overlapping request, cancel the source? */
+function sourceOwnsCancellation(
+  dataDir: string,
+  source: { agentGroupId: string; sessionId: string },
+  receiptId: string,
+): { owned: boolean; unreadable: boolean } {
+  try {
+    const owned = readSessionInbound({ ...source, dataDir }, (mailbox) =>
+      mailbox.hasMoveCancellationReceipt(receiptId),
+    );
+    return { owned: owned ?? false, unreadable: false };
+  } catch {
+    return { owned: false, unreadable: true };
+  }
+}
+
+/** Does any target task session contain the exact row this move reserved before cancel? */
+function targetOwnsIntent(
+  dataDir: string,
+  targets: Array<{ agentGroupId: string; sessionId: string }>,
+  targetRowId: string,
+  seriesId: string,
+): { owned: boolean; unreadable: boolean } {
+  let unreadable = false;
+  for (const target of targets) {
+    try {
+      const row = readSessionInbound({ ...target, dataDir }, (mailbox) => mailbox.getTaskRowById(targetRowId));
+      // The generated id is the durable ownership token, but bind it to the
+      // intent's series too: an impossible id collision must not suppress a
+      // source repair for another series.
+      if (row?.series_id === seriesId) return { owned: true, unreadable: false };
+    } catch {
+      unreadable = true;
+    }
+  }
+  return { owned: false, unreadable };
 }
 
 /**
@@ -167,44 +239,93 @@ export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<
 
     const detail = parseIntentDetail(intent.detail_json);
     const source = { agentGroupId: intent.agent_group_id, sessionId: intent.session_id };
-    const targetSessionId =
-      detail.targetAgentGroupId && detail.targetMessagingGroupId
-        ? await resolveTargetSessionId(detail.targetAgentGroupId, detail.targetMessagingGroupId)
-        : null;
-    const target =
-      detail.targetAgentGroupId && targetSessionId
-        ? { agentGroupId: detail.targetAgentGroupId, sessionId: targetSessionId }
-        : null;
-
-    // Scoped {source, target} live count — M1 (never a fleet-wide series scan).
-    const live = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
-    if (live.unreadable) {
-      // Live state UNKNOWN → skip this pass (leave unresolved). Never restore on
-      // unknown (F6 / M2).
-      log.warn('scheduled-move-recovery: scoped live count unreadable — deferring', {
+    const targetResolution = detail.targetAgentGroupId
+      ? await resolveTargetSessions(detail.targetAgentGroupId, intent.series_id)
+      : { sessions: [], unreadable: false };
+    if (targetResolution.unreadable) {
+      log.warn('scheduled-move-recovery: target session lookup unreadable — deferring', {
         seriesId: intent.series_id,
         correlationId: intent.correlation_id,
       });
       continue;
     }
-    if (live.count > 0) {
-      // A live row exists at source or target → the move's row landed; the intent
-      // breadcrumb has done its job. Stamp + purge; never restore (would double the
-      // live rows).
-      if (live.count > 1) {
-        // >1 = a PRE-EXISTING duplicate the move inherited (it didn't create it — the
-        // move's E-2 invariant already returned 500 and refused to claim success).
-        // We resolve the intent WITHOUT auto-deduping: deleting a row the move didn't
-        // own is its own data-loss risk, and leaving it unresolved would reintroduce
-        // the ADV-S2 zombie repair row. The board's duplicate-successor health detector
-        // surfaces the duplicate independently. Log it so it isn't silently swallowed.
-        log.warn(
-          'scheduled-move-recovery: >1 live row for series — pre-existing duplicate, resolving intent without dedup (surfaced via duplicate-successor health)',
-          { seriesId: intent.series_id, correlationId: intent.correlation_id, liveCount: live.count },
-        );
-      }
+    // Legacy intents can only count a live target row. An active task session
+    // is the only status that can hold one; durable ownership below searches
+    // closed sessions too.
+    const target = targetResolution.sessions.find((session) => session.status === 'active') ?? null;
+
+    // A receipt-bearing intent compensates only a source cancellation it can
+    // prove it performed. If no receipt exists, the source may have been
+    // changed by an overlapping winning move; resolving this loser is the
+    // safe direction. Pre-receipt intents retain their historical recovery
+    // policy below so an upgrade cannot strand an already-cancelled source.
+    const sourceCancellation = detail.sourceCancellationReceiptId
+      ? sourceOwnsCancellation(dataDir, source, detail.sourceCancellationReceiptId)
+      : null;
+    if (sourceCancellation?.unreadable) {
+      log.warn('scheduled-move-recovery: source cancellation receipt unreadable — deferring', {
+        seriesId: intent.series_id,
+        correlationId: intent.correlation_id,
+      });
+      continue;
+    }
+    if (detail.sourceCancellationReceiptId && !sourceCancellation?.owned) {
       await purgeIntentBody(intent.correlation_id);
       continue;
+    }
+
+    // New intents reserve a target row id before source cancellation. A
+    // same-series row is not enough to prove the move landed: it can be a
+    // manual run that collided after preflight. Legacy intents lack this field
+    // and retain the old scoped-count fallback below.
+    const ownedTarget = detail.targetRowId
+      ? targetOwnsIntent(dataDir, targetResolution.sessions, detail.targetRowId, intent.series_id)
+      : null;
+    if (ownedTarget?.unreadable) {
+      log.warn('scheduled-move-recovery: target ownership unreadable — deferring', {
+        seriesId: intent.series_id,
+        correlationId: intent.correlation_id,
+      });
+      continue;
+    }
+    const sourceLive = countLiveRowsInSessions(dataDir, [source], intent.series_id);
+    if (sourceLive.unreadable) {
+      log.warn('scheduled-move-recovery: source live count unreadable — deferring', {
+        seriesId: intent.series_id,
+        correlationId: intent.correlation_id,
+      });
+      continue;
+    }
+    if (detail.targetRowId) {
+      if (sourceLive.count > 0 || ownedTarget?.owned) {
+        await purgeIntentBody(intent.correlation_id);
+        continue;
+      }
+      // Source is gone and no owned target exists. Continue to compensation
+      // even if a different target row uses this series id; it is not ours to
+      // overwrite, and it must not turn a rejected move into source loss.
+    } else {
+      // Legacy intent: its audit payload cannot identify a target row, so the
+      // conservative historical rule is the only safe classification.
+      const live = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
+      if (live.unreadable) {
+        log.warn('scheduled-move-recovery: scoped live count unreadable — deferring', {
+          seriesId: intent.series_id,
+          correlationId: intent.correlation_id,
+        });
+        continue;
+      }
+      if (live.count > 0) {
+        if (live.count > 1) {
+          log.warn('scheduled-move-recovery: >1 live row for legacy series — resolving without dedup', {
+            seriesId: intent.series_id,
+            correlationId: intent.correlation_id,
+            liveCount: live.count,
+          });
+        }
+        await purgeIntentBody(intent.correlation_id);
+        continue;
+      }
     }
 
     // Zero live rows in scope → restore the source from the snapshot.
@@ -238,12 +359,30 @@ export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<
       // one it has just been told is gone (invariant I-10).
       outcome = await withExistingMailboxSession(intent.agent_group_id, intent.session_id, (mailbox) =>
         withCentralSync(() => {
-          // Idempotency re-check: the restore + the resolved_at stamp span two DB
-          // files (not atomic), so re-confirm a readable zero-live IMMEDIATELY before
-          // insert. An unreadable re-check defers (never restore on unknown).
-          const recheck = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
-          if (recheck.unreadable) return 'deferred' as const;
-          if (recheck.count === 0) {
+          // Idempotency re-check: a durable target row id distinguishes this
+          // move from unrelated same-series work. Legacy intents still use the
+          // old scoped count because they have no ownership record to consult.
+          const sourceRecheck = countLiveRowsInSessions(dataDir, [source], intent.series_id);
+          if (sourceRecheck.unreadable || sourceRecheck.count > 0) return 'deferred' as const;
+          if (
+            detail.sourceCancellationReceiptId &&
+            !mailbox.hasMoveCancellationReceipt(detail.sourceCancellationReceiptId)
+          ) {
+            return 'deferred' as const;
+          }
+          if (detail.targetRowId) {
+            const ownership = targetOwnsIntent(
+              dataDir,
+              targetResolution.sessions,
+              detail.targetRowId,
+              intent.series_id,
+            );
+            if (ownership.unreadable || ownership.owned) return 'deferred' as const;
+          } else {
+            const legacyRecheck = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
+            if (legacyRecheck.unreadable || legacyRecheck.count > 0) return 'deferred' as const;
+          }
+          {
             // This duty runs in tick:housekeeping — AFTER the session fan-out and
             // after the quiet-mark flush. The fan-out saw a source with no live
             // task (that is the crash state this recovery exists for) and may have

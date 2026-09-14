@@ -65,7 +65,9 @@ import {
   getLatestTaskRoutingStamp,
   getLatestTaskRow,
   getLiveSeriesRow,
+  getTaskRowById,
   getLiveTaskRow,
+  getLiveTaskRowById,
   hasPendingRecurrence,
   hasTriggeredInboundRow,
   hasWorkContinuation,
@@ -90,6 +92,7 @@ import {
   type TaskFireRow,
   type TaskRoutingStamp,
 } from './ops/reads.js';
+import { hasMoveCancellationReceipt } from './ops/tasks.js';
 import {
   assertQueryable,
   asMissingDbError,
@@ -152,6 +155,9 @@ export interface InboundSessionRead {
   getLiveSeriesRow(seriesId: string): ScheduledTaskRow | null;
   getLatestSeriesRow(seriesId: string): ScheduledTaskRow | null;
   getLiveTaskRow(seriesId: string): ScheduledTaskRow | null;
+  getLiveTaskRowById(rowId: string): ScheduledTaskRow | null;
+  getTaskRowById(rowId: string): ScheduledTaskRow | null;
+  hasMoveCancellationReceipt(receiptId: string): boolean;
   getLatestTaskRow(seriesId: string): ScheduledTaskRow | null;
   listRecentTaskFires(seriesId: string, limit: number): TaskFireRow[];
   latestInboundMessageId(): string | null;
@@ -290,6 +296,9 @@ export function readSessionInbound<T>(
       getLiveSeriesRow: (seriesId) => getLiveSeriesRow(db, seriesId),
       getLatestSeriesRow: (seriesId) => getLatestSeriesRow(db, seriesId),
       getLiveTaskRow: (seriesId) => getLiveTaskRow(db, seriesId),
+      getLiveTaskRowById: (rowId) => getLiveTaskRowById(db, rowId),
+      getTaskRowById: (rowId) => getTaskRowById(db, rowId),
+      hasMoveCancellationReceipt: (receiptId) => hasMoveCancellationReceipt(db, receiptId),
       getLatestTaskRow: (seriesId) => getLatestTaskRow(db, seriesId),
       listRecentTaskFires: (seriesId, limit) => listRecentTaskFires(db, seriesId, limit),
       latestInboundMessageId: () => latestInboundMessageId(db),

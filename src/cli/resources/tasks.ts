@@ -26,6 +26,7 @@ import {
 import { resolveTaskFlagIntent, validateTaskPin } from '../../modules/scheduling/task-flags.js';
 import { parseTaskContent, parseTaskPin } from '../../modules/scheduling/task-content.js';
 import { writeAudit } from '../../dashboard/api/scheduled-shared.js';
+import { moveTaskAsHost } from '../../dashboard/api/scheduled-move.js';
 import { resolveTaskSession, withExistingMailboxSession } from '../../session-manager.js';
 import { resolveEffectiveModel, vocabFor } from '../../flag-parser.js';
 import { log } from '../../log.js';
@@ -826,6 +827,30 @@ async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerConte
 }
 
 /**
+ * Move exactly one task series through the dashboard's hardened transaction.
+ * A task move changes its execution identity, so unlike ordinary task verbs it
+ * never fans out and is available only through the host's 0600 ncl socket.
+ */
+async function moveTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
+  if (ctx.caller !== 'host') throw new Error('tasks move is operator-only');
+  const seriesId = taskId(args);
+  const sourceAgentGroupId = suppliedFlag(args, 'group', '--group');
+  const sourceSessionId = suppliedFlag(args, 'session', '--session');
+  const targetAgentGroupId = suppliedFlag(args, 'target_group', '--target-group');
+  const targetMessagingGroupId = suppliedFlag(args, 'target_messaging_group', '--target-messaging-group');
+  if (!sourceAgentGroupId || !sourceSessionId || !targetAgentGroupId || !targetMessagingGroupId) {
+    throw new Error('--group, --session, --target-group, and --target-messaging-group are required');
+  }
+  return moveTaskAsHost({
+    sourceAgentGroupId,
+    sourceSessionId,
+    seriesId,
+    targetAgentGroupId,
+    targetMessagingGroupId,
+  });
+}
+
+/**
  * `ncl tasks run <id>` — fire a task on demand without disturbing its schedule.
  * Inserts a fresh pending occurrence (same series, content, no recurrence) due
  * now, which the next sweep delivers through the normal fire path. Unlike
@@ -1512,6 +1537,26 @@ registerResource({
         },
       ],
       handler: async (args, ctx) => appendTaskLog(args, ctx),
+    },
+    move: {
+      access: 'open',
+      hostOnly: true,
+      description:
+        'Move one live task series to a wired target agent group without changing its series identity. OPERATOR-ONLY.\n\n' +
+        'This is the CLI entry point for the same cancel-first, durable-intent, compensating move transaction used by the Scheduled Tasks Board. It preserves the occurrence slot, recurrence, task controls, pins, routing and audit trail; it refuses a busy source, unreadable state, invalid destination pin, or a target series collision.',
+      args: [
+        { name: 'id', type: 'string', description: 'Task series id.', required: true },
+        { name: 'group', type: 'string', description: 'Source agent group id.', required: true },
+        { name: 'session', type: 'string', description: 'Exact source task session id.', required: true },
+        { name: 'target_group', type: 'string', description: 'Destination agent group id.', required: true },
+        {
+          name: 'target_messaging_group',
+          type: 'string',
+          description: 'Destination messaging group id already wired to --target-group.',
+          required: true,
+        },
+      ],
+      handler: async (args, ctx) => moveTaskCommand(args, ctx),
     },
     update: {
       access: 'open',

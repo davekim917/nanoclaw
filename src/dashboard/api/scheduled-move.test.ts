@@ -41,7 +41,7 @@ import { ensureSchema } from '../../modules/mailbox/schema.js';
 import { taskThreadId } from '../../db/sessions.js';
 import { migration043 } from '../../db/migrations/043-scheduled-audit.js';
 import { encodeKey, invalidateScheduledCache, _resetScheduledRateLimitForTesting } from './scheduled-shared.js';
-import { movePreviewHandler, moveExecuteHandler, _setMoveTestOptions } from './scheduled-move.js';
+import { movePreviewHandler, moveExecuteHandler, moveTaskAsHost, _setMoveTestOptions } from './scheduled-move.js';
 import { computeSecretDelta, isCrossWorkgroup } from './scheduled-move.js';
 import type { AuthedRequestContext } from '../router.js';
 
@@ -243,6 +243,7 @@ function seedMoveFixture(opts?: {
   sourceStatus?: string;
   sourceProcessAfter?: string | null;
   sourceScheduledFor?: string | null;
+  sourceContent?: string;
 }): { key: string } {
   addWorkgroup('wg-1', ['Anthropic', 'Linear']);
   addGroup('src-ag', 'src-folder', 'wg-1');
@@ -260,6 +261,7 @@ function seedMoveFixture(opts?: {
     series_id: 'ser-1',
     status: opts?.sourceStatus ?? 'pending',
     process_after: opts?.sourceProcessAfter ?? isoIn(3600_000),
+    ...(opts?.sourceContent === undefined ? {} : { content: opts.sourceContent }),
     ...(opts?.sourceScheduledFor === undefined ? {} : { scheduled_for: opts.sourceScheduledFor }),
   });
   addUser('owner');
@@ -415,13 +417,14 @@ function liveRowsForSeries(
   process_after: string | null;
   scheduled_for: string | null;
   recurrence: string | null;
+  content: string;
 }> {
   const p = path.join(TEST_DIR, 'v2-sessions', agentGroupId, sessionId, 'inbound.db');
   if (!fs.existsSync(p)) return [];
   const db = openInboundDb(p);
   const rows = db
     .prepare(
-      "SELECT id, status, process_after, scheduled_for, recurrence FROM messages_in WHERE series_id = ? AND kind = 'task' AND status IN ('pending','paused')",
+      "SELECT id, status, process_after, scheduled_for, recurrence, content FROM messages_in WHERE series_id = ? AND kind = 'task' AND status IN ('pending','paused')",
     )
     .all(seriesId) as Array<{
     id: string;
@@ -429,6 +432,7 @@ function liveRowsForSeries(
     process_after: string | null;
     scheduled_for: string | null;
     recurrence: string | null;
+    content: string;
   }>;
   db.close();
   return rows;
@@ -467,6 +471,54 @@ describe('moveExecuteHandler', () => {
     const tgtLive = liveRowsForSeries('tgt-ag', tgtSess!, 'ser-1');
     expect(tgtLive).toHaveLength(1);
     expect(tgtLive[0].recurrence).toBe('0 9 * * *');
+    const source = openInboundDb(path.join(TEST_DIR, 'v2-sessions', 'src-ag', 'src-sess', 'inbound.db'));
+    const receipts = source
+      .prepare(
+        "SELECT COUNT(*) AS c FROM messages_in WHERE id LIKE 'scheduled-move-cancel:%' AND kind = 'system' AND status = 'completed'",
+      )
+      .get() as { c: number };
+    source.close();
+    expect(receipts.c).toBe(1);
+  });
+
+  it('host task move uses the same transaction without creating a dashboard identity', async () => {
+    seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    const moved = await moveTaskAsHost({
+      sourceAgentGroupId: 'src-ag',
+      sourceSessionId: 'src-sess',
+      seriesId: 'ser-1',
+      targetAgentGroupId: 'tgt-ag',
+      targetMessagingGroupId: 'tgt-mg',
+    });
+
+    expect(moved).toMatchObject({ moved: true, secretGainsCount: 1, secretLossesCount: 0 });
+    expect(liveRowsForSeries('src-ag', 'src-sess', 'ser-1')).toHaveLength(0);
+    expect(liveRowsForSeries('tgt-ag', targetSessionId()!, 'ser-1')).toHaveLength(1);
+    const audit = getRawDb()
+      .prepare("SELECT actor FROM scheduled_audit WHERE action = 'move' ORDER BY ts LIMIT 1")
+      .get() as { actor: string };
+    expect(audit.actor).toBe('host');
+  });
+
+  it('preserves the complete source task envelope across a move', async () => {
+    const content = JSON.stringify({
+      prompt: 'do thing',
+      script: 'echo hi',
+      scriptHost: true,
+      threadAnchor: false,
+      originSessionId: 'origin-session',
+      muteChat: true,
+      chatLimit: 1,
+      quietStatus: true,
+      flagIntent: { turnModel: 'opus', turnEffort: 'high' },
+    });
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000), sourceContent: content });
+
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(200);
+    const target = liveRowsForSeries('tgt-ag', targetSessionId()!, 'ser-1');
+    expect(target).toHaveLength(1);
+    expect(target[0]!.content).toBe(content);
   });
 
   // The move approves ONE occurrence and writes a move_intent naming that row
@@ -506,6 +558,10 @@ describe('moveExecuteHandler', () => {
     const tgtSess = targetSessionId();
     expect(tgtSess === null || liveRowsForSeries('tgt-ag', tgtSess, 'ser-1')).toBeTruthy();
     if (tgtSess) expect(liveRowsForSeries('tgt-ag', tgtSess, 'ser-1')).toHaveLength(0);
+    const intent = getRawDb().prepare("SELECT resolved_at FROM scheduled_audit WHERE action = 'move_intent'").get() as {
+      resolved_at: string | null;
+    };
+    expect(intent.resolved_at).toBeTruthy();
   });
 
   // The sibling of the successor case, and the one an id-scoped cancel alone
@@ -537,6 +593,32 @@ describe('moveExecuteHandler', () => {
     // ...and nothing was written into the target from the stale snapshot.
     const tgtSess = targetSessionId();
     if (tgtSess) expect(liveRowsForSeries('tgt-ag', tgtSess, 'ser-1')).toHaveLength(0);
+  });
+
+  it('resolves a losing overlapping move intent rather than letting recovery resurrect the winner source', async () => {
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    const srcInbound = path.join(TEST_DIR, 'v2-sessions', 'src-ag', 'src-sess', 'inbound.db');
+
+    duringMailboxAcquire.run = () => {
+      // The competing move has already won the exact source occurrence and
+      // installed its own target row before this request reaches its cancel.
+      const source = openInboundDb(srcInbound);
+      source.prepare("UPDATE messages_in SET status = 'cancelled', recurrence = NULL WHERE id = 'r1'").run();
+      source.close();
+      addTaskSession('winner-tgt-sess', 'tgt-ag');
+      const target = seedSession('tgt-ag', 'winner-tgt-sess').inbound;
+      insertRow(target, { id: 'winner-target-row', series_id: 'ser-1', content: JSON.stringify({ prompt: 'winner' }) });
+    };
+
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(409);
+    expect((await readJson(res)).reason).toBe('stale_key');
+    expect(liveRowsForSeries('src-ag', 'src-sess', 'ser-1')).toHaveLength(0);
+    expect(liveRowsForSeries('tgt-ag', 'winner-tgt-sess', 'ser-1')).toMatchObject([{ id: 'winner-target-row' }]);
+    const intent = getRawDb().prepare("SELECT resolved_at FROM scheduled_audit WHERE action = 'move_intent'").get() as {
+      resolved_at: string | null;
+    };
+    expect(intent.resolved_at).toBeTruthy();
   });
 
   // The claim half of the same guard: a container holding a processing claim
@@ -778,54 +860,68 @@ describe('moveExecuteHandler', () => {
     expect(targetSessionId()).toBeNull();
   });
 
-  // ── M1: move_intent persists the full target locator ──────────────────────────
-  it('test_move_intent_stores_target_locator', async () => {
-    // Force a path where the intent is written then left unresolved so its body
-    // survives: a post-move invariant violation (E-2) leaves the intent. We get
-    // there by pre-seeding TWO live ser-1 rows in the target system session
-    // — scheduleTask's idempotent UPDATE only touches one, so both stay live and
-    // the post-move {source,target} count becomes 2 (invariant violated).
+  it('refuses a pre-existing target series before it can overwrite target work', async () => {
     const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
     addTaskSession('tgt-sess', 'tgt-ag');
     const tgtInbound = seedSession('tgt-ag', 'tgt-sess').inbound;
     insertRow(tgtInbound, { id: 'stray-a', series_id: 'ser-1', status: 'pending' });
-    insertRow(tgtInbound, { id: 'stray-b', series_id: 'ser-1', status: 'pending' });
 
     const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
-    // Invariant violated (2 live rows post-move) → 500, intent left unresolved.
-    expect(res.status).toBe(500);
-    const intent = getRawDb()
-      .prepare("SELECT detail_json, resolved_at FROM scheduled_audit WHERE action = 'move_intent'")
-      .get() as { detail_json: string | null; resolved_at: string | null };
-    expect(intent.resolved_at).toBeNull(); // E-2: NOT purged → recoverable
-    const detail = JSON.parse(intent.detail_json!) as Record<string, unknown>;
-    expect(detail.targetAgentGroupId).toBe('tgt-ag');
-    expect(detail.targetMessagingGroupId).toBe('tgt-mg');
+    expect(res.status).toBe(409);
+    expect((await readJson(res)).reason).toBe('target_conflict');
+    expect(liveRowsForSeries('src-ag', 'src-sess', 'ser-1')).toHaveLength(1);
+    const target = liveRowsForSeries('tgt-ag', 'tgt-sess', 'ser-1');
+    expect(target).toHaveLength(1);
+    expect(target[0]!.id).toBe('stray-a');
+    expect(
+      (
+        getRawDb().prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE action = 'move_intent'").get() as {
+          c: number;
+        }
+      ).c,
+    ).toBe(0);
   });
 
-  // ── E-2: post-move invariant violation → 500 + intent unresolved ───────────────
-  it('test_move_invariant_violation_leaves_intent_unresolved', async () => {
+  it('refuses a hidden pending manual run behind a terminal recurring target strand', async () => {
     const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
-    // Two pre-existing live ser-1 rows in the target session → after the move's
-    // idempotent UPDATE, both remain → post-move count == 2.
     addTaskSession('tgt-sess', 'tgt-ag');
     const tgtInbound = seedSession('tgt-ag', 'tgt-sess').inbound;
-    insertRow(tgtInbound, { id: 'stray-a', series_id: 'ser-1', status: 'pending' });
-    insertRow(tgtInbound, { id: 'stray-b', series_id: 'ser-1', status: 'pending' });
+    insertRow(tgtInbound, { id: 'terminal-chain', series_id: 'ser-1', status: 'completed', recurrence: '0 9 * * *' });
+    insertRow(tgtInbound, {
+      id: 'manual-run',
+      series_id: 'ser-1',
+      recurrence: null,
+      content: JSON.stringify({ prompt: 'preserve manual run' }),
+    });
 
     const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
-    expect(res.status).toBe(500);
-    expect((await readJson(res)).error).toBe('move_failed');
-    // Intent left unresolved so the recovery sweep can repair it.
+    expect(res.status).toBe(409);
+    expect((await readJson(res)).reason).toBe('target_conflict');
+    expect(liveRowsForSeries('src-ag', 'src-sess', 'ser-1')).toHaveLength(1);
+    const target = liveRowsForSeries('tgt-ag', 'tgt-sess', 'ser-1');
+    expect(target).toHaveLength(1);
+    expect(target[0]).toMatchObject({ id: 'manual-run', content: JSON.stringify({ prompt: 'preserve manual run' }) });
+  });
+
+  it('restores the source when a target collision materializes after preflight', async () => {
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    duringMailboxAcquire.run = () => {
+      addTaskSession('tgt-sess', 'tgt-ag');
+      const target = seedSession('tgt-ag', 'tgt-sess').inbound;
+      insertRow(target, { id: 'late-target', series_id: 'ser-1', content: JSON.stringify({ prompt: 'late work' }) });
+    };
+
+    const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(409);
+    expect((await readJson(res)).reason).toBe('target_conflict');
+    expect(liveRowsForSeries('src-ag', 'src-sess', 'ser-1')).toHaveLength(1);
+    const target = liveRowsForSeries('tgt-ag', 'tgt-sess', 'ser-1');
+    expect(target).toHaveLength(1);
+    expect(target[0]).toMatchObject({ id: 'late-target', content: JSON.stringify({ prompt: 'late work' }) });
     const intent = getRawDb().prepare("SELECT resolved_at FROM scheduled_audit WHERE action = 'move_intent'").get() as {
       resolved_at: string | null;
     };
-    expect(intent.resolved_at).toBeNull();
-    // No two-sided 'move' success audit was written.
-    const moveRows = getRawDb().prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE action = 'move'").get() as {
-      c: number;
-    };
-    expect(moveRows.c).toBe(0);
+    expect(intent.resolved_at).toBeTruthy();
   });
 
   // Codex round 2, H2. The move cancels the source, then AWAITS the target
@@ -858,33 +954,27 @@ describe('moveExecuteHandler', () => {
     expect(row.last_active).not.toBe(stale);
   });
 
-  // ── M2: compensation must NOT restore when the count is UNREADABLE ─────────────
-  it('test_move_compensation_unreadable_no_spurious_restore', async () => {
+  it('refuses an unreadable existing target before cancelling the source', async () => {
     const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
-    // Unwire the target so scheduleTask throws AFTER cancel (the compensation
-    // path). The target session never gets created — but corrupt the SOURCE
-    // inbound.db AFTER the cancel so the live-count read throws → unreadable →
-    // the handler must NOT restore (fail-safe). We can't time the corruption
-    // mid-handler, so instead: pre-seed a corrupt SECOND target session row that
-    // the {source,target} count would read. Simpler + deterministic: unwire +
-    // corrupt the target's would-be session dir so the count read throws.
-    getRawDb().prepare("DELETE FROM messaging_group_agents WHERE agent_group_id = 'tgt-ag'").run();
-    // Pre-create the target system-session pointer + a CORRUPT inbound.db so
-    // the post-cancel compensation count read throws → unreadable.
+    // A target system session is present, but its inbound database is corrupt.
+    // It is not safe to treat that as an empty target and learn only after the
+    // source was cancelled.
     addTaskSession('tgt-sess', 'tgt-ag');
     const tgtDir = path.join(TEST_DIR, 'v2-sessions', 'tgt-ag', 'tgt-sess');
     fs.mkdirSync(tgtDir, { recursive: true });
     fs.writeFileSync(path.join(tgtDir, 'inbound.db'), 'this is not sqlite');
 
     const res = (await moveExecuteHandler(req(await moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
-    expect(res.status).toBe(500);
-    // Unreadable count → NO restore → source stays terminal (cancelled), and the
-    // move_restore_failed audit is written (recoverable, not silently healed).
-    expect(liveRowsForSeries('src-ag', 'src-sess', 'ser-1')).toHaveLength(0);
-    const failRow = getRawDb()
-      .prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE action = 'move_restore_failed'")
-      .get() as { c: number };
-    expect(failRow.c).toBe(1);
+    expect(res.status).toBe(503);
+    expect((await readJson(res)).reason).toBe('session_unreadable');
+    expect(liveRowsForSeries('src-ag', 'src-sess', 'ser-1')).toHaveLength(1);
+    expect(
+      (
+        getRawDb().prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE action = 'move_intent'").get() as {
+          c: number;
+        }
+      ).c,
+    ).toBe(0);
   });
 
   // ── E-4: delta hash binds the move target ──────────────────────────────────────

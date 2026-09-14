@@ -29,17 +29,20 @@ import { findSystemSession, taskThreadId, withQuietInvalidationSync } from '../.
 import { readSessionInbound, type ScheduledTaskRow } from '../../modules/mailbox/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import * as scheduledTasks from '../../db/scheduled-tasks.js';
-import { type TaskDef } from '../../db/scheduled-tasks.js';
+import { TaskSeriesCollisionError, type TaskDef } from '../../db/scheduled-tasks.js';
 import { type TaskRowSnapshot } from '../../modules/scheduling/db.js';
 import { countLiveRowsInSessions } from '../../modules/scheduling/live-count.js';
 import { log } from '../../log.js';
 import { parseUtcTimestampMs } from '../../thread-context.js';
 import { mergeWorkgroupAndGroupSecrets } from '../../onecli-secrets.js';
-import { GUARD_GRACE_MS, verbVerdict, type HealthState } from './scheduled-board-matrix.js';
+import { resolveTaskFlagIntent } from '../../modules/scheduling/task-flags.js';
+import { parseTaskPin } from '../../modules/scheduling/task-content.js';
+import { verbVerdict, type HealthState } from './scheduled-board-matrix.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
 import {
   canManageScheduled,
   decodeKey,
+  encodeKey,
   invalidateScheduledCache,
   purgeIntentBody,
   rateLimit,
@@ -224,6 +227,18 @@ interface MoveBody {
   confirmedDeltaHash?: string;
 }
 
+/**
+ * The dashboard and the local `ncl` socket have different authentication
+ * transports but the same move transaction. Keep that distinction at this
+ * boundary: HTTP callers carry a scoped dashboard identity, whereas the
+ * 0600 host socket is already the operator authentication boundary.
+ */
+interface MoveAuthorization {
+  actor: string;
+  hostOperator: boolean;
+  scopes?: AuthedRequestContext['scopes'];
+}
+
 interface ResolvedMove {
   source: { agentGroupId: string; sessionId: string; seriesId: string; folder: string };
   target: { agentGroupId: string; messagingGroupId: string; folder: string };
@@ -239,18 +254,21 @@ interface ResolvedMove {
 async function resolveAndGate(
   key: string,
   body: MoveBody,
-  ctx: AuthedRequestContext,
+  auth: MoveAuthorization,
 ): Promise<{ error: Response } | { ok: ResolvedMove }> {
   const decoded = decodeKey(key);
   if (!decoded) return { error: json({ error: 'not_found' }, 404) };
 
   // Mutation-tier gate (preview reads secret names — M5/SEC-1). Non-manage →
   // 404, never 403 (don't reveal the resource exists).
-  if (!(await canManageScheduled(ctx.user.id))) return { error: json({ error: 'not_found' }, 404) };
+  if (!auth.hostOperator) {
+    if (!(await canManageScheduled(auth.actor))) return { error: json({ error: 'not_found' }, 404) };
 
-  // Scope re-check from the decoded key (never trust the key as authz, §4.5).
-  if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(decoded.agentGroupId)) {
-    return { error: json({ error: 'not_found' }, 404) };
+    // Scope re-check from the decoded key (never trust the key as authz, §4.5).
+    const scopes = auth.scopes;
+    if (!scopes || (!scopes.no_filter && !scopes.allowed_group_ids.includes(decoded.agentGroupId))) {
+      return { error: json({ error: 'not_found' }, 404) };
+    }
   }
 
   const sourceAg = await getAgentGroup(decoded.agentGroupId);
@@ -285,6 +303,10 @@ export async function isCrossWorkgroup(sourceAgId: string, targetAgId: string): 
   return s.workgroup_id !== t.workgroup_id;
 }
 
+function dashboardMoveAuthorization(ctx: AuthedRequestContext): MoveAuthorization {
+  return { actor: ctx.user.id, hostOperator: false, scopes: ctx.scopes };
+}
+
 // ── D1: preview handler ─────────────────────────────────────────────────────────
 
 export const movePreviewHandler: AuthHandler = async (req, params, ctx) => {
@@ -296,7 +318,7 @@ export const movePreviewHandler: AuthHandler = async (req, params, ctx) => {
     return json({ error: 'invalid_request' }, 400);
   }
 
-  const resolved = await resolveAndGate(params['key'] ?? '', body, ctx);
+  const resolved = await resolveAndGate(params['key'] ?? '', body, dashboardMoveAuthorization(ctx));
   if ('error' in resolved) return resolved.error;
   const { source, target } = resolved.ok;
 
@@ -349,7 +371,7 @@ function taskDefFromSnapshot(
   seriesId: string,
   targetAgentGroupId: string,
   targetMg: { platform_id: string; channel_type: string },
-  processAfterOverride?: string,
+  targetRowId: string,
 ): TaskDef {
   let content: { prompt?: string; script?: string; quietStatus?: boolean; flagIntent?: TaskDef['flagIntent'] } = {};
   try {
@@ -358,10 +380,10 @@ function taskDefFromSnapshot(
     /* malformed — fall through with empty content; prompt falls back below */
   }
   return {
-    id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    id: targetRowId,
     agentGroupId: targetAgentGroupId,
     cron: snapshot.recurrence ?? '',
-    processAfter: processAfterOverride ?? snapshot.process_after ?? new Date().toISOString(),
+    processAfter: snapshot.process_after ?? new Date().toISOString(),
     // The moved row is the SAME occurrence, so it keeps the slot it was armed
     // for. Without this the destination's scheduled_for would be stamped from
     // process_after — which is the staged grace time on the paused path, and
@@ -369,6 +391,19 @@ function taskDefFromSnapshot(
     ...(snapshot.scheduled_for ? { scheduledFor: snapshot.scheduled_for } : {}),
     seriesId,
     prompt: typeof content.prompt === 'string' ? content.prompt : snapshot.content,
+    // Preserve every existing task control, not merely the fields this move
+    // flow knew when it was first written. `scheduleTask` otherwise rebuilds
+    // content from a short allow-list and silently drops controls such as
+    // scriptHost, threadAnchor, originSessionId, muteChat and chatLimit.
+    rawContent: snapshot.content,
+    // A move is not a generic re-schedule. Never upsert a target task that
+    // happens to carry the same series id; the scheduler re-checks this at
+    // its mailbox write boundary to close the competing-writer race.
+    rejectExistingLiveSeries: true,
+    // A paused source moves as paused at the target write itself. The old
+    // pending grace insert followed by a second pause left a crash window in
+    // which recovery could bless a runnable target.
+    ...(snapshot.status === 'paused' ? { status: 'paused' as const } : {}),
     ...(typeof content.script === 'string' ? { script: content.script } : {}),
     ...(content.quietStatus ? { quietStatus: true } : {}),
     ...(content.flagIntent ? { flagIntent: content.flagIntent } : {}),
@@ -404,22 +439,12 @@ async function targetSessionIdFor(targetAgentGroupId: string, seriesId: string):
   return (await findSystemSession(targetAgentGroupId, taskThreadId(seriesId)))?.id ?? null;
 }
 
-export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
+/** Execute the one move transaction after transport-specific authentication. */
+async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization): Promise<Response> {
   const { dataDir, groupsDir, nowMs } = moveOpts();
-  let body: MoveBody;
-  try {
-    body = (await req.json()) as MoveBody;
-  } catch {
-    return json({ error: 'invalid_request' }, 400);
-  }
-
-  const resolved = await resolveAndGate(params['key'] ?? '', body, ctx);
+  const resolved = await resolveAndGate(key, body, auth);
   if ('error' in resolved) return resolved.error;
   const { source, target } = resolved.ok;
-
-  // Rate limit (move converts a keypress into container compute — §4.5/A14/S10).
-  const rl = rateLimit(ctx.user.id, 'move');
-  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.retryAfter }, 429);
 
   const targetMg = await getMessagingGroup(target.messagingGroupId);
   if (!targetMg) return json({ error: 'not_found' }, 404);
@@ -454,6 +479,37 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
   // Stale key — no live source row to move (§3b: touched 0 → 409 stale_key).
   if (!snapshot) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
+  // Pins are persisted as source content. The destination can use a different
+  // provider, so validate the literal stored pin before cancelling anything;
+  // preserving an unusable pin would create a series that fails unattended.
+  const pin = parseTaskPin(snapshot.content);
+  const pinCheck = await resolveTaskFlagIntent(
+    { model: pin.model ?? undefined, effort: pin.effort ?? undefined },
+    { agent_group_id: target.agentGroupId },
+  );
+  if (pinCheck.error) return json({ error: 'target_pin_invalid', reason: 'target_pin_invalid' }, 409);
+
+  // Fast failure before source cancellation. The scheduler repeats this exact
+  // live-row exclusion inside the target mailbox transaction, because another
+  // writer can still create a series during the scheduling funnel below.
+  const existingTargetSession = await targetSessionIdFor(target.agentGroupId, source.seriesId);
+  if (
+    existingTargetSession &&
+    (existingTargetSession !== source.sessionId || target.agentGroupId !== source.agentGroupId)
+  ) {
+    try {
+      const targetLive = await withExistingMailboxSession(target.agentGroupId, existingTargetSession, (mailbox) =>
+        mailbox.getLiveTaskRow(source.seriesId),
+      );
+      if (targetLive) return json({ error: 'target_conflict', reason: 'target_conflict' }, 409);
+    } catch {
+      // A corrupt target is not an empty target. Refuse before cancelling the
+      // source rather than discovering the unreadable post-state only after
+      // a compensation path has begun.
+      return json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503);
+    }
+  }
+
   // Step 2a: §4.0 in-flight admission guard (verbVerdict is the ONLY guard source).
   const processAfterMs = parseUtcTimestampMs(snapshot.process_after);
   const guardState = moveGuardState(snapshot.status, processAfterMs, nowMs);
@@ -473,11 +529,16 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
 
   const wasPaused = snapshot.status === 'paused';
   const correlationId = randomUUID();
+  const sourceCancellationReceiptId = `scheduled-move-cancel:${correlationId}`;
+  // This ID is durable move ownership, not a series identity. It tells both
+  // compensation and crash recovery whether a target row came from THIS move
+  // or was unrelated work sharing the same series id.
+  const targetRowId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   // Step 2b: durable move_intent BEFORE cancel (F2). Full snapshot in
   // detail_json; correlation_id links the recovery.
   await writeAudit({
-    actor: ctx.user.id,
+    actor: auth.actor,
     action: 'move_intent',
     agentGroupId: source.agentGroupId,
     sessionId: source.sessionId,
@@ -503,6 +564,8 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
       target: target.agentGroupId,
       targetAgentGroupId: target.agentGroupId,
       targetMessagingGroupId: target.messagingGroupId,
+      targetRowId,
+      sourceCancellationReceiptId,
     },
   });
 
@@ -586,76 +649,64 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
         });
         return 0;
       }
-      return mailbox.cancelTaskRow(snapshot.id);
+      return mailbox.cancelTaskRowWithMoveReceipt(snapshot.id, sourceCancellationReceiptId);
     })) ?? 0;
   if (cancelTouched === 0) {
-    // Nothing was cancelled (the approved occurrence stopped being live between
-    // the guard and here) — leave the intent unresolved for the recovery sweep
-    // and do NOT insert.
+    // Nothing was cancelled: this request did not change the source, so its
+    // intent has no compensation duty. Resolving it here is essential when a
+    // concurrent move won the source row first: recovery must not mistake the
+    // winner's target occurrence for an unrelated collision and resurrect the
+    // source recurrence. Do NOT insert into the target.
     log.warn('scheduled-move: cancel touched 0 rows — aborting before target insert', {
       seriesId: source.seriesId,
       rowId: snapshot.id,
     });
+    await purgeIntentBody(correlationId);
+    invalidateScheduledCache();
     return json({ error: 'stale_key', reason: 'stale_key' }, 409);
   }
 
-  // Step 4: re-schedule into the target. Paused snapshots take the staged path
-  // (4a) so the row is never simultaneously pending + due (F1).
+  // Step 4: re-schedule into the target. A paused snapshot is inserted as
+  // paused atomically, so it never has a runnable intermediate state.
   try {
-    if (wasPaused) {
-      const stagedProcessAfter = new Date(nowMs + GUARD_GRACE_MS).toISOString();
-      await scheduledTasks.scheduleTask(
-        taskDefFromSnapshot(snapshot, source.seriesId, target.agentGroupId, targetMg, stagedProcessAfter),
-      );
-      const tgtSessId = await targetSessionIdFor(target.agentGroupId, source.seriesId);
-      if (tgtSessId) {
-        // A DIFFERENT key from the source session above, and that session is
-        // closed by now — the two opens are sequential, never nested, which is
-        // what the same-key nesting guard (invariant I-3) forbids.
-        //
-        // `scheduleTask` just provisioned this mailbox, so `undefined` is a
-        // genuine fault: staging exists so the row is never simultaneously
-        // pending and due, and skipping it would land a paused move as
-        // pending. Throwing takes the restore path, as the pre-seam open did.
-        const staged = await withExistingMailboxSession(target.agentGroupId, tgtSessId, (mailbox) => {
-          mailbox.pauseTask(source.seriesId);
-          // keepScheduledFor: this restores the row's RUN time after the
-          // staged grace insert. scheduleTask already stamped the occurrence's
-          // slot from the snapshot, and moving it again here would overwrite it
-          // with the run time.
-          if (snapshot.process_after) {
-            mailbox.updateTask(source.seriesId, {
-              processAfter: snapshot.process_after,
-              keepScheduledFor: true,
-            });
-          }
-          return true;
-        });
-        if (!staged) throw new Error(`target task session ${tgtSessId} has no inbound mailbox to stage into`);
-      }
-    } else {
-      await scheduledTasks.scheduleTask(taskDefFromSnapshot(snapshot, source.seriesId, target.agentGroupId, targetMg));
-    }
+    await scheduledTasks.scheduleTask(
+      taskDefFromSnapshot(snapshot, source.seriesId, target.agentGroupId, targetMg, targetRowId),
+    );
   } catch (err) {
-    // Step 5: target insert failed → restore the source — but ONLY when the
-    // scoped {source,target} live count is a readable ZERO. M2/F6: if the count
-    // is UNREADABLE, the post-state is UNKNOWN, so we must NOT restore (a blind
-    // restore on top of a live row we couldn't see would double it). Never
-    // delete a succeeded target.
+    // Step 5: target insert failed → restore the source. Most failures require
+    // a readable zero across {source,target}: a target may have landed before
+    // throwing. A TaskSeriesCollisionError is different: the scheduler's own
+    // mailbox transaction proves this move wrote no target row, so unrelated
+    // same-series target work must not prevent restoring the cancelled source.
     log.warn('scheduled-move: target insert failed — restoring source', {
       seriesId: source.seriesId,
       err: err instanceof Error ? err.message : String(err),
     });
     let restored = false;
     try {
-      const tgtSessId = await targetSessionIdFor(target.agentGroupId, source.seriesId);
-      const live = scopedLiveCount(
+      const sourceLive = scopedLiveCount(
         dataDir,
         { agentGroupId: source.agentGroupId, sessionId: source.sessionId },
-        { agentGroupId: target.agentGroupId, sessionId: tgtSessId },
+        { agentGroupId: target.agentGroupId, sessionId: null },
         source.seriesId,
       );
-      if (!live.unreadable && live.count === 0) {
+      const targetLive =
+        err instanceof TaskSeriesCollisionError
+          ? null
+          : scopedLiveCount(
+              dataDir,
+              { agentGroupId: source.agentGroupId, sessionId: source.sessionId },
+              {
+                agentGroupId: target.agentGroupId,
+                sessionId: await targetSessionIdFor(target.agentGroupId, source.seriesId),
+              },
+              source.seriesId,
+            );
+      if (
+        !sourceLive.unreadable &&
+        sourceLive.count === 0 &&
+        (!targetLive || (!targetLive.unreadable && targetLive.count === 0))
+      ) {
         restored =
           (await withExistingMailboxSession(source.agentGroupId, source.sessionId, (mailbox) =>
             withCentralSync(() => {
@@ -697,7 +748,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
     }
     if (!restored) {
       await writeAudit({
-        actor: ctx.user.id,
+        actor: auth.actor,
         action: 'move_restore_failed',
         agentGroupId: source.agentGroupId,
         sessionId: source.sessionId,
@@ -708,6 +759,9 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
       await purgeIntentBody(correlationId);
     }
     invalidateScheduledCache();
+    if (err instanceof TaskSeriesCollisionError) {
+      return json({ error: 'target_conflict', reason: 'target_conflict' }, 409);
+    }
     return json({ error: 'move_failed', reason: 'move_failed' }, 500);
   }
 
@@ -717,6 +771,30 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
   // UNREADABLE post-state is equally not-success (never claim a move succeeded
   // on a state we couldn't observe).
   const tgtSessId = await targetSessionIdFor(target.agentGroupId, source.seriesId);
+  let targetOwned: boolean;
+  try {
+    targetOwned = !!(
+      tgtSessId &&
+      (await withExistingMailboxSession(target.agentGroupId, tgtSessId, (mailbox) =>
+        mailbox.getLiveTaskRowById(targetRowId),
+      ))
+    );
+  } catch {
+    log.error('scheduled-move: target ownership unreadable — leaving intent for recovery', {
+      seriesId: source.seriesId,
+      targetRowId,
+    });
+    invalidateScheduledCache();
+    return json({ error: 'move_failed', reason: 'post_state_unreadable' }, 503);
+  }
+  if (!targetOwned) {
+    log.error('scheduled-move: target ownership missing — leaving intent for recovery', {
+      seriesId: source.seriesId,
+      targetRowId,
+    });
+    invalidateScheduledCache();
+    return json({ error: 'move_failed', reason: 'invariant_violated' }, 500);
+  }
   const post = scopedLiveCount(
     dataDir,
     { agentGroupId: source.agentGroupId, sessionId: source.sessionId },
@@ -745,7 +823,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
   await purgeIntentBody(correlationId);
   const secretDetail = { secretGainsCount: (await delta).gains.length, secretLossesCount: (await delta).losses.length };
   await writeAudit({
-    actor: ctx.user.id,
+    actor: auth.actor,
     action: 'move',
     agentGroupId: source.agentGroupId,
     sessionId: source.sessionId,
@@ -754,7 +832,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
     detail: { direction: 'source', target: target.agentGroupId, ...secretDetail },
   });
   await writeAudit({
-    actor: ctx.user.id,
+    actor: auth.actor,
     action: 'move',
     agentGroupId: target.agentGroupId,
     sessionId: tgtSessId ?? '',
@@ -765,4 +843,70 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
   invalidateScheduledCache();
 
   return json({ moved: true });
+}
+
+export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
+  let body: MoveBody;
+  try {
+    body = (await req.json()) as MoveBody;
+  } catch {
+    return json({ error: 'invalid_request' }, 400);
+  }
+
+  // Rate limit only bounds interactive dashboard keypresses. The local host
+  // socket is a separate, explicit operator command and already serializes
+  // through its own request/guard boundary.
+  const rl = rateLimit(ctx.user.id, 'move');
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.retryAfter }, 429);
+  return executeMove(params['key'] ?? '', body, dashboardMoveAuthorization(ctx));
 };
+
+/** Exact source/target locator accepted only from the host CLI socket. */
+export interface HostTaskMoveRequest {
+  sourceAgentGroupId: string;
+  sourceSessionId: string;
+  seriesId: string;
+  targetAgentGroupId: string;
+  targetMessagingGroupId: string;
+}
+
+/**
+ * Host-operator entry point for the same move transaction the dashboard uses.
+ *
+ * This does not mint or fabricate a dashboard session. The local ncl socket is
+ * independently authenticated by its 0600 filesystem boundary; it is the
+ * existing operator surface for task mutation. The delta is still bound and
+ * rechecked by `executeMove`, but names are never returned to the CLI.
+ */
+export async function moveTaskAsHost(request: HostTaskMoveRequest): Promise<{
+  moved: true;
+  secretGainsCount: number;
+  secretLossesCount: number;
+}> {
+  const key = encodeKey(request.sourceAgentGroupId, request.sourceSessionId, request.seriesId);
+  const body: MoveBody = {
+    targetAgentGroupId: request.targetAgentGroupId,
+    targetMessagingGroupId: request.targetMessagingGroupId,
+  };
+  const auth: MoveAuthorization = { actor: 'host', hostOperator: true };
+  const resolved = await resolveAndGate(key, body, auth);
+  if ('error' in resolved) throw new Error('task move source or target was not found');
+
+  const delta = await computeSecretDelta(
+    resolved.ok.source.agentGroupId,
+    resolved.ok.source.folder,
+    resolved.ok.target.agentGroupId,
+    resolved.ok.target.folder,
+    resolved.ok.target.messagingGroupId,
+    moveOpts().groupsDir,
+  );
+  body.confirmedDeltaHash = delta.deltaHash;
+  const response = await executeMove(key, body, auth);
+  const result = (await response.json()) as { moved?: unknown; error?: unknown; reason?: unknown };
+  if (response.status !== 200 || result.moved !== true) {
+    const reason =
+      result.reason === 'target_conflict' || result.reason === 'target_pin_invalid' ? result.reason : 'move_failed';
+    throw new Error(`task move failed: ${reason}`);
+  }
+  return { moved: true, secretGainsCount: delta.gains.length, secretLossesCount: delta.losses.length };
+}

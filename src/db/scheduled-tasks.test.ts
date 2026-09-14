@@ -772,6 +772,44 @@ describe('test_scheduleTask_idempotent', () => {
     expect(rows[0].process_after).toBe(processAfter2);
   });
 
+  it('rejectExistingLiveSeries refuses an existing target instead of upserting it', async () => {
+    seedActiveSession();
+    seedInboundDb();
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+
+    await scheduleTask({
+      id: 't-existing',
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 3 * * *',
+      processAfter,
+      seriesId: 's-no-upsert',
+      prompt: 'target work',
+      destination: TEST_DESTINATION,
+    });
+
+    await expect(
+      scheduleTask({
+        id: 't-overwrite',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 4 * * *',
+        processAfter: new Date(Date.now() + 172800000).toISOString(),
+        seriesId: 's-no-upsert',
+        prompt: 'must not replace target work',
+        rejectExistingLiveSeries: true,
+        destination: TEST_DESTINATION,
+      }),
+    ).rejects.toThrow('target already has a live task series s-no-upsert');
+
+    const db = openInboundDb(taskInboundPath('s-no-upsert'));
+    const row = db.prepare("SELECT content, process_after FROM messages_in WHERE series_id = 's-no-upsert'").get() as {
+      content: string;
+      process_after: string;
+    };
+    db.close();
+    expect(JSON.parse(row.content)).toMatchObject({ prompt: 'target work' });
+    expect(row.process_after).toBe(processAfter);
+  });
+
   it('removes stale recall and re-sequences an admitted active row as inert when rescheduled', async () => {
     seedActiveSession();
     seedInboundDb();

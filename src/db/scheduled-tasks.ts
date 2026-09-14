@@ -35,7 +35,19 @@ import {
 import { withCentralSync, withRawDb } from './central-lease.js';
 
 /** Did the row land, or was the session closed under us before the write? */
-type StampOutcome = 'written' | 'session-closed';
+type StampOutcome = 'written' | 'session-closed' | 'series-collision';
+
+/**
+ * A move must never turn a target task into an upsert. The generic scheduler
+ * deliberately upserts by series id; the move flow opts out and handles this
+ * as a recoverable target-insert failure instead.
+ */
+export class TaskSeriesCollisionError extends Error {
+  constructor(seriesId: string) {
+    super(`scheduleTask: target already has a live task series ${seriesId}`);
+    this.name = 'TaskSeriesCollisionError';
+  }
+}
 
 export interface TaskDef {
   id: string;
@@ -63,6 +75,16 @@ export interface TaskDef {
    * are byte-unaffected. See docs/specs/scheduled-tasks-board/design.md §4.2.
    */
   script?: string;
+  /**
+   * The source task envelope exactly as persisted. Only the move path supplies
+   * this: rebuilding a snapshot from selected fields loses task controls added
+   * after this public scheduler API (for example muteChat and chatLimit).
+   */
+  rawContent?: string;
+  /** Refuse a live target series instead of scheduleTask's normal upsert. */
+  rejectExistingLiveSeries?: boolean;
+  /** Insert a paused occurrence directly instead of staging it as pending. */
+  status?: 'pending' | 'paused';
   tz?: string;
   /**
    * REQUIRED. Where the task's chat output lands. The (agent_group_id,
@@ -270,12 +292,14 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
   // after re-validating the destination. See the note there.
   const { session } = await resolveTaskSession(def.agentGroupId, def.seriesId);
 
-  const content = JSON.stringify({
-    prompt: def.prompt,
-    ...(def.script !== undefined ? { script: def.script } : {}),
-    ...(def.quietStatus ? { quietStatus: true } : {}),
-    ...(def.flagIntent ? { flagIntent: def.flagIntent } : {}),
-  });
+  const content =
+    def.rawContent ??
+    JSON.stringify({
+      prompt: def.prompt,
+      ...(def.script !== undefined ? { script: def.script } : {}),
+      ...(def.quietStatus ? { quietStatus: true } : {}),
+      ...(def.flagIntent ? { flagIntent: def.flagIntent } : {}),
+    });
 
   // Existing-only first, provisioning only if there is genuinely no mailbox.
   // `resolveTaskSession` may have just created the session row, and a task is
@@ -392,12 +416,15 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
             scheduledFor: def.scheduledFor,
             recurrence: def.cron,
             content,
+            status: def.status,
+            rejectExistingLiveSeries: def.rejectExistingLiveSeries,
             platformId: def.destination.platformId,
             channelType: def.destination.channelType,
             threadId: def.destination.threadId,
           }),
         );
       }, 'scheduleTask upsert');
+      if ('collision' in upserted) return 'series-collision';
       try {
         await setTaskRoutingPlatformId(sessionId, def.destination.platformId);
       } catch (err) {
@@ -452,17 +479,21 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
   // Each attempt invalidates only the session it is about to write to, so a
   // spurious invalidation ahead of a write that then fails (session closed,
   // retried against a different session) never touches the WRONG session's mark.
-  if ((await write(session.id)) === 'written') {
+  const first = await write(session.id);
+  if (first === 'written') {
     return;
   }
+  if (first === 'series-collision') throw new TaskSeriesCollisionError(def.seriesId);
 
   // Lost the race. Re-resolve and try once more. This terminates: the lookups
   // behind `resolveTaskSession` filter `status = 'active'`, so the closed row
   // can never come back — a fresh active task session is minted instead.
   const retry = await resolveTaskSession(def.agentGroupId, def.seriesId);
-  if ((await write(retry.session.id)) === 'written') {
+  const second = await write(retry.session.id);
+  if (second === 'written') {
     return;
   }
+  if (second === 'series-collision') throw new TaskSeriesCollisionError(def.seriesId);
   throw new Error(
     `scheduleTask: task session for series ${def.seriesId} was closed twice while scheduling; not retrying again`,
   );

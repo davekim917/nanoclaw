@@ -84,7 +84,13 @@ import {
   type InboundRoutingAnchor,
   type RoutedTaskRow,
 } from './ops/lookups.js';
-import { getLiveTaskRow, listTurnUsageSince, type ScheduledTaskRow, type SessionTurnUsageRow } from './ops/reads.js';
+import {
+  getLiveTaskRow,
+  getLiveTaskRowById,
+  listTurnUsageSince,
+  type ScheduledTaskRow,
+  type SessionTurnUsageRow,
+} from './ops/reads.js';
 import {
   admitDueRow,
   admitPendingUpgradeRow,
@@ -103,9 +109,11 @@ import {
   armNextTask,
   cancelSeriesWithStrandClear,
   cancelTaskRow,
+  cancelTaskRowWithMoveReceipt,
   getCliTaskRow,
   getCompletedRecurring,
   getCreatedTaskRow,
+  hasMoveCancellationReceipt,
   insertRecurrence,
   insertTaskRow,
   listCliTaskSeries,
@@ -123,6 +131,7 @@ import {
   type RecurringMessage as ForkRecurringMessage,
   type TaskRowInsert,
   type TaskRowSnapshot,
+  type TaskSeriesCollision,
   type TaskSeriesSnapshot,
   type UpsertedTaskSeries,
   type TaskUpdate as ForkTaskUpdate,
@@ -224,6 +233,7 @@ export {
   type RecurringMessage,
   type TaskRowInsert,
   type TaskRowSnapshot,
+  type TaskSeriesCollision,
   type TaskSeriesSnapshot,
   type TaskUpdate,
   type UpsertedTaskSeries,
@@ -494,6 +504,10 @@ export interface NanoclawMailboxSession extends MailboxSession {
    * `cancelTask`, for a writer acting on a row it read earlier.
    */
   cancelTaskRow(rowId: string): number;
+  /** Atomically cancel one task row and record the given move-intent receipt. */
+  cancelTaskRowWithMoveReceipt(rowId: string, receiptId: string): number;
+  /** Whether this source inbox durably records the exact move cancellation. */
+  hasMoveCancellationReceipt(receiptId: string): boolean;
   /**
    * The newest LIVE (`pending`/`paused`) task row of a series.
    *
@@ -503,6 +517,8 @@ export interface NanoclawMailboxSession extends MailboxSession {
    * statement (invariant I-2) — the surface differs, the SQL does not.
    */
   getLiveTaskRow(seriesId: string): ScheduledTaskRow | null;
+  /** Exact live task occurrence lookup; used to prove a move owns its target row. */
+  getLiveTaskRowById(rowId: string): ScheduledTaskRow | null;
   upsertTaskSeries(row: {
     id: string;
     seriesId: string;
@@ -511,11 +527,13 @@ export interface NanoclawMailboxSession extends MailboxSession {
     scheduledFor?: string | null;
     recurrence: string;
     content: string;
+    status?: 'pending' | 'paused';
+    rejectExistingLiveSeries?: boolean;
     platformId: string | null;
     channelType: string | null;
     threadId: string | null;
     /** Returns the row it touched and that row's prior state, for `restoreTaskSeries`. */
-  }): UpsertedTaskSeries;
+  }): UpsertedTaskSeries | TaskSeriesCollision;
   listDueTaskRows(): HostGatedTaskRow[];
   resolvePendingTask(taskId: string, status: 'completed' | 'failed'): void;
   setPendingTaskContent(taskId: string, content: string): void;
@@ -1196,7 +1214,10 @@ function forkOps(
     restoreTaskSeries: (touchedId, prior, priorRecall) => restoreTaskSeries(inbound, touchedId, prior, priorRecall),
     cancelSeriesWithStrandClear: (taskId) => cancelSeriesWithStrandClear(inbound, taskId),
     cancelTaskRow: (rowId) => cancelTaskRow(inbound, rowId),
+    cancelTaskRowWithMoveReceipt: (rowId, receiptId) => cancelTaskRowWithMoveReceipt(inbound, rowId, receiptId),
+    hasMoveCancellationReceipt: (receiptId) => hasMoveCancellationReceipt(inbound, receiptId),
     getLiveTaskRow: (seriesId) => getLiveTaskRow(inbound, seriesId),
+    getLiveTaskRowById: (rowId) => getLiveTaskRowById(inbound, rowId),
     upsertTaskSeries: (row) => upsertTaskSeries(inbound, row),
     listDueTaskRows: () => listDueTaskRows(inbound),
     resolvePendingTask: (taskId, status) => resolvePendingTask(inbound, taskId, status),

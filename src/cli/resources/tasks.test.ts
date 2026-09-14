@@ -144,6 +144,26 @@ describe('tasks CLI resource', () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
+  it('rejects a move from an agent caller before it can inspect task state', async () => {
+    const result = await dispatch(
+      {
+        id: 'agent-move',
+        command: 'tasks-move',
+        args: {
+          id: 'series-1',
+          group: 'ag-1',
+          session: 'sess-1',
+          target_group: 'ag-2',
+          target_messaging_group: 'mg-2',
+        },
+      },
+      agentCtx(),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error('agent task move unexpectedly succeeded');
+    expect(result.error?.code).toBe('forbidden');
+  });
+
   it("computes an unscoped --process-after in EACH matched group's timezone", async () => {
     // An unscoped host `tasks update` fans out across every active session,
     // which can span groups whose timezone overrides differ. Computing the

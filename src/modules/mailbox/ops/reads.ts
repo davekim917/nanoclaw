@@ -215,6 +215,36 @@ export function getLiveTaskRow(db: Database.Database, seriesId: string): Schedul
   );
 }
 
+/** Exact live task occurrence lookup for move ownership/recovery. */
+export function getLiveTaskRowById(db: Database.Database, rowId: string): ScheduledTaskRow | null {
+  return (
+    (db
+      .prepare(
+        `SELECT ${scheduledColumns(db)} FROM messages_in
+          WHERE id = ? AND kind = 'task' AND status IN ('pending', 'paused') LIMIT 1`,
+      )
+      .get(rowId) as ScheduledTaskRow | undefined) ?? null
+  );
+}
+
+/**
+ * Durable task occurrence lookup for move recovery.
+ *
+ * The move intent records the target row's exact id before source cancellation.
+ * Recovery must still recognize that ownership after the occurrence completes:
+ * a recurring completion can arm its successor before a crashed host recovers.
+ */
+export function getTaskRowById(db: Database.Database, rowId: string): ScheduledTaskRow | null {
+  return (
+    (db
+      .prepare(
+        `SELECT ${scheduledColumns(db)} FROM messages_in
+          WHERE id = ? AND kind = 'task' LIMIT 1`,
+      )
+      .get(rowId) as ScheduledTaskRow | undefined) ?? null
+  );
+}
+
 /** The recurring task definition, including a terminal strand, or newest one-off. */
 export function getLatestTaskRow(db: Database.Database, seriesId: string): ScheduledTaskRow | null {
   return (

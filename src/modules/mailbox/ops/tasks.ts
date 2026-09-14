@@ -441,6 +441,37 @@ export function cancelTaskRow(db: Database.Database, rowId: string): number {
 }
 
 /**
+ * Cancel one task occurrence and write its move-cancellation receipt in the
+ * same inbound-db transaction.
+ *
+ * A move intent is written to the central DB before cancellation, but it
+ * cannot prove which of two overlapping moves changed the source. This
+ * terminal system row is that proof: recovery restores a source only when the
+ * exact intent owns this durable receipt. A crash commits both rows or neither.
+ */
+export function cancelTaskRowWithMoveReceipt(db: Database.Database, rowId: string, receiptId: string): number {
+  migrateMessagesInTable(db);
+  return db
+    .transaction(() => {
+      const cancelled = cancelTaskRow(db, rowId);
+      if (cancelled === 0) return 0;
+      db.prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, content)
+         VALUES (?, ?, 'system', ?, 'completed', '{}')`,
+      ).run(receiptId, nextEvenSeq(db), new Date().toISOString());
+      return cancelled;
+    })
+    .immediate();
+}
+
+/** True only when this exact move's cancellation receipt is durable. */
+export function hasMoveCancellationReceipt(db: Database.Database, receiptId: string): boolean {
+  return !!db
+    .prepare("SELECT 1 FROM messages_in WHERE id = ? AND kind = 'system' AND status = 'completed' LIMIT 1")
+    .get(receiptId);
+}
+
+/**
  * Board-cancel a series AND make it non-resurrectable. `cancelTask` cancels
  * the live row(s) and clears their recurrence, but crash residue
  * (`recurrence.ts` insert-then-clear) or a swallowed-parse strand can leave a
@@ -527,6 +558,11 @@ export interface UpsertedTaskSeries {
    * undone depends on the task row's own `trigger` — see `restoreTaskSeries`.
    */
   priorRecall: TaskSeriesSnapshot | null;
+}
+
+/** A caller opted out of scheduleTask's normal active-series upsert. */
+export interface TaskSeriesCollision {
+  collision: true;
 }
 
 /**
@@ -642,14 +678,18 @@ export function upsertTaskSeries(
     scheduledFor?: string | null;
     recurrence: string;
     content: string;
+    /** Insert a paused task atomically (used only by a paused move). */
+    status?: 'pending' | 'paused';
+    /** Refuse, rather than overwrite, the exact live row this upsert selected. */
+    rejectExistingLiveSeries?: boolean;
     platformId: string | null;
     channelType: string | null;
     threadId: string | null;
   },
-): UpsertedTaskSeries {
+): UpsertedTaskSeries | TaskSeriesCollision {
   migrateMessagesInTable(db);
   return db
-    .transaction((): UpsertedTaskSeries => {
+    .transaction((): UpsertedTaskSeries | TaskSeriesCollision => {
       // The WHOLE row, and selected ONCE. `scheduleTask` has to be able to undo
       // this write when its central-DB companion fails, and the only place that
       // knows WHICH live row was chosen is here. A caller re-running this SELECT
@@ -664,6 +704,12 @@ export function upsertTaskSeries(
       const activeRow = db
         .prepare("SELECT * FROM messages_in WHERE series_id = ? AND status IN ('pending', 'paused')")
         .get(row.seriesId) as TaskSeriesSnapshot | undefined;
+
+      // This predicate deliberately lives beside the SELECT the generic
+      // upsert actually uses. `getLiveTaskRow()` has board semantics that can
+      // hide a pending manual run behind a terminal recurring strand; using it
+      // here would let a move overwrite exactly the row it promised not to.
+      if (row.rejectExistingLiveSeries && activeRow) return { collision: true };
 
       if (activeRow) {
         // Captured BEFORE the delete below, in the same statement sequence that
@@ -708,11 +754,12 @@ export function upsertTaskSeries(
         `INSERT INTO messages_in
          (id, seq, kind, timestamp, status, tries, process_after, scheduled_for, recurrence, series_id, content,
           platform_id, channel_type, thread_id, trigger)
-       VALUES (?, ?, 'task', ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+       VALUES (?, ?, 'task', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
       ).run(
         row.id,
         nextEvenSeq(db),
         new Date().toISOString(),
+        row.status ?? 'pending',
         row.processAfter,
         isoSlot(row.scheduledFor ?? row.processAfter),
         row.recurrence,
