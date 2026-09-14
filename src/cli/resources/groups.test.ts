@@ -40,7 +40,12 @@ import { createSession } from '../../db/sessions.js';
 import { recordDeliveryAttempt } from '../../db/coordination.js';
 import { dispatch } from '../dispatch.js';
 import { readContainerConfig } from '../../container-config.js';
-import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
+import {
+  ensureContainerConfig,
+  getContainerConfig,
+  updateContainerConfigJson,
+  updateContainerConfigScalars,
+} from '../../db/container-configs.js';
 import { isSiblingBoundField } from '../../sibling-parity.js';
 // Side-effect import: registers the `groups-*` commands (including delete).
 import './groups.js';
@@ -1023,6 +1028,41 @@ describe('groups config — the container.json + container_configs dual write ho
     expect(row.effort).toBe('high');
     expect(row.assistant_name).toBe('Dual');
     expect(row.timezone).toBe('Europe/Lisbon');
+  });
+
+  it('config update clears redundant model and effort pins from both stores', async () => {
+    const id = 'ag-dual-write-clear';
+    const folder = 'dual-write-clear';
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await ensureContainerConfig(id);
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({
+        mcpServers: {},
+        packages: { apt: [], npm: [] },
+        skills: 'all',
+        model: 'gpt-5.6-terra',
+        effort: 'xhigh',
+      }) + '\n',
+    );
+    await updateContainerConfigScalars(id, { model: 'gpt-5.6-terra', effort: 'xhigh' });
+
+    const res = await dispatch(
+      {
+        id: 'req-dual-clear',
+        command: 'groups-config-update',
+        args: { id, model: '', effort: '' },
+      },
+      { caller: 'host' },
+    );
+    expect(res.ok).toBe(true);
+    expect(readContainerConfig(folder).model).toBeUndefined();
+    expect(readContainerConfig(folder).effort).toBeUndefined();
+    const row = (await getContainerConfig(id))!;
+    expect(row.model).toBeNull();
+    expect(row.effort).toBeNull();
   });
 
   it('config add-mcp-server and remove-mcp-server both write file and DB', async () => {
