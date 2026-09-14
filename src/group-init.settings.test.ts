@@ -21,6 +21,7 @@ vi.mock('./log.js', () => ({
 }));
 
 import { closeDb, createAgentGroup, initTestDb, runMigrations, getRawDb } from './db/index.js';
+import { CLAUDE_MAX_CONCURRENT_SUBAGENTS, CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH } from './claude-spawn-defaults.js';
 import { initGroupFilesystem } from './group-init.js';
 import type { AgentGroup } from './types.js';
 
@@ -74,5 +75,33 @@ describe('default settings.json for new groups', () => {
     const after = JSON.parse(fs.readFileSync(file, 'utf-8'));
     expect(after.disableWorkflows).toBeUndefined();
     expect(after.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS).toBe('1');
+  });
+});
+
+describe('quota env reconciliation (PR #810 F2)', () => {
+  it('overwrites conflicting subagent caps and scrubs the compact-window pin', async () => {
+    const ag = await makeGroup('ag-quota-env');
+    initGroupFilesystem(ag, {});
+    const file = path.join(TEST_ROOT, 'data', 'v2-sessions', ag.id, '.claude-shared', 'settings.json');
+
+    // A fresh file carries the managed caps, equal to what claudeSpawnEnv sends.
+    const fresh = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(fresh.env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH).toBe(CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH);
+    expect(fresh.env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS).toBe(CLAUDE_MAX_CONCURRENT_SUBAGENTS);
+    expect(fresh.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
+
+    // Seed the shadowing shape: a hand-edit (or a pre-#810 file) with values
+    // that disagree with the spawn `-e`.
+    fresh.env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH = '5';
+    fresh.env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS = '20';
+    fresh.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = '1000000';
+    fs.writeFileSync(file, JSON.stringify(fresh, null, 2) + '\n');
+
+    initGroupFilesystem(ag, {}); // next spawn
+
+    const after = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(after.env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH).toBe(CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH);
+    expect(after.env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS).toBe(CLAUDE_MAX_CONCURRENT_SUBAGENTS);
+    expect(after.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
   });
 });

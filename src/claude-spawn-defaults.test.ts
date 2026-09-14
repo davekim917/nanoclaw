@@ -1,10 +1,21 @@
+import fs from 'fs';
+import path from 'path';
 import { describe, expect, it } from 'vitest';
 
-import { claudeSpawnEnv, resolveClaudeSpawnDefaults } from './claude-spawn-defaults.js';
+import {
+  CLAUDE_MAX_CONCURRENT_SUBAGENTS,
+  CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH,
+  DEFAULT_CLAUDE_AUTO_COMPACT_WINDOW,
+  claudeSpawnEnv,
+  resolveClaudeSpawnDefaults,
+} from './claude-spawn-defaults.js';
 import { DEFAULT_SONNET_MODEL } from './flag-parser.js';
 import type { ContainerConfig } from './container-config.js';
 
-type Cfg = Pick<ContainerConfig, 'model' | 'effort' | 'defaultModel' | 'defaultEffort' | 'providerConfig'>;
+type Cfg = Pick<
+  ContainerConfig,
+  'model' | 'effort' | 'defaultModel' | 'defaultEffort' | 'providerConfig' | 'autoCompactWindow'
+>;
 const cfg = (over: Partial<Cfg> = {}): Cfg => ({ ...over }) as Cfg;
 
 const pairs = (env: string[]): Record<string, string> => {
@@ -164,6 +175,12 @@ describe('claudeSpawnEnv', () => {
       'ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5-20251001',
       '-e',
       'NANOCLAW_EFFORT_OVERRIDE=medium',
+      '-e',
+      'CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000',
+      '-e',
+      'CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1',
+      '-e',
+      'CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=3',
     ]);
   });
 
@@ -178,8 +195,11 @@ describe('claudeSpawnEnv', () => {
       ANTHROPIC_DEFAULT_OPUS_MODEL: DEFAULT_SONNET_MODEL,
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5-20251001',
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
+      CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: '1',
+      CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: '3',
     });
-    expect(env).toHaveLength(6);
+    expect(env).toHaveLength(12);
   });
 
   it('claude_spawn_env_matches_the_live_fleet_baseline', () => {
@@ -212,5 +232,60 @@ describe('claudeSpawnEnv', () => {
     // ...and no effort is invented for it. The container derives Sonnet's
     // xhigh from this very id (agent-runner defaultEffortForModel).
     expect(env.NANOCLAW_EFFORT_OVERRIDE).toBeUndefined();
+  });
+});
+
+// Quota caps (docs/specs/quota-burn/plan.md §Tier 0). PR #810 round 1 (F1):
+// the wiki spawn branch builds its own argv and `return`s before the ordinary
+// branch's env block, so caps pushed ad hoc in that block never reached wiki
+// containers — and with the settings.json pin scrubbed, their compact window
+// fell to the runner's 165k fallback. The three vars therefore ride
+// claudeSpawnEnv, the one helper both branches call.
+describe('claudeSpawnEnv — quota caps', () => {
+  const QUOTA_VARS = [
+    'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+    'CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH',
+    'CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS',
+  ] as const;
+
+  it('emits the fleet default window and both caps when autoCompactWindow is absent', () => {
+    const env = pairs(claudeSpawnEnv(cfg()));
+    expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe(String(DEFAULT_CLAUDE_AUTO_COMPACT_WINDOW));
+    expect(env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH).toBe(CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH);
+    expect(env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS).toBe(CLAUDE_MAX_CONCURRENT_SUBAGENTS);
+  });
+
+  it('emits a configured autoCompactWindow verbatim, caps unchanged', () => {
+    // The plan §0.5 shape: one group's container.json → 400000.
+    const env = pairs(claudeSpawnEnv(cfg({ autoCompactWindow: 400000 })));
+    expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('400000');
+    expect(env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH).toBe('1');
+    expect(env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS).toBe('3');
+  });
+
+  it('is emitted by both container-runner spawn branches and nowhere else', () => {
+    // buildContainerArgs cannot execute under vitest (live `onecli` calls), so
+    // the branch-coverage half is a source assertion: every `claudeSpawnEnv(`
+    // call site in container-runner.ts is counted, the wiki branch's early
+    // `return args` must come AFTER one of them, and no ad-hoc `-e` push of
+    // any quota var may exist outside the helper — that is the exact shape
+    // that lost the wiki branch in round 1.
+    const runner = fs.readFileSync(path.join(import.meta.dirname, 'container-runner.ts'), 'utf-8');
+    const callSites = [...runner.matchAll(/claudeSpawnEnv\(/g)].map((m) => m.index);
+    expect(callSites.length).toBeGreaterThanOrEqual(2);
+
+    const wikiReturn = runner.indexOf("'exec /app/entrypoint.sh');\n    return args;");
+    expect(wikiReturn).toBeGreaterThan(0);
+    const wikiBranchStart = runner.lastIndexOf('if (wikiActor', wikiReturn);
+    expect(wikiBranchStart).toBeGreaterThan(0);
+    expect(callSites.some((i) => i > wikiBranchStart && i < wikiReturn)).toBe(true);
+    expect(callSites.some((i) => i > wikiReturn)).toBe(true);
+
+    for (const name of QUOTA_VARS) {
+      expect(runner.includes(`'${name}=`), `${name} pushed ad hoc in container-runner.ts`).toBe(false);
+      expect(runner.includes(`\`${name}=`), `${name} pushed ad hoc in container-runner.ts`).toBe(false);
+    }
+    const helper = fs.readFileSync(path.join(import.meta.dirname, 'claude-spawn-defaults.ts'), 'utf-8');
+    for (const name of QUOTA_VARS) expect(helper).toContain(`\`${name}=`);
   });
 });

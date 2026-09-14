@@ -14,6 +14,7 @@ import {
   readContainerConfigStrict,
   effectiveTimezone,
   honouredTimezoneOverride,
+  MIN_AUTO_COMPACT_WINDOW,
   resolveGroupTimezone,
   updateContainerConfig,
   writeContainerConfig,
@@ -723,5 +724,34 @@ describe('opaqueUrlParts', () => {
     ]) {
       expect(opaqueUrlParts(url)).toEqual([]);
     }
+  });
+});
+
+describe('autoCompactWindow (quota-burn plan §0.5)', () => {
+  it('reads a positive integer and leaves it undefined when absent', () => {
+    writeGroupConfig('acw-set', { autoCompactWindow: 400000 });
+    expect(readContainerConfig('acw-set').autoCompactWindow).toBe(400000);
+    writeGroupConfig('acw-absent', {});
+    expect(readContainerConfig('acw-absent').autoCompactWindow).toBeUndefined();
+  });
+
+  it('refuses a malformed value instead of silently reverting to the 1M default', () => {
+    // A typo that read as "default" would quietly undo a lowered window —
+    // the fail-open shape docs/review-notes.md registers as a class.
+    for (const bad of ['400000', 400000.5, 0, -1]) {
+      writeGroupConfig('acw-bad', { autoCompactWindow: bad });
+      expect(() => readContainerConfig('acw-bad')).toThrow(/autoCompactWindow/);
+    }
+  });
+
+  it('refuses a window below the floor and accepts the floor itself', () => {
+    // 1000 is a positive integer and would pass a shape-only check, but at
+    // 80% it compacts every few tool calls (PR #810 review N3).
+    for (const low of [1000, MIN_AUTO_COMPACT_WINDOW - 1]) {
+      writeGroupConfig('acw-low', { autoCompactWindow: low });
+      expect(() => readContainerConfig('acw-low')).toThrow(new RegExp(`>= ${MIN_AUTO_COMPACT_WINDOW}`));
+    }
+    writeGroupConfig('acw-floor', { autoCompactWindow: MIN_AUTO_COMPACT_WINDOW });
+    expect(readContainerConfig('acw-floor').autoCompactWindow).toBe(MIN_AUTO_COMPACT_WINDOW);
   });
 });
