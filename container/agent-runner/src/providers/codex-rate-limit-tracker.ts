@@ -79,6 +79,14 @@ export class CodexRateLimitTracker {
   private snapshot: CodexRateLimitSnapshot | null = null;
   private who: AccountIdentity = { account: null, credentialSet: null, lane: null };
   private lastReadAt = 0;
+  /** Telemetry only: pushes never advance `lastReadAt` (see `onNotification`). */
+  private lastPushAt = 0;
+  /**
+   * Monotonic push counter. `read()` captures it before its await and
+   * compares after: a push that lands mid-read is newer than the read's
+   * answer, so the answer is discarded rather than overwriting the merge.
+   */
+  private pushSeq = 0;
   private readInFlight: Promise<void> | null = null;
 
   constructor(deps: Partial<CodexRateLimitTrackerDeps> = {}) {
@@ -93,6 +101,11 @@ export class CodexRateLimitTracker {
   /** Who the samples are about. `account` is the ChatGPT account id; see `bind`. */
   get identity(): AccountIdentity {
     return this.who;
+  }
+
+  /** Clock of the last push merged (0 = none). Telemetry/diagnostic surface. */
+  get lastPushMs(): number {
+    return this.lastPushAt;
   }
 
   /**
@@ -137,8 +150,10 @@ export class CodexRateLimitTracker {
   }
 
   /**
-   * Re-pull when the snapshot is older than the refresh interval. Pushes keep
-   * `lastReadAt` fresh too, so a server that streams updates never re-reads.
+   * Re-pull when the last FULL read is older than the refresh interval. Pushes
+   * deliberately do not reset this clock: they are sparse, so fields a push
+   * omits — a window, `rateLimitReachedType`, `credits` — only ever refresh
+   * through a full read, and a steady push stream must not starve it.
    */
   async refreshIfStale(): Promise<void> {
     if (!this.server) return;
@@ -160,10 +175,22 @@ export class CodexRateLimitTracker {
     const server = this.server;
     // Advance BEFORE awaiting so a slow read cannot stack a second one.
     this.lastReadAt = this.deps.now();
+    // Check-then-act across the await: the snapshot this answer will replace
+    // is the one held NOW; a push merged during the await is newer than the
+    // answer, so the answer must not win (review round 1 on #812).
+    const seq = this.pushSeq;
     this.readInFlight = (async () => {
       try {
         const res = await this.deps.read(server, this.deps.readTimeoutMs);
         if (this.server !== server) return; // rebound mid-read: the answer is about the old server's account
+        if (this.pushSeq !== seq) {
+          // The push already updated state and recorded its rows; sampling
+          // this older full response would write stale numbers and could
+          // flip the park decision back. The next cadence read re-fetches
+          // whatever the push omitted.
+          this.deps.log('read superseded by push, discarding');
+          return;
+        }
         if (res.accountId) this.who = { ...this.who, account: res.accountId };
         this.snapshot = res.rateLimits;
         this.logAssumedWindows(res.rateLimits, 'read');
@@ -191,8 +218,10 @@ export class CodexRateLimitTracker {
     if (n.method !== CODEX_RATE_LIMITS_UPDATED_METHOD) return;
     const update = parseCodexRateLimitsUpdated(n.params);
     if (!update) return;
+    this.pushSeq += 1;
     this.snapshot = mergeCodexRateLimitSnapshot(this.snapshot, update);
-    this.lastReadAt = this.deps.now();
+    // Not `lastReadAt`: full reads run on their own clock (see refreshIfStale).
+    this.lastPushAt = this.deps.now();
     this.logAssumedWindows(update, 'push');
     // The row records what THIS push said (sparse: only the windows it
     // carried), attributed with the plan the merged snapshot knows.

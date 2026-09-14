@@ -211,15 +211,57 @@ describe('CodexRateLimitTracker.refreshIfStale', () => {
     expect(h.recorded).toHaveLength(2);
   });
 
-  it('a push counts as fresh — a server that streams updates never re-reads', async () => {
+  it('a steady stream of sparse pushes does not starve the full read (F2, #812 round 1)', async () => {
+    // Pushes are sparse: a window, the reached-limit enum or credits a push
+    // omits only ever refresh through a full read, so pushes must not reset
+    // the read clock.
     const h = harness(async () => HEALTHY, undefined, 1000);
     const server = fakeServer();
     await h.tracker.bind(server, '/home/node/.codex');
-    h.clock.now += 900;
-    notify(server, 'account/rateLimits/updated', { rateLimits: { primary: { usedPercent: 11 } } });
-    h.clock.now += 900;
+    for (let i = 0; i < 5; i++) {
+      h.clock.now += 300;
+      notify(server, 'account/rateLimits/updated', { rateLimits: { primary: { usedPercent: 11 + i } } });
+      await h.tracker.refreshIfStale();
+    }
+    // 1500 ms of pushes across a 1000 ms cadence: exactly one cadence read fired.
+    expect(h.reads).toBe(2);
+    expect(h.tracker.lastPushMs).toBe(1_000_000 + 1500);
+  });
+
+  it('a read that resolves after a push landed is discarded: the push wins and is not re-sampled (F1, #812 round 1)', async () => {
+    let release: (() => void) | null = null;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let calls = 0;
+    const h = harness(async () => {
+      calls += 1;
+      if (calls === 1) return HEALTHY;
+      await gate; // the cadence read: held open until the test releases it
+      return HEALTHY; // an OLDER full response: weekly 20%
+    }, undefined, 1000);
+    const server = fakeServer();
+    await h.tracker.bind(server, '/home/node/.codex');
+    h.clock.now += 1000;
+    const pending = h.tracker.refreshIfStale();
+    // Push lands mid-read with a newer weekly reading past the park threshold.
+    notify(server, 'account/rateLimits/updated', {
+      rateLimits: { secondary: { usedPercent: 97, windowDurationMins: 10080, resetsAt: RESET_S } },
+    });
+    expect(h.tracker.parkDecision()?.usedPercent).toBe(97);
+    release!();
+    await pending;
+    // The stale read did not overwrite the merge, flip the park, or write rows.
+    expect(h.tracker.current?.secondary?.usedPercent).toBe(97);
+    expect(h.tracker.current?.primary).toEqual({ usedPercent: 10, windowDurationMins: 300 });
+    expect(h.tracker.parkDecision()).toMatchObject({ reason: 'seven_day_threshold', usedPercent: 97 });
+    expect(h.recorded.map((rows) => rows[0]?.source)).toEqual(['usage_pull', 'rate_limit_event']);
+    expect(h.logs).toContain('read superseded by push, discarding');
+    // A read with no push in between still lands normally.
+    h.clock.now += 1000;
     await h.tracker.refreshIfStale();
-    expect(h.reads).toBe(1);
+    expect(h.reads).toBe(3);
+    expect(h.tracker.current?.secondary?.usedPercent).toBe(20);
   });
 
   it('does nothing before a bind', async () => {
