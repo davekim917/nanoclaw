@@ -73,7 +73,8 @@ const SEVEN_DAY_MINS = 7 * 24 * 60;
  * fallback BEFORE the wall, so the last turns of the week land somewhere that
  * can answer them. Spec: docs/specs/quota-burn/plan.md item 0.7.
  */
-export const CODEX_SEVEN_DAY_PARK_PERCENT = 90;
+// Park at 95% used, not 100%: leaves headroom for the in-flight turn to finish before the wall. A wall mid-turn aborts and replays the whole turn, which costs more than the last 5% of a weekly bucket. Matches SLOT_PICK_HEADROOM on the Claude side (#811). Tune from measurement.
+export const CODEX_PARK_USED_PERCENT = 95;
 
 export interface ClassifiedCodexWindow {
   /** `five_hour` | `seven_day` (Claude's vocabulary, so one query spans both providers) | `window_<mins>m`. */
@@ -221,7 +222,7 @@ export interface CodexRateLimitPark {
 
 /**
  * Park rule (plan item 0.7): park when the weekly window is at or past
- * CODEX_SEVEN_DAY_PARK_PERCENT, or when the server says a limit is reached
+ * CODEX_PARK_USED_PERCENT, or when the server says a limit is reached
  * (any `rateLimitReachedType`). The enum distinguishes a plain rate limit
  * from workspace credit/usage exhaustion; the message names which so the
  * `provider_health` row does too.
@@ -259,7 +260,7 @@ export function decideCodexRateLimitPark(
     };
   }
 
-  if (sevenDay && sevenDay.usedPercent >= CODEX_SEVEN_DAY_PARK_PERCENT) {
+  if (sevenDay && sevenDay.usedPercent >= CODEX_PARK_USED_PERCENT) {
     return {
       reason: 'seven_day_threshold',
       reachedType: null,
@@ -267,7 +268,7 @@ export function decideCodexRateLimitPark(
       usedPercent: sevenDay.usedPercent,
       resetsAt: sevenDay.resetsAt,
       message:
-        `Codex rate limit [seven_day] ${sevenDay.usedPercent}% used, at or past the ${CODEX_SEVEN_DAY_PARK_PERCENT}% park threshold` +
+        `Codex rate limit [seven_day] ${sevenDay.usedPercent}% used, at or past the ${CODEX_PARK_USED_PERCENT}% park threshold` +
         (sevenDay.resetsAt ? ` (resets ${sevenDay.resetsAt})` : ''),
     };
   }

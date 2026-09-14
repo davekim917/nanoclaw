@@ -200,8 +200,21 @@ describe('Codex rate-limit read → park through gen()', () => {
     expect(rows[1]?.resets_at).toBe(RESET_ISO);
   }, 5_000);
 
-  it('a spent primary with no spare CODEX_HOME never starts a turn: one quota error carrying the measured reset', async () => {
+  it('a weekly window under the 95% threshold (92%) still runs the turn', async () => {
+    // 92 < CODEX_PARK_USED_PERCENT (95): the 5% headroom rule (#811) leaves
+    // this account in service; the reading is recorded, not acted on.
     const { events, requests, spawned } = await run({ weeklyByInstance: '92' });
+    expect(spawned).toBe(1);
+    expect(requests.some((r) => r.method === 'turn/start')).toBe(true);
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(events.find((e) => e.type === 'result')).toMatchObject({
+      text: 'turn result',
+      rateLimit: { type: 'seven_day', utilization: 0.93, resetsAt: RESET_ISO },
+    });
+  }, 5_000);
+
+  it('a spent primary (96%) with no spare CODEX_HOME never starts a turn: one quota error carrying the measured reset', async () => {
+    const { events, requests, spawned } = await run({ weeklyByInstance: '96' });
     expect(spawned).toBe(1);
     expect(requests.some((r) => r.method === 'turn/start')).toBe(false);
     expect(events.filter((e) => e.type === 'result')).toHaveLength(0);
@@ -211,12 +224,12 @@ describe('Codex rate-limit read → park through gen()', () => {
       retryable: false,
       classification: 'quota',
       resetAt: RESET_ISO,
-      message: `Codex rate limit [seven_day] 92% used, at or past the 90% park threshold (resets ${RESET_ISO})`,
+      message: `Codex rate limit [seven_day] 96% used, at or past the 95% park threshold (resets ${RESET_ISO})`,
     });
     // The reading that caused the park is on record for the fleet to see.
     expect(getRateLimitSampleRows().map((r) => [r.limit_type, r.utilization])).toEqual([
       ['five_hour', 0.1],
-      ['seven_day', 0.92],
+      ['seven_day', 0.96],
     ]);
   }, 5_000);
 

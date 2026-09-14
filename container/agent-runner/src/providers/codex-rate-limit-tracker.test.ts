@@ -150,24 +150,24 @@ describe('CodexRateLimitTracker pushes', () => {
     const server = fakeServer();
     await h.tracker.bind(server, '/home/node/.codex');
     notify(server, 'account/rateLimits/updated', {
-      rateLimits: { secondary: { usedPercent: 92, windowDurationMins: 10080, resetsAt: RESET_S } },
+      rateLimits: { secondary: { usedPercent: 96, windowDurationMins: 10080, resetsAt: RESET_S } },
     });
     // Five-hour window kept from the read; weekly replaced by the push.
     expect(h.tracker.current?.primary).toEqual({ usedPercent: 10, windowDurationMins: 300 });
-    expect(h.tracker.current?.secondary?.usedPercent).toBe(92);
+    expect(h.tracker.current?.secondary?.usedPercent).toBe(96);
     expect(h.recorded).toHaveLength(2);
     expect(h.recorded[1]).toEqual([
       expect.objectContaining({
         source: 'rate_limit_event',
         limitType: 'seven_day',
-        utilization: 0.92,
+        utilization: 0.96,
         resetsAt: RESET_ISO,
         // Plan comes from the merged snapshot when the sparse push omits it.
         subscriptionType: 'pro',
         account: 'acct-auth',
       }),
     ]);
-    expect(h.tracker.parkDecision()).toMatchObject({ reason: 'seven_day_threshold', usedPercent: 92 });
+    expect(h.tracker.parkDecision()).toMatchObject({ reason: 'seven_day_threshold', usedPercent: 96 });
     expect(h.logs.some((l) => l.startsWith('park condition after push:'))).toBe(true);
   });
 

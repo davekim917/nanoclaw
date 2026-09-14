@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 
 import {
-  CODEX_SEVEN_DAY_PARK_PERCENT,
+  CODEX_PARK_USED_PERCENT,
   classifyCodexRateLimitWindows,
   codexResetsAtIso,
   codexSnapshotToSamples,
@@ -184,12 +184,16 @@ describe('codexSnapshotToSamples', () => {
 describe('decideCodexRateLimitPark', () => {
   const healthy = {
     primary: { usedPercent: 60, windowDurationMins: 300, resetsAt: RESET_S - 3600 },
-    secondary: { usedPercent: 89, windowDurationMins: 10080, resetsAt: RESET_S },
+    secondary: { usedPercent: 94, windowDurationMins: 10080, resetsAt: RESET_S },
   };
 
   it('does not park a healthy account — including a weekly window one point under the threshold', () => {
-    expect(CODEX_SEVEN_DAY_PARK_PERCENT).toBe(90);
+    // 95, not 90: the 5% headroom rule shared with the Claude side (#811).
+    expect(CODEX_PARK_USED_PERCENT).toBe(95);
     expect(decideCodexRateLimitPark(healthy)).toBeNull();
+    expect(
+      decideCodexRateLimitPark({ ...healthy, secondary: { usedPercent: 92, windowDurationMins: 10080 } }),
+    ).toBeNull();
     expect(decideCodexRateLimitPark(null)).toBeNull();
     expect(decideCodexRateLimitPark({})).toBeNull();
   });
@@ -197,18 +201,21 @@ describe('decideCodexRateLimitPark', () => {
   it('parks at exactly the weekly threshold with that window as the reset', () => {
     const park = decideCodexRateLimitPark({
       ...healthy,
-      secondary: { usedPercent: 90, windowDurationMins: 10080, resetsAt: RESET_S },
+      secondary: { usedPercent: 95, windowDurationMins: 10080, resetsAt: RESET_S },
     });
     expect(park).toMatchObject({
       reason: 'seven_day_threshold',
       reachedType: null,
       limitType: 'seven_day',
-      usedPercent: 90,
+      usedPercent: 95,
       resetsAt: RESET_ISO,
     });
     expect(park?.message).toBe(
-      `Codex rate limit [seven_day] 90% used, at or past the 90% park threshold (resets ${RESET_ISO})`,
+      `Codex rate limit [seven_day] 95% used, at or past the 95% park threshold (resets ${RESET_ISO})`,
     );
+    expect(
+      decideCodexRateLimitPark({ ...healthy, secondary: { usedPercent: 96, windowDurationMins: 10080 } })?.usedPercent,
+    ).toBe(96);
   });
 
   it('does not park on the five-hour window alone — it is a rate, not the weekly wall', () => {
