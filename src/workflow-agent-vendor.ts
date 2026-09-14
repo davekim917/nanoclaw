@@ -9,9 +9,11 @@
  * describe different workers.
  *
  * Develop in the plugin repo, then run
- * `pnpm exec tsx scripts/vendor-workflow-agent.ts` and commit the result.
- * src/workflow-agent-vendor.test.ts fails the host suite on drift (skipped on
- * machines without the plugin repo).
+ * `pnpm exec tsx scripts/vendor-workflow-agent.ts` and commit the result — it
+ * syncs the file AND refreshes the committed fingerprint below.
+ * src/workflow-agent-vendor.test.ts fails on drift. Its fingerprint layer runs
+ * everywhere, including CI with no plugin repo; only the live byte-identity
+ * layer is skipped where ~/plugins/bootstrap is absent.
  *
  * What is NOT vendored, deliberately:
  *   - the plugin's generated Codex role TOML. NanoClaw renders its own from
