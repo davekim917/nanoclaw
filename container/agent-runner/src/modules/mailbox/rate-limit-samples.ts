@@ -11,7 +11,8 @@
  * Shape rationale, `available` semantics, and the 0-1 utilization convention
  * are documented on RATE_LIMIT_SAMPLES_DDL in schema.ts.
  *
- * Claude-only. Nothing here covers Codex or OpenCode.
+ * Claude and Codex (providers/codex-rate-limit-tracker.ts writes the Codex
+ * rows through the same function). Nothing here covers OpenCode.
  */
 import { getOutboundDb } from '../../mailbox/sqlite/connection.js';
 

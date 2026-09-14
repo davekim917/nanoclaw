@@ -241,10 +241,42 @@ function isProviderQuotaExhausted(err: unknown): boolean {
  * genuine bug that breaks both providers still surfaces — one turn later,
  * having been tried on two runtimes instead of one.
  */
+export interface ProviderUnavailableDetail {
+  /** Provider-MEASURED recovery instant (ISO) — see ProviderEvent error `resetAt`. */
+  resetAt?: string | null;
+  /** `system_error` when the failure is the coarse Codex systemError wedge; the host bounds that park at 60 min. */
+  reason?: string | null;
+}
+
+/**
+ * The `provider_unavailable` system row's content, as the host handler reads
+ * it (src/modules/provider-fallback/handler.ts). `resetAt` and `reason` are
+ * present only when known, so an older host that ignores them sees exactly
+ * the row it always did.
+ */
+export function buildProviderUnavailableReport(
+  activeProvider: string,
+  recognizedQuota: boolean,
+  message: string,
+  fallbackProvider: string,
+  detail: ProviderUnavailableDetail = {},
+): Record<string, unknown> {
+  return {
+    action: 'provider_unavailable',
+    provider: activeProvider,
+    classification: recognizedQuota ? 'quota' : 'unavailable',
+    message: message.slice(0, 500),
+    fallbackProvider,
+    ...(detail.resetAt ? { resetAt: detail.resetAt } : {}),
+    ...(detail.reason ? { reason: detail.reason } : {}),
+  };
+}
+
 async function reportProviderUnavailable(
   providerName: string | null,
   message: string,
   recognizedQuota: boolean,
+  detail: ProviderUnavailableDetail = {},
 ): Promise<boolean> {
   let runnerConfig: ReturnType<typeof getConfig>;
   try {
@@ -269,13 +301,9 @@ async function reportProviderUnavailable(
     await writeMessageOut({
       id: generateId(),
       kind: 'system',
-      content: JSON.stringify({
-        action: 'provider_unavailable',
-        provider: activeProvider,
-        classification: recognizedQuota ? 'quota' : 'unavailable',
-        message: message.slice(0, 500),
-        fallbackProvider,
-      }),
+      content: JSON.stringify(
+        buildProviderUnavailableReport(activeProvider, recognizedQuota, message, fallbackProvider, detail),
+      ),
     });
     const suppress = !alreadyOnFallback;
     log(
@@ -1360,6 +1388,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           config.providerName,
           err instanceof Error ? err.message : String(err),
           quotaExhausted,
+          err instanceof ProviderEventError
+            ? {
+                resetAt: err.event.resetAt ?? null,
+                reason: err.classification === 'system_error' ? 'system_error' : null,
+              }
+            : {},
         ));
       deferredToFallback = quotaHandled;
 
@@ -2564,7 +2598,7 @@ export async function handleEvent(event: ProviderEvent, routing: RoutingContext)
       // instead of shown: the session respawns on the fallback provider.
       // See the thrown-error sibling branch for the same decision.
       if (event.retryable === false && event.classification === 'quota') {
-        if (await reportProviderUnavailable(null, event.message, true)) break;
+        if (await reportProviderUnavailable(null, event.message, true, { resetAt: event.resetAt ?? null })) break;
       }
       if (event.retryable === false) {
         // `log()` above already covers unconditional logging for this

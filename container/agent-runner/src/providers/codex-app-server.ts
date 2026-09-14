@@ -15,6 +15,12 @@ import path from 'path';
 import { spawn, type ChildProcess } from 'child_process';
 import { createInterface, type Interface as ReadlineInterface } from 'readline';
 
+import {
+  CODEX_RATE_LIMITS_READ_METHOD,
+  type CodexRateLimitsReadResponse,
+  parseCodexRateLimitsReadResponse,
+} from './codex-rate-limits.js';
+
 function log(msg: string): void {
   console.error(`[codex-app-server] ${msg}`);
 }
@@ -458,6 +464,30 @@ export async function probeCodexThreadHealth(
     rootStatus: rootResult.thread.status,
     descendantStatuses: descendants.map((thread) => thread.status),
   };
+}
+
+/**
+ * Pull the account's rate-limit snapshot — the Codex counterpart of Claude's
+ * `/usage` control request (providers/claude.ts `planUsagePuller`).
+ * `excludeResetCreditDetails: true` is the schema's own flag for background
+ * usage polls: it skips a second reset-credit lookup we do not read. Throws on
+ * an RPC error or a malformed result; the caller treats a failed read as NOT
+ * SAMPLED (no row, no park) and logs it — telemetry must never fail a turn.
+ */
+export async function readCodexAccountRateLimits(
+  server: AppServer,
+  timeoutMs: number,
+): Promise<CodexRateLimitsReadResponse> {
+  const resp = await sendCodexRequest(
+    server,
+    CODEX_RATE_LIMITS_READ_METHOD,
+    { excludeResetCreditDetails: true },
+    timeoutMs,
+  );
+  if (resp.error) throw new Error(`${CODEX_RATE_LIMITS_READ_METHOD} failed: ${resp.error.message}`);
+  const parsed = parseCodexRateLimitsReadResponse(resp.result);
+  if (!parsed) throw new Error(`${CODEX_RATE_LIMITS_READ_METHOD} response missing rateLimits`);
+  return parsed;
 }
 
 /** Best-effort graceful cancellation before replacing a responsive server. */

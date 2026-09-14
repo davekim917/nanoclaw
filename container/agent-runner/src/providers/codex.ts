@@ -46,6 +46,8 @@ import {
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
 import { CodexTurnLiveness, isCodexTerminalTurnItem, normalizeCodexThreadStatus } from './codex-liveness.js';
+import { CodexRateLimitTracker } from './codex-rate-limit-tracker.js';
+import type { CodexRateLimitPark } from './codex-rate-limits.js';
 import { attachTurnEffort } from './turn-effort.js';
 
 /**
@@ -1138,6 +1140,14 @@ export class CodexProvider implements AgentProvider {
    * costs the old behavior (a visible error) rather than a wrong one.
    */
   isQuotaExhausted(err: unknown): boolean {
+    // A provider event already classified `quota` — the structured
+    // `UsageLimitExceeded` kind, or the pre-turn rate-limit park synthesized
+    // in gen() (see `parkedTurnEvents`) — is a spent account regardless of
+    // wording; the poll-loop hands us its ProviderEventError, which carries
+    // the classification (poll-loop.ts `ProviderEventError`).
+    if (err && typeof err === 'object' && (err as { classification?: unknown }).classification === 'quota') {
+      return true;
+    }
     const msg = err instanceof Error ? err.message : String(err);
     return CODEX_USAGE_LIMIT_RE.test(msg);
   }
@@ -1205,6 +1215,11 @@ export class CodexProvider implements AgentProvider {
       let server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
       turnTracker.server = server;
       attachCodexAutoApproval(server);
+      // Account rate-limit snapshot for this query: pulled at every server
+      // bind below, pushed via account/rateLimits/updated in between. Asked
+      // before each turn whether to park, and at each result for the window
+      // to stamp on turn_usage. See codex-rate-limit-tracker.ts.
+      const rateLimits = new CodexRateLimitTracker();
 
       let threadId: string | undefined = input.continuation;
       let initYielded = false;
@@ -1218,6 +1233,7 @@ export class CodexProvider implements AgentProvider {
 
       try {
         await initializeCodexAppServer(server);
+        await rateLimits.bind(server, currentCodexHome);
 
         // Codex preserves base instructions across native compaction. The
         // lifecycle seam adds trusted static memory handling/write guidance;
@@ -1314,21 +1330,38 @@ export class CodexProvider implements AgentProvider {
             // rotation-eligible kind AND we have a fallback CODEX_HOME
             // available, transparently swap identity and retry instead of
             // surfacing the error.
-            for await (const ev of runOneTurn(
-              server,
-              threadId!,
-              attemptText,
-              effectiveModel,
-              input.cwd,
-              () => initYielded,
-              () => {
-                initYielded = true;
-              },
-              turnTracker,
-              codexTurnHealthConfigFromEnv(),
-              controlPlaneRecoveryAttempts,
-              turnAccum,
-            )) {
+            //
+            // PRE-TURN PARK (plan item 0.7). Before spending a turn on this
+            // account, consult the rate-limit snapshot. At the weekly park
+            // threshold, or with a limit already reached, the turn is
+            // replaced by a synthetic `quota` error so the SAME branches
+            // below handle it: rotate to a fallback CODEX_HOME when one is
+            // left (that home's own snapshot is read at bind and checked on
+            // the retry), else surface it — the poll-loop reports it to the
+            // host, which parks (agent_group, 'codex') until the window's
+            // reset and respawns the session on the group's providerFallback.
+            // A failed read leaves the snapshot empty, which never parks.
+            await rateLimits.refreshIfStale();
+            const preTurnPark = rateLimits.parkDecision();
+            if (preTurnPark) console.error(`[codex-provider] pre-turn park: ${preTurnPark.message}`);
+            const turnEvents: AsyncIterable<ProviderEvent> = preTurnPark
+              ? parkedTurnEvents(preTurnPark)
+              : runOneTurn(
+                  server,
+                  threadId!,
+                  attemptText,
+                  effectiveModel,
+                  input.cwd,
+                  () => initYielded,
+                  () => {
+                    initYielded = true;
+                  },
+                  turnTracker,
+                  codexTurnHealthConfigFromEnv(),
+                  controlPlaneRecoveryAttempts,
+                  turnAccum,
+                );
+            for await (const ev of turnEvents) {
               if (ev.type === 'error' && ev.retryable === false) {
                 const controlPlaneFailure =
                   ev.classification === 'control_plane_unresponsive' || ev.classification === 'protocol_desync';
@@ -1382,6 +1415,7 @@ export class CodexProvider implements AgentProvider {
                   turnTracker.server = server;
                   attachCodexAutoApproval(server);
                   await initializeCodexAppServer(server);
+                  await rateLimits.bind(server, currentCodexHome);
 
                   const previousThreadId: string | undefined = threadId;
                   threadId = await startOrResumeCodexThread(server, threadId, threadParams);
@@ -1431,6 +1465,7 @@ export class CodexProvider implements AgentProvider {
                   turnTracker.server = server;
                   attachCodexAutoApproval(server);
                   await initializeCodexAppServer(server);
+                  await rateLimits.bind(server, currentCodexHome);
 
                   const previousThreadId: string | undefined = threadId;
                   threadId = await startOrResumeCodexThread(server, threadId, threadParams);
@@ -1505,6 +1540,7 @@ export class CodexProvider implements AgentProvider {
                     turnTracker.server = server;
                     attachCodexAutoApproval(server);
                     await initializeCodexAppServer(server);
+                    await rateLimits.bind(server, currentCodexHome);
 
                     // Re-resume the thread on the new identity. If the
                     // rollout copy succeeded, threadId stays the same and
@@ -1555,7 +1591,12 @@ export class CodexProvider implements AgentProvider {
               // usage. Done here rather than in runOneTurn because this is
               // where the resolved config lives; runOneTurn only ever sees a
               // model string.
-              yield ev.type === 'result' ? { ...ev, usage: attachTurnEffort(ev.usage, turnEffort) } : ev;
+              // `rateLimit` is the latest snapshot's weekly window (or the
+              // five-hour one), so turn_usage.rate_limit_* is populated for
+              // Codex turns the way the Claude provider populates it.
+              yield ev.type === 'result'
+                ? { ...ev, usage: attachTurnEffort(ev.usage, turnEffort), rateLimit: rateLimits.turnRateLimit() }
+                : ev;
             }
           }
         }
@@ -2390,6 +2431,25 @@ export async function* runOneTurn(
     const idx = server.notificationHandlers.indexOf(handler);
     if (idx >= 0) server.notificationHandlers.splice(idx, 1);
   }
+}
+
+/**
+ * The turn a pre-turn rate-limit park replaces: one non-retryable `quota`
+ * error carrying the measured reset instant. `classification: 'quota'` is
+ * what makes it rotation-eligible in gen() (`isCodexOAuthRotationEligible`)
+ * and a recognized spent account in the poll-loop (`isQuotaExhausted`);
+ * `resetAt` rides to the host as `provider_unavailable.resetAt`, where a
+ * MEASURED reset is honoured as the park end instead of clamped to backoff
+ * (src/db/provider-health.ts `honorResetAt`).
+ */
+export async function* parkedTurnEvents(park: CodexRateLimitPark): AsyncGenerator<ProviderEvent> {
+  yield {
+    type: 'error',
+    message: park.message,
+    retryable: false,
+    classification: 'quota',
+    resetAt: park.resetsAt,
+  };
 }
 
 registerProvider('codex', (opts) => new CodexProvider(opts));

@@ -53,6 +53,40 @@ describe('provider health cooldown', () => {
     expect(Date.parse(second) - NOW).toBe(30 * 60_000);
   });
 
+  it('honours a MEASURED long reset as the schedule when told to (Codex rate-limit read, plan 0.7)', async () => {
+    // A weekly window measured at 92% resetting ~60h out: nothing restores a
+    // usage window early, so the park ends exactly there, not on backoff.
+    const resetAt = new Date(NOW + 60 * 60 * 60_000).toISOString();
+    const until = await markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW, resetAt, honorResetAt: true });
+    expect(until).toBe(resetAt);
+    // Still never past the global cap.
+    const farOut = new Date(NOW + 30 * 24 * 60 * 60_000).toISOString();
+    const capped = await markProviderUnavailable(GID, 'codex', 'quota', {
+      nowMs: NOW,
+      resetAt: farOut,
+      honorResetAt: true,
+    });
+    expect(Date.parse(capped) - NOW).toBe(7 * 24 * 60 * 60_000);
+    // Without a reset to honour the flag changes nothing: backoff applies (third failure → 1h).
+    const noReset = await markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW, honorResetAt: true });
+    expect(Date.parse(noReset) - NOW).toBe(60 * 60_000);
+  });
+
+  it('bounds a window by maxCooldownMs even deep into a failure streak', async () => {
+    const hour = 60 * 60_000;
+    let until = '';
+    for (let i = 0; i < 6; i++) {
+      until = await markProviderUnavailable(GID, 'codex', 'unavailable', { nowMs: NOW, maxCooldownMs: hour });
+    }
+    // Unbounded, the sixth failure would sit at the 6h backoff cap.
+    expect(Date.parse(until) - NOW).toBe(hour);
+    const row = await getProviderHealth(GID, 'codex');
+    expect(row?.consecutive_failures).toBe(6);
+    // A bound above the backoff leaves the backoff alone.
+    const loose = await markProviderUnavailable(GID, 'claude', 'unavailable', { nowMs: NOW, maxCooldownMs: hour });
+    expect(Date.parse(loose) - NOW).toBe(15 * 60_000);
+  });
+
   it('backs off on the failure streak when no reset time is given', async () => {
     const first = await markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
     expect(Date.parse(first) - NOW).toBe(15 * 60_000);

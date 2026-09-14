@@ -11,6 +11,7 @@ import {
   steerCodexTurn,
   parseTomlTableHeader,
   probeCodexThreadHealth,
+  readCodexAccountRateLimits,
   readCodexTurnSnapshot,
   writeCodexHooksJson,
   writeCodexMcpConfigToml,
@@ -130,6 +131,47 @@ describe('Codex app-server liveness RPCs', () => {
     const { server } = fakeAppServer(() => null);
     await expect(probeCodexThreadHealth(server, 'root-1', 5)).rejects.toThrow(
       'Timeout waiting for thread/read response',
+    );
+  });
+
+  it('reads the account rate-limit snapshot as a background usage poll', async () => {
+    const { server, requests } = fakeAppServer(() => ({
+      result: {
+        rateLimits: {
+          primary: { usedPercent: 12, windowDurationMins: 300 },
+          secondary: { usedPercent: 91, windowDurationMins: 10080 },
+        },
+        rateLimitsByLimitId: { codex: { primary: { usedPercent: 12 } } },
+        accountId: 'acct-1',
+      },
+    }));
+    await expect(readCodexAccountRateLimits(server, 50)).resolves.toEqual({
+      rateLimits: {
+        primary: { usedPercent: 12, windowDurationMins: 300 },
+        secondary: { usedPercent: 91, windowDurationMins: 10080 },
+      },
+      rateLimitsByLimitId: { codex: { primary: { usedPercent: 12 } } },
+      accountId: 'acct-1',
+    });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      method: 'account/rateLimits/read',
+      params: { excludeResetCreditDetails: true },
+    });
+  });
+
+  it('surfaces a rate-limit read the server rejects or answers malformed, so the caller logs and skips the sample', async () => {
+    const rejected = fakeAppServer(() => ({ error: { code: -32601, message: 'method not found' } }));
+    await expect(readCodexAccountRateLimits(rejected.server, 50)).rejects.toThrow(
+      'account/rateLimits/read failed: method not found',
+    );
+    const malformed = fakeAppServer(() => ({ result: { accountId: 'acct-1' } }));
+    await expect(readCodexAccountRateLimits(malformed.server, 50)).rejects.toThrow(
+      'account/rateLimits/read response missing rateLimits',
+    );
+    const silent = fakeAppServer(() => null);
+    await expect(readCodexAccountRateLimits(silent.server, 5)).rejects.toThrow(
+      'Timeout waiting for account/rateLimits/read response',
     );
   });
 

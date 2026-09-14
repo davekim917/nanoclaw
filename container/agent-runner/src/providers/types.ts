@@ -479,10 +479,12 @@ export type ProviderEvent =
    * construction for what that is); NULL when nothing usable is available,
    * never a guessed count.
    *
-   * `rateLimit` is Claude-only: the most recent `rate_limit_event` observed
-   * during this turn (utilization/type/resetsAt), or null if none fired.
-   * Answers "what share of our weekly allowance have we burned" directly,
-   * instead of inferring it from cost estimates.
+   * `rateLimit` answers "what share of our weekly allowance have we burned"
+   * directly, instead of inferring it from cost estimates. Claude: the most
+   * recent `rate_limit_event` observed during this turn, or null if none
+   * fired. Codex: the weekly (else five-hour) window of the account
+   * rate-limit snapshot held at the result (providers/codex-rate-limits.ts
+   * `codexTurnRateLimit`). OpenCode exposes nothing and leaves it unset.
    */
   | {
       type: 'result';
@@ -512,7 +514,15 @@ export type ProviderEvent =
    * tracks prompt ids emits it.
    */
   | { type: 'settled'; unansweredPrompts: string[] }
-  | { type: 'error'; message: string; retryable: boolean; classification?: string }
+  /**
+   * `resetAt` is the provider's MEASURED recovery instant (ISO-8601 UTC) when
+   * it has one — today the Codex rate-limit snapshot's `resetsAt` behind a
+   * pre-turn park. The poll-loop forwards it on the `provider_unavailable`
+   * report and the host parks until exactly then (`honorResetAt`), unlike a
+   * reset PARSED out of error prose, which the host treats as an upper bound
+   * and retries on backoff. Absent for every other error.
+   */
+  | { type: 'error'; message: string; retryable: boolean; classification?: string; resetAt?: string | null }
   | { type: 'progress'; message: string }
   /**
    * Provider-produced file artifact that should be delivered to the

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { CodexProvider } from './codex.js';
+import { CodexProvider, parkedTurnEvents } from './codex.js';
 
 // The real thrown message, captured from a live app-server on a spent
 // account. The reset date and billing URL vary per account, so the matcher
@@ -27,5 +27,40 @@ describe('CodexProvider.isQuotaExhausted', () => {
 
   it('does not fire on a transient server overload — that is recoverable in-turn', () => {
     expect(provider.isQuotaExhausted(new Error('ServerOverloaded: try again shortly'))).toBe(false);
+  });
+
+  it('treats an error event already classified quota as a spent account, whatever its wording', () => {
+    // The poll-loop hands over its ProviderEventError, which carries the
+    // classification; the pre-turn rate-limit park is worded nothing like the
+    // CLI's usage-limit sentence and must still route to the fallback.
+    const parked = Object.assign(new Error('Codex rate limit [seven_day] 92% used'), { classification: 'quota' });
+    expect(provider.isQuotaExhausted(parked)).toBe(true);
+    const other = Object.assign(new Error('Codex rate limit [seven_day] 92% used'), { classification: 'system_error' });
+    expect(provider.isQuotaExhausted(other)).toBe(false);
+  });
+});
+
+describe('parkedTurnEvents', () => {
+  it('replaces the turn with one non-retryable quota error carrying the measured reset', async () => {
+    const events = [];
+    for await (const ev of parkedTurnEvents({
+      reason: 'seven_day_threshold',
+      reachedType: null,
+      limitType: 'seven_day',
+      usedPercent: 92,
+      resetsAt: '2026-09-17T00:00:00.000Z',
+      message: 'Codex rate limit [seven_day] 92% used',
+    })) {
+      events.push(ev);
+    }
+    expect(events).toEqual([
+      {
+        type: 'error',
+        message: 'Codex rate limit [seven_day] 92% used',
+        retryable: false,
+        classification: 'quota',
+        resetAt: '2026-09-17T00:00:00.000Z',
+      },
+    ]);
   });
 });
