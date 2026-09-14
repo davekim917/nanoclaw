@@ -3604,20 +3604,28 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(efforts).toEqual(['medium', 'xhigh']);
   }, 15_000);
 
-  it('reopens a query with immutable runtime context before admitting a changed setting', async () => {
+  it('defers an immutable runtime-context restart until the active query is idle', async () => {
     insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+    let firstResult = false;
 
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'c1' };
+      // Several follow-up polls see occ-2 while this turn is still active.
+      // An eager end() would close Claude's live control channel here.
+      await Bun.sleep(1600);
+      firstResult = true;
       yield { type: 'result', text: 'first fire', isError: true };
+      // The next poll reaches the idle boundary and can now end safely.
       await Bun.sleep(1600);
     }
     let ended = false;
+    let endedAfterResult = false;
     let applied = false;
     const query: AgentQuery = {
       push: () => {},
       end: () => {
         ended = true;
+        endedAfterResult = firstResult;
       },
       abort: () => {},
       applySettings: async () => {
@@ -3633,7 +3641,9 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     });
 
     expect(ended).toBe(true);
+    expect(endedAfterResult).toBe(true);
     expect(applied).toBe(false);
+    expect(getPendingMessages().map((message) => message.id)).toContain('occ-2');
   }, 15_000);
 
   it('a task admitted mid-turn does NOT retarget the running stream', async () => {

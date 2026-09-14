@@ -3091,8 +3091,8 @@ export class ClaudeProvider implements AgentProvider {
       end: () => stream.end(),
       events: translateEvents(),
       // The SDK installs systemPrompt at query creation and exposes no control
-      // request to replace it. A live model/effort change must therefore open
-      // a fresh query, where the Active Runtime block remains authoritative.
+      // request to replace it. The poll-loop waits for an idle boundary before
+      // a live model/effort change opens a fresh authoritative query.
       requiresRestartForRuntimeContext: true,
       // Live view of `activeModel`, which is the resolved creation model and
       // is reassigned by applySettings. A getter rather than a snapshot so

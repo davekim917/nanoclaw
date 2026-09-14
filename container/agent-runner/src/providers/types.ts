@@ -367,8 +367,9 @@ export interface AgentQuery {
 
   /**
    * True when the provider's runtime identity is installed in immutable
-   * query-start instructions. The poll-loop must end and reopen on a settings
-   * change rather than leave a later prompt with a stale identity statement.
+   * query-start instructions. The poll-loop keeps a settings-bearing follow-up
+   * pending until the active query is idle, then ends and reopens rather than
+   * leave a later prompt with a stale identity statement.
    */
   readonly requiresRestartForRuntimeContext?: boolean;
 
