@@ -20,6 +20,7 @@ describe('parseRawConfig provider fallback bridge', () => {
     const config = parseRawConfig({ ...BASE });
     expect(config.provider).toBe('codex');
     expect(config.model).toBe('gpt-5.6-sol');
+    expect(config.fallbackApplied).toBe(false);
   });
 
   it('lets the spawn-time override beat the file — the file is static per group', () => {
@@ -42,6 +43,7 @@ describe('parseRawConfig provider fallback bridge', () => {
     expect(config.model).toBeUndefined();
     expect(config.effort).toBeUndefined();
     expect(config.providerFallback).toEqual({ provider: 'codex' });
+    expect(config.fallbackApplied).toBe(true);
   });
 
   it('drops the primary provider-specific fields under an override — they are the wrong provider now', () => {

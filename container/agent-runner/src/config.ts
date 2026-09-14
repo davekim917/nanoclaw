@@ -26,6 +26,14 @@ export interface RunnerConfig {
   effort?: string;
 
   /**
+   * True only when this particular spawn is running on the group's declared
+   * secondary provider. The marker is needed below the host/container
+   * boundary: task pins were validated for the primary provider and must not
+   * cross into a different provider as if they were target-native settings.
+   */
+  fallbackApplied: boolean;
+
+  /**
    * Where the host routes spawns while this provider is unavailable. The
    * runner only needs to know whether one EXISTS: when a turn dies on a
    * provider-level quota and a fallback is declared, the failure is reported
@@ -136,6 +144,7 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
       activeFallback?.effort ||
       (onFallback ? undefined : configuredProviderEffort || configuredEffort) ||
       undefined,
+    fallbackApplied: onFallback,
     providerFallback: declaredFallback || undefined,
   };
 }
