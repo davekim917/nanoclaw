@@ -27,18 +27,15 @@ describe('codexConfigSchema', () => {
 
   it('test_codexConfigSchema_accepts_xhigh_effort', () => {
     // xhigh is advertised by the current Codex model catalog, including the
-    // production default gpt-5.6-sol.
+    // production default gpt-5.6-terra.
     const parsed = codexConfigSchema.parse({ reasoning_effort: 'xhigh' });
     expect(parsed.reasoning_effort).toBe('xhigh');
   });
 
-  it.each(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])(
-    'test_codexConfigSchema_accepts_%s_effort',
-    (effort) => {
-      const parsed = codexConfigSchema.parse({ reasoning_effort: effort });
-      expect(parsed.reasoning_effort).toBe(effort);
-    },
-  );
+  it.each(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])('test_codexConfigSchema_accepts_%s_effort', (effort) => {
+    const parsed = codexConfigSchema.parse({ reasoning_effort: effort });
+    expect(parsed.reasoning_effort).toBe(effort);
+  });
 
   it.each(['none', 'minimal'])('test_codexConfigSchema_rejects_%s_effort', (effort) => {
     const result = codexConfigSchema.safeParse({ reasoning_effort: effort });
@@ -59,12 +56,12 @@ describe('codexConfigSchema', () => {
     expect(result.success).toBe(false);
   });
 
-  it('test_codexConfigSchema_empty_object_defaults_to_high', () => {
-    // Default reasoning_effort is `high` for gpt-5.6-sol. The full
+  it('test_codexConfigSchema_empty_object_defaults_to_xhigh', () => {
+    // Default reasoning_effort is `xhigh` for gpt-5.6-terra. The full
     // ladder (xhigh|max|ultra) is still accepted when operators opt in via
     // container.json.
     const parsed = codexConfigSchema.parse({});
-    expect(parsed).toEqual({ reasoning_effort: 'high', max_concurrent_threads_per_session: 15 });
+    expect(parsed).toEqual({ reasoning_effort: 'xhigh', max_concurrent_threads_per_session: 15 });
   });
 
   it('test_codexConfigSchema_explicit_low_overrides_default', () => {
@@ -127,25 +124,27 @@ describe('CodexProvider sticky config + override propagation', () => {
 
   it('test_stickyConfig_explicit_undefined_no_override', () => {
     // Constructing CodexProvider with an empty providerConfig schema-defaults
-    // to 'high', so this case is hit only when stickyConfig is genuinely
+    // to 'xhigh', so this case is hit only when stickyConfig is genuinely
     // undefined (not parsed through the schema).
     const overrides = createCodexConfigOverrides({});
     expect(overrides.find((o) => o.startsWith('model_reasoning_effort'))).toBeUndefined();
   });
 
-  it('test_stickyConfig_default_high_emits_override', () => {
+  it('test_stickyConfig_default_xhigh_emits_override', () => {
     // CodexProvider's constructor parses providerConfig through the schema,
-    // which defaults reasoning_effort to 'high' for gpt-5.6-sol (the default
+    // which defaults reasoning_effort to 'xhigh' for gpt-5.6-terra (the default
     // model). This covers the production
-    // path: every codex agent gets high effort unless explicitly overridden
+    // path: every unpinned Codex agent gets xhigh unless explicitly overridden
     // in container.json.
     const p = new CodexProvider();
-    const sticky = (p as unknown as {
-      stickyConfig: { reasoning_effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' };
-    }).stickyConfig;
-    expect(sticky.reasoning_effort).toBe('high');
+    const sticky = (
+      p as unknown as {
+        stickyConfig: { reasoning_effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' };
+      }
+    ).stickyConfig;
+    expect(sticky.reasoning_effort).toBe('xhigh');
     const overrides = createCodexConfigOverrides(sticky);
-    expect(overrides).toContain('model_reasoning_effort="high"');
+    expect(overrides).toContain('model_reasoning_effort="xhigh"');
   });
 
   it('test_stickyConfig_model_overrides_default_and_env', () => {
@@ -162,9 +161,9 @@ describe('CodexProvider sticky config + override propagation', () => {
     expect((p as unknown as { model: string }).model).toBe('gpt-5.4-mini');
   });
 
-  it('test_default_model_is_gpt_5_6_sol_when_no_sticky_or_env', () => {
+  it('test_default_model_is_gpt_5_6_terra_when_no_sticky_or_env', () => {
     const p = new CodexProvider();
-    expect((p as unknown as { model: string }).model).toBe('gpt-5.6-sol');
+    expect((p as unknown as { model: string }).model).toBe('gpt-5.6-terra');
   });
 
   it('test_constructor_rejects_invalid_provider_config', () => {
@@ -181,7 +180,8 @@ describe('CodexProvider provider-fallback model/effort', () => {
     // A claude group whose `providerFallback` declares codex spawns with an
     // EMPTY providerConfig (config.ts drops the primary's sticky config) and
     // the fallback's model/effort on options.model/options.effort. Without
-    // this the container ran gpt-5.6-sol at the schema-default `high`.
+    // this the container ignored the declared fallback settings and used the
+    // provider default instead.
     const p = new CodexProvider({ providerConfig: {}, model: 'gpt-5.5-pro', effort: 'xhigh' });
     expect(sticky(p).model).toBe('gpt-5.5-pro');
     expect(sticky(p).reasoning_effort).toBe('xhigh');
@@ -210,7 +210,7 @@ describe('CodexProvider provider-fallback model/effort', () => {
     const p = new CodexProvider({ providerConfig: {}, effort: 'low' });
     expect(sticky(p).model).toBeUndefined();
     expect(sticky(p).reasoning_effort).toBe('low');
-    expect((p as unknown as { model: string }).model).toBe('gpt-5.6-sol');
+    expect((p as unknown as { model: string }).model).toBe('gpt-5.6-terra');
   });
 
   it('test_declared_providerConfig_still_wins_on_the_primary_path', () => {
@@ -232,13 +232,13 @@ describe('CodexProvider provider-fallback model/effort', () => {
     // is strict and a throw here is a crash loop, not a bad answer.
     const p = new CodexProvider({ providerConfig: {}, model: 'claude-opus-5[1m]', effort: 'extreme' });
     expect(sticky(p).model).toBeUndefined();
-    expect(sticky(p).reasoning_effort).toBe('high');
-    expect((p as unknown as { model: string }).model).toBe('gpt-5.6-sol');
+    expect(sticky(p).reasoning_effort).toBe('xhigh');
+    expect((p as unknown as { model: string }).model).toBe('gpt-5.6-terra');
   });
 
   it('test_no_options_model_or_effort_keeps_schema_defaults', () => {
     const p = new CodexProvider({ providerConfig: {} });
     expect(sticky(p).model).toBeUndefined();
-    expect(sticky(p).reasoning_effort).toBe('high');
+    expect(sticky(p).reasoning_effort).toBe('xhigh');
   });
 });

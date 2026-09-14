@@ -124,14 +124,14 @@ describe('a claude provider fallback reaches the provider without a container-si
     // own vocabulary refuses both, so the container never sees them — and a
     // boot-time crash loop is impossible because nothing is parsed there.
     const r = fallbackSpawn({ model: 'gpt-5.6-sol', effort: 'ultra' });
-    expect(r.model).toBe('claude-opus-5[1m]');
-    expect(r.effort).toBe('high');
+    expect(r.model).toBe('claude-sonnet-5');
+    expect(r.effort).toBe('xhigh');
   });
 
   it('test_a_fallback_with_no_declaration_runs_the_install_default', () => {
     const r = fallbackSpawn({});
-    expect(r.model).toBe('claude-opus-5[1m]');
-    expect(r.effort).toBe('high');
+    expect(r.model).toBe('claude-sonnet-5');
+    expect(r.effort).toBe('xhigh');
   });
 });
 

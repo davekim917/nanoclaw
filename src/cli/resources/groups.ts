@@ -518,8 +518,11 @@ registerResource({
         if (args.provider !== undefined) updates.provider = args.provider as string;
         const timezone = parseTimezoneFlag(args.timezone);
         if (timezone !== undefined) updates.timezone = timezone;
-        if (args.model !== undefined) updates.model = args.model as string;
-        if (args.effort !== undefined) updates.effort = args.effort as string;
+        // Empty is an explicit clear, mirroring --timezone "". A group that
+        // matches the provider default must not retain a redundant per-group
+        // pin: that would silently defeat a later fleet-wide default change.
+        if (args.model !== undefined) updates.model = String(args.model) || null;
+        if (args.effort !== undefined) updates.effort = String(args.effort) || null;
         if (args.image_tag !== undefined) updates.image_tag = args.image_tag as string;
         if (args.assistant_name !== undefined) updates.assistant_name = args.assistant_name as string;
         if (args.max_messages_per_prompt !== undefined)

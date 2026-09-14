@@ -56,7 +56,7 @@ import {
   resolveContainerResources,
   type ContainerResources,
 } from './container-resources.js';
-import { resolveSpawnProvider } from './provider-fallback.js';
+import { applyProviderFallbackRuntime, providerFallbackRuntimeEnv, resolveSpawnProvider } from './provider-fallback.js';
 import { markProviderAvailable } from './db/provider-health.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import { updateContainerConfigScalars } from './db/container-configs.js';
@@ -1771,14 +1771,12 @@ async function spawnContainer(
     containerConfig,
   });
   if (providerDecision.fallbackApplied) {
-    containerConfig.provider = providerDecision.provider;
     // Assign unconditionally. A fallback that declares no model wants the new
-    // provider's own default, NOT the primary's model id — keeping the old
-    // value here would emit NANOCLAW_MODEL_OVERRIDE=<codex model> to a claude
-    // container, which is the same class of failure as shipping the primary's
-    // providerConfig across (see parseRawConfig in the agent-runner).
-    containerConfig.model = providerDecision.model;
-    containerConfig.effort = providerDecision.effort;
+    // provider's own default, NOT any model/effort layer belonging to the
+    // primary. The helper drops legacy defaultModel/defaultEffort as well as
+    // top-level fields; otherwise they can leak through the target provider's
+    // normal spawn path (see parseRawConfig in the agent-runner).
+    applyProviderFallbackRuntime(containerConfig, providerDecision);
     log.warn('Provider fallback engaged — primary is in a recorded outage window', {
       sessionId: session.id,
       agentGroup: agentGroup.name,
@@ -6125,10 +6123,10 @@ async function buildContainerArgs(
   // archive projection (race-fix).
   resolvedWgId?: string,
   /**
-   * Set when a spawn-time provider fallback diverged from container.json.
-   * Drives the NANOCLAW_PROVIDER_OVERRIDE/_MODEL_OVERRIDE bridge — the
-   * container reads its provider from the bind-mounted file, which the host
-   * does not rewrite per spawn.
+   * Set when a spawn-time provider fallback is applied. Drives the
+   * NANOCLAW_PROVIDER_OVERRIDE/_MODEL_OVERRIDE bridge — including when a
+   * session's primary differs from the file but the fallback target happens
+   * to equal the file's provider.
    */
   providerFallbackApplied?: boolean,
   /**
@@ -6340,13 +6338,14 @@ async function buildContainerArgs(
   // Provider fallback bridge. The container reads its provider and model from
   // the bind-mounted container.json, which the host does not rewrite per
   // spawn — so a spawn-time fallback has to travel as env, exactly like
-  // NANOCLAW_ASSISTANT_NAME beats the file's static value. Emitted only when
-  // the effective provider actually diverges from the file, so a normal
-  // spawn's environment is unchanged.
+  // NANOCLAW_ASSISTANT_NAME beats the file's static value. The explicit
+  // marker is required even when the fallback target equals that static
+  // provider: equality alone cannot distinguish it from a normal spawn.
   if (providerFallbackApplied && containerConfig.provider) {
-    args.push('-e', `NANOCLAW_PROVIDER_OVERRIDE=${containerConfig.provider}`);
-    if (containerConfig.model) {
-      args.push('-e', `NANOCLAW_MODEL_OVERRIDE=${containerConfig.model}`);
+    for (const [key, value] of Object.entries(
+      providerFallbackRuntimeEnv({ provider: containerConfig.provider, model: containerConfig.model }),
+    )) {
+      args.push('-e', `${key}=${value}`);
     }
   }
 
