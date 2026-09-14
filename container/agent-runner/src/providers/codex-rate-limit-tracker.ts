@@ -26,6 +26,7 @@ import {
   type CodexRateLimitSnapshot,
   type CodexRateLimitsReadResponse,
   classifyCodexRateLimitWindows,
+  codexRateLimitSnapshotUpdatedKeys,
   codexSnapshotToSamples,
   codexTurnRateLimit,
   decideCodexRateLimitPark,
@@ -82,11 +83,23 @@ export class CodexRateLimitTracker {
   /** Telemetry only: pushes never advance `lastReadAt` (see `onNotification`). */
   private lastPushAt = 0;
   /**
-   * Monotonic push counter. `read()` captures it before its await and
-   * compares after: a push that lands mid-read is newer than the read's
-   * answer, so the answer is discarded rather than overwriting the merge.
+   * Monotonic push counter, source for `fieldPushSeq` below. Not read
+   * directly by `read()` any more — round 2 fix: a single scalar seq made
+   * `read()` discard the WHOLE response when ANY field had an intervening
+   * push, even an unrelated one (e.g. a sparse primary-only push would
+   * blank out a read's fresh secondary=96% reading and leave it unchecked
+   * for the next 5-minute cadence). Per-field tracking below fixes that.
    */
   private pushSeq = 0;
+  /**
+   * Per-field push freshness: `fieldPushSeq[key]` is the `pushSeq` value at
+   * the last push that actually set `key` (see
+   * `codexRateLimitSnapshotUpdatedKeys` for which keys a given update
+   * touches). `read()` snapshots this map before its await and, per field,
+   * keeps the read's answer only where the map is unchanged after —
+   * i.e. no push touched that specific field while the read was in flight.
+   */
+  private fieldPushSeq: Partial<Record<keyof CodexRateLimitSnapshot, number>> = {};
   private readInFlight: Promise<void> | null = null;
 
   constructor(deps: Partial<CodexRateLimitTrackerDeps> = {}) {
@@ -129,6 +142,7 @@ export class CodexRateLimitTracker {
     this.server = server;
     this.snapshot = null;
     this.lastReadAt = 0;
+    this.fieldPushSeq = {};
     this.who = {
       account: readCodexAccountIdFromAuthJson(this.deps.readAuthJson(codexHome)),
       credentialSet: `codex:${path.basename(codexHome)}`,
@@ -175,32 +189,47 @@ export class CodexRateLimitTracker {
     const server = this.server;
     // Advance BEFORE awaiting so a slow read cannot stack a second one.
     this.lastReadAt = this.deps.now();
-    // Check-then-act across the await: the snapshot this answer will replace
-    // is the one held NOW; a push merged during the await is newer than the
-    // answer, so the answer must not win (review round 1 on #812).
-    const seq = this.pushSeq;
+    // Check-then-act across the await, per FIELD (review round 2 on #812): a
+    // whole-snapshot seq made the read discard EVERY field when ANY one had
+    // an intervening push, e.g. a sparse primary-only push would blank out
+    // the read's own fresh secondary reading and leave it unchecked for a
+    // full cadence interval. Snapshot each field's push-freshness marker now;
+    // after the await, a field wins from the read unless ITS marker moved.
+    const seqAtStart = { ...this.fieldPushSeq };
     this.readInFlight = (async () => {
       try {
         const res = await this.deps.read(server, this.deps.readTimeoutMs);
         if (this.server !== server) return; // rebound mid-read: the answer is about the old server's account
-        if (this.pushSeq !== seq) {
-          // The push already updated state and recorded its rows; sampling
-          // this older full response would write stale numbers and could
-          // flip the park decision back. The next cadence read re-fetches
-          // whatever the push omitted.
-          this.deps.log('read superseded by push, discarding');
-          return;
+        const merged: CodexRateLimitSnapshot = { ...(this.snapshot ?? {}) };
+        let supersededAny = false;
+        for (const key of Object.keys(res.rateLimits) as (keyof CodexRateLimitSnapshot)[]) {
+          if (this.fieldPushSeq[key] !== seqAtStart[key]) {
+            // A push set THIS field while the read was in flight; the push's
+            // value (already merged into this.snapshot) is newer than the
+            // read's answer for it, so keep it — don't let the read blank
+            // out or roll back a field it wasn't asking about.
+            supersededAny = true;
+            continue;
+          }
+          (merged as Record<string, unknown>)[key] = res.rateLimits[key];
+        }
+        if (supersededAny) {
+          this.deps.log('read partially superseded by an intervening push; kept the push-updated field(s)');
         }
         if (res.accountId) this.who = { ...this.who, account: res.accountId };
-        this.snapshot = res.rateLimits;
-        this.logAssumedWindows(res.rateLimits, 'read');
+        this.snapshot = merged;
+        this.logAssumedWindows(merged, 'read');
         if (res.rateLimitsByLimitId && Object.keys(res.rateLimitsByLimitId).length > 0) {
           // Multi-bucket view keyed by metered limit_id. Logged, not modelled
           // (plan item 0.7): nothing reads it until a bucket other than the
           // default one is observed in production.
           this.deps.log(`rateLimitsByLimitId (debug): ${JSON.stringify(res.rateLimitsByLimitId).slice(0, 2000)}`);
         }
-        this.deps.record(codexSnapshotToSamples(res.rateLimits, this.who, 'usage_pull'));
+        // Sampled from the resolved (post-merge) snapshot, not the raw
+        // response: a superseded field's row then carries the push's own
+        // value (already recorded once as rate_limit_event) rather than a
+        // stale pre-push number — redundant at worst, never wrong.
+        this.deps.record(codexSnapshotToSamples(merged, this.who, 'usage_pull'));
         const park = this.parkDecision();
         if (park) this.deps.log(`park condition after read: ${park.message}`);
       } catch (err) {
@@ -219,6 +248,10 @@ export class CodexRateLimitTracker {
     const update = parseCodexRateLimitsUpdated(n.params);
     if (!update) return;
     this.pushSeq += 1;
+    // Stamp only the fields THIS push actually sets — same eligibility rule
+    // `mergeCodexRateLimitSnapshot` uses, so a read in flight can tell a
+    // push that touched, say, `primary` from one that didn't.
+    for (const key of codexRateLimitSnapshotUpdatedKeys(update)) this.fieldPushSeq[key] = this.pushSeq;
     this.snapshot = mergeCodexRateLimitSnapshot(this.snapshot, update);
     // Not `lastReadAt`: full reads run on their own clock (see refreshIfStale).
     this.lastPushAt = this.deps.now();

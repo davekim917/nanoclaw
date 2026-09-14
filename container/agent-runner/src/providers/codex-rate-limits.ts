@@ -143,6 +143,29 @@ export function classifyCodexRateLimitWindows(
 }
 
 /**
+ * Which top-level keys an update would actually overwrite in
+ * `mergeCodexRateLimitSnapshot`: present, non-null, and — for `primary`/
+ * `secondary` — a valid window (usedPercent is required, so a malformed
+ * window is not a reading). Exported so the tracker can stamp per-field
+ * freshness (a read in flight must know, per field, whether a push that
+ * landed mid-read actually touched that field) without duplicating this
+ * eligibility rule.
+ */
+export function codexRateLimitSnapshotUpdatedKeys(
+  update: CodexRateLimitSnapshot | null | undefined,
+): (keyof CodexRateLimitSnapshot)[] {
+  if (!update || typeof update !== 'object') return [];
+  const keys: (keyof CodexRateLimitSnapshot)[] = [];
+  for (const key of Object.keys(update) as (keyof CodexRateLimitSnapshot)[]) {
+    const value = update[key];
+    if (value === null || value === undefined) continue;
+    if ((key === 'primary' || key === 'secondary') && !isWindow(value)) continue;
+    keys.push(key);
+  }
+  return keys;
+}
+
+/**
  * Sparse merge per the notification's own contract: "merge available values
  * into the most recent read response … nullable account metadata may be
  * unavailable in a rolling update and does not clear a previously observed
@@ -160,11 +183,8 @@ export function mergeCodexRateLimitSnapshot(
 ): CodexRateLimitSnapshot | null {
   if (!update || typeof update !== 'object') return prev;
   const merged: CodexRateLimitSnapshot = { ...(prev ?? {}) };
-  for (const key of Object.keys(update) as (keyof CodexRateLimitSnapshot)[]) {
-    const value = update[key];
-    if (value === null || value === undefined) continue;
-    if ((key === 'primary' || key === 'secondary') && !isWindow(value)) continue;
-    (merged as Record<string, unknown>)[key] = value;
+  for (const key of codexRateLimitSnapshotUpdatedKeys(update)) {
+    (merged as Record<string, unknown>)[key] = update[key];
   }
   return merged;
 }

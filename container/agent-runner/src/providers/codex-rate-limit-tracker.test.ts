@@ -228,7 +228,7 @@ describe('CodexRateLimitTracker.refreshIfStale', () => {
     expect(h.tracker.lastPushMs).toBe(1_000_000 + 1500);
   });
 
-  it('a read that resolves after a push landed is discarded: the push wins and is not re-sampled (F1, #812 round 1)', async () => {
+  it('a read that resolves after a push touched the SAME field keeps the push for that field only (F1, #812 round 2)', async () => {
     let release: (() => void) | null = null;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
@@ -251,17 +251,89 @@ describe('CodexRateLimitTracker.refreshIfStale', () => {
     expect(h.tracker.parkDecision()?.usedPercent).toBe(97);
     release!();
     await pending;
-    // The stale read did not overwrite the merge, flip the park, or write rows.
+    // secondary: the field the push touched — the read's (older) answer for
+    // it does NOT overwrite the merge or flip the park back.
     expect(h.tracker.current?.secondary?.usedPercent).toBe(97);
+    // primary: untouched by the push — the read still supplies it normally,
+    // this round's fix (round 1 wrongly discarded this field too).
     expect(h.tracker.current?.primary).toEqual({ usedPercent: 10, windowDurationMins: 300 });
     expect(h.tracker.parkDecision()).toMatchObject({ reason: 'seven_day_threshold', usedPercent: 97 });
-    expect(h.recorded.map((rows) => rows[0]?.source)).toEqual(['usage_pull', 'rate_limit_event']);
-    expect(h.logs).toContain('read superseded by push, discarding');
-    // A read with no push in between still lands normally.
+    // The read still records: primary from the read, secondary from the (kept) push.
+    expect(h.recorded.map((rows) => rows[0]?.source)).toEqual(['usage_pull', 'rate_limit_event', 'usage_pull']);
+    expect(h.logs).toContain('read partially superseded by an intervening push; kept the push-updated field(s)');
+    // A later read with no push in between still refreshes the field freely.
     h.clock.now += 1000;
     await h.tracker.refreshIfStale();
     expect(h.reads).toBe(3);
     expect(h.tracker.current?.secondary?.usedPercent).toBe(20);
+  });
+
+  it('a sparse push for an UNRELATED field mid-read does not blank the read fresh answer for the field it never touched (F1, #812 round 2)', async () => {
+    // Reproduces the round-2 review finding exactly: initial bind leaves
+    // snapshot null, a sparse primary-only push lands while the initial read
+    // is in flight, and the read comes back with a fresh (park-triggering)
+    // secondary. A whole-snapshot discard would blank the read's secondary
+    // out entirely and leave the account unparked on an exhausted bucket.
+    let release: (() => void) | null = null;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const h = harness(async () => {
+      await gate;
+      return {
+        rateLimits: { secondary: { usedPercent: 96, windowDurationMins: 10080, resetsAt: RESET_S } },
+        accountId: null,
+      };
+    });
+    const server = fakeServer();
+    const pending = h.tracker.bind(server, '/home/node/.codex');
+    // Sparse push lands mid-read, touching only primary — a field the read
+    // response never mentions at all.
+    notify(server, 'account/rateLimits/updated', { rateLimits: { primary: { usedPercent: 10 } } });
+    release!();
+    await pending;
+    expect(h.tracker.current?.primary).toEqual({ usedPercent: 10 });
+    // secondary was not touched by any push, so the read's answer wins —
+    // the park decision reflects it, with the read's own resetsAt.
+    expect(h.tracker.current?.secondary).toEqual({ usedPercent: 96, windowDurationMins: 10080, resetsAt: RESET_S });
+    expect(h.tracker.parkDecision()).toMatchObject({
+      reason: 'seven_day_threshold',
+      usedPercent: 96,
+      resetsAt: RESET_ISO,
+    });
+  });
+
+  it('an intervening primary-only push does not starve a stale secondary from refreshing on the next cadence read (F1, #812 round 2)', async () => {
+    let release: (() => void) | null = null;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let calls = 0;
+    const h = harness(async () => {
+      calls += 1;
+      if (calls === 1) return HEALTHY; // initial bind: secondary 20%, not parked
+      await gate;
+      return {
+        rateLimits: { secondary: { usedPercent: 97, windowDurationMins: 10080, resetsAt: RESET_S } },
+        accountId: null,
+      };
+    }, undefined, 1000);
+    const server = fakeServer();
+    await h.tracker.bind(server, '/home/node/.codex');
+    expect(h.tracker.parkDecision()).toBeNull();
+    h.clock.now += 1000;
+    const pending = h.tracker.refreshIfStale();
+    // Unrelated push: touches only primary, while the cadence read (which
+    // will refresh the now-stale secondary) is in flight.
+    notify(server, 'account/rateLimits/updated', { rateLimits: { primary: { usedPercent: 55 } } });
+    release!();
+    await pending;
+    // secondary refreshed to the read's fresh, parked value — not held back
+    // by a push that never mentioned it.
+    expect(h.tracker.current?.secondary).toEqual({ usedPercent: 97, windowDurationMins: 10080, resetsAt: RESET_S });
+    // primary keeps the push's value, since the push is the newer answer for it.
+    expect(h.tracker.current?.primary).toEqual({ usedPercent: 55 });
+    expect(h.tracker.parkDecision()).toMatchObject({ reason: 'seven_day_threshold', usedPercent: 97 });
   });
 
   it('does nothing before a bind', async () => {
