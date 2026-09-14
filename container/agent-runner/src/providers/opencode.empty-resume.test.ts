@@ -156,6 +156,28 @@ describe('isEmptyOpenCodeResume', () => {
 });
 
 describe('OpenCodeProvider — empty-resume recovery', () => {
+  it('puts resolved provider, model, and effort ahead of an agent identity instruction', async () => {
+    const sessionId = 'sess-runtime';
+    const { deps, prompts } = makeRuntime(
+      [[assistantEnvelope(sessionId, 'm1'), textPart(sessionId, 'm1', 'p1', 'done'), idle(sessionId)]],
+      [sessionId],
+    );
+
+    const query = newProvider(deps).query({
+      prompt: 'hello',
+      cwd: '/workspace/agent',
+      model: 'opencode-go/test-model',
+      effort: 'medium',
+      systemContext: { instructions: 'You are the agent.' },
+    });
+    await drainUntilResult(query.events);
+
+    const promptText = (prompts.at(0)?.parts[0] as { text?: string } | undefined)?.text;
+    expect(promptText).toContain('You are the agent.');
+    expect(promptText).toContain('provider "opencode", model "opencode-go/test-model", and reasoning effort "medium"');
+    query.abort();
+  });
+
   it('test_oc_resume_raises_stale_session: a silent resume raises rather than replaying inline', async () => {
     // Recovery belongs to the poll-loop's stale-session branch, which clears the
     // continuation, resets the provider context, re-arms the memory bootstrap

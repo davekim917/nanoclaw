@@ -11,6 +11,7 @@ import { createOpencodeClient, type FilePartInput, type OpencodeClient } from '@
 import { createOpencodeClient as createOpencodeQuestionClient } from '@opencode-ai/sdk/v2';
 
 import { memoryContextForSessionStart, type MemorySessionHookRegistration } from '../memory/session-hook.js';
+import { appendActiveRuntimeContext } from '../runtime-context.js';
 import { registerProvider } from './provider-registry.js';
 import type {
   AgentProvider,
@@ -598,20 +599,10 @@ function spawnOpencodeServer(
 // profile, capability note, live destinations addendum — built in index.ts,
 // never present in AGENTS.md) with no other delivery path into OpenCode, so
 // that wrap stays.
-function wrapPromptWithContext(text: string, systemInstructions?: string, currentModel?: string): string {
+function wrapPromptWithContext(text: string, systemInstructions?: string): string {
   let out = text;
   if (systemInstructions) {
     out = `<system>\n${systemInstructions}\n</system>\n\n${out}`;
-  }
-  // Tell the agent which model it is ACTUALLY running on this turn. OpenCode
-  // doesn't surface this to the model, so without it the agent guesses its own
-  // identity and gets it wrong after a `-m`/change_model switch (reporting the
-  // old model and making the switch look like it failed). Outermost block so
-  // it's prominent. `currentModel` is the effective per-turn slug.
-  if (currentModel) {
-    out =
-      `<system>\nYou are currently running on model \`${currentModel}\`. ` +
-      `If asked which model or provider you are, answer with exactly this — do not guess from earlier context.\n</system>\n\n${out}`;
   }
   return out;
 }
@@ -1304,15 +1295,20 @@ export class OpenCodeProvider implements AgentProvider {
       effective: clampOpenCodeEffort(rawTurnEffort),
       requested: rawTurnEffort,
     };
+    const runtimeInstructions = appendActiveRuntimeContext(input.systemContext?.instructions, {
+      provider: 'opencode',
+      model: effectiveModel ?? OPENCODE_NATIVE_DEFAULT_MODEL,
+      effort: turnEffort.effective,
+    });
     const promptModel = effectiveModel ? splitModelSlug(effectiveModel) : null;
 
     // OpenCode has no session-start hook API. Its native prompt lifecycle
     // carries trusted static memory handling/write guidance on every prompt;
     // canonical bytes arrive per turn only in paired untrusted recall.
     const memoryContext = memoryContextForSessionStart('startup');
-    const systemInstructions = [input.systemContext?.instructions, memoryContext].filter(Boolean).join('\n\n');
+    const systemInstructions = [runtimeInstructions, memoryContext].filter(Boolean).join('\n\n');
     pending.push({
-      text: wrapPromptWithContext(input.prompt, systemInstructions, effectiveModel),
+      text: wrapPromptWithContext(input.prompt, systemInstructions),
       attachments: input.attachments,
       replayPrompt: input.continuation ? input.prompt : undefined,
     });
@@ -1711,7 +1707,7 @@ export class OpenCodeProvider implements AgentProvider {
       resolvedModel: effectiveModel ?? OPENCODE_NATIVE_DEFAULT_MODEL,
       push: (message: string, attachments?: PromptAttachment[]) => {
         pending.push({
-          text: wrapPromptWithContext(message, systemInstructions, effectiveModel),
+          text: wrapPromptWithContext(message, systemInstructions),
           attachments,
         });
         kick();

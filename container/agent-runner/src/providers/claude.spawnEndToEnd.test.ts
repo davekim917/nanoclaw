@@ -3,13 +3,21 @@ let cap: Record<string, unknown> | null = null;
 mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   query: (a: unknown) => {
     cap = (a as { options?: Record<string, unknown> }).options ?? null;
-    const g = (async function* () {})() as AsyncGenerator & { setModel: (m?: string) => Promise<void>; applyFlagSettings: (s: Record<string, unknown>) => Promise<void> };
-    g.setModel = () => Promise.resolve(); g.applyFlagSettings = () => Promise.resolve();
+    const g = (async function* () {})() as AsyncGenerator & {
+      setModel: (m?: string) => Promise<void>;
+      applyFlagSettings: (s: Record<string, unknown>) => Promise<void>;
+    };
+    g.setModel = () => Promise.resolve();
+    g.applyFlagSettings = () => Promise.resolve();
     return g;
   },
 }));
 const rcs = await import('../db/container-state.js');
-mock.module('../db/container-state.js', () => ({ ...rcs, clearContainerToolInFlight: () => {}, setContainerToolInFlight: () => {} }));
+mock.module('../db/container-state.js', () => ({
+  ...rcs,
+  clearContainerToolInFlight: () => {},
+  setContainerToolInFlight: () => {},
+}));
 const { claudeSpawnEnv } = await import('../../../../src/claude-spawn-defaults.ts');
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
 const { ClaudeProvider } = await import('./claude.js');
@@ -39,7 +47,7 @@ function spawn(cfg: Record<string, unknown>, channel: { model?: string | null; e
     p.registerMemorySessionHook(MEMORY_SESSION_HOOK);
     cap = null;
     p.query({ prompt: 'x', cwd: '/tmp' });
-    return { env: kv, model: cap?.model, effort: cap?.effort };
+    return { env: kv, model: cap?.model, effort: cap?.effort, systemPrompt: cap?.systemPrompt };
   } finally {
     if (prevAlias === undefined) delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
     else process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = prevAlias;
@@ -61,15 +69,15 @@ describe('END-TO-END after the deletion', () => {
   it('round-6 P2: an explicit effort the host no longer clamps is clamped by the container', () => {
     const r = spawn({ model: 'haiku', effort: 'high' });
     console.log('  haiku+high   env=', JSON.stringify(r.env), ' -> model=', r.model, ' effort=', r.effort);
-    expect(r.env.NANOCLAW_EFFORT_OVERRIDE).toBe('high');   // host passes it through
-    expect(r.effort).toBeUndefined();                       // container clamps it
+    expect(r.env.NANOCLAW_EFFORT_OVERRIDE).toBe('high'); // host passes it through
+    expect(r.effort).toBeUndefined(); // container clamps it
   });
 
   it('round-6 P2 shape: providerConfig.model wins and the operator effort SURVIVES', () => {
     const r = spawn({ model: 'haiku', effort: 'high', providerConfig: { model: 'claude-fable-5-1[1m]' } });
     console.log('  pc=fable m=haiku e=high -> model=', r.model, ' effort=', r.effort);
     expect(r.model).toBe('claude-fable-5-1[1m]');
-    expect(r.effort).toBe('high');   // was silently dropped before
+    expect(r.effort).toBe('high'); // was silently dropped before
   });
 
   it('sonnet wiring: family default now comes from the container', () => {
@@ -77,6 +85,11 @@ describe('END-TO-END after the deletion', () => {
     console.log('  sonnet wiring -> model=', r.model, ' effort=', r.effort);
     expect(r.env.NANOCLAW_EFFORT_OVERRIDE).toBeUndefined();
     expect(r.effort).toBe('xhigh');
+    expect(r.systemPrompt).toMatchObject({
+      type: 'preset',
+      preset: 'claude_code',
+      append: expect.stringContaining('provider "claude", model "claude-sonnet-5", and reasoning effort "xhigh"'),
+    });
   });
 
   it('the ncl-configured pair still lands', () => {

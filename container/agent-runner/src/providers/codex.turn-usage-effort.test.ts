@@ -16,7 +16,11 @@ import path from 'path';
 
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { MEMORY_SESSION_HOOK } from '../memory/session-hook.js';
-import { getTurnUsageRows, recordTurnUsage, _resetCumulativeTrackingForTesting } from '../modules/mailbox/turn-usage.js';
+import {
+  getTurnUsageRows,
+  recordTurnUsage,
+  _resetCumulativeTrackingForTesting,
+} from '../modules/mailbox/turn-usage.js';
 import { CodexProvider, codexConfigSchema } from './codex.js';
 import type { TurnUsageInfo } from './types.js';
 
@@ -24,6 +28,7 @@ const ORIGINAL_ENV = {
   PATH: process.env.PATH,
   CODEX_HOME: process.env.CODEX_HOME,
   CODEX_HEALTH_STILL_WORKING_NOTICE_MS: process.env.CODEX_HEALTH_STILL_WORKING_NOTICE_MS,
+  FAKE_CODEX_THREAD_PARAMS_FILE: process.env.FAKE_CODEX_THREAD_PARAMS_FILE,
 };
 
 let tmpDir = '';
@@ -50,6 +55,7 @@ function writeFakeCodex(binDir: string): void {
     path.join(binDir, 'codex'),
     `#!/usr/bin/env bun
 import readline from 'readline';
+import fs from 'fs';
 
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
 const usage = {
@@ -65,6 +71,9 @@ lines.on('line', (line) => {
     return;
   }
   if (request.method === 'thread/start' || request.method === 'thread/resume') {
+    if (process.env.FAKE_CODEX_THREAD_PARAMS_FILE) {
+      fs.writeFileSync(process.env.FAKE_CODEX_THREAD_PARAMS_FILE, JSON.stringify(request.params));
+    }
     send({ id: request.id, result: { thread: { id: 'thread-1', status: { type: 'idle' } } } });
     return;
   }
@@ -108,20 +117,30 @@ lines.on('line', (line) => {
  * the row that reached SQLite.
  */
 async function runTurnAndRecord(
-  options: { providerConfig?: Record<string, unknown>; effort?: string } = {},
-): Promise<{ effort: string | null; effort_requested: string | null; model: string | null }> {
+  options: { providerConfig?: Record<string, unknown>; effort?: string; instructions?: string } = {},
+): Promise<{
+  row: { effort: string | null; effort_requested: string | null; model: string | null };
+  threadParams: { baseInstructions?: string };
+}> {
   const binDir = path.join(tmpDir, 'bin');
   const codexHome = path.join(tmpDir, 'codex-home');
+  const threadParamsFile = path.join(tmpDir, 'thread-params.json');
   writeFakeCodex(binDir);
   fs.mkdirSync(codexHome, { recursive: true });
 
   process.env.PATH = `${binDir}:${process.env.PATH ?? ''}`;
   process.env.CODEX_HOME = codexHome;
   process.env.CODEX_HEALTH_STILL_WORKING_NOTICE_MS = '10000';
+  process.env.FAKE_CODEX_THREAD_PARAMS_FILE = threadParamsFile;
 
   const provider = new CodexProvider({ providerConfig: options.providerConfig ?? {} });
   provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
-  const query = provider.query({ prompt: 'one turn', cwd: tmpDir, effort: options.effort });
+  const query = provider.query({
+    prompt: 'one turn',
+    cwd: tmpDir,
+    effort: options.effort,
+    systemContext: options.instructions ? { instructions: options.instructions } : undefined,
+  });
 
   for await (const event of query.events) {
     if (event.type !== 'result') continue;
@@ -130,12 +149,15 @@ async function runTurnAndRecord(
     query.end();
   }
   const [row] = getTurnUsageRows();
-  return row as unknown as { effort: string | null; effort_requested: string | null; model: string | null };
+  return {
+    row: row as unknown as { effort: string | null; effort_requested: string | null; model: string | null },
+    threadParams: JSON.parse(fs.readFileSync(threadParamsFile, 'utf8')) as { baseInstructions?: string },
+  };
 }
 
 describe('codex turn effort -> turn_usage row', () => {
   it('records the configured sticky effort a turn ran at', async () => {
-    const row = await runTurnAndRecord({ providerConfig: { reasoning_effort: 'low' } });
+    const { row } = await runTurnAndRecord({ providerConfig: { reasoning_effort: 'low' } });
     expect(row).toMatchObject({ effort: 'low', effort_requested: 'low' });
   }, 15_000);
 
@@ -147,14 +169,14 @@ describe('codex turn effort -> turn_usage row', () => {
     // literal here would make this test a change-detector for that dial —
     // which is not a fact about this plumbing.
     const schemaDefault = codexConfigSchema.parse({}).reasoning_effort;
-    const row = await runTurnAndRecord();
+    const { row } = await runTurnAndRecord();
     expect(row.effort).toBe(schemaDefault);
     // Guard against the tautology: it must be a real value, not null/undefined.
     expect(row.effort).toBeTruthy();
   }, 15_000);
 
   it('records a per-turn -e over the sticky config', async () => {
-    const row = await runTurnAndRecord({ providerConfig: { reasoning_effort: 'low' }, effort: 'xhigh' });
+    const { row } = await runTurnAndRecord({ providerConfig: { reasoning_effort: 'low' }, effort: 'xhigh' });
     expect(row).toMatchObject({ effort: 'xhigh', effort_requested: 'xhigh' });
   }, 15_000);
 
@@ -162,8 +184,20 @@ describe('codex turn effort -> turn_usage row', () => {
     // Codex silently drops a `-e` outside its vocabulary and stays on the
     // sticky default. Recording only the effective value would hide that the
     // operator asked for something else entirely.
-    const row = await runTurnAndRecord({ providerConfig: { reasoning_effort: 'low' }, effort: 'bogus' });
+    const { row } = await runTurnAndRecord({ providerConfig: { reasoning_effort: 'low' }, effort: 'bogus' });
     expect(row.effort).toBe('low');
     expect(row.effort_requested).toBe('bogus');
+  }, 15_000);
+
+  it('reports the resolved Codex model and effort over an agent identity instruction', async () => {
+    const { threadParams } = await runTurnAndRecord({
+      providerConfig: { model: 'gpt-6-astra', reasoning_effort: 'medium' },
+      instructions: 'You are the agent.',
+    });
+
+    expect(threadParams.baseInstructions).toContain('You are the agent.');
+    expect(threadParams.baseInstructions).toContain(
+      'provider "codex", model "gpt-6-astra", and reasoning effort "medium"',
+    );
   }, 15_000);
 });
