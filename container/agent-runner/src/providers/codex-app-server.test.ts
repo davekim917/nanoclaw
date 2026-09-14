@@ -240,7 +240,7 @@ describe('createCodexConfigOverrides', () => {
   it('uses the configured native subagent concurrency default', () => {
     const overrides = createCodexConfigOverrides();
     expect(overrides).toContain('features.multi_agent=true');
-    expect(overrides).toContain('agents.max_concurrent_threads_per_session=15');
+    expect(overrides).toContain('agents.max_concurrent_threads_per_session=4');
   });
 
   it('honors the validated per-group native subagent concurrency override', () => {

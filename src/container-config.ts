@@ -625,6 +625,20 @@ export function validateGitIdentity(value: unknown): GitIdentity | undefined {
   return { name, email };
 }
 
+/**
+ * Validate the optional `autoCompactWindow` override. Absent means the fleet
+ * default; anything present must be a positive integer token count. A typo
+ * throws, like `validateContainerResources`, rather than silently reading as
+ * the 1M default — a lowered window that quietly reverts is a fail-open.
+ */
+export function validateAutoCompactWindow(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+    throw new Error('autoCompactWindow must be a positive integer (tokens)');
+  }
+  return value;
+}
+
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
   /** Host-enrolled wiki actors fail closed if their private policy is absent. */
@@ -662,6 +676,15 @@ export interface ContainerConfig {
    * dual-write provider/model/effort use.
    */
   timezone?: string;
+
+  /**
+   * Claude Code auto-compact window (tokens) for this group's containers —
+   * `CLAUDE_CODE_AUTO_COMPACT_WINDOW` at spawn. Absent = the fleet default
+   * (1,000,000, the [1m] capacity). Lowering it makes compaction fire earlier
+   * and bounds the per-step context a long session carries. Not mirrored to
+   * the DB; only the spawn path reads it. docs/specs/quota-burn/plan.md §0.5.
+   */
+  autoCompactWindow?: number;
 
   /**
    * Where to route spawns while `provider` is recorded unavailable (an
@@ -1200,6 +1223,7 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
     model: raw.model,
     effort: raw.effort,
     timezone: raw.timezone,
+    autoCompactWindow: validateAutoCompactWindow(raw.autoCompactWindow),
     providerFallback: raw.providerFallback,
     githubTokenEnv: raw.githubTokenEnv,
     excludePlugins: raw.excludePlugins,

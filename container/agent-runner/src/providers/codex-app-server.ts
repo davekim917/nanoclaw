@@ -749,7 +749,10 @@ export function createCodexConfigOverrides(
   return overrides;
 }
 
-// The native cap counts spawned agents, excluding the primary thread. Fifteen
-// is the install default; operators can override it per group through
-// providerConfig when a workload warrants it.
-export const DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION = 15;
+// The native cap counts spawned agents, excluding the primary thread. Four is
+// the install default (was 15; lowered for quota — docs/specs/quota-burn/plan.md
+// §0.4); operators can override it per group through providerConfig when a
+// workload warrants it. This constant is what actually binds: it is passed as a
+// `-c agents.max_concurrent_threads_per_session=` override at app-server spawn
+// (createCodexConfigOverrides above), which beats the generated config.toml.
+export const DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION = 4;
