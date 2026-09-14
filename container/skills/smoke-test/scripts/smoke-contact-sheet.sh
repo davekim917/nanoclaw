@@ -103,6 +103,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAX_SHOTS=8
+# A resize-driven drawer transition in the observed PR #1857 campaign was
+# still mid-slide immediately after the 390px viewport switch and settled by
+# 1.5 seconds. Keep a small margin and make the mobile capture wait explicit:
+# a timing artifact is not acceptable visual evidence.
+MOBILE_VIEWPORT_SETTLE_MS=1600
 
 die() { jq -cn --arg e "$1" '{ok:false,error:$e}'; exit 2; }
 
@@ -333,11 +338,14 @@ while IFS= read -r SCREEN; do
   MOBILE_CAPTURED=false
   MOBILE_REASON=""
   if [ "$NAV_OK" = true ]; then
-    if agent-browser --session "$SESSION" set viewport 390 844 >/dev/null 2>&1 &&
-       SHOT_OUT="$(agent-browser --session "$SESSION" screenshot --full "$MOBILE_FILE" 2>&1)"; then
+    if ! agent-browser --session "$SESSION" set viewport 390 844 >/dev/null 2>&1; then
+      MOBILE_REASON="mobile viewport failed"
+    elif ! SETTLE_OUT="$(agent-browser --session "$SESSION" wait "$MOBILE_VIEWPORT_SETTLE_MS" 2>&1)"; then
+      MOBILE_REASON="mobile viewport settle failed: $SETTLE_OUT"
+    elif SHOT_OUT="$(agent-browser --session "$SESSION" screenshot --full "$MOBILE_FILE" 2>&1)"; then
       [ -s "$MOBILE_FILE" ] && MOBILE_CAPTURED=true || MOBILE_REASON="screenshot produced no file"
     else
-      MOBILE_REASON="${SHOT_OUT:-mobile viewport/screenshot failed}"
+      MOBILE_REASON="${SHOT_OUT:-mobile screenshot failed}"
     fi
   else
     MOBILE_REASON="$NAV_ERR"
