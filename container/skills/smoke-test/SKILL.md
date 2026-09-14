@@ -1919,7 +1919,8 @@ is not a problem and does not change the size: the one constant plus the
 lines derived from it is what a real policy file looks like.
 
 Commands: `poll` (default), `check <pr>` (read-only, mirrors the develop
-gate's `check`), `claim <run-id> <pr> <sha> [owner-token]`,
+gate's `check`), `wait-settled <pr> --head <sha> [--interval-seconds N]
+[--max-seconds N]` (read-only pinned-preview waiter), `claim <run-id> <pr> <sha> [owner-token]`,
 `progress <run-id> [owner-token]`, `release <run-id> [owner-token]`,
 `finish <sha> <run-id> <verdict> [owner-token]`. `progress`/`release`/
 `finish` take no PR argument — the gate recovers it by locating whichever
@@ -1936,6 +1937,20 @@ establish the retained binding before any PR/develop claim is considered;
 malformed or contradictory shared records refuse rather than being treated as
 absence. A historical released run that left no SHA-bearing artifact cannot be
 reconstructed and is not assigned invented identity.
+
+`wait-settled` is for a scheduled re-verification or visual canary that needs
+one particular preview to become ready without hand-rolling a sleep loop. It
+reuses `check`, never claims a lease or writes PR state, and preserves that
+check's `campaignSize`, `sizeReason`, source SHA, and CI SHA. `--head` is
+required: a changed PR head exits immediately as `terminal:"head_moved"`, and
+a closed, merged, wrong-base, or unlabelled PR exits as
+`terminal:"ineligible"`; neither turns into a misleading timeout. A settled
+result includes `checkIdentity` with the requested, observed, and CI SHA.
+Temporary fetch failures and a preview that remains pending exit non-zero with
+`timedOut:true,incomplete:true` and the underlying diagnostic intact, so the
+caller reports **BLOCKED**, never PASS or FAIL. The limits are command options
+with defaults of 300 and 2700 seconds; invalid values reject this waiter only
+and cannot change the scheduled `poll` or ordinary `check` behavior.
 
 `poll` claims the shared coordinator lease before it emits
 `pr_build_settled`. Its payload includes `coordinatorOwnerToken`; treat that
