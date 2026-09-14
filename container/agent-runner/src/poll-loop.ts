@@ -1982,11 +1982,11 @@ export async function processQuery(
           // Codex fast mode is selected when its app-server starts. Even if a
           // provider supports live model/effort controls, a tier change must
           // end this query so the outer loop can respawn with new overrides.
-          if (fastChanged || !query.applySettings) {
+          if (fastChanged || !query.applySettings || query.requiresRestartForRuntimeContext) {
             log(
               `Query settings changed (${liveSettings.model ?? 'default'} → ${fb.model ?? 'default'}, ` +
                 `fast=${liveSettings.fast ? 'on' : 'off'} → ${fb.fast ? 'on' : 'off'}) — ` +
-                'ending stream; next query honors it',
+                `${query.requiresRestartForRuntimeContext ? 'restarting for a fresh runtime context; ' : ''}next query honors it`,
             );
             endedForCommand = true;
             query.end();

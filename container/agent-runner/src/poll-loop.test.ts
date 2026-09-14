@@ -3604,6 +3604,38 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(efforts).toEqual(['medium', 'xhigh']);
   }, 15_000);
 
+  it('reopens a query with immutable runtime context before admitting a changed setting', async () => {
+    insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'first fire', isError: true };
+      await Bun.sleep(1600);
+    }
+    let ended = false;
+    let applied = false;
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {
+        ended = true;
+      },
+      abort: () => {},
+      applySettings: async () => {
+        applied = true;
+      },
+      requiresRestartForRuntimeContext: true,
+      events: events(),
+    };
+
+    await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'xhigh',
+      ultracode: false,
+    });
+
+    expect(ended).toBe(true);
+    expect(applied).toBe(false);
+  }, 15_000);
+
   it('a task admitted mid-turn does NOT retarget the running stream', async () => {
     // Round-5 P1, and the regression guard for this whole class.
     //

@@ -3090,6 +3090,10 @@ export class ClaudeProvider implements AgentProvider {
       hasQueuedWork: () => sessionStateSeen && stream.outstanding.size > 0,
       end: () => stream.end(),
       events: translateEvents(),
+      // The SDK installs systemPrompt at query creation and exposes no control
+      // request to replace it. A live model/effort change must therefore open
+      // a fresh query, where the Active Runtime block remains authoritative.
+      requiresRestartForRuntimeContext: true,
       // Live view of `activeModel`, which is the resolved creation model and
       // is reassigned by applySettings. A getter rather than a snapshot so
       // creation and mid-stream retarget cannot report different things.

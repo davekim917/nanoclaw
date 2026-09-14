@@ -451,6 +451,7 @@ describe('live applySettings (-m/-e on an active query — same conversation, no
 
   it('test_applySettings_model_switch: -m fable mid-turn → setModel + family-default effort', async () => {
     const q = start(); // opus @ high (Opus 5 default as of 2026-07-27)
+    expect(q.requiresRestartForRuntimeContext).toBe(true);
     await q.applySettings!({ model: 'claude-fable-5[1m]' });
     expect(capturedSetModel).toEqual(['claude-fable-5[1m]']);
     expect(capturedFlagSettings).toEqual([{ effortLevel: 'medium' }]);
