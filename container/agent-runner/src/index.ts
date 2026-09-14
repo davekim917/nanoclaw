@@ -320,6 +320,11 @@ async function main(): Promise<void> {
   // may now read the credential slot a previous container of this session
   // rotated onto.
   provider.restorePersistedCredentialSlot?.();
+  // Then re-pick by live plan utilization (quota-burn 0.6): every slot is
+  // sampled and the most-used slot with headroom wins; the restore above is
+  // the fallback when nothing is readable. Awaited so the first query runs
+  // on the chosen slot rather than racing the pick.
+  await provider.pickCredentialSlotByUsage?.();
 
   const stopResourceTelemetry = startResourceTelemetry(log);
   try {

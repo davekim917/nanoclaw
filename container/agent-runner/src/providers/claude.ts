@@ -23,6 +23,7 @@ import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { appendActiveRuntimeContext } from '../runtime-context.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { shimCwd } from './cwd-shim.js';
+import { fetchSlotUsage, formatSlotRanking, pickSlotByUsage, type SlotUsageReading } from './claude-slot-pick.js';
 import { attachTurnEffort } from './turn-effort.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
@@ -2258,6 +2259,11 @@ export class ClaudeProvider implements AgentProvider {
    * falls through to the default primary silently, and a session-DB read
    * failure is logged and ignored — a respawn must never fail to boot over a
    * position hint it can re-derive by rotating.
+   *
+   * Since quota-burn 0.6 this is a HINT, not authority: the runner awaits
+   * `pickCredentialSlotByUsage` right after it, and a readable `/usage` map
+   * overrides the restored position. The restore still matters when every
+   * slot's pull fails or every slot is exhausted — that is the fallback.
    */
   restorePersistedCredentialSlot(): void {
     let persisted: string | undefined;
@@ -2298,6 +2304,81 @@ export class ClaudeProvider implements AgentProvider {
     // written) — ignore and stay on the primary. Log once so a stale slot
     // never rotting silently is at least visible.
     log(`Persisted credential slot "${persisted}" is not in the current pool — ignoring, staying on primary`);
+  }
+
+  /**
+   * Usage-maximizing slot pick at session start — quota-burn plan item 0.6.
+   * Rule and rationale: `./claude-slot-pick.ts`.
+   *
+   * Pulls `/api/oauth/usage` for EVERY ring slot in parallel (each bounded by
+   * the usage-pull deadline), records a `usage_pull` sample row per slot per
+   * window so idle slots stop going dark, then moves the ring onto the slot
+   * with the highest `seven_day` utilization still below 1.0 and persists it
+   * exactly as `rotateApiKey` does. Runs on fresh AND resumed sessions: the
+   * persisted slot restored just before is a hint the pick overrides
+   * (prompt-cache miss on the new account is accepted cost).
+   *
+   * Fallbacks, all logged: API-key auth or an empty ring → no-op; a failed
+   * pull leaves that slot unsampled and ineligible; no eligible slot at all →
+   * today's behaviour (the restored/primary position stands).
+   *
+   * Never throws — this must not stop a container from booting. Called by
+   * the runner entrypoint after `restorePersistedCredentialSlot` (index.ts);
+   * not from the constructor (session DB) and not from `query()` (async).
+   *
+   * `deps.fetchImpl` exists for tests; production uses global fetch.
+   */
+  async pickCredentialSlotByUsage(deps: { fetchImpl?: typeof fetch; timeoutMs?: number } = {}): Promise<void> {
+    const usingOauth = !this.env.ANTHROPIC_API_KEY && this.oauthRing.length > 0;
+    if (!usingOauth) return;
+    const timeoutMs = deps.timeoutMs ?? usagePullTimeoutMs;
+    const credentialSet = process.env.NANOCLAW_OAUTH_CREDENTIAL_SET ?? null;
+
+    let readings: SlotUsageReading[];
+    try {
+      readings = await Promise.all(
+        this.oauthRing.map(async (slot): Promise<SlotUsageReading> => {
+          const who: AccountIdentity = {
+            account: slot.name,
+            credentialSet,
+            lane: laneForSlot(process.env.CLAUDE_CODE_OAUTH_LANES, slot.name),
+          };
+          try {
+            const res = await fetchSlotUsage(slot.value, { fetchImpl: deps.fetchImpl, timeoutMs });
+            const samples = usageResponseToSamples(res, who);
+            recordRateLimitSamples(samples);
+            return { name: slot.name, samples };
+          } catch (err) {
+            log(`Slot usage pull failed for ${slot.name} (unsampled): ${err instanceof Error ? err.message : String(err)}`);
+            return { name: slot.name, samples: null };
+          }
+        }),
+      );
+    } catch (err) {
+      log(`Slot usage pick aborted: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+
+    if (this.oauthRing.length < 2) return; // sampled the lone slot; nothing to choose between
+
+    const current = this.oauthRing[this.oauthRingPos];
+    const pick = pickSlotByUsage(readings);
+    log(`Slot usage at session start: ${formatSlotRanking(pick.ranking)}`);
+    if (pick.chosen === null) {
+      log(`No OAuth slot eligible by usage — keeping ${current.name} (ring ${this.oauthRingPos + 1}/${this.oauthRing.length})`);
+      return;
+    }
+    const idx = this.oauthRing.findIndex((entry) => entry.name === pick.chosen);
+    if (idx === -1) return; // cannot happen: readings are built from the ring
+    const next = this.oauthRing[idx];
+    this.oauthRingPos = idx;
+    this.env.CLAUDE_CODE_OAUTH_TOKEN = next.value;
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = next.value;
+    log(
+      `Picked credential slot ${next.name} by usage (ring ${idx + 1}/${this.oauthRing.length}` +
+        `${next.name === current.name ? ', unchanged' : `, was ${current.name}`})`,
+    );
+    this.persistCredentialSlot(next.name);
   }
 
   /** Best-effort persist; never throws — a respawn just re-derives via rotation. */
