@@ -120,10 +120,19 @@ async function runUntilQueryCount(provider: RecordingProvider, n: number): Promi
   await loop.catch(() => {});
 }
 
-async function runUntilQueried(provider: RecordingProvider): Promise<void> {
+async function runUntilQueried(
+  provider: RecordingProvider,
+  options: { providerName?: string; providerFallbackActive?: boolean } = {},
+): Promise<void> {
   const controller = new AbortController();
   const loop = Promise.race([
-    runPollLoop({ provider, providerName: 'claude', cwd: '/tmp', signal: controller.signal }),
+    runPollLoop({
+      provider,
+      providerName: options.providerName ?? 'claude',
+      providerFallbackActive: options.providerFallbackActive,
+      cwd: '/tmp',
+      signal: controller.signal,
+    }),
     new Promise<void>((_, reject) => setTimeout(() => reject(new Error('timeout')), 4000)),
   ]);
   const start = Date.now();
@@ -159,6 +168,22 @@ describe('scheduled-task model/effort resolution (claude)', () => {
 
     expect(provider.inputs[0].model).toBe('claude-fable-5-1[1m]');
     expect(provider.inputs[0].effort).toBe('medium');
+  });
+
+  it('drops a primary-provider task pin while the task runs on a fallback', async () => {
+    // The task was valid when scheduled for its Claude primary, but a Codex
+    // fallback cannot safely consume the Claude model id. The fallback's own
+    // declared model/effort (or Terra/xhigh when unpinned) resolves instead.
+    insertTask('t2-fallback', {
+      prompt: 'weekly build',
+      flagIntent: { turnModel: 'claude-fable-5-1[1m]', turnEffort: 'medium' },
+    });
+    const provider = new RecordingProvider({}, () => '<message to="discord-test">done</message>');
+
+    await runUntilQueried(provider, { providerName: 'codex', providerFallbackActive: true });
+
+    expect(provider.inputs[0].model).toBeUndefined();
+    expect(provider.inputs[0].effort).toBeUndefined();
   });
 
   it('a MODEL-only pin no longer drags an xhigh effort along with it', async () => {

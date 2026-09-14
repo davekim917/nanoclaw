@@ -326,6 +326,7 @@ async function main(): Promise<void> {
     await runPollLoop({
       provider,
       providerName,
+      providerFallbackActive: config.fallbackApplied,
       cwd: CWD,
       systemContext: { instructions },
     });

@@ -3770,6 +3770,59 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(ended).toBe(false);
   }, 15_000);
 
+  it('drops a primary-provider task pin admitted into a fallback stream', async () => {
+    // This row was valid when it was scheduled for its Codex primary. The
+    // fallback now runs Claude, so feeding its gpt-* pin to applySettings
+    // would make the fallback stream invalid rather than target-native.
+    insertMessage('occ-fallback', 'task', {
+      prompt: 'a scheduled fire that came due during fallback',
+      flagIntent: { turnModel: 'gpt-6-astra', turnEffort: 'medium' },
+    });
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'partial', isError: false };
+      await Bun.sleep(1600);
+      yield { type: 'result', text: 'done', isError: false };
+    }
+    const applied: Array<Record<string, unknown>> = [];
+    const pushed: string[] = [];
+    const query: AgentQuery = {
+      push: (message) => {
+        pushed.push(message);
+      },
+      end: () => {},
+      abort: () => {},
+      applySettings: async (settings) => {
+        applied.push(settings);
+      },
+      events: events(),
+    };
+
+    // Fallback model/effort live in the provider's fallback config, not the
+    // per-turn input. An absent turn override is therefore the correct
+    // unchanged baseline for this fallback query.
+    await processQuery(
+      query,
+      TASK_ROUTING,
+      ['m1'],
+      'claude',
+      undefined,
+      'p',
+      undefined,
+      { ultracode: false },
+      undefined,
+      undefined,
+      undefined,
+      'unknown',
+      undefined,
+      { ignoreTaskFlagIntents: true },
+    );
+
+    expect(pushed.join('\n')).toContain('a scheduled fire that came due during fallback');
+    expect(applied).toEqual([]);
+  }, 15_000);
+
   it('keeps two separate fires apart even though they share a series', async () => {
     async function fire(occurrenceId: string) {
       async function* events() {

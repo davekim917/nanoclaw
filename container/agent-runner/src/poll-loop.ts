@@ -341,6 +341,12 @@ export interface PollLoopConfig {
    * resurrect a stale id from a different backend.
    */
   providerName: string;
+  /**
+   * This spawn is executing on a declared fallback provider. Scheduled task
+   * pins were validated for the primary provider, so they cannot safely
+   * override this target provider's fallback/default configuration.
+   */
+  providerFallbackActive?: boolean;
   cwd: string;
   systemContext?: {
     instructions?: string;
@@ -376,6 +382,7 @@ async function checkpointTurnEnd(autosaveWorktrees: (reason: string) => Promise<
  */
 export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   const runnerId = randomUUID();
+  const processQueryFallbackOptions = { ignoreTaskFlagIntents: config.providerFallbackActive === true };
   const autosaveWorktrees = config.autosaveWorktrees ?? autoCommitDirtyWorktrees;
   const idleSuppressedContinuationIds = new Set<string>();
   const suppressContinuationUntilRealInbound = (id: string): void => {
@@ -506,6 +513,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               // task's original trigger predates this turn) — the resume
               // itself IS the cause.
               'continuation',
+              undefined,
+              processQueryFallbackOptions,
             );
             if (result.continuation && result.continuation !== continuation) {
               continuation = result.continuation;
@@ -681,7 +690,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     applyChatBudget(keep);
-    const flagBatch = effectiveTurnSettings(keep, routing, config.providerName);
+    const flagBatch = effectiveTurnSettings(keep, routing, config.providerName, config.providerFallbackActive === true);
     const effectiveModel = flagBatch.model;
     const effectiveEffort = flagBatch.effort;
     const effectiveUltracode = flagBatch.ultracode;
@@ -831,6 +840,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         suppressContinuationUntilRealInbound,
         trigger,
         reportTaskOutcome,
+        processQueryFallbackOptions,
       );
       mergeTaskTurns(result.taskTurns);
       if (result.continuation && result.continuation !== continuation) {
@@ -921,6 +931,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               suppressContinuationUntilRealInbound,
               trigger,
               reportTaskOutcome,
+              processQueryFallbackOptions,
             );
             mergeTaskTurns(retryResult.taskTurns);
             if (retryResult.continuation && retryResult.continuation !== continuation) {
@@ -1005,6 +1016,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               suppressContinuationUntilRealInbound,
               trigger,
               reportTaskOutcome,
+              processQueryFallbackOptions,
             );
             mergeTaskTurns(retryResult.taskTurns);
             if (retryResult.continuation && retryResult.continuation !== continuation) {
@@ -1087,6 +1099,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             suppressContinuationUntilRealInbound,
             trigger,
             reportTaskOutcome,
+            processQueryFallbackOptions,
           );
           mergeTaskTurns(retryResult.taskTurns);
           if (retryResult.continuation && retryResult.continuation !== continuation) {
@@ -1165,6 +1178,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             suppressContinuationUntilRealInbound,
             trigger,
             reportTaskOutcome,
+            processQueryFallbackOptions,
           );
           mergeTaskTurns(retryResult.taskTurns);
           if (retryResult.continuation) {
@@ -1230,6 +1244,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             suppressContinuationUntilRealInbound,
             trigger,
             reportTaskOutcome,
+            processQueryFallbackOptions,
           );
           mergeTaskTurns(retryResult.taskTurns);
           if (retryResult.continuation) {
@@ -1298,6 +1313,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             suppressContinuationUntilRealInbound,
             trigger,
             reportTaskOutcome,
+            processQueryFallbackOptions,
           );
           mergeTaskTurns(retryResult.taskTurns);
           if (retryResult.continuation) {
@@ -1657,6 +1673,7 @@ export async function processQuery(
   // never ended, so this call can outlive its container: the host reaps it
   // first, and an outcome held for the return is never written.
   onTaskOutcome?: (key: string, outcome: FireOutcome) => Promise<void>,
+  options: { ignoreTaskFlagIntents?: boolean } = {},
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -1972,7 +1989,9 @@ export async function processQuery(
         // So the pre-existing behaviour stands: a task occurrence joining a
         // running stream inherits that stream's settings. Documented as a known
         // limitation rather than left for someone to rediscover.
-        const fb = applyFlagBatch(keep, extractRouting(keep), providerName);
+        const fb = applyFlagBatch(keep, extractRouting(keep), providerName, {
+          ignoreTaskFlagIntents: options.ignoreTaskFlagIntents,
+        });
         const liveSettingsChanged =
           fb.model !== liveSettings.model ||
           fb.effort !== liveSettings.effort ||
@@ -3155,6 +3174,7 @@ export function applyFlagBatch(
   messages: MessageInRow[],
   _routing: RoutingContext,
   providerName: string,
+  options: { ignoreTaskFlagIntents?: boolean } = {},
 ): { model?: string; effort?: string; ultracode?: boolean; fast: boolean } {
   let intent: FlagIntent | undefined;
   for (const m of messages) {
@@ -3162,6 +3182,12 @@ export function applyFlagBatch(
     // wake tasks (for example, scheduled reports) to pin model+effort per fire without a
     // global agent-group config change.
     if (m.kind !== 'chat' && m.kind !== 'chat-sdk' && m.kind !== 'task') continue;
+    // Scheduled pins are admitted against the primary provider's vocabulary.
+    // A fallback may have a different model namespace (Claude vs Codex), so
+    // treating that pin as target-provider input can produce a failed request
+    // or a misleading hybrid model/effort. The fallback's explicit config—or
+    // its native default—is the only model authority for that task fire.
+    if (options.ignoreTaskFlagIntents && m.kind === 'task') continue;
     try {
       const parsed = JSON.parse(m.content) as { flagIntent?: FlagIntent };
       if (parsed.flagIntent) {
@@ -3257,9 +3283,10 @@ function effectiveTurnSettings(
   messages: MessageInRow[],
   routing: RoutingContext,
   providerName: string,
+  ignoreTaskFlagIntents = false,
 ): { model?: string; effort?: string; ultracode?: boolean; fast: boolean } {
-  const flagBatch = applyFlagBatch(messages, routing, providerName);
-  const task = taskWakeIntent(messages);
+  const flagBatch = applyFlagBatch(messages, routing, providerName, { ignoreTaskFlagIntents });
+  const task = taskWakeIntent(messages, ignoreTaskFlagIntents);
   if (!task.isPureTaskWake) return flagBatch;
   return {
     model: task.turnModel,
@@ -3287,7 +3314,10 @@ function effectiveTurnSettings(
 // admitted turn, so one batch-level model decision can span several outcome
 // slots, and that is correct — the model is fixed when the query opens, while
 // each joining occurrence still gets its own slot.
-function taskWakeIntent(messages: MessageInRow[]): {
+function taskWakeIntent(
+  messages: MessageInRow[],
+  ignoreTaskFlagIntents = false,
+): {
   isPureTaskWake: boolean;
   turnModel?: string;
   turnEffort?: string;
@@ -3307,7 +3337,7 @@ function taskWakeIntent(messages: MessageInRow[]): {
   for (const m of messages) {
     if (m.kind === 'task') {
       hasTask = true;
-      if (!pin) {
+      if (!ignoreTaskFlagIntents && !pin) {
         try {
           const fi = (JSON.parse(m.content) as { flagIntent?: FlagIntent }).flagIntent;
           if (fi) pin = fi;
