@@ -59,7 +59,7 @@ function commitWithoutAllowlist(root: string, value: string, message = value): s
   return runGit(root, ['rev-parse', 'HEAD']);
 }
 
-function fixture(objectFormat?: 'sha256'): { root: string; hook: string; log: string; bin: string } {
+function fixture(objectFormat?: 'sha256'): { root: string; hook: string; log: string; bin: string; approval: string } {
   const root = tempRoot();
   runGit(root, objectFormat ? ['init', `--object-format=${objectFormat}`, '--quiet'] : ['init', '--quiet']);
   runGit(root, ['config', 'user.email', 'test@example.invalid']);
@@ -76,6 +76,8 @@ function fixture(objectFormat?: 'sha256'): { root: string; hook: string; log: st
   const hook = path.join(root, '.husky', 'pre-push');
   fs.mkdirSync(path.dirname(hook), { recursive: true });
   fs.copyFileSync(new URL('../.husky/pre-push', import.meta.url), hook);
+  const approval = path.join(root, 'scripts', 'local-git-task-approval.mjs');
+  fs.copyFileSync(new URL('./local-git-task-approval.mjs', import.meta.url), approval);
 
   const bin = path.join(root, 'bin');
   const modules = path.join(root, 'node_modules', '.bin');
@@ -107,7 +109,11 @@ exec "$HOOK_REAL_TSX" "$script" "$@"
   writeExecutable(
     path.join(bin, 'git'),
     `#!/bin/sh
-if [ "$1" = -C ] && [ "$3" = ls-remote ]; then shift 2; fi
+if [ "$1" = -C ] && { [ "$3" = ls-remote ] || [ "$3" = remote ]; }; then shift 2; fi
+if [ "$1" = remote ] && [ "$2" = get-url ] && [ "$3" = --push ]; then
+  printf '%s\\n' "\${HOOK_PUSH_URL:-test://origin}"
+  exit 0
+fi
 if [ "$1" = ls-remote ] && [ "$2" = --get-url ]; then
   # HOOK_GET_URL_FAILS simulates --get-url itself failing (nonzero exit, no
   # output) — distinct from HOOK_GET_URL, which simulates a successful
@@ -145,7 +151,7 @@ exec "$HOOK_REAL_GIT" "$@"
   fs.mkdirSync(hooks);
   writeExecutable(path.join(hooks, 'post-checkout'), '#!/bin/sh\ntouch "$HOOK_POST_CHECKOUT"\n');
   runGit(root, ['config', 'core.hooksPath', hooks]);
-  return { root, hook, log: path.join(root, 'hook.log'), bin };
+  return { root, hook, log: path.join(root, 'hook.log'), bin, approval };
 }
 
 function push(
@@ -162,7 +168,8 @@ function push(
     commandScopedConfig?: 'count' | 'parameters';
     withoutIonice?: boolean;
     realTreeCheck?: boolean;
-    allowMainPush?: boolean;
+    legacyMainBypass?: boolean;
+    remoteUrl?: string;
   } = {},
 ) {
   if (options.withoutIonice) {
@@ -178,7 +185,7 @@ exec "$@"
 `,
     );
   }
-  return spawnSync('/bin/sh', [f.hook, 'origin', 'test://origin'], {
+  return spawnSync('/bin/sh', [f.hook, 'origin', options.remoteUrl ?? 'test://origin'], {
     cwd: f.root,
     encoding: 'utf8',
     input: refs,
@@ -190,6 +197,7 @@ exec "$@"
       TMPDIR: f.root,
       HOOK_FAIL: options.fail ?? '',
       HOOK_REMOTE_REFS: options.remoteRefs ?? '',
+      HOOK_PUSH_URL: options.remoteUrl ?? 'test://origin',
       HOOK_LS_REMOTE_FAIL: options.remoteFailure ? '1' : '',
       HOOK_LS_REMOTE_FAIL_AFTER_OUTPUT: options.lsRemoteFailAfterOutput ? '1' : '',
       HOOK_GET_URL: options.getUrl ?? '',
@@ -199,7 +207,7 @@ exec "$@"
       HOOK_REAL_TSX: realTsx,
       HOOK_REAL_CHECKER: fileURLToPath(new URL('./check-public-boundary.ts', import.meta.url)),
       HOOK_CHECK_TREE: options.realTreeCheck ? '1' : '',
-      NANOCLAW_ALLOW_MAIN_PUSH: options.allowMainPush ? '1' : '',
+      NANOCLAW_ALLOW_MAIN_PUSH: options.legacyMainBypass ? '1' : '',
       ...(options.sourceGitEnv ? { GIT_DIR: path.join(f.root, '.git'), GIT_WORK_TREE: f.root } : {}),
       ...(options.commandScopedConfig === 'count'
         ? { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'user.name', GIT_CONFIG_VALUE_0: 'Hook Test' }
@@ -209,6 +217,41 @@ exec "$@"
         : {}),
     },
   });
+}
+
+function grantMainApproval(
+  f: ReturnType<typeof fixture>,
+  remoteRefs: string,
+  task = 'Reviewed direct main task',
+  remoteUrl = 'test://origin',
+): void {
+  const result = spawnSync(
+    'node',
+    [
+      f.approval,
+      'grant',
+      '--repo-root',
+      f.root,
+      '--remote',
+      'origin',
+      '--remote-ref',
+      'refs/heads/main',
+      '--task',
+      task,
+    ],
+    {
+      cwd: f.root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${f.bin}:${process.env.PATH}`,
+        HOOK_REMOTE_REFS: remoteRefs,
+        HOOK_PUSH_URL: remoteUrl,
+        HOOK_REAL_GIT: realGit,
+      },
+    },
+  );
+  expect(result.status, result.stderr).toBe(0);
 }
 
 function records(log: string): string[] {
@@ -249,7 +292,7 @@ describe('.husky/pre-push', () => {
     expect(result.stderr).toContain('refusing to push to main');
   });
 
-  it('does not name its own bypass in the refusal message', () => {
+  it('does not name an environment bypass in the refusal message', () => {
     const f = fixture();
     const base = commit(f.root, 'remote-base');
     const pushed = commit(f.root, 'direct-to-main-again');
@@ -262,19 +305,67 @@ describe('.husky/pre-push', () => {
     expect(result.stderr).not.toContain('NANOCLAW_ALLOW_MAIN_PUSH');
   });
 
-  it('lets an emergency main push through with NANOCLAW_ALLOW_MAIN_PUSH=1, and still scans it', () => {
+  it('does not let the retired environment bypass authorize a main update', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commit(f.root, 'direct-to-main-again');
+    const result = push(f, `refs/heads/main ${pushed} refs/heads/main ${base}\n`, {
+      remoteRefs: `${base}\trefs/heads/main\n`,
+      legacyMainBypass: true,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('No valid scoped task approval');
+    expect(fs.existsSync(f.log)).toBe(false);
+  });
+
+  it('accepts a matching scoped main approval and still scans the pushed tree', () => {
     const f = fixture();
     const base = commit(f.root, 'remote-base');
     const pushed = commit(f.root, 'emergency-fix');
+    const remoteRefs = `${base}\trefs/heads/main\n`;
+    grantMainApproval(f, remoteRefs);
     const result = push(f, `refs/heads/main ${pushed} refs/heads/main ${base}\n`, {
-      allowMainPush: true,
       fail: 'boundary:emergency-fix',
-      remoteRefs: `${base}\trefs/heads/main\n`,
+      remoteRefs,
     });
 
     expect(result.status).toBe(1);
     expect(result.stderr).not.toContain('refusing to push to main');
     expect(records(f.log).join('\n')).toContain('emergency-fix');
+  });
+
+  it('does not let an approval for an older local head authorize a newer main update', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const approved = commit(f.root, 'approved-head');
+    const remoteRefs = `${base}\trefs/heads/main\n`;
+    grantMainApproval(f, remoteRefs);
+    const newer = commit(f.root, 'newer-head');
+
+    const result = push(f, `refs/heads/main ${newer} refs/heads/main ${base}\n`, { remoteRefs });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('No valid scoped task approval');
+    expect(fs.existsSync(f.log)).toBe(false);
+    expect(approved).not.toBe(newer);
+  });
+
+  it('does not let an approval for another push destination authorize a main update', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commit(f.root, 'approved-head');
+    const remoteRefs = `${base}\trefs/heads/main\n`;
+    grantMainApproval(f, remoteRefs, 'Reviewed direct main task', 'test://approved-destination');
+
+    const result = push(f, `refs/heads/main ${pushed} refs/heads/main ${base}\n`, {
+      remoteRefs,
+      remoteUrl: 'test://retargeted-destination',
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('No valid scoped task approval');
+    expect(fs.existsSync(f.log)).toBe(false);
   });
 
   it('does not refuse a local main pushed to another branch name', () => {
