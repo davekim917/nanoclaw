@@ -13,6 +13,11 @@
 #                                pair unchanged
 #   read                        print the current live pair as JSON
 #
+# For a PR-owned completion contract, start/check/finish also require both
+# serving commits to equal that contract's sourceSha. The shared gate env
+# intentionally names the develop pair by default, so merely comparing a
+# frozen pair to itself cannot establish that a PR campaign froze its preview.
+#
 # Tests: smoke-pair-identity.test.sh (unchanged, same-commit redeploy, null id,
 # garbage, non-live-first, live→deactivated, non-string ids, re-start after
 # drift, unwritable run dir, unwritable check log, bounded re-freeze — first
@@ -20,8 +25,9 @@
 # every lane is redispatched — all fail closed).
 #
 # Exit: 0 unchanged/frozen/re-frozen · 2 unreadable/invalid/unwritable/misconfigured, or
-#       finish refused (a lane not redispatched since a re-freeze) · 3 DRIFT (lane finishes
-#       BLOCKED) · 4 refused (re-start after freeze, or a second re-freeze)
+#       finish refused (a lane not redispatched since a re-freeze) · 3 DRIFT or a
+#       PR-contract source mismatch (lane finishes BLOCKED) · 4 refused (re-start
+#       after freeze, or a second re-freeze)
 #
 # Env: RENDER_API_KEY; SMOKE_GATE_FRONTEND_SERVICE / SMOKE_GATE_BACKEND_SERVICE (required —
 #      no defaults; a missing id fails closed rather than silently identifying the wrong pair.
@@ -90,26 +96,78 @@ if not ok: pair["error"] = "; ".join(f"{s}: {o['error']}" for s, o in (("fronten
 print(json.dumps(pair, separators=(",", ":"))); sys.exit(0 if ok else 2)
 PY
 }
-compare() { # $1 frozen file, $2 now json, $3 label, $4 rc-of-read, $5 log, $6 freeze-generation → prints verdict, exit 0/2/3
-  python3 - "$1" "$2" "$3" "$4" "$5" "$6" <<'PY'
+
+# A PR campaign's contract is the only source-of-truth that says which build
+# this pair must serve. Develop/task campaigns may intentionally have frontend
+# and backend at different commits, so preserve their existing pair-only
+# behaviour. A valid PR contract with a missing/malformed sourceSha refuses;
+# a wholly unreadable legacy contract is left for the existing contract
+# consumers to reject, while a prior PR freeze keeps its stored expectation.
+pr_contract_source_sha() { # <run-dir> → sourceSha on stdout, empty if not PR-owned
+  local run="$1" contract payload error kind source
+  contract="$run/completion-contract.json"
+  [ -e "$contract" ] || return 0
+  payload="$(jq -cs '
+    if length != 1 then {error:"completion contract must contain exactly one JSON document"}
+    elif (.[0] | type) != "object" then {error:"completion contract must be an object"}
+    else .[0]
+    end
+  ' "$contract" 2>/dev/null)" || {
+    return 0
+  }
+  error="$(jq -r '.error // empty' <<<"$payload" 2>/dev/null)"
+  if [ -n "$error" ]; then
+    return 0
+  fi
+  kind="$(jq -r '.ownershipKind // empty' <<<"$payload" 2>/dev/null)"
+  [ "$kind" = "pr" ] || return 0
+  source="$(jq -r '.sourceSha // empty' <<<"$payload" 2>/dev/null)"
+  if ! printf '%s' "$source" | grep -Eq '^[0-9a-f]{40}$'; then
+    echo "REFUSED: PR completion contract at $contract has no valid 40-character sourceSha (exit 2)" >&2
+    return 2
+  fi
+  printf '%s\n' "$source"
+}
+
+stored_expected_source_sha() { # <identity.json> → validated sourceSha or empty
+  local source
+  source="$(jq -r '.expectedSourceSha // empty' "$1" 2>/dev/null)"
+  printf '%s' "$source" | grep -Eq '^[0-9a-f]{40}$' || return 0
+  printf '%s\n' "$source"
+}
+
+pair_matches_source_sha() { # <pair-json> <source-sha>
+  jq -e --arg sha "$2" '
+    .frontend.commit == $sha and .backend.commit == $sha
+  ' <<<"$1" >/dev/null 2>&1
+}
+
+compare() { # $1 frozen file, $2 now json, $3 label, $4 rc-of-read, $5 log, $6 freeze-generation, $7 expected-source-sha → prints verdict, exit 0/2/3
+  python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PY'
 import json, sys, os
 try: frozen = json.load(open(sys.argv[1]))
 except Exception as e: print(f"{sys.argv[3]}: unreadable — identity.json: {e}"); sys.exit(2)
-now = json.loads(sys.argv[2]); label = sys.argv[3]; rc = int(sys.argv[4]); log = sys.argv[5]
+now = json.loads(sys.argv[2]); label = sys.argv[3]; rc = int(sys.argv[4]); log = sys.argv[5]; expected = sys.argv[7]
 try: generation = int(sys.argv[6])
 except Exception: generation = 1
 def key(o, s): return (o.get(s, {}).get("service"), o.get(s, {}).get("deploy"), o.get(s, {}).get("commit"))
+def serves_expected(pair): return not expected or all(pair.get(s, {}).get("commit") == expected for s in ("frontend", "backend"))
 if not frozen.get("ok"): verdict = "unreadable"
+elif not serves_expected(frozen): verdict = "source-mismatch"
 elif rc != 0: verdict = "unreadable"
+elif not serves_expected(now): verdict = "source-mismatch"
 else: verdict = "drift" if any(key(frozen, s) != key(now, s) for s in ("frontend", "backend")) else "ok"
 rec = {"label": label, "verdict": verdict, "freezeGeneration": generation,
        "frozen": {s: frozen.get(s) for s in ("frontend", "backend")},
-       "now": {s: now.get(s) for s in ("frontend", "backend")}, "readAt": now.get("readAt")}
+       "now": {s: now.get(s) for s in ("frontend", "backend")}, "readAt": now.get("readAt"),
+       "expectedSourceSha": expected or None}
 try:
     with open(log, "a") as f: f.write(json.dumps(rec, separators=(",", ":")) + "\n"); f.flush(); os.fsync(f.fileno())
 except Exception as e: print(f"{label}: unreadable — check log not writable: {e}"); sys.exit(2)
-print(f"{label}: {verdict}" + ("" if verdict == "ok" else " — " + json.dumps(rec["now"])))
-sys.exit({"ok": 0, "drift": 3, "unreadable": 2}[verdict])
+detail = "" if verdict == "ok" else " — " + json.dumps(rec["now"])
+if expected: detail += " expectedSourceSha=" + expected
+print(f"{label}: {verdict}" + detail)
+sys.exit({"ok": 0, "drift": 3, "source-mismatch": 3, "unreadable": 2}[verdict])
 PY
 }
 case "${1:-}" in
@@ -119,9 +177,18 @@ case "${1:-}" in
     RUN="${2:?run dir}"; F="$RUN/coordinator/identity.json"
     [ -e "$F" ] && { echo "REFUSED: $F already exists — identity is frozen once; use check/refreeze/finish (exit 4)" >&2; exit 4; }
     mkdir -p "$RUN/coordinator" 2>/dev/null || { echo "REFUSED: cannot create $RUN/coordinator (exit 2)" >&2; exit 2; }
+    CONTRACT_SOURCE_SHA="$(pr_contract_source_sha "$RUN")" || exit 2
+    EXPECTED_SOURCE_SHA="$CONTRACT_SOURCE_SHA"
     P="$(read_pair)"; rc=$?
     [ $rc -eq 0 ] || { echo "REFUSED: identity unreadable/invalid — nothing frozen: $P" >&2; exit 2; }
-    PAYLOAD="$(printf '%s' "$P" | jq -c '. + {freezeGeneration: 1, history: []}')" || {
+    if [ -n "$EXPECTED_SOURCE_SHA" ] && ! pair_matches_source_sha "$P" "$EXPECTED_SOURCE_SHA"; then
+      echo "REFUSED: live pair does not serve PR contract sourceSha $EXPECTED_SOURCE_SHA — nothing frozen (exit 2): $P" >&2
+      exit 2
+    fi
+    PAYLOAD="$(printf '%s' "$P" | jq -c --arg expected "$EXPECTED_SOURCE_SHA" '
+      . + {freezeGeneration: 1, history: []} +
+      (if $expected == "" then {} else {expectedSourceSha: $expected} end)
+    ')" || {
       echo "REFUSED: could not attach freeze bookkeeping to the live pair (exit 2)" >&2; exit 2; }
     python3 - "$RUN/coordinator" "$PAYLOAD" <<'PY'
 import json, os, sys, tempfile
@@ -184,8 +251,15 @@ PY
       echo "REFUSED: could not snapshot the contract's lane generations — nothing re-frozen (exit 2)" >&2; exit 2; }
     SNAP_ERR="$(jq -r '.error // empty' <<<"$SNAP")"
     [ -z "$SNAP_ERR" ] || { echo "REFUSED: $SNAP_ERR — cannot snapshot lane generations; nothing re-frozen (exit 2)" >&2; exit 2; }
+    CONTRACT_SOURCE_SHA="$(pr_contract_source_sha "$RUN")" || exit 2
+    EXPECTED_SOURCE_SHA="$CONTRACT_SOURCE_SHA"
+    [ -n "$EXPECTED_SOURCE_SHA" ] || EXPECTED_SOURCE_SHA="$(stored_expected_source_sha "$F")"
     P="$(read_pair)"; rc=$?
     [ $rc -eq 0 ] || { echo "REFUSED: live identity unreadable/invalid — nothing re-frozen: $P" >&2; exit 2; }
+    if [ -n "$EXPECTED_SOURCE_SHA" ] && ! pair_matches_source_sha "$P" "$EXPECTED_SOURCE_SHA"; then
+      echo "REFUSED: live pair does not serve PR contract sourceSha $EXPECTED_SOURCE_SHA — nothing re-frozen (exit 2): $P" >&2
+      exit 2
+    fi
     NOW_ISO="$(date -u +%FT%TZ)"
     PAYLOAD="$(jq -c \
       --argjson old "$OLD" --arg reason "$REASON" --arg at "$NOW_ISO" --argjson gen "$NEW_GEN" \
@@ -220,6 +294,9 @@ PY
     require_services
     RUN="${2:?run dir}"; LABEL="${3:-$1}"; F="$RUN/coordinator/identity.json"; LOG="$RUN/coordinator/identity-checks.ndjson"
     [ -s "$F" ] || { echo "$LABEL: unreadable — no identity.json in $RUN (run start first) (exit 2)"; exit 2; }
+    CONTRACT_SOURCE_SHA="$(pr_contract_source_sha "$RUN")" || exit 2
+    EXPECTED_SOURCE_SHA="$CONTRACT_SOURCE_SHA"
+    [ -n "$EXPECTED_SOURCE_SHA" ] || EXPECTED_SOURCE_SHA="$(stored_expected_source_sha "$F")"
     CUR_GEN="$(jq -r '(.freezeGeneration // 1)' "$F" 2>/dev/null || echo 1)"
     printf '%s' "$CUR_GEN" | grep -Eq '^[0-9]+$' || CUR_GEN=1
     if [ "$1" = finish ]; then
@@ -265,6 +342,7 @@ if not current:
     sys.exit(2)
 verdicts = [rec.get("verdict") for rec in current]
 if "drift" in verdicts: print("finish: drift — a check already recorded drift at the current freeze generation; verdict must be BLOCKED (exit 3)"); sys.exit(3)
+if "source-mismatch" in verdicts: print("finish: source mismatch — a check recorded a pair that does not serve the PR contract sourceSha at the current freeze generation; verdict must be BLOCKED (exit 3)"); sys.exit(3)
 bad = [v for v in verdicts if v != "ok"]
 # What is checked: at least one check exists at the current generation and every check
 # there is ok. Check labels are free-form, so this cannot tell which lane posted which.
@@ -272,6 +350,6 @@ if bad: print(f"finish: unreadable — non-ok identity checks {bad} at the curre
 PY
       LABEL="finish-prepublication"
     fi
-    NOW="$(read_pair)"; rc=$?; compare "$F" "$NOW" "$LABEL" "$rc" "$LOG" "$CUR_GEN"; exit $? ;;
+    NOW="$(read_pair)"; rc=$?; compare "$F" "$NOW" "$LABEL" "$rc" "$LOG" "$CUR_GEN" "$EXPECTED_SOURCE_SHA"; exit $? ;;
   *) sed -n 2,24p "$0"; exit 1 ;;
 esac

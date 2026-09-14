@@ -379,4 +379,43 @@ else
   echo "note: tmpfs partial-write fixture skipped (no mount privilege)"
 fi
 
+# --- 7. A PR contract binds the frozen pair to its preview source SHA -------
+# The shared smoke-gate env normally names the develop services. For a PR run,
+# letting start freeze those services and then having check compare them only
+# to themselves is a false green. A PR-owned contract makes its sourceSha the
+# expected serving commit for BOTH services; develop contracts above retain
+# their existing pair-only behavior because their services may differ.
+RUN16="$T/run16"; mkdir -p "$RUN16"
+cat >"$RUN16/completion-contract.json" <<JSON
+{"schemaVersion":1,"sourceSha":"$SRC_SHA","ownershipKind":"pr","requiredLaneMarkers":[]}
+JSON
+mk dep-fe000000001 live "$A" > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"
+mk dep-be000000001 live "$B" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+expect_rc "$(run start "$RUN16")" 2 pr-start-refuses-base-pair
+[ ! -e "$RUN16/coordinator/identity.json" ] ||
+  fail "pr-start-refuses-base-pair: a wrong serving pair was frozen"
+err | grep -Fq "does not serve PR contract sourceSha $SRC_SHA" ||
+  fail "pr-start-refuses-base-pair: refusal did not name the contract SHA"
+
+# The real PR preview pair freezes successfully and records the source binding
+# with the identity. If the configured services later move back to the base
+# pair, check must report a source mismatch rather than comparing the wrong
+# pair to itself and returning ok.
+mk dep-fe000000016 live "$SRC_SHA" > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"
+mk dep-be000000016 live "$SRC_SHA" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+expect_rc "$(run start "$RUN16")" 0 pr-start-preview-pair
+jq -e --arg sha "$SRC_SHA" '.expectedSourceSha == $sha and .frontend.commit == $sha and .backend.commit == $sha' "$RUN16/coordinator/identity.json" >/dev/null ||
+  fail "pr-start-preview-pair: frozen identity did not record the expected source"
+mk dep-fe000000001 live "$A" > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"
+mk dep-be000000001 live "$B" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+expect_rc "$(run check "$RUN16" base-pair-returned)" 3 pr-check-detects-base-pair
+out | grep -Fq "base-pair-returned: source-mismatch" ||
+  fail "pr-check-detects-base-pair: wrong pair did not report source-mismatch"
+tail -1 "$RUN16/coordinator/identity-checks.ndjson" | jq -e --arg sha "$SRC_SHA" '
+  .verdict == "source-mismatch" and .expectedSourceSha == $sha
+' >/dev/null || fail "pr-check-detects-base-pair: receipt omitted the expected source"
+expect_rc "$(run finish "$RUN16")" 3 pr-finish-blocks-source-mismatch
+out | grep -Fq "finish: source mismatch" ||
+  fail "pr-finish-blocks-source-mismatch: finish did not preserve BLOCKED semantics"
+
 echo "smoke pair identity tests passed"
