@@ -33,7 +33,7 @@ runtime explicitly exposes an update. Failed cross-transport resume is a
 recovery decision, never permission to silently restart the build.
 
 Ordinary coordinators use Sonnet/xhigh (Claude) and Terra/xhigh (Codex) for this
-trial. Substantive work goes to the default Opus 5/Sol worker at high; Fable/Astra
+trial. High is the default worker effort; the default worker is `claude-opus-5` on Claude and `gpt-5.6-sol` on Codex. Fable/Astra
 are the judgment-shape escalation and run at medium, selected with helper --model
 from task start. Escalating the model does not also escalate the effort. QA/release roots that still own
 technical verdicts remain separate until their judgment responsibilities move
