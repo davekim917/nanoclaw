@@ -34,6 +34,39 @@ export interface SpawnProviderDecision {
   fallbackApplied: boolean;
 }
 
+/**
+ * Apply the runtime portion of a provider-fallback decision to the mutable
+ * spawn config. Identity, filesystem, tools, tone and standing instructions
+ * deliberately remain on the same group; all model/effort layers belong to
+ * the source provider and must be removed before the target resolves its own
+ * native defaults.
+ */
+export function applyProviderFallbackRuntime(
+  containerConfig: Pick<ContainerConfig, 'provider' | 'model' | 'effort' | 'defaultModel' | 'defaultEffort'>,
+  decision: Pick<SpawnProviderDecision, 'provider' | 'model' | 'effort'>,
+): void {
+  containerConfig.provider = decision.provider;
+  containerConfig.model = decision.model;
+  containerConfig.effort = decision.effort;
+  containerConfig.defaultModel = undefined;
+  containerConfig.defaultEffort = undefined;
+}
+
+/**
+ * Environment bridge for the runner's immutable container.json. The marker
+ * is independent of the provider value because the target can equal the
+ * group's file provider when a session-level primary is different.
+ */
+export function providerFallbackRuntimeEnv(
+  decision: Pick<SpawnProviderDecision, 'provider' | 'model'>,
+): Record<string, string> {
+  return {
+    NANOCLAW_PROVIDER_OVERRIDE: decision.provider,
+    NANOCLAW_PROVIDER_FALLBACK_APPLIED: '1',
+    ...(decision.model ? { NANOCLAW_MODEL_OVERRIDE: decision.model } : {}),
+  };
+}
+
 export async function resolveSpawnProvider(options: {
   agentGroupId: string;
   sessionProvider: string | null | undefined;

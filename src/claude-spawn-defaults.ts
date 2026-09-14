@@ -1,10 +1,4 @@
-import {
-  DEFAULT_HAIKU_MODEL,
-  DEFAULT_OPUS_MODEL,
-  DEFAULT_SONNET_MODEL,
-  resolveEffectiveModel,
-  vocabFor,
-} from './flag-parser.js';
+import { DEFAULT_HAIKU_MODEL, DEFAULT_SONNET_MODEL, resolveEffectiveModel, vocabFor } from './flag-parser.js';
 import type { ContainerConfig } from './container-config.js';
 
 /**
@@ -98,7 +92,11 @@ export function resolveClaudeSpawnDefaults(
     ['container.json model', containerConfig.model],
     ['container.json defaultModel', containerConfig.defaultModel],
   ];
-  let model = DEFAULT_OPUS_MODEL;
+  // The default is a Sonnet conversation, not an implicit Opus escalation.
+  // This is also the neutral Claude target for an unpinned Codex → Claude
+  // fallback: provider fallback changes the runtime, not the agent's identity
+  // or an otherwise-unconfigured model tier.
+  let model = DEFAULT_SONNET_MODEL;
   for (const [layer, raw] of modelLayers) {
     if (!raw) continue;
     const resolved = resolveEffectiveModel(raw);

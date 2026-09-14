@@ -99,17 +99,17 @@ describe('END-TO-END after the deletion', () => {
     expect(r.effort).toBe('medium');
   });
 
-  it('the unconfigured fleet baseline is unchanged', () => {
+  it('the unconfigured fleet baseline resolves to Sonnet/xhigh', () => {
     const r = spawn({});
     console.log('  baseline      -> model=', r.model, ' effort=', r.effort);
-    expect(r.model).toBe('claude-opus-5[1m]');
-    expect(r.effort).toBe('high');
+    expect(r.model).toBe('claude-sonnet-5');
+    expect(r.effort).toBe('xhigh');
   });
 
   it('a carried codex model + ultra are still refused at the host', () => {
     const r = spawn({ model: 'gpt-6-astra', effort: 'ultra' });
     console.log('  codex residue -> model=', r.model, ' effort=', r.effort);
-    expect(r.model).toBe('claude-opus-5[1m]');
-    expect(r.effort).toBe('high');
+    expect(r.model).toBe('claude-sonnet-5');
+    expect(r.effort).toBe('xhigh');
   });
 });

@@ -70,6 +70,11 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
   const env = typeof process !== 'undefined' ? process.env : undefined;
   const envProvider = env?.NANOCLAW_PROVIDER_OVERRIDE;
   const envModel = env?.NANOCLAW_MODEL_OVERRIDE;
+  // Provider equality cannot tell us whether this is a fallback: a session
+  // may be pinned to Codex while its group file names Claude, then legitimately
+  // fall back to Claude. Carry the host's decision explicitly so the runner
+  // still discards the file's source-provider settings in that case.
+  const envFallbackApplied = env?.NANOCLAW_PROVIDER_FALLBACK_APPLIED === '1';
   // Channel defaults are injected by the host at spawn time. Keep them on a
   // provider-specific surface: Codex's config schema uses `model` and
   // `reasoning_effort`, while Claude uses `model` and `effort`. They must be
@@ -86,7 +91,9 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
   // every fallback spawn into an instant crash loop. Take the declared
   // fallback's own model/effort instead; drop the primary's sticky config.
   const declaredFallback = raw.providerFallback as RunnerConfig['providerFallback'];
-  const onFallback = provider !== fileProvider;
+  // Keep the provider-difference check for hosts deployed before the explicit
+  // marker. The marker is required for the equal-to-file case above.
+  const onFallback = envFallbackApplied || provider !== fileProvider;
   const activeFallback = onFallback && declaredFallback?.provider === provider ? declaredFallback : undefined;
   const configuredProviderConfig = (raw.providerConfig as Record<string, unknown>) ?? {};
   const providerConfig = onFallback ? {} : { ...configuredProviderConfig };

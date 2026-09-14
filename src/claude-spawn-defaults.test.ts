@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { claudeSpawnEnv, resolveClaudeSpawnDefaults } from './claude-spawn-defaults.js';
-import { DEFAULT_OPUS_MODEL } from './flag-parser.js';
+import { DEFAULT_SONNET_MODEL } from './flag-parser.js';
 import type { ContainerConfig } from './container-config.js';
 
 type Cfg = Pick<ContainerConfig, 'model' | 'effort' | 'defaultModel' | 'defaultEffort' | 'providerConfig'>;
@@ -73,12 +73,12 @@ describe('resolveClaudeSpawnDefaults — layer precedence', () => {
     expect(r.effort).toBe('low');
   });
 
-  it('test_unconfigured_group_is_unchanged', () => {
-    // 23 of the fleet's 24 groups. No configured model means the container's
-    // own alias derivation is provably right, so no effort is emitted and the
-    // spawn env is byte-identical to before this seam existed.
+  it('test_unconfigured_group_uses_the_native_claude_default', () => {
+    // An unpinned native Claude group and an unpinned Codex → Claude fallback
+    // reach this same configuration. No effort is emitted: the provider derives
+    // Sonnet's xhigh from the resolved model at query time.
     const r = resolveClaudeSpawnDefaults(cfg());
-    expect(r).toEqual({ model: DEFAULT_OPUS_MODEL, effort: undefined, drops: [] });
+    expect(r).toEqual({ model: DEFAULT_SONNET_MODEL, effort: undefined, drops: [] });
   });
 
   it('test_chain_matches_the_codex_branch', () => {
@@ -107,7 +107,7 @@ describe('resolveClaudeSpawnDefaults — foreign vocabulary is dropped, never ex
     // NANOCLAW_EFFORT_OVERRIDE bypasses claudeConfigSchema, so nothing
     // downstream would have rejected these.
     const r = resolveClaudeSpawnDefaults(cfg({ model: 'gpt-6-astra', effort: 'ultra' }));
-    expect(r.model).toBe(DEFAULT_OPUS_MODEL);
+    expect(r.model).toBe(DEFAULT_SONNET_MODEL);
     expect(r.effort).toBeUndefined();
     expect(r.drops).toHaveLength(2);
     expect(r.drops[0]).toContain('gpt-6-astra');
@@ -121,7 +121,7 @@ describe('resolveClaudeSpawnDefaults — foreign vocabulary is dropped, never ex
   });
 
   it('test_an_opencode_slug_is_dropped', () => {
-    expect(resolveClaudeSpawnDefaults(cfg({ model: 'opencode-go/kimi-k3' })).model).toBe(DEFAULT_OPUS_MODEL);
+    expect(resolveClaudeSpawnDefaults(cfg({ model: 'opencode-go/kimi-k3' })).model).toBe(DEFAULT_SONNET_MODEL);
   });
 
   it('test_a_dropped_layer_yields_to_the_next_one', () => {
@@ -175,7 +175,7 @@ describe('claudeSpawnEnv', () => {
     const env = claudeSpawnEnv(cfg());
     expect(env.join(' ')).not.toContain('NANOCLAW_EFFORT_OVERRIDE');
     expect(pairs(env)).toEqual({
-      ANTHROPIC_DEFAULT_OPUS_MODEL: DEFAULT_OPUS_MODEL,
+      ANTHROPIC_DEFAULT_OPUS_MODEL: DEFAULT_SONNET_MODEL,
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5-20251001',
     });
@@ -183,9 +183,9 @@ describe('claudeSpawnEnv', () => {
   });
 
   it('claude_spawn_env_matches_the_live_fleet_baseline', () => {
-    // 23 of 24 groups configure neither field. `docker inspect` on the live
-    // claude containers (2026-09-07) shows exactly this env shape.
-    expect(pairs(claudeSpawnEnv(cfg())).ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5[1m]');
+    // This is the unpinned Claude baseline; group-level model/effort fields are
+    // exceptions, not copies of this default.
+    expect(pairs(claudeSpawnEnv(cfg())).ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-sonnet-5');
     expect(claudeSpawnEnv(cfg()).includes('NANOCLAW_EFFORT_OVERRIDE=')).toBe(false);
   });
 

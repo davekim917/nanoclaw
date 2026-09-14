@@ -67,24 +67,20 @@ refs_file=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-refs.XXXXXX")
 seen_objects=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-seen.XXXXXX")
 cat > "$refs_file"
 
-# Direct updates of main require a local, expiry-bound approval receipt. The
-# host-side agent writes that receipt only after the operator approves the
-# reviewed task in natural language; it binds the approval to this exact old
-# and new ref state, so a successful update cannot replay it. This avoids
-# making the operator copy a commit hash while retaining a narrow local gate.
-# Main deletion remains PR/server-admin only.
-needs_scoped_main_approval=''
+# The fork's main changes only through merged pull requests. A direct push
+# skips CI and review, and nothing server-side refuses one on this repository,
+# so refuse any update or deletion of a remote main here, before any other
+# work. For an emergency, NANOCLAW_ALLOW_MAIN_PUSH=1 lets the push through and
+# the boundary scan below still runs; --no-verify would skip that scan too.
+# The refusal below does not name that override: printing it hands the next
+# reader (agent or human) a ready-made bypass for a guard that exists to make
+# them stop and open a PR instead.
 while read -r local_ref local_sha remote_ref remote_sha; do
-  [ "$remote_ref" = refs/heads/main ] && needs_scoped_main_approval=1
+  if [ "$remote_ref" = refs/heads/main ] && [ "${NANOCLAW_ALLOW_MAIN_PUSH:-}" != 1 ]; then
+    echo "pre-push: refusing to push to main on $remote_name. main takes changes through pull requests only: push a branch and open a PR." >&2
+    exit 1
+  fi
 done < "$refs_file"
-if [ -n "$needs_scoped_main_approval" ] && ! node "$repo_root/scripts/local-git-task-approval.mjs" verify \
-  --git-common-dir "$(git -C "$worktree_root" rev-parse --path-format=absolute --git-common-dir)" \
-  --remote-name "$remote_name" \
-  --remote-url "$remote_url" \
-  --refs-file "$refs_file"; then
-  echo "pre-push: refusing to push to main on $remote_name. No valid scoped task approval matches this exact update." >&2
-  exit 1
-fi
 
 needs_remote_tips=''
 while read -r local_ref local_sha remote_ref remote_sha; do

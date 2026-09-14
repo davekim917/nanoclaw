@@ -7,6 +7,7 @@ const BASE = { provider: 'codex', model: 'gpt-5.6-sol' };
 function clearEnv(): void {
   delete process.env.NANOCLAW_PROVIDER_OVERRIDE;
   delete process.env.NANOCLAW_MODEL_OVERRIDE;
+  delete process.env.NANOCLAW_PROVIDER_FALLBACK_APPLIED;
   delete process.env.NANOCLAW_CODEX_MODEL_OVERRIDE;
   delete process.env.NANOCLAW_CODEX_EFFORT_OVERRIDE;
 }
@@ -38,6 +39,8 @@ describe('parseRawConfig provider fallback bridge', () => {
     });
     expect(config.provider).toBe('codex');
     expect(config.providerConfig).toEqual({});
+    expect(config.model).toBeUndefined();
+    expect(config.effort).toBeUndefined();
     expect(config.providerFallback).toEqual({ provider: 'codex' });
   });
 
@@ -69,6 +72,39 @@ describe('parseRawConfig provider fallback bridge', () => {
     expect(config.model).toBe('claude-opus-5[1m]');
     expect(config.effort).toBe('high');
     expect(config.providerConfig).toEqual({});
+  });
+
+  it('drops Claude file settings when a Codex-pinned session falls back to its file provider', () => {
+    // Provider equality alone is not enough: the session's primary was Codex,
+    // but this group's file names Claude. The host's explicit fallback marker
+    // preserves the source/target boundary across that env bridge.
+    process.env.NANOCLAW_PROVIDER_OVERRIDE = 'claude';
+    process.env.NANOCLAW_PROVIDER_FALLBACK_APPLIED = '1';
+    const config = parseRawConfig({
+      provider: 'claude',
+      model: 'claude-fable-5-1[1m]',
+      effort: 'medium',
+      providerConfig: { model: 'claude-fable-5-1[1m]', effort: 'medium' },
+      providerFallback: { provider: 'claude' },
+    });
+    expect(config.providerConfig).toEqual({});
+    expect(config.model).toBeUndefined();
+    expect(config.effort).toBeUndefined();
+  });
+
+  it('drops Codex file settings when a Claude-pinned session falls back to its file provider', () => {
+    process.env.NANOCLAW_PROVIDER_OVERRIDE = 'codex';
+    process.env.NANOCLAW_PROVIDER_FALLBACK_APPLIED = '1';
+    const config = parseRawConfig({
+      provider: 'codex',
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+      providerConfig: { model: 'gpt-5.6-sol', reasoning_effort: 'high' },
+      providerFallback: { provider: 'codex' },
+    });
+    expect(config.providerConfig).toEqual({});
+    expect(config.model).toBeUndefined();
+    expect(config.effort).toBeUndefined();
   });
 
   it('carries a Codex fallback declaration onto config.model/effort', () => {
