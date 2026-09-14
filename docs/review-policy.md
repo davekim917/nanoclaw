@@ -37,11 +37,11 @@ does not relax required CI, holds, or merge authorization.
 The substitute, like every review (a delta check after a rebase or ratchet
 regeneration, adversarial verification, a gap analysis), uses the native
 `worker-frontier`: Claude's `model:` frontmatter or Codex's
-`CODEX_WORKER_MODELS['worker-frontier']` (`src/claude-agent-md.ts`). Medium is
+`CODEX_WORKER_MODELS['worker-frontier']` (`src/claude-agent-md.ts`). High is
 the default effort; an explicit task override must use a runtime field or the
 scoped CLI helper described in `docs/frontier-worker-trial.md`, never prompt
 wording. The allowed ids are generated from the frontier configuration plus explicit
-receipt compatibility for prior `claude-opus-5` and `gpt-5.6-sol` reviewers.
+receipt compatibility for prior `claude-fable-5-1` and `gpt-6-astra` reviewers.
 Those IDs remain accepted so unchanged exact-head evidence survives this
 roster migration; they are not new dispatch defaults. The existing gate
 accepts these IDs for both receipt submission and receipt consumption:
