@@ -9,7 +9,9 @@ import {
   formatCodexAgentToml,
   isManagedToml,
   parseClaudeAgentMd,
+  retargetRunsOnSentence,
 } from './claude-agent-md.js';
+import { buildContainerCodexConfig } from './providers/codex.js';
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 
@@ -153,6 +155,40 @@ describe('native frontier worker conversion', () => {
     expect(out).toContain('high reasoning by default');
     expect(out).not.toContain('Runs on Opus');
     expect(out).toContain('fresh independent context');
+  });
+
+  /**
+   * Driven with an effort the policy does not currently carry, so it fails if
+   * the word is ever typed back into the sentence. The parity test below cannot
+   * do this on its own: with the policy at `high`, a re-hardcoded `high` and a
+   * derived one produce identical output.
+   */
+  test('takes the effort word from its argument, never a literal', () => {
+    expect(retargetRunsOnSentence('Review it. Runs on Opus 5 at high effort.', 'gpt-6-astra', 'medium')).toContain(
+      'Runs on gpt-6-astra with medium reasoning by default',
+    );
+  });
+
+  /**
+   * The role's description is a routing signal, so the effort it advertises has
+   * to be the effort the role actually runs at — and that is
+   * `[agents].default_subagent_reasoning_effort` in the container config, not a
+   * word typed into the sentence. This is what would have caught the r2 finding
+   * on #837 at the moment it mattered: the policy flip that makes the two
+   * disagree.
+   */
+  test('advertises the same effort the container config sets', () => {
+    const source = fs.readFileSync(path.join(REPO_ROOT, 'container/agents/worker-frontier.md'), 'utf8');
+    const advertised = /Runs on \S+ with (\S+) reasoning by default/.exec(
+      formatCodexAgentToml(parseClaudeAgentMd(source)!),
+    );
+    const configured = /^default_subagent_reasoning_effort = "([^"]+)"$/m.exec(buildContainerCodexConfig());
+    expect(
+      advertised,
+      'the Codex role description no longer carries a "Runs on … reasoning by default" clause',
+    ).not.toBeNull();
+    expect(configured, 'the container config no longer sets default_subagent_reasoning_effort').not.toBeNull();
+    expect(advertised![1]).toBe(configured![1]);
   });
 
   test('rewrites model names containing periods without stripping routing instructions', () => {
