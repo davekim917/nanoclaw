@@ -188,6 +188,27 @@ describe('429 handling', () => {
     expect(calls).toHaveLength(2);
   });
 
+  // anthropics/claude-code#30930 reports this endpoint answering 429 with
+  // `retry-after: 0`, and #31637 reports pollers that then loop on 429 forever.
+  // Zero is not permission to retry now. Mutation-checked, and the result is
+  // worth recording: it is the ORDINARY interval guard (lastAttemptAt, advanced
+  // before the await) that holds this, not the Math.max clamp on the backoff —
+  // removing the clamp leaves this test green. The clamp is belt; the floor is
+  // braces. The clamp's own bite is the Math.min case below.
+  it('does not retry immediately on retry-after: 0 — the floor is the ordinary interval', async () => {
+    const { fetchImpl, calls } = countingFetch(() => jsonResponse({}, 429, { 'retry-after': '0' }));
+    let clock = Date.parse('2026-09-15T05:00:00.000Z');
+    const now = () => clock;
+    const slots = [RING[0]!];
+    await refreshSlotUsageSurvey('global', slots, { fetchImpl, now });
+    clock += 1000;
+    await refreshSlotUsageSurvey('global', slots, { fetchImpl, now });
+    expect(calls).toHaveLength(1);
+    clock += SLOT_USAGE_SURVEY_MIN_INTERVAL_MS;
+    await refreshSlotUsageSurvey('global', slots, { fetchImpl, now });
+    expect(calls).toHaveLength(2);
+  });
+
   it('clamps an absurd retry-after so a slot cannot be parked forever', async () => {
     const { fetchImpl, calls } = countingFetch(() => jsonResponse({}, 429, { 'retry-after': String(365 * 24 * 3600) }));
     let clock = Date.parse('2026-09-15T05:00:00.000Z');
