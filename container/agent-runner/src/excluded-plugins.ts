@@ -49,12 +49,14 @@ let cached: ExcludedPlugins | null = null;
  * walker would register what they withheld. So a non-object, array or null root
  * throws like any other unreadable config.
  *
- * The host's own `readContainerConfig` is deliberately laxer — it logs and
- * falls back to an empty config for a malformed file, because it reads every
- * field and a group whose model is unreadable should still boot. That asymmetry
- * is the point: the laxer reader loses an exclusion silently, this one refuses.
- * They cannot disagree about an entry, only about whether a broken file is
- * survivable, and for this field it is not.
+ * The host's own `readContainerConfig` stays laxer — it logs and falls back to
+ * an empty config — because it reads every field and one bad field should not
+ * fail the read. It is not, however, the last word on a broken file: the host
+ * refuses to WRITE over a config it could not understand as an object
+ * (`writeContainerConfig`, `src/container-config.ts`), and since the spawn path
+ * writes identity fields on every spawn, a malformed file aborts the spawn
+ * there rather than reaching this reader at all. This check is what answers for
+ * a file that changed under the mount after that point.
  */
 export function parseExcludedPlugins(raw: string): ExcludedPlugins {
   const parsed: unknown = JSON.parse(raw);

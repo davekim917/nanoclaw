@@ -1311,8 +1311,8 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
  *
  * Refuses to overwrite an existing file the reader cannot understand as an
  * object. `readContainerConfig` is deliberately tolerant — it reads every field
- * and defaults a document it cannot understand, so a group whose model is
- * unreadable still boots — and every caller here is read-modify-write
+ * and defaults a document it cannot understand, so a READ never fails on one
+ * bad field — and every caller here is read-modify-write
  * (`updateContainerConfig`, and `ensureRuntimeFields`'s race-safe re-read on
  * the spawn path, `src/container-runner.ts`). Composed, those two turn a root
  * the reader could not understand into a materialized default written back over
@@ -1337,6 +1337,17 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
  * legitimately CREATES a config, `initContainerConfig`, returns before writing
  * when the file exists, so nothing about first-time setup changes. Repair is a
  * person editing the file, and the error message says so.
+ *
+ * OPERATIONAL CONSEQUENCE, stated plainly because it is a change in how a
+ * broken install behaves: a group whose `container.json` exists but is
+ * malformed no longer spawns at all. `ensureRuntimeFields` runs on every spawn
+ * and writes whenever the identity fields are missing, which they are for a
+ * file the reader had to default, so the refusal aborts that spawn. It used to
+ * silently repair the file into a config declaring no exclusions and carry on.
+ * Wedging one group until a person looks at it is the intended trade against
+ * dropping a deny policy nobody was told about, but it IS a trade: the earlier
+ * claim that a group with an unreadable config still boots is no longer true
+ * once the file exists.
  */
 export function writeContainerConfig(folder: string, config: ContainerConfig): void {
   validateMcpServers(config.mcpServers ?? {});
