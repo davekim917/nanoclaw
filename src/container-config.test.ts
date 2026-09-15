@@ -777,7 +777,7 @@ describe('excludePlugins', () => {
       'bootstrap/plugins/orchestrate/skills/deep',
       'bootstrap//orchestrate',
       'bootstrap/plugins/',
-      'bootstrap\\plugins',
+      'bootstrap/plug\\ins',
       '',
       42,
     ]) {
@@ -796,9 +796,29 @@ describe('excludePlugins', () => {
     // allowlist here would refuse a config that already worked and take the
     // group's whole spawn down with it — readContainerConfig throws on every
     // read. Only traversal and separator confusion are the guard's business.
-    const entries = ['foo+bar', 'c++-tools', '@internal', 'my plugin', 'ünïcode', 'bootstrap/plugins/a b+c'];
+    // A TOP-LEVEL entry is held to the shape rule alone. Backslash, newline
+    // and DEL are all legal bytes in a Linux directory name, so refusing them
+    // would be the same accepted-set regression -- and a top-level entry is only
+    // ever compared for Set membership against a readdirSync name, never
+    // interpolated into a mount, a path join, or any delimited format.
+    const entries = [
+      'foo+bar',
+      'c++-tools',
+      '@internal',
+      'my plugin',
+      'ünïcode',
+      'back\\slash',
+      'new\nline',
+      'del\u007Fbyte',
+      'bootstrap/plugins/a b+c',
+    ];
     writeGroupConfig('xp-odd-names', { excludePlugins: entries });
     expect(readContainerConfig('xp-odd-names').excludePlugins).toEqual(entries);
+    // ... but `.` and `..` are refused at every depth, top-level included.
+    for (const bad of ['.', '..']) {
+      writeGroupConfig('xp-dots', { excludePlugins: [bad] });
+      expect(() => readContainerConfig('xp-dots')).toThrow(/excludePlugins entry/);
+    }
   });
 
   it('refuses a colon in a sub-path but keeps accepting one in a top-level name', () => {
@@ -817,10 +837,10 @@ describe('excludePlugins', () => {
     expect(readContainerConfig('xp-colon-toplevel').excludePlugins).toEqual(['foo:bar']);
   });
 
-  it('still refuses a control character in a segment', () => {
+  it('still refuses a control character in a sub-path segment', () => {
     // Escape sequences, never literal bytes: a literal NUL makes grep and rg
     // treat the file as binary and match nothing over it (docs/review-notes/818.md).
-    for (const bad of ['foo\u0000bar', 'foo\nbar', 'bootstrap/plugins/o\u007Frchestrate', 'foo\u009Fbar']) {
+    for (const bad of ['r/foo\u0000bar', 'r/foo\nbar', 'bootstrap/plugins/o\u007Frchestrate', 'r/foo\u009Fbar']) {
       writeGroupConfig('xp-ctrl', { excludePlugins: [bad] });
       expect(() => readContainerConfig('xp-ctrl')).toThrow(/excludePlugins entry/);
     }

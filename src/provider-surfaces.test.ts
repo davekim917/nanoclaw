@@ -1215,6 +1215,48 @@ describe('buildMounts agent surfaces', async () => {
       expect(
         nested.map((mount) => mount.containerPath).filter((p) => p.startsWith('/workspace/plugins/bootstrap/')),
       ).toEqual(['/workspace/plugins/bootstrap/plugins']);
+
+      // The mask source must be PROVEN empty, not merely created. Its emptiness
+      // IS the exclusion: content here is delivered at exactly the path the
+      // operator excluded, for every mask in the fleet, and no walker
+      // downstream can tell it from the real sub-plugin. So a contaminated
+      // source refuses the spawn rather than mounting.
+      const contaminated = path.join(EMPTY_PLUGIN_MASK_DIR, '.claude-plugin');
+      fs.mkdirSync(contaminated, { recursive: true });
+      fs.writeFileSync(path.join(contaminated, 'plugin.json'), '{"name":"planted"}');
+      try {
+        await expect(
+          buildMounts(
+            ag,
+            session('s-subplugin-dirty', ag.id),
+            { ...containerConfig(), excludePlugins: ['bootstrap/plugins/orchestrate'] },
+            'claude',
+            {},
+          ),
+        ).rejects.toThrow(/is not empty/);
+      } finally {
+        fs.rmSync(contaminated, { recursive: true, force: true });
+      }
+
+      // A symlink at that path is refused too — lstat, never stat, so the mask
+      // source cannot be redirected at somewhere that has content.
+      fs.rmSync(EMPTY_PLUGIN_MASK_DIR, { recursive: true, force: true });
+      const elsewhere = path.join(TEST_ROOT, 'mask-symlink-target');
+      fs.mkdirSync(elsewhere, { recursive: true });
+      fs.symlinkSync(elsewhere, EMPTY_PLUGIN_MASK_DIR);
+      try {
+        await expect(
+          buildMounts(
+            ag,
+            session('s-subplugin-symlink', ag.id),
+            { ...containerConfig(), excludePlugins: ['bootstrap/plugins/orchestrate'] },
+            'claude',
+            {},
+          ),
+        ).rejects.toThrow(/is not a directory \(symlink\)/);
+      } finally {
+        fs.unlinkSync(EMPTY_PLUGIN_MASK_DIR);
+      }
     } finally {
       homedirSpy.mockRestore();
     }

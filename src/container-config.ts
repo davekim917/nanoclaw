@@ -669,7 +669,21 @@ export function validateAutoCompactWindow(value: unknown): number | undefined {
  * any C0/C1 control character (`/` cannot appear — segments are the result of
  * splitting on it). `src/plugin-scopes.ts:44`'s narrower `PLUGIN_NAME_RE`
  * governs an operator-authored policy file and is left alone.
+ *
+ * This applies to SUB-PATH entries only. Backslash, newline and DEL are all
+ * legal bytes in a Linux directory name, so a top-level entry carrying one is
+ * still a real plugin the enabler would write here, and a top-level entry is
+ * only ever compared for Set membership against a `readdirSync` name — it never
+ * reaches a mount argument, a path join, or any delimited format. Refusing it
+ * would be the same accepted-set regression this rule exists to undo, so a
+ * top-level entry is held to `EVERY_SEGMENT_RE` alone. The distinction is the
+ * one the colon rule below already draws; it belongs to every character rule,
+ * not just that one.
  */
+/** Every entry, top-level or sub-path: a real name, never empty, `.` or `..`. */
+const EVERY_SEGMENT_RE = /^(?!\.\.?$).+$/su;
+
+/** Additionally, for a sub-path segment: no backslash and no control character. */
 const PLUGIN_PATH_SEGMENT_RE = /^(?!\.\.?$)[^\\\p{Cc}]+$/u;
 
 /**
@@ -707,8 +721,9 @@ export function validateExcludePlugins(value: unknown): string[] | undefined {
     if (typeof entry !== 'string' || entry === '') fail('must be a non-empty string');
     const name = entry as string;
     if (name.startsWith('/')) fail('must be relative to ~/plugins, not an absolute path');
-    if (name.includes('\\')) fail('must use "/" separators');
     const segments = name.split('/');
+    const isSubPath = segments.length > 1;
+    if (isSubPath && name.includes('\\')) fail('must use "/" separators');
     // A sub-path, and only a sub-path, is interpolated into a mount: the mask's
     // container path is `/workspace/plugins/<entry>` and `readonlyMountArgs`
     // serializes it as `${hostPath}:${containerPath}:ro`
@@ -718,16 +733,23 @@ export function validateExcludePlugins(value: unknown): string[] | undefined {
     // (`src/container-runner.ts`, plugin mounts) and never reaches a mount
     // argument, so it keeps accepting every directory name it accepted before —
     // which is the point of the rule above.
-    if (segments.length > 1 && name.includes(':')) {
+    if (isSubPath && name.includes(':')) {
       fail('must not contain ":" — a sub-plugin path is interpolated into a "-v host:container:ro" mount argument');
     }
     if (segments.length > MAX_EXCLUDE_PLUGIN_DEPTH) {
       fail(`is deeper than ${MAX_EXCLUDE_PLUGIN_DEPTH} path segments, which no sub-plugin walker descends to`);
     }
+    // A top-level entry is held to the shape rule alone — it is compared for
+    // Set membership against a `readdirSync` name and never interpolated
+    // anywhere, and backslash, newline and DEL are all legal bytes in a real
+    // directory name the enabler would write here.
+    const segmentRe = isSubPath ? PLUGIN_PATH_SEGMENT_RE : EVERY_SEGMENT_RE;
     for (const segment of segments) {
-      if (!PLUGIN_PATH_SEGMENT_RE.test(segment)) {
+      if (!segmentRe.test(segment)) {
         fail(
-          'must be <plugin> or <plugin>/<sub>[/<sub2>] with no empty, "." or ".." segments and no control characters',
+          isSubPath
+            ? 'must be <plugin>/<sub>[/<sub2>] with no empty, "." or ".." segments and no control characters'
+            : 'must be a plugin directory name, not "", "." or ".."',
         );
       }
     }

@@ -4413,8 +4413,43 @@ function logSpawnStage(stage: string, startedAt: number): void {
  */
 export const EMPTY_PLUGIN_MASK_DIR = path.join(DATA_DIR, 'empty-plugin-mask');
 
+/**
+ * The mask source, proven empty on every use.
+ *
+ * The emptiness is the whole mechanism: a sub-plugin is "excluded" only because
+ * what gets bound over it has no manifest for any walker to find. If this
+ * directory ever holds content, every mask in the fleet stops hiding a
+ * sub-plugin and starts DELIVERING that content at exactly the path the
+ * operator declared excluded — an exclusion inverted into a delivery, on a
+ * control whose documented purpose includes withholding a CLI that carries the
+ * host's OAuth session. One directory backs every mask, so one contaminated
+ * inode is a fleet-wide failure, and nothing downstream can notice: a walker
+ * finding a manifest here cannot tell it apart from the real sub-plugin.
+ *
+ * `mkdirSync(recursive: true)` alone proves none of that — it succeeds on an
+ * existing directory whatever it contains, and on a symlink pointing somewhere
+ * else entirely. So the invariant is asserted here, in the primitive that
+ * supplies the source, rather than at the call site: `lstat` (never `stat`, so
+ * a symlink is refused rather than followed) and a directory that reads empty.
+ * A spawn that cannot prove it is refused, because a mask that might not mask
+ * is worse than no spawn.
+ */
 function emptyPluginMaskDir(): string {
   fs.mkdirSync(EMPTY_PLUGIN_MASK_DIR, { recursive: true });
+  const stat = fs.lstatSync(EMPTY_PLUGIN_MASK_DIR);
+  if (!stat.isDirectory()) {
+    throw new Error(
+      `plugin mask source ${EMPTY_PLUGIN_MASK_DIR} is not a directory (${stat.isSymbolicLink() ? 'symlink' : 'other'}); ` +
+        'refusing to mount it over an excluded sub-plugin',
+    );
+  }
+  const contents = fs.readdirSync(EMPTY_PLUGIN_MASK_DIR);
+  if (contents.length > 0) {
+    throw new Error(
+      `plugin mask source ${EMPTY_PLUGIN_MASK_DIR} is not empty (${contents.length} entr${contents.length === 1 ? 'y' : 'ies'}); ` +
+        'mounting it would deliver that content at the path excludePlugins excludes. Empty or remove it.',
+    );
+  }
   return EMPTY_PLUGIN_MASK_DIR;
 }
 
