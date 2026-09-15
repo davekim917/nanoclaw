@@ -20,18 +20,21 @@ import {
 interface RecordedRequest {
   id: number;
   method: string;
-  params: Record<string, unknown>;
+  params?: Record<string, unknown>;
 }
 
 function fakeAppServer(
   respond: (request: RecordedRequest) => { result?: unknown; error?: { code: number; message: string } } | null,
-): { server: AppServer; requests: RecordedRequest[] } {
+): { server: AppServer; requests: RecordedRequest[]; lines: string[] } {
   const requests: RecordedRequest[] = [];
+  /** Raw JSON-RPC text as written to the server's stdin — the actual wire shape. */
+  const lines: string[] = [];
   const pending = new Map<number, { resolve: (value: never) => void; reject: (error: Error) => void }>();
   const server = {
     process: {
       stdin: {
         write(line: string) {
+          lines.push(line);
           const request = JSON.parse(line) as RecordedRequest;
           requests.push(request);
           const response = respond(request);
@@ -54,7 +57,7 @@ function fakeAppServer(
     notificationHandlers: [],
     serverRequestHandlers: [],
   } as unknown as AppServer;
-  return { server, requests };
+  return { server, requests, lines };
 }
 
 describe('Codex app-server liveness RPCs', () => {
@@ -154,10 +157,30 @@ describe('Codex app-server liveness RPCs', () => {
       accountId: 'acct-1',
     });
     expect(requests).toHaveLength(1);
-    expect(requests[0]).toMatchObject({
-      method: 'account/rateLimits/read',
-      params: { excludeResetCreditDetails: true },
-    });
+    expect(requests[0]).toMatchObject({ method: 'account/rateLimits/read' });
+  });
+
+  // The container's pinned codex (ARG CODEX_VERSION=0.153.4, container/Dockerfile:41)
+  // deserializes this method's params as unit and rejects a params map carrying
+  // fields with `Invalid request: invalid type: map, expected unit`, before any
+  // account lookup — which is what production logged on every bind-time read.
+  // The host's newer 0.154.0 accepts such a map, so the skew is invisible from
+  // the host; assert the WIRE TEXT here rather than a shape mirrored from the
+  // code, so restoring `{ excludeResetCreditDetails: true }` fails this test.
+  it('sends the rate-limit read with no params key at all, the one shape both pinned and host codex accept', async () => {
+    const { server, requests, lines } = fakeAppServer(() => ({
+      result: { rateLimits: { primary: { usedPercent: 3, windowDurationMins: 300 } } },
+    }));
+    await readCodexAccountRateLimits(server, 50);
+
+    expect(lines).toHaveLength(1);
+    const raw = lines[0]!;
+    // Wire text: no `"params"` member, in any form — not a map, not `null`.
+    expect(raw).not.toContain('"params"');
+    expect(raw).not.toContain('excludeResetCreditDetails');
+    expect(JSON.parse(raw)).toEqual({ id: expect.any(Number), method: 'account/rateLimits/read' });
+    expect(Object.keys(JSON.parse(raw)).sort()).toEqual(['id', 'method']);
+    expect('params' in requests[0]!).toBe(false);
   });
 
   it('surfaces a rate-limit read the server rejects or answers malformed, so the caller logs and skips the sample', async () => {

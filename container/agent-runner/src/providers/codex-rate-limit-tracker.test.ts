@@ -342,3 +342,75 @@ describe('CodexRateLimitTracker.refreshIfStale', () => {
     expect(h.reads).toBe(0);
   });
 });
+
+/**
+ * Every other test in this file injects `read`, so none of them ever sees the
+ * JSON-RPC request the real helper writes — which is how a params shape the
+ * container's pinned codex rejects reached production and silently cost every
+ * `usage_pull` row for a full deploy (the push path kept writing, so the table
+ * looked alive). This suite drives the DEFAULT `read` against a stdin-recording
+ * fake server so the wire shape and the sample it feeds are pinned together.
+ */
+describe('CodexRateLimitTracker.bind over the real account/rateLimits/read helper', () => {
+  function recordingServer(result: unknown): { server: AppServer; lines: string[] } {
+    const lines: string[] = [];
+    const pending = new Map<number, { resolve: (value: never) => void; reject: (error: Error) => void }>();
+    const server = {
+      process: {
+        stdin: {
+          write(line: string) {
+            lines.push(line);
+            const { id } = JSON.parse(line) as { id: number };
+            queueMicrotask(() => {
+              const handler = pending.get(id);
+              pending.delete(id);
+              handler?.resolve({ id, result } as never);
+            });
+            return true;
+          },
+        },
+      },
+      pending,
+      notificationHandlers: [],
+      serverRequestHandlers: [],
+    } as unknown as AppServer;
+    return { server, lines };
+  }
+
+  it('emits no params for the read and records the usage_pull sample it feeds', async () => {
+    const { server, lines } = recordingServer({
+      rateLimits: {
+        primary: { usedPercent: 10, windowDurationMins: 300 },
+        secondary: { usedPercent: 20, windowDurationMins: 10080, resetsAt: RESET_S },
+        planType: 'pro',
+      },
+      accountId: 'acct-read',
+    });
+    const recorded: RateLimitSample[][] = [];
+    const tracker = new CodexRateLimitTracker({
+      // `read` deliberately NOT injected: this is the production helper.
+      readAuthJson: () => JSON.stringify({ tokens: { account_id: 'acct-auth' } }),
+      record: (rows) => recorded.push(rows),
+      log: () => {},
+      now: () => 1_000_000,
+      readTimeoutMs: 1000,
+    });
+
+    await tracker.bind(server, '/home/node/.codex');
+
+    // Wire shape the pinned container codex (0.153.4) accepts: no `params`
+    // member at all. A map here is refused as `invalid type: map, expected unit`
+    // before any account lookup.
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!).not.toContain('"params"');
+    expect(JSON.parse(lines[0]!)).toEqual({ id: expect.any(Number), method: 'account/rateLimits/read' });
+
+    // …and the read therefore resolves, so the pull rows the production symptom
+    // was missing entirely actually get written.
+    const rows = recorded.flat();
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((r) => r.source === 'usage_pull')).toBe(true);
+    expect(rows.every((r) => r.credentialSet === 'codex:.codex')).toBe(true);
+    expect(tracker.identity.account).toBe('acct-read');
+  });
+});

@@ -107,7 +107,8 @@ let nextRequestId = 1;
 interface JsonRpcRequest {
   id: number;
   method: string;
-  params: Record<string, unknown>;
+  /** Absent when the method takes no params — see `makeRequest`. */
+  params?: Record<string, unknown>;
 }
 
 export interface JsonRpcResponse {
@@ -129,8 +130,15 @@ export interface JsonRpcServerRequest {
 
 type JsonRpcMessage = JsonRpcResponse | JsonRpcNotification | JsonRpcServerRequest;
 
-function makeRequest(method: string, params: Record<string, unknown>): JsonRpcRequest {
-  return { id: nextRequestId++, method, params };
+/**
+ * `params` omitted (not `null`, not `{}`) when the caller passes none: the key
+ * is left off the object so `JSON.stringify` writes no `"params"` at all. A
+ * method whose params the server deserializes as unit accepts that shape on
+ * every codex version we run (see `readCodexAccountRateLimits`).
+ */
+function makeRequest(method: string, params?: Record<string, unknown>): JsonRpcRequest {
+  const id = nextRequestId++;
+  return params === undefined ? { id, method } : { id, method, params };
 }
 
 function isResponse(msg: JsonRpcMessage): msg is JsonRpcResponse {
@@ -218,7 +226,7 @@ export function spawnCodexAppServer(configOverrides: string[] = []): AppServer {
 export function sendCodexRequest(
   server: AppServer,
   method: string,
-  params: Record<string, unknown>,
+  params: Record<string, unknown> | undefined,
   timeoutMs = 60_000,
 ): Promise<JsonRpcResponse> {
   const req = makeRequest(method, params);
@@ -469,21 +477,40 @@ export async function probeCodexThreadHealth(
 /**
  * Pull the account's rate-limit snapshot — the Codex counterpart of Claude's
  * `/usage` control request (providers/claude.ts `planUsagePuller`).
- * `excludeResetCreditDetails: true` is the schema's own flag for background
- * usage polls: it skips a second reset-credit lookup we do not read. Throws on
- * an RPC error or a malformed result; the caller treats a failed read as NOT
- * SAMPLED (no row, no park) and logs it — telemetry must never fail a turn.
+ *
+ * **Sent with NO `params` at all**, and that is version-forced. This runner
+ * runs against the codex pinned into the image — `ARG CODEX_VERSION=0.153.4`,
+ * `container/Dockerfile:41` — where `account/rateLimits/read` deserializes its
+ * params as unit, so a params map carrying fields is refused at the JSON-RPC
+ * boundary before any account lookup:
+ *   `Invalid request: invalid type: map, expected unit`
+ * That is exactly what production logged for every bind-time read after the
+ * original flag shipped. The flag was written against the HOST's newer
+ * codex-cli 0.154.0, whose generated schema does define
+ * `GetAccountRateLimitsParams` (with `excludeResetCreditDetails`) and marks the
+ * request's `params` as optional — so it accepted the map, and the skew was
+ * invisible from the host. Omitting `params` is valid on both: unit on
+ * 0.153.4, absent-and-optional on 0.154.0 (verified by issuing the real RPC
+ * against both binaries).
+ *
+ * `excludeResetCreditDetails: true` only skipped a second reset-credit lookup
+ * we never read, so nothing is lost by dropping it. Regaining it requires
+ * bumping the container's `CODEX_VERSION` past 0.153.4 first — a supply-chain
+ * decision, not a thing to re-add here.
+ *
+ * Throws on an RPC error or a malformed result; the caller treats a failed read
+ * as NOT SAMPLED (no row, no park) and logs it — telemetry must never fail a
+ * turn. That is why this failed silently for a full deploy:
+ * `CodexRateLimitTracker.read()` writes its `usage_pull` sample inside the same
+ * `try` (`codex-rate-limit-tracker.ts:232`, caught at `:235`), so a throw here
+ * costs every pull row while the push path (`account/rateLimits/updated`,
+ * `onNotification` at `:261`) keeps writing and the sample table looks alive.
  */
 export async function readCodexAccountRateLimits(
   server: AppServer,
   timeoutMs: number,
 ): Promise<CodexRateLimitsReadResponse> {
-  const resp = await sendCodexRequest(
-    server,
-    CODEX_RATE_LIMITS_READ_METHOD,
-    { excludeResetCreditDetails: true },
-    timeoutMs,
-  );
+  const resp = await sendCodexRequest(server, CODEX_RATE_LIMITS_READ_METHOD, undefined, timeoutMs);
   if (resp.error) throw new Error(`${CODEX_RATE_LIMITS_READ_METHOD} failed: ${resp.error.message}`);
   const parsed = parseCodexRateLimitsReadResponse(resp.result);
   if (!parsed) throw new Error(`${CODEX_RATE_LIMITS_READ_METHOD} response missing rateLimits`);
