@@ -121,6 +121,48 @@ describe('background_tasks_changed → hasBackgroundWork', () => {
     expect(bg[1].i).toBe(events.length - 1);
   });
 
+  it('drops the idle evidence when a task the idle did not cover joins the set', async () => {
+    // A bash is live at idle (the CLI does not gate on it). Then a turn adds
+    // a subagent: the CLI withholds idle again, so the drain that empties the
+    // set must NOT release — the subagent's completion turn is still coming.
+    const bashAndAgent = {
+      type: 'system',
+      subtype: 'background_tasks_changed',
+      tasks: [
+        { task_id: 'bash-1', task_type: 'local_bash', description: 'pnpm test' },
+        { task_id: 'agent-1', task_type: 'local_agent', description: 'worker' },
+      ],
+    };
+    const agentOnly = {
+      type: 'system',
+      subtype: 'background_tasks_changed',
+      tasks: [{ task_id: 'agent-1', task_type: 'local_agent', description: 'worker' }],
+    };
+    sdkMessages.push(
+      { type: 'system', subtype: 'init', session_id: 'sess' },
+      RUNNING,
+      bashLive,
+      RESULT,
+      IDLE,
+      RUNNING,
+      bashAndAgent,
+      RESULT,
+      agentOnly,
+      empty,
+      IDLE,
+    );
+
+    const { events, sampled } = await drain();
+    const bg = events.map((e, i) => ({ e, i })).filter(({ e }) => e.type === 'background_work');
+    // Reported at the first idle (bash live) and at the final idle only —
+    // nothing at the drain.
+    expect(bg.map(({ e }) => e.live)).toEqual([1, 0]);
+    expect(bg[1].i).toBe(events.length - 1);
+    // Held all the way through the drain; released at the final idle.
+    expect(sampled.slice(bg[0].i, bg[1].i).every((v) => v === true)).toBe(true);
+    expect(sampled[bg[1].i]).toBe(false);
+  });
+
   it('does not release at a drain the CLI has not yet gone idle over', async () => {
     // The task ends mid-turn, before any idle: still one release, at idle.
     sdkMessages.push({ type: 'system', subtype: 'init', session_id: 'sess' }, RUNNING, bashLive, empty, RESULT, IDLE);

@@ -2591,8 +2591,15 @@ export class ClaudeProvider implements AgentProvider {
     // types is the same protection they had before this hold existed (none
     // past their completion; a completion-started follow-up turn's `init`
     // re-raises the level itself).
+    // `idleSeenWithHold` is evidence about the tasks that were live at that
+    // idle, not about the query: a gating task (a subagent) joining the set
+    // afterwards withholds idle again, and releasing at ITS drain would
+    // reopen the drain→follow-up gap. `idleCoveredTasks` is the set the idle
+    // vouched for; any membership change that adds an id outside it drops
+    // the evidence, and the release waits for the next idle.
     let backgroundHold = false;
     let idleSeenWithHold = false;
+    let idleCoveredTasks = new Set<string>();
 
     // Per-turn input takes precedence over sticky config (A3).
     // Normalize bare opus → [1m] so the CLI's auto-compact window stays at 1M
@@ -3086,6 +3093,14 @@ export class ClaudeProvider implements AgentProvider {
             if (t && typeof t.task_id === 'string' && t.ambient !== true) liveBackgroundTasks.add(t.task_id);
           }
           if (liveBackgroundTasks.size > 0) backgroundHold = true;
+          if (idleSeenWithHold) {
+            for (const id of liveBackgroundTasks) {
+              if (!idleCoveredTasks.has(id)) {
+                idleSeenWithHold = false;
+                break;
+              }
+            }
+          }
           log(`Background tasks: ${liveBackgroundTasks.size} live${backgroundHold ? ' (hold)' : ''}`);
           if (liveBackgroundTasks.size === 0 && idleSeenWithHold) {
             // The CLI already went idle over these tasks: no idle will follow
@@ -3112,7 +3127,10 @@ export class ClaudeProvider implements AgentProvider {
             // the CLI does not gate idle on, at the drain that follows an
             // idle like this one (idleSeenWithHold).
             if (liveBackgroundTasks.size === 0) backgroundHold = false;
-            else if (backgroundHold) idleSeenWithHold = true;
+            else if (backgroundHold) {
+              idleSeenWithHold = true;
+              idleCoveredTasks = new Set(liveBackgroundTasks);
+            }
             yield { type: 'background_work', live: liveBackgroundTasks.size };
           }
         } else if (message.type === 'assistant') {
