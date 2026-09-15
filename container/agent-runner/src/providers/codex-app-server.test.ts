@@ -160,13 +160,15 @@ describe('Codex app-server liveness RPCs', () => {
     expect(requests[0]).toMatchObject({ method: 'account/rateLimits/read' });
   });
 
-  // The container's pinned codex (ARG CODEX_VERSION=0.153.4, container/Dockerfile:41)
-  // deserializes this method's params as unit and rejects a params map carrying
-  // fields with `Invalid request: invalid type: map, expected unit`, before any
-  // account lookup — which is what production logged on every bind-time read.
-  // The host's newer 0.154.0 accepts such a map, so the skew is invisible from
-  // the host; assert the WIRE TEXT here rather than a shape mirrored from the
-  // code, so restoring `{ excludeResetCreditDetails: true }` fails this test.
+  // codex 0.153.4 deserializes this method's params as unit and rejects a
+  // params map carrying fields with `Invalid request: invalid type: map,
+  // expected unit`, before any account lookup — which is what production logged
+  // on every bind-time read while the container pinned it (#817). The container
+  // now pins 0.154.0 (ARG CODEX_VERSION, container/Dockerfile:41), which would
+  // accept the map; the no-params shape is retained deliberately because it is
+  // the one BOTH versions accept, and the field it dropped was never read.
+  // Assert the WIRE TEXT here rather than a shape mirrored from the code, so
+  // restoring `{ excludeResetCreditDetails: true }` fails this test.
   it('sends the rate-limit read with no params key at all, the one shape both pinned and host codex accept', async () => {
     const { server, requests, lines } = fakeAppServer(() => ({
       result: { rateLimits: { primary: { usedPercent: 3, windowDurationMins: 300 } } },

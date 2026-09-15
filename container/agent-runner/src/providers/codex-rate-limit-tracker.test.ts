@@ -406,9 +406,10 @@ describe('CodexRateLimitTracker.bind over the real account/rateLimits/read helpe
 
     await tracker.bind(server, '/home/node/.codex');
 
-    // Wire shape the pinned container codex (0.153.4) accepts: no `params`
-    // member at all. A map here is refused as `invalid type: map, expected unit`
-    // before any account lookup.
+    // Wire shape EVERY codex accepts: no `params` member at all. On 0.153.4 a
+    // map here is refused as `invalid type: map, expected unit` before any
+    // account lookup; on the container's current 0.154.0 pin it would be
+    // accepted, and the shape is kept version-neutral on purpose (#817).
     expect(lines).toHaveLength(1);
     expect(lines[0]!).not.toContain('"params"');
     expect(JSON.parse(lines[0]!)).toEqual({ id: expect.any(Number), method: 'account/rateLimits/read' });
