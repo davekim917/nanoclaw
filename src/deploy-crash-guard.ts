@@ -73,10 +73,19 @@ type RestartedUnits = { kind: 'absent' } | { kind: 'units'; units: string[] } | 
  * plain unit ids is never quietly downgraded to "nothing to restart" — that is
  * the shape that let a half-done rollback read as a complete one. It is
  * reported as malformed so the operator sees the rollback was partial.
+ *
+ * Only a MISSING KEY is `absent`. JSON cannot express `undefined`, so a parsed
+ * manifest yields `undefined` exactly when the writer omitted the key — which
+ * is the legacy signal. An explicit `null` is a manifest that says something
+ * and says it wrong, and reading it as legacy-absence would collapse
+ * present-but-malformed back into "nothing to do", which is the whole point of
+ * having three answers rather than two.
  */
 export function readRestartedUnits(raw: unknown): RestartedUnits {
-  if (raw === undefined || raw === null) return { kind: 'absent' };
-  if (!Array.isArray(raw)) return { kind: 'malformed', detail: `restartedUnits is ${typeof raw}, not a list` };
+  if (raw === undefined) return { kind: 'absent' };
+  if (!Array.isArray(raw)) {
+    return { kind: 'malformed', detail: `restartedUnits is ${raw === null ? 'null' : typeof raw}, not a list` };
+  }
   const bad = raw.filter((u) => typeof u !== 'string' || !UNIT_ID.test(u));
   if (bad.length > 0) {
     return { kind: 'malformed', detail: `restartedUnits holds ${bad.length} entr(y/ies) that is not a unit id` };

@@ -325,7 +325,18 @@ describe('performRollback puts the deploy’s restarted services back', () => {
   });
 
   it('refuses a malformed list loudly rather than reading it as nothing to do', () => {
-    for (const bad of ['nanoclaw-codex-sync.service', ['nanoclaw-codex-sync'], [42], ['a.service; rm -rf /']]) {
+    // `null` is in here deliberately (r2 MEDIUM): a manifest carrying an
+    // explicit null is present-but-wrong, not a manifest from before the field
+    // existed, and reading it as the latter reset the checkout, restarted
+    // nothing, and reported the rollback as complete.
+    for (const bad of [
+      'nanoclaw-codex-sync.service',
+      ['nanoclaw-codex-sync'],
+      [42],
+      ['a.service; rm -rf /'],
+      null,
+      { 0: 'a.service' },
+    ]) {
       fs.rmSync(path.join(root, 'logs'), { recursive: true, force: true });
       const calls: string[][] = [];
       rollback(manifestWith(bad), calls);
@@ -376,8 +387,13 @@ describe('performRollback puts the deploy’s restarted services back', () => {
 
 describe('readRestartedUnits', () => {
   it('separates absent, empty and malformed', () => {
+    // Only a MISSING KEY is legacy-absence. JSON cannot express `undefined`, so
+    // `undefined` here means the writer omitted the key; an explicit null is a
+    // manifest that says something and says it wrong (r2 MEDIUM — reading null
+    // as absent collapsed present-but-malformed into "nothing to do").
     expect(readRestartedUnits(undefined)).toEqual({ kind: 'absent' });
-    expect(readRestartedUnits(null)).toEqual({ kind: 'absent' });
+    expect(readRestartedUnits(null)).toMatchObject({ kind: 'malformed' });
+    expect(readRestartedUnits(null)).toMatchObject({ detail: expect.stringContaining('null') });
     expect(readRestartedUnits([])).toEqual({ kind: 'units', units: [] });
     expect(readRestartedUnits(['a.service', 'nanoclaw-unit-alert@.service'])).toEqual({
       kind: 'units',

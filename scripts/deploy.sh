@@ -160,7 +160,7 @@ restore_before_restart() {
   if [ -n "$IMAGE_SAVED_BASE" ]; then
     docker tag "${IMAGE_SAVED_BASE}:pre-deploy" "${IMAGE_SAVED_BASE}:latest" >> "$LOG" 2>&1 || true
   fi
-  rm -f data/deploy-rollback.json data/deploy-boot-attempts.json
+  rm -f data/deploy-rollback.json data/deploy-rollback.json.tmp data/deploy-boot-attempts.json
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Pre-restart rollback restored ${restored:-nothing}" >> "$LOG"
   exit "$exit_code"
 }
@@ -500,12 +500,40 @@ done <<< "$SIBLING_UNITS"
 # - `restartedUnits` is emitted whenever the guard is armed, `[]` included: an
 #   ABSENT field means a deploy that predates this and restarted nothing, and
 #   the guard must be able to tell that apart from "this deploy found none".
-UNITS_JSON=$(printf '%s\n' $RESTART_ATTEMPTED_UNITS | awk 'NF { printf "%s\"%s\"", (n++ ? "," : ""), $0 }')
+#
+# The manifest is JSON, so a JSON ENCODER writes it — not a `printf` template.
+# systemd escapes any byte a unit id may not carry literally as `\xNN`, so a
+# legitimately-named unit puts a BACKSLASH in the list, and a template emitted
+# that raw: valid-looking output that is not valid JSON. The write succeeds, the
+# restart hands off, and two processes later readJson answers null, evaluateBoot
+# reads null as `no-op`, and the crashing deployment silently loses automatic
+# rollback for the host AND every sibling. Values reach the encoder through the
+# ENVIRONMENT, never argv, so nothing is interpolated into a command line
+# either; see scripts/write-deploy-rollback-manifest.mjs.
+#
+# Written to a temp file and renamed, because a half-written manifest is
+# unparsable in exactly the same way, and refused loudly if it cannot be
+# produced: this is still before the handoff, where the trap can restore.
 if [ -z "$MIGRATION_CHANGES" ]; then
   mkdir -p data
-  printf '{"commit":"%s","imageBase":"%s","timestamp":"%s","node":"%s","restartedUnits":[%s]}\n' \
-    "$PRE_COMMIT" "${IMAGE_SAVED_BASE}" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(node --version 2>/dev/null)" \
-    "$UNITS_JSON" > data/deploy-rollback.json
+  # shellcheck disable=SC2086
+  if ! NANOCLAW_ROLLBACK_COMMIT="$PRE_COMMIT" \
+    NANOCLAW_ROLLBACK_IMAGE_BASE="$IMAGE_SAVED_BASE" \
+    NANOCLAW_ROLLBACK_TIMESTAMP="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    NANOCLAW_ROLLBACK_NODE="$(node --version 2>/dev/null)" \
+    NANOCLAW_ROLLBACK_UNITS="$(printf '%s\n' $RESTART_ATTEMPTED_UNITS)" \
+    node scripts/write-deploy-rollback-manifest.mjs > data/deploy-rollback.json.tmp 2>> "$LOG"; then
+    rm -f data/deploy-rollback.json.tmp
+    write_status "failed" "crash guard manifest" \
+      "could not write the rollback manifest — restart refused rather than deploy with no rollback point"
+    exit 1
+  fi
+  if ! mv data/deploy-rollback.json.tmp data/deploy-rollback.json; then
+    rm -f data/deploy-rollback.json.tmp
+    write_status "failed" "crash guard manifest" \
+      "could not install the rollback manifest — restart refused rather than deploy with no rollback point"
+    exit 1
+  fi
 else
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Crash guard NOT armed: deploy ships migrations ($(echo "$MIGRATION_CHANGES" | head -3 | tr '\n' ' '))" >> "$LOG"
   rm -f data/deploy-rollback.json

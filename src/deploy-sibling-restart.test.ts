@@ -178,7 +178,8 @@ function tailProbe(): string {
     `REPO_ROOT="${harness.repoRoot}"`,
     `STATUS_FILE="${path.join(harness.dir, 'status.json')}"`,
     `LOG="${path.join(harness.dir, 'deploy.log')}"`,
-    'PRE_COMMIT="0000000000000000000000000000000000000000"',
+    // Overridable so a test can drive the manifest encoder's refusal path.
+    'PRE_COMMIT="${PROBE_PRE_COMMIT:-0000000000000000000000000000000000000000}"',
     'IMAGE_SAVED_BASE=""',
     'MIGRATION_CHANGES=""',
     'RESTART_ATTEMPTED_UNITS=""',
@@ -221,6 +222,11 @@ beforeEach(() => {
     callsFile: path.join(dir, 'calls'),
     repoRoot: '/srv/checkout',
   };
+  // The slice runs `node scripts/write-deploy-rollback-manifest.mjs` by its
+  // relative path, the way deploy.sh does from the repo root, while `data/` and
+  // the logs have to land in the sandbox. Link the real scripts/ in rather than
+  // copying a stand-in — a fake encoder here would test nothing.
+  fs.symlinkSync(path.join(root, 'scripts'), path.join(dir, 'scripts'), 'dir');
   writeFakes(bin, harness.unitsFile, harness.callsFile);
   writeUnits(THIS_HOST);
 });
@@ -303,12 +309,43 @@ describe('deploy records what it restarted for the crash guard', () => {
     expect(manifest()?.restartedUnits).toEqual([]);
   });
 
+  it('survives a systemd-escaped unit id end to end (r2 [high] regression)', () => {
+    // systemd escapes any byte a unit id may not carry literally as `\xNN`, so
+    // a legitimate unit puts a BACKSLASH in the list. The old printf template
+    // wrote it raw, the manifest stopped being JSON, and the guard's readJson
+    // answered null on the next boot — losing automatic rollback for the host
+    // and every sibling, silently, on a crashing deploy. The encoder's own
+    // cases (quote, tab) are in scripts/write-deploy-rollback-manifest.test.ts;
+    // this one proves the value reaches it intact through discovery, the
+    // restart loop and the environment.
+    const escaped = 'nanoclaw-worker@blue\\x2dgreen.service';
+    writeUnits([...THIS_HOST, { id: escaped, type: 'simple', workingDirectory: '/srv/checkout', active: true }]);
+    runProbe(tailProbe(), { KILL_ON: 'nanoclaw-v2' });
+    // Parses at all — this is the assertion the defect broke.
+    expect(manifest()?.restartedUnits).toEqual(['nanoclaw-codex-sync.service', escaped]);
+    expect(restartCalls()).toEqual(['nanoclaw-codex-sync.service', escaped, 'nanoclaw-v2']);
+  });
+
   it('arms no rollback point at all when a sibling restart failed', () => {
     // The manifest is written after the loop, so a deploy whose siblings did
     // not come back can never hand the crash guard a list it cannot trust.
     const run = runProbe(tailProbe(), { KILL_ON: 'nanoclaw-v2', FAIL_UNIT: 'nanoclaw-codex-sync.service' });
     expect(run.status).toBe(1);
     expect(manifest()).toBeNull();
+  });
+
+  it('refuses the handoff when the manifest cannot be written', () => {
+    // A manifest that cannot be produced is the same silent loss the encoder
+    // exists to prevent, one step earlier: deploying with no rollback point
+    // while reporting ok. Fail here, where the trap still restores.
+    const run = runProbe(tailProbe(), { KILL_ON: 'nanoclaw-v2', PROBE_PRE_COMMIT: 'not-a-sha' });
+    expect(run.status).toBe(1);
+    expect(run.signal).toBeNull();
+    expect(manifest()).toBeNull();
+    expect(fs.existsSync(path.join(harness.dir, 'data', 'deploy-rollback.json.tmp'))).toBe(false);
+    expect(status()).toMatchObject({ status: 'failed', step: 'crash guard manifest' });
+    // Never reached the host restart.
+    expect(restartCalls()).not.toContain('nanoclaw-v2');
   });
 });
 
