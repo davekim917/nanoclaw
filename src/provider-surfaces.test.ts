@@ -1197,6 +1197,49 @@ describe('buildMounts agent surfaces', async () => {
     }
   });
 
+  it('reports an excludePlugins entry that matched no plugin, whatever the reason', async () => {
+    // The structural half of the class three review rounds kept finding one
+    // string at a time: a NUL, a lone surrogate, a segment past NAME_MAX — each
+    // passes every shape check, matches no readdirSync name, and leaves the
+    // plugin mounted while the operator believes it withheld. The validator
+    // cannot enumerate "cannot name a file"; here both sides are in hand, so
+    // the fact is reported rather than the cause guessed. A typo and an
+    // uninstalled plugin land in the same place and are equally worth saying.
+    const homedir = path.join(TEST_ROOT, 'home');
+    fs.mkdirSync(path.join(homedir, 'plugins', 'codex'), { recursive: true });
+    fs.mkdirSync(path.join(homedir, 'plugins', 'humanizer'), { recursive: true });
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(homedir);
+
+    try {
+      const ag = group('ag-unmatched-exclude', 'unmatched-exclude');
+      await createAgentGroup(ag);
+      withWorkgroup(ag);
+      await ensureContainerConfig(ag.id);
+      initGroupFilesystem(ag, {});
+      vi.mocked(log.warn).mockClear();
+
+      const mounts = await buildMounts(
+        ag,
+        session('s-unmatched-exclude', ag.id),
+        { ...containerConfig(), excludePlugins: ['codex', 'codexx', 'never-installed'] },
+        'claude',
+        {},
+      );
+
+      // The real exclusion still works...
+      const paths = mounts.map((m) => m.containerPath);
+      expect(paths).not.toContain('/workspace/plugins/codex');
+      expect(paths).toContain('/workspace/plugins/humanizer');
+      // ...and the two that matched nothing are named.
+      expect(log.warn).toHaveBeenCalledWith(
+        expect.stringContaining('excludePlugins names plugins that do not exist'),
+        expect.objectContaining({ unmatched: ['codexx', 'never-installed'] }),
+      );
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
   it('mounts a workgroup-scoped plugin only for groups in its workgroups (src/plugin-scopes.ts)', async () => {
     const homedir = path.join(TEST_ROOT, 'home');
     fs.mkdirSync(path.join(homedir, 'plugins', 'client-plugin'), { recursive: true });

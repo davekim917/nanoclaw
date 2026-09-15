@@ -211,7 +211,7 @@ describe('discoverPortableSkills', () => {
     writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'wwbd', 'skills', 'wwbd'), { name: 'wwbd' });
     fs.mkdirSync(path.join(tmpDir, 'bootstrap', 'plugins', 'orchestrate'), { recursive: true });
     // Rule 8's `<repo>/<sub>` layout is gated on the sub-dir's Claude manifest,
-    // which a masked dir also lacks.
+    // which an empty sub-plugin directory also lacks.
     fs.mkdirSync(path.join(tmpDir, 'bootstrap', 'rootlevel'), { recursive: true });
 
     expect(discoverPortableSkills(tmpDir, { runtime: 'opencode' }).map((s) => s.name)).toEqual(['wwbd']);

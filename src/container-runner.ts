@@ -5061,10 +5061,8 @@ export async function buildMounts(
     // in-tree skill and (via CLAUDE_PLUGINS_ROOT auto-discovery) start a second
     // MCP server with a different allowed root. Host/OSS-only by design.
     const IN_TREE_SHADOWED_PLUGINS = ['design-artifact-loop', 'gitnexus'];
-    const excluded = new Set([
-      ...IN_TREE_SHADOWED_PLUGINS,
-      ...splitExcludedPlugins(containerConfig.excludePlugins).topLevel,
-    ]);
+    const declaredTopLevel = splitExcludedPlugins(containerConfig.excludePlugins).topLevel;
+    const excluded = new Set([...IN_TREE_SHADOWED_PLUGINS, ...declaredTopLevel]);
     const pluginScopes = loadPluginScopes(); // client plugins mount only in their workgroups
     let entries: string[] = [];
     try {
@@ -5073,6 +5071,29 @@ export async function buildMounts(
       log.warn('Failed to read ~/plugins directory', { err });
     }
     warnUnmatchedPluginScopes(pluginScopes, entries);
+    // An exclusion that matches nothing is the failure mode this field keeps
+    // producing, and it is the one the VALIDATOR cannot close. Three separate
+    // review rounds found a different string that passes every shape check and
+    // can still never equal a `readdirSync` name — a NUL, a lone surrogate, a
+    // segment past NAME_MAX — and each fix was one more entry on a list that
+    // has no end, because "cannot name a file" is not enumerable from the
+    // string alone. Every one of them lands the same way: the operator declares
+    // `codex` withheld, nothing matches, the plugin mounts, and with
+    // `codexHostAuth` the host's Codex OAuth session mounts with it.
+    //
+    // Here the question is answerable, because here we have both sides. A
+    // typo, an uninstalled plugin, or a byte no filename can hold are
+    // indistinguishable from the config alone and identical in consequence, so
+    // this reports the fact rather than guessing the cause. It WARNS rather
+    // than refusing: a fleet shares configs across hosts, and naming a plugin
+    // this host has not installed is ordinary, not an error.
+    const unmatched = [...declaredTopLevel].filter((name) => !entries.includes(name));
+    if (unmatched.length > 0) {
+      log.warn('excludePlugins names plugins that do not exist in ~/plugins; those exclusions matched nothing', {
+        group: agentGroup.id,
+        unmatched,
+      });
+    }
     for (const entry of entries) {
       if (excluded.has(entry) || !pluginAllowedForWorkgroup(entry, wgKey, pluginScopes)) continue;
       const pluginHostPath = path.join(pluginsHostDir, entry);

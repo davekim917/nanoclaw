@@ -709,6 +709,17 @@ export function validateAutoCompactWindow(value: unknown): number | undefined {
 const PLUGIN_PATH_SEGMENT_RE = /^(?!\.\.?$)[^\0\p{Surrogate}]+$/su;
 
 /**
+ * Longest single path segment any filename on this host may have, in BYTES.
+ *
+ * Linux's `NAME_MAX` is 255 on every filesystem this host uses (`getconf
+ * NAME_MAX ~/plugins`). It is a byte limit rather than a character one, so an
+ * astral character costs four of the 255. Hardcoded rather than probed: the
+ * value is a kernel constant, and probing it would make the validator's answer
+ * depend on which filesystem the config happens to be read from.
+ */
+const NAME_MAX_BYTES = 255;
+
+/**
  * Deepest `excludePlugins` entry we accept, in path segments. Bounded by what
  * the three sub-plugin walkers actually descend to, so an entry can never name
  * a directory no walker would have looked at:
@@ -752,6 +763,12 @@ export function validateExcludePlugins(value: unknown): string[] | undefined {
         fail(
           'must be <plugin> or <plugin>/<sub>[/<sub2>] with no empty, "." or ".." segments and nothing a filename cannot hold',
         );
+      }
+      // Length is measured in BYTES, not characters: `NAME_MAX` is a byte
+      // limit, so one astral character costs four of the 255 a basename gets.
+      const bytes = Buffer.byteLength(segment, 'utf8');
+      if (bytes > NAME_MAX_BYTES) {
+        fail(`has a ${bytes}-byte path segment; no filename may exceed ${NAME_MAX_BYTES} bytes (NAME_MAX)`);
       }
     }
   }

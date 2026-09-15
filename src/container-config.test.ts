@@ -857,6 +857,28 @@ describe('excludePlugins', () => {
     expect(readContainerConfig('xp-astral').excludePlugins).toEqual(ok);
   });
 
+  it('refuses a path segment longer than NAME_MAX, measured in bytes', () => {
+    // Third instance of one class: a segment past NAME_MAX cannot be a basename,
+    // so the entry matches nothing and the exclusion silently does not apply.
+    // Bytes, not characters — an astral character costs four of the 255.
+    const ok255 = 'a'.repeat(255);
+    const over256 = 'a'.repeat(256);
+    writeGroupConfig('xp-len-ok', { excludePlugins: [ok255, `repo/${ok255}`] });
+    expect(readContainerConfig('xp-len-ok').excludePlugins).toEqual([ok255, `repo/${ok255}`]);
+
+    for (const bad of [over256, `repo/plugins/${over256}`, 'x'.repeat(4097)]) {
+      writeGroupConfig('xp-len-bad', { excludePlugins: [bad] });
+      expect(() => readContainerConfig('xp-len-bad')).toThrow(/NAME_MAX/);
+    }
+    // 64 astral characters are 256 bytes — a character count would pass this.
+    writeGroupConfig('xp-len-astral', { excludePlugins: ['\u{1F600}'.repeat(64)] });
+    expect(() => readContainerConfig('xp-len-astral')).toThrow(/NAME_MAX/);
+    // 63 of them are 252 bytes and stay accepted.
+    const astral63 = '\u{1F600}'.repeat(63);
+    writeGroupConfig('xp-len-astral-ok', { excludePlugins: [astral63] });
+    expect(readContainerConfig('xp-len-astral-ok').excludePlugins).toEqual([astral63]);
+  });
+
   it('refuses a malformed entry on write, not only on read', () => {
     expect(() =>
       writeContainerConfig('xp-write', {
