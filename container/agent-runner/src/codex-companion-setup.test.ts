@@ -15,11 +15,14 @@ import {
   buildRuntimeConfigForTest,
   planCodexPluginRegistration,
   projectCodexPluginConfigForTest,
+  readCodexConfigToml,
   renderMcpServerForTest,
   setupCodexRuntime,
   stripPluginsAndMarketplacesForTest,
+  writeCodexHooksAndTrust,
 } from './codex-companion-setup.js';
-import { parseTomlTableHeader } from './providers/codex-app-server.js';
+import { buildCodexHooksJson, parseTomlTableHeader } from './providers/codex-app-server.js';
+import { codexHookEventKey, isCodexHookEvent } from './providers/codex-hook-trust.js';
 
 describe('parseTomlTableHeader', () => {
   it('closes on the LAST bracket so a quoted segment may contain one', () => {
@@ -192,7 +195,10 @@ describe('buildRuntimeConfig', () => {
 
   it('installs the in-tree hook chain into the peer-mode CODEX_HOME', () => {
     const source = fs.readFileSync(new URL('./codex-companion-setup.ts', import.meta.url), 'utf8');
-    expect(source).toMatch(/writeCodexHooksJson\(\{\s*codexHome:\s*RUNTIME_CODEX_DIR\s*\}\)/);
+    // `writeCodexHooksAndTrust`, not `writeCodexHooksJson`: Codex will not
+    // dispatch a hook with no matching `[hooks.state.*]` trust entry, so the
+    // bare file write leaves the guard chain loaded and inert.
+    expect(source).toMatch(/writeCodexHooksAndTrust\(\{\s*codexHome:\s*RUNTIME_CODEX_DIR\s*\}\)/);
   });
 
   it('setupCodexRuntime fails closed on codex, not on the container', () => {
@@ -211,9 +217,12 @@ describe('buildRuntimeConfig', () => {
     // The ONLY null return is the benign missing-auth case.
     expect(body.match(/return null/g) ?? []).toHaveLength(1);
     expect(body).toMatch(/Host codex auth not mounted[\s\S]*?return null/);
-    // mkdir, auth symlink, config.toml write, hooks.json write — all four
-    // hand the sentinel back to the caller.
-    expect(body.match(/return failClosed\(/g) ?? []).toHaveLength(4);
+    // mkdir, auth symlink, config.toml write, hooks.json+trust write, and the
+    // post-registration trust re-sync — all five hand the sentinel back to the
+    // caller. The re-sync counts because `codex plugin add` has already
+    // rewritten config.toml by then, so a failure there leaves NO trust entries
+    // standing rather than the pre-registration ones.
+    expect(body.match(/return failClosed\(/g) ?? []).toHaveLength(5);
     expect(body).not.toMatch(/\bthrow new\b/);
 
     // The sentinel must be a nonexistent path (codex hard-errors on it), and
@@ -402,7 +411,14 @@ describe('planCodexPluginRegistration', () => {
 
     const plans = planCodexPluginRegistration(root);
     expect(plans).toEqual([
-      { name: 'skills', action: 'register', entryName: 'wix', marketplaceName: 'skills', repoName: 'skills' },
+      {
+        name: 'skills',
+        action: 'register',
+        entryName: 'wix',
+        marketplaceName: 'skills',
+        repoName: 'skills',
+        pluginDir: dir,
+      },
     ]);
   });
 
@@ -431,6 +447,9 @@ describe('planCodexPluginRegistration', () => {
       // single-plugin repo it equals `name`; for a monorepo sub-plugin the label
       // is `<repo>/<entry>` while repoName stays the repo root.
       repoName: 'taste-skill',
+      // Dir holding the `.codex-plugin` manifest — what hook-trust reads the
+      // plugin's declared hooks file from.
+      pluginDir: registerable,
     });
     expect(plans).toHaveLength(3);
   });
@@ -458,8 +477,279 @@ describe('planCodexPluginRegistration', () => {
       entryName: 'data-analytics',
       marketplaceName: 'monorepo-mkt',
       repoName: 'monorepo',
+      // The SUB-directory, not the repo root: that is where the manifest and
+      // any declared hooks file live.
+      pluginDir: sub,
     });
     expect(byName.has('monorepo/not-checked-out')).toBe(false);
+  });
+});
+
+// ── Hook trust wiring ──────────────────────────────────────────────────────
+// Codex >=0.154 loads an untrusted hook and then never dispatches it, with no
+// error anywhere. So the invariant worth guarding is not "we call the trust
+// function" but the EFFECT: read back the two files a spawn actually leaves on
+// disk and prove every hook in one is trusted by the other.
+
+/** Minimal `[hooks.state."<key>"] trusted_hash = "<hash>"` reader. */
+function parseTrustEntries(toml: string): Map<string, string> {
+  const entries = new Map<string, string>();
+  let current: string | null = null;
+  for (const line of toml.split('\n')) {
+    const header = parseTomlTableHeader(line);
+    if (header !== null) {
+      const match = header.match(/^hooks\.state\."(.*)"$/);
+      current = match ? match[1] : null;
+      continue;
+    }
+    const hash = current && line.match(/^\s*trusted_hash\s*=\s*"([^"]+)"\s*$/);
+    if (hash) entries.set(current as string, hash[1]);
+  }
+  return entries;
+}
+
+describe('readCodexConfigToml', () => {
+  // Every config.toml read in this module exists only to REWRITE the file from
+  // what it read, so "could not look" collapsing into "nothing there" does not
+  // lose a read, it loses the file — and the write then succeeds, which is why
+  // no caller notices. Three answers, not two.
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-config-read-'));
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('returns the contents when the file is readable', () => {
+    const p = path.join(dir, 'config.toml');
+    fs.writeFileSync(p, '[features]\nhooks = true\n');
+    expect(readCodexConfigToml(p)).toBe('[features]\nhooks = true\n');
+  });
+
+  it('answers empty for an absent file — ENOENT is the only absence', () => {
+    expect(readCodexConfigToml(path.join(dir, 'missing.toml'))).toBe('');
+    // A missing PARENT is ENOENT too, and is genuinely absent.
+    expect(readCodexConfigToml(path.join(dir, 'nodir', 'config.toml'))).toBe('');
+  });
+
+  it('throws for a file that exists but cannot be read', () => {
+    const p = path.join(dir, 'config.toml');
+    fs.writeFileSync(p, '[features]\nhooks = true\n');
+    fs.chmodSync(p, 0o200);
+    try {
+      expect(() => readCodexConfigToml(p)).toThrow(/could not read Codex config/i);
+    } finally {
+      fs.chmodSync(p, 0o600);
+    }
+  });
+
+  it('is the only way this module reads a config.toml', () => {
+    // The pattern audit, not a grep done once by hand: the defect was
+    // `existsSync(p) ? readFileSync(p) : ''` at the site that feeds every
+    // OAuth fallback home, which `existsSync` answering false on EACCES turns
+    // into an empty projection over all of them. Reintroducing that shape at
+    // ANY site fails here.
+    const source = fs.readFileSync(new URL('./codex-companion-setup.ts', import.meta.url), 'utf-8');
+    const helperAt = source.indexOf('export function readCodexConfigToml');
+    expect(helperAt).toBeGreaterThan(-1);
+    const helper = source.slice(helperAt, source.indexOf('\n}\n', helperAt));
+    const outsideHelper = source.slice(0, helperAt) + source.slice(helperAt + helper.length);
+
+    // Report the offending LINES, not the whole file — a 900-line diff in the
+    // failure message is a test nobody reads.
+    const offenders = outsideHelper
+      .split('\n')
+      .filter((line) => /existsSync\([^)]*[Cc]onfig[^)]*\)\s*\?/.test(line) || /readFileSync\([^)]*[Cc]onfigPath/.test(line))
+      .map((line) => line.trim());
+    expect(offenders).toEqual([]);
+    // …and the helper itself is still the three-answer one.
+    expect(helper).toContain("code === 'ENOENT'");
+  });
+});
+
+describe('writeCodexHooksAndTrust', () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-trust-home-'));
+    fs.writeFileSync(path.join(home, 'config.toml'), '[features]\nhooks = true\n');
+  });
+  afterEach(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  it('throws rather than returning when the TRUST write specifically fails', () => {
+    // The postcondition is "hooks written AND trusted". Reporting success with
+    // only the first half is the state this module exists to eliminate: codex
+    // loads the handlers, reports them untrusted, never dispatches them, and
+    // the app-server starts anyway — the destructive-action guard present,
+    // inert and silent. Every caller continues straight into a spawn, so the
+    // failure has to reach them.
+    //
+    // The directory stays WRITABLE and only config.toml is read-only, so
+    // hooks.json is written normally and the trust write is the one thing that
+    // fails. An unwritable directory would fail the hooks.json write first and
+    // this test would pass with the trust failure still swallowed — which is
+    // exactly what it did before the message assertion below was added.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-trust-ro-'));
+    const configPath = path.join(home, 'config.toml');
+    fs.writeFileSync(configPath, '[features]\nhooks = true\n');
+    fs.chmodSync(configPath, 0o400);
+    try {
+      expect(() => writeCodexHooksAndTrust({ codexHome: home, pluginsRoot: path.join(home, 'no-plugins') })).toThrow(
+        /hook trust/i,
+      );
+      // hooks.json really was written — so the throw is the trust write, not
+      // an earlier step failing for an unrelated reason.
+      expect(fs.existsSync(path.join(home, 'hooks.json'))).toBe(true);
+    } finally {
+      fs.chmodSync(configPath, 0o600);
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('throws, and leaves config.toml untouched, when the config is unreadable but writable', () => {
+    // The read side of the same class as the test above, and the one that is
+    // worse: rewriting from an empty base SUCCEEDS, so nothing fails, and the
+    // file it writes has lost `[features] hooks = true` — codex then loads no
+    // hooks at all and the app-server starts. Mode 0200 is the live shape (a
+    // mount that kept write and lost read); only ENOENT means "absent".
+    const roHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-trust-unreadable-'));
+    const configPath = path.join(roHome, 'config.toml');
+    const original = '[features]\nhooks = true\n\n[marketplaces.mkt]\nsource_type = "local"\n';
+    fs.writeFileSync(configPath, original);
+    fs.chmodSync(configPath, 0o200);
+    try {
+      expect(() => writeCodexHooksAndTrust({ codexHome: roHome, pluginsRoot: path.join(roHome, 'no-plugins') })).toThrow(
+        /could not read Codex config/i,
+      );
+      fs.chmodSync(configPath, 0o600);
+      // The feature flag and the plugin tables are still there — the refusal
+      // happened BEFORE the rewrite, not after a partial one.
+      expect(fs.readFileSync(configPath, 'utf-8')).toBe(original);
+    } finally {
+      fs.chmodSync(configPath, 0o600);
+      fs.rmSync(roHome, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves every hook it wrote to hooks.json trusted in config.toml', () => {
+    writeCodexHooksAndTrust({ codexHome: home, pluginsRoot: path.join(home, 'no-plugins') });
+
+    const hooksJson = JSON.parse(fs.readFileSync(path.join(home, 'hooks.json'), 'utf-8')) as {
+      hooks: Record<string, Array<{ hooks: unknown[] }>>;
+    };
+    const trusted = parseTrustEntries(fs.readFileSync(path.join(home, 'config.toml'), 'utf-8'));
+
+    const expectedKeys: string[] = [];
+    for (const [event, groups] of Object.entries(hooksJson.hooks)) {
+      expect(isCodexHookEvent(event)).toBe(true);
+      groups.forEach((group, gi) =>
+        group.hooks.forEach((_handler, hi) =>
+          // Keyed on the home this call actually wrote to — that is what makes
+          // an OAuth-fallback rotation carry its own trust entries.
+          expectedKeys.push(`${path.join(home, 'hooks.json')}:${codexHookEventKey(event as never)}:${gi}:${hi}`),
+        ),
+      );
+    }
+
+    expect(expectedKeys.length).toBeGreaterThan(0);
+    for (const key of expectedKeys) {
+      expect(trusted.get(key)).toMatch(/^sha256:[0-9a-f]{64}$/);
+    }
+    // No orphan rows either: an entry keyed on a hook that no longer exists is
+    // dead weight that hides a rename.
+    expect([...trusted.keys()].sort()).toEqual(expectedKeys.sort());
+    // And the pre-existing config is still there.
+    expect(fs.readFileSync(path.join(home, 'config.toml'), 'utf-8')).toContain('hooks = true');
+  });
+
+  it('is what the codex provider calls at every hooks.json write', () => {
+    // Four call sites: the pre-spawn write and three OAuth-rotation rewrites.
+    // A bare `writeCodexHooksJson()` at any of them writes the guard chain into
+    // a home with no trust entries, where it loads and never fires.
+    const source = fs.readFileSync(new URL('./providers/codex.ts', import.meta.url), 'utf8');
+    expect(source).not.toMatch(/\bwriteCodexHooksJson\s*\(/);
+    expect(source.match(/\bwriteCodexHooksAndTrust\s*\(/g)).toHaveLength(4);
+  });
+
+  it('trusts the hooks a mounted plugin declares, keyed <plugin>@<marketplace>', () => {
+    // The Claude provider already dispatches these same plugins' hooks through
+    // the SDK; leaving them untrusted under Codex is a provider asymmetry, not
+    // isolation — it is why the workflow-agents Codex guard was inert.
+    const pluginsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-trust-plugins-'));
+    try {
+      const repo = path.join(pluginsRoot, 'bootstrap');
+      const sub = path.join(repo, 'plugins', 'workflow-agents');
+      fs.mkdirSync(path.join(repo, '.agents', 'plugins'), { recursive: true });
+      fs.writeFileSync(
+        path.join(repo, '.agents', 'plugins', 'marketplace.json'),
+        JSON.stringify({ name: 'davekim917-bootstrap' }),
+      );
+      fs.mkdirSync(path.join(sub, '.codex-plugin'), { recursive: true });
+      fs.mkdirSync(path.join(sub, 'hooks'), { recursive: true });
+      fs.writeFileSync(
+        path.join(sub, '.codex-plugin', 'plugin.json'),
+        JSON.stringify({ name: 'bootstrap-workflow-agents', hooks: './hooks/workflow-hooks.json' }),
+      );
+      fs.writeFileSync(
+        path.join(sub, 'hooks', 'workflow-hooks.json'),
+        JSON.stringify({
+          hooks: {
+            PreToolUse: [
+              {
+                hooks: [
+                  { type: 'command', command: 'bun "${PLUGIN_ROOT}/hooks/codex-guard.ts" PreToolUse', timeout: 3600 },
+                ],
+              },
+            ],
+          },
+        }),
+      );
+
+      writeCodexHooksAndTrust({ codexHome: home, pluginsRoot });
+      const trusted = parseTrustEntries(fs.readFileSync(path.join(home, 'config.toml'), 'utf-8'));
+      // Hash pinned to what Codex itself wrote for this exact hook, so this
+      // asserts interoperability, not just self-consistency.
+      expect(
+        trusted.get('bootstrap-workflow-agents@davekim917-bootstrap:hooks/workflow-hooks.json:pre_tool_use:0:0'),
+      ).toBe('sha256:098408625edddbfeabfdc5593d17ade95699bf36fd463bd17ffd604cf314cb4a');
+      // The generated guard chain is still trusted alongside it.
+      expect(trusted.has(`${path.join(home, 'hooks.json')}:pre_tool_use:0:0`)).toBe(true);
+    } finally {
+      fs.rmSync(pluginsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('re-keys the entries when the home rotates', () => {
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-trust-home2-'));
+    try {
+      const pluginsRoot = path.join(home, 'no-plugins');
+      writeCodexHooksAndTrust({ codexHome: home, pluginsRoot });
+      writeCodexHooksAndTrust({ codexHome: other, pluginsRoot });
+      const rotated = [...parseTrustEntries(fs.readFileSync(path.join(other, 'config.toml'), 'utf-8')).keys()];
+      expect(rotated.length).toBeGreaterThan(0);
+      expect(rotated.every((key) => key.startsWith(path.join(other, 'hooks.json') + ':'))).toBe(true);
+    } finally {
+      fs.rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it('tracks a changed hook command instead of leaving the old hash trusted', () => {
+    const pluginsRoot = path.join(home, 'no-plugins');
+    writeCodexHooksAndTrust({ codexHome: home, emailGateTimeoutSec: 3600, pluginsRoot });
+    const before = parseTrustEntries(fs.readFileSync(path.join(home, 'config.toml'), 'utf-8'));
+    writeCodexHooksAndTrust({ codexHome: home, emailGateTimeoutSec: 120, pluginsRoot });
+    const after = parseTrustEntries(fs.readFileSync(path.join(home, 'config.toml'), 'utf-8'));
+
+    const preKey = `${path.join(home, 'hooks.json')}:pre_tool_use:0:0`;
+    expect(before.get(preKey)).toBeDefined();
+    expect(after.get(preKey)).toBeDefined();
+    // The PreToolUse timeout is part of the hashed identity, so the entry must
+    // move; the untouched PostToolUse entry must not.
+    expect(after.get(preKey)).not.toBe(before.get(preKey));
+    const postKey = `${path.join(home, 'hooks.json')}:post_tool_use:0:0`;
+    expect(after.get(postKey)).toBe(before.get(postKey) as string);
+    // Sanity: the hooks.json really did change, so the assertion above is not
+    // passing on a no-op.
+    expect(buildCodexHooksJson({ emailGateTimeoutSec: 120 }).hooks.PreToolUse[0].hooks[0].timeout).toBe(120);
   });
 });
 

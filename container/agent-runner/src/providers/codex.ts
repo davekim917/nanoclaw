@@ -42,9 +42,12 @@ import {
   startCodexTurn,
   startOrResumeCodexThread,
   steerCodexTurn,
-  writeCodexHooksJson,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
+// Hooks AND the `[hooks.state.*]` entries that make Codex actually dispatch
+// them: Codex >=0.154 refuses to run an untrusted hook, so writing hooks.json
+// alone leaves the destructive-action guard chain loaded but never fired.
+import { writeCodexHooksAndTrust } from '../codex-companion-setup.js';
 import { CodexTurnLiveness, isCodexTerminalTurnItem, normalizeCodexThreadStatus } from './codex-liveness.js';
 import { CodexRateLimitTracker } from './codex-rate-limit-tracker.js';
 import type { CodexRateLimitPark } from './codex-rate-limits.js';
@@ -1211,7 +1214,7 @@ export class CodexProvider implements AgentProvider {
       // query active per batch of pending messages and ends it on idle, so
       // spawn-per-query matches that cadence naturally.
       writeCodexMcpConfigToml(self.mcpServers);
-      writeCodexHooksJson();
+      writeCodexHooksAndTrust();
       let server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
       turnTracker.server = server;
       attachCodexAutoApproval(server);
@@ -1410,7 +1413,7 @@ export class CodexProvider implements AgentProvider {
                   killCodexAppServer(server);
 
                   writeCodexMcpConfigToml(self.mcpServers);
-                  writeCodexHooksJson();
+                  writeCodexHooksAndTrust();
                   server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
                   turnTracker.server = server;
                   attachCodexAutoApproval(server);
@@ -1459,7 +1462,7 @@ export class CodexProvider implements AgentProvider {
                   killCodexAppServer(server);
 
                   writeCodexMcpConfigToml(self.mcpServers);
-                  writeCodexHooksJson();
+                  writeCodexHooksAndTrust();
 
                   server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
                   turnTracker.server = server;
@@ -1533,7 +1536,7 @@ export class CodexProvider implements AgentProvider {
                     // app-server runs UNGUARDED. agents/ is bind-mounted only at the
                     // primary, so mirror the role definitions across explicitly. (codex #126)
                     writeCodexMcpConfigToml(self.mcpServers);
-                    writeCodexHooksJson();
+                    writeCodexHooksAndTrust();
                     mirrorCodexAgentsToHome(self.primaryCodexHome, nextHome);
 
                     server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
