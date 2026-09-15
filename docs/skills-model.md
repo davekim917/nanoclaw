@@ -74,6 +74,17 @@ This fetch is **additive, never a merge**. The skill copies in the files it need
 
 Either way the skill brings its own code, from its folder or from its branch.
 
+## Agent plugins and their standing directives
+
+A `~/plugins/<repo>` entry is not a NanoClaw skill — it's someone's plugin repo, mounted read-only into every container at `/workspace/plugins/<repo>`. A plugin that carries a standing directive ("always on this way of working") reaches a container by **one** of two paths, never both:
+
+- **The plugin's own SessionStart hook.** Claude auto-loads it from the mount via `CLAUDE_PLUGINS_ROOT`; Codex fires plugin hooks too, and a hook that injects context is how a Codex container gets the directive natively. Nothing is composed for either provider.
+- **`composeGroupClaudeMd`, for OpenCode only** — the one provider with no plugin hook path at all. It reads the plugin's own generic `always-on.md` (`~/plugins/<repo>/plugins/<sub>/always-on.md`, or `~/plugins/<repo>/<sub>/always-on.md`) and inlines it as a fragment. The filename is the plugin's own; NanoClaw asks a plugin repo to carry nothing on our behalf.
+
+`~/plugins/<repo>/.nanoclaw-always-on.md` is a different thing: the **operator's override**, for a third-party plugin that ships no clean ruleset of its own. It is a NanoClaw-side convention, authored by `/enable-agent-plugins`, lives at the repo root, and is read for every non-Claude provider. Use it only where we don't control the plugin.
+
+Withholding either from one agent group is the same field, `excludePlugins` in `groups/<folder>/container.json` — a whole entry (`"bootstrap"`) or one sub-plugin path (`"bootstrap/plugins/orchestrate"`, `"<repo>/<sub>"`). A sub-plugin path also bind-mounts an empty read-only directory over just that sub-path, so no provider's plugin walker finds it. See [workgroups.md](workgroups.md) for workgroup-scoped plugins, which are opt-in rather than opt-out.
+
 ## A test for every integration point
 
 The tests a skill *must* ship are the ones that prove it integrates with the core and keeps working as the core changes. That's the whole point. Tests of a skill's own internal logic, or of its behavior against an external service, are fine but optional: the creator's call, because they don't guard against upstream changes. A pure-add skill that touches nothing existing needs no required integration test at all.

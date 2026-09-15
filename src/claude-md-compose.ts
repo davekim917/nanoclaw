@@ -55,12 +55,23 @@ const STANDING_INSTRUCTIONS_FRAGMENT = 'standing-instructions.md';
 // tests, which mock GROUPS_DIR to a scratch dir, resolve these consistently.
 const MCP_TOOLS_HOST_SUBPATH = path.join('container', 'agent-runner', 'src', 'mcp-tools');
 
-/** A plugin opts into always-on injection by writing this file. */
-const ALWAYS_ON_MARKER = '.nanoclaw-always-on.md';
+/**
+ * NanoClaw-side override marker, written by the operator (via
+ * /enable-agent-plugins) into a `~/plugins` entry that ships no clean standing
+ * ruleset of its own. A NanoClaw-specific filename, so it belongs only on
+ * third-party plugins we do not control.
+ */
+const NANOCLAW_ALWAYS_ON_MARKER = '.nanoclaw-always-on.md';
 
-/** The marker's trimmed contents, or null when absent, empty, or unreadable. */
-function readAlwaysOnRuleset(pluginDir: string): string | null {
-  const file = path.join(pluginDir, ALWAYS_ON_MARKER);
+/**
+ * A plugin's OWN standing-directive file, in the plugin's own vocabulary — no
+ * NanoClaw-specific name, nothing a plugin repo carries for our benefit.
+ */
+const PLUGIN_ALWAYS_ON_FILE = 'always-on.md';
+
+/** One ruleset file's trimmed contents, or null when absent, empty, or unreadable. */
+function readRulesetFile(dir: string, filename: string): string | null {
+  const file = path.join(dir, filename);
   try {
     if (!fs.statSync(file).isFile()) return null;
     return fs.readFileSync(file, 'utf-8').trim() || null;
@@ -230,24 +241,27 @@ export async function composeGroupClaudeMd(
     }
   }
 
-  // Always-on agent-plugin rulesets — NON-Claude groups only. A Claude group
-  // gets a plugin's always-on behavior from its mounted SessionStart hook
-  // (CLAUDE_PLUGINS_ROOT auto-loads it); Codex/OpenCode containers fire NO
-  // plugin hooks, so we inject the plugin's captured ruleset here instead. A
-  // plugin opts in by writing its ruleset to `~/plugins/<name>/.nanoclaw-always-on.md`
-  // (the /enable-agent-plugins skill authors this). Per-group opt-out reuses
-  // `excludePlugins` — the same field that drops the Claude mount — so excluding
-  // a plugin from a group removes it on every provider. See docs/skills-model.md.
-  // A workgroup-scoped plugin's ruleset reaches only its workgroups, matching the
-  // mount (src/plugin-scopes.ts); with no spawn-resolved workgroup it reaches none.
+  // Always-on agent-plugin rulesets. A plugin's standing directive reaches a
+  // container by ONE of two paths, never both:
   //
-  // A monorepo plugin may also mark ONE sub-plugin's ruleset, at
-  // `~/plugins/<name>/plugins/<sub>/.nanoclaw-always-on.md` or
-  // `~/plugins/<name>/<sub>/.nanoclaw-always-on.md` — the same two sub-plugin
-  // layouts the mount masking and the container-side walkers use. That lets a
-  // group drop `<name>/plugins/<sub>` from `excludePlugins` and lose only that
-  // sub-plugin's standing directive, while its siblings in the same repo keep
-  // theirs.
+  //   1. The plugin's own SessionStart hook, from the mounted plugin. Claude
+  //      auto-loads it via CLAUDE_PLUGINS_ROOT; Codex fires plugin hooks too,
+  //      and a hook that injects context is how a Codex container gets the
+  //      directive natively. Neither provider is composed for below.
+  //   2. This composer, for OpenCode only — the one provider with no plugin
+  //      hook path at all. It reads the plugin's own generic
+  //      `always-on.md` (no NanoClaw-specific filename in the plugin repo).
+  //
+  // Separately, `~/plugins/<name>/.nanoclaw-always-on.md` is the operator's
+  // OVERRIDE for a third-party plugin that ships no clean ruleset — a
+  // NanoClaw-side convention authored by /enable-agent-plugins, read for every
+  // non-Claude provider as it always has been.
+  //
+  // Per-group opt-out reuses `excludePlugins` — the same field that drops the
+  // mount — so excluding a plugin, or one sub-plugin path of a monorepo,
+  // withholds its directive here too. A workgroup-scoped plugin's ruleset
+  // reaches only its workgroups, matching the mount (src/plugin-scopes.ts);
+  // with no spawn-resolved workgroup it reaches none. See docs/skills-model.md.
   if (provider !== 'claude') {
     const { topLevel: excluded, subPaths: excludedSubPaths } = splitExcludedPlugins(
       readContainerConfig(group.folder).excludePlugins,
@@ -262,17 +276,16 @@ export async function composeGroupClaudeMd(
     }
     for (const name of pluginDirs) {
       if (excluded.has(name) || !pluginAllowedForWorkgroup(name, options.workgroupId, pluginScopes)) continue;
-      const rootContent = readAlwaysOnRuleset(path.join(pluginsRoot, name));
-      if (rootContent) desired.set(`plugin-${name}.md`, rootContent);
+      const override = readRulesetFile(path.join(pluginsRoot, name), NANOCLAW_ALWAYS_ON_MARKER);
+      if (override) desired.set(`plugin-${name}.md`, override);
+      // A plugin's own always-on.md reaches OpenCode and nothing else. Codex
+      // would receive the same text twice — once here, once from the plugin's
+      // SessionStart hook — so the gate is provider equality, not `!== 'claude'`.
+      if (provider !== 'opencode') continue;
       for (const { subPath, dir } of subPluginDirs(pluginsRoot, name)) {
         if (isExcludedSubPath(subPath, excludedSubPaths)) continue;
-        const content = readAlwaysOnRuleset(dir);
+        const content = readRulesetFile(dir, PLUGIN_ALWAYS_ON_FILE);
         if (!content) continue;
-        // Interim double-injection guard: a repo mid-migration still carries a
-        // root ruleset that is a hand-concatenation of its sub-plugins'. If the
-        // root fragment already contains this block verbatim, emitting it again
-        // would repeat the directive in the composed prompt.
-        if (rootContent?.includes(content)) continue;
         const fragment = `plugin-${name}-${path.basename(subPath)}.md`;
         if (desired.has(fragment)) {
           log.warn('Two plugin rulesets compose to the same fragment name; keeping the first', {

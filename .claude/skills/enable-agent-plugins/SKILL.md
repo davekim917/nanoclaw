@@ -32,14 +32,20 @@ Each provider reaches the plugin by its own path, all rooted at the `~/plugins` 
 | Plugin provides | Claude group | Codex group | OpenCode group |
 |---|---|---|---|
 | **Skills / commands** (`skills/<n>/SKILL.md`) | `.claude-plugin/plugin.json` + mount (`CLAUDE_PLUGINS_ROOT`) | native registration at spawn from the mount, needs `.codex-plugin/plugin.json` + `.agents/plugins/marketplace.json` | mirror → `~/.config/opencode/skill/` (no plugin loader) |
-| **Always-on ruleset** (e.g. impeccable) | plugin SessionStart hook (auto) | `~/plugins/<n>/.nanoclaw-always-on.md`, and `~/plugins/<n>/plugins/<sub>/.nanoclaw-always-on.md` per sub-plugin → `AGENTS.md`/`CLAUDE.md` | same |
+| **Always-on directive, plugin's own** | plugin SessionStart hook (auto, via `CLAUDE_PLUGINS_ROOT`) | plugin SessionStart hook (Codex fires plugin hooks; a hook that injects context delivers it natively) | composed from the plugin's own `always-on.md` → `AGENTS.md` — the only provider with no hook path |
+| **Always-on ruleset, operator override** (e.g. impeccable) | not composed — hook only | `~/plugins/<n>/.nanoclaw-always-on.md` → `AGENTS.md` | same |
 | **Opt-out** | `excludePlugins` (drops mount) | `excludePlugins` (drops mount) + skip the ruleset | `excludePlugins` skips the **ruleset only** — skills stay. The mirror is synced globally, not per group |
-| **Sub-plugin opt-out** | `excludePlugins: ["<n>/plugins/<sub>"]` masks that one sub-plugin with an empty dir; the repo still mounts | same mask, so Codex never registers it, plus its own `.nanoclaw-always-on.md` is skipped | same mask + ruleset skip; skills the **global** mirror already copied stay |
+| **Sub-plugin opt-out** | `excludePlugins: ["<n>/plugins/<sub>"]` masks that one sub-plugin with an empty dir; the repo still mounts, so its hook never fires | same mask, so Codex neither registers it nor fires its hook | same mask, and its `always-on.md` is not composed; skills the **global** mirror already copied stay |
 | **Workgroup scope** | `data/plugin-scopes.json`: mounts only in the listed workgroups | same, and the ruleset skips it elsewhere; the subagent mirror never copies it | the ruleset skips it elsewhere; the skill and subagent mirrors never copy it |
 
 So the only artifacts ever worth generating are: **(1)** the manifests a repo ships
-none of, and **(2)** a condensed always-on ruleset for "mode" plugins. A skills-only
-plugin that already ships its manifests needs neither — it reaches all three on the
+none of, and **(2)** a condensed always-on ruleset for a "mode" plugin **we do not
+control** — written to `~/plugins/<n>/.nanoclaw-always-on.md`, a NanoClaw-side
+filename that belongs on a third-party clone and nowhere else. A plugin we DO own
+ships its directive as its own `always-on.md` next to the sub-plugin it belongs to,
+and loads it through its own SessionStart hook on Claude and Codex; never add a
+NanoClaw-specific file to a repo we maintain. A skills-only plugin that already ships
+its manifests needs neither — it reaches all three on the
 next spawn, and the enabler run is just a verification pass.
 
 ## Steps
@@ -184,7 +190,7 @@ next spawn, and the enabler run is just a verification pass.
    | Mechanism | Claude | Codex | OpenCode |
    |---|---|---|---|
    | `excludePlugins` (per group, via `--exclude`) | drops the mount | drops **both** | drops the ruleset, **keeps the skills** |
-   | `excludePlugins` with a sub-plugin path (per group, by hand) | masks that sub-plugin only | masks it, so it never registers; skips its own ruleset | masks it in the mount; skips its own ruleset; the **global** skill mirror still has it |
+   | `excludePlugins` with a sub-plugin path (per group, by hand) | masks that sub-plugin only, so its hook never fires | masks it, so it neither registers nor fires its hook | masks it in the mount and skips its `always-on.md`; the **global** skill mirror still has it |
    | `--deny <provider>` (per plugin, all groups) | only before a manifest exists | drops the skills, **keeps the ruleset** | drops the skills, **keeps the ruleset** |
    | remove from `~/plugins` | effective | effective | **does not remove already-synced skills** |
 
@@ -364,10 +370,12 @@ treats it as a fault will undo the opt-out trying to repair it.
 - If the user explicitly asks for the plugin in their **own** `codex`/`claude` CLI, that's
   a separate request outside this skill — do it deliberately and say what host state it
   changes, don't fold it into the fleet enablement.
-- `~/plugins/<name>/.nanoclaw-always-on.md` is the opt-in marker for always-on injection.
-  Delete it (then rebuild) to make a plugin skills-only again. A monorepo may also mark
-  one sub-plugin at `~/plugins/<name>/plugins/<sub>/.nanoclaw-always-on.md` (or
-  `~/plugins/<name>/<sub>/...`), which composes as its own fragment and is skipped for a
-  group whose `excludePlugins` names that sub-path. Both markers are read, so a repo
-  mid-migration keeps working; a sub-plugin block the root marker already contains
-  verbatim is not injected twice.
+- `~/plugins/<name>/.nanoclaw-always-on.md` is the **operator override** for a plugin we
+  do not control: it injects that ruleset on Codex and OpenCode. Delete it (then rebuild)
+  to make such a plugin skills-only again. Do NOT write one into a plugin repo we
+  maintain — that repo carries its directive as its own `always-on.md` beside the
+  sub-plugin it belongs to (`~/plugins/<name>/plugins/<sub>/always-on.md`, or
+  `~/plugins/<name>/<sub>/always-on.md`), which composes as its own fragment **for
+  OpenCode only** and is skipped for a group whose `excludePlugins` names that sub-path.
+  Claude and Codex read the same directive from the plugin's own SessionStart hook, so
+  composing it for them would deliver it twice.

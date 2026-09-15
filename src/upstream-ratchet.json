@@ -409,7 +409,7 @@
 "docs/skill-directives.md":{"diff":15,"mode":"100644","sha256":"0c50066d3c0806a973bc711d64c15ee6c64d08b5d27bfdf81d401465829bdd84"},
 "docs/skill-engine-seam.md":{"diff":2,"mode":"100644","sha256":"24fb6acee09e840fe322455c9d67331a218f98bf96111d05d50268157671d5b2"},
 "docs/skill-guidelines.md":{"diff":17,"mode":"100644","sha256":"d313885cc1dd225e12c789ac1d4cdf22f3b5ed1c54349fc486ffc5ae0c84fbe5"},
-"docs/skills-model.md":{"diff":42,"mode":"100644","sha256":"7dc5398a7a8127f7b6ed60c210d48b0cecd87a5ea330af0062c5dbb8c1c9e6ed"},
+"docs/skills-model.md":{"diff":53,"mode":"100644","sha256":"e3cdb29201e19e31664ea12f1e5af9460ebdec81bfcbc3362497517ccc885072"},
 "docs/templates.md":{"diff":393,"mode":"100644","sha256":"0d76aed227c3ae86c71da93a2eb7920b358fd38300314a79b91009b9a90d1c95"},
 "docs/upgrade-recovery.md":{"diff":28,"mode":"100644","sha256":"b02b88c4567b2e9a948de04538d7d336e5969def6aa09c84e4012771261c5ba9"},
 "docs/v1-to-v2-changes.md":{"diff":26,"mode":"100644","sha256":"6f7c617873209951ab6a44e6066daaf9ab59f7f4e1da804987aea29bfd9f2070"},
