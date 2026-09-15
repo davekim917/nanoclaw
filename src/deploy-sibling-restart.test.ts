@@ -33,14 +33,16 @@ function shellFunction(name: string): string {
 }
 
 /**
- * Everything from the crash-guard manifest to the end of the file. The anchor
- * sits ABOVE the sibling-restart block and stays above it however the block is
- * moved, so a mutation that relocates the restarts below the nanoclaw-v2
- * handoff still lands inside this slice — and is then caught by the SIGKILL.
+ * Everything from the planted-host-dir sweep — the last step before the restart
+ * sequence, and a different concern from it — to the end of the file. The
+ * anchor sits ABOVE the sibling-restart block and stays above it however that
+ * block or the crash-guard manifest is moved, so a mutation that relocates the
+ * restarts below the nanoclaw-v2 handoff still lands inside this slice, and is
+ * then caught by the SIGKILL.
  */
 function deployTail(): string {
-  const anchor = script.indexOf('if [ -z "$MIGRATION_CHANGES" ]; then');
-  expect(anchor, 'crash-guard manifest anchor missing from deploy.sh').toBeGreaterThan(0);
+  const anchor = script.indexOf('write_status "running" "planted host-dir sweep" ""');
+  expect(anchor, 'planted host-dir sweep anchor missing from deploy.sh').toBeGreaterThan(0);
   return script.slice(anchor);
 }
 
@@ -71,6 +73,9 @@ let harness: Harness;
  */
 function writeFakes(bin: string, unitsFile: string, callsFile: string): void {
   fs.writeFileSync(path.join(bin, 'sudo'), '#!/bin/sh\nexec "$@"\n', { mode: 0o755 });
+  // The slice opens with the planted-host-dir sweep (`pnpm exec tsx ...`),
+  // which is somebody else's gate and already has its own tests.
+  fs.writeFileSync(path.join(bin, 'pnpm'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
   fs.writeFileSync(
     path.join(bin, 'systemctl'),
     [
@@ -268,6 +273,42 @@ describe('deploy long-running-service discovery', () => {
   it('answers "could not look" with a non-zero exit, never with an empty list', () => {
     const broken = discover(THIS_HOST, { SYSTEMCTL_BROKEN: '1' });
     expect(broken.stdout.trim()).toBe('rc=1');
+  });
+});
+
+/**
+ * The shell's in-memory unit list dies with the `systemctl restart nanoclaw-v2`
+ * that kills the script, so the post-handoff crash rollback
+ * (src/deploy-crash-guard.ts `performRollback`) cannot read it. The manifest
+ * carries it across. These tests pin the producing half of that contract;
+ * src/deploy-crash-guard.test.ts pins the consuming half.
+ */
+describe('deploy records what it restarted for the crash guard', () => {
+  function manifest(): { restartedUnits?: unknown } | null {
+    const file = path.join(harness.dir, 'data', 'deploy-rollback.json');
+    if (!fs.existsSync(file)) return null;
+    return JSON.parse(fs.readFileSync(file, 'utf-8')) as { restartedUnits?: unknown };
+  }
+
+  it('lists the units it restarted, as valid JSON', () => {
+    runProbe(tailProbe(), { KILL_ON: 'nanoclaw-v2' });
+    expect(manifest()?.restartedUnits).toEqual(['nanoclaw-codex-sync.service']);
+  });
+
+  it('emits an empty list, not an absent field, on a sibling-free host', () => {
+    // Absent means "written by a deploy.sh that predates this"; `[]` means
+    // "this deploy looked and found none". The guard reports them differently.
+    writeUnits(THIS_HOST.filter((u) => u.id !== 'nanoclaw-codex-sync.service'));
+    runProbe(tailProbe(), { KILL_ON: 'nanoclaw-v2' });
+    expect(manifest()?.restartedUnits).toEqual([]);
+  });
+
+  it('arms no rollback point at all when a sibling restart failed', () => {
+    // The manifest is written after the loop, so a deploy whose siblings did
+    // not come back can never hand the crash guard a list it cannot trust.
+    const run = runProbe(tailProbe(), { KILL_ON: 'nanoclaw-v2', FAIL_UNIT: 'nanoclaw-codex-sync.service' });
+    expect(run.status).toBe(1);
+    expect(manifest()).toBeNull();
   });
 });
 

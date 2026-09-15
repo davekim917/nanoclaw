@@ -377,18 +377,10 @@ wait_for_drain
 
 echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Build complete, restarting..." >> "$LOG"
 
-# Arm the post-restart crash guard (src/deploy-crash-guard.ts). The restart
-# kills this script's process group, so nothing HERE can watch the service
-# come up — the guard runs inside every boot of the new build instead, and
-# this manifest is what tells it a rollback point exists and is fresh.
-#
-# Two deliberate limits (codex review on PR #180):
-# - A deploy that ships new migrations does NOT arm the guard: migrations can
-#   be destructive (dropped columns/tables), so restoring old code against the
-#   migrated database is worse than the crash loop. Those deploys keep the
-#   pre-guard behavior; the operator decides.
-# - imageBase is recorded only when THIS deploy retagged :pre-deploy. A stale
-#   tag from an earlier deploy must never be retagged over the current image.
+# Whether this deploy ships migrations decides whether the post-restart crash
+# guard gets armed at all; the manifest that arms it is written further down,
+# after the sibling restarts it has to record. Read the diff HERE, while
+# PRE_COMMIT and HEAD are both still what the checks below assume.
 MIGRATION_CHANGES=$(git diff --name-only "$PRE_COMMIT" HEAD -- src/db/migrations/ 2>/dev/null)
 if tracked_changes; then
   write_status "failed" "pre-restart" "tracked source changed during deploy — restart refused to preserve customizations"
@@ -429,15 +421,6 @@ write_status "running" "planted host-dir sweep" ""
 if ! pnpm exec tsx scripts/quarantine-planted-host-dirs.ts --apply >> "$LOG" 2>&1; then
   write_status "failed" "planted host-dir sweep" "could not sweep container-planted .host directories — restart refused"
   exit 1
-fi
-
-if [ -z "$MIGRATION_CHANGES" ]; then
-  mkdir -p data
-  printf '{"commit":"%s","imageBase":"%s","timestamp":"%s","node":"%s"}\n' \
-    "$PRE_COMMIT" "${IMAGE_SAVED_BASE}" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(node --version 2>/dev/null)" > data/deploy-rollback.json
-else
-  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Crash guard NOT armed: deploy ships migrations ($(echo "$MIGRATION_CHANGES" | head -3 | tr '\n' ' '))" >> "$LOG"
-  rm -f data/deploy-rollback.json
 fi
 
 # Restart every OTHER long-running service that holds this checkout's code
@@ -490,6 +473,43 @@ while IFS= read -r unit; do
     exit 1
   fi
 done <<< "$SIBLING_UNITS"
+
+# Arm the post-restart crash guard (src/deploy-crash-guard.ts). The restart
+# kills this script's process group, so nothing HERE can watch the service come
+# up — the guard runs inside every boot of the new build instead, and this
+# manifest is what tells it a rollback point exists and is fresh.
+#
+# Written AFTER the sibling restarts, not before, because `restartedUnits` is a
+# record of what this deploy actually did: reaching this line means every unit
+# listed came back cleanly (a failure exits above, before the handoff, where the
+# shell trap owns the rollback). The crash guard cannot re-derive the set — this
+# shell and its RESTART_ATTEMPTED_UNITS are dead by the time it runs — and
+# should not: like `imageBase` below, the guard's whole contract is to undo what
+# THIS deploy did rather than to act on what the host looks like three boots
+# later. Re-deriving would also mean a second copy of the discovery predicate,
+# in another language, with nothing to catch the drift.
+#
+# Three deliberate limits (the first two from the codex review on PR #180):
+# - A deploy that ships new migrations does NOT arm the guard: migrations can
+#   be destructive (dropped columns/tables), so restoring old code against the
+#   migrated database is worse than the crash loop. Those deploys keep the
+#   pre-guard behavior; the operator decides. Their siblings are then the
+#   operator's to restart too — the same call, made once.
+# - imageBase is recorded only when THIS deploy retagged :pre-deploy. A stale
+#   tag from an earlier deploy must never be retagged over the current image.
+# - `restartedUnits` is emitted whenever the guard is armed, `[]` included: an
+#   ABSENT field means a deploy that predates this and restarted nothing, and
+#   the guard must be able to tell that apart from "this deploy found none".
+UNITS_JSON=$(printf '%s\n' $RESTART_ATTEMPTED_UNITS | awk 'NF { printf "%s\"%s\"", (n++ ? "," : ""), $0 }')
+if [ -z "$MIGRATION_CHANGES" ]; then
+  mkdir -p data
+  printf '{"commit":"%s","imageBase":"%s","timestamp":"%s","node":"%s","restartedUnits":[%s]}\n' \
+    "$PRE_COMMIT" "${IMAGE_SAVED_BASE}" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(node --version 2>/dev/null)" \
+    "$UNITS_JSON" > data/deploy-rollback.json
+else
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Crash guard NOT armed: deploy ships migrations ($(echo "$MIGRATION_CHANGES" | head -3 | tr '\n' ' '))" >> "$LOG"
+  rm -f data/deploy-rollback.json
+fi
 
 # Write success status BEFORE restart — systemctl restart kills this script's
 # process group, so lines after don't run. The new process reads this file

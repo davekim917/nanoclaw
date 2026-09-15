@@ -12,7 +12,8 @@
  * retags the spawn image as :pre-deploy, and writes data/deploy-rollback.json
  * just before restarting. Each boot while that manifest is fresh increments
  * data/deploy-boot-attempts.json. On the Nth boot (i.e. after N-1 straight
- * crashes) the guard restores the snapshots, resets the checkout, retags the
+ * crashes) the guard restores the snapshots, resets the checkout, restarts the
+ * long-running services that deploy recorded in `restartedUnits`, retags the
  * image, writes a "rolled-back" deploy status for the announcer, and exits so
  * systemd restarts into the restored build. A successful startup calls
  * markDeployBootHealthy() which disarms the guard.
@@ -47,6 +48,40 @@ interface RollbackManifest {
    * would produce a build that cannot load its native modules.
    */
   node?: string;
+  /**
+   * The long-running services this deploy restarted onto the deployed commit
+   * (`long_running_repo_units` in scripts/deploy.sh; nanoclaw-v2 is never in
+   * here — it is the service this guard is running inside). Rolling the
+   * checkout back without restarting them leaves each one resident on the code
+   * the reset just removed, which is the defect #822 fixed in the pre-handoff
+   * shell trap, reproduced in the path that runs after that shell is dead.
+   *
+   * ABSENT and `[]` are different answers and are reported differently:
+   * absent means a deploy.sh that predates #822 wrote this manifest and
+   * restarted nothing, `[]` means this deploy looked and found no siblings.
+   */
+  restartedUnits?: unknown;
+}
+
+/** A systemd unit id as `systemctl show -p Id` spells one. */
+const UNIT_ID = /^[A-Za-z0-9:_.\\@-]+\.service$/;
+
+type RestartedUnits = { kind: 'absent' } | { kind: 'units'; units: string[] } | { kind: 'malformed'; detail: string };
+
+/**
+ * Read `restartedUnits` fail-closed. A field that is present but not a list of
+ * plain unit ids is never quietly downgraded to "nothing to restart" — that is
+ * the shape that let a half-done rollback read as a complete one. It is
+ * reported as malformed so the operator sees the rollback was partial.
+ */
+export function readRestartedUnits(raw: unknown): RestartedUnits {
+  if (raw === undefined || raw === null) return { kind: 'absent' };
+  if (!Array.isArray(raw)) return { kind: 'malformed', detail: `restartedUnits is ${typeof raw}, not a list` };
+  const bad = raw.filter((u) => typeof u !== 'string' || !UNIT_ID.test(u));
+  if (bad.length > 0) {
+    return { kind: 'malformed', detail: `restartedUnits holds ${bad.length} entr(y/ies) that is not a unit id` };
+  }
+  return { kind: 'units', units: raw as string[] };
 }
 
 interface GuardDeps {
@@ -138,6 +173,7 @@ export function performRollback(
       console.error(`deploy-crash-guard: could not restore ${name}`, err);
     }
   }
+  let commitReset = false;
   try {
     const tracked = deps.execFile('git', ['status', '--porcelain', '--untracked-files=no'], { cwd: root }).trim();
     if (tracked) {
@@ -145,9 +181,50 @@ export function performRollback(
     } else {
       deps.execFile('git', ['reset', '--hard', manifest.commit], { cwd: root });
       restored.push(`commit ${manifest.commit.slice(0, 8)}`);
+      commitReset = true;
     }
   } catch (err) {
     console.error('deploy-crash-guard: git reset failed', err);
+  }
+  // Put the services this deploy restarted back onto the restored checkout.
+  // Same reasoning as the pre-handoff shell trap, in the path that runs after
+  // that shell is dead: nanoclaw-codex-sync runs `tsx src/...`, loads the
+  // source once at process start, and would otherwise keep serving — and
+  // mirroring — the commit this rollback just rejected, while the host reports
+  // a successful automatic rollback.
+  //
+  // Gated on the commit actually being reset, exactly as the shell trap is: if
+  // it was skipped to preserve tracked changes, src/ is the new commit plus
+  // uncommitted edits, and restarting would move the sibling onto THAT rather
+  // than back. Leaving it alone is the conservative half of an already
+  // ambiguous state, and the status line above says the state exists.
+  //
+  // Never throws: every restart is caught individually, because an escape here
+  // would crash the boot with the manifest still armed — an infinite rollback
+  // loop. But a failure is never silent either: it goes into `restored`, which
+  // is the operator-facing status the announcer reads.
+  const siblings = readRestartedUnits(manifest.restartedUnits);
+  if (siblings.kind === 'malformed') {
+    restored.push(`SIBLING SERVICES NOT RESTARTED — ${siblings.detail}; restart them by hand`);
+    console.error('deploy-crash-guard: unusable restartedUnits —', siblings.detail);
+  } else if (!commitReset) {
+    if (siblings.kind === 'units' && siblings.units.length > 0) {
+      restored.push(`${siblings.units.length} sibling service(s) left running (commit reset skipped)`);
+    }
+  } else if (siblings.kind === 'absent') {
+    // Said, not inferred from silence: a pre-#822 manifest restarted nothing,
+    // so there is nothing to undo — which is a different fact from `[]`.
+    console.error('deploy-crash-guard: manifest predates sibling restarts — no services to put back');
+  } else {
+    for (const unit of siblings.units) {
+      try {
+        deps.execFile('sudo', ['systemctl', 'restart', unit], { cwd: root });
+        restored.push(unit);
+      } catch (err) {
+        restored.push(`${unit} FAILED TO RESTART — it is NOT running the restored code`);
+        console.error(`deploy-crash-guard: could not restart ${unit}`, err);
+      }
+    }
   }
   if (manifest.imageBase) {
     try {

@@ -3,9 +3,23 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { evaluateBoot, markDeployBootHealthy, performRollback, runDeployCrashGuard } from './deploy-crash-guard.js';
+import {
+  evaluateBoot,
+  markDeployBootHealthy,
+  performRollback,
+  readRestartedUnits,
+  runDeployCrashGuard,
+} from './deploy-crash-guard.js';
 
 let root: string;
+
+interface RollbackManifestForTest {
+  commit: string;
+  imageBase: string;
+  timestamp: string;
+  node?: string;
+  restartedUnits?: unknown;
+}
 
 function writeManifest(ageMs: number, commit = 'a'.repeat(40)): void {
   fs.mkdirSync(path.join(root, 'data'), { recursive: true });
@@ -243,6 +257,135 @@ describe('performRollback', () => {
       error: string;
     };
     expect(status.error).toContain('tracked source changes preserved');
+  });
+});
+
+/**
+ * #822 r1: the sibling restarts deploy.sh performs before the handoff have to
+ * survive the POST-handoff rollback too. Concrete sequence the shell tests
+ * cannot reach: the sibling is restarted onto the deployed commit, the
+ * `systemctl restart nanoclaw-v2` kills the deploy shell along with its
+ * in-memory unit list, the new build crash-loops, and on the third boot this
+ * guard resets the checkout — while the watcher stays resident on the rejected
+ * code and keeps mirroring it, under a status line announcing a clean rollback.
+ * The shell's list is gone by then, so the deploy records it in the manifest.
+ */
+describe('performRollback puts the deploy’s restarted services back', () => {
+  /** A rolled-back manifest listing `units` as restarted by the deploy. */
+  function manifestWith(restartedUnits: unknown): RollbackManifestForTest {
+    return { commit: 'e'.repeat(40), imageBase: '', timestamp: new Date().toISOString(), restartedUnits };
+  }
+
+  function rollback(manifest: RollbackManifestForTest, execCalls: string[][], failUnit?: string): void {
+    const base = fakeDeps(execCalls);
+    const deps = {
+      ...base,
+      execFile: (cmd: string, args: string[]) => {
+        if (failUnit && cmd === 'sudo' && args[2] === failUnit) {
+          execCalls.push([cmd, ...args]);
+          throw new Error('Failed to restart: unit not found');
+        }
+        return base.execFile(cmd, args);
+      },
+    };
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(() => performRollback(root, manifest as never, 3, deps as never)).toThrow(exitError);
+  }
+
+  function statusError(): string {
+    return (JSON.parse(fs.readFileSync(path.join(root, 'logs', 'deploy-status.json'), 'utf-8')) as { error: string })
+      .error;
+  }
+
+  function restartedUnitCalls(calls: string[][]): string[] {
+    return calls.filter(([cmd, sub]) => cmd === 'sudo' && sub === 'systemctl').map((c) => c[3]);
+  }
+
+  it('restarts each listed unit, after the checkout is back', () => {
+    const calls: string[][] = [];
+    rollback(manifestWith(['nanoclaw-codex-sync.service']), calls);
+    expect(restartedUnitCalls(calls)).toEqual(['nanoclaw-codex-sync.service']);
+    // Order matters: restarting before the reset would boot the sibling onto
+    // the very code being rolled back.
+    const resetAt = calls.findIndex(([cmd, action]) => cmd === 'git' && action === 'reset');
+    const restartAt = calls.findIndex(([cmd]) => cmd === 'sudo');
+    expect(resetAt).toBeGreaterThanOrEqual(0);
+    expect(restartAt).toBeGreaterThan(resetAt);
+    expect(statusError()).toContain('nanoclaw-codex-sync.service');
+  });
+
+  it('surfaces a failed restart in the operator-facing status instead of throwing', () => {
+    const calls: string[][] = [];
+    rollback(manifestWith(['a.service', 'nanoclaw-codex-sync.service']), calls, 'a.service');
+    // The failure does not abort the rollback — a throw here would crash the
+    // boot with the manifest still armed.
+    expect(restartedUnitCalls(calls)).toEqual(['a.service', 'nanoclaw-codex-sync.service']);
+    expect(statusError()).toContain('a.service FAILED TO RESTART');
+    expect(statusError()).toContain('nanoclaw-codex-sync.service');
+  });
+
+  it('refuses a malformed list loudly rather than reading it as nothing to do', () => {
+    for (const bad of ['nanoclaw-codex-sync.service', ['nanoclaw-codex-sync'], [42], ['a.service; rm -rf /']]) {
+      fs.rmSync(path.join(root, 'logs'), { recursive: true, force: true });
+      const calls: string[][] = [];
+      rollback(manifestWith(bad), calls);
+      expect(restartedUnitCalls(calls), JSON.stringify(bad)).toEqual([]);
+      expect(statusError(), JSON.stringify(bad)).toContain('SIBLING SERVICES NOT RESTARTED');
+    }
+  });
+
+  it('restarts nothing when the deploy restarted nothing, and never claims it did', () => {
+    const empty: string[][] = [];
+    rollback(manifestWith([]), empty);
+    expect(restartedUnitCalls(empty)).toEqual([]);
+    expect(statusError()).not.toContain('FAILED TO RESTART');
+    expect(statusError()).not.toContain('SIBLING SERVICES NOT RESTARTED');
+
+    // A manifest from a deploy.sh that predates the field: also nothing to do,
+    // but a different fact, and not one the guard may confuse with a malformed
+    // list either.
+    fs.rmSync(path.join(root, 'logs'), { recursive: true, force: true });
+    const legacy: string[][] = [];
+    rollback({ commit: 'f'.repeat(40), imageBase: '', timestamp: new Date().toISOString() }, legacy);
+    expect(restartedUnitCalls(legacy)).toEqual([]);
+    expect(statusError()).not.toContain('SIBLING SERVICES NOT RESTARTED');
+  });
+
+  it('leaves them alone when the reset was skipped, and says so', () => {
+    const calls: string[][] = [];
+    const base = fakeDeps(calls);
+    const deps = {
+      ...base,
+      // Tracked changes present -> performRollback skips the commit reset.
+      execFile: (cmd: string, args: string[]) => {
+        if (cmd === 'git' && args[0] === 'status') {
+          calls.push([cmd, ...args]);
+          return ' M src/foo.ts\n';
+        }
+        return base.execFile(cmd, args);
+      },
+    };
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(() =>
+      performRollback(root, manifestWith(['nanoclaw-codex-sync.service']) as never, 3, deps as never),
+    ).toThrow(exitError);
+    expect(restartedUnitCalls(calls)).toEqual([]);
+    expect(statusError()).toContain('1 sibling service(s) left running');
+  });
+});
+
+describe('readRestartedUnits', () => {
+  it('separates absent, empty and malformed', () => {
+    expect(readRestartedUnits(undefined)).toEqual({ kind: 'absent' });
+    expect(readRestartedUnits(null)).toEqual({ kind: 'absent' });
+    expect(readRestartedUnits([])).toEqual({ kind: 'units', units: [] });
+    expect(readRestartedUnits(['a.service', 'nanoclaw-unit-alert@.service'])).toEqual({
+      kind: 'units',
+      units: ['a.service', 'nanoclaw-unit-alert@.service'],
+    });
+    for (const bad of ['a.service', 42, {}, ['a.timer'], ['a service.service'], [''], [null]]) {
+      expect(readRestartedUnits(bad), JSON.stringify(bad)).toMatchObject({ kind: 'malformed' });
+    }
   });
 });
 
