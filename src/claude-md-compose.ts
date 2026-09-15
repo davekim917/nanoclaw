@@ -415,13 +415,14 @@ export async function composeGroupClaudeMd(
       // auto-loads the plugin's SessionStart hook through CLAUDE_PLUGINS_ROOT,
       // and Codex fires plugin hooks too — but ONLY for a plugin whose
       // `.codex-plugin/plugin.json` declares them AND whose hook identity is
-      // trusted. Container-side hook trust is what PR #827 installs; BEFORE IT
-      // LANDS, Codex plugin hooks are untrusted and inert, so a maintained
-      // plugin's directive reaches a Codex container by neither route. That gap
-      // is deliberate and ordered: #827 merges first, and the two deploy
-      // together, so the premise is true at the moment this code goes live.
-      // Composing for Codex in the meantime would deliver the text twice the
-      // day #827 merges.
+      // TRUSTED. That trust is not automatic: codex reports an unenrolled plugin
+      // hook as `trustStatus: "untrusted"` and never dispatches it, which made
+      // this gate's premise FALSE until #827 installed container-side hook
+      // trust. #827 is merged and is in this branch, so the premise holds. The
+      // ordering was the fix rather than the code — composing for Codex in the
+      // meantime would have delivered the text twice the day #827 landed.
+      // Re-check this gate if hook trust is removed, or if a plugin's manifest
+      // stops declaring the hooks file it ships.
       if (provider !== 'opencode') continue;
       // The repo ROOT's own generic ruleset, for a single-plugin repo whose
       // directive is not under a sub-plugin. Without this, such a repo would
