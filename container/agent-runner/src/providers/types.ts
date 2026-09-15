@@ -350,14 +350,16 @@ export interface AgentQuery {
    * launched with `run_in_background` above all — that will report back into
    * this session after the current turn's `result`. `claude.ts` mirrors the CLI's `background_tasks_changed` level
    * message (REPLACE semantics, ambient watchers excluded) and LATCHES it:
-   * once raised it releases at the CLI's idle with nothing live, never at
-   * the membership change that empties the set, because between that drain
-   * and the idle (or the `init` of a completion-started follow-up turn) the
-   * work is not over. The CLI gates its idle only on background SUBAGENTS;
-   * for the other task types it reports (a backgrounded Bash, a monitor with
-   * no timeout, …) idle arrives with them still live, and the hold then
-   * releases at the drain instead — those keep the protection they had
-   * before this hold, none past their completion. Consumers can act on the
+   * once raised it releases at the CLI's idle with nothing live. For a
+   * background subagent the membership change that empties the set is NOT
+   * the release, because between that drain and the idle (or the `init` of
+   * a completion-started follow-up turn) the work is not over — the CLI
+   * withholds idle for subagents until then. For the other task types it
+   * reports (a backgrounded Bash, a monitor with no timeout, …) the CLI does
+   * not gate its idle, so idle arrives with them still live; once that has
+   * been observed over exactly those tasks, their drain is the release —
+   * they keep the protection they had before this hold, none past their
+   * completion. Consumers can act on the
    * predicate directly. The other providers have no such work and leave it
    * undefined.
    *
