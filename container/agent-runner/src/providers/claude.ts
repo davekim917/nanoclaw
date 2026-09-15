@@ -3062,12 +3062,21 @@ export class ClaudeProvider implements AgentProvider {
             if (t && typeof t.task_id === 'string' && t.ambient !== true) liveBackgroundTasks.add(t.task_id);
           }
           log(`Background tasks: ${liveBackgroundTasks.size} live`);
-          yield { type: 'background_work', live: liveBackgroundTasks.size };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'session_state_changed') {
           sessionStateSeen = true;
           if ((message as { state?: string }).state === 'idle') {
             const unansweredPrompts = stream.settle();
             if (unansweredPrompts.length > 0) yield { type: 'settled', unansweredPrompts };
+            // Report the background level HERE, not at the membership change:
+            // on this CLI idle is withheld while background agents run and
+            // fires only once the bg-agent loop exits (sdk.d.ts on
+            // SDKSessionStateChangedMessage; CLI 2.1.272 changelog — headless
+            // sessions stopped reporting idle with agents still running,
+            // CLAUDE_CODE_BG_TASKS_REPORT_RUNNING defaults on). So `live: 0`
+            // at idle is the CLI confirming no follow-up turn is coming, and
+            // the poll-loop can lower the level it held for that work without
+            // opening a gap before a completion-started turn's `init`.
+            yield { type: 'background_work', live: liveBackgroundTasks.size };
           }
         } else if (message.type === 'assistant') {
           // Record tool_use id → name so a later task_notification can be
@@ -3192,12 +3201,12 @@ export class ClaudeProvider implements AgentProvider {
       push: (msg) => stream.push(msg),
       initialPromptId,
       // Holds the turn level while a prompt is unanswered. The hold ends at the
-      // prompt's echo or at the CLI's idle; there is no runner-side timer. It
-      // relies on the CLI (2.1.272) emitting idle even while background agents
-      // run: a CLI that withheld idle during background work (for example with
-      // CLAUDE_CODE_BG_TASKS_REPORT_RUNNING on by default) would hold the level
-      // for that work's duration after a dropped echo, bounded only by the
-      // 30-minute ceiling.
+      // prompt's echo or at the CLI's idle; there is no runner-side timer. On
+      // this CLI (2.1.272) idle is withheld while background agents run
+      // (CLAUDE_CODE_BG_TASKS_REPORT_RUNNING defaults on — verified in the
+      // binary's changelog), so a dropped echo during background work holds
+      // the level for that work's duration, which is also what
+      // hasBackgroundWork below wants; the 30-minute ceiling stays the bound.
       hasQueuedWork: () => sessionStateSeen && stream.outstanding.size > 0,
       // Background agents outlive the turn that launched them; the CLI reports
       // them back into this same stream when they finish (task_notification,

@@ -2238,8 +2238,8 @@ export async function processQuery(
     // idle for it and the task reaper killed the container — and the agent —
     // within one sweep tick (2026-09-15: a task session's parent ended each
     // turn on a `wait`, was reaped 15–60s later nine times in 80 minutes, and
-    // every delegated worker died mid-flight). The `background_work` event
-    // re-runs this once the set drains.
+    // every delegated worker died mid-flight). The `background_work` report
+    // at the CLI's idle re-runs this once that work is done.
     if (query.hasBackgroundWork?.()) return;
     setProviderTurnExecuting(false);
   };
@@ -2526,12 +2526,11 @@ export async function processQuery(
         lowerTurnLevelUnlessQueued();
       } else if (event.type === 'background_work') {
         // The level was held at `result` for this work (lowerTurnLevelUnlessQueued).
-        // Once it drains with no turn running, the container is idle. When the
-        // drain does start a follow-up turn (the CLI folds the completion in
-        // as a task-notification and answers it), that turn's `init` raises
-        // the level again on its own; the only exposure is the CLI's gap
-        // between the two, against a 60s sweep. A drain mid-turn changes
-        // nothing: the turn's own `result` decides.
+        // The provider reports the level at the CLI's idle, which that CLI
+        // withholds until background agents are done and any follow-up turn
+        // they start has run — so `live: 0` with no turn running means the
+        // container is genuinely idle, with no init still on its way. A
+        // report mid-turn changes nothing: the turn's own `result` decides.
         if (event.live === 0 && turnIdle && !resultScopeOpen) lowerTurnLevelUnlessQueued();
       } else if (event.type === 'compacted') {
         advanceMemoryContextEpoch(providerName);

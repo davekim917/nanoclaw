@@ -61,7 +61,7 @@ async function drain(): Promise<{ events: Ev[]; sampled: boolean[]; before: bool
 }
 
 describe('background_tasks_changed → hasBackgroundWork', () => {
-  it('starts empty, follows the level set with replace semantics, excludes ambient entries', async () => {
+  it('starts empty, follows the level set with replace semantics, excludes ambient entries, reports at idle', async () => {
     sdkMessages.push(
       { type: 'system', subtype: 'init', session_id: 'sess-1' },
       {
@@ -73,34 +73,56 @@ describe('background_tasks_changed → hasBackgroundWork', () => {
         ],
       },
       { type: 'result', subtype: 'success', result: '<internal>delegated, waiting</internal>' },
-      // The agent finished; only the ambient watcher remains → no work.
+      // The agent finished; only the ambient watcher remains → no work. The
+      // CLI withheld idle until now.
       {
         type: 'system',
         subtype: 'background_tasks_changed',
         tasks: [{ task_id: 'watch-1', task_type: 'live_update', description: 'artifact watch', ambient: true }],
       },
+      { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id: 'sess-1' },
     );
 
     const { events, sampled, before } = await drain();
     expect(before).toBe(false);
 
+    // The membership change itself emits nothing; the level is reported at idle.
     const bg = events.map((e, i) => ({ e, i })).filter(({ e }) => e.type === 'background_work');
-    expect(bg.map(({ e }) => e.live)).toEqual([1, 0]);
-    // Live after the first level message, through the result, until the drain.
-    expect(sampled[bg[0].i]).toBe(true);
+    expect(bg.map(({ e }) => e.live)).toEqual([0]);
     const resultIdx = events.findIndex((e) => e.type === 'result');
-    expect(resultIdx).toBeGreaterThan(bg[0].i);
+    expect(bg[0].i).toBeGreaterThan(resultIdx);
+    // hasBackgroundWork tracks the set: live through the result, false once
+    // only the ambient watcher remains.
     expect(sampled[resultIdx]).toBe(true);
-    expect(sampled[bg[1].i]).toBe(false);
+    expect(sampled[bg[0].i]).toBe(false);
+  });
+
+  it('reports the live count at an idle that arrives with work still running', async () => {
+    sdkMessages.push(
+      { type: 'system', subtype: 'init', session_id: 'sess-3' },
+      {
+        type: 'system',
+        subtype: 'background_tasks_changed',
+        tasks: [{ task_id: 'agent-1', task_type: 'local_agent', description: 'worker' }],
+      },
+      { type: 'result', subtype: 'success', result: '<internal>delegated</internal>' },
+      { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id: 'sess-3' },
+    );
+    const { events, sampled } = await drain();
+    const bg = events.filter((e) => e.type === 'background_work');
+    expect(bg.map((e) => e.live)).toEqual([1]);
+    expect(sampled[sampled.length - 1]).toBe(true);
   });
 
   it('a CLI that never emits the level message reports no background work', async () => {
     sdkMessages.push(
       { type: 'system', subtype: 'init', session_id: 'sess-2' },
       { type: 'result', subtype: 'success', result: '<internal>done</internal>' },
+      { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id: 'sess-2' },
     );
     const { events, sampled } = await drain();
-    expect(events.some((e) => e.type === 'background_work')).toBe(false);
+    const bg = events.filter((e) => e.type === 'background_work');
+    expect(bg.map((e) => e.live)).toEqual([0]);
     expect(sampled.every((v) => v === false)).toBe(true);
   });
 });

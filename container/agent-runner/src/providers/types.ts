@@ -533,13 +533,15 @@ export type ProviderEvent =
    */
   | { type: 'settled'; unansweredPrompts: string[] }
   /**
-   * The provider's set of live background tasks changed; `live` is how many
-   * remain (ambient watchers excluded). Emitted by a provider that implements
-   * `hasBackgroundWork`, on every change. The poll-loop uses the drain to
-   * zero (`live === 0`) to lower the busy level it held for that work when no
-   * turn is running — otherwise the level would stay up until the next
-   * `result`, and a background task whose completion starts no follow-up turn
-   * would pin the container past every reaper.
+   * The provider's background level, `live` non-ambient tasks, reported at
+   * the CLI's authoritative turn-over signal (`session_state_changed: idle`)
+   * by a provider that implements `hasBackgroundWork`. That signal is withheld
+   * while background agents run and fires once their loop exits, so
+   * `live === 0` here means the CLI has confirmed no completion-started
+   * follow-up turn is coming. The poll-loop lowers the busy level it held for
+   * that work on it, when no turn is running — reporting at the membership
+   * change instead would open a gap between the drain and the follow-up
+   * turn's `init` in which a sweep could reap the container.
    */
   | { type: 'background_work'; live: number }
   /**

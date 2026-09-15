@@ -2707,18 +2707,20 @@ describe('processQuery provider_executing', () => {
   // ended on a `wait`, and the idle reaper killed the container 15–60s later
   // — nine times in 80 minutes, every worker lost. The provider reports the
   // CLI's live background set (hasBackgroundWork); `result` must hold the
-  // level while it is non-empty.
-  it('holds the level at `result` while the provider reports live background work', async () => {
+  // level while it is non-empty. The provider reports the level again at the
+  // CLI's idle, which the CLI withholds until background agents are done and
+  // any follow-up turn they start has run — that report is what lowers it.
+  it('holds the level at `result` while the provider reports live background work, and lowers on the idle report', async () => {
     const observed: Record<string, number> = {};
     let live = 1;
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'sess-bg' };
       yield { type: 'result', text: '<internal>delegated, waiting</internal>', answeredPrompts: ['p-initial'] };
       observed.afterResultWithBackground = providerExecuting();
-      // The worker finishes: the CLI's level set drains between turns.
+      // The worker finishes with no follow-up turn; the CLI's idle arrives.
       live = 0;
       yield { type: 'background_work', live: 0 };
-      observed.afterDrain = providerExecuting();
+      observed.afterIdleReport = providerExecuting();
     }
     const query: AgentQuery = {
       push: () => {},
@@ -2733,7 +2735,7 @@ describe('processQuery provider_executing', () => {
     await processQuery(query, ERR_ROUTING, ['m-bg'], 'claude', undefined, 'prompt', undefined, {});
 
     expect(observed.afterResultWithBackground).toBe(1);
-    expect(observed.afterDrain).toBe(0);
+    expect(observed.afterIdleReport).toBe(0);
     expect(providerExecuting()).toBe(0);
   });
 
@@ -2744,17 +2746,17 @@ describe('processQuery provider_executing', () => {
       yield { type: 'init', continuation: 'sess-bg2' };
       yield { type: 'result', text: '<internal>delegated</internal>', answeredPrompts: ['p-initial'] };
       observed.afterResult = providerExecuting();
-      // A membership change that leaves work live (one of two finished)
-      // must not lower anything.
-      yield { type: 'background_work', live: 1 };
-      observed.afterPartialDrain = providerExecuting();
+      // No idle report while the worker runs: the CLI withholds it. The
+      // worker finishes and the CLI folds the completion in as a turn of its
+      // own — `init` before any report.
       live = 0;
-      yield { type: 'background_work', live: 0 };
-      // The CLI folds the completion in and starts a turn of its own.
       yield { type: 'init', continuation: 'sess-bg2' };
       observed.followUpRunning = providerExecuting();
       yield { type: 'result', text: '<internal>reported</internal>', answeredPrompts: [] };
       observed.afterFollowUp = providerExecuting();
+      // Then the idle report — nothing left to lower.
+      yield { type: 'background_work', live: 0 };
+      observed.afterIdleReport = providerExecuting();
     }
     const query: AgentQuery = {
       push: () => {},
@@ -2769,21 +2771,27 @@ describe('processQuery provider_executing', () => {
     await processQuery(query, ERR_ROUTING, ['m-bg2'], 'claude', undefined, 'prompt', undefined, {});
 
     expect(observed.afterResult).toBe(1);
-    expect(observed.afterPartialDrain).toBe(1);
     expect(observed.followUpRunning).toBe(1);
     expect(observed.afterFollowUp).toBe(0);
+    expect(observed.afterIdleReport).toBe(0);
   });
 
-  it('ignores a background drain that lands mid-turn — the turn\'s own result decides', async () => {
+  it('ignores a background report that still shows live work, or that lands mid-turn', async () => {
     const observed: Record<string, number> = {};
     let live = 1;
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'sess-bg3' };
+      // A report mid-turn (whatever it says) never lowers a running turn.
+      yield { type: 'background_work', live: 0 };
+      observed.midTurn = providerExecuting();
+      yield { type: 'result', text: '<internal>delegated</internal>', answeredPrompts: ['p-initial'] };
+      observed.afterResult = providerExecuting();
+      // A between-turns report with work still live keeps the hold.
+      yield { type: 'background_work', live: 1 };
+      observed.afterLiveReport = providerExecuting();
       live = 0;
       yield { type: 'background_work', live: 0 };
-      observed.midTurnAfterDrain = providerExecuting();
-      yield { type: 'result', text: '<internal>done</internal>', answeredPrompts: ['p-initial'] };
-      observed.afterResult = providerExecuting();
+      observed.afterIdleReport = providerExecuting();
     }
     const query: AgentQuery = {
       push: () => {},
@@ -2797,8 +2805,10 @@ describe('processQuery provider_executing', () => {
 
     await processQuery(query, ERR_ROUTING, ['m-bg3'], 'claude', undefined, 'prompt', undefined, {});
 
-    expect(observed.midTurnAfterDrain).toBe(1);
-    expect(observed.afterResult).toBe(0);
+    expect(observed.midTurn).toBe(1);
+    expect(observed.afterResult).toBe(1);
+    expect(observed.afterLiveReport).toBe(1);
+    expect(observed.afterIdleReport).toBe(0);
   });
 
   it('lowers the level when the provider settles the queued prompt at idle', async () => {
@@ -3819,6 +3829,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
       // CLI: several polls see occ-2 here and must not end() — the open input
       // is what keeps that worker alive.
       await Bun.sleep(1600);
+      // The worker finishes; the CLI's idle report says nothing is live.
       live = 0;
       drained = true;
       yield { type: 'background_work', live: 0 };
