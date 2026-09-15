@@ -15,6 +15,7 @@ import {
   buildRuntimeConfigForTest,
   planCodexPluginRegistration,
   projectCodexPluginConfigForTest,
+  readCodexConfigToml,
   renderMcpServerForTest,
   setupCodexRuntime,
   stripPluginsAndMarketplacesForTest,
@@ -507,6 +508,64 @@ function parseTrustEntries(toml: string): Map<string, string> {
   return entries;
 }
 
+describe('readCodexConfigToml', () => {
+  // Every config.toml read in this module exists only to REWRITE the file from
+  // what it read, so "could not look" collapsing into "nothing there" does not
+  // lose a read, it loses the file — and the write then succeeds, which is why
+  // no caller notices. Three answers, not two.
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-config-read-'));
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('returns the contents when the file is readable', () => {
+    const p = path.join(dir, 'config.toml');
+    fs.writeFileSync(p, '[features]\nhooks = true\n');
+    expect(readCodexConfigToml(p)).toBe('[features]\nhooks = true\n');
+  });
+
+  it('answers empty for an absent file — ENOENT is the only absence', () => {
+    expect(readCodexConfigToml(path.join(dir, 'missing.toml'))).toBe('');
+    // A missing PARENT is ENOENT too, and is genuinely absent.
+    expect(readCodexConfigToml(path.join(dir, 'nodir', 'config.toml'))).toBe('');
+  });
+
+  it('throws for a file that exists but cannot be read', () => {
+    const p = path.join(dir, 'config.toml');
+    fs.writeFileSync(p, '[features]\nhooks = true\n');
+    fs.chmodSync(p, 0o200);
+    try {
+      expect(() => readCodexConfigToml(p)).toThrow(/could not read Codex config/i);
+    } finally {
+      fs.chmodSync(p, 0o600);
+    }
+  });
+
+  it('is the only way this module reads a config.toml', () => {
+    // The pattern audit, not a grep done once by hand: the defect was
+    // `existsSync(p) ? readFileSync(p) : ''` at the site that feeds every
+    // OAuth fallback home, which `existsSync` answering false on EACCES turns
+    // into an empty projection over all of them. Reintroducing that shape at
+    // ANY site fails here.
+    const source = fs.readFileSync(new URL('./codex-companion-setup.ts', import.meta.url), 'utf-8');
+    const helperAt = source.indexOf('export function readCodexConfigToml');
+    expect(helperAt).toBeGreaterThan(-1);
+    const helper = source.slice(helperAt, source.indexOf('\n}\n', helperAt));
+    const outsideHelper = source.slice(0, helperAt) + source.slice(helperAt + helper.length);
+
+    // Report the offending LINES, not the whole file — a 900-line diff in the
+    // failure message is a test nobody reads.
+    const offenders = outsideHelper
+      .split('\n')
+      .filter((line) => /existsSync\([^)]*[Cc]onfig[^)]*\)\s*\?/.test(line) || /readFileSync\([^)]*[Cc]onfigPath/.test(line))
+      .map((line) => line.trim());
+    expect(offenders).toEqual([]);
+    // …and the helper itself is still the three-answer one.
+    expect(helper).toContain("code === 'ENOENT'");
+  });
+});
+
 describe('writeCodexHooksAndTrust', () => {
   let home: string;
 
@@ -543,6 +602,31 @@ describe('writeCodexHooksAndTrust', () => {
     } finally {
       fs.chmodSync(configPath, 0o600);
       fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('throws, and leaves config.toml untouched, when the config is unreadable but writable', () => {
+    // The read side of the same class as the test above, and the one that is
+    // worse: rewriting from an empty base SUCCEEDS, so nothing fails, and the
+    // file it writes has lost `[features] hooks = true` — codex then loads no
+    // hooks at all and the app-server starts. Mode 0200 is the live shape (a
+    // mount that kept write and lost read); only ENOENT means "absent".
+    const roHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-trust-unreadable-'));
+    const configPath = path.join(roHome, 'config.toml');
+    const original = '[features]\nhooks = true\n\n[marketplaces.mkt]\nsource_type = "local"\n';
+    fs.writeFileSync(configPath, original);
+    fs.chmodSync(configPath, 0o200);
+    try {
+      expect(() => writeCodexHooksAndTrust({ codexHome: roHome, pluginsRoot: path.join(roHome, 'no-plugins') })).toThrow(
+        /could not read Codex config/i,
+      );
+      fs.chmodSync(configPath, 0o600);
+      // The feature flag and the plugin tables are still there — the refusal
+      // happened BEFORE the rewrite, not after a partial one.
+      expect(fs.readFileSync(configPath, 'utf-8')).toBe(original);
+    } finally {
+      fs.chmodSync(configPath, 0o600);
+      fs.rmSync(roHome, { recursive: true, force: true });
     }
   });
 

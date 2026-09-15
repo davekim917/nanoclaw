@@ -376,6 +376,36 @@ function pluginHookTrustEntries(pluginsRoot: string): CodexHookTrustEntry[] {
 }
 
 /**
+ * Read a `config.toml`, keeping "it is not there" and "I could not look"
+ * apart.
+ *
+ * Every caller here reads a config.toml only to REWRITE it from what it read,
+ * so collapsing a read failure into `''` does not lose a read — it loses the
+ * file. The base a rewrite starts from carries `[features] hooks = true`
+ * (`CONTAINER_CODEX_CONFIG_BASE`, `providers/codex.ts`), without which codex
+ * loads no hooks at all, plus the `[marketplaces.*]` / `[plugins.*]` tables
+ * `codex plugin add` wrote. Rewriting from `''` therefore deletes the feature
+ * flag that makes the guard chain exist, the write succeeds, and the spawn
+ * continues — the same silent-inert end state this module exists to prevent,
+ * reached from the read side instead of the write side. A file that is
+ * unreadable but writable (mode `0200`, a mount that lost read access) is the
+ * live shape.
+ *
+ * So ENOENT — and only ENOENT — is an empty base. Everything else throws, and
+ * the caller decides.
+ */
+export function readCodexConfigToml(configPath: string): string {
+  try {
+    return fs.readFileSync(configPath, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return '';
+    const detail = err instanceof Error ? err.message : String(err);
+    log(`FAILED to read ${configPath} — refusing to rewrite it from an empty base: ${detail}`);
+    throw new Error(`could not read Codex config at ${configPath}: ${detail}`);
+  }
+}
+
+/**
  * Rewrite the `[hooks.state.*]` tables in `<codexHome>/config.toml` so every
  * hook this container generates or mounts is TRUSTED.
  *
@@ -399,12 +429,7 @@ export function syncCodexHookTrust(
     ...collectCodexHookTrustEntries(path.join(codexHome, 'hooks.json'), buildCodexHooksJson(opts).hooks),
     ...pluginHookTrustEntries(opts?.pluginsRoot ?? CONTAINER_PLUGINS_DIR),
   ];
-  let existing = '';
-  try {
-    existing = fs.readFileSync(configPath, 'utf-8');
-  } catch {
-    existing = '';
-  }
+  const existing = readCodexConfigToml(configPath);
   try {
     fs.mkdirSync(codexHome, { recursive: true });
     fs.writeFileSync(configPath, mergeCodexHookTrustIntoToml(existing, entries));
@@ -604,9 +629,32 @@ export function setupCodexPrimaryRuntime(
   }
   const projectedFallbacks: string[] = [];
   const primaryConfigPath = path.join(HOST_CODEX_DIR, 'config.toml');
-  const primaryConfig = fs.existsSync(primaryConfigPath) ? fs.readFileSync(primaryConfigPath, 'utf-8') : '';
+  // Same class as the read inside `syncCodexHookTrust`, at the site that feeds
+  // EVERY fallback home: `existsSync` answers false on EACCES as readily as on
+  // absence, so an unreadable primary used to project an EMPTY config into each
+  // fallback — dropping `[features] hooks = true` and the plugin tables there,
+  // in one pass, for the homes an OAuth rotation is about to switch to. Skip the
+  // projection instead: leaving a fallback's own config standing is recoverable,
+  // overwriting it with nothing is not, and the spawn re-derives hooks and trust
+  // for whichever home it lands on.
+  const primaryConfig = ((): string | null => {
+    try {
+      return readCodexConfigToml(primaryConfigPath);
+    } catch (err) {
+      registration.errors.push(
+        `${primaryConfigPath}: unreadable — skipped projecting it into ${fallbackHomes.length} fallback home(s) ` +
+          `rather than writing an empty config over them: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
+  })();
 
-  for (const fallbackHome of fallbackHomes) {
+  // Pairing each home with the base it projects is what lets the "we could not
+  // read the primary" case be an EMPTY list rather than a null threaded through
+  // the loop body.
+  const projections = primaryConfig === null ? [] : fallbackHomes.map((home) => [home, primaryConfig] as const);
+
+  for (const [fallbackHome, basePrimaryConfig] of projections) {
     try {
       fs.mkdirSync(fallbackHome, { recursive: true });
       replaceWithDirectorySymlink(path.join(fallbackHome, 'plugins'), path.join(HOST_CODEX_DIR, 'plugins'));
@@ -616,8 +664,8 @@ export function setupCodexPrimaryRuntime(
       );
 
       const fallbackConfigPath = path.join(fallbackHome, 'config.toml');
-      const fallbackConfig = fs.existsSync(fallbackConfigPath) ? fs.readFileSync(fallbackConfigPath, 'utf-8') : '';
-      fs.writeFileSync(fallbackConfigPath, projectCodexPluginConfig(primaryConfig, fallbackConfig));
+      const fallbackConfig = readCodexConfigToml(fallbackConfigPath);
+      fs.writeFileSync(fallbackConfigPath, projectCodexPluginConfig(basePrimaryConfig, fallbackConfig));
       // Trust entries are keyed on the home's OWN hooks.json path, so the
       // projection cannot carry the primary's — derive them for this home.
       syncCodexHookTrust(fallbackHome);
