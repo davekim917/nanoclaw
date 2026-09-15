@@ -1309,7 +1309,7 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
  * directory if necessary. Pretty-printed JSON so diffs in the activation
  * flow are reviewable.
  *
- * Refuses to overwrite an existing file whose root PARSES but is not a JSON
+ * Refuses to overwrite an existing file the reader cannot understand as an
  * object. `readContainerConfig` is deliberately tolerant — it reads every field
  * and defaults a document it cannot understand, so a group whose model is
  * unreadable still boots — and every caller here is read-modify-write
@@ -1323,10 +1323,20 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
  * mount. Tolerance is the right shape for READING a field; it is not a licence
  * to normalize away a document nobody has agreed to discard.
  *
- * Only the parses-but-is-not-an-object case is refused. Bytes that do not parse
- * at all are left as they were: that is a different question — there is no
- * structure to have lost a field from — and refusing it here would leave a
- * group with a corrupt file no repair path could rewrite.
+ * Unparseable bytes are refused on the same terms — which the third substitute
+ * pass argued for, and which this function originally got wrong by carving them
+ * out. A truncated write leaves exactly the realistic case,
+ * `{"excludePlugins": ["…"],` — the entries visibly in the file, the tolerant
+ * reader answering "none" — and nothing here can tell that from any other parse
+ * failure. The objection to refusing it was that a corrupt file would then have
+ * no repair path; the answer is that automatic replacement was never one. Every
+ * caller is read-modify-write over the tolerant reader
+ * (`updateContainerConfig`, `ensureRuntimeFields` on the spawn path, and
+ * `applyOptOut` in `scripts/enable-agent-plugin.ts`), so each would write the
+ * reader's guess rather than the operator's file. The one caller that
+ * legitimately CREATES a config, `initContainerConfig`, returns before writing
+ * when the file exists, so nothing about first-time setup changes. Repair is a
+ * person editing the file, and the error message says so.
  */
 export function writeContainerConfig(folder: string, config: ContainerConfig): void {
   validateMcpServers(config.mcpServers ?? {});
@@ -1341,23 +1351,35 @@ export function writeContainerConfig(folder: string, config: ContainerConfig): v
 }
 
 /**
- * Throw when `p` holds valid JSON whose root is not an object — see
- * `writeContainerConfig`. Absent, unreadable, or unparseable files pass: each
- * of those is a file with no fields to lose.
+ * Throw unless `p` is absent or holds a JSON object — see
+ * `writeContainerConfig`. ABSENCE is the one state that passes, and it is
+ * distinguished from a failed read rather than inferred from one: a file that
+ * cannot be read or parsed may hold fields the writer is about to discard,
+ * while a file that is not there holds none.
  */
 function assertOverwritableContainerConfig(p: string): void {
+  const refuse = (why: string): never => {
+    throw new Error(
+      `refusing to overwrite ${p}: ${why}, so any field it declares (excludePlugins among them) would be ` +
+        'discarded rather than read. Fix the file by hand — nothing here rewrites it for you.',
+    );
+  };
+  let raw: string;
+  try {
+    raw = fs.readFileSync(p, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return;
+    return refuse(`it exists but could not be read (${(err as Error).message})`);
+  }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
+    parsed = JSON.parse(raw);
   } catch {
-    return;
+    return refuse('its contents are not valid JSON');
   }
   if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) return;
   const shape = parsed === null ? 'null' : Array.isArray(parsed) ? 'array' : typeof parsed;
-  throw new Error(
-    `refusing to overwrite ${p}: its root is a JSON ${shape}, not an object, so any field it declares ` +
-      '(excludePlugins among them) would be discarded rather than read. Fix the file by hand.',
-  );
+  refuse(`its root is a JSON ${shape}, not an object`);
 }
 
 /**

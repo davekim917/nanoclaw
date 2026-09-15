@@ -31,7 +31,12 @@ vi.mock('./config.js', async (importOriginal) => ({
   DATA_DIR: dirs.DATA_DIR,
 }));
 
-import { readContainerConfig, updateContainerConfig, writeContainerConfig } from './container-config.js';
+import {
+  initContainerConfig,
+  readContainerConfig,
+  updateContainerConfig,
+  writeContainerConfig,
+} from './container-config.js';
 import type { ContainerConfig } from './container-config.js';
 
 /** The smallest complete config — every required field, nothing else. */
@@ -90,12 +95,40 @@ describe('writeContainerConfig refuses to overwrite a non-object root', () => {
     expect(readContainerConfig(FOLDER).groupName).toBe('probe');
   });
 
-  it('still writes over bytes that do not parse at all — no structure to have lost a field from', () => {
-    // Deliberately NOT refused: a file that is not JSON has no fields the
-    // reader dropped, and refusing here would leave a group with a corrupt
-    // config no repair path could rewrite.
-    fs.writeFileSync(configFile(), '{ this is not json');
+  it('REFUSES bytes that do not parse at all — a truncated write is the realistic corruption', () => {
+    // This case was carved OUT in the first version of this guard, on the
+    // ground that a corrupt file would otherwise have no repair path. The
+    // third substitute pass argued it back in and was right: a truncated write
+    // leaves the entries visibly in the file, the tolerant reader answers
+    // "none", and nothing distinguishes that from any other parse failure.
+    // Automatic replacement was never a repair path — every writer is
+    // read-modify-write over that reader (`updateContainerConfig`,
+    // `ensureRuntimeFields`, `applyOptOut`), so each would persist the
+    // reader's guess. Repair is a person editing the file.
+    const truncated = '{"excludePlugins": ["bootstrap/plugins/orchestrate"],';
+    fs.writeFileSync(configFile(), truncated);
+    expect(() => writeContainerConfig(FOLDER, baseConfig())).toThrow(/not valid JSON/);
+    expect(fs.readFileSync(configFile(), 'utf8')).toBe(truncated);
+  });
+
+  it('distinguishes ABSENCE from a failed read — the one state that may be overwritten', () => {
+    // A directory at the config path cannot be read as a file, and might have
+    // been anything; absence is the only state that provably holds no field.
+    fs.rmSync(configFile(), { force: true });
+    fs.mkdirSync(configFile());
+    expect(() => writeContainerConfig(FOLDER, baseConfig())).toThrow(/could not be read/);
+    fs.rmdirSync(configFile());
     writeContainerConfig(FOLDER, baseConfig());
     expect(readContainerConfig(FOLDER).groupName).toBe('probe');
+  });
+
+  it('leaves first-time initialization alone — initContainerConfig never writes over a file', () => {
+    // The only caller that legitimately CREATES a config returns before
+    // writing when one exists, so a refused overwrite cannot wedge setup.
+    fs.rmSync(configFile(), { force: true });
+    expect(initContainerConfig(FOLDER)).toBe(true);
+    fs.writeFileSync(configFile(), '{ truncated');
+    expect(initContainerConfig(FOLDER)).toBe(false);
+    expect(fs.readFileSync(configFile(), 'utf8')).toBe('{ truncated');
   });
 });
