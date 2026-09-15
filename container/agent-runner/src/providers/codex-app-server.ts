@@ -726,8 +726,15 @@ export function buildCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): {
  * coverage. Email-gate is on the PreToolUse chain — its 60-minute admin
  * approval wait requires a long timeout (`emailGateTimeoutSec`), so this
  * event gets the longest timeout in the file.
+ *
+ * Writing the file is only half the wiring: Codex will not RUN an untrusted
+ * hook, so the resolved home ALSO needs matching `[hooks.state.*]` entries in
+ * its config.toml. Returning the directory is what lets the caller
+ * (`writeCodexHooksAndTrust` in ../codex-companion-setup.ts) key those entries
+ * on the home this call actually wrote to, including after an OAuth-fallback
+ * rotation.
  */
-export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number; codexHome?: string }): void {
+export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number; codexHome?: string }): string {
   // Honor CODEX_HOME (see writeCodexMcpConfigToml): hooks.json is the destructive-
   // guard wiring, so a rotated fallback home MUST get the regenerated hooks or the
   // guard silently stops firing after an OAuth rotation. An explicit codexHome
@@ -740,6 +747,7 @@ export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number; codex
   const hooks = buildCodexHooksJson(opts);
   fs.writeFileSync(hooksJsonPath, JSON.stringify(hooks, null, 2));
   log(`Wrote hooks.json (PreToolUse timeout=${hooks.hooks.PreToolUse[0].hooks[0].timeout}s)`);
+  return codexConfigDir;
 }
 
 /**

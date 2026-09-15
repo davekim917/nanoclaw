@@ -38,7 +38,19 @@ import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { parseTomlTableHeader, tomlBasicString, tomlKey, writeCodexHooksJson } from './providers/codex-app-server.js';
+import {
+  buildCodexHooksJson,
+  parseTomlTableHeader,
+  tomlBasicString,
+  tomlKey,
+  writeCodexHooksJson,
+} from './providers/codex-app-server.js';
+import {
+  type CodexHookTrustEntry,
+  collectCodexHookTrustEntries,
+  collectPluginHookTrustEntries,
+  mergeCodexHookTrustIntoToml,
+} from './providers/codex-hook-trust.js';
 import {
   type AgentRuntime,
   discoverPortableSkills,
@@ -335,6 +347,95 @@ function failClosed(what: string, err: unknown): string {
 }
 
 /**
+ * Trust entries for every plugin hook mounted at `/workspace/plugins`.
+ *
+ * DECISION: NanoClaw trusts operator-curated plugin hooks under Codex. The
+ * mount is read-only and operator-curated, and the Claude provider already
+ * dispatches these same plugins' hooks unconditionally through the SDK hook
+ * pass-through (`providers/claude.ts`), so declining to trust them under Codex
+ * buys no isolation — it only makes the two providers behave differently. The
+ * observable effect today is that the workflow-agents Codex destructive guard
+ * and its SessionStart role installer are silently inert in Codex containers.
+ *
+ * Keyed off `planCodexPluginRegistration`, so a plugin excluded from
+ * registration (deny-sibling, in-tree-shadowed, no manifest) is never trusted.
+ */
+function pluginHookTrustEntries(pluginsRoot: string): CodexHookTrustEntry[] {
+  if (!fs.existsSync(pluginsRoot)) return [];
+  const entries: CodexHookTrustEntry[] = [];
+  for (const plan of planCodexPluginRegistration(pluginsRoot)) {
+    if (plan.action !== 'register' || !plan.pluginDir || !plan.entryName || !plan.marketplaceName) continue;
+    entries.push(
+      ...collectPluginHookTrustEntries({
+        pluginId: `${plan.entryName}@${plan.marketplaceName}`,
+        dir: plan.pluginDir,
+      }),
+    );
+  }
+  return entries;
+}
+
+/**
+ * Rewrite the `[hooks.state.*]` tables in `<codexHome>/config.toml` so every
+ * hook this container generates or mounts is TRUSTED.
+ *
+ * Without this, Codex ≥0.154 loads the hooks, reports them as `untrusted` via
+ * `hooks/list`, and never dispatches them — the destructive-action guard chain
+ * fails open and silent. See `providers/codex-hook-trust.ts` for the hash.
+ *
+ * Idempotent and keyed on the home passed in, so it is safe to call again
+ * after `codex plugin add` has rewritten config.toml and after an OAuth
+ * fallback rotation has moved CODEX_HOME.
+ *
+ * `pluginsRoot` defaults to the real `/workspace/plugins` mount; it is
+ * injectable so tests can drive a fixture tree without a container.
+ */
+export function syncCodexHookTrust(
+  codexHome: string,
+  opts?: { emailGateTimeoutSec?: number; pluginsRoot?: string },
+): void {
+  const configPath = path.join(codexHome, 'config.toml');
+  const entries = [
+    ...collectCodexHookTrustEntries(path.join(codexHome, 'hooks.json'), buildCodexHooksJson(opts).hooks),
+    ...pluginHookTrustEntries(opts?.pluginsRoot ?? CONTAINER_PLUGINS_DIR),
+  ];
+  let existing = '';
+  try {
+    existing = fs.readFileSync(configPath, 'utf-8');
+  } catch {
+    existing = '';
+  }
+  try {
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(configPath, mergeCodexHookTrustIntoToml(existing, entries));
+  } catch (err) {
+    // Non-fatal on its own: the container still boots, but the guard chain is
+    // inert, so this must be loud.
+    log(
+      `FAILED to write hook trust entries to ${configPath} — Codex hooks will be UNTRUSTED and will not fire: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return;
+  }
+  log(`Hook trust: ${entries.length} entry(ies) written to ${configPath}`);
+}
+
+/**
+ * Write `hooks.json` AND the trust entries that make Codex actually run it.
+ * Every caller that used to call `writeCodexHooksJson` directly must call this
+ * instead — a hooks.json with no matching trust entry is a no-op file.
+ */
+export function writeCodexHooksAndTrust(opts?: {
+  emailGateTimeoutSec?: number;
+  codexHome?: string;
+  pluginsRoot?: string;
+}): string {
+  const home = writeCodexHooksJson(opts);
+  syncCodexHookTrust(home, opts);
+  return home;
+}
+
+/**
  * Set up `/home/node/.codex-runtime/` and return the path so callers can
  * point `CODEX_HOME` at it. Returns `null` ONLY when the codex auth mount is
  * absent (no host `~/.codex/auth.json`) — benign, since codex cannot run at
@@ -423,7 +524,7 @@ export function setupCodexRuntime(
   // install the same in-tree PreToolUse chain used by the Codex provider before
   // exposing the runtime. Fail closed if the guard wiring cannot be persisted.
   try {
-    writeCodexHooksJson({ codexHome: RUNTIME_CODEX_DIR });
+    writeCodexHooksAndTrust({ codexHome: RUNTIME_CODEX_DIR });
   } catch (err) {
     return failClosed('could not write the peer Codex hooks.json', err);
   }
@@ -433,6 +534,12 @@ export function setupCodexRuntime(
   // run AFTER config.toml is written (registration mutates config.toml
   // in-place via `codex plugin` under CODEX_HOME=RUNTIME_CODEX_DIR).
   registerContainerCodexPlugins(RUNTIME_CODEX_DIR, runtime);
+
+  // Re-sync AFTER registration: `codex plugin add` rewrites config.toml in
+  // place, and the newly-registered plugins' own hook files only become
+  // reachable once they are registered. Idempotent, so re-running it costs a
+  // file rewrite and nothing else.
+  syncCodexHookTrust(RUNTIME_CODEX_DIR);
 
   // Skills mirror is already populated by index.ts at startup with the correct
   // runtime; calling it again here without a runtime arg would default to
@@ -464,6 +571,12 @@ export function setupCodexPrimaryRuntime(
     .filter(Boolean),
 ): { registered: string[]; skipped: string[]; errors: string[]; projectedFallbacks: string[] } {
   const registration = registerContainerCodexPlugins(HOST_CODEX_DIR, 'codex');
+  // Trust the freshly-registered plugin hooks (and the generated guard chain)
+  // in the primary home. The provider rewrites config.toml + hooks.json again
+  // right before each app-server spawn (providers/codex.ts), but that rewrite
+  // preserves nothing it did not author, so the entries must be re-derived
+  // there too — `writeCodexHooksAndTrust` is what both paths go through.
+  syncCodexHookTrust(HOST_CODEX_DIR);
   const projectedFallbacks: string[] = [];
   const primaryConfigPath = path.join(HOST_CODEX_DIR, 'config.toml');
   const primaryConfig = fs.existsSync(primaryConfigPath) ? fs.readFileSync(primaryConfigPath, 'utf-8') : '';
@@ -480,6 +593,9 @@ export function setupCodexPrimaryRuntime(
       const fallbackConfigPath = path.join(fallbackHome, 'config.toml');
       const fallbackConfig = fs.existsSync(fallbackConfigPath) ? fs.readFileSync(fallbackConfigPath, 'utf-8') : '';
       fs.writeFileSync(fallbackConfigPath, projectCodexPluginConfig(primaryConfig, fallbackConfig));
+      // Trust entries are keyed on the home's OWN hooks.json path, so the
+      // projection cannot carry the primary's — derive them for this home.
+      syncCodexHookTrust(fallbackHome);
       projectedFallbacks.push(fallbackHome);
     } catch (err) {
       registration.errors.push(
@@ -601,6 +717,15 @@ export interface CodexPluginRegistrationPlan {
    * REPO root, not the sub-directory, so the dir can't be derived from the label.
    */
   repoName?: string;
+  /**
+   * Absolute dir holding this plugin's `.codex-plugin/plugin.json`. For a
+   * single-plugin repo that is the repo root; for a monorepo sub-plugin it is
+   * the SUB-directory, which is neither `repoName` nor derivable from `name`
+   * (the folder name and the manifest's entry name need not match — see
+   * `readCodexPluginEntryName`). `syncCodexHookTrust` needs it to read the
+   * plugin's declared hooks file.
+   */
+  pluginDir?: string;
 }
 
 /**
@@ -646,7 +771,7 @@ export function planCodexPluginRegistration(pluginsRoot: string): CodexPluginReg
     const entryName = readCodexPluginEntryName(dir);
     if (entryName) {
       // Single-plugin repo: the repo root IS the plugin.
-      plans.push({ name, action: 'register', entryName, marketplaceName, repoName: name });
+      plans.push({ name, action: 'register', entryName, marketplaceName, repoName: name, pluginDir: dir });
       continue;
     }
     // Marketplace monorepo: no manifest at the root, so register each checked-out
@@ -664,6 +789,7 @@ export function planCodexPluginRegistration(pluginsRoot: string): CodexPluginReg
         entryName: sub.entryName,
         marketplaceName,
         repoName: name,
+        pluginDir: sub.dir,
       });
     }
   }
