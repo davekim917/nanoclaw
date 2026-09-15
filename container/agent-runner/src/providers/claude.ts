@@ -2567,8 +2567,17 @@ export class ClaudeProvider implements AgentProvider {
     // bookends, so a missed bookend cannot wedge a stale indicator). Per CLI
     // process, so per query: nothing is emitted at startup and this starts
     // empty. Ambient entries (live-update watchers, skip_transcript tasks) are
-    // not work and are excluded, as the SDK asks. Read by `hasBackgroundWork`.
+    // not work and are excluded, as the SDK asks.
     const liveBackgroundTasks = new Set<string>();
+    // The hold `hasBackgroundWork` reports. Latched: raised by the first
+    // non-empty level report, released ONLY at the CLI's idle with the set
+    // empty — never at the membership change that empties it. Between that
+    // drain and the idle (or the `init` of the follow-up turn the CLI starts
+    // on completion) the set is empty but the work is not over, and every
+    // consumer of the predicate — the poll-loop's lowering at `result`, its
+    // restart gate for a settings change — would otherwise act in that gap.
+    // The invariant lives here so no consumer has to know about it.
+    let backgroundHold = false;
 
     // Per-turn input takes precedence over sticky config (A3).
     // Normalize bare opus → [1m] so the CLI's auto-compact window stays at 1M
@@ -3061,7 +3070,8 @@ export class ClaudeProvider implements AgentProvider {
           for (const t of Array.isArray(payload.tasks) ? payload.tasks : []) {
             if (t && typeof t.task_id === 'string' && t.ambient !== true) liveBackgroundTasks.add(t.task_id);
           }
-          log(`Background tasks: ${liveBackgroundTasks.size} live`);
+          if (liveBackgroundTasks.size > 0) backgroundHold = true;
+          log(`Background tasks: ${liveBackgroundTasks.size} live${backgroundHold ? ' (hold)' : ''}`);
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'session_state_changed') {
           sessionStateSeen = true;
           if ((message as { state?: string }).state === 'idle') {
@@ -3075,7 +3085,9 @@ export class ClaudeProvider implements AgentProvider {
             // CLAUDE_CODE_BG_TASKS_REPORT_RUNNING defaults on). So `live: 0`
             // at idle is the CLI confirming no follow-up turn is coming, and
             // the poll-loop can lower the level it held for that work without
-            // opening a gap before a completion-started turn's `init`.
+            // opening a gap before a completion-started turn's `init`. The
+            // hold releases here and only here, for the same reason.
+            if (liveBackgroundTasks.size === 0) backgroundHold = false;
             yield { type: 'background_work', live: liveBackgroundTasks.size };
           }
         } else if (message.type === 'assistant') {
@@ -3212,8 +3224,9 @@ export class ClaudeProvider implements AgentProvider {
       // them back into this same stream when they finish (task_notification,
       // then a turn it starts itself). Holding the busy level while any are
       // live is what keeps the task reaper off a container whose parent turn
-      // ended on a `wait`. See AgentQuery.hasBackgroundWork.
-      hasBackgroundWork: () => liveBackgroundTasks.size > 0,
+      // ended on a `wait`. Latched until the CLI's idle — see backgroundHold
+      // and AgentQuery.hasBackgroundWork.
+      hasBackgroundWork: () => backgroundHold,
       end: () => stream.end(),
       events: translateEvents(),
       // The SDK installs systemPrompt at query creation and exposes no control

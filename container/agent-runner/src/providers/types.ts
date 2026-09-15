@@ -350,8 +350,12 @@ export interface AgentQuery {
    * launched with `run_in_background`, a backgrounded Bash command, a Monitor
    * — that will report back into this session after the current turn's
    * `result`. `claude.ts` mirrors the CLI's `background_tasks_changed` level
-   * message (REPLACE semantics, ambient watchers excluded); the other
-   * providers have no such work and leave it undefined.
+   * message (REPLACE semantics, ambient watchers excluded) and LATCHES it:
+   * once raised it releases only at the CLI's idle with nothing live, never
+   * at the membership change that empties the set, because between that
+   * drain and the idle (or the `init` of a completion-started follow-up
+   * turn) the work is not over. Consumers can act on the predicate directly.
+   * The other providers have no such work and leave it undefined.
    *
    * The poll-loop reads it wherever it would lower the published busy level.
    * A turn that launches a background agent and then ends (typically after a

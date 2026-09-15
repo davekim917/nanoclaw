@@ -91,9 +91,13 @@ describe('background_tasks_changed → hasBackgroundWork', () => {
     expect(bg.map(({ e }) => e.live)).toEqual([0]);
     const resultIdx = events.findIndex((e) => e.type === 'result');
     expect(bg[0].i).toBeGreaterThan(resultIdx);
-    // hasBackgroundWork tracks the set: live through the result, false once
-    // only the ambient watcher remains.
+    // hasBackgroundWork is latched: true through the result AND through the
+    // drain that leaves only the ambient watcher — the restart gate polls in
+    // that gap — and false only at the idle report.
     expect(sampled[resultIdx]).toBe(true);
+    const drainIdx = bg[0].i - 1;
+    expect(drainIdx).toBeGreaterThan(resultIdx);
+    expect(sampled[drainIdx]).toBe(true);
     expect(sampled[bg[0].i]).toBe(false);
   });
 
