@@ -362,6 +362,12 @@ export function slotUsageSurveyForSpawn(
   // One refresh per credential set at a time. Without this a burst of spawns
   // would each start their own pass; the per-slot interval would still bound
   // the REQUESTS, but the passes would interleave for no reason.
+  //
+  // A joiner rides the in-flight pass, which means it rides the FIRST caller's
+  // `slots` and `deps`. That is sound because the key is the credential set and
+  // every spawn on one set resolves the same ring from the same `.env`
+  // (`resolveAnthropicAuth` -> `ringSlotsForSurvey`); if that ever stops being
+  // true, key this map on the ring as well, not just the set.
   let refreshed = inFlight.get(credentialSet);
   if (!refreshed) {
     refreshed = refreshSlotUsageSurvey(credentialSet, slots, deps)
