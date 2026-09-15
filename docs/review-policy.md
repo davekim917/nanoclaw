@@ -81,15 +81,34 @@ Flipping it — for an experiment or for good — is four steps, in this order:
    `node scripts/check-parity.mjs`. The gate names every prose surface that
    still states the old policy; fix those by hand. Commit, PR, merge.
 2. Here, `pnpm exec tsx scripts/vendor-workflow-agent.ts`. It refuses if the
-   plugin is mid-flip (its policy file and its generated Codex role
-   disagreeing), so a half-landed plugin change cannot be vendored.
-3. `pnpm test` — `src/workflow-agent-vendor.test.ts` proves the vendored module
-   is the current render, `scripts/dispatch-default-docs.test.ts` fails by name
-   any dispatch-policy doc still carrying the old default sentence, and
-   `scripts/reviewer-models-freshness.test.ts` fails because the reviewer
-   allowlist is derived from the same frontier config (below). Run
-   `pnpm run reviewer-models -- --write`, and update those docs, including the
-   paragraph above.
+   plugin is mid-flip — its policy file disagreeing with the generated Codex
+   role TOML **or** with the Claude def's `model:`/`effort:` frontmatter, which
+   is the half that decides Claude dispatch — so a half-landed plugin change
+   cannot be vendored, and nothing is written before both checks pass.
+3. `pnpm test`, then work its failures. They are the flip's checklist, not
+   accidents:
+   - `src/workflow-agent-vendor.test.ts` proves the vendored module is the
+     current render of the policy.
+   - `scripts/dispatch-default-docs.test.ts` fails by name every
+     dispatch-policy doc still carrying the old default sentence. Fix them,
+     including the paragraph above.
+   - `scripts/reviewer-models-freshness.test.ts` fails because the reviewer
+     allowlist derives from the same frontier config (see below). Run
+     `pnpm run reviewer-models -- --write`.
+   - Three tests **pin the current policy as literals, deliberately**, and a
+     flip must edit them by hand:
+     `src/claude-agent-md.test.ts`'s "pins Sol without an effort field…",
+     `src/providers/codex.container-config.test.ts` and
+     `container/agent-runner/src/codex-companion-setup.test.ts`, which both
+     assert the rendered `default_subagent_reasoning_effort` line verbatim.
+     They are not oversights left over from the constants refactor and must not
+     be rewritten to read `src/worker-policy.vendored.ts`: an oracle that reads
+     the same constant as the code can never disagree with it (the recurring
+     `mutation coverage` lesson in `docs/review-notes.md`), and host/container
+     agreement is already proved from the constant by
+     `src/provider-surfaces.test.ts`. The literal is the independent statement
+     of what the policy is today, and a flip is supposed to be a visible edit
+     to it.
 4. PR, merge, deploy. **Containers pin the role at spawn**, so nothing changes
    for a running agent until its container restarts on the new image.
 

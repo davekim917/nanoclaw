@@ -34,6 +34,8 @@
  *     (src/container-runner.ts), codex-sync, MANAGED_WORKER_DEFS and
  *     scripts/reviewer-models.ts all keep reading the vendored copy unchanged.
  */
+import { extractScalar, splitClaudeAgentMd } from './claude-agent-md.js';
+
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -147,6 +149,68 @@ export const WORKER_POLICY_CLAUDE_EFFORT = ${JSON.stringify(policy.claude.effort
 export const PLUGIN_CODEX_ROLE = `plugins/workflow-agents/agents/${WORKER_AGENT}.toml`;
 
 /**
+ * `model:`/`effort:` out of a Claude agent def's frontmatter.
+ *
+ * The Claude half of the policy does not land in a generated file the way the
+ * Codex model lands in the role TOML — it lands in the def's own frontmatter,
+ * which is the file this script vendors verbatim. So this is the Claude twin of
+ * `codexRoleModel`, and `assertPluginNotMidFlip` uses it for the same purpose.
+ */
+export function claudeRoleDispatch(md: string): { model: string; effort: string } {
+  const split = splitClaudeAgentMd(md);
+  if (!split) throw new Error(`no frontmatter block in the Claude role .md`);
+  const model = extractScalar(split.frontmatter, 'model');
+  const effort = extractScalar(split.frontmatter, 'effort');
+  if (!model || !effort) {
+    throw new Error(`the Claude role .md frontmatter must carry both \`model:\` and \`effort:\``);
+  }
+  return { model, effort };
+}
+
+/**
+ * Refuse a plugin checkout whose policy file and rendered artifacts disagree.
+ *
+ * Both halves, symmetrically. Checking only the Codex model — as this did when
+ * it shipped — leaves the Claude half unguarded, and the Claude half is the one
+ * that actually decides dispatch: a policy edit to `claude.model` with the
+ * plugin's sync not re-run renders new constants next to a STALE
+ * `container/agents/worker-frontier.md`, every drift test passes because each
+ * artifact agrees with the thing it was rendered from, and the frontmatter the
+ * runtime reads is the old model. Found by review r1 on #837.
+ *
+ * Called before anything is written, so a mid-flip plugin cannot leave a
+ * half-vendored tree behind: the .md copy used to happen first and a refusal
+ * then left it committed against an unrefreshed manifest.
+ */
+export function assertPluginNotMidFlip(policy: WorkerPolicy, codexRoleToml: string, claudeRoleMd: string): void {
+  const mismatches: string[] = [];
+  const roleModel = codexRoleModel(codexRoleToml);
+  if (roleModel !== policy.codex.model) {
+    mismatches.push(
+      `${PLUGIN_WORKER_POLICY} says codex.model=${policy.codex.model} but ${PLUGIN_CODEX_ROLE} says ${roleModel}`,
+    );
+  }
+  const claudeRole = claudeRoleDispatch(claudeRoleMd);
+  const claudeSource = VENDORED[0].from;
+  if (claudeRole.model !== policy.claude.model) {
+    mismatches.push(
+      `${PLUGIN_WORKER_POLICY} says claude.model=${policy.claude.model} but ${claudeSource} says ${claudeRole.model}`,
+    );
+  }
+  if (claudeRole.effort !== policy.claude.effort) {
+    mismatches.push(
+      `${PLUGIN_WORKER_POLICY} says claude.effort=${policy.claude.effort} but ${claudeSource} says ${claudeRole.effort}`,
+    );
+  }
+  if (mismatches.length > 0) {
+    throw new Error(
+      `plugin is mid-flip: ${mismatches.join('; ')}. In the plugin repo run: ` +
+        'node plugins/workflow-agents/scripts/sync-agent-skills.mjs',
+    );
+  }
+}
+
+/**
  * Committed fingerprint of the vendored content.
  *
  * Without it the drift test can only run where ~/plugins/bootstrap exists, so
@@ -186,6 +250,16 @@ export function vendorWorkflowAgent(): string[] {
   if (!fs.existsSync(PLUGIN_ROOT)) {
     throw new Error(`plugin repo not found at ${PLUGIN_ROOT} — clone github.com/davekim917/bootstrap there first`);
   }
+  // Both halves of the mid-flip check run BEFORE anything is written: a refusal
+  // must not leave a freshly copied role def behind against an unrefreshed
+  // manifest.
+  const policy = parseWorkerPolicy(fs.readFileSync(path.join(PLUGIN_ROOT, PLUGIN_WORKER_POLICY), 'utf8'));
+  assertPluginNotMidFlip(
+    policy,
+    fs.readFileSync(path.join(PLUGIN_ROOT, PLUGIN_CODEX_ROLE), 'utf8'),
+    fs.readFileSync(path.join(PLUGIN_ROOT, VENDORED[0].from), 'utf8'),
+  );
+
   const changed: string[] = [];
   const files: Record<string, string> = {};
   for (const { from, to } of VENDORED) {
@@ -196,20 +270,6 @@ export function vendorWorkflowAgent(): string[] {
     fs.mkdirSync(path.dirname(dst), { recursive: true });
     fs.writeFileSync(dst, content);
     changed.push(to);
-  }
-
-  // The policy file is the source; the plugin's generated Codex role is the
-  // cross-check. The plugin's own parity gate keeps the two in step, so a
-  // disagreement here means the plugin was caught mid-flip — refuse rather than
-  // vendor half a policy.
-  const policy = parseWorkerPolicy(fs.readFileSync(path.join(PLUGIN_ROOT, PLUGIN_WORKER_POLICY), 'utf8'));
-  const roleModel = codexRoleModel(fs.readFileSync(path.join(PLUGIN_ROOT, PLUGIN_CODEX_ROLE), 'utf8'));
-  if (roleModel !== policy.codex.model) {
-    throw new Error(
-      `plugin is mid-flip: ${PLUGIN_WORKER_POLICY} says codex.model=${policy.codex.model} but ` +
-        `${PLUGIN_CODEX_ROLE} says ${roleModel}. In the plugin repo run: ` +
-        'node plugins/workflow-agents/scripts/sync-agent-skills.mjs',
-    );
   }
 
   const policyModule = renderWorkerPolicyModule(policy);

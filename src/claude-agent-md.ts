@@ -50,10 +50,15 @@ export const CODEX_WORKER_MODELS: Record<string, string> = {
 };
 
 /**
- * Parse a Claude subagent `.md` file's text content. Returns null when the
- * frontmatter is missing or doesn't have the required `name`/`description`.
+ * Slice a Claude subagent `.md` into its frontmatter block and its body.
+ * Returns null when there is no frontmatter block at all.
+ *
+ * Exported because callers need the frontmatter itself, not just the three
+ * fields `parseClaudeAgentMd` keeps: `model:` and `effort:` are the Claude half
+ * of the worker policy, and the vendor script cross-checks them against the
+ * plugin's policy file (`claudeRoleDispatch`, src/workflow-agent-vendor.ts).
  */
-export function parseClaudeAgentMd(content: string): ClaudeAgent | null {
+export function splitClaudeAgentMd(content: string): { frontmatter: string; body: string } | null {
   // Normalize line endings up front. The parser is line-oriented, and any
   // stray `\r` in a value or scalar key would otherwise fail the regex
   // matchers below and the trailing-`\r` in the frontmatter content would
@@ -63,11 +68,20 @@ export function parseClaudeAgentMd(content: string): ClaudeAgent | null {
   const rest = normalized.slice('---\n'.length);
   const endIdx = rest.indexOf('\n---');
   if (endIdx < 0) return null;
-  const frontmatterRaw = rest.slice(0, endIdx);
   // Skip past the closing `---` and the line break that follows it.
   let bodyStart = endIdx + '\n---'.length;
   if (rest[bodyStart] === '\n') bodyStart++;
-  const body = rest.slice(bodyStart);
+  return { frontmatter: rest.slice(0, endIdx), body: rest.slice(bodyStart) };
+}
+
+/**
+ * Parse a Claude subagent `.md` file's text content. Returns null when the
+ * frontmatter is missing or doesn't have the required `name`/`description`.
+ */
+export function parseClaudeAgentMd(content: string): ClaudeAgent | null {
+  const split = splitClaudeAgentMd(content);
+  if (!split) return null;
+  const { frontmatter: frontmatterRaw, body } = split;
 
   const name = extractScalar(frontmatterRaw, 'name');
   const description = extractScalar(frontmatterRaw, 'description');

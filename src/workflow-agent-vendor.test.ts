@@ -32,6 +32,8 @@ import {
   TREE_ROOT,
   VENDORED,
   WORKER_AGENT,
+  assertPluginNotMidFlip,
+  claudeRoleDispatch,
   codexRoleModel,
   parseWorkerPolicy,
   readManifest,
@@ -158,6 +160,73 @@ describe('parseWorkerPolicy', () => {
     ['effort not a string', '{"claude":{"model":"m","effort":3},"codex":{"model":"n","effort":"f"}}'],
   ])('throws on %s', (_name, json) => {
     expect(() => parseWorkerPolicy(json)).toThrow(/model.*effort|effort/);
+  });
+});
+
+describe('claudeRoleDispatch', () => {
+  it('reads model and effort out of the frontmatter and tolerates CRLF', () => {
+    const md = '---\r\nname: w\r\nmodel: claude-opus-5[1m]\r\neffort: high\r\n---\r\n\r\nbody\r\n';
+    expect(claudeRoleDispatch(md)).toEqual({ model: 'claude-opus-5[1m]', effort: 'high' });
+  });
+
+  it.each([
+    ['no frontmatter block', 'just prose\n'],
+    ['no model line', '---\nname: w\neffort: high\n---\n\nbody\n'],
+    ['no effort line', '---\nname: w\nmodel: claude-opus-5[1m]\n---\n\nbody\n'],
+  ])('throws rather than defaulting on %s', (_name, md) => {
+    expect(() => claudeRoleDispatch(md)).toThrow();
+  });
+});
+
+/**
+ * The refusal is symmetric on purpose. Checking only the Codex model — as this
+ * shipped in the first commit — leaves the half that actually decides Claude
+ * dispatch unguarded: the def's frontmatter is vendored verbatim, so a policy
+ * edit with the plugin's sync not re-run renders new constants beside a stale
+ * `model:`/`effort:`, and every drift test still passes because each artifact
+ * agrees with the thing it was rendered from. Found by review r1 on #837.
+ */
+describe('assertPluginNotMidFlip', () => {
+  const policy = {
+    claude: { model: 'claude-opus-5[1m]', effort: 'high' },
+    codex: { model: 'gpt-5.6-sol', effort: 'high' },
+  };
+  const codexToml = 'name = "worker-frontier"\nmodel = "gpt-5.6-sol"\n';
+  const claudeMd = '---\nname: worker-frontier\nmodel: claude-opus-5[1m]\neffort: high\n---\n\nbody\n';
+
+  it('accepts a plugin whose artifacts all agree with the policy', () => {
+    expect(() => assertPluginNotMidFlip(policy, codexToml, claudeMd)).not.toThrow();
+  });
+
+  it('refuses a stale Codex role model, naming both values', () => {
+    expect(() => assertPluginNotMidFlip(policy, 'model = "gpt-6-astra"\n', claudeMd)).toThrow(
+      /codex\.model=gpt-5\.6-sol.*gpt-6-astra/s,
+    );
+  });
+
+  it('refuses a stale Claude frontmatter model, naming both values', () => {
+    const stale = '---\nname: worker-frontier\nmodel: claude-fable-5-1[1m]\neffort: high\n---\n\nbody\n';
+    expect(() => assertPluginNotMidFlip(policy, codexToml, stale)).toThrow(
+      /claude\.model=claude-opus-5\[1m\].*claude-fable-5-1\[1m\]/s,
+    );
+  });
+
+  /**
+   * Effort separately from model: a `medium`/`high` flip changes no model id at
+   * all, so a check that only compared models would pass it through.
+   */
+  it('refuses a stale Claude frontmatter effort, naming both values', () => {
+    const stale = '---\nname: worker-frontier\nmodel: claude-opus-5[1m]\neffort: medium\n---\n\nbody\n';
+    expect(() => assertPluginNotMidFlip(policy, codexToml, stale)).toThrow(/claude\.effort=high.*medium/s);
+  });
+
+  it('reports every mismatch at once rather than the first', () => {
+    const stale = '---\nname: worker-frontier\nmodel: claude-fable-5-1[1m]\neffort: medium\n---\n\nbody\n';
+    const call = () => assertPluginNotMidFlip(policy, 'model = "gpt-6-astra"\n', stale);
+    expect(call).toThrow(/codex\.model=/);
+    expect(call).toThrow(/claude\.model=/);
+    expect(call).toThrow(/claude\.effort=/);
+    expect(call).toThrow(/sync-agent-skills\.mjs/);
   });
 });
 
