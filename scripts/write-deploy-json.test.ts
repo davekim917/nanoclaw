@@ -23,7 +23,7 @@ import { fileURLToPath } from 'url';
 import { describe, expect, it } from 'vitest';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const script = path.join(root, 'scripts', 'write-deploy-rollback-manifest.mjs');
+const script = path.join(root, 'scripts', 'write-deploy-json.mjs');
 const SHA = 'a'.repeat(40);
 
 interface Manifest {
@@ -34,8 +34,11 @@ interface Manifest {
   restartedUnits?: unknown;
 }
 
-function run(env: Record<string, string>): { status: number | null; stdout: string; stderr: string } {
-  const out = spawnSync('node', [script], {
+function run(
+  env: Record<string, string>,
+  shape = 'rollback-manifest',
+): { status: number | null; stdout: string; stderr: string } {
+  const out = spawnSync('node', [script, shape], {
     cwd: root,
     env: { ...process.env, NANOCLAW_ROLLBACK_COMMIT: SHA, ...env },
     encoding: 'utf8',
@@ -50,7 +53,7 @@ function parsed(env: Record<string, string>): Manifest {
   return JSON.parse(out.stdout) as Manifest;
 }
 
-describe('write-deploy-rollback-manifest', () => {
+describe('write-deploy-json: rollback-manifest', () => {
   it('round-trips a unit id holding a backslash, a quote and a control character', () => {
     const hostile = 'nanoclaw-worker@blue\\x2dgreen\\x22quote"\tliteral.service';
     expect(hostile).toContain('\\');
@@ -101,6 +104,59 @@ describe('write-deploy-rollback-manifest', () => {
       expect(out.status, commit).toBe(1);
       expect(out.stdout, commit).toBe('');
       expect(out.stderr).toContain('NANOCLAW_ROLLBACK_COMMIT');
+    }
+  });
+});
+
+/**
+ * r3: the manifest got the encoder and the STATUS did not, so the failure
+ * status naming a unit id still pasted it into a template — the same defect at
+ * the call site the first fix did not audit, on the artifact the announcer and
+ * the health alert read.
+ */
+describe('write-deploy-json: status', () => {
+  function statusOf(env: Record<string, string>): { status: number | null; parsed: Record<string, string> } {
+    const out = run({ NANOCLAW_STATUS_STATUS: 'failed', ...env }, 'status');
+    expect(out.status, out.stderr).toBe(0);
+    return { status: out.status, parsed: JSON.parse(out.stdout) as Record<string, string> };
+  }
+
+  it('round-trips an error holding a backslash, a quote and a control character', () => {
+    const message = 'systemctl restart nanoclaw-worker@blue\\x2dgreen"q".service\tfailed';
+    expect(message).toContain('\\');
+    expect(message).toContain('"');
+    expect(message).toContain('\t');
+    expect(statusOf({ NANOCLAW_STATUS_ERROR: message }).parsed.error).toBe(message);
+  });
+
+  it('carries step and timestamp through the encoder too', () => {
+    const p = statusOf({
+      NANOCLAW_STATUS_STEP: 'sibling "service" restart\\',
+      NANOCLAW_STATUS_TIMESTAMP: '2026-09-15T00:00:00Z',
+    }).parsed;
+    expect(p.step).toBe('sibling "service" restart\\');
+    expect(p.timestamp).toBe('2026-09-15T00:00:00Z');
+    expect(p.status).toBe('failed');
+  });
+
+  it('refuses a status outside the announcer’s vocabulary', () => {
+    // deploy.sh's fallback reproduces `status` from a closed set of three shell
+    // literals. That is only sound because nothing else can get through here.
+    for (const value of ['', 'OK', 'done', 'failed\\"']) {
+      const out = run({ NANOCLAW_STATUS_STATUS: value }, 'status');
+      expect(out.status, value).toBe(1);
+      expect(out.stdout, value).toBe('');
+    }
+    for (const value of ['ok', 'running', 'failed']) {
+      expect(run({ NANOCLAW_STATUS_STATUS: value }, 'status').status, value).toBe(0);
+    }
+  });
+
+  it('refuses an unknown shape rather than guessing one', () => {
+    for (const shape of ['', 'manifest', 'Status']) {
+      const out = run({ NANOCLAW_STATUS_STATUS: 'ok' }, shape);
+      expect(out.status, shape).toBe(1);
+      expect(out.stdout, shape).toBe('');
     }
   });
 });

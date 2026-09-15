@@ -21,10 +21,46 @@ IMAGE_SAVED_BASE=""
 RESTART_ATTEMPTED_UNITS=""
 COMMIT_RESTORED=0
 
+# The operator-facing deploy status, written by a JSON encoder rather than a
+# `printf '{"status":"%s"…}'` template. `error` carries a unit id at the
+# sibling-restart failures below, and systemd escapes any byte a unit id may not
+# hold literally as `\xNN`, so a legitimately-named unit puts a BACKSLASH in the
+# text and a template emits something that is not JSON. This file is what the
+# announcer and the health alert read, so a malformed one turns a reported
+# failure into silence at the moment somebody needed to hear about it — the same
+# defect as the rollback manifest's, at the call site the first fix did not
+# audit. Routing the FUNCTION, not the one interpolating caller, is what closes
+# it: all 30-odd write_status calls and every future one come out of the encoder.
+#
+# The fallback exists because this is the reporter of last resort and must not
+# depend on more than the shell. It interpolates nothing it did not author: the
+# encoder refuses a `status` outside ok|running|failed, so reaching the fallback
+# with one of those three literals is the only way through, and the full text is
+# in "$LOG" regardless of what lands here.
 write_status() {
-  local status="$1" step="$2" error="$3"
-  printf '{"status":"%s","step":"%s","error":"%s","timestamp":"%s"}\n' \
-    "$status" "$step" "$error" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$STATUS_FILE"
+  local status="$1" step="$2" error="$3" stamp
+  stamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  if NANOCLAW_STATUS_STATUS="$status" \
+    NANOCLAW_STATUS_STEP="$step" \
+    NANOCLAW_STATUS_ERROR="$error" \
+    NANOCLAW_STATUS_TIMESTAMP="$stamp" \
+    node scripts/write-deploy-json.mjs status > "${STATUS_FILE}.tmp" 2>> "$LOG" &&
+    mv "${STATUS_FILE}.tmp" "$STATUS_FILE"; then
+    return 0
+  fi
+  rm -f "${STATUS_FILE}.tmp"
+  # `safe` and `stamp` are the only values that reach this template, and both
+  # are authored here: one of three literals assigned below, and a `date` format
+  # string that can only yield digits and `-:TZ`. An unrecognised status reads
+  # as `failed` rather than passing through — this path is only reached when
+  # something is already wrong.
+  local safe=failed
+  case "$status" in
+    ok) safe=ok ;;
+    running) safe=running ;;
+  esac
+  printf '{"status":"%s","step":"encoder","error":"deploy status could not be encoded — see logs/deploy.log","timestamp":"%s"}\n' \
+    "$safe" "$stamp" > "$STATUS_FILE"
 }
 
 tracked_changes() {
@@ -509,7 +545,8 @@ done <<< "$SIBLING_UNITS"
 # reads null as `no-op`, and the crashing deployment silently loses automatic
 # rollback for the host AND every sibling. Values reach the encoder through the
 # ENVIRONMENT, never argv, so nothing is interpolated into a command line
-# either; see scripts/write-deploy-rollback-manifest.mjs.
+# either; see scripts/write-deploy-json.mjs, which writes every JSON this
+# script emits, the status file included.
 #
 # Written to a temp file and renamed, because a half-written manifest is
 # unparsable in exactly the same way, and refused loudly if it cannot be
@@ -522,7 +559,7 @@ if [ -z "$MIGRATION_CHANGES" ]; then
     NANOCLAW_ROLLBACK_TIMESTAMP="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
     NANOCLAW_ROLLBACK_NODE="$(node --version 2>/dev/null)" \
     NANOCLAW_ROLLBACK_UNITS="$(printf '%s\n' $RESTART_ATTEMPTED_UNITS)" \
-    node scripts/write-deploy-rollback-manifest.mjs > data/deploy-rollback.json.tmp 2>> "$LOG"; then
+    node scripts/write-deploy-json.mjs rollback-manifest > data/deploy-rollback.json.tmp 2>> "$LOG"; then
     rm -f data/deploy-rollback.json.tmp
     write_status "failed" "crash guard manifest" \
       "could not write the rollback manifest — restart refused rather than deploy with no rollback point"

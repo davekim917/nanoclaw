@@ -222,7 +222,7 @@ beforeEach(() => {
     callsFile: path.join(dir, 'calls'),
     repoRoot: '/srv/checkout',
   };
-  // The slice runs `node scripts/write-deploy-rollback-manifest.mjs` by its
+  // The slice runs `node scripts/write-deploy-json.mjs` by its
   // relative path, the way deploy.sh does from the repo root, while `data/` and
   // the logs have to land in the sandbox. Link the real scripts/ in rather than
   // copying a stand-in — a fake encoder here would test nothing.
@@ -315,7 +315,7 @@ describe('deploy records what it restarted for the crash guard', () => {
     // wrote it raw, the manifest stopped being JSON, and the guard's readJson
     // answered null on the next boot — losing automatic rollback for the host
     // and every sibling, silently, on a crashing deploy. The encoder's own
-    // cases (quote, tab) are in scripts/write-deploy-rollback-manifest.test.ts;
+    // cases (quote, tab) are in scripts/write-deploy-json.test.ts;
     // this one proves the value reaches it intact through discovery, the
     // restart loop and the environment.
     const escaped = 'nanoclaw-worker@blue\\x2dgreen.service';
@@ -385,6 +385,22 @@ describe('deploy restarts every long-running service before the handoff', () => 
     expect(attempted()).toEqual(['nanoclaw-codex-sync.service']);
   });
 
+  it('keeps the operator-facing status parsable when the failing unit id carries a metacharacter', () => {
+    // r3: the manifest got the encoder, `write_status` did not, so the failure
+    // that names the unit still pasted it into a JSON template. This file is
+    // what the announcer and the health alert read — a malformed one turns a
+    // reported failure into silence at the moment somebody needed to hear it.
+    const escaped = 'nanoclaw-worker@blue\\x2dgreen.service';
+    writeUnits([...THIS_HOST, { id: escaped, type: 'simple', workingDirectory: '/srv/checkout', active: true }]);
+    const run = runProbe(tailProbe(), { KILL_ON: 'nanoclaw-v2', FAIL_UNIT: escaped });
+    expect(run.status).toBe(1);
+    const raw = fs.readFileSync(path.join(harness.dir, 'status.json'), 'utf-8');
+    expect(() => JSON.parse(raw), `deploy-status.json is not JSON: ${raw}`).not.toThrow();
+    // And it is the real message, not the encoder fallback's placeholder.
+    expect(status()).toMatchObject({ status: 'failed', step: 'sibling service restart' });
+    expect(status().error).toContain(escaped);
+  });
+
   it('refuses the deploy when the enumeration loses its own control unit', () => {
     // nanoclaw-v2 is running but the discovery cannot see it — a REPO_ROOT that
     // does not match the unit byte for byte, a moved `systemctl show` shape. The
@@ -406,6 +422,49 @@ describe('deploy restarts every long-running service before the handoff', () => 
     expect(restartCalls()).toEqual([]);
     expect(status()).toMatchObject({ status: 'failed', step: 'sibling service restart' });
     expect(status().error).toContain('enumerate');
+  });
+});
+
+/**
+ * `write_status` is the reporter of last resort. Routing it through an encoder
+ * is what stops a unit id with a backslash from producing an unreadable
+ * deploy-status.json — but if it DEPENDED on that encoder being runnable, a
+ * failure that is node being unrunnable would report nothing at all, which is
+ * the same silence by another route. So it falls back, and the fallback is
+ * exercised rather than assumed.
+ */
+describe('deploy status survives an encoder that cannot run', () => {
+  function statusProbe(status: string): string {
+    // No scripts/ in this probe's cwd, so `node scripts/write-deploy-json.mjs`
+    // cannot resolve — the shape of "the encoder is not available".
+    fs.rmSync(path.join(harness.dir, 'scripts'));
+    return [
+      '#!/usr/bin/env bash',
+      `STATUS_FILE="${path.join(harness.dir, 'status.json')}"`,
+      `LOG="${path.join(harness.dir, 'deploy.log')}"`,
+      shellFunction('write_status'),
+      `write_status "${status}" "install" 'pnpm "install" failed\\'`,
+      '',
+    ].join('\n');
+  }
+
+  it('still writes valid JSON, naming the log that has the detail', () => {
+    runProbe(statusProbe('failed'));
+    const raw = fs.readFileSync(path.join(harness.dir, 'status.json'), 'utf-8');
+    expect(() => JSON.parse(raw), `fallback status is not JSON: ${raw}`).not.toThrow();
+    expect(status()).toMatchObject({ status: 'failed', step: 'encoder' });
+    expect(status().error).toContain('logs/deploy.log');
+  });
+
+  it('does not turn a running or ok deploy into a failure', () => {
+    // The announcer branches on `status`; a fallback that reported `failed`
+    // for every write would invent an outage out of an encoder problem.
+    for (const value of ['ok', 'running']) {
+      fs.rmSync(path.join(harness.dir, 'status.json'), { force: true });
+      runProbe(statusProbe(value));
+      expect(status().status, value).toBe(value);
+      fs.symlinkSync(path.join(root, 'scripts'), path.join(harness.dir, 'scripts'), 'dir');
+    }
   });
 });
 
