@@ -2577,7 +2577,22 @@ export class ClaudeProvider implements AgentProvider {
     // consumer of the predicate — the poll-loop's lowering at `result`, its
     // restart gate for a settings change — would otherwise act in that gap.
     // The invariant lives here so no consumer has to know about it.
+    //
+    // The CLI gates its idle on a NARROWER set than it reports: background
+    // subagents (`local_agent`) withhold idle, but a backgrounded Bash
+    // (`local_bash`), a dream, a parked MCP task, a long-running remote
+    // agent, and a monitor with no timeout do not (CLI 2.1.272, its idle
+    // predicate excludes those types by name). For those, idle arrives with
+    // the set still non-empty and no second idle ever comes, so "release at
+    // idle with the set empty" alone would pin the hold for the rest of the
+    // query. `idleSeenWithHold` records that the CLI has shown it will not
+    // withhold idle for what is left; from then on the membership change
+    // that empties the set releases the hold and reports it, which for those
+    // types is the same protection they had before this hold existed (none
+    // past their completion; a completion-started follow-up turn's `init`
+    // re-raises the level itself).
     let backgroundHold = false;
+    let idleSeenWithHold = false;
 
     // Per-turn input takes precedence over sticky config (A3).
     // Normalize bare opus → [1m] so the CLI's auto-compact window stays at 1M
@@ -3072,6 +3087,13 @@ export class ClaudeProvider implements AgentProvider {
           }
           if (liveBackgroundTasks.size > 0) backgroundHold = true;
           log(`Background tasks: ${liveBackgroundTasks.size} live${backgroundHold ? ' (hold)' : ''}`);
+          if (liveBackgroundTasks.size === 0 && idleSeenWithHold) {
+            // The CLI already went idle over these tasks: no idle will follow
+            // this drain, so this is the release (see idleSeenWithHold).
+            backgroundHold = false;
+            idleSeenWithHold = false;
+            yield { type: 'background_work', live: 0 };
+          }
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'session_state_changed') {
           sessionStateSeen = true;
           if ((message as { state?: string }).state === 'idle') {
@@ -3086,8 +3108,11 @@ export class ClaudeProvider implements AgentProvider {
             // at idle is the CLI confirming no follow-up turn is coming, and
             // the poll-loop can lower the level it held for that work without
             // opening a gap before a completion-started turn's `init`. The
-            // hold releases here and only here, for the same reason.
+            // hold releases here for the same reason — or, for task types
+            // the CLI does not gate idle on, at the drain that follows an
+            // idle like this one (idleSeenWithHold).
             if (liveBackgroundTasks.size === 0) backgroundHold = false;
+            else if (backgroundHold) idleSeenWithHold = true;
             yield { type: 'background_work', live: liveBackgroundTasks.size };
           }
         } else if (message.type === 'assistant') {
@@ -3226,7 +3251,11 @@ export class ClaudeProvider implements AgentProvider {
       // live is what keeps the task reaper off a container whose parent turn
       // ended on a `wait`. Latched until the CLI's idle — see backgroundHold
       // and AgentQuery.hasBackgroundWork.
-      hasBackgroundWork: () => backgroundHold,
+      // Gated on sessionStateSeen like hasQueuedWork above: the raise comes
+      // from a message the CLI always emits, the release from one it emits
+      // only behind CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS — a CLI that has
+      // not shown the latter must not be able to pin a container.
+      hasBackgroundWork: () => sessionStateSeen && backgroundHold,
       end: () => stream.end(),
       events: translateEvents(),
       // The SDK installs systemPrompt at query creation and exposes no control
