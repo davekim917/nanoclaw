@@ -650,12 +650,27 @@ export function validateAutoCompactWindow(value: unknown): number | undefined {
 }
 
 /**
- * One path segment of an `excludePlugins` entry: a directory name, never `.`,
- * `..`, or anything carrying a separator. Same rule as `PLUGIN_NAME_RE` in
- * `src/plugin-scopes.ts:44`, which validates the other host-owned policy that
- * names `~/plugins` directories.
+ * One path segment of an `excludePlugins` entry: a real directory name, never
+ * empty, `.` or `..`, and carrying no separator or control character.
+ *
+ * Deliberately NOT a slug allowlist. `excludePlugins` had no validation at all
+ * before this field grew sub-paths, and the entries it holds are directory
+ * basenames the operator did not choose: `scripts/enable-agent-plugin.ts`
+ * accepts any direct child of `~/plugins` (`resolvePluginDir` checks only that
+ * the path is a directory whose parent is the plugins root) and writes that
+ * basename straight into this list (`applyOptOut`). A clone named `foo+bar` or
+ * `c++-tools` is an ordinary directory, so an allowlist of `[A-Za-z0-9._-]`
+ * would refuse a config that worked before and take the whole group's spawn
+ * down with it — `readContainerConfig` throws on every read — which is the
+ * fail-closed guard refusing a legitimate state rather than a bad input.
+ *
+ * What the guard actually has to stop is traversal and separator confusion, and
+ * that is exactly what remains: an empty segment, `.`, `..`, a backslash, and
+ * any C0/C1 control character (`/` cannot appear — segments are the result of
+ * splitting on it). `src/plugin-scopes.ts:44`'s narrower `PLUGIN_NAME_RE`
+ * governs an operator-authored policy file and is left alone.
  */
-const PLUGIN_PATH_SEGMENT_RE = /^(?!\.\.?$)[A-Za-z0-9._-]+$/;
+const PLUGIN_PATH_SEGMENT_RE = /^(?!\.\.?$)[^\\\p{Cc}]+$/u;
 
 /**
  * Deepest `excludePlugins` entry we accept, in path segments. Bounded by what
@@ -699,7 +714,9 @@ export function validateExcludePlugins(value: unknown): string[] | undefined {
     }
     for (const segment of segments) {
       if (!PLUGIN_PATH_SEGMENT_RE.test(segment)) {
-        fail('must be <plugin> or <plugin>/<sub>[/<sub2>] with no empty, "." or ".." segments');
+        fail(
+          'must be <plugin> or <plugin>/<sub>[/<sub2>] with no empty, "." or ".." segments and no control characters',
+        );
       }
     }
   }

@@ -788,6 +788,28 @@ describe('excludePlugins', () => {
     expect(() => readContainerConfig('xp-notarray')).toThrow(/must be an array/);
   });
 
+  it('accepts any real directory name, because the enabler writes basenames nobody chose', () => {
+    // scripts/enable-agent-plugin.ts accepts ANY direct child of ~/plugins
+    // (resolvePluginDir checks only "is a directory, parent is the plugins
+    // root") and writes that basename into excludePlugins (applyOptOut). The
+    // field also had no validation at all before sub-paths existed. So a slug
+    // allowlist here would refuse a config that already worked and take the
+    // group's whole spawn down with it — readContainerConfig throws on every
+    // read. Only traversal and separator confusion are the guard's business.
+    const entries = ['foo+bar', 'c++-tools', '@internal', 'my plugin', 'ünïcode', 'bootstrap/plugins/a b+c'];
+    writeGroupConfig('xp-odd-names', { excludePlugins: entries });
+    expect(readContainerConfig('xp-odd-names').excludePlugins).toEqual(entries);
+  });
+
+  it('still refuses a control character in a segment', () => {
+    // Escape sequences, never literal bytes: a literal NUL makes grep and rg
+    // treat the file as binary and match nothing over it (docs/review-notes/818.md).
+    for (const bad of ['foo\u0000bar', 'foo\nbar', 'bootstrap/plugins/o\u007Frchestrate', 'foo\u009Fbar']) {
+      writeGroupConfig('xp-ctrl', { excludePlugins: [bad] });
+      expect(() => readContainerConfig('xp-ctrl')).toThrow(/excludePlugins entry/);
+    }
+  });
+
   it('refuses a malformed entry on write, not only on read', () => {
     expect(() =>
       writeContainerConfig('xp-write', {
