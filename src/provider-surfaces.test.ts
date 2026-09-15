@@ -39,7 +39,7 @@ vi.mock('./db/messaging-groups.js', async (importOriginal) => {
   };
 });
 
-import { buildMounts } from './container-runner.js';
+import { buildMounts, EMPTY_PLUGIN_MASK_DIR } from './container-runner.js';
 import { log } from './log.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { sessionContextPath, sessionDir, writeSessionContext } from './session-manager.js';
@@ -1132,6 +1132,71 @@ describe('buildMounts agent surfaces', async () => {
       expect(paths).not.toContain('/workspace/plugins/gitnexus');
       expect(paths).not.toContain('/workspace/plugins/nanoclaw-hooks');
       expect(paths).toContain('/workspace/plugins/unrelated-plugin');
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('masks an excluded sub-plugin with an empty dir while its repo and siblings still mount', async () => {
+    const homedir = path.join(TEST_ROOT, 'home');
+    const bootstrap = path.join(homedir, 'plugins', 'bootstrap');
+    fs.mkdirSync(path.join(bootstrap, 'plugins', 'orchestrate'), { recursive: true });
+    fs.mkdirSync(path.join(bootstrap, 'plugins', 'wwbd'), { recursive: true });
+    // Second sub-plugin layout: a sub-plugin at the repo root (rule 8 of
+    // container/agent-runner/src/plugin-skill-discovery.ts:303).
+    fs.mkdirSync(path.join(bootstrap, 'rootlevel'), { recursive: true });
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(homedir);
+
+    try {
+      const ag = group('ag-subplugin-mask', 'subplugin-mask');
+      await createAgentGroup(ag);
+      withWorkgroup(ag);
+      await ensureContainerConfig(ag.id);
+      initGroupFilesystem(ag, {});
+
+      const mounts = await buildMounts(
+        ag,
+        session('s-subplugin-mask', ag.id),
+        {
+          ...containerConfig(),
+          excludePlugins: ['bootstrap/plugins/orchestrate', 'bootstrap/rootlevel', 'bootstrap/plugins/absent'],
+        },
+        'claude',
+        {},
+      );
+      const byPath = new Map(mounts.map((mount) => [mount.containerPath, mount]));
+
+      // The repo itself still mounts from its real host path.
+      expect(byPath.get('/workspace/plugins/bootstrap')).toEqual({
+        hostPath: bootstrap,
+        containerPath: '/workspace/plugins/bootstrap',
+        readonly: true,
+      });
+      // Each excluded sub-path is masked by the shared empty dir, read-only.
+      for (const subPath of ['bootstrap/plugins/orchestrate', 'bootstrap/rootlevel']) {
+        expect(byPath.get(`/workspace/plugins/${subPath}`)).toEqual({
+          hostPath: EMPTY_PLUGIN_MASK_DIR,
+          containerPath: `/workspace/plugins/${subPath}`,
+          readonly: true,
+        });
+      }
+      expect(fs.readdirSync(EMPTY_PLUGIN_MASK_DIR)).toEqual([]);
+      // Siblings are untouched — no mount of their own, reached through the repo.
+      expect(byPath.has('/workspace/plugins/bootstrap/plugins/wwbd')).toBe(false);
+      // A sub-path with no host directory is NOT masked: docker cannot create a
+      // mountpoint inside an already-read-only bind and would fail the spawn
+      // (verified against the daemon; see the mask comment in container-runner.ts).
+      expect(byPath.has('/workspace/plugins/bootstrap/plugins/absent')).toBe(false);
+      expect(log.warn).toHaveBeenCalledWith(
+        expect.stringContaining('excludePlugins names a sub-plugin path that does not exist'),
+        expect.objectContaining({ subPath: 'bootstrap/plugins/absent' }),
+      );
+      // The mask mount must follow its repo mount; a mask ordered first would be
+      // overlaid by the repo bind and silently stop masking.
+      const order = mounts.map((mount) => mount.containerPath);
+      expect(order.indexOf('/workspace/plugins/bootstrap')).toBeLessThan(
+        order.indexOf('/workspace/plugins/bootstrap/plugins/orchestrate'),
+      );
     } finally {
       homedirSpy.mockRestore();
     }

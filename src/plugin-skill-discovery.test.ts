@@ -201,6 +201,21 @@ describe('discoverPortableSkills', () => {
     const out = discoverPortableSkills(tmpDir);
     expect(out[0].name).toBe('real-name');
   });
+
+  it('finds nothing in a sub-plugin the host masked with an empty directory', () => {
+    // A group's `excludePlugins` may name one sub-plugin of a repo it keeps;
+    // the host bind-mounts an empty read-only dir over that path, so in-container
+    // discovery sees a directory with no `skills/` (rules 7 and 8 both gate on
+    // `isDirectory(subSkillsDir)`). This is the container-side half of that mask,
+    // and the host copy of this module is asserted identical below.
+    writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'wwbd', 'skills', 'wwbd'), { name: 'wwbd' });
+    fs.mkdirSync(path.join(tmpDir, 'bootstrap', 'plugins', 'orchestrate'), { recursive: true });
+    // Rule 8's `<repo>/<sub>` layout is gated on the sub-dir's Claude manifest,
+    // which a masked dir also lacks.
+    fs.mkdirSync(path.join(tmpDir, 'bootstrap', 'rootlevel'), { recursive: true });
+
+    expect(discoverPortableSkills(tmpDir, { runtime: 'opencode' }).map((s) => s.name)).toEqual(['wwbd']);
+  });
 });
 
 describe('syncSkillSymlinks (mirror-dir mode)', () => {

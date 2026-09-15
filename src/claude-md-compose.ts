@@ -31,7 +31,12 @@ import os from 'os';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
-import { readContainerConfig, validateMcpServers, type McpServerConfig } from './container-config.js';
+import {
+  readContainerConfig,
+  splitExcludedPlugins,
+  validateMcpServers,
+  type McpServerConfig,
+} from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { flattenClaudeMd } from './agents-md-flatten.js';
 import { CODEX_PROJECT_DOC_CONFIGURED_MAX_BYTES, warnIfOversized } from './codex-project-doc-cap.js';
@@ -49,6 +54,68 @@ const STANDING_INSTRUCTIONS_FRAGMENT = 'standing-instructions.md';
 // Joined against `projectRoot` (derived from GROUPS_DIR) at call time so
 // tests, which mock GROUPS_DIR to a scratch dir, resolve these consistently.
 const MCP_TOOLS_HOST_SUBPATH = path.join('container', 'agent-runner', 'src', 'mcp-tools');
+
+/** A plugin opts into always-on injection by writing this file. */
+const ALWAYS_ON_MARKER = '.nanoclaw-always-on.md';
+
+/** The marker's trimmed contents, or null when absent, empty, or unreadable. */
+function readAlwaysOnRuleset(pluginDir: string): string | null {
+  const file = path.join(pluginDir, ALWAYS_ON_MARKER);
+  try {
+    if (!fs.statSync(file).isFile()) return null;
+    return fs.readFileSync(file, 'utf-8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Every sub-plugin directory of one `~/plugins` entry, in both layouts the
+ * container-side walkers descend: `<repo>/plugins/<sub>` (Claude
+ * container/agent-runner/src/providers/claude.ts:1790-1817; Codex
+ * container/agent-runner/src/codex-companion-setup.ts:570) and `<repo>/<sub>`
+ * (same two). Returned paths are relative to the plugins root, which is the
+ * spelling `excludePlugins` uses.
+ */
+function subPluginDirs(pluginsRoot: string, name: string): Array<{ subPath: string; dir: string }> {
+  const out: Array<{ subPath: string; dir: string }> = [];
+  const seen = new Set<string>();
+  for (const container of [path.join(name, 'plugins'), name]) {
+    let subs: string[];
+    try {
+      subs = fs.readdirSync(path.join(pluginsRoot, container)).sort();
+    } catch {
+      continue;
+    }
+    for (const sub of subs) {
+      if (sub.startsWith('.')) continue;
+      const subPath = path.join(container, sub);
+      if (seen.has(subPath)) continue;
+      const dir = path.join(pluginsRoot, subPath);
+      try {
+        if (!fs.statSync(dir).isDirectory()) continue;
+      } catch {
+        continue;
+      }
+      seen.add(subPath);
+      out.push({ subPath, dir });
+    }
+  }
+  return out;
+}
+
+/**
+ * True when this sub-path, or any ancestor of it below the repo root, is
+ * excluded — so excluding `bootstrap/plugins` also drops every sub-plugin
+ * under it, matching what the mask mount would do to that directory.
+ */
+function isExcludedSubPath(subPath: string, excludedSubPaths: ReadonlySet<string>): boolean {
+  const segments = subPath.split('/');
+  for (let i = 2; i <= segments.length; i++) {
+    if (excludedSubPaths.has(segments.slice(0, i).join('/'))) return true;
+  }
+  return false;
+}
 
 const COMPOSED_HEADER =
   '<!-- Composed at spawn - do not edit. Standing instructions: standing-instructions.md. Memory: memory/. -->';
@@ -173,8 +240,18 @@ export async function composeGroupClaudeMd(
   // a plugin from a group removes it on every provider. See docs/skills-model.md.
   // A workgroup-scoped plugin's ruleset reaches only its workgroups, matching the
   // mount (src/plugin-scopes.ts); with no spawn-resolved workgroup it reaches none.
+  //
+  // A monorepo plugin may also mark ONE sub-plugin's ruleset, at
+  // `~/plugins/<name>/plugins/<sub>/.nanoclaw-always-on.md` or
+  // `~/plugins/<name>/<sub>/.nanoclaw-always-on.md` — the same two sub-plugin
+  // layouts the mount masking and the container-side walkers use. That lets a
+  // group drop `<name>/plugins/<sub>` from `excludePlugins` and lose only that
+  // sub-plugin's standing directive, while its siblings in the same repo keep
+  // theirs.
   if (provider !== 'claude') {
-    const excluded = new Set(readContainerConfig(group.folder).excludePlugins ?? []);
+    const { topLevel: excluded, subPaths: excludedSubPaths } = splitExcludedPlugins(
+      readContainerConfig(group.folder).excludePlugins,
+    );
     const pluginScopes = loadPluginScopes();
     const pluginsRoot = path.join(os.homedir(), 'plugins');
     let pluginDirs: string[] = [];
@@ -185,15 +262,27 @@ export async function composeGroupClaudeMd(
     }
     for (const name of pluginDirs) {
       if (excluded.has(name) || !pluginAllowedForWorkgroup(name, options.workgroupId, pluginScopes)) continue;
-      const rulesetFile = path.join(pluginsRoot, name, '.nanoclaw-always-on.md');
-      let content: string;
-      try {
-        if (!fs.statSync(rulesetFile).isFile()) continue;
-        content = fs.readFileSync(rulesetFile, 'utf-8').trim();
-      } catch {
-        continue;
+      const rootContent = readAlwaysOnRuleset(path.join(pluginsRoot, name));
+      if (rootContent) desired.set(`plugin-${name}.md`, rootContent);
+      for (const { subPath, dir } of subPluginDirs(pluginsRoot, name)) {
+        if (isExcludedSubPath(subPath, excludedSubPaths)) continue;
+        const content = readAlwaysOnRuleset(dir);
+        if (!content) continue;
+        // Interim double-injection guard: a repo mid-migration still carries a
+        // root ruleset that is a hand-concatenation of its sub-plugins'. If the
+        // root fragment already contains this block verbatim, emitting it again
+        // would repeat the directive in the composed prompt.
+        if (rootContent?.includes(content)) continue;
+        const fragment = `plugin-${name}-${path.basename(subPath)}.md`;
+        if (desired.has(fragment)) {
+          log.warn('Two plugin rulesets compose to the same fragment name; keeping the first', {
+            fragment,
+            subPath,
+          });
+          continue;
+        }
+        desired.set(fragment, content);
       }
-      if (content) desired.set(`plugin-${name}.md`, content);
     }
   }
 

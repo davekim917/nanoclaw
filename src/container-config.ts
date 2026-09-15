@@ -649,6 +649,83 @@ export function validateAutoCompactWindow(value: unknown): number | undefined {
   return value;
 }
 
+/**
+ * One path segment of an `excludePlugins` entry: a directory name, never `.`,
+ * `..`, or anything carrying a separator. Same rule as `PLUGIN_NAME_RE` in
+ * `src/plugin-scopes.ts:44`, which validates the other host-owned policy that
+ * names `~/plugins` directories.
+ */
+const PLUGIN_PATH_SEGMENT_RE = /^(?!\.\.?$)[A-Za-z0-9._-]+$/;
+
+/**
+ * Deepest `excludePlugins` entry we accept, in path segments. Bounded by what
+ * the three sub-plugin walkers actually descend to, so an entry can never name
+ * a directory no walker would have looked at:
+ *   - Claude: `<repo>/<sub>` and `<repo>/<sub>/<sub2>`
+ *     (`container/agent-runner/src/providers/claude.ts:1790-1817`)
+ *   - Codex: `<repo>/plugins/<sub>` and `<repo>/<sub>`
+ *     (`findCodexSubPlugins`, `container/agent-runner/src/codex-companion-setup.ts:570`)
+ *   - OpenCode skill mirror: `<repo>/plugins/<sub>/skills` and `<repo>/<sub>/skills`
+ *     (`container/agent-runner/src/plugin-skill-discovery.ts:283,303`)
+ * Three is the maximum any of them reaches.
+ */
+const MAX_EXCLUDE_PLUGIN_DEPTH = 3;
+
+/**
+ * Validate `excludePlugins`. Entries are either a top-level `~/plugins` folder
+ * name (`bootstrap`) or a sub-plugin path relative to the plugins root
+ * (`bootstrap/plugins/orchestrate`, `knowledge-work-plugins/data`).
+ *
+ * Fails closed and loudly: an entry that does not parse throws, naming the
+ * entry, rather than being dropped. A silently-ignored exclusion is a
+ * fail-open — the operator believes a plugin is withheld from a group while
+ * the mount, the Codex registration and the always-on ruleset all still
+ * deliver it.
+ */
+export function validateExcludePlugins(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new Error('excludePlugins must be an array of plugin names or sub-plugin paths');
+  for (const entry of value) {
+    const fail = (why: string): never => {
+      throw new Error(`excludePlugins entry ${JSON.stringify(entry)} ${why}`);
+    };
+    if (typeof entry !== 'string' || entry === '') fail('must be a non-empty string');
+    const name = entry as string;
+    if (name.startsWith('/')) fail('must be relative to ~/plugins, not an absolute path');
+    if (name.includes('\\')) fail('must use "/" separators');
+    const segments = name.split('/');
+    if (segments.length > MAX_EXCLUDE_PLUGIN_DEPTH) {
+      fail(`is deeper than ${MAX_EXCLUDE_PLUGIN_DEPTH} path segments, which no sub-plugin walker descends to`);
+    }
+    for (const segment of segments) {
+      if (!PLUGIN_PATH_SEGMENT_RE.test(segment)) {
+        fail('must be <plugin> or <plugin>/<sub>[/<sub2>] with no empty, "." or ".." segments');
+      }
+    }
+  }
+  return value as string[];
+}
+
+/**
+ * Split a validated `excludePlugins` list into the two shapes its consumers
+ * need: whole `~/plugins` entries to drop, and sub-plugin paths to mask inside
+ * a repo that IS still delivered. Shared by the mount builder
+ * (`src/container-runner.ts`) and the always-on composer
+ * (`src/claude-md-compose.ts`) so the two can't disagree about what an entry means.
+ */
+export function splitExcludedPlugins(entries: readonly string[] | undefined): {
+  topLevel: Set<string>;
+  subPaths: Set<string>;
+} {
+  const topLevel = new Set<string>();
+  const subPaths = new Set<string>();
+  for (const entry of entries ?? []) {
+    if (entry.includes('/')) subPaths.add(entry);
+    else topLevel.add(entry);
+  }
+  return { topLevel, subPaths };
+}
+
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
   /** Host-enrolled wiki actors fail closed if their private policy is absent. */
@@ -740,12 +817,23 @@ export interface ContainerConfig {
   githubTokenEnv?: string;
 
   /**
-   * Plugin subdir names under `~/plugins/` to NOT mount for this group.
-   * Plugins under `~/plugins/` are mounted into every container by default
-   * (RO at `/workspace/plugins/<name>`). Use this when a group shouldn't
-   * have access to a specific plugin — e.g., security-sensitive agents
-   * excluding the `codex` plugin to avoid handing them a CLI with the
-   * host's Codex OAuth session.
+   * Plugin paths under `~/plugins/` to NOT deliver to this group. Plugins
+   * under `~/plugins/` are mounted into every container by default (RO at
+   * `/workspace/plugins/<name>`). Use this when a group shouldn't have access
+   * to a specific plugin — e.g., security-sensitive agents excluding the
+   * `codex` plugin to avoid handing them a CLI with the host's Codex OAuth
+   * session.
+   *
+   * Two granularities, one field:
+   *   - `"bootstrap"` — a top-level entry; its mount is never created.
+   *   - `"bootstrap/plugins/orchestrate"` — one sub-plugin of a monorepo whose
+   *     other sub-plugins the group keeps. The repo still mounts; an empty
+   *     host directory is bind-mounted over just that sub-path, so all three
+   *     sub-plugin walkers see a directory with no manifest and skip it
+   *     (`src/container-runner.ts`, plugin mounts).
+   *
+   * Validated by `validateExcludePlugins` — a malformed entry throws rather
+   * than being silently ignored.
    */
   excludePlugins?: string[];
 
@@ -1236,7 +1324,7 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
     autoCompactWindow: validateAutoCompactWindow(raw.autoCompactWindow),
     providerFallback: raw.providerFallback,
     githubTokenEnv: raw.githubTokenEnv,
-    excludePlugins: raw.excludePlugins,
+    excludePlugins: validateExcludePlugins(raw.excludePlugins),
     codexHostAuth: raw.codexHostAuth,
     wixHostAuth: raw.wixHostAuth,
     codexAuthFallbacks: raw.codexAuthFallbacks,
@@ -1267,6 +1355,7 @@ export function writeContainerConfig(folder: string, config: ContainerConfig): v
   validateMcpServers(config.mcpServers ?? {});
   validateContainerResources(config.resources);
   validateGitIdentity(config.gitIdentity);
+  validateExcludePlugins(config.excludePlugins);
   const p = configPath(folder);
   const dir = path.dirname(p);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });

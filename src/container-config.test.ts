@@ -16,7 +16,9 @@ import {
   honouredTimezoneOverride,
   MIN_AUTO_COMPACT_WINDOW,
   resolveGroupTimezone,
+  splitExcludedPlugins,
   updateContainerConfig,
+  validateExcludePlugins,
   writeContainerConfig,
 } from './container-config.js';
 import { TIMEZONE } from './config.js';
@@ -753,5 +755,56 @@ describe('autoCompactWindow (quota-burn plan §0.5)', () => {
     }
     writeGroupConfig('acw-floor', { autoCompactWindow: MIN_AUTO_COMPACT_WINDOW });
     expect(readContainerConfig('acw-floor').autoCompactWindow).toBe(MIN_AUTO_COMPACT_WINDOW);
+  });
+});
+
+describe('excludePlugins', () => {
+  it('accepts a top-level plugin name and a sub-plugin path in either layout', () => {
+    const entries = ['codex', 'bootstrap/plugins/orchestrate', 'knowledge-work-plugins/data', 'a.b_c-d'];
+    writeGroupConfig('xp-ok', { excludePlugins: entries });
+    expect(readContainerConfig('xp-ok').excludePlugins).toEqual(entries);
+    expect(validateExcludePlugins(undefined)).toBeUndefined();
+  });
+
+  it('refuses an entry no sub-plugin walker could act on, naming the entry', () => {
+    // Fail closed: a dropped entry would leave the operator believing a plugin
+    // is withheld while the mount, the Codex registration and the always-on
+    // ruleset all still deliver it.
+    for (const bad of [
+      '/abs/path',
+      '../escape',
+      'bootstrap/../codex',
+      'bootstrap/plugins/orchestrate/skills/deep',
+      'bootstrap//orchestrate',
+      'bootstrap/plugins/',
+      'bootstrap\\plugins',
+      '',
+      42,
+    ]) {
+      writeGroupConfig('xp-bad', { excludePlugins: [bad] });
+      expect(() => readContainerConfig('xp-bad')).toThrow(/excludePlugins entry/);
+    }
+    writeGroupConfig('xp-notarray', { excludePlugins: 'bootstrap' });
+    expect(() => readContainerConfig('xp-notarray')).toThrow(/must be an array/);
+  });
+
+  it('refuses a malformed entry on write, not only on read', () => {
+    expect(() =>
+      writeContainerConfig('xp-write', {
+        mcpServers: {},
+        packages: { apt: [], npm: [] },
+        additionalMounts: [],
+        skills: 'all',
+        excludePlugins: ['../escape'],
+      }),
+    ).toThrow(/excludePlugins entry/);
+  });
+
+  it('splits entries into whole-plugin drops and sub-plugin masks', () => {
+    expect(splitExcludedPlugins(['codex', 'bootstrap/plugins/orchestrate', 'repo/sub'])).toEqual({
+      topLevel: new Set(['codex']),
+      subPaths: new Set(['bootstrap/plugins/orchestrate', 'repo/sub']),
+    });
+    expect(splitExcludedPlugins(undefined)).toEqual({ topLevel: new Set(), subPaths: new Set() });
   });
 });

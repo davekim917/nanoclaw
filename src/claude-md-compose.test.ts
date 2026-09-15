@@ -472,3 +472,142 @@ describe('workgroup-scoped plugin rulesets (src/plugin-scopes.ts)', () => {
     }
   });
 });
+
+describe('sub-plugin always-on rulesets', () => {
+  const ROOT_SENTINEL = 'SENTINEL_ROOT_RULES_1a2b';
+  const ORCHESTRATE_SENTINEL = 'SENTINEL_ORCHESTRATE_RULES_3c4d';
+  const WWBD_SENTINEL = 'SENTINEL_WWBD_RULES_5e6f';
+  const ROOTLEVEL_SENTINEL = 'SENTINEL_ROOTLEVEL_RULES_7a8b';
+
+  /** ~/plugins/bootstrap with sub-plugin rulesets in both walked layouts. */
+  function seedBootstrapPlugin(rootRuleset: string | null): string {
+    const home = path.join(TEST_ROOT, 'home');
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    for (const [dir, sentinel] of [
+      [path.join(repo, 'plugins', 'orchestrate'), ORCHESTRATE_SENTINEL],
+      [path.join(repo, 'plugins', 'wwbd'), WWBD_SENTINEL],
+      [path.join(repo, 'rootlevel'), ROOTLEVEL_SENTINEL],
+    ] as const) {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, '.nanoclaw-always-on.md'), `${sentinel}\n`);
+    }
+    fs.mkdirSync(repo, { recursive: true });
+    if (rootRuleset !== null) fs.writeFileSync(path.join(repo, '.nanoclaw-always-on.md'), rootRuleset);
+    return home;
+  }
+
+  function setExcludePlugins(folder: string, entries: string[]): void {
+    const dir = path.join(GROUPS_DIR, folder);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'container.json'), JSON.stringify({ excludePlugins: entries }, null, 2));
+  }
+
+  function agentsDoc(folder: string): string {
+    return fs.readFileSync(path.join(GROUPS_DIR, folder, 'AGENTS.md'), 'utf-8');
+  }
+
+  it('injects each sub-plugin ruleset alongside the repo-level one', async () => {
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(seedBootstrapPlugin(`${ROOT_SENTINEL}\n`));
+    try {
+      const ag = group('ag-sub-all', 'sub-all');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'codex', {});
+
+      const doc = agentsDoc(ag.folder);
+      for (const sentinel of [ROOT_SENTINEL, ORCHESTRATE_SENTINEL, WWBD_SENTINEL, ROOTLEVEL_SENTINEL]) {
+        expect(doc).toContain(sentinel);
+      }
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('drops only the excluded sub-plugin ruleset, keeping its siblings and the repo-level one', async () => {
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(seedBootstrapPlugin(`${ROOT_SENTINEL}\n`));
+    try {
+      const ag = group('ag-sub-excluded', 'sub-excluded');
+      await seed(ag);
+      setExcludePlugins(ag.folder, ['bootstrap/plugins/orchestrate']);
+      await composeGroupClaudeMd(ag, 'codex', {});
+
+      const doc = agentsDoc(ag.folder);
+      expect(doc).not.toContain(ORCHESTRATE_SENTINEL);
+      expect(doc).toContain(WWBD_SENTINEL);
+      expect(doc).toContain(ROOTLEVEL_SENTINEL);
+      expect(doc).toContain(ROOT_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('excluding the plugins/ container drops every sub-plugin under it', async () => {
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(seedBootstrapPlugin(null));
+    try {
+      const ag = group('ag-sub-container', 'sub-container');
+      await seed(ag);
+      setExcludePlugins(ag.folder, ['bootstrap/plugins']);
+      await composeGroupClaudeMd(ag, 'codex', {});
+
+      const doc = agentsDoc(ag.folder);
+      expect(doc).not.toContain(ORCHESTRATE_SENTINEL);
+      expect(doc).not.toContain(WWBD_SENTINEL);
+      expect(doc).toContain(ROOTLEVEL_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('excluding the whole repo still drops every sub-plugin ruleset', async () => {
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(seedBootstrapPlugin(`${ROOT_SENTINEL}\n`));
+    try {
+      const ag = group('ag-sub-repo', 'sub-repo');
+      await seed(ag);
+      setExcludePlugins(ag.folder, ['bootstrap']);
+      await composeGroupClaudeMd(ag, 'codex', {});
+
+      const doc = agentsDoc(ag.folder);
+      for (const sentinel of [ROOT_SENTINEL, ORCHESTRATE_SENTINEL, WWBD_SENTINEL, ROOTLEVEL_SENTINEL]) {
+        expect(doc).not.toContain(sentinel);
+      }
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('does not repeat a sub-plugin block the repo-level ruleset already concatenates', async () => {
+    // The interim state of a repo mid-migration: the root marker is still a
+    // hand-concatenation of its sub-plugins' blocks while the sub markers exist.
+    const concatenated = `${ORCHESTRATE_SENTINEL}\n\n${WWBD_SENTINEL}\n`;
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(seedBootstrapPlugin(concatenated));
+    try {
+      const ag = group('ag-sub-dedupe', 'sub-dedupe');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'codex', {});
+
+      const doc = agentsDoc(ag.folder);
+      const occurrences = (needle: string) => doc.split(needle).length - 1;
+      expect(occurrences(ORCHESTRATE_SENTINEL)).toBe(1);
+      expect(occurrences(WWBD_SENTINEL)).toBe(1);
+      // A sub-plugin the root does NOT carry is still emitted.
+      expect(occurrences(ROOTLEVEL_SENTINEL)).toBe(1);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('never injects any plugin ruleset into a Claude group (its SessionStart hook owns that)', async () => {
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(seedBootstrapPlugin(`${ROOT_SENTINEL}\n`));
+    try {
+      const ag = group('ag-sub-claude', 'sub-claude');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'claude', {});
+
+      const doc = docOf(ag.folder);
+      for (const sentinel of [ROOT_SENTINEL, ORCHESTRATE_SENTINEL, WWBD_SENTINEL]) {
+        expect(doc).not.toContain(sentinel);
+      }
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+});

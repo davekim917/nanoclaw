@@ -461,6 +461,25 @@ describe('planCodexPluginRegistration', () => {
     });
     expect(byName.has('monorepo/not-checked-out')).toBe(false);
   });
+
+  it('never registers a sub-plugin the host masked with an empty directory', () => {
+    // A group's `excludePlugins` may name one sub-plugin of a repo it keeps;
+    // the host then bind-mounts an empty read-only dir over exactly that path
+    // (src/container-runner.ts, plugin mounts). In here the masked dir is a
+    // real directory with no `.codex-plugin/plugin.json`, so
+    // `readCodexPluginEntryName` returns null and `findCodexSubPlugins`
+    // (codex-companion-setup.ts:582-583) drops it. Both sub-plugin layouts
+    // the walker descends are covered.
+    const repo = path.join(root, 'bootstrap');
+    writeJson(path.join(repo, '.agents', 'plugins', 'marketplace.json'), { name: 'bootstrap-mkt' });
+    const kept = path.join(repo, 'plugins', 'wwbd');
+    writeJson(path.join(kept, '.codex-plugin', 'plugin.json'), { name: 'wwbd' });
+    fs.mkdirSync(path.join(repo, 'plugins', 'orchestrate'), { recursive: true });
+    fs.mkdirSync(path.join(repo, 'rootlevel'), { recursive: true });
+
+    const plans = planCodexPluginRegistration(root);
+    expect(plans.map((p) => p.name)).toEqual(['bootstrap/wwbd']);
+  });
 });
 
 // ── Filesystem integration ─────────────────────────────────────────────────

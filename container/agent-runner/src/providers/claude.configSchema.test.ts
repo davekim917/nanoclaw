@@ -210,6 +210,30 @@ describe('Claude plugin discovery', () => {
     }
   });
 
+  it('skips a sub-plugin the host masked with an empty directory, keeping its siblings', () => {
+    // The host bind-mounts an empty read-only dir over one sub-plugin when a
+    // group's `excludePlugins` names it (src/container-runner.ts, plugin
+    // mounts). From in here that is indistinguishable from a manifest-less
+    // directory, which `hasManifest` (claude.ts:1751) already skips — this
+    // pins that, because the mask relies on it.
+    const pluginsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-plugin-masked-'));
+    try {
+      const repo = path.join(pluginsRoot, 'bootstrap');
+      const wwbd = path.join(repo, 'plugins', 'wwbd');
+      fs.mkdirSync(path.join(wwbd, '.claude-plugin'), { recursive: true });
+      fs.writeFileSync(path.join(wwbd, '.claude-plugin', 'plugin.json'), '{"name":"wwbd"}');
+      // Masked: a real directory with nothing in it.
+      fs.mkdirSync(path.join(repo, 'plugins', 'orchestrate'), { recursive: true });
+      // Second layout — a sub-plugin directly under the repo root, also masked.
+      fs.mkdirSync(path.join(repo, 'rootlevel'), { recursive: true });
+
+      const discovery = discoverPlugins(pluginsRoot);
+      expect(discovery.plugins).toEqual([{ type: 'local', path: wwbd }]);
+    } finally {
+      fs.rmSync(pluginsRoot, { recursive: true, force: true });
+    }
+  });
+
   it('gives a declared Bootstrap Bash-email guard sole ownership of the gate', () => {
     const pluginsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-plugin-owner-'));
     const originalPluginsRoot = process.env.CLAUDE_PLUGINS_ROOT;
