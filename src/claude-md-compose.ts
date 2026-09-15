@@ -286,15 +286,32 @@ export async function composeGroupClaudeMd(
         if (isExcludedSubPath(subPath, excludedSubPaths)) continue;
         const content = readRulesetFile(dir, PLUGIN_ALWAYS_ON_FILE);
         if (!content) continue;
-        const fragment = `plugin-${name}-${path.basename(subPath)}.md`;
-        if (desired.has(fragment)) {
-          log.warn('Two plugin rulesets compose to the same fragment name; keeping the first', {
-            fragment,
-            subPath,
-          });
-          continue;
-        }
-        desired.set(fragment, content);
+        // Keyed by the FULL sub-path, not its basename. A repo carrying the
+        // same name in both walked layouts (`repo/plugins/foo` and `repo/foo`
+        // — `subPluginDirs` returns both) shares a basename, so a
+        // basename-keyed fragment collided and one sub-plugin's ruleset was
+        // silently dropped. `subPath` is unique per sub-plugin by construction
+        // (`subPluginDirs` dedupes on it — the `seen` set at :93, added at
+        // :111), and it always carries a `/`, which a top-level
+        // `plugin-<name>.md` key never can: `name` is an entry of
+        // `fs.readdirSync(pluginsRoot)` (:273), i.e. one path component. The
+        // two key spaces are therefore disjoint and no collision is reachable.
+        //
+        // A `/` here is safe ONLY because these keys never become paths, so
+        // that is asserted against every consumer rather than assumed — a key
+        // that reached a path join would make this traversal, not a collision.
+        // `desired` is a function-local const (:204), never returned and never
+        // passed to a callee. Written at :209, :213, :232, :240, :280, this
+        // line, and :323; read at exactly two places — `pushFragment`'s
+        // `desired.get` (:364) and the `[...desired.keys()].sort()` that orders
+        // sections (:369). Both feed `sections`, joined into `body` (:372) and
+        // written to two FIXED paths, `<groupDir>/CLAUDE.md` (:373) and
+        // `<groupDir>/AGENTS.md` (:420). No key is ever a filename: the
+        // `.claude-fragments/` directory that once made them one is gone along
+        // with the mount that backed it (`src/container-runner.ts:4845-4846`),
+        // and `removeStaleFragmentArtifacts` only deletes that legacy
+        // directory — it never reads `desired`.
+        desired.set(`plugin-${subPath}.md`, content);
       }
     }
   }

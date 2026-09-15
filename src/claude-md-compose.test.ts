@@ -598,6 +598,62 @@ describe("sub-plugin always-on: the plugin's own always-on.md (OpenCode only)", 
     }
   });
 
+  it('keeps both rulesets when one repo carries the same sub-plugin name in both layouts', async () => {
+    // `subPluginDirs` walks `<repo>/plugins/<sub>` AND `<repo>/<sub>`, so a repo
+    // with both shares a basename. Keying the fragment by that basename dropped
+    // one of the two silently. (PR #826 Codex round 3, P2.)
+    const home = path.join(TEST_ROOT, 'home');
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    const NESTED = 'SENTINEL_NESTED_TWIN_9c1e';
+    const ROOTED = 'SENTINEL_ROOTED_TWIN_4f7d';
+    for (const [dir, sentinel] of [
+      [path.join(repo, 'plugins', 'twin'), NESTED],
+      [path.join(repo, 'twin'), ROOTED],
+    ] as const) {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'always-on.md'), `${sentinel}\n`);
+    }
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-twin', 'sub-twin');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+
+      const doc = agentsDoc(ag.folder);
+      expect(doc).toContain(NESTED);
+      expect(doc).toContain(ROOTED);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('still excludes a twin by its own sub-path, leaving the other in place', async () => {
+    const home = path.join(TEST_ROOT, 'home');
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    const NESTED = 'SENTINEL_NESTED_TWIN_9c1e';
+    const ROOTED = 'SENTINEL_ROOTED_TWIN_4f7d';
+    for (const [dir, sentinel] of [
+      [path.join(repo, 'plugins', 'twin'), NESTED],
+      [path.join(repo, 'twin'), ROOTED],
+    ] as const) {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'always-on.md'), `${sentinel}\n`);
+    }
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-twin-excl', 'sub-twin-excl');
+      await seed(ag);
+      setExcludePlugins(ag.folder, ['bootstrap/plugins/twin']);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+
+      const doc = agentsDoc(ag.folder);
+      expect(doc).not.toContain(NESTED);
+      expect(doc).toContain(ROOTED);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
   it('never injects any plugin ruleset into a Claude group (its SessionStart hook owns that)', async () => {
     const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(seedBootstrapPlugin(`${OVERRIDE_SENTINEL}\n`));
     try {
