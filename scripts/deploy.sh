@@ -15,6 +15,11 @@ PRE_COMMIT="${NANOCLAW_DEPLOY_PRE_COMMIT:-}"
 ROLLBACK_READY=0
 DEPLOY_HANDOFF=0
 IMAGE_SAVED_BASE=""
+# Units this deploy has asked systemd to restart, recorded BEFORE the attempt so
+# a unit whose restart failed is still put back by the rollback. nanoclaw-v2 is
+# not in here — it restarts last, under its own guard.
+RESTART_ATTEMPTED_UNITS=""
+COMMIT_RESTORED=0
 
 write_status() {
   local status="$1" step="$2" error="$3"
@@ -24,6 +29,62 @@ write_status() {
 
 tracked_changes() {
   [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]
+}
+
+# Every ACTIVE systemd service that holds this checkout's code resident, one
+# unit id per line, nanoclaw-v2 included. Non-zero exit means "could not look",
+# which is never the same answer as "nothing there" (#818).
+#
+# Discovered, not listed. `nanoclaw-codex-sync.service` runs
+# `pnpm exec tsx src/codex-sync-watcher.ts`: tsx loads the TypeScript into
+# memory once at process start, so nothing short of a restart moves it off the
+# source it booted with, and until this ran a deploy never restarted it — one
+# watcher sat two days behind main and kept re-mirroring the pre-#813
+# CODEX_WORKER_MODELS map (src/claude-agent-md.ts:40, read at :161 by the
+# formatter the watcher calls through src/codex-sync-watcher.ts:43) over every
+# ~/.codex*/agents and groups/*/.codex/agents tree. A hardcoded second name
+# would have fixed exactly that unit and gone quietly wrong at the third; this
+# host already carries a third `Type=simple` nanoclaw unit file
+# (nanoclaw-container-limits.service, currently disabled, and correctly
+# excluded below because it runs /usr/local/sbin, not this checkout).
+#
+# Three predicates, each chosen to be wrong LOUDLY rather than quietly:
+#   - ACTIVE, so an installed-but-stopped or disabled unit is never started by
+#     a deploy. An active unit is by definition loaded, so `list-units` sees it.
+#   - WorkingDirectory == REPO_ROOT, which is what "runs this checkout's code"
+#     actually means — it catches a long-running unit named outside the
+#     `nanoclaw-` prefix, and a spelling mismatch here takes nanoclaw-v2 out of
+#     the result too, where the caller's self-check refuses the deploy.
+#   - NOT Type=oneshot. oneshot is the only type that is definitionally not a
+#     resident process; every other type (simple, exec, notify, forking, dbus,
+#     idle, and whatever systemd adds next) is. An unknown type therefore lands
+#     in the restart set rather than being skipped unexamined.
+#
+# `systemctl show` emits one blank-line-separated block per unit with the
+# properties in an unspecified order, so parse by key, never by position.
+long_running_repo_units() {
+  local active
+  active=$(systemctl list-units --type=service --state=active --plain --no-legend --no-pager 2>/dev/null) || return 1
+  active=$(printf '%s\n' "$active" | awk '{print $1}' | grep '\.service$')
+  [ -n "$active" ] || return 1
+  local blocks
+  # shellcheck disable=SC2086
+  blocks=$(systemctl show --no-pager --property=Id --property=Type --property=WorkingDirectory $active 2>/dev/null) || return 1
+  printf '%s\n' "$blocks" |
+    awk -v root="$REPO_ROOT" '
+      BEGIN { RS = ""; FS = "\n" }
+      {
+        id = ""; type = ""; wd = ""
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /^Id=/) id = substr($i, 4)
+          else if ($i ~ /^Type=/) type = substr($i, 6)
+          else if ($i ~ /^WorkingDirectory=/) wd = substr($i, 18)
+        }
+        sub(/^-/, "", wd)
+        if (id == "" || type == "" || wd != root) next
+        if (type == "oneshot") next
+        print id
+      }'
 }
 
 snapshot_dir() {
@@ -76,6 +137,24 @@ restore_before_restart() {
     echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Pre-restart rollback preserved tracked source changes; commit reset skipped" >> "$LOG"
   elif git reset --hard "$PRE_COMMIT" >> "$LOG" 2>&1; then
     restored="${restored}commit ${PRE_COMMIT:0:8} "
+    COMMIT_RESTORED=1
+  fi
+
+  # A sibling this deploy restarted is now resident on the code the reset above
+  # just removed — the same stale-long-running-service class this script exists
+  # to close, in mirror image. Put them back onto the restored checkout. Only
+  # when the commit actually moved: if the reset was skipped, the checkout is
+  # still at the new commit and the siblings already match it. Never changes the
+  # exit code — the status file already says the deploy failed — but a unit that
+  # will not come back is named, because that one IS an outage.
+  if [ "$COMMIT_RESTORED" = "1" ] && [ -n "$RESTART_ATTEMPTED_UNITS" ]; then
+    for unit in $RESTART_ATTEMPTED_UNITS; do
+      if sudo systemctl restart "$unit" >> "$LOG" 2>&1; then
+        restored="${restored}${unit} "
+      else
+        echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Rollback could not restart ${unit} onto the restored build — it is NOT running this checkout's code; check it by hand" >> "$LOG"
+      fi
+    done
   fi
 
   if [ -n "$IMAGE_SAVED_BASE" ]; then
@@ -360,6 +439,57 @@ else
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Crash guard NOT armed: deploy ships migrations ($(echo "$MIGRATION_CHANGES" | head -3 | tr '\n' ' '))" >> "$LOG"
   rm -f data/deploy-rollback.json
 fi
+
+# Restart every OTHER long-running service that holds this checkout's code
+# resident, BEFORE the handoff below (#824).
+#
+# This has to be here and not after the restart of nanoclaw-v2: that restart
+# kills this script (the host spawns it `detached: true`, which gives it its own
+# process group and session but leaves it in the unit's cgroup —
+# src/channels/discord-slash-commands.ts:110-118 — and neither
+# scripts/nanoclaw-v2.service nor the installed copy sets KillMode, so systemd's
+# default `control-group` SIGTERMs the whole cgroup on stop). Nothing appended
+# after that restart ever executes — which is the same reason the success status
+# is written before it, per the comment below.
+#
+# Failure is terminal, and deliberately so: the rollback trap has not handed off
+# yet, so exiting here restores dist/, node_modules/ and the previous commit
+# exactly the way the planted-host-dir sweep above does, and the deploy reports
+# `failed`, never `ok`, with the unit named. Restarting the siblings last, right
+# before the handoff, also keeps the window in which they run newer code than
+# the still-live host as short as it can be.
+write_status "running" "sibling service restart" ""
+SIBLING_UNITS=$(long_running_repo_units) || {
+  write_status "failed" "sibling service restart" \
+    "could not enumerate this checkout's long-running services — restart refused"
+  exit 1
+}
+# nanoclaw-v2 is the one unit guaranteed to satisfy every clause of that
+# predicate while it is running, so it is the enumeration's own control. A
+# broken enumeration — systemctl unreadable, a REPO_ROOT that does not match the
+# unit's WorkingDirectory byte for byte, a `systemctl show` output shape that
+# moved — answers "no siblings" in exactly the words a host with no siblings
+# uses. Losing the control says the answer is not trustworthy, so refuse rather
+# than restart nothing and report ok (#818).
+if systemctl is-active --quiet nanoclaw-v2.service 2>/dev/null &&
+  ! printf '%s\n' "$SIBLING_UNITS" | grep -qxF 'nanoclaw-v2.service'; then
+  write_status "failed" "sibling service restart" \
+    "long-running-service discovery did not find the running nanoclaw-v2.service — refusing to trust it"
+  exit 1
+fi
+while IFS= read -r unit; do
+  [ -n "$unit" ] || continue
+  [ "$unit" = "nanoclaw-v2.service" ] && continue
+  # Recorded before the attempt: a unit whose restart fails is in an unknown
+  # state, and the rollback's job is to put it back on the restored build.
+  RESTART_ATTEMPTED_UNITS="${RESTART_ATTEMPTED_UNITS}${unit} "
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Restarting ${unit} onto the new build" >> "$LOG"
+  if ! sudo systemctl restart "$unit" >> "$LOG" 2>&1; then
+    write_status "failed" "sibling service restart" \
+      "systemctl restart ${unit} failed — restored the previous build"
+    exit 1
+  fi
+done <<< "$SIBLING_UNITS"
 
 # Write success status BEFORE restart — systemctl restart kills this script's
 # process group, so lines after don't run. The new process reads this file
