@@ -256,10 +256,14 @@ catch it — the fixture mirrored the code's own request shape. See memory
 **RESOLVED — #817 (`e70fe9e5d`) is the fix**: omit `params` entirely (valid on both versions), with
 wire-shape regression tests asserting the raw stdin text carries no `params` member. **Read path is
 live**: first `usage_pull` row 2026-09-15T03:46:35Z (`limit_type='seven_day'`, utilization 0.08,
-`resets_at` 2026-09-22T01:30:07Z). Verified 04:05Z across the six live containers: every container
-spawned against the post-fix runner snapshot (`20260915T033918Z`) logs zero `invalid type: map`
-errors; the one still running from 02:33:56Z predates that snapshot and still logs it, because the
-runner source is a boot snapshot and a live container keeps the one it bound. Park decisions rest on
+`resets_at` 2026-09-22T01:30:07Z). Verified 04:14Z across the live containers: **no occurrence of
+`invalid type: map` after the fix deployed**. The read is bind-time only, so the single occurrence
+anywhere on the host is historical — one container booted 02:33:55Z, inside the window where #812
+was deployed and #817 was not, logged it once at 02:34:01Z and has logged nothing like it since
+while running continuously; it holds the pre-fix runner source from its boot snapshot and will until
+it respawns. The container that bound 03:46:29Z, after the fix, logged a successful
+`rateLimitsByLimitId` payload at 03:46:35.966Z — the same instant as that first `usage_pull` row.
+Park decisions rest on
 the bind-time snapshot again for every group that has respawned since the fix; groups still on a
 pre-fix container carry no pull row at all until their next bind, which is what
 `scripts/rate-limit-telemetry-health.ts` reports. | … → r3 approve `a4e06320f` → PR was CONFLICTING with main so CI never ran (see memory `ci-silent-on-conflicting-pr`) → rebased twice (main moved with #813/#814) → `9df6bc432` → r4 rebase confirmation by a fresh Claude Opus reviewer (host Codex out of quota) → CI green → merged. |
