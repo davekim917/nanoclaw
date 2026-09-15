@@ -759,22 +759,36 @@ export interface ContainerConfig {
    * `codex` plugin to avoid handing them a CLI with the host's Codex OAuth
    * session.
    *
-   * Two granularities, one field — and today they reach different distances:
+   * Two granularities, one field. Both reach every provider; what differs is
+   * whether the BYTES go or only the REGISTRATION:
    *   - `"bootstrap"` — a top-level entry. Its mount is never created, so the
-   *     plugin is absent from `/workspace/plugins` for every provider.
+   *     plugin is absent from `/workspace/plugins` for every provider. (One
+   *     documented exception: OpenCode's skills arrive through the host's
+   *     per-sibling mirror rather than this mount, and the session XDG copy of
+   *     that mirror is filtered for SUB-PATH entries only, so a top-level entry
+   *     there drops the mount and the ruleset and keeps the skills. See
+   *     `excludedOpenCodeSkillNames`, `src/providers/opencode.ts`.)
    *   - `"bootstrap/plugins/orchestrate"` — one sub-plugin of a monorepo whose
-   *     other sub-plugins the group keeps. This withholds that sub-plugin's
-   *     standing directive from the composed prompt
-   *     (`src/claude-md-compose.ts`) and NOTHING ELSE: the repo mounts whole,
-   *     so the sub-plugin's skills, manifest and hooks are still reachable in
-   *     the container.
+   *     other sub-plugins the group keeps. The repo still mounts whole, so the
+   *     sub-plugin's FILES stay readable at `/workspace/plugins/<repo>/<sub>`.
+   *     What is withheld is REGISTRATION, by each walker that would have
+   *     performed it: the Claude SDK `plugins:` list (and with it the
+   *     sub-plugin's SessionStart hook and PreToolUse guards), the Codex
+   *     registration plan (and, keyed off it, hook trust), the
+   *     `~/.agents/skills` mirror both Codex and OpenCode read, the OpenCode
+   *     session XDG skill copy, and the standing directive in the composed
+   *     prompt (`src/claude-md-compose.ts`).
    *
-   * The gap is deliberate and temporary. Masking the sub-path with an empty
-   * bind mount was tried and removed: it required the host to predict what a
-   * container's own walkers would resolve, and an absolute symlink inside the
-   * repo is absent to a host `statSync` while live once the repo is mounted, so
-   * the exclusion silently did not apply. Container-side exclusion lands in a
-   * follow-up, where each walker honours this same list in its own namespace.
+   * Every one of those decisions is made where the path resolves, against a
+   * path the walker assembled itself, through one shared predicate
+   * (`src/plugin-exclusions.ts`, copied verbatim to
+   * `container/agent-runner/src/plugin-exclusions.ts`). Masking the sub-path
+   * host-side with an empty bind mount was tried and removed first: it required
+   * the host to predict what a container's own walkers would resolve, and an
+   * absolute symlink inside the repo is absent to a host `statSync` while live
+   * once the repo is mounted, so the exclusion silently did not apply. Nothing
+   * here predicts. An entry naming a sub-plugin this install does not carry is
+   * an inert no-op, logged once at container startup, never a spawn failure.
    *
    * Validated by `validateExcludePlugins` — a malformed entry throws rather
    * than being silently ignored.

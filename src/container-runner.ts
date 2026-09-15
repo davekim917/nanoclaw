@@ -5040,17 +5040,27 @@ export async function buildMounts(
   // excludePlugins deny list skips named plugins — useful for limiting
   // a group's tool surface (e.g. security agents without codex).
   //
-  // Only a TOP-LEVEL entry is honoured here. An entry carrying a "/" names one
-  // sub-plugin of a monorepo the group otherwise keeps, and this path has no
-  // way to withhold it: the host cannot decide what a container's own walkers
-  // will find. Masking it by bind-mounting an empty directory over the sub-path
-  // was tried and removed, because it made the host predict container-side path
-  // resolution and the two namespaces do not have to agree — an absolute
-  // symlink inside the repo is absent to a host `statSync` and live once the
-  // repo is mounted, so the exclusion silently did not apply. Sub-path entries
-  // are validated and drive the always-on composer (`src/claude-md-compose.ts`),
-  // and container-side skill/plugin exclusion lands in a follow-up where each
-  // walker honours the list in its own namespace.
+  // Only a TOP-LEVEL entry is honoured HERE, and that is the whole design, not
+  // a gap. An entry carrying a "/" names one sub-plugin of a monorepo the group
+  // otherwise keeps, and the mount path has no honest way to withhold it: the
+  // host cannot decide what a container's own walkers will find. Masking it by
+  // bind-mounting an empty directory over the sub-path was tried and removed,
+  // because it made the host predict container-side path resolution and the two
+  // namespaces do not have to agree — an absolute symlink inside the repo is
+  // absent to a host `statSync` and live once the repo is mounted, so the
+  // exclusion silently did not apply.
+  //
+  // A sub-path entry is honoured where the path resolves instead: each walker
+  // that would have REGISTERED the sub-plugin asks one shared predicate about a
+  // path it assembled itself (`isExcludedPluginPath`,
+  // `container/agent-runner/src/plugin-exclusions.ts`, a verbatim copy of
+  // `src/plugin-exclusions.ts`) — the Claude SDK plugin list, the Codex
+  // registration plan and its hook trust, the `~/.agents/skills` mirror, and
+  // the always-on composer (`src/claude-md-compose.ts`). The one host-side
+  // consumer is the OpenCode session XDG skill copy, which filters a mirror
+  // this mount does not feed (`src/providers/opencode.ts`). So the repo's bytes
+  // stay readable under this mount by design; what the entry withholds is
+  // registration.
   //
   // Special case: if codex plugin is mounted and the host's ~/.codex dir
   // exists, mount that RW so the Codex CLI can use the host's OAuth
