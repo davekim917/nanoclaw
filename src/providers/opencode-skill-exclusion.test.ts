@@ -70,6 +70,23 @@ describe('excludedOpenCodeSkillNames', () => {
     const dropped = excludedOpenCodeSkillNames(plugins, splitExcludedPlugins(['bootstrap/plugins/orchestrate']));
     expect(dropped.has('orchestrate')).toBe(false);
   });
+
+  it('drops a duplicated name when the EXCLUDED source is the one the mirror published', () => {
+    // The inverse of the case above, and the one a name-only difference got
+    // wrong: `bootstrap` sorts before `zulu`, so the excluded sub-plugin wins
+    // discovery's first-plugin-wins dedup and its directory is what the shared
+    // mirror holds under this name. The name still exists in a filtered walk —
+    // supplied by `zulu` — so comparing names alone would read it as kept and
+    // copy the excluded source into the group's XDG, inverting the exclusion.
+    // `zulu`'s copy is not lost: the container-side mirror honours the same
+    // list over `/workspace/plugins` and picks it up there.
+    fs.mkdirSync(path.join(plugins, 'zulu'), { recursive: true });
+    writeSkill(path.join(plugins, 'zulu', 'skills', 'orchestrate'), 'orchestrate');
+    const dropped = excludedOpenCodeSkillNames(plugins, splitExcludedPlugins(['bootstrap/plugins/orchestrate']));
+    expect(dropped.has('orchestrate')).toBe(true);
+    // And only that name — `wwbd` shares the repo but not the excluded path.
+    expect([...dropped]).toEqual(['orchestrate']);
+  });
 });
 
 describe('copyOpenCodeSkills with a drop set', () => {

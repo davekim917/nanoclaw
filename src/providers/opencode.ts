@@ -30,7 +30,7 @@ import {
   replaceUntrustedFile,
 } from '../fs-safety.js';
 import { assertValidGroupFolder } from '../group-folder.js';
-import { splitExcludedPlugins, type ExcludedPlugins } from '../plugin-exclusions.js';
+import { isExcludedPluginPath, splitExcludedPlugins, type ExcludedPlugins } from '../plugin-exclusions.js';
 import { discoverPortableSkills } from '../plugin-skill-discovery.js';
 import { registerProviderContainerConfig } from './provider-container-registry.js';
 
@@ -71,12 +71,44 @@ const DEFAULT_OPENCODE_EFFORT = 'high';
  * would silently withdraw skills those groups have today, which is a fleet
  * change, not this one's. The top-level gap stays as it was.
  *
- * Deriving the drop set by DIFFERENCE — discover twice over the host's own
- * `~/plugins`, once with the list and once without — rather than by mapping
- * mirror entries back to plugin paths, keeps three properties that matter:
- * the same predicate decides here as in the container, first-plugin-wins name
- * dedup is respected (a name another plugin also provides is NOT dropped), and
- * nothing resolves a path across a mount namespace.
+ * The question this set answers is about the SOURCE the mirror published, not
+ * about a name: the mirror holds exactly one directory per skill name, and the
+ * copy either hands that directory to the group or does not. So each discovered
+ * skill is asked the predicate directly, about the path the walk assembled for
+ * it — `path.relative(pluginsRoot, skillDir)`, built from `readdirSync` names
+ * by `discoverInPlugin`'s own `path.join`s, never a `realpath` and never a path
+ * from another mount namespace, which is what `isExcludedPluginPath`'s contract
+ * requires.
+ *
+ * An earlier revision took a DIFFERENCE of two walks — one with the list, one
+ * without — and compared the NAMES that survived. That inverted the exclusion
+ * in the case review r1 named: discovery keeps only the first plugin to claim a
+ * name (`src/plugin-skill-discovery.ts:407-409`, alphabetical) and the mirror
+ * was built from the UNFILTERED walk (`syncOpenCodePluginSkills`,
+ * `src/opencode-sync.ts:253-256`), so when the excluded sub-plugin is a name's
+ * FIRST provider the name survives the filtered walk — supplied by the later
+ * plugin — while the bytes in the mirror are still the excluded one's. A
+ * name-only comparison read that as "kept" and copied the excluded source
+ * through. Comparing part of an identifier the producer guarantees unique in
+ * full is the same mistake #826 r3 recorded for the composer's fragment keys.
+ *
+ * A name whose mirror copy IS the excluded source is therefore dropped even
+ * when another plugin also provides it — the mirror holds the wrong one and
+ * there is no other copy of that name in it. Nothing is lost: the later
+ * plugin's copy reaches the group through the container-side mirror, which
+ * discovers over `/workspace/plugins` with the same list and picks that source
+ * up (`syncAgentSkillsMirror`,
+ * `container/agent-runner/src/codex-companion-setup.ts:826-828`), and OpenCode
+ * auto-loads `~/.agents/skills`.
+ *
+ * KNOWN RESIDUAL, not closed here: this walk's population is not quite the
+ * mirror's. `syncOpenCodePluginSkills` also denies workgroup-scoped plugins
+ * (`scopedPluginNames`, `src/opencode-sync.ts:246`) and this one does not, so a
+ * scoped plugin claiming the same skill name as an excluded sub-plugin, and
+ * sorting ahead of it, would win here while the mirror published the excluded
+ * source. Closing it means threading the mirror's deny set through this call,
+ * which is a second reader of the scopes file on the spawn path; re-raise if a
+ * scoped plugin ever ships a skill name that an unscoped one also ships.
  *
  * Returns an empty set for a group with no sub-path entry, which is every group
  * today: the copy below then behaves exactly as it did.
@@ -84,12 +116,9 @@ const DEFAULT_OPENCODE_EFFORT = 'high';
 export function excludedOpenCodeSkillNames(pluginsRoot: string, excluded: ExcludedPlugins): Set<string> {
   if (excluded.subPaths.size === 0) return new Set();
   const subPathsOnly: ExcludedPlugins = { topLevel: new Set(), subPaths: excluded.subPaths };
-  const kept = new Set(
-    discoverPortableSkills(pluginsRoot, { runtime: 'opencode', excludePlugins: subPathsOnly }).map((s) => s.name),
-  );
   const dropped = new Set<string>();
   for (const skill of discoverPortableSkills(pluginsRoot, { runtime: 'opencode' })) {
-    if (!kept.has(skill.name)) dropped.add(skill.name);
+    if (isExcludedPluginPath(path.relative(pluginsRoot, skill.skillDir), subPathsOnly)) dropped.add(skill.name);
   }
   return dropped;
 }
