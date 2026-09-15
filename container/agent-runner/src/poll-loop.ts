@@ -2230,6 +2230,14 @@ export async function processQuery(
    */
   const lowerTurnLevelUnlessQueued = (): void => {
     if (query.hasQueuedWork?.()) return;
+    // Same gap, different work: a background agent launched this turn is
+    // still running inside the CLI after `result`. Lowering here published
+    // idle for it and the task reaper killed the container — and the agent —
+    // within one sweep tick (2026-09-15: a task session's parent ended each
+    // turn on a `wait`, was reaped 15–60s later nine times in 80 minutes, and
+    // every delegated worker died mid-flight). The `background_work` event
+    // re-runs this once the set drains.
+    if (query.hasBackgroundWork?.()) return;
     setProviderTurnExecuting(false);
   };
 
@@ -2513,6 +2521,15 @@ export async function processQuery(
         // `result` kept the level up while these prompts looked queued
         // (lowerTurnLevelUnlessQueued). The turn is over now.
         lowerTurnLevelUnlessQueued();
+      } else if (event.type === 'background_work') {
+        // The level was held at `result` for this work (lowerTurnLevelUnlessQueued).
+        // Once it drains with no turn running, the container is idle. When the
+        // drain does start a follow-up turn (the CLI folds the completion in
+        // as a task-notification and answers it), that turn's `init` raises
+        // the level again on its own; the only exposure is the CLI's gap
+        // between the two, against a 60s sweep. A drain mid-turn changes
+        // nothing: the turn's own `result` decides.
+        if (event.live === 0 && turnIdle && !resultScopeOpen) lowerTurnLevelUnlessQueued();
       } else if (event.type === 'compacted') {
         advanceMemoryContextEpoch(providerName);
         // The SDK auto-compacted the conversation. After compaction the

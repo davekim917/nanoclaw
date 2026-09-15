@@ -345,6 +345,24 @@ export interface AgentQuery {
    */
   hasQueuedWork?(): boolean;
 
+  /**
+   * Whether the provider's CLI still has live background work — a subagent
+   * launched with `run_in_background`, a backgrounded Bash command, a Monitor
+   * — that will report back into this session after the current turn's
+   * `result`. `claude.ts` mirrors the CLI's `background_tasks_changed` level
+   * message (REPLACE semantics, ambient watchers excluded); the other
+   * providers have no such work and leave it undefined.
+   *
+   * The poll-loop reads it wherever it would lower the published busy level.
+   * A turn that launches a background agent and then ends (typically after a
+   * `wait`) otherwise publishes idle while that agent is mid-flight, and the
+   * host's task reaper kills the container within one sweep tick — the
+   * background agent dies with it and the next wake finds "didn't finish
+   * before the previous session ended" (2026-09-15, one task session killed
+   * nine times in 80 minutes this way, every worker lost).
+   */
+  hasBackgroundWork?(): boolean;
+
   /** Signal that no more input will be sent. */
   end(): void;
 
@@ -514,6 +532,16 @@ export type ProviderEvent =
    * tracks prompt ids emits it.
    */
   | { type: 'settled'; unansweredPrompts: string[] }
+  /**
+   * The provider's set of live background tasks changed; `live` is how many
+   * remain (ambient watchers excluded). Emitted by a provider that implements
+   * `hasBackgroundWork`, on every change. The poll-loop uses the drain to
+   * zero (`live === 0`) to lower the busy level it held for that work when no
+   * turn is running — otherwise the level would stay up until the next
+   * `result`, and a background task whose completion starts no follow-up turn
+   * would pin the container past every reaper.
+   */
+  | { type: 'background_work'; live: number }
   /**
    * `resetAt` is the provider's MEASURED recovery instant (ISO-8601 UTC) when
    * it has one — today the Codex rate-limit snapshot's `resetsAt` behind a

@@ -2561,6 +2561,14 @@ export class ClaudeProvider implements AgentProvider {
     // that ends every wait on an outstanding prompt. Until then, report no
     // queued work, as before, so a CLI without the events cannot pin a turn.
     let sessionStateSeen = false;
+    // Live background tasks as the CLI last reported them
+    // (`background_tasks_changed`, sdk.d.ts: a level signal with REPLACE
+    // semantics — swap the set for each payload, never pair start/finish
+    // bookends, so a missed bookend cannot wedge a stale indicator). Per CLI
+    // process, so per query: nothing is emitted at startup and this starts
+    // empty. Ambient entries (live-update watchers, skip_transcript tasks) are
+    // not work and are excluded, as the SDK asks. Read by `hasBackgroundWork`.
+    const liveBackgroundTasks = new Set<string>();
 
     // Per-turn input takes precedence over sticky config (A3).
     // Normalize bare opus → [1m] so the CLI's auto-compact window stays at 1M
@@ -3047,6 +3055,14 @@ export class ClaudeProvider implements AgentProvider {
             const emoji = (tn.status && TASK_NOTIFICATION_EMOJI[tn.status]) || '🔧';
             yield { type: 'progress', message: formatBlockquoteLabel(emoji, summary) };
           }
+        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'background_tasks_changed') {
+          const payload = message as { tasks?: { task_id?: string; ambient?: boolean; task_type?: string }[] };
+          liveBackgroundTasks.clear();
+          for (const t of Array.isArray(payload.tasks) ? payload.tasks : []) {
+            if (t && typeof t.task_id === 'string' && t.ambient !== true) liveBackgroundTasks.add(t.task_id);
+          }
+          log(`Background tasks: ${liveBackgroundTasks.size} live`);
+          yield { type: 'background_work', live: liveBackgroundTasks.size };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'session_state_changed') {
           sessionStateSeen = true;
           if ((message as { state?: string }).state === 'idle') {
@@ -3183,6 +3199,12 @@ export class ClaudeProvider implements AgentProvider {
       // for that work's duration after a dropped echo, bounded only by the
       // 30-minute ceiling.
       hasQueuedWork: () => sessionStateSeen && stream.outstanding.size > 0,
+      // Background agents outlive the turn that launched them; the CLI reports
+      // them back into this same stream when they finish (task_notification,
+      // then a turn it starts itself). Holding the busy level while any are
+      // live is what keeps the task reaper off a container whose parent turn
+      // ended on a `wait`. See AgentQuery.hasBackgroundWork.
+      hasBackgroundWork: () => liveBackgroundTasks.size > 0,
       end: () => stream.end(),
       events: translateEvents(),
       // The SDK installs systemPrompt at query creation and exposes no control

@@ -2703,6 +2703,104 @@ describe('processQuery provider_executing', () => {
     expect(observed.afterAnswer).toBe(0);
   });
 
+  // 2026-09-15: a task session's parent turn launched a background worker,
+  // ended on a `wait`, and the idle reaper killed the container 15–60s later
+  // — nine times in 80 minutes, every worker lost. The provider reports the
+  // CLI's live background set (hasBackgroundWork); `result` must hold the
+  // level while it is non-empty.
+  it('holds the level at `result` while the provider reports live background work', async () => {
+    const observed: Record<string, number> = {};
+    let live = 1;
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-bg' };
+      yield { type: 'result', text: '<internal>delegated, waiting</internal>', answeredPrompts: ['p-initial'] };
+      observed.afterResultWithBackground = providerExecuting();
+      // The worker finishes: the CLI's level set drains between turns.
+      live = 0;
+      yield { type: 'background_work', live: 0 };
+      observed.afterDrain = providerExecuting();
+    }
+    const query: AgentQuery = {
+      push: () => {},
+      initialPromptId: 'p-initial',
+      hasQueuedWork: () => false,
+      hasBackgroundWork: () => live > 0,
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    await processQuery(query, ERR_ROUTING, ['m-bg'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(observed.afterResultWithBackground).toBe(1);
+    expect(observed.afterDrain).toBe(0);
+    expect(providerExecuting()).toBe(0);
+  });
+
+  it('keeps the level through the follow-up turn a background completion starts, and lowers at its result', async () => {
+    const observed: Record<string, number> = {};
+    let live = 1;
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-bg2' };
+      yield { type: 'result', text: '<internal>delegated</internal>', answeredPrompts: ['p-initial'] };
+      observed.afterResult = providerExecuting();
+      // A membership change that leaves work live (one of two finished)
+      // must not lower anything.
+      yield { type: 'background_work', live: 1 };
+      observed.afterPartialDrain = providerExecuting();
+      live = 0;
+      yield { type: 'background_work', live: 0 };
+      // The CLI folds the completion in and starts a turn of its own.
+      yield { type: 'init', continuation: 'sess-bg2' };
+      observed.followUpRunning = providerExecuting();
+      yield { type: 'result', text: '<internal>reported</internal>', answeredPrompts: [] };
+      observed.afterFollowUp = providerExecuting();
+    }
+    const query: AgentQuery = {
+      push: () => {},
+      initialPromptId: 'p-initial',
+      hasQueuedWork: () => false,
+      hasBackgroundWork: () => live > 0,
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    await processQuery(query, ERR_ROUTING, ['m-bg2'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(observed.afterResult).toBe(1);
+    expect(observed.afterPartialDrain).toBe(1);
+    expect(observed.followUpRunning).toBe(1);
+    expect(observed.afterFollowUp).toBe(0);
+  });
+
+  it('ignores a background drain that lands mid-turn — the turn\'s own result decides', async () => {
+    const observed: Record<string, number> = {};
+    let live = 1;
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-bg3' };
+      live = 0;
+      yield { type: 'background_work', live: 0 };
+      observed.midTurnAfterDrain = providerExecuting();
+      yield { type: 'result', text: '<internal>done</internal>', answeredPrompts: ['p-initial'] };
+      observed.afterResult = providerExecuting();
+    }
+    const query: AgentQuery = {
+      push: () => {},
+      initialPromptId: 'p-initial',
+      hasQueuedWork: () => false,
+      hasBackgroundWork: () => live > 0,
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    await processQuery(query, ERR_ROUTING, ['m-bg3'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(observed.midTurnAfterDrain).toBe(1);
+    expect(observed.afterResult).toBe(0);
+  });
+
   it('lowers the level when the provider settles the queued prompt at idle', async () => {
     const observed: Record<string, number> = {};
     let queued = true;
