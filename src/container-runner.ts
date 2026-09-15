@@ -117,6 +117,7 @@ import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { applyOnecliContainerConfig, describeDiagnosis } from './onecli-apply.js';
+import { encodeSlotUsageSurvey, ringSlotsForSurvey, slotUsageSurveyForSpawn } from './slot-usage-survey.js';
 import {
   applyOnecliSecrets,
   ensureOnecliAgent,
@@ -6597,8 +6598,12 @@ async function buildContainerArgs(
     // under the same unscoped `_N` names as globals, so without this the
     // container cannot tell its slot 2 from the global pool's slot 2 — and
     // rate-limit utilization sampled against them is not comparable (see
-    // rate_limit_samples in the container's outbound.db).
-    args.push('-e', `NANOCLAW_OAUTH_CREDENTIAL_SET=${auth.oauthScoped ? `group:${credentialFolder}` : 'global'}`);
+    // rate_limit_samples in the container's outbound.db). ONE binding, shared
+    // with the usage-survey push below: a second copy of this expression could
+    // drift and file the host's readings for a slot under a different set than
+    // the container files its sample rows under.
+    const oauthCredentialSet = auth.oauthScoped ? `group:${credentialFolder}` : 'global';
+    args.push('-e', `NANOCLAW_OAUTH_CREDENTIAL_SET=${oauthCredentialSet}`);
     // Operator-declared lane per slot (`<slot>:<lane>,...`). The container
     // reads this from its own env (see laneForSlot in providers/claude.ts),
     // and there is NO generic env passthrough into containers — the only one
@@ -6620,6 +6625,24 @@ async function buildContainerArgs(
     // proxy, scopes undeclared -> available:false / no windows; declared ->
     // available:true / five_hour + seven_day readings.
     args.push('-e', 'CLAUDE_CODE_OAUTH_SCOPES=user:inference user:profile');
+    // Plan utilization for EVERY ring slot, surveyed by this host on its own
+    // clock (src/slot-usage-survey.ts). The runner used to pull
+    // /api/oauth/usage for all six slots itself at every session start, which
+    // made each token's request rate equal the fleet's spawn rate and earned a
+    // fleet-wide 429 (PR #811 follow-up). It now reads the answer from here and
+    // makes no network call of its own.
+    //
+    // Emitted from THIS block, unconditionally, alongside the slots it
+    // describes: a spawn that forwards an OAuth ring always forwards a survey
+    // variable, so an ABSENT variable is a wiring bug and an EMPTY one is the
+    // cold-start state. (#810's lesson — a pin pushed from only one of the
+    // branches that need it regresses silently.)
+    const surveySlots = ringSlotsForSurvey(hostOauth, auth.oauthFallbacks);
+    const { survey, refreshed } = slotUsageSurveyForSpawn(oauthCredentialSet, surveySlots);
+    // Background, and already caught inside — the spawn never waits on it and
+    // a usage pull can never fail a spawn. Telemetry, not correctness.
+    void refreshed;
+    args.push('-e', `NANOCLAW_SLOT_USAGE_SURVEY=${encodeSlotUsageSurvey(survey)}`);
   }
 
   // GitHub token for git-over-HTTPS + `gh` CLI. Per-agent-group: resolves

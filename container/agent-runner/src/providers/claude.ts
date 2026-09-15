@@ -23,7 +23,14 @@ import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { appendActiveRuntimeContext } from '../runtime-context.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { shimCwd } from './cwd-shim.js';
-import { fetchSlotUsage, formatSlotRanking, pickSlotByUsage, type SlotUsageReading } from './claude-slot-pick.js';
+import {
+  formatSlotRanking,
+  parseSlotUsageSurvey,
+  pickSlotByUsage,
+  surveyEntryToUsageResponse,
+  SLOT_USAGE_SURVEY_ENV,
+  type SlotUsageReading,
+} from './claude-slot-pick.js';
 import { attachTurnEffort } from './turn-effort.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
@@ -2310,50 +2317,57 @@ export class ClaudeProvider implements AgentProvider {
    * Usage-maximizing slot pick at session start — quota-burn plan item 0.6.
    * Rule and rationale: `./claude-slot-pick.ts`.
    *
-   * Pulls `/api/oauth/usage` for EVERY ring slot in parallel (each bounded by
-   * the usage-pull deadline), records a `usage_pull` sample row per slot per
-   * window so idle slots stop going dark, then moves the ring onto the slot
-   * with the highest `seven_day` utilization still below 1.0 and persists it
-   * exactly as `rotateApiKey` does. Runs on fresh AND resumed sessions: the
+   * Reads the host's plan-utilization survey for EVERY ring slot from
+   * `NANOCLAW_SLOT_USAGE_SURVEY`, records a `usage_pull` sample row per slot
+   * per window so idle slots stop going dark, then moves the ring onto the
+   * slot with the highest `seven_day` utilization still below 1.0 and persists
+   * it exactly as `rotateApiKey` does. Runs on fresh AND resumed sessions: the
    * persisted slot restored just before is a hint the pick overrides
    * (prompt-cache miss on the new account is accepted cost).
    *
-   * Fallbacks, all logged: API-key auth or an empty ring → no-op; a failed
-   * pull leaves that slot unsampled and ineligible; no eligible slot at all →
-   * today's behaviour (the restored/primary position stands).
+   * Makes NO network call. #811 pulled `/api/oauth/usage` for all six slots
+   * here, once per container boot, which put each token's request rate at the
+   * fleet's spawn rate and earned a fleet-wide 429; the host surveys on its own
+   * clock instead (`src/slot-usage-survey.ts`, and the block that pushes this
+   * variable in `src/container-runner.ts` next to the ring itself).
+   *
+   * Fallbacks, all logged: API-key auth or an empty ring → no-op; a slot with
+   * no fresh reading is unsampled and ineligible, exactly as a failed pull was;
+   * no eligible slot at all → today's behaviour (the restored/primary position
+   * stands). A survey that is absent, unparseable or entirely stale therefore
+   * degrades to the pre-0.6 behaviour rather than to a wrong pick.
    *
    * Never throws — this must not stop a container from booting. Called by
    * the runner entrypoint after `restorePersistedCredentialSlot` (index.ts);
    * not from the constructor (session DB) and not from `query()` (async).
-   *
-   * `deps.fetchImpl` exists for tests; production uses global fetch.
    */
-  async pickCredentialSlotByUsage(deps: { fetchImpl?: typeof fetch; timeoutMs?: number } = {}): Promise<void> {
+  async pickCredentialSlotByUsage(deps: { now?: number; maxAgeMs?: number } = {}): Promise<void> {
     const usingOauth = !this.env.ANTHROPIC_API_KEY && this.oauthRing.length > 0;
     if (!usingOauth) return;
-    const timeoutMs = deps.timeoutMs ?? usagePullTimeoutMs;
     const credentialSet = process.env.NANOCLAW_OAUTH_CREDENTIAL_SET ?? null;
 
     let readings: SlotUsageReading[];
     try {
-      readings = await Promise.all(
-        this.oauthRing.map(async (slot): Promise<SlotUsageReading> => {
-          const who: AccountIdentity = {
-            account: slot.name,
-            credentialSet,
-            lane: laneForSlot(process.env.CLAUDE_CODE_OAUTH_LANES, slot.name),
-          };
-          try {
-            const res = await fetchSlotUsage(slot.value, { fetchImpl: deps.fetchImpl, timeoutMs });
-            const samples = usageResponseToSamples(res, who);
-            recordRateLimitSamples(samples);
-            return { name: slot.name, samples };
-          } catch (err) {
-            log(`Slot usage pull failed for ${slot.name} (unsampled): ${err instanceof Error ? err.message : String(err)}`);
-            return { name: slot.name, samples: null };
-          }
-        }),
-      );
+      const survey = parseSlotUsageSurvey(process.env[SLOT_USAGE_SURVEY_ENV], {
+        now: deps.now ?? Date.now(),
+        maxAgeMs: deps.maxAgeMs,
+      });
+      if (survey.problem) log(`Slot usage survey unusable (every slot unsampled): ${survey.problem}`);
+      if (survey.staleSlots.length > 0) {
+        log(`Slot usage survey too old to use for: ${survey.staleSlots.join(', ')}`);
+      }
+      readings = this.oauthRing.map((slot): SlotUsageReading => {
+        const entry = survey.fresh[slot.name];
+        if (!entry) return { name: slot.name, samples: null };
+        const who: AccountIdentity = {
+          account: slot.name,
+          credentialSet,
+          lane: laneForSlot(process.env.CLAUDE_CODE_OAUTH_LANES, slot.name),
+        };
+        const samples = usageResponseToSamples(surveyEntryToUsageResponse(entry), who);
+        recordRateLimitSamples(samples);
+        return { name: slot.name, samples };
+      });
     } catch (err) {
       log(`Slot usage pick aborted: ${err instanceof Error ? err.message : String(err)}`);
       return;
