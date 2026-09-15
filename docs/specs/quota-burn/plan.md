@@ -46,7 +46,7 @@ Claude last 12h (ISO-correct); Codex last 7d. Per-turn figures are comparable ac
 | Provider / role | Model | Turns | Input+cache per turn | Notes |
 |---|---|---|---|---|
 | Claude **coordinator** | Sonnet 5 xhigh | 74 | **2.1M** | heavier than its own builders |
-| Claude **builder** | Fable 5.1 medium | 63 | 1.75M | 7.4 API turns/turn on coordinator-A — lean |
+| Claude **builder** | Fable 5.1 medium | 63 | 1.75M | 7.4 API turns/turn on agent-A — lean |
 | Codex **coordinator** | Terra xhigh | 76 | **0.8M** | 4× leaner than its builders — correct shape |
 | Codex builder | Astra (all efforts) | 276 | 3.2M | xhigh 8.3M/turn, low 2.0M, medium 1.7M |
 | Codex builder | Sol (all efforts) | 201 | 3.5M | high/human is the biggest single Codex line |
@@ -55,18 +55,18 @@ Claude last 12h (ISO-correct); Codex last 7d. Per-turn figures are comparable ac
 - **The Claude coordinator/builder split is inverted; the Codex one is not.** Same xhigh
   effort on a comparable-tier coordinator (Terra) runs 0.8M/turn. So Sonnet's churn is not
   "cheap model needs more steps" — Terra disproves that. It's what the Sonnet sessions *do*.
-- **What they do:** builder-B retained Sonnet coordinator, all-time 477 Bash / 78 Agent (6:1).
+- **What they do:** agent-B retained Sonnet coordinator, all-time 477 Bash / 78 Agent (6:1).
   In the 66-step turn ending 01:12Z: 59 steps over 13 min *before* dispatching Fable —
   `git show` on frontend source, `curl` on deployment healthz, a full `agent-browser` login.
   Each is a named violation of the dispatch-first gate. Its own brief said *"I am not
   pre-solving any of this for you."* Narrated, not enforced.
 - **Context floor:** `CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000` (`container-runner.ts:6253`,
   fork commit `28dca8140`) with `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80` → sessions grow to ~800k
-  before compacting. Observed 120–300k/step and rising. builder-B standing instructions 57KB
+  before compacting. Observed 120–300k/step and rising. agent-B standing instructions 57KB
   (~14k tokens) is the fixed part; the rest is un-compacted history. Retained coordinator
   transcript 12.7MB / 257 turns since 09-12.
 - **Scheduled = 57% of Claude spend.** `xzo-pr-watch` 132 fires/7d on Fable; sample outcome
-  *"eight open PRs, none ready."* coordinator-A scheduled $130/day. Overnight 28 autonomous Fable
+  *"eight open PRs, none ready."* agent-A scheduled $130/day. Overnight 28 autonomous Fable
   turns, $117.
 - **Codex effort does track volume** (Astra xhigh 8.3M vs medium 1.7M per turn). Container
   Codex top-level effort defaults `xhigh` when `container.json` omits it
@@ -77,10 +77,10 @@ Claude last 12h (ISO-correct); Codex last 7d. Per-turn figures are comparable ac
 - **OAuth ring is lockstep and half-blind.** Ring is primary → `_2` … `_6`
   (`container/agent-runner/src/providers/claude.ts:2223–2230`); a fresh session starts at
   position 0 and advances only on failure, so every group in a shared credential set
-  (`group:workgroup-1` = coordinator-A, builder-B, workgroup-1, builder-C) exhausts slots together. `/usage` is
+  (`group:workgroup-1` = agent-A, agent-B, workgroup-1, agent-C) exhausts slots together. `/usage` is
   pulled only for the *active* slot, so idle slots go dark — `TOKEN` last sampled 09-09.
   Weekly map 2026-09-14T14:00Z: `_1` 0.76 (stale) · `_2` 0.87 · `_3` 0.88 · `_4` 0.83
-  (dead to 09-17; builder-B assigned) · `_5` 0.21 · `_6` 0.18 (week began 09-13; five sessions
+  (dead to 09-17; agent-B assigned) · `_5` 0.21 · `_6` 0.18 (week began 09-13; five sessions
   on it). Four slots at 76–88%, two fresh, and the ring cannot see it. This is why six keys
   don't finish a week.
 - **Codex quota is observable; nanoclaw doesn't read it.** 561 Codex turns, zero rate-limit
@@ -90,8 +90,8 @@ Claude last 12h (ISO-correct); Codex last 7d. Per-turn figures are comparable ac
   push, **`account/rateLimits/updated`** → `AccountRateLimitsUpdatedNotification` (sparse; merge
   into the last read). Neither is called or subscribed in
   `container/agent-runner/src/providers/codex-app-server.ts`; `makeRequest(method, params)` at
-  `:126` is the seam. Today the only signal is `systemError` after the fact — and coordinator-A,
-  workgroup-1, builder-B are all on Codex fallback right now (14:14Z). `provider_health` is fork-owned
+  `:126` is the seam. Today the only signal is `systemError` after the fact — and agent-A,
+  workgroup-1, agent-B are all on Codex fallback right now (14:14Z). `provider_health` is fork-owned
   (`src/modules/provider-fallback/`, `src/db/provider-health.ts`).
 
 Ruled out: self-heal nudges (7% of scheduled fires); coordinator effort as the cause
@@ -143,19 +143,19 @@ Host-CLI settings and `groups/` config are direct edits. 0.1–0.5 approved 2026
 | 0.2 | `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=3` | same | default is 20 |
 | 0.3 | Explicit `effort` on every Codex group and every Codex `providerFallback` block | `groups/*/container.json` | `turn_usage.effort` never null/xhigh-by-default for Codex |
 | 0.4 | `max_concurrent_threads_per_session` 15 → 4; host `~/.codex/config.toml` `[agents]` to match | `src/providers/codex.ts:80`, `container/agent-runner/src/codex-companion-setup.ts:106`, host toml | fork-owned files |
-| 0.5 | **`CLAUDE_CODE_AUTO_COMPACT_WINDOW` 1,000,000 → 400,000 on one group** (builder-B). Compaction fires ~320k instead of ~800k. Watch `cache_read_tokens/steps` and builder review verdicts for 24h. If quality holds, fleet-wide; if not, try 600k. | `container-runner.ts:6253` — existing fork line; add optional `autoCompactWindow` to `container.json`, default 1,000,000 | cache-read/step on builder-B drops; no builder `must_fix` attributable to lost context |
+| 0.5 | **`CLAUDE_CODE_AUTO_COMPACT_WINDOW` 1,000,000 → 400,000 on one group** (agent-B). Compaction fires ~320k instead of ~800k. Watch `cache_read_tokens/steps` and builder review verdicts for 24h. If quality holds, fleet-wide; if not, try 600k. | `container-runner.ts:6253` — existing fork line; add optional `autoCompactWindow` to `container.json`, default 1,000,000 | cache-read/step on agent-B drops; no builder `must_fix` attributable to lost context |
 | 0.6 | **Usage-maximizing slot pick** *(the operator-directed 2026-09-14)*. At session start, `/usage`-pull every ring slot, not just the active one; choose **highest `seven_day` utilization that is still below 100%** (drain the most-used account first), tiebreak highest `five_hour`; skip any slot whose `seven_day` is exhausted. Persist as today. *Objective:* leave no headroom unspent at a slot's reset — a slot at 88% resetting in 14h is 12% of free quota; lowest-first would have left it on the table. Hitting 100% mid-session is handled by the existing in-turn rotate-and-retry (`poll-loop.ts:1052`, `claude.ts:2389`); the prompt-cache miss on the new account is accepted cost. Idle slots stop going dark because every slot is pulled at each session start. **Worker must verify:** in-flight subagents survive a parent ring rotation (they share the container process env — confirm the SDK re-reads `CLAUDE_CODE_OAUTH_TOKEN` on the next call rather than caching it at spawn). | `container/agent-runner/src/providers/claude.ts` ring build ~2223 / resume ~2268; `usage_pull` helper exists | fork-owned; slots reach their reset at ≥ 95% used; no slot sits idle below 50% while another is being drained |
 | 0.7 | **Codex rate-limit read + park** *(needs approval)*. Mirror Claude's `usage_pull`: on Codex session start call `account/rateLimits/read` (params `{ excludeResetCreditDetails: true }`), subscribe to `account/rateLimits/updated` and merge sparse updates into the last snapshot. From `RateLimitSnapshot`: `primary`/`secondary` are `RateLimitWindow { usedPercent 0–100, resetsAt, windowDurationMins }` — classify by `windowDurationMins` (300 → `five_hour`, 10080 → `seven_day`). Write rows to the existing `rate_limit_samples` (`utilization = usedPercent/100`, `account` = Codex auth identity, `source='usage_pull'`) — no new schema. Park the group's Codex in `provider_health` when `secondary.usedPercent ≥ 90` or `rateLimitReachedType` is non-null (enum distinguishes `rate_limit_reached` from `workspace_*_credits_depleted` / `workspace_*_usage_limit_reached` — record which). Keep a 60-min park on `systemError` as the fallback for when the read itself fails. `rateLimitsByLimitId` (multi-bucket by `limit_id`, e.g. `codex`) — log it, don't design around it yet. Surface in `ncl`. Schema source: `codex app-server generate-json-schema --out <dir>`, codex-cli 0.154.0. | `container/agent-runner/src/providers/codex-app-server.ts` — `makeRequest(method, params)` at `:126`, notification handler alongside the existing `ServerNotification` dispatch; `src/modules/provider-fallback/`, `src/db/provider-health.ts` for the park | all fork-owned; Codex `seven_day` appears in `rate_limit_samples` per account; fallback groups park before exhausting rather than after `systemError` |
 
 ### Tier 1 — split poll from act, zero-drift ladder
 
-Try in order. Measure each on `turn_usage` (coordinator-A, `trigger='scheduled'`, $/day) before
+Try in order. Measure each on `turn_usage` (agent-A, `trigger='scheduled'`, $/day) before
 moving down.
 
 | # | Task | Drift |
 |---|---|---|
 | 1.1a | **Prompt edit.** `xzo-pr-watch` prompt: first action is one `gh api` head-sha comparison against a state file; on no delta reply "no change" and stop. Same wake, ~2 API turns instead of 7.4. | none — `ncl tasks` edit |
-| 1.1b | **Poll agent group.** If 1.1a isn't enough: a `provider: opencode` (GLM-flash or, after §3.1, DeepSeek) or Haiku group owns the poll series. On delta it `@`-mentions coordinator-A with the delta. Everything is a message — no host change. | none — new group + wiring |
+| 1.1b | **Poll agent group.** If 1.1a isn't enough: a `provider: opencode` (GLM-flash or, after §3.1, DeepSeek) or Haiku group owns the poll series. On delta it `@`-mentions agent-A with the delta. Everything is a message — no host change. | none — new group + wiring |
 | 1.1c | **Host precondition.** If a+b don't land the number: recurrence row precondition evaluated in `host-sweep` S18, additive, one seam. | upstream-tracked — ratchet `--accept` with reason in PR body |
 | 1.2 | Inventory poll-shaped series in `task_run_outcomes` (7d): inbox pollers, CI watches, `xzo-develop-qa-harness` if it's a "did develop move" check. Apply 1.1a. | none |
 
@@ -212,7 +212,7 @@ plus a config-backup ritual to route work that no longer exists is complexity wi
 
 | # | Task |
 |---|---|
-| 4.1 | **Done live by the operator ~17:00Z 2026-09-14** on observed Fable burn: coordinator-A `claude-fable-5-1[1m]`/`medium` → **`claude-opus-5[1m]`/`high`**, fallback Astra/medium → **`gpt-5.6-sol`/`high`** (`groups/` `00e423e9`). Not a one-build A/B — the heaviest group, all triggers. Measurement window starts 17:00Z. First Opus turn (human, 23 min): 90 steps, 117k ctx/step, 48.8k out, **$8.55** vs Fable/medium 24h avg 10.5 steps, 213k ctx/step, 7.5k out, **$6.76/turn**. One turn; not a read. Watch at +24h: cost/turn by trigger, steps/turn on `scheduled` (the poll shape), and which weekly meter moves (Opus draws *All models*, was 24%). |
+| 4.1 | **Done live by the operator ~17:00Z 2026-09-14** on observed Fable burn: agent-A `claude-fable-5-1[1m]`/`medium` → **`claude-opus-5[1m]`/`high`**, fallback Astra/medium → **`gpt-5.6-sol`/`high`** (`groups/` `00e423e9`). Not a one-build A/B — the heaviest group, all triggers. Measurement window starts 17:00Z. First Opus turn (human, 23 min): 90 steps, 117k ctx/step, 48.8k out, **$8.55** vs Fable/medium 24h avg 10.5 steps, 213k ctx/step, 7.5k out, **$6.76/turn**. One turn; not a read. Watch at +24h: cost/turn by trigger, steps/turn on `scheduled` (the poll shape), and which weekly meter moves (Opus draws *All models*, was 24%). |
 | 4.2 | **Decided by the operator 2026-09-14 ~22:50Z, fleet-wide, not waiting on 4.1:** default worker is **Opus 5 / Sol at `high`**; **Fable 5.1 / Astra are the escalation** (explicit human request, or the judgment-heavy shapes the contract already names) and when used skew **low/medium, some high, few xhigh, max rare**. Model tier buys judgment, effort buys depth, don't stack both unless the shape demands it. Two default columns in the rubric: Opus/Sol "stay at" = `high`; Fable/Astra "stay at" = `medium`. Step-down/step-up triggers unchanged. Dispatched to `policy-default-worker` (Opus): `workflow-contract.md` ×2, always-on ×2, `container/agents/worker-frontier.md` (model + effort pin), Codex worker default Astra→Sol, agent-runner terminal fallback (`config.ts:136–144`) if it's Fable/Astra, reviewer-models regen, bootstrap 5.2.0/2.2.0. No `groups/` pins touched. Limitation surfaced: the Agent tool has no per-call effort override, so a dispatch inherits the agent def's pin — the def must carry `high`. |
 | 4.3 | Coordinator Sonnet vs Opus/medium — only if 2.1 lands and Sonnet p95 is still > 12. Note it can't move the Fable meter. |
 
@@ -220,7 +220,7 @@ plus a config-backup ritual to route work that no longer exists is complexity wi
 
 | # | Task |
 |---|---|
-| 5.1 | `instruction-audit` on builder-B/coordinator-A standing instructions (57KB). |
+| 5.1 | `instruction-audit` on agent-B/agent-A standing instructions (57KB). |
 | 5.2 | Retained-coordinator session length — reset coordinator session per task; keep the *builder* thread continuous (anshuc's winning shape). |
 
 ## Codex-side assessment (asked 2026-09-14)
@@ -235,7 +235,7 @@ tracks volume there, so 0.3 (explicit effort) has teeth on Codex. Codex total in
 
 | PR | Item | Head | State |
 |---|---|---|---|
-| #810 | 0.1–0.5 | **merged `06720dd54`** | r1 `needs-attention` → fix `8417a3734` → r2 `approve` → notes `553ead55f` (CI red: unregistered class) → `0cc31f8e1` r4 `approve` → merged 17:46Z → deploy #1 failed on untracked `reports/` (rolled back) → **deploy #2 ok 17:54:50Z; service restarted 17:54:51Z; preflight ok**. **Verified** on first post-restart spawn (workgroup-1 17:55:49Z): depth=1, concurrency=3, window=1000000. builder-B 400000 pending its next spawn. `BUILD_INFO.json` sha==HEAD, `dirty:false`. |
+| #810 | 0.1–0.5 | **merged `06720dd54`** | r1 `needs-attention` → fix `8417a3734` → r2 `approve` → notes `553ead55f` (CI red: unregistered class) → `0cc31f8e1` r4 `approve` → merged 17:46Z → deploy #1 failed on untracked `reports/` (rolled back) → **deploy #2 ok 17:54:50Z; service restarted 17:54:51Z; preflight ok**. **Verified** on first post-restart spawn (workgroup-1 17:55:49Z): depth=1, concurrency=3, window=1000000. agent-B 400000 pending its next spawn. `BUILD_INFO.json` sha==HEAD, `dirty:false`. |
 | #811 | 0.6 | **merged `da3d2d06e`** | headroom 0.05 → scope `skip` (labeler miss) → Astra run anyway → r1 **[high] token value in fetch-error log** → Fable worker 429'd at commit → Codex finisher completed it (sanitize at source, deadline test retargeted to sanitized contract, new class `secret in error message`) `bc768297a` → Astra r2 `approve` → CI green → merged 21:58Z → **deployed 22:02:47Z**, BUILD_INFO `da3d2d06e` dirty=false. Live slot-pick check pending first post-restart Claude spawn. |
 | #812 | 0.7 | **merged `e4dbcb006`**; **deploy #3 ok 01:30:17Z** (BUILD_INFO `e4dbcb006` dirty=false, preflight ok, runner snapshot `20260915T013019` carries `readCodexAccountRateLimits`; carries #814). Live check pending: first Codex spawn should write `rate_limit_samples` (provider `codex`, source `usage_pull`) into that session's `outbound.db` (`container/agent-runner/src/modules/mailbox/rate-limit-samples.ts`) — watcher armed. | … → r3 approve `a4e06320f` → PR was CONFLICTING with main so CI never ran (see memory `ci-silent-on-conflicting-pr`) → rebased twice (main moved with #813/#814) → `9df6bc432` → r4 rebase confirmation by a fresh Claude Opus reviewer (host Codex out of quota) → CI green → merged. |
 | #815 | 5.1 | `a0a5f7542` receipted (r1 Astra approve at `0f99201c9`; r2 Claude rebase-confirm) — **will re-conflict on ratchet after #812**; owner rebasing again | OpenCode fleet default → `opencode-go/deepseek-v4.1-flash`. the operator opted in on OpenCode Go 01:10Z; live probe answers OK incl. `reasoningEffort: high`. No DB default (provider_models dropped in 039). OpenCode `worker-frontier` twin has no model pin → rides the fleet default (parked decision). Needs its own deploy after merge. |
@@ -302,11 +302,11 @@ documented fallback for Codex-authored heads.
   workgroup-1 Claude spawn ran the pick; every `/api/oauth/usage` pull returned **HTTP 429
   `rate_limit_error`** (verified from the host for `_5` and `_6`, 29–127 ms, with and without
   the beta header), so all six came back `unsampled` and it fell back to the ring walk —
-  which found **5 of 6 slots `seven_day`-rejected** and landed on `_6`, where builder-B and both
-  coordinator-A containers already sit. The session then failed over to Codex. Fleet at 22:35Z:
+  which found **5 of 6 slots `seven_day`-rejected** and landed on `_6`, where agent-B and both
+  agent-A containers already sit. The session then failed over to Codex. Fleet at 22:35Z:
   3 Claude (all `_6`), 2 Codex, 1 OpenCode. Resets: `_3`/`_5` 04:00Z, `_1` 06:00Z, `_6`
   15:00Z (09-15). **Real #811 test is the first Claude spawn after 04:00Z.**
-  **Live-confirmed 22:30:23Z** (builder-B Claude spawn, docker stderr): ring loaded, resumed `_4`,
+  **Live-confirmed 22:30:23Z** (agent-B Claude spawn, docker stderr): ring loaded, resumed `_4`,
   pick fired 5 pulls → each `Slot usage pull failed for <slot> (unsampled): usage pull HTTP
   429` — sanitized, no token value (F1 fix live) → summary line `7d=? 5h=? skipped:unsampled`
   ×5 → fallback kept `_4`. Ring is **5 slots, not 6: `CLAUDE_CODE_OAUTH_TOKEN_5` is empty**
@@ -337,7 +337,7 @@ Instrument: `turn_usage` (central). Compare with
 `steps` across providers; use `input_tokens + cache_read_tokens`.
 
 Read at +24h and +7d. Success: Fable meter < 60% at week-end; Sonnet p95 API-turns < 12;
-coordinator-A scheduled $/day < $40; builder-B cache-read/step < 150k after 0.5.
+agent-A scheduled $/day < $40; agent-B cache-read/step < 150k after 0.5.
 
 ## Sequencing
 
