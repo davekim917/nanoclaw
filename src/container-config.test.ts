@@ -801,6 +801,22 @@ describe('excludePlugins', () => {
     expect(readContainerConfig('xp-odd-names').excludePlugins).toEqual(entries);
   });
 
+  it('refuses a colon in a sub-path but keeps accepting one in a top-level name', () => {
+    // A sub-path becomes `/workspace/plugins/<entry>` in a mask mount, and
+    // readonlyMountArgs serializes that as `${hostPath}:${containerPath}:ro`
+    // (src/container-runtime.ts:29-30) — a colon in the value is a `-v` field
+    // separator, so the spawn fails. A top-level entry is only ever tested for
+    // Set membership against a readdirSync name and never reaches a mount
+    // argument, so narrowing it would break a config that already worked for
+    // no benefit.
+    for (const bad of ['repo/plugins/foo:bar', 'repo:x/sub', 'a/b:c/d']) {
+      writeGroupConfig('xp-colon', { excludePlugins: [bad] });
+      expect(() => readContainerConfig('xp-colon')).toThrow(/must not contain ":"/);
+    }
+    writeGroupConfig('xp-colon-toplevel', { excludePlugins: ['foo:bar'] });
+    expect(readContainerConfig('xp-colon-toplevel').excludePlugins).toEqual(['foo:bar']);
+  });
+
   it('still refuses a control character in a segment', () => {
     // Escape sequences, never literal bytes: a literal NUL makes grep and rg
     // treat the file as binary and match nothing over it (docs/review-notes/818.md).

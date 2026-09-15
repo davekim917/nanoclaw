@@ -709,6 +709,18 @@ export function validateExcludePlugins(value: unknown): string[] | undefined {
     if (name.startsWith('/')) fail('must be relative to ~/plugins, not an absolute path');
     if (name.includes('\\')) fail('must use "/" separators');
     const segments = name.split('/');
+    // A sub-path, and only a sub-path, is interpolated into a mount: the mask's
+    // container path is `/workspace/plugins/<entry>` and `readonlyMountArgs`
+    // serializes it as `${hostPath}:${containerPath}:ro`
+    // (`src/container-runtime.ts:29-30`), where a colon in the value silently
+    // becomes a `-v` field separator and the spawn fails. A TOP-LEVEL entry is
+    // only ever tested for Set membership against a `readdirSync` name
+    // (`src/container-runner.ts`, plugin mounts) and never reaches a mount
+    // argument, so it keeps accepting every directory name it accepted before —
+    // which is the point of the rule above.
+    if (segments.length > 1 && name.includes(':')) {
+      fail('must not contain ":" — a sub-plugin path is interpolated into a "-v host:container:ro" mount argument');
+    }
     if (segments.length > MAX_EXCLUDE_PLUGIN_DEPTH) {
       fail(`is deeper than ${MAX_EXCLUDE_PLUGIN_DEPTH} path segments, which no sub-plugin walker descends to`);
     }
