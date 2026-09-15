@@ -210,12 +210,12 @@ describe('Claude plugin discovery', () => {
     }
   });
 
-  it('skips a sub-plugin the host masked with an empty directory, keeping its siblings', () => {
-    // The host bind-mounts an empty read-only dir over one sub-plugin when a
-    // group's `excludePlugins` names it (src/container-runner.ts, plugin
-    // mounts). From in here that is indistinguishable from a manifest-less
-    // directory, which `hasManifest` (claude.ts:1751) already skips — this
-    // pins that, because the mask relies on it.
+  it('skips a sub-plugin directory with no manifest, keeping its siblings', () => {
+    // `hasManifest` (claude.ts:1751) skips a manifest-less directory. This pins
+    // that skip on its own terms: the host mask that used to produce such a
+    // directory for an excluded sub-plugin was removed (#826), so nothing here
+    // is an exclusion — it is the walker behaviour the follow-up will hang the
+    // exclusion list on.
     const pluginsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-plugin-masked-'));
     try {
       const repo = path.join(pluginsRoot, 'bootstrap');

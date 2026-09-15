@@ -106,33 +106,91 @@ const MAX_PLUGIN_RULESET_BYTES = 64 * 1024;
  */
 function readRulesetFile(dir: string, filename: string, repoRoot: string): string | null {
   const file = path.join(dir, filename);
+  let fd: number;
   try {
+    // O_NONBLOCK, always: opening a FIFO for reading blocks until a writer
+    // appears, and that open happens before any check below can reject it — so
+    // a plugin repo carrying a `mkfifo` would hang the host's single event loop
+    // rather than return an error. On a regular file Linux ignores the flag.
+    // Same flag, same reason, as `readContainedFile` in
+    // `src/dashboard/api/attention-fs.ts`, which is where this whole pattern
+    // comes from.
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+  } catch {
+    return null;
+  }
+  try {
+    // Containment is decided about the OPEN DESCRIPTOR, not about the path.
+    // `realpathSync(file)` answers a question about a string at one instant;
+    // between that answer and the read, any component — the leaf or a directory
+    // `subPluginDirs` walked through — can become a symlink, and the read then
+    // follows somewhere the check never saw. `/proc/self/fd/<fd>` is a
+    // kernel-maintained link to the inode this descriptor already holds, so it
+    // cannot be raced: the open happened first, and nothing about a path can
+    // change what an open descriptor refers to.
+    //
+    // This matters because what the host reads here is written into the group's
+    // `AGENTS.md`, which is mounted into the container — so a win moves
+    // host-only state (`~/.codex/auth.json`, `.env`) into container-visible
+    // state. That a plugin's code already runs in the container is a different
+    // permission.
+    //
+    // NOT `O_NOFOLLOW`: it refuses only the final component, so it would not
+    // close the walked-parent case this check does close, and it WOULD refuse a
+    // leaf that is legitimately a symlink to another file inside the same repo.
     const root = fs.realpathSync(repoRoot);
-    const resolved = fs.realpathSync(file);
-    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    let opened: string;
+    try {
+      // `null` where /proc is absent (a macOS dev checkout). The fallback
+      // narrows the window to open→realpath rather than closing it; this host
+      // is Linux (CLAUDE.md), where the fd path is always there.
+      const viaFd = fs.readlinkSync(`/proc/self/fd/${fd}`);
+      opened = path.isAbsolute(viaFd) ? viaFd : fs.realpathSync(file);
+    } catch {
+      opened = fs.realpathSync(file);
+    }
+    if (opened !== root && !opened.startsWith(root + path.sep)) {
       log.warn('Plugin ruleset resolves outside its plugin repository; not composing it', { file, repoRoot: root });
       return null;
     }
-    const stat = fs.statSync(resolved);
-    if (!stat.isFile()) return null;
-    // Bounded before the read, not after. Containment says WHERE the file may
-    // be, not how big it is, and a plugin repo may carry an arbitrarily large
-    // file at a path we compose: `readFileSync` is synchronous and on the spawn
-    // path, so the cost is paid as spawn latency and host memory before
-    // anything downstream — including the project-document cap — gets to look.
-    // Refusing is also the more useful answer than truncating: half a standing
-    // ruleset is a directive with its carve-outs cut off.
-    if (stat.size > MAX_PLUGIN_RULESET_BYTES) {
+    // Every remaining question is answered from this same descriptor, so a swap
+    // has nothing left to win — including the size bound, which a second
+    // `statSync` would let a growing file defeat.
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) return null;
+    // A HARD LINK defeats containment in either form, and measuring it is the
+    // only way to see that: `ln ~/.codex/auth.json <repo>/plugins/x/always-on.md`
+    // makes both `realpath` and the fd path answer with the in-repo name
+    // (verified on this host), because a hard link is not an indirection — the
+    // directory entry IS the file. So containment alone would compose the
+    // secret. `nlink` is the property that actually differs, and this repo
+    // already uses it for the same reason on the canonical-git sentinel
+    // (`docs/review-notes.md`, #739). A plugin's standing ruleset having a
+    // second name is not a legitimate shape.
+    if (st.nlink !== 1) {
+      log.warn('Plugin ruleset has more than one hard link; not composing it', { file, nlink: st.nlink });
+      return null;
+    }
+    if (st.size > MAX_PLUGIN_RULESET_BYTES) {
       log.warn('Plugin ruleset is too large to compose; skipping it', {
         file,
-        bytes: stat.size,
+        bytes: st.size,
         maxBytes: MAX_PLUGIN_RULESET_BYTES,
       });
       return null;
     }
-    return fs.readFileSync(resolved, 'utf-8').trim() || null;
+    const buf = Buffer.allocUnsafe(st.size);
+    let read = 0;
+    while (read < st.size) {
+      const n = fs.readSync(fd, buf, read, st.size - read, read);
+      if (n === 0) break; // truncated under us — use what the fd actually held
+      read += n;
+    }
+    return buf.subarray(0, read).toString('utf8').trim() || null;
   } catch {
     return null;
+  } finally {
+    fs.closeSync(fd);
   }
 }
 

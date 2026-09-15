@@ -462,14 +462,14 @@ describe('planCodexPluginRegistration', () => {
     expect(byName.has('monorepo/not-checked-out')).toBe(false);
   });
 
-  it('never registers a sub-plugin the host masked with an empty directory', () => {
-    // A group's `excludePlugins` may name one sub-plugin of a repo it keeps;
-    // the host then bind-mounts an empty read-only dir over exactly that path
-    // (src/container-runner.ts, plugin mounts). In here the masked dir is a
-    // real directory with no `.codex-plugin/plugin.json`, so
-    // `readCodexPluginEntryName` returns null and `findCodexSubPlugins`
-    // (codex-companion-setup.ts:582-583) drops it. Both sub-plugin layouts
-    // the walker descends are covered.
+  it('never registers a sub-plugin directory that carries no Codex manifest', () => {
+    // A manifest-less directory is skipped: `readCodexPluginEntryName` returns
+    // null and `findCodexSubPlugins` drops it, in both layouts the walker
+    // descends. NOTE this pins walker behaviour, NOT an exclusion — a
+    // sub-plugin named in `excludePlugins` still reaches this walker intact,
+    // because the host mask that used to blank it was removed (#826). The
+    // follow-up that teaches this walker the exclusion list will build on
+    // exactly this skip.
     const repo = path.join(root, 'bootstrap');
     writeJson(path.join(repo, '.agents', 'plugins', 'marketplace.json'), { name: 'bootstrap-mkt' });
     const kept = path.join(repo, 'plugins', 'wwbd');

@@ -599,6 +599,37 @@ describe("sub-plugin always-on: the plugin's own always-on.md (OpenCode only)", 
     }
   });
 
+  it('never composes a ruleset that is a hard link to a file outside the repository', async () => {
+    // A hard link is not an indirection — the directory entry IS the file — so
+    // `realpath` and the open descriptor BOTH answer with the in-repo name and
+    // containment passes (measured on this host). `nlink` is the property that
+    // actually differs, and this repo already uses it for the same reason on
+    // the canonical-git sentinel (#739). A standing ruleset with a second name
+    // is not a legitimate shape.
+    const home = seedBootstrapPlugin(null);
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    const secret = path.join(TEST_ROOT, 'host-only-secret-hardlink.json');
+    fs.writeFileSync(secret, 'SENTINEL_HARDLINKED_SECRET_6e2a\n');
+
+    const sub = path.join(repo, 'plugins', 'linked-out');
+    fs.mkdirSync(sub, { recursive: true });
+    fs.linkSync(secret, path.join(sub, 'always-on.md'));
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-hardlink', 'sub-hardlink');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+      const doc = agentsDoc(ag.folder);
+      expect(doc).not.toContain('SENTINEL_HARDLINKED_SECRET_6e2a');
+      // The escape is refused, not the feature.
+      expect(doc).toContain(ORCHESTRATE_SENTINEL);
+      expect(doc).toContain(WWBD_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
   it('composes a ruleset reached by a symlink that stays inside the repository', async () => {
     // Containment, not a ban on symlinks: a repo is free to point a sub-plugin's
     // directive at another file of its own.

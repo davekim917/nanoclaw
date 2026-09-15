@@ -202,12 +202,12 @@ describe('discoverPortableSkills', () => {
     expect(out[0].name).toBe('real-name');
   });
 
-  it('finds nothing in a sub-plugin the host masked with an empty directory', () => {
-    // A group's `excludePlugins` may name one sub-plugin of a repo it keeps;
-    // the host bind-mounts an empty read-only dir over that path, so in-container
-    // discovery sees a directory with no `skills/` (rules 7 and 8 both gate on
-    // `isDirectory(subSkillsDir)`). This is the container-side half of that mask,
-    // and the host copy of this module is asserted identical below.
+  it('finds nothing in a sub-plugin directory that has no skills/ of its own', () => {
+    // Rules 7 and 8 both gate on `isDirectory(subSkillsDir)`, so a sub-plugin
+    // directory with no `skills/` contributes nothing. Pinned on its own terms:
+    // the host mask that used to produce such a directory for an excluded
+    // sub-plugin was removed (#826). The host copy of this module is asserted
+    // identical below.
     writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'wwbd', 'skills', 'wwbd'), { name: 'wwbd' });
     fs.mkdirSync(path.join(tmpDir, 'bootstrap', 'plugins', 'orchestrate'), { recursive: true });
     // Rule 8's `<repo>/<sub>` layout is gated on the sub-dir's Claude manifest,
