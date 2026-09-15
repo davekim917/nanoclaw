@@ -2041,7 +2041,10 @@ export async function processQuery(
             // but end() is only safe between turns: closing streaming input
             // while a turn runs also closes its control channel (#608/#610).
             // Leave these rows pending and retry on the next idle poll.
-            if (!turnIdle || resultScopeOpen || query.hasQueuedWork?.()) {
+            // Live background work is the same hazard between turns: the
+            // open input is what keeps a background subagent alive, so
+            // end() here would kill the worker the busy hold protects.
+            if (!turnIdle || resultScopeOpen || query.hasQueuedWork?.() || query.hasBackgroundWork?.()) {
               log('Query settings changed but runtime context is immutable — deferring follow-up until the active query and result handling drain');
               return;
             }
@@ -2230,6 +2233,14 @@ export async function processQuery(
    */
   const lowerTurnLevelUnlessQueued = (): void => {
     if (query.hasQueuedWork?.()) return;
+    // Same gap, different work: a background agent launched this turn is
+    // still running inside the CLI after `result`. Lowering here published
+    // idle for it and the task reaper killed the container — and the agent —
+    // within one sweep tick (2026-09-15: a task session's parent ended each
+    // turn on a `wait`, was reaped 15–60s later nine times in 80 minutes, and
+    // every delegated worker died mid-flight). The `background_work` report
+    // at the CLI's idle re-runs this once that work is done.
+    if (query.hasBackgroundWork?.()) return;
     setProviderTurnExecuting(false);
   };
 
@@ -2513,6 +2524,14 @@ export async function processQuery(
         // `result` kept the level up while these prompts looked queued
         // (lowerTurnLevelUnlessQueued). The turn is over now.
         lowerTurnLevelUnlessQueued();
+      } else if (event.type === 'background_work') {
+        // The level was held at `result` for this work (lowerTurnLevelUnlessQueued).
+        // The provider reports the level at the CLI's idle, which that CLI
+        // withholds until background agents are done and any follow-up turn
+        // they start has run — so `live: 0` with no turn running means the
+        // container is genuinely idle, with no init still on its way. A
+        // report mid-turn changes nothing: the turn's own `result` decides.
+        if (event.live === 0 && turnIdle && !resultScopeOpen) lowerTurnLevelUnlessQueued();
       } else if (event.type === 'compacted') {
         advanceMemoryContextEpoch(providerName);
         // The SDK auto-compacted the conversation. After compaction the

@@ -91,7 +91,11 @@ export function clearProviderHealthState(outbound: Database = getOutboundDb()): 
  *     NOT stream lifetime, because a multi-turn stream stays open after
  *     `result` to accept pushes — holding the bit for the whole stream would
  *     pin it through the container's entire idle stretch and defeat the
- *     reaper.
+ *     reaper. One exception holds it past `result`: a provider reporting live
+ *     background work (`AgentQuery.hasBackgroundWork` — a subagent launched
+ *     with `run_in_background` keeps running inside the CLI after the parent
+ *     turn ends). The poll-loop lowers the level when that work drains
+ *     (`background_work` event) or at the follow-up turn's own `result`.
  *   - **bracketed windows outside a turn** — the pre-task script batch, the
  *     turn-end git checkpoint. These nest, so they are counted.
  *

@@ -345,6 +345,32 @@ export interface AgentQuery {
    */
   hasQueuedWork?(): boolean;
 
+  /**
+   * Whether the provider's CLI still has live background work — a subagent
+   * launched with `run_in_background` above all — that will report back into
+   * this session after the current turn's `result`. `claude.ts` mirrors the CLI's `background_tasks_changed` level
+   * message (REPLACE semantics, ambient watchers excluded) and LATCHES it:
+   * once raised it releases at the CLI's idle with nothing live, never at
+   * the membership change that empties the set, because between that drain
+   * and the idle (or the `init` of a completion-started follow-up turn) the
+   * work is not over. The CLI gates its idle only on background SUBAGENTS;
+   * for the other task types it reports (a backgrounded Bash, a monitor with
+   * no timeout, …) idle arrives with them still live, and the hold then
+   * releases at the drain instead — those keep the protection they had
+   * before this hold, none past their completion. Consumers can act on the
+   * predicate directly. The other providers have no such work and leave it
+   * undefined.
+   *
+   * The poll-loop reads it wherever it would lower the published busy level.
+   * A turn that launches a background agent and then ends (typically after a
+   * `wait`) otherwise publishes idle while that agent is mid-flight, and the
+   * host's task reaper kills the container within one sweep tick — the
+   * background agent dies with it and the next wake finds "didn't finish
+   * before the previous session ended" (2026-09-15, one task session killed
+   * nine times in 80 minutes this way, every worker lost).
+   */
+  hasBackgroundWork?(): boolean;
+
   /** Signal that no more input will be sent. */
   end(): void;
 
@@ -514,6 +540,18 @@ export type ProviderEvent =
    * tracks prompt ids emits it.
    */
   | { type: 'settled'; unansweredPrompts: string[] }
+  /**
+   * The provider's background level, `live` non-ambient tasks, reported at
+   * the CLI's authoritative turn-over signal (`session_state_changed: idle`)
+   * by a provider that implements `hasBackgroundWork`. That signal is withheld
+   * while background agents run and fires once their loop exits, so
+   * `live === 0` here means the CLI has confirmed no completion-started
+   * follow-up turn is coming. The poll-loop lowers the busy level it held for
+   * that work on it, when no turn is running — reporting at the membership
+   * change instead would open a gap between the drain and the follow-up
+   * turn's `init` in which a sweep could reap the container.
+   */
+  | { type: 'background_work'; live: number }
   /**
    * `resetAt` is the provider's MEASURED recovery instant (ISO-8601 UTC) when
    * it has one — today the Codex rate-limit snapshot's `resetsAt` behind a
