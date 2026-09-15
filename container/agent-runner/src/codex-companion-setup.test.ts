@@ -146,7 +146,7 @@ describe('buildRuntimeConfig', () => {
     expect(config).toContain('fast_mode = false');
     expect(config).toContain('multi_agent = true');
     expect(config).toContain('[agents]');
-    expect(config).toContain('default_subagent_reasoning_effort = "medium"');
+    expect(config).toContain('default_subagent_reasoning_effort = "high"');
     expect(config).toContain('max_concurrent_threads_per_session = 4');
     expect(config).not.toContain('multi_agent_v2');
     expect(config).not.toContain('remote_control');

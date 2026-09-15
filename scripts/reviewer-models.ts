@@ -32,14 +32,14 @@ const CLAUDE_AGENT_FILES = ['container/agents/worker-frontier.md'];
 const CODEX_WORKER_NAMES = ['worker-frontier'] as const;
 // Receipt compatibility only: these models remain eligible so an unchanged
 // exact-head receipt does not expire when dispatch defaults change.
-const COMPATIBLE_RECEIPT_MODELS = ['claude-opus-5', 'gpt-5.6-sol'];
+const COMPATIBLE_RECEIPT_MODELS = ['claude-fable-5-1', 'gpt-6-astra'];
 
 export const REVIEWER_MODELS_HEADER = [
   '# generated from the frontier config: edit container/agents/worker-frontier.md or',
   '# CODEX_WORKER_MODELS, then run `pnpm run reviewer-models -- --write`',
   '#',
   '# One reviewer-eligible model id per line — the native frontier worker, whichever',
-  '# vendor, plus prior Opus/Sol receipt compatibility (not dispatch defaults).',
+  '# vendor, plus prior Fable/Astra receipt compatibility (not dispatch defaults).',
   '# container/skills/pr-review-loop/scripts/codex-review.sh reads this file to',
   '# gate `receipt` and `merge-check`. See scripts/reviewer-models.ts.',
 ].join('\n');

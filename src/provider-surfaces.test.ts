@@ -1220,10 +1220,18 @@ describe('worker agent def sync (orchestrator roster)', async () => {
       expect(fs.existsSync(path.join(agentsDir, retired))).toBe(false);
     }
     expect(fs.readFileSync(path.join(agentsDir, 'impeccable-reviewer.md'), 'utf8')).toBe('specialized definition\n');
-    // Fable must retain the 1M context suffix and explicit medium default.
+    // The def must pin a 1M-suffixed model and an explicit effort — invariants
+    // carried by the regexes, so the tier itself stays DERIVED from trunk. A
+    // hardcoded tier (Fable/medium until #813) fails CI on every roster move
+    // while adding nothing to the byte-identity check above.
     const frontierWorker = fs.readFileSync(path.join(agentsDir, 'worker-frontier.md'), 'utf-8');
-    expect(frontierWorker).toContain('model: claude-fable-5-1[1m]');
-    expect(frontierWorker).toContain('effort: medium');
+    const trunkDef = fs.readFileSync(path.join(process.cwd(), 'container', 'agents', 'worker-frontier.md'), 'utf-8');
+    const modelLine = /^model: \S+\[1m\]$/m.exec(trunkDef)?.[0];
+    const effortLine = /^effort: (?:low|medium|high|xhigh|max)$/m.exec(trunkDef)?.[0];
+    expect(modelLine, 'trunk def must pin a 1M-suffixed model').toBeDefined();
+    expect(effortLine, 'trunk def must pin an explicit effort').toBeDefined();
+    expect(frontierWorker).toContain(modelLine);
+    expect(frontierWorker).toContain(effortLine);
     expect(frontierWorker).toContain('including investigation, technical decisions');
     expect(frontierWorker).toContain('do not spawn a wrapper agent');
     expect(frontierWorker).toContain('foreground-attached for cancellation');

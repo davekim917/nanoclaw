@@ -37,11 +37,11 @@ does not relax required CI, holds, or merge authorization.
 The substitute, like every review (a delta check after a rebase or ratchet
 regeneration, adversarial verification, a gap analysis), uses the native
 `worker-frontier`: Claude's `model:` frontmatter or Codex's
-`CODEX_WORKER_MODELS['worker-frontier']` (`src/claude-agent-md.ts`). Medium is
-the default effort; an explicit task override must use a runtime field or the
+`CODEX_WORKER_MODELS['worker-frontier']` (`src/claude-agent-md.ts`). High is the default worker effort; the default worker is `claude-opus-5` on Claude and `gpt-5.6-sol` on Codex.
+An explicit task override must use a runtime field or the
 scoped CLI helper described in `docs/frontier-worker-trial.md`, never prompt
 wording. The allowed ids are generated from the frontier configuration plus explicit
-receipt compatibility for prior `claude-opus-5` and `gpt-5.6-sol` reviewers.
+receipt compatibility for prior `claude-fable-5-1` and `gpt-6-astra` reviewers.
 Those IDs remain accepted so unchanged exact-head evidence survives this
 roster migration; they are not new dispatch defaults. The existing gate
 accepts these IDs for both receipt submission and receipt consumption:
@@ -54,11 +54,11 @@ an approving receipt whose first word isn't allowed does not unlock a merge.
 The reviewer reports its **exact model id from its own runtime** — a Claude
 subagent from its system prompt, Codex from the `-m` it ran with or
 `codex exec`'s session metadata — as that first word, and the receipt's `--reviewer`
-copies it verbatim, e.g. `claude-fable-5-1 (worker-frontier)` or
-`gpt-6-astra medium (codex exec)`. Nobody has to be free for this: the author
+copies it verbatim, e.g. `claude-opus-5 (worker-frontier)` or
+`gpt-5.6-sol high (codex exec)`. Nobody has to be free for this: the author
 may start that reviewer as a fresh process
-(`codex exec -m gpt-6-astra -c model_reasoning_effort=medium`, or
-`CLAUDE_CODE_EFFORT_LEVEL=medium claude -p --model 'claude-fable-5-1[1m]' --effort medium`) and hand it the inputs above.
+(`codex exec -m gpt-5.6-sol -c model_reasoning_effort=high`, or
+`CLAUDE_CODE_EFFORT_LEVEL=high claude -p --model 'claude-opus-5[1m]' --effort high`) and hand it the inputs above.
 
 Record a durable review receipt tied to the exact final SHA: reviewer and
 runtime, complete-diff and relevant-file scope, outcome, and every finding with
