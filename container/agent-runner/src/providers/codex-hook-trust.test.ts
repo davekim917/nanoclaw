@@ -251,12 +251,49 @@ describe('plugin hook trust', () => {
     });
   });
 
-  it('returns nothing for a plugin that declares no hooks', () => {
+  it('returns nothing for a plugin with no declaration and no conventional file', () => {
     const dir = path.join(tmpdir(), 'plain');
     fs.mkdirSync(path.join(dir, '.codex-plugin'), { recursive: true });
     fs.writeFileSync(path.join(dir, '.codex-plugin', 'plugin.json'), JSON.stringify({ name: 'plain' }));
     expect(declaredPluginHookFiles(dir)).toEqual([]);
     expect(collectPluginHookTrustEntries({ pluginId: 'plain@mkt', dir })).toEqual([]);
+  });
+
+  it('falls back to the conventional hooks/hooks.json when the manifest declares none', () => {
+    // Verified against codex-cli 0.154.0: an undeclared `hooks/hooks.json` IS
+    // loaded (key `<plugin>@<mkt>:hooks/hooks.json:...`), so skipping it leaves
+    // a real hook untrusted and silently inert.
+    const dir = path.join(tmpdir(), 'conventional');
+    fs.mkdirSync(path.join(dir, '.codex-plugin'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'hooks'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.codex-plugin', 'plugin.json'), JSON.stringify({ name: 'conv' }));
+    fs.writeFileSync(
+      path.join(dir, 'hooks', 'hooks.json'),
+      JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: '/bin/true', timeout: 9 }] }] } }),
+    );
+    expect(declaredPluginHookFiles(dir)).toEqual(['hooks/hooks.json']);
+    expect(collectPluginHookTrustEntries({ pluginId: 'conv@mkt', dir })).toEqual([
+      {
+        key: 'conv@mkt:hooks/hooks.json:session_start:0:0',
+        hash: codexHookTrustHash('SessionStart', { type: 'command', command: '/bin/true', timeout: 9 }),
+      },
+    ]);
+  });
+
+  it('does NOT add the conventional file when the manifest declares one', () => {
+    // A declaration REPLACES the default (verified: the sibling hooks/hooks.json
+    // never appears in hooks/list). Emitting both would write a trust row keyed
+    // on a file Codex never reads.
+    const dir = path.join(tmpdir(), 'both');
+    fs.mkdirSync(path.join(dir, '.codex-plugin'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'hooks'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, '.codex-plugin', 'plugin.json'),
+      JSON.stringify({ name: 'both', hooks: './hooks/declared.json' }),
+    );
+    fs.writeFileSync(path.join(dir, 'hooks', 'declared.json'), JSON.stringify({ hooks: {} }));
+    fs.writeFileSync(path.join(dir, 'hooks', 'hooks.json'), JSON.stringify({ hooks: {} }));
+    expect(declaredPluginHookFiles(dir)).toEqual(['hooks/declared.json']);
   });
 
   it('falls back to the Claude-first manifest', () => {

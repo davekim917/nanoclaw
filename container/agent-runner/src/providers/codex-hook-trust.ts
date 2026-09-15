@@ -320,12 +320,28 @@ function readJson(file: string): Record<string, unknown> | null {
 }
 
 /**
- * Relative hooks-file paths a plugin DECLARES in its manifest. Only declared
- * files are considered: an undeclared, conventionally-named file is not a hook
- * source Codex loads, and inventing one would write entries that match nothing.
- * `.codex-plugin/plugin.json` wins; `.claude-plugin/plugin.json` is the
- * fallback (Codex accepts Claude-first manifests — see `readCodexMarketplaceName`
- * in `../codex-companion-setup.ts`).
+ * Conventional hooks file Codex loads when a plugin's manifest declares none.
+ * The path is also the `source_relative_path` half of the state key.
+ */
+const DEFAULT_PLUGIN_HOOKS_FILE = 'hooks/hooks.json';
+
+/**
+ * Relative hooks-file paths Codex will load for a plugin.
+ *
+ * Verified against codex-cli 0.154.0 by registering fixture plugins into a
+ * scratch CODEX_HOME and reading `hooks/list`:
+ *
+ * | manifest `hooks` | file present        | loaded |
+ * |------------------|---------------------|--------|
+ * | `./hooks/d.json` | `hooks/d.json`      | yes    |
+ * | `./hooks/d.json` | `hooks/hooks.json`  | NO — a declaration REPLACES the default |
+ * | absent           | `hooks/hooks.json`  | yes    |
+ * | absent           | `hooks/other.json`  | no     |
+ *
+ * So the default is a fallback, never an addition — emitting both would write
+ * a trust row keyed on a file Codex never reads. `.codex-plugin/plugin.json`
+ * wins over `.claude-plugin/plugin.json` (Codex accepts Claude-first
+ * manifests — see `readCodexMarketplaceName` in `../codex-companion-setup.ts`).
  */
 export function declaredPluginHookFiles(pluginDir: string): string[] {
   for (const manifestRel of [path.join('.codex-plugin', 'plugin.json'), path.join('.claude-plugin', 'plugin.json')]) {
@@ -340,10 +356,11 @@ export function declaredPluginHookFiles(pluginDir: string): string[] {
       .map((value) => value.replace(/^\.\//, '').replace(/^\/+/, ''));
     if (files.length > 0) return files;
   }
-  return [];
+  // No declaration anywhere → the conventional file, if the plugin ships one.
+  return fs.existsSync(path.join(pluginDir, DEFAULT_PLUGIN_HOOKS_FILE)) ? [DEFAULT_PLUGIN_HOOKS_FILE] : [];
 }
 
-/** Trust entries for every hook a plugin declares. */
+/** Trust entries for every hook Codex will load for this plugin. */
 export function collectPluginHookTrustEntries(source: CodexPluginHookSource): CodexHookTrustEntry[] {
   const entries: CodexHookTrustEntry[] = [];
   for (const rel of declaredPluginHookFiles(source.dir)) {
