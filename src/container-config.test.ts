@@ -777,7 +777,6 @@ describe('excludePlugins', () => {
       'bootstrap/plugins/orchestrate/skills/deep',
       'bootstrap//orchestrate',
       'bootstrap/plugins/',
-      'bootstrap/plug\\ins',
       '',
       42,
     ]) {
@@ -811,6 +810,13 @@ describe('excludePlugins', () => {
       'new\nline',
       'del\u007Fbyte',
       'bootstrap/plugins/a b+c',
+      // A SUB-PATH is held to the same rule now. It used to be narrower because
+      // it was interpolated into a mask mount's `-v host:container:ro`
+      // argument; that mount is gone, so the narrowing went with it rather than
+      // staying behind as a rule whose reason no longer exists.
+      'repo/plugins/foo:bar',
+      'repo/plugins/back\\slash',
+      'repo/plugins/new\nline',
     ];
     writeGroupConfig('xp-odd-names', { excludePlugins: entries });
     expect(readContainerConfig('xp-odd-names').excludePlugins).toEqual(entries);
@@ -818,31 +824,6 @@ describe('excludePlugins', () => {
     for (const bad of ['.', '..']) {
       writeGroupConfig('xp-dots', { excludePlugins: [bad] });
       expect(() => readContainerConfig('xp-dots')).toThrow(/excludePlugins entry/);
-    }
-  });
-
-  it('refuses a colon in a sub-path but keeps accepting one in a top-level name', () => {
-    // A sub-path becomes `/workspace/plugins/<entry>` in a mask mount, and
-    // readonlyMountArgs serializes that as `${hostPath}:${containerPath}:ro`
-    // (src/container-runtime.ts:29-30) — a colon in the value is a `-v` field
-    // separator, so the spawn fails. A top-level entry is only ever tested for
-    // Set membership against a readdirSync name and never reaches a mount
-    // argument, so narrowing it would break a config that already worked for
-    // no benefit.
-    for (const bad of ['repo/plugins/foo:bar', 'repo:x/sub', 'a/b:c/d']) {
-      writeGroupConfig('xp-colon', { excludePlugins: [bad] });
-      expect(() => readContainerConfig('xp-colon')).toThrow(/must not contain ":"/);
-    }
-    writeGroupConfig('xp-colon-toplevel', { excludePlugins: ['foo:bar'] });
-    expect(readContainerConfig('xp-colon-toplevel').excludePlugins).toEqual(['foo:bar']);
-  });
-
-  it('still refuses a control character in a sub-path segment', () => {
-    // Escape sequences, never literal bytes: a literal NUL makes grep and rg
-    // treat the file as binary and match nothing over it (docs/review-notes/818.md).
-    for (const bad of ['r/foo\u0000bar', 'r/foo\nbar', 'bootstrap/plugins/o\u007Frchestrate', 'r/foo\u009Fbar']) {
-      writeGroupConfig('xp-ctrl', { excludePlugins: [bad] });
-      expect(() => readContainerConfig('xp-ctrl')).toThrow(/excludePlugins entry/);
     }
   });
 
@@ -858,7 +839,7 @@ describe('excludePlugins', () => {
     ).toThrow(/excludePlugins entry/);
   });
 
-  it('splits entries into whole-plugin drops and sub-plugin masks', () => {
+  it('splits entries into whole-plugin drops and sub-plugin paths', () => {
     expect(splitExcludedPlugins(['codex', 'bootstrap/plugins/orchestrate', 'repo/sub'])).toEqual({
       topLevel: new Set(['codex']),
       subPaths: new Set(['bootstrap/plugins/orchestrate', 'repo/sub']),

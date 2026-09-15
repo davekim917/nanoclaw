@@ -38,9 +38,9 @@ Each provider reaches the plugin by its own path, all rooted at the `~/plugins` 
 |---|---|---|---|
 | **Skills / commands** (`skills/<n>/SKILL.md`) | `.claude-plugin/plugin.json` + mount (`CLAUDE_PLUGINS_ROOT`) | native registration at spawn from the mount, needs `.codex-plugin/plugin.json` + `.agents/plugins/marketplace.json` | mirror → `~/.config/opencode/skill/` (no plugin loader) |
 | **Always-on directive, plugin's own** | plugin SessionStart hook (auto, via `CLAUDE_PLUGINS_ROOT`) | plugin SessionStart hook (Codex fires plugin hooks; a hook that injects context delivers it natively) | composed from the plugin's own `always-on.md` → `AGENTS.md` — the only provider with no hook path |
-| **Always-on ruleset, operator override** (e.g. impeccable) | not composed — hook only | `~/plugins/<n>/.nanoclaw-always-on.md` → `AGENTS.md` | same |
+| **Always-on ruleset, operator override** (e.g. impeccable) | not composed — hook only | `~/plugins/<n>/.nanoclaw-always-on.md` → `AGENTS.md`. Only for a plugin we do NOT control — never alongside the plugin's own `always-on.md`, or the directive lands twice | same |
 | **Opt-out** | `excludePlugins` (drops mount) | `excludePlugins` (drops mount) + skip the ruleset | `excludePlugins` skips the **ruleset only** — skills stay. The mirror is synced globally, not per group |
-| **Sub-plugin opt-out** | `excludePlugins: ["<n>/plugins/<sub>"]` masks that one sub-plugin with an empty dir; the repo still mounts, so its hook never fires | same mask, so Codex neither registers it nor fires its hook | same mask, and its `always-on.md` is not composed; skills the **global** mirror already copied stay |
+| **Sub-plugin opt-out** | `excludePlugins: ["<n>/plugins/<sub>"]` — **no effect yet** (see below) | **no effect yet** | withholds that sub-plugin's `always-on.md` from the composed prompt; its skills and manifest stay |
 | **Workgroup scope** | `data/plugin-scopes.json`: mounts only in the listed workgroups | same, and the ruleset skips it elsewhere; the subagent mirror never copies it | the ruleset skips it elsewhere; the skill and subagent mirrors never copy it |
 
 So the only artifacts ever worth generating are: **(1)** the manifests a repo ships
@@ -159,9 +159,15 @@ next spawn, and the enabler run is just a verification pass.
    means Codex **containers** will register it themselves at spawn — there is no
    command for you to run.
 
-3. **Author the always-on ruleset** (only when `sessionStartHook` is true and
-   `hasAlwaysOnFile` is false/stub). This is the one judgment step — do NOT dump the
-   raw hook output. Read the plugin's hook/instructions/primary `SKILL.md`, then write
+3. **Author the always-on ruleset** — only for a plugin we do NOT control, and only
+   when `sessionStartHook` is true, `hasOwnRuleset` is false, and `hasAlwaysOnFile` is
+   false/stub. **Skip this step entirely for a plugin we maintain.** Such a repo already
+   carries its directive as its own `always-on.md` beside the sub-plugin it belongs to;
+   adding the NanoClaw-side override on top would deliver the directive twice on
+   OpenCode (the plugin's own file AND the override) and, on Codex, the override on top
+   of the plugin's own SessionStart hook. `scripts/enable-agent-plugin.ts` applies the
+   same three-way condition, so its "next steps" output is the check, not your memory.
+   This is the one judgment step — do NOT dump the raw hook output. Read the plugin's hook/instructions/primary `SKILL.md`, then write
    `~/plugins/<name>/.nanoclaw-always-on.md` containing the **clean, condensed** ruleset:
    - **Strip runtime noise**: activation banners ("X MODE ACTIVE"), statusline/setup
      nudges, and anything host-Claude-specific. Codex/OpenCode agents should see only
@@ -195,23 +201,32 @@ next spawn, and the enabler run is just a verification pass.
    | Mechanism | Claude | Codex | OpenCode |
    |---|---|---|---|
    | `excludePlugins` (per group, via `--exclude`) | drops the mount | drops **both** | drops the ruleset, **keeps the skills** |
-   | `excludePlugins` with a sub-plugin path (per group, by hand) | masks that sub-plugin only, so its hook never fires | masks it, so it neither registers nor fires its hook | masks it in the mount and skips its `always-on.md`; the **global** skill mirror still has it |
+   | `excludePlugins` with a sub-plugin path (per group, by hand) | nothing yet | nothing yet | skips its `always-on.md` only; skills, manifest and hooks stay |
    | `--deny <provider>` (per plugin, all groups) | only before a manifest exists | drops the skills, **keeps the ruleset** | drops the skills, **keeps the ruleset** |
    | remove from `~/plugins` | effective | effective | **does not remove already-synced skills** |
 
    A sub-plugin path is written into the group's `container.json` by hand —
    `"excludePlugins": ["bootstrap/plugins/orchestrate"]` — and the enabler's
    `--exclude` flag does not produce one. Both sub-plugin layouts the container-side
-   walkers descend are accepted: `<repo>/plugins/<sub>` and `<repo>/<sub>`. The repo
-   itself keeps mounting; the host bind-mounts one empty read-only directory over just
-   that sub-path (`src/container-runner.ts`, plugin mounts), so every walker sees a
-   directory with no manifest and skips it. A malformed entry, or one naming a path
-   that does not exist on the host, is refused or logged rather than silently ignored.
+   walkers descend are accepted: `<repo>/plugins/<sub>` and `<repo>/<sub>`, and a
+   malformed entry throws rather than being silently ignored.
+
+   **What it does today is narrower than the name suggests, so state it plainly when
+   you use it.** A sub-path entry withholds that sub-plugin's standing directive from
+   the composed prompt (`src/claude-md-compose.ts`) and nothing else: the repo mounts
+   whole, and the sub-plugin's skills, manifest and hooks are all still reachable in
+   the container. Masking the sub-path with an empty bind mount was tried and removed —
+   it required the HOST to predict what a container's own walkers would resolve, and an
+   absolute symlink inside the repo is absent to a host `statSync` while live once the
+   repo is mounted, so the exclusion silently did not apply. Container-side exclusion
+   lands in a follow-up, where each of the three walkers honours this same list in its
+   own namespace. Until then, use a TOP-LEVEL entry when you need the plugin actually
+   withheld.
 
    `excludePlugins` is the only per-group opt-out, and it is not uniform. (A plugin that
    carries one workgroup's content belongs in `data/plugin-scopes.json` instead: opt-in,
    and uniform across all three providers. See docs/workgroups.md.) The plugin
-   mount in `src/container-runner.ts:5051-5116` has no provider conditional, so an
+   mount in `src/container-runner.ts:5040-5090` has no provider conditional, so an
    excluded plugin is absent from `/workspace/plugins` for every provider — which is
    why Codex loses its skills too: `planCodexPluginRegistration` reads that mount, and
    the entry simply never appears (`container/agent-runner/src/codex-companion-setup.ts`
@@ -230,7 +245,7 @@ next spawn, and the enabler run is just a verification pass.
      (`scripts/enable-agent-plugin.ts:480`), so it prevents one being created. Once a
      manifest exists — shipped with the plugin, or generated by an earlier step 2 —
      the mount assembly reads only `containerConfig.excludePlugins`
-     (`src/container-runner.ts:5051-5116`) and the plugin auto-loads regardless. Use
+     (`src/container-runner.ts:5040-5090`) and the plugin auto-loads regardless. Use
      `excludePlugins` for Claude on an already-enabled plugin.
    - **Order matters when removing from OpenCode: deny first, delete second.**
      `--deny opencode` DOES prune an already-synced mirror, because

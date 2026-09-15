@@ -573,6 +573,32 @@ describe("sub-plugin always-on: the plugin's own always-on.md (OpenCode only)", 
     }
   });
 
+  it('skips a ruleset larger than the composer bound, keeping its siblings', async () => {
+    // Containment says WHERE a ruleset may live, not how big it is. The read is
+    // synchronous and on the spawn path, so an oversized file is paid as spawn
+    // latency and host memory before anything downstream looks. Refusing beats
+    // truncating: half a standing ruleset is a directive with its carve-outs
+    // cut off.
+    const home = seedBootstrapPlugin(null);
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    const huge = path.join(repo, 'plugins', 'huge');
+    fs.mkdirSync(huge, { recursive: true });
+    fs.writeFileSync(path.join(huge, 'always-on.md'), `SENTINEL_HUGE_RULESET_8b1d\n${'x'.repeat(64 * 1024)}`);
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-huge', 'sub-huge');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+      const doc = agentsDoc(ag.folder);
+      expect(doc).not.toContain('SENTINEL_HUGE_RULESET_8b1d');
+      expect(doc).toContain(ORCHESTRATE_SENTINEL);
+      expect(doc).toContain(WWBD_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
   it('composes a ruleset reached by a symlink that stays inside the repository', async () => {
     // Containment, not a ban on symlinks: a repo is free to point a sub-plugin's
     // directive at another file of its own.

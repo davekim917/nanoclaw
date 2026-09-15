@@ -70,6 +70,8 @@ interface Classification {
   sessionStartHook: boolean;
   hasAlwaysOnFile: boolean;
   alwaysOnIsStub: boolean;
+  /** The plugin carries its OWN generic `always-on.md` — no override wanted. */
+  hasOwnRuleset: boolean;
 }
 
 function die(msg: string): never {
@@ -109,7 +111,11 @@ function parseArgs(): ParsedArgs {
     const a = argv[i];
     if (a === '--dry-run') dryRun = true;
     else if (a === '--report-json') reportJson = true;
-    else if (a === '--exclude') exclude = (argv[++i] ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+    else if (a === '--exclude')
+      exclude = (argv[++i] ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
     else if (a === '--deny') deny = parseRuntimeList(argv[++i] ?? '', '--deny');
     else if (a === '--allow') allow = parseRuntimeList(argv[++i] ?? '', '--allow');
     else if (!a.startsWith('--') && !target) target = a;
@@ -267,9 +273,7 @@ function parseCodexMarketplaceSelfEntry(marketplacePath: string): CodexMarketpla
     };
     const marketplaceName = typeof parsed.name === 'string' ? parsed.name : null;
     const selfEntry = Array.isArray(parsed.plugins)
-      ? parsed.plugins.find(
-          (p) => p?.source?.source === 'local' && (p.source?.path === './' || p.source?.path === '.'),
-        )
+      ? parsed.plugins.find((p) => p?.source?.source === 'local' && (p.source?.path === './' || p.source?.path === '.'))
       : undefined;
     if (!marketplaceName || !selfEntry || typeof selfEntry.name !== 'string') return null;
     return { marketplaceName, pluginEntryName: selfEntry.name };
@@ -390,9 +394,7 @@ function resolveCodexRegistration(dir: string, name: string, dryRun: boolean): C
     if (subs.length > 0) {
       const self = parseCodexMarketplaceSelfEntry(path.join(dir, '.agents', 'plugins', 'marketplace.json'));
       const mkt = self?.marketplaceName ?? readAnyMarketplaceName(dir);
-      const entries = subs
-        .map((s) => readDeclaredCodexName(s.dir))
-        .filter((n): n is string => Boolean(n));
+      const entries = subs.map((s) => readDeclaredCodexName(s.dir)).filter((n): n is string => Boolean(n));
       return {
         skillsRoot: `${subs.length} sub-plugin(s)`,
         manifestGenerated: subs.some((s) => s.generated),
@@ -438,11 +440,8 @@ function resolveCodexRegistration(dir: string, name: string, dryRun: boolean): C
       fs.mkdirSync(path.dirname(marketplacePath), { recursive: true });
       fs.writeFileSync(
         marketplacePath,
-        JSON.stringify(
-          { name, plugins: [{ name: entryName, source: { source: 'local', path: './' } }] },
-          null,
-          2,
-        ) + '\n',
+        JSON.stringify({ name, plugins: [{ name: entryName, source: { source: 'local', path: './' } }] }, null, 2) +
+          '\n',
       );
     }
   } else {
@@ -500,6 +499,26 @@ function main(): void {
   const alwaysOnPath = path.join(dir, '.nanoclaw-always-on.md');
   const hasAlwaysOnFile = fs.existsSync(alwaysOnPath);
   const alwaysOnIsStub = hasAlwaysOnFile && fs.readFileSync(alwaysOnPath, 'utf-8').trim().length === 0;
+  // A plugin we MAINTAIN ships its directive as its own generic `always-on.md`
+  // and needs no NanoClaw-specific file. `.nanoclaw-always-on.md` is the
+  // OVERRIDE for a third-party clone that ships no clean ruleset. Instructing
+  // an operator to author one beside a plugin that already has its own would
+  // deliver the directive twice on OpenCode (the plugin's own file plus the
+  // override) and, on Codex, the override on top of the plugin's native hook.
+  // Both layouts the composer walks: `<repo>/plugins/<sub>/always-on.md` and
+  // `<repo>/<sub>/always-on.md` (`subPluginDirs`, src/claude-md-compose.ts),
+  // plus the repo root for a single-plugin repo.
+  const hasOwnRuleset =
+    fs.existsSync(path.join(dir, 'always-on.md')) ||
+    [path.join(dir, 'plugins'), dir].some((container) => {
+      let subs: string[];
+      try {
+        subs = fs.readdirSync(container);
+      } catch {
+        return false;
+      }
+      return subs.some((sub) => !sub.startsWith('.') && fs.existsSync(path.join(container, sub, 'always-on.md')));
+    });
 
   const classification: Classification = {
     name,
@@ -515,6 +534,7 @@ function main(): void {
     sessionStartHook: detectSessionStartHook(dir),
     hasAlwaysOnFile,
     alwaysOnIsStub,
+    hasOwnRuleset,
   };
 
   // Mirror skills to OpenCode's discovery path (idempotent). Codex now loads
@@ -531,13 +551,16 @@ function main(): void {
     return;
   }
 
-  const needsRuleset = classification.sessionStartHook && (!hasAlwaysOnFile || alwaysOnIsStub);
+  const needsRuleset =
+    classification.sessionStartHook && !classification.hasOwnRuleset && (!hasAlwaysOnFile || alwaysOnIsStub);
   console.log(`\n${dryRun ? '[dry-run] ' : ''}enable-agent-plugin: ${name}`);
   console.log(`  dir:               ${dir}`);
   console.log(
     `  deny siblings:     ${classification.denySiblings.length ? classification.denySiblings.join(', ') : '(none — delivered to all three)'}`,
   );
-  console.log(`  Claude manifest:   ${hasClaudeManifest ? 'present' : 'MISSING'}${generatedManifest ? ' (generated)' : ''}`);
+  console.log(
+    `  Claude manifest:   ${hasClaudeManifest ? 'present' : 'MISSING'}${generatedManifest ? ' (generated)' : ''}`,
+  );
   if (deny.has('codex')) {
     console.log(`  Codex:             denied (sibling opt-out)`);
   } else if (codexReg.skillsRoot === null) {
@@ -549,10 +572,16 @@ function main(): void {
     );
     console.log(`  Codex registers:   at container spawn, from /workspace/plugins (no host CLI involved)`);
   }
-  console.log(`  portable skills:   ${portableSkills.length}${portableSkills.length ? ` (${portableSkills.join(', ')})` : ''}`);
+  console.log(
+    `  portable skills:   ${portableSkills.length}${portableSkills.length ? ` (${portableSkills.join(', ')})` : ''}`,
+  );
   console.log(`  skills mirrored:   opencode +${opencodeCreated}`);
-  console.log(`  always-on plugin:  ${classification.sessionStartHook ? 'yes (has SessionStart hook)' : 'no (skills-only)'}`);
-  console.log(`  ruleset file:      ${hasAlwaysOnFile ? (alwaysOnIsStub ? 'present but EMPTY' : 'present') : 'absent'}`);
+  console.log(
+    `  always-on plugin:  ${classification.sessionStartHook ? 'yes (has SessionStart hook)' : 'no (skills-only)'}`,
+  );
+  console.log(
+    `  ruleset file:      ${hasAlwaysOnFile ? (alwaysOnIsStub ? 'present but EMPTY' : 'present') : 'absent'}`,
+  );
   if (optedOut.length) console.log(`  opted out:         ${optedOut.join(', ')}`);
   console.log('\n  next steps:');
   if (needsRuleset) {
@@ -560,6 +589,8 @@ function main(): void {
     console.log(`       ruleset (strip runtime banners / host-only nudges). The skill does this.`);
     console.log(`    2. pnpm run build   # composer is host src/`);
     console.log(`    3. restart the host to respawn containers`);
+  } else if (classification.hasOwnRuleset) {
+    console.log(`    1. pnpm run build && restart host  (plugin ships its own always-on.md — no override wanted)`);
   } else if (classification.sessionStartHook) {
     console.log(`    1. pnpm run build && restart host  (ruleset already present)`);
   } else {

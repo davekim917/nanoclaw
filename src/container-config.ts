@@ -651,40 +651,39 @@ export function validateAutoCompactWindow(value: unknown): number | undefined {
 
 /**
  * One path segment of an `excludePlugins` entry: a real directory name, never
- * empty, `.` or `..`, and carrying no separator or control character.
+ * empty, `.` or `..`. Shape only, for every entry at every depth.
  *
- * Deliberately NOT a slug allowlist. `excludePlugins` had no validation at all
- * before this field grew sub-paths, and the entries it holds are directory
- * basenames the operator did not choose: `scripts/enable-agent-plugin.ts`
- * accepts any direct child of `~/plugins` (`resolvePluginDir` checks only that
- * the path is a directory whose parent is the plugins root) and writes that
- * basename straight into this list (`applyOptOut`). A clone named `foo+bar` or
- * `c++-tools` is an ordinary directory, so an allowlist of `[A-Za-z0-9._-]`
- * would refuse a config that worked before and take the whole group's spawn
- * down with it — `readContainerConfig` throws on every read — which is the
- * fail-closed guard refusing a legitimate state rather than a bad input.
+ * Deliberately NOT a slug allowlist, and deliberately not a character rule.
+ * `excludePlugins` had no validation at all before this field grew sub-paths,
+ * and the entries it holds are directory basenames the operator did not choose:
+ * `scripts/enable-agent-plugin.ts` accepts any direct child of `~/plugins`
+ * (`resolvePluginDir` checks only that the path is a directory whose parent is
+ * the plugins root) and writes that basename straight into this list
+ * (`applyOptOut`). A clone named `foo+bar` or `c++-tools` is an ordinary
+ * directory, so an allowlist of `[A-Za-z0-9._-]` would refuse a config that
+ * worked before and take the whole group's spawn down with it —
+ * `readContainerConfig` throws on every read — which is a fail-closed guard
+ * refusing a legitimate state rather than a bad input.
  *
- * What the guard actually has to stop is traversal and separator confusion, and
- * that is exactly what remains: an empty segment, `.`, `..`, a backslash, and
- * any C0/C1 control character (`/` cannot appear — segments are the result of
- * splitting on it). `src/plugin-scopes.ts:44`'s narrower `PLUGIN_NAME_RE`
- * governs an operator-authored policy file and is left alone.
+ * Earlier revisions of this PR also refused a backslash, a control character
+ * and a colon in a sub-path entry, because a sub-path was interpolated into a
+ * mask mount's container path and thence into `-v <host>:<container>:ro`. That
+ * mask mechanism is gone (see the plugin-mount block in
+ * `src/container-runner.ts`), so a sub-path entry is no longer interpolated
+ * into anything: it is compared as a string and joined onto a host path whose
+ * result is then `realpath`-contained (`src/claude-md-compose.ts`). Those rules
+ * went with the mechanism that justified them rather than staying behind as
+ * comments pointing at a code path the value no longer reaches — and backslash,
+ * newline and DEL are all legal bytes in a Linux directory name, so refusing
+ * them is the same accepted-set regression in a narrower place.
  *
- * This applies to SUB-PATH entries only. Backslash, newline and DEL are all
- * legal bytes in a Linux directory name, so a top-level entry carrying one is
- * still a real plugin the enabler would write here, and a top-level entry is
- * only ever compared for Set membership against a `readdirSync` name — it never
- * reaches a mount argument, a path join, or any delimited format. Refusing it
- * would be the same accepted-set regression this rule exists to undo, so a
- * top-level entry is held to `EVERY_SEGMENT_RE` alone. The distinction is the
- * one the colon rule below already draws; it belongs to every character rule,
- * not just that one.
+ * What remains is what traversal actually needs: no empty segment, no `.` or
+ * `..`, no absolute path, and the depth bound below. `/` cannot appear in a
+ * segment at all — segments are the result of splitting on it.
+ * `src/plugin-scopes.ts:44`'s narrower `PLUGIN_NAME_RE` governs an
+ * operator-authored policy file and is left alone.
  */
-/** Every entry, top-level or sub-path: a real name, never empty, `.` or `..`. */
-const EVERY_SEGMENT_RE = /^(?!\.\.?$).+$/su;
-
-/** Additionally, for a sub-path segment: no backslash and no control character. */
-const PLUGIN_PATH_SEGMENT_RE = /^(?!\.\.?$)[^\\\p{Cc}]+$/u;
+const PLUGIN_PATH_SEGMENT_RE = /^(?!\.\.?$).+$/su;
 
 /**
  * Deepest `excludePlugins` entry we accept, in path segments. Bounded by what
@@ -722,35 +721,12 @@ export function validateExcludePlugins(value: unknown): string[] | undefined {
     const name = entry as string;
     if (name.startsWith('/')) fail('must be relative to ~/plugins, not an absolute path');
     const segments = name.split('/');
-    const isSubPath = segments.length > 1;
-    if (isSubPath && name.includes('\\')) fail('must use "/" separators');
-    // A sub-path, and only a sub-path, is interpolated into a mount: the mask's
-    // container path is `/workspace/plugins/<entry>` and `readonlyMountArgs`
-    // serializes it as `${hostPath}:${containerPath}:ro`
-    // (`src/container-runtime.ts:29-30`), where a colon in the value silently
-    // becomes a `-v` field separator and the spawn fails. A TOP-LEVEL entry is
-    // only ever tested for Set membership against a `readdirSync` name
-    // (`src/container-runner.ts`, plugin mounts) and never reaches a mount
-    // argument, so it keeps accepting every directory name it accepted before —
-    // which is the point of the rule above.
-    if (isSubPath && name.includes(':')) {
-      fail('must not contain ":" — a sub-plugin path is interpolated into a "-v host:container:ro" mount argument');
-    }
     if (segments.length > MAX_EXCLUDE_PLUGIN_DEPTH) {
       fail(`is deeper than ${MAX_EXCLUDE_PLUGIN_DEPTH} path segments, which no sub-plugin walker descends to`);
     }
-    // A top-level entry is held to the shape rule alone — it is compared for
-    // Set membership against a `readdirSync` name and never interpolated
-    // anywhere, and backslash, newline and DEL are all legal bytes in a real
-    // directory name the enabler would write here.
-    const segmentRe = isSubPath ? PLUGIN_PATH_SEGMENT_RE : EVERY_SEGMENT_RE;
     for (const segment of segments) {
-      if (!segmentRe.test(segment)) {
-        fail(
-          isSubPath
-            ? 'must be <plugin>/<sub>[/<sub2>] with no empty, "." or ".." segments and no control characters'
-            : 'must be a plugin directory name, not "", "." or ".."',
-        );
+      if (!PLUGIN_PATH_SEGMENT_RE.test(segment)) {
+        fail('must be <plugin> or <plugin>/<sub>[/<sub2>] with no empty, "." or ".." segments');
       }
     }
   }
@@ -759,19 +735,19 @@ export function validateExcludePlugins(value: unknown): string[] | undefined {
 
 /**
  * Split a validated `excludePlugins` list into the two shapes its consumers
- * need: whole `~/plugins` entries to drop, and sub-plugin paths to mask inside
- * a repo that IS still delivered. Shared by the mount builder
+ * need: whole `~/plugins` entries to drop, and sub-plugin paths to withhold
+ * inside a repo that IS still delivered. Shared by the mount builder
  * (`src/container-runner.ts`) and the always-on composer
  * (`src/claude-md-compose.ts`) so the two can't disagree about what an entry means.
  *
  * `subPaths` holds only the entries no broader exclusion already covers. A
  * sub-path under an excluded ancestor says nothing the ancestor has not already
- * said, and emitting it anyway is not merely redundant at the mount builder: the
- * ancestor's mask is an empty read-only bind, so the descendant's mountpoint no
- * longer exists inside it, docker cannot create one there, and the spawn fails
- * outright instead of excluding the plugin. Both ancestor shapes drop here —
- * a top-level entry (`bootstrap`, whose repo mount is never created at all) and
- * a shallower sub-path (`bootstrap/plugins` over `bootstrap/plugins/orchestrate`).
+ * said, so the covering relation is resolved once, here, rather than at each
+ * consumer — the always-on composer resolves ancestors when it walks discovered
+ * sub-plugins, and a future consumer should not have to rediscover the rule.
+ * Both ancestor shapes drop: a top-level entry (`bootstrap`, whose repo is
+ * withheld whole) and a shallower sub-path (`bootstrap/plugins` over
+ * `bootstrap/plugins/orchestrate`).
  */
 export function splitExcludedPlugins(entries: readonly string[] | undefined): {
   topLevel: Set<string>;
@@ -895,13 +871,22 @@ export interface ContainerConfig {
    * `codex` plugin to avoid handing them a CLI with the host's Codex OAuth
    * session.
    *
-   * Two granularities, one field:
-   *   - `"bootstrap"` — a top-level entry; its mount is never created.
+   * Two granularities, one field — and today they reach different distances:
+   *   - `"bootstrap"` — a top-level entry. Its mount is never created, so the
+   *     plugin is absent from `/workspace/plugins` for every provider.
    *   - `"bootstrap/plugins/orchestrate"` — one sub-plugin of a monorepo whose
-   *     other sub-plugins the group keeps. The repo still mounts; an empty
-   *     host directory is bind-mounted over just that sub-path, so all three
-   *     sub-plugin walkers see a directory with no manifest and skip it
-   *     (`src/container-runner.ts`, plugin mounts).
+   *     other sub-plugins the group keeps. This withholds that sub-plugin's
+   *     standing directive from the composed prompt
+   *     (`src/claude-md-compose.ts`) and NOTHING ELSE: the repo mounts whole,
+   *     so the sub-plugin's skills, manifest and hooks are still reachable in
+   *     the container.
+   *
+   * The gap is deliberate and temporary. Masking the sub-path with an empty
+   * bind mount was tried and removed: it required the host to predict what a
+   * container's own walkers would resolve, and an absolute symlink inside the
+   * repo is absent to a host `statSync` while live once the repo is mounted, so
+   * the exclusion silently did not apply. Container-side exclusion lands in a
+   * follow-up, where each walker honours this same list in its own namespace.
    *
    * Validated by `validateExcludePlugins` — a malformed entry throws rather
    * than being silently ignored.

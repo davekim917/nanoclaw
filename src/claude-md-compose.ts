@@ -70,6 +70,18 @@ const NANOCLAW_ALWAYS_ON_MARKER = '.nanoclaw-always-on.md';
 const PLUGIN_ALWAYS_ON_FILE = 'always-on.md';
 
 /**
+ * Largest plugin ruleset this composer will read, in bytes.
+ *
+ * Sized against the surface it feeds rather than picked round: the composed
+ * doc as a whole is already capped at `CODEX_PROJECT_DOC_CONFIGURED_MAX_BYTES`
+ * (`src/codex-project-doc-cap.ts`), and one plugin's standing directive is a
+ * fraction of a document that also carries the persona, the shared base and
+ * every other fragment. 64 KiB is far above every ruleset in the tree and far
+ * below anything that costs a spawn measurable time or memory.
+ */
+const MAX_PLUGIN_RULESET_BYTES = 64 * 1024;
+
+/**
  * One ruleset file's trimmed contents, or null when absent, empty, unreadable,
  * or resolving outside `repoRoot`.
  *
@@ -101,7 +113,23 @@ function readRulesetFile(dir: string, filename: string, repoRoot: string): strin
       log.warn('Plugin ruleset resolves outside its plugin repository; not composing it', { file, repoRoot: root });
       return null;
     }
-    if (!fs.statSync(resolved).isFile()) return null;
+    const stat = fs.statSync(resolved);
+    if (!stat.isFile()) return null;
+    // Bounded before the read, not after. Containment says WHERE the file may
+    // be, not how big it is, and a plugin repo may carry an arbitrarily large
+    // file at a path we compose: `readFileSync` is synchronous and on the spawn
+    // path, so the cost is paid as spawn latency and host memory before
+    // anything downstream — including the project-document cap — gets to look.
+    // Refusing is also the more useful answer than truncating: half a standing
+    // ruleset is a directive with its carve-outs cut off.
+    if (stat.size > MAX_PLUGIN_RULESET_BYTES) {
+      log.warn('Plugin ruleset is too large to compose; skipping it', {
+        file,
+        bytes: stat.size,
+        maxBytes: MAX_PLUGIN_RULESET_BYTES,
+      });
+      return null;
+    }
     return fs.readFileSync(resolved, 'utf-8').trim() || null;
   } catch {
     return null;
@@ -145,8 +173,8 @@ function subPluginDirs(pluginsRoot: string, name: string): Array<{ subPath: stri
 
 /**
  * True when this sub-path, or any ancestor of it below the repo root, is
- * excluded — so excluding `bootstrap/plugins` also drops every sub-plugin
- * under it, matching what the mask mount would do to that directory.
+ * excluded — so excluding `bootstrap/plugins` also withholds the directive of
+ * every sub-plugin under it, not only one named exactly.
  */
 function isExcludedSubPath(subPath: string, excludedSubPaths: ReadonlySet<string>): boolean {
   const segments = subPath.split('/');

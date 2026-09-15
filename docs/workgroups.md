@@ -91,10 +91,12 @@ Authenticate the refresh through the host's git credential helper.
 ## Workgroup-scoped plugins
 
 `~/plugins` is fleet-wide: every agent group mounts every plugin unless its
-`container.json` `excludePlugins` names it — either a whole entry
-(`"bootstrap"`) or one sub-plugin of a monorepo whose siblings the group keeps
-(`"bootstrap/plugins/orchestrate"`, or `"<repo>/<sub>"` for a repo that puts
-its sub-plugins at the root). For a plugin that carries one
+`container.json` `excludePlugins` names it. A whole entry (`"bootstrap"`)
+drops the mount. A sub-plugin path (`"bootstrap/plugins/orchestrate"`, or
+`"<repo>/<sub>"` for a repo that puts its sub-plugins at the root) currently
+withholds only that sub-plugin's standing directive from the composed prompt —
+the repo still mounts whole; container-side exclusion lands in a follow-up.
+For a plugin that carries one
 tenant's content, that default is backwards, because a group created later
 receives it until someone remembers to exclude it. The host-owned policy
 `data/plugin-scopes.json` makes such a plugin opt-in:

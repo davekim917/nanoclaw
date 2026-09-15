@@ -39,7 +39,7 @@ vi.mock('./db/messaging-groups.js', async (importOriginal) => {
   };
 });
 
-import { buildMounts, EMPTY_PLUGIN_MASK_DIR } from './container-runner.js';
+import { buildMounts } from './container-runner.js';
 import { log } from './log.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { sessionContextPath, sessionDir, writeSessionContext } from './session-manager.js';
@@ -1137,18 +1137,24 @@ describe('buildMounts agent surfaces', async () => {
     }
   });
 
-  it('masks an excluded sub-plugin with an empty dir while its repo and siblings still mount', async () => {
+  it('never mounts anything for a sub-path exclusion — the repo and all its sub-plugins still mount', async () => {
+    // The mount path honours TOP-LEVEL entries only. Masking a sub-path by
+    // binding an empty directory over it was tried and removed: it made the
+    // host predict container-side path resolution, and an absolute symlink
+    // inside the repo is absent to a host `statSync` but live once the repo is
+    // mounted, so the exclusion silently did not apply. A sub-path entry is
+    // still validated and still drives the always-on composer; it contributes
+    // no mount, and it must not disturb the repo's own.
     const homedir = path.join(TEST_ROOT, 'home');
     const bootstrap = path.join(homedir, 'plugins', 'bootstrap');
     fs.mkdirSync(path.join(bootstrap, 'plugins', 'orchestrate'), { recursive: true });
     fs.mkdirSync(path.join(bootstrap, 'plugins', 'wwbd'), { recursive: true });
-    // Second sub-plugin layout: a sub-plugin at the repo root (rule 8 of
-    // container/agent-runner/src/plugin-skill-discovery.ts:303).
     fs.mkdirSync(path.join(bootstrap, 'rootlevel'), { recursive: true });
+    fs.mkdirSync(path.join(homedir, 'plugins', 'codex'), { recursive: true });
     const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(homedir);
 
     try {
-      const ag = group('ag-subplugin-mask', 'subplugin-mask');
+      const ag = group('ag-subplugin-nomask', 'subplugin-nomask');
       await createAgentGroup(ag);
       withWorkgroup(ag);
       await ensureContainerConfig(ag.id);
@@ -1156,107 +1162,36 @@ describe('buildMounts agent surfaces', async () => {
 
       const mounts = await buildMounts(
         ag,
-        session('s-subplugin-mask', ag.id),
+        session('s-subplugin-nomask', ag.id),
         {
           ...containerConfig(),
-          excludePlugins: ['bootstrap/plugins/orchestrate', 'bootstrap/rootlevel', 'bootstrap/plugins/absent'],
+          // One top-level entry and three sub-path entries, including a nested
+          // pair and one naming a directory that does not exist.
+          excludePlugins: [
+            'codex',
+            'bootstrap/plugins',
+            'bootstrap/plugins/orchestrate',
+            'bootstrap/rootlevel',
+            'bootstrap/plugins/absent',
+          ],
         },
         'claude',
         {},
       );
-      const byPath = new Map(mounts.map((mount) => [mount.containerPath, mount]));
+      const pluginMounts = mounts
+        .map((mount) => mount.containerPath)
+        .filter((p) => p.startsWith('/workspace/plugins/'));
 
-      // The repo itself still mounts from its real host path.
-      expect(byPath.get('/workspace/plugins/bootstrap')).toEqual({
+      // The repo mounts once, from its real host path, and nothing else under
+      // /workspace/plugins is emitted for it.
+      expect(pluginMounts).toEqual(['/workspace/plugins/bootstrap']);
+      expect(mounts.find((m) => m.containerPath === '/workspace/plugins/bootstrap')).toEqual({
         hostPath: bootstrap,
         containerPath: '/workspace/plugins/bootstrap',
         readonly: true,
       });
-      // Each excluded sub-path is masked by the shared empty dir, read-only.
-      for (const subPath of ['bootstrap/plugins/orchestrate', 'bootstrap/rootlevel']) {
-        expect(byPath.get(`/workspace/plugins/${subPath}`)).toEqual({
-          hostPath: EMPTY_PLUGIN_MASK_DIR,
-          containerPath: `/workspace/plugins/${subPath}`,
-          readonly: true,
-        });
-      }
-      expect(fs.readdirSync(EMPTY_PLUGIN_MASK_DIR)).toEqual([]);
-      // Siblings are untouched — no mount of their own, reached through the repo.
-      expect(byPath.has('/workspace/plugins/bootstrap/plugins/wwbd')).toBe(false);
-      // A sub-path with no host directory is NOT masked: docker cannot create a
-      // mountpoint inside an already-read-only bind and would fail the spawn
-      // (verified against the daemon; see the mask comment in container-runner.ts).
-      expect(byPath.has('/workspace/plugins/bootstrap/plugins/absent')).toBe(false);
-      expect(log.warn).toHaveBeenCalledWith(
-        expect.stringContaining('excludePlugins names a sub-plugin path that does not exist'),
-        expect.objectContaining({ subPath: 'bootstrap/plugins/absent' }),
-      );
-      // The mask mount must follow its repo mount; a mask ordered first would be
-      // overlaid by the repo bind and silently stop masking.
-      const order = mounts.map((mount) => mount.containerPath);
-      expect(order.indexOf('/workspace/plugins/bootstrap')).toBeLessThan(
-        order.indexOf('/workspace/plugins/bootstrap/plugins/orchestrate'),
-      );
-
-      // A descendant of an already-excluded ancestor emits NO mask of its own.
-      // The ancestor's mask is an empty read-only bind, so the descendant's
-      // mountpoint no longer exists inside it, docker cannot create one there,
-      // and the spawn would fail outright instead of excluding the plugin.
-      const nested = await buildMounts(
-        ag,
-        session('s-subplugin-nested', ag.id),
-        {
-          ...containerConfig(),
-          excludePlugins: ['bootstrap/plugins', 'bootstrap/plugins/orchestrate', 'bootstrap/plugins/wwbd'],
-        },
-        'claude',
-        {},
-      );
-      expect(
-        nested.map((mount) => mount.containerPath).filter((p) => p.startsWith('/workspace/plugins/bootstrap/')),
-      ).toEqual(['/workspace/plugins/bootstrap/plugins']);
-
-      // The mask source must be PROVEN empty, not merely created. Its emptiness
-      // IS the exclusion: content here is delivered at exactly the path the
-      // operator excluded, for every mask in the fleet, and no walker
-      // downstream can tell it from the real sub-plugin. So a contaminated
-      // source refuses the spawn rather than mounting.
-      const contaminated = path.join(EMPTY_PLUGIN_MASK_DIR, '.claude-plugin');
-      fs.mkdirSync(contaminated, { recursive: true });
-      fs.writeFileSync(path.join(contaminated, 'plugin.json'), '{"name":"planted"}');
-      try {
-        await expect(
-          buildMounts(
-            ag,
-            session('s-subplugin-dirty', ag.id),
-            { ...containerConfig(), excludePlugins: ['bootstrap/plugins/orchestrate'] },
-            'claude',
-            {},
-          ),
-        ).rejects.toThrow(/is not empty/);
-      } finally {
-        fs.rmSync(contaminated, { recursive: true, force: true });
-      }
-
-      // A symlink at that path is refused too — lstat, never stat, so the mask
-      // source cannot be redirected at somewhere that has content.
-      fs.rmSync(EMPTY_PLUGIN_MASK_DIR, { recursive: true, force: true });
-      const elsewhere = path.join(TEST_ROOT, 'mask-symlink-target');
-      fs.mkdirSync(elsewhere, { recursive: true });
-      fs.symlinkSync(elsewhere, EMPTY_PLUGIN_MASK_DIR);
-      try {
-        await expect(
-          buildMounts(
-            ag,
-            session('s-subplugin-symlink', ag.id),
-            { ...containerConfig(), excludePlugins: ['bootstrap/plugins/orchestrate'] },
-            'claude',
-            {},
-          ),
-        ).rejects.toThrow(/is not a directory \(symlink\)/);
-      } finally {
-        fs.unlinkSync(EMPTY_PLUGIN_MASK_DIR);
-      }
+      // The top-level entry is still honoured — that is the half that works.
+      expect(pluginMounts).not.toContain('/workspace/plugins/codex');
     } finally {
       homedirSpy.mockRestore();
     }

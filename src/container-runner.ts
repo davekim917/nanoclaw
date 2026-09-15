@@ -4404,55 +4404,6 @@ function logSpawnStage(stage: string, startedAt: number): void {
   log.info('Spawn stage timing', { stage, ms: Date.now() - startedAt });
 }
 
-/**
- * The one empty directory every sub-plugin mask binds from. Host-owned and
- * under `data/` rather than `/tmp` so a tmpfs wipe, a tmp reaper, or another
- * process planting content at a guessable path can never turn a mask into a
- * live delivery. Created on demand and never written to; `recursive: true`
- * makes the call idempotent across spawns.
- */
-export const EMPTY_PLUGIN_MASK_DIR = path.join(DATA_DIR, 'empty-plugin-mask');
-
-/**
- * The mask source, proven empty on every use.
- *
- * The emptiness is the whole mechanism: a sub-plugin is "excluded" only because
- * what gets bound over it has no manifest for any walker to find. If this
- * directory ever holds content, every mask in the fleet stops hiding a
- * sub-plugin and starts DELIVERING that content at exactly the path the
- * operator declared excluded — an exclusion inverted into a delivery, on a
- * control whose documented purpose includes withholding a CLI that carries the
- * host's OAuth session. One directory backs every mask, so one contaminated
- * inode is a fleet-wide failure, and nothing downstream can notice: a walker
- * finding a manifest here cannot tell it apart from the real sub-plugin.
- *
- * `mkdirSync(recursive: true)` alone proves none of that — it succeeds on an
- * existing directory whatever it contains, and on a symlink pointing somewhere
- * else entirely. So the invariant is asserted here, in the primitive that
- * supplies the source, rather than at the call site: `lstat` (never `stat`, so
- * a symlink is refused rather than followed) and a directory that reads empty.
- * A spawn that cannot prove it is refused, because a mask that might not mask
- * is worse than no spawn.
- */
-function emptyPluginMaskDir(): string {
-  fs.mkdirSync(EMPTY_PLUGIN_MASK_DIR, { recursive: true });
-  const stat = fs.lstatSync(EMPTY_PLUGIN_MASK_DIR);
-  if (!stat.isDirectory()) {
-    throw new Error(
-      `plugin mask source ${EMPTY_PLUGIN_MASK_DIR} is not a directory (${stat.isSymbolicLink() ? 'symlink' : 'other'}); ` +
-        'refusing to mount it over an excluded sub-plugin',
-    );
-  }
-  const contents = fs.readdirSync(EMPTY_PLUGIN_MASK_DIR);
-  if (contents.length > 0) {
-    throw new Error(
-      `plugin mask source ${EMPTY_PLUGIN_MASK_DIR} is not empty (${contents.length} entr${contents.length === 1 ? 'y' : 'ies'}); ` +
-        'mounting it would deliver that content at the path excludePlugins excludes. Empty or remove it.',
-    );
-  }
-  return EMPTY_PLUGIN_MASK_DIR;
-}
-
 export async function buildMounts(
   agentGroup: AgentGroup,
   session: Session,
@@ -5089,16 +5040,17 @@ export async function buildMounts(
   // excludePlugins deny list skips named plugins — useful for limiting
   // a group's tool surface (e.g. security agents without codex).
   //
-  // An excludePlugins entry carrying a "/" names ONE sub-plugin of a monorepo
-  // the group otherwise keeps (`bootstrap/plugins/orchestrate`). The repo mount
-  // is still created; an empty host directory is then bind-mounted read-only
-  // over just that sub-path, so every sub-plugin walker sees a directory with
-  // no manifest and skips it: Claude's `hasManifest`
-  // (container/agent-runner/src/providers/claude.ts:1751, applied at :1797 and
-  // :1814), Codex's `readCodexPluginEntryName`
-  // (container/agent-runner/src/codex-companion-setup.ts:582-583), and the
-  // OpenCode/portable skill mirror's `isDirectory(subSkillsDir)` check
-  // (container/agent-runner/src/plugin-skill-discovery.ts:291,311).
+  // Only a TOP-LEVEL entry is honoured here. An entry carrying a "/" names one
+  // sub-plugin of a monorepo the group otherwise keeps, and this path has no
+  // way to withhold it: the host cannot decide what a container's own walkers
+  // will find. Masking it by bind-mounting an empty directory over the sub-path
+  // was tried and removed, because it made the host predict container-side path
+  // resolution and the two namespaces do not have to agree — an absolute
+  // symlink inside the repo is absent to a host `statSync` and live once the
+  // repo is mounted, so the exclusion silently did not apply. Sub-path entries
+  // are validated and drive the always-on composer (`src/claude-md-compose.ts`),
+  // and container-side skill/plugin exclusion lands in a follow-up where each
+  // walker honours the list in its own namespace.
   //
   // Special case: if codex plugin is mounted and the host's ~/.codex dir
   // exists, mount that RW so the Codex CLI can use the host's OAuth
@@ -5109,17 +5061,10 @@ export async function buildMounts(
     // in-tree skill and (via CLAUDE_PLUGINS_ROOT auto-discovery) start a second
     // MCP server with a different allowed root. Host/OSS-only by design.
     const IN_TREE_SHADOWED_PLUGINS = ['design-artifact-loop', 'gitnexus'];
-    const split = splitExcludedPlugins(containerConfig.excludePlugins);
-    const excluded = new Set([...IN_TREE_SHADOWED_PLUGINS, ...split.topLevel]);
-    // Sub-plugin exclusions grouped by the repo they live in, so the mask
-    // mounts can be emitted right after that repo's own mount.
-    const maskedSubPaths = new Map<string, string[]>();
-    for (const subPath of split.subPaths) {
-      const repo = subPath.slice(0, subPath.indexOf('/'));
-      const list = maskedSubPaths.get(repo);
-      if (list) list.push(subPath);
-      else maskedSubPaths.set(repo, [subPath]);
-    }
+    const excluded = new Set([
+      ...IN_TREE_SHADOWED_PLUGINS,
+      ...splitExcludedPlugins(containerConfig.excludePlugins).topLevel,
+    ]);
     const pluginScopes = loadPluginScopes(); // client plugins mount only in their workgroups
     let entries: string[] = [];
     try {
@@ -5141,26 +5086,6 @@ export async function buildMounts(
         containerPath: `/workspace/plugins/${entry}`,
         readonly: true,
       });
-      for (const subPath of maskedSubPaths.get(entry) ?? []) {
-        // Only mask a sub-path that exists on the host. Docker cannot create a
-        // missing mountpoint inside an already-read-only bind, and a mask over
-        // a path no walker would have found changes nothing anyway.
-        const subHostPath = path.join(pluginsHostDir, subPath);
-        try {
-          if (!fs.statSync(subHostPath).isDirectory()) continue;
-        } catch {
-          log.warn('excludePlugins names a sub-plugin path that does not exist on the host; nothing to mask', {
-            group: agentGroup.id,
-            subPath,
-          });
-          continue;
-        }
-        mounts.push({
-          hostPath: emptyPluginMaskDir(),
-          containerPath: `/workspace/plugins/${subPath}`,
-          readonly: true,
-        });
-      }
     }
 
     // Host ~/.wix mount: opt-in via container.json `wixHostAuth: true`. RW
