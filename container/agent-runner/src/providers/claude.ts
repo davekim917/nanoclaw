@@ -2699,17 +2699,20 @@ export class ClaudeProvider implements AgentProvider {
     // Leave CLAUDE_CODE_SUBAGENT_MODEL unset: a concrete value outranks
     // per-invocation and frontmatter model selection, pinning every subagent
     // to the group model; subagents without an explicit model already inherit
-    // the main model. The family env vars below only resolve matching bare
-    // aliases (docs: code.claude.com/docs/en/sub-agents.md).
+    // the main model. The family env vars only resolve matching bare aliases
+    // (docs: code.claude.com/docs/en/sub-agents.md), and they arrive here from
+    // the spawn env (`claudeSpawnEnv`) carrying install-wide constants.
+    //
+    // This used to REWRITE the resolved model's own family alias to that model
+    // for the query — the last place the group's model still redefined a
+    // family word. It made the fix above true only at the docker boundary: a
+    // group pinned to a non-current opus (say `opus48`) had `opus` rewritten
+    // back to claude-opus-4-8[1m] here, so its `model: opus` subagents ran the
+    // group's pin rather than the install's Opus (PR #839 review r1 P2). The
+    // family words are install constants in every layer now; the model in
+    // force travels as the SDK's own `model` option, which is set from
+    // `model` directly and needs no alias.
     const perQueryEnv: Record<string, string | undefined> = { ...this.env };
-    if (model) {
-      // Guard: a bare alias here would create an alias→alias loop in the SDK.
-      if (!/^(opus|sonnet|haiku|default)$/i.test(model)) {
-        const family = /^claude-(opus|sonnet|haiku)-/i.exec(model)?.[1]?.toLowerCase();
-        const aliasEnvKey = family ? FAMILY_ALIAS_ENV[family] : undefined;
-        if (aliasEnvKey) perQueryEnv[aliasEnvKey] = model;
-      }
-    }
 
     // Which OAuth ring slot this query runs on. Rate-limit utilization is an
     // ACCOUNT property, and rotation means one container can burn through

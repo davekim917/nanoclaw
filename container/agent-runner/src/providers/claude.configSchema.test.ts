@@ -537,21 +537,30 @@ describe('live applySettings (-m/-e on an active query — same conversation, no
 });
 
 describe('subagent model env', () => {
-  it('test_claude_no_subagent_model_pin: perQueryEnv omits CLAUDE_CODE_SUBAGENT_MODEL and pins only the matching family alias', () => {
+  it('test_claude_no_subagent_model_pin: perQueryEnv omits CLAUDE_CODE_SUBAGENT_MODEL and rewrites no family alias', () => {
     // CLAUDE_CODE_SUBAGENT_MODEL outranks per-invocation and frontmatter model
     // selection — setting it would pin every subagent to the group model.
+    //
+    // Nor may the query rewrite the resolved model's OWN family alias, which
+    // it did until PR #839: a group running a non-current opus rewrote `opus`
+    // back to its own pin for the query, so `model: opus` subagents ran the
+    // group's model — the alias-means-the-group's-model defect one layer in.
+    // Every ANTHROPIC_DEFAULT_* value the query sends is whatever the spawn
+    // env holds (install constants), untouched.
     capturedSdkOptions = null;
     mockSdkQuery.mockClear();
 
-    const provider = makeClaudeProvider({});
-    provider.query({ prompt: 'hi', cwd: '/tmp', model: 'claude-sonnet-5' });
+    const provider = makeClaudeProvider({ env: { ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-5[1m]' } });
+    provider.query({ prompt: 'hi', cwd: '/tmp', model: 'claude-opus-4-8[1m]' });
 
     expect(mockSdkQuery).toHaveBeenCalledTimes(1);
     const env = capturedSdkOptions?.env as Record<string, string | undefined>;
     expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBeUndefined();
-    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-sonnet-5');
-    // Cross-family aliases stay untouched so explicit frontmatter choices resolve freely.
-    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBeUndefined();
+    // The group runs opus 4.8; the word `opus` still means the install's Opus.
+    expect(capturedSdkOptions?.model).toBe('claude-opus-4-8[1m]');
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5[1m]');
+    // And a family the spawn env did not carry is not invented here either.
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBeUndefined();
   });
 });
 
