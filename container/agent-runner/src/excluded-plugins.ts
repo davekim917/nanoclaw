@@ -37,10 +37,34 @@ let cached: ExcludedPlugins | null = null;
  * for tests and for `loadExcludedPlugins`; applies the SAME validator the host
  * applied before the spawn, so an entry the host accepted cannot be read
  * differently here.
+ *
+ * The ROOT is checked before the field is read, because JSON.parse succeeding
+ * is not the same as the document being a config. `[]`, `42`, `"oops"` and
+ * `null` all parse; reading `.excludePlugins` off them yields `undefined` (or
+ * throws, for `null`), and `undefined` means "nothing declared" here — which is
+ * the fail-open this module exists to prevent, arrived at through a shape check
+ * nobody wrote rather than through a read that failed. The shape that matters
+ * is an object wrapping the real config (`[{"excludePlugins": […]}]` is the
+ * reachable one): the operator's entries are RIGHT THERE in the file and every
+ * walker would register what they withheld. So a non-object, array or null root
+ * throws like any other unreadable config.
+ *
+ * The host's own `readContainerConfig` is deliberately laxer — it logs and
+ * falls back to an empty config for a malformed file, because it reads every
+ * field and a group whose model is unreadable should still boot. That asymmetry
+ * is the point: the laxer reader loses an exclusion silently, this one refuses.
+ * They cannot disagree about an entry, only about whether a broken file is
+ * survivable, and for this field it is not.
  */
 export function parseExcludedPlugins(raw: string): ExcludedPlugins {
-  const parsed = JSON.parse(raw) as { excludePlugins?: unknown };
-  return splitExcludedPlugins(validateExcludePlugins(parsed.excludePlugins));
+  const parsed: unknown = JSON.parse(raw);
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    const shape = parsed === null ? 'null' : Array.isArray(parsed) ? 'array' : typeof parsed;
+    throw new Error(
+      `container.json did not parse to a JSON object (got ${shape}) — refusing to read that as "nothing excluded"`,
+    );
+  }
+  return splitExcludedPlugins(validateExcludePlugins((parsed as { excludePlugins?: unknown }).excludePlugins));
 }
 
 /**

@@ -100,6 +100,10 @@ describe('copyOpenCodeSkills with a drop set', () => {
       fs.mkdirSync(path.join(source, name, 'references'), { recursive: true });
       fs.writeFileSync(path.join(source, name, 'SKILL.md'), name);
       fs.writeFileSync(path.join(source, name, 'references', 'notes.md'), name);
+      // The marker syncSkillSymlinks writes into every dir IT published. Its
+      // absence is the mirror's only record that a dir was placed by someone
+      // else, and the copy refuses to drop those.
+      fs.writeFileSync(path.join(source, name, '.nanoclaw-managed'), 'managed by nanoclaw plugin-skill-discovery\n');
     }
   });
 
@@ -123,5 +127,19 @@ describe('copyOpenCodeSkills with a drop set', () => {
   it('copies everything when the drop set is empty (the default)', () => {
     copyOpenCodeSkills(source, target);
     expect(fs.readdirSync(target).sort()).toEqual(['orchestrate', 'team-auto', 'wwbd']);
+  });
+
+  it('NEVER drops a dir the mirror writer did not publish, even when the name is in the drop set', () => {
+    // `syncSkillSymlinks` preserves a directory it did not create rather than
+    // overwriting it (src/plugin-skill-discovery.ts:522), so an
+    // operator-placed or natively-installed `<mirror>/<name>` survives every
+    // sync. The drop set names a SOURCE in ~/plugins; if an excluded plugin
+    // happens to publish the same name, dropping on the name alone would
+    // withdraw this content from the session — a guard refusing a legitimate
+    // state instead of the bad input.
+    fs.rmSync(path.join(source, 'orchestrate', '.nanoclaw-managed'));
+    copyOpenCodeSkills(source, target, new Set(['orchestrate']));
+    expect(fs.readdirSync(target).sort()).toEqual(['orchestrate', 'team-auto', 'wwbd']);
+    expect(fs.readFileSync(path.join(target, 'orchestrate', 'references', 'notes.md'), 'utf8')).toBe('orchestrate');
   });
 });

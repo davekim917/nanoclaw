@@ -90,4 +90,29 @@ describe('parseExcludedPlugins', () => {
     );
     expect([...split.subPaths]).toEqual(['bootstrap/plugins']);
   });
+
+  it('THROWS on a root that parses but is not an object — parsing is not the same as being a config', () => {
+    // Each of these is valid JSON, so JSON.parse never fails; reading
+    // `.excludePlugins` off them yields undefined, which means "nothing
+    // declared". That is the fail-open this module exists to prevent, reached
+    // through a shape nobody checked rather than through a failed read.
+    for (const raw of ['[]', '42', '"oops"', 'null', 'true']) {
+      expect(() => parseExcludedPlugins(raw)).toThrow(/did not parse to a JSON object/);
+    }
+  });
+
+  it('THROWS on an ARRAY root wrapping a real config — the reachable shape, with the entries right there', () => {
+    // `[{"excludePlugins": [...]}]` is the shape that actually loses an
+    // exclusion: the operator's entries are in the file, and reading the field
+    // off the array would answer "nothing excluded".
+    const raw = JSON.stringify([{ excludePlugins: ['bootstrap/plugins/orchestrate'] }]);
+    expect(() => parseExcludedPlugins(raw)).toThrow(/did not parse to a JSON object \(got array\)/);
+  });
+
+  it('still accepts an ordinary object root, with and without the field', () => {
+    expect(parseExcludedPlugins(JSON.stringify({ model: 'x' })).subPaths.size).toBe(0);
+    expect([...parseExcludedPlugins(JSON.stringify({ excludePlugins: ['bootstrap'] })).topLevel]).toEqual([
+      'bootstrap',
+    ]);
+  });
 });

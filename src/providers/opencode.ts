@@ -101,14 +101,18 @@ const DEFAULT_OPENCODE_EFFORT = 'high';
  * `container/agent-runner/src/codex-companion-setup.ts:826-828`), and OpenCode
  * auto-loads `~/.agents/skills`.
  *
- * KNOWN RESIDUAL, not closed here: this walk's population is not quite the
- * mirror's. `syncOpenCodePluginSkills` also denies workgroup-scoped plugins
- * (`scopedPluginNames`, `src/opencode-sync.ts:246`) and this one does not, so a
- * scoped plugin claiming the same skill name as an excluded sub-plugin, and
- * sorting ahead of it, would win here while the mirror published the excluded
- * source. Closing it means threading the mirror's deny set through this call,
- * which is a second reader of the scopes file on the spawn path; re-raise if a
- * scoped plugin ever ships a skill name that an unscoped one also ships.
+ * This names the source the CURRENT `~/plugins` tree would publish under each
+ * name, which is not in every case the source the mirror actually holds — the
+ * mirror is written by a different pass at a different time. `copyOpenCodeSkills`
+ * closes the direction that would withdraw content (it drops only a dir the
+ * mirror writer published, never an operator-placed one); the direction that
+ * would leak a STALE managed entry needs per-entry provenance at the writer and
+ * is recorded in #836, together with the third divergence: this walk does not
+ * deny workgroup-scoped plugins as `syncOpenCodePluginSkills` does
+ * (`scopedPluginNames`, `src/opencode-sync.ts:246`). Re-raise on any of the
+ * three — a scoped plugin sharing a skill name with an unscoped one, a mirror
+ * left stale across a plugin rename, or any further divergence between what
+ * this walk sees and what the mirror was built from.
  *
  * Returns an empty set for a group with no sub-path entry, which is every group
  * today: the copy below then behaves exactly as it did.
@@ -124,8 +128,39 @@ export function excludedOpenCodeSkillNames(pluginsRoot: string, excluded: Exclud
 }
 
 /**
+ * The marker `syncSkillSymlinks` drops inside every mirror dir IT created
+ * (`MIRROR_MARKER`, `src/plugin-skill-discovery.ts`). Its absence is how that
+ * writer itself distinguishes a directory it published from one an operator or
+ * a native installer placed — `isManagedMirror`, the same predicate that makes
+ * the sync pass SKIP a native dir rather than overwrite it
+ * (`src/plugin-skill-discovery.ts:522`), and makes the cleanup pass leave one
+ * alone rather than prune it (`:489`).
+ */
+const MIRROR_MARKER = '.nanoclaw-managed';
+
+/**
  * Copy a host-owned skill tree without mutating it or following stale links,
- * omitting any top-level skill dir in `dropNames`.
+ * omitting any top-level skill dir in `dropNames` — but only where that dir is
+ * one the mirror writer published.
+ *
+ * The drop set is derived from a walk of `~/plugins` and therefore names a
+ * SOURCE. A mirror entry, though, is not always the thing that walk found:
+ * `syncSkillSymlinks` preserves a directory it did not create, so an
+ * operator-placed or natively-installed `<mirror>/<name>` survives every sync
+ * untouched. Dropping on the name alone would withdraw that content from the
+ * session because an excluded plugin happens to publish the same name — the
+ * over-broad-guard failure this line of work has recorded three times: refusing
+ * a legitimate state instead of the bad input. So the drop is gated on the
+ * writer's own marker, which is the only provenance the mirror carries.
+ *
+ * What that gate does NOT establish is which SOURCE a managed dir came from —
+ * the marker is generic, and `SKILL.md` is copied rather than symlinked, so a
+ * managed dir need carry no link back to its plugin at all. A managed entry can
+ * therefore be stale relative to the current tree (its source renamed or
+ * deleted between syncs), and for that window the drop set and the mirror
+ * disagree. Closing that needs per-entry source provenance written by
+ * `syncSkillSymlinks` itself, which is a change to a mirror Codex shares:
+ * recorded in #836, not made here.
  */
 export function copyOpenCodeSkills(source: string, target: string, dropNames: ReadonlySet<string> = new Set()): void {
   fs.cpSync(source, target, {
@@ -136,7 +171,8 @@ export function copyOpenCodeSkills(source: string, target: string, dropNames: Re
       // `<mirror>/<skill-name>/...` — the first segment is the skill name the
       // mirror published, which is what the drop set holds. `''` is the root.
       const rel = path.relative(source, sourcePath);
-      if (rel && dropNames.has(rel.split(path.sep)[0])) return false;
+      const name = rel ? rel.split(path.sep)[0] : '';
+      if (name && dropNames.has(name) && fs.existsSync(path.join(source, name, MIRROR_MARKER))) return false;
       const stat = fs.lstatSync(sourcePath, { throwIfNoEntry: false });
       return stat !== undefined && (!stat.isSymbolicLink() || fs.existsSync(sourcePath));
     },
