@@ -12,16 +12,22 @@ Pins are data (no deploy); the defaults are code (needs one). **A group you want
 
 ## 1. Detect
 
-Which Claude groups are unpinned — those are the ones that move:
+Which Claude groups are unpinned — those are the ones that move.
+
+**Read `groups/<folder>/container.json`, not the DB projection.** The spawn path reads the file (`readContainerConfig`, `src/container-config.ts`), while `ncl groups config get` reports the `container_configs` row (`presentConfig`, `src/cli/resources/groups.ts:68-74`). The two are kept in sync by `ncl groups config update`, but an older DB-only update or a hand edit can leave them disagreeing — and then the projection says "pinned" while the next spawn reads an unpinned file and moves to Opus. Check both `model` and the legacy hand-authored `defaultModel`; either one pins.
 
 ```bash
-ncl groups list --json | jq -r '.data[] | [.id, .name] | @tsv' | while IFS=$'\t' read -r id name; do
-  cfg=$(ncl groups config get --id "$id" --json)
-  prov=$(jq -r '.data.provider // "claude"' <<<"$cfg")
-  model=$(jq -r '.data.model // "(unpinned)"' <<<"$cfg")
-  [ "$prov" = "claude" ] && printf '%s\t%s\t%s\n' "$id" "$name" "$model"
+ncl groups list --json | jq -r '.data[] | [.id, .name, .folder] | @tsv' |
+while IFS=$'\t' read -r id name folder; do
+  f="groups/$folder/container.json"
+  [ -f "$f" ] || { printf '%s\t%s\tMISSING %s\n' "$id" "$name" "$f"; continue; }
+  jq -r --arg id "$id" --arg name "$name" '
+    select((.provider // "claude") == "claude")
+    | [$id, $name, (.model // .defaultModel // "(unpinned)")] | @tsv' "$f"
 done
 ```
+
+Run it from the install root (the same directory `groups/` lives in). Where the projection and the file disagree, the file is what runs — and it is also what a drifted install should have corrected, with `ncl groups config update --model <id>`, which writes both.
 
 A per-channel wiring can also pin a model, and it outranks the group config; check any channel you care about:
 

@@ -65,6 +65,7 @@ Add a class here, in the same PR, only when none of these fits.
 - `reformatted artifact` — a repo-wide formatter, fixer or hook rewrites a GENERATED file after its generator wrote it, so the committed bytes stop being the render; every fingerprint, byte-identity or regeneration check on that file then fails, and the tempting repair is to loosen the check rather than take the artifact out of the formatter's scope
 - `unescaped interpolation` — a structured artifact (JSON, TOML, a command line) is built by pasting values into a template instead of through an encoder, so a value carrying the format's own metacharacters yields an unparsable artifact; the write succeeds and the failure surfaces in a later reader, in another process, as that reader's tolerant fallback
 - `undeclared default migration` — a change to a default lands with no `[BREAKING]` CHANGELOG entry and migration path, so the installs that never configured the thing — the only ones the change moves — get no warning and no pre-deploy pin
+- `projection read` — a check, script or migration step reads a derived copy (a DB projection, a cache, a mirrored config row) instead of the store the runtime actually reads, so any drift between them makes the check report the opposite of what will happen
 
 ## Lessons
 
