@@ -441,7 +441,7 @@ else
 fi
 
 # Restart every OTHER long-running service that holds this checkout's code
-# resident, BEFORE the handoff below (#824).
+# resident, BEFORE the handoff below (#822).
 #
 # This has to be here and not after the restart of nanoclaw-v2: that restart
 # kills this script (the host spawns it `detached: true`, which gives it its own
