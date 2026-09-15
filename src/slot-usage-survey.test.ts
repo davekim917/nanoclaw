@@ -10,6 +10,9 @@
  * with a counting fetch and asserts the count, against the count the old code
  * would have produced.
  */
+import fs from 'fs';
+import path from 'path';
+
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { log } from './log.js';
@@ -404,5 +407,69 @@ describe('ringSlotsForSurvey mirrors the ring the runner builds', () => {
         { index: 3, value: '' },
       ]),
     ).toEqual([{ name: 'CLAUDE_CODE_OAUTH_TOKEN', value: 'p' }]);
+  });
+});
+
+/**
+ * The host writes `NANOCLAW_SLOT_USAGE_SURVEY` and the agent-runner parses it,
+ * and the two live in different package trees that cannot import each other
+ * (Node/pnpm vs Bun). A fixture each side asserts against is the only thing
+ * that can catch one of them changing shape — #817's lesson, where a wire shape
+ * verified only against the code's own belief passed every test and failed in
+ * production. This half pins what the host PRODUCES; the matching half, which
+ * pins what the runner makes of it, is the fixture describe in
+ * `container/agent-runner/src/providers/claude-slot-pick.test.ts`.
+ *
+ * If you change the payload shape, both halves must be updated in the same PR
+ * or one of them goes red.
+ */
+describe('the host/runner survey wire shape', () => {
+  const fixturePath = path.join(
+    import.meta.dirname,
+    '..',
+    'container',
+    'agent-runner',
+    'src',
+    'providers',
+    'slot-usage-survey.fixture.json',
+  );
+
+  it('produces exactly the payload the runner-side fixture describes', async () => {
+    const fetchedAt = Date.parse('2026-09-15T06:00:00.000Z');
+    const now = () => fetchedAt;
+    const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+      const token = (init?.headers as Record<string, string>).Authorization.replace(/^Bearer /, '');
+      // slot 1: two real windows plus the non-window keys the endpoint returns.
+      if (token === 'tok-1') {
+        return jsonResponse({
+          five_hour: { utilization: 12, resets_at: '2026-09-15T10:00:00Z' },
+          seven_day: { utilization: 87, resets_at: '2026-09-22T00:00:00Z' },
+          limits: [],
+          extra_usage: { is_enabled: false },
+        });
+      }
+      // slot 3: a plan that reports no numeric window at all.
+      return jsonResponse({ limits: [] });
+    }) as unknown as typeof fetch;
+
+    await refreshSlotUsageSurvey(
+      'global',
+      [
+        { name: 'CLAUDE_CODE_OAUTH_TOKEN', value: 'tok-1' },
+        { name: 'CLAUDE_CODE_OAUTH_TOKEN_3', value: 'tok-3' },
+      ],
+      { fetchImpl, now },
+    );
+    const { survey } = slotUsageSurveyForSpawn(
+      'global',
+      [
+        { name: 'CLAUDE_CODE_OAUTH_TOKEN', value: 'tok-1' },
+        { name: 'CLAUDE_CODE_OAUTH_TOKEN_3', value: 'tok-3' },
+      ],
+      { fetchImpl, now },
+    );
+
+    const encoded = encodeSlotUsageSurvey(survey);
+    expect(JSON.parse(encoded)).toEqual(JSON.parse(fs.readFileSync(fixturePath, 'utf8')));
   });
 });

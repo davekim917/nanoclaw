@@ -7,6 +7,8 @@
  * `NANOCLAW_SLOT_USAGE_SURVEY` (see `src/slot-usage-survey.ts` and its test,
  * which is where request volume is pinned).
  */
+import { readFileSync } from 'node:fs';
+
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
 import { ClaudeProvider, usageResponseToSamples } from './claude.js';
@@ -407,5 +409,74 @@ describe('ClaudeProvider.pickCredentialSlotByUsage — ring integration', () => 
     const p = new ClaudeProvider({ env: RING });
     await expect(p.pickCredentialSlotByUsage({ now: NOW })).resolves.toBeUndefined();
     expect(getRateLimitSampleRows()).toHaveLength(0);
+  });
+});
+
+/**
+ * The other half of the host/runner wire contract. The host writes
+ * `NANOCLAW_SLOT_USAGE_SURVEY` from a different package tree that this one
+ * cannot import (Node/pnpm vs Bun), so a fixture both sides assert against is
+ * the only thing that catches one of them changing shape — #817's lesson,
+ * where a wire shape verified only against the code's own belief passed every
+ * test and failed in production.
+ *
+ * The producing half is the "the host/runner survey wire shape" describe in
+ * `src/slot-usage-survey.test.ts`, which asserts the host emits EXACTLY this
+ * file. Change the payload shape and both halves must move together.
+ */
+describe('the host/runner survey wire shape', () => {
+  const fixture = readFileSync(new URL('./slot-usage-survey.fixture.json', import.meta.url), 'utf8');
+  // The fixture is stamped 06:00:00Z; read it a minute later so age is not the
+  // thing under test here.
+  const now = Date.parse('2026-09-15T06:01:00.000Z');
+
+  it('turns the host’s payload into the usage_pull rows the pick ranks', () => {
+    const parsed = parseSlotUsageSurvey(fixture, { now });
+    expect(parsed.problem).toBeNull();
+    expect(parsed.staleSlots).toEqual([]);
+    expect(Object.keys(parsed.fresh).sort()).toEqual(['CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN_3']);
+
+    const rows = usageResponseToSamples(surveyEntryToUsageResponse(parsed.fresh.CLAUDE_CODE_OAUTH_TOKEN!), {
+      ...WHO,
+      account: 'CLAUDE_CODE_OAUTH_TOKEN',
+    });
+    expect(rows.map((r) => r.limitType).sort()).toEqual(['five_hour', 'seven_day']);
+    expect(rows.find((r) => r.limitType === 'seven_day')).toMatchObject({
+      source: 'usage_pull',
+      available: true,
+      utilization: 0.87,
+      resetsAt: '2026-09-22T00:00:00Z',
+    });
+    expect(rows.find((r) => r.limitType === 'five_hour')!.utilization).toBeCloseTo(0.12);
+
+    // A plan reporting no numeric window still records that the pull happened.
+    const none = usageResponseToSamples(surveyEntryToUsageResponse(parsed.fresh.CLAUDE_CODE_OAUTH_TOKEN_3!), {
+      ...WHO,
+      account: 'CLAUDE_CODE_OAUTH_TOKEN_3',
+    });
+    expect(none).toHaveLength(1);
+    expect(none[0]).toMatchObject({ available: true, limitType: null, status: 'no_window' });
+  });
+
+  it('ranks the fixture the way the pick must', () => {
+    const parsed = parseSlotUsageSurvey(fixture, { now });
+    const pick = pickSlotByUsage([
+      {
+        name: 'CLAUDE_CODE_OAUTH_TOKEN',
+        samples: usageResponseToSamples(surveyEntryToUsageResponse(parsed.fresh.CLAUDE_CODE_OAUTH_TOKEN!), {
+          ...WHO,
+          account: 'CLAUDE_CODE_OAUTH_TOKEN',
+        }),
+      },
+      {
+        name: 'CLAUDE_CODE_OAUTH_TOKEN_3',
+        samples: usageResponseToSamples(surveyEntryToUsageResponse(parsed.fresh.CLAUDE_CODE_OAUTH_TOKEN_3!), {
+          ...WHO,
+          account: 'CLAUDE_CODE_OAUTH_TOKEN_3',
+        }),
+      },
+    ]);
+    expect(pick.chosen).toBe('CLAUDE_CODE_OAUTH_TOKEN');
+    expect(pick.ranking[1]!.skipped).toBe('no_seven_day');
   });
 });
