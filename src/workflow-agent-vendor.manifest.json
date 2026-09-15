@@ -1,6 +1,8 @@
 {
   "files": {
-    "container/agents/worker-frontier.md": "9b3055bd0c94b0505c271d2c38ef3efc33eba565fbeb0ea09efb1bd2a2d4c6c3"
+    "container/agents/worker-frontier.md": "9b3055bd0c94b0505c271d2c38ef3efc33eba565fbeb0ea09efb1bd2a2d4c6c3",
+    "src/worker-policy.vendored.ts": "8af5f34144e09860140eb3c048dbe63bea513e8b1b87844f8124df3d24a7c3c8",
+    "container/agent-runner/src/worker-policy.vendored.ts": "8af5f34144e09860140eb3c048dbe63bea513e8b1b87844f8124df3d24a7c3c8"
   },
   "codexModel": "gpt-5.6-sol"
 }

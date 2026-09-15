@@ -14,9 +14,9 @@
  *   markdown body           → toml developer_instructions (multiline `"""…"""`)
  *
  * The native frontier worker pins its Codex model. Effort stays out of the
- * role file: [agents].default_subagent_reasoning_effort supplies high
- * (src/providers/codex.ts:79) and the native spawn reasoning_effort field can
- * override it per task.
+ * role file: [agents].default_subagent_reasoning_effort supplies it
+ * (src/providers/codex.ts) and the native spawn reasoning_effort field can
+ * override it per task. Both values come from the same vendored worker policy.
  * Specialized agents continue inheriting their parent model.
  *
  * Dropped (no Codex equivalent or runtime-specific):
@@ -28,6 +28,8 @@
  *   frontmatter.proactive   — Claude routing hint
  */
 
+import { WORKER_POLICY_CODEX_MODEL } from './worker-policy.vendored.js';
+
 const MANAGED_MARKER = '# managed by nanoclaw codex-sync';
 
 export interface ClaudeAgent {
@@ -36,9 +38,15 @@ export interface ClaudeAgent {
   body: string;
 }
 
-/** Only the native execution role has a provider-specific model mapping. */
+/**
+ * Only the native execution role has a provider-specific model mapping, and the
+ * model is not typed here: it is vendored from the bootstrap plugin's one worker
+ * policy file, which is also where the role def's model/effort come from.
+ * Retyping it here is exactly how the two halves forked before;
+ * src/workflow-agent-vendor.test.ts pins them together.
+ */
 export const CODEX_WORKER_MODELS: Record<string, string> = {
-  'worker-frontier': 'gpt-5.6-sol',
+  'worker-frontier': WORKER_POLICY_CODEX_MODEL,
 };
 
 /**

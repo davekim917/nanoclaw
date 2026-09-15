@@ -54,6 +54,8 @@ import {
   registerProviderContainerConfig,
   type ProviderContainerContribution,
 } from './providers/provider-container-registry.js';
+import { WORKER_POLICY_CODEX_EFFORT } from './worker-policy.vendored.js';
+
 import type { ContainerConfig } from './container-config.js';
 import type { AgentGroup, Session } from './types.js';
 
@@ -298,7 +300,13 @@ describe('container instruction contracts', async () => {
         `If it was reshaped, update this test to match — it is the only thing keeping it in sync with ` +
         `buildContainerCodexConfig() in src/providers/codex.ts. ${PARALLEL_IMPL_NOTE}`,
     ).not.toBeNull();
-    const containerBase = new Function(`return ${literal![1]}`)() as string;
+    // The literal is evaluated in a bare scope, so every free identifier it uses
+    // must be supplied here. Today that is the vendored worker policy — and both
+    // sides read the SAME constant, which is the point: the host and container
+    // configs cannot name different Codex subagent efforts.
+    const containerBase = new Function('WORKER_POLICY_CODEX_EFFORT', `return ${literal![1]}`)(
+      WORKER_POLICY_CODEX_EFFORT,
+    ) as string;
 
     // Comments differ by design (each names its own generating file); every
     // other line must match exactly, in order, in both directions.
