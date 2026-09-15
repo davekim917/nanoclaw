@@ -245,16 +245,28 @@ rest, which are ring-fallback probes. Note the ring is back to **6 slots** — a
 "`_5` removed 17:11Z → 5 accounts" note is superseded. |
 | #812 | 0.7 | **merged `e4dbcb006`**; **deploy #3 ok 01:30:17Z** (BUILD_INFO `e4dbcb006` dirty=false, preflight ok, runner snapshot `20260915T013019` carries `readCodexAccountRateLimits`; carries #814). **Live check done 02:50Z — HALF of 0.7 is dead in production.** Push path works: 382 rows since
 01:30Z, `source='rate_limit_event'`, `credential_set='codex:.codex'`, `limit_type='seven_day'`,
-util 0.01→0.04. Read path fails on EVERY bind: live container logs show
+util 0.01→0.04. Read path failed on EVERY bind: live container logs showed
 `account/rateLimits/read failed: Invalid request: invalid type: map, expected unit`, so the
-`usage_pull` write at `codex-rate-limit-tracker.ts:232` never runs (zero such rows fleet-wide).
+`usage_pull` write at `codex-rate-limit-tracker.ts:232` never ran (zero such rows fleet-wide).
 **Root cause — version skew:** 0.7 was written against the HOST schema (codex-cli 0.154.0, which
 defines `GetAccountRateLimitsParams` and marks `params` optional), but containers run codex-cli
 **0.153.4** (`container/Dockerfile:41`), where the method takes unit. Fixtured RPC tests could not
-catch it — the fixture mirrored the code's own request shape. Fix dispatched: omit params entirely
-(valid on both), plus a wire-shape regression test. See memory `codex-version-skew-host-vs-container`.
-Park decisions therefore currently rest only on whatever a push happens to carry — the bind-time
-snapshot that 0.7's park logic was designed around is absent. | … → r3 approve `a4e06320f` → PR was CONFLICTING with main so CI never ran (see memory `ci-silent-on-conflicting-pr`) → rebased twice (main moved with #813/#814) → `9df6bc432` → r4 rebase confirmation by a fresh Claude Opus reviewer (host Codex out of quota) → CI green → merged. |
+catch it — the fixture mirrored the code's own request shape. See memory
+`codex-version-skew-host-vs-container`.
+**RESOLVED — #817 (`e70fe9e5d`) is the fix**: omit `params` entirely (valid on both versions), with
+wire-shape regression tests asserting the raw stdin text carries no `params` member. **Read path is
+live**: first `usage_pull` row 2026-09-15T03:46:35Z (`limit_type='seven_day'`, utilization 0.08,
+`resets_at` 2026-09-22T01:30:07Z). Verified 04:14Z across the live containers: **no occurrence of
+`invalid type: map` after the fix deployed**. The read is bind-time only, so the single occurrence
+anywhere on the host is historical — one container booted 02:33:55Z, inside the window where #812
+was deployed and #817 was not, logged it once at 02:34:01Z and has logged nothing like it since
+while running continuously; it holds the pre-fix runner source from its boot snapshot and will until
+it respawns. The container that bound 03:46:29Z, after the fix, logged a successful
+`rateLimitsByLimitId` payload at 03:46:35.966Z — the same instant as that first `usage_pull` row.
+Park decisions rest on
+the bind-time snapshot again for every group that has respawned since the fix; groups still on a
+pre-fix container carry no pull row at all until their next bind, which is what
+`scripts/rate-limit-telemetry-health.ts` reports. | … → r3 approve `a4e06320f` → PR was CONFLICTING with main so CI never ran (see memory `ci-silent-on-conflicting-pr`) → rebased twice (main moved with #813/#814) → `9df6bc432` → r4 rebase confirmation by a fresh Claude Opus reviewer (host Codex out of quota) → CI green → merged. |
 | #815 | 5.1 | `a0a5f7542` receipted (r1 Astra approve at `0f99201c9`; r2 Claude rebase-confirm) — **will re-conflict on ratchet after #812**; owner rebasing again | OpenCode fleet default → `opencode-go/deepseek-v4.1-flash`. the operator opted in on OpenCode Go 01:10Z; live probe answers OK incl. `reasoningEffort: high`. No DB default (provider_models dropped in 039). OpenCode `worker-frontier` twin has no model pin → rides the fleet default (parked decision). Needs its own deploy after merge. |
 | #812-old | 0.7 | `a4e06320f` | park 95 → scope `review` → Astra r1 `needs-attention`: **[high] in-flight read overwrites a newer push** (`tracker.ts:169` vs `:193`), [medium] pushes bump `lastReadAt` and starve the full read (`:194`) → receipt `changes` → Fable worker 429'd with ~79 lines uncommitted → Codex (`codex-finish-812`) `4161e3a23` (F1/F2 were complete; CI red was a source-anchor regex in `codex.factory.test.ts` that 0.7's `turnEvents` binding had orphaned — retargeted, no assertion weakened; runner 1856/0, host 9052/0) → Astra r2 **[high] whole-read discard opens a sparse-update hole** (primary-only push mid-read blanks a fresh `secondary=96`) → `a4e06320f` per-field `fieldPushSeq` + shared `codexRateLimitSnapshotUpdatedKeys`, 2 repro tests, note class `over-broad guard` → Astra r3 `approve` (executed the repro; bind resets seq; no overflow path) → receipt 23:11Z |
 | #813 | 4.2 | **merged `09dec73e1`, deployed 00:47:44Z** (BUILD_INFO sha match, dirty=false, preflight ok). r3 approve `c2c6e9fad` → CI red: `provider-surfaces.test.ts` asserted the old Fable literal (verification had been touched-files-only) → `5d120ce5b` derives model/effort from the def, full host suite 9056/0, ratchet +8 accepted → r4 approve → merged. Post-deploy hand actions done 00:48Z: `~/.claude/agents/worker-frontier.md` re-copied (Opus/high); `pnpm exec tsx scripts/sync-codex-subagents.ts` (watcher missed the cp) → host + 18 group `.codex/agents/worker-frontier.toml` now `gpt-5.6-sol` / high — **21 modified files in `groups/` for the operator to commit**. |
