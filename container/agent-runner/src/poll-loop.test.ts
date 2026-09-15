@@ -20,6 +20,7 @@ import {
   dispatchResultText,
   applyChatBudget,
   applyFlagBatch,
+  buildProviderUnavailableReport,
   buildWorkContinuationPrompt,
   handleEvent,
   isAdmissibleTrigger,
@@ -2423,6 +2424,68 @@ describe('handleEvent — terminal-error visibility (Layer-1 fix)', () => {
     expect(out).toHaveLength(1);
     const body = JSON.parse(out[0].content) as { text: string };
     expect(body.text).toContain('Rate limit');
+  });
+
+  it('a quota error carrying a measured resetAt still surfaces when no fallback is declared', async () => {
+    // The Codex pre-turn park (providers/codex.ts parkedTurnEvents) arrives
+    // here with `resetAt`; with nothing to route to, the outage stays loud.
+    await handleEvent(
+      {
+        type: 'error',
+        message: 'Codex rate limit [seven_day] 92% used',
+        retryable: false,
+        classification: 'quota',
+        resetAt: '2026-09-17T00:00:00.000Z',
+      },
+      routingFixture(),
+    );
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].kind).toBe('chat');
+    expect(JSON.parse(out[0].content)).toMatchObject({ text: expect.stringContaining('92% used') });
+  });
+});
+
+describe('buildProviderUnavailableReport — the provider_unavailable row the host handler reads', () => {
+  it('carries a measured resetAt and a reason only when known, and never widens the base row otherwise', () => {
+    expect(buildProviderUnavailableReport('codex', true, 'usage limit reached', 'claude')).toEqual({
+      action: 'provider_unavailable',
+      provider: 'codex',
+      classification: 'quota',
+      message: 'usage limit reached',
+      fallbackProvider: 'claude',
+    });
+    expect(
+      buildProviderUnavailableReport('codex', true, 'Codex rate limit [seven_day] 92% used', 'claude', {
+        resetAt: '2026-09-17T00:00:00.000Z',
+        reason: null,
+      }),
+    ).toEqual({
+      action: 'provider_unavailable',
+      provider: 'codex',
+      classification: 'quota',
+      message: 'Codex rate limit [seven_day] 92% used',
+      fallbackProvider: 'claude',
+      resetAt: '2026-09-17T00:00:00.000Z',
+    });
+    expect(
+      buildProviderUnavailableReport('codex', false, 'codex_system_error: thread entered systemError state', 'claude', {
+        resetAt: null,
+        reason: 'system_error',
+      }),
+    ).toEqual({
+      action: 'provider_unavailable',
+      provider: 'codex',
+      classification: 'unavailable',
+      message: 'codex_system_error: thread entered systemError state',
+      fallbackProvider: 'claude',
+      reason: 'system_error',
+    });
+  });
+
+  it('truncates the message to the 500-char cap the host stores', () => {
+    const report = buildProviderUnavailableReport('codex', false, 'x'.repeat(900), 'claude');
+    expect((report.message as string).length).toBe(500);
   });
 });
 

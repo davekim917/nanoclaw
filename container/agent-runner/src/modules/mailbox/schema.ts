@@ -40,7 +40,11 @@ export const OUTBOUND_DB_PATH = '/workspace/outbound.db';
  * failure. NO ROW means we never sampled. Those are different states and the
  * table keeps them apart.
  *
- * Claude-only. Codex and OpenCode expose nothing equivalent, so a read
+ * Claude and Codex. Codex rows come from the app-server's
+ * `account/rateLimits/read` pull and `account/rateLimits/updated` push
+ * (providers/codex-rate-limits.ts); `account` is the ChatGPT account id and
+ * `credential_set` the CODEX_HOME slot (`codex:.codex`,
+ * `codex:.codex-fallback-N`). OpenCode exposes nothing equivalent, so a read
  * surface over this table must never imply fleet-wide coverage.
  *
  * TWO WAYS THESE ROWS ARE NOT COMPARABLE. Both have already fooled a reader.
@@ -235,7 +239,7 @@ export function ensureNanoclawOutboundSchema(outbound: Database): void {
     ['trigger', 'TEXT'],
     // rate_limit_*: added after the columns above (per-turn cost attribution
     // follow-up — persist the SDK's weekly-allowance utilization instead of
-    // discarding it). Claude-only; always NULL for the other two providers.
+    // discarding it). Claude and Codex; always NULL for OpenCode.
     ['rate_limit_type', 'TEXT'],
     ['rate_limit_utilization', 'REAL'],
     ['rate_limit_resets_at', 'TEXT'],

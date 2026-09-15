@@ -45,8 +45,22 @@ function clampCooldown(ms: number): number {
   return Math.min(MAX_COOLDOWN_MS, Math.max(MIN_COOLDOWN_MS, ms));
 }
 
-function cooldownMs(consecutiveFailures: number, resetAtMs: number | null, nowMs: number): number {
+function cooldownMs(
+  consecutiveFailures: number,
+  resetAtMs: number | null,
+  nowMs: number,
+  options: { honorResetAt?: boolean; maxCooldownMs?: number } = {},
+): number {
+  const cap = Math.min(MAX_COOLDOWN_MS, options.maxCooldownMs ?? MAX_COOLDOWN_MS);
   const backoff = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** Math.max(0, consecutiveFailures - 1));
+  // A MEASURED reset — the provider's own rate-limit snapshot reporting when
+  // the exhausted window rolls over (Codex `account/rateLimits/read`, plan
+  // item 0.7) — is the schedule, not an upper bound: nothing restores a
+  // usage window early, and re-probing it costs a spawn per backoff step
+  // that lands on the fallback anyway. Still clamped: never past the cap.
+  if (options.honorResetAt && resetAtMs !== null && Number.isFinite(resetAtMs)) {
+    return Math.min(cap, clampCooldown(resetAtMs - nowMs));
+  }
   // A provider's stated reset is an UPPER BOUND, never the schedule. Accounts
   // are often restored before the quoted time, and a window pinned to that
   // quote would keep a group on its fallback for days after the primary came
@@ -58,9 +72,9 @@ function cooldownMs(consecutiveFailures: number, resetAtMs: number | null, nowMs
   // container start and a turn that dies immediately, it is suppressed from
   // chat, and it reroutes to the fallback in the same breath.
   if (resetAtMs !== null && Number.isFinite(resetAtMs)) {
-    return clampCooldown(Math.min(resetAtMs - nowMs, backoff));
+    return Math.min(cap, clampCooldown(Math.min(resetAtMs - nowMs, backoff)));
   }
-  return clampCooldown(backoff);
+  return Math.min(cap, clampCooldown(backoff));
 }
 
 export async function getProviderHealth(
@@ -94,6 +108,10 @@ export async function isProviderUnavailable(
 /**
  * Record a provider as unavailable and return the window end.
  * `resetAt` is the provider's own stated recovery time when it gave one.
+ * `honorResetAt` says that time was MEASURED (a rate-limit snapshot), not
+ * parsed out of error prose, so the window ends exactly there instead of on
+ * the backoff schedule. `maxCooldownMs` bounds the window below the global
+ * cap — the coarse Codex systemError park uses it to stay within an hour.
  *
  * The read-then-upsert is one central transaction (`centralTransaction`,
  * plan §4.4), which is what keeps the failure streak from racing itself. The
@@ -103,7 +121,13 @@ export async function markProviderUnavailable(
   agentGroupId: string,
   provider: string,
   errorClass: ProviderErrorClass,
-  options: { nowMs?: number; resetAt?: string | null; message?: string | null } = {},
+  options: {
+    nowMs?: number;
+    resetAt?: string | null;
+    message?: string | null;
+    honorResetAt?: boolean;
+    maxCooldownMs?: number;
+  } = {},
 ): Promise<string> {
   if (!agentGroupId) throw new Error('agent group id is required');
   if (!provider) throw new Error('provider is required');
@@ -114,7 +138,11 @@ export async function markProviderUnavailable(
     const prior = await getProviderHealth(agentGroupId, provider);
     const consecutiveFailures = (prior?.consecutive_failures ?? 0) + 1;
     const unavailableUntil = new Date(
-      nowMs + cooldownMs(consecutiveFailures, Number.isFinite(resetAtMs as number) ? resetAtMs : null, nowMs),
+      nowMs +
+        cooldownMs(consecutiveFailures, Number.isFinite(resetAtMs as number) ? resetAtMs : null, nowMs, {
+          honorResetAt: options.honorResetAt,
+          maxCooldownMs: options.maxCooldownMs,
+        }),
     ).toISOString();
     await getDb().run(
       `INSERT INTO provider_health

@@ -21,6 +21,29 @@ function str(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
+/**
+ * Bound for the coarse Codex `systemError` park (plan item 0.7). That wedge
+ * carries no structured cause — it may be a spent account, a dead thread, or
+ * an app-server bug — so the group leaves Codex for at most an hour rather
+ * than riding the failure-streak backoff out to its 6h cap.
+ */
+export const SYSTEM_ERROR_PARK_MAX_MS = 60 * 60_000;
+
+/**
+ * A container-reported MEASURED reset (ISO), accepted only when it parses and
+ * lies in the future; anything else falls back to prose parsing / backoff,
+ * the safe direction. The container is trusted only about its own group's
+ * provider, and only to shorten or lengthen a window `markProviderUnavailable`
+ * still clamps.
+ */
+export function measuredResetAt(value: unknown, nowMs = Date.now()): string | null {
+  const raw = str(value);
+  if (!raw) return null;
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed) || parsed <= nowMs) return null;
+  return new Date(parsed).toISOString();
+}
+
 export async function handleProviderUnavailable(content: Record<string, unknown>, session: Session): Promise<void> {
   const reportedProvider = str(content.provider);
   if (!reportedProvider) {
@@ -49,8 +72,18 @@ export async function handleProviderUnavailable(content: Record<string, unknown>
   // meaningful); 'unavailable' is any other unrecovered provider failure,
   // which only earns a short backoff window.
   const errorClass = str(content.classification) === 'quota' ? 'quota' : 'unavailable';
+  // Read → park (Codex, plan item 0.7): the container's pre-turn rate-limit
+  // park arrives here as classification 'quota' with `resetAt` = the
+  // exhausted window's own reset (container/agent-runner/src/providers/
+  // codex.ts `parkedTurnEvents` → poll-loop.ts `reportProviderUnavailable`).
+  // A measured reset is honoured as the window end; a reset parsed out of
+  // error prose stays an upper bound on the backoff schedule.
+  const measured = errorClass === 'quota' ? measuredResetAt(content.resetAt) : null;
+  const systemError = str(content.reason) === 'system_error';
   const until = await markProviderUnavailable(agentGroup.id, reportedProvider.toLowerCase(), errorClass, {
-    resetAt: errorClass === 'quota' ? parseProviderResetAt(message) : null,
+    resetAt: measured ?? (errorClass === 'quota' ? parseProviderResetAt(message) : null),
+    honorResetAt: measured !== null,
+    maxCooldownMs: systemError ? SYSTEM_ERROR_PARK_MAX_MS : undefined,
     message,
   });
   log.warn('Provider recorded unavailable — sessions will spawn on the fallback', {
@@ -59,6 +92,8 @@ export async function handleProviderUnavailable(content: Record<string, unknown>
     provider: reportedProvider,
     fallbackProvider,
     unavailableUntil: until,
+    measuredResetAt: measured,
+    reason: str(content.reason) ?? null,
   });
 
   // Respawn only when the next spawn would actually land somewhere believed

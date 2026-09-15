@@ -581,11 +581,14 @@ describe('codex gen() self-heals on hard turn errors (Layer-2 fix)', () => {
   it('gen() returns on `retryable:false` so the app-server gets killed', () => {
     const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
 
-    // The runOneTurn for-await is the anchor. Slice from there to the
-    // matching outer finally (where killCodexAppServer fires) so the
+    // The for-await over `turnEvents` is the anchor (plan item 0.7's
+    // pre-turn park wraps runOneTurn's call behind that binding — parked
+    // turns iterate `parkedTurnEvents(...)` instead — so the loop, not the
+    // `runOneTurn(` call site, is the stable anchor). Slice from there to
+    // the matching outer finally (where killCodexAppServer fires) so the
     // assertion covers the whole inner-loop body regardless of how much
     // rotation logic lives between the iterator and the terminal return.
-    const runOneTurnIdx = src.search(/^\s+for await \(const ev of runOneTurn\(/m);
+    const runOneTurnIdx = src.search(/^\s+for await \(const ev of turnEvents\)/m);
     expect(runOneTurnIdx).toBeGreaterThan(-1);
     const finallyIdx = src.indexOf('} finally {', runOneTurnIdx);
     expect(finallyIdx).toBeGreaterThan(runOneTurnIdx);

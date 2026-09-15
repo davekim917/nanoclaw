@@ -66,8 +66,8 @@ export interface TurnUsageRow {
  * row per model but the same TurnMeta on each). `steps` coverage varies by
  * provider — see each provider's result-event construction — and is NULL
  * when the provider exposes nothing usable rather than a guessed count.
- * `rateLimit*` fields are Claude-only (see ProviderEvent's `result.rateLimit`
- * doc) — always NULL for the other two providers. `turnId` is generated once
+ * `rateLimit*` fields are set by Claude and Codex (see ProviderEvent's
+ * `result.rateLimit` doc) — always NULL for OpenCode. `turnId` is generated once
  * per `result` event (poll-loop.ts, outside the per-model recordTurnUsage
  * loop) so every row a multi-model turn produces shares it — the honest
  * denominator for "how many turns actually happened", since usage_daily's

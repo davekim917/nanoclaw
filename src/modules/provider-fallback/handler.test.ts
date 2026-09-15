@@ -24,7 +24,7 @@ const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-provider-
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
 import { getProviderHealth, isProviderUnavailable, markProviderUnavailable } from '../../db/provider-health.js';
 import type { Session } from '../../types.js';
-import { handleProviderUnavailable } from './handler.js';
+import { SYSTEM_ERROR_PARK_MAX_MS, handleProviderUnavailable, measuredResetAt } from './handler.js';
 
 const GID = 'ag-pf';
 const FOLDER = 'pf-group';
@@ -107,5 +107,87 @@ describe('provider_unavailable handler', () => {
     const row = await getProviderHealth(GID, 'codex');
     expect(row?.consecutive_failures).toBe(1);
     expect(await isProviderUnavailable(GID, 'codex')).toBe(true);
+  });
+
+  // Read → park (plan item 0.7): the container's pre-turn Codex rate-limit
+  // park arrives as a quota report carrying the window's own reset.
+  it('parks until a MEASURED resetAt exactly, and names the reading in last_error_message', async () => {
+    writeConfig({ provider: 'codex', providerFallback: { provider: 'claude' } });
+    const resetAt = new Date(Date.now() + 3 * 24 * 60 * 60_000).toISOString();
+    const message = `Codex rate limit reached (workspace_owner_usage_limit_reached) [seven_day] 100% used (resets ${resetAt})`;
+    await handleProviderUnavailable(
+      { action: 'provider_unavailable', provider: 'codex', classification: 'quota', message, resetAt },
+      session,
+    );
+    const row = await getProviderHealth(GID, 'codex');
+    expect(row?.unavailable_until).toBe(resetAt);
+    expect(row?.last_error_class).toBe('quota');
+    expect(row?.last_error_message).toBe(message);
+    expect(killed).toHaveLength(1);
+  });
+
+  it('ignores a past or malformed resetAt and falls back to prose parsing / backoff', async () => {
+    writeConfig({ provider: 'codex', providerFallback: { provider: 'claude' } });
+    await handleProviderUnavailable(
+      {
+        provider: 'codex',
+        classification: 'quota',
+        message: 'usage limit reached',
+        resetAt: '2001-01-01T00:00:00.000Z',
+      },
+      session,
+    );
+    const first = await getProviderHealth(GID, 'codex');
+    expect(Date.parse(first!.unavailable_until as string) - Date.now()).toBeLessThanOrEqual(15 * 60_000);
+    await handleProviderUnavailable(
+      { provider: 'codex', classification: 'quota', message: 'usage limit reached', resetAt: 'soon-ish' },
+      session,
+    );
+    const second = await getProviderHealth(GID, 'codex');
+    expect(Date.parse(second!.unavailable_until as string) - Date.now()).toBeLessThanOrEqual(30 * 60_000);
+  });
+
+  it('does not honour a measured resetAt on a non-quota report', async () => {
+    writeConfig({ provider: 'codex', providerFallback: { provider: 'claude' } });
+    const resetAt = new Date(Date.now() + 3 * 24 * 60 * 60_000).toISOString();
+    await handleProviderUnavailable(
+      { provider: 'codex', classification: 'unavailable', message: 'stream disconnected', resetAt },
+      session,
+    );
+    const row = await getProviderHealth(GID, 'codex');
+    expect(Date.parse(row!.unavailable_until as string) - Date.now()).toBeLessThanOrEqual(15 * 60_000);
+  });
+
+  it('bounds the coarse Codex systemError park at 60 minutes however long the streak', async () => {
+    writeConfig({ provider: 'codex', providerFallback: { provider: 'claude' } });
+    // Six prior unrecovered failures would put plain backoff at its 6h cap.
+    for (let i = 0; i < 5; i++) await markProviderUnavailable(GID, 'codex', 'unavailable', {});
+    await handleProviderUnavailable(
+      {
+        provider: 'codex',
+        classification: 'unavailable',
+        reason: 'system_error',
+        message: 'codex_system_error: thread entered systemError state',
+      },
+      session,
+    );
+    const row = await getProviderHealth(GID, 'codex');
+    expect(row?.consecutive_failures).toBe(6);
+    const windowMs = Date.parse(row!.unavailable_until as string) - Date.now();
+    expect(windowMs).toBeGreaterThan(SYSTEM_ERROR_PARK_MAX_MS - 60_000);
+    expect(windowMs).toBeLessThanOrEqual(SYSTEM_ERROR_PARK_MAX_MS);
+  });
+});
+
+describe('measuredResetAt', () => {
+  const now = Date.parse('2026-09-14T12:00:00.000Z');
+  it('accepts only a parseable future instant, normalized to ISO', () => {
+    expect(measuredResetAt('2026-09-17T00:00:00Z', now)).toBe('2026-09-17T00:00:00.000Z');
+    expect(measuredResetAt('2026-09-14T12:00:00.000Z', now)).toBeNull();
+    expect(measuredResetAt('2026-09-01T00:00:00.000Z', now)).toBeNull();
+    expect(measuredResetAt('not a date', now)).toBeNull();
+    expect(measuredResetAt(1789603200, now)).toBeNull();
+    expect(measuredResetAt(undefined, now)).toBeNull();
+    expect(measuredResetAt('', now)).toBeNull();
   });
 });

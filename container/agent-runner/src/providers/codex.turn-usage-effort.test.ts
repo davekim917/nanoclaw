@@ -70,6 +70,21 @@ lines.on('line', (line) => {
     send({ id: request.id, result: { userAgent: 'fake-codex' } });
     return;
   }
+  // Healthy account snapshot: the provider reads this at every app-server
+  // bind (codex-rate-limit-tracker.ts) and would wait out its deadline on a
+  // fake that stays silent.
+  if (request.method === 'account/rateLimits/read') {
+    send({
+      id: request.id,
+      result: {
+        rateLimits: {
+          primary: { usedPercent: 10, windowDurationMins: 300 },
+          secondary: { usedPercent: 20, windowDurationMins: 10080 },
+        },
+      },
+    });
+    return;
+  }
   if (request.method === 'thread/start' || request.method === 'thread/resume') {
     if (process.env.FAKE_CODEX_THREAD_PARAMS_FILE) {
       fs.writeFileSync(process.env.FAKE_CODEX_THREAD_PARAMS_FILE, JSON.stringify(request.params));

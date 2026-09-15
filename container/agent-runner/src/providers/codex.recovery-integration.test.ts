@@ -90,6 +90,21 @@ lines.on('line', (line) => {
     send({ id: request.id, result: { userAgent: 'fake-codex' } });
     return;
   }
+  // Healthy account snapshot: the provider reads this at every app-server
+  // bind (codex-rate-limit-tracker.ts) and would wait out its deadline on a
+  // fake that stays silent.
+  if (request.method === 'account/rateLimits/read') {
+    send({
+      id: request.id,
+      result: {
+        rateLimits: {
+          primary: { usedPercent: 10, windowDurationMins: 300 },
+          secondary: { usedPercent: 20, windowDurationMins: 10080 },
+        },
+      },
+    });
+    return;
+  }
   if (request.method === 'thread/start') {
     send({ id: request.id, result: { thread: { id: 'thread-1', status: { type: 'idle' } } } });
     return;
@@ -251,6 +266,21 @@ lines.on('line', (line) => {
   log({ method: request.method, params: request.params });
   if (request.method === 'initialize') {
     send({ id: request.id, result: { userAgent: 'fake-codex' } });
+    return;
+  }
+  // Healthy account snapshot: the provider reads this at every app-server
+  // bind (codex-rate-limit-tracker.ts) and would wait out its deadline on a
+  // fake that stays silent.
+  if (request.method === 'account/rateLimits/read') {
+    send({
+      id: request.id,
+      result: {
+        rateLimits: {
+          primary: { usedPercent: 10, windowDurationMins: 300 },
+          secondary: { usedPercent: 20, windowDurationMins: 10080 },
+        },
+      },
+    });
     return;
   }
   if (request.method === 'thread/start' || request.method === 'thread/resume') {
@@ -451,6 +481,21 @@ lines.on('line', (line) => {
   log({ method: request.method, params: request.params });
   if (request.method === 'initialize') {
     send({ id: request.id, result: { userAgent: 'fake-codex' } });
+    return;
+  }
+  // Healthy account snapshot: the provider reads this at every app-server
+  // bind (codex-rate-limit-tracker.ts) and would wait out its deadline on a
+  // fake that stays silent.
+  if (request.method === 'account/rateLimits/read') {
+    send({
+      id: request.id,
+      result: {
+        rateLimits: {
+          primary: { usedPercent: 10, windowDurationMins: 300 },
+          secondary: { usedPercent: 20, windowDurationMins: 10080 },
+        },
+      },
+    });
     return;
   }
   if (request.method === 'thread/resume') {
@@ -667,6 +712,21 @@ lines.on('line', (line) => {
   log({ method: request.method, params: request.params });
   if (request.method === 'initialize') {
     send({ id: request.id, result: { userAgent: 'fake-codex' } });
+    return;
+  }
+  // Healthy account snapshot: the provider reads this at every app-server
+  // bind (codex-rate-limit-tracker.ts) and would wait out its deadline on a
+  // fake that stays silent.
+  if (request.method === 'account/rateLimits/read') {
+    send({
+      id: request.id,
+      result: {
+        rateLimits: {
+          primary: { usedPercent: 10, windowDurationMins: 300 },
+          secondary: { usedPercent: 20, windowDurationMins: 10080 },
+        },
+      },
+    });
     return;
   }
   if (request.method === 'thread/start' || request.method === 'thread/resume') {
