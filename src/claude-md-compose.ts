@@ -31,13 +31,9 @@ import os from 'os';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
-import {
-  readContainerConfig,
-  splitExcludedPlugins,
-  validateMcpServers,
-  type McpServerConfig,
-} from './container-config.js';
+import { readContainerConfig, validateMcpServers, type McpServerConfig } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
+import { isExcludedPluginPath, splitExcludedPlugins } from './plugin-exclusions.js';
 import { flattenClaudeMd } from './agents-md-flatten.js';
 import { CODEX_PROJECT_DOC_CONFIGURED_MAX_BYTES, warnIfOversized } from './codex-project-doc-cap.js';
 import { readGroupPersona } from './group-persona.js';
@@ -229,19 +225,6 @@ function subPluginDirs(pluginsRoot: string, name: string): Array<{ subPath: stri
   return out;
 }
 
-/**
- * True when this sub-path, or any ancestor of it below the repo root, is
- * excluded — so excluding `bootstrap/plugins` also withholds the directive of
- * every sub-plugin under it, not only one named exactly.
- */
-function isExcludedSubPath(subPath: string, excludedSubPaths: ReadonlySet<string>): boolean {
-  const segments = subPath.split('/');
-  for (let i = 2; i <= segments.length; i++) {
-    if (excludedSubPaths.has(segments.slice(0, i).join('/'))) return true;
-  }
-  return false;
-}
-
 const COMPOSED_HEADER =
   '<!-- Composed at spawn - do not edit. Standing instructions: standing-instructions.md. Memory: memory/. -->';
 
@@ -377,9 +360,11 @@ export async function composeGroupClaudeMd(
   // reaches only its workgroups, matching the mount (src/plugin-scopes.ts);
   // with no spawn-resolved workgroup it reaches none. See docs/skills-model.md.
   if (provider !== 'claude') {
-    const { topLevel: excluded, subPaths: excludedSubPaths } = splitExcludedPlugins(
-      readContainerConfig(group.folder).excludePlugins,
-    );
+    // The same split, and below the same predicate, the three container
+    // walkers ask (`container/agent-runner/src/plugin-exclusions.ts` is a
+    // verbatim copy of the module this imports), so a directive and a
+    // registration can never disagree about one entry.
+    const excluded = splitExcludedPlugins(readContainerConfig(group.folder).excludePlugins);
     const pluginScopes = loadPluginScopes();
     const pluginsRoot = path.join(os.homedir(), 'plugins');
     let pluginDirs: string[] = [];
@@ -389,7 +374,8 @@ export async function composeGroupClaudeMd(
       /* no ~/plugins — nothing to inject */
     }
     for (const name of pluginDirs) {
-      if (excluded.has(name) || !pluginAllowedForWorkgroup(name, options.workgroupId, pluginScopes)) continue;
+      if (isExcludedPluginPath(name, excluded) || !pluginAllowedForWorkgroup(name, options.workgroupId, pluginScopes))
+        continue;
       const repoRoot = path.join(pluginsRoot, name);
       const override = readRulesetFile(repoRoot, NANOCLAW_ALWAYS_ON_MARKER, repoRoot);
       if (override) desired.set(`plugin-${name}.md`, override);
@@ -398,7 +384,7 @@ export async function composeGroupClaudeMd(
       // SessionStart hook — so the gate is provider equality, not `!== 'claude'`.
       if (provider !== 'opencode') continue;
       for (const { subPath, dir } of subPluginDirs(pluginsRoot, name)) {
-        if (isExcludedSubPath(subPath, excludedSubPaths)) continue;
+        if (isExcludedPluginPath(subPath, excluded)) continue;
         const content = readRulesetFile(dir, PLUGIN_ALWAYS_ON_FILE, repoRoot);
         if (!content) continue;
         // Keyed by the FULL sub-path, not its basename. A repo carrying the

@@ -83,7 +83,17 @@ A `~/plugins/<repo>` entry is not a NanoClaw skill — it's someone's plugin rep
 
 `~/plugins/<repo>/.nanoclaw-always-on.md` is a different thing: the **operator's override**, for a third-party plugin that ships no clean ruleset of its own. It is a NanoClaw-side convention, authored by `/enable-agent-plugins`, lives at the repo root, and is read for every non-Claude provider. Use it only where we don't control the plugin.
 
-Withholding either from one agent group is the same field, `excludePlugins` in `groups/<folder>/container.json` — a whole entry (`"bootstrap"`) or one sub-plugin path (`"bootstrap/plugins/orchestrate"`, `"<repo>/<sub>"`). **The two reach different distances.** A whole entry drops the mount, so the plugin is absent for every provider. A sub-plugin path withholds only that sub-plugin's standing directive from the composed prompt; the repo still mounts whole and its skills, manifest and hooks stay reachable. Masking the sub-path with an empty bind mount was tried and removed — it made the host predict what a container's own walkers would resolve, and an absolute symlink inside the repo is absent to a host `statSync` while live once the repo is mounted, so the exclusion silently did not apply. Container-side exclusion is a follow-up in which each walker honours the same list in its own namespace. See [workgroups.md](workgroups.md) for workgroup-scoped plugins, which are opt-in rather than opt-out.
+Withholding either from one agent group is the same field, `excludePlugins` in `groups/<folder>/container.json` — a whole entry (`"bootstrap"`) or one sub-plugin path (`"bootstrap/plugins/orchestrate"`, `"<repo>/<sub>"`). **The two reach different distances, and both now reach every provider.** A whole entry drops the mount, so the plugin is absent before the container starts. A sub-plugin path leaves the repo mounted whole — the FILES stay readable at `/workspace/plugins/<repo>/<sub>` — and is honoured by each walker that would have REGISTERED it, in the container, in its own namespace:
+
+| Walker | Effect of a sub-plugin entry |
+|---|---|
+| Claude `discoverPlugins` | the sub-plugin is not in the SDK `plugins:` list, so its SessionStart hook and its `nanoclaw-plugin.json` PreToolUse guards never load |
+| Codex `planCodexPluginRegistration` | no `codex plugin marketplace add` / `plugin add`, and no hook trust entry (trust is keyed off the same plan) |
+| Skill mirror `discoverPortableSkills` | the sub-plugin's skills are absent from `~/.agents/skills` (Codex's and OpenCode's discovery root) |
+| `composeGroupClaudeMd` (OpenCode) | its `always-on.md` is not inlined into the composed prompt |
+| OpenCode session XDG skill copy | the host's per-sibling mirror is copied minus the skills that sub-plugin contributed |
+
+Masking the sub-path host-side with an empty bind mount was tried and removed: it made the host predict what a container's own walkers would resolve, and an absolute symlink inside the repo is absent to a host `statSync` while live once the repo is mounted, so the exclusion silently did not apply. Every row above answers in the namespace where the path resolves, through one shared predicate (`src/plugin-exclusions.ts`, copied verbatim to `container/agent-runner/src/plugin-exclusions.ts`). An entry naming a sub-plugin this install does not carry is a no-op, logged at startup, not a spawn failure. See [workgroups.md](workgroups.md) for workgroup-scoped plugins, which are opt-in rather than opt-out.
 
 ## A test for every integration point
 

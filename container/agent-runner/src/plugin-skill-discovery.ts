@@ -34,6 +34,8 @@
 import fs from 'fs';
 import path from 'path';
 
+import { isExcludedPluginPath, splitExcludedPlugins, type ExcludedPlugins } from './plugin-exclusions.js';
+
 export interface DiscoveredSkill {
   /** Skill name (used as `~/.codex/skills/<name>/` link basename) */
   name: string;
@@ -210,6 +212,7 @@ function discoverInPlugin(
   denySubPluginSkillDirs: Set<string>,
   allowNonInvocable: boolean,
   runtime: AgentRuntime,
+  excluded: ExcludedPlugins,
 ): DiscoveredSkill[] {
   const skills = new Map<string, DiscoveredSkill>();
 
@@ -284,6 +287,8 @@ function discoverInPlugin(
   if (isDirectory(multiPluginDir)) {
     for (const sub of fs.readdirSync(multiPluginDir)) {
       const subDir = path.join(multiPluginDir, sub);
+      // Relative to the plugins root, assembled from this walk's own names.
+      if (isExcludedPluginPath(`${pluginName}/plugins/${sub}`, excluded)) continue;
       if (skipCodexNative(subDir)) continue;
       const subKey = `${pluginName}/plugins/${sub}/skills`;
       if (denySubPluginSkillDirs.has(subKey)) continue;
@@ -303,6 +308,7 @@ function discoverInPlugin(
   for (const sub of fs.readdirSync(pluginDir)) {
     if (RUNTIME_SPECIFIC_DIRS.has(sub)) continue;
     const subDir = path.join(pluginDir, sub);
+    if (isExcludedPluginPath(`${pluginName}/${sub}`, excluded)) continue;
     if (!isDirectory(subDir)) continue;
     if (!fs.existsSync(path.join(subDir, '.claude-plugin', 'plugin.json'))) continue;
     if (skipCodexNative(subDir)) continue;
@@ -329,6 +335,15 @@ export interface DiscoverOptions {
    * Defaults to 'codex' for back-compat with the original caller.
    */
   runtime?: AgentRuntime;
+  /**
+   * A group's `excludePlugins`, already split (`./plugin-exclusions.js`).
+   * Honoured for BOTH shapes: a top-level entry drops the repo, a sub-plugin
+   * path drops that sub-plugin's skills while the rest of the repo still
+   * mirrors. Defaults to "nothing excluded" — the host copy's callers
+   * (`src/opencode-sync.ts`, `scripts/enable-agent-plugin.ts`) build mirrors
+   * that are not scoped to one agent group and so have no list to apply.
+   */
+  excludePlugins?: ExcludedPlugins;
 }
 
 /**
@@ -347,9 +362,12 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
   // reference. Claude/Codex load those via their plugin loaders, so their mirrors stay lean.
   const allowNonInvocable = runtime === 'opencode';
 
+  const excluded = options.excludePlugins ?? splitExcludedPlugins(undefined);
+
   const allSkills = new Map<string, DiscoveredSkill>();
   for (const pluginName of fs.readdirSync(pluginsRoot)) {
     if (denyPlugins.has(pluginName)) continue;
+    if (isExcludedPluginPath(pluginName, excluded)) continue;
     if (RUNTIME_SPECIFIC_DIRS.has(pluginName)) continue;
     const pluginDir = path.join(pluginsRoot, pluginName);
     if (!isDirectory(pluginDir)) continue;
@@ -358,7 +376,14 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
     if (readPluginDenySiblings(pluginDir).has(runtime)) continue;
     // Skip deprecated subtree contents — they live at <plugin>/deprecated/ and
     // shouldn't appear as portable skills.
-    for (const skill of discoverInPlugin(pluginDir, pluginName, denySubPluginSkillDirs, allowNonInvocable, runtime)) {
+    for (const skill of discoverInPlugin(
+      pluginDir,
+      pluginName,
+      denySubPluginSkillDirs,
+      allowNonInvocable,
+      runtime,
+      excluded,
+    )) {
       if (denySkills.has(skill.name)) continue;
       if (skill.skillDir.includes('/deprecated/')) continue;
       // First-plugin-wins by name (alphabetical iteration); a later plugin

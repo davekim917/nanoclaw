@@ -24,6 +24,7 @@ import { validateContainerResources, type ContainerResources } from './container
 import { getAgentGroup } from './db/agent-groups.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import { log } from './log.js';
+import { validateExcludePlugins } from './plugin-exclusions.js';
 import { TOKEN_SHAPE_PATTERNS } from './secret-scrubber.js';
 import { isIanaTimezone } from './timezone.js';
 import type { AgentGroup, ContainerConfigRow } from './types.js';
@@ -650,128 +651,15 @@ export function validateAutoCompactWindow(value: unknown): number | undefined {
 }
 
 /**
- * One path segment of an `excludePlugins` entry: a real directory name, never
- * empty, `.` or `..`. Shape only, for every entry at every depth.
- *
- * Deliberately NOT a slug allowlist, and deliberately not a character rule.
- * `excludePlugins` had no validation at all before this field grew sub-paths,
- * and the entries it holds are directory basenames the operator did not choose:
- * `scripts/enable-agent-plugin.ts` accepts any direct child of `~/plugins`
- * (`resolvePluginDir` checks only that the path is a directory whose parent is
- * the plugins root) and writes that basename straight into this list
- * (`applyOptOut`). A clone named `foo+bar` or `c++-tools` is an ordinary
- * directory, so an allowlist of `[A-Za-z0-9._-]` would refuse a config that
- * worked before and take the whole group's spawn down with it —
- * `readContainerConfig` throws on every read — which is a fail-closed guard
- * refusing a legitimate state rather than a bad input.
- *
- * Earlier revisions of this PR also refused a backslash, a control character
- * and a colon in a sub-path entry, because a sub-path was interpolated into a
- * mask mount's container path and thence into `-v <host>:<container>:ro`. That
- * mask mechanism is gone (see the plugin-mount block in
- * `src/container-runner.ts`), so a sub-path entry is no longer interpolated
- * into anything: it is compared as a string and joined onto a host path whose
- * result is then `realpath`-contained (`src/claude-md-compose.ts`). Those rules
- * went with the mechanism that justified them rather than staying behind as
- * comments pointing at a code path the value no longer reaches — and backslash,
- * newline and DEL are all legal bytes in a Linux directory name, so refusing
- * them is the same accepted-set regression in a narrower place.
- *
- * What remains is what traversal actually needs: no empty segment, no `.` or
- * `..`, no absolute path, and the depth bound below. `/` cannot appear in a
- * segment at all — segments are the result of splitting on it.
- * `src/plugin-scopes.ts:44`'s narrower `PLUGIN_NAME_RE` governs an
- * operator-authored policy file and is left alone.
+ * `excludePlugins` validation and the covering relation live in
+ * `src/plugin-exclusions.ts`, the import-free file the container runs a
+ * verbatim copy of (`container/agent-runner/src/plugin-exclusions.ts`), so the
+ * host's reading of an entry and each in-container walker's are one
+ * implementation. Re-exported here because this module is where every host
+ * consumer already reaches for container.json's schema.
  */
-const PLUGIN_PATH_SEGMENT_RE = /^(?!\.\.?$).+$/su;
-
-/**
- * Deepest `excludePlugins` entry we accept, in path segments. Bounded by what
- * the three sub-plugin walkers actually descend to, so an entry can never name
- * a directory no walker would have looked at:
- *   - Claude: `<repo>/<sub>` and `<repo>/<sub>/<sub2>`
- *     (`container/agent-runner/src/providers/claude.ts:1790-1817`)
- *   - Codex: `<repo>/plugins/<sub>` and `<repo>/<sub>`
- *     (`findCodexSubPlugins`, `container/agent-runner/src/codex-companion-setup.ts:570`)
- *   - OpenCode skill mirror: `<repo>/plugins/<sub>/skills` and `<repo>/<sub>/skills`
- *     (`container/agent-runner/src/plugin-skill-discovery.ts:283,303`)
- * Three is the maximum any of them reaches.
- */
-const MAX_EXCLUDE_PLUGIN_DEPTH = 3;
-
-/**
- * Validate `excludePlugins`. Entries are either a top-level `~/plugins` folder
- * name (`bootstrap`) or a sub-plugin path relative to the plugins root
- * (`bootstrap/plugins/orchestrate`, `knowledge-work-plugins/data`).
- *
- * Fails closed and loudly: an entry that does not parse throws, naming the
- * entry, rather than being dropped. A silently-ignored exclusion is a
- * fail-open — the operator believes a plugin is withheld from a group while
- * the mount, the Codex registration and the always-on ruleset all still
- * deliver it.
- */
-export function validateExcludePlugins(value: unknown): string[] | undefined {
-  if (value === undefined) return undefined;
-  if (!Array.isArray(value)) throw new Error('excludePlugins must be an array of plugin names or sub-plugin paths');
-  for (const entry of value) {
-    const fail = (why: string): never => {
-      throw new Error(`excludePlugins entry ${JSON.stringify(entry)} ${why}`);
-    };
-    if (typeof entry !== 'string' || entry === '') fail('must be a non-empty string');
-    const name = entry as string;
-    if (name.startsWith('/')) fail('must be relative to ~/plugins, not an absolute path');
-    const segments = name.split('/');
-    if (segments.length > MAX_EXCLUDE_PLUGIN_DEPTH) {
-      fail(`is deeper than ${MAX_EXCLUDE_PLUGIN_DEPTH} path segments, which no sub-plugin walker descends to`);
-    }
-    for (const segment of segments) {
-      if (!PLUGIN_PATH_SEGMENT_RE.test(segment)) {
-        fail('must be <plugin> or <plugin>/<sub>[/<sub2>] with no empty, "." or ".." segments');
-      }
-    }
-  }
-  return value as string[];
-}
-
-/**
- * Split a validated `excludePlugins` list into the two shapes its consumers
- * need: whole `~/plugins` entries to drop, and sub-plugin paths to withhold
- * inside a repo that IS still delivered. Shared by the mount builder
- * (`src/container-runner.ts`) and the always-on composer
- * (`src/claude-md-compose.ts`) so the two can't disagree about what an entry means.
- *
- * `subPaths` holds only the entries no broader exclusion already covers. A
- * sub-path under an excluded ancestor says nothing the ancestor has not already
- * said, so the covering relation is resolved once, here, rather than at each
- * consumer — the always-on composer resolves ancestors when it walks discovered
- * sub-plugins, and a future consumer should not have to rediscover the rule.
- * Both ancestor shapes drop: a top-level entry (`bootstrap`, whose repo is
- * withheld whole) and a shallower sub-path (`bootstrap/plugins` over
- * `bootstrap/plugins/orchestrate`).
- */
-export function splitExcludedPlugins(entries: readonly string[] | undefined): {
-  topLevel: Set<string>;
-  subPaths: Set<string>;
-} {
-  const topLevel = new Set<string>();
-  const allSubPaths = new Set<string>();
-  for (const entry of entries ?? []) {
-    if (entry.includes('/')) allSubPaths.add(entry);
-    else topLevel.add(entry);
-  }
-  const subPaths = new Set<string>();
-  for (const subPath of allSubPaths) {
-    const segments = subPath.split('/');
-    // Strict ancestors only: the repo name (a top-level entry), then every
-    // shallower sub-path. `i < segments.length` stops before the entry itself.
-    let covered = topLevel.has(segments[0]);
-    for (let i = 2; !covered && i < segments.length; i++) {
-      covered = allSubPaths.has(segments.slice(0, i).join('/'));
-    }
-    if (!covered) subPaths.add(subPath);
-  }
-  return { topLevel, subPaths };
-}
+export { splitExcludedPlugins, validateExcludePlugins, isExcludedPluginPath } from './plugin-exclusions.js';
+export type { ExcludedPlugins } from './plugin-exclusions.js';
 
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {

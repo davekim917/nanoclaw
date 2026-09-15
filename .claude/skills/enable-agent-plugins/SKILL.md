@@ -40,7 +40,7 @@ Each provider reaches the plugin by its own path, all rooted at the `~/plugins` 
 | **Always-on directive, plugin's own** | plugin SessionStart hook (auto, via `CLAUDE_PLUGINS_ROOT`) | plugin SessionStart hook (Codex fires plugin hooks; a hook that injects context delivers it natively) | composed from the plugin's own `always-on.md` → `AGENTS.md` — the only provider with no hook path |
 | **Always-on ruleset, operator override** (e.g. impeccable) | not composed — hook only | `~/plugins/<n>/.nanoclaw-always-on.md` → `AGENTS.md`. Only for a plugin we do NOT control — never alongside the plugin's own `always-on.md`, or the directive lands twice | same |
 | **Opt-out** | `excludePlugins` (drops mount) | `excludePlugins` (drops mount) + skip the ruleset | `excludePlugins` skips the **ruleset only** — skills stay. The mirror is synced globally, not per group |
-| **Sub-plugin opt-out** | `excludePlugins: ["<n>/plugins/<sub>"]` — **no effect yet** (see below) | **no effect yet** | withholds that sub-plugin's `always-on.md` from the composed prompt; its skills and manifest stay |
+| **Sub-plugin opt-out** | `excludePlugins: ["<n>/plugins/<sub>"]` — dropped from the SDK `plugins:` list, so its skills, commands, SessionStart hook and guards do not load | not registered (`codex plugin add`), so no skills and no hook trust; skills mirror drops it too | its `always-on.md` is not composed, and its skills leave both the `~/.agents/skills` mirror and the session XDG copy |
 | **Workgroup scope** | `data/plugin-scopes.json`: mounts only in the listed workgroups | same, and the ruleset skips it elsewhere; the subagent mirror never copies it | the ruleset skips it elsewhere; the skill and subagent mirrors never copy it |
 
 So the only artifacts ever worth generating are: **(1)** the manifests a repo ships
@@ -201,7 +201,7 @@ next spawn, and the enabler run is just a verification pass.
    | Mechanism | Claude | Codex | OpenCode |
    |---|---|---|---|
    | `excludePlugins` (per group, via `--exclude`) | drops the mount | drops **both** | drops the ruleset, **keeps the skills** |
-   | `excludePlugins` with a sub-plugin path (per group, by hand) | nothing yet | nothing yet | skips its `always-on.md` only; skills, manifest and hooks stay |
+   | `excludePlugins` with a sub-plugin path (per group, by hand) | not registered as a plugin: no skills, no commands, no hook | not registered: no skills, no hook trust | no ruleset, no skills (both mirrors) |
    | `--deny <provider>` (per plugin, all groups) | only before a manifest exists | drops the skills, **keeps the ruleset** | drops the skills, **keeps the ruleset** |
    | remove from `~/plugins` | effective | effective | **does not remove already-synced skills** |
 
@@ -211,17 +211,25 @@ next spawn, and the enabler run is just a verification pass.
    walkers descend are accepted: `<repo>/plugins/<sub>` and `<repo>/<sub>`, and a
    malformed entry throws rather than being silently ignored.
 
-   **What it does today is narrower than the name suggests, so state it plainly when
-   you use it.** A sub-path entry withholds that sub-plugin's standing directive from
-   the composed prompt (`src/claude-md-compose.ts`) and nothing else: the repo mounts
-   whole, and the sub-plugin's skills, manifest and hooks are all still reachable in
-   the container. Masking the sub-path with an empty bind mount was tried and removed —
-   it required the HOST to predict what a container's own walkers would resolve, and an
-   absolute symlink inside the repo is absent to a host `statSync` while live once the
-   repo is mounted, so the exclusion silently did not apply. Container-side exclusion
-   lands in a follow-up, where each of the three walkers honours this same list in its
-   own namespace. Until then, use a TOP-LEVEL entry when you need the plugin actually
-   withheld.
+   **What it does and what it does NOT do, so state it plainly when you use it.** The
+   repo still mounts whole, so the sub-plugin's FILES stay readable at
+   `/workspace/plugins/<repo>/<sub>` — an agent that goes looking can read them. What
+   the entry withholds is REGISTRATION, and it is withheld in the container, by each
+   walker, in its own namespace (`container/agent-runner/src/plugin-exclusions.ts`, a
+   verbatim copy of `src/plugin-exclusions.ts`): the Claude SDK plugin list (`plugins:`,
+   which carries the SessionStart hook and any PreToolUse guard), the Codex registration
+   plan (and, keyed off it, hook trust), the `~/.agents/skills` mirror both Codex and
+   OpenCode read, and — host-side, filtered per group at spawn — the OpenCode session
+   XDG skill copy. The always-on composer skips the sub-plugin's `always-on.md` as
+   before.
+
+   Masking the sub-path with an empty bind mount was tried and removed — it required the
+   HOST to predict what a container's own walkers would resolve, and an absolute symlink
+   inside the repo is absent to a host `statSync` while live once the repo is mounted, so
+   the exclusion silently did not apply. Nothing here predicts: each walker asks about a
+   path it assembled itself. An entry naming a sub-plugin this install does not carry is
+   an inert no-op, logged once at container startup — not a spawn failure. Use a
+   TOP-LEVEL entry when you want the bytes gone from the mount as well.
 
    `excludePlugins` is the only per-group opt-out, and it is not uniform. (A plugin that
    carries one workgroup's content belongs in `data/plugin-scopes.json` instead: opt-in,

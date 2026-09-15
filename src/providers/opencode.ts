@@ -21,6 +21,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { readContainerConfig } from '../container-config.js';
 import { getContainerConfig } from '../db/container-configs.js';
 import {
   assertRealDirectory,
@@ -29,6 +30,8 @@ import {
   replaceUntrustedFile,
 } from '../fs-safety.js';
 import { assertValidGroupFolder } from '../group-folder.js';
+import { splitExcludedPlugins, type ExcludedPlugins } from '../plugin-exclusions.js';
+import { discoverPortableSkills } from '../plugin-skill-discovery.js';
 import { registerProviderContainerConfig } from './provider-container-registry.js';
 
 // Code-level opencode defaults — the floor under the per-group DB value
@@ -47,13 +50,64 @@ const DEFAULT_OPENCODE_MODEL = 'opencode-go/deepseek-v4.1-flash';
 const DEFAULT_OPENCODE_PROVIDER = 'opencode-go';
 const DEFAULT_OPENCODE_EFFORT = 'high';
 
-/** Copy a host-owned skill tree without mutating it or following stale links. */
-export function copyOpenCodeSkills(source: string, target: string): void {
+/**
+ * Skill names this group's `excludePlugins` SUB-PATH entries withhold from the
+ * host-side OpenCode mirror.
+ *
+ * OpenCode receives skills by TWO paths, and the container-side one is not
+ * enough on its own: the in-container mirror at `~/.agents/skills`
+ * (`syncAgentSkillsMirror`, which honours `excludePlugins` in the container)
+ * AND this copy of the host's per-sibling mirror into the session XDG. The host
+ * mirror is built once for every sibling of a provider, with no agent group in
+ * hand (`syncOpenCodePluginSkills`, `src/opencode-sync.ts`), so an excluded
+ * sub-plugin's skills sit in it and would reach the group anyway — a sub-plugin
+ * exclusion would be half-applied on exactly one provider.
+ *
+ * SUB-PATHS ONLY, deliberately. A TOP-LEVEL entry's skills also survive in this
+ * mirror today, and that is a pre-existing, documented behaviour
+ * (`.claude/skills/enable-agent-plugins/SKILL.md`: "drops the ruleset, keeps the
+ * skills") that live groups are configured against — every OpenCode group on
+ * this install carries top-level entries. Widening this filter to cover them
+ * would silently withdraw skills those groups have today, which is a fleet
+ * change, not this one's. The top-level gap stays as it was.
+ *
+ * Deriving the drop set by DIFFERENCE — discover twice over the host's own
+ * `~/plugins`, once with the list and once without — rather than by mapping
+ * mirror entries back to plugin paths, keeps three properties that matter:
+ * the same predicate decides here as in the container, first-plugin-wins name
+ * dedup is respected (a name another plugin also provides is NOT dropped), and
+ * nothing resolves a path across a mount namespace.
+ *
+ * Returns an empty set for a group with no sub-path entry, which is every group
+ * today: the copy below then behaves exactly as it did.
+ */
+export function excludedOpenCodeSkillNames(pluginsRoot: string, excluded: ExcludedPlugins): Set<string> {
+  if (excluded.subPaths.size === 0) return new Set();
+  const subPathsOnly: ExcludedPlugins = { topLevel: new Set(), subPaths: excluded.subPaths };
+  const kept = new Set(
+    discoverPortableSkills(pluginsRoot, { runtime: 'opencode', excludePlugins: subPathsOnly }).map((s) => s.name),
+  );
+  const dropped = new Set<string>();
+  for (const skill of discoverPortableSkills(pluginsRoot, { runtime: 'opencode' })) {
+    if (!kept.has(skill.name)) dropped.add(skill.name);
+  }
+  return dropped;
+}
+
+/**
+ * Copy a host-owned skill tree without mutating it or following stale links,
+ * omitting any top-level skill dir in `dropNames`.
+ */
+export function copyOpenCodeSkills(source: string, target: string, dropNames: ReadonlySet<string> = new Set()): void {
   fs.cpSync(source, target, {
     recursive: true,
     dereference: true,
     force: true,
     filter: (sourcePath) => {
+      // `<mirror>/<skill-name>/...` — the first segment is the skill name the
+      // mirror published, which is what the drop set holds. `''` is the root.
+      const rel = path.relative(source, sourcePath);
+      if (rel && dropNames.has(rel.split(path.sep)[0])) return false;
       const stat = fs.lstatSync(sourcePath, { throwIfNoEntry: false });
       return stat !== undefined && (!stat.isSymbolicLink() || fs.existsSync(sourcePath));
     },
@@ -207,7 +261,15 @@ registerProviderContainerConfig('opencode', async (ctx) => {
     // A stale mirror link must not wedge the spawn, but this source is
     // host-owned authority. Filter the derived copy; never prune the source.
     const targetSkillsDir = replaceUntrustedDirectory(opencodeSubdir, 'skill');
-    copyOpenCodeSkills(hostSkillsDir, targetSkillsDir);
+    // The group's own exclusions, read from the file that is authoritative for
+    // them (`groups/<folder>/container.json`, the same file the container reads
+    // through its read-only mount). The mirror is shared across siblings; the
+    // filter is per group.
+    const dropNames = excludedOpenCodeSkillNames(
+      path.join(hostHome, 'plugins'),
+      splitExcludedPlugins(readContainerConfig(path.basename(ctx.groupDir)).excludePlugins),
+    );
+    copyOpenCodeSkills(hostSkillsDir, targetSkillsDir, dropNames);
   }
 
   // Model + effort resolution mirrors the claude/codex template: a code-level
