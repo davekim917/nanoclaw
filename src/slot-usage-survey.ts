@@ -45,6 +45,8 @@
  * whose message quotes the whole `Authorization: Bearer <token>` header
  * (PR #811 review F1, `docs/review-notes/811.md`).
  */
+import { createHash } from 'crypto';
+
 import { log } from './log.js';
 
 /** One rate-limit window as the endpoint reports it: `utilization` is 0-100. */
@@ -141,6 +143,16 @@ export const SLOT_USAGE_429_DEFAULT_BACKOFF_MS = 30 * 60_000;
 export const SLOT_USAGE_429_MAX_BACKOFF_MS = 2 * 60 * 60_000;
 
 interface SlotState {
+  /**
+   * Which CREDENTIAL this state describes — see `credentialFingerprint`. A slot
+   * NAME is not an identity: the spawn path re-reads `.env` on every spawn
+   * (`src/container-runner.ts`, the `readEnvFileMatching` argument to
+   * `resolveAnthropicAuth`, added so per-group token edits take effect on the
+   * next respawn rather than the next host restart), so the token behind
+   * `CLAUDE_CODE_OAUTH_TOKEN_2` can become a different Anthropic account
+   * between two spawns with nothing else changing.
+   */
+  fingerprint: string;
   /** Epoch ms of the last ATTEMPT (success or failure). */
   lastAttemptAt: number;
   /** Epoch ms before which no attempt may be made at all (429 backoff). */
@@ -158,12 +170,35 @@ interface SlotState {
  * JSON rather than a `<set><sep><name>` string so there is no separator that
  * could appear inside either half and collide two different slots onto one
  * throttle.
+ *
+ * One entry per slot, carrying the fingerprint of the credential it describes.
+ * Keying on the fingerprint instead would grow an entry per token ever seen and
+ * would keep a replaced account's park alive for a slot nothing uses any more.
  */
 const slotStates = new Map<string, SlotState>();
 const inFlight = new Map<string, Promise<void>>();
 
 function stateKey(credentialSet: string, slotName: string): string {
   return JSON.stringify([credentialSet, slotName]);
+}
+
+/**
+ * A stable, non-reversible handle for one token value.
+ *
+ * NEVER the token itself — not as a map key, not in a log line, not in the
+ * payload handed to a container. A sha256 prefix is enough to answer the only
+ * question asked of it ("is this the same credential the reading came from?"),
+ * and 64 bits of a hash over a high-entropy secret collides with nothing.
+ *
+ * Why this exists: a cached reading that outlives its credential is worse than
+ * no reading. The pick would rank a fresh account on the replaced account's
+ * utilization, and `recordRateLimitSamples` would file the OLD account's
+ * numbers under the new one — poisoning the very telemetry quota-burn reads.
+ * The 45-minute age guard cannot see that, because the reading is young; only
+ * identity can. (PR #821 review r1.)
+ */
+export function credentialFingerprint(token: string): string {
+  return createHash('sha256').update(token, 'utf8').digest('hex').slice(0, 16);
 }
 
 /** The error's class name only (`TypeError`, `AbortError`, …) — never its message. */
@@ -292,6 +327,15 @@ export interface SlotUsageSurveyDeps {
  * Never rejects. Never throws. A slot that fails keeps its previous reading
  * (the consumer ages it out) and is retried after the ordinary interval; a
  * slot that is 429'd is parked for the window the server named.
+ *
+ * A slot whose CREDENTIAL has changed since the last pass starts over: the
+ * reading, the interval and the 429 park all belong to the account that earned
+ * them. Inheriting them would make a freshly-installed account serve the old
+ * one's utilization and sit out the old one's penalty, and the rate limit is
+ * per identity (see the header), so a new identity genuinely has its own
+ * budget. The reset is bounded by how often an operator edits `.env`, which is
+ * human-scale — not by the spawn rate this whole module exists to decouple
+ * from.
  */
 export async function refreshSlotUsageSurvey(
   credentialSet: string,
@@ -302,8 +346,11 @@ export async function refreshSlotUsageSurvey(
   const timeoutMs = deps.timeoutMs ?? SLOT_USAGE_PULL_TIMEOUT_MS;
   for (const slot of slots) {
     const key = stateKey(credentialSet, slot.name);
+    const fingerprint = credentialFingerprint(slot.value);
     const at = now();
-    const state = slotStates.get(key) ?? { lastAttemptAt: 0, blockedUntil: 0 };
+    const existing = slotStates.get(key);
+    const state: SlotState =
+      existing && existing.fingerprint === fingerprint ? existing : { fingerprint, lastAttemptAt: 0, blockedUntil: 0 };
     if (at < state.blockedUntil) continue;
     if (at - state.lastAttemptAt < SLOT_USAGE_SURVEY_MIN_INTERVAL_MS) continue;
     // Advance BEFORE awaiting, so a slow pull cannot let a second one stack up
@@ -312,9 +359,21 @@ export async function refreshSlotUsageSurvey(
     slotStates.set(key, state);
     try {
       const rateLimits = await fetchSlotUsage(slot.value, { fetchImpl: deps.fetchImpl, timeoutMs, now });
+      // The result belongs to the credential it was fetched WITH, which is the
+      // one `state.fingerprint` names — so publishing it here can never attach
+      // A's numbers to B's slot even if `.env` was swapped mid-flight: a reader
+      // holding B's token compares fingerprints and sees nothing. What must not
+      // happen is this pass writing back over a state some LATER pass already
+      // replaced, which is the check-then-act shape #812 recorded. So write only
+      // while we are still the state this key holds.
+      if (slotStates.get(key) !== state) continue;
       state.entry = { fetchedAt: new Date(now()).toISOString(), rateLimits };
       state.blockedUntil = 0;
     } catch (err) {
+      // Same rule as the success path: a park earned by THIS credential must
+      // not be written back over a state a later pass installed for a different
+      // one, or a replaced account's penalty would land on its successor.
+      if (slotStates.get(key) !== state) continue;
       if (err instanceof SlotUsageRateLimited) {
         const backoff =
           err.retryAfterMs === null
@@ -355,8 +414,15 @@ export function slotUsageSurveyForSpawn(
 ): { survey: SlotUsageSurvey; refreshed: Promise<void> } {
   const survey: SlotUsageSurvey = {};
   for (const slot of slots) {
-    const entry = slotStates.get(stateKey(credentialSet, slot.name))?.entry;
-    if (entry) survey[slot.name] = entry;
+    const state = slotStates.get(stateKey(credentialSet, slot.name));
+    // A reading is evidence about a CREDENTIAL, not about a slot name. The
+    // caller has just re-resolved this slot's token from `.env`, so if the
+    // fingerprints differ the account behind the name was replaced and the
+    // reading describes somebody else: absent, not stale-but-usable. Handing it
+    // over would rank the new account on the old one's utilization and file the
+    // old one's numbers against the new one's slot. (PR #821 review r1.)
+    if (!state || state.fingerprint !== credentialFingerprint(slot.value)) continue;
+    if (state.entry) survey[slot.name] = state.entry;
   }
 
   // One refresh per credential set at a time. Without this a burst of spawns

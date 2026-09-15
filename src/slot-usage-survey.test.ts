@@ -21,6 +21,7 @@ import {
   SLOT_USAGE_429_MAX_BACKOFF_MS,
   SLOT_USAGE_SURVEY_MIN_INTERVAL_MS,
   _resetSlotUsageSurveyForTesting,
+  credentialFingerprint,
   encodeSlotUsageSurvey,
   fetchSlotUsage,
   parseRetryAfterMs,
@@ -471,5 +472,159 @@ describe('the host/runner survey wire shape', () => {
 
     const encoded = encodeSlotUsageSurvey(survey);
     expect(JSON.parse(encoded)).toEqual(JSON.parse(fs.readFileSync(fixturePath, 'utf8')));
+  });
+});
+
+/**
+ * A cached reading is evidence about a CREDENTIAL. The spawn path re-reads
+ * `.env` every spawn so an operator's slot edit takes effect on the next
+ * respawn (`src/container-runner.ts`, the `readEnvFileMatching` argument to
+ * `resolveAnthropicAuth`), which means the account behind a slot NAME can
+ * change with nothing else changing. A reading that outlives its credential is
+ * worse than no reading: it ranks the new account on the old one's numbers and
+ * files the old one's utilization against the new one's slot. PR #821 review r1.
+ */
+describe('a reading does not outlive the credential it describes', () => {
+  const SLOT = 'CLAUDE_CODE_OAUTH_TOKEN_2';
+  const OTHER = 'CLAUDE_CODE_OAUTH_TOKEN';
+
+  it('the exact reported sequence: cache A at 90%, swap in exhausted B, next spawn must not pick B on A’s number', async () => {
+    let clock = Date.parse('2026-09-15T05:00:00.000Z');
+    const now = () => clock;
+    // `_1` sits at 40%; `_2` holds account A at 90%.
+    const { fetchImpl, calls } = countingFetch((token) => {
+      if (token === 'tok-1') return jsonResponse(okBody(40));
+      if (token === 'account-A') return jsonResponse(okBody(90));
+      return jsonResponse(okBody(99)); // account B, effectively exhausted
+    });
+
+    const before = [
+      { name: OTHER, value: 'tok-1' },
+      { name: SLOT, value: 'account-A' },
+    ];
+    await slotUsageSurveyForSpawn('global', before, { fetchImpl, now }).refreshed;
+    expect(
+      slotUsageSurveyForSpawn('global', before, { fetchImpl, now }).survey[SLOT]!.rateLimits.seven_day!.utilization,
+    ).toBe(90);
+
+    // A minute later the operator replaces `_2`'s token with account B. The
+    // reading is a minute old — the age guard cannot see anything wrong.
+    clock += 60_000;
+    const after = [
+      { name: OTHER, value: 'tok-1' },
+      { name: SLOT, value: 'account-B' },
+    ];
+    const { survey } = slotUsageSurveyForSpawn('global', after, { fetchImpl, now });
+
+    // The consequence that matters: nothing is handed over for that slot, so
+    // the pick cannot rank B on A's 90% (and cannot record A's number as B's).
+    expect(survey[SLOT]).toBeUndefined();
+    expect(Object.keys(survey)).toEqual([OTHER]);
+    expect(survey[OTHER]!.rateLimits.seven_day!.utilization).toBe(40);
+    // And the entry we did hand over is the one whose credential is unchanged.
+    expect(calls).toEqual(['tok-1', 'account-A']);
+  });
+
+  it('gives the replacement a clean slate: the old account’s interval does not silence the new one', async () => {
+    let clock = Date.parse('2026-09-15T05:00:00.000Z');
+    const now = () => clock;
+    const { fetchImpl, calls } = countingFetch(() => jsonResponse(okBody(50)));
+    const slots = (value: string) => [{ name: SLOT, value }];
+
+    await refreshSlotUsageSurvey('global', slots('account-A'), { fetchImpl, now });
+    expect(calls).toEqual(['account-A']);
+
+    // Well inside the interval — for account A this would be refused.
+    clock += 60_000;
+    await refreshSlotUsageSurvey('global', slots('account-A'), { fetchImpl, now });
+    expect(calls).toEqual(['account-A']);
+
+    // A different credential is a different rate-limit identity, so it gets its
+    // own budget rather than inheriting A's cooldown.
+    await refreshSlotUsageSurvey('global', slots('account-B'), { fetchImpl, now });
+    expect(calls).toEqual(['account-A', 'account-B']);
+    expect(slotUsageSurveyForSpawn('global', slots('account-B'), { fetchImpl, now }).survey[SLOT]).toBeDefined();
+  });
+
+  it('does not make the replacement serve the old account’s 429 park', async () => {
+    let clock = Date.parse('2026-09-15T05:00:00.000Z');
+    const now = () => clock;
+    const { fetchImpl, calls } = countingFetch((token) =>
+      token === 'account-A' ? jsonResponse({}, 429, { 'retry-after': '3166' }) : jsonResponse(okBody(30)),
+    );
+    await refreshSlotUsageSurvey('global', [{ name: SLOT, value: 'account-A' }], { fetchImpl, now });
+    expect(calls).toEqual(['account-A']);
+
+    clock += 5_000;
+    await refreshSlotUsageSurvey('global', [{ name: SLOT, value: 'account-B' }], { fetchImpl, now });
+    expect(calls).toEqual(['account-A', 'account-B']);
+    expect(
+      slotUsageSurveyForSpawn('global', [{ name: SLOT, value: 'account-B' }], { fetchImpl, now }).survey[SLOT]!
+        .rateLimits.seven_day!.utilization,
+    ).toBe(30);
+  });
+
+  it('an in-flight pull that resolves after the swap publishes under its OWN credential, never the new one', async () => {
+    const clock = Date.parse('2026-09-15T05:00:00.000Z');
+    const now = () => clock;
+    let releaseA: ((r: Response) => void) | null = null;
+    const seen: string[] = [];
+    const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+      const token = (init?.headers as Record<string, string>).Authorization.replace(/^Bearer /, '');
+      seen.push(token);
+      if (token === 'account-A') return new Promise<Response>((resolve) => (releaseA = resolve));
+      return jsonResponse(okBody(30));
+    }) as unknown as typeof fetch;
+
+    // A's pull is started and left hanging.
+    const pass = refreshSlotUsageSurvey('global', [{ name: SLOT, value: 'account-A' }], { fetchImpl, now });
+    await Promise.resolve();
+    expect(seen).toEqual(['account-A']);
+
+    // `.env` is swapped mid-flight; A's answer only arrives afterwards.
+    releaseA!(jsonResponse(okBody(90)));
+    await pass;
+
+    // B must see nothing: A's 90% did land in the cache, but under A's
+    // fingerprint, so the reader holding B's token finds no match.
+    const afterSwap = slotUsageSurveyForSpawn('global', [{ name: SLOT, value: 'account-B' }], { fetchImpl, now });
+    expect(afterSwap.survey[SLOT]).toBeUndefined();
+    await afterSwap.refreshed;
+
+    // The documented trade-off of one entry per slot: B's pass displaced A's
+    // reading, so flipping back to A costs one fresh pull rather than serving a
+    // mismatch. Cheap, and it keeps the map from growing an entry per token
+    // ever seen.
+    const backToA = slotUsageSurveyForSpawn('global', [{ name: SLOT, value: 'account-A' }], { fetchImpl, now });
+    expect(backToA.survey[SLOT]).toBeUndefined();
+    expect(seen).toEqual(['account-A', 'account-B', 'account-A']);
+  });
+
+  it('never lets the token itself become a fingerprint, a key, or a log line', async () => {
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const TOKEN = 'sk-ant-oat01-SECRETVALUE';
+    const fp = credentialFingerprint(TOKEN);
+    expect(fp).toMatch(/^[0-9a-f]{16}$/);
+    expect(fp).not.toContain('SECRET');
+    expect(TOKEN).not.toContain(fp);
+    // Same input, same handle; different input, different handle.
+    expect(credentialFingerprint(TOKEN)).toBe(fp);
+    expect(credentialFingerprint(TOKEN + 'x')).not.toBe(fp);
+
+    // Drive both a success and a failure and scrape everything they emit.
+    const fetchImpl = (async () => {
+      throw new TypeError(`Headers.append: "Bearer ${TOKEN}" is an invalid header value`);
+    }) as unknown as typeof fetch;
+    const now = () => Date.parse('2026-09-15T05:00:00.000Z');
+    await refreshSlotUsageSurvey('global', [{ name: SLOT, value: TOKEN }], { fetchImpl, now });
+    const logged = JSON.stringify(warn.mock.calls);
+    expect(logged).not.toContain('SECRET');
+    expect(logged).not.toContain(fp);
+
+    // …and nothing the container is handed carries either.
+    const { survey } = slotUsageSurveyForSpawn('global', [{ name: SLOT, value: TOKEN }], { fetchImpl, now });
+    const encoded = encodeSlotUsageSurvey(survey);
+    expect(encoded).not.toContain('SECRET');
+    expect(encoded).not.toContain(fp);
   });
 });
