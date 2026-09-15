@@ -69,12 +69,40 @@ const NANOCLAW_ALWAYS_ON_MARKER = '.nanoclaw-always-on.md';
  */
 const PLUGIN_ALWAYS_ON_FILE = 'always-on.md';
 
-/** One ruleset file's trimmed contents, or null when absent, empty, or unreadable. */
-function readRulesetFile(dir: string, filename: string): string | null {
+/**
+ * One ruleset file's trimmed contents, or null when absent, empty, unreadable,
+ * or resolving outside `repoRoot`.
+ *
+ * The containment check is this reader's security boundary, and it lives here
+ * because this is the one place the bytes are actually read. What this composes
+ * lands in the group's `AGENTS.md`, which is mounted into the container — so the
+ * HOST reads a path and publishes it somewhere the container can see. Every
+ * component of that path is plugin-choosable: `statSync` and `readFileSync`
+ * follow symlinks, and `subPluginDirs` walks through directory symlinks too, so
+ * an `always-on.md` symlinked at `~/.codex/auth.json`, or a sub-plugin directory
+ * symlinked at `/etc`, would otherwise read host-only state and paste it into
+ * the prompt.
+ *
+ * That a plugin's code is already trusted to RUN in the container is not the
+ * same permission — this crosses host-only state into container-visible state.
+ * So the rule is resolved-path containment rather than a check on the final
+ * component: `realpathSync` both sides, compared with a separator boundary so a
+ * sibling named `<root>-evil` cannot prefix-match. Resolving the root as well
+ * keeps an ordinarily-symlinked `~/plugins/<name>` (a dev checkout living
+ * elsewhere) working, and an in-repo symlink still composes — only leaving the
+ * repository is refused.
+ */
+function readRulesetFile(dir: string, filename: string, repoRoot: string): string | null {
   const file = path.join(dir, filename);
   try {
-    if (!fs.statSync(file).isFile()) return null;
-    return fs.readFileSync(file, 'utf-8').trim() || null;
+    const root = fs.realpathSync(repoRoot);
+    const resolved = fs.realpathSync(file);
+    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+      log.warn('Plugin ruleset resolves outside its plugin repository; not composing it', { file, repoRoot: root });
+      return null;
+    }
+    if (!fs.statSync(resolved).isFile()) return null;
+    return fs.readFileSync(resolved, 'utf-8').trim() || null;
   } catch {
     return null;
   }
@@ -276,7 +304,8 @@ export async function composeGroupClaudeMd(
     }
     for (const name of pluginDirs) {
       if (excluded.has(name) || !pluginAllowedForWorkgroup(name, options.workgroupId, pluginScopes)) continue;
-      const override = readRulesetFile(path.join(pluginsRoot, name), NANOCLAW_ALWAYS_ON_MARKER);
+      const repoRoot = path.join(pluginsRoot, name);
+      const override = readRulesetFile(repoRoot, NANOCLAW_ALWAYS_ON_MARKER, repoRoot);
       if (override) desired.set(`plugin-${name}.md`, override);
       // A plugin's own always-on.md reaches OpenCode and nothing else. Codex
       // would receive the same text twice — once here, once from the plugin's
@@ -284,7 +313,7 @@ export async function composeGroupClaudeMd(
       if (provider !== 'opencode') continue;
       for (const { subPath, dir } of subPluginDirs(pluginsRoot, name)) {
         if (isExcludedSubPath(subPath, excludedSubPaths)) continue;
-        const content = readRulesetFile(dir, PLUGIN_ALWAYS_ON_FILE);
+        const content = readRulesetFile(dir, PLUGIN_ALWAYS_ON_FILE, repoRoot);
         if (!content) continue;
         // Keyed by the FULL sub-path, not its basename. A repo carrying the
         // same name in both walked layouts (`repo/plugins/foo` and `repo/foo`

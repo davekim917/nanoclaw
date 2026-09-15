@@ -526,6 +526,75 @@ describe("sub-plugin always-on: the plugin's own always-on.md (OpenCode only)", 
     }
   });
 
+  it('never composes a ruleset that resolves outside its plugin repository', async () => {
+    // The host reads these paths and publishes what it finds into AGENTS.md,
+    // which is mounted into the container — so a symlink here moves host-only
+    // state into container-visible state. That a plugin's code already runs in
+    // the container is a different permission. Every component is
+    // plugin-choosable, so containment is on the RESOLVED path, not the name.
+    const home = seedBootstrapPlugin(null);
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    const secret = path.join(TEST_ROOT, 'host-only-secret.json');
+    fs.writeFileSync(secret, 'SENTINEL_HOST_SECRET_9f3e\n');
+
+    // (a) the ruleset file itself is a symlink out of the repo
+    const viaFile = path.join(repo, 'plugins', 'exfil-file');
+    fs.mkdirSync(viaFile, { recursive: true });
+    fs.symlinkSync(secret, path.join(viaFile, 'always-on.md'));
+
+    // (b) the sub-plugin DIRECTORY is a symlink out of the repo — subPluginDirs
+    //     follows it, so a check on the final component alone would miss this
+    const outside = path.join(TEST_ROOT, 'outside-repo');
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'always-on.md'), 'SENTINEL_HOST_SECRET_9f3e\n');
+    fs.symlinkSync(outside, path.join(repo, 'plugins', 'exfil-dir'));
+
+    // (c) a sibling whose path merely PREFIXES the repo root is not inside it —
+    //     containment compares on a separator boundary
+    const sibling = `${repo}-evil`;
+    fs.mkdirSync(sibling, { recursive: true });
+    fs.writeFileSync(path.join(sibling, 'always-on.md'), 'SENTINEL_HOST_SECRET_9f3e\n');
+    fs.symlinkSync(sibling, path.join(repo, 'plugins', 'exfil-sibling'));
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-symlink', 'sub-symlink');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+
+      const doc = agentsDoc(ag.folder);
+      expect(doc).not.toContain('SENTINEL_HOST_SECRET_9f3e');
+      // The legitimate siblings in the same repo still compose — this refuses
+      // the escape, not the feature.
+      expect(doc).toContain(ORCHESTRATE_SENTINEL);
+      expect(doc).toContain(WWBD_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('composes a ruleset reached by a symlink that stays inside the repository', async () => {
+    // Containment, not a ban on symlinks: a repo is free to point a sub-plugin's
+    // directive at another file of its own.
+    const home = seedBootstrapPlugin(null);
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    const inRepo = path.join(repo, 'shared-rules.md');
+    fs.writeFileSync(inRepo, 'SENTINEL_IN_REPO_LINK_2c5a\n');
+    const sub = path.join(repo, 'plugins', 'linked');
+    fs.mkdirSync(sub, { recursive: true });
+    fs.symlinkSync(inRepo, path.join(sub, 'always-on.md'));
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-inrepo-link', 'sub-inrepo-link');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+      expect(agentsDoc(ag.folder)).toContain('SENTINEL_IN_REPO_LINK_2c5a');
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
   it('never injects a sub-plugin always-on.md into a Codex group — its plugin hook delivers it', async () => {
     // Codex fires plugin SessionStart hooks, so composing the same text here
     // would double-deliver the directive. Only the operator's NanoClaw-side

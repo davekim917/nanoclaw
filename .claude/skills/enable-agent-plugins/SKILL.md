@@ -9,7 +9,12 @@ Bring a plugin in `~/plugins/<name>` to **all three** container agent providers 
 parity. The container mount + `CLAUDE_PLUGINS_ROOT` already gives Claude groups any
 plugin that carries a Claude manifest — this skill closes the gaps that aren't
 automatic: missing manifests, the OpenCode skill mirror, and always-on activation on
-Codex/OpenCode (which fire **no** plugin hooks in NanoClaw containers).
+Codex/OpenCode. Hook delivery is **conditional, and the condition is the manifest**:
+Claude always fires a plugin's SessionStart hook, Codex fires it only for a plugin it
+can register — one shipping `.codex-plugin/plugin.json` that declares a hook — and
+OpenCode has no plugin loader, so no hook path at all. A Codex-registerable plugin
+that declares no hook (bootstrap's `orchestrate-agents` today) still needs the
+operator override below.
 
 ## Scope: container agent groups only — never a host CLI
 
