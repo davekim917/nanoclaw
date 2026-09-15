@@ -472,3 +472,474 @@ describe('workgroup-scoped plugin rulesets (src/plugin-scopes.ts)', () => {
     }
   });
 });
+
+describe("sub-plugin always-on: the plugin's own always-on.md (OpenCode only)", () => {
+  const OVERRIDE_SENTINEL = 'SENTINEL_OVERRIDE_RULES_1a2b';
+  const ORCHESTRATE_SENTINEL = 'SENTINEL_ORCHESTRATE_RULES_3c4d';
+  const WWBD_SENTINEL = 'SENTINEL_WWBD_RULES_5e6f';
+  const ROOTLEVEL_SENTINEL = 'SENTINEL_ROOTLEVEL_RULES_7a8b';
+
+  /**
+   * ~/plugins/bootstrap carrying each sub-plugin's OWN `always-on.md` in both
+   * walked layouts, plus (optionally) the operator's NanoClaw-side override at
+   * the repo root.
+   */
+  function seedBootstrapPlugin(override: string | null): string {
+    const home = path.join(TEST_ROOT, 'home');
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    for (const [dir, sentinel] of [
+      [path.join(repo, 'plugins', 'orchestrate'), ORCHESTRATE_SENTINEL],
+      [path.join(repo, 'plugins', 'wwbd'), WWBD_SENTINEL],
+      [path.join(repo, 'rootlevel'), ROOTLEVEL_SENTINEL],
+    ] as const) {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'always-on.md'), `${sentinel}\n`);
+    }
+    fs.mkdirSync(repo, { recursive: true });
+    if (override !== null) fs.writeFileSync(path.join(repo, '.nanoclaw-always-on.md'), override);
+    return home;
+  }
+
+  function setExcludePlugins(folder: string, entries: string[]): void {
+    const dir = path.join(GROUPS_DIR, folder);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'container.json'), JSON.stringify({ excludePlugins: entries }, null, 2));
+  }
+
+  function agentsDoc(folder: string): string {
+    return fs.readFileSync(path.join(GROUPS_DIR, folder, 'AGENTS.md'), 'utf-8');
+  }
+
+  it("injects every sub-plugin's own always-on.md into an OpenCode group", async () => {
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(seedBootstrapPlugin(null));
+    try {
+      const ag = group('ag-sub-opencode', 'sub-opencode');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+
+      const doc = agentsDoc(ag.folder);
+      for (const sentinel of [ORCHESTRATE_SENTINEL, WWBD_SENTINEL, ROOTLEVEL_SENTINEL]) {
+        expect(doc).toContain(sentinel);
+      }
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it("composes a single-plugin repo's ROOT always-on.md, with the operator override winning", async () => {
+    // A repo we maintain must reach OpenCode without a NanoClaw-specific file,
+    // which is only true if the composer reads the root's own generic ruleset —
+    // `subPluginDirs` returns children only, so a single-plugin repo has no
+    // sub-plugin to carry it. The override keeps precedence where both exist,
+    // because that is the operator deliberately replacing a third party's text.
+    const home = seedBootstrapPlugin(null);
+    const solo = path.join(home, 'plugins', 'solo');
+    fs.mkdirSync(solo, { recursive: true });
+    fs.writeFileSync(path.join(solo, 'always-on.md'), 'SENTINEL_SOLO_ROOT_3a9c\n');
+
+    const both = path.join(home, 'plugins', 'overridden');
+    fs.mkdirSync(both, { recursive: true });
+    fs.writeFileSync(path.join(both, 'always-on.md'), 'SENTINEL_OWN_LOSES_7c1b\n');
+    fs.writeFileSync(path.join(both, '.nanoclaw-always-on.md'), 'SENTINEL_OVERRIDE_WINS_4d2f\n');
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-root-ruleset', 'root-ruleset');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+      const doc = agentsDoc(ag.folder);
+      expect(doc).toContain('SENTINEL_SOLO_ROOT_3a9c');
+      expect(doc).toContain('SENTINEL_OVERRIDE_WINS_4d2f');
+      expect(doc).not.toContain('SENTINEL_OWN_LOSES_7c1b');
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it("excludes a single-plugin repo's root ruleset by its top-level name", async () => {
+    const home = seedBootstrapPlugin(null);
+    const solo = path.join(home, 'plugins', 'solo');
+    fs.mkdirSync(solo, { recursive: true });
+    fs.writeFileSync(path.join(solo, 'always-on.md'), 'SENTINEL_SOLO_EXCLUDED_8e4a\n');
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-root-excluded', 'root-excluded');
+      await seed(ag);
+      setExcludePlugins(ag.folder, ['solo']);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+      const doc = agentsDoc(ag.folder);
+      expect(doc).not.toContain('SENTINEL_SOLO_EXCLUDED_8e4a');
+      expect(doc).toContain(ORCHESTRATE_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('never composes a root always-on.md into a Codex group before #827 lands', async () => {
+    const home = seedBootstrapPlugin(null);
+    const solo = path.join(home, 'plugins', 'solo');
+    fs.mkdirSync(solo, { recursive: true });
+    fs.writeFileSync(path.join(solo, 'always-on.md'), 'SENTINEL_SOLO_CODEX_1b5d\n');
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-root-codex', 'root-codex');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'codex', {});
+      expect(agentsDoc(ag.folder)).not.toContain('SENTINEL_SOLO_CODEX_1b5d');
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('never composes a ruleset that resolves outside its plugin repository', async () => {
+    // The host reads these paths and publishes what it finds into AGENTS.md,
+    // which is mounted into the container — so a symlink here moves host-only
+    // state into container-visible state. That a plugin's code already runs in
+    // the container is a different permission. Every component is
+    // plugin-choosable, so containment is on the RESOLVED path, not the name.
+    const home = seedBootstrapPlugin(null);
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    const secret = path.join(TEST_ROOT, 'host-only-secret.json');
+    fs.writeFileSync(secret, 'SENTINEL_HOST_SECRET_9f3e\n');
+
+    // (a) the ruleset file itself is a symlink out of the repo
+    const viaFile = path.join(repo, 'plugins', 'exfil-file');
+    fs.mkdirSync(viaFile, { recursive: true });
+    fs.symlinkSync(secret, path.join(viaFile, 'always-on.md'));
+
+    // (b) the sub-plugin DIRECTORY is a symlink out of the repo — subPluginDirs
+    //     follows it, so a check on the final component alone would miss this
+    const outside = path.join(TEST_ROOT, 'outside-repo');
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'always-on.md'), 'SENTINEL_HOST_SECRET_9f3e\n');
+    fs.symlinkSync(outside, path.join(repo, 'plugins', 'exfil-dir'));
+
+    // (c) a sibling whose path merely PREFIXES the repo root is not inside it —
+    //     containment compares on a separator boundary. The planted file is
+    //     NOT named always-on.md, so the only way its bytes could reach the doc
+    //     is through bootstrap's symlink: the sibling is itself a plugin
+    //     directory, and composing its OWN root ruleset would be correct.
+    const sibling = `${repo}-evil`;
+    fs.mkdirSync(path.join(sibling, 'plugins', 'sneak'), { recursive: true });
+    fs.writeFileSync(path.join(sibling, 'plugins', 'sneak', 'always-on.md'), 'SENTINEL_HOST_SECRET_9f3e\n');
+    fs.symlinkSync(path.join(sibling, 'plugins', 'sneak'), path.join(repo, 'plugins', 'exfil-sibling'));
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-symlink', 'sub-symlink');
+      await seed(ag);
+      // The sibling is itself a plugin directory under ~/plugins, so composing
+      // ITS rulesets would be correct and would put the sentinel in the doc for
+      // an innocent reason. Excluding it by name leaves bootstrap's symlink as
+      // the only route the sentinel could take — which is the route under test.
+      setExcludePlugins(ag.folder, ['bootstrap-evil']);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+
+      const doc = agentsDoc(ag.folder);
+      expect(doc).not.toContain('SENTINEL_HOST_SECRET_9f3e');
+      // The legitimate siblings in the same repo still compose — this refuses
+      // the escape, not the feature.
+      expect(doc).toContain(ORCHESTRATE_SENTINEL);
+      expect(doc).toContain(WWBD_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('skips a ruleset larger than the composer bound, keeping its siblings', async () => {
+    // Containment says WHERE a ruleset may live, not how big it is. The read is
+    // synchronous and on the spawn path, so an oversized file is paid as spawn
+    // latency and host memory before anything downstream looks. Refusing beats
+    // truncating: half a standing ruleset is a directive with its carve-outs
+    // cut off.
+    const home = seedBootstrapPlugin(null);
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    const huge = path.join(repo, 'plugins', 'huge');
+    fs.mkdirSync(huge, { recursive: true });
+    fs.writeFileSync(path.join(huge, 'always-on.md'), `SENTINEL_HUGE_RULESET_8b1d\n${'x'.repeat(64 * 1024)}`);
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-huge', 'sub-huge');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+      const doc = agentsDoc(ag.folder);
+      expect(doc).not.toContain('SENTINEL_HUGE_RULESET_8b1d');
+      expect(doc).toContain(ORCHESTRATE_SENTINEL);
+      expect(doc).toContain(WWBD_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('never composes a ruleset that is a hard link to a file outside the repository', async () => {
+    // A hard link is not an indirection — the directory entry IS the file — so
+    // `realpath` and the open descriptor BOTH answer with the in-repo name and
+    // containment passes (measured on this host). `nlink` is the property that
+    // actually differs, and this repo already uses it for the same reason on
+    // the canonical-git sentinel (#739). A standing ruleset with a second name
+    // is not a legitimate shape.
+    const home = seedBootstrapPlugin(null);
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    const secret = path.join(TEST_ROOT, 'host-only-secret-hardlink.json');
+    fs.writeFileSync(secret, 'SENTINEL_HARDLINKED_SECRET_6e2a\n');
+
+    const sub = path.join(repo, 'plugins', 'linked-out');
+    fs.mkdirSync(sub, { recursive: true });
+    fs.linkSync(secret, path.join(sub, 'always-on.md'));
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-hardlink', 'sub-hardlink');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+      const doc = agentsDoc(ag.folder);
+      expect(doc).not.toContain('SENTINEL_HARDLINKED_SECRET_6e2a');
+      // The escape is refused, not the feature.
+      expect(doc).toContain(ORCHESTRATE_SENTINEL);
+      expect(doc).toContain(WWBD_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('resolves the repository root BEFORE opening the file, not after', async () => {
+    // An ordering claim needs an ordering probe: asserting the composed output
+    // holds either way, because the race this ordering closes cannot be driven
+    // from outside the function. A root resolved AFTER the open is a second
+    // pathname lookup the first cannot constrain — swap `~/plugins/<repo>` for
+    // a symlink to a parent between the two and a descriptor holding
+    // `~/.codex/auth.json` measures as contained by the freshly-resolved root.
+    const home = seedBootstrapPlugin(null);
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    const calls: string[] = [];
+    const realRealpath = fs.realpathSync;
+    const realOpen = fs.openSync;
+    const realpathSpy = vi.spyOn(fs, 'realpathSync').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      if (String(p) === repo) calls.push(`realpath:${p}`);
+      return (realRealpath as unknown as (...a: unknown[]) => string)(p, ...rest);
+    }) as typeof fs.realpathSync);
+    const openSpy = vi.spyOn(fs, 'openSync').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      if (String(p).startsWith(repo)) calls.push(`open:${p}`);
+      return (realOpen as unknown as (...a: unknown[]) => number)(p, ...rest);
+    }) as typeof fs.openSync);
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-order', 'sub-order');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+
+      // Per READ, not globally: the composer reads one ruleset per sub-plugin,
+      // so the sequence is realpath, open, realpath, open... What must never
+      // appear is an open whose root lookup came after it.
+      expect(
+        calls.some((c) => c.startsWith('open:')),
+        'the composer must open at least one ruleset',
+      ).toBe(true);
+      expect(calls[0] ?? '', 'the first filesystem call must be the root lookup').toMatch(/^realpath:/);
+      calls.forEach((call, i) => {
+        if (!call.startsWith('open:')) return;
+        expect(calls[i - 1] ?? '', `open at ${i} must be preceded by its root lookup`).toMatch(/^realpath:/);
+      });
+    } finally {
+      homedirSpy.mockRestore();
+      openSpy.mockRestore();
+      realpathSpy.mockRestore();
+    }
+  });
+
+  it('composes nothing when the open descriptor cannot be identified', async () => {
+    // r7 claimed no deterministic test could reach the fd path; r8 pointed out
+    // an fs spy can. Forcing `/proc/self/fd/<fd>` to fail is the no-`/proc`
+    // platform (macOS). The old fallback re-resolved the path by name, which is
+    // exactly the lookup the descriptor check exists to avoid — so it now fails
+    // closed instead, and this pins that rather than the fallback.
+    const home = seedBootstrapPlugin(null);
+    const readlinkSpy = vi.spyOn(fs, 'readlinkSync').mockImplementation((p: fs.PathLike, ...rest) => {
+      if (String(p).startsWith('/proc/self/fd/')) throw new Error('ENOSYS: no /proc on this platform');
+      return (fs.readlinkSync as unknown as (...a: unknown[]) => string)(p, ...rest);
+    });
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-noproc', 'sub-noproc');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+      const doc = agentsDoc(ag.folder);
+      // Every plugin ruleset is withheld — not just an escaping one.
+      expect(doc).not.toContain(ORCHESTRATE_SENTINEL);
+      expect(doc).not.toContain(WWBD_SENTINEL);
+      expect(doc).not.toContain(ROOTLEVEL_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+      readlinkSpy.mockRestore();
+    }
+  });
+
+  it('composes a ruleset reached by a symlink that stays inside the repository', async () => {
+    // Containment, not a ban on symlinks: a repo is free to point a sub-plugin's
+    // directive at another file of its own.
+    const home = seedBootstrapPlugin(null);
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    const inRepo = path.join(repo, 'shared-rules.md');
+    fs.writeFileSync(inRepo, 'SENTINEL_IN_REPO_LINK_2c5a\n');
+    const sub = path.join(repo, 'plugins', 'linked');
+    fs.mkdirSync(sub, { recursive: true });
+    fs.symlinkSync(inRepo, path.join(sub, 'always-on.md'));
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-inrepo-link', 'sub-inrepo-link');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+      expect(agentsDoc(ag.folder)).toContain('SENTINEL_IN_REPO_LINK_2c5a');
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('never injects a sub-plugin always-on.md into a Codex group — its plugin hook delivers it', async () => {
+    // Codex fires plugin SessionStart hooks, so composing the same text here
+    // would double-deliver the directive. Only the operator's NanoClaw-side
+    // override at the repo root still reaches a Codex group.
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(seedBootstrapPlugin(`${OVERRIDE_SENTINEL}\n`));
+    try {
+      const ag = group('ag-sub-codex', 'sub-codex');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'codex', {});
+
+      const doc = agentsDoc(ag.folder);
+      for (const sentinel of [ORCHESTRATE_SENTINEL, WWBD_SENTINEL, ROOTLEVEL_SENTINEL]) {
+        expect(doc).not.toContain(sentinel);
+      }
+      expect(doc).toContain(OVERRIDE_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('drops only the excluded sub-plugin, keeping its siblings and the operator override', async () => {
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(seedBootstrapPlugin(`${OVERRIDE_SENTINEL}\n`));
+    try {
+      const ag = group('ag-sub-excluded', 'sub-excluded');
+      await seed(ag);
+      setExcludePlugins(ag.folder, ['bootstrap/plugins/orchestrate']);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+
+      const doc = agentsDoc(ag.folder);
+      expect(doc).not.toContain(ORCHESTRATE_SENTINEL);
+      expect(doc).toContain(WWBD_SENTINEL);
+      expect(doc).toContain(ROOTLEVEL_SENTINEL);
+      expect(doc).toContain(OVERRIDE_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('excluding the plugins/ container drops every sub-plugin under it', async () => {
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(seedBootstrapPlugin(null));
+    try {
+      const ag = group('ag-sub-container', 'sub-container');
+      await seed(ag);
+      setExcludePlugins(ag.folder, ['bootstrap/plugins']);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+
+      const doc = agentsDoc(ag.folder);
+      expect(doc).not.toContain(ORCHESTRATE_SENTINEL);
+      expect(doc).not.toContain(WWBD_SENTINEL);
+      expect(doc).toContain(ROOTLEVEL_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('excluding the whole repo drops the sub-plugins and the override together', async () => {
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(seedBootstrapPlugin(`${OVERRIDE_SENTINEL}\n`));
+    try {
+      const ag = group('ag-sub-repo', 'sub-repo');
+      await seed(ag);
+      setExcludePlugins(ag.folder, ['bootstrap']);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+
+      const doc = agentsDoc(ag.folder);
+      for (const sentinel of [OVERRIDE_SENTINEL, ORCHESTRATE_SENTINEL, WWBD_SENTINEL, ROOTLEVEL_SENTINEL]) {
+        expect(doc).not.toContain(sentinel);
+      }
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('keeps both rulesets when one repo carries the same sub-plugin name in both layouts', async () => {
+    // `subPluginDirs` walks `<repo>/plugins/<sub>` AND `<repo>/<sub>`, so a repo
+    // with both shares a basename. Keying the fragment by that basename dropped
+    // one of the two silently. (PR #826 Codex round 3, P2.)
+    const home = path.join(TEST_ROOT, 'home');
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    const NESTED = 'SENTINEL_NESTED_TWIN_9c1e';
+    const ROOTED = 'SENTINEL_ROOTED_TWIN_4f7d';
+    for (const [dir, sentinel] of [
+      [path.join(repo, 'plugins', 'twin'), NESTED],
+      [path.join(repo, 'twin'), ROOTED],
+    ] as const) {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'always-on.md'), `${sentinel}\n`);
+    }
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-twin', 'sub-twin');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+
+      const doc = agentsDoc(ag.folder);
+      expect(doc).toContain(NESTED);
+      expect(doc).toContain(ROOTED);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('still excludes a twin by its own sub-path, leaving the other in place', async () => {
+    const home = path.join(TEST_ROOT, 'home');
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    const NESTED = 'SENTINEL_NESTED_TWIN_9c1e';
+    const ROOTED = 'SENTINEL_ROOTED_TWIN_4f7d';
+    for (const [dir, sentinel] of [
+      [path.join(repo, 'plugins', 'twin'), NESTED],
+      [path.join(repo, 'twin'), ROOTED],
+    ] as const) {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'always-on.md'), `${sentinel}\n`);
+    }
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-twin-excl', 'sub-twin-excl');
+      await seed(ag);
+      setExcludePlugins(ag.folder, ['bootstrap/plugins/twin']);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+
+      const doc = agentsDoc(ag.folder);
+      expect(doc).not.toContain(NESTED);
+      expect(doc).toContain(ROOTED);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('never injects any plugin ruleset into a Claude group (its SessionStart hook owns that)', async () => {
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(seedBootstrapPlugin(`${OVERRIDE_SENTINEL}\n`));
+    try {
+      const ag = group('ag-sub-claude', 'sub-claude');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'claude', {});
+
+      const doc = docOf(ag.folder);
+      for (const sentinel of [OVERRIDE_SENTINEL, ORCHESTRATE_SENTINEL, WWBD_SENTINEL]) {
+        expect(doc).not.toContain(sentinel);
+      }
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+});

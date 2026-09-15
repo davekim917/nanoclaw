@@ -31,7 +31,12 @@ import os from 'os';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
-import { readContainerConfig, validateMcpServers, type McpServerConfig } from './container-config.js';
+import {
+  readContainerConfig,
+  splitExcludedPlugins,
+  validateMcpServers,
+  type McpServerConfig,
+} from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { flattenClaudeMd } from './agents-md-flatten.js';
 import { CODEX_PROJECT_DOC_CONFIGURED_MAX_BYTES, warnIfOversized } from './codex-project-doc-cap.js';
@@ -49,6 +54,211 @@ const STANDING_INSTRUCTIONS_FRAGMENT = 'standing-instructions.md';
 // Joined against `projectRoot` (derived from GROUPS_DIR) at call time so
 // tests, which mock GROUPS_DIR to a scratch dir, resolve these consistently.
 const MCP_TOOLS_HOST_SUBPATH = path.join('container', 'agent-runner', 'src', 'mcp-tools');
+
+/**
+ * NanoClaw-side override marker, written by the operator (via
+ * /enable-agent-plugins) into a `~/plugins` entry that ships no clean standing
+ * ruleset of its own. A NanoClaw-specific filename, so it belongs only on
+ * third-party plugins we do not control.
+ */
+const NANOCLAW_ALWAYS_ON_MARKER = '.nanoclaw-always-on.md';
+
+/**
+ * A plugin's OWN standing-directive file, in the plugin's own vocabulary — no
+ * NanoClaw-specific name, nothing a plugin repo carries for our benefit.
+ */
+const PLUGIN_ALWAYS_ON_FILE = 'always-on.md';
+
+/**
+ * Largest plugin ruleset this composer will read, in bytes.
+ *
+ * Sized against the surface it feeds rather than picked round: the composed
+ * doc as a whole is already capped at `CODEX_PROJECT_DOC_CONFIGURED_MAX_BYTES`
+ * (`src/codex-project-doc-cap.ts`), and one plugin's standing directive is a
+ * fraction of a document that also carries the persona, the shared base and
+ * every other fragment. 64 KiB is far above every ruleset in the tree and far
+ * below anything that costs a spawn measurable time or memory.
+ */
+const MAX_PLUGIN_RULESET_BYTES = 64 * 1024;
+
+/**
+ * One ruleset file's trimmed contents, or null when absent, empty, unreadable,
+ * or resolving outside `repoRoot`.
+ *
+ * The containment check is this reader's security boundary, and it lives here
+ * because this is the one place the bytes are actually read. What this composes
+ * lands in the group's `AGENTS.md`, which is mounted into the container — so the
+ * HOST reads a path and publishes it somewhere the container can see. Every
+ * component of that path is plugin-choosable: `statSync` and `readFileSync`
+ * follow symlinks, and `subPluginDirs` walks through directory symlinks too, so
+ * an `always-on.md` symlinked at `~/.codex/auth.json`, or a sub-plugin directory
+ * symlinked at `/etc`, would otherwise read host-only state and paste it into
+ * the prompt.
+ *
+ * That a plugin's code is already trusted to RUN in the container is not the
+ * same permission — this crosses host-only state into container-visible state.
+ * So the rule is resolved-path containment rather than a check on the final
+ * component: `realpathSync` both sides, compared with a separator boundary so a
+ * sibling named `<root>-evil` cannot prefix-match. Resolving the root as well
+ * keeps an ordinarily-symlinked `~/plugins/<name>` (a dev checkout living
+ * elsewhere) working, and an in-repo symlink still composes — only leaving the
+ * repository is refused.
+ */
+function readRulesetFile(dir: string, filename: string, repoRoot: string): string | null {
+  const file = path.join(dir, filename);
+  // The root is resolved BEFORE the open, and that ordering is the point. A
+  // root resolved afterwards is a second pathname lookup the first one cannot
+  // constrain: swap `~/plugins/<repo>` for a symlink to `/home/ubuntu` between
+  // the two, and a descriptor holding `~/.codex/auth.json` measures as
+  // contained by the freshly-resolved root. Resolving first means the fd is
+  // always judged against the root we INTENDED, and a root swapped before the
+  // open sends the open somewhere that no longer measures as inside it.
+  let root: string;
+  try {
+    root = fs.realpathSync(repoRoot);
+  } catch {
+    return null;
+  }
+  let fd: number;
+  try {
+    // O_NONBLOCK, always: opening a FIFO for reading blocks until a writer
+    // appears, and that open happens before any check below can reject it — so
+    // a plugin repo carrying a `mkfifo` would hang the host's single event loop
+    // rather than return an error. On a regular file Linux ignores the flag.
+    // Same flag, same reason, as `readContainedFile` in
+    // `src/dashboard/api/attention-fs.ts`, which is where this pattern comes
+    // from.
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+  } catch {
+    return null;
+  }
+  try {
+    // Containment is decided about the OPEN DESCRIPTOR, never about a path.
+    // `realpathSync(file)` answers a question about a string at one instant;
+    // between that answer and the read, any component — the leaf or a directory
+    // `subPluginDirs` walked through — can become a symlink, and the read then
+    // follows somewhere the check never saw. `/proc/self/fd/<fd>` is a
+    // kernel-maintained link to the inode this descriptor already holds, so it
+    // cannot be raced: the open happened first, and nothing about a path can
+    // change what an open descriptor refers to.
+    //
+    // This matters because what the host reads here is written into the group's
+    // `AGENTS.md`, which is mounted into the container — so a win moves
+    // host-only state (`~/.codex/auth.json`, `.env`) into container-visible
+    // state. That a plugin's code already runs in the container is a different
+    // permission.
+    //
+    // NOT `O_NOFOLLOW`: it refuses only the final component, so it would not
+    // close the walked-parent case this check does close, and it WOULD refuse a
+    // leaf that is legitimately a symlink to another file inside the same repo.
+    //
+    // FAILS CLOSED where the descriptor cannot be identified. `/proc` is absent
+    // on macOS, and falling back to `realpathSync(file)` there would reinstate
+    // exactly the pathname lookup this check exists to avoid. `attention-fs.ts`
+    // does take that fallback, because it serves a live dashboard where
+    // emitting nothing is a visible outage; here the cost is that a macOS
+    // developer checkout composes no plugin rulesets, which is a degraded
+    // convenience rather than a broken product. This host is Linux (CLAUDE.md).
+    let opened: string;
+    try {
+      opened = fs.readlinkSync(`/proc/self/fd/${fd}`);
+    } catch {
+      log.warn('Cannot identify the open descriptor (no /proc); not composing plugin rulesets on this host', { file });
+      return null;
+    }
+    if (!path.isAbsolute(opened)) return null;
+    if (opened !== root && !opened.startsWith(root + path.sep)) {
+      log.warn('Plugin ruleset resolves outside its plugin repository; not composing it', { file, repoRoot: root });
+      return null;
+    }
+    // Every remaining question is answered from this same descriptor, so a swap
+    // has nothing left to win — including the size bound, which a second
+    // `statSync` would let a growing file defeat.
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) return null;
+    // A HARD LINK defeats containment in either form, and measuring it is the
+    // only way to see that: `ln ~/.codex/auth.json <repo>/plugins/x/always-on.md`
+    // makes both `realpath` and the fd path answer with the in-repo name
+    // (verified on this host), because a hard link is not an indirection — the
+    // directory entry IS the file. So containment alone would compose the
+    // secret. `nlink` is the property that actually differs, and this repo
+    // already uses it for the same reason on the canonical-git sentinel
+    // (`docs/review-notes.md`, #739). A plugin's standing ruleset having a
+    // second name is not a legitimate shape.
+    if (st.nlink !== 1) {
+      log.warn('Plugin ruleset has more than one hard link; not composing it', { file, nlink: st.nlink });
+      return null;
+    }
+    if (st.size > MAX_PLUGIN_RULESET_BYTES) {
+      log.warn('Plugin ruleset is too large to compose; skipping it', {
+        file,
+        bytes: st.size,
+        maxBytes: MAX_PLUGIN_RULESET_BYTES,
+      });
+      return null;
+    }
+    const buf = Buffer.allocUnsafe(st.size);
+    let read = 0;
+    while (read < st.size) {
+      const n = fs.readSync(fd, buf, read, st.size - read, read);
+      if (n === 0) break; // truncated under us — use what the fd actually held
+      read += n;
+    }
+    return buf.subarray(0, read).toString('utf8').trim() || null;
+  } catch {
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Every sub-plugin directory of one `~/plugins` entry, in both layouts the
+ * container-side walkers descend: `<repo>/plugins/<sub>` (Claude
+ * container/agent-runner/src/providers/claude.ts:1790-1817; Codex
+ * container/agent-runner/src/codex-companion-setup.ts:570) and `<repo>/<sub>`
+ * (same two). Returned paths are relative to the plugins root, which is the
+ * spelling `excludePlugins` uses.
+ */
+function subPluginDirs(pluginsRoot: string, name: string): Array<{ subPath: string; dir: string }> {
+  const out: Array<{ subPath: string; dir: string }> = [];
+  const seen = new Set<string>();
+  for (const container of [path.join(name, 'plugins'), name]) {
+    let subs: string[];
+    try {
+      subs = fs.readdirSync(path.join(pluginsRoot, container)).sort();
+    } catch {
+      continue;
+    }
+    for (const sub of subs) {
+      if (sub.startsWith('.')) continue;
+      const subPath = path.join(container, sub);
+      if (seen.has(subPath)) continue;
+      const dir = path.join(pluginsRoot, subPath);
+      try {
+        if (!fs.statSync(dir).isDirectory()) continue;
+      } catch {
+        continue;
+      }
+      seen.add(subPath);
+      out.push({ subPath, dir });
+    }
+  }
+  return out;
+}
+
+/**
+ * True when this sub-path, or any ancestor of it below the repo root, is
+ * excluded — so excluding `bootstrap/plugins` also withholds the directive of
+ * every sub-plugin under it, not only one named exactly.
+ */
+function isExcludedSubPath(subPath: string, excludedSubPaths: ReadonlySet<string>): boolean {
+  const segments = subPath.split('/');
+  for (let i = 2; i <= segments.length; i++) {
+    if (excludedSubPaths.has(segments.slice(0, i).join('/'))) return true;
+  }
+  return false;
+}
 
 const COMPOSED_HEADER =
   '<!-- Composed at spawn - do not edit. Standing instructions: standing-instructions.md. Memory: memory/. -->';
@@ -163,18 +373,31 @@ export async function composeGroupClaudeMd(
     }
   }
 
-  // Always-on agent-plugin rulesets — NON-Claude groups only. A Claude group
-  // gets a plugin's always-on behavior from its mounted SessionStart hook
-  // (CLAUDE_PLUGINS_ROOT auto-loads it); Codex/OpenCode containers fire NO
-  // plugin hooks, so we inject the plugin's captured ruleset here instead. A
-  // plugin opts in by writing its ruleset to `~/plugins/<name>/.nanoclaw-always-on.md`
-  // (the /enable-agent-plugins skill authors this). Per-group opt-out reuses
-  // `excludePlugins` — the same field that drops the Claude mount — so excluding
-  // a plugin from a group removes it on every provider. See docs/skills-model.md.
-  // A workgroup-scoped plugin's ruleset reaches only its workgroups, matching the
-  // mount (src/plugin-scopes.ts); with no spawn-resolved workgroup it reaches none.
+  // Always-on agent-plugin rulesets. A plugin's standing directive reaches a
+  // container by ONE of two paths, never both:
+  //
+  //   1. The plugin's own SessionStart hook, from the mounted plugin. Claude
+  //      auto-loads it via CLAUDE_PLUGINS_ROOT; Codex fires plugin hooks too,
+  //      and a hook that injects context is how a Codex container gets the
+  //      directive natively. Neither provider is composed for below.
+  //   2. This composer, for OpenCode only — the one provider with no plugin
+  //      hook path at all. It reads the plugin's own generic
+  //      `always-on.md` (no NanoClaw-specific filename in the plugin repo).
+  //
+  // Separately, `~/plugins/<name>/.nanoclaw-always-on.md` is the operator's
+  // OVERRIDE for a third-party plugin that ships no clean ruleset — a
+  // NanoClaw-side convention authored by /enable-agent-plugins, read for every
+  // non-Claude provider as it always has been.
+  //
+  // Per-group opt-out reuses `excludePlugins` — the same field that drops the
+  // mount — so excluding a plugin, or one sub-plugin path of a monorepo,
+  // withholds its directive here too. A workgroup-scoped plugin's ruleset
+  // reaches only its workgroups, matching the mount (src/plugin-scopes.ts);
+  // with no spawn-resolved workgroup it reaches none. See docs/skills-model.md.
   if (provider !== 'claude') {
-    const excluded = new Set(readContainerConfig(group.folder).excludePlugins ?? []);
+    const { topLevel: excluded, subPaths: excludedSubPaths } = splitExcludedPlugins(
+      readContainerConfig(group.folder).excludePlugins,
+    );
     const pluginScopes = loadPluginScopes();
     const pluginsRoot = path.join(os.homedir(), 'plugins');
     let pluginDirs: string[] = [];
@@ -185,15 +408,65 @@ export async function composeGroupClaudeMd(
     }
     for (const name of pluginDirs) {
       if (excluded.has(name) || !pluginAllowedForWorkgroup(name, options.workgroupId, pluginScopes)) continue;
-      const rulesetFile = path.join(pluginsRoot, name, '.nanoclaw-always-on.md');
-      let content: string;
-      try {
-        if (!fs.statSync(rulesetFile).isFile()) continue;
-        content = fs.readFileSync(rulesetFile, 'utf-8').trim();
-      } catch {
-        continue;
+      const repoRoot = path.join(pluginsRoot, name);
+      const override = readRulesetFile(repoRoot, NANOCLAW_ALWAYS_ON_MARKER, repoRoot);
+      if (override) desired.set(`plugin-${name}.md`, override);
+      // A plugin's own always-on.md reaches OpenCode and nothing else. Claude
+      // auto-loads the plugin's SessionStart hook through CLAUDE_PLUGINS_ROOT,
+      // and Codex fires plugin hooks too — but ONLY for a plugin whose
+      // `.codex-plugin/plugin.json` declares them AND whose hook identity is
+      // TRUSTED. That trust is not automatic: codex reports an unenrolled plugin
+      // hook as `trustStatus: "untrusted"` and never dispatches it, which made
+      // this gate's premise FALSE until #827 installed container-side hook
+      // trust. #827 is merged and is in this branch, so the premise holds. The
+      // ordering was the fix rather than the code — composing for Codex in the
+      // meantime would have delivered the text twice the day #827 landed.
+      // Re-check this gate if hook trust is removed, or if a plugin's manifest
+      // stops declaring the hooks file it ships.
+      if (provider !== 'opencode') continue;
+      // The repo ROOT's own generic ruleset, for a single-plugin repo whose
+      // directive is not under a sub-plugin. Without this, such a repo would
+      // still need a NanoClaw-specific `.nanoclaw-always-on.md` to reach
+      // OpenCode — the exact property a plugin repo we maintain is supposed to
+      // avoid. Same containment read and same key as the override, so an
+      // operator override present alongside it wins: `desired.set` above ran
+      // first, and this does not overwrite.
+      const rootFragment = `plugin-${name}.md`;
+      if (!desired.has(rootFragment)) {
+        const rootOwn = readRulesetFile(repoRoot, PLUGIN_ALWAYS_ON_FILE, repoRoot);
+        if (rootOwn) desired.set(rootFragment, rootOwn);
       }
-      if (content) desired.set(`plugin-${name}.md`, content);
+      for (const { subPath, dir } of subPluginDirs(pluginsRoot, name)) {
+        if (isExcludedSubPath(subPath, excludedSubPaths)) continue;
+        const content = readRulesetFile(dir, PLUGIN_ALWAYS_ON_FILE, repoRoot);
+        if (!content) continue;
+        // Keyed by the FULL sub-path, not its basename. A repo carrying the
+        // same name in both walked layouts (`repo/plugins/foo` and `repo/foo`
+        // — `subPluginDirs` returns both) shares a basename, so a
+        // basename-keyed fragment collided and one sub-plugin's ruleset was
+        // silently dropped. `subPath` is unique per sub-plugin by construction
+        // (`subPluginDirs` dedupes on it — the `seen` set at :93, added at
+        // :111), and it always carries a `/`, which a top-level
+        // `plugin-<name>.md` key never can: `name` is an entry of
+        // `fs.readdirSync(pluginsRoot)` (:273), i.e. one path component. The
+        // two key spaces are therefore disjoint and no collision is reachable.
+        //
+        // A `/` here is safe ONLY because these keys never become paths, so
+        // that is asserted against every consumer rather than assumed — a key
+        // that reached a path join would make this traversal, not a collision.
+        // `desired` is a function-local const (:204), never returned and never
+        // passed to a callee. Written at :209, :213, :232, :240, :280, this
+        // line, and :323; read at exactly two places — `pushFragment`'s
+        // `desired.get` (:364) and the `[...desired.keys()].sort()` that orders
+        // sections (:369). Both feed `sections`, joined into `body` (:372) and
+        // written to two FIXED paths, `<groupDir>/CLAUDE.md` (:373) and
+        // `<groupDir>/AGENTS.md` (:420). No key is ever a filename: the
+        // `.claude-fragments/` directory that once made them one is gone along
+        // with the mount that backed it (`src/container-runner.ts:4845-4846`),
+        // and `removeStaleFragmentArtifacts` only deletes that legacy
+        // directory — it never reads `desired`.
+        desired.set(`plugin-${subPath}.md`, content);
+      }
     }
   }
 

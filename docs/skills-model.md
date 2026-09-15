@@ -74,6 +74,17 @@ This fetch is **additive, never a merge**. The skill copies in the files it need
 
 Either way the skill brings its own code, from its folder or from its branch.
 
+## Agent plugins and their standing directives
+
+A `~/plugins/<repo>` entry is not a NanoClaw skill — it's someone's plugin repo, mounted read-only into every container at `/workspace/plugins/<repo>`. A plugin that carries a standing directive ("always on this way of working") reaches a container by **one** of two paths, never both:
+
+- **The plugin's own SessionStart hook.** Claude auto-loads it from the mount via `CLAUDE_PLUGINS_ROOT`. Codex can fire plugin hooks, but only for a plugin whose `.codex-plugin/plugin.json` declares them AND whose hook identity is TRUSTED — codex reports an unenrolled plugin hook as `trustStatus: "untrusted"` and never dispatches it. Container-side hook trust is what PR #827 installs, and it is merged — before it, a Codex container got nothing from this path and a maintained plugin's directive reached Codex by neither route. Nothing is composed for either provider.
+- **`composeGroupClaudeMd`, for OpenCode only** — the one provider with no plugin hook path at all. It reads the plugin's own generic `always-on.md` (`~/plugins/<repo>/plugins/<sub>/always-on.md`, or `~/plugins/<repo>/<sub>/always-on.md`) and inlines it as a fragment. The filename is the plugin's own; NanoClaw asks a plugin repo to carry nothing on our behalf.
+
+`~/plugins/<repo>/.nanoclaw-always-on.md` is a different thing: the **operator's override**, for a third-party plugin that ships no clean ruleset of its own. It is a NanoClaw-side convention, authored by `/enable-agent-plugins`, lives at the repo root, and is read for every non-Claude provider. Use it only where we don't control the plugin.
+
+Withholding either from one agent group is the same field, `excludePlugins` in `groups/<folder>/container.json` — a whole entry (`"bootstrap"`) or one sub-plugin path (`"bootstrap/plugins/orchestrate"`, `"<repo>/<sub>"`). **The two reach different distances.** A whole entry drops the mount, so the plugin is absent for every provider. A sub-plugin path withholds only that sub-plugin's standing directive from the composed prompt; the repo still mounts whole and its skills, manifest and hooks stay reachable. Masking the sub-path with an empty bind mount was tried and removed — it made the host predict what a container's own walkers would resolve, and an absolute symlink inside the repo is absent to a host `statSync` while live once the repo is mounted, so the exclusion silently did not apply. Container-side exclusion is a follow-up in which each walker honours the same list in its own namespace. See [workgroups.md](workgroups.md) for workgroup-scoped plugins, which are opt-in rather than opt-out.
+
 ## A test for every integration point
 
 The tests a skill *must* ship are the ones that prove it integrates with the core and keeps working as the core changes. That's the whole point. Tests of a skill's own internal logic, or of its behavior against an external service, are fine but optional: the creator's call, because they don't guard against upstream changes. A pure-add skill that touches nothing existing needs no required integration test at all.

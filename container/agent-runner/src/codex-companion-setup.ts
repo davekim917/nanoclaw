@@ -817,10 +817,17 @@ export interface CodexPluginRegistrationPlan {
  * (deny-sibling routing, manifest presence, name resolution) is unit-testable
  * against a fake plugins root with no subprocess involved.
  *
- * Per-group `excludePlugins` and `IN_TREE_SHADOWED_PLUGINS` need no handling
- * here — `container-runner.ts` already omits those entries from the
- * `/workspace/plugins` mount before the container ever starts, so they
- * simply never appear as entries in `pluginsRoot`.
+ * A per-group `excludePlugins` TOP-LEVEL entry, and `IN_TREE_SHADOWED_PLUGINS`,
+ * need no handling here — `container-runner.ts` omits those from the
+ * `/workspace/plugins` mount before the container ever starts, so they simply
+ * never appear as entries in `pluginsRoot`.
+ *
+ * A SUB-PLUGIN path entry is a different matter and is NOT handled anywhere
+ * yet: the host mounts the repo whole, so this walker still finds and registers
+ * the excluded sub-plugin. Honouring the list here — in the container's own
+ * namespace, where the paths actually resolve — is the follow-up to #826, which
+ * removed the host-side mask precisely because the host cannot predict what
+ * this walker will see.
  */
 export function planCodexPluginRegistration(pluginsRoot: string): CodexPluginRegistrationPlan[] {
   let entries: string[] = [];

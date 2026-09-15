@@ -483,6 +483,25 @@ describe('planCodexPluginRegistration', () => {
     });
     expect(byName.has('monorepo/not-checked-out')).toBe(false);
   });
+
+  it('never registers a sub-plugin directory that carries no Codex manifest', () => {
+    // A manifest-less directory is skipped: `readCodexPluginEntryName` returns
+    // null and `findCodexSubPlugins` drops it, in both layouts the walker
+    // descends. NOTE this pins walker behaviour, NOT an exclusion — a
+    // sub-plugin named in `excludePlugins` still reaches this walker intact,
+    // because the host mask that used to blank it was removed (#826). The
+    // follow-up that teaches this walker the exclusion list will build on
+    // exactly this skip.
+    const repo = path.join(root, 'bootstrap');
+    writeJson(path.join(repo, '.agents', 'plugins', 'marketplace.json'), { name: 'bootstrap-mkt' });
+    const kept = path.join(repo, 'plugins', 'wwbd');
+    writeJson(path.join(kept, '.codex-plugin', 'plugin.json'), { name: 'wwbd' });
+    fs.mkdirSync(path.join(repo, 'plugins', 'orchestrate'), { recursive: true });
+    fs.mkdirSync(path.join(repo, 'rootlevel'), { recursive: true });
+
+    const plans = planCodexPluginRegistration(root);
+    expect(plans.map((p) => p.name)).toEqual(['bootstrap/wwbd']);
+  });
 });
 
 // ── Hook trust wiring ──────────────────────────────────────────────────────

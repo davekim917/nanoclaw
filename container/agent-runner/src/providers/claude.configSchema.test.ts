@@ -210,6 +210,30 @@ describe('Claude plugin discovery', () => {
     }
   });
 
+  it('skips a sub-plugin directory with no manifest, keeping its siblings', () => {
+    // `hasManifest` (claude.ts:1751) skips a manifest-less directory. This pins
+    // that skip on its own terms: the host mask that used to produce such a
+    // directory for an excluded sub-plugin was removed (#826), so nothing here
+    // is an exclusion — it is the walker behaviour the follow-up will hang the
+    // exclusion list on.
+    const pluginsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-plugin-masked-'));
+    try {
+      const repo = path.join(pluginsRoot, 'bootstrap');
+      const wwbd = path.join(repo, 'plugins', 'wwbd');
+      fs.mkdirSync(path.join(wwbd, '.claude-plugin'), { recursive: true });
+      fs.writeFileSync(path.join(wwbd, '.claude-plugin', 'plugin.json'), '{"name":"wwbd"}');
+      // A real directory with nothing in it.
+      fs.mkdirSync(path.join(repo, 'plugins', 'orchestrate'), { recursive: true });
+      // Second layout — a sub-plugin directly under the repo root.
+      fs.mkdirSync(path.join(repo, 'rootlevel'), { recursive: true });
+
+      const discovery = discoverPlugins(pluginsRoot);
+      expect(discovery.plugins).toEqual([{ type: 'local', path: wwbd }]);
+    } finally {
+      fs.rmSync(pluginsRoot, { recursive: true, force: true });
+    }
+  });
+
   it('gives a declared Bootstrap Bash-email guard sole ownership of the gate', () => {
     const pluginsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-plugin-owner-'));
     const originalPluginsRoot = process.env.CLAUDE_PLUGINS_ROOT;

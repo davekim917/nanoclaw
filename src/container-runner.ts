@@ -45,6 +45,7 @@ import {
   validateMcpServers,
   writeContainerConfig,
   resolveContainerSecurity,
+  splitExcludedPlugins,
   type ContainerConfig,
   type GitIdentity,
   type McpServerConfig,
@@ -5039,6 +5040,18 @@ export async function buildMounts(
   // excludePlugins deny list skips named plugins — useful for limiting
   // a group's tool surface (e.g. security agents without codex).
   //
+  // Only a TOP-LEVEL entry is honoured here. An entry carrying a "/" names one
+  // sub-plugin of a monorepo the group otherwise keeps, and this path has no
+  // way to withhold it: the host cannot decide what a container's own walkers
+  // will find. Masking it by bind-mounting an empty directory over the sub-path
+  // was tried and removed, because it made the host predict container-side path
+  // resolution and the two namespaces do not have to agree — an absolute
+  // symlink inside the repo is absent to a host `statSync` and live once the
+  // repo is mounted, so the exclusion silently did not apply. Sub-path entries
+  // are validated and drive the always-on composer (`src/claude-md-compose.ts`),
+  // and container-side skill/plugin exclusion lands in a follow-up where each
+  // walker honours the list in its own namespace.
+  //
   // Special case: if codex plugin is mounted and the host's ~/.codex dir
   // exists, mount that RW so the Codex CLI can use the host's OAuth
   // session and persist refresh tokens.
@@ -5048,7 +5061,8 @@ export async function buildMounts(
     // in-tree skill and (via CLAUDE_PLUGINS_ROOT auto-discovery) start a second
     // MCP server with a different allowed root. Host/OSS-only by design.
     const IN_TREE_SHADOWED_PLUGINS = ['design-artifact-loop', 'gitnexus'];
-    const excluded = new Set([...IN_TREE_SHADOWED_PLUGINS, ...(containerConfig.excludePlugins ?? [])]);
+    const declaredTopLevel = splitExcludedPlugins(containerConfig.excludePlugins).topLevel;
+    const excluded = new Set([...IN_TREE_SHADOWED_PLUGINS, ...declaredTopLevel]);
     const pluginScopes = loadPluginScopes(); // client plugins mount only in their workgroups
     let entries: string[] = [];
     try {
@@ -5057,6 +5071,58 @@ export async function buildMounts(
       log.warn('Failed to read ~/plugins directory', { err });
     }
     warnUnmatchedPluginScopes(pluginScopes, entries);
+    // An exclusion that matches nothing is the failure mode this field keeps
+    // producing, and it is the one the VALIDATOR cannot close. Three separate
+    // review rounds each found a different string that passes every shape check
+    // and still can never equal a `readdirSync` name — a NUL, a lone surrogate,
+    // a segment past NAME_MAX — and each fix was one more item on a list with no
+    // end, because "cannot name a file" is not enumerable from the string alone.
+    // Every one of them lands the same way: the operator declares `codex`
+    // withheld, nothing matches, the plugin mounts, and with `codexHostAuth` the
+    // host's Codex OAuth session mounts with it.
+    //
+    // Here the question IS answerable, because here both sides are present. So
+    // this is the rule that closes the class: every declared entry must equal an
+    // entry on disk, compared as the exact string `readdirSync` returned.
+    //
+    // It REFUSES the spawn rather than warning. `excludePlugins` is a
+    // withholding control, so an entry accepted at config-read time that can
+    // never match is a silent fail-open — precisely what a warning nobody reads
+    // preserves. An unresolvable `onecliSecrets` name aborts a spawn for the
+    // same reason (CLAUDE.md, Secrets). A typo, an uninstalled plugin and a byte
+    // no filename can hold are indistinguishable from the config alone and
+    // identical in consequence, so the message names the group and the entries
+    // and leaves the cause to the operator.
+    //
+    // Sub-paths are checked segment by segment against the real tree: the repo
+    // must exist, and each segment below it must exist under the last. That is
+    // what makes the rule cover the sub-path half of the field too, which no
+    // top-level-only check would.
+    const missing: string[] = [];
+    for (const entry of containerConfig.excludePlugins ?? []) {
+      let cursor = pluginsHostDir;
+      for (const segment of entry.split('/')) {
+        let listing: string[];
+        try {
+          listing = fs.readdirSync(cursor);
+        } catch {
+          missing.push(entry);
+          break;
+        }
+        if (!listing.includes(segment)) {
+          missing.push(entry);
+          break;
+        }
+        cursor = path.join(cursor, segment);
+      }
+    }
+    if (missing.length > 0) {
+      throw new Error(
+        `excludePlugins names ${missing.length === 1 ? 'an entry' : 'entries'} that do not exist under ${pluginsHostDir}: ` +
+          `${missing.map((m) => JSON.stringify(m)).join(', ')} (group ${agentGroup.id}). ` +
+          'An exclusion that matches nothing withholds nothing — fix or remove the entry.',
+      );
+    }
     for (const entry of entries) {
       if (excluded.has(entry) || !pluginAllowedForWorkgroup(entry, wgKey, pluginScopes)) continue;
       const pluginHostPath = path.join(pluginsHostDir, entry);

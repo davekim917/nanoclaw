@@ -238,6 +238,21 @@ describe('discoverPortableSkills', () => {
     const out = discoverPortableSkills(tmpDir);
     expect(out[0].name).toBe('real-name');
   });
+
+  it('finds nothing in a sub-plugin directory that has no skills/ of its own', () => {
+    // Rules 7 and 8 both gate on `isDirectory(subSkillsDir)`, so a sub-plugin
+    // directory with no `skills/` contributes nothing. Pinned on its own terms:
+    // the host mask that used to produce such a directory for an excluded
+    // sub-plugin was removed (#826). The host copy of this module is asserted
+    // identical below.
+    writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'wwbd', 'skills', 'wwbd'), { name: 'wwbd' });
+    fs.mkdirSync(path.join(tmpDir, 'bootstrap', 'plugins', 'orchestrate'), { recursive: true });
+    // Rule 8's `<repo>/<sub>` layout is gated on the sub-dir's Claude manifest,
+    // which an empty sub-plugin directory also lacks.
+    fs.mkdirSync(path.join(tmpDir, 'bootstrap', 'rootlevel'), { recursive: true });
+
+    expect(discoverPortableSkills(tmpDir, { runtime: 'opencode' }).map((s) => s.name)).toEqual(['wwbd']);
+  });
 });
 
 describe('syncSkillSymlinks (mirror-dir mode)', () => {

@@ -1145,6 +1145,118 @@ describe('buildMounts agent surfaces', async () => {
     }
   });
 
+  it('never mounts anything for a sub-path exclusion — the repo and all its sub-plugins still mount', async () => {
+    // The mount path honours TOP-LEVEL entries only. Masking a sub-path by
+    // binding an empty directory over it was tried and removed: it made the
+    // host predict container-side path resolution, and an absolute symlink
+    // inside the repo is absent to a host `statSync` but live once the repo is
+    // mounted, so the exclusion silently did not apply. A sub-path entry is
+    // still validated and still drives the always-on composer; it contributes
+    // no mount, and it must not disturb the repo's own.
+    const homedir = path.join(TEST_ROOT, 'home');
+    const bootstrap = path.join(homedir, 'plugins', 'bootstrap');
+    fs.mkdirSync(path.join(bootstrap, 'plugins', 'orchestrate'), { recursive: true });
+    fs.mkdirSync(path.join(bootstrap, 'plugins', 'wwbd'), { recursive: true });
+    fs.mkdirSync(path.join(bootstrap, 'rootlevel'), { recursive: true });
+    fs.mkdirSync(path.join(homedir, 'plugins', 'codex'), { recursive: true });
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(homedir);
+
+    try {
+      const ag = group('ag-subplugin-nomask', 'subplugin-nomask');
+      await createAgentGroup(ag);
+      withWorkgroup(ag);
+      await ensureContainerConfig(ag.id);
+      initGroupFilesystem(ag, {});
+
+      const mounts = await buildMounts(
+        ag,
+        session('s-subplugin-nomask', ag.id),
+        {
+          ...containerConfig(),
+          // One top-level entry and three sub-path entries, including a nested
+          // pair and one naming a directory that does not exist.
+          // All real paths: an entry matching nothing now refuses the spawn
+          // outright (covered separately below), so this fixture exercises the
+          // mount behaviour rather than the admission rule.
+          excludePlugins: ['codex', 'bootstrap/plugins', 'bootstrap/plugins/orchestrate', 'bootstrap/rootlevel'],
+        },
+        'claude',
+        {},
+      );
+      const pluginMounts = mounts
+        .map((mount) => mount.containerPath)
+        .filter((p) => p.startsWith('/workspace/plugins/'));
+
+      // The repo mounts once, from its real host path, and nothing else under
+      // /workspace/plugins is emitted for it.
+      expect(pluginMounts).toEqual(['/workspace/plugins/bootstrap']);
+      expect(mounts.find((m) => m.containerPath === '/workspace/plugins/bootstrap')).toEqual({
+        hostPath: bootstrap,
+        containerPath: '/workspace/plugins/bootstrap',
+        readonly: true,
+      });
+      // The top-level entry is still honoured — that is the half that works.
+      expect(pluginMounts).not.toContain('/workspace/plugins/codex');
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('refuses the spawn when an excludePlugins entry matches nothing on disk', async () => {
+    // The rule that closes the class three review rounds kept finding one string
+    // at a time: a NUL, a lone surrogate, a segment past NAME_MAX — each passes
+    // every shape check, equals no readdirSync name, and leaves the plugin
+    // mounted while the operator believes it withheld. "Cannot name a file" is
+    // not enumerable from the string; "matched nothing" is answerable here,
+    // where both sides are present.
+    //
+    // REFUSES rather than warns: excludePlugins is a withholding control, so an
+    // accepted entry that can never match is a silent fail-open, which is
+    // exactly what a warning nobody reads preserves.
+    const homedir = path.join(TEST_ROOT, 'home');
+    fs.mkdirSync(path.join(homedir, 'plugins', 'codex'), { recursive: true });
+    fs.mkdirSync(path.join(homedir, 'plugins', 'bootstrap', 'plugins', 'wwbd'), { recursive: true });
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(homedir);
+
+    try {
+      const ag = group('ag-unmatched-exclude', 'unmatched-exclude');
+      await createAgentGroup(ag);
+      withWorkgroup(ag);
+      await ensureContainerConfig(ag.id);
+      initGroupFilesystem(ag, {});
+      const build = (excludePlugins: string[]) =>
+        buildMounts(
+          ag,
+          session(`s-x-${excludePlugins.length}`, ag.id),
+          { ...containerConfig(), excludePlugins },
+          'claude',
+          {},
+        );
+
+      // Every shape the validator's character rules were chasing, plus the two
+      // it never could: a case mismatch and a plugin that is simply not here.
+      for (const bad of [
+        ['codex\u0000'],
+        ['codex\uD800'],
+        ['c'.repeat(256)],
+        ['Codex'],
+        ['never-installed'],
+        ['bootstrap/plugins/absent'],
+        ['bootstrap/absent/wwbd'],
+      ]) {
+        await expect(build(bad), `expected ${JSON.stringify(bad[0])} to refuse`).rejects.toThrow(/do not exist under/);
+      }
+
+      // What DOES exist still works, at both depths.
+      const mounts = await build(['codex', 'bootstrap/plugins/wwbd']);
+      const paths = mounts.map((m) => m.containerPath);
+      expect(paths).not.toContain('/workspace/plugins/codex');
+      expect(paths).toContain('/workspace/plugins/bootstrap');
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
   it('mounts a workgroup-scoped plugin only for groups in its workgroups (src/plugin-scopes.ts)', async () => {
     const homedir = path.join(TEST_ROOT, 'home');
     fs.mkdirSync(path.join(homedir, 'plugins', 'client-plugin'), { recursive: true });

@@ -16,7 +16,9 @@ import {
   honouredTimezoneOverride,
   MIN_AUTO_COMPACT_WINDOW,
   resolveGroupTimezone,
+  splitExcludedPlugins,
   updateContainerConfig,
+  validateExcludePlugins,
   writeContainerConfig,
 } from './container-config.js';
 import { TIMEZONE } from './config.js';
@@ -753,5 +755,176 @@ describe('autoCompactWindow (quota-burn plan §0.5)', () => {
     }
     writeGroupConfig('acw-floor', { autoCompactWindow: MIN_AUTO_COMPACT_WINDOW });
     expect(readContainerConfig('acw-floor').autoCompactWindow).toBe(MIN_AUTO_COMPACT_WINDOW);
+  });
+});
+
+describe('excludePlugins', () => {
+  it('accepts a top-level plugin name and a sub-plugin path in either layout', () => {
+    const entries = ['codex', 'bootstrap/plugins/orchestrate', 'knowledge-work-plugins/data', 'a.b_c-d'];
+    writeGroupConfig('xp-ok', { excludePlugins: entries });
+    expect(readContainerConfig('xp-ok').excludePlugins).toEqual(entries);
+    expect(validateExcludePlugins(undefined)).toBeUndefined();
+  });
+
+  it('refuses an entry no sub-plugin walker could act on, naming the entry', () => {
+    // Fail closed: a dropped entry would leave the operator believing a plugin
+    // is withheld while the mount, the Codex registration and the always-on
+    // ruleset all still deliver it.
+    for (const bad of [
+      '/abs/path',
+      '../escape',
+      'bootstrap/../codex',
+      'bootstrap/plugins/orchestrate/skills/deep',
+      'bootstrap//orchestrate',
+      'bootstrap/plugins/',
+      '',
+      42,
+    ]) {
+      writeGroupConfig('xp-bad', { excludePlugins: [bad] });
+      expect(() => readContainerConfig('xp-bad')).toThrow(/excludePlugins entry/);
+    }
+    writeGroupConfig('xp-notarray', { excludePlugins: 'bootstrap' });
+    expect(() => readContainerConfig('xp-notarray')).toThrow(/must be an array/);
+  });
+
+  it('accepts any real directory name, because the enabler writes basenames nobody chose', () => {
+    // scripts/enable-agent-plugin.ts accepts ANY direct child of ~/plugins
+    // (resolvePluginDir checks only "is a directory, parent is the plugins
+    // root") and writes that basename into excludePlugins (applyOptOut). The
+    // field also had no validation at all before sub-paths existed. So a slug
+    // allowlist here would refuse a config that already worked and take the
+    // group's whole spawn down with it — readContainerConfig throws on every
+    // read. Only traversal and separator confusion are the guard's business.
+    // A TOP-LEVEL entry is held to the shape rule alone. Backslash, newline
+    // and DEL are all legal bytes in a Linux directory name, so refusing them
+    // would be the same accepted-set regression -- and a top-level entry is only
+    // ever compared for Set membership against a readdirSync name, never
+    // interpolated into a mount, a path join, or any delimited format.
+    const entries = [
+      'foo+bar',
+      'c++-tools',
+      '@internal',
+      'my plugin',
+      'ünïcode',
+      'back\\slash',
+      'new\nline',
+      'del\u007Fbyte',
+      'bootstrap/plugins/a b+c',
+      // A SUB-PATH is held to the same rule now. It used to be narrower because
+      // it was interpolated into a mask mount's `-v host:container:ro`
+      // argument; that mount is gone, so the narrowing went with it rather than
+      // staying behind as a rule whose reason no longer exists.
+      'repo/plugins/foo:bar',
+      'repo/plugins/back\\slash',
+      'repo/plugins/new\nline',
+    ];
+    writeGroupConfig('xp-odd-names', { excludePlugins: entries });
+    expect(readContainerConfig('xp-odd-names').excludePlugins).toEqual(entries);
+    // ... but `.` and `..` are refused at every depth, top-level included.
+    for (const bad of ['.', '..']) {
+      writeGroupConfig('xp-dots', { excludePlugins: [bad] });
+      expect(() => readContainerConfig('xp-dots')).toThrow(/excludePlugins entry/);
+    }
+  });
+
+  it('refuses what JSON can express and a filename cannot hold: NUL and lone surrogates', () => {
+    // Not a style rule. An entry carrying a NUL passes every shape check and
+    // can never match anything, so `codex` with a trailing NUL lands in the
+    // top-level exclusion set, fails to match the real `codex` directory, and
+    // the plugin mounts — a credential-withholding exclusion silently turned
+    // into credential delivery. Backslash, newline and DEL are legal bytes in a
+    // real directory name and stay accepted (above); NUL has its own
+    // filesystem justification.
+    for (const bad of [
+      'codex\u0000',
+      'repo/plugins/sub\u0000',
+      '\u0000',
+      // An unpaired surrogate is the same class: node re-encodes it as U+FFFD
+      // on the way to a syscall, so the entry can never equal the real
+      // readdirSync name — and with `codexHostAuth` the host's Codex OAuth
+      // mount is admitted alongside the plugin the operator meant to withhold.
+      'codex\uD800',
+      'codex\uDC00',
+      'repo/plugins/sub\uD800',
+    ]) {
+      writeGroupConfig('xp-unnameable', { excludePlugins: [bad] });
+      expect(() => readContainerConfig('xp-unnameable')).toThrow(/excludePlugins entry/);
+    }
+    // A VALID surrogate pair is an ordinary directory name and stays accepted —
+    // the rule is "a filename could be this", not "ASCII only".
+    const ok = ['emoji\u{1F600}', 'repo/plugins/emoji\u{1F600}'];
+    writeGroupConfig('xp-astral', { excludePlugins: ok });
+    expect(readContainerConfig('xp-astral').excludePlugins).toEqual(ok);
+  });
+
+  it('refuses a path segment longer than NAME_MAX, measured in bytes', () => {
+    // Third instance of one class: a segment past NAME_MAX cannot be a basename,
+    // so the entry matches nothing and the exclusion silently does not apply.
+    // Bytes, not characters — an astral character costs four of the 255.
+    const ok255 = 'a'.repeat(255);
+    const over256 = 'a'.repeat(256);
+    writeGroupConfig('xp-len-ok', { excludePlugins: [ok255, `repo/${ok255}`] });
+    expect(readContainerConfig('xp-len-ok').excludePlugins).toEqual([ok255, `repo/${ok255}`]);
+
+    for (const bad of [over256, `repo/plugins/${over256}`, 'x'.repeat(4097)]) {
+      writeGroupConfig('xp-len-bad', { excludePlugins: [bad] });
+      expect(() => readContainerConfig('xp-len-bad')).toThrow(/NAME_MAX/);
+    }
+    // 64 astral characters are 256 bytes — a character count would pass this.
+    writeGroupConfig('xp-len-astral', { excludePlugins: ['\u{1F600}'.repeat(64)] });
+    expect(() => readContainerConfig('xp-len-astral')).toThrow(/NAME_MAX/);
+    // 63 of them are 252 bytes and stay accepted.
+    const astral63 = '\u{1F600}'.repeat(63);
+    writeGroupConfig('xp-len-astral-ok', { excludePlugins: [astral63] });
+    expect(readContainerConfig('xp-len-astral-ok').excludePlugins).toEqual([astral63]);
+  });
+
+  it('refuses a malformed entry on write, not only on read', () => {
+    expect(() =>
+      writeContainerConfig('xp-write', {
+        mcpServers: {},
+        packages: { apt: [], npm: [] },
+        additionalMounts: [],
+        skills: 'all',
+        excludePlugins: ['../escape'],
+      }),
+    ).toThrow(/excludePlugins entry/);
+  });
+
+  it('splits entries into whole-plugin drops and sub-plugin paths', () => {
+    expect(splitExcludedPlugins(['codex', 'bootstrap/plugins/orchestrate', 'repo/sub'])).toEqual({
+      topLevel: new Set(['codex']),
+      subPaths: new Set(['bootstrap/plugins/orchestrate', 'repo/sub']),
+    });
+    expect(splitExcludedPlugins(undefined)).toEqual({ topLevel: new Set(), subPaths: new Set() });
+  });
+
+  it('drops a sub-path an excluded ancestor already covers, in both ancestor shapes', () => {
+    // The broader entry already says everything the narrower one does, so the
+    // covering relation is resolved once here rather than at each consumer.
+    expect(
+      splitExcludedPlugins(['bootstrap/plugins', 'bootstrap/plugins/orchestrate', 'bootstrap/plugins/wwbd']),
+    ).toEqual({
+      topLevel: new Set(),
+      subPaths: new Set(['bootstrap/plugins']),
+    });
+    // A top-level entry withholds the repo whole, so nothing under it needs
+    // naming separately.
+    expect(splitExcludedPlugins(['bootstrap', 'bootstrap/plugins/orchestrate'])).toEqual({
+      topLevel: new Set(['bootstrap']),
+      subPaths: new Set(),
+    });
+    // Order-independent: the ancestor listed after the descendant still wins.
+    expect(splitExcludedPlugins(['bootstrap/plugins/orchestrate', 'bootstrap/plugins'])).toEqual({
+      topLevel: new Set(),
+      subPaths: new Set(['bootstrap/plugins']),
+    });
+    // A prefix that is not a path ancestor is not an ancestor: `bootstrap/plug`
+    // does not cover `bootstrap/plugins/orchestrate`, and a sibling repo's
+    // exclusion covers nothing here.
+    expect(splitExcludedPlugins(['bootstrap/plug', 'bootstrap/plugins/orchestrate', 'other'])).toEqual({
+      topLevel: new Set(['other']),
+      subPaths: new Set(['bootstrap/plug', 'bootstrap/plugins/orchestrate']),
+    });
   });
 });
