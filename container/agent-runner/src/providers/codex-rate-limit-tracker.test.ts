@@ -234,12 +234,16 @@ describe('CodexRateLimitTracker.refreshIfStale', () => {
       release = resolve;
     });
     let calls = 0;
-    const h = harness(async () => {
-      calls += 1;
-      if (calls === 1) return HEALTHY;
-      await gate; // the cadence read: held open until the test releases it
-      return HEALTHY; // an OLDER full response: weekly 20%
-    }, undefined, 1000);
+    const h = harness(
+      async () => {
+        calls += 1;
+        if (calls === 1) return HEALTHY;
+        await gate; // the cadence read: held open until the test releases it
+        return HEALTHY; // an OLDER full response: weekly 20%
+      },
+      undefined,
+      1000,
+    );
     const server = fakeServer();
     await h.tracker.bind(server, '/home/node/.codex');
     h.clock.now += 1000;
@@ -309,15 +313,19 @@ describe('CodexRateLimitTracker.refreshIfStale', () => {
       release = resolve;
     });
     let calls = 0;
-    const h = harness(async () => {
-      calls += 1;
-      if (calls === 1) return HEALTHY; // initial bind: secondary 20%, not parked
-      await gate;
-      return {
-        rateLimits: { secondary: { usedPercent: 97, windowDurationMins: 10080, resetsAt: RESET_S } },
-        accountId: null,
-      };
-    }, undefined, 1000);
+    const h = harness(
+      async () => {
+        calls += 1;
+        if (calls === 1) return HEALTHY; // initial bind: secondary 20%, not parked
+        await gate;
+        return {
+          rateLimits: { secondary: { usedPercent: 97, windowDurationMins: 10080, resetsAt: RESET_S } },
+          accountId: null,
+        };
+      },
+      undefined,
+      1000,
+    );
     const server = fakeServer();
     await h.tracker.bind(server, '/home/node/.codex');
     expect(h.tracker.parkDecision()).toBeNull();
