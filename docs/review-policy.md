@@ -64,6 +64,74 @@ Record a durable review receipt tied to the exact final SHA: reviewer and
 runtime, complete-diff and relevant-file scope, outcome, and every finding with
 its disposition. A local completion claim is not substitute-review coverage.
 
+## Changing the worker policy
+
+The roster above — which model the frontier worker runs and at what effort — is
+**not owned by this repo**. It lives in one hand-edited file in the bootstrap
+plugin, `plugins/workflow/worker-policy.json` (`~/plugins/bootstrap`), and
+everything mechanical on both sides is rendered from it. NanoClaw is a consumer:
+`CODEX_WORKER_MODELS`, the vendor manifest's `codexModel`, and the container
+config's `[agents].default_subagent_reasoning_effort` all read
+`src/worker-policy.vendored.ts`, which only the vendor script writes.
+
+Flipping it — for an experiment or for good — is four steps, in this order:
+
+1. In `~/plugins/bootstrap`, edit `plugins/workflow/worker-policy.json`, run
+   `node plugins/workflow-agents/scripts/sync-agent-skills.mjs`, then
+   `node scripts/check-parity.mjs`. The gate names every prose surface that
+   still states the old policy; fix those by hand. Commit, PR, merge.
+2. Here, `pnpm exec tsx scripts/vendor-workflow-agent.ts`. It refuses if the
+   plugin is mid-flip — its policy file disagreeing with the generated Codex
+   role TOML **or** with the Claude def's `model:`/`effort:` frontmatter, which
+   is the half that decides Claude dispatch — so a half-landed plugin change
+   cannot be vendored, and nothing is written before both checks pass.
+3. `pnpm test`, then work its failures. They are the flip's checklist, not
+   accidents:
+   - `src/workflow-agent-vendor.test.ts` proves the vendored module is the
+     current render of the policy.
+   - `scripts/dispatch-default-docs.test.ts` fails by name every
+     dispatch-policy doc still carrying the old default sentence. Fix them,
+     including the paragraph above.
+   - `scripts/reviewer-models-freshness.test.ts` fails because the reviewer
+     allowlist derives from the same frontier config (see below). Run
+     `pnpm run reviewer-models -- --write`.
+   - Three tests **pin the current policy as literals, deliberately**, and a
+     flip must edit them by hand:
+     `src/claude-agent-md.test.ts`'s "pins Sol without an effort field…",
+     `src/providers/codex.container-config.test.ts` and
+     `container/agent-runner/src/codex-companion-setup.test.ts`, which both
+     assert the rendered `default_subagent_reasoning_effort` line verbatim.
+     They are not oversights left over from the constants refactor and must not
+     be rewritten to read `src/worker-policy.vendored.ts`: an oracle that reads
+     the same constant as the code can never disagree with it (the recurring
+     `mutation coverage` lesson in `docs/review-notes.md`), and host/container
+     agreement is already proved from the constant by
+     `src/provider-surfaces.test.ts`. The literal is the independent statement
+     of what the policy is today, and a flip is supposed to be a visible edit
+     to it.
+4. PR, merge, deploy. **Containers pin the role at spawn**, so nothing changes
+   for a running agent until its container restarts on the new image.
+
+Step 2 is not optional and cannot be shortcut by editing
+`src/worker-policy.vendored.ts` directly: the file is fingerprinted in
+`src/workflow-agent-vendor.manifest.json`, and only the vendor script — which
+needs the plugin repo — refreshes that fingerprint. A hand edit fails on every
+machine, CI included.
+
+**Which reviewer is dispatched** is not a policy question — a reviewer is chosen
+for independence from the artifact's author, not for the worker tier, and the
+plugin's own cross-model review lane pins its models deliberately rather than
+deriving them from this file. **Who is eligible to review is not independent of
+it.** `scripts/reviewer-models.ts` builds
+`container/skills/pr-review-loop/reviewer-models.txt` from exactly two live
+inputs — `container/agents/worker-frontier.md`'s `model:` frontmatter and
+`CODEX_WORKER_MODELS` — plus the fixed Fable/Astra receipt-compatibility ids
+(`computeReviewerModelIds`, `scripts/reviewer-models.ts:107-121`). Both live
+inputs now trace back to the policy file, so a flip moves the allowlist with it:
+the model being flipped away from stops being receipt-eligible unless it is one
+of the two compatibility ids. That is why step 3 regenerates the file rather
+than leaving it to the next PR to notice.
+
 ## Review notes and fix links
 
 Before writing or reviewing code, the author and the reviewer read

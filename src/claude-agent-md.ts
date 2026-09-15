@@ -14,9 +14,9 @@
  *   markdown body           → toml developer_instructions (multiline `"""…"""`)
  *
  * The native frontier worker pins its Codex model. Effort stays out of the
- * role file: [agents].default_subagent_reasoning_effort supplies high
- * (src/providers/codex.ts:79) and the native spawn reasoning_effort field can
- * override it per task.
+ * role file: [agents].default_subagent_reasoning_effort supplies it
+ * (src/providers/codex.ts) and the native spawn reasoning_effort field can
+ * override it per task. Both values come from the same vendored worker policy.
  * Specialized agents continue inheriting their parent model.
  *
  * Dropped (no Codex equivalent or runtime-specific):
@@ -28,6 +28,8 @@
  *   frontmatter.proactive   — Claude routing hint
  */
 
+import { WORKER_POLICY_CODEX_EFFORT, WORKER_POLICY_CODEX_MODEL } from './worker-policy.vendored.js';
+
 const MANAGED_MARKER = '# managed by nanoclaw codex-sync';
 
 export interface ClaudeAgent {
@@ -36,16 +38,27 @@ export interface ClaudeAgent {
   body: string;
 }
 
-/** Only the native execution role has a provider-specific model mapping. */
+/**
+ * Only the native execution role has a provider-specific model mapping, and the
+ * model is not typed here: it is vendored from the bootstrap plugin's one worker
+ * policy file, which is also where the role def's model/effort come from.
+ * Retyping it here is exactly how the two halves forked before;
+ * src/workflow-agent-vendor.test.ts pins them together.
+ */
 export const CODEX_WORKER_MODELS: Record<string, string> = {
-  'worker-frontier': 'gpt-5.6-sol',
+  'worker-frontier': WORKER_POLICY_CODEX_MODEL,
 };
 
 /**
- * Parse a Claude subagent `.md` file's text content. Returns null when the
- * frontmatter is missing or doesn't have the required `name`/`description`.
+ * Slice a Claude subagent `.md` into its frontmatter block and its body.
+ * Returns null when there is no frontmatter block at all.
+ *
+ * Exported because callers need the frontmatter itself, not just the three
+ * fields `parseClaudeAgentMd` keeps: `model:` and `effort:` are the Claude half
+ * of the worker policy, and the vendor script cross-checks them against the
+ * plugin's policy file (`claudeRoleDispatch`, src/workflow-agent-vendor.ts).
  */
-export function parseClaudeAgentMd(content: string): ClaudeAgent | null {
+export function splitClaudeAgentMd(content: string): { frontmatter: string; body: string } | null {
   // Normalize line endings up front. The parser is line-oriented, and any
   // stray `\r` in a value or scalar key would otherwise fail the regex
   // matchers below and the trailing-`\r` in the frontmatter content would
@@ -55,11 +68,20 @@ export function parseClaudeAgentMd(content: string): ClaudeAgent | null {
   const rest = normalized.slice('---\n'.length);
   const endIdx = rest.indexOf('\n---');
   if (endIdx < 0) return null;
-  const frontmatterRaw = rest.slice(0, endIdx);
   // Skip past the closing `---` and the line break that follows it.
   let bodyStart = endIdx + '\n---'.length;
   if (rest[bodyStart] === '\n') bodyStart++;
-  const body = rest.slice(bodyStart);
+  return { frontmatter: rest.slice(0, endIdx), body: rest.slice(bodyStart) };
+}
+
+/**
+ * Parse a Claude subagent `.md` file's text content. Returns null when the
+ * frontmatter is missing or doesn't have the required `name`/`description`.
+ */
+export function parseClaudeAgentMd(content: string): ClaudeAgent | null {
+  const split = splitClaudeAgentMd(content);
+  if (!split) return null;
+  const { frontmatter: frontmatterRaw, body } = split;
 
   const name = extractScalar(frontmatterRaw, 'name');
   const description = extractScalar(frontmatterRaw, 'description');
@@ -186,10 +208,21 @@ export function formatCodexAgentToml(agent: ClaudeAgent): string {
  * Matches up to the LAST period on the description's final line, not the
  * first — a model name with a version number ("Fable 5.1") contains its own
  * period, and `[^.]*` would stop there and leave the clause unstripped.
+ *
+ * The effort word comes from the vendored policy for the same reason the model
+ * does. It used to be the literal "high": the config this role runs under
+ * follows `WORKER_POLICY_CODEX_EFFORT`, so a `codex.effort` flip left the role
+ * advertising an effort it does not run at — and the description is a routing
+ * signal, so that mis-routes the orchestrator exactly as a wrong model name
+ * would. Found by review r2 on #837.
  */
-function retargetRunsOnSentence(description: string, model: string): string {
+export function retargetRunsOnSentence(
+  description: string,
+  model: string,
+  effort: string = WORKER_POLICY_CODEX_EFFORT,
+): string {
   const stripped = description.replace(/\s*Runs on [^\n]*\.\s*$/, '');
-  return `${stripped} Runs on ${model} with high reasoning by default; explicit spawn effort overrides the default.`;
+  return `${stripped} Runs on ${model} with ${effort} reasoning by default; explicit spawn effort overrides the default.`;
 }
 
 /**

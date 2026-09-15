@@ -36,6 +36,7 @@ import {
   resolveContainedRealDirectory,
 } from '../fs-safety.js';
 import { assertValidGroupFolder } from '../group-folder.js';
+import { WORKER_POLICY_CODEX_EFFORT } from '../worker-policy.vendored.js';
 import { registerProviderContainerConfig, type VolumeMount } from './provider-container-registry.js';
 
 function resolveCodexSourceDir(agentGroupFolder: string | undefined, agentGroupId: string, hostHome: string): string {
@@ -76,7 +77,14 @@ export function buildContainerCodexConfig(): string {
     'multi_agent = true',
     '',
     '[agents]',
-    'default_subagent_reasoning_effort = "high"',
+    // Vendored from the bootstrap plugin's one worker policy file. Codex named
+    // roles carry no per-role effort field, so this GLOBAL subagent default is
+    // where the worker's effort lands; a native spawn's own reasoning_effort
+    // still overrides it per task.
+    // JSON.stringify, not a bare `"${…}"`: for these ASCII values JSON and TOML
+    // basic-string escaping agree, and the host has no tomlBasicString helper —
+    // it lives in the runner's separate Bun tree, which this file cannot import.
+    `default_subagent_reasoning_effort = ${JSON.stringify(WORKER_POLICY_CODEX_EFFORT)}`,
     'max_concurrent_threads_per_session = 4',
     '',
     ...CONTAINER_TRUSTED_PROJECTS.flatMap((proj) => [`[projects."${proj}"]`, 'trust_level = "trusted"', '']),

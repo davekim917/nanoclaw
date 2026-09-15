@@ -46,6 +46,7 @@ import {
   syncSkillSymlinks as syncDiscoveredSkillSymlinks,
 } from './plugin-skill-discovery.js';
 import type { McpServerConfig } from './providers/types.js';
+import { WORKER_POLICY_CODEX_EFFORT } from './worker-policy.vendored.js';
 
 const HOST_CODEX_DIR = '/home/node/.codex';
 const RUNTIME_CODEX_DIR = '/home/node/.codex-runtime';
@@ -102,7 +103,15 @@ const CONTAINER_CODEX_CONFIG_BASE = [
   'multi_agent = true',
   '',
   '[agents]',
-  'default_subagent_reasoning_effort = "high"',
+  // Vendored from the bootstrap plugin's one worker policy file — the same
+  // value src/providers/codex.ts writes, so the companion and the provider path
+  // cannot disagree about what a Codex subagent runs at.
+  //
+  // JSON.stringify, not the tomlBasicString helper above: src/provider-surfaces.test.ts
+  // evaluates THIS array literal in a bare `new Function` scope to compare it
+  // against the host's, so the literal may reference only bindings that test
+  // supplies. For an effort word JSON and TOML basic-string escaping agree.
+  `default_subagent_reasoning_effort = ${JSON.stringify(WORKER_POLICY_CODEX_EFFORT)}`,
   'max_concurrent_threads_per_session = 4',
   '',
   ...['/workspace/agent', '/workspace/workgroup', '/workspace/worktrees', '/tmp'].flatMap((proj) => [
