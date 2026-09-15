@@ -3163,7 +3163,7 @@ export class ClaudeProvider implements AgentProvider {
       initialPromptId,
       // Holds the turn level while a prompt is unanswered. The hold ends at the
       // prompt's echo or at the CLI's idle; there is no runner-side timer. It
-      // relies on the CLI (2.1.263) emitting idle even while background agents
+      // relies on the CLI (2.1.272) emitting idle even while background agents
       // run: a CLI that withheld idle during background work (for example with
       // CLAUDE_CODE_BG_TASKS_REPORT_RUNNING on by default) would hold the level
       // for that work's duration after a dropped echo, bounded only by the

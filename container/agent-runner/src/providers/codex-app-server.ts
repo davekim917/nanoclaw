@@ -478,25 +478,25 @@ export async function probeCodexThreadHealth(
  * Pull the account's rate-limit snapshot — the Codex counterpart of Claude's
  * `/usage` control request (providers/claude.ts `planUsagePuller`).
  *
- * **Sent with NO `params` at all**, and that is version-forced. This runner
- * runs against the codex pinned into the image — `ARG CODEX_VERSION=0.153.4`,
- * `container/Dockerfile:41` — where `account/rateLimits/read` deserializes its
- * params as unit, so a params map carrying fields is refused at the JSON-RPC
+ * **Sent with NO `params` at all**, and that stays true across pin moves. The
+ * shape originally shipped as `{ excludeResetCreditDetails: true }`, written
+ * against the HOST's codex-cli 0.154.0, whose generated schema defines
+ * `GetAccountRateLimitsParams` and marks the request's `params` optional. The
+ * container was then pinned to 0.153.4, where `account/rateLimits/read`
+ * deserializes its params as unit, so that map was refused at the JSON-RPC
  * boundary before any account lookup:
  *   `Invalid request: invalid type: map, expected unit`
- * That is exactly what production logged for every bind-time read after the
- * original flag shipped. The flag was written against the HOST's newer
- * codex-cli 0.154.0, whose generated schema does define
- * `GetAccountRateLimitsParams` (with `excludeResetCreditDetails`) and marks the
- * request's `params` as optional — so it accepted the map, and the skew was
- * invisible from the host. Omitting `params` is valid on both: unit on
- * 0.153.4, absent-and-optional on 0.154.0 (verified by issuing the real RPC
- * against both binaries).
+ * — which is what production logged for every bind-time read (#817). Omitting
+ * `params` is valid on both: unit on 0.153.4, absent-and-optional on 0.154.0
+ * (verified by issuing the real RPC against both binaries).
  *
- * `excludeResetCreditDetails: true` only skipped a second reset-credit lookup
- * we never read, so nothing is lost by dropping it. Regaining it requires
- * bumping the container's `CODEX_VERSION` past 0.153.4 first — a supply-chain
- * decision, not a thing to re-add here.
+ * The container's `ARG CODEX_VERSION` (`container/Dockerfile:41`) is now
+ * **0.154.0** too, so the params map would be accepted again — and it is still
+ * deliberately NOT sent. `excludeResetCreditDetails: true` only skipped a
+ * second reset-credit lookup we never read, so re-adding it would buy nothing
+ * and re-couple this call to one codex version; the no-params shape is the one
+ * both old and new binaries accept, and it is what the next pin move should
+ * keep. Do not "fix" it back.
  *
  * Throws on an RPC error or a malformed result; the caller treats a failed read
  * as NOT SAMPLED (no row, no park) and logs it — telemetry must never fail a

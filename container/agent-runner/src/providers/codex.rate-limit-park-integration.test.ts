@@ -177,12 +177,14 @@ describe('Codex rate-limit read → park through gen()', () => {
     expect(events.some((e) => e.type === 'error')).toBe(false);
 
     const read = requests.find((r) => r.method === 'account/rateLimits/read');
-    // No params at all — the container's pinned codex (ARG CODEX_VERSION=0.153.4,
-    // container/Dockerfile:41) deserializes this method's params as unit and
-    // refuses a params map carrying fields with `invalid type: map, expected
-    // unit`, which killed every bind-time read in production. Asserted here too
-    // because this is the end-to-end path: a params shape the pinned binary
-    // rejects costs every `usage_pull` row the test below expects.
+    // No params at all — codex 0.153.4 deserializes this method's params as
+    // unit and refuses a params map carrying fields with `invalid type: map,
+    // expected unit`, which killed every bind-time read in production while the
+    // container pinned it (#817). The pin is now 0.154.0 (ARG CODEX_VERSION,
+    // container/Dockerfile:41) and the no-params shape is kept deliberately as
+    // the cross-version one. Asserted here too because this is the end-to-end
+    // path: a params shape a pinned binary rejects costs every `usage_pull` row
+    // the test below expects.
     expect(read).toBeDefined();
     expect(read && 'params' in read).toBe(false);
     // The read precedes the thread and the turn — the park decision is made before either.
