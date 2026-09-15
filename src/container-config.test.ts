@@ -827,7 +827,7 @@ describe('excludePlugins', () => {
     }
   });
 
-  it('refuses a NUL, which JSON can express and a filename cannot hold', () => {
+  it('refuses what JSON can express and a filename cannot hold: NUL and lone surrogates', () => {
     // Not a style rule. An entry carrying a NUL passes every shape check and
     // can never match anything, so `codex` with a trailing NUL lands in the
     // top-level exclusion set, fails to match the real `codex` directory, and
@@ -835,10 +835,26 @@ describe('excludePlugins', () => {
     // into credential delivery. Backslash, newline and DEL are legal bytes in a
     // real directory name and stay accepted (above); NUL has its own
     // filesystem justification.
-    for (const bad of ['codex\u0000', 'repo/plugins/sub\u0000', '\u0000']) {
-      writeGroupConfig('xp-nul', { excludePlugins: [bad] });
-      expect(() => readContainerConfig('xp-nul')).toThrow(/excludePlugins entry/);
+    for (const bad of [
+      'codex\u0000',
+      'repo/plugins/sub\u0000',
+      '\u0000',
+      // An unpaired surrogate is the same class: node re-encodes it as U+FFFD
+      // on the way to a syscall, so the entry can never equal the real
+      // readdirSync name — and with `codexHostAuth` the host's Codex OAuth
+      // mount is admitted alongside the plugin the operator meant to withhold.
+      'codex\uD800',
+      'codex\uDC00',
+      'repo/plugins/sub\uD800',
+    ]) {
+      writeGroupConfig('xp-unnameable', { excludePlugins: [bad] });
+      expect(() => readContainerConfig('xp-unnameable')).toThrow(/excludePlugins entry/);
     }
+    // A VALID surrogate pair is an ordinary directory name and stays accepted —
+    // the rule is "a filename could be this", not "ASCII only".
+    const ok = ['emoji\u{1F600}', 'repo/plugins/emoji\u{1F600}'];
+    writeGroupConfig('xp-astral', { excludePlugins: ok });
+    expect(readContainerConfig('xp-astral').excludePlugins).toEqual(ok);
   });
 
   it('refuses a malformed entry on write, not only on read', () => {

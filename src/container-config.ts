@@ -682,21 +682,31 @@ export function validateAutoCompactWindow(value: unknown): number | undefined {
  * depth bound below — and no NUL. `/` cannot appear in a segment, since
  * segments are the result of splitting on it.
  *
- * NUL is refused on a filesystem justification the removed character rules did
- * not have. JSON can express it, POSIX filenames cannot contain it, and node
- * rejects such a path outright, so an entry carrying one PASSES validation and
- * can never match anything. That is not a harmless typo: `codex` with a
- * trailing NUL lands in the top-level exclusion set, fails to match the real
- * `codex` directory, and the plugin mounts — a credential-withholding exclusion
- * silently turned into credential delivery, which is exactly the fail-open this
- * validator exists to prevent. Backslash, newline and DEL stay allowed: those
- * are legal bytes in a real Linux directory name, so refusing them refuses
- * configurations that already worked.
+ * Two things are refused on a filesystem justification the removed character
+ * rules did not have, and they are one rule rather than two: an accepted entry
+ * must be a string a filename can actually BE. JSON can express values that a
+ * POSIX name cannot hold — a NUL, and an unpaired UTF-16 surrogate, which node
+ * re-encodes as U+FFFD on its way to a syscall. Either one PASSES every shape
+ * check and can then never match anything. That is not a harmless typo:
+ * `"codex"` with a trailing NUL or lone surrogate lands in the top-level
+ * exclusion set, fails to match the real `codex` directory, and the plugin
+ * mounts — and with `codexHostAuth` the host's Codex OAuth mount is admitted
+ * with it. A credential-withholding exclusion silently turned into credential
+ * delivery is exactly the fail-open this validator exists to prevent.
+ *
+ * Backslash, newline and DEL stay allowed, and the distinction is the whole
+ * point: those are legal bytes in a real Linux directory name, so refusing them
+ * refuses configurations that already worked. These two cannot name any file at
+ * all.
  *
  * `src/plugin-scopes.ts:44`'s narrower `PLUGIN_NAME_RE` governs an
  * operator-authored policy file and is left alone.
  */
-const PLUGIN_PATH_SEGMENT_RE = /^(?!\.\.?$)[^\0]+$/su;
+// `\p{Surrogate}` under the `u` flag matches a LONE surrogate only: a valid
+// pair combines into one astral code point, which is not a surrogate. So an
+// emoji directory name passes and a half-character cannot. (`isWellFormed`
+// says the same thing, but needs an ES2024 lib this tsconfig does not set.)
+const PLUGIN_PATH_SEGMENT_RE = /^(?!\.\.?$)[^\0\p{Surrogate}]+$/su;
 
 /**
  * Deepest `excludePlugins` entry we accept, in path segments. Bounded by what
@@ -739,7 +749,9 @@ export function validateExcludePlugins(value: unknown): string[] | undefined {
     }
     for (const segment of segments) {
       if (!PLUGIN_PATH_SEGMENT_RE.test(segment)) {
-        fail('must be <plugin> or <plugin>/<sub>[/<sub2>] with no empty, "." or ".." segments and no NUL');
+        fail(
+          'must be <plugin> or <plugin>/<sub>[/<sub2>] with no empty, "." or ".." segments and nothing a filename cannot hold',
+        );
       }
     }
   }
