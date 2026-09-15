@@ -2041,7 +2041,10 @@ export async function processQuery(
             // but end() is only safe between turns: closing streaming input
             // while a turn runs also closes its control channel (#608/#610).
             // Leave these rows pending and retry on the next idle poll.
-            if (!turnIdle || resultScopeOpen || query.hasQueuedWork?.()) {
+            // Live background work is the same hazard between turns: the
+            // open input is what keeps a background subagent alive, so
+            // end() here would kill the worker the busy hold protects.
+            if (!turnIdle || resultScopeOpen || query.hasQueuedWork?.() || query.hasBackgroundWork?.()) {
               log('Query settings changed but runtime context is immutable — deferring follow-up until the active query and result handling drain');
               return;
             }

@@ -3807,6 +3807,49 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(getPendingMessages().map((message) => message.id)).toContain('occ-2');
   }, 15_000);
 
+  it('defers an immutable runtime-context restart while background work is live, and ends once it drains', async () => {
+    insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+    let live = 1;
+    let drained = false;
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'delegated, waiting', isError: true };
+      // Idle boundary, but a background worker is still running inside the
+      // CLI: several polls see occ-2 here and must not end() — the open input
+      // is what keeps that worker alive.
+      await Bun.sleep(1600);
+      live = 0;
+      drained = true;
+      yield { type: 'background_work', live: 0 };
+      // Now the next poll may end safely.
+      await Bun.sleep(1600);
+    }
+    let ended = false;
+    let endedAfterDrain = false;
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {
+        ended = true;
+        endedAfterDrain = drained;
+      },
+      abort: () => {},
+      applySettings: async () => {},
+      hasBackgroundWork: () => live > 0,
+      requiresRestartForRuntimeContext: true,
+      events: events(),
+    };
+
+    await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'xhigh',
+      ultracode: false,
+    });
+
+    expect(ended).toBe(true);
+    expect(endedAfterDrain).toBe(true);
+    expect(getPendingMessages().map((message) => message.id)).toContain('occ-2');
+  }, 15_000);
+
   it('does not close immutable runtime context during asynchronous result handling', async () => {
     insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
     let beginOutcome!: () => void;
