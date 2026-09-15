@@ -2336,6 +2336,14 @@ describe('CLAUDE_CODE_OAUTH_SCOPES reaches the container', () => {
     expect(push).toBeTruthy();
   });
 
+  it('derives the credential set ONCE, so the survey cache and the sample rows cannot be filed under different sets', () => {
+    const oauthBlock = source.slice(source.indexOf('if (hostOauth) {'), source.indexOf('const ghToken'));
+    const occurrences = oauthBlock.match(/auth\.oauthScoped \? `group:\$\{credentialFolder\}` : 'global'/g) ?? [];
+    expect(occurrences).toHaveLength(1);
+    expect(oauthBlock).toContain('NANOCLAW_OAUTH_CREDENTIAL_SET=${oauthCredentialSet}');
+    expect(oauthBlock).toContain('slotUsageSurveyForSpawn(oauthCredentialSet, surveySlots)');
+  });
+
   it('never awaits the survey refresh on the spawn path — a usage pull cannot delay or fail a spawn', () => {
     const oauthBlock = source.slice(source.indexOf('if (hostOauth) {'), source.indexOf('const ghToken'));
     expect(oauthBlock).toContain('void refreshed;');

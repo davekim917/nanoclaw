@@ -6598,8 +6598,12 @@ async function buildContainerArgs(
     // under the same unscoped `_N` names as globals, so without this the
     // container cannot tell its slot 2 from the global pool's slot 2 — and
     // rate-limit utilization sampled against them is not comparable (see
-    // rate_limit_samples in the container's outbound.db).
-    args.push('-e', `NANOCLAW_OAUTH_CREDENTIAL_SET=${auth.oauthScoped ? `group:${credentialFolder}` : 'global'}`);
+    // rate_limit_samples in the container's outbound.db). ONE binding, shared
+    // with the usage-survey push below: a second copy of this expression could
+    // drift and file the host's readings for a slot under a different set than
+    // the container files its sample rows under.
+    const oauthCredentialSet = auth.oauthScoped ? `group:${credentialFolder}` : 'global';
+    args.push('-e', `NANOCLAW_OAUTH_CREDENTIAL_SET=${oauthCredentialSet}`);
     // Operator-declared lane per slot (`<slot>:<lane>,...`). The container
     // reads this from its own env (see laneForSlot in providers/claude.ts),
     // and there is NO generic env passthrough into containers — the only one
@@ -6633,10 +6637,8 @@ async function buildContainerArgs(
     // variable, so an ABSENT variable is a wiring bug and an EMPTY one is the
     // cold-start state. (#810's lesson — a pin pushed from only one of the
     // branches that need it regresses silently.)
-    //
     const surveySlots = ringSlotsForSurvey(hostOauth, auth.oauthFallbacks);
-    const credentialSet = auth.oauthScoped ? `group:${credentialFolder}` : 'global';
-    const { survey, refreshed } = slotUsageSurveyForSpawn(credentialSet, surveySlots);
+    const { survey, refreshed } = slotUsageSurveyForSpawn(oauthCredentialSet, surveySlots);
     // Background, and already caught inside — the spawn never waits on it and
     // a usage pull can never fail a spawn. Telemetry, not correctness.
     void refreshed;
