@@ -827,6 +827,20 @@ describe('excludePlugins', () => {
     }
   });
 
+  it('refuses a NUL, which JSON can express and a filename cannot hold', () => {
+    // Not a style rule. An entry carrying a NUL passes every shape check and
+    // can never match anything, so `codex` with a trailing NUL lands in the
+    // top-level exclusion set, fails to match the real `codex` directory, and
+    // the plugin mounts — a credential-withholding exclusion silently turned
+    // into credential delivery. Backslash, newline and DEL are legal bytes in a
+    // real directory name and stay accepted (above); NUL has its own
+    // filesystem justification.
+    for (const bad of ['codex\u0000', 'repo/plugins/sub\u0000', '\u0000']) {
+      writeGroupConfig('xp-nul', { excludePlugins: [bad] });
+      expect(() => readContainerConfig('xp-nul')).toThrow(/excludePlugins entry/);
+    }
+  });
+
   it('refuses a malformed entry on write, not only on read', () => {
     expect(() =>
       writeContainerConfig('xp-write', {

@@ -106,6 +106,19 @@ const MAX_PLUGIN_RULESET_BYTES = 64 * 1024;
  */
 function readRulesetFile(dir: string, filename: string, repoRoot: string): string | null {
   const file = path.join(dir, filename);
+  // The root is resolved BEFORE the open, and that ordering is the point. A
+  // root resolved afterwards is a second pathname lookup the first one cannot
+  // constrain: swap `~/plugins/<repo>` for a symlink to `/home/ubuntu` between
+  // the two, and a descriptor holding `~/.codex/auth.json` measures as
+  // contained by the freshly-resolved root. Resolving first means the fd is
+  // always judged against the root we INTENDED, and a root swapped before the
+  // open sends the open somewhere that no longer measures as inside it.
+  let root: string;
+  try {
+    root = fs.realpathSync(repoRoot);
+  } catch {
+    return null;
+  }
   let fd: number;
   try {
     // O_NONBLOCK, always: opening a FIFO for reading blocks until a writer
@@ -113,14 +126,14 @@ function readRulesetFile(dir: string, filename: string, repoRoot: string): strin
     // a plugin repo carrying a `mkfifo` would hang the host's single event loop
     // rather than return an error. On a regular file Linux ignores the flag.
     // Same flag, same reason, as `readContainedFile` in
-    // `src/dashboard/api/attention-fs.ts`, which is where this whole pattern
-    // comes from.
+    // `src/dashboard/api/attention-fs.ts`, which is where this pattern comes
+    // from.
     fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
   } catch {
     return null;
   }
   try {
-    // Containment is decided about the OPEN DESCRIPTOR, not about the path.
+    // Containment is decided about the OPEN DESCRIPTOR, never about a path.
     // `realpathSync(file)` answers a question about a string at one instant;
     // between that answer and the read, any component — the leaf or a directory
     // `subPluginDirs` walked through — can become a symlink, and the read then
@@ -138,17 +151,22 @@ function readRulesetFile(dir: string, filename: string, repoRoot: string): strin
     // NOT `O_NOFOLLOW`: it refuses only the final component, so it would not
     // close the walked-parent case this check does close, and it WOULD refuse a
     // leaf that is legitimately a symlink to another file inside the same repo.
-    const root = fs.realpathSync(repoRoot);
+    //
+    // FAILS CLOSED where the descriptor cannot be identified. `/proc` is absent
+    // on macOS, and falling back to `realpathSync(file)` there would reinstate
+    // exactly the pathname lookup this check exists to avoid. `attention-fs.ts`
+    // does take that fallback, because it serves a live dashboard where
+    // emitting nothing is a visible outage; here the cost is that a macOS
+    // developer checkout composes no plugin rulesets, which is a degraded
+    // convenience rather than a broken product. This host is Linux (CLAUDE.md).
     let opened: string;
     try {
-      // `null` where /proc is absent (a macOS dev checkout). The fallback
-      // narrows the window to open→realpath rather than closing it; this host
-      // is Linux (CLAUDE.md), where the fd path is always there.
-      const viaFd = fs.readlinkSync(`/proc/self/fd/${fd}`);
-      opened = path.isAbsolute(viaFd) ? viaFd : fs.realpathSync(file);
+      opened = fs.readlinkSync(`/proc/self/fd/${fd}`);
     } catch {
-      opened = fs.realpathSync(file);
+      log.warn('Cannot identify the open descriptor (no /proc); not composing plugin rulesets on this host', { file });
+      return null;
     }
+    if (!path.isAbsolute(opened)) return null;
     if (opened !== root && !opened.startsWith(root + path.sep)) {
       log.warn('Plugin ruleset resolves outside its plugin repository; not composing it', { file, repoRoot: root });
       return null;

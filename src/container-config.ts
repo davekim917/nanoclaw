@@ -677,13 +677,26 @@ export function validateAutoCompactWindow(value: unknown): number | undefined {
  * newline and DEL are all legal bytes in a Linux directory name, so refusing
  * them is the same accepted-set regression in a narrower place.
  *
- * What remains is what traversal actually needs: no empty segment, no `.` or
- * `..`, no absolute path, and the depth bound below. `/` cannot appear in a
- * segment at all — segments are the result of splitting on it.
+ * What remains is what traversal actually needs, plus one byte that is not a
+ * style rule at all: no empty segment, no `.` or `..`, no absolute path, the
+ * depth bound below — and no NUL. `/` cannot appear in a segment, since
+ * segments are the result of splitting on it.
+ *
+ * NUL is refused on a filesystem justification the removed character rules did
+ * not have. JSON can express it, POSIX filenames cannot contain it, and node
+ * rejects such a path outright, so an entry carrying one PASSES validation and
+ * can never match anything. That is not a harmless typo: `codex` with a
+ * trailing NUL lands in the top-level exclusion set, fails to match the real
+ * `codex` directory, and the plugin mounts — a credential-withholding exclusion
+ * silently turned into credential delivery, which is exactly the fail-open this
+ * validator exists to prevent. Backslash, newline and DEL stay allowed: those
+ * are legal bytes in a real Linux directory name, so refusing them refuses
+ * configurations that already worked.
+ *
  * `src/plugin-scopes.ts:44`'s narrower `PLUGIN_NAME_RE` governs an
  * operator-authored policy file and is left alone.
  */
-const PLUGIN_PATH_SEGMENT_RE = /^(?!\.\.?$).+$/su;
+const PLUGIN_PATH_SEGMENT_RE = /^(?!\.\.?$)[^\0]+$/su;
 
 /**
  * Deepest `excludePlugins` entry we accept, in path segments. Bounded by what
@@ -726,7 +739,7 @@ export function validateExcludePlugins(value: unknown): string[] | undefined {
     }
     for (const segment of segments) {
       if (!PLUGIN_PATH_SEGMENT_RE.test(segment)) {
-        fail('must be <plugin> or <plugin>/<sub>[/<sub2>] with no empty, "." or ".." segments');
+        fail('must be <plugin> or <plugin>/<sub>[/<sub2>] with no empty, "." or ".." segments and no NUL');
       }
     }
   }

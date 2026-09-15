@@ -505,20 +505,21 @@ function main(): void {
   // an operator to author one beside a plugin that already has its own would
   // deliver the directive twice on OpenCode (the plugin's own file plus the
   // override) and, on Codex, the override on top of the plugin's native hook.
-  // Both layouts the composer walks: `<repo>/plugins/<sub>/always-on.md` and
-  // `<repo>/<sub>/always-on.md` (`subPluginDirs`, src/claude-md-compose.ts),
-  // plus the repo root for a single-plugin repo.
-  const hasOwnRuleset =
-    fs.existsSync(path.join(dir, 'always-on.md')) ||
-    [path.join(dir, 'plugins'), dir].some((container) => {
-      let subs: string[];
-      try {
-        subs = fs.readdirSync(container);
-      } catch {
-        return false;
-      }
-      return subs.some((sub) => !sub.startsWith('.') && fs.existsSync(path.join(container, sub, 'always-on.md')));
-    });
+  // EXACTLY the layouts the composer walks, and no others: `subPluginDirs`
+  // (src/claude-md-compose.ts) returns `<repo>/plugins/<sub>` and `<repo>/<sub>`
+  // — never the repo itself. A `<repo>/always-on.md` is read by NOBODY, so
+  // counting it here would suppress the override for a repo whose ruleset
+  // nothing composes, and the group would get neither. Eligibility has to be
+  // the composer's set, not a superset that looks like it.
+  const hasOwnRuleset = [path.join(dir, 'plugins'), dir].some((container) => {
+    let subs: string[];
+    try {
+      subs = fs.readdirSync(container);
+    } catch {
+      return false;
+    }
+    return subs.some((sub) => !sub.startsWith('.') && fs.existsSync(path.join(container, sub, 'always-on.md')));
+  });
 
   const classification: Classification = {
     name,

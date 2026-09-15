@@ -630,6 +630,78 @@ describe("sub-plugin always-on: the plugin's own always-on.md (OpenCode only)", 
     }
   });
 
+  it('resolves the repository root BEFORE opening the file, not after', async () => {
+    // An ordering claim needs an ordering probe: asserting the composed output
+    // holds either way, because the race this ordering closes cannot be driven
+    // from outside the function. A root resolved AFTER the open is a second
+    // pathname lookup the first cannot constrain — swap `~/plugins/<repo>` for
+    // a symlink to a parent between the two and a descriptor holding
+    // `~/.codex/auth.json` measures as contained by the freshly-resolved root.
+    const home = seedBootstrapPlugin(null);
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    const calls: string[] = [];
+    const realRealpath = fs.realpathSync;
+    const realOpen = fs.openSync;
+    const realpathSpy = vi.spyOn(fs, 'realpathSync').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      if (String(p) === repo) calls.push(`realpath:${p}`);
+      return (realRealpath as unknown as (...a: unknown[]) => string)(p, ...rest);
+    }) as typeof fs.realpathSync);
+    const openSpy = vi.spyOn(fs, 'openSync').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      if (String(p).startsWith(repo)) calls.push(`open:${p}`);
+      return (realOpen as unknown as (...a: unknown[]) => number)(p, ...rest);
+    }) as typeof fs.openSync);
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-order', 'sub-order');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+
+      // Per READ, not globally: the composer reads one ruleset per sub-plugin,
+      // so the sequence is realpath, open, realpath, open... What must never
+      // appear is an open whose root lookup came after it.
+      expect(
+        calls.some((c) => c.startsWith('open:')),
+        'the composer must open at least one ruleset',
+      ).toBe(true);
+      expect(calls[0] ?? '', 'the first filesystem call must be the root lookup').toMatch(/^realpath:/);
+      calls.forEach((call, i) => {
+        if (!call.startsWith('open:')) return;
+        expect(calls[i - 1] ?? '', `open at ${i} must be preceded by its root lookup`).toMatch(/^realpath:/);
+      });
+    } finally {
+      homedirSpy.mockRestore();
+      openSpy.mockRestore();
+      realpathSpy.mockRestore();
+    }
+  });
+
+  it('composes nothing when the open descriptor cannot be identified', async () => {
+    // r7 claimed no deterministic test could reach the fd path; r8 pointed out
+    // an fs spy can. Forcing `/proc/self/fd/<fd>` to fail is the no-`/proc`
+    // platform (macOS). The old fallback re-resolved the path by name, which is
+    // exactly the lookup the descriptor check exists to avoid — so it now fails
+    // closed instead, and this pins that rather than the fallback.
+    const home = seedBootstrapPlugin(null);
+    const readlinkSpy = vi.spyOn(fs, 'readlinkSync').mockImplementation((p: fs.PathLike, ...rest) => {
+      if (String(p).startsWith('/proc/self/fd/')) throw new Error('ENOSYS: no /proc on this platform');
+      return (fs.readlinkSync as unknown as (...a: unknown[]) => string)(p, ...rest);
+    });
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-noproc', 'sub-noproc');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+      const doc = agentsDoc(ag.folder);
+      // Every plugin ruleset is withheld — not just an escaping one.
+      expect(doc).not.toContain(ORCHESTRATE_SENTINEL);
+      expect(doc).not.toContain(WWBD_SENTINEL);
+      expect(doc).not.toContain(ROOTLEVEL_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+      readlinkSpy.mockRestore();
+    }
+  });
+
   it('composes a ruleset reached by a symlink that stays inside the repository', async () => {
     // Containment, not a ban on symlinks: a repo is free to point a sub-plugin's
     // directive at another file of its own.
