@@ -14,20 +14,35 @@ Pins are data (no deploy); the defaults are code (needs one). **A group you want
 
 Which Claude groups are unpinned — those are the ones that move.
 
-**Read `groups/<folder>/container.json`, not the DB projection.** The spawn path reads the file (`readContainerConfig`, `src/container-config.ts`), while `ncl groups config get` reports the `container_configs` row (`presentConfig`, `src/cli/resources/groups.ts:68-74`). The two are kept in sync by `ncl groups config update`, but an older DB-only update or a hand edit can leave them disagreeing — and then the projection says "pinned" while the next spawn reads an unpinned file and moves to Opus. Check both `model` and the legacy hand-authored `defaultModel`; either one pins.
+**Ask the host's own resolver, not a hand-written check.** Two things make a hand-written check wrong, and both bit this doc in review:
+
+- `groups/<folder>/container.json` is authoritative, not the `container_configs` row `ncl groups config get` prints (`presentConfig`, `src/cli/resources/groups.ts:68-74`) — the spawn path reads the file (`readContainerConfig`), and a DB-only update or hand edit can leave the two disagreeing.
+- **A present `model` is not necessarily a pin.** `resolveClaudeSpawnDefaults` DROPS a value that is not Claude vocabulary and falls through to the default — so a `gpt-*` id left behind by `--provider claude` (which does not clear the previous provider's model), or any typo, reads as pinned and runs as unpinned.
+
+So run the resolver itself. From the install root:
 
 ```bash
-ncl groups list --json | jq -r '.data[] | [.id, .name, .folder] | @tsv' |
-while IFS=$'\t' read -r id name folder; do
-  f="groups/$folder/container.json"
-  [ -f "$f" ] || { printf '%s\t%s\tMISSING %s\n' "$id" "$name" "$f"; continue; }
-  jq -r --arg id "$id" --arg name "$name" '
-    select((.provider // "claude") == "claude")
-    | [$id, $name, (.model // .defaultModel // "(unpinned)")] | @tsv' "$f"
-done
+cat > ./claude-default-audit.ts <<'TS'
+import fs from 'fs';
+import path from 'path';
+import { GROUPS_DIR } from './src/config.js';
+import { readContainerConfig } from './src/container-config.js';
+import { resolveClaudeSpawnDefaults } from './src/claude-spawn-defaults.js';
+
+for (const folder of fs.readdirSync(GROUPS_DIR)) {
+  if (!fs.existsSync(path.join(GROUPS_DIR, folder, 'container.json'))) continue;
+  const cfg = readContainerConfig(folder);
+  if ((cfg?.provider ?? 'claude') !== 'claude') continue;
+  const r = resolveClaudeSpawnDefaults(cfg ?? {});
+  console.log([folder, cfg?.model ?? cfg?.defaultModel ?? '(none)', r.model, r.drops.join('; ') || '-'].join('\t'));
+}
+TS
+pnpm exec tsx ./claude-default-audit.ts   # delete the file when you're done
 ```
 
-Run it from the install root (the same directory `groups/` lives in). Where the projection and the file disagree, the file is what runs — and it is also what a drifted install should have corrected, with `ncl groups config update --model <id>`, which writes both.
+Columns: folder, the configured value, **what will actually run**, and any value the resolver refused. Run it on the code you have now to see today's answer, and again after deploy to see the new one — it imports the same function the spawn path calls, so it cannot drift from the vocabulary or the precedence chain.
+
+A row whose third column is not its second is unpinned in effect: either nothing was configured, or the fourth column says what was thrown away.
 
 A per-channel wiring can also pin a model, and it outranks the group config; check any channel you care about:
 
