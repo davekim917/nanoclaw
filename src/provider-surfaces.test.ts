@@ -910,7 +910,7 @@ describe('buildMounts agent surfaces', async () => {
     const contribution = await providerContribution('opencode', ag, session('s-opencode-defaults', ag.id));
 
     expect(contribution.env).toMatchObject({
-      OPENCODE_MODEL: 'opencode-go/glm-5.3-flash',
+      OPENCODE_MODEL: 'opencode-go/deepseek-v4.1-flash',
       OPENCODE_PROVIDER: 'opencode-go',
       OPENCODE_EFFORT: 'high',
     });
