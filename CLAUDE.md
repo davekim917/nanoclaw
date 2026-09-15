@@ -45,6 +45,7 @@ Most of `src/` is discoverable by reading it. These are the ones you would not g
 - **`src/host-sweep.ts`** — one 60s sweep owns `processing_ack` sync, stale detection, due-message wake, recurrence, ceiling-kill accountability. Anything "on a timer" happens here.
 - **`src/router.ts` → `src/delivery.ts`** — the two ends of the message path; everything else hangs off them.
 - **`scripts/vendor-design-artifact-loop.ts`** — the design-artifact-loop skill and `design_review` engine are **vendored** from `~/plugins/design-artifact-loop` (develop there, not in-tree); `src/design-artifact-loop-vendor.test.ts` fails on drift.
+- **`scripts/vendor-workflow-agent.ts`** — `container/agents/worker-frontier.md` is **vendored** from `~/plugins/bootstrap/plugins/workflow/agents/` (the plugin ships the role so `/orchestrate` works without NanoClaw). Edit it there, not in-tree; `src/workflow-agent-vendor.test.ts` fails on drift and pins `CODEX_WORKER_MODELS` to the plugin's Codex role.
 - **`src/group-init.ts`** — the agent-runner source is a boot snapshot (`src/agent-runner-source.ts`) mounted read-only for every group; edits take effect at the next host restart, not the next spawn.
 
 ## Admin CLI (`ncl`)
