@@ -1308,6 +1308,25 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
  * Write the container config for a group, creating the groups/<folder>/
  * directory if necessary. Pretty-printed JSON so diffs in the activation
  * flow are reviewable.
+ *
+ * Refuses to overwrite an existing file whose root PARSES but is not a JSON
+ * object. `readContainerConfig` is deliberately tolerant — it reads every field
+ * and defaults a document it cannot understand, so a group whose model is
+ * unreadable still boots — and every caller here is read-modify-write
+ * (`updateContainerConfig`, and `ensureRuntimeFields`'s race-safe re-read on
+ * the spawn path, `src/container-runner.ts`). Composed, those two turn a root
+ * the reader could not understand into a materialized default written back over
+ * the original: `[{"excludePlugins": […]}]` is replaced, on disk, by a config
+ * declaring no exclusions, before any container reads it. That is the
+ * operator's file destroyed and a deny policy silently dropped in one step, and
+ * no fail-closed reader downstream can see it happen — it runs before the
+ * mount. Tolerance is the right shape for READING a field; it is not a licence
+ * to normalize away a document nobody has agreed to discard.
+ *
+ * Only the parses-but-is-not-an-object case is refused. Bytes that do not parse
+ * at all are left as they were: that is a different question — there is no
+ * structure to have lost a field from — and refusing it here would leave a
+ * group with a corrupt file no repair path could rewrite.
  */
 export function writeContainerConfig(folder: string, config: ContainerConfig): void {
   validateMcpServers(config.mcpServers ?? {});
@@ -1315,9 +1334,30 @@ export function writeContainerConfig(folder: string, config: ContainerConfig): v
   validateGitIdentity(config.gitIdentity);
   validateExcludePlugins(config.excludePlugins);
   const p = configPath(folder);
+  assertOverwritableContainerConfig(p);
   const dir = path.dirname(p);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(p, JSON.stringify(config, null, 2) + '\n');
+}
+
+/**
+ * Throw when `p` holds valid JSON whose root is not an object — see
+ * `writeContainerConfig`. Absent, unreadable, or unparseable files pass: each
+ * of those is a file with no fields to lose.
+ */
+function assertOverwritableContainerConfig(p: string): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch {
+    return;
+  }
+  if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) return;
+  const shape = parsed === null ? 'null' : Array.isArray(parsed) ? 'array' : typeof parsed;
+  throw new Error(
+    `refusing to overwrite ${p}: its root is a JSON ${shape}, not an object, so any field it declares ` +
+      '(excludePlugins among them) would be discarded rather than read. Fix the file by hand.',
+  );
 }
 
 /**
