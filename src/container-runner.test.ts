@@ -2310,6 +2310,37 @@ describe('CLAUDE_CODE_OAUTH_SCOPES reaches the container', () => {
     expect(oauthBlock.indexOf('CLAUDE_CODE_OAUTH_SCOPES')).toBeGreaterThan(-1);
     expect(oauthBlock.indexOf('CLAUDE_CODE_OAUTH_SCOPES')).toBeLessThan(oauthBlock.indexOf('const ghToken'));
   });
+
+  // The host's plan-utilization survey rides the same block as the ring it
+  // describes. Volume and correctness are pinned in slot-usage-survey.test.ts;
+  // what can only be checked here is that the push is not stranded on some
+  // other branch — #810's lesson, where a pin emitted from one of two spawn
+  // branches regressed the other one silently.
+  it('pushes NANOCLAW_SLOT_USAGE_SURVEY from the same block that forwards the ring', () => {
+    const oauthBlock = source.slice(source.indexOf('if (hostOauth) {'), source.indexOf('const ghToken'));
+    expect(oauthBlock).toMatch(
+      /args\.push\(\s*'-e',\s*`NANOCLAW_SLOT_USAGE_SURVEY=\$\{encodeSlotUsageSurvey\(survey\)\}`/,
+    );
+    expect(oauthBlock).toContain('ringSlotsForSurvey(hostOauth, auth.oauthFallbacks)');
+  });
+
+  it('pushes it unconditionally, so an absent variable is a wiring bug and an empty one is cold start', () => {
+    const oauthBlock = source.slice(source.indexOf('if (hostOauth) {'), source.indexOf('const ghToken'));
+    const push = oauthBlock.slice(oauthBlock.indexOf('NANOCLAW_SLOT_USAGE_SURVEY'));
+    // No `if (`/ternary between the survey read and its push.
+    const between = oauthBlock.slice(
+      oauthBlock.indexOf('slotUsageSurveyForSpawn'),
+      oauthBlock.indexOf('NANOCLAW_SLOT_USAGE_SURVEY'),
+    );
+    expect(between).not.toMatch(/\bif\s*\(/);
+    expect(push).toBeTruthy();
+  });
+
+  it('never awaits the survey refresh on the spawn path — a usage pull cannot delay or fail a spawn', () => {
+    const oauthBlock = source.slice(source.indexOf('if (hostOauth) {'), source.indexOf('const ghToken'));
+    expect(oauthBlock).toContain('void refreshed;');
+    expect(oauthBlock).not.toContain('await refreshed');
+  });
 });
 
 // ── Per-channel instructions profile ─────────────────────────────────────────

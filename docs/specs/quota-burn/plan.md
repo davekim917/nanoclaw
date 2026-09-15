@@ -329,12 +329,28 @@ documented fallback for Codex-authored heads.
   ×5 → fallback kept `_4`. Ring is **5 slots, not 6: `CLAUDE_CODE_OAUTH_TOKEN_5` is empty**
   in `.env` (len 0) — it was live at 12:31Z (real readings) and 14:00Z (3 sessions); blanked
   sometime after. The ring's placeholder guard skips it. Fleet has 5 accounts tonight.
-- **#811 follow-up — no throttle on the six-way pull.** Old single-slot pull:
-  `USAGE_PULL_MIN_INTERVAL_MS = 5 min` (`claude.ts:230`). `pickCredentialSlotByUsage` has
-  none — every session start (including resume and ceiling respawn) fires 6 parallel calls.
-  Under a crash/respawn loop that's a self-inflicted `/usage` throttle and may be part of
-  tonight's 429s. Fix: per-slot min-interval sharing the same constant; serve a fresh-enough
-  `rate_limit_samples` row instead of re-pulling.
+- **#811 follow-up — no throttle on the six-way pull. RESOLVED, and the recorded fix was
+  wrong.** Old single-slot pull: `USAGE_PULL_MIN_INTERVAL_MS = 5 min` (`claude.ts:230`) —
+  that constant governs the IN-TURN SDK `get_usage` pull for the ACTIVE slot and was never
+  dropped. `pickCredentialSlotByUsage` had no throttle, and adding a per-slot one there
+  would have been a **no-op**: it is called exactly once per container boot
+  (`container/agent-runner/src/index.ts`, the single `await
+  provider.pickCredentialSlotByUsage?.()`), and module scope is per-container scope, so a
+  process that does the pull once and exits has nothing to throttle. Serving a fresh
+  `rate_limit_samples` row instead is no better — those rows live in the SESSION's
+  `outbound.db`, so a new session has none and no session can see another's.
+  **Measured 2026-09-15 03:53Z** (fix PR `fix/slot-usage-pull-throttle`): the 429 is
+  per-IDENTITY, not per-IP — a garbage bearer from the same host IP answered `401` in the
+  same second, while `_2`/`_3`/`_4` all answered 429 with `retry-after` decoding to the
+  same instant (04:45:48Z), while a slot from a group-scoped credential set on that same
+  IP decoded to a different one (04:30:57Z). Identical window ends across three accounts is the
+  signature of our own six-way parallel pull advancing every slot's bucket in lockstep, at
+  the fleet's spawn rate (~25/hr, bursting 4-8/min). Real fix: the HOST surveys
+  `/api/oauth/usage` on its own clock (`src/slot-usage-survey.ts`, one pull per slot per
+  `SLOT_USAGE_SURVEY_MIN_INTERVAL_MS`, `retry-after` honoured) and hands each spawn the
+  readings in `NANOCLAW_SLOT_USAGE_SURVEY`; the runner picks and records samples exactly as
+  before and makes no network call. Request volume is now a function of time and ring size
+  alone.
 - **deploy.sh label-restamp on a cache hit** is still a real bug for what IS baked (deps,
   tools): a full-cache-hit build restamps `nanoclaw.commit` onto old layers, and the next
   deploy's `git diff $IMAGE_COMMIT HEAD -- container/` then sees no change. Harmless tonight

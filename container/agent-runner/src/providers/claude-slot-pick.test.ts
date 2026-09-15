@@ -2,19 +2,22 @@
  * Quota-burn 0.6: usage-maximizing OAuth slot pick at session start.
  *
  * Fixtures are raw `/api/oauth/usage` bodies (utilization 0-100) as the CLI
- * passes them through to `get_usage`'s `rate_limits`. No network: the fetch
- * is injected, and the hermeticity preload would trip on the global one.
+ * passes them through to `get_usage`'s `rate_limits`. The runner makes NO
+ * network call any more — the host surveys and hands the readings over in
+ * `NANOCLAW_SLOT_USAGE_SURVEY` (see `src/slot-usage-survey.ts` and its test,
+ * which is where request volume is pinned).
  */
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
 import { ClaudeProvider, usageResponseToSamples } from './claude.js';
 import {
-  OAUTH_BETA_HEADER,
-  OAUTH_USAGE_URL,
   SLOT_PICK_HEADROOM,
-  fetchSlotUsage,
+  SLOT_USAGE_SURVEY_ENV,
+  SLOT_USAGE_SURVEY_MAX_AGE_MS,
   formatSlotRanking,
+  parseSlotUsageSurvey,
   pickSlotByUsage,
+  surveyEntryToUsageResponse,
   type SlotUsageReading,
 } from './claude-slot-pick.js';
 import { getRateLimitSampleRows } from '../modules/mailbox/index.js';
@@ -145,75 +148,76 @@ describe('pickSlotByUsage — the rule', () => {
   });
 });
 
-describe('fetchSlotUsage — the per-slot pull', () => {
-  const json = (body: unknown, status = 200) =>
-    new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+describe('parseSlotUsageSurvey — reading what the host handed over', () => {
+  const now = Date.parse('2026-09-15T06:00:00.000Z');
+  const entry = (fetchedAt: string, seven: number) => ({
+    fetchedAt,
+    rateLimits: { five_hour: win(4), seven_day: win(seven) },
+  });
 
-  it('GETs the usage endpoint authenticated as the given slot and maps the body to rate_limits', async () => {
-    const calls: Array<{ url: string; init: RequestInit }> = [];
-    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
-      calls.push({ url: String(url), init: init ?? {} });
-      return json({ five_hour: win(12), seven_day: win(87), limits: [], extra_usage: { is_enabled: false } });
-    }) as unknown as typeof fetch;
-
-    const res = await fetchSlotUsage('tok-2', { fetchImpl, timeoutMs: 1000 });
-    expect(calls).toHaveLength(1);
-    expect(calls[0]!.url).toBe(OAUTH_USAGE_URL);
-    expect(calls[0]!.init.method).toBe('GET');
-    expect(calls[0]!.init.headers).toMatchObject({ Authorization: 'Bearer tok-2', 'anthropic-beta': OAUTH_BETA_HEADER });
-    expect(res.rate_limits_available).toBe(true);
-    expect(res.rate_limits).toMatchObject({ five_hour: win(12), seven_day: win(87) });
-    // Non-window keys pass through and are ignored downstream (no numeric utilization).
-    const rows = usageResponseToSamples(res, WHO);
-    expect(rows.map((r) => r.limitType).sort()).toEqual(['five_hour', 'seven_day']);
+  it('keeps a fresh reading and hands it over in the shape usageResponseToSamples consumes', () => {
+    const parsed = parseSlotUsageSurvey(
+      JSON.stringify({ CLAUDE_CODE_OAUTH_TOKEN_2: entry('2026-09-15T05:58:00.000Z', 87) }),
+      { now },
+    );
+    expect(parsed.problem).toBeNull();
+    expect(parsed.staleSlots).toEqual([]);
+    const rows = usageResponseToSamples(surveyEntryToUsageResponse(parsed.fresh.CLAUDE_CODE_OAUTH_TOKEN_2!), WHO);
+    // 0-100 in the payload, 0-1 in storage — one normalization seam, unchanged.
     expect(rows.find((r) => r.limitType === 'seven_day')!.utilization).toBeCloseTo(0.87);
+    expect(rows.find((r) => r.limitType === 'seven_day')!.resetsAt).toBe('2026-09-17T00:00:00Z');
   });
 
-  it('rejects on a non-2xx status (expired or scope-less token) instead of recording a row', async () => {
-    const fetchImpl = (async () => json({ error: 'unauthorized' }, 401)) as unknown as typeof fetch;
-    await expect(fetchSlotUsage('bad', { fetchImpl, timeoutMs: 1000 })).rejects.toThrow('HTTP 401');
+  it('drops a reading older than the max age rather than steering the pick with it', () => {
+    const old = new Date(now - SLOT_USAGE_SURVEY_MAX_AGE_MS - 1000).toISOString();
+    const fresh = new Date(now - 60_000).toISOString();
+    const parsed = parseSlotUsageSurvey(
+      JSON.stringify({ CLAUDE_CODE_OAUTH_TOKEN: entry(old, 91), CLAUDE_CODE_OAUTH_TOKEN_2: entry(fresh, 40) }),
+      { now },
+    );
+    expect(Object.keys(parsed.fresh)).toEqual(['CLAUDE_CODE_OAUTH_TOKEN_2']);
+    expect(parsed.staleSlots).toEqual(['CLAUDE_CODE_OAUTH_TOKEN']);
   });
 
-  it('rejects on a non-object body', async () => {
-    const fetchImpl = (async () => json([1, 2, 3])) as unknown as typeof fetch;
-    await expect(fetchSlotUsage('t', { fetchImpl, timeoutMs: 1000 })).rejects.toThrow('non-object');
-  });
-
-  it('never lets the fetch layer’s message — which can quote the Authorization header — escape (PR #811 F1)', async () => {
-    const fetchImpl = (async () => {
-      throw new TypeError('Headers.append: "Bearer sk-live-SECRET" is an invalid header value');
-    }) as unknown as typeof fetch;
-    let thrown: unknown;
-    try {
-      await fetchSlotUsage('sk-live-SECRET', { fetchImpl, timeoutMs: 1000 });
-    } catch (err) {
-      thrown = err;
+  it('is total: every malformed shape yields no reading and no throw', () => {
+    const cases: Array<string | undefined> = [undefined, '', '{nope', '[]', '7', 'null'];
+    for (const raw of cases) {
+      const parsed = parseSlotUsageSurvey(raw, { now });
+      expect(parsed.fresh).toEqual({});
+      expect(parsed.problem).toBeTruthy();
     }
-    expect(thrown).toBeInstanceOf(Error);
-    const message = (thrown as Error).message;
-    expect(message).toBe('usage pull transport error: TypeError');
-    expect(message).not.toContain('SECRET');
-    expect(String(thrown)).not.toContain('SECRET');
+    // Per-slot junk is skipped without poisoning its neighbours.
+    const mixed = parseSlotUsageSurvey(
+      JSON.stringify({
+        A: null,
+        B: { fetchedAt: 42, rateLimits: {} },
+        C: { fetchedAt: 'not-a-date', rateLimits: {} },
+        D: { fetchedAt: '2026-09-15T05:59:00.000Z', rateLimits: 'nope' },
+        E: entry('2026-09-15T05:59:00.000Z', 55),
+      }),
+      { now },
+    );
+    expect(Object.keys(mixed.fresh)).toEqual(['E']);
+    expect(mixed.problem).toBeNull();
   });
 
-  it('sanitizes a body-parse failure the same way', async () => {
-    const fetchImpl = (async () =>
-      new Response('not json sk-live-SECRET', { status: 200, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch;
-    await expect(fetchSlotUsage('sk-live-SECRET', { fetchImpl, timeoutMs: 1000 })).rejects.toThrow(
-      /^usage pull body unreadable: \w+$/,
-    );
+  it('never echoes the variable’s contents into the problem string', () => {
+    const parsed = parseSlotUsageSurvey('{"leaked":"sk-live-SECRET"', { now });
+    expect(parsed.problem).toBe('NANOCLAW_SLOT_USAGE_SURVEY is not JSON');
+    expect(parsed.problem).not.toContain('SECRET');
   });
 
-  it('aborts a hung pull at the deadline', async () => {
-    const fetchImpl = ((_url: unknown, init?: RequestInit) =>
-      new Promise<Response>((_, reject) => {
-        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
-      })) as unknown as typeof fetch;
-    // The reject only fires from the abort listener, so a rejection here still proves the
-    // deadline fired; the message itself is sanitized to the error's class name (PR #811 F1).
-    await expect(fetchSlotUsage('t', { fetchImpl, timeoutMs: 20 })).rejects.toThrow(
-      'usage pull transport error: Error',
+  it('keeps only windows carrying a numeric utilization', () => {
+    const parsed = parseSlotUsageSurvey(
+      JSON.stringify({
+        A: {
+          fetchedAt: '2026-09-15T05:59:00.000Z',
+          rateLimits: { seven_day: win(70), opus: { utilization: null }, limits: [], nope: 'x' },
+        },
+      }),
+      { now },
     );
+    expect(Object.keys(parsed.fresh.A!.rateLimits)).toEqual(['seven_day']);
   });
 });
 
@@ -221,17 +225,20 @@ describe('ClaudeProvider.pickCredentialSlotByUsage — ring integration', () => 
   const savedToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
   const savedSet = process.env.NANOCLAW_OAUTH_CREDENTIAL_SET;
   const savedLanes = process.env.CLAUDE_CODE_OAUTH_LANES;
+  const savedSurvey = process.env[SLOT_USAGE_SURVEY_ENV];
 
   beforeEach(() => {
     initTestSessionDb();
     delete process.env.NANOCLAW_OAUTH_CREDENTIAL_SET;
     delete process.env.CLAUDE_CODE_OAUTH_LANES;
+    delete process.env[SLOT_USAGE_SURVEY_ENV];
   });
   afterEach(() => {
     const restore = (k: string, v: string | undefined) => (v === undefined ? delete process.env[k] : (process.env[k] = v));
     restore('CLAUDE_CODE_OAUTH_TOKEN', savedToken);
     restore('NANOCLAW_OAUTH_CREDENTIAL_SET', savedSet);
     restore('CLAUDE_CODE_OAUTH_LANES', savedLanes);
+    restore(SLOT_USAGE_SURVEY_ENV, savedSurvey);
   });
 
   const RING = {
@@ -240,32 +247,30 @@ describe('ClaudeProvider.pickCredentialSlotByUsage — ring integration', () => 
     CLAUDE_CODE_OAUTH_TOKEN_3: 'tok-3',
   };
 
-  /** Fake fetch keyed by bearer token; `null` → HTTP 500 for that slot. */
-  function fakeFetch(byToken: Record<string, Record<string, unknown> | null>) {
-    const seen: string[] = [];
-    const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
-      const auth = (init?.headers as Record<string, string>).Authorization;
-      const token = auth.replace(/^Bearer /, '');
-      seen.push(token);
-      const body = byToken[token];
-      if (body === null || body === undefined) return new Response('boom', { status: 500 });
-      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
-    }) as unknown as typeof fetch;
-    return { fetchImpl, seen };
+  const NOW = Date.parse('2026-09-15T06:00:00.000Z');
+
+  /** Publish a survey the way the host's spawn push does. */
+  function publishSurvey(bySlot: Record<string, Record<string, unknown> | null>, ageMs = 60_000) {
+    const fetchedAt = new Date(NOW - ageMs).toISOString();
+    const payload: Record<string, unknown> = {};
+    for (const [slot, rateLimits] of Object.entries(bySlot)) {
+      if (rateLimits === null) continue; // a slot the host could not read: simply absent
+      payload[slot] = { fetchedAt, rateLimits };
+    }
+    process.env[SLOT_USAGE_SURVEY_ENV] = JSON.stringify(payload);
   }
 
-  it('samples every slot, records a usage_pull row per slot per window, and moves the ring onto the pick', async () => {
+  it('records a usage_pull row per slot per window and moves the ring onto the pick', async () => {
     process.env.NANOCLAW_OAUTH_CREDENTIAL_SET = 'group:example';
     process.env.CLAUDE_CODE_OAUTH_LANES = '1:agentic-primary,3:shared-dev';
-    const { fetchImpl, seen } = fakeFetch({
-      'tok-1': { five_hour: win(10), seven_day: win(76) },
-      'tok-2': { five_hour: win(40), seven_day: win(87) },
-      'tok-3': { five_hour: win(5), seven_day: win(21) },
+    publishSurvey({
+      CLAUDE_CODE_OAUTH_TOKEN: { five_hour: win(10), seven_day: win(76) },
+      CLAUDE_CODE_OAUTH_TOKEN_2: { five_hour: win(40), seven_day: win(87) },
+      CLAUDE_CODE_OAUTH_TOKEN_3: { five_hour: win(5), seven_day: win(21) },
     });
     const p = new ClaudeProvider({ env: RING });
-    await p.pickCredentialSlotByUsage({ fetchImpl, timeoutMs: 1000 });
+    await p.pickCredentialSlotByUsage({ now: NOW });
 
-    expect(seen.sort()).toEqual(['tok-1', 'tok-2', 'tok-3']);
     expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-2');
     expect(getCredentialSlot('claude')).toBe('CLAUDE_CODE_OAUTH_TOKEN_2');
 
@@ -276,9 +281,17 @@ describe('ClaudeProvider.pickCredentialSlotByUsage — ring integration', () => 
     const sevenDay = Object.fromEntries(
       rows.filter((r) => r.limit_type === 'seven_day').map((r) => [r.account, r.utilization]),
     );
-    expect(sevenDay).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: 0.76, CLAUDE_CODE_OAUTH_TOKEN_2: 0.87, CLAUDE_CODE_OAUTH_TOKEN_3: 0.21 });
+    expect(sevenDay).toEqual({
+      CLAUDE_CODE_OAUTH_TOKEN: 0.76,
+      CLAUDE_CODE_OAUTH_TOKEN_2: 0.87,
+      CLAUDE_CODE_OAUTH_TOKEN_3: 0.21,
+    });
     const lanes = Object.fromEntries(rows.map((r) => [r.account, r.lane]));
-    expect(lanes).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: 'agentic-primary', CLAUDE_CODE_OAUTH_TOKEN_2: null, CLAUDE_CODE_OAUTH_TOKEN_3: 'shared-dev' });
+    expect(lanes).toEqual({
+      CLAUDE_CODE_OAUTH_TOKEN: 'agentic-primary',
+      CLAUDE_CODE_OAUTH_TOKEN_2: null,
+      CLAUDE_CODE_OAUTH_TOKEN_3: 'shared-dev',
+    });
     expect(rows.every((r) => /^\d{4}-\d{2}-\d{2}T.*Z$/.test(r.ts))).toBe(true);
 
     // The pick is what the next query runs on, and rotation continues from it.
@@ -288,29 +301,29 @@ describe('ClaudeProvider.pickCredentialSlotByUsage — ring integration', () => 
 
   it('on resume, re-picks rather than restoring the persisted slot blindly', async () => {
     setCredentialSlot('claude', 'CLAUDE_CODE_OAUTH_TOKEN_3'); // a previous container ended here
-    const { fetchImpl } = fakeFetch({
-      'tok-1': { five_hour: win(1), seven_day: win(90) },
-      'tok-2': { five_hour: win(1), seven_day: win(30) },
-      'tok-3': { five_hour: win(1), seven_day: win(10) },
+    publishSurvey({
+      CLAUDE_CODE_OAUTH_TOKEN: { five_hour: win(1), seven_day: win(90) },
+      CLAUDE_CODE_OAUTH_TOKEN_2: { five_hour: win(1), seven_day: win(30) },
+      CLAUDE_CODE_OAUTH_TOKEN_3: { five_hour: win(1), seven_day: win(10) },
     });
     const p = new ClaudeProvider({ env: RING });
     p.restorePersistedCredentialSlot();
     expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-3');
-    await p.pickCredentialSlotByUsage({ fetchImpl, timeoutMs: 1000 });
+    await p.pickCredentialSlotByUsage({ now: NOW });
     expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-1');
     expect(getCredentialSlot('claude')).toBe('CLAUDE_CODE_OAUTH_TOKEN');
   });
 
-  it('keeps today’s behaviour (restored position, hint untouched) when every slot is exhausted', async () => {
+  it('keeps today’s behaviour (restored position, hint untouched) when every readable slot is exhausted', async () => {
     setCredentialSlot('claude', 'CLAUDE_CODE_OAUTH_TOKEN_2');
-    const { fetchImpl } = fakeFetch({
-      'tok-1': { five_hour: win(0), seven_day: win(100) },
-      'tok-2': { five_hour: win(0), seven_day: win(100) },
-      'tok-3': null, // pull fails → unsampled
+    publishSurvey({
+      CLAUDE_CODE_OAUTH_TOKEN: { five_hour: win(0), seven_day: win(100) },
+      CLAUDE_CODE_OAUTH_TOKEN_2: { five_hour: win(0), seven_day: win(100) },
+      CLAUDE_CODE_OAUTH_TOKEN_3: null, // the host could not read this slot
     });
     const p = new ClaudeProvider({ env: RING });
     p.restorePersistedCredentialSlot();
-    await p.pickCredentialSlotByUsage({ fetchImpl, timeoutMs: 1000 });
+    await p.pickCredentialSlotByUsage({ now: NOW });
     expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-2');
     expect(getCredentialSlot('claude')).toBe('CLAUDE_CODE_OAUTH_TOKEN_2');
     // The two readable slots were still sampled — that is what stops idle slots going dark.
@@ -322,29 +335,77 @@ describe('ClaudeProvider.pickCredentialSlotByUsage — ring integration', () => 
     ]);
   });
 
-  it('does nothing on the API-key auth path (no pulls, no rows)', async () => {
-    const { fetchImpl, seen } = fakeFetch({});
+  it('degrades to the restored slot, with no rows, when the host has published nothing yet', async () => {
+    setCredentialSlot('claude', 'CLAUDE_CODE_OAUTH_TOKEN_3');
+    process.env[SLOT_USAGE_SURVEY_ENV] = '{}';
+    const p = new ClaudeProvider({ env: RING });
+    p.restorePersistedCredentialSlot();
+    await p.pickCredentialSlotByUsage({ now: NOW });
+    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-3');
+    expect(getCredentialSlot('claude')).toBe('CLAUDE_CODE_OAUTH_TOKEN_3');
+    expect(getRateLimitSampleRows()).toHaveLength(0);
+  });
+
+  it('degrades the same way when the variable is missing entirely', async () => {
+    setCredentialSlot('claude', 'CLAUDE_CODE_OAUTH_TOKEN_2');
+    const p = new ClaudeProvider({ env: RING });
+    p.restorePersistedCredentialSlot();
+    await p.pickCredentialSlotByUsage({ now: NOW });
+    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-2');
+    expect(getRateLimitSampleRows()).toHaveLength(0);
+  });
+
+  it('ignores a survey the host stopped refreshing, rather than picking on hour-old numbers', async () => {
+    setCredentialSlot('claude', 'CLAUDE_CODE_OAUTH_TOKEN_2');
+    publishSurvey(
+      {
+        CLAUDE_CODE_OAUTH_TOKEN: { five_hour: win(1), seven_day: win(90) },
+        CLAUDE_CODE_OAUTH_TOKEN_3: { five_hour: win(1), seven_day: win(80) },
+      },
+      SLOT_USAGE_SURVEY_MAX_AGE_MS + 60_000,
+    );
+    const p = new ClaudeProvider({ env: RING });
+    p.restorePersistedCredentialSlot();
+    await p.pickCredentialSlotByUsage({ now: NOW });
+    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-2');
+    expect(getRateLimitSampleRows()).toHaveLength(0);
+  });
+
+  it('picks from a PARTIAL survey and leaves the unread slots unsampled', async () => {
+    setCredentialSlot('claude', 'CLAUDE_CODE_OAUTH_TOKEN');
+    publishSurvey({
+      CLAUDE_CODE_OAUTH_TOKEN: null, // the host was 429'd on this one
+      CLAUDE_CODE_OAUTH_TOKEN_2: { five_hour: win(1), seven_day: win(30) },
+      CLAUDE_CODE_OAUTH_TOKEN_3: { five_hour: win(1), seven_day: win(66) },
+    });
+    const p = new ClaudeProvider({ env: RING });
+    p.restorePersistedCredentialSlot();
+    await p.pickCredentialSlotByUsage({ now: NOW });
+    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-3');
+    expect(new Set(getRateLimitSampleRows().map((r) => r.account))).toEqual(
+      new Set(['CLAUDE_CODE_OAUTH_TOKEN_2', 'CLAUDE_CODE_OAUTH_TOKEN_3']),
+    );
+  });
+
+  it('does nothing on the API-key auth path (no rows)', async () => {
+    publishSurvey({ CLAUDE_CODE_OAUTH_TOKEN: { five_hour: win(1), seven_day: win(2) } });
     const p = new ClaudeProvider({ env: { ANTHROPIC_API_KEY: 'sk-x', ...RING } });
-    await p.pickCredentialSlotByUsage({ fetchImpl, timeoutMs: 1000 });
-    expect(seen).toEqual([]);
+    await p.pickCredentialSlotByUsage({ now: NOW });
     expect(getRateLimitSampleRows()).toHaveLength(0);
   });
 
   it('samples a single-slot ring but has nothing to pick between', async () => {
-    const { fetchImpl, seen } = fakeFetch({ solo: { five_hour: win(1), seven_day: win(2) } });
+    publishSurvey({ CLAUDE_CODE_OAUTH_TOKEN: { five_hour: win(1), seven_day: win(2) } });
     const p = new ClaudeProvider({ env: { CLAUDE_CODE_OAUTH_TOKEN: 'solo' } });
-    await p.pickCredentialSlotByUsage({ fetchImpl, timeoutMs: 1000 });
-    expect(seen).toEqual(['solo']);
+    await p.pickCredentialSlotByUsage({ now: NOW });
     expect(getRateLimitSampleRows()).toHaveLength(2);
     expect(getCredentialSlot('claude')).toBeUndefined();
   });
 
-  it('never throws when the fetch implementation itself throws synchronously', async () => {
-    const fetchImpl = (() => {
-      throw new Error('fetch is broken');
-    }) as unknown as typeof fetch;
+  it('never throws on a survey that is outright garbage', async () => {
+    process.env[SLOT_USAGE_SURVEY_ENV] = 'not json at all {';
     const p = new ClaudeProvider({ env: RING });
-    await expect(p.pickCredentialSlotByUsage({ fetchImpl, timeoutMs: 1000 })).resolves.toBeUndefined();
-    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe(savedToken);
+    await expect(p.pickCredentialSlotByUsage({ now: NOW })).resolves.toBeUndefined();
+    expect(getRateLimitSampleRows()).toHaveLength(0);
   });
 });

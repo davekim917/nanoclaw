@@ -10,37 +10,43 @@
  * 18% with five sessions piled on it.
  *
  * Objective: every slot reaches its weekly reset at ~100% used. So at session
- * start (fresh AND resume) pull `/usage` for EVERY slot, record a sample row
- * per slot per window, and pick the slot with the HIGHEST `seven_day`
- * utilization that is still below 1.0 — drain the most-used account first,
- * because a slot at 88% resetting in 14h is 12% of free quota that a
- * lowest-first rule would leave on the table. Tiebreak: highest `five_hour`
- * below 1.0. Hitting 100% mid-session is handled by the existing in-turn
- * rotate-and-retry (poll-loop.ts, claude.ts `rotateApiKey`).
+ * start (fresh AND resume) read plan utilization for EVERY slot, record a
+ * sample row per slot per window, and pick the slot with the HIGHEST
+ * `seven_day` utilization that is still below 1.0 — drain the most-used
+ * account first, because a slot at 88% resetting in 14h is 12% of free quota
+ * that a lowest-first rule would leave on the table. Tiebreak: highest
+ * `five_hour` below 1.0. Hitting 100% mid-session is handled by the existing
+ * in-turn rotate-and-retry (poll-loop.ts, claude.ts `rotateApiKey`).
  *
- * Why a direct HTTP pull and not the SDK control request: the SDK's
- * `get_usage` is answered by the CLI subprocess of a RUNNING query, under
- * that query's own token (sdk.mjs:221 hands `env:rn` to the spawned CLI). To
- * read a slot that is not active we would have to spawn a CLI per slot. The
- * CLI itself answers `get_usage` by fetching `GET /api/oauth/usage` with
- * `Authorization: Bearer <token>` + `anthropic-beta: oauth-2025-04-20` and
- * passing the body through as `rate_limits` (CLI 2.1.270 bundle: `YD` builds
- * the request, `J5e` returns `rate_limits: d===null?null:...d`), so one
- * fetch per slot yields exactly the object `usageResponseToSamples` already
- * consumes. The container reaches api.anthropic.com directly: the host adds
- * it to NO_PROXY when forwarding OAuth slots (src/container-runner.ts, the
- * "OAuth path" block near `hostOauth`).
+ * WHERE THE READINGS COME FROM. #811 shipped this as one direct
+ * `GET /api/oauth/usage` per slot, issued from here at every session start.
+ * That is once per container boot, so each token saw a request rate equal to
+ * the fleet's Claude session-start rate and the endpoint started answering
+ * `429 rate_limit_error` for every slot at once (measured 2026-09-15 03:53Z,
+ * `retry-after: 3166`). No throttle inside a container can fix a per-identity
+ * limit driven by how many containers start, so the HOST now surveys on its
+ * own clock and hands each spawn the readings in `NANOCLAW_SLOT_USAGE_SURVEY`
+ * (`src/slot-usage-survey.ts`). This module parses that and picks; it makes no
+ * network call at all, and a missing or stale survey degrades to
+ * "unsampled" — the pre-0.6 behaviour of keeping the restored slot.
  *
- * Pure functions only. `fetchSlotUsage` takes its fetch as a parameter so
- * tests never touch the network (test-hermeticity.ts trips on global fetch).
+ * Why a direct HTTP pull rather than the SDK control request, host-side or
+ * otherwise: the SDK's `get_usage` is answered by the CLI subprocess of a
+ * RUNNING query, under that query's own token (sdk.mjs:221 hands `env:rn` to
+ * the spawned CLI). To read a slot that is not active we would have to spawn a
+ * CLI per slot. The CLI itself answers `get_usage` by fetching
+ * `GET /api/oauth/usage` with `Authorization: Bearer <token>` +
+ * `anthropic-beta: oauth-2025-04-20` and passing the body through as
+ * `rate_limits` (CLI 2.1.270 bundle: `YD` builds the request, `J5e` returns
+ * `rate_limits: d===null?null:...d`), so one fetch per slot yields exactly the
+ * object `usageResponseToSamples` already consumes.
+ *
+ * Pure functions only — no IO, no clock of its own.
  */
 import type { RateLimitSample } from '../modules/mailbox/index.js';
 
 // Headroom left on a slot so the in-flight turn can finish before the wall. A wall mid-turn aborts and replays the whole query (SDK snapshots the token at spawn — see PR #811 body), which costs more than 5% of a weekly slot. Tune from measurement: slots resetting under 90% used → tighten; mid-turn walls still >2/day → widen.
 export const SLOT_PICK_HEADROOM = 0.05;
-
-export const OAUTH_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
-export const OAUTH_BETA_HEADER = 'oauth-2025-04-20';
 
 /** Structural mirror of the CLI's `get_usage` response — only what we read. */
 export interface OauthUsageWindow {
@@ -54,71 +60,104 @@ export interface OauthUsageResponse {
   rate_limits?: Record<string, OauthUsageWindow | null | undefined> | null;
 }
 
-export interface FetchSlotUsageOptions {
-  fetchImpl?: typeof fetch;
-  timeoutMs: number;
-  url?: string;
+/** The env variable the host fills with its survey (`src/slot-usage-survey.ts`). */
+export const SLOT_USAGE_SURVEY_ENV = 'NANOCLAW_SLOT_USAGE_SURVEY';
+
+/**
+ * How old a host reading may be and still steer the pick.
+ *
+ * The host refreshes each slot every 10 minutes, but parks a slot for as long
+ * as the server's own `retry-after` when it is rate limited (~53 minutes
+ * observed). Past this age a reading stops being evidence: the slot is
+ * reported `unsampled`, the pick ignores it, and with nothing left the session
+ * keeps the slot it restored. Under-reading is the safe direction anyway —
+ * utilization only climbs inside a window, so a stale number can only make us
+ * pick a slot LESS eagerly than it deserves, and a slot that crossed the wall
+ * since is caught by the in-turn rotate-and-retry.
+ */
+export const SLOT_USAGE_SURVEY_MAX_AGE_MS = 45 * 60_000;
+
+/** One slot's reading as the host serializes it. `utilization` is 0-100, as the endpoint reports it. */
+export interface SlotUsageSurveyEntry {
+  fetchedAt: string;
+  rateLimits: Record<string, { utilization: number; resets_at: string | null }>;
+}
+
+export interface ParsedSlotUsageSurvey {
+  /** Slot name -> a reading young enough to use. */
+  fresh: Record<string, SlotUsageSurveyEntry>;
+  /** Slot names dropped for age, in the order they appeared. */
+  staleSlots: string[];
+  /** Set when the variable was present but unusable — logged, never thrown. */
+  problem: string | null;
 }
 
 /**
- * One `/api/oauth/usage` round-trip authenticated as `token`. Rejects on a
- * non-2xx status, a non-object body, or the deadline; the caller records a
- * rejection as "unsampled" (no row), which is distinct from the
- * `available: false` row that means "plan limits do not apply".
+ * Parse `NANOCLAW_SLOT_USAGE_SURVEY`.
  *
- * `subscription_type` is null here: the CLI derives it from the OAuth
- * profile, not from this endpoint, and the pick does not need it.
- *
- * Every error leaving this function is built HERE from a status code or an
- * error CLASS NAME — never from the fetch layer's `.message`. The token is
- * the `Authorization` header value, and a malformed slot value (a stray
- * newline, a non-ASCII byte) makes `fetch()` throw a TypeError whose message
- * quotes the offending header value verbatim; the caller logs `.message`,
- * so passing it through would put the credential in the container log.
- * PR #811 review F1.
+ * Total function: every malformed shape — absent, not JSON, not an object, a
+ * slot whose entry is the wrong shape, a `fetchedAt` that is not a date —
+ * yields no reading for that slot rather than an exception. The caller treats
+ * a missing reading exactly as it used to treat a failed pull: unsampled, no
+ * sample row, ineligible for the pick.
  */
-export async function fetchSlotUsage(token: string, opts: FetchSlotUsageOptions): Promise<OauthUsageResponse> {
-  const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+export function parseSlotUsageSurvey(
+  raw: string | undefined,
+  opts: { now: number; maxAgeMs?: number },
+): ParsedSlotUsageSurvey {
+  const empty: ParsedSlotUsageSurvey = { fresh: {}, staleSlots: [], problem: null };
+  if (raw === undefined) return { ...empty, problem: `${SLOT_USAGE_SURVEY_ENV} is not set` };
+  if (raw.trim() === '') return { ...empty, problem: `${SLOT_USAGE_SURVEY_ENV} is empty` };
+
+  let parsed: unknown;
   try {
-    let res: Response;
-    try {
-      res = await fetchImpl(opts.url ?? OAUTH_USAGE_URL, {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'anthropic-beta': OAUTH_BETA_HEADER,
-          Accept: 'application/json',
-        },
-        signal: controller.signal,
-      });
-    } catch (err) {
-      throw new Error(`usage pull transport error: ${sanitizedErrorName(err)}`);
-    }
-    if (!res.ok) throw new Error(`usage pull HTTP ${res.status}`);
-    let body: unknown;
-    try {
-      body = await res.json();
-    } catch (err) {
-      throw new Error(`usage pull body unreadable: ${sanitizedErrorName(err)}`);
-    }
-    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
-      throw new Error('usage pull returned a non-object body');
-    }
-    return {
-      subscription_type: null,
-      rate_limits_available: true,
-      rate_limits: body as Record<string, OauthUsageWindow | null | undefined>,
-    };
-  } finally {
-    clearTimeout(timer);
+    parsed = JSON.parse(raw);
+  } catch {
+    // Never echo the value: it is host-supplied, and quoting an unparseable
+    // blob into the container log is how a secret in an adjacent variable
+    // would end up there if the spawn path ever mis-joined two pushes.
+    return { ...empty, problem: `${SLOT_USAGE_SURVEY_ENV} is not JSON` };
   }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { ...empty, problem: `${SLOT_USAGE_SURVEY_ENV} is not an object` };
+  }
+
+  const maxAgeMs = opts.maxAgeMs ?? SLOT_USAGE_SURVEY_MAX_AGE_MS;
+  const fresh: Record<string, SlotUsageSurveyEntry> = {};
+  const staleSlots: string[] = [];
+  for (const [slot, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const entry = value as { fetchedAt?: unknown; rateLimits?: unknown };
+    if (typeof entry.fetchedAt !== 'string') continue;
+    const fetchedAt = Date.parse(entry.fetchedAt);
+    if (Number.isNaN(fetchedAt)) continue;
+    if (opts.now - fetchedAt > maxAgeMs) {
+      staleSlots.push(slot);
+      continue;
+    }
+    if (!entry.rateLimits || typeof entry.rateLimits !== 'object' || Array.isArray(entry.rateLimits)) continue;
+    const windows: Record<string, { utilization: number; resets_at: string | null }> = {};
+    for (const [name, w] of Object.entries(entry.rateLimits as Record<string, unknown>)) {
+      if (!w || typeof w !== 'object' || Array.isArray(w)) continue;
+      const window = w as { utilization?: unknown; resets_at?: unknown };
+      if (typeof window.utilization !== 'number' || !Number.isFinite(window.utilization)) continue;
+      windows[name] = {
+        utilization: window.utilization,
+        resets_at: typeof window.resets_at === 'string' ? window.resets_at : null,
+      };
+    }
+    fresh[slot] = { fetchedAt: entry.fetchedAt, rateLimits: windows };
+  }
+  return { fresh, staleSlots, problem: null };
 }
 
-/** The error's class name only (`TypeError`, `AbortError`, …) — never its message. */
-function sanitizedErrorName(err: unknown): string {
-  return err instanceof Error && err.name ? err.name : 'unknown';
+/**
+ * One survey entry as the `/usage` response shape `usageResponseToSamples`
+ * already consumes, so the 0-100 -> 0-1 normalization stays at its single
+ * seam and the rows written are byte-for-byte what #811 wrote.
+ */
+export function surveyEntryToUsageResponse(entry: SlotUsageSurveyEntry): OauthUsageResponse {
+  return { subscription_type: null, rate_limits_available: true, rate_limits: entry.rateLimits };
 }
 
 /** One ring slot's pull outcome. `samples: null` means the pull failed (unsampled). */
