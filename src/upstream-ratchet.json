@@ -355,7 +355,7 @@
 "container/agent-runner/src/providers/mock.ts":{"diff":45,"mode":"100644","sha256":"2948e18bcf5a5311669bbbca6638908e63fb7e4e3be8c7cad29a2fb42aeb4ea1"},
 "container/agent-runner/src/providers/provider-registry.ts":{"diff":30,"mode":"100644","sha256":"120b0e8ec5d45b04dff6371f702fe0ff983c661399df2c1f57b8fda5e6f7e337"},
 "container/agent-runner/src/providers/rate-limit.test.ts":{"diff":22,"mode":"100644","sha256":"a4e3929dcc6e2d1cc3d77a98b6edc3f33ab80f3b34ea6590acdf43bdd3214cf4"},
-"container/agent-runner/src/providers/types.ts":{"diff":468,"mode":"100644","sha256":"0ea5836819a2ef09dc04236b74dfb84e9a6f3e0a15d13692f78230ec69810311"},
+"container/agent-runner/src/providers/types.ts":{"diff":477,"mode":"100644","sha256":"3825b6db0a48fc20bf661a22aecf2d924748abe34b49f49772f6c98a793501b0"},
 "container/agent-runner/src/scheduling/task-script.test.ts":{"diff":316,"mode":"100644","sha256":"3f8045506c6dbfabfa2e82931fa42226ca35ffe7fa37a1d748c1a7614c2703da"},
 "container/agent-runner/src/scheduling/task-script.ts":{"diff":168,"mode":"100644","sha256":"07ac0bfe183521b98b4e7734b6b30109ff1a8601740add254c72f9a46bbffac8"},
 "container/agent-runner/src/task-delivery.test.ts":{"diff":183,"mode":"100644","sha256":"6728ff0fd8513491c8477e643fed0f86909d1652a83017b6973ad258ca73051d"},
