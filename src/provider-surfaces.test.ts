@@ -1167,13 +1167,10 @@ describe('buildMounts agent surfaces', async () => {
           ...containerConfig(),
           // One top-level entry and three sub-path entries, including a nested
           // pair and one naming a directory that does not exist.
-          excludePlugins: [
-            'codex',
-            'bootstrap/plugins',
-            'bootstrap/plugins/orchestrate',
-            'bootstrap/rootlevel',
-            'bootstrap/plugins/absent',
-          ],
+          // All real paths: an entry matching nothing now refuses the spawn
+          // outright (covered separately below), so this fixture exercises the
+          // mount behaviour rather than the admission rule.
+          excludePlugins: ['codex', 'bootstrap/plugins', 'bootstrap/plugins/orchestrate', 'bootstrap/rootlevel'],
         },
         'claude',
         {},
@@ -1197,17 +1194,20 @@ describe('buildMounts agent surfaces', async () => {
     }
   });
 
-  it('reports an excludePlugins entry that matched no plugin, whatever the reason', async () => {
-    // The structural half of the class three review rounds kept finding one
-    // string at a time: a NUL, a lone surrogate, a segment past NAME_MAX — each
-    // passes every shape check, matches no readdirSync name, and leaves the
-    // plugin mounted while the operator believes it withheld. The validator
-    // cannot enumerate "cannot name a file"; here both sides are in hand, so
-    // the fact is reported rather than the cause guessed. A typo and an
-    // uninstalled plugin land in the same place and are equally worth saying.
+  it('refuses the spawn when an excludePlugins entry matches nothing on disk', async () => {
+    // The rule that closes the class three review rounds kept finding one string
+    // at a time: a NUL, a lone surrogate, a segment past NAME_MAX — each passes
+    // every shape check, equals no readdirSync name, and leaves the plugin
+    // mounted while the operator believes it withheld. "Cannot name a file" is
+    // not enumerable from the string; "matched nothing" is answerable here,
+    // where both sides are present.
+    //
+    // REFUSES rather than warns: excludePlugins is a withholding control, so an
+    // accepted entry that can never match is a silent fail-open, which is
+    // exactly what a warning nobody reads preserves.
     const homedir = path.join(TEST_ROOT, 'home');
     fs.mkdirSync(path.join(homedir, 'plugins', 'codex'), { recursive: true });
-    fs.mkdirSync(path.join(homedir, 'plugins', 'humanizer'), { recursive: true });
+    fs.mkdirSync(path.join(homedir, 'plugins', 'bootstrap', 'plugins', 'wwbd'), { recursive: true });
     const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(homedir);
 
     try {
@@ -1216,25 +1216,34 @@ describe('buildMounts agent surfaces', async () => {
       withWorkgroup(ag);
       await ensureContainerConfig(ag.id);
       initGroupFilesystem(ag, {});
-      vi.mocked(log.warn).mockClear();
+      const build = (excludePlugins: string[]) =>
+        buildMounts(
+          ag,
+          session(`s-x-${excludePlugins.length}`, ag.id),
+          { ...containerConfig(), excludePlugins },
+          'claude',
+          {},
+        );
 
-      const mounts = await buildMounts(
-        ag,
-        session('s-unmatched-exclude', ag.id),
-        { ...containerConfig(), excludePlugins: ['codex', 'codexx', 'never-installed'] },
-        'claude',
-        {},
-      );
+      // Every shape the validator's character rules were chasing, plus the two
+      // it never could: a case mismatch and a plugin that is simply not here.
+      for (const bad of [
+        ['codex\u0000'],
+        ['codex\uD800'],
+        ['c'.repeat(256)],
+        ['Codex'],
+        ['never-installed'],
+        ['bootstrap/plugins/absent'],
+        ['bootstrap/absent/wwbd'],
+      ]) {
+        await expect(build(bad), `expected ${JSON.stringify(bad[0])} to refuse`).rejects.toThrow(/do not exist under/);
+      }
 
-      // The real exclusion still works...
+      // What DOES exist still works, at both depths.
+      const mounts = await build(['codex', 'bootstrap/plugins/wwbd']);
       const paths = mounts.map((m) => m.containerPath);
       expect(paths).not.toContain('/workspace/plugins/codex');
-      expect(paths).toContain('/workspace/plugins/humanizer');
-      // ...and the two that matched nothing are named.
-      expect(log.warn).toHaveBeenCalledWith(
-        expect.stringContaining('excludePlugins names plugins that do not exist'),
-        expect.objectContaining({ unmatched: ['codexx', 'never-installed'] }),
-      );
+      expect(paths).toContain('/workspace/plugins/bootstrap');
     } finally {
       homedirSpy.mockRestore();
     }

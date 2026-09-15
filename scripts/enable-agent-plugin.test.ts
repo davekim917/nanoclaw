@@ -76,15 +76,16 @@ describe('enable-agent-plugin next steps', () => {
     expect(out).toContain('ships its own always-on.md');
   });
 
-  it('still asks for the override when the only always-on.md is at the repo root', () => {
-    // `subPluginDirs` returns `<repo>/plugins/<sub>` and `<repo>/<sub>`, never
-    // the repo itself, so `<repo>/always-on.md` is read by NOBODY. Counting it
-    // as "the plugin has its own" would suppress the override for a repo whose
-    // ruleset nothing composes, and an OpenCode group would get neither. The
-    // enabler's eligibility must be the composer's set, not a superset that
-    // looks like it — the first version of this test asserted the superset,
-    // which is an oracle written from the same wrong belief as the code.
+  it('never asks for the override when the only always-on.md is at the repo root', () => {
+    // A single-plugin repo has no sub-plugin to carry its directive, so the
+    // composer reads the repo ROOT's own always-on.md for OpenCode and this
+    // must agree — a repo we maintain has to reach OpenCode without a
+    // NanoClaw-specific file. The two sides are one decision: if this counted
+    // the root while the composer did not, the override would be suppressed for
+    // a repo whose ruleset nothing composed and the group would get neither.
     seedPlugin('root-only', { ownRulesetAt: 'always-on.md' });
-    expect(runEnabler('root-only')).toMatch(AUTHOR_OVERRIDE);
+    const out = runEnabler('root-only');
+    expect(out).not.toMatch(AUTHOR_OVERRIDE);
+    expect(out).toContain('ships its own always-on.md');
   });
 });

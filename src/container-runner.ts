@@ -5073,26 +5073,55 @@ export async function buildMounts(
     warnUnmatchedPluginScopes(pluginScopes, entries);
     // An exclusion that matches nothing is the failure mode this field keeps
     // producing, and it is the one the VALIDATOR cannot close. Three separate
-    // review rounds found a different string that passes every shape check and
-    // can still never equal a `readdirSync` name — a NUL, a lone surrogate, a
-    // segment past NAME_MAX — and each fix was one more entry on a list that
-    // has no end, because "cannot name a file" is not enumerable from the
-    // string alone. Every one of them lands the same way: the operator declares
-    // `codex` withheld, nothing matches, the plugin mounts, and with
-    // `codexHostAuth` the host's Codex OAuth session mounts with it.
+    // review rounds each found a different string that passes every shape check
+    // and still can never equal a `readdirSync` name — a NUL, a lone surrogate,
+    // a segment past NAME_MAX — and each fix was one more item on a list with no
+    // end, because "cannot name a file" is not enumerable from the string alone.
+    // Every one of them lands the same way: the operator declares `codex`
+    // withheld, nothing matches, the plugin mounts, and with `codexHostAuth` the
+    // host's Codex OAuth session mounts with it.
     //
-    // Here the question is answerable, because here we have both sides. A
-    // typo, an uninstalled plugin, or a byte no filename can hold are
-    // indistinguishable from the config alone and identical in consequence, so
-    // this reports the fact rather than guessing the cause. It WARNS rather
-    // than refusing: a fleet shares configs across hosts, and naming a plugin
-    // this host has not installed is ordinary, not an error.
-    const unmatched = [...declaredTopLevel].filter((name) => !entries.includes(name));
-    if (unmatched.length > 0) {
-      log.warn('excludePlugins names plugins that do not exist in ~/plugins; those exclusions matched nothing', {
-        group: agentGroup.id,
-        unmatched,
-      });
+    // Here the question IS answerable, because here both sides are present. So
+    // this is the rule that closes the class: every declared entry must equal an
+    // entry on disk, compared as the exact string `readdirSync` returned.
+    //
+    // It REFUSES the spawn rather than warning. `excludePlugins` is a
+    // withholding control, so an entry accepted at config-read time that can
+    // never match is a silent fail-open — precisely what a warning nobody reads
+    // preserves. An unresolvable `onecliSecrets` name aborts a spawn for the
+    // same reason (CLAUDE.md, Secrets). A typo, an uninstalled plugin and a byte
+    // no filename can hold are indistinguishable from the config alone and
+    // identical in consequence, so the message names the group and the entries
+    // and leaves the cause to the operator.
+    //
+    // Sub-paths are checked segment by segment against the real tree: the repo
+    // must exist, and each segment below it must exist under the last. That is
+    // what makes the rule cover the sub-path half of the field too, which no
+    // top-level-only check would.
+    const missing: string[] = [];
+    for (const entry of containerConfig.excludePlugins ?? []) {
+      let cursor = pluginsHostDir;
+      for (const segment of entry.split('/')) {
+        let listing: string[];
+        try {
+          listing = fs.readdirSync(cursor);
+        } catch {
+          missing.push(entry);
+          break;
+        }
+        if (!listing.includes(segment)) {
+          missing.push(entry);
+          break;
+        }
+        cursor = path.join(cursor, segment);
+      }
+    }
+    if (missing.length > 0) {
+      throw new Error(
+        `excludePlugins names ${missing.length === 1 ? 'an entry' : 'entries'} that do not exist under ${pluginsHostDir}: ` +
+          `${missing.map((m) => JSON.stringify(m)).join(', ')} (group ${agentGroup.id}). ` +
+          'An exclusion that matches nothing withholds nothing — fix or remove the entry.',
+      );
     }
     for (const entry of entries) {
       if (excluded.has(entry) || !pluginAllowedForWorkgroup(entry, wgKey, pluginScopes)) continue;

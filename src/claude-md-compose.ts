@@ -411,10 +411,30 @@ export async function composeGroupClaudeMd(
       const repoRoot = path.join(pluginsRoot, name);
       const override = readRulesetFile(repoRoot, NANOCLAW_ALWAYS_ON_MARKER, repoRoot);
       if (override) desired.set(`plugin-${name}.md`, override);
-      // A plugin's own always-on.md reaches OpenCode and nothing else. Codex
-      // would receive the same text twice — once here, once from the plugin's
-      // SessionStart hook — so the gate is provider equality, not `!== 'claude'`.
+      // A plugin's own always-on.md reaches OpenCode and nothing else. Claude
+      // auto-loads the plugin's SessionStart hook through CLAUDE_PLUGINS_ROOT,
+      // and Codex fires plugin hooks too — but ONLY for a plugin whose
+      // `.codex-plugin/plugin.json` declares them AND whose hook identity is
+      // trusted. Container-side hook trust is what PR #827 installs; BEFORE IT
+      // LANDS, Codex plugin hooks are untrusted and inert, so a maintained
+      // plugin's directive reaches a Codex container by neither route. That gap
+      // is deliberate and ordered: #827 merges first, and the two deploy
+      // together, so the premise is true at the moment this code goes live.
+      // Composing for Codex in the meantime would deliver the text twice the
+      // day #827 merges.
       if (provider !== 'opencode') continue;
+      // The repo ROOT's own generic ruleset, for a single-plugin repo whose
+      // directive is not under a sub-plugin. Without this, such a repo would
+      // still need a NanoClaw-specific `.nanoclaw-always-on.md` to reach
+      // OpenCode — the exact property a plugin repo we maintain is supposed to
+      // avoid. Same containment read and same key as the override, so an
+      // operator override present alongside it wins: `desired.set` above ran
+      // first, and this does not overwrite.
+      const rootFragment = `plugin-${name}.md`;
+      if (!desired.has(rootFragment)) {
+        const rootOwn = readRulesetFile(repoRoot, PLUGIN_ALWAYS_ON_FILE, repoRoot);
+        if (rootOwn) desired.set(rootFragment, rootOwn);
+      }
       for (const { subPath, dir } of subPluginDirs(pluginsRoot, name)) {
         if (isExcludedSubPath(subPath, excludedSubPaths)) continue;
         const content = readRulesetFile(dir, PLUGIN_ALWAYS_ON_FILE, repoRoot);
