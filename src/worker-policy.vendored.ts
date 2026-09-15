@@ -11,7 +11,7 @@
  */
 
 /** The frontier worker's Codex model — what `worker-frontier` dispatches to. */
-export const WORKER_POLICY_CODEX_MODEL = 'gpt-5.6-sol';
+export const WORKER_POLICY_CODEX_MODEL = "gpt-5.6-sol";
 
 /**
  * The frontier worker's Codex reasoning effort. Codex named roles have no
@@ -20,10 +20,10 @@ export const WORKER_POLICY_CODEX_MODEL = 'gpt-5.6-sol';
  * a GLOBAL subagent default, which a native spawn's own `reasoning_effort`
  * still overrides per task.
  */
-export const WORKER_POLICY_CODEX_EFFORT = 'high';
+export const WORKER_POLICY_CODEX_EFFORT = "high";
 
 /** The frontier worker's Claude model, as the plugin's agent def pins it. */
-export const WORKER_POLICY_CLAUDE_MODEL = 'claude-opus-5[1m]';
+export const WORKER_POLICY_CLAUDE_MODEL = "claude-opus-5[1m]";
 
 /** The frontier worker's Claude effort, as the plugin's agent def pins it. */
-export const WORKER_POLICY_CLAUDE_EFFORT = 'high';
+export const WORKER_POLICY_CLAUDE_EFFORT = "high";
