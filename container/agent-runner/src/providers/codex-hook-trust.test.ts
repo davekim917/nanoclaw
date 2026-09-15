@@ -322,10 +322,57 @@ describe('plugin hook trust', () => {
     expect(declaredPluginHookFiles(dir)).toEqual(['hooks/declared.json']);
   });
 
-  it('falls back to the Claude-first manifest', () => {
-    const dir = path.join(tmpdir(), 'claude-first');
+  it('ignores a hooks declaration that only the Claude manifest makes', () => {
+    // Measured against codex-cli 0.154.0, with a control in the same run: a
+    // fixture declaring hooks in `.codex-plugin/plugin.json` is loaded, and a
+    // fixture declaring the SAME file only in `.claude-plugin/plugin.json`
+    // yields zero hooks. The real `wwbd@davekim917-bootstrap` is that second
+    // shape and Codex reports no hooks for it. Trusting the Claude-declared
+    // file would key a row on a file Codex never reads and record a hook as
+    // covered when it does not run at all.
+    const dir = path.join(tmpdir(), 'claude-declared-only');
+    fs.mkdirSync(path.join(dir, '.codex-plugin'), { recursive: true });
     fs.mkdirSync(path.join(dir, '.claude-plugin'), { recursive: true });
-    fs.writeFileSync(path.join(dir, '.claude-plugin', 'plugin.json'), JSON.stringify({ hooks: 'hooks/h.json' }));
-    expect(declaredPluginHookFiles(dir)).toEqual(['hooks/h.json']);
+    fs.mkdirSync(path.join(dir, 'hooks'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.codex-plugin', 'plugin.json'), JSON.stringify({ name: 'cldecl' }));
+    fs.writeFileSync(
+      path.join(dir, '.claude-plugin', 'plugin.json'),
+      JSON.stringify({ name: 'cldecl', hooks: './hooks/declared.json' }),
+    );
+    fs.writeFileSync(
+      path.join(dir, 'hooks', 'declared.json'),
+      JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: '/bin/true' }] }] } }),
+    );
+    expect(declaredPluginHookFiles(dir)).toEqual([]);
+    expect(collectPluginHookTrustEntries({ pluginId: 'cldecl@mkt', dir })).toEqual([]);
+  });
+
+  it('takes the conventional file when the Codex manifest declares none, even if the Claude manifest declares one', () => {
+    // Same measurement, third fixture: `.codex-plugin` without `hooks`,
+    // `.claude-plugin` declaring `hooks/declared.json`, both files on disk.
+    // Codex 0.154.0 loads `hooks/hooks.json` — key
+    // `cxnone@probemk:hooks/hooks.json:session_start:0:0` — and never
+    // `hooks/declared.json`. The selecting manifest is the Codex one alone.
+    const dir = path.join(tmpdir(), 'codex-none-claude-declares');
+    fs.mkdirSync(path.join(dir, '.codex-plugin'), { recursive: true });
+    fs.mkdirSync(path.join(dir, '.claude-plugin'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'hooks'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.codex-plugin', 'plugin.json'), JSON.stringify({ name: 'cxnone' }));
+    fs.writeFileSync(
+      path.join(dir, '.claude-plugin', 'plugin.json'),
+      JSON.stringify({ name: 'cxnone', hooks: './hooks/declared.json' }),
+    );
+    fs.writeFileSync(path.join(dir, 'hooks', 'declared.json'), JSON.stringify({ hooks: {} }));
+    fs.writeFileSync(
+      path.join(dir, 'hooks', 'hooks.json'),
+      JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: '/bin/true', timeout: 9 }] }] } }),
+    );
+    expect(declaredPluginHookFiles(dir)).toEqual(['hooks/hooks.json']);
+    expect(collectPluginHookTrustEntries({ pluginId: 'cxnone@mkt', dir })).toEqual([
+      {
+        key: 'cxnone@mkt:hooks/hooks.json:session_start:0:0',
+        hash: codexHookTrustHash('SessionStart', { type: 'command', command: '/bin/true', timeout: 9 }),
+      },
+    ]);
   });
 });

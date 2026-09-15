@@ -341,33 +341,47 @@ const DEFAULT_PLUGIN_HOOKS_FILE = 'hooks/hooks.json';
  * Verified against codex-cli 0.154.0 by registering fixture plugins into a
  * scratch CODEX_HOME and reading `hooks/list`:
  *
- * | manifest `hooks` | file present        | loaded |
- * |------------------|---------------------|--------|
- * | `./hooks/d.json` | `hooks/d.json`      | yes    |
- * | `./hooks/d.json` | `hooks/hooks.json`  | NO — a declaration REPLACES the default |
- * | absent           | `hooks/hooks.json`  | yes    |
- * | absent           | `hooks/other.json`  | no     |
+ * | `.codex-plugin` `hooks` | `.claude-plugin` `hooks` | files present            | loaded             |
+ * |-------------------------|--------------------------|--------------------------|--------------------|
+ * | `./hooks/d.json`        | —                        | `hooks/d.json`           | `hooks/d.json`     |
+ * | `./hooks/d.json`        | —                        | + `hooks/hooks.json`     | `hooks/d.json` only — a declaration REPLACES the default |
+ * | absent                  | —                        | `hooks/hooks.json`       | `hooks/hooks.json` |
+ * | absent                  | —                        | `hooks/other.json`       | nothing            |
+ * | absent                  | `./hooks/d.json`         | `hooks/d.json`           | **nothing**        |
+ * | absent                  | `./hooks/d.json`         | + `hooks/hooks.json`     | `hooks/hooks.json` |
  *
- * So the default is a fallback, never an addition — emitting both would write
- * a trust row keyed on a file Codex never reads. `.codex-plugin/plugin.json`
- * wins over `.claude-plugin/plugin.json` (Codex accepts Claude-first
- * manifests — see `readCodexMarketplaceName` in `../codex-companion-setup.ts`).
+ * Two rules, both measured, and the second is the one that is easy to get
+ * wrong. The default is a FALLBACK, never an addition — emitting both would
+ * write a trust row keyed on a file Codex never reads. And the selecting
+ * manifest is `.codex-plugin/plugin.json` ALONE: a `hooks` field in
+ * `.claude-plugin/plugin.json` is not read at all, so a plugin whose Codex
+ * manifest omits `hooks` takes the conventional fallback even when the Claude
+ * manifest declares something else. (The Claude-first acceptance that does
+ * exist is for MARKETPLACE manifests — `readCodexMarketplaceName` in
+ * `../codex-companion-setup.ts` — not for a plugin's own hooks declaration.)
+ *
+ * The last two rows are live in this tree: `wwbd@davekim917-bootstrap` ships
+ * `hooks/wwbd-hooks.json` declared only in its Claude manifest and no
+ * conventional file, and Codex 0.154.0 reports zero hooks for it. Reading the
+ * Claude manifest here would key a trust row on that file — harmless in
+ * itself, but it would state as covered a hook Codex never loads. Every
+ * registerable plugin has a `.codex-plugin/plugin.json` by construction
+ * (`readCodexPluginEntryName` is what admits it, for repo roots and monorepo
+ * sub-plugins alike), so reading only that manifest loses no plugin.
  */
 export function declaredPluginHookFiles(pluginDir: string): string[] {
-  for (const manifestRel of [path.join('.codex-plugin', 'plugin.json'), path.join('.claude-plugin', 'plugin.json')]) {
-    const manifest = readJson(path.join(pluginDir, manifestRel));
-    if (!manifest) continue;
-    const raw = manifest.hooks;
-    const candidates = typeof raw === 'string' ? [raw] : Array.isArray(raw) ? raw : [];
-    const files = candidates
-      .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
-      // The state key carries the path as declared minus a `./` prefix —
-      // `hooks/workflow-hooks.json`, not `./hooks/workflow-hooks.json`.
-      .map((value) => value.replace(/^\.\//, '').replace(/^\/+/, ''));
-    if (files.length > 0) return files;
-  }
-  // No declaration anywhere → the conventional file, if the plugin ships one.
-  return fs.existsSync(path.join(pluginDir, DEFAULT_PLUGIN_HOOKS_FILE)) ? [DEFAULT_PLUGIN_HOOKS_FILE] : [];
+  const conventional = (): string[] =>
+    fs.existsSync(path.join(pluginDir, DEFAULT_PLUGIN_HOOKS_FILE)) ? [DEFAULT_PLUGIN_HOOKS_FILE] : [];
+  const manifest = readJson(path.join(pluginDir, '.codex-plugin', 'plugin.json'));
+  if (!manifest) return conventional();
+  const raw = manifest.hooks;
+  const candidates = typeof raw === 'string' ? [raw] : Array.isArray(raw) ? raw : [];
+  const files = candidates
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    // The state key carries the path as declared minus a `./` prefix —
+    // `hooks/workflow-hooks.json`, not `./hooks/workflow-hooks.json`.
+    .map((value) => value.replace(/^\.\//, '').replace(/^\/+/, ''));
+  return files.length > 0 ? files : conventional();
 }
 
 /** Trust entries for every hook Codex will load for this plugin. */
