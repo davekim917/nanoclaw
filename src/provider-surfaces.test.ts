@@ -1197,6 +1197,24 @@ describe('buildMounts agent surfaces', async () => {
       expect(order.indexOf('/workspace/plugins/bootstrap')).toBeLessThan(
         order.indexOf('/workspace/plugins/bootstrap/plugins/orchestrate'),
       );
+
+      // A descendant of an already-excluded ancestor emits NO mask of its own.
+      // The ancestor's mask is an empty read-only bind, so the descendant's
+      // mountpoint no longer exists inside it, docker cannot create one there,
+      // and the spawn would fail outright instead of excluding the plugin.
+      const nested = await buildMounts(
+        ag,
+        session('s-subplugin-nested', ag.id),
+        {
+          ...containerConfig(),
+          excludePlugins: ['bootstrap/plugins', 'bootstrap/plugins/orchestrate', 'bootstrap/plugins/wwbd'],
+        },
+        'claude',
+        {},
+      );
+      expect(
+        nested.map((mount) => mount.containerPath).filter((p) => p.startsWith('/workspace/plugins/bootstrap/')),
+      ).toEqual(['/workspace/plugins/bootstrap/plugins']);
     } finally {
       homedirSpy.mockRestore();
     }

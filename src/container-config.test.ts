@@ -807,4 +807,34 @@ describe('excludePlugins', () => {
     });
     expect(splitExcludedPlugins(undefined)).toEqual({ topLevel: new Set(), subPaths: new Set() });
   });
+
+  it('drops a sub-path an excluded ancestor already covers, in both ancestor shapes', () => {
+    // A mask is an empty read-only bind, so a descendant mask's mountpoint does
+    // not exist inside it and docker refuses the spawn rather than excluding the
+    // plugin. The broader entry already says everything the narrower one does.
+    expect(
+      splitExcludedPlugins(['bootstrap/plugins', 'bootstrap/plugins/orchestrate', 'bootstrap/plugins/wwbd']),
+    ).toEqual({
+      topLevel: new Set(),
+      subPaths: new Set(['bootstrap/plugins']),
+    });
+    // A top-level entry drops the repo mount entirely, so nothing under it needs
+    // masking either.
+    expect(splitExcludedPlugins(['bootstrap', 'bootstrap/plugins/orchestrate'])).toEqual({
+      topLevel: new Set(['bootstrap']),
+      subPaths: new Set(),
+    });
+    // Order-independent: the ancestor listed after the descendant still wins.
+    expect(splitExcludedPlugins(['bootstrap/plugins/orchestrate', 'bootstrap/plugins'])).toEqual({
+      topLevel: new Set(),
+      subPaths: new Set(['bootstrap/plugins']),
+    });
+    // A prefix that is not a path ancestor is not an ancestor: `bootstrap/plug`
+    // does not cover `bootstrap/plugins/orchestrate`, and a sibling repo's
+    // exclusion covers nothing here.
+    expect(splitExcludedPlugins(['bootstrap/plug', 'bootstrap/plugins/orchestrate', 'other'])).toEqual({
+      topLevel: new Set(['other']),
+      subPaths: new Set(['bootstrap/plug', 'bootstrap/plugins/orchestrate']),
+    });
+  });
 });

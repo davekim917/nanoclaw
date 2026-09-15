@@ -712,16 +712,36 @@ export function validateExcludePlugins(value: unknown): string[] | undefined {
  * a repo that IS still delivered. Shared by the mount builder
  * (`src/container-runner.ts`) and the always-on composer
  * (`src/claude-md-compose.ts`) so the two can't disagree about what an entry means.
+ *
+ * `subPaths` holds only the entries no broader exclusion already covers. A
+ * sub-path under an excluded ancestor says nothing the ancestor has not already
+ * said, and emitting it anyway is not merely redundant at the mount builder: the
+ * ancestor's mask is an empty read-only bind, so the descendant's mountpoint no
+ * longer exists inside it, docker cannot create one there, and the spawn fails
+ * outright instead of excluding the plugin. Both ancestor shapes drop here —
+ * a top-level entry (`bootstrap`, whose repo mount is never created at all) and
+ * a shallower sub-path (`bootstrap/plugins` over `bootstrap/plugins/orchestrate`).
  */
 export function splitExcludedPlugins(entries: readonly string[] | undefined): {
   topLevel: Set<string>;
   subPaths: Set<string>;
 } {
   const topLevel = new Set<string>();
-  const subPaths = new Set<string>();
+  const allSubPaths = new Set<string>();
   for (const entry of entries ?? []) {
-    if (entry.includes('/')) subPaths.add(entry);
+    if (entry.includes('/')) allSubPaths.add(entry);
     else topLevel.add(entry);
+  }
+  const subPaths = new Set<string>();
+  for (const subPath of allSubPaths) {
+    const segments = subPath.split('/');
+    // Strict ancestors only: the repo name (a top-level entry), then every
+    // shallower sub-path. `i < segments.length` stops before the entry itself.
+    let covered = topLevel.has(segments[0]);
+    for (let i = 2; !covered && i < segments.length; i++) {
+      covered = allSubPaths.has(segments.slice(0, i).join('/'));
+    }
+    if (!covered) subPaths.add(subPath);
   }
   return { topLevel, subPaths };
 }
