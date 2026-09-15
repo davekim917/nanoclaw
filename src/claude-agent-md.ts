@@ -28,7 +28,7 @@
  *   frontmatter.proactive   — Claude routing hint
  */
 
-import { WORKER_POLICY_CODEX_MODEL } from './worker-policy.vendored.js';
+import { WORKER_POLICY_CODEX_EFFORT, WORKER_POLICY_CODEX_MODEL } from './worker-policy.vendored.js';
 
 const MANAGED_MARKER = '# managed by nanoclaw codex-sync';
 
@@ -208,10 +208,21 @@ export function formatCodexAgentToml(agent: ClaudeAgent): string {
  * Matches up to the LAST period on the description's final line, not the
  * first — a model name with a version number ("Fable 5.1") contains its own
  * period, and `[^.]*` would stop there and leave the clause unstripped.
+ *
+ * The effort word comes from the vendored policy for the same reason the model
+ * does. It used to be the literal "high": the config this role runs under
+ * follows `WORKER_POLICY_CODEX_EFFORT`, so a `codex.effort` flip left the role
+ * advertising an effort it does not run at — and the description is a routing
+ * signal, so that mis-routes the orchestrator exactly as a wrong model name
+ * would. Found by review r2 on #837.
  */
-function retargetRunsOnSentence(description: string, model: string): string {
+export function retargetRunsOnSentence(
+  description: string,
+  model: string,
+  effort: string = WORKER_POLICY_CODEX_EFFORT,
+): string {
   const stripped = description.replace(/\s*Runs on [^\n]*\.\s*$/, '');
-  return `${stripped} Runs on ${model} with high reasoning by default; explicit spawn effort overrides the default.`;
+  return `${stripped} Runs on ${model} with ${effort} reasoning by default; explicit spawn effort overrides the default.`;
 }
 
 /**
