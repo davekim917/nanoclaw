@@ -9,19 +9,28 @@
  * (codex-rs `hooks/src/engine/discovery.rs:664-716`). There is no RPC to grant
  * trust, and a `-c hooks.state...` override does not take.
  *
- * There IS one bypass, and an earlier revision of this comment wrongly said
- * there was none (corrected in review round 8, verified against the installed
- * binary): `--dangerously-bypass-hook-trust`, a top-level flag that
- * `codex --dangerously-bypass-hook-trust app-server` accepts, with a matching
- * `bypass_hook_trust` app-server request override. It is not used here, and
- * the choice is deliberate rather than an oversight: the flag runs EVERY
- * enabled hook codex loads, so it is per-invocation (each spawn path and each
- * rotated home would have to carry it) and indiscriminate, where these entries
- * name exactly the handlers NanoClaw generated plus the plugins
- * `planCodexPluginRegistration` admits. The trade-off is real in both
- * directions — the flag cannot silently mis-hash, which is the failure class
- * tracked in #830 and the reason #832 exists — so it is recorded on the PR for
- * the operator rather than settled in a comment.
+ * A flag that LOOKS like a bypass exists, and an earlier revision of this
+ * comment wrongly said there was none: `--dangerously-bypass-hook-trust`
+ * ("Run enabled hooks without requiring persisted hook trust for this
+ * invocation"), a global option and also an option of `codex exec`.
+ * `codex app-server --dangerously-bypass-hook-trust` is rejected outright.
+ *
+ * It does not work for this path, which was MEASURED rather than assumed
+ * before choosing (full table on PR #827). With no trust entry, a PreToolUse
+ * handler did not fire under app-server with the global flag, under any of
+ * four spellings and placements of a `bypassHookTrust` request override,
+ * under both together, or under `codex exec` with the flag in either
+ * position — while the same handler, same home, same probe, DID fire as soon
+ * as an entry from this module was written. So these entries are not a
+ * preference over the flag; they are the only mechanism observed to dispatch
+ * the guard chain under app-server, which is the only path containers use.
+ *
+ * Two traps, recorded because each yields a false pass: the app-server
+ * silently accepts unknown params, so an override being "accepted" on
+ * `thread/start` is no evidence it exists; and `hooks/list` still reports
+ * `untrusted` with the flag set, so it cannot be the oracle either. The
+ * oracle has to be whether the handler actually ran. Why the flag is inert
+ * here is #838, and nothing in this file depends on the answer.
  *
  * That makes this file load-bearing for the container guard chain: NanoClaw
  * generates `hooks.json` (`buildCodexHooksJson` in `./codex-app-server.ts`)
