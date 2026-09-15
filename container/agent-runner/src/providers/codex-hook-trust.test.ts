@@ -195,6 +195,32 @@ describe('mergeCodexHookTrustIntoToml', () => {
     expect(twice.match(/\[hooks\.state\./g)).toHaveLength(2);
   });
 
+  it('escapes every control byte a plugin filename may legally carry', () => {
+    // A state key embeds the plugin's own relative hook filename, and codex
+    // accepts a manifest declaring any legal Linux name — a form feed included.
+    // TOML forbids raw C0/DEL in a basic string, and codex answers one such
+    // byte with "Invalid configuration; using defaults" and then STARTS: the
+    // whole file is discarded, so the PreToolUse/PostToolUse guard chain
+    // disappears along with the plugin hook. The write succeeds and the launch
+    // succeeds; only the protection is gone (docs/review-notes/822.md).
+    const hostile = [
+      { key: 'plug@mkt:hooks/h\u000Cf.json:session_start:0:0', hash: 'sha256:ccc' },
+      { key: 'plug@mkt:hooks/h\u0000n.json:stop:0:0', hash: 'sha256:ddd' },
+      { key: 'plug@mkt:hooks/h\u007Fd.json:interrupt:0:0', hash: 'sha256:eee' },
+      { key: 'plug@mkt:hooks/h\u001Be.json:pre_tool_use:0:0', hash: 'sha256:fff' },
+    ];
+    const block = renderCodexHookTrustBlock(hostile);
+    // No raw control byte survives into the rendered TOML...
+    // eslint-disable-next-line no-control-regex
+    expect(/[\x00-\x1f\x7f]/.test(block.replace(/\n/g, ''))).toBe(false);
+    // ...and each is emitted as TOML's \uXXXX escape, so the key still round-trips.
+    expect(block).toContain('\\u000C');
+    expect(block).toContain('\\u0000');
+    expect(block).toContain('\\u007F');
+    expect(block).toContain('\\u001B');
+    for (const { hash } of hostile) expect(block).toContain(hash);
+  });
+
   it('strips the block entirely when there are no entries', () => {
     const after = mergeCodexHookTrustIntoToml(
       '[features]\nhooks = true\n\n[hooks.state."k"]\ntrusted_hash = "x"\n',

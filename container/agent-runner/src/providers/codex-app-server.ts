@@ -68,13 +68,38 @@ export function tomlBasicString(value: string): string {
       `MCP config value contains newline (not supported in config.toml): ${JSON.stringify(value.slice(0, 40))}${value.length > 40 ? '…' : ''}`,
     );
   }
+  return `"${escapeTomlBasicStringBody(value)}"`;
+}
+
+/**
+ * The escaping half of {@link tomlBasicString}, without its newline refusal —
+ * the one place this repo escapes a TOML basic string, so a second caller
+ * cannot ship a partial ruleset of its own.
+ *
+ * `tomlBasicString` REFUSES a newline because one inside an MCP env value or
+ * header is misconfiguration worth surfacing (a secret pasted with a trailing
+ * newline). A TOML KEY is different: it is derived from a path this process was
+ * handed rather than authored, so refusing would turn one oddly-named plugin
+ * file into a spawn that never happens. Keys escape everything and always
+ * produce a parsable table header.
+ *
+ * Escaping the whole C0/DEL range is the load-bearing part either way, and the
+ * reason is the tolerant reader on the other side: codex answers one raw
+ * control byte anywhere in config.toml with "Invalid configuration; using
+ * defaults" and then starts anyway, so a stray byte fails neither the write nor
+ * the launch — it silently drops EVERY table in the file. (upstream 05860324c
+ * for the MCP half; `docs/review-notes/822.md` registers the class.)
+ */
+export function escapeTomlBasicStringBody(value: string): string {
   // The control-char replace must stay LAST: an earlier pass would double the
   // backslash it emits into a literal `\\uXXXX`.
-  return `"${value
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    // eslint-disable-next-line no-control-regex
-    .replace(/[\x00-\x1f\x7f]/g, (c) => `\\u${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}`)}"`;
+  return (
+    value
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+      // eslint-disable-next-line no-control-regex
+      .replace(/[\x00-\x1f\x7f]/g, (c) => `\\u${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}`)
+  );
 }
 
 /**

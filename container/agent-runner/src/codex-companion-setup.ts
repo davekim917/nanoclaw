@@ -409,13 +409,18 @@ export function syncCodexHookTrust(
     fs.mkdirSync(codexHome, { recursive: true });
     fs.writeFileSync(configPath, mergeCodexHookTrustIntoToml(existing, entries));
   } catch (err) {
-    // Non-fatal on its own: the container still boots, but the guard chain is
-    // inert, so this must be loud.
-    log(
-      `FAILED to write hook trust entries to ${configPath} — Codex hooks will be UNTRUSTED and will not fire: ` +
-        `${err instanceof Error ? err.message : String(err)}`,
-    );
-    return;
+    // THROWS, deliberately. Swallowing here leaves hooks.json on disk with no
+    // matching trust entry — precisely the state this module exists to
+    // eliminate: codex loads the handlers, reports them untrusted, never
+    // dispatches them, and the app-server starts anyway, so the
+    // destructive-action guard is present, inert and silent. Returning normally
+    // would also let `writeCodexHooksAndTrust` report a postcondition it did
+    // not achieve, and every caller below it continues straight into a spawn.
+    // Each caller decides what to do with the failure; none of them may decide
+    // it by default.
+    const detail = err instanceof Error ? err.message : String(err);
+    log(`FAILED to write hook trust to ${configPath} — Codex hooks would be UNTRUSTED and never fire: ${detail}`);
+    throw new Error(`could not write Codex hook trust entries to ${configPath}: ${detail}`);
   }
   log(`Hook trust: ${entries.length} entry(ies) written to ${configPath}`);
 }
@@ -538,8 +543,15 @@ export function setupCodexRuntime(
   // Re-sync AFTER registration: `codex plugin add` rewrites config.toml in
   // place, and the newly-registered plugins' own hook files only become
   // reachable once they are registered. Idempotent, so re-running it costs a
-  // file rewrite and nothing else.
-  syncCodexHookTrust(RUNTIME_CODEX_DIR);
+  // file rewrite and nothing else. Fails closed for the same reason the write
+  // above does — `codex plugin add` has already rewritten config.toml by this
+  // point, so a failure here does not leave the pre-registration entries
+  // standing, it leaves none.
+  try {
+    syncCodexHookTrust(RUNTIME_CODEX_DIR);
+  } catch (err) {
+    return failClosed('could not re-write the peer Codex hook trust after plugin registration', err);
+  }
 
   // Skills mirror is already populated by index.ts at startup with the correct
   // runtime; calling it again here without a runtime arg would default to
@@ -576,7 +588,20 @@ export function setupCodexPrimaryRuntime(
   // right before each app-server spawn (providers/codex.ts), but that rewrite
   // preserves nothing it did not author, so the entries must be re-derived
   // there too — `writeCodexHooksAndTrust` is what both paths go through.
-  syncCodexHookTrust(HOST_CODEX_DIR);
+  //
+  // Recorded rather than thrown, and ONLY here: this runs at startup, and the
+  // invariant that matters — no app-server without a trusted guard chain — is
+  // enforced at the spawn, where `writeCodexHooksAndTrust` now propagates. So a
+  // transient failure at startup costs a loud error and the next spawn's
+  // refusal, not a crash-loop that takes the container down for a condition the
+  // spawn would have caught anyway. It is never silent.
+  try {
+    syncCodexHookTrust(HOST_CODEX_DIR);
+  } catch (err) {
+    registration.errors.push(
+      `${HOST_CODEX_DIR}: hook trust sync failed — ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   const projectedFallbacks: string[] = [];
   const primaryConfigPath = path.join(HOST_CODEX_DIR, 'config.toml');
   const primaryConfig = fs.existsSync(primaryConfigPath) ? fs.readFileSync(primaryConfigPath, 'utf-8') : '';

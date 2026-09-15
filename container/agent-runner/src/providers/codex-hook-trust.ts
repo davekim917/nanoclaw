@@ -32,6 +32,8 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import { escapeTomlBasicStringBody } from './codex-app-server.js';
+
 /** hooks.json event keys, in the PascalCase spelling Codex reads. */
 export type CodexHookEvent =
   | 'PreToolUse'
@@ -225,15 +227,23 @@ export function collectCodexHookTrustEntries(
   return entries;
 }
 
-/** Quote a state key as a TOML basic string (keys carry `/`, `:`, `@`, `.`). */
+/**
+ * Quote a state key as a TOML basic string (keys carry `/`, `:`, `@`, `.`).
+ *
+ * Through the SHARED encoder, never a second local one. A state key embeds the
+ * plugin's own relative hook filename, and codex 0.154.0 accepts a plugin whose
+ * manifest declares a name carrying any legal Linux byte — a form feed
+ * included. TOML forbids raw C0/DEL inside a basic string, and codex answers
+ * one such byte with "Invalid configuration; using defaults" and then starts
+ * anyway: `hooks/list` returns nothing, and the PreToolUse/PostToolUse guard
+ * chain this whole module exists to make live disappears along with the
+ * plugin's hook. So an escape set that stops at `\t` is not a cosmetic gap — it
+ * is a plugin-supplied input that silently removes the destructive-action
+ * guard, which is `docs/review-notes/822.md`'s registered
+ * `unescaped interpolation` class exactly.
+ */
 function tomlQuotedKey(key: string): string {
-  const escaped = key
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\n/g, '\\n')
-    .replace(/\r/g, '\\r')
-    .replace(/\t/g, '\\t');
-  return `"${escaped}"`;
+  return `"${escapeTomlBasicStringBody(key)}"`;
 }
 
 export const HOOK_TRUST_MARKER = '# --- nanoclaw hook trust ---';

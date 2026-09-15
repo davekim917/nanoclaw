@@ -216,9 +216,12 @@ describe('buildRuntimeConfig', () => {
     // The ONLY null return is the benign missing-auth case.
     expect(body.match(/return null/g) ?? []).toHaveLength(1);
     expect(body).toMatch(/Host codex auth not mounted[\s\S]*?return null/);
-    // mkdir, auth symlink, config.toml write, hooks.json write — all four
-    // hand the sentinel back to the caller.
-    expect(body.match(/return failClosed\(/g) ?? []).toHaveLength(4);
+    // mkdir, auth symlink, config.toml write, hooks.json+trust write, and the
+    // post-registration trust re-sync — all five hand the sentinel back to the
+    // caller. The re-sync counts because `codex plugin add` has already
+    // rewritten config.toml by then, so a failure there leaves NO trust entries
+    // standing rather than the pre-registration ones.
+    expect(body.match(/return failClosed\(/g) ?? []).toHaveLength(5);
     expect(body).not.toMatch(/\bthrow new\b/);
 
     // The sentinel must be a nonexistent path (codex hard-errors on it), and
@@ -512,6 +515,36 @@ describe('writeCodexHooksAndTrust', () => {
     fs.writeFileSync(path.join(home, 'config.toml'), '[features]\nhooks = true\n');
   });
   afterEach(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  it('throws rather than returning when the TRUST write specifically fails', () => {
+    // The postcondition is "hooks written AND trusted". Reporting success with
+    // only the first half is the state this module exists to eliminate: codex
+    // loads the handlers, reports them untrusted, never dispatches them, and
+    // the app-server starts anyway — the destructive-action guard present,
+    // inert and silent. Every caller continues straight into a spawn, so the
+    // failure has to reach them.
+    //
+    // The directory stays WRITABLE and only config.toml is read-only, so
+    // hooks.json is written normally and the trust write is the one thing that
+    // fails. An unwritable directory would fail the hooks.json write first and
+    // this test would pass with the trust failure still swallowed — which is
+    // exactly what it did before the message assertion below was added.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-trust-ro-'));
+    const configPath = path.join(home, 'config.toml');
+    fs.writeFileSync(configPath, '[features]\nhooks = true\n');
+    fs.chmodSync(configPath, 0o400);
+    try {
+      expect(() => writeCodexHooksAndTrust({ codexHome: home, pluginsRoot: path.join(home, 'no-plugins') })).toThrow(
+        /hook trust/i,
+      );
+      // hooks.json really was written — so the throw is the trust write, not
+      // an earlier step failing for an unrelated reason.
+      expect(fs.existsSync(path.join(home, 'hooks.json'))).toBe(true);
+    } finally {
+      fs.chmodSync(configPath, 0o600);
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
 
   it('leaves every hook it wrote to hooks.json trusted in config.toml', () => {
     writeCodexHooksAndTrust({ codexHome: home, pluginsRoot: path.join(home, 'no-plugins') });
