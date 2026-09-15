@@ -42,10 +42,15 @@
  *   - It does not read the central DB, `container.json`, or any provider
  *     config, and it never restarts, kills or reconfigures anything.
  *
- * ERRORS ARE NEVER ZEROS. A session DB that cannot be opened or queried is
- * counted and listed as an error, separately from "no rows" — the whole point
- * of the check is that a swallowed failure must not read as health. A DB with
- * no `rate_limit_samples` table at all is a third state again (`noTable`):
+ * ERRORS ARE NEVER ZEROS — and that covers the FILESYSTEM walk, not just the
+ * DB reads. A group directory that cannot be listed, an `outbound.db` path
+ * that cannot be stat'd, a DB that cannot be opened, and a query that fails
+ * are each counted and listed under their own code, separately from "no rows".
+ * None of them may resolve to a silent skip: a swallowed failure reading as
+ * health is the whole defect this check exists to catch, and it is just as
+ * fatal in the scanner as in the thing scanned. An unlistable sessions ROOT is
+ * a hard failure rather than a finding — see `scanRateLimitTelemetry`. A DB
+ * with no `rate_limit_samples` table at all is a third state again (`noTable`):
  * every session predating the table has one, and it is evidence of nothing.
  *
  * Opens are `readonly` + `PRAGMA query_only=ON`. A read-only open never
@@ -98,10 +103,22 @@ export interface TelemetryPair {
   pushingSessions: number;
 }
 
+export type ScanErrorCode =
+  /** A group directory could not be listed — every session under it is invisible. */
+  | 'group_unlistable'
+  /** An `outbound.db` path could not be stat'd for a reason other than ENOENT. */
+  | 'db_unstattable'
+  /** The DB exists but could not be opened. */
+  | 'unreadable'
+  /** The DB opened but a query failed. */
+  | 'query_failed'
+  /** Rows whose `ts` SQLite cannot parse, dropped from both counts. */
+  | 'unparsable_timestamps';
+
 export interface TelemetryScanError {
-  /** `<agent group>/<session>` relative to the sessions root. */
-  session: string;
-  code: 'unreadable' | 'query_failed' | 'unparsable_timestamps';
+  /** `<agent group>` or `<agent group>/<session>`, relative to the sessions root. */
+  path: string;
+  code: ScanErrorCode;
   detail: string;
 }
 
@@ -119,8 +136,10 @@ export interface TelemetryHealthReport {
     withTable: number;
     /** …of those, ones predating the table. Not an error, not a symptom. */
     noTable: number;
-    /** …of those, ones that failed to open or query. */
+    /** DB paths that failed to stat, open or query. Never folded into a zero. */
     errored: number;
+    /** Group directories that could not be listed — a blind spot, not an absence. */
+    unlistableDirs: number;
   };
   /** Every pair with push activity in the window, `never`/`stale` first. */
   pairs: TelemetryPair[];
@@ -186,22 +205,75 @@ const UNPARSABLE_TS_SQL = `SELECT COUNT(*) AS n FROM rate_limit_samples WHERE da
 
 const TABLE_PRESENT_SQL = `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'rate_limit_samples'`;
 
-function subdirectories(dir: string): string[] {
+type DirListing = { names: string[] } | { error: string };
+
+/**
+ * THE ONE PLACE A DIRECTORY IS LISTED. Every caller goes through here, so the
+ * accounting cannot drift back out to individual call sites.
+ *
+ * It answers a discriminated union, never a bare array, because `[]` and
+ * "could not look" must not be the same value. A `catch { return [] }` here
+ * makes an unlistable directory report as an empty one: zero groups, zero
+ * errors, no findings, and a gate that says healthy — the precise failure this
+ * script exists to catch, one level up. Measured on this host at uid 1001:
+ * `readdirSync` on a 0o000 directory throws EACCES.
+ *
+ * A symlinked entry is kept as a candidate rather than filtered away: if it
+ * resolves to a directory it is a real group/session, and if it does not, the
+ * listing or stat that follows fails LOUDLY (ENOTDIR) instead of vanishing.
+ * A plain file is not a candidate and is not an error — it is structurally not
+ * a group or a session directory.
+ */
+function listSubdirectories(dir: string): DirListing {
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return [];
+  } catch (err) {
+    return { error: errorDetail(err) };
   }
-  return entries
-    .filter((e) => e.isDirectory())
-    .map((e) => e.name)
-    .sort();
+  return {
+    names: entries
+      .filter((e) => e.isDirectory() || e.isSymbolicLink())
+      .map((e) => e.name)
+      .sort(),
+  };
 }
 
-function pairKey(credentialSet: string | null): string {
-  // A literal 'null' credential_set and a SQL NULL must not collapse together.
-  return credentialSet === null ? ' null' : `s:${credentialSet}`;
+type DbProbe = { present: boolean } | { error: string };
+
+/**
+ * Does this session hold an `outbound.db`?
+ *
+ * `statSync`, NOT `fs.existsSync`: existsSync answers `false` for every
+ * failure, so an EACCES on a session directory nobody can traverse is
+ * indistinguishable from a session that simply has no DB, and the file is
+ * skipped before the open handler could ever count it (measured at uid 1001:
+ * existsSync → false, statSync → EACCES). ENOENT is the only genuine "no" —
+ * plenty of session directories legitimately hold no outbound.db.
+ */
+function probeSessionDb(file: string): DbProbe {
+  try {
+    fs.statSync(file);
+    return { present: true };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { present: false };
+    return { error: errorDetail(err) };
+  }
+}
+
+/**
+ * Field separator for the composite pair key, written as an ESCAPE and never
+ * as a literal NUL byte. NUL is the right separator — no agent-group id or
+ * `credential_set` can contain one, where a space could collide — but a
+ * literal one in the source makes this file binary to `grep` and `rg`, which
+ * then return nothing over it and look like a clean search. That happened to
+ * this very file during development.
+ */
+const KEY_SEP = '\u0000';
+
+/** A literal 'null' credential_set and a SQL NULL must not collapse together. */
+function pairKey(agentGroup: string, credentialSet: string | null): string {
+  return `${agentGroup}${KEY_SEP}${credentialSet === null ? 'n' : `s:${credentialSet}`}`;
 }
 
 /** Newest-first within a verdict; `never` before `stale` before `ok`. */
@@ -218,24 +290,53 @@ export function scanRateLimitTelemetry(options: ScanOptions): TelemetryHealthRep
 
   const errors: TelemetryScanError[] = [];
   const pairs = new Map<string, { credentialSet: string | null; agentGroup: string; acc: PairAccumulator }>();
-  const counts = { agentGroups: 0, sessionDbs: 0, withTable: 0, noTable: 0, errored: 0 };
+  const counts = { agentGroups: 0, sessionDbs: 0, withTable: 0, noTable: 0, errored: 0, unlistableDirs: 0 };
 
-  for (const agentGroup of subdirectories(sessionsRoot)) {
+  // A ROOT THAT CANNOT BE LISTED IS A HARD FAILURE, not a finding. Every other
+  // failure here costs coverage of one group or one session and leaves a real
+  // report around it; an unlistable root leaves NO coverage at all, so every
+  // statement the report could make is vacuous. Rendering that as "0 groups
+  // scanned, 0 findings, 1 error" invites exactly the misreading this script
+  // exists to end, so it throws and `main` routes it to a non-zero exit — or,
+  // under `--gate`, to wakeAgent:true, because a checker that breaks must still
+  // wake someone.
+  const rootListing = listSubdirectories(sessionsRoot);
+  if ('error' in rootListing) {
+    throw new Error(`sessions root is not listable: ${sessionsRoot} — ${rootListing.error}`);
+  }
+
+  for (const agentGroup of rootListing.names) {
     counts.agentGroups += 1;
     const groupDir = path.join(sessionsRoot, agentGroup);
 
-    for (const session of subdirectories(groupDir)) {
+    const groupListing = listSubdirectories(groupDir);
+    if ('error' in groupListing) {
+      // One unlistable group hides every session DB beneath it. Counted and
+      // named, never passed off as a group with no sessions.
+      counts.unlistableDirs += 1;
+      errors.push({ path: agentGroup, code: 'group_unlistable', detail: groupListing.error });
+      continue;
+    }
+
+    for (const session of groupListing.names) {
       const file = path.join(groupDir, session, 'outbound.db');
-      if (!fs.existsSync(file)) continue;
-      counts.sessionDbs += 1;
       const label = `${agentGroup}/${session}`;
+
+      const probe = probeSessionDb(file);
+      if ('error' in probe) {
+        counts.errored += 1;
+        errors.push({ path: label, code: 'db_unstattable', detail: probe.error });
+        continue;
+      }
+      if (!probe.present) continue;
+      counts.sessionDbs += 1;
 
       let db: Database.Database;
       try {
         db = openDb(file);
       } catch (err) {
         counts.errored += 1;
-        errors.push({ session: label, code: 'unreadable', detail: errorDetail(err) });
+        errors.push({ path: label, code: 'unreadable', detail: errorDetail(err) });
         continue;
       }
 
@@ -254,14 +355,14 @@ export function scanRateLimitTelemetry(options: ScanOptions): TelemetryHealthRep
 
         if (unparsable.n > 0) {
           errors.push({
-            session: label,
+            path: label,
             code: 'unparsable_timestamps',
             detail: `${unparsable.n} row(s) with a ts SQLite cannot parse — excluded from both counts`,
           });
         }
 
         for (const row of rows) {
-          const key = `${agentGroup} ${pairKey(row.credential_set)}`;
+          const key = pairKey(agentGroup, row.credential_set);
           const entry = pairs.get(key) ?? {
             agentGroup,
             credentialSet: row.credential_set,
@@ -276,7 +377,7 @@ export function scanRateLimitTelemetry(options: ScanOptions): TelemetryHealthRep
         }
       } catch (err) {
         counts.errored += 1;
-        errors.push({ session: label, code: 'query_failed', detail: errorDetail(err) });
+        errors.push({ path: label, code: 'query_failed', detail: errorDetail(err) });
       } finally {
         try {
           db.close();
@@ -373,7 +474,8 @@ export function formatHumanReport(report: TelemetryHealthReport, timezone: strin
   out.push(`  window    ${at(report.sinceIso)} → ${at(report.generatedAt)} (${timezone})`);
   out.push(
     `  scanned   ${report.counts.sessionDbs} session db(s) in ${report.counts.agentGroups} group(s): ` +
-      `${report.counts.withTable} with the table, ${report.counts.noTable} predating it, ${report.counts.errored} unreadable`,
+      `${report.counts.withTable} with the table, ${report.counts.noTable} predating it, ${report.counts.errored} unreadable, ` +
+      `${report.counts.unlistableDirs} group dir(s) unlistable`,
   );
   out.push('');
 
@@ -401,7 +503,7 @@ export function formatHumanReport(report: TelemetryHealthReport, timezone: strin
   if (report.errors.length > 0) {
     out.push('');
     out.push(`${report.errors.length} scan error(s) — these are NOT zero rows:`);
-    for (const e of report.errors) out.push(`  ${e.code}  ${e.session}  ${e.detail}`);
+    for (const e of report.errors) out.push(`  ${e.code}  ${e.path}  ${e.detail}`);
   }
 
   return out.join('\n');

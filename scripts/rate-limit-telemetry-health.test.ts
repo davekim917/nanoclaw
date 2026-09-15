@@ -320,7 +320,7 @@ describe('scanRateLimitTelemetry — a failure is never a zero', () => {
     const report = scan(root);
 
     expect(report.errors).toHaveLength(1);
-    expect(report.errors[0]).toMatchObject({ session: 'group-corrupt/sess-bad', code: 'query_failed' });
+    expect(report.errors[0]).toMatchObject({ path: 'group-corrupt/sess-bad', code: 'query_failed' });
     expect(report.counts.errored).toBe(1);
     // The unreadable DB is NOT folded into the healthy count…
     expect(report.counts.withTable).toBe(1);
@@ -340,7 +340,7 @@ describe('scanRateLimitTelemetry — a failure is never a zero', () => {
     });
 
     expect(report.errors).toEqual([
-      { session: 'group-open-fail/sess-1', code: 'unreadable', detail: 'Error: EACCES: permission denied' },
+      { path: 'group-open-fail/sess-1', code: 'unreadable', detail: 'Error: EACCES: permission denied' },
     ]);
     expect(report.counts.errored).toBe(1);
     expect(report.counts.withTable).toBe(0);
@@ -373,7 +373,7 @@ describe('scanRateLimitTelemetry — a failure is never a zero', () => {
 
     expect(report.errors).toHaveLength(1);
     expect(report.errors[0].code).toBe('unparsable_timestamps');
-    expect(report.errors[0].session).toBe('group-bad-ts/sess-1');
+    expect(report.errors[0].path).toBe('group-bad-ts/sess-1');
     // The unparsable pull row is excluded from the counts, so the pair still
     // reads as broken — but the operator is told the row was dropped.
     expect(report.findings).toHaveLength(1);
@@ -388,6 +388,148 @@ describe('scanRateLimitTelemetry — a failure is never a zero', () => {
     expect(report.counts.sessionDbs).toBe(0);
     expect(report.counts.agentGroups).toBe(1);
     expect(report.errors).toEqual([]);
+  });
+});
+
+/**
+ * Real permission conditions, not injected ones: `chmod 0o000` then let the
+ * production code meet the EACCES the operating system actually raises.
+ * Measured on this host at uid 1001 — `readdirSync` throws EACCES and
+ * `fs.existsSync` answers `false` (rather than throwing) for a path under a
+ * non-traversable directory, which is why the scanner stats instead.
+ *
+ * Skipped under uid 0, where the mode bits do not apply and the setup would
+ * silently succeed — a test that cannot fail is worse than no test.
+ */
+const asRoot = (process.getuid?.() ?? -1) === 0;
+const itUnlessRoot = asRoot ? it.skip : it;
+
+describe('scanRateLimitTelemetry — a filesystem failure is never an absence', () => {
+  const RESTORE: string[] = [];
+
+  afterEach(() => {
+    // Restore traversal BEFORE the shared afterEach tries to remove the tree.
+    for (const dir of RESTORE.splice(0)) {
+      try {
+        fs.chmodSync(dir, 0o700);
+        // eslint-disable-next-line no-catch-all/no-catch-all -- best-effort test cleanup: a failure to restore the mode must not mask the assertion failure that is the real result of the test
+      } catch {
+        /* already removed, or never sealed */
+      }
+    }
+  });
+
+  function sealDirectory(dir: string): void {
+    RESTORE.push(dir);
+    fs.chmodSync(dir, 0o000);
+  }
+
+  itUnlessRoot('an unlistable GROUP directory is a counted error, not a group with no sessions', () => {
+    const root = makeRoot();
+    writeSessionDb(root, 'group-sealed', 'sess-1', [
+      { ts: '2026-09-15T01:00:00.000Z', source: 'usage_pull' },
+      { ts: '2026-09-15T01:05:00.000Z', source: 'rate_limit_event' },
+    ]);
+    writeSessionDb(root, 'group-open', 'sess-1', [
+      { ts: '2026-09-15T02:00:00.000Z', source: 'usage_pull' },
+      { ts: '2026-09-15T02:05:00.000Z', source: 'rate_limit_event' },
+    ]);
+    sealDirectory(path.join(root, 'group-sealed'));
+
+    const report = scan(root);
+
+    expect(report.errors).toHaveLength(1);
+    expect(report.errors[0]).toMatchObject({ path: 'group-sealed', code: 'group_unlistable' });
+    expect(report.errors[0].detail).toMatch(/EACCES/);
+    expect(report.counts.unlistableDirs).toBe(1);
+    // The sealed group contributed no session DB, and that absence is NOT
+    // reported as a healthy group: the error carries it.
+    expect(report.counts.sessionDbs).toBe(1);
+    expect(report.pairs.map((p) => p.agentGroup)).toEqual(['group-open']);
+    // …and it drives the gate, which would otherwise call this fleet healthy.
+    expect(gateResult(report).wakeAgent).toBe(true);
+    expect(formatHumanReport(report, 'UTC')).toContain('group_unlistable');
+  });
+
+  itUnlessRoot('an unreachable DB under a sealed SESSION directory is counted, not skipped', () => {
+    const root = makeRoot();
+    writeSessionDb(root, 'group-a', 'sess-sealed', [{ ts: '2026-09-15T01:00:00.000Z', source: 'rate_limit_event' }]);
+    sealDirectory(path.join(root, 'group-a', 'sess-sealed'));
+
+    const report = scan(root);
+
+    // fs.existsSync answers false here, so the pre-fix code skipped this DB
+    // before any handler could see it and reported a clean, empty scan.
+    expect(report.errors).toHaveLength(1);
+    expect(report.errors[0]).toMatchObject({ path: 'group-a/sess-sealed', code: 'db_unstattable' });
+    expect(report.errors[0].detail).toMatch(/EACCES/);
+    expect(report.counts.errored).toBe(1);
+    expect(report.counts.sessionDbs).toBe(0);
+    expect(gateResult(report).wakeAgent).toBe(true);
+    expect(formatHumanReport(report, 'UTC')).toContain('db_unstattable');
+  });
+
+  itUnlessRoot('an unlistable sessions ROOT is a hard failure, never an empty healthy report', () => {
+    const root = makeRoot();
+    writeSessionDb(root, 'group-a', 'sess-1', [{ ts: '2026-09-15T01:00:00.000Z', source: 'rate_limit_event' }]);
+    sealDirectory(root);
+
+    // Not a finding: with no coverage at all, every statement a report could
+    // make is vacuous, so the scan refuses to produce one.
+    expect(() => scan(root)).toThrow(/not listable/);
+  });
+
+  itUnlessRoot('--gate on an unlistable root wakes and still exits 0', () => {
+    const root = makeRoot();
+    writeSessionDb(root, 'group-a', 'sess-1', [{ ts: '2026-09-15T01:00:00.000Z', source: 'rate_limit_event' }]);
+    sealDirectory(root);
+
+    const chunks: string[] = [];
+    const orig = console.log;
+    console.log = (...args: unknown[]) => chunks.push(args.map(String).join(' '));
+    let code: number;
+    try {
+      code = main(['--sessions-root', root, '--gate']);
+    } finally {
+      console.log = orig;
+    }
+
+    expect(code).toBe(0);
+    const parsed = JSON.parse(chunks.join('\n').trim().split('\n').pop() as string);
+    expect(parsed.wakeAgent).toBe(true);
+    expect(parsed.data.scanError).toMatch(/not listable/);
+  });
+
+  itUnlessRoot('an unlistable root without --gate exits 1, never 0', () => {
+    const root = makeRoot();
+    sealDirectory(root);
+
+    const errChunks: string[] = [];
+    const orig = console.error;
+    console.error = (...args: unknown[]) => errChunks.push(args.map(String).join(' '));
+    let code: number;
+    try {
+      code = main(['--sessions-root', root]);
+    } finally {
+      console.error = orig;
+    }
+
+    expect(code).toBe(1);
+    expect(errChunks.join('\n')).toMatch(/not listable/);
+  });
+});
+
+describe('source hygiene', () => {
+  it('carries no literal NUL byte, which would make it binary to grep and rg', () => {
+    // A literal NUL in the source makes `grep`/`rg` classify the file as
+    // binary and return nothing over it — a search that looks clean because
+    // it silently matched nothing. This file shipped two during development
+    // (the pair-key separator); `KEY_SEP` is an escape sequence for that
+    // reason, and this pins it.
+    const source = fs.readFileSync(
+      path.resolve(import.meta.dirname, 'rate-limit-telemetry-health.ts'),
+    );
+    expect(source.includes(0)).toBe(false);
   });
 });
 
