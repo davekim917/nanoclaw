@@ -8,7 +8,7 @@ import { describe, it, expect, mock } from 'bun:test';
 // review findings (a too-broad regex, a stray /i, and validating before
 // resolving aliases) — all of them defects in a mirror of the host's model
 // vocabulary that only existed to carry a value the host already sends.
-// Since the provider reads ANTHROPIC_DEFAULT_OPUS_MODEL directly, the
+// Since the provider reads NANOCLAW_CLAUDE_MODEL directly, the
 // declaration arrives resolved and validated by the host's own tables, and
 // the mirror is gone. These tests pin that the arrival still happens.
 let capturedSdkOptions: Record<string, unknown> | null = null;
@@ -47,7 +47,7 @@ const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
  * fallback's values before building the env (the `providerDecision` block), so
  * the host seam sees exactly this shape. The env is restored afterwards: bun
  * runs every file in ONE process and the provider reads
- * ANTHROPIC_DEFAULT_OPUS_MODEL at query time.
+ * NANOCLAW_CLAUDE_MODEL at query time.
  */
 function fallbackSpawn(declared: { model?: string; effort?: string }) {
   const env = claudeSpawnEnv({ model: declared.model, effort: declared.effort } as never, {});
@@ -56,10 +56,12 @@ function fallbackSpawn(declared: { model?: string; effort?: string }) {
     const [k, ...rest] = env[i + 1].split('=');
     kv[k] = rest.join('=');
   }
+  const prevGroupModel = process.env.NANOCLAW_CLAUDE_MODEL;
   const prevAlias = process.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
   const prevEffort = process.env.NANOCLAW_EFFORT_OVERRIDE;
   const prevProvider = process.env.NANOCLAW_PROVIDER_OVERRIDE;
   try {
+    process.env.NANOCLAW_CLAUDE_MODEL = kv.NANOCLAW_CLAUDE_MODEL;
     process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = kv.ANTHROPIC_DEFAULT_OPUS_MODEL;
     if (kv.NANOCLAW_EFFORT_OVERRIDE === undefined) delete process.env.NANOCLAW_EFFORT_OVERRIDE;
     else process.env.NANOCLAW_EFFORT_OVERRIDE = kv.NANOCLAW_EFFORT_OVERRIDE;
@@ -76,6 +78,8 @@ function fallbackSpawn(declared: { model?: string; effort?: string }) {
     p.query({ prompt: 'hi', cwd: '/tmp' });
     return { env: kv, model: capturedSdkOptions?.model, effort: capturedSdkOptions?.effort };
   } finally {
+    if (prevGroupModel === undefined) delete process.env.NANOCLAW_CLAUDE_MODEL;
+    else process.env.NANOCLAW_CLAUDE_MODEL = prevGroupModel;
     if (prevAlias === undefined) delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
     else process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = prevAlias;
     if (prevEffort === undefined) delete process.env.NANOCLAW_EFFORT_OVERRIDE;
@@ -106,7 +110,7 @@ describe('a claude provider fallback reaches the provider without a container-si
   it('test_fallback_family_effort_follows_the_declared_model', () => {
     expect(fallbackSpawn({ model: 'fable' }).effort).toBe('medium');
     expect(fallbackSpawn({ model: 'sonnet5' }).effort).toBe('xhigh');
-    expect(fallbackSpawn({ model: 'claude-opus-5[1m]' }).effort).toBe('high');
+    expect(fallbackSpawn({ model: 'claude-opus-5[1m]' }).effort).toBe('medium');
   });
 
   it('test_fallback_haiku_declaration_gets_no_effort_at_all', () => {
@@ -124,22 +128,22 @@ describe('a claude provider fallback reaches the provider without a container-si
     // own vocabulary refuses both, so the container never sees them — and a
     // boot-time crash loop is impossible because nothing is parsed there.
     const r = fallbackSpawn({ model: 'gpt-5.6-sol', effort: 'ultra' });
-    expect(r.model).toBe('claude-sonnet-5');
-    expect(r.effort).toBe('xhigh');
+    expect(r.model).toBe('claude-opus-5[1m]');
+    expect(r.effort).toBe('medium');
   });
 
   it('test_a_fallback_with_no_declaration_runs_the_install_default', () => {
     const r = fallbackSpawn({});
-    expect(r.model).toBe('claude-sonnet-5');
-    expect(r.effort).toBe('xhigh');
+    expect(r.model).toBe('claude-opus-5[1m]');
+    expect(r.effort).toBe('medium');
   });
 });
 
 describe('the primary path is unchanged by the removal', () => {
   it('test_primary_providerConfig_is_still_authoritative', () => {
-    const prev = process.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
+    const prev = process.env.NANOCLAW_CLAUDE_MODEL;
     try {
-      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = 'claude-sonnet-5';
+      process.env.NANOCLAW_CLAUDE_MODEL = 'claude-sonnet-5';
       const p = new ClaudeProvider({ providerConfig: { model: 'claude-opus-5[1m]', effort: 'low' } });
       p.registerMemorySessionHook(MEMORY_SESSION_HOOK);
       capturedSdkOptions = null;
@@ -147,8 +151,8 @@ describe('the primary path is unchanged by the removal', () => {
       expect(capturedSdkOptions?.model).toBe('claude-opus-5[1m]');
       expect(capturedSdkOptions?.effort).toBe('low');
     } finally {
-      if (prev === undefined) delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
-      else process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = prev;
+      if (prev === undefined) delete process.env.NANOCLAW_CLAUDE_MODEL;
+      else process.env.NANOCLAW_CLAUDE_MODEL = prev;
     }
   });
 });

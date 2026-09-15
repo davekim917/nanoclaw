@@ -26,9 +26,9 @@ const { ClaudeProvider } = await import('./claude.js');
  * Host seam -> real spawn env -> real provider. No step reasoned about.
  *
  * The env is restored before returning. bun:test shares ONE process across
- * files, and ANTHROPIC_DEFAULT_OPUS_MODEL is now read at query time (#540), so
- * leaking it here silently rewrites the model in every later file — six
- * unrelated failures in claude.configSchema.test.ts, observed.
+ * files, and NANOCLAW_CLAUDE_MODEL is read at query time (#540 in the var it
+ * then had), so leaking it here silently rewrites the model in every later
+ * file — six unrelated failures in claude.configSchema.test.ts, observed.
  */
 function spawn(cfg: Record<string, unknown>, channel: { model?: string | null; effort?: string | null } = {}) {
   const env = claudeSpawnEnv(cfg as never, channel);
@@ -37,9 +37,11 @@ function spawn(cfg: Record<string, unknown>, channel: { model?: string | null; e
     const [k, ...r] = env[i + 1].split('=');
     kv[k] = r.join('=');
   }
+  const prevGroupModel = process.env.NANOCLAW_CLAUDE_MODEL;
   const prevAlias = process.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
   const prevEffort = process.env.NANOCLAW_EFFORT_OVERRIDE;
   try {
+    process.env.NANOCLAW_CLAUDE_MODEL = kv.NANOCLAW_CLAUDE_MODEL;
     process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = kv.ANTHROPIC_DEFAULT_OPUS_MODEL;
     if (kv.NANOCLAW_EFFORT_OVERRIDE === undefined) delete process.env.NANOCLAW_EFFORT_OVERRIDE;
     else process.env.NANOCLAW_EFFORT_OVERRIDE = kv.NANOCLAW_EFFORT_OVERRIDE;
@@ -49,6 +51,8 @@ function spawn(cfg: Record<string, unknown>, channel: { model?: string | null; e
     p.query({ prompt: 'x', cwd: '/tmp' });
     return { env: kv, model: cap?.model, effort: cap?.effort, systemPrompt: cap?.systemPrompt };
   } finally {
+    if (prevGroupModel === undefined) delete process.env.NANOCLAW_CLAUDE_MODEL;
+    else process.env.NANOCLAW_CLAUDE_MODEL = prevGroupModel;
     if (prevAlias === undefined) delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
     else process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = prevAlias;
     if (prevEffort === undefined) delete process.env.NANOCLAW_EFFORT_OVERRIDE;
@@ -60,7 +64,10 @@ describe('END-TO-END after the deletion', () => {
   it('round-5 P1: a haiku group sends NO effort, and the container is what refuses it', () => {
     const r = spawn({ model: 'haiku' });
     console.log('  haiku group  env=', JSON.stringify(r.env), ' -> model=', r.model, ' effort=', r.effort);
-    expect(r.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-haiku-4-5-20251001');
+    expect(r.env.NANOCLAW_CLAUDE_MODEL).toBe('claude-haiku-4-5-20251001');
+    // ...and the group's model does NOT become what the word `opus` means:
+    // a `model: opus` subagent in a haiku group still gets Opus.
+    expect(r.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5[1m]');
     expect(r.env.NANOCLAW_EFFORT_OVERRIDE).toBeUndefined();
     expect(r.model).toBe('claude-haiku-4-5-20251001');
     expect(r.effort).toBeUndefined();
@@ -99,9 +106,24 @@ describe('END-TO-END after the deletion', () => {
     expect(r.effort).toBe('medium');
   });
 
-  it('the unconfigured fleet baseline resolves to Sonnet/xhigh', () => {
+  it('the unconfigured fleet baseline resolves to Opus [1m] / medium', () => {
     const r = spawn({});
     console.log('  baseline      -> model=', r.model, ' effort=', r.effort);
+    expect(r.model).toBe('claude-opus-5[1m]');
+    expect(r.effort).toBe('medium');
+  });
+
+  it('a `model: opus` group pin resolves to Opus even where the group runs Sonnet', () => {
+    // group-init writes `"model": "opus"` into every group's
+    // .claude-shared/settings.json, and a subagent's `model:` frontmatter uses
+    // the same word. Both resolve through ANTHROPIC_DEFAULT_OPUS_MODEL, which
+    // carried the GROUP's model until 2026-09-15 — so in this Sonnet group the
+    // word meant Sonnet 5, and every `model: opus` subagent silently ran it.
+    const r = spawn({ model: 'claude-sonnet-5' });
+    expect(r.env.NANOCLAW_CLAUDE_MODEL).toBe('claude-sonnet-5');
+    expect(r.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5[1m]');
+    expect(r.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-sonnet-5');
+    // ...and the group still runs the model it pinned.
     expect(r.model).toBe('claude-sonnet-5');
     expect(r.effort).toBe('xhigh');
   });
@@ -109,7 +131,7 @@ describe('END-TO-END after the deletion', () => {
   it('a carried codex model + ultra are still refused at the host', () => {
     const r = spawn({ model: 'gpt-6-astra', effort: 'ultra' });
     console.log('  codex residue -> model=', r.model, ' effort=', r.effort);
-    expect(r.model).toBe('claude-sonnet-5');
-    expect(r.effort).toBe('xhigh');
+    expect(r.model).toBe('claude-opus-5[1m]');
+    expect(r.effort).toBe('medium');
   });
 });

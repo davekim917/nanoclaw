@@ -214,7 +214,7 @@ export interface MessagingGroupAgent {
    * Per-channel model override (this channel's conversations with this
    * agent use this model by default). Null = fall through to the agent's
    * container.json defaultModel, then the install-wide DEFAULT_OPUS_MODEL
-   * constant in container-runner.ts.
+   * constant in src/flag-parser.ts.
    */
   default_model: string | null;
   /**
