@@ -61,6 +61,7 @@ Add a class here, in the same PR, only when none of these fits.
 - `pattern audit` — a fix for one instance of an unsafe pattern is not grepped across every call site that shares it, leaving siblings unfixed
 - `narrowed exclusion` — a coarse lock is replaced by a finer one, dropping mutual exclusion against every operation that still takes the coarse one; the two claim namespaces do not conflict, so both proceed and collide deeper in
 - `secret in error message` — a lower layer's error quotes the value it was handed (a header value, a URL with a key) and a caller logs or rethrows `.message` verbatim, so a credential lands in a log; sanitize at the layer that holds the secret, passing on only a status or an error class name
+- `unobservable failure` — a fail-open path reports its failure only where the report does not survive (a container log lost on `--rm`, a swallowed promise) while a sibling path keeps writing the same record, so the outage looks like health and has no detection surface of its own; the surface is the asymmetry between the two paths
 
 ## Lessons
 
