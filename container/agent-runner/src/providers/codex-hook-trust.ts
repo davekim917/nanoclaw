@@ -6,9 +6,22 @@
  * matching `[hooks.state."<key>"] trusted_hash` entry in `config.toml`, and
  * the handler is simply never dispatched — the discovery loop only pushes a
  * handler when `trust_status` is `Managed | Trusted`
- * (codex-rs `hooks/src/engine/discovery.rs:664-716`). There is no bypass flag
- * on `codex app-server`, no RPC to grant trust, and a `-c hooks.state...`
- * override does not take.
+ * (codex-rs `hooks/src/engine/discovery.rs:664-716`). There is no RPC to grant
+ * trust, and a `-c hooks.state...` override does not take.
+ *
+ * There IS one bypass, and an earlier revision of this comment wrongly said
+ * there was none (corrected in review round 8, verified against the installed
+ * binary): `--dangerously-bypass-hook-trust`, a top-level flag that
+ * `codex --dangerously-bypass-hook-trust app-server` accepts, with a matching
+ * `bypass_hook_trust` app-server request override. It is not used here, and
+ * the choice is deliberate rather than an oversight: the flag runs EVERY
+ * enabled hook codex loads, so it is per-invocation (each spawn path and each
+ * rotated home would have to carry it) and indiscriminate, where these entries
+ * name exactly the handlers NanoClaw generated plus the plugins
+ * `planCodexPluginRegistration` admits. The trade-off is real in both
+ * directions — the flag cannot silently mis-hash, which is the failure class
+ * tracked in #830 and the reason #832 exists — so it is recorded on the PR for
+ * the operator rather than settled in a comment.
  *
  * That makes this file load-bearing for the container guard chain: NanoClaw
  * generates `hooks.json` (`buildCodexHooksJson` in `./codex-app-server.ts`)
