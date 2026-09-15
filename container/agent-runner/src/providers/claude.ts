@@ -3096,19 +3096,27 @@ export class ClaudeProvider implements AgentProvider {
           if (idleSeenWithHold) {
             for (const id of liveBackgroundTasks) {
               if (!idleCoveredTasks.has(id)) {
+                // Evidence and its scope go together: a snapshot without the
+                // flag is a dropped window nothing may consult.
                 idleSeenWithHold = false;
+                idleCoveredTasks = new Set();
                 break;
               }
             }
           }
-          log(`Background tasks: ${liveBackgroundTasks.size} live${backgroundHold ? ' (hold)' : ''}`);
-          if (liveBackgroundTasks.size === 0 && idleSeenWithHold) {
+          const releasedAtDrain = liveBackgroundTasks.size === 0 && idleSeenWithHold;
+          if (releasedAtDrain) {
             // The CLI already went idle over these tasks: no idle will follow
             // this drain, so this is the release (see idleSeenWithHold).
             backgroundHold = false;
             idleSeenWithHold = false;
-            yield { type: 'background_work', live: 0 };
+            idleCoveredTasks = new Set();
           }
+          log(
+            `Background tasks: ${liveBackgroundTasks.size} live` +
+              (releasedAtDrain ? ' (hold released at drain)' : backgroundHold ? ' (hold)' : ''),
+          );
+          if (releasedAtDrain) yield { type: 'background_work', live: 0 };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'session_state_changed') {
           sessionStateSeen = true;
           if ((message as { state?: string }).state === 'idle') {
