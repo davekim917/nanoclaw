@@ -296,7 +296,7 @@ default** is the floor, the **per-group DB value** (`container_configs`, set via
 scoped vars were removed (one config pattern across all harnesses).
 
 A new Go-billing sibling needs **no model config at all** — it inherits
-`DEFAULT_OPENCODE_MODEL` (`opencode-go/glm-5.3-flash`, effort `high`) from
+`DEFAULT_OPENCODE_MODEL` (`opencode-go/deepseek-v4.1-flash`, effort `high`) from
 `src/providers/opencode.ts`. To run a different model, set it on the DB row
 **after** the `agent_groups` row exists (step 7):
 
@@ -498,7 +498,7 @@ WHERE mga.agent_group_id='${SIBLING_FOLDER}'"
 # .env var to read anymore).
 MODEL=$(pnpm exec tsx scripts/q.ts data/v2.db \
   "SELECT model FROM container_configs WHERE agent_group_id='${SIBLING_FOLDER}'" 2>/dev/null | tr -d '\n')
-[ -n "$MODEL" ] || MODEL="opencode-go/glm-5.3-flash"   # DEFAULT_OPENCODE_MODEL
+[ -n "$MODEL" ] || MODEL="opencode-go/deepseek-v4.1-flash"   # DEFAULT_OPENCODE_MODEL
 PROV="${MODEL%%/*}"   # e.g. opencode-go (Go), opencode (Zen), nvidia
 # Resolve the auth.json this sibling uses: scoped dir if present, else global.
 AUTH="$HOME/.local/share/opencode-${SIBLING_FOLDER}/auth.json"

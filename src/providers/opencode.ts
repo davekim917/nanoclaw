@@ -35,9 +35,15 @@ import { registerProviderContainerConfig } from './provider-container-registry.j
 // (container_configs), mirroring DEFAULT_OPUS_MODEL etc. for claude in
 // container-runner.ts. Default to the Go subscription (cheapest tier); Zen is
 // opt-in via an explicit `opencode/*` model. Bump these when the fleet default
-// moves. The provider is derived from the model prefix at
+// moves (2026-09-15: glm-5.3-flash → deepseek-v4.1-flash). This is the ONLY
+// place the default lives: the `provider_models` allowlist that once carried
+// an `is_default` row was dropped by migration 039
+// (`src/db/migrations/039-denied-models.ts:42`), so no DB row shadows it.
+// DeepSeek models on Go are China-hosted and the OpenCode workspace must have
+// opted in, or every request errors at the endpoint while `opencode models`
+// still lists the slug. The provider is derived from the model prefix at
 // runtime; the constant only guards a malformed override.
-const DEFAULT_OPENCODE_MODEL = 'opencode-go/glm-5.3-flash';
+const DEFAULT_OPENCODE_MODEL = 'opencode-go/deepseek-v4.1-flash';
 const DEFAULT_OPENCODE_PROVIDER = 'opencode-go';
 const DEFAULT_OPENCODE_EFFORT = 'high';
 
