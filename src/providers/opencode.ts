@@ -31,11 +31,11 @@ import {
 } from '../fs-safety.js';
 import { assertValidGroupFolder } from '../group-folder.js';
 import { log } from '../log.js';
-import { collectSiblingSupportDirs, openCodeMirrorDenyPlugins } from '../opencode-sync.js';
+import { collectSiblingSupportDirs, openCodeMirrorSkills } from '../opencode-sync.js';
 import { isExcludedPluginPath, splitExcludedPlugins, type ExcludedPlugins } from '../plugin-exclusions.js';
 import {
   MIRROR_MARKER,
-  discoverPortableSkills,
+  type DiscoveredSkill,
   isWithinResolvedRoot,
   readMirrorSourceRoot,
   resolvePluginRoots,
@@ -111,27 +111,41 @@ const DEFAULT_OPENCODE_EFFORT = 'high';
  * `container/agent-runner/src/codex-companion-setup.ts`), and OpenCode
  * auto-loads `~/.agents/skills`.
  *
- * This names the source the CURRENT `~/plugins` tree would publish under each
- * name, which is not in every case the source the mirror actually holds — the
- * mirror is written by a different pass at a different time. `copyOpenCodeSkills`
- * closes the direction that would withdraw content (it drops only a dir the
- * mirror writer published, never an operator-placed one); the direction that
- * would leak a STALE managed entry needs per-entry provenance at the writer and
- * is recorded in #836, together with the third divergence: this walk does not
- * deny workgroup-scoped plugins as `syncOpenCodePluginSkills` does
- * (`scopedPluginNames`, `src/opencode-sync.ts`). Re-raise on any of the
- * three — a scoped plugin sharing a skill name with an unscoped one, a mirror
- * left stale across a plugin rename, or any further divergence between what
- * this walk sees and what the mirror was built from.
+ * The population is the MIRROR'S, not one this reader derives: `discovered`
+ * comes from `openCodeMirrorSkills`, the single walk the writer also uses
+ * (`src/opencode-sync.ts`), and the spawn path passes the same array to this and
+ * to `mirrorSourceRootsByName`. Deriving it here was #836: this walk denied only
+ * the code-level plugins while the mirror also denies every workgroup-scoped one,
+ * so a scoped plugin that claimed a skill name ahead of an excluded sub-plugin
+ * won HERE (not excluded → not dropped) while the mirror, having denied it,
+ * published the excluded sub-plugin's directory under that name — and the
+ * excluded source was copied into the group.
+ *
+ * What remains is the direction that walks the CURRENT tree at all: this answers
+ * about the source `~/plugins` would publish under each name NOW, and the mirror
+ * was written by a different pass at a different time, so a managed entry left
+ * stale by a rename between the two is judged by a path it no longer has.
+ * `copyOpenCodeSkills` closes the direction that would withdraw content (it drops
+ * only a dir the mirror writer published). Closing the other needs the writer to
+ * record each entry's own SOURCE DIR beside the repository root it already
+ * records (`MIRROR_SOURCE_ROOT_FILE`, `src/plugin-skill-discovery.ts`), since a
+ * sub-path exclusion is about a path inside the repository and the root alone
+ * cannot decide one — #852. Re-raise on a mirror left stale across a plugin
+ * rename, or on any new reader that walks for itself instead of taking this
+ * population.
  *
  * Returns an empty set for a group with no sub-path entry, which is every group
  * today: the copy below then behaves exactly as it did.
  */
-export function excludedOpenCodeSkillNames(pluginsRoot: string, excluded: ExcludedPlugins): Set<string> {
+export function excludedOpenCodeSkillNames(
+  pluginsRoot: string,
+  excluded: ExcludedPlugins,
+  discovered: readonly DiscoveredSkill[] = openCodeMirrorSkills(pluginsRoot),
+): Set<string> {
   if (excluded.subPaths.size === 0) return new Set();
   const subPathsOnly: ExcludedPlugins = { topLevel: new Set(), subPaths: excluded.subPaths };
   const dropped = new Set<string>();
-  for (const skill of discoverPortableSkills(pluginsRoot, { runtime: 'opencode' })) {
+  for (const skill of discovered) {
     if (isExcludedPluginPath(path.relative(pluginsRoot, skill.skillDir), subPathsOnly)) dropped.add(skill.name);
   }
   return dropped;
@@ -165,14 +179,13 @@ export function excludedOpenCodeSkillNames(pluginsRoot: string, excluded: Exclud
  * a legitimate state instead of the bad input. So the drop is gated on the
  * writer's own marker, which is the only provenance the mirror carries.
  *
- * What that gate does NOT establish is which SOURCE a managed dir came from —
- * the marker is generic, and `SKILL.md` is copied rather than symlinked, so a
- * managed dir need carry no link back to its plugin at all. A managed entry can
- * therefore be stale relative to the current tree (its source renamed or
- * deleted between syncs), and for that window the drop set and the mirror
- * disagree. Closing that needs per-entry source provenance written by
- * `syncSkillSymlinks` itself, which is a change to a mirror Codex shares:
- * recorded in #836, not made here.
+ * What that gate does NOT establish is which SOURCE inside its repository a
+ * managed dir came from. `MIRROR_SOURCE_ROOT_FILE` records the repository, which
+ * is what containment needs, but a sub-path exclusion is about a path INSIDE one
+ * and every skill of a repo records the same root. So a managed entry left stale
+ * by a rename is still judged by the drop set against the path the CURRENT tree
+ * publishes under its name rather than the one it holds. Closing that means
+ * recording the entry's own source dir beside the root — #852, not made here.
  */
 /**
  * The containment roots for one top-level entry of the mirror. See the ordering
@@ -262,16 +275,10 @@ export interface CopyOpenCodeSkillsOptions {
  * override of one. Where the two disagree the record wins, because the record is
  * about the bytes in the mirror and this is not.
  */
-export function mirrorSourceRootsByName(pluginsRoot: string): Map<string, string> {
-  // The SAME deny set the mirror was written with. A walk denying less would
-  // name a different owner for a shared skill name — discovery keeps the first
-  // plugin to claim one — and would then attribute a legacy dir to a
-  // workgroup-scoped plugin the mirror never published from, reopening exactly
-  // the cross-plugin reach this containment closes.
-  const discovered = discoverPortableSkills(pluginsRoot, {
-    runtime: 'opencode',
-    denyPlugins: openCodeMirrorDenyPlugins(),
-  });
+export function mirrorSourceRootsByName(
+  pluginsRoot: string,
+  discovered: readonly DiscoveredSkill[] = openCodeMirrorSkills(pluginsRoot),
+): Map<string, string> {
   const roots = new Map<string, string>();
   for (const skill of discovered) {
     const resolved = resolveRealPath(skill.pluginRoot);
@@ -280,7 +287,7 @@ export function mirrorSourceRootsByName(pluginsRoot: string): Map<string, string
   // Support dirs are attributed by the SAME function the writer records from,
   // over the same plugin roots, so the record and this fallback cannot name
   // different owners for one mirror dir.
-  for (const [name, { pluginRoot }] of collectSiblingSupportDirs(discovered, resolvePluginRoots(pluginsRoot))) {
+  for (const [name, { pluginRoot }] of collectSiblingSupportDirs([...discovered], resolvePluginRoots(pluginsRoot))) {
     if (roots.has(name)) continue;
     roots.set(name, pluginRoot);
   }
@@ -522,9 +529,15 @@ registerProviderContainerConfig('opencode', async (ctx) => {
     // the walk would find nothing, the drop set would be empty, and the
     // exclusion would silently not apply.
     const pluginsRoot = path.join(os.homedir(), 'plugins');
+    // ONE walk, shared by both readers below. They answer different questions
+    // about the same mirror — which names to withhold, and which repository each
+    // name came from — and a population each derived for itself is how the two
+    // came to disagree (#836).
+    const mirrorSkills = openCodeMirrorSkills(pluginsRoot);
     const dropNames = excludedOpenCodeSkillNames(
       pluginsRoot,
       splitExcludedPlugins(readContainerConfig(path.basename(ctx.groupDir)).excludePlugins),
+      mirrorSkills,
     );
     // Containment for the dereferencing copy: the mirror is built from plugin
     // repositories and from nothing else, so a link resolving outside every one
@@ -533,7 +546,7 @@ registerProviderContainerConfig('opencode', async (ctx) => {
     copyOpenCodeSkills(hostSkillsDir, targetSkillsDir, {
       dropNames,
       allowedRoots: resolvePluginRoots(pluginsRoot),
-      sourceRootsByName: mirrorSourceRootsByName(pluginsRoot),
+      sourceRootsByName: mirrorSourceRootsByName(pluginsRoot, mirrorSkills),
     });
   }
 

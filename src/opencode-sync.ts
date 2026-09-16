@@ -33,6 +33,7 @@ import { log } from './log.js';
 import {
   DEFAULT_DENY_PLUGINS,
   MIRROR_OWNED_CHILDREN,
+  type DiscoveredSkill,
   discoverPortableSkills,
   isWithinResolvedRoot,
   resolvePluginRoots,
@@ -263,9 +264,9 @@ export interface OpenCodeSkillSyncResult {
  * ONE function rather than a set each caller assembles, because two walks that
  * deny different plugins are two different populations, and discovery keeps only
  * the FIRST plugin to claim a skill name — so a reader deriving its own deny set
- * can name a different owner for a name than the writer published under it. That
- * divergence is a live bug class here: the drop set still walks with the default
- * denials only, which is #836.
+ * can name a different owner for a name than the writer published under it. The
+ * drop set walked with the default denials only and did exactly that, which was
+ * #836; every reader now takes its population from `openCodeMirrorSkills`.
  */
 export function openCodeMirrorDenyPlugins(): Set<string> {
   // A workgroup-scoped plugin's skills are never mirrored. Every target here is
@@ -277,16 +278,28 @@ export function openCodeMirrorDenyPlugins(): Set<string> {
   return new Set([...DEFAULT_DENY_PLUGINS, ...scopedPluginNames(loadPluginScopes())]);
 }
 
+/**
+ * The skills this mirror publishes: one walk, one population.
+ *
+ * Every reader of the mirror must ask this rather than walking for itself.
+ * Discovery keeps only the FIRST plugin to claim a skill name (alphabetically),
+ * so two walks that deny different plugins can name different owners for one
+ * name — and then a reader's answer is about a directory the mirror does not
+ * hold. That divergence has now cost this file three findings: the drop set's
+ * own walk (#836, closed here), the attribution walk's deny set, and the
+ * support-dir population.
+ */
+export function openCodeMirrorSkills(pluginsRoot: string): DiscoveredSkill[] {
+  return discoverPortableSkills(pluginsRoot, { runtime: 'opencode', denyPlugins: openCodeMirrorDenyPlugins() });
+}
+
 export function syncOpenCodePluginSkills(): OpenCodeSkillSyncResult {
   const pluginsRoot = path.join(os.homedir(), 'plugins');
   // The repository roots anything in this mirror may point into. Shared by the
   // skill mirror (via each skill's own `pluginRoot`) and the support-dir mirror
   // below, which has no single plugin in hand.
   const pluginRoots = resolvePluginRoots(pluginsRoot);
-  const discovered = discoverPortableSkills(pluginsRoot, {
-    runtime: 'opencode',
-    denyPlugins: openCodeMirrorDenyPlugins(),
-  });
+  const discovered = openCodeMirrorSkills(pluginsRoot);
   const targets = discoverOpenCodeXdgTargets('skill');
 
   // Collect sibling support dirs (non-SKILL-md children of skills/ roots, e.g.
