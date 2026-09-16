@@ -221,7 +221,9 @@ next spawn, and the enabler run is just a verification pass.
    plan (and, keyed off it, hook trust), the `~/.agents/skills` mirror both Codex and
    OpenCode read, and — host-side, filtered per group at spawn — the OpenCode session
    XDG skill copy. The always-on composer skips the sub-plugin's `always-on.md` as
-   before.
+   before. Not withheld: the guard cores the runner imports by absolute path from
+   `bootstrap/plugins/workflow-agents/hooks/guards/` — loaded by file presence, never
+   through a walker — so excluding that sub-plugin keeps the destructive-command guard.
 
    Masking the sub-path with an empty bind mount was tried and removed — it required the
    HOST to predict what a container's own walkers would resolve, and an absolute symlink

@@ -150,7 +150,7 @@ describe('copyOpenCodeSkills with a drop set', () => {
 
   it('NEVER drops a dir the mirror writer did not publish, even when the name is in the drop set', () => {
     // `syncSkillSymlinks` preserves a directory it did not create rather than
-    // overwriting it (src/plugin-skill-discovery.ts:522), so an
+    // overwriting it (`isManagedMirror`, src/plugin-skill-discovery.ts), so an
     // operator-placed or natively-installed `<mirror>/<name>` survives every
     // sync. The drop set names a SOURCE in ~/plugins; if an excluded plugin
     // happens to publish the same name, dropping on the name alone would

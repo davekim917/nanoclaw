@@ -595,7 +595,7 @@ export function syncSkillSymlinks(
  * distinguish our writes from native installs (e.g. `gitnexus setup`)
  * without ambiguity — a native install never has this file.
  */
-const MIRROR_MARKER = '.nanoclaw-managed';
+export const MIRROR_MARKER = '.nanoclaw-managed';
 
 /**
  * A "managed mirror" dir is one we created: it contains our marker file.

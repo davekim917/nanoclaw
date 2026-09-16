@@ -87,7 +87,7 @@ Withholding either from one agent group is the same field, `excludePlugins` in `
 
 | Walker | Effect of a sub-plugin entry |
 |---|---|
-| Claude `discoverPlugins` | the sub-plugin is not in the SDK `plugins:` list, so its SessionStart hook and its `nanoclaw-plugin.json` PreToolUse guards never load |
+| Claude `discoverPlugins` | the sub-plugin is not in the SDK `plugins:` list, so its SessionStart hook and its `nanoclaw-plugin.json` PreToolUse guards never load (the guard *cores* the runner imports by absolute path from `bootstrap/plugins/workflow-agents/hooks/guards/` are the exception — loaded by file presence, not registration, so they stay in place) |
 | Codex `planCodexPluginRegistration` | no `codex plugin marketplace add` / `plugin add`, and no hook trust entry (trust is keyed off the same plan) |
 | Skill mirror `discoverPortableSkills` | the sub-plugin's skills are absent from `~/.agents/skills` (Codex's and OpenCode's discovery root) |
 | `composeGroupClaudeMd` (OpenCode) | its `always-on.md` is not inlined into the composed prompt |

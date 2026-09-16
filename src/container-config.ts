@@ -777,7 +777,13 @@ export interface ContainerConfig {
    *     registration plan (and, keyed off it, hook trust), the
    *     `~/.agents/skills` mirror both Codex and OpenCode read, the OpenCode
    *     session XDG skill copy, and the standing directive in the composed
-   *     prompt (`src/claude-md-compose.ts`).
+   *     prompt (`src/claude-md-compose.ts`). One thing a sub-path entry does
+   *     NOT withhold: the guard cores the runner imports by absolute path
+   *     (`bootstrap/plugins/workflow-agents/hooks/guards/*-core.ts`, loaded by
+   *     file presence in `providers/claude.ts`, `codex-hooks/runner.ts`,
+   *     `providers/opencode.ts`, `scheduling/task-script.ts`) — those never
+   *     pass through a walker, so excluding that sub-plugin leaves the
+   *     destructive-command guard in place. Fail-safe, and worth knowing.
    *
    * Every one of those decisions is made where the path resolves, against a
    * path the walker assembled itself, through one shared predicate
