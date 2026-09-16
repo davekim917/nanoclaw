@@ -412,6 +412,34 @@ function readThreadKey(content: { threadKey?: unknown }, msgId: string, sessionI
 }
 
 /**
+ * Keyed-anchor bookkeeping after a keyed post, which has already landed on the
+ * platform by the time this runs. So a failed write here is logged, never thrown:
+ * a throw would fail the row and re-post a message the channel already shows.
+ *   - threaded under the anchor → bump last_used_at
+ *   - root post with an id (new key, expired key, or a threaded failure that
+ *     fell back) → upsert the record, then prune stale keys
+ *   - fell back to root but got no id → drop the dead record, so the next post
+ *     doesn't pay the same failed threaded call
+ */
+async function settleThreadKeyAnchor(
+  addr: ThreadKeyAddress,
+  outcome: { threaded: boolean; fellBack: boolean; platformMsgId: string | undefined; msgId: string },
+): Promise<void> {
+  try {
+    const nowIso = new Date().toISOString();
+    if (outcome.threaded) await touchThreadKeyAnchor(addr, nowIso);
+    else if (outcome.platformMsgId) await recordThreadKeyAnchor(addr, outcome.platformMsgId, nowIso);
+    else if (outcome.fellBack) await deleteThreadKeyAnchor(addr);
+  } catch (err) {
+    log.warn('Keyed thread anchor bookkeeping failed after delivery — the post stands', {
+      id: outcome.msgId,
+      threadKey: addr.threadKey,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
  * Serializes lookup → post → record per keyed destination. Delivery is excluded
  * per session only (`inflightDeliveries` below), but a thread key is scoped to the
  * agent group, so two sessions of one group posting the same new key at once
@@ -419,6 +447,12 @@ function readThreadKey(content: { threadKey?: unknown }, msgId: string, sessionI
  * process, so an in-memory chain is the whole exclusion.
  */
 const threadKeyLocks = new Map<string, Promise<void>>();
+let threadKeyLockWaiters = 0;
+
+/** Test-only: how many deliveries are queued behind another holder of their key's lock. */
+export function _threadKeyLockWaitersForTest(): number {
+  return threadKeyLockWaiters;
+}
 
 async function withThreadKeyLock<T>(
   msg: { id: string; channel_type: string | null; platform_id: string | null; content: string },
@@ -433,15 +467,23 @@ async function withThreadKeyLock<T>(
     return deliver();
   }
   if (typeof threadKey !== 'string' || !THREAD_KEY_PATTERN.test(threadKey)) return deliver();
-  // Wider than strictly needed (a keyed row with an explicit thread_id never
-  // reads the anchor) — harmless, and it keeps one eligibility rule in deliverMessage.
+  // Coarser than the anchor's identity on purpose: the anchor is per messaging
+  // group (instance), which only deliverMessage resolves, so the lock covers every
+  // instance on this address, and also keyed rows with an explicit thread_id that
+  // never read the anchor. Over-serializing those is harmless; it keeps the one
+  // eligibility and routing rule inside deliverMessage.
   const lockKey = JSON.stringify([session.agent_group_id, msg.channel_type, msg.platform_id, threadKey]);
   const prior = threadKeyLocks.get(lockKey) ?? Promise.resolve();
   let release!: () => void;
   const held = new Promise<void>((resolve) => (release = resolve));
   const tail = prior.then(() => held);
   threadKeyLocks.set(lockKey, tail);
-  await prior;
+  threadKeyLockWaiters++;
+  try {
+    await prior;
+  } finally {
+    threadKeyLockWaiters--;
+  }
   try {
     return await deliver();
   } finally {
@@ -1238,6 +1280,7 @@ async function deliverMessage(
   // (instead of marking it delivered when nothing was actually delivered,
   // which was the pre-refactor bug).
   let deliverInstance: string | undefined;
+  let deliverMessagingGroupId: string | undefined;
   if (msg.channel_type && msg.platform_id) {
     // Resolve the messaging group ORIGIN-SESSION-FIRST: when the message
     // targets the session's own chat address, the origin row wins even if
@@ -1271,6 +1314,7 @@ async function deliverMessage(
       }
     }
     deliverInstance = mg.instance;
+    deliverMessagingGroupId = mg.id;
   }
 
   // Status messages — post-then-edit per session. First status in a turn
@@ -1523,16 +1567,13 @@ async function deliverMessage(
   // it with no day rotation, and a new key is a new top-level post. It takes
   // precedence over both anchors below, and like them never overrides an
   // explicit thread_id. Keyed per agent group, so a recreated task session
-  // keeps its open incidents.
+  // keeps its open incidents, and per messaging group — the resolved
+  // (channel, address, instance) above — so two adapter instances wired to one
+  // conversation never share a parent.
   const threadKey = readThreadKey(content, msg.id, session.id);
   const keyAddr: ThreadKeyAddress | null =
-    threadKey !== null && baseThreadId === null
-      ? {
-          agentGroupId: session.agent_group_id,
-          channelType: msg.channel_type,
-          platformId: msg.platform_id,
-          threadKey,
-        }
+    threadKey !== null && baseThreadId === null && deliverMessagingGroupId !== undefined
+      ? { agentGroupId: session.agent_group_id, messagingGroupId: deliverMessagingGroupId, threadKey }
       : null;
   const keyedEligible = keyAddr !== null;
 
@@ -1624,9 +1665,8 @@ async function deliverMessage(
     if (isInPlaceOp) {
       // The target just wasn't in the thread; the anchor itself is still good.
     } else if (keyAddr) {
-      // Dropped here, replaced below by the root post's id: a root post that
-      // returns no id must not leave the dead anchor to fail the next post too.
-      await deleteThreadKeyAnchor(keyAddr);
+      // Settled after the root post (`settleThreadKeyAnchor`), never before: if
+      // that post throws too, the failure may be transient and the record stays.
     } else if (taskAnchorEligible) {
       await deleteTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id);
     } else {
@@ -1649,10 +1689,15 @@ async function deliverMessage(
   // actually posted at root (effectiveThreadId still null) — a message that
   // already threaded under an existing anchor must not overwrite it, or the
   // next post would chain off it instead of the original root.
-  if (effectiveThreadId === null && platformMsgId && !isInPlaceOp) {
-    if (keyAddr) {
-      await recordThreadKeyAnchor(keyAddr, platformMsgId, new Date().toISOString());
-    } else if (taskAnchorEligible) {
+  if (keyAddr && !isInPlaceOp) {
+    await settleThreadKeyAnchor(keyAddr, {
+      threaded: effectiveThreadId !== null,
+      fellBack: usedAnchor && effectiveThreadId === null,
+      platformMsgId,
+      msgId: msg.id,
+    });
+  } else if (effectiveThreadId === null && platformMsgId && !isInPlaceOp) {
+    if (taskAnchorEligible) {
       await setTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id, platformMsgId, new Date().toISOString());
     } else if (turnAnchorEligible) {
       chatThreadAnchor.set(session.id, {
@@ -1662,8 +1707,6 @@ async function deliverMessage(
         messageId: platformMsgId,
       });
     }
-  } else if (keyAddr && usedAnchor && !isInPlaceOp) {
-    await touchThreadKeyAnchor(keyAddr, new Date().toISOString());
   }
   log.info('Message delivered', {
     id: msg.id,
@@ -1709,7 +1752,10 @@ async function deliverMessage(
           channelType: msg.channel_type,
           channelName: mg?.name ?? null,
           platformId: msg.platform_id,
-          threadId: msg.thread_id,
+          // Where the post actually landed: an anchored post (keyed, task day,
+          // or turn) has a null row thread_id but lives in the anchor's thread,
+          // which is the id read_thread and link search look it up by.
+          threadId: effectiveThreadId,
           role: 'assistant',
           senderId: session.agent_group_id,
           senderName: 'assistant',

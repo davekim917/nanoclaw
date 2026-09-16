@@ -36,6 +36,7 @@ import { getTaskThreadAnchor, setTaskThreadAnchor } from './db/task-thread-ancho
 import { getRawDb } from './db/connection.js';
 import { createPendingApproval, getPendingApproval, getPendingQuestion } from './db/sessions.js';
 import {
+  _threadKeyLockWaitersForTest,
   clearSessionStatusOnKill,
   deliverSessionMessages,
   registerDeliveryAction,
@@ -1569,6 +1570,9 @@ describe('keyed thread anchors (content.threadKey, migration 081)', () => {
       .run(agentGroupId, messagingGroupId, now());
   }
 
+  // Content shapes are the ones the runner's tools write
+  // (container/agent-runner/src/mcp-tools/core.ts): send_message → { text, threadKey },
+  // edit_message → { operation: 'edit', messageId, text, threadKey }.
   function insertChat(
     agentGroupId: string,
     sessionId: string,
@@ -1586,6 +1590,7 @@ describe('keyed thread anchors (content.threadKey, migration 081)', () => {
 
   function keyRows(): Array<{
     agent_group_id: string;
+    messaging_group_id: string;
     thread_key: string;
     thread_platform_id: string;
     created_at: string;
@@ -1593,19 +1598,25 @@ describe('keyed thread anchors (content.threadKey, migration 081)', () => {
   }> {
     return getRawDb()
       .prepare(
-        'SELECT agent_group_id, thread_key, thread_platform_id, created_at, last_used_at FROM thread_key_anchors ORDER BY agent_group_id, thread_key',
+        'SELECT agent_group_id, messaging_group_id, thread_key, thread_platform_id, created_at, last_used_at FROM thread_key_anchors ORDER BY agent_group_id, messaging_group_id, thread_key',
       )
       .all() as never;
   }
 
-  function seedKey(agentGroupId: string, threadKey: string, threadPlatformId: string, atIso: string): void {
+  function seedKey(
+    agentGroupId: string,
+    threadKey: string,
+    threadPlatformId: string,
+    atIso: string,
+    messagingGroupId = 'mg-1',
+  ): void {
     getRawDb()
       .prepare(
         `INSERT INTO thread_key_anchors
-           (agent_group_id, channel_type, platform_id, thread_key, thread_platform_id, created_at, last_used_at)
-         VALUES (?, 'telegram', 'telegram:123', ?, ?, ?, ?)`,
+           (agent_group_id, messaging_group_id, thread_key, thread_platform_id, created_at, last_used_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(agentGroupId, threadKey, threadPlatformId, atIso, atIso);
+      .run(agentGroupId, messagingGroupId, threadKey, threadPlatformId, atIso, atIso);
   }
 
   function recordingAdapter(opts: { failThreaded?: boolean } = {}): Array<{ threadId: string | null }> {
@@ -1618,6 +1629,15 @@ describe('keyed thread anchors (content.threadKey, migration 081)', () => {
       },
     });
     return calls;
+  }
+
+  function deliveredIds(agentGroupId: string, sessionId: string): Set<string> {
+    const inDb = openInboundDbAt(inboundDbPath(agentGroupId, sessionId));
+    try {
+      return getDeliveredIds(inDb);
+    } finally {
+      inDb.close();
+    }
   }
 
   async function taskSession(series = 'series-1') {
@@ -1637,6 +1657,7 @@ describe('keyed thread anchors (content.threadKey, migration 081)', () => {
     expect(keyRows()).toEqual([
       {
         agent_group_id: 'ag-1',
+        messaging_group_id: 'mg-1',
         thread_key: 'job-a-run-1',
         thread_platform_id: 'plat-1',
         created_at: expect.any(String),
@@ -1661,6 +1682,24 @@ describe('keyed thread anchors (content.threadKey, migration 081)', () => {
     expect(row.thread_platform_id).toBe('plat-root');
     expect(row.created_at).toBe(earlier);
     expect(row.last_used_at > earlier).toBe(true);
+  });
+
+  it('archives a keyed follow-up under the thread it landed in, so read_thread finds it', async () => {
+    const session = await taskSession();
+    seedKey('ag-1', 'job-a-run-1', 'plat-root', now());
+    insertChat('ag-1', session.id, 'out-2', { text: 'still failing', threadKey: 'job-a-run-1' });
+    recordingAdapter();
+
+    await deliverSessionMessages(session);
+
+    const archive = new Database(`${TEST_DIR}/archive.db`, { readonly: true });
+    try {
+      expect(archive.prepare("SELECT thread_id FROM messages_archive WHERE id = 'out-2'").get()).toEqual({
+        thread_id: 'telegram:123:plat-root',
+      });
+    } finally {
+      archive.close();
+    }
   });
 
   it('a different key is a new top-level post, even the same day and with a live day anchor', async () => {
@@ -1708,6 +1747,40 @@ describe('keyed thread anchors (content.threadKey, migration 081)', () => {
     ]);
   });
 
+  it('is scoped per adapter instance: a second instance on the same conversation keeps its own parent', async () => {
+    await seedAgentAndChannel();
+    await createMessagingGroup({
+      id: 'mg-1b',
+      channel_type: 'telegram',
+      platform_id: 'telegram:123',
+      instance: 'telegram-second-bot',
+      name: 'Test Chat (second bot)',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    // Instance A (mg-1) already opened the key.
+    seedKey('ag-1', 'job-a-run-1', 'plat-instance-a', now(), 'mg-1');
+    // A session whose origin chat is instance B delivers through mg-1b (origin-first resolution).
+    const { session } = await resolveSession('ag-1', 'mg-1b', null, 'shared');
+    insertChat('ag-1', session.id, 'out-1', { text: 'x', threadKey: 'job-a-run-1' });
+    const calls: Array<{ threadId: string | null; instance?: string }> = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, threadId, _kind, _content, _files, instance) {
+        calls.push({ threadId, instance });
+        return 'plat-instance-b';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null, instance: 'telegram-second-bot' }]);
+    expect(keyRows().map((r) => [r.messaging_group_id, r.thread_platform_id])).toEqual([
+      ['mg-1', 'plat-instance-a'],
+      ['mg-1b', 'plat-instance-b'],
+    ]);
+  });
+
   it('survives a recreated session: the key is held by the agent group, not the session', async () => {
     const first = await taskSession('series-1');
     insertChat('ag-1', first.id, 'out-1', { text: 'x', threadKey: 'job-a-run-1' });
@@ -1741,6 +1814,25 @@ describe('keyed thread anchors (content.threadKey, migration 081)', () => {
     warn.mockRestore();
   });
 
+  it('a transient threaded failure whose root fallback also throws keeps the existing record', async () => {
+    const session = await taskSession();
+    seedKey('ag-1', 'job-a-run-1', 'plat-root', now());
+    insertChat('ag-1', session.id, 'out-1', { text: 'x', threadKey: 'job-a-run-1' });
+    const calls = recordingAdapter();
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, threadId) {
+        calls.push({ threadId });
+        throw new Error('network down');
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: 'telegram:123:plat-root' }, { threadId: null }]);
+    expect(keyRows().map((r) => r.thread_platform_id)).toEqual(['plat-root']);
+    expect(deliveredIds('ag-1', session.id).has('out-1')).toBe(false);
+  });
+
   it('a failed threaded post whose root fallback returns no id leaves no dead record behind', async () => {
     const session = await taskSession();
     seedKey('ag-1', 'job-a-run-1', 'plat-deleted', now());
@@ -1757,7 +1849,28 @@ describe('keyed thread anchors (content.threadKey, migration 081)', () => {
     expect(keyRows()).toEqual([]);
   });
 
-  it('edits: the keyed root is edited at root, an in-thread message via the key, and nothing is recorded', async () => {
+  it('a bookkeeping write that fails after the post landed is logged, and the message is not re-posted', async () => {
+    const session = await taskSession();
+    getRawDb().exec(
+      "CREATE TRIGGER thread_key_anchors_refuse BEFORE INSERT ON thread_key_anchors BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    );
+    insertChat('ag-1', session.id, 'out-1', { text: 'x', threadKey: 'job-a-run-1' });
+    const calls = recordingAdapter();
+    const warn = vi.spyOn(log, 'warn');
+
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null }]);
+    expect(deliveredIds('ag-1', session.id).has('out-1')).toBe(true);
+    expect(warn).toHaveBeenCalledWith(
+      'Keyed thread anchor bookkeeping failed after delivery — the post stands',
+      expect.objectContaining({ id: 'out-1', threadKey: 'job-a-run-1' }),
+    );
+    warn.mockRestore();
+  });
+
+  it('edit_message rows: the keyed root is edited at root, an in-thread message via the key, nothing recorded', async () => {
     const session = await taskSession();
     seedKey('ag-1', 'job-a-run-1', 'plat-root', now());
     const edit = (messageId: string) => ({ operation: 'edit', messageId, text: 'amended', threadKey: 'job-a-run-1' });
@@ -1808,6 +1921,33 @@ describe('keyed thread anchors (content.threadKey, migration 081)', () => {
     expect(keyRows()).toEqual([]);
   });
 
+  it("a keyed root in an interactive turn does not become that turn's anchor", async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertChat(
+      'ag-1',
+      session.id,
+      'out-1',
+      { text: 'incident', threadKey: 'inc-1' },
+      {
+        ts: '2026-08-10T09:00:00.000Z',
+        inReplyTo: 'turn-A',
+      },
+    );
+    insertChat(
+      'ag-1',
+      session.id,
+      'out-2',
+      { text: 'unrelated' },
+      { ts: '2026-08-10T09:00:01.000Z', inReplyTo: 'turn-A' },
+    );
+    const calls = recordingAdapter();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null }, { threadId: null }]);
+  });
+
   it('a key unused past the retention window is a new incident, and recording prunes stale keys', async () => {
     const session = await taskSession();
     seedKey('ag-1', 'job-a-run-1', 'plat-ancient', new Date(Date.now() - 31 * DAY_MS).toISOString());
@@ -1832,17 +1972,33 @@ describe('keyed thread anchors (content.threadKey, migration 081)', () => {
     insertChat('ag-1', a.id, 'out-a', { text: 'a', threadKey: 'job-a-run-1' });
     insertChat('ag-1', b.id, 'out-b', { text: 'b', threadKey: 'job-a-run-1' });
     const calls: Array<{ threadId: string | null }> = [];
+    let releaseFirst!: () => void;
+    const firstHeld = new Promise<void>((resolve) => (releaseFirst = resolve));
+    let firstEntered!: () => void;
+    const firstStarted = new Promise<void>((resolve) => (firstEntered = resolve));
     setDeliveryAdapter({
       async deliver(_ct, _pid, threadId) {
         calls.push({ threadId });
-        // Hold the first post open long enough for the other session to reach
-        // its lookup; without the per-key lock it misses and posts a second root.
-        if (calls.length === 1) await new Promise((resolve) => setTimeout(resolve, 150));
+        if (calls.length === 1) {
+          firstEntered();
+          await firstHeld;
+        }
         return `plat-${calls.length}`;
       },
     });
 
-    await Promise.all([deliverSessionMessages(a), deliverSessionMessages(b)]);
+    const drains = Promise.all([deliverSessionMessages(a), deliverSessionMessages(b)]);
+    await firstStarted;
+    // Release the first post only once the other session is observably queued on
+    // the key's lock. A timeout fails loudly instead of falling through to a pass.
+    const deadline = Date.now() + 5_000;
+    while (_threadKeyLockWaitersForTest() !== 1) {
+      if (Date.now() > deadline) throw new Error('second session never queued on the thread-key lock');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(calls).toHaveLength(1);
+    releaseFirst();
+    await drains;
 
     expect(calls).toEqual([{ threadId: null }, { threadId: 'telegram:123:plat-1' }]);
     expect(keyRows().map((r) => r.thread_platform_id)).toEqual(['plat-1']);

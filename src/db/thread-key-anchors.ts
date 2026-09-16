@@ -24,8 +24,8 @@ export interface ThreadKeyAnchor {
 
 export interface ThreadKeyAddress {
   agentGroupId: string;
-  channelType: string;
-  platformId: string;
+  /** The messaging group the post resolved to — channel, address AND adapter instance. */
+  messagingGroupId: string;
   threadKey: string;
 }
 
@@ -37,10 +37,9 @@ function retentionCutoff(nowIso: string): string {
 export async function getThreadKeyAnchor(addr: ThreadKeyAddress, nowIso: string): Promise<ThreadKeyAnchor | null> {
   const row = await getDb().get<{ thread_platform_id: string; last_used_at: string }>(
     `SELECT thread_platform_id, last_used_at FROM thread_key_anchors
-      WHERE agent_group_id = ? AND channel_type = ? AND platform_id = ? AND thread_key = ?`,
+      WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_key = ?`,
     addr.agentGroupId,
-    addr.channelType,
-    addr.platformId,
+    addr.messagingGroupId,
     addr.threadKey,
   );
   if (!row) return null;
@@ -63,15 +62,14 @@ export async function recordThreadKeyAnchor(
 ): Promise<void> {
   await getDb().run(
     `INSERT INTO thread_key_anchors
-       (agent_group_id, channel_type, platform_id, thread_key, thread_platform_id, created_at, last_used_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(agent_group_id, channel_type, platform_id, thread_key) DO UPDATE SET
+       (agent_group_id, messaging_group_id, thread_key, thread_platform_id, created_at, last_used_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(agent_group_id, messaging_group_id, thread_key) DO UPDATE SET
        thread_platform_id = excluded.thread_platform_id,
        created_at = excluded.created_at,
        last_used_at = excluded.last_used_at`,
     addr.agentGroupId,
-    addr.channelType,
-    addr.platformId,
+    addr.messagingGroupId,
     addr.threadKey,
     threadPlatformId,
     nowIso,
@@ -84,11 +82,10 @@ export async function recordThreadKeyAnchor(
 export async function touchThreadKeyAnchor(addr: ThreadKeyAddress, nowIso: string): Promise<void> {
   await getDb().run(
     `UPDATE thread_key_anchors SET last_used_at = ?
-      WHERE agent_group_id = ? AND channel_type = ? AND platform_id = ? AND thread_key = ?`,
+      WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_key = ?`,
     nowIso,
     addr.agentGroupId,
-    addr.channelType,
-    addr.platformId,
+    addr.messagingGroupId,
     addr.threadKey,
   );
 }
@@ -102,10 +99,9 @@ export async function pruneThreadKeyAnchors(nowIso: string): Promise<void> {
 
 export async function deleteThreadKeyAnchor(addr: ThreadKeyAddress): Promise<void> {
   await getDb().run(
-    'DELETE FROM thread_key_anchors WHERE agent_group_id = ? AND channel_type = ? AND platform_id = ? AND thread_key = ?',
+    'DELETE FROM thread_key_anchors WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_key = ?',
     addr.agentGroupId,
-    addr.channelType,
-    addr.platformId,
+    addr.messagingGroupId,
     addr.threadKey,
   );
 }

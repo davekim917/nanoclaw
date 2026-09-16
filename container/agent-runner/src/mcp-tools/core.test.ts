@@ -19,7 +19,7 @@ import path from 'path';
 import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
-import { editMessage, sendFile, sendMessage, isAllowedFilePath, parseThreadKey } from './core.js';
+import { addReaction, editMessage, sendFile, sendMessage, isAllowedFilePath, parseThreadKey } from './core.js';
 
 /**
  * Publish the a2a reply stamp the way the poll loop does: a direct write to
@@ -166,8 +166,35 @@ describe('send_message / send_file MCP tools — thread_key', () => {
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
-  it('both tools advertise thread_key as optional', () => {
-    for (const t of [sendMessage, sendFile]) {
+  it('edit_message and add_reaction carry the key into their in-place rows, and omit it when absent', async () => {
+    await sendMessage.handler({ to: 'peer', text: 'incident', thread_key: 'inc-7' });
+    const [original] = getUndeliveredMessages();
+
+    await editMessage.handler({ messageId: original.seq, text: 'amended', thread_key: ' inc-7 ' });
+    await addReaction.handler({ messageId: original.seq, emoji: 'eyes', thread_key: 'inc-7' });
+    await editMessage.handler({ messageId: original.seq, text: 'unkeyed' });
+
+    const out = getUndeliveredMessages().map((r) => JSON.parse(r.content));
+    expect(out[1]).toEqual({ operation: 'edit', messageId: expect.any(String), text: 'amended', threadKey: 'inc-7' });
+    expect(out[2]).toEqual({ operation: 'reaction', messageId: expect.any(String), emoji: 'eyes', threadKey: 'inc-7' });
+    expect(out[3]).toEqual({ operation: 'edit', messageId: expect.any(String), text: 'unkeyed' });
+  });
+
+  it('edit_message and add_reaction refuse an invalid key and write nothing', async () => {
+    await sendMessage.handler({ to: 'peer', text: 'incident' });
+    const [original] = getUndeliveredMessages();
+
+    expect((await editMessage.handler({ messageId: original.seq, text: 'x', thread_key: 'bad key' })).isError).toBe(
+      true,
+    );
+    expect((await addReaction.handler({ messageId: original.seq, emoji: 'eyes', thread_key: 'bad key' })).isError).toBe(
+      true,
+    );
+    expect(getUndeliveredMessages()).toHaveLength(1);
+  });
+
+  it('every outbound tool advertises thread_key as optional', () => {
+    for (const t of [sendMessage, sendFile, editMessage, addReaction]) {
       expect(t.tool.inputSchema.properties).toHaveProperty('thread_key');
       expect(t.tool.inputSchema.required).not.toContain('thread_key');
     }
