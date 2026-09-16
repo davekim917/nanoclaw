@@ -347,6 +347,66 @@ describe('createCodexConfigOverrides', () => {
 });
 
 describe('writeCodexMcpConfigToml', () => {
+  it('THROWS rather than truncating the file when config.toml is unreadable but writable', () => {
+    // The live shape, and the reason this writer had to change: it read under
+    // `catch { base = '' }`, so a mode-0200 config.toml was read as EMPTY and
+    // the file then rewritten to MCP tables only — dropping the
+    // `[hooks.state.*]` trust rows and the `[plugins.*]` / `[marketplaces.*]`
+    // tables. It runs immediately BEFORE writeCodexHooksAndTrust on every
+    // spawn, so it got there first: the trust writer's own read guard aborted
+    // that query, but the damage was already on disk and the NEXT query wrote
+    // valid trust rows over a base that had lost everything else.
+    const prevCodexHome = process.env.CODEX_HOME;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-unreadable-'));
+    const configPath = path.join(home, 'config.toml');
+    const original = [
+      '[features]',
+      'hooks = true',
+      '',
+      '[marketplaces.mkt]',
+      'source_type = "local"',
+      '',
+      '[hooks.state."/h/hooks.json:pre_tool_use:0:0"]',
+      'trusted_hash = "sha256:deadbeef"',
+      '',
+    ].join('\n');
+    try {
+      process.env.CODEX_HOME = home;
+      fs.writeFileSync(configPath, original);
+      fs.chmodSync(configPath, 0o200);
+      expect(() => writeCodexMcpConfigToml({ nanoclaw: { command: 'bun' } })).toThrow(/could not read Codex config/i);
+      fs.chmodSync(configPath, 0o600);
+      // Untouched: not truncated, not rewritten, every load-bearing table still there.
+      expect(fs.readFileSync(configPath, 'utf-8')).toBe(original);
+    } finally {
+      if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = prevCodexHome;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('commits by rename, so a failed write leaves the last valid config standing', () => {
+    // `fs.writeFileSync` truncates in place: an ENOSPC after the open leaves
+    // the file empty or partial, and the next spawn reads the damage as its
+    // base. A leftover read-only temp file stands in for that failure here.
+    const prevCodexHome = process.env.CODEX_HOME;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-commit-'));
+    const configPath = path.join(home, 'config.toml');
+    const original = '[features]\nhooks = true\n';
+    try {
+      process.env.CODEX_HOME = home;
+      fs.writeFileSync(configPath, original);
+      fs.writeFileSync(`${configPath}.tmp`, 'leftover');
+      fs.chmodSync(`${configPath}.tmp`, 0o400);
+      expect(() => writeCodexMcpConfigToml({ nanoclaw: { command: 'bun' } })).toThrow(/could not write Codex config/i);
+      expect(fs.readFileSync(configPath, 'utf-8')).toBe(original);
+    } finally {
+      if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = prevCodexHome;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('preserves non-MCP config blocks while replacing MCP blocks', () => {
     const prevHome = process.env.HOME;
     const prevCodexHome = process.env.CODEX_HOME;
