@@ -22,6 +22,7 @@ import {
 import { getRateLimitSampleRows } from '../modules/mailbox/index.js';
 import { getCredentialSlot, setCredentialSlot } from '../modules/mailbox/session-state.js';
 import { initTestSessionDb } from '../modules/mailbox/testing.js';
+import { getOutboundDb } from '../mailbox/sqlite/connection.js';
 
 const WHO = { account: 'x', credentialSet: null, lane: null };
 
@@ -193,6 +194,17 @@ describe('ClaudeProvider.recordSlotUsageSurvey — telemetry, never selection', 
     expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-3');
     expect(getCredentialSlot('claude')).toBe('CLAUDE_CODE_OAUTH_TOKEN_3');
     expect(getRateLimitSampleRows()).toHaveLength(6);
+  });
+
+  it('ignores a slot the retired usage pick persisted under the old key', () => {
+    getOutboundDb()
+      .prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run('credential_slot:claude', 'CLAUDE_CODE_OAUTH_TOKEN_3', new Date().toISOString());
+    const p = new ClaudeProvider({ env: RING });
+    p.restorePersistedCredentialSlot();
+    expect(getCredentialSlot('claude')).toBeUndefined();
+    p.resetRotationCycle();
+    expect(p.rotateApiKey()).toMatchObject({ slot: 'CLAUDE_CODE_OAUTH_TOKEN_2' }); // was on slot 1
   });
 
   it('records nothing when the host has published nothing yet', () => {
