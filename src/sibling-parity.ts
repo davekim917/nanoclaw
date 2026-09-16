@@ -88,7 +88,8 @@ function slackUserTokenEnabled(value: unknown): unknown {
 
 /**
  * Diff two sibling configs on capability parity rather than raw serialization.
- * Slack's capability grant must match, while `also_allowed_in` contains exact
+ * Slack's non-identity settings must match (including the retired
+ * `enabled` flag, so a pair's files stay identical), while `also_allowed_in` contains exact
  * messaging-group IDs and is therefore identity-bound to each adapter.
  */
 export function findSiblingParityDrifts(

@@ -22,7 +22,8 @@ architecture block:
 - Resource budgets are operator-tunable rather than a capability invariant;
   inherit the source budget as the safe clone-time baseline, then let the
   operator size the sibling explicitly.
-- Preserve capability grants such as `slack_user_token.enabled`, but remove
+- Preserve the source's non-identity config, such as `slack_user_token.enabled`
+  (retired, but still compared for sibling parity), but remove
   identity-scoped values such as `also_allowed_in` messaging-group IDs. Those
   IDs belong to the source adapter and must be configured for the sibling's
   own wiring. Remove `gitIdentity` too: Git attribution is an explicit

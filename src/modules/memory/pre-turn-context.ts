@@ -1576,12 +1576,40 @@ function archiveExcerpt(row: ArchiveEvidenceRow, score: number, passageText?: st
   };
 }
 
+type CapabilityService = SessionServicesSnapshot['services'][number];
+
+/**
+ * Evict one capability entry for a budget: the LAST entry not marked
+ * `retainUnderBudget`, or the last entry outright once only retained ones are
+ * left. Both capability budgets evict from the end, and entries are pushed in
+ * a fixed authoring order (the Slack entry is pushed at src/capabilities.ts:812, near the end), so without the mark whichever
+ * service happens to be authored late is the one an agent loses — the Slack
+ * entry was, on the widest-wired groups, and the agent then told the owner it
+ * could not read a Slack link it could read.
+ */
+function evictCapability(services: CapabilityService[]): string | undefined {
+  for (let index = services.length - 1; index >= 0; index--) {
+    if (!services[index]!.retainUnderBudget) return services.splice(index, 1)[0]!.name;
+  }
+  return services.pop()?.name;
+}
+
+/**
+ * The first `limit` entries in authoring order, except that retained entries
+ * past the limit displace the latest non-retained ones instead of being cut.
+ */
+function selectCapabilities(services: CapabilityService[], limit: number): CapabilityService[] {
+  const selected = [...services];
+  while (selected.length > limit) evictCapability(selected);
+  return selected;
+}
+
 /** Exported for direct test of the total-block budget — see pre-turn-context.test.ts. */
 export function boundedCapabilities(
   snapshot: SessionServicesSnapshot,
   notices: ContextNotice[],
 ): SessionServicesSnapshot {
-  const selected = snapshot.services.slice(0, PRE_TURN_BOUNDS.capabilityServices).map((service) => ({
+  const selected = selectCapabilities(snapshot.services, PRE_TURN_BOUNDS.capabilityServices).map((service) => ({
     ...service,
     name: boundedText(service.name, PRE_TURN_BOUNDS.capabilityDetailChars, TRUNCATED_CAPABILITY_DETAIL),
     cli:
@@ -1629,10 +1657,11 @@ export function boundedCapabilities(
   // without first trying Y") is written last — clipping would remove exactly
   // the guidance the entry exists to deliver. Enforced here so capabilities can
   // never reach enforceFinalBound large enough to evict conversation and memory
-  // recall, which that function sacrifices first.
+  // recall, which that function sacrifices first. A `retainUnderBudget` entry
+  // is dropped only after every other entry is gone (evictCapability).
   const droppedForBudget: string[] = [];
   while (selected.length > 0 && JSON.stringify(selected).length > PRE_TURN_BOUNDS.capabilityTotalChars) {
-    droppedForBudget.push(selected.pop()!.name);
+    droppedForBudget.push(evictCapability(selected)!);
   }
   if (droppedForBudget.length > 0) {
     notices.push({
@@ -1678,7 +1707,7 @@ export function enforceFinalBound(context: PreTurnContext): void {
     truncated = true;
   }
   while (serializedLength() > limit && (context.trustedCapabilities?.services.length ?? 0) > 0) {
-    context.trustedCapabilities!.services.pop();
+    evictCapability(context.trustedCapabilities!.services);
     truncated = true;
   }
   while (serializedLength() > limit && context.conversationEvidence.excerpts.length > 0) {

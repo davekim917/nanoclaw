@@ -201,8 +201,8 @@ describe('buildSessionServicesSnapshot', () => {
 
     // Guard the guard: prove we actually took the owner-safe branch, so this
     // test can never silently regress into measuring the short string again.
-    const slack = (await snapshot).services.find((s) => s.name === 'Slack (read)');
-    expect(slack?.useFor).toContain('FILE ATTACHMENTS');
+    const slack = (await snapshot).services.find((s) => s.name === 'Slack');
+    expect(slack?.useFor).toContain('LIVE in THIS session');
 
     const oversized = (await snapshot).services.flatMap((s) =>
       (['useFor', 'activation'] as const)
@@ -211,6 +211,121 @@ describe('buildSessionServicesSnapshot', () => {
     );
     expect(oversized).toEqual([]);
     expect((await snapshot).services.length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.capabilityServices);
+  });
+
+  describe('Slack', () => {
+    const OWNER_SAFE_MG = 'mg-owner-safe';
+
+    async function slackGroup(opts: { secret: boolean; enabled?: boolean }): Promise<AgentGroup> {
+      insertWorkgroup('example-retail', opts.secret ? ['Slack-User-Token-ExampleRetail'] : ['Anthropic']);
+      const ag = group('ag-slack', 'example-retail-slack');
+      await createGroupInWorkgroup(ag, 'example-retail');
+      writeContainerConfig(ag.folder, {
+        mcpServers: {},
+        packages: { apt: [], npm: [] },
+        additionalMounts: [],
+        skills: 'all',
+        tools: [],
+        slack_user_token: {
+          ...(opts.enabled === undefined ? {} : { enabled: opts.enabled }),
+          also_allowed_in: [OWNER_SAFE_MG],
+        },
+      } as Parameters<typeof writeContainerConfig>[1]);
+      return ag;
+    }
+
+    async function slackEntry(agentGroupId: string, messagingGroupId?: string | null) {
+      return (await buildSessionServicesSnapshot(agentGroupId, messagingGroupId)).services.find(
+        (s) => s.name === 'Slack',
+      );
+    }
+
+    it('owner-safe: states curl is the whole surface, how to read a permalink, and never mentions an MCP', async () => {
+      const ag = await slackGroup({ secret: true, enabled: true });
+      const slack = await slackEntry(ag.id, OWNER_SAFE_MG);
+
+      expect(slack?.cli).toBe('curl');
+      expect(slack?.useFor).toContain('curl https://slack.com/api/<method>');
+      expect(slack?.useFor).toContain('NO auth header');
+      for (const method of [
+        'conversations.history',
+        'conversations.replies',
+        'search.messages',
+        'users.info',
+        'chat.postMessage',
+      ]) {
+        expect(slack?.useFor).toContain(method);
+      }
+      expect(slack?.useFor).toContain('p1789080120758779');
+      expect(slack?.useFor).toContain('1789080120.758779');
+      expect(slack?.useFor).not.toMatch(/mcp__slack|user-token MCP|MCP \(if loaded\)/);
+      // Posting needs an optional scope; the entry must not promise it unconditionally.
+      expect(slack?.useFor).toContain('chat:write');
+    });
+
+    it('owner-safe: the permalink recipe survives the runner fallback’s per-string clip', async () => {
+      // The runner's fresh-context bootstrap keeps only the first
+      // MAX_CAPABILITY_STRING_CHARS (600) minus its marker of every string
+      // (container/agent-runner/src/memory/bootstrap.ts:8, :13, :20-24). The
+      // host bound is 2,500, so the operative recipe has to be authored first.
+      const ag = await slackGroup({ secret: true });
+      const slack = await slackEntry(ag.id, OWNER_SAFE_MG);
+      const kept = slack!.useFor!.slice(0, 600 - '[truncated:fresh-context-bootstrap]'.length);
+
+      expect(kept).toContain('curl https://slack.com/api/<method>');
+      expect(kept).toContain('NO auth header');
+      expect(kept).toContain('1789080120.758779');
+      expect(kept).toContain('conversations.replies?channel=C0123&ts=');
+    });
+
+    it('owner-safe: the files.slack.com fix does not rely on the naming convention alone', async () => {
+      // An explicit onecli_secret_names list is authoritative
+      // (src/onecli-secrets.ts:589-592), so "name it slack+user" would leave an
+      // unlisted file credential injected in shared channels.
+      const ag = await slackGroup({ secret: true });
+      const slack = await slackEntry(ag.id, OWNER_SAFE_MG);
+      expect(slack?.useFor).toContain('files.slack.com');
+      expect(slack?.useFor).not.toContain('with `slack` and `user` in its name');
+    });
+
+    it('non-owner-safe: keeps the WITHHELD text and drops the MCP mention', async () => {
+      const ag = await slackGroup({ secret: true, enabled: true });
+      const slack = await slackEntry(ag.id, 'mg-some-shared-channel');
+
+      expect(slack?.useFor).toMatch(/^WITHHELD IN THIS SESSION/);
+      expect(slack?.useFor).toContain('slack_user_token.also_allowed_in');
+      expect(slack?.useFor).not.toMatch(/MCP/);
+    });
+
+    it('group-level (no session): describes the scoping without claiming access here', async () => {
+      const ag = await slackGroup({ secret: true });
+      const slack = await slackEntry(ag.id);
+
+      expect(slack?.useFor).toContain('withheld everywhere else');
+      expect(slack?.useFor).not.toContain('LIVE in THIS session');
+      expect(slack?.useFor).not.toMatch(/mcp__slack/);
+    });
+
+    it('is marked to survive the pre-turn capability budget in every branch', async () => {
+      const ag = await slackGroup({ secret: true });
+      for (const mg of [OWNER_SAFE_MG, 'mg-some-shared-channel', undefined]) {
+        expect((await slackEntry(ag.id, mg))?.retainUnderBudget).toBe(true);
+      }
+    });
+
+    it('retired `enabled` flag: neither grants an entry without the secret nor withholds one with it', async () => {
+      const enabledNoSecret = await slackGroup({ secret: false, enabled: true });
+      expect(await slackEntry(enabledNoSecret.id, OWNER_SAFE_MG)).toBeUndefined();
+
+      await closeDb();
+      fs.rmSync(dirs.TEST_ROOT, { recursive: true, force: true });
+      fs.mkdirSync(dirs.GROUPS_DIR, { recursive: true });
+      await initTestDb();
+      runMigrations(getRawDb());
+
+      const disabledWithSecret = await slackGroup({ secret: true, enabled: false });
+      expect((await slackEntry(disabledWithSecret.id, OWNER_SAFE_MG))?.useFor).toContain('LIVE in THIS session');
+    });
   });
 
   it('does not surface Cloudflare unless both its secret and MCP server are wired', async () => {

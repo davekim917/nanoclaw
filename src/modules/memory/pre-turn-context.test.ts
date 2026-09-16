@@ -293,6 +293,58 @@ describe('bounded authoritative pre-turn retrieval', () => {
     expect(notices.some((n) => n.code === 'capability-total-budget')).toBe(true);
   });
 
+  // 2026-09-16: on the widest-wired groups the total budget dropped
+  // `Fivetran, Profound, SELECT (select.dev), Slack (read)` — the last four
+  // authored — and an agent with live Slack told the owner Slack was down.
+  describe('retainUnderBudget', () => {
+    const service = (name: string, retainUnderBudget?: boolean) => ({
+      name,
+      declaredTools: [],
+      scopes: [],
+      credentialPaths: [],
+      useFor: 'x'.repeat(PRE_TURN_BOUNDS.capabilityDetailChars),
+      ...(retainUnderBudget ? { retainUnderBudget } : {}),
+    });
+
+    it('the total budget evicts every other entry before a retained one authored last', () => {
+      const notices: ContextNotice[] = [];
+      const services = [...Array.from({ length: 8 }, (_, i) => service(`Service ${i}`)), service('Slack', true)];
+      const bounded = boundedCapabilities({ agentGroupId: 'ag-a', services }, notices);
+
+      expect(JSON.stringify(bounded.services).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.capabilityTotalChars);
+      expect(bounded.services.map((s) => s.name)).toContain('Slack');
+      // Authoring order is kept for what survives; eviction takes the latest
+      // non-retained entries, so the earliest ones stay.
+      expect(bounded.services[0]?.name).toBe('Service 0');
+      expect(bounded.services.at(-1)?.name).toBe('Slack');
+      const dropped = notices.find((n) => n.code === 'capability-total-budget')?.detail ?? '';
+      expect(dropped).toContain('Service 7');
+      expect(dropped).not.toContain('Slack');
+    });
+
+    it('without the mark the same entry is the first dropped (control)', () => {
+      const notices: ContextNotice[] = [];
+      const services = [...Array.from({ length: 8 }, (_, i) => service(`Service ${i}`)), service('Slack')];
+      const bounded = boundedCapabilities({ agentGroupId: 'ag-a', services }, notices);
+      expect(bounded.services.map((s) => s.name)).not.toContain('Slack');
+    });
+
+    it('the service-count limit displaces a non-retained entry instead of cutting a retained one', () => {
+      const notices: ContextNotice[] = [];
+      const small = (name: string, retain?: boolean) => ({ ...service(name, retain), useFor: 'short' });
+      const services = [
+        ...Array.from({ length: PRE_TURN_BOUNDS.capabilityServices + 3 }, (_, i) => small(`Service ${i}`)),
+        small('Slack', true),
+      ];
+      const bounded = boundedCapabilities({ agentGroupId: 'ag-a', services }, notices);
+
+      expect(bounded.services).toHaveLength(PRE_TURN_BOUNDS.capabilityServices);
+      expect(bounded.services.at(-1)?.name).toBe('Slack');
+      expect(bounded.services.map((s) => s.name)).not.toContain(`Service ${PRE_TURN_BOUNDS.capabilityServices - 1}`);
+      expect(notices.some((n) => n.code === 'capability-service-limit')).toBe(true);
+    });
+  });
+
   it('test_core_conflicts_and_truncation_are_explicit', async () => {
     memoryFile(
       'preferences/operator.md',
@@ -2141,6 +2193,33 @@ describe('final-bound eviction order at the seam', () => {
     enforceFinalBound(context);
     expect(JSON.stringify(context).length).toBe(before);
     expect(context.notices.some((n) => n.code === 'final-context-limit')).toBe(false);
+  });
+
+  it('capability eviction at the final bound takes non-retained entries first', () => {
+    const context = makeSized(PRE_TURN_BOUNDS.bootstrapFinalChars + 1_000, { caps: true });
+    // Nothing but capabilities left to shed: no memory or conversation rows.
+    context.memoryEvidence.excerpts = [];
+    context.conversationEvidence.excerpts = [];
+    const entry = (name: string, retainUnderBudget?: boolean) => ({
+      name,
+      declaredTools: [],
+      scopes: [],
+      credentialPaths: [],
+      useFor: 'y'.repeat(2_400),
+      ...(retainUnderBudget ? { retainUnderBudget } : {}),
+    });
+    context.trustedCapabilities!.services = [
+      ...Array.from({ length: 11 }, (_, i) => entry(`Service ${i}`)),
+      entry('Slack', true),
+    ];
+    expect(JSON.stringify(context).length).toBeGreaterThan(PRE_TURN_BOUNDS.bootstrapFinalChars);
+
+    enforceFinalBound(context);
+
+    const names = context.trustedCapabilities!.services.map((s) => s.name);
+    expect(names.length).toBeLessThan(12);
+    expect(names).toContain('Slack');
+    expect(names).toContain('Service 0');
   });
 
   it('conversation excerpts evict before memory (order regression)', () => {

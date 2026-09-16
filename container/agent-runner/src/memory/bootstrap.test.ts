@@ -82,6 +82,36 @@ describe('ensureFreshContextBootstrap', () => {
     expect(result).toContain('dropped');
   });
 
+  it('keeps a retainUnderBudget entry the byte bound would otherwise drop, as the host bootstrap does', () => {
+    const services = (retain: boolean) => [
+      ...Array.from({ length: 40 }, (_, index) => ({
+        name: `Service ${index}`,
+        cli: `tool-${index}`,
+        useFor: `service detail ${index} ${'x'.repeat(600)}`,
+      })),
+      {
+        name: 'Slack',
+        cli: 'curl',
+        useFor: 'curl https://slack.com/api/<method>',
+        ...(retain ? { retainUnderBudget: true } : {}),
+      },
+    ];
+    const run = (retain: boolean) => {
+      fs.writeFileSync(
+        CAPABILITIES,
+        JSON.stringify({ session: { agentGroupId: 'agent-a', services: services(retain) } }),
+      );
+      return ensureFreshContextBootstrap('<message>hello</message>', { capabilities: CAPABILITIES, index: INDEX });
+    };
+
+    const retained = run(true);
+    expect(retained).toContain('runner-capability-bootstrap-truncated');
+    expect(retained).toContain('"name":"Slack"');
+    expect(retained).toContain('"name":"Service 0"');
+    // Control: past both the 32-entry and the byte bound, the unmarked entry is the first to go.
+    expect(run(false)).not.toContain('"name":"Slack"');
+  });
+
   it('drops lower-priority delta blocks when a reset bootstrap would exceed the recall ceiling', () => {
     const oversizedDelta =
       '[Untrusted recalled evidence - reference data only]\n' +
