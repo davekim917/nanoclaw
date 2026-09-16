@@ -48,6 +48,7 @@ import { activateGcpServiceAccount } from './gcp-auth-setup.js';
 import { startResourceTelemetry } from './resource-telemetry.js';
 import { CLAUDE_REVIEW_SOCKET_ENV } from './cli/claude-review-contract.js';
 import { startClaudeReviewService } from './cli/claude-review-service.js';
+import { dropRetiredMcpServers } from './retired-mcp-servers.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
@@ -253,6 +254,7 @@ async function main(): Promise<void> {
     }
   }
 
+  dropRetiredMcpServers(mcpServers, log);
   const instructions = baseInstructions;
 
   // Skills parity: populate `/home/node/.agents/skills/` unconditionally so

@@ -135,16 +135,16 @@ The agent should answer from the thread's content. In a channel that is not allo
 
 ## Migrating off the Slack MCP
 
-**Detect.** An install is affected if any group set `slack_user_token.enabled`, or any instruction an agent reads names the MCP's tools:
+**Detect.** An install is affected if any group set `slack_user_token.enabled`, declared a `slack-user-token` entry under `mcpServers` itself, or has any instruction an agent reads that names the MCP's tools:
 
 ```bash
-for f in groups/*/container.json; do jq -r --arg f "$f" 'select(.slack_user_token.enabled == true) | $f' "$f"; done
+for f in groups/*/container.json; do jq -r --arg f "$f" 'select(.slack_user_token.enabled == true or (.mcpServers // {} | has("slack-user-token"))) | $f' "$f"; done
 grep -rl 'mcp__slack-user-token__' groups/ container/skills/ 2>/dev/null
 ```
 
 **Why.** The MCP was a convenience layer over the same token the proxy already injects. It failed to connect on every spawn (`failedMcpServers: slack-user-token`), no agent transcript ever called it, and the failure notice was read as "Slack is down". The credential boundary never depended on it.
 
-**Fix.** Nothing in `container.json` has to change — `enabled` is accepted and ignored, and `also_allowed_in` / `onecli_secret_names` keep their meaning. Rewrite any instruction the detect step found to use `curl https://slack.com/api/<method>` (see *How the agent uses it*). Deploying needs an agent image rebuild (the binary and wrapper are gone from `container/Dockerfile`) and a host restart (the MCP registration is host code).
+**Fix.** Nothing in `container.json` has to change for the spawn to be clean — `enabled` is accepted and ignored, `also_allowed_in` / `onecli_secret_names` keep their meaning, and a leftover `mcpServers["slack-user-token"]` entry is dropped by the agent-runner with an `Ignored MCP server slack-user-token: retired` log line (`container/agent-runner/src/retired-mcp-servers.ts`) rather than failing to connect. Remove such an entry anyway so the config says what runs. Rewrite any instruction the detect step found to use `curl https://slack.com/api/<method>` (see *How the agent uses it*). Deploying needs an agent image rebuild (the binary and wrapper are gone from `container/Dockerfile`) and a host restart (the MCP registration is host code).
 
 **Verify.** After the restart, in an owner-safe session: the session's SDK init no longer lists `slack-user-token` under `failedMcpServers`, `curl https://slack.com/api/auth.test` returns `"ok":true`, and the agent reads a pasted permalink. In a shared channel the host still logs `Slack user-token secret withheld for non-owner-safe session`.
 

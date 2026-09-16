@@ -287,7 +287,7 @@
 "container/agent-runner/src/harness-tag-strip.ts":{"diff":20,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/heartbeat.test.ts":{"diff":32,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/heartbeat.ts":{"diff":0,"mode":"100644","sha256":"0af906120acbba6a0615f0b39276ae7a187404d17d2ea55a101f9f89e2dd049b"},
-"container/agent-runner/src/index.ts":{"diff":235,"mode":"100644","sha256":"b95e15b6492fe303148c006ab167b3a535d606dcfa290ef97c57305c94dba1cd"},
+"container/agent-runner/src/index.ts":{"diff":237,"mode":"100644","sha256":"a8c9b926e455ccb09abd1145ba3dd80270174e6b5fee862c5090acdee8adba4d"},
 "container/agent-runner/src/integration.test.ts":{"diff":664,"mode":"100644","sha256":"2083b44e3a3bd86f14edf52754c4f7771612984ab76a2932baae378f65a56995"},
 "container/agent-runner/src/mailbox/compose.ts":{"diff":4,"mode":"100644","sha256":"5f52cbb63a4777c3d063ba7700affbf4017e53c5b4256528f9f621fbb5675ae5"},
 "container/agent-runner/src/mailbox/index.ts":{"diff":0,"mode":"100644","sha256":"d8568702a9b5a287f75a4dd9821deccba44c14b534f92a669ba313ba9c59dde3"},
