@@ -197,7 +197,13 @@ function resolveRootsFor(
   } catch {
     return [];
   }
-  if (entry === undefined || !entry.isDirectory()) return allowedRoots;
+  // A non-directory entry (a top-level file, or the pre-mirror-dir legacy
+  // symlink shape) carries no record of its own, but the current walk may still
+  // know the name — prefer that over the union.
+  if (entry === undefined || !entry.isDirectory()) {
+    const walkedEntry = sourceRootsByName.get(name);
+    return walkedEntry === undefined ? allowedRoots : [walkedEntry];
+  }
 
   const recorded = readMirrorSourceRoot(dir);
   if (recorded !== null) {
@@ -271,10 +277,12 @@ export function mirrorSourceRootsByName(pluginsRoot: string): Map<string, string
     const resolved = resolveRealPath(skill.pluginRoot);
     if (resolved !== null) roots.set(skill.name, resolved);
   }
-  for (const [name, { pluginRoot }] of collectSiblingSupportDirs(discovered)) {
+  // Support dirs are attributed by the SAME function the writer records from,
+  // over the same plugin roots, so the record and this fallback cannot name
+  // different owners for one mirror dir.
+  for (const [name, { pluginRoot }] of collectSiblingSupportDirs(discovered, resolvePluginRoots(pluginsRoot))) {
     if (roots.has(name)) continue;
-    const resolved = resolveRealPath(pluginRoot);
-    if (resolved !== null) roots.set(name, resolved);
+    roots.set(name, pluginRoot);
   }
   return roots;
 }

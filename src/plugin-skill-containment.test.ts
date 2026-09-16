@@ -407,6 +407,32 @@ describe('plugin skill mirror containment', () => {
     expect(readAll(xdg)).not.toContain('HOST-ONLY-SECRET');
   });
 
+  it('does not fail the copy on a top-level FILE or file-symlink in the mirror', () => {
+    // `lstatSync(<entry>/.nanoclaw-source-root, { throwIfNoEntry: false })`
+    // suppresses ENOENT and nothing else: through a file it throws ENOTDIR, and
+    // an unhandled throw here escapes the cpSync filter and fails the spawn for
+    // every group sharing the mirror.
+    const mirror = path.join(tmp, 'mirror');
+    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+    fs.writeFileSync(path.join(mirror, 'loose.md'), 'loose');
+    fs.writeFileSync(path.join(tmp, 'elsewhere.md'), 'elsewhere');
+    fs.symlinkSync(path.join(tmp, 'elsewhere.md'), path.join(mirror, 'linked.md'));
+
+    const xdg = path.join(tmp, 'xdg');
+    expect(() =>
+      copyOpenCodeSkills(mirror, xdg, {
+        allowedRoots: resolvePluginRoots(plugins),
+        sourceRootsByName: mirrorSourceRootsByName(plugins),
+      }),
+    ).not.toThrow();
+
+    expect(fs.readFileSync(path.join(xdg, 'loose.md'), 'utf8')).toBe('loose');
+    // The link leaves every plugin repository, so it is refused — not copied,
+    // and not a spawn failure either.
+    expect(fs.existsSync(path.join(xdg, 'linked.md'))).toBe(false);
+    expect(fs.existsSync(path.join(xdg, 'helper', 'SKILL.md'))).toBe(true);
+  });
+
   it('prunes a mirror dir whose source became an escape since the last sync', () => {
     const skillDir = path.join(plugins, 'evil', 'skills', 'leak');
     writeSkill(skillDir, 'leak');

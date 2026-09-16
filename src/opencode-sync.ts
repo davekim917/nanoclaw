@@ -294,7 +294,7 @@ export function syncOpenCodePluginSkills(): OpenCodeSkillSyncResult {
   // peer SKILL.md files via `../<sibling>/...` relative paths. Without this,
   // team-auto/SKILL.md's `../shared/codex-workflow-primitives.md` lookup
   // resolves to a missing file in the mirror.
-  const supportDirs = collectSiblingSupportDirs(discovered);
+  const supportDirs = collectSiblingSupportDirs(discovered, pluginRoots);
 
   let created = 0;
   let unchanged = 0;
@@ -346,12 +346,23 @@ export function syncOpenCodePluginSkills(): OpenCodeSkillSyncResult {
  */
 export function collectSiblingSupportDirs(
   discovered: ReturnType<typeof discoverPortableSkills>,
+  pluginRoots: readonly string[],
 ): Map<string, { dir: string; pluginRoot: string }> {
   const seenRoots = new Set<string>();
   const supportDirs = new Map<string, { dir: string; pluginRoot: string }>();
 
   for (const skill of [...discovered].sort((a, b) => a.skillDir.localeCompare(b.skillDir))) {
     // skill.skillDir = <plugin-root>/.../skills/<skill-name>
+    //
+    // EXCEPT for a single-skill repo, whose skill dir IS the repo root
+    // (discovery rule 3, `<plugin>/SKILL.md`): its parent is the PLUGINS ROOT,
+    // and treating that as a skills root makes every other plugin repository
+    // without a root `SKILL.md` a "support dir" — published whole into the
+    // shared mirror under its own folder name, workgroup-scoped repositories
+    // included, since nothing on this path consults the deny set. `humanizer`
+    // is that shape on this install. A skills root is a directory INSIDE a
+    // plugin; the repo root is not one.
+    if (skill.skillDir === skill.pluginRoot) continue;
     const skillsRoot = path.dirname(skill.skillDir);
     if (seenRoots.has(skillsRoot)) continue;
     seenRoots.add(skillsRoot);
@@ -368,10 +379,30 @@ export function collectSiblingSupportDirs(
       const childPath = path.join(skillsRoot, entry.name);
       if (fs.existsSync(path.join(childPath, 'SKILL.md'))) continue; // it's a skill, handled separately
       if (supportDirs.has(entry.name)) continue;
-      supportDirs.set(entry.name, { dir: childPath, pluginRoot: skill.pluginRoot });
+      // The repository that CONTAINS the directory, not the repository of the
+      // skill that led us to it. The two are the same for every shape this
+      // walks today, and a reader deriving one while the writer records the
+      // other is the divergence class this file has already paid for twice.
+      const owner = supportDirRoot(childPath, pluginRoots);
+      if (owner === undefined) continue;
+      supportDirs.set(entry.name, { dir: childPath, pluginRoot: owner });
     }
   }
   return supportDirs;
+}
+
+/**
+ * The resolved plugin repository containing `dir`, or undefined when it is in
+ * none of them. One definition, shared by the support-dir writer and the
+ * attribution walk the session copy uses (`mirrorSourceRootsByName`,
+ * `src/providers/opencode.ts`), so the two cannot name different owners for one
+ * mirror dir — the writer's record and the reader's fallback have to agree or
+ * the fallback refuses content the record would have allowed.
+ */
+export function supportDirRoot(dir: string, pluginRoots: readonly string[]): string | undefined {
+  const resolved = resolveRealPath(dir);
+  if (resolved === null) return undefined;
+  return pluginRoots.find((root) => isWithinResolvedRoot(resolved, root));
 }
 
 /**
@@ -390,9 +421,7 @@ export function collectSiblingSupportDirs(
  */
 function mirrorSupportDir(src: string, dst: string, pluginRoots: readonly string[]): string[] {
   const refused: string[] = [];
-  const resolvedSrc = resolveRealPath(src);
-  const ownRoot =
-    resolvedSrc === null ? undefined : pluginRoots.find((root) => isWithinResolvedRoot(resolvedSrc, root));
+  const ownRoot = supportDirRoot(src, pluginRoots);
   fs.mkdirSync(dst, { recursive: true });
   // Provenance, same record the skill mirror writes: without it the session
   // copy has no repository to contain this dir's links to, and a link NESTED

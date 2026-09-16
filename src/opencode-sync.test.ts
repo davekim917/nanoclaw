@@ -160,6 +160,31 @@ describe('syncOpenCodePluginSkills containment (#829)', () => {
     expect(fs.existsSync(path.join(xdg, 'shared', 'sub', 'cross.md'))).toBe(false);
   });
 
+  it('never treats the PLUGINS ROOT as a skills root, so a sibling repo is not published as a support dir', () => {
+    // A single-skill repo's skill dir IS its repo root (discovery rule 3), so
+    // its parent is ~/plugins. Treating that as a skills root made every other
+    // repository without a root SKILL.md a "support dir" — published whole into
+    // the shared mirror, workgroup scoping and all, since this path never
+    // consults the deny set.
+    const single = path.join(HOME, 'plugins', 'single-skill-repo');
+    fs.mkdirSync(single, { recursive: true });
+    fs.writeFileSync(
+      path.join(single, 'SKILL.md'),
+      '---\nname: single-skill-repo\ndescription: A single-skill repo.\n---\n\nBody.\n',
+    );
+    const clientDoc = path.join(HOME, 'plugins', 'client-plugin', 'domain', 'client.md');
+    fs.mkdirSync(path.dirname(clientDoc), { recursive: true });
+    fs.writeFileSync(clientDoc, 'CLIENT-TENANT-DATA');
+    scopePlugins({ 'client-plugin': ['client-wg'] });
+
+    syncOpenCodePluginSkills();
+
+    expect(fs.existsSync(path.join(GLOBAL_SKILLS, 'client-plugin'))).toBe(false);
+    expect(fs.existsSync(path.join(GLOBAL_SKILLS, 'shared-plugin'))).toBe(false);
+    // The single-skill repo's own skill is still mirrored.
+    expect(fs.existsSync(path.join(GLOBAL_SKILLS, 'single-skill-repo', 'SKILL.md'))).toBe(true);
+  });
+
   it('attributes a name to the plugin the MIRROR published it from, not to a scoped one', () => {
     // Discovery keeps the first plugin to claim a name, alphabetically. A walk
     // that denied less than the mirror's would name `a-client` as the owner of
