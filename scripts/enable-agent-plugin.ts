@@ -46,9 +46,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { discoverPortableSkills, readPluginDenySiblings, type AgentRuntime } from '../src/plugin-skill-discovery.js';
+import { readPluginDenySiblings, type AgentRuntime } from '../src/plugin-skill-discovery.js';
 import { findCodexSkillsRoot, materializeSymlinkedSkills } from '../src/codex-skill-materialize.js';
-import { syncOpenCodePluginSkills } from '../src/opencode-sync.js';
+import { openCodeMirrorSkills, syncOpenCodePluginSkills } from '../src/opencode-sync.js';
 import { readContainerConfig, writeContainerConfig } from '../src/container-config.js';
 import { GROUPS_DIR } from '../src/config.js';
 
@@ -492,7 +492,12 @@ function main(): void {
       }
     : resolveCodexRegistration(dir, name, dryRun);
 
-  const portableSkills = discoverPortableSkills(PLUGINS_ROOT, { runtime: 'opencode' })
+  // The MIRROR's population, not a walk of this script's own: what this reports
+  // is what `syncOpenCodePluginSkills` below will publish, and a walk denying
+  // less would credit this plugin with a name a scoped plugin claims ahead of it
+  // (or omit one it loses to a scoped plugin), which is #836's class in the
+  // operator's report rather than in a group's skills.
+  const portableSkills = openCodeMirrorSkills(PLUGINS_ROOT)
     .filter((s) => s.plugin === name)
     .map((s) => s.name);
 
