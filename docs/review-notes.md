@@ -58,6 +58,7 @@ Add a class here, in the same PR, only when none of these fits.
 - `writable-sidecar` — a file is protected by a read-only overlay but its directory stays container-writable, so a planted sibling (a rollback journal, a lock, a `-wal`) changes how the host later reads or opens the protected file
 - `evidence keying` — a durable record is keyed on a caller-supplied id instead of a host-generated one, so a collision silently discards or misattributes a prior record
 - `check-then-act` — a uniqueness or exclusion check crosses an await before the write it guards, so two concurrent callers both pass it and both write
+- `unaudited clear` — a verb that removes a value writes no record of what it removed, so a mistaken clear cannot be put back from the trail
 - `pattern audit` — a fix for one instance of an unsafe pattern is not grepped across every call site that shares it, leaving siblings unfixed
 - `narrowed exclusion` — a coarse lock is replaced by a finer one, dropping mutual exclusion against every operation that still takes the coarse one; the two claim namespaces do not conflict, so both proceed and collide deeper in
 - `secret in error message` — a lower layer's error quotes the value it was handed (a header value, a URL with a key) and a caller logs or rethrows `.message` verbatim, so a credential lands in a log; sanitize at the layer that holds the secret, passing on only a status or an error class name
