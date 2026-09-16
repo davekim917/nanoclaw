@@ -32,11 +32,13 @@ import { formatOpenCodeAgentMd, isManagedOpenCodeAgent } from './opencode-agent-
 import { log } from './log.js';
 import {
   DEFAULT_DENY_PLUGINS,
+  MIRROR_OWNED_CHILDREN,
   discoverPortableSkills,
   isWithinResolvedRoot,
   resolvePluginRoots,
   resolveRealPath,
   syncSkillSymlinks,
+  writeMirrorSourceRoot,
 } from './plugin-skill-discovery.js';
 import { loadPluginScopes, scopedPluginNames } from './plugin-scopes.js';
 
@@ -294,7 +296,7 @@ export function syncOpenCodePluginSkills(): OpenCodeSkillSyncResult {
     for (const s of result.skipped) skippedSet.add(s);
     for (const r of result.refused) refusedSet.add(r);
 
-    for (const [name, srcDir] of supportDirs) {
+    for (const [name, { dir: srcDir }] of supportDirs) {
       const dstDir = path.join(target, name);
       // Don't trample a name we already wrote as a real skill mirror — skill
       // wins over support dir (extremely unlikely collision but cheap to guard).
@@ -328,9 +330,11 @@ export function syncOpenCodePluginSkills(): OpenCodeSkillSyncResult {
  * skills/shared/). Keyed by dir name; first-wins if multiple plugins share a
  * name (alphabetical by source plugin).
  */
-function collectSiblingSupportDirs(discovered: ReturnType<typeof discoverPortableSkills>): Map<string, string> {
+export function collectSiblingSupportDirs(
+  discovered: ReturnType<typeof discoverPortableSkills>,
+): Map<string, { dir: string; pluginRoot: string }> {
   const seenRoots = new Set<string>();
-  const supportDirs = new Map<string, string>();
+  const supportDirs = new Map<string, { dir: string; pluginRoot: string }>();
 
   for (const skill of [...discovered].sort((a, b) => a.skillDir.localeCompare(b.skillDir))) {
     // skill.skillDir = <plugin-root>/.../skills/<skill-name>
@@ -350,7 +354,7 @@ function collectSiblingSupportDirs(discovered: ReturnType<typeof discoverPortabl
       const childPath = path.join(skillsRoot, entry.name);
       if (fs.existsSync(path.join(childPath, 'SKILL.md'))) continue; // it's a skill, handled separately
       if (supportDirs.has(entry.name)) continue;
-      supportDirs.set(entry.name, childPath);
+      supportDirs.set(entry.name, { dir: childPath, pluginRoot: skill.pluginRoot });
     }
   }
   return supportDirs;
@@ -376,9 +380,15 @@ function mirrorSupportDir(src: string, dst: string, pluginRoots: readonly string
   const ownRoot =
     resolvedSrc === null ? undefined : pluginRoots.find((root) => isWithinResolvedRoot(resolvedSrc, root));
   fs.mkdirSync(dst, { recursive: true });
+  // Provenance, same record the skill mirror writes: without it the session
+  // copy has no repository to contain this dir's links to, and a link NESTED
+  // below one of them — never resolved here, since only direct children are —
+  // would be judged against the union of every plugin root.
+  if (ownRoot !== undefined) writeMirrorSourceRoot(dst, ownRoot);
   const entries = fs.readdirSync(src, { withFileTypes: true });
   // Drop any stale entries we own.
   for (const existing of fs.readdirSync(dst)) {
+    if (MIRROR_OWNED_CHILDREN.has(existing)) continue;
     const existingPath = path.join(dst, existing);
     try {
       if (fs.lstatSync(existingPath).isSymbolicLink()) fs.unlinkSync(existingPath);
@@ -388,6 +398,7 @@ function mirrorSupportDir(src: string, dst: string, pluginRoots: readonly string
   }
   for (const entry of entries) {
     if (entry.name.startsWith('.')) continue;
+    if (MIRROR_OWNED_CHILDREN.has(entry.name)) continue;
     const srcEntry = path.join(src, entry.name);
     const resolved = resolveRealPath(srcEntry);
     if (resolved === null || ownRoot === undefined || !isWithinResolvedRoot(resolved, ownRoot)) {

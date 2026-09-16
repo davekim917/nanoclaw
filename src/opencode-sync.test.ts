@@ -19,6 +19,7 @@ vi.mock('./log.js', () => ({
 }));
 
 import { syncOpenCodePluginSkills, syncOpenCodeSubagents } from './opencode-sync.js';
+import { copyOpenCodeSkills, mirrorSourceRootsByName } from './providers/opencode.js';
 
 const HOME = path.join(TEST_ROOT, 'home');
 const GLOBAL_SKILLS = path.join(HOME, '.config', 'opencode', 'skill');
@@ -130,12 +131,46 @@ describe('syncOpenCodePluginSkills containment (#829)', () => {
     expect(result.refused).toEqual(expect.arrayContaining(['shared/stolen.md', 'shared/cross.md']));
   });
 
-  it('records the source repository in each mirror dir marker', () => {
-    syncOpenCodePluginSkills();
-    const marker = fs.readFileSync(path.join(GLOBAL_SKILLS, 'shared-skill', '.nanoclaw-managed'), 'utf-8');
-    expect(marker).toContain(
-      `source-root: ${JSON.stringify(fs.realpathSync(path.join(HOME, 'plugins', 'shared-plugin')))}`,
+  it('refuses a link NESTED inside a support dir that reaches another plugin', () => {
+    // End to end: sync the mirror, then copy it as a spawn does. The support
+    // dir's `sub/` is a real in-repo directory, so the writer links it whole and
+    // never resolves what is under it — the record it left is what holds the
+    // nested link to this plugin.
+    const support = path.join(HOME, 'plugins', 'shared-plugin', 'skills', 'shared', 'sub');
+    fs.mkdirSync(support, { recursive: true });
+    fs.writeFileSync(path.join(support, 'own.md'), 'in-repo primitives');
+    fs.symlinkSync(
+      path.join(HOME, 'plugins', 'client-plugin', 'skills', 'client-skill', 'SKILL.md'),
+      path.join(support, 'cross.md'),
     );
+
+    syncOpenCodePluginSkills();
+
+    const xdg = path.join(TEST_ROOT, 'xdg');
+    copyOpenCodeSkills(GLOBAL_SKILLS, xdg, {
+      allowedRoots: [fs.realpathSync(path.join(HOME, 'plugins', 'shared-plugin'))],
+      sourceRootsByName: mirrorSourceRootsByName(path.join(HOME, 'plugins')),
+    });
+
+    expect(fs.readFileSync(path.join(xdg, 'shared', 'sub', 'own.md'), 'utf-8')).toBe('in-repo primitives');
+    expect(fs.existsSync(path.join(xdg, 'shared', 'sub', 'cross.md'))).toBe(false);
+  });
+
+  it('records the source repository in every mirror dir it writes, skills and support dirs alike', () => {
+    const support = path.join(HOME, 'plugins', 'shared-plugin', 'skills', 'shared');
+    fs.mkdirSync(support, { recursive: true });
+    fs.writeFileSync(path.join(support, 'primitives.md'), 'in-repo primitives');
+
+    syncOpenCodePluginSkills();
+
+    const expected = `${JSON.stringify(fs.realpathSync(path.join(HOME, 'plugins', 'shared-plugin')))}\n`;
+    expect(fs.readFileSync(path.join(GLOBAL_SKILLS, 'shared-skill', '.nanoclaw-source-root'), 'utf-8')).toBe(expected);
+    expect(fs.readFileSync(path.join(GLOBAL_SKILLS, 'shared', '.nanoclaw-source-root'), 'utf-8')).toBe(expected);
+    // The support dir must NOT read as a managed skill mirror, or the cleanup
+    // pass would delete it on every sync (its name is no skill's).
+    expect(fs.existsSync(path.join(GLOBAL_SKILLS, 'shared', '.nanoclaw-managed'))).toBe(false);
+    syncOpenCodePluginSkills();
+    expect(fs.existsSync(path.join(GLOBAL_SKILLS, 'shared', 'primitives.md'))).toBe(true);
   });
 });
 

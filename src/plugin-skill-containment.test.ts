@@ -5,7 +5,7 @@ import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { discoverPortableSkills, resolvePluginRoots, syncSkillSymlinks } from './plugin-skill-discovery.js';
-import { copyOpenCodeSkills } from './providers/opencode.js';
+import { copyOpenCodeSkills, mirrorSourceRootsByName } from './providers/opencode.js';
 
 /**
  * The host reads plugin-chosen paths and writes the result into a directory
@@ -37,7 +37,10 @@ describe('plugin skill mirror containment', () => {
     const xdg = path.join(tmp, 'xdg');
     const discovered = discoverPortableSkills(plugins, { runtime: 'opencode' });
     const result = syncSkillSymlinks(mirror, discovered);
-    copyOpenCodeSkills(mirror, xdg, { allowedRoots: resolvePluginRoots(plugins) });
+    copyOpenCodeSkills(mirror, xdg, {
+      allowedRoots: resolvePluginRoots(plugins),
+      sourceRootsByName: mirrorSourceRootsByName(plugins),
+    });
     return { mirror, xdg, refused: result.refused };
   };
 
@@ -262,6 +265,83 @@ describe('plugin skill mirror containment', () => {
 
     expect(result.refused).toContain('helper/notes.md');
     expect(fs.existsSync(path.join(mirror, 'helper', 'notes.md'))).toBe(false);
+  });
+
+  it('attributes a LEGACY mirror dir — no provenance record — from the current tree', () => {
+    // Every mirror dir on an install that predates the record has no record,
+    // and nothing re-runs the sync at boot. Falling back to the union for those
+    // would leave the escape open on exactly the installs this fixes.
+    const other = path.join(plugins, 'other');
+    fs.mkdirSync(other, { recursive: true });
+    fs.writeFileSync(path.join(other, 'private.md'), 'OTHER-TENANT-CONTENT');
+    const reference = path.join(plugins, 'good', 'skills', 'helper', 'reference');
+    fs.mkdirSync(reference, { recursive: true });
+    fs.writeFileSync(path.join(reference, 'own.md'), 'own reference');
+    fs.symlinkSync(path.join(other, 'private.md'), path.join(reference, 'stolen.md'));
+
+    const mirror = path.join(tmp, 'mirror');
+    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+    // Downgrade the mirror to the pre-record shape.
+    fs.rmSync(path.join(mirror, 'helper', '.nanoclaw-source-root'));
+
+    const xdg = path.join(tmp, 'xdg');
+    copyOpenCodeSkills(mirror, xdg, {
+      allowedRoots: resolvePluginRoots(plugins),
+      sourceRootsByName: mirrorSourceRootsByName(plugins),
+    });
+
+    expect(fs.readFileSync(path.join(xdg, 'helper', 'reference', 'own.md'), 'utf8')).toBe('own reference');
+    expect(fs.existsSync(path.join(xdg, 'helper', 'reference', 'stolen.md'))).toBe(false);
+    expect(readAll(xdg)).not.toContain('OTHER-TENANT-CONTENT');
+  });
+
+  it('refuses the links of a MANAGED dir the current tree no longer publishes', () => {
+    // No record, no name in the walk: the dir is stale, its source left the
+    // tree, and there is nothing left to contain it to. Refuse, do not widen.
+    const other = path.join(plugins, 'other');
+    fs.mkdirSync(other, { recursive: true });
+    fs.writeFileSync(path.join(other, 'private.md'), 'OTHER-TENANT-CONTENT');
+    const mirror = path.join(tmp, 'mirror');
+    const stale = path.join(mirror, 'stale-skill');
+    fs.mkdirSync(stale, { recursive: true });
+    fs.writeFileSync(path.join(stale, '.nanoclaw-managed'), 'managed by nanoclaw plugin-skill-discovery\n');
+    fs.writeFileSync(path.join(stale, 'SKILL.md'), 'stale');
+    fs.symlinkSync(path.join(other, 'private.md'), path.join(stale, 'notes.md'));
+
+    const xdg = path.join(tmp, 'xdg');
+    copyOpenCodeSkills(mirror, xdg, {
+      allowedRoots: resolvePluginRoots(plugins),
+      sourceRootsByName: mirrorSourceRootsByName(plugins),
+    });
+
+    expect(fs.existsSync(path.join(xdg, 'stale-skill', 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(xdg, 'stale-skill', 'notes.md'))).toBe(false);
+    expect(readAll(xdg)).not.toContain('OTHER-TENANT-CONTENT');
+  });
+
+  it('does not read a provenance record that is a symlink, and never mirrors a plugin one', () => {
+    // A plugin shipping a file by either owned name must not be able to plant a
+    // record — directly, or by occupying the slot after a failed write of ours.
+    const skillDir = path.join(plugins, 'good', 'skills', 'helper');
+    fs.writeFileSync(path.join(skillDir, '.nanoclaw-source-root'), JSON.stringify('/'));
+    fs.writeFileSync(path.join(skillDir, '.nanoclaw-managed'), 'forged');
+
+    const { mirror } = runPipeline();
+
+    const record = fs.readFileSync(path.join(mirror, 'helper', '.nanoclaw-source-root'), 'utf8');
+    expect(record).toBe(`${JSON.stringify(fs.realpathSync(path.join(plugins, 'good')))}\n`);
+    expect(fs.lstatSync(path.join(mirror, 'helper', '.nanoclaw-source-root')).isSymbolicLink()).toBe(false);
+
+    // And a record that IS a symlink is not followed: treat as no record.
+    fs.rmSync(path.join(mirror, 'helper', '.nanoclaw-source-root'));
+    fs.writeFileSync(path.join(tmp, 'forged-root.json'), JSON.stringify('/'));
+    fs.symlinkSync(path.join(tmp, 'forged-root.json'), path.join(mirror, 'helper', '.nanoclaw-source-root'));
+    fs.symlinkSync(secret, path.join(mirror, 'helper', 'notes.md'));
+
+    const xdg = path.join(tmp, 'xdg2');
+    copyOpenCodeSkills(mirror, xdg, { allowedRoots: resolvePluginRoots(plugins), sourceRootsByName: new Map() });
+    expect(fs.existsSync(path.join(xdg, 'helper', 'notes.md'))).toBe(false);
+    expect(readAll(xdg)).not.toContain('HOST-ONLY-SECRET');
   });
 
   it('prunes a mirror dir whose source became an escape since the last sync', () => {

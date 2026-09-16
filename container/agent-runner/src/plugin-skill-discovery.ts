@@ -628,55 +628,105 @@ export function syncSkillSymlinks(
 /**
  * Marker file we drop inside every mirror dir we create. Lets us
  * distinguish our writes from native installs (e.g. `gitnexus setup`)
- * without ambiguity — a native install never has this file.
- *
- * It also records WHICH plugin repository the dir was published from, because
- * the dir's own name is a skill name and carries no provenance. The reader that
- * needs it is the session copy (`copyOpenCodeSkills`, `src/providers/opencode.ts`):
- * containment there has to be against this ONE repository, not against the union
- * of every repository under `~/plugins`. A union would let a link nested below a
- * skill's top level — never seen by the mirror writer, which only resolves each
- * direct child — reach into a DIFFERENT plugin, including a workgroup-scoped one
- * the mirror deliberately never published (`scopedPluginNames`,
- * `src/plugin-scopes.ts`).
+ * without ambiguity — a native install never has this file. Managed-ness is
+ * ALL it means: the source a dir was published from lives in
+ * `MIRROR_SOURCE_ROOT_FILE`, which the support-dir mirror writes too and which
+ * `isManagedMirror` must not key on.
  */
 export const MIRROR_MARKER = '.nanoclaw-managed';
 
-const MIRROR_SOURCE_ROOT_PREFIX = 'source-root: ';
+/**
+ * Provenance file: the plugin repository a mirror dir was published from.
+ *
+ * The dir's own name is a skill name and carries no provenance, and the reader
+ * that needs it is the session copy (`copyOpenCodeSkills`,
+ * `src/providers/opencode.ts`): containment there has to be against this ONE
+ * repository, not against the union of every repository under `~/plugins`. A
+ * union lets a link NESTED below a mirror dir's top level — never seen by these
+ * writers, which resolve only each direct child — reach a DIFFERENT plugin,
+ * including a workgroup-scoped one the mirror deliberately never published
+ * (`scopedPluginNames`, `src/plugin-scopes.ts`).
+ *
+ * Separate from `MIRROR_MARKER` because the support-dir mirror
+ * (`mirrorSupportDir`, `src/opencode-sync.ts`) needs provenance too and must NOT
+ * read as a managed skill mirror — `isManagedMirror` keys on `MIRROR_MARKER`,
+ * and the cleanup pass deletes a managed dir whose name is not a desired skill,
+ * which every support dir's is not.
+ */
+export const MIRROR_SOURCE_ROOT_FILE = '.nanoclaw-source-root';
+
+/** Names this mirror owns in its own dirs. A plugin child using one is never mirrored. */
+export const MIRROR_OWNED_CHILDREN: ReadonlySet<string> = new Set([MIRROR_MARKER, MIRROR_SOURCE_ROOT_FILE]);
 
 /**
- * The marker's contents for a mirror dir published from `resolvedRoot`.
+ * The provenance file's contents for a mirror dir published from `resolvedRoot`.
  *
- * The path is JSON-encoded, so a directory name containing a newline cannot
- * forge or truncate the record — a real Linux basename may contain one
+ * JSON-encoded, so a directory name containing a newline can neither forge nor
+ * truncate the record — a real Linux basename may contain one
  * (`docs/review-notes/826.md`, the segment-rule rounds).
  */
-export function formatMirrorMarker(resolvedRoot: string): string {
-  return `managed by nanoclaw plugin-skill-discovery\n${MIRROR_SOURCE_ROOT_PREFIX}${JSON.stringify(resolvedRoot)}\n`;
+export function formatMirrorSourceRoot(resolvedRoot: string): string {
+  return `${JSON.stringify(resolvedRoot)}\n`;
 }
 
 /**
- * The plugin repository a mirror dir was published from, or null when the dir
- * carries no marker (operator-placed or natively installed) or a marker written
- * before this record existed. Null means "no provenance", never "any root".
+ * Write the provenance file, replacing anything that is not already exactly it.
+ *
+ * `lstat` first and unlink a non-regular entry: if an earlier write failed, the
+ * child loop could have symlinked a plugin's own same-named file into this dir,
+ * and writing through that link would both trust a plugin-authored record and
+ * write into the plugin's repository. Returns whether anything changed.
+ */
+export function writeMirrorSourceRoot(mirrorDir: string, resolvedRoot: string): boolean {
+  const file = path.join(mirrorDir, MIRROR_SOURCE_ROOT_FILE);
+  const content = formatMirrorSourceRoot(resolvedRoot);
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (stat !== undefined && stat.isFile()) {
+    try {
+      if (fs.readFileSync(file, 'utf8') === content) return false;
+    } catch {
+      /* unreadable — rewrite below */
+    }
+  } else if (stat !== undefined) {
+    try {
+      fs.rmSync(file, { recursive: true, force: true });
+    } catch {
+      return false;
+    }
+  }
+  try {
+    fs.writeFileSync(file, content);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The plugin repository a mirror dir was published from, or null when it holds
+ * no provenance file — a dir published before this record existed, or one an
+ * operator or native installer placed. Null means "no provenance recorded",
+ * never "any root": the caller decides what an unattributed dir may do.
+ *
+ * `lstat`-gated to a regular file, so a symlink standing where the record
+ * belongs is not followed and read as a record.
  */
 export function readMirrorSourceRoot(mirrorDir: string): string | null {
+  const file = path.join(mirrorDir, MIRROR_SOURCE_ROOT_FILE);
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (stat === undefined || !stat.isFile()) return null;
   let content: string;
   try {
-    content = fs.readFileSync(path.join(mirrorDir, MIRROR_MARKER), 'utf8');
+    content = fs.readFileSync(file, 'utf8');
   } catch {
     return null;
   }
-  for (const line of content.split('\n')) {
-    if (!line.startsWith(MIRROR_SOURCE_ROOT_PREFIX)) continue;
-    try {
-      const value: unknown = JSON.parse(line.slice(MIRROR_SOURCE_ROOT_PREFIX.length));
-      return typeof value === 'string' && value !== '' ? value : null;
-    } catch {
-      return null;
-    }
+  try {
+    const value: unknown = JSON.parse(content.trim());
+    return typeof value === 'string' && value !== '' ? value : null;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 /**
@@ -734,26 +784,21 @@ function mirrorSkillDir(
     return { changed: false, refusedChildren }; // caller should have filtered this case
   }
 
-  // Drop our marker so future runs recognize this as a managed mirror, and so
-  // the session copy can contain this dir to the ONE repository it came from.
-  // Rewritten when it differs, so a dir published before the root was recorded
-  // — or from a plugin that has since moved — self-heals on the next sync.
+  // Drop our marker so future runs recognize this as a managed mirror.
   const markerPath = path.join(dstDir, MIRROR_MARKER);
-  const markerContent = formatMirrorMarker(resolvedRoot);
-  let existingMarker: string | null = null;
-  try {
-    existingMarker = fs.readFileSync(markerPath, 'utf8');
-  } catch {
-    /* missing */
-  }
-  if (existingMarker !== markerContent) {
+  if (!fs.existsSync(markerPath)) {
     try {
-      fs.writeFileSync(markerPath, markerContent);
+      fs.writeFileSync(markerPath, 'managed by nanoclaw plugin-skill-discovery\n');
       changed = true;
     } catch {
       /* swallow — non-critical */
     }
   }
+  // Record the ONE repository this dir was published from, so the session copy
+  // can contain every link under it to that root. Rewritten when it differs, so
+  // a dir published before this record existed — or from a plugin that has since
+  // moved — self-heals on the next sync.
+  if (writeMirrorSourceRoot(dstDir, resolvedRoot)) changed = true;
 
   let srcEntries: string[];
   try {
@@ -766,6 +811,11 @@ function mirrorSkillDir(
   // is ALSO pruned from a dst a previous run wrote it into.
   const allowedChildren: string[] = [];
   for (const child of srcEntries) {
+    // Names this mirror writes itself are never taken from the source. A plugin
+    // shipping one would otherwise be mirrored into the slot our own record
+    // occupies the moment a write of ours fails, and the copy would then read a
+    // plugin-authored provenance record.
+    if (MIRROR_OWNED_CHILDREN.has(child)) continue;
     const resolvedChild = resolveRealPath(path.join(srcDir, child));
     if (resolvedChild === null || !isWithinResolvedRoot(resolvedChild, resolvedRoot)) {
       refusedChildren.push(child);
@@ -785,7 +835,7 @@ function mirrorSkillDir(
   }
   for (const child of dstChildren) {
     if (desiredChildren.has(child)) continue;
-    if (child === MIRROR_MARKER) continue; // preserve our marker
+    if (MIRROR_OWNED_CHILDREN.has(child)) continue; // preserve the files we own
     const childPath = path.join(dstDir, child);
     try {
       const stat = fs.lstatSync(childPath);
@@ -865,8 +915,9 @@ function syncSkillMdCopy(dst: string, src: string): boolean {
   } catch {
     return false;
   }
-  // A FIFO passes every containment check and blocks the reader forever, which
-  // on the host is the single event loop. Only a regular file is a SKILL.md.
+  // `copyFileSync` on a FIFO blocks until a writer appears, and on the host that
+  // is the single event loop. A containment check cannot see this: the path is
+  // inside the repository. Only a regular file is a SKILL.md.
   if (!srcStat.isFile()) return false;
   let dstStat: fs.Stats | null = null;
   try {
