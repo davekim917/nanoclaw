@@ -5945,6 +5945,17 @@ const MANAGED_WORKER_DEFS = [
   'worker-frontier.md',
 ];
 
+// NOTE on `worker-high.md` above: that name is ALSO one of the orchestrate
+// plugin's live shims (`plugins/orchestrate/agents/worker-high.md`). The two
+// never collide, and the prune is what keeps them from colliding. This list
+// only ever touches `.claude-shared/agents/` — the container's USER scope —
+// while the shim is registered from the plugin mount. Claude's personal scope
+// outranks a plugin's, so a stale user-scope `worker-high.md` left from the
+// retired roster would SHADOW the plugin's shim and silently run the old
+// definition. Pruning it is therefore not merely cleanup: it is what lets the
+// plugin's shim resolve at all. The same holds for any future shim whose name
+// this list has ever carried.
+
 /**
  * Copy trunk worker subagent defs (container/agents/*.md) into
  * .claude-shared/agents/ — the container's ~/.claude/agents. Copies, not
@@ -5968,8 +5979,16 @@ function syncWorkerAgentDefs(claudeDir: string): void {
   let current: Set<string>;
   try {
     current = new Set(fs.readdirSync(srcDir).filter((e) => e.endsWith('.md')));
-  } catch {
-    // No trunk def dir — nothing to copy, everything managed gets pruned.
+  } catch (err) {
+    // ENOENT ONLY — "trunk ships no defs", the normal state, so everything
+    // managed gets pruned below. Any other failure (EACCES, EIO, a transient
+    // read error) is NOT an answer about what trunk ships, and swallowing it
+    // here would turn an unreadable source directory into the destructive
+    // prune of every managed def in the group. Rethrow instead: the caller
+    // logs and spawns without the roster (`src/container-runner.ts`, the
+    // syncWorkerAgentDefs call site), which leaves the group's existing files
+    // untouched — the safe answer when the source cannot be read.
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
     current = new Set<string>();
   }
   // Prune managed defs retired from trunk. Names are compile-time constants,

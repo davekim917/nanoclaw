@@ -1394,6 +1394,44 @@ describe('worker agent def sync (orchestrator roster)', async () => {
     );
   });
 
+  it('leaves the managed defs alone when the trunk source is unreadable, rather than pruning them', async () => {
+    // ENOENT means "trunk ships no defs" and prunes. Any other read failure is
+    // not an answer about what trunk ships, and treating it as one would turn
+    // an unreadable source directory into a destructive prune. The call site
+    // catches and spawns without the roster, so the group's files survive.
+    const ag = group('ag-worker-defs-eacces', 'worker-defs-eacces');
+    await createAgentGroup(ag);
+    withWorkgroup(ag);
+    await ensureContainerConfig(ag.id);
+    initGroupFilesystem(ag, {});
+
+    const agentsDir = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared', 'agents');
+    fs.mkdirSync(agentsDir, { recursive: true });
+    fs.writeFileSync(path.join(agentsDir, 'worker-frontier.md'), 'old managed definition\n');
+
+    // Fail ONLY the trunk def dir; every other readdirSync on the spawn path
+    // must keep working, so the real implementation is captured before the spy
+    // replaces it and every other path delegates to it.
+    const real = fs.readdirSync;
+    const readdir = vi.spyOn(fs, 'readdirSync');
+    readdir.mockImplementation(((p: fs.PathLike, ...rest: never[]) => {
+      if (String(p).endsWith(path.join('container', 'agents'))) {
+        const err = new Error('EACCES: permission denied') as NodeJS.ErrnoException;
+        err.code = 'EACCES';
+        throw err;
+      }
+      return (real as (...a: never[]) => unknown)(p as never, ...rest);
+    }) as never);
+
+    try {
+      await buildMounts(ag, session('s-wd-eacces', ag.id), containerConfig(), 'claude', {});
+    } finally {
+      readdir.mockRestore();
+    }
+
+    expect(fs.existsSync(path.join(agentsDir, 'worker-frontier.md'))).toBe(true);
+  });
+
   it('never deletes outside the agents dir even if a poisoned file is planted (F1 traversal guard)', async () => {
     const ag = group('ag-worker-defs-sec', 'worker-defs-sec');
     await createAgentGroup(ag);

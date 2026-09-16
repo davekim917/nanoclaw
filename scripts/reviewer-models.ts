@@ -82,11 +82,23 @@ export function assertConcreteModelId(id: string, source: string): void {
   }
 }
 
-/** The reviewer-eligible model ids, sorted and de-duplicated. */
-export function computeReviewerModelIds(): string[] {
-  for (const id of FRONTIER_MODELS) assertConcreteModelId(id, 'FRONTIER_MODELS');
-  for (const id of COMPATIBLE_RECEIPT_MODELS) assertConcreteModelId(id, 'COMPATIBLE_RECEIPT_MODELS');
-  return Array.from(new Set([...FRONTIER_MODELS, ...COMPATIBLE_RECEIPT_MODELS])).sort();
+/**
+ * The reviewer-eligible model ids, sorted and de-duplicated.
+ *
+ * The two rosters are parameters, defaulted to the real ones, so a test can
+ * drive this with an alias and prove the guard is REACHED. Asserting that the
+ * real ids happen to satisfy `assertConcreteModelId` proves nothing — delete
+ * both loops below and that assertion stays green, because the committed ids
+ * are valid either way (the recurring `mutation coverage` lesson in
+ * docs/review-notes.md).
+ */
+export function computeReviewerModelIds(
+  frontier: readonly string[] = FRONTIER_MODELS,
+  compatible: readonly string[] = COMPATIBLE_RECEIPT_MODELS,
+): string[] {
+  for (const id of frontier) assertConcreteModelId(id, 'FRONTIER_MODELS');
+  for (const id of compatible) assertConcreteModelId(id, 'COMPATIBLE_RECEIPT_MODELS');
+  return Array.from(new Set([...frontier, ...compatible])).sort();
 }
 
 export function renderReviewerModelsFile(ids: string[]): string {
@@ -99,10 +111,7 @@ export function renderReviewerModelsFile(ids: string[]): string {
  * failure shapes are reachable from a test against a temp file. Only the guard
  * below turns the code into an exit.
  */
-export function main(
-  args: string[] = process.argv.slice(2),
-  outputPath: string = REVIEWER_MODELS_OUTPUT_PATH,
-): number {
+export function main(args: string[] = process.argv.slice(2), outputPath: string = REVIEWER_MODELS_OUTPUT_PATH): number {
   const write = args.includes('--write');
   const check = args.includes('--check');
   if (write === check) {

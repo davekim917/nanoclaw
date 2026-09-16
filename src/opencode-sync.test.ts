@@ -44,8 +44,9 @@ function pluginAgent(plugin: string, name: string, extraFrontmatter = ''): void 
 
 /**
  * An agent at the depth the bootstrap plugin actually uses:
- * `~/plugins/<repo>/plugins/<sub>/agents/<name>.md`. The delegation shims live
- * there, so a walk that only reached `<repo>/agents/` would miss all five.
+ * `~/plugins/<repo>/plugins/<sub>/agents/<name>.md` — where the orchestrate
+ * plugin's five `worker-<effort>` shims live, so a walk that only reached
+ * `<repo>/agents/` would miss all of them.
  */
 function subPluginAgent(repo: string, sub: string, name: string, extraFrontmatter = ''): void {
   const dir = path.join(HOME, 'plugins', repo, 'plugins', sub, 'agents');
@@ -293,23 +294,23 @@ describe('syncOpenCodeSubagents carries the delegation shims', () => {
   const read = (name: string) => fs.readFileSync(path.join(GLOBAL_AGENTS, `${name}.md`), 'utf8');
 
   it('finds an agent nested at <repo>/plugins/<sub>/agents/, where the shims live', () => {
-    subPluginAgent('bootstrap', 'orchestrate', 'delegate-high', 'model: inherit\neffort: high\n');
+    subPluginAgent('bootstrap', 'orchestrate', 'worker-high', 'model: inherit\neffort: high\n');
     expect(syncOpenCodeSubagents().discovered).toBe(1);
-    expect(fs.existsSync(path.join(GLOBAL_AGENTS, 'delegate-high.md'))).toBe(true);
+    expect(fs.existsSync(path.join(GLOBAL_AGENTS, 'worker-high.md'))).toBe(true);
   });
 
   it('writes `effort:` through as options.reasoningEffort, the provider option', () => {
-    subPluginAgent('bootstrap', 'orchestrate', 'delegate-low', 'model: inherit\neffort: low\n');
+    subPluginAgent('bootstrap', 'orchestrate', 'worker-low', 'model: inherit\neffort: low\n');
     syncOpenCodeSubagents();
     // Nested under `options:`, which OpenCode's v1 agent schema merges into the
     // provider model options (packages/core/src/v1/config/agent.ts, `normalize`).
-    expect(read('delegate-low')).toContain('options:\n  reasoningEffort: "low"\n');
+    expect(read('worker-low')).toContain('options:\n  reasoningEffort: "low"\n');
   });
 
   it('never writes `model: inherit` — OpenCode inherits the parent when the key is unset', () => {
-    subPluginAgent('bootstrap', 'orchestrate', 'delegate-max', 'model: inherit\neffort: max\n');
+    subPluginAgent('bootstrap', 'orchestrate', 'worker-max', 'model: inherit\neffort: max\n');
     syncOpenCodeSubagents();
-    const out = read('delegate-max');
+    const out = read('worker-max');
     expect(out).not.toMatch(/^model:/m);
     expect(out).not.toContain('inherit');
   });
@@ -326,13 +327,13 @@ describe('syncOpenCodeSubagents carries the delegation shims', () => {
     // The sync compares rendered bytes against what is on disk, so an effort
     // flip must produce different bytes or the shim would keep its old effort
     // forever with the sync reporting "unchanged".
-    subPluginAgent('bootstrap', 'orchestrate', 'delegate-medium', 'model: inherit\neffort: medium\n');
+    subPluginAgent('bootstrap', 'orchestrate', 'worker-medium', 'model: inherit\neffort: medium\n');
     syncOpenCodeSubagents();
-    expect(read('delegate-medium')).toContain('reasoningEffort: "medium"');
+    expect(read('worker-medium')).toContain('reasoningEffort: "medium"');
 
-    subPluginAgent('bootstrap', 'orchestrate', 'delegate-medium', 'model: inherit\neffort: xhigh\n');
+    subPluginAgent('bootstrap', 'orchestrate', 'worker-medium', 'model: inherit\neffort: xhigh\n');
     const second = syncOpenCodeSubagents();
     expect(second.writes).toBeGreaterThan(0);
-    expect(read('delegate-medium')).toContain('reasoningEffort: "xhigh"');
+    expect(read('worker-medium')).toContain('reasoningEffort: "xhigh"');
   });
 });

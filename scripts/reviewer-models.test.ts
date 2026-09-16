@@ -10,12 +10,7 @@ import path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import {
-  assertConcreteModelId,
-  computeReviewerModelIds,
-  main,
-  renderReviewerModelsFile,
-} from './reviewer-models.js';
+import { assertConcreteModelId, computeReviewerModelIds, main, renderReviewerModelsFile } from './reviewer-models.js';
 
 describe('computeReviewerModelIds', () => {
   it('lists the frontier models plus prior receipt compatibility, deduplicated and sorted', () => {
@@ -29,14 +24,23 @@ describe('computeReviewerModelIds', () => {
     }
   });
 
-  it('runs every listed id through the concrete-id guard', () => {
-    // The roster is hand-maintained now, so the guard running over it is the
-    // only thing stopping an alias being typed in. Asserted by exercising the
-    // guard on each id rather than trusting the happy path above — a guard
-    // that is never reached passes exactly the same way.
-    for (const id of computeReviewerModelIds()) {
-      expect(() => assertConcreteModelId(id, 'roster')).not.toThrow();
-    }
+  // MUTATION-SENSITIVE, deliberately. Asserting that the committed ids happen
+  // to satisfy `assertConcreteModelId` proves nothing about the code: delete
+  // both guard loops and that assertion stays green, because the real ids are
+  // valid either way. The roster is hand-maintained now, so the guard RUNNING
+  // is the only thing that stops an alias being typed in — so these drive the
+  // function with a roster it must refuse. Deleting either loop turns the
+  // matching case red.
+  it('refuses an alias typed into the frontier roster', () => {
+    expect(() => computeReviewerModelIds(['opus'], ['claude-fable-5-1'])).toThrow(/FRONTIER_MODELS/);
+  });
+
+  it('refuses an alias typed into the receipt-compatibility roster', () => {
+    expect(() => computeReviewerModelIds(['claude-opus-5'], ['inherit'])).toThrow(/COMPATIBLE_RECEIPT_MODELS/);
+  });
+
+  it('deduplicates and sorts across the two rosters', () => {
+    expect(computeReviewerModelIds(['b-2', 'a-1'], ['a-1', 'c-3'])).toEqual(['a-1', 'b-2', 'c-3']);
   });
 });
 

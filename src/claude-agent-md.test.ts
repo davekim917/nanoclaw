@@ -61,9 +61,9 @@ body
   });
 
   test('keeps `effort:` when present — the delegation shims are nothing else', () => {
-    const src = '---\nname: delegate-low\ndescription: y\nmodel: inherit\neffort: low\n---\nbody\n';
+    const src = '---\nname: worker-low\ndescription: y\nmodel: inherit\neffort: low\n---\nbody\n';
     expect(parseClaudeAgentMd(src)).toEqual({
-      name: 'delegate-low',
+      name: 'worker-low',
       description: 'y',
       body: 'body',
       effort: 'low',
@@ -194,7 +194,7 @@ describe('no role carries a provider-specific model or effort pin', () => {
     // `retargetRunsOnSentence` rewrote its description to match. Both are gone
     // with the role. Asserted on that exact name so a re-introduced special
     // case fails here rather than shipping a pin nothing else knows about.
-    for (const name of ['worker-frontier', 'codex-rescue', 'delegate-max']) {
+    for (const name of ['worker-frontier', 'codex-rescue', 'worker-max']) {
       const out = formatCodexAgentToml({ name, description: 'd', body: 'b' });
       expect(out, name).not.toContain('model = ');
       expect(out, name).not.toContain('model_reasoning_effort');
@@ -215,7 +215,7 @@ describe('no role carries a provider-specific model or effort pin', () => {
     // `[agents].default_subagent_reasoning_effort` (src/providers/codex.ts),
     // overridden per task by a native spawn's own `reasoning_effort`. Writing
     // per-role `model_reasoning_effort` here would pin every sibling's roster.
-    const out = formatCodexAgentToml({ name: 'delegate-low', description: 'd', body: 'b', effort: 'xhigh' });
+    const out = formatCodexAgentToml({ name: 'worker-low', description: 'd', body: 'b', effort: 'xhigh' });
     expect(out).not.toContain('model_reasoning_effort');
     expect(out).not.toContain('effort');
     expect(out).not.toContain('xhigh');

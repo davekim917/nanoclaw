@@ -30,10 +30,34 @@
  * `options` therefore cannot be captured by a future top-level field of the
  * same name.
  *
+ * Why not `variant:`, which looks like the right key. OpenCode computes a
+ * per-model table of effort variants and maps each to the provider's own
+ * spelling (`reasoningEffort` for openai-compatible, `thinking`/`effort` for
+ * anthropic) — `ProviderTransform.reasoningVariants`,
+ * `packages/opencode/src/provider/transform.ts`. That would solve the
+ * vocabulary problem below for free, and it does NOT work here: resolving an
+ * agent's `variant` requires the agent to name its own `model:`. The guard is
+ * `const same = ag.model && …` at `packages/opencode/src/session/prompt.ts`,
+ * and `variant` is kept only when `same` holds and the model's table has that
+ * variant; otherwise it resolves to `undefined`. These shims deliberately name
+ * no model, so their `variant:` would be dropped in silence. `options` has no
+ * such gate — `item.options = mergeDeep(item.options, value.options ?? {})`,
+ * `packages/opencode/src/agent/agent.ts` — which is why the raw provider
+ * option is the channel that actually carries.
+ *
  * `reasoningEffort` is a PROVIDER-SPECIFIC option — it is the OpenAI-family
- * spelling. A provider that does not know it ignores it; this converter does
- * not try to translate per provider, because the sync has no idea which
- * provider a given OpenCode sibling is pointed at.
+ * spelling, and it is passed through unvalidated. This converter does not
+ * translate per provider, because the sync has no idea which provider a given
+ * OpenCode sibling is pointed at.
+ *
+ * Two consequences, both deliberate. A provider that does not know the KEY
+ * ignores it. A provider that DOES know it can reject an out-of-range VALUE:
+ * the fleet's openai-compatible siblings accept `none|minimal|low|medium|high|
+ * xhigh` for a non-GPT-5 id (`OPENAI_EFFORTS`, same transform.ts), so a
+ * `worker-max` shim would send an effort that upstream may refuse. That is a
+ * loud failure on one shim, which is the right trade against silently dropping
+ * the effort the caller asked for — but it is the reason this file does not
+ * claim the option is universally safe.
  *
  * Dropped (no OpenCode equivalent or runtime-specific):
  *   frontmatter.model       — Claude model names, and `inherit` is not one.
