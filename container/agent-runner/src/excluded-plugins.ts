@@ -1,0 +1,124 @@
+/**
+ * The container's own read of `excludePlugins`.
+ *
+ * `groups/<folder>/container.json` is bind-mounted read-only at
+ * `/workspace/agent/container.json` (`src/container-runner.ts`, the
+ * `containerJsonPath` mount). The host writes the field; every walker in here
+ * honours it in its own mount namespace, against paths it assembled itself —
+ * see `plugin-exclusions.ts` for why the host cannot do this for us.
+ *
+ * Deliberately NOT read through `config.ts`. `loadConfig` swallows a read or
+ * parse failure and continues on defaults (`config.ts`, the catch around
+ * `readFileSync`), which is right for a model name and wrong for an exclusion:
+ * "I could not read the file" would become "nothing is excluded", and every
+ * walker would then register the plugin the operator withheld. A read that
+ * cannot answer throws, and no caller here catches it — the spawn fails loudly
+ * instead of silently delivering what was excluded.
+ *
+ * Reachability of that throw: the host validates the same field with the same
+ * code before it ever spawns (`readContainerConfig` → `validateExcludePlugins`,
+ * `src/container-config.ts`), and the mount is created by the spawn path, so a
+ * throw here means the file changed under the mount or the mount is gone.
+ */
+import fs from 'fs';
+
+import { splitExcludedPlugins, validateExcludePlugins, type ExcludedPlugins } from './plugin-exclusions.js';
+
+export const CONTAINER_CONFIG_PATH = '/workspace/agent/container.json';
+
+function log(msg: string): void {
+  console.error(`[excluded-plugins] ${msg}`);
+}
+
+let cached: ExcludedPlugins | null = null;
+
+/**
+ * Parse `excludePlugins` out of an already-read container.json body. Exported
+ * for tests and for `loadExcludedPlugins`; applies the SAME validator the host
+ * applied before the spawn, so an entry the host accepted cannot be read
+ * differently here.
+ *
+ * The ROOT is checked before the field is read, because JSON.parse succeeding
+ * is not the same as the document being a config. `[]`, `42`, `"oops"` and
+ * `null` all parse; reading `.excludePlugins` off them yields `undefined` (or
+ * throws, for `null`), and `undefined` means "nothing declared" here — which is
+ * the fail-open this module exists to prevent, arrived at through a shape check
+ * nobody wrote rather than through a read that failed. The shape that matters
+ * is an object wrapping the real config (`[{"excludePlugins": […]}]` is the
+ * reachable one): the operator's entries are RIGHT THERE in the file and every
+ * walker would register what they withheld. So a non-object, array or null root
+ * throws like any other unreadable config.
+ *
+ * The host's own `readContainerConfig` stays laxer — it logs and falls back to
+ * an empty config — because it reads every field and one bad field should not
+ * fail the read. It is not, however, the last word on a broken file: the host
+ * refuses to WRITE over a config it could not understand as an object
+ * (`writeContainerConfig`, `src/container-config.ts`), and since the spawn path
+ * writes identity fields on every spawn, a malformed file aborts the spawn
+ * there rather than reaching this reader at all. This check is what answers for
+ * a file that changed under the mount after that point.
+ */
+export function parseExcludedPlugins(raw: string): ExcludedPlugins {
+  const parsed: unknown = JSON.parse(raw);
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    const shape = parsed === null ? 'null' : Array.isArray(parsed) ? 'array' : typeof parsed;
+    throw new Error(
+      `container.json did not parse to a JSON object (got ${shape}) — refusing to read that as "nothing excluded"`,
+    );
+  }
+  return splitExcludedPlugins(validateExcludePlugins((parsed as { excludePlugins?: unknown }).excludePlugins));
+}
+
+/**
+ * Read and memoize the group's exclusions.
+ *
+ * ENOENT — and only ENOENT — is "no exclusions": a container.json that is not
+ * there cannot have declared any, and dev/test containers run without one.
+ * Every other failure (unreadable mount, malformed JSON, an entry that does not
+ * validate) throws, because each of those is a file that MIGHT have carried an
+ * exclusion we would be dropping.
+ */
+export function loadExcludedPlugins(configPath = CONTAINER_CONFIG_PATH): ExcludedPlugins {
+  if (cached && configPath === CONTAINER_CONFIG_PATH) return cached;
+  let raw: string;
+  try {
+    raw = fs.readFileSync(configPath, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      const empty = splitExcludedPlugins(undefined);
+      if (configPath === CONTAINER_CONFIG_PATH) cached = empty;
+      return empty;
+    }
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `could not read ${configPath} to apply excludePlugins — refusing to treat that as "nothing excluded": ${detail}`,
+    );
+  }
+  const split = parseExcludedPlugins(raw);
+  if (split.topLevel.size || split.subPaths.size) {
+    // Logged once per container, at the only place the list is read.
+    //
+    // Reports what was DECLARED, not what was found, and that split of
+    // responsibility is deliberate: the HOST already refused this spawn if any
+    // entry names a path the tree does not carry, walking each entry segment by
+    // segment before the mounts are built (`src/container-runner.ts`) — when
+    // `~/plugins` exists at all; when it does not, nothing is mounted and there
+    // is nothing to withhold. So by the time this line runs, every entry
+    // matched something the container can see. Re-deciding that
+    // here would mean asking three walkers to report back, in a process that
+    // cannot see the host's tree any better than the host could. The declared
+    // list plus each walker's own output is what makes an applied entry
+    // legible in a container log.
+    log(
+      `excludePlugins: ${[...split.topLevel, ...split.subPaths].sort().join(', ')} ` +
+        `(read from ${configPath}; applied by every plugin walker in this container)`,
+    );
+  }
+  if (configPath === CONTAINER_CONFIG_PATH) cached = split;
+  return split;
+}
+
+/** Reset the memo — tests only. */
+export function _resetExcludedPlugins(): void {
+  cached = null;
+}

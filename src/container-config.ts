@@ -24,6 +24,7 @@ import { validateContainerResources, type ContainerResources } from './container
 import { getAgentGroup } from './db/agent-groups.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import { log } from './log.js';
+import { validateExcludePlugins } from './plugin-exclusions.js';
 import { TOKEN_SHAPE_PATTERNS } from './secret-scrubber.js';
 import { isIanaTimezone } from './timezone.js';
 import type { AgentGroup, ContainerConfigRow } from './types.js';
@@ -650,170 +651,15 @@ export function validateAutoCompactWindow(value: unknown): number | undefined {
 }
 
 /**
- * One path segment of an `excludePlugins` entry: a real directory name, never
- * empty, `.` or `..`. Shape only, for every entry at every depth.
- *
- * Deliberately NOT a slug allowlist, and deliberately not a character rule.
- * `excludePlugins` had no validation at all before this field grew sub-paths,
- * and the entries it holds are directory basenames the operator did not choose:
- * `scripts/enable-agent-plugin.ts` accepts any direct child of `~/plugins`
- * (`resolvePluginDir` checks only that the path is a directory whose parent is
- * the plugins root) and writes that basename straight into this list
- * (`applyOptOut`). A clone named `foo+bar` or `c++-tools` is an ordinary
- * directory, so an allowlist of `[A-Za-z0-9._-]` would refuse a config that
- * worked before and take the whole group's spawn down with it —
- * `readContainerConfig` throws on every read — which is a fail-closed guard
- * refusing a legitimate state rather than a bad input.
- *
- * Earlier revisions of this PR also refused a backslash, a control character
- * and a colon in a sub-path entry, because a sub-path was interpolated into a
- * mask mount's container path and thence into `-v <host>:<container>:ro`. That
- * mask mechanism is gone (see the plugin-mount block in
- * `src/container-runner.ts`), so a sub-path entry is no longer interpolated
- * into anything: it is compared as a string and joined onto a host path whose
- * result is then `realpath`-contained (`src/claude-md-compose.ts`). Those rules
- * went with the mechanism that justified them rather than staying behind as
- * comments pointing at a code path the value no longer reaches — and backslash,
- * newline and DEL are all legal bytes in a Linux directory name, so refusing
- * them is the same accepted-set regression in a narrower place.
- *
- * What remains is what traversal actually needs, plus one byte that is not a
- * style rule at all: no empty segment, no `.` or `..`, no absolute path, the
- * depth bound below — and no NUL. `/` cannot appear in a segment, since
- * segments are the result of splitting on it.
- *
- * Two things are refused on a filesystem justification the removed character
- * rules did not have, and they are one rule rather than two: an accepted entry
- * must be a string a filename can actually BE. JSON can express values that a
- * POSIX name cannot hold — a NUL, and an unpaired UTF-16 surrogate, which node
- * re-encodes as U+FFFD on its way to a syscall. Either one PASSES every shape
- * check and can then never match anything. That is not a harmless typo:
- * `"codex"` with a trailing NUL or lone surrogate lands in the top-level
- * exclusion set, fails to match the real `codex` directory, and the plugin
- * mounts — and with `codexHostAuth` the host's Codex OAuth mount is admitted
- * with it. A credential-withholding exclusion silently turned into credential
- * delivery is exactly the fail-open this validator exists to prevent.
- *
- * Backslash, newline and DEL stay allowed, and the distinction is the whole
- * point: those are legal bytes in a real Linux directory name, so refusing them
- * refuses configurations that already worked. These two cannot name any file at
- * all.
- *
- * `src/plugin-scopes.ts:44`'s narrower `PLUGIN_NAME_RE` governs an
- * operator-authored policy file and is left alone.
+ * `excludePlugins` validation and the covering relation live in
+ * `src/plugin-exclusions.ts`, the import-free file the container runs a
+ * verbatim copy of (`container/agent-runner/src/plugin-exclusions.ts`), so the
+ * host's reading of an entry and each in-container walker's are one
+ * implementation. Re-exported here because this module is where every host
+ * consumer already reaches for container.json's schema.
  */
-// `\p{Surrogate}` under the `u` flag matches a LONE surrogate only: a valid
-// pair combines into one astral code point, which is not a surrogate. So an
-// emoji directory name passes and a half-character cannot. (`isWellFormed`
-// says the same thing, but needs an ES2024 lib this tsconfig does not set.)
-const PLUGIN_PATH_SEGMENT_RE = /^(?!\.\.?$)[^\0\p{Surrogate}]+$/su;
-
-/**
- * Longest single path segment any filename on this host may have, in BYTES.
- *
- * Linux's `NAME_MAX` is 255 on every filesystem this host uses (`getconf
- * NAME_MAX ~/plugins`). It is a byte limit rather than a character one, so an
- * astral character costs four of the 255. Hardcoded rather than probed: the
- * value is a kernel constant, and probing it would make the validator's answer
- * depend on which filesystem the config happens to be read from.
- */
-const NAME_MAX_BYTES = 255;
-
-/**
- * Deepest `excludePlugins` entry we accept, in path segments. Bounded by what
- * the three sub-plugin walkers actually descend to, so an entry can never name
- * a directory no walker would have looked at:
- *   - Claude: `<repo>/<sub>` and `<repo>/<sub>/<sub2>`
- *     (`container/agent-runner/src/providers/claude.ts:1790-1817`)
- *   - Codex: `<repo>/plugins/<sub>` and `<repo>/<sub>`
- *     (`findCodexSubPlugins`, `container/agent-runner/src/codex-companion-setup.ts:570`)
- *   - OpenCode skill mirror: `<repo>/plugins/<sub>/skills` and `<repo>/<sub>/skills`
- *     (`container/agent-runner/src/plugin-skill-discovery.ts:283,303`)
- * Three is the maximum any of them reaches.
- */
-const MAX_EXCLUDE_PLUGIN_DEPTH = 3;
-
-/**
- * Validate `excludePlugins`. Entries are either a top-level `~/plugins` folder
- * name (`bootstrap`) or a sub-plugin path relative to the plugins root
- * (`bootstrap/plugins/orchestrate`, `knowledge-work-plugins/data`).
- *
- * Fails closed and loudly: an entry that does not parse throws, naming the
- * entry, rather than being dropped. A silently-ignored exclusion is a
- * fail-open — the operator believes a plugin is withheld from a group while
- * the mount, the Codex registration and the always-on ruleset all still
- * deliver it.
- */
-export function validateExcludePlugins(value: unknown): string[] | undefined {
-  if (value === undefined) return undefined;
-  if (!Array.isArray(value)) throw new Error('excludePlugins must be an array of plugin names or sub-plugin paths');
-  for (const entry of value) {
-    const fail = (why: string): never => {
-      throw new Error(`excludePlugins entry ${JSON.stringify(entry)} ${why}`);
-    };
-    if (typeof entry !== 'string' || entry === '') fail('must be a non-empty string');
-    const name = entry as string;
-    if (name.startsWith('/')) fail('must be relative to ~/plugins, not an absolute path');
-    const segments = name.split('/');
-    if (segments.length > MAX_EXCLUDE_PLUGIN_DEPTH) {
-      fail(`is deeper than ${MAX_EXCLUDE_PLUGIN_DEPTH} path segments, which no sub-plugin walker descends to`);
-    }
-    for (const segment of segments) {
-      if (!PLUGIN_PATH_SEGMENT_RE.test(segment)) {
-        fail(
-          'must be <plugin> or <plugin>/<sub>[/<sub2>] with no empty, "." or ".." segments and nothing a filename cannot hold',
-        );
-      }
-      // Length is measured in BYTES, not characters: `NAME_MAX` is a byte
-      // limit, so one astral character costs four of the 255 a basename gets.
-      const bytes = Buffer.byteLength(segment, 'utf8');
-      if (bytes > NAME_MAX_BYTES) {
-        fail(`has a ${bytes}-byte path segment; no filename may exceed ${NAME_MAX_BYTES} bytes (NAME_MAX)`);
-      }
-    }
-  }
-  return value as string[];
-}
-
-/**
- * Split a validated `excludePlugins` list into the two shapes its consumers
- * need: whole `~/plugins` entries to drop, and sub-plugin paths to withhold
- * inside a repo that IS still delivered. Shared by the mount builder
- * (`src/container-runner.ts`) and the always-on composer
- * (`src/claude-md-compose.ts`) so the two can't disagree about what an entry means.
- *
- * `subPaths` holds only the entries no broader exclusion already covers. A
- * sub-path under an excluded ancestor says nothing the ancestor has not already
- * said, so the covering relation is resolved once, here, rather than at each
- * consumer — the always-on composer resolves ancestors when it walks discovered
- * sub-plugins, and a future consumer should not have to rediscover the rule.
- * Both ancestor shapes drop: a top-level entry (`bootstrap`, whose repo is
- * withheld whole) and a shallower sub-path (`bootstrap/plugins` over
- * `bootstrap/plugins/orchestrate`).
- */
-export function splitExcludedPlugins(entries: readonly string[] | undefined): {
-  topLevel: Set<string>;
-  subPaths: Set<string>;
-} {
-  const topLevel = new Set<string>();
-  const allSubPaths = new Set<string>();
-  for (const entry of entries ?? []) {
-    if (entry.includes('/')) allSubPaths.add(entry);
-    else topLevel.add(entry);
-  }
-  const subPaths = new Set<string>();
-  for (const subPath of allSubPaths) {
-    const segments = subPath.split('/');
-    // Strict ancestors only: the repo name (a top-level entry), then every
-    // shallower sub-path. `i < segments.length` stops before the entry itself.
-    let covered = topLevel.has(segments[0]);
-    for (let i = 2; !covered && i < segments.length; i++) {
-      covered = allSubPaths.has(segments.slice(0, i).join('/'));
-    }
-    if (!covered) subPaths.add(subPath);
-  }
-  return { topLevel, subPaths };
-}
+export { splitExcludedPlugins, validateExcludePlugins, isExcludedPluginPath } from './plugin-exclusions.js';
+export type { ExcludedPlugins } from './plugin-exclusions.js';
 
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
@@ -913,22 +759,50 @@ export interface ContainerConfig {
    * `codex` plugin to avoid handing them a CLI with the host's Codex OAuth
    * session.
    *
-   * Two granularities, one field — and today they reach different distances:
+   * Two granularities, one field. Both reach every provider; what differs is
+   * whether the BYTES go or only the REGISTRATION:
    *   - `"bootstrap"` — a top-level entry. Its mount is never created, so the
-   *     plugin is absent from `/workspace/plugins` for every provider.
+   *     plugin is absent from `/workspace/plugins` for every provider. (One
+   *     documented exception: OpenCode's skills arrive through the host's
+   *     per-sibling mirror rather than this mount, and the session XDG copy of
+   *     that mirror is filtered for SUB-PATH entries only, so a top-level entry
+   *     there drops the mount and the ruleset and keeps the skills. See
+   *     `excludedOpenCodeSkillNames`, `src/providers/opencode.ts`.)
    *   - `"bootstrap/plugins/orchestrate"` — one sub-plugin of a monorepo whose
-   *     other sub-plugins the group keeps. This withholds that sub-plugin's
-   *     standing directive from the composed prompt
-   *     (`src/claude-md-compose.ts`) and NOTHING ELSE: the repo mounts whole,
-   *     so the sub-plugin's skills, manifest and hooks are still reachable in
-   *     the container.
+   *     other sub-plugins the group keeps. The repo still mounts whole, so the
+   *     sub-plugin's FILES stay readable at `/workspace/plugins/<repo>/<sub>`.
+   *     What is withheld is REGISTRATION, by each walker that would have
+   *     performed it: the Claude SDK `plugins:` list (and with it the
+   *     sub-plugin's SessionStart hook and PreToolUse guards), the Codex
+   *     registration plan (and, keyed off it, hook trust), the
+   *     `~/.agents/skills` mirror both Codex and OpenCode read, the OpenCode
+   *     session XDG skill copy, and the standing directive in the composed
+   *     prompt (`src/claude-md-compose.ts`). One thing a sub-path entry does
+   *     NOT withhold: the guard files the runner imports by absolute path,
+   *     which never pass through a walker. Three sites load
+   *     `bootstrap/plugins/workflow-agents/hooks/guards/*-core.ts` by file
+   *     presence and fall back to an inline policy when it is gone
+   *     (`providers/claude.ts`, `codex-hooks/runner.ts`,
+   *     `scheduling/task-script.ts`); `providers/opencode.ts` loads
+   *     `bootstrap/plugins/workflow/hooks/guards/opencode-guard.ts` — a
+   *     DIFFERENT sub-plugin — and REFUSES THE SPAWN rather than degrading if
+   *     that file is absent. So excluding `workflow-agents` keeps the guard
+   *     everywhere, and excluding `workflow` keeps it too, because the entry
+   *     withholds registration, not bytes.
    *
-   * The gap is deliberate and temporary. Masking the sub-path with an empty
-   * bind mount was tried and removed: it required the host to predict what a
-   * container's own walkers would resolve, and an absolute symlink inside the
-   * repo is absent to a host `statSync` while live once the repo is mounted, so
-   * the exclusion silently did not apply. Container-side exclusion lands in a
-   * follow-up, where each walker honours this same list in its own namespace.
+   * Every one of those decisions is made where the path resolves, against a
+   * path the walker assembled itself, through one shared predicate
+   * (`src/plugin-exclusions.ts`, copied verbatim to
+   * `container/agent-runner/src/plugin-exclusions.ts`). Masking the sub-path
+   * host-side with an empty bind mount was tried and removed first: it required
+   * the host to predict what a container's own walkers would resolve, and an
+   * absolute symlink inside the repo is absent to a host `statSync` while live
+   * once the repo is mounted, so the exclusion silently did not apply. Nothing
+   * here predicts. An entry naming a path this install does not carry REFUSES
+   * THE SPAWN, top-level and sub-path alike: the mount builder walks each entry
+   * segment by segment against the real tree and throws when one is missing
+   * (`src/container-runner.ts`). An exclusion that matches nothing withholds
+   * nothing, and a warning nobody reads is how that stays invisible.
    *
    * Validated by `validateExcludePlugins` — a malformed entry throws rather
    * than being silently ignored.
@@ -1453,6 +1327,46 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
  * Write the container config for a group, creating the groups/<folder>/
  * directory if necessary. Pretty-printed JSON so diffs in the activation
  * flow are reviewable.
+ *
+ * Refuses to overwrite an existing file the reader cannot understand as an
+ * object. `readContainerConfig` is deliberately tolerant — it reads every field
+ * and defaults a document it cannot understand, so a READ never fails on one
+ * bad field — and every caller here is read-modify-write
+ * (`updateContainerConfig`, and `ensureRuntimeFields`'s race-safe re-read on
+ * the spawn path, `src/container-runner.ts`). Composed, those two turn a root
+ * the reader could not understand into a materialized default written back over
+ * the original: `[{"excludePlugins": […]}]` is replaced, on disk, by a config
+ * declaring no exclusions, before any container reads it. That is the
+ * operator's file destroyed and a deny policy silently dropped in one step, and
+ * no fail-closed reader downstream can see it happen — it runs before the
+ * mount. Tolerance is the right shape for READING a field; it is not a licence
+ * to normalize away a document nobody has agreed to discard.
+ *
+ * Unparseable bytes are refused on the same terms — which the third substitute
+ * pass argued for, and which this function originally got wrong by carving them
+ * out. A truncated write leaves exactly the realistic case,
+ * `{"excludePlugins": ["…"],` — the entries visibly in the file, the tolerant
+ * reader answering "none" — and nothing here can tell that from any other parse
+ * failure. The objection to refusing it was that a corrupt file would then have
+ * no repair path; the answer is that automatic replacement was never one. Every
+ * caller is read-modify-write over the tolerant reader
+ * (`updateContainerConfig`, `ensureRuntimeFields` on the spawn path, and
+ * `applyOptOut` in `scripts/enable-agent-plugin.ts`), so each would write the
+ * reader's guess rather than the operator's file. The one caller that
+ * legitimately CREATES a config, `initContainerConfig`, returns before writing
+ * when the file exists, so nothing about first-time setup changes. Repair is a
+ * person editing the file, and the error message says so.
+ *
+ * OPERATIONAL CONSEQUENCE, stated plainly because it is a change in how a
+ * broken install behaves: a group whose `container.json` exists but is
+ * malformed no longer spawns at all. `ensureRuntimeFields` runs on every spawn
+ * and writes whenever the identity fields are missing, which they are for a
+ * file the reader had to default, so the refusal aborts that spawn. It used to
+ * silently repair the file into a config declaring no exclusions and carry on.
+ * Wedging one group until a person looks at it is the intended trade against
+ * dropping a deny policy nobody was told about, but it IS a trade: the earlier
+ * claim that a group with an unreadable config still boots is no longer true
+ * once the file exists.
  */
 export function writeContainerConfig(folder: string, config: ContainerConfig): void {
   validateMcpServers(config.mcpServers ?? {});
@@ -1460,9 +1374,42 @@ export function writeContainerConfig(folder: string, config: ContainerConfig): v
   validateGitIdentity(config.gitIdentity);
   validateExcludePlugins(config.excludePlugins);
   const p = configPath(folder);
+  assertOverwritableContainerConfig(p);
   const dir = path.dirname(p);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(p, JSON.stringify(config, null, 2) + '\n');
+}
+
+/**
+ * Throw unless `p` is absent or holds a JSON object — see
+ * `writeContainerConfig`. ABSENCE is the one state that passes, and it is
+ * distinguished from a failed read rather than inferred from one: a file that
+ * cannot be read or parsed may hold fields the writer is about to discard,
+ * while a file that is not there holds none.
+ */
+function assertOverwritableContainerConfig(p: string): void {
+  const refuse = (why: string): never => {
+    throw new Error(
+      `refusing to overwrite ${p}: ${why}, so any field it declares (excludePlugins among them) would be ` +
+        'discarded rather than read. Fix the file by hand — nothing here rewrites it for you.',
+    );
+  };
+  let raw: string;
+  try {
+    raw = fs.readFileSync(p, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return;
+    return refuse(`it exists but could not be read (${(err as Error).message})`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return refuse('its contents are not valid JSON');
+  }
+  if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) return;
+  const shape = parsed === null ? 'null' : Array.isArray(parsed) ? 'array' : typeof parsed;
+  refuse(`its root is a JSON ${shape}, not an object`);
 }
 
 /**

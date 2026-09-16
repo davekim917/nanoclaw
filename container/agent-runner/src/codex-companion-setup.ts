@@ -38,6 +38,8 @@ import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import fs from 'fs';
 import path from 'path';
 
+import { loadExcludedPlugins } from './excluded-plugins.js';
+import { isExcludedPluginPath, type ExcludedPlugins } from './plugin-exclusions.js';
 import {
   buildCodexHooksJson,
   parseTomlTableHeader,
@@ -761,12 +763,20 @@ function readCodexMarketplaceName(pluginDir: string): string | null {
  * That is what makes a sparse checkout do the right thing: a monorepo's marketplace.json
  * may advertise a dozen plugins, but if only one was checked out, only that one registers.
  */
-function findCodexSubPlugins(pluginDir: string): Array<{ dir: string; entryName: string }> {
+function findCodexSubPlugins(
+  pluginDir: string,
+  repoName: string,
+  excluded: ExcludedPlugins,
+): Array<{ dir: string; entryName: string }> {
   const found: Array<{ dir: string; entryName: string }> = [];
   const seen = new Set<string>();
   // Both monorepo layouts: `<root>/plugins/<sub>` and `<root>/<sub>`.
   for (const container of [path.join(pluginDir, 'plugins'), pluginDir]) {
     if (!isDirectorySafe(container)) continue;
+    // The relative path of THIS layout's container, as the plugins root sees
+    // it. Built from the repo's own entry name, not from `pluginDir` — the
+    // exclusion is asked about the walk's own path, never a resolved one.
+    const containerRel = container === pluginDir ? repoName : `${repoName}/plugins`;
     let subs: string[] = [];
     try {
       subs = fs.readdirSync(container);
@@ -776,6 +786,7 @@ function findCodexSubPlugins(pluginDir: string): Array<{ dir: string; entryName:
     for (const sub of subs) {
       if (sub.startsWith('.')) continue;
       const dir = path.join(container, sub);
+      if (isExcludedPluginPath(`${containerRel}/${sub}`, excluded)) continue;
       if (seen.has(dir) || !isDirectorySafe(dir)) continue;
       const entryName = readCodexPluginEntryName(dir);
       if (!entryName) continue;
@@ -820,16 +831,22 @@ export interface CodexPluginRegistrationPlan {
  * A per-group `excludePlugins` TOP-LEVEL entry, and `IN_TREE_SHADOWED_PLUGINS`,
  * need no handling here — `container-runner.ts` omits those from the
  * `/workspace/plugins` mount before the container ever starts, so they simply
- * never appear as entries in `pluginsRoot`.
+ * never appear as entries in `pluginsRoot`. The top-level check below is
+ * therefore belt-and-braces, and cheap: it costs one Set lookup and it is what
+ * makes this walker's answer stand on its own rather than on the mount builder.
  *
- * A SUB-PLUGIN path entry is a different matter and is NOT handled anywhere
- * yet: the host mounts the repo whole, so this walker still finds and registers
- * the excluded sub-plugin. Honouring the list here — in the container's own
- * namespace, where the paths actually resolve — is the follow-up to #826, which
- * removed the host-side mask precisely because the host cannot predict what
- * this walker will see.
+ * A SUB-PLUGIN path entry IS handled here, because the host mounts the repo
+ * whole and only this walker knows which sub-plugins it would have registered.
+ * An excluded sub-plugin is never `codex plugin add`ed — and so, since
+ * `pluginHookTrustEntries` keys off this plan, never gains a hook trust entry
+ * either. #826 removed the host-side mask precisely because the host cannot
+ * predict what this walker will see; the list is honoured in the walker's own
+ * namespace instead (`plugin-exclusions.ts`).
  */
-export function planCodexPluginRegistration(pluginsRoot: string): CodexPluginRegistrationPlan[] {
+export function planCodexPluginRegistration(
+  pluginsRoot: string,
+  excluded: ExcludedPlugins = loadExcludedPlugins(),
+): CodexPluginRegistrationPlan[] {
   let entries: string[] = [];
   try {
     entries = fs.readdirSync(pluginsRoot);
@@ -840,6 +857,10 @@ export function planCodexPluginRegistration(pluginsRoot: string): CodexPluginReg
   const plans: CodexPluginRegistrationPlan[] = [];
   for (const name of entries) {
     const dir = path.join(pluginsRoot, name);
+    if (isExcludedPluginPath(name, excluded)) {
+      plans.push({ name, action: 'skip', reason: 'excluded-by-config' });
+      continue;
+    }
     if (!isDirectorySafe(dir)) {
       plans.push({ name, action: 'skip', reason: 'not-a-directory' });
       continue;
@@ -866,7 +887,7 @@ export function planCodexPluginRegistration(pluginsRoot: string): CodexPluginReg
     // Marketplace monorepo: no manifest at the root, so register each checked-out
     // sub-plugin against the repo's marketplace. `codex plugin marketplace add` is
     // run once per plan against the same repo dir, which is idempotent.
-    const subs = findCodexSubPlugins(dir);
+    const subs = findCodexSubPlugins(dir, name, excluded);
     if (subs.length === 0) {
       plans.push({ name, action: 'skip', reason: 'no-codex-plugin-manifest' });
       continue;
@@ -1008,7 +1029,10 @@ export function syncAgentSkillsMirror(runtime?: AgentRuntime): void {
   // OpenCode has NO plugin loader at all, so the mirror remains its sole delivery for
   // plugin skills. Per-plugin routing (.nanoclaw-plugin.json `denySiblings`) is applied
   // inside discoverPortableSkills.
-  const pluginSkills = runtime === 'codex' ? [] : discoverPortableSkills(CONTAINER_PLUGINS_DIR, { runtime });
+  const pluginSkills =
+    runtime === 'codex'
+      ? []
+      : discoverPortableSkills(CONTAINER_PLUGINS_DIR, { runtime, excludePlugins: loadExcludedPlugins() });
 
   // Plugin skills first (preferred source), then container-bundled —
   // first occurrence wins by name.

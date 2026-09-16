@@ -34,6 +34,8 @@
 import fs from 'fs';
 import path from 'path';
 
+import { isExcludedPluginPath, splitExcludedPlugins, type ExcludedPlugins } from './plugin-exclusions.js';
+
 export interface DiscoveredSkill {
   /** Skill name (used as `~/.codex/skills/<name>/` link basename) */
   name: string;
@@ -217,6 +219,7 @@ function discoverInPlugin(
   denySubPluginSkillDirs: Set<string>,
   allowNonInvocable: boolean,
   runtime: AgentRuntime,
+  excluded: ExcludedPlugins,
 ): DiscoveredSkill[] {
   const skills = new Map<string, DiscoveredSkill>();
 
@@ -226,8 +229,30 @@ function discoverInPlugin(
   const skipCodexNative = (root: string) => runtime === 'codex' && loadedNativelyByCodex(root);
   const doTopLevel = !skipCodexNative(pluginDir);
 
+  // The group's exclusions, asked ONCE here rather than at each layout rule.
+  // Every rule below ends at `recordCandidate`, and it is the only place that
+  // holds the candidate's full path, so this is the seam they share. Rules 7
+  // and 8 used to carry the check themselves, and rules 4-6 — `plugin/`,
+  // `<repo>-cursor-integration/`, `<repo>-claude-plugin/`, all of them
+  // root-level sub-plugin layouts an entry can legitimately name — did not, so
+  // an excluded sub-plugin in one of those shapes was recorded before the
+  // later check could refuse it (first match wins), and only this walker
+  // disagreed: Claude's and Codex's honour the same entry. A predicate applied
+  // per layout rule is a predicate one new layout rule forgets.
+  //
+  // `relPath` is assembled from this walk's own names — `pluginName`, then the
+  // path the rule built under `pluginDir` — never a `realpath`, which is what
+  // `isExcludedPluginPath` requires. Ancestor coverage does the rest: a
+  // candidate at `<repo>/plugin/skills/<name>` is covered by an entry naming
+  // `<repo>/plugin`.
+  const excludedCandidate = (skillDir: string): boolean => {
+    const rel = path.relative(pluginDir, skillDir);
+    return isExcludedPluginPath(rel ? `${pluginName}/${rel.split(path.sep).join('/')}` : pluginName, excluded);
+  };
+
   const recordCandidate = (skillDir: string) => {
     if (!hasSkillMd(skillDir)) return;
+    if (excludedCandidate(skillDir)) return;
     // `user-invocable: false` skills are referenceable helpers (e.g.
     // team-verification-before-completion), not user-facing commands. Claude & Codex load
     // them via native plugin loaders — available to reference, hidden from the command list.
@@ -336,6 +361,15 @@ export interface DiscoverOptions {
    * Defaults to 'codex' for back-compat with the original caller.
    */
   runtime?: AgentRuntime;
+  /**
+   * A group's `excludePlugins`, already split (`./plugin-exclusions.js`).
+   * Honoured for BOTH shapes: a top-level entry drops the repo, a sub-plugin
+   * path drops that sub-plugin's skills while the rest of the repo still
+   * mirrors. Defaults to "nothing excluded" — the host copy's callers
+   * (`src/opencode-sync.ts`, `scripts/enable-agent-plugin.ts`) build mirrors
+   * that are not scoped to one agent group and so have no list to apply.
+   */
+  excludePlugins?: ExcludedPlugins;
 }
 
 /**
@@ -354,9 +388,12 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
   // reference. Claude/Codex load those via their plugin loaders, so their mirrors stay lean.
   const allowNonInvocable = runtime === 'opencode';
 
+  const excluded = options.excludePlugins ?? splitExcludedPlugins(undefined);
+
   const allSkills = new Map<string, DiscoveredSkill>();
   for (const pluginName of fs.readdirSync(pluginsRoot)) {
     if (denyPlugins.has(pluginName)) continue;
+    if (isExcludedPluginPath(pluginName, excluded)) continue;
     if (RUNTIME_SPECIFIC_DIRS.has(pluginName)) continue;
     const pluginDir = path.join(pluginsRoot, pluginName);
     if (!isDirectory(pluginDir)) continue;
@@ -365,7 +402,14 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
     if (readPluginDenySiblings(pluginDir).has(runtime)) continue;
     // Skip deprecated subtree contents — they live at <plugin>/deprecated/ and
     // shouldn't appear as portable skills.
-    for (const skill of discoverInPlugin(pluginDir, pluginName, denySubPluginSkillDirs, allowNonInvocable, runtime)) {
+    for (const skill of discoverInPlugin(
+      pluginDir,
+      pluginName,
+      denySubPluginSkillDirs,
+      allowNonInvocable,
+      runtime,
+      excluded,
+    )) {
       if (denySkills.has(skill.name)) continue;
       if (skill.skillDir.includes('/deprecated/')) continue;
       // First-plugin-wins by name (alphabetical iteration); a later plugin
@@ -513,7 +557,7 @@ export function syncSkillSymlinks(
  * distinguish our writes from native installs
  * without ambiguity — a native install never has this file.
  */
-const MIRROR_MARKER = '.nanoclaw-managed';
+export const MIRROR_MARKER = '.nanoclaw-managed';
 
 /**
  * A "managed mirror" dir is one we created: it contains our marker file.

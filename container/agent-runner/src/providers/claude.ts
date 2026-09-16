@@ -17,6 +17,8 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
+import { loadExcludedPlugins } from '../excluded-plugins.js';
+import { isExcludedPluginPath, type ExcludedPlugins } from '../plugin-exclusions.js';
 import { recordRateLimitSamples, type AccountIdentity, type RateLimitSample } from '../modules/mailbox/index.js';
 import { getCredentialSlot, setCredentialSlot } from '../modules/mailbox/session-state.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
@@ -1741,9 +1743,19 @@ export interface PluginDiscovery {
  * `nanoclaw-plugin.json` is deliberately separate from Claude's plugin
  * manifest: it is an explicit host/plugin integration contract without
  * relying on undocumented Claude-manifest extension fields.
+ *
+ * `excludePlugins` is honoured HERE, in the namespace where these paths
+ * resolve, against the relative path this walk assembles from its own
+ * `readdirSync` names — never a `realpath` or a host-side prediction of it
+ * (`../plugin-exclusions.ts`). A top-level entry never reaches this walk at all
+ * (the host omits it from the mount, `src/container-runner.ts`); a sub-plugin
+ * entry does, and dropping it here removes the plugin from the SDK `plugins:`
+ * list, which is what carries its hooks — its SessionStart hook and any
+ * `preToolUseGuards` it declares go with it.
  */
 export function discoverPlugins(
   pluginsRoot = process.env.CLAUDE_PLUGINS_ROOT || '/workspace/plugins',
+  excluded: ExcludedPlugins = loadExcludedPlugins(),
 ): PluginDiscovery {
   if (!fs.existsSync(pluginsRoot)) return { plugins: [], preToolUseGuards: [] };
   const plugins: SdkPluginConfig[] = [];
@@ -1772,6 +1784,7 @@ export function discoverPlugins(
   }
   for (const entry of entries) {
     const repoPath = path.join(pluginsRoot, entry);
+    if (isExcludedPluginPath(entry, excluded)) continue;
     try {
       if (!fs.statSync(repoPath).isDirectory()) continue;
     } catch {
@@ -1789,6 +1802,8 @@ export function discoverPlugins(
     }
     for (const sub of subs) {
       const subPath = path.join(repoPath, sub);
+      const subRel = `${entry}/${sub}`;
+      if (isExcludedPluginPath(subRel, excluded)) continue;
       try {
         if (!fs.statSync(subPath).isDirectory()) continue;
       } catch {
@@ -1806,6 +1821,7 @@ export function discoverPlugins(
       }
       for (const sub2 of sub2s) {
         const sub2Path = path.join(subPath, sub2);
+        if (isExcludedPluginPath(`${subRel}/${sub2}`, excluded)) continue;
         try {
           if (!fs.statSync(sub2Path).isDirectory()) continue;
         } catch {

@@ -21,6 +21,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { readContainerConfig } from '../container-config.js';
 import { getContainerConfig } from '../db/container-configs.js';
 import {
   assertRealDirectory,
@@ -29,6 +30,8 @@ import {
   replaceUntrustedFile,
 } from '../fs-safety.js';
 import { assertValidGroupFolder } from '../group-folder.js';
+import { isExcludedPluginPath, splitExcludedPlugins, type ExcludedPlugins } from '../plugin-exclusions.js';
+import { MIRROR_MARKER, discoverPortableSkills } from '../plugin-skill-discovery.js';
 import { registerProviderContainerConfig } from './provider-container-registry.js';
 
 // Code-level opencode defaults — the floor under the per-group DB value
@@ -47,13 +50,132 @@ const DEFAULT_OPENCODE_MODEL = 'opencode-go/deepseek-v4.1-flash';
 const DEFAULT_OPENCODE_PROVIDER = 'opencode-go';
 const DEFAULT_OPENCODE_EFFORT = 'high';
 
-/** Copy a host-owned skill tree without mutating it or following stale links. */
-export function copyOpenCodeSkills(source: string, target: string): void {
+/**
+ * Skill names this group's `excludePlugins` SUB-PATH entries withhold from the
+ * host-side OpenCode mirror.
+ *
+ * OpenCode receives skills by TWO paths, and the container-side one is not
+ * enough on its own: the in-container mirror at `~/.agents/skills`
+ * (`syncAgentSkillsMirror`, which honours `excludePlugins` in the container)
+ * AND this copy of the host's per-sibling mirror into the session XDG. The host
+ * mirror is built once for every sibling of a provider, with no agent group in
+ * hand (`syncOpenCodePluginSkills`, `src/opencode-sync.ts`), so an excluded
+ * sub-plugin's skills sit in it and would reach the group anyway — a sub-plugin
+ * exclusion would be half-applied on exactly one provider.
+ *
+ * SUB-PATHS ONLY, deliberately. A TOP-LEVEL entry's skills also survive in this
+ * mirror today, and that is a pre-existing, documented behaviour
+ * (`.claude/skills/enable-agent-plugins/SKILL.md`: "drops the ruleset, keeps the
+ * skills") that live groups are configured against — every OpenCode group on
+ * this install carries top-level entries. Widening this filter to cover them
+ * would silently withdraw skills those groups have today, which is a fleet
+ * change, not this one's. The top-level gap stays as it was.
+ *
+ * The question this set answers is about the SOURCE the mirror published, not
+ * about a name: the mirror holds exactly one directory per skill name, and the
+ * copy either hands that directory to the group or does not. So each discovered
+ * skill is asked the predicate directly, about the path the walk assembled for
+ * it — `path.relative(pluginsRoot, skillDir)`, built from `readdirSync` names
+ * by `discoverInPlugin`'s own `path.join`s, never a `realpath` and never a path
+ * from another mount namespace, which is what `isExcludedPluginPath`'s contract
+ * requires.
+ *
+ * An earlier revision took a DIFFERENCE of two walks — one with the list, one
+ * without — and compared the NAMES that survived. That inverted the exclusion
+ * in the case review r1 named: discovery keeps only the first plugin to claim a
+ * name (first-plugin-wins in `discoverPortableSkills`,
+ * `src/plugin-skill-discovery.ts`, alphabetical) and the mirror was built from
+ * the UNFILTERED walk (`syncOpenCodePluginSkills`, `src/opencode-sync.ts`), so
+ * when the excluded sub-plugin is a name's
+ * FIRST provider the name survives the filtered walk — supplied by the later
+ * plugin — while the bytes in the mirror are still the excluded one's. A
+ * name-only comparison read that as "kept" and copied the excluded source
+ * through. Comparing part of an identifier the producer guarantees unique in
+ * full is the same mistake #826 r3 recorded for the composer's fragment keys.
+ *
+ * A name whose mirror copy IS the excluded source is therefore dropped even
+ * when another plugin also provides it — the mirror holds the wrong one and
+ * there is no other copy of that name in it. Nothing is lost: the later
+ * plugin's copy reaches the group through the container-side mirror, which
+ * discovers over `/workspace/plugins` with the same list and picks that source
+ * up (`syncAgentSkillsMirror`,
+ * `container/agent-runner/src/codex-companion-setup.ts`), and OpenCode
+ * auto-loads `~/.agents/skills`.
+ *
+ * This names the source the CURRENT `~/plugins` tree would publish under each
+ * name, which is not in every case the source the mirror actually holds — the
+ * mirror is written by a different pass at a different time. `copyOpenCodeSkills`
+ * closes the direction that would withdraw content (it drops only a dir the
+ * mirror writer published, never an operator-placed one); the direction that
+ * would leak a STALE managed entry needs per-entry provenance at the writer and
+ * is recorded in #836, together with the third divergence: this walk does not
+ * deny workgroup-scoped plugins as `syncOpenCodePluginSkills` does
+ * (`scopedPluginNames`, `src/opencode-sync.ts`). Re-raise on any of the
+ * three — a scoped plugin sharing a skill name with an unscoped one, a mirror
+ * left stale across a plugin rename, or any further divergence between what
+ * this walk sees and what the mirror was built from.
+ *
+ * Returns an empty set for a group with no sub-path entry, which is every group
+ * today: the copy below then behaves exactly as it did.
+ */
+export function excludedOpenCodeSkillNames(pluginsRoot: string, excluded: ExcludedPlugins): Set<string> {
+  if (excluded.subPaths.size === 0) return new Set();
+  const subPathsOnly: ExcludedPlugins = { topLevel: new Set(), subPaths: excluded.subPaths };
+  const dropped = new Set<string>();
+  for (const skill of discoverPortableSkills(pluginsRoot, { runtime: 'opencode' })) {
+    if (isExcludedPluginPath(path.relative(pluginsRoot, skill.skillDir), subPathsOnly)) dropped.add(skill.name);
+  }
+  return dropped;
+}
+
+/**
+ * The marker `syncSkillSymlinks` drops inside every mirror dir IT created is
+ * `MIRROR_MARKER`, imported from `src/plugin-skill-discovery.ts` rather than
+ * redeclared here: the writer and this reader must agree on one string, and a
+ * local copy would drift silently — a renamed marker would make every
+ * `existsSync` below answer false and the drop set would stop applying with
+ * green tests. Its absence is how that writer itself distinguishes a directory
+ * it published from one an operator or a native installer placed —
+ * `isManagedMirror`, the same predicate that makes the sync pass SKIP a native
+ * dir rather than overwrite it, and makes the cleanup pass leave one alone
+ * rather than prune it (both in `src/plugin-skill-discovery.ts`).
+ */
+
+/**
+ * Copy a host-owned skill tree without mutating it or following stale links,
+ * omitting any top-level skill dir in `dropNames` — but only where that dir is
+ * one the mirror writer published.
+ *
+ * The drop set is derived from a walk of `~/plugins` and therefore names a
+ * SOURCE. A mirror entry, though, is not always the thing that walk found:
+ * `syncSkillSymlinks` preserves a directory it did not create, so an
+ * operator-placed or natively-installed `<mirror>/<name>` survives every sync
+ * untouched. Dropping on the name alone would withdraw that content from the
+ * session because an excluded plugin happens to publish the same name — the
+ * over-broad-guard failure this line of work has recorded three times: refusing
+ * a legitimate state instead of the bad input. So the drop is gated on the
+ * writer's own marker, which is the only provenance the mirror carries.
+ *
+ * What that gate does NOT establish is which SOURCE a managed dir came from —
+ * the marker is generic, and `SKILL.md` is copied rather than symlinked, so a
+ * managed dir need carry no link back to its plugin at all. A managed entry can
+ * therefore be stale relative to the current tree (its source renamed or
+ * deleted between syncs), and for that window the drop set and the mirror
+ * disagree. Closing that needs per-entry source provenance written by
+ * `syncSkillSymlinks` itself, which is a change to a mirror Codex shares:
+ * recorded in #836, not made here.
+ */
+export function copyOpenCodeSkills(source: string, target: string, dropNames: ReadonlySet<string> = new Set()): void {
   fs.cpSync(source, target, {
     recursive: true,
     dereference: true,
     force: true,
     filter: (sourcePath) => {
+      // `<mirror>/<skill-name>/...` — the first segment is the skill name the
+      // mirror published, which is what the drop set holds. `''` is the root.
+      const rel = path.relative(source, sourcePath);
+      const name = rel ? rel.split(path.sep)[0] : '';
+      if (name && dropNames.has(name) && fs.existsSync(path.join(source, name, MIRROR_MARKER))) return false;
       const stat = fs.lstatSync(sourcePath, { throwIfNoEntry: false });
       return stat !== undefined && (!stat.isSymbolicLink() || fs.existsSync(sourcePath));
     },
@@ -207,7 +329,19 @@ registerProviderContainerConfig('opencode', async (ctx) => {
     // A stale mirror link must not wedge the spawn, but this source is
     // host-owned authority. Filter the derived copy; never prune the source.
     const targetSkillsDir = replaceUntrustedDirectory(opencodeSubdir, 'skill');
-    copyOpenCodeSkills(hostSkillsDir, targetSkillsDir);
+    // The group's own exclusions, read from the file that is authoritative for
+    // them (`groups/<folder>/container.json`, the same file the container reads
+    // through its read-only mount). The mirror is shared across siblings; the
+    // filter is per group. The walk reads the SAME root the mirror was built
+    // from — `os.homedir()`, as `syncOpenCodePluginSkills` does
+    // (`src/opencode-sync.ts`) — not `hostHome`: were the two ever to differ,
+    // the walk would find nothing, the drop set would be empty, and the
+    // exclusion would silently not apply.
+    const dropNames = excludedOpenCodeSkillNames(
+      path.join(os.homedir(), 'plugins'),
+      splitExcludedPlugins(readContainerConfig(path.basename(ctx.groupDir)).excludePlugins),
+    );
+    copyOpenCodeSkills(hostSkillsDir, targetSkillsDir, dropNames);
   }
 
   // Model + effort resolution mirrors the claude/codex template: a code-level

@@ -1,0 +1,292 @@
+/**
+ * `excludePlugins` honoured in the container, by each walker, in its own
+ * namespace.
+ *
+ * Every assertion here is an EFFECT on the thing the provider actually
+ * consumes — the SDK `plugins:` list (which is what carries a plugin's hooks),
+ * the Codex registration plan, the mirrored skill set — not an exit code and
+ * not "the function was called". #826's mask was removed because the host
+ * cannot predict what these walks resolve; these tests drive the walks.
+ *
+ * The fixture is one plugins root shaped like the real one, and carries BOTH
+ * sub-plugin layouts every walker knows: a `mono` monorepo holding
+ * `plugins/alpha` + `plugins/alpha-agents` (the pair an operator
+ * wants withheld) beside `plugins/gamma` and `plugins/delta` (which
+ * must survive); a `knowledge` monorepo whose sub-plugins sit at its ROOT
+ * (`knowledge/data`, `knowledge/docs`); and a `standalone` repo that is itself
+ * one plugin.
+ */
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
+import { planCodexPluginRegistration } from './codex-companion-setup.js';
+import { isExcludedPluginPath, splitExcludedPlugins } from './plugin-exclusions.js';
+import { discoverPortableSkills } from './plugin-skill-discovery.js';
+import { discoverPlugins } from './providers/claude.js';
+
+const EXCLUDED_PAIR = ['mono/plugins/alpha', 'mono/plugins/alpha-agents'];
+
+/**
+ * Every sub-plugin the fixture carries, as the walkers see it: both the
+ * `<repo>/plugins/<sub>` layout and the `<repo>/<sub>` one. Basenames are
+ * unique across the fixture, so a walker's output can be mapped back to the
+ * sub-path it came from.
+ */
+const SUB_PLUGINS = [
+  'mono/plugins/alpha',
+  'mono/plugins/alpha-agents',
+  'mono/plugins/gamma',
+  'mono/plugins/delta',
+  'knowledge/data',
+  'knowledge/docs',
+];
+
+const basename = (subPath: string): string => subPath.split('/').at(-1) as string;
+
+let root: string;
+
+function writeJson(file: string, body: unknown): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(body));
+}
+
+function writeSkill(dir: string, name: string): void {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${name}\ndescription: ${name}\n---\n\nbody\n`);
+}
+
+/** One sub-plugin: a Claude manifest, a Codex manifest, and one skill. */
+function writeSubPlugin(dir: string, name: string): void {
+  writeJson(path.join(dir, '.claude-plugin', 'plugin.json'), { name });
+  writeJson(path.join(dir, '.codex-plugin', 'plugin.json'), { name });
+  writeSkill(path.join(dir, 'skills', name), name);
+}
+
+beforeEach(() => {
+  root = fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-exclusions-'));
+  for (const repo of ['mono', 'knowledge']) {
+    writeJson(path.join(root, repo, '.claude-plugin', 'marketplace.json'), { name: repo });
+  }
+  for (const subPath of SUB_PLUGINS) {
+    writeSubPlugin(path.join(root, ...subPath.split('/')), basename(subPath));
+  }
+  const standalone = path.join(root, 'standalone');
+  writeJson(path.join(standalone, '.claude-plugin', 'plugin.json'), { name: 'standalone' });
+  writeJson(path.join(standalone, '.claude-plugin', 'marketplace.json'), { name: 'standalone' });
+  writeJson(path.join(standalone, '.codex-plugin', 'plugin.json'), { name: 'standalone' });
+  writeSkill(path.join(standalone, 'skills', 'standalone'), 'standalone');
+});
+
+afterEach(() => {
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe('Claude discoverPlugins', () => {
+  it('drops an excluded sub-plugin from the SDK plugin list, keeping its siblings', () => {
+    const before = discoverPlugins(root, splitExcludedPlugins(undefined)).plugins.map((p) => p.path);
+    expect(before).toContain(path.join(root, 'mono', 'plugins', 'alpha'));
+    expect(before).toContain(path.join(root, 'mono', 'plugins', 'alpha-agents'));
+
+    const after = discoverPlugins(root, splitExcludedPlugins(EXCLUDED_PAIR)).plugins.map((p) => p.path);
+    expect(after).not.toContain(path.join(root, 'mono', 'plugins', 'alpha'));
+    expect(after).not.toContain(path.join(root, 'mono', 'plugins', 'alpha-agents'));
+    expect(after).toContain(path.join(root, 'mono', 'plugins', 'gamma'));
+    expect(after).toContain(path.join(root, 'mono', 'plugins', 'delta'));
+    expect(after).toContain(path.join(root, 'standalone'));
+  });
+
+  it("drops the excluded plugin's PreToolUse guard with it — the hooks ride on the plugin entry", () => {
+    // A plugin reaches the SDK as one `{type:'local', path}` entry: its
+    // SessionStart hook and its declared guards arrive together or not at all.
+    writeJson(path.join(root, 'mono', 'plugins', 'alpha', 'nanoclaw-plugin.json'), {
+      preToolUseGuards: ['alpha-guard'],
+    });
+    writeJson(path.join(root, 'mono', 'plugins', 'delta', 'nanoclaw-plugin.json'), {
+      preToolUseGuards: ['delta-guard'],
+    });
+    expect(discoverPlugins(root, splitExcludedPlugins(undefined)).preToolUseGuards).toContain('alpha-guard');
+
+    const after = discoverPlugins(root, splitExcludedPlugins(EXCLUDED_PAIR));
+    expect(after.preToolUseGuards).not.toContain('alpha-guard');
+    expect(after.preToolUseGuards).toContain('delta-guard');
+  });
+
+  it('excludes a single-plugin repo named at the top level — its manifest is at the ROOT, so no deeper check sees it', () => {
+    // The only shape the top-level check alone catches: a repo the walk
+    // registers without descending. (In production the host already omits a
+    // top-level entry from the mount; this walker does not depend on that.)
+    const after = discoverPlugins(root, splitExcludedPlugins(['standalone'])).plugins.map((p) =>
+      path.relative(root, p.path),
+    );
+    expect(after).not.toContain('standalone');
+    expect(after).toContain(path.join('mono', 'plugins', 'alpha'));
+  });
+
+  it('excludes the whole subtree when a repo is excluded at the top level', () => {
+    const after = discoverPlugins(root, splitExcludedPlugins(['mono']))
+      .plugins.map((p) => path.relative(root, p.path))
+      .sort();
+    expect(after).toEqual(['knowledge/data', 'knowledge/docs', 'standalone']);
+  });
+});
+
+describe('Codex planCodexPluginRegistration', () => {
+  const registered = (entries: string[] | undefined): string[] =>
+    planCodexPluginRegistration(root, splitExcludedPlugins(entries))
+      .filter((p) => p.action === 'register')
+      .map((p) => p.name)
+      .sort();
+
+  it('does not register an excluded sub-plugin — so nothing `codex plugin add`s it, or trusts its hooks', () => {
+    expect(registered(undefined)).toEqual([
+      'knowledge/data',
+      'knowledge/docs',
+      'mono/alpha',
+      'mono/alpha-agents',
+      'mono/delta',
+      'mono/gamma',
+      'standalone',
+    ]);
+    expect(registered(EXCLUDED_PAIR)).toEqual([
+      'knowledge/data',
+      'knowledge/docs',
+      'mono/delta',
+      'mono/gamma',
+      'standalone',
+    ]);
+    // The root layout is honoured the same way.
+    expect(registered(['knowledge/data'])).toEqual([
+      'knowledge/docs',
+      'mono/alpha',
+      'mono/alpha-agents',
+      'mono/delta',
+      'mono/gamma',
+      'standalone',
+    ]);
+  });
+
+  it('skips an excluded top-level repo with a reason naming the config', () => {
+    const plan = planCodexPluginRegistration(root, splitExcludedPlugins(['standalone']));
+    expect(plan.find((p) => p.name === 'standalone')).toEqual({
+      name: 'standalone',
+      action: 'skip',
+      reason: 'excluded-by-config',
+    });
+  });
+});
+
+describe('skill mirror discoverPortableSkills', () => {
+  const skillNames = (entries: string[] | undefined): string[] =>
+    discoverPortableSkills(root, {
+      runtime: 'opencode',
+      excludePlugins: splitExcludedPlugins(entries),
+    })
+      .map((s) => s.name)
+      .sort();
+
+  it("drops an excluded sub-plugin's skills and keeps every sibling's", () => {
+    expect(skillNames(undefined)).toEqual(['alpha', 'alpha-agents', 'data', 'delta', 'docs', 'gamma', 'standalone']);
+    expect(skillNames(EXCLUDED_PAIR)).toEqual(['data', 'delta', 'docs', 'gamma', 'standalone']);
+    // The root layout again — rule 8 of the discovery order, not rule 7.
+    expect(skillNames(['knowledge/data'])).toEqual(['alpha', 'alpha-agents', 'delta', 'docs', 'gamma', 'standalone']);
+  });
+
+  it('drops an excluded sub-plugin in the `plugin/`, cursor and claude-plugin layouts too', () => {
+    // Rules 4-6 of the discovery order walk root-level sub-plugin directories
+    // by fixed name — `plugin/`, `<repo>-cursor-integration/`,
+    // `<repo>-claude-plugin/`. They ran BEFORE the only exclusion check this
+    // walker had, and first-match-wins meant an excluded sub-plugin in one of
+    // those shapes was already recorded by the time the check ran, while
+    // Claude's and Codex's walkers honoured the same entry. The check now sits
+    // at the one seam every rule ends in.
+    const repo = path.join(root, 'layouts');
+    writeJson(path.join(repo, '.claude-plugin', 'plugin.json'), { name: 'layouts' });
+    writeSkill(path.join(repo, 'plugin', 'skills', 'via-plugin-dir'), 'via-plugin-dir');
+    writeSkill(path.join(repo, 'layouts-cursor-integration', 'skills', 'via-cursor'), 'via-cursor');
+    writeSkill(path.join(repo, 'layouts-claude-plugin', 'skills', 'via-claude-plugin'), 'via-claude-plugin');
+
+    expect(skillNames(undefined)).toContain('via-plugin-dir');
+    expect(skillNames(undefined)).toContain('via-cursor');
+    expect(skillNames(undefined)).toContain('via-claude-plugin');
+
+    expect(skillNames(['layouts/plugin'])).not.toContain('via-plugin-dir');
+    expect(skillNames(['layouts/layouts-cursor-integration'])).not.toContain('via-cursor');
+    expect(skillNames(['layouts/layouts-claude-plugin'])).not.toContain('via-claude-plugin');
+
+    // Excluding one of them withholds only that one.
+    const afterPluginDir = skillNames(['layouts/plugin']);
+    expect(afterPluginDir).toContain('via-cursor');
+    expect(afterPluginDir).toContain('via-claude-plugin');
+    expect(afterPluginDir).toContain('delta');
+  });
+
+  it('drops a whole repo for a top-level entry', () => {
+    expect(skillNames(['mono'])).toEqual(['data', 'docs', 'standalone']);
+    // A single-plugin repo: its skills come from the repo root (rules 1-6), not
+    // from a sub-plugin rule, so only the top-level check can withhold them.
+    expect(skillNames(['standalone'])).toEqual(['alpha', 'alpha-agents', 'data', 'delta', 'docs', 'gamma']);
+  });
+});
+
+describe('the three walkers and the predicate agree', () => {
+  // Point of this block: one fixture, one list, and the set each walker
+  // withholds is EXACTLY the set `isExcludedPluginPath` marks — the same
+  // predicate the host's always-on composer asks (`src/claude-md-compose.ts`,
+  // through the byte-identical `src/plugin-exclusions.ts`). Compared by
+  // basename because that is the only identifier all three outputs share.
+  it('withholds exactly the sub-plugins the predicate excludes, for every list shape', () => {
+    for (const entries of [
+      undefined,
+      [],
+      EXCLUDED_PAIR,
+      ['mono/plugins/delta'],
+      ['mono/plugins'],
+      ['mono/plugins', 'mono/plugins/alpha'],
+      ['knowledge/data'],
+      ['knowledge'],
+    ]) {
+      const excluded = splitExcludedPlugins(entries);
+      const expected = SUB_PLUGINS.filter((subPath) => !isExcludedPluginPath(subPath, excluded))
+        .map(basename)
+        .sort();
+
+      const claude = discoverPlugins(root, excluded)
+        .plugins.map((p) => basename(path.relative(root, p.path)))
+        .filter((name) => name !== 'standalone')
+        .sort();
+      expect(claude).toEqual(expected);
+
+      const codex = planCodexPluginRegistration(root, excluded)
+        .filter((p) => p.action === 'register' && p.name.includes('/'))
+        .map((p) => p.entryName as string)
+        .sort();
+      expect(codex).toEqual(expected);
+
+      const skills = discoverPortableSkills(root, { runtime: 'opencode', excludePlugins: excluded })
+        .filter((s) => s.name !== 'standalone')
+        .map((s) => s.name)
+        .sort();
+      expect(skills).toEqual(expected);
+    }
+  });
+});
+
+describe('an exclusion that matches nothing', () => {
+  it("leaves every walker's output untouched — the walk simply never meets the path", () => {
+    // The HOST is what refuses an entry naming a path the tree does not carry,
+    // before the mounts are built (`src/container-runner.ts`), so in production
+    // no such entry reaches these walkers. What is pinned here is the walkers'
+    // own behaviour for one that somehow did: they deliver exactly what they
+    // would have, rather than each inventing its own failure for a line the
+    // host already judged.
+    const ghost = splitExcludedPlugins(['mono/plugins/does-not-exist', 'knowledge/never-cloned', 'no-such-repo']);
+    const none = splitExcludedPlugins(undefined);
+    expect(discoverPlugins(root, ghost).plugins).toEqual(discoverPlugins(root, none).plugins);
+    expect(planCodexPluginRegistration(root, ghost)).toEqual(planCodexPluginRegistration(root, none));
+    expect(discoverPortableSkills(root, { runtime: 'opencode', excludePlugins: ghost })).toEqual(
+      discoverPortableSkills(root, { runtime: 'opencode', excludePlugins: none }),
+    );
+  });
+});

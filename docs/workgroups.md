@@ -92,10 +92,16 @@ Authenticate the refresh through the host's git credential helper.
 
 `~/plugins` is fleet-wide: every agent group mounts every plugin unless its
 `container.json` `excludePlugins` names it. A whole entry (`"bootstrap"`)
-drops the mount. A sub-plugin path (`"bootstrap/plugins/orchestrate"`, or
-`"<repo>/<sub>"` for a repo that puts its sub-plugins at the root) currently
-withholds only that sub-plugin's standing directive from the composed prompt —
-the repo still mounts whole; container-side exclusion lands in a follow-up.
+drops the mount (on OpenCode, whose skills come from the host mirror rather
+than that mount, it drops the mount and the ruleset and keeps the skills — see
+[skills-model.md](skills-model.md)). A sub-plugin path
+(`"bootstrap/plugins/orchestrate"`, or `"<repo>/<sub>"` for a repo that puts
+its sub-plugins at the root) leaves the repo mounted whole — the files stay
+readable — and withholds that sub-plugin's REGISTRATION instead: the Claude SDK
+plugin list and its hooks, the Codex registration plan and its hook trust, the
+`~/.agents/skills` mirror, the OpenCode session XDG skill copy, and the
+standing directive in the composed prompt. Each is decided in the namespace
+where the path resolves, through one shared predicate.
 For a plugin that carries one
 tenant's content, that default is backwards, because a group created later
 receives it until someone remembers to exclude it. The host-owned policy
