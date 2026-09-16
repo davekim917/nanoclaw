@@ -795,6 +795,37 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
         detail: {
           ...(sessionUpdate.recurrence !== undefined ? { recurrence: sessionUpdate.recurrence } : {}),
           ...(sessionUpdate.processAfter !== undefined ? { processAfter: sessionUpdate.processAfter } : {}),
+          // The pin, from and to. A CLEAR is the reason this is not optional:
+          // it is the one pin edit that destroys a value rather than replacing
+          // it, so without the `from` half neither the row nor the trail can
+          // say what the series used to be pinned to, and a clear run by
+          // mistake — `--model "$MODEL"` with MODEL unset arrives as `""` and
+          // now means "clear" — has no way back. `repin` already records
+          // `detail.repin.from/to`; the same pin change was audited through one
+          // verb and not the other.
+          ...(sessionUpdate.flagIntent !== undefined
+            ? {
+                pin: {
+                  from: before ? parseTaskPin(before.content) : null,
+                  // What `updateTask` will have MERGED, not the delta: an
+                  // untouched axis keeps its old value, and a null axis is gone.
+                  to: {
+                    model:
+                      sessionUpdate.flagIntent.turnModel === undefined
+                        ? before
+                          ? parseTaskPin(before.content).model
+                          : null
+                        : sessionUpdate.flagIntent.turnModel,
+                    effort:
+                      sessionUpdate.flagIntent.turnEffort === undefined
+                        ? before
+                          ? parseTaskPin(before.content).effort
+                          : null
+                        : sessionUpdate.flagIntent.turnEffort,
+                  },
+                },
+              }
+            : {}),
         },
       });
     }

@@ -1589,6 +1589,32 @@ describe('tasks CLI resource', () => {
         expect(storedContent(session_id, series_id).flagIntent).toEqual({ turnModel: 'sonnet' });
       });
 
+      it('records the pin it removed in the audit trail — a clear destroys a value', async () => {
+        // The one pin edit that DESTROYS rather than replaces. Without the
+        // `from` half, neither the row nor the trail can say what the series
+        // used to be pinned to, and `--model "$MODEL"` with MODEL unset now
+        // means "clear" — so a mistake has no way back. `repin` already
+        // recorded from/to; this closes the gap between the two verbs.
+        const { series_id } = await pinnedSeries('clr-audit', { model: 'sonnet', effort: 'low' });
+        const upd = await dispatch(
+          { id: 'u-audit', command: 'tasks-update', args: { id: series_id, model: '', group: 'ag-1' } },
+          agentCtx('ag-1', 'chat-1'),
+        );
+        expect(upd.ok).toBe(true);
+        const detail = (
+          getRawDb()
+            .prepare("SELECT detail_json FROM scheduled_audit WHERE series_id = ? AND action = 'update'")
+            .all(series_id) as Array<{ detail_json: string | null }>
+        ).map((r) => JSON.parse(r.detail_json ?? '{}') as { pin?: unknown });
+        expect(detail).toHaveLength(1);
+        expect(detail[0]!.pin).toEqual({
+          from: { model: 'sonnet', effort: 'low' },
+          // The MERGED result, not the delta: the untouched effort axis is
+          // still pinned after the model clear.
+          to: { model: null, effort: 'low' },
+        });
+      });
+
       it('an effort clear leaves a model pin standing', async () => {
         const { session_id, series_id } = await pinnedSeries('clr-effort', { model: 'sonnet', effort: 'low' });
         const upd = await dispatch(
@@ -2810,8 +2836,13 @@ describe('ncl tasks repin', () => {
       if (r.ok) return;
       expect(r.error.message).toContain('ambiguous');
       expect(r.error.message).toContain('--group');
-      // Nothing was written on the way to the refusal.
+      // Nothing was written on the way to the refusal — BOTH sides. Checking
+      // only the first would still pass if the refusal ever moved to after the
+      // write loop, which is the regression this guards.
       expect(storedTaskPin('ag-1', first.session_id, first.series_id)).toEqual({ turnModel: 'claude-sonnet-5' });
+      // Keyed on ag-2's own ROW id: the collision above rewrote only its
+      // series_id, which is what `repin` matches on.
+      expect(storedTaskPin('ag-2', second.session_id, second.series_id)).toEqual({ turnModel: 'claude-sonnet-5' });
     });
 
     it('still honours --from-model: a series in scope that does not match is not rewritten', async () => {
