@@ -1366,22 +1366,20 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     expect(anchor?.threadPlatformId).toBe('plat-1');
   });
 
-  it('edits and reactions are never routed under the anchor, and never disturb it', async () => {
+  it('edits/reactions: the anchor message is addressed at root, in-thread messages via the anchor', async () => {
     await seedAgentAndChannel();
     grantChannelDestination('ag-1', 'mg-1');
     const { session } = await resolveTaskSession('ag-1', 'series-1');
     await setTaskThreadAnchor(session.id, 'telegram', 'telegram:123', 'plat-1', new Date().toISOString());
     const now = new Date().toISOString();
-    insertTaskChat('ag-1', session.id, 'out-edit', now, null, 'task-fire-x', {
-      operation: 'edit',
-      messageId: 'plat-1',
-      text: 'amended',
-    });
-    insertTaskChat('ag-1', session.id, 'out-react', now, null, 'task-fire-x', {
+    const edit = (messageId: string) => ({ operation: 'edit', messageId, text: 'amended' });
+    insertTaskChat('ag-1', session.id, 'out-1', now, null, 'task-fire-x', edit('plat-1'));
+    insertTaskChat('ag-1', session.id, 'out-2', now, null, 'task-fire-x', {
       operation: 'reaction',
       messageId: 'plat-1',
       emoji: 'eyes',
     });
+    insertTaskChat('ag-1', session.id, 'out-3', now, null, 'task-fire-x', edit('plat-in-thread'));
 
     const calls: Array<{ threadId: string | null }> = [];
     setDeliveryAdapter({
@@ -1393,9 +1391,34 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
 
     await deliverSessionMessages(session);
 
-    expect(calls).toEqual([{ threadId: null }, { threadId: null }]);
-    const anchor = await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123');
-    expect(anchor?.threadPlatformId).toBe('plat-1');
+    expect(calls).toEqual([{ threadId: null }, { threadId: null }, { threadId: 'telegram:123:plat-1' }]);
+    expect((await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123'))?.threadPlatformId).toBe('plat-1');
+  });
+
+  it('edits: a failed edit under the anchor retries at root and keeps the anchor', async () => {
+    await seedAgentAndChannel();
+    grantChannelDestination('ag-1', 'mg-1');
+    const { session } = await resolveTaskSession('ag-1', 'series-1');
+    await setTaskThreadAnchor(session.id, 'telegram', 'telegram:123', 'plat-1', new Date().toISOString());
+    insertTaskChat('ag-1', session.id, 'out-1', new Date().toISOString(), null, 'task-fire-x', {
+      operation: 'edit',
+      messageId: 'plat-yesterday',
+      text: 'amended',
+    });
+
+    const calls: Array<{ threadId: string | null }> = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, threadId) {
+        calls.push({ threadId });
+        if (threadId !== null) throw new Error('Unknown Message');
+        return undefined;
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: 'telegram:123:plat-1' }, { threadId: null }]);
+    expect((await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123'))?.threadPlatformId).toBe('plat-1');
   });
 
   it('day rollover: posts a fresh root message and replaces the anchor', async () => {
