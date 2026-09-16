@@ -9,6 +9,7 @@ import {
   createBlockGitCloneHook,
   createBlockCodexCompanionHook,
   createEmailGateHook,
+  resetGateClaimApiForTest,
 } from './claude.js';
 import { buildSecretEnvVarList } from './secret-env.js';
 import * as messagesOut from '../db/messages-out.js';
@@ -582,9 +583,12 @@ describe('E3 createEmailGateHook', () => {
     expect(staged).toHaveLength(0);
   });
 
-  it('signature unchanged (no args → HookCallback)', () => {
-    expect(createEmailGateHook).toHaveLength(0);
+  it('still callable with NO args, and the one option it gained is optional', () => {
+    // The option (`sharedApprovalClaim`) is what arms the one-card-per-tool-call
+    // claim, and it must stay opt-in: every existing caller constructs this hook
+    // with no arguments and must keep its unclaimed behaviour.
     expect(typeof createEmailGateHook()).toBe('function');
+    expect(createEmailGateHook.length).toBe(1); // one FORMAL param, none required
   });
 });
 
@@ -765,5 +769,178 @@ describe('createSanitizeBashHook: jest serialization', () => {
     const out = await runHook('codex exec --yolo "npm test"');
     expect(out).toContain('</dev/null');
     expect(out).toContain('flock -n -E 126');
+  });
+});
+
+// ── One approval card per tool call (#833) ──
+// In a Codex container this hook and the plugin's codex-guard.ts both run on
+// every tool call — concurrently, with the same tool_use_id — and both reach the
+// outbound-email gate. These tests pin that this hook joins the shared claim
+// rather than staging a second card.
+describe('createEmailGateHook — one approval card per tool call', () => {
+  const CLAIM_CORE = new URL('./__test-fixtures__/gate-claim-core-stub.ts', import.meta.url).pathname;
+  const savedEmail = process.env.NANOCLAW_EMAIL_GATE_CORE;
+  const savedGuard = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
+  const savedSched = process.env.NANOCLAW_IS_SCHEDULED_TASK;
+
+  let staged: Array<{ id: string } & Record<string, unknown>>;
+  let ackedRequestIds: string[];
+  const spies: Array<{ mockRestore: () => void }> = [];
+
+  interface Recorder {
+    keyArgs: unknown[][];
+    claims: string[];
+    published: Array<[string, string]>;
+    abandoned: string[];
+    peerRequestId: string | null;
+    peerAlreadyDecided: boolean;
+    decidedChecks: string[];
+  }
+  const rec = (): Recorder => (globalThis as { __nanoclawGateClaimRec: Recorder }).__nanoclawGateClaimRec;
+
+  const GATED = 'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com';
+
+  async function runWithToolUseId(toolUseId: string | undefined): Promise<{ permissionDecision?: string }> {
+    const input = {
+      tool_name: 'Bash',
+      tool_input: { command: GATED },
+      ...(toolUseId ? { tool_use_id: toolUseId } : {}),
+    } as unknown as PreToolUseHookInput;
+    const out = await createEmailGateHook({ sharedApprovalClaim: true })(
+      input as Parameters<HookCallback>[0],
+      EMPTY_CTX,
+      EMPTY_OPTS,
+    );
+    return {
+      permissionDecision: (out as { hookSpecificOutput?: { permissionDecision?: string } })?.hookSpecificOutput
+        ?.permissionDecision,
+    };
+  }
+
+  beforeEach(() => {
+    staged = [];
+    ackedRequestIds = [];
+    spies.length = 0;
+    (globalThis as { __nanoclawGateClaimRec?: Recorder }).__nanoclawGateClaimRec = {
+      keyArgs: [],
+      claims: [],
+      published: [],
+      abandoned: [],
+      peerRequestId: null,
+      peerAlreadyDecided: false,
+      decidedChecks: [],
+    };
+    process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_STUB_CORE;
+    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = CLAIM_CORE;
+    delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
+    resetGateClaimApiForTest();
+    spies.push(
+      spyOn(messagesOut, 'writeMessageOut').mockImplementation((row: { id: string; content: string }) => {
+        staged.push({ id: row.id, ...(JSON.parse(row.content) as Record<string, unknown>) });
+        return 1;
+      }),
+    );
+    spies.push(
+      spyOn(sessionRouting, 'getSessionRouting').mockImplementation(() => ({
+        channel_type: null,
+        platform_id: null,
+        thread_id: null,
+      })),
+    );
+    spies.push(
+      spyOn(deliveryAcks, 'awaitDeliveryAck').mockImplementation(async (messageId: string) => {
+        ackedRequestIds.push(messageId);
+        return { status: 'delivered' } as deliveryAcks.DeliveryAck;
+      }),
+    );
+  });
+
+  afterEach(() => {
+    for (const s of spies) s.mockRestore();
+    resetGateClaimApiForTest();
+    if (savedEmail === undefined) delete process.env.NANOCLAW_EMAIL_GATE_CORE;
+    else process.env.NANOCLAW_EMAIL_GATE_CORE = savedEmail;
+    if (savedGuard === undefined) delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
+    else process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = savedGuard;
+    if (savedSched === undefined) delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
+    else process.env.NANOCLAW_IS_SCHEDULED_TASK = savedSched;
+  });
+
+  it('keys the claim on the TOOL CALL and the gate — never on the command', async () => {
+    // This hook gates the SANITIZED command while the plugin adapter gates the
+    // raw one (codex hands every handler one input_json, built before any of
+    // them runs). A command-keyed claim produced two keys for one tool call and
+    // both guards staged anyway — the exact behaviour the claim removes.
+    await runWithToolUseId('exec-abc');
+    expect(rec().keyArgs).toEqual([['exec-abc', 'request_bash_gate']]);
+  });
+
+  it('as the claim OWNER, stages one card and publishes its requestId', async () => {
+    await runWithToolUseId('exec-abc');
+    expect(staged).toHaveLength(1);
+    expect(rec().published).toEqual([['key:exec-abc|request_bash_gate', staged[0].id as string]]);
+    expect(rec().abandoned).toEqual([]);
+  });
+
+  it('as a LOSER, stages NOTHING and waits on the peer’s requestId', async () => {
+    rec().peerRequestId = 'gate-peer-1';
+    const r = await runWithToolUseId('exec-abc');
+    expect(staged).toEqual([]);
+    expect(ackedRequestIds).toEqual(['gate-peer-1']);
+    expect(r.permissionDecision).toBeUndefined(); // peer approved → allow
+  });
+
+  it('a LOSER honours the peer’s DENIAL rather than raising its own card', async () => {
+    rec().peerRequestId = 'gate-peer-1';
+    spies[2].mockRestore();
+    spies[2] = spyOn(deliveryAcks, 'awaitDeliveryAck').mockImplementation(
+      async () => ({ status: 'failed', error: 'admin declined' }) as deliveryAcks.DeliveryAck,
+    );
+    const r = await runWithToolUseId('exec-abc');
+    expect(staged).toEqual([]);
+    expect(r.permissionDecision).toBe('deny');
+  });
+
+  it('with NO tool_use_id, behaves exactly as before — one card, no claim', async () => {
+    await runWithToolUseId(undefined);
+    expect(rec().claims).toEqual([]);
+    expect(staged).toHaveLength(1);
+  });
+
+  it('is NOT armed unless the caller opts in — the Claude path never claims', async () => {
+    // `tool_use_id` is a REQUIRED field of the Claude SDK's PreToolUse input, so
+    // keying on its presence would arm the claim where this hook is the only
+    // gate and no peer will ever publish.
+    const input = {
+      tool_name: 'Bash',
+      tool_input: { command: GATED },
+      tool_use_id: 'exec-abc',
+    } as unknown as PreToolUseHookInput;
+    await createEmailGateHook()(input as Parameters<HookCallback>[0], EMPTY_CTX, EMPTY_OPTS);
+    expect(rec().claims).toEqual([]);
+    expect(staged).toHaveLength(1);
+  });
+
+  it('REFUSES an already-decided peer requestId and stages its own card', async () => {
+    // The claim directory is under /tmp, which the agent can write to. A
+    // published id that already carries a `delivered` row is not a live peer —
+    // it is a past approval being replayed at a different command, and
+    // honouring it would skip the gate outright.
+    rec().peerRequestId = 'gate-replayed-1';
+    rec().peerAlreadyDecided = true;
+    await runWithToolUseId('exec-abc');
+    expect(rec().decidedChecks).toEqual(['gate-replayed-1']);
+    expect(staged).toHaveLength(1); // its own card, not the replayed decision
+    expect(ackedRequestIds).toEqual([staged[0].id as string]);
+  });
+
+  it('releases the claim when staging THROWS, so a peer is not left waiting', async () => {
+    spies[0].mockRestore();
+    spies[0] = spyOn(messagesOut, 'writeMessageOut').mockImplementation(() => {
+      throw new Error('outbound.db unavailable');
+    });
+    await expect(runWithToolUseId('exec-abc')).rejects.toThrow(/outbound.db unavailable/);
+    expect(rec().abandoned).toEqual(['key:exec-abc|request_bash_gate']);
+    expect(rec().published).toEqual([]);
   });
 });
