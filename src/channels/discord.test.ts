@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { DiscordFormatConverter } from '@chat-adapter/discord';
+import { createDiscordAdapter, DiscordFormatConverter } from '@chat-adapter/discord';
 
 import {
   installForwardUnwrap,
@@ -796,6 +796,34 @@ describe('installMessageThreadAutoCreate', () => {
 
     await expect(adapter.postMessage(anchor, {})).rejects.toBe(original);
     expect(postMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('matches the error the real @chat-adapter/discord throws on 404 Unknown Channel', async () => {
+    const realAdapter = createDiscordAdapter({
+      botToken: 'test-token',
+      publicKey: 'a'.repeat(64),
+      applicationId: 'app',
+    });
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response('{"message": "Unknown Channel", "code": 10003}', { status: 404 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 'reply-1', channel_id: 'msg1', content: 'x', author: { id: 'b' } }), {
+          status: 200,
+        }),
+      );
+    try {
+      const rest = {
+        get: vi.fn().mockResolvedValue({ content: 'Parent' }),
+        post: vi.fn().mockResolvedValue({ id: 'msg1' }),
+      };
+      installMessageThreadAutoCreate(realAdapter, rest as unknown as DiscordThreadRestClient);
+      await realAdapter.postMessage(anchor, { markdown: 'part 2' });
+      expect(rest.post).toHaveBeenCalledWith('/channels/chan1/messages/msg1/threads', { body: { name: 'Parent' } });
+      expect(String(fetchSpy.mock.calls[1][0])).toContain('/channels/msg1/messages');
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   it('leaves channel-root posts, DMs and unrelated errors untouched', async () => {

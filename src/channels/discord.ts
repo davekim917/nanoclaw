@@ -761,8 +761,10 @@ export interface DiscordThreadRestClient {
 }
 
 function isDiscordUnknownChannelError(err: unknown): boolean {
-  // @chat-adapter/discord's discordFetch throws `Discord API error: <status> <body>`
-  // (dist/index.js discordFetch, `throw new NetworkError(... ${response.status} ${errorText})`).
+  // @chat-adapter/discord@4.29.0 serialises HTTP failures into the message text, not a code field:
+  // `Discord API error: ${response.status} ${errorText}` (dist/index.js:1661, discordFetch) and
+  // `Failed to post message: ${response.status} ${error}` (dist/index.js:1255, postMessageWithFiles).
+  // Pinned against the real adapter by the "real @chat-adapter/discord" test in discord.test.ts.
   const message = err instanceof Error ? err.message : String(err);
   return /\b404\b/.test(message) && new RegExp(`"code":\\s*${RESTJSONErrorCodes.UnknownChannel}\\b`).test(message);
 }
