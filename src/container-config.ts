@@ -778,12 +778,17 @@ export interface ContainerConfig {
    *     `~/.agents/skills` mirror both Codex and OpenCode read, the OpenCode
    *     session XDG skill copy, and the standing directive in the composed
    *     prompt (`src/claude-md-compose.ts`). One thing a sub-path entry does
-   *     NOT withhold: the guard cores the runner imports by absolute path
-   *     (`bootstrap/plugins/workflow-agents/hooks/guards/*-core.ts`, loaded by
-   *     file presence in `providers/claude.ts`, `codex-hooks/runner.ts`,
-   *     `providers/opencode.ts`, `scheduling/task-script.ts`) — those never
-   *     pass through a walker, so excluding that sub-plugin leaves the
-   *     destructive-command guard in place. Fail-safe, and worth knowing.
+   *     NOT withhold: the guard files the runner imports by absolute path,
+   *     which never pass through a walker. Three sites load
+   *     `bootstrap/plugins/workflow-agents/hooks/guards/*-core.ts` by file
+   *     presence and fall back to an inline policy when it is gone
+   *     (`providers/claude.ts`, `codex-hooks/runner.ts`,
+   *     `scheduling/task-script.ts`); `providers/opencode.ts` loads
+   *     `bootstrap/plugins/workflow/hooks/guards/opencode-guard.ts` — a
+   *     DIFFERENT sub-plugin — and REFUSES THE SPAWN rather than degrading if
+   *     that file is absent. So excluding `workflow-agents` keeps the guard
+   *     everywhere, and excluding `workflow` keeps it too, because the entry
+   *     withholds registration, not bytes.
    *
    * Every one of those decisions is made where the path resolves, against a
    * path the walker assembled itself, through one shared predicate

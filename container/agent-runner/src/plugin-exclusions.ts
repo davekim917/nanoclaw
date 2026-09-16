@@ -73,7 +73,7 @@
  * refuses configurations that already worked. These two cannot name any file at
  * all.
  *
- * `src/plugin-scopes.ts:44`'s narrower `PLUGIN_NAME_RE` governs an
+ * `src/plugin-scopes.ts`'s narrower `PLUGIN_NAME_RE` governs an
  * operator-authored policy file and is left alone.
  */
 // `\p{Surrogate}` under the `u` flag matches a LONE surrogate only: a valid
