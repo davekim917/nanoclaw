@@ -1252,6 +1252,29 @@ describe('buildMounts agent surfaces', async () => {
       const paths = mounts.map((m) => m.containerPath);
       expect(paths).not.toContain('/workspace/plugins/codex');
       expect(paths).toContain('/workspace/plugins/bootstrap');
+
+      // A REDUNDANT DESCENDANT is one entry, not two: `splitExcludedPlugins`
+      // drops a sub-path its ancestor already covers, and this walk reads that
+      // normalized set — the same one the mount denial above reads. So an
+      // absent descendant under an EXCLUDED repo does not refuse the spawn: the
+      // ancestor withholds the whole subtree, so that line withholds nothing
+      // whether or not it exists, and there is no fail-open for a typo to make.
+      const redundant = await build(['bootstrap', 'bootstrap/plugins/absent']);
+      expect(redundant.map((m) => m.containerPath)).not.toContain('/workspace/plugins/bootstrap');
+
+      // And the same absent descendant WITHOUT the covering ancestor still
+      // refuses, so this is a normalization change and not a relaxation.
+      await expect(build(['bootstrap/plugins/absent'])).rejects.toThrow(/do not exist under/);
+
+      // The other covering shape: the ancestor is itself a SUB-PATH.
+      // `splitExcludedPlugins` resolves that through its prefix loop, not
+      // through `topLevel`, so a regression that only honoured top-level
+      // coverage would pass the pair above and fail here.
+      const subAncestor = await build(['bootstrap/plugins', 'bootstrap/plugins/absent']);
+      expect(subAncestor.map((m) => m.containerPath)).toContain('/workspace/plugins/bootstrap');
+      // ...and when the sub-path ancestor itself is absent, nothing covers
+      // either entry and the spawn still refuses.
+      await expect(build(['bootstrap/absent', 'bootstrap/absent/deeper'])).rejects.toThrow(/do not exist under/);
     } finally {
       homedirSpy.mockRestore();
     }
