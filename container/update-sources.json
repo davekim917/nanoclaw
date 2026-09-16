@@ -17,7 +17,6 @@
     { "id": "opencode", "name": "OpenCode", "arg": "OPENCODE_VERSION", "source": { "kind": "npm", "package": "opencode-ai" } },
     { "id": "wix-cli", "name": "Wix CLI", "arg": "WIX_CLI_VERSION", "source": { "kind": "npm", "package": "@wix/cli" } },
     { "id": "dbt-mcp", "name": "dbt MCP", "arg": "DBT_MCP_VERSION", "source": { "kind": "pypi", "package": "dbt-mcp" } },
-    { "id": "slack-mcp", "name": "Slack MCP", "arg": "SLACK_MCP_VERSION", "source": { "kind": "github", "repo": "korotovsky/slack-mcp-server" } },
     { "id": "pip", "name": "pip", "arg": "PIP_VERSION", "source": { "kind": "pypi", "package": "pip" } },
     { "id": "setuptools", "name": "setuptools", "arg": "SETUPTOOLS_VERSION", "source": { "kind": "pypi", "package": "setuptools" } },
     { "id": "wheel", "name": "wheel", "arg": "WHEEL_VERSION", "source": { "kind": "pypi", "package": "wheel" } },

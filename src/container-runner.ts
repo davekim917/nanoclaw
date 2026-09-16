@@ -6915,8 +6915,9 @@ async function buildContainerArgs(
         : await getWorkgroupOnecliSecrets(agentGroup.id);
       const mergedSecrets = mergeWorkgroupAndGroupSecrets(workgroupSecrets, containerConfig.onecliSecrets);
 
-      // Slack user-token scoping — the credential-layer half of the Slack
-      // boundary (the MCP half is canUseSlackUserToken below). The OneCLI
+      // Slack user-token scoping — the whole Slack boundary: live Slack access
+      // is `curl https://slack.com/api/*` through the proxy, so whether the
+      // token is injected is the only control there is. The OneCLI
       // agent identity is per-GROUP, so all sessions of this group share one
       // secret set; we cannot strip Slack per-session on a single identity
       // without racing concurrent sessions. Instead, non-owner-safe sessions
@@ -6924,7 +6925,7 @@ async function buildContainerArgs(
       // session_mode; every channel stays per-thread) spawn under a SECOND
       // identity `<group>-noslack` whose secret set excludes the Slack user
       // token. The proxy then has no Slack token to inject for that container →
-      // both `curl slack.com/api/*` and the MCP fail closed. Owner-safe sessions
+      // `curl slack.com/api/*` fails closed. Owner-safe sessions
       // (owner DM or also_allowed_in) keep the
       // primary identity + full set. Only ONE extra identity per affected
       // group, so well clear of the gateway's list-pagination ceiling.
@@ -7382,81 +7383,6 @@ async function buildContainerArgs(
         hasHost: !!host,
         hasToken: !!token,
         hasProdEnvId: !!prodEnvId,
-      });
-    }
-  }
-  // Slack user-token (xoxp-) MCP — korotovsky/slack-mcp-server, baked into the
-  // image. Gated per-spawn: only registers if the session is the owner's 1:1
-  // DM with this agent (default) OR the session's messaging_group_id is in
-  // container.json's slack_user_token.also_allowed_in override list. Fail-
-  // closed by default so adding the agent to a team channel doesn't leak the
-  // owner's DMs through it.
-  //
-  // The token is xoxp- placeholder here; OneCLI gateway substitutes the real
-  // Bearer header for outbound slack.com calls based on the workgroup's
-  // assigned `Slack-User-Token-<Workspace>` vault secret. Gateway rules for
-  // slack.com hosts must be configured at the OneCLI side (see
-  // docs/slack-user-token.md).
-  //
-  // Proxy: korotovsky's HTTP client honors only SLACK_MCP_PROXY, not the
-  // standard HTTPS_PROXY. We can't compute the gateway URL here (it's
-  // injected by applyContainerConfig into the container's env, not the host
-  // process). The slack-mcp-wrapper.sh baked into the image copies the
-  // container's HTTPS_PROXY into SLACK_MCP_PROXY at startup — see
-  // container/slack-mcp-wrapper.sh.
-  // Resolve allowed-or-not BEFORE branching so the deny path runs even when
-  // the operator left slack_user_token unset/disabled. A static
-  // `slack-user-token` entry in container.json.mcpServers would otherwise
-  // sneak past — `delete` runs unconditionally on deny.
-  // (Codex P2 catch on PR #108 follow-up.)
-  let slackUserTokenAllowed = false;
-  if (containerConfig.slack_user_token?.enabled) {
-    const { canUseSlackUserToken } = await import('./modules/permissions/slack-user-token-gate.js');
-    slackUserTokenAllowed = await withCentralSync(
-      () =>
-        withRawDb((db) =>
-          canUseSlackUserToken(
-            db,
-            agentGroup.id,
-            slackSafetyMessagingGroupId ?? null,
-            containerConfig.slack_user_token,
-          ),
-        ),
-      'slack user-token gate',
-    );
-  }
-  if (slackUserTokenAllowed) {
-    mcpServers['slack-user-token'] = {
-      type: 'stdio',
-      command: 'slack-mcp-server',
-      // `--transport stdio` is REQUIRED by v1.3.0 — omitting it means the
-      // server starts without a transport and MCP init handshake fails.
-      args: ['--transport', 'stdio'],
-      env: {
-        SLACK_MCP_XOXP_TOKEN: 'xoxp-onecli-managed-placeholder',
-        // Caches default to `.users_cache.json` + `.channels_cache_v2.json`
-        // in the working directory. With --rm containers the cache vanishes
-        // per spawn, so the first call after spawn pays a one-time
-        // listing cost — acceptable for low-spawn frequency. If perf
-        // becomes a concern, mount a writable cache path and set
-        // SLACK_MCP_USERS_CACHE / SLACK_MCP_CHANNELS_CACHE to absolute
-        // paths there. Empty values fall through to the default — we do
-        // NOT set them.
-      },
-    };
-  } else {
-    // Strip any pre-declared `slack-user-token` entry that came from
-    // container.json.mcpServers (operator mistake, stale config, or copy-
-    // paste). The host-side env-var copy is the only one we control here;
-    // container-side enforcement is at container/agent-runner/src/index.ts
-    // via the SLACK_USER_TOKEN_RESERVED list. (Codex P2 catch on PR #108.)
-    delete mcpServers['slack-user-token'];
-    if (containerConfig.slack_user_token?.enabled) {
-      log.info('slack-user-token MCP gated off for this session', {
-        sessionMessagingGroupId: sessionMessagingGroupId ?? null,
-        slackSafetyMessagingGroupId: slackSafetyMessagingGroupId ?? null,
-        folder: agentGroup.folder,
-        reason: slackSafetyMessagingGroupId == null ? 'no_messaging_group' : 'not_owner_dm_and_not_in_allowlist',
       });
     }
   }

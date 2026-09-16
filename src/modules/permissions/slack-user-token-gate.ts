@@ -1,23 +1,25 @@
 import type { RawStatements } from '../../db/central-lease.js';
 
-import type { SlackUserTokenConfig } from '../../container-config.js';
-
 /**
- * Per-spawn permission gate for the Slack user-token MCP.
+ * Slack user-token owner-safety boundary.
  *
- * The agent's container.json sets `slack_user_token.enabled: true` to grant
- * the CAPABILITY at all. This function decides whether — for THIS session's
- * messaging context — the MCP should be registered in the per-spawn config.
+ * Live Slack access is `curl https://slack.com/api/<method>` through the
+ * OneCLI proxy, which injects the owner's user token (xoxp-) at the boundary.
+ * The token reads from the OWNER's Slack lens, so the host decides per spawn
+ * whether it is injected at all: a session that is not owner-safe spawns under
+ * the `<group>-noslack` OneCLI identity whose secret set excludes it (the
+ * two-tier identity in `src/container-runner.ts`, next to the
+ * `slackUserTokenSecrets` call). There is no second layer: a Slack MCP used to
+ * be registered behind this same predicate and was retired, so this function
+ * is the whole authorization decision.
  *
  * Fail-closed semantics:
- *   - Capability not enabled → never register
- *   - Session has no messaging_group (e.g., admin shell) → never register
- *   - Default: only register when the session is in a 1:1 DM AND a global
+ *   - Session has no messaging_group (e.g., admin shell) → not owner-safe
+ *   - Default: owner-safe only when the session is in a 1:1 DM AND a global
  *     OWNER has been recorded with a DM in the same WORKGROUP as the
- *     session's agent. The Slack MCP reads from the owner's lens; surfacing
- *     it in a shared channel (is_group=1) or in a workgroup where no owner
- *     has registered a DM would let teammates query the owner's Slack
- *     through the agent.
+ *     session's agent. Surfacing the token in a shared channel (is_group=1)
+ *     or in a workgroup where no owner has registered a DM would let
+ *     teammates query the owner's Slack through the agent.
  *   - Override: `also_allowed_in` is an operator-curated list of
  *     `messaging_group.id` values that bypass the default. Use for trusted
  *     private channels (e.g., a channel that's just the owner + a vetted
@@ -54,7 +56,7 @@ import type { SlackUserTokenConfig } from '../../container-config.js';
  *         authorize — even if a different human in a different workspace
  *         happens to have the same Slack user-id handle.
  *
- *   For Operator's install (the production bug that motivated this PR):
+ *   For Operator's install (the production bug that motivated this check):
  *     - example-assistant-codex session DM user: `slack-retail-codex:UOWNER` (handle UOWNER,
  *       workgroup `retail`).
  *     - Global owner: `slack-retail:UOWNER` (handle UOWNER) with user_dms
@@ -68,26 +70,11 @@ import type { SlackUserTokenConfig } from '../../container-config.js';
  *       user_dms is wired to workgroup `acme`. Workgroup mismatch → DENY.
  *     - No string parsing involved.
  *
- * The check is run at spawn time, not per-tool-call: if the gate denies, the
- * MCP server is never spawned for this session, so the in-container agent
- * cannot invoke its tools at all. That's safer than runtime per-call gating
- * (no risk of an LLM bypass, no per-call DB lookup hot path).
+ * The check runs at spawn time, not per call: if it denies, the proxy has no
+ * Slack token for that container, so no in-container code path — curl, a
+ * script, or any MCP an operator declares — can authenticate to Slack as the
+ * owner.
  */
-export function canUseSlackUserToken(
-  db: RawStatements,
-  agentGroupId: string,
-  sessionMessagingGroupId: string | null,
-  config: SlackUserTokenConfig | undefined,
-): boolean {
-  // The MCP-capability grant (`enabled`) AND the owner-safe context check
-  // must both hold. The owner-safe check is the same predicate that now
-  // also governs whether the Slack OneCLI secret is injected at the proxy
-  // layer (see isOwnerSafeSlackSession + container-runner two-tier identity),
-  // so the MCP and the curl floor share ONE boundary instead of the old
-  // split where the MCP was gated but the proxy token leaked everywhere.
-  if (!config?.enabled) return false;
-  return isOwnerSafeSlackSession(db, agentGroupId, sessionMessagingGroupId, config.also_allowed_in);
-}
 
 /**
  * Is this session a context where the OWNER's Slack may be read on the
@@ -95,14 +82,14 @@ export function canUseSlackUserToken(
  * non-owner human able to query through the agent?
  *
  * This is the single source of truth for Slack user-token authorization,
- * consumed by BOTH:
- *   - `canUseSlackUserToken` (whether the Slack user-token MCP is spawned), and
- *   - the spawn-time credential gate (whether the Slack OneCLI secret is
- *     injected into this session's OneCLI agent — the curl/proxy floor).
+ * consumed by the spawn-time credential gate (whether the Slack OneCLI secret
+ * is injected into this session's OneCLI agent) and by the capabilities
+ * snapshot, which tells the agent whether it has live Slack in this session.
  *
- * Independent of `slack_user_token.enabled`: a group may carry the Slack
- * OneCLI secret without enabling the MCP, and we still want the curl floor
- * scoped to owner-safe sessions only.
+ * Independent of `slack_user_token.enabled`, which no longer gates anything:
+ * the Slack secret being in the group's merged set is what makes this check
+ * run, and a group carrying it is scoped to owner-safe sessions regardless of
+ * that flag.
  *
  * Owner-safe iff EITHER:
  *   - `sessionMessagingGroupId` is in the operator-curated `also_allowed_in`

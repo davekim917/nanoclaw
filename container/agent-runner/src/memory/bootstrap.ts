@@ -31,6 +31,28 @@ function boundedStringArray(value: unknown): string[] {
     .filter((item): item is string => item !== undefined);
 }
 
+/**
+ * Evict one capability entry: the last one not marked `retainUnderBudget`,
+ * or the last outright once only retained ones remain. The host's
+ * `evictCapability` (src/modules/memory/pre-turn-context.ts) applies the same
+ * rule to the host-built bootstrap; this fallback must not drop an entry the
+ * host would have kept.
+ */
+function evictCapability(services: unknown[]): void {
+  for (let index = services.length - 1; index >= 0; index--) {
+    const service = services[index];
+    const retained =
+      !!service &&
+      typeof service === 'object' &&
+      (service as { retainUnderBudget?: unknown }).retainUnderBudget === true;
+    if (!retained) {
+      services.splice(index, 1);
+      return;
+    }
+  }
+  services.pop();
+}
+
 function readCapabilitiesFrom(filePath: string): {
   snapshot: CapabilitySnapshot;
   degraded?: string;
@@ -42,7 +64,9 @@ function readCapabilitiesFrom(filePath: string): {
     };
     const session = root.session;
     if (!session || !Array.isArray(session.services)) throw new Error('session capability snapshot is missing');
-    const services = session.services.slice(0, MAX_CAPABILITY_SERVICES).map((raw) => {
+    const selectedRaw = [...(session.services as unknown[])];
+    while (selectedRaw.length > MAX_CAPABILITY_SERVICES) evictCapability(selectedRaw);
+    const services = selectedRaw.map((raw) => {
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
       const service = raw as Record<string, unknown>;
       return {
@@ -56,6 +80,7 @@ function readCapabilitiesFrom(filePath: string): {
         credentialPaths: boundedStringArray(service.credentialPaths),
         ...(boundedString(service.activation) === undefined ? {} : { activation: boundedString(service.activation) }),
         ...(boundedString(service.useFor) === undefined ? {} : { useFor: boundedString(service.useFor) }),
+        ...(service.retainUnderBudget === true ? { retainUnderBudget: true } : {}),
       };
     });
     const snapshot = {
@@ -64,7 +89,7 @@ function readCapabilitiesFrom(filePath: string): {
     };
     let truncatedServices = session.services.length - services.length;
     while (JSON.stringify(snapshot).length > MAX_CAPABILITY_JSON_CHARS && snapshot.services.length > 0) {
-      snapshot.services.pop();
+      evictCapability(snapshot.services);
       truncatedServices++;
     }
     return { snapshot, ...(truncatedServices > 0 ? { truncatedServices } : {}) };
@@ -180,7 +205,5 @@ export function ensureFreshContextBootstrap(
   // provider SDK can dispatch it. Keep that token at byte zero even when a
   // cold-context bootstrap is needed; otherwise the bootstrap turns a native
   // command back into ordinary prompt text before the provider sees it.
-  return boundedPrompt.startsWith('/')
-    ? `${boundedPrompt}\n\n${bootstrap}`
-    : `${bootstrap}\n\n${boundedPrompt}`;
+  return boundedPrompt.startsWith('/') ? `${boundedPrompt}\n\n${bootstrap}` : `${bootstrap}\n\n${boundedPrompt}`;
 }

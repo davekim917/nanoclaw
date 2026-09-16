@@ -1043,40 +1043,34 @@ export interface ContainerConfig {
   workgroup_id?: string;
 
   /**
-   * Slack user-token (xoxp-) MCP capability. When enabled, the agent gets
-   * the korotovsky/slack-mcp-server MCP — letting it search/read DMs,
-   * channels, threads, and files from the OWNER'S Slack lens.
+   * Slack user-token (xoxp-) scoping. The token lives in the OneCLI vault and
+   * is injected at the proxy, so live Slack is `curl https://slack.com/api/*`
+   * from the container, reading from the OWNER'S Slack lens.
    *
-   * Fail-closed defaults: the capability is auto-scoped to the owner's
-   * 1:1 DM with this agent at runtime. Adding the agent to a shared
-   * channel does NOT grant teammates the ability to query through it
-   * unless the operator explicitly extends `also_allowed_in` with the
-   * channel's messaging_group_id.
+   * Fail-closed defaults: the token is injected only in the owner's 1:1 DM
+   * with this agent. A shared channel spawns under the `<group>-noslack`
+   * OneCLI identity with the token withheld, unless the operator explicitly
+   * extends `also_allowed_in` with the channel's messaging_group_id.
    *
    * The OneCLI vault must have a token entry for the agent's workspace
    * (e.g., `Slack-User-Token-Example Labs`) assigned via the workgroup's
-   * `onecli_secrets`. Without the token, the MCP refuses to register
-   * even when `enabled: true` and the gate would allow.
+   * `onecli_secrets`. See docs/slack-user-token.md.
    */
   slack_user_token?: SlackUserTokenConfig;
 }
 
-/**
- * Per-agent Slack user-token MCP capability. Wired into containers via the
- * korotovsky/slack-mcp-server binary. The actual token lives in OneCLI vault
- * and is injected at request time — never appears in this config.
- */
+/** Per-agent Slack user-token scoping. The token never appears in this config. */
 export interface SlackUserTokenConfig {
   /**
-   * Whether this agent has the Slack user-token MCP at all. When false or
-   * unset, the MCP is never registered for this agent. Default false.
+   * RETIRED, accepted and ignored: it registered the removed Slack MCP. No
+   * spawn or capability path reads it; sibling-parity still compares it.
    */
-  enabled: boolean;
+  enabled?: boolean;
 
   /**
-   * Override allow-list. By default the MCP is only registered when the
-   * spawning session is the owner's 1:1 DM with this agent. Add specific
-   * `messaging_group_id` values here to allow the capability in additional
+   * Override allow-list. By default the Slack user token is injected only
+   * when the spawning session is the owner's 1:1 DM with this agent. Add
+   * specific `messaging_group_id` values here to inject it in additional
    * contexts (e.g., a private channel that's just the owner + trusted
    * collaborators where it's OK to query the owner's lens).
    *
@@ -1088,11 +1082,10 @@ export interface SlackUserTokenConfig {
   /**
    * Names (or UUIDs) of the OneCLI secrets that back Slack user-token access
    * for this agent — the credentials that let it read the OWNER's Slack via
-   * the proxy (`curl https://slack.com/api/*`) or the MCP. In SHARED sessions
-   * (not owner-safe per `also_allowed_in` / owner-DM) these secrets are
-   * WITHHELD from the session's OneCLI agent, so neither curl nor the MCP can
-   * reach Slack — the boundary is enforced at the credential layer, not just
-   * the MCP registration.
+   * the proxy (`curl https://slack.com/api/*`). In SHARED sessions (not
+   * owner-safe per `also_allowed_in` / owner-DM) these secrets are WITHHELD
+   * from the session's OneCLI agent, so nothing in that container can reach
+   * Slack as the owner — the boundary is enforced at the credential layer.
    *
    * When unset, the host falls back to a naming convention: any merged
    * OneCLI secret whose name contains both "slack" and "user" (case-

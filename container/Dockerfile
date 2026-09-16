@@ -42,7 +42,6 @@ ARG CODEX_VERSION=0.154.0
 ARG OPENCODE_VERSION=1.18.31
 ARG WIX_CLI_VERSION=1.1.230
 ARG DBT_MCP_VERSION=1.22.1
-ARG SLACK_MCP_VERSION=1.3.0
 ARG PIP_VERSION=26.1.2
 ARG SETUPTOOLS_VERSION=83.0.0
 ARG WHEEL_VERSION=0.47.0
@@ -128,36 +127,6 @@ RUN python3 -m venv /opt/atlassian-venv \
     && /opt/atlassian-venv/bin/pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}" "setuptools==${SETUPTOOLS_VERSION}" "wheel==${WHEEL_VERSION}" \
     && /opt/atlassian-venv/bin/pip install --no-cache-dir "mcp-atlassian==${MCP_ATLASSIAN_VERSION}" \
     && ln -sf /opt/atlassian-venv/bin/mcp-atlassian /usr/local/bin/mcp-atlassian
-
-# korotovsky/slack-mcp-server — stdio MCP server for Slack user-token (xoxp-)
-# auth. Single Go-built binary (~16MB), published to GitHub Releases. Used by
-# agents whose container.json sets slack_user_token.enabled. Token injection
-# is at spawn time (SLACK_MCP_XOXP_TOKEN env via OneCLI vault), permission
-# gating is per-session in container-runner.ts.
-#
-# Installs to /usr/local/bin/slack-mcp-server.real; the on-disk
-# /usr/local/bin/slack-mcp-server is a thin wrapper (slack-mcp-wrapper.sh in
-# this directory) that copies HTTPS_PROXY → SLACK_MCP_PROXY at startup so
-# korotovsky's HTTP client (which honors only SLACK_MCP_PROXY, not
-# HTTPS_PROXY) routes outbound slack.com calls through the OneCLI gateway
-# for credential substitution.
-#
-# Path is relative to the Docker build context, which is `container/` (per
-# container/build.sh:55 — `docker build … .` after `cd "$SCRIPT_DIR"`). The
-# prior `container/slack-mcp-wrapper.sh` form double-nested and broke the
-# build because Docker resolves COPY paths relative to the context root.
-COPY --chmod=0755 slack-mcp-wrapper.sh /usr/local/bin/slack-mcp-server
-RUN ARCH=$(uname -m) \
-    && case "$ARCH" in \
-         x86_64)  SLACK_ARCH=amd64 ;; \
-         aarch64) SLACK_ARCH=arm64 ;; \
-         *)       echo "unsupported arch for slack-mcp-server: $ARCH" >&2; exit 1 ;; \
-       esac \
-    && curl -fsSL "https://github.com/korotovsky/slack-mcp-server/releases/download/v${SLACK_MCP_VERSION}/slack-mcp-server-linux-${SLACK_ARCH}" \
-       -o /usr/local/bin/slack-mcp-server.real \
-    && chmod 0755 /usr/local/bin/slack-mcp-server.real /usr/local/bin/slack-mcp-server \
-    && test -x /usr/local/bin/slack-mcp-server.real \
-    && test -x /usr/local/bin/slack-mcp-server
 
 # dbt-labs/dbt-mcp — stdio MCP server for dbt Cloud (Discovery + Semantic Layer
 # + Admin API + dbt CLI/LSP). Requires Python >=3.12; node:22-slim (bookworm)
@@ -514,7 +483,6 @@ RUN unreadable="$(find /opt/remotion \( -type f ! -readable -o -type d ! -execut
     && test -r /app/bun.lock \
     && test -r /app/puppeteer-config.json \
     && test -x /app/entrypoint.sh \
-    && test -x /usr/local/bin/slack-mcp-server \
     && test -x /usr/local/bin/hex-wrapper.sh \
     && test -x /opt/remotion/new-video.sh
 # The runtime cwd is /workspace/agent (agent-runner's CWD constant, passed to
