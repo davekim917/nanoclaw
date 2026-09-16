@@ -11,25 +11,42 @@
  * Mapping (mechanical, no semantic translation):
  *   frontmatter.name        → toml name
  *   frontmatter.description → toml description
+ *   frontmatter.effort      → toml model_reasoning_effort (omitted when absent)
  *   markdown body           → toml developer_instructions (multiline `"""…"""`)
  *
  * Every converted role inherits its parent's model. No name carries a
  * provider-specific model pin any more: the one that did (`worker-frontier`,
  * via `CODEX_WORKER_MODELS`) was deleted along with the bootstrap worker-policy
- * file it was rendered from. Delegation now picks a reasoning effort, not a
- * model — see the `effort` note below.
+ * file it was rendered from. Delegation picks a reasoning effort, not a model —
+ * hence the `effort` mapping above.
+ *
+ * Why `model_reasoning_effort` is the key, and why writing it is safe: a role
+ * file deserializes as `RawAgentRoleFileToml`, whose non-role fields are
+ * `#[serde(flatten)]`ed into `ConfigToml` (codex-rs 0.154.0
+ * `agent-roles/src/agent_role_config.rs:20-28`) — the same flatten that carries
+ * `developer_instructions`. `model_reasoning_effort: Option<ReasoningEffort>`
+ * is a top-level `ConfigToml` field (`config/src/config_toml.rs:371`), so it
+ * belongs at the top level of the role TOML, beside the keys we already write.
+ * That struct is `#[serde(deny_unknown_fields)]`, so a misspelled key would
+ * fail the WHOLE file to parse — which is why the name is cited rather than
+ * assumed. `ReasoningEffort`'s `FromStr` maps the nine known spellings
+ * (none/minimal/low/medium/high/xhigh/max/ultra/persistent) and turns any other
+ * non-empty string into `Custom(String)` rather than an error
+ * (`protocol/src/openai_models.rs:137-155`), so an unrecognised frontmatter
+ * effort degrades to a value Codex carries, not a file it rejects. The empty
+ * string is that impl's only hard error; `parseClaudeAgentMd` already folds a
+ * blank `effort:` to absent, and the emitter re-checks before writing.
+ *
+ * Without this key a role runs at the GLOBAL
+ * `[agents].default_subagent_reasoning_effort` (`src/providers/codex.ts`) — how
+ * all five `worker-{low,medium,high,xhigh,max}` shims came to run at `high`
+ * while each description, a routing signal Codex's orchestrator reads,
+ * advertised a different level. A native `spawn_agent`'s own `reasoning_effort`
+ * still overrides this per task.
  *
  * Dropped (no Codex equivalent or runtime-specific):
  *   frontmatter.model       — Claude model names differ, and `inherit` (what
  *                              the delegation shims carry) is not a Codex id
- *   frontmatter.effort      — parsed (the OpenCode converter carries it, see
- *                              opencode-agent-md.ts) but deliberately NOT
- *                              written here. Codex's global subagent default
- *                              is `[agents].default_subagent_reasoning_effort`
- *                              (src/providers/codex.ts) and a native spawn's
- *                              own `reasoning_effort` overrides it per task.
- *                              Wiring per-role `model_reasoning_effort` is a
- *                              separate change to every sibling's TOML roster.
  *   frontmatter.tools       — Claude tool-restriction model; Codex uses
  *                              mcp_servers / skills.config at a coarser level
  *   frontmatter.color       — Claude UI only
@@ -44,7 +61,8 @@ export interface ClaudeAgent {
   body: string;
   /**
    * The `effort:` frontmatter scalar when the source carries one, else
-   * undefined. Only the OpenCode converter writes it; see the module note.
+   * undefined. Both converters write it — `model_reasoning_effort` here,
+   * `options.reasoningEffort` in opencode-agent-md.ts.
    */
   effort?: string;
 }
@@ -193,9 +211,18 @@ export function formatCodexAgentToml(agent: ClaudeAgent): string {
     agent.description.includes('\n')
       ? `description = ${tomlMultilineString(agent.description)}`
       : `description = ${tomlBasicString(agent.description)}`,
-    `developer_instructions = ${tomlMultilineString(agent.body)}`,
-    '',
   ];
+  // Only when the source frontmatter actually carried one: a role already
+  // converted without `effort:` must keep running at Codex's global subagent
+  // default, not acquire a pin this sync invented. The `.trim()` guard makes an
+  // effort that is present-but-blank behave as absent for a caller that built
+  // the ClaudeAgent by hand rather than through `parseClaudeAgentMd` — an empty
+  // `model_reasoning_effort` is the one value `ReasoningEffort::from_str`
+  // rejects outright (see the module note), which would fail the whole file.
+  if (agent.effort?.trim()) {
+    lines.push(`model_reasoning_effort = ${tomlBasicString(agent.effort.trim())}`);
+  }
+  lines.push(`developer_instructions = ${tomlMultilineString(agent.body)}`, '');
   return lines.join('\n');
 }
 

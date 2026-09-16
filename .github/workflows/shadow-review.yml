@@ -194,17 +194,33 @@ jobs:
             mv "$RUNNER_TEMP/shadow-review.diff.trunc" "$RUNNER_TEMP/shadow-review.diff"
           fi
 
-      # The reviewer-eligibility tier rule (scripts/reviewer-models.ts, "generated
-      # from the tier config") says this reviewer must run worker-high's Claude
-      # model. Resolved from container/agents/worker-high.md's `model:` frontmatter
-      # (the same source the generator reads) rather than the flat
-      # reviewer-models.txt allowlist, which unions both tiers and both vendors and
-      # so cannot say which id is worker-high specifically. Read from the PR's BASE
-      # sha via the Contents API, never the merge commit that is about to be
-      # checked out: a PR could otherwise edit its own worker-high.md to pick which
-      # model reviews it — same contents-API-from-base pattern
-      # codex-review.sh's repo_mode() uses for labeler.yml.
-      - name: Resolve the worker-high reviewer model
+      # This reviewer runs the Claude frontier model — the same id
+      # container/skills/pr-review-loop/scripts/codex-review.sh gates review
+      # receipts on. Resolved from `FRONTIER_MODELS` in scripts/reviewer-models.ts
+      # (the roster), not from the generated
+      # container/skills/pr-review-loop/reviewer-models.txt allowlist: that file
+      # unions both vendors AND the prior-id receipt-compatibility tier
+      # (`COMPATIBLE_RECEIPT_MODELS`, reviewer-models.ts:45), so it cannot say
+      # which single id is the current Claude frontier one.
+      #
+      # This step used to read container/agents/worker-high.md's `model:`
+      # frontmatter and reimplement the generator's frontmatterOf() /
+      # extractScalar() in bash. Both ends of that are gone. The generator no
+      # longer derives anything — its ids are stated in the file, and its own
+      # docstring says why (reviewer-models.ts:8-15): delegation is now a set of
+      # effort shims carrying `model: inherit`, and an alias is exactly what
+      # `assertConcreteModelId` refuses, so no live agent file names a concrete
+      # frontier model any more. `container/agents/worker-high.md` did not exist
+      # on `main` even before #866 (main carried only worker-frontier.md), so this
+      # step has never resolved from `main`; #866 emptied the directory, so it
+      # never could.
+      #
+      # Read from the PR's BASE sha via the Contents API, never the merge commit
+      # that is about to be checked out: a PR could otherwise edit the roster in
+      # the same commit to pick which model reviews it — the same
+      # contents-API-from-base pattern codex-review.sh's repo_mode() uses for
+      # labeler.yml.
+      - name: Resolve the Claude reviewer model
         id: reviewer_model
         env:
           GH_TOKEN: ${{ github.token }}
@@ -212,76 +228,63 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
+          ROSTER="scripts/reviewer-models.ts"
           content=$(gh api -H 'Accept: application/vnd.github.raw+json' \
-            "repos/$REPO/contents/container/agents/worker-high.md?ref=$BASE_SHA")
+            "repos/$REPO/contents/$ROSTER?ref=$BASE_SHA")
 
-          # Normalize CRLF/lone-CR line endings the same way the generator's
-          # frontmatterOf() does, before anything else looks at line breaks.
+          # Normalize CRLF/lone-CR line endings before anything looks at line
+          # breaks.
           content=$(printf '%s' "$content" | tr -d '\r')
 
-          # Scope to the frontmatter block ONLY (between the first two `---`
-          # lines), and ONLY if a closing `---` is actually present. Buffered,
-          # not streamed: awk exiting mid-file on an unclosed frontmatter
-          # would otherwise have already printed every line up to EOF,
-          # including the body — so a body `model:` line would read as if it
-          # were in frontmatter. Mirrors scripts/reviewer-models.ts's
-          # frontmatterOf()/extractScalar(), reimplemented in bash since this
-          # step has no Node/tsx runtime.
-          frontmatter=$(printf '%s\n' "$content" | awk '
-            NR==1 && $0=="---" { infm=1; next }
-            infm && $0=="---" { closed=1; exit }
-            infm { buf = buf $0 "\n" }
-            END { if (closed) printf "%s", buf }
+          # The FRONTIER_MODELS array literal: its declaration line through the
+          # first line containing a `]`. A RANGE rather than a single-line
+          # match, so a reformat that wraps the array over several lines still
+          # resolves; buffered and `exit`ing at the closing bracket so no later
+          # array (COMPATIBLE_RECEIPT_MODELS in particular) can leak in. This
+          # step has no Node/tsx runtime, so the roster is read as text.
+          array=$(printf '%s\n' "$content" | awk '
+            !infm && /^(export[[:space:]]+)?const[[:space:]]+FRONTIER_MODELS[[:space:]]*(:[^=]*)?=/ { infm=1 }
+            infm { buf = buf $0 "\n"; if (index($0, "]")) { printf "%s", buf; exit } }
           ')
-
-          # `grep -m1` exits 1 on no match, and under pipefail that becomes
-          # the whole pipeline's exit status — `|| true` neutralizes that so a
-          # genuine no-match reaches the validation below instead of aborting
-          # silently before it (a prior version of this step had exactly that
-          # bug on the `-z "$model"` check).
-          raw=$(printf '%s\n' "$frontmatter" | grep -m1 -E '^model:[[:space:]]*' || true)
-          value="${raw#model:}"
-          while [ "${value#[[:space:]]}" != "$value" ]; do value="${value#[[:space:]]}"; done
-
-          # Folded block scalar (`model: |` then an indented line below) —
-          # take that first continuation line as the value.
-          if [ "$value" = '|' ] || [ "$value" = '|-' ] || [ "$value" = '|+' ] || [ "$value" = '>' ]; then
-            value=$(printf '%s\n' "$frontmatter" | awk '
-              found { if ($0 ~ /^[[:space:]]+/) { sub(/^[[:space:]]+/, ""); print; exit } else exit }
-              /^model:/ { found=1 }
-            ')
+          if [ -z "$array" ]; then
+            echo "could not find a FRONTIER_MODELS array literal in $ROSTER@$BASE_SHA" >&2
+            exit 1
           fi
 
-          # Trailing whitespace on the value — parity with the generator's own
-          # line-oriented handling, so "model: claude-opus-5[1m]  " (trailing
-          # spaces) resolves the same id here as it would there.
-          value=$(printf '%s' "$value" | sed -E 's/[[:space:]]+$//')
+          # Every quoted string inside that literal, one per line, unquoted.
+          # `grep` exits 1 on no match and pipefail would make that the whole
+          # pipeline's status, so each is `|| true`-guarded to let the
+          # count check below report the real problem instead of the step
+          # aborting silently before it.
+          ids=$(printf '%s' "$array" | grep -oE "'[^']*'|\"[^\"]*\"" | sed -E "s/^['\"]//; s/['\"]\$//" || true)
+          claude_ids=$(printf '%s\n' "$ids" | grep -E '^claude-' || true)
 
-          # Strip a wrapping quote pair, then a trailing [1m] context-window
-          # suffix (case-insensitive) — same normalization the generator does.
-          case "$value" in
-            \"*\") value="${value#\"}"; value="${value%\"}" ;;
-            \'*\') value="${value#\'}"; value="${value%\'}" ;;
-          esac
-          value="${value%\[1[Mm]\]}"
-          model="$value"
+          # Exactly one, or fail loudly. Zero means the roster moved or renamed
+          # its Claude id; more than one means the roster now carries a choice
+          # this step is not entitled to make silently.
+          count=$(printf '%s\n' "$claude_ids" | grep -c '^claude-' || true)
+          if [ "$count" -ne 1 ]; then
+            echo "expected exactly one claude-* id in FRONTIER_MODELS at $ROSTER@$BASE_SHA, found $count" >&2
+            exit 1
+          fi
+          model=$(printf '%s\n' "$claude_ids" | head -n 1)
 
           # Reject anything that isn't a bare model id, matching
-          # assertConcreteModelId's two checks in scripts/reviewer-models.ts:
-          # a bare alias with no digit ("opus", "sonnet", "inherit"), and any
-          # shape that isn't purely id characters (a trailing comment or extra
-          # words — extractScalar isn't a full YAML parser, so either reads
-          # back as part of the value) would otherwise silently name the wrong
-          # --model.
+          # assertConcreteModelId's two checks in scripts/reviewer-models.ts:73-82
+          # — a bare alias with no digit ("opus", "sonnet", "inherit"), and any
+          # shape that isn't purely id characters (a `[1m]` suffix, a trailing
+          # comment, extra words). The generator asserts both when it runs, but
+          # this reads the roster as TEXT at an arbitrary base sha, so it
+          # re-checks rather than trusting that the generator ran there.
           case "$model" in
             *[0-9]*) ;;
             *)
-              echo "could not resolve a valid worker-high model id from container/agents/worker-high.md@$BASE_SHA (no versioned 'model:' frontmatter scalar found)" >&2
+              echo "$model is not a concrete versioned model id (from FRONTIER_MODELS at $ROSTER@$BASE_SHA)" >&2
               exit 1
               ;;
           esac
           if ! printf '%s' "$model" | grep -qE '^[A-Za-z0-9._-]+$'; then
-            echo "could not resolve a valid worker-high model id from container/agents/worker-high.md@$BASE_SHA (no bare 'model:' frontmatter scalar found)" >&2
+            echo "$model is not a bare model id (from FRONTIER_MODELS at $ROSTER@$BASE_SHA)" >&2
             exit 1
           fi
           echo "model=$model" >> "$GITHUB_OUTPUT"
