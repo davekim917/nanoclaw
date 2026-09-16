@@ -286,7 +286,7 @@ untracked `mr-wiki-*` groups), host `settings.json` caps.
 **Decided 2026-09-14 (the operator deferred to WWBD recommendation): 5% headroom, one number both
 sides.** SDK snapshots `process.env` into the spawned CLI (`sdk.mjs:221`); a mid-turn wall is
 abort + full query replay (`claude.ts:2571–2591`), not a hot swap — so walling costs a turn
-replay, not a cache miss. 0.6: `SLOT_PICK_HEADROOM = 0.05` — pick highest `seven_day < 0.95`.
+replay, not a cache miss. 0.6: `SLOT_PICK_HEADROOM = 0.05` — pick highest `seven_day < 0.95` (removed 2026-09-16, #849: numbered order).
 0.7: `CODEX_PARK_USED_PERCENT = 95` (was 90 in the pre-objective plan text). Vetoed: ship
 as-is (spends the last 5% *and* re-spends the interrupted turn); hot-swap now (no one-line
 fix at the `sdk.mjs:221` seam — build only if measurement says walls persist). Retune at +7d:
