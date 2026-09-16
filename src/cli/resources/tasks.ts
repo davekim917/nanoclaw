@@ -684,14 +684,42 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
     update.scriptHost = scriptHost;
   }
   if (args.thread_anchor !== undefined) update.threadAnchor = bool(args.thread_anchor);
-  const model = str(args.model);
-  const effort = str(args.effort);
+  // `--model ""` CLEARS the per-fire pin, the same spelling `groups config
+  // update` uses for a group pin (groups.ts:521), plus this verb's own
+  // `"null"`/`"none"` clear words (`--script`, `--recurrence`). `str()` is
+  // wrong here for the reason `suppliedFlag` exists one way up: it collapses
+  // "absent" and "supplied empty" into `undefined`, and on THIS flag the empty
+  // string is the whole request. Until this landed there was no spelling at
+  // all — `--model ""` reported "nothing to update" and `--model null` came
+  // back "unknown model: null", so the only way off a pin was another pin.
+  const model = normalizeNullableString(args.model);
+  const effort = normalizeNullableString(args.effort);
   if (model !== undefined || effort !== undefined) {
+    // `--group` is required for a CLEAR too, not only for a set. A set needs it
+    // to resolve the provider vocabulary; a clear needs it for SCOPE, which is
+    // the separate reason and the one that bites harder. Series ids are unique
+    // within an agent group, not fleet-wide
+    // (`src/modules/scheduling/create.ts:67`, `src/session-manager.ts:428`),
+    // and an unscoped `tasks update --id X` falls back to every active session
+    // (`selectedSessions` below) — so an unscoped clear could silently unpin a
+    // same-named series in another group and report success. Exempting clears
+    // from the requirement (an earlier draft of this change) would have been a
+    // new way to touch a group the operator never named.
     const group = groupArg(args, ctx);
-    if (!group) throw new Error('--group is required to validate --model/--effort');
-    const { flagIntent, error: flagError } = await resolveTaskFlagIntent({ model, effort }, { agent_group_id: group });
-    if (flagError) throw new Error(flagError);
-    if (flagIntent && (flagIntent.turnModel || flagIntent.turnEffort)) update.flagIntent = flagIntent;
+    if (!group) throw new Error('--group is required to set or clear --model/--effort');
+    if (model || effort) {
+      const { flagIntent, error: flagError } = await resolveTaskFlagIntent(
+        { model: model ?? undefined, effort: effort ?? undefined },
+        { agent_group_id: group },
+      );
+      if (flagError) throw new Error(flagError);
+      if (flagIntent?.turnModel) update.flagIntent = { ...update.flagIntent, turnModel: flagIntent.turnModel };
+      if (flagIntent?.turnEffort) update.flagIntent = { ...update.flagIntent, turnEffort: flagIntent.turnEffort };
+    }
+    // Clears are applied AFTER the validated sets, and independently: a single
+    // call may clear one axis while setting the other.
+    if (model === null) update.flagIntent = { ...update.flagIntent, turnModel: null };
+    if (effort === null) update.flagIntent = { ...update.flagIntent, turnEffort: null };
   }
   // `wallClockUpdate` contributes exactly one key when it contributes any, so
   // the reported field list is the same for every session even though the
@@ -767,6 +795,37 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
         detail: {
           ...(sessionUpdate.recurrence !== undefined ? { recurrence: sessionUpdate.recurrence } : {}),
           ...(sessionUpdate.processAfter !== undefined ? { processAfter: sessionUpdate.processAfter } : {}),
+          // The pin, from and to. A CLEAR is the reason this is not optional:
+          // it is the one pin edit that destroys a value rather than replacing
+          // it, so without the `from` half neither the row nor the trail can
+          // say what the series used to be pinned to, and a clear run by
+          // mistake — `--model "$MODEL"` with MODEL unset arrives as `""` and
+          // now means "clear" — has no way back. `repin` already records
+          // `detail.repin.from/to`; the same pin change was audited through one
+          // verb and not the other.
+          ...(sessionUpdate.flagIntent !== undefined
+            ? {
+                pin: {
+                  from: before ? parseTaskPin(before.content) : null,
+                  // What `updateTask` will have MERGED, not the delta: an
+                  // untouched axis keeps its old value, and a null axis is gone.
+                  to: {
+                    model:
+                      sessionUpdate.flagIntent.turnModel === undefined
+                        ? before
+                          ? parseTaskPin(before.content).model
+                          : null
+                        : sessionUpdate.flagIntent.turnModel,
+                    effort:
+                      sessionUpdate.flagIntent.turnEffort === undefined
+                        ? before
+                          ? parseTaskPin(before.content).effort
+                          : null
+                        : sessionUpdate.flagIntent.turnEffort,
+                  },
+                },
+              }
+            : {}),
         },
       });
     }
@@ -1083,6 +1142,12 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
         '--session alone is already a complete scope.',
     );
   }
+  // Narrows the walk to ONE series inside the chosen scope. It is not itself a
+  // scope: the series id says nothing about which group owns it, so without
+  // --group/--session/--all the run would still fan out over every group on the
+  // host to find it. Requiring a scope alongside keeps that fan-out an explicit
+  // `--all`, the same bargain every other filter on this verb makes.
+  const seriesId = suppliedFlag(args, 'series_id', '--series-id');
   const targetProvider = suppliedFlag(args, 'target_provider', '--target-provider');
   // `--target-provider` describes ONE group's migration — it is the answer to
   // "what will this group's provider be after the switch". Applied fleet-wide
@@ -1128,6 +1193,21 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
 
   const candidates: RepinCandidate[] = [];
   const nearMisses: Array<{ session_id: string; series_id: string; model: string | null; effort: string | null }> = [];
+  // WHERE `--series-id` was seen, not merely whether. Two questions ride on it:
+  //
+  //   NOT SEEN AT ALL — a typo'd or out-of-scope id is otherwise
+  //     indistinguishable from "that series is not pinned to --from-model":
+  //     both report zero matches, and the operator reads the second as the
+  //     first and moves on.
+  //   SEEN IN MORE THAN ONE SESSION — series ids are NOT globally unique. A
+  //     named task's id is `<slug>-<4hex>` (`src/modules/scheduling/create.ts:67`),
+  //     so two groups that both run a task by the same name collide on a
+  //     1-in-65536 draw, and nothing anywhere prevents it — task-session lookup
+  //     scopes the id by agent group rather than assuming uniqueness
+  //     (`src/session-manager.ts:428`). Under `--all` a single `--series-id`
+  //     could therefore re-pin several series while the flag promised one.
+  //     Refused below, before any write, rather than silently repinning both.
+  const seriesSeenIn = new Set<string>();
 
   for (const session of await repinSessions(args, ctx)) {
     const rows =
@@ -1139,6 +1219,13 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
         })),
       )) ?? [];
     for (const row of rows) {
+      // A pure NARROWING filter, applied before matching: `--series-id` picks
+      // which series the --from-* filter is allowed to hit, it does not replace
+      // it. Repin's contract is "retarget an existing pin", and a run that
+      // skipped the from-check would be a blind overwrite of whatever that
+      // series currently carries — `tasks update --model` is the verb for that.
+      if (seriesId !== undefined && row.seriesId !== seriesId) continue;
+      if (seriesId !== undefined) seriesSeenIn.add(`${session.agent_group_id}/${session.id}`);
       const resolveModel = modelResolverFor(await currentProviderFor(session.agent_group_id));
       const modelHit = pinMatches(row.pin.model, fromModel, modelLiteral, resolveModel, matchResolved);
       const effortHit = pinMatches(row.pin.effort, fromEffort, effortIdentity, effortIdentity, matchResolved);
@@ -1170,6 +1257,24 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
         matchedVia: modelHit === 'resolved' || effortHit === 'resolved' ? 'resolved' : 'literal',
       });
     }
+  }
+
+  // Refuse rather than report an empty run: "no series with that id is in
+  // scope" and "that series is not pinned to --from-model" are different
+  // answers, and only one of them means the operator's command was wrong.
+  if (seriesId !== undefined && seriesSeenIn.size === 0) {
+    throw new Error(`no task series ${seriesId} in scope — check --series-id against \`ncl tasks list\``);
+  }
+  // An ambiguous id is refused, never resolved by picking one. `--series-id`
+  // promises ONE series; honouring it across several would rewrite pins the
+  // operator did not name, and choosing a winner silently is this file's
+  // documented defect class (see the CONTRADICTORY-INPUT REFUSALS block).
+  if (seriesId !== undefined && seriesSeenIn.size > 1) {
+    throw new Error(
+      `--series-id ${seriesId} is ambiguous: it names a series in ${seriesSeenIn.size} sessions ` +
+        `(${[...seriesSeenIn].sort().join(', ')}). Series ids are unique within an agent group, not across the ` +
+        'fleet — narrow the run with --group <id> or --session <id>.',
+    );
   }
 
   // Validate EVERY match before writing anything. The target is checked against
@@ -1608,12 +1713,14 @@ registerResource({
         {
           name: 'model',
           type: 'string',
-          description: "Per-fire model pin, validated against the agent group's provider vocabulary.",
+          description:
+            'Per-fire model pin, validated against the agent group\'s provider vocabulary. ""/"null"/"none" clears it, so the series falls back to the group\'s own model. Needs --group either way (auto-filled inside a container): series ids are unique within a group, not fleet-wide.',
         },
         {
           name: 'effort',
           type: 'string',
-          description: "Per-fire effort pin, validated against the agent group's provider vocabulary.",
+          description:
+            'Per-fire effort pin, validated against the agent group\'s provider vocabulary. ""/"null"/"none" clears it. Needs --group either way.',
         },
       ],
       handler: async (args, ctx) => updateTaskCommand(args, ctx),
@@ -1628,6 +1735,7 @@ registerResource({
       description:
         'Retarget per-fire model/effort pins in bulk (e.g. move everything pinned to one model onto its successor). OPERATOR-ONLY.\n\n' +
         'Matching is LITERAL: --from-model sonnet matches only pins stored as "sonnet", not "claude-sonnet-5". That is deliberate — the family alias tracks the install default across future bumps while the frozen id does not, so rewriting one is not the same act as rewriting the other. --match-resolved unifies them; either way the report lists near-misses (same resolved model, different literal pin) so a literal run never reads as exhaustive.\n\n' +
+        'Matching is also by VALUE, so several series in a group share a pin. --series-id narrows a run to one of them. To take a series OFF a pin entirely rather than onto another, use `ncl tasks update --model "" --effort ""`.\n\n' +
         "Every match is validated against its own group's provider BEFORE the first write, and one invalid target aborts the whole run — a half-applied bulk re-pin is worse than none. --skip-invalid applies the valid subset instead.\n\n" +
         'Re-pinning AHEAD of a provider migration needs --target-provider: pins are otherwise validated against the provider the group still has, which would reject every correct new value. That is the supported path out of a `groups config update --provider` refusal.\n\n' +
         'Always --dry-run first.',
@@ -1670,11 +1778,18 @@ registerResource({
         { name: 'group', type: 'string', description: 'Limit to one agent group id.' },
         { name: 'all', type: 'boolean', description: 'Run fleet-wide across every group (required without --group).' },
         { name: 'session', type: 'string', description: 'Limit to one task session id.' },
+        {
+          name: 'series_id',
+          type: 'string',
+          description:
+            'Limit to ONE series inside the chosen scope. Narrows the --from-* match, it does not replace it; still needs --group, --session or --all. Refuses if no such series is in scope, and refuses as ambiguous if the id names a series in more than one session (ids are unique within a group, not fleet-wide).',
+        },
       ],
       examples: [
         `# See what a model bump would touch, fleet-wide, before touching anything:\nncl tasks repin --all --from-model claude-opus-5[1m] --to-model claude-opus-5-1[1m] --dry-run`,
         `# Fix an effort pin the target provider does not have (claude/codex xhigh -> opencode high):\nncl tasks repin --group ag-123 --target-provider opencode --from-effort xhigh --to-effort high`,
         `# Clear the way for a codex -> claude migration, then run the switch:\nncl tasks repin --group ag-123 --target-provider claude --from-model gpt-6-astra --to-model claude-sonnet-5`,
+        `# Move ONE series off a pin several series share:\nncl tasks repin --group ag-123 --series-id task-abc --from-model sonnet --to-model opus --dry-run`,
       ],
       handler: async (args, ctx) => repinTasks(args, ctx),
     },
