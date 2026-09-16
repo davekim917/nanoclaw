@@ -15,6 +15,7 @@ import path from 'path';
 import { spawn, type ChildProcess } from 'child_process';
 import { createInterface, type Interface as ReadlineInterface } from 'readline';
 
+import { writeCodexConfigToml } from './codex-config-file.js';
 import {
   CODEX_RATE_LIMITS_READ_METHOD,
   type CodexRateLimitsReadResponse,
@@ -719,21 +720,14 @@ function stripExistingMcpServers(toml: string): string {
   return collapsed.join('\n').trimEnd();
 }
 
-export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>): void {
-  // Honor CODEX_HOME so a rotated home (OAuth fallback) gets its own regenerated
-  // config — otherwise the rotated app-server reads stale config from the wrong
-  // dir. CODEX_HOME == $HOME/.codex on initial spawn, so this is a no-op there. (codex #126)
-  const codexConfigDir = process.env.CODEX_HOME || path.join(process.env.HOME || '/home/node', '.codex');
-  fs.mkdirSync(codexConfigDir, { recursive: true });
-  const configTomlPath = path.join(codexConfigDir, 'config.toml');
-
-  let base = '';
-  try {
-    base = stripExistingMcpServers(fs.readFileSync(configTomlPath, 'utf-8'));
-  } catch {
-    base = '';
-  }
-
+/**
+ * Render the MCP half of a config.toml over an existing base.
+ *
+ * Split out from the write so the rendering is testable without a filesystem,
+ * and so the write itself is one call to the shared durable primitive.
+ */
+export function renderCodexMcpConfigToml(existing: string, servers: Record<string, CodexMcpServer>): string {
+  const base = stripExistingMcpServers(existing);
   const lines: string[] = base ? [base, '', MCP_MARKER, ''] : [];
   for (const [name, config] of Object.entries(servers)) {
     const tomlName = tomlKey(name);
@@ -765,8 +759,38 @@ export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>)
     }
     lines.push('');
   }
+  return lines.join('\n');
+}
 
-  fs.writeFileSync(configTomlPath, lines.join('\n'));
+/**
+ * Resolve the container's Codex config directory.
+ *
+ * Honors CODEX_HOME so a rotated home (OAuth fallback) gets its own regenerated
+ * config — otherwise the rotated app-server reads stale config from the wrong
+ * dir. CODEX_HOME == $HOME/.codex on initial spawn, so this is a no-op there.
+ * (codex #126)
+ */
+function resolveCodexConfigDir(): string {
+  return process.env.CODEX_HOME || path.join(process.env.HOME || '/home/node', '.codex');
+}
+
+/**
+ * Rewrite the MCP tables in the container's `config.toml`.
+ *
+ * THROWS when the existing file cannot be read or the new one cannot be
+ * committed, and that is the fix this function exists for. It used to read
+ * under `catch { base = '' }`: a config.toml that is unreadable but writable
+ * (mode `0200`) was read as empty and the file then TRUNCATED to MCP tables
+ * only — dropping the `[hooks.state.*]` trust rows and the `[plugins.*]` /
+ * `[marketplaces.*]` tables. This runs immediately BEFORE `writeCodexHooksAndTrust`
+ * on every spawn (`./codex.ts`), so it got there first: the trust writer's own
+ * read guard aborted that query, but the damage was already on disk, and the
+ * next query happily wrote valid trust rows over a base that had lost
+ * everything else. See `./codex-config-file.ts`.
+ */
+export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>): void {
+  const configTomlPath = path.join(resolveCodexConfigDir(), 'config.toml');
+  writeCodexConfigToml(configTomlPath, (existing) => renderCodexMcpConfigToml(existing, servers));
   log(`Wrote MCP config.toml (${Object.keys(servers).length} server(s))`);
 }
 
@@ -833,13 +857,19 @@ export function buildCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): {
  * rotation.
  */
 export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number; codexHome?: string }): string {
-  // Honor CODEX_HOME (see writeCodexMcpConfigToml): hooks.json is the destructive-
+  // Honor CODEX_HOME (see resolveCodexConfigDir): hooks.json is the destructive-
   // guard wiring, so a rotated fallback home MUST get the regenerated hooks or the
   // guard silently stops firing after an OAuth rotation. An explicit codexHome
   // lets peer-mode `codex exec` receive the same in-tree hook before CODEX_HOME
   // is switched to its synthesized runtime directory. (codex #126)
-  const codexConfigDir =
-    opts?.codexHome ?? process.env.CODEX_HOME ?? path.join(process.env.HOME || '/home/node', '.codex');
+  //
+  // Through the SAME resolver as the config writer, deliberately. This used to
+  // read `process.env.CODEX_HOME ?? …` while the config writer read
+  // `process.env.CODEX_HOME || …`, so `CODEX_HOME=""` sent config.toml to
+  // `$HOME/.codex` and hooks.json to the relative path `hooks.json` — trust
+  // entries keyed on a file the app-server would never load, which is this
+  // module's silent-inert failure reached through a typo in one env var.
+  const codexConfigDir = opts?.codexHome ?? resolveCodexConfigDir();
   fs.mkdirSync(codexConfigDir, { recursive: true });
   const hooksJsonPath = path.join(codexConfigDir, 'hooks.json');
   const hooks = buildCodexHooksJson(opts);

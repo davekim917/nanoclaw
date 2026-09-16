@@ -562,29 +562,61 @@ describe('readCodexConfigToml', () => {
     }
   });
 
-  it('is the only way this module reads a config.toml', () => {
+  it('is the only way ANY config.toml writer reads one, across all three modules', () => {
     // The pattern audit, not a grep done once by hand: the defect was
     // `existsSync(p) ? readFileSync(p) : ''` at the site that feeds every
     // OAuth fallback home, which `existsSync` answering false on EACCES turns
-    // into an empty projection over all of them. Reintroducing that shape at
-    // ANY site fails here.
-    const source = fs.readFileSync(new URL('./codex-companion-setup.ts', import.meta.url), 'utf-8');
-    const helperAt = source.indexOf('export function readCodexConfigToml');
+    // into an empty projection over all of them — and, separately,
+    // `catch { base = '' }` in the MCP writer, which turned an unreadable-but-
+    // writable config.toml into a file TRUNCATED to MCP tables. Reintroducing
+    // either shape in any of the three modules that touch a config.toml fails
+    // here; auditing only this file is what let the MCP writer keep its copy.
+    const owner = fs.readFileSync(new URL('./providers/codex-config-file.ts', import.meta.url), 'utf-8');
+    const helperAt = owner.indexOf('export function readCodexConfigToml');
     expect(helperAt).toBeGreaterThan(-1);
-    const helper = source.slice(helperAt, source.indexOf('\n}\n', helperAt));
-    const outsideHelper = source.slice(0, helperAt) + source.slice(helperAt + helper.length);
-
-    // Report the offending LINES, not the whole file — a 900-line diff in the
-    // failure message is a test nobody reads.
-    const offenders = outsideHelper
-      .split('\n')
-      .filter(
-        (line) => /existsSync\([^)]*[Cc]onfig[^)]*\)\s*\?/.test(line) || /readFileSync\([^)]*[Cc]onfigPath/.test(line),
-      )
-      .map((line) => line.trim());
-    expect(offenders).toEqual([]);
+    const helper = owner.slice(helperAt, owner.indexOf('\n}\n', helperAt));
     // …and the helper itself is still the three-answer one.
     expect(helper).toContain("code === 'ENOENT'");
+
+    const audited: Array<[string, string]> = [
+      ['codex-config-file.ts', owner.slice(0, helperAt) + owner.slice(helperAt + helper.length)],
+      ['codex-companion-setup.ts', fs.readFileSync(new URL('./codex-companion-setup.ts', import.meta.url), 'utf-8')],
+      [
+        'providers/codex-app-server.ts',
+        fs.readFileSync(new URL('./providers/codex-app-server.ts', import.meta.url), 'utf-8'),
+      ],
+    ];
+    // Report the offending LINES, not the whole file — a 900-line diff in the
+    // failure message is a test nobody reads.
+    const offenders: string[] = [];
+    for (const [name, source] of audited) {
+      for (const line of source.split('\n')) {
+        if (
+          /existsSync\([^)]*[Cc]onfig[^)]*\)\s*\?/.test(line) ||
+          /readFileSync\([^)]*[Cc]onfig(Path|TomlPath)/.test(line)
+        ) {
+          offenders.push(`${name}: ${line.trim()}`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('every in-tree config.toml commit goes through the durable writer', () => {
+    // The other half of the same class. A plain `writeFileSync(<configPath>, …)`
+    // truncates in place, so an ENOSPC after the open leaves the file empty or
+    // partial and the NEXT spawn reads the damage as its base. One writer
+    // keeping a plain write buys nothing for the others sharing the file.
+    for (const rel of ['./codex-companion-setup.ts', './providers/codex-app-server.ts']) {
+      const source = fs.readFileSync(new URL(rel, import.meta.url), 'utf-8');
+      const offenders = source
+        .split('\n')
+        .filter((line) =>
+          /writeFileSync\(\s*(configTomlPath|configPath|runtimeConfigPath|fallbackConfigPath)/.test(line),
+        )
+        .map((line) => `${rel}: ${line.trim()}`);
+      expect(offenders).toEqual([]);
+    }
   });
 });
 
@@ -605,15 +637,24 @@ describe('writeCodexHooksAndTrust', () => {
     // inert and silent. Every caller continues straight into a spawn, so the
     // failure has to reach them.
     //
-    // The directory stays WRITABLE and only config.toml is read-only, so
-    // hooks.json is written normally and the trust write is the one thing that
-    // fails. An unwritable directory would fail the hooks.json write first and
-    // this test would pass with the trust failure still swallowed — which is
-    // exactly what it did before the message assertion below was added.
+    // The directory stays WRITABLE and the commit is blocked at the temp file,
+    // so hooks.json is written normally and the trust write is the one thing
+    // that fails. An unwritable directory would fail the hooks.json write first
+    // and this test would pass with the trust failure still swallowed — which
+    // is exactly what it did before the message assertion below was added.
+    //
+    // A read-only config.toml is NOT the lever any more, and that is the
+    // durable writer working: it commits by rename, which the DIRECTORY's mode
+    // governs, so a 0400 config.toml is now correctly replaced rather than
+    // blocking the guard wiring. The lever is a leftover read-only
+    // `config.toml.tmp` — the shape a crashed write can leave behind — which
+    // makes the `open(…, 'w')` fail with EACCES.
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-trust-ro-'));
     const configPath = path.join(home, 'config.toml');
+    const tmpPath = `${configPath}.tmp`;
     fs.writeFileSync(configPath, '[features]\nhooks = true\n');
-    fs.chmodSync(configPath, 0o400);
+    fs.writeFileSync(tmpPath, 'leftover');
+    fs.chmodSync(tmpPath, 0o400);
     try {
       expect(() => writeCodexHooksAndTrust({ codexHome: home, pluginsRoot: path.join(home, 'no-plugins') })).toThrow(
         /hook trust/i,
@@ -621,9 +662,36 @@ describe('writeCodexHooksAndTrust', () => {
       // hooks.json really was written — so the throw is the trust write, not
       // an earlier step failing for an unrelated reason.
       expect(fs.existsSync(path.join(home, 'hooks.json'))).toBe(true);
+      // …and the last valid config is still standing, untouched.
+      expect(fs.readFileSync(configPath, 'utf-8')).toBe('[features]\nhooks = true\n');
+      // The failed commit cleaned up after itself: `unlink(2)` needs write on
+      // the DIRECTORY, so even the read-only temp file goes, and the next spawn
+      // is not blocked by the wreckage of this one.
+      expect(fs.existsSync(tmpPath)).toBe(false);
     } finally {
-      fs.chmodSync(configPath, 0o600);
       fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('REPLACES a read-only config.toml, because the commit is a rename the directory governs', () => {
+    // Pinned as a deliberate behavior change from the plain `writeFileSync`
+    // this replaced: a 0400 config.toml used to make the trust write fail and
+    // refuse the spawn, which is the safe answer but not the right one — the
+    // guard wiring should land. `rename(2)` needs write on the DIRECTORY, not
+    // on the target file.
+    const roHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hook-trust-ro-replaced-'));
+    const configPath = path.join(roHome, 'config.toml');
+    fs.writeFileSync(configPath, '[features]\nhooks = true\n');
+    fs.chmodSync(configPath, 0o400);
+    try {
+      writeCodexHooksAndTrust({ codexHome: roHome, pluginsRoot: path.join(roHome, 'no-plugins') });
+      const committed = fs.readFileSync(configPath, 'utf-8');
+      expect(committed).toContain('[features]');
+      expect(committed).toContain('[hooks.state.');
+      // No temp file left behind on the success path.
+      expect(fs.existsSync(`${configPath}.tmp`)).toBe(false);
+    } finally {
+      fs.rmSync(roHome, { recursive: true, force: true });
     }
   });
 

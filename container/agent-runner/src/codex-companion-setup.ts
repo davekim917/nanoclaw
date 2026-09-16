@@ -41,6 +41,11 @@ import path from 'path';
 import { loadExcludedPlugins } from './excluded-plugins.js';
 import { isExcludedPluginPath, type ExcludedPlugins } from './plugin-exclusions.js';
 import {
+  readCodexConfigToml,
+  writeCodexConfigToml,
+  writeCodexConfigTomlAsserting,
+} from './providers/codex-config-file.js';
+import {
   type AppServer,
   buildCodexHooksJson,
   listCodexHooks,
@@ -65,6 +70,13 @@ import {
 } from './plugin-skill-discovery.js';
 import type { McpServerConfig } from './providers/types.js';
 import { WORKER_POLICY_CODEX_EFFORT } from './worker-policy.vendored.js';
+
+/**
+ * Re-exported from its owning module so the historical import path keeps
+ * working; `providers/codex-config-file.ts` is where the three-answer read and
+ * the durable commit live, shared with `providers/codex-app-server.ts`.
+ */
+export { readCodexConfigToml };
 
 const HOST_CODEX_DIR = '/home/node/.codex';
 const RUNTIME_CODEX_DIR = '/home/node/.codex-runtime';
@@ -391,36 +403,6 @@ function pluginHookTrustEntries(pluginsRoot: string): CodexHookTrustEntry[] {
 }
 
 /**
- * Read a `config.toml`, keeping "it is not there" and "I could not look"
- * apart.
- *
- * Every caller here reads a config.toml only to REWRITE it from what it read,
- * so collapsing a read failure into `''` does not lose a read — it loses the
- * file. The base a rewrite starts from carries `[features] hooks = true`
- * (`CONTAINER_CODEX_CONFIG_BASE`, `providers/codex.ts`), without which codex
- * loads no hooks at all, plus the `[marketplaces.*]` / `[plugins.*]` tables
- * `codex plugin add` wrote. Rewriting from `''` therefore deletes the feature
- * flag that makes the guard chain exist, the write succeeds, and the spawn
- * continues — the same silent-inert end state this module exists to prevent,
- * reached from the read side instead of the write side. A file that is
- * unreadable but writable (mode `0200`, a mount that lost read access) is the
- * live shape.
- *
- * So ENOENT — and only ENOENT — is an empty base. Everything else throws, and
- * the caller decides.
- */
-export function readCodexConfigToml(configPath: string): string {
-  try {
-    return fs.readFileSync(configPath, 'utf-8');
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return '';
-    const detail = err instanceof Error ? err.message : String(err);
-    log(`FAILED to read ${configPath} — refusing to rewrite it from an empty base: ${detail}`);
-    throw new Error(`could not read Codex config at ${configPath}: ${detail}`);
-  }
-}
-
-/**
  * Trust entries for the hooks.json NanoClaw GENERATES into `codexHome` — the
  * PreToolUse/PostToolUse destructive-action guard chain, and nothing else.
  *
@@ -528,10 +510,18 @@ export function syncCodexHookTrust(
     ...generatedHookTrustEntries(codexHome, opts),
     ...pluginHookTrustEntries(opts?.pluginsRoot ?? CONTAINER_PLUGINS_DIR),
   ];
-  const existing = readCodexConfigToml(configPath);
   try {
     fs.mkdirSync(codexHome, { recursive: true });
-    fs.writeFileSync(configPath, mergeCodexHookTrustIntoToml(existing, entries));
+    // Asserting variant: the trust rows are the one table in this file that
+    // nothing else can restore, so the post-write check reads the COMMITTED
+    // bytes back and refuses if a row this call meant to write is not in them.
+    // Checking what was rendered instead would only prove the renderer agrees
+    // with itself — the same criticism `docs/review-notes/817.md` records.
+    writeCodexConfigTomlAsserting(
+      configPath,
+      (existing) => mergeCodexHookTrustIntoToml(existing, entries),
+      entries.map((entry) => `trusted_hash = "${entry.hash}"`),
+    );
   } catch (err) {
     // THROWS, deliberately. Swallowing here leaves hooks.json on disk with no
     // matching trust entry — precisely the state this module exists to
@@ -640,10 +630,14 @@ export function setupCodexRuntime(
   // `registerContainerCodexPlugins`. Containers must have zero dependency on
   // host CLI plugin state.
 
-  const mergedConfig = buildRuntimeConfig(mcpServers);
   const runtimeConfigPath = path.join(RUNTIME_CODEX_DIR, 'config.toml');
   try {
-    fs.writeFileSync(runtimeConfigPath, mergedConfig);
+    // Full regeneration — the peer-mode runtime config carries NOTHING from
+    // whatever was here before (see `buildRuntimeConfig`) — but still committed
+    // through the shared primitive, so an ENOSPC mid-write leaves the last
+    // valid runtime config standing instead of a truncated one that the next
+    // `codex plugin add` would then decorate and the spawn would believe.
+    writeCodexConfigToml(runtimeConfigPath, () => buildRuntimeConfig(mcpServers));
   } catch (err) {
     return failClosed('could not write the merged config.toml', err);
   }
@@ -763,8 +757,9 @@ export function setupCodexPrimaryRuntime(
       );
 
       const fallbackConfigPath = path.join(fallbackHome, 'config.toml');
-      const fallbackConfig = readCodexConfigToml(fallbackConfigPath);
-      fs.writeFileSync(fallbackConfigPath, projectCodexPluginConfig(basePrimaryConfig, fallbackConfig));
+      writeCodexConfigToml(fallbackConfigPath, (fallbackConfig) =>
+        projectCodexPluginConfig(basePrimaryConfig, fallbackConfig),
+      );
       // Trust entries are keyed on the home's OWN hooks.json path, so the
       // projection cannot carry the primary's — derive them for this home.
       syncCodexHookTrust(fallbackHome);
