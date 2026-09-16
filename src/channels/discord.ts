@@ -20,7 +20,7 @@
  * /deploy etc.
  */
 import { createDiscordAdapter } from '@chat-adapter/discord';
-import { Constants, MessageType, REST, Routes } from 'discord.js';
+import { Constants, MessageType, REST, RESTJSONErrorCodes, Routes } from 'discord.js';
 
 import { readEnvFileMatching } from '../env.js';
 import { log } from '../log.js';
@@ -724,6 +724,109 @@ export async function discordCreateThread(
   return { threadId: thread.id, messageId: firstMsg.id };
 }
 
+/** Discord caps thread names at 100 characters. */
+const DISCORD_THREAD_NAME_MAX = 100;
+
+/**
+ * Thread name for a thread opened under an existing bot post: the post's first
+ * non-empty line with Markdown punctuation stripped, capped at Discord's limit.
+ * Exported for unit testing.
+ */
+export function discordThreadNameFrom(content: string | undefined): string {
+  const line =
+    (content ?? '')
+      .split('\n')
+      .map((l) =>
+        l
+          .replace(/[*_~`#>|]/g, '')
+          .replace(/\s+/g, ' ')
+          .trim(),
+      )
+      .find((l) => l.length > 0) ?? '';
+  const points = Array.from(line);
+  if (points.length === 0) return 'Continued';
+  if (points.length <= DISCORD_THREAD_NAME_MAX) return line;
+  return (
+    points
+      .slice(0, DISCORD_THREAD_NAME_MAX - 1)
+      .join('')
+      .trimEnd() + '…'
+  );
+}
+
+/** REST surface `installMessageThreadAutoCreate` needs — narrow for tests. */
+export interface DiscordThreadRestClient {
+  get(route: `/${string}`): Promise<unknown>;
+  post(route: `/${string}`, options?: { body?: unknown }): Promise<unknown>;
+}
+
+function isDiscordUnknownChannelError(err: unknown): boolean {
+  // @chat-adapter/discord's discordFetch throws `Discord API error: <status> <body>`
+  // (dist/index.js discordFetch, `throw new NetworkError(... ${response.status} ${errorText})`).
+  const message = err instanceof Error ? err.message : String(err);
+  return /\b404\b/.test(message) && new RegExp(`"code":\\s*${RESTJSONErrorCodes.UnknownChannel}\\b`).test(message);
+}
+
+/**
+ * Make `discord:<guild>:<channel>:<messageId>` a postable thread target when
+ * no thread exists on that message yet.
+ *
+ * Slack threads on any message's ts, so NanoClaw anchors multi-message output
+ * as `<platformId>:<parentMessageId>` — delivery.ts's task/turn anchors and the
+ * bridge's `threadContinuationChunks`. Discord threads are channels that must be
+ * created from the message first; until then the adapter POSTs to
+ * `/channels/<messageId>/messages` and gets 404 Unknown Channel (10003), and
+ * every "reply" fell back to a new channel-root post. A thread created from a
+ * message shares that message's snowflake, so the encoded id stays valid once
+ * the thread exists.
+ *
+ * On exactly that 404, open a thread on the message (named from its first
+ * line) and retry the post once. A concurrent creator racing us returns
+ * 160004 ThreadAlreadyCreatedForMessage — the thread exists, so retry anyway.
+ * Any other creation failure (DMs have no threads, missing permission, the id
+ * is a deleted thread rather than a message) rethrows the ORIGINAL error, so
+ * callers keep their existing root-post fallbacks.
+ */
+export function installMessageThreadAutoCreate(
+  adapter: ReturnType<typeof createDiscordAdapter>,
+  rest: DiscordThreadRestClient,
+): void {
+  const target = adapter as unknown as {
+    postMessage: (threadId: string, message: unknown) => Promise<unknown>;
+  };
+  const original = target.postMessage.bind(adapter);
+  target.postMessage = async (threadId, message) => {
+    try {
+      return await original(threadId, message);
+    } catch (err) {
+      const [scheme, guildId, channelId, messageId] = threadId.split(':');
+      if (scheme !== 'discord' || guildId === '@me' || !channelId || !messageId) throw err;
+      if (!isDiscordUnknownChannelError(err)) throw err;
+      try {
+        let name = 'Continued';
+        try {
+          const parent = (await rest.get(Routes.channelMessage(channelId, messageId))) as { content?: string };
+          name = discordThreadNameFrom(parent.content);
+        } catch {
+          // Unreadable parent: the thread-create call below decides whether the id is usable.
+        }
+        await rest.post(Routes.threads(channelId, messageId), { body: { name } });
+        log.info('Discord thread opened under anchor message', { channelId, messageId });
+      } catch (createErr) {
+        if ((createErr as { code?: unknown }).code !== RESTJSONErrorCodes.ThreadAlreadyCreatedForMessage) {
+          log.warn('Discord thread auto-create failed', {
+            channelId,
+            messageId,
+            err: createErr instanceof Error ? createErr.message : String(createErr),
+          });
+          throw err;
+        }
+      }
+      return original(threadId, message);
+    }
+  };
+}
+
 export interface DiscordWorkspace {
   channelType: string;
   botToken: string;
@@ -811,6 +914,7 @@ for (const ws of workspaces) {
       // fire here. Mirrors the equivalent override in slack.ts.
       (discordAdapter as unknown as { name: string }).name = ws.channelType;
       const rest = new REST({ version: '10' }).setToken(ws.botToken);
+      installMessageThreadAutoCreate(discordAdapter, rest);
       const bridge = createChatSdkBridge({
         adapter: discordAdapter,
         concurrency: 'concurrent',
@@ -818,6 +922,10 @@ for (const ws of workspaces) {
         extractReplyContext,
         supportsThreads: true,
         maxTextLength: 1900,
+        // Oversize channel-level posts: continuation chunks reply in a thread on
+        // the first chunk (opened by installMessageThreadAutoCreate) instead of
+        // landing as additional channel parents.
+        threadContinuationChunks: true,
         channelType: ws.channelType,
         // Markdown delivery (not raw) keeps the chat-adapter's tableToAscii
         // conversion in play; without it, Markdown tables would render as raw

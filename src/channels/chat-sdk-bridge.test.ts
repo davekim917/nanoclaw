@@ -959,6 +959,28 @@ describe('createChatSdkBridge.deliver — status fresh-post truncation', () => {
     expect(id).toBe('ts-1');
   });
 
+  it('threadContinuationChunks: a continuation chunk that cannot thread falls back to channel level, not truncation', async () => {
+    const targets: string[] = [];
+    const adapter = stubAdapter({
+      postMessage: async (threadId: string) => {
+        targets.push(threadId);
+        if (threadId !== 'discord:g:c1') throw new Error('Missing Permissions');
+        return { id: `m-${targets.length}`, threadId, raw: {} };
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({
+      adapter,
+      supportsThreads: true,
+      maxTextLength: 30,
+      threadContinuationChunks: true,
+    });
+    const text = 'A'.repeat(30) + '\n' + 'B'.repeat(30) + '\n' + 'C'.repeat(30);
+    const id = await bridge.deliver('discord:g:c1', null, { kind: 'chat', content: { text } });
+    // Chunk 2 tries the thread once, then it and chunk 3 land at channel level.
+    expect(targets).toEqual(['discord:g:c1', 'discord:g:c1:m-1', 'discord:g:c1', 'discord:g:c1']);
+    expect(id).toBe('m-1');
+  });
+
   it('threadContinuationChunks: thread-targeted deliveries keep all chunks on the given thread', async () => {
     const targets: string[] = [];
     const adapter = stubAdapter({

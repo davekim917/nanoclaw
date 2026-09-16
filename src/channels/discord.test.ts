@@ -11,6 +11,9 @@ import {
   rewriteDiscordLinks,
   discordPostParent,
   discordCreateThread,
+  discordThreadNameFrom,
+  installMessageThreadAutoCreate,
+  type DiscordThreadRestClient,
   discoverDiscordRecoveryTargets,
   extractDiscordChannelId,
   unwrapForwardedSnapshot,
@@ -725,6 +728,88 @@ describe('discordCreateThread', () => {
     const route = postSpy.mock.calls[0][0] as string;
     expect(route).toContain('/channels/123456789000000002/messages/parent-msg/threads');
     expect(route).not.toContain('discord:');
+  });
+});
+
+describe('discordThreadNameFrom', () => {
+  it('uses the first non-empty line with Markdown punctuation stripped', () => {
+    expect(discordThreadNameFrom('\n🔴 **High — not transient.** One prod job down\nmore')).toBe(
+      '🔴 High — not transient. One prod job down',
+    );
+  });
+
+  it('caps at 100 characters and falls back when empty', () => {
+    const name = discordThreadNameFrom('x'.repeat(150));
+    expect(Array.from(name)).toHaveLength(100);
+    expect(name.endsWith('…')).toBe(true);
+    expect(discordThreadNameFrom('**  **')).toBe('Continued');
+    expect(discordThreadNameFrom(undefined)).toBe('Continued');
+  });
+});
+
+describe('installMessageThreadAutoCreate', () => {
+  const unknownChannel = () => new Error('Discord API error: 404 {"message": "Unknown Channel", "code": 10003}');
+  const anchor = 'discord:guild1:chan1:msg1';
+
+  function setup(
+    postMessage: ReturnType<typeof vi.fn>,
+    rest: { get: ReturnType<typeof vi.fn>; post: ReturnType<typeof vi.fn> },
+  ) {
+    const adapter = { postMessage } as unknown as Parameters<typeof installMessageThreadAutoCreate>[0];
+    installMessageThreadAutoCreate(adapter, rest as unknown as DiscordThreadRestClient);
+    return adapter as unknown as { postMessage: (t: string, m: unknown) => Promise<unknown> };
+  }
+
+  it('opens a thread on the anchor message after 404 Unknown Channel and retries the post once', async () => {
+    const postMessage = vi.fn().mockRejectedValueOnce(unknownChannel()).mockResolvedValueOnce({ id: 'reply-1' });
+    const rest = {
+      get: vi.fn().mockResolvedValue({ content: '**Daily dbt failure**\nbody' }),
+      post: vi.fn().mockResolvedValue({ id: 'msg1' }),
+    };
+    const adapter = setup(postMessage, rest);
+
+    await expect(adapter.postMessage(anchor, { markdown: 'part 2' })).resolves.toEqual({ id: 'reply-1' });
+    expect(rest.get.mock.calls[0][0]).toBe('/channels/chan1/messages/msg1');
+    expect(rest.post).toHaveBeenCalledWith('/channels/chan1/messages/msg1/threads', {
+      body: { name: 'Daily dbt failure' },
+    });
+    expect(postMessage).toHaveBeenCalledTimes(2);
+    expect(postMessage.mock.calls[1][0]).toBe(anchor);
+  });
+
+  it('treats 160004 (thread already created by a racing sender) as success', async () => {
+    const postMessage = vi.fn().mockRejectedValueOnce(unknownChannel()).mockResolvedValueOnce({ id: 'reply-1' });
+    const raced = Object.assign(new Error('A thread has already been created for this message'), { code: 160004 });
+    const rest = { get: vi.fn().mockResolvedValue({ content: 'x' }), post: vi.fn().mockRejectedValue(raced) };
+    const adapter = setup(postMessage, rest);
+
+    await expect(adapter.postMessage(anchor, {})).resolves.toEqual({ id: 'reply-1' });
+    expect(postMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('rethrows the ORIGINAL error when the thread cannot be created, so callers keep their root fallback', async () => {
+    const original = unknownChannel();
+    const postMessage = vi.fn().mockRejectedValue(original);
+    const denied = Object.assign(new Error('Missing Permissions'), { code: 50013 });
+    const rest = { get: vi.fn().mockResolvedValue({ content: 'x' }), post: vi.fn().mockRejectedValue(denied) };
+    const adapter = setup(postMessage, rest);
+
+    await expect(adapter.postMessage(anchor, {})).rejects.toBe(original);
+    expect(postMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves channel-root posts, DMs and unrelated errors untouched', async () => {
+    const rest = { get: vi.fn(), post: vi.fn() };
+    for (const [target, err] of [
+      ['discord:guild1:chan1', unknownChannel()],
+      ['discord:@me:dm1:msg1', unknownChannel()],
+      [anchor, new Error('Discord API error: 403 {"message": "Missing Access", "code": 50001}')],
+    ] as const) {
+      const adapter = setup(vi.fn().mockRejectedValue(err), rest);
+      await expect(adapter.postMessage(target, {})).rejects.toBe(err);
+    }
+    expect(rest.get).not.toHaveBeenCalled();
+    expect(rest.post).not.toHaveBeenCalled();
   });
 });
 

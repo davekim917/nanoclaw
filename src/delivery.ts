@@ -1509,10 +1509,10 @@ async function deliverMessage(
   } catch (err) {
     if (!usedAnchor) throw err;
     // Platforms disagree on whether a parent message is addressable as a thread.
-    // Slack threads on the parent's ts, so the encoded anchor works. Discord
-    // needs a real thread object to exist first — a thread started from a message
-    // shares its snowflake, but when none was created the encoded id resolves to
-    // nothing. Never let that cost the message: post at root instead.
+    // Slack threads on the parent's ts. Discord needs a thread object first; its
+    // adapter opens one on first use (installMessageThreadAutoCreate, discord.ts),
+    // which can still fail (DMs, missing permission). Never let that cost the
+    // message: post at root instead.
     //
     // Also record that anchoring is off for the REST OF THIS TURN (turn anchor)
     // or drop the stale anchor outright (task anchor — the next fire just

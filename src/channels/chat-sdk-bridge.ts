@@ -382,10 +382,12 @@ export interface ChatSdkBridgeConfig {
    * first chunk instead of posting them as additional channel parents. On
    * platforms with Slack-style threads, sibling parents read as unrelated
    * messages and repliers thread under the wrong one. Requires the adapter
-   * to accept `<platformId>:<messageId>` as a thread target (Slack does;
-   * Discord threads are separate channels, so leave this unset there).
-   * Thread-targeted deliveries are unaffected — their chunks already land
-   * in the same thread.
+   * to accept `<platformId>:<messageId>` as a thread target (Slack does
+   * natively; Discord does via `installMessageThreadAutoCreate` in discord.ts,
+   * which opens the thread on first use). If a continuation chunk can't be
+   * posted under that thread, the rest of the message falls back to channel
+   * level rather than being truncated. Thread-targeted deliveries are
+   * unaffected — their chunks already land in the same thread.
    */
   threadContinuationChunks?: boolean;
   /**
@@ -1540,6 +1542,21 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
                   retryAfterMs,
                 });
                 await sleep(retryAfterMs + RATE_LIMIT_BUFFER_MS);
+                continue;
+              }
+              // A continuation chunk that can't land under the first chunk's
+              // thread (no thread support in that context, missing permission)
+              // must not cost the rest of the message: drop back to the
+              // original target for this and every later chunk.
+              if (i > 0 && chunkTid !== tid) {
+                log.warn('chat-sdk-bridge: continuation chunk could not thread; posting at channel level', {
+                  chunkIndex: i,
+                  totalChunks: chunks.length,
+                  attemptedThreadId: chunkTid,
+                  err,
+                });
+                chunkTid = tid;
+                attempt = 0;
                 continue;
               }
               // Non-429 error or retries exhausted. First-chunk failures
