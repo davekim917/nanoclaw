@@ -574,6 +574,7 @@ written by the host) resolves the name to routing fields.
     text: string,    // message content (required)
     to?: string,     // destination name (e.g. "family", "worker-1").
                      // Optional when the agent has exactly one destination.
+    thread_key?: string, // stable incident/topic id — see "Keyed threads" below
   }
 }
 ```
@@ -582,7 +583,44 @@ Implementation: `resolveRouting(to)` looks up the destination. With no `to`, it 
 the session's own reply routing (`session_routing`); if the destination resolves to the same
 channel the session is bound to, the session's `thread_id` is preserved so the reply lands
 in-thread, otherwise `thread_id` is null. The tool then writes a `messages_out` row with
-`kind: 'chat'` and content `{ text }`, and returns the new `seq` as the message id.
+`kind: 'chat'` and content `{ text }` (`{ text, threadKey }` when a `thread_key` was given),
+and returns the new `seq` as the message id.
+
+##### Keyed threads
+
+`thread_key` names the incident or topic a post belongs to. The runner trims it and refuses
+anything over 128 characters or outside `[A-Za-z0-9._:-]` (first character alphanumeric);
+the host re-checks the same rule and delivers a row with a malformed key as if it had none.
+
+On the host (`deliverMessage`, `src/delivery.ts`), a row with a `threadKey` and no explicit
+`thread_id` looks the key up in `thread_key_anchors`, keyed by (agent group, resolved
+messaging group — so the adapter instance counts — key):
+
+- **Found** → post under `<platform_id>:<anchor message id>`, and bump `last_used_at`. No day
+  rotation, so an incident that spans midnight stays in one thread.
+- **Not found**, or unused for 30 days → post at root and record the returned message id
+  (for an oversize post, the bridge returns the first chunk's id). Recording also prunes
+  every key unused for 30 days.
+- **Threaded post fails** → post at root; the record is replaced by the new root, dropped if
+  the root post returned no id, and kept if the root post threw too.
+- Bookkeeping writes after a post has landed are logged on failure, never thrown, so a
+  database hiccup can't make delivery re-post the message.
+
+A keyed post takes precedence over both unkeyed anchors — the rolling per-session day anchor
+for task sessions (`task_thread_anchors`, rotated by `anchorRotationKey` in
+`src/db/task-thread-anchors.ts`, opt-out `ncl tasks … --thread-anchor false`) and the
+in-memory per-turn anchor — and neither reads nor writes them. Edits and reactions carrying a
+key (`edit_message`/`add_reaction` accept the same optional `thread_key`) follow the same rule as under the day anchor: the anchor message itself is addressed at
+root, anything else through the thread, and nothing is recorded. Keying on the agent group
+rather than the session means a task session closed by the spent-session GC and recreated
+keeps its open incidents. The archive stores every anchored post (keyed, day, or turn) under
+the thread it landed in, so `read_thread` finds it. Posts under one key are serialized
+in-process, so two sessions can't both open the same new key. Otherwise unkeyed rows behave
+as before.
+
+A watcher mints the key from something that changes when the incident does — e.g.
+`<job>-<first failing run of the current failure streak>`, so a recovery followed by a new
+failure naturally yields a new key and a new top-level post.
 
 #### send_file
 
@@ -596,6 +634,7 @@ Send a file to a named destination (same destination model as `send_message`).
     to?: string,           // destination name; optional if the agent has one destination
     text?: string,         // optional accompanying message
     filename?: string,     // display name (default: basename of path)
+    thread_key?: string,   // as send_message
   }
 }
 ```
@@ -605,7 +644,7 @@ Implementation:
 1. Resolve routing via `resolveRouting(to)` (as `send_message`)
 2. Generate a message ID and create `/workspace/outbox/{messageId}/`
 3. Copy the file into that outbox directory
-4. Write a `messages_out` row (`kind: 'chat'`) with content `{ text, files: [filename] }`
+4. Write a `messages_out` row (`kind: 'chat'`) with content `{ text, files: [filename] }` (plus `threadKey` when given)
 
 #### send_card
 

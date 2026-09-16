@@ -36,6 +36,7 @@ import { getTaskThreadAnchor, setTaskThreadAnchor } from './db/task-thread-ancho
 import { getRawDb } from './db/connection.js';
 import { createPendingApproval, getPendingApproval, getPendingQuestion } from './db/sessions.js';
 import {
+  _threadKeyLockWaitersForTest,
   clearSessionStatusOnKill,
   deliverSessionMessages,
   registerDeliveryAction,
@@ -1554,6 +1555,453 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     // The transient same-fire anchor must not turn into the task's rolling
     // day anchor; the next fire still starts a distinct campaign root.
     expect(await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toBeNull();
+  });
+});
+
+describe('keyed thread anchors (content.threadKey, migration 081)', () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  function grantChannelDestination(agentGroupId: string, messagingGroupId: string): void {
+    getRawDb()
+      .prepare(
+        `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
+         VALUES (?, 'main', 'channel', ?, ?)`,
+      )
+      .run(agentGroupId, messagingGroupId, now());
+  }
+
+  // Content shapes are the ones the runner's tools write
+  // (container/agent-runner/src/mcp-tools/core.ts): send_message → { text, threadKey },
+  // edit_message → { operation: 'edit', messageId, text, threadKey }.
+  function insertChat(
+    agentGroupId: string,
+    sessionId: string,
+    msgId: string,
+    content: Record<string, unknown>,
+    opts: { ts?: string; threadId?: string | null; inReplyTo?: string } = {},
+  ): void {
+    const db = new Database(outboundDbPath(agentGroupId, sessionId));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, in_reply_to, content)
+       VALUES (?, ?, 'chat', 'telegram:123', 'telegram', ?, ?, ?)`,
+    ).run(msgId, opts.ts ?? now(), opts.threadId ?? null, opts.inReplyTo ?? `fire-${msgId}`, JSON.stringify(content));
+    db.close();
+  }
+
+  function keyRows(): Array<{
+    agent_group_id: string;
+    messaging_group_id: string;
+    thread_key: string;
+    thread_platform_id: string;
+    created_at: string;
+    last_used_at: string;
+  }> {
+    return getRawDb()
+      .prepare(
+        'SELECT agent_group_id, messaging_group_id, thread_key, thread_platform_id, created_at, last_used_at FROM thread_key_anchors ORDER BY agent_group_id, messaging_group_id, thread_key',
+      )
+      .all() as never;
+  }
+
+  function seedKey(
+    agentGroupId: string,
+    threadKey: string,
+    threadPlatformId: string,
+    atIso: string,
+    messagingGroupId = 'mg-1',
+  ): void {
+    getRawDb()
+      .prepare(
+        `INSERT INTO thread_key_anchors
+           (agent_group_id, messaging_group_id, thread_key, thread_platform_id, created_at, last_used_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(agentGroupId, messagingGroupId, threadKey, threadPlatformId, atIso, atIso);
+  }
+
+  function recordingAdapter(opts: { failThreaded?: boolean } = {}): Array<{ threadId: string | null }> {
+    const calls: Array<{ threadId: string | null }> = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, threadId) {
+        calls.push({ threadId });
+        if (opts.failThreaded && threadId !== null) throw new Error('Unknown Channel');
+        return `plat-${calls.length}`;
+      },
+    });
+    return calls;
+  }
+
+  function deliveredIds(agentGroupId: string, sessionId: string): Set<string> {
+    const inDb = openInboundDbAt(inboundDbPath(agentGroupId, sessionId));
+    try {
+      return getDeliveredIds(inDb);
+    } finally {
+      inDb.close();
+    }
+  }
+
+  async function taskSession(series = 'series-1') {
+    await seedAgentAndChannel();
+    grantChannelDestination('ag-1', 'mg-1');
+    return (await resolveTaskSession('ag-1', series)).session;
+  }
+
+  it('first keyed post goes to root and records the key', async () => {
+    const session = await taskSession();
+    insertChat('ag-1', session.id, 'out-1', { text: 'job A failed', threadKey: 'job-a-run-1' });
+    const calls = recordingAdapter();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null }]);
+    expect(keyRows()).toEqual([
+      {
+        agent_group_id: 'ag-1',
+        messaging_group_id: 'mg-1',
+        thread_key: 'job-a-run-1',
+        thread_platform_id: 'plat-1',
+        created_at: expect.any(String),
+        last_used_at: expect.any(String),
+      },
+    ]);
+    // A keyed post is not the series' rolling day anchor.
+    expect(await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toBeNull();
+  });
+
+  it('a later post with the same key threads under the first, keeps the record, and bumps last_used_at', async () => {
+    const session = await taskSession();
+    const earlier = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    seedKey('ag-1', 'job-a-run-1', 'plat-root', earlier);
+    insertChat('ag-1', session.id, 'out-2', { text: 'still failing', threadKey: 'job-a-run-1' });
+    const calls = recordingAdapter();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: 'telegram:123:plat-root' }]);
+    const [row] = keyRows();
+    expect(row.thread_platform_id).toBe('plat-root');
+    expect(row.created_at).toBe(earlier);
+    expect(row.last_used_at > earlier).toBe(true);
+  });
+
+  it('archives a keyed follow-up under the thread it landed in, so read_thread finds it', async () => {
+    const session = await taskSession();
+    seedKey('ag-1', 'job-a-run-1', 'plat-root', now());
+    insertChat('ag-1', session.id, 'out-2', { text: 'still failing', threadKey: 'job-a-run-1' });
+    recordingAdapter();
+
+    await deliverSessionMessages(session);
+
+    const archive = new Database(`${TEST_DIR}/archive.db`, { readonly: true });
+    try {
+      expect(archive.prepare("SELECT thread_id FROM messages_archive WHERE id = 'out-2'").get()).toEqual({
+        thread_id: 'telegram:123:plat-root',
+      });
+    } finally {
+      archive.close();
+    }
+  });
+
+  it('a different key is a new top-level post, even the same day and with a live day anchor', async () => {
+    const session = await taskSession();
+    seedKey('ag-1', 'job-a-run-1', 'plat-root-a', now());
+    await setTaskThreadAnchor(session.id, 'telegram', 'telegram:123', 'plat-day', now());
+    insertChat('ag-1', session.id, 'out-1', { text: 'job B failed', threadKey: 'job-b-run-5' });
+    const calls = recordingAdapter();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null }]);
+    expect(keyRows().map((r) => [r.thread_key, r.thread_platform_id])).toEqual([
+      ['job-a-run-1', 'plat-root-a'],
+      ['job-b-run-5', 'plat-1'],
+    ]);
+    // The keyed post neither threaded under nor replaced the day anchor.
+    expect((await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123'))?.threadPlatformId).toBe('plat-day');
+  });
+
+  it('does not rotate at the day boundary: a key recorded days ago still threads', async () => {
+    const session = await taskSession();
+    seedKey('ag-1', 'job-a-run-1', 'plat-root', new Date(Date.now() - 3 * DAY_MS).toISOString());
+    insertChat('ag-1', session.id, 'out-1', { text: 'day 4, still red', threadKey: 'job-a-run-1' });
+    const calls = recordingAdapter();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: 'telegram:123:plat-root' }]);
+  });
+
+  it('is scoped per agent group: another group with the same key does not thread this one', async () => {
+    const session = await taskSession();
+    await createAgentGroup({ id: 'ag-2', name: 'Other', folder: 'other', agent_provider: null, created_at: now() });
+    seedKey('ag-2', 'job-a-run-1', 'plat-other-group', now());
+    insertChat('ag-1', session.id, 'out-1', { text: 'x', threadKey: 'job-a-run-1' });
+    const calls = recordingAdapter();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null }]);
+    expect(keyRows().map((r) => [r.agent_group_id, r.thread_platform_id])).toEqual([
+      ['ag-1', 'plat-1'],
+      ['ag-2', 'plat-other-group'],
+    ]);
+  });
+
+  it('is scoped per adapter instance: a second instance on the same conversation keeps its own parent', async () => {
+    await seedAgentAndChannel();
+    await createMessagingGroup({
+      id: 'mg-1b',
+      channel_type: 'telegram',
+      platform_id: 'telegram:123',
+      instance: 'telegram-second-bot',
+      name: 'Test Chat (second bot)',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    // Instance A (mg-1) already opened the key.
+    seedKey('ag-1', 'job-a-run-1', 'plat-instance-a', now(), 'mg-1');
+    // A session whose origin chat is instance B delivers through mg-1b (origin-first resolution).
+    const { session } = await resolveSession('ag-1', 'mg-1b', null, 'shared');
+    insertChat('ag-1', session.id, 'out-1', { text: 'x', threadKey: 'job-a-run-1' });
+    const calls: Array<{ threadId: string | null; instance?: string }> = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, threadId, _kind, _content, _files, instance) {
+        calls.push({ threadId, instance });
+        return 'plat-instance-b';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null, instance: 'telegram-second-bot' }]);
+    expect(keyRows().map((r) => [r.messaging_group_id, r.thread_platform_id])).toEqual([
+      ['mg-1', 'plat-instance-a'],
+      ['mg-1b', 'plat-instance-b'],
+    ]);
+  });
+
+  it('survives a recreated session: the key is held by the agent group, not the session', async () => {
+    const first = await taskSession('series-1');
+    insertChat('ag-1', first.id, 'out-1', { text: 'x', threadKey: 'job-a-run-1' });
+    recordingAdapter();
+    await deliverSessionMessages(first);
+
+    const second = (await resolveTaskSession('ag-1', 'series-2')).session;
+    insertChat('ag-1', second.id, 'out-2', { text: 'y', threadKey: 'job-a-run-1' });
+    const calls = recordingAdapter();
+    await deliverSessionMessages(second);
+
+    expect(calls).toEqual([{ threadId: 'telegram:123:plat-1' }]);
+  });
+
+  it('a failed threaded post falls back to root and replaces the record', async () => {
+    const session = await taskSession();
+    seedKey('ag-1', 'job-a-run-1', 'plat-deleted', now());
+    insertChat('ag-1', session.id, 'out-1', { text: 'x', threadKey: 'job-a-run-1' });
+    const calls = recordingAdapter({ failThreaded: true });
+    const warn = vi.spyOn(log, 'warn');
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: 'telegram:123:plat-deleted' }, { threadId: null }]);
+    expect(keyRows().map((r) => r.thread_platform_id)).toEqual(['plat-2']);
+    // Reported as a keyed fallback, not a day-anchor one: a keyed post is never task-anchor eligible.
+    expect(warn).toHaveBeenCalledWith(
+      'Threaded delivery under anchor failed — posting at root',
+      expect.objectContaining({ taskAnchor: false, threadKey: 'job-a-run-1' }),
+    );
+    warn.mockRestore();
+  });
+
+  it('a transient threaded failure whose root fallback also throws keeps the existing record', async () => {
+    const session = await taskSession();
+    seedKey('ag-1', 'job-a-run-1', 'plat-root', now());
+    insertChat('ag-1', session.id, 'out-1', { text: 'x', threadKey: 'job-a-run-1' });
+    const calls = recordingAdapter();
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, threadId) {
+        calls.push({ threadId });
+        throw new Error('network down');
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: 'telegram:123:plat-root' }, { threadId: null }]);
+    expect(keyRows().map((r) => r.thread_platform_id)).toEqual(['plat-root']);
+    expect(deliveredIds('ag-1', session.id).has('out-1')).toBe(false);
+  });
+
+  it('a failed threaded post whose root fallback returns no id leaves no dead record behind', async () => {
+    const session = await taskSession();
+    seedKey('ag-1', 'job-a-run-1', 'plat-deleted', now());
+    insertChat('ag-1', session.id, 'out-1', { text: 'x', threadKey: 'job-a-run-1' });
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, threadId) {
+        if (threadId !== null) throw new Error('Unknown Channel');
+        return undefined;
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(keyRows()).toEqual([]);
+  });
+
+  it('a bookkeeping write that fails after the post landed is logged, and the message is not re-posted', async () => {
+    const session = await taskSession();
+    getRawDb().exec(
+      "CREATE TRIGGER thread_key_anchors_refuse BEFORE INSERT ON thread_key_anchors BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    );
+    insertChat('ag-1', session.id, 'out-1', { text: 'x', threadKey: 'job-a-run-1' });
+    const calls = recordingAdapter();
+    const warn = vi.spyOn(log, 'warn');
+
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null }]);
+    expect(deliveredIds('ag-1', session.id).has('out-1')).toBe(true);
+    expect(warn).toHaveBeenCalledWith(
+      'Keyed thread anchor bookkeeping failed after delivery — the post stands',
+      expect.objectContaining({ id: 'out-1', threadKey: 'job-a-run-1' }),
+    );
+    warn.mockRestore();
+  });
+
+  it('edit_message rows: the keyed root is edited at root, an in-thread message via the key, nothing recorded', async () => {
+    const session = await taskSession();
+    seedKey('ag-1', 'job-a-run-1', 'plat-root', now());
+    const edit = (messageId: string) => ({ operation: 'edit', messageId, text: 'amended', threadKey: 'job-a-run-1' });
+    insertChat('ag-1', session.id, 'out-1', edit('plat-root'), { ts: '2026-08-10T09:00:00.000Z' });
+    insertChat('ag-1', session.id, 'out-2', edit('plat-in-thread'), { ts: '2026-08-10T09:00:01.000Z' });
+    const calls = recordingAdapter();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null }, { threadId: 'telegram:123:plat-root' }]);
+    expect(keyRows().map((r) => r.thread_platform_id)).toEqual(['plat-root']);
+  });
+
+  it('an explicit thread_id wins over a key: posted where addressed, anchor untouched', async () => {
+    const session = await taskSession();
+    const earlier = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    seedKey('ag-1', 'job-a-run-1', 'plat-root', earlier);
+    insertChat('ag-1', session.id, 'out-1', { text: 'x', threadKey: 'job-a-run-1' }, { threadId: 'thr-9' });
+    const calls = recordingAdapter();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: 'thr-9' }]);
+    expect(keyRows().map((r) => [r.thread_platform_id, r.last_used_at])).toEqual([['plat-root', earlier]]);
+  });
+
+  it('a malformed key is ignored and the row delivers exactly as an unkeyed one (day anchor)', async () => {
+    const session = await taskSession();
+    await setTaskThreadAnchor(session.id, 'telegram', 'telegram:123', 'plat-day', now());
+    insertChat('ag-1', session.id, 'out-1', { text: 'x', threadKey: 'has space' });
+    const calls = recordingAdapter();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: 'telegram:123:plat-day' }]);
+    expect(keyRows()).toEqual([]);
+  });
+
+  it('unkeyed task posts never touch thread_key_anchors', async () => {
+    const session = await taskSession();
+    insertChat('ag-1', session.id, 'out-1', { text: 'x' });
+    const calls = recordingAdapter();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null }]);
+    expect((await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123'))?.threadPlatformId).toBe('plat-1');
+    expect(keyRows()).toEqual([]);
+  });
+
+  it("a keyed root in an interactive turn does not become that turn's anchor", async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertChat(
+      'ag-1',
+      session.id,
+      'out-1',
+      { text: 'incident', threadKey: 'inc-1' },
+      {
+        ts: '2026-08-10T09:00:00.000Z',
+        inReplyTo: 'turn-A',
+      },
+    );
+    insertChat(
+      'ag-1',
+      session.id,
+      'out-2',
+      { text: 'unrelated' },
+      { ts: '2026-08-10T09:00:01.000Z', inReplyTo: 'turn-A' },
+    );
+    const calls = recordingAdapter();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null }, { threadId: null }]);
+  });
+
+  it('a key unused past the retention window is a new incident, and recording prunes stale keys', async () => {
+    const session = await taskSession();
+    seedKey('ag-1', 'job-a-run-1', 'plat-ancient', new Date(Date.now() - 31 * DAY_MS).toISOString());
+    seedKey('ag-1', 'job-z-stale', 'plat-stale', new Date(Date.now() - 31 * DAY_MS).toISOString());
+    const recent = new Date(Date.now() - 29 * DAY_MS).toISOString();
+    seedKey('ag-1', 'job-y-recent', 'plat-recent', recent);
+    insertChat('ag-1', session.id, 'out-1', { text: 'x', threadKey: 'job-a-run-1' });
+    const calls = recordingAdapter();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null }]);
+    expect(keyRows().map((r) => [r.thread_key, r.thread_platform_id])).toEqual([
+      ['job-a-run-1', 'plat-1'],
+      ['job-y-recent', 'plat-recent'],
+    ]);
+  });
+
+  it('two sessions of one group posting the same new key concurrently make exactly one root', async () => {
+    const a = await taskSession('series-1');
+    const b = (await resolveTaskSession('ag-1', 'series-2')).session;
+    insertChat('ag-1', a.id, 'out-a', { text: 'a', threadKey: 'job-a-run-1' });
+    insertChat('ag-1', b.id, 'out-b', { text: 'b', threadKey: 'job-a-run-1' });
+    const calls: Array<{ threadId: string | null }> = [];
+    let releaseFirst!: () => void;
+    const firstHeld = new Promise<void>((resolve) => (releaseFirst = resolve));
+    let firstEntered!: () => void;
+    const firstStarted = new Promise<void>((resolve) => (firstEntered = resolve));
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, threadId) {
+        calls.push({ threadId });
+        if (calls.length === 1) {
+          firstEntered();
+          await firstHeld;
+        }
+        return `plat-${calls.length}`;
+      },
+    });
+
+    const drains = Promise.all([deliverSessionMessages(a), deliverSessionMessages(b)]);
+    await firstStarted;
+    // Release the first post only once the other session is observably queued on
+    // the key's lock. A timeout fails loudly instead of falling through to a pass.
+    const deadline = Date.now() + 5_000;
+    while (_threadKeyLockWaitersForTest() !== 1) {
+      if (Date.now() > deadline) throw new Error('second session never queued on the thread-key lock');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(calls).toHaveLength(1);
+    releaseFirst();
+    await drains;
+
+    expect(calls).toEqual([{ threadId: null }, { threadId: 'telegram:123:plat-1' }]);
+    expect(keyRows().map((r) => r.thread_platform_id)).toEqual(['plat-1']);
   });
 });
 
