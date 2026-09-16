@@ -259,6 +259,33 @@ describe('buildSessionServicesSnapshot', () => {
       expect(slack?.useFor).toContain('p1789080120758779');
       expect(slack?.useFor).toContain('1789080120.758779');
       expect(slack?.useFor).not.toMatch(/mcp__slack|user-token MCP|MCP \(if loaded\)/);
+      // Posting needs an optional scope; the entry must not promise it unconditionally.
+      expect(slack?.useFor).toContain('chat:write');
+    });
+
+    it('owner-safe: the permalink recipe survives the runner fallback’s per-string clip', async () => {
+      // The runner's fresh-context bootstrap keeps only the first
+      // MAX_CAPABILITY_STRING_CHARS (600) minus its marker of every string
+      // (container/agent-runner/src/memory/bootstrap.ts:8, :13, :20-24). The
+      // host bound is 2,500, so the operative recipe has to be authored first.
+      const ag = await slackGroup({ secret: true });
+      const slack = await slackEntry(ag.id, OWNER_SAFE_MG);
+      const kept = slack!.useFor!.slice(0, 600 - '[truncated:fresh-context-bootstrap]'.length);
+
+      expect(kept).toContain('curl https://slack.com/api/<method>');
+      expect(kept).toContain('NO auth header');
+      expect(kept).toContain('1789080120.758779');
+      expect(kept).toContain('conversations.replies?channel=C0123&ts=');
+    });
+
+    it('owner-safe: the files.slack.com fix does not rely on the naming convention alone', async () => {
+      // An explicit onecli_secret_names list is authoritative
+      // (src/onecli-secrets.ts:589-592), so "name it slack+user" would leave an
+      // unlisted file credential injected in shared channels.
+      const ag = await slackGroup({ secret: true });
+      const slack = await slackEntry(ag.id, OWNER_SAFE_MG);
+      expect(slack?.useFor).toContain('files.slack.com');
+      expect(slack?.useFor).not.toContain('with `slack` and `user` in its name');
     });
 
     it('non-owner-safe: keeps the WITHHELD text and drops the MCP mention', async () => {

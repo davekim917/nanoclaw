@@ -58,7 +58,7 @@ In the OneCLI UI:
 2. **Auth method**: `Bearer` header.
 3. Same for `Slack-User-Token-ExampleRetail`.
 
-File bytes (`url_private`) live on `files.slack.com`, which the gateway matches separately. To let the agent download attachments, add a second vault entry with the same token, host `files.slack.com`, path `*`, and `slack` and `user` in its name so it is withheld in the same sessions.
+File bytes (`url_private`) live on `files.slack.com`, which the gateway matches separately. To let the agent download attachments, add a second vault entry with the same token, host `files.slack.com`, path `*`, and make sure it is withheld in the same sessions: give it `slack` and `user` in its name, **and if the group sets `slack_user_token.onecli_secret_names`, add this entry's name to that list too** — a non-empty list is authoritative and the naming convention is not consulted (`slackUserTokenSecrets`, `src/onecli-secrets.ts:589-592`), so an unlisted file credential would be injected into shared-channel sessions.
 
 ### 4. Assign secrets to workgroups
 
@@ -86,7 +86,9 @@ The script validates the name against OneCLI vault before writing, fail-closed o
   "slack_user_token": {
     // optional: extra owner-safe contexts
     "also_allowed_in": ["mg-channel-eng-leads-private"],
-    // optional: name the withheld secrets instead of relying on the convention
+    // optional: name the withheld secrets instead of relying on the convention.
+    // Authoritative when set — list EVERY Slack user-token entry, including a
+    // files.slack.com one, or the unlisted one is injected in shared channels.
     "onecli_secret_names": ["Slack-User-Token-ExampleRetail"]
   }
 }
@@ -113,7 +115,7 @@ Add the id to `also_allowed_in`. `also_allowed_in` holds exact messaging-group i
 - Identity: `curl https://slack.com/api/auth.test`
 - A permalink `https://<ws>.slack.com/archives/C0123/p1789080120758779` is channel `C0123`, ts `1789080120.758779` (a dot before the last six digits); a `thread_ts` query parameter names the thread parent. Read it with `conversations.replies?channel=C0123&ts=<thread_ts, else that ts>`.
 - `conversations.history`, `search.messages`, `users.info`, `conversations.list` for everything else.
-- `chat.postMessage` (POST JSON with `channel`, `text`, optional `thread_ts`) posts **as you**, so the agent is told to use it only when asked.
+- `chat.postMessage` (POST JSON with `channel`, `text`, optional `thread_ts`) posts **as you**, so the agent is told to use it only when asked. It needs the optional `chat:write` scope; a token minted without it answers `missing_scope`, and the agent is told to report that rather than retry.
 
 ## Smoke test
 
