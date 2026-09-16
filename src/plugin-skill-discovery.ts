@@ -43,6 +43,69 @@ export interface DiscoveredSkill {
   skillDir: string;
   /** Plugin folder it came from */
   plugin: string;
+  /**
+   * Absolute path to the repository root that must CONTAIN every byte this
+   * skill contributes to a mirror. The mirror is copied into an agent
+   * container, so the host reading a path the plugin chose is the host moving
+   * whatever that path resolves to across the host→container boundary. A
+   * plugin's code being trusted to RUN in the container is a different
+   * permission (the reasoning `readRulesetFile` carries in
+   * `src/claude-md-compose.ts`). Producers set it to the directory they walked;
+   * `syncSkillSymlinks` refuses anything resolving outside it.
+   */
+  pluginRoot: string;
+}
+
+/**
+ * `fs.realpathSync`, or null when the path does not resolve (missing, dangling
+ * symlink, permission). Callers treat null as "refuse", never as "allow".
+ */
+export function resolveRealPath(target: string): string | null {
+  try {
+    return fs.realpathSync(target);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Is an already-resolved path inside an already-resolved root?
+ *
+ * Both sides must come from `realpathSync`, and the boundary is a separator so
+ * a sibling directory named `<root>-evil` cannot prefix-match. Same shape as
+ * the containment in `readRulesetFile` (`src/claude-md-compose.ts`).
+ */
+export function isWithinResolvedRoot(resolved: string, resolvedRoot: string): boolean {
+  return resolved === resolvedRoot || resolved.startsWith(resolvedRoot + path.sep);
+}
+
+/**
+ * The resolved repository roots a mirror built from `pluginsRoot` may point
+ * into: one per plugin directory, each `realpath`-resolved so an ordinarily
+ * symlinked `~/plugins/<name>` (a dev checkout living elsewhere) keeps working.
+ *
+ * Resolving per plugin rather than taking `realpath(pluginsRoot)` as one root is
+ * what makes that dev-checkout case work; the cost is that a plugin root which
+ * is ITSELF a symlink to somewhere broad widens its own boundary. Placing that
+ * link is a write to `~/plugins`, i.e. an operator act with the same authority
+ * as installing the plugin — the input this contains is what a repository holds,
+ * not what the operator mounted.
+ */
+export function resolvePluginRoots(pluginsRoot: string): string[] {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(pluginsRoot);
+  } catch {
+    return [];
+  }
+  const roots: string[] = [];
+  for (const entry of entries) {
+    const resolved = resolveRealPath(path.join(pluginsRoot, entry));
+    if (resolved === null) continue;
+    if (!isDirectory(resolved)) continue;
+    roots.push(resolved);
+  }
+  return roots;
 }
 
 /**
@@ -287,7 +350,7 @@ function discoverInPlugin(
     const fmName = readPluginName(skillDir);
     const name = fmName ?? path.basename(skillDir);
     if (skills.has(name)) return; // first match wins (preference order)
-    skills.set(name, { name, skillDir, plugin: pluginName });
+    skills.set(name, { name, skillDir, plugin: pluginName, pluginRoot: pluginDir });
   };
 
   // 1. .agents/skills/<name>/
@@ -492,6 +555,22 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
  *   - `removed`:   stale managed mirror dir deleted
  *   - `skipped`:   would have written but a real non-managed entry already
  *                  exists (deferring to it)
+ *   - `refused`:   a skill (or one child of one) resolving outside its own
+ *                  `pluginRoot` — see the containment note below
+ *
+ * CONTAINMENT. Every path this mirrors is one a plugin chose, and the mirror is
+ * copied into an agent container (`copyOpenCodeSkills`, `src/providers/opencode.ts`),
+ * so a link out of the repository makes the HOST read host-only state and hand
+ * the bytes over. `SKILL.md` is COPIED rather than linked, so that read happens
+ * here, at sync time, and no filter downstream can see it any more. So each
+ * skill directory and each of its children is resolved and required to stay
+ * inside the skill's own `pluginRoot`; a link that stays in the repository still
+ * mirrors. Refusals are returned rather than logged because this file is
+ * maintained as a byte-for-byte-logic twin of the container's copy, which has a
+ * different logger; the callers log.
+ *
+ * A refused name is treated as NOT desired, so a mirror dir created before the
+ * escape was planted is pruned by the cleanup pass rather than left behind.
  *
  * Idempotent.
  */
@@ -503,15 +582,29 @@ export function syncSkillSymlinks(
   removed: string[];
   unchanged: string[];
   skipped: string[];
+  refused: string[];
 } {
   fs.mkdirSync(dst, { recursive: true });
-
-  const desired = new Map(skills.map((s) => [s.name, s.skillDir] as const));
 
   const created: string[] = [];
   const removed: string[] = [];
   const unchanged: string[] = [];
   const skipped: string[] = [];
+  const refused: string[] = [];
+
+  // Resolve containment BEFORE anything is written, so a refused name is absent
+  // from `desired` and the cleanup pass below prunes any dir a previous run made
+  // for it.
+  const desired = new Map<string, { skillDir: string; resolvedRoot: string }>();
+  for (const skill of skills) {
+    const resolvedRoot = resolveRealPath(skill.pluginRoot);
+    const resolvedSkillDir = resolveRealPath(skill.skillDir);
+    if (resolvedRoot === null || resolvedSkillDir === null || !isWithinResolvedRoot(resolvedSkillDir, resolvedRoot)) {
+      refused.push(skill.name);
+      continue;
+    }
+    desired.set(skill.name, { skillDir: skill.skillDir, resolvedRoot });
+  }
 
   // ── Cleanup pass: drop managed mirror dirs whose name is no longer
   // desired. A managed mirror dir is a real dir whose entries are all
@@ -544,7 +637,7 @@ export function syncSkillSymlinks(
 
   // ── Sync pass: ensure each desired skill is a real dir whose children
   // are symlinks to the corresponding source entries.
-  for (const [name, srcDir] of desired) {
+  for (const [name, { skillDir: srcDir, resolvedRoot }] of desired) {
     const skillDirAtDst = path.join(dst, name);
 
     let dstStat: fs.Stats | null = null;
@@ -572,7 +665,9 @@ export function syncSkillSymlinks(
       continue;
     }
 
-    const changed = mirrorSkillDir(skillDirAtDst, srcDir);
+    const mirrored = mirrorSkillDir(skillDirAtDst, srcDir, resolvedRoot);
+    for (const child of mirrored.refusedChildren) refused.push(`${name}/${child}`);
+    const changed = mirrored.changed;
     if (dstStat?.isDirectory()) {
       if (changed) {
         // Re-sync touched some links; classify as updated (we report
@@ -587,7 +682,7 @@ export function syncSkillSymlinks(
     }
   }
 
-  return { created, removed, unchanged, skipped };
+  return { created, removed, unchanged, skipped, refused };
 }
 
 /**
@@ -625,10 +720,23 @@ function isManagedMirror(dir: string): boolean {
  *     entry. Subdir reads at agent runtime follow symlinks normally, so
  *     `scripts/`, `reference/`, `agents/`, etc. inherit auto-update.
  *
- * Returns `true` if anything changed.
+ * Every child is resolved against `resolvedRoot` first; one that leaves the
+ * plugin's own repository is refused and named in `refusedChildren` instead of
+ * being mirrored. That covers both of the reads this function makes: the
+ * `SKILL.md` COPY, whose bytes are taken here and are indistinguishable from a
+ * legitimate file downstream, and the per-child SYMLINK, which the session copy
+ * later dereferences. A dangling child resolves to null and is refused too — it
+ * carried no content and the copy dropped it anyway.
+ *
+ * Returns whether anything changed, plus the refused child names.
  */
-function mirrorSkillDir(dstDir: string, srcDir: string): boolean {
+function mirrorSkillDir(
+  dstDir: string,
+  srcDir: string,
+  resolvedRoot: string,
+): { changed: boolean; refusedChildren: string[] } {
   let changed = false;
+  const refusedChildren: string[] = [];
   let dstExists: fs.Stats | null = null;
   try {
     dstExists = fs.lstatSync(dstDir);
@@ -639,7 +747,7 @@ function mirrorSkillDir(dstDir: string, srcDir: string): boolean {
     fs.mkdirSync(dstDir, { recursive: true });
     changed = true;
   } else if (!dstExists.isDirectory()) {
-    return false; // caller should have filtered this case
+    return { changed: false, refusedChildren }; // caller should have filtered this case
   }
 
   // Drop our marker so future runs recognize this as a managed mirror.
@@ -657,9 +765,21 @@ function mirrorSkillDir(dstDir: string, srcDir: string): boolean {
   try {
     srcEntries = fs.readdirSync(srcDir);
   } catch {
-    return changed;
+    return { changed, refusedChildren };
   }
-  const desiredChildren = new Set(srcEntries);
+
+  // Containment, decided before the removal pass below so a child refused now
+  // is ALSO pruned from a dst a previous run wrote it into.
+  const allowedChildren: string[] = [];
+  for (const child of srcEntries) {
+    const resolvedChild = resolveRealPath(path.join(srcDir, child));
+    if (resolvedChild === null || !isWithinResolvedRoot(resolvedChild, resolvedRoot)) {
+      refusedChildren.push(child);
+      continue;
+    }
+    allowedChildren.push(child);
+  }
+  const desiredChildren = new Set(allowedChildren);
 
   // Remove stale children whose name no longer exists in src.
   // Only remove our own writes — symlinks and copies of SKILL.md.
@@ -689,8 +809,8 @@ function mirrorSkillDir(dstDir: string, srcDir: string): boolean {
     }
   }
 
-  // Sync each source child into dst.
-  for (const child of srcEntries) {
+  // Sync each contained source child into dst.
+  for (const child of allowedChildren) {
     const childPath = path.join(dstDir, child);
     const srcPath = path.join(srcDir, child);
 
@@ -733,7 +853,7 @@ function mirrorSkillDir(dstDir: string, srcDir: string): boolean {
     }
   }
 
-  return changed;
+  return { changed, refusedChildren };
 }
 
 /**

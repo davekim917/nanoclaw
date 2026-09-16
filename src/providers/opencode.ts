@@ -30,8 +30,15 @@ import {
   replaceUntrustedFile,
 } from '../fs-safety.js';
 import { assertValidGroupFolder } from '../group-folder.js';
+import { log } from '../log.js';
 import { isExcludedPluginPath, splitExcludedPlugins, type ExcludedPlugins } from '../plugin-exclusions.js';
-import { MIRROR_MARKER, discoverPortableSkills } from '../plugin-skill-discovery.js';
+import {
+  MIRROR_MARKER,
+  discoverPortableSkills,
+  isWithinResolvedRoot,
+  resolvePluginRoots,
+  resolveRealPath,
+} from '../plugin-skill-discovery.js';
 import { registerProviderContainerConfig } from './provider-container-registry.js';
 
 // Code-level opencode defaults — the floor under the per-group DB value
@@ -165,7 +172,23 @@ export function excludedOpenCodeSkillNames(pluginsRoot: string, excluded: Exclud
  * `syncSkillSymlinks` itself, which is a change to a mirror Codex shares:
  * recorded in #836, not made here.
  */
-export function copyOpenCodeSkills(source: string, target: string, dropNames: ReadonlySet<string> = new Set()): void {
+export interface CopyOpenCodeSkillsOptions {
+  /** Skill names to omit, gated on the mirror writer's marker (see above). */
+  dropNames?: ReadonlySet<string>;
+  /**
+   * The resolved plugin repository roots a link in this mirror may resolve
+   * into — `resolvePluginRoots(<plugins root>)`. REQUIRED, and with no default,
+   * because the containment it carries is this copy's security boundary: an
+   * omitted-means-allow-everything default is the one shape that would let a
+   * caller reintroduce the escape silently. An empty array refuses every link,
+   * which is the safe direction.
+   */
+  allowedRoots: readonly string[];
+}
+
+export function copyOpenCodeSkills(source: string, target: string, options: CopyOpenCodeSkillsOptions): void {
+  const dropNames = options.dropNames ?? new Set<string>();
+  const { allowedRoots } = options;
   fs.cpSync(source, target, {
     recursive: true,
     dereference: true,
@@ -177,7 +200,30 @@ export function copyOpenCodeSkills(source: string, target: string, dropNames: Re
       const name = rel ? rel.split(path.sep)[0] : '';
       if (name && dropNames.has(name) && fs.existsSync(path.join(source, name, MIRROR_MARKER))) return false;
       const stat = fs.lstatSync(sourcePath, { throwIfNoEntry: false });
-      return stat !== undefined && (!stat.isSymbolicLink() || fs.existsSync(sourcePath));
+      if (stat === undefined) return false;
+      // A real file or directory in the mirror is content the mirror writer
+      // already contained; only a LINK can still reach out of the plugin tree.
+      if (!stat.isSymbolicLink()) return true;
+      // `dereference: true` means this copy READS whatever the link resolves
+      // to and writes the bytes into a directory mounted into the container.
+      // The writer contains what it creates (`syncSkillSymlinks`,
+      // `src/plugin-skill-discovery.ts`), but a link in a plugin repository can
+      // be repointed AFTER that sync and before this spawn, and this is the
+      // only reader standing between that and the container. So containment is
+      // re-decided here, against the resolved plugin roots, on a separator
+      // boundary so a sibling named `<root>-evil` cannot prefix-match.
+      const resolved = resolveRealPath(sourcePath);
+      // Dangling — the pre-existing reason this filter exists: a stale link
+      // must not wedge the spawn. Unchanged behaviour, no warning.
+      if (resolved === null) return false;
+      if (!allowedRoots.some((root) => isWithinResolvedRoot(resolved, root))) {
+        log.warn('OpenCode skill mirror link resolves outside every plugin repository; not copying it', {
+          link: sourcePath,
+          resolved,
+        });
+        return false;
+      }
+      return true;
     },
   });
 }
@@ -337,11 +383,19 @@ registerProviderContainerConfig('opencode', async (ctx) => {
     // (`src/opencode-sync.ts`) — not `hostHome`: were the two ever to differ,
     // the walk would find nothing, the drop set would be empty, and the
     // exclusion would silently not apply.
+    const pluginsRoot = path.join(os.homedir(), 'plugins');
     const dropNames = excludedOpenCodeSkillNames(
-      path.join(os.homedir(), 'plugins'),
+      pluginsRoot,
       splitExcludedPlugins(readContainerConfig(path.basename(ctx.groupDir)).excludePlugins),
     );
-    copyOpenCodeSkills(hostSkillsDir, targetSkillsDir, dropNames);
+    // Containment for the dereferencing copy: the mirror is built from plugin
+    // repositories and from nothing else, so a link resolving outside every one
+    // of them is an escape, not a shape this feature has. Resolved from the
+    // SAME root the mirror was built from, for the same reason the drop set is.
+    copyOpenCodeSkills(hostSkillsDir, targetSkillsDir, {
+      dropNames,
+      allowedRoots: resolvePluginRoots(pluginsRoot),
+    });
   }
 
   // Model + effort resolution mirrors the claude/codex template: a code-level

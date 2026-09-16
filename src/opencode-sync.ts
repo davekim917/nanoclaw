@@ -29,7 +29,15 @@ import path from 'path';
 import { parseClaudeAgentMd } from './claude-agent-md.js';
 import { discoverClaudeSubagents, type DiscoveredSubagent } from './claude-subagent-discovery.js';
 import { formatOpenCodeAgentMd, isManagedOpenCodeAgent } from './opencode-agent-md.js';
-import { DEFAULT_DENY_PLUGINS, discoverPortableSkills, syncSkillSymlinks } from './plugin-skill-discovery.js';
+import { log } from './log.js';
+import {
+  DEFAULT_DENY_PLUGINS,
+  discoverPortableSkills,
+  isWithinResolvedRoot,
+  resolvePluginRoots,
+  resolveRealPath,
+  syncSkillSymlinks,
+} from './plugin-skill-discovery.js';
 import { loadPluginScopes, scopedPluginNames } from './plugin-scopes.js';
 
 export interface OpenCodeSubagentsSyncResult {
@@ -213,6 +221,12 @@ export interface OpenCodeSkillSyncResult {
   removed: number;
   /** Skill names a target preserved because non-managed content existed there. */
   skipped: string[];
+  /**
+   * Paths refused for resolving outside their own plugin repository
+   * (`<skill>` or `<skill>/<child>`). Non-empty means a plugin holds a link
+   * out of its tree — see the containment note on `syncSkillSymlinks`.
+   */
+  refused: string[];
 }
 
 /**
@@ -249,6 +263,10 @@ export function syncOpenCodePluginSkills(): OpenCodeSkillSyncResult {
   // plugin can't shadow a same-named skill in an unscoped one, and the cleanup
   // pass prunes a copy made before scoping the next time this runs.
   const scoped = scopedPluginNames(loadPluginScopes());
+  // The repository roots anything in this mirror may point into. Shared by the
+  // skill mirror (via each skill's own `pluginRoot`) and the support-dir mirror
+  // below, which has no single plugin in hand.
+  const pluginRoots = resolvePluginRoots(pluginsRoot);
   const discovered = discoverPortableSkills(pluginsRoot, {
     runtime: 'opencode',
     denyPlugins: new Set([...DEFAULT_DENY_PLUGINS, ...scoped]),
@@ -266,6 +284,7 @@ export function syncOpenCodePluginSkills(): OpenCodeSkillSyncResult {
   let unchanged = 0;
   let removed = 0;
   const skippedSet = new Set<string>();
+  const refusedSet = new Set<string>();
 
   for (const target of targets) {
     const result = syncSkillSymlinks(target, discovered);
@@ -273,14 +292,23 @@ export function syncOpenCodePluginSkills(): OpenCodeSkillSyncResult {
     unchanged += result.unchanged.length;
     removed += result.removed.length;
     for (const s of result.skipped) skippedSet.add(s);
+    for (const r of result.refused) refusedSet.add(r);
 
     for (const [name, srcDir] of supportDirs) {
       const dstDir = path.join(target, name);
       // Don't trample a name we already wrote as a real skill mirror — skill
       // wins over support dir (extremely unlikely collision but cheap to guard).
       if (discovered.some((d) => d.name === name)) continue;
-      mirrorSupportDir(srcDir, dstDir);
+      for (const r of mirrorSupportDir(srcDir, dstDir, pluginRoots)) refusedSet.add(`${name}/${r}`);
     }
+  }
+
+  if (refusedSet.size > 0) {
+    // Never silent: a skill quietly missing from an agent is the failure mode
+    // a containment refusal must not have.
+    log.warn('OpenCode skill mirror refused paths resolving outside their plugin repository', {
+      refused: [...refusedSet],
+    });
   }
 
   return {
@@ -290,6 +318,7 @@ export function syncOpenCodePluginSkills(): OpenCodeSkillSyncResult {
     unchanged,
     removed,
     skipped: [...skippedSet],
+    refused: [...refusedSet],
   };
 }
 
@@ -331,8 +360,16 @@ function collectSiblingSupportDirs(discovered: ReturnType<typeof discoverPortabl
  * Mirror a support dir to its target as a real directory with per-child
  * symlinks (so plugin updates propagate without re-sync). Container provider
  * will copy with `dereference: true` so the container sees real files.
+ *
+ * Contained the same way the skill mirror is, and for the same reason: this
+ * writes links a session copy later DEREFERENCES into a container, so a child
+ * resolving outside every plugin repository would move host-only state across
+ * that boundary. This writer has no single plugin in hand — the support dir is
+ * a sibling of some skills root — so the whole set of roots is the boundary.
+ * Returns the refused child names.
  */
-function mirrorSupportDir(src: string, dst: string): void {
+function mirrorSupportDir(src: string, dst: string, pluginRoots: readonly string[]): string[] {
+  const refused: string[] = [];
   fs.mkdirSync(dst, { recursive: true });
   const entries = fs.readdirSync(src, { withFileTypes: true });
   // Drop any stale entries we own.
@@ -347,6 +384,11 @@ function mirrorSupportDir(src: string, dst: string): void {
   for (const entry of entries) {
     if (entry.name.startsWith('.')) continue;
     const srcEntry = path.join(src, entry.name);
+    const resolved = resolveRealPath(srcEntry);
+    if (resolved === null || !pluginRoots.some((root) => isWithinResolvedRoot(resolved, root))) {
+      refused.push(entry.name);
+      continue;
+    }
     const dstEntry = path.join(dst, entry.name);
     try {
       fs.symlinkSync(srcEntry, dstEntry);
@@ -354,4 +396,5 @@ function mirrorSupportDir(src: string, dst: string): void {
       /* already exists or race — best-effort */
     }
   }
+  return refused;
 }
