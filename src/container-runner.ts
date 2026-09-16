@@ -5071,8 +5071,8 @@ export async function buildMounts(
     // in-tree skill and (via CLAUDE_PLUGINS_ROOT auto-discovery) start a second
     // MCP server with a different allowed root. Host/OSS-only by design.
     const IN_TREE_SHADOWED_PLUGINS = ['design-artifact-loop', 'gitnexus'];
-    const declaredTopLevel = splitExcludedPlugins(containerConfig.excludePlugins).topLevel;
-    const excluded = new Set([...IN_TREE_SHADOWED_PLUGINS, ...declaredTopLevel]);
+    const declared = splitExcludedPlugins(containerConfig.excludePlugins);
+    const excluded = new Set([...IN_TREE_SHADOWED_PLUGINS, ...declared.topLevel]);
     const pluginScopes = loadPluginScopes(); // client plugins mount only in their workgroups
     let entries: string[] = [];
     try {
@@ -5108,8 +5108,25 @@ export async function buildMounts(
     // must exist, and each segment below it must exist under the last. That is
     // what makes the rule cover the sub-path half of the field too, which no
     // top-level-only check would.
+    //
+    // The NORMALIZED set, not the raw list. `splitExcludedPlugins` resolves the
+    // covering relation once, at the seam every consumer reads
+    // (`src/container-config.ts`), and drops a sub-path an excluded ancestor
+    // already covers — so a redundant pair like `["mono", "mono/plugins/alpha"]`
+    // is ONE entry to the mount denial a few lines above and was TWO here. Two
+    // readers of one field normalizing differently is the class #826 r3 recorded
+    // for the composer's fragment keys, and it is a defect even where today's
+    // outcomes happen to agree.
+    //
+    // It also fixes the outcome for the one shape where they do not: a
+    // descendant that does NOT exist, under an ancestor that does. Refusing that
+    // spawn is the rule misapplied — the ancestor already withholds the whole
+    // subtree, so the descendant line withholds nothing WHETHER OR NOT it
+    // exists, and there is nothing for a typo there to fail open. The rule
+    // exists for an entry that withholds nothing because it matches nothing;
+    // this one withholds nothing because its ancestor withholds everything.
     const missing: string[] = [];
-    for (const entry of containerConfig.excludePlugins ?? []) {
+    for (const entry of [...declared.topLevel, ...declared.subPaths]) {
       let cursor = pluginsHostDir;
       for (const segment of entry.split('/')) {
         let listing: string[];

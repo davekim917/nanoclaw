@@ -1252,6 +1252,19 @@ describe('buildMounts agent surfaces', async () => {
       const paths = mounts.map((m) => m.containerPath);
       expect(paths).not.toContain('/workspace/plugins/codex');
       expect(paths).toContain('/workspace/plugins/bootstrap');
+
+      // A REDUNDANT DESCENDANT is one entry, not two: `splitExcludedPlugins`
+      // drops a sub-path its ancestor already covers, and this walk reads that
+      // normalized set — the same one the mount denial above reads. So an
+      // absent descendant under an EXCLUDED repo does not refuse the spawn: the
+      // ancestor withholds the whole subtree, so that line withholds nothing
+      // whether or not it exists, and there is no fail-open for a typo to make.
+      const redundant = await build(['bootstrap', 'bootstrap/plugins/absent']);
+      expect(redundant.map((m) => m.containerPath)).not.toContain('/workspace/plugins/bootstrap');
+
+      // And the same absent descendant WITHOUT the covering ancestor still
+      // refuses, so this is a normalization change and not a relaxation.
+      await expect(build(['bootstrap/plugins/absent'])).rejects.toThrow(/do not exist under/);
     } finally {
       homedirSpy.mockRestore();
     }
