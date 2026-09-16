@@ -9,9 +9,9 @@
  * cannot predict what these walks resolve; these tests drive the walks.
  *
  * The fixture is one plugins root shaped like the real one, and carries BOTH
- * sub-plugin layouts every walker knows: a `bootstrap` monorepo holding
- * `plugins/orchestrate` + `plugins/orchestrate-agents` (the pair an operator
- * wants withheld) beside `plugins/workflow-agents` and `plugins/wwbd` (which
+ * sub-plugin layouts every walker knows: a `mono` monorepo holding
+ * `plugins/alpha` + `plugins/alpha-agents` (the pair an operator
+ * wants withheld) beside `plugins/gamma` and `plugins/delta` (which
  * must survive); a `knowledge` monorepo whose sub-plugins sit at its ROOT
  * (`knowledge/data`, `knowledge/docs`); and a `standalone` repo that is itself
  * one plugin.
@@ -26,7 +26,7 @@ import { isExcludedPluginPath, splitExcludedPlugins } from './plugin-exclusions.
 import { discoverPortableSkills } from './plugin-skill-discovery.js';
 import { discoverPlugins } from './providers/claude.js';
 
-const ORCHESTRATE_PAIR = ['bootstrap/plugins/orchestrate', 'bootstrap/plugins/orchestrate-agents'];
+const EXCLUDED_PAIR = ['mono/plugins/alpha', 'mono/plugins/alpha-agents'];
 
 /**
  * Every sub-plugin the fixture carries, as the walkers see it: both the
@@ -35,10 +35,10 @@ const ORCHESTRATE_PAIR = ['bootstrap/plugins/orchestrate', 'bootstrap/plugins/or
  * sub-path it came from.
  */
 const SUB_PLUGINS = [
-  'bootstrap/plugins/orchestrate',
-  'bootstrap/plugins/orchestrate-agents',
-  'bootstrap/plugins/workflow-agents',
-  'bootstrap/plugins/wwbd',
+  'mono/plugins/alpha',
+  'mono/plugins/alpha-agents',
+  'mono/plugins/gamma',
+  'mono/plugins/delta',
   'knowledge/data',
   'knowledge/docs',
 ];
@@ -66,7 +66,7 @@ function writeSubPlugin(dir: string, name: string): void {
 
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-exclusions-'));
-  for (const repo of ['bootstrap', 'knowledge']) {
+  for (const repo of ['mono', 'knowledge']) {
     writeJson(path.join(root, repo, '.claude-plugin', 'marketplace.json'), { name: repo });
   }
   for (const subPath of SUB_PLUGINS) {
@@ -86,31 +86,31 @@ afterEach(() => {
 describe('Claude discoverPlugins', () => {
   it('drops an excluded sub-plugin from the SDK plugin list, keeping its siblings', () => {
     const before = discoverPlugins(root, splitExcludedPlugins(undefined)).plugins.map((p) => p.path);
-    expect(before).toContain(path.join(root, 'bootstrap', 'plugins', 'orchestrate'));
-    expect(before).toContain(path.join(root, 'bootstrap', 'plugins', 'orchestrate-agents'));
+    expect(before).toContain(path.join(root, 'mono', 'plugins', 'alpha'));
+    expect(before).toContain(path.join(root, 'mono', 'plugins', 'alpha-agents'));
 
-    const after = discoverPlugins(root, splitExcludedPlugins(ORCHESTRATE_PAIR)).plugins.map((p) => p.path);
-    expect(after).not.toContain(path.join(root, 'bootstrap', 'plugins', 'orchestrate'));
-    expect(after).not.toContain(path.join(root, 'bootstrap', 'plugins', 'orchestrate-agents'));
-    expect(after).toContain(path.join(root, 'bootstrap', 'plugins', 'workflow-agents'));
-    expect(after).toContain(path.join(root, 'bootstrap', 'plugins', 'wwbd'));
+    const after = discoverPlugins(root, splitExcludedPlugins(EXCLUDED_PAIR)).plugins.map((p) => p.path);
+    expect(after).not.toContain(path.join(root, 'mono', 'plugins', 'alpha'));
+    expect(after).not.toContain(path.join(root, 'mono', 'plugins', 'alpha-agents'));
+    expect(after).toContain(path.join(root, 'mono', 'plugins', 'gamma'));
+    expect(after).toContain(path.join(root, 'mono', 'plugins', 'delta'));
     expect(after).toContain(path.join(root, 'standalone'));
   });
 
   it("drops the excluded plugin's PreToolUse guard with it — the hooks ride on the plugin entry", () => {
     // A plugin reaches the SDK as one `{type:'local', path}` entry: its
     // SessionStart hook and its declared guards arrive together or not at all.
-    writeJson(path.join(root, 'bootstrap', 'plugins', 'orchestrate', 'nanoclaw-plugin.json'), {
-      preToolUseGuards: ['orchestrate-guard'],
+    writeJson(path.join(root, 'mono', 'plugins', 'alpha', 'nanoclaw-plugin.json'), {
+      preToolUseGuards: ['alpha-guard'],
     });
-    writeJson(path.join(root, 'bootstrap', 'plugins', 'wwbd', 'nanoclaw-plugin.json'), {
-      preToolUseGuards: ['wwbd-guard'],
+    writeJson(path.join(root, 'mono', 'plugins', 'delta', 'nanoclaw-plugin.json'), {
+      preToolUseGuards: ['delta-guard'],
     });
-    expect(discoverPlugins(root, splitExcludedPlugins(undefined)).preToolUseGuards).toContain('orchestrate-guard');
+    expect(discoverPlugins(root, splitExcludedPlugins(undefined)).preToolUseGuards).toContain('alpha-guard');
 
-    const after = discoverPlugins(root, splitExcludedPlugins(ORCHESTRATE_PAIR));
-    expect(after.preToolUseGuards).not.toContain('orchestrate-guard');
-    expect(after.preToolUseGuards).toContain('wwbd-guard');
+    const after = discoverPlugins(root, splitExcludedPlugins(EXCLUDED_PAIR));
+    expect(after.preToolUseGuards).not.toContain('alpha-guard');
+    expect(after.preToolUseGuards).toContain('delta-guard');
   });
 
   it('excludes a single-plugin repo named at the top level — its manifest is at the ROOT, so no deeper check sees it', () => {
@@ -121,11 +121,11 @@ describe('Claude discoverPlugins', () => {
       path.relative(root, p.path),
     );
     expect(after).not.toContain('standalone');
-    expect(after).toContain(path.join('bootstrap', 'plugins', 'orchestrate'));
+    expect(after).toContain(path.join('mono', 'plugins', 'alpha'));
   });
 
   it('excludes the whole subtree when a repo is excluded at the top level', () => {
-    const after = discoverPlugins(root, splitExcludedPlugins(['bootstrap']))
+    const after = discoverPlugins(root, splitExcludedPlugins(['mono']))
       .plugins.map((p) => path.relative(root, p.path))
       .sort();
     expect(after).toEqual(['knowledge/data', 'knowledge/docs', 'standalone']);
@@ -141,28 +141,28 @@ describe('Codex planCodexPluginRegistration', () => {
 
   it('does not register an excluded sub-plugin — so nothing `codex plugin add`s it, or trusts its hooks', () => {
     expect(registered(undefined)).toEqual([
-      'bootstrap/orchestrate',
-      'bootstrap/orchestrate-agents',
-      'bootstrap/workflow-agents',
-      'bootstrap/wwbd',
       'knowledge/data',
       'knowledge/docs',
+      'mono/alpha',
+      'mono/alpha-agents',
+      'mono/delta',
+      'mono/gamma',
       'standalone',
     ]);
-    expect(registered(ORCHESTRATE_PAIR)).toEqual([
-      'bootstrap/workflow-agents',
-      'bootstrap/wwbd',
+    expect(registered(EXCLUDED_PAIR)).toEqual([
       'knowledge/data',
       'knowledge/docs',
+      'mono/delta',
+      'mono/gamma',
       'standalone',
     ]);
     // The root layout is honoured the same way.
     expect(registered(['knowledge/data'])).toEqual([
-      'bootstrap/orchestrate',
-      'bootstrap/orchestrate-agents',
-      'bootstrap/workflow-agents',
-      'bootstrap/wwbd',
       'knowledge/docs',
+      'mono/alpha',
+      'mono/alpha-agents',
+      'mono/delta',
+      'mono/gamma',
       'standalone',
     ]);
   });
@@ -187,25 +187,10 @@ describe('skill mirror discoverPortableSkills', () => {
       .sort();
 
   it("drops an excluded sub-plugin's skills and keeps every sibling's", () => {
-    expect(skillNames(undefined)).toEqual([
-      'data',
-      'docs',
-      'orchestrate',
-      'orchestrate-agents',
-      'standalone',
-      'workflow-agents',
-      'wwbd',
-    ]);
-    expect(skillNames(ORCHESTRATE_PAIR)).toEqual(['data', 'docs', 'standalone', 'workflow-agents', 'wwbd']);
+    expect(skillNames(undefined)).toEqual(['alpha', 'alpha-agents', 'data', 'delta', 'docs', 'gamma', 'standalone']);
+    expect(skillNames(EXCLUDED_PAIR)).toEqual(['data', 'delta', 'docs', 'gamma', 'standalone']);
     // The root layout again — rule 8 of the discovery order, not rule 7.
-    expect(skillNames(['knowledge/data'])).toEqual([
-      'docs',
-      'orchestrate',
-      'orchestrate-agents',
-      'standalone',
-      'workflow-agents',
-      'wwbd',
-    ]);
+    expect(skillNames(['knowledge/data'])).toEqual(['alpha', 'alpha-agents', 'delta', 'docs', 'gamma', 'standalone']);
   });
 
   it('drops an excluded sub-plugin in the `plugin/`, cursor and claude-plugin layouts too', () => {
@@ -234,21 +219,14 @@ describe('skill mirror discoverPortableSkills', () => {
     const afterPluginDir = skillNames(['layouts/plugin']);
     expect(afterPluginDir).toContain('via-cursor');
     expect(afterPluginDir).toContain('via-claude-plugin');
-    expect(afterPluginDir).toContain('wwbd');
+    expect(afterPluginDir).toContain('delta');
   });
 
   it('drops a whole repo for a top-level entry', () => {
-    expect(skillNames(['bootstrap'])).toEqual(['data', 'docs', 'standalone']);
+    expect(skillNames(['mono'])).toEqual(['data', 'docs', 'standalone']);
     // A single-plugin repo: its skills come from the repo root (rules 1-6), not
     // from a sub-plugin rule, so only the top-level check can withhold them.
-    expect(skillNames(['standalone'])).toEqual([
-      'data',
-      'docs',
-      'orchestrate',
-      'orchestrate-agents',
-      'workflow-agents',
-      'wwbd',
-    ]);
+    expect(skillNames(['standalone'])).toEqual(['alpha', 'alpha-agents', 'data', 'delta', 'docs', 'gamma']);
   });
 });
 
@@ -262,10 +240,10 @@ describe('the three walkers and the predicate agree', () => {
     for (const entries of [
       undefined,
       [],
-      ORCHESTRATE_PAIR,
-      ['bootstrap/plugins/wwbd'],
-      ['bootstrap/plugins'],
-      ['bootstrap/plugins', 'bootstrap/plugins/orchestrate'],
+      EXCLUDED_PAIR,
+      ['mono/plugins/delta'],
+      ['mono/plugins'],
+      ['mono/plugins', 'mono/plugins/alpha'],
       ['knowledge/data'],
       ['knowledge'],
     ]) {
@@ -300,7 +278,7 @@ describe('an exclusion that matches nothing', () => {
     // An operator can name a sub-plugin that was never checked out, or misspell
     // one. Refusing the spawn over that would take a group down for a line with
     // no effect; the walk simply never meets the path.
-    const ghost = splitExcludedPlugins(['bootstrap/plugins/does-not-exist', 'knowledge/never-cloned', 'no-such-repo']);
+    const ghost = splitExcludedPlugins(['mono/plugins/does-not-exist', 'knowledge/never-cloned', 'no-such-repo']);
     const none = splitExcludedPlugins(undefined);
     expect(discoverPlugins(root, ghost).plugins).toEqual(discoverPlugins(root, none).plugins);
     expect(planCodexPluginRegistration(root, ghost)).toEqual(planCodexPluginRegistration(root, none));

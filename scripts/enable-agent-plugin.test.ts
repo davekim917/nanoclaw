@@ -64,16 +64,27 @@ describe('enable-agent-plugin next steps', () => {
   });
 
   it.each([
-    ['at the repo root', 'always-on.md'],
     ['under plugins/<sub>', path.join('plugins', 'wwbd', 'always-on.md')],
     ['at <sub>/ in the root layout', path.join('wwbd', 'always-on.md')],
   ])('never asks for the override when the plugin ships its own always-on.md %s', (_label, rel) => {
-    // Both sub-plugin layouts the composer walks, plus the single-plugin repo
-    // shape — the enabler has to recognise the same set the composer reads
-    // (`subPluginDirs`, src/claude-md-compose.ts), or it instructs a double
-    // delivery for exactly the repos we maintain.
+    // EXACTLY the two layouts the composer walks — the enabler has to recognise
+    // the composer's set (`subPluginDirs`, src/claude-md-compose.ts), or it
+    // instructs a double delivery for the repos we maintain.
     seedPlugin('ours', { ownRulesetAt: rel });
     const out = runEnabler('ours');
+    expect(out).not.toMatch(AUTHOR_OVERRIDE);
+    expect(out).toContain('ships its own always-on.md');
+  });
+
+  it('never asks for the override when the only always-on.md is at the repo root', () => {
+    // A single-plugin repo has no sub-plugin to carry its directive, so the
+    // composer reads the repo ROOT's own always-on.md for OpenCode and this
+    // must agree — a repo we maintain has to reach OpenCode without a
+    // NanoClaw-specific file. The two sides are one decision: if this counted
+    // the root while the composer did not, the override would be suppressed for
+    // a repo whose ruleset nothing composed and the group would get neither.
+    seedPlugin('root-only', { ownRulesetAt: 'always-on.md' });
+    const out = runEnabler('root-only');
     expect(out).not.toMatch(AUTHOR_OVERRIDE);
     expect(out).toContain('ships its own always-on.md');
   });

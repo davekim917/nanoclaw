@@ -222,9 +222,9 @@ describe('Claude plugin discovery', () => {
       const wwbd = path.join(repo, 'plugins', 'wwbd');
       fs.mkdirSync(path.join(wwbd, '.claude-plugin'), { recursive: true });
       fs.writeFileSync(path.join(wwbd, '.claude-plugin', 'plugin.json'), '{"name":"wwbd"}');
-      // Masked: a real directory with nothing in it.
+      // A real directory with nothing in it.
       fs.mkdirSync(path.join(repo, 'plugins', 'orchestrate'), { recursive: true });
-      // Second layout — a sub-plugin directly under the repo root, also masked.
+      // Second layout — a sub-plugin directly under the repo root.
       fs.mkdirSync(path.join(repo, 'rootlevel'), { recursive: true });
 
       const discovery = discoverPlugins(pluginsRoot);

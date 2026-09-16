@@ -51,13 +51,47 @@
  * are all legal bytes in a Linux directory name, so refusing them would be the
  * same accepted-set regression in a narrower place.
  *
- * What remains is what traversal actually needs: no empty segment, no `.` or
- * `..`, no absolute path, and the depth bound below. `/` cannot appear in a
- * segment at all — segments are the result of splitting on it.
+ * What remains is what traversal actually needs, plus one byte that is not a
+ * style rule at all: no empty segment, no `.` or `..`, no absolute path, the
+ * depth bound below — and no NUL. `/` cannot appear in a segment, since
+ * segments are the result of splitting on it.
+ *
+ * Two things are refused on a filesystem justification the removed character
+ * rules did not have, and they are one rule rather than two: an accepted entry
+ * must be a string a filename can actually BE. JSON can express values that a
+ * POSIX name cannot hold — a NUL, and an unpaired UTF-16 surrogate, which node
+ * re-encodes as U+FFFD on its way to a syscall. Either one PASSES every shape
+ * check and can then never match anything. That is not a harmless typo:
+ * `"codex"` with a trailing NUL or lone surrogate lands in the top-level
+ * exclusion set, fails to match the real `codex` directory, and the plugin
+ * mounts — and with `codexHostAuth` the host's Codex OAuth mount is admitted
+ * with it. A credential-withholding exclusion silently turned into credential
+ * delivery is exactly the fail-open this validator exists to prevent.
+ *
+ * Backslash, newline and DEL stay allowed, and the distinction is the whole
+ * point: those are legal bytes in a real Linux directory name, so refusing them
+ * refuses configurations that already worked. These two cannot name any file at
+ * all.
+ *
  * `src/plugin-scopes.ts:44`'s narrower `PLUGIN_NAME_RE` governs an
  * operator-authored policy file and is left alone.
  */
-const PLUGIN_PATH_SEGMENT_RE = /^(?!\.\.?$).+$/su;
+// `\p{Surrogate}` under the `u` flag matches a LONE surrogate only: a valid
+// pair combines into one astral code point, which is not a surrogate. So an
+// emoji directory name passes and a half-character cannot. (`isWellFormed`
+// says the same thing, but needs an ES2024 lib this tsconfig does not set.)
+const PLUGIN_PATH_SEGMENT_RE = /^(?!\.\.?$)[^\0\p{Surrogate}]+$/su;
+
+/**
+ * Longest single path segment any filename on this host may have, in BYTES.
+ *
+ * Linux's `NAME_MAX` is 255 on every filesystem this host uses (`getconf
+ * NAME_MAX ~/plugins`). It is a byte limit rather than a character one, so an
+ * astral character costs four of the 255. Hardcoded rather than probed: the
+ * value is a kernel constant, and probing it would make the validator's answer
+ * depend on which filesystem the config happens to be read from.
+ */
+const NAME_MAX_BYTES = 255;
 
 /**
  * Deepest `excludePlugins` entry we accept, in path segments. Bounded by what
@@ -112,7 +146,15 @@ export function validateExcludePlugins(value: unknown): string[] | undefined {
     }
     for (const segment of segments) {
       if (!PLUGIN_PATH_SEGMENT_RE.test(segment)) {
-        fail('must be <plugin> or <plugin>/<sub>[/<sub2>] with no empty, "." or ".." segments');
+        fail(
+          'must be <plugin> or <plugin>/<sub>[/<sub2>] with no empty, "." or ".." segments and nothing a filename cannot hold',
+        );
+      }
+      // Length is measured in BYTES, not characters: `NAME_MAX` is a byte
+      // limit, so one astral character costs four of the 255 a basename gets.
+      const bytes = Buffer.byteLength(segment, 'utf8');
+      if (bytes > NAME_MAX_BYTES) {
+        fail(`has a ${bytes}-byte path segment; no filename may exceed ${NAME_MAX_BYTES} bytes (NAME_MAX)`);
       }
     }
   }

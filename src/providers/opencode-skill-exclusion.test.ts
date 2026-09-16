@@ -24,14 +24,14 @@ describe('excludedOpenCodeSkillNames', () => {
 
   beforeEach(() => {
     plugins = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-exclusion-'));
-    fs.mkdirSync(path.join(plugins, 'bootstrap', '.claude-plugin'), { recursive: true });
-    for (const sub of ['orchestrate', 'wwbd']) {
-      fs.mkdirSync(path.join(plugins, 'bootstrap', 'plugins', sub, '.claude-plugin'), { recursive: true });
+    fs.mkdirSync(path.join(plugins, 'mono', '.claude-plugin'), { recursive: true });
+    for (const sub of ['alpha', 'delta']) {
+      fs.mkdirSync(path.join(plugins, 'mono', 'plugins', sub, '.claude-plugin'), { recursive: true });
       fs.writeFileSync(
-        path.join(plugins, 'bootstrap', 'plugins', sub, '.claude-plugin', 'plugin.json'),
+        path.join(plugins, 'mono', 'plugins', sub, '.claude-plugin', 'plugin.json'),
         JSON.stringify({ name: sub }),
       );
-      writeSkill(path.join(plugins, 'bootstrap', 'plugins', sub, 'skills', sub), sub);
+      writeSkill(path.join(plugins, 'mono', 'plugins', sub, 'skills', sub), sub);
     }
     // A single-plugin repo, so a top-level entry has skills of its own to lose.
     writeSkill(path.join(plugins, 'solo', 'skills', 'solo-skill'), 'solo-skill');
@@ -42,8 +42,8 @@ describe('excludedOpenCodeSkillNames', () => {
   });
 
   it('names exactly the skills an excluded sub-plugin contributed', () => {
-    const dropped = excludedOpenCodeSkillNames(plugins, splitExcludedPlugins(['bootstrap/plugins/orchestrate']));
-    expect([...dropped]).toEqual(['orchestrate']);
+    const dropped = excludedOpenCodeSkillNames(plugins, splitExcludedPlugins(['mono/plugins/alpha']));
+    expect([...dropped]).toEqual(['alpha']);
   });
 
   it('returns an empty set for a group that excludes nothing — the copy is untouched for every group today', () => {
@@ -55,20 +55,20 @@ describe('excludedOpenCodeSkillNames', () => {
     // Every OpenCode group on this install carries top-level entries today and
     // keeps those skills through this mirror. Widening the filter to them would
     // withdraw skills from running groups; that is not this change.
-    expect(excludedOpenCodeSkillNames(plugins, splitExcludedPlugins(['bootstrap'])).size).toBe(0);
+    expect(excludedOpenCodeSkillNames(plugins, splitExcludedPlugins(['mono'])).size).toBe(0);
     // `solo` HAS a skill in this mirror, and excluding it top-level alongside a
     // sub-path must still drop only the sub-path's.
-    const mixed = excludedOpenCodeSkillNames(plugins, splitExcludedPlugins(['solo', 'bootstrap/plugins/orchestrate']));
-    expect([...mixed]).toEqual(['orchestrate']);
+    const mixed = excludedOpenCodeSkillNames(plugins, splitExcludedPlugins(['solo', 'mono/plugins/alpha']));
+    expect([...mixed]).toEqual(['alpha']);
   });
 
   it('keeps a skill name another, non-excluded plugin also provides', () => {
     // First-plugin-wins dedup means the name still has a live source, so
     // dropping it would withhold a skill the exclusion never named.
     fs.mkdirSync(path.join(plugins, 'aardvark'), { recursive: true });
-    writeSkill(path.join(plugins, 'aardvark', 'skills', 'orchestrate'), 'orchestrate');
-    const dropped = excludedOpenCodeSkillNames(plugins, splitExcludedPlugins(['bootstrap/plugins/orchestrate']));
-    expect(dropped.has('orchestrate')).toBe(false);
+    writeSkill(path.join(plugins, 'aardvark', 'skills', 'alpha'), 'alpha');
+    const dropped = excludedOpenCodeSkillNames(plugins, splitExcludedPlugins(['mono/plugins/alpha']));
+    expect(dropped.has('alpha')).toBe(false);
   });
 
   it('covers the `plugin/` root layout, which discovery walks by fixed name', () => {
@@ -86,15 +86,13 @@ describe('excludedOpenCodeSkillNames', () => {
     ]);
     // And an unrelated exclusion leaves it alone.
     expect(
-      excludedOpenCodeSkillNames(plugins, splitExcludedPlugins(['bootstrap/plugins/orchestrate'])).has(
-        'via-plugin-dir',
-      ),
+      excludedOpenCodeSkillNames(plugins, splitExcludedPlugins(['mono/plugins/alpha'])).has('via-plugin-dir'),
     ).toBe(false);
   });
 
   it('drops a duplicated name when the EXCLUDED source is the one the mirror published', () => {
     // The inverse of the case above, and the one a name-only difference got
-    // wrong: `bootstrap` sorts before `zulu`, so the excluded sub-plugin wins
+    // wrong: `mono` sorts before `zulu`, so the excluded sub-plugin wins
     // discovery's first-plugin-wins dedup and its directory is what the shared
     // mirror holds under this name. The name still exists in a filtered walk —
     // supplied by `zulu` — so comparing names alone would read it as kept and
@@ -102,11 +100,11 @@ describe('excludedOpenCodeSkillNames', () => {
     // `zulu`'s copy is not lost: the container-side mirror honours the same
     // list over `/workspace/plugins` and picks it up there.
     fs.mkdirSync(path.join(plugins, 'zulu'), { recursive: true });
-    writeSkill(path.join(plugins, 'zulu', 'skills', 'orchestrate'), 'orchestrate');
-    const dropped = excludedOpenCodeSkillNames(plugins, splitExcludedPlugins(['bootstrap/plugins/orchestrate']));
-    expect(dropped.has('orchestrate')).toBe(true);
-    // And only that name — `wwbd` shares the repo but not the excluded path.
-    expect([...dropped]).toEqual(['orchestrate']);
+    writeSkill(path.join(plugins, 'zulu', 'skills', 'alpha'), 'alpha');
+    const dropped = excludedOpenCodeSkillNames(plugins, splitExcludedPlugins(['mono/plugins/alpha']));
+    expect(dropped.has('alpha')).toBe(true);
+    // And only that name — `delta` shares the repo but not the excluded path.
+    expect([...dropped]).toEqual(['alpha']);
   });
 });
 
@@ -117,7 +115,7 @@ describe('copyOpenCodeSkills with a drop set', () => {
   beforeEach(() => {
     source = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-mirror-'));
     target = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-xdg-'));
-    for (const name of ['orchestrate', 'team-auto', 'wwbd']) {
+    for (const name of ['alpha', 'team-auto', 'delta']) {
       fs.mkdirSync(path.join(source, name, 'references'), { recursive: true });
       fs.writeFileSync(path.join(source, name, 'SKILL.md'), name);
       fs.writeFileSync(path.join(source, name, 'references', 'notes.md'), name);
@@ -134,20 +132,20 @@ describe('copyOpenCodeSkills with a drop set', () => {
   });
 
   it('omits a dropped skill entirely — children included — and copies every other', () => {
-    copyOpenCodeSkills(source, target, new Set(['orchestrate']));
-    expect(fs.readdirSync(target).sort()).toEqual(['team-auto', 'wwbd']);
-    expect(fs.existsSync(path.join(target, 'orchestrate', 'references', 'notes.md'))).toBe(false);
-    expect(fs.readFileSync(path.join(target, 'wwbd', 'references', 'notes.md'), 'utf8')).toBe('wwbd');
+    copyOpenCodeSkills(source, target, new Set(['alpha']));
+    expect(fs.readdirSync(target).sort()).toEqual(['delta', 'team-auto']);
+    expect(fs.existsSync(path.join(target, 'alpha', 'references', 'notes.md'))).toBe(false);
+    expect(fs.readFileSync(path.join(target, 'delta', 'references', 'notes.md'), 'utf8')).toBe('delta');
   });
 
   it('never mutates the host-owned mirror it copied from', () => {
-    copyOpenCodeSkills(source, target, new Set(['orchestrate']));
-    expect(fs.readdirSync(source).sort()).toEqual(['orchestrate', 'team-auto', 'wwbd']);
+    copyOpenCodeSkills(source, target, new Set(['alpha']));
+    expect(fs.readdirSync(source).sort()).toEqual(['alpha', 'delta', 'team-auto']);
   });
 
   it('copies everything when the drop set is empty (the default)', () => {
     copyOpenCodeSkills(source, target);
-    expect(fs.readdirSync(target).sort()).toEqual(['orchestrate', 'team-auto', 'wwbd']);
+    expect(fs.readdirSync(target).sort()).toEqual(['alpha', 'delta', 'team-auto']);
   });
 
   it('NEVER drops a dir the mirror writer did not publish, even when the name is in the drop set', () => {
@@ -158,9 +156,9 @@ describe('copyOpenCodeSkills with a drop set', () => {
     // happens to publish the same name, dropping on the name alone would
     // withdraw this content from the session — a guard refusing a legitimate
     // state instead of the bad input.
-    fs.rmSync(path.join(source, 'orchestrate', '.nanoclaw-managed'));
-    copyOpenCodeSkills(source, target, new Set(['orchestrate']));
-    expect(fs.readdirSync(target).sort()).toEqual(['orchestrate', 'team-auto', 'wwbd']);
-    expect(fs.readFileSync(path.join(target, 'orchestrate', 'references', 'notes.md'), 'utf8')).toBe('orchestrate');
+    fs.rmSync(path.join(source, 'alpha', '.nanoclaw-managed'));
+    copyOpenCodeSkills(source, target, new Set(['alpha']));
+    expect(fs.readdirSync(target).sort()).toEqual(['alpha', 'delta', 'team-auto']);
+    expect(fs.readFileSync(path.join(target, 'alpha', 'references', 'notes.md'), 'utf8')).toBe('alpha');
   });
 });

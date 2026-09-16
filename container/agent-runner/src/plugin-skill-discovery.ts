@@ -81,13 +81,20 @@ export const DEFAULT_DENY_PLUGINS = new Set<string>([
 const DENY_SUB_PLUGIN_SKILL_DIRS_BY_RUNTIME: Record<AgentRuntime, Set<string>> = {
   claude: new Set<string>([
     'bootstrap/plugins/workflow-agents/skills',
+    'bootstrap/plugins/orchestrate-agents/skills',
   ]),
   codex: new Set<string>([
     'bootstrap/plugins/workflow/skills',
     'bootstrap/plugins/workflow-agents/skills',
+    // orchestrate-agents needs no entry: it ships `.codex-plugin`, so the
+    // manifest rule already keeps it out of the codex mirror.
+    'bootstrap/plugins/orchestrate/skills',
   ]),
   opencode: new Set<string>([
     'bootstrap/plugins/workflow/skills',
+    // Claude orchestrate dispatches through Claude's Agent tool; the
+    // orchestrate-agents twin stays surfaced, matching team-*.
+    'bootstrap/plugins/orchestrate/skills',
     // workflow-agents is NOT denied — opencode has no native codex-plugin
     // loader, and surfacing the skill TEXT gives the agent awareness of
     // /team-* patterns even without the spawn_task harness.

@@ -102,6 +102,19 @@ const MAX_PLUGIN_RULESET_BYTES = 64 * 1024;
  */
 function readRulesetFile(dir: string, filename: string, repoRoot: string): string | null {
   const file = path.join(dir, filename);
+  // The root is resolved BEFORE the open, and that ordering is the point. A
+  // root resolved afterwards is a second pathname lookup the first one cannot
+  // constrain: swap `~/plugins/<repo>` for a symlink to `/home/ubuntu` between
+  // the two, and a descriptor holding `~/.codex/auth.json` measures as
+  // contained by the freshly-resolved root. Resolving first means the fd is
+  // always judged against the root we INTENDED, and a root swapped before the
+  // open sends the open somewhere that no longer measures as inside it.
+  let root: string;
+  try {
+    root = fs.realpathSync(repoRoot);
+  } catch {
+    return null;
+  }
   let fd: number;
   try {
     // O_NONBLOCK, always: opening a FIFO for reading blocks until a writer
@@ -109,14 +122,14 @@ function readRulesetFile(dir: string, filename: string, repoRoot: string): strin
     // a plugin repo carrying a `mkfifo` would hang the host's single event loop
     // rather than return an error. On a regular file Linux ignores the flag.
     // Same flag, same reason, as `readContainedFile` in
-    // `src/dashboard/api/attention-fs.ts`, which is where this whole pattern
-    // comes from.
+    // `src/dashboard/api/attention-fs.ts`, which is where this pattern comes
+    // from.
     fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
   } catch {
     return null;
   }
   try {
-    // Containment is decided about the OPEN DESCRIPTOR, not about the path.
+    // Containment is decided about the OPEN DESCRIPTOR, never about a path.
     // `realpathSync(file)` answers a question about a string at one instant;
     // between that answer and the read, any component — the leaf or a directory
     // `subPluginDirs` walked through — can become a symlink, and the read then
@@ -134,17 +147,22 @@ function readRulesetFile(dir: string, filename: string, repoRoot: string): strin
     // NOT `O_NOFOLLOW`: it refuses only the final component, so it would not
     // close the walked-parent case this check does close, and it WOULD refuse a
     // leaf that is legitimately a symlink to another file inside the same repo.
-    const root = fs.realpathSync(repoRoot);
+    //
+    // FAILS CLOSED where the descriptor cannot be identified. `/proc` is absent
+    // on macOS, and falling back to `realpathSync(file)` there would reinstate
+    // exactly the pathname lookup this check exists to avoid. `attention-fs.ts`
+    // does take that fallback, because it serves a live dashboard where
+    // emitting nothing is a visible outage; here the cost is that a macOS
+    // developer checkout composes no plugin rulesets, which is a degraded
+    // convenience rather than a broken product. This host is Linux (CLAUDE.md).
     let opened: string;
     try {
-      // `null` where /proc is absent (a macOS dev checkout). The fallback
-      // narrows the window to open→realpath rather than closing it; this host
-      // is Linux (CLAUDE.md), where the fd path is always there.
-      const viaFd = fs.readlinkSync(`/proc/self/fd/${fd}`);
-      opened = path.isAbsolute(viaFd) ? viaFd : fs.realpathSync(file);
+      opened = fs.readlinkSync(`/proc/self/fd/${fd}`);
     } catch {
-      opened = fs.realpathSync(file);
+      log.warn('Cannot identify the open descriptor (no /proc); not composing plugin rulesets on this host', { file });
+      return null;
     }
+    if (!path.isAbsolute(opened)) return null;
     if (opened !== root && !opened.startsWith(root + path.sep)) {
       log.warn('Plugin ruleset resolves outside its plugin repository; not composing it', { file, repoRoot: root });
       return null;
@@ -379,10 +397,31 @@ export async function composeGroupClaudeMd(
       const repoRoot = path.join(pluginsRoot, name);
       const override = readRulesetFile(repoRoot, NANOCLAW_ALWAYS_ON_MARKER, repoRoot);
       if (override) desired.set(`plugin-${name}.md`, override);
-      // A plugin's own always-on.md reaches OpenCode and nothing else. Codex
-      // would receive the same text twice — once here, once from the plugin's
-      // SessionStart hook — so the gate is provider equality, not `!== 'claude'`.
+      // A plugin's own always-on.md reaches OpenCode and nothing else. Claude
+      // auto-loads the plugin's SessionStart hook through CLAUDE_PLUGINS_ROOT,
+      // and Codex fires plugin hooks too — but ONLY for a plugin whose
+      // `.codex-plugin/plugin.json` declares them AND whose hook identity is
+      // TRUSTED. That trust is not automatic: codex reports an unenrolled plugin
+      // hook as `trustStatus: "untrusted"` and never dispatches it, which made
+      // this gate's premise FALSE until #827 installed container-side hook
+      // trust. #827 is merged and is in this branch, so the premise holds. The
+      // ordering was the fix rather than the code — composing for Codex in the
+      // meantime would have delivered the text twice the day #827 landed.
+      // Re-check this gate if hook trust is removed, or if a plugin's manifest
+      // stops declaring the hooks file it ships.
       if (provider !== 'opencode') continue;
+      // The repo ROOT's own generic ruleset, for a single-plugin repo whose
+      // directive is not under a sub-plugin. Without this, such a repo would
+      // still need a NanoClaw-specific `.nanoclaw-always-on.md` to reach
+      // OpenCode — the exact property a plugin repo we maintain is supposed to
+      // avoid. Same containment read and same key as the override, so an
+      // operator override present alongside it wins: `desired.set` above ran
+      // first, and this does not overwrite.
+      const rootFragment = `plugin-${name}.md`;
+      if (!desired.has(rootFragment)) {
+        const rootOwn = readRulesetFile(repoRoot, PLUGIN_ALWAYS_ON_FILE, repoRoot);
+        if (rootOwn) desired.set(rootFragment, rootOwn);
+      }
       for (const { subPath, dir } of subPluginDirs(pluginsRoot, name)) {
         if (isExcludedPluginPath(subPath, excluded)) continue;
         const content = readRulesetFile(dir, PLUGIN_ALWAYS_ON_FILE, repoRoot);

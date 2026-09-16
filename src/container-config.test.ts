@@ -827,6 +827,58 @@ describe('excludePlugins', () => {
     }
   });
 
+  it('refuses what JSON can express and a filename cannot hold: NUL and lone surrogates', () => {
+    // Not a style rule. An entry carrying a NUL passes every shape check and
+    // can never match anything, so `codex` with a trailing NUL lands in the
+    // top-level exclusion set, fails to match the real `codex` directory, and
+    // the plugin mounts — a credential-withholding exclusion silently turned
+    // into credential delivery. Backslash, newline and DEL are legal bytes in a
+    // real directory name and stay accepted (above); NUL has its own
+    // filesystem justification.
+    for (const bad of [
+      'codex\u0000',
+      'repo/plugins/sub\u0000',
+      '\u0000',
+      // An unpaired surrogate is the same class: node re-encodes it as U+FFFD
+      // on the way to a syscall, so the entry can never equal the real
+      // readdirSync name — and with `codexHostAuth` the host's Codex OAuth
+      // mount is admitted alongside the plugin the operator meant to withhold.
+      'codex\uD800',
+      'codex\uDC00',
+      'repo/plugins/sub\uD800',
+    ]) {
+      writeGroupConfig('xp-unnameable', { excludePlugins: [bad] });
+      expect(() => readContainerConfig('xp-unnameable')).toThrow(/excludePlugins entry/);
+    }
+    // A VALID surrogate pair is an ordinary directory name and stays accepted —
+    // the rule is "a filename could be this", not "ASCII only".
+    const ok = ['emoji\u{1F600}', 'repo/plugins/emoji\u{1F600}'];
+    writeGroupConfig('xp-astral', { excludePlugins: ok });
+    expect(readContainerConfig('xp-astral').excludePlugins).toEqual(ok);
+  });
+
+  it('refuses a path segment longer than NAME_MAX, measured in bytes', () => {
+    // Third instance of one class: a segment past NAME_MAX cannot be a basename,
+    // so the entry matches nothing and the exclusion silently does not apply.
+    // Bytes, not characters — an astral character costs four of the 255.
+    const ok255 = 'a'.repeat(255);
+    const over256 = 'a'.repeat(256);
+    writeGroupConfig('xp-len-ok', { excludePlugins: [ok255, `repo/${ok255}`] });
+    expect(readContainerConfig('xp-len-ok').excludePlugins).toEqual([ok255, `repo/${ok255}`]);
+
+    for (const bad of [over256, `repo/plugins/${over256}`, 'x'.repeat(4097)]) {
+      writeGroupConfig('xp-len-bad', { excludePlugins: [bad] });
+      expect(() => readContainerConfig('xp-len-bad')).toThrow(/NAME_MAX/);
+    }
+    // 64 astral characters are 256 bytes — a character count would pass this.
+    writeGroupConfig('xp-len-astral', { excludePlugins: ['\u{1F600}'.repeat(64)] });
+    expect(() => readContainerConfig('xp-len-astral')).toThrow(/NAME_MAX/);
+    // 63 of them are 252 bytes and stay accepted.
+    const astral63 = '\u{1F600}'.repeat(63);
+    writeGroupConfig('xp-len-astral-ok', { excludePlugins: [astral63] });
+    expect(readContainerConfig('xp-len-astral-ok').excludePlugins).toEqual([astral63]);
+  });
+
   it('refuses a malformed entry on write, not only on read', () => {
     expect(() =>
       writeContainerConfig('xp-write', {

@@ -54,6 +54,8 @@ import {
   registerProviderContainerConfig,
   type ProviderContainerContribution,
 } from './providers/provider-container-registry.js';
+import { WORKER_POLICY_CODEX_EFFORT } from './worker-policy.vendored.js';
+
 import type { ContainerConfig } from './container-config.js';
 import type { AgentGroup, Session } from './types.js';
 
@@ -298,7 +300,13 @@ describe('container instruction contracts', async () => {
         `If it was reshaped, update this test to match — it is the only thing keeping it in sync with ` +
         `buildContainerCodexConfig() in src/providers/codex.ts. ${PARALLEL_IMPL_NOTE}`,
     ).not.toBeNull();
-    const containerBase = new Function(`return ${literal![1]}`)() as string;
+    // The literal is evaluated in a bare scope, so every free identifier it uses
+    // must be supplied here. Today that is the vendored worker policy — and both
+    // sides read the SAME constant, which is the point: the host and container
+    // configs cannot name different Codex subagent efforts.
+    const containerBase = new Function('WORKER_POLICY_CODEX_EFFORT', `return ${literal![1]}`)(
+      WORKER_POLICY_CODEX_EFFORT,
+    ) as string;
 
     // Comments differ by design (each names its own generating file); every
     // other line must match exactly, in order, in both directions.
@@ -1167,13 +1175,10 @@ describe('buildMounts agent surfaces', async () => {
           ...containerConfig(),
           // One top-level entry and three sub-path entries, including a nested
           // pair and one naming a directory that does not exist.
-          excludePlugins: [
-            'codex',
-            'bootstrap/plugins',
-            'bootstrap/plugins/orchestrate',
-            'bootstrap/rootlevel',
-            'bootstrap/plugins/absent',
-          ],
+          // All real paths: an entry matching nothing now refuses the spawn
+          // outright (covered separately below), so this fixture exercises the
+          // mount behaviour rather than the admission rule.
+          excludePlugins: ['codex', 'bootstrap/plugins', 'bootstrap/plugins/orchestrate', 'bootstrap/rootlevel'],
         },
         'claude',
         {},
@@ -1192,6 +1197,61 @@ describe('buildMounts agent surfaces', async () => {
       });
       // The top-level entry is still honoured — that is the half that works.
       expect(pluginMounts).not.toContain('/workspace/plugins/codex');
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('refuses the spawn when an excludePlugins entry matches nothing on disk', async () => {
+    // The rule that closes the class three review rounds kept finding one string
+    // at a time: a NUL, a lone surrogate, a segment past NAME_MAX — each passes
+    // every shape check, equals no readdirSync name, and leaves the plugin
+    // mounted while the operator believes it withheld. "Cannot name a file" is
+    // not enumerable from the string; "matched nothing" is answerable here,
+    // where both sides are present.
+    //
+    // REFUSES rather than warns: excludePlugins is a withholding control, so an
+    // accepted entry that can never match is a silent fail-open, which is
+    // exactly what a warning nobody reads preserves.
+    const homedir = path.join(TEST_ROOT, 'home');
+    fs.mkdirSync(path.join(homedir, 'plugins', 'codex'), { recursive: true });
+    fs.mkdirSync(path.join(homedir, 'plugins', 'bootstrap', 'plugins', 'wwbd'), { recursive: true });
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(homedir);
+
+    try {
+      const ag = group('ag-unmatched-exclude', 'unmatched-exclude');
+      await createAgentGroup(ag);
+      withWorkgroup(ag);
+      await ensureContainerConfig(ag.id);
+      initGroupFilesystem(ag, {});
+      const build = (excludePlugins: string[]) =>
+        buildMounts(
+          ag,
+          session(`s-x-${excludePlugins.length}`, ag.id),
+          { ...containerConfig(), excludePlugins },
+          'claude',
+          {},
+        );
+
+      // Every shape the validator's character rules were chasing, plus the two
+      // it never could: a case mismatch and a plugin that is simply not here.
+      for (const bad of [
+        ['codex\u0000'],
+        ['codex\uD800'],
+        ['c'.repeat(256)],
+        ['Codex'],
+        ['never-installed'],
+        ['bootstrap/plugins/absent'],
+        ['bootstrap/absent/wwbd'],
+      ]) {
+        await expect(build(bad), `expected ${JSON.stringify(bad[0])} to refuse`).rejects.toThrow(/do not exist under/);
+      }
+
+      // What DOES exist still works, at both depths.
+      const mounts = await build(['codex', 'bootstrap/plugins/wwbd']);
+      const paths = mounts.map((m) => m.containerPath);
+      expect(paths).not.toContain('/workspace/plugins/codex');
+      expect(paths).toContain('/workspace/plugins/bootstrap');
     } finally {
       homedirSpy.mockRestore();
     }

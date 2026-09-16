@@ -130,6 +130,43 @@ describe('discoverPortableSkills', () => {
     expect(names).not.toContain('team-qa');
   });
 
+  it('orchestrate twins: each runtime mirrors the copy built for it, not whichever dir readdir hit first', () => {
+    // `orchestrate` ships as a twin pair, same skill name in both dirs:
+    //   plugins/orchestrate/skills        -> dispatches via Claude's Agent tool
+    //   plugins/orchestrate-agents/skills -> the codex/opencode port
+    // Only one can win per runtime (name collision), and without an explicit
+    // denylist entry the winner is decided by first-match-wins over an
+    // UNSORTED readdirSync — i.e. filesystem order, not intent. Asserting the
+    // resolved skillDir (not just the name) is the point: a name-only
+    // assertion passes even when the wrong copy wins, which is exactly the
+    // defect this test pins. opencode must land on the -agents port, matching
+    // how team-* already resolves from workflow-agents for that runtime.
+    const claudeDir = path.join(tmpDir, 'bootstrap', 'plugins', 'orchestrate', 'skills', 'orchestrate');
+    const agentsDir = path.join(tmpDir, 'bootstrap', 'plugins', 'orchestrate-agents', 'skills', 'orchestrate');
+    writeSkill(claudeDir, { name: 'orchestrate' });
+    writeSkill(agentsDir, { name: 'orchestrate' });
+    // Mirror the real tree: orchestrate-agents ships .codex-plugin, so Codex
+    // loads it natively and the manifest rule keeps it out of the codex mirror.
+    const agentsPlugin = path.join(tmpDir, 'bootstrap', 'plugins', 'orchestrate-agents', '.codex-plugin');
+    fs.mkdirSync(agentsPlugin, { recursive: true });
+    fs.writeFileSync(
+      path.join(agentsPlugin, 'plugin.json'),
+      JSON.stringify({ name: 'bootstrap-orchestrate-agents', version: '1.0.0' }),
+    );
+
+    const resolve = (rt: 'claude' | 'codex' | 'opencode') => {
+      const hits = discoverPortableSkills(tmpDir, { runtime: rt }).filter((s) => s.name === 'orchestrate');
+      expect(hits, `${rt}: expected exactly one orchestrate`).toHaveLength(1);
+      return hits[0].skillDir;
+    };
+
+    expect(resolve('claude')).toBe(claudeDir);
+    expect(resolve('opencode')).toBe(agentsDir);
+    // Codex loads orchestrate-agents natively via .codex-plugin, and the Claude
+    // copy needs a tool it lacks — neither belongs in the codex mirror.
+    expect(discoverPortableSkills(tmpDir, { runtime: 'codex' }).map((s) => s.name)).not.toContain('orchestrate');
+  });
+
   it('opencode provisions user-invocable:false helpers (no plugin loader); claude/codex exclude them', () => {
     // opencode has no native plugin loader — the discovery mirror is its ONLY skill delivery,
     // so referenceable helpers (user-invocable:false, e.g. team-verification-before-completion)
@@ -211,7 +248,7 @@ describe('discoverPortableSkills', () => {
     writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'wwbd', 'skills', 'wwbd'), { name: 'wwbd' });
     fs.mkdirSync(path.join(tmpDir, 'bootstrap', 'plugins', 'orchestrate'), { recursive: true });
     // Rule 8's `<repo>/<sub>` layout is gated on the sub-dir's Claude manifest,
-    // which a masked dir also lacks.
+    // which an empty sub-plugin directory also lacks.
     fs.mkdirSync(path.join(tmpDir, 'bootstrap', 'rootlevel'), { recursive: true });
 
     expect(discoverPortableSkills(tmpDir, { runtime: 'opencode' }).map((s) => s.name)).toEqual(['wwbd']);

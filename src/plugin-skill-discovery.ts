@@ -85,6 +85,12 @@ const DENY_SUB_PLUGIN_SKILL_DIRS_BY_RUNTIME: Record<AgentRuntime, Set<string>> =
     // the Claude plugin marketplace, so mirroring the codex variant would be
     // a name-collision duplicate.
     'bootstrap/plugins/workflow-agents/skills',
+    // orchestrate-agents: same reasoning as workflow-agents. Claude loads
+    // `bootstrap/plugins/orchestrate/skills` from the marketplace, so the
+    // agents twin is a same-name duplicate here. Without this entry the winner
+    // between the two directories is decided by first-match-wins over an
+    // unsorted readdirSync (see the discovery loop below), i.e. arbitrary.
+    'bootstrap/plugins/orchestrate-agents/skills',
   ]),
   codex: new Set<string>([
     // Claude workflow: requires Claude's Skill/Agent tool.
@@ -92,10 +98,20 @@ const DENY_SUB_PLUGIN_SKILL_DIRS_BY_RUNTIME: Record<AgentRuntime, Set<string>> =
     // Codex workflow: installed through `.codex-plugin/plugin.json`, not the
     // legacy skills mirror. Same-name collision would make precedence ambiguous.
     'bootstrap/plugins/workflow-agents/skills',
+    // Claude orchestrate: requires Claude's Skill/Agent tool, same as the
+    // Claude workflow above. Its orchestrate-agents twin needs no entry —
+    // that one ships `.codex-plugin`, so the manifest rule already keeps it
+    // out of the codex mirror.
+    'bootstrap/plugins/orchestrate/skills',
   ]),
   opencode: new Set<string>([
     // Claude workflow: requires Claude's Skill/Agent tool.
     'bootstrap/plugins/workflow/skills',
+    // Claude orchestrate: same reasoning as the Claude workflow above — its
+    // /orchestrate SKILL.md dispatches through Claude's Agent tool, which
+    // opencode does not have. Its twin under orchestrate-agents stays
+    // surfaced, matching how team-* already resolves from workflow-agents.
+    'bootstrap/plugins/orchestrate/skills',
     // workflow-agents is NOT denied for opencode — there's no native codex-plugin
     // loader on opencode, and surfacing the skill TEXT gives the agent
     // awareness of /team-* patterns even without the spawn_task harness
