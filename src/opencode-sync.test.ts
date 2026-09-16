@@ -20,7 +20,8 @@ vi.mock('./log.js', () => ({
 
 import { syncOpenCodePluginSkills, syncOpenCodeSubagents } from './opencode-sync.js';
 import { resolvePluginRoots } from './plugin-skill-discovery.js';
-import { copyOpenCodeSkills, mirrorSourceRootsByName } from './providers/opencode.js';
+import { splitExcludedPlugins } from './plugin-exclusions.js';
+import { copyOpenCodeSkills, excludedOpenCodeSkillNames, mirrorSourceRootsByName } from './providers/opencode.js';
 
 const HOME = path.join(TEST_ROOT, 'home');
 const GLOBAL_SKILLS = path.join(HOME, '.config', 'opencode', 'skill');
@@ -215,6 +216,47 @@ describe('syncOpenCodePluginSkills containment (#829)', () => {
     expect(fs.existsSync(path.join(GLOBAL_SKILLS, 'shared', '.nanoclaw-managed'))).toBe(false);
     syncOpenCodePluginSkills();
     expect(fs.existsSync(path.join(GLOBAL_SKILLS, 'shared', 'primitives.md'))).toBe(true);
+  });
+});
+
+describe('excludedOpenCodeSkillNames walks the mirror population (#836)', () => {
+  const subPluginSkill = (repo: string, sub: string, name: string): void => {
+    const dir = path.join(HOME, 'plugins', repo, 'plugins', sub);
+    fs.mkdirSync(path.join(dir, '.claude-plugin'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: sub }));
+    const skillDir = path.join(dir, 'skills', name);
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), `---\nname: ${name}\ndescription: ${name}\n---\n\nBody.\n`);
+  };
+
+  it('drops an excluded sub-plugin skill whose name a SCOPED plugin also claims', () => {
+    // `a-client` sorts first, so with the default deny set it wins discovery's
+    // first-plugin-wins dedup for `dup-skill` — it is not under an excluded
+    // path, so the name is not dropped. But the MIRROR denied it for being
+    // workgroup-scoped and published the excluded sub-plugin's directory under
+    // that name, so the group receives the excluded source: the exclusion
+    // inverted by two walks disagreeing about one population.
+    pluginSkill('a-client', 'dup-skill');
+    subPluginSkill('mono', 'alpha', 'dup-skill');
+    scopePlugins({ 'a-client': ['client-wg'] });
+
+    const dropped = excludedOpenCodeSkillNames(
+      path.join(HOME, 'plugins'),
+      splitExcludedPlugins(['mono/plugins/alpha']),
+    );
+
+    expect(dropped.has('dup-skill')).toBe(true);
+    // And the mirror really does hold the excluded source under that name.
+    syncOpenCodePluginSkills();
+    expect(fs.readFileSync(path.join(GLOBAL_SKILLS, 'dup-skill', '.nanoclaw-source-root'), 'utf-8')).toBe(
+      `${JSON.stringify(fs.realpathSync(path.join(HOME, 'plugins', 'mono')))}\n`,
+    );
+  });
+
+  it('still drops nothing for a group with no sub-path entry, which is every group today', () => {
+    subPluginSkill('mono', 'alpha', 'alpha-skill');
+    expect(excludedOpenCodeSkillNames(path.join(HOME, 'plugins'), splitExcludedPlugins(['mono'])).size).toBe(0);
+    expect(excludedOpenCodeSkillNames(path.join(HOME, 'plugins'), splitExcludedPlugins(undefined)).size).toBe(0);
   });
 });
 
