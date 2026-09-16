@@ -1450,6 +1450,9 @@ async function deliverMessage(
   // roots glued into one day-thread. content.threadAnchor === false exempts
   // the whole series; the anchor default stays ON because the storm shape
   // (repeated status posts) is the common case.
+  // Edits/reactions target a message, not a new post: they follow the anchor to reach in-thread
+  // messages, but address the anchor message itself at root and never drop/record an anchor.
+  const isInPlaceOp = content.operation === 'edit' || content.operation === 'reaction';
   const isTaskSessionPost = session.messaging_group_id === null && isTaskThread(session.thread_id);
   const taskAnchorEligible = isTaskSessionPost && baseThreadId === null && !(await isThreadAnchorExempt(session));
 
@@ -1464,7 +1467,11 @@ async function deliverMessage(
   let usedAnchor = false;
   if (taskAnchorEligible) {
     const anchor = await getTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id);
-    if (anchor && anchorRotationKey(anchor.createdAt) === anchorRotationKey(new Date().toISOString())) {
+    if (
+      anchor &&
+      anchorRotationKey(anchor.createdAt) === anchorRotationKey(new Date().toISOString()) &&
+      !(isInPlaceOp && content.messageId === anchor.threadPlatformId)
+    ) {
       // Same encoding as the turn anchor below: `<platform-address>:<thread>`.
       effectiveThreadId = `${msg.platform_id}:${anchor.threadPlatformId}`;
       usedAnchor = true;
@@ -1475,7 +1482,8 @@ async function deliverMessage(
       anchor &&
       anchor.inReplyTo === msg.in_reply_to &&
       anchor.channelType === msg.channel_type &&
-      anchor.platformId === msg.platform_id
+      anchor.platformId === msg.platform_id &&
+      !(isInPlaceOp && content.messageId === anchor.messageId)
     ) {
       // Adapters decode a thread id as `<platform-address>:<thread>` —
       // `discord:<guild>:<channel>:<thread>`, `slack:<channel>:<ts>`. `platform_id`
@@ -1509,10 +1517,8 @@ async function deliverMessage(
   } catch (err) {
     if (!usedAnchor) throw err;
     // Platforms disagree on whether a parent message is addressable as a thread.
-    // Slack threads on the parent's ts, so the encoded anchor works. Discord
-    // needs a real thread object to exist first — a thread started from a message
-    // shares its snowflake, but when none was created the encoded id resolves to
-    // nothing. Never let that cost the message: post at root instead.
+    // Slack threads on the parent's ts; Discord's adapter opens a thread on first use
+    // (installMessageThreadAutoCreate), which can fail (DMs, permission). Post at root.
     //
     // Also record that anchoring is off for the REST OF THIS TURN (turn anchor)
     // or drop the stale anchor outright (task anchor — the next fire just
@@ -1525,7 +1531,9 @@ async function deliverMessage(
       attemptedThreadId: effectiveThreadId,
       err: err instanceof Error ? err.message : String(err),
     });
-    if (taskAnchorEligible) {
+    if (isInPlaceOp) {
+      // The target just wasn't in the thread; the anchor itself is still good.
+    } else if (taskAnchorEligible) {
       await deleteTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id);
     } else {
       chatThreadAnchor.delete(session.id);
@@ -1547,7 +1555,7 @@ async function deliverMessage(
   // actually posted at root (effectiveThreadId still null) — a message that
   // already threaded under an existing anchor must not overwrite it, or the
   // next post would chain off it instead of the original root.
-  if (effectiveThreadId === null && platformMsgId) {
+  if (effectiveThreadId === null && platformMsgId && !isInPlaceOp) {
     if (taskAnchorEligible) {
       await setTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id, platformMsgId, new Date().toISOString());
     } else if (turnAnchorEligible) {
