@@ -2059,15 +2059,15 @@ function canonicalUsageModel(model: string | undefined, env: Record<string, stri
  * Per-model-family default effort, applied only when nothing upstream chose
  * one (-e flag, group provider config, operator NANOCLAW_EFFORT_OVERRIDE).
  *
- *   opus → medium — operator decision 2026-09-15, replacing the `high` of
- *           2026-07-27. Opus is now the default model for an unpinned group
- *           (DEFAULT_OPUS_MODEL in src/claude-spawn-defaults.ts), so this
- *           default is what the whole fleet burns by default rather than
- *           what a deliberate escalation burns; medium is the tier that
- *           choice was made at. Applies to the bare `opus` alias and every
- *           concrete claude-opus-* id; this install only runs Opus 5+ (opus
- *           4.8 and below are no longer used). Operators dial up per group,
- *           per channel or per turn via -e / NANOCLAW_EFFORT_OVERRIDE.
+ *   opus → high — operator decision 2026-07-27, aligned with the GPT 5.6 SOL
+ *           default for cross-provider parity, and reaffirmed 2026-09-16 when
+ *           Opus became the model an UNPINNED group runs (DEFAULT_OPUS_MODEL
+ *           in src/claude-spawn-defaults.ts): the fleet baseline is Opus at
+ *           `high`, not a quieter tier chosen because it is now the default.
+ *           Applies to the bare `opus` alias and every concrete claude-opus-*
+ *           id; this install only runs Opus 5+ (opus 4.8 and below are no
+ *           longer used). Operators dial down or up per group, per channel or
+ *           per turn via -e / NANOCLAW_EFFORT_OVERRIDE.
  *   fable → medium — keep Fable's default at medium; operators can dial up
  *           via -e or NANOCLAW_EFFORT_OVERRIDE when a task warrants it.
  *   sonnet → xhigh — Sonnet 5 (the bare `sonnet` alias) defaults to xhigh, the
@@ -2083,10 +2083,10 @@ function defaultEffortForModel(model: string | undefined): string | undefined {
   const m = model.toLowerCase();
   // Opus 5+ only — every opus id (and the bare alias, which resolves to
   // DEFAULT_OPUS_MODEL via ANTHROPIC_DEFAULT_OPUS_MODEL) defaults to
-  // `medium`. Pre-5 opus ids are no longer used in this install; if one ever
-  // appears, it falls through to the same `medium` default rather than 400 on
+  // `high`. Pre-5 opus ids are no longer used in this install; if one ever
+  // appears, it falls through to the same `high` default rather than 400 on
   // the unsupported `xhigh` of older opus generations.
-  if (m === 'opus' || m.startsWith('claude-opus-')) return 'medium';
+  if (m === 'opus' || m.startsWith('claude-opus-')) return 'high';
   // Sonnet 5 (the bare `sonnet` alias resolves to it) defaults to xhigh.
   if (m === 'sonnet' || m.startsWith('claude-sonnet-')) return 'xhigh';
   if (m.startsWith('claude-fable-')) return 'medium';

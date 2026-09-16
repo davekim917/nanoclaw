@@ -106,11 +106,11 @@ describe('END-TO-END after the deletion', () => {
     expect(r.effort).toBe('medium');
   });
 
-  it('the unconfigured fleet baseline resolves to Opus [1m] / medium', () => {
+  it('the unconfigured fleet baseline resolves to Opus [1m] / high', () => {
     const r = spawn({});
     console.log('  baseline      -> model=', r.model, ' effort=', r.effort);
     expect(r.model).toBe('claude-opus-5[1m]');
-    expect(r.effort).toBe('medium');
+    expect(r.effort).toBe('high');
   });
 
   it('a `model: opus` group pin resolves to Opus even where the group runs Sonnet', () => {
@@ -132,6 +132,6 @@ describe('END-TO-END after the deletion', () => {
     const r = spawn({ model: 'gpt-6-astra', effort: 'ultra' });
     console.log('  codex residue -> model=', r.model, ' effort=', r.effort);
     expect(r.model).toBe('claude-opus-5[1m]');
-    expect(r.effort).toBe('medium');
+    expect(r.effort).toBe('high');
   });
 });

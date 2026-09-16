@@ -1,14 +1,14 @@
-# Migration: the `opus` alias means Opus, and an unpinned Claude group runs it
+# Migration: the `opus` alias means Opus, and the fleet defaults move
 
 Two things changed together, and only one of them is a default anyone chose.
 
 1. **The defect.** `ANTHROPIC_DEFAULT_OPUS_MODEL` — the SDK short-circuit that decides what the bare word `opus` resolves to — carried **each group's own resolved model**, not an Opus id. So "opus" meant "whatever this group runs". When the unpinned Claude default moved to Sonnet 5 (2026-09-14, `7d0e7df3a`), the `"model": "opus"` pin that `src/group-init.ts` writes into **every** group's `.claude-shared/settings.json` started resolving to `claude-sonnet-5`. Measured in a running container: `ANTHROPIC_DEFAULT_OPUS_MODEL=claude-sonnet-5`. The alias is now the install's Opus constant in every group, and the group's model travels in its own variable, `NANOCLAW_CLAUDE_MODEL`.
 
-2. **The default.** An unpinned Claude group now resolves to `claude-opus-5[1m]`, and Opus's per-family default effort moves `high` → `medium` (that default is now the fleet's baseline burn rather than a deliberate escalation's).
+2. **The defaults.** An unpinned **Claude** group now resolves to `claude-opus-5[1m]`, at Opus's unchanged `high` family effort. An unpinned **Codex** group now resolves to `gpt-5.6-sol` at `high` reasoning (was `gpt-5.6-terra` at `xhigh`) — the same tier on both providers, so a group's provider decides what runs it, not what tier it runs at.
 
-**This changes production behaviour on deploy.** Every Claude group with no model configured moves from Sonnet 5/`xhigh` to Opus 5 [1m]/`medium` on its next spawn, and every `model: opus` subagent or settings pin — in every group, including Sonnet-pinned ones — starts genuinely running Opus.
+**This changes production behaviour on deploy.** Every Claude group with no model configured moves from Sonnet 5/`xhigh` to Opus 5 [1m]/`high` on its next spawn; every Codex group with no model configured moves from Terra/`xhigh` to Sol/`high`; and every `model: opus` subagent or settings pin — in every group, including Sonnet-pinned ones — starts genuinely running Opus. **No pin is ever rewritten**, on either provider.
 
-Pins are data (no deploy); the defaults are code (needs one). **A group you want held on Sonnet must be pinned BEFORE you deploy**, or it runs Opus from the first spawn after the restart.
+Pins are data (no deploy); the defaults are code (needs one). **A group you want held where it is must be pinned BEFORE you deploy**, or it runs the new default from the first spawn after the restart.
 
 ## 1. Detect
 
@@ -50,7 +50,19 @@ A per-channel wiring can also pin a model, and it outranks the group config; che
 ncl wirings list --json | jq -r '.data[] | select(.default_model != null) | [.id, .agent_group_id, .messaging_group_id, .default_model] | @tsv'
 ```
 
-Anything reading `(unpinned)` with no channel pin runs Opus 5 [1m] at `medium` after deploy.
+A Claude group whose third column already reads `claude-opus-5[1m]`, with no channel pin above it, is staying put. Everything else moves to Opus 5 [1m] at `high` after deploy.
+
+**Codex groups** are simpler: their fleet default is applied inside the container, so a group is unpinned exactly when its `container.json` carries neither `providerConfig.model`/`reasoning_effort` nor a top-level `model`/`effort`. List them with:
+
+```bash
+for f in groups/*/container.json; do
+  jq -r --arg f "$f" 'select(.provider == "codex")
+    | [$f, (.providerConfig.model // .model // "(unpinned)"),
+           (.providerConfig.reasoning_effort // .effort // "(unpinned)")] | @tsv' "$f"
+done
+```
+
+Each column moves independently: a row reading `(unpinned)` in column 2 runs `gpt-5.6-sol` after deploy, and `(unpinned)` in column 3 runs `high`. A configured value in either column is a pin and is untouched. (Measured on this install: every Codex group sets `effort` explicitly, so only the model moves.)
 
 To see the defect itself in a live container before you deploy:
 
@@ -104,6 +116,6 @@ What actually ran per turn is recorded, not inferred — the runner logs `query:
 
 Nothing here is destructive and no data migrates, so rollback is per-group configuration or a revert:
 
-- **One group**: `ncl groups config update --id <group-id> --model claude-sonnet-5 --effort xhigh`, then restart that group (`ncl groups restart --id <group-id>`).
-- **The fleet default**: revert `let model = DEFAULT_OPUS_MODEL` to `DEFAULT_SONNET_MODEL` in `src/claude-spawn-defaults.ts`, and `defaultEffortForModel`'s opus branch to `high` in `container/agent-runner/src/providers/claude.ts`, then rebuild and restart.
+- **One group**: `ncl groups config update --id <group-id> --model <the model it had> --effort <the effort it had>`, then restart that group (`ncl groups restart --id <group-id>`). Works the same for a Codex group (`--model gpt-5.6-terra --effort xhigh`).
+- **The fleet defaults**: revert `let model = DEFAULT_OPUS_MODEL` to `DEFAULT_SONNET_MODEL` in `src/claude-spawn-defaults.ts` for Claude, and `DEFAULT_CODEX_MODEL`/`DEFAULT_CODEX_EFFORT` in `container/agent-runner/src/providers/codex.ts` for Codex, then rebuild and restart. Each provider's default is one constant; neither touches the other.
 - **The alias separation is not the part to roll back.** Reverting it restores the defect: the word `opus` goes back to meaning whatever each group runs. If the fleet default is the problem, change the default.
