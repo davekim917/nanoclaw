@@ -60,13 +60,13 @@ afterEach(() => {
 });
 
 describe('writeContainerConfig refuses to overwrite a non-object root', () => {
-  it('REFUSES the array-wrapping-a-real-config shape, leaving the operator bytes intact', () => {
+  it('REFUSES the array-wrapping-a-real-config shape, leaving the operator bytes intact', async () => {
     // The reachable case: the exclusions are right there in the file, and the
     // tolerant reader answers "no exclusions" for them.
     const original = JSON.stringify([{ excludePlugins: ['bootstrap/plugins/orchestrate'] }]);
     fs.writeFileSync(configFile(), original);
 
-    expect(() => updateContainerConfig(FOLDER, (c) => void (c.groupName = 'probe'))).toThrow(
+    await expect(updateContainerConfig(FOLDER, (c) => void (c.groupName = 'probe'))).rejects.toThrow(
       /refusing to overwrite .*root is a JSON array/,
     );
     expect(fs.readFileSync(configFile(), 'utf8')).toBe(original);
@@ -102,8 +102,9 @@ describe('writeContainerConfig refuses to overwrite a non-object root', () => {
     // leaves the entries visibly in the file, the tolerant reader answers
     // "none", and nothing distinguishes that from any other parse failure.
     // Automatic replacement was never a repair path — every writer is
-    // read-modify-write over that reader (`updateContainerConfig`,
-    // `ensureRuntimeFields`, `applyOptOut`), so each would persist the
+    // read-modify-write over that reader — since #840 every one of them
+    // (`ensureRuntimeFields`, `applyOptOut`, the CLI, self-mod) goes through
+    // the single locked `updateContainerConfig` — so each would persist the
     // reader's guess. Repair is a person editing the file.
     const truncated = '{"excludePlugins": ["bootstrap/plugins/orchestrate"],';
     fs.writeFileSync(configFile(), truncated);
@@ -122,13 +123,13 @@ describe('writeContainerConfig refuses to overwrite a non-object root', () => {
     expect(readContainerConfig(FOLDER).groupName).toBe('probe');
   });
 
-  it('leaves first-time initialization alone — initContainerConfig never writes over a file', () => {
+  it('leaves first-time initialization alone — initContainerConfig never writes over a file', async () => {
     // The only caller that legitimately CREATES a config returns before
     // writing when one exists, so a refused overwrite cannot wedge setup.
     fs.rmSync(configFile(), { force: true });
-    expect(initContainerConfig(FOLDER)).toBe(true);
+    expect(await initContainerConfig(FOLDER)).toBe(true);
     fs.writeFileSync(configFile(), '{ truncated');
-    expect(initContainerConfig(FOLDER)).toBe(false);
+    expect(await initContainerConfig(FOLDER)).toBe(false);
     expect(fs.readFileSync(configFile(), 'utf8')).toBe('{ truncated');
   });
 });

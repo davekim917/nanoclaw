@@ -231,7 +231,7 @@ registerResource({
         await ensureContainerConfig(id);
         if (timezone) {
           await updateContainerConfigScalars(id, { timezone });
-          updateContainerConfig(folder, (config) => {
+          await updateContainerConfig(folder, (config) => {
             config.timezone = timezone;
           });
         }
@@ -616,8 +616,6 @@ registerResource({
           }
         }
 
-        if (Object.keys(updates).length > 0) await updateContainerConfigScalars(id, updates);
-
         // Mirror the runtime-selecting scalars into container.json. The DB row
         // is a read-side projection (flag vocabulary, task-flag validation);
         // the FILE is what the spawn path and the in-container runner actually
@@ -625,8 +623,18 @@ registerResource({
         // group running its old provider after `config update --provider`,
         // which reads as "the command did nothing" — the update appears in
         // `config get` while the container keeps booting the old runtime.
-        // updateContainerConfig re-reads before writing, so a concurrent
-        // spawn-time identity write is not clobbered.
+        // `updateContainerConfig` holds the group's file lock across its
+        // read-mutate-write, so a concurrent spawn-time identity write can
+        // neither be clobbered by this one nor clobber it.
+        //
+        // THE FILE COMMITS FIRST, and the projection follows (#840). Either
+        // write can fail, so one of the two disagreements has to be the one
+        // this command can leave behind; file-ahead is the recoverable half.
+        // The container boots what the operator asked for and the CLI's flag
+        // vocabulary lags until the command is re-run. Projection-ahead was the
+        // other way round: `config get` reports the new provider while the
+        // container keeps booting the old one, which is indistinguishable from
+        // success at every later read.
         if (
           updates.provider !== undefined ||
           updates.model !== undefined ||
@@ -634,7 +642,7 @@ registerResource({
           updates.assistant_name !== undefined ||
           updates.timezone !== undefined
         ) {
-          updateContainerConfig(group.folder, (config) => {
+          await updateContainerConfig(group.folder, (config) => {
             if (updates.provider !== undefined) config.provider = updates.provider as string;
             if (updates.model !== undefined) config.model = (updates.model as string) || undefined;
             if (updates.effort !== undefined) config.effort = (updates.effort as string) || undefined;
@@ -647,8 +655,10 @@ registerResource({
           });
         }
 
+        if (Object.keys(updates).length > 0) await updateContainerConfigScalars(id, updates);
+
         if (hasResourceUpdate) {
-          updateContainerConfig(group.folder, (config) => {
+          await updateContainerConfig(group.folder, (config) => {
             const resources: ContainerResources = {
               ...(config.resources ?? {}),
               memory: { ...(config.resources?.memory ?? {}) },
@@ -741,7 +751,7 @@ registerResource({
         // for mcp_servers/additional_mounts since the spawn path never reads
         // those fields from the DB; the backfill-container-configs sync is
         // file→DB one-way, so DB drift gets overwritten on next host start.
-        const fileConfig = updateContainerConfig(group.folder, (cfg) => {
+        const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
           assertMcpServerNotPluginOwned(cfg.mcpServers?.[name], name, group.folder);
           if (!cfg.mcpServers) cfg.mcpServers = {};
           cfg.mcpServers[name] = newEntry;
@@ -768,7 +778,7 @@ registerResource({
 
         // Validate against the canonical file (DB cache may be stale post-
         // operator-edit; file is the source of truth).
-        const fileConfig = updateContainerConfig(group.folder, (cfg) => {
+        const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
           if (!cfg.mcpServers || !cfg.mcpServers[name]) {
             throw new Error(`MCP server "${name}" not found`);
           }
@@ -802,7 +812,7 @@ registerResource({
         // Build path happens to read from DB too, so package-add WAS working
         // pre-fix — but file would have drifted, leaving operators with stale
         // container.json and a DB that gets clobbered by next backfill.
-        const fileConfig = updateContainerConfig(group.folder, (cfg) => {
+        const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
           if (!cfg.packages) cfg.packages = { apt: [], npm: [] };
           if (apt && !cfg.packages.apt.includes(apt)) cfg.packages.apt.push(apt);
           if (npm && !cfg.packages.npm.includes(npm)) cfg.packages.npm.push(npm);
@@ -833,7 +843,7 @@ registerResource({
         const npm = args.npm as string | undefined;
         if (!apt && !npm) throw new Error('Provide --apt <pkg> or --npm <pkg>');
 
-        const fileConfig = updateContainerConfig(group.folder, (cfg) => {
+        const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
           if (!cfg.packages) cfg.packages = { apt: [], npm: [] };
           if (apt) cfg.packages.apt = cfg.packages.apt.filter((p) => p !== apt);
           if (npm) cfg.packages.npm = cfg.packages.npm.filter((p) => p !== npm);
@@ -871,7 +881,7 @@ registerResource({
           containerPath,
           ...(args.ro || args.readonly ? { readonly: true } : {}),
         };
-        const fileConfig = updateContainerConfig(group.folder, (cfg) => {
+        const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
           if (!cfg.additionalMounts) cfg.additionalMounts = [];
           if (!cfg.additionalMounts.some((m) => m.hostPath === hostPath && m.containerPath === containerPath)) {
             cfg.additionalMounts.push(mount);
@@ -900,7 +910,7 @@ registerResource({
         const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
-        const fileConfig = updateContainerConfig(group.folder, (cfg) => {
+        const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
           cfg.additionalMounts = (cfg.additionalMounts ?? []).filter(
             (m) => !(m.hostPath === hostPath && m.containerPath === containerPath),
           );
