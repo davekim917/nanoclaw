@@ -73,7 +73,7 @@ const SEVEN_DAY_MINS = 7 * 24 * 60;
  * fallback BEFORE the wall, so the last turns of the week land somewhere that
  * can answer them. Spec: docs/specs/quota-burn/plan.md item 0.7.
  */
-// Park at 95% used, not 100%: leaves headroom for the in-flight turn to finish before the wall. A wall mid-turn aborts and replays the whole turn, which costs more than the last 5% of a weekly bucket. Matches SLOT_PICK_HEADROOM on the Claude side (#811). Tune from measurement.
+// Park at 95% used, not 100%: leaves headroom for the in-flight turn to finish before the wall. A wall mid-turn aborts and replays the whole turn, which costs more than the last 5% of a weekly bucket. Tune from measurement.
 export const CODEX_PARK_USED_PERCENT = 95;
 
 export interface ClassifiedCodexWindow {

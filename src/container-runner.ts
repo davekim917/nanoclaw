@@ -6708,8 +6708,8 @@ async function buildContainerArgs(
     // clock (src/slot-usage-survey.ts). The runner used to pull
     // /api/oauth/usage for all six slots itself at every session start, which
     // made each token's request rate equal the fleet's spawn rate and earned a
-    // fleet-wide 429 (PR #811 follow-up). It now reads the answer from here and
-    // makes no network call of its own.
+    // fleet-wide 429 (PR #811 follow-up). Telemetry only: the runner records
+    // it as sample rows, never picks a slot by it (numbered order, 2026-09-16).
     //
     // Emitted from THIS block, unconditionally, alongside the slots it
     // describes: a spawn that forwards an OAuth ring always forwards a survey

@@ -4,10 +4,9 @@
  *
  * WHY THIS LIVES ON THE HOST
  *
- * #811 put the survey in the agent-runner: `pickCredentialSlotByUsage` fired
- * one `/api/oauth/usage` request per ring slot at every session start. That is
- * called exactly once per container boot (`container/agent-runner/src/index.ts`,
- * the `await provider.pickCredentialSlotByUsage?.()` line), so the request rate
+ * #811 put the survey in the agent-runner: its slot pick fired one
+ * `/api/oauth/usage` request per ring slot at every session start, exactly
+ * once per container boot, so the request rate
  * seen by EACH token equals the fleet's Claude session-start rate — ~25
  * spawns/hour here, bursting 4-8 in a single minute. Measured 2026-09-15
  * 03:53Z: every slot answered `HTTP 429 rate_limit_error` with
@@ -23,8 +22,13 @@
  * the pull once and exits, so a per-process interval is a no-op. The limit is
  * per credential, fleet-wide, and the only process that sees the whole fleet
  * is this one. So the host surveys on its own clock and each spawn carries the
- * readings in `NANOCLAW_SLOT_USAGE_SURVEY`; the runner does the picking and
- * the sample recording exactly as before, with no network call of its own.
+ * readings in `NANOCLAW_SLOT_USAGE_SURVEY`; the runner records them as
+ * `usage_pull` sample rows (`ClaudeProvider.recordSlotUsageSurvey`), with no
+ * network call of its own.
+ *
+ * TELEMETRY ONLY. Since 2026-09-16 (operator decision) the readings never
+ * choose a credential: slots run in numbered order and advance on a wall. The
+ * usage-maximizing pick this survey was built to feed is gone.
  *
  * Request volume is therefore a function of wall-clock time and ring size
  * ALONE — `SLOT_USAGE_SURVEY_MIN_INTERVAL_MS` per slot — and completely
@@ -81,7 +85,7 @@ export interface RingSlot {
  * after it in index order, the OneCLI `placeholder` sentinel refused, and
  * duplicates dropped BY VALUE keeping the first name. A slot surveyed under a
  * name the ring does not carry is a wasted request, and a ring slot missing
- * from the survey is a slot the pick cannot rank.
+ * from the survey is a slot with no telemetry.
  */
 export function ringSlotsForSurvey(
   primary: string | undefined,
@@ -123,8 +127,7 @@ export const OAUTH_BETA_HEADER = 'oauth-2025-04-20';
  * polling it every 30-60s falling into a permanent 429 loop. So treat this
  * constant as a starting point, and treat widening it as the FIRST answer if
  * 429s persist — never retrying harder. Tune from measurement: 429s still in
- * the host log -> widen; picks landing on slots already past the wall ->
- * narrow.
+ * the host log -> widen.
  */
 export const SLOT_USAGE_SURVEY_MIN_INTERVAL_MS = 10 * 60_000;
 
@@ -191,8 +194,7 @@ function stateKey(credentialSet: string, slotName: string): string {
  * and 64 bits of a hash over a high-entropy secret collides with nothing.
  *
  * Why this exists: a cached reading that outlives its credential is worse than
- * no reading. The pick would rank a fresh account on the replaced account's
- * utilization, and `recordRateLimitSamples` would file the OLD account's
+ * no reading: `recordRateLimitSamples` would file the OLD account's
  * numbers under the new one — poisoning the very telemetry quota-burn reads.
  * The 45-minute age guard cannot see that, because the reading is young; only
  * identity can. (PR #821 review r1.)
@@ -249,7 +251,7 @@ export interface FetchSlotUsageOptions {
  *
  * Non-window keys the endpoint returns (`limits`, `extra_usage`, …) are
  * dropped HERE rather than forwarded: this result is serialized into a
- * container's environment, so it carries only what the pick reads.
+ * container's environment, so it carries only what the sample rows need.
  */
 export async function fetchSlotUsage(
   token: string,

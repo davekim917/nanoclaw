@@ -1,5 +1,6 @@
 /**
- * Quota-burn 0.6: usage-maximizing OAuth slot pick at session start.
+ * Per-slot OAuth plan-utilization telemetry at session start — and the proof
+ * that it never picks the credential (slots run in numbered order).
  *
  * Fixtures are raw `/api/oauth/usage` bodies (utilization 0-100) as the CLI
  * passes them through to `get_usage`'s `rate_limits`. The runner makes NO
@@ -13,142 +14,18 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
 import { ClaudeProvider, usageResponseToSamples } from './claude.js';
 import {
-  SLOT_PICK_HEADROOM,
   SLOT_USAGE_SURVEY_ENV,
   SLOT_USAGE_SURVEY_MAX_AGE_MS,
-  formatSlotRanking,
   parseSlotUsageSurvey,
-  pickSlotByUsage,
   surveyEntryToUsageResponse,
-  type SlotUsageReading,
-} from './claude-slot-pick.js';
+} from './claude-slot-usage.js';
 import { getRateLimitSampleRows } from '../modules/mailbox/index.js';
 import { getCredentialSlot, setCredentialSlot } from '../modules/mailbox/session-state.js';
 import { initTestSessionDb } from '../modules/mailbox/testing.js';
 
 const WHO = { account: 'x', credentialSet: null, lane: null };
 
-/** Raw usage body → the sample rows the provider would record for one slot. */
-function reading(name: string, body: Record<string, unknown> | null): SlotUsageReading {
-  if (body === null) return { name, samples: null };
-  return {
-    name,
-    samples: usageResponseToSamples(
-      { subscription_type: null, rate_limits_available: true, rate_limits: body as never },
-      { ...WHO, account: name },
-    ),
-  };
-}
-
 const win = (utilization: number, resets_at = '2026-09-17T00:00:00Z') => ({ utilization, resets_at });
-
-describe('pickSlotByUsage — the rule', () => {
-  it('picks the highest seven_day utilization that is still below the headroom line (drain most-used first)', () => {
-    const pick = pickSlotByUsage([
-      reading('CLAUDE_CODE_OAUTH_TOKEN', { five_hour: win(10), seven_day: win(76) }),
-      reading('CLAUDE_CODE_OAUTH_TOKEN_2', { five_hour: win(40), seven_day: win(87) }),
-      reading('CLAUDE_CODE_OAUTH_TOKEN_3', { five_hour: win(5), seven_day: win(88) }),
-      reading('CLAUDE_CODE_OAUTH_TOKEN_5', { five_hour: win(0), seven_day: win(21) }),
-      reading('CLAUDE_CODE_OAUTH_TOKEN_6', { five_hour: win(60), seven_day: win(18) }),
-    ]);
-    expect(pick.chosen).toBe('CLAUDE_CODE_OAUTH_TOKEN_3');
-  });
-
-  it('leaves SLOT_PICK_HEADROOM: a slot at 0.96 is skipped in favour of one at 0.90', () => {
-    expect(SLOT_PICK_HEADROOM).toBe(0.05);
-    const pick = pickSlotByUsage([
-      reading('A', { five_hour: win(1), seven_day: win(96) }),
-      reading('B', { five_hour: win(1), seven_day: win(90) }),
-    ]);
-    expect(pick.chosen).toBe('B');
-    expect(pick.ranking[0]).toMatchObject({ name: 'A', sevenDay: 0.96, skipped: 'seven_day_exhausted' });
-  });
-
-  it('a slot at 0.94 is still inside the headroom line and is picked over 0.90', () => {
-    const pick = pickSlotByUsage([
-      reading('A', { five_hour: win(1), seven_day: win(94) }),
-      reading('B', { five_hour: win(1), seven_day: win(90) }),
-    ]);
-    expect(pick.chosen).toBe('A');
-  });
-
-  it('tiebreaks equal seven_day on the highest five_hour below 1.0', () => {
-    const pick = pickSlotByUsage([
-      reading('A', { five_hour: win(20), seven_day: win(50) }),
-      reading('B', { five_hour: win(70), seven_day: win(50) }),
-      reading('C', { five_hour: win(45), seven_day: win(50) }),
-    ]);
-    expect(pick.chosen).toBe('B');
-  });
-
-  it('falls back to ring order on an exact tie of both windows', () => {
-    const pick = pickSlotByUsage([
-      reading('A', { five_hour: win(20), seven_day: win(50) }),
-      reading('B', { five_hour: win(20), seven_day: win(50) }),
-    ]);
-    expect(pick.chosen).toBe('A');
-  });
-
-  it('skips a slot whose seven_day is exhausted (>= 1.0), even though it ranks highest', () => {
-    const pick = pickSlotByUsage([
-      reading('A', { five_hour: win(3), seven_day: win(100) }),
-      reading('B', { five_hour: win(50), seven_day: win(83) }),
-    ]);
-    expect(pick.chosen).toBe('B');
-    expect(pick.ranking[0]).toMatchObject({ name: 'A', sevenDay: 1, skipped: 'seven_day_exhausted' });
-  });
-
-  it('skips a slot whose pull said plan limits do not apply (available: false)', () => {
-    const notApplicable: SlotUsageReading = {
-      name: 'A',
-      samples: usageResponseToSamples({ rate_limits_available: false }, { ...WHO, account: 'A' }),
-    };
-    const pick = pickSlotByUsage([notApplicable, reading('B', { five_hour: win(1), seven_day: win(2) })]);
-    expect(pick.chosen).toBe('B');
-    expect(pick.ranking[0]!.skipped).toBe('not_applicable');
-  });
-
-  it('skips an unsampled slot (pull failed) rather than guessing its usage', () => {
-    const pick = pickSlotByUsage([reading('A', null), reading('B', { five_hour: win(1), seven_day: win(2) })]);
-    expect(pick.chosen).toBe('B');
-    expect(pick.ranking[0]!.skipped).toBe('unsampled');
-  });
-
-  it('skips a slot with no seven_day window — it cannot be ranked', () => {
-    const pick = pickSlotByUsage([reading('A', { five_hour: win(1) }), reading('B', { five_hour: win(1), seven_day: win(2) })]);
-    expect(pick.chosen).toBe('B');
-    expect(pick.ranking[0]!.skipped).toBe('no_seven_day');
-  });
-
-  it('skips a slot whose five_hour window is full — its first request would 429', () => {
-    const pick = pickSlotByUsage([
-      reading('A', { five_hour: win(100), seven_day: win(90) }),
-      reading('B', { five_hour: win(10), seven_day: win(60) }),
-    ]);
-    expect(pick.chosen).toBe('B');
-    expect(pick.ranking[0]!.skipped).toBe('five_hour_exhausted');
-  });
-
-  it('returns chosen: null when every slot is exhausted or unreadable (caller keeps today’s behaviour)', () => {
-    const pick = pickSlotByUsage([
-      reading('A', { five_hour: win(0), seven_day: win(100) }),
-      reading('B', null),
-      reading('C', { five_hour: win(0), seven_day: win(120) }),
-    ]);
-    expect(pick.chosen).toBeNull();
-    expect(pick.ranking.map((r) => r.skipped)).toEqual(['seven_day_exhausted', 'unsampled', 'seven_day_exhausted']);
-  });
-
-  it('formats the ranking as one log line with percentages and skip reasons', () => {
-    const pick = pickSlotByUsage([
-      reading('CLAUDE_CODE_OAUTH_TOKEN_2', { five_hour: win(12), seven_day: win(87) }),
-      reading('CLAUDE_CODE_OAUTH_TOKEN_4', { five_hour: win(3), seven_day: win(100) }),
-    ]);
-    expect(formatSlotRanking(pick.ranking)).toBe(
-      'CLAUDE_CODE_OAUTH_TOKEN_2 7d=87% 5h=12% · CLAUDE_CODE_OAUTH_TOKEN_4 7d=100% 5h=3% skipped:seven_day_exhausted',
-    );
-  });
-});
 
 describe('parseSlotUsageSurvey — reading what the host handed over', () => {
   const now = Date.parse('2026-09-15T06:00:00.000Z');
@@ -170,7 +47,7 @@ describe('parseSlotUsageSurvey — reading what the host handed over', () => {
     expect(rows.find((r) => r.limitType === 'seven_day')!.resetsAt).toBe('2026-09-17T00:00:00Z');
   });
 
-  it('drops a reading older than the max age rather than steering the pick with it', () => {
+  it('drops a reading older than the max age rather than recording it', () => {
     const old = new Date(now - SLOT_USAGE_SURVEY_MAX_AGE_MS - 1000).toISOString();
     const fresh = new Date(now - 60_000).toISOString();
     const parsed = parseSlotUsageSurvey(
@@ -223,7 +100,7 @@ describe('parseSlotUsageSurvey — reading what the host handed over', () => {
   });
 });
 
-describe('ClaudeProvider.pickCredentialSlotByUsage — ring integration', () => {
+describe('ClaudeProvider.recordSlotUsageSurvey — telemetry, never selection', () => {
   const savedToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
   const savedSet = process.env.NANOCLAW_OAUTH_CREDENTIAL_SET;
   const savedLanes = process.env.CLAUDE_CODE_OAUTH_LANES;
@@ -236,7 +113,8 @@ describe('ClaudeProvider.pickCredentialSlotByUsage — ring integration', () => 
     delete process.env[SLOT_USAGE_SURVEY_ENV];
   });
   afterEach(() => {
-    const restore = (k: string, v: string | undefined) => (v === undefined ? delete process.env[k] : (process.env[k] = v));
+    const restore = (k: string, v: string | undefined) =>
+      v === undefined ? delete process.env[k] : (process.env[k] = v);
     restore('CLAUDE_CODE_OAUTH_TOKEN', savedToken);
     restore('NANOCLAW_OAUTH_CREDENTIAL_SET', savedSet);
     restore('CLAUDE_CODE_OAUTH_LANES', savedLanes);
@@ -262,19 +140,19 @@ describe('ClaudeProvider.pickCredentialSlotByUsage — ring integration', () => 
     process.env[SLOT_USAGE_SURVEY_ENV] = JSON.stringify(payload);
   }
 
-  it('records a usage_pull row per slot per window and moves the ring onto the pick', async () => {
+  it('records a usage_pull row per slot per window and leaves the ring on slot 1', () => {
     process.env.NANOCLAW_OAUTH_CREDENTIAL_SET = 'group:example';
     process.env.CLAUDE_CODE_OAUTH_LANES = '1:agentic-primary,3:shared-dev';
+    // _2 is the most used and slot 1 is not — usage must not matter.
     publishSurvey({
       CLAUDE_CODE_OAUTH_TOKEN: { five_hour: win(10), seven_day: win(76) },
       CLAUDE_CODE_OAUTH_TOKEN_2: { five_hour: win(40), seven_day: win(87) },
       CLAUDE_CODE_OAUTH_TOKEN_3: { five_hour: win(5), seven_day: win(21) },
     });
     const p = new ClaudeProvider({ env: RING });
-    await p.pickCredentialSlotByUsage({ now: NOW });
+    p.recordSlotUsageSurvey({ now: NOW });
 
-    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-2');
-    expect(getCredentialSlot('claude')).toBe('CLAUDE_CODE_OAUTH_TOKEN_2');
+    expect(getCredentialSlot('claude')).toBeUndefined();
 
     const rows = getRateLimitSampleRows();
     expect(rows).toHaveLength(6);
@@ -296,12 +174,13 @@ describe('ClaudeProvider.pickCredentialSlotByUsage — ring integration', () => 
     });
     expect(rows.every((r) => /^\d{4}-\d{2}-\d{2}T.*Z$/.test(r.ts))).toBe(true);
 
-    // The pick is what the next query runs on, and rotation continues from it.
+    // A wall on slot 1 moves to the next NUMBER, not the most-used slot.
     p.resetRotationCycle();
+    expect(p.rotateApiKey()).toMatchObject({ rotated: true, slot: 'CLAUDE_CODE_OAUTH_TOKEN_2', position: 2 });
     expect(p.rotateApiKey()).toMatchObject({ rotated: true, slot: 'CLAUDE_CODE_OAUTH_TOKEN_3', position: 3 });
   });
 
-  it('on resume, re-picks rather than restoring the persisted slot blindly', async () => {
+  it('on resume, keeps the restored slot whatever the survey says', () => {
     setCredentialSlot('claude', 'CLAUDE_CODE_OAUTH_TOKEN_3'); // a previous container ended here
     publishSurvey({
       CLAUDE_CODE_OAUTH_TOKEN: { five_hour: win(1), seven_day: win(90) },
@@ -310,55 +189,26 @@ describe('ClaudeProvider.pickCredentialSlotByUsage — ring integration', () => 
     });
     const p = new ClaudeProvider({ env: RING });
     p.restorePersistedCredentialSlot();
-    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-3');
-    await p.pickCredentialSlotByUsage({ now: NOW });
-    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-1');
-    expect(getCredentialSlot('claude')).toBe('CLAUDE_CODE_OAUTH_TOKEN');
-  });
-
-  it('keeps today’s behaviour (restored position, hint untouched) when every readable slot is exhausted', async () => {
-    setCredentialSlot('claude', 'CLAUDE_CODE_OAUTH_TOKEN_2');
-    publishSurvey({
-      CLAUDE_CODE_OAUTH_TOKEN: { five_hour: win(0), seven_day: win(100) },
-      CLAUDE_CODE_OAUTH_TOKEN_2: { five_hour: win(0), seven_day: win(100) },
-      CLAUDE_CODE_OAUTH_TOKEN_3: null, // the host could not read this slot
-    });
-    const p = new ClaudeProvider({ env: RING });
-    p.restorePersistedCredentialSlot();
-    await p.pickCredentialSlotByUsage({ now: NOW });
-    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-2');
-    expect(getCredentialSlot('claude')).toBe('CLAUDE_CODE_OAUTH_TOKEN_2');
-    // The two readable slots were still sampled — that is what stops idle slots going dark.
-    expect(getRateLimitSampleRows().map((r) => r.account).sort()).toEqual([
-      'CLAUDE_CODE_OAUTH_TOKEN',
-      'CLAUDE_CODE_OAUTH_TOKEN',
-      'CLAUDE_CODE_OAUTH_TOKEN_2',
-      'CLAUDE_CODE_OAUTH_TOKEN_2',
-    ]);
-  });
-
-  it('degrades to the restored slot, with no rows, when the host has published nothing yet', async () => {
-    setCredentialSlot('claude', 'CLAUDE_CODE_OAUTH_TOKEN_3');
-    process.env[SLOT_USAGE_SURVEY_ENV] = '{}';
-    const p = new ClaudeProvider({ env: RING });
-    p.restorePersistedCredentialSlot();
-    await p.pickCredentialSlotByUsage({ now: NOW });
+    p.recordSlotUsageSurvey({ now: NOW });
     expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-3');
     expect(getCredentialSlot('claude')).toBe('CLAUDE_CODE_OAUTH_TOKEN_3');
-    expect(getRateLimitSampleRows()).toHaveLength(0);
+    expect(getRateLimitSampleRows()).toHaveLength(6);
   });
 
-  it('degrades the same way when the variable is missing entirely', async () => {
-    setCredentialSlot('claude', 'CLAUDE_CODE_OAUTH_TOKEN_2');
+  it('records nothing when the host has published nothing yet', () => {
+    process.env[SLOT_USAGE_SURVEY_ENV] = '{}';
     const p = new ClaudeProvider({ env: RING });
-    p.restorePersistedCredentialSlot();
-    await p.pickCredentialSlotByUsage({ now: NOW });
-    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-2');
+    p.recordSlotUsageSurvey({ now: NOW });
     expect(getRateLimitSampleRows()).toHaveLength(0);
   });
 
-  it('ignores a survey the host stopped refreshing, rather than picking on hour-old numbers', async () => {
-    setCredentialSlot('claude', 'CLAUDE_CODE_OAUTH_TOKEN_2');
+  it('records nothing when the variable is missing entirely', () => {
+    const p = new ClaudeProvider({ env: RING });
+    p.recordSlotUsageSurvey({ now: NOW });
+    expect(getRateLimitSampleRows()).toHaveLength(0);
+  });
+
+  it('ignores a survey the host stopped refreshing, rather than filing hour-old numbers', () => {
     publishSurvey(
       {
         CLAUDE_CODE_OAUTH_TOKEN: { five_hour: win(1), seven_day: win(90) },
@@ -367,47 +217,42 @@ describe('ClaudeProvider.pickCredentialSlotByUsage — ring integration', () => 
       SLOT_USAGE_SURVEY_MAX_AGE_MS + 60_000,
     );
     const p = new ClaudeProvider({ env: RING });
-    p.restorePersistedCredentialSlot();
-    await p.pickCredentialSlotByUsage({ now: NOW });
-    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-2');
+    p.recordSlotUsageSurvey({ now: NOW });
     expect(getRateLimitSampleRows()).toHaveLength(0);
   });
 
-  it('picks from a PARTIAL survey and leaves the unread slots unsampled', async () => {
-    setCredentialSlot('claude', 'CLAUDE_CODE_OAUTH_TOKEN');
+  it('records a PARTIAL survey and leaves the unread slots unsampled', () => {
     publishSurvey({
       CLAUDE_CODE_OAUTH_TOKEN: null, // the host was 429'd on this one
       CLAUDE_CODE_OAUTH_TOKEN_2: { five_hour: win(1), seven_day: win(30) },
       CLAUDE_CODE_OAUTH_TOKEN_3: { five_hour: win(1), seven_day: win(66) },
     });
     const p = new ClaudeProvider({ env: RING });
-    p.restorePersistedCredentialSlot();
-    await p.pickCredentialSlotByUsage({ now: NOW });
-    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok-3');
+    p.recordSlotUsageSurvey({ now: NOW });
     expect(new Set(getRateLimitSampleRows().map((r) => r.account))).toEqual(
       new Set(['CLAUDE_CODE_OAUTH_TOKEN_2', 'CLAUDE_CODE_OAUTH_TOKEN_3']),
     );
   });
 
-  it('does nothing on the API-key auth path (no rows)', async () => {
+  it('does nothing on the API-key auth path (no rows)', () => {
     publishSurvey({ CLAUDE_CODE_OAUTH_TOKEN: { five_hour: win(1), seven_day: win(2) } });
     const p = new ClaudeProvider({ env: { ANTHROPIC_API_KEY: 'sk-x', ...RING } });
-    await p.pickCredentialSlotByUsage({ now: NOW });
+    p.recordSlotUsageSurvey({ now: NOW });
     expect(getRateLimitSampleRows()).toHaveLength(0);
   });
 
-  it('samples a single-slot ring but has nothing to pick between', async () => {
+  it('samples a single-slot ring', () => {
     publishSurvey({ CLAUDE_CODE_OAUTH_TOKEN: { five_hour: win(1), seven_day: win(2) } });
     const p = new ClaudeProvider({ env: { CLAUDE_CODE_OAUTH_TOKEN: 'solo' } });
-    await p.pickCredentialSlotByUsage({ now: NOW });
+    p.recordSlotUsageSurvey({ now: NOW });
     expect(getRateLimitSampleRows()).toHaveLength(2);
     expect(getCredentialSlot('claude')).toBeUndefined();
   });
 
-  it('never throws on a survey that is outright garbage', async () => {
+  it('never throws on a survey that is outright garbage', () => {
     process.env[SLOT_USAGE_SURVEY_ENV] = 'not json at all {';
     const p = new ClaudeProvider({ env: RING });
-    await expect(p.pickCredentialSlotByUsage({ now: NOW })).resolves.toBeUndefined();
+    expect(() => p.recordSlotUsageSurvey({ now: NOW })).not.toThrow();
     expect(getRateLimitSampleRows()).toHaveLength(0);
   });
 });
@@ -430,7 +275,7 @@ describe('the host/runner survey wire shape', () => {
   // thing under test here.
   const now = Date.parse('2026-09-15T06:01:00.000Z');
 
-  it('turns the host’s payload into the usage_pull rows the pick ranks', () => {
+  it('turns the host’s payload into the usage_pull rows', () => {
     const parsed = parseSlotUsageSurvey(fixture, { now });
     expect(parsed.problem).toBeNull();
     expect(parsed.staleSlots).toEqual([]);
@@ -456,27 +301,5 @@ describe('the host/runner survey wire shape', () => {
     });
     expect(none).toHaveLength(1);
     expect(none[0]).toMatchObject({ available: true, limitType: null, status: 'no_window' });
-  });
-
-  it('ranks the fixture the way the pick must', () => {
-    const parsed = parseSlotUsageSurvey(fixture, { now });
-    const pick = pickSlotByUsage([
-      {
-        name: 'CLAUDE_CODE_OAUTH_TOKEN',
-        samples: usageResponseToSamples(surveyEntryToUsageResponse(parsed.fresh.CLAUDE_CODE_OAUTH_TOKEN!), {
-          ...WHO,
-          account: 'CLAUDE_CODE_OAUTH_TOKEN',
-        }),
-      },
-      {
-        name: 'CLAUDE_CODE_OAUTH_TOKEN_3',
-        samples: usageResponseToSamples(surveyEntryToUsageResponse(parsed.fresh.CLAUDE_CODE_OAUTH_TOKEN_3!), {
-          ...WHO,
-          account: 'CLAUDE_CODE_OAUTH_TOKEN_3',
-        }),
-      },
-    ]);
-    expect(pick.chosen).toBe('CLAUDE_CODE_OAUTH_TOKEN');
-    expect(pick.ranking[1]!.skipped).toBe('no_seven_day');
   });
 });
