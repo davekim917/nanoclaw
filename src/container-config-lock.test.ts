@@ -127,11 +127,13 @@ describe('mutations of container.json are serialized', () => {
         config.agentGroupId = 'ag-spawn';
       });
       const final = readContainerConfig(FOLDER);
-      // WITHOUT the lock: this update commits during the holder's dawdle, the
-      // holder's stale copy lands on top, and `agentGroupId` is gone — the
-      // lost update, with the roles the issue describes reversed so the
-      // separate process is the one that wins. WITH it, this update waits, the
-      // holder's write is already committed when we read, and both land.
+      // WITHOUT the lock: this update commits during the holder's dawdle and
+      // returns within milliseconds, so the read below runs BEFORE the holder's
+      // delayed write — `excludePlugins` still lacks `second-withheld` and that
+      // assertion fails (the holder's stale copy then lands on top afterwards,
+      // dropping `agentGroupId`, which is the lost update the issue describes).
+      // WITH it, this update waits, the holder's write is already committed
+      // when we read, and both land.
       expect(final.agentGroupId).toBe('ag-spawn');
       expect(final.excludePlugins).toEqual(['withheld-plugin', 'second-withheld']);
     } finally {
@@ -162,7 +164,14 @@ describe('mutations of container.json are serialized', () => {
       order.push('second:write');
     });
     await Promise.all([first, second]);
-    expect(order).toEqual(['first:read', 'first:write', 'second:read', 'second:write']);
+    // Which mutator wins the lock is the kernel scheduler's choice (each spawns
+    // its own flock holder), so assert non-interleaving, not who went first.
+    expect(order).toHaveLength(4);
+    for (let i = 0; i < order.length; i += 2) {
+      const who = order[i].split(':')[0];
+      expect(order[i]).toBe(`${who}:read`);
+      expect(order[i + 1]).toBe(`${who}:write`);
+    }
     const final = readContainerConfig(FOLDER);
     expect(final.groupName).toBe('first');
     expect(final.agentGroupId).toBe('ag-second');

@@ -193,7 +193,10 @@ export async function withFileLock<T>(
   } finally {
     holder.stdin.end('\n');
     await new Promise<void>((resolve) => {
-      if (holder.exitCode !== null) return resolve();
+      // A holder killed by a signal has already closed with `exitCode === null`
+      // and `signalCode` set; waiting for a second 'close' would never settle,
+      // and on the spawn path that is a hung `ensureRuntimeFields`.
+      if (holder.exitCode !== null || holder.signalCode !== null) return resolve();
       holder.once('close', () => resolve());
     });
   }
