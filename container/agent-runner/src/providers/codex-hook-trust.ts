@@ -56,9 +56,17 @@ import path from 'path';
 
 import { type CodexHookListEntry, escapeTomlBasicStringBody } from './codex-app-server.js';
 
-/** hooks.json event keys, in the PascalCase spelling Codex reads. */
+/**
+ * hooks.json event keys, in the PascalCase spelling Codex reads.
+ *
+ * All twelve of codex 0.154.0's `HOOK_EVENT_NAMES` (`hooks/src/lib.rs`).
+ * `PermissionRequest` was missing and its handlers therefore got no trust entry
+ * at all — they loaded and reported `untrusted`, which is this module's silent
+ * failure reached by omission rather than by a wrong hash.
+ */
 export type CodexHookEvent =
   | 'PreToolUse'
+  | 'PermissionRequest'
   | 'PostToolUse'
   | 'SessionStart'
   | 'SessionEnd'
@@ -78,6 +86,7 @@ export type CodexHookEvent =
  */
 const EVENT_KEYS: Record<CodexHookEvent, string> = {
   PreToolUse: 'pre_tool_use',
+  PermissionRequest: 'permission_request',
   PostToolUse: 'post_tool_use',
   SessionStart: 'session_start',
   SessionEnd: 'session_end',
@@ -98,6 +107,30 @@ export function codexHookEventKey(event: CodexHookEvent): string {
   return EVENT_KEYS[event];
 }
 
+/**
+ * The events whose `matcher` survives into the hashed identity — codex's
+ * `HOOK_EVENT_NAMES_WITH_MATCHERS` (`hooks/src/lib.rs`), applied by
+ * `matcher_pattern_for_event` (`hooks/src/events/common.rs:112-128`) BEFORE
+ * `hook_hash` sees the group.
+ *
+ * For `UserPromptSubmit`, `Stop` and `Interrupt` codex replaces the declared
+ * matcher with `None`, so hashing the declared value produces a well-formed
+ * entry that matches nothing: codex reports the handler `modified` and never
+ * dispatches it. Measured on a real 0.154.0 — a `Stop` hook with a matcher
+ * received this module's old hash while codex had normalized the matcher away.
+ */
+const MATCHER_EVENTS = new Set<CodexHookEvent>([
+  'PreToolUse',
+  'PermissionRequest',
+  'PostToolUse',
+  'PreCompact',
+  'PostCompact',
+  'SessionStart',
+  'SessionEnd',
+  'SubagentStart',
+  'SubagentStop',
+]);
+
 /** Default hook timeout for every event except SessionEnd/Interrupt. */
 const DEFAULT_TIMEOUT_SEC = 600;
 /** SessionEnd/Interrupt get their own (much shorter) default and a hard cap. */
@@ -109,6 +142,11 @@ const SESSION_END_MAX_TIMEOUT_SEC = 3;
  * hash identically.
  */
 const DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT = 2500;
+/** Whether a declared matcher reaches the hash for this event. */
+export function codexHookEventUsesMatcher(event: CodexHookEvent): boolean {
+  return MATCHER_EVENTS.has(event);
+}
+
 /** The only events whose handlers may carry `additionalContextLimit` at all. */
 const ADDITIONAL_CONTEXT_EVENTS = new Set<CodexHookEvent>([
   'PreToolUse',
@@ -129,6 +167,24 @@ export interface CodexCommandHookHandler {
   additionalContextLimit?: number | null;
 }
 
+/**
+ * A `"type": "mcp_tool"` handler (`HookHandlerConfig::McpTool`,
+ * codex-rs `config/src/hook_config.rs:186-196`).
+ *
+ * `input` carries `#[serde(default)]` and NO `skip_serializing_if`, so unlike
+ * the `Option` fields it is present in the hashed document even when empty.
+ */
+export interface CodexMcpToolHookHandler {
+  type: 'mcp_tool';
+  server: string;
+  tool: string;
+  input?: Record<string, unknown>;
+  timeout?: number | null;
+  statusMessage?: string | null;
+}
+
+export type CodexHookHandler = CodexCommandHookHandler | CodexMcpToolHookHandler;
+
 export interface CodexHookGroup {
   matcher?: string | null;
   hooks?: unknown[];
@@ -138,6 +194,26 @@ export interface CodexHookGroup {
 export interface CodexHookTrustEntry {
   key: string;
   hash: string;
+}
+
+/**
+ * Is this a value we can hash EXACTLY as codex received it?
+ *
+ * `timeout` is a `u64` and `additionalContextLimit` a `usize` on the Rust side,
+ * and codex retains the declared integer before hashing. `JSON.parse` rounds
+ * anything past 2^53, so a declaration of `9007199254740993` reaches this module
+ * as `9007199254740992` and the digests diverge — the handler loads, reads back
+ * `untrusted`, and is silently never dispatched.
+ *
+ * So a value outside the safe-integer range is REFUSED rather than hashed
+ * rounded: the handler simply gets no trust entry. That is the same end state as
+ * a wrong hash, but it is reached deliberately and it is visible — the spawn-time
+ * `hooks/list` check reports an undispatchable plugin handler by name. Throwing
+ * instead would take a container down over one absurd value in one third-party
+ * plugin, which is the over-broad-guard class this repo has been bitten by.
+ */
+function hashableInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value);
 }
 
 function normalizeTimeout(event: CodexHookEvent, timeout: number | null | undefined): number {
@@ -163,7 +239,11 @@ function normalizeTimeout(event: CodexHookEvent, timeout: number | null | undefi
  *   when set (and, for the limit, only on the five events that can emit
  *   additional context and only when it differs from the default).
  */
-function normalizeCommandHandler(event: CodexHookEvent, handler: CodexCommandHookHandler): Record<string, unknown> {
+function normalizeCommandHandler(
+  event: CodexHookEvent,
+  handler: CodexCommandHookHandler,
+): Record<string, unknown> | null {
+  if (handler.timeout !== undefined && handler.timeout !== null && !hashableInteger(handler.timeout)) return null;
   const normalized: Record<string, unknown> = {
     type: 'command',
     command: handler.command,
@@ -174,10 +254,121 @@ function normalizeCommandHandler(event: CodexHookEvent, handler: CodexCommandHoo
     normalized.statusMessage = handler.statusMessage;
   }
   const limit = handler.additionalContextLimit;
-  if (typeof limit === 'number' && ADDITIONAL_CONTEXT_EVENTS.has(event) && limit !== DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT) {
-    normalized.additionalContextLimit = limit;
+  if (limit !== undefined && limit !== null && ADDITIONAL_CONTEXT_EVENTS.has(event)) {
+    if (!hashableInteger(limit)) return null;
+    if (limit !== DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT) normalized.additionalContextLimit = limit;
   }
   return normalized;
+}
+
+/**
+ * serde_json's PRIVATE number token, which codex 0.154.0 leaks into the hash.
+ *
+ * `input` is a `serde_json::Map`, and the identity is hashed by converting the
+ * whole document to a `toml::Value` first. serde_json's `Number` serializes
+ * itself as a one-field struct with this magic key whenever the target
+ * serializer is not serde_json, and toml's does not special-case it — so a
+ * number inside `input` becomes a TOML TABLE `{ "$serde_json::private::Number" =
+ * "1" }` and reaches `canonical_json` in that shape.
+ *
+ * Not a guess. Measured against the real binary, five values in one run: `0`,
+ * `1`, `2` and `1.5` under key `a`, plus `1` under key `b`, all five digests
+ * reproduced exactly by this encoding and by nothing else tried (a plain JSON
+ * number, `1.0`, a string, an array, a nested table, and a TOML-rendered string
+ * were each ruled out). Strings and booleans inside `input` are NOT affected and
+ * hash as themselves — which is why this gap hid: the obvious fixture uses a
+ * string.
+ */
+const SERDE_JSON_PRIVATE_NUMBER = '$serde_json::private::Number';
+
+/**
+ * Re-encode an `input` value the way codex's toml round-trip does.
+ *
+ * Returns `null` when the value cannot be hashed exactly — an integer past
+ * `Number.MAX_SAFE_INTEGER`, which `JSON.parse` has already rounded by the time
+ * this module sees it (same hazard as `timeout`; see `hashableInteger`).
+ * Non-integer numbers are serialized with `String`, which is the shortest
+ * round-trip form and matches serde_json for every value a plugin realistically
+ * declares.
+ */
+function encodeMcpToolInputValue(value: unknown): unknown | null {
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return null;
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) return null;
+    return { [SERDE_JSON_PRIVATE_NUMBER]: String(value) };
+  }
+  if (Array.isArray(value)) {
+    const out: unknown[] = [];
+    for (const item of value) {
+      const encoded = encodeMcpToolInputValue(item);
+      if (encoded === null && item !== null) return null;
+      out.push(encoded);
+    }
+    return out;
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      const encoded = encodeMcpToolInputValue(item);
+      if (encoded === null && item !== null) return null;
+      out[key] = encoded;
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * The `mcp_tool` counterpart. Same `Option`-disappears rule, one difference
+ * worth naming: `input` is a plain map with `#[serde(default)]` and no
+ * `skip_serializing_if`, so it is ALWAYS in the hashed document — an omitted
+ * `input` hashes as an empty table, not as an absent field.
+ *
+ * `async` and `additionalContextLimit` never appear: the McpTool variant has
+ * neither field (`config/src/hook_config.rs:186-196`).
+ */
+function normalizeMcpToolHandler(
+  event: CodexHookEvent,
+  handler: CodexMcpToolHookHandler,
+): Record<string, unknown> | null {
+  if (handler.timeout !== undefined && handler.timeout !== null && !hashableInteger(handler.timeout)) return null;
+  const rawInput = handler.input && typeof handler.input === 'object' ? handler.input : {};
+  const input = encodeMcpToolInputValue(rawInput);
+  if (input === null) return null;
+  const normalized: Record<string, unknown> = {
+    type: 'mcp_tool',
+    server: handler.server,
+    tool: handler.tool,
+    input,
+    timeout: normalizeTimeout(event, handler.timeout),
+  };
+  if (handler.statusMessage !== undefined && handler.statusMessage !== null) {
+    normalized.statusMessage = handler.statusMessage;
+  }
+  return normalized;
+}
+
+/**
+ * Normalize whichever handler variant this is, or `null` when codex would not
+ * load it at all (`prompt` and `agent` are recorded as unsupported and skipped,
+ * `mcp_tool` on `SessionEnd` likewise — `discovery.rs`), or when a declared
+ * integer cannot be hashed exactly.
+ *
+ * A skipped handler still CONSUMES its index: codex enumerates the whole group
+ * and `continue`s, so the key of every later handler depends on it
+ * (`append_matcher_groups`, `discovery.rs:502-655`).
+ */
+function normalizeHandler(event: CodexHookEvent, handler: CodexHookHandler): Record<string, unknown> | null {
+  if (handler.type === 'command') {
+    return typeof handler.command === 'string' && handler.command.trim() ? normalizeCommandHandler(event, handler) : null;
+  }
+  if (handler.type === 'mcp_tool') {
+    if (event === 'SessionEnd') return null;
+    const { server, tool } = handler;
+    if (typeof server !== 'string' || !server.trim() || typeof tool !== 'string' || !tool.trim()) return null;
+    return normalizeMcpToolHandler(event, handler);
+  }
+  return null;
 }
 
 /** Recursively sort object keys — `canonical_json` in `fingerprint.rs:67-84`. */
@@ -194,35 +385,47 @@ function canonicalize(value: unknown): unknown {
 }
 
 /**
- * Trust hash for ONE handler under ONE event. `matcher` is included only when
- * the group declares one (`Option<String>` → absent from the TOML document).
+ * Trust hash for ONE handler under ONE event, or `null` when codex would not
+ * load the handler (see `normalizeHandler`).
+ *
+ * `matcher` is included only when the group declares one AND the event keeps it:
+ * codex runs `matcher_pattern_for_event` before `hook_hash`, so a matcher on
+ * `UserPromptSubmit`, `Stop` or `Interrupt` is `None` by the time the identity
+ * is built. Beyond that it is an `Option<String>`, which disappears from the
+ * TOML document when absent.
  */
 export function codexHookTrustHash(
   event: CodexHookEvent,
-  handler: CodexCommandHookHandler,
+  handler: CodexHookHandler,
   matcher?: string | null,
-): string {
+): string | null {
+  const normalized = normalizeHandler(event, handler);
+  if (!normalized) return null;
   const identity: Record<string, unknown> = {
     event_name: EVENT_KEYS[event],
-    hooks: [normalizeCommandHandler(event, handler)],
+    hooks: [normalized],
   };
-  if (matcher !== undefined && matcher !== null) identity.matcher = matcher;
+  if (matcher !== undefined && matcher !== null && MATCHER_EVENTS.has(event)) identity.matcher = matcher;
   const serialized = JSON.stringify(canonicalize(identity));
   const hex = crypto.createHash('sha256').update(Buffer.from(serialized)).digest('hex');
   return `sha256:${hex}`;
 }
 
 /**
- * Walk a hooks-file `hooks` block and emit one trust entry per handler.
+ * Walk a hooks-file `hooks` block and emit one trust entry per handler codex
+ * will load.
  *
  * `keySource` is the prefix Codex builds the state key from: the ABSOLUTE
  * hooks.json path for a file hook, or `<plugin>@<marketplace>:<relative path>`
- * for a plugin hook (`discovery.rs:271-290`, `hook_key`). The suffix is
- * `:<event_key>:<groupIndex>:<handlerIndex>` — indices are positions in the
- * file as written, so this walk must not filter or reorder groups.
+ * for a plugin hook (`hook_key`, `hooks/src/lib.rs:113-123`). The suffix is
+ * `:<event_key>:<groupIndex>:<handlerIndex>`.
  *
- * Non-command handlers (`mcp_tool`, `agent`) are skipped: their identity
- * shape differs and NanoClaw generates none.
+ * INDICES ARE POSITIONS IN THE FILE AS WRITTEN, including handlers codex
+ * refuses to load: `append_matcher_groups` enumerates the whole group and
+ * `continue`s past a `prompt`/`agent`/malformed entry, so skipping one here
+ * without consuming its index would shift the key of every handler after it.
+ * This walk must therefore never filter or reorder — it emits nothing for a
+ * handler it cannot hash and moves on.
  */
 export function collectCodexHookTrustEntries(
   keySource: string,
@@ -236,12 +439,13 @@ export function collectCodexHookTrustEntries(
       const group = rawGroup as CodexHookGroup;
       const handlers = Array.isArray(group?.hooks) ? group.hooks : [];
       handlers.forEach((rawHandler, handlerIndex) => {
-        const handler = rawHandler as CodexCommandHookHandler;
-        if (!handler || handler.type !== 'command' || typeof handler.command !== 'string') return;
-        if (!handler.command.trim()) return;
+        const handler = rawHandler as CodexHookHandler;
+        if (!handler || typeof handler !== 'object') return;
+        const hash = codexHookTrustHash(eventName, handler, group?.matcher);
+        if (!hash) return;
         entries.push({
           key: `${keySource}:${EVENT_KEYS[eventName]}:${groupIndex}:${handlerIndex}`,
-          hash: codexHookTrustHash(eventName, handler, group?.matcher),
+          hash,
         });
       });
     });
@@ -543,28 +747,137 @@ const DEFAULT_PLUGIN_HOOKS_FILE = 'hooks/hooks.json';
  * (`readCodexPluginEntryName` is what admits it, for repo roots and monorepo
  * sub-plugins alike), so reading only that manifest loses no plugin.
  */
-export function declaredPluginHookFiles(pluginDir: string): string[] {
-  const conventional = (): string[] =>
-    fs.existsSync(path.join(pluginDir, DEFAULT_PLUGIN_HOOKS_FILE)) ? [DEFAULT_PLUGIN_HOOKS_FILE] : [];
+/**
+ * Resolve one declared `hooks` path the way codex's manifest loader does, or
+ * `null` when codex would DISCARD it (`resolve_manifest_path`,
+ * `core-plugins/src/manifest.rs:597-649`).
+ *
+ * Four refusals, all of them silent warnings on the codex side:
+ *   - empty;
+ *   - not prefixed `./` — codex requires it, and this module used to accept a
+ *     bare `hooks/x.json`, keying a trust row on a file codex never reads while
+ *     suppressing the conventional-file fallback it DOES read;
+ *   - a `..` component anywhere — rejected before loading, so a manifest
+ *     declaring `../../elsewhere.json` made this module read and hash a file
+ *     outside the plugin directory for a key codex never asks about;
+ *   - absolute.
+ *
+ * Returns the path as codex records it in the state key: the declaration minus
+ * its `./`, backslashes normalized to `/`.
+ */
+export function resolveDeclaredPluginHookPath(declared: unknown): string | null {
+  if (typeof declared !== 'string' || declared.length === 0) return null;
+  if (!declared.startsWith('./')) return null;
+  const relative = declared.slice(2);
+  if (!relative) return null;
+  if (relative.split(/[\\/]/).some((component) => component === '..')) return null;
+  if (relative.startsWith('/') || relative.startsWith('\\')) return null;
+  return relative.replace(/\\/g, '/');
+}
+
+/** One hooks block codex will load for a plugin, with the key-source suffix it uses. */
+export interface CodexPluginHookBlock {
+  /**
+   * The `source_relative_path` half of the state key: a relative file path, or
+   * `plugin.json#hooks[<index>]` for a hooks block declared INLINE in the
+   * manifest (`load_plugin_hooks`, `core-plugins/src/loader.rs:1191-1243`).
+   */
+  keySuffix: string;
+  /** The `hooks` object itself — from the file, or from the manifest inline. */
+  hooks: Record<string, unknown> | undefined;
+}
+
+/**
+ * Every hooks block codex 0.154.0 will load for this plugin, in its own order.
+ *
+ * Reproduces `resolve_manifest_hooks` (`core-plugins/src/manifest.rs:413-444`)
+ * feeding `load_plugin_hooks` (`core-plugins/src/loader.rs:1191-1243`). The
+ * manifest `hooks` field accepts FOUR shapes, and this module previously handled
+ * two:
+ *
+ * | declaration              | loaded                                    |
+ * |--------------------------|-------------------------------------------|
+ * | `"./a.json"`             | `a.json`                                  |
+ * | `["./a.json", "bad"]`    | `a.json` — invalid entries are dropped, the rest stand |
+ * | `["bad"]`, `[]`          | NOTHING resolves → the conventional file  |
+ * | `{ "hooks": { … } }`     | inline, keyed `plugin.json#hooks[0]`      |
+ * | `[{ … }, { … }]`         | inline, keyed `plugin.json#hooks[0]`, `[1]` |
+ * | absent, or not one of those | the conventional `hooks/hooks.json`    |
+ *
+ * The fallback is a FALLBACK, never an addition: a declaration that resolves to
+ * anything replaces it. An inline entry whose own `hooks` is empty is skipped
+ * but still CONSUMES its index, so a later entry's key depends on it.
+ *
+ * The selecting manifest is `.codex-plugin/plugin.json` ALONE. A `hooks` field
+ * in `.claude-plugin/plugin.json` is not read at all, so a plugin whose Codex
+ * manifest omits `hooks` takes the conventional fallback even when the Claude
+ * manifest declares something else — measured on 0.154.0, and live in this tree
+ * (`wwbd@davekim917-bootstrap` ships `hooks/wwbd-hooks.json` declared only in
+ * its Claude manifest and codex reports zero hooks for it).
+ */
+export function resolvePluginHookBlocks(pluginDir: string): CodexPluginHookBlock[] {
+  const readFileBlock = (rel: string): CodexPluginHookBlock | null => {
+    const parsed = readJson(path.join(pluginDir, rel));
+    const hooks = parsed?.hooks;
+    // codex drops a file whose `hooks` is absent or empty before recording a
+    // source, so no key is ever derived from it.
+    if (!hooks || typeof hooks !== 'object' || Object.keys(hooks).length === 0) return null;
+    return { keySuffix: rel, hooks: hooks as Record<string, unknown> };
+  };
+  const conventional = (): CodexPluginHookBlock[] => {
+    if (!fs.existsSync(path.join(pluginDir, DEFAULT_PLUGIN_HOOKS_FILE))) return [];
+    const block = readFileBlock(DEFAULT_PLUGIN_HOOKS_FILE);
+    return block ? [block] : [];
+  };
+
   const manifest = readJson(path.join(pluginDir, '.codex-plugin', 'plugin.json'));
-  if (!manifest) return conventional();
-  const raw = manifest.hooks;
-  const candidates = typeof raw === 'string' ? [raw] : Array.isArray(raw) ? raw : [];
-  const files = candidates
-    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
-    // The state key carries the path as declared minus a `./` prefix —
-    // `hooks/workflow-hooks.json`, not `./hooks/workflow-hooks.json`.
-    .map((value) => value.replace(/^\.\//, '').replace(/^\/+/, ''));
-  return files.length > 0 ? files : conventional();
+  const raw = manifest?.hooks;
+
+  // Inline object, or a list of inline objects. Checked BEFORE the string forms
+  // because an array can be either, and only its element type tells them apart —
+  // the same order codex's untagged enum tries.
+  const inlineEntries: unknown[] | null =
+    raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? [raw]
+      : Array.isArray(raw) && raw.some((entry) => entry !== null && typeof entry === 'object')
+        ? raw
+        : null;
+  if (inlineEntries) {
+    const blocks: CodexPluginHookBlock[] = [];
+    inlineEntries.forEach((entry, index) => {
+      const hooks = (entry as { hooks?: unknown } | null)?.hooks;
+      if (!hooks || typeof hooks !== 'object' || Object.keys(hooks).length === 0) return;
+      blocks.push({ keySuffix: `plugin.json#hooks[${index}]`, hooks: hooks as Record<string, unknown> });
+    });
+    return blocks.length > 0 ? blocks : conventional();
+  }
+
+  const declared = typeof raw === 'string' ? [raw] : Array.isArray(raw) ? raw : [];
+  const resolved = declared
+    .map(resolveDeclaredPluginHookPath)
+    .filter((rel): rel is string => rel !== null);
+  if (resolved.length === 0) return conventional();
+  return resolved.map(readFileBlock).filter((block): block is CodexPluginHookBlock => block !== null);
+}
+
+/**
+ * The relative hooks-FILE paths codex will load for this plugin.
+ *
+ * A narrower view of {@link resolvePluginHookBlocks}, kept because a file path
+ * is what an operator can go and look at; an inline declaration has none and is
+ * omitted here by construction.
+ */
+export function declaredPluginHookFiles(pluginDir: string): string[] {
+  return resolvePluginHookBlocks(pluginDir)
+    .map((block) => block.keySuffix)
+    .filter((suffix) => !suffix.startsWith('plugin.json#'));
 }
 
 /** Trust entries for every hook Codex will load for this plugin. */
 export function collectPluginHookTrustEntries(source: CodexPluginHookSource): CodexHookTrustEntry[] {
   const entries: CodexHookTrustEntry[] = [];
-  for (const rel of declaredPluginHookFiles(source.dir)) {
-    const parsed = readJson(path.join(source.dir, rel));
-    if (!parsed) continue;
-    entries.push(...collectCodexHookTrustEntries(`${source.pluginId}:${rel}`, parsed.hooks as Record<string, unknown>));
+  for (const block of resolvePluginHookBlocks(source.dir)) {
+    entries.push(...collectCodexHookTrustEntries(`${source.pluginId}:${block.keySuffix}`, block.hooks));
   }
   return entries;
 }
