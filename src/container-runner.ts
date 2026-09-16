@@ -5946,15 +5946,21 @@ const MANAGED_WORKER_DEFS = [
 ];
 
 // NOTE on `worker-high.md` above: that name is ALSO one of the orchestrate
-// plugin's live shims (`plugins/orchestrate/agents/worker-high.md`). The two
-// never collide, and the prune is what keeps them from colliding. This list
-// only ever touches `.claude-shared/agents/` — the container's USER scope —
-// while the shim is registered from the plugin mount. Claude's personal scope
-// outranks a plugin's, so a stale user-scope `worker-high.md` left from the
-// retired roster would SHADOW the plugin's shim and silently run the old
-// definition. Pruning it is therefore not merely cleanup: it is what lets the
-// plugin's shim resolve at all. The same holds for any future shim whose name
-// this list has ever carried.
+// plugin's live shims (`plugins/orchestrate/agents/worker-high.md`), and the
+// two meet under one name in a container. This list only ever touches
+// `.claude-shared/agents/` — the container's user scope — while the shim is
+// registered from the plugin mount; on the HOST a plugin agent carries the
+// qualified `<plugin>:<agent>` name, but IN A CONTAINER it is exposed bare
+// (this fork's own #814 finding, recorded in docs/specs/quota-burn/plan.md).
+// So a stale user-scope `worker-high.md` left from the retired roster sits
+// under the same bare name as the live shim.
+//
+// Which of the two a dispatch would then resolve to is NOT asserted here —
+// nothing was read that settles it. The prune does not depend on the answer:
+// the retired file is a definition this repo no longer ships, under a name
+// something else now uses, and either outcome of that ambiguity is wrong.
+// Removing it is what makes the question moot. The same holds for any future
+// shim whose name this list has ever carried.
 
 /**
  * Copy trunk worker subagent defs (container/agents/*.md) into
