@@ -36,6 +36,7 @@ import {
   MIRROR_MARKER,
   discoverPortableSkills,
   isWithinResolvedRoot,
+  readMirrorSourceRoot,
   resolvePluginRoots,
   resolveRealPath,
 } from '../plugin-skill-discovery.js';
@@ -176,12 +177,18 @@ export interface CopyOpenCodeSkillsOptions {
   /** Skill names to omit, gated on the mirror writer's marker (see above). */
   dropNames?: ReadonlySet<string>;
   /**
-   * The resolved plugin repository roots a link in this mirror may resolve
-   * into — `resolvePluginRoots(<plugins root>)`. REQUIRED, and with no default,
+   * The resolved plugin repository roots a link may resolve into when the
+   * mirror dir holding it records no source root of its own —
+   * `resolvePluginRoots(<plugins root>)`. REQUIRED, and with no default,
    * because the containment it carries is this copy's security boundary: an
    * omitted-means-allow-everything default is the one shape that would let a
    * caller reintroduce the escape silently. An empty array refuses every link,
    * which is the safe direction.
+   *
+   * A dir the mirror writer published records its ONE repository in the marker
+   * and is held to that instead, which is strictly tighter — see
+   * `MIRROR_MARKER` in `src/plugin-skill-discovery.ts` for why a union is not
+   * enough for those.
    */
   allowedRoots: readonly string[];
 }
@@ -189,6 +196,31 @@ export interface CopyOpenCodeSkillsOptions {
 export function copyOpenCodeSkills(source: string, target: string, options: CopyOpenCodeSkillsOptions): void {
   const dropNames = options.dropNames ?? new Set<string>();
   const { allowedRoots } = options;
+  // Per-mirror-dir containment roots, resolved once per name.
+  //
+  // A dir the writer published names its source repository, and THAT single
+  // root is the boundary for every link under it — a nested link the writer
+  // never resolved (it checks only each skill's direct children) therefore
+  // cannot reach a different plugin, including a workgroup-scoped one this
+  // mirror deliberately never published. A recorded root that no longer
+  // resolves yields NO roots, refusing every link rather than falling back to a
+  // wider set. Only a dir with no marker at all — operator-placed or natively
+  // installed, which no plugin can create here — falls back to the union.
+  const rootsByName = new Map<string, readonly string[]>();
+  const rootsFor = (name: string): readonly string[] => {
+    const cached = rootsByName.get(name);
+    if (cached !== undefined) return cached;
+    const recorded = readMirrorSourceRoot(path.join(source, name));
+    let roots: readonly string[];
+    if (recorded === null) {
+      roots = allowedRoots;
+    } else {
+      const resolved = resolveRealPath(recorded);
+      roots = resolved === null ? [] : [resolved];
+    }
+    rootsByName.set(name, roots);
+    return roots;
+  };
   fs.cpSync(source, target, {
     recursive: true,
     dereference: true,
@@ -216,13 +248,19 @@ export function copyOpenCodeSkills(source: string, target: string, options: Copy
       // Dangling — the pre-existing reason this filter exists: a stale link
       // must not wedge the spawn. Unchanged behaviour, no warning.
       if (resolved === null) return false;
-      if (!allowedRoots.some((root) => isWithinResolvedRoot(resolved, root))) {
-        log.warn('OpenCode skill mirror link resolves outside every plugin repository; not copying it', {
+      const roots = name ? rootsFor(name) : allowedRoots;
+      if (!roots.some((root) => isWithinResolvedRoot(resolved, root))) {
+        log.warn('OpenCode skill mirror link resolves outside its plugin repository; not copying it', {
           link: sourcePath,
           resolved,
         });
         return false;
       }
+      // A FIFO, socket or device node passes containment and then blocks
+      // `cpSync` — and with it the host's event loop — for as long as no writer
+      // appears. A skill is files and directories.
+      const targetStat = fs.statSync(resolved, { throwIfNoEntry: false });
+      if (targetStat === undefined || !(targetStat.isFile() || targetStat.isDirectory())) return false;
       return true;
     },
   });

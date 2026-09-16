@@ -163,19 +163,105 @@ describe('plugin skill mirror containment', () => {
     expect(readAll(xdg)).not.toContain('HOST-ONLY-SECRET');
   });
 
-  it('copies nothing linked when allowedRoots is empty (the fail-closed direction)', () => {
-    const shared = path.join(plugins, 'good', 'shared');
-    fs.mkdirSync(shared, { recursive: true });
-    fs.writeFileSync(path.join(shared, 'ref.md'), 'in-repo reference');
-    fs.symlinkSync(path.join(shared, 'ref.md'), path.join(plugins, 'good', 'skills', 'helper', 'notes.md'));
+  it('refuses a link NESTED below the skill top level that reaches another plugin', () => {
+    // The mirror writer resolves each skill's DIRECT children only: `reference`
+    // is a real in-repo directory and is symlinked wholesale, so nothing under
+    // it is seen at sync time. The session copy is where that link is read, and
+    // it holds the dir to the one repository the marker records — so a nested
+    // link into a DIFFERENT plugin (here one a workgroup scope would keep out
+    // of the mirror entirely) does not reach the group.
+    const scopedPlugin = path.join(plugins, 'scoped-wiki');
+    fs.mkdirSync(scopedPlugin, { recursive: true });
+    fs.writeFileSync(path.join(scopedPlugin, 'client.md'), 'OTHER-TENANT-CONTENT');
+    const reference = path.join(plugins, 'good', 'skills', 'helper', 'reference');
+    fs.mkdirSync(reference, { recursive: true });
+    fs.writeFileSync(path.join(reference, 'own.md'), 'own reference');
+    fs.symlinkSync(path.join(scopedPlugin, 'client.md'), path.join(reference, 'stolen.md'));
+
+    const { xdg } = runPipeline();
+
+    // The in-repo sibling still arrives; only the cross-plugin link does not.
+    expect(fs.readFileSync(path.join(xdg, 'helper', 'reference', 'own.md'), 'utf8')).toBe('own reference');
+    expect(fs.existsSync(path.join(xdg, 'helper', 'reference', 'stolen.md'))).toBe(false);
+    expect(readAll(xdg)).not.toContain('OTHER-TENANT-CONTENT');
+  });
+
+  it('refuses a top-level child linked into a SIBLING plugin repository', () => {
+    const other = path.join(plugins, 'other');
+    fs.mkdirSync(other, { recursive: true });
+    fs.writeFileSync(path.join(other, 'private.md'), 'OTHER-TENANT-CONTENT');
+    fs.symlinkSync(path.join(other, 'private.md'), path.join(plugins, 'good', 'skills', 'helper', 'notes.md'));
+
+    const { xdg, refused } = runPipeline();
+
+    expect(refused).toContain('helper/notes.md');
+    expect(readAll(xdg)).not.toContain('OTHER-TENANT-CONTENT');
+  });
+
+  it('refuses every link in a mirror dir whose recorded source root has gone', () => {
+    // A recorded root that no longer resolves means "no provenance", and the
+    // answer is refusal, not a fallback to the union — the union is exactly
+    // what would admit the repointed checkout here. Shape: `~/plugins/good` is
+    // a symlinked dev checkout, the mirror records the checkout it was
+    // published from, and the symlink is later repointed at a different tree.
+    fs.rmSync(path.join(plugins, 'good'), { recursive: true, force: true });
+    const checkoutA = path.join(tmp, 'checkout-a');
+    writeSkill(path.join(checkoutA, 'skills', 'helper'), 'helper');
+    fs.writeFileSync(path.join(checkoutA, 'skills', 'helper', 'notes.md'), 'checkout A notes');
+    fs.symlinkSync(checkoutA, path.join(plugins, 'good'));
 
     const mirror = path.join(tmp, 'mirror');
     syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+
+    const checkoutB = path.join(tmp, 'checkout-b');
+    writeSkill(path.join(checkoutB, 'skills', 'helper'), 'helper');
+    fs.writeFileSync(path.join(checkoutB, 'skills', 'helper', 'notes.md'), 'OTHER-TENANT-CONTENT');
+    fs.unlinkSync(path.join(plugins, 'good'));
+    fs.symlinkSync(checkoutB, path.join(plugins, 'good'));
+    fs.rmSync(checkoutA, { recursive: true, force: true });
+
     const xdg = path.join(tmp, 'xdg');
-    copyOpenCodeSkills(mirror, xdg, { allowedRoots: [] });
+    copyOpenCodeSkills(mirror, xdg, { allowedRoots: resolvePluginRoots(plugins) });
 
     expect(fs.existsSync(path.join(xdg, 'helper', 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(path.join(xdg, 'helper', 'notes.md'))).toBe(false);
+    expect(readAll(xdg)).not.toContain('OTHER-TENANT-CONTENT');
+  });
+
+  it('falls back to allowedRoots only for a dir the mirror writer did not publish', () => {
+    // An operator-placed or natively-installed dir has no marker and therefore
+    // no plugin of record. No plugin can create one of these, so the fallback
+    // is not a hole a repository can reach; empty roots still refuse.
+    const mirror = path.join(tmp, 'mirror');
+    const native = path.join(mirror, 'native');
+    fs.mkdirSync(native, { recursive: true });
+    fs.writeFileSync(path.join(native, 'SKILL.md'), 'native');
+    fs.symlinkSync(secret, path.join(native, 'notes.md'));
+
+    const xdg = path.join(tmp, 'xdg');
+    copyOpenCodeSkills(mirror, xdg, { allowedRoots: [] });
+
+    expect(fs.existsSync(path.join(xdg, 'native', 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(xdg, 'native', 'notes.md'))).toBe(false);
+  });
+
+  it('prunes a mirror CHILD whose source became an escape since the last sync', () => {
+    const shared = path.join(plugins, 'good', 'shared');
+    fs.mkdirSync(shared, { recursive: true });
+    fs.writeFileSync(path.join(shared, 'ref.md'), 'in-repo reference');
+    const link = path.join(plugins, 'good', 'skills', 'helper', 'notes.md');
+    fs.symlinkSync(path.join(shared, 'ref.md'), link);
+
+    const mirror = path.join(tmp, 'mirror');
+    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+    expect(fs.existsSync(path.join(mirror, 'helper', 'notes.md'))).toBe(true);
+
+    fs.unlinkSync(link);
+    fs.symlinkSync(secret, link);
+    const result = syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+
+    expect(result.refused).toContain('helper/notes.md');
+    expect(fs.existsSync(path.join(mirror, 'helper', 'notes.md'))).toBe(false);
   });
 
   it('prunes a mirror dir whose source became an escape since the last sync', () => {

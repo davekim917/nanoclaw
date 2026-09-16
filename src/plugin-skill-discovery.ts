@@ -100,6 +100,9 @@ export function resolvePluginRoots(pluginsRoot: string): string[] {
   }
   const roots: string[] = [];
   for (const entry of entries) {
+    // `.git`, `.codex`, `.agents` under the plugins root are not plugins and
+    // must not widen the boundary.
+    if (entry.startsWith('.')) continue;
     const resolved = resolveRealPath(path.join(pluginsRoot, entry));
     if (resolved === null) continue;
     if (!isDirectory(resolved)) continue;
@@ -689,8 +692,55 @@ export function syncSkillSymlinks(
  * Marker file we drop inside every mirror dir we create. Lets us
  * distinguish our writes from native installs (e.g. `gitnexus setup`)
  * without ambiguity — a native install never has this file.
+ *
+ * It also records WHICH plugin repository the dir was published from, because
+ * the dir's own name is a skill name and carries no provenance. The reader that
+ * needs it is the session copy (`copyOpenCodeSkills`, `src/providers/opencode.ts`):
+ * containment there has to be against this ONE repository, not against the union
+ * of every repository under `~/plugins`. A union would let a link nested below a
+ * skill's top level — never seen by the mirror writer, which only resolves each
+ * direct child — reach into a DIFFERENT plugin, including a workgroup-scoped one
+ * the mirror deliberately never published (`scopedPluginNames`,
+ * `src/plugin-scopes.ts`).
  */
 export const MIRROR_MARKER = '.nanoclaw-managed';
+
+const MIRROR_SOURCE_ROOT_PREFIX = 'source-root: ';
+
+/**
+ * The marker's contents for a mirror dir published from `resolvedRoot`.
+ *
+ * The path is JSON-encoded, so a directory name containing a newline cannot
+ * forge or truncate the record — a real Linux basename may contain one
+ * (`docs/review-notes/826.md`, the segment-rule rounds).
+ */
+export function formatMirrorMarker(resolvedRoot: string): string {
+  return `managed by nanoclaw plugin-skill-discovery\n${MIRROR_SOURCE_ROOT_PREFIX}${JSON.stringify(resolvedRoot)}\n`;
+}
+
+/**
+ * The plugin repository a mirror dir was published from, or null when the dir
+ * carries no marker (operator-placed or natively installed) or a marker written
+ * before this record existed. Null means "no provenance", never "any root".
+ */
+export function readMirrorSourceRoot(mirrorDir: string): string | null {
+  let content: string;
+  try {
+    content = fs.readFileSync(path.join(mirrorDir, MIRROR_MARKER), 'utf8');
+  } catch {
+    return null;
+  }
+  for (const line of content.split('\n')) {
+    if (!line.startsWith(MIRROR_SOURCE_ROOT_PREFIX)) continue;
+    try {
+      const value: unknown = JSON.parse(line.slice(MIRROR_SOURCE_ROOT_PREFIX.length));
+      return typeof value === 'string' && value !== '' ? value : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
 
 /**
  * A "managed mirror" dir is one we created: it contains our marker file.
@@ -750,11 +800,21 @@ function mirrorSkillDir(
     return { changed: false, refusedChildren }; // caller should have filtered this case
   }
 
-  // Drop our marker so future runs recognize this as a managed mirror.
+  // Drop our marker so future runs recognize this as a managed mirror, and so
+  // the session copy can contain this dir to the ONE repository it came from.
+  // Rewritten when it differs, so a dir published before the root was recorded
+  // — or from a plugin that has since moved — self-heals on the next sync.
   const markerPath = path.join(dstDir, MIRROR_MARKER);
-  if (!fs.existsSync(markerPath)) {
+  const markerContent = formatMirrorMarker(resolvedRoot);
+  let existingMarker: string | null = null;
+  try {
+    existingMarker = fs.readFileSync(markerPath, 'utf8');
+  } catch {
+    /* missing */
+  }
+  if (existingMarker !== markerContent) {
     try {
-      fs.writeFileSync(markerPath, 'managed by nanoclaw plugin-skill-discovery\n');
+      fs.writeFileSync(markerPath, markerContent);
       changed = true;
     } catch {
       /* swallow — non-critical */
@@ -871,6 +931,9 @@ function syncSkillMdCopy(dst: string, src: string): boolean {
   } catch {
     return false;
   }
+  // A FIFO passes every containment check and blocks the reader forever, which
+  // on the host is the single event loop. Only a regular file is a SKILL.md.
+  if (!srcStat.isFile()) return false;
   let dstStat: fs.Stats | null = null;
   try {
     dstStat = fs.lstatSync(dst);

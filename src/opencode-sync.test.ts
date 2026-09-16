@@ -102,6 +102,43 @@ describe('syncOpenCodePluginSkills with workgroup-scoped plugins (src/plugin-sco
   });
 });
 
+describe('syncOpenCodePluginSkills containment (#829)', () => {
+  it('mirrors an in-repo support dir but refuses a child linked out of the plugin', () => {
+    // A support dir is a non-skill sibling of a skills root (e.g.
+    // workflow-agents/skills/shared/), mirrored as per-child symlinks the
+    // session copy later DEREFERENCES into a container. So a child linked out
+    // of the plugin would move host-only state across that boundary.
+    const support = path.join(HOME, 'plugins', 'shared-plugin', 'skills', 'shared');
+    fs.mkdirSync(support, { recursive: true });
+    fs.writeFileSync(path.join(support, 'primitives.md'), 'in-repo primitives');
+    const secret = path.join(TEST_ROOT, 'host-only-auth.json');
+    fs.writeFileSync(secret, 'HOST-ONLY-SECRET');
+    fs.symlinkSync(secret, path.join(support, 'stolen.md'));
+    // And a child linked into a DIFFERENT plugin, which a union-of-roots
+    // boundary would admit.
+    fs.symlinkSync(
+      path.join(HOME, 'plugins', 'client-plugin', 'skills', 'client-skill', 'SKILL.md'),
+      path.join(support, 'cross.md'),
+    );
+
+    const result = syncOpenCodePluginSkills();
+
+    const mirrored = path.join(GLOBAL_SKILLS, 'shared');
+    expect(fs.existsSync(path.join(mirrored, 'primitives.md'))).toBe(true);
+    expect(fs.existsSync(path.join(mirrored, 'stolen.md'))).toBe(false);
+    expect(fs.existsSync(path.join(mirrored, 'cross.md'))).toBe(false);
+    expect(result.refused).toEqual(expect.arrayContaining(['shared/stolen.md', 'shared/cross.md']));
+  });
+
+  it('records the source repository in each mirror dir marker', () => {
+    syncOpenCodePluginSkills();
+    const marker = fs.readFileSync(path.join(GLOBAL_SKILLS, 'shared-skill', '.nanoclaw-managed'), 'utf-8');
+    expect(marker).toContain(
+      `source-root: ${JSON.stringify(fs.realpathSync(path.join(HOME, 'plugins', 'shared-plugin')))}`,
+    );
+  });
+});
+
 describe('syncOpenCodeSubagents with workgroup-scoped plugins (src/plugin-scopes.ts)', () => {
   it('never mirrors a scoped plugin agent, and prunes one mirrored before it was scoped', () => {
     pluginAgent('client-plugin', 'client-agent');

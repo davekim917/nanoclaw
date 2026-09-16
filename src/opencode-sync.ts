@@ -363,13 +363,18 @@ function collectSiblingSupportDirs(discovered: ReturnType<typeof discoverPortabl
  *
  * Contained the same way the skill mirror is, and for the same reason: this
  * writes links a session copy later DEREFERENCES into a container, so a child
- * resolving outside every plugin repository would move host-only state across
- * that boundary. This writer has no single plugin in hand — the support dir is
- * a sibling of some skills root — so the whole set of roots is the boundary.
- * Returns the refused child names.
+ * resolving outside the plugin would move state across that boundary. The
+ * support dir is a sibling of some skills root rather than a skill, so its
+ * repository is derived here — the ONE root of `pluginRoots` that contains it —
+ * and every child is held to that, not to the union. Returns the refused child
+ * names; a support dir whose own path is in no plugin repository refuses all of
+ * them.
  */
 function mirrorSupportDir(src: string, dst: string, pluginRoots: readonly string[]): string[] {
   const refused: string[] = [];
+  const resolvedSrc = resolveRealPath(src);
+  const ownRoot =
+    resolvedSrc === null ? undefined : pluginRoots.find((root) => isWithinResolvedRoot(resolvedSrc, root));
   fs.mkdirSync(dst, { recursive: true });
   const entries = fs.readdirSync(src, { withFileTypes: true });
   // Drop any stale entries we own.
@@ -385,7 +390,7 @@ function mirrorSupportDir(src: string, dst: string, pluginRoots: readonly string
     if (entry.name.startsWith('.')) continue;
     const srcEntry = path.join(src, entry.name);
     const resolved = resolveRealPath(srcEntry);
-    if (resolved === null || !pluginRoots.some((root) => isWithinResolvedRoot(resolved, root))) {
+    if (resolved === null || ownRoot === undefined || !isWithinResolvedRoot(resolved, ownRoot)) {
       refused.push(entry.name);
       continue;
     }
