@@ -1450,7 +1450,9 @@ async function deliverMessage(
   // roots glued into one day-thread. content.threadAnchor === false exempts
   // the whole series; the anchor default stays ON because the storm shape
   // (repeated status posts) is the common case.
-  const isTaskSessionPost = session.messaging_group_id === null && isTaskThread(session.thread_id);
+  // Edits/reactions address an existing message, never a thread (anchoring them 404s on Discord and drops the anchor).
+  const isInPlaceOp = content.operation === 'edit' || content.operation === 'reaction';
+  const isTaskSessionPost = !isInPlaceOp && session.messaging_group_id === null && isTaskThread(session.thread_id);
   const taskAnchorEligible = isTaskSessionPost && baseThreadId === null && !(await isThreadAnchorExempt(session));
 
   // Per-turn channel-root threading (see ChatThreadAnchor above) — everything
@@ -1458,7 +1460,7 @@ async function deliverMessage(
   // already target a thread (thread_id null) and the turn has an inbound
   // anchor (in_reply_to set). The first message of the turn posts at root
   // and is recorded below; later messages of the same turn reply under it.
-  const turnAnchorEligible = !taskAnchorEligible && baseThreadId === null && msg.in_reply_to != null;
+  const turnAnchorEligible = !isInPlaceOp && !taskAnchorEligible && baseThreadId === null && msg.in_reply_to != null;
 
   let effectiveThreadId = baseThreadId;
   let usedAnchor = false;
@@ -1509,10 +1511,8 @@ async function deliverMessage(
   } catch (err) {
     if (!usedAnchor) throw err;
     // Platforms disagree on whether a parent message is addressable as a thread.
-    // Slack threads on the parent's ts. Discord needs a thread object first; its
-    // adapter opens one on first use (installMessageThreadAutoCreate, discord.ts),
-    // which can still fail (DMs, missing permission). Never let that cost the
-    // message: post at root instead.
+    // Slack threads on the parent's ts; Discord's adapter opens a thread on first use
+    // (installMessageThreadAutoCreate), which can fail (DMs, permission). Post at root.
     //
     // Also record that anchoring is off for the REST OF THIS TURN (turn anchor)
     // or drop the stale anchor outright (task anchor — the next fire just

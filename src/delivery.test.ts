@@ -1178,12 +1178,13 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     ts: string,
     threadId: string | null = null,
     inReplyTo = `task-fire-${msgId}`,
+    content: Record<string, unknown> = { text: msgId },
   ): void {
     const db = new Database(outboundDbPath(agentGroupId, sessionId));
     db.prepare(
       `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, in_reply_to, content)
        VALUES (?, ?, 'chat', 'telegram:123', 'telegram', ?, ?, ?)`,
-    ).run(msgId, ts, threadId, inReplyTo, JSON.stringify({ text: msgId }));
+    ).run(msgId, ts, threadId, inReplyTo, JSON.stringify(content));
     db.close();
   }
 
@@ -1361,6 +1362,38 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
 
     expect(calls).toEqual([{ threadId: 'telegram:123:plat-1' }]);
     // Threading under an existing anchor must not overwrite it.
+    const anchor = await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123');
+    expect(anchor?.threadPlatformId).toBe('plat-1');
+  });
+
+  it('edits and reactions are never routed under the anchor, and never disturb it', async () => {
+    await seedAgentAndChannel();
+    grantChannelDestination('ag-1', 'mg-1');
+    const { session } = await resolveTaskSession('ag-1', 'series-1');
+    await setTaskThreadAnchor(session.id, 'telegram', 'telegram:123', 'plat-1', new Date().toISOString());
+    const now = new Date().toISOString();
+    insertTaskChat('ag-1', session.id, 'out-edit', now, null, 'task-fire-x', {
+      operation: 'edit',
+      messageId: 'plat-1',
+      text: 'amended',
+    });
+    insertTaskChat('ag-1', session.id, 'out-react', now, null, 'task-fire-x', {
+      operation: 'reaction',
+      messageId: 'plat-1',
+      emoji: 'eyes',
+    });
+
+    const calls: Array<{ threadId: string | null }> = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, threadId) {
+        calls.push({ threadId });
+        return undefined;
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null }, { threadId: null }]);
     const anchor = await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123');
     expect(anchor?.threadPlatformId).toBe('plat-1');
   });
