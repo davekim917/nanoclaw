@@ -680,7 +680,12 @@ export function formatMirrorSourceRoot(resolvedRoot: string): string {
 export function writeMirrorSourceRoot(mirrorDir: string, resolvedRoot: string): boolean {
   const file = path.join(mirrorDir, MIRROR_SOURCE_ROOT_FILE);
   const content = formatMirrorSourceRoot(resolvedRoot);
-  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  let stat: fs.Stats | undefined;
+  try {
+    stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  } catch {
+    return false;
+  }
   if (stat !== undefined && stat.isFile()) {
     try {
       if (fs.readFileSync(file, 'utf8') === content) return false;
@@ -713,7 +718,17 @@ export function writeMirrorSourceRoot(mirrorDir: string, resolvedRoot: string): 
  */
 export function readMirrorSourceRoot(mirrorDir: string): string | null {
   const file = path.join(mirrorDir, MIRROR_SOURCE_ROOT_FILE);
-  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  let stat: fs.Stats | undefined;
+  try {
+    // `throwIfNoEntry` suppresses ENOENT and nothing else: this path has a
+    // caller-supplied DIRECTORY component, so a file (or a symlink to one)
+    // standing where that directory should be throws ENOTDIR, and an unreadable
+    // parent throws EACCES. Unhandled, either would escape a `cpSync` filter and
+    // fail the whole spawn over one bad entry in a shared mirror.
+    stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  } catch {
+    return null;
+  }
   if (stat === undefined || !stat.isFile()) return null;
   let content: string;
   try {

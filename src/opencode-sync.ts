@@ -256,22 +256,36 @@ export interface OpenCodeSkillSyncResult {
  * the OpenCode provider copies the skill/ tree into the session XDG with
  * `dereference: true` so the container sees real files.
  */
-export function syncOpenCodePluginSkills(): OpenCodeSkillSyncResult {
-  const pluginsRoot = path.join(os.homedir(), 'plugins');
+/**
+ * The deny set every walk of this mirror's population must use: the code-level
+ * denials plus every workgroup-scoped plugin.
+ *
+ * ONE function rather than a set each caller assembles, because two walks that
+ * deny different plugins are two different populations, and discovery keeps only
+ * the FIRST plugin to claim a skill name — so a reader deriving its own deny set
+ * can name a different owner for a name than the writer published under it. That
+ * divergence is a live bug class here: the drop set still walks with the default
+ * denials only, which is #836.
+ */
+export function openCodeMirrorDenyPlugins(): Set<string> {
   // A workgroup-scoped plugin's skills are never mirrored. Every target here is
   // either the global dir, which any OpenCode group without its own falls back
   // to, or a per-sibling dir not keyed by workgroup (src/plugin-scopes.ts). They
   // are denied before discovery's first-plugin-wins name dedup, so a scoped
   // plugin can't shadow a same-named skill in an unscoped one, and the cleanup
-  // pass prunes a copy made before scoping the next time this runs.
-  const scoped = scopedPluginNames(loadPluginScopes());
+  // pass prunes a copy made before scoping the next time the sync runs.
+  return new Set([...DEFAULT_DENY_PLUGINS, ...scopedPluginNames(loadPluginScopes())]);
+}
+
+export function syncOpenCodePluginSkills(): OpenCodeSkillSyncResult {
+  const pluginsRoot = path.join(os.homedir(), 'plugins');
   // The repository roots anything in this mirror may point into. Shared by the
   // skill mirror (via each skill's own `pluginRoot`) and the support-dir mirror
   // below, which has no single plugin in hand.
   const pluginRoots = resolvePluginRoots(pluginsRoot);
   const discovered = discoverPortableSkills(pluginsRoot, {
     runtime: 'opencode',
-    denyPlugins: new Set([...DEFAULT_DENY_PLUGINS, ...scoped]),
+    denyPlugins: openCodeMirrorDenyPlugins(),
   });
   const targets = discoverOpenCodeXdgTargets('skill');
 

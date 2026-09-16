@@ -31,7 +31,7 @@ import {
 } from '../fs-safety.js';
 import { assertValidGroupFolder } from '../group-folder.js';
 import { log } from '../log.js';
-import { collectSiblingSupportDirs } from '../opencode-sync.js';
+import { collectSiblingSupportDirs, openCodeMirrorDenyPlugins } from '../opencode-sync.js';
 import { isExcludedPluginPath, splitExcludedPlugins, type ExcludedPlugins } from '../plugin-exclusions.js';
 import {
   MIRROR_MARKER,
@@ -174,6 +174,49 @@ export function excludedOpenCodeSkillNames(pluginsRoot: string, excluded: Exclud
  * `syncSkillSymlinks` itself, which is a change to a mirror Codex shares:
  * recorded in #836, not made here.
  */
+/**
+ * The containment roots for one top-level entry of the mirror. See the ordering
+ * note at the `rootsFor` call site.
+ */
+function resolveRootsFor(
+  source: string,
+  name: string,
+  allowedRoots: readonly string[],
+  sourceRootsByName: ReadonlyMap<string, string>,
+): readonly string[] {
+  const dir = path.join(source, name);
+  // Provenance belongs to a REAL DIRECTORY the mirror writers published. A
+  // top-level file, or a symlink standing where a mirror dir would be (the
+  // pre-mirror-dir legacy shape, which only a sync prunes), has a path the
+  // writers never wrote: reading a record "inside" it would follow that link
+  // into a plugin repository and let the PLUGIN choose the root — a record
+  // saying `/` is wider than the union it replaced.
+  let entry: fs.Stats | undefined;
+  try {
+    entry = fs.lstatSync(dir, { throwIfNoEntry: false });
+  } catch {
+    return [];
+  }
+  if (entry === undefined || !entry.isDirectory()) return allowedRoots;
+
+  const recorded = readMirrorSourceRoot(dir);
+  if (recorded !== null) {
+    const resolved = resolveRealPath(recorded);
+    // A record is a claim about WHICH plugin repository, never about what counts
+    // as one. Honour it only when it names a root that is still a plugin
+    // repository now; a record pointing anywhere else is stale or planted.
+    return resolved !== null && allowedRoots.includes(resolved) ? [resolved] : [];
+  }
+  const walked = sourceRootsByName.get(name);
+  if (walked !== undefined) return [walked];
+  try {
+    if (fs.lstatSync(path.join(dir, MIRROR_MARKER), { throwIfNoEntry: false }) !== undefined) return [];
+  } catch {
+    return [];
+  }
+  return allowedRoots;
+}
+
 export interface CopyOpenCodeSkillsOptions {
   /** Skill names to omit, gated on the mirror writer's marker (see above). */
   dropNames?: ReadonlySet<string>;
@@ -214,7 +257,15 @@ export interface CopyOpenCodeSkillsOptions {
  * about the bytes in the mirror and this is not.
  */
 export function mirrorSourceRootsByName(pluginsRoot: string): Map<string, string> {
-  const discovered = discoverPortableSkills(pluginsRoot, { runtime: 'opencode' });
+  // The SAME deny set the mirror was written with. A walk denying less would
+  // name a different owner for a shared skill name — discovery keeps the first
+  // plugin to claim one — and would then attribute a legacy dir to a
+  // workgroup-scoped plugin the mirror never published from, reopening exactly
+  // the cross-plugin reach this containment closes.
+  const discovered = discoverPortableSkills(pluginsRoot, {
+    runtime: 'opencode',
+    denyPlugins: openCodeMirrorDenyPlugins(),
+  });
   const roots = new Map<string, string>();
   for (const skill of discovered) {
     const resolved = resolveRealPath(skill.pluginRoot);
@@ -256,18 +307,7 @@ export function copyOpenCodeSkills(source: string, target: string, options: Copy
   const rootsFor = (name: string): readonly string[] => {
     const cached = rootsByName.get(name);
     if (cached !== undefined) return cached;
-    const dir = path.join(source, name);
-    const recorded = readMirrorSourceRoot(dir);
-    let roots: readonly string[];
-    if (recorded !== null) {
-      const resolved = resolveRealPath(recorded);
-      roots = resolved === null ? [] : [resolved];
-    } else {
-      const walked = sourceRootsByName.get(name);
-      if (walked !== undefined) roots = [walked];
-      else if (fs.lstatSync(path.join(dir, MIRROR_MARKER), { throwIfNoEntry: false }) !== undefined) roots = [];
-      else roots = allowedRoots;
-    }
+    const roots = resolveRootsFor(source, name, allowedRoots, sourceRootsByName);
     rootsByName.set(name, roots);
     return roots;
   };

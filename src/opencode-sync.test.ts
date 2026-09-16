@@ -19,6 +19,7 @@ vi.mock('./log.js', () => ({
 }));
 
 import { syncOpenCodePluginSkills, syncOpenCodeSubagents } from './opencode-sync.js';
+import { resolvePluginRoots } from './plugin-skill-discovery.js';
 import { copyOpenCodeSkills, mirrorSourceRootsByName } from './providers/opencode.js';
 
 const HOME = path.join(TEST_ROOT, 'home');
@@ -146,14 +147,32 @@ describe('syncOpenCodePluginSkills containment (#829)', () => {
 
     syncOpenCodePluginSkills();
 
+    // The widest inputs a spawn ever passes — every plugin root allowed, no
+    // walk attribution — so the record this sync wrote is the only thing that
+    // can refuse the cross-plugin link.
     const xdg = path.join(TEST_ROOT, 'xdg');
     copyOpenCodeSkills(GLOBAL_SKILLS, xdg, {
-      allowedRoots: [fs.realpathSync(path.join(HOME, 'plugins', 'shared-plugin'))],
-      sourceRootsByName: mirrorSourceRootsByName(path.join(HOME, 'plugins')),
+      allowedRoots: resolvePluginRoots(path.join(HOME, 'plugins')),
+      sourceRootsByName: new Map(),
     });
 
     expect(fs.readFileSync(path.join(xdg, 'shared', 'sub', 'own.md'), 'utf-8')).toBe('in-repo primitives');
     expect(fs.existsSync(path.join(xdg, 'shared', 'sub', 'cross.md'))).toBe(false);
+  });
+
+  it('attributes a name to the plugin the MIRROR published it from, not to a scoped one', () => {
+    // Discovery keeps the first plugin to claim a name, alphabetically. A walk
+    // that denied less than the mirror's would name `a-client` as the owner of
+    // `dup-skill`, so a legacy dir published from `b-shared` would be contained
+    // to a scoped plugin's repository — refusing its own links and admitting
+    // links into the scoped one, which is the escape this fix closes.
+    pluginSkill('a-client', 'dup-skill');
+    pluginSkill('b-shared', 'dup-skill');
+    scopePlugins({ 'a-client': ['client-wg'] });
+
+    const roots = mirrorSourceRootsByName(path.join(HOME, 'plugins'));
+
+    expect(roots.get('dup-skill')).toBe(fs.realpathSync(path.join(HOME, 'plugins', 'b-shared')));
   });
 
   it('records the source repository in every mirror dir it writes, skills and support dirs alike', () => {

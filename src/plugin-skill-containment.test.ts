@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { discoverPortableSkills, resolvePluginRoots, syncSkillSymlinks } from './plugin-skill-discovery.js';
 import { copyOpenCodeSkills, mirrorSourceRootsByName } from './providers/opencode.js';
@@ -326,8 +326,28 @@ describe('plugin skill mirror containment', () => {
     fs.writeFileSync(path.join(skillDir, '.nanoclaw-source-root'), JSON.stringify('/'));
     fs.writeFileSync(path.join(skillDir, '.nanoclaw-managed'), 'forged');
 
-    const { mirror } = runPipeline();
+    // Our own write FAILS — every write of the record sits in a bare catch — so
+    // the only thing standing between the plugin's file and the record slot is
+    // the owned-name skip in the child loop.
+    const realWriteFileSync = fs.writeFileSync;
+    const writeSpy = vi.spyOn(fs, 'writeFileSync').mockImplementation(((
+      file: fs.PathOrFileDescriptor,
+      ...rest: unknown[]
+    ) => {
+      if (typeof file === 'string' && file.endsWith('.nanoclaw-source-root')) throw new Error('ENOSPC');
+      return (realWriteFileSync as (...args: unknown[]) => void)(file, ...rest);
+    }) as typeof fs.writeFileSync);
+    const mirror = path.join(tmp, 'mirror');
+    try {
+      syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+    } finally {
+      writeSpy.mockRestore();
+    }
+    expect(fs.existsSync(path.join(mirror, 'helper', '.nanoclaw-source-root'))).toBe(false);
 
+    // With the write working again the record is ours, a regular file, naming
+    // this plugin — never the plugin's own bytes.
+    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
     const record = fs.readFileSync(path.join(mirror, 'helper', '.nanoclaw-source-root'), 'utf8');
     expect(record).toBe(`${JSON.stringify(fs.realpathSync(path.join(plugins, 'good')))}\n`);
     expect(fs.lstatSync(path.join(mirror, 'helper', '.nanoclaw-source-root')).isSymbolicLink()).toBe(false);
@@ -341,6 +361,49 @@ describe('plugin skill mirror containment', () => {
     const xdg = path.join(tmp, 'xdg2');
     copyOpenCodeSkills(mirror, xdg, { allowedRoots: resolvePluginRoots(plugins), sourceRootsByName: new Map() });
     expect(fs.existsSync(path.join(xdg, 'helper', 'notes.md'))).toBe(false);
+    expect(readAll(xdg)).not.toContain('HOST-ONLY-SECRET');
+  });
+
+  it('refuses a record naming a directory that is not a plugin repository', () => {
+    // A record is a claim about WHICH repository, not about what counts as one.
+    // Honouring an arbitrary resolvable path would let a stale or planted record
+    // nominate its own boundary.
+    const mirror = path.join(tmp, 'mirror');
+    syncSkillSymlinks(mirror, discoverPortableSkills(plugins, { runtime: 'opencode' }));
+    fs.writeFileSync(path.join(mirror, 'helper', '.nanoclaw-source-root'), `${JSON.stringify(secretDir)}\n`);
+    fs.symlinkSync(secret, path.join(mirror, 'helper', 'notes.md'));
+
+    const xdg = path.join(tmp, 'xdg');
+    copyOpenCodeSkills(mirror, xdg, {
+      allowedRoots: resolvePluginRoots(plugins),
+      sourceRootsByName: mirrorSourceRootsByName(plugins),
+    });
+
+    expect(fs.existsSync(path.join(xdg, 'helper', 'notes.md'))).toBe(false);
+    expect(readAll(xdg)).not.toContain('HOST-ONLY-SECRET');
+  });
+
+  it('does not read a record through a top-level mirror entry that is a SYMLINK', () => {
+    // The pre-mirror-dir legacy shape: a top-level symlink straight into a
+    // plugin's skill dir, which only a sync prunes. Reading "its" record would
+    // follow that link into the plugin and let the PLUGIN name the root — and a
+    // planted `/` is wider than the union it replaced.
+    const evilSkill = path.join(plugins, 'evil', 'skills', 'foo');
+    writeSkill(evilSkill, 'foo');
+    fs.writeFileSync(path.join(evilSkill, '.nanoclaw-source-root'), `${JSON.stringify('/')}\n`);
+    fs.symlinkSync(secret, path.join(evilSkill, 'notes.md'));
+
+    const mirror = path.join(tmp, 'mirror');
+    fs.mkdirSync(mirror, { recursive: true });
+    fs.symlinkSync(evilSkill, path.join(mirror, 'foo'));
+
+    const xdg = path.join(tmp, 'xdg');
+    copyOpenCodeSkills(mirror, xdg, {
+      allowedRoots: resolvePluginRoots(plugins),
+      sourceRootsByName: new Map(),
+    });
+
+    expect(fs.existsSync(path.join(xdg, 'foo', 'notes.md'))).toBe(false);
     expect(readAll(xdg)).not.toContain('HOST-ONLY-SECRET');
   });
 
