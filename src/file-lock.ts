@@ -134,6 +134,14 @@ export async function withFileLock<T>(
   const holder = spawn('flock', ['-x', '-w', String(waitSec), lockFile, 'sh', '-c', 'printf ready; read _'], {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+  // Every release path writes a newline to stdin. If the holder is already
+  // gone (killed by a signal, or `flock` missing), that write surfaces as an
+  // asynchronous EPIPE on the stream — with no listener it is an uncaught
+  // exception in the HOST process, not a failed lock. Swallow it: a dead
+  // holder has already released the lock, which is all the write was for.
+  holder.stdin.on('error', () => {
+    /* holder gone; lock already released */
+  });
 
   await new Promise<void>((resolve, reject) => {
     let output = '';
