@@ -9,7 +9,7 @@ import {
   claudeSpawnEnv,
   resolveClaudeSpawnDefaults,
 } from './claude-spawn-defaults.js';
-import { DEFAULT_SONNET_MODEL } from './flag-parser.js';
+import { DEFAULT_OPUS_MODEL, DEFAULT_SONNET_MODEL } from './flag-parser.js';
 import type { ContainerConfig } from './container-config.js';
 
 type Cfg = Pick<
@@ -87,9 +87,10 @@ describe('resolveClaudeSpawnDefaults — layer precedence', () => {
   it('test_unconfigured_group_uses_the_native_claude_default', () => {
     // An unpinned native Claude group and an unpinned Codex → Claude fallback
     // reach this same configuration. No effort is emitted: the provider derives
-    // Sonnet's xhigh from the resolved model at query time.
+    // Opus's high from the resolved model at query time.
     const r = resolveClaudeSpawnDefaults(cfg());
-    expect(r).toEqual({ model: DEFAULT_SONNET_MODEL, effort: undefined, drops: [] });
+    expect(r).toEqual({ model: DEFAULT_OPUS_MODEL, effort: undefined, drops: [] });
+    expect(r.model).toBe('claude-opus-5[1m]');
   });
 
   it('test_chain_matches_the_codex_branch', () => {
@@ -118,7 +119,7 @@ describe('resolveClaudeSpawnDefaults — foreign vocabulary is dropped, never ex
     // NANOCLAW_EFFORT_OVERRIDE bypasses claudeConfigSchema, so nothing
     // downstream would have rejected these.
     const r = resolveClaudeSpawnDefaults(cfg({ model: 'gpt-6-astra', effort: 'ultra' }));
-    expect(r.model).toBe(DEFAULT_SONNET_MODEL);
+    expect(r.model).toBe(DEFAULT_OPUS_MODEL);
     expect(r.effort).toBeUndefined();
     expect(r.drops).toHaveLength(2);
     expect(r.drops[0]).toContain('gpt-6-astra');
@@ -132,7 +133,7 @@ describe('resolveClaudeSpawnDefaults — foreign vocabulary is dropped, never ex
   });
 
   it('test_an_opencode_slug_is_dropped', () => {
-    expect(resolveClaudeSpawnDefaults(cfg({ model: 'opencode-go/kimi-k3' })).model).toBe(DEFAULT_SONNET_MODEL);
+    expect(resolveClaudeSpawnDefaults(cfg({ model: 'opencode-go/kimi-k3' })).model).toBe(DEFAULT_OPUS_MODEL);
   });
 
   it('test_a_dropped_layer_yields_to_the_next_one', () => {
@@ -166,9 +167,15 @@ describe('claudeSpawnEnv', () => {
   it('claude_spawn_env_emits_ncl_configured_model_and_effort', () => {
     // The exact container.json shape left by
     // `ncl groups config update --model claude-fable-5-1[1m] --effort medium`.
+    // This asserted ANTHROPIC_DEFAULT_OPUS_MODEL=claude-fable-5-1[1m] until
+    // 2026-09-15 — i.e. it pinned the group's model INTO the `opus` alias,
+    // which is the defect, not a contract. The group's model now rides
+    // NANOCLAW_CLAUDE_MODEL and the alias stays constant.
     expect(claudeSpawnEnv(cfg({ model: 'claude-fable-5-1[1m]', effort: 'medium' }))).toEqual([
       '-e',
-      'ANTHROPIC_DEFAULT_OPUS_MODEL=claude-fable-5-1[1m]',
+      'NANOCLAW_CLAUDE_MODEL=claude-fable-5-1[1m]',
+      '-e',
+      'ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5[1m]',
       '-e',
       'ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5',
       '-e',
@@ -192,20 +199,22 @@ describe('claudeSpawnEnv', () => {
     const env = claudeSpawnEnv(cfg());
     expect(env.join(' ')).not.toContain('NANOCLAW_EFFORT_OVERRIDE');
     expect(pairs(env)).toEqual({
-      ANTHROPIC_DEFAULT_OPUS_MODEL: DEFAULT_SONNET_MODEL,
+      NANOCLAW_CLAUDE_MODEL: DEFAULT_OPUS_MODEL,
+      ANTHROPIC_DEFAULT_OPUS_MODEL: DEFAULT_OPUS_MODEL,
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5-20251001',
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
       CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: '1',
       CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: '3',
     });
-    expect(env).toHaveLength(12);
+    expect(env).toHaveLength(14);
   });
 
   it('claude_spawn_env_matches_the_live_fleet_baseline', () => {
-    // This is the unpinned Claude baseline; group-level model/effort fields are
-    // exceptions, not copies of this default.
-    expect(pairs(claudeSpawnEnv(cfg())).ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-sonnet-5');
+    // This is the unpinned Claude baseline: Opus [1m], and no effort — the
+    // container applies Opus's family default (high), which is the value no
+    // host-side env could express without also pinning every other group.
+    expect(pairs(claudeSpawnEnv(cfg())).NANOCLAW_CLAUDE_MODEL).toBe('claude-opus-5[1m]');
     expect(claudeSpawnEnv(cfg()).includes('NANOCLAW_EFFORT_OVERRIDE=')).toBe(false);
   });
 
@@ -216,22 +225,67 @@ describe('claudeSpawnEnv', () => {
         effort: 'xhigh',
       }),
     );
-    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-sonnet-5');
+    expect(env.NANOCLAW_CLAUDE_MODEL).toBe('claude-sonnet-5');
     expect(env.NANOCLAW_EFFORT_OVERRIDE).toBe('xhigh');
   });
 
   it('claude_spawn_env_normalises_a_bare_opus_id_to_the_1m_window', () => {
-    expect(pairs(claudeSpawnEnv(cfg({ model: 'claude-opus-5' }))).ANTHROPIC_DEFAULT_OPUS_MODEL).toBe(
-      'claude-opus-5[1m]',
-    );
+    expect(pairs(claudeSpawnEnv(cfg({ model: 'claude-opus-5' }))).NANOCLAW_CLAUDE_MODEL).toBe('claude-opus-5[1m]');
   });
 
   it('claude_spawn_env_resolves_a_bare_family_alias', () => {
     const env = pairs(claudeSpawnEnv(cfg({ defaultModel: 'sonnet' })));
-    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-sonnet-5');
+    expect(env.NANOCLAW_CLAUDE_MODEL).toBe('claude-sonnet-5');
     // ...and no effort is invented for it. The container derives Sonnet's
     // xhigh from this very id (agent-runner defaultEffortForModel).
     expect(env.NANOCLAW_EFFORT_OVERRIDE).toBeUndefined();
+  });
+});
+
+// The alias short-circuit. `ANTHROPIC_DEFAULT_<FAMILY>_MODEL` is what the CLI
+// sends when anything uses the bare family WORD: a subagent's `model:`
+// frontmatter, or the `"model": "opus"` pin group-init writes into every
+// group's .claude-shared/settings.json (src/group-init.ts REQUIRED_SETTINGS).
+//
+// The opus one carried `resolved.model` until 2026-09-15, so the word meant
+// "whatever this group runs" — and once the unpinned default moved to Sonnet
+// in 7d0e7df3a, it meant Sonnet 5 in 8 of 9 Claude groups. Measured in a live
+// container: ANTHROPIC_DEFAULT_OPUS_MODEL=claude-sonnet-5.
+describe('claudeSpawnEnv — the family aliases are install constants, never the group model', () => {
+  const opusAlias = (c: Cfg = cfg(), ch = {}) => pairs(claudeSpawnEnv(c, ch)).ANTHROPIC_DEFAULT_OPUS_MODEL;
+
+  it('an unpinned group resolves `opus` to the fleet Opus id', () => {
+    expect(opusAlias()).toBe(DEFAULT_OPUS_MODEL);
+  });
+
+  it('a sonnet-pinned group still resolves `opus` to the fleet Opus id', () => {
+    // The `model: opus` settings pin and every `model: opus` subagent in this
+    // group ran Sonnet 5 before this. The group itself keeps its pin.
+    const env = pairs(claudeSpawnEnv(cfg({ model: 'claude-sonnet-5' })));
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe(DEFAULT_OPUS_MODEL);
+    expect(env.NANOCLAW_CLAUDE_MODEL).toBe('claude-sonnet-5');
+  });
+
+  it('no layer can retarget the alias — not the channel wiring, not either container.json field', () => {
+    expect(opusAlias(cfg({ model: 'claude-haiku-4-5-20251001' }))).toBe(DEFAULT_OPUS_MODEL);
+    expect(opusAlias(cfg({ defaultModel: 'claude-fable-5-1[1m]' }))).toBe(DEFAULT_OPUS_MODEL);
+    expect(opusAlias(cfg({ model: 'claude-fable-5-1[1m]' }), { model: 'sonnet' })).toBe(DEFAULT_OPUS_MODEL);
+  });
+
+  it('the sonnet and haiku aliases are constants too', () => {
+    const env = pairs(claudeSpawnEnv(cfg({ model: 'claude-opus-5[1m]' })));
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(DEFAULT_SONNET_MODEL);
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-haiku-4-5-20251001');
+  });
+
+  it('the group model travels in its own variable, never in an alias', () => {
+    // The structural form: for a group pinned to something that is not Opus,
+    // no ANTHROPIC_DEFAULT_* var may hold that pin.
+    const env = pairs(claudeSpawnEnv(cfg({ model: 'claude-fable-5-1[1m]' })));
+    expect(env.NANOCLAW_CLAUDE_MODEL).toBe('claude-fable-5-1[1m]');
+    for (const [k, v] of Object.entries(env)) {
+      if (k.startsWith('ANTHROPIC_DEFAULT_')) expect(v).not.toBe('claude-fable-5-1[1m]');
+    }
   });
 });
 

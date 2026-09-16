@@ -2007,8 +2007,10 @@ function ensureOpus1mSuffix(model: string): string {
 }
 
 /**
- * The env var the CLI expands each bare family alias through — the SAME table
- * the send path below uses when it pins a concrete id into `perQueryEnv`.
+ * The env var the CLI expands each bare family alias through. It is read
+ * here only in the alias → concrete id direction (`canonicalUsageModel`); the
+ * send path pins nothing into `perQueryEnv` any more, because a family word
+ * means the same model in every group.
  *
  * The host resolves every alias once at spawn and injects the answers here
  * (`claudeSpawnEnv` in src/claude-spawn-defaults.ts, forwarded by
@@ -2060,10 +2062,14 @@ function canonicalUsageModel(model: string | undefined, env: Record<string, stri
  * one (-e flag, group provider config, operator NANOCLAW_EFFORT_OVERRIDE).
  *
  *   opus → high — operator decision 2026-07-27, aligned with the GPT 5.6 SOL
- *           default for cross-provider parity. Applies to the bare `opus`
- *           alias and every concrete claude-opus-* id; this install only
- *           runs Opus 5+ (opus 4.8 and below are no longer used). Operators
- *           can dial up via -e or NANOCLAW_EFFORT_OVERRIDE.
+ *           default for cross-provider parity, and reaffirmed 2026-09-16 when
+ *           Opus became the model an UNPINNED group runs (DEFAULT_OPUS_MODEL
+ *           in src/claude-spawn-defaults.ts): the fleet baseline is Opus at
+ *           `high`, not a quieter tier chosen because it is now the default.
+ *           Applies to the bare `opus` alias and every concrete claude-opus-*
+ *           id; this install only runs Opus 5+ (opus 4.8 and below are no
+ *           longer used). Operators dial down or up per group, per channel or
+ *           per turn via -e / NANOCLAW_EFFORT_OVERRIDE.
  *   fable → medium — keep Fable's default at medium; operators can dial up
  *           via -e or NANOCLAW_EFFORT_OVERRIDE when a task warrants it.
  *   sonnet → xhigh — Sonnet 5 (the bare `sonnet` alias) defaults to xhigh, the
@@ -2077,8 +2083,8 @@ function canonicalUsageModel(model: string | undefined, env: Record<string, stri
 function defaultEffortForModel(model: string | undefined): string | undefined {
   if (!model) return 'high';
   const m = model.toLowerCase();
-  // Opus 5+ only — every opus id (and the bare alias, which resolves to the
-  // current production opus via ANTHROPIC_DEFAULT_OPUS_MODEL) defaults to
+  // Opus 5+ only — every opus id (and the bare alias, which resolves to
+  // DEFAULT_OPUS_MODEL via ANTHROPIC_DEFAULT_OPUS_MODEL) defaults to
   // `high`. Pre-5 opus ids are no longer used in this install; if one ever
   // appears, it falls through to the same `high` default rather than 400 on
   // the unsupported `xhigh` of older opus generations.
@@ -2606,14 +2612,30 @@ export class ClaudeProvider implements AgentProvider {
     // regardless of auth path (see ensureOpus1mSuffix).
     //
     // Final fallback is the CONCRETE id the host already resolved for this
-    // spawn, read from ANTHROPIC_DEFAULT_OPUS_MODEL — the same value the CLI
-    // would substitute for the bare `opus` alias, so the model that runs is
-    // unchanged. Never undefined: with model undefined the CLI uses its own
+    // spawn's group (channel wiring → container.json → the install default),
+    // read from NANOCLAW_CLAUDE_MODEL (`claudeSpawnEnv` in
+    // src/claude-spawn-defaults.ts).
+    //
+    // That used to be read from ANTHROPIC_DEFAULT_OPUS_MODEL, which the host
+    // set to the same resolved id. It is the SDK's `opus` ALIAS answer, so
+    // sharing it meant the word "opus" — in a subagent's frontmatter, in the
+    // `"model": "opus"` pin group-init writes into every group's
+    // settings.json — resolved to whatever the group ran; once the unpinned
+    // default moved to Sonnet, every one of those silently ran Sonnet 5. The
+    // alias now carries the install's Opus constant and the group's model
+    // travels in its own variable. Never read the alias var for THIS chain
+    // again; reading it below in `canonicalUsageModel` is the opposite
+    // direction (alias → id) and is correct.
+    //
+    // Never undefined: with model undefined the CLI uses its own
     // built-in default — whatever Opus was current at the pinned binary's
     // release (2.1.156 → opus-4-7, observed live 2026-06-09) — silently
     // ignoring the configured chain (channel default → container.json →
-    // DEFAULT_OPUS_MODEL). The bare alias remains the last resort for spawns
-    // that carry no env at all (unit tests, a host too old to set it).
+    // DEFAULT_OPUS_MODEL). ANTHROPIC_DEFAULT_OPUS_MODEL is kept as the next
+    // fallback for the ROLLING case only — a container spawned by a host that
+    // predates NANOCLAW_CLAUDE_MODEL, where that var still holds the group's
+    // resolved id — and the bare alias is the last resort for spawns that
+    // carry no env at all (unit tests).
     //
     // Reading the concrete id here rather than the alias is what makes the
     // effort default below correct. `defaultEffortForModel` is the ONLY place
@@ -2628,7 +2650,12 @@ export class ClaudeProvider implements AgentProvider {
     //
     // `stickyConfig.model` still wins over this, unchanged — a per-agent
     // providerConfig is more specific than the group's default model.
-    const rawModel = input.model ?? this.stickyConfig.model ?? process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ?? 'opus';
+    const rawModel =
+      input.model ??
+      this.stickyConfig.model ??
+      process.env.NANOCLAW_CLAUDE_MODEL ??
+      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ??
+      'opus';
     const model = rawModel ? ensureOpus1mSuffix(rawModel) : rawModel;
     // Effort precedence: -e flag (turn/sticky, arrives as input.effort) →
     // group container.json provider config → operator override env
@@ -2674,17 +2701,20 @@ export class ClaudeProvider implements AgentProvider {
     // Leave CLAUDE_CODE_SUBAGENT_MODEL unset: a concrete value outranks
     // per-invocation and frontmatter model selection, pinning every subagent
     // to the group model; subagents without an explicit model already inherit
-    // the main model. The family env vars below only resolve matching bare
-    // aliases (docs: code.claude.com/docs/en/sub-agents.md).
+    // the main model. The family env vars only resolve matching bare aliases
+    // (docs: code.claude.com/docs/en/sub-agents.md), and they arrive here from
+    // the spawn env (`claudeSpawnEnv`) carrying install-wide constants.
+    //
+    // This used to REWRITE the resolved model's own family alias to that model
+    // for the query — the last place the group's model still redefined a
+    // family word. It made the fix above true only at the docker boundary: a
+    // group pinned to a non-current opus (say `opus48`) had `opus` rewritten
+    // back to claude-opus-4-8[1m] here, so its `model: opus` subagents ran the
+    // group's pin rather than the install's Opus (PR #839 review r1 P2). The
+    // family words are install constants in every layer now; the model in
+    // force travels as the SDK's own `model` option, which is set from
+    // `model` directly and needs no alias.
     const perQueryEnv: Record<string, string | undefined> = { ...this.env };
-    if (model) {
-      // Guard: a bare alias here would create an alias→alias loop in the SDK.
-      if (!/^(opus|sonnet|haiku|default)$/i.test(model)) {
-        const family = /^claude-(opus|sonnet|haiku)-/i.exec(model)?.[1]?.toLowerCase();
-        const aliasEnvKey = family ? FAMILY_ALIAS_ENV[family] : undefined;
-        if (aliasEnvKey) perQueryEnv[aliasEnvKey] = model;
-      }
-    }
 
     // Which OAuth ring slot this query runs on. Rate-limit utilization is an
     // ACCOUNT property, and rotation means one container can burn through

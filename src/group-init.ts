@@ -58,7 +58,7 @@ const REQUIRED_ENV: Record<string, string> = {
 //
 // ANTHROPIC_DEFAULT_<FAMILY>_MODEL and NANOCLAW_DEFAULT_EFFORT used to
 // be pinned here, but their single source of truth now lives in
-// container-runner.ts (DEFAULT_OPUS_MODEL etc.) and gets passed via
+// flag-parser.ts (DEFAULT_OPUS_MODEL etc.) and gets passed via
 // docker -e at spawn time. Pinning them in settings.json was a
 // group-level layer that bled into every session in the group when
 // changed — wrong scope for a "default."
@@ -75,6 +75,11 @@ const DEPRECATED_ENV: readonly string[] = [
   // be pinned in settings.json either.
   'NANOCLAW_DEFAULT_EFFORT',
   'NANOCLAW_EFFORT_OVERRIDE',
+  // The group's resolved model, added 2026-09-15 when it stopped riding the
+  // opus alias. Spawn-env-only for the same reason as the pair above: a
+  // settings.json pin is a group-level layer that would shadow the per-spawn
+  // `-e` for every session in the group, including the per-channel wiring.
+  'NANOCLAW_CLAUDE_MODEL',
   // Moved to a per-group spawn-time `-e` (container.json `autoCompactWindow`,
   // docs/specs/quota-burn/plan.md §0.5). A settings.json pin would shadow the
   // per-group value for every session in the group, so scrub it.
@@ -93,9 +98,17 @@ const REQUIRED_SETTINGS: Record<string, unknown> = {
   // so `/update-nanoclaw` can never leave a group with thinking disabled
   // after a settings.json drift.
   alwaysThinkingEnabled: true,
-  // Default model alias. Resolves via ANTHROPIC_DEFAULT_OPUS_MODEL —
-  // which container-runner.ts ships as a docker `-e` env from
-  // DEFAULT_OPUS_MODEL (the install's single source of truth).
+  // Default model alias, for any CLI path that reads settings.json rather
+  // than the `model` the runner passes per query (which outranks it).
+  // Resolves via ANTHROPIC_DEFAULT_OPUS_MODEL, shipped as a docker `-e` from
+  // DEFAULT_OPUS_MODEL (src/flag-parser.ts) by claudeSpawnEnv — so this word
+  // means Opus in every group, pinned or not.
+  //
+  // It did not until 2026-09-15: the alias var carried the group's OWN
+  // resolved model, so this pin meant "whatever this group runs" and, once
+  // the unpinned default became Sonnet in 7d0e7df3a, meant Sonnet 5. The
+  // group's model now travels as NANOCLAW_CLAUDE_MODEL
+  // (src/claude-spawn-defaults.ts).
   model: 'opus',
   // Container agents deliver into chat threads, not a terminal — the default
   // style's preamble/recap padding is pure noise there. Claude-only knob

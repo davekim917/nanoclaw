@@ -1021,11 +1021,16 @@ export interface ContainerConfig {
   gitnexusInjectAgentsMd?: boolean;
 
   /**
-   * Per-group default model when the agent uses the bare `opus` alias.
-   * Resolves the SDK's opus-alias short-circuit ANTHROPIC_DEFAULT_OPUS_MODEL.
-   * Overrides the install-wide DEFAULT_OPUS_MODEL constant in
-   * container-runner.ts. Per-channel wiring overrides this; per-session
-   * `-m <model>` flags override on top of that.
+   * Per-group default model for this agent's turns — exported as
+   * NANOCLAW_CLAUDE_MODEL (`claudeSpawnEnv`, src/claude-spawn-defaults.ts).
+   * Overrides the install-wide default (DEFAULT_OPUS_MODEL, src/flag-parser.ts).
+   * Per-channel wiring overrides this; per-session `-m <model>` flags override
+   * on top of that.
+   *
+   * It does NOT set what the bare `opus` alias resolves to: the SDK's
+   * ANTHROPIC_DEFAULT_OPUS_MODEL short-circuit is the install's Opus constant
+   * for every group. It carried this value until 2026-09-15, which is why a
+   * `model: opus` pin or subagent ran whatever the group ran.
    */
   defaultModel?: string;
 

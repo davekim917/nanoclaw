@@ -1,4 +1,10 @@
-import { DEFAULT_HAIKU_MODEL, DEFAULT_SONNET_MODEL, resolveEffectiveModel, vocabFor } from './flag-parser.js';
+import {
+  DEFAULT_HAIKU_MODEL,
+  DEFAULT_OPUS_MODEL,
+  DEFAULT_SONNET_MODEL,
+  resolveEffectiveModel,
+  vocabFor,
+} from './flag-parser.js';
 import type { ContainerConfig } from './container-config.js';
 
 /**
@@ -36,8 +42,13 @@ export const CLAUDE_MAX_CONCURRENT_SUBAGENTS = '3';
 /** What the claude spawn branch will put in the container's environment. */
 export interface ClaudeSpawnDefaults {
   /**
-   * The RESOLVED concrete model id that lands in ANTHROPIC_DEFAULT_OPUS_MODEL:
-   * family alias mapped, pinned alias mapped, `[1m]` applied.
+   * The RESOLVED concrete model id this group's turns run on, which lands in
+   * NANOCLAW_CLAUDE_MODEL: family alias mapped, pinned alias mapped, `[1m]`
+   * applied.
+   *
+   * It does NOT land in ANTHROPIC_DEFAULT_OPUS_MODEL. That variable answers
+   * the SDK's `opus` ALIAS and is the install's Opus constant for every
+   * group, pinned or not — see `claudeSpawnEnv`.
    */
   model: string;
   /**
@@ -114,11 +125,19 @@ export function resolveClaudeSpawnDefaults(
     ['container.json model', containerConfig.model],
     ['container.json defaultModel', containerConfig.defaultModel],
   ];
-  // The default is a Sonnet conversation, not an implicit Opus escalation.
-  // This is also the neutral Claude target for an unpinned Codex → Claude
-  // fallback: provider fallback changes the runtime, not the agent's identity
-  // or an otherwise-unconfigured model tier.
-  let model = DEFAULT_SONNET_MODEL;
+  // An unpinned Claude group runs Opus (operator decision 2026-09-15). This
+  // is also the Claude target for an unpinned Codex → Claude fallback: the
+  // fallback changes the runtime, and the tier it lands on is the fleet's
+  // default tier, not a quieter one chosen by the fallback path.
+  //
+  // It was DEFAULT_SONNET_MODEL from 7d0e7df3a (2026-09-14) until this line,
+  // and because the resolved model was ALSO the `opus` alias answer, the pin
+  // `"model": "opus"` that group-init writes into every group's
+  // .claude-shared/settings.json resolved to Sonnet 5 — measured live. The
+  // alias no longer carries this value (see `claudeSpawnEnv`), so the two
+  // decisions are now independent: this is the group's model, that is what
+  // the word "opus" means.
+  let model = DEFAULT_OPUS_MODEL;
   for (const [layer, raw] of modelLayers) {
     if (!raw) continue;
     const resolved = resolveEffectiveModel(raw);
@@ -168,8 +187,22 @@ export function resolveClaudeSpawnDefaults(
  * pin every group in the fleet to one model-blind effort.
  * `claude_spawn_env_omits_effort_when_nothing_configured` guards it.
  *
- * The sonnet and haiku aliases are install-wide constants with no per-group
- * layer, so they are emitted verbatim; only the opus alias is operator-tunable.
+ * ## The three alias vars carry ALIASES, never the group's model
+ *
+ * `ANTHROPIC_DEFAULT_<FAMILY>_MODEL` is the SDK's alias short-circuit: the
+ * string in it is what the CLI sends when anything — the agent, a subagent's
+ * `model:` frontmatter, the `"model": "opus"` pin group-init writes into every
+ * group's settings.json — uses that bare family word. All three are therefore
+ * install-wide constants emitted verbatim, so `opus` means Opus in every
+ * group and `sonnet` means Sonnet in every group.
+ *
+ * The opus one used to carry `resolved.model` instead, which made the word
+ * "opus" mean "whatever this group runs". Paired with the unpinned default
+ * moving to Sonnet in 7d0e7df3a, every unpinned group's settings.json pin and
+ * every `model: opus` subagent silently ran Sonnet 5. The group's model needs
+ * its own transport, and has one: NANOCLAW_CLAUDE_MODEL, read by the claude
+ * provider at `input.model ?? stickyConfig.model ?? env` (`container/
+ * agent-runner/src/providers/claude.ts`). Do not reunite them.
  *
  * `onDrop` receives one message per refused value. Logging lives at the call
  * site so this stays a pure function and the log line carries session context.
@@ -183,7 +216,9 @@ export function claudeSpawnEnv(
   if (onDrop) for (const d of resolved.drops) onDrop(d);
   const env = [
     '-e',
-    `ANTHROPIC_DEFAULT_OPUS_MODEL=${resolved.model}`,
+    `NANOCLAW_CLAUDE_MODEL=${resolved.model}`,
+    '-e',
+    `ANTHROPIC_DEFAULT_OPUS_MODEL=${DEFAULT_OPUS_MODEL}`,
     '-e',
     `ANTHROPIC_DEFAULT_SONNET_MODEL=${DEFAULT_SONNET_MODEL}`,
     '-e',

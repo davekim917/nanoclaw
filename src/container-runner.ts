@@ -6321,8 +6321,8 @@ async function buildContainerArgs(
   // model, and they could conflict with always-adaptive models like
   // fable models that reject non-adaptive thinking.)
 
-  // Default `opus` alias resolution and default effort. The constants
-  // at the top of this file (DEFAULT_OPUS_MODEL etc.) are the single
+  // The group's default model and effort. The constants in flag-parser.ts
+  // (DEFAULT_OPUS_MODEL etc.) are the single
   // source of truth — they're the only "default" surface. Per-channel
   // and per-group layers can override; per-session flags override on
   // top of those. Short aliases (opus46, opus47, etc.) live in the
@@ -6338,11 +6338,13 @@ async function buildContainerArgs(
   //      — applies to every channel wired to this agent unless (2) overrides.
   //   4. The DEFAULT_* constants above.
   //
-  // ANTHROPIC_DEFAULT_<FAMILY>_MODEL is the SDK's alias resolver
-  // short-circuit: whatever string is in that env var gets sent to the
-  // API verbatim when the agent or a subagent uses the bare alias.
+  // The resolution above feeds NANOCLAW_CLAUDE_MODEL, NOT the SDK's alias
+  // short-circuit. ANTHROPIC_DEFAULT_<FAMILY>_MODEL is that short-circuit —
+  // whatever string is in it gets sent to the API verbatim when the agent or
+  // a subagent uses the bare family word — and all three carry install-wide
+  // constants, so `opus` means Opus in every group (claudeSpawnEnv).
   // ensureOpus1mSuffix is load-bearing here: a bare `claude-opus-*` reaching
-  // ANTHROPIC_DEFAULT_OPUS_MODEL (e.g. via set_channel_model, which does not
+  // the container as its model (e.g. via set_channel_model, which does not
   // resolve aliases, or a hand-set channel/container default) makes the CLI's
   // auto-compact window collapse to 200k under proxy auth and force-compact
   // long sessions. Normalizing at this consumption point guarantees the 1M
@@ -6377,10 +6379,11 @@ async function buildContainerArgs(
     // pinned short aliases (`opus5`, `opus48`, `sonnet5`, `fable`), then
     // ensureOpus1mSuffix on bare ids. The chat ack calls the same function, so
     // the confirmation the user sees is exactly what lands in
-    // ANTHROPIC_DEFAULT_OPUS_MODEL.
+    // NANOCLAW_CLAUDE_MODEL.
     // Both the resolution and the `-e` strings themselves live in
     // claude-spawn-defaults.ts so they can be executed by a test;
-    // buildContainerArgs cannot (live `onecli` shell calls). Emits the three
+    // buildContainerArgs cannot (live `onecli` shell calls). Emits
+    // NANOCLAW_CLAUDE_MODEL and the three constant
     // ANTHROPIC_DEFAULT_<FAMILY>_MODEL aliases always, and
     // NANOCLAW_EFFORT_OVERRIDE only when a channel wiring or the group's
     // container.json actually configures one — absent means the claude
