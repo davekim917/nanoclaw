@@ -65,13 +65,18 @@ for (const folder of fs.readdirSync(GROUPS_DIR).sort()) {
   if (!fs.existsSync(path.join(GROUPS_DIR, folder, 'container.json'))) continue;
   const cfg = readContainerConfig(folder) as Record<string, any> | undefined;
   if (!cfg) continue;
-  print(
-    folder,
-    'primary',
-    cfg.provider ?? 'claude',
-    cfg.model ?? cfg.defaultModel ?? cfg.providerConfig?.model ?? null,
-    cfg.effort ?? cfg.defaultEffort ?? cfg.providerConfig?.reasoning_effort ?? null,
-  );
+  // providerConfig is the provider's OWN sticky config, and the two providers
+  // rank it oppositely: claude's `stickyConfig` beats the env the host sends
+  // (claude.ts `input.model ?? this.stickyConfig.model ?? env`), while codex's
+  // top-level model reaches providerConfig through config.ts and wins. Its
+  // effort key differs too — `effort` on claude, `reasoning_effort` on codex.
+  const provider = cfg.provider ?? 'claude';
+  const pc = cfg.providerConfig ?? {};
+  const [model, effort] =
+    provider === 'claude'
+      ? [pc.model ?? cfg.model ?? cfg.defaultModel ?? null, pc.effort ?? cfg.effort ?? cfg.defaultEffort ?? null]
+      : [cfg.model ?? cfg.defaultModel ?? pc.model ?? null, cfg.effort ?? cfg.defaultEffort ?? pc.reasoning_effort ?? null];
+  print(folder, 'primary', provider, model, effort);
   // A declared fallback carries its OWN model/effort and nothing else: the
   // primary's are discarded when it applies (src/provider-fallback.ts), so it
   // must be resolved from the fallback's own fields, never the group's.
@@ -82,9 +87,9 @@ TS
 pnpm exec tsx ./claude-default-audit.ts   # delete the file when you're done
 ```
 
-Columns: folder, primary-or-fallback, provider, that path's own configured value, **what will actually run**, the effort, and anything the resolver refused. A row whose fifth column is not its fourth is unpinned in effect on that path — either nothing was configured, or the last column says what was thrown away. `(family default)` in the effort column means no effort is exported and the provider picks its own (Opus → `high`, Sonnet → `xhigh`, Haiku → none).
+Columns: folder, primary-or-fallback, provider, that path's own configured value, **what will actually run**, the effort, and anything the resolver refused. A path is unpinned — and moves — when its fourth column reads `(none)`, **or** when the last column names a refusal: a value the resolver threw away (a `gpt-*` id left behind by `--provider claude`, a typo) leaves the path running the default just as surely as configuring nothing. Short of that, a fifth column that merely *differs* from the fourth is usually benign: an alias expanding (`opus` → `claude-opus-5[1m]`), or an OpenCode row, which differs by construction because that provider's default is out of scope here and does not move. `(family default)` in the effort column means no effort is exported and the provider picks its own (Opus → `high`, Sonnet → `xhigh`, Haiku → none).
 
-Run it on the code you have now to see today's answers, and again after deploy to see the new ones. It calls the same resolver the spawn path calls and reads the Codex constants out of their own source, so it cannot drift from the vocabulary or the precedence chain.
+Run it on the code you have now to see today's answers, and again after deploy to see the new ones. It calls the same resolver the spawn path calls and reads the Codex constants out of their own source, so the vocabulary and the install defaults cannot drift from it. The one thing it restates is the per-provider ranking of `providerConfig` against the top-level fields (see the comment in the loop) — if a group ever grows a `providerConfig` block, re-read that comment before trusting the row — against `container/agent-runner/src/providers/claude.ts` for the Claude side, and against `src/container-runner.ts` (the host ships the top-level model as the channel-shaped `NANOCLAW_CODEX_MODEL_OVERRIDE`, which is why it outranks `providerConfig`) for the Codex side. `container/agent-runner/src/config.ts` alone reads the opposite way.
 
 A per-channel wiring can also pin a model, and it outranks the group config; check any channel you care about:
 
