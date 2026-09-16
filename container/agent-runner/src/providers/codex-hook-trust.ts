@@ -156,15 +156,79 @@ const ADDITIONAL_CONTEXT_EVENTS = new Set<CodexHookEvent>([
   'SubagentStart',
 ]);
 
+// ── raw number literals ────────────────────────────────────────────────────
+// codex 0.154.0 builds serde_json with `arbitrary_precision`, so a JSON number
+// keeps its SOURCE TEXT all the way into the hash: measured, `1.0` and `1`
+// produce different digests, as do `1e3` and `1000`, and `1.50` and `1.5`.
+// `JSON.parse` throws that text away and `String(value)` rebuilds JS's own
+// spelling, so a plugin writing `1.0` would be hashed as `1` and its handler
+// would read back `modified`.
+//
+// Bun's `JSON.parse` exposes the source text to a reviver (ES2025 JSON source
+// access), so hooks files are parsed through one that BOXES every number with
+// the literal that produced it. Everything downstream accepts either a boxed
+// number or a plain one; a plain number falls back to `String`, which is exact
+// for the values NanoClaw generates itself (3600, 30) and is the documented
+// limit for a caller that hands over an already-parsed object.
+//
+// The same source text turns the integer-precision check from a heuristic into
+// an exact one: a literal whose text does not round-trip through the parsed
+// value is a literal `JSON.parse` rounded.
+
+const RAW_NUMBER = Symbol.for('nanoclaw.codexHookTrust.rawNumber');
+
+interface BoxedNumber {
+  [RAW_NUMBER]: string;
+  valueOf(): number;
+}
+
+function boxNumber(value: number, source: string): BoxedNumber {
+  return { [RAW_NUMBER]: source, valueOf: () => value };
+}
+
+function isBoxedNumber(value: unknown): value is BoxedNumber {
+  return typeof value === 'object' && value !== null && typeof (value as BoxedNumber)[RAW_NUMBER] === 'string';
+}
+
+/** The numeric value of a boxed or plain number, or `null` for anything else. */
+function numberValue(value: unknown): number | null {
+  if (typeof value === 'number') return value;
+  if (isBoxedNumber(value)) return value.valueOf();
+  return null;
+}
+
+/**
+ * The literal text codex hashes. For a boxed number that is exactly what the
+ * file said; for a plain one it is JS's spelling, which is all a caller who
+ * already parsed can offer.
+ */
+function numberSource(value: number | BoxedNumber): string {
+  return isBoxedNumber(value) ? value[RAW_NUMBER] : String(value);
+}
+
+/**
+ * `JSON.parse` that keeps every number's source text.
+ *
+ * Falls back to a plain parse on a runtime whose reviver has no `source`
+ * (the third argument is simply absent), which costs exactness only for a
+ * number whose literal is not its JS spelling.
+ */
+export function parseHooksJsonPreservingNumbers(text: string): unknown {
+  return JSON.parse(text, function reviver(this: unknown, _key: string, value: unknown, context?: { source?: string }) {
+    if (typeof value === 'number' && typeof context?.source === 'string') return boxNumber(value, context.source);
+    return value;
+  });
+}
+
 /** A `"type": "command"` handler as it appears in a hooks.json group. */
 export interface CodexCommandHookHandler {
   type: 'command';
   command: string;
   commandWindows?: string | null;
-  timeout?: number | null;
+  timeout?: number | BoxedNumber | null;
   async?: boolean;
   statusMessage?: string | null;
-  additionalContextLimit?: number | null;
+  additionalContextLimit?: number | BoxedNumber | null;
 }
 
 /**
@@ -179,7 +243,7 @@ export interface CodexMcpToolHookHandler {
   server: string;
   tool: string;
   input?: Record<string, unknown>;
-  timeout?: number | null;
+  timeout?: number | BoxedNumber | null;
   statusMessage?: string | null;
 }
 
@@ -212,16 +276,22 @@ export interface CodexHookTrustEntry {
  * instead would take a container down over one absurd value in one third-party
  * plugin, which is the over-broad-guard class this repo has been bitten by.
  */
-function hashableInteger(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value);
+function hashableInteger(value: unknown): boolean {
+  const numeric = numberValue(value);
+  if (numeric === null || !Number.isSafeInteger(numeric)) return false;
+  // With the source text this is EXACT rather than a range heuristic: a literal
+  // that does not round-trip through the parsed value is one JSON.parse rounded.
+  if (isBoxedNumber(value) && value[RAW_NUMBER] !== String(numeric)) return false;
+  return true;
 }
 
-function normalizeTimeout(event: CodexHookEvent, timeout: number | null | undefined): number {
+function normalizeTimeout(event: CodexHookEvent, timeout: number | BoxedNumber | null | undefined): number {
+  const declared = numberValue(timeout);
   if (event === 'SessionEnd' || event === 'Interrupt') {
-    const raw = typeof timeout === 'number' ? timeout : SESSION_END_DEFAULT_TIMEOUT_SEC;
+    const raw = declared ?? SESSION_END_DEFAULT_TIMEOUT_SEC;
     return Math.min(Math.max(raw, 1), SESSION_END_MAX_TIMEOUT_SEC);
   }
-  return Math.max(typeof timeout === 'number' ? timeout : DEFAULT_TIMEOUT_SEC, 1);
+  return Math.max(declared ?? DEFAULT_TIMEOUT_SEC, 1);
 }
 
 /**
@@ -256,7 +326,8 @@ function normalizeCommandHandler(
   const limit = handler.additionalContextLimit;
   if (limit !== undefined && limit !== null && ADDITIONAL_CONTEXT_EVENTS.has(event)) {
     if (!hashableInteger(limit)) return null;
-    if (limit !== DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT) normalized.additionalContextLimit = limit;
+    const value = numberValue(limit)!;
+    if (value !== DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT) normalized.additionalContextLimit = value;
   }
   return normalized;
 }
@@ -282,20 +353,56 @@ function normalizeCommandHandler(
 const SERDE_JSON_PRIVATE_NUMBER = '$serde_json::private::Number';
 
 /**
+ * The literal text codex stores for a JSON number, which is NOT the source text
+ * verbatim. All of this was measured against 0.154.0, one fixture per row:
+ *
+ * | declared | stored   | note                                   |
+ * |----------|----------|----------------------------------------|
+ * | `1`      | `1`      |                                        |
+ * | `1.0`    | `1.0`    | NOT `1` — the fraction survives        |
+ * | `1.50`   | `1.50`   | NOT `1.5` — trailing zeros survive     |
+ * | `1e3`    | `1e+3`   | an unsigned exponent gains a `+`       |
+ * | `1E3`    | `1e+3`   | …and `E` is lowercased                 |
+ * | `1e-3`   | `1e-3`   | a signed exponent is kept              |
+ * | `2.5e10` | `2.5e+10`|                                        |
+ * | `-1`     | `-1`     |                                        |
+ * | `-0`     | `0`      | an INTEGER negative zero loses its sign|
+ * | `-0.0`   | `-0.0`   | …a float one does not                  |
+ *
+ * Integers go through `BigInt`, which is exact at any width and is what turns
+ * `-0` into `0`, so a number inside `input` needs no safe-integer refusal: the
+ * literal is emitted, never a rounded value.
+ */
+function normalizeNumberLiteral(source: string): string | null {
+  const match = /^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?)(\d+))?$/.exec(source);
+  if (!match) return null;
+  const [, sign, integer, fraction, exponentSign, exponentDigits] = match;
+  if (fraction === undefined && exponentDigits === undefined) return String(BigInt(`${sign}${integer}`));
+  const exponent = exponentDigits === undefined ? '' : `e${exponentSign || '+'}${exponentDigits}`;
+  return `${sign}${integer}${fraction === undefined ? '' : `.${fraction}`}${exponent}`;
+}
+
+/**
  * Re-encode an `input` value the way codex's toml round-trip does.
  *
- * Returns `null` when the value cannot be hashed exactly — an integer past
- * `Number.MAX_SAFE_INTEGER`, which `JSON.parse` has already rounded by the time
- * this module sees it (same hazard as `timeout`; see `hashableInteger`).
- * Non-integer numbers are serialized with `String`, which is the shortest
- * round-trip form and matches serde_json for every value a plugin realistically
- * declares.
+ * The number's SOURCE TEXT is what goes in, not its JS spelling — see
+ * `normalizeNumberLiteral` for the exact (measured) transform. A number that
+ * reached this module already parsed, with no boxed source, falls back to
+ * `String`, which is exact only when the literal was already in JS's spelling;
+ * that is the documented limit of handing over a pre-parsed object.
  */
 function encodeMcpToolInputValue(value: unknown): unknown | null {
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) return null;
-    if (Number.isInteger(value) && !Number.isSafeInteger(value)) return null;
-    return { [SERDE_JSON_PRIVATE_NUMBER]: String(value) };
+  if (typeof value === 'number' || isBoxedNumber(value)) {
+    const numeric = numberValue(value)!;
+    if (!Number.isFinite(numeric)) return null;
+    // A PLAIN number carries no literal, so `String` is all there is — and for an
+    // integer past 2^53 that string is the ROUNDED value, which would be hashed
+    // as if it were what the file said. Refuse it. A boxed number has the
+    // literal and needs no such limit: it is emitted exactly, at any width.
+    if (!isBoxedNumber(value) && Number.isInteger(numeric) && !Number.isSafeInteger(numeric)) return null;
+    const literal = normalizeNumberLiteral(numberSource(value as number | BoxedNumber));
+    if (literal === null) return null;
+    return { [SERDE_JSON_PRIVATE_NUMBER]: literal };
   }
   if (Array.isArray(value)) {
     const out: unknown[] = [];
@@ -698,9 +805,14 @@ export interface CodexPluginHookSource {
   dir: string;
 }
 
+/**
+ * Read a hooks file or plugin manifest, PRESERVING every number's source text —
+ * see `parseHooksJsonPreservingNumbers`. Manifest fields this module reads are
+ * all strings or objects, so boxing numbers there costs nothing.
+ */
 function readJson(file: string): Record<string, unknown> | null {
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf-8')) as unknown;
+    const parsed = parseHooksJsonPreservingNumbers(fs.readFileSync(file, 'utf-8'));
     return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
   } catch {
     return null;
@@ -762,17 +874,27 @@ const DEFAULT_PLUGIN_HOOKS_FILE = 'hooks/hooks.json';
  *     outside the plugin directory for a key codex never asks about;
  *   - absolute.
  *
- * Returns the path as codex records it in the state key: the declaration minus
- * its `./`, backslashes normalized to `/`.
+ * Returns the two forms separately, because codex uses two. The FILE it opens
+ * keeps the declaration literally (POSIX: a `\\` is an ordinary filename byte);
+ * the KEY it records replaces `\\` with `/` (`append_plugin_hook_file`,
+ * `core-plugins/src/loader.rs:1280-1285`). Measured: a plugin declaring
+ * `./hooks\\d.json`, with BOTH a file literally named `hooks\\d.json` and a real
+ * `hooks/d.json`, loaded the backslash-named one and keyed it `hooks/d.json`.
  */
-export function resolveDeclaredPluginHookPath(declared: unknown): string | null {
+export function resolveDeclaredPluginHookPath(declared: unknown): { readPath: string; keySuffix: string } | null {
   if (typeof declared !== 'string' || declared.length === 0) return null;
   if (!declared.startsWith('./')) return null;
   const relative = declared.slice(2);
   if (!relative) return null;
-  if (relative.split(/[\\/]/).some((component) => component === '..')) return null;
-  if (relative.startsWith('/') || relative.startsWith('\\')) return null;
-  return relative.replace(/\\/g, '/');
+  // POSIX rules exactly, because containers are Linux: codex splits on `/`
+  // ALONE and only treats `\` as a separator under the Windows path convention
+  // (`infer_path_convention`). Splitting on both here would refuse
+  // `./a\..\b.json`, which codex accepts as one absurdly-named file, and
+  // rewriting `\` to `/` would key the row on a different filename than the one
+  // codex reads.
+  if (relative.split('/').some((component) => component === '..')) return null;
+  if (relative.startsWith('/')) return null;
+  return { readPath: relative, keySuffix: relative.replace(/\\/g, '/') };
 }
 
 /** One hooks block codex will load for a plugin, with the key-source suffix it uses. */
@@ -816,46 +938,57 @@ export interface CodexPluginHookBlock {
  * its Claude manifest and codex reports zero hooks for it).
  */
 export function resolvePluginHookBlocks(pluginDir: string): CodexPluginHookBlock[] {
-  const readFileBlock = (rel: string): CodexPluginHookBlock | null => {
-    const parsed = readJson(path.join(pluginDir, rel));
+  const readFileBlock = (resolved: { readPath: string; keySuffix: string }): CodexPluginHookBlock | null => {
+    const parsed = readJson(path.join(pluginDir, resolved.readPath));
     const hooks = parsed?.hooks;
     // codex drops a file whose `hooks` is absent or empty before recording a
     // source, so no key is ever derived from it.
     if (!hooks || typeof hooks !== 'object' || Object.keys(hooks).length === 0) return null;
-    return { keySuffix: rel, hooks: hooks as Record<string, unknown> };
+    return { keySuffix: resolved.keySuffix, hooks: hooks as Record<string, unknown> };
   };
   const conventional = (): CodexPluginHookBlock[] => {
     if (!fs.existsSync(path.join(pluginDir, DEFAULT_PLUGIN_HOOKS_FILE))) return [];
-    const block = readFileBlock(DEFAULT_PLUGIN_HOOKS_FILE);
+    const block = readFileBlock({ readPath: DEFAULT_PLUGIN_HOOKS_FILE, keySuffix: DEFAULT_PLUGIN_HOOKS_FILE });
     return block ? [block] : [];
   };
 
   const manifest = readJson(path.join(pluginDir, '.codex-plugin', 'plugin.json'));
   const raw = manifest?.hooks;
 
-  // Inline object, or a list of inline objects. Checked BEFORE the string forms
-  // because an array can be either, and only its element type tells them apart —
-  // the same order codex's untagged enum tries.
+  // `RawPluginManifestHooks` is an UNTAGGED enum, so serde tries its variants in
+  // declaration order and the FIRST that deserializes wins:
+  //   Path(String) → Paths(Vec<String>) → Inline(HooksFile) → InlineList(Vec<HooksFile>) → Invalid
+  // Order matters for the mixed cases, and guessing "is there an object in the
+  // array?" gets them backwards. `["./a.json", null]` and
+  // `["./a.json", { … }]` both fail `Vec<String>` AND `Vec<HooksFile>`, so codex
+  // takes `Invalid`, resolves to `None`, and loads the conventional file — while
+  // an element-sniffing check would key rows on `a.json` and skip the fallback.
+  const isHooksFile = (entry: unknown): boolean => entry !== null && typeof entry === 'object' && !Array.isArray(entry);
   const inlineEntries: unknown[] | null =
-    raw && typeof raw === 'object' && !Array.isArray(raw)
+    isHooksFile(raw) && !('length' in (raw as object))
       ? [raw]
-      : Array.isArray(raw) && raw.some((entry) => entry !== null && typeof entry === 'object')
+      : Array.isArray(raw) && raw.length > 0 && raw.every(isHooksFile)
         ? raw
         : null;
   if (inlineEntries) {
+    // `HooksFile.hooks` is `#[serde(default)]`, so `{}` and `{"hooks":{}}` are
+    // VALID inline declarations that load nothing. They resolve to `Some(Inline)`
+    // all the same, so there is no fallback — an empty inline list is a plugin
+    // saying "no hooks", not "use the default".
     const blocks: CodexPluginHookBlock[] = [];
     inlineEntries.forEach((entry, index) => {
-      const hooks = (entry as { hooks?: unknown } | null)?.hooks;
+      const hooks = (entry as { hooks?: unknown }).hooks;
       if (!hooks || typeof hooks !== 'object' || Object.keys(hooks).length === 0) return;
       blocks.push({ keySuffix: `plugin.json#hooks[${index}]`, hooks: hooks as Record<string, unknown> });
     });
-    return blocks.length > 0 ? blocks : conventional();
+    return blocks;
   }
 
-  const declared = typeof raw === 'string' ? [raw] : Array.isArray(raw) ? raw : [];
+  const declared = typeof raw === 'string' ? [raw] : Array.isArray(raw) && raw.every((e) => typeof e === 'string') ? raw : null;
+  if (declared === null) return conventional();
   const resolved = declared
     .map(resolveDeclaredPluginHookPath)
-    .filter((rel): rel is string => rel !== null);
+    .filter((entry): entry is { readPath: string; keySuffix: string } => entry !== null);
   if (resolved.length === 0) return conventional();
   return resolved.map(readFileBlock).filter((block): block is CodexPluginHookBlock => block !== null);
 }

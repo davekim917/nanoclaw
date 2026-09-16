@@ -14,6 +14,7 @@ import {
   declaredPluginHookFiles,
   isCodexHookDispatchable,
   mergeCodexHookTrustIntoToml,
+  parseHooksJsonPreservingNumbers,
   resolveDeclaredPluginHookPath,
   resolvePluginHookBlocks,
   renderCodexHookTrustBlock,
@@ -693,7 +694,12 @@ describe('integers that cannot be hashed exactly are REFUSED, not rounded', () =
     ).toBeNull();
   });
 
-  it('refuses an unsafe integer nested inside an mcp_tool input', () => {
+  it('refuses an unsafe integer inside an mcp_tool input ONLY when it arrives pre-parsed', () => {
+    // A plain number carries no literal, so `String` gives the ROUNDED value and
+    // hashing it would silently claim the file said something it did not. Read
+    // through `parseHooksJsonPreservingNumbers` the same value is emitted
+    // exactly (see the literal tests below), so the refusal is specific to the
+    // pre-parsed path, not to the magnitude.
     expect(
       codexHookTrustHash('PostToolUse', {
         type: 'mcp_tool',
@@ -740,7 +746,10 @@ describe('a handler codex skips still CONSUMES its index — measured', () => {
 
 describe('resolveDeclaredPluginHookPath — codex discards more than it accepts', () => {
   it('accepts a ./-prefixed path and returns it without the prefix', () => {
-    expect(resolveDeclaredPluginHookPath('./hooks/d.json')).toBe('hooks/d.json');
+    expect(resolveDeclaredPluginHookPath('./hooks/d.json')).toEqual({
+      readPath: 'hooks/d.json',
+      keySuffix: 'hooks/d.json',
+    });
   });
 
   it('REFUSES a path with no ./ prefix', () => {
@@ -764,8 +773,25 @@ describe('resolveDeclaredPluginHookPath — codex discards more than it accepts'
     expect(resolveDeclaredPluginHookPath(42)).toBeNull();
   });
 
-  it('normalizes backslashes the way the loader does', () => {
-    expect(resolveDeclaredPluginHookPath('./hooks\\d.json')).toBe('hooks/d.json');
+  it('reads the literal backslash filename but KEYS it with slashes', () => {
+    // Measured: a plugin declaring `./hooks\\d.json`, with BOTH a file literally
+    // named `hooks\\d.json` and a real `hooks/d.json`, loaded the backslash-named
+    // one and reported the key `hooks/d.json`. On POSIX a backslash is an
+    // ordinary filename byte, and only the KEY is rewritten
+    // (`append_plugin_hook_file`).
+    expect(resolveDeclaredPluginHookPath('./hooks\\d.json')).toEqual({
+      readPath: 'hooks\\d.json',
+      keySuffix: 'hooks/d.json',
+    });
+  });
+
+  it('does NOT treat a backslash as a path separator for the .. check', () => {
+    // codex splits on `/` alone under the POSIX convention, so this is one
+    // absurdly-named file, not a traversal.
+    expect(resolveDeclaredPluginHookPath('./a\\..\\b.json')).toEqual({
+      readPath: 'a\\..\\b.json',
+      keySuffix: 'a/../b.json',
+    });
   });
 });
 
@@ -856,5 +882,89 @@ describe('resolvePluginHookBlocks — all four manifest shapes, measured', () =>
   it('no declaration at all takes the conventional file', () => {
     const dir = plugin(undefined, { 'hooks/hooks.json': { hooks: HOOK('/bin/conv') } });
     expect(keys(dir)).toEqual(['hooks/hooks.json']);
+  });
+});
+
+describe('number LITERALS inside mcp_tool input — codex keeps the spelling', () => {
+  // Every hash below was written by codex 0.154.0 for a hooks.json declaring
+  // that exact literal. `JSON.parse` throws the spelling away, so these only
+  // reproduce when the file is read through `parseHooksJsonPreservingNumbers`.
+  const hashFor = (literal: string): string | null => {
+    const doc = parseHooksJsonPreservingNumbers(
+      `{"hooks":{"PostToolUse":[{"hooks":[{"type":"mcp_tool","server":"s","tool":"t","timeout":10,"input":{"a":${literal}}}]}]}}`,
+    ) as { hooks: Record<string, unknown> };
+    const entries = collectCodexHookTrustEntries('/k', doc.hooks);
+    return entries.length === 1 ? entries[0].hash : null;
+  };
+
+  const measured: Array<[string, string]> = [
+    ['1', 'sha256:8b8d20971040f3bb499bdac9084bcabc23791e7b9cc9c3c5be764d15b6a4cd14'],
+    ['0', 'sha256:c484e4200531c5d951bf1230cae904b37c4c421285ffa03beb7a2e1decd537dd'],
+    ['1.5', 'sha256:a1e1e1c15f03742f9cb44570d78a9fad4809fc45fa7821e463b60d1f70baa9c5'],
+    // The pairs that a JS-spelling encoder gets wrong:
+    ['1.0', 'sha256:38200fefd5a1875241b94d2e78cd5a78023b7cf748ed90ce8e56affb025ecfe6'],
+    ['1.50', 'sha256:75069268107bf167ca055a4d14fdd9f6181e6a0e88cd13c162bdc3e3f798a714'],
+    ['1e3', 'sha256:bcfd1fb165bd8f1250c76e1eb13b25647374624044cc829c2b807f5c766941a8'],
+    ['1E3', 'sha256:bcfd1fb165bd8f1250c76e1eb13b25647374624044cc829c2b807f5c766941a8'],
+    ['1e+3', 'sha256:bcfd1fb165bd8f1250c76e1eb13b25647374624044cc829c2b807f5c766941a8'],
+    ['1e-3', 'sha256:01262af2adadf11a1847053e78a2187a761dffae981e69cb41e930c0c86fd4d9'],
+    ['2.5e10', 'sha256:5e8cbb6ebb5739b62eb791a960cee48c7579aceda0601c44f0d88f6b0d9f24c8'],
+    ['1000', 'sha256:c1afed8459dcac8b077b3647ade554f4618eea41521f4c36f8735cdc7d01fb9a'],
+    ['-1', 'sha256:35356dedeba8e7b054479ea85207c13eda258c42dfcbe7c35f052c1fc93ef046'],
+    ['-0.0', 'sha256:f429a9d339371f4681660ee279b6fb942c45a94d6278d8819d195be92c1c6181'],
+    // An INTEGER negative zero loses its sign; a float one does not.
+    ['-0', 'sha256:c484e4200531c5d951bf1230cae904b37c4c421285ffa03beb7a2e1decd537dd'],
+  ];
+
+  for (const [literal, expected] of measured) {
+    it(`${literal} hashes as codex hashes it`, () => {
+      expect(hashFor(literal)).toBe(expected);
+    });
+  }
+
+  it('1.0 and 1 are DIFFERENT, which a JS-spelling encoder cannot see', () => {
+    expect(hashFor('1.0')).not.toBe(hashFor('1'));
+    expect(hashFor('1e3')).not.toBe(hashFor('1000'));
+    expect(hashFor('1.50')).not.toBe(hashFor('1.5'));
+  });
+
+  it('an exact big integer beyond 2^53 is emitted from its literal, not rounded', () => {
+    // No refusal is needed inside `input`: the literal goes in verbatim through
+    // BigInt, so precision is never lost. (The refusal still applies to
+    // `timeout` and `additionalContextLimit`, whose VALUES are normalized
+    // arithmetically.)
+    const a = hashFor('9007199254740993');
+    const b = hashFor('9007199254740992');
+    expect(a).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(a).not.toBe(b);
+  });
+});
+
+describe('parseHooksJsonPreservingNumbers', () => {
+  it('leaves non-numbers untouched and keeps the document shape', () => {
+    const doc = parseHooksJsonPreservingNumbers('{"a":"s","b":true,"c":null,"d":[1,"x"]}') as Record<string, unknown>;
+    expect(doc.a).toBe('s');
+    expect(doc.b).toBe(true);
+    expect(doc.c).toBeNull();
+    expect(Array.isArray(doc.d)).toBe(true);
+  });
+
+  it('a boxed number still reads as its numeric value everywhere it is used', () => {
+    const doc = parseHooksJsonPreservingNumbers(
+      '{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"x","timeout":7}]}]}}',
+    ) as { hooks: Record<string, unknown> };
+    // Same hash as the plain-object path: the timeout is consumed as a number.
+    expect(collectCodexHookTrustEntries('/k', doc.hooks)[0].hash).toBe(
+      codexHookTrustHash('PreToolUse', { type: 'command', command: 'x', timeout: 7 }),
+    );
+  });
+
+  it('refuses a timeout literal that JSON.parse ROUNDED, exactly', () => {
+    // With the source text this is exact rather than a range heuristic: the
+    // literal does not round-trip through the parsed value.
+    const doc = parseHooksJsonPreservingNumbers(
+      '{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"x","timeout":9007199254740993}]}]}}',
+    ) as { hooks: Record<string, unknown> };
+    expect(collectCodexHookTrustEntries('/k', doc.hooks)).toEqual([]);
   });
 });
