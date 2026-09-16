@@ -921,6 +921,20 @@ describe('createEmailGateHook — one approval card per tool call', () => {
     expect(staged).toHaveLength(1);
   });
 
+  it('WAITS on a peer whose card is still PENDING — the live case', async () => {
+    // The host writes a `pending` row the moment it posts the card and leaves
+    // it there for the whole decision window, so `pending` is exactly what a
+    // loser should wait on. A replay check that counted a pending row as
+    // decided would stage a second card for every loser arriving more than one
+    // host poll after the owner — the duplication this whole mechanism removes.
+    rec().peerRequestId = 'gate-peer-pending';
+    rec().peerAlreadyDecided = false;
+    await runWithToolUseId('exec-abc');
+    expect(rec().decidedChecks).toEqual(['gate-peer-pending']);
+    expect(staged).toEqual([]);
+    expect(ackedRequestIds).toEqual(['gate-peer-pending']);
+  });
+
   it('REFUSES an already-decided peer requestId and stages its own card', async () => {
     // The claim directory is under /tmp, which the agent can write to. A
     // published id that already carries a `delivered` row is not a live peer —

@@ -16,7 +16,11 @@ interface Recorder {
   abandoned: string[];
   /** When set, `claimGateRequest` answers as a LOSER with this peer requestId. */
   peerRequestId: string | null;
-  /** When true, the peer requestId reads back as an already-decided replay. */
+  /**
+   * When true, the peer requestId reads back as an already-DECIDED replay
+   * (`delivered`/`failed`). A live peer's card sits at `pending`, which is NOT
+   * decided — that is the state the loser must wait on.
+   */
   peerAlreadyDecided: boolean;
   decidedChecks: string[];
 }

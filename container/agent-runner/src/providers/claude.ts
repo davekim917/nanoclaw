@@ -1727,6 +1727,11 @@ interface GateClaimApi {
    * ALREADY been decided is not a live peer — it is a past approval being
    * replayed at a different command. Required, not optional: a core without it
    * disables the claim entirely (two cards), which is the safe default.
+   *
+   * DECIDED is `delivered` or `failed`, never `pending`. The host writes a
+   * `pending` row the moment it posts the card, so `pending` is precisely the
+   * state a loser should wait on — the same reading `awaitDeliveryAck` uses
+   * (`../db/delivery-acks.ts`).
    */
   gateRequestAlreadyDecided: (requestId: string) => boolean;
 }
