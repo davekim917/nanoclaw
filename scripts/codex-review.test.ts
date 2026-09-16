@@ -419,9 +419,13 @@ function commitStatus(context: string, state: string, createdAt = '2026-09-05T00
   return { id: Date.parse(createdAt) / 1000, context, state, created_at: createdAt };
 }
 
-// `reviewer` defaults to an allowed worker-frontier model so existing approve-path
-// fixtures keep passing the model-allowlist check merge-check now applies;
-// tests of the allowlist itself pass a disallowed (or omitted) reviewer.
+// `reviewer` defaults to an allowed model so existing approve-path fixtures
+// keep passing the model-allowlist check merge-check now applies; tests of the
+// allowlist itself pass a disallowed (or omitted) reviewer. The parenthetical
+// after the model id is free text — only the FIRST word is checked — and the
+// default here deliberately carries the historical `(worker-frontier)`
+// spelling, so every merge-check case below doubles as proof that receipts
+// written before the label change still unlock their head.
 // `databaseId` is the comment's posting order, which receipts are ordered by;
 // by default it follows createdAt, to the second.
 function receiptComment(
@@ -2321,8 +2325,17 @@ describe('codex-review risk-scoped review requests', () => {
       .filter((line) => line.length > 0 && !line.startsWith('#'));
     expect(ids.length).toBeGreaterThan(0);
 
-    // Every plain listed id, plus one with the [1m] context-window suffix appended.
-    const reviewers = [...ids.map((id) => `${id} (worker-frontier)`), `${ids[0]}[1m] (worker-frontier)`];
+    // Every plain listed id, plus one with the [1m] context-window suffix
+    // appended. Both label spellings are exercised: `(opus)` is what a receipt
+    // written today carries, `(worker-frontier)` is what receipts written
+    // before the delegation rework carry, and the gate must accept both because
+    // it reads only the first word.
+    const reviewers = [
+      ...ids.map((id) => `${id} (opus)`),
+      ...ids.map((id) => `${id} (worker-frontier)`),
+      `${ids[0]}[1m] (opus)`,
+      `${ids[0]}[1m] (worker-frontier)`,
+    ];
     for (const reviewer of reviewers) {
       const root = tempRoot();
       const bodyFile = path.join(root, 'review.md');

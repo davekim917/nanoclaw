@@ -4,8 +4,8 @@
  * `scripts/deploy.sh` restarted `nanoclaw-v2` and nothing else, so
  * `nanoclaw-codex-sync.service` — `pnpm exec tsx src/codex-sync-watcher.ts`,
  * whose tsx process loads the TypeScript once at start — sat two days behind
- * main and kept re-mirroring a stale `CODEX_WORKER_MODELS`
- * (`src/claude-agent-md.ts:40`, read at `:161`). A string assertion that
+ * main and kept re-mirroring a stale worker-model map (then in
+ * `src/claude-agent-md.ts`, since deleted with the worker roster). A string assertion that
  * `deploy.sh` mentions that unit would have passed with the restart appended
  * BELOW the `systemctl restart nanoclaw-v2` that kills the script, i.e. on a
  * line that never runs. So these tests run the real tail of the script against

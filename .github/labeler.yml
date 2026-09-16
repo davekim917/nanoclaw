@@ -165,10 +165,13 @@ risk:high:
     - '.public-boundary-allowlist.json'
     - 'container/skills/pr-review-loop/**'
     - 'docs/review-policy.md'
-    # The reviewer-eligibility tier rule the merge gate enforces: the generator,
-    # the worker-tier agent defs it derives Claude ids from, and the Codex tier
-    # map (CODEX_WORKER_TIERS) it imports rather than reparses. A change to any
-    # of these changes who is allowed to approve a merge.
+    # The reviewer-eligibility tier rule the merge gate enforces. The generator
+    # now STATES its roster rather than deriving it, so a change there changes
+    # who may approve a merge directly. The other two no longer feed it and are
+    # kept for their own reasons: `container/agents/**` is empty today, and a
+    # def re-added there would reach every Claude group's subagent roster;
+    # `src/claude-agent-md.ts` is the Claude-to-Codex agent converter every
+    # group's `.codex/agents/` roster is generated through.
     - 'scripts/reviewer-models*.ts'
     - 'container/agents/**'
     - 'src/claude-agent-md.ts'

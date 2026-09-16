@@ -1,7 +1,7 @@
-# generated from the frontier config: edit container/agents/worker-frontier.md or
-# CODEX_WORKER_MODELS, then run `pnpm run reviewer-models -- --write`
+# generated from the reviewer roster in scripts/reviewer-models.ts — edit the
+# ids there, then run `pnpm run reviewer-models -- --write`
 #
-# One reviewer-eligible model id per line — the native frontier worker, whichever
+# One reviewer-eligible model id per line — the frontier model for each
 # vendor, plus prior Fable/Astra receipt compatibility (not dispatch defaults).
 # container/skills/pr-review-loop/scripts/codex-review.sh reads this file to
 # gate `receipt` and `merge-check`. See scripts/reviewer-models.ts.

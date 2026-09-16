@@ -1,19 +1,19 @@
 /**
- * Correctness tests for the reviewer-model derivation logic. Failure here
- * means the code is broken, not that a committed artifact is stale — the
- * pure freshness/drift check lives separately in
- * reviewer-models-freshness.test.ts (VITEST_LANE=drift), so the two failure
- * modes never get conflated.
+ * Correctness tests for the reviewer-model roster. Failure here means the code
+ * or the roster is broken, not that a committed artifact is stale — the pure
+ * freshness/drift check lives separately in reviewer-models-freshness.test.ts
+ * (VITEST_LANE=drift), so the two failure modes never get conflated.
  */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
 
-import { computeReviewerModelIds } from './reviewer-models.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { assertConcreteModelId, computeReviewerModelIds, main, renderReviewerModelsFile } from './reviewer-models.js';
 
 describe('computeReviewerModelIds', () => {
-  it('derives frontier models plus prior receipt compatibility, deduplicated and sorted', () => {
+  it('lists the frontier models plus prior receipt compatibility, deduplicated and sorted', () => {
     const ids = computeReviewerModelIds();
     expect(ids).toEqual(['claude-fable-5-1', 'claude-opus-5', 'gpt-5.6-sol', 'gpt-6-astra']);
     expect(new Set(ids).size).toBe(ids.length);
@@ -23,66 +23,91 @@ describe('computeReviewerModelIds', () => {
       expect(id).not.toMatch(/sonnet|haiku|luna|terra|mini|nano|lite|flash/i);
     }
   });
-});
 
-// Fixture repos for extractModelLine's edge cases: a real repoRoot's worker-frontier.md are byte-fixed, so a folded-block or quoted `model:` line
-// can only be exercised against a throwaway fixture tree.
-const roots: string[] = [];
-
-function writeFixtureRepo(overrides: { workerFrontier?: string }): string {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reviewer-models-fixture-'));
-  roots.push(root);
-  const dir = path.join(root, 'container/agents');
-  fs.mkdirSync(dir, { recursive: true });
-  const frontmatter = (name: string, model: string) =>
-    `---\nname: ${name}\ndescription: d\nmodel: ${model}\neffort: high\n---\n\nbody\n`;
-  fs.writeFileSync(
-    path.join(dir, 'worker-frontier.md'),
-    overrides.workerFrontier ?? frontmatter('worker-frontier', 'claude-fable-5-1[1m]'),
-  );
-  return root;
-}
-
-afterEach(() => {
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
-});
-
-describe('extractModelLine edge cases', () => {
-  it('reads a folded block-scalar `model: |` line', () => {
-    const root = writeFixtureRepo({
-      workerFrontier:
-        '---\nname: worker-frontier\ndescription: d\nmodel: |\n  claude-opus-5[1m]\neffort: high\n---\n\nbody\n',
-    });
-    expect(computeReviewerModelIds(root)).toContain('claude-opus-5');
+  // MUTATION-SENSITIVE, deliberately. Asserting that the committed ids happen
+  // to satisfy `assertConcreteModelId` proves nothing about the code: delete
+  // both guard loops and that assertion stays green, because the real ids are
+  // valid either way. The roster is hand-maintained now, so the guard RUNNING
+  // is the only thing that stops an alias being typed in — so these drive the
+  // function with a roster it must refuse. Deleting either loop turns the
+  // matching case red.
+  it('refuses an alias typed into the frontier roster', () => {
+    expect(() => computeReviewerModelIds(['opus'], ['claude-fable-5-1'])).toThrow(/FRONTIER_MODELS/);
   });
 
-  it('reads a double-quoted `model: "..."` line, unquoted', () => {
-    const root = writeFixtureRepo({
-      workerFrontier:
-        '---\nname: worker-frontier\ndescription: d\nmodel: "claude-opus-5[1m]"\neffort: high\n---\n\nbody\n',
-    });
-    expect(computeReviewerModelIds(root)).toContain('claude-opus-5');
+  it('refuses an alias typed into the receipt-compatibility roster', () => {
+    expect(() => computeReviewerModelIds(['claude-opus-5'], ['inherit'])).toThrow(/COMPATIBLE_RECEIPT_MODELS/);
   });
 
+  it('deduplicates and sorts across the two rosters', () => {
+    expect(computeReviewerModelIds(['b-2', 'a-1'], ['a-1', 'c-3'])).toEqual(['a-1', 'b-2', 'c-3']);
+  });
+});
+
+describe('assertConcreteModelId', () => {
   it.each(['opus', 'sonnet', 'inherit'])('refuses a bare alias "%s" with no version number', (alias) => {
-    const root = writeFixtureRepo({
-      workerFrontier: `---\nname: worker-frontier\ndescription: d\nmodel: ${alias}\neffort: high\n---\n\nbody\n`,
-    });
-    expect(() => computeReviewerModelIds(root)).toThrow(/not a concrete versioned model id/);
+    expect(() => assertConcreteModelId(alias, 'fixture')).toThrow(/not a concrete versioned model id/);
   });
 
-  it('refuses a model line carrying a trailing comment (extractScalar reads it as part of the value)', () => {
-    const root = writeFixtureRepo({
-      workerFrontier:
-        '---\nname: worker-frontier\ndescription: d\nmodel: claude-opus-5[1m] # pinned\neffort: high\n---\n\nbody\n',
-    });
-    expect(() => computeReviewerModelIds(root)).toThrow(/is not a bare model id/);
+  it('refuses an id carrying a trailing comment', () => {
+    expect(() => assertConcreteModelId('claude-opus-5 # pinned', 'fixture')).toThrow(/is not a bare model id/);
   });
 
-  it('refuses a model line that is several space-separated words, not one id', () => {
-    const root = writeFixtureRepo({
-      workerFrontier: '---\nname: worker-frontier\ndescription: d\nmodel: claude opus 5\neffort: high\n---\n\nbody\n',
-    });
-    expect(() => computeReviewerModelIds(root)).toThrow(/is not a bare model id/);
+  it('refuses an id that is several space-separated words', () => {
+    expect(() => assertConcreteModelId('claude opus 5', 'fixture')).toThrow(/is not a bare model id/);
+  });
+
+  it('refuses an id with the [1m] context-window suffix left on', () => {
+    // The receipt gate tolerates a `[1m]` suffix on the reviewer's first word,
+    // but the ALLOWLIST holds bare ids — a suffixed entry here would never be
+    // what the gate compares against.
+    expect(() => assertConcreteModelId('claude-opus-5[1m]', 'fixture')).toThrow(/is not a bare model id/);
+  });
+
+  it('accepts a bare versioned id', () => {
+    expect(() => assertConcreteModelId('gpt-5.6-sol', 'fixture')).not.toThrow();
+  });
+});
+
+describe('main', () => {
+  let dir: string;
+  let out: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'reviewer-models-cli-'));
+    out = path.join(dir, 'reviewer-models.txt');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('--write renders the roster to the output path', () => {
+    expect(main(['--write'], out)).toBe(0);
+    expect(fs.readFileSync(out, 'utf8')).toBe(renderReviewerModelsFile(computeReviewerModelIds()));
+  });
+
+  it('--check passes on a file --write just produced', () => {
+    main(['--write'], out);
+    expect(main(['--check'], out)).toBe(0);
+  });
+
+  it('--check fails on a stale file', () => {
+    fs.writeFileSync(out, 'stale\n');
+    expect(main(['--check'], out)).toBe(1);
+  });
+
+  it('--check fails when the file is missing entirely, never reads absence as a pass', () => {
+    expect(main(['--check'], out)).toBe(1);
+  });
+
+  it('refuses both modes at once and neither mode, with the usage exit code', () => {
+    expect(main([], out)).toBe(2);
+    expect(main(['--write', '--check'], out)).toBe(2);
+    // Neither call may have written anything.
+    expect(fs.existsSync(out)).toBe(false);
   });
 });

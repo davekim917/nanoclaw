@@ -5932,32 +5932,71 @@ const MANAGED_WORKER_DEFS = [
   'worker-fast.md',
   'worker.md',
   'worker-high.md',
-  'worker-frontier.md',
   'worker-codex.md',
   // Retired: renamed to worker-high.md so the tier name describes the rung
   // rather than a Claude model (the same def is gpt-5.6-sol on Codex). Listed
   // so groups that already have the old file get it pruned on next spawn.
   'worker-opus.md',
+  // Retired: trunk no longer ships a worker def at all. Delegation is the
+  // bootstrap orchestrate plugin's effort shims, which reach a container
+  // through the plugin mount, not through this copy. Listed — not deleted —
+  // because every group on this install already has the file in
+  // `.claude-shared/agents/`, and this list is the only thing that removes it.
+  'worker-frontier.md',
 ];
+
+// NOTE on `worker-high.md` above: that name is ALSO one of the orchestrate
+// plugin's live shims (`plugins/orchestrate/agents/worker-high.md`), and the
+// two meet under one name in a container. This list only ever touches
+// `.claude-shared/agents/` — the container's user scope — while the shim is
+// registered from the plugin mount; on the HOST a plugin agent carries the
+// qualified `<plugin>:<agent>` name, but IN A CONTAINER it is exposed bare
+// (this fork's own #814 finding, recorded in docs/specs/quota-burn/plan.md).
+// So a stale user-scope `worker-high.md` left from the retired roster sits
+// under the same bare name as the live shim.
+//
+// Which of the two a dispatch would then resolve to is NOT asserted here —
+// nothing was read that settles it. The prune does not depend on the answer:
+// one outcome runs a retired definition, the other leaves a dead file under a
+// live name for a reader or a model to pick by mistake. Removing it is what
+// makes the question moot. The same holds for any future shim whose name this
+// list has ever carried.
 
 /**
  * Copy trunk worker subagent defs (container/agents/*.md) into
- * .claude-shared/agents/ — the container's ~/.claude/agents — so every Claude
- * group gets the native frontier worker. Cross-provider work uses the direct
- * CLI helper, without a wrapper agent. Copies, not symlinks: agent discovery
- * through dangling host symlinks is unverified, and the files are tiny.
- * Trunk is canonical: a managed def absent from the current trunk set is
- * pruned; operator-added defs (never in MANAGED_WORKER_DEFS) are untouched. A
- * group can shadow a trunk def with a same-name file in
+ * .claude-shared/agents/ — the container's ~/.claude/agents. Copies, not
+ * symlinks: agent discovery through dangling host symlinks is unverified, and
+ * the files are tiny. Trunk is canonical: a managed def absent from the current
+ * trunk set is pruned; operator-added defs (never in MANAGED_WORKER_DEFS) are
+ * untouched. A group can shadow a trunk def with a same-name file in
  * groups/<folder>/.claude/agents/ (project scope outranks user scope).
+ *
+ * Trunk currently ships NO defs, so in practice this only prunes. That is why
+ * a missing `container/agents/` is not an early return: git does not track an
+ * empty directory, so deleting the last def deletes the directory, and an early
+ * return there would leave every group's retired copy in place forever — the
+ * exact file the list above exists to remove.
  */
 function syncWorkerAgentDefs(claudeDir: string): void {
   const srcDir = path.join(process.cwd(), 'container', 'agents');
-  if (!fs.existsSync(srcDir)) return;
   const dstDir = path.join(claudeDir, 'agents');
   fs.mkdirSync(dstDir, { recursive: true });
 
-  const current = new Set(fs.readdirSync(srcDir).filter((e) => e.endsWith('.md')));
+  let current: Set<string>;
+  try {
+    current = new Set(fs.readdirSync(srcDir).filter((e) => e.endsWith('.md')));
+  } catch (err) {
+    // ENOENT ONLY — "trunk ships no defs", the normal state, so everything
+    // managed gets pruned below. Any other failure (EACCES, EIO, a transient
+    // read error) is NOT an answer about what trunk ships, and swallowing it
+    // here would turn an unreadable source directory into the destructive
+    // prune of every managed def in the group. Rethrow instead: the caller
+    // logs and spawns without the roster (`src/container-runner.ts`, the
+    // syncWorkerAgentDefs call site), which leaves the group's existing files
+    // untouched — the safe answer when the source cannot be read.
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+    current = new Set<string>();
+  }
   // Prune managed defs retired from trunk. Names are compile-time constants,
   // so no traversal is possible even though dstDir is container-writable.
   for (const name of MANAGED_WORKER_DEFS) {

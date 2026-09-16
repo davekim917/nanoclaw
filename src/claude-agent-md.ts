@@ -13,22 +13,28 @@
  *   frontmatter.description → toml description
  *   markdown body           → toml developer_instructions (multiline `"""…"""`)
  *
- * The native frontier worker pins its Codex model. Effort stays out of the
- * role file: [agents].default_subagent_reasoning_effort supplies it
- * (src/providers/codex.ts) and the native spawn reasoning_effort field can
- * override it per task. Both values come from the same vendored worker policy.
- * Specialized agents continue inheriting their parent model.
+ * Every converted role inherits its parent's model. No name carries a
+ * provider-specific model pin any more: the one that did (`worker-frontier`,
+ * via `CODEX_WORKER_MODELS`) was deleted along with the bootstrap worker-policy
+ * file it was rendered from. Delegation now picks a reasoning effort, not a
+ * model — see the `effort` note below.
  *
  * Dropped (no Codex equivalent or runtime-specific):
- *   frontmatter.model       — Claude model names differ; Codex model comes
- *                              from CODEX_WORKER_MODELS, not from frontmatter
+ *   frontmatter.model       — Claude model names differ, and `inherit` (what
+ *                              the delegation shims carry) is not a Codex id
+ *   frontmatter.effort      — parsed (the OpenCode converter carries it, see
+ *                              opencode-agent-md.ts) but deliberately NOT
+ *                              written here. Codex's global subagent default
+ *                              is `[agents].default_subagent_reasoning_effort`
+ *                              (src/providers/codex.ts) and a native spawn's
+ *                              own `reasoning_effort` overrides it per task.
+ *                              Wiring per-role `model_reasoning_effort` is a
+ *                              separate change to every sibling's TOML roster.
  *   frontmatter.tools       — Claude tool-restriction model; Codex uses
  *                              mcp_servers / skills.config at a coarser level
  *   frontmatter.color       — Claude UI only
  *   frontmatter.proactive   — Claude routing hint
  */
-
-import { WORKER_POLICY_CODEX_EFFORT, WORKER_POLICY_CODEX_MODEL } from './worker-policy.vendored.js';
 
 const MANAGED_MARKER = '# managed by nanoclaw codex-sync';
 
@@ -36,27 +42,20 @@ export interface ClaudeAgent {
   name: string;
   description: string;
   body: string;
+  /**
+   * The `effort:` frontmatter scalar when the source carries one, else
+   * undefined. Only the OpenCode converter writes it; see the module note.
+   */
+  effort?: string;
 }
-
-/**
- * Only the native execution role has a provider-specific model mapping, and the
- * model is not typed here: it is vendored from the bootstrap plugin's one worker
- * policy file, which is also where the role def's model/effort come from.
- * Retyping it here is exactly how the two halves forked before;
- * src/workflow-agent-vendor.test.ts pins them together.
- */
-export const CODEX_WORKER_MODELS: Record<string, string> = {
-  'worker-frontier': WORKER_POLICY_CODEX_MODEL,
-};
 
 /**
  * Slice a Claude subagent `.md` into its frontmatter block and its body.
  * Returns null when there is no frontmatter block at all.
  *
- * Exported because callers need the frontmatter itself, not just the three
- * fields `parseClaudeAgentMd` keeps: `model:` and `effort:` are the Claude half
- * of the worker policy, and the vendor script cross-checks them against the
- * plugin's policy file (`claudeRoleDispatch`, src/workflow-agent-vendor.ts).
+ * Exported because callers need the frontmatter itself, not just the fields
+ * `parseClaudeAgentMd` keeps — `model:` in particular, which no converter
+ * writes.
  */
 export function splitClaudeAgentMd(content: string): { frontmatter: string; body: string } | null {
   // Normalize line endings up front. The parser is line-oriented, and any
@@ -86,12 +85,16 @@ export function parseClaudeAgentMd(content: string): ClaudeAgent | null {
   const name = extractScalar(frontmatterRaw, 'name');
   const description = extractScalar(frontmatterRaw, 'description');
   if (!name || !description) return null;
+  // Optional. An empty or whitespace-only `effort:` is the same as absent —
+  // a converter must never emit `reasoningEffort: ""` to a provider.
+  const effortRaw = extractScalar(frontmatterRaw, 'effort')?.trim();
+  const effort = effortRaw ? effortRaw : undefined;
 
   // Drop leading blank lines from the body — Claude's `.md` convention puts
   // a blank line between the closing `---` and the first prose line, and
   // forwarding that blank into developer_instructions would just confuse
   // the model with a leading empty paragraph.
-  return { name, description, body: body.replace(/^\n+/, '').trimEnd() };
+  return { name, description, body: body.replace(/^\n+/, '').trimEnd(), ...(effort ? { effort } : {}) };
 }
 
 /**
@@ -180,8 +183,6 @@ function tomlMultilineString(value: string): string {
  * output (and leave manually-authored TOMLs alone).
  */
 export function formatCodexAgentToml(agent: ClaudeAgent): string {
-  const model = CODEX_WORKER_MODELS[agent.name];
-  const description = model ? retargetRunsOnSentence(agent.description, model) : agent.description;
   const lines: string[] = [
     MANAGED_MARKER,
     '',
@@ -189,40 +190,13 @@ export function formatCodexAgentToml(agent: ClaudeAgent): string {
     // Description can contain literal newlines (Claude's frontmatter often
     // packs multi-line "Examples" lists in description). Single-line basic
     // strings can't carry newlines, so pick multiline when needed.
-    description.includes('\n')
-      ? `description = ${tomlMultilineString(description)}`
-      : `description = ${tomlBasicString(description)}`,
+    agent.description.includes('\n')
+      ? `description = ${tomlMultilineString(agent.description)}`
+      : `description = ${tomlBasicString(agent.description)}`,
     `developer_instructions = ${tomlMultilineString(agent.body)}`,
+    '',
   ];
-  if (model) lines.push(`model = ${tomlBasicString(model)}`);
-  lines.push('');
   return lines.join('\n');
-}
-
-/**
- * Replace the Claude-model claim that ends the frontier worker's description
- * ("Runs on Sonnet at xhigh effort.") with the Codex model it actually runs
- * on. Left alone when the sentence isn't there — the description is a routing
- * signal, so a wrong model name in it actively mis-routes the orchestrator.
- *
- * Matches up to the LAST period on the description's final line, not the
- * first — a model name with a version number ("Fable 5.1") contains its own
- * period, and `[^.]*` would stop there and leave the clause unstripped.
- *
- * The effort word comes from the vendored policy for the same reason the model
- * does. It used to be the literal "high": the config this role runs under
- * follows `WORKER_POLICY_CODEX_EFFORT`, so a `codex.effort` flip left the role
- * advertising an effort it does not run at — and the description is a routing
- * signal, so that mis-routes the orchestrator exactly as a wrong model name
- * would. Found by review r2 on #837.
- */
-export function retargetRunsOnSentence(
-  description: string,
-  model: string,
-  effort: string = WORKER_POLICY_CODEX_EFFORT,
-): string {
-  const stripped = description.replace(/\s*Runs on [^\n]*\.\s*$/, '');
-  return `${stripped} Runs on ${model} with ${effort} reasoning by default; explicit spawn effort overrides the default.`;
 }
 
 /**

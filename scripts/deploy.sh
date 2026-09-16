@@ -75,10 +75,10 @@ tracked_changes() {
 # `pnpm exec tsx src/codex-sync-watcher.ts`: tsx loads the TypeScript into
 # memory once at process start, so nothing short of a restart moves it off the
 # source it booted with, and until this ran a deploy never restarted it — one
-# watcher sat two days behind main and kept re-mirroring the pre-#813
-# CODEX_WORKER_MODELS map (src/claude-agent-md.ts:40, read at :161 by the
-# formatter the watcher calls through src/codex-sync-watcher.ts:43) over every
-# ~/.codex*/agents and groups/*/.codex/agents tree. A hardcoded second name
+# watcher sat two days behind main and kept re-mirroring a stale worker-model
+# map (then in src/claude-agent-md.ts, since deleted with the worker roster;
+# the watcher still calls that module's formatter, src/codex-sync-watcher.ts)
+# over every ~/.codex*/agents and groups/*/.codex/agents tree. A hardcoded second name
 # would have fixed exactly that unit and gone quietly wrong at the third; this
 # host already carries a third `Type=simple` nanoclaw unit file
 # (nanoclaw-container-limits.service, currently disabled, and correctly

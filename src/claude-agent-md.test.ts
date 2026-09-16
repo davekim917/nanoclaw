@@ -1,19 +1,6 @@
-import fs from 'node:fs';
-import path from 'node:path';
-
 import { describe, expect, test } from 'vitest';
 
-import {
-  CODEX_WORKER_MODELS,
-  MANAGED_MARKER,
-  formatCodexAgentToml,
-  isManagedToml,
-  parseClaudeAgentMd,
-  retargetRunsOnSentence,
-} from './claude-agent-md.js';
-import { buildContainerCodexConfig } from './providers/codex.js';
-
-const REPO_ROOT = path.resolve(__dirname, '..');
+import { MANAGED_MARKER, formatCodexAgentToml, isManagedToml, parseClaudeAgentMd } from './claude-agent-md.js';
 
 describe('parseClaudeAgentMd', () => {
   test('parses plain frontmatter', () => {
@@ -73,6 +60,27 @@ body
     expect(out).toEqual({ name: 'x', description: 'y', body: 'body' });
   });
 
+  test('keeps `effort:` when present — the delegation shims are nothing else', () => {
+    const src = '---\nname: worker-low\ndescription: y\nmodel: inherit\neffort: low\n---\nbody\n';
+    expect(parseClaudeAgentMd(src)).toEqual({
+      name: 'worker-low',
+      description: 'y',
+      body: 'body',
+      effort: 'low',
+    });
+  });
+
+  test('omits the effort key entirely when the source has none', () => {
+    const out = parseClaudeAgentMd('---\nname: x\ndescription: y\n---\nbody\n');
+    expect(out).not.toHaveProperty('effort');
+  });
+
+  test('treats a blank `effort:` as absent, never as an empty option value', () => {
+    // An empty string reaching the OpenCode converter would emit
+    // `reasoningEffort: ""` — a provider option with no value.
+    expect(parseClaudeAgentMd('---\nname: x\ndescription: y\neffort:   \n---\nbody\n')).not.toHaveProperty('effort');
+  });
+
   test('rejects missing frontmatter', () => {
     expect(parseClaudeAgentMd('no frontmatter here')).toBeNull();
   });
@@ -80,6 +88,37 @@ body
   test('rejects when name or description is missing', () => {
     expect(parseClaudeAgentMd('---\nname: x\n---\nbody')).toBeNull();
     expect(parseClaudeAgentMd('---\ndescription: y\n---\nbody')).toBeNull();
+  });
+
+  test('rejects an opened but never-closed frontmatter block', () => {
+    // No `\n---` anywhere after the opener. Returning the whole file as
+    // frontmatter would make the entire agent body parse as scalars.
+    expect(parseClaudeAgentMd('---\nname: x\ndescription: y\nbody with no close\n')).toBeNull();
+  });
+
+  test('reads a single-quoted scalar, unquoted', () => {
+    expect(parseClaudeAgentMd("---\nname: x\ndescription: 'y: with a colon'\n---\nbody\n")?.description).toBe(
+      'y: with a colon',
+    );
+  });
+
+  test('reads a folded block scalar that contains a blank line and ends at the next key', () => {
+    // Exercises the block-scalar collector's three exits: a blank line inside
+    // the block (kept, once something has been collected), a following line at
+    // no indent (ends the block), and the indent-mismatch guard.
+    const src = ['---', 'name: x', 'description: |', '  first', '', '  third', 'effort: high', '---', 'body', ''].join(
+      '\n',
+    );
+    const out = parseClaudeAgentMd(src);
+    expect(out?.description).toBe('first\n\nthird');
+    expect(out?.effort).toBe('high');
+  });
+
+  test('a leading blank line inside a block scalar is not collected', () => {
+    // `collected.length > 0` guards it: a block that opens with a blank line
+    // must not start with an empty paragraph.
+    const src = ['---', 'name: x', 'description: |', '', '  only', '---', 'body', ''].join('\n');
+    expect(parseClaudeAgentMd(src)?.description).toBe('only');
   });
 
   test('preserves CRLF line endings before frontmatter close', () => {
@@ -123,6 +162,15 @@ describe('formatCodexAgentToml', () => {
     expect(out.match(/(?<![\\"])"""/g)?.length).toBe(2);
   });
 
+  test('refuses a newline in a single-line TOML basic string rather than emitting invalid TOML', () => {
+    // `name` is always a basic string. A newline in it would close the string
+    // mid-value and produce a TOML file Codex cannot parse; the guard turns
+    // that into a loud throw at write time instead.
+    expect(() => formatCodexAgentToml({ name: 'a\nb', description: 'd', body: 'c' })).toThrow(
+      /tomlMultilineString for multi-line values/,
+    );
+  });
+
   test('round-trips through parse → format → re-parse cleanly for non-marker content', () => {
     const src = `---
 name: r
@@ -140,71 +188,37 @@ Body line 2.
   });
 });
 
-describe('native frontier worker conversion', () => {
-  test('pins Sol without an effort field that would override a native spawn request', () => {
-    const source = fs.readFileSync(path.join(REPO_ROOT, 'container/agents/worker-frontier.md'), 'utf8');
-    const out = formatCodexAgentToml(parseClaudeAgentMd(source)!);
-    // One agent def, one name: the Claude frontmatter pins Opus 5 at high and
-    // this conversion swaps ONLY the model for the Codex twin. Astra/Fable stay
-    // reachable through a per-dispatch model override, never a second def.
-    expect(CODEX_WORKER_MODELS).toEqual({ 'worker-frontier': 'gpt-5.6-sol' });
-    expect(source).toContain('model: claude-opus-5[1m]');
-    expect(source).toContain('effort: high');
-    expect(out).toContain('model = "gpt-5.6-sol"');
-    expect(out).not.toMatch(/^model_reasoning_effort\s*=/m);
-    expect(out).toContain('high reasoning by default');
-    expect(out).not.toContain('Runs on Opus');
-    expect(out).toContain('fresh independent context');
+describe('no role carries a provider-specific model or effort pin', () => {
+  test('every converted role inherits its parent model, whatever its name', () => {
+    // `CODEX_WORKER_MODELS` used to give `worker-frontier` a Codex model, and
+    // `retargetRunsOnSentence` rewrote its description to match. Both are gone
+    // with the role. Asserted on that exact name so a re-introduced special
+    // case fails here rather than shipping a pin nothing else knows about.
+    for (const name of ['worker-frontier', 'codex-rescue', 'worker-max']) {
+      const out = formatCodexAgentToml({ name, description: 'd', body: 'b' });
+      expect(out, name).not.toContain('model = ');
+      expect(out, name).not.toContain('model_reasoning_effort');
+    }
   });
 
-  /**
-   * Driven with an effort the policy does not currently carry, so it fails if
-   * the word is ever typed back into the sentence. The parity test below cannot
-   * do this on its own: with the policy at `high`, a re-hardcoded `high` and a
-   * derived one produce identical output.
-   */
-  test('takes the effort word from its argument, never a literal', () => {
-    expect(retargetRunsOnSentence('Review it. Runs on Opus 5 at high effort.', 'gpt-6-astra', 'medium')).toContain(
-      'Runs on gpt-6-astra with medium reasoning by default',
-    );
-  });
-
-  /**
-   * The role's description is a routing signal, so the effort it advertises has
-   * to be the effort the role actually runs at — and that is
-   * `[agents].default_subagent_reasoning_effort` in the container config, not a
-   * word typed into the sentence. This is what would have caught the r2 finding
-   * on #837 at the moment it mattered: the policy flip that makes the two
-   * disagree.
-   */
-  test('advertises the same effort the container config sets', () => {
-    const source = fs.readFileSync(path.join(REPO_ROOT, 'container/agents/worker-frontier.md'), 'utf8');
-    const advertised = /Runs on \S+ with (\S+) reasoning by default/.exec(
-      formatCodexAgentToml(parseClaudeAgentMd(source)!),
-    );
-    const configured = /^default_subagent_reasoning_effort = "([^"]+)"$/m.exec(buildContainerCodexConfig());
-    expect(
-      advertised,
-      'the Codex role description no longer carries a "Runs on … reasoning by default" clause',
-    ).not.toBeNull();
-    expect(configured, 'the container config no longer sets default_subagent_reasoning_effort').not.toBeNull();
-    expect(advertised![1]).toBe(configured![1]);
-  });
-
-  test('rewrites model names containing periods without stripping routing instructions', () => {
+  test('leaves the description exactly as written — it is a routing signal', () => {
     const out = formatCodexAgentToml({
       name: 'worker-frontier',
       description: 'Review in a fresh context. Runs on Opus 5 at high effort.',
       body: 'b',
     });
-    expect(out).toContain('Review in a fresh context. Runs on gpt-5.6-sol');
-    expect(out).not.toContain('Opus');
+    expect(out).toContain('description = "Review in a fresh context. Runs on Opus 5 at high effort."');
   });
 
-  test('leaves specialized roles inheriting their parent model', () => {
-    const out = formatCodexAgentToml({ name: 'codex-rescue', description: 'd', body: 'b' });
-    expect(out).not.toContain('model = ');
+  test('drops `effort:` rather than writing it as a Codex field', () => {
+    // Codex's subagent effort is the GLOBAL
+    // `[agents].default_subagent_reasoning_effort` (src/providers/codex.ts),
+    // overridden per task by a native spawn's own `reasoning_effort`. Writing
+    // per-role `model_reasoning_effort` here would pin every sibling's roster.
+    const out = formatCodexAgentToml({ name: 'worker-low', description: 'd', body: 'b', effort: 'xhigh' });
     expect(out).not.toContain('model_reasoning_effort');
+    expect(out).not.toContain('effort');
+    expect(out).not.toContain('xhigh');
   });
 });
 

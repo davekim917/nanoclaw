@@ -33,12 +33,27 @@ function pluginSkill(plugin: string, name: string): void {
   fs.writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${name}\ndescription: Test skill ${name}.\n---\n\nBody.\n`);
 }
 
-function pluginAgent(plugin: string, name: string): void {
+function pluginAgent(plugin: string, name: string, extraFrontmatter = ''): void {
   const dir = path.join(HOME, 'plugins', plugin, 'agents');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(
     path.join(dir, `${name}.md`),
-    `---\nname: ${name}\ndescription: Test agent ${name}.\n---\n\nYou are ${name}.\n`,
+    `---\nname: ${name}\ndescription: Test agent ${name}.\n${extraFrontmatter}---\n\nYou are ${name}.\n`,
+  );
+}
+
+/**
+ * An agent at the depth the bootstrap plugin actually uses:
+ * `~/plugins/<repo>/plugins/<sub>/agents/<name>.md` — where the orchestrate
+ * plugin's five `worker-<effort>` shims live, so a walk that only reached
+ * `<repo>/agents/` would miss all of them.
+ */
+function subPluginAgent(repo: string, sub: string, name: string, extraFrontmatter = ''): void {
+  const dir = path.join(HOME, 'plugins', repo, 'plugins', sub, 'agents');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, `${name}.md`),
+    `---\nname: ${name}\ndescription: Test agent ${name}.\n${extraFrontmatter}---\n\nYou are ${name}.\n`,
   );
 }
 
@@ -272,5 +287,53 @@ describe('syncOpenCodeSubagents with workgroup-scoped plugins (src/plugin-scopes
 
     expect(fs.existsSync(path.join(GLOBAL_AGENTS, 'client-agent.md'))).toBe(false);
     expect(fs.existsSync(path.join(GLOBAL_AGENTS, 'shared-agent.md'))).toBe(true);
+  });
+});
+
+describe('syncOpenCodeSubagents carries the delegation shims', () => {
+  const read = (name: string) => fs.readFileSync(path.join(GLOBAL_AGENTS, `${name}.md`), 'utf8');
+
+  it('finds an agent nested at <repo>/plugins/<sub>/agents/, where the shims live', () => {
+    subPluginAgent('bootstrap', 'orchestrate', 'worker-high', 'model: inherit\neffort: high\n');
+    expect(syncOpenCodeSubagents().discovered).toBe(1);
+    expect(fs.existsSync(path.join(GLOBAL_AGENTS, 'worker-high.md'))).toBe(true);
+  });
+
+  it('writes `effort:` through as options.reasoningEffort, the provider option', () => {
+    subPluginAgent('bootstrap', 'orchestrate', 'worker-low', 'model: inherit\neffort: low\n');
+    syncOpenCodeSubagents();
+    // Nested under `options:`, which OpenCode's v1 agent schema merges into the
+    // provider model options (packages/core/src/v1/config/agent.ts, `normalize`).
+    expect(read('worker-low')).toContain('options:\n  reasoningEffort: "low"\n');
+  });
+
+  it('never writes `model: inherit` — OpenCode inherits the parent when the key is unset', () => {
+    subPluginAgent('bootstrap', 'orchestrate', 'worker-max', 'model: inherit\neffort: max\n');
+    syncOpenCodeSubagents();
+    const out = read('worker-max');
+    expect(out).not.toMatch(/^model:/m);
+    expect(out).not.toContain('inherit');
+  });
+
+  it('emits no options block for an agent with no effort', () => {
+    pluginAgent('shared-plugin', 'plain-agent');
+    syncOpenCodeSubagents();
+    const out = read('plain-agent');
+    expect(out).not.toContain('options:');
+    expect(out).not.toContain('reasoningEffort');
+  });
+
+  it('rewrites an already-mirrored agent when only its effort changed', () => {
+    // The sync compares rendered bytes against what is on disk, so an effort
+    // flip must produce different bytes or the shim would keep its old effort
+    // forever with the sync reporting "unchanged".
+    subPluginAgent('bootstrap', 'orchestrate', 'worker-medium', 'model: inherit\neffort: medium\n');
+    syncOpenCodeSubagents();
+    expect(read('worker-medium')).toContain('reasoningEffort: "medium"');
+
+    subPluginAgent('bootstrap', 'orchestrate', 'worker-medium', 'model: inherit\neffort: xhigh\n');
+    const second = syncOpenCodeSubagents();
+    expect(second.writes).toBeGreaterThan(0);
+    expect(read('worker-medium')).toContain('reasoningEffort: "xhigh"');
   });
 });

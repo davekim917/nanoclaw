@@ -71,7 +71,6 @@ import {
   syncSkillSymlinks as syncDiscoveredSkillSymlinks,
 } from './plugin-skill-discovery.js';
 import type { McpServerConfig } from './providers/types.js';
-import { WORKER_POLICY_CODEX_EFFORT } from './worker-policy.vendored.js';
 
 /**
  * Re-exported from its owning module so the historical import path keeps
@@ -135,15 +134,16 @@ const CONTAINER_CODEX_CONFIG_BASE = [
   'multi_agent = true',
   '',
   '[agents]',
-  // Vendored from the bootstrap plugin's one worker policy file — the same
-  // value src/providers/codex.ts writes, so the companion and the provider path
-  // cannot disagree about what a Codex subagent runs at.
+  // The GLOBAL default effort for every Codex subagent — the same value
+  // src/providers/codex.ts writes, so the companion and the provider path
+  // cannot disagree about what a Codex subagent runs at. It used to be
+  // rendered from the bootstrap plugin's worker-policy file; that file and its
+  // vendored constant are gone, so the value is stated here, unchanged.
   //
-  // JSON.stringify, not the tomlBasicString helper above: src/provider-surfaces.test.ts
-  // evaluates THIS array literal in a bare `new Function` scope to compare it
-  // against the host's, so the literal may reference only bindings that test
-  // supplies. For an effort word JSON and TOML basic-string escaping agree.
-  `default_subagent_reasoning_effort = ${JSON.stringify(WORKER_POLICY_CODEX_EFFORT)}`,
+  // A plain literal, not a template: src/provider-surfaces.test.ts evaluates
+  // THIS array literal in a bare `new Function` scope to compare it against the
+  // host's, so the literal may reference only bindings that test supplies.
+  'default_subagent_reasoning_effort = "high"',
   'max_concurrent_threads_per_session = 4',
   '',
   ...['/workspace/agent', '/workspace/workgroup', '/workspace/worktrees', '/tmp'].flatMap((proj) => [
