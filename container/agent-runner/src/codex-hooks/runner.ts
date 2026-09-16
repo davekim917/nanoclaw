@@ -38,6 +38,13 @@ export interface CodexHookInput {
   tool_response?: unknown;
   cwd?: string;
   session_id?: string;
+  /**
+   * The tool call this hook was fired for. Codex supplies it on every
+   * PreToolUse input (`PreToolUseCommandInput`, codex-rs `hooks/src/schema.rs`),
+   * and EVERY handler of one tool call receives the same value — which is what
+   * lets the concurrently-dispatched guards collapse to one approval card.
+   */
+  tool_use_id?: string;
   transcript_path?: string;
   hook_event_name?: string;
   [key: string]: unknown;
@@ -76,13 +83,25 @@ export function normalizeCodexHookInput(input: CodexHookInput): CodexHookInput {
 export type HookEvent = 'PreToolUse' | 'PostToolUse' | 'PostToolUseFailure';
 
 // ── Destructive-action guard (shared bootstrap core) ───────────────────────────
-// Codex does NOT fire plugin-provided hooks under app-server (container) or exec
-// (host) — verified empirically. So the destructive-command gate (parity with the
-// Claude block-destructive hook + the OpenCode opencode-guard plugin) is wired
-// into THIS chain, the codex surface that provably fires (same path email-gate
-// rides). It reuses the SAME decision core the other runtimes import — no drift.
-// The equivalent HOST codex adapter is workflow-agents/hooks/codex-guard.ts
-// (wired via ~/.codex/hooks.json, which fires in interactive codex).
+// This chain carries the destructive-command gate (parity with the Claude
+// block-destructive hook + the OpenCode opencode-guard plugin), reusing the SAME
+// decision core the other runtimes import — no drift. The equivalent adapter on
+// the plugin side is workflow-agents/hooks/codex-guard.ts.
+//
+// It was wired here because Codex did NOT fire plugin-provided hooks under
+// app-server or exec. That premise is GONE: #827 writes the `[hooks.state.*]`
+// trust entries that make codex dispatch plugin hooks, and #832 refuses the
+// spawn unless the generated chain reads back dispatchable. So in a Codex
+// container BOTH adapters now run on every tool call — concurrently, with the
+// same `tool_use_id` (codex-rs 0.154.0 `hooks/src/engine/dispatcher.rs` pushes
+// every matched handler onto a `FuturesUnordered`; measured 0.7 ms apart).
+//
+// Both still EVALUATE, deliberately: the two chains are not equivalent (the
+// plugin alone carries the /team-auto request_user_input block, the native
+// email-tool gate and the snapshot-git-mutation guard), so silencing either
+// would drop coverage. What must not double is the APPROVAL: `toolUseId` is
+// threaded into the gate so the two guards share one card. See
+// `claimGateRequest` in the shared core.
 type GuardCore = {
   evaluateBashCommand: (
     cmd: string,
@@ -93,6 +112,12 @@ type GuardCore = {
     cmd: string,
     reason: string,
     onStageError?: (e: unknown) => void,
+    /**
+     * OPTIONAL 4th positional, added by the shared core's one-card-per-tool-call
+     * claim. A core from an older container image ignores it and behaves exactly
+     * as before — two cards — so this must never be required.
+     */
+    toolUseId?: string,
   ) => 'approved' | 'denied' | 'timeout';
   IS_NANOCLAW: boolean;
 };
@@ -167,7 +192,10 @@ function denyDecision(reason: string): {
 /** Evaluate a bash command against the shared core; return a deny decision to
  *  block, or null to allow. Mirrors the control flow of block-destructive.ts /
  *  opencode-guard.ts / codex-guard.ts (each a thin adapter over the same core). */
-async function runDestructiveGuard(command: string): Promise<ReturnType<typeof denyDecision> | null> {
+async function runDestructiveGuard(
+  command: string,
+  toolUseId?: string,
+): Promise<ReturnType<typeof denyDecision> | null> {
   if (!command) return null;
   const loaded = await loadGuardCore();
   // Fail-CLOSED (D17/C4): a missing or malformed core denies, it does NOT allow.
@@ -221,9 +249,14 @@ async function runDestructiveGuard(command: string): Promise<ReturnType<typeof d
     }
     if (core.IS_NANOCLAW) {
       let staged = true;
-      const decision = core.runNanoclawGate(command, reason, () => {
-        staged = false;
-      });
+      const decision = core.runNanoclawGate(
+        command,
+        reason,
+        () => {
+          staged = false;
+        },
+        toolUseId,
+      );
       if (!staged) return denyDecision(`${reason} — could not stage approval request (session DBs unavailable).`);
       if (decision === 'approved') {
         const post = core.evaluateBashCommand(command, { skipGate: true });
@@ -400,7 +433,10 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
     createSelfApprovalBlockHook(),
     createBlockSnowflakeConnectorHook(),
     createBlockGitCloneHook(),
-    createEmailGateHook(),
+    // The ONLY caller that arms the shared approval claim: this chain knows the
+    // plugin adapter is gating the same tool call. See `GateClaimApi` in
+    // providers/claude.ts.
+    createEmailGateHook({ sharedApprovalClaim: true }),
   ];
   let currentInput: CodexHookInput = normalized;
   let mergedUpdatedInput: Record<string, unknown> | undefined;
@@ -450,7 +486,13 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
   // Destructive-action guard — runs on the post-sanitize command, after the
   // existing chain. Returns a deny decision (blocks) or null (allow/continue).
   const guardCommand = (currentInput.tool_input as { command?: string } | undefined)?.command ?? '';
-  const guardDeny = await runDestructiveGuard(guardCommand);
+  // The gate is keyed on the RAW tool_use_id codex supplied, not on anything
+  // this chain derived: the plugin adapter keys on the same value, and a
+  // divergence would silently give each chain its own card again.
+  // `typeof === 'string'`, matching codex-guard.ts: a non-string id would make
+  // this chain claim while the plugin adapter did not, which is two cards again.
+  const toolUseId = typeof normalized.tool_use_id === 'string' ? normalized.tool_use_id : undefined;
+  const guardDeny = await runDestructiveGuard(guardCommand, toolUseId);
   if (guardDeny) return guardDeny;
 
   if (mergedUpdatedInput) {

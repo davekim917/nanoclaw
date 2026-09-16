@@ -1558,7 +1558,14 @@ function isWellFormedEmailVerdict(v: unknown): v is EmailGateVerdict {
   return a === 'allow' || a === 'gate';
 }
 
-export function createEmailGateHook(): HookCallback {
+export function createEmailGateHook(opts?: {
+  /**
+   * Join the shared one-card-per-tool-call claim. Set ONLY by the in-tree Codex
+   * chain, which knows the plugin adapter is gating the same tool call. See the
+   * comment above `GateClaimApi`.
+   */
+  sharedApprovalClaim?: boolean;
+}): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;
@@ -1616,25 +1623,66 @@ export function createEmailGateHook(): HookCallback {
     const { getSessionRouting } = await import('../db/session-routing.js');
     const { awaitDeliveryAck } = await import('../db/delivery-acks.js');
 
-    const routing = getSessionRouting();
-    const requestId = `gate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    await writeMessageOut({
-      id: requestId,
-      kind: 'system',
-      platform_id: routing?.platform_id ?? null,
-      channel_type: routing?.channel_type ?? null,
-      thread_id: routing?.thread_id ?? null,
-      content: JSON.stringify({
-        action: 'request_bash_gate',
-        requestId,
-        label,
-        summary,
-        // The host renders a bounded head+tail preview and retains the full
-        // command in the approval record. Approvers need enough context to
-        // make a real decision, even when this fallback owns the gate.
-        command: evalCommand,
-      }),
-    });
+    // Share ONE card with the peer guard gating this same tool call. Opt-in per
+    // the comment on `GateClaimApi`: never armed on the Claude path, where no
+    // peer exists.
+    const claimApi = opts?.sharedApprovalClaim ? await loadGateClaimApi() : null;
+    const toolUseId = (pre as { tool_use_id?: unknown }).tool_use_id;
+    // Keyed on the tool call and the gate, NOT the command: this hook gates the
+    // SANITIZED command while the plugin adapter gates the raw one (codex hands
+    // every handler one `input_json`, built before any of them runs), so a
+    // command-keyed claim would give each its own card again.
+    const claimKey =
+      claimApi && typeof toolUseId === 'string' && toolUseId
+        ? claimApi.gateClaimKey(toolUseId, 'request_bash_gate')
+        : null;
+    if (claimKey && claimApi) {
+      const claim = claimApi.claimGateRequest(claimKey);
+      if (!claim.owner && claim.requestId && !claimApi.gateRequestAlreadyDecided(claim.requestId)) {
+        // A peer staged this exact card. Wait on ITS decision so the human
+        // answers once and both guards honour that one answer.
+        const peerAck = await awaitDeliveryAck(claim.requestId, 60 * 60 * 1000);
+        if (!peerAck) {
+          return denyBash(`Email ${action} blocked: timed out waiting for admin approval. Do not retry — ask the user.`);
+        }
+        if (peerAck.status === 'delivered') return {};
+        return denyBash(
+          `Email ${action} blocked: ${peerAck.error ?? 'admin declined'}. Do not retry — acknowledge briefly.`,
+        );
+      }
+      // We own the claim, or nobody published in time. Both stage below; the
+      // second is the fail-closed fallback — two cards beats no gate.
+    }
+
+    // Everything from the routing lookup on is inside the try: a throw ANYWHERE
+    // after the claim is taken has to release it, or the peer waits out the full
+    // publish window for a card that will never exist.
+    let requestId: string;
+    try {
+      const routing = getSessionRouting();
+      requestId = `gate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      await writeMessageOut({
+        id: requestId,
+        kind: 'system',
+        platform_id: routing?.platform_id ?? null,
+        channel_type: routing?.channel_type ?? null,
+        thread_id: routing?.thread_id ?? null,
+        content: JSON.stringify({
+          action: 'request_bash_gate',
+          requestId,
+          label,
+          summary,
+          // The host renders a bounded head+tail preview and retains the full
+          // command in the approval record. Approvers need enough context to
+          // make a real decision, even when this fallback owns the gate.
+          command: evalCommand,
+        }),
+      });
+    } catch (err) {
+      if (claimKey && claimApi) claimApi.abandonGateClaim(claimKey);
+      throw err;
+    }
+    if (claimKey && claimApi) claimApi.publishGateClaim(claimKey, requestId);
 
     const ack = await awaitDeliveryAck(requestId, 60 * 60 * 1000);
     if (!ack) {
@@ -1645,6 +1693,71 @@ export function createEmailGateHook(): HookCallback {
     }
     return denyBash(`Email ${action} blocked: ${ack.error ?? 'admin declined'}. Do not retry — acknowledge briefly.`);
   };
+}
+
+
+// ── One approval card per tool call (Codex only) ──
+// In a Codex container this hook and the plugin's `codex-guard.ts` BOTH run on
+// every tool call — concurrently, with the same `tool_use_id` (codex-rs 0.154.0
+// `hooks/src/engine/dispatcher.rs` pushes every matched handler onto a
+// `FuturesUnordered`; measured 0.7 ms apart) — and both reach the outbound-email
+// gate. Without a claim, one gated send raises TWO approval cards for one
+// command.
+//
+// OPT-IN, and that is load-bearing. `tool_use_id` is a REQUIRED field of the
+// Claude SDK's PreToolUse input too, so keying on its presence would arm the
+// claim on the Claude path as well — where this hook is the only gate and no
+// peer will ever publish, so the claim could only ever cost (a wait, and one
+// more agent-writable file the gate would read). Only `codex-hooks/runner.ts`
+// passes `sharedApprovalClaim`, and only because it knows a peer guard exists.
+//
+// The claim lives in the SHARED guard core so this staging path and the core's
+// `runGateRequest` agree on the key and the directory; a core from an older
+// container image has none of these exports and the behaviour is exactly as it
+// was — two cards, never a skipped gate.
+
+interface GateClaimApi {
+  gateClaimKey: (toolUseId: string, action: string) => string;
+  claimGateRequest: (key: string) => { owner: boolean; requestId?: string | null };
+  publishGateClaim: (key: string, requestId: string) => void;
+  abandonGateClaim: (key: string) => void;
+  /**
+   * The check that makes the claim safe to read at all. The claim directory is
+   * under /tmp, which an agent can write to, so a published requestId that has
+   * ALREADY been decided is not a live peer — it is a past approval being
+   * replayed at a different command. Required, not optional: a core without it
+   * disables the claim entirely (two cards), which is the safe default.
+   *
+   * DECIDED is `delivered` or `failed`, never `pending`. The host writes a
+   * `pending` row the moment it posts the card, so `pending` is precisely the
+   * state a loser should wait on — the same reading `awaitDeliveryAck` uses
+   * (`../db/delivery-acks.ts`).
+   */
+  gateRequestAlreadyDecided: (requestId: string) => boolean;
+}
+
+let _gateClaimApi: GateClaimApi | null | undefined;
+
+async function loadGateClaimApi(): Promise<GateClaimApi | null> {
+  if (_gateClaimApi !== undefined) return _gateClaimApi;
+  try {
+    const core = (await import(guardCorePath())) as Record<string, unknown>;
+    const ok =
+      typeof core.gateClaimKey === 'function' &&
+      typeof core.claimGateRequest === 'function' &&
+      typeof core.publishGateClaim === 'function' &&
+      typeof core.abandonGateClaim === 'function' &&
+      typeof core.gateRequestAlreadyDecided === 'function';
+    _gateClaimApi = ok ? (core as unknown as GateClaimApi) : null;
+  } catch {
+    _gateClaimApi = null;
+  }
+  return _gateClaimApi;
+}
+
+/** Test seam: drop the memoized claim API so a swapped core path is re-read. */
+export function resetGateClaimApiForTest(): void {
+  _gateClaimApi = undefined;
 }
 
 // ── Block ad-hoc `git clone` outside /tmp ──

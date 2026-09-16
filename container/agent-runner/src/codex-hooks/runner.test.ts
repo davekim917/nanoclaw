@@ -536,3 +536,73 @@ describe('E6 codex dispatch — each guard + uniform fail-closed', () => {
     expect(edit2.decision).toBe('deny');
   });
 });
+
+describe('runPreToolUseChain — one approval card per tool call (#833)', () => {
+  // In a Codex container this chain and the plugin's codex-guard.ts BOTH run on
+  // every tool call, concurrently, with the same tool_use_id (codex-rs 0.154.0
+  // `hooks/src/engine/dispatcher.rs`; measured 0.7 ms apart). The shared core
+  // collapses them to one approval card by keying its claim on that id — which
+  // only works if this chain actually FORWARDS it.
+  const FIXTURE = new URL('./__test-fixtures__/gate-tooluseid/block-destructive-core.ts', import.meta.url).pathname;
+  const SINK = `/tmp/nanoclaw-gate-arg-${process.pid}.json`;
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const k of ['NANOCLAW_DESTRUCTIVE_GUARD_CORE', 'NANOCLAW_TEST_GATE_ARG_SINK']) saved[k] = process.env[k];
+    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = FIXTURE;
+    process.env.NANOCLAW_TEST_GATE_ARG_SINK = SINK;
+    try {
+      require('fs').unlinkSync(SINK);
+    } catch {
+      /* fresh */
+    }
+  });
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try {
+      require('fs').unlinkSync(SINK);
+    } catch {
+      /* already gone */
+    }
+  });
+
+  const recorded = (): { toolUseId: string | null } =>
+    JSON.parse(require('fs').readFileSync(SINK, 'utf-8')) as { toolUseId: string | null };
+
+  it('forwards codex’s tool_use_id into the session-DB gate', async () => {
+    await runPreToolUseChain({
+      tool_name: 'exec_command',
+      tool_input: { command: 'echo gated' },
+      tool_use_id: 'exec-30d6d4d2-4cdf-417a-a44c-5497d38b905d',
+    });
+    expect(recorded().toolUseId).toBe('exec-30d6d4d2-4cdf-417a-a44c-5497d38b905d');
+  });
+
+  it('survives a payload with NO tool_use_id — the gate still runs, unkeyed', async () => {
+    // Older codex, or a non-Codex caller. The claim is skipped and behaviour is
+    // exactly what it was before: a card of its own. Never a skipped gate.
+    const out = (await runPreToolUseChain({
+      tool_name: 'exec_command',
+      tool_input: { command: 'echo gated' },
+    })) as { hookSpecificOutput?: { permissionDecision?: string } };
+    expect(recorded().toolUseId).toBeNull();
+    // The gate ran and approved; nothing was denied for want of an id.
+    expect(out.hookSpecificOutput?.permissionDecision).not.toBe('deny');
+  });
+
+  it('forwards the id codex supplied, not one derived from the rewritten command', async () => {
+    // createSanitizeBashHook rewrites the command earlier in this chain. The
+    // claim key must still be built from the RAW tool_use_id — the plugin
+    // adapter keys on that same raw value, and any divergence silently gives
+    // each chain its own card again.
+    await runPreToolUseChain({
+      tool_name: 'exec_command',
+      tool_input: { command: 'echo gated' },
+      tool_use_id: 'exec-raw-id',
+    });
+    expect(recorded().toolUseId).toBe('exec-raw-id');
+  });
+});
