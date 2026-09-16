@@ -1154,11 +1154,21 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
 
   const candidates: RepinCandidate[] = [];
   const nearMisses: Array<{ session_id: string; series_id: string; model: string | null; effort: string | null }> = [];
-  // Did `--series-id` name a series that exists in scope at all? Without this,
-  // a typo'd or out-of-scope id is indistinguishable from "that series is not
-  // pinned to --from-model" — both report zero matches, and the operator reads
-  // the second as the first and moves on.
-  let seriesSeen = false;
+  // WHERE `--series-id` was seen, not merely whether. Two questions ride on it:
+  //
+  //   NOT SEEN AT ALL — a typo'd or out-of-scope id is otherwise
+  //     indistinguishable from "that series is not pinned to --from-model":
+  //     both report zero matches, and the operator reads the second as the
+  //     first and moves on.
+  //   SEEN IN MORE THAN ONE SESSION — series ids are NOT globally unique. A
+  //     named task's id is `<slug>-<4hex>` (`src/modules/scheduling/create.ts:67`),
+  //     so two groups that both run a task by the same name collide on a
+  //     1-in-65536 draw, and nothing anywhere prevents it — task-session lookup
+  //     scopes the id by agent group rather than assuming uniqueness
+  //     (`src/session-manager.ts:428`). Under `--all` a single `--series-id`
+  //     could therefore re-pin several series while the flag promised one.
+  //     Refused below, before any write, rather than silently repinning both.
+  const seriesSeenIn = new Set<string>();
 
   for (const session of await repinSessions(args, ctx)) {
     const rows =
@@ -1176,7 +1186,7 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
       // skipped the from-check would be a blind overwrite of whatever that
       // series currently carries — `tasks update --model` is the verb for that.
       if (seriesId !== undefined && row.seriesId !== seriesId) continue;
-      if (seriesId !== undefined) seriesSeen = true;
+      if (seriesId !== undefined) seriesSeenIn.add(`${session.agent_group_id}/${session.id}`);
       const resolveModel = modelResolverFor(await currentProviderFor(session.agent_group_id));
       const modelHit = pinMatches(row.pin.model, fromModel, modelLiteral, resolveModel, matchResolved);
       const effortHit = pinMatches(row.pin.effort, fromEffort, effortIdentity, effortIdentity, matchResolved);
@@ -1213,8 +1223,19 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
   // Refuse rather than report an empty run: "no series with that id is in
   // scope" and "that series is not pinned to --from-model" are different
   // answers, and only one of them means the operator's command was wrong.
-  if (seriesId !== undefined && !seriesSeen) {
+  if (seriesId !== undefined && seriesSeenIn.size === 0) {
     throw new Error(`no task series ${seriesId} in scope — check --series-id against \`ncl tasks list\``);
+  }
+  // An ambiguous id is refused, never resolved by picking one. `--series-id`
+  // promises ONE series; honouring it across several would rewrite pins the
+  // operator did not name, and choosing a winner silently is this file's
+  // documented defect class (see the CONTRADICTORY-INPUT REFUSALS block).
+  if (seriesId !== undefined && seriesSeenIn.size > 1) {
+    throw new Error(
+      `--series-id ${seriesId} is ambiguous: it names a series in ${seriesSeenIn.size} sessions ` +
+        `(${[...seriesSeenIn].sort().join(', ')}). Series ids are unique within an agent group, not across the ` +
+        'fleet — narrow the run with --group <id> or --session <id>.',
+    );
   }
 
   // Validate EVERY match before writing anything. The target is checked against
@@ -1722,7 +1743,7 @@ registerResource({
           name: 'series_id',
           type: 'string',
           description:
-            'Limit to ONE series inside the chosen scope. Narrows the --from-* match, it does not replace it; still needs --group, --session or --all. Refuses if no such series is in scope.',
+            'Limit to ONE series inside the chosen scope. Narrows the --from-* match, it does not replace it; still needs --group, --session or --all. Refuses if no such series is in scope, and refuses as ambiguous if the id names a series in more than one session (ids are unique within a group, not fleet-wide).',
         },
       ],
       examples: [

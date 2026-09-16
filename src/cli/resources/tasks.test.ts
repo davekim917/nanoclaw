@@ -2781,6 +2781,33 @@ describe('ncl tasks repin', () => {
       expect(r.error.message).toContain('no task series no-such-series in scope');
     });
 
+    it('REFUSES an id that names a series in more than one group rather than repinning both', async () => {
+      // Series ids are unique within an agent group, not fleet-wide: a named
+      // task's id is `<slug>-<4hex>` (scheduling/create.ts:67), so two groups
+      // running a task of the same name collide on a 1-in-65536 draw. Under
+      // `--all`, a filter that promised ONE series would then rewrite several.
+      await makePinGroup('ag-2', 'claude');
+      const first = await makePinnedTask('ag-1', 'shared', { model: 'claude-sonnet-5' });
+      const second = await makePinnedTask('ag-2', 'shared', { model: 'claude-sonnet-5' });
+      // Force the collision the id scheme permits but rarely produces.
+      const db = new Database(inboundDbPath('ag-2', second.session_id));
+      db.prepare("UPDATE messages_in SET series_id = ? WHERE kind = 'task'").run(first.series_id);
+      db.close();
+
+      const r = await repin({
+        all: true,
+        series_id: first.series_id,
+        from_model: 'claude-sonnet-5',
+        to_model: 'claude-opus-5[1m]',
+      });
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(r.error.message).toContain('ambiguous');
+      expect(r.error.message).toContain('--group');
+      // Nothing was written on the way to the refusal.
+      expect(storedTaskPin('ag-1', first.session_id, first.series_id)).toEqual({ turnModel: 'claude-sonnet-5' });
+    });
+
     it('still honours --from-model: a series in scope that does not match is not rewritten', async () => {
       const t = await makePinnedTask('ag-1', 'other-pin', { model: 'claude-fable-5-1[1m]' });
       const r = await repin({
