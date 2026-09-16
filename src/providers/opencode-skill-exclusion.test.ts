@@ -111,10 +111,14 @@ describe('excludedOpenCodeSkillNames', () => {
 describe('copyOpenCodeSkills with a drop set', () => {
   let source: string;
   let target: string;
+  let allowedRoots: string[];
 
   beforeEach(() => {
     source = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-mirror-'));
     target = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-xdg-'));
+    // No symlinks in this fixture, so containment decides nothing here; the
+    // drop-set behaviour is what these cases pin.
+    allowedRoots = [fs.realpathSync(source)];
     for (const name of ['alpha', 'team-auto', 'delta']) {
       fs.mkdirSync(path.join(source, name, 'references'), { recursive: true });
       fs.writeFileSync(path.join(source, name, 'SKILL.md'), name);
@@ -132,19 +136,19 @@ describe('copyOpenCodeSkills with a drop set', () => {
   });
 
   it('omits a dropped skill entirely — children included — and copies every other', () => {
-    copyOpenCodeSkills(source, target, new Set(['alpha']));
+    copyOpenCodeSkills(source, target, { dropNames: new Set(['alpha']), allowedRoots });
     expect(fs.readdirSync(target).sort()).toEqual(['delta', 'team-auto']);
     expect(fs.existsSync(path.join(target, 'alpha', 'references', 'notes.md'))).toBe(false);
     expect(fs.readFileSync(path.join(target, 'delta', 'references', 'notes.md'), 'utf8')).toBe('delta');
   });
 
   it('never mutates the host-owned mirror it copied from', () => {
-    copyOpenCodeSkills(source, target, new Set(['alpha']));
+    copyOpenCodeSkills(source, target, { dropNames: new Set(['alpha']), allowedRoots });
     expect(fs.readdirSync(source).sort()).toEqual(['alpha', 'delta', 'team-auto']);
   });
 
   it('copies everything when the drop set is empty (the default)', () => {
-    copyOpenCodeSkills(source, target);
+    copyOpenCodeSkills(source, target, { allowedRoots });
     expect(fs.readdirSync(target).sort()).toEqual(['alpha', 'delta', 'team-auto']);
   });
 
@@ -157,7 +161,7 @@ describe('copyOpenCodeSkills with a drop set', () => {
     // withdraw this content from the session — a guard refusing a legitimate
     // state instead of the bad input.
     fs.rmSync(path.join(source, 'alpha', '.nanoclaw-managed'));
-    copyOpenCodeSkills(source, target, new Set(['alpha']));
+    copyOpenCodeSkills(source, target, { dropNames: new Set(['alpha']), allowedRoots });
     expect(fs.readdirSync(target).sort()).toEqual(['alpha', 'delta', 'team-auto']);
     expect(fs.readFileSync(path.join(target, 'alpha', 'references', 'notes.md'), 'utf8')).toBe('alpha');
   });

@@ -41,7 +41,9 @@ describe('copyOpenCodeSkills', () => {
     const intentionalEmpty = path.join(root, 'intentional-empty');
     fs.mkdirSync(intentionalEmpty);
     const dst = path.join(copyRoot, 'skills');
-    copyOpenCodeSkills(root, dst);
+    // `root` stands in for the one plugin repository this mirror was built
+    // from, so an in-repo link is contained and a dangling one still is not.
+    copyOpenCodeSkills(root, dst, { allowedRoots: [fs.realpathSync(root)] });
 
     // The host-owned source is untouched, including intentional empty dirs.
     expect(fs.lstatSync(path.join(stale, 'references')).isSymbolicLink()).toBe(true);

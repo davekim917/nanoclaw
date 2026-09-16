@@ -19,6 +19,8 @@ vi.mock('./log.js', () => ({
 }));
 
 import { syncOpenCodePluginSkills, syncOpenCodeSubagents } from './opencode-sync.js';
+import { resolvePluginRoots } from './plugin-skill-discovery.js';
+import { copyOpenCodeSkills, mirrorSourceRootsByName } from './providers/opencode.js';
 
 const HOME = path.join(TEST_ROOT, 'home');
 const GLOBAL_SKILLS = path.join(HOME, '.config', 'opencode', 'skill');
@@ -99,6 +101,120 @@ describe('syncOpenCodePluginSkills with workgroup-scoped plugins (src/plugin-sco
     expect(result.targets).toContain(path.join(sibling, 'skill'));
     expect(fs.existsSync(path.join(sibling, 'skill', 'client-skill'))).toBe(false);
     expect(fs.existsSync(path.join(sibling, 'skill', 'shared-skill'))).toBe(true);
+  });
+});
+
+describe('syncOpenCodePluginSkills containment (#829)', () => {
+  it('mirrors an in-repo support dir but refuses a child linked out of the plugin', () => {
+    // A support dir is a non-skill sibling of a skills root (e.g.
+    // workflow-agents/skills/shared/), mirrored as per-child symlinks the
+    // session copy later DEREFERENCES into a container. So a child linked out
+    // of the plugin would move host-only state across that boundary.
+    const support = path.join(HOME, 'plugins', 'shared-plugin', 'skills', 'shared');
+    fs.mkdirSync(support, { recursive: true });
+    fs.writeFileSync(path.join(support, 'primitives.md'), 'in-repo primitives');
+    const secret = path.join(TEST_ROOT, 'host-only-auth.json');
+    fs.writeFileSync(secret, 'HOST-ONLY-SECRET');
+    fs.symlinkSync(secret, path.join(support, 'stolen.md'));
+    // And a child linked into a DIFFERENT plugin, which a union-of-roots
+    // boundary would admit.
+    fs.symlinkSync(
+      path.join(HOME, 'plugins', 'client-plugin', 'skills', 'client-skill', 'SKILL.md'),
+      path.join(support, 'cross.md'),
+    );
+
+    const result = syncOpenCodePluginSkills();
+
+    const mirrored = path.join(GLOBAL_SKILLS, 'shared');
+    expect(fs.existsSync(path.join(mirrored, 'primitives.md'))).toBe(true);
+    expect(fs.existsSync(path.join(mirrored, 'stolen.md'))).toBe(false);
+    expect(fs.existsSync(path.join(mirrored, 'cross.md'))).toBe(false);
+    expect(result.refused).toEqual(expect.arrayContaining(['shared/stolen.md', 'shared/cross.md']));
+  });
+
+  it('refuses a link NESTED inside a support dir that reaches another plugin', () => {
+    // End to end: sync the mirror, then copy it as a spawn does. The support
+    // dir's `sub/` is a real in-repo directory, so the writer links it whole and
+    // never resolves what is under it — the record it left is what holds the
+    // nested link to this plugin.
+    const support = path.join(HOME, 'plugins', 'shared-plugin', 'skills', 'shared', 'sub');
+    fs.mkdirSync(support, { recursive: true });
+    fs.writeFileSync(path.join(support, 'own.md'), 'in-repo primitives');
+    fs.symlinkSync(
+      path.join(HOME, 'plugins', 'client-plugin', 'skills', 'client-skill', 'SKILL.md'),
+      path.join(support, 'cross.md'),
+    );
+
+    syncOpenCodePluginSkills();
+
+    // The widest inputs a spawn ever passes — every plugin root allowed, no
+    // walk attribution — so the record this sync wrote is the only thing that
+    // can refuse the cross-plugin link.
+    const xdg = path.join(TEST_ROOT, 'xdg');
+    copyOpenCodeSkills(GLOBAL_SKILLS, xdg, {
+      allowedRoots: resolvePluginRoots(path.join(HOME, 'plugins')),
+      sourceRootsByName: new Map(),
+    });
+
+    expect(fs.readFileSync(path.join(xdg, 'shared', 'sub', 'own.md'), 'utf-8')).toBe('in-repo primitives');
+    expect(fs.existsSync(path.join(xdg, 'shared', 'sub', 'cross.md'))).toBe(false);
+  });
+
+  it('never treats the PLUGINS ROOT as a skills root, so a sibling repo is not published as a support dir', () => {
+    // A single-skill repo's skill dir IS its repo root (discovery rule 3), so
+    // its parent is ~/plugins. Treating that as a skills root made every other
+    // repository without a root SKILL.md a "support dir" — published whole into
+    // the shared mirror, workgroup scoping and all, since this path never
+    // consults the deny set.
+    const single = path.join(HOME, 'plugins', 'single-skill-repo');
+    fs.mkdirSync(single, { recursive: true });
+    fs.writeFileSync(
+      path.join(single, 'SKILL.md'),
+      '---\nname: single-skill-repo\ndescription: A single-skill repo.\n---\n\nBody.\n',
+    );
+    const clientDoc = path.join(HOME, 'plugins', 'client-plugin', 'domain', 'client.md');
+    fs.mkdirSync(path.dirname(clientDoc), { recursive: true });
+    fs.writeFileSync(clientDoc, 'CLIENT-TENANT-DATA');
+    scopePlugins({ 'client-plugin': ['client-wg'] });
+
+    syncOpenCodePluginSkills();
+
+    expect(fs.existsSync(path.join(GLOBAL_SKILLS, 'client-plugin'))).toBe(false);
+    expect(fs.existsSync(path.join(GLOBAL_SKILLS, 'shared-plugin'))).toBe(false);
+    // The single-skill repo's own skill is still mirrored.
+    expect(fs.existsSync(path.join(GLOBAL_SKILLS, 'single-skill-repo', 'SKILL.md'))).toBe(true);
+  });
+
+  it('attributes a name to the plugin the MIRROR published it from, not to a scoped one', () => {
+    // Discovery keeps the first plugin to claim a name, alphabetically. A walk
+    // that denied less than the mirror's would name `a-client` as the owner of
+    // `dup-skill`, so a legacy dir published from `b-shared` would be contained
+    // to a scoped plugin's repository — refusing its own links and admitting
+    // links into the scoped one, which is the escape this fix closes.
+    pluginSkill('a-client', 'dup-skill');
+    pluginSkill('b-shared', 'dup-skill');
+    scopePlugins({ 'a-client': ['client-wg'] });
+
+    const roots = mirrorSourceRootsByName(path.join(HOME, 'plugins'));
+
+    expect(roots.get('dup-skill')).toBe(fs.realpathSync(path.join(HOME, 'plugins', 'b-shared')));
+  });
+
+  it('records the source repository in every mirror dir it writes, skills and support dirs alike', () => {
+    const support = path.join(HOME, 'plugins', 'shared-plugin', 'skills', 'shared');
+    fs.mkdirSync(support, { recursive: true });
+    fs.writeFileSync(path.join(support, 'primitives.md'), 'in-repo primitives');
+
+    syncOpenCodePluginSkills();
+
+    const expected = `${JSON.stringify(fs.realpathSync(path.join(HOME, 'plugins', 'shared-plugin')))}\n`;
+    expect(fs.readFileSync(path.join(GLOBAL_SKILLS, 'shared-skill', '.nanoclaw-source-root'), 'utf-8')).toBe(expected);
+    expect(fs.readFileSync(path.join(GLOBAL_SKILLS, 'shared', '.nanoclaw-source-root'), 'utf-8')).toBe(expected);
+    // The support dir must NOT read as a managed skill mirror, or the cleanup
+    // pass would delete it on every sync (its name is no skill's).
+    expect(fs.existsSync(path.join(GLOBAL_SKILLS, 'shared', '.nanoclaw-managed'))).toBe(false);
+    syncOpenCodePluginSkills();
+    expect(fs.existsSync(path.join(GLOBAL_SKILLS, 'shared', 'primitives.md'))).toBe(true);
   });
 });
 

@@ -30,8 +30,17 @@ import {
   replaceUntrustedFile,
 } from '../fs-safety.js';
 import { assertValidGroupFolder } from '../group-folder.js';
+import { log } from '../log.js';
+import { collectSiblingSupportDirs, openCodeMirrorDenyPlugins } from '../opencode-sync.js';
 import { isExcludedPluginPath, splitExcludedPlugins, type ExcludedPlugins } from '../plugin-exclusions.js';
-import { MIRROR_MARKER, discoverPortableSkills } from '../plugin-skill-discovery.js';
+import {
+  MIRROR_MARKER,
+  discoverPortableSkills,
+  isWithinResolvedRoot,
+  readMirrorSourceRoot,
+  resolvePluginRoots,
+  resolveRealPath,
+} from '../plugin-skill-discovery.js';
 import { registerProviderContainerConfig } from './provider-container-registry.js';
 
 // Code-level opencode defaults — the floor under the per-group DB value
@@ -165,7 +174,151 @@ export function excludedOpenCodeSkillNames(pluginsRoot: string, excluded: Exclud
  * `syncSkillSymlinks` itself, which is a change to a mirror Codex shares:
  * recorded in #836, not made here.
  */
-export function copyOpenCodeSkills(source: string, target: string, dropNames: ReadonlySet<string> = new Set()): void {
+/**
+ * The containment roots for one top-level entry of the mirror. See the ordering
+ * note at the `rootsFor` call site.
+ */
+function resolveRootsFor(
+  source: string,
+  name: string,
+  allowedRoots: readonly string[],
+  sourceRootsByName: ReadonlyMap<string, string>,
+): readonly string[] {
+  const dir = path.join(source, name);
+  // Provenance belongs to a REAL DIRECTORY the mirror writers published. A
+  // top-level file, or a symlink standing where a mirror dir would be (the
+  // pre-mirror-dir legacy shape, which only a sync prunes), has a path the
+  // writers never wrote: reading a record "inside" it would follow that link
+  // into a plugin repository and let the PLUGIN choose the root — a record
+  // saying `/` is wider than the union it replaced.
+  let entry: fs.Stats | undefined;
+  try {
+    entry = fs.lstatSync(dir, { throwIfNoEntry: false });
+  } catch {
+    return [];
+  }
+  // A non-directory entry (a top-level file, or the pre-mirror-dir legacy
+  // symlink shape) carries no record of its own, but the current walk may still
+  // know the name — prefer that over the union.
+  if (entry === undefined || !entry.isDirectory()) {
+    const walkedEntry = sourceRootsByName.get(name);
+    return walkedEntry === undefined ? allowedRoots : [walkedEntry];
+  }
+
+  const recorded = readMirrorSourceRoot(dir);
+  if (recorded !== null) {
+    const resolved = resolveRealPath(recorded);
+    // A record is a claim about WHICH plugin repository, never about what counts
+    // as one. Honour it only when it names a root that is still a plugin
+    // repository now; a record pointing anywhere else is stale or planted.
+    return resolved !== null && allowedRoots.includes(resolved) ? [resolved] : [];
+  }
+  const walked = sourceRootsByName.get(name);
+  if (walked !== undefined) return [walked];
+  try {
+    if (fs.lstatSync(path.join(dir, MIRROR_MARKER), { throwIfNoEntry: false }) !== undefined) return [];
+  } catch {
+    return [];
+  }
+  return allowedRoots;
+}
+
+export interface CopyOpenCodeSkillsOptions {
+  /** Skill names to omit, gated on the mirror writer's marker (see above). */
+  dropNames?: ReadonlySet<string>;
+  /**
+   * The resolved plugin repository roots a link may resolve into when the
+   * mirror dir holding it records no source root of its own —
+   * `resolvePluginRoots(<plugins root>)`. REQUIRED, and with no default,
+   * because the containment it carries is this copy's security boundary: an
+   * omitted-means-allow-everything default is the one shape that would let a
+   * caller reintroduce the escape silently. An empty array refuses every link,
+   * which is the safe direction.
+   *
+   * A dir the mirror writer published is held to its ONE repository instead,
+   * which is strictly tighter — see `MIRROR_SOURCE_ROOT_FILE` in
+   * `src/plugin-skill-discovery.ts` for why a union is not enough for those.
+   */
+  allowedRoots: readonly string[];
+  /**
+   * Skill and support-dir name → resolved plugin repository, from a walk of the
+   * CURRENT plugins tree (`mirrorSourceRootsByName`). Attributes a dir published
+   * before the provenance record existed, which is every dir on an install that
+   * predates it. Omitting it is safe but weaker: such a dir is then treated as
+   * stale and its links refused, never widened.
+   */
+  sourceRootsByName?: ReadonlyMap<string, string>;
+}
+
+/**
+ * Every mirror-dir name the CURRENT `~/plugins` tree would publish, mapped to
+ * the resolved repository that publishes it — skills first, then the support
+ * dirs the mirror writes alongside them (`collectSiblingSupportDirs`,
+ * `src/opencode-sync.ts`), which are the same two populations
+ * `syncOpenCodePluginSkills` writes.
+ *
+ * This answers about the tree as it is NOW, not about what the mirror holds, so
+ * it is the FALLBACK for a dir carrying no provenance record — never an
+ * override of one. Where the two disagree the record wins, because the record is
+ * about the bytes in the mirror and this is not.
+ */
+export function mirrorSourceRootsByName(pluginsRoot: string): Map<string, string> {
+  // The SAME deny set the mirror was written with. A walk denying less would
+  // name a different owner for a shared skill name — discovery keeps the first
+  // plugin to claim one — and would then attribute a legacy dir to a
+  // workgroup-scoped plugin the mirror never published from, reopening exactly
+  // the cross-plugin reach this containment closes.
+  const discovered = discoverPortableSkills(pluginsRoot, {
+    runtime: 'opencode',
+    denyPlugins: openCodeMirrorDenyPlugins(),
+  });
+  const roots = new Map<string, string>();
+  for (const skill of discovered) {
+    const resolved = resolveRealPath(skill.pluginRoot);
+    if (resolved !== null) roots.set(skill.name, resolved);
+  }
+  // Support dirs are attributed by the SAME function the writer records from,
+  // over the same plugin roots, so the record and this fallback cannot name
+  // different owners for one mirror dir.
+  for (const [name, { pluginRoot }] of collectSiblingSupportDirs(discovered, resolvePluginRoots(pluginsRoot))) {
+    if (roots.has(name)) continue;
+    roots.set(name, pluginRoot);
+  }
+  return roots;
+}
+
+export function copyOpenCodeSkills(source: string, target: string, options: CopyOpenCodeSkillsOptions): void {
+  const dropNames = options.dropNames ?? new Set<string>();
+  const { allowedRoots } = options;
+  const sourceRootsByName = options.sourceRootsByName ?? new Map<string, string>();
+  // Per-mirror-dir containment roots, resolved once per name.
+  //
+  // The boundary for every link under a mirror dir is the ONE repository that
+  // dir was published from, because a link NESTED below its top level is never
+  // resolved by either writer (both check direct children only) and the union of
+  // every plugin root would let such a link reach a DIFFERENT plugin —
+  // including a workgroup-scoped one this mirror deliberately never published.
+  //
+  // Four answers, in descending order of how directly they know the source:
+  //   1. the dir's own provenance record — authoritative about the bytes here;
+  //      recorded-but-unresolvable yields NO roots rather than a wider set;
+  //   2. the current walk's root for this name — the dirs on an install that
+  //      predates the record have no record and MUST NOT silently keep the
+  //      union, and nothing re-runs the mirror sync at boot
+  //      (`syncOpenCodePluginSkills`'s only callers are the plugin-update path
+  //      and the enable script), so this is what closes them;
+  //   3. a MANAGED dir neither of those attributes is stale — its source left
+  //      the tree — so refuse its links rather than widen;
+  //   4. only an UNMANAGED, unattributed dir (operator-placed or natively
+  //      installed, which no plugin can create in this mirror) falls back.
+  const rootsByName = new Map<string, readonly string[]>();
+  const rootsFor = (name: string): readonly string[] => {
+    const cached = rootsByName.get(name);
+    if (cached !== undefined) return cached;
+    const roots = resolveRootsFor(source, name, allowedRoots, sourceRootsByName);
+    rootsByName.set(name, roots);
+    return roots;
+  };
   fs.cpSync(source, target, {
     recursive: true,
     dereference: true,
@@ -177,7 +330,38 @@ export function copyOpenCodeSkills(source: string, target: string, dropNames: Re
       const name = rel ? rel.split(path.sep)[0] : '';
       if (name && dropNames.has(name) && fs.existsSync(path.join(source, name, MIRROR_MARKER))) return false;
       const stat = fs.lstatSync(sourcePath, { throwIfNoEntry: false });
-      return stat !== undefined && (!stat.isSymbolicLink() || fs.existsSync(sourcePath));
+      if (stat === undefined) return false;
+      // A real file or directory in the mirror is content the mirror writer
+      // already contained; only a LINK can still reach out of the plugin tree.
+      if (!stat.isSymbolicLink()) return true;
+      // `dereference: true` means this copy READS whatever the link resolves
+      // to and writes the bytes into a directory mounted into the container.
+      // The writer contains what it creates (`syncSkillSymlinks`,
+      // `src/plugin-skill-discovery.ts`), but a link in a plugin repository can
+      // be repointed AFTER that sync and before this spawn, and this is the
+      // only reader standing between that and the container. So containment is
+      // re-decided here, against the resolved plugin roots, on a separator
+      // boundary so a sibling named `<root>-evil` cannot prefix-match.
+      const resolved = resolveRealPath(sourcePath);
+      // Dangling — the pre-existing reason this filter exists: a stale link
+      // must not wedge the spawn. Unchanged behaviour, no warning.
+      if (resolved === null) return false;
+      const roots = name ? rootsFor(name) : allowedRoots;
+      if (!roots.some((root) => isWithinResolvedRoot(resolved, root))) {
+        log.warn('OpenCode skill mirror link resolves outside its plugin repository; not copying it', {
+          link: sourcePath,
+          resolved,
+        });
+        return false;
+      }
+      // A FIFO, socket or device node passes containment and then makes
+      // `cpSync` throw (`ERR_INTERNAL_ASSERTION` on node 22, measured), which
+      // fails the whole spawn over one bad entry in one plugin. Refusing it
+      // keeps the rest of the mirror. `syncSkillMdCopy` carries the same guard
+      // for the copy it makes, where a FIFO genuinely does block the reader.
+      const targetStat = fs.statSync(resolved, { throwIfNoEntry: false });
+      if (targetStat === undefined || !(targetStat.isFile() || targetStat.isDirectory())) return false;
+      return true;
     },
   });
 }
@@ -337,11 +521,20 @@ registerProviderContainerConfig('opencode', async (ctx) => {
     // (`src/opencode-sync.ts`) — not `hostHome`: were the two ever to differ,
     // the walk would find nothing, the drop set would be empty, and the
     // exclusion would silently not apply.
+    const pluginsRoot = path.join(os.homedir(), 'plugins');
     const dropNames = excludedOpenCodeSkillNames(
-      path.join(os.homedir(), 'plugins'),
+      pluginsRoot,
       splitExcludedPlugins(readContainerConfig(path.basename(ctx.groupDir)).excludePlugins),
     );
-    copyOpenCodeSkills(hostSkillsDir, targetSkillsDir, dropNames);
+    // Containment for the dereferencing copy: the mirror is built from plugin
+    // repositories and from nothing else, so a link resolving outside every one
+    // of them is an escape, not a shape this feature has. Resolved from the
+    // SAME root the mirror was built from, for the same reason the drop set is.
+    copyOpenCodeSkills(hostSkillsDir, targetSkillsDir, {
+      dropNames,
+      allowedRoots: resolvePluginRoots(pluginsRoot),
+      sourceRootsByName: mirrorSourceRootsByName(pluginsRoot),
+    });
   }
 
   // Model + effort resolution mirrors the claude/codex template: a code-level

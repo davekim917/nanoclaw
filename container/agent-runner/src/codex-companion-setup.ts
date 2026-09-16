@@ -65,6 +65,7 @@ import {
 } from './providers/codex-hook-trust.js';
 import {
   type AgentRuntime,
+  type DiscoveredSkill,
   discoverPortableSkills,
   readPluginDenySiblings,
   syncSkillSymlinks as syncDiscoveredSkillSymlinks,
@@ -1089,13 +1090,22 @@ export function syncAgentSkillsMirror(runtime?: AgentRuntime): void {
   //      Claude-only sub-plugins denied).
   // Defers to any pre-existing non-symlink content (host-side mounts or
   // operator-managed runtime installs).
-  const containerSkillEntries: Array<{ name: string; skillDir: string; plugin: string }> = [];
+  const containerSkillEntries: DiscoveredSkill[] = [];
   try {
     for (const entry of fs.readdirSync(CONTAINER_CLAUDE_SKILLS_DIR)) {
       const sd = path.join(CONTAINER_CLAUDE_SKILLS_DIR, entry);
       try {
         if (fs.statSync(sd).isDirectory() && fs.existsSync(path.join(sd, 'SKILL.md'))) {
-          containerSkillEntries.push({ name: entry, skillDir: sd, plugin: 'container-bundled' });
+          // Containment root for a bundled skill is the bundled-skills dir
+          // itself: these ship in the image and have no plugin repository. The
+          // image's own skills contain no symlinks today, so this changes
+          // nothing about what they mirror.
+          containerSkillEntries.push({
+            name: entry,
+            skillDir: sd,
+            plugin: 'container-bundled',
+            pluginRoot: CONTAINER_CLAUDE_SKILLS_DIR,
+          });
         }
       } catch {
         continue;
@@ -1122,7 +1132,7 @@ export function syncAgentSkillsMirror(runtime?: AgentRuntime): void {
 
   // Plugin skills first (preferred source), then container-bundled —
   // first occurrence wins by name.
-  const merged = new Map<string, { name: string; skillDir: string; plugin: string }>();
+  const merged = new Map<string, DiscoveredSkill>();
   for (const s of pluginSkills) merged.set(s.name, s);
   for (const s of containerSkillEntries) if (!merged.has(s.name)) merged.set(s.name, s);
 
@@ -1133,4 +1143,10 @@ export function syncAgentSkillsMirror(runtime?: AgentRuntime): void {
       `created=${result.created.length} unchanged=${result.unchanged.length} ` +
       `removed=${result.removed.length} skipped=${result.skipped.length}`,
   );
+  // Containment refusals: a skill dir or child resolving outside its own plugin
+  // repository. Never silent — an operator seeing a skill go missing needs the
+  // reason in the log rather than in a diff of the mirror.
+  if (result.refused.length > 0) {
+    log(`~/.agents/skills/: refused ${result.refused.length} path(s) outside their plugin: ${result.refused.join(', ')}`);
+  }
 }

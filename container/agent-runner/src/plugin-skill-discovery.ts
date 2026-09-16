@@ -43,6 +43,54 @@ export interface DiscoveredSkill {
   skillDir: string;
   /** Plugin folder it came from */
   plugin: string;
+  /**
+   * Absolute path to the repository root that must CONTAIN every byte this
+   * skill contributes to a mirror. `syncSkillSymlinks` refuses anything
+   * resolving outside it; the host twin carries the full reasoning.
+   */
+  pluginRoot: string;
+}
+
+/** `fs.realpathSync`, or null when the path does not resolve. Null means refuse. */
+export function resolveRealPath(target: string): string | null {
+  try {
+    return fs.realpathSync(target);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Is an already-resolved path inside an already-resolved root? Separator
+ * boundary, so a sibling named `<root>-evil` cannot prefix-match.
+ */
+export function isWithinResolvedRoot(resolved: string, resolvedRoot: string): boolean {
+  return resolved === resolvedRoot || resolved.startsWith(resolvedRoot + path.sep);
+}
+
+/**
+ * The resolved repository roots a mirror built from `pluginsRoot` may point
+ * into — one per plugin directory, each resolved so a symlinked plugin checkout
+ * keeps working.
+ */
+export function resolvePluginRoots(pluginsRoot: string): string[] {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(pluginsRoot);
+  } catch {
+    return [];
+  }
+  const roots: string[] = [];
+  for (const entry of entries) {
+    // `.git`, `.codex`, `.agents` under the plugins root are not plugins and
+    // must not widen the boundary.
+    if (entry.startsWith('.')) continue;
+    const resolved = resolveRealPath(path.join(pluginsRoot, entry));
+    if (resolved === null) continue;
+    if (!isDirectory(resolved)) continue;
+    roots.push(resolved);
+  }
+  return roots;
 }
 
 /**
@@ -264,7 +312,7 @@ function discoverInPlugin(
     const fmName = readPluginName(skillDir);
     const name = fmName ?? path.basename(skillDir);
     if (skills.has(name)) return; // first match wins (preference order)
-    skills.set(name, { name, skillDir, plugin: pluginName });
+    skills.set(name, { name, skillDir, plugin: pluginName, pluginRoot: pluginDir });
   };
 
   // 1. .agents/skills/<name>/
@@ -454,6 +502,16 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
  *   - `removed`:   stale managed mirror dir deleted
  *   - `skipped`:   would have written but a real non-managed entry already
  *                  exists (deferring to it)
+ *   - `refused`:   a skill (or one child of one) resolving outside its own
+ *                  `pluginRoot`
+ *
+ * CONTAINMENT: every path mirrored here is one a plugin chose, and the mirror
+ * is read into agent-visible state, so a link out of the repository would make
+ * the reader fetch state the plugin was never given. `SKILL.md` is COPIED here,
+ * so no downstream filter can see that read. Refusals are returned rather than
+ * logged so this file stays logic-identical to its host twin; callers log.
+ * A refused name is treated as NOT desired, so a dir a previous run wrote for
+ * it is pruned by the cleanup pass.
  *
  * Idempotent.
  */
@@ -465,15 +523,28 @@ export function syncSkillSymlinks(
   removed: string[];
   unchanged: string[];
   skipped: string[];
+  refused: string[];
 } {
   fs.mkdirSync(dst, { recursive: true });
-
-  const desired = new Map(skills.map((s) => [s.name, s.skillDir] as const));
 
   const created: string[] = [];
   const removed: string[] = [];
   const unchanged: string[] = [];
   const skipped: string[] = [];
+  const refused: string[] = [];
+
+  // Decided before anything is written, so a refused name is absent from
+  // `desired` and the cleanup pass prunes a dir a previous run made for it.
+  const desired = new Map<string, { skillDir: string; resolvedRoot: string }>();
+  for (const skill of skills) {
+    const resolvedRoot = resolveRealPath(skill.pluginRoot);
+    const resolvedSkillDir = resolveRealPath(skill.skillDir);
+    if (resolvedRoot === null || resolvedSkillDir === null || !isWithinResolvedRoot(resolvedSkillDir, resolvedRoot)) {
+      refused.push(skill.name);
+      continue;
+    }
+    desired.set(skill.name, { skillDir: skill.skillDir, resolvedRoot });
+  }
 
   // ── Cleanup pass: drop managed mirror dirs whose name is no longer
   // desired. A managed mirror dir is a real dir whose entries are all
@@ -506,7 +577,7 @@ export function syncSkillSymlinks(
 
   // ── Sync pass: ensure each desired skill is a real dir whose children
   // are symlinks to the corresponding source entries.
-  for (const [name, srcDir] of desired) {
+  for (const [name, { skillDir: srcDir, resolvedRoot }] of desired) {
     const skillDirAtDst = path.join(dst, name);
 
     let dstStat: fs.Stats | null = null;
@@ -534,7 +605,9 @@ export function syncSkillSymlinks(
       continue;
     }
 
-    const changed = mirrorSkillDir(skillDirAtDst, srcDir);
+    const mirrored = mirrorSkillDir(skillDirAtDst, srcDir, resolvedRoot);
+    for (const child of mirrored.refusedChildren) refused.push(`${name}/${child}`);
+    const changed = mirrored.changed;
     if (dstStat?.isDirectory()) {
       if (changed) {
         // Re-sync touched some links; classify as updated (we report
@@ -549,15 +622,127 @@ export function syncSkillSymlinks(
     }
   }
 
-  return { created, removed, unchanged, skipped };
+  return { created, removed, unchanged, skipped, refused };
 }
 
 /**
  * Marker file we drop inside every mirror dir we create. Lets us
- * distinguish our writes from native installs
- * without ambiguity — a native install never has this file.
+ * distinguish our writes from native installs (e.g. `gitnexus setup`)
+ * without ambiguity — a native install never has this file. Managed-ness is
+ * ALL it means: the source a dir was published from lives in
+ * `MIRROR_SOURCE_ROOT_FILE`, which the support-dir mirror writes too and which
+ * `isManagedMirror` must not key on.
  */
 export const MIRROR_MARKER = '.nanoclaw-managed';
+
+/**
+ * Provenance file: the plugin repository a mirror dir was published from.
+ *
+ * The dir's own name is a skill name and carries no provenance, and the reader
+ * that needs it is the session copy (`copyOpenCodeSkills`,
+ * `src/providers/opencode.ts`): containment there has to be against this ONE
+ * repository, not against the union of every repository under `~/plugins`. A
+ * union lets a link NESTED below a mirror dir's top level — never seen by these
+ * writers, which resolve only each direct child — reach a DIFFERENT plugin,
+ * including a workgroup-scoped one the mirror deliberately never published
+ * (`scopedPluginNames`, `src/plugin-scopes.ts`).
+ *
+ * Separate from `MIRROR_MARKER` because the support-dir mirror
+ * (`mirrorSupportDir`, `src/opencode-sync.ts`) needs provenance too and must NOT
+ * read as a managed skill mirror — `isManagedMirror` keys on `MIRROR_MARKER`,
+ * and the cleanup pass deletes a managed dir whose name is not a desired skill,
+ * which every support dir's is not.
+ */
+export const MIRROR_SOURCE_ROOT_FILE = '.nanoclaw-source-root';
+
+/** Names this mirror owns in its own dirs. A plugin child using one is never mirrored. */
+export const MIRROR_OWNED_CHILDREN: ReadonlySet<string> = new Set([MIRROR_MARKER, MIRROR_SOURCE_ROOT_FILE]);
+
+/**
+ * The provenance file's contents for a mirror dir published from `resolvedRoot`.
+ *
+ * JSON-encoded, so a directory name containing a newline can neither forge nor
+ * truncate the record — a real Linux basename may contain one
+ * (`docs/review-notes/826.md`, the segment-rule rounds).
+ */
+export function formatMirrorSourceRoot(resolvedRoot: string): string {
+  return `${JSON.stringify(resolvedRoot)}\n`;
+}
+
+/**
+ * Write the provenance file, replacing anything that is not already exactly it.
+ *
+ * `lstat` first and unlink a non-regular entry: if an earlier write failed, the
+ * child loop could have symlinked a plugin's own same-named file into this dir,
+ * and writing through that link would both trust a plugin-authored record and
+ * write into the plugin's repository. Returns whether anything changed.
+ */
+export function writeMirrorSourceRoot(mirrorDir: string, resolvedRoot: string): boolean {
+  const file = path.join(mirrorDir, MIRROR_SOURCE_ROOT_FILE);
+  const content = formatMirrorSourceRoot(resolvedRoot);
+  let stat: fs.Stats | undefined;
+  try {
+    stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  } catch {
+    return false;
+  }
+  if (stat !== undefined && stat.isFile()) {
+    try {
+      if (fs.readFileSync(file, 'utf8') === content) return false;
+    } catch {
+      /* unreadable — rewrite below */
+    }
+  } else if (stat !== undefined) {
+    try {
+      fs.rmSync(file, { recursive: true, force: true });
+    } catch {
+      return false;
+    }
+  }
+  try {
+    fs.writeFileSync(file, content);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The plugin repository a mirror dir was published from, or null when it holds
+ * no provenance file — a dir published before this record existed, or one an
+ * operator or native installer placed. Null means "no provenance recorded",
+ * never "any root": the caller decides what an unattributed dir may do.
+ *
+ * `lstat`-gated to a regular file, so a symlink standing where the record
+ * belongs is not followed and read as a record.
+ */
+export function readMirrorSourceRoot(mirrorDir: string): string | null {
+  const file = path.join(mirrorDir, MIRROR_SOURCE_ROOT_FILE);
+  let stat: fs.Stats | undefined;
+  try {
+    // `throwIfNoEntry` suppresses ENOENT and nothing else: this path has a
+    // caller-supplied DIRECTORY component, so a file (or a symlink to one)
+    // standing where that directory should be throws ENOTDIR, and an unreadable
+    // parent throws EACCES. Unhandled, either would escape a `cpSync` filter and
+    // fail the whole spawn over one bad entry in a shared mirror.
+    stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  } catch {
+    return null;
+  }
+  if (stat === undefined || !stat.isFile()) return null;
+  let content: string;
+  try {
+    content = fs.readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+  try {
+    const value: unknown = JSON.parse(content.trim());
+    return typeof value === 'string' && value !== '' ? value : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * A "managed mirror" dir is one we created: it contains our marker file.
@@ -587,10 +772,20 @@ function isManagedMirror(dir: string): boolean {
  *     entry. Subdir reads at agent runtime follow symlinks normally, so
  *     `scripts/`, `reference/`, `agents/`, etc. inherit auto-update.
  *
- * Returns `true` if anything changed.
+ * Every child is resolved against `resolvedRoot` first; one that leaves the
+ * plugin's own repository is refused and named in `refusedChildren` instead of
+ * being mirrored — the `SKILL.md` copy and the per-child symlink alike. A
+ * dangling child resolves to null and is refused too.
+ *
+ * Returns whether anything changed, plus the refused child names.
  */
-function mirrorSkillDir(dstDir: string, srcDir: string): boolean {
+function mirrorSkillDir(
+  dstDir: string,
+  srcDir: string,
+  resolvedRoot: string,
+): { changed: boolean; refusedChildren: string[] } {
   let changed = false;
+  const refusedChildren: string[] = [];
   let dstExists: fs.Stats | null = null;
   try {
     dstExists = fs.lstatSync(dstDir);
@@ -601,7 +796,7 @@ function mirrorSkillDir(dstDir: string, srcDir: string): boolean {
     fs.mkdirSync(dstDir, { recursive: true });
     changed = true;
   } else if (!dstExists.isDirectory()) {
-    return false; // caller should have filtered this case
+    return { changed: false, refusedChildren }; // caller should have filtered this case
   }
 
   // Drop our marker so future runs recognize this as a managed mirror.
@@ -614,14 +809,36 @@ function mirrorSkillDir(dstDir: string, srcDir: string): boolean {
       /* swallow — non-critical */
     }
   }
+  // Record the ONE repository this dir was published from, so the session copy
+  // can contain every link under it to that root. Rewritten when it differs, so
+  // a dir published before this record existed — or from a plugin that has since
+  // moved — self-heals on the next sync.
+  if (writeMirrorSourceRoot(dstDir, resolvedRoot)) changed = true;
 
   let srcEntries: string[];
   try {
     srcEntries = fs.readdirSync(srcDir);
   } catch {
-    return changed;
+    return { changed, refusedChildren };
   }
-  const desiredChildren = new Set(srcEntries);
+
+  // Containment, decided before the removal pass below so a child refused now
+  // is ALSO pruned from a dst a previous run wrote it into.
+  const allowedChildren: string[] = [];
+  for (const child of srcEntries) {
+    // Names this mirror writes itself are never taken from the source. A plugin
+    // shipping one would otherwise be mirrored into the slot our own record
+    // occupies the moment a write of ours fails, and the copy would then read a
+    // plugin-authored provenance record.
+    if (MIRROR_OWNED_CHILDREN.has(child)) continue;
+    const resolvedChild = resolveRealPath(path.join(srcDir, child));
+    if (resolvedChild === null || !isWithinResolvedRoot(resolvedChild, resolvedRoot)) {
+      refusedChildren.push(child);
+      continue;
+    }
+    allowedChildren.push(child);
+  }
+  const desiredChildren = new Set(allowedChildren);
 
   // Remove stale children whose name no longer exists in src.
   // Only remove our own writes — symlinks and copies of SKILL.md.
@@ -633,7 +850,7 @@ function mirrorSkillDir(dstDir: string, srcDir: string): boolean {
   }
   for (const child of dstChildren) {
     if (desiredChildren.has(child)) continue;
-    if (child === MIRROR_MARKER) continue; // preserve our marker
+    if (MIRROR_OWNED_CHILDREN.has(child)) continue; // preserve the files we own
     const childPath = path.join(dstDir, child);
     try {
       const stat = fs.lstatSync(childPath);
@@ -651,8 +868,8 @@ function mirrorSkillDir(dstDir: string, srcDir: string): boolean {
     }
   }
 
-  // Sync each source child into dst.
-  for (const child of srcEntries) {
+  // Sync each contained source child into dst.
+  for (const child of allowedChildren) {
     const childPath = path.join(dstDir, child);
     const srcPath = path.join(srcDir, child);
 
@@ -695,7 +912,7 @@ function mirrorSkillDir(dstDir: string, srcDir: string): boolean {
     }
   }
 
-  return changed;
+  return { changed, refusedChildren };
 }
 
 /**
@@ -713,6 +930,10 @@ function syncSkillMdCopy(dst: string, src: string): boolean {
   } catch {
     return false;
   }
+  // `copyFileSync` on a FIFO blocks until a writer appears, and on the host that
+  // is the single event loop. A containment check cannot see this: the path is
+  // inside the repository. Only a regular file is a SKILL.md.
+  if (!srcStat.isFile()) return false;
   let dstStat: fs.Stats | null = null;
   try {
     dstStat = fs.lstatSync(dst);

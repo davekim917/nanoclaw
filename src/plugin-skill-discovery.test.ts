@@ -269,7 +269,7 @@ describe('syncSkillSymlinks (mirror-dir mode)', () => {
   it('materializes <dst>/<name>/ as a REAL DIR (Codex requires real dirs)', () => {
     const src = makeSourceSkill(path.join(tmpDir, 'src-a'));
     const dst = path.join(tmpDir, 'dst');
-    const result = syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p' }]);
+    const result = syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p', pluginRoot: src }]);
     expect(result.created).toEqual(['a']);
     const stat = fs.lstatSync(path.join(dst, 'a'));
     expect(stat.isSymbolicLink()).toBe(false);
@@ -283,7 +283,7 @@ describe('syncSkillSymlinks (mirror-dir mode)', () => {
       reference: 'dir',
     });
     const dst = path.join(tmpDir, 'dst');
-    syncSkillSymlinks(dst, [{ name: 'imp', skillDir: src, plugin: 'p' }]);
+    syncSkillSymlinks(dst, [{ name: 'imp', skillDir: src, plugin: 'p', pluginRoot: src }]);
     const mirror = path.join(dst, 'imp');
     expect(fs.lstatSync(path.join(mirror, 'SKILL.md')).isFile()).toBe(true);
     expect(fs.lstatSync(path.join(mirror, 'SKILL.md')).isSymbolicLink()).toBe(false);
@@ -295,8 +295,8 @@ describe('syncSkillSymlinks (mirror-dir mode)', () => {
   it('idempotent: re-run with same input reports unchanged', () => {
     const src = makeSourceSkill(path.join(tmpDir, 'src-a'));
     const dst = path.join(tmpDir, 'dst');
-    syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p' }]);
-    const result = syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p' }]);
+    syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p', pluginRoot: src }]);
+    const result = syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p', pluginRoot: src }]);
     expect(result.created).toEqual([]);
     expect(result.unchanged).toEqual(['a']);
   });
@@ -306,10 +306,10 @@ describe('syncSkillSymlinks (mirror-dir mode)', () => {
     const srcB = makeSourceSkill(path.join(tmpDir, 'src-b'));
     const dst = path.join(tmpDir, 'dst');
     syncSkillSymlinks(dst, [
-      { name: 'a', skillDir: srcA, plugin: 'p' },
-      { name: 'b', skillDir: srcB, plugin: 'p' },
+      { name: 'a', skillDir: srcA, plugin: 'p', pluginRoot: srcA },
+      { name: 'b', skillDir: srcB, plugin: 'p', pluginRoot: srcB },
     ]);
-    const result = syncSkillSymlinks(dst, [{ name: 'a', skillDir: srcA, plugin: 'p' }]);
+    const result = syncSkillSymlinks(dst, [{ name: 'a', skillDir: srcA, plugin: 'p', pluginRoot: srcA }]);
     expect(result.removed).toEqual(['b']);
     expect(fs.existsSync(path.join(dst, 'b'))).toBe(false);
   });
@@ -320,7 +320,7 @@ describe('syncSkillSymlinks (mirror-dir mode)', () => {
     fs.mkdirSync(dst, { recursive: true });
     fs.mkdirSync(path.join(dst, 'collide'), { recursive: true });
     fs.writeFileSync(path.join(dst, 'collide', 'SKILL.md'), 'NATIVE_INSTALL');
-    const result = syncSkillSymlinks(dst, [{ name: 'collide', skillDir: src, plugin: 'p' }]);
+    const result = syncSkillSymlinks(dst, [{ name: 'collide', skillDir: src, plugin: 'p', pluginRoot: src }]);
     expect(result.skipped).toEqual(['collide']);
     expect(fs.readFileSync(path.join(dst, 'collide', 'SKILL.md'), 'utf-8')).toBe('NATIVE_INSTALL');
   });
@@ -337,18 +337,18 @@ describe('syncSkillSymlinks (mirror-dir mode)', () => {
   it('updates child symlinks when source adds a file between runs', () => {
     const src = makeSourceSkill(path.join(tmpDir, 'src'), { 'SKILL.md': 'file' });
     const dst = path.join(tmpDir, 'dst');
-    syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p' }]);
+    syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p', pluginRoot: src }]);
     fs.writeFileSync(path.join(src, 'NEW.md'), '');
-    syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p' }]);
+    syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p', pluginRoot: src }]);
     expect(fs.lstatSync(path.join(dst, 'a', 'NEW.md')).isSymbolicLink()).toBe(true);
   });
 
   it('removes stale child symlinks when source removes a file', () => {
     const src = makeSourceSkill(path.join(tmpDir, 'src'), { 'SKILL.md': 'file', 'OLD.md': 'file' });
     const dst = path.join(tmpDir, 'dst');
-    syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p' }]);
+    syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p', pluginRoot: src }]);
     fs.unlinkSync(path.join(src, 'OLD.md'));
-    syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p' }]);
+    syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p', pluginRoot: src }]);
     expect(fs.existsSync(path.join(dst, 'a', 'OLD.md'))).toBe(false);
   });
 
@@ -357,7 +357,7 @@ describe('syncSkillSymlinks (mirror-dir mode)', () => {
     const dst = path.join(tmpDir, 'dst');
     fs.mkdirSync(dst, { recursive: true });
     fs.symlinkSync(src, path.join(dst, 'legacy'));
-    syncSkillSymlinks(dst, [{ name: 'legacy', skillDir: src, plugin: 'p' }]);
+    syncSkillSymlinks(dst, [{ name: 'legacy', skillDir: src, plugin: 'p', pluginRoot: src }]);
     expect(fs.lstatSync(path.join(dst, 'legacy')).isSymbolicLink()).toBe(false);
     expect(fs.lstatSync(path.join(dst, 'legacy')).isDirectory()).toBe(true);
     expect(fs.lstatSync(path.join(dst, 'legacy', 'SKILL.md')).isFile()).toBe(true);
