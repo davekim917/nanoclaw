@@ -24,8 +24,12 @@ function memoryContextEpochKey(providerName: string): string {
   return `memory_context_epoch:${providerName.toLowerCase()}`;
 }
 
+// `:numbered` retires every slot the usage-based pick (#811/#821) persisted
+// under the bare key, so each session restarts at slot 1 once instead of
+// resuming a usage-chosen slot (#849, operator 2026-09-16). Orphaned rows are
+// never read.
 function credentialSlotKey(providerName: string): string {
-  return `credential_slot:${providerName.toLowerCase()}`;
+  return `credential_slot:${providerName.toLowerCase()}:numbered`;
 }
 
 /**

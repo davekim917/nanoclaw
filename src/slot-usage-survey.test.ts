@@ -419,7 +419,7 @@ describe('ringSlotsForSurvey mirrors the ring the runner builds', () => {
  * verified only against the code's own belief passed every test and failed in
  * production. This half pins what the host PRODUCES; the matching half, which
  * pins what the runner makes of it, is the fixture describe in
- * `container/agent-runner/src/providers/claude-slot-pick.test.ts`.
+ * `container/agent-runner/src/providers/claude-slot-usage.test.ts`.
  *
  * If you change the payload shape, both halves must be updated in the same PR
  * or one of them goes red.
@@ -488,7 +488,7 @@ describe('a reading does not outlive the credential it describes', () => {
   const SLOT = 'CLAUDE_CODE_OAUTH_TOKEN_2';
   const OTHER = 'CLAUDE_CODE_OAUTH_TOKEN';
 
-  it('the exact reported sequence: cache A at 90%, swap in exhausted B, next spawn must not pick B on A’s number', async () => {
+  it('the exact reported sequence: cache A at 90%, swap in exhausted B, next spawn must not file A’s number under B', async () => {
     let clock = Date.parse('2026-09-15T05:00:00.000Z');
     const now = () => clock;
     // `_1` sits at 40%; `_2` holds account A at 90%.
@@ -517,7 +517,7 @@ describe('a reading does not outlive the credential it describes', () => {
     const { survey } = slotUsageSurveyForSpawn('global', after, { fetchImpl, now });
 
     // The consequence that matters: nothing is handed over for that slot, so
-    // the pick cannot rank B on A's 90% (and cannot record A's number as B's).
+    // A's 90% cannot be recorded as B's.
     expect(survey[SLOT]).toBeUndefined();
     expect(Object.keys(survey)).toEqual([OTHER]);
     expect(survey[OTHER]!.rateLimits.seven_day!.utilization).toBe(40);

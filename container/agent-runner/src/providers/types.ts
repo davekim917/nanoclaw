@@ -125,13 +125,12 @@ export interface AgentProvider {
   restorePersistedCredentialSlot?(): void;
 
   /**
-   * Usage-maximizing credential pick at session start (quota-burn 0.6 —
-   * `ClaudeProvider.pickCredentialSlotByUsage`). Pulls plan utilization for
-   * every credential slot and moves onto the most-used one that still has
-   * headroom; the restored slot above is only a hint. Network round-trips, so
-   * the runner entrypoint AWAITS it once, right after the restore.
+   * Record the host's per-slot plan-utilization survey as sample rows
+   * (`ClaudeProvider.recordSlotUsageSurvey`). Telemetry only — it never
+   * changes which credential is active. The runner entrypoint calls it once,
+   * right after the restore.
    */
-  pickCredentialSlotByUsage?(): Promise<void>;
+  recordSlotUsageSurvey?(): void;
 
   /**
    * Optional pre-resume maintenance. Given the stored continuation token,

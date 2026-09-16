@@ -26,13 +26,10 @@ import { appendActiveRuntimeContext } from '../runtime-context.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { shimCwd } from './cwd-shim.js';
 import {
-  formatSlotRanking,
   parseSlotUsageSurvey,
-  pickSlotByUsage,
   surveyEntryToUsageResponse,
   SLOT_USAGE_SURVEY_ENV,
-  type SlotUsageReading,
-} from './claude-slot-pick.js';
+} from './claude-slot-usage.js';
 import { attachTurnEffort } from './turn-effort.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
@@ -2289,10 +2286,9 @@ export class ClaudeProvider implements AgentProvider {
    * failure is logged and ignored — a respawn must never fail to boot over a
    * position hint it can re-derive by rotating.
    *
-   * Since quota-burn 0.6 this is a HINT, not authority: the runner awaits
-   * `pickCredentialSlotByUsage` right after it, and a readable `/usage` map
-   * overrides the restored position. The restore still matters when every
-   * slot's pull fails or every slot is exhausted — that is the fallback.
+   * This is the only thing that moves the ring at boot. Plan utilization never
+   * does (`recordSlotUsageSurvey` only records it): slot order is the
+   * operator's numbered priority, operator decision 2026-09-16.
    */
   restorePersistedCredentialSlot(): void {
     let persisted: string | undefined;
@@ -2336,85 +2332,44 @@ export class ClaudeProvider implements AgentProvider {
   }
 
   /**
-   * Usage-maximizing slot pick at session start — quota-burn plan item 0.6.
-   * Rule and rationale: `./claude-slot-pick.ts`.
+   * Record the host's plan-utilization survey (`NANOCLAW_SLOT_USAGE_SURVEY`,
+   * `src/slot-usage-survey.ts`) as one `usage_pull` sample row per ring slot
+   * per window, so idle slots stay visible in `rate_limit_samples`.
    *
-   * Reads the host's plan-utilization survey for EVERY ring slot from
-   * `NANOCLAW_SLOT_USAGE_SURVEY`, records a `usage_pull` sample row per slot
-   * per window so idle slots stop going dark, then moves the ring onto the
-   * slot with the highest `seven_day` utilization still below 1.0 and persists
-   * it exactly as `rotateApiKey` does. Runs on fresh AND resumed sessions: the
-   * persisted slot restored just before is a hint the pick overrides
-   * (prompt-cache miss on the new account is accepted cost).
+   * Telemetry ONLY: it never moves the ring. Slots are used in numbered order
+   * (`CLAUDE_CODE_OAUTH_TOKEN`, `_2`, `_3`, …) and advance only on a wall via
+   * `rotateApiKey` — the operator's priority, decided 2026-09-16, reversing
+   * quota-burn 0.6's most-used-first pick (#811/#821).
    *
-   * Makes NO network call. #811 pulled `/api/oauth/usage` for all six slots
-   * here, once per container boot, which put each token's request rate at the
-   * fleet's spawn rate and earned a fleet-wide 429; the host surveys on its own
-   * clock instead (`src/slot-usage-survey.ts`, and the block that pushes this
-   * variable in `src/container-runner.ts` next to the ring itself).
-   *
-   * Fallbacks, all logged: API-key auth or an empty ring → no-op; a slot with
-   * no fresh reading is unsampled and ineligible, exactly as a failed pull was;
-   * no eligible slot at all → today's behaviour (the restored/primary position
-   * stands). A survey that is absent, unparseable or entirely stale therefore
-   * degrades to the pre-0.6 behaviour rather than to a wrong pick.
-   *
-   * Never throws — this must not stop a container from booting. Called by
-   * the runner entrypoint after `restorePersistedCredentialSlot` (index.ts);
-   * not from the constructor (session DB) and not from `query()` (async).
+   * Makes no network call; a missing, unparseable or stale survey records
+   * nothing. Never throws — this must not stop a container from booting.
    */
-  async pickCredentialSlotByUsage(deps: { now?: number; maxAgeMs?: number } = {}): Promise<void> {
+  recordSlotUsageSurvey(deps: { now?: number; maxAgeMs?: number } = {}): void {
     const usingOauth = !this.env.ANTHROPIC_API_KEY && this.oauthRing.length > 0;
     if (!usingOauth) return;
     const credentialSet = process.env.NANOCLAW_OAUTH_CREDENTIAL_SET ?? null;
-
-    let readings: SlotUsageReading[];
     try {
       const survey = parseSlotUsageSurvey(process.env[SLOT_USAGE_SURVEY_ENV], {
         now: deps.now ?? Date.now(),
         maxAgeMs: deps.maxAgeMs,
       });
-      if (survey.problem) log(`Slot usage survey unusable (every slot unsampled): ${survey.problem}`);
+      if (survey.problem) log(`Slot usage survey unusable (nothing recorded): ${survey.problem}`);
       if (survey.staleSlots.length > 0) {
         log(`Slot usage survey too old to use for: ${survey.staleSlots.join(', ')}`);
       }
-      readings = this.oauthRing.map((slot): SlotUsageReading => {
+      for (const slot of this.oauthRing) {
         const entry = survey.fresh[slot.name];
-        if (!entry) return { name: slot.name, samples: null };
+        if (!entry) continue;
         const who: AccountIdentity = {
           account: slot.name,
           credentialSet,
           lane: laneForSlot(process.env.CLAUDE_CODE_OAUTH_LANES, slot.name),
         };
-        const samples = usageResponseToSamples(surveyEntryToUsageResponse(entry), who);
-        recordRateLimitSamples(samples);
-        return { name: slot.name, samples };
-      });
+        recordRateLimitSamples(usageResponseToSamples(surveyEntryToUsageResponse(entry), who));
+      }
     } catch (err) {
-      log(`Slot usage pick aborted: ${err instanceof Error ? err.message : String(err)}`);
-      return;
+      log(`Slot usage survey recording aborted: ${err instanceof Error ? err.message : String(err)}`);
     }
-
-    if (this.oauthRing.length < 2) return; // sampled the lone slot; nothing to choose between
-
-    const current = this.oauthRing[this.oauthRingPos];
-    const pick = pickSlotByUsage(readings);
-    log(`Slot usage at session start: ${formatSlotRanking(pick.ranking)}`);
-    if (pick.chosen === null) {
-      log(`No OAuth slot eligible by usage — keeping ${current.name} (ring ${this.oauthRingPos + 1}/${this.oauthRing.length})`);
-      return;
-    }
-    const idx = this.oauthRing.findIndex((entry) => entry.name === pick.chosen);
-    if (idx === -1) return; // cannot happen: readings are built from the ring
-    const next = this.oauthRing[idx];
-    this.oauthRingPos = idx;
-    this.env.CLAUDE_CODE_OAUTH_TOKEN = next.value;
-    process.env.CLAUDE_CODE_OAUTH_TOKEN = next.value;
-    log(
-      `Picked credential slot ${next.name} by usage (ring ${idx + 1}/${this.oauthRing.length}` +
-        `${next.name === current.name ? ', unchanged' : `, was ${current.name}`})`,
-    );
-    this.persistCredentialSlot(next.name);
   }
 
   /** Best-effort persist; never throws — a respawn just re-derives via rotation. */
