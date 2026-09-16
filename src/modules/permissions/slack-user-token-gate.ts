@@ -8,8 +8,8 @@ import type { RawStatements } from '../../db/central-lease.js';
  * The token reads from the OWNER's Slack lens, so the host decides per spawn
  * whether it is injected at all: a session that is not owner-safe spawns under
  * the `<group>-noslack` OneCLI identity whose secret set excludes it (the
- * two-tier identity in `src/container-runner.ts`, next to the
- * `slackUserTokenSecrets` call). There is no second layer: a Slack MCP used to
+ * two-tier identity at `src/container-runner.ts:6938`, which runs
+ * only when `slackUserTokenSecrets` finds a secret, `:6941`). There is no second layer: a Slack MCP used to
  * be registered behind this same predicate and was retired, so this function
  * is the whole authorization decision.
  *

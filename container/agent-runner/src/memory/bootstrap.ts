@@ -34,7 +34,7 @@ function boundedStringArray(value: unknown): string[] {
 /**
  * Evict one capability entry: the last one not marked `retainUnderBudget`,
  * or the last outright once only retained ones remain. The host's
- * `evictCapability` (src/modules/memory/pre-turn-context.ts) applies the same
+ * `evictCapability` (src/modules/memory/pre-turn-context.ts:1590) applies the same
  * rule to the host-built bootstrap; this fallback must not drop an entry the
  * host would have kept.
  */

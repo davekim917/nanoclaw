@@ -569,8 +569,8 @@ export function mergeWorkgroupAndGroupSecrets(
  * threads (`curl https://slack.com/api/*` through the proxy). The host
  * withholds exactly these from a session's OneCLI agent when the session is
  * not owner-safe, so teammates in a shared channel can't extract the owner's
- * Slack through the agent. See `isOwnerSafeSlackSession` + the two-tier identity in
- * container-runner.
+ * Slack through the agent. See `isOwnerSafeSlackSession`
+ * (src/modules/permissions/slack-user-token-gate.ts:108) and the two-tier identity (src/container-runner.ts:6941).
  *
  * Resolution:
  *   - If `explicitNames` is provided (from `slack_user_token.onecli_secret_names`),

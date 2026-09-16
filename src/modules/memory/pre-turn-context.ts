@@ -1582,7 +1582,7 @@ type CapabilityService = SessionServicesSnapshot['services'][number];
  * Evict one capability entry for a budget: the LAST entry not marked
  * `retainUnderBudget`, or the last entry outright once only retained ones are
  * left. Both capability budgets evict from the end, and entries are pushed in
- * a fixed authoring order (src/capabilities.ts), so without the mark whichever
+ * a fixed authoring order (the Slack entry is pushed at src/capabilities.ts:812, near the end), so without the mark whichever
  * service happens to be authored late is the one an agent loses — the Slack
  * entry was, on the widest-wired groups, and the agent then told the owner it
  * could not read a Slack link it could read.

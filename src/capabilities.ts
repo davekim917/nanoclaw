@@ -135,9 +135,12 @@ export interface SessionServicesSnapshot {
     /**
      * Never evicted by a capability budget while any entry without it can be
      * evicted instead. For an entry whose absence makes the agent deny an
-     * ability it has. Honoured by `boundedCapabilities` and `enforceFinalBound`
-     * (src/modules/memory/pre-turn-context.ts) and by the runner's fresh-context
-     * fallback (container/agent-runner/src/memory/bootstrap.ts).
+     * ability it has. Honoured through `evictCapability`
+     * (src/modules/memory/pre-turn-context.ts:1590) at all three host eviction
+     * sites — the service-count limit (:1612), the total budget
+     * (:1664) and `enforceFinalBound` (:1710) — and by the runner's
+     * fresh-context fallback through its own `evictCapability`
+     * (container/agent-runner/src/memory/bootstrap.ts:41, called at :68 and :92).
      */
     retainUnderBudget?: boolean;
   }>;
@@ -743,8 +746,8 @@ export function buildSessionServicesSnapshotFrom(
   //   - non-owner-safe session (anything else): the host spawns under the
   //     `-noslack` OneCLI identity with the Slack secret WITHHELD → no Slack
   //     access here, by design, so teammates can't extract the owner's Slack
-  //     through the agent. (See isOwnerSafeSlackSession + the two-tier identity
-  //     in container-runner.)
+  //     through the agent. (isOwnerSafeSlackSession, slack-user-token-gate.ts:108;
+  //     the two-tier identity, src/container-runner.ts:6941.)
   //
   // The access itself is one surface: the Slack Web API through the OneCLI
   // proxy (`curl https://slack.com/api/<method>`, no auth header). There is no
@@ -756,7 +759,7 @@ export function buildSessionServicesSnapshotFrom(
   // `retainUnderBudget`: this entry is what stops the agent telling the owner
   // it can't read a Slack link, and it was the one the pre-turn capability
   // budget dropped (it sits late in this list and budget eviction pops from
-  // the end). See boundedCapabilities in src/modules/memory/pre-turn-context.ts.
+  // the end). See evictCapability, src/modules/memory/pre-turn-context.ts:1590.
   const mergedSecrets = mergeWorkgroupAndGroupSecrets(central.workgroupSecrets, cfg?.onecliSecrets);
   const hasSlackSecret = slackUserTokenSecrets(mergedSecrets, cfg?.slack_user_token?.onecli_secret_names).length > 0;
   if (hasSlackSecret) {
