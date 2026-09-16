@@ -68,24 +68,61 @@ export function readCodexConfigToml(configPath: string): string {
   }
 }
 
+/** Best-effort `fsync` of a directory, so a completed rename survives a crash. */
+function fsyncDir(dir: string): void {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(dir, 'r');
+    fs.fsyncSync(fd);
+  } catch {
+    // Not every filesystem permits opening a directory for fsync, and the
+    // rename has already happened either way. Losing it to a power cut costs
+    // one regenerated config on the next spawn, never a corrupt one.
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* nothing left to do */
+      }
+    }
+  }
+}
+
 /**
- * Durably replace a container `config.toml`.
+ * Atomically replace a container `config.toml`.
  *
  * `render` receives the CURRENT contents (`''` only when the file genuinely
  * does not exist) and returns the complete new file. It runs before anything is
- * written, so a renderer that throws leaves the file untouched.
+ * written, so a renderer that throws leaves the file untouched. Pass
+ * `readBase: false` for a FULL regeneration that ignores what was there — the
+ * renderer then gets `''` and an unreadable current file is not a reason to
+ * refuse, since nothing was going to be carried forward from it.
  *
  * Commit is temp-file-and-rename in the SAME directory — `rename(2)` is atomic
  * only within a filesystem, and a temp file elsewhere (`/tmp`) would silently
  * degrade to a copy across a mount boundary. The temp file is `fsync`ed before
- * the rename so the rename cannot publish a name pointing at unwritten data.
+ * the rename so the rename cannot publish a name pointing at unwritten data,
+ * and the directory is `fsync`ed after so the rename itself is durable.
+ *
+ * Two edges, both recorded because neither is reachable in this tree and a
+ * future caller could make one so. A config.toml that is a SYMLINK is replaced
+ * by a regular file rather than written through — nothing here creates one (the
+ * host writes a regular file, `src/fs-safety.ts` and `src/container-runner.ts`).
+ * And a leftover DIRECTORY named `config.toml.tmp` blocks every write: `open`
+ * fails EISDIR and `unlink` cannot clear it, so the spawn refuses until it is
+ * removed by hand.
  *
  * Throws on any failure, after removing the temp file. That is deliberate at
- * every call site: a Codex spawn that cannot durably persist its guard wiring
- * must not proceed as if it had.
+ * every call site: a Codex spawn that cannot persist its guard wiring must not
+ * proceed as if it had.
  */
-export function writeCodexConfigToml(configPath: string, render: (base: string) => string): void {
-  const base = readCodexConfigToml(configPath);
+export function writeCodexConfigToml(
+  configPath: string,
+  render: (base: string) => string,
+  opts?: { readBase?: boolean },
+): void {
+  const base = opts?.readBase === false ? '' : readCodexConfigToml(configPath);
   const next = render(base);
 
   const dir = path.dirname(configPath);
@@ -97,15 +134,19 @@ export function writeCodexConfigToml(configPath: string, render: (base: string) 
     fd = fs.openSync(tmpPath, 'w');
     fs.writeFileSync(fd, next);
     fs.fsyncSync(fd);
-    fs.closeSync(fd);
+    // Cleared BEFORE the close, not after: `close(2)` frees the descriptor even
+    // when it reports an error, so a catch block that closed it again could
+    // shut a file some other thread had since been handed the same number for.
+    const toClose = fd;
     fd = undefined;
+    fs.closeSync(toClose);
     fs.renameSync(tmpPath, configPath);
   } catch (err) {
     if (fd !== undefined) {
       try {
         fs.closeSync(fd);
       } catch {
-        /* already closed / closing is what failed */
+        /* the open succeeded but a later step failed; nothing left to do */
       }
     }
     try {
@@ -117,6 +158,7 @@ export function writeCodexConfigToml(configPath: string, render: (base: string) 
     log(`FAILED to commit ${configPath} — the previous configuration is left standing: ${detail}`);
     throw new Error(`could not write Codex config at ${configPath}: ${detail}`);
   }
+  fsyncDir(dir);
 }
 
 /**

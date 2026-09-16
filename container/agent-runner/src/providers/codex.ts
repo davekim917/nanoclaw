@@ -42,6 +42,7 @@ import {
   startCodexTurn,
   startOrResumeCodexThread,
   steerCodexTurn,
+  resolveCodexConfigDir,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
 // Hooks AND the `[hooks.state.*]` entries that make Codex actually dispatch
@@ -1110,7 +1111,7 @@ export class CodexProvider implements AgentProvider {
         .map((s) => s.trim())
         .filter((s) => s.length > 0),
     );
-    this.primaryCodexHome = process.env.CODEX_HOME ?? '/home/node/.codex';
+    this.primaryCodexHome = resolveCodexConfigDir();
     this.primaryHostCodexHome = process.env.CODEX_PRIMARY_HOST_HOME;
     if (this.fallbackHomes.length > 0) {
       console.error(
@@ -1247,7 +1248,7 @@ export class CodexProvider implements AgentProvider {
       // pass it into findRolloutFile (the rollout to copy lives in the home
       // we're rotating AWAY from). Falls back to the conventional path when
       // process.env.CODEX_HOME is unset — the codex CLI uses the same default.
-      let currentCodexHome = process.env.CODEX_HOME ?? self.primaryCodexHome;
+      let currentCodexHome = resolveCodexConfigDir();
       let primaryAuthRefreshAttempted = false;
 
       try {

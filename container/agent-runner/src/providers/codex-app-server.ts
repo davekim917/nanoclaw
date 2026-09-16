@@ -770,7 +770,7 @@ export function renderCodexMcpConfigToml(existing: string, servers: Record<strin
  * dir. CODEX_HOME == $HOME/.codex on initial spawn, so this is a no-op there.
  * (codex #126)
  */
-function resolveCodexConfigDir(): string {
+export function resolveCodexConfigDir(): string {
   return process.env.CODEX_HOME || path.join(process.env.HOME || '/home/node', '.codex');
 }
 

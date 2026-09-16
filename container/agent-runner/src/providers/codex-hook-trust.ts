@@ -270,16 +270,38 @@ function tomlQuotedKey(key: string): string {
 
 export const HOOK_TRUST_MARKER = '# --- nanoclaw hook trust ---';
 
+/**
+ * Deterministic order, and last-writer-wins on a duplicate key so the block can
+ * never emit the same table twice (codex rejects a duplicate table).
+ */
+function dedupeTrustEntries(entries: readonly CodexHookTrustEntry[]): Map<string, string> {
+  const deduped = new Map<string, string>();
+  for (const entry of entries) deduped.set(entry.key, entry.hash);
+  return new Map([...deduped.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+}
+
+/**
+ * The exact two-line table each trust entry renders as.
+ *
+ * This is what a post-write read-back must look for, and it is derived from the
+ * SAME dedupe as the renderer so the two cannot disagree. Asserting on the hash
+ * alone would be wrong in both directions: two identical handlers under
+ * different keys share one hash, so a committed file that lost one of their
+ * tables would still pass; and a duplicate key carrying a different hash is
+ * dropped by the dedupe above, so its hash would be reported missing from a
+ * file that is in fact correct.
+ */
+export function codexHookTrustTables(entries: readonly CodexHookTrustEntry[]): string[] {
+  return [...dedupeTrustEntries(entries)].map(
+    ([key, hash]) => `[hooks.state.${tomlQuotedKey(key)}]\ntrusted_hash = "${hash}"`,
+  );
+}
+
 export function renderCodexHookTrustBlock(entries: readonly CodexHookTrustEntry[]): string {
   if (entries.length === 0) return '';
   const lines = [HOOK_TRUST_MARKER, ''];
-  // Deterministic order, and last-writer-wins on a duplicate key so the block
-  // can never emit the same table twice (codex rejects a duplicate table).
-  const deduped = new Map<string, string>();
-  for (const entry of entries) deduped.set(entry.key, entry.hash);
-  for (const key of [...deduped.keys()].sort()) {
-    lines.push(`[hooks.state.${tomlQuotedKey(key)}]`);
-    lines.push(`trusted_hash = "${deduped.get(key)}"`);
+  for (const table of codexHookTrustTables(entries)) {
+    lines.push(...table.split('\n'));
     lines.push('');
   }
   return lines.join('\n');

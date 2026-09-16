@@ -6,6 +6,7 @@ import path from 'path';
 import {
   HOOK_TRUST_MARKER,
   classifyCodexHookList,
+  codexHookTrustTables,
   codexHookTrustHash,
   collectCodexHookTrustEntries,
   collectPluginHookTrustEntries,
@@ -502,5 +503,40 @@ describe('classifyCodexHookList', () => {
     );
     expect(verdict.generated).toEqual([]);
     expect(verdict.plugin).toEqual([]);
+  });
+});
+
+describe('codexHookTrustTables', () => {
+  const entry = (key: string, hash: string) => ({ key, hash });
+
+  it('renders the exact two-line tables the block emits, so a read-back cannot disagree', () => {
+    const entries = [
+      entry('/h/hooks.json:post_tool_use:0:0', 'sha256:b'),
+      entry('/h/hooks.json:pre_tool_use:0:0', 'sha256:a'),
+    ];
+    const block = renderCodexHookTrustBlock(entries);
+    for (const table of codexHookTrustTables(entries)) expect(block).toContain(table);
+  });
+
+  it('dedupes a repeated key last-writer-wins, matching the renderer', () => {
+    // A post-write check built from the RAW entries would report the dropped
+    // hash missing from a file the renderer wrote correctly, and refuse a
+    // spawn over it.
+    const entries = [entry('k', 'sha256:first'), entry('k', 'sha256:second')];
+    const tables = codexHookTrustTables(entries);
+    expect(tables).toEqual(['[hooks.state."k"]\ntrusted_hash = "sha256:second"']);
+    expect(renderCodexHookTrustBlock(entries)).toContain(tables[0]);
+  });
+
+  it('sorts by key, and escapes a key the way the table header does', () => {
+    const entries = [entry('z', 'sha256:z'), entry('a\u0000b', 'sha256:a')];
+    expect(codexHookTrustTables(entries).map((t) => t.split('\n')[0])).toEqual([
+      '[hooks.state."a\\u0000b"]',
+      '[hooks.state."z"]',
+    ]);
+  });
+
+  it('is empty for no entries', () => {
+    expect(codexHookTrustTables([])).toEqual([]);
   });
 });

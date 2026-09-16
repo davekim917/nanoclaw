@@ -58,6 +58,7 @@ import {
   type CodexHookTrustEntry,
   classifyCodexHookList,
   collectCodexHookTrustEntries,
+  codexHookTrustTables,
   collectPluginHookTrustEntries,
   formatCodexHookTrustProblem,
   mergeCodexHookTrustIntoToml,
@@ -520,7 +521,7 @@ export function syncCodexHookTrust(
     writeCodexConfigTomlAsserting(
       configPath,
       (existing) => mergeCodexHookTrustIntoToml(existing, entries),
-      entries.map((entry) => `trusted_hash = "${entry.hash}"`),
+      codexHookTrustTables(entries),
     );
   } catch (err) {
     // THROWS, deliberately. Swallowing here leaves hooks.json on disk with no
@@ -632,12 +633,14 @@ export function setupCodexRuntime(
 
   const runtimeConfigPath = path.join(RUNTIME_CODEX_DIR, 'config.toml');
   try {
-    // Full regeneration — the peer-mode runtime config carries NOTHING from
-    // whatever was here before (see `buildRuntimeConfig`) — but still committed
-    // through the shared primitive, so an ENOSPC mid-write leaves the last
-    // valid runtime config standing instead of a truncated one that the next
-    // `codex plugin add` would then decorate and the spawn would believe.
-    writeCodexConfigToml(runtimeConfigPath, () => buildRuntimeConfig(mcpServers));
+    // Full regeneration: the peer-mode runtime config carries NOTHING from
+    // whatever was here before (see `buildRuntimeConfig`), so `readBase: false`
+    // — an unreadable previous file is no reason to disable peer Codex when
+    // none of it was going to be carried forward. Still committed through the
+    // shared primitive, so an ENOSPC mid-write leaves the last valid runtime
+    // config standing rather than a truncated one that the next
+    // `codex plugin add` would decorate and the spawn would believe.
+    writeCodexConfigToml(runtimeConfigPath, () => buildRuntimeConfig(mcpServers), { readBase: false });
   } catch (err) {
     return failClosed('could not write the merged config.toml', err);
   }

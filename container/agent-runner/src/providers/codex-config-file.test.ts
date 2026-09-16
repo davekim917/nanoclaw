@@ -116,6 +116,28 @@ describe('writeCodexConfigToml', () => {
     expect(fs.readFileSync(configPath, 'utf-8')).toBe(LOAD_BEARING);
   });
 
+  it('readBase:false skips the read entirely, so an unreadable current file is no obstacle', () => {
+    // A FULL regeneration carries nothing forward, so refusing on an unreadable
+    // previous file would disable peer-mode Codex for no benefit.
+    fs.writeFileSync(configPath, LOAD_BEARING);
+    fs.chmodSync(configPath, 0o200);
+    let seen = 'not-called';
+    try {
+      writeCodexConfigToml(
+        configPath,
+        (base) => {
+          seen = base;
+          return '[regenerated]\n';
+        },
+        { readBase: false },
+      );
+    } finally {
+      fs.chmodSync(configPath, 0o600);
+    }
+    expect(seen).toBe('');
+    expect(fs.readFileSync(configPath, 'utf-8')).toBe('[regenerated]\n');
+  });
+
   it('REPLACES a read-only file, because the commit is a rename the directory governs', () => {
     fs.writeFileSync(configPath, LOAD_BEARING);
     fs.chmodSync(configPath, 0o400);
@@ -142,6 +164,19 @@ describe('writeCodexConfigTomlAsserting', () => {
   it('names the missing entries, capped, so the log is readable', () => {
     const required = Array.from({ length: 7 }, (_, i) => `trusted_hash = "sha256:${i}"`);
     expect(() => writeCodexConfigTomlAsserting(configPath, () => '', required)).toThrow(/…\(2 more\)/);
+  });
+
+  it('catches a dropped TABLE even when an identical handler elsewhere shares its hash', () => {
+    // Asserting on the hash alone would miss this: two identical handlers under
+    // different keys have one hash, so a file that lost one of their tables
+    // still carries the hash. The required strings are whole tables.
+    const tables = [
+      '[hooks.state."/a/hooks.json:pre_tool_use:0:0"]\ntrusted_hash = "sha256:same"',
+      '[hooks.state."/b/hooks.json:pre_tool_use:0:0"]\ntrusted_hash = "sha256:same"',
+    ];
+    expect(() => writeCodexConfigTomlAsserting(configPath, () => `${tables[0]}\n`, tables)).toThrow(
+      /committed without 1 required entry/i,
+    );
   });
 
   it('skips the read-back entirely when nothing is required', () => {
