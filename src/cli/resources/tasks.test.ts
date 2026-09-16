@@ -1573,20 +1573,26 @@ describe('tasks CLI resource', () => {
         expect(storedContent(session_id, series_id).flagIntent).toEqual({ turnEffort: 'high' });
       });
 
-      it('a clear-only update needs no --group: there is no vocabulary to validate against', async () => {
+      it('REFUSES an unscoped clear: series ids are not unique across groups', async () => {
+        // A set needs --group for the provider vocabulary; a clear needs it for
+        // SCOPE. Unscoped, `tasks update --id X` fans out to every active
+        // session, and two groups can hold the same series id — so an unscoped
+        // clear could unpin a same-named series in a group nobody named.
         const { session_id, series_id } = await pinnedSeries('clr-nogroup', { model: 'sonnet' });
         const upd = await dispatch(
           { id: 'u-nogroup', command: 'tasks-update', args: { id: series_id, model: '' } },
           { caller: 'host' },
         );
-        expect(upd.ok).toBe(true);
-        expect(storedContent(session_id, series_id)).not.toHaveProperty('flagIntent');
+        expect(upd.ok).toBe(false);
+        if (!upd.ok) expect(upd.error.message).toContain('--group is required to set or clear');
+        // The pin is untouched by the refusal.
+        expect(storedContent(session_id, series_id).flagIntent).toEqual({ turnModel: 'sonnet' });
       });
 
       it('an effort clear leaves a model pin standing', async () => {
         const { session_id, series_id } = await pinnedSeries('clr-effort', { model: 'sonnet', effort: 'low' });
         const upd = await dispatch(
-          { id: 'u-effort', command: 'tasks-update', args: { id: series_id, effort: '' } },
+          { id: 'u-effort', command: 'tasks-update', args: { id: series_id, effort: '', group: 'ag-1' } },
           agentCtx('ag-1', 'chat-1'),
         );
         expect(upd.ok).toBe(true);

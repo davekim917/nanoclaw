@@ -695,11 +695,19 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
   const model = normalizeNullableString(args.model);
   const effort = normalizeNullableString(args.effort);
   if (model !== undefined || effort !== undefined) {
-    // Only a SET needs the provider vocabulary; a clear has nothing to
-    // validate, so it does not drag in the `--group` requirement.
+    // `--group` is required for a CLEAR too, not only for a set. A set needs it
+    // to resolve the provider vocabulary; a clear needs it for SCOPE, which is
+    // the separate reason and the one that bites harder. Series ids are unique
+    // within an agent group, not fleet-wide
+    // (`src/modules/scheduling/create.ts:67`, `src/session-manager.ts:428`),
+    // and an unscoped `tasks update --id X` falls back to every active session
+    // (`selectedSessions` below) — so an unscoped clear could silently unpin a
+    // same-named series in another group and report success. Exempting clears
+    // from the requirement (an earlier draft of this change) would have been a
+    // new way to touch a group the operator never named.
+    const group = groupArg(args, ctx);
+    if (!group) throw new Error('--group is required to set or clear --model/--effort');
     if (model || effort) {
-      const group = groupArg(args, ctx);
-      if (!group) throw new Error('--group is required to validate --model/--effort');
       const { flagIntent, error: flagError } = await resolveTaskFlagIntent(
         { model: model ?? undefined, effort: effort ?? undefined },
         { agent_group_id: group },
@@ -1675,13 +1683,13 @@ registerResource({
           name: 'model',
           type: 'string',
           description:
-            'Per-fire model pin, validated against the agent group\'s provider vocabulary. ""/"null"/"none" clears it, so the series falls back to the group\'s own model.',
+            'Per-fire model pin, validated against the agent group\'s provider vocabulary. ""/"null"/"none" clears it, so the series falls back to the group\'s own model. Needs --group either way (auto-filled inside a container): series ids are unique within a group, not fleet-wide.',
         },
         {
           name: 'effort',
           type: 'string',
           description:
-            'Per-fire effort pin, validated against the agent group\'s provider vocabulary. ""/"null"/"none" clears it.',
+            'Per-fire effort pin, validated against the agent group\'s provider vocabulary. ""/"null"/"none" clears it. Needs --group either way.',
         },
       ],
       handler: async (args, ctx) => updateTaskCommand(args, ctx),
