@@ -5932,32 +5932,46 @@ const MANAGED_WORKER_DEFS = [
   'worker-fast.md',
   'worker.md',
   'worker-high.md',
-  'worker-frontier.md',
   'worker-codex.md',
   // Retired: renamed to worker-high.md so the tier name describes the rung
   // rather than a Claude model (the same def is gpt-5.6-sol on Codex). Listed
   // so groups that already have the old file get it pruned on next spawn.
   'worker-opus.md',
+  // Retired: trunk no longer ships a worker def at all. Delegation is the
+  // bootstrap orchestrate plugin's effort shims, which reach a container
+  // through the plugin mount, not through this copy. Listed — not deleted —
+  // because every group on this install already has the file in
+  // `.claude-shared/agents/`, and this list is the only thing that removes it.
+  'worker-frontier.md',
 ];
 
 /**
  * Copy trunk worker subagent defs (container/agents/*.md) into
- * .claude-shared/agents/ — the container's ~/.claude/agents — so every Claude
- * group gets the native frontier worker. Cross-provider work uses the direct
- * CLI helper, without a wrapper agent. Copies, not symlinks: agent discovery
- * through dangling host symlinks is unverified, and the files are tiny.
- * Trunk is canonical: a managed def absent from the current trunk set is
- * pruned; operator-added defs (never in MANAGED_WORKER_DEFS) are untouched. A
- * group can shadow a trunk def with a same-name file in
+ * .claude-shared/agents/ — the container's ~/.claude/agents. Copies, not
+ * symlinks: agent discovery through dangling host symlinks is unverified, and
+ * the files are tiny. Trunk is canonical: a managed def absent from the current
+ * trunk set is pruned; operator-added defs (never in MANAGED_WORKER_DEFS) are
+ * untouched. A group can shadow a trunk def with a same-name file in
  * groups/<folder>/.claude/agents/ (project scope outranks user scope).
+ *
+ * Trunk currently ships NO defs, so in practice this only prunes. That is why
+ * a missing `container/agents/` is not an early return: git does not track an
+ * empty directory, so deleting the last def deletes the directory, and an early
+ * return there would leave every group's retired copy in place forever — the
+ * exact file the list above exists to remove.
  */
 function syncWorkerAgentDefs(claudeDir: string): void {
   const srcDir = path.join(process.cwd(), 'container', 'agents');
-  if (!fs.existsSync(srcDir)) return;
   const dstDir = path.join(claudeDir, 'agents');
   fs.mkdirSync(dstDir, { recursive: true });
 
-  const current = new Set(fs.readdirSync(srcDir).filter((e) => e.endsWith('.md')));
+  let current: Set<string>;
+  try {
+    current = new Set(fs.readdirSync(srcDir).filter((e) => e.endsWith('.md')));
+  } catch {
+    // No trunk def dir — nothing to copy, everything managed gets pruned.
+    current = new Set<string>();
+  }
   // Prune managed defs retired from trunk. Names are compile-time constants,
   // so no traversal is possible even though dstDir is container-writable.
   for (const name of MANAGED_WORKER_DEFS) {

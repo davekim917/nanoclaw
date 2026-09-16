@@ -5,15 +5,3 @@
 # turn the file into a merge minefield. Regenerate it, never format it:
 #   pnpm run ratchet:report -- --write
 src/upstream-ratchet.json
-
-# The vendored worker policy is generated twice from one render
-# (renderWorkerPolicyModule in src/workflow-agent-vendor.ts) — once here and
-# once into container/agent-runner/src/, which is a separate Bun tree prettier
-# never sees. Both copies are fingerprinted under ONE hash, so the two files
-# must be the same bytes. The renderer encodes its values with JSON.stringify
-# (double quotes) because a generator writes structured output through an
-# encoder, never a quote-pasting template; formatting this copy to singleQuote
-# breaks the byte-identity and every drift test that rests on it. Regenerate it,
-# never format it:
-#   pnpm exec tsx scripts/vendor-workflow-agent.ts
-src/worker-policy.vendored.ts

@@ -64,28 +64,25 @@ The coordinator never launches the other provider through a wrapper; ask the
 paired challenger for the independent cross-family pass instead.
 
 **Dispatch and effort are runtime settings.** Start the owner with the installed
-native QA profile, or with the installed Bootstrap `frontier-worker.mjs` helper
-when explicit CLI effort/resume is needed. Read the installed `orchestrate`
-skill to resolve its helper path. Give a helper-started owner the full installed
-QA role body, this skill, standing instructions, exact scope and authority in
-its stdin brief; the helper does not select the QA role automatically.
-Use `--runtime claude --effort medium --model 'claude-fable-5-1[1m]'` or
-`--runtime codex --effort medium --model gpt-6-astra`, plus the actual working
-directory via `--cwd`. An explicit effort change uses the helper's `--effort`
-on the same CLI session's `--resume`, or a verified supported native runtime
-field. Claude native Agent has no effort input; use the installed medium
-profile or the helper's child-scoped `CLAUDE_CODE_EFFORT_LEVEL`. Do not set a
+native QA profile, or with a scoped CLI invocation of the provider when an
+explicit effort or an exact-session resume is needed. Give a CLI-started owner
+the full installed QA role body, this skill, standing instructions, exact scope
+and authority in its stdin brief; nothing selects the QA role for you.
+Use `CLAUDE_CODE_EFFORT_LEVEL=medium claude -p --model 'claude-fable-5-1[1m]' --effort medium`
+or `codex exec -m gpt-6-astra -c model_reasoning_effort=medium`, run from the
+actual working directory. An explicit effort change repeats the flag on the
+same CLI session's resume, or uses a verified supported native runtime field.
+Claude's native Agent tool has no per-call effort input; use the installed
+medium profile or a child-scoped `CLAUDE_CODE_EFFORT_LEVEL`. Do not set a
 fleet-wide environment override, describe effort only in prose, or silently
-switch models. The helper applies these flags in
-`/workspace/plugins/bootstrap/plugins/workflow-agents/scripts/frontier-worker.mjs`
-(`invocation`); it adds no permission bypass.
+switch models. A scoped CLI invocation adds no permission bypass.
 
 Record default, requested and actual model/effort separately in the existing
 run record, plus transport, parent session, runtime home, owner handle, and
 assigned scope. Mark unavailable runtime metadata unverified. Retain the same
 owner for corrections and remaining work. Native handles resume only through
-the spawning parent; the helper accepts only its own CLI UUID with the same
-runtime home and accessible history. A matching home path in another container
+the spawning parent; a CLI session resumes only on its own session UUID with
+the same runtime home and accessible history. A matching home path in another container
 is insufficient: NanoClaw mounts per-session Claude project history
 (`src/session-claude-mounts.ts:56`), and provider session state may be isolated.
 Do not copy credentials or histories across those boundaries.

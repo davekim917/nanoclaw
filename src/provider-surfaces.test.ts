@@ -54,7 +54,6 @@ import {
   registerProviderContainerConfig,
   type ProviderContainerContribution,
 } from './providers/provider-container-registry.js';
-import { WORKER_POLICY_CODEX_EFFORT } from './worker-policy.vendored.js';
 
 import type { ContainerConfig } from './container-config.js';
 import type { AgentGroup, Session } from './types.js';
@@ -300,13 +299,13 @@ describe('container instruction contracts', async () => {
         `If it was reshaped, update this test to match — it is the only thing keeping it in sync with ` +
         `buildContainerCodexConfig() in src/providers/codex.ts. ${PARALLEL_IMPL_NOTE}`,
     ).not.toBeNull();
-    // The literal is evaluated in a bare scope, so every free identifier it uses
-    // must be supplied here. Today that is the vendored worker policy — and both
-    // sides read the SAME constant, which is the point: the host and container
-    // configs cannot name different Codex subagent efforts.
-    const containerBase = new Function('WORKER_POLICY_CODEX_EFFORT', `return ${literal![1]}`)(
-      WORKER_POLICY_CODEX_EFFORT,
-    ) as string;
+    // The literal is evaluated in a BARE scope, so it may reference no free
+    // identifier at all. It has none today — `default_subagent_reasoning_effort`
+    // is a plain string on both sides since the vendored worker-policy constant
+    // was deleted — and this call is what keeps it that way: a new free binding
+    // in the container literal throws a ReferenceError here rather than
+    // quietly letting the two configs name different Codex subagent efforts.
+    const containerBase = new Function(`return ${literal![1]}`)() as string;
 
     // Comments differ by design (each names its own generating file); every
     // other line must match exactly, in order, in both directions.
@@ -1331,7 +1330,16 @@ describe('buildMounts agent surfaces', async () => {
 });
 
 describe('worker agent def sync (orchestrator roster)', async () => {
-  it('copies trunk defs for a claude spawn, prunes retired managed defs, preserves operator files', async () => {
+  const MANAGED_DEFS = [
+    'worker-fast.md',
+    'worker.md',
+    'worker-high.md',
+    'worker-opus.md',
+    'worker-codex.md',
+    'worker-frontier.md',
+  ];
+
+  it('prunes every managed def when trunk ships none, and preserves operator files', async () => {
     const ag = group('ag-worker-defs', 'worker-defs');
     await createAgentGroup(ag);
     withWorkgroup(ag);
@@ -1339,45 +1347,34 @@ describe('worker agent def sync (orchestrator roster)', async () => {
     initGroupFilesystem(ag, {});
 
     const agentsDir = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared', 'agents');
-    // Seed: an operator-owned def plus a currently-shipping managed def that a
-    // later trunk revision could retire (worker-codex stands in — it IS in
-    // MANAGED_WORKER_DEFS, so if trunk dropped it, the prune must remove it).
+    // Seed: an operator-owned def, a specialized def, and every managed name
+    // this feature has ever shipped. Trunk ships no worker def at all now —
+    // delegation roles reach a container through the bootstrap plugin mount —
+    // so the whole managed set must go, `worker-frontier.md` included. Every
+    // group on this install has that file today; this prune is the only thing
+    // that removes it.
     fs.mkdirSync(agentsDir, { recursive: true });
     fs.writeFileSync(path.join(agentsDir, 'custom-op.md'), 'operator-owned\n');
-    for (const retired of ['worker-fast.md', 'worker.md', 'worker-high.md', 'worker-opus.md', 'worker-codex.md']) {
+    for (const retired of MANAGED_DEFS) {
       fs.writeFileSync(path.join(agentsDir, retired), 'old managed definition\n');
     }
     fs.writeFileSync(path.join(agentsDir, 'impeccable-reviewer.md'), 'specialized definition\n');
 
     await buildMounts(ag, session('s-wd', ag.id), containerConfig(), 'claude', {});
 
-    // Trunk roster copied byte-for-byte.
-    for (const def of ['worker-frontier.md']) {
-      expect(fs.readFileSync(path.join(agentsDir, def), 'utf-8')).toBe(
-        fs.readFileSync(path.join(process.cwd(), 'container', 'agents', def), 'utf-8'),
-      );
-    }
     // Operator file untouched.
     expect(fs.readFileSync(path.join(agentsDir, 'custom-op.md'), 'utf-8')).toBe('operator-owned\n');
-    for (const retired of ['worker-fast.md', 'worker.md', 'worker-high.md', 'worker-opus.md', 'worker-codex.md']) {
-      expect(fs.existsSync(path.join(agentsDir, retired))).toBe(false);
+    for (const retired of MANAGED_DEFS) {
+      expect(fs.existsSync(path.join(agentsDir, retired)), `${retired} should have been pruned`).toBe(false);
     }
     expect(fs.readFileSync(path.join(agentsDir, 'impeccable-reviewer.md'), 'utf8')).toBe('specialized definition\n');
-    // The def must pin a 1M-suffixed model and an explicit effort — invariants
-    // carried by the regexes, so the tier itself stays DERIVED from trunk. A
-    // hardcoded tier (Fable/medium until #813) fails CI on every roster move
-    // while adding nothing to the byte-identity check above.
-    const frontierWorker = fs.readFileSync(path.join(agentsDir, 'worker-frontier.md'), 'utf-8');
-    const trunkDef = fs.readFileSync(path.join(process.cwd(), 'container', 'agents', 'worker-frontier.md'), 'utf-8');
-    const modelLine = /^model: \S+\[1m\]$/m.exec(trunkDef)?.[0];
-    const effortLine = /^effort: (?:low|medium|high|xhigh|max)$/m.exec(trunkDef)?.[0];
-    expect(modelLine, 'trunk def must pin a 1M-suffixed model').toBeDefined();
-    expect(effortLine, 'trunk def must pin an explicit effort').toBeDefined();
-    expect(frontierWorker).toContain(modelLine);
-    expect(frontierWorker).toContain(effortLine);
-    expect(frontierWorker).toContain('including investigation, technical decisions');
-    expect(frontierWorker).toContain('do not spawn a wrapper agent');
-    expect(frontierWorker).toContain('foreground-attached for cancellation');
+    // Trunk must really ship nothing: a def re-added to container/agents/ is a
+    // roster this prune would then have to copy rather than remove, and the
+    // assertions above would silently stop meaning what they say.
+    const trunkDefs = fs.existsSync(path.join(process.cwd(), 'container', 'agents'))
+      ? fs.readdirSync(path.join(process.cwd(), 'container', 'agents')).filter((e) => e.endsWith('.md'))
+      : [];
+    expect(trunkDefs, 'container/agents/ must stay empty — delegation ships in the plugin').toEqual([]);
     // The retired always-on roster fragment stays absent.
     expect(
       fs.existsSync(

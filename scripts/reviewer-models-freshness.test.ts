@@ -1,13 +1,12 @@
 /**
  * Drift tripwire for container/skills/pr-review-loop/reviewer-models.txt: it is
- * generated from the frontier config (container/agents/worker-frontier.md
- * `model:` frontmatter and CODEX_WORKER_MODELS), not hand-maintained. If a tier
- * model changes without regenerating the file, the merge gate's reviewer
- * allowlist silently goes stale — this test fails the same way on the next
- * test run instead.
+ * generated from the roster in scripts/reviewer-models.ts, not hand-maintained
+ * at the artifact. If a tier model changes there without regenerating the file,
+ * the merge gate's reviewer allowlist silently goes stale — this test fails the
+ * same way on the next test run instead.
  *
- * Split out from reviewer-models.test.ts (which covers correctness — parsing
- * edge cases, alias rejection) on purpose: this file's ONLY failure mode is
+ * Split out from reviewer-models.test.ts (which covers correctness — the
+ * roster's contents, alias rejection) on purpose: this file's ONLY failure mode is
  * "the committed artifact is stale, regenerate it" (VITEST_LANE=drift, see
  * vitest.config.ts's DRIFT_TESTS), never "the code is broken". Mixing the two
  * into one file would make a real parsing bug in reviewer-models.ts read as
@@ -20,7 +19,7 @@ import { computeReviewerModelIds, REVIEWER_MODELS_OUTPUT_PATH, renderReviewerMod
 
 const REGEN_HINT = 'pnpm run reviewer-models -- --write';
 
-describe('reviewer-models.txt matches the frontier config', () => {
+describe('reviewer-models.txt matches the reviewer roster', () => {
   it('the generated file is exactly what computeReviewerModelIds produces', () => {
     const ids = computeReviewerModelIds();
     const expected = renderReviewerModelsFile(ids);

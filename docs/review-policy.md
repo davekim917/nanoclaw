@@ -35,12 +35,11 @@ own change. A substitute review still triages findings under this policy and
 does not relax required CI, holds, or merge authorization.
 
 The substitute, like every review (a delta check after a rebase or ratchet
-regeneration, adversarial verification, a gap analysis), uses the native
-`worker-frontier`: Claude's `model:` frontmatter or Codex's
-`CODEX_WORKER_MODELS['worker-frontier']` (`src/claude-agent-md.ts`). High is the default worker effort; the default worker is `claude-opus-5` on Claude and `gpt-5.6-sol` on Codex.
-An explicit task override must use a runtime field or the
-scoped CLI helper described in `docs/frontier-worker-trial.md`, never prompt
-wording. The allowed ids are generated from the frontier configuration plus explicit
+regeneration, adversarial verification, a gap analysis), runs on a frontier
+model: `claude-opus-5` on Claude, `gpt-5.6-sol` on Codex, both at `high`
+effort. Effort is a runtime setting — a native spawn's own field, or a scoped
+CLI invocation — never prompt wording. The allowed ids are the roster in
+`scripts/reviewer-models.ts` plus explicit
 receipt compatibility for prior `claude-fable-5-1` and `gpt-6-astra` reviewers.
 Those IDs remain accepted so unchanged exact-head evidence survives this
 roster migration; they are not new dispatch defaults. The existing gate
@@ -54,8 +53,10 @@ an approving receipt whose first word isn't allowed does not unlock a merge.
 The reviewer reports its **exact model id from its own runtime** — a Claude
 subagent from its system prompt, Codex from the `-m` it ran with or
 `codex exec`'s session metadata — as that first word, and the receipt's `--reviewer`
-copies it verbatim, e.g. `claude-opus-5 (worker-frontier)` or
-`gpt-5.6-sol high (codex exec)`. Nobody has to be free for this: the author
+copies it verbatim, e.g. `claude-opus-5 (opus)` or
+`gpt-5.6-sol high (codex exec)`. Only that first word is checked, so a receipt
+written under an older parenthetical — `claude-opus-5 (worker-frontier)` — is
+still honoured on the head it was posted against. Nobody has to be free for this: the author
 may start that reviewer as a fresh process
 (`codex exec -m gpt-5.6-sol -c model_reasoning_effort=high`, or
 `CLAUDE_CODE_EFFORT_LEVEL=high claude -p --model 'claude-opus-5[1m]' --effort high`) and hand it the inputs above.
@@ -64,73 +65,43 @@ Record a durable review receipt tied to the exact final SHA: reviewer and
 runtime, complete-diff and relevant-file scope, outcome, and every finding with
 its disposition. A local completion claim is not substitute-review coverage.
 
-## Changing the worker policy
+## Changing who may review
 
-The roster above — which model the frontier worker runs and at what effort — is
-**not owned by this repo**. It lives in one hand-edited file in the bootstrap
-plugin, `plugins/workflow/worker-policy.json` (`~/plugins/bootstrap`), and
-everything mechanical on both sides is rendered from it. NanoClaw is a consumer:
-`CODEX_WORKER_MODELS`, the vendor manifest's `codexModel`, and the container
-config's `[agents].default_subagent_reasoning_effort` all read
-`src/worker-policy.vendored.ts`, which only the vendor script writes.
+There is no longer a worker-policy file, in this repo or in the bootstrap
+plugin. The plugin ships delegation as effort shims that inherit the caller's
+model, so nothing in a live config names a concrete frontier model any more,
+and nothing can be derived from one. Two places state a model or an effort, and
+they are independent of each other:
 
-Flipping it — for an experiment or for good — is four steps, in this order:
+- **Who may review.** The roster in `scripts/reviewer-models.ts`
+  (`FRONTIER_MODELS`, plus the fixed Fable/Astra receipt-compatibility ids).
+  Edit it, run `pnpm run reviewer-models -- --write`, commit the regenerated
+  `container/skills/pr-review-loop/reviewer-models.txt`.
+  `scripts/reviewer-models-freshness.test.ts` fails if you skip the regen, and
+  `assertConcreteModelId` refuses an alias, so the allowlist can never come to
+  mean "whatever the runtime defaults to today".
+- **What a Codex subagent runs at.** The GLOBAL
+  `[agents].default_subagent_reasoning_effort` in the generated container
+  config, written identically by `src/providers/codex.ts` and
+  `container/agent-runner/src/codex-companion-setup.ts`. A native spawn's own
+  `reasoning_effort` overrides it per task.
+  `src/providers/codex.container-config.test.ts` and
+  `container/agent-runner/src/codex-companion-setup.test.ts` assert the
+  rendered line verbatim — deliberately literals, not a shared constant read
+  back, since an oracle reading the same constant as the code can never
+  disagree with it (the recurring `mutation coverage` lesson in
+  `docs/review-notes.md`). `src/provider-surfaces.test.ts` proves the host and
+  container renders agree.
 
-1. In `~/plugins/bootstrap`, edit `plugins/workflow/worker-policy.json`, run
-   `node plugins/workflow-agents/scripts/sync-agent-skills.mjs`, then
-   `node scripts/check-parity.mjs`. The gate names every prose surface that
-   still states the old policy; fix those by hand. Commit, PR, merge.
-2. Here, `pnpm exec tsx scripts/vendor-workflow-agent.ts`. It refuses if the
-   plugin is mid-flip — its policy file disagreeing with the generated Codex
-   role TOML **or** with the Claude def's `model:`/`effort:` frontmatter, which
-   is the half that decides Claude dispatch — so a half-landed plugin change
-   cannot be vendored, and nothing is written before both checks pass.
-3. `pnpm test`, then work its failures. They are the flip's checklist, not
-   accidents:
-   - `src/workflow-agent-vendor.test.ts` proves the vendored module is the
-     current render of the policy.
-   - `scripts/dispatch-default-docs.test.ts` fails by name every
-     dispatch-policy doc still carrying the old default sentence. Fix them,
-     including the paragraph above.
-   - `scripts/reviewer-models-freshness.test.ts` fails because the reviewer
-     allowlist derives from the same frontier config (see below). Run
-     `pnpm run reviewer-models -- --write`.
-   - Three tests **pin the current policy as literals, deliberately**, and a
-     flip must edit them by hand:
-     `src/claude-agent-md.test.ts`'s "pins Sol without an effort field…",
-     `src/providers/codex.container-config.test.ts` and
-     `container/agent-runner/src/codex-companion-setup.test.ts`, which both
-     assert the rendered `default_subagent_reasoning_effort` line verbatim.
-     They are not oversights left over from the constants refactor and must not
-     be rewritten to read `src/worker-policy.vendored.ts`: an oracle that reads
-     the same constant as the code can never disagree with it (the recurring
-     `mutation coverage` lesson in `docs/review-notes.md`), and host/container
-     agreement is already proved from the constant by
-     `src/provider-surfaces.test.ts`. The literal is the independent statement
-     of what the policy is today, and a flip is supposed to be a visible edit
-     to it.
-4. PR, merge, deploy. **Containers pin the role at spawn**, so nothing changes
-   for a running agent until its container restarts on the new image.
-
-Step 2 is not optional and cannot be shortcut by editing
-`src/worker-policy.vendored.ts` directly: the file is fingerprinted in
-`src/workflow-agent-vendor.manifest.json`, and only the vendor script — which
-needs the plugin repo — refreshes that fingerprint. A hand edit fails on every
-machine, CI included.
+Dropping an id from the reviewer roster costs that model receipt eligibility
+immediately, including on heads already receipted, unless it is one of the two
+compatibility ids. That is the reason the compatibility ids exist.
 
 **Which reviewer is dispatched** is not a policy question — a reviewer is chosen
-for independence from the artifact's author, not for the worker tier, and the
-plugin's own cross-model review lane pins its models deliberately rather than
-deriving them from this file. **Who is eligible to review is not independent of
-it.** `scripts/reviewer-models.ts` builds
-`container/skills/pr-review-loop/reviewer-models.txt` from exactly two live
-inputs — `container/agents/worker-frontier.md`'s `model:` frontmatter and
-`CODEX_WORKER_MODELS` — plus the fixed Fable/Astra receipt-compatibility ids
-(`computeReviewerModelIds`, `scripts/reviewer-models.ts:107-121`). Both live
-inputs now trace back to the policy file, so a flip moves the allowlist with it:
-the model being flipped away from stops being receipt-eligible unless it is one
-of the two compatibility ids. That is why step 3 regenerates the file rather
-than leaving it to the next PR to notice.
+for independence from the artifact's author, not for a worker tier.
+
+Containers read the generated config at spawn, so an effort change reaches a
+running agent only when its container restarts on the new image.
 
 ## Review notes and fix links
 

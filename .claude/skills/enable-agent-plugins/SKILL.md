@@ -13,8 +13,8 @@ Codex/OpenCode. Hook delivery is **conditional, and the condition is the manifes
 Claude always fires a plugin's SessionStart hook, Codex fires it only for a plugin it
 can register — one shipping `.codex-plugin/plugin.json` that declares a hook — and
 OpenCode has no plugin loader, so no hook path at all. A Codex-registerable plugin
-that declares no hook (bootstrap's `orchestrate-agents` today) still needs the
-operator override below.
+that declares no hook (bootstrap's `orchestrate` today, which ships both
+manifests) still needs the operator override below.
 
 ## Scope: container agent groups only — never a host CLI
 
