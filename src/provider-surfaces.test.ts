@@ -1265,6 +1265,16 @@ describe('buildMounts agent surfaces', async () => {
       // And the same absent descendant WITHOUT the covering ancestor still
       // refuses, so this is a normalization change and not a relaxation.
       await expect(build(['bootstrap/plugins/absent'])).rejects.toThrow(/do not exist under/);
+
+      // The other covering shape: the ancestor is itself a SUB-PATH.
+      // `splitExcludedPlugins` resolves that through its prefix loop, not
+      // through `topLevel`, so a regression that only honoured top-level
+      // coverage would pass the pair above and fail here.
+      const subAncestor = await build(['bootstrap/plugins', 'bootstrap/plugins/absent']);
+      expect(subAncestor.map((m) => m.containerPath)).toContain('/workspace/plugins/bootstrap');
+      // ...and when the sub-path ancestor itself is absent, nothing covers
+      // either entry and the spawn still refuses.
+      await expect(build(['bootstrap/absent', 'bootstrap/absent/deeper'])).rejects.toThrow(/do not exist under/);
     } finally {
       homedirSpy.mockRestore();
     }

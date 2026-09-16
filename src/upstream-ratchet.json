@@ -903,7 +903,7 @@
 "src/platform-id.ts":{"diff":9,"mode":"100644","sha256":"9c480223f688b784fce277021502d33e00ee790602413f72a8372037dd5d2fb9"},
 "src/project-doc-compose.test.ts":{"diff":389,"mode":"100644","sha256":null,"deleted":true},
 "src/project-doc-compose.ts":{"diff":271,"mode":"100644","sha256":null,"deleted":true},
-"src/provider-surfaces.test.ts":{"diff":1532,"mode":"100644","sha256":"35d40a5c1773d35eb1e3a917b839b7eea4982eafeeffb78611cebc4a76cb550a"},
+"src/provider-surfaces.test.ts":{"diff":1542,"mode":"100644","sha256":"b5cdabf27a25c482bcaf0cb676e794132c037b5ae250c1a6390b2ae89e2b2f17"},
 "src/providers/claude.ts":{"diff":0,"mode":"100644","sha256":"e2f264518e5714e97577e085048d2b1a493a8be8ed6044922b779f9e40a9fd60"},
 "src/providers/index.ts":{"diff":3,"mode":"100644","sha256":"61b3aacf3e4be86ca6763efc28a25a68ffe11605f4972c84bf08fa4d79cafc10"},
 "src/providers/provider-container-registry.ts":{"diff":33,"mode":"100644","sha256":"51b9ffbf202008feecdcdeb400999e7c0acd315560bd8d4c7b59a0755ad332bd"},
