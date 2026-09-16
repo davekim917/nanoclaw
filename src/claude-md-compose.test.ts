@@ -864,6 +864,42 @@ describe("sub-plugin always-on: the plugin's own always-on.md (OpenCode only)", 
     }
   });
 
+  it('refuses a sub-plugin whose CODEX manifest does not parse or carries no name', async () => {
+    // Each manifest is held to its own walker's rule. Codex registers the
+    // manifest's `name`, so one that cannot be read is not a plugin to Codex —
+    // and must not be one here either.
+    const home = seedBootstrapPlugin(null);
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    for (const [sub, manifest, sentinel] of [
+      ['codex-broken', '{ not json', 'SENTINEL_CODEX_BROKEN_7c1d'],
+      ['codex-nameless', JSON.stringify({ description: 'no name' }), 'SENTINEL_CODEX_NAMELESS_2a6b'],
+      ['codex-blank', JSON.stringify({ name: '   ' }), 'SENTINEL_CODEX_BLANK_9e4f'],
+    ] as const) {
+      const dir = path.join(repo, 'plugins', sub);
+      fs.mkdirSync(path.join(dir, '.codex-plugin'), { recursive: true });
+      fs.writeFileSync(path.join(dir, '.codex-plugin', 'plugin.json'), manifest);
+      fs.writeFileSync(path.join(dir, 'always-on.md'), `${sentinel}\n`);
+    }
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-badcodex', 'sub-badcodex');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+      const doc = agentsDoc(ag.folder);
+      for (const sentinel of [
+        'SENTINEL_CODEX_BROKEN_7c1d',
+        'SENTINEL_CODEX_NAMELESS_2a6b',
+        'SENTINEL_CODEX_BLANK_9e4f',
+      ]) {
+        expect(doc).not.toContain(sentinel);
+      }
+      expect(doc).toContain(ORCHESTRATE_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
   it('keeps a repo-root ruleset that a SUB-PATH exclusion does not name — only a top-level entry withholds it', async () => {
     // The seam #828 recorded, pinned as behaviour rather than left implicit. A
     // sub-path entry withholds the SUB-PLUGIN's own file; the repo root's file
