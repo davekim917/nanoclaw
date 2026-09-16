@@ -168,6 +168,32 @@ function normalizeToolMessageText(
   return { text: envelope };
 }
 
+// Mirrors the host's THREAD_KEY_PATTERN (src/db/thread-key-anchors.ts), which
+// re-checks every row: the runner's check is for a useful error, the host's is
+// the one that holds.
+const THREAD_KEY_MAX_LENGTH = 128;
+const THREAD_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
+const THREAD_KEY_DESCRIPTION =
+  'Optional stable id for ONE incident or topic (e.g. "db-backup-job-42-since-run-9001"). First post with a key is a new top-level post; later posts with the SAME key — any fire, any day — go in that post\'s thread; a NEW key is a new top-level post, so mint a new key when an incident ends and another begins. Omit for ordinary messages. Letters, digits, . _ : - only; max 128 chars. No effect when posting into the current conversation\'s thread.';
+
+/** Validate an optional thread_key argument. Blank or absent → no key. Exported for tests. */
+export function parseThreadKey(raw: unknown): { threadKey: string | null } | { error: string } {
+  if (raw === undefined || raw === null) return { threadKey: null };
+  if (typeof raw !== 'string') return { error: 'thread_key must be a string' };
+  const key = raw.trim();
+  if (!key) return { threadKey: null };
+  if (key.length > THREAD_KEY_MAX_LENGTH) {
+    return { error: `thread_key is too long (${key.length} characters, max ${THREAD_KEY_MAX_LENGTH})` };
+  }
+  if (!THREAD_KEY_PATTERN.test(key)) {
+    return {
+      error: 'thread_key may contain only letters, digits, and . _ : - and must start with a letter or digit',
+    };
+  }
+  return { threadKey: key };
+}
+
 /**
  * Resolve a destination name to routing fields.
  *
@@ -241,6 +267,7 @@ export const sendMessage: McpToolDefinition = {
           description: 'Destination name (e.g., "family", "worker-1"). Optional when replying in this conversation.',
         },
         text: { type: 'string', description: 'Message content' },
+        thread_key: { type: 'string', description: THREAD_KEY_DESCRIPTION },
       },
       required: ['text'],
     },
@@ -252,6 +279,9 @@ export const sendMessage: McpToolDefinition = {
     if ('error' in normalized) return err(normalized.error);
     const text = normalized.text;
     if (!text) return err('text is required');
+
+    const key = parseThreadKey(args.thread_key);
+    if ('error' in key) return err(key.error);
 
     const routing = resolveRouting(args.to as string | undefined);
     if ('error' in routing) return err(routing.error);
@@ -266,7 +296,7 @@ export const sendMessage: McpToolDefinition = {
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
       thread_id: routing.thread_id,
-      content: JSON.stringify({ text }),
+      content: JSON.stringify(key.threadKey ? { text, threadKey: key.threadKey } : { text }),
     });
 
     log(`send_message: #${seq} → ${routing.resolvedName}`);
@@ -286,6 +316,7 @@ export const sendFile: McpToolDefinition = {
         path: { type: 'string', description: 'File path (relative to /workspace/agent/ or absolute)' },
         text: { type: 'string', description: 'Optional accompanying message' },
         filename: { type: 'string', description: 'Display name (default: basename of path)' },
+        thread_key: { type: 'string', description: THREAD_KEY_DESCRIPTION },
       },
       required: ['path'],
     },
@@ -303,6 +334,9 @@ export const sendFile: McpToolDefinition = {
       if ('error' in normalized) return err(normalized.error);
       caption = normalized.text;
     }
+
+    const key = parseThreadKey(args.thread_key);
+    if ('error' in key) return err(key.error);
 
     const denial = chatSendDenial();
     if (denial) return err(denial);
@@ -359,7 +393,11 @@ export const sendFile: McpToolDefinition = {
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
       thread_id: routing.thread_id,
-      content: JSON.stringify({ text: caption, files: [filename] }),
+      content: JSON.stringify(
+        key.threadKey
+          ? { text: caption, files: [filename], threadKey: key.threadKey }
+          : { text: caption, files: [filename] },
+      ),
     });
 
     log(`send_file: ${id} → ${routing.resolvedName} (${filename}), awaiting host ack`);

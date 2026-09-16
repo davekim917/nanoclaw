@@ -19,7 +19,7 @@ import path from 'path';
 import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
-import { editMessage, sendFile, sendMessage, isAllowedFilePath } from './core.js';
+import { editMessage, sendFile, sendMessage, isAllowedFilePath, parseThreadKey } from './core.js';
 
 /**
  * Publish the a2a reply stamp the way the poll loop does: a direct write to
@@ -114,6 +114,63 @@ describe('send_message MCP tool — default replies in the current conversation'
     expect(out).toHaveLength(1);
     expect(out[0].platform_id).toBe('slack:DTEST00009');
     expect(out[0].thread_id).toBeNull();
+  });
+});
+
+describe('send_message / send_file MCP tools — thread_key', () => {
+  it('parseThreadKey accepts a trimmed safe key and treats blank or absent as no key', () => {
+    expect(parseThreadKey(undefined)).toEqual({ threadKey: null });
+    expect(parseThreadKey(null)).toEqual({ threadKey: null });
+    expect(parseThreadKey('   ')).toEqual({ threadKey: null });
+    expect(parseThreadKey('  dbt-job-30294-run-9001 ')).toEqual({ threadKey: 'dbt-job-30294-run-9001' });
+    expect(parseThreadKey('a.b_c:d-1')).toEqual({ threadKey: 'a.b_c:d-1' });
+    expect(parseThreadKey('k'.repeat(128))).toEqual({ threadKey: 'k'.repeat(128) });
+  });
+
+  it('parseThreadKey refuses a non-string, an over-long key, an unsafe charset, and a leading separator', () => {
+    expect(parseThreadKey(42)).toHaveProperty('error');
+    expect(parseThreadKey('k'.repeat(129))).toHaveProperty('error');
+    expect(parseThreadKey('has space')).toHaveProperty('error');
+    expect(parseThreadKey('slash/key')).toHaveProperty('error');
+    expect(parseThreadKey('emoji-🔥')).toHaveProperty('error');
+    expect(parseThreadKey('-leading')).toHaveProperty('error');
+  });
+
+  it('send_message serialises the trimmed key into content as threadKey', async () => {
+    await sendMessage.handler({ to: 'peer', text: 'job failed', thread_key: ' dbt-job-1-run-7 ' });
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content)).toEqual({ text: 'job failed', threadKey: 'dbt-job-1-run-7' });
+  });
+
+  it('send_message without a key writes exactly the pre-feature content', async () => {
+    await sendMessage.handler({ to: 'peer', text: 'hello' });
+
+    expect(getUndeliveredMessages()[0].content).toBe(JSON.stringify({ text: 'hello' }));
+  });
+
+  it('send_message refuses an invalid key and writes nothing', async () => {
+    const result = await sendMessage.handler({ to: 'peer', text: 'hello', thread_key: 'no spaces allowed' });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('thread_key');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('send_file refuses an invalid key before staging anything', async () => {
+    const result = await sendFile.handler({ to: 'peer', path: '/nonexistent/report.txt', thread_key: 'k'.repeat(200) });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('thread_key');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('both tools advertise thread_key as optional', () => {
+    for (const t of [sendMessage, sendFile]) {
+      expect(t.tool.inputSchema.properties).toHaveProperty('thread_key');
+      expect(t.tool.inputSchema.required).not.toContain('thread_key');
+    }
   });
 });
 
@@ -351,6 +408,46 @@ describe('send_file MCP tool — caption envelope normalization', () => {
       const result = await handlerPromise;
       expect(result.isError).toBeUndefined();
       expect(result.content[0].text).toContain('delivered to peer');
+    } finally {
+      mkdirSpy.mockRestore();
+      writeFileSpy.mockRestore();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('send_file MCP tool — thread_key on a successful delivery', () => {
+  it('serialises the key into the staged row alongside the file', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-send-file-key-'));
+    const filePath = path.join(tmpDir, 'incident.txt');
+    // Distinct bytes from every other send_file test: the handler dedups by content hash per process.
+    fs.writeFileSync(filePath, `incident evidence ${Date.now()}`);
+
+    const realMkdirSync = fs.mkdirSync.bind(fs);
+    const realWriteFileSync = fs.writeFileSync.bind(fs);
+    const mkdirSpy = spyOn(fs, 'mkdirSync').mockImplementation((target, opts) => {
+      if (typeof target === 'string' && target.startsWith('/workspace/outbox')) return undefined;
+      return realMkdirSync(target, opts as never);
+    });
+    const writeFileSpy = spyOn(fs, 'writeFileSync').mockImplementation((target, data, opts) => {
+      if (typeof target === 'string' && target.startsWith('/workspace/outbox')) return undefined;
+      return realWriteFileSync(target, data as never, opts as never);
+    });
+
+    try {
+      const handlerPromise = sendFile.handler({ to: 'peer', path: filePath, text: 'log', thread_key: 'inc-7' });
+      let out = getUndeliveredMessages();
+      for (let i = 0; i < 100 && out.length === 0; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        out = getUndeliveredMessages();
+      }
+      expect(out).toHaveLength(1);
+      expect(JSON.parse(out[0].content)).toEqual({ text: 'log', files: ['incident.txt'], threadKey: 'inc-7' });
+
+      getInboundDb()
+        .prepare("INSERT INTO delivered (message_out_id, status, delivered_at) VALUES (?, 'delivered', ?)")
+        .run(out[0].id, new Date().toISOString());
+      expect((await handlerPromise).isError).toBeUndefined();
     } finally {
       mkdirSpy.mockRestore();
       writeFileSpy.mockRestore();

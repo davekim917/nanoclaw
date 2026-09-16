@@ -481,6 +481,27 @@ CREATE TABLE host_inbound_provenance (
 
 ---
 
+### 1.21 `thread_key_anchors`
+
+Where each agent-named incident or topic key's first post landed, so later posts under the same key thread beneath it. Written and read only by delivery (`src/delivery.ts` via `src/db/thread-key-anchors.ts`) for outbound rows whose content carries `threadKey` (set by `send_message`/`send_file`'s `thread_key`). Added by migration 081.
+
+No rotation: `created_at` is informational. `last_used_at` moves on every post under the key; a key unused for 30 days (`THREAD_KEY_RETENTION_MS`) reads as absent, and every new record prunes such keys. Keyed by agent group, not session, so a recreated task session keeps its open incidents. The unkeyed, per-session, day-rotated sibling is `task_thread_anchors` (migration 048). See [agent-runner-details.md](agent-runner-details.md), "Keyed threads".
+
+```sql
+CREATE TABLE thread_key_anchors (
+  agent_group_id      TEXT NOT NULL,
+  channel_type        TEXT NOT NULL,
+  platform_id         TEXT NOT NULL,
+  thread_key          TEXT NOT NULL,
+  thread_platform_id  TEXT NOT NULL,   -- platform message id of the key's root post
+  created_at          TEXT NOT NULL,
+  last_used_at        TEXT NOT NULL,
+  PRIMARY KEY (agent_group_id, channel_type, platform_id, thread_key)
+);
+```
+
+---
+
 ## 2. Migration system
 
 Migrations live in `src/db/migrations/`, one file per migration. Runner: `runMigrations()` in `src/db/migrations/index.ts`. It:

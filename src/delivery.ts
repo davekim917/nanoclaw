@@ -31,6 +31,14 @@ import {
   deleteTaskThreadAnchor,
   anchorRotationKey,
 } from './db/task-thread-anchors.js';
+import {
+  deleteThreadKeyAnchor,
+  getThreadKeyAnchor,
+  recordThreadKeyAnchor,
+  touchThreadKeyAnchor,
+  THREAD_KEY_PATTERN,
+  type ThreadKeyAddress,
+} from './db/thread-key-anchors.js';
 import { recordTaskRunOutcome } from './db/task-run-outcomes.js';
 import { getMessagingGroup, getMessagingGroupByPlatform } from './db/messaging-groups.js';
 import { runGuarded, type DeliveryGuardSpec, type GuardedDeliveryHandler } from './delivery-guard.js';
@@ -387,6 +395,60 @@ const chatThreadAnchor = new Map<string, ChatThreadAnchor>();
  * costs one turn, not the session.
  */
 const chatThreadAnchorDisabled = new Map<string, string>();
+
+/**
+ * The agent-named incident/topic key on an outbound row (`content.threadKey`,
+ * written by send_message/send_file — container/agent-runner/src/mcp-tools/core.ts).
+ * A malformed key is ignored rather than refused: the row still delivers exactly
+ * as an unkeyed one would, which is the pre-feature behaviour, instead of burning
+ * retries and dropping the message.
+ */
+function readThreadKey(content: { threadKey?: unknown }, msgId: string, sessionId: string): string | null {
+  const raw = content.threadKey;
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw === 'string' && THREAD_KEY_PATTERN.test(raw)) return raw;
+  log.warn('Ignoring a malformed threadKey — delivering unkeyed', { id: msgId, sessionId });
+  return null;
+}
+
+/**
+ * Serializes lookup → post → record per keyed destination. Delivery is excluded
+ * per session only (`inflightDeliveries` below), but a thread key is scoped to the
+ * agent group, so two sessions of one group posting the same new key at once
+ * would otherwise both miss the lookup and both post a root. The host is one
+ * process, so an in-memory chain is the whole exclusion.
+ */
+const threadKeyLocks = new Map<string, Promise<void>>();
+
+async function withThreadKeyLock<T>(
+  msg: { id: string; channel_type: string | null; platform_id: string | null; content: string },
+  session: Session,
+  deliver: () => Promise<T>,
+): Promise<T> {
+  let threadKey: unknown;
+  try {
+    threadKey = (JSON.parse(msg.content) as { threadKey?: unknown } | null)?.threadKey;
+  } catch {
+    // Unparseable content: deliverMessage's own JSON.parse reports it.
+    return deliver();
+  }
+  if (typeof threadKey !== 'string' || !THREAD_KEY_PATTERN.test(threadKey)) return deliver();
+  // Wider than strictly needed (a keyed row with an explicit thread_id never
+  // reads the anchor) — harmless, and it keeps one eligibility rule in deliverMessage.
+  const lockKey = JSON.stringify([session.agent_group_id, msg.channel_type, msg.platform_id, threadKey]);
+  const prior = threadKeyLocks.get(lockKey) ?? Promise.resolve();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const tail = prior.then(() => held);
+  threadKeyLocks.set(lockKey, tail);
+  await prior;
+  try {
+    return await deliver();
+  } finally {
+    release();
+    if (threadKeyLocks.get(lockKey) === tail) threadKeyLocks.delete(lockKey);
+  }
+}
 
 /**
  * Sessions whose outbound queue is currently being drained.
@@ -747,7 +809,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
       continue;
     }
     try {
-      const result = await deliverMessage(msg, session);
+      const result = await withThreadKeyLock(msg, session, () => deliverMessage(msg, session));
       // System actions like request_bash_gate return deferAck:true — the
       // handler owns the `delivered` row lifecycle and writes it later
       // (on admin approval or timeout). Auto-acking here would race
@@ -1454,7 +1516,28 @@ async function deliverMessage(
   // messages, but address the anchor message itself at root and never drop/record an anchor.
   const isInPlaceOp = content.operation === 'edit' || content.operation === 'reaction';
   const isTaskSessionPost = session.messaging_group_id === null && isTaskThread(session.thread_id);
-  const taskAnchorEligible = isTaskSessionPost && baseThreadId === null && !(await isThreadAnchorExempt(session));
+
+  // Keyed thread anchor (`content.threadKey`, migration 081). The agent names
+  // the incident or topic a post belongs to: the first post under a key lands
+  // at root and is recorded, every later post under that key threads beneath
+  // it with no day rotation, and a new key is a new top-level post. It takes
+  // precedence over both anchors below, and like them never overrides an
+  // explicit thread_id. Keyed per agent group, so a recreated task session
+  // keeps its open incidents.
+  const threadKey = readThreadKey(content, msg.id, session.id);
+  const keyAddr: ThreadKeyAddress | null =
+    threadKey !== null && baseThreadId === null
+      ? {
+          agentGroupId: session.agent_group_id,
+          channelType: msg.channel_type,
+          platformId: msg.platform_id,
+          threadKey,
+        }
+      : null;
+  const keyedEligible = keyAddr !== null;
+
+  const taskAnchorEligible =
+    !keyedEligible && isTaskSessionPost && baseThreadId === null && !(await isThreadAnchorExempt(session));
 
   // Per-turn channel-root threading (see ChatThreadAnchor above) — everything
   // that isn't a task-session post. Only engages when the agent didn't
@@ -1465,7 +1548,13 @@ async function deliverMessage(
 
   let effectiveThreadId = baseThreadId;
   let usedAnchor = false;
-  if (taskAnchorEligible) {
+  if (keyAddr) {
+    const anchor = await getThreadKeyAnchor(keyAddr, new Date().toISOString());
+    if (anchor && !(isInPlaceOp && content.messageId === anchor.threadPlatformId)) {
+      effectiveThreadId = `${msg.platform_id}:${anchor.threadPlatformId}`;
+      usedAnchor = true;
+    }
+  } else if (taskAnchorEligible) {
     const anchor = await getTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id);
     if (
       anchor &&
@@ -1528,11 +1617,16 @@ async function deliverMessage(
       id: msg.id,
       sessionId: session.id,
       taskAnchor: taskAnchorEligible,
+      ...(keyedEligible ? { threadKey } : {}),
       attemptedThreadId: effectiveThreadId,
       err: err instanceof Error ? err.message : String(err),
     });
     if (isInPlaceOp) {
       // The target just wasn't in the thread; the anchor itself is still good.
+    } else if (keyAddr) {
+      // Dropped here, replaced below by the root post's id: a root post that
+      // returns no id must not leave the dead anchor to fail the next post too.
+      await deleteThreadKeyAnchor(keyAddr);
     } else if (taskAnchorEligible) {
       await deleteTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id);
     } else {
@@ -1556,7 +1650,9 @@ async function deliverMessage(
   // already threaded under an existing anchor must not overwrite it, or the
   // next post would chain off it instead of the original root.
   if (effectiveThreadId === null && platformMsgId && !isInPlaceOp) {
-    if (taskAnchorEligible) {
+    if (keyAddr) {
+      await recordThreadKeyAnchor(keyAddr, platformMsgId, new Date().toISOString());
+    } else if (taskAnchorEligible) {
       await setTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id, platformMsgId, new Date().toISOString());
     } else if (turnAnchorEligible) {
       chatThreadAnchor.set(session.id, {
@@ -1566,6 +1662,8 @@ async function deliverMessage(
         messageId: platformMsgId,
       });
     }
+  } else if (keyAddr && usedAnchor && !isInPlaceOp) {
+    await touchThreadKeyAnchor(keyAddr, new Date().toISOString());
   }
   log.info('Message delivered', {
     id: msg.id,
