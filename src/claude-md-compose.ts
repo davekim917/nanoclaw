@@ -209,12 +209,52 @@ function readRulesetFile(dir: string, filename: string, repoRoot: string): strin
 }
 
 /**
+ * A directory is a sub-plugin when it declares itself one, which is the signal
+ * both container-side walkers use: Claude asks only that
+ * `.claude-plugin/plugin.json` EXIST (`hasManifest`,
+ * `container/agent-runner/src/providers/claude.ts:1760`, applied to `<repo>/<sub>`
+ * and `<repo>/plugins/<sub>` alike), while Codex additionally requires the
+ * manifest to PARSE and carry a non-empty `name`, since that name is what it
+ * registers (`readCodexPluginEntryName`,
+ * `container/agent-runner/src/codex-companion-setup.ts:804`, reached from
+ * `findCodexSubPlugins` at `:853` for the same two layouts).
+ *
+ * Each manifest is held to its OWN walker's rule rather than to one rule for
+ * both: a broken `.codex-plugin/plugin.json` is not a plugin to Codex, so it
+ * must not be one here either.
+ *
+ * EITHER manifest, because this composer serves OpenCode — the provider with no
+ * native plugin loader at all — and a directory either walker would load as a
+ * plugin is one this must be able to speak for. A directory declaring neither is
+ * not a plugin to anything in this system: a ruleset file under
+ * `~/plugins/<repo>/docs/` would otherwise be injected into every OpenCode
+ * group's standing prompt while no walker mounts, registers or excludes it, and
+ * `excludePlugins` names plugins.
+ *
+ * NOT a claim that this walks the same DIRECTORIES the walkers do, only that it
+ * asks the same question of one. Claude stops descending at a repo root that
+ * carries a manifest and descends a level deeper than this does elsewhere; this
+ * composer walks `<repo>/<sub>` and `<repo>/plugins/<sub>` unconditionally, and
+ * that is load-bearing — `bootstrap` ships a root `.claude-plugin/`, so matching
+ * Claude's stop-at-the-root rule would withhold `plugins/wwbd`'s directive from
+ * every OpenCode group.
+ */
+function hasPluginManifest(dir: string): boolean {
+  if (fs.existsSync(path.join(dir, '.claude-plugin', 'plugin.json'))) return true;
+  try {
+    const raw = fs.readFileSync(path.join(dir, '.codex-plugin', 'plugin.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as { name?: unknown };
+    return typeof parsed.name === 'string' && parsed.name.trim() !== '';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Every sub-plugin directory of one `~/plugins` entry, in both layouts the
- * container-side walkers descend: `<repo>/plugins/<sub>` (Claude
- * container/agent-runner/src/providers/claude.ts:1790-1817; Codex
- * container/agent-runner/src/codex-companion-setup.ts:570) and `<repo>/<sub>`
- * (same two). Returned paths are relative to the plugins root, which is the
- * spelling `excludePlugins` uses.
+ * container-side walkers descend: `<repo>/plugins/<sub>` and `<repo>/<sub>`.
+ * Returned paths are relative to the plugins root, which is the spelling
+ * `excludePlugins` uses.
  */
 function subPluginDirs(pluginsRoot: string, name: string): Array<{ subPath: string; dir: string }> {
   const out: Array<{ subPath: string; dir: string }> = [];
@@ -236,6 +276,7 @@ function subPluginDirs(pluginsRoot: string, name: string): Array<{ subPath: stri
       } catch {
         continue;
       }
+      if (!hasPluginManifest(dir)) continue;
       seen.add(subPath);
       out.push({ subPath, dir });
     }

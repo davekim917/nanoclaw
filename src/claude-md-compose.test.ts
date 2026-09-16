@@ -437,6 +437,18 @@ describe('workgroup wiki section (src/workgroup-wiki.ts)', () => {
   });
 });
 
+/**
+ * Make a directory a sub-plugin the way the container walkers require: a
+ * `.claude-plugin/plugin.json` (Claude) or `.codex-plugin/plugin.json` (Codex).
+ * The composer honours either, and a directory declaring neither is not a
+ * plugin to anything in this system.
+ */
+function declareSubPlugin(dir: string, flavour: 'claude' | 'codex' = 'claude'): void {
+  const manifestDir = path.join(dir, flavour === 'claude' ? '.claude-plugin' : '.codex-plugin');
+  fs.mkdirSync(manifestDir, { recursive: true });
+  fs.writeFileSync(path.join(manifestDir, 'plugin.json'), JSON.stringify({ name: path.basename(dir) }));
+}
+
 describe('workgroup-scoped plugin rulesets (src/plugin-scopes.ts)', () => {
   it('composes a scoped plugin ruleset only for groups in its workgroups', async () => {
     const home = path.join(TEST_ROOT, 'home');
@@ -494,6 +506,7 @@ describe("sub-plugin always-on: the plugin's own always-on.md (OpenCode only)", 
     ] as const) {
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(path.join(dir, 'always-on.md'), `${sentinel}\n`);
+      declareSubPlugin(dir);
     }
     fs.mkdirSync(repo, { recursive: true });
     if (override !== null) fs.writeFileSync(path.join(repo, '.nanoclaw-always-on.md'), override);
@@ -786,6 +799,7 @@ describe("sub-plugin always-on: the plugin's own always-on.md (OpenCode only)", 
     fs.writeFileSync(inRepo, 'SENTINEL_IN_REPO_LINK_2c5a\n');
     const sub = path.join(repo, 'plugins', 'linked');
     fs.mkdirSync(sub, { recursive: true });
+    declareSubPlugin(sub);
     fs.symlinkSync(inRepo, path.join(sub, 'always-on.md'));
 
     const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
@@ -794,6 +808,124 @@ describe("sub-plugin always-on: the plugin's own always-on.md (OpenCode only)", 
       await seed(ag);
       await composeGroupClaudeMd(ag, 'opencode', {});
       expect(agentsDoc(ag.folder)).toContain('SENTINEL_IN_REPO_LINK_2c5a');
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it("never composes a NON-PLUGIN directory's always-on.md", async () => {
+    // `<repo>/docs/` is not a plugin: no walker mounts, registers or excludes
+    // it, and `excludePlugins` names plugins. Composing its file would put text
+    // in every OpenCode group's standing prompt that no control can withhold.
+    const home = seedBootstrapPlugin(null);
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    const notAPlugin = path.join(repo, 'docs');
+    fs.mkdirSync(notAPlugin, { recursive: true });
+    fs.writeFileSync(path.join(notAPlugin, 'always-on.md'), 'SENTINEL_NOT_A_PLUGIN_8d3c\n');
+    // The same directory name under the other walked layout, equally not one.
+    const nestedNotAPlugin = path.join(repo, 'plugins', 'notes');
+    fs.mkdirSync(nestedNotAPlugin, { recursive: true });
+    fs.writeFileSync(path.join(nestedNotAPlugin, 'always-on.md'), 'SENTINEL_NOT_A_PLUGIN_NESTED_5b7e\n');
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-nonplugin', 'sub-nonplugin');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+      const doc = agentsDoc(ag.folder);
+      expect(doc).not.toContain('SENTINEL_NOT_A_PLUGIN_8d3c');
+      expect(doc).not.toContain('SENTINEL_NOT_A_PLUGIN_NESTED_5b7e');
+      // The real sub-plugins beside them still compose.
+      expect(doc).toContain(ORCHESTRATE_SENTINEL);
+      expect(doc).toContain(ROOTLEVEL_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('accepts a sub-plugin that declares itself with a CODEX manifest only', async () => {
+    // Either manifest, because this composer serves OpenCode and a directory
+    // either container walker would load as a plugin is one it must speak for.
+    const home = seedBootstrapPlugin(null);
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    const codexOnly = path.join(repo, 'plugins', 'codex-only');
+    fs.mkdirSync(codexOnly, { recursive: true });
+    declareSubPlugin(codexOnly, 'codex');
+    fs.writeFileSync(path.join(codexOnly, 'always-on.md'), 'SENTINEL_CODEX_MANIFEST_3f9a\n');
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-codexmanifest', 'sub-codexmanifest');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+      expect(agentsDoc(ag.folder)).toContain('SENTINEL_CODEX_MANIFEST_3f9a');
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('refuses a sub-plugin whose CODEX manifest does not parse or carries no name', async () => {
+    // Each manifest is held to its own walker's rule. Codex registers the
+    // manifest's `name`, so one that cannot be read is not a plugin to Codex —
+    // and must not be one here either.
+    const home = seedBootstrapPlugin(null);
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    for (const [sub, manifest, sentinel] of [
+      ['codex-broken', '{ not json', 'SENTINEL_CODEX_BROKEN_7c1d'],
+      ['codex-nameless', JSON.stringify({ description: 'no name' }), 'SENTINEL_CODEX_NAMELESS_2a6b'],
+      ['codex-blank', JSON.stringify({ name: '   ' }), 'SENTINEL_CODEX_BLANK_9e4f'],
+    ] as const) {
+      const dir = path.join(repo, 'plugins', sub);
+      fs.mkdirSync(path.join(dir, '.codex-plugin'), { recursive: true });
+      fs.writeFileSync(path.join(dir, '.codex-plugin', 'plugin.json'), manifest);
+      fs.writeFileSync(path.join(dir, 'always-on.md'), `${sentinel}\n`);
+    }
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const ag = group('ag-sub-badcodex', 'sub-badcodex');
+      await seed(ag);
+      await composeGroupClaudeMd(ag, 'opencode', {});
+      const doc = agentsDoc(ag.folder);
+      for (const sentinel of [
+        'SENTINEL_CODEX_BROKEN_7c1d',
+        'SENTINEL_CODEX_NAMELESS_2a6b',
+        'SENTINEL_CODEX_BLANK_9e4f',
+      ]) {
+        expect(doc).not.toContain(sentinel);
+      }
+      expect(doc).toContain(ORCHESTRATE_SENTINEL);
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('keeps a repo-root ruleset that a SUB-PATH exclusion does not name — only a top-level entry withholds it', async () => {
+    // The seam #828 recorded, pinned as behaviour rather than left implicit. A
+    // sub-path entry withholds the SUB-PLUGIN's own file; the repo root's file
+    // is the repo's directive and stays. An operator isolating prompt content
+    // has to exclude the repo, and a repo whose root file restates a
+    // sub-plugin's directive defeats the sub-path entry — which is why
+    // bootstrap ships its directives per sub-plugin and no root file at all.
+    const home = seedBootstrapPlugin(null);
+    const repo = path.join(home, 'plugins', 'bootstrap');
+    fs.writeFileSync(path.join(repo, 'always-on.md'), 'SENTINEL_REPO_ROOT_RULES_6e2d\n');
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const kept = group('ag-root-kept', 'root-kept');
+      await seed(kept);
+      setExcludePlugins(kept.folder, ['bootstrap/plugins/orchestrate']);
+      await composeGroupClaudeMd(kept, 'opencode', {});
+      const keptDoc = agentsDoc(kept.folder);
+      expect(keptDoc).not.toContain(ORCHESTRATE_SENTINEL);
+      expect(keptDoc).toContain('SENTINEL_REPO_ROOT_RULES_6e2d');
+
+      const dropped = group('ag-root-dropped', 'root-dropped');
+      await seed(dropped);
+      setExcludePlugins(dropped.folder, ['bootstrap']);
+      await composeGroupClaudeMd(dropped, 'opencode', {});
+      expect(agentsDoc(dropped.folder)).not.toContain('SENTINEL_REPO_ROOT_RULES_6e2d');
     } finally {
       homedirSpy.mockRestore();
     }
@@ -885,6 +1017,7 @@ describe("sub-plugin always-on: the plugin's own always-on.md (OpenCode only)", 
     ] as const) {
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(path.join(dir, 'always-on.md'), `${sentinel}\n`);
+      declareSubPlugin(dir);
     }
     const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
     try {
@@ -911,6 +1044,7 @@ describe("sub-plugin always-on: the plugin's own always-on.md (OpenCode only)", 
     ] as const) {
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(path.join(dir, 'always-on.md'), `${sentinel}\n`);
+      declareSubPlugin(dir);
     }
     const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
     try {
