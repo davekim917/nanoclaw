@@ -19,10 +19,11 @@ import {
   renderMcpServerForTest,
   setupCodexRuntime,
   stripPluginsAndMarketplacesForTest,
+  verifyCodexHookTrust,
   writeCodexHooksAndTrust,
 } from './codex-companion-setup.js';
-import { buildCodexHooksJson, parseTomlTableHeader } from './providers/codex-app-server.js';
-import { codexHookEventKey, isCodexHookEvent } from './providers/codex-hook-trust.js';
+import { type AppServer, buildCodexHooksJson, parseTomlTableHeader } from './providers/codex-app-server.js';
+import { codexHookEventKey, collectCodexHookTrustEntries, isCodexHookEvent } from './providers/codex-hook-trust.js';
 
 describe('parseTomlTableHeader', () => {
   it('closes on the LAST bracket so a quoted segment may contain one', () => {
@@ -577,7 +578,9 @@ describe('readCodexConfigToml', () => {
     // failure message is a test nobody reads.
     const offenders = outsideHelper
       .split('\n')
-      .filter((line) => /existsSync\([^)]*[Cc]onfig[^)]*\)\s*\?/.test(line) || /readFileSync\([^)]*[Cc]onfigPath/.test(line))
+      .filter(
+        (line) => /existsSync\([^)]*[Cc]onfig[^)]*\)\s*\?/.test(line) || /readFileSync\([^)]*[Cc]onfigPath/.test(line),
+      )
       .map((line) => line.trim());
     expect(offenders).toEqual([]);
     // …and the helper itself is still the three-answer one.
@@ -636,9 +639,9 @@ describe('writeCodexHooksAndTrust', () => {
     fs.writeFileSync(configPath, original);
     fs.chmodSync(configPath, 0o200);
     try {
-      expect(() => writeCodexHooksAndTrust({ codexHome: roHome, pluginsRoot: path.join(roHome, 'no-plugins') })).toThrow(
-        /could not read Codex config/i,
-      );
+      expect(() =>
+        writeCodexHooksAndTrust({ codexHome: roHome, pluginsRoot: path.join(roHome, 'no-plugins') }),
+      ).toThrow(/could not read Codex config/i);
       fs.chmodSync(configPath, 0o600);
       // The feature flag and the plugin tables are still there — the refusal
       // happened BEFORE the rewrite, not after a partial one.
@@ -861,5 +864,107 @@ const CAN_RUN_FS = (() => {
       hooks: { PreToolUse: Array<{ hooks: Array<{ command: string }> }> };
     };
     expect(hooks.hooks.PreToolUse[0].hooks[0].command).toBe('bun /app/src/codex-hooks/cli.ts PreToolUse');
+  });
+});
+
+// ── verifyCodexHookTrust ───────────────────────────────────────────────────
+
+/**
+ * Minimal app-server stub: `sendCodexRequest` writes a JSON-RPC line to
+ * `process.stdin` and resolves whatever it finds in `pending`, so a stub only
+ * has to answer on that path.
+ */
+function hookListServer(answer: { result?: unknown; error?: { code: number; message: string } } | null): AppServer {
+  const pending = new Map<number, { resolve: (value: never) => void; reject: (error: Error) => void }>();
+  return {
+    process: {
+      stdin: {
+        write(line: string) {
+          const request = JSON.parse(line) as { id: number };
+          if (answer) {
+            queueMicrotask(() => {
+              const handler = pending.get(request.id);
+              pending.delete(request.id);
+              handler?.resolve({ id: request.id, ...answer } as never);
+            });
+          }
+          return true;
+        },
+      },
+      kill: () => true,
+    },
+    readline: { close() {} },
+    pending,
+    notificationHandlers: [],
+    serverRequestHandlers: [],
+  } as unknown as AppServer;
+}
+
+/** The keys `syncCodexHookTrust` writes for a given home, from the same collector. */
+function generatedKeys(home: string): string[] {
+  return collectCodexHookTrustEntries(path.join(home, 'hooks.json'), buildCodexHooksJson().hooks).map((e) => e.key);
+}
+
+function listing(rows: Array<Record<string, unknown>>): { result: unknown } {
+  return { result: { data: [{ cwd: '/workspace/agent', hooks: rows, warnings: [], errors: [] }] } };
+}
+
+describe('verifyCodexHookTrust', () => {
+  const HOME = '/probe/codex-home';
+
+  it('passes when every generated handler reads back trusted and enabled', async () => {
+    const rows = generatedKeys(HOME).map((key) => ({ key, enabled: true, trustStatus: 'trusted' }));
+    await verifyCodexHookTrust(hookListServer(listing(rows)), HOME);
+  });
+
+  it('REFUSES the spawn when a generated handler reads back untrusted', async () => {
+    // The failure this check exists for: the handler loads, codex reports it
+    // untrusted, never dispatches it, and the session otherwise runs normally.
+    const keys = generatedKeys(HOME);
+    const rows = keys.map((key, i) => ({ key, enabled: true, trustStatus: i === 0 ? 'untrusted' : 'trusted' }));
+    await expect(verifyCodexHookTrust(hookListServer(listing(rows)), HOME)).rejects.toThrow(
+      /hook trust verification failed/i,
+    );
+  });
+
+  it('REFUSES the spawn when the listing is empty', async () => {
+    // Hooks feature off, or hooks.json unread: nothing bad to find in the
+    // listing, and the whole guard chain is inert.
+    await expect(verifyCodexHookTrust(hookListServer(listing([])), HOME)).rejects.toThrow(/missing/);
+  });
+
+  it('REFUSES the spawn when a generated handler is trusted but DISABLED', async () => {
+    const rows = generatedKeys(HOME).map((key, i) => ({ key, enabled: i !== 0, trustStatus: 'trusted' }));
+    await expect(verifyCodexHookTrust(hookListServer(listing(rows)), HOME)).rejects.toThrow(/enabled=false/);
+  });
+
+  it('REFUSES the spawn when hooks/list itself fails', async () => {
+    // Fail closed on a version drift that removes or renames the method: the
+    // alternative is the same silence the check exists to end.
+    const server = hookListServer({ error: { code: -32601, message: 'method not found' } });
+    await expect(verifyCodexHookTrust(server, HOME)).rejects.toThrow(/hooks\/list unavailable/);
+  });
+
+  it('keys the expected set on the home passed in, so a rotated CODEX_HOME is checked against ITS own hooks.json', async () => {
+    // An OAuth-fallback rotation moves CODEX_HOME; trust entries are keyed on
+    // the absolute hooks.json path, so rows from the OLD home must not satisfy
+    // the check for the new one.
+    const rows = generatedKeys('/probe/fallback-home').map((key) => ({ key, enabled: true, trustStatus: 'trusted' }));
+    await expect(verifyCodexHookTrust(hookListServer(listing(rows)), HOME)).rejects.toThrow(/missing/);
+  });
+
+  it('does NOT fail on an undispatchable plugin handler', async () => {
+    // Reported, not fatal: one oddly-shaped third-party plugin must not take
+    // the container down, and the guard core depends on no plugin.
+    const rows = [
+      ...generatedKeys(HOME).map((key) => ({ key, enabled: true, trustStatus: 'trusted' })),
+      {
+        key: 'some-plugin@mkt:hooks/hooks.json:pre_tool_use:0:0',
+        pluginId: 'some-plugin@mkt',
+        enabled: true,
+        trustStatus: 'untrusted',
+      },
+    ];
+    await verifyCodexHookTrust(hookListServer(listing(rows)), HOME);
   });
 });

@@ -80,6 +80,29 @@ lines.on('line', (line) => {
     send({ id: request.id, result: { userAgent: 'fake-codex' } });
     return;
   }
+  // verifyCodexHookTrust (codex-companion-setup.ts) refuses the spawn unless
+  // every generated guard handler reads back dispatchable. The provider writes
+  // hooks.json AND its trust entries immediately before each spawn, so a
+  // faithful fake reports exactly those two handlers trusted and enabled —
+  // which is what a real codex 0.154.0 does against the same home (measured).
+  if (request.method === 'hooks/list') {
+    const home = process.env.CODEX_HOME || (process.env.HOME || '/home/node') + '/.codex';
+    const hooksPath = home + '/hooks.json';
+    const rows = ['pre_tool_use', 'post_tool_use'].map((event, index) => ({
+      key: hooksPath + ':' + event + ':0:0',
+      eventName: event,
+      handlerType: 'command',
+      sourcePath: hooksPath,
+      source: 'user',
+      pluginId: null,
+      displayOrder: index,
+      enabled: true,
+      isManaged: false,
+      trustStatus: 'trusted',
+    }));
+    send({ id: request.id, result: { data: [{ cwd: process.cwd(), hooks: rows, warnings: [], errors: [] }] } });
+    return;
+  }
   // Healthy account snapshot: the provider reads this at every app-server
   // bind (codex-rate-limit-tracker.ts) and would wait out its deadline on a
   // fake that stays silent.

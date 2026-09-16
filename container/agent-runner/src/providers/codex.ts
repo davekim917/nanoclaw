@@ -47,7 +47,7 @@ import {
 // Hooks AND the `[hooks.state.*]` entries that make Codex actually dispatch
 // them: Codex >=0.154 refuses to run an untrusted hook, so writing hooks.json
 // alone leaves the destructive-action guard chain loaded but never fired.
-import { writeCodexHooksAndTrust } from '../codex-companion-setup.js';
+import { verifyCodexHookTrust, writeCodexHooksAndTrust } from '../codex-companion-setup.js';
 import { CodexTurnLiveness, isCodexTerminalTurnItem, normalizeCodexThreadStatus } from './codex-liveness.js';
 import { CodexRateLimitTracker } from './codex-rate-limit-tracker.js';
 import type { CodexRateLimitPark } from './codex-rate-limits.js';
@@ -418,10 +418,7 @@ export const DEFAULT_CODEX_EFFORT = 'high' as const;
 
 export const codexConfigSchema = z.strictObject({
   model: z.string().min(1).optional(),
-  reasoning_effort: z
-    .enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
-    .optional()
-    .default(DEFAULT_CODEX_EFFORT),
+  reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional().default(DEFAULT_CODEX_EFFORT),
   max_concurrent_threads_per_session: z
     .number()
     .int()
@@ -1255,6 +1252,9 @@ export class CodexProvider implements AgentProvider {
 
       try {
         await initializeCodexAppServer(server);
+        // Fail closed on a guard chain that loaded but would never fire. Runs on
+        // EVERY spawn (11ms measured, first call) — see verifyCodexHookTrust.
+        await verifyCodexHookTrust(server, currentCodexHome);
         await rateLimits.bind(server, currentCodexHome);
 
         // Codex preserves base instructions across native compaction. The
@@ -1437,6 +1437,7 @@ export class CodexProvider implements AgentProvider {
                   turnTracker.server = server;
                   attachCodexAutoApproval(server);
                   await initializeCodexAppServer(server);
+                  await verifyCodexHookTrust(server, currentCodexHome);
                   await rateLimits.bind(server, currentCodexHome);
 
                   const previousThreadId: string | undefined = threadId;
@@ -1487,6 +1488,7 @@ export class CodexProvider implements AgentProvider {
                   turnTracker.server = server;
                   attachCodexAutoApproval(server);
                   await initializeCodexAppServer(server);
+                  await verifyCodexHookTrust(server, currentCodexHome);
                   await rateLimits.bind(server, currentCodexHome);
 
                   const previousThreadId: string | undefined = threadId;
@@ -1562,6 +1564,9 @@ export class CodexProvider implements AgentProvider {
                     turnTracker.server = server;
                     attachCodexAutoApproval(server);
                     await initializeCodexAppServer(server);
+                    // currentCodexHome was just switched to the fallback above;
+                    // the guard chain must be proven live in the NEW home too.
+                    await verifyCodexHookTrust(server, currentCodexHome);
                     await rateLimits.bind(server, currentCodexHome);
 
                     // Re-resume the thread on the new identity. If the

@@ -54,7 +54,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
-import { escapeTomlBasicStringBody } from './codex-app-server.js';
+import { type CodexHookListEntry, escapeTomlBasicStringBody } from './codex-app-server.js';
 
 /** hooks.json event keys, in the PascalCase spelling Codex reads. */
 export type CodexHookEvent =
@@ -325,6 +325,136 @@ export function mergeCodexHookTrustIntoToml(toml: string, entries: readonly Code
   const block = renderCodexHookTrustBlock(entries);
   if (!block) return base ? `${base}\n` : '';
   return [base, '', block].filter((part, i) => i !== 0 || part).join('\n');
+}
+
+// ── runtime verification (hooks/list) ──────────────────────────────────────
+// Everything above computes what SHOULD be trusted, offline. An offline hash
+// asserting itself proves only that this file agrees with this file — and every
+// way the reproduction can drift (a codex normalization change, an uncovered
+// hook shape, a rewrite that drops the entries) produces the same silence: the
+// handler loads, reports `untrusted`, is never dispatched, and the app-server
+// starts anyway. So the entries are also CHECKED against the running binary.
+
+/**
+ * Codex dispatches a handler only when `enabled && trust_status ∈ {Managed,
+ * Trusted}` (`hooks/src/engine/discovery.rs:713-718`; `bypass_hook_trust` is
+ * the third disjunct and is inert on this path — see this file's header). Both
+ * halves matter: a `[hooks.state."<key>"] enabled = false` row leaves a handler
+ * `trusted` and still undispatched (`hook_enabled`, `discovery.rs:813-815`).
+ */
+export function isCodexHookDispatchable(entry: CodexHookListEntry): boolean {
+  const status = (entry.trustStatus ?? '').toLowerCase();
+  return entry.enabled === true && (status === 'trusted' || status === 'managed');
+}
+
+/** One handler that loaded but will never fire, with why. */
+export interface CodexHookTrustProblem {
+  key: string;
+  trustStatus: string;
+  enabled: boolean;
+  /** `null` for a hooks.json handler, `<plugin>@<marketplace>` for a plugin's. */
+  pluginId: string | null;
+  /**
+   * The listing's own `source` word — `"plugin"`, `"user"`, or whatever codex
+   * labels a project-local `.codex/hooks.json` with. Carried so the log does
+   * not call a project-local hook a plugin: `hooks/list` discovers hook files
+   * PER CWD, so the non-generated rows are not all plugin rows.
+   */
+  source: string | null;
+  reason: 'missing' | 'not-dispatchable';
+}
+
+export interface CodexHookTrustVerdict {
+  /**
+   * Handlers NanoClaw generated that will not fire — a key that never appeared
+   * in `hooks/list` at all (`missing`: the file was not loaded, or the whole
+   * hooks feature is off) or one that appeared undispatchable. FATAL: this is
+   * the destructive-action guard chain.
+   */
+  generated: CodexHookTrustProblem[];
+  /**
+   * Every OTHER handler that will not fire — a mounted plugin's, or a
+   * project-local hook file codex discovered under the cwd. REPORTED, not fatal:
+   * one oddly-shaped third-party plugin must not take a container down, and the
+   * guard core does not depend on any plugin being mounted.
+   */
+  plugin: CodexHookTrustProblem[];
+  /** Generated handlers confirmed dispatchable. */
+  generatedOk: string[];
+}
+
+// Named away from `describe` on purpose: this file sits next to its bun:test
+// suite, and shadowing that global in a grep is a needless trap.
+function toTrustProblem(
+  entry: CodexHookListEntry,
+  key: string,
+  reason: CodexHookTrustProblem['reason'],
+): CodexHookTrustProblem {
+  return {
+    key,
+    trustStatus: entry.trustStatus ?? 'absent',
+    enabled: entry.enabled === true,
+    pluginId: typeof entry.pluginId === 'string' ? entry.pluginId : null,
+    source: typeof entry.source === 'string' ? entry.source : null,
+    reason,
+  };
+}
+
+/**
+ * Compare what `hooks/list` reports against the entries this module wrote.
+ *
+ * `expectedGeneratedKeys` is the key set from `collectCodexHookTrustEntries`
+ * over the generated `hooks.json` — so a handler that vanished from the listing
+ * entirely is caught, not just one reporting the wrong status. That is the case
+ * a "scan the listing for untrusted rows" check silently passes: with the hooks
+ * feature off or the file unread, the listing is EMPTY and every row in it is
+ * fine.
+ *
+ * Plugin rows are whatever else the listing carries. They are classified on the
+ * same predicate and returned separately for the caller to log.
+ */
+export function classifyCodexHookList(
+  listed: readonly CodexHookListEntry[],
+  expectedGeneratedKeys: readonly string[],
+): CodexHookTrustVerdict {
+  const byKey = new Map<string, CodexHookListEntry>();
+  for (const entry of listed) {
+    if (typeof entry.key === 'string') byKey.set(entry.key, entry);
+  }
+
+  const expected = new Set(expectedGeneratedKeys);
+  const generated: CodexHookTrustProblem[] = [];
+  const generatedOk: string[] = [];
+  for (const key of expected) {
+    const entry = byKey.get(key);
+    if (!entry) {
+      generated.push({
+        key,
+        trustStatus: 'absent',
+        enabled: false,
+        pluginId: null,
+        source: null,
+        reason: 'missing',
+      });
+    } else if (!isCodexHookDispatchable(entry)) {
+      generated.push(toTrustProblem(entry, key, 'not-dispatchable'));
+    } else {
+      generatedOk.push(key);
+    }
+  }
+
+  const plugin: CodexHookTrustProblem[] = [];
+  for (const [key, entry] of byKey) {
+    if (expected.has(key)) continue;
+    if (!isCodexHookDispatchable(entry)) plugin.push(toTrustProblem(entry, key, 'not-dispatchable'));
+  }
+
+  return { generated, plugin, generatedOk };
+}
+
+export function formatCodexHookTrustProblem(problem: CodexHookTrustProblem): string {
+  const who = problem.pluginId ? ` plugin=${problem.pluginId}` : problem.source ? ` source=${problem.source}` : '';
+  return `${problem.key} (${problem.reason}, trustStatus=${problem.trustStatus}, enabled=${problem.enabled}${who})`;
 }
 
 // ── plugin hooks ───────────────────────────────────────────────────────────

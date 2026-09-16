@@ -19,6 +19,7 @@ const ORIGINAL_ENV = {
   PATH: process.env.PATH,
   CODEX_HOME: process.env.CODEX_HOME,
   CODEX_FALLBACK_HOMES: process.env.CODEX_FALLBACK_HOMES,
+  FAKE_CODEX_UNTRUSTED_HOME_MATCH: process.env.FAKE_CODEX_UNTRUSTED_HOME_MATCH,
   CODEX_HEALTH_PROBE_QUIET_MS: process.env.CODEX_HEALTH_PROBE_QUIET_MS,
   CODEX_HEALTH_PROBE_INTERVAL_MS: process.env.CODEX_HEALTH_PROBE_INTERVAL_MS,
   CODEX_HEALTH_PROBE_TIMEOUT_MS: process.env.CODEX_HEALTH_PROBE_TIMEOUT_MS,
@@ -81,6 +82,35 @@ lines.on('line', (line) => {
     send({ id: request.id, result: { userAgent: 'fake-codex' } });
     return;
   }
+  // verifyCodexHookTrust (codex-companion-setup.ts) refuses the spawn unless
+  // every generated guard handler reads back dispatchable. The provider writes
+  // hooks.json AND its trust entries immediately before each spawn, so a
+  // faithful fake reports exactly those two handlers trusted and enabled —
+  // which is what a real codex 0.154.0 does against the same home (measured).
+  if (request.method === 'hooks/list') {
+    const home = process.env.CODEX_HOME || (process.env.HOME || '/home/node') + '/.codex';
+    const hooksPath = home + '/hooks.json';
+    // FAKE_CODEX_UNTRUSTED_HOME_MATCH models the silent failure: this home's
+    // handlers load and codex reports them untrusted, so they would never be
+    // dispatched. Scoped by substring so a rotation can land on an untrusted
+    // fallback while the primary was fine.
+    const untrustedMatch = process.env.FAKE_CODEX_UNTRUSTED_HOME_MATCH;
+    const trustStatus = untrustedMatch && home.includes(untrustedMatch) ? 'untrusted' : 'trusted';
+    const rows = ['pre_tool_use', 'post_tool_use'].map((event, index) => ({
+      key: hooksPath + ':' + event + ':0:0',
+      eventName: event,
+      handlerType: 'command',
+      sourcePath: hooksPath,
+      source: 'user',
+      pluginId: null,
+      displayOrder: index,
+      enabled: true,
+      isManaged: false,
+      trustStatus,
+    }));
+    send({ id: request.id, result: { data: [{ cwd: process.cwd(), hooks: rows, warnings: [], errors: [] }] } });
+    return;
+  }
   if (request.method === 'account/rateLimits/read') {
     send({
       id: request.id,
@@ -130,9 +160,18 @@ interface Run {
   events: Array<Record<string, unknown> & { type: string }>;
   requests: Array<{ instance: number; method: string; params?: Record<string, unknown> }>;
   spawned: number;
+  /** The generator's own throw, when `tolerateThrow` is set. */
+  thrown?: string;
 }
 
-async function run(opts: { weeklyByInstance: string; fallbackHomes?: string[] }): Promise<Run> {
+async function run(opts: {
+  weeklyByInstance: string;
+  fallbackHomes?: string[];
+  /** Substring of a CODEX_HOME whose hooks the fake reports as untrusted. */
+  untrustedHomeMatch?: string;
+  /** Capture a generator throw instead of propagating it, so the request log can still be read. */
+  tolerateThrow?: boolean;
+}): Promise<Run> {
   const binDir = path.join(tmpDir, 'bin');
   const codexHome = path.join(tmpDir, 'codex-home');
   const statePath = path.join(tmpDir, 'spawn-count');
@@ -148,6 +187,8 @@ async function run(opts: { weeklyByInstance: string; fallbackHomes?: string[] })
   process.env.FAKE_CODEX_STATE = statePath;
   process.env.FAKE_CODEX_LOG = logPath;
   process.env.FAKE_CODEX_WEEKLY_BY_INSTANCE = opts.weeklyByInstance;
+  if (opts.untrustedHomeMatch) process.env.FAKE_CODEX_UNTRUSTED_HOME_MATCH = opts.untrustedHomeMatch;
+  else delete process.env.FAKE_CODEX_UNTRUSTED_HOME_MATCH;
   process.env.CODEX_HEALTH_PROBE_QUIET_MS = '60000';
   process.env.CODEX_HEALTH_PROBE_INTERVAL_MS = '1000';
   process.env.CODEX_HEALTH_PROBE_TIMEOUT_MS = '1000';
@@ -156,9 +197,16 @@ async function run(opts: { weeklyByInstance: string; fallbackHomes?: string[] })
   provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
   const query = provider.query({ prompt: 'do the task', cwd: tmpDir });
   const events: Run['events'] = [];
-  for await (const event of query.events) {
-    events.push(event as Run['events'][number]);
-    if (event.type === 'result' || (event.type === 'error' && !event.retryable)) query.end();
+  let thrown: string | undefined;
+  try {
+    for await (const event of query.events) {
+      events.push(event as Run['events'][number]);
+      if (event.type === 'result' || (event.type === 'error' && !event.retryable)) query.end();
+    }
+  } catch (err) {
+    if (!opts.tolerateThrow) throw err;
+    thrown = err instanceof Error ? err.message : String(err);
+    query.end();
   }
   const requests = fs.existsSync(logPath)
     ? fs
@@ -167,7 +215,7 @@ async function run(opts: { weeklyByInstance: string; fallbackHomes?: string[] })
         .split('\n')
         .map((line) => JSON.parse(line) as Run['requests'][number])
     : [];
-  return { events, requests, spawned: Number(fs.readFileSync(statePath, 'utf8')) };
+  return { events, requests, spawned: Number(fs.readFileSync(statePath, 'utf8')), thrown };
 }
 
 describe('Codex rate-limit read → park through gen()', () => {
@@ -262,5 +310,41 @@ describe('Codex rate-limit read → park through gen()', () => {
       ['acct-1', 'codex:codex-home', 0.95],
       ['acct-2', 'codex:codex-fallback-1', 0.3],
     ]);
+  }, 5_000);
+
+  // The fail-closed wiring itself, driven through the real provider rather than
+  // by calling the verifier directly — otherwise deleting any of the four
+  // `await verifyCodexHookTrust(...)` lines in codex.ts leaves every test green.
+  it('REFUSES the very first spawn when the app-server reports the generated guard chain untrusted', async () => {
+    const { events, requests, spawned, thrown } = await run({
+      weeklyByInstance: '20',
+      untrustedHomeMatch: 'codex-home',
+      tolerateThrow: true,
+    });
+    expect(spawned).toBe(1);
+    expect(thrown).toMatch(/hook trust verification failed/i);
+    // The point of failing closed: no turn ever ran under an inert guard.
+    expect(requests.some((r) => r.method === 'thread/start' || r.method === 'thread/resume')).toBe(false);
+    expect(requests.some((r) => r.method === 'turn/start')).toBe(false);
+    expect(events.some((e) => e.type === 'result')).toBe(false);
+  }, 5_000);
+
+  it('REFUSES the rotated spawn when only the FALLBACK home reports the guard chain untrusted', async () => {
+    // The site that is easiest to lose in a refactor: CODEX_HOME has just moved,
+    // trust entries are keyed on the absolute hooks.json path, and the primary
+    // having been fine proves nothing about the home the turn will actually run in.
+    const fallbackHome = path.join(tmpDir, 'codex-fallback-1');
+    fs.mkdirSync(fallbackHome, { recursive: true });
+    const { requests, spawned, thrown } = await run({
+      weeklyByInstance: '95,30',
+      fallbackHomes: [fallbackHome],
+      untrustedHomeMatch: 'codex-fallback-1',
+      tolerateThrow: true,
+    });
+    expect(spawned).toBe(2);
+    expect(thrown).toMatch(/hook trust verification failed/i);
+    expect(thrown).toContain('codex-fallback-1');
+    // Instance 1 was parked before any turn; instance 2 is refused before one.
+    expect(requests.some((r) => r.method === 'turn/start')).toBe(false);
   }, 5_000);
 });
