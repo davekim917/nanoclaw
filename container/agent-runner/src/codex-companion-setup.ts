@@ -483,7 +483,7 @@ export async function verifyCodexHookTrust(
 
   const verdict = classifyCodexHookList(listed.entries, expected);
   for (const problem of verdict.plugin) {
-    log(`Plugin hook will NOT fire (reported, not fatal): ${formatCodexHookTrustProblem(problem)}`);
+    log(`Non-generated hook will NOT fire (reported, not fatal): ${formatCodexHookTrustProblem(problem)}`);
   }
   for (const warning of listed.warnings) log(`hooks/list warning: ${warning}`);
   for (const error of listed.errors) log(`hooks/list error: ${error}`);

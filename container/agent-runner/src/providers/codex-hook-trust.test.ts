@@ -453,6 +453,7 @@ describe('classifyCodexHookList', () => {
         trustStatus: 'untrusted',
         enabled: true,
         pluginId: null,
+        source: 'user',
         reason: 'not-dispatchable',
       },
     ]);
@@ -483,6 +484,7 @@ describe('classifyCodexHookList', () => {
         trustStatus: 'modified',
         enabled: true,
         pluginId: pluginRow.pluginId,
+        source: 'plugin',
         reason: 'not-dispatchable',
       },
     ]);
