@@ -209,12 +209,32 @@ function readRulesetFile(dir: string, filename: string, repoRoot: string): strin
 }
 
 /**
+ * A directory is a sub-plugin when it declares itself one, which is the signal
+ * both container-side walkers use: `.claude-plugin/plugin.json` for Claude
+ * (`hasManifest`, `container/agent-runner/src/providers/claude.ts`, applied to
+ * `<repo>/<sub>` and `<repo>/plugins/<sub>` alike) and `.codex-plugin/plugin.json`
+ * for Codex (`readCodexPluginEntryName` via `findCodexSubPlugins`,
+ * `container/agent-runner/src/codex-companion-setup.ts`, same two layouts).
+ *
+ * EITHER manifest, because this composer serves OpenCode — the provider with no
+ * native plugin loader at all — and a directory either walker would load as a
+ * plugin is one this must be able to speak for. A directory declaring neither is
+ * not a plugin to anything in this system: `~/plugins/<repo>/docs/always-on.md`
+ * would otherwise be injected into every OpenCode group's standing prompt while
+ * no walker mounts, registers or excludes it, and `excludePlugins` names plugins.
+ */
+function hasPluginManifest(dir: string): boolean {
+  return (
+    fs.existsSync(path.join(dir, '.claude-plugin', 'plugin.json')) ||
+    fs.existsSync(path.join(dir, '.codex-plugin', 'plugin.json'))
+  );
+}
+
+/**
  * Every sub-plugin directory of one `~/plugins` entry, in both layouts the
- * container-side walkers descend: `<repo>/plugins/<sub>` (Claude
- * container/agent-runner/src/providers/claude.ts:1790-1817; Codex
- * container/agent-runner/src/codex-companion-setup.ts:570) and `<repo>/<sub>`
- * (same two). Returned paths are relative to the plugins root, which is the
- * spelling `excludePlugins` uses.
+ * container-side walkers descend: `<repo>/plugins/<sub>` and `<repo>/<sub>`.
+ * Returned paths are relative to the plugins root, which is the spelling
+ * `excludePlugins` uses.
  */
 function subPluginDirs(pluginsRoot: string, name: string): Array<{ subPath: string; dir: string }> {
   const out: Array<{ subPath: string; dir: string }> = [];
@@ -236,6 +256,7 @@ function subPluginDirs(pluginsRoot: string, name: string): Array<{ subPath: stri
       } catch {
         continue;
       }
+      if (!hasPluginManifest(dir)) continue;
       seen.add(subPath);
       out.push({ subPath, dir });
     }
