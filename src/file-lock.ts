@@ -46,11 +46,17 @@ export function openStableRegularFile(file: string): { fd: number; created: bool
     created = false;
     try {
       // READ-ONLY on the reopen. `flock(2)` needs an open fd, not write access,
-      // and asking for O_RDWR is how a lock created by one user permanently
-      // locks out another: a `sudo` run of a host script leaves a root-owned
-      // 0600 lock, after which the non-root service gets EACCES here on every
-      // later mutation of that group's config. Read is the weakest open that
-      // works.
+      // so this is the weakest open that works and it removes one way to be
+      // locked out of a lock another user created.
+      //
+      // HONEST LIMIT: it does not fix that case. The create mode is 0600
+      // (above), so a lock created by root is unreadable to a non-root service
+      // whatever open mode is used, and a root-created LOCK DIRECTORY (0700)
+      // fails the `wx+` create for every group that has no lock yet. All this
+      // branch buys is the message below instead of a bare EACCES. Nothing
+      // documented tells an operator to `sudo` a host script, so the cure —
+      // refusing to run as root, or relaxing the mode — is left until someone
+      // actually hits it.
       fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     } catch (openError) {
       const code = (openError as NodeJS.ErrnoException).code;

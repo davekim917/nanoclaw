@@ -1446,9 +1446,12 @@ function assertOverwritableContainerConfig(p: string): void {
 /**
  * Sidecar lock guarding every mutation of a group's `container.json`.
  *
- * A SIDECAR rather than the config file itself, because `writeContainerConfig`
- * commits by rename: locking the data file would leave every holder waiting on
- * an inode the write has already replaced.
+ * A SIDECAR rather than the config file itself. Two reasons, and the second is
+ * the one that decided the path: a lock that IS the data file is fragile
+ * against any future change to how that file is committed (a write-to-temp and
+ * rename would leave every holder locked on an inode the write had already
+ * replaced), and it forces the lock to live wherever the data lives — which
+ * here is exactly where it must not.
  *
  * Under DATA_DIR, deliberately NOT beside the config. `groups/<folder>/` is
  * bind-mounted into the agent container as `/workspace/agent`, so a lock file

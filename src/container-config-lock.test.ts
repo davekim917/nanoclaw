@@ -82,18 +82,31 @@ describe('mutations of container.json are serialized', () => {
     fs.writeFileSync(lock, '');
     const ready = path.join(dirs.TEST_ROOT, 'holder-ready');
     const inner = path.join(dirs.TEST_ROOT, 'holder.sh');
-    // Under the lock: announce, dawdle, then append an exclusion. The dawdle
-    // is what puts this process's read-mutate-write inside the holder's
-    // critical section rather than merely after it.
+    // ORDER IS THE WHOLE TEST. Under the lock the holder must READ FIRST, then
+    // announce, then dawdle, then write the copy it read. That is what makes
+    // its write STALE with respect to anything this process commits in the
+    // meantime, which is the lost update.
+    //
+    // An earlier version of this test announced before reading, and was
+    // vacuous: the unlocked update finished inside the 0.4s dawdle, the holder
+    // then read a file that ALREADY had `agentGroupId`, and both fields
+    // survived with or without the lock. Removing `withFileLock` entirely left
+    // the suite green. The assertion at the bottom of this test is only worth
+    // anything because of this ordering.
     fs.writeFileSync(
       inner,
       [
         '#!/bin/sh',
-        `touch ${JSON.stringify(ready)}`,
-        'sleep 0.4',
-        `node -e 'const fs=require("fs");const p=process.argv[1];const d=JSON.parse(fs.readFileSync(p,"utf8"));` +
-          `d.excludePlugins=[...(d.excludePlugins||[]),"second-withheld"];fs.writeFileSync(p,JSON.stringify(d,null,2));' ` +
-          JSON.stringify(configFile()),
+        `node -e 'const fs=require("fs");` +
+          `const p=process.argv[1], ready=process.argv[2];` +
+          // Read the config, THEN announce: from here on this holder's copy is
+          // frozen, and anything the other process writes is what its eventual
+          // write would clobber.
+          `const d=JSON.parse(fs.readFileSync(p,"utf8"));` +
+          `fs.writeFileSync(ready,"");` +
+          `setTimeout(()=>{d.excludePlugins=[...(d.excludePlugins||[]),"second-withheld"];` +
+          `fs.writeFileSync(p,JSON.stringify(d,null,2));},400);' ` +
+          `${JSON.stringify(configFile())} ${JSON.stringify(ready)}`,
       ].join('\n') + '\n',
       { mode: 0o755 },
     );
@@ -114,6 +127,11 @@ describe('mutations of container.json are serialized', () => {
         config.agentGroupId = 'ag-spawn';
       });
       const final = readContainerConfig(FOLDER);
+      // WITHOUT the lock: this update commits during the holder's dawdle, the
+      // holder's stale copy lands on top, and `agentGroupId` is gone — the
+      // lost update, with the roles the issue describes reversed so the
+      // separate process is the one that wins. WITH it, this update waits, the
+      // holder's write is already committed when we read, and both land.
       expect(final.agentGroupId).toBe('ag-spawn');
       expect(final.excludePlugins).toEqual(['withheld-plugin', 'second-withheld']);
     } finally {
