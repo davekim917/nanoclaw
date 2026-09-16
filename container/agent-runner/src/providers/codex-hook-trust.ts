@@ -9,28 +9,46 @@
  * (codex-rs `hooks/src/engine/discovery.rs:664-716`). There is no RPC to grant
  * trust, and a `-c hooks.state...` override does not take.
  *
- * A flag that LOOKS like a bypass exists, and an earlier revision of this
- * comment wrongly said there was none: `--dangerously-bypass-hook-trust`
- * ("Run enabled hooks without requiring persisted hook trust for this
- * invocation"), a global option and also an option of `codex exec`.
- * `codex app-server --dangerously-bypass-hook-trust` is rejected outright.
+ * A bypass DOES exist, and two earlier revisions of this comment were wrong
+ * about it in opposite directions — first that there was none, then that it
+ * was inert everywhere. What is true on 0.154.0, measured against the binary
+ * with a positive and a negative control on every row (#847; full arm table
+ * and codex-rs citations on #838):
  *
- * It does not work for this path, which was MEASURED rather than assumed
- * before choosing (full table on PR #827). With no trust entry, a PreToolUse
- * handler did not fire under app-server with the global flag, under any of
- * four spellings and placements of a `bypassHookTrust` request override,
- * under both together, or under `codex exec` with the flag in either
- * position — while the same handler, same home, same probe, DID fire as soon
- * as an entry from this module was written. So these entries are not a
- * preference over the flag; they are the only mechanism observed to dispatch
- * the guard chain under app-server, which is the only path containers use.
+ * | path                                              | untrusted hooks fired |
+ * |---------------------------------------------------|----------------------|
+ * | app-server, no override                            | no                   |
+ * | app-server, `params.config.bypass_hook_trust`      | YES                  |
+ * | app-server, top-level `params.bypass_hook_trust`   | no                   |
+ * | `codex exec --dangerously-bypass-hook-trust`       | YES (either position) |
+ * | `codex app-server --dangerously-bypass-hook-trust` | rejected: unexpected argument |
+ * | `codex --dangerously-bypass-hook-trust app-server` | no — parses, then silently dropped |
+ *
+ * So the flag gates per DISPATCH PATH, not per event and not per hook source.
+ * `codex exec` honours it; the app-server arm of the root dispatcher never
+ * reads it (`cli/src/main.rs`, `app-server/src/lib.rs` — the transport runner
+ * takes no `ConfigOverrides` to receive it), which is why the process flag is
+ * genuinely inert for containers. The working lever under app-server is the
+ * per-request override, and the NESTING IS LOAD-BEARING: under `config` it
+ * dispatches, at the top level it does nothing.
+ *
+ * The entries stay the mechanism anyway, and now as a stated choice rather
+ * than for want of an alternative. They name exactly the generated handlers
+ * plus the plugins `planCodexPluginRegistration` admits; the override runs
+ * EVERY enabled hook in the home, including anything that arrives there later.
+ * The entries' own weakness — they can silently mis-hash, which is the whole
+ * #830 class — is what #832's spawn-time `hooks/list` check exists to catch.
  *
  * Two traps, recorded because each yields a false pass: the app-server
  * silently accepts unknown params, so an override being "accepted" on
- * `thread/start` is no evidence it exists; and `hooks/list` still reports
- * `untrusted` with the flag set, so it cannot be the oracle either. The
- * oracle has to be whether the handler actually ran. Why the flag is inert
- * here is #838, and nothing in this file depends on the answer.
+ * `thread/start` is no evidence it took — the top-level spelling above is
+ * accepted and does nothing; and `hooks/list` still reports `untrusted` with a
+ * bypass in force, so it cannot be the oracle either. The oracle has to be
+ * whether the handler actually RAN. A third trap cost a round here: `codex
+ * exec` with stdin held open blocks on "Reading additional input from stdin"
+ * and times out having run nothing, which reads exactly like a hook that did
+ * not fire — close stdin, and keep a trusted-entry positive control on the
+ * same home so a silent no-op cannot pass as a negative result.
  *
  * That makes this file load-bearing for the container guard chain: NanoClaw
  * generates `hooks.json` (`buildCodexHooksJson` in `./codex-app-server.ts`)
