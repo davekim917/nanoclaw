@@ -205,5 +205,7 @@ export function ensureFreshContextBootstrap(
   // provider SDK can dispatch it. Keep that token at byte zero even when a
   // cold-context bootstrap is needed; otherwise the bootstrap turns a native
   // command back into ordinary prompt text before the provider sees it.
-  return boundedPrompt.startsWith('/') ? `${boundedPrompt}\n\n${bootstrap}` : `${bootstrap}\n\n${boundedPrompt}`;
+  return boundedPrompt.startsWith('/')
+    ? `${boundedPrompt}\n\n${bootstrap}`
+    : `${bootstrap}\n\n${boundedPrompt}`;
 }
