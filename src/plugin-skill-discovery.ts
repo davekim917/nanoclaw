@@ -236,8 +236,30 @@ function discoverInPlugin(
   const skipCodexNative = (root: string) => runtime === 'codex' && loadedNativelyByCodex(root);
   const doTopLevel = !skipCodexNative(pluginDir);
 
+  // The group's exclusions, asked ONCE here rather than at each layout rule.
+  // Every rule below ends at `recordCandidate`, and it is the only place that
+  // holds the candidate's full path, so this is the seam they share. Rules 7
+  // and 8 used to carry the check themselves, and rules 4-6 — `plugin/`,
+  // `<repo>-cursor-integration/`, `<repo>-claude-plugin/`, all of them
+  // root-level sub-plugin layouts an entry can legitimately name — did not, so
+  // an excluded sub-plugin in one of those shapes was recorded before the
+  // later check could refuse it (first match wins), and only this walker
+  // disagreed: Claude's and Codex's honour the same entry. A predicate applied
+  // per layout rule is a predicate one new layout rule forgets.
+  //
+  // `relPath` is assembled from this walk's own names — `pluginName`, then the
+  // path the rule built under `pluginDir` — never a `realpath`, which is what
+  // `isExcludedPluginPath` requires. Ancestor coverage does the rest: a
+  // candidate at `<repo>/plugin/skills/<name>` is covered by an entry naming
+  // `<repo>/plugin`.
+  const excludedCandidate = (skillDir: string): boolean => {
+    const rel = path.relative(pluginDir, skillDir);
+    return isExcludedPluginPath(rel ? `${pluginName}/${rel.split(path.sep).join('/')}` : pluginName, excluded);
+  };
+
   const recordCandidate = (skillDir: string) => {
     if (!hasSkillMd(skillDir)) return;
+    if (excludedCandidate(skillDir)) return;
     // `user-invocable: false` skills are referenceable helpers (e.g.
     // team-verification-before-completion), not user-facing commands. Claude & Codex load
     // them via native plugin loaders — available to reference, hidden from the command list.
@@ -301,8 +323,6 @@ function discoverInPlugin(
   if (isDirectory(multiPluginDir)) {
     for (const sub of fs.readdirSync(multiPluginDir)) {
       const subDir = path.join(multiPluginDir, sub);
-      // Relative to the plugins root, assembled from this walk's own names.
-      if (isExcludedPluginPath(`${pluginName}/plugins/${sub}`, excluded)) continue;
       if (skipCodexNative(subDir)) continue;
       const subKey = `${pluginName}/plugins/${sub}/skills`;
       if (denySubPluginSkillDirs.has(subKey)) continue;
@@ -322,7 +342,6 @@ function discoverInPlugin(
   for (const sub of fs.readdirSync(pluginDir)) {
     if (RUNTIME_SPECIFIC_DIRS.has(sub)) continue;
     const subDir = path.join(pluginDir, sub);
-    if (isExcludedPluginPath(`${pluginName}/${sub}`, excluded)) continue;
     if (!isDirectory(subDir)) continue;
     if (!fs.existsSync(path.join(subDir, '.claude-plugin', 'plugin.json'))) continue;
     if (skipCodexNative(subDir)) continue;
@@ -355,9 +374,20 @@ export interface DiscoverOptions {
    * A group's `excludePlugins`, already split (`./plugin-exclusions.js`).
    * Honoured for BOTH shapes: a top-level entry drops the repo, a sub-plugin
    * path drops that sub-plugin's skills while the rest of the repo still
-   * mirrors. Defaults to "nothing excluded" — the host copy's callers
-   * (`src/opencode-sync.ts`, `scripts/enable-agent-plugin.ts`) build mirrors
-   * that are not scoped to one agent group and so have no list to apply.
+   * mirrors. Defaults to "nothing excluded".
+   *
+   * NO HOST CALLER PASSES IT, and that is not an oversight to fix by finding
+   * one. Every host caller builds a mirror shared across groups
+   * (`syncOpenCodePluginSkills`, `src/opencode-sync.ts`;
+   * `scripts/enable-agent-plugin.ts`) and so has no group's list in hand, and
+   * the one host consumer that IS per-group asks the predicate about each
+   * discovered skill's own path rather than filtering the walk
+   * (`excludedOpenCodeSkillNames`, `src/providers/opencode.ts`). The option
+   * stays because this file is maintained as the twin of
+   * `container/agent-runner/src/plugin-skill-discovery.ts`, where it is live
+   * and per-group; letting the two diverge is how a walker's behaviour stops
+   * being reviewable in one place. Its behaviour is pinned by the twin's tests
+   * (`container/agent-runner/src/plugin-exclusion-walkers.test.ts`).
    */
   excludePlugins?: ExcludedPlugins;
 }

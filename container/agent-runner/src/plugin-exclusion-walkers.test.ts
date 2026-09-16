@@ -208,6 +208,35 @@ describe('skill mirror discoverPortableSkills', () => {
     ]);
   });
 
+  it('drops an excluded sub-plugin in the `plugin/`, cursor and claude-plugin layouts too', () => {
+    // Rules 4-6 of the discovery order walk root-level sub-plugin directories
+    // by fixed name — `plugin/`, `<repo>-cursor-integration/`,
+    // `<repo>-claude-plugin/`. They ran BEFORE the only exclusion check this
+    // walker had, and first-match-wins meant an excluded sub-plugin in one of
+    // those shapes was already recorded by the time the check ran, while
+    // Claude's and Codex's walkers honoured the same entry. The check now sits
+    // at the one seam every rule ends in.
+    const repo = path.join(root, 'layouts');
+    writeJson(path.join(repo, '.claude-plugin', 'plugin.json'), { name: 'layouts' });
+    writeSkill(path.join(repo, 'plugin', 'skills', 'via-plugin-dir'), 'via-plugin-dir');
+    writeSkill(path.join(repo, 'layouts-cursor-integration', 'skills', 'via-cursor'), 'via-cursor');
+    writeSkill(path.join(repo, 'layouts-claude-plugin', 'skills', 'via-claude-plugin'), 'via-claude-plugin');
+
+    expect(skillNames(undefined)).toContain('via-plugin-dir');
+    expect(skillNames(undefined)).toContain('via-cursor');
+    expect(skillNames(undefined)).toContain('via-claude-plugin');
+
+    expect(skillNames(['layouts/plugin'])).not.toContain('via-plugin-dir');
+    expect(skillNames(['layouts/layouts-cursor-integration'])).not.toContain('via-cursor');
+    expect(skillNames(['layouts/layouts-claude-plugin'])).not.toContain('via-claude-plugin');
+
+    // Excluding one of them withholds only that one.
+    const afterPluginDir = skillNames(['layouts/plugin']);
+    expect(afterPluginDir).toContain('via-cursor');
+    expect(afterPluginDir).toContain('via-claude-plugin');
+    expect(afterPluginDir).toContain('wwbd');
+  });
+
   it('drops a whole repo for a top-level entry', () => {
     expect(skillNames(['bootstrap'])).toEqual(['data', 'docs', 'standalone']);
     // A single-plugin repo: its skills come from the repo root (rules 1-6), not

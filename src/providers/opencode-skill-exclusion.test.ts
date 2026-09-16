@@ -71,6 +71,27 @@ describe('excludedOpenCodeSkillNames', () => {
     expect(dropped.has('orchestrate')).toBe(false);
   });
 
+  it('covers the `plugin/` root layout, which discovery walks by fixed name', () => {
+    // discoverPortableSkills reaches a skill at `<repo>/plugin/skills/<name>`
+    // by a fixed-name rule, not by the manifest-gated sub-plugin rules. This
+    // drop set never asks discovery to filter — it asks the predicate about
+    // each discovered skill's own path — so the layout is covered by ancestor
+    // coverage over `path.relative(pluginsRoot, skillDir)` rather than by
+    // anything layout-specific. That is what this pins: the same entry that
+    // withholds the sub-plugin from the container walkers also withholds its
+    // skill from the session XDG copy.
+    writeSkill(path.join(plugins, 'layouts', 'plugin', 'skills', 'via-plugin-dir'), 'via-plugin-dir');
+    expect([...excludedOpenCodeSkillNames(plugins, splitExcludedPlugins(['layouts/plugin']))]).toEqual([
+      'via-plugin-dir',
+    ]);
+    // And an unrelated exclusion leaves it alone.
+    expect(
+      excludedOpenCodeSkillNames(plugins, splitExcludedPlugins(['bootstrap/plugins/orchestrate'])).has(
+        'via-plugin-dir',
+      ),
+    ).toBe(false);
+  });
+
   it('drops a duplicated name when the EXCLUDED source is the one the mirror published', () => {
     // The inverse of the case above, and the one a name-only difference got
     // wrong: `bootstrap` sorts before `zulu`, so the excluded sub-plugin wins
