@@ -98,15 +98,15 @@ export function loadExcludedPlugins(configPath = CONTAINER_CONFIG_PATH): Exclude
   if (split.topLevel.size || split.subPaths.size) {
     // Logged once per container, at the only place the list is read.
     //
-    // This is the ONLY observability an exclusion gets, and it deliberately
-    // reports what was DECLARED, not what was found: an entry naming a
-    // sub-plugin this checkout does not carry (never cloned, renamed, typo) is
-    // a no-op, and the walkers below simply never meet that path. Refusing the
-    // spawn over it would take the whole group down for a line with no effect —
-    // the #826 shape — and "warn that it matched nothing" would mean asking
-    // three walkers to report back so one of them could decide the operator was
-    // wrong. The declared list plus each walker's own output is enough to tell
-    // an applied entry from an inert one.
+    // Reports what was DECLARED, not what was found, and that split of
+    // responsibility is deliberate: the HOST already refused this spawn if any
+    // entry names a path the tree does not carry, walking each entry segment by
+    // segment before the mounts are built (`src/container-runner.ts`). So by
+    // the time this line runs, every entry matched something. Re-deciding that
+    // here would mean asking three walkers to report back, in a process that
+    // cannot see the host's tree any better than the host could. The declared
+    // list plus each walker's own output is what makes an applied entry
+    // legible in a container log.
     log(
       `excludePlugins: ${[...split.topLevel, ...split.subPaths].sort().join(', ')} ` +
         `(read from ${configPath}; applied by every plugin walker in this container)`,

@@ -227,8 +227,11 @@ next spawn, and the enabler run is just a verification pass.
    HOST to predict what a container's own walkers would resolve, and an absolute symlink
    inside the repo is absent to a host `statSync` while live once the repo is mounted, so
    the exclusion silently did not apply. Nothing here predicts: each walker asks about a
-   path it assembled itself. An entry naming a sub-plugin this install does not carry is
-   an inert no-op, logged once at container startup — not a spawn failure. Use a
+   path it assembled itself. An entry naming a path this install does not carry REFUSES
+   THE SPAWN — the mount builder walks every entry segment by segment against the real
+   tree and throws on the first one missing, naming the group and the entries, because an
+   exclusion that matches nothing withholds nothing. Fix or remove the entry; a typo and
+   an uninstalled plugin look identical from the config. Use a
    TOP-LEVEL entry when you want the bytes gone from the mount as well.
 
    `excludePlugins` is the only per-group opt-out, and it is not uniform. (A plugin that

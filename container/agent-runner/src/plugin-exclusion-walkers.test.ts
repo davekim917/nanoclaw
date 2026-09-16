@@ -274,10 +274,13 @@ describe('the three walkers and the predicate agree', () => {
 });
 
 describe('an exclusion that matches nothing', () => {
-  it('is a no-op, not a failure — the walkers deliver exactly what they would have', () => {
-    // An operator can name a sub-plugin that was never checked out, or misspell
-    // one. Refusing the spawn over that would take a group down for a line with
-    // no effect; the walk simply never meets the path.
+  it("leaves every walker's output untouched — the walk simply never meets the path", () => {
+    // The HOST is what refuses an entry naming a path the tree does not carry,
+    // before the mounts are built (`src/container-runner.ts`), so in production
+    // no such entry reaches these walkers. What is pinned here is the walkers'
+    // own behaviour for one that somehow did: they deliver exactly what they
+    // would have, rather than each inventing its own failure for a line the
+    // host already judged.
     const ghost = splitExcludedPlugins(['mono/plugins/does-not-exist', 'knowledge/never-cloned', 'no-such-repo']);
     const none = splitExcludedPlugins(undefined);
     expect(discoverPlugins(root, ghost).plugins).toEqual(discoverPlugins(root, none).plugins);

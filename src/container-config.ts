@@ -787,8 +787,11 @@ export interface ContainerConfig {
    * the host to predict what a container's own walkers would resolve, and an
    * absolute symlink inside the repo is absent to a host `statSync` while live
    * once the repo is mounted, so the exclusion silently did not apply. Nothing
-   * here predicts. An entry naming a sub-plugin this install does not carry is
-   * an inert no-op, logged once at container startup, never a spawn failure.
+   * here predicts. An entry naming a path this install does not carry REFUSES
+   * THE SPAWN, top-level and sub-path alike: the mount builder walks each entry
+   * segment by segment against the real tree and throws when one is missing
+   * (`src/container-runner.ts`). An exclusion that matches nothing withholds
+   * nothing, and a warning nobody reads is how that stays invisible.
    *
    * Validated by `validateExcludePlugins` — a malformed entry throws rather
    * than being silently ignored.
