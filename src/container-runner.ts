@@ -5957,10 +5957,10 @@ const MANAGED_WORKER_DEFS = [
 //
 // Which of the two a dispatch would then resolve to is NOT asserted here —
 // nothing was read that settles it. The prune does not depend on the answer:
-// the retired file is a definition this repo no longer ships, under a name
-// something else now uses, and either outcome of that ambiguity is wrong.
-// Removing it is what makes the question moot. The same holds for any future
-// shim whose name this list has ever carried.
+// one outcome runs a retired definition, the other leaves a dead file under a
+// live name for a reader or a model to pick by mistake. Removing it is what
+// makes the question moot. The same holds for any future shim whose name this
+// list has ever carried.
 
 /**
  * Copy trunk worker subagent defs (container/agents/*.md) into
