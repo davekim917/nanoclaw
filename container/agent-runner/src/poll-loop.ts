@@ -3313,9 +3313,9 @@ export function applyFlagBatch(
  * So: SUPPRESS the sticky rather than replace it. `undefined` is not "no
  * model", it is "no per-TURN override", which lets the group's configured
  * model apply exactly as it does for interactive chat — the host exports it as
- * ANTHROPIC_DEFAULT_OPUS_MODEL at spawn (`claudeSpawnEnv`) and the provider
+ * NANOCLAW_CLAUDE_MODEL at spawn (`claudeSpawnEnv`) and the provider
  * reads it at
- * `input.model ?? stickyConfig.model ?? process.env.ANTHROPIC_DEFAULT_OPUS_MODEL`.
+ * `input.model ?? stickyConfig.model ?? process.env.NANOCLAW_CLAUDE_MODEL`.
  *
  * Deliberately NOT gated on `providerName === 'claude'`: the sticky is
  * provider-neutral, so a codex or opencode task inherits an interactive `-m`

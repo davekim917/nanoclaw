@@ -392,17 +392,36 @@ export function materializeRawImageGeneration(
 // uses low | medium | high | xhigh | max | ultra. Ultra is a real Codex effort
 // value that adds proactive task delegation, not Claude's `ultracode` flag.
 //
-// Default is gpt-5.6-terra at xhigh. Per-agent settings are exceptions only:
-// an unpinned native Codex group and an unpinned Claude → Codex fallback must
-// resolve identically after the source provider's config is discarded.
+// Per-agent settings are exceptions only: an unpinned native Codex group and
+// an unpinned Claude → Codex fallback must resolve identically after the
+// source provider's config is discarded — which is why the fleet default is
+// ONE pair of constants, used by both the schema default below and the model
+// chain in the constructor, and nowhere else.
 //
 // Sticky-only: `model` is applied at thread-start; `reasoning_effort` and the
 // native collaboration cap are applied at app-server spawn. They persist for
 // the query/session. Per-turn overrides for these fields are not currently
 // exposed by Codex's `thread/start` shape.
+/**
+ * The unpinned Codex fleet default: gpt-5.6-sol at `high` reasoning (operator
+ * decision 2026-09-16, replacing gpt-5.6-terra at `xhigh`). It matches the
+ * Claude side's Opus-at-high baseline, so a group's provider decides what runs
+ * it, not what tier it runs at.
+ *
+ * These are the ONLY fleet defaults for Codex. A group pins with
+ * `providerConfig.model`/`reasoning_effort` in container.json, or
+ * `ncl groups config update --model/--effort`, and a pin always wins — nothing
+ * here rewrites one.
+ */
+export const DEFAULT_CODEX_MODEL = 'gpt-5.6-sol';
+export const DEFAULT_CODEX_EFFORT = 'high' as const;
+
 export const codexConfigSchema = z.strictObject({
   model: z.string().min(1).optional(),
-  reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional().default('xhigh'),
+  reasoning_effort: z
+    .enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+    .optional()
+    .default(DEFAULT_CODEX_EFFORT),
   max_concurrent_threads_per_session: z
     .number()
     .int()
@@ -1080,7 +1099,7 @@ export class CodexProvider implements AgentProvider {
     // (host default) > built-in default.
     // Unpinned native Codex groups and unpinned provider fallbacks share this
     // final default. A fallback's primary config is intentionally absent here.
-    this.model = this.stickyConfig.model ?? (options.env?.CODEX_MODEL as string | undefined) ?? 'gpt-5.6-terra';
+    this.model = this.stickyConfig.model ?? (options.env?.CODEX_MODEL as string | undefined) ?? DEFAULT_CODEX_MODEL;
 
     // Fallback OAuth identities. Empty when CODEX_FALLBACK_HOMES is unset
     // (the host didn't mount any fallbacks). Read from process.env rather
@@ -1613,7 +1632,7 @@ export class CodexProvider implements AgentProvider {
 
     return {
       // What this query actually runs, already resolved above. Codex always
-      // names a model (`stickyConfig.model ?? CODEX_MODEL ?? gpt-5.6-terra`), so
+      // names a model (`stickyConfig.model ?? CODEX_MODEL ?? DEFAULT_CODEX_MODEL`), so
       // there is no unknown case here.
       resolvedModel: effectiveModel,
       push: (message: string) => {

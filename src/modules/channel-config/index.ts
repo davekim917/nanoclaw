@@ -15,8 +15,9 @@
  *   1. Per-session flag in chat: -m / -m1 / -e / -e1
  *   2. Per-channel wiring: messaging_group_agents.default_model / _effort  ← this module
  *   3. Per-agent container.json: model / effort, then defaultModel / defaultEffort
- *   4. Install-wide DEFAULT_OPUS_MODEL / DEFAULT_EFFORT constants in
- *      container-runner.ts (single source of truth for "default")
+ *   4. Install-wide DEFAULT_OPUS_MODEL in src/flag-parser.ts (single source of
+ *      truth for "default"); effort has no install-wide constant — with no
+ *      override the claude provider applies its per-model-family default.
  *
  * Authorization (trust-minimal, mirrors permissions/grant.ts):
  *   1. Caller identity derived from session's latest inbound chat message.
