@@ -204,7 +204,7 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     return;
   }
 
-  const fileConfig = updateContainerConfig(agentGroup.folder, (config) => {
+  const fileConfig = await updateContainerConfig(agentGroup.folder, (config) => {
     if (!config.mcpServers) config.mcpServers = {};
     config.mcpServers[name] = serverConfig;
   });

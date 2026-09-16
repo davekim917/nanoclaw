@@ -5,13 +5,14 @@
  * only the resulting topic root, canonical `.git`, pin, and stable lock mounts;
  * they never choose a workgroup or canonical host path themselves.
  */
-import { execFileSync, spawn } from 'child_process';
+import { execFileSync } from 'child_process';
 import { createHash, randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
 import { readCanonicalCommondir, type CanonicalCommondirState } from './canonical-git-commondir.js';
 import { DATA_DIR } from './config.js';
+import { ensureLockFile, withFileLock } from './file-lock.js';
 import { safeGitArgs, safeGitEnv } from './safe-git.js';
 
 const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -137,94 +138,25 @@ export function originPinPath(workgroupId: string, repo: string, dataDir: string
   return path.join(repositoryCoordinationDir(workgroupId, repo, dataDir), 'origin.json');
 }
 
-function openStableRegularFile(file: string): number {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  let fd: number;
-  try {
-    fd = fs.openSync(file, 'wx+', 0o600);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    try {
-      fd = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
-    } catch (openError) {
-      if ((openError as NodeJS.ErrnoException).code === 'ELOOP') {
-        throw new Error(`Repository coordination file must not be a symlink: ${file}`, { cause: openError });
-      }
-      throw openError;
-    }
-  }
-  const stat = fs.fstatSync(fd);
-  if (!stat.isFile()) {
-    fs.closeSync(fd);
-    throw new Error(`Repository coordination path must be a regular file: ${file}`);
-  }
-  return fd;
-}
-
 export function ensureRepositoryLock(workgroupId: string, repo: string, dataDir: string = DATA_DIR): string {
-  const file = repositoryLockPath(workgroupId, repo, dataDir);
-  const fd = openStableRegularFile(file);
-  fs.closeSync(fd);
-  fs.chmodSync(file, 0o600);
-  return file;
+  return ensureLockFile(repositoryLockPath(workgroupId, repo, dataDir));
 }
 
+/**
+ * The flock holder, the acquisition timeout and the lock-identity re-check now
+ * live in `file-lock.ts`, shared with `container.json`'s mutation primitive —
+ * same mechanism, same guarantees, one place to fix. Behaviour here is
+ * unchanged: exclusive, 120s wait, identity verified after acquisition.
+ */
 export async function withHostRepositoryLock<T>(
   workgroupId: string,
   repo: string,
   fn: () => Promise<T> | T,
   dataDir: string = DATA_DIR,
 ): Promise<T> {
-  const lock = ensureRepositoryLock(workgroupId, repo, dataDir);
-  const before = fs.lstatSync(lock);
-  const holder = spawn('flock', ['-x', '-w', '120', lock, 'sh', '-c', 'printf ready; read _'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
+  return withFileLock(ensureRepositoryLock(workgroupId, repo, dataDir), fn, {
+    label: `repository lock for ${workgroupId}/${repo}`,
   });
-
-  await new Promise<void>((resolve, reject) => {
-    let output = '';
-    let stderr = '';
-    const timeout = setTimeout(() => {
-      holder.kill('SIGTERM');
-      reject(new Error(`timed out acquiring repository lock for ${workgroupId}/${repo}`));
-    }, 125_000);
-    holder.stdout.setEncoding('utf8');
-    holder.stderr.setEncoding('utf8');
-    holder.stderr.on('data', (chunk: string) => {
-      stderr += chunk;
-    });
-    holder.stdout.on('data', (chunk: string) => {
-      output += chunk;
-      if (output.includes('ready')) {
-        clearTimeout(timeout);
-        resolve();
-      }
-    });
-    holder.once('error', (error) => {
-      clearTimeout(timeout);
-      reject(error);
-    });
-    holder.once('close', (code) => {
-      if (!output.includes('ready')) {
-        clearTimeout(timeout);
-        reject(new Error(`failed to acquire repository lock (${code}): ${stderr.trim()}`));
-      }
-    });
-  });
-
-  try {
-    const after = fs.lstatSync(lock);
-    if (!after.isFile() || after.isSymbolicLink() || before.dev !== after.dev || before.ino !== after.ino) {
-      throw new Error(`repository lock identity changed for ${workgroupId}/${repo}`);
-    }
-    return await fn();
-  } finally {
-    holder.stdin.end('\n');
-    await new Promise<void>((resolve) => {
-      if (holder.exitCode !== null) return resolve();
-      holder.once('close', () => resolve());
-    });
-  }
 }
 
 export async function withRepositoryLifecycleClaims<T>(

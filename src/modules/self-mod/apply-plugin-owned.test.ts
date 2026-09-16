@@ -69,7 +69,7 @@ beforeEach(async () => {
     skills: 'all',
     onecliSecrets: [],
   });
-  updateContainerConfig('agent', (cfg) => {
+  await updateContainerConfig('agent', (cfg) => {
     // `plugin` is the provenance marker a template stamps; the runtime type
     // does not declare it, exactly as on disk.
     (cfg as { mcpServers?: Record<string, unknown> }).mcpServers = {

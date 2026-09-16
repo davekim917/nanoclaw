@@ -19,10 +19,11 @@
 import fs from 'fs';
 import path from 'path';
 
-import { GROUPS_DIR, TIMEZONE } from './config.js';
+import { DATA_DIR, GROUPS_DIR, TIMEZONE } from './config.js';
 import { validateContainerResources, type ContainerResources } from './container-resources.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
+import { withFileLock } from './file-lock.js';
 import { log } from './log.js';
 import { validateExcludePlugins } from './plugin-exclusions.js';
 import { TOKEN_SHAPE_PATTERNS } from './secret-scrubber.js';
@@ -1321,6 +1322,13 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
  * directory if necessary. Pretty-printed JSON so diffs in the activation
  * flow are reviewable.
  *
+ * UNLOCKED, and the last step of a mutation rather than a mutation itself.
+ * Every change to an EXISTING config must go through `updateContainerConfig`,
+ * which holds the group's lock across read → mutate → write; calling this
+ * directly on a live group races every other writer and is how #840 happened.
+ * It stays exported for seeding a config from whole cloth (tests, fixtures),
+ * where there is nothing to lose.
+ *
  * Refuses to overwrite an existing file the reader cannot understand as an
  * object. `readContainerConfig` is deliberately tolerant — it reads every field
  * and defaults a document it cannot understand, so a READ never fails on one
@@ -1370,6 +1378,29 @@ export function writeContainerConfig(folder: string, config: ContainerConfig): v
   assertOverwritableContainerConfig(p);
   const dir = path.dirname(p);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  // IN PLACE, deliberately — NOT write-to-temp-and-rename.
+  //
+  // The rename is the textbook atomic write, and an earlier draft of this
+  // change used it. It is wrong HERE, and the reason is a mount:
+  // `groups/<folder>/` is bind-mounted read-WRITE into the agent container at
+  // `/workspace/agent` (`src/container-runner.ts:4677`), the container runs as
+  // the host's own uid (`:7134`), and the ONLY thing protecting this file is a
+  // nested read-only single-file mount of `container.json` itself
+  // (`:4809-4813`). An in-place write stays inside that protection. A sibling
+  // temp file gets none of it — an agent watching the directory can overwrite
+  // the temp file between our close and our rename, and the host then installs
+  // the agent's bytes as the authoritative config: `excludePlugins` emptied,
+  // `onecliSecrets` widened, `mcpServers` rewritten, with nothing downstream
+  // able to tell (`assertOverwritableContainerConfig` inspects only the file
+  // being replaced). That is a worse version of the very harm #840 is about.
+  //
+  // What the rename would have bought is the torn-write case: a crash
+  // mid-`writeFileSync` leaves `{"excludePlugins": ["…"],`, which the tolerant
+  // reader answers "no exclusions" for. That case is already REFUSED rather
+  // than silently repaired by `assertOverwritableContainerConfig` above, and it
+  // is unchanged by this PR. Serializing the writers is what #840 needs;
+  // atomicity against a crash is a separate question and does not justify
+  // handing the agent a write it never had.
   fs.writeFileSync(p, JSON.stringify(config, null, 2) + '\n');
 }
 
@@ -1406,24 +1437,94 @@ function assertOverwritableContainerConfig(p: string): void {
 }
 
 /**
- * Apply a mutator function to a group's container config and persist the
- * result. Convenient for append-style changes like `install_packages` and
- * `add_mcp_server` handlers.
+ * Sidecar lock guarding every mutation of a group's `container.json`.
+ *
+ * A SIDECAR rather than the config file itself. Two reasons, and the second is
+ * the one that decided the path: a lock that IS the data file is fragile
+ * against any future change to how that file is committed (a write-to-temp and
+ * rename would leave every holder locked on an inode the write had already
+ * replaced), and it forces the lock to live wherever the data lives — which
+ * here is exactly where it must not.
+ *
+ * Under DATA_DIR, deliberately NOT beside the config. `groups/<folder>/` is
+ * bind-mounted into the agent container as `/workspace/agent`, so a lock file
+ * there would be visible to the agent and, on a writable mount, deletable by
+ * it — and `withFileLock` treats a changed lock inode as a hard failure
+ * (`file-lock.ts`), which would turn an agent's `rm` into a refused spawn.
+ * `data/` is host-only and never mounted. It also keeps the group folder's
+ * tracked surface exactly what an operator authored.
+ *
+ * Stateless: the file carries no content and is safe to delete while the host
+ * is stopped.
  */
-export function updateContainerConfig(folder: string, mutate: (config: ContainerConfig) => void): ContainerConfig {
-  const config = readContainerConfig(folder);
-  mutate(config);
-  writeContainerConfig(folder, config);
-  return config;
+export function containerConfigLockPath(folder: string): string {
+  return path.join(DATA_DIR, 'locks', 'container-config', `${path.basename(folder)}.lock`);
+}
+
+/**
+ * THE mutation primitive for `groups/<folder>/container.json`. Every writer of
+ * an existing config goes through here — the CLI (`ncl groups config update`),
+ * the self-mod apply path, the spawn path's identity sync
+ * (`ensureRuntimeFields`, `src/container-runner.ts`) and the plugin enabler's
+ * opt-out (`applyOptOut`, `scripts/enable-agent-plugin.ts`, a SEPARATE
+ * process).
+ *
+ * WHAT IT FIXES (#840). All four were read-modify-write over the tolerant
+ * `readContainerConfig` with no lock, version or compare-and-swap anywhere, so
+ * process A's read, process B's whole write, then A's write silently discarded
+ * B's change. `excludePlugins` is what made that more than a config annoyance:
+ * losing it re-enables a plugin an operator deliberately withheld from a group,
+ * with no error anywhere and no reader downstream able to tell. The spawn
+ * path's `ensureRuntimeFields` re-read NARROWED that window and was commented
+ * as "race-safe"; a re-read cannot close it, because the write that follows is
+ * still a separate syscall.
+ *
+ * The lock spans read → mutate → write, so the mutator always sees the freshest
+ * disk state and nothing lands between its read and its commit. It is held
+ * across an `await` of the mutator's own return only if the mutator is async;
+ * keep mutators synchronous and trivial — this is a file lock on the spawn
+ * path, and anything slow inside it blocks every other writer for that group.
+ *
+ * Cross-process by construction (kernel `flock`, see `file-lock.ts`), which is
+ * the requirement: one of the four writers is a hand-run script, so an
+ * in-process mutex would have protected nothing that actually broke.
+ */
+export async function updateContainerConfig(
+  folder: string,
+  mutate: (config: ContainerConfig) => void,
+): Promise<ContainerConfig> {
+  return withFileLock(
+    containerConfigLockPath(folder),
+    () => {
+      const config = readContainerConfig(folder);
+      mutate(config);
+      writeContainerConfig(folder, config);
+      return config;
+    },
+    { label: `container.json for ${folder}` },
+  );
 }
 
 /**
  * Initialize an empty container.json for a group if one doesn't already
- * exist. Idempotent — used from `group-init.ts`.
+ * exist. Idempotent. (This doc used to name `group-init.ts` as the caller; it
+ * has none in `src/` today — `readContainerConfig` tolerates an absent file and
+ * the first real write creates it.)
+ *
+ * Under the same lock as every other writer, and for the same reason: the
+ * check-then-create was not exclusive either, so two concurrent first spawns
+ * could both see "absent" and the loser's empty config could land on top of
+ * whatever the winner's caller wrote next.
  */
-export function initContainerConfig(folder: string): boolean {
-  const p = configPath(folder);
-  if (fs.existsSync(p)) return false;
-  writeContainerConfig(folder, emptyConfig());
-  return true;
+export async function initContainerConfig(folder: string): Promise<boolean> {
+  return withFileLock(
+    containerConfigLockPath(folder),
+    () => {
+      const p = configPath(folder);
+      if (fs.existsSync(p)) return false;
+      writeContainerConfig(folder, emptyConfig());
+      return true;
+    },
+    { label: `container.json for ${folder}` },
+  );
 }
