@@ -127,8 +127,15 @@ export interface TaskUpdate {
    * Values are already validated against the agent's provider vocab by the
    * caller (resolveTaskFlagIntent → parseMessageFlags), so effort is a plain
    * string here — the same loose shape the chat-side FlagIntent carries.
+   *
+   * `null` on an axis CLEARS that axis — the one thing a merge cannot express
+   * by value, because every storable pin is a non-empty string and `undefined`
+   * already means "leave this axis alone". Writing `''` instead would be a
+   * different bug: `parseTaskPin` (task-content.ts:56) reads `''` back as an
+   * absent pin, so the series would DISPLAY unpinned while the key survives in
+   * the envelope for the next merge to resurrect.
    */
-  flagIntent?: { turnModel?: string; turnEffort?: string };
+  flagIntent?: { turnModel?: string | null; turnEffort?: string | null };
   chatLimit?: number;
 }
 
@@ -210,9 +217,22 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
         if (update.quietStatus !== undefined) parsed.quietStatus = update.quietStatus;
         if (update.flagIntent !== undefined) {
           // Merge, don't replace: a model-only change keeps an existing effort
-          // pin (and vice versa).
-          const existing = (parsed.flagIntent as Record<string, unknown> | undefined) ?? {};
-          parsed.flagIntent = { ...existing, ...update.flagIntent };
+          // pin (and vice versa). A `null` axis is the exception — it DELETES
+          // its key, which is what "clear the pin" has to mean here.
+          const merged: Record<string, unknown> = {
+            ...((parsed.flagIntent as Record<string, unknown> | undefined) ?? {}),
+          };
+          for (const [key, value] of Object.entries(update.flagIntent)) {
+            if (value === null) delete merged[key];
+            else merged[key] = value;
+          }
+          // Drop the envelope key once both axes are gone, rather than leaving
+          // `flagIntent: {}` behind. Readers tolerate either (parseTaskPin
+          // answers null for a missing key, task-content.ts:56), but a
+          // byte-level diff of the content is how an operator confirms a pin is
+          // actually gone, and `{}` reads as "something is still pinned here".
+          if (Object.keys(merged).length === 0) delete parsed.flagIntent;
+          else parsed.flagIntent = merged;
         }
         content = JSON.stringify(parsed);
       }

@@ -1516,6 +1516,83 @@ describe('tasks CLI resource', () => {
       const content = JSON.parse(row.content);
       expect(content.flagIntent).toEqual({ turnModel: 'sonnet', turnEffort: 'low' });
     });
+
+    // #842: before this, a pinned series could only be re-pinned, never
+    // unpinned — `--model ""` answered "nothing to update" and `--model null`
+    // was rejected by the vocabulary validator.
+    describe('clearing a pin (#842)', () => {
+      async function pinnedSeries(id: string, pin: Record<string, string>) {
+        const created = await dispatch(
+          {
+            id,
+            command: 'tasks-create',
+            args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z', ...pin },
+          },
+          agentCtx('ag-1', 'chat-1'),
+        );
+        expect(created.ok).toBe(true);
+        if (!created.ok) throw new Error('create failed');
+        return created.data as { session_id: string; series_id: string };
+      }
+
+      function storedContent(sessionId: string, seriesId: string) {
+        const db = new Database(inboundDbPath('ag-1', sessionId), { readonly: true });
+        const row = db.prepare("SELECT content FROM messages_in WHERE kind = 'task' AND id = ?").get(seriesId) as {
+          content: string;
+        };
+        db.close();
+        return JSON.parse(row.content) as Record<string, unknown>;
+      }
+
+      it.each(['', 'null', 'none'])('--model %o --effort %o drops the envelope key entirely', async (clear) => {
+        const { session_id, series_id } = await pinnedSeries(`clr-${clear || 'empty'}`, {
+          model: 'sonnet',
+          effort: 'low',
+        });
+        const upd = await dispatch(
+          {
+            id: `u-${clear || 'empty'}`,
+            command: 'tasks-update',
+            args: { id: series_id, model: clear, effort: clear },
+          },
+          agentCtx('ag-1', 'chat-1'),
+        );
+        expect(upd.ok).toBe(true);
+        // Not `flagIntent: {}` — an empty object reads as "still pinned" to an
+        // operator diffing the envelope.
+        expect(storedContent(session_id, series_id)).not.toHaveProperty('flagIntent');
+      });
+
+      it('clears one axis while setting the other in the same call', async () => {
+        const { session_id, series_id } = await pinnedSeries('clr-mixed', { model: 'sonnet', effort: 'low' });
+        const upd = await dispatch(
+          { id: 'u-mixed', command: 'tasks-update', args: { id: series_id, model: '', effort: 'high', group: 'ag-1' } },
+          agentCtx('ag-1', 'chat-1'),
+        );
+        expect(upd.ok).toBe(true);
+        expect(storedContent(session_id, series_id).flagIntent).toEqual({ turnEffort: 'high' });
+      });
+
+      it('a clear-only update needs no --group: there is no vocabulary to validate against', async () => {
+        const { session_id, series_id } = await pinnedSeries('clr-nogroup', { model: 'sonnet' });
+        const upd = await dispatch(
+          { id: 'u-nogroup', command: 'tasks-update', args: { id: series_id, model: '' } },
+          { caller: 'host' },
+        );
+        expect(upd.ok).toBe(true);
+        expect(storedContent(session_id, series_id)).not.toHaveProperty('flagIntent');
+      });
+
+      it('an effort clear leaves a model pin standing', async () => {
+        const { session_id, series_id } = await pinnedSeries('clr-effort', { model: 'sonnet', effort: 'low' });
+        const upd = await dispatch(
+          { id: 'u-effort', command: 'tasks-update', args: { id: series_id, effort: '' } },
+          agentCtx('ag-1', 'chat-1'),
+        );
+        expect(upd.ok).toBe(true);
+        expect(storedContent(session_id, series_id).flagIntent).toEqual({ turnModel: 'sonnet' });
+      });
+    });
   });
 
   describe('scheduled_audit trail (fleet-hardening Phase 0.2)', () => {
@@ -2668,6 +2745,54 @@ describe('ncl tasks repin', () => {
     expect(storedTaskPin('ag-1', t.session_id, t.series_id)).toEqual({
       turnModel: 'claude-sonnet-5',
       turnEffort: 'xhigh',
+    });
+  });
+
+  // #842: matching is by pin VALUE, so sibling series in a group share a match.
+  // --series-id is how one of them is isolated.
+  describe('--series-id (#842)', () => {
+    it('narrows a value match to one series and leaves its siblings alone', async () => {
+      const target = await makePinnedTask('ag-1', 'target', { model: 'claude-sonnet-5' });
+      const sibling = await makePinnedTask('ag-1', 'sibling', { model: 'claude-sonnet-5' });
+
+      const r = await repin({
+        group: 'ag-1',
+        series_id: target.series_id,
+        from_model: 'claude-sonnet-5',
+        to_model: 'claude-opus-5[1m]',
+      });
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect((r.data as { applied: number }).applied).toBe(1);
+      expect(storedTaskPin('ag-1', target.session_id, target.series_id)).toEqual({ turnModel: 'claude-opus-5[1m]' });
+      expect(storedTaskPin('ag-1', sibling.session_id, sibling.series_id)).toEqual({ turnModel: 'claude-sonnet-5' });
+    });
+
+    it('refuses an id that is not in scope instead of reporting an empty run', async () => {
+      await makePinnedTask('ag-1', 'only', { model: 'claude-sonnet-5' });
+      const r = await repin({
+        group: 'ag-1',
+        series_id: 'no-such-series',
+        from_model: 'claude-sonnet-5',
+        to_model: 'claude-opus-5[1m]',
+      });
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(r.error.message).toContain('no task series no-such-series in scope');
+    });
+
+    it('still honours --from-model: a series in scope that does not match is not rewritten', async () => {
+      const t = await makePinnedTask('ag-1', 'other-pin', { model: 'claude-fable-5-1[1m]' });
+      const r = await repin({
+        group: 'ag-1',
+        series_id: t.series_id,
+        from_model: 'claude-sonnet-5',
+        to_model: 'claude-opus-5[1m]',
+      });
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect((r.data as { matched: number; applied: number }).applied).toBe(0);
+      expect(storedTaskPin('ag-1', t.session_id, t.series_id)).toEqual({ turnModel: 'claude-fable-5-1[1m]' });
     });
   });
 
