@@ -87,7 +87,7 @@ describe('resolveClaudeSpawnDefaults — layer precedence', () => {
   it('test_unconfigured_group_uses_the_native_claude_default', () => {
     // An unpinned native Claude group and an unpinned Codex → Claude fallback
     // reach this same configuration. No effort is emitted: the provider derives
-    // Opus's medium from the resolved model at query time.
+    // Opus's high from the resolved model at query time.
     const r = resolveClaudeSpawnDefaults(cfg());
     expect(r).toEqual({ model: DEFAULT_OPUS_MODEL, effort: undefined, drops: [] });
     expect(r.model).toBe('claude-opus-5[1m]');
@@ -212,7 +212,7 @@ describe('claudeSpawnEnv', () => {
 
   it('claude_spawn_env_matches_the_live_fleet_baseline', () => {
     // This is the unpinned Claude baseline: Opus [1m], and no effort — the
-    // container applies Opus's family default (medium), which is the value no
+    // container applies Opus's family default (high), which is the value no
     // host-side env could express without also pinning every other group.
     expect(pairs(claudeSpawnEnv(cfg())).NANOCLAW_CLAUDE_MODEL).toBe('claude-opus-5[1m]');
     expect(claudeSpawnEnv(cfg()).includes('NANOCLAW_EFFORT_OVERRIDE=')).toBe(false);

@@ -46,7 +46,7 @@ class RecordingProvider extends MockProvider {
  * exposes the result as `resolvedModel`.
  *
  * `GROUP_DEFAULT` stands in for whatever the group's configuration resolves
- * to — `stickyConfig.model ?? ANTHROPIC_DEFAULT_OPUS_MODEL` inside the real
+ * to — `stickyConfig.model ?? NANOCLAW_CLAUDE_MODEL` inside the real
  * provider. The poll loop cannot compute that, which is the whole reason it
  * has to read the value back rather than record what it asked for.
  */

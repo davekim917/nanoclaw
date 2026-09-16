@@ -194,7 +194,7 @@ describe('parseRawConfig provider fallback bridge', () => {
     // container-side guard with its own copy of the host model vocabulary;
     // that guard is gone (it drew three findings in three rounds), because the
     // host already resolves and validates the declaration into
-    // ANTHROPIC_DEFAULT_OPUS_MODEL, which the provider reads directly.
+    // NANOCLAW_CLAUDE_MODEL, which the provider reads directly.
     process.env.NANOCLAW_PROVIDER_OVERRIDE = 'claude';
     const fallback = parseRawConfig({
       ...BASE,

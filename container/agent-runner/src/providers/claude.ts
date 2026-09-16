@@ -2007,8 +2007,10 @@ function ensureOpus1mSuffix(model: string): string {
 }
 
 /**
- * The env var the CLI expands each bare family alias through — the SAME table
- * the send path below uses when it pins a concrete id into `perQueryEnv`.
+ * The env var the CLI expands each bare family alias through. It is read
+ * here only in the alias → concrete id direction (`canonicalUsageModel`); the
+ * send path pins nothing into `perQueryEnv` any more, because a family word
+ * means the same model in every group.
  *
  * The host resolves every alias once at spawn and injects the answers here
  * (`claudeSpawnEnv` in src/claude-spawn-defaults.ts, forwarded by

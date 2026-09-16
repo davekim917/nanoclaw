@@ -12,14 +12,15 @@ Pins are data (no deploy); the defaults are code (needs one). **A group you want
 
 ## 1. Detect
 
-Which Claude groups are unpinned — those are the ones that move.
+Which groups move — and it is **not** just the Claude ones. A declared `providerFallback` resolves through these same defaults, so a Codex group that falls back to Claude moves on the Claude default, and a Claude group that falls back to Codex moves on the Codex one. Measured on this install: 14 fallback paths resolve through a default that moves, and a primary-provider-only check lists none of them.
 
-**Ask the host's own resolver, not a hand-written check.** Two things make a hand-written check wrong, and both bit this doc in review:
+Three things make a hand-written check wrong, and all three were found in review of this PR:
 
 - `groups/<folder>/container.json` is authoritative, not the `container_configs` row `ncl groups config get` prints (`presentConfig`, `src/cli/resources/groups.ts:68-74`) — the spawn path reads the file (`readContainerConfig`), and a DB-only update or hand edit can leave the two disagreeing.
 - **A present `model` is not necessarily a pin.** `resolveClaudeSpawnDefaults` DROPS a value that is not Claude vocabulary and falls through to the default — so a `gpt-*` id left behind by `--provider claude` (which does not clear the previous provider's model), or any typo, reads as pinned and runs as unpinned.
+- **The primary provider is not the only thing that runs.** See above.
 
-So run the resolver itself. From the install root:
+So run the resolver itself, over every group and its fallback. From the install root:
 
 ```bash
 cat > ./claude-default-audit.ts <<'TS'
@@ -29,40 +30,67 @@ import { GROUPS_DIR } from './src/config.js';
 import { readContainerConfig } from './src/container-config.js';
 import { resolveClaudeSpawnDefaults } from './src/claude-spawn-defaults.js';
 
-for (const folder of fs.readdirSync(GROUPS_DIR)) {
+// Codex's fleet defaults live in the container package (a separate Bun tree
+// this host script cannot import), so read them out of their single source
+// rather than restating them. Loud on a rename; never silently stale.
+const codexSrc = fs.readFileSync('container/agent-runner/src/providers/codex.ts', 'utf8');
+const pick = (name: string) => {
+  const m = new RegExp(`export const ${name} = '([^']+)'`).exec(codexSrc);
+  if (!m) throw new Error(`${name} not found — read container/agent-runner/src/providers/codex.ts`);
+  return m[1];
+};
+const CODEX_MODEL = pick('DEFAULT_CODEX_MODEL');
+const CODEX_EFFORT = pick('DEFAULT_CODEX_EFFORT');
+
+// What a spawn on `provider` resolves to, given the model/effort that reaches
+// it. The claude half calls the host's own resolver; the codex half applies
+// its constants the way the provider does (a pin always wins). OpenCode has
+// its own default (DEFAULT_OPENCODE_MODEL, src/providers/opencode.ts) that
+// this change does not touch — say so rather than running it through the
+// wrong resolver.
+const resolve = (provider: string, model?: string | null, effort?: string | null) => {
+  if (provider === 'codex') return { model: model ?? CODEX_MODEL, effort: effort ?? CODEX_EFFORT, drops: [] as string[] };
+  if (provider !== 'claude') return { model: model ?? "(this provider's own default)", effort: effort ?? undefined, drops: [] as string[] };
+  return resolveClaudeSpawnDefaults({ model, effort } as never);
+};
+
+const print = (folder: string, kind: string, provider: string, configured: string | null, effort: string | null) => {
+  const r = resolve(provider, configured, effort);
+  console.log(
+    [folder, kind, provider, configured ?? '(none)', r.model, r.effort ?? '(family default)', r.drops.join('; ') || '-'].join('\t'),
+  );
+};
+
+for (const folder of fs.readdirSync(GROUPS_DIR).sort()) {
   if (!fs.existsSync(path.join(GROUPS_DIR, folder, 'container.json'))) continue;
-  const cfg = readContainerConfig(folder);
-  if ((cfg?.provider ?? 'claude') !== 'claude') continue;
-  const r = resolveClaudeSpawnDefaults(cfg ?? {});
-  console.log([folder, cfg?.model ?? cfg?.defaultModel ?? '(none)', r.model, r.drops.join('; ') || '-'].join('\t'));
+  const cfg = readContainerConfig(folder) as Record<string, any> | undefined;
+  if (!cfg) continue;
+  print(
+    folder,
+    'primary',
+    cfg.provider ?? 'claude',
+    cfg.model ?? cfg.defaultModel ?? cfg.providerConfig?.model ?? null,
+    cfg.effort ?? cfg.defaultEffort ?? cfg.providerConfig?.reasoning_effort ?? null,
+  );
+  // A declared fallback carries its OWN model/effort and nothing else: the
+  // primary's are discarded when it applies (src/provider-fallback.ts), so it
+  // must be resolved from the fallback's own fields, never the group's.
+  const fb = cfg.providerFallback;
+  if (fb?.provider) print(folder, 'fallback', fb.provider, fb.model ?? null, fb.effort ?? null);
 }
 TS
 pnpm exec tsx ./claude-default-audit.ts   # delete the file when you're done
 ```
 
-Columns: folder, the configured value, **what will actually run**, and any value the resolver refused. Run it on the code you have now to see today's answer, and again after deploy to see the new one — it imports the same function the spawn path calls, so it cannot drift from the vocabulary or the precedence chain.
+Columns: folder, primary-or-fallback, provider, that path's own configured value, **what will actually run**, the effort, and anything the resolver refused. A row whose fifth column is not its fourth is unpinned in effect on that path — either nothing was configured, or the last column says what was thrown away. `(family default)` in the effort column means no effort is exported and the provider picks its own (Opus → `high`, Sonnet → `xhigh`, Haiku → none).
 
-A row whose third column is not its second is unpinned in effect: either nothing was configured, or the fourth column says what was thrown away.
+Run it on the code you have now to see today's answers, and again after deploy to see the new ones. It calls the same resolver the spawn path calls and reads the Codex constants out of their own source, so it cannot drift from the vocabulary or the precedence chain.
 
 A per-channel wiring can also pin a model, and it outranks the group config; check any channel you care about:
 
 ```bash
 ncl wirings list --json | jq -r '.data[] | select(.default_model != null) | [.id, .agent_group_id, .messaging_group_id, .default_model] | @tsv'
 ```
-
-A Claude group whose third column already reads `claude-opus-5[1m]`, with no channel pin above it, is staying put. Everything else moves to Opus 5 [1m] at `high` after deploy.
-
-**Codex groups** are simpler: their fleet default is applied inside the container, so a group is unpinned exactly when its `container.json` carries neither `providerConfig.model`/`reasoning_effort` nor a top-level `model`/`effort`. List them with:
-
-```bash
-for f in groups/*/container.json; do
-  jq -r --arg f "$f" 'select(.provider == "codex")
-    | [$f, (.providerConfig.model // .model // "(unpinned)"),
-           (.providerConfig.reasoning_effort // .effort // "(unpinned)")] | @tsv' "$f"
-done
-```
-
-Each column moves independently: a row reading `(unpinned)` in column 2 runs `gpt-5.6-sol` after deploy, and `(unpinned)` in column 3 runs `high`. A configured value in either column is a pin and is untouched. (Measured on this install: every Codex group sets `effort` explicitly, so only the model moves.)
 
 To see the defect itself in a live container before you deploy:
 
