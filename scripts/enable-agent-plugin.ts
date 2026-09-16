@@ -49,7 +49,7 @@ import path from 'path';
 import { readPluginDenySiblings, type AgentRuntime } from '../src/plugin-skill-discovery.js';
 import { findCodexSkillsRoot, materializeSymlinkedSkills } from '../src/codex-skill-materialize.js';
 import { openCodeMirrorSkills, syncOpenCodePluginSkills } from '../src/opencode-sync.js';
-import { readContainerConfig, writeContainerConfig } from '../src/container-config.js';
+import { readContainerConfig, updateContainerConfig } from '../src/container-config.js';
 import { GROUPS_DIR } from '../src/config.js';
 
 const PLUGINS_ROOT = path.join(os.homedir(), 'plugins');
@@ -452,7 +452,17 @@ function resolveCodexRegistration(dir: string, name: string, dryRun: boolean): C
   return { skillsRoot, manifestGenerated, marketplaceGenerated, registerable: self !== null, reason };
 }
 
-function applyOptOut(exclude: string[], pluginName: string, dryRun: boolean): string[] {
+/**
+ * This runs in a SEPARATE PROCESS from the host, which is why the primitive it
+ * calls has to be cross-process. Its own read-modify-write used to race the
+ * host's spawn-time identity write, and the field it lost — `excludePlugins` —
+ * is the one that withholds a plugin from a group on purpose (#840).
+ *
+ * The dry-run branch reads and reports without taking the lock: it writes
+ * nothing, so there is nothing to serialize, and its answer is a snapshot
+ * either way.
+ */
+async function applyOptOut(exclude: string[], pluginName: string, dryRun: boolean): Promise<string[]> {
   const applied: string[] = [];
   for (const folder of exclude) {
     const groupDir = path.join(GROUPS_DIR, folder);
@@ -460,17 +470,27 @@ function applyOptOut(exclude: string[], pluginName: string, dryRun: boolean): st
       console.warn(`  opt-out: group folder not found, skipped: ${folder}`);
       continue;
     }
-    const cfg = readContainerConfig(folder);
-    const set = new Set(cfg.excludePlugins ?? []);
-    if (set.has(pluginName)) continue;
-    set.add(pluginName);
-    if (!dryRun) writeContainerConfig(folder, { ...cfg, excludePlugins: [...set] });
-    applied.push(folder);
+    if (dryRun) {
+      if (!new Set(readContainerConfig(folder).excludePlugins ?? []).has(pluginName)) applied.push(folder);
+      continue;
+    }
+    // The "already excluded" check moves INSIDE the lock with the write it
+    // guards: deciding outside it is the same check-then-act the primitive
+    // exists to remove.
+    let added = false;
+    await updateContainerConfig(folder, (cfg) => {
+      const set = new Set(cfg.excludePlugins ?? []);
+      if (set.has(pluginName)) return;
+      set.add(pluginName);
+      cfg.excludePlugins = [...set];
+      added = true;
+    });
+    if (added) applied.push(folder);
   }
   return applied;
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const { target, exclude, deny: denyFlags, allow: allowFlags, dryRun, reportJson } = parseArgs();
   const { name, dir } = resolvePluginDir(target);
 
@@ -553,7 +573,7 @@ function main(): void {
     opencodeCreated = syncOpenCodePluginSkills().created;
   }
 
-  const optedOut = applyOptOut(exclude, name, dryRun);
+  const optedOut = await applyOptOut(exclude, name, dryRun);
 
   if (reportJson) {
     console.log(JSON.stringify({ ...classification, optedOut, opencodeCreated, dryRun }, null, 2));
@@ -608,4 +628,7 @@ function main(): void {
   }
 }
 
-main();
+main().catch((err: unknown) => {
+  console.error(err instanceof Error ? err.message : String(err));
+  process.exit(1);
+});

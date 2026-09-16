@@ -42,8 +42,8 @@ import {
   effectiveTimezone,
   readContainerConfig,
   readContainerConfigForSpawn,
+  updateContainerConfig,
   validateMcpServers,
-  writeContainerConfig,
   resolveContainerSecurity,
   splitExcludedPlugins,
   type ContainerConfig,
@@ -1689,7 +1689,7 @@ async function spawnContainer(
 
   // Ensure container.json has the agent group identity fields the runner needs.
   // Written at spawn time so the runner can read them from the RO mount.
-  ensureRuntimeFields(containerConfig, agentGroup);
+  await ensureRuntimeFields(containerConfig, agentGroup);
 
   // Workgroup reconciliation — runs at every spawn.
   // Keeps agent_groups.workgroup_id and workgroups rows in sync with the
@@ -5980,10 +5980,10 @@ function syncWorkerAgentDefs(claudeDir: string): void {
  * change (e.g. group rename). Only writes if values differ to avoid
  * unnecessary file churn.
  */
-function ensureRuntimeFields(
+async function ensureRuntimeFields(
   containerConfig: import('./container-config.js').ContainerConfig,
   agentGroup: AgentGroup,
-): void {
+): Promise<void> {
   let dirty = false;
   if (containerConfig.agentGroupId !== agentGroup.id) {
     containerConfig.agentGroupId = agentGroup.id;
@@ -6002,21 +6002,21 @@ function ensureRuntimeFields(
   // file untouched preserves whatever the operator (or
   // `container_configs.assistant_name`) wrote without per-channel churn.
   if (dirty) {
-    // Race-safe write: re-read container.json immediately before persisting
-    // and merge our identity fields onto the freshest disk state. Without
-    // this, a concurrent config-mutating script can have its
-    // update silently clobbered when our write lands later in the spawn
-    // flow with a stale in-memory containerConfig.
-    //
-    // This read/merge/write shape preserves any operator-owned fields written
-    // after the spawn began.
-    const fresh = readContainerConfig(agentGroup.folder);
-    fresh.agentGroupId = agentGroup.id;
-    fresh.groupName = agentGroup.name;
-    writeContainerConfig(agentGroup.folder, fresh);
-    // Sync the in-memory copy with anything the concurrent writer may have
-    // added between our read and write — downstream spawn code reads other
-    // fields from containerConfig and would otherwise miss those updates.
+    // Through the ONE mutation primitive, which holds the group's file lock
+    // across read → mutate → write. This was a bare re-read plus a write,
+    // commented "race-safe": the re-read narrowed the window in which a
+    // concurrent writer's change could be overwritten, but two separate
+    // syscalls cannot close it, and what fell through was a silently discarded
+    // `excludePlugins` (#840). The read/merge/write shape is unchanged — any
+    // operator-owned field written after the spawn began is still preserved —
+    // it is now exclusive as well.
+    const fresh = await updateContainerConfig(agentGroup.folder, (config) => {
+      config.agentGroupId = agentGroup.id;
+      config.groupName = agentGroup.name;
+    });
+    // Sync the in-memory copy with anything a writer that got in before us may
+    // have added — downstream spawn code reads other fields from
+    // containerConfig and would otherwise miss those updates.
     if (fresh.tools !== undefined) containerConfig.tools = fresh.tools;
     if (fresh.mcpServers !== undefined) containerConfig.mcpServers = fresh.mcpServers;
   }

@@ -277,8 +277,8 @@ describe('MCP server transport validation', () => {
 });
 
 describe('MCP server cwd (Agent Plugins fixed forms)', () => {
-  it('a stdio server declaring cwd survives the round trip through container.json', () => {
-    updateContainerConfig('test-mcp-cwd-roundtrip', (config) => {
+  it('a stdio server declaring cwd survives the round trip through container.json', async () => {
+    await updateContainerConfig('test-mcp-cwd-roundtrip', (config) => {
       config.mcpServers = {
         plugged: {
           command: 'node',

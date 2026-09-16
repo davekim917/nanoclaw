@@ -306,7 +306,7 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
     //         the rollback story clean: any failure here also rolls back the
     //         folder via safeRemoveFolder.
     try {
-      updateContainerConfig(folder, (c) => {
+      await updateContainerConfig(folder, (c) => {
         c.agentGroupId = agentGroupId;
         // Written HERE, before the DB insert and therefore before any spawn:
         // the spawn path reads container.json, not the DB row, so a child

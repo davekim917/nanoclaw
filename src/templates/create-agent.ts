@@ -151,7 +151,7 @@ export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOpt
   // path hands the container as its TZ.
   if (timezone) {
     await updateContainerConfigScalars(id, { timezone });
-    updateContainerConfig(folder, (config) => {
+    await updateContainerConfig(folder, (config) => {
       config.timezone = timezone;
     });
   }
@@ -193,7 +193,7 @@ export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOpt
   // empty config. The file carries the container-side marks; the ownership
   // marker rides only on the projection (see `withPluginOwner`).
   const marked = withPluginOwner(markPluginServers(tpl.mcpServers, tpl.name), tpl.name);
-  updateContainerConfig(folder, (config) => {
+  await updateContainerConfig(folder, (config) => {
     config.mcpServers = { ...(config.mcpServers ?? {}), ...marked };
   });
   await updateContainerConfigJson(id, 'mcp_servers', marked);
