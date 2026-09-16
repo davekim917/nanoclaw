@@ -8,6 +8,7 @@ import {
   buildCodexHooksJson,
   createCodexConfigOverrides,
   interruptCodexTurn,
+  listCodexHooks,
   steerCodexTurn,
   parseTomlTableHeader,
   probeCodexThreadHealth,
@@ -683,5 +684,62 @@ describe('writeCodexMcpConfigToml', () => {
       fs.rmSync(home, { recursive: true, force: true });
       fs.rmSync(fallback, { recursive: true, force: true });
     }
+  });
+});
+
+describe('listCodexHooks', () => {
+  /**
+   * Response shape captured from codex-cli 0.154.0 against a scratch
+   * CODEX_HOME: `data` is one group PER CWD (project-local hook files are
+   * discovered per working directory), each carrying its own `hooks`,
+   * `warnings` and `errors`.
+   */
+  const group = (cwd: string, keys: string[]) => ({
+    cwd,
+    hooks: keys.map((key) => ({ key, enabled: true, trustStatus: 'trusted', sourcePath: '/h/hooks.json' })),
+    warnings: [],
+    errors: [],
+  });
+
+  it('sends params as {} — codex REFUSES the request with no params member', () => {
+    // Measured: omitting `params` is answered
+    // `Invalid request: missing field \`params\`` (-32600). The opposite of
+    // account/rateLimits/read above, whose params deserialize as unit.
+    const { server, requests, lines } = fakeAppServer(() => ({ result: { data: [] } }));
+    return listCodexHooks(server).then(() => {
+      expect(requests[0].method).toBe('hooks/list');
+      expect(requests[0].params).toEqual({});
+      expect(lines[0]).toContain('"params":{}');
+    });
+  });
+
+  it('flattens handlers across every cwd group', async () => {
+    const { server } = fakeAppServer(() => ({
+      result: { data: [group('/workspace/agent', ['a', 'b']), group('/tmp', ['c'])] },
+    }));
+    const listed = await listCodexHooks(server);
+    expect(listed.entries.map((e) => e.key)).toEqual(['a', 'b', 'c']);
+  });
+
+  it('collects per-group warnings and errors', async () => {
+    const { server } = fakeAppServer(() => ({
+      result: { data: [{ cwd: '/x', hooks: [], warnings: ['w1'], errors: ['e1'] }] },
+    }));
+    const listed = await listCodexHooks(server);
+    expect(listed.warnings).toEqual(['w1']);
+    expect(listed.errors).toEqual(['e1']);
+  });
+
+  it('throws on an RPC error and on a malformed result', async () => {
+    const rejected = fakeAppServer(() => ({ error: { code: -32601, message: 'method not found' } }));
+    await expect(listCodexHooks(rejected.server)).rejects.toThrow(/method not found/);
+    const malformed = fakeAppServer(() => ({ result: { hooks: [] } }));
+    await expect(listCodexHooks(malformed.server)).rejects.toThrow(/missing data array/);
+  });
+
+  it('tolerates a group with no hooks array and drops non-object rows', async () => {
+    const { server } = fakeAppServer(() => ({ result: { data: [{ cwd: '/x' }, { cwd: '/y', hooks: [null, 'x'] }] } }));
+    const listed = await listCodexHooks(server);
+    expect(listed.entries).toEqual([]);
   });
 });

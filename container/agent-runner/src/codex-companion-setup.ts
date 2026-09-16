@@ -41,7 +41,9 @@ import path from 'path';
 import { loadExcludedPlugins } from './excluded-plugins.js';
 import { isExcludedPluginPath, type ExcludedPlugins } from './plugin-exclusions.js';
 import {
+  type AppServer,
   buildCodexHooksJson,
+  listCodexHooks,
   parseTomlTableHeader,
   tomlBasicString,
   tomlKey,
@@ -49,8 +51,10 @@ import {
 } from './providers/codex-app-server.js';
 import {
   type CodexHookTrustEntry,
+  classifyCodexHookList,
   collectCodexHookTrustEntries,
   collectPluginHookTrustEntries,
+  formatCodexHookTrustProblem,
   mergeCodexHookTrustIntoToml,
 } from './providers/codex-hook-trust.js';
 import {
@@ -417,6 +421,90 @@ export function readCodexConfigToml(configPath: string): string {
 }
 
 /**
+ * Trust entries for the hooks.json NanoClaw GENERATES into `codexHome` — the
+ * PreToolUse/PostToolUse destructive-action guard chain, and nothing else.
+ *
+ * Shared by the writer (`syncCodexHookTrust`) and the runtime verifier
+ * (`verifyCodexHookTrust`) so the check cannot drift from the write and quietly
+ * assert a different key set than the one that was written.
+ */
+function generatedHookTrustEntries(codexHome: string, opts?: { emailGateTimeoutSec?: number }): CodexHookTrustEntry[] {
+  return collectCodexHookTrustEntries(path.join(codexHome, 'hooks.json'), buildCodexHooksJson(opts).hooks);
+}
+
+/**
+ * Assert against the RUNNING app-server that every generated guard handler will
+ * actually be dispatched. Throws — a refused spawn — when any will not.
+ *
+ * Call after `initializeCodexAppServer` on the same connection. Cost measured on
+ * codex 0.154.0 against a scratch CODEX_HOME: 11 ms for the first `hooks/list`,
+ * 2 ms after, so this runs on EVERY app-server spawn rather than once a session.
+ *
+ * **Deliberately fatal, including when the RPC itself fails.** The failure this
+ * exists to catch is silent by construction: a handler whose hash does not match
+ * reports `untrusted` and is simply never dispatched, while the session runs
+ * normally. A version drift that removes or renames `hooks/list` is the same
+ * class of event as one that changes the hashed field set, so degrading to a
+ * warning here would restore exactly the silence the check is for. A Codex
+ * container that cannot prove its guard chain live does not start.
+ *
+ * Scoped to the generated handlers. A mounted plugin's hook reading back
+ * undispatchable is LOGGED, not fatal: one oddly-shaped third-party plugin must
+ * not take the container down, and the guard core does not depend on any plugin
+ * being mounted.
+ */
+export async function verifyCodexHookTrust(
+  server: AppServer,
+  codexHome: string,
+  opts?: { emailGateTimeoutSec?: number },
+): Promise<void> {
+  const expected = generatedHookTrustEntries(codexHome, opts).map((entry) => entry.key);
+  if (expected.length === 0) {
+    // buildCodexHooksJson always emits both events, so an empty set means the
+    // collector stopped recognizing its own output — fail closed rather than
+    // vacuously pass.
+    throw new Error(
+      `Codex hook trust verification: derived NO expected handler keys for ${codexHome} — ` +
+        `refusing to spawn an app-server whose guard chain cannot be checked.`,
+    );
+  }
+
+  let listed;
+  try {
+    listed = await listCodexHooks(server);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    log(
+      `FAIL-CLOSED: could not read hooks/list from the app-server — the destructive-action guard chain ` +
+        `cannot be proven live, so the spawn is refused: ${detail}`,
+    );
+    throw new Error(`Codex hook trust verification failed (hooks/list unavailable): ${detail}`);
+  }
+
+  const verdict = classifyCodexHookList(listed.entries, expected);
+  for (const problem of verdict.plugin) {
+    log(`Plugin hook will NOT fire (reported, not fatal): ${formatCodexHookTrustProblem(problem)}`);
+  }
+  for (const warning of listed.warnings) log(`hooks/list warning: ${warning}`);
+  for (const error of listed.errors) log(`hooks/list error: ${error}`);
+
+  if (verdict.generated.length > 0) {
+    const detail = verdict.generated.map(formatCodexHookTrustProblem).join('; ');
+    log(
+      `FAIL-CLOSED: ${verdict.generated.length} of ${expected.length} generated guard handler(s) in ${codexHome} ` +
+        `would NEVER be dispatched by this codex — ${detail}. ` +
+        `Refusing the spawn: a Codex session with an inert destructive-action guard is the exact silent ` +
+        `state this check exists to make unreachable.`,
+    );
+    throw new Error(`Codex hook trust verification failed for ${codexHome}: ${detail}`);
+  }
+
+  log(
+    `Hook trust verified live: ${verdict.generatedOk.length} generated guard handler(s) dispatchable in ${codexHome}`,
+  );
+}
+
+/**
  * Rewrite the `[hooks.state.*]` tables in `<codexHome>/config.toml` so every
  * hook this container generates or mounts is TRUSTED.
  *
@@ -437,7 +525,7 @@ export function syncCodexHookTrust(
 ): void {
   const configPath = path.join(codexHome, 'config.toml');
   const entries = [
-    ...collectCodexHookTrustEntries(path.join(codexHome, 'hooks.json'), buildCodexHooksJson(opts).hooks),
+    ...generatedHookTrustEntries(codexHome, opts),
     ...pluginHookTrustEntries(opts?.pluginsRoot ?? CONTAINER_PLUGINS_DIR),
   ];
   const existing = readCodexConfigToml(configPath);

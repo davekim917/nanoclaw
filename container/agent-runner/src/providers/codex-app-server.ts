@@ -542,6 +542,79 @@ export async function readCodexAccountRateLimits(
   return parsed;
 }
 
+// ── hooks/list ──────────────────────────────────────────────────────────────
+
+/**
+ * One handler as `hooks/list` reports it. Fields are those codex 0.154.0
+ * actually emits, measured against a scratch `CODEX_HOME`; everything is
+ * optional because this is a foreign wire shape and a pin move may drop or
+ * rename a field. The three the trust check reads — `key`, `enabled`,
+ * `trustStatus` — are exactly the three codex's own dispatch predicate reads
+ * (`hooks/src/engine/discovery.rs:713-718`: `enabled && (bypass_hook_trust ||
+ * trust_status is Managed | Trusted)`).
+ */
+export interface CodexHookListEntry {
+  key?: string;
+  eventName?: string;
+  handlerType?: string;
+  command?: string;
+  sourcePath?: string;
+  /** `"user"` for a hooks.json in the home, `"plugin"` for a registered plugin. */
+  source?: string;
+  pluginId?: string | null;
+  enabled?: boolean;
+  isManaged?: boolean;
+  currentHash?: string;
+  /** `"trusted" | "managed" | "modified" | "untrusted"` on 0.154.0. */
+  trustStatus?: string;
+}
+
+export interface CodexHookListResult {
+  entries: CodexHookListEntry[];
+  /** Per-source diagnostics codex attaches to the listing, flattened. */
+  warnings: string[];
+  errors: string[];
+}
+
+export const CODEX_HOOKS_LIST_METHOD = 'hooks/list';
+
+/**
+ * Read back every hook the app-server actually loaded, with its trust status.
+ *
+ * **`params` is `{}`, not omitted.** Measured on 0.154.0: sending the request
+ * with no `params` member is refused at the JSON-RPC boundary with
+ * `Invalid request: missing field \`params\`` — the opposite of
+ * `account/rateLimits/read` above, whose params deserialize as unit. Do not
+ * "harmonize" the two.
+ *
+ * The result is `{ data: [ { cwd, hooks: [...], warnings, errors } ] }` — one
+ * group per cwd, because project-local hook files are discovered per working
+ * directory. Every group's handlers are flattened into one list; the caller
+ * scopes by `sourcePath`.
+ */
+export async function listCodexHooks(server: AppServer, timeoutMs = 15_000): Promise<CodexHookListResult> {
+  const resp = await sendCodexRequest(server, CODEX_HOOKS_LIST_METHOD, {}, timeoutMs);
+  if (resp.error) throw new Error(`${CODEX_HOOKS_LIST_METHOD} failed: ${resp.error.message}`);
+  const result = resp.result as { data?: unknown } | undefined;
+  const groups = result?.data;
+  if (!Array.isArray(groups)) throw new Error(`${CODEX_HOOKS_LIST_METHOD} response missing data array`);
+
+  const entries: CodexHookListEntry[] = [];
+  const warnings: string[] = [];
+  const errors: string[] = [];
+  for (const rawGroup of groups) {
+    const group = (rawGroup ?? {}) as { hooks?: unknown; warnings?: unknown; errors?: unknown };
+    if (Array.isArray(group.hooks)) {
+      for (const hook of group.hooks) {
+        if (hook && typeof hook === 'object') entries.push(hook as CodexHookListEntry);
+      }
+    }
+    if (Array.isArray(group.warnings)) warnings.push(...group.warnings.map((w) => String(w)));
+    if (Array.isArray(group.errors)) errors.push(...group.errors.map((e) => String(e)));
+  }
+  return { entries, warnings, errors };
+}
+
 /** Best-effort graceful cancellation before replacing a responsive server. */
 export async function interruptCodexTurn(
   server: AppServer,

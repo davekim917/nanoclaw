@@ -5,10 +5,12 @@ import path from 'path';
 
 import {
   HOOK_TRUST_MARKER,
+  classifyCodexHookList,
   codexHookTrustHash,
   collectCodexHookTrustEntries,
   collectPluginHookTrustEntries,
   declaredPluginHookFiles,
+  isCodexHookDispatchable,
   mergeCodexHookTrustIntoToml,
   renderCodexHookTrustBlock,
 } from './codex-hook-trust.js';
@@ -374,5 +376,129 @@ describe('plugin hook trust', () => {
         hash: codexHookTrustHash('SessionStart', { type: 'command', command: '/bin/true', timeout: 9 }),
       },
     ]);
+  });
+});
+
+// ── runtime verification (hooks/list) ──────────────────────────────────────
+
+/**
+ * Real `hooks/list` rows from codex-cli 0.154.0, captured against a scratch
+ * CODEX_HOME holding exactly the generated `hooks.json`
+ * (`buildCodexHooksJson`). The first capture had NO `[hooks.state.*]` entries
+ * and every row read back `untrusted`; writing the entries this module derives
+ * flipped both to `trusted` with `currentHash` byte-identical to our hash.
+ *
+ * Kept as literal fixtures rather than a hand-written shape so the field
+ * spelling (`trustStatus`, not `trust_status`; `enabled`, not `isEnabled`) is
+ * pinned to what the binary emits.
+ */
+const LISTED_UNTRUSTED = {
+  key: '/probe/home/hooks.json:pre_tool_use:0:0',
+  eventName: 'preToolUse',
+  handlerType: 'command',
+  command: 'bun /app/src/codex-hooks/cli.ts PreToolUse',
+  matcher: null,
+  timeoutSec: 3600,
+  sourcePath: '/probe/home/hooks.json',
+  source: 'user',
+  pluginId: null,
+  enabled: true,
+  isManaged: false,
+  currentHash: 'sha256:ebc36aabcd4f59a8dbe0f85c78187466b8e568381df304cd1ad12e73d124d3e5',
+  trustStatus: 'untrusted',
+};
+const LISTED_TRUSTED = { ...LISTED_UNTRUSTED, trustStatus: 'trusted' };
+
+describe('isCodexHookDispatchable — codex’s own predicate', () => {
+  // discovery.rs:713-718 — `enabled && (bypass || trust_status in {Managed, Trusted})`.
+  it('accepts trusted and managed', () => {
+    expect(isCodexHookDispatchable(LISTED_TRUSTED)).toBe(true);
+    expect(isCodexHookDispatchable({ ...LISTED_TRUSTED, trustStatus: 'managed' })).toBe(true);
+  });
+
+  it('rejects untrusted and modified', () => {
+    expect(isCodexHookDispatchable(LISTED_UNTRUSTED)).toBe(false);
+    expect(isCodexHookDispatchable({ ...LISTED_TRUSTED, trustStatus: 'modified' })).toBe(false);
+  });
+
+  it('rejects a TRUSTED handler that is disabled', () => {
+    // `hook_enabled` (discovery.rs:813-815) reads a separate `enabled` key on
+    // the same `[hooks.state."<key>"]` table, so `enabled = false` leaves a
+    // correctly-hashed handler trusted and still never dispatched. Checking
+    // only trustStatus would pass this.
+    expect(isCodexHookDispatchable({ ...LISTED_TRUSTED, enabled: false })).toBe(false);
+  });
+
+  it('rejects a row with no trustStatus at all', () => {
+    expect(isCodexHookDispatchable({ key: 'k', enabled: true })).toBe(false);
+  });
+});
+
+describe('classifyCodexHookList', () => {
+  const expectedKeys = ['/probe/home/hooks.json:pre_tool_use:0:0', '/probe/home/hooks.json:post_tool_use:0:0'];
+  const listedPost = { ...LISTED_TRUSTED, key: expectedKeys[1], eventName: 'postToolUse', timeoutSec: 30 };
+
+  it('passes when every generated handler reads back dispatchable', () => {
+    const verdict = classifyCodexHookList([LISTED_TRUSTED, listedPost], expectedKeys);
+    expect(verdict.generated).toEqual([]);
+    expect(verdict.plugin).toEqual([]);
+    expect(verdict.generatedOk.sort()).toEqual([...expectedKeys].sort());
+  });
+
+  it('flags a generated handler that reads back untrusted', () => {
+    const verdict = classifyCodexHookList([LISTED_UNTRUSTED, listedPost], expectedKeys);
+    expect(verdict.generated).toEqual([
+      {
+        key: expectedKeys[0],
+        trustStatus: 'untrusted',
+        enabled: true,
+        pluginId: null,
+        reason: 'not-dispatchable',
+      },
+    ]);
+  });
+
+  it('flags a generated handler ABSENT from the listing', () => {
+    // The case a "scan the listing for untrusted rows" check passes vacuously:
+    // with the hooks feature off or the file unread, `hooks/list` is empty and
+    // there is no bad row to find.
+    const verdict = classifyCodexHookList([], expectedKeys);
+    expect(verdict.generated.map((p) => p.reason)).toEqual(['missing', 'missing']);
+    expect(verdict.generatedOk).toEqual([]);
+  });
+
+  it('reports an undispatchable PLUGIN handler separately from the generated ones', () => {
+    const pluginRow = {
+      key: 'bootstrap-workflow-agents@davekim917-bootstrap:hooks/workflow-hooks.json:pre_tool_use:0:0',
+      source: 'plugin',
+      pluginId: 'bootstrap-workflow-agents@davekim917-bootstrap',
+      enabled: true,
+      trustStatus: 'modified',
+    };
+    const verdict = classifyCodexHookList([LISTED_TRUSTED, listedPost, pluginRow], expectedKeys);
+    expect(verdict.generated).toEqual([]);
+    expect(verdict.plugin).toEqual([
+      {
+        key: pluginRow.key,
+        trustStatus: 'modified',
+        enabled: true,
+        pluginId: pluginRow.pluginId,
+        reason: 'not-dispatchable',
+      },
+    ]);
+  });
+
+  it('ignores a dispatchable plugin handler and rows with no key', () => {
+    const verdict = classifyCodexHookList(
+      [
+        LISTED_TRUSTED,
+        listedPost,
+        { ...LISTED_TRUSTED, key: 'other@mkt:hooks/hooks.json:stop:0:0' },
+        { enabled: true },
+      ],
+      expectedKeys,
+    );
+    expect(verdict.generated).toEqual([]);
+    expect(verdict.plugin).toEqual([]);
   });
 });
