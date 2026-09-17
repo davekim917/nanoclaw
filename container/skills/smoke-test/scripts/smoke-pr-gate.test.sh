@@ -961,7 +961,7 @@ journeys_fixture() { # <compare-files-json>; one ready freeze (PR 13) with a val
   cp "$JOURNEYS_EXAMPLE" "$STATE_DIR/journeys.json"
   export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/journeys.json"
 }
-BACKEND_ONLY='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/migrations/0042_loan_period_options.sql"},{"filename":"api/src/reports/export.ts"},{"filename":"docs/changelog.md"}]}'
+BACKEND_ONLY='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/migrations/0042_loan_period_options.sql"},{"filename":"api/src/reports/export.ts"},{"filename":"docs/internal/changelog.md"}]}'
 
 # No catalogue: byte-identical. Env unset (default path absent) and env naming
 # an absent file give the same bytes, with no `journeys` key; and adopting a
@@ -984,7 +984,8 @@ jq -e '.journeys.selection == "matched" and .journeys.route == "web" and .journe
   [.journeys.matchedJourneys[] | select(.reason == "changed") | .id] == ["loan-desk-checkout"] and
   .journeys.matchedJourneys[0].evidence == "browser" and
   .journeys.unmappedPaths == ["api/src/reports/export.ts"] and
-  .journeys.excludedPaths == [{"path":"docs/changelog.md","glob":"docs/**"}]' <<<"$T5K_WITH" >/dev/null ||
+  (.journeys.excludedPaths | map({path,glob})) == [{"path":"docs/internal/changelog.md","glob":"docs/internal/**"}] and
+  (.journeys.excludedPaths[0].reason | length > 0)' <<<"$T5K_WITH" >/dev/null ||
   { echo "5k: backend-only selection wrong: $T5K_WITH" >&2; exit 1; }
 [ ! -e "$STATE_DIR/journeys" ] || { echo "5k: check pinned a selection" >&2; exit 1; }
 
@@ -1005,7 +1006,7 @@ range_case 5k-frozen '.journeys.pinned == true and .journeys.unmappedPaths == ["
 
 # NATIVE-ONLY: a non-empty scope claimed entirely by native-manual journeys
 # routes to the manual packet. One stray path keeps it a web campaign.
-journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"mobile/src/scan.tsx"},{"filename":"docs/mobile.md"}]}'
+journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"mobile/src/scan.tsx"},{"filename":"docs/internal/mobile.md"}]}'
 range_case 5k-native '.journeys.route == "native-manual" and .journeys.unmappedPaths == [] and
   [.journeys.matchedJourneys[].id] == ["mobile-scan-return"]'
 journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"mobile/src/scan.tsx"},{"filename":"api/src/reports/export.ts"}]}'

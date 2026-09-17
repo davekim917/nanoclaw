@@ -49,15 +49,41 @@ bad_catalogue 1-browser-checkpoints '.journeys[0].checkpoints = []' 'checkpoints
 jq '.journeys[1].consumes = []' "$EXAMPLE" > "$WORK/floor-no-consumes.json"
 expect 1-floor-may-consume-nothing '.ok == true' "$(python3 "$TOOL" validate "$WORK/floor-no-consumes.json")"
 
+# Warnings: a VALID catalogue can still drop scope silently, because the
+# matcher applies excludePaths before consumes. The example is clean.
+expect 1w-example-clean '.warnings == []' "$(python3 "$TOOL" validate "$EXAMPLE")"
+warns() { # <label> <jq-edit> <warning-regex>
+  jq "$2" "$EXAMPLE" > "$WORK/warn.json"
+  expect "$1" '.ok == true and any(.warnings[]; test("'"$3"'"))' "$(python3 "$TOOL" validate "$WORK/warn.json")"
+}
+warns 1w-extension-wide '.excludePaths += [{"glob":"**/*.md","reason":"docs"}]' 'excludePaths .\\*\\*/\\*.md. is a bare top-level or extension-wide'
+warns 1w-top-level '.excludePaths += [{"glob":".github/**","reason":"ci"}]' 'bare top-level'
+warns 1w-no-reason '.excludePaths += ["docs/archive/**"]' 'docs/archive/\\*\\*. carries no reason'
+# A consumes glob an exclusion shadows selects nothing, and says so...
+warns 1w-shadowed-md '.excludePaths += [{"glob":"**/*.md","reason":"docs"}] | .journeys[0].consumes += ["web/release-notes/**/*.md"]' \
+  'loan-desk-checkout: consumes .web/release-notes/\\*\\*/\\*.md. can never match'
+warns 1w-shadowed-dir '.excludePaths += [{"glob":".github/**","reason":"ci"}] | .journeys[2].consumes += [".github/workflows/build-app.yml"]' \
+  'mobile-scan-return: consumes ..github/workflows/build-app.yml. can never match'
+# ...which is the matcher's real behaviour, not a lint opinion: the workflow
+# that builds the installable app is excluded, never routed to its journey.
+jq '.excludePaths += [{"glob":".github/**","reason":"ci"}] | .journeys[2].consumes += [".github/workflows/build-app.yml"]' "$EXAMPLE" > "$WORK/shadow.json"
+expect 1w-exclusion-wins '.matchedJourneys == [] and .excludedPaths[0].glob == ".github/**"' \
+  "$(printf '[".github/workflows/build-app.yml"]' | python3 "$TOOL" match --catalogue "$WORK/shadow.json" --state-dir "$WORK/sw" --pin-key k --as-of "$NOW")"
+# A partly-overlapping glob is not "never matches".
+jq '.excludePaths += [{"glob":"**/*.md","reason":"docs"}]' "$EXAMPLE" > "$WORK/warn.json"
+expect 1w-partial-overlap-quiet '[.warnings[] | select(test("can never match"))] == []' "$(python3 "$TOOL" validate "$WORK/warn.json")"
+bad_catalogue 1-exclude-key '.excludePaths += [{"glob":"a/b/**","why":"x"}]' 'unknown key why'
+
 # --- 2. match ----------------------------------------------------------------
 CATALOGUE="$WORK/journeys.json"; cp "$EXAMPLE" "$CATALOGUE"
 # A backend-only change selects the unchanged UI consumer; ALL applicable
 # journeys match, not the first; a deleted path is just a path.
-OUT="$(match "$WORK/s2" k '["api/migrations/0042_loan_period_options.sql","api/src/auth/session.ts","api/src/reports/export.ts",".github/workflows/ci.yml"]')"
+OUT="$(match "$WORK/s2" k '["api/migrations/0042_loan_period_options.sql","api/src/auth/session.ts","api/src/reports/export.ts","tools/lint/rules.yml"]')"
 expect 2-backend-only '.selection == "matched" and .route == "web" and .pinned == false and
   [.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"changed"},{"id":"branch-scope-crossing","reason":"changed"}] and
   .unmappedPaths == ["api/src/reports/export.ts"] and
-  .excludedPaths == [{"path":".github/workflows/ci.yml","glob":".github/**"}]' "$OUT"
+  (.excludedPaths | map({path,glob})) == [{"path":"tools/lint/rules.yml","glob":"tools/lint/**"}] and
+  (.excludedPaths[0].reason | test("lint"))' "$OUT"
 [ ! -e "$WORK/s2" ] || fail "2: an unpinned match wrote state"
 expect 2-native-only '.route == "native-manual" and [.matchedJourneys[].id] == ["mobile-scan-return"]' \
   "$(match "$WORK/s2" k '["mobile/app/scan.tsx"]')"
@@ -65,7 +91,7 @@ expect 2-native-plus-unmapped '.route == "web"' "$(match "$WORK/s2" k '["mobile/
 expect 2-native-plus-web '.route == "web"' "$(match "$WORK/s2" k '["mobile/app/scan.tsx","web/src/desk/a.tsx"]')"
 # Excluded-only is an EMPTY scope, which is not "all native".
 expect 2-empty-scope '.route == "web" and .matchedJourneys == [] and .unmappedPaths == []' \
-  "$(match "$WORK/s2" k '["docs/a.md"]')"
+  "$(match "$WORK/s2" k '["docs/internal/a.md"]')"
 expect 2-unknown '.selection == "full" and .reason == "no GO" and .unmappedPaths == [] and
   [.matchedJourneys[] | select(.reason == "range-unknown") | .id] == ["loan-desk-checkout","branch-scope-crossing"] and
   .unassessedNativeJourneys == ["mobile-scan-return"]' "$(match "$WORK/s2" k '[]' --unknown "no GO")"

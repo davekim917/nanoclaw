@@ -549,27 +549,29 @@ outside the stated scope.
 ### Journeys — saved walks, matched to the change before any model wakes
 
 An install may keep a **journey catalogue**, `journeys.json`, beside its
-standing instructions (shape and a fictional example:
-`references/journeys.example.json`; check one with `smoke-journeys.py validate`).
-A journey is a saved plain-English walk — `id` (its lane id, for life), `title`,
+standing instructions (fictional example: `references/journeys.example.json`;
+check one with `smoke-journeys.py validate`). A journey is a saved walk — `id` (its lane id, for life), `title`,
 `proves`, `evidence` (`browser` | `api` | `native-manual`), `entryPath`,
 `steps[]`, `endState` (including persistence after reload where claimed),
 `seats`, `seed`, `restore`, `checkpoints[]` (screens captured *during* the walk)
 — plus `consumes[]`, globs over the **whole repo**, not just its frontend: the
 migration, route file or taxonomy table whose change makes this walk relevant.
-A worker walks a journey from the catalogue alone — nobody re-derives how to
-reach a screen — and a backend-only change selects the screens that consume it.
+`excludePaths[]` (`{glob, reason}`) is applied **before** `consumes`, so no
+journey can rescue a path it hides: keep each exclusion narrow and reasoned.
+`validate` warns on a top-level or extension-wide one (`**/*.md` hides runtime
+release notes) and on any `consumes` glob an exclusion shadows.
+A worker walks it from the catalogue alone, and a backend-only change selects
+the screens that consume it.
 
 For a freeze campaign the gate matches `campaignRange`'s file list against the
-catalogue and states the result once, as `journeys`, in `check` and the
-`pr_build_settled` wake — pinned, with a snapshot of the catalogue and its
-sha256, by the first settled poll, so neither a catalogue edit nor a recovery
-wake can change a run's contract. No catalogue: no `journeys` key, and none of
-this applies. At intake:
+catalogue and states the result as `journeys` in `check` and the
+`pr_build_settled` wake — pinned, with a sha256-named catalogue snapshot, by the
+first settled poll, so neither a catalogue edit nor a recovery wake can change a
+run's contract. No catalogue: no `journeys` key. At intake:
 
 1. `smoke-journeys.py pin-run <run-dir> <journeys.pinFile>` copies the pin and
-   the snapshot into `<run-dir>/journeys/`. Workers and siblings read journeys
-   from that run copy, never from a group's private live file.
+   snapshot into `<run-dir>/journeys/`; workers and siblings read that copy,
+   never a group's private live file.
 2. **Every `matchedJourneys[]` entry becomes a contract lane with the journey
    id as its lane id** — `reason` says why it is there (`changed`, `floor`, or
    `range-unknown`). An `evidence: api` journey is scaffolded `--evidence
@@ -582,20 +584,30 @@ this applies. At intake:
    `mapped-to-journey` or `new-journey` (+ `journeyId`, which must be a lane),
    `no-user-facing-consumer` (+ `changedBehaviour`, and `evidence[]` citing at
    least one file saved in the run, normally the search below), or `unresolved`
-   (+ `reason`) — uncertainty terminates honestly rather than inventing an
-   answer. Adding a glob to the catalogue later does not erase the obligation.
-4. **Search the source even when globs matched.** For each changed backend
+   (+ `reason`), so uncertainty ends honestly. A glob added later erases nothing.
+4. **Search the source even when globs matched** — a broad glob (every
+   migration → one journey) can hide a second consumer. For each changed backend
    route, payload field, taxonomy id or feature flag, search the web and native
-   clients for the literal identifier and save the identifier, command and call
-   sites under the run. A broad glob (every migration → one journey) can hide a
-   second consumer. Hits suggest consumers; zero hits do not prove absence.
+   clients for the literal identifier; save the identifier, command and call
+   sites under the run. **For a deleted or renamed-away path, search at
+   `campaignRange.baselineSha`, not the head** — at the head its importers are
+   already gone, and "no importer" reads as dead code. Hits suggest consumers;
+   zero hits do not prove absence.
 5. **Preflight demonstrability and fixtures before dispatch**: deployed data and
    flags (`PREVIEW-STALE`, below), seat capability, fixture availability.
-   Fixtures are allocated per run **and side** — `QA-<runId>-<side>-*` — so two
+   Fixtures are allocated per run **and side** (`QA-<runId>-<side>-*`), so two
    owners on one seat cannot collide, and are cleaned up after a failure too.
    Every worker brief carries this sentence verbatim: "creating/deleting objects
    named QA-<runId>-* inside the QA tenant with a QA seat is pre-authorized;
    nothing else is."
+
+**A journey that only renders an area does not cover a changed backend
+behaviour.** For each one, name the endpoint or job and every affected web and
+native consumer, and record a concrete input or fixture, the expected result,
+the observed request/response, and the rendered result; for a write, reload and
+read it back. A loaded page, an unexercised path, an unavailable fixture or a
+missing deployment is `blocked` or `unresolved` with the missing proof named —
+never a pass, and neither a matcher hit nor a note in the catalogue stands in.
 
 **`route: "native-manual"`** — a non-empty change claimed entirely by
 `native-manual` journeys — spends nothing on a web campaign: source and CI
@@ -615,14 +627,14 @@ backend/data scope disposition, and samples the positive matches — a broad glo
 hides an omission as well as "no consumer".
 
 **Maintenance is reviewed, not append-only**: journeys are corrected, replaced
-and retired, with history in git. A first successful walk *qualifies* a new
-journey for promotion; it does not certify that its assertions test the claim.
-Owners and challengers propose changes as files in their run; **one publisher —
-the group's coordinator — applies them**: `SMOKE_LANE_ROLE=coordinator
+and retired, history in git. A first successful walk *qualifies* a journey for
+promotion; it does not certify its assertions. Owners and challengers propose
+changes as files in their run; **one publisher — the group's coordinator —
+applies them**: `SMOKE_LANE_ROLE=coordinator
 smoke-journeys.py publish <catalogue> <proposed> --expect-sha256 <digest the
 proposal was based on> --lock <state-dir>/control.lock` (schema and ids
-validated, stale digest refused, atomic replace). Deliberately absent: a runner,
-a step DSL, a replay cache, golden baselines, a dependency graph.
+validated, stale digest refused, atomic replace). There is deliberately no
+runner, step DSL, replay cache, golden baseline or dependency graph.
 
 ### The coverage floor — the part of the manifest the diff does not get a vote on
 
@@ -630,14 +642,11 @@ The manifest above is derived from the diff, every lane in §3 scopes from this
 campaign's own change — the acceptance lane included, since a PR body describes
 the PR — and a manifest built only that way tests whatever is actively
 regressing. Measured across one deployment's first 74 campaigns: a
-money-adjacent approval flow was walked in a browser **exactly once, ever** —
-that run's own manifest called it "never browser-tested before" — and never
-functionally again. A planning surface appeared in 22 of the 74, every
-appearance incidental to a style change that happened to touch the file, never
-once as a functional lane. An in-app assistant surface: 2 of 74, one of those an
-explicit full sweep rather than a campaign. Nothing regressed on those surfaces
-in that window; nothing was watching either. A very fast green suite over the
-same blind spots is what this section exists to prevent.
+money-adjacent approval flow was walked in a browser **exactly once, ever**; a
+planning surface appeared in 22, always incidental to a style change, never as
+a functional lane; an in-app assistant surface in 2. Nothing regressed on those
+surfaces in that window; nothing was watching either. A very fast green suite
+over the same blind spots is what this section exists to prevent.
 
 So: **changed-surface scoping decides what runs *extra*. It never decides what
 runs at all.** A small declared set of journeys is exercised against the
@@ -721,15 +730,10 @@ backend-only diff, not on a one-line change, not on a campaign that found
 nothing.
 
 **The skip rule below does not apply to floor entries, and this is not an
-exemption carved out of it.** That rule lets a browser check go unwritten when
-a source lane in the same campaign already proves the identical claim with a
-green spec. A floor entry's claim is composition on a deployed build: whether
-the connected flow still works end to end, through storage and the network, on
-the build actually being served. The counter-rule already names composition,
-deploy identity, persistence across reload and permission crossings as claims a
-green spec structurally cannot observe, and a floor entry is made of precisely
-those — there is no line in any spec that would have failed had the floor
-journey been broken in the browser. A floor entry whose claim *looks*
+exemption carved out of it.** A floor entry's claim is composition on a deployed
+build — the connected flow working end to end, through storage and the network,
+on the build being served — which that rule's own counter-rule already says a
+green spec structurally cannot observe. A floor entry whose claim *looks*
 spec-covered is the most tempting skip and the most expensive one: the unit
 assertion is green, nobody has walked the flow in weeks, and the run reports
 coverage it does not have.
@@ -801,10 +805,8 @@ journeys (and no floor table) mean the coordinator cannot compute a due entry;
 record `floor undeclared` on the run record, name it on the report's Untested
 line, and cap the run at `PASS_WITH_GAPS`. Do not invent a floor from the
 product — inventing one is the coordinator picking its own floor, which the
-nomination rule above exists to prevent. `PASS_WITH_GAPS` is deliberate rather
-than blocking: an install picking up this version keeps shipping, but never
-again reports an unqualified `PASS` while nobody has said which journeys must
-not silently break.
+nomination rule above exists to prevent. The cap is deliberate rather than
+blocking: the install keeps shipping, but never reports an unqualified `PASS`.
 
 ### Scoring permission crossings — a success is the defect
 

@@ -92,6 +92,51 @@ def _glob_problem(g):
     return None
 
 
+def _exclude_entries(cat):
+    """excludePaths as [(glob, reason)]. An entry is `{glob, reason}`; a bare
+    string is still read (reason None) and `validate` warns about it."""
+    out = []
+    for e in cat.get("excludePaths", []) if isinstance(cat, dict) else []:
+        if isinstance(e, dict):
+            out.append((e.get("glob"), e.get("reason")))
+        else:
+            out.append((e, None))
+    return out
+
+
+def _sample_paths(glob):
+    """Concrete paths a glob would match, for the shadow check below."""
+    samples = []
+    for g in _globs.expand_braces(glob):
+        for deep in ("x", "x/y"):
+            segs = [deep if seg == "**" else seg.replace("*", "x").replace("?", "x") for seg in g.split("/")]
+            samples.append("/".join(segs))
+    return samples
+
+
+def catalogue_warnings(cat):
+    """Ways a VALID catalogue silently drops scope. The matcher strips
+    excludePaths BEFORE consumes, so an exclusion always wins: a consumes glob
+    it shadows selects nothing, and no journey can rescue a path a broad
+    exclusion hides. Warnings, not errors -- the catalogue still loads."""
+    warnings = []
+    entries = [(g, r) for g, r in _exclude_entries(cat) if _is_text(g)]
+    for g, reason in entries:
+        segs = g.split("/")
+        if segs[0] in ("**", "*") or segs[0].startswith("*") or (len(segs) == 2 and segs[1] == "**"):
+            warnings.append("excludePaths {!r} is a bare top-level or extension-wide wildcard; it hides every such path from every journey -- name the narrow area instead".format(g))
+        if not _is_text(reason):
+            warnings.append("excludePaths {!r} carries no reason".format(g))
+    rules = _globs.compile_rule_list([g for g, _ in entries])
+    for j in cat.get("journeys", []):
+        for g in j.get("consumes", []):
+            shadows = {_globs.match_first(p, rules) for p in _sample_paths(g)}
+            if shadows and None not in shadows:
+                warnings.append("journey {}: consumes {!r} can never match -- excludePaths {} is applied first".format(
+                    j.get("id"), g, ", ".join(repr(x) for x in sorted(shadows))))
+    return warnings
+
+
 def _unknown_keys(obj, allowed):
     return sorted(k for k in obj if k not in allowed and not k.startswith("_"))
 
@@ -109,10 +154,16 @@ def validate_catalogue(cat):
     if not isinstance(excludes, list):
         errors.append("excludePaths must be a list of globs")
     else:
-        for g in excludes:
-            problem = _glob_problem(g)
+        for e in excludes:
+            if isinstance(e, dict):
+                for k in _unknown_keys(e, {"glob", "reason"}):
+                    errors.append("excludePaths entry has unknown key {}".format(k))
+                if "reason" in e and not _is_text(e["reason"]):
+                    errors.append("excludePaths {!r} reason must be a non-empty string".format(e.get("glob")))
+                e = e.get("glob")
+            problem = _glob_problem(e)
             if problem:
-                errors.append("excludePaths glob {!r} {}".format(g, problem))
+                errors.append("excludePaths glob {!r} {}".format(e, problem))
     journeys = cat.get("journeys")
     if not isinstance(journeys, list):
         return errors + ["journeys must be a list"]
@@ -265,12 +316,13 @@ def floor_due(cat, run_root, size, as_of):
 
 def compute_selection(cat, digest, paths, unknown_reason, size, run_root, as_of):
     journeys = cat["journeys"]
-    exclude_rules = _globs.compile_rule_list(cat.get("excludePaths", []))
+    exclude_reasons = dict(_exclude_entries(cat))
+    exclude_rules = _globs.compile_rule_list(list(exclude_reasons))
     excluded, scope = [], []
     for p in paths:
         hit = _globs.match_first(p, exclude_rules)
         if hit:
-            excluded.append({"path": p, "glob": hit})
+            excluded.append({"path": p, "glob": hit, "reason": exclude_reasons[hit]})
         else:
             scope.append(p)
 
@@ -690,7 +742,8 @@ def cmd_publish(args):
                 emit({"ok": False, "error": "this proposal changes floor membership or a floor journey's proves/maxIntervalDays/evidence; that is a human call -- pass --floor-authority <where it was approved>"}, 1)
         _write_atomic(os.path.abspath(args.catalogue), new_raw)
     emit({"ok": True, "catalogue": args.catalogue, "sha256": new_digest, "priorSha256": prior_digest,
-          "journeyCount": len(proposed["journeys"]), "floorAuthority": args.floor_authority or None})
+          "journeyCount": len(proposed["journeys"]), "floorAuthority": args.floor_authority or None,
+          "warnings": catalogue_warnings(proposed)})
 
 
 # --- cli --------------------------------------------------------------------
@@ -740,6 +793,7 @@ def main():
     if args.command == "validate":
         cat, digest, _, errors = load_catalogue(args.catalogue)
         emit({"ok": cat is not None, "sha256": digest, "errors": errors,
+              "warnings": catalogue_warnings(cat) if cat else [],
               "journeyCount": len(cat["journeys"]) if cat else 0}, 0 if cat is not None else 1)
     if args.command == "floor-due":
         cat, _, _, errors = load_catalogue(args.catalogue)
