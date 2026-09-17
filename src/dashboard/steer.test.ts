@@ -48,7 +48,7 @@ vi.mock('../modules/mailbox/read-only.js', async (importOriginal) => ({
 // PR 7) — same statements, one module further in.
 vi.mock('../modules/mailbox/ops/sweep.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../modules/mailbox/ops/sweep.js')>()),
-  syncProcessingAcks: vi.fn(),
+  syncProcessingAcks: vi.fn().mockReturnValue([]),
   countDueMessages: vi.fn().mockReturnValue(0),
   getProcessingClaims: vi.fn().mockReturnValue([]),
   deleteOrphanProcessingClaims: vi.fn().mockReturnValue(0),

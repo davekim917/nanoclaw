@@ -23,7 +23,8 @@ import path from 'path';
 import { withCentralSync, withRawDb } from './db/central-lease.js';
 import { GROUPS_DIR } from './config.js';
 import { getRegisteredChannelNames } from './channels/channel-registry.js';
-import { readContainerConfig } from './container-config.js';
+import { readContainerConfig, type McpServerConfig } from './container-config.js';
+import { RETIRED_MCP_SERVER_NAMES, effectiveMcpServers, readFleetMcpServers } from './fleet-mcp-servers.js';
 import { getAllAgentGroups, getAgentGroup, getWorkgroupOnecliSecrets } from './db/agent-groups.js';
 import type { AgentGroup } from './types.js';
 import { mergeWorkgroupAndGroupSecrets, slackUserTokenSecrets } from './onecli-secrets.js';
@@ -341,10 +342,6 @@ export function buildSessionServicesSnapshotFrom(
   // "credentials missing — Ask Operator" for every sibling.
   const folder = cfg?.credentialFolder ?? ag?.folder ?? '';
   const tools = cfg?.tools;
-  const excludedMcpServers = new Set(cfg?.excludeMcpServers ?? []);
-  const universalMcpAvailable = (name: string): boolean =>
-    !excludedMcpServers.has(name) || cfg?.mcpServers?.[name] !== undefined;
-
   const listAccounts = (absDir: string): string[] => {
     try {
       return fs
@@ -549,71 +546,17 @@ export function buildSessionServicesSnapshotFrom(
     }
   }
 
-  // Exa — universal. Always shown; container-runner injects the MCP
-  // unconditionally and the OneCLI gateway proxy injects auth at request
-  // time (vault entry "Exa-MCP" → mcp.exa.ai).
-  if (universalMcpAvailable('exa')) {
-    services.push({
-      name: 'Exa',
-      mcpNamespace: 'mcp__exa__*',
-      declaredTools: declaredMatchingTools(['exa']),
-      scopes: [],
-      credentialPaths: [],
-      useFor:
-        'Web search, research, and code context. Prefer exa over ad-hoc WebSearch/WebFetch for: web search including code/docs lookups (`mcp__exa__web_search_exa`), reading specific URLs (`mcp__exa__web_fetch_exa`), filtered search — categories (company, people), domains, dates (`mcp__exa__web_search_advanced_exa`), multi-step research agent (`mcp__exa__agent_run`).',
-    });
-  }
-
-  // DeepWiki — always-on. No tool gate; host injects the MCP server unconditionally.
-  if (universalMcpAvailable('deepwiki'))
-    services.push({
-      name: 'DeepWiki',
-      mcpNamespace: 'mcp__deepwiki__*',
-      declaredTools: [],
-      scopes: [],
-      credentialPaths: [],
-      useFor:
-        'AI-powered documentation for any public GitHub repo. Use when the user asks "how does repo X work", for reading wiki structure, fetching wiki contents, or asking free-form questions about a repo. Tools: `mcp__deepwiki__read_wiki_structure`, `mcp__deepwiki__read_wiki_contents`, `mcp__deepwiki__ask_question`.',
-    });
-
-  // Context7 — always-on. Fetches up-to-date library docs; useful when the
-  // agent would otherwise rely on stale training knowledge.
-  if (universalMcpAvailable('context7'))
-    services.push({
-      name: 'Context7',
-      mcpNamespace: 'mcp__context7__*',
-      declaredTools: [],
-      scopes: [],
-      credentialPaths: [],
-      useFor:
-        'Live library / framework / SDK / API docs — React, Next.js, Prisma, Tailwind, Claude SDKs, Stripe, etc. Prefer Context7 over training-memory for: library-specific debugging, API syntax, config options, version migrations, CLI usage. Do NOT use for refactoring, business logic, or general concepts.',
-    });
-
-  // Pocket — universal. Always shown; container-runner injects the MCP
-  // unconditionally and the OneCLI gateway proxy injects auth at request
-  // time (vault entry "Pocket" → public.heypocketai.com).
-  if (universalMcpAvailable('pocket'))
-    services.push({
-      name: 'Pocket',
-      mcpNamespace: 'mcp__pocket__*',
-      declaredTools: declaredMatchingTools(['pocket']),
-      scopes: [],
-      credentialPaths: [],
-      useFor:
-        'Personal knowledge / memory via https://public.heypocketai.com/mcp. Auth pre-injected (Authorization: Bearer). Use Pocket tools to save references, recall prior context, search personal knowledge.',
-    });
-
-  // Granola — universal. Always shown; container-runner injects unconditionally.
-  if (universalMcpAvailable('granola'))
-    services.push({
-      name: 'Granola',
-      mcpNamespace: 'mcp__granola__*',
-      declaredTools: declaredMatchingTools(['granola']),
-      scopes: [],
-      credentialPaths: [],
-      useFor:
-        'Meeting transcripts + notes via Granola REST API. Auth injected by OneCLI on public-api.granola.ai; no token visible in-container. Tools: `mcp__granola__list_meetings`, `mcp__granola__get_meeting` (set include_transcript=true for raw transcript).',
-    });
+  // Where the derived MCP entries land. The five universals that moved into
+  // the fleet file (exa, deepwiki, context7, pocket, granola) were pushed
+  // exactly here, and both capability budgets evict from the END
+  // (`evictCapability`, src/modules/memory/pre-turn-context.ts:1590-1595), so
+  // appending them instead would have moved every one of them into the
+  // eviction zone on the widest-wired groups — the ones measured at 19
+  // services / 8,954 chars before this change and 22 / 9,773 after, against a
+  // 10,000-char budget (`PRE_TURN_BOUNDS.capabilityTotalChars`) that eats
+  // backwards from the end. The entries are built at the end of this function, where every
+  // hand-written `mcpNamespace` is known, and spliced in at this index.
+  const derivedMcpIndex = services.length;
 
   // Linear — gated by tool entry. Container-runner injects when 'linear' is in
   // container.json.tools and the OneCLI gateway proxy injects auth at request
@@ -905,7 +848,107 @@ export function buildSessionServicesSnapshotFrom(
     });
   }
 
+  // Every MCP server this container actually gets that no entry above already
+  // describes. `effectiveMcpServers` is the SAME merge the spawn path runs
+  // (src/container-runner.ts, buildContainerArgs) — fleet defaults from
+  // data/fleet-mcp-servers.json plus this group's own container.json entries,
+  // minus `excludeMcpServers` — so a server the agent has is a server the
+  // agent is told about, with no second list to keep in sync. Adding a tool is
+  // one `ncl groups config add-mcp-server` away, with or without `--fleet`.
+  //
+  // "Already described" is matched on the namespace, not the label: an entry
+  // whose `mcpNamespace` is `mcp__<name>__*` owns that server's text (Linear,
+  // Datafold, Atlassian, dbt-mcp and Looker still write their own, because
+  // each says something the stored entry cannot).
+  const describedMcpServers = new Set(
+    services
+      .map((service) => service.mcpNamespace)
+      .filter((namespace): namespace is string => typeof namespace === 'string')
+      .map((namespace) => namespace.replace(/^mcp__/, '').replace(/__\*$/, '')),
+  );
+  // Fleet entries are the fleet-wide baseline every group inherits; a
+  // group-specific server is the one a budget should give up first. Marking
+  // the baseline `retainUnderBudget` is the same mechanism #862 used for
+  // Slack, and for the same reason: an agent that loses the line stops
+  // believing it has the tool. Keyed on the fleet REGISTRY, not on which copy
+  // won the merge — a group that declares `littlebird` itself (all 24 do
+  // today) holds the same capability. If every entry is retained the budget
+  // still terminates: `evictCapability` pops the last one outright
+  // (src/modules/memory/pre-turn-context.ts:1594).
+  const fleetProvided = new Set(Object.keys(readFleetMcpServers()));
+  const derived: SessionServicesSnapshot['services'] = [];
+  for (const [name, server] of Object.entries(effectiveMcpServers(cfg))) {
+    if (describedMcpServers.has(name)) continue;
+    // A retired name still sitting in some group's container.json is deleted
+    // from the merged map by the runner on every spawn
+    // (container/agent-runner/src/retired-mcp-servers.ts:13, applied at
+    // container/agent-runner/src/index.ts:256), so advertising it would
+    // promise a tool that cannot exist — the exact failure docs/slack-user-token.md
+    // documents. The entry stays in the spawn payload, where the runner logs
+    // the drop for the operator; it just never reaches the agent's capability
+    // list.
+    if (RETIRED_MCP_SERVER_NAMES.has(name)) continue;
+    // A hand-edited container.json can hold a malformed entry: the group file's
+    // `validateMcpServers` refuses only SSE (src/container-config.ts:573-590),
+    // so `null` reaches here. One bad entry must not cost the whole snapshot —
+    // an agent with no capability list is the worse failure by far.
+    if (server === null || typeof server !== 'object') continue;
+    derived.push({
+      name: server.displayName ?? name.charAt(0).toUpperCase() + name.slice(1),
+      mcpNamespace: `mcp__${name}__*`,
+      declaredTools: declaredMatchingTools([name]),
+      scopes: [],
+      credentialPaths: [],
+      useFor: server.description ?? genericMcpUseFor(name, server),
+      ...(fleetProvided.has(name) ? { retainUnderBudget: true } : {}),
+    });
+  }
+  // Fleet entries first inside the derived block, group-specific after, so the
+  // block reads in the order the hardcoded universals used to (exa, deepwiki,
+  // …) and a group's own servers sit later — nearer the end the budgets eat
+  // from. `Object.entries` would otherwise lead with the group's own map.
+  derived.sort((a, b) => Number(Boolean(b.retainUnderBudget)) - Number(Boolean(a.retainUnderBudget)));
+  services.splice(derivedMcpIndex, 0, ...derived);
+
   return { agentGroupId, services };
+}
+
+/**
+ * Capability text for a stored MCP server that carries no `description`.
+ *
+ * Deliberately says nothing about what the server does — that is the
+ * `description` field's job — and names only the endpoint the agent needs to
+ * reason about, in one short line: every derived entry costs the capability
+ * budget (`PRE_TURN_BOUNDS.capabilityTotalChars`), and a described server
+ * spends those characters saying something useful instead.
+ *
+ * A URL is safe to print: `parseMcpServerConfig` refuses one carrying
+ * credentials at intake (src/container-config.ts:477-501), and the agent reads
+ * the same value in its own read-only container.json mount
+ * (src/container-runner.ts:4877). `env` and `headers` are never rendered —
+ * those DO carry placeholder credentials.
+ */
+function genericMcpUseFor(name: string, server: McpServerConfig): string {
+  return `MCP server \`${name}\` (${mcpEndpoint(server)}); tools self-describe under \`mcp__${name}__*\`.`;
+}
+
+/**
+ * What to print as a server's endpoint.
+ *
+ * Every remote MCP this fork wires as stdio is the bridge pattern — `command:
+ * "bun"`, `args: ["/app/src/remote-mcp-bridge.ts", "<endpoint>"]` (see
+ * `container/agent-runner/src/remote-mcp-bridge.ts`, and the `dropbox` /
+ * `amplitude` entries on this install) — so printing `command` alone says "bun" for
+ * all of them and identifies nothing. Print what the bridge dials instead; a
+ * genuine local subprocess still prints its command.
+ */
+function mcpEndpoint(server: McpServerConfig): string {
+  if (server.type === 'http' || server.type === 'sse') return server.url;
+  const [script, endpoint] = server.args ?? [];
+  if (typeof script === 'string' && script.endsWith('remote-mcp-bridge.ts') && typeof endpoint === 'string') {
+    return endpoint;
+  }
+  return server.command;
 }
 
 export async function getHostCapabilities(

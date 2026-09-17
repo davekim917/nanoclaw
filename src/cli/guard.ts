@@ -89,6 +89,16 @@ function commandDecide(cmd: CommandDef, input: GuardInput) {
     if (args.cli_scope !== undefined || args['cli-scope'] !== undefined) {
       return DENY('Cannot change cli_scope from a group-scoped agent.');
     }
+
+    // `--fleet` (groups config add/remove-mcp-server, config get) edits the
+    // install-wide MCP defaults every group inherits — the one flag on a
+    // group-scoped resource whose blast radius is the whole fleet. The scope
+    // check above keys on the group id, which a fleet write does not carry, so
+    // refuse the flag itself. Reading is refused with it: `config get --fleet`
+    // would otherwise enumerate other groups' inherited tooling.
+    if (args.fleet !== undefined && args.fleet !== false) {
+      return DENY('CLI access is scoped to this agent group. Cannot use --fleet.');
+    }
   }
 
   if (cmd.access === 'approval') {

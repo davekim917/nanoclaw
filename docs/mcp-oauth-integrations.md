@@ -114,6 +114,20 @@ servers require before they will issue a refresh token — add it with
 If `complete` reports **"the server issued no refresh token"**, fix it now rather than later: that
 bearer will expire and nothing can renew it.
 
+**Littlebird** (`https://mcp.littlebird.ai/mcp`) is a fleet default — every group inherits it from
+`data/fleet-mcp-servers.json` ([docs/fleet-mcp-servers.md](fleet-mcp-servers.md)), so the bearer has
+to be granted to every workgroup, not just the one that logged in. Its authorization server publishes
+`offline_access` while its protected resource does not, so ask for it explicitly or no refresh token
+is issued and the bearer dies at its first expiry:
+
+```bash
+ncl integrations login --name littlebird --url https://mcp.littlebird.ai/mcp \
+  --group <agent-group-id> --secret Littlebird \
+  --scopes 'littlebird:mcp openid email offline_access'
+# then, per workgroup — extend-only union, keep the existing names:
+pnpm exec tsx scripts/set-workgroup-secrets.ts <workgroup-id> --secrets <existing...>,Littlebird
+```
+
 ## Which secret it writes
 
 The bearer goes into a OneCLI secret named `<Name>-MCP-<Group>` by default
