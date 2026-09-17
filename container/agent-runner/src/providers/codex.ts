@@ -1136,11 +1136,12 @@ export class CodexProvider implements AgentProvider {
    * account's reset — while the primary, rotated away from turns earlier, had
    * long since recovered. Observed 2026-09-16: a group parked on codex until
    * its secondary's 2026-09-21 weekly reset with a healthy primary.
-   * `tried` is per query, so every account is retried once per turn and only a
-   * turn on which ALL of them fail reaches the host (gen() then reports the
-   * ring's earliest reset, `earliestCodexSlotReset`). Nothing is persisted:
-   * `process.env.CODEX_HOME` carries the active home between queries, and a
-   * respawn starts on the primary.
+   * `tried` is per turn (gen() creates it at the `pending.shift()` boundary —
+   * one query serves many turns), so every account is retried once per turn
+   * and only a turn on which ALL of them fail reaches the host (gen() then
+   * reports the ring's earliest reset, `earliestCodexSlotReset`). Nothing is
+   * persisted: `process.env.CODEX_HOME` carries the active home between turns
+   * and queries, and a respawn starts on the primary.
    *
    * Exported as a method so the gen() body and unit tests can both drive it.
    */
@@ -1262,13 +1263,6 @@ export class CodexProvider implements AgentProvider {
       // process.env.CODEX_HOME is unset — the codex CLI uses the same default.
       let currentCodexHome = resolveCodexConfigDir();
       let primaryAuthRefreshAttempted = false;
-      // Homes this query has already run on. A rotation adds its target and
-      // `rotateCodexHome` skips them, so one query tries each account at most
-      // once — the bound that keeps the rotation loop finite.
-      const triedHomes = new Set<string>([currentCodexHome]);
-      // The reset instant each failed account stated (null when its error
-      // carried none), in rotation order; read only once the ring is exhausted.
-      const slotResets: Array<string | null> = [];
 
       try {
         await initializeCodexAppServer(server);
@@ -1347,6 +1341,20 @@ export class CodexProvider implements AgentProvider {
           // The fresh-thread paths reset only the thread-scoped dedupe state; see
           // resetCodexTurnAccumulatorThread.
           const turnAccum = createCodexTurnAccumulator();
+          // Ring state is per TURN, at this same boundary. The poll-loop keeps
+          // one query open and pushes later turns into it (poll-loop.ts:1844
+          // `query.push`), so a set scoped to the
+          // query would keep every home marked tried after the first
+          // rotation, and a later turn's park on the fallback would find
+          // nothing left — the outage shape again. Homes this turn has run on:
+          // a rotation adds its target and `rotateCodexHome` skips them, so
+          // one turn tries each account at most once — the bound that keeps
+          // the rotation loop finite.
+          const triedHomes = new Set<string>([currentCodexHome]);
+          // The reset instant each failed account stated this turn (null when
+          // its error carried none), in rotation order; read only once the
+          // ring is exhausted.
+          const slotResets: Array<string | null> = [];
 
           // Restart loop. Each recovery branch has its own monotonic cap:
           // one control-plane replacement, one primary-auth refresh, and

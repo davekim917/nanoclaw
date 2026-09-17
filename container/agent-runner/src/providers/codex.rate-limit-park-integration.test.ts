@@ -27,6 +27,7 @@ const ORIGINAL_ENV = {
   FAKE_CODEX_LOG: process.env.FAKE_CODEX_LOG,
   FAKE_CODEX_WEEKLY_BY_INSTANCE: process.env.FAKE_CODEX_WEEKLY_BY_INSTANCE,
   FAKE_CODEX_RESET_BY_INSTANCE: process.env.FAKE_CODEX_RESET_BY_INSTANCE,
+  FAKE_CODEX_PUSH_WEEKLY_BY_INSTANCE: process.env.FAKE_CODEX_PUSH_WEEKLY_BY_INSTANCE,
 };
 
 function restoreEnv(): void {
@@ -76,6 +77,11 @@ const weeklyByInstance = (process.env.FAKE_CODEX_WEEKLY_BY_INSTANCE ?? '20').spl
 const weekly = weeklyByInstance[Math.min(instance, weeklyByInstance.length) - 1];
 const resetByInstance = (process.env.FAKE_CODEX_RESET_BY_INSTANCE ?? '${RESET_S}').split(',').map(Number);
 const resetS = resetByInstance[Math.min(instance, resetByInstance.length) - 1];
+// The weekly usedPercent this instance PUSHES mid-turn (default: one point up).
+// A push past the park threshold makes the NEXT turn on this same app-server park.
+const pushByInstance = (process.env.FAKE_CODEX_PUSH_WEEKLY_BY_INSTANCE ?? '').split(',').map(Number);
+const pushedRaw = pushByInstance[instance - 1];
+const pushWeekly = Number.isFinite(pushedRaw) && pushedRaw > 0 ? pushedRaw : weekly + 1;
 
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
 const log = (value) => fs.appendFileSync(logPath, JSON.stringify({ instance, ...value }) + '\\n');
@@ -140,7 +146,7 @@ lines.on('line', (line) => {
     send({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: turnId, status: 'inProgress', items: [] } } });
     setTimeout(() => {
       // A sparse rolling push mid-turn: only the weekly window, one point up.
-      send({ method: 'account/rateLimits/updated', params: { rateLimits: { secondary: { usedPercent: weekly + 1, windowDurationMins: 10080, resetsAt: resetS } } } });
+      send({ method: 'account/rateLimits/updated', params: { rateLimits: { secondary: { usedPercent: pushWeekly, windowDurationMins: 10080, resetsAt: resetS } } } });
       send({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId, delta: 'turn result' } });
       send({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: turnId, status: 'completed', items: [] } } });
     }, 5);
@@ -178,8 +184,12 @@ async function run(opts: {
   untrustedHomeMatch?: string;
   /** Capture a generator throw instead of propagating it, so the request log can still be read. */
   tolerateThrow?: boolean;
-  /** Consecutive queries on the SAME provider instance (default 1) — what a container's later turns are. */
+  /** Consecutive queries on the SAME provider instance (default 1) — a container's later wakes. */
   queries?: number;
+  /** Turns pushed into EACH query after its first result (default 0) — the poll-loop's `query.push` path. */
+  pushedTurns?: number;
+  /** Weekly usedPercent each instance pushes mid-turn (comma list, blank = default weekly+1). */
+  pushWeeklyByInstance?: string;
 }): Promise<Run> {
   const binDir = path.join(tmpDir, 'bin');
   const codexHome = path.join(tmpDir, 'codex-home');
@@ -198,6 +208,8 @@ async function run(opts: {
   process.env.FAKE_CODEX_WEEKLY_BY_INSTANCE = opts.weeklyByInstance;
   if (opts.resetByInstance) process.env.FAKE_CODEX_RESET_BY_INSTANCE = opts.resetByInstance;
   else delete process.env.FAKE_CODEX_RESET_BY_INSTANCE;
+  if (opts.pushWeeklyByInstance) process.env.FAKE_CODEX_PUSH_WEEKLY_BY_INSTANCE = opts.pushWeeklyByInstance;
+  else delete process.env.FAKE_CODEX_PUSH_WEEKLY_BY_INSTANCE;
   if (opts.untrustedHomeMatch) process.env.FAKE_CODEX_UNTRUSTED_HOME_MATCH = opts.untrustedHomeMatch;
   else delete process.env.FAKE_CODEX_UNTRUSTED_HOME_MATCH;
   process.env.CODEX_HEALTH_PROBE_QUIET_MS = '60000';
@@ -210,10 +222,16 @@ async function run(opts: {
   let thrown: string | undefined;
   for (let n = 0; n < (opts.queries ?? 1) && thrown === undefined; n++) {
     const query = provider.query({ prompt: 'do the task', cwd: tmpDir });
+    let turnsLeft = opts.pushedTurns ?? 0;
     try {
       for await (const event of query.events) {
         events.push(event as Run['events'][number]);
-        if (event.type === 'result' || (event.type === 'error' && !event.retryable)) query.end();
+        if (event.type === 'result' && turnsLeft > 0) {
+          turnsLeft--;
+          query.push('and the next task');
+        } else if (event.type === 'result' || (event.type === 'error' && !event.retryable)) {
+          query.end();
+        }
       }
     } catch (err) {
       if (!opts.tolerateThrow) throw err;
@@ -347,6 +365,35 @@ describe('Codex rate-limit read → park through gen()', () => {
       expect.stringContaining('→ account 1/2'),
     ]);
     expect(events.filter((e) => e.type === 'result')).toHaveLength(2);
+  }, 5_000);
+
+  it('a later turn PUSHED into the same query gets a fresh ring: fallback parks → back to the primary', async () => {
+    // Round-2 review finding: the poll-loop keeps one query open and pushes
+    // later turns into it (poll-loop.ts:1844). A tried-set scoped to the query
+    // would keep both homes marked after turn 1's rotation, and turn 2's park
+    // on the fallback would find nothing left — the outage again.
+    //
+    // Turn 1: primary (96%) parks → fallback (30%) runs and PUSHES 97% at the
+    // end of its turn. Turn 2, pushed into the same query, starts on that same
+    // fallback app-server: the pre-turn check sees 97% → park → the ring must
+    // offer the primary (instance 3, 20%) and complete there.
+    const fallbackHome = path.join(tmpDir, 'codex-fallback-1');
+    fs.mkdirSync(fallbackHome, { recursive: true });
+    const { events, requests, spawned } = await run({
+      weeklyByInstance: '96,30,20',
+      pushWeeklyByInstance: ',97',
+      fallbackHomes: [fallbackHome],
+      pushedTurns: 1,
+    });
+    expect(spawned).toBe(3);
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(requests.filter((r) => r.method === 'turn/start').map((r) => r.instance)).toEqual([2, 3]);
+    expect(events.filter((e) => e.type === 'result')).toHaveLength(2);
+    const rotations = events.filter((e) => e.type === 'progress' && String(e.message).includes('Codex OAuth rotating'));
+    expect(rotations.map((e) => String(e.message))).toEqual([
+      expect.stringContaining('→ account 2/2'),
+      expect.stringContaining('→ account 1/2'),
+    ]);
   }, 5_000);
 
   it('every account spent: one quota error carrying the EARLIEST reset in the ring, not the last account tried', async () => {

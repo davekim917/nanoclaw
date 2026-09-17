@@ -47,7 +47,7 @@ function credentialSlotKey(providerName: string): string {
  * `restorePersistedCredentialSlot`): it relies on a respawn as its reset, and
  * a persisted cursor that never wraps would turn a recoverable dead end into
  * a permanent one. Codex's ring (`CodexProvider.rotateCodexHome`) is circular
- * per query and carries its active home in `process.env.CODEX_HOME`, so it
+ * per turn and carries its active home in `process.env.CODEX_HOME`, so it
  * has no cursor to persist either.
  */
 export function getCredentialSlot(providerName: string): string | undefined {

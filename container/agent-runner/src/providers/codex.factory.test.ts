@@ -964,7 +964,7 @@ describe('codex OAuth fallback — rotation primitives', () => {
       });
     });
 
-    it('rotateCodexHome walks the ring after the current home, skipping homes tried this query, and wraps to the primary', () => {
+    it('rotateCodexHome walks the ring after the current home, skipping homes tried this turn, and wraps to the primary', () => {
       withEnv({ CODEX_HOME: '/p', CODEX_FALLBACK_HOMES: '/a:/b:/c' }, () => {
         const p = new CodexProvider();
         expect(p.codexHomeRing).toEqual(['/p', '/a', '/b', '/c']);
@@ -975,7 +975,7 @@ describe('codex OAuth fallback — rotation primitives', () => {
         tried.add('/b');
         expect(p.rotateCodexHome('/b', tried)).toBe('/c');
         tried.add('/c');
-        // Every account tried this query: exhausted, and stays so.
+        // Every account tried this turn: exhausted, and stays so.
         expect(p.rotateCodexHome('/c', tried)).toBeNull();
         expect(p.rotateCodexHome('/c', tried)).toBeNull();
       });
