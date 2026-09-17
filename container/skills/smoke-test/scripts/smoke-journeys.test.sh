@@ -129,12 +129,15 @@ expect 2-unknown '.selection == "full" and .reason == "no GO" and .unmappedPaths
   [.matchedJourneys[] | select(.reason == "range-unknown") | .id] == ["loan-desk-checkout","branch-scope-crossing"] and
   .unassessedNativeJourneys == ["mobile-scan-return"]' "$(match '[]' --unknown "no GO")"
 expect 2-unreadable-paths '.selection == "full" and (.reason | test("unreadable"))' "$(match 'not json')"
-# An unusable catalogue still owes every journey it can NAME (floor included).
-jq '.journeys[0].evidence = "web"' "$EXAMPLE" > "$WORK/half-broken.json"
-expect 2-invalid-names-journeys '.selection == "full" and .catalogueValid == false and
-  [.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"catalogue-invalid"},{"id":"branch-scope-crossing","reason":"catalogue-invalid"},{"id":"mobile-scan-return","reason":"catalogue-invalid"}] and
-  .matchedJourneys[0].evidence == "browser" and .matchedJourneys[1].evidence == "api" and .floor.due == ["branch-scope-crossing"]' \
-  "$(CATALOGUE="$WORK/half-broken.json" match '["web/src/desk/a.tsx"]')"
+# ONE rule for every unusable catalogue. One that parses but fails validation
+# (here: one empty title) is refused exactly like one that does not parse — a
+# partial reading could name journeys while dropping every unclaimed path.
+jq '.journeys[0].title = ""' "$EXAMPLE" > "$WORK/half-broken.json"
+if OUT="$(CATALOGUE="$WORK/half-broken.json" match '["api/src/reports/export.ts"]' 2>"$WORK/half.err")"; then
+  fail "2-invalid-catalogue-refused: exit 0 with: $OUT"
+fi
+[ -z "$OUT" ] || fail "2-invalid-catalogue-refused: printed a selection: $OUT"
+expect 2-invalid-catalogue-says-why '.ok == false and (.error | test("unusable: journey loan-desk-checkout: title must be"))' "$(cat "$WORK/half.err")"
 printf 'nope' > "$WORK/broken.json"
 # A catalogue NOTHING can be read out of selects nothing, and that must never
 # look like a selection somebody could pin: the matcher fails instead.
@@ -365,10 +368,13 @@ jq -n '{schemaVersion:1,pr:7,runId:"run-1",owner:"owner-1",boundAt:"x"}' > "$GAT
 expect 5b-authority-fallback '.ready == true' "$(repo_barrier org/repo)"
 rm -f "$GATE_LEASES/pr-7-authority.json" "$PIN_PR8" "$PIN_FORK"
 
-# Only a VALID pin binds. What the gate reports as pinState:"invalid" (a
-# symlink, a directory, truncated JSON) has no selection to adopt, so it cannot
-# hold a run hostage — the campaign is already `full` by the gate's own word.
-pr_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
+# AN INVALID PIN IS NEVER "NO PIN" on the enforcing side either. Whatever sits
+# at this campaign's pin path and is not a well-formed pin (truncated, a
+# symlink, a directory) refuses the run until it adopts the REBUILT selection
+# pin-run writes — every journey of the live catalogue — and then holds it to
+# that: a lane per journey with the right kind and evidence, and one explicit
+# scope-rebuilt disposition, because the changed paths are unknown.
+ALL_LANES='[{"id":"loan-desk-checkout","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"},{"id":"mobile-scan-return","kind":"lane"}]'
 for kind in truncated symlink directory; do
   rm -rf "$WORK/bad-leases"; share_lease "$WORK/bad-leases" 7
   bad="$WORK/bad-leases/journeys-pin-org__repo-pr-7-$SHA.json"
@@ -377,8 +383,77 @@ for kind in truncated symlink directory; do
     symlink) ln -s "$GATE_PIN" "$bad" ;;
     directory) mkdir "$bad" ;;
   esac
-  expect "5b-invalid-pin-$kind" '.ready == true' "$(SMOKE_GATE_LEASE_DIR="$WORK/bad-leases" bash "$BARRIER" "$RUN" lanes)"
+  bad_barrier() { SMOKE_GATE_LEASE_DIR="$WORK/bad-leases" bash "$BARRIER" "$RUN" lanes || true; }
+  # An unrelated terminal lane and no selection: NOT ready, naming the command.
+  pr_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
+  expect "5b-invalid-pin-$kind-refuses" '.ready == false and any(.invalidReasons[]; test("never switches journey checks off") and test("pin-run .* --catalogue"))' "$(bad_barrier)"
+  # A VALID pin's bytes from elsewhere are not the rebuilt selection.
+  mkdir -p "$RUN/journeys"; cp "$GATE_PIN" "$RUN/journeys/selection.json"; cp "$EXAMPLE" "$RUN/journeys/catalogue.json"
+  expect "5b-invalid-pin-$kind-wrong-selection" 'any(.invalidReasons[]; test("must hold the REBUILT selection"))' "$(bad_barrier)"
+  # Rebuild, and the run is held to the whole catalogue.
+  pr_run "$ALL_LANES"
+  expect "5b-invalid-pin-$kind-needs-catalogue" '.ok == false' "$(python3 "$TOOL" pin-run "$RUN" "$bad" || true)"
+  expect "5b-invalid-pin-$kind-rebuild" '.ok == true and .rebuilt == true' "$(python3 "$TOOL" pin-run "$RUN" "$bad" --catalogue "$EXAMPLE")"
+  jq -e --arg p "$bad" '.rebuilt == true and .invalidPin.path == $p and .selection == "full" and
+    [.matchedJourneys[].id] == ["loan-desk-checkout","branch-scope-crossing","mobile-scan-return"]' "$RUN/journeys/selection.json" >/dev/null || fail "5b: rebuilt selection shape"
+  for lane in loan-desk-checkout branch-scope-crossing mobile-scan-return; do marker "$lane" blocked '[]'; done
+  expect "5b-invalid-pin-$kind-needs-disposition" '.ready == false and any(.invalidReasons[]; test("scope-rebuilt"))' "$(bad_barrier)"
+  disposition '{"dispositions":[{"disposition":"scope-rebuilt","reason":"gate pin invalid; changed paths unknown, whole catalogue walked"}]}'
+  expect "5b-invalid-pin-$kind-rebuilt-ready" '.ready == true' "$(bad_barrier)"
+  # One journey short is not the whole catalogue.
+  pr_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"}]'
+  python3 "$TOOL" pin-run "$RUN" "$bad" --catalogue "$EXAMPLE" >/dev/null
+  marker loan-desk-checkout blocked '[]'; marker branch-scope-crossing blocked '[]'
+  disposition '{"dispositions":[{"disposition":"scope-rebuilt","reason":"x"}]}'
+  expect "5b-invalid-pin-$kind-lane-per-journey" 'any(.invalidReasons[]; test("matched journey mobile-scan-return \\(scope-rebuilt\\) has no lane"))' "$(bad_barrier)"
+  # A rebuilt selection thinned by hand no longer names its own catalogue.
+  jq -c 'del(.matchedJourneys[2])' "$RUN/journeys/selection.json" > "$RUN/journeys/s.tmp"; mv "$RUN/journeys/s.tmp" "$RUN/journeys/selection.json"
+  expect "5b-invalid-pin-$kind-thinned" 'any(.invalidReasons[]; test("rebuilt selection does not name catalogue journey mobile-scan-return"))' "$(bad_barrier)"
 done
+unset -f bad_barrier
+# The rebuild needs a USABLE live catalogue, and no pin at all is not a rebuild.
+pr_run "$ALL_LANES"
+expect 5b-rebuild-bad-catalogue '.ok == false' "$(python3 "$TOOL" pin-run "$RUN" "$bad" --catalogue "$WORK/half-broken.json" || true)"
+expect 5b-no-pin-file '.ok == false and (.error | test("no gate pin at"))' "$(python3 "$TOOL" pin-run "$RUN" "$WORK/nothing-here.json" --catalogue "$EXAMPLE" || true)"
+
+# --- 5c. one lane rule for every journey-backed lane ------------------------------
+# A catalogue whose BROWSER journey is also a floor journey.
+jq '.journeys[0].maxIntervalDays = 3' "$EXAMPLE" > "$WORK/browser-floor.json"
+FLOOR_PIN="$(CATALOGUE="$WORK/browser-floor.json" gate_pin "$WORK/lease5c" "$SHA" '["web/src/desk/a.tsx","api/src/reports/export.ts"]')"
+floor_run() { # <loan-desk lane kind>; report-export is there for the disposition cases
+  new_run '[{"id":"loan-desk-checkout","kind":"'"$1"'"},{"id":"mobile-scan-return","kind":"lane"}]'
+  python3 "$TOOL" pin-run "$RUN" "$FLOOR_PIN" >/dev/null
+  printf 'ok' > "$RUN/api.txt"; printf 'png' > "$RUN/desk.png"; marker mobile-scan-return blocked '[]'
+  disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
+}
+# A floor journey scaffolded as an ordinary lane slips the barrier's floor-media
+# bar and never touches the cadence clock: refused, whatever it cites.
+floor_run lane; marker loan-desk-checkout pass '["api.txt"]'
+expect 5c-floor-journey-needs-floor-kind '.ready == false and any(.invalidReasons[]; test("loan-desk-checkout is a floor journey but its lane is kind .lane."))' "$(barrier)"
+floor_run floor; marker loan-desk-checkout pass '["api.txt"]'
+expect 5c-browser-pass-needs-media '.ready == false and any(.invalidReasons[]; test("browser"))' "$(barrier)"
+floor_run floor; marker loan-desk-checkout pass '["desk.png"]'
+expect 5c-browser-floor-pass '.ready == true' "$(barrier)"
+# The media bar is the JOURNEY's, not the lane kind's: a non-floor browser
+# journey cannot pass on a text file either, nor on media that is not there.
+new_run '[{"id":"loan-desk-checkout","kind":"lane"}]'; python3 "$TOOL" pin-run "$RUN" "$PIN_FILE" >/dev/null
+disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
+printf 'ok' > "$RUN/api.txt"; marker loan-desk-checkout pass '["api.txt"]'
+expect 5c-browser-lane-text-only 'any(.invalidReasons[]; test("a browser journey passes only on browser media"))' "$(barrier)"
+printf 'png' > "$RUN/desk.png"; marker loan-desk-checkout pass '["api.txt","desk.png"]'
+expect 5c-browser-lane-with-media '.ready == true' "$(barrier)"
+# Disposition-linked journeys take the SAME helper: a native-manual journey
+# reached through mapped-to-journey passes only on the tester's result.
+floor_run floor; marker loan-desk-checkout blocked '[]'; printf 'packet' > "$RUN/packet.md"
+marker mobile-scan-return pass '["packet.md"]'
+disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"mapped-to-journey","journeyId":"mobile-scan-return"}]}'
+expect 5c-disposition-native-needs-result 'any(.invalidReasons[]; test("named tester"))' "$(barrier)"
+disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"mapped-to-journey","journeyId":"loan-desk-checkout"}]}'
+marker mobile-scan-return blocked '[]'
+new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"mobile-scan-return","kind":"lane"}]'; python3 "$TOOL" pin-run "$RUN" "$FLOOR_PIN" >/dev/null
+marker loan-desk-checkout blocked '[]'; marker mobile-scan-return blocked '[]'
+disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"mapped-to-journey","journeyId":"loan-desk-checkout"}]}'
+expect 5c-disposition-floor-kind 'any(.invalidReasons[]; test("is a floor journey but its lane is kind"))' "$(barrier)"
 
 # --- 6. capture recipes --------------------------------------------------------
 new_run '[{"id":"loan-desk-checkout","kind":"lane"}]'

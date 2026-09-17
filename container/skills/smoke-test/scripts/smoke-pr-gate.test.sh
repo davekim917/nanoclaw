@@ -1494,7 +1494,8 @@ for T5K_KIND in truncated dangling directory; do
     directory) mkdir "$(jpin_file 13 "$FREEZE_SHA")" ;;
   esac
   range_case "5k-invalid-$T5K_KIND" '.journeys.pinState == "invalid" and .journeys.selection == "full" and
-    (.journeys.reason | test("cannot be recovered")) and .journeys.pinFile == null'
+    (.journeys.reason | test("cannot be recovered")) and .journeys.pinFile == null and
+    .journeys.invalidPinFile == "'"$(jpin_file 13 "$FREEZE_SHA")"'"'
   bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and
     .data.journeys.pinState == "invalid" and .data.journeys.selection == "full"' >/dev/null ||
     { echo "5k: an invalid journeys pin ($T5K_KIND) made the freeze unofferable" >&2; exit 1; }
@@ -1592,18 +1593,24 @@ rm -f "$STUB_BIN/python3"
 # The real producers of that state: a catalogue that is truncated, or
 # unreadable, at the first settled poll. No pin, not offered, reason on stderr;
 # once the catalogue is repaired the next poll pins the real selection.
-for T5K_KIND in truncated unreadable; do
+# ONE rule: a catalogue that parses but fails validation (one empty title) is
+# refused the same way — named journeys with no unmapped paths would let an
+# unclaimed change through.
+for T5K_KIND in truncated unreadable invalid; do
   journeys_fixture "$BACKEND_ONLY"
   case "$T5K_KIND" in
+    invalid)    jq '.journeys[0].title = ""' "$JOURNEYS_EXAMPLE" > "$STATE_DIR/journeys.json" ;;
     truncated)  head -c 200 "$JOURNEYS_EXAMPLE" > "$STATE_DIR/journeys.json" ;;
     unreadable) chmod 000 "$STATE_DIR/journeys.json"; [ "$(id -u)" != 0 ] || continue ;;
   esac
   range_case "5k-$T5K_KIND-catalogue" '.journeys.selection == "full" and .journeys.pinState == "absent" and
-    (.journeys.reason | test("catalogue that cannot be parsed"))'
+    (.journeys.reason | test("journey matcher failed: journey catalogue is unusable")) and .journeys.matchedJourneys == []'
   bash "$GATE" poll 2>"$T5K_FAIL_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
     { echo "5k: a $T5K_KIND catalogue's empty selection was offered" >&2; exit 1; }
-  grep -q 'journey selection could not be pinned' "$T5K_FAIL_ERR" ||
-    { echo "5k: $T5K_KIND catalogue: the unoffered head was silent" >&2; exit 1; }
+  grep -q 'journey selection could not be pinned (journey matcher failed: journey catalogue is unusable' "$T5K_FAIL_ERR" ||
+    { echo "5k: $T5K_KIND catalogue: the unoffered head was silent: $(cat "$T5K_FAIL_ERR")" >&2; exit 1; }
+  [ "$T5K_KIND" != invalid ] || grep -q 'title must be' "$T5K_FAIL_ERR" ||
+    { echo "5k: the validation error was not named: $(cat "$T5K_FAIL_ERR")" >&2; exit 1; }
   [ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: a $T5K_KIND catalogue was pinned" >&2; exit 1; }
   chmod 644 "$STATE_DIR/journeys.json"; cp "$JOURNEYS_EXAMPLE" "$STATE_DIR/journeys.json"
   bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.journeys.pinned == true and
@@ -1622,7 +1629,7 @@ range_case 5k-unknown '.campaignRange.determinable == false and .journeys.select
 journeys_fixture "$BACKEND_ONLY"
 printf '{"schemaVersion":1,"journeys":"nope"}' > "$STATE_DIR/journeys.json"
 range_case 5k-broken '.journeys.selection == "full" and .journeys.catalogueValid == false and
-  (.journeys.reason | test("names no journey.*unusable"))'
+  (.journeys.reason | test("journey matcher failed: journey catalogue is unusable")) and .journeys.pinState == "absent"'
 # An ordinary PR has no campaignRange, so it gets no selection either.
 journeys_fixture "$BACKEND_ONLY"
 export STUB_PR_FILES='[{"filename":"api/src/loans/period.ts"}]'

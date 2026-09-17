@@ -568,20 +568,25 @@ catalogue and states the result as `journeys` in `check` and the
 `pr_build_settled` wake. It reads the **pinned** range paths and is pinned with
 them at the first settled poll — immutable, in the shared lease directory, with
 a sha256-named catalogue snapshot — so no catalogue edit, recovery wake or
-second coordinator changes a run's contract. An empty `full` is never pinned
-(the head waits a cycle and retries). `pinState: invalid` ⇒ `full`, still
-offered, **naming nothing the barrier can enforce**: its scope is unrecoverable,
-so the owner walks every journey in the live catalogue, scaffolds a lane for
-each, and says on the report that the selection was rebuilt by hand. No catalogue: no `journeys` key. At intake:
+second coordinator changes a run's contract. An unusable catalogue (unreadable,
+unparseable, or failing `validate`) selects nothing: nothing is pinned, the head
+is not offered that cycle, stderr names the errors, and the next poll retries.
+`pinState: invalid` ⇒ `full`, still offered, its scope unrecoverable — and
+never an off switch: `pin-run <run-dir> <journeys.invalidPinFile> --catalogue
+<live catalogue>` adopts a **rebuilt** selection (every journey in the
+catalogue), and the barrier refuses the run until it holds one, with a lane per
+journey and one `{"disposition":"scope-rebuilt","reason":…}` entry. No catalogue: no `journeys` key. At intake:
 
 1. `smoke-journeys.py pin-run <run-dir> <journeys.pinFile>` copies the pin and
    snapshot into `<run-dir>/journeys/`; workers and siblings read that copy,
    never a group's private live file.
 2. **Every `matchedJourneys[]` entry becomes a contract lane with the journey
    id as its lane id** — `reason` says why it is there (`changed`, `floor`, or
-   `range-unknown`, `catalogue-invalid`). An `evidence: api` journey's lane
-   **must** be scaffolded `--evidence <id>=api` and no other lane may be — the
-   barrier refuses both directions. `selection: "full"` (range unknown, or the
+   `range-unknown`, `scope-rebuilt`). The barrier holds every journey-backed
+   lane, disposition-linked ones included, to one rule: a floor journey's lane
+   is kind `floor`; an `evidence: api` journey's lane **must** be scaffolded
+   `--evidence <id>=api` and no other may be; a browser `pass` names media that
+   exists in the run; a native-manual `pass` names the tester's result. `selection: "full"` (range unknown, or the
    catalogue unusable — `reason` says which) selects every walkable journey,
    and `unassessedNativeJourneys[]` go on the Untested line by name.
 3. **Every frozen `unmappedPaths[]` entry gets a scope disposition** in

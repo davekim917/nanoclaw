@@ -524,10 +524,11 @@ done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 # shared, so a second coordinator's barrier finds it too), resolved from the
 # same two env vars the gate and the scaffold use; a pr-owned contract's
 # sourceSha IS that head sha (require_fenced_source_sha, smoke-run-scaffold.sh:309).
-# Only a VALID pin binds: an invalid one is what the gate itself reports as
-# unrecoverable/`full`, with nothing to adopt. No catalogue means no pin, and a
-# run with neither a pin nor a selection is untouched; an unreadable answer
-# fails closed.
+# An INVALID pin (symlink, directory, truncated) is never "no pin": the run must
+# then hold the REBUILT selection `pin-run` writes for it — every journey in
+# the catalogue — and is held to that. No catalogue means no pin, and a run
+# with neither a pin nor a selection is untouched; an unreadable answer fails
+# closed.
 JOURNEY_LEASE_DIR="${SMOKE_GATE_LEASE_DIR:-${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases}"
 #
 # ONE owning pin, never "any pin for this sha". The lease dir is shared, so two

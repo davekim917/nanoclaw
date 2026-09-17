@@ -1865,11 +1865,14 @@ journeys_pin_file() {  # <pr> <head-sha>
   f="$(range_pin_file "$1" "$2")"
   printf '%s/journeys-pin-%s' "$LEASE_DIR" "${f##*/range-pin-}"
 }
-journeys_full() {  # <reason> <pinState> — the fail-closed selection: full, said why
-  jq -cn --arg reason "$1" --arg state "$2" \
+journeys_full() {  # <reason> <pinState> [invalid-pin-file] — the fail-closed selection: full, said why
+  # invalidPinFile is what the owner hands to `smoke-journeys.py pin-run` to
+  # adopt a REBUILT selection; the barrier refuses the run without one.
+  jq -cn --arg reason "$1" --arg state "$2" --arg bad "${3:-}" \
     '{schemaVersion:1, selection:"full", reason:$reason, route:"web", catalogueValid:false,
       catalogueSha256:null, matchedJourneys:[], unmappedPaths:[], excludedPaths:[],
-      unassessedNativeJourneys:[], pinned:false, pinFile:null, catalogueSnapshot:null, pinState:$state}'
+      unassessedNativeJourneys:[], pinned:false, pinFile:null, catalogueSnapshot:null, pinState:$state}
+     + (if $bad == "" then {} else {invalidPinFile:$bad} end)'
 }
 # Prints the selection (one JSON object), or `null` when the install has no
 # catalogue AND this head has no journeys pin. Range-sized data reaches the
@@ -1877,7 +1880,7 @@ journeys_full() {  # <reason> <pinState> — the fail-closed selection: full, sa
 # never an empty match; a matcher crash fails closed the same way.
 journeys_select() {  # <pr> <head-sha> <determinable> <fail-reason> <paths-json> <size>
   local pr="$1" head_sha="$2" determinable="$3" fail_reason="$4" paths_json="${5:-[]}" size="$6"
-  local f why out snapshot_out=""
+  local f why out err snapshot_out=""
   local -a args
   if ! why="$(range_pin_store_readable)"; then
     [ -e "$JOURNEYS_CATALOGUE" ] || [ -L "$JOURNEYS_CATALOGUE" ] || { printf 'null'; return 0; }
@@ -1892,7 +1895,7 @@ journeys_select() {  # <pr> <head-sha> <determinable> <fail-reason> <paths-json>
       return 0
     else why="truncated or malformed"
     fi
-    journeys_full "the journeys pin for this head ($f) is $why, so the selection it pinned cannot be recovered" invalid
+    journeys_full "the journeys pin for this head ($f) is $why, so the selection it pinned cannot be recovered" invalid "$f"
     return 0
   fi
   [ -e "$JOURNEYS_CATALOGUE" ] || [ -L "$JOURNEYS_CATALOGUE" ] || { printf 'null'; return 0; }
@@ -1904,16 +1907,22 @@ journeys_select() {  # <pr> <head-sha> <determinable> <fail-reason> <paths-json>
     rm -f "$snapshot_out" "$TMP_DIR/journeys-pin-$pr.json" 2>/dev/null
     args+=(--snapshot-out "$snapshot_out")
   fi
-  # A matcher that crashed, timed out, could not parse the catalogue, or came
-  # back with an empty `full` has selected NOTHING (JOURNEYS_PINNABLE): report
-  # it, leave no candidate — poll then cannot promote, does not offer the head
-  # this cycle and says why, and the next poll tries again.
-  if ! out="$(printf '%s' "$paths_json" | timeout 20 python3 "$JOURNEYS_TOOL" match "${args[@]}" 2>/dev/null)" ||
+  # A matcher that crashed, timed out, was handed an unusable catalogue
+  # (unreadable, unparseable OR failing validation — one rule, it exits
+  # non-zero), or came back with an empty `full` has selected NOTHING
+  # (JOURNEYS_PINNABLE): report it with the matcher's own first errors, leave
+  # no candidate — poll then cannot promote, does not offer the head this cycle
+  # and says why, and the next poll tries again.
+  err="$(mktemp 2>/dev/null)" || err=/dev/null
+  if ! out="$(printf '%s' "$paths_json" | timeout 20 python3 "$JOURNEYS_TOOL" match "${args[@]}" 2>"$err")" ||
      ! out="$(jq -ce "select($JOURNEYS_PIN_SHAPE) | . + {pinState:\"absent\"}" <<<"$out" 2>/dev/null)"; then
     [ -z "$snapshot_out" ] || rm -f "$snapshot_out" 2>/dev/null
-    journeys_full "journey matcher failed (crash, timeout, or a catalogue that cannot be parsed)" absent
+    why="$(jq -r '.error // empty' "$err" 2>/dev/null | head -c 400)"
+    [ "$err" = /dev/null ] || rm -f "$err" 2>/dev/null
+    journeys_full "journey matcher failed: ${why:-crash or timeout}" absent
     return 0
   fi
+  [ "$err" = /dev/null ] || rm -f "$err" 2>/dev/null
   if ! jq -e "$JOURNEYS_PINNABLE" <<<"$out" >/dev/null 2>&1; then
     [ -z "$snapshot_out" ] || rm -f "$snapshot_out" 2>/dev/null
     journeys_full "the selection is \`full\` but names no journey ($(jq -r '.reason // "no reason given"' <<<"$out"))" absent
