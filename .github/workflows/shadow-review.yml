@@ -249,30 +249,50 @@ jobs:
           #    one expression whether it is written on one line or wrapped over
           #    several.
           flat=$(printf '%s\n' "$content" | sed -E 's;//.*$;;' | tr '\n' ' ')
-          flat=$(printf '%s' "$flat" | sed -E 's;/\*([^*]|\*+[^*/])*\*+/;;g')
+          # A block comment becomes a SPACE, not nothing: deleting it outright
+          # would let `…['a']/**/const FRONTIER_MODELS=['b']` fuse into one
+          # token and hide the second declaration from the duplicate check.
+          flat=$(printf '%s' "$flat" | sed -E 's;/\*([^*]|\*+[^*/])*\*+/; ;g')
+          # Because `//` is stripped first, a `//` INSIDE a block comment eats
+          # that comment's `*/` and leaves the `/*` unclosed — which would make
+          # the text after it read as live code. Any surviving delimiter means
+          # the strip did not do what the matching below assumes, so refuse
+          # rather than resolve from text we cannot account for.
+          if printf '%s' "$flat" | grep -qE '/\*|\*/'; then
+            echo "unbalanced block comment after comment-stripping $ROSTER@$BASE_SHA — refusing to resolve a reviewer from it" >&2
+            exit 1
+          fi
 
           # 3. The FRONTIER_MODELS array literal: the declaration, then
           #    everything from the `[` that opens the array to the FIRST `]`
           #    after it, so no later array (COMPATIBLE_RECEIPT_MODELS in
-          #    particular) can leak in. `[^=]*` spans an optional type
-          #    annotation; anchoring the bracket scan AFTER the `=` is what
-          #    keeps a `readonly string[]` annotation from being mistaken for
-          #    the array's own closing bracket. A `]` INSIDE an id (a stray
-          #    `[1m]` suffix) still truncates the literal there, so such a
-          #    roster fails below as "found 0" rather than by name — imprecise,
-          #    but fail-closed: no `[1m]` id can reach the reviewer input.
+          #    particular) can leak in. Anchoring the bracket scan AFTER the `=`
+          #    is what keeps a `readonly string[]` annotation from being
+          #    mistaken for the array's own closing bracket. A `]` INSIDE an id
+          #    (a stray `[1m]` suffix) still truncates the literal there, so
+          #    such a roster fails below as "found 0" rather than by name —
+          #    imprecise, but fail-closed: no `[1m]` id reaches the reviewer.
           #
-          #    The name is bounded on BOTH sides. Without the trailing
-          #    `([[:space:]]*:|[[:space:]]*=)` a longer name starting with the
-          #    same prefix matches too — a `FRONTIER_MODELS_PREVIOUS = [...]`
-          #    declared above the real one resolved to the PREVIOUS array and
-          #    exited 0, reviewing with a superseded model. Leading `[^A-Za-z0-9_]`
-          #    (or start-of-text) does the same for a `NEXT_FRONTIER_MODELS`.
+          #    Reading `decl` left to right, each piece and what it guards:
+          #      `(^|[^A-Za-z0-9_$])` — the char before `const` is not an
+          #        identifier char, so `myconst`/`$const` cannot match.
+          #      `const[[:space:]]+FRONTIER_MODELS` — this is what already
+          #        rejects a LONGER name ending in the target, e.g.
+          #        `NEXT_FRONTIER_MODELS`.
+          #      `[[:space:]]*(:[^=;]*)?=` — the name is followed only by
+          #        optional space, an optional type annotation, and then the
+          #        `=`. This is the bound that was MISSING: without it,
+          #        `FRONTIER_MODELS_PREVIOUS = [...]` declared above the real
+          #        one matched, `head -n 1` took it, and the job reviewed with a
+          #        superseded model and exited 0. Excluding `;` from the
+          #        annotation keeps it from running past a bare
+          #        `declare const FRONTIER_MODELS: readonly string[];` into a
+          #        different declaration's array.
           # 4. Every match is counted, not just the first: two declarations that
           #    both satisfy the pattern mean the roster carries a choice this
           #    step is not entitled to make silently, so it fails rather than
           #    taking whichever comes first.
-          decl="(^|[^A-Za-z0-9_\$])(export[[:space:]]+)?const[[:space:]]+FRONTIER_MODELS[[:space:]]*(:[^=]*)?=[[:space:]]*\[[^]]*\]"
+          decl="(^|[^A-Za-z0-9_\$])(export[[:space:]]+)?const[[:space:]]+FRONTIER_MODELS[[:space:]]*(:[^=;]*)?=[[:space:]]*\[[^]]*\]"
           matches=$(printf '%s' "$flat" | grep -oE "$decl" || true)
           decl_count=$(printf '%s\n' "$matches" | grep -cE 'FRONTIER_MODELS' || true)
           if [ "$decl_count" -ne 1 ]; then
