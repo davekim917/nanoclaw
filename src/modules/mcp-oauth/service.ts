@@ -185,9 +185,31 @@ export interface LoginResult {
 /** How long an opt-in loopback listener stays up by default. */
 export const DEFAULT_LISTEN_TIMEOUT_SECONDS = 600;
 
+/**
+ * Lock key for a (group, MCP URL) pair, held ONLY by `startLogin` and only
+ * inside the name lock.
+ *
+ * #905 review P2: the name lock does not serialize two logins that use
+ * different NAMES for the same target, so both could pass the duplicate check
+ * below, both dynamically register a client, and only the second fail at the
+ * unique index — leaving exactly the stray registration the check exists to
+ * prevent. Covering the check, the registration and the upsert with a
+ * target-scoped lock is what makes that check mean anything under concurrency.
+ *
+ * `\u0000` cannot appear in a name (`assertIntegrationName` allows
+ * `[a-z0-9-]`), so a target key can never collide with one. Deadlock-free by
+ * ordering: name is always taken before target, and nothing else in this module
+ * takes two locks at all.
+ */
+function targetLockKey(agentGroupId: string, mcpUrl: string): string {
+  return `\u0000target\u0000${agentGroupId}\u0000${mcpUrl}`;
+}
+
 export function startLogin(input: LoginInput, fetchImpl: FetchLike = fetch): Promise<LoginResult> {
   assertIntegrationName(input.name);
-  return withIntegrationLock(input.name, () => startLoginLocked(input, fetchImpl));
+  return withIntegrationLock(input.name, () =>
+    withIntegrationLock(targetLockKey(input.agentGroupId, input.mcpUrl), () => startLoginLocked(input, fetchImpl)),
+  );
 }
 
 async function startLoginLocked(input: LoginInput, fetchImpl: FetchLike): Promise<LoginResult> {

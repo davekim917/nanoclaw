@@ -434,3 +434,24 @@ describe('startLogin — the bearer secret id follows the NAME (P3d)', () => {
     expect((await getMcpOAuthIntegration('example-int'))!.bearer_secret_id).toBe('secret-uuid-1');
   });
 });
+
+// #905 review P2: the duplicate check only means something if two logins for
+// the same target cannot run through it at once. The locks are name-scoped, so
+// two different NAMES for one (group, URL) were serialized by nothing.
+describe('startLogin — concurrent logins for one target are serialized', () => {
+  it('registers exactly one client when two names race for the same group and URL', async () => {
+    const registrations: string[] = [];
+    const fetchImpl = server({ registrations });
+
+    const results = await Promise.allSettled([
+      startLogin({ name: 'example-int', mcpUrl: MCP_URL, agentGroupId: 'ag-1' }, fetchImpl),
+      startLogin({ name: 'example-dupe', mcpUrl: MCP_URL, agentGroupId: 'ag-1' }, fetchImpl),
+    ]);
+
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((r) => r.status === 'rejected')).toHaveLength(1);
+    // The one that lost registered nothing at the provider — which is the
+    // whole point, since nothing here could ever revoke it.
+    expect(registrations).toHaveLength(1);
+  });
+});

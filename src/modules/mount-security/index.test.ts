@@ -245,3 +245,43 @@ describe('default blocked patterns cover the OAuth bundles and hyphenated key fi
     expect(mountOf('ordinary-repo').allowed).toBe(true);
   });
 });
+
+// #905 review P1: a blocked PATTERN only inspects the mount's own path, so
+// `mcp-oauth` in the list closed the leaf and left every ancestor open —
+// `data/`, or a home directory, reaches the same bundles through the parent.
+describe('the MCP OAuth bundle directory is unreachable from above as well as below', () => {
+  function mount(hostPath: string, readonly = true): ReturnType<typeof validateMount> {
+    writeAllowlist({ allowedRoots: [{ path: tmpDir, allowReadWrite: true }], blockedPatterns: [] });
+    return validateMount({ hostPath, readonly });
+  }
+
+  it('refuses a READ-ONLY mount of DATA_DIR, the realistic operator mistake', () => {
+    fs.mkdirSync(path.join(mockState.dataDir, 'mcp-oauth'), { recursive: true });
+    const result = mount(mockState.dataDir);
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toMatch(/MCP OAuth bundle directory/);
+  });
+
+  it('refuses an ancestor above DATA_DIR too', () => {
+    fs.mkdirSync(path.join(mockState.dataDir, 'mcp-oauth'), { recursive: true });
+    expect(mount(tmpDir).allowed).toBe(false);
+  });
+
+  it('refuses it before the directory exists — no integration has been created yet', () => {
+    // Nothing named mcp-oauth on disk anywhere.
+    expect(fs.existsSync(path.join(mockState.dataDir, 'mcp-oauth'))).toBe(false);
+    expect(mount(mockState.dataDir).allowed).toBe(false);
+  });
+
+  it('refuses the bundle directory itself, read-only', () => {
+    const bundles = path.join(mockState.dataDir, 'mcp-oauth');
+    fs.mkdirSync(bundles, { recursive: true });
+    expect(mount(bundles).allowed).toBe(false);
+  });
+
+  it('leaves a sibling under DATA_DIR alone — this is a targeted refusal, not a ban on data/', () => {
+    const siblings = path.join(mockState.dataDir, 'workgroups');
+    fs.mkdirSync(siblings, { recursive: true });
+    expect(mount(siblings).allowed).toBe(true);
+  });
+});

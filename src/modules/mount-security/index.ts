@@ -256,6 +256,38 @@ function touchesManagedGitHooksRoot(realPath: string): boolean {
 }
 
 /**
+ * True when `realPath` touches the MCP OAuth bundle directory
+ * (`data/mcp-oauth/` — `src/modules/mcp-oauth/store.ts`) in either direction.
+ *
+ * The blocked PATTERN is not enough on its own, and #905 review P1 is the
+ * reason: `matchesBlockedPattern` only inspects the selected path itself
+ * (`matchesBlockedPattern` below scans `realPath`'s own components and its own
+ * string), never its descendants. So `mcp-oauth` in the list refuses a mount
+ * AIMED at the bundle directory and does nothing about a mount of `data/`, or
+ * of `$HOME`, which reaches the same files through the parent. The pattern is
+ * kept because it also catches a bundle directory copied somewhere outside
+ * `DATA_DIR`; this check is what closes the ancestor case.
+ *
+ * Unlike {@link touchesManagedGitHooksRoot}, this refuses READ-ONLY mounts too.
+ * The git-hooks tree is protected against a container WRITING a hook; here the
+ * harm is reading — each bundle holds a refresh token and a client secret, the
+ * means to mint a working bearer for as long as the grant lives.
+ *
+ * Lexical first, then realpath, for the same two reasons that check gives: the
+ * lexical form works before `data/mcp-oauth/` exists at all (no integration has
+ * been created yet), and the realpath form catches a symlinked alias of
+ * `DATA_DIR` that resolves onto the same target without matching the string.
+ */
+function touchesMcpOAuthBundleRoot(realPath: string): boolean {
+  const bundleRootLiteral = path.join(DATA_DIR, 'mcp-oauth');
+  if (isPathContainedOrContains(bundleRootLiteral, realPath)) return true;
+
+  const dataDirReal = getRealPath(DATA_DIR);
+  if (dataDirReal === null) return true; // DATA_DIR itself unreadable — cannot verify, fail closed
+  return isPathContainedOrContains(path.join(dataDirReal, 'mcp-oauth'), realPath);
+}
+
+/**
  * Check if a path matches any blocked pattern
  */
 function matchesBlockedPattern(realPath: string, blockedPatterns: string[]): string | null {
@@ -392,6 +424,20 @@ export function validateMount(mount: AdditionalMount): MountValidationResult {
     return {
       allowed: false,
       reason: `Path "${realPath}" is read-write inside the host-managed git-hooks tree — refused unconditionally`,
+    };
+  }
+
+  // Refuse ANY mount — read-only included — that reaches the MCP OAuth bundle
+  // directory, from above or below. Reading one bundle is the whole attack: it
+  // carries the refresh token and client secret that mint this group's bearer.
+  // Unconditional, like the git-hooks refusal above, because an allowlist that
+  // happens to permit `data/` is exactly the mistake this exists to survive.
+  // Ordered AFTER that one so a read-write mount of DATA_DIR keeps reporting
+  // the git-hooks reason its own cases pin — both refuse it either way.
+  if (touchesMcpOAuthBundleRoot(realPath)) {
+    return {
+      allowed: false,
+      reason: `Path "${realPath}" reaches the MCP OAuth bundle directory (refresh tokens) — refused unconditionally`,
     };
   }
 
