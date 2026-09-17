@@ -89,6 +89,20 @@ export interface StdioMcpServerConfig {
    */
   plugin?: string;
   instructions?: string;
+  /**
+   * Human label for the capability snapshot (`src/capabilities.ts`), e.g.
+   * "DeepWiki" for the server named `deepwiki`. Absent means the server name
+   * with its first letter capitalized. Host-only metadata: stripped before the
+   * map reaches a container (`serializeMcpServersEnv`).
+   */
+  displayName?: string;
+  /**
+   * What this server is for, in the agent's own capability list. Absent means
+   * a generic line naming the transport. Host-only metadata, like
+   * `displayName` — distinct from `instructions`, which is always-in-context
+   * text the host imports into the composed CLAUDE.md.
+   */
+  description?: string;
 }
 
 export interface HttpMcpServerConfig {
@@ -99,6 +113,20 @@ export interface HttpMcpServerConfig {
   plugin?: string;
   // Optional always-in-context guidance; host imports into composed CLAUDE.md.
   instructions?: string;
+  /**
+   * Human label for the capability snapshot (`src/capabilities.ts`), e.g.
+   * "DeepWiki" for the server named `deepwiki`. Absent means the server name
+   * with its first letter capitalized. Host-only metadata: stripped before the
+   * map reaches a container (`serializeMcpServersEnv`).
+   */
+  displayName?: string;
+  /**
+   * What this server is for, in the agent's own capability list. Absent means
+   * a generic line naming the transport. Host-only metadata, like
+   * `displayName` — distinct from `instructions`, which is always-in-context
+   * text the host imports into the composed CLAUDE.md.
+   */
+  description?: string;
 }
 
 export interface SseMcpServerConfig {
@@ -107,6 +135,11 @@ export interface SseMcpServerConfig {
   headers?: Record<string, string>;
   // Optional always-in-context guidance; host imports into composed CLAUDE.md.
   instructions?: string;
+  /** See StdioMcpServerConfig.displayName. Present for shape symmetry only —
+   * `validateMcpServers` refuses an SSE entry before it can be read. */
+  displayName?: string;
+  /** See StdioMcpServerConfig.description. Present for shape symmetry only. */
+  description?: string;
 }
 
 /**
@@ -406,6 +439,22 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
     throw new Error('MCP instructions must be a string');
   }
 
+  // Host-only metadata for the capability snapshot. Validated here like every
+  // other field so a bad value is refused at intake rather than surfacing as
+  // a malformed capability line in some agent's context days later.
+  const displayName = input.displayName;
+  if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim() === '')) {
+    throw new Error('MCP displayName must be a non-empty string');
+  }
+  const description = input.description;
+  if (description !== undefined && typeof description !== 'string') {
+    throw new Error('MCP description must be a string');
+  }
+  const metadata = {
+    ...(displayName === undefined ? {} : { displayName: displayName.trim() }),
+    ...(description === undefined ? {} : { description }),
+  };
+
   if (url !== undefined) {
     if (input.command !== undefined) throw new Error('Provide exactly one of command or url');
     // A declared type that contradicts the fields is a mistake, not something
@@ -462,6 +511,7 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
       url,
       ...(headers === undefined || Object.keys(headers).length === 0 ? {} : { headers }),
       ...(instructions === undefined ? {} : { instructions }),
+      ...metadata,
     };
   }
   if (command === undefined) throw new Error('Provide exactly one of command or url');
@@ -497,6 +547,7 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
     env,
     ...(cwd === undefined ? {} : { cwd }),
     ...(instructions === undefined ? {} : { instructions }),
+    ...metadata,
   };
 }
 

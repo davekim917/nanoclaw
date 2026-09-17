@@ -68,6 +68,8 @@ Per-agent-group container runtime config (provider, model, packages, MCP servers
 
 `ncl groups config get/update` and the self-mod MCP tools manage both: `config update` writes `provider`/`model`/`effort` to the DB row *and* mirrors them into `container.json`, so a provider change takes effect next restart — writing only the DB row leaves the container booting its old provider.
 
+**Fleet-wide MCP servers are data, not code.** `data/fleet-mcp-servers.json` (`ncl groups config add-mcp-server --fleet …`) holds the servers every group inherits; a group's own `container.json` entry wins for that name, and `excludeMcpServers` withholds an inherited one. The capability snapshot describes whatever that merge produces — one function, `effectiveMcpServers` (`src/fleet-mcp-servers.ts`), serves both the spawn and the snapshot, so there is no second list to update when a tool is added. [docs/fleet-mcp-servers.md](docs/fleet-mcp-servers.md)
+
 **`cli_scope`** controls what the agent can do with `ncl` in-container:
 
 | Value | Behavior |
@@ -172,6 +174,7 @@ Tracks latest stable, including majors; prerelease/beta/RC/dev/nightly/draft/yan
 | Isolation levels | `isolation-model.md` |
 | Workgroups | `workgroups.md` |
 | Skills | `skills-model.md`, `skill-guidelines.md`, `skill-directives.md`, `skill-engine-seam.md` |
+| Fleet MCP defaults | `fleet-mcp-servers.md` |
 | Runtime, CI | `build-and-runtime.md` |
 | Dependency updates | `dependency-updates.md` |
 | Remote MCP OAuth | `mcp-oauth-integrations.md` |

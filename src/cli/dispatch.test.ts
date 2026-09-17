@@ -365,6 +365,18 @@ describe('CLI scope enforcement', () => {
     }
   });
 
+  it('group: blocks --fleet, whose blast radius is every group', async () => {
+    mockGetContainerConfig.mockReturnValue({ cli_scope: 'group' });
+
+    const resp = await dispatch({ id: '1', command: 'groups-test', args: { fleet: true } }, agentCtx());
+
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) {
+      expect(resp.error.code).toBe('forbidden');
+      expect(resp.error.message).toContain('--fleet');
+    }
+  });
+
   it('group: blocks cli-scope escalation (hyphenated)', async () => {
     mockGetContainerConfig.mockReturnValue({ cli_scope: 'group' });
 
