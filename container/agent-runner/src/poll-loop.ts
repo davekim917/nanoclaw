@@ -1538,9 +1538,13 @@ function hasRealInbound(messages: MessageInRow[]): boolean {
   });
 }
 
-/** A person's message that engaged the agent (trigger=1) — not context rows, not a peer agent. */
-function hasTriggeringHumanInbound(messages: MessageInRow[]): boolean {
-  return hasRealInbound(messages.filter((m) => m.trigger === 1 && m.channel_type !== 'agent'));
+/**
+ * The person's message that engaged the agent, if the batch holds one: an
+ * admissible trigger (so not a /clear-style command — isAdmissibleTrigger),
+ * not a peer agent's, not host-authored.
+ */
+function triggeringHumanInbound(messages: MessageInRow[]): MessageInRow | undefined {
+  return messages.find((m) => isAdmissibleTrigger(m) && m.channel_type !== 'agent' && hasRealInbound([m]));
 }
 
 function isContinuationRecoveryBatch(messages: MessageInRow[]): boolean {
@@ -1744,15 +1748,21 @@ export async function processQuery(
   // <message> blocks are inert (formatter.ts, RoutingContext.taskRun), so the
   // nudge would ask for a reply that cannot be delivered.
   type ReplyDebt = { sinceSeq: number; channelType: string | null; platformId: string | null; threadId: string | null };
-  const replyDebt = (rows: MessageInRow[], from: RoutingContext): ReplyDebt | null =>
-    !routing.taskRun && hasTriggeringHumanInbound(rows)
-      ? {
-          sinceSeq: maxOutboundSeq(),
-          channelType: from.channelType,
-          platformId: from.platformId,
-          threadId: from.threadId,
-        }
-      : null;
+  // The conversation is the PERSON'S row's, not the batch anchor's:
+  // extractRouting anchors a mixed batch on its task row (formatter.ts, "task
+  // row" anchor), which is the task's destination, not where the person is.
+  // A row with no routing of its own falls back to the batch's.
+  const replyDebt = (rows: MessageInRow[], from: RoutingContext): ReplyDebt | null => {
+    const human = routing.taskRun ? undefined : triggeringHumanInbound(rows);
+    if (!human) return null;
+    const own = human.platform_id != null && human.channel_type != null;
+    return {
+      sinceSeq: maxOutboundSeq(),
+      channelType: own ? human.channel_type : from.channelType,
+      platformId: own ? human.platform_id : from.platformId,
+      threadId: own ? (human.thread_id ?? null) : from.threadId,
+    };
+  };
   let humanReplyOwed: ReplyDebt | null = replyDebt(
     initialBatchIds.map((id) => getMessageIn(id)).filter((m): m is MessageInRow => m != null),
     routing,
@@ -2206,7 +2216,7 @@ export async function processQuery(
         // and none was delivered.
         const midTurnNote =
           pushedHumanTrigger && !turnIdle
-            ? '\n\n<system>This arrived while your turn is still running. Text you write between tool calls is NOT ' +
+            ? '\n\n<system>Reminder: text you write between tool calls is NOT ' +
               'delivered. To answer now, call the `send_message` tool; otherwise answer in <message to="name"> ' +
               'blocks when the turn ends.</system>'
             : '';
@@ -2568,9 +2578,17 @@ export async function processQuery(
             if (!willRetryWrapping && !willRetryTaskBlocks) {
               completeDeliveredPrompt();
             }
-            // Delivered, deliberately <internal>, or already nudged once: the
-            // debt is settled either way. A pending wrapping retry keeps it.
-            if (!willRetryWrapping && answersRunnerPrompt) humanReplyOwed = null;
+            // Settled when the person's conversation got a row, or the agent
+            // deliberately sent nothing (<internal> only, or the one nudge is
+            // spent). Blocks sent only ELSEWHERE leave it open, the same
+            // question hasChatOutboundAfter answers for send_message.
+            if (
+              humanReplyOwed &&
+              !willRetryWrapping &&
+              answersRunnerPrompt &&
+              (sent === 0 || hasChatOutboundAfter(humanReplyOwed.sinceSeq, humanReplyOwed))
+            )
+              humanReplyOwed = null;
           }
         } else {
           // `ProviderEvent.text` is `string | null`, so a terminal result can

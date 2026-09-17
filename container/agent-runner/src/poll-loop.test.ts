@@ -3228,6 +3228,72 @@ describe("a person's message that got nothing delivered", () => {
     expect(pushes).toHaveLength(1);
   });
 
+  it('counts a card as the reply', async () => {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    const { query, pushes } = emptyTurn(() =>
+      writeMessageOut({
+        id: 'card',
+        kind: 'chat-sdk',
+        channel_type: 'discord',
+        platform_id: 'chan-1',
+        content: JSON.stringify({ type: 'card', card: { title: 'Status' }, fallbackText: 'Status' }),
+      }),
+    );
+    await human(query);
+
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('counts a keyed reply when the conversation is a thread: the key has no effect there', async () => {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    const threaded = { ...ERR_ROUTING, threadId: 'chan-1:T' };
+    const { query, pushes } = emptyTurn(() =>
+      writeMessageOut({
+        id: 'keyed-in-thread',
+        kind: 'chat',
+        channel_type: 'discord',
+        platform_id: 'chan-1',
+        thread_id: 'chan-1:T',
+        content: JSON.stringify({ text: 'restore is at 80%', threadKey: 'db-restore-9' }),
+      }),
+    );
+    insertMessage('m1', 'chat', { sender: 'Operator', senderId: 'U1', text: 'checking in' });
+    await processQuery(query, threaded, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('with no routing to match, counts any non-agent reply and still ignores one to a peer', async () => {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    const unrouted = { ...ERR_ROUTING, platformId: null, channelType: null };
+    const toPeer = emptyTurn(() =>
+      writeMessageOut({
+        id: 'peer-only',
+        kind: 'chat',
+        channel_type: 'agent',
+        platform_id: 'ag-peer',
+        content: JSON.stringify({ text: 'take this' }),
+      }),
+    );
+    insertMessage('m1', 'chat', { sender: 'Operator', senderId: 'U1', text: 'checking in' });
+    await processQuery(toPeer.query, unrouted, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+    expect(toPeer.pushes).toHaveLength(1);
+
+    const answered = emptyTurn(() =>
+      writeMessageOut({ id: 'plain', kind: 'chat', content: JSON.stringify({ text: 'here' }) }),
+    );
+    await processQuery(answered.query, unrouted, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+    expect(answered.pushes).toHaveLength(0);
+  });
+
+  it('does not open a debt for a /clear command', async () => {
+    insertMessage('c1', 'chat', { sender: 'Operator', senderId: 'U1', text: '/clear' });
+    const { query, pushes } = emptyTurn();
+    await processQuery(query, ERR_ROUTING, ['c1'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(pushes).toHaveLength(0);
+  });
+
   it('leaves an empty result alone when no person triggered the turn', async () => {
     const { query, pushes } = makeResultQuery({ type: 'result', text: null });
 
