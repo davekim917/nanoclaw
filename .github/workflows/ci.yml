@@ -53,12 +53,22 @@ jobs:
   # merge ref (actions/checkout's default for pull_request), so its tree IS
   # main's new tree in exactly that case; when the base moved, the merged tree
   # was never tested and this job says so. `correctness` records each tree it
-  # passed as an empty artifact named by tree hash (its LAST step, never
-  # `if: always()`, so the marker exists only for a green job); this job looks
-  # the marker up. Anything but a definite hit — API error, expired marker —
-  # runs the tests, so the failure direction is "tested twice", never
-  # "tested never". `bookkeeping` always runs: it is 30s and its red means
-  # something different (see the split above).
+  # passed as an empty artifact named by tree hash AND the PR head it merged
+  # (its LAST step, never `if: always()`, so the marker exists only for a
+  # green job); this job looks the marker up. Anything but a definite hit —
+  # API error, expired marker — runs the tests, so the failure direction is
+  # "tested twice", never "tested never". `bookkeeping` always runs: it is
+  # 30s and its red means something different (see the split above).
+  #
+  # Same tree is not the same HISTORY, and one check is history-sensitive:
+  # scripts/review-notes.test.ts resolves every `at <sha>` citation pin
+  # against full history and fails on one it cannot resolve. A squash merge
+  # drops the PR's commits, so a pin to one of them passes the PR run (the
+  # merge ref reaches them) and would fail on main. Hence the marker also
+  # names the PR head, and the lookup requires main's new commit to be a
+  # merge commit whose second parent IS that head — then everything the PR
+  # run could reach, main reaches too. Squash, rebase and direct pushes
+  # always run.
   #
   # Not a new trust boundary: a PR can already edit this file, and its own
   # run is what the merge gate reads, so forging a marker gains nothing a
@@ -77,13 +87,22 @@ jobs:
         run: |
           set -euo pipefail
           tree=$(git rev-parse 'HEAD^{tree}')
-          hits=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=ci-green-tree-$tree&per_page=5" \
+          # `rev-list --parents -n 1` prints "<sha> <parent1> [<parent2>]".
+          read -r -a parents <<< "$(git rev-list --parents -n 1 HEAD)"
+          if [ "${#parents[@]}" -ne 3 ]; then
+            echo "HEAD is not a merge commit (squash, rebase or direct push): its history differs from the PR run's; running"
+            echo "already_green=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          head="${parents[2]}"
+          name="ci-green-tree-$tree-head-$head"
+          hits=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=5" \
             --jq '[.artifacts[] | select(.expired == false)] | length' || echo 0)
           if [ "$hits" -gt 0 ]; then
-            echo "tree $tree passed correctness on a pull_request run; skipping the re-run"
+            echo "tree $tree merged from PR head $head passed correctness on its pull_request run; skipping the re-run"
             echo "already_green=true" >> "$GITHUB_OUTPUT"
           else
-            echo "tree $tree has no green marker (base moved before the merge, or the marker expired); running"
+            echo "no green marker for tree $tree from head $head (base moved before the merge, or the marker expired); running"
             echo "already_green=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -308,10 +327,10 @@ jobs:
             /tmp/coverage-risk-baseline-candidate.json
           retention-days: 14
 
-      # The marker tested-tree reads. Last step on purpose, and `success()` is
-      # spelled out because an explicit `if:` replaces the implicit one: the
-      # marker must exist only when every step above passed. pull_request only —
-      # a push tree never recurs on main.
+      # The marker tested-tree reads: this tree, merged from this PR head. Last
+      # step on purpose, and `success()` is spelled out because an explicit
+      # `if:` replaces the implicit one: the marker must exist only when every
+      # step above passed. pull_request only — a push tree never recurs on main.
       - name: Record this tree as green
         id: tree
         if: success() && github.event_name == 'pull_request'
@@ -321,7 +340,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: success() && github.event_name == 'pull_request'
         with:
-          name: ci-green-tree-${{ steps.tree.outputs.tree }}
+          name: ci-green-tree-${{ steps.tree.outputs.tree }}-head-${{ github.event.pull_request.head.sha }}
           path: tested-tree.marker
           retention-days: 7
 
