@@ -68,7 +68,7 @@ Channel recovery is an adapter contract rather than a Discord special case. Befo
 
 ## CI shape
 
-`.github/workflows/ci.yml` installs both Node (with pnpm cache) and Bun, then runs in order:
+`.github/workflows/ci-full.yml` (nightly and `workflow_dispatch`; a pull_request only gets `ci.yml`'s typecheck job) installs both Node (with pnpm cache) and Bun, then runs in order:
 
 1. `pnpm install --frozen-lockfile` (host)
 2. `bun install --frozen-lockfile` in `container/agent-runner/` (container)
