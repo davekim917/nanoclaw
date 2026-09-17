@@ -63,7 +63,11 @@ import {
 } from './pre-turn-context.js';
 import { evaluateRecallCorpus, type RecallCorpus } from './recall-corpus-eval.js';
 import { withCentralSync } from '../../db/central-lease.js';
-import { resolveSessionServicesCentral, type SessionServicesCentral } from '../../capabilities.js';
+import {
+  CAPABILITY_ROSTER_PREAMBLE,
+  resolveSessionServicesCentral,
+  type SessionServicesCentral,
+} from '../../capabilities.js';
 import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
 import { log } from '../../log.js';
 import { upsertArchiveMessage } from '../../message-archive.js';
@@ -271,16 +275,22 @@ describe('bounded authoritative pre-turn retrieval', () => {
     // "what did we decide last week", has zero archive and zero memory
     // excerpts, and answers "I don't have context on that" for a question the
     // archive answers. Only an internal notice records the loss.
+    //
+    // Pressure comes from the NAME now, not from `useFor`. The block carries a
+    // roster whose hint is capped at `capabilityRosterUseChars`, so free text
+    // can no longer reach this budget through the hint; a service name still
+    // can, because a stored MCP server's `displayName` becomes the entry name
+    // verbatim and is checked only for "non-empty string", with no length
+    // bound (src/container-config.ts:446).
     const notices: ContextNotice[] = [];
     const bounded = boundedCapabilities(
       {
         agentGroupId: 'ag-a',
         services: Array.from({ length: 20 }, (_, i) => ({
-          name: `Service ${i}`,
+          name: `Service ${i} ${'x'.repeat(PRE_TURN_BOUNDS.capabilityDetailChars)}`,
           declaredTools: [],
           scopes: [],
           credentialPaths: [],
-          useFor: 'x'.repeat(PRE_TURN_BOUNDS.capabilityDetailChars),
         })),
       },
       notices,
@@ -297,12 +307,21 @@ describe('bounded authoritative pre-turn retrieval', () => {
   // `Fivetran, Profound, SELECT (select.dev), Slack (read)` — the last four
   // authored — and an agent with live Slack told the owner Slack was down.
   describe('retainUnderBudget', () => {
+    // The roster's hint is capped at `capabilityRosterUseChars`, so the way to
+    // put a roster over `capabilityTotalChars` is a long NAME — which is
+    // operator-reachable: a stored MCP server's `displayName` becomes the
+    // entry name verbatim and is checked only for "non-empty string"
+    // (src/container-config.ts:446). Assertions strip the padding so they
+    // still read as the service names they are about — so the pad must stay
+    // UNDER `capabilityDetailChars`, or `boundedText` clips it and `unpad`
+    // silently stops matching.
+    const PAD = ` ${'x'.repeat(1_500)}`;
+    const unpad = (name: string | undefined) => name?.replace(PAD, '');
     const service = (name: string, retainUnderBudget?: boolean) => ({
-      name,
+      name: `${name}${PAD}`,
       declaredTools: [],
       scopes: [],
       credentialPaths: [],
-      useFor: 'x'.repeat(PRE_TURN_BOUNDS.capabilityDetailChars),
       ...(retainUnderBudget ? { retainUnderBudget } : {}),
     });
 
@@ -312,11 +331,11 @@ describe('bounded authoritative pre-turn retrieval', () => {
       const bounded = boundedCapabilities({ agentGroupId: 'ag-a', services }, notices);
 
       expect(JSON.stringify(bounded.services).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.capabilityTotalChars);
-      expect(bounded.services.map((s) => s.name)).toContain('Slack');
+      expect(bounded.services.map((s) => unpad(s.name))).toContain('Slack');
       // Authoring order is kept for what survives; eviction takes the latest
       // non-retained entries, so the earliest ones stay.
-      expect(bounded.services[0]?.name).toBe('Service 0');
-      expect(bounded.services.at(-1)?.name).toBe('Slack');
+      expect(unpad(bounded.services[0]?.name)).toBe('Service 0');
+      expect(unpad(bounded.services.at(-1)?.name)).toBe('Slack');
       const dropped = notices.find((n) => n.code === 'capability-total-budget')?.detail ?? '';
       expect(dropped).toContain('Service 7');
       expect(dropped).not.toContain('Slack');
@@ -326,12 +345,13 @@ describe('bounded authoritative pre-turn retrieval', () => {
       const notices: ContextNotice[] = [];
       const services = [...Array.from({ length: 8 }, (_, i) => service(`Service ${i}`)), service('Slack')];
       const bounded = boundedCapabilities({ agentGroupId: 'ag-a', services }, notices);
-      expect(bounded.services.map((s) => s.name)).not.toContain('Slack');
+      expect(bounded.services.map((s) => unpad(s.name))).not.toContain('Slack');
     });
 
     it('the service-count limit displaces a non-retained entry instead of cutting a retained one', () => {
       const notices: ContextNotice[] = [];
-      const small = (name: string, retain?: boolean) => ({ ...service(name, retain), useFor: 'short' });
+      // Count limit, not the char budget — so these entries stay small.
+      const small = (name: string, retain?: boolean) => ({ ...service(name, retain), name, summary: 'short' });
       const services = [
         ...Array.from({ length: PRE_TURN_BOUNDS.capabilityServices + 3 }, (_, i) => small(`Service ${i}`)),
         small('Slack', true),
@@ -590,7 +610,12 @@ describe('bounded authoritative pre-turn retrieval', () => {
     );
     expect(result.trustedCapabilities).toEqual({
       agentGroupId: 'ag-a',
-      services: [{ name: 'safe-for:mg-a', declaredTools: [], scopes: [], credentialPaths: [] }],
+      howToUse: CAPABILITY_ROSTER_PREAMBLE,
+      // The block carries the ROSTER, not the full snapshot: name, how it is
+      // reached, and a hint. The fixture service has neither cli nor
+      // mcpNamespace and no text at all, so `via` is empty and there is no
+      // `use` to derive.
+      services: [{ name: 'safe-for:mg-a', via: '' }],
     });
     expect(JSON.stringify(result.trustedCapabilities)).not.toContain('admin');
   });
@@ -837,7 +862,11 @@ describe('bounded authoritative pre-turn retrieval', () => {
     FAILURES.capabilities = true;
     const capabilityFailure = await withCentralSync(() => buildPreTurnContext(input), 'test');
     expect(capabilityFailure.memoryEvidence.excerpts[0]?.path).toBe('preferences/operator.md');
-    expect(capabilityFailure.trustedCapabilities).toEqual({ agentGroupId: 'ag-a', services: [] });
+    expect(capabilityFailure.trustedCapabilities).toEqual({
+      agentGroupId: 'ag-a',
+      howToUse: CAPABILITY_ROSTER_PREAMBLE,
+      services: [],
+    });
     expect(capabilityFailure.notices.some((notice) => notice.code === 'capability-detail-read-failed')).toBe(true);
   });
 
@@ -2139,7 +2168,9 @@ describe('final-bound eviction order at the seam', () => {
     shape: { caps?: boolean; exactLinks?: number } = {},
   ): Parameters<typeof enforceFinalBound>[0] {
     const context: Parameters<typeof enforceFinalBound>[0] = {
-      ...(shape.caps ? { trustedCapabilities: { agentGroupId: 'ag-a', services: [] } } : {}),
+      ...(shape.caps
+        ? { trustedCapabilities: { agentGroupId: 'ag-a', howToUse: CAPABILITY_ROSTER_PREAMBLE, services: [] } }
+        : {}),
       memoryEvidence: { core: [], excerpts: [memRow(0, 1_800), memRow(1, 1_800), memRow(2, 1_800)] },
       conversationEvidence: {
         excerpts: [
@@ -2200,12 +2231,17 @@ describe('final-bound eviction order at the seam', () => {
     // Nothing but capabilities left to shed: no memory or conversation rows.
     context.memoryEvidence.excerpts = [];
     context.conversationEvidence.excerpts = [];
+    // Roster entries. A roster of real services cannot reach this bound any
+    // more — the hint is capped at `capabilityRosterUseChars` and the entry
+    // count at `capabilityServices` — so the pressure has to come from the
+    // name, which is operator-reachable through a stored MCP server's
+    // `displayName` (src/container-config.ts:446). The pad stays under
+    // `capabilityDetailChars` so nothing here is clipped.
+    const PAD = ` ${'y'.repeat(2_000)}`;
     const entry = (name: string, retainUnderBudget?: boolean) => ({
-      name,
-      declaredTools: [],
-      scopes: [],
-      credentialPaths: [],
-      useFor: 'y'.repeat(2_400),
+      name: `${name}${PAD}`,
+      via: 'curl',
+      use: 'short',
       ...(retainUnderBudget ? { retainUnderBudget } : {}),
     });
     context.trustedCapabilities!.services = [
@@ -2216,7 +2252,7 @@ describe('final-bound eviction order at the seam', () => {
 
     enforceFinalBound(context);
 
-    const names = context.trustedCapabilities!.services.map((s) => s.name);
+    const names = context.trustedCapabilities!.services.map((s) => s.name.replace(PAD, ''));
     expect(names.length).toBeLessThan(12);
     expect(names).toContain('Slack');
     expect(names).toContain('Service 0');

@@ -16,7 +16,16 @@ beforeEach(() => {
     JSON.stringify({
       session: {
         agentGroupId: 'agent-a',
-        services: [{ name: 'Snowflake', cli: 'snowsql', scopes: ['analytics'] }],
+        howToUse: 'EVERY service listed here is wired into THIS session right now.',
+        services: [
+          {
+            name: 'Snowflake',
+            cli: 'snowsql',
+            scopes: ['analytics'],
+            summary: 'Run SQL on the warehouse',
+            activation: 'snow sql -q "SELECT ..." -c analytics. Long host-authored activation prose lives here.',
+          },
+        ],
       },
     }),
   );
@@ -43,6 +52,69 @@ describe('ensureFreshContextBootstrap', () => {
     expect(result).toContain('Snowflake facts live here.');
     expect(result).toContain('runner-fresh-context-bootstrap');
     expect(result).toContain('<message>hello</message>');
+  });
+
+  it('renders the roster, not the mini-manual, and carries the host standing instruction', () => {
+    // Same reduction the host applies (`buildCapabilityRoster`,
+    // src/capabilities.ts): name + how it is reached + a short hint. The
+    // activation prose stays in the mounted snapshot for
+    // `get_capabilities({ service })` to serve; putting it back here would
+    // re-create on the fallback path exactly the budget pressure the roster
+    // removed on the normal one.
+    const result = ensureFreshContextBootstrap('<message>hello</message>', {
+      capabilities: CAPABILITIES,
+      index: INDEX,
+    });
+
+    expect(result).toContain('\"via\":\"snowsql\"');
+    expect(result).toContain('\"use\":\"Run SQL on the warehouse\"');
+    expect(result).not.toContain('Long host-authored activation prose');
+    // The host writes `howToUse` into the snapshot, so there is one source for
+    // the text and the runner does not keep a second copy to drift.
+    expect(result).toContain('EVERY service listed here is wired into THIS session right now.');
+  });
+
+  it('falls back to its own standing instruction for a snapshot written by an older host', () => {
+    fs.writeFileSync(
+      CAPABILITIES,
+      JSON.stringify({ session: { agentGroupId: 'agent-a', services: [{ name: 'Hex', cli: 'hex' }] } }),
+    );
+
+    const result = ensureFreshContextBootstrap('<message>hello</message>', {
+      capabilities: CAPABILITIES,
+      index: INDEX,
+    });
+
+    expect(result).toContain('never tell the user you lack one of them');
+    expect(result).toContain('get_capabilities');
+  });
+
+  it('derives a hint from the prose when an older snapshot carries no summary', () => {
+    fs.writeFileSync(
+      CAPABILITIES,
+      JSON.stringify({
+        session: {
+          agentGroupId: 'agent-a',
+          services: [
+            {
+              name: 'Looker',
+              mcpNamespace: 'mcp__looker__*',
+              useFor: `Looker via Google's MCP Toolbox. ${'Detail sentence. '.repeat(30)}`,
+            },
+          ],
+        },
+      }),
+    );
+
+    const result = ensureFreshContextBootstrap('<message>hello</message>', {
+      capabilities: CAPABILITIES,
+      index: INDEX,
+    });
+
+    expect(result).toContain('\"via\":\"mcp__looker__*\"');
+    expect(result).toContain("Looker via Google's MCP Toolbox.");
+    // Cut at a word boundary, not mid-word, and nowhere near the full prose.
+    expect(result).not.toContain('Detail sentence. Detail sentence. Detail sentence. Detail sentence.');
   });
 
   it('keeps a raw native slash command ahead of a runner-created bootstrap', () => {
@@ -83,9 +155,14 @@ describe('ensureFreshContextBootstrap', () => {
   });
 
   it('keeps a retainUnderBudget entry the byte bound would otherwise drop, as the host bootstrap does', () => {
+    // Roster entries are small, so the pressure here is a long NAME — the one
+    // capability field an operator can still make arbitrarily large (a stored
+    // MCP server's `displayName`, src/container-config.ts:446). Without
+    // it, 32 surviving entries come to ~4.8k against MAX_CAPABILITY_JSON_CHARS
+    // of 5,000 and only the count limit would be under test.
     const services = (retain: boolean) => [
       ...Array.from({ length: 40 }, (_, index) => ({
-        name: `Service ${index}`,
+        name: `Service ${index} ${'n'.repeat(400)}`,
         cli: `tool-${index}`,
         useFor: `service detail ${index} ${'x'.repeat(600)}`,
       })),
@@ -107,7 +184,7 @@ describe('ensureFreshContextBootstrap', () => {
     const retained = run(true);
     expect(retained).toContain('runner-capability-bootstrap-truncated');
     expect(retained).toContain('"name":"Slack"');
-    expect(retained).toContain('"name":"Service 0"');
+    expect(retained).toContain('"name":"Service 0 ');
     // Control: past both the 32-entry and the byte bound, the unmarked entry is the first to go.
     expect(run(false)).not.toContain('"name":"Slack"');
   });
