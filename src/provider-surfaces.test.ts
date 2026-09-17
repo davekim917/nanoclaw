@@ -133,16 +133,29 @@ async function providerContribution(
   );
 }
 
+// Hermeticity: `buildMounts` resolves ~/plugins, the Codex home and the
+// OpenCode home from `os.homedir()`/`$HOME`, so with the operator's real HOME a
+// case that says nothing about credentials still stats — and now COPIES — the
+// host's real `~/.local/share/opencode/auth.json` into TEST_ROOT. Every case
+// gets an empty test home by default; the cases that exercise credential
+// resolution set their own `fakeHome` and restore to this one.
+let savedHome: string | undefined;
+
 beforeEach(async () => {
   vi.clearAllMocks();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
+  savedHome = process.env.HOME;
+  process.env.HOME = path.join(TEST_ROOT, 'home');
+  fs.mkdirSync(process.env.HOME, { recursive: true });
   await initTestDb();
   runMigrations(getRawDb());
 });
 
 afterEach(async () => {
   await closeDb();
+  if (savedHome === undefined) delete process.env.HOME;
+  else process.env.HOME = savedHome;
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
@@ -1027,6 +1040,80 @@ describe('buildMounts agent surfaces', async () => {
       readonly: false,
     });
     expect(mounts.some((m) => m.hostPath === fallback)).toBe(false);
+    // A peer never runs the rotation that would need the fallback account's
+    // transcripts — CODEX_FALLBACK_HOMES is read only by the Codex provider and
+    // by `setupCodexPrimaryRuntime` — so `sessions/` stays on the host.
+    expect(mounts.some((m) => m.containerPath.endsWith('/sessions'))).toBe(false);
+    expect(fs.existsSync(path.join(fallback, 'sessions'))).toBe(false);
+  });
+
+  // Round-2 review: staging reads host state, so a malformed home throws. For a
+  // Claude or OpenCode group Codex is a PEER capability and the container must
+  // still boot — the runner finds no auth.json and skips CODEX_HOME setup. For
+  // provider=codex the credential IS the session, so the throw stands.
+  it('withholds a malformed Codex home from a peer container but fails a codex session', async () => {
+    // A home whose `auth.json` is a SYMLINK. The gate is `existsSync`, which
+    // follows the link, so the home is admitted and then rejected by
+    // `stageCodexAuth`'s `lstat`.
+    const plantBadHome = (fakeHome: string, dirName: string): string => {
+      const bad = path.join(fakeHome, dirName);
+      const elsewhere = path.join(fakeHome, `${dirName}-target`);
+      fs.mkdirSync(bad, { recursive: true });
+      fs.mkdirSync(elsewhere, { recursive: true });
+      fs.writeFileSync(path.join(elsewhere, 'auth.json'), '{}');
+      fs.symlinkSync(path.join(elsewhere, 'auth.json'), path.join(bad, 'auth.json'));
+      return bad;
+    };
+
+    const mountsFor = async (provider: string, suffix: string) => {
+      const ag = group(`ag-codex-bad-${suffix}`, `codex-bad-${suffix}`);
+      await createAgentGroup(ag);
+      withWorkgroup(ag);
+      await ensureContainerConfig(ag.id);
+      initGroupFilesystem({ ...ag, workgroup_id: ag.folder }, { provider });
+
+      const fakeHome = path.join(TEST_ROOT, `codex-bad-home-${suffix}`);
+      fs.mkdirSync(path.join(fakeHome, 'plugins', 'codex'), { recursive: true });
+      // Both the primary peer home and a declared fallback are malformed, so
+      // one config exercises whichever branch this provider takes.
+      plantBadHome(fakeHome, '.codex');
+      plantBadHome(fakeHome, '.codex-spare');
+
+      const sess = session(`s-codex-bad-${suffix}`, ag.id);
+      const contribution = await providerContribution(provider, ag, sess);
+      const prevHome = process.env.HOME;
+      process.env.HOME = fakeHome;
+      try {
+        return await buildMounts(
+          ag,
+          sess,
+          { ...containerConfig(), codexAuthFallbacks: ['~/.codex-spare'] },
+          provider,
+          contribution,
+          ag.folder,
+        );
+      } finally {
+        process.env.HOME = prevHome;
+      }
+    };
+
+    const peerMounts = await mountsFor('claude', 'peer');
+    // Neither the peer home nor the fallback crossed, and no throw.
+    expect(peerMounts.some((m) => m.containerPath.startsWith('/home/node/.codex'))).toBe(false);
+    // The container still gets everything else it needs to boot.
+    expect(peerMounts.some((m) => m.containerPath === '/workspace')).toBe(true);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining('withheld'),
+      expect.objectContaining({ containerPath: '/home/node/.codex' }),
+    );
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining('withheld'),
+      expect.objectContaining({ containerPath: '/home/node/.codex-fallback-1' }),
+    );
+
+    // provider=codex owns /home/node/.codex itself, so the malformed home
+    // reaches it through the fallback branch — where the throw still stands.
+    await expect(mountsFor('codex', 'primary')).rejects.toThrow(/Unsafe codex auth file/);
   });
 
   // The withholding lever, and the only one: a group that excludes the `codex`

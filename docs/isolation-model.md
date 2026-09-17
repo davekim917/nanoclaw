@@ -24,9 +24,20 @@ What crosses is the CREDENTIAL, not the host home. Every Codex home is staged
 per session: the container's `/home/node/.codex` (and each
 `/home/node/.codex-fallback-N`) is a session-owned directory with a generated
 `config.toml`, into which the host home's `auth.json` is bind-mounted as a
-single file so token refresh still writes back. The operator's `config.toml`,
-`hooks.json`, `hooks/`, `AGENTS.md` and transcripts never reach a container.
-OpenCode is staged the same way, into a session-private XDG tree.
+single file so token refresh still writes back. No container can write the
+operator's `config.toml`, `hooks.json`, `hooks/` or `AGENTS.md`, so none can
+plant a hook a host-side `codex` run would execute. OpenCode is staged the same
+way, into a session-private XDG tree.
+
+One READ path is deliberately wider. A `provider: codex` group also gets its
+resolved host Codex home mounted READ-ONLY at `/home/node/.codex-host-primary`,
+because `refreshCodexAuthFromHost` re-reads `auth.json` from it when the host
+rotates a token mid-session, and a refresh source has to be a directory to see a
+file the host REPLACED. So a codex-provider container can read that home,
+transcripts included. It cannot write any of it. A fallback identity's
+`sessions/` is likewise mounted read-write, but only for `provider: codex`,
+where an in-session rotation lands on that home; peer containers get the
+credential alone.
 
 What *is* bounded is credential SCOPE, not presence — which account a group
 reaches, via the per-group ring and per-group home above — plus the one
