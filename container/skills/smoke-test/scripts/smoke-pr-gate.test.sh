@@ -2404,6 +2404,99 @@ jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and (.data.coo
   exit 1
 }
 
+# --- Recovery owner adopts the predecessor's contract -----------------------
+# End to end through the real poll: claim -> contract -> marker -> container
+# dies (lease expires, progress goes stale) -> poll recovers the SAME run id
+# under a freshly minted token -> the successor adopts, finishes the missing
+# lane and finishes the run, with the predecessor's marker still counting.
+# Owner tokens are never echoed: every failure message below names the step.
+SCAFFOLD="$SCRIPT_DIR/smoke-run-scaffold.sh"
+BARRIER="$SCRIPT_DIR/smoke-evidence-barrier.sh"
+export SMOKE_GATE_RUN_ROOT="$STATE_DIR/run-root"
+mkdir -p "$SMOKE_GATE_RUN_ROOT"
+jq -e '.data.resumedRunId == false and .data.contractAdoptionRequired == false' <<<"$NEXT_POLL" >/dev/null
+ADOPT_RUN="$(jq -r '.data.runId' <<<"$NEXT_POLL")"
+ADOPT_T1="$(jq -r '.data.coordinatorOwnerToken' <<<"$NEXT_POLL")"
+ADOPT_DIR="$SMOKE_GATE_RUN_ROOT/$ADOPT_RUN"
+mkdir -p "$ADOPT_DIR"
+ADOPT_DEADLINE="$(jq -r '.challengerDeadline' "$STATE_DIR/pr-126-state.json")"
+[ -n "$ADOPT_DEADLINE" ] && [ "$ADOPT_DEADLINE" != null ]
+scaffold_as() { local owner="$1"; shift; SMOKE_LANE_ROLE=coordinator SMOKE_GATE_OWNER="$owner" bash "$SCAFFOLD" "$@"; }
+scaffold_as "$ADOPT_T1" contract "$ADOPT_DIR" "$POLL_FAIL_SHA" B1:browser S1:source | jq -e '.ok == true' >/dev/null
+scaffold_as "$ADOPT_T1" marker "$ADOPT_DIR" B1 fail 'by the original owner' | jq -e '.ok == true' >/dev/null
+ADOPT_B1_HASH="$(sha256sum "$ADOPT_DIR/markers/B1.json" | cut -d' ' -f1)"
+# A live run is not recoverable: no second token is minted.
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates"' >/dev/null
+# The predecessor's container dies. A later deadline would be observable.
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$ADOPT_RUN.json"
+sleep 1
+# Two competing recoveries: exactly one poll wins the lease and is handed a
+# token; the other is refused by the shared authority and delivers none.
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll > "$STATE_DIR/recover-1.json" 2>/dev/null &
+RECOVER_PID_1=$!
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll > "$STATE_DIR/recover-2.json" 2>/dev/null &
+RECOVER_PID_2=$!
+wait "$RECOVER_PID_1" || true
+wait "$RECOVER_PID_2" || true
+[ "$(jq -s '[.[] | select(.data.trigger == "pr_build_settled")] | length' \
+  "$STATE_DIR/recover-1.json" "$STATE_DIR/recover-2.json")" -eq 1 ] || {
+  echo "expected exactly one competing recovery poll to win the run" >&2; exit 1; }
+RECOVERED="$(jq -sc '[.[] | select(.data.trigger == "pr_build_settled")][0]' \
+  "$STATE_DIR/recover-1.json" "$STATE_DIR/recover-2.json")"
+jq -e --arg run "$ADOPT_RUN" '.wakeAgent == true and .data.runId == $run and .data.resumedRunId == true and
+  .data.recovery == true and .data.contractAdoptionRequired == true' <<<"$RECOVERED" >/dev/null || {
+  echo "recovery wake did not resume the run id and flag the contract adoption" >&2; exit 1; }
+ADOPT_T2="$(jq -r '.data.coordinatorOwnerToken' <<<"$RECOVERED")"
+[ -n "$ADOPT_T2" ] && [ "$ADOPT_T2" != "$ADOPT_T1" ]
+jq -e --arg owner "$ADOPT_T2" '.activeLeaseOwner == $owner' "$STATE_DIR/pr-126-state.json" >/dev/null
+# No fresh time budget: the original challenger deadline survives recovery.
+[ "$(jq -r '.challengerDeadline' "$STATE_DIR/pr-126-state.json")" = "$ADOPT_DEADLINE" ] || {
+  echo "recovery replaced the original challenger deadline" >&2; exit 1; }
+# Before adoption: the predecessor is fenced, the successor is refused by the
+# contract, and a caller that lost the recovery race cannot adopt at all.
+OUT="$(scaffold_as "$ADOPT_T1" marker "$ADOPT_DIR" S1 fail stale 2>&1 || true)"
+jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null
+OUT="$(scaffold_as "$ADOPT_T2" marker "$ADOPT_DIR" S1 fail unadopted 2>&1 || true)"
+jq -e '.ok == false and (.error | test("different coordinator owner")) and (.error | test("adopt"))' <<<"$OUT" >/dev/null
+OUT="$(scaffold_as owner-lost-the-race adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null
+[ ! -e "$ADOPT_DIR/markers/S1.json" ]
+scaffold_as "$ADOPT_T2" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" | jq -e '.ok == true and .adopted == true and .adoptionCount == 1' >/dev/null
+scaffold_as "$ADOPT_T2" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" | jq -e '.ok == true and .adopted == false and .adoptionCount == 1' >/dev/null
+# After adoption the predecessor is still fenced on every scaffold verb and on
+# the gate's own terminal verb; its token is nowhere in the contract.
+for stale_verb in marker redispatch adopt; do
+  case "$stale_verb" in
+    marker) OUT="$(scaffold_as "$ADOPT_T1" marker "$ADOPT_DIR" S1 fail stale 2>&1 || true)" ;;
+    redispatch) OUT="$(scaffold_as "$ADOPT_T1" redispatch "$ADOPT_DIR" B1 2>&1 || true)" ;;
+    adopt) OUT="$(scaffold_as "$ADOPT_T1" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" 2>&1 || true)" ;;
+  esac
+  jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null || {
+    echo "post-adoption predecessor $stale_verb was not fenced" >&2; exit 1; }
+done
+OUT="$(bash "$GATE" finish "$POLL_FAIL_SHA" "$ADOPT_RUN" NO_GO "$ADOPT_T1" || true)"
+jq -e '.ok == false and (.error | test("caller owner"))' <<<"$OUT" >/dev/null
+for leaked in "$ADOPT_T1" "$(printf '%s' "$ADOPT_T1" | sha256sum | cut -d' ' -f1)" \
+              "$(printf '%s' "$ADOPT_T2" | sha256sum | cut -d' ' -f1)"; do
+  if grep -qF "$leaked" "$ADOPT_DIR/completion-contract.json"; then
+    echo "adoption left a predecessor token or an owner-derived digest in the contract" >&2; exit 1
+  fi
+done
+jq -e '.ownerAdoptions == [.ownerAdoptions[0]] and (.ownerAdoptions[0] | keys == ["adoptedAt","index"])' \
+  "$ADOPT_DIR/completion-contract.json" >/dev/null
+# The successor finishes the missing lane; the predecessor's marker is the
+# same bytes at the same generation and still satisfies the barrier.
+scaffold_as "$ADOPT_T2" marker "$ADOPT_DIR" S1 completed 'by the recovery owner' | jq -e '.ok == true and .generation == 1' >/dev/null
+[ "$(sha256sum "$ADOPT_DIR/markers/B1.json" | cut -d' ' -f1)" = "$ADOPT_B1_HASH" ]
+bash "$BARRIER" "$ADOPT_DIR" lanes | jq -e '.ready == true' >/dev/null
+[ "$(jq -r '.challengerDeadline' "$STATE_DIR/pr-126-state.json")" = "$ADOPT_DEADLINE" ]
+OUT="$(bash "$GATE" finish "$POLL_FAIL_SHA" "$ADOPT_RUN" NO_GO "$ADOPT_T2" || true)"
+jq -e '.ok == true' <<<"$OUT" >/dev/null || { echo "recovery owner could not finish the adopted run" >&2; exit 1; }
+# Already terminal: nothing holds the slot, so nothing can adopt into it.
+OUT="$(scaffold_as "$ADOPT_T2" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("does not hold the gate"))' <<<"$OUT" >/dev/null
+unset SMOKE_GATE_RUN_ROOT
+
 # --- INVARIANT 3: num_env rejects the classes it was built to stop --------
 # Mirror of the develop suite's case-53 extension. "All digits" admitted three
 # shapes, each a distinct silent failure: a leading zero is octal (or fatal) in
@@ -4342,6 +4435,70 @@ jq -e '.ok == false and .activePr == 178 and (.error | test("PR campaign"))' <<<
   [ ! -e "$CROSS_LEASE/task-binding-run-cross-pr-active.json" ]
 SMOKE_GATE_STATE_DIR="$CROSS_A" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
   bash "$GATE" release run-cross-pr-active owner-pr | jq -e '.ok == true' >/dev/null
+
+# Task-kind adoption validates the shared lifetime binding, not just the
+# private slot and lease. Recovery owner B adopts a live same-SHA run; on a
+# second run B's task-finish commits the shared terminal binding and dies
+# before clearing lease/slot — state and lease still look live, and adopt must
+# refuse because the run is already terminal.
+ADOPT_TASK_STATE="$CROSS_BASE/adopt-task" ADOPT_TASK_LEASE="$TEST_SHARED_ROOT/adopt-task/leases"
+ADOPT_TASK_ROOT="$CROSS_BASE/adopt-task-runs"
+mkdir -p "$ADOPT_TASK_STATE" "$ADOPT_TASK_ROOT"
+task_scaffold_as() { local owner="$1"; shift
+  SMOKE_LANE_ROLE=coordinator SMOKE_GATE_OWNER="$owner" SMOKE_GATE_STATE_DIR="$ADOPT_TASK_STATE" \
+    SMOKE_GATE_LEASE_DIR="$ADOPT_TASK_LEASE" bash "$SCRIPT_DIR/smoke-run-scaffold.sh" "$@"; }
+task_gate() { SMOKE_GATE_STATE_DIR="$ADOPT_TASK_STATE" SMOKE_GATE_LEASE_DIR="$ADOPT_TASK_LEASE" bash "$GATE" "$@"; }
+for ADOPT_TASK_RUN in run-adopt-task-live run-adopt-task-terminal; do
+  mkdir -p "$ADOPT_TASK_ROOT/$ADOPT_TASK_RUN"
+  task_gate task-claim "$ADOPT_TASK_RUN" "$CROSS_SHA_A" owner-a | jq -e '.ok == true' >/dev/null
+  task_scaffold_as owner-a contract "$ADOPT_TASK_ROOT/$ADOPT_TASK_RUN" "$CROSS_SHA_A" B1:browser | jq -e '.ok == true' >/dev/null
+  expire_lease "$ADOPT_TASK_LEASE/task-lease-$ADOPT_TASK_RUN.json"
+  task_gate task-claim "$ADOPT_TASK_RUN" "$CROSS_SHA_A" owner-b | jq -e '.ok == true' >/dev/null
+done
+task_scaffold_as owner-b adopt "$ADOPT_TASK_ROOT/run-adopt-task-live" "$CROSS_SHA_A" |
+  jq -e '.ok == true and .adopted == true' >/dev/null
+OUT="$(task_scaffold_as owner-a adopt "$ADOPT_TASK_ROOT/run-adopt-task-live" "$CROSS_SHA_A" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null
+# A binding for another build, or none at all, is not a verifiable identity.
+ADOPT_TASK_BINDING="$ADOPT_TASK_LEASE/task-binding-run-adopt-task-terminal.json"
+ADOPT_TASK_BINDING_BEFORE="$(cat "$ADOPT_TASK_BINDING")"
+ADOPT_TASK_CONTRACT_HASH="$(sha256sum "$ADOPT_TASK_ROOT/run-adopt-task-terminal/completion-contract.json" | cut -d' ' -f1)"
+jq -c --arg sha "$CROSS_SHA_B" '.deploySha=$sha' <<<"$ADOPT_TASK_BINDING_BEFORE" > "$ADOPT_TASK_BINDING"
+OUT="$(task_scaffold_as owner-b adopt "$ADOPT_TASK_ROOT/run-adopt-task-terminal" "$CROSS_SHA_A" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("different deploy SHA"))' <<<"$OUT" >/dev/null
+rm -f "$ADOPT_TASK_BINDING"
+OUT="$(task_scaffold_as owner-b adopt "$ADOPT_TASK_ROOT/run-adopt-task-terminal" "$CROSS_SHA_A" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("missing or malformed"))' <<<"$OUT" >/dev/null
+# Parseable but malformed by the gate's own validator (read_task_binding):
+# adopt must fail closed on exactly the records the lifecycle verbs refuse.
+for BAD_BINDING in 'del(.boundAt)' '.boundAt="2026-02-30T00:00:00Z"' '.boundAt="yesterday"' \
+    '.terminal={}' '.terminal={"verdict":"GO"}' \
+    '.terminal={"verdict":"MAYBE","completedAt":"2026-09-17T00:00:00Z","verdictDigest":"'"$(sha c)$(sha c | cut -c1-24)"'"}' \
+    '.terminal={"verdict":"GO","completedAt":"2026-13-01T00:00:00Z","verdictDigest":"'"$(sha c)$(sha c | cut -c1-24)"'"}' \
+    '.schemaVersion=2' 'del(.terminal) | .kind="task"'; do
+  jq -c "$BAD_BINDING" <<<"$ADOPT_TASK_BINDING_BEFORE" > "$ADOPT_TASK_BINDING"
+  task_gate task-progress run-adopt-task-terminal owner-b 2>/dev/null | jq -e '.ok == false' >/dev/null || {
+    echo "fixture is not malformed to the gate itself: $BAD_BINDING" >&2; exit 1; }
+  OUT="$(task_scaffold_as owner-b adopt "$ADOPT_TASK_ROOT/run-adopt-task-terminal" "$CROSS_SHA_A" 2>&1 || true)"
+  jq -e '.ok == false and (.error | test("missing or malformed"))' <<<"$OUT" >/dev/null || {
+    echo "adopt accepted a malformed shared task binding: $BAD_BINDING" >&2; exit 1; }
+  [ "$(sha256sum "$ADOPT_TASK_ROOT/run-adopt-task-terminal/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_TASK_CONTRACT_HASH" ]
+done
+printf '%s\n' "$ADOPT_TASK_BINDING_BEFORE" > "$ADOPT_TASK_BINDING"
+# The crash cut: terminal binding committed, lease and private slot not cleared.
+if SMOKE_GATE_TEST_TASK_FINISH_EXIT_AFTER=binding \
+   task_gate task-finish run-adopt-task-terminal "$CROSS_SHA_A" NO_GO owner-b >/dev/null; then
+  echo "task-finish binding crash seam unexpectedly returned success" >&2; exit 1
+fi
+jq -e '.terminal.verdict == "NO_GO"' "$ADOPT_TASK_BINDING" >/dev/null
+[ -s "$ADOPT_TASK_LEASE/task-lease-run-adopt-task-terminal.json" ]
+jq -e '.activeRunId == "run-adopt-task-terminal" and .activeLeaseOwner == "owner-b"' \
+  "$ADOPT_TASK_STATE/task-run-adopt-task-terminal-state.json" >/dev/null
+OUT="$(task_scaffold_as owner-b adopt "$ADOPT_TASK_ROOT/run-adopt-task-terminal" "$CROSS_SHA_A" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("already terminal"))' <<<"$OUT" >/dev/null || {
+  echo "adopt succeeded on a task run whose shared binding is already terminal" >&2; exit 1; }
+[ "$(sha256sum "$ADOPT_TASK_ROOT/run-adopt-task-terminal/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_TASK_CONTRACT_HASH" ]
+task_gate task-finish run-adopt-task-terminal "$CROSS_SHA_A" NO_GO owner-b | jq -e '.ok == true' >/dev/null
 
 # Exact retries recover after each finish cut. The final cut has no lease at
 # all and therefore proves task-finish no longer needs a task-claim detour.
