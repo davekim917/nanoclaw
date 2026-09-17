@@ -2075,9 +2075,15 @@ target**, and the gate states it once, in the facts (`check`) and the
   the `targetSha` of the newest handoff-ledger `GO` whose receipt validates
   (digest matches its run `verdict.json`, and the freeze commit / freeze PR
   really bind to that target). `BLOCKED`, `NO_GO` and `HUMAN_DECISION` never
-  move it. It is pinned per freeze head SHA, so every poll and recovery wake
-  of one campaign reports the same range. `baselineRunId`, `baselineResolved`
-  and `baselinePinned` say where it came from.
+  move it. `baselineRunId` and `baselineResolved` say where it came from.
+- **The whole range result is pinned** (`campaignRangePin` in the PR state) at
+  the first *settled* `poll` of a freeze head: the range, its file list, the
+  migration/frontend facts and `campaignSize`/`sizeReason`. Every later
+  `poll`, `check` and recovery wake of that head reads the pin
+  (`baselinePinned: true`) instead of recomputing — a campaign opened as
+  unknown/`full` on a transient API failure stays unknown/`full`, and a
+  determinable one never changes under a running campaign. A new head SHA is a
+  new campaign with its own pin. `check` never writes a pin.
 - `migrationsInRange` — the migration files in that range, or **`null`** (never
   `[]`) when the range is unknown.
 

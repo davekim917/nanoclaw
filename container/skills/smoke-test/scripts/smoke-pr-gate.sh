@@ -1718,6 +1718,32 @@ campaign_size_classify() {
   printf '%s' "$out"
 }
 
+# --- Freeze-campaign range pin -----------------------------------------------
+# ONE record, campaignRangePin in the PR state, holds EVERYTHING range-derived
+# for a freeze head: the campaignRange object (baseline, determinable, reason,
+# fileListMethod), the changed-path list, the migration/frontend facts read
+# from it, and the size verdict classified from it. `poll` writes it at the
+# first SETTLED evaluation of that head — the moment a campaign can be opened —
+# and from then on every `poll` and `check` of that head READS it instead of
+# recomputing. Pinning only the baseline was not enough: a transient compare
+# or tree failure opens a campaign as unknown/`full`, and a recomputing
+# recovery wake could come back determinable/`standard` — shrinking required
+# coverage, and changing migrationsInRange, for the SAME run. Sizing is in the
+# pin for the same reason (the rules file can change between two polls).
+# A different head SHA is a different campaign and gets its own pin. `check`
+# never writes: it reads a pin if one exists and otherwise computes.
+RANGE_PIN_SHAPE='type == "object" and .schemaVersion == 1 and (.headSha | type == "string") and
+  (.campaignRange | type == "object") and (.campaignRange.determinable | type == "boolean") and
+  (.rangePaths | type == "array") and (.migrationFiles | type == "array") and
+  (.migrationsTouched | type == "boolean") and (.frontendTouched | type == "boolean") and
+  (.migrationsDeterminable | type == "boolean") and
+  ((.migrationsInRange | type) as $t | $t == "array" or $t == "null") and
+  (.campaignSize | type == "string") and (.sizeReason | type == "string")'
+range_pin_for_head() {  # <state-json> <head-sha>; prints the pin or nothing
+  jq -c --arg h "$2" ".campaignRangePin // empty | select(($RANGE_PIN_SHAPE) and .headSha == \$h)" \
+    <<<"$1" 2>/dev/null
+}
+
 # --- Freeze-campaign baseline ------------------------------------------------
 # A freeze PR's target sits ON the tracked branch (smoke-freeze-pr.sh parents
 # the marker commit on a SHA of SMOKE_GATE_BRANCH), so `compare/$BRANCH...target`
@@ -1741,15 +1767,12 @@ campaign_size_classify() {
 # freeze commit. A line that fails is skipped for the next-older GO: an older
 # baseline only ever WIDENS the range, which is the safe direction.
 #
-# Prints {baselineSha, runId, resolved, pinned, reason}. `resolved:false` means
-# the answer could not be established this call (a binding fetch failed) and
-# must not be pinned; `resolved:true` with a null baselineSha is the conclusive
-# "no validated GO exists".
-#
-# PINNED per campaign: `poll` stores the first resolved answer for a head SHA
-# in the PR state (campaignBaseline) and every later evaluation of that head —
-# including a recovery wake — reads it back here, so one campaign never sees
-# two ranges just because another GO (its own included) landed mid-run.
+# Prints {baselineSha, runId, resolved, reason}. `resolved:false` means the
+# answer could not be established this call (a binding fetch failed);
+# `resolved:true` with a null baselineSha is the conclusive "no validated GO
+# exists". Stability across one campaign is not this function's job: the whole
+# range result, this baseline included, is pinned by campaignRangePin (see
+# range_pin_for_head).
 BASELINE_CANDIDATE_LIMIT=10
 
 # Complete changed-file list between two commits, from their recursive trees.
@@ -1788,19 +1811,11 @@ campaign_range_tree_files() {  # <baseline-sha> <target-sha>
     {files: [(($x | keys) + ($y | keys)) | unique | .[] | select($x[.] != $y[.]) | {filename: .}]}
   ' 2>/dev/null || { printf 'the tree diff could not be computed'; return 1; }
 }
-resolve_campaign_baseline() {  # <pr> <head-sha>
-  local pr="$1" head_sha="$2" pin line n=0
+resolve_campaign_baseline() {
+  local line n=0
   local l_target l_freeze l_pr l_run l_digest l_finished vfile vjson parent pr_head
-  pin="$(jq -c --arg h "$head_sha" \
-    '.campaignBaseline // empty | select(type == "object" and .headSha == $h)' \
-    <<<"$(read_pr_state "$pr")" 2>/dev/null)"
-  if [ -n "$pin" ]; then
-    jq -c '{baselineSha:(.baselineSha // null),runId:(.runId // null),resolved:true,pinned:true,
-            reason:(.reason // null)}' <<<"$pin"
-    return 0
-  fi
   if [ -z "$HANDOFF_LEDGER" ] || [ ! -s "$HANDOFF_LEDGER" ]; then
-    jq -cn '{baselineSha:null,runId:null,resolved:true,pinned:false,
+    jq -cn '{baselineSha:null,runId:null,resolved:true,
              reason:"no handoff ledger is configured or it is empty, so there is no certified baseline"}'
     return 0
   fi
@@ -1830,17 +1845,17 @@ resolve_campaign_baseline() {  # <pr> <head-sha>
        ! pr_head="$(timeout 8 gh api "repos/$REPO/pulls/$l_pr" --jq '.head.sha // empty' 2>/dev/null)" ||
        [ -z "$pr_head" ]; then
       jq -cn --arg run "$l_run" \
-        '{baselineSha:null,runId:null,resolved:false,pinned:false,
+        '{baselineSha:null,runId:null,resolved:false,
           reason:("the target/PR binding of GO receipt " + $run + " could not be fetched, so the certified baseline is unverified")}'
       return 0
     fi
     [ "$parent" = "$l_target" ] && [ "$pr_head" = "$l_freeze" ] || continue
     jq -cn --arg sha "$l_target" --arg run "$l_run" \
-      '{baselineSha:$sha,runId:$run,resolved:true,pinned:false,reason:null}'
+      '{baselineSha:$sha,runId:$run,resolved:true,reason:null}'
     return 0
   done < <(jq -cR 'fromjson? | select(type == "object") | select(.verdict == "GO")' \
              "$HANDOFF_LEDGER" 2>/dev/null | tac)
-  jq -cn '{baselineSha:null,runId:null,resolved:true,pinned:false,
+  jq -cn '{baselineSha:null,runId:null,resolved:true,
            reason:"no GO entry in the handoff ledger has a validating receipt, so there is no certified baseline"}'
 }
 
@@ -1855,7 +1870,7 @@ evaluate_pr() {
   local files_json files_len files_fetch_failed migrations_touched frontend_touched frontend_required is_freeze ci_sha
   local migration_files migrations_determinable target_files_json target_files_len
   local baseline_json baseline_sha range_determinable range_reason migrations_in_range campaign_range_json
-  local range_files_method range_paths_json
+  local range_files_method range_paths_json range_pin="" range_pin_size_out=""
   local runs_json runs_len ci_total ci_pending ci_failed ci_succeeded ci_ready ci_truncated
   local services_json backend backend_id backend_url backend_deploy_sha backend_ready
   local frontend frontend_id frontend_url frontend_deploy_sha frontend_ready
@@ -1942,10 +1957,23 @@ evaluate_pr() {
     range_reason=""
     range_files_method=""
     target_files_json='{"files":[]}'
-    if [ -z "$ci_sha" ]; then
+    range_pin="$(range_pin_for_head "$(read_pr_state "$pr")" "$head_sha")"
+    if [ -n "$range_pin" ]; then
+      # This head's campaign range is pinned: read it, fetch nothing.
+      range_determinable="$(jq -r '.campaignRange.determinable' <<<"$range_pin")"
+      range_reason="$(jq -r '.campaignRange.reason // ""' <<<"$range_pin")"
+      range_paths_json="$(jq -c '.rangePaths' <<<"$range_pin")"
+      migrations_touched="$(jq -r '.migrationsTouched' <<<"$range_pin")"
+      frontend_touched="$(jq -r '.frontendTouched' <<<"$range_pin")"
+      migrations_determinable="$(jq -r '.migrationsDeterminable' <<<"$range_pin")"
+      migration_files="$(jq -c '.migrationFiles' <<<"$range_pin")"
+      migrations_in_range="$(jq -c '.migrationsInRange' <<<"$range_pin")"
+      campaign_range_json="$(jq -c '.campaignRange + {baselinePinned:true}' <<<"$range_pin")"
+      range_pin_size_out="$(jq -c '{campaignSize, sizeReason}' <<<"$range_pin")"
+    elif [ -z "$ci_sha" ]; then
       range_reason="the freeze target commit could not be determined"
     else
-      baseline_json="$(resolve_campaign_baseline "$pr" "$head_sha")"
+      baseline_json="$(resolve_campaign_baseline)"
       jq -e 'type == "object"' <<<"$baseline_json" >/dev/null 2>&1 ||
         baseline_json='{"baselineSha":null,"reason":"the certified baseline could not be resolved"}'
       baseline_sha="$(jq -r '.baselineSha // empty' <<<"$baseline_json")"
@@ -1997,47 +2025,49 @@ evaluate_pr() {
         fi
       fi
     fi
-    # ONE path list for everything range-derived below (migration facts,
-    # frontend fact, sizing): both the new AND the previous path of every
-    # entry. A file renamed or moved OUT of a prefix carries that prefix only
-    # in `previous_filename`, and a migration that left the migrations folder
-    # is still a changed migration — reading `.filename` alone reported
-    # migrationsTouched:false / migrationsInRange:[] for exactly that range.
-    range_paths_json='[]'
-    if [ "$range_determinable" = true ]; then
-      range_paths_json="$(jq -c '[.files[] | .filename, (.previous_filename // empty)]' <<<"$target_files_json" 2>/dev/null)"
-      jq -e 'type == "array" and all(.[]; type == "string")' <<<"$range_paths_json" >/dev/null 2>&1 || range_paths_json=""
-      migrations_touched="$(jq -r --arg p "$MIGRATIONS_PREFIX" 'any(.[]; startswith($p))' <<<"$range_paths_json" 2>/dev/null)"
-      frontend_touched="$(jq -r --arg p "$FRONTEND_PREFIX" 'any(.[]; startswith($p))' <<<"$range_paths_json" 2>/dev/null)"
-      migration_files="$(jq -c --arg p "$MIGRATIONS_PREFIX" '[.[] | select(startswith($p))] | unique' <<<"$range_paths_json" 2>/dev/null)"
+    if [ -z "$range_pin" ]; then
+      # ONE path list for everything range-derived below (migration facts,
+      # frontend fact, sizing): both the new AND the previous path of every
+      # entry. A file renamed or moved OUT of a prefix carries that prefix only
+      # in `previous_filename`, and a migration that left the migrations folder
+      # is still a changed migration — reading `.filename` alone reported
+      # migrationsTouched:false / migrationsInRange:[] for exactly that range.
+      range_paths_json='[]'
+      if [ "$range_determinable" = true ]; then
+        range_paths_json="$(jq -c '[.files[] | .filename, (.previous_filename // empty)]' <<<"$target_files_json" 2>/dev/null)"
+        jq -e 'type == "array" and all(.[]; type == "string")' <<<"$range_paths_json" >/dev/null 2>&1 || range_paths_json=""
+        migrations_touched="$(jq -r --arg p "$MIGRATIONS_PREFIX" 'any(.[]; startswith($p))' <<<"$range_paths_json" 2>/dev/null)"
+        frontend_touched="$(jq -r --arg p "$FRONTEND_PREFIX" 'any(.[]; startswith($p))' <<<"$range_paths_json" 2>/dev/null)"
+        migration_files="$(jq -c --arg p "$MIGRATIONS_PREFIX" '[.[] | select(startswith($p))] | unique' <<<"$range_paths_json" 2>/dev/null)"
+      fi
+      if [ "$range_determinable" != true ] ||
+         { [ "$migrations_touched" != true ] && [ "$migrations_touched" != false ]; } ||
+         { [ "$frontend_touched" != true ] && [ "$frontend_touched" != false ]; } ||
+         ! jq -e 'type == "array"' <<<"$migration_files" >/dev/null 2>&1; then
+        [ -n "$range_reason" ] || range_reason="the baseline...target comparison could not be read"
+        range_determinable=false
+        # Fail-closed ASSUMPTIONS, flagged as such by migrationsDeterminable.
+        migrations_touched=true
+        frontend_touched=true
+        migrations_determinable=false
+        migration_files='[]'
+      else
+        migrations_in_range="$migration_files"
+      fi
+      campaign_range_json="$(jq -cn --arg base "$baseline_sha" --arg target "$ci_sha" \
+        --argjson determinable "$range_determinable" --arg reason "$range_reason" \
+        --argjson baseline "${baseline_json:-null}" --arg method "$range_files_method" \
+        '{baselineSha:(if $base == "" then null else $base end),
+          targetSha:(if $target == "" then null else $target end),
+          determinable:$determinable,
+          reason:(if $determinable then null else $reason end),
+          # Which source produced the file list: "compare", "tree" (compare was
+          # at its 300-file cap), or null when no list was needed or obtained.
+          fileListMethod:(if $determinable and $method != "" then $method else null end),
+          baselineRunId:($baseline.runId // null),
+          baselineResolved:($baseline.resolved // false),
+          baselinePinned:false}')"
     fi
-    if [ "$range_determinable" != true ] ||
-       { [ "$migrations_touched" != true ] && [ "$migrations_touched" != false ]; } ||
-       { [ "$frontend_touched" != true ] && [ "$frontend_touched" != false ]; } ||
-       ! jq -e 'type == "array"' <<<"$migration_files" >/dev/null 2>&1; then
-      [ -n "$range_reason" ] || range_reason="the baseline...target comparison could not be read"
-      range_determinable=false
-      # Fail-closed ASSUMPTIONS, flagged as such by migrationsDeterminable.
-      migrations_touched=true
-      frontend_touched=true
-      migrations_determinable=false
-      migration_files='[]'
-    else
-      migrations_in_range="$migration_files"
-    fi
-    campaign_range_json="$(jq -cn --arg base "$baseline_sha" --arg target "$ci_sha" \
-      --argjson determinable "$range_determinable" --arg reason "$range_reason" \
-      --argjson baseline "${baseline_json:-null}" --arg method "$range_files_method" \
-      '{baselineSha:(if $base == "" then null else $base end),
-        targetSha:(if $target == "" then null else $target end),
-        determinable:$determinable,
-        reason:(if $determinable then null else $reason end),
-        # Which source produced the file list: "compare", "tree" (compare was
-        # at its 300-file cap), or null when no list was needed or obtained.
-        fileListMethod:(if $determinable and $method != "" then $method else null end),
-        baselineRunId:($baseline.runId // null),
-        baselineResolved:($baseline.resolved // false),
-        baselinePinned:($baseline.pinned // false)}')"
   elif [ "$files_fetch_failed" = true ] || { [ "$files_len" -ge 100 ] 2>/dev/null; }; then
     # Ordinary (non-freeze) PR whose own diff we couldn't read — same
     # fail-closed default as migrations_touched above, and equally unable to
@@ -2082,9 +2112,28 @@ evaluate_pr() {
     fi
   fi
   local size_out campaign_size campaign_size_reason
-  size_out="$(campaign_size_classify "$size_determinable" "$size_fail_reason" "$size_files_json")"
+  # A pinned freeze range carries its size verdict too (see range_pin_for_head).
+  size_out="${range_pin_size_out:-$(campaign_size_classify "$size_determinable" "$size_fail_reason" "$size_files_json")}"
   campaign_size="$(jq -r '.campaignSize' <<<"$size_out")"
   campaign_size_reason="$(jq -r '.sizeReason' <<<"$size_out")"
+
+  # The pin CANDIDATE for this evaluation: exactly the range-derived values
+  # emitted below, written where only `poll` can pick it up (its per-invocation
+  # TMP_DIR). This function runs unlocked and in a subshell, so it never writes
+  # PR state itself — `poll` promotes the candidate under the PR lock, and only
+  # for a settled head. `check` has no TMP_DIR and writes nothing.
+  if [ "$is_freeze" = true ] && [ -z "$range_pin" ] && [ "$COMMAND" = poll ] && [ -n "${TMP_DIR:-}" ]; then
+    jq -e 'type == "array"' <<<"$range_paths_json" >/dev/null 2>&1 || range_paths_json='[]'
+    [ "$range_determinable" = true ] || range_paths_json='[]'
+    jq -cn --arg h "$head_sha" --argjson range "$campaign_range_json" --argjson paths "$range_paths_json" \
+      --argjson mt "$migrations_touched" --argjson ft "$frontend_touched" \
+      --argjson md "$migrations_determinable" --argjson mf "$migration_files" \
+      --argjson mir "$migrations_in_range" --arg size "$campaign_size" --arg sizeReason "$campaign_size_reason" \
+      '{schemaVersion:1,headSha:$h,campaignRange:$range,rangePaths:$paths,
+        migrationsTouched:$mt,frontendTouched:$ft,migrationsDeterminable:$md,
+        migrationFiles:$mf,migrationsInRange:$mir,campaignSize:$size,sizeReason:$sizeReason}' \
+      > "$TMP_DIR/range-pin-$pr.json" 2>/dev/null || rm -f "$TMP_DIR/range-pin-$pr.json" 2>/dev/null
+  fi
 
   # `frontendTouched` remains a factual target-diff field. It is not an
   # identity requirement for a detected two-marker freeze: the marker pair
@@ -4272,33 +4321,34 @@ while IFS= read -r ROW; do
       STATE_DIRTY=true
     fi
   fi
-  # Pin the freeze campaign's baseline to this head SHA, first resolved answer
-  # wins (see resolve_campaign_baseline). An UNRESOLVED answer (the binding
-  # fetch failed) is retried on later polls — until the freeze is settled and
-  # about to be offered as a campaign: from there "unknown" is pinned too, so a
-  # recovery wake can never shrink a campaign that was opened as `full`.
-  # These FACTS were computed before the lock; if another poll pinned a
-  # different answer in between, drop this candidate for one cycle rather than
-  # wake on a range the pin contradicts.
-  BASELINE_PIN_CONFLICT=false
-  if [ "$(jq -r '.isFreezePr == true and (.campaignRange | type == "object") and
-                 (.campaignRange.baselineResolved == true or .settled == true)' <<<"$FACTS")" = true ]; then
-    PINNED="$(jq -c --arg h "$HEAD_SHA" '.campaignBaseline // empty | select(type == "object" and .headSha == $h)' <<<"$STATE")"
-    if [ -z "$PINNED" ]; then
-      STATE="$(jq -c --arg h "$HEAD_SHA" --arg now "$(iso_now)" --argjson range "$(jq -c '.campaignRange' <<<"$FACTS")" \
-        '.campaignBaseline={headSha:$h,baselineSha:$range.baselineSha,runId:$range.baselineRunId,
-                            reason:(if $range.baselineSha == null then $range.reason else null end),pinnedAt:$now}' <<<"$STATE")"
+  # Pin the freeze campaign's WHOLE range result to this head SHA at the first
+  # settled evaluation (see range_pin_for_head). These FACTS were computed
+  # before the lock: if they were not read from a pin but a valid pin for this
+  # head exists now, another poll pinned in between — drop this candidate for
+  # one cycle rather than wake on facts the pin may contradict; the next poll
+  # reads the pin. A settled freeze whose pin cannot be written is not offered
+  # either: an unpinned campaign is exactly what this exists to prevent.
+  RANGE_PIN_CONFLICT=false
+  RANGE_PIN_WRITING=false
+  if [ "$(jq -r '.isFreezePr == true and .settled == true and
+                 (.campaignRange.baselinePinned != true)' <<<"$FACTS")" = true ]; then
+    RANGE_PIN_CANDIDATE="$(range_pin_for_head "$(jq -cn --slurpfile c "$TMP_DIR/range-pin-$PR.json" \
+      '{campaignRangePin:$c[0]}' 2>/dev/null)" "$HEAD_SHA")"
+    if [ -n "$(range_pin_for_head "$STATE" "$HEAD_SHA")" ] || [ -z "$RANGE_PIN_CANDIDATE" ]; then
+      RANGE_PIN_CONFLICT=true
+    else
+      STATE="$(jq -c --arg now "$(iso_now)" --argjson pin "$RANGE_PIN_CANDIDATE" \
+        '.campaignRangePin=($pin + {pinnedAt:$now})' <<<"$STATE")"
       STATE_DIRTY=true
-    elif [ "$(jq -r '.baselineSha // ""' <<<"$PINNED")" != "$(jq -r '.campaignRange.baselineSha // ""' <<<"$FACTS")" ]; then
-      BASELINE_PIN_CONFLICT=true
+      RANGE_PIN_WRITING=true
     fi
   fi
   if [ "$STATE_DIRTY" = true ]; then
-    write_pr_state "$PR" "$STATE"
+    write_pr_state "$PR" "$STATE" || { [ "$RANGE_PIN_WRITING" != true ] || RANGE_PIN_CONFLICT=true; }
   fi
   flock -u 9
   exec 9>&-
-  [ "$BASELINE_PIN_CONFLICT" != true ] || continue
+  [ "$RANGE_PIN_CONFLICT" != true ] || continue
 
   # The ceiling was demoted from executioner to alarm, and an alarm has to ring.
   # It no longer evicts a stamping run (that produced two coordinators on one
