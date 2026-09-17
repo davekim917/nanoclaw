@@ -301,17 +301,22 @@ jobs:
           #     intact and is always fine.
           #   - a glob like `'**/*.ts'`.
           # On THIS roster that means a URL comment or glob is refused here
-          # only at or below the last docblock's close (line 113). Above it,
-          # the delimiters pair and step 1's path is taken instead — which
-          # branch depends on what the swallowed span covers: exit 0 with a
-          # later declaration resolving, or "found 0" when the span covers
-          # `FRONTIER_MODELS` itself. This roster declares it once, so "found
-          # 0" is the branch to expect — a URL on the `*/` line of the docblock
-          # just above the declaration produces exactly that. Which is the
-          # misdirection this message exists to prevent, one layer up: "found
-          # 0" reads as a missing array, not as a URL four lines above it.
-          # (A glob written inside comment TEXT rather than a string closes
-          # that comment early and is refused wherever it sits.)
+          # only at or below the last docblock's close (line 113). Above it
+          # the delimiters pair, and the outcome turns on what the swallowed
+          # span covers — three cases, not one:
+          #   - no declaration: exit 0 with the CORRECT id, nothing lost. This
+          #     is the usual case here; a URL on the `*/` line at 28, 71 or 94
+          #     each still resolve `claude-opus-5`.
+          #   - a declaration, with a later one left visible: exit 0 with the
+          #     WRONG id. Cannot happen on this roster, which declares
+          #     `FRONTIER_MODELS` once — it is step 1's silent case.
+          #   - `FRONTIER_MODELS` itself, with nothing after it: "found 0". A
+          #     URL on the `*/` at line 40, directly above the declaration,
+          #     does this. It is the misdirection this message exists to
+          #     prevent, one layer up: "found 0" reads as a missing array, not
+          #     as a URL on the line above it.
+          # (A glob written inside comment TEXT rather than a string literal
+          # closes that comment early and is refused wherever it sits.)
           if printf '%s' "$flat" | grep -qE '/\*|\*/'; then
             echo "unresolved /* or */ after comment-stripping $ROSTER@$BASE_SHA — refusing to resolve a reviewer from text this step cannot account for." >&2
             echo "Usual cause: a URL or other '//' on the SAME line as a block comment's '*/' (that '//' deletes the '*/'), or an unpaired '/*' or '*/' inside a string literal such as a '**/*.ts' glob." >&2
