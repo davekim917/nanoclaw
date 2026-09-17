@@ -3664,6 +3664,55 @@ jq -e '.ok == false and .activePr == 178 and (.error | test("PR campaign"))' <<<
 SMOKE_GATE_STATE_DIR="$CROSS_A" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
   bash "$GATE" release run-cross-pr-active owner-pr | jq -e '.ok == true' >/dev/null
 
+# Task-kind adoption validates the shared lifetime binding, not just the
+# private slot and lease. Recovery owner B adopts a live same-SHA run; on a
+# second run B's task-finish commits the shared terminal binding and dies
+# before clearing lease/slot — state and lease still look live, and adopt must
+# refuse because the run is already terminal.
+ADOPT_TASK_STATE="$CROSS_BASE/adopt-task" ADOPT_TASK_LEASE="$TEST_SHARED_ROOT/adopt-task/leases"
+ADOPT_TASK_ROOT="$CROSS_BASE/adopt-task-runs"
+mkdir -p "$ADOPT_TASK_STATE" "$ADOPT_TASK_ROOT"
+task_scaffold_as() { local owner="$1"; shift
+  SMOKE_LANE_ROLE=coordinator SMOKE_GATE_OWNER="$owner" SMOKE_GATE_STATE_DIR="$ADOPT_TASK_STATE" \
+    SMOKE_GATE_LEASE_DIR="$ADOPT_TASK_LEASE" bash "$SCRIPT_DIR/smoke-run-scaffold.sh" "$@"; }
+task_gate() { SMOKE_GATE_STATE_DIR="$ADOPT_TASK_STATE" SMOKE_GATE_LEASE_DIR="$ADOPT_TASK_LEASE" bash "$GATE" "$@"; }
+for ADOPT_TASK_RUN in run-adopt-task-live run-adopt-task-terminal; do
+  mkdir -p "$ADOPT_TASK_ROOT/$ADOPT_TASK_RUN"
+  task_gate task-claim "$ADOPT_TASK_RUN" "$CROSS_SHA_A" owner-a | jq -e '.ok == true' >/dev/null
+  task_scaffold_as owner-a contract "$ADOPT_TASK_ROOT/$ADOPT_TASK_RUN" "$CROSS_SHA_A" B1:browser | jq -e '.ok == true' >/dev/null
+  expire_lease "$ADOPT_TASK_LEASE/task-lease-$ADOPT_TASK_RUN.json"
+  task_gate task-claim "$ADOPT_TASK_RUN" "$CROSS_SHA_A" owner-b | jq -e '.ok == true' >/dev/null
+done
+task_scaffold_as owner-b adopt "$ADOPT_TASK_ROOT/run-adopt-task-live" "$CROSS_SHA_A" |
+  jq -e '.ok == true and .adopted == true' >/dev/null
+OUT="$(task_scaffold_as owner-a adopt "$ADOPT_TASK_ROOT/run-adopt-task-live" "$CROSS_SHA_A" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null
+# A binding for another build, or none at all, is not a verifiable identity.
+ADOPT_TASK_BINDING="$ADOPT_TASK_LEASE/task-binding-run-adopt-task-terminal.json"
+ADOPT_TASK_BINDING_BEFORE="$(cat "$ADOPT_TASK_BINDING")"
+ADOPT_TASK_CONTRACT_HASH="$(sha256sum "$ADOPT_TASK_ROOT/run-adopt-task-terminal/completion-contract.json" | cut -d' ' -f1)"
+jq -c --arg sha "$CROSS_SHA_B" '.deploySha=$sha' <<<"$ADOPT_TASK_BINDING_BEFORE" > "$ADOPT_TASK_BINDING"
+OUT="$(task_scaffold_as owner-b adopt "$ADOPT_TASK_ROOT/run-adopt-task-terminal" "$CROSS_SHA_A" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("different deploy SHA"))' <<<"$OUT" >/dev/null
+rm -f "$ADOPT_TASK_BINDING"
+OUT="$(task_scaffold_as owner-b adopt "$ADOPT_TASK_ROOT/run-adopt-task-terminal" "$CROSS_SHA_A" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("missing or malformed"))' <<<"$OUT" >/dev/null
+printf '%s\n' "$ADOPT_TASK_BINDING_BEFORE" > "$ADOPT_TASK_BINDING"
+# The crash cut: terminal binding committed, lease and private slot not cleared.
+if SMOKE_GATE_TEST_TASK_FINISH_EXIT_AFTER=binding \
+   task_gate task-finish run-adopt-task-terminal "$CROSS_SHA_A" NO_GO owner-b >/dev/null; then
+  echo "task-finish binding crash seam unexpectedly returned success" >&2; exit 1
+fi
+jq -e '.terminal.verdict == "NO_GO"' "$ADOPT_TASK_BINDING" >/dev/null
+[ -s "$ADOPT_TASK_LEASE/task-lease-run-adopt-task-terminal.json" ]
+jq -e '.activeRunId == "run-adopt-task-terminal" and .activeLeaseOwner == "owner-b"' \
+  "$ADOPT_TASK_STATE/task-run-adopt-task-terminal-state.json" >/dev/null
+OUT="$(task_scaffold_as owner-b adopt "$ADOPT_TASK_ROOT/run-adopt-task-terminal" "$CROSS_SHA_A" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("already terminal"))' <<<"$OUT" >/dev/null || {
+  echo "adopt succeeded on a task run whose shared binding is already terminal" >&2; exit 1; }
+[ "$(sha256sum "$ADOPT_TASK_ROOT/run-adopt-task-terminal/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_TASK_CONTRACT_HASH" ]
+task_gate task-finish run-adopt-task-terminal "$CROSS_SHA_A" NO_GO owner-b | jq -e '.ok == true' >/dev/null
+
 # Exact retries recover after each finish cut. The final cut has no lease at
 # all and therefore proves task-finish no longer needs a task-claim detour.
 for CUT in before-binding binding verdict lease-removal; do

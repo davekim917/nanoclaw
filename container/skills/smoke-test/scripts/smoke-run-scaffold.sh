@@ -660,6 +660,27 @@ adopt)
   [ "$FENCED_STATE_KIND" != develop ] ||
     die "adopt does not apply to a develop-fenced run — its contract carries no coordinator owner"
   require_fenced_source_sha "$SOURCE_SHA"
+  # A task run's LIFETIME identity is the shared binding, not the private
+  # slot: `task-finish` commits `.terminal` there FIRST and clears the lease
+  # and private slot afterwards (smoke-pr-gate.sh:3072-3083), so a crash in
+  # between leaves state + lease looking live for a run that is already
+  # terminal. The task fence above reads only state and lease, so adoption
+  # checks the binding itself. It is read under fd 8, which is the same
+  # `task-lease-<runId>.lock` file the gate serializes binding writes on
+  # (smoke-pr-gate.sh:628 and :678) — no new lock. Fail closed on a missing
+  # or malformed record: every current task-claim writes one.
+  if [ "$FENCED_STATE_KIND" = task ]; then
+    TASK_BINDING_FILE="$LEASE_DIR/task-binding-$(basename "$RUN_DIR").json"
+    jq -e --arg run "$(basename "$RUN_DIR")" '
+      type == "object" and .schemaVersion == 1 and .kind == "task-binding" and .runId == $run and
+      (.deploySha | type == "string" and test("^[0-9a-f]{40}$")) and has("terminal") and
+      (.terminal == null or (.terminal | type) == "object")' "$TASK_BINDING_FILE" >/dev/null 2>&1 ||
+      die "shared task binding is missing or malformed — this run's lifetime identity cannot be verified, refusing adoption"
+    [ "$(jq -r '.deploySha' "$TASK_BINDING_FILE")" = "$SOURCE_SHA" ] ||
+      die "shared task binding names a different deploy SHA — refusing adoption"
+    [ "$(jq -r '.terminal == null' "$TASK_BINDING_FILE")" = true ] ||
+      die "this task run is already terminal in the shared task binding — nothing to adopt; re-run the exact task-finish to reconcile the lease and private slot"
+  fi
   [ -s "$CONTRACT" ] || die "no completion contract at $CONTRACT — nothing to adopt; write it with the contract command"
   jq -e 'type == "object" and .schemaVersion == 1 and
          (.sourceSha | type) == "string" and (.requiredLaneMarkers | type) == "array" and
