@@ -1897,7 +1897,7 @@ state, fail-closed on every fetch, one-line JSON stdout.
 install-supplied rules file (`SMOKE_SIZING_RULES`, default
 `/workspace/agent/campaign-sizing.json`) — never agent judgment; classification
 fails closed to `full` on an unreadable or truncated file list, and a freeze
-PR sizes off its develop-compare target diff, never its own two-marker diff.
+PR sizes off its `campaignRange` (below), never its own two-marker diff.
 No rules file means `standard`, `sizeReason: "no sizing rules"` — unchanged
 behavior for installs that never added one. A rules file that IS present but
 unreadable (a dangling symlink included — the path exists, its target does
@@ -2028,10 +2028,14 @@ freeze PR (see below), where CI is checked on the head's *parent* commit,
 since freeze commits get no path-filtered CI of their own; and the backend's
 `/healthz` returns 200 (a fresh preview can read `{"status":"warming"}` for
 ~6-10 minutes after `live` — the gate never sleeps waiting this out, it just
-reports not-settled and lets the next poll catch it). Any labeled PR whose
-diff touches `XZO-BACKEND/migrations/` is refused outright (one throttled
-`pr_migrations_refused` alarm, never a settle) — a preview boot runs
-migrations against the **shared** dev Postgres. `finish` records a per-PR
+reports not-settled and lets the next poll catch it). Any labeled **ordinary**
+PR whose own diff touches `XZO-BACKEND/migrations/` is refused outright (one
+throttled `pr_migrations_refused` alarm, never a settle). A **freeze PR is
+never refused on migrations**: its target is already on the tracked branch, so
+a migration in its range is campaign scope, reported in `migrationsInRange`,
+not a readiness fact — target identity, CI, deploy identity, frontend readiness
+and `/healthz` still gate it, and a backend that cannot boot is caught there.
+`finish` records a per-PR
 verdict JSON under the state dir, then suspends the backend preview
 (`POST .../suspend`) so a finished PR stops billing compute while it waits on
 merge/close; a failed suspend is logged in the JSON, never fails the finish.
@@ -2059,6 +2063,43 @@ service rootDirs — a real diff, since an empty commit triggers no preview),
 opens it as a draft PR against `SMOKE_GATE_BRANCH` with the preview label, and
 prints `{prNumber, branch, freezeSha, targetSha}`. `smoke-pr-gate.sh` polls it
 like any other labeled PR; close the PR when the campaign is done.
+
+#### Freeze campaign range (`campaignRange`)
+
+A freeze target sits on the tracked branch, so "branch...target" is always
+empty. The range a freeze campaign covers is **last certified build ...
+target**, and the gate states it once, in the facts (`check`) and the
+`pr_build_settled` wake, for freeze PRs only:
+
+- `campaignRange{baselineSha,targetSha,determinable,reason}` — `baselineSha` is
+  the `targetSha` of the newest handoff-ledger `GO` whose receipt validates
+  (digest matches its run `verdict.json`, and the freeze commit / freeze PR
+  really bind to that target). `BLOCKED`, `NO_GO` and `HUMAN_DECISION` never
+  move it. It is pinned per freeze head SHA, so every poll and recovery wake
+  of one campaign reports the same range. `baselineRunId`, `baselineResolved`
+  and `baselinePinned` say where it came from.
+- `migrationsInRange` — the migration files in that range, or **`null`** (never
+  `[]`) when the range is unknown.
+
+`determinable:false` (no validated GO, target behind/diverged from the
+baseline, a malformed or ≥300-file comparison, a failed fetch) means the range
+is **unknown**: `campaignSize` is `full` and `reason` says why. It does not
+block the campaign. **Quote this range** — for route/consumer selection, the
+manifest, and any range shown to a human — never one re-derived by hand.
+
+#### Freeze intake: read the bound preview's deploy log first
+
+Before spending a freeze campaign, the owner reads the deploy log of the
+**exact preview deploy the gate bound** (`backendPreviewId` / `backendDeploySha`):
+
+- a `PREVIEW-STALE` line with a pending-migration list ⇒ every claim that
+  depends on those migrations is classified `not demonstrable` **up front** and
+  carried as an explicit coverage gap through to the verdict;
+- the "pending set could not be determined" variant, or no marker at all ⇒ the
+  schema state is **unknown** — say so; absence is not proof of compatibility;
+- `[migrate] up →` on a preview ⇒ **stop and escalate** as "migration execution
+  attempted against shared dev". It is logged before execution, so it is not
+  proof anything was mutated.
 
 Config: `SMOKE_GATE_REPO`, `SMOKE_GATE_BRANCH` (default `develop`),
 `SMOKE_GATE_BACKEND_SERVICE` / `SMOKE_GATE_FRONTEND_SERVICE` (the **base**

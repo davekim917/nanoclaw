@@ -41,6 +41,11 @@ set -u
 [ -n "${STUB_PR_FILES_EXIT+x}" ] || STUB_PR_FILES_EXIT=0
 [ -n "${STUB_COMPARE_FILES+x}" ] || STUB_COMPARE_FILES='{"files":[]}'
 [ -n "${STUB_COMPARE_EXIT+x}" ] || STUB_COMPARE_EXIT=0
+# Freeze-campaign baseline binding (resolve_campaign_baseline): a ledger GO's
+# freeze commit -> its first parent, and freeze PR number -> its head SHA.
+[ -n "${STUB_PARENT_BY_COMMIT+x}" ] || STUB_PARENT_BY_COMMIT='{}'
+[ -n "${STUB_PULL_HEADS+x}" ] || STUB_PULL_HEADS='{}'
+[ -n "${STUB_BINDING_EXIT+x}" ] || STUB_BINDING_EXIT=0
 
 sequenced_run_list() {
   local n=1 out count_file
@@ -86,7 +91,16 @@ case "$1" in
     # (non-git) commits endpoint with this --jq expression; check it before
     # any path-based branch so it matches regardless of the exact endpoint.
     if printf '%s' "$*" | grep -qF '.parents[0].sha'; then
+      MAPPED="$(jq -r --arg c "${P##*/commits/}" '.[$c] // empty' <<<"$STUB_PARENT_BY_COMMIT")"
+      if [ -n "$MAPPED" ]; then
+        [ "$STUB_BINDING_EXIT" = 0 ] || exit "$STUB_BINDING_EXIT"
+        printf '%s' "$MAPPED"; exit 0
+      fi
       printf '%s' "$STUB_PARENT_SHA"; exit 0
+    fi
+    if printf '%s' "$*" | grep -qF '.head.sha'; then
+      [ "$STUB_BINDING_EXIT" = 0 ] || exit "$STUB_BINDING_EXIT"
+      jq -r --arg n "${P##*/pulls/}" '.[$n] // empty' <<<"$STUB_PULL_HEADS"; exit 0
     fi
     if printf '%s' "$P" | grep -qF '/pulls/' && printf '%s' "$P" | grep -qF '/files'; then
       printf '%s' "$STUB_PR_FILES"; exit "$STUB_PR_FILES_EXIT"
@@ -95,6 +109,8 @@ case "$1" in
     # MG-1 fix: evaluate_pr no longer trusts a freeze PR's own two-marker
     # diff for migrations/frontend, it compares against this instead.
     if printf '%s' "$P" | grep -qF '/compare/'; then
+      # Which range was asked for is the contract under test, so record it.
+      [ -z "${STUB_COMPARE_LOG:-}" ] || printf '%s\n' "${P##*/compare/}" >> "$STUB_COMPARE_LOG"
       printf '%s' "$STUB_COMPARE_FILES"; exit "$STUB_COMPARE_EXIT"
     fi
     if printf '%s' "$P" | grep -qF '/git/ref/heads/'; then
@@ -265,6 +281,7 @@ reset_stubs() {
         STUB_PR_FILES_EXIT STUB_PR_CREATE_EXIT STUB_NEW_PR_NUMBER STUB_SUSPEND_CODE \
         STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS STUB_DEPLOYS_BY_SERVICE_JSON \
         STUB_COMPARE_FILES STUB_COMPARE_EXIT STUB_LOCK_PROBE STUB_LOCK_PROBE_FILE \
+        STUB_PARENT_BY_COMMIT STUB_PULL_HEADS STUB_BINDING_EXIT STUB_COMPARE_LOG \
         STUB_STATE_PROBE STUB_STATE_PROBE_FILE STUB_SUSPEND_SLEEP STUB_REPO_VIEW_EXIT \
         STUB_LEDGER_JQ_EMPTY_FILE STUB_SUSPEND_LOG \
         STUB_FRONTEND_HTML_EXIT STUB_FRONTEND_HTML STUB_BUNDLE_EXIT STUB_BUNDLE_JS \
@@ -281,6 +298,42 @@ fresh_state() {
   reset_stubs
 }
 sha() { printf "$1%.0s" $(seq 40); }
+# Seeds one handoff-ledger line plus the run-level verdict.json it is a receipt
+# of, in exactly the shapes `finish` writes (5c below proves that against the
+# real `finish`), and registers the GitHub-side target/PR binding for it.
+seed_ledger_receipt() { # <ledger> <run-id> <verdict> <target-sha> <freeze-sha> <freeze-pr>
+  local ledger="$1" run="$2" verdict="$3" target="$4" freeze="$5" pr="$6" now payload digest
+  now="2026-09-01T00:00:00Z"
+  payload="$(jq -cn --arg sha "$freeze" --arg run "$run" --arg verdict "$verdict" --arg now "$now" \
+    '{schemaVersion:1,sha:$sha,runId:$run,verdict:$verdict,finishedAt:$now}')"
+  digest="$(printf '%s' "$payload" | sha256sum | cut -d' ' -f1)"
+  mkdir -p "$STATE_DIR/runs/$run" "$(dirname "$ledger")"
+  printf '%s\n' "$payload" > "$STATE_DIR/runs/$run/verdict.json"
+  jq -cn --arg target "$target" --arg freeze "$freeze" --argjson pr "$pr" --arg run "$run" \
+    --arg verdict "$verdict" --arg now "$now" --arg digest "$digest" \
+    '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,
+      runId:$run,verdict:$verdict,finishedAt:$now,verdictDigest:$digest}' >> "$ledger"
+  [ -n "${STUB_PARENT_BY_COMMIT:-}" ] || STUB_PARENT_BY_COMMIT='{}'
+  [ -n "${STUB_PULL_HEADS:-}" ] || STUB_PULL_HEADS='{}'
+  STUB_PARENT_BY_COMMIT="$(jq -c --arg c "$freeze" --arg t "$target" '.[$c]=$t' <<<"$STUB_PARENT_BY_COMMIT")"
+  STUB_PULL_HEADS="$(jq -c --arg n "$pr" --arg f "$freeze" '.[$n]=$f' <<<"$STUB_PULL_HEADS")"
+  export STUB_PARENT_BY_COMMIT STUB_PULL_HEADS
+}
+# A freeze PR that is ready in every respect a campaign needs: target identity,
+# green CI on the target, both previews live on the marker SHA, healthz 200.
+freeze_ready_fixture() { # <pr> <freeze-sha> <target-sha>
+  export STUB_PR_VIEW="{\"number\":$1,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$2\",\"headRefName\":\"smoke-freeze/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+  export STUB_PR_LIST="[{\"number\":$1,\"headRefOid\":\"$2\",\"headRefName\":\"smoke-freeze/x\"}]"
+  export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+  export STUB_PARENT_SHA="$3"
+  export STUB_RUN_LIST="[{\"headSha\":\"$3\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+  export STUB_SERVICES="[\
+{\"id\":\"srv-backend-pr-$1\",\"name\":\"XZO-DEV-BACKEND PR #$1\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-$1.onrender.com\"}},\
+{\"id\":\"srv-frontend-pr-$1\",\"name\":\"XZO-DEV-FRONTEND PR #$1\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://xzo-dev-frontend-pr-$1.onrender.com\"}}]"
+  export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$2\"}}]"
+  export STUB_FRONTEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$2\"}}]"
+  export STUB_HEALTHZ_CODE=200
+}
 expire_lease() { # <lease-file>; no writer is live in these test fixtures
   local lease_file="$1" tmp="${1}.expired"
   jq -c '.expiresAt="2000-01-01T00:00:00Z"' "$lease_file" > "$tmp"
@@ -565,66 +618,333 @@ bash "$GATE" check 7 | jq -e --arg head "$HEAD_SHA" --arg stale "$STALE_SHA" '
   .backendDeploySha == $stale and .headSha == $head
 ' >/dev/null
 
-# --- 5. Freeze-PR: CI checked on the PARENT sha, not the marker head -------
-# STUB_COMPARE_FILES is the target-tree diff (base branch vs. the marker's
-# parent) — evaluate_pr now judges migrations/frontend off THIS, never off
-# the freeze PR's own two-marker diff (STUB_PR_FILES), since that diff is
-# always exactly the two markers no matter what the target contains (MG-1,
-# see tests 5a/5b below). Here the target only touched an unrelated backend
-# file, so neither should be reported touched.
+# --- 5. Freeze-PR: CI checked on the PARENT sha, not the marker head; range
+# facts come from campaignRange = validated-GO baseline ... target.
+# A freeze target sits ON the tracked branch, so the old `compare/develop...
+# target` was empty for every freeze (5d pins the API's real answer to that
+# call shape). The three fixtures that used to live here hand-set
+# `"status":"ahead"` on that call — a response GitHub cannot return for it —
+# which is how the oracle passed while production compared nothing. `ahead`
+# is only realistic for baseline...target, and STUB_COMPARE_LOG proves that
+# is the range actually requested.
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 PARENT_SHA="$(sha e)"
 FREEZE_SHA="$(sha f)"
+BASE_SHA="$(sha a)"
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
 export STUB_PR_VIEW="{\"number\":9,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$FREEZE_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
 export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
 export STUB_PARENT_SHA="$PARENT_SHA"
-export STUB_COMPARE_FILES='{"status":"ahead","files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":3,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_COMPARE_LOG="$STATE_DIR/compare.log"
 export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"pr-title-check\"}]"
-bash "$GATE" check 9 | jq -e --arg parent "$PARENT_SHA" --arg head "$FREEZE_SHA" '
+T5_OUT="$(bash "$GATE" check 9)"
+jq -e --arg parent "$PARENT_SHA" --arg head "$FREEZE_SHA" --arg base "$BASE_SHA" '
   .isFreezePr == true and .ciSha == $parent and .ciReady == true and
   .migrationsTouched == false and .frontendTouched == false and .headSha == $head and
-  .migrationsDeterminable == true and .migrationFiles == []
-' >/dev/null
+  .migrationsDeterminable == true and .migrationFiles == [] and .migrationsInRange == [] and
+  .campaignRange.baselineSha == $base and .campaignRange.targetSha == $parent and
+  .campaignRange.determinable == true and .campaignRange.reason == null and
+  .campaignRange.baselineRunId == "run-go-base"
+' <<<"$T5_OUT" >/dev/null || { echo "5: freeze range facts wrong: $T5_OUT" >&2; exit 1; }
+[ "$(cat "$STUB_COMPARE_LOG")" = "$BASE_SHA...$PARENT_SHA" ] ||
+  { echo "5: compared the wrong range: $(cat "$STUB_COMPARE_LOG")" >&2; exit 1; }
+# `check` is read-only: it never pins.
+[ ! -e "$STATE_DIR/pr-9-state.json" ]
 
-# --- 5a. MG-1 fix: a freeze PR whose TARGET (not its own 2-marker diff)
-# touches migrations must refuse to settle, exactly like PR #1188/migration
-# 222 on 2026-08-24 — the freeze PR's own `pulls/.../files` is always just
-# the two markers (STUB_PR_FILES below), so this can only be caught by
-# reading STUB_COMPARE_FILES, which is the whole point of the fix.
+# --- 5a. INTENTIONAL POLICY CHANGE. A freeze whose range carries a migration
+# used to be refused outright (MG-1, migration 222, 2026-08-24). It now
+# SETTLES when it is otherwise ready: the migration is a fact about campaign
+# scope, reported by name, and the failure MG-1 was about — a backend that
+# cannot boot — is caught by backendReady/healthz (5a-ii), not by refusing
+# every migration-bearing range forever. No pr_migrations_refused alarm.
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 PARENT_SHA="$(sha e)"
 FREEZE_SHA="$(sha f)"
-export STUB_PR_VIEW="{\"number\":10,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$FREEZE_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
-export STUB_PARENT_SHA="$PARENT_SHA"
-export STUB_COMPARE_FILES='{"status":"ahead","files":[{"filename":"XZO-BACKEND/migrations/222_undo_edit_prior_actor.sql"},{"filename":"XZO-BACKEND/src/other.ts"}]}'
-export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"pr-title-check\"}]"
-bash "$GATE" check 10 | jq -e '
-  .isFreezePr == true and .migrationsTouched == true and .settled == false and
+BASE_SHA="$(sha a)"
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+freeze_ready_fixture 10 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":2,"behind_by":0,"files":[{"filename":"XZO-BACKEND/migrations/222_undo_edit_prior_actor.sql"},{"filename":"XZO-BACKEND/src/other.ts"}]}'
+T5A_OUT="$(bash "$GATE" check 10)"
+jq -e '
+  .isFreezePr == true and .migrationsTouched == true and .settled == true and .fetchOk == true and
   .migrationsDeterminable == true and
-  .migrationFiles == ["XZO-BACKEND/migrations/222_undo_edit_prior_actor.sql"]
-' >/dev/null
-
-# --- 5b. Fail closed when the target-tree compare itself is unreadable —
-# never fall through to "no migrations" just because the check couldn't run.
+  .migrationFiles == ["XZO-BACKEND/migrations/222_undo_edit_prior_actor.sql"] and
+  .migrationsInRange == ["XZO-BACKEND/migrations/222_undo_edit_prior_actor.sql"] and
+  .campaignRange.determinable == true
+' <<<"$T5A_OUT" >/dev/null || { echo "5a: a ready migration-bearing freeze did not settle: $T5A_OUT" >&2; exit 1; }
+T5A_POLL="$(bash "$GATE" poll)"
+jq -e --arg base "$BASE_SHA" --arg parent "$PARENT_SHA" '
+  .wakeAgent == true and .data.trigger == "pr_build_settled" and .data.pr == 10 and
+  .data.isFreezePr == true and
+  .data.campaignRange.baselineSha == $base and .data.campaignRange.targetSha == $parent and
+  .data.campaignRange.determinable == true and
+  .data.migrationsInRange == ["XZO-BACKEND/migrations/222_undo_edit_prior_actor.sql"]
+' <<<"$T5A_POLL" >/dev/null || { echo "5a: poll did not settle the freeze with its range: $T5A_POLL" >&2; exit 1; }
+jq -e '.refusedAlertSha == null' "$STATE_DIR/pr-10-state.json" >/dev/null
+# 5a-ii. What still blocks: the MG-1 failure itself. Same freeze, but the
+# backend never came healthy — not settled, whatever the range says.
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
-PARENT_SHA="$(sha e)"
-FREEZE_SHA="$(sha f)"
-export STUB_PR_VIEW="{\"number\":12,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$FREEZE_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
-export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
-export STUB_PARENT_SHA="$PARENT_SHA"
-export STUB_COMPARE_EXIT=1
-export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"pr-title-check\"}]"
-bash "$GATE" check 12 | jq -e '
-  .isFreezePr == true and .migrationsTouched == true and .frontendTouched == true and
-  .settled == false and .migrationsDeterminable == false and .fetchOk == false
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+freeze_ready_fixture 10 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":2,"behind_by":0,"files":[{"filename":"XZO-BACKEND/migrations/222_undo_edit_prior_actor.sql"}]}'
+export STUB_HEALTHZ_CODE=503
+bash "$GATE" check 10 | jq -e '.settled == false and .healthzReady == false' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null
+export STUB_HEALTHZ_CODE=200
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$(sha 0)\"}}]"
+bash "$GATE" check 10 | jq -e '.settled == false and .backendReady == false' >/dev/null
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$FREEZE_SHA\"}}]"
+export STUB_FRONTEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$(sha 0)\"}}]"
+bash "$GATE" check 10 | jq -e '.settled == false and .frontendReady == false' >/dev/null
+export STUB_FRONTEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$FREEZE_SHA\"}}]"
+export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"failure\",\"workflowName\":\"CI\"}]"
+bash "$GATE" check 10 | jq -e '.settled == false and .ciReady == false' >/dev/null
+# Missing target identity: still fetchOk:false, still never settles.
+export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_PARENT_SHA=''
+bash "$GATE" check 10 | jq -e '
+  .settled == false and .fetchOk == false and .ciSha == null and
+  .campaignRange.targetSha == null and .campaignRange.determinable == false and
+  .migrationsInRange == null and .campaignSize == "full"
 ' >/dev/null
+
+# --- 5b. An unreadable range is UNKNOWN, never "no migrations" — and it no
+# longer poisons readiness. Before, a failed compare cleared fetchOk, which
+# clamps `settled` in check and skips the candidate in poll: with a range that
+# can legitimately stay unknown (>=300 files) that is "never runs again".
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+freeze_ready_fixture 12 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_EXIT=1
+T5B_OUT="$(bash "$GATE" check 12)"
+jq -e --arg base "$BASE_SHA" '
+  .isFreezePr == true and .migrationsTouched == true and .frontendTouched == true and
+  .migrationsDeterminable == false and .migrationFiles == [] and .migrationsInRange == null and
+  .campaignRange.baselineSha == $base and .campaignRange.determinable == false and
+  .campaignRange.reason == "the baseline...target comparison could not be fetched" and
+  .campaignSize == "full" and
+  .sizeReason == "full: the baseline...target comparison could not be fetched" and
+  .fetchOk == true and .settled == true
+' <<<"$T5B_OUT" >/dev/null || { echo "5b: compare fetch failure: $T5B_OUT" >&2; exit 1; }
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "pr_build_settled" and .data.campaignSize == "full" and
+  .data.campaignRange.determinable == false and .data.migrationsInRange == null
+' >/dev/null
+export STUB_COMPARE_EXIT=0
+
+# --- 5c..5k share one ready freeze and vary only the ledger / the compare ----
+range_case() { # <label> <jq-assertion over `check`>; expects fixture env already set
+  local out
+  out="$(bash "$GATE" check 13)"
+  jq -e --arg base "$BASE_SHA" --arg parent "$PARENT_SHA" "$2" <<<"$out" >/dev/null ||
+    { echo "$1: $out" >&2; exit 1; }
+}
+UNKNOWN_RANGE='.campaignRange.determinable == false and .migrationsInRange == null and
+  .migrationsDeterminable == false and .migrationsTouched == true and
+  .campaignSize == "full" and .fetchOk == true and .settled == true'
+
+# --- 5c. Producer -> reader: the receipt the REAL `finish` writes validates,
+# and a later BLOCKED on the very same target/PR does not unseat that GO
+# (BLOCKED asserts nothing about the build). NO_GO / BLOCKED on a NEWER target
+# never advance the baseline either.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_PUBLISH_FILE="$STATE_DIR/dev-gate/latest-verdict.json" \
+  SMOKE_GATE_HOLD_FILE="$STATE_DIR/dev-gate/develop-hold.json" \
+  SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+GO_FREEZE="$(sha b)"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PARENT_SHA="$BASE_SHA"
+bash "$GATE" claim run-real-go 5 "$GO_FREEZE" >/dev/null
+bash "$GATE" finish "$GO_FREEZE" run-real-go GO | jq -e '.ok == true and .handoff.written == true' >/dev/null
+bash "$GATE" claim run-real-blocked 5 "$GO_FREEZE" >/dev/null
+bash "$GATE" finish "$GO_FREEZE" run-real-blocked BLOCKED | jq -e '.ok == true' >/dev/null
+LATER_SHA="$(sha c)"
+export STUB_PARENT_SHA="$LATER_SHA"
+bash "$GATE" claim run-real-nogo 6 "$(sha d)" >/dev/null
+bash "$GATE" finish "$(sha d)" run-real-nogo NO_GO | jq -e '.ok == true' >/dev/null
+bash "$GATE" claim run-real-blocked2 6 "$(sha d)" >/dev/null
+bash "$GATE" finish "$(sha d)" run-real-blocked2 BLOCKED | jq -e '.ok == true' >/dev/null
+[ "$(wc -l < "$SMOKE_GATE_HANDOFF_LEDGER")" -eq 4 ]
+tail -1 "$SMOKE_GATE_HANDOFF_LEDGER" | jq -e --arg t "$LATER_SHA" '.verdict == "BLOCKED" and .targetSha == $t' >/dev/null
+export STUB_PARENT_BY_COMMIT="{\"$GO_FREEZE\":\"$BASE_SHA\"}" STUB_PULL_HEADS="{\"5\":\"$GO_FREEZE\"}"
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+range_case 5c '.campaignRange.baselineSha == $base and .campaignRange.baselineRunId == "run-real-go" and
+  .campaignRange.determinable == true and .migrationsInRange == [] and .settled == true'
+
+# --- 5d. The call shape production used, answered the way the API really
+# answers it: an ancestor-or-equal head is `behind`, zero files. That must
+# never again read as migrationsTouched:false / determinable:true. Same for
+# diverged, and for `identical` when the SHAs are not in fact the same.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"behind","ahead_by":0,"behind_by":4,"files":[]}'
+range_case 5d-behind "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"not strictly ahead.*behind\"))"
+export STUB_COMPARE_FILES='{"status":"diverged","ahead_by":2,"behind_by":1,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+range_case 5d-diverged "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"diverged\"))"
+export STUB_COMPARE_FILES='{"status":"identical","ahead_by":0,"behind_by":0,"files":[]}'
+range_case 5d-identical-but-different "$UNKNOWN_RANGE"
+# `ahead` with an EMPTY list is not a confirmed empty range either.
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":2,"behind_by":0,"files":[]}'
+range_case 5d-ahead-empty "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"empty although\"))"
+# Malformed: no status / files not an array / a non-object body.
+export STUB_COMPARE_FILES='{"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+range_case 5d-malformed-nostatus "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"malformed\"))"
+export STUB_COMPARE_FILES='{"status":"ahead","behind_by":0,"files":"nope"}'
+range_case 5d-malformed-files "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"malformed\"))"
+export STUB_COMPARE_FILES='[]'
+range_case 5d-malformed-body "$UNKNOWN_RANGE"
+# A renamed/removed migration still counts: previous_filename sizes, filename names it.
+export SMOKE_SIZING_RULES="$STATE_DIR/rules.json"
+printf '%s' '{"full":["XZO-BACKEND/migrations/**"],"lightAllowed":["XZO-FRONTEND/**"]}' > "$SMOKE_SIZING_RULES"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-FRONTEND/src/moved.sql","previous_filename":"XZO-BACKEND/migrations/9_x.sql","status":"renamed"}]}'
+range_case 5d-renamed '.campaignRange.determinable == true and .campaignSize == "full" and
+  (.sizeReason | test("XZO-BACKEND/migrations/9_x.sql"))'
+unset SMOKE_SIZING_RULES
+
+# --- 5e. Identical: target IS the certified baseline. The one legitimately
+# empty range — determinable, [] (not null), and no compare is even requested.
+export STUB_COMPARE_LOG="$STATE_DIR/compare-identical.log"
+export STUB_COMPARE_FILES='{"status":"behind","ahead_by":0,"behind_by":9,"files":[]}'
+freeze_ready_fixture 13 "$FREEZE_SHA" "$BASE_SHA"
+range_case 5e '.campaignRange.baselineSha == $base and .campaignRange.targetSha == $base and
+  .campaignRange.determinable == true and .campaignRange.reason == null and
+  .migrationsInRange == [] and .migrationsTouched == false and .migrationsDeterminable == true and
+  .settled == true'
+[ ! -e "$STUB_COMPARE_LOG" ] || { echo "5e: an identical range still hit the compare API" >&2; exit 1; }
+unset STUB_COMPARE_LOG
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+
+# --- 5f. >=300 files: GitHub truncates the list, so the range is unknown —
+# and, unlike before, the campaign still runs (as `full`) instead of never.
+export STUB_COMPARE_FILES="$(python3 -c 'import json; print(json.dumps({"status":"ahead","ahead_by":40,"behind_by":0,"files":[{"filename": f"XZO-BACKEND/src/f{i}.ts"} for i in range(300)]}))')"
+range_case 5f "$UNKNOWN_RANGE and (.campaignRange.reason | test(\">=300\"))"
+bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and .data.campaignSize == "full"' >/dev/null
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+
+# --- 5g. No validated GO: no ledger configured, an empty one, and one that
+# holds only non-GO verdicts. Unknown range, full, still settles.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+range_case 5g-unconfigured "$UNKNOWN_RANGE and .campaignRange.baselineSha == null and
+  (.campaignRange.reason | test(\"no handoff ledger\"))"
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-nogo NO_GO "$BASE_SHA" "$(sha b)" 5
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-hd HUMAN_DECISION "$BASE_SHA" "$(sha b)" 5
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-bl BLOCKED "$BASE_SHA" "$(sha b)" 5
+range_case 5g-no-go "$UNKNOWN_RANGE and .campaignRange.baselineSha == null and
+  (.campaignRange.reason | test(\"no GO entry\"))"
+
+# --- 5h. Invalid receipts are skipped for the next-older GO, never trusted.
+# Oldest line is the one genuine GO; every newer GO line is bad in one way.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+FORGED_SHA="$(sha 9)"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+# (i) no verdict.json behind the digest at all
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-nofile GO "$FORGED_SHA" "$(sha 1)" 21
+rm -f "$STATE_DIR/runs/run-go-nofile/verdict.json"
+# (ii) digest does not match the verdict.json on disk
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-baddigest GO "$FORGED_SHA" "$(sha 2)" 22
+jq -c '.finishedAt="2026-09-02T00:00:00Z"' "$STATE_DIR/runs/run-go-baddigest/verdict.json" > "$STATE_DIR/runs/run-go-baddigest/v.tmp"
+mv "$STATE_DIR/runs/run-go-baddigest/v.tmp" "$STATE_DIR/runs/run-go-baddigest/verdict.json"
+# (iii) a genuine NO_GO receipt relabelled GO on the ledger line only
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-nogo-relabelled NO_GO "$FORGED_SHA" "$(sha 3)" 23
+sed -i '$ s/"verdict":"NO_GO"/"verdict":"GO"/' "$SMOKE_GATE_HANDOFF_LEDGER"
+# (iv) a genuine GO receipt whose line was RE-POINTED at another target: the
+# digest still validates (it never covered targetSha) — only the binding
+# (freeze commit's parent) catches it.
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-repointed GO "$(sha 8)" "$(sha 4)" 24
+sed -i "\$ s/\"targetSha\":\"$(sha 8)\"/\"targetSha\":\"$FORGED_SHA\"/" "$SMOKE_GATE_HANDOFF_LEDGER"
+# (v) a genuine GO receipt attributed to a PR whose head is a different commit
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-wrongpr GO "$FORGED_SHA" "$(sha 6)" 25
+export STUB_PULL_HEADS="$(jq -c --arg other "$(sha 7)" '.["25"]=$other' <<<"$STUB_PULL_HEADS")"
+# (vi) torn / malformed trailing lines never abort the scan
+printf '%s\n' '{"verdict":"GO","targetSha":"short","runId":"../../etc"}' '{"verdict":"GO"' >> "$SMOKE_GATE_HANDOFF_LEDGER"
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+range_case 5h '.campaignRange.baselineSha == $base and .campaignRange.baselineRunId == "run-go-base" and
+  .campaignRange.determinable == true'
+
+# --- 5i. The binding could not be FETCHED: not the same as invalid. Nothing
+# older is substituted and nothing is assumed — range unknown, full, and the
+# answer is not pinned by an unsettled look.
+export STUB_BINDING_EXIT=1
+range_case 5i "$UNKNOWN_RANGE and .campaignRange.baselineSha == null and
+  .campaignRange.baselineResolved == false and (.campaignRange.reason | test(\"could not be fetched\"))"
+export STUB_BINDING_EXIT=0
+
+# --- 5j. PINNED across recovery. The first poll settles on baseline A and
+# pins it to this head SHA. A newer validated GO then lands (this campaign's
+# own GO would do the same) — check, a second poll and the RECOVERY wake of the
+# same run all still report baseline A, never the newer one.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+T5J_FIRST="$(bash "$GATE" poll)"
+jq -e --arg base "$BASE_SHA" '.data.trigger == "pr_build_settled" and .data.recovery == false and
+  .data.campaignRange.baselineSha == $base' <<<"$T5J_FIRST" >/dev/null ||
+  { echo "5j: first poll: $T5J_FIRST" >&2; exit 1; }
+T5J_RUN="$(jq -r '.data.runId' <<<"$T5J_FIRST")"
+jq -e --arg base "$BASE_SHA" --arg head "$FREEZE_SHA" '
+  .campaignBaseline.headSha == $head and .campaignBaseline.baselineSha == $base and
+  .campaignBaseline.runId == "run-go-base"' "$STATE_DIR/pr-13-state.json" >/dev/null
+NEWER_SHA="$(sha c)"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-newer GO "$NEWER_SHA" "$(sha d)" 6
+range_case 5j-check '.campaignRange.baselineSha == $base and .campaignRange.baselinePinned == true'
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$T5J_RUN.json"
+T5J_RECOVERY="$(SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll)"
+jq -e --arg base "$BASE_SHA" --arg run "$T5J_RUN" '
+  .wakeAgent == true and .data.trigger == "pr_build_settled" and .data.recovery == true and
+  .data.runId == $run and .data.campaignRange.baselineSha == $base and
+  .data.campaignRange.baselinePinned == true' <<<"$T5J_RECOVERY" >/dev/null ||
+  { echo "5j: recovery wake moved the baseline: $T5J_RECOVERY" >&2; exit 1; }
+# Control: the newer GO IS valid — a different freeze head on the same PR (a
+# new campaign) picks it up, so the pin above is what held, not a bad fixture.
+NEW_FREEZE="$(sha 5)"
+freeze_ready_fixture 13 "$NEW_FREEZE" "$PARENT_SHA"
+range_case 5j-new-head '.campaignRange.baselineSha != $base and .campaignRange.baselinePinned == false'
+# An unknown answer is pinned too once the freeze is offered to settle, so a
+# recovery can never SHRINK a campaign that was woken as `full`.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.campaignSize == "full" and
+  .data.campaignRange.determinable == false' >/dev/null
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-late GO "$BASE_SHA" "$(sha b)" 5
+range_case 5j-unknown-pinned "$UNKNOWN_RANGE"' and .campaignRange.baselineSha == null and .campaignRange.baselinePinned == true'
+unset -f range_case
 
 # --- 6. Migrations refusal: never settles; one throttled alarm wake --------
 fresh_state
@@ -1737,8 +2057,8 @@ bash "$GATE" check 300 | jq -e '
   .campaignSize == "full" and .sizeReason == "full: the PR file list is truncated (>=100 files)"
 ' >/dev/null
 
-# --- 30. Freeze PR: sized from the develop-compare target diff, never the
-# freeze PR's own two-marker diff (same MG-1 rule migrationsTouched follows).
+# --- 30. Freeze PR: sized from campaignRange (validated-GO baseline...target),
+# never the freeze PR's own two-marker diff.
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
@@ -1748,13 +2068,19 @@ FREEZE_SHA="$(sha f)"
 export STUB_PR_VIEW="{\"number\":301,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$FREEZE_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
 export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
 export STUB_PARENT_SHA="$PARENT_SHA"
-export STUB_COMPARE_FILES='{"status":"ahead","files":[{"filename":"backend/migrations/1_x.sql"}]}'
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$(sha a)" "$(sha b)" 5
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"backend/migrations/1_x.sql"}]}'
 export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"pr-title-check\"}]"
 bash "$GATE" check 301 | jq -e '
   .isFreezePr == true and .campaignSize == "full" and
   .sizeReason == "full: backend/migrations/1_x.sql matched backend/migrations/**"
 ' >/dev/null
-unset STUB_PARENT_SHA STUB_COMPARE_FILES SMOKE_SIZING_RULES
+# Same range, nothing `full` in it: the rules are genuinely consulted, so the
+# `full` above came from the migration and not from an unknown range.
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"docs/readme.md"}]}'
+bash "$GATE" check 301 | jq -e '.campaignRange.determinable == true and .campaignSize != "full"' >/dev/null
+unset STUB_PARENT_SHA STUB_COMPARE_FILES SMOKE_SIZING_RULES SMOKE_GATE_HANDOFF_LEDGER
 
 # =============================================================================
 # Campaign-size classifier: present-but-broken sizing rules must fail closed,
