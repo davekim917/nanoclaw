@@ -1737,6 +1737,8 @@ export async function processQuery(
   let done = false;
   let unwrappedNudged = false;
   let taskBlockNudged = false;
+  // Complete <message> blocks already delivered from this turn's interim text.
+  const deliveredInterimBlocks = new Set<string>();
   // Set when a person's triggering message is admitted: the outbound watermark
   // at that moment and the conversation it came from. Null when no such
   // message is owed a reply. Read at an empty `result`. Decided from the
@@ -2215,9 +2217,9 @@ export async function processQuery(
         // and none was delivered.
         const midTurnNote =
           pushedHumanTrigger && !turnIdle
-            ? '\n\n<system>Reminder: text you write between tool calls is NOT ' +
-              'delivered. To answer now, call the `send_message` tool; otherwise answer in <message to="name"> ' +
-              'blocks when the turn ends.</system>'
+            ? '\n\n<system>Reminder: unwrapped text you write between tool calls is NOT delivered. ' +
+              'To answer now, write a complete <message to="name">...</message> block or call the ' +
+              '`send_message` tool.</system>'
             : '';
         const pushedId = pushToQuery(prompt + midTurnNote, extractAttachments(keep));
         if (admittedTurn && pushedId) admittedTurn.promptIds = [pushedId];
@@ -2401,6 +2403,11 @@ export async function processQuery(
         setProviderTurnExecuting(true);
       } else if (event.type === 'result') {
         sawResult = true; // the SDK produced output → any prior api_retry recovered
+        // Interim deliveries belong to the turn this result ends, whatever its
+        // text — an empty result must not leave them to eat the NEXT turn's
+        // identical block.
+        const interimThisTurn = [...deliveredInterimBlocks];
+        deliveredInterimBlocks.clear();
         // A turn that consumed none of the runner's prompts never answers a
         // task fire: the CLI's synthetic "Continue from where you left off."
         // turn on resuming an interrupted session, or a turn a background-task
@@ -2524,7 +2531,11 @@ export async function processQuery(
               });
             }
           }
-          const { sent, hasUnwrapped, taskBlocks } = await dispatchResultText(event.text, routing);
+          // An agent that posted an update mid-turn often repeats it verbatim in
+          // its final text; the person already has it.
+          const { sent, hasUnwrapped, taskBlocks } = await dispatchResultText(event.text, routing, {
+            alreadyDelivered: new Set(interimThisTurn),
+          });
           const willRetryTaskBlocks = shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
           // With prompt ids a nudge's answer matches no fire, so only the id-less
           // path needs `taskBlockNudged` to keep it out of the next fire's slot.
@@ -2620,8 +2631,8 @@ export async function processQuery(
               .map((d) => d.name)
               .join(', ');
             pushToQuery(
-              `<system>Your turn ended without delivering anything to the person who wrote to you. Text written ` +
-                `between tool calls is not delivered. Reply now in <message to="name">...</message> blocks ` +
+              `<system>Your turn ended without delivering anything to the person who wrote to you. Unwrapped text ` +
+                `written between tool calls is not delivered. Reply now in <message to="name">...</message> blocks ` +
                 `(destinations: ${names}), or, if no reply is warranted, answer with <internal>no reply</internal>.</system>`,
             );
             // Like the wrapping retry, the nudged result answers the SAME
@@ -2681,6 +2692,8 @@ export async function processQuery(
             'Use <message to="name"> blocks to address them. Bare text goes to the scratchpad fallback only.';
         }
         pushToQuery(ensureFreshContextBootstrap(reminder));
+      } else if (event.type === 'interim_text') {
+        for (const block of await dispatchInterimMessageBlocks(event.text, routing)) deliveredInterimBlocks.add(block);
       } else if (event.type === 'file') {
         await dispatchFileAttachment(event, routing);
       }
@@ -2926,6 +2939,48 @@ export interface TaskMessageBlock {
   body: string;
 }
 
+const COMPLETE_MESSAGE_BLOCK_RE = /<message\s+to="[^"]+"\s*>[\s\S]*?<\/message>/g;
+// Fenced and inline code: a block QUOTED in narration ("I'll answer with
+// `<message to="here">…</message>` once the build finishes") is not a send.
+const CODE_SPAN_RE = /```[\s\S]*?```|`[^`\n]*`/g;
+
+/**
+ * Deliver the complete `<message to="…">…</message>` blocks in text the agent
+ * wrote mid-turn (ProviderEvent `interim_text`), and return the exact block
+ * spans that were routed as addressed. Everything else in the text is
+ * narration between tool calls and is dropped — `blocksOnly` keeps
+ * dispatchResultText's origin fallback and wrapping verdict out of it; those
+ * belong to the turn's FINAL text, which is the agent's answer. An unclosed
+ * opener is left for the final text too; mid-turn is no place to guess where a
+ * body ends. Routing, the `here` alias and peer recovery are
+ * dispatchResultText's, so a block behaves the same wherever in the turn it
+ * was written.
+ *
+ * A block whose destination does not resolve is simply not sent and not
+ * returned, so the final text can still deliver it: destinations are read live
+ * and can be added during a session (destinations.ts header) — e.g. by the
+ * very tool call that follows this text. Task runs never deliver blocks
+ * (RoutingContext.taskRun), so nothing is attempted there.
+ */
+export async function dispatchInterimMessageBlocks(text: string, routing: RoutingContext): Promise<string[]> {
+  if (routing.taskRun) return [];
+  const delivered: string[] = [];
+  // Mask, never delete: code spans are blanked to equal-length spaces only to
+  // decide WHERE blocks are, and each block is then cut from the original
+  // text — a real update keeps the backticked shas and fenced output in its
+  // body, and the recorded span is byte-identical to a verbatim repeat. A
+  // block wholly inside a code span has its own opener blanked, so it never
+  // matches.
+  const masked = text.replace(CODE_SPAN_RE, (span) => ' '.repeat(span.length));
+  for (const m of masked.matchAll(COMPLETE_MESSAGE_BLOCK_RE)) {
+    const block = text.slice(m.index, m.index + m[0].length);
+    const { sent } = await dispatchResultText(block, routing, { blocksOnly: true });
+    if (sent > 0) delivered.push(block);
+  }
+  if (delivered.length > 0) log(`Interim text: ${delivered.length} <message> block(s) delivered before a tool call`);
+  return delivered;
+}
+
 /**
  * Signal the turn boundary to the host.
  *
@@ -2956,6 +3011,14 @@ async function emitTurnEnd(): Promise<void> {
 export async function dispatchResultText(
   text: string,
   routing: RoutingContext,
+  // `alreadyDelivered`: exact block spans that went out mid-turn
+  // (dispatchInterimMessageBlocks). They are not sent again but still COUNT as
+  // sent — removing them from `text` instead would leave `sent === 0` and hand
+  // the narration around them to the unwrapped-output fallback below.
+  // `blocksOnly`: mid-turn text. Blocks route as usual; nothing else does — no
+  // fallback, no unwrapped verdict — and `sent` counts only blocks routed as
+  // addressed.
+  opts: { alreadyDelivered?: ReadonlySet<string>; blocksOnly?: boolean } = {},
 ): Promise<{ sent: number; hasUnwrapped: boolean; taskBlocks: TaskMessageBlock[] }> {
   type Opener = { index: number; endIndex: number; toName: string };
   const openers: Opener[] = [];
@@ -2984,6 +3047,10 @@ export async function dispatchResultText(
     const body = text.slice(opener.endIndex, bodyEnd).trim();
     cursor = closeBeforeNext ? explicitClose + MESSAGE_CLOSER.length : nextOpenerIdx;
 
+    if (opts.alreadyDelivered?.has(text.slice(opener.index, cursor))) {
+      sent++;
+      continue;
+    }
     const toName = opener.toName;
     if (!toName) {
       // Opener with empty to="" — treat as malformed; body becomes scratchpad.
@@ -3082,6 +3149,8 @@ export async function dispatchResultText(
   // fallback turned that into channel spam (one no-op status line per wake).
   // A wake that HAS news posts it via an explicit <message> block — the wake
   // prompt states this contract.
+  if (opts.blocksOnly) return { sent, hasUnwrapped: false, taskBlocks };
+
   if (!routing.taskRun && !routing.selfWake && sent === 0 && scratchpad) {
     const origin = findByRouting(routing.channelType, routing.platformId);
     if (origin) {
