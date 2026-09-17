@@ -491,13 +491,22 @@ export const OPENCODE_XDG_CONTAINER_PATH = '/opencode-xdg';
  * (a crashpad workaround) after Docker applies this env, so only
  * `XDG_DATA_HOME` survives. That is the one credential discovery needs —
  * `auth.json` lives under `$XDG_DATA_HOME/opencode/`. Both vars are still
- * declared: a `docker exec` shell skips the entrypoint and sees this pair, and
- * an agent-authored `opencode` config would be looked for under
- * `$XDG_CONFIG_HOME/opencode/`.
+ * declared: a `docker exec` shell skips the entrypoint and sees this pair.
+ *
+ * `OPENCODE_CONFIG` is what makes the staged default-model config
+ * (`stagedOpenCodeConfig`, written beside `auth.json`) reach an agent shell:
+ * with `XDG_CONFIG_HOME` clobbered, OpenCode's global-config lookup never
+ * finds it (#887 — the #886 fix was verified from a `docker exec` shell, which
+ * skips the entrypoint, and was dead for the runner's own children). The env
+ * var names the file explicitly and survives the entrypoint, which re-exports
+ * only `XDG_*`; OpenCode loads it as its "custom config" (opencode.ai/docs/config,
+ * "Precedence order": 3 of 8, still below the inline `OPENCODE_CONFIG_CONTENT`
+ * the OpenCode provider's own container runs on).
  */
 export const OPENCODE_XDG_ENV: Readonly<Record<string, string>> = Object.freeze({
   XDG_DATA_HOME: OPENCODE_XDG_CONTAINER_PATH,
   XDG_CONFIG_HOME: OPENCODE_XDG_CONTAINER_PATH,
+  OPENCODE_CONFIG: `${OPENCODE_XDG_CONTAINER_PATH}/opencode/opencode.json`,
 });
 
 export interface StagedOpenCodeAuth {
