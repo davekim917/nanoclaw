@@ -1,0 +1,322 @@
+name: CI full
+
+on:
+  schedule:
+    # 09:00 UTC daily — the full suite's one run per day.
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+# Read-only token. These jobs run the PR's own code (install, tests), and this repo's
+# default workflow token is write, so without this block any PR's tests could write to
+# the repository as github-actions[bot], labels included. Every scope not listed here is
+# none.
+permissions:
+  contents: read
+
+# The full suite: everything ci.yml's pull_request lane does not run, once a
+# night and on demand (`gh workflow run ci-full.yml --ref <branch>`). Its own
+# workflow, not a second trigger on `CI`, because merge-check keeps only the
+# NEWEST run per workflow name on a head (codex-review.sh, `ci_verdict()`):
+# sharing the name would let a fast green typecheck hide a red or still-running
+# full run dispatched on the same head (Codex, #880 round 2). Under its own
+# name the gate treats a red run as red and an unfinished run as pending, so a
+# dispatched full run on a PR head is an honoured pre-merge check, not a
+# courtesy.
+
+# Two jobs, run in parallel, both blocking. The split is purely about
+# legibility: `correctness` red means the code is broken, `bookkeeping` red
+# means a committed manifest is stale and needs regenerating. When both lived in
+# one job they showed up as the same failing step, so a stale-manifest failure
+# read like a real regression and a real regression could hide behind an
+# already-red run — three consecutive pushes landed on a red main on
+# 2026-09-08/09 that way. Neither job gets continue-on-error; the point is
+# telling the two kinds of red apart, not tolerating either.
+jobs:
+  correctness:
+    runs-on: ubuntu-latest
+    # A wedged test otherwise runs to GitHub's 360-minute default; p90 for
+    # this job is 23 min (2026-09-17).
+    timeout-minutes: 45
+    steps:
+      # fetch-depth: 0 (full history), not actions/checkout@v4's default depth-1
+      # shallow clone. scripts/review-notes.test.ts's citation checker resolves
+      # every pinned `at <sha>` and skips one that doesn't resolve ONLY when
+      # `git rev-parse --is-shallow-repository` says the checkout is shallow
+      # (#730 P3) — with the default shallow checkout, a typo'd sha or a
+      # missing file behind a bogus pin silently passed here even though the
+      # sha is a real, resolvable commit in this repo's actual history. Full
+      # history costs ~46MB and a few seconds on this repo's size as of
+      # 2026-09; revisit the number if this job's checkout time becomes
+      # noticeable as history grows.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # Keep in lockstep with ARG BUN_VERSION in container/Dockerfile. This pin
+          # last moved in April; the image went to 1.3.14 in May, so CI spent two
+          # months testing agent-runner code against a Bun we never ship.
+          bun-version: 1.3.14
+      - run: pnpm install --frozen-lockfile
+      - name: Install agent-runner deps (Bun)
+        working-directory: container/agent-runner
+        run: bun install --frozen-lockfile
+
+      - name: Format check
+        run: pnpm run format:check
+
+      # Seam 3 — neither pre-push locally (bypassed with --no-verify, or a
+      # push from a checkout without husky's git hooks wired) nor the
+      # `prebuild` guard (only reached by `pnpm run build`, which CI never
+      # runs) actually gates this without a CI step of its own: a commit that
+      # violates no-floating-promises/no-misused-promises/projectService (or
+      # any of the pre-existing rules) could merge clean and only surface at
+      # the next deploy build.
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Typecheck host
+        run: pnpm exec tsc --noEmit
+
+      - name: Typecheck scripts
+        run: pnpm exec tsc -p tsconfig.scripts.json --noEmit
+
+      - name: Typecheck container
+        run: pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
+
+      # Everything except the three drift tests, which belong to `bookkeeping`.
+      # See DRIFT_TESTS in vitest.config.ts. ONE step, not a plain run followed
+      # by a second `--coverage` run: this repo's Actions-minutes budget is
+      # tight (see the concurrency block above), and a second full
+      # correctness-lane run to add coverage would roughly double this job's
+      # minutes on every push. `--coverage` runs the exact same tests, not a
+      # smaller/faster set, so this step's own duration is the honest cost.
+      #
+      # coverage-v8 starts V8's precise/detailed coverage profiler for the
+      # WHOLE worker regardless of vitest.config.ts's `coverage.include` (see
+      # that file's own comment, and scripts/check-risk-coverage.ts's file
+      # header) — the CPU overhead is global to the process, not confined to
+      # risk:high files. That overhead once turned an unrelated, CPU-heavy
+      # TS-compiler test's normal 5.1s into 18.1s, past vitest's 5000ms
+      # default testTimeout, and red "correctness" for a reason that had
+      # nothing to do with the code under test (PR #662). Fixed generically,
+      # not per-test: vitest.config.ts's COVERAGE_TIMEOUT_MULTIPLIER scales
+      # `testTimeout`/`hookTimeout` under `--coverage` (4x — sized to the
+      # 18.1s case, not the 3x that would only reach 15s), and
+      # src/test-timeout-scale.ts's `scaledTimeout()` gives the same
+      # multiplier to the handful of tests with their own explicit timeout
+      # (which vitest lets override `testTimeout` entirely, so they don't
+      # inherit that scaling on their own).
+      #
+      # Feeds scripts/check-risk-coverage.ts below.
+      - name: Host tests
+        run: pnpm exec vitest run --coverage
+        env:
+          VITEST_LANE: correctness
+
+      - name: Container tests
+        working-directory: container/agent-runner
+        # No concurrency flag here on purpose. `bun test` runs test FILES
+        # sequentially in a single process — `--max-concurrency` only caps
+        # `test.concurrent` tests, of which this suite has none, so it was a
+        # no-op that read like a fix and cost two misdiagnoses.
+        #
+        # The real isolation hazard is that single process: `mock.module()` is
+        # process-global and permanent (`mock.restore()` does not undo it), and
+        # bun's file order follows raw readdir(), which differs on every fresh
+        # runner. A file that mocks a first-party module therefore poisons
+        # whichever later files that checkout's directory order happens to put
+        # after it — green locally, red here, different tests each run. If this
+        # step fails with rows that "should exist" missing, look for a
+        # mock.module of a src/ module, not for concurrency.
+        #
+        # `bun run test`, not bare `bun test`: the package script adds the
+        # hermeticity tripwire preload (issue #305). bunfig.toml would be the
+        # natural home for it, but that file is a byte-for-byte upstream port
+        # pinned by src/mailbox-seam-upstream.test.ts.
+        #
+        # `--coverage`/`--coverage-reporter` are extra args after `bun run
+        # test`'s own `--`, not a bunfig.toml edit (see the pin note above).
+        # lcov feeds scripts/check-risk-coverage.ts; text keeps the per-file
+        # breakdown visible in this step's own log. The full agent-runner
+        # suite ran clean under `--coverage` in local verification (1709
+        # pass, 0 fail, no timeouts) with no equivalent to the host's
+        # CPU-heavy-test regression found, so this needed no timeout scaling
+        # of its own. Revisit if a bun-side test starts timing out under
+        # coverage the way transaction-closures.test.ts did on the host.
+        run: bun run test -- --coverage --coverage-reporter=lcov --coverage-reporter=text
+
+      # Both build real fixture repos and run the SHIPPED scripts against
+      # them (never a re-implementation of either script's own logic) — the
+      # runtime self-tests each script's own hook/library calls
+      # (secret_scan_selftest) can only prove the pattern set compiles and
+      # actually matches something; only these catch a semantic regression
+      # (a boundary anchor removed, the allowlist substitution reverted to
+      # deletion, a fallback re-introduced) that still compiles fine.
+      # #666 review T1 — this was in the original wiki-hook spec and had
+      # been missing from CI until now. A real gate, not `continue-on-error`.
+      # Both selfchecks build real fixture repos and expect a usable git
+      # identity to be available for the odd direct commit-tree/commit/tag
+      # call that isn't inside a fixture repo with its own configured
+      # user.email/user.name — this runner has no global git identity at
+      # all (review-666 P2-C: a bare-remote commit-tree call without one
+      # failed here, though not locally, where a personal git identity
+      # happened to hide it).
+      - name: git-safety.sh selfcheck
+        run: pnpm run check:git-safety-selfcheck
+        env:
+          GIT_AUTHOR_NAME: selfcheck
+          GIT_AUTHOR_EMAIL: selfcheck@example.invalid
+          GIT_COMMITTER_NAME: selfcheck
+          GIT_COMMITTER_EMAIL: selfcheck@example.invalid
+
+      - name: wiki-pre-push-hook.sh selfcheck
+        run: pnpm run check:wiki-pre-push-hook-selfcheck
+        env:
+          GIT_AUTHOR_NAME: selfcheck
+          GIT_AUTHOR_EMAIL: selfcheck@example.invalid
+          GIT_COMMITTER_NAME: selfcheck
+          GIT_COMMITTER_EMAIL: selfcheck@example.invalid
+
+      # Builds real fixture repos (via a real, throwaway HOME) and runs the
+      # SHIPPED health-sentinel.sh against them, same shape as the two
+      # selfchecks above — this one had no CI job at all until #715's
+      # follow-up (review-715 P3 #5). Unlike those two, this fixture sets its
+      # own git identity inside each throwaway repo it creates, so it needs no
+      # GIT_AUTHOR_*/GIT_COMMITTER_* env here. HOME is a fresh mktemp -d and
+      # GIT_CONFIG_NOSYSTEM=1 keeps it hermetic against this runner's own git
+      # config; ~7s, bash/git/jq are all preinstalled on ubuntu-latest.
+      - name: health-sentinel.sh selfcheck
+        run: |
+          export HOME="$(mktemp -d)"
+          export GIT_CONFIG_NOSYSTEM=1
+          pnpm run check:health-sentinel-selfcheck
+
+      # Feeds scripts/check-risk-coverage.ts against the committed
+      # coverage-risk-baseline.json (docs/specs/risk-based-review/plan.md,
+      # "Tests on risky paths"): a per-file floor set by each risk file's OWN
+      # prior measurement, never a single fixed number like 85% (the plan's
+      # Non-goals rule that out), and raised only manually via --write, never
+      # automatically. Fails when a risk file drops more than 0.5 points
+      # below its baseline, or a new risk file has no tests at all — see
+      # that script's own file header for the complete classification model
+      # and fail-closed list (a missing baseline, a risk file missing from
+      # either report entirely, a missing container report). Runs from the
+      # repo root against both reports produced above, in the same job so no
+      # artifact hand-off is needed for the gate itself (the steps below are
+      # only for regenerating the baseline from a real CI run).
+      - name: Risk-path coverage ratchet
+        run: pnpm exec tsx scripts/check-risk-coverage.ts
+
+      # A SEPARATE, unconditional (`if: always()`) computation from the same
+      # two reports: writes a FRESH baseline candidate to a throwaway path,
+      # never the real coverage-risk-baseline.json the step above reads, so
+      # it can never collide with or accidentally satisfy that gate.
+      # `--bootstrap`: this step's only job is producing a candidate, even
+      # before any baseline is committed at all (true on this very PR).
+      #
+      # This is the sanctioned way to regenerate the baseline: download this
+      # artifact and commit the file it contains directly. NOT "download the
+      # raw reports and run `--write` locally" — the host suite runs on a
+      # memory-constrained, production-serving box that must never run the
+      # full vitest suite with coverage (docs/specs/risk-based-review/plan.md),
+      # and even a partial local run's `--write` would resolve
+      # coverage-summary.json's absolute paths against THIS box's checkout
+      # root, not the one that generated the report — see
+      # scripts/check-risk-coverage.ts's parseVitestJsonSummary and file
+      # header for the full mismatched-root hazard this sidesteps.
+      - name: Generate coverage baseline candidate
+        if: always()
+        run: >-
+          pnpm exec tsx scripts/check-risk-coverage.ts --write --bootstrap
+          --baseline /tmp/coverage-risk-baseline-candidate.json
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: risk-coverage-reports
+          path: |
+            coverage/coverage-summary.json
+            container/agent-runner/coverage/lcov.info
+            /tmp/coverage-risk-baseline-candidate.json
+          retention-days: 14
+
+  bookkeeping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      # No Bun here on purpose: every step in this job is Node-only, and
+      # installing it would let a bun.lock or Bun-pin change red the
+      # BOOKKEEPING job for a reason that has nothing to do with bookkeeping.
+      # Keeping each job's red meaningful is the whole point of the split.
+      - run: pnpm install --frozen-lockfile
+
+      - name: Public repository boundary
+        run: pnpm run check:public-boundary -- --portable
+
+      # The host suite can only prove src/upstream-ratchet.json is CURRENT — it
+      # has no git and this clone carries no upstream objects. Recomputing the
+      # diff numbers needs the pinned commit, so fetch exactly that one object
+      # (GitHub serves a by-sha fetch; --depth=1 keeps it to a single commit,
+      # under a second) and let the report arbitrate. Without this step the
+      # manifest's numbers are self-reported: a PR could regenerate it with
+      # --accept-all and nothing would ever recheck the arithmetic.
+      # Exit 1 = a diff grew or became newly divergent. Exit 2 = the fetch did
+      # not land, which is an infrastructure failure, not a ratchet failure.
+      - name: Upstream divergence ratchet
+        run: |
+          git fetch --depth=1 https://github.com/nanocoai/nanoclaw.git \
+            "$(node -p "require('./src/upstream-ratchet.json').upstream")"
+          pnpm run ratchet:report
+
+      # The three manifest-freshness tests. Red here means "regenerate and
+      # commit an artifact", never "the code is broken". See DRIFT_TESTS in
+      # vitest.config.ts.
+      - name: Drift tests
+        run: pnpm exec vitest run
+        env:
+          VITEST_LANE: drift
+
+  # A red nightly has no PR to block, so it has to make noise: one open issue,
+  # commented on each further red night rather than a new issue per night.
+  # `issues: write` is scoped to this job alone, and it runs on `schedule`
+  # only — that is the one trigger guaranteed to be main's own workflow on
+  # main's own tree. A `workflow_dispatch --ref <branch>` runs the branch's
+  # copy of this file on the branch's tree, so its red is not main's (and
+  # its code must not hold a write scope): dispatch shows its result in the
+  # run itself (Codex, #880 round 1).
+  report:
+    needs: [correctness, bookkeeping]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update the red-nightly issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CORRECTNESS: ${{ needs.correctness.result }}
+          BOOKKEEPING: ${{ needs.bookkeeping.result }}
+        run: |
+          set -euo pipefail
+          title="Nightly CI is red on main"
+          body="$RUN_URL — correctness=$CORRECTNESS, bookkeeping=$BOOKKEEPING. Fix forward the same day; close this when a nightly run is green again."
+          n=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

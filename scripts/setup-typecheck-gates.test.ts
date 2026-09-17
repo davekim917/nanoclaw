@@ -96,9 +96,9 @@ exec /usr/bin/env PATH=${quote(process.env.PATH ?? '')} pnpm "$@"`,
 // `scripts/pin-git-hooks-path.sh` makes hooks resolve from every agent worktree.
 //
 // The protection is not lost, only moved earlier-to-later:
-//   - CI runs `pnpm run lint`, `tsc --noEmit` and
-//     `tsc -p tsconfig.scripts.json --noEmit` on every PR
-//     (.github/workflows/ci.yml:44, :47, :50).
+//   - CI runs `tsc --noEmit` and `tsc -p tsconfig.scripts.json --noEmit` on
+//     every PR (.github/workflows/ci.yml, the `typecheck` job); `pnpm run lint`
+//     runs nightly (ci-full.yml) and by the author before pushing (CLAUDE.md).
 //   - `scripts/check-build-clean.ts` still rejects the same setup type error,
 //     so a bad type cannot reach a build or a deploy. The 'build' cases below
 //     are that evidence and are unchanged.
@@ -106,7 +106,7 @@ exec /usr/bin/env PATH=${quote(process.env.PATH ?? '')} pnpm "$@"`,
 // than at push time.
 //
 // The boundary check stays in the hook because CI structurally cannot run it:
-// the CI step is `--portable` (ci.yml:34), structural patterns only, since a
+// the CI step is `--portable` (ci-full.yml, `bookkeeping`), structural patterns only, since a
 // runner has no `data/v2.db` and shipping it the identifier registry would
 // publish what the registry protects. So the push gate keeps a case of its own
 // here — deleting one outright would leave the hook with nothing pinning it,

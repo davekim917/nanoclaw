@@ -137,8 +137,9 @@ fi
 exec "$HOOK_REAL_GIT" "$@"
 `,
   );
-  // No eslint or tsc fake: the hook no longer runs either. CI owns lint and
-  // typecheck (.github/workflows/ci.yml:44, :47, :50); this hook carries only
+  // No eslint or tsc fake: the hook no longer runs either. CI owns typecheck
+  // (.github/workflows/ci.yml, `typecheck` job) and the nightly owns lint
+  // (ci-full.yml; the author lints before pushing); this hook carries only
   // the public-boundary check, which CI cannot run against the identifier
   // registry.
   const hooks = path.join(root, 'hooks');
