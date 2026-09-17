@@ -3154,6 +3154,36 @@ describe('interim text — a <message> block written before a tool call', () => 
     expect(sentTexts()).toEqual(['still running', 'still running']);
   });
 
+  it('leaves a block for a destination that does not exist yet to the final text, where it may', async () => {
+    seedOrigin();
+    const block = '<message to="new-child">your brief</message>';
+    const pushes: string[] = [];
+    async function* gen(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      yield { type: 'interim_text', text: block };
+      // Nothing may have gone out yet — not the block, not a "[dropped …]" note to the origin.
+      expect(sentTexts()).toEqual([]);
+      // The tool call that followed the text created the destination.
+      getInboundDb()
+        .prepare(
+          `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+           VALUES ('new-child', 'new-child', 'channel', 'discord', 'chan-child', NULL)`,
+        )
+        .run();
+      yield { type: 'result', text: block };
+    }
+    const query: AgentQuery = {
+      push: (m: string) => void pushes.push(m),
+      end: () => {},
+      abort: () => {},
+      events: gen(),
+    };
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(sentTexts()).toEqual(['your brief']);
+    expect(getUndeliveredMessages()[0].platform_id).toBe('chan-child');
+  });
+
   it('leaves an unclosed block for the final text', async () => {
     seedOrigin();
     await run([

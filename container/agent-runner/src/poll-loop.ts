@@ -2843,6 +2843,7 @@ export interface TaskMessageBlock {
 }
 
 const COMPLETE_MESSAGE_BLOCK_RE = /<message\s+to="[^"]+"\s*>[\s\S]*?<\/message>/g;
+const COMPLETE_MESSAGE_TO_RE = /^<message\s+to="([^"]+)"/;
 
 /**
  * Deliver the complete `<message to="…">…</message>` blocks in text the agent
@@ -2857,11 +2858,23 @@ const COMPLETE_MESSAGE_BLOCK_RE = /<message\s+to="[^"]+"\s*>[\s\S]*?<\/message>/
  */
 export async function dispatchInterimMessageBlocks(text: string, routing: RoutingContext): Promise<string[]> {
   if (routing.taskRun) return [];
-  const blocks = text.match(COMPLETE_MESSAGE_BLOCK_RE) ?? [];
-  if (blocks.length === 0) return [];
-  const { sent } = await dispatchResultText(blocks.join('\n'), routing);
-  log(`Interim text: ${blocks.length} <message> block(s) written before a tool call, ${sent} delivered`);
-  return blocks;
+  const delivered: string[] = [];
+  for (const block of text.match(COMPLETE_MESSAGE_BLOCK_RE) ?? []) {
+    // Only a block addressable NOW goes out mid-turn. Destinations are read
+    // live and can be added during a session (destinations.ts header) — e.g.
+    // by the very tool call that follows this text — so an unknown name is
+    // left for the final text rather than dropped, or worse, handed to
+    // dispatchResultText's origin fallback as a "[dropped: …]" note.
+    const to = COMPLETE_MESSAGE_TO_RE.exec(block)?.[1]?.trim() ?? '';
+    const addressable = to.toLowerCase() === 'here' || findByName(to) !== undefined || findPeerName(to) !== undefined;
+    if (!addressable) continue;
+    const { sent } = await dispatchResultText(block, routing);
+    // Reported as delivered — and so stripped from the final text — only if a
+    // row was actually written for it.
+    if (sent > 0) delivered.push(block);
+  }
+  if (delivered.length > 0) log(`Interim text: ${delivered.length} <message> block(s) delivered before a tool call`);
+  return delivered;
 }
 
 /**
