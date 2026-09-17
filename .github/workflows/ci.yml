@@ -87,14 +87,18 @@ jobs:
         run: |
           set -euo pipefail
           tree=$(git rev-parse 'HEAD^{tree}')
-          # `rev-list --parents -n 1` prints "<sha> <parent1> [<parent2>]".
-          read -r -a parents <<< "$(git rev-list --parents -n 1 HEAD)"
-          if [ "${#parents[@]}" -ne 3 ]; then
+          # Parents from the commit OBJECT, not from `rev-list --parents`: this
+          # checkout is depth-1, and git treats a shallow boundary commit as a
+          # root, so rev-list would report no parents for every push and this
+          # job could never skip anything (Codex, #877 round 2). The object
+          # still carries its `parent` headers; cat-file reads them directly.
+          mapfile -t parents < <(git cat-file -p HEAD | awk '/^parent /{print $2}')
+          if [ "${#parents[@]}" -ne 2 ]; then
             echo "HEAD is not a merge commit (squash, rebase or direct push): its history differs from the PR run's; running"
             echo "already_green=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          head="${parents[2]}"
+          head="${parents[1]}"
           name="ci-green-tree-$tree-head-$head"
           hits=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=5" \
             --jq '[.artifacts[] | select(.expired == false)] | length' || echo 0)
