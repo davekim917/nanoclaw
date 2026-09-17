@@ -3913,18 +3913,24 @@ export function resolveCodexAuthFallbacks(
 
 /**
  * True for a credential-staging failure caused by HOST STATE rather than by a
- * bug here: a filesystem error (which carries an errno `code`) or one of the
- * `Unsafe …` refusals the staging guards raise (`src/fs-safety.ts:44`, `:56`,
- * `:67`, plus `stageCodexAuth` and `materializeCodexFallbackRuntime` below).
+ * bug here: a SYSCALL error, or one of the `Unsafe …` refusals the staging
+ * guards raise (`src/fs-safety.ts:44`, plus `stageCodexAuth` and
+ * `materializeCodexFallbackRuntime` below).
  *
  * A PEER credential — Codex in a non-codex container, OpenCode in any of them —
  * is withheld on one of these rather than failing the spawn. Anything else
  * rethrows: swallowing a TypeError would turn a provider off fleet-wide behind
  * one warn per spawn.
+ *
+ * "Syscall error" means the bare-`E…` code shape (`ENOENT`, `EACCES`, `EEXIST`),
+ * NOT any string `code`: Node stamps its own argument-validation TypeErrors with
+ * codes too (`ERR_INVALID_ARG_TYPE`), and those are exactly the bugs this
+ * predicate exists to let through. The underscore is what separates them.
  */
 function isHostStateFailure(err: unknown): err is Error {
   if (!(err instanceof Error)) return false;
-  return typeof (err as NodeJS.ErrnoException).code === 'string' || err.message.startsWith('Unsafe ');
+  const code = (err as NodeJS.ErrnoException).code;
+  return (typeof code === 'string' && /^E[A-Z0-9]+$/.test(code)) || err.message.startsWith('Unsafe ');
 }
 
 /**
