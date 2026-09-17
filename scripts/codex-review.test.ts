@@ -182,6 +182,19 @@ if [ -n "$rest" ]; then
       printf '[{"total_count":0,"jobs":'; cat "$MOCK_DIR/jobs--$run.json"; printf '}]'
       exit 0
       ;;
+    */collaborators/*/permission)
+      # permission--<login> holds that login's repository permission (absent = write), as the
+      # script's --jq .permission prints it; a .error marker makes the lookup fail.
+      login="\${rest#*/collaborators/}"
+      login="\${login%/permission}"
+      if [ -f "$MOCK_DIR/permission--$login.error" ]; then
+        echo '{"message":"Not Found","status":"404"}'
+        echo 'gh: Not Found (HTTP 404)' >&2
+        exit 1
+      fi
+      if [ -f "$MOCK_DIR/permission--$login" ]; then cat "$MOCK_DIR/permission--$login"; else echo write; fi
+      exit 0
+      ;;
     */rules/branches/*)
       # rules--<branch>.json is the branch's active rules, as the API lists them; absent = none.
       # A .noplan marker answers as GitHub does where rulesets are not on the plan, and a
@@ -2705,6 +2718,7 @@ describe('codex-review risk-scoped review requests', () => {
     it.each([
       ['failure', 'Release policy=failure'],
       ['error', 'Release policy=error'],
+      ['some_future_state', 'Release policy=some_future_state'],
     ])('refuses (24) when a required status is %s on the head, and never defers', (state, named) => {
       const root = tempRoot();
       legacy(root, { statuses: [commitStatus('Release policy', state), commitStatus('Release approval', 'success')] });
@@ -2774,19 +2788,24 @@ describe('codex-review risk-scoped review requests', () => {
       return { id: Date.parse(startedAt) / 1000, name, status, conclusion, started_at: startedAt, completed_at: null };
     }
 
-    it.each(['failure', 'timed_out', 'cancelled', 'action_required'])(
-      'refuses (24) when a required check run concluded %s',
-      (conclusion) => {
-        const root = tempRoot();
-        legacy(root);
-        writeJson(root, `check-runs--${HEAD}.json`, [checkRun('CI Gate', 'completed', conclusion)]);
+    it.each([
+      'failure',
+      'timed_out',
+      'cancelled',
+      'action_required',
+      'startup_failure',
+      'stale',
+      'some_future_conclusion',
+    ])('refuses (24) when a required check run concluded %s', (conclusion) => {
+      const root = tempRoot();
+      legacy(root);
+      writeJson(root, `check-runs--${HEAD}.json`, [checkRun('CI Gate', 'completed', conclusion)]);
 
-        const result = runHelper(root, ['merge-check', '--head', HEAD]);
-        expect(result.status).toBe(24);
-        expect(result.stderr).toContain(`mode=legacy: required_red: CI Gate=${conclusion}`);
-        expect(result.stdout).not.toContain('merge=');
-      },
-    );
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain(`mode=legacy: required_red: CI Gate=${conclusion}`);
+      expect(result.stdout).not.toContain('merge=');
+    });
 
     it.each([
       ['in_progress', checkRun('CI Gate', 'in_progress', null)],
@@ -2972,6 +2991,80 @@ describe('codex-review risk-scoped review requests', () => {
       const result = runHelper(root, ['merge-check', '--head', HEAD]);
       expect(result.status).toBe(24);
       expect(result.stderr).toContain(why);
+    });
+
+    describe('who may clear: anyone trusted can block, only write access can clear', () => {
+      const FORGED = [
+        independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z'),
+        {
+          ...independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:40:00Z', 'COLLABORATOR'),
+          author: { login: 'reader' },
+        },
+      ];
+
+      it.each(['read', 'triage', 'none'])(
+        'ignores a later CLEAR from an author whose permission is %s: the CHANGES under it stands',
+        (permission) => {
+          const root = tempRoot();
+          legacy(root, { comments: FORGED });
+          fs.writeFileSync(path.join(root, 'permission--reader'), `${permission}\n`);
+
+          const result = runHelper(root, ['merge-check', '--head', HEAD]);
+          expect(result.status).toBe(24);
+          expect(result.stderr).toContain('release-desk posted the newest independent-review receipt');
+          expect(result.stderr).toContain('verdict CHANGES, blocking_findings 1');
+        },
+      );
+
+      it.each(['write', 'admin'])(
+        'counts a later CLEAR from an author with %s permission, after one lookup',
+        (permission) => {
+          const root = tempRoot();
+          legacy(root, { comments: FORGED });
+          fs.writeFileSync(path.join(root, 'permission--reader'), `${permission}\n`);
+
+          const result = runHelper(root, ['merge-check', '--head', HEAD]);
+          expect(result.status).toBe(26);
+          expect(result.calls.match(/^rest .*\/permission$/gm)).toEqual([
+            'rest repos/example/repository/collaborators/reader/permission',
+          ]);
+        },
+      );
+
+      it('does not count a CLEAR whose author cannot be looked up', () => {
+        const root = tempRoot();
+        legacy(root, { comments: FORGED });
+        fs.writeFileSync(path.join(root, 'permission--reader.error'), '');
+
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(24);
+      });
+
+      it("lets a read-only author's CHANGES block over a writer's older CLEAR, with no lookup", () => {
+        const root = tempRoot();
+        legacy(root, {
+          comments: [
+            independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:28:00Z'),
+            {
+              ...independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:40:00Z', 'COLLABORATOR'),
+              author: { login: 'reader' },
+            },
+          ],
+        });
+        fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
+
+        const result = runHelper(root, ['merge-check', '--head', HEAD]);
+        expect(result.status).toBe(24);
+        expect(result.stderr).toContain('reader posted the newest independent-review receipt');
+        expect(result.calls).not.toContain('/permission');
+      });
+
+      it('defers when the only receipt is a CLEAR that does not count: nothing says no', () => {
+        const root = tempRoot();
+        legacy(root, { comments: [FORGED[1]] });
+        fs.writeFileSync(path.join(root, 'permission--reader'), 'read\n');
+
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+      });
     });
 
     // A trusted comment that only quotes a receipt, inside `wrap`.

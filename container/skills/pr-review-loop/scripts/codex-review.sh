@@ -1284,7 +1284,19 @@ ci_verdict() {
 # the two cannot be told apart, so hiding can only ever block, never clear. (The substitute
 # receipt marker is matched against the raw body, so it has the quoting hole
 # too; it is left as it is here, because closing it the plain way would let an
-# unclosed fence in a reviewer's body hide a `changes` receipt.) A receipt that
+# unclosed fence in a reviewer's body hide a `changes` receipt.)
+#
+# Who wrote it follows the same asymmetry. authorAssociation is not a
+# permission: MEMBER is membership of the organisation, and a COLLABORATOR can
+# hold read or triage only. So anyone in that set can block, and only an author
+# whose permission on the repository is write or above can clear (may_clear),
+# looked up for the clear receipt that would decide and for no other. A clear
+# one that fails it is left out and the next newest decides, so a genuine
+# CHANGES under a forged CLEAR still stands. (receipt_outcome trusts the same
+# association set for a substitute `approve`, so the risk-scoped path shares
+# this weakness too; it is left as it is here.)
+#
+# A receipt that
 # names another head says nothing about this one. One that names no readable
 # head at all could be about this one, so it counts: a later clear receipt for
 # this head supersedes it, as it would a CHANGES. Substitute receipts are not
@@ -1294,10 +1306,37 @@ ci_verdict() {
 # reaches it (a legacy repo exits the audit arm first), so nothing is read as
 # of a merge. Non-zero when the comments cannot be read.
 independent_receipt_state() {
-  local pages
+  local pages state login denied='[]'
   pages=$(paginate_connection comments receipt_comments_page) || return 1
-  printf '%s\n' "$pages" | jq -rs -L "$HERE" --arg re "$INDEPENDENT_RECEIPT_MARKER_RE" \
-    --arg jsonRe "$INDEPENDENT_RECEIPT_JSON_RE" --arg headRe "$INDEPENDENT_RECEIPT_HEAD_RE" --arg head "$1" '
+  while :; do
+    state=$(independent_receipt_newest "$pages" "$1" "$denied") || return 1
+    case "$state" in
+      clear$'\t'*)
+        login="${state#*$'\t'}"
+        if may_clear "$login"; then echo clear; return 0; fi
+        denied=$(jq -cn --argjson d "$denied" --arg l "$login" '$d + [$l]') || return 1
+        ;;
+      *) printf '%s\n' "$state"; return 0 ;;
+    esac
+  done
+}
+
+# Whether LOGIN may clear a head: its permission on this repository, now, is
+# write or above (`permission` folds maintain into write and triage into
+# read). Anything else, a failed read included, is no: the clear receipt does
+# not count and whatever it would have superseded stands.
+may_clear() {
+  local permission
+  permission=$(gh api "repos/$REPO/collaborators/$(jq -rn --arg l "$1" '$l | @uri')/permission" --jq .permission 2>/dev/null) || return 1
+  [ "$permission" = admin ] || [ "$permission" = write ]
+}
+
+# independent_receipt_state's one read of the comment pages $1 for head $2,
+# with the clear receipts of every login in the JSON array $3 left out. Prints
+# `clear\t<login>` for a clear newest receipt, so its author can be checked.
+independent_receipt_newest() {
+  printf '%s\n' "$1" | jq -rs -L "$HERE" --arg re "$INDEPENDENT_RECEIPT_MARKER_RE" --argjson denied "$3" \
+    --arg jsonRe "$INDEPENDENT_RECEIPT_JSON_RE" --arg headRe "$INDEPENDENT_RECEIPT_HEAD_RE" --arg head "$2" '
     include "receipt-order";
     include "pr-body";
     [ .[] | .data.repository.pullRequest.comments.nodes[]
@@ -1315,6 +1354,7 @@ independent_receipt_state() {
       | select(($named | type) != "string" or $named == $head)
       | ($doc != null and $doc.head == $head and $doc.verdict == "CLEAR" and $doc.blocking_findings == 0) as $clear
       | select($open != null or ($clear | not))
+      | select(($clear | not) or ($c.login as $l | $denied | index($l) | not))
       | $c + { clear: $clear,
                said: ((if $open == null then "(marker inside a code fence or an HTML comment) " else "" end)
                       + (if $doc == null then "its JSON block does not parse"
@@ -1325,7 +1365,7 @@ independent_receipt_state() {
       else
         ( $matches | sort_by(.idstr | posting_key) | last ) as $latest
         | if $latest == null then "none"
-          elif $latest.clear then "clear"
+          elif $latest.clear then "clear\t\($latest.login)"
           else "blocked\t\($latest.login) posted the newest independent-review receipt for this head at \($latest.at): \($latest.said)" end
       end'
 }
@@ -1346,10 +1386,13 @@ independent_receipt_state() {
 # the newest report per context name decides, whichever kind it is: a status
 # by created_at, a check run by started_at (completed_at when it never
 # started). A success status under a newer failed check run of the same name
-# is red, and the reverse is not. Red is a status of `failure` or `error`, or
-# a completed check run that concluded `failure`, `timed_out`, `cancelled` or
-# `action_required`. Everything else is left alone — pending, queued,
-# in_progress, neutral, skipped, or not reported at all: a Release approval
+# is red, and the reverse is not. Red is named by what is acceptable, so a
+# conclusion GitHub adds later is red until someone says otherwise, as in
+# ci_verdict: a status whose state is neither `success` nor `pending`, or a
+# completed check run whose conclusion is not `success`, `neutral` or
+# `skipped` (failure, timed_out, cancelled, action_required, startup_failure,
+# stale, none at all). What has not finished is left alone — pending, queued,
+# in_progress, or not reported at all: a Release approval
 # waiting on a person is not a defect in the head, which is what
 # CI_EXCLUDED_CONTEXTS protects in ci_verdict too, and GitHub holds the merge
 # for it anyway. Nothing about the head is read when the branch requires
@@ -1392,10 +1435,10 @@ required_status_red() {
   checks=$(head_check_runs "$head") || return 1
   printf '%s\n%s\n' "$statuses" "$checks" | jq -rs --argjson required "$required" '
     [ ( .[0][][]? | { context, app: null, status: true, at: (.created_at // ""), id: (.id // 0), state,
-                      red: (.state == "failure" or .state == "error") } ),
+                      red: (.state != "success" and .state != "pending") } ),
       ( .[1][]? | { context: .name, app: (.app_id // null), status: false, at: (.started_at // .completed_at // ""), id: (.id // 0),
                     state: (if .status == "completed" then (.conclusion // "none") else (.status // "unknown") end),
-                    red: (.status == "completed" and (.conclusion | IN("failure", "timed_out", "cancelled", "action_required"))) } ) ] as $reports
+                    red: (.status == "completed" and (.conclusion | IN("success", "neutral", "skipped") | not)) } ) ] as $reports
     | [ $required[] as $need
         | [ $reports[] | select(.context == $need.context)
             | select(if $need.app == null then true else (.status | not) and .app == $need.app end) ]
