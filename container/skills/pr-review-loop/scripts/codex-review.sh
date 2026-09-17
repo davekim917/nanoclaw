@@ -48,7 +48,10 @@
 #   25  merge-check: the base branch moved while the check ran, or could not be
 #       re-read, so the verdict may be stale — re-run merge-check
 #   26  merge-check: `merge=defer mode=legacy` — not risk-scoped, so SKILL.md Step 6's
-#       evidence rules decide this merge; never chain it into `gh pr merge`
+#       evidence rules decide this merge; never chain it into `gh pr merge`. A legacy
+#       head still gets 24 first when a check GitHub marks required for the PR is red on it
+#       (`required_red`) or the newest independent-review-receipt:v1 for it is not
+#       CLEAR (`independent_receipt_not_clear`) — legacy_precheck
 #   27  merge: merge-check allowed the head, but `gh pr merge` did not merge it
 #   28  audit: merge-check would have refused this PR at its merge, or it merged by a
 #       method the gate does not authorize (rebase or manual) — a gate bypass
@@ -499,8 +502,8 @@ run_gate() {
 # a label for people to read; the gate never takes a missing label as an
 # answer. `risk:high` or `review:requested` being present adds review, and
 # nothing takes it away. Every other repo is legacy: `scope` answers `auto`,
-# `request` refuses, `merge-check` defers, and no command above this block
-# reads any of it.
+# `request` refuses, `merge-check` defers once legacy_precheck finds nothing to
+# refuse, and no command above this block reads any of it.
 RISK_LABEL_WORKFLOW='Risk label'
 # release-policy.py's own contexts are a policy gate, not CI: a pending human approval must never read as ci_pending.
 CI_EXCLUDED_CONTEXTS='["Release policy","Release approval"]'
@@ -524,6 +527,12 @@ REVIEW_CLAIM_MAX_TTL_MINUTES=120
 # instead. Only an author with write access counts: a receipt unlocks a merge,
 # and anyone who can read a public repo can comment on its PRs.
 RECEIPT_MARKER_RE='(^|\n)<!-- pr-review-loop:substitute-receipt head=(?<head>[0-9a-f]{40}) outcome=(?<outcome>approve|changes) -->'
+# A review desk's receipt, which no command here writes: the marker on its own
+# line, then one fenced JSON object carrying `head`, `verdict` and
+# `blocking_findings`. The repo that uses it owns the full field contract; the
+# legacy precheck (independent_receipt_state) reads only those three.
+INDEPENDENT_RECEIPT_MARKER_RE='(^|\n)<!-- independent-review-receipt:v1 -->[ \t]*\r?(?=\n|\z)'
+INDEPENDENT_RECEIPT_JSON_RE='\A\s*```json[ \t]*\r?\n(?<json>[\s\S]*?)\n[ \t]*```'
 # The receipt body's human-readable "who reviewed" line, used to recover the
 # reviewer text for a model-allowlist check — the marker itself carries only
 # head/outcome, never the reviewer, so this is read separately from the body
@@ -1257,6 +1266,198 @@ ci_verdict() {
       else empty end'
 }
 
+# The newest independent-review-receipt:v1 for exactly HEAD, from the authors
+# receipt_outcome trusts and in the posting order it uses (receipt-order.jq):
+# `none`, `clear`, `blocked\t<why>` or `unknown\t<why>`. Clear is verdict CLEAR
+# with zero blocking findings; anything else the newest one says is blocked, a
+# CHANGES verdict and a receipt whose JSON does not parse alike.
+#
+# One rule for what a comment says, with no reading of what Markdown shows:
+# blocking takes no parsing, and a clearing receipt starts with the marker.
+# Every marker in the comment is read, each against the JSON between it and
+# the next marker, wherever it sits — quoted, fenced, commented out, inside a
+# tag — and any receipt among them that applies to this head and is not clear
+# makes the comment a no. A comment is clear only when it holds exactly one
+# marker, that receipt is clear, and the marker is the first thing in the
+# body, after nothing but a byte-order mark and ASCII whitespace: nothing
+# precedes it, so nothing can hide it, and the desk's prose goes after the
+# receipt. Any other comment is not a clear: it clears nothing and masks
+# nothing. Modelling what GitHub renders, and then listing what could open a
+# hidden context before the marker, each drew a finding a round; this models
+# nothing. (The substitute receipt marker is matched against the raw body too,
+# so a quoted `approve` counts there; it is left as it is here.)
+#
+# Who wrote it follows the same asymmetry. authorAssociation is not a
+# permission: MEMBER is membership of the organisation, and a COLLABORATOR can
+# hold read or triage only. So anyone in that set can block, and only an author
+# whose permission on the repository is write or above can clear (may_clear),
+# looked up for the clear receipt that would decide and for no other. A clear
+# one that fails it is left out and the next newest decides, so a genuine
+# CHANGES under a forged CLEAR still stands. (receipt_outcome trusts the same
+# association set for a substitute `approve`, so the risk-scoped path shares
+# this weakness too; it is left as it is here.)
+#
+# Which head a receipt is about is not left to a second parser either. A
+# receipt applies to this head when its JSON text names the head's full SHA
+# anywhere at all, or parses with no string `head`; one that does not mention
+# it is about another head and says nothing here. So a payload that does not
+# parse, or parses to another `head` while still naming this one (a nested
+# object, a duplicate key), blocks rather than drops out. Clearing reads only
+# the parsed top-level `head`, `verdict` and `blocking_findings` (the number
+# 0, not "0" or null), and only from a text that spells each of those keys
+# exactly once and holds no backslash: jq keeps the last of duplicate keys,
+# and an escape can spell a key a second way, so neither can turn a CHANGES
+# into a CLEAR. Substitute receipts are not
+# read here, so an approving one, older or newer, never outvotes the desk. A
+# receipt whose database id cannot be ordered makes the answer `unknown`, as
+# in receipt_outcome. Only the legacy precheck calls this, and `audit` never
+# reaches it (a legacy repo exits the audit arm first), so nothing is read as
+# of a merge. Non-zero when the comments cannot be read.
+independent_receipt_state() {
+  local pages state login denied='[]'
+  pages=$(paginate_connection comments receipt_comments_page) || return 1
+  while :; do
+    state=$(independent_receipt_newest "$pages" "$1" "$denied") || return 1
+    case "$state" in
+      clear$'\t'*)
+        login="${state#*$'\t'}"
+        if may_clear "$login"; then echo clear; return 0; fi
+        denied=$(jq -cn --argjson d "$denied" --arg l "$login" '$d + [$l]') || return 1
+        ;;
+      *) printf '%s\n' "$state"; return 0 ;;
+    esac
+  done
+}
+
+# Whether LOGIN may clear a head: its permission on this repository, now, is
+# write or above (`permission` folds maintain into write and triage into
+# read). Anything else, a failed read included, is no: the clear receipt does
+# not count and whatever it would have superseded stands.
+may_clear() {
+  local permission
+  permission=$(gh api "repos/$REPO/collaborators/$(jq -rn --arg l "$1" '$l | @uri')/permission" --jq .permission 2>/dev/null) || return 1
+  [ "$permission" = admin ] || [ "$permission" = write ]
+}
+
+# independent_receipt_state's one read of the comment pages $1 for head $2,
+# with the clear receipts of every login in the JSON array $3 left out. Prints
+# `clear\t<login>` for a clear newest receipt, so its author can be checked.
+independent_receipt_newest() {
+  printf '%s\n' "$1" | jq -rs -L "$HERE" --arg re "$INDEPENDENT_RECEIPT_MARKER_RE" --argjson denied "$3" \
+    --arg jsonRe "$INDEPENDENT_RECEIPT_JSON_RE" --arg head "$2" '
+    include "receipt-order";
+    [ .[] | .data.repository.pullRequest.comments.nodes[]
+      | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
+      | { login: (.author.login // "someone"), at: .createdAt, idstr: ((.fullDatabaseId // "") | tostring) } as $c
+      | [ (.body // "") | ltrimstr("\uFEFF") | splits($re) ] as $parts
+      | select(($parts | length) > 1)
+      | [ range(1; $parts | length) as $i
+          | $parts[$i] as $rest
+          | (([ $rest | capture($jsonRe) | .json ] | first) // $rest) as $text
+          | ([ $text | try fromjson catch null | objects ] | first) as $doc
+          | select(($text | contains($head)) or ($doc != null and ($doc.head | type) != "string"))
+          | { clear: ($doc != null and $doc.head == $head and $doc.verdict == "CLEAR" and $doc.blocking_findings == 0
+                      and ($text | contains("\\") | not)
+                      and all("head", "verdict", "blocking_findings"; . as $k | [ $text | match("\"\($k)\""; "g") ] | length == 1)),
+              said: (if $doc == null then "its JSON block does not parse"
+                     else "verdict \($doc.verdict // "missing" | tostring), blocking_findings \($doc.blocking_findings // "missing" | tostring)" end) } ] as $receipts
+      | ([ $receipts[] | select(.clear | not) ] | first) as $no
+      | if $no != null then $c + { clear: false, said: $no.said }
+        elif ($parts | length) == 2 and ($receipts | length) == 1 and ($parts[0] | test("\\A[ \t\r\n]*\\z"))
+             and ($c.login as $l | $denied | index($l) | not) then $c + { clear: true, said: "" }
+        else empty end ] as $matches
+    | ([ $matches[] | select((.idstr | canonical_id) | not) ] | first) as $bad
+    | if $bad != null then
+        "unknown\treceipt_order_unknown: an independent-review receipt for this head from \($bad.login) has no usable database id (fullDatabaseId=\(if $bad.idstr == "" then "null" else $bad.idstr end)), so which receipt is newest cannot be determined"
+      else
+        ( $matches | sort_by(.idstr | posting_key) | last ) as $latest
+        | if $latest == null then "none"
+          elif $latest.clear then "clear\t\($latest.login)"
+          else "blocked\t\($latest.login) posted the newest independent-review receipt for this head at \($latest.at): \($latest.said)" end
+      end'
+}
+
+# One page of the PR head's status rollup: every check run and commit status
+# GitHub counts on it, each with GitHub's own answer to whether this PR's base
+# requires it. A head nothing has reported on has no rollup at all (null, read
+# 2026-09-17 on a repo with no CI); that is an empty page, not a failed read.
+rollup_page() {
+  gh api graphql -f query='
+    query($owner:String!,$name:String!,$pr:Int!,$after:String){
+      repository(owner:$owner,name:$name){ pullRequest(number:$pr){
+        headRefOid statusCheckRollup{ contexts(first:100,after:$after){ pageInfo{hasNextPage endCursor} nodes{
+          __typename
+          ... on CheckRun{ name status conclusion isRequired(pullRequestNumber:$pr) }
+          ... on StatusContext{ context state isRequired(pullRequestNumber:$pr) }
+        } } }
+      } }
+    }' \
+    -F owner="$OWNER" -F name="$NAME" -F pr="$PR" -F after="$1" \
+    | jq -c 'if .data.repository.pullRequest != null and .data.repository.pullRequest.statusCheckRollup == null
+             then .data.repository.pullRequest.statusCheckRollup = { contexts: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } }
+             else . end'
+}
+
+# The required checks that are red on exactly HEAD, as `<name>=<state>` joined
+# by ", "; empty when none is. Which checks are required, and which report
+# answers for each, is GitHub's to say and is asked, not re-derived:
+# `isRequired(pullRequestNumber:)` is its evaluation across rulesets and
+# classic protection, app pins, and a status and a check run sharing a name
+# (it requires both). Three review rounds re-deriving those rules one case at
+# a time is why none of them is restated here.
+#
+# Red is named by what is acceptable, as in ci_verdict, so a value GitHub adds
+# later is red: a required check run that is COMPLETED with a conclusion other
+# than SUCCESS, NEUTRAL or SKIPPED, or a required status whose state is not
+# SUCCESS, PENDING or EXPECTED. What has not finished or not reported is left
+# alone: a Release approval waiting on a person is not a defect in the head,
+# which is what CI_EXCLUDED_CONTEXTS protects in ci_verdict too, and GitHub
+# holds the merge for it anyway. The rollup is the PR head's, so every page
+# must name HEAD as that head; a failed or partial read is no verdict, and
+# there is no second source to fall back on.
+required_status_red() {
+  local pages
+  pages=$(paginate_connection statusCheckRollup.contexts rollup_page) || return 1
+  printf '%s\n' "$pages" | jq -rs --arg head "$1" '
+    if all(.[]; .data.repository.pullRequest.headRefOid == $head) | not
+    then error("the status rollup read is for another head than \($head)") else . end
+    | [ .[] | .data.repository.pullRequest.statusCheckRollup.contexts.nodes[] | select(.isRequired == true)
+        | if .__typename == "CheckRun"
+          then select(.status == "COMPLETED" and (.conclusion | IN("SUCCESS", "NEUTRAL", "SKIPPED") | not)) | "\(.name)=\(.conclusion // "none" | ascii_downcase)"
+          else select(.state | IN("SUCCESS", "PENDING", "EXPECTED") | not) | "\(.context)=\(.state // "none" | ascii_downcase)" end ]
+    | unique | join(", ")'
+}
+
+# What a legacy merge still answers to mechanically. merge-check defers a
+# legacy repo to SKILL.md Step 6, and Step 6 is prose: a PR merged there over a
+# red required status and a desk receipt asking for changes, with the rule
+# against both already written down. These two facts need no judgement, so
+# they refuse (24) before the defer; everything else about a legacy merge is
+# still Step 6's. No verdict (1) when either cannot be read.
+legacy_precheck() {
+  local red receipt
+  red=$(required_status_red "$SCOPE_HEAD") || {
+    echo "merge=error head=$SCOPE_HEAD: could not read which required checks are red on this head (GitHub status rollup); no verdict" >&2
+    exit 1
+  }
+  if [ -n "$red" ]; then
+    echo "merge=refused head=$SCOPE_HEAD mode=legacy: required_red: $red — GitHub requires it for this PR and it is red on this head; fix what it reports, never merge around it" >&2
+    exit 24
+  fi
+  receipt=$(independent_receipt_state "$SCOPE_HEAD") || exit 1
+  case "$receipt" in
+    none|clear) ;;
+    blocked$'\t'*|unknown$'\t'*)
+      echo "merge=refused head=$SCOPE_HEAD mode=legacy: independent_receipt_not_clear: ${receipt#*$'\t'}; only a later CLEAR independent-review receipt for this head, or a new head, lifts it" >&2
+      exit 24
+      ;;
+    *)
+      echo "merge=error head=$SCOPE_HEAD: the independent-receipt check gave no verdict (got \"$receipt\")" >&2
+      exit 1
+      ;;
+  esac
+}
+
 # merge-check's decision, for the merge-check command and for `merge`, which
 # runs it in a subshell of this same process. Exit 0 only when merging exactly
 # this head is allowed; the merge then pins it with `gh pr merge
@@ -1276,6 +1477,11 @@ merge_check_main() {
   done
   scope_eval || exit 1
   if [ "$SCOPE_MODE" = legacy ]; then
+    if [ -n "$want" ] && [[ "$SCOPE_HEAD" != "$want"* ]]; then
+      echo "merge=refused head=$SCOPE_HEAD: the PR head is not $want" >&2
+      exit 24
+    fi
+    legacy_precheck
     refuse_if_base_moved
     echo "merge=defer mode=legacy: $REPO is not risk-scoped; the existing Step-6 evidence rules apply"
     exit 26
