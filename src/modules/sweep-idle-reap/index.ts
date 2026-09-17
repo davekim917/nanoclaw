@@ -99,6 +99,20 @@ export function shouldReapIdleTaskContainer(
  * last outbound row (chat or status) is older than CHAT_IDLE_REAP_MS. State
  * lives entirely in inbound.db/outbound.db, so the next @mention respawns
  * and resumes exactly like a stuck-ceiling kill does today.
+ *
+ * `provider_executing` blocks the reap for the same reason it blocks the task
+ * reap above: message quiet is not idleness. A parent turn that launched a
+ * background agent ends with a `result` and then emits nothing until the
+ * agent finishes; the runner holds the turn level up across that stretch
+ * (`lowerTurnLevelUnlessQueued`, container/agent-runner/src/poll-loop.ts:2265,
+ * returns early while `query.hasBackgroundWork()`), and it is the only signal
+ * that does — no due row, no claim, no continuation, no outbound. Observed
+ * live 2026-09-16/17: a chat session's builder subagent ran past the floor
+ * twice and was killed mid-build each time, 15 min after the parent's last
+ * status, with the heartbeat fresh and the flag raised. A container that
+ * wedges with the flag up is still bounded: a wedged provider stops touching
+ * the heartbeat, and the ceiling (`decideStuckAction`,
+ * src/modules/sweep-container-health/index.ts:555) keys on that alone.
  */
 export const CHAT_IDLE_REAP_MS = 15 * 60 * 1000;
 
@@ -106,6 +120,7 @@ export function shouldReapIdleChatContainer(
   threadId: string | null,
   dueMessageCount: number,
   processingClaimCount: number,
+  providerExecuting: boolean,
   hasActiveContinuation: boolean,
   lastOutboundAtMs: number | null,
   lastInboundAtMs: number | null,
@@ -113,6 +128,7 @@ export function shouldReapIdleChatContainer(
 ): boolean {
   if (isTaskThread(threadId)) return false; // task threads use shouldReapIdleTaskContainer
   if (dueMessageCount !== 0 || processingClaimCount !== 0 || hasActiveContinuation) return false;
+  if (providerExecuting) return false;
   if (lastOutboundAtMs === null) return false;
   // Idleness is the newest activity in EITHER direction, not just outbound.
   // A container that has consumed a fresh message but not yet emitted its
@@ -164,6 +180,7 @@ export function registerIdleReapSweepDuties(): void {
         ctx.session.thread_id,
         ctx.plan.dueCount,
         ctx.observed!.processingClaimCount,
+        ctx.observed!.containerState?.provider_executing === 1,
         ctx.plan.workContinuation !== null,
         ctx.observed!.lastOutboundAtMs,
         ctx.observed!.lastInboundAtMs,
