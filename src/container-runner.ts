@@ -3926,11 +3926,21 @@ export function resolveCodexAuthFallbacks(
  * NOT any string `code`: Node stamps its own argument-validation TypeErrors with
  * codes too (`ERR_INVALID_ARG_TYPE`), and those are exactly the bugs this
  * predicate exists to let through. The underscore is what separates them.
+ *
+ * `Invalid group folder` (`src/group-folder.ts:21`, reached through
+ * `stageOpenCodeAuth`'s defense-in-depth check on the scoped path) counts as
+ * host state for the same reason: the folder grammar tightened over time, and
+ * `groupFolderExistsOnDisk` says so in as many words, so a group minted under
+ * the older grammar must lose the peer credential rather than become
+ * unspawnable. Withholding also means the scoped path is never built, which is
+ * strictly safer than proceeding.
  */
+const HOST_STATE_REFUSAL = /^(Unsafe |Invalid group folder )/;
+
 function isHostStateFailure(err: unknown): err is Error {
   if (!(err instanceof Error)) return false;
   const code = (err as NodeJS.ErrnoException).code;
-  return (typeof code === 'string' && /^E[A-Z0-9]+$/.test(code)) || err.message.startsWith('Unsafe ');
+  return (typeof code === 'string' && /^E[A-Z0-9]+$/.test(code)) || HOST_STATE_REFUSAL.test(err.message);
 }
 
 /**
