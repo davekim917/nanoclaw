@@ -570,11 +570,6 @@ export type ProviderEvent =
    */
   | { type: 'file'; path: string; filename?: string; text?: string }
   /**
-   * Liveness signal. Providers MUST yield this on every underlying SDK
-   * event (tool call, thinking, partial message, anything) so the
-   * poll-loop's idle timer stays honest during long tool runs.
-   */
-  /**
    * Text the agent wrote and then kept working past — a tool call followed it
    * inside the same turn, so it is NOT the turn's final text and the `result`
    * will not carry it. The poll-loop delivers the complete
@@ -586,6 +581,11 @@ export type ProviderEvent =
    * such text simply never emit it.
    */
   | { type: 'interim_text'; text: string }
+  /**
+   * Liveness signal. Providers MUST yield this on every underlying SDK
+   * event (tool call, thinking, partial message, anything) so the
+   * poll-loop's idle timer stays honest during long tool runs.
+   */
   | { type: 'activity' }
   /**
    * The provider's underlying SDK auto-compacted the conversation context.

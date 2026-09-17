@@ -2217,9 +2217,9 @@ export async function processQuery(
         // and none was delivered.
         const midTurnNote =
           pushedHumanTrigger && !turnIdle
-            ? '\n\n<system>Reminder: text you write between tool calls is NOT ' +
-              'delivered. To answer now, call the `send_message` tool; otherwise answer in <message to="name"> ' +
-              'blocks when the turn ends.</system>'
+            ? '\n\n<system>Reminder: unwrapped text you write between tool calls is NOT delivered. ' +
+              'To answer now, write a complete <message to="name">...</message> block or call the ' +
+              '`send_message` tool.</system>'
             : '';
         const pushedId = pushToQuery(prompt + midTurnNote, extractAttachments(keep));
         if (admittedTurn && pushedId) admittedTurn.promptIds = [pushedId];
@@ -2533,9 +2533,9 @@ export async function processQuery(
           }
           // An agent that posted an update mid-turn often repeats it verbatim in
           // its final text; the person already has it.
-          let finalText = event.text;
-          for (const block of interimThisTurn) finalText = finalText.split(block).join('');
-          const { sent, hasUnwrapped, taskBlocks } = await dispatchResultText(finalText, routing);
+          const { sent, hasUnwrapped, taskBlocks } = await dispatchResultText(event.text, routing, {
+            alreadyDelivered: new Set(interimThisTurn),
+          });
           const willRetryTaskBlocks = shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
           // With prompt ids a nudge's answer matches no fire, so only the id-less
           // path needs `taskBlockNudged` to keep it out of the next fire's slot.
@@ -2631,8 +2631,8 @@ export async function processQuery(
               .map((d) => d.name)
               .join(', ');
             pushToQuery(
-              `<system>Your turn ended without delivering anything to the person who wrote to you. Text written ` +
-                `between tool calls is not delivered. Reply now in <message to="name">...</message> blocks ` +
+              `<system>Your turn ended without delivering anything to the person who wrote to you. Unwrapped text ` +
+                `written between tool calls is not delivered. Reply now in <message to="name">...</message> blocks ` +
                 `(destinations: ${names}), or, if no reply is warranted, answer with <internal>no reply</internal>.</system>`,
             );
             // Like the wrapping retry, the nudged result answers the SAME
@@ -2940,34 +2940,33 @@ export interface TaskMessageBlock {
 }
 
 const COMPLETE_MESSAGE_BLOCK_RE = /<message\s+to="[^"]+"\s*>[\s\S]*?<\/message>/g;
-const COMPLETE_MESSAGE_TO_RE = /^<message\s+to="([^"]+)"/;
+// Fenced and inline code: a block QUOTED in narration ("I'll answer with
+// `<message to="here">…</message>` once the build finishes") is not a send.
+const CODE_SPAN_RE = /```[\s\S]*?```|`[^`\n]*`/g;
 
 /**
  * Deliver the complete `<message to="…">…</message>` blocks in text the agent
- * wrote mid-turn (ProviderEvent `interim_text`), and return the blocks handed
- * to delivery. Everything else in the text is narration between tool calls
- * and is dropped — no origin fallback, no wrapping nudge: those belong to the
- * turn's FINAL text, which is the agent's answer. An unclosed opener is left
- * for the final text too; mid-turn is no place to guess where a body ends.
- * Routing, the `here` alias and peer recovery are dispatchResultText's, so a
- * block behaves the same wherever in the turn it was written. Task runs never
- * deliver blocks (RoutingContext.taskRun), so nothing is attempted there.
+ * wrote mid-turn (ProviderEvent `interim_text`), and return the exact block
+ * spans that were routed as addressed. Everything else in the text is
+ * narration between tool calls and is dropped — `blocksOnly` keeps
+ * dispatchResultText's origin fallback and wrapping verdict out of it; those
+ * belong to the turn's FINAL text, which is the agent's answer. An unclosed
+ * opener is left for the final text too; mid-turn is no place to guess where a
+ * body ends. Routing, the `here` alias and peer recovery are
+ * dispatchResultText's, so a block behaves the same wherever in the turn it
+ * was written.
+ *
+ * A block whose destination does not resolve is simply not sent and not
+ * returned, so the final text can still deliver it: destinations are read live
+ * and can be added during a session (destinations.ts header) — e.g. by the
+ * very tool call that follows this text. Task runs never deliver blocks
+ * (RoutingContext.taskRun), so nothing is attempted there.
  */
 export async function dispatchInterimMessageBlocks(text: string, routing: RoutingContext): Promise<string[]> {
   if (routing.taskRun) return [];
   const delivered: string[] = [];
-  for (const block of text.match(COMPLETE_MESSAGE_BLOCK_RE) ?? []) {
-    // Only a block addressable NOW goes out mid-turn. Destinations are read
-    // live and can be added during a session (destinations.ts header) — e.g.
-    // by the very tool call that follows this text — so an unknown name is
-    // left for the final text rather than dropped, or worse, handed to
-    // dispatchResultText's origin fallback as a "[dropped: …]" note.
-    const to = COMPLETE_MESSAGE_TO_RE.exec(block)?.[1]?.trim() ?? '';
-    const addressable = to.toLowerCase() === 'here' || findByName(to) !== undefined || findPeerName(to) !== undefined;
-    if (!addressable) continue;
-    const { sent } = await dispatchResultText(block, routing);
-    // Reported as delivered — and so stripped from the final text — only if a
-    // row was actually written for it.
+  for (const block of text.replace(CODE_SPAN_RE, '').match(COMPLETE_MESSAGE_BLOCK_RE) ?? []) {
+    const { sent } = await dispatchResultText(block, routing, { blocksOnly: true });
     if (sent > 0) delivered.push(block);
   }
   if (delivered.length > 0) log(`Interim text: ${delivered.length} <message> block(s) delivered before a tool call`);
@@ -3004,6 +3003,14 @@ async function emitTurnEnd(): Promise<void> {
 export async function dispatchResultText(
   text: string,
   routing: RoutingContext,
+  // `alreadyDelivered`: exact block spans that went out mid-turn
+  // (dispatchInterimMessageBlocks). They are not sent again but still COUNT as
+  // sent — removing them from `text` instead would leave `sent === 0` and hand
+  // the narration around them to the unwrapped-output fallback below.
+  // `blocksOnly`: mid-turn text. Blocks route as usual; nothing else does — no
+  // fallback, no unwrapped verdict — and `sent` counts only blocks routed as
+  // addressed.
+  opts: { alreadyDelivered?: ReadonlySet<string>; blocksOnly?: boolean } = {},
 ): Promise<{ sent: number; hasUnwrapped: boolean; taskBlocks: TaskMessageBlock[] }> {
   type Opener = { index: number; endIndex: number; toName: string };
   const openers: Opener[] = [];
@@ -3032,6 +3039,10 @@ export async function dispatchResultText(
     const body = text.slice(opener.endIndex, bodyEnd).trim();
     cursor = closeBeforeNext ? explicitClose + MESSAGE_CLOSER.length : nextOpenerIdx;
 
+    if (opts.alreadyDelivered?.has(text.slice(opener.index, cursor))) {
+      sent++;
+      continue;
+    }
     const toName = opener.toName;
     if (!toName) {
       // Opener with empty to="" — treat as malformed; body becomes scratchpad.
@@ -3130,6 +3141,8 @@ export async function dispatchResultText(
   // fallback turned that into channel spam (one no-op status line per wake).
   // A wake that HAS news posts it via an explicit <message> block — the wake
   // prompt states this contract.
+  if (opts.blocksOnly) return { sent, hasUnwrapped: false, taskBlocks };
+
   if (!routing.taskRun && !routing.selfWake && sent === 0 && scratchpad) {
     const origin = findByRouting(routing.channelType, routing.platformId);
     if (origin) {

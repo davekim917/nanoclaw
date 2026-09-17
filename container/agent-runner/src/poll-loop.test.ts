@@ -3184,6 +3184,56 @@ describe('interim text — a <message> block written before a tool call', () => 
     expect(getUndeliveredMessages()[0].platform_id).toBe('chan-child');
   });
 
+  // The repeat must be skipped INSIDE the dispatcher, still counted as sent:
+  // removing it from the text left `sent === 0`, and the narration around it
+  // went to the person through the unwrapped-output fallback.
+  it('keeps the narration private when the final text is the repeated block plus prose', async () => {
+    seedOrigin();
+    const block = '<message to="here">head is 2c8cf18</message>';
+    const pushes = await run([
+      { type: 'interim_text', text: block },
+      { type: 'result', text: `I've posted the head. ${block}` },
+    ]);
+
+    expect(sentTexts()).toEqual(['head is 2c8cf18']);
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('does not re-post a delivered block when the turn ends in an error', async () => {
+    seedOrigin();
+    const block = '<message to="here">head is 2c8cf18</message>';
+    await run([
+      { type: 'interim_text', text: block },
+      { type: 'result', text: block, isError: true },
+    ]);
+
+    expect(sentTexts()).toEqual(['head is 2c8cf18']);
+  });
+
+  it('does not send a block the agent only quoted in code', async () => {
+    seedOrigin();
+    await run([
+      {
+        type: 'interim_text',
+        text: 'I will answer with `<message to="here">the summary</message>` once the build ends.',
+      },
+      { type: 'interim_text', text: '```\n<message to="here">fenced example</message>\n```' },
+      { type: 'result', text: '<message to="here">real answer</message>' },
+    ]);
+
+    expect(sentTexts()).toEqual(['real answer']);
+  });
+
+  it('never routes a dropped-block note to the origin mid-turn', async () => {
+    seedOrigin();
+    await run([
+      { type: 'interim_text', text: '<message to=" nowhere ">lost</message>' },
+      { type: 'result', text: '<message to="here">done</message>' },
+    ]);
+
+    expect(sentTexts()).toEqual(['done']);
+  });
+
   it('leaves an unclosed block for the final text', async () => {
     seedOrigin();
     await run([
