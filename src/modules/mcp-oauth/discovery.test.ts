@@ -263,3 +263,33 @@ describe('discoverAuthorization', () => {
     await expect(discoverAuthorization(fetchImpl, 'https://mcp.x.test/mcp')).rejects.toThrow(/--issuer/);
   });
 });
+
+describe('cleartext is refused before anything is fetched (#876 P2-3)', () => {
+  it('refuses an http:// MCP URL without probing it', async () => {
+    const calls: string[] = [];
+    await expect(discoverAuthorization(routed({}, calls), 'http://mcp.example.com/mcp')).rejects.toThrow(
+      /--url must be https/,
+    );
+    // Nothing was probed: the bearer token would be sent to this URL.
+    expect(calls).toEqual([]);
+  });
+
+  it('never fetches a cleartext resource_metadata URL from a challenge, and still tries the well-known paths', async () => {
+    const calls: string[] = [];
+    const fetchImpl = routed(
+      {
+        'https://mcp.example.com/mcp': json({}, 401, {
+          'www-authenticate': 'Bearer resource_metadata="http://evil.example.net/prm"',
+        }),
+      },
+      calls,
+    );
+    await expect(discoverAuthorization(fetchImpl, 'https://mcp.example.com/mcp')).rejects.toThrow(
+      /resource_metadata must be https/,
+    );
+    // The advertised cleartext URL is named in the failure list but was never
+    // requested; the https well-known candidates were.
+    expect(calls).not.toContain('http://evil.example.net/prm');
+    expect(calls.some((u) => u.startsWith('https://mcp.example.com/.well-known/oauth-protected-resource'))).toBe(true);
+  });
+});
