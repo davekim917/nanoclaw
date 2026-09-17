@@ -33,6 +33,17 @@ const MAX_CAPABILITY_JSON_CHARS = 11_000;
 /** Roster hint cap. Mirrors PRE_TURN_BOUNDS.capabilityRosterUseChars on the host. */
 const MAX_CAPABILITY_USE_CHARS = 200;
 /**
+ * The standing instruction gets its OWN bound, well clear of the 822 chars the
+ * host writes today (`CAPABILITY_ROSTER_PREAMBLE`, src/capabilities.ts).
+ *
+ * At the 600-char default this string was clipped mid-list, around
+ * `snow login[truncated:…]`, which dropped the "never set your own
+ * Authorization header" rule and the "report it instead of re-authenticating"
+ * fallback — the exact prohibitions the preamble exists to keep always-on, and
+ * only on the cold-context path, where nobody would see it go.
+ */
+const MAX_HOW_TO_USE_CHARS = 2_000;
+/**
  * Used only when the mounted snapshot predates the roster and so carries no
  * `session.howToUse`. The host writes that field
  * (`CAPABILITY_ROSTER_PREAMBLE`, src/capabilities.ts), so the live text has
@@ -135,7 +146,7 @@ function readCapabilitiesFrom(filePath: string): {
       });
     const snapshot = {
       agentGroupId: boundedString(session.agentGroupId) ?? 'unknown',
-      howToUse: boundedString(session.howToUse) ?? FALLBACK_HOW_TO_USE,
+      howToUse: boundedString(session.howToUse, MAX_HOW_TO_USE_CHARS) ?? FALLBACK_HOW_TO_USE,
       services,
     };
     let truncatedServices = session.services.length - services.length;

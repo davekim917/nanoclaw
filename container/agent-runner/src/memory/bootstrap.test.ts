@@ -74,6 +74,34 @@ describe('ensureFreshContextBootstrap', () => {
     expect(result).toContain('EVERY service listed here is wired into THIS session right now.');
   });
 
+  it('keeps the whole host-written standing instruction, imperatives and all', () => {
+    // Round 1, P2. At the 600-char default bound this 822-char preamble was
+    // clipped mid-list, dropping the "never set your own Authorization header"
+    // rule and the "report it instead of re-authenticating" fallback — on the
+    // cold-context path only, where nobody would see it go. The previous test
+    // covered the MISSING-field fallback, not the field the host actually
+    // writes.
+    const howToUse =
+      'EVERY service listed here is wired into THIS session right now — never tell the user you lack one of them, and never ask for its credentials. ' +
+      'These are one-line reminders, not instructions: before you first use a service in a session, call `get_capabilities` with `{"service":"<name>"}` for its full usage notes (auth, exact tool names, known failure shapes). ' +
+      'Credentials are injected for you at spawn, so NEVER run an interactive login or auth command in this container (`gh auth login`, `wix login`, `hex auth login`, `aws configure`, `aws sso login`, `snow login`, …) and NEVER set your own `Authorization` header on a gateway-injected service — the gateway overwrites it, so a 401 there is not evidence the credential is missing. If a credential genuinely fails, report it to the operator instead of re-authenticating.';
+    expect(howToUse.length).toBeGreaterThan(600);
+    fs.writeFileSync(
+      CAPABILITIES,
+      JSON.stringify({ session: { agentGroupId: 'agent-a', howToUse, services: [{ name: 'Hex', cli: 'hex' }] } }),
+    );
+
+    const result = ensureFreshContextBootstrap('<message>hello</message>', {
+      capabilities: CAPABILITIES,
+      index: INDEX,
+    });
+
+    expect(result).not.toContain('[truncated:fresh-context-bootstrap]');
+    // The clauses that sat past the old 600-char cut.
+    expect(result).toContain('NEVER set your own `Authorization` header');
+    expect(result).toContain('report it to the operator instead of re-authenticating');
+  });
+
   it('skips a malformed entry instead of emitting a nameless roster line', () => {
     fs.writeFileSync(
       CAPABILITIES,

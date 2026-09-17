@@ -17,7 +17,7 @@ vi.mock('./config.js', async (importOriginal) => ({
   DATA_DIR: dirs.DATA_DIR,
 }));
 
-import { buildSessionServicesSnapshot, getHostCapabilities } from './capabilities.js';
+import { boundedNameList, buildSessionServicesSnapshot, getHostCapabilities } from './capabilities.js';
 import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from './db/index.js';
 import { writeContainerConfig } from './container-config.js';
 import { SIBLING_BOUND_FIELDS } from './sibling-parity.js';
@@ -850,6 +850,60 @@ describe('buildSessionServicesSnapshot', () => {
         expect(wix).toContain('www.wixapis.com REST');
         expect(wix).toContain('never hardcoded or guessed');
         expect(wix).toContain('never run `wix login`');
+      });
+
+      it('a long account list cannot clip the Google Workspace warning off the end', async () => {
+        // Round 1, P2. The account list is the only unbounded part of that
+        // hint, `boundedText` clips from the END, and the imperative is
+        // written there — so five modestly named accounts silently amputated
+        // the `auth_method: none` explanation. The previous no-clipping test
+        // ran in an environment with no account files at all, so it exercised
+        // only the static branch; this one creates them.
+        const home = `${dirs.TEST_ROOT}/fake-home`;
+        fs.mkdirSync(`${home}/.config/gws/accounts`, { recursive: true });
+        const accounts = [
+          'operations-team-shared',
+          'finance-team-shared',
+          'marketing-team-shared',
+          'support-team-shared',
+          'engineering-team-shared',
+        ];
+        for (const name of accounts) fs.writeFileSync(`${home}/.config/gws/accounts/${name}.json`, '{}');
+        // os.homedir() reads $HOME first on POSIX, which is how the snapshot
+        // builder's account lookup is reachable from a hermetic test at all.
+        vi.stubEnv('HOME', home);
+
+        insertWorkgroup('gws-many', []);
+        const ag = group('ag-gws-many', 'gws-many');
+        await createGroupInWorkgroup(ag, 'gws-many');
+        writeContainerConfig(ag.folder, {
+          mcpServers: {},
+          packages: { apt: [], npm: [] },
+          additionalMounts: [],
+          skills: 'all',
+          tools: ['google-workspace'],
+        } as Parameters<typeof writeContainerConfig>[1]);
+
+        const gws = (await buildSessionServicesSnapshot(ag.id)).services.find(
+          (service) => service.name === 'Google Workspace',
+        );
+        // Guard the guard: prove the accounts were actually found, or this
+        // test silently measures the static no-account branch again.
+        expect(gws?.credentialPaths).toHaveLength(accounts.length);
+        expect(gws?.summary?.length ?? 0).toBeLessThanOrEqual(PRE_TURN_BOUNDS.capabilityRosterUseChars);
+        expect(gws?.summary).toContain('GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE');
+        expect(gws?.summary).toContain('`auth_method: none`');
+        // Over budget the list collapses to a count rather than being cut.
+        expect(gws?.summary).toContain('5 available');
+      });
+
+      it('boundedNameList collapses rather than truncates', () => {
+        expect(boundedNameList(['alpha', 'beta'])).toBe('alpha, beta');
+        // One long name is as dangerous as many short ones.
+        expect(boundedNameList(['a'.repeat(80)])).toBe('1 available — get_capabilities for names');
+        expect(boundedNameList(Array.from({ length: 9 }, (_, i) => `profile-${i}`))).toBe(
+          '9 available — get_capabilities for names',
+        );
       });
 
       it('no hint is clipped, so no imperative can be cut off the end', async () => {

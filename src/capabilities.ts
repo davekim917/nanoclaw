@@ -167,7 +167,7 @@ export interface SessionServicesSnapshot {
      * sites — the service-count limit (:1666), the total budget
      * (:1719) and `enforceFinalBound` (:1765) — and by the runner's
      * fresh-context fallback through its own `evictCapability`
-     * (container/agent-runner/src/memory/bootstrap.ts:89, called at :116 and :143).
+     * (container/agent-runner/src/memory/bootstrap.ts:100, called at :127 and :154).
      */
     retainUnderBudget?: boolean;
   }>;
@@ -266,6 +266,35 @@ export function buildCapabilityRoster(snapshot: SessionServicesSnapshot): Capabi
     }),
   };
 }
+
+/**
+ * Render a scope/account/profile list for a roster hint without letting it
+ * push the hint past `PRE_TURN_BOUNDS.capabilityRosterUseChars`.
+ *
+ * Load-bearing, not cosmetic. These lists are the only UNBOUNDED part of a
+ * hand-written hint — a group can hold any number of gws accounts, snowflake
+ * connections, aws profiles or dbt profiles — and `boundedText` clips a hint
+ * from the END, where the safety imperative is written. Without this, five
+ * modestly named accounts silently amputate "`auth_method: none` means that
+ * var is unset", which is the whole reason that entry exists.
+ *
+ * Over budget the list collapses to a count: the names are still one
+ * `get_capabilities` call away in `scopes` and the full prose, and a count the
+ * agent can act on beats a truncated list it cannot.
+ */
+export function boundedNameList(names: string[], budget = ROSTER_NAME_LIST_CHARS): string {
+  const joined = names.join(', ');
+  if (joined.length <= budget) return joined;
+  return `${names.length} available — get_capabilities for names`;
+}
+
+/**
+ * Budget for the interpolated list above. Derived: the longest fixed part of a
+ * hint that carries one is Google Workspace's, at 152 characters, against a
+ * 200-character cap. Guarded by `src/capabilities.test.ts`, which builds the
+ * worst case rather than trusting this arithmetic.
+ */
+const ROSTER_NAME_LIST_CHARS = 48;
 
 function rosterFallbackUse(service: SessionServicesSnapshot['services'][number]): string | undefined {
   const text = service.activation ?? service.useFor;
@@ -497,7 +526,7 @@ export function buildSessionServicesSnapshotFrom(
       // then sees `auth_method: none` has had its wrong conclusion confirmed.
       summary:
         effective.length > 0
-          ? `Gmail/Calendar/Drive/Docs/Sheets/Slides (${effective.join(', ')}); export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE — \`auth_method: none\` means that var is unset, not missing creds`
+          ? `Gmail/Calendar/Drive/Docs/Sheets/Slides (${boundedNameList(effective)}); export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE — \`auth_method: none\` means that var is unset, not missing creds`
           : 'No gws account file on the host yet; once there is one, export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE — `auth_method: none` means that var is unset, not missing creds',
       activation:
         effective.length > 0
@@ -520,7 +549,7 @@ export function buildSessionServicesSnapshotFrom(
       credentialPaths: ['/home/node/.snowflake/connections.toml'],
       summary:
         effective.length > 0
-          ? `Run SQL on the warehouse: \`snow sql -c ${effective[0]}\` (connections: ${effective.join(', ')})`
+          ? `Run SQL on the warehouse: \`snow sql -c ${effective[0]}\` (connections: ${boundedNameList(effective)})`
           : 'SQL on the warehouse — no matching connection in connections.toml',
       activation:
         effective.length > 0
@@ -542,7 +571,7 @@ export function buildSessionServicesSnapshotFrom(
       credentialPaths: ['/home/node/.aws/credentials'],
       summary:
         effective.length > 0
-          ? `AWS CLI against profiles ${effective.join(', ')} (pass --profile)`
+          ? `AWS CLI against profiles ${boundedNameList(effective)} (pass --profile)`
           : 'AWS CLI — credentials mounted but no matching scoped profile',
       activation:
         effective.length > 0
@@ -565,7 +594,7 @@ export function buildSessionServicesSnapshotFrom(
       credentialPaths: ['/home/node/.dbt/profiles.yml'],
       summary:
         effective.length > 0
-          ? `dbt CLI (run/compile/test/build) on profiles ${effective.join(', ')}`
+          ? `dbt CLI (run/compile/test/build) on profiles ${boundedNameList(effective)}`
           : 'dbt CLI — profiles.yml mounted but no matching scoped profile',
       activation:
         effective.length > 0
