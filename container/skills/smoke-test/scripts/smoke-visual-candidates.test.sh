@@ -68,9 +68,11 @@ barrier "$RUN" | jq -e '.ready == false and .missing == ["contact-sheet/manifest
 
 # Owed by the gate's pinned journeys even when the owner wrote no shots.json.
 RUN="$(new_run journeys-owed)"
-mkdir -p "$RUN/journeys"
-echo '{"matchedJourneys":[{"id":"J1"}]}' >"$RUN/journeys/selection.json"
-echo '{"journeys":[{"id":"J1","captureRecipes":[{"name":"lantern","path":"/lantern"}]}]}' >"$RUN/journeys/catalogue.json"
+# Adopted the way a campaign adopts it: `pin-run` from the gate's pin + snapshot.
+echo '{"journeys":[{"id":"J1","captureRecipes":[{"name":"lantern","path":"/lantern"}]}]}' >"$TMP/catalogue-snapshot.json"
+jq -cn --arg snap "$TMP/catalogue-snapshot.json" --arg sha "$(sha256sum "$TMP/catalogue-snapshot.json" | cut -d' ' -f1)"   '{pinned:true,matchedJourneys:[{id:"J1"}],unmappedPaths:[],catalogueSnapshot:$snap,catalogueSha256:$sha}' >"$TMP/journeys-pin.json"
+python3 "$SCRIPT_DIR/smoke-journeys.py" pin-run "$RUN" "$TMP/journeys-pin.json" | jq -e '.ok' >/dev/null || fail "pin-run fixture"
+cmp -s "$RUN/journeys/selection.json" "$TMP/journeys-pin.json" || fail "pin-run stores the pin byte for byte"
 python3 "$VC" barrier "$RUN" | jq -e '.missing == ["contact-sheet/manifest.json"]
   and (.invalidReasons[0] | contains("pinned journeys carry capture recipes"))' >/dev/null ||
   fail "pinned journeys with capture recipes owe a sheet"

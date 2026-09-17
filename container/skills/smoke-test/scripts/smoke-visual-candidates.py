@@ -97,7 +97,7 @@ def emit(obj, code=0):
 
 def writer_side(what):
     """Same fence, same env, same fail-closed-on-unset as the scaffold's
-    require_coordinator_role (smoke-run-scaffold.sh:149) -- except both sides
+    require_coordinator_role (smoke-run-scaffold.sh:154) -- except both sides
     may write here, and the record says which one did."""
     side = os.environ.get("SMOKE_LANE_ROLE", "")
     if side not in SIDES:
@@ -154,9 +154,13 @@ def _run_file_ok(run_dir, rel):
 
 
 def journey_required_shots(run_dir):
-    """Screen names the run's pinned journeys demand (smoke-journeys.py shots).
+    """Screen names the run's ADOPTED selection demands, read through
+    `smoke-journeys.py shots` -- the one reader of what `pin-run` stores
+    (journeys/selection.json + catalogue.json), never a second parser of it.
     Whether a sheet is owed is then the gate's pin, not whether the owner got
-    round to writing shots.json. None = the answer could not be read."""
+    round to writing shots.json. A valid gate pin the run has not adopted yet
+    is smoke-journeys.py barrier's refusal, which runs first; nothing is read
+    from the lease dir here. None = the answer could not be read."""
     if not os.path.exists(os.path.join(run_dir, "journeys", "selection.json")):
         return []
     try:

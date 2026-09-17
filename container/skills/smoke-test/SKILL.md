@@ -1078,25 +1078,24 @@ not run is recorded with `--unavailable <reason>`, never omitted.
   `changed` it — neither alone is a candidate;
 - `critic@sheet`, when the critic was recorded unavailable.
 
-The UI adversary reproduces each one interactively, in a viewport at that width
-on the bound build, and records exactly one disposition with `dispose <run-dir>
+The UI adversary reproduces each interactively, in a viewport at that width on
+the bound build, and records exactly one disposition with `dispose <run-dir>
 <candidate> <disposition> --by <who> …`:
 
 | Disposition | Carries | Then |
 | --- | --- | --- |
 | `confirmed` | `--finding <id> --evidence <viewport capture>` | A normal section 4 finding; its lane marker lists the id in `confirmedFindings`. |
-| `refuted-capture-artifact` | `--reason --evidence <viewport capture>` | `aggregate <run-root> known-artifacts` gives it to the next critic as known-acceptable. |
-| `deferred` | `--owner --trigger` | Real but tolerable, with a concrete revisit trigger. |
-| `blocked` | `--reason` | Could not reproduce. The screen goes on the verdict's Untested line. |
+| `refuted-capture-artifact` | `--reason --evidence <viewport capture>` | `aggregate <run-root> known-artifacts` tells the next critic. |
+| `deferred` | `--owner --trigger` | Real but tolerable. |
+| `blocked` | `--reason` | Could not reproduce; goes on the verdict's Untested line. |
 
 A failed capture is **missing evidence for that journey**: re-capture it, or
 record `confirmed`/`blocked` — never refuted or deferred unseen. Re-capturing
 voids the critic record.
 
-Both writers need `SMOKE_LANE_ROLE` and record it as `side`. Refuting or
-deferring a `BROKEN` must come from the other side than the one that recorded
-the critic; a side may confirm or block its own. The role is self-declared, as
-for markers — whether a disposition is true is the challenger's review.
+Both writers need `SMOKE_LANE_ROLE`, recorded as `side`. Refuting or deferring
+a `BROKEN` must come from the other side than the one that recorded the critic.
+The role is self-declared, as for markers — truth is the challenger's review.
 
 Where the install exports `SMOKE_VISUAL_DISPOSITIONS=1` (unset, nothing is
 enforced), `smoke-evidence-barrier.sh synthesis` refuses while a required sheet
@@ -1104,9 +1103,8 @@ has no manifest, a sheet has no critic record, or a candidate lacks a valid
 disposition — the `confirmedFindings`→clip pattern, likewise COMPLETENESS
 ONLY. The critic is never a gate: any honest disposition clears readiness, so a
 screenshot-only suspicion cannot hold a release; the verdict moves only through
-a `confirmed` finding's severity, so a confirmed user-blocking defect cannot be
-waved through. `aggregate <run-root> critic-log` derives the shared critic
-log; never hand-append it.
+a `confirmed` finding's severity, so a confirmed user-blocking defect is never
+waved through. `aggregate <run-root> critic-log` derives the shared critic log.
 
 ### Backend and specification verifier
 
