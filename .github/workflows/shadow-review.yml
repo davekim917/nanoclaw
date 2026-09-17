@@ -292,13 +292,19 @@ jobs:
           # is short, reviewed, and read at the base sha) as the real defence
           # and this check as a backstop for the no-partner case only.
           #
-          # What it does refuse is legitimate TypeScript, all fail-CLOSED:
-          # a one-line `/* … https://… */` or a docblock whose LAST line holds
-          # the URL (the `//` eats that line's `*/`; a `//` AFTER the `*/`, or
-          # a URL on a middle line, is fine), and a trailing glob like
-          # `'**/*.ts'` with no later `*/`. The message names the delimiter
-          # and the fix, because "unbalanced" alone sends the reader looking
-          # for a broken comment when the cause is a URL or a glob.
+          # What it does refuse is legitimate TypeScript, and the same "only
+          # when no later `*/` exists to pair with" applies to every case —
+          # these are orphans like any other, not a separate category:
+          #   - a one-line `/* … https://… */`, or a docblock whose LAST line
+          #     holds the URL, since the `//` eats that line's `*/`. A `//`
+          #     AFTER the `*/`, or a URL on a middle line, leaves the `*/`
+          #     intact and is always fine.
+          #   - a glob like `'**/*.ts'`.
+          # On THIS roster that means a URL comment or glob is refused only
+          # below the last docblock (line 113); above it, it pairs and takes
+          # step 1's silent path instead. The message names the delimiter and
+          # the fix, because "unbalanced" alone sends the reader looking for a
+          # broken comment when the cause is a URL or a glob.
           if printf '%s' "$flat" | grep -qE '/\*|\*/'; then
             echo "unresolved /* or */ after comment-stripping $ROSTER@$BASE_SHA — refusing to resolve a reviewer from text this step cannot account for." >&2
             echo "Usual cause: a URL or other '//' on the SAME line as a block comment's '*/' (that '//' deletes the '*/'), or an unpaired '/*' or '*/' inside a string literal such as a '**/*.ts' glob." >&2
