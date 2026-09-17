@@ -2891,8 +2891,8 @@ describe('codex-review risk-scoped review requests', () => {
         'blocking_findings 1',
       ],
       [
-        'a JSON block that does not parse and names no head',
-        independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:28:00Z', 'OWNER', '1788568080', '{ not json'),
+        'a JSON block that does not parse but names this head',
+        independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:28:00Z', 'OWNER', '1788568080', `{ not json ${HEAD}`),
         'its JSON block does not parse',
       ],
       [
@@ -3185,6 +3185,64 @@ describe('codex-review risk-scoped review requests', () => {
         });
 
         expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+      });
+    });
+
+    describe('which head a receipt is about, and what clears, is never left to a second parser', () => {
+      const payload = (json: string, createdAt = '2026-09-05T00:40:00Z'): Page =>
+        independentReceipt(HEAD, 'CLEAR', 0, createdAt, 'MEMBER', String(Date.parse(createdAt) / 1000), json);
+
+      it.each([
+        [
+          'a trailing comma, with a nested head ahead of the real one',
+          `{"previous":{"head":"${OLD_HEAD}"},"head":"${HEAD}","verdict":"CHANGES","blocking_findings":1,}`,
+        ],
+        [
+          'a duplicate head key that parses to another head',
+          `{"head":"${HEAD}","verdict":"CHANGES","blocking_findings":1,"head":"${OLD_HEAD}"}`,
+        ],
+        ['no JSON fence content at all beyond the head', `${HEAD} CHANGES`],
+      ])('blocks on an unattributable CHANGES that names this head: %s', (_case, json) => {
+        const root = tempRoot();
+        legacy(root, { comments: [payload(json)] });
+
+        const result = runHelper(root, ['merge-check', '--head', HEAD]);
+        expect(result.status).toBe(24);
+        expect(result.stderr).toContain('independent_receipt_not_clear');
+      });
+
+      it('ignores a payload that does not parse and does not name this head, like a parsed receipt for another head', () => {
+        const root = tempRoot();
+        legacy(root, { comments: [payload(`{"head":"${OLD_HEAD}","verdict":"CHANGES","blocking_findings":1,}`)] });
+
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+      });
+
+      it.each([
+        ['a marker-first CLEAR that does not parse', `{"head":"${HEAD}","verdict":"CLEAR","blocking_findings":0,}`],
+        [
+          'a duplicate verdict key, CLEAR last',
+          `{"head":"${HEAD}","verdict":"CHANGES","verdict":"CLEAR","blocking_findings":0}`,
+        ],
+        [
+          'a verdict key spelled a second way with an escape',
+          `{"head":"${HEAD}","verdict":"CHANGES","\\u0076erdict":"CLEAR","blocking_findings":0}`,
+        ],
+        [
+          'a duplicate blocking_findings key, 0 last',
+          `{"head":"${HEAD}","verdict":"CLEAR","blocking_findings":2,"blocking_findings":0}`,
+        ],
+        ['blocking_findings "0"', `{"head":"${HEAD}","verdict":"CLEAR","blocking_findings":"0"}`],
+        ['blocking_findings null', `{"head":"${HEAD}","verdict":"CLEAR","blocking_findings":null}`],
+        ['blocking_findings absent', `{"head":"${HEAD}","verdict":"CLEAR"}`],
+        ['a lower-case verdict', `{"head":"${HEAD}","verdict":"clear","blocking_findings":0}`],
+      ])('does not clear on %s: the older CHANGES stands, and alone it blocks', (_case, json) => {
+        const root = tempRoot();
+        legacy(root, { comments: [independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z'), payload(json)] });
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(24);
+
+        legacy(root, { comments: [payload(json)] });
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(24);
       });
     });
 

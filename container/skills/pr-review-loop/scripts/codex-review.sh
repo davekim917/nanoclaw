@@ -533,7 +533,6 @@ RECEIPT_MARKER_RE='(^|\n)<!-- pr-review-loop:substitute-receipt head=(?<head>[0-
 # legacy precheck (independent_receipt_state) reads only those three.
 INDEPENDENT_RECEIPT_MARKER_RE='(^|\n)<!-- independent-review-receipt:v1 -->[ \t]*\r?(?=\n|\z)'
 INDEPENDENT_RECEIPT_JSON_RE='\A\s*```json[ \t]*\r?\n(?<json>[\s\S]*?)\n[ \t]*```'
-INDEPENDENT_RECEIPT_HEAD_RE='"head"\s*:\s*"(?<head>[0-9a-f]{40})"'
 # The receipt body's human-readable "who reviewed" line, used to recover the
 # reviewer text for a model-allowlist check — the marker itself carries only
 # head/outcome, never the reviewer, so this is read separately from the body
@@ -1298,10 +1297,17 @@ ci_verdict() {
 # association set for a substitute `approve`, so the risk-scoped path shares
 # this weakness too; it is left as it is here.)
 #
-# A receipt that
-# names another head says nothing about this one. One that names no readable
-# head at all could be about this one, so it counts: a later clear receipt for
-# this head supersedes it, as it would a CHANGES. Substitute receipts are not
+# Which head a receipt is about is not left to a second parser either. A
+# receipt applies to this head when its JSON text names the head's full SHA
+# anywhere at all, or parses with no string `head`; one that does not mention
+# it is about another head and says nothing here. So a payload that does not
+# parse, or parses to another `head` while still naming this one (a nested
+# object, a duplicate key), blocks rather than drops out. Clearing reads only
+# the parsed top-level `head`, `verdict` and `blocking_findings` (the number
+# 0, not "0" or null), and only from a text that spells each of those keys
+# exactly once and holds no backslash: jq keeps the last of duplicate keys,
+# and an escape can spell a key a second way, so neither can turn a CHANGES
+# into a CLEAR. Substitute receipts are not
 # read here, so an approving one, older or newer, never outvotes the desk. A
 # receipt whose database id cannot be ordered makes the answer `unknown`, as
 # in receipt_outcome. Only the legacy precheck calls this, and `audit` never
@@ -1338,7 +1344,7 @@ may_clear() {
 # `clear\t<login>` for a clear newest receipt, so its author can be checked.
 independent_receipt_newest() {
   printf '%s\n' "$1" | jq -rs -L "$HERE" --arg re "$INDEPENDENT_RECEIPT_MARKER_RE" --argjson denied "$3" \
-    --arg jsonRe "$INDEPENDENT_RECEIPT_JSON_RE" --arg headRe "$INDEPENDENT_RECEIPT_HEAD_RE" --arg head "$2" '
+    --arg jsonRe "$INDEPENDENT_RECEIPT_JSON_RE" --arg head "$2" '
     include "receipt-order";
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
@@ -1347,10 +1353,12 @@ independent_receipt_newest() {
       | select(($parts | length) > 1)
       | [ range(1; $parts | length) as $i
           | $parts[$i] as $rest
-          | ([ $rest | capture($jsonRe) | .json | try fromjson catch null | objects ] | first) as $doc
-          | (if $doc != null then ($doc.head // null) else ([ $rest | capture($headRe) ] | first | .head) end) as $named
-          | select(($named | type) != "string" or $named == $head)
-          | { clear: ($doc != null and $doc.head == $head and $doc.verdict == "CLEAR" and $doc.blocking_findings == 0),
+          | (([ $rest | capture($jsonRe) | .json ] | first) // $rest) as $text
+          | ([ $text | try fromjson catch null | objects ] | first) as $doc
+          | select(($text | contains($head)) or ($doc != null and ($doc.head | type) != "string"))
+          | { clear: ($doc != null and $doc.head == $head and $doc.verdict == "CLEAR" and $doc.blocking_findings == 0
+                      and ($text | contains("\\") | not)
+                      and all("head", "verdict", "blocking_findings"; . as $k | [ $text | match("\"\($k)\""; "g") ] | length == 1)),
               said: (if $doc == null then "its JSON block does not parse"
                      else "verdict \($doc.verdict // "missing" | tostring), blocking_findings \($doc.blocking_findings // "missing" | tostring)" end) } ] as $receipts
       | ([ $receipts[] | select(.clear | not) ] | first) as $no
