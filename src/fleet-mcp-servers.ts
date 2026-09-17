@@ -25,7 +25,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from './config.js';
-import { validateMcpServers, type McpServerConfig } from './container-config.js';
+import { validateMcpServerName, validateMcpServers, type McpServerConfig } from './container-config.js';
 
 export const FLEET_MCP_SERVERS_PATH = path.join(DATA_DIR, 'fleet-mcp-servers.json');
 
@@ -109,8 +109,69 @@ export const DEFAULT_FLEET_MCP_SERVERS: Record<string, McpServerConfig> = {
   },
 };
 
+/**
+ * Names the agent-runner deletes from the merged map on every spawn
+ * (`RETIRED_MCP_SERVER_NAMES`, container/agent-runner/src/retired-mcp-servers.ts:13,
+ * applied at container/agent-runner/src/index.ts:257). A fleet entry under one
+ * of these would be dead config, and a capability entry for one would promise
+ * the agent a tool that cannot exist — so the file refuses the name and the
+ * capability snapshot skips it. `src/fleet-mcp-servers.test.ts` fails if this
+ * set and the container's drift apart; a group's own stale container.json
+ * entry is NOT refused here, because the runner still logs and drops it, which
+ * is the operator's cue to clean the file.
+ */
+export const RETIRED_MCP_SERVER_NAMES: ReadonlySet<string> = new Set(['slack-user-token']);
+
 function fail(message: string): never {
   throw new Error(`Invalid fleet MCP defaults at ${FLEET_MCP_SERVERS_PATH}: ${message}`);
+}
+
+/**
+ * Shape-check one stored entry.
+ *
+ * `validateMcpServers` only refuses SSE and strips a provenance-less `cwd`
+ * (src/container-config.ts:573-589), so it would pass `null` or an `http`
+ * entry with no `url` straight through to a container and to the capability
+ * snapshot. Everything written through `ncl groups config add-mcp-server` has
+ * already been through the full intake (`parseMcpServerConfig`); this is the
+ * floor for a file someone edited by hand, and it deliberately does NOT
+ * normalize — adding a default `args`/`env` here would silently change what an
+ * existing entry sends to its container.
+ */
+function validateFleetEntry(name: string, entry: McpServerConfig): void {
+  try {
+    validateMcpServerName(name);
+  } catch (error) {
+    fail(`server name ${JSON.stringify(name)}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (RETIRED_MCP_SERVER_NAMES.has(name)) {
+    fail(`server ${JSON.stringify(name)} is retired and is dropped by the agent-runner on every spawn`);
+  }
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) fail(`server ${name} must be an object`);
+  const server = entry as unknown as Record<string, unknown>;
+  const hasUrl = typeof server.url === 'string' && server.url.trim() !== '';
+  const hasCommand = typeof server.command === 'string' && server.command.trim() !== '';
+  if (hasUrl === hasCommand) fail(`server ${name} needs exactly one of url (remote) or command (stdio)`);
+  if (server.type !== undefined && server.type !== 'stdio' && server.type !== 'http') {
+    fail(`server ${name} has unsupported transport ${JSON.stringify(server.type)}`);
+  }
+  if (hasUrl) {
+    if (server.type === 'stdio') fail(`server ${name} declares type "stdio" with a url`);
+    let parsed: URL;
+    try {
+      parsed = new URL(server.url as string);
+    } catch (error) {
+      fail(`server ${name} url is not a valid URL: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    // Mirrors `parseMcpServerConfig` (src/container-config.ts:466-472): HTTPS,
+    // or plain HTTP only for a loopback host the gateway never sees.
+    const loopback = ['localhost', '127.0.0.1', '[::1]', 'host.docker.internal'].includes(parsed.hostname);
+    if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && loopback)) {
+      fail(`server ${name} url must use HTTPS (plain HTTP only for localhost and host.docker.internal)`);
+    }
+  } else if (server.type === 'http') {
+    fail(`server ${name} declares type "http" with no url`);
+  }
 }
 
 function parseFile(contents: string): Record<string, McpServerConfig> {
@@ -131,8 +192,11 @@ function parseFile(contents: string): Record<string, McpServerConfig> {
     fail('mcpServers must be an object keyed by server name');
   }
   // Same validator the per-group file goes through, so an SSE entry or a
-  // provenance-less `cwd` is refused/stripped identically in both places.
-  return validateMcpServers(servers as Record<string, McpServerConfig>);
+  // provenance-less `cwd` is refused/stripped identically in both places —
+  // then the per-entry floor it does not cover.
+  const validated = validateMcpServers(servers as Record<string, McpServerConfig>);
+  for (const [name, entry] of Object.entries(validated)) validateFleetEntry(name, entry);
+  return validated;
 }
 
 /**
@@ -159,7 +223,9 @@ export function updateFleetMcpServers(
 ): Record<string, McpServerConfig> {
   const servers = readFleetMcpServers();
   mutate(servers);
-  const file: FleetMcpServersFile = { version: 1, mcpServers: validateMcpServers(servers) };
+  const validated = validateMcpServers(servers);
+  for (const [name, entry] of Object.entries(validated)) validateFleetEntry(name, entry);
+  const file: FleetMcpServersFile = { version: 1, mcpServers: validated };
   fs.mkdirSync(path.dirname(FLEET_MCP_SERVERS_PATH), { recursive: true });
   const tmp = `${FLEET_MCP_SERVERS_PATH}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(file, null, 2) + '\n');

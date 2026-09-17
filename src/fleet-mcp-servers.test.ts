@@ -14,6 +14,7 @@ vi.mock('./config.js', async (importOriginal) => ({
 
 import {
   DEFAULT_FLEET_MCP_SERVERS,
+  RETIRED_MCP_SERVER_NAMES,
   FLEET_MCP_SERVERS_PATH,
   effectiveMcpServers,
   readFleetMcpServers,
@@ -90,6 +91,63 @@ describe('the fleet file', () => {
       JSON.stringify({ version: 1, mcpServers: { legacy: { type: 'sse', url: 'https://x.test/sse' } } }),
     );
     expect(() => readFleetMcpServers()).toThrow(/SSE/);
+  });
+});
+
+describe('entry validation', () => {
+  const write = (servers: Record<string, unknown>): void =>
+    fs.writeFileSync(FLEET_MCP_SERVERS_PATH, JSON.stringify({ version: 1, mcpServers: servers }));
+
+  it('refuses a null entry rather than crashing the capability snapshot', () => {
+    write({ oops: null });
+    expect(() => readFleetMcpServers()).toThrow(/must be an object/);
+  });
+
+  it('refuses an entry with neither url nor command, and one with both', () => {
+    write({ half: { type: 'http' } });
+    expect(() => readFleetMcpServers()).toThrow(/exactly one of url/);
+
+    write({ both: { url: 'https://x.test/mcp', command: 'bun' } });
+    expect(() => readFleetMcpServers()).toThrow(/exactly one of url/);
+  });
+
+  it('refuses a cleartext or malformed url', () => {
+    write({ plain: { type: 'http', url: 'http://mcp.example.test/mcp' } });
+    expect(() => readFleetMcpServers()).toThrow(/must use HTTPS/);
+
+    write({ broken: { type: 'http', url: 'not-a-url' } });
+    expect(() => readFleetMcpServers()).toThrow(/not a valid URL/);
+
+    // Loopback over plain HTTP is allowed, exactly as the per-group intake
+    // allows it — the gateway never sees that request.
+    write({ local: { type: 'http', url: 'http://127.0.0.1:8080/mcp' } });
+    expect(readFleetMcpServers().local).toBeDefined();
+  });
+
+  it('refuses a reserved or malformed server name', () => {
+    write({ nanoclaw: { type: 'http', url: 'https://x.test/mcp' } });
+    expect(() => readFleetMcpServers()).toThrow(/reserved/);
+
+    write({ 'bad name': { type: 'http', url: 'https://x.test/mcp' } });
+    expect(() => readFleetMcpServers()).toThrow(/letters, digits/);
+  });
+
+  it('refuses a retired name the runner would delete anyway', () => {
+    write({ 'slack-user-token': { type: 'http', url: 'https://slack.test/mcp' } });
+    expect(() => readFleetMcpServers()).toThrow(/retired/);
+    expect(() =>
+      updateFleetMcpServers((s) => (s['slack-user-token'] = { type: 'http', url: 'https://x.test/mcp' })),
+    ).toThrow(/retired/);
+  });
+
+  it('holds the same retired set as the runner', () => {
+    // Two copies of one fact across the host/container boundary (no shared
+    // modules). This fails the moment they disagree.
+    const source = fs.readFileSync('container/agent-runner/src/retired-mcp-servers.ts', 'utf-8');
+    const literal = source.match(/RETIRED_MCP_SERVER_NAMES[^=]*=\s*new Set\(\[([^\]]*)\]\)/);
+    expect(literal, 'runner retired-set literal').not.toBeNull();
+    const runnerNames = [...literal![1].matchAll(/'([^']+)'/g)].map((m) => m[1]).sort();
+    expect([...RETIRED_MCP_SERVER_NAMES].sort()).toEqual(runnerNames);
   });
 });
 

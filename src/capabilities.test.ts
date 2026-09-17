@@ -442,6 +442,33 @@ describe('buildSessionServicesSnapshot', () => {
     expect(plainly?.useFor).toContain('mcp__plainly__*');
   });
 
+  it('never advertises a retired server, or trips over a malformed one', async () => {
+    insertWorkgroup('stale', []);
+    const ag = group('ag-stale', 'stale');
+    await createGroupInWorkgroup(ag, 'stale');
+    writeContainerConfig(ag.folder, {
+      mcpServers: {
+        // The documented stale entry: the runner deletes it from the merged
+        // map on every spawn, so a capability line for it would be a promise
+        // of a tool that cannot exist.
+        'slack-user-token': { type: 'http', url: 'https://slack.test/mcp' },
+        broken: null as never,
+      },
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+      tools: [],
+    });
+
+    const names = (await buildSessionServicesSnapshot(ag.id)).services.map((service) => service.name);
+
+    expect(names).not.toContain('Slack-user-token');
+    expect(names.some((n) => /slack-user-token/i.test(n))).toBe(false);
+    expect(names).not.toContain('Broken');
+    // The rest of the snapshot still builds.
+    expect(names).toContain('Littlebird');
+  });
+
   it('keeps the migrated universal text verbatim and never doubles an entry', async () => {
     insertWorkgroup('universal', []);
     const ag = group('ag-universal', 'universal');

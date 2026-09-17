@@ -24,7 +24,7 @@ import { withCentralSync, withRawDb } from './db/central-lease.js';
 import { GROUPS_DIR } from './config.js';
 import { getRegisteredChannelNames } from './channels/channel-registry.js';
 import { readContainerConfig, type McpServerConfig } from './container-config.js';
-import { effectiveMcpServers } from './fleet-mcp-servers.js';
+import { RETIRED_MCP_SERVER_NAMES, effectiveMcpServers } from './fleet-mcp-servers.js';
 import { getAllAgentGroups, getAgentGroup, getWorkgroupOnecliSecrets } from './db/agent-groups.js';
 import type { AgentGroup } from './types.js';
 import { mergeWorkgroupAndGroupSecrets, slackUserTokenSecrets } from './onecli-secrets.js';
@@ -856,6 +856,20 @@ export function buildSessionServicesSnapshotFrom(
   );
   for (const [name, server] of Object.entries(effectiveMcpServers(cfg))) {
     if (describedMcpServers.has(name)) continue;
+    // A retired name still sitting in some group's container.json is deleted
+    // from the merged map by the runner on every spawn
+    // (container/agent-runner/src/retired-mcp-servers.ts:13, applied at
+    // container/agent-runner/src/index.ts:257), so advertising it would
+    // promise a tool that cannot exist — the exact failure docs/slack-user-token.md
+    // documents. The entry stays in the spawn payload, where the runner logs
+    // the drop for the operator; it just never reaches the agent's capability
+    // list.
+    if (RETIRED_MCP_SERVER_NAMES.has(name)) continue;
+    // A hand-edited container.json can hold a malformed entry: the group file's
+    // `validateMcpServers` refuses only SSE (src/container-config.ts:573-589),
+    // so `null` reaches here. One bad entry must not cost the whole snapshot —
+    // an agent with no capability list is the worse failure by far.
+    if (server === null || typeof server !== 'object') continue;
     services.push({
       name: server.displayName ?? name.charAt(0).toUpperCase() + name.slice(1),
       mcpNamespace: `mcp__${name}__*`,
