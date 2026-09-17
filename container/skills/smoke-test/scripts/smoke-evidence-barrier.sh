@@ -515,9 +515,25 @@ done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 # disposition for every frozen unmapped path. COMPLETENESS ONLY, the same
 # bargain as confirmedFindings: a disposition's presence proves bookkeeping,
 # and whether it is TRUE is the challenger's question. A run with no pinned
-# selection is unaffected; an unreadable answer fails closed.
-if [ -e "$RUN_DIR/journeys/selection.json" ]; then
-  journeys_result="$(python3 "$SCRIPT_DIR/smoke-journeys.py" barrier "$RUN_DIR" 2>/dev/null)" || journeys_result=""
+#
+# WHETHER a run owes this is the gate's decision, never the run's bookkeeping:
+# if the PR gate pinned a selection for this campaign (smoke-journeys.py match
+# --pin writes <gate-state>/journeys/pin-pr-<n>-<claimed sha>.json, and a
+# pr-owned contract's sourceSha IS that claimed sha — require_fenced_source_sha,
+# smoke-run-scaffold.sh:304), the run must hold those exact bytes. Skipping
+# pin-run is therefore a refusal, not an exit from every check below. Same
+# state-dir resolution as the scaffold's fence. No catalogue means no pin, and
+# a run with neither a pin nor a selection is untouched; an unreadable answer
+# fails closed.
+JOURNEY_PIN_ARGS=()
+if [ "$(jq -r '.ownershipKind' "$CONTRACT")" = pr ]; then
+  while IFS= read -r gate_pin; do
+    JOURNEY_PIN_ARGS+=(--gate-pin "$gate_pin")
+  done < <(compgen -G "${SMOKE_GATE_STATE_DIR:-/workspace/agent/smoke-gate}/journeys/pin-pr-*-$SOURCE_SHA.json" || true)
+fi
+if [ -e "$RUN_DIR/journeys/selection.json" ] || [ "${#JOURNEY_PIN_ARGS[@]}" -gt 0 ]; then
+  journeys_result="$(python3 "$SCRIPT_DIR/smoke-journeys.py" barrier "$RUN_DIR" \
+    ${JOURNEY_PIN_ARGS[@]+"${JOURNEY_PIN_ARGS[@]}"} 2>/dev/null)" || journeys_result=""
   if ! jq -e '(.missing | type == "array") and (.invalid | type == "array") and (.invalidReasons | type == "array")' \
        <<<"$journeys_result" >/dev/null 2>&1; then
     INVALID+=("journeys/selection.json")

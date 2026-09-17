@@ -209,6 +209,43 @@ python3 "$TOOL" pin-run "$RUN" "$NATIVE_PIN" >/dev/null
 marker branch-scope-crossing blocked '[]'; marker mobile-scan-return blocked '[]'
 expect 5-api-laundering 'any(.invalidReasons[]; test("scaffolded --evidence api but its journey declares evidence native-manual"))' "$(barrier)"
 
+# --- 5b. enforcement follows the GATE's pin, not the run's bookkeeping ---------
+# A pr-owned run whose campaign the gate pinned cannot escape by skipping
+# pin-run, nor by adopting a narrowed or stale selection.
+GATE_STATE="$WORK/gate-state"
+GATE_PIN="$(jq -r '.pinFile' <<<"$(match "$GATE_STATE" "pr-7-$SHA" '["api/src/reports/export.ts","web/src/desk/a.tsx"]' --pin)")"
+pr_run() { # lanes as new_run, but claimed by a PR campaign on $SHA
+  new_run "$1"
+  jq '.ownershipKind = "pr" | .coordinatorOwnerToken = "owner-1"' "$RUN/completion-contract.json" > "$RUN/c.tmp"
+  mv "$RUN/c.tmp" "$RUN/completion-contract.json"
+}
+gate_barrier() { SMOKE_GATE_STATE_DIR="$GATE_STATE" bash "$BARRIER" "$RUN" lanes || true; }
+pr_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
+NO_PIN_OUT="$(SMOKE_GATE_STATE_DIR="$WORK/empty-state" bash "$BARRIER" "$RUN" lanes)"
+[ "$NO_PIN_OUT" = '{"ready":true,"phase":"lanes","sourceSha":"'"$SHA"'","missing":[],"invalid":[],"invalidReasons":[]}' ] ||
+  fail "5b: no gate pin changed the barrier's output: $NO_PIN_OUT"
+expect 5b-skipped-pin-run '.ready == false and (.invalid | index("journeys/selection.json")) and
+  any(.invalidReasons[]; test("never adopted it") and test("pin-run"))' "$(gate_barrier)"
+# A different head SHA's pin, or a develop-owned run, is not this campaign's.
+match "$WORK/other-state" "pr-7-$(printf 'b%.0s' $(seq 40))" '["web/src/desk/a.tsx"]' --pin >/dev/null
+expect 5b-other-head '.ready == true' "$(SMOKE_GATE_STATE_DIR="$WORK/other-state" bash "$BARRIER" "$RUN" lanes)"
+# Adopting a doctored copy (unmapped path dropped) is refused by bytes...
+mkdir -p "$RUN/journeys"; jq -c '.unmappedPaths = []' "$GATE_PIN" > "$RUN/journeys/selection.json"
+cp "$EXAMPLE" "$RUN/journeys/catalogue.json"
+expect 5b-narrowed-copy '.ready == false and any(.invalidReasons[]; test("does not match the gate.s pin"))' "$(gate_barrier)"
+# ...and so is a selection pinned from another catalogue version (sha mismatch).
+jq -c '.catalogueSha256 = "0000"' "$GATE_PIN" > "$RUN/journeys/selection.json"
+expect 5b-sha-mismatch 'any(.invalidReasons[]; test("catalogueSha256 run=0000 gate=[0-9a-f]{64}"))' "$(gate_barrier)"
+# The real thing: pin-run, lanes, disposition => ready.
+pr_run '[{"id":"loan-desk-checkout","kind":"lane"}]'; marker loan-desk-checkout blocked '[]'
+python3 "$TOOL" pin-run "$RUN" "$GATE_PIN" >/dev/null
+disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
+expect 5b-adopted '.ready == true' "$(gate_barrier)"
+# An unreadable gate pin fails closed.
+chmod 000 "$GATE_PIN"
+if [ "$(id -u)" != 0 ]; then expect 5b-unreadable-pin '.ready == false' "$(gate_barrier)"; fi
+chmod 644 "$GATE_PIN"
+
 # --- 6. capture recipes --------------------------------------------------------
 new_run '[{"id":"loan-desk-checkout","kind":"lane"}]'
 python3 "$TOOL" pin-run "$RUN" "$PIN_FILE" >/dev/null

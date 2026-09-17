@@ -606,12 +606,13 @@ and fixtures, the journey's steps and expected result, what to capture, the
 gates. Issuing a packet is `completed`, never `pass`; `pass` needs the tester's
 recorded result under `<run-dir>/manual-results/`, filed against the journey id.
 
-`smoke-evidence-barrier.sh` enforces the **completeness** of all this — a lane
-per matched journey, a valid disposition per frozen path, the run's catalogue
-still hashing to its pin — and nothing about its truth. **Substance is the
-challenger's**: it `cmp`s `journeys/selection.json` against the gate's pin file,
-reviews every exclusion and every backend/data scope disposition, and samples
-the positive matches — a broad glob hides an omission as well as "no consumer".
+`smoke-evidence-barrier.sh` enforces the **completeness** of all this — the
+gate's pin held byte-for-byte by the run (skipping `pin-run` is a refusal, not
+a way out), a lane per matched journey, a valid disposition per frozen path,
+the run's catalogue still hashing to its pin — and nothing about its truth.
+**Substance is the challenger's**: it reviews every exclusion and every
+backend/data scope disposition, and samples the positive matches — a broad glob
+hides an omission as well as "no consumer".
 
 **Maintenance is reviewed, not append-only**: journeys are corrected, replaced
 and retired, with history in git. A first successful walk *qualifies* a new

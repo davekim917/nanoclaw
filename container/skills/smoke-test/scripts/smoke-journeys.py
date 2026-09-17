@@ -14,7 +14,7 @@ wakes, WHICH journeys a change selects and which changed paths nothing claims.
   floor-due <catalogue> <run-root> [--size ...] [--as-of <iso>]
   pin-run   <run-dir> <gate-pin-file>
   shots     <run-dir>
-  barrier   <run-dir>
+  barrier   <run-dir> [--gate-pin <file>]...
   publish   <catalogue> <proposed> --expect-sha256 <hex|absent> --lock <file>
             [--floor-authority <citation>]
 
@@ -439,6 +439,7 @@ def cmd_pin_run(args):
     base, selection_path, catalogue_path = _run_paths(args.run_dir)
     if not os.path.isdir(args.run_dir):
         emit({"ok": False, "error": "run dir does not exist"}, 2)
+    pin_raw, selection = b"", None
     try:
         with open(args.pin_file, "rb") as fh:
             pin_raw = fh.read()
@@ -449,6 +450,7 @@ def cmd_pin_run(args):
         emit({"ok": False, "error": "not a pinned selection -- pass the pinFile path from the wake payload, not a copy of its contents"}, 1)
     snapshot_raw = None
     if selection.get("catalogueSnapshot"):
+        snapshot_raw = b""
         try:
             with open(selection["catalogueSnapshot"], "rb") as fh:
                 snapshot_raw = fh.read()
@@ -512,15 +514,44 @@ def cmd_barrier(args):
     run_dir = args.run_dir
     _, selection_path, catalogue_path = _run_paths(run_dir)
     missing, invalid, reasons = [], [], []
-    if not os.path.exists(selection_path):
-        emit({"applies": False, "missing": [], "invalid": [], "invalidReasons": []})
+    sel_rel, cat_rel, disp_rel = "journeys/selection.json", "journeys/catalogue.json", "journeys/scope-dispositions.json"
 
     def bad(rel, why):
         if rel not in invalid:
             invalid.append(rel)
         reasons.append("{}: {}".format(rel, why))
 
-    sel_rel, cat_rel, disp_rel = "journeys/selection.json", "journeys/catalogue.json", "journeys/scope-dispositions.json"
+    # Whether this run owes a journey selection is the GATE's decision, not the
+    # run's bookkeeping: a pin the gate wrote for this campaign must be in the
+    # run byte-for-byte, so skipping pin-run (or pinning a narrowed copy) is a
+    # refusal rather than a way out of every check below.
+    gate_pins = []
+    for pin_path in args.gate_pin:
+        try:
+            with open(pin_path, "rb") as fh:
+                gate_pins.append((pin_path, fh.read()))
+        except OSError:
+            gate_pins.append((pin_path, None))
+    if gate_pins:
+        try:
+            with open(selection_path, "rb") as fh:
+                run_raw = fh.read()
+        except OSError:
+            run_raw = None
+        if run_raw is None:
+            bad(sel_rel, "the gate pinned a journey selection for this campaign but the run never adopted it -- run `smoke-journeys.py pin-run {} {}`, then scaffold a lane per matched journey".format(run_dir, gate_pins[0][0]))
+        elif not any(raw == run_raw for _, raw in gate_pins):
+            gate = _read_json(gate_pins[0][0])
+            run = _read_json(selection_path)
+            bad(sel_rel, "does not match the gate's pin {} (catalogueSha256 run={} gate={}) -- a run's journey contract is the gate's, byte for byte; re-run pin-run in a clean run dir".format(
+                gate_pins[0][0],
+                run.get("catalogueSha256") if isinstance(run, dict) else "unreadable",
+                gate.get("catalogueSha256") if isinstance(gate, dict) else "unreadable"))
+        if invalid:
+            emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
+    if not os.path.exists(selection_path):
+        emit({"applies": False, "missing": [], "invalid": [], "invalidReasons": []})
+
     selection = _read_json(selection_path)
     if not isinstance(selection, dict) or not isinstance(selection.get("matchedJourneys"), list) \
             or not isinstance(selection.get("unmappedPaths"), list):
@@ -691,9 +722,12 @@ def main():
     p.add_argument("run_dir")
     p.add_argument("pin_file")
 
-    for name in ("shots", "barrier"):
-        p = sub.add_parser(name)
-        p.add_argument("run_dir")
+    p = sub.add_parser("shots")
+    p.add_argument("run_dir")
+
+    p = sub.add_parser("barrier")
+    p.add_argument("run_dir")
+    p.add_argument("--gate-pin", action="append", default=[])
 
     p = sub.add_parser("publish")
     p.add_argument("catalogue")
