@@ -3697,6 +3697,21 @@ jq -e '.ok == false and (.error | test("different deploy SHA"))' <<<"$OUT" >/dev
 rm -f "$ADOPT_TASK_BINDING"
 OUT="$(task_scaffold_as owner-b adopt "$ADOPT_TASK_ROOT/run-adopt-task-terminal" "$CROSS_SHA_A" 2>&1 || true)"
 jq -e '.ok == false and (.error | test("missing or malformed"))' <<<"$OUT" >/dev/null
+# Parseable but malformed by the gate's own validator (read_task_binding):
+# adopt must fail closed on exactly the records the lifecycle verbs refuse.
+for BAD_BINDING in 'del(.boundAt)' '.boundAt="2026-02-30T00:00:00Z"' '.boundAt="yesterday"' \
+    '.terminal={}' '.terminal={"verdict":"GO"}' \
+    '.terminal={"verdict":"MAYBE","completedAt":"2026-09-17T00:00:00Z","verdictDigest":"'"$(sha c)$(sha c | cut -c1-24)"'"}' \
+    '.terminal={"verdict":"GO","completedAt":"2026-13-01T00:00:00Z","verdictDigest":"'"$(sha c)$(sha c | cut -c1-24)"'"}' \
+    '.schemaVersion=2' 'del(.terminal) | .kind="task"'; do
+  jq -c "$BAD_BINDING" <<<"$ADOPT_TASK_BINDING_BEFORE" > "$ADOPT_TASK_BINDING"
+  task_gate task-progress run-adopt-task-terminal owner-b 2>/dev/null | jq -e '.ok == false' >/dev/null || {
+    echo "fixture is not malformed to the gate itself: $BAD_BINDING" >&2; exit 1; }
+  OUT="$(task_scaffold_as owner-b adopt "$ADOPT_TASK_ROOT/run-adopt-task-terminal" "$CROSS_SHA_A" 2>&1 || true)"
+  jq -e '.ok == false and (.error | test("missing or malformed"))' <<<"$OUT" >/dev/null || {
+    echo "adopt accepted a malformed shared task binding: $BAD_BINDING" >&2; exit 1; }
+  [ "$(sha256sum "$ADOPT_TASK_ROOT/run-adopt-task-terminal/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_TASK_CONTRACT_HASH" ]
+done
 printf '%s\n' "$ADOPT_TASK_BINDING_BEFORE" > "$ADOPT_TASK_BINDING"
 # The crash cut: terminal binding committed, lease and private slot not cleared.
 if SMOKE_GATE_TEST_TASK_FINISH_EXIT_AFTER=binding \

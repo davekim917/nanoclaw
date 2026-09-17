@@ -671,11 +671,31 @@ adopt)
   # or malformed record: every current task-claim writes one.
   if [ "$FENCED_STATE_KIND" = task ]; then
     TASK_BINDING_FILE="$LEASE_DIR/task-binding-$(basename "$RUN_DIR").json"
-    jq -e --arg run "$(basename "$RUN_DIR")" '
-      type == "object" and .schemaVersion == 1 and .kind == "task-binding" and .runId == $run and
-      (.deploySha | type == "string" and test("^[0-9a-f]{40}$")) and has("terminal") and
-      (.terminal == null or (.terminal | type) == "object")' "$TASK_BINDING_FILE" >/dev/null 2>&1 ||
+    # SOURCE OF TRUTH: read_task_binding in smoke-pr-gate.sh:631-663 — the jq
+    # predicate at :638-650 and the calendar round-trip of boundAt and
+    # terminal.completedAt at :654-661. Duplicated verbatim because the gate
+    # is an executable, not a sourceable library; keep the two in step. A
+    # looser check here would adopt a contract onto a binding every gate
+    # lifecycle verb then refuses as malformed.
+    TASK_BINDING="$(jq -ce --arg run "$(basename "$RUN_DIR")" '
+      def iso: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
+      def terminal_ok:
+        . == null or
+        (type == "object" and
+         (.verdict == "GO" or .verdict == "NO_GO" or .verdict == "HUMAN_DECISION" or .verdict == "BLOCKED") and
+         (.completedAt | iso) and
+         (.verdictDigest | type == "string" and test("^[0-9a-f]{64}$")));
+      select(type == "object" and .schemaVersion == 1 and .kind == "task-binding" and
+             .runId == $run and
+             (.deploySha | type == "string" and test("^[0-9a-f]{40}$")) and
+             (.boundAt | iso) and
+             (.terminal | terminal_ok))
+    ' "$TASK_BINDING_FILE" 2>/dev/null)" ||
       die "shared task binding is missing or malformed — this run's lifetime identity cannot be verified, refusing adoption"
+    for _stamp in "$(jq -r '.boundAt' <<<"$TASK_BINDING")" "$(jq -r '.terminal.completedAt // empty' <<<"$TASK_BINDING")"; do
+      [ -z "$_stamp" ] || valid_utc_timestamp "$_stamp" ||
+        die "shared task binding is missing or malformed — this run's lifetime identity cannot be verified, refusing adoption"
+    done
     [ "$(jq -r '.deploySha' "$TASK_BINDING_FILE")" = "$SOURCE_SHA" ] ||
       die "shared task binding names a different deploy SHA — refusing adoption"
     [ "$(jq -r '.terminal == null' "$TASK_BINDING_FILE")" = true ] ||
