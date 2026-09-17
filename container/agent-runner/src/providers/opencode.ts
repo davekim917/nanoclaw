@@ -474,14 +474,17 @@ const STALE_SESSION_RE = new RegExp(
  * `codex exec` — see secret-env.ts's header for the model.
  *
  * CONSEQUENCE, stated rather than hidden: an OpenCode session whose model is
- * `anthropic/*` no longer has those vars removed from the server env, and
- * buildOpenCodeConfig does not inject a placeholder apiKey for the `anthropic`
- * provider (opencode.ts:856), so such a model can resolve the container's own
- * Anthropic credential from env rather than from auth.json. Every other
- * provider (opencode/opencode-go/nvidia via auth.json, deepseek/openrouter via
- * the OneCLI proxy placeholder) is unaffected — their credentials were never in
- * this list. We keep OPENCODE_CONFIG_CONTENT and all non-secret vars (PATH,
- * HOME, NANOCLAW_*, OPENCODE_*) intact.
+ * `anthropic/*` now sees those vars in its server env. It still FAILS CLOSED
+ * unless auth.json carries an anthropic record (buildOpenCodeConfig throws
+ * otherwise), so env alone cannot run such a model. When both an auth.json
+ * record and an env credential exist, which one OpenCode prefers is UNVERIFIED
+ * against the pinned binary — the only env value that would matter there is an
+ * ANTHROPIC_API_KEY (OneCLI's `placeholder`, or a real key under
+ * ANTHROPIC_BASE_URL). Every other provider (opencode/opencode-go/nvidia via
+ * auth.json, deepseek/openrouter via the OneCLI proxy placeholder) is
+ * unaffected — their credentials were never in this list. We keep
+ * OPENCODE_CONFIG_CONTENT and all non-secret vars (PATH, HOME, NANOCLAW_*,
+ * OPENCODE_*) intact.
  *
  * Pure + exported so it can be unit-tested without actually spawning a process.
  */
@@ -522,10 +525,8 @@ function spawnOpencodeServer(
     // provider already passes input.cwd; this brings OpenCode to parity.
     // Caller falls back to process.cwd() if input.cwd was undefined.
     const proc = spawn('opencode', ['serve', `--hostname=${hostname}`, `--port=${port}`], {
-      // Auth secrets (ANTHROPIC_API_KEY*, CLAUDE_CODE_OAUTH_TOKEN*, GMAIL_*) are
-      // stripped from the child env here — OpenCode auths via auth.json/XDG, not
-      // process.env, so they're never needed and an unguarded `bash` tool would
-      // otherwise be able to printenv them. See buildOpencodeServerEnv.
+      // Child env: see buildOpencodeServerEnv for what is (and is no longer)
+      // stripped.
       env: buildOpencodeServerEnv(process.env, config),
       cwd: cwd ?? process.cwd(),
     });
@@ -794,7 +795,7 @@ export function buildOpenCodeConfig(
   if (provider === 'anthropic' && !authProviders.includes('anthropic')) {
     throw new Error(
       `OpenCode model ${model ?? '<unset>'} requires a valid top-level anthropic record in ` +
-        `/opencode-xdg/opencode/auth.json; environment credentials are intentionally unavailable.`,
+        `/opencode-xdg/opencode/auth.json; an env credential alone does not enable this provider.`,
     );
   }
   const enabledProviders =
@@ -851,9 +852,9 @@ export function buildOpenCodeConfig(
   // opencode → /zen/v1, nvidia → NVIDIA), so no manual override is needed.
   const sdkOptions: Record<string, unknown> = {};
   // Anthropic credentials are never synthesized here: an `anthropic/*` model
-  // resolves its own credential (auth.json, or the container's env — see
-  // buildOpencodeServerEnv), and a placeholder would clobber it. The per-model
-  // block is independent, though — it carries the effective model's effort options.
+  // requires an auth.json record (checked above) and a placeholder would
+  // clobber it. The per-model block is independent, though — it carries the
+  // effective model's effort options.
   if (provider !== 'anthropic' && !opencodeAuthHasCredential(provider)) sdkOptions.apiKey = 'placeholder';
 
   const providerConfig = {

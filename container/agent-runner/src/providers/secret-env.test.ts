@@ -12,8 +12,9 @@ describe('secret-env', () => {
   //
   // MUTATION CHECK: re-adding any ANTHROPIC_API_KEY* / CLAUDE_CODE_OAUTH_TOKEN*
   // name to MCP_HEADER_ONLY_SECRET_VARS fails the exact-equality assertion here
-  // AND the "credentials survive" assertions in claude.guards.test.ts,
-  // opencode.failClosed.test.ts and task-script's env test.
+  // AND the "credentials survive" assertions in opencode.failClosed.test.ts and
+  // task-script's env test (the Bash rewrite hook never reads this list, so
+  // claude.guards.test.ts is unaffected by that mutation).
   it('test_header_only_list_is_exactly_the_mcp_headers', () => {
     expect([...MCP_HEADER_ONLY_SECRET_VARS]).toEqual(['GRANOLA_ACCESS_TOKEN', 'EXA_API_KEY', 'BRAINTRUST_API_KEY']);
 

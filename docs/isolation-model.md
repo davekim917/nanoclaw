@@ -9,14 +9,7 @@ one workgroup reads and edits the same canonical Markdown tree at
 surfaces; they are not memory stores. Use different workgroups whenever memory
 or archived conversation must not cross between agents.
 
-Credentials have a third boundary, and it is the agent group, not the bash
-environment. Each group's container carries only its own credential ring, and an
-agent's shell inherits it — so `claude -p`, `codex exec` and `opencode run` all
-work headless inside a session, under the identity that session already runs as.
-Isolating one group's credentials from another's therefore means a separate
-agent group with its own container config and OneCLI secret assignment, never a
-shell-level restriction inside a shared one. See
-[agent-runner-details.md](agent-runner-details.md#credentials-in-container-shells).
+Credentials are scoped by agent group, not by shell: a group's container carries only its own ring, and its shell inherits it (`container/agent-runner/src/providers/secret-env.ts`).
 
 ## The Three Levels
 

@@ -33,9 +33,11 @@
  * to drive a headless Claude.
  *
  * GMAIL_OAUTH_PATH / GMAIL_CREDENTIALS_PATH went with them, for a different
- * reason: nothing in `src/` or `container/` sets either one. The only mention
- * left is an illustrative `channels/gmail.ts` snippet in docs/architecture.md:657,
- * and trunk ships no channel adapter. They were two names that could never match.
+ * reason: nothing in `src/` or `container/` sets either one in the container
+ * env. `.claude/skills/add-gmail-tool/SKILL.md:177` sets both — on the gmail MCP
+ * server's OWN env, not the container's — so the old unset never matched them,
+ * and their values are file paths, not secrets. Two names that could never
+ * match.
  *
  * Still stripped: MCP_HEADER_ONLY_SECRET_VARS below — credentials a shell
  * genuinely never needs, because they are registration-time HTTP headers.

@@ -1020,9 +1020,7 @@ export function createSubagentQuotaHook(options: {
   };
 }
 
-// The credential model for container shells — why Bash subprocesses keep the
-// Anthropic credential, and what IS still stripped from child envs — lives in
-// secret-env.ts, an SDK-free module sibling adapters can import.
+// Credential model for container shells: secret-env.ts (SDK-free).
 
 // `codex exec` reads stdin IN ADDITION to the prompt arg — codex's own help:
 // "If stdin is piped and a prompt is also provided, stdin is appended as a
@@ -1087,13 +1085,8 @@ export function wrapJestSerialized(command: string): string {
 
 /**
  * Rewrites a Bash command before it runs: `/dev/null` stdin for `codex exec`
- * (see CODEX_EXEC_RE above) and the jest serialization lock (wrapJestSerialized).
- *
- * It no longer prepends an `unset <secrets>` prefix. A container's shell
- * inherits the provider credential the container runs on, so `claude -p` works
- * headless in an agent's own session the way `codex exec` and `opencode run`
- * already did — the rationale and the scope-not-env boundary are in
- * secret-env.ts's header.
+ * (CODEX_EXEC_RE) and the jest serialization lock (wrapJestSerialized). No
+ * `unset <secrets>` prefix any more — see secret-env.ts's header.
  */
 export function createBashCommandRewriteHook(): HookCallback {
   return async (input) => {
@@ -1579,13 +1572,8 @@ export function createEmailGateHook(opts?: {
     const command = (pre.tool_input as { command?: string })?.command;
     if (!command) return {};
 
-    // No prefix stripping here any more. createBashCommandRewriteHook used to run
-    // EARLIER in this chain and rewrite the command to
-    // `unset <secret-vars> 2>/dev/null; <original>`, which this gate had to undo
-    // so a legit `--dry-run`/`--help` probe wasn't refused for starting with
-    // `unset` + a `;` metachar (codex #126 F1). That prefix is gone — the hook
-    // now only wraps `codex exec` stdin and jest runs, and neither pattern fires
-    // on an email-send command — so the gate evaluates what the agent wrote.
+    // The rewrite hook no longer prepends an `unset …;` prefix (codex #126 F1
+    // is moot), so the gate evaluates exactly what the agent wrote.
     const evalCommand = command;
 
     // Verdict (allow vs gate + pre-built card) comes from the shared core's
