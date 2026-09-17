@@ -45,6 +45,7 @@ import { getAgentMailbox } from './mailbox/index.js';
 import { sessionContextPath, sessionDir, writeSessionContext } from './session-manager.js';
 import { inboundDbPath } from './mailbox/sqlite/paths.js';
 import { buildContainerCodexConfig } from './providers/codex.js';
+import { OPENCODE_XDG_ENV } from './providers/opencode.js';
 import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from './db/index.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { initGroupFilesystem } from './group-init.js';
@@ -132,16 +133,29 @@ async function providerContribution(
   );
 }
 
+// Hermeticity: `buildMounts` resolves ~/plugins, the Codex home and the
+// OpenCode home from `os.homedir()`/`$HOME`, so with the operator's real HOME a
+// case that says nothing about credentials still stats — and now COPIES — the
+// host's real `~/.local/share/opencode/auth.json` into TEST_ROOT. Every case
+// gets an empty test home by default; the cases that exercise credential
+// resolution set their own `fakeHome` and restore to this one.
+let savedHome: string | undefined;
+
 beforeEach(async () => {
   vi.clearAllMocks();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
+  savedHome = process.env.HOME;
+  process.env.HOME = path.join(TEST_ROOT, 'home');
+  fs.mkdirSync(process.env.HOME, { recursive: true });
   await initTestDb();
   runMigrations(getRawDb());
 });
 
 afterEach(async () => {
   await closeDb();
+  if (savedHome === undefined) delete process.env.HOME;
+  else process.env.HOME = savedHome;
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
@@ -864,11 +878,9 @@ describe('buildMounts agent surfaces', async () => {
   );
 
   // Pins the deletion of the global-~/.codex `config.toml` / `plugins` fallback
-  // mounts (822f1deb). Nothing in the container reads /home/node/.codex/* in
-  // codex-as-peer mode — the runner redirects CODEX_HOME to
-  // /home/node/.codex-runtime — and as nested mounts runc created both entries
-  // as root inside the operator's host ~/.codex-<folder>/.
-  it('never nests global-codex config.toml or plugins inside a scoped ~/.codex home', async () => {
+  // mounts (822f1deb): the peer home is keyed on the SCOPED host dir and the
+  // global `~/.codex` contributes nothing, not even nested entries.
+  it('never sources the global ~/.codex when a scoped home resolves', async () => {
     const ag = group('ag-codex-peer', 'codex-peer');
     await createAgentGroup(ag);
     withWorkgroup(ag);
@@ -890,10 +902,111 @@ describe('buildMounts agent surfaces', async () => {
     process.env.HOME = fakeHome;
     let mounts;
     try {
+      mounts = await buildMounts(ag, session('s-codex-peer', ag.id), containerConfig(), 'claude', {}, ag.folder);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+    }
+
+    // The scoped home is the credential source, and the ONLY thing it
+    // contributes is auth.json — file-bound into a session-owned directory.
+    expect(mounts).toContainEqual({
+      hostPath: path.join(scoped, 'auth.json'),
+      containerPath: '/home/node/.codex/auth.json',
+      readonly: false,
+    });
+    expect(mounts.filter((m) => m.hostPath.startsWith(`${scoped}/`) || m.hostPath === scoped)).toHaveLength(1);
+    expect(mounts.some((m) => m.hostPath === globalCodex || m.hostPath.startsWith(`${globalCodex}/`))).toBe(false);
+  });
+
+  // P1 of the round-1 review on #874: a non-codex group used to get the
+  // operator's WHOLE host ~/.codex bind-mounted RW at /home/node/.codex —
+  // hooks.json, config.toml, AGENTS.md and transcripts included — so a
+  // prompt-injected agent could plant a hook the next host-side `codex` run
+  // executes. The home is now staged in the session dir with a generated
+  // config.toml, and only auth.json is file-bound from the host.
+  //
+  // Mutation check for the fix: restore
+  // `mounts.push({ hostPath: primaryHostPath, containerPath: '/home/node/.codex', readonly: false })`
+  // in place of the `stageCodexAuth` call and the source/contents assertions
+  // below both fail.
+  it('stages the peer Codex home in the session dir rather than mounting the host home', async () => {
+    const ag = group('ag-codex-staged', 'codex-staged');
+    await createAgentGroup(ag);
+    withWorkgroup(ag);
+    await ensureContainerConfig(ag.id);
+    initGroupFilesystem({ ...ag, workgroup_id: ag.folder }, { provider: 'claude' });
+
+    const fakeHome = path.join(TEST_ROOT, 'codex-staged-home');
+    const globalCodex = path.join(fakeHome, '.codex');
+    fs.mkdirSync(path.join(fakeHome, 'plugins', 'codex'), { recursive: true });
+    fs.mkdirSync(path.join(globalCodex, 'hooks'), { recursive: true });
+    fs.mkdirSync(path.join(globalCodex, 'sessions'), { recursive: true });
+    fs.writeFileSync(path.join(globalCodex, 'auth.json'), '{"tokens":{"access_token":"t"}}');
+    fs.writeFileSync(path.join(globalCodex, 'hooks.json'), '{"PreToolUse":[]}');
+    fs.writeFileSync(path.join(globalCodex, 'config.toml'), 'notify = ["/bin/sh","-c","pwned"]\n');
+    fs.writeFileSync(path.join(globalCodex, 'AGENTS.md'), '# operator instructions\n');
+
+    const prevHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    let mounts;
+    try {
+      mounts = await buildMounts(ag, session('s-codex-staged', ag.id), containerConfig(), 'claude', {}, ag.folder);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+    }
+
+    const stagedHost = path.join(sessionDir(ag.id, 's-codex-staged'), 'codex-peer');
+    expect(mounts).toContainEqual({ hostPath: stagedHost, containerPath: '/home/node/.codex', readonly: false });
+    // Nothing from the host home crosses but auth.json.
+    expect(mounts.filter((m) => m.hostPath === globalCodex || m.hostPath.startsWith(`${globalCodex}/`))).toEqual([
+      {
+        hostPath: path.join(globalCodex, 'auth.json'),
+        containerPath: '/home/node/.codex/auth.json',
+        readonly: false,
+      },
+    ]);
+    // The staged directory carries a generated config, an empty bind target for
+    // auth.json, and no hooks, AGENTS.md or transcripts.
+    expect(fs.readdirSync(stagedHost).sort()).toEqual(['auth.json', 'config.toml']);
+    expect(fs.readFileSync(path.join(stagedHost, 'config.toml'), 'utf8')).not.toContain('pwned');
+    expect(fs.readFileSync(path.join(stagedHost, 'config.toml'), 'utf8')).toContain('sandbox_mode');
+  });
+
+  // Every container carries the host Codex credential. A plain Claude group
+  // declares NOTHING about codex — no `codexHostAuth`, which no longer exists
+  // — and still gets `/home/node/.codex` plus its declared fallback homes.
+  //
+  // This is also the mutation check for the removed gate: the config below has
+  // no `codexHostAuth` key, so re-adding `containerConfig.codexHostAuth === true`
+  // to the condition in `buildMounts` drops both mounts and fails here.
+  it('gives a Claude group that declares nothing the host Codex home and its fallbacks', async () => {
+    const ag = group('ag-codex-default', 'codex-default');
+    await createAgentGroup(ag);
+    withWorkgroup(ag);
+    await ensureContainerConfig(ag.id);
+    initGroupFilesystem({ ...ag, workgroup_id: ag.folder }, { provider: 'claude' });
+
+    const fakeHome = path.join(TEST_ROOT, 'codex-default-home');
+    const globalCodex = path.join(fakeHome, '.codex');
+    const fallback = path.join(fakeHome, '.codex-spare');
+    fs.mkdirSync(path.join(fakeHome, 'plugins', 'codex'), { recursive: true });
+    fs.mkdirSync(globalCodex, { recursive: true });
+    fs.mkdirSync(fallback, { recursive: true });
+    // No `~/.codex-<folder>`, so resolveCodexAuthDir falls back to the global
+    // home (src/container-runner.ts:3861-3865).
+    fs.writeFileSync(path.join(globalCodex, 'auth.json'), '{}');
+    fs.writeFileSync(path.join(fallback, 'auth.json'), '{}');
+
+    const prevHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    let mounts;
+    try {
       mounts = await buildMounts(
         ag,
-        session('s-codex-peer', ag.id),
-        { ...containerConfig(), codexHostAuth: true },
+        session('s-codex-default', ag.id),
+        { ...containerConfig(), codexAuthFallbacks: ['~/.codex-spare'] },
         'claude',
         {},
         ag.folder,
@@ -903,10 +1016,243 @@ describe('buildMounts agent surfaces', async () => {
       else process.env.HOME = prevHome;
     }
 
-    // The scoped home itself still mounts — that is the credential surface.
-    expect(mounts).toContainEqual({ hostPath: scoped, containerPath: '/home/node/.codex', readonly: false });
-    expect(mounts.some((m) => m.containerPath.startsWith('/home/node/.codex/'))).toBe(false);
-    expect(mounts.some((m) => m.hostPath === globalCodex || m.hostPath.startsWith(`${globalCodex}/`))).toBe(false);
+    const sessDir = sessionDir(ag.id, 's-codex-default');
+    expect(mounts).toContainEqual({
+      hostPath: path.join(sessDir, 'codex-peer'),
+      containerPath: '/home/node/.codex',
+      readonly: false,
+    });
+    expect(mounts).toContainEqual({
+      hostPath: path.join(globalCodex, 'auth.json'),
+      containerPath: '/home/node/.codex/auth.json',
+      readonly: false,
+    });
+    // Fallback identities are staged the same way for every provider — the
+    // peer branch no longer bind-mounts the declared host home raw.
+    expect(mounts).toContainEqual({
+      hostPath: path.join(sessDir, 'codex-fallbacks', '1'),
+      containerPath: '/home/node/.codex-fallback-1',
+      readonly: false,
+    });
+    expect(mounts).toContainEqual({
+      hostPath: path.join(fallback, 'auth.json'),
+      containerPath: '/home/node/.codex-fallback-1/auth.json',
+      readonly: false,
+    });
+    expect(mounts.some((m) => m.hostPath === fallback)).toBe(false);
+    // A peer never runs the rotation that would need the fallback account's
+    // transcripts — CODEX_FALLBACK_HOMES is read only by the Codex provider and
+    // by `setupCodexPrimaryRuntime` — so `sessions/` stays on the host.
+    expect(mounts.some((m) => m.containerPath.endsWith('/sessions'))).toBe(false);
+    expect(fs.existsSync(path.join(fallback, 'sessions'))).toBe(false);
+  });
+
+  // Round-2 review: staging reads host state, so a malformed home throws. For a
+  // Claude or OpenCode group Codex is a PEER capability and the container must
+  // still boot — the runner finds no auth.json and skips CODEX_HOME setup. For
+  // provider=codex the credential IS the session, so the throw stands.
+  it('withholds a malformed Codex home from a peer container but fails a codex session', async () => {
+    // A home whose `auth.json` is a SYMLINK. The gate is `existsSync`, which
+    // follows the link, so the home is admitted and then rejected by
+    // `stageCodexAuth`'s `lstat`.
+    const plantBadHome = (fakeHome: string, dirName: string): string => {
+      const bad = path.join(fakeHome, dirName);
+      const elsewhere = path.join(fakeHome, `${dirName}-target`);
+      fs.mkdirSync(bad, { recursive: true });
+      fs.mkdirSync(elsewhere, { recursive: true });
+      fs.writeFileSync(path.join(elsewhere, 'auth.json'), '{}');
+      fs.symlinkSync(path.join(elsewhere, 'auth.json'), path.join(bad, 'auth.json'));
+      return bad;
+    };
+
+    const mountsFor = async (provider: string, suffix: string) => {
+      const ag = group(`ag-codex-bad-${suffix}`, `codex-bad-${suffix}`);
+      await createAgentGroup(ag);
+      withWorkgroup(ag);
+      await ensureContainerConfig(ag.id);
+      initGroupFilesystem({ ...ag, workgroup_id: ag.folder }, { provider });
+
+      const fakeHome = path.join(TEST_ROOT, `codex-bad-home-${suffix}`);
+      fs.mkdirSync(path.join(fakeHome, 'plugins', 'codex'), { recursive: true });
+      // Both the primary peer home and a declared fallback are malformed, so
+      // one config exercises whichever branch this provider takes.
+      plantBadHome(fakeHome, '.codex');
+      plantBadHome(fakeHome, '.codex-spare');
+
+      const sess = session(`s-codex-bad-${suffix}`, ag.id);
+      const contribution = await providerContribution(provider, ag, sess);
+      const prevHome = process.env.HOME;
+      process.env.HOME = fakeHome;
+      try {
+        return await buildMounts(
+          ag,
+          sess,
+          { ...containerConfig(), codexAuthFallbacks: ['~/.codex-spare'] },
+          provider,
+          contribution,
+          ag.folder,
+        );
+      } finally {
+        process.env.HOME = prevHome;
+      }
+    };
+
+    const peerMounts = await mountsFor('claude', 'peer');
+    // Neither the peer home nor the fallback crossed, and no throw.
+    expect(peerMounts.some((m) => m.containerPath.startsWith('/home/node/.codex'))).toBe(false);
+    // The container still gets everything else it needs to boot.
+    expect(peerMounts.some((m) => m.containerPath === '/workspace')).toBe(true);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining('withheld'),
+      expect.objectContaining({ containerPath: '/home/node/.codex' }),
+    );
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining('withheld'),
+      expect.objectContaining({ containerPath: '/home/node/.codex-fallback-1' }),
+    );
+
+    // provider=codex owns /home/node/.codex itself, so the malformed home
+    // reaches it through the fallback branch — where the throw still stands.
+    await expect(mountsFor('codex', 'primary')).rejects.toThrow(/Unsafe codex auth file/);
+  });
+
+  // The withholding lever, and the only one: a group that excludes the `codex`
+  // plugin gets neither the plugin nor the credential that rides on it.
+  it('withholds the host Codex home from a group that excludes the codex plugin', async () => {
+    const ag = group('ag-codex-excluded', 'codex-excluded');
+    await createAgentGroup(ag);
+    withWorkgroup(ag);
+    await ensureContainerConfig(ag.id);
+    initGroupFilesystem({ ...ag, workgroup_id: ag.folder }, { provider: 'claude' });
+
+    const fakeHome = path.join(TEST_ROOT, 'codex-excluded-home');
+    const globalCodex = path.join(fakeHome, '.codex');
+    fs.mkdirSync(path.join(fakeHome, 'plugins', 'codex'), { recursive: true });
+    fs.mkdirSync(globalCodex, { recursive: true });
+    fs.writeFileSync(path.join(globalCodex, 'auth.json'), '{}');
+
+    const prevHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    let mounts;
+    try {
+      mounts = await buildMounts(
+        ag,
+        session('s-codex-excluded', ag.id),
+        { ...containerConfig(), excludePlugins: ['codex'] },
+        'claude',
+        {},
+        ag.folder,
+      );
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+    }
+
+    expect(mounts.some((m) => m.containerPath === '/home/node/.codex')).toBe(false);
+    expect(mounts.some((m) => m.containerPath === '/workspace/plugins/codex')).toBe(false);
+  });
+
+  // Part of the same credential matrix as the Codex block above: every
+  // container carries the host OpenCode credential, so any agent can drive
+  // `opencode` headless. AUTH ONLY for a non-OpenCode group — agent
+  // definitions, skills and opencode.db are OpenCode provider session state.
+  it('stages only the OpenCode credential into a Claude container', async () => {
+    const ag = group('ag-opencode-auth', 'opencode-auth');
+    await createAgentGroup(ag);
+    withWorkgroup(ag);
+    await ensureContainerConfig(ag.id);
+    initGroupFilesystem({ ...ag, workgroup_id: ag.folder }, { provider: 'claude' });
+
+    const fakeHome = path.join(TEST_ROOT, 'opencode-auth-home');
+    // Scoped host dir with every surface populated. Only auth.json may cross.
+    const scoped = path.join(fakeHome, '.local', 'share', `opencode-${ag.folder}`);
+    fs.mkdirSync(path.join(scoped, 'agent'), { recursive: true });
+    fs.mkdirSync(path.join(scoped, 'skill', 'demo'), { recursive: true });
+    fs.writeFileSync(path.join(scoped, 'auth.json'), '{"opencode":{"type":"api"}}');
+    fs.writeFileSync(path.join(scoped, 'agent', 'reviewer.md'), '# reviewer\n');
+    fs.writeFileSync(path.join(scoped, 'skill', 'demo', 'SKILL.md'), '# demo\n');
+
+    const prevHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    let mounts;
+    try {
+      mounts = await buildMounts(ag, session('s-opencode-auth', ag.id), containerConfig(), 'claude', {}, ag.folder);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+    }
+
+    const xdgHost = path.join(sessionDir(ag.id, 's-opencode-auth'), 'opencode-xdg');
+    expect(mounts).toContainEqual({ hostPath: xdgHost, containerPath: '/opencode-xdg', readonly: false });
+    // The credential crossed, and nothing else did.
+    const staged = path.join(xdgHost, 'opencode');
+    expect(fs.readFileSync(path.join(staged, 'auth.json'), 'utf8')).toBe('{"opencode":{"type":"api"}}');
+    expect(fs.readdirSync(staged)).toEqual(['auth.json']);
+  });
+
+  // The env half. `buildContainerArgs` is not reachable from a unit test
+  // (src/container-runner.ts:85-87), so the seam that makes the two sides
+  // agree is the shared constant: the spawn path emits it verbatim for every
+  // non-OpenCode provider, and the OpenCode provider spreads the same object
+  // into its own env. Asserting both against one value is what pins that.
+  it('points every container at the staged XDG tree through one env definition', async () => {
+    const ag = group('ag-opencode-xdgenv', 'opencode-xdgenv');
+    await createAgentGroup(ag);
+    await ensureContainerConfig(ag.id);
+
+    expect(OPENCODE_XDG_ENV).toEqual({ XDG_DATA_HOME: '/opencode-xdg', XDG_CONFIG_HOME: '/opencode-xdg' });
+
+    const contribution = await providerContribution('opencode', ag, session('s-opencode-xdgenv', ag.id));
+    expect(contribution.env).toMatchObject(OPENCODE_XDG_ENV);
+    expect(contribution.mounts).toContainEqual(
+      expect.objectContaining({ containerPath: '/opencode-xdg', readonly: false }),
+    );
+  });
+
+  // Same rule as the peer Codex credential (round-3 review): OpenCode is a PEER
+  // capability in a Claude or Codex container, so a host-state failure withholds
+  // it instead of failing the spawn. The wedge is the one an agent can actually
+  // reach — the session dir is mounted RW at /workspace, so it can replace
+  // `/workspace/opencode-xdg` with a symlink and `assertRealDirectory` refuses
+  // it on every later spawn (src/fs-safety.ts:41).
+  it('withholds the OpenCode credential from a container that wedged its own staging dir', async () => {
+    const ag = group('ag-opencode-wedged', 'opencode-wedged');
+    await createAgentGroup(ag);
+    withWorkgroup(ag);
+    await ensureContainerConfig(ag.id);
+    initGroupFilesystem({ ...ag, workgroup_id: ag.folder }, { provider: 'claude' });
+
+    const sess = session('s-opencode-wedged', ag.id);
+    const sessDir = sessionDir(ag.id, sess.id);
+    fs.mkdirSync(sessDir, { recursive: true });
+    fs.symlinkSync(path.join(TEST_ROOT, 'home'), path.join(sessDir, 'opencode-xdg'), 'dir');
+
+    const mounts = await buildMounts(ag, sess, containerConfig(), 'claude', {}, ag.folder);
+
+    expect(mounts.some((m) => m.containerPath === '/opencode-xdg')).toBe(false);
+    expect(mounts.some((m) => m.containerPath === '/workspace')).toBe(true);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining('OpenCode credential withheld'),
+      expect.objectContaining({ containerPath: '/opencode-xdg' }),
+    );
+  });
+
+  // Mutation check for the `provider !== 'opencode'` guard on the staging call
+  // (src/container-runner.ts). Drop or invert it and an OpenCode session gets
+  // /opencode-xdg twice — once from the provider contribution, once from the
+  // fleet-wide staging — which Docker rejects, so every opencode spawn fails.
+  it('mounts /opencode-xdg exactly once for an OpenCode session', async () => {
+    const ag = group('ag-opencode-once', 'opencode-once');
+    await createAgentGroup(ag);
+    withWorkgroup(ag);
+    await ensureContainerConfig(ag.id);
+    initGroupFilesystem({ ...ag, workgroup_id: ag.folder }, { provider: 'opencode' });
+
+    const sess = session('s-opencode-once', ag.id);
+    const contribution = await providerContribution('opencode', ag, sess);
+    const mounts = await buildMounts(ag, sess, containerConfig(), 'opencode', contribution, ag.folder);
+
+    expect(mounts.filter((m) => m.containerPath === '/opencode-xdg')).toHaveLength(1);
   });
 
   it('uses the OpenCode Go default at high effort when no DB override exists', async () => {

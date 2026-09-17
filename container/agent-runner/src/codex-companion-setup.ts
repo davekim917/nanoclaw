@@ -4,14 +4,16 @@
  * When Claude is the agent provider but the agent invokes Codex as a peer
  * (via the `/codex:rescue` subagent or the codex-companion script bundled
  * in the `~/plugins/codex/` plugin), the spawned `codex` reads MCP servers
- * from `~/.codex/config.toml`. Inside the container `~/.codex/` is the
- * host's directory mounted RW — so we cannot inject the container-only
- * `nanoclaw` MCP server entry there without polluting the host's config.
+ * from `~/.codex/config.toml`. Inside the container `~/.codex/` is a staged
+ * session-local home whose `config.toml` the host regenerates on every spawn
+ * (`stageCodexAuth`, src/container-runner.ts), so an MCP entry written there
+ * would not survive — and it carries no MCP servers to begin with.
  *
  * The fix: synthesize a container-only Codex config directory at
  * `/home/node/.codex-runtime/`, populated with:
- *   - a symlink to the mounted host `auth.json` (so OAuth refresh still
- *     persists back to the host) — the ONLY thing read from the host home
+ *   - a symlink to `~/.codex/auth.json`, itself a file-bind of the host home's
+ *     auth.json (so OAuth refresh still persists back to the host) — the ONLY
+ *     thing this container reads from `~/.codex`
  *   - a GENERATED config.toml (CONTAINER_CODEX_CONFIG_BASE) plus exactly the
  *     MCP servers the agent-runner has wired (including `nanoclaw`)
  *   - an `agents/` symlink to the group-owned roster at
@@ -30,7 +32,8 @@
  * `bun`, or `codex` child process.
  *
  * No-ops when:
- *   - the codex auth mount is absent (operator chose `codexHostAuth: false`)
+ *   - the codex auth mount is absent (the group withholds the `codex` plugin,
+ *     which is the only thing that mount now rides on)
  *   - we're already inside a Codex-provider session (Codex's own writer
  *     handles `~/.codex/config.toml` directly)
  */
@@ -350,14 +353,14 @@ export function projectCodexPluginConfigForTest(primaryToml: string, targetToml:
  *
  * Returning `null` here would be a guard BYPASS, not a graceful degrade: the
  * caller only sets `CODEX_HOME` on a non-null return, so a peer-mode
- * `codex exec` would fall back to `/home/node/.codex` — the host's RW-mounted
- * home, which HAS auth and never receives the in-tree PreToolUse destructive-
- * action guard chain. Net: an authenticated, working, UNGUARDED codex. Writing
- * the guard into that directory instead is not an option: it is the operator's
- * real `~/.codex` on the host.
+ * `codex exec` would fall back to `/home/node/.codex` — the staged home, which
+ * HAS auth and never receives the in-tree PreToolUse destructive-action guard
+ * chain. Net: an authenticated, working, UNGUARDED codex. Writing the guard
+ * into that directory instead is not an option: the host regenerates its
+ * `config.toml` on every spawn, so the entries would not survive a respawn.
  *
  * So we hand back a nonexistent sentinel. Codex refuses to start on it and
- * cannot reach the host-mounted auth or config, while the primary provider
+ * cannot reach the staged auth or config, while the primary provider
  * (Claude/OpenCode) boots and works normally — these are all filesystem
  * failures in the container's writable home, and under disk pressure throwing
  * would convert "peer codex degraded" into "every container crash-loops".
@@ -369,7 +372,7 @@ function failClosed(what: string, err: unknown): string {
   log(
     `FAIL-CLOSED: peer-mode Codex DISABLED for this container — ${what}: ${detail}. ` +
       `CODEX_HOME is set to the nonexistent sentinel ${FAILED_CODEX_HOME}, so \`codex exec\` will refuse ` +
-      `to start rather than run unguarded against the host-mounted ${HOST_CODEX_DIR}. ` +
+      `to start rather than run unguarded against the staged ${HOST_CODEX_DIR}. ` +
       `The primary agent provider is unaffected. Most likely cause: no space / bad permissions on /home/node.`,
   );
   return FAILED_CODEX_HOME;

@@ -155,6 +155,7 @@ import {
   type VolumeMount,
 } from './providers/provider-container-registry.js';
 import { buildContainerCodexConfig } from './providers/codex.js';
+import { OPENCODE_XDG_CONTAINER_PATH, OPENCODE_XDG_ENV, stageOpenCodeAuth } from './providers/opencode.js';
 import { getSessionClaudeMounts } from './session-claude-mounts.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { assertHostOwnedInboundDb, hostInboundMounts, migrateInboundDbToHostDir } from './modules/mailbox/index.js';
@@ -3911,39 +3912,80 @@ export function resolveCodexAuthFallbacks(
 }
 
 /**
- * Build a session-local CODEX_HOME for one fallback identity. Only the two
- * pieces of mutable identity/history state that must survive are bind-mounted
- * from the host home: auth.json and sessions/. Config, hooks, agents, and
- * plugin state are generated inside the NanoClaw session.
+ * True for a credential-staging failure caused by HOST STATE rather than by a
+ * bug here: a SYSCALL error, or one of the `Unsafe …` refusals the staging
+ * guards raise (`src/fs-safety.ts:44`, plus `stageCodexAuth` and
+ * `materializeCodexFallbackRuntime` below).
+ *
+ * A PEER credential — Codex in a non-codex container, OpenCode in any of them —
+ * is withheld on one of these rather than failing the spawn. Anything else
+ * rethrows: swallowing a TypeError would turn a provider off fleet-wide behind
+ * one warn per spawn.
+ *
+ * "Syscall error" means the bare-`E…` code shape (`ENOENT`, `EACCES`, `EEXIST`),
+ * NOT any string `code`: Node stamps its own argument-validation TypeErrors with
+ * codes too (`ERR_INVALID_ARG_TYPE`), and those are exactly the bugs this
+ * predicate exists to let through. The underscore is what separates them.
+ *
+ * `Invalid group folder` (`src/group-folder.ts:21`, reached through
+ * `stageOpenCodeAuth`'s defense-in-depth check on the scoped path) counts as
+ * host state too: a live `agent_groups.folder` CAN fail the grammar, because
+ * not every creation path checks it. `toFolder` in
+ * `src/modules/permissions/channel-approval.ts:119` has no length cap, so a
+ * channel name of 65+ characters mints a folder the 64-char pattern refuses,
+ * and `setup/migrate-v2/groups.ts:78` carries v1 folder names over verbatim.
+ * The spawn path itself never checks the grammar, so such a group spawned fine
+ * before this PR; making the peer credential the one thing that renders it
+ * unspawnable would be a regression. Withholding also means the scoped path is
+ * never built, which is strictly safer than proceeding.
  */
-export function materializeCodexFallbackRuntime(fallback: CodexAuthFallback, runtimeHostPath: string): VolumeMount[] {
+const HOST_STATE_REFUSAL = /^(Unsafe |Invalid group folder )/;
+
+function isHostStateFailure(err: unknown): err is Error {
+  if (!(err instanceof Error)) return false;
+  const code = (err as NodeJS.ErrnoException).code;
+  return (typeof code === 'string' && /^E[A-Z0-9]+$/.test(code)) || HOST_STATE_REFUSAL.test(err.message);
+}
+
+/**
+ * Stage a session-local CODEX_HOME whose only host coupling is the credential.
+ * The directory itself is session-owned with a GENERATED config.toml; the host
+ * home's `auth.json` is FILE-bind-mounted into it, so an OAuth refresh inside
+ * the container still writes back to the host file while the rest of that home
+ * — `config.toml`, `hooks.json`, `hooks/`, `AGENTS.md`, transcripts — never
+ * reaches the container. Shared by the peer-mode primary home and every
+ * fallback identity.
+ */
+export function stageCodexAuth(hostHomePath: string, runtimeHostPath: string, containerPath: string): VolumeMount[] {
   fs.mkdirSync(runtimeHostPath, { recursive: true });
   assertRealDirectory(runtimeHostPath);
-  assertRealDirectory(fallback.hostPath);
+  assertRealDirectory(hostHomePath);
   removeUntrustedPathEntry(runtimeHostPath, 'plugins');
   removeUntrustedPathEntry(runtimeHostPath, '.tmp');
 
-  const fallbackAuth = path.join(fallback.hostPath, 'auth.json');
-  const fallbackAuthStat = fs.lstatSync(fallbackAuth, { throwIfNoEntry: false });
-  if (!fallbackAuthStat || fallbackAuthStat.isSymbolicLink() || !fallbackAuthStat.isFile()) {
-    throw new Error(`Unsafe fallback auth file: ${fallbackAuth}`);
+  const hostAuth = path.join(hostHomePath, 'auth.json');
+  const hostAuthStat = fs.lstatSync(hostAuth, { throwIfNoEntry: false });
+  if (!hostAuthStat || hostAuthStat.isSymbolicLink() || !hostAuthStat.isFile()) {
+    throw new Error(`Unsafe codex auth file: ${hostAuth}`);
   }
-  // Container-owned base config — same generated content as the primary home.
-  // The fallback host dir contributes credentials (auth.json) and history
-  // (sessions/) only; its config.toml, if any, never reaches the container.
   replaceUntrustedFile(runtimeHostPath, 'config.toml', buildContainerCodexConfig());
 
   // Docker file bind targets must exist before the parent runtime-home mount.
   replaceUntrustedFile(runtimeHostPath, 'auth.json', '');
 
-  const mounts: VolumeMount[] = [
-    { hostPath: runtimeHostPath, containerPath: fallback.containerPath, readonly: false },
-    {
-      hostPath: fallbackAuth,
-      containerPath: `${fallback.containerPath}/auth.json`,
-      readonly: false,
-    },
+  return [
+    { hostPath: runtimeHostPath, containerPath, readonly: false },
+    { hostPath: hostAuth, containerPath: `${containerPath}/auth.json`, readonly: false },
   ];
+}
+
+/**
+ * Build a session-local CODEX_HOME for one fallback identity. `stageCodexAuth`
+ * contributes the credential and the generated config; this adds `sessions/`,
+ * the one piece of mutable history a rotated-to identity must keep.
+ */
+export function materializeCodexFallbackRuntime(fallback: CodexAuthFallback, runtimeHostPath: string): VolumeMount[] {
+  const mounts = stageCodexAuth(fallback.hostPath, runtimeHostPath, fallback.containerPath);
 
   const hostSessions = path.join(fallback.hostPath, 'sessions');
   const hostSessionsStat = fs.lstatSync(hostSessions, { throwIfNoEntry: false });
@@ -5088,8 +5130,8 @@ export async function buildMounts(
     // a segment past NAME_MAX — and each fix was one more item on a list with no
     // end, because "cannot name a file" is not enumerable from the string alone.
     // Every one of them lands the same way: the operator declares `codex`
-    // withheld, nothing matches, the plugin mounts, and with `codexHostAuth` the
-    // host's Codex OAuth session mounts with it.
+    // withheld, nothing matches, the plugin mounts, and the host's Codex OAuth
+    // session mounts with it.
     //
     // Here the question IS answerable, because here both sides are present. So
     // this is the rule that closes the class: every declared entry must equal an
@@ -5178,22 +5220,48 @@ export async function buildMounts(
       }
     }
 
-    // Host ~/.codex mount: opt-in via container.json `codexHostAuth: true`.
-    // RW because the Codex CLI rewrites auth.json on token refresh — RO
-    // breaks long-running sessions when access tokens expire. Token-theft
-    // risk is unchanged regardless of RO/RW (read access alone is enough),
-    // so the security improvement is the OPT-IN itself: pre-2026-05-03 the
-    // mount fired on every group that had the codex plugin available;
-    // now operators must explicitly grant Codex host auth per group.
-    if (containerConfig.codexHostAuth === true && !excluded.has('codex') && entries.includes('codex')) {
+    // Codex credential, for every container: the staged CODEX_HOME below lets
+    // any agent drive `codex exec` headless with the fleet's own OAuth
+    // identity. The withholding lever is `excludePlugins` — a group that must
+    // not reach Codex withholds the `codex` plugin and the credential goes with
+    // it, and the refusal above makes an exclusion that matches nothing fatal
+    // rather than silently fail-open.
+    if (!excluded.has('codex') && entries.includes('codex')) {
       const providerHasCodexMount = providerContribution.mounts?.some((m) => m.containerPath === '/home/node/.codex');
 
-      // Primary host-codex mount fires only when the provider didn't
-      // already contribute one. provider=codex paths bring their own
-      // session-local copy of auth.json at /home/node/.codex (see
-      // src/providers/codex.ts's container-config registry contribution);
-      // codex-as-peer setups (provider=claude with the codex plugin) rely
-      // on this block to surface the host's ~/.codex directly.
+      // Staging reads and rewrites host-side state, so a malformed home (a
+      // symlinked `auth.json` or `sessions/`) throws. For provider=codex that is
+      // fatal by design — the credential IS the session. For every other
+      // provider Codex is a PEER capability, and failing a whole container over
+      // it would be exactly the "peer codex degraded → every container
+      // crash-loops" trade the runner refuses
+      // (container/agent-runner/src/codex-companion-setup.ts:352-369). So a peer
+      // stage that throws is logged and WITHHELD: the container boots, finds no
+      // `auth.json`, and skips CODEX_HOME setup (`codex-companion-setup.ts:582`).
+      // Narrowed by `isHostStateFailure` so a bug here still surfaces.
+      const stageOrWithhold = (what: string, stage: () => VolumeMount[]): VolumeMount[] => {
+        try {
+          return stage();
+        } catch (err) {
+          if (providerHasCodexMount || !isHostStateFailure(err)) throw err;
+          log.warn('Codex credential withheld from peer container (staging failed)', {
+            agentGroupId: agentGroup.id,
+            containerPath: what,
+            error: err.message,
+          });
+          return [];
+        }
+      };
+
+      // provider=codex brings its own session-local /home/node/.codex (see
+      // src/providers/codex.ts's container-config registry contribution) plus
+      // the RO host home below, which `refreshCodexAuthFromHost`
+      // (container/agent-runner/src/providers/codex.ts:897) re-reads auth.json
+      // from when the host rotates a token mid-session. That mount is the ONE
+      // place a container still sees a whole host Codex home, read-only —
+      // narrowing it to a file bind would defeat the refresh, which exists to
+      // pick up a REPLACED file. Every other provider gets the staged peer home
+      // in the branch after it.
       const primaryHostPath = resolveCodexAuthDir(agentGroup.folder);
       if (providerHasCodexMount && fs.existsSync(path.join(primaryHostPath, 'auth.json'))) {
         mounts.push({
@@ -5203,65 +5271,85 @@ export async function buildMounts(
         });
       }
 
-      if (!providerHasCodexMount) {
-        // Per-group resolution: ~/.codex-<folder>/ wins if it has an
-        // auth.json, otherwise fall back to the global ~/.codex/.
+      if (!providerHasCodexMount && fs.existsSync(path.join(primaryHostPath, 'auth.json'))) {
+        // Codex-as-peer home, STAGED not bind-mounted: the session owns the
+        // directory and only `auth.json` is file-bound from the host home, so
+        // a prompt-injected agent cannot reach the operator's `hooks.json`,
+        // `config.toml`, `AGENTS.md` or transcripts — nor plant a hook there
+        // that the next host-side `codex` run would execute. The runner reads
+        // exactly one file from this mount (`HOST_CODEX_DIR/auth.json`, which
+        // it symlinks into its own CODEX_HOME:
+        // container/agent-runner/src/codex-companion-setup.ts:581-604).
         //
-        // NB: Keyed on `agentGroup.folder`, NOT `containerConfig.credentialFolder`.
-        // A codex sibling typically WANTS its own Codex account (different
-        // OpenAI/ChatGPT identity than the Claude source); credentialFolder
-        // is for env-var creds (LOOKER, DBT, GitHub tokens) which the sibling
-        // should inherit. Conflating the two would silently override the
-        // sibling's purpose-built ~/.codex-<sibling>/ dir with the source's.
-        const hostCodex = primaryHostPath;
-        if (fs.existsSync(hostCodex)) {
-          // DELIBERATELY no global-`~/.codex` fallback for `config.toml` /
-          // `plugins` when hostCodex is a scoped `~/.codex-<folder>`. 822f1deb
-          // added both so a scoped group inherited the host's
-          // `[plugins.*]`/`[marketplaces.*]` config and plugin cache; that
-          // inheritance is gone (4da9d288 registers plugins fresh from
-          // /workspace/plugins, 87b12122 generates the peer config.toml), and
-          // this branch is codex-as-peer only, where the runner always
-          // redirects CODEX_HOME to /home/node/.codex-runtime. So nothing read
-          // them — while as NESTED mounts into an RW bind whose source lacks
-          // the entry, runc created both as ROOT in the operator's host
-          // `~/.codex-<folder>/`. Pinned by src/provider-surfaces.test.ts.
-          mounts.push({ hostPath: hostCodex, containerPath: '/home/node/.codex', readonly: false });
-        }
+        // Source keyed on `agentGroup.folder`, NOT `credentialFolder`: a codex
+        // sibling usually wants its own ChatGPT identity, while credentialFolder
+        // governs env-var creds the sibling should inherit.
+        mounts.push(
+          ...stageOrWithhold('/home/node/.codex', () =>
+            stageCodexAuth(
+              primaryHostPath,
+              path.join(sessionDir(agentGroup.id, session.id), 'codex-peer'),
+              '/home/node/.codex',
+            ),
+          ),
+        );
       }
 
-      // codexAuthFallbacks: ordered list of additional ~/.codex* dirs to
-      // mount as fallback OAuth identities. INDEPENDENT of the primary
-      // mount source — fallbacks target /home/node/.codex-fallback-N/
-      // which never conflicts with /home/node/.codex. So they fire
-      // regardless of whether the primary came from the provider's
-      // per-session copy (provider=codex, the original Example-Retail-codex case) or
-      // from the direct host mount above (codex-as-peer). Without this
-      // independence the fallback was effectively dead code for the very
-      // configuration we built it for.
+      // codexAuthFallbacks: ordered list of additional ~/.codex* dirs to stage
+      // as fallback OAuth identities at /home/node/.codex-fallback-N/, which
+      // never conflicts with /home/node/.codex — so they fire independently of
+      // where the primary came from. Resolution and dedup (against
+      // primaryHostPath) live in `resolveCodexAuthFallbacks`; the container
+      // provider reads CODEX_FALLBACK_HOMES and rotates on UsageLimitExceeded /
+      // ServerOverloaded / coarse-systemError.
       //
-      // Resolution + filtering lives in `resolveCodexAuthFallbacks`; each
-      // survivor mounts at /home/node/.codex-fallback-N/ in declared order.
-      // The container provider reads CODEX_FALLBACK_HOMES and rotates on
-      // UsageLimitExceeded / ServerOverloaded / coarse-systemError. RW
-      // because codex refresh-rotates tokens in-place.
-      //
-      // primaryHostPath for dedup uses resolveCodexAuthDir — the host path
-      // the primary auth came from, regardless of whether the actual
-      // /home/node/.codex mount source is that path or a session-local
-      // copy. Lets a fallback declaration matching the primary be skipped.
+      // A fallback carries `sessions/` only where rotation actually lands mid-
+      // session and the transcript must follow it: provider=codex. A peer's
+      // fallback is a credential and nothing else — `CODEX_FALLBACK_HOMES` is
+      // read only by the Codex provider and by `setupCodexPrimaryRuntime`
+      // (container/agent-runner/src/codex-companion-setup.ts:704), neither of
+      // which a Claude or OpenCode container runs — so mounting that account's
+      // host transcripts RW into one would be exposure with no function.
       const resolvedFallbacks = resolveCodexAuthFallbacks(containerConfig.codexAuthFallbacks, primaryHostPath);
       resolvedFallbacks.forEach((entry, index) => {
-        if (providerHasCodexMount) {
-          const fallbackRuntime = path.join(
-            sessionDir(agentGroup.id, session.id),
-            'codex-fallbacks',
-            String(index + 1),
-          );
-          mounts.push(...materializeCodexFallbackRuntime(entry, fallbackRuntime));
-        } else {
-          mounts.push({ hostPath: entry.hostPath, containerPath: entry.containerPath, readonly: false });
-        }
+        const fallbackRuntime = path.join(sessionDir(agentGroup.id, session.id), 'codex-fallbacks', String(index + 1));
+        mounts.push(
+          ...stageOrWithhold(entry.containerPath, () =>
+            providerHasCodexMount
+              ? materializeCodexFallbackRuntime(entry, fallbackRuntime)
+              : stageCodexAuth(entry.hostPath, fallbackRuntime, entry.containerPath),
+          ),
+        );
+      });
+    }
+  }
+
+  // Host OpenCode credential for every non-OpenCode container, AUTH ONLY —
+  // the same `stageOpenCodeAuth` the provider calls for its own auth step, so
+  // the staging exists once. Outside the `~/plugins` block because OpenCode has
+  // no plugin for the credential to ride on.
+  //
+  // Withheld on a host-state failure for the same reason the peer Codex stage
+  // is: this is a PEER credential, and an agent that replaced
+  // `/workspace/opencode-xdg` with a symlink would otherwise fail every later
+  // spawn of its own session. An OpenCode session's own staging still throws —
+  // it runs in the provider contribution, not here.
+  if (provider !== 'opencode') {
+    try {
+      mounts.push(
+        ...stageOpenCodeAuth(
+          sessionDir(agentGroup.id, session.id),
+          agentGroup.folder,
+          agentGroup.id,
+          process.env.HOME || os.homedir(),
+        ).mounts,
+      );
+    } catch (err) {
+      if (!isHostStateFailure(err)) throw err;
+      log.warn('OpenCode credential withheld from container (staging failed)', {
+        agentGroupId: agentGroup.id,
+        containerPath: OPENCODE_XDG_CONTAINER_PATH,
+        error: err.message,
       });
     }
   }
@@ -6915,6 +7003,17 @@ async function buildContainerArgs(
   }
   for (const [key, value] of Object.entries(providerEnv)) {
     args.push('-e', `${key}=${value}`);
+  }
+
+  // Env half of the staged OpenCode credential. Keyed on the MOUNT rather than
+  // on `provider !== 'opencode'` directly, the same way CODEX_FALLBACK_HOMES is
+  // above: an OpenCode session gets the env from its provider contribution, so
+  // emitting it here too would duplicate it, and a container whose staging was
+  // withheld should not be pointed at a path it has no mount for.
+  if (provider !== 'opencode' && mounts.some((m) => m.containerPath === OPENCODE_XDG_CONTAINER_PATH)) {
+    for (const [key, value] of Object.entries(OPENCODE_XDG_ENV)) {
+      args.push('-e', `${key}=${value}`);
+    }
   }
 
   // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls

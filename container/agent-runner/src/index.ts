@@ -283,7 +283,7 @@ async function main(): Promise<void> {
     // cannot run at all and CODEX_HOME is left unset. Any OTHER failure returns
     // the nonexistent FAILED_CODEX_HOME sentinel rather than null — a truthy
     // value we deliberately still assign, because an unset CODEX_HOME would run
-    // codex unguarded against the host-mounted ~/.codex. So a non-null result
+    // codex unguarded against the staged ~/.codex. So a non-null result
     // means "CODEX_HOME is authoritative", NOT "peer codex is usable": on the
     // sentinel, codex refuses to start (see failClosed in codex-companion-setup).
     const codexHome = setupCodexRuntime(mcpServers, providerName === 'opencode' ? 'opencode' : 'claude');

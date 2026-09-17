@@ -122,6 +122,12 @@ describe('maintenance authority', () => {
     expect(() => wikiEnrollment('ordinary', false, file)).toThrow();
     expect(() => readWikiPublicationPolicy(file)).toThrow();
   });
+  // `codexHostAuth` is a RETIRED key: `assertWikiActorConfig` refuses it as an
+  // unknown key rather than as a named capability, and `materializeContainerConfig`
+  // drops it before the spawn path anyway (src/container-config.ts:1290). Kept
+  // deliberately — 17 on-disk `groups/*/container.json` still carry it and
+  // `SIBLING_BOUND_FIELDS` still names it (src/sibling-parity.ts:53), so it
+  // remains a key a config can present. Drop it here when that entry goes.
   it.each(['githubTokenEnv', 'credentialFolder', 'providerFallback', 'onecliSecrets', 'codexHostAuth', 'wixHostAuth'])(
     'rejects application capability %s before spawn',
     (key) => {

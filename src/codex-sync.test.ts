@@ -175,30 +175,41 @@ describe('syncCodexLocalMarketplacePluginCache', () => {
 });
 
 describe('discoverCodexAgentTargets', () => {
-  it('adds groups/<folder>/.codex/agents for provider=codex groups only', () => {
+  it('adds groups/<folder>/.codex/agents for every group with a readable container.json', () => {
     const groupsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-sync-groups-'));
     try {
       // provider=codex → target
       fs.mkdirSync(path.join(groupsDir, 'acme-codex'));
       fs.writeFileSync(path.join(groupsDir, 'acme-codex', 'container.json'), JSON.stringify({ provider: 'codex' }));
-      // provider=claude, no codex peer → no target
+      // A plain Claude group is codex-capable now: host Codex auth reaches every
+      // container, so every group needs the roster.
       fs.mkdirSync(path.join(groupsDir, 'acme'));
       fs.writeFileSync(path.join(groupsDir, 'acme', 'container.json'), JSON.stringify({ provider: 'claude' }));
-      // provider=claude with codex-as-peer → target
-      fs.mkdirSync(path.join(groupsDir, 'acme-peer'));
+      // Even one still carrying the retired opt-out on disk.
+      fs.mkdirSync(path.join(groupsDir, 'acme-optout'));
       fs.writeFileSync(
-        path.join(groupsDir, 'acme-peer', 'container.json'),
-        JSON.stringify({ provider: 'claude', codexHostAuth: true }),
+        path.join(groupsDir, 'acme-optout', 'container.json'),
+        JSON.stringify({ provider: 'claude', codexHostAuth: false }),
       );
-      // malformed container.json → skipped, no throw
+      // provider=opencode, which never carried the key at all
+      fs.mkdirSync(path.join(groupsDir, 'acme-opencode'));
+      fs.writeFileSync(
+        path.join(groupsDir, 'acme-opencode', 'container.json'),
+        JSON.stringify({ provider: 'opencode' }),
+      );
+      // malformed container.json → skipped, no throw. A readable config is still
+      // what makes a directory a group.
       fs.mkdirSync(path.join(groupsDir, 'broken-codex'));
       fs.writeFileSync(path.join(groupsDir, 'broken-codex', 'container.json'), '{nope');
+      // no container.json at all → not a group
+      fs.mkdirSync(path.join(groupsDir, 'not-a-group'));
 
       const targets = discoverCodexAgentTargets(groupsDir);
-      expect(targets).toContain(path.join(groupsDir, 'acme-codex', '.codex', 'agents'));
-      expect(targets).not.toContain(path.join(groupsDir, 'acme', '.codex', 'agents'));
-      expect(targets).toContain(path.join(groupsDir, 'acme-peer', '.codex', 'agents'));
+      for (const folder of ['acme-codex', 'acme', 'acme-optout', 'acme-opencode']) {
+        expect(targets).toContain(path.join(groupsDir, folder, '.codex', 'agents'));
+      }
       expect(targets).not.toContain(path.join(groupsDir, 'broken-codex', '.codex', 'agents'));
+      expect(targets).not.toContain(path.join(groupsDir, 'not-a-group', '.codex', 'agents'));
       // the global host-CLI roster target is still present
       expect(targets).toContain(path.join(os.homedir(), '.codex', 'agents'));
     } finally {
