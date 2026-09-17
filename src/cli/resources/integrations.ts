@@ -26,6 +26,15 @@
  * No `create`/`update`/`delete` generic verbs: a row here is only ever
  * meaningful alongside its OAuth bundle and its OneCLI secret, and a hand-written
  * row would be a registry entry with no credential behind it.
+ *
+ * FLAG NAMES ARE snake_case, ALWAYS. Every command parser runs `normalizeArgs`
+ * before `validateArgs` (`src/cli/crud.ts:474,646`), so `--authorize-param`
+ * reaches validation as the key `authorize_param`; a ColumnDef declaring
+ * `authorize-param` therefore matches nothing and the flag is rejected as
+ * `unknown flag --authorize-param`. Help and error text hyphenate for display
+ * (`flagName`, `src/cli/help-render.ts:16-18`), so the operator-facing syntax
+ * stays `--authorize-param` either way. `src/cli/flag-name-normalization.test.ts`
+ * enforces this across every registered resource.
  */
 import { TIMEZONE } from '../../config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
@@ -140,24 +149,24 @@ registerResource({
             'OneCLI secret name to write the bearer into. Defaults to <Name>-MCP-<Group>; point it at an existing secret to adopt it.',
         },
         {
-          name: 'redirect-uri',
+          name: 'redirect_uri',
           type: 'string',
           description:
             'Loopback redirect override (default http://127.0.0.1:8765/callback). Must be a URI the authorization server will accept.',
         },
         {
-          name: 'client-name',
+          name: 'client_name',
           type: 'string',
           description: 'Client name sent to dynamic registration (default NanoClaw).',
         },
         {
-          name: 'authorize-param',
+          name: 'authorize_param',
           type: 'string',
           description:
             'Extra authorize-endpoint parameter, key=value. Repeatable. Dropbox needs token_access_type=offline to issue a refresh token.',
         },
         {
-          name: 'no-resource',
+          name: 'no_resource',
           type: 'boolean',
           description: 'Omit the RFC 8707 resource parameter, for a server that rejects it.',
         },
@@ -174,7 +183,7 @@ registerResource({
             'Loopback port for the redirect URI and --listen (default 8765). A re-login keeps the port its client was registered with.',
         },
         {
-          name: 'listen-timeout',
+          name: 'listen_timeout',
           type: 'number',
           description: 'Seconds the --listen listener stays up (default 600).',
         },
@@ -185,7 +194,7 @@ registerResource({
             'Opt-in: use the RFC 8628 device grant instead of a redirect. Only works where the server publishes device_authorization_endpoint.',
         },
         {
-          name: 'device-endpoint',
+          name: 'device_endpoint',
           type: 'string',
           description:
             'Device-authorization endpoint for a server that advertises the device_code grant without publishing the endpoint.',
@@ -205,15 +214,15 @@ registerResource({
           scopes: args.scopes === undefined ? undefined : String(args.scopes),
           issuer: args.issuer === undefined ? undefined : String(args.issuer),
           secretName: args.secret === undefined ? undefined : String(args.secret),
-          redirectUri: args['redirect-uri'] === undefined ? undefined : String(args['redirect-uri']),
-          clientName: args['client-name'] === undefined ? undefined : String(args['client-name']),
-          extraAuthorizeParams: parseExtraParams(args['authorize-param']),
-          noResourceIndicator: flag(args['no-resource']),
+          redirectUri: args.redirect_uri === undefined ? undefined : String(args.redirect_uri),
+          clientName: args.client_name === undefined ? undefined : String(args.client_name),
+          extraAuthorizeParams: parseExtraParams(args.authorize_param),
+          noResourceIndicator: flag(args.no_resource),
           listen: flag(args.listen),
           port: args.port === undefined ? undefined : Number(args.port),
-          listenTimeoutSeconds: args['listen-timeout'] === undefined ? undefined : Number(args['listen-timeout']),
+          listenTimeoutSeconds: args.listen_timeout === undefined ? undefined : Number(args.listen_timeout),
           device: flag(args.device),
-          deviceEndpoint: args['device-endpoint'] === undefined ? undefined : String(args['device-endpoint']),
+          deviceEndpoint: args.device_endpoint === undefined ? undefined : String(args.device_endpoint),
         });
         return {
           ...result,
@@ -281,7 +290,7 @@ registerResource({
       args: [
         { name: 'name', type: 'string', description: 'Integration handle from `login`.', required: true },
         {
-          name: 'redirect-url',
+          name: 'redirect_url',
           type: 'string',
           description: 'The URL the browser landed on. A bare ?code=…&state=… or a bare code also works.',
           required: true,
@@ -290,8 +299,7 @@ registerResource({
       examples: [
         "ncl integrations complete --name dropbox-files --redirect-url 'http://127.0.0.1:8765/callback?code=abc&state=xyz'",
       ],
-      handler: async (args) =>
-        completeLogin({ name: String(args.name), redirectResponse: String(args['redirect-url']) }),
+      handler: async (args) => completeLogin({ name: String(args.name), redirectResponse: String(args.redirect_url) }),
       formatHuman: (data) => {
         const d = data as Awaited<ReturnType<typeof completeLogin>>;
         const lines = [
@@ -324,7 +332,7 @@ registerResource({
       args: [
         { name: 'name', type: 'string', description: 'Integration handle.', required: true },
         {
-          name: 'delete-secret',
+          name: 'delete_secret',
           type: 'boolean',
           description:
             "Also delete the OneCLI bearer secret. Remove it from the group's container.json first, or the next spawn fails closed.",
@@ -332,7 +340,7 @@ registerResource({
       ],
       handler: async (args) =>
         removeIntegration(String(args.name), {
-          deleteSecret: args['delete-secret'] === true || args['delete-secret'] === 'true',
+          deleteSecret: flag(args.delete_secret),
         }),
     },
 
