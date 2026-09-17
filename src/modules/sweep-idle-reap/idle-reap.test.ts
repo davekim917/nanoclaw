@@ -356,7 +356,7 @@ function fakeSession(id: string, overrides: Partial<Session> = {}): Session {
 
 function fakeMailbox(overrides: Record<string, unknown> = {}): NanoclawMailboxSession {
   const base: Record<string, unknown> = {
-    syncProcessingAcks: () => undefined,
+    syncProcessingAcks: () => [],
     expireStalePending: () => 0,
     getProcessingClaimRows: () => [],
     hasOutbound: () => true,

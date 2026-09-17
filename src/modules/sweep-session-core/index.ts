@@ -130,7 +130,16 @@ export function registerSessionCoreSweepDuties(): void {
     order: 10,
     // 1. Sync processing_ack → messages_in status
     run: (ctx) => {
-      asSessionContext(ctx).mailbox!.syncProcessingAcks();
+      const { session, mailbox } = asSessionContext(ctx);
+      const answered = mailbox!.syncProcessingAcks();
+      // Not the normal completion path: each id is a row the runner would never
+      // select again and the host would have counted due forever.
+      if (answered.length > 0) {
+        log.warn('Completed answered rows the runner left pending with no ack', {
+          sessionId: session.id,
+          messageIds: answered,
+        });
+      }
     },
   });
 

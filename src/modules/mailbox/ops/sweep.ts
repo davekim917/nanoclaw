@@ -6,6 +6,7 @@
 import type Database from 'better-sqlite3';
 
 import { migrateMessagesInTable } from '../schema.js';
+import { parseSqliteUtc } from '../sqlite-utc.js';
 
 /**
  * Earliest FUTURE process_after among pending rows, or null. Used by the host
@@ -193,30 +194,103 @@ export function getMessageForRetry(
  * `getTerminalProcessingAcks()` + `applyProcessingAcks()`; the fork keeps it
  * fused because both handles are already in scope inside a mailbox session and
  * the host sweep's control flow is written around one call.
+ *
+ * This is the one place the runner's notion of "handled" is mapped onto
+ * `messages_in.status`, which is what every host reader of due-ness keys on
+ * (`countDueMessages`, `getDueWakePriority`, recurrence fan-out). The runner
+ * has TWO ways of treating a row as handled, and both are reconciled here:
+ * a terminal `processing_ack`, and an answer in `messages_out`
+ * (`completeAnsweredPendingRows` below).
+ *
+ * Returns the ids completed because they were already answered, so the caller
+ * can log them; terminal-ack syncs are the normal path and stay silent.
  */
-export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Database): void {
+export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Database): string[] {
   const completed = outDb
     .prepare(
       "SELECT message_id, status FROM processing_ack WHERE status IN ('completed', 'failed', 'script-skip:error')",
     )
     .all() as Array<{ message_id: string; status: string }>;
 
-  if (completed.length === 0) return;
+  if (completed.length > 0) {
+    // `script-skip:error` (pre-task script crashed) lands as a FAILED run —
+    // semantically true, and it lets recurrence derive the trailing failed
+    // streak from the occurrence rows themselves (no stored counter).
+    const completeStmt = inDb.prepare(
+      "UPDATE messages_in SET status = 'completed' WHERE id = ? AND status NOT IN ('completed', 'failed')",
+    );
+    const failStmt = inDb.prepare(
+      "UPDATE messages_in SET status = 'failed' WHERE id = ? AND status NOT IN ('completed', 'failed')",
+    );
+    inDb.transaction(() => {
+      for (const { message_id, status } of completed) {
+        (status === 'script-skip:error' ? failStmt : completeStmt).run(message_id);
+      }
+    })();
+  }
 
-  // `script-skip:error` (pre-task script crashed) lands as a FAILED run —
-  // semantically true, and it lets recurrence derive the trailing failed
-  // streak from the occurrence rows themselves (no stored counter).
-  const completeStmt = inDb.prepare(
-    "UPDATE messages_in SET status = 'completed' WHERE id = ? AND status NOT IN ('completed', 'failed')",
+  return completeAnsweredPendingRows(inDb, outDb);
+}
+
+/**
+ * Complete due wake rows the runner will never select again because they are
+ * already answered.
+ *
+ * The runner drops a pending row from selection when `messages_out` holds a
+ * non-status row with `in_reply_to` = its id, written at/after the row's
+ * `process_after` (any time, for a row without one) — `isResponded`,
+ * container/agent-runner/src/modules/mailbox/selection.ts:333-339, applied at
+ * :356. `in_reply_to` is stamped from the CLAIMED batch
+ * (container/agent-runner/src/poll-loop.ts:2767), so such a row was claimed
+ * once. Normally the claim turns terminal and the sync above completes the
+ * row. It does not when the turn ends without `markCompleted` — a batch
+ * deferred to the fallback provider keeps its 'processing' claim
+ * (poll-loop.ts:1499-1507) — and the next container's startup then deletes
+ * every 'processing' claim (`clearStaleProcessingAcks`,
+ * container/agent-runner/src/modules/mailbox/container-state.ts:168). What is
+ * left is a row with no ack at all that the runner treats as handled and the
+ * host still counts as due: the wake duty sees due work behind a running
+ * container, the idle-task reap sees due work and declines, and a recurring
+ * row is exempt from `expireStalePending`, so its series never re-arms
+ * (observed live 2026-09-15: one series silent for 57 hours across two containers).
+ *
+ * The predicate is a strict mirror of the runner's, so this can only complete
+ * a row the runner would never run. It is no grace period's business: the
+ * answer's timestamp and the row's `process_after` are both already written,
+ * and only the host moves `process_after` (synchronously, not under this
+ * call). A row carrying ANY ack is left alone — a live claim belongs to the
+ * container, a terminal one to the sync above, an orphan 'processing' one to
+ * `resetStuckProcessingRows` (src/modules/sweep-session-core/index.ts:50).
+ *
+ * Writes inbound only. The due filter is `countDueMessages`' own, so the rows
+ * considered are exactly the rows that hold a session "due".
+ */
+export function completeAnsweredPendingRows(inDb: Database.Database, outDb: Database.Database): string[] {
+  migrateMessagesInTable(inDb);
+  const due = inDb
+    .prepare(
+      `SELECT id, process_after AS processAfter FROM messages_in
+       WHERE status = 'pending'
+         AND repo_fence_epoch IS NULL
+         AND trigger = 1
+         AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
+    )
+    .all() as Array<{ id: string; processAfter: string | null }>;
+  if (due.length === 0) return [];
+
+  const answeredAtStmt = outDb.prepare(
+    "SELECT MAX(timestamp) AS ts FROM messages_out WHERE in_reply_to = ? AND kind != 'status'",
   );
-  const failStmt = inDb.prepare(
-    "UPDATE messages_in SET status = 'failed' WHERE id = ? AND status NOT IN ('completed', 'failed')",
-  );
-  inDb.transaction(() => {
-    for (const { message_id, status } of completed) {
-      (status === 'script-skip:error' ? failStmt : completeStmt).run(message_id);
-    }
-  })();
+  const completeStmt = inDb.prepare("UPDATE messages_in SET status = 'completed' WHERE id = ? AND status = 'pending'");
+  const backfilled: string[] = [];
+  for (const { id, processAfter } of due) {
+    const answeredAt = (answeredAtStmt.get(id) as { ts: string | null }).ts;
+    if (answeredAt === null) continue;
+    if (processAfter !== null && parseSqliteUtc(answeredAt) < parseSqliteUtc(processAfter)) continue;
+    if (hasProcessingAck(outDb, id)) continue;
+    if (completeStmt.run(id).changes > 0) backfilled.push(id);
+  }
+  return backfilled;
 }
 
 export interface ProcessingClaim {
