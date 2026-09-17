@@ -81,7 +81,13 @@ export function buildContainerCodexConfig(): string {
     // that file and its vendored constant are gone, so the value is stated
     // here — unchanged, so no container's subagent dispatch moves with this
     // deletion. A native spawn's own `reasoning_effort` still overrides it per
-    // task, which is how a delegation asks for anything but this default.
+    // task, which is how a delegation asks for anything but this default — but
+    // a ROLE carrying `model_reasoning_effort` beats BOTH, because the role is
+    // applied AFTER the spawn argument and sets the effort unconditionally
+    // (codex-rs 0.154.0 core/src/tools/handlers/multi_agents/spawn.rs:97-107,
+    // core/src/agent/role.rs:191-193). `formatCodexAgentToml` writes that key
+    // for any agent `.md` with an `effort:` (src/claude-agent-md.ts), so the
+    // five delegation shims are exactly such roles.
     // Kept byte-identical with CONTAINER_CODEX_CONFIG_BASE in
     // container/agent-runner/src/codex-companion-setup.ts (parallel Bun tree,
     // no shared modules); src/provider-surfaces.test.ts proves the two agree.

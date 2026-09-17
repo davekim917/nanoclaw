@@ -237,17 +237,19 @@ jobs:
           # text — hence the three normalizations below.
           content=$(printf '%s' "$content" | tr -d '\r')
 
-          # 1. Strip `//` line comments, BEFORE the array is located. A
-          #    commented-out id is not part of the roster, and without this an
-          #    operator pausing the Claude reviewer by commenting its line out
-          #    would still have that id resolved and used. Model ids contain no
-          #    `//`, so nothing real is lost; a `//` inside some other string on
-          #    those lines would truncate it, which can only cost a match and
-          #    therefore only ever fails loudly below.
+          # 1. Strip comments BEFORE the array is located — `//` to end of line
+          #    first, then `/* … */` once the text is one line. A commented-out
+          #    id is not part of the roster: without this, an operator pausing
+          #    the Claude reviewer by commenting its id out still had that id
+          #    resolved and used, in EITHER comment style. Model ids contain
+          #    neither delimiter, so nothing real is lost; a `//` inside some
+          #    other string would truncate that line, which can only cost a
+          #    match and so only ever fails loudly below.
           # 2. Flatten to a single line, so the array literal can be matched as
           #    one expression whether it is written on one line or wrapped over
           #    several.
           flat=$(printf '%s\n' "$content" | sed -E 's;//.*$;;' | tr '\n' ' ')
+          flat=$(printf '%s' "$flat" | sed -E 's;/\*([^*]|\*+[^*/])*\*+/;;g')
 
           # 3. The FRONTIER_MODELS array literal: the declaration, then
           #    everything from the `[` that opens the array to the FIRST `]`
@@ -259,13 +261,25 @@ jobs:
           #    `[1m]` suffix) still truncates the literal there, so such a
           #    roster fails below as "found 0" rather than by name — imprecise,
           #    but fail-closed: no `[1m]` id can reach the reviewer input.
-          array=$(printf '%s' "$flat" \
-            | grep -oE "(export[[:space:]]+)?const[[:space:]]+FRONTIER_MODELS[^=]*=[[:space:]]*\[[^]]*\]" \
-            | head -n 1 || true)
-          if [ -z "$array" ]; then
-            echo "could not find a FRONTIER_MODELS array literal in $ROSTER@$BASE_SHA" >&2
+          #
+          #    The name is bounded on BOTH sides. Without the trailing
+          #    `([[:space:]]*:|[[:space:]]*=)` a longer name starting with the
+          #    same prefix matches too — a `FRONTIER_MODELS_PREVIOUS = [...]`
+          #    declared above the real one resolved to the PREVIOUS array and
+          #    exited 0, reviewing with a superseded model. Leading `[^A-Za-z0-9_]`
+          #    (or start-of-text) does the same for a `NEXT_FRONTIER_MODELS`.
+          # 4. Every match is counted, not just the first: two declarations that
+          #    both satisfy the pattern mean the roster carries a choice this
+          #    step is not entitled to make silently, so it fails rather than
+          #    taking whichever comes first.
+          decl="(^|[^A-Za-z0-9_\$])(export[[:space:]]+)?const[[:space:]]+FRONTIER_MODELS[[:space:]]*(:[^=]*)?=[[:space:]]*\[[^]]*\]"
+          matches=$(printf '%s' "$flat" | grep -oE "$decl" || true)
+          decl_count=$(printf '%s\n' "$matches" | grep -cE 'FRONTIER_MODELS' || true)
+          if [ "$decl_count" -ne 1 ]; then
+            echo "expected exactly one FRONTIER_MODELS array literal in $ROSTER@$BASE_SHA, found $decl_count" >&2
             exit 1
           fi
+          array="$matches"
 
           # Every quoted string inside that literal, one per line, unquoted.
           # `grep` exits 1 on no match and pipefail would make that the whole

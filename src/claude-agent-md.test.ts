@@ -270,9 +270,11 @@ describe('formatCodexAgentToml carries `effort:` as model_reasoning_effort', () 
 
   test('treats a blank effort as absent rather than emitting the one value Codex rejects', () => {
     // `ReasoningEffort::from_str` errors on "" and only on ""
-    // (codex-rs protocol/src/openai_models.rs:137-155), and the role file is
-    // `deny_unknown_fields`, so `model_reasoning_effort = ""` would fail the
-    // whole TOML to parse. Exercised via a hand-built ClaudeAgent, the path
+    // (codex-rs protocol/src/openai_models.rs:139-157), and its `Deserialize`
+    // is a thin wrapper that passes that error straight on (`:130-136`), so
+    // `model_reasoning_effort = ""` fails the whole role file to parse. This is
+    // a KNOWN key with a rejected value, nothing to do with the file's
+    // `deny_unknown_fields`. Exercised via a hand-built ClaudeAgent, the path
     // `parseClaudeAgentMd`'s own blank-folding does not cover.
     expect(formatCodexAgentToml({ name: 'a', description: 'd', body: 'b', effort: '   ' })).not.toContain(
       'model_reasoning_effort',

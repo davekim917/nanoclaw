@@ -80,14 +80,21 @@
  *      `supported_reasoning_levels`, returning
  *      "Reasoning effort `x` is not supported for model `y`"
  *      (`core/src/tools/handlers/multi_agents_common.rs:355-393`, validator at
- *      `:422-442`). Which levels a given model supports is NOT knowable from
- *      codex-rs: `supported_reasoning_levels` is served per model by the models
- *      manager, and the source carries no static table to read — so treat this
- *      as a live failure mode, not one ruled out here. Two things bound it: the
- *      check is skipped entirely when the model metadata came back as a
- *      fallback (`multi_agents_common.rs:384-386`), and a loud refusal at spawn
- *      is the outcome we want over a shim named for a level quietly running at
- *      another.
+ *      `:422-442`). Which levels a model supports IS readable: the catalog is
+ *      bundled into the binary (`models-manager/models.json`, compiled in by
+ *      `models-manager/src/lib.rs:12-16`), and in 0.154.0 `max` is missing from
+ *      `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini` and `gpt-5.2`, while `gpt-5.6-sol`,
+ *      `gpt-5.6-luna`, `gpt-5.6-terra` and `gpt-6-astra` all carry it. So the
+ *      one shim this can bite is `worker-max`, and only when it is spawned onto
+ *      a 5.5-or-older model: that spawn now fails where it previously ran at
+ *      the global default. Accepted. The fleet default is `DEFAULT_CODEX_MODEL`
+ *      = `gpt-5.6-sol` (`container/agent-runner/src/providers/codex.ts:417`),
+ *      no Codex group pins an older one, and a refusal naming the unsupported
+ *      level beats a shim called `worker-max` silently running at `high`. The
+ *      other four shims name `low`/`medium`/`high`/`xhigh`, which every model
+ *      in the catalog supports. One more bound: validation is skipped outright
+ *      when the model metadata came back as a fallback
+ *      (`multi_agents_common.rs:384-386`).
  *
  * Dropped (no Codex equivalent or runtime-specific):
  *   frontmatter.model       — Claude model names differ, and `inherit` (what
