@@ -120,6 +120,8 @@ cd container/agent-runner && bun run test  # bun:test + hermeticity
 
 Container typecheck is a separate tsconfig — after editing `container/agent-runner/src/`, run `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` (or `bun run typecheck` from that dir).
 
+**CI is not your test run.** A PR only gets typechecks; the full suite runs nightly (`.github/workflows/ci.yml` — ~20 min on GitHub's 2-vCPU runner against a 2,000 min/month quota, so it cannot run per push). Correctness before merge is the author's: run the test files for what you touched, throttled, never the full suite on this host — `flock <scratchpad>/vitest.lock ionice -c3 nice -n 10 node_modules/.bin/vitest run <files> --maxWorkers=2` — and say in the PR which files you ran. A red nightly opens or updates the issue "Nightly CI is red on main"; fix forward the same day. `gh workflow run ci.yml --ref <branch>` runs the full suite on demand for a change that warrants it.
+
 Service management: the host runs as a **system** unit, `nanoclaw-v2.service` — `sudo systemctl start|stop|restart nanoclaw-v2`. There is no `--user` unit; `systemctl --user` finds nothing.
 
 ## Module System (host)
