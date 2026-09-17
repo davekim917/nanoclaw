@@ -368,7 +368,17 @@ export async function discoverAuthorizationServer(
   for (const url of authorizationServerMetadataUrls(issuer)) {
     try {
       const metadata = await getJson<AuthorizationServerMetadata>(fetchImpl, url);
-      if (metadata.authorization_endpoint && metadata.token_endpoint) return { url, metadata };
+      if (metadata.authorization_endpoint && metadata.token_endpoint) {
+        // RFC 8414 §3.3 is an ACCEPTANCE test for a candidate, not a verdict on
+        // the whole probe (#905 review round 2). The probe list deliberately
+        // includes the ROOT well-known path as a fallback for a path-carrying
+        // issuer, and on a multi-tenant host that document is complete and
+        // belongs to somebody else. Checking it after the loop let that
+        // document abort a discovery the issuer-specific candidate two entries
+        // later would have completed.
+        assertIssuerMatches(metadata.issuer, issuer, url);
+        return { url, metadata };
+      }
       failures.push(`${url}: no authorization_endpoint/token_endpoint`);
     } catch (err) {
       failures.push(`${url}: ${err instanceof Error ? err.message : String(err)}`);
@@ -412,8 +422,10 @@ export async function discoverAuthorization(
   // this is the document every endpoint below is read out of.
   assertHttpsEndpoint(issuerOverride ? '--issuer' : 'authorization_servers entry', issuer);
 
+  // The issuer match is enforced INSIDE `discoverAuthorizationServer`, as a
+  // candidate acceptance test — a document that fails it is skipped and the
+  // next candidate is tried, rather than ending the probe.
   const asDoc = await discoverAuthorizationServer(fetchImpl, issuer);
-  assertIssuerMatches(asDoc.metadata.issuer, issuer, asDoc.url);
   return {
     resource: resourceDoc.metadata.resource,
     // The metadata value, not the one we asked for: they are now known to be

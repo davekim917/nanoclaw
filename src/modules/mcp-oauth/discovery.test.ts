@@ -472,3 +472,65 @@ describe('transport gate on the resource side (issue #876 P2-3)', () => {
     expect(() => assertResourceUrlIsSecure('MCP URL', 'http://127.0.0.1.evil.test/mcp')).toThrow(/must be https/);
   });
 });
+
+// #905 review round 2: the probe list includes the ROOT well-known path as a
+// fallback for a path-carrying issuer, and on a multi-tenant host that document
+// is complete and belongs to a different tenant. Checking the issuer after the
+// loop let that document end a discovery the tenant-specific candidate would
+// have completed.
+describe('a mismatched candidate is skipped, not fatal', () => {
+  const ISSUER = 'https://as.x.test/tenant-7';
+
+  it('keeps probing past a complete root document that belongs to another issuer', async () => {
+    const calls: string[] = [];
+    const fetchImpl = routed(
+      {
+        'https://mcp.x.test/mcp': json({}, 401),
+        'https://mcp.x.test/.well-known/oauth-protected-resource/mcp': json({
+          resource: 'https://mcp.x.test/mcp',
+          authorization_servers: [ISSUER],
+        }),
+        // Candidate 1 (…/oauth-authorization-server/tenant-7) 404s.
+        // Candidate 2: the host's root document — complete, and someone else's.
+        'https://as.x.test/.well-known/oauth-authorization-server': json({
+          issuer: 'https://as.x.test/tenant-1',
+          authorization_endpoint: 'https://as.x.test/tenant-1/authorize',
+          token_endpoint: 'https://as.x.test/tenant-1/token',
+        }),
+        // Candidate 3: the tenant's own document.
+        'https://as.x.test/.well-known/openid-configuration/tenant-7': json({
+          issuer: ISSUER,
+          authorization_endpoint: 'https://as.x.test/tenant-7/authorize',
+          token_endpoint: 'https://as.x.test/tenant-7/token',
+          code_challenge_methods_supported: ['S256'],
+        }),
+      },
+      calls,
+    );
+
+    const result = await discoverAuthorization(fetchImpl, 'https://mcp.x.test/mcp');
+    expect(result.issuer).toBe(ISSUER);
+    expect(result.tokenEndpoint).toBe('https://as.x.test/tenant-7/token');
+    // It really did read the other tenant's document and move on.
+    expect(calls).toContain('https://as.x.test/.well-known/oauth-authorization-server');
+  });
+
+  it('still fails, naming every mismatch, when NO candidate declares the right issuer', async () => {
+    const fetchImpl = routed({
+      'https://mcp.x.test/mcp': json({}, 401),
+      'https://mcp.x.test/.well-known/oauth-protected-resource/mcp': json({
+        resource: 'https://mcp.x.test/mcp',
+        authorization_servers: [ISSUER],
+      }),
+      'https://as.x.test/.well-known/oauth-authorization-server': json({
+        issuer: 'https://as.x.test/tenant-1',
+        authorization_endpoint: 'https://as.x.test/tenant-1/authorize',
+        token_endpoint: 'https://as.x.test/tenant-1/token',
+      }),
+    });
+
+    await expect(discoverAuthorization(fetchImpl, 'https://mcp.x.test/mcp')).rejects.toThrow(
+      /No authorization-server metadata for issuer[\s\S]*declares issuer "https:\/\/as\.x\.test\/tenant-1"/,
+    );
+  });
+});

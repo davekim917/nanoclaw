@@ -550,3 +550,76 @@ describe('a OneCLI outage costs one grant, not one per minute (P3c)', () => {
     }
   });
 });
+
+// #905 review round 2: a parked token with no stated `expires_in` had no clock,
+// so it was held forever — an outage longer than its real lifetime ended with a
+// dead bearer in the vault and no fresh grant ever attempted.
+describe('a parked token with no stated expiry is still bounded', () => {
+  async function seedDue(): Promise<void> {
+    const r = row({ expires_at: new Date(Date.now() + 60_000).toISOString() });
+    const { created_at: _c, updated_at: _u, ...insertable } = r;
+    await upsertMcpOAuthIntegration(insertable);
+    writeMcpOAuthBundle({
+      name: r.name,
+      clientId: 'client-1',
+      refreshToken: 'rt-old',
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  /** A server that states no `expires_in` at all. */
+  function endpoint(grants: string[]) {
+    return async () => {
+      grants.push(`grant-${grants.length + 1}`);
+      return tokenResponse({ access_token: `at-${grants.length}`, token_type: 'Bearer' });
+    };
+  }
+
+  it('re-mints once the unknown-expiry interval has passed', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    try {
+      await seedDue();
+      secretWriteFails = true;
+      const grants: string[] = [];
+      await refreshExpiringMcpOAuthIntegrations(endpoint(grants));
+      expect(grants).toEqual(['grant-1']);
+
+      secretWriteFails = false;
+      vi.setSystemTime(NOW + UNKNOWN_EXPIRY_REFRESH_INTERVAL_MS);
+      await refreshExpiringMcpOAuthIntegrations(endpoint(grants));
+
+      expect(grants).toEqual(['grant-1', 'grant-2']);
+      expect(secretWrites).toEqual([{ name: 'Dropbox-Files', value: 'at-2' }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stamps last_refresh_at with the MINT time on recovery, not the recovery time', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    try {
+      await seedDue();
+      secretWriteFails = true;
+      const grants: string[] = [];
+      await refreshExpiringMcpOAuthIntegrations(endpoint(grants));
+
+      // Recover well inside the interval; the token is still the one minted
+      // at NOW, so the 12-hour clock must keep running from NOW.
+      secretWriteFails = false;
+      vi.setSystemTime(NOW + 6 * 60 * 60 * 1000);
+      await refreshExpiringMcpOAuthIntegrations(endpoint(grants));
+
+      expect(grants).toEqual(['grant-1']);
+      const after = await getMcpOAuthIntegration('dropbox-files');
+      expect(after!.status).toBe('active');
+      expect(after!.expires_at).toBeNull();
+      expect(Date.parse(after!.last_refresh_at!)).toBe(NOW);
+      // …and the row is therefore due again 12 hours after the mint, not 18.
+      expect(decideRefresh({ ...after! }, NOW + UNKNOWN_EXPIRY_REFRESH_INTERVAL_MS).refresh).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

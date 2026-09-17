@@ -860,19 +860,28 @@ interface ParkedSecretWrite {
   scope: string | null;
   /** Expiry of THIS access token, so a token the outage outlived is dropped. */
   expiresAt: string | null;
+  /** When the token endpoint issued it. The only clock a token with no stated
+   *  `expires_in` has, and what `last_refresh_at` is set from on recovery. */
+  mintedAtMs: number;
   attempts: number;
   nextAttemptAtMs: number;
 }
 
 const pendingSecretWrites = new Map<string, ParkedSecretWrite>();
 
-function rememberPendingSecretWrite(name: string, token: TokenResponse, expiresAt: string | null): void {
+function rememberPendingSecretWrite(
+  name: string,
+  token: TokenResponse,
+  expiresAt: string | null,
+  mintedAtMs: number = Date.now(),
+): void {
   const attempts = (pendingSecretWrites.get(name)?.attempts ?? 0) + 1;
   pendingSecretWrites.set(name, {
     accessToken: token.accessToken,
     tokenType: token.tokenType || 'Bearer',
     scope: token.scope ?? null,
     expiresAt,
+    mintedAtMs,
     attempts,
     nextAttemptAtMs: Date.now() + secretWriteRetryDelayMs(attempts),
   });
@@ -891,11 +900,17 @@ function pendingWriteStatusDetail(name: string, err: unknown): string {
  * True once the parked token is too close to its own expiry to be worth
  * writing. Uses the same margin the refresher admits a row on, so a token
  * dropped here is immediately replaced by a fresh grant rather than leaving a
- * gap. A token with no stated expiry is never spent by the clock — there is no
- * clock to judge it by — and the backoff bounds the retries instead.
+ * gap.
+ *
+ * A token with no stated `expires_in` has no expiry to judge, and treating that
+ * as "never spent" parked it forever (#905 review round 2): an outage longer
+ * than its real lifetime would end with a dead bearer written to the vault and
+ * no fresh grant ever attempted. It is bounded by the same interval the
+ * refresher already uses for an unknown expiry — past that, a refresh was due
+ * anyway, so nothing is lost by re-minting.
  */
 function parkedTokenIsSpent(parked: ParkedSecretWrite, nowMs: number): boolean {
-  if (!parked.expiresAt) return false;
+  if (!parked.expiresAt) return nowMs - parked.mintedAtMs >= UNKNOWN_EXPIRY_REFRESH_INTERVAL_MS;
   const expiresMs = Date.parse(parked.expiresAt);
   if (!Number.isFinite(expiresMs)) return true;
   return expiresMs - nowMs <= REFRESH_MARGIN_MS;
@@ -925,7 +940,11 @@ async function retryPendingSecretWrite(
       expires_at: parked.expiresAt,
       scopes: parked.scope ?? row.scopes,
       bearer_secret_id: secret.id,
-      last_refresh_at: new Date().toISOString(),
+      // The MINT time, not now. For a token with no stated expiry
+      // `decideRefresh` measures its 12-hour interval from this column, and
+      // stamping it with the recovery time would hand a token that is already
+      // hours old another full interval.
+      last_refresh_at: new Date(parked.mintedAtMs).toISOString(),
     });
     // The same tail `finalizeToken` runs: a bearer the group does not declare
     // is a bearer the agent is never granted (`src/onecli-secrets.ts`
@@ -942,6 +961,7 @@ async function retryPendingSecretWrite(
       row.name,
       { accessToken: parked.accessToken, tokenType: parked.tokenType, scope: parked.scope ?? undefined },
       parked.expiresAt,
+      parked.mintedAtMs,
     );
     await markMcpOAuthIntegration(row.name, {
       status: 'error',
