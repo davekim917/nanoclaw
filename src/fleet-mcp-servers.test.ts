@@ -132,6 +132,38 @@ describe('entry validation', () => {
     expect(() => readFleetMcpServers()).toThrow(/letters, digits/);
   });
 
+  it('refuses every wrong field shape, not just the transport', () => {
+    // A string `args` clears `args.length > 0` and then throws on `.map` while
+    // Codex writes its TOML
+    // (container/agent-runner/src/providers/codex-app-server.ts:749-750) — in
+    // every group, since a fleet entry is inherited fleet-wide.
+    write({ srv: { command: 'bun', args: '--serve' } });
+    expect(() => readFleetMcpServers()).toThrow(/args must be an array of strings/);
+
+    write({ srv: { command: 'bun', env: { OK: 1 } } });
+    expect(() => readFleetMcpServers()).toThrow(/env must be an object with string values/);
+
+    write({ srv: { command: 'bun', env: { 'not an env name': 'x' } } });
+    expect(() => readFleetMcpServers()).toThrow(/is not a valid env name/);
+
+    write({ srv: { type: 'http', url: 'https://x.test/mcp', headers: { 'Bad Header': 'x' } } });
+    expect(() => readFleetMcpServers()).toThrow(/is not a valid headers name/);
+
+    write({ srv: { type: 'http', url: 'https://x.test/mcp', description: 42 } });
+    expect(() => readFleetMcpServers()).toThrow(/description must be a string/);
+
+    write({ srv: { type: 'http', url: 'https://x.test/mcp', displayName: '  ' } });
+    expect(() => readFleetMcpServers()).toThrow(/displayName must be a non-empty string/);
+
+    // A field that belongs to per-group plugin provenance, which a fleet-wide
+    // entry has no way to mean.
+    write({ srv: { command: 'bun', pluginRoot: '/workspace/agent/plugins/x' } });
+    expect(() => readFleetMcpServers()).toThrow(/unsupported field/);
+
+    write({ srv: { type: 'http', url: 'https://x.test/mcp', env: { A: 'b' } } });
+    expect(() => readFleetMcpServers()).toThrow(/unsupported field/);
+  });
+
   it('refuses a retired name the runner would delete anyway', () => {
     write({ 'slack-user-token': { type: 'http', url: 'https://slack.test/mcp' } });
     expect(() => readFleetMcpServers()).toThrow(/retired/);

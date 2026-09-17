@@ -155,6 +155,50 @@ function validateFleetEntry(name: string, entry: McpServerConfig): void {
   if (server.type !== undefined && server.type !== 'stdio' && server.type !== 'http') {
     fail(`server ${name} has unsupported transport ${JSON.stringify(server.type)}`);
   }
+  // Every remaining field, by the same shapes `parseMcpServerConfig` enforces
+  // (src/container-config.ts:396-520) — minus its normalization. A wrong shape
+  // here is inherited by EVERY group and only fails inside the container: a
+  // string `args` survives `args.length > 0` and then throws on `.map` while
+  // Codex writes its TOML (container/agent-runner/src/providers/codex-app-server.ts:749-750).
+  // Unknown keys are refused rather than passed along, because the fields that
+  // are not here (`cwd`, `plugin`, `pluginRoot`) are per-group plugin
+  // provenance that a fleet-wide entry has no way to mean.
+  const allowed = new Set(
+    hasUrl
+      ? ['type', 'url', 'headers', 'instructions', 'displayName', 'description']
+      : ['type', 'command', 'args', 'env', 'instructions', 'displayName', 'description'],
+  );
+  for (const key of Object.keys(server)) {
+    if (!allowed.has(key)) fail(`server ${name} has unsupported field ${JSON.stringify(key)}`);
+  }
+  if (server.args !== undefined && (!Array.isArray(server.args) || !server.args.every((a) => typeof a === 'string'))) {
+    fail(`server ${name} args must be an array of strings`);
+  }
+  for (const field of ['env', 'headers'] as const) {
+    const value = server[field];
+    if (value === undefined) continue;
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      fail(`server ${name} ${field} must be an object with string values`);
+    }
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof item !== 'string') fail(`server ${name} ${field} must be an object with string values`);
+      // Env keys reach a process environment; header names reach the wire.
+      const keyOk =
+        field === 'env' ? /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) : /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/.test(key);
+      if (!keyOk) fail(`server ${name} ${field} key ${JSON.stringify(key)} is not a valid ${field} name`);
+    }
+  }
+  for (const field of ['instructions', 'description'] as const) {
+    if (server[field] !== undefined && typeof server[field] !== 'string')
+      fail(`server ${name} ${field} must be a string`);
+  }
+  if (
+    server.displayName !== undefined &&
+    (typeof server.displayName !== 'string' || server.displayName.trim() === '')
+  ) {
+    fail(`server ${name} displayName must be a non-empty string`);
+  }
+
   if (hasUrl) {
     if (server.type === 'stdio') fail(`server ${name} declares type "stdio" with a url`);
     let parsed: URL;
