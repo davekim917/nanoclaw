@@ -4,7 +4,8 @@
 # of opening N screenshots. This is deterministic evidence collection — no
 # LLM browser time — same motivation as smoke-build-identity.sh.
 #
-# Usage: smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> [source-sha]
+# Usage: smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> \
+#          [source-sha] [baseline-url] [baseline-auth-state.json]
 #
 #   <run-dir>          an existing smoke-test run directory. Reads
 #                       <run-dir>/contact-sheet/shots.json (already written by
@@ -28,7 +29,38 @@
 #                       served page for `meta[name="build-sha"]`,
 #                       `window.__BUILD_SHA__`, or a `data-build-sha`
 #                       attribute — the app may expose none of those, in
-#                       which case `buildSha` ends up empty.
+#                       which case `buildSha` ends up empty. Pass "" to
+#                       skip it when a baseline follows.
+#   [baseline-url]      optional. The deployment this build is compared
+#                       against (e.g. the develop deployment). See "Baseline
+#                       diff" below. Omitted: no baseline is touched and no
+#                       diff key appears anywhere in the outputs.
+#   [baseline-auth-state.json]
+#                       optional, defaults to <auth-state.json>. Cookies are
+#                       origin-scoped, so a baseline on another origin needs
+#                       a state file valid there. Same placement rules as
+#                       <auth-state.json>, same refusal.
+#
+# What is graded: for every screen and width, `file` in manifest.json is a
+# VIEWPORT-sized capture (1280x900, 390x844) taken with CSS animations and
+# transitions frozen, after two consecutive captures matched pixel for pixel
+# (`settled`). `fullPage` is a second, full-height capture named `*-full.png`,
+# kept for context only and never graded: full-page stitching misplaces
+# fixed/sticky headers and drawers, which has produced false BROKEN findings.
+# A page that never stops moving is still captured, with `settled: false` and
+# an UNSETTLED badge on its tile — such a tile is not evidence of breakage.
+#
+# Baseline diff: with a baseline url, each screen/width is first captured
+# from the baseline with the IDENTICAL recipe (own fresh session, state load,
+# open, the same `steps`, freeze, viewport, settle) into `*-base.png`, then
+# pixel-diffed against the head page (`agent-browser diff screenshot`), and
+# the manifest entry gains `diff: {status: changed|unchanged|failed, pct,
+# differentPixels, image, baseline, reason}`. Tiles are ordered changed
+# (largest first), then diff-failed, then unchanged. Baseline capture is
+# STRICTLY READ-ONLY — navigation, the declared `steps`, the local freeze
+# style, screenshot; no build-sha sniff, no full-page capture, nothing else.
+# Any baseline failure degrades to `diff.status: "failed"` with a reason for
+# that screen/width; it never fails or alters the head capture.
 #
 # SECURITY: the auth state file holds a live session token. This script
 # REFUSES a path that resolves (realpath) inside <run-dir> or anywhere under
@@ -78,8 +110,15 @@
 #     XPath only (`click --help`). The text locator is `find text "<v>" click`.
 #   - `state load <path>` must run BEFORE `open`, in the same session: it sets
 #     the state path, applied on the session's next navigation.
-#   - `set viewport <w> <h>` and `screenshot --full <path>` behave exactly as
-#     documented.
+#   - `set viewport <w> <h>`, `screenshot <path>` (viewport) and
+#     `screenshot --full <path>` behave exactly as documented.
+#   - `--json diff screenshot --baseline <png> -o <png>` screenshots the
+#     session's CURRENT page and compares it to the file: exit 0 either way,
+#     `{"success":true,"data":{"match":false,"mismatchPercentage":4.44375,
+#     "differentPixels":51192,"totalPixels":1152000,"dimensionMismatch":null,
+#     "diffPath":"..."}}`. On a match it writes NO diff image. A size
+#     mismatch reports `dimensionMismatch:{expected,actual}` at 100%. An
+#     unreadable baseline is exit 1 with `success:false`.
 #   - a `--session <name>` this script has not used before starts fresh: the
 #     `agent-browser` skill documents a REUSED session name as the thing that
 #     "persists across invocations... instead of starting fresh"
@@ -103,11 +142,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAX_SHOTS=8
-# A resize-driven drawer transition in the observed PR #1857 campaign was
-# still mid-slide immediately after the 390px viewport switch and settled by
-# 1.5 seconds. Keep a small margin and make the mobile capture wait explicit:
-# a timing artifact is not acceptable visual evidence.
-MOBILE_VIEWPORT_SETTLE_MS=1600
+# Settling is measured, not slept: a capture is settled when the live page
+# still matches it pixel for pixel. A resize-driven drawer in the PR #1857
+# campaign was mid-slide right after the 390px switch; the freeze below stops
+# CSS-driven motion outright and this loop covers what CSS cannot (JS-driven
+# motion, late data).
+SETTLE_MAX_ATTEMPTS=4
+SETTLE_INTERVAL_MS=400
+# Zero-duration rather than `animation:none`: an entry animation that ends at
+# opacity:1 from a base style of opacity:0 must land on its END state, not be
+# cancelled back to invisible. Idempotent, so it is re-asserted per capture.
+FREEZE_JS='(function(){var i="smoke-contact-sheet-freeze";if(!document.getElementById(i)){var s=document.createElement("style");s.id=i;s.textContent="*,*::before,*::after{animation-duration:0s!important;animation-delay:0s!important;animation-iteration-count:1!important;transition-duration:0s!important;transition-delay:0s!important;scroll-behavior:auto!important;caret-color:transparent!important}";document.documentElement.appendChild(s)}return "frozen"})()'
 
 die() { jq -cn --arg e "$1" '{ok:false,error:$e}'; exit 2; }
 
@@ -115,13 +160,20 @@ RUN_DIR="${1:-}"
 BASE_URL="${2:-}"
 AUTH_STATE="${3:-}"
 SOURCE_SHA="${4:-}"
+BASELINE_URL="${5:-}"
+BASELINE_AUTH="${6:-$AUTH_STATE}"
 
 [ -n "$RUN_DIR" ] && [ -n "$BASE_URL" ] && [ -n "$AUTH_STATE" ] ||
-  die "usage: smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> [source-sha]"
+  die "usage: smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> [source-sha] [baseline-url] [baseline-auth-state.json]"
 [ -d "$RUN_DIR" ] || die "run dir does not exist: $RUN_DIR"
 printf '%s' "$BASE_URL" | grep -Eq '^https?://' ||
   die "base url must start with http:// or https://"
 [ -s "$AUTH_STATE" ] || die "auth state file is missing or empty: $AUTH_STATE"
+if [ -n "$BASELINE_URL" ]; then
+  printf '%s' "$BASELINE_URL" | grep -Eq '^https?://' ||
+    die "baseline url must start with http:// or https://"
+  [ -s "$BASELINE_AUTH" ] || die "baseline auth state file is missing or empty: $BASELINE_AUTH"
+fi
 # A caller-supplied SHA is trusted verbatim into a shared, durable manifest —
 # refuse a malformed value rather than writing junk (e.g. a branch name, or
 # an accidentally-passed URL) into evidence other sessions read as fact.
@@ -137,19 +189,24 @@ fi
 # /workspace/workgroup must still compare correctly.
 WORKGROUP_ROOT="${SMOKE_WORKGROUP_ROOT:-/workspace/workgroup}"
 RUN_DIR_RESOLVED="$(realpath -e "$RUN_DIR")"
-AUTH_STATE_RESOLVED="$(realpath -e "$AUTH_STATE")"
 WORKGROUP_ROOT_RESOLVED="$(realpath -m "$WORKGROUP_ROOT")"
 
-case "$AUTH_STATE_RESOLVED" in
-  "$RUN_DIR_RESOLVED"|"$RUN_DIR_RESOLVED"/*)
-    die "auth state must not live inside the run dir (shared, readable evidence tree): $AUTH_STATE"
-    ;;
-esac
-case "$AUTH_STATE_RESOLVED" in
-  "$WORKGROUP_ROOT_RESOLVED"|"$WORKGROUP_ROOT_RESOLVED"/*)
-    die "auth state must not live under the shared workgroup tree ($WORKGROUP_ROOT): $AUTH_STATE"
-    ;;
-esac
+refuse_shared_auth() {
+  local resolved
+  resolved="$(realpath -e "$1")"
+  case "$resolved" in
+    "$RUN_DIR_RESOLVED"|"$RUN_DIR_RESOLVED"/*)
+      die "auth state must not live inside the run dir (shared, readable evidence tree): $1"
+      ;;
+  esac
+  case "$resolved" in
+    "$WORKGROUP_ROOT_RESOLVED"|"$WORKGROUP_ROOT_RESOLVED"/*)
+      die "auth state must not live under the shared workgroup tree ($WORKGROUP_ROOT): $1"
+      ;;
+  esac
+}
+refuse_shared_auth "$AUTH_STATE"
+[ -z "$BASELINE_URL" ] || refuse_shared_auth "$BASELINE_AUTH"
 
 CS_DIR="$RUN_DIR/contact-sheet"
 SHOTS_JSON="$CS_DIR/shots.json"
@@ -191,7 +248,7 @@ cleanup() {
       [ -n "$s" ] && agent-browser --session "$s" close >/dev/null 2>&1 || true
     done <"$SESSIONS_FILE"
   fi
-  rm -f "$SESSIONS_FILE"
+  rm -f "$SESSIONS_FILE" "$SESSIONS_FILE.settle.png"
 }
 trap cleanup EXIT
 
@@ -251,6 +308,118 @@ run_step() {
   esac
 }
 
+# open_screen SIDE SESSION AUTH URL STEPS_JSON -> 0/1, sets SESSION and, on
+# failure, NAV_ERR. The one navigation recipe, shared by head and baseline so
+# the two captures cannot drift apart. SIDE=base skips the build-sha sniff:
+# the baseline is read-only and its sha is not this build's.
+open_screen() {
+  local side="$1" auth="$3" url="$4" steps="$5" out step verb rest
+  SESSION="$2"
+  NAV_ERR=""
+  # Registered for cleanup before use so a mid-screen crash still closes it.
+  printf '%s\n' "$SESSION" >>"$SESSIONS_FILE"
+  if ! out="$(agent-browser --session "$SESSION" state load "$auth" 2>&1)"; then
+    NAV_ERR="state load: $out"
+    return 1
+  fi
+  if ! out="$(agent-browser --session "$SESSION" open "$url" 2>&1)"; then
+    NAV_ERR="open $url: $out"
+    return 1
+  fi
+  if [ "$side" = head ] && [ -z "$BUILD_SHA" ]; then
+    out="$(agent-browser --session "$SESSION" eval "$BUILD_SHA_JS" 2>/dev/null || true)"
+    out="$(printf '%s' "$out" | tr -d '"' | tr -d '[:space:]')"
+    [ -n "$out" ] && [ "$out" != "null" ] && BUILD_SHA="$out" || true
+  fi
+  while IFS= read -r step; do
+    [ -n "$step" ] || continue
+    verb="${step%% *}"
+    if [ "$verb" = "$step" ]; then rest=""; else rest="${step#* }"; fi
+    if ! run_step "$verb" "$rest"; then
+      NAV_ERR="$STEP_ERR"
+      return 1
+    fi
+  done < <(printf '%s' "$steps" | jq -r '.[]')
+  # Best-effort: some apps keep a long-lived connection open and never go
+  # idle. The per-capture settle loop below is what the image relies on.
+  agent-browser --session "$SESSION" wait --load networkidle >/dev/null 2>&1 || true
+  return 0
+}
+
+# capture_view W H FILE -> 0/1 in $SESSION, sets CAP_REASON and CAP_SETTLED.
+# Viewport-sized, animations frozen, re-captured until the live page still
+# matches the file (see SETTLE_* above).
+SETTLE_DIFF="$SESSIONS_FILE.settle.png"
+capture_view() {
+  local w="$1" h="$2" file="$3" out attempt=1
+  CAP_REASON=""
+  CAP_SETTLED=false
+  if ! out="$(agent-browser --session "$SESSION" set viewport "$w" "$h" 2>&1)"; then
+    CAP_REASON="viewport ${w}x${h} failed: $out"
+    return 1
+  fi
+  if ! out="$(agent-browser --session "$SESSION" eval "$FREEZE_JS" 2>&1)" ||
+     ! printf '%s' "$out" | grep -q frozen; then
+    CAP_REASON="animation freeze failed: $out"
+    return 1
+  fi
+  while :; do
+    rm -f "$file"
+    if ! out="$(agent-browser --session "$SESSION" screenshot "$file" 2>&1)"; then
+      CAP_REASON="${out:-screenshot failed}"
+      return 1
+    fi
+    [ -s "$file" ] || { CAP_REASON="screenshot produced no file"; return 1; }
+    if out="$(agent-browser --session "$SESSION" --json diff screenshot --baseline "$file" -o "$SETTLE_DIFF" 2>/dev/null)" &&
+       printf '%s' "$out" | jq -e '.data.match == true' >/dev/null 2>&1; then
+      CAP_SETTLED=true
+    fi
+    rm -f "$SETTLE_DIFF"
+    [ "$CAP_SETTLED" = true ] || [ "$attempt" -ge "$SETTLE_MAX_ATTEMPTS" ] && break
+    attempt=$((attempt + 1))
+    agent-browser --session "$SESSION" wait "$SETTLE_INTERVAL_MS" >/dev/null 2>&1 || true
+  done
+  return 0
+}
+
+# diff_view BASE_FILE BASE_REASON DIFF_FILE REL_BASE REL_DIFF -> DIFF_JSON.
+# Compares $SESSION's current (just-captured, frozen) page to the baseline
+# capture. Never fails the caller.
+diff_view() {
+  local base_file="$1" base_reason="$2" diff_file="$3" rel_base="$4" rel_diff="$5" out
+  if [ -n "$base_reason" ]; then
+    DIFF_JSON="$(jq -cn --arg r "baseline: $base_reason" '{status:"failed",reason:$r}')"
+    return 0
+  fi
+  rm -f "$diff_file"
+  if ! out="$(agent-browser --session "$SESSION" --json diff screenshot --baseline "$base_file" -o "$diff_file" 2>&1)" ||
+     ! printf '%s' "$out" | jq -e '.success == true and (.data | type == "object")' >/dev/null 2>&1; then
+    DIFF_JSON="$(jq -cn --arg r "diff failed: $out" --arg b "$rel_base" '{status:"failed",baseline:$b,reason:$r}')"
+    return 0
+  fi
+  local rel_image=""
+  [ -s "$diff_file" ] && rel_image="$rel_diff" || true
+  DIFF_JSON="$(printf '%s' "$out" | jq -c --arg b "$rel_base" --arg img "$rel_image" '.data |
+    if .dimensionMismatch != null then
+      {status:"failed", baseline:$b, reason:("dimension mismatch: " + (.dimensionMismatch | tojson))}
+    else
+      {status:(if .match then "unchanged" else "changed" end),
+       pct:.mismatchPercentage, differentPixels:.differentPixels,
+       image:(if $img == "" then null else $img end), baseline:$b}
+    end')"
+}
+
+# The baseline auth state gets the same up-front load probe, but a failure
+# only disables the diff — it must never stop the head capture.
+BASELINE_DISABLED=""
+if [ -n "$BASELINE_URL" ] && [ "$BASELINE_AUTH" != "$AUTH_STATE" ]; then
+  printf '%s\n' "${SESSION_BASE}-basepreflight" >>"$SESSIONS_FILE"
+  if ! LOAD_OUT="$(agent-browser --session "${SESSION_BASE}-basepreflight" state load "$BASELINE_AUTH" 2>&1)"; then
+    BASELINE_DISABLED="could not load baseline auth state: $LOAD_OUT"
+  fi
+  agent-browser --session "${SESSION_BASE}-basepreflight" close >/dev/null 2>&1 || true
+fi
+
 I=0
 while IFS= read -r SCREEN; do
   IDX="$(printf '%02d' "$I")"
@@ -263,97 +432,74 @@ while IFS= read -r SCREEN; do
     /*) ;;
     *) SCREEN_PATH="/$SCREEN_PATH" ;;
   esac
-  URL="${BASE_URL%/}${SCREEN_PATH}"
+  STEPS="$(printf '%s' "$SCREEN" | jq -c '.steps // []')"
+
+  # Baseline first, in its own never-before-used session, so the head page is
+  # the live one when the diff runs. BASE_REASON_<w> non-empty = no baseline
+  # image for that width.
+  BASE_REASON_1280=""
+  BASE_REASON_390=""
+  if [ -n "$BASELINE_URL" ]; then
+    if [ -n "$BASELINE_DISABLED" ]; then
+      BASE_REASON_1280="$BASELINE_DISABLED"
+      BASE_REASON_390="$BASELINE_DISABLED"
+    else
+      if open_screen base "${SESSION_BASE}-base${IDX}" "$BASELINE_AUTH" "${BASELINE_URL%/}${SCREEN_PATH}" "$STEPS"; then
+        capture_view 1280 900 "$SHOTS_DIR/${BASENAME}-1280-base.png" || BASE_REASON_1280="$CAP_REASON"
+        capture_view 390 844 "$SHOTS_DIR/${BASENAME}-390-base.png" || BASE_REASON_390="$CAP_REASON"
+      else
+        BASE_REASON_1280="$NAV_ERR"
+        BASE_REASON_390="$NAV_ERR"
+      fi
+      agent-browser --session "$SESSION" close >/dev/null 2>&1 || true
+    fi
+  fi
 
   # A never-before-used session name per screen — a fresh browser context,
-  # not a URL this script has navigated in before. Registered for cleanup
-  # before use so a mid-screen crash still gets it closed.
-  SESSION="${SESSION_BASE}-scr${IDX}"
-  printf '%s\n' "$SESSION" >>"$SESSIONS_FILE"
+  # not a URL this script has navigated in before.
+  NAV_OK=true
+  open_screen head "${SESSION_BASE}-scr${IDX}" "$AUTH_STATE" "${BASE_URL%/}${SCREEN_PATH}" "$STEPS" || NAV_OK=false
 
-  STATE_OK=true
-  STATE_ERR=""
-  if ! OUT="$(agent-browser --session "$SESSION" state load "$AUTH_STATE" 2>&1)"; then
-    STATE_OK=false
-    STATE_ERR="state load: $OUT"
-  fi
-
-  OPEN_OK=true
-  OPEN_ERR=""
-  if [ "$STATE_OK" = true ]; then
-    if ! OUT="$(agent-browser --session "$SESSION" open "$URL" 2>&1)"; then
-      OPEN_OK=false
-      OPEN_ERR="open $URL: $OUT"
-    fi
-  else
-    OPEN_OK=false
-    OPEN_ERR="$STATE_ERR"
-  fi
-
-  if [ "$OPEN_OK" = true ] && [ -z "$BUILD_SHA" ]; then
-    SHA_OUT="$(agent-browser --session "$SESSION" eval "$BUILD_SHA_JS" 2>/dev/null || true)"
-    SHA_OUT="$(printf '%s' "$SHA_OUT" | tr -d '"' | tr -d '[:space:]')"
-    [ -n "$SHA_OUT" ] && [ "$SHA_OUT" != "null" ] && BUILD_SHA="$SHA_OUT" || true
-  fi
-
-  STEP_OK=true
-  STEP_ERR=""
-  if [ "$OPEN_OK" = true ]; then
-    while IFS= read -r STEP; do
-      [ -n "$STEP" ] || continue
-      VERB="${STEP%% *}"
-      if [ "$VERB" = "$STEP" ]; then REST=""; else REST="${STEP#* }"; fi
-      if ! run_step "$VERB" "$REST"; then
-        STEP_OK=false
-        break
+  CAPTURED_ANY=false
+  CAPTURED_ALL=true
+  WIDTHS_JSON='{}'
+  for VIEW in "desktop 1280 900" "mobile 390 844"; do
+    # shellcheck disable=SC2086 # intentional split of the fixed triple above
+    set -- $VIEW
+    KEY="$1" W="$2" H="$3"
+    REL="shots/${BASENAME}-${W}"
+    if [ "$NAV_OK" = true ] && capture_view "$W" "$H" "$CS_DIR/$REL.png"; then
+      CAPTURED_ANY=true
+      DIFF_JSON=null
+      if [ -n "$BASELINE_URL" ]; then
+        BASE_REASON_VAR="BASE_REASON_${W}"
+        diff_view "$CS_DIR/$REL-base.png" "${!BASE_REASON_VAR}" "$CS_DIR/$REL-diff.png" "$REL-base.png" "$REL-diff.png"
       fi
-    done < <(printf '%s' "$SCREEN" | jq -r '(.steps // [])[]')
-    # Best-effort settle after steps navigate/mutate the page. Never fails the
-    # screen on its own — some apps keep a long-lived connection open and
-    # never go idle, and a screenshot of a not-perfectly-settled page is still
-    # useful evidence.
-    [ "$STEP_OK" = true ] &&
-      agent-browser --session "$SESSION" wait --load networkidle >/dev/null 2>&1 || true
-  fi
-
-  NAV_OK=$([ "$OPEN_OK" = true ] && [ "$STEP_OK" = true ] && echo true || echo false)
-  NAV_ERR="$OPEN_ERR"
-  [ "$OPEN_OK" = true ] && [ "$STEP_OK" = false ] && NAV_ERR="$STEP_ERR" || true
-
-  DESKTOP_FILE="$SHOTS_DIR/${BASENAME}-1280.png"
-  DESKTOP_CAPTURED=false
-  DESKTOP_REASON=""
-  if [ "$NAV_OK" = true ]; then
-    if agent-browser --session "$SESSION" set viewport 1280 900 >/dev/null 2>&1 &&
-       SHOT_OUT="$(agent-browser --session "$SESSION" screenshot --full "$DESKTOP_FILE" 2>&1)"; then
-      [ -s "$DESKTOP_FILE" ] && DESKTOP_CAPTURED=true || DESKTOP_REASON="screenshot produced no file"
+      # Context only, after the graded capture and the diff so its scrolling
+      # cannot disturb either. Best-effort: its absence changes no status.
+      FULL_REL=""
+      if agent-browser --session "$SESSION" screenshot --full "$CS_DIR/$REL-full.png" >/dev/null 2>&1 &&
+         [ -s "$CS_DIR/$REL-full.png" ]; then
+        FULL_REL="$REL-full.png"
+      fi
+      ENTRY="$(jq -cn --arg f "$REL.png" --arg full "$FULL_REL" --argjson settled "$CAP_SETTLED" --argjson diff "$DIFF_JSON" \
+        '{captured:true, file:$f, graded:"viewport", settled:$settled,
+          fullPage:(if $full == "" then null else $full end)}
+         + (if $diff == null then {} else {diff:$diff} end)')"
     else
-      DESKTOP_REASON="${SHOT_OUT:-desktop viewport/screenshot failed}"
+      CAPTURED_ALL=false
+      REASON="$CAP_REASON"
+      [ "$NAV_OK" = true ] || REASON="$NAV_ERR"
+      ENTRY="$(jq -cn --arg r "$REASON" --argjson b "$([ -n "$BASELINE_URL" ] && echo true || echo false)" \
+        '{captured:false, file:null, reason:$r}
+         + (if $b then {diff:{status:"failed",reason:"head not captured"}} else {} end)')"
     fi
-  else
-    DESKTOP_REASON="$NAV_ERR"
-  fi
+    WIDTHS_JSON="$(printf '%s' "$WIDTHS_JSON" | jq -c --arg k "$KEY" --argjson e "$ENTRY" '. + {($k): $e}')"
+  done
 
-  MOBILE_FILE="$SHOTS_DIR/${BASENAME}-390.png"
-  MOBILE_CAPTURED=false
-  MOBILE_REASON=""
-  if [ "$NAV_OK" = true ]; then
-    if ! agent-browser --session "$SESSION" set viewport 390 844 >/dev/null 2>&1; then
-      MOBILE_REASON="mobile viewport failed"
-    elif ! SETTLE_OUT="$(agent-browser --session "$SESSION" wait "$MOBILE_VIEWPORT_SETTLE_MS" 2>&1)"; then
-      MOBILE_REASON="mobile viewport settle failed: $SETTLE_OUT"
-    elif SHOT_OUT="$(agent-browser --session "$SESSION" screenshot --full "$MOBILE_FILE" 2>&1)"; then
-      [ -s "$MOBILE_FILE" ] && MOBILE_CAPTURED=true || MOBILE_REASON="screenshot produced no file"
-    else
-      MOBILE_REASON="${SHOT_OUT:-mobile screenshot failed}"
-    fi
-  else
-    MOBILE_REASON="$NAV_ERR"
-  fi
-
-  if [ "$DESKTOP_CAPTURED" = true ] && [ "$MOBILE_CAPTURED" = true ]; then
+  if [ "$CAPTURED_ALL" = true ]; then
     STATUS=captured
-  elif [ "$DESKTOP_CAPTURED" = true ] || [ "$MOBILE_CAPTURED" = true ]; then
+  elif [ "$CAPTURED_ANY" = true ]; then
     STATUS=partial
   else
     STATUS=failed
@@ -366,19 +512,15 @@ while IFS= read -r SCREEN; do
   agent-browser --session "$SESSION" close >/dev/null 2>&1 || true
 
   jq -cn \
-    --arg name "$NAME" --arg path "$SCREEN_PATH" --arg status "$STATUS" \
-    --argjson dcap "$DESKTOP_CAPTURED" --arg dfile "shots/${BASENAME}-1280.png" --arg dreason "$DESKTOP_REASON" \
-    --argjson mcap "$MOBILE_CAPTURED" --arg mfile "shots/${BASENAME}-390.png" --arg mreason "$MOBILE_REASON" \
+    --arg name "$NAME" --arg path "$SCREEN_PATH" --arg status "$STATUS" --argjson widths "$WIDTHS_JSON" \
     '{
       name: $name, path: $path, status: $status,
       # Every screen navigates in its own never-before-used session (see the
       # "Fresh state per screen" header note) — always true by construction,
       # not conditioned on whether the navigation itself succeeded, so a
       # later reader can tell a real default state from a leftover one.
-      freshNavigation: true,
-      desktop: ({captured: $dcap} + (if $dcap then {file: $dfile} else {file: null, reason: $dreason} end)),
-      mobile: ({captured: $mcap} + (if $mcap then {file: $mfile} else {file: null, reason: $mreason} end))
-    }' >>"$RESULTS_FILE"
+      freshNavigation: true
+    } + $widths' >>"$RESULTS_FILE"
 
   I=$((I + 1))
 done < <(printf '%s' "$SHOTS_LIST" | jq -c '.[]')
@@ -392,7 +534,7 @@ import json
 import os
 import sys
 
-cs_dir, base_url, build_sha, requested, capped, generated_at = sys.argv[1:7]
+cs_dir, base_url, build_sha, requested, capped, generated_at, baseline_url = sys.argv[1:8]
 requested = int(requested)
 capped = capped == "1"
 
@@ -402,8 +544,22 @@ totals = {"screens": len(screens), "captured": 0, "partial": 0, "failed": 0}
 for s in screens:
     totals[s["status"]] = totals.get(s["status"], 0) + 1
 
+WIDTHS = ("desktop", "mobile")
+if baseline_url:
+    totals["diff"] = {"changed": 0, "unchanged": 0, "failed": 0}
+    for s in screens:
+        for w in WIDTHS:
+            totals["diff"][s[w]["diff"]["status"]] += 1
+
 manifest = {
-    "schemaVersion": 1,
+    # 2: `file` became the graded VIEWPORT capture (was full-page); the
+    # full-page image moved to `fullPage`, context only.
+    "schemaVersion": 2,
+    "capture": {
+        "graded": "viewport",
+        "animationsFrozen": True,
+        "fullPage": "context only, never graded",
+    },
     "baseUrl": base_url,
     # No authState field, deliberately — the auth state path is never copied
     # into this shared, durable artifact (see the security note in the
@@ -417,20 +573,53 @@ manifest = {
     "totals": totals,
     "sheetImage": "sheet.png",
 }
+if baseline_url:
+    manifest["baselineUrl"] = baseline_url
 with open(os.path.join(cs_dir, "manifest.json"), "w") as f:
     json.dump(manifest, f, indent=2)
     f.write("\n")
 
 
+def badges(entry):
+    out = []
+    if entry["captured"] and not entry["settled"]:
+        out.append(("failed", "unsettled"))
+    diff = entry.get("diff")
+    if diff:
+        label = {
+            "changed": "changed %.2f%%" % diff.get("pct", 0),
+            "unchanged": "unchanged",
+            "failed": "diff failed: %s" % diff.get("reason", ""),
+        }[diff["status"]]
+        out.append((diff["status"], label))
+    return "".join(
+        '<span class="status badge-%s">%s</span>' % (k, html.escape(v)) for k, v in out
+    )
+
+
 def tile(entry, css_class):
-    if entry["captured"]:
-        return '<img class="%s" src="%s">' % (css_class, html.escape(entry["file"], quote=True))
-    reason = entry.get("reason") or "capture failed"
-    return '<div class="%s placeholder">FAILED<br>%s</div>' % (css_class, html.escape(reason))
+    if not entry["captured"]:
+        reason = entry.get("reason") or "capture failed"
+        return '<div class="%s placeholder">FAILED<br>%s</div>' % (css_class, html.escape(reason))
+    parts = [badges(entry), '<img class="%s" src="%s">' % (css_class, html.escape(entry["file"], quote=True))]
+    image = (entry.get("diff") or {}).get("image")
+    if image:
+        parts.append('<img class="%s diff" src="%s">' % (css_class, html.escape(image, quote=True)))
+    return '<div class="tile">%s</div>' % "".join(parts)
 
 
+def diff_rank(s):
+    # changed (largest first), then diff-failed (unknown — needs eyes), then
+    # unchanged. Stable, so ties keep shots.json order.
+    diffs = [s[w]["diff"] for w in WIDTHS]
+    if any(d["status"] == "changed" for d in diffs):
+        return (0, -max(d.get("pct", 0) for d in diffs))
+    return (1, 0) if any(d["status"] == "failed" for d in diffs) else (2, 0)
+
+
+# manifest.json keeps shots.json order; only the sheet is reordered.
 rows = []
-for s in screens:
+for s in sorted(screens, key=diff_rank) if baseline_url else screens:
     rows.append(
         '<div class="row"><div class="label">%s<br><span class="path">%s</span>'
         '<br><span class="status status-%s">%s</span></div>'
@@ -457,6 +646,11 @@ body{margin:0;font-family:-apple-system,Helvetica,Arial,sans-serif;background:#f
 .status-partial{background:#fef9c3;color:#854d0e;}
 .status-failed{background:#fee2e2;color:#991b1b;}
 .shot{display:flex;align-items:flex-start;}
+.tile{display:flex;flex-direction:column;gap:6px;align-items:flex-start;}
+.badge-changed{background:#fed7aa;color:#9a3412;}
+.badge-unchanged{background:#e5e7eb;color:#374151;}
+.badge-failed{background:#fee2e2;color:#991b1b;}
+img.diff{border-color:#f97316;}
 img.desktop{max-width:1280px;border:1px solid #ccc;}
 img.mobile{max-width:390px;border:1px solid #ccc;}
 .placeholder{display:flex;align-items:center;justify-content:center;text-align:center;
@@ -475,7 +669,7 @@ PYEOF
 
 CAPPED_FLAG=0
 [ "$CAPPED" = true ] && CAPPED_FLAG=1 || true
-python3 "$RENDER_SCRIPT" "$CS_DIR" "$BASE_URL" "$BUILD_SHA" "$REQUESTED" "$CAPPED_FLAG" "$GENERATED_AT" \
+python3 "$RENDER_SCRIPT" "$CS_DIR" "$BASE_URL" "$BUILD_SHA" "$REQUESTED" "$CAPPED_FLAG" "$GENERATED_AT" "$BASELINE_URL" \
   <"$RESULTS_FILE"
 rm -f "$RENDER_SCRIPT"
 
@@ -511,6 +705,7 @@ if [ "$CAPTURED_COUNT" -eq 0 ]; then
   exit 1
 fi
 
-jq -cn --arg m "$CS_DIR/manifest.json" --arg s "$SHEET_FILE" \
+jq -c --arg m "$CS_DIR/manifest.json" --arg s "$SHEET_FILE" \
   --argjson c "$CAPTURED_COUNT" --argjson f "$FAILED_COUNT" --argjson r "$REQUESTED" --argjson capd "$CAPPED" \
-  '{ok:true,requested:$r,capped:$capd,captured:$c,failed:$f,manifest:$m,sheet:$s}'
+  '{ok:true,requested:$r,capped:$capd,captured:$c,failed:$f,manifest:$m,sheet:$s}
+   + (if .totals.diff then {diff:.totals.diff} else {} end)' "$CS_DIR/manifest.json"
