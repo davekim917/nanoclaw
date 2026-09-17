@@ -13,6 +13,11 @@
 #   smoke-run-scaffold.sh contract    <run-dir> <source-sha> <lane>[:kind[:title]]... [--regenerate] [--evidence <lane-id>=api]...
 #   smoke-run-scaffold.sh marker      <run-dir> <lane-id> <status> [summary] [evidence-csv] [--confirmed-findings <id>[,<id>...]]
 #   smoke-run-scaffold.sh redispatch  <run-dir> <lane-id>
+#   smoke-run-scaffold.sh adopt       <run-dir> <source-sha>
+#
+# `adopt` is the fenced ownership transition for a RECOVERED run: the gate's
+# current owner rebinds an existing same-SHA contract to itself, leaving lanes,
+# generations, markers and `createdAt` untouched. See CONTRACT ADOPTION below.
 #
 # `--evidence <lane-id>=api` declares a `floor` lane's proof is an API
 # contract by design (a guard that must not be exercised through the UI),
@@ -306,11 +311,18 @@ require_fenced_source_sha() {
     die "artifact sourceSha does not match the SHA claimed by this run — refusing metadata write"
 }
 
+# The refusal names `adopt` because a caller that reaches this line has ALREADY
+# passed begin_active_run_fence — it is the gate's current owner, not a stale
+# one (a stale owner dies earlier, on "caller owner does not match", :237 for
+# a task run and :268 for a PR run). Before
+# `adopt` existed the only exit from here was `contract --regenerate`, which
+# retires every valid marker of a run whose previews may already be gone
+# (the recovery-owner wedge).
 require_contract_owner() {
   local bound
   bound="$(jq -r '.coordinatorOwnerToken // empty' "$CONTRACT" 2>/dev/null || printf '')"
   [ "$bound" = "$FENCED_OWNER" ] ||
-    die "completion contract belongs to a different coordinator owner — STOP this campaign"
+    die "completion contract belongs to a different coordinator owner — STOP writing. If you are the RECOVERY owner of this same run on the same sourceSha, run 'adopt <run-dir> <source-sha>' once and retry; on a different sourceSha only 'contract --regenerate' applies. Otherwise STOP this campaign"
 }
 
 # A re-dispatched lane gets a newer generation before its replacement marker
@@ -349,7 +361,7 @@ archive_prior_marker_if_superseded() {
   die "could not atomically archive superseded marker at $history_path; refusing to replace $marker_path"
 }
 
-[ -n "$COMMAND" ] || die "usage: smoke-run-scaffold.sh <contract|marker|redispatch> <run-dir> ..."
+[ -n "$COMMAND" ] || die "usage: smoke-run-scaffold.sh <contract|marker|redispatch|adopt> <run-dir> ..."
 [ -n "$RUN_DIR" ] || die "a run directory is required"
 
 CONTRACT="$RUN_DIR/completion-contract.json"
@@ -610,7 +622,137 @@ redispatch)
     '{ok:true,lane:$lane,generation:$generation,retiredExistingMarker:$retired}'
   ;;
 
+adopt)
+  # CONTRACT ADOPTION — the fenced ownership transition for a recovered run.
+  #
+  # `smoke-pr-gate.sh poll` mints a fresh owner token on EVERY wake, same-run
+  # recovery included (smoke-pr-gate.sh:4790), and writes it to the lease
+  # (:4819), the PR authority (:4824) and the state (:4862-4869) — no line of
+  # that block touches the contract. The recovery owner
+  # therefore passes begin_active_run_fence and then dies in
+  # require_contract_owner, with `contract --regenerate` (which retires every
+  # marker) as the only exit. This verb is the missing transition.
+  #
+  # What keeps it safe is that it adds NO new authority check of its own: the
+  # caller must already be the one current owner under the lifecycle + run
+  # lease locks (state == lease == authority == caller, lease unexpired), which
+  # is exactly what every other write here requires. A stale or previous owner
+  # is refused by that fence before this block runs, before AND after an
+  # adoption, because adoption never touches state, lease or authority. It
+  # never copies the prior token anywhere and never re-authorizes it.
+  #
+  # Deliberately NOT changed: lanes, generations, requiredLaneMarkers, markers,
+  # `createdAt`, and the gate's challengerDeadline (this script cannot write
+  # gate state at all; the gate's own same-SHA recovery keeps the original,
+  # smoke-pr-gate.sh:4864-4868) — so valid prior evidence keeps validating and recovery
+  # buys no fresh time budget. The successor is recorded as an ADOPTER in
+  # `ownerAdoptions[]`, never as the author.
+  require_coordinator_role "a completion-contract ownership adoption"
+  SOURCE_SHA="${3:-}"
+  printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$' ||
+    die "adopt requires the 40-character frozen source SHA"
+  begin_active_run_fence "a completion-contract ownership adoption"
+  # A develop-fenced contract carries a null token by construction
+  # (FENCED_OWNER="" above), so there is no owner binding to move.
+  [ "$FENCED_STATE_KIND" != develop ] ||
+    die "adopt does not apply to a develop-fenced run — its contract carries no coordinator owner"
+  require_fenced_source_sha "$SOURCE_SHA"
+  # A task run's LIFETIME identity is the shared binding, not the private
+  # slot: `task-finish` commits `.terminal` there FIRST
+  # (smoke-pr-gate.sh:3480-3491) and only afterwards removes the lease
+  # (smoke-pr-gate.sh:3540) and clears the private slot
+  # (smoke-pr-gate.sh:3550-3554), so a crash in between leaves state + lease looking live for a run that is already
+  # terminal. The task fence above reads only state and lease, so adoption
+  # checks the binding itself. It is read under fd 8, which is the same
+  # `task-lease-<runId>.lock` file the gate serializes binding writes on
+  # (smoke-pr-gate.sh:628 and :678; task-finish takes it at :1172) — no new
+  # lock. Fail closed on a missing or malformed record: task-claim's
+  # task_lease_acquire backfills one from a legacy lease
+  # (smoke-pr-gate.sh:1011-1014) or creates one (smoke-pr-gate.sh:1049-1052)
+  # and refuses the claim if that write fails.
+  if [ "$FENCED_STATE_KIND" = task ]; then
+    TASK_BINDING_FILE="$LEASE_DIR/task-binding-$(basename "$RUN_DIR").json"
+    # SOURCE OF TRUTH: read_task_binding in smoke-pr-gate.sh:631-663 — the jq
+    # predicate at :638-650 and the calendar round-trip of boundAt and
+    # terminal.completedAt at :654-661. Duplicated verbatim because the gate
+    # is an executable, not a sourceable library; keep the two in step. A
+    # looser check here would adopt a contract onto a binding every gate
+    # lifecycle verb then refuses as malformed (task_lease_fence_begin,
+    # smoke-pr-gate.sh:1129-1134).
+    TASK_BINDING="$(jq -ce --arg run "$(basename "$RUN_DIR")" '
+      def iso: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
+      def terminal_ok:
+        . == null or
+        (type == "object" and
+         (.verdict == "GO" or .verdict == "NO_GO" or .verdict == "HUMAN_DECISION" or .verdict == "BLOCKED") and
+         (.completedAt | iso) and
+         (.verdictDigest | type == "string" and test("^[0-9a-f]{64}$")));
+      select(type == "object" and .schemaVersion == 1 and .kind == "task-binding" and
+             .runId == $run and
+             (.deploySha | type == "string" and test("^[0-9a-f]{40}$")) and
+             (.boundAt | iso) and
+             (.terminal | terminal_ok))
+    ' "$TASK_BINDING_FILE" 2>/dev/null)" ||
+      die "shared task binding is missing or malformed — this run's lifetime identity cannot be verified, refusing adoption"
+    for _stamp in "$(jq -r '.boundAt' <<<"$TASK_BINDING")" "$(jq -r '.terminal.completedAt // empty' <<<"$TASK_BINDING")"; do
+      [ -z "$_stamp" ] || valid_utc_timestamp "$_stamp" ||
+        die "shared task binding is missing or malformed — this run's lifetime identity cannot be verified, refusing adoption"
+    done
+    [ "$(jq -r '.deploySha' "$TASK_BINDING_FILE")" = "$SOURCE_SHA" ] ||
+      die "shared task binding names a different deploy SHA — refusing adoption"
+    [ "$(jq -r '.terminal == null' "$TASK_BINDING_FILE")" = true ] ||
+      die "this task run is already terminal in the shared task binding — nothing to adopt; re-run the exact task-finish to reconcile the lease and private slot"
+  fi
+  [ -s "$CONTRACT" ] || die "no completion contract at $CONTRACT — nothing to adopt; write it with the contract command"
+  jq -e 'type == "object" and .schemaVersion == 1 and
+         (.sourceSha | type) == "string" and (.requiredLaneMarkers | type) == "array" and
+         ((.ownerAdoptions // []) | type) == "array"' "$CONTRACT" >/dev/null 2>&1 ||
+    die "completion contract at $CONTRACT does not read as a scaffold contract (truncated or corrupt) — adoption would bless lane definitions this script cannot see; use 'contract --regenerate'"
+  [ "$(jq -r '.sourceSha' "$CONTRACT")" = "$SOURCE_SHA" ] ||
+    die "completion contract is bound to a different sourceSha — adoption only continues the SAME campaign; a different build requires 'contract --regenerate'"
+  [ "$(jq -r '.ownershipKind // empty' "$CONTRACT")" = "$FENCED_STATE_KIND" ] ||
+    die "completion contract ownershipKind does not match this run's active $FENCED_STATE_KIND slot — refusing adoption"
+  [ "$(jq -r '.runId // empty' "$CONTRACT")" = "$(basename "$RUN_DIR")" ] ||
+    die "completion contract names a different run — refusing adoption"
+  PRIOR_OWNER="$(jq -r '.coordinatorOwnerToken // empty' "$CONTRACT")"
+  # A null token on a pr/task contract did not come from a live claim
+  # (smoke-evidence-barrier.sh:55-70 refuses it too); there is nothing
+  # legitimate to continue.
+  [ -n "$PRIOR_OWNER" ] ||
+    die "completion contract carries no coordinator owner — it was not written under a live claim; use 'contract --regenerate'"
+  # Exact retry: the contract already names the caller. No write, no second
+  # history entry — byte-identical file.
+  if [ "$PRIOR_OWNER" = "$FENCED_OWNER" ]; then
+    jq -cn --arg path "$CONTRACT" \
+      --argjson adoptions "$(jq -c '(.ownerAdoptions // []) | length' "$CONTRACT")" \
+      '{ok:true,contract:$path,adopted:false,alreadyOwner:true,adoptionCount:$adoptions}'
+    exit 0
+  fi
+  tmp="$(mktemp "$RUN_DIR/.completion-contract.XXXXXX")"
+  # The history entry carries NOTHING derived from an owner value — no token
+  # and no digest of one. An owner is not always a gate-minted 256-bit token:
+  # task-claim takes an arbitrary caller-supplied owner and otherwise defaults
+  # to the hostname (smoke-pr-gate.sh:3183, DEFAULT_OWNER at :212), so an unsalted digest would be
+  # enumerable back to a reusable credential. `index` + `adoptedAt` record that
+  # and when ownership changed hands; who holds it now is the token above.
+  jq --arg owner "$FENCED_OWNER" --arg now "$(iso_now)" \
+    '.coordinatorOwnerToken = $owner |
+     .ownerAdoptions = ((.ownerAdoptions // []) +
+       [{index:(((.ownerAdoptions // []) | length) + 1), adoptedAt:$now}])' \
+    "$CONTRACT" > "$tmp"
+  # Deterministic regression seam for a crash between validation and commit,
+  # same guard as smoke-pr-gate.sh:4841. Production wrappers never set it.
+  if [ -n "${SMOKE_GATE_SHARED_ROOT+x}" ] && [ "$SMOKE_GATE_SHARED_ROOT" != /workspace/workgroup ] &&
+     [ "${SMOKE_SCAFFOLD_TEST_CRASH_BEFORE_ADOPT_COMMIT:-}" = 1 ]; then
+    kill -KILL "$$"
+  fi
+  mv "$tmp" "$CONTRACT"
+  jq -cn --arg path "$CONTRACT" \
+    --argjson adoptions "$(jq -c '.ownerAdoptions | length' "$CONTRACT")" \
+    '{ok:true,contract:$path,adopted:true,alreadyOwner:false,adoptionCount:$adoptions}'
+  ;;
+
 *)
-  die "unknown command: $COMMAND (expected contract, marker or redispatch)"
+  die "unknown command: $COMMAND (expected contract, marker, redispatch or adopt)"
   ;;
 esac

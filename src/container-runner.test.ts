@@ -167,6 +167,7 @@ import {
   resolveScanPolicyHooksMount,
   canonicalGitControlMounts,
 } from './container-runner.js';
+import { effectiveMcpServers } from './fleet-mcp-servers.js';
 import { ForeignCanonicalCommondirError } from './canonical-git-commondir.js';
 import {
   MANAGED_GIT_HOOKS_REFUSE_DIR,
@@ -646,6 +647,48 @@ describe('serializeMcpServersEnv', () => {
     expect(() => serializeMcpServersEnv({ legacy: { type: 'sse', url: 'https://example.test/sse' } })).toThrow(
       /deprecated SSE transport/,
     );
+  });
+
+  it('keeps host-only capability metadata out of the container payload', () => {
+    const env = serializeMcpServersEnv({
+      acme: {
+        type: 'http',
+        url: 'https://mcp.acme.test/mcp',
+        displayName: 'Acme',
+        description: 'Acme widgets.',
+        instructions: 'Always-in-context text.',
+      },
+    });
+
+    const servers = JSON.parse(env!.replace(/^NANOCLAW_MCP_SERVERS=/, ''));
+    // `instructions` already crosses the boundary today and keeps doing so;
+    // displayName and description are new host-only metadata and must not
+    // (container/agent-runner/src/providers/types.ts:260-298 declares none of
+    // the three).
+    expect(servers.acme).toEqual({
+      type: 'http',
+      url: 'https://mcp.acme.test/mcp',
+      instructions: 'Always-in-context text.',
+    });
+  });
+
+  it('serializes the fleet defaults exactly as the per-name blocks used to', () => {
+    // The five servers that were hardcoded `if (canInject('<name>'))` blocks in
+    // buildContainerArgs. What reaches the container must be byte-identical to
+    // what those blocks emitted, or a "pure data move" quietly reconfigures
+    // every group's tooling.
+    const servers = JSON.parse(
+      serializeMcpServersEnv(effectiveMcpServers({ mcpServers: {} }))!.replace(/^NANOCLAW_MCP_SERVERS=/, ''),
+    );
+    expect(servers.granola).toEqual({ type: 'stdio', command: 'bun', args: ['/app/src/granola-mcp-server.ts'] });
+    expect(servers.deepwiki).toEqual({ type: 'http', url: 'https://mcp.deepwiki.com/mcp' });
+    expect(servers.context7).toEqual({ type: 'stdio', command: 'npx', args: ['-y', '@upstash/context7-mcp'], env: {} });
+    expect(servers.exa).toEqual({
+      type: 'http',
+      url: 'https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa,agent_run',
+    });
+    expect(servers.pocket).toEqual({ type: 'http', url: 'https://public.heypocketai.com/mcp' });
+    expect(servers.littlebird).toEqual({ type: 'http', url: 'https://mcp.littlebird.ai/mcp' });
   });
 });
 

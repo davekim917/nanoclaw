@@ -1028,7 +1028,8 @@ desktop and phone width into one labelled image. `smoke-journeys.py shots
 <run-dir>` prints the matched journeys' `captureRecipes` (`name`, `path`,
 click/wait `steps`) as `shots.json`; a journey's English steps are never fed to
 the capture script.
-`smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> <source-sha>`
+`smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> <source-sha>
+[baseline-url] [baseline-auth-state.json]`
 — pass the campaign's frozen `sourceSha` as the fourth argument so
 `manifest.json`'s `buildSha` records the SHA you already froze on rather
 than whatever (if anything) the served page exposes; omit it only when no
@@ -1060,11 +1061,29 @@ screen's leftover DOM/localStorage state (e.g. a nav drawer a prior screen's
 graded BROKEN as a pure capture artifact. Each screen's manifest entry
 carries `freshNavigation: true` as the record of this.
 
-**The phone capture waits for responsive transitions after its viewport
-resize.** Do not replace that settle step with a screenshot immediately after
-the 390px switch: a real PR campaign captured a drawer mid-slide and created a
-false visual finding. If the settle wait itself fails, the mobile entry is
-recorded as missing/partial instead of emitting timing-contaminated evidence.
+**Grade the viewport capture, never the full-page one.** Each width's `file`
+is viewport-sized, taken with CSS animations/transitions frozen and re-taken
+until the live page matches it (`settled`). `fullPage` (`*-full.png`) is
+context only: full-page stitching misplaces fixed/sticky headers and drawers
+and has produced false BROKEN findings. A tile badged `unsettled` is not
+evidence of breakage on its own. A capture whose final `location.pathname`
+is not the shot's `path` (or its declared `finalPath`, for a `steps` click
+that navigates on purpose) fails with both paths named — a bounce to a login
+route is never graded, and on the baseline it is a failed diff, never
+`changed`.
+
+**With a baseline url, judge what the build changed.** Each screen/width is
+also captured from the baseline with the identical recipe and pixel-diffed;
+`manifest.json` gains `diff: {status, pct, image, baseline, reason}` per
+width and the sheet orders tiles changed → diff failed → unchanged, each
+badged, with the diff overlay under a changed tile. Give a critic the head
+image, its `*-base.png` and `*-diff.png`, and ask what the change broke — an
+`unchanged` screen looked that way before this build. Baseline capture is
+strictly read-only (navigation, the declared `steps`, screenshot) and is the
+only thing a deployment's baseline url may be used for; a baseline failure
+records `diff.status: "failed"` with a reason and never touches the head
+capture. A baseline on another origin needs its own auth state file, under
+the same placement rule below.
 
 **Auth state is a live session token — never put it in the run dir or under
 the shared workgroup tree.** The script refuses both (`realpath`-checked
@@ -1991,7 +2010,7 @@ and cannot change the scheduled `poll` or ordinary `check` behavior.
 `pr_build_settled`. Its payload includes `coordinatorOwnerToken`; treat that
 opaque value as part of the run identity. Pass it explicitly to every gate
 verb above and export it as `SMOKE_GATE_OWNER` for every
-`smoke-run-scaffold.sh` contract, marker, and redispatch writer. Native lane
+`smoke-run-scaffold.sh` contract, marker, redispatch, and adopt writer. Native lane
 workers and the separate synthesis session receive the same token in their
 briefs. A caller must never copy `.activeLeaseOwner` from mutable PR state:
 after a reclaim that field names the successor, and adopting it would let a
@@ -2027,8 +2046,31 @@ bash /workspace/agent/smoke-pr-gate.sh claim \
 ```
 
 That same-run claim safely reacquires an expired lease without a human. A
-different token may reclaim only after expiry; it must then regenerate the
-completion contract before writing markers. `lease-renew` and `lease-release`
+different token may reclaim only after expiry — this is also what every `poll`
+recovery is, because `poll` mints a new token per wake (`resumedRunId:true`,
+and `contractAdoptionRequired:true` when the run already has a contract). The
+existing contract still names the predecessor, so `marker`/`redispatch` refuse
+with `different coordinator owner` until the recovery owner takes ONE of:
+
+```bash
+# SAME run id, SAME sourceSha — continue the campaign. Keeps every lane,
+# generation and marker; the original challenger deadline still applies.
+SMOKE_LANE_ROLE=coordinator SMOKE_GATE_OWNER=<your-token> \
+bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh adopt <run-dir> <source-sha>
+
+# Different sourceSha, a corrupt contract, or lanes you must redefine —
+# retire every existing marker.
+... smoke-run-scaffold.sh contract <run-dir> <source-sha> <lane>... --regenerate
+```
+
+Default to `adopt` on a same-SHA recovery: `--regenerate` throws away valid
+evidence that may be unrecoverable once previews are gone. `adopt` only works
+for the caller that currently holds the state, lease and PR authority, appends
+an `ownerAdoptions[]` entry (you adopted the contract; you did not author it —
+report it that way), and is a no-op on exact retry. It
+is never a way around a refusal: never reuse or look up the predecessor's
+token, and if `adopt` itself answers `caller owner does not match`, you are the
+stale one — STOP. `lease-renew` and `lease-release`
 never revive or remove an expired lease. Explicit operator `--takeover`
 restrictions remain the only way to replace a still-active different run.
 The low-level compatibility verb is `lease-claim <run-id> <owner-token> <pr>`
@@ -2096,15 +2138,33 @@ target**, and the gate states it once, in the facts (`check`) and the
   the `targetSha` of the newest handoff-ledger `GO` whose receipt validates
   (digest matches its run `verdict.json`, and the freeze commit / freeze PR
   really bind to that target). `BLOCKED`, `NO_GO` and `HUMAN_DECISION` never
-  move it. It is pinned per freeze head SHA, so every poll and recovery wake
-  of one campaign reports the same range. `baselineRunId`, `baselineResolved`
-  and `baselinePinned` say where it came from.
+  move it. `baselineRunId` and `baselineResolved` say where it came from.
+- **The whole range result is pinned** — one immutable file per freeze head,
+  `range-pin-<repo>-pr-<n>-<headSha>.json` in the **shared lease directory**
+  (same place as the leases, so a coordinator resuming the run from another
+  state dir reads the same pin), first write wins, never trimmed by the gate.
+  `campaignRange.pinState`: `valid` (read from the pin), `absent` (computed),
+  `invalid` (something unreadable is at the pin's path — unknown/`full`, still
+  offered, never recomputed over), `unavailable` (no shared directory —
+  unknown/`full`, **not offered**). Pinned at
+  the first *settled* `poll` of a freeze head: the range, its file list, the
+  migration/frontend facts and `campaignSize`/`sizeReason`. Every later
+  `poll`, `check` and recovery wake of that head reads the pin
+  (`baselinePinned: true`) instead of recomputing — a campaign opened as
+  unknown/`full` on a transient API failure stays unknown/`full`, and a
+  determinable one never changes under a running campaign. A new head SHA is a
+  new campaign with its own pin. `check` never writes a pin.
 - `migrationsInRange` — the migration files in that range, or **`null`** (never
   `[]`) when the range is unknown.
 
+The file list comes from the compare response, or — when that is at the
+endpoint's 300-file cap — from a diff of the two commits' recursive trees,
+which is complete (a rename appears as both its old and new path);
+`fileListMethod` says which (`compare` / `tree`).
+
 `determinable:false` (no validated GO, target behind/diverged from the
-baseline, a malformed or ≥300-file comparison, a failed fetch) means the range
-is **unknown**: `campaignSize` is `full` and `reason` says why. It does not
+baseline, a malformed comparison, a truncated or unreadable tree, a failed
+fetch) means the range is **unknown**: `campaignSize` is `full` and `reason` says why. It does not
 block the campaign. **Quote this range** — for the manifest and any range shown
 to a human — never one re-derived by hand. Journey selection (§2) already
 consumes it and nothing else; an unknown range selects `full`, never nothing.
@@ -2193,7 +2253,16 @@ step. A settled SHA while a handoff is open queues like any other
 `queued_behind_active_run` (one freeze at a time); a freeze PR closed with no
 verdict ever recorded wakes `develop_freeze_abandoned` once and frees the
 slot; a failing helper wakes `develop_freeze_failed`, throttled like a
-failing preflight command. In handoff mode the develop gate also refuses `claim`: chat-requested campaigns cut a freeze PR (`smoke-freeze-pr.sh`) and claim on the PR gate — shared dev is never a campaign environment.
+failing preflight command. With `SMOKE_GATE_PR_STATE_DIR` pointed at the PR
+gate's own state dir (read-only; unset = inert), every poll holding a handoff
+carries `campaignTrace.disposition` — `never_started`, `campaign_live`,
+`stalled` or `terminal_unreported` — and so do `develop_freeze_stale` and
+`develop_freeze_abandoned`, whose hint then says whether closing the PR is
+right. A freeze still `never_started` after
+`SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS` (default 5400) wakes
+`develop_freeze_unclaimed` once per freeze PR: do not close the PR or start a
+campaign from that wake — find out why the PR-gate poll series has not picked
+the freeze up, and report it. In handoff mode the develop gate also refuses `claim`: chat-requested campaigns cut a freeze PR (`smoke-freeze-pr.sh`) and claim on the PR gate — shared dev is never a campaign environment.
 
 The other half lives in `smoke-pr-gate.sh`'s `finish`: `SMOKE_GATE_PUBLISH_FILE`
 / `SMOKE_GATE_HOLD_FILE` / `SMOKE_GATE_HANDOFF_LEDGER` (all no-ops unless set,

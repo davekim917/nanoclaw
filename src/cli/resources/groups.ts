@@ -15,6 +15,7 @@ import {
   resolveGroupProvider,
 } from '../../container-config.js';
 import { resolveContainerResources, type ContainerResources } from '../../container-resources.js';
+import { FLEET_MCP_SERVERS_PATH, readFleetMcpServers, updateFleetMcpServers } from '../../fleet-mcp-servers.js';
 import { buildAgentGroupImage, killContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
 import { requestWake } from '../../request-wake.js';
@@ -65,6 +66,23 @@ function parseTimezoneFlag(value: unknown): string | null | undefined {
 }
 
 /** Deserialize JSON columns for display. */
+/**
+ * One parse for both doors — a group's container.json and the fleet defaults —
+ * so `--fleet` cannot end up with a looser intake than `--id` (the URL
+ * credential refusals live in `parseMcpServerConfig`).
+ */
+function parseMcpServerEntry(args: Record<string, unknown>): McpServerConfig {
+  return parseMcpServerConfig({
+    command: args.command,
+    url: args.url,
+    args: args.args === undefined ? undefined : JSON.parse(String(args.args)),
+    env: args.env === undefined ? undefined : JSON.parse(String(args.env)),
+    headers: args.headers === undefined ? undefined : JSON.parse(String(args.headers)),
+    description: args.description,
+    displayName: args['display-name'] ?? args.display_name,
+  });
+}
+
 function presentConfig(row: ContainerConfigRow, folder?: string): Record<string, unknown> {
   const fileConfig = folder ? readContainerConfig(folder) : undefined;
   return {
@@ -474,8 +492,14 @@ registerResource({
     },
     'config get': {
       access: 'open',
-      description: 'Show the container config for a group. Use --id <group-id>.',
+      description:
+        'Show the container config for a group. Use --id <group-id>, or --fleet for the fleet-wide MCP defaults ' +
+        'every group inherits (data/fleet-mcp-servers.json).',
       handler: async (args) => {
+        if (args.fleet) {
+          if (args.id) throw new Error('--fleet and --id are mutually exclusive');
+          return { path: FLEET_MCP_SERVERS_PATH, mcp_servers: readFleetMcpServers() };
+        }
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
         const row = await getContainerConfig(id);
@@ -720,30 +744,37 @@ registerResource({
     'config add-mcp-server': {
       access: 'approval',
       description:
-        'Add an MCP server to a group. Requires `ncl groups restart` to take effect. ' +
-        'Use --id <group-id> --name <server-name> with EITHER --command <cmd> [--args <json-array>] [--env <json-object>] ' +
+        'Add an MCP server to a group, or to every group with --fleet. Requires `ncl groups restart` to take effect. ' +
+        'Use --id <group-id> (or --fleet) --name <server-name> with EITHER --command <cmd> [--args <json-array>] [--env <json-object>] ' +
         'for a local stdio server, OR --url <https-url> [--headers <json-object>] for a remote Streamable HTTP server ' +
         '(plain HTTP only for localhost / host.docker.internal). Credential headers must carry the "onecli-managed" ' +
-        'placeholder — the OneCLI gateway substitutes the real secret at the proxy boundary.',
+        'placeholder — the OneCLI gateway substitutes the real secret at the proxy boundary. ' +
+        '--description <text> is what the agent reads in its capability list (absent: a generic line naming the transport), ' +
+        'and --display-name <text> is the label there. --fleet writes data/fleet-mcp-servers.json, which every group ' +
+        'inherits unless it declares that name itself or lists it in container.json excludeMcpServers; no host restart.',
       handler: async (args) => {
         const id = args.id as string;
-        if (!id) throw new Error('--id is required');
+        const fleet = Boolean(args.fleet);
+        if (fleet && id) throw new Error('--fleet and --id are mutually exclusive');
+        if (!fleet && !id) throw new Error('--id is required');
         const name = args.name as string;
         if (!name) throw new Error('--name is required');
         validateMcpServerName(name);
+
+        if (fleet) {
+          const entry = parseMcpServerEntry(args);
+          const servers = updateFleetMcpServers((current) => {
+            current[name] = entry;
+          });
+          return { added: name, fleet: true, path: FLEET_MCP_SERVERS_PATH, servers };
+        }
 
         const group = await getAgentGroup(id);
         if (!group) throw new Error(`No agent group: ${id}`);
         const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
-        const newEntry: McpServerConfig = parseMcpServerConfig({
-          command: args.command,
-          url: args.url,
-          args: args.args === undefined ? undefined : JSON.parse(String(args.args)),
-          env: args.env === undefined ? undefined : JSON.parse(String(args.env)),
-          headers: args.headers === undefined ? undefined : JSON.parse(String(args.headers)),
-        });
+        const newEntry: McpServerConfig = parseMcpServerEntry(args);
 
         // Dual-write: container.json (canonical — what the spawn reads via
         // readContainerConfig) + container_configs.mcp_servers (cache — what
@@ -764,12 +795,24 @@ registerResource({
     'config remove-mcp-server': {
       access: 'approval',
       description:
-        'Remove an MCP server from a group. Requires `ncl groups restart` to take effect. Use --id <group-id> --name <server-name>.',
+        'Remove an MCP server from a group, or from the fleet defaults with --fleet. Requires `ncl groups restart` ' +
+        'to take effect. Use --id <group-id> (or --fleet) --name <server-name>. Removing a fleet entry does NOT touch ' +
+        'a group that declares the same name in its own container.json.',
       handler: async (args) => {
         const id = args.id as string;
-        if (!id) throw new Error('--id is required');
+        const fleet = Boolean(args.fleet);
+        if (fleet && id) throw new Error('--fleet and --id are mutually exclusive');
+        if (!fleet && !id) throw new Error('--id is required');
         const name = args.name as string;
         if (!name) throw new Error('--name is required');
+
+        if (fleet) {
+          const servers = updateFleetMcpServers((current) => {
+            if (!current[name]) throw new Error(`MCP server "${name}" not found in the fleet defaults`);
+            delete current[name];
+          });
+          return { removed: name, fleet: true, path: FLEET_MCP_SERVERS_PATH, servers };
+        }
 
         const group = await getAgentGroup(id);
         if (!group) throw new Error(`No agent group: ${id}`);

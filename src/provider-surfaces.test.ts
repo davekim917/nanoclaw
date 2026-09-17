@@ -314,9 +314,9 @@ describe('container instruction contracts', async () => {
         `buildContainerCodexConfig() in src/providers/codex.ts. ${PARALLEL_IMPL_NOTE}`,
     ).not.toBeNull();
     // The literal is evaluated in a BARE scope, so it may reference no free
-    // identifier at all. It has none today — `default_subagent_reasoning_effort`
-    // is a plain string on both sides since the vendored worker-policy constant
-    // was deleted — and this call is what keeps it that way: a new free binding
+    // identifier at all. It has none today — the vendored worker-policy
+    // constant that once fed a subagent-effort line was deleted, and that line
+    // itself is gone — and this call is what keeps it that way: a new free binding
     // in the container literal throws a ReferenceError here rather than
     // quietly letting the two configs name different Codex subagent efforts.
     const containerBase = new Function(`return ${literal![1]}`)() as string;
@@ -1207,7 +1207,14 @@ describe('buildMounts agent surfaces', async () => {
     await createAgentGroup(ag);
     await ensureContainerConfig(ag.id);
 
-    expect(OPENCODE_XDG_ENV).toEqual({ XDG_DATA_HOME: '/opencode-xdg', XDG_CONFIG_HOME: '/opencode-xdg' });
+    expect(OPENCODE_XDG_ENV).toEqual({
+      XDG_DATA_HOME: '/opencode-xdg',
+      XDG_CONFIG_HOME: '/opencode-xdg',
+      // Names the staged default-model file explicitly: the entrypoint
+      // re-exports XDG_CONFIG_HOME to /tmp/.chromium, so the global-config
+      // lookup never reaches it (#887).
+      OPENCODE_CONFIG: '/opencode-xdg/opencode/opencode.json',
+    });
 
     const contribution = await providerContribution('opencode', ag, session('s-opencode-xdgenv', ag.id));
     expect(contribution.env).toMatchObject(OPENCODE_XDG_ENV);

@@ -159,8 +159,10 @@ import {
   getNextFutureProcessAfter,
   getProcessingClaims,
   hasProcessingAck,
+  listOverdueRecurringRows,
   syncProcessingAcks,
   type ContainerState as ForkContainerState,
+  type OverdueRecurringRow,
   type ProcessingClaim,
 } from './ops/sweep.js';
 import {
@@ -298,7 +300,7 @@ export type {
   TaskFireRow,
   TaskRoutingStamp,
 } from './ops/reads.js';
-export type { ContainerState, ProcessingClaim } from './ops/sweep.js';
+export type { ContainerState, OverdueRecurringRow, ProcessingClaim } from './ops/sweep.js';
 
 /**
  * `(mtime, size)` of a session's outbound.db for the delivery sweep's quiet
@@ -446,8 +448,14 @@ export interface NanoclawMailboxSession extends MailboxSession {
    */
   expireClosedSessionPending(): number;
   getDueWakePriority(): 'interactive' | 'scheduled';
-  /** Fused: reads outbound processing_ack and writes inbound statuses in one action. */
-  syncProcessingAcks(): void;
+  /**
+   * Fused: reads outbound processing_ack and writes inbound statuses in one
+   * action. Returns the ids completed because the runner had already answered
+   * them with no ack left to sync (see the op).
+   */
+  syncProcessingAcks(): string[];
+  /** Recurring occurrences due since before `cutoffIso` with nothing in the session being worked (see the op). */
+  listOverdueRecurringRows(cutoffIso: string): OverdueRecurringRow[];
   /** Raw snake_case claim rows; upstream's `getProcessingClaims` returns the record shape. */
   getProcessingClaimRows(): ProcessingClaim[];
   /**
@@ -1198,7 +1206,9 @@ function forkOps(
     expireStalePending: (maxAgeMs) => expireStalePending(inbound, maxAgeMs),
     expireClosedSessionPending: () => expireClosedSessionPending(inbound),
     getDueWakePriority: () => getDueWakePriority(inbound),
-    syncProcessingAcks: () => readOutbound(undefined, (outbound) => syncProcessingAcks(inbound, outbound)),
+    syncProcessingAcks: () => readOutbound([], (outbound) => syncProcessingAcks(inbound, outbound)),
+    listOverdueRecurringRows: (cutoffIso) =>
+      listOverdueRecurringRows(inbound, outboundPresent ? readableOutbound() : null, cutoffIso),
     // A never-woken session has no turn usage: empty is the honest answer here,
     // not the opener's throw (the rollup runs over every session every tick).
     listTurnUsageSince: (afterId) => readOutbound([], (outbound) => listTurnUsageSince(outbound, afterId)),
