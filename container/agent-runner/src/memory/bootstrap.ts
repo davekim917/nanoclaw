@@ -6,7 +6,26 @@ const CAPABILITIES_PATH = '/workspace/capabilities.json';
 const INDEX_PATH = '/workspace/workgroup/memory/index.md';
 const MAX_CAPABILITY_SERVICES = 32;
 const MAX_CAPABILITY_STRING_CHARS = 600;
-const MAX_CAPABILITY_JSON_CHARS = 5_000;
+/**
+ * Must cover the LARGEST roster the host itself would emit, or this fallback
+ * drops services the host kept and capabilities vanish specifically after a
+ * cold-context recovery — the one path the agent cannot see happening.
+ *
+ * The host bounds `JSON.stringify(services)` at `PRE_TURN_BOUNDS
+ * .capabilityTotalChars` = 10,000 (src/modules/memory/pre-turn-context.ts,
+ * `boundedCapabilities`); this bound is measured over the whole snapshot
+ * object, which adds `agentGroupId` and the ~360-char `howToUse`. 11,000
+ * clears that with margin. At 5,000 — the pre-roster value, sized when the
+ * block carried five or six full manuals — a host-accepted shape (32 services,
+ * 160-char hints, ~7KB) lost entries here alone.
+ *
+ * This can leave less room under `NORMAL_RECALL_CHARS` for evidence blocks,
+ * and that ordering is deliberate: `enforceFinalBound` on the host sheds
+ * conversation and memory excerpts BEFORE capability entries, so the fallback
+ * shedding evidence to keep the roster matches it. Real rosters measure ~3.3k,
+ * so this only bites on pathological input.
+ */
+const MAX_CAPABILITY_JSON_CHARS = 11_000;
 /** Roster hint cap. Mirrors PRE_TURN_BOUNDS.capabilityRosterUseChars on the host. */
 const MAX_CAPABILITY_USE_CHARS = 160;
 /**

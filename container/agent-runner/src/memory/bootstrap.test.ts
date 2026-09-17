@@ -129,13 +129,38 @@ describe('ensureFreshContextBootstrap', () => {
     expect(result.indexOf('<trusted_capabilities_json>')).toBeGreaterThan(command.length);
   });
 
+  it('keeps a full host-accepted roster instead of evicting on the cold-context path', () => {
+    // Round 1, P2: the runner's byte bound was sized before the roster and
+    // dropped services the host had kept — so capabilities would vanish
+    // exactly after a cold-context recovery, which the agent cannot see
+    // happening. A roster at the host's own ceiling (32 services, hints at
+    // `capabilityRosterUseChars`) must survive this path intact.
+    const services = Array.from({ length: 32 }, (_, index) => ({
+      name: `Service ${index}`,
+      mcpNamespace: `mcp__service-${index}__*`,
+      summary: `x`.repeat(160),
+    }));
+    fs.writeFileSync(CAPABILITIES, JSON.stringify({ session: { agentGroupId: 'agent-a', services } }));
+
+    const result = ensureFreshContextBootstrap('<message>hello</message>', {
+      capabilities: CAPABILITIES,
+      index: INDEX,
+    });
+
+    expect(result).not.toContain('runner-capability-bootstrap-truncated');
+    for (const service of services) expect(result).toContain(`"name":"${service.name}"`);
+  });
+
   it('reports when runner-side capability bounding drops services', () => {
+    // Past MAX_CAPABILITY_SERVICES (32), so the count limit fires. It used to
+    // be exactly 32 and leant on the byte bound, which a host-accepted roster
+    // no longer trips — see the test above.
     fs.writeFileSync(
       CAPABILITIES,
       JSON.stringify({
         session: {
           agentGroupId: 'agent-a',
-          services: Array.from({ length: 32 }, (_, index) => ({
+          services: Array.from({ length: 40 }, (_, index) => ({
             name: `Service ${index}`,
             cli: `tool-${index}`,
             useFor: `service detail ${index} ${'x'.repeat(600)}`,
