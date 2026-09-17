@@ -247,7 +247,11 @@ export function resolveAllowlistPath(snapshot: string): { path: string; usedFall
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-remote-boundary-allowlist-'));
     const emptyAllowlist = path.join(dir, 'allowlist.json');
     fs.writeFileSync(emptyAllowlist, '{"entries": []}\n');
-    return { path: emptyAllowlist, usedFallback: true, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+    return {
+      path: emptyAllowlist,
+      usedFallback: true,
+      cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
+    };
   }
   if (!stat.isFile()) {
     throw new Error(
@@ -290,7 +294,11 @@ const REAL_RUN_CHECKER: RunChecker = ({ root, allowlistPath }) => {
 };
 
 /** Run the boundary checker over `snapshot` (a checkout of `commit`), against this install's registry. */
-export function scanSnapshot(snapshot: string, commit: string, runChecker: RunChecker = REAL_RUN_CHECKER): BoundaryScan {
+export function scanSnapshot(
+  snapshot: string,
+  commit: string,
+  runChecker: RunChecker = REAL_RUN_CHECKER,
+): BoundaryScan {
   const allowlist = resolveAllowlistPath(snapshot);
   if (allowlist.usedFallback) {
     // Non-fatal, and it does not change the scan's outcome (empty exempts
