@@ -300,11 +300,18 @@ jobs:
           #     AFTER the `*/`, or a URL on a middle line, leaves the `*/`
           #     intact and is always fine.
           #   - a glob like `'**/*.ts'`.
-          # On THIS roster that means a URL comment or glob is refused only
-          # below the last docblock (line 113); above it, it pairs and takes
-          # step 1's silent path instead. The message names the delimiter and
-          # the fix, because "unbalanced" alone sends the reader looking for a
-          # broken comment when the cause is a URL or a glob.
+          # On THIS roster that means a URL comment or glob is refused here
+          # only at or below the last docblock's close (line 113). Above it,
+          # the delimiters pair and step 1's path is taken instead — which
+          # branch depends on what the swallowed span covers: exit 0 with a
+          # later declaration resolving, or "found 0" when the span covers
+          # `FRONTIER_MODELS` itself. This roster declares it once, so "found
+          # 0" is the branch to expect — a URL on the `*/` line of the docblock
+          # just above the declaration produces exactly that. Which is the
+          # misdirection this message exists to prevent, one layer up: "found
+          # 0" reads as a missing array, not as a URL four lines above it.
+          # (A glob written inside comment TEXT rather than a string closes
+          # that comment early and is refused wherever it sits.)
           if printf '%s' "$flat" | grep -qE '/\*|\*/'; then
             echo "unresolved /* or */ after comment-stripping $ROSTER@$BASE_SHA — refusing to resolve a reviewer from text this step cannot account for." >&2
             echo "Usual cause: a URL or other '//' on the SAME line as a block comment's '*/' (that '//' deletes the '*/'), or an unpaired '/*' or '*/' inside a string literal such as a '**/*.ts' glob." >&2
