@@ -1209,6 +1209,34 @@ describe('buildMounts agent surfaces', async () => {
     );
   });
 
+  // Same rule as the peer Codex credential (round-3 review): OpenCode is a PEER
+  // capability in a Claude or Codex container, so a host-state failure withholds
+  // it instead of failing the spawn. The wedge is the one an agent can actually
+  // reach — the session dir is mounted RW at /workspace, so it can replace
+  // `/workspace/opencode-xdg` with a symlink and `assertRealDirectory` refuses
+  // it on every later spawn (src/fs-safety.ts:41).
+  it('withholds the OpenCode credential from a container that wedged its own staging dir', async () => {
+    const ag = group('ag-opencode-wedged', 'opencode-wedged');
+    await createAgentGroup(ag);
+    withWorkgroup(ag);
+    await ensureContainerConfig(ag.id);
+    initGroupFilesystem({ ...ag, workgroup_id: ag.folder }, { provider: 'claude' });
+
+    const sess = session('s-opencode-wedged', ag.id);
+    const sessDir = sessionDir(ag.id, sess.id);
+    fs.mkdirSync(sessDir, { recursive: true });
+    fs.symlinkSync(path.join(TEST_ROOT, 'home'), path.join(sessDir, 'opencode-xdg'), 'dir');
+
+    const mounts = await buildMounts(ag, sess, containerConfig(), 'claude', {}, ag.folder);
+
+    expect(mounts.some((m) => m.containerPath === '/opencode-xdg')).toBe(false);
+    expect(mounts.some((m) => m.containerPath === '/workspace')).toBe(true);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining('OpenCode credential withheld'),
+      expect.objectContaining({ containerPath: '/opencode-xdg' }),
+    );
+  });
+
   // Mutation check for the `provider !== 'opencode'` guard on the staging call
   // (src/container-runner.ts). Drop or invert it and an OpenCode session gets
   // /opencode-xdg twice — once from the provider contribution, once from the

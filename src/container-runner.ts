@@ -155,7 +155,7 @@ import {
   type VolumeMount,
 } from './providers/provider-container-registry.js';
 import { buildContainerCodexConfig } from './providers/codex.js';
-import { OPENCODE_XDG_ENV, stageOpenCodeAuth } from './providers/opencode.js';
+import { OPENCODE_XDG_CONTAINER_PATH, OPENCODE_XDG_ENV, stageOpenCodeAuth } from './providers/opencode.js';
 import { getSessionClaudeMounts } from './session-claude-mounts.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { assertHostOwnedInboundDb, hostInboundMounts, migrateInboundDbToHostDir } from './modules/mailbox/index.js';
@@ -3912,6 +3912,22 @@ export function resolveCodexAuthFallbacks(
 }
 
 /**
+ * True for a credential-staging failure caused by HOST STATE rather than by a
+ * bug here: a filesystem error (which carries an errno `code`) or one of the
+ * `Unsafe …` refusals the staging guards raise (`src/fs-safety.ts:44`, `:56`,
+ * `:67`, plus `stageCodexAuth` and `materializeCodexFallbackRuntime` below).
+ *
+ * A PEER credential — Codex in a non-codex container, OpenCode in any of them —
+ * is withheld on one of these rather than failing the spawn. Anything else
+ * rethrows: swallowing a TypeError would turn a provider off fleet-wide behind
+ * one warn per spawn.
+ */
+function isHostStateFailure(err: unknown): err is Error {
+  if (!(err instanceof Error)) return false;
+  return typeof (err as NodeJS.ErrnoException).code === 'string' || err.message.startsWith('Unsafe ');
+}
+
+/**
  * Stage a session-local CODEX_HOME whose only host coupling is the credential.
  * The directory itself is session-owned with a GENERATED config.toml; the host
  * home's `auth.json` is FILE-bind-mounted into it, so an OAuth refresh inside
@@ -5201,16 +5217,17 @@ export async function buildMounts(
       // crash-loops" trade the runner refuses
       // (container/agent-runner/src/codex-companion-setup.ts:352-369). So a peer
       // stage that throws is logged and WITHHELD: the container boots, finds no
-      // `auth.json`, and skips CODEX_HOME setup (`codex-companion-setup.ts:581`).
+      // `auth.json`, and skips CODEX_HOME setup (`codex-companion-setup.ts:582`).
+      // Narrowed by `isHostStateFailure` so a bug here still surfaces.
       const stageOrWithhold = (what: string, stage: () => VolumeMount[]): VolumeMount[] => {
         try {
           return stage();
         } catch (err) {
-          if (providerHasCodexMount) throw err;
+          if (providerHasCodexMount || !isHostStateFailure(err)) throw err;
           log.warn('Codex credential withheld from peer container (staging failed)', {
             agentGroupId: agentGroup.id,
             containerPath: what,
-            error: err instanceof Error ? err.message : String(err),
+            error: err.message,
           });
           return [];
         }
@@ -5291,15 +5308,30 @@ export async function buildMounts(
   // the same `stageOpenCodeAuth` the provider calls for its own auth step, so
   // the staging exists once. Outside the `~/plugins` block because OpenCode has
   // no plugin for the credential to ride on.
+  //
+  // Withheld on a host-state failure for the same reason the peer Codex stage
+  // is: this is a PEER credential, and an agent that replaced
+  // `/workspace/opencode-xdg` with a symlink would otherwise fail every later
+  // spawn of its own session. An OpenCode session's own staging still throws —
+  // it runs in the provider contribution, not here.
   if (provider !== 'opencode') {
-    mounts.push(
-      ...stageOpenCodeAuth(
-        sessionDir(agentGroup.id, session.id),
-        agentGroup.folder,
-        agentGroup.id,
-        process.env.HOME || os.homedir(),
-      ).mounts,
-    );
+    try {
+      mounts.push(
+        ...stageOpenCodeAuth(
+          sessionDir(agentGroup.id, session.id),
+          agentGroup.folder,
+          agentGroup.id,
+          process.env.HOME || os.homedir(),
+        ).mounts,
+      );
+    } catch (err) {
+      if (!isHostStateFailure(err)) throw err;
+      log.warn('OpenCode credential withheld from container (staging failed)', {
+        agentGroupId: agentGroup.id,
+        containerPath: OPENCODE_XDG_CONTAINER_PATH,
+        error: err.message,
+      });
+    }
   }
 
   // Project source tree at /workspace/project (RO). Lets agents read the
@@ -6953,10 +6985,12 @@ async function buildContainerArgs(
     args.push('-e', `${key}=${value}`);
   }
 
-  // Env half of the staged OpenCode credential. Same predicate as the mount in
-  // `buildMounts`, and as the provider's own contribution above — an OpenCode
-  // session would otherwise receive both copies of `/opencode-xdg`.
-  if (provider !== 'opencode') {
+  // Env half of the staged OpenCode credential. Keyed on the MOUNT rather than
+  // on `provider !== 'opencode'` directly, the same way CODEX_FALLBACK_HOMES is
+  // above: an OpenCode session gets the env from its provider contribution, so
+  // emitting it here too would duplicate it, and a container whose staging was
+  // withheld should not be pointed at a path it has no mount for.
+  if (provider !== 'opencode' && mounts.some((m) => m.containerPath === OPENCODE_XDG_CONTAINER_PATH)) {
     for (const [key, value] of Object.entries(OPENCODE_XDG_ENV)) {
       args.push('-e', `${key}=${value}`);
     }
