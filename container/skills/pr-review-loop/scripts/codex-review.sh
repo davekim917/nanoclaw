@@ -533,6 +533,8 @@ RECEIPT_MARKER_RE='(^|\n)<!-- pr-review-loop:substitute-receipt head=(?<head>[0-
 # legacy precheck (independent_receipt_state) reads only those three.
 INDEPENDENT_RECEIPT_MARKER_RE='(^|\n)<!-- independent-review-receipt:v1 -->[ \t]*\r?(?=\n|\z)'
 INDEPENDENT_RECEIPT_JSON_RE='\A\s*```json[ \t]*\r?\n(?<json>[\s\S]*?)\n[ \t]*```'
+# What may not precede the marker of a receipt that clears (independent_receipt_state).
+INDEPENDENT_RECEIPT_UNSAFE_PREFIX_RE='(^|\n)[ \t>]*(```|~~~)|<!--|<(pre|code|details|script|style|textarea|xmp|template)\b|(^|\n)[ >]*( {4}|\t)'
 INDEPENDENT_RECEIPT_HEAD_RE='"head"\s*:\s*"(?<head>[0-9a-f]{40})"'
 # The receipt body's human-readable "who reviewed" line, used to recover the
 # reviewer text for a model-allowlist check — the marker itself carries only
@@ -1273,25 +1275,22 @@ ci_verdict() {
 # with zero blocking findings; anything else the newest one says is blocked, a
 # CHANGES verdict and a receipt whose JSON does not parse alike.
 #
-# One rule for what a comment says — visible: the newest visible decides;
-# hidden: can only block, and all hidden markers are read. Within one comment
-# every marker is read, visible and hidden alike and never the first alone:
-# any receipt among them that applies to this head and is not clear makes the
-# comment a no, and only a visible clear one, with no such no beside it, makes
-# it clear. So a clear receipt never suppresses another, before or after it.
-#
-# A marker quoted inside a code fence or an HTML comment is an example, not a
-# receipt, by the rule the Fixes-PR and Review-notes lines are read under, and
-# by the same reader: each marker line is swapped for a numbered sentinel and
-# the body goes through pr_body_text (pr-body.jq); a marker whose sentinel
-# survives stands in the open, and each marker's receipt is the JSON between it
-# and the next marker. Only a visible receipt can be clear: a hidden one that
-# reads clear is dropped. A hidden one that does not read clear still counts: a fence left
-# unclosed above a real CHANGES receipt hides it exactly as a quote would, and
-# the two cannot be told apart, so hiding can only ever block, never clear. (The substitute
-# receipt marker is matched against the raw body, so it has the quoting hole
-# too; it is left as it is here, because closing it the plain way would let an
-# unclosed fence in a reviewer's body hide a `changes` receipt.)
+# One rule for what a comment says, with no reading of what Markdown shows:
+# blocking takes no parsing, and clearing is a positive shape. Every marker in
+# the comment is read, each against the JSON between it and the next marker,
+# wherever it sits — quoted, fenced, commented out — and any receipt among
+# them that applies to this head and is not clear makes the comment a no. A
+# comment is clear only when it holds exactly one marker, that receipt is
+# clear, and nothing before the marker could open a literal or hidden context
+# (INDEPENDENT_RECEIPT_UNSAFE_PREFIX_RE: a line starting a backtick or tilde
+# fence, behind blockquote marks or not; `<!--`; a <pre>, <code>, <details> or
+# similar tag; a line indented as code). Only what precedes a marker can hide
+# it, so the prefix is the whole check, and a desk receipt — prose, the
+# marker, then its JSON fence — passes it. Any other comment is not a clear:
+# it clears nothing and masks nothing. Deciding what GitHub renders was tried
+# first and drew a finding a round; this decides nothing about rendering.
+# (The substitute receipt marker is matched against the raw body too, so a
+# quoted `approve` counts there; it is left as it is here.)
 #
 # Who wrote it follows the same asymmetry. authorAssociation is not a
 # permission: MEMBER is membership of the organisation, and a COLLABORATOR can
@@ -1343,33 +1342,26 @@ may_clear() {
 # `clear\t<login>` for a clear newest receipt, so its author can be checked.
 independent_receipt_newest() {
   printf '%s\n' "$1" | jq -rs -L "$HERE" --arg re "$INDEPENDENT_RECEIPT_MARKER_RE" --argjson denied "$3" \
-    --arg jsonRe "$INDEPENDENT_RECEIPT_JSON_RE" --arg headRe "$INDEPENDENT_RECEIPT_HEAD_RE" --arg head "$2" '
+    --arg jsonRe "$INDEPENDENT_RECEIPT_JSON_RE" --arg headRe "$INDEPENDENT_RECEIPT_HEAD_RE" \
+    --arg unsafeRe "$INDEPENDENT_RECEIPT_UNSAFE_PREFIX_RE" --arg head "$2" '
     include "receipt-order";
-    include "pr-body";
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
       | { login: (.author.login // "someone"), at: .createdAt, idstr: ((.fullDatabaseId // "") | tostring) } as $c
-      | ((.body // "") | gsub("\u001f"; "")) as $raw
-      | [ $raw | splits($re) ] as $parts
+      | [ (.body // "") | splits($re) ] as $parts
       | select(($parts | length) > 1)
-      | (($parts | length) - 1) as $markers
-      | ({ body: ([ range(0; $markers) as $i | $parts[$i], "\n\u001f\($i)\u001f" ] + [ $parts[$markers] ] | join("")) } | pr_body_text) as $plain
-      | [ range(0; $markers) | select(. as $i | $plain | test("(^|\n)\u001f\($i)\u001f[ \t]*\r?(\n|$)")) ] as $visible
-      | [ range(0; $markers) as $i
-          | ($visible | index($i) != null) as $open
-          | $parts[$i + 1] as $rest
+      | [ range(1; $parts | length) as $i
+          | $parts[$i] as $rest
           | ([ $rest | capture($jsonRe) | .json | try fromjson catch null | objects ] | first) as $doc
           | (if $doc != null then ($doc.head // null) else ([ $rest | capture($headRe) ] | first | .head) end) as $named
           | select(($named | type) != "string" or $named == $head)
-          | { open: $open,
-              clear: ($doc != null and $doc.head == $head and $doc.verdict == "CLEAR" and $doc.blocking_findings == 0),
+          | { clear: ($doc != null and $doc.head == $head and $doc.verdict == "CLEAR" and $doc.blocking_findings == 0),
               said: (if $doc == null then "its JSON block does not parse"
                      else "verdict \($doc.verdict // "missing" | tostring), blocking_findings \($doc.blocking_findings // "missing" | tostring)" end) } ] as $receipts
       | ([ $receipts[] | select(.clear | not) ] | first) as $no
-      | if $no != null then
-          $c + { clear: false, said: ((if $no.open then "" else "(marker inside a code fence or an HTML comment) " end) + $no.said) }
-        elif any($receipts[]; .open and .clear) and ($c.login as $l | $denied | index($l) | not) then
-          $c + { clear: true, said: "" }
+      | if $no != null then $c + { clear: false, said: $no.said }
+        elif ($parts | length) == 2 and ($receipts | length) == 1 and ($parts[0] | test($unsafeRe; "i") | not)
+             and ($c.login as $l | $denied | index($l) | not) then $c + { clear: true, said: "" }
         else empty end ] as $matches
     | ([ $matches[] | select((.idstr | canonical_id) | not) ] | first) as $bad
     | if $bad != null then

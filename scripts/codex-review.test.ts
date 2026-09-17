@@ -3028,7 +3028,7 @@ describe('codex-review risk-scoped review requests', () => {
 
       const result = runHelper(root, ['merge-check', '--head', HEAD]);
       expect(result.status).toBe(24);
-      expect(result.stderr).toContain('(marker inside a code fence or an HTML comment) verdict CHANGES');
+      expect(result.stderr).toContain('verdict CHANGES');
     });
 
     describe('hidden markers can only block, and every one of them is read', () => {
@@ -3046,9 +3046,7 @@ describe('codex-review risk-scoped review requests', () => {
 
         const result = runHelper(root, ['merge-check', '--head', HEAD]);
         expect(result.status).toBe(24);
-        expect(result.stderr).toContain(
-          '(marker inside a code fence or an HTML comment) verdict CHANGES, blocking_findings 1',
-        );
+        expect(result.stderr).toContain('verdict CHANGES, blocking_findings 1');
       });
 
       it('reads a visible CHANGES after a visible CLEAR in one comment as a no', () => {
@@ -3068,9 +3066,7 @@ describe('codex-review risk-scoped review requests', () => {
 
         const result = runHelper(root, ['merge-check', '--head', HEAD]);
         expect(result.status).toBe(24);
-        expect(result.stderr).toContain(
-          '(marker inside a code fence or an HTML comment) verdict CHANGES, blocking_findings 1',
-        );
+        expect(result.stderr).toContain('verdict CHANGES, blocking_findings 1');
       });
 
       it.each([
@@ -3091,6 +3087,58 @@ describe('codex-review risk-scoped review requests', () => {
         expect(result.status).toBe(24);
         expect(result.stderr).toContain('verdict CHANGES, blocking_findings 1');
       });
+
+      // A CLEAR clears only in the desk's shape: one marker, and nothing before it
+      // that could open a literal or hidden context. Each of these is a newer
+      // write-author comment over a real CHANGES, and none of them clears.
+      it.each([
+        ['an HTML comment and tilde fences interleaved', (r: string) => `<!--\n~~~\n-->\n~~~\n-->\n${r}`],
+        ['a fence opened inside a blockquote', (r: string) => `> \`\`\`\n> quoted\n\n${r}`],
+        ['a fence opened behind nested blockquote marks', (r: string) => `> > ~~~\n${r}`],
+        ['an indented code line', (r: string) => `Steps:\n\n    example line\n${r}`],
+        ['a tab-indented code line', (r: string) => `Steps:\n\n\texample line\n${r}`],
+        ['a <details> block', (r: string) => `<details><summary>sample</summary>\n\n${r}`],
+        ['a <pre> block', (r: string) => `<PRE>\n${r}`],
+        ['a second CLEAR marker in the same comment', (r: string) => `${r}\n${r}`],
+      ])('does not let a CLEAR preceded by %s clear the head', (_case, wrap) => {
+        const root = tempRoot();
+        const newer = independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:40:00Z');
+        legacy(root, {
+          comments: [
+            independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z'),
+            { ...newer, body: wrap(receiptText('CLEAR', 0)) },
+          ],
+        });
+
+        const result = runHelper(root, ['merge-check', '--head', HEAD]);
+        expect(result.status).toBe(24);
+        expect(result.stderr).toContain('verdict CHANGES, blocking_findings 1');
+      });
+
+      it.each([
+        ['write', 26],
+        ['read', 24],
+      ])(
+        'reads a desk-shaped CLEAR (prose, list, inline code, marker, then its JSON fence) from a %s author as %i',
+        (permission, code) => {
+          const root = tempRoot();
+          const newer = independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:40:00Z');
+          const prose =
+            'Release desk — **independent review at head `aaaaaaaa`: CLEAR, 0 blocking findings.**\n\n' +
+            'Fresh-context read of the complete diff (<model>, high, 11 min). It confirms the claim:\n\n' +
+            '1. **P2, non-blocking** — `repo.ts:848` authorizes only the current row.\n' +
+            '- no `<!` anywhere, a > quote mark mid-line, and ``double ticks`` inline.\n\n';
+          legacy(root, {
+            comments: [
+              independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z'),
+              { ...newer, body: prose + receiptText('CLEAR', 0) },
+            ],
+          });
+          fs.writeFileSync(path.join(root, 'permission--release-desk'), `${permission}\n`);
+
+          expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(code);
+        },
+      );
 
       it("still lets a writer's later visible CLEAR clear an older hidden CHANGES", () => {
         const root = tempRoot();
