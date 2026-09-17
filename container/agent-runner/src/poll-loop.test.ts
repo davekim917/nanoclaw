@@ -3112,6 +3112,119 @@ describe('error result with no <message> envelope', () => {
   });
 });
 
+describe("a person's message that got nothing delivered", () => {
+  // Live 2026-09-17: an agent answered five check-ins as text between tool
+  // calls and ended each turn with an empty result. Nothing was delivered and
+  // the wrapping nudge, which keys on unwrapped RESULT text, never fired.
+  const human = (query: AgentQuery) =>
+    processQuery(
+      query,
+      ERR_ROUTING,
+      ['m1'],
+      'claude',
+      undefined,
+      'prompt',
+      undefined,
+      {},
+      'r',
+      undefined,
+      undefined,
+      'human',
+    );
+
+  it('nudges once when a human-triggered turn ends empty with nothing delivered', async () => {
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      yield { type: 'result', text: null };
+      yield { type: 'result', text: null };
+    }
+    await human({ push: (m: string) => void pushes.push(m), end: () => {}, abort: () => {}, events: events() });
+
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain('without delivering anything');
+  });
+
+  it('does not nudge when the agent answered through send_message mid-turn', async () => {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      await writeMessageOut({ id: 'sent-mid-turn', kind: 'chat', content: JSON.stringify({ text: 'on it' }) });
+      yield { type: 'result', text: null };
+    }
+    await human({ push: (m: string) => void pushes.push(m), end: () => {}, abort: () => {}, events: events() });
+
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('does not count a status label as a delivered reply', async () => {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      await writeMessageOut({ id: 'label', kind: 'status', content: JSON.stringify({ text: '> thinking' }) });
+      yield { type: 'result', text: null };
+    }
+    await human({ push: (m: string) => void pushes.push(m), end: () => {}, abort: () => {}, events: events() });
+
+    expect(pushes).toHaveLength(1);
+  });
+
+  it('leaves an empty result alone when no person triggered the turn', async () => {
+    const { query, pushes } = makeResultQuery({ type: 'result', text: null });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('accepts a deliberate <internal> answer as the end of it', async () => {
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      yield { type: 'result', text: '<internal>no reply</internal>' };
+      yield { type: 'result', text: null };
+    }
+    await human({ push: (m: string) => void pushes.push(m), end: () => {}, abort: () => {}, events: events() });
+
+    expect(pushes).toHaveLength(0);
+  });
+
+  it("tells the agent mid-turn text is not delivered when a person's message is pushed into a running turn", async () => {
+    insertMessage('m-checkin', 'chat', { sender: 'Operator', senderId: 'U1', text: 'are you there' });
+    let sawPush!: () => void;
+    const pushed = new Promise<void>((resolve) => {
+      sawPush = resolve;
+    });
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      await pushed; // the turn is still running when the poll admits the row
+      yield { type: 'result', text: '<internal>answered through send_message</internal>' };
+    }
+    const query: AgentQuery = {
+      push: (m: string) => {
+        pushes.push(m);
+        sawPush();
+      },
+      end: () => {},
+      abort: () => {},
+      events: events(),
+    };
+
+    // Settings must match what the follow-up batch resolves to, or the poll ends the stream instead of pushing.
+    await processQuery(query, ERR_ROUTING, [], 'claude', undefined, 'initial', undefined, {
+      ultracode: false,
+      fast: false,
+    });
+
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain('are you there');
+    expect(pushes[0]).toContain('is NOT delivered');
+  }, 30_000);
+});
+
 describe('isCorruptionError', () => {
   it('matches the Docker Desktop macOS torn-read symptom', () => {
     expect(isCorruptionError('database disk image is malformed')).toBe(true);

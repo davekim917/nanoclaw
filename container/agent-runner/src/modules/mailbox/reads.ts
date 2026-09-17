@@ -76,3 +76,20 @@ export function readDeliveredRow(messageOutId: string): DeliveredRow | undefined
     .prepare('SELECT status, platform_message_id, error FROM delivered WHERE message_out_id = ?')
     .get(messageOutId) as DeliveredRow | undefined;
 }
+
+/** Highest outbound seq written so far, 0 when none — a watermark for `hasChatOutboundAfter`. */
+export function maxOutboundSeq(): number {
+  const row = getOutboundDb().prepare('SELECT MAX(seq) AS seq FROM messages_out').get() as { seq: number | null };
+  return row.seq ?? 0;
+}
+
+/**
+ * Whether anything a person can read was written after `seq`. Asked of the DB
+ * rather than counted in-process because `send_message`/`send_file` run in the
+ * MCP server's own process (mcp-tools/server.ts) and write here directly.
+ * Only `chat` rows reach a person: `status` is a progress label, `system` and
+ * `task_log` are host-facing.
+ */
+export function hasChatOutboundAfter(seq: number): boolean {
+  return getOutboundDb().prepare("SELECT 1 FROM messages_out WHERE seq > ? AND kind = 'chat' LIMIT 1").get(seq) != null;
+}

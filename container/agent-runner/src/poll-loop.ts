@@ -28,6 +28,8 @@ import {
   advanceMemoryContextEpoch,
   beginProviderBusyScope,
   classifyTrigger,
+  hasChatOutboundAfter,
+  maxOutboundSeq,
   clearDoneProposal,
   clearStickyEffort,
   clearStickyModel,
@@ -1536,6 +1538,11 @@ function hasRealInbound(messages: MessageInRow[]): boolean {
   });
 }
 
+/** A person's message that engaged the agent (trigger=1) — not context rows, not a peer agent. */
+function hasTriggeringHumanInbound(messages: MessageInRow[]): boolean {
+  return hasRealInbound(messages.filter((m) => m.trigger === 1 && m.channel_type !== 'agent'));
+}
+
 function isContinuationRecoveryBatch(messages: MessageInRow[]): boolean {
   if (hasRealInbound(messages)) return false;
   return messages.some((message) => {
@@ -1726,6 +1733,10 @@ export async function processQuery(
   let done = false;
   let unwrappedNudged = false;
   let taskBlockNudged = false;
+  // Outbound watermark taken when a person's triggering message was admitted
+  // and nothing has been delivered for it yet; null when no such message is
+  // owed a reply. Read at `result` (see nudgeUndeliveredHumanReply).
+  let humanReplyOwedSinceSeq: number | null = trigger === 'human' && !routing.taskRun ? maxOutboundSeq() : null;
   // Retryable (e.g. SDK `api_retry`) events are the SDK's own mid-stream retry
   // signal, NOT a turn-ending error. Record the last one but keep consuming so
   // the SDK's internal retry can still produce a result; only surface it if the
@@ -2149,6 +2160,8 @@ export async function processQuery(
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;
+        const pushedHumanTrigger = !routing.taskRun && hasTriggeringHumanInbound(keep);
+        if (pushedHumanTrigger && humanReplyOwedSinceSeq === null) humanReplyOwedSinceSeq = maxOutboundSeq();
         // A later occurrence joining this stream is a SEPARATE fire and needs
         // its own outcome slot. Without this it answered into the first fire's
         // slot — or, once that was filled, vanished — so a frequently failing
@@ -2162,7 +2175,19 @@ export async function processQuery(
             taskTurns.push(admittedTurn);
           }
         }
-        const pushedId = pushToQuery(prompt, extractAttachments(keep));
+        // A push into a RUNNING turn is merged into it, and that turn's
+        // `result` may be an hour away. Text written between tool calls is
+        // never dispatched (only the result text is — dispatchResultText), so
+        // an "on it" typed there reaches nobody. Observed live 2026-09-17: a
+        // person's five check-ins over 23 hours were each answered that way
+        // and none was delivered.
+        const midTurnNote =
+          pushedHumanTrigger && !turnIdle
+            ? '\n\n<system>This arrived while your turn is still running. Text you write between tool calls is NOT ' +
+              'delivered. To answer now, call the `send_message` tool; otherwise answer in <message to="name"> ' +
+              'blocks when the turn ends.</system>'
+            : '';
+        const pushedId = pushToQuery(prompt + midTurnNote, extractAttachments(keep));
         if (admittedTurn && pushedId) admittedTurn.promptIds = [pushedId];
         archivePrompts.push({ prompt });
         admittedInbound = true;
@@ -2520,6 +2545,9 @@ export async function processQuery(
             if (!willRetryWrapping && !willRetryTaskBlocks) {
               completeDeliveredPrompt();
             }
+            // Delivered, deliberately <internal>, or already nudged once: the
+            // debt is settled either way. A pending wrapping retry keeps it.
+            if (!willRetryWrapping && answersRunnerPrompt) humanReplyOwedSinceSeq = null;
           }
         } else {
           // `ProviderEvent.text` is `string | null`, so a terminal result can
@@ -2533,7 +2561,36 @@ export async function processQuery(
               event.answeredPrompts,
             );
           }
-          pauseAnsweredPrompt();
+          // An empty result is normally fine — the agent answered through
+          // `send_message`, or the message needed no answer. It is NOT fine
+          // when a person's triggering message is owed a reply and nothing
+          // readable was written since it was admitted: the wrapping nudge
+          // above keys on unwrapped RESULT text, so an agent that typed its
+          // answer between tool calls and then ended the turn empty got no
+          // nudge at all (2026-09-17, same thread as the mid-turn note).
+          // One nudge per batch, shared with the wrapping retry.
+          const replyOwed =
+            humanReplyOwedSinceSeq !== null &&
+            answersRunnerPrompt &&
+            event.isError !== true &&
+            !hasChatOutboundAfter(humanReplyOwedSinceSeq);
+          if (replyOwed && !unwrappedNudged) {
+            unwrappedNudged = true;
+            const names = getAllDestinations()
+              .map((d) => d.name)
+              .join(', ');
+            pushToQuery(
+              `<system>Your turn ended without delivering anything to the person who wrote to you. Text written ` +
+                `between tool calls is not delivered. Reply now in <message to="name">...</message> blocks ` +
+                `(destinations: ${names}), or, if no reply is warranted, answer with <internal>no reply</internal>.</system>`,
+            );
+            // Like the wrapping retry, the nudged result answers the SAME
+            // prompt. A continuation at the ledger head still has to be paused.
+            if (archivePrompts[0]?.continuationId) pauseAnsweredPrompt();
+          } else {
+            if (answersRunnerPrompt) humanReplyOwedSinceSeq = null;
+            pauseAnsweredPrompt();
+          }
         }
         // A provisional outcome stays only while a fire it could answer is open.
         if (provisional) {
