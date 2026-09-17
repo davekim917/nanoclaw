@@ -565,9 +565,11 @@ the screens that consume it.
 
 For a freeze campaign the gate matches `campaignRange`'s file list against the
 catalogue and states the result as `journeys` in `check` and the
-`pr_build_settled` wake — pinned, with a sha256-named catalogue snapshot, by the
-first settled poll, so neither a catalogue edit nor a recovery wake can change a
-run's contract. No catalogue: no `journeys` key. At intake:
+`pr_build_settled` wake. It reads the **pinned** range paths and is pinned with
+them at the first settled poll — immutable, in the shared lease directory, with
+a sha256-named catalogue snapshot — so no catalogue edit, recovery wake or
+second coordinator changes a run's contract (`pinState: invalid` ⇒ `full`,
+still offered). No catalogue: no `journeys` key. At intake:
 
 1. `smoke-journeys.py pin-run <run-dir> <journeys.pinFile>` copies the pin and
    snapshot into `<run-dir>/journeys/`; workers and siblings read that copy,

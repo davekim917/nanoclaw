@@ -1724,35 +1724,6 @@ campaign_size_classify() {
   printf '%s' "$out"
 }
 
-# Prints the freeze campaign's journey selection (one JSON object), or `null`
-# when the install has no catalogue. Consumes ONLY campaignRange's file list —
-# the same both-sides-of-a-rename list sizing reads — so selection can never
-# be computed off a different range than the one the campaign quotes. An
-# undeterminable range is `selection:"full"`, never an empty match. The
-# selection is pinned on the first SETTLED poll and read back verbatim from
-# then on (a recovery wake, or a catalogue edited mid-campaign, cannot change
-# a run's contract); `check` never pins, same as the baseline. A matcher that
-# crashes fails closed to `full`, same direction as the sizing classifier.
-journeys_select() {
-  local pr="$1" head_sha="$2" settled="$3" determinable="$4" fail_reason="$5" files_json="${6:-[]}" size="$7"
-  local out
-  local -a args
-  [ -e "$JOURNEYS_CATALOGUE" ] || [ -L "$JOURNEYS_CATALOGUE" ] || { printf 'null'; return 0; }
-  args=(--catalogue "$JOURNEYS_CATALOGUE" --state-dir "$STATE_DIR" --pin-key "pr-$pr-$head_sha"
-        --size "$size" --run-root "${SMOKE_GATE_RUN_ROOT:-}")
-  [ "$determinable" = true ] || args+=(--unknown "range not determinable: $fail_reason")
-  if [ "$COMMAND" = poll ] && [ "$settled" = true ]; then args+=(--pin); fi
-  if ! out="$(printf '%s' "$files_json" | timeout 20 python3 "$JOURNEYS_TOOL" match "${args[@]}" 2>/dev/null)" ||
-     ! jq -e 'type == "object" and (.selection | type == "string") and (.matchedJourneys | type == "array")' \
-       <<<"$out" >/dev/null 2>&1; then
-    jq -cn '{schemaVersion:1, selection:"full", reason:"journey matcher failed", route:"web",
-             catalogueValid:false, catalogueSha256:null, matchedJourneys:[], unmappedPaths:[],
-             excludedPaths:[], unassessedNativeJourneys:[], pinned:false, pinFile:null, catalogueSnapshot:null}'
-    return 0
-  fi
-  printf '%s' "$out"
-}
-
 # --- Freeze-campaign range pin -----------------------------------------------
 # A pin holds EVERYTHING range-derived for one freeze head: the campaignRange
 # object (baseline, determinable, reason, fileListMethod), the changed-path
@@ -1857,6 +1828,110 @@ range_pin_promote() {  # <pr> <head-sha> <candidate-file>
   tmp="$(mktemp "$LEASE_DIR/.range-pin-pr-$pr.XXXXXX" 2>/dev/null)" || return 1
   if ! jq -c --arg h "$head" --arg now "$(iso_now)" \
          "select(($RANGE_PIN_SHAPE) and .headSha == \$h) | . + {pinnedAt:\$now}" \
+         "$candidate" > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+    rm -f "$tmp" 2>/dev/null; return 1
+  fi
+  if ln "$tmp" "$f" 2>/dev/null; then rm -f "$tmp" 2>/dev/null; return 0; fi
+  rm -f "$tmp" 2>/dev/null
+  if [ -e "$f" ] || [ -L "$f" ]; then return 3; fi
+  return 1
+}
+
+# --- Freeze-campaign journey selection (smoke-journeys.py) ---------------------
+# Which saved journeys this campaign owes, which changed paths no journey
+# claims, and whether the change is a native-manual one. Derived from the
+# campaign's range paths and NOTHING else — the caller hands in the same
+# `range_paths_json` sizing reads, which IS the pinned list whenever the range
+# pin is valid — and then pinned itself, because the two inputs the range pin
+# does not hold can also move between two polls: the catalogue, and the floor's
+# last-proven dates. Same storage invariant as the range pin, through the same
+# primitives (range_pin_file's naming, range_pin_store_readable,
+# lease_dir_prepare, `ln` fail-on-exists): shared LEASE_DIR, immutable, keyed by
+# (repo, PR, head), never trimmed, invalid is not absent. The catalogue bytes
+# the selection was computed from are kept beside it, content-addressed.
+JOURNEYS_PIN_SHAPE='type == "object" and .schemaVersion == 1 and (.selection | type == "string") and
+  (.route | type == "string") and (.matchedJourneys | type == "array") and (.unmappedPaths | type == "array")'
+journeys_pin_file() {  # <pr> <head-sha>
+  local f
+  f="$(range_pin_file "$1" "$2")"
+  printf '%s/journeys-pin-%s' "$LEASE_DIR" "${f##*/range-pin-}"
+}
+journeys_full() {  # <reason> <pinState> — the fail-closed selection: full, said why
+  jq -cn --arg reason "$1" --arg state "$2" \
+    '{schemaVersion:1, selection:"full", reason:$reason, route:"web", catalogueValid:false,
+      catalogueSha256:null, matchedJourneys:[], unmappedPaths:[], excludedPaths:[],
+      unassessedNativeJourneys:[], pinned:false, pinFile:null, catalogueSnapshot:null, pinState:$state}'
+}
+# Prints the selection (one JSON object), or `null` when the install has no
+# catalogue AND this head has no journeys pin. Range-sized data reaches the
+# matcher on stdin, never argv. An undeterminable range is `selection:"full"`,
+# never an empty match; a matcher crash fails closed the same way.
+journeys_select() {  # <pr> <head-sha> <determinable> <fail-reason> <paths-json> <size>
+  local pr="$1" head_sha="$2" determinable="$3" fail_reason="$4" paths_json="${5:-[]}" size="$6"
+  local f why out snapshot_out=""
+  local -a args
+  if ! why="$(range_pin_store_readable)"; then
+    [ -e "$JOURNEYS_CATALOGUE" ] || [ -L "$JOURNEYS_CATALOGUE" ] || { printf 'null'; return 0; }
+    journeys_full "journey selection cannot be pinned on shared storage ($why)" unavailable
+    return 0
+  fi
+  f="$(journeys_pin_file "$pr" "$head_sha")"
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    if [ -L "$f" ]; then why="a symlink"
+    elif [ ! -f "$f" ]; then why="not a regular file"
+    elif jq -ce --arg h "$head_sha" "select(($JOURNEYS_PIN_SHAPE) and .pinned == true and .headSha == \$h)" "$f" 2>/dev/null; then
+      return 0
+    else why="truncated or malformed"
+    fi
+    journeys_full "the journeys pin for this head ($f) is $why, so the selection it pinned cannot be recovered" invalid
+    return 0
+  fi
+  [ -e "$JOURNEYS_CATALOGUE" ] || [ -L "$JOURNEYS_CATALOGUE" ] || { printf 'null'; return 0; }
+  args=(--catalogue "$JOURNEYS_CATALOGUE" --size "$size" --run-root "${SMOKE_GATE_RUN_ROOT:-}")
+  [ "$determinable" = true ] || args+=(--unknown "range not determinable: $fail_reason")
+  # Like the range pin's candidate: written only where `poll` can promote it.
+  if [ "$COMMAND" = poll ] && [ -n "${TMP_DIR:-}" ]; then
+    snapshot_out="$TMP_DIR/journeys-catalogue-$pr.json"
+    rm -f "$snapshot_out" "$TMP_DIR/journeys-pin-$pr.json" 2>/dev/null
+    args+=(--snapshot-out "$snapshot_out")
+  fi
+  if ! out="$(printf '%s' "$paths_json" | timeout 20 python3 "$JOURNEYS_TOOL" match "${args[@]}" 2>/dev/null)" ||
+     ! out="$(jq -ce "select($JOURNEYS_PIN_SHAPE) | . + {pinState:\"absent\"}" <<<"$out" 2>/dev/null)"; then
+    out="$(journeys_full "journey matcher failed" absent)"
+    [ -z "$snapshot_out" ] || rm -f "$snapshot_out" 2>/dev/null
+  fi
+  [ -z "$snapshot_out" ] || printf '%s' "$out" > "$TMP_DIR/journeys-pin-$pr.json" 2>/dev/null || true
+  printf '%s' "$out"
+}
+# Promote poll's candidate to THE journeys pin for (pr, head), catalogue
+# snapshot first. Same return contract as range_pin_promote: 0 created, 3 the
+# path is already occupied, 1 nothing could be created.
+journeys_pin_promote() {  # <pr> <head-sha> <candidate> <snapshot-candidate>
+  local pr="$1" head="$2" candidate="$3" snapshot="$4" f tmp digest snap=""
+  printf '%s' "$pr" | grep -Eq '^[0-9]+$' && printf '%s' "$head" | grep -Eq '^[0-9a-f]{40}$' || return 1
+  lease_dir_prepare || { printf 'smoke-pr-gate: journeys pin not written: %s\n' "$LEASE_DIR_ERROR" >&2; return 1; }
+  f="$(journeys_pin_file "$pr" "$head")"
+  if [ -e "$f" ] || [ -L "$f" ]; then return 3; fi
+  digest="$(jq -r '.catalogueSha256 // empty' "$candidate" 2>/dev/null)" || return 1
+  if [ -n "$digest" ]; then
+    printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$' && [ -f "$snapshot" ] &&
+      [ "$(sha256sum < "$snapshot" | cut -d' ' -f1)" = "$digest" ] || return 1
+    snap="$LEASE_DIR/journeys-catalogue-$digest.json"
+    if [ ! -e "$snap" ] && [ ! -L "$snap" ]; then
+      tmp="$(mktemp "$LEASE_DIR/.journeys-catalogue.XXXXXX" 2>/dev/null)" || return 1
+      cat "$snapshot" > "$tmp" 2>/dev/null && { ln "$tmp" "$snap" 2>/dev/null || true; }
+      rm -f "$tmp" 2>/dev/null
+    fi
+    # Content-addressed, so an existing one is fine exactly when it verifies.
+    if [ -L "$snap" ] || [ ! -f "$snap" ] || [ "$(sha256sum < "$snap" | cut -d' ' -f1)" != "$digest" ]; then
+      printf 'smoke-pr-gate: journeys pin not written: catalogue snapshot %s does not verify\n' "$snap" >&2
+      return 1
+    fi
+  fi
+  tmp="$(mktemp "$LEASE_DIR/.journeys-pin-pr-$pr.XXXXXX" 2>/dev/null)" || return 1
+  if ! jq -c --arg h "$head" --arg now "$(iso_now)" --arg f "$f" --arg snap "$snap" \
+         "select($JOURNEYS_PIN_SHAPE) | . + {headSha:\$h, pinned:true, pinState:\"valid\", pinFile:\$f,
+            catalogueSnapshot:(if \$snap == \"\" then null else \$snap end), pinnedAt:\$now}" \
          "$candidate" > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
     rm -f "$tmp" 2>/dev/null; return 1
   fi
@@ -2458,10 +2533,15 @@ evaluate_pr() {
     settled=true
   fi
 
+  # Journey selection reads `range_paths_json` — the pinned list whenever this
+  # head's range pin is valid, never a second fetch — through $size_files_json,
+  # the same value sizing classified.
   local journeys_json=null
   if [ "$is_freeze" = true ]; then
-    journeys_json="$(journeys_select "$pr" "$head_sha" "$settled" "$size_determinable" \
+    journeys_json="$(journeys_select "$pr" "$head_sha" "$size_determinable" \
       "$size_fail_reason" "$size_files_json" "$campaign_size")"
+    jq -e 'type == "object" or . == null' <<<"$journeys_json" >/dev/null 2>&1 ||
+      journeys_json="$(journeys_full "journey selection could not be read" absent)"
   fi
 
   # The two migration lists are range-sized, so they reach jq through
@@ -2470,7 +2550,8 @@ evaluate_pr() {
   # shadowed with `null` there and rebound from the file as the program's
   # first step.
   local range_lists_json
-  range_lists_json="$(printf '{"migrationFiles":%s,"migrationsInRange":%s}' "$migration_files" "$migrations_in_range")"
+  # The journey selection lists range paths too, so it rides the same file.
+  range_lists_json="$(printf '{"migrationFiles":%s,"migrationsInRange":%s,"journeys":%s}' "$migration_files" "$migrations_in_range" "$journeys_json")"
   migrations_in_range=null
   jq -cn \
     --argjson pr "$pr" --arg headSha "$head_sha" \
@@ -2495,9 +2576,9 @@ evaluate_pr() {
     --argjson previewAmbiguous "$preview_ambiguous" --arg previewAmbiguityReason "$preview_ambiguity_text" \
     --argjson frontendEvidenceGap "$frontend_evidence_gap" \
     --argjson campaignRange "$campaign_range_json" --argjson migrationsInRange "$migrations_in_range" \
-    --argjson journeys "$journeys_json" \
     '($rangeLists[0].migrationFiles) as $migrationFiles |
      ($rangeLists[0].migrationsInRange) as $migrationsInRange |
+     ($rangeLists[0].journeys) as $journeys |
      ({
       pr: $pr, headSha: $headSha, fetchOk: $fetchOk,
       migrationsTouched: $migrationsTouched, frontendTouched: $frontendTouched,
@@ -4535,6 +4616,26 @@ while IFS= read -r ROW; do
       *) RANGE_PIN_CONFLICT=true
          printf 'smoke-pr-gate: freeze PR #%s is settled but not offered: %s\n' "$PR" \
            "$(jq -r '.campaignRange.reason // "no shared range-pin storage"' <<<"$FACTS")" >&2 ;;
+    esac
+  fi
+  # The journeys pin follows the range pin, by the same table: valid/invalid
+  # are offered as read; absent is promoted (rc 3 or 1 drops the candidate for
+  # this cycle); unavailable is not offered.
+  if [ "$RANGE_PIN_CONFLICT" != true ] &&
+     [ "$(jq -r '.isFreezePr == true and .settled == true and (.journeys | type == "object")' <<<"$FACTS")" = true ]; then
+    case "$(jq -r '.journeys.pinState // "absent"' <<<"$FACTS")" in
+      valid|invalid) ;;
+      absent)
+        if journeys_pin_promote "$PR" "$HEAD_SHA" "$TMP_DIR/journeys-pin-$PR.json" "$TMP_DIR/journeys-catalogue-$PR.json" &&
+           JOURNEYS_PINNED="$(jq -c --slurpfile j "$(journeys_pin_file "$PR" "$HEAD_SHA")" '.journeys=$j[0]' <<<"$FACTS" 2>/dev/null)" &&
+           [ -n "$JOURNEYS_PINNED" ]; then
+          FACTS="$JOURNEYS_PINNED"
+        else
+          RANGE_PIN_CONFLICT=true
+        fi ;;
+      *) RANGE_PIN_CONFLICT=true
+         printf 'smoke-pr-gate: freeze PR #%s is settled but not offered: %s\n' "$PR" \
+           "$(jq -r '.journeys.reason // "no shared journeys-pin storage"' <<<"$FACTS")" >&2 ;;
     esac
   fi
   if [ "$STATE_DIRTY" = true ]; then

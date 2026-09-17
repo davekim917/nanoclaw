@@ -8,9 +8,9 @@ executes the steps; this only decides, deterministically and before any model
 wakes, WHICH journeys a change selects and which changed paths nothing claims.
 
   validate  <catalogue>
-  match     --catalogue <file> --state-dir <dir> --pin-key <key>
-            [--pin] [--unknown <reason>] [--size light|standard|full]
-            [--run-root <dir>] [--as-of <iso>]        (changed paths: JSON array on stdin)
+  match     --catalogue <file> [--snapshot-out <file>] [--unknown <reason>]
+            [--size light|standard|full] [--run-root <dir>] [--as-of <iso>]
+            (changed paths: JSON array on stdin, never argv)
   floor-due <catalogue> <run-root> [--size ...] [--as-of <iso>]
   pin-run   <run-dir> <gate-pin-file>
   shots     <run-dir>
@@ -383,8 +383,8 @@ def compute_selection(cat, digest, paths, unknown_reason, size, run_root, as_of)
         "catalogueValid": True,
         "catalogueSha256": digest,
         "matchedJourneys": matched,
-        # Frozen with the pin: a glob added to the catalogue later does not
-        # take a path off this list.
+        # Frozen once the gate pins this selection: a glob added to the
+        # catalogue later does not take a path off this list.
         "unmappedPaths": [] if unknown_reason is not None else unmapped,
         "excludedPaths": [] if unknown_reason is not None else excluded,
         "unassessedNativeJourneys": unassessed_native,
@@ -422,17 +422,12 @@ def _write_atomic(path, data):
 
 
 def cmd_match(args):
-    if not re.match(r"^[A-Za-z0-9._-]{1,200}$", args.pin_key):
-        emit({"ok": False, "error": "pin key is not a safe path segment"}, 2)
-    pin_dir = os.path.join(args.state_dir, "journeys")
-    pin_file = os.path.join(pin_dir, "pin-{}.json".format(args.pin_key))
-
-    # A pinned selection IS the campaign's contract: later catalogue edits, a
-    # later poll, and a recovery wake all read it back unchanged.
-    pinned = _read_json(pin_file)
-    if isinstance(pinned, dict) and pinned.get("pinned") is True:
-        emit(pinned)
-
+    """Compute one selection. Pinning is NOT done here: a campaign's pin is
+    shared, immutable state the PR gate owns (journeys_pin_promote), beside
+    the range pin it is derived from. `--snapshot-out` hands the gate the exact
+    catalogue bytes this selection was computed from, so the snapshot it pins
+    is the one that was hashed, not a second read of a file that may have
+    moved."""
     try:
         paths = json.load(sys.stdin)
     except ValueError:
@@ -452,31 +447,9 @@ def cmd_match(args):
     else:
         selection = compute_selection(cat, digest, paths, unknown, args.size, args.run_root, as_of)
     selection.update({"pinned": False, "pinFile": None, "catalogueSnapshot": None})
-
-    if args.pin:
-        try:
-            os.makedirs(pin_dir, exist_ok=True)
-            if raw is not None:
-                snapshot = os.path.join(pin_dir, "catalogue-{}.json".format(digest))
-                if not os.path.exists(snapshot):
-                    _write_atomic(snapshot, raw)
-                selection["catalogueSnapshot"] = snapshot
-            selection.update({"pinned": True, "pinFile": pin_file, "pinnedAt": as_of.strftime("%Y-%m-%dT%H:%M:%SZ")})
-            fd, tmp = tempfile.mkstemp(dir=pin_dir, prefix=".tmp-pin-")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump(selection, fh, separators=(",", ":"))
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.link(tmp, pin_file)  # no-clobber: first writer wins
-            except FileExistsError:
-                winner = _read_json(pin_file)
-                if isinstance(winner, dict):
-                    selection = winner
-            finally:
-                os.unlink(tmp)
-        except OSError as exc:
-            selection.update({"pinned": False, "pinFile": None, "pinError": str(exc)})
+    if args.snapshot_out and raw is not None:
+        with open(args.snapshot_out, "wb") as fh:
+            fh.write(raw)
     emit(selection)
 
 
@@ -577,13 +550,22 @@ def cmd_barrier(args):
     # run's bookkeeping: a pin the gate wrote for this campaign must be in the
     # run byte-for-byte, so skipping pin-run (or pinning a narrowed copy) is a
     # refusal rather than a way out of every check below.
+    #
+    # Only a VALID pin can be adopted. Anything else at a pin's path (a symlink,
+    # a directory, truncated JSON) is what the gate itself reports as
+    # pinState:"invalid" -- scope unrecoverable, campaign `full`, no pinFile to
+    # hand to pin-run -- so there is nothing here to hold the run to.
     gate_pins = []
     for pin_path in args.gate_pin:
+        if os.path.islink(pin_path) or not os.path.isfile(pin_path):
+            continue
         try:
             with open(pin_path, "rb") as fh:
-                gate_pins.append((pin_path, fh.read()))
-        except OSError:
-            gate_pins.append((pin_path, None))
+                raw = fh.read()
+            if json.loads(raw.decode("utf-8")).get("pinned") is True:
+                gate_pins.append((pin_path, raw))
+        except (OSError, ValueError, UnicodeDecodeError, AttributeError):
+            continue
     if gate_pins:
         try:
             with open(selection_path, "rb") as fh:
@@ -757,9 +739,7 @@ def main():
 
     p = sub.add_parser("match")
     p.add_argument("--catalogue", required=True)
-    p.add_argument("--state-dir", required=True)
-    p.add_argument("--pin-key", required=True)
-    p.add_argument("--pin", action="store_true")
+    p.add_argument("--snapshot-out", default="")
     p.add_argument("--unknown")
     p.add_argument("--size", default="standard")
     p.add_argument("--run-root", default="")

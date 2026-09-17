@@ -1389,7 +1389,9 @@ unset -f recover_run pin_file
 # --- 5k. Journey selection rides campaignRange (smoke-journeys.py) ----------
 # The catalogue is the fictional example under references/. Selection consumes
 # ONLY the baseline...target file list, is absent when the install has no
-# catalogue, and is pinned by the first settled poll.
+# catalogue, and is pinned by the first settled poll — in the SHARED lease dir,
+# beside the range pin, by the same immutable primitives.
+jpin_file() { printf '%s/journeys-pin-org__repo-pr-%s-%s.json' "$SMOKE_GATE_LEASE_DIR" "$1" "$2"; }
 JOURNEYS_EXAMPLE="$SCRIPT_DIR/../references/journeys.example.json"
 journeys_fixture() { # <compare-files-json>; one ready freeze (PR 13) with a validated baseline
   fresh_state
@@ -1428,7 +1430,8 @@ jq -e '.journeys.selection == "matched" and .journeys.route == "web" and .journe
   (.journeys.excludedPaths | map({path,glob})) == [{"path":"docs/internal/changelog.md","glob":"docs/internal/**"}] and
   (.journeys.excludedPaths[0].reason | length > 0)' <<<"$T5K_WITH" >/dev/null ||
   { echo "5k: backend-only selection wrong: $T5K_WITH" >&2; exit 1; }
-[ ! -e "$STATE_DIR/journeys" ] || { echo "5k: check pinned a selection" >&2; exit 1; }
+jq -e '.journeys.pinState == "absent"' <<<"$T5K_WITH" >/dev/null
+[ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: check pinned a selection" >&2; exit 1; }
 
 # The settled poll pins it and the wake carries it, with the catalogue snapshot.
 T5K_POLL="$(bash "$GATE" poll)"
@@ -1438,12 +1441,89 @@ jq -e '.data.trigger == "pr_build_settled" and .data.journeys.pinned == true and
   { echo "5k: wake payload carries no pinned selection: $T5K_POLL" >&2; exit 1; }
 T5K_SNAPSHOT="$(jq -r '.data.journeys.catalogueSnapshot' <<<"$T5K_POLL")"
 [ "$(sha256sum < "$T5K_SNAPSHOT" | cut -d' ' -f1)" = "$(jq -r '.data.journeys.catalogueSha256' <<<"$T5K_POLL")" ]
+# The pin and its snapshot live in the shared lease dir, never the private
+# state dir, and the wake IS the pin, byte for byte.
+[ "$(jq -r '.data.journeys.pinFile' <<<"$T5K_POLL")" = "$(jpin_file 13 "$FREEZE_SHA")" ]
+case "$T5K_SNAPSHOT" in "$SMOKE_GATE_LEASE_DIR"/journeys-catalogue-*) ;; *) echo "5k: snapshot outside the shared lease dir: $T5K_SNAPSHOT" >&2; exit 1 ;; esac
+[ "$(jq -c '.data.journeys' <<<"$T5K_POLL")" = "$(jq -c . "$(jpin_file 13 "$FREEZE_SHA")")" ] ||
+  { echo "5k: the wake's selection is not the pin" >&2; exit 1; }
+[ -z "$(find "$STATE_DIR" -name '*journeys-pin*' -o -name 'journeys-catalogue-*' | head -1)" ] ||
+  { echo "5k: a journeys pin was written under the private state dir" >&2; exit 1; }
 # FROZEN: a glob added afterwards claims the path in the live catalogue, and
 # the campaign still owes the explanation it was opened with.
 jq '.journeys[0].consumes += ["api/src/reports/**"]' "$JOURNEYS_EXAMPLE" > "$STATE_DIR/journeys.json"
 range_case 5k-frozen '.journeys.pinned == true and .journeys.unmappedPaths == ["api/src/reports/export.ts"]'
 [ "$(bash "$GATE" check 13 | jq -c '.journeys')" = "$(jq -c '.data.journeys' <<<"$T5K_POLL")" ] ||
   { echo "5k: the pinned selection moved after a catalogue edit" >&2; exit 1; }
+# SHARED ownership: a second coordinator with a DIFFERENT private state dir
+# (no ledger, no catalogue of its own, the API down) reads the same selection.
+T5K_OTHER="$(mktemp -d)"
+[ "$(SMOKE_GATE_STATE_DIR="$T5K_OTHER" SMOKE_GATE_HANDOFF_LEDGER="$T5K_OTHER/none.jsonl" \
+     SMOKE_JOURNEYS_CATALOGUE="$T5K_OTHER/none.json" STUB_COMPARE_EXIT=1 bash "$GATE" check 13 | jq -c '.journeys')" = \
+  "$(jq -c '.data.journeys' <<<"$T5K_POLL")" ] ||
+  { echo "5k: a second coordinator did not read the shared journeys pin" >&2; exit 1; }
+rm -rf "$T5K_OTHER"
+# IMMUTABLE: a second promotion for the same head changes nothing on disk.
+T5K_PIN_SUM="$(sha256sum < "$(jpin_file 13 "$FREEZE_SHA")")"
+bash "$GATE" poll >/dev/null
+[ "$(sha256sum < "$(jpin_file 13 "$FREEZE_SHA")")" = "$T5K_PIN_SUM" ]
+
+# The matcher consumes the PINNED range paths, never a recomputed list: pin the
+# range with no catalogue installed, then adopt one while the API starts naming
+# different files. Selection is computed off what the range pin holds.
+journeys_fixture "$BACKEND_ONLY"
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/not-yet.json"
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and (.data | has("journeys") | not)' >/dev/null ||
+  { echo "5k: setup: range did not pin without a catalogue" >&2; exit 1; }
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/journeys.json"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"mobile/src/scan.tsx"}]}'
+range_case 5k-pinned-paths '.campaignRange.baselinePinned == true and .journeys.route == "web" and
+  [.journeys.matchedJourneys[] | select(.reason == "changed") | .id] == ["loan-desk-checkout"] and
+  .journeys.unmappedPaths == ["api/src/reports/export.ts"]'
+
+# INVALID IS NOT ABSENT: anything at the pin's path that is not a well-formed
+# pin means the selection is unrecoverable — `full`, said why, still OFFERED,
+# and never recomputed over, replaced or written through.
+for T5K_KIND in truncated dangling directory; do
+  journeys_fixture "$BACKEND_ONLY"
+  mkdir -p "$SMOKE_GATE_LEASE_DIR"
+  case "$T5K_KIND" in
+    truncated) printf '{"schemaVersion":1,"selec' > "$(jpin_file 13 "$FREEZE_SHA")" ;;
+    dangling)  ln -s "$STATE_DIR/nowhere.json" "$(jpin_file 13 "$FREEZE_SHA")" ;;
+    directory) mkdir "$(jpin_file 13 "$FREEZE_SHA")" ;;
+  esac
+  range_case "5k-invalid-$T5K_KIND" '.journeys.pinState == "invalid" and .journeys.selection == "full" and
+    (.journeys.reason | test("cannot be recovered")) and .journeys.pinFile == null'
+  bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and
+    .data.journeys.pinState == "invalid" and .data.journeys.selection == "full"' >/dev/null ||
+    { echo "5k: an invalid journeys pin ($T5K_KIND) made the freeze unofferable" >&2; exit 1; }
+  case "$T5K_KIND" in
+    truncated) [ "$(cat "$(jpin_file 13 "$FREEZE_SHA")")" = '{"schemaVersion":1,"selec' ] ;;
+    dangling)  [ -L "$(jpin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$STATE_DIR/nowhere.json" ] ;;
+    directory) [ -d "$(jpin_file 13 "$FREEZE_SHA")" ] ;;
+  esac
+done
+
+# Range-sized selections never travel in argv: 5,200 changed paths nobody
+# claims (>200 KB of unmappedPaths) still pin, wake and read back.
+journeys_fixture "$(python3 -c 'import json; print(json.dumps({"status":"ahead","ahead_by":900,"behind_by":0,"files":[{"filename": f"api/src/f{i}.ts"} for i in range(300)]}))')"
+export STUB_TREES_FILE="$STATE_DIR/big-trees.json"
+python3 - "$BASE_SHA" "$PARENT_SHA" > "$STUB_TREES_FILE" <<'PYF'
+import json, sys
+base, target = sys.argv[1], sys.argv[2]
+blob = lambda p, s: {"path": p, "type": "blob", "mode": "100644", "sha": s}
+paths = [f"api/src/reports/some/deeply/nested/feature/area/file_{i:05d}.ts" for i in range(5199)] + ["web/src/desk/a.tsx"]
+print(json.dumps({base: {"truncated": False, "tree": [blob(p, "a") for p in paths]},
+                  target: {"truncated": False, "tree": [blob(p, "b") for p in paths]}}))
+PYF
+T5K_BIG="$(bash "$GATE" poll)"
+jq -e '.data.trigger == "pr_build_settled" and .data.journeys.pinned == true and
+  (.data.journeys.unmappedPaths | length) == 5199 and
+  [.data.journeys.matchedJourneys[] | select(.reason == "changed") | .id] == ["loan-desk-checkout"]' <<<"$T5K_BIG" >/dev/null ||
+  { echo "5k: a >128KiB selection did not pin+wake: ${T5K_BIG:0:300}" >&2; exit 1; }
+[ "$(jq -c '.unmappedPaths' "$(jpin_file 13 "$FREEZE_SHA")" | wc -c)" -gt 204800 ]
+range_case 5k-big-readback '(.journeys.unmappedPaths | length) == 5199 and .journeys.pinState == "valid"'
+unset STUB_TREES_FILE
 
 # NATIVE-ONLY: a non-empty scope claimed entirely by native-manual journeys
 # routes to the manual packet. One stray path keeps it a web campaign.
@@ -1475,7 +1555,7 @@ export STUB_PR_FILES='[{"filename":"api/src/loans/period.ts"}]'
 bash "$GATE" check 13 | jq -e '.isFreezePr == false and (has("journeys") | not)' >/dev/null ||
   { echo "5k: an ordinary PR grew a journeys key" >&2; exit 1; }
 unset SMOKE_JOURNEYS_CATALOGUE
-unset -f range_case journeys_fixture
+unset -f range_case journeys_fixture jpin_file
 
 # --- 6. Migrations refusal: never settles; one throttled alarm wake --------
 fresh_state
