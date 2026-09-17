@@ -86,6 +86,8 @@ Per-agent-group container runtime config (provider, model, packages, MCP servers
 
 Secrets live in the OneCLI gateway, injected per-request at the proxy boundary — never env vars, chat, or on-disk. `src/onecli-secrets.ts`, `container/skills/onecli-gateway/SKILL.md`.
 
+**Remote MCP servers use OAuth, not a pasted key**: `ncl integrations login|complete|list|remove` runs MCP authorization (discovery → dynamic client registration → PKCE authorization-code), writes the access token into the group's bearer secret, and a sweep duty keeps it fresh. The refresh token is host-side (`data/mcp-oauth/`, 0600) because OneCLI secret values are **write-only** — `PATCH /api/secrets/{id}` exists, no read route does. [docs/mcp-oauth-integrations.md](docs/mcp-oauth-integrations.md)
+
 **Fail-closed, declarative scoping**: `container.json`'s `onecliSecrets` (names/UUIDs) resolves and assigns on every spawn; an unresolvable name aborts the spawn (sweep retries). Workgroup secrets merge as a union with per-group additions — extend only, never subtract. [docs/workgroups.md](docs/workgroups.md) **Gotcha — auto-created agents default to `selective` mode with nothing assigned**: symptom is a `401` from an API whose credential *is* in the vault; fix is declaring `onecliSecrets` above, or `onecli agents set-secrets` / `set-secret-mode --mode all` (looser). Verified against `onecli@1.4.1`. Approval gating is two-sided — a configured gateway rule with no host callback running hangs every credentialed call until timeout.
 
 ## Skills
@@ -170,6 +172,7 @@ Tracks latest stable, including majors; prerelease/beta/RC/dev/nightly/draft/yan
 | Skills | `skills-model.md`, `skill-guidelines.md`, `skill-directives.md`, `skill-engine-seam.md` |
 | Runtime, CI | `build-and-runtime.md` |
 | Dependency updates | `dependency-updates.md` |
+| Remote MCP OAuth | `mcp-oauth-integrations.md` |
 | v1→v2 migration | `v1-to-v2-changes.md`, `migration-dev.md` |
 | Provider switching | `provider-migration.md` |
 | Templates | `templates.md` |

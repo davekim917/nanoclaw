@@ -1,0 +1,170 @@
+# Remote MCP integrations (OAuth)
+
+Connecting a remote MCP server — Dropbox, Amplitude, anything that answers `401` with
+`WWW-Authenticate: Bearer resource_metadata="…"` — without creating a developer app or pasting an
+API key. The host does what a first-party MCP client does: discovers the authorization server,
+registers itself dynamically, runs an authorization-code flow with PKCE, and then keeps the access
+token fresh on its own.
+
+```
+ncl integrations login --name <n> --url <mcp-url> --group <agent-group-id>
+ncl integrations complete --name <n> --redirect-url '<the URL your browser landed on>'
+ncl integrations list
+ncl integrations refresh
+ncl integrations remove --name <n> [--delete-secret]
+```
+
+## What it fixes
+
+A remote MCP server authenticates with a short-lived OAuth access token. Before this, the operator
+pasted one into a OneCLI header-injection secret by hand. When it expired the gateway kept injecting
+the dead value — `status=401 injections_applied=1` in the gateway log — and the container's stdio
+bridge died with `CONNECTION_CLOSED` on every spawn, until a human noticed and pasted a new one.
+
+## Where each piece of state lives
+
+| Thing | Where | Why there |
+|---|---|---|
+| Access token (the bearer) | OneCLI secret, injected at the proxy | The container never sees a credential; this is the existing model |
+| Refresh token, client id/secret | `data/mcp-oauth/<name>.json`, mode 0600 in a 0700 directory | OneCLI's API is **write-only** for secret values (see below), so a refresh token parked there could never be read back |
+| Endpoints, scopes, secret name, expiry, status | `mcp_oauth_integrations` (migration 082) | Metadata only — no token material, so `ncl integrations list` is safe to read and to share |
+
+**Why the refresh token is not in OneCLI.** Verified against the live gateway on 2026-09-17,
+`onecli@1.4.1`: `POST /api/secrets` → 201, `PATCH /api/secrets/{id}` with `{"value":…}` → 200
+(leaving hostPattern / pathPattern / injectionConfig untouched), `DELETE /api/secrets/{id}` → 204.
+There is **no read route**: `GET /api/secrets/{id}`, `…/value`, `…/reveal`, `?reveal=true` and
+`?include=value` all 404 or return the same value-free listing. A refresher that cannot read its
+refresh token cannot refresh. The precedent for holding it host-side is exact — the GitHub App
+**private key** already sits on this host's filesystem at `GITHUB_APP_PRIVATE_KEY_PATH` and the host
+mints short-lived installation tokens from it (`src/github-app-token.ts:227`). `DATA_DIR` itself is
+never bind-mounted into a container; only named subpaths under it are, and `mcp-oauth/` is not one.
+
+## Logging in
+
+The host is headless and you reach it over ssh, so nothing here ever tries to open a browser — no
+`xdg-open`, no `$DISPLAY`, no `BROWSER`. There are three ways in; the first needs no setup at all.
+
+### 1. Paste (the default)
+
+```bash
+ncl integrations login --name amplitude-analytics \
+  --url https://mcp.amplitude.com/mcp \
+  --group <agent-group-id> \
+  --secret Amplitude-MCP-Analytics
+```
+
+It prints an authorization URL. Open that **on your own machine**. Approve. Your browser will fail
+to load the redirect (`http://127.0.0.1:8765/callback?code=…`) — that is expected, nothing is
+listening there. Copy the whole URL out of the address bar:
+
+```bash
+ncl integrations complete --name amplitude-analytics \
+  --redirect-url 'http://127.0.0.1:8765/callback?code=abc123&state=xyz'
+```
+
+A bare `?code=…&state=…` or a bare code works too. A login is a once-per-integration event, which is
+why the simplest thing that always works is the default.
+
+### 2. `--listen` (optional, needs an ssh tunnel)
+
+Add `--listen` and the host also binds `127.0.0.1:8765`. That port is only reachable from your
+laptop if you forward it, so open a second terminal and run — verbatim, both sides the same port:
+
+```bash
+ssh -L 8765:127.0.0.1:8765 <user>@<host>
+```
+
+With the tunnel up, approving in the browser completes the login by itself; confirm with
+`ncl integrations list`. The paste path stays open alongside it, so a tunnel you forgot to open
+costs nothing. `--port <n>` moves both the redirect URI and the listener together (they must match).
+`--listen-timeout <seconds>` defaults to 600. If the port will not bind, the command says so and you
+paste instead.
+
+### 3. `--device` (optional, only where the server publishes it)
+
+RFC 8628 — a user code and a verification URL, no redirect at all. It needs
+`device_authorization_endpoint` in the authorization server's metadata. **Neither first target
+publishes one**: Amplitude does not list the grant at all, and Dropbox lists `device_code` in
+`grant_types_supported` while publishing no endpoint to start it at. `--device` says exactly that
+rather than guessing a URL; `--device-endpoint <url>` overrides it if you know the endpoint.
+
+## Provider notes
+
+**Dropbox** (`https://mcp.dropbox.com/mcp`) issues **no refresh token** unless the authorization
+request carries `token_access_type=offline`, and nothing in its metadata says so:
+
+```bash
+ncl integrations login --name dropbox-files --url https://mcp.dropbox.com/mcp \
+  --group <agent-group-id> --secret Dropbox-Files \
+  --authorize-param token_access_type=offline
+```
+
+Its token endpoint is on `api.dropboxapi.com` while its issuer is `www.dropbox.com` — the two are
+discovered and stored separately, never derived from each other.
+
+**Amplitude** (`https://mcp.amplitude.com/mcp`) is its own authorization server. Its protected
+resource advertises `mcp:read` and `mcp:write`; the AS also supports `offline_access`, which some
+servers require before they will issue a refresh token — add it with
+`--scopes 'mcp:read mcp:write offline_access'` if `complete` warns that none was issued.
+
+If `complete` reports **"the server issued no refresh token"**, fix it now rather than later: that
+bearer will expire and nothing can renew it.
+
+## Which secret it writes
+
+The bearer goes into a OneCLI secret named `<Name>-MCP-<Group>` by default
+(so an integration named `amplitude-analytics` on a group foldered `analytics` writes
+`AmplitudeAnalytics-MCP-Analytics`). `--secret <name>` points it at a different one — use this to
+**adopt** a secret you already created by hand, which is the usual case when a server was previously
+wired up with a pasted token. Adopting updates the value in place and leaves the existing
+host/path/header matching rule alone.
+
+`complete` also appends the secret name to the group's `groups/<folder>/container.json`
+`onecliSecrets`, because that declaration is what actually grants it: `applyOnecliSecrets` reconciles
+the group's OneCLI agent to exactly the declared set on every spawn (`src/onecli-secrets.ts`). A
+secret that exists in the vault but is missing from `container.json` is a secret the agent is not
+granted, however fresh its value is.
+
+**Restart the group afterwards** so the spawn path picks up the new declaration:
+
+```bash
+ncl groups restart --id <agent-group-id>
+```
+
+An already-running container does not need a restart for a later *refresh* — the gateway injects the
+new value on the next request.
+
+## Staying fresh
+
+`mcp-oauth-refresh` (FORK4) runs in the 60-second host sweep, `tick:housekeeping` order 27, right
+after the two GitHub credential duties. Any `active` integration within 10 minutes of expiry gets a
+new access token, PATCHed over the same OneCLI secret.
+
+- **Refresh-token rotation** is persisted before the row is updated, so a server that reissues one on
+  every refresh cannot lock the integration out.
+- **`invalid_grant` / `invalid_client` / `unauthorized_client`** move the row to `needs_login`, log
+  one WARN, and stop retrying. Only a fresh `login` clears it.
+- **Anything else** leaves the row in `error` with the old bearer untouched, and the next tick
+  retries.
+- **No `expires_in`** from the server falls back to refreshing every 12 hours.
+
+`ncl integrations refresh` runs the same pass on demand.
+
+## Removing one
+
+```bash
+ncl integrations remove --name dropbox-files
+```
+
+Deletes the registry row and the host-side bundle. The OneCLI secret and the `container.json`
+declaration are left alone — the secret may predate the integration and other requests may match on
+it. `--delete-secret` also deletes it; remove it from `container.json` **first**, or the next spawn
+fails closed on an unresolvable declaration.
+
+## Access
+
+`login`, `complete`, `remove` and `refresh` are **operator-only** (`hostOnly`): an OAuth login mints
+a credential for your account at a third party, and no `cli_scope` — not even `global` — makes that
+appropriate for an agent to initiate. `list` and `get` are open; they carry no token material and
+answer the question an agent hitting a 401 through its MCP bridge actually has. `integrations` is not
+in `GROUP_SCOPE_RESOURCES`, so a group-scoped agent is refused it regardless.

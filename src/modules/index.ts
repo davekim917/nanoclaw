@@ -105,3 +105,8 @@ import './sweep-scheduling/index.js';
 // Sweep duty family: scheduled-task failure escalation (T24) — a series whose
 // agent turn keeps erroring reaches a human instead of dying silently.
 import './sweep-task-escalation/index.js';
+
+// Sweep duty family: remote-MCP OAuth token refresh (FORK4) — keeps the OneCLI
+// bearer secret behind an OAuth-protected MCP server fresh, so a dead access
+// token stops being something a human has to notice and re-paste.
+import './mcp-oauth/index.js';

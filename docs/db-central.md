@@ -501,6 +501,54 @@ CREATE TABLE thread_key_anchors (
 
 ---
 
+### 1.22 `mcp_oauth_integrations`
+
+Remote MCP servers connected over standard MCP authorization (`ncl integrations`). Added by migration
+082. Written and read by `src/db/mcp-oauth-integrations.ts`, reached from
+`src/modules/mcp-oauth/service.ts` (login / complete / refresh / remove) and the CLI resource
+`src/cli/resources/integrations.ts`.
+
+**No token material.** Every column is metadata an unauthenticated probe of the MCP URL would have
+told you anyway. The access token lives in the named OneCLI secret; the refresh token and client
+secret live in `DATA_DIR/mcp-oauth/<name>.json` (mode 0600), because `onecli@1.4.1` has no route that
+reads a secret value back. See [mcp-oauth-integrations.md](mcp-oauth-integrations.md).
+
+Keyed by `name` (the operator's handle, and the CLI's argument) rather than by (group, name). The
+UNIQUE on `(agent_group_id, mcp_url)` is the collision guard that matters: two integrations for one
+group pointed at one endpoint would race each other's writes to the same OneCLI secret. No foreign
+key on `agent_group_id`, same as 048/081 — a cascade here would delete an OAuth registration on an
+unrelated group delete, and a stale row is cleared by `ncl integrations remove`.
+
+```sql
+CREATE TABLE mcp_oauth_integrations (
+  name                     TEXT PRIMARY KEY,  -- operator handle, e.g. dropbox-files
+  agent_group_id           TEXT NOT NULL,     -- whose container.json declares the bearer secret
+  mcp_url                  TEXT NOT NULL,
+  resource                 TEXT,              -- RFC 8707 resource indicator
+  authorization_endpoint   TEXT NOT NULL,
+  token_endpoint           TEXT NOT NULL,     -- may be a different host from the issuer
+  registration_endpoint    TEXT,
+  issuer                   TEXT,
+  scopes                   TEXT,              -- space-delimited, as it travels on the wire
+  redirect_uri             TEXT NOT NULL,
+  bearer_secret_name       TEXT NOT NULL,     -- the OneCLI secret the gateway injects
+  bearer_secret_id         TEXT,
+  host_pattern             TEXT NOT NULL,
+  path_pattern             TEXT,
+  status                   TEXT NOT NULL,     -- pending | active | needs_login | error
+  status_detail            TEXT,
+  expires_at               TEXT,              -- access-token expiry, ISO-8601 UTC
+  last_refresh_at          TEXT,
+  created_at               TEXT NOT NULL,
+  updated_at               TEXT NOT NULL
+);
+CREATE UNIQUE INDEX idx_mcp_oauth_integrations_group_url
+  ON mcp_oauth_integrations (agent_group_id, mcp_url);
+CREATE INDEX idx_mcp_oauth_integrations_status ON mcp_oauth_integrations (status);
+```
+
+---
+
 ## 2. Migration system
 
 Migrations live in `src/db/migrations/`, one file per migration. Runner: `runMigrations()` in `src/db/migrations/index.ts`. It:
