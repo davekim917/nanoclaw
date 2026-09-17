@@ -557,7 +557,13 @@ fi
 # normal severity. A run with no contact-sheet dir and no pinned journey
 # selection has no user-visible surface on record and is untouched — the
 # candidate rule lives in smoke-visual-candidates.py, which is not even run.
-if [ "$PHASE" = "synthesis" ] &&
+#
+# OPT-IN: enforced only when the install exports SMOKE_VISUAL_DISPOSITIONS=1.
+# container/skills is a live bind mount, so this file is live the moment the
+# checkout advances; a campaign whose task prompt does not yet record the
+# critic must not start failing on a trunk merge. Unset, every run — a sheet
+# with no critic record included — gets exactly the output it got before.
+if [ "$PHASE" = "synthesis" ] && [ "${SMOKE_VISUAL_DISPOSITIONS:-}" = 1 ] &&
    { [ -e "$RUN_DIR/contact-sheet" ] || [ -e "$RUN_DIR/journeys/selection.json" ]; }; then
   visual_result="$(python3 "$SCRIPT_DIR/smoke-visual-candidates.py" barrier "$RUN_DIR" 2>/dev/null)" || visual_result=""
   if ! jq -e '(.missing | type == "array") and (.invalid | type == "array") and (.invalidReasons | type == "array")' \

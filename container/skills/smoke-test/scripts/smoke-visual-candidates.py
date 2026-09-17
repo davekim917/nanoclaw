@@ -34,6 +34,12 @@ plus `critic@sheet` (critic-unavailable) when the critic was recorded as not run
 A `changed` screen the critic graded FINE is not a candidate, and neither is a
 DEGRADED grade on a screen this build did not change.
 
+Writers are fenced like the scaffold's marker writes: `record-critic` and
+`dispose` need SMOKE_LANE_ROLE=coordinator|challenger and record it as `side`.
+`refuted-capture-artifact`/`deferred` on a BROKEN must come from the OTHER side
+than the one that recorded the critic. The role is self-declared, exactly as it
+is for markers; that a disposition is true stays the challenger's review.
+
 Every command prints one JSON object, except `aggregate critic-log` (NDJSON).
 """
 import argparse
@@ -71,6 +77,10 @@ ALLOWED_BY_KIND = {
     "critic-unavailable": ("deferred", "blocked"),
 }
 CRITIC_CANDIDATE = "critic@sheet"
+SIDES = ("coordinator", "challenger")
+# Letting a BROKEN go without a finding is the one move that waves a candidate
+# through, so the side that captured and graded the sheet may not make it.
+INDEPENDENT_DISPOSITIONS = ("refuted-capture-artifact", "deferred")
 ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 SEP_RE = re.compile(r"\s+·\s+")
 
@@ -83,6 +93,17 @@ DISP_REL = "contact-sheet/dispositions.json"
 def emit(obj, code=0):
     print(json.dumps(obj, separators=(",", ":"), ensure_ascii=False))
     sys.exit(code)
+
+
+def writer_side(what):
+    """Same fence, same env, same fail-closed-on-unset as the scaffold's
+    require_coordinator_role (smoke-run-scaffold.sh:149) -- except both sides
+    may write here, and the record says which one did."""
+    side = os.environ.get("SMOKE_LANE_ROLE", "")
+    if side not in SIDES:
+        emit({"ok": False, "error": "SMOKE_LANE_ROLE must be 'coordinator' or 'challenger' to write {} (got: {})".format(
+            what, side or "unset")}, 1)
+    return side
 
 
 def _now():
@@ -180,6 +201,8 @@ def critic_problem(critic, manifest):
     if critic.get("manifestGeneratedAt") != manifest.get("generatedAt"):
         return "graded a different capture (manifestGeneratedAt {} != manifest generatedAt {}) -- re-run the critic on the current shots".format(
             critic.get("manifestGeneratedAt"), manifest.get("generatedAt"))
+    if critic.get("side") not in SIDES:
+        return "does not record which side captured and graded the sheet"
     if "unavailable" in critic:
         return None if _is_text(critic["unavailable"]) else "unavailable needs a one-line reason"
     grades = critic.get("grades")
@@ -268,10 +291,16 @@ def confirmed_finding_ids(run_dir):
     return ids
 
 
-def disposition_problem(run_dir, entry, candidate, check_lifecycle):
+def disposition_problem(run_dir, entry, candidate, critic, check_lifecycle):
     kind = entry.get("disposition")
     if kind not in DISPOSITIONS:
         return "disposition must be one of {}".format(", ".join(DISPOSITIONS))
+    if entry.get("side") not in SIDES:
+        return "does not record which side (coordinator|challenger) wrote it -- write it with `dispose`"
+    detected_by = critic.get("side") if isinstance(critic, dict) else None
+    if "critic-broken" in candidate["kinds"] and kind in INDEPENDENT_DISPOSITIONS and entry["side"] == detected_by:
+        return ("{} of a BROKEN must come from the other side: the {} side captured and graded this sheet, "
+                "so it may confirm or block its own candidate but not wave it off").format(kind, detected_by)
     allowed = allowed_dispositions(candidate["kinds"])
     if kind not in allowed:
         return "a {} candidate can only be {}".format("/".join(candidate["kinds"]), " or ".join(allowed))
@@ -316,10 +345,12 @@ def _state(run_dir):
 # --- record-critic ----------------------------------------------------------
 
 def cmd_record_critic(args):
+    side = writer_side("the critic record")
     manifest = load_manifest(args.run_dir)
     if manifest is None:
         emit({"ok": False, "error": "no readable {} -- run smoke-contact-sheet.sh first".format(MANIFEST_REL)}, 1)
-    record = {"schemaVersion": SCHEMA_VERSION, "manifestGeneratedAt": manifest.get("generatedAt"), "recordedAt": _now()}
+    record = {"schemaVersion": SCHEMA_VERSION, "manifestGeneratedAt": manifest.get("generatedAt"),
+              "side": side, "recordedAt": _now()}
     if args.unavailable is not None:
         if not _is_text(args.unavailable):
             emit({"ok": False, "error": "--unavailable needs a one-line reason"}, 1)
@@ -376,19 +407,21 @@ def cmd_list(args):
 
 
 def cmd_dispose(args):
-    _, _, _, candidates = _state(args.run_dir)
+    side = writer_side("a visual candidate disposition")
+    _, _, critic, candidates = _state(args.run_dir)
     candidate = next((c for c in candidates if c["candidate"] == args.candidate), None)
     if candidate is None:
         emit({"ok": False, "error": "{} is not a candidate in this run".format(args.candidate),
               "candidates": [c["candidate"] for c in candidates]}, 1)
     entry = {"candidate": args.candidate, "disposition": args.disposition, "kinds": candidate["kinds"],
-             "screen": candidate["screen"], "width": candidate["width"], "by": args.by, "recordedAt": _now()}
+             "screen": candidate["screen"], "width": candidate["width"], "side": side, "by": args.by,
+             "recordedAt": _now()}
     for field in ("finding", "evidence", "reason", "owner", "trigger"):
         if getattr(args, field) is not None:
             entry[field] = getattr(args, field)
     # The marker that carries the finding may not be written yet; the barrier
     # is where a confirmed candidate must have reached the finding lifecycle.
-    problem = disposition_problem(args.run_dir, entry, candidate, check_lifecycle=False)
+    problem = disposition_problem(args.run_dir, entry, candidate, critic, check_lifecycle=False)
     if problem:
         emit({"ok": False, "error": problem}, 1)
     existing = load_dispositions(args.run_dir)
@@ -397,7 +430,7 @@ def cmd_dispose(args):
     kept = [d for d in existing if d.get("candidate") != args.candidate]
     _write_atomic(os.path.join(args.run_dir, DISP_REL),
                   {"schemaVersion": SCHEMA_VERSION, "dispositions": kept + [entry]})
-    emit({"ok": True, "candidate": args.candidate, "disposition": args.disposition,
+    emit({"ok": True, "candidate": args.candidate, "disposition": args.disposition, "side": side,
           "replaced": len(kept) != len(existing)})
 
 
@@ -460,7 +493,7 @@ def cmd_barrier(args):
             add(invalid, rel, "visual candidate with no owner -- {}. Reproduce it in a viewport at that width on the bound build, then record one of: {}".format(
                 c["detail"], ", ".join(allowed_dispositions(c["kinds"]))))
         else:
-            problem = disposition_problem(run_dir, mine[0], c, check_lifecycle=True)
+            problem = disposition_problem(run_dir, mine[0], c, critic, check_lifecycle=True)
             if problem:
                 add(invalid, rel, problem)
     done()

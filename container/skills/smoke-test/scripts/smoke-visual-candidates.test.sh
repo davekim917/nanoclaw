@@ -42,9 +42,13 @@ w() { # <file-or-empty> [settled] [diff-status]
 screen() { jq -cn --arg n "$1" --argjson d "$2" --argjson m "$3" '{name:$n,path:("/" + $n),status:"captured",desktop:$d,mobile:$m}'; }
 LANTERN="[$(screen lantern "$(w 01-lantern-1280.png)" "$(w 01-lantern-390.png)")]"
 
+# The install opts in; the sheet is captured and graded on the coordinator
+# side, and the UI adversary dispositions from the challenger side.
+export SMOKE_VISUAL_DISPOSITIONS=1
+unset SMOKE_LANE_ROLE
 barrier() { bash "$BARRIER" "$1" synthesis || true; }
-critic() { python3 "$VC" record-critic "$1" --rubric "$TMP/design-rubric.md" --design-system-version 41c27273; }
-dispose() { python3 "$VC" dispose "$@" --by ui-adversary; }
+critic() { SMOKE_LANE_ROLE=coordinator python3 "$VC" record-critic "$1" --rubric "$TMP/design-rubric.md" --design-system-version 41c27273; }
+dispose() { SMOKE_LANE_ROLE="${SIDE:-challenger}" python3 "$VC" dispose "$@" --by ui-adversary; }
 
 # --- no user-visible surface: byte-identical barrier output ------------------
 RUN="$(new_run none)"
@@ -83,6 +87,17 @@ barrier "$RUN" | jq -e '.ready == false and .missing == ["contact-sheet/critic.j
   and (.invalidReasons[0] | contains("a critic that did not run does not waive visual review"))' >/dev/null ||
   fail "a sheet with no critic record must not be ready" "$(barrier "$RUN")"
 
+# NOT OPTED IN: the same sheet-with-no-critic run is byte-identical to the base.
+[ "$(SMOKE_VISUAL_DISPOSITIONS= barrier "$RUN")" = "{\"ready\":true,\"phase\":\"synthesis\",\"sourceSha\":\"$SHA\",\"missing\":[],\"invalid\":[],\"invalidReasons\":[]}" ] ||
+  fail "without SMOKE_VISUAL_DISPOSITIONS=1 a sheet with no critic record must not change the barrier's output"
+[ "$(SMOKE_VISUAL_DISPOSITIONS=0 barrier "$RUN")" = "$(SMOKE_VISUAL_DISPOSITIONS= barrier "$RUN")" ] || fail "only the value 1 opts in"
+
+# Writers are fenced: no declared side, no write.
+if printf 'FINE · 01-lantern-1280.png · ok\nFINE · 01-lantern-390.png · ok\n' |
+  python3 "$VC" record-critic "$RUN" --rubric "$TMP/design-rubric.md" >/dev/null; then fail "record-critic without SMOKE_LANE_ROLE"; fi
+if printf 'FINE · 01-lantern-1280.png · ok\nFINE · 01-lantern-390.png · ok\n' |
+  SMOKE_LANE_ROLE=worker python3 "$VC" record-critic "$RUN" --rubric "$TMP/design-rubric.md" >/dev/null; then fail "record-critic with a made-up role"; fi
+
 # A critic that skipped a screen, or emitted something unparseable, is refused.
 if printf 'FINE · 01-lantern-1280.png · ok\n' | critic "$RUN" >/dev/null; then fail "a skipped screen is not a FINE"; fi
 if printf 'FINE · 01-lantern-1280.png · ok\nlooks good to me\n' | critic "$RUN" >/dev/null; then fail "garbage critic line accepted"; fi
@@ -91,15 +106,36 @@ if printf 'FINE · 01-lantern-1280.png · ok\nlooks good to me\n' | critic "$RUN
 # --- BROKEN undispositioned => not ready; FINE is never a candidate -----------
 printf 'NOTE · design system changed since calibration (41c27273 → 99999999)\nFINE · 01-lantern-1280.png · ok at 1280\nBROKEN · 01-lantern-390.png · Shelf label clipped at 390\n' |
   critic "$RUN" | jq -e '.ok and .candidates == ["lantern@mobile"]' >/dev/null || fail "record-critic"
-jq -e '.rubric.sha256 and .designSystemVersion == "41c27273" and (.notes | length) == 1
+jq -e '.rubric.sha256 and .designSystemVersion == "41c27273" and (.notes | length) == 1 and .side == "coordinator"
   and .manifestGeneratedAt == "2026-09-17T10:00:00Z"' "$RUN/contact-sheet/critic.json" >/dev/null || fail "critic.json shape"
 barrier "$RUN" | jq -e '.ready == false and .missing == [] and .invalid == ["contact-sheet/dispositions.json#lantern@mobile"]
   and (.invalidReasons[0] | contains("no owner") and contains("Shelf label clipped"))' >/dev/null ||
   fail "an undispositioned BROKEN must block synthesis readiness" "$(barrier "$RUN")"
 python3 "$VC" list "$RUN" | jq -e '.undispositioned == ["lantern@mobile"] and .candidates[0].kinds == ["critic-broken"]' >/dev/null || fail "list"
 
-# --- each disposition kind => ready -------------------------------------------
+# NOT OPTED IN: an undispositioned BROKEN is byte-identical to the base too.
+[ "$(SMOKE_VISUAL_DISPOSITIONS= barrier "$RUN")" = "{\"ready\":true,\"phase\":\"synthesis\",\"sourceSha\":\"$SHA\",\"missing\":[],\"invalid\":[],\"invalidReasons\":[]}" ] ||
+  fail "without SMOKE_VISUAL_DISPOSITIONS=1 an undispositioned BROKEN must not change the barrier's output"
+
+# --- writer fence ---------------------------------------------------------------
 printf 'png' >"$RUN/contact-sheet/repro-lantern-390.png"
+if python3 "$VC" dispose "$RUN" lantern@mobile blocked --reason x --by someone >/dev/null; then fail "dispose without SMOKE_LANE_ROLE"; fi
+if SMOKE_LANE_ROLE=worker python3 "$VC" dispose "$RUN" lantern@mobile blocked --reason x --by someone >/dev/null; then fail "dispose with a made-up role"; fi
+# The side that captured and graded the sheet cannot wave its own BROKEN off...
+if SIDE=coordinator dispose "$RUN" lantern@mobile refuted-capture-artifact --reason "drawer" --evidence contact-sheet/repro-lantern-390.png >/dev/null; then
+  fail "the detecting side refuted its own BROKEN"; fi
+if SIDE=coordinator dispose "$RUN" lantern@mobile deferred --owner design --trigger later >/dev/null; then fail "the detecting side deferred its own BROKEN"; fi
+# ...and a dispositions file edited to say so is refused by the barrier.
+SIDE=challenger dispose "$RUN" lantern@mobile deferred --owner design --trigger later | jq -e '.side == "challenger"' >/dev/null || fail "side recorded"
+jq '.dispositions[0].side = "coordinator"' "$RUN/contact-sheet/dispositions.json" >"$RUN/d.tmp" && mv "$RUN/d.tmp" "$RUN/contact-sheet/dispositions.json"
+barrier "$RUN" | jq -e '.ready == false and (.invalidReasons[0] | contains("must come from the other side"))' >/dev/null || fail "same-side deferral must not clear readiness" "$(barrier "$RUN")"
+jq '.dispositions[0] |= del(.side)' "$RUN/contact-sheet/dispositions.json" >"$RUN/d.tmp" && mv "$RUN/d.tmp" "$RUN/contact-sheet/dispositions.json"
+barrier "$RUN" | jq -e '.ready == false and (.invalidReasons[0] | contains("does not record which side"))' >/dev/null || fail "a disposition with no side must not clear readiness"
+# It may still confirm or block its own candidate: neither waves anything through.
+SIDE=coordinator dispose "$RUN" lantern@mobile blocked --reason "preview gone" >/dev/null
+barrier "$RUN" | jq -e '.ready == true' >/dev/null || fail "detecting side may block"
+
+# --- each disposition kind => ready -------------------------------------------
 if dispose "$RUN" lantern@desktop blocked --reason x >/dev/null; then fail "a FINE screen is not a candidate"; fi
 if dispose "$RUN" lantern@mobile refuted-capture-artifact --reason "drawer left open" >/dev/null; then fail "refuted needs the live viewport evidence"; fi
 if dispose "$RUN" lantern@mobile deferred --owner design >/dev/null; then fail "deferred needs a revisit trigger"; fi
@@ -155,6 +191,9 @@ RUN="$(new_run unsettled)"
 manifest "$RUN" 2026-09-17T10:00:00Z "[$(screen lantern "$(w 01-lantern-1280.png false)" "$(w 01-lantern-390.png)")]"
 printf 'FINE · 01-lantern-1280.png · ok\nFINE · 01-lantern-390.png · ok\n' | critic "$RUN" | jq -e '.candidates == ["lantern@desktop"]' >/dev/null ||
   fail "settled:false is a candidate even when graded FINE"
+printf 'png' >"$RUN/contact-sheet/x.png"
+SIDE=coordinator dispose "$RUN" lantern@desktop refuted-capture-artifact --reason "carousel autoplay" --evidence contact-sheet/x.png >/dev/null ||
+  fail "the independence rule is for BROKEN only"
 
 # --- freeze vs author-PR: DEGRADED is a candidate only on a screen the diff says changed
 RUN="$(new_run freeze)" # no baseline => no diff in the manifest
@@ -173,7 +212,7 @@ barrier "$RUN" | jq -e '.ready == false and .invalid == ["contact-sheet/disposit
 # --- critic recorded as not run ------------------------------------------------
 RUN="$(new_run critic-down)"
 manifest "$RUN" 2026-09-17T10:00:00Z "$LANTERN"
-python3 "$VC" record-critic "$RUN" --unavailable "critic provider returned 529 three times" | jq -e '.candidates == ["critic@sheet"]' >/dev/null || fail "unavailable"
+SMOKE_LANE_ROLE=coordinator python3 "$VC" record-critic "$RUN" --unavailable "critic provider returned 529 three times" | jq -e '.candidates == ["critic@sheet"]' >/dev/null || fail "unavailable"
 barrier "$RUN" | jq -e '.ready == false and .invalid == ["contact-sheet/dispositions.json#critic@sheet"]' >/dev/null || fail "an unrun critic is owed a disposition"
 printf 'png' >"$RUN/contact-sheet/x.png"
 if dispose "$RUN" critic@sheet refuted-capture-artifact --reason x --evidence contact-sheet/x.png >/dev/null; then fail "an unrun critic cannot be refuted"; fi
