@@ -1045,7 +1045,11 @@ is viewport-sized, taken with CSS animations/transitions frozen and re-taken
 until the live page matches it (`settled`). `fullPage` (`*-full.png`) is
 context only: full-page stitching misplaces fixed/sticky headers and drawers
 and has produced false BROKEN findings. A tile badged `unsettled` is not
-evidence of breakage on its own.
+evidence of breakage on its own. A capture whose final `location.pathname`
+is not the shot's `path` (or its declared `finalPath`, for a `steps` click
+that navigates on purpose) fails with both paths named — a bounce to a login
+route is never graded, and on the baseline it is a failed diff, never
+`changed`.
 
 **With a baseline url, judge what the build changed.** Each screen/width is
 also captured from the baseline with the identical recipe and pixel-diffed;

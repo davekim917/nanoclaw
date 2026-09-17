@@ -53,7 +53,7 @@
 # Baseline diff: with a baseline url, each screen/width is first captured
 # from the baseline with the IDENTICAL recipe (own fresh session, state load,
 # open, the same `steps`, freeze, viewport, settle) into `*-base.png`, then
-# pixel-diffed against the head page (`agent-browser diff screenshot`), and
+# checked for the same final path, then pixel-diffed against the head page (`agent-browser diff screenshot`), and
 # the manifest entry gains `diff: {status: changed|unchanged|failed, pct,
 # differentPixels, image, baseline, reason}`. Tiles are ordered changed
 # (largest first), then diff-failed, then unchanged. Baseline capture is
@@ -76,6 +76,14 @@
 # shots.json shape (written by the caller, capped here at 8 entries):
 #   [{ "name": "settings-pricing", "path": "/settings",
 #      "steps": ["click text=Pricing", "wait 500"] }, ...]
+#
+# Optional `finalPath`: the pathname the screen must be on when captured.
+# Defaults to `path` (query/hash ignored). Every capture, head and baseline
+# alike, reads `location.pathname` after it settles and FAILS with a reason
+# when it differs — a bounce to a login route (expired or wrong-origin auth
+# state) must never be graded, or diffed as a confident `changed`. Purely a
+# path comparison, no page-content heuristics; declare `finalPath` only when
+# a `steps` click navigates on purpose.
 #
 # `steps` supports exactly two verbs, run in order against that screen's
 # session:
@@ -346,7 +354,15 @@ open_screen() {
   return 0
 }
 
+# norm_path PATH -> pathname only, no query/hash, no trailing slash.
+norm_path() {
+  local p="${1%%[?#]*}"
+  [ "$p" = "/" ] || p="${p%/}"
+  printf '%s' "${p:-/}"
+}
+
 # capture_view W H FILE -> 0/1 in $SESSION, sets CAP_REASON and CAP_SETTLED.
+# Reads $EXPECT_PATH (see `finalPath` in the header).
 # Viewport-sized, animations frozen, re-captured until the live page still
 # matches the file (see SETTLE_* above).
 SETTLE_DIFF="$SESSIONS_FILE.settle.png"
@@ -379,6 +395,14 @@ capture_view() {
     attempt=$((attempt + 1))
     agent-browser --session "$SESSION" wait "$SETTLE_INTERVAL_MS" >/dev/null 2>&1 || true
   done
+  # Checked after the capture, so it is the location of the image just taken.
+  out="$(agent-browser --session "$SESSION" eval "location.pathname" 2>&1)" || out=""
+  out="$(norm_path "$(printf '%s' "$out" | tr -d '"' | tr -d '[:space:]')")"
+  if [ "$out" != "$EXPECT_PATH" ]; then
+    rm -f "$file"
+    CAP_REASON="landed on $out, expected $EXPECT_PATH (redirected — e.g. to a login route)"
+    return 1
+  fi
   return 0
 }
 
@@ -433,6 +457,7 @@ while IFS= read -r SCREEN; do
     *) SCREEN_PATH="/$SCREEN_PATH" ;;
   esac
   STEPS="$(printf '%s' "$SCREEN" | jq -c '.steps // []')"
+  EXPECT_PATH="$(norm_path "$(printf '%s' "$SCREEN" | jq -r --arg p "$SCREEN_PATH" '.finalPath // $p')")"
 
   # Baseline first, in its own never-before-used session, so the head page is
   # the live one when the diff runs. BASE_REASON_<w> non-empty = no baseline
