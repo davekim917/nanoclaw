@@ -180,7 +180,7 @@ codex-review.sh request                   # risk-scoped repos: the only way to a
 codex-review.sh claim --head <sha> --owner <session-label> [--ttl-minutes 1-120]
                                          # advisory local-review claim; default expiry is 45 minutes
 codex-review.sh merge-check [--head <sha>] # exit 0 only when merging exactly that head is allowed; legacy repo: 26 = Step 6 decides,
-                                         # 24 = a required status is red on the head or its newest independent-review receipt is not CLEAR
+                                         # 24 = a required status or check run is red on the head or its newest independent-review receipt is not CLEAR
 codex-review.sh merge --head <sha> [--method merge|squash]
                                          # risk-scoped repos: the only way to merge — merge-check, then gh pr merge on exit 0 alone
 codex-review.sh audit                     # a merged PR as of its merge, by the merge-check rules of the code you run (main-provenance's gate-audit job)
@@ -428,7 +428,7 @@ codex-review.sh merge-check --head "$SHA"  # 26, or stop
 gh pr merge "$PR" --repo "$REPO" --squash --delete-branch --match-head-commit "$SHA"
 ```
 
-Three separate steps, never chained or piped: the merge runs only after `merge-check` exits 26 (`merge=defer mode=legacy`) for that head. 24 there is a refusal, not advice — a status the base branch requires is red on the head (`required_red`; fix what it reports, since `ci-wait` leaves `Release policy` and `Release approval` out of CI and will read green over one), or the newest `independent-review-receipt:v1` for the head from an author with write access is not CLEAR (`independent_receipt_not_clear`; your own approving substitute receipt never outvotes it — push a fix, or get a later CLEAR receipt for this head). 1 is no verdict; 25, run it again. A required status still pending is not a refusal here, and GitHub holds the merge for it: wait, never route around it. In a risk-scoped repo, merge only with `codex-review.sh merge` (Risk-scoped repos, step 4).
+Three separate steps, never chained or piped: the merge runs only after `merge-check` exits 26 (`merge=defer mode=legacy`) for that head. 24 there is a refusal, not advice — a status or check run the base branch requires is red on the head, newest report per context name (`required_red`; fix what it reports, since `ci-wait` leaves `Release policy` and `Release approval` out of CI and will read green over one), or the newest `independent-review-receipt:v1` for the head from an author with write access is not CLEAR (`independent_receipt_not_clear`; your own approving substitute receipt never outvotes it — push a fix, or get a later CLEAR receipt for this head). 1 is no verdict; 25, run it again. A required status still pending is not a refusal here, and GitHub holds the merge for it: wait, never route around it. In a risk-scoped repo, merge only with `codex-review.sh merge` (Risk-scoped repos, step 4).
 
 Squash is the default. Use `--merge` when the PR's topology matters — an upstream-sync PR whose second parent must survive; squashing one drops the merge base and makes the fork report "behind" forever.
 

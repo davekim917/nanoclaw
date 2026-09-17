@@ -149,6 +149,39 @@ if [ -n "$rest" ]; then
       printf ']'
       exit 0
       ;;
+    */commits/*/check-runs\\?*)
+      # check-runs--<sha>.json is every check run on that commit; absent = none. A
+      # .forbidden marker answers as GitHub does to a token that may not read checks,
+      # and a .error marker fails another way.
+      sha="\${rest#*/commits/}"
+      sha="\${sha%%/*}"
+      if [ -f "$MOCK_DIR/check-runs--$sha.forbidden" ]; then
+        echo '[{"message":"Resource not accessible by personal access token","status":"403"}]'
+        echo 'gh: Resource not accessible by personal access token (HTTP 403)' >&2
+        exit 1
+      fi
+      if [ -f "$MOCK_DIR/check-runs--$sha.error" ]; then
+        echo '[{"message":"Server Error","status":"500"}]'
+        echo 'gh: Server Error (HTTP 500)' >&2
+        exit 1
+      fi
+      printf '[{"total_count":0,"check_runs":'
+      if [ -f "$MOCK_DIR/check-runs--$sha.json" ]; then cat "$MOCK_DIR/check-runs--$sha.json"; else printf '[]'; fi
+      printf '}]'
+      exit 0
+      ;;
+    */actions/runs/*/jobs\\?*)
+      # jobs--<run id>.json is that run's jobs; absent = the read fails.
+      run="\${rest#*/actions/runs/}"
+      run="\${run%%/*}"
+      if [ ! -f "$MOCK_DIR/jobs--$run.json" ]; then
+        echo '{"message":"Not Found","status":"404"}'
+        echo 'gh: Not Found (HTTP 404)' >&2
+        exit 1
+      fi
+      printf '[{"total_count":0,"jobs":'; cat "$MOCK_DIR/jobs--$run.json"; printf '}]'
+      exit 0
+      ;;
     */rules/branches/*)
       # rules--<branch>.json is the branch's active rules, as the API lists them; absent = none.
       # A .noplan marker answers as GitHub does where rulesets are not on the plan, and a
@@ -2730,6 +2763,99 @@ describe('codex-review risk-scoped review requests', () => {
       expect(wait.status).toBe(0);
       expect(wait.stdout).toContain(`ci=green head=${HEAD}`);
       expect(wait.stdout + wait.stderr).not.toContain('ci_pending');
+    });
+
+    function checkRun(
+      name: string,
+      status: string,
+      conclusion: string | null,
+      startedAt = '2026-09-05T00:02:00Z',
+    ): Page {
+      return { id: Date.parse(startedAt) / 1000, name, status, conclusion, started_at: startedAt, completed_at: null };
+    }
+
+    it.each(['failure', 'timed_out', 'cancelled', 'action_required'])(
+      'refuses (24) when a required check run concluded %s',
+      (conclusion) => {
+        const root = tempRoot();
+        legacy(root);
+        writeJson(root, `check-runs--${HEAD}.json`, [checkRun('CI Gate', 'completed', conclusion)]);
+
+        const result = runHelper(root, ['merge-check', '--head', HEAD]);
+        expect(result.status).toBe(24);
+        expect(result.stderr).toContain(`mode=legacy: required_red: CI Gate=${conclusion}`);
+        expect(result.stdout).not.toContain('merge=');
+      },
+    );
+
+    it.each([
+      ['in_progress', checkRun('CI Gate', 'in_progress', null)],
+      ['queued', checkRun('CI Gate', 'queued', null)],
+      ['neutral', checkRun('CI Gate', 'completed', 'neutral')],
+      ['skipped', checkRun('CI Gate', 'completed', 'skipped')],
+      ['red but not required', checkRun('lint', 'completed', 'failure')],
+    ])('does not refuse on a check run that is %s', (_case, run) => {
+      const root = tempRoot();
+      legacy(root);
+      writeJson(root, `check-runs--${HEAD}.json`, [run]);
+
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+    });
+
+    it('lets the newest report per context name decide, across a status and a check run of one name', () => {
+      const root = tempRoot();
+      legacy(root, { statuses: [commitStatus('CI Gate', 'success', '2026-09-05T00:02:00Z')] });
+      writeJson(root, `check-runs--${HEAD}.json`, [
+        checkRun('CI Gate', 'completed', 'failure', '2026-09-05T00:03:00Z'),
+      ]);
+      const newerRun = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(newerRun.status).toBe(24);
+      expect(newerRun.stderr).toContain('required_red: CI Gate=failure');
+
+      legacy(root, { statuses: [commitStatus('CI Gate', 'success', '2026-09-05T00:04:00Z')] });
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+
+      // A re-run in progress is newer than the failure it replaces.
+      legacy(root);
+      writeJson(root, `check-runs--${HEAD}.json`, [
+        checkRun('CI Gate', 'completed', 'failure', '2026-09-05T00:03:00Z'),
+        checkRun('CI Gate', 'in_progress', null, '2026-09-05T00:05:00Z'),
+      ]);
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+    });
+
+    it("reads the head's Actions jobs when the token may not read check runs, and gives no verdict on any other failure", () => {
+      const root = tempRoot();
+      legacy(root);
+      fs.writeFileSync(path.join(root, `check-runs--${HEAD}.forbidden`), '');
+      const run = workflowRun('CI', 'completed', 'failure');
+      writeJson(root, 'runs.json', {
+        total_count: 2,
+        workflow_runs: [run, workflowRun('CI', 'completed', 'failure', undefined, OLD_HEAD)],
+      });
+      writeJson(root, `jobs--${run.id}.json`, [checkRun('CI Gate', 'completed', 'failure')]);
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('required_red: CI Gate=failure');
+      expect(result.calls).toContain(`actions/runs/${run.id}/jobs?per_page=100&filter=latest`);
+
+      fs.rmSync(path.join(root, `check-runs--${HEAD}.forbidden`));
+      fs.writeFileSync(path.join(root, `check-runs--${HEAD}.error`), '');
+      const broken = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(broken.status).toBe(1);
+      expect(broken.stderr).toContain('could not read the check runs');
+      expect(broken.stdout).not.toContain('merge=');
+    });
+
+    it('reads nothing about the head when the branch requires nothing', () => {
+      const root = tempRoot();
+      legacy(root, { required: [], statuses: [commitStatus('Release policy', 'failure')] });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(26);
+      expect(result.calls).not.toContain('/statuses');
+      expect(result.calls).not.toContain('/check-runs');
     });
 
     it('treats the no-rulesets-on-this-plan 403 as nothing required, and any other rules failure as no verdict', () => {

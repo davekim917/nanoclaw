@@ -49,7 +49,7 @@
 #       re-read, so the verdict may be stale — re-run merge-check
 #   26  merge-check: `merge=defer mode=legacy` — not risk-scoped, so SKILL.md Step 6's
 #       evidence rules decide this merge; never chain it into `gh pr merge`. A legacy
-#       head still gets 24 first when a status its base branch requires is red on it
+#       head still gets 24 first when a status or check run its base branch requires is red on it
 #       (`required_red`) or the newest independent-review-receipt:v1 for it is not
 #       CLEAR (`independent_receipt_not_clear`) — legacy_precheck
 #   27  merge: merge-check allowed the head, but `gh pr merge` did not merge it
@@ -1319,16 +1319,21 @@ independent_receipt_state() {
 # private repo of a free account); no ruleset can exist there, so that one
 # answer is an empty list, and any other failure is no verdict.
 #
-# Only the newest status per context counts, as in ci_verdict, and only
-# `failure` or `error` refuses. A required context that is pending or has not
-# reported is left alone: a Release approval waiting on a person is not a
-# defect in the head, which is what CI_EXCLUDED_CONTEXTS protects in ci_verdict
-# too, and GitHub holds the merge for it anyway. A required check that is an
-# Actions job rather than a commit status is not read here (check-runs 403
-# under the tokens container agents hold, see ci_verdict); ci-wait judges the
-# workflow run it belongs to.
+# A required context is either a commit status or a check run (an Actions job,
+# or an app's check), and GitHub matches both by name, so both are read and
+# the newest report per context name decides, whichever kind it is: a status
+# by created_at, a check run by started_at (completed_at when it never
+# started). A success status under a newer failed check run of the same name
+# is red, and the reverse is not. Red is a status of `failure` or `error`, or
+# a completed check run that concluded `failure`, `timed_out`, `cancelled` or
+# `action_required`. Everything else is left alone — pending, queued,
+# in_progress, neutral, skipped, or not reported at all: a Release approval
+# waiting on a person is not a defect in the head, which is what
+# CI_EXCLUDED_CONTEXTS protects in ci_verdict too, and GitHub holds the merge
+# for it anyway. Nothing about the head is read when the branch requires
+# nothing.
 required_status_red() {
-  local head="$1" branch rules status=0 protection statuses
+  local head="$1" branch rules status=0 protection required statuses checks
   branch=$(jq -rn --arg r "$2" '$r | split("/") | map(@uri) | join("/")') || return 1
   rules=$(gh api --paginate --slurp "repos/$REPO/rules/branches/$branch?per_page=100" 2>/dev/null) || status=$?
   if [ "$status" -ne 0 ]; then
@@ -1340,15 +1345,51 @@ required_status_red() {
     fi
   fi
   protection=$(gh api "repos/$REPO/branches/$branch") || return 1
+  required=$(printf '%s\n%s\n' "$rules" "$protection" | jq -cs '
+    [ .[0] | .. | objects | select(.type == "required_status_checks") | .parameters.required_status_checks[]?.context ]
+    + [ .[1].protection.required_status_checks.contexts[]?, .[1].protection.required_status_checks.checks[]?.context ]
+    | map(strings) | unique') || return 1
+  if [ "$required" = '[]' ]; then return 0; fi
   statuses=$(gh api --paginate --slurp "repos/$REPO/commits/$head/statuses?per_page=100") || return 1
-  printf '%s\n%s\n%s\n' "$rules" "$protection" "$statuses" | jq -rs '
-    ( [ .[0] | .. | objects | select(.type == "required_status_checks") | .parameters.required_status_checks[]?.context ]
-      + [ .[1].protection.required_status_checks.contexts[]? ]
-      | map(strings) | unique ) as $required
-    | [ .[2][][]? | select(.context as $c | $required | index($c)) ]
-    | group_by(.context) | map(max_by([.created_at // "", .id // 0]))
-    | [ .[] | select(.state == "failure" or .state == "error") | "\(.context)=\(.state)" ]
+  checks=$(head_check_runs "$head") || return 1
+  printf '%s\n%s\n' "$statuses" "$checks" | jq -rs --argjson required "$required" '
+    [ ( .[0][][]? | { context, at: (.created_at // ""), id: (.id // 0), state,
+                      red: (.state == "failure" or .state == "error") } ),
+      ( .[1][]? | { context: .name, at: (.started_at // .completed_at // ""), id: (.id // 0),
+                    state: (if .status == "completed" then (.conclusion // "none") else (.status // "unknown") end),
+                    red: (.status == "completed" and (.conclusion | IN("failure", "timed_out", "cancelled", "action_required"))) } ) ]
+    | map(select(.context as $c | $required | index($c)))
+    | group_by(.context) | map(max_by([.at, .id]))
+    | [ .[] | select(.red) | "\(.context)=\(.state)" ]
     | join(", ")'
+}
+
+# Every check run on exactly HEAD, as a JSON array of {name, status,
+# conclusion, started_at, completed_at, id}. `commits/<sha>/check-runs` is the
+# whole answer, apps' checks included, but it 403s ("Resource not accessible
+# by personal access token") under the narrower tokens container agents may
+# hold (ci_verdict's header). Under that one answer the head's Actions jobs
+# stand in: `actions/runs` is what ci_verdict already reads with those tokens,
+# a job's name is its check run's name, and `filter=latest` keeps a re-run's
+# replaced attempt out. An app's check run is not visible that way. Any other
+# failure is no verdict.
+head_check_runs() {
+  local raw status=0 runs id jobs all='[]'
+  raw=$(gh api --paginate --slurp "repos/$REPO/commits/$1/check-runs?per_page=100" 2>/dev/null) || status=$?
+  if [ "$status" -eq 0 ]; then
+    printf '%s' "$raw" | jq -c '[ .[].check_runs[]? | { name, status, conclusion, started_at, completed_at, id } ]'
+    return
+  fi
+  if ! printf '%s' "$raw" | jq -e '[ .. | objects | select(.status == "403" and ((.message // "") | startswith("Resource not accessible"))) ] | length >= 1' >/dev/null 2>&1; then
+    echo "could not read the check runs on $1 in $REPO" >&2
+    return 1
+  fi
+  runs=$(gh api --paginate --slurp "repos/$REPO/actions/runs?head_sha=$1&per_page=100") || return 1
+  for id in $(printf '%s' "$runs" | jq -r --arg head "$1" '.[].workflow_runs[]? | select(.head_sha == $head) | .id | numbers'); do
+    jobs=$(gh api --paginate --slurp "repos/$REPO/actions/runs/$id/jobs?per_page=100&filter=latest") || return 1
+    all=$(printf '%s\n%s\n' "$all" "$jobs" | jq -cs '.[0] + [ .[1][].jobs[]? | { name, status, conclusion, started_at, completed_at, id } ]') || return 1
+  done
+  printf '%s' "$all"
 }
 
 # What a legacy merge still answers to mechanically. merge-check defers a
