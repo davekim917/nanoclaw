@@ -24,7 +24,7 @@ import type {
 } from './types.js';
 import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
 import { attachTurnEffort } from './turn-effort.js';
-import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
+import { MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 import { shouldPostInfraWarning } from '../modules/mailbox/index.js';
 import { MANAGED_GIT_OPENCODE_PLUGIN_PATH } from '../managed-git-guard.js';
 
@@ -459,34 +459,37 @@ const STALE_SESSION_RE = new RegExp(
 );
 
 /**
- * Build the env handed to the `opencode serve` child, stripping the auth secrets
- * named by buildSecretEnvVarList() (the SINGLE SOURCE shared with the Claude
- * provider — see secret-env.ts). OpenCode authenticates via auth.json / XDG
- * (opencodeAuthProviders reads /opencode-xdg/opencode/auth.json), NOT
- * process.env, so removing these is safe and never breaks model auth.
+ * Build the env handed to the `opencode serve` child, stripping the MCP
+ * header-only secrets (MCP_HEADER_ONLY_SECRET_VARS — the SINGLE SOURCE shared
+ * with the Claude provider, see secret-env.ts) so opencode's bash tool and MCP
+ * stdio children can't printenv Exa/Braintrust/Granola. That is the
+ * cross-provider env-hygiene parity bar (Claude strips the same set via
+ * filterSdkEnv). Data-tool secrets (SNOWFLAKE_PASSWORD, DBT_*, OPENAI_API_KEY,
+ * …) are deliberately KEPT, matching Claude. (codex #126)
  *
- * This INTENTIONALLY includes ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN
- * (codex #126 F3). An `anthropic/*` OpenCode model must authenticate via
- * auth.json like every other provider — NOT via the host's Anthropic creds
- * leaking through process.env. Forwarding the host's Claude-subscription OAuth
- * token to OpenCode's model traffic is exactly the leak this strip prevents
- * (and OpenCode 1.3+ can't use that subscription token anyway).
+ * ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN used to be stripped here too
+ * (codex #126 F3). They no longer are: a container's shell inherits the
+ * credential the container runs on, so an agent in an OpenCode session can run
+ * `claude -p` headless the way it can already run `opencode run` and
+ * `codex exec` — see secret-env.ts's header for the model.
  *
- * The Claude provider unsets the same vars per-Bash-command (createSanitizeBashHook).
- * OpenCode has no equivalent per-tool hook on its bash path, so we strip once at
- * the server level — broader than Claude's per-command unset, but the outcome is
- * identical: every shell subprocess opencode spawns (bash tool, MCP stdio
- * children) inherits a secret-free env. We keep OPENCODE_CONFIG_CONTENT and all
- * non-secret vars (PATH, HOME, NANOCLAW_*, OPENCODE_*) intact.
+ * CONSEQUENCE, stated rather than hidden: an OpenCode session whose model is
+ * `anthropic/*` now sees those vars in its server env. It still FAILS CLOSED
+ * unless auth.json carries an anthropic record (buildOpenCodeConfig throws
+ * otherwise), so env alone cannot run such a model. When both an auth.json
+ * record and an env credential exist, which one OpenCode prefers is UNVERIFIED
+ * against the pinned binary — the only env value that would matter there is an
+ * ANTHROPIC_API_KEY (OneCLI's `placeholder`, or a real key under
+ * ANTHROPIC_BASE_URL). Every other provider (opencode/opencode-go/nvidia via
+ * auth.json, deepseek/openrouter via the OneCLI proxy placeholder) is
+ * unaffected — their credentials were never in this list. We keep
+ * OPENCODE_CONFIG_CONTENT and all non-secret vars (PATH, HOME, NANOCLAW_*,
+ * OPENCODE_*) intact.
  *
  * Pure + exported so it can be unit-tested without actually spawning a process.
  */
 export function buildOpencodeServerEnv(baseEnv: NodeJS.ProcessEnv, config: Record<string, unknown>): NodeJS.ProcessEnv {
-  // Strip the env-derived auth list PLUS the MCP/header-only secrets Claude also
-  // strips (filterSdkEnv) — env-hygiene parity so opencode's bash/MCP children
-  // can't printenv Exa/Braintrust/Granola. Data-tool secrets (SNOWFLAKE_PASSWORD,
-  // DBT_*, OPENAI_API_KEY, …) are deliberately KEPT, matching Claude. (codex #126)
-  const secretVars = new Set([...buildSecretEnvVarList(), ...MCP_HEADER_ONLY_SECRET_VARS]);
+  const secretVars = new Set<string>(MCP_HEADER_ONLY_SECRET_VARS);
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(baseEnv)) {
     if (secretVars.has(k)) continue;
@@ -522,10 +525,8 @@ function spawnOpencodeServer(
     // provider already passes input.cwd; this brings OpenCode to parity.
     // Caller falls back to process.cwd() if input.cwd was undefined.
     const proc = spawn('opencode', ['serve', `--hostname=${hostname}`, `--port=${port}`], {
-      // Auth secrets (ANTHROPIC_API_KEY*, CLAUDE_CODE_OAUTH_TOKEN*, GMAIL_*) are
-      // stripped from the child env here — OpenCode auths via auth.json/XDG, not
-      // process.env, so they're never needed and an unguarded `bash` tool would
-      // otherwise be able to printenv them. See buildOpencodeServerEnv.
+      // Child env: see buildOpencodeServerEnv for what is (and is no longer)
+      // stripped.
       env: buildOpencodeServerEnv(process.env, config),
       cwd: cwd ?? process.cwd(),
     });
@@ -794,7 +795,7 @@ export function buildOpenCodeConfig(
   if (provider === 'anthropic' && !authProviders.includes('anthropic')) {
     throw new Error(
       `OpenCode model ${model ?? '<unset>'} requires a valid top-level anthropic record in ` +
-        `/opencode-xdg/opencode/auth.json; environment credentials are intentionally unavailable.`,
+        `/opencode-xdg/opencode/auth.json; an env credential alone does not enable this provider.`,
     );
   }
   const enabledProviders =
@@ -850,9 +851,10 @@ export function buildOpenCodeConfig(
   // by the auth.json cred-key + model prefix (opencode-go → /zen/go/v1,
   // opencode → /zen/v1, nvidia → NVIDIA), so no manual override is needed.
   const sdkOptions: Record<string, unknown> = {};
-  // Anthropic credentials must never be synthesized here: the host strips its
-  // Claude subscription secrets from the OpenCode child. The per-model block
-  // is independent, though — it carries the effective model's effort options.
+  // Anthropic credentials are never synthesized here: an `anthropic/*` model
+  // requires an auth.json record (checked above) and a placeholder would
+  // clobber it. The per-model block is independent, though — it carries the
+  // effective model's effort options.
   if (provider !== 'anthropic' && !opencodeAuthHasCredential(provider)) sdkOptions.apiKey = 'placeholder';
 
   const providerConfig = {

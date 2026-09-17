@@ -32,7 +32,7 @@ import {
 } from './claude-slot-usage.js';
 import { attachTurnEffort } from './turn-effort.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
-import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
+import { MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 import {
   QUOTA_EMBEDDED_RE,
   QUOTA_RESULT_RE,
@@ -721,10 +721,10 @@ export function createPreCompactHook(assistantName?: string): HookCallback {
   };
 }
 
-// ── Bash secret sanitization hook ──
+// ── Credential rotation patterns ──
 
 // ANTHROPIC_API_KEY _N fallback variants (_2, _5, ...). The base-name match
-// (ANTHROPIC_KEY_RE) lives in secret-env.ts with the Bash-sanitize list.
+// (ANTHROPIC_KEY_RE) lives in secret-env.ts.
 const ANTHROPIC_FALLBACK_RE = /^ANTHROPIC_API_KEY_(\d+)$/;
 
 // CLAUDE_CODE_OAUTH_TOKEN (Claude Max subscription) _N fallback variants.
@@ -1020,8 +1020,7 @@ export function createSubagentQuotaHook(options: {
   };
 }
 
-// buildSecretEnvVarList (the Bash-sanitize unset list) lives in secret-env.ts —
-// an SDK-free module so sibling adapters can import the same single-source list.
+// Credential model for container shells: secret-env.ts (SDK-free).
 
 // `codex exec` reads stdin IN ADDITION to the prompt arg — codex's own help:
 // "If stdin is piped and a prompt is also provided, stdin is appended as a
@@ -1084,20 +1083,22 @@ export function wrapJestSerialized(command: string): string {
   ].join(' ');
 }
 
-export function createSanitizeBashHook(): HookCallback {
+/**
+ * Rewrites a Bash command before it runs: `/dev/null` stdin for `codex exec`
+ * (CODEX_EXEC_RE) and the jest serialization lock (wrapJestSerialized). No
+ * `unset <secrets>` prefix any more — see secret-env.ts's header.
+ */
+export function createBashCommandRewriteHook(): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;
     if (!command) return {};
-    const vars = buildSecretEnvVarList();
-    const unsetPrefix = vars.length > 0 ? `unset ${vars.join(' ')} 2>/dev/null; ` : '';
     const wrapCodexStdin = CODEX_EXEC_RE.test(command) && !ALREADY_DEVNULL_STDIN_RE.test(command);
 
-    let rewritten = unsetPrefix + command;
+    let rewritten = command;
     if (wrapCodexStdin) rewritten = `{ ${rewritten} ; } </dev/null`;
     // After the codex wrap, so a `codex exec` that itself runs jest keeps its
-    // /dev/null stdin; before returning, so the lock covers the unset prefix's
-    // command too.
+    // /dev/null stdin.
     if (JEST_RE.test(command) && !ALREADY_FLOCKED_RE.test(command)) {
       rewritten = wrapJestSerialized(rewritten);
     }
@@ -1571,18 +1572,9 @@ export function createEmailGateHook(opts?: {
     const command = (pre.tool_input as { command?: string })?.command;
     if (!command) return {};
 
-    // createSanitizeBashHook runs EARLIER in this chain and rewrites the command
-    // to `unset <secret-vars> 2>/dev/null; <original>` (updatedInput). Strip that
-    // EXACT, reconstructed prefix before evaluating, so a legit `--dry-run`/`--help`
-    // probe isn't gated by the injected `unset …;` — the whole-command bypass would
-    // otherwise read `unset` as the first word + a `;` metachar and refuse the
-    // bypass. Only the precise sanitizer prefix is stripped (reconstructed from the
-    // same buildSecretEnvVarList), never an arbitrary `unset` (which could hide a
-    // `$( … )` send), so it can't smuggle a real send past the gate. (codex #126 F1)
-    const sanitizeVars = buildSecretEnvVarList();
-    const sanitizePrefix = sanitizeVars.length ? `unset ${sanitizeVars.join(' ')} 2>/dev/null; ` : '';
-    const evalCommand =
-      sanitizePrefix && command.startsWith(sanitizePrefix) ? command.slice(sanitizePrefix.length) : command;
+    // The rewrite hook no longer prepends an `unset …;` prefix (codex #126 F1
+    // is moot), so the gate evaluates exactly what the agent wrote.
+    const evalCommand = command;
 
     // Verdict (allow vs gate + pre-built card) comes from the shared core's
     // evaluateEmailSend; the inline evaluator is the fail-CLOSED fallback when
@@ -2551,8 +2543,9 @@ export class ClaudeProvider implements AgentProvider {
    * thread-search Haiku rerank, future MCP tools, anything reading
    * process.env — pick up the active credential without their own
    * rotation logic. Safe because (a) container code reads env fresh at
-   * call time (no module-load captures), (b) the bash sanitize hook
-   * filters by key name not value so its scrub list is unchanged, and
+   * call time (no module-load captures), (b) Bash subprocesses inherit
+   * the same rotated value, so a `claude -p` an agent launches signs with
+   * the active slot rather than a stale one, and
    * (c) host-side container-runner.ts adds api.anthropic.com to NO_PROXY
    * and re-injects the real token values, so direct callers bypass the
    * OneCLI proxy and use process.env directly.
@@ -2865,11 +2858,11 @@ export class ClaudeProvider implements AgentProvider {
           PreToolUse: [
             {
               matcher: 'Bash',
-              // Order matters: sanitize runs first so blocked commands
-              // also get the unset prefix stripped from logs. Block
-              // hooks run after and return deny if they match.
+              // Order matters: the command rewrite runs first so the later
+              // block hooks and the email gate all evaluate the same
+              // command text. Block hooks return deny if they match.
               hooks: [
-                createSanitizeBashHook(),
+                createBashCommandRewriteHook(),
                 createManagedGitMaintenanceHook(),
                 createSelfApprovalBlockHook(),
                 createBlockSnowflakeConnectorHook(),

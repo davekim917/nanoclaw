@@ -9,6 +9,8 @@ one workgroup reads and edits the same canonical Markdown tree at
 surfaces; they are not memory stores. Use different workgroups whenever memory
 or archived conversation must not cross between agents.
 
+Credentials are scoped by agent group, not by shell: a group's container carries only its own ring, and its shell inherits it (`container/agent-runner/src/providers/secret-env.ts`).
+
 ## The Three Levels
 
 ### 1. Shared Session

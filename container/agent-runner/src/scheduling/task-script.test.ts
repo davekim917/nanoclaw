@@ -168,8 +168,9 @@ describe('script-skip ack chain (container leg)', () => {
 
 // Fleet-hardening Phase 4, P1 leg 2: a pre-task script runs unattended with no
 // approval round-trip, so it must be classified by the SAME destructive-command
-// core as the interactive Bash gate, and its subprocess env must be sanitized of
-// auth secrets — otherwise `ncl tasks create --script` was an ungated exec path.
+// core as the interactive Bash gate — otherwise `ncl tasks create --script` was
+// an ungated exec path. Its subprocess env is also at parity with that gate,
+// which now means the container's provider credential is present (secret-env.ts).
 describe('pre-task script destructive-classifier gate (P1 leg 2)', () => {
   it('refuses a destructive script (rm -rf) — never executes it, acks script-skip:error', async () => {
     // If it ran, the `touch` side effect would prove execution — but block
@@ -197,20 +198,32 @@ describe('pre-task script destructive-classifier gate (P1 leg 2)', () => {
     expect(JSON.parse(keep[0].content).scriptOutput).toEqual({ n: 1 });
   });
 
-  it('strips auth secrets from the script env but keeps ordinary vars', async () => {
+  // The script env matches an interactive Bash command's: the container's own
+  // provider credential is present (so a scheduled script can drive `claude -p`
+  // / `codex exec`), and only the MCP header-only secrets — which no shell ever
+  // needs — are removed. See secret-env.ts for why the credential boundary is
+  // scope rather than the bash env.
+  //
+  // MUTATION CHECK: re-adding ANTHROPIC_API_KEY to the strip set in scriptEnv
+  // fails the first assertion; dropping EXA_API_KEY from
+  // MCP_HEADER_ONLY_SECRET_VARS fails the third.
+  it('keeps the provider credential in the script env, strips the MCP header-only secrets', async () => {
     process.env.ANTHROPIC_API_KEY = 'sk-secret';
+    process.env.EXA_API_KEY = 'exa-secret';
     process.env.TASK_SCRIPT_KEEP = 'kept';
     try {
       insertTask(
         't-env',
-        'echo "{\\"wakeAgent\\": true, \\"data\\": {\\"secret\\": \\"$ANTHROPIC_API_KEY\\", \\"kept\\": \\"$TASK_SCRIPT_KEEP\\"}}"',
+        'echo "{\\"wakeAgent\\": true, \\"data\\": {\\"secret\\": \\"$ANTHROPIC_API_KEY\\", \\"header\\": \\"$EXA_API_KEY\\", \\"kept\\": \\"$TASK_SCRIPT_KEEP\\"}}"',
       );
       const { keep } = await applyPreTaskScripts(getPendingMessages());
       const out = JSON.parse(keep[0].content).scriptOutput;
-      expect(out.secret).toBe(''); // stripped
+      expect(out.secret).toBe('sk-secret'); // provider credential reaches the script
       expect(out.kept).toBe('kept'); // ordinary var survives
+      expect(out.header).toBe(''); // MCP header-only secret still stripped
     } finally {
       delete process.env.ANTHROPIC_API_KEY;
+      delete process.env.EXA_API_KEY;
       delete process.env.TASK_SCRIPT_KEEP;
     }
   });

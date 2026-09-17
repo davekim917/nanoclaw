@@ -632,16 +632,15 @@ Optionally, uninstall the sibling's bot app from the platform — `api.slack.com
 - Concurrent git operations across siblings: the shared worktree has standard git internal locks (`.git/index.lock`). Turn-taking via the `@`-mention pattern mitigates by design — only one sibling is active per turn after a hand-off. If both fire on the same user message (`@helper @helper-codex collab`), git ops can race; failures are loud (`fatal: Unable to create '.git/index.lock'`) and the agent retries.
 - **Joint mentions and race conditions**: when a user `@`-mentions both siblings in one message, both wake in parallel. Whichever finishes generating first posts first; the second-to-finish sees the first's reply via session inbound and (per CLAUDE.md guidance) accommodates by picking a different slice. This accommodation depends on the second container being slower than the first's complete reply — typically true since Codex's reasoning phase adds latency vs Claude's faster time-to-first-token. If both happen to finish near-simultaneously, you can see both claim the same slice. The mitigation is in the prompt — explicit framing like "helper you start" forces ordering — not in the router.
 
-### Known limitation: Codex Bash secret sanitization is a no-op
+### Credentials in the sibling's shell
 
-The Claude provider's `createSanitizeBashHook` returns `hookSpecificOutput.updatedInput` with an `unset ANTHROPIC_API_KEY ...` prefix before every Bash command. Per the Codex hooks docs (developers.openai.com/codex/hooks), Codex parses `updatedInput` but does **not** apply it — the hook fails open. So a Codex container can `printenv` and see the OAuth tokens / API keys passed to it.
-
-Mitigations in place that do work for Codex:
+A sibling's shell inherits the credential its container runs on — `claude -p`, `codex exec` and `opencode run` all work headless in-session. The controls that bound credential reach are provider-agnostic:
+- Per-agent-group credential rings and OneCLI secret assignment — a sibling holds only its own group's credentials.
+- OneCLI injects the real value per request at the proxy boundary; the container-side value is frequently just the `placeholder` sentinel.
 - Host-side `scrubSecrets` on outbound delivery filters registered secret values out of chat replies.
-- OneCLI proxy intercepts most HTTPS egress; secrets in headers/URLs that route through it get logged + gated.
-- The container is single-tenant — only the operator's own agents run in it, no adversarial workloads.
+- The URL-scoped git credential helper — its token is useless outside the allowlisted orgs.
 
-Not mitigated: an agent that bypasses the proxy (NO_PROXY) and exfiltrates via direct HTTP to a remote it controls. Proper fix is to rewrite the Codex container's env before launch — out of scope for the pilot.
+See `container/agent-runner/src/providers/secret-env.ts`. Out of scope: an agent that bypasses the proxy (`NO_PROXY`) and sends data over direct HTTP to a remote it controls.
 
 ### Discord-specific: bot filter relaxation
 
