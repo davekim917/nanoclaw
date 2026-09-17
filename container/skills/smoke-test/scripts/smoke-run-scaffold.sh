@@ -313,7 +313,8 @@ require_fenced_source_sha() {
 
 # The refusal names `adopt` because a caller that reaches this line has ALREADY
 # passed begin_active_run_fence — it is the gate's current owner, not a stale
-# one (a stale owner dies earlier, on "caller owner does not match"). Before
+# one (a stale owner dies earlier, on "caller owner does not match", :237 for
+# a task run and :268 for a PR run). Before
 # `adopt` existed the only exit from here was `contract --regenerate`, which
 # retires every valid marker of a run whose previews may already be gone
 # (the recovery-owner wedge).
@@ -625,8 +626,9 @@ adopt)
   # CONTRACT ADOPTION — the fenced ownership transition for a recovered run.
   #
   # `smoke-pr-gate.sh poll` mints a fresh owner token on EVERY wake, same-run
-  # recovery included (smoke-pr-gate.sh:4337), and writes it to the state, the
-  # lease and the PR authority — but never to the contract. The recovery owner
+  # recovery included (smoke-pr-gate.sh:4337), and writes it to the lease
+  # (:4366), the PR authority (:4371) and the state (:4409-4416) — no line of
+  # that block touches the contract. The recovery owner
   # therefore passes begin_active_run_fence and then dies in
   # require_contract_owner, with `contract --regenerate` (which retires every
   # marker) as the only exit. This verb is the missing transition.
@@ -641,7 +643,8 @@ adopt)
   #
   # Deliberately NOT changed: lanes, generations, requiredLaneMarkers, markers,
   # `createdAt`, and the gate's challengerDeadline (this script cannot write
-  # gate state at all) — so valid prior evidence keeps validating and recovery
+  # gate state at all; the gate's own same-SHA recovery keeps the original,
+  # smoke-pr-gate.sh:4411-4415) — so valid prior evidence keeps validating and recovery
   # buys no fresh time budget. The successor is recorded as an ADOPTER in
   # `ownerAdoptions[]`, never as the author.
   require_coordinator_role "a completion-contract ownership adoption"
@@ -655,14 +658,18 @@ adopt)
     die "adopt does not apply to a develop-fenced run — its contract carries no coordinator owner"
   require_fenced_source_sha "$SOURCE_SHA"
   # A task run's LIFETIME identity is the shared binding, not the private
-  # slot: `task-finish` commits `.terminal` there FIRST and clears the lease
-  # and private slot afterwards (smoke-pr-gate.sh:3072-3083), so a crash in
-  # between leaves state + lease looking live for a run that is already
+  # slot: `task-finish` commits `.terminal` there FIRST
+  # (smoke-pr-gate.sh:3072-3083) and only afterwards removes the lease
+  # (smoke-pr-gate.sh:3132) and clears the private slot
+  # (smoke-pr-gate.sh:3142-3146), so a crash in between leaves state + lease looking live for a run that is already
   # terminal. The task fence above reads only state and lease, so adoption
   # checks the binding itself. It is read under fd 8, which is the same
   # `task-lease-<runId>.lock` file the gate serializes binding writes on
-  # (smoke-pr-gate.sh:628 and :678) — no new lock. Fail closed on a missing
-  # or malformed record: every current task-claim writes one.
+  # (smoke-pr-gate.sh:628 and :678; task-finish takes it at :1172) — no new
+  # lock. Fail closed on a missing or malformed record: task-claim's
+  # task_lease_acquire backfills one from a legacy lease
+  # (smoke-pr-gate.sh:1011-1014) or creates one (smoke-pr-gate.sh:1049-1052)
+  # and refuses the claim if that write fails.
   if [ "$FENCED_STATE_KIND" = task ]; then
     TASK_BINDING_FILE="$LEASE_DIR/task-binding-$(basename "$RUN_DIR").json"
     # SOURCE OF TRUTH: read_task_binding in smoke-pr-gate.sh:631-663 — the jq
@@ -670,7 +677,8 @@ adopt)
     # terminal.completedAt at :654-661. Duplicated verbatim because the gate
     # is an executable, not a sourceable library; keep the two in step. A
     # looser check here would adopt a contract onto a binding every gate
-    # lifecycle verb then refuses as malformed.
+    # lifecycle verb then refuses as malformed (task_lease_fence_begin,
+    # smoke-pr-gate.sh:1129-1134).
     TASK_BINDING="$(jq -ce --arg run "$(basename "$RUN_DIR")" '
       def iso: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
       def terminal_ok:
@@ -724,7 +732,7 @@ adopt)
   # The history entry carries NOTHING derived from an owner value — no token
   # and no digest of one. An owner is not always a gate-minted 256-bit token:
   # task-claim takes an arbitrary caller-supplied owner and otherwise defaults
-  # to the hostname (smoke-pr-gate.sh:2775), so an unsalted digest would be
+  # to the hostname (smoke-pr-gate.sh:2775, DEFAULT_OWNER at :212), so an unsalted digest would be
   # enumerable back to a reusable credential. `index` + `adoptedAt` record that
   # and when ownership changed hands; who holds it now is the token above.
   jq --arg owner "$FENCED_OWNER" --arg now "$(iso_now)" \
