@@ -149,6 +149,34 @@ if [ -n "$rest" ]; then
       printf ']'
       exit 0
       ;;
+    */rules/branches/*)
+      # rules--<branch>.json is the branch's active rules, as the API lists them; absent = none.
+      # A .noplan marker answers as GitHub does where rulesets are not on the plan, and a
+      # .error marker fails another way. gh prints an error body wrapped under --slurp too.
+      branch="\${rest#*/rules/branches/}"
+      branch="\${branch%%\\?*}"
+      if [ -f "$MOCK_DIR/rules--$branch.noplan" ]; then
+        echo '[{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","status":"403"}]'
+        echo 'gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)' >&2
+        exit 1
+      fi
+      if [ -f "$MOCK_DIR/rules--$branch.error" ]; then
+        echo '[{"message":"Server Error","status":"500"}]'
+        echo 'gh: Server Error (HTTP 500)' >&2
+        exit 1
+      fi
+      printf '['
+      if [ -f "$MOCK_DIR/rules--$branch.json" ]; then cat "$MOCK_DIR/rules--$branch.json"; else printf '[]'; fi
+      printf ']'
+      exit 0
+      ;;
+    */branches/*)
+      # branch--<branch>.json is the branch with its classic protection summary; absent = unprotected.
+      branch="\${rest#*/branches/}"
+      if [ -f "$MOCK_DIR/branch--$branch.json" ]; then cat "$MOCK_DIR/branch--$branch.json"
+      else printf '{"name":"%s","protection":{"enabled":false,"required_status_checks":{"enforcement_level":"off","contexts":[],"checks":[]}}}\\n' "$branch"; fi
+      exit 0
+      ;;
     */git/ref/heads/*)
       # ref--<branch> holds the commit the branch points at; ref--<branch>-<n>, when
       # present, answers the nth read of it in this run instead. Absent = no such branch.
@@ -445,6 +473,30 @@ function receiptComment(
     createdAt,
     fullDatabaseId: databaseId,
     body: `### Substitute review receipt\n\n- **Reviewer and runtime:** ${reviewer}\n- **Outcome:** ${outcome}\n\n<!-- pr-review-loop:substitute-receipt head=${head} outcome=${outcome} -->`,
+  };
+}
+
+// A review desk's receipt: the v1 marker, then one fenced JSON object. `json`
+// replaces the object's text, for a block that does not parse.
+function independentReceipt(
+  head: string,
+  verdict: string,
+  blockingFindings: number,
+  createdAt: string,
+  authorAssociation = 'MEMBER',
+  databaseId: string | null = String(Date.parse(createdAt) / 1000),
+  json = JSON.stringify(
+    { head, fresh_context: true, scope: 'full-final-head', verdict, blocking_findings: blockingFindings },
+    null,
+    2,
+  ),
+): Page {
+  return {
+    author: { login: 'release-desk' },
+    authorAssociation,
+    createdAt,
+    fullDatabaseId: databaseId,
+    body: `Independent review at head \`${head.slice(0, 8)}\`: ${verdict}.\n\n<!-- independent-review-receipt:v1 -->\n\`\`\`json\n${json}\n\`\`\`\n`,
   };
 }
 
@@ -1097,7 +1149,8 @@ describe('codex-review risk-scoped review requests', () => {
     expect(merge.status).toBe(26);
     expect(merge.stdout).toContain('merge=defer mode=legacy');
     expect(merge.stdout).toContain('Step-6 evidence rules apply');
-    expect(merge.calls).not.toMatch(/^(reviews|reactions|comments|reviewThreads) /m);
+    // The precheck reads the comments for a desk receipt; the Codex verdict stays Step 6's.
+    expect(merge.calls).not.toMatch(/^(reviews|reactions|reviewThreads) /m);
   });
 
   it('runs the pre-existing commands in a legacy repo exactly as before, reading no risk-scope state', () => {
@@ -2577,7 +2630,7 @@ describe('codex-review risk-scoped review requests', () => {
     expect(result.stdout).toContain('the latest substitute receipt for this head approves');
   });
 
-  it('leaves legacy merge-check deferring without reading CI or receipts, whatever they say', () => {
+  it('leaves legacy merge-check deferring over what Step 6 still judges: CI runs, substitute receipts, the Fixes-PR line', () => {
     const root = tempRoot();
     scopeFixture(root, {
       baseConfig: null,
@@ -2585,16 +2638,251 @@ describe('codex-review risk-scoped review requests', () => {
       title: 'fix: a fix with no Fixes-PR line',
       comments: [receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z')],
       ci: [workflowRun('CI', 'completed', 'failure')],
-      statuses: [commitStatus('ci/external', 'pending')],
+      statuses: [commitStatus('ci/external', 'pending'), commitStatus('ci/optional', 'failure')],
     });
 
     const result = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(result.status).toBe(26);
-    expect(result.stdout).toContain('merge=defer mode=legacy');
+    expect(result.stdout).toBe(
+      'merge=defer mode=legacy: example/repository is not risk-scoped; the existing Step-6 evidence rules apply\n',
+    );
     expect(result.calls).not.toContain('actions/runs');
-    expect(result.calls).not.toContain('statuses');
     expect(result.calls).not.toContain('/files');
-    expect(result.calls).not.toMatch(/^comments /m);
+  });
+
+  describe('legacy precheck: the two facts a legacy merge answers to mechanically', () => {
+    // What the develop ruleset of the repo this was found in requires.
+    const REQUIRED = ['CI Gate', 'Release policy', 'Release approval'];
+
+    function requires(root: string, contexts: string[], branch = 'main'): void {
+      writeJson(root, `rules--${branch}.json`, [
+        { type: 'deletion' },
+        {
+          type: 'required_status_checks',
+          parameters: { required_status_checks: contexts.map((context) => ({ context })) },
+        },
+      ]);
+    }
+
+    function legacy(root: string, opts: { statuses?: Page[]; comments?: Page[]; required?: string[] } = {}): void {
+      scopeFixture(root, { baseConfig: null, labels: [], statuses: opts.statuses, comments: opts.comments });
+      requires(root, opts.required ?? REQUIRED);
+    }
+
+    it.each([
+      ['failure', 'Release policy=failure'],
+      ['error', 'Release policy=error'],
+    ])('refuses (24) when a required status is %s on the head, and never defers', (state, named) => {
+      const root = tempRoot();
+      legacy(root, { statuses: [commitStatus('Release policy', state), commitStatus('Release approval', 'success')] });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain(`merge=refused head=${HEAD} mode=legacy: required_red: ${named}`);
+      expect(result.stdout).not.toContain('merge=');
+      expect(result.calls).toContain('rest repos/example/repository/rules/branches/main?per_page=100\n');
+    });
+
+    it('reads classic branch protection as required too', () => {
+      const root = tempRoot();
+      legacy(root, { required: [], statuses: [commitStatus('ci/gate', 'failure')] });
+      writeJson(root, 'branch--main.json', {
+        name: 'main',
+        protection: { enabled: true, required_status_checks: { enforcement_level: 'everyone', contexts: ['ci/gate'] } },
+      });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('required_red: ci/gate=failure');
+    });
+
+    it('judges only the newest status per required context: a failure since replaced by success does not refuse', () => {
+      const root = tempRoot();
+      legacy(root, {
+        statuses: [
+          commitStatus('Release policy', 'failure', '2026-09-05T00:02:00Z'),
+          commitStatus('Release policy', 'success', '2026-09-05T00:03:00Z'),
+        ],
+      });
+
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+    });
+
+    it('does not refuse on a red status the branch does not require', () => {
+      const root = tempRoot();
+      legacy(root, { statuses: [commitStatus('ci/optional', 'failure')] });
+
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+    });
+
+    it('does not read a pending required Release approval as red: it defers, and ci-wait still reads green', () => {
+      const root = tempRoot();
+      legacy(root, {
+        statuses: [commitStatus('Release approval', 'pending'), commitStatus('Release policy', 'success')],
+      });
+
+      const merge = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(merge.status).toBe(26);
+      expect(merge.stderr).not.toContain('required_red');
+
+      writeJson(root, 'pr.json', ciPr());
+      const wait = ciWait(root, ['--head', HEAD], [0, 0, 0]);
+      expect(wait.status).toBe(0);
+      expect(wait.stdout).toContain(`ci=green head=${HEAD}`);
+      expect(wait.stdout + wait.stderr).not.toContain('ci_pending');
+    });
+
+    it('treats the no-rulesets-on-this-plan 403 as nothing required, and any other rules failure as no verdict', () => {
+      const root = tempRoot();
+      legacy(root, { statuses: [commitStatus('Release policy', 'failure')] });
+      fs.rmSync(path.join(root, 'rules--main.json'));
+      fs.writeFileSync(path.join(root, 'rules--main.noplan'), '');
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+
+      fs.rmSync(path.join(root, 'rules--main.noplan'));
+      fs.writeFileSync(path.join(root, 'rules--main.error'), '');
+      const broken = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(broken.status).toBe(1);
+      expect(broken.stderr).toContain('could not read the rules for branch main');
+      expect(broken.stdout).not.toContain('merge=');
+    });
+
+    it('refuses (24) when a newer independent CHANGES receipt follows an older approving substitute receipt', () => {
+      const root = tempRoot();
+      legacy(root, {
+        comments: [
+          receiptComment(HEAD, 'approve', '2026-09-05T00:14:00Z', 'MEMBER'),
+          independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z'),
+        ],
+      });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain(`merge=refused head=${HEAD} mode=legacy: independent_receipt_not_clear:`);
+      expect(result.stderr).toContain('verdict CHANGES, blocking_findings 1');
+      expect(result.stdout).not.toContain('merge=');
+    });
+
+    it('is not lifted by a substitute approve posted after the CHANGES receipt: only the desk clears its own no', () => {
+      const root = tempRoot();
+      legacy(root, {
+        comments: [
+          independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z'),
+          receiptComment(HEAD, 'approve', '2026-09-05T00:30:00Z', 'MEMBER'),
+        ],
+      });
+
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(24);
+    });
+
+    it('defers once a later CLEAR receipt for the head follows the CHANGES one, ordered by posting id, not createdAt', () => {
+      const root = tempRoot();
+      legacy(root, {
+        comments: [
+          // Same second: only the database id says which came last.
+          independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:28:00Z', 'MEMBER', '9007199254740993'),
+          independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z', 'MEMBER', '9007199254740992'),
+        ],
+      });
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+
+      legacy(root, {
+        comments: [
+          independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:28:00Z', 'MEMBER', '9007199254740992'),
+          independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z', 'MEMBER', '9007199254740993'),
+        ],
+      });
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(24);
+    });
+
+    it.each(['NONE', 'CONTRIBUTOR', 'FIRST_TIME_CONTRIBUTOR'])(
+      'ignores an independent CHANGES receipt from an author without write access (%s)',
+      (association) => {
+        const root = tempRoot();
+        legacy(root, { comments: [independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z', association)] });
+
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+      },
+    );
+
+    it('ignores a receipt for another head, and a marker only mentioned in prose', () => {
+      const root = tempRoot();
+      legacy(root, {
+        comments: [
+          independentReceipt(OLD_HEAD, 'CHANGES', 2, '2026-09-05T00:28:00Z'),
+          {
+            author: { login: 'davekim917' },
+            authorAssociation: 'OWNER',
+            createdAt: '2026-09-05T00:29:00Z',
+            fullDatabaseId: '1788568140',
+            body: 'merge-check does not read `<!-- independent-review-receipt:v1 -->` markers yet.',
+          },
+        ],
+      });
+
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+    });
+
+    it.each([
+      [
+        'CLEAR with blocking findings',
+        independentReceipt(HEAD, 'CLEAR', 1, '2026-09-05T00:28:00Z'),
+        'blocking_findings 1',
+      ],
+      [
+        'a JSON block that does not parse and names no head',
+        independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:28:00Z', 'OWNER', '1788568080', '{ not json'),
+        'its JSON block does not parse',
+      ],
+      [
+        'a receipt with no orderable database id',
+        independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:28:00Z', 'OWNER', null),
+        'receipt_order_unknown',
+      ],
+    ])('fails closed on %s', (_case, receipt, why) => {
+      const root = tempRoot();
+      legacy(root, { comments: [receipt] });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain(why);
+    });
+
+    it('refuses a legacy head that is not the one named, before judging it', () => {
+      const root = tempRoot();
+      legacy(root);
+
+      const result = runHelper(root, ['merge-check', '--head', OTHER_HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain(`the PR head is not ${OTHER_HEAD}`);
+      expect(result.calls).not.toContain('rules/branches');
+    });
+
+    it('gives no verdict (1), never a defer, when the comments cannot be read', () => {
+      const root = tempRoot();
+      legacy(root);
+      fs.writeFileSync(path.join(root, 'comments-fail-1'), '');
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(1);
+      expect(result.stdout).not.toContain('merge=');
+    });
+
+    it('leaves a risk-scoped repo alone: no rules read, and neither fact changes its verdict', () => {
+      const root = tempRoot();
+      scopeFixture(root, {
+        labels: [],
+        statuses: [commitStatus('Release policy', 'failure')],
+        comments: [independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z')],
+      });
+      requires(root, REQUIRED);
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`merge=allowed head=${HEAD} mode=risk-scoped verdict=skip ci=green`);
+      expect(result.calls).not.toContain('rules/branches');
+      expect(result.calls).not.toContain('/branches/main');
+    });
   });
 
   // merge-check's own --head (unlike ci-wait/merge/receipt) is optional, but a
