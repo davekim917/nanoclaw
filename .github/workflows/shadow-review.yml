@@ -244,15 +244,22 @@ jobs:
           #    resolved and used, in EITHER comment style. Model ids contain
           #    neither delimiter, so nothing real is lost.
           #
-          #    This is TEXT stripping, not a parse, and the limit is worth
-          #    stating plainly: a `//` inside a string or URL truncates that
-          #    line. Usually that only costs a match and fails loudly below,
-          #    but a roster that ALSO carries `'/*'`/`'*/'` string literals
-          #    around a later declaration can rebalance the delimiters and
-          #    resolve the wrong id. That shape is contrived — the real roster
-          #    (`scripts/reviewer-models.ts`) has no URL at all — and the
-          #    honest fix is to stop reading the file as text, which needs a
-          #    Node/tsx runtime this step does not have. Recorded, not fixed.
+          #    This is TEXT stripping, not a parse, and the limit is exactly
+          #    that: `/*`, `*/` and `//` are treated as comment delimiters
+          #    wherever they appear, INCLUDING inside string literals. A
+          #    roster carrying `'/*'` and `'*/'` literals around a declaration
+          #    therefore comments that declaration out as far as this step is
+          #    concerned, and a second declaration after it resolves instead —
+          #    with NO `//` involved and with the delimiters still balanced, so
+          #    the check below cannot see it either. A `//` inside a string is
+          #    one more way into the same hole, not the cause of it.
+          #
+          #    Contrived, and not fixed here: the real roster
+          #    (`scripts/reviewer-models.ts`) contains no `http` and no such
+          #    literal, and the honest fix is to stop reading the file as text,
+          #    which needs a Node/tsx runtime this step does not have. What
+          #    bounds the risk meanwhile is that the roster is read at the
+          #    PR's BASE sha, so landing such a literal takes a merged commit.
           # 2. Flatten to a single line, so the array literal can be matched as
           #    one expression whether it is written on one line or wrapped over
           #    several.
@@ -267,13 +274,20 @@ jobs:
           # the strip did not do what the matching below assumes, so refuse
           # rather than resolve from text we cannot account for.
           #
-          # The one legitimate shape this refuses is a SINGLE-LINE docblock
-          # whose text contains a URL (`/** @see https://… */`): the `//` eats
-          # its `*/`. A multi-line docblock with a URL is fine, since its `*/`
-          # is on a later line. Refusing is the right side to err on, and the
-          # message says exactly what to change.
+          # It refuses more than that one case, all of them fail-CLOSED, and
+          # all of them legitimate TypeScript:
+          #   - any `/* … */` whose CLOSING line also holds a `//` — a URL in a
+          #     one-line block comment, or on the last line of a docblock. A
+          #     URL on a middle line is fine, since the `*/` survives.
+          #   - a string literal holding an unpaired delimiter, e.g. a glob
+          #     like `'**/*.ts'`, whose `*/` has nothing to pair with.
+          # The message names the delimiter and the fix, because "unbalanced"
+          # alone sends the reader looking for a broken comment when the cause
+          # is usually a URL or a glob in ordinary code.
           if printf '%s' "$flat" | grep -qE '/\*|\*/'; then
-            echo "unbalanced block comment after comment-stripping $ROSTER@$BASE_SHA — refusing to resolve a reviewer from it" >&2
+            echo "unresolved /* or */ after comment-stripping $ROSTER@$BASE_SHA — refusing to resolve a reviewer from text this step cannot account for." >&2
+            echo "Usual cause: a URL or other '//' on the SAME line as a block comment's '*/' (that '//' deletes the '*/'), or an unpaired '/*' or '*/' inside a string literal such as a '**/*.ts' glob." >&2
+            echo "Fix in $ROSTER: move the URL off the closing line of the comment, or keep such literals out of this file." >&2
             exit 1
           fi
 
