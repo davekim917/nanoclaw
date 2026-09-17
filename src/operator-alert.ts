@@ -34,6 +34,29 @@ import { log } from './log.js';
 import { ensureUserDm } from './modules/permissions/user-dm.js';
 import { scrubSecrets } from './secret-scrubber.js';
 
+/**
+ * Ceiling on each network step of one recipient attempt. Every caller is a
+ * sweep duty awaiting this from inside a per-session or tick window, and an
+ * adapter promise that never settles would hold that window open for good: the
+ * session stays in the driver's running set and every later tick skips it
+ * (`sessionsRunning`, src/host-sweep.ts:1118). An alert is never worth the
+ * sweep, so a slow recipient is a failed recipient.
+ *
+ * Generous on purpose — a healthy DM send is sub-second, and the cost of a
+ * false timeout is a possible duplicate: the abandoned send may still land
+ * after this returns false and the caller re-alerts next tick.
+ */
+export const OPERATOR_ALERT_STEP_TIMEOUT_MS = 30_000;
+
+/** Reject after `ms` so the recipient loop's `catch` treats a hang like a throw. */
+function bounded<T>(step: string, work: Promise<T>, ms = OPERATOR_ALERT_STEP_TIMEOUT_MS): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`operator-alert: ${step} did not settle within ${ms}ms`)), ms);
+  });
+  return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
+}
+
 export async function notifyOperators(rawText: string, context: Record<string, unknown> = {}): Promise<boolean> {
   // Alerts quote things that failed, and what failed is often agent or command
   // output. `scrubSecrets` is applied on the normal outbound path in
@@ -74,7 +97,7 @@ export async function notifyOperators(rawText: string, context: Record<string, u
   // later rows are failover only.
   for (const recipient of recipients) {
     try {
-      const dm = await ensureUserDm(recipient.user_id);
+      const dm = await bounded('DM resolution', ensureUserDm(recipient.user_id));
       if (!dm) {
         log.warn('operator-alert: administrator is unreachable', { ...context, userId: recipient.user_id });
         continue;
@@ -90,14 +113,17 @@ export async function notifyOperators(rawText: string, context: Record<string, u
       // undeliverable exactly when it mattered. Dropping the instance here
       // would have shipped a second undeliverable path with a receipt that
       // still said `true` (Codex round 3).
-      await adapter.deliver(
-        dm.channel_type,
-        dm.platform_id,
-        null,
-        'chat',
-        JSON.stringify({ text }),
-        undefined,
-        dm.instance ?? dm.channel_type,
+      await bounded(
+        'delivery',
+        adapter.deliver(
+          dm.channel_type,
+          dm.platform_id,
+          null,
+          'chat',
+          JSON.stringify({ text }),
+          undefined,
+          dm.instance ?? dm.channel_type,
+        ),
       );
       return true;
     } catch (err) {

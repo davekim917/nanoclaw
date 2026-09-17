@@ -25,7 +25,7 @@ vi.mock('./log.js', () => ({
   isSurvivableIoError: vi.fn(() => false),
 }));
 
-import { notifyOperators } from './operator-alert.js';
+import { OPERATOR_ALERT_STEP_TIMEOUT_MS, notifyOperators } from './operator-alert.js';
 import { registerSecrets } from './secret-scrubber.js';
 
 beforeEach(() => {
@@ -55,6 +55,45 @@ describe('notifyOperators', () => {
   it('reports failure when every recipient send throws', async () => {
     mocks.deliver.mockRejectedValue(new Error('slack down'));
     expect(await notifyOperators('something broke')).toBe(false);
+  });
+
+  it('a delivery that never settles is a failed recipient, not a suspended caller', async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.roleRows = [{ user_id: 'discord:owner-1' }, { user_id: 'slack:admin-2' }];
+      mocks.deliver.mockReset();
+      mocks.deliver.mockImplementationOnce(() => new Promise<string>(() => undefined)).mockResolvedValueOnce('plat-2');
+
+      const result = notifyOperators('something broke');
+      await vi.advanceTimersByTimeAsync(OPERATOR_ALERT_STEP_TIMEOUT_MS);
+
+      // Failed over to the next recipient exactly as a throw would.
+      expect(await result).toBe(true);
+      expect(mocks.deliver).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports failure, and returns, when every step hangs', async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.roleRows = [{ user_id: 'discord:owner-1' }, { user_id: 'slack:admin-2' }];
+      mocks.ensureUserDm.mockReset();
+      mocks.ensureUserDm.mockImplementationOnce(() => new Promise(() => undefined));
+      mocks.ensureUserDm.mockResolvedValueOnce({ channel_type: 'slack', platform_id: 'dm-2' });
+      mocks.deliver.mockReset().mockImplementation(() => new Promise<string>(() => undefined));
+
+      const result = notifyOperators('something broke');
+      await vi.advanceTimersByTimeAsync(2 * OPERATOR_ALERT_STEP_TIMEOUT_MS);
+
+      expect(await result).toBe(false);
+      expect(mocks.deliver).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('sends through ONE bot only, even with several owner rows', async () => {
