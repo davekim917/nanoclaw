@@ -3085,6 +3085,196 @@ describe('mid-turn fast-mode changes', () => {
   }, 30_000);
 });
 
+describe('interim text — a <message> block written before a tool call', () => {
+  function seedOrigin(): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('discord-main', 'discord-main', 'channel', 'discord', 'chan-1', NULL)`,
+      )
+      .run();
+  }
+  const run = (events: ProviderEvent[]) => {
+    const pushes: string[] = [];
+    async function* gen(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      for (const e of events) yield e;
+    }
+    const query: AgentQuery = {
+      push: (m: string) => void pushes.push(m),
+      end: () => {},
+      abort: () => {},
+      events: gen(),
+    };
+    return processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {}).then(() => pushes);
+  };
+  const sentTexts = () => getUndeliveredMessages().map((m) => JSON.parse(m.content).text as string);
+
+  it('delivers the wrapped block and drops the narration around it', async () => {
+    seedOrigin();
+    await run([
+      { type: 'interim_text', text: 'Pushed. <message to="here">head is 2c8cf18</message> Now the benchmark.' },
+      { type: 'result', text: '<message to="here">benchmark done</message>' },
+    ]);
+
+    expect(sentTexts()).toEqual(['head is 2c8cf18', 'benchmark done']);
+  });
+
+  it('never delivers bare interim narration, and does not nudge for it', async () => {
+    seedOrigin();
+    const pushes = await run([
+      { type: 'interim_text', text: 'Now run the seam suites, then typecheck.' },
+      { type: 'result', text: '<message to="here">green</message>' },
+    ]);
+
+    expect(sentTexts()).toEqual(['green']);
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('does not send a block twice when the final text repeats it', async () => {
+    seedOrigin();
+    const block = '<message to="here">head is 2c8cf18</message>';
+    await run([
+      { type: 'interim_text', text: block },
+      { type: 'result', text: `${block}\n<message to="here">and CI is green</message>` },
+    ]);
+
+    expect(sentTexts()).toEqual(['head is 2c8cf18', 'and CI is green']);
+  });
+
+  it('forgets interim deliveries at an empty result, so the next turn can say the same thing', async () => {
+    seedOrigin();
+    const block = '<message to="here">still running</message>';
+    await run([
+      { type: 'interim_text', text: block },
+      { type: 'result', text: null },
+      { type: 'result', text: block },
+    ]);
+
+    expect(sentTexts()).toEqual(['still running', 'still running']);
+  });
+
+  it('leaves a block for a destination that does not exist yet to the final text, where it may', async () => {
+    seedOrigin();
+    const block = '<message to="new-child">your brief</message>';
+    const pushes: string[] = [];
+    async function* gen(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      yield { type: 'interim_text', text: block };
+      // Nothing may have gone out yet — not the block, not a "[dropped …]" note to the origin.
+      expect(sentTexts()).toEqual([]);
+      // The tool call that followed the text created the destination.
+      getInboundDb()
+        .prepare(
+          `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+           VALUES ('new-child', 'new-child', 'channel', 'discord', 'chan-child', NULL)`,
+        )
+        .run();
+      yield { type: 'result', text: block };
+    }
+    const query: AgentQuery = {
+      push: (m: string) => void pushes.push(m),
+      end: () => {},
+      abort: () => {},
+      events: gen(),
+    };
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(sentTexts()).toEqual(['your brief']);
+    expect(getUndeliveredMessages()[0].platform_id).toBe('chan-child');
+  });
+
+  // The repeat must be skipped INSIDE the dispatcher, still counted as sent:
+  // removing it from the text left `sent === 0`, and the narration around it
+  // went to the person through the unwrapped-output fallback.
+  it('keeps the narration private when the final text is the repeated block plus prose', async () => {
+    seedOrigin();
+    const block = '<message to="here">head is 2c8cf18</message>';
+    const pushes = await run([
+      { type: 'interim_text', text: block },
+      { type: 'result', text: `I've posted the head. ${block}` },
+    ]);
+
+    expect(sentTexts()).toEqual(['head is 2c8cf18']);
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('does not re-post a delivered block when the turn ends in an error', async () => {
+    seedOrigin();
+    const block = '<message to="here">head is 2c8cf18</message>';
+    await run([
+      { type: 'interim_text', text: block },
+      { type: 'result', text: block, isError: true },
+    ]);
+
+    expect(sentTexts()).toEqual(['head is 2c8cf18']);
+  });
+
+  it('keeps the code inside a real block, and still recognises its verbatim repeat', async () => {
+    seedOrigin();
+    const block = '<message to="here">head is `2c8cf18`, see `src/a.ts:12`\n```\n19 suites green\n```</message>';
+    await run([
+      { type: 'interim_text', text: `Posting. ${block}` },
+      { type: 'result', text: block },
+    ]);
+
+    expect(sentTexts()).toEqual(['head is `2c8cf18`, see `src/a.ts:12`\n```\n19 suites green\n```']);
+  });
+
+  it('does not send a block the agent only quoted in code', async () => {
+    seedOrigin();
+    await run([
+      {
+        type: 'interim_text',
+        text: 'I will answer with `<message to="here">the summary</message>` once the build ends.',
+      },
+      { type: 'interim_text', text: '```\n<message to="here">fenced example</message>\n```' },
+      { type: 'result', text: '<message to="here">real answer</message>' },
+    ]);
+
+    expect(sentTexts()).toEqual(['real answer']);
+  });
+
+  it('never routes a dropped-block note to the origin mid-turn', async () => {
+    seedOrigin();
+    await run([
+      { type: 'interim_text', text: '<message to=" nowhere ">lost</message>' },
+      { type: 'result', text: '<message to="here">done</message>' },
+    ]);
+
+    expect(sentTexts()).toEqual(['done']);
+  });
+
+  it('leaves an unclosed block for the final text', async () => {
+    seedOrigin();
+    await run([
+      { type: 'interim_text', text: '<message to="here">half a thought' },
+      { type: 'result', text: null },
+    ]);
+
+    expect(sentTexts()).toEqual([]);
+  });
+
+  it('delivers nothing mid-turn in a task run', async () => {
+    seedOrigin();
+    const pushes: string[] = [];
+    async function* gen(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      yield { type: 'interim_text', text: '<message to="here">from a task</message>' };
+      yield { type: 'result', text: null };
+    }
+    const query: AgentQuery = {
+      push: (m: string) => void pushes.push(m),
+      end: () => {},
+      abort: () => {},
+      events: gen(),
+    };
+    await processQuery(query, { ...ERR_ROUTING, taskRun: true }, [], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(sentTexts()).toEqual([]);
+  });
+});
+
 describe('error result with no <message> envelope', () => {
   it('delivers a budget/billing error to the triggering channel and does not nudge', async () => {
     const budgetText = 'Spending limit reached. Add your own key at https://example.com/keys';

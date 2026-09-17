@@ -6,7 +6,40 @@ const CAPABILITIES_PATH = '/workspace/capabilities.json';
 const INDEX_PATH = '/workspace/workgroup/memory/index.md';
 const MAX_CAPABILITY_SERVICES = 32;
 const MAX_CAPABILITY_STRING_CHARS = 600;
-const MAX_CAPABILITY_JSON_CHARS = 5_000;
+/**
+ * Must cover the LARGEST roster the host itself would emit, or this fallback
+ * drops services the host kept and capabilities vanish specifically after a
+ * cold-context recovery — the one path the agent cannot see happening.
+ *
+ * The host bounds `JSON.stringify(services)` at `PRE_TURN_BOUNDS
+ * .capabilityTotalChars` = 10,000 (src/modules/memory/pre-turn-context.ts,
+ * `boundedCapabilities`); this bound is measured over the whole snapshot
+ * object, which adds `agentGroupId` and the ~360-char `howToUse`. 11,000
+ * clears that with margin. At 5,000 — the pre-roster value, sized when the
+ * block carried five or six full manuals — a host-accepted shape (32 services,
+ * 160-char hints, ~7KB) lost entries here alone.
+ *
+ * This leaves less room under `NORMAL_RECALL_CHARS`, and at the extreme this
+ * bound plus a full `MAX_INDEX_BYTES` index exceeds it on its own. That is
+ * handled where the ceiling is enforced, in `ensureFreshContextBootstrap`,
+ * which sheds in the host's order: evidence blocks, then the index, then
+ * capability entries. The ordering is deliberate — `enforceFinalBound` on the
+ * host sacrifices capabilities last — and it only bites on pathological input,
+ * since real rosters measure ~3.3k.
+ */
+const MAX_CAPABILITY_JSON_CHARS = 11_000;
+/** Roster hint cap. Mirrors PRE_TURN_BOUNDS.capabilityRosterUseChars on the host. */
+const MAX_CAPABILITY_USE_CHARS = 160;
+/**
+ * Used only when the mounted snapshot predates the roster and so carries no
+ * `session.howToUse`. The host writes that field
+ * (`CAPABILITY_ROSTER_PREAMBLE`, src/capabilities.ts), so the live text has
+ * one source; this is the older-host fallback, not a second copy to keep in
+ * sync.
+ */
+const FALLBACK_HOW_TO_USE =
+  'EVERY service listed here is wired into THIS session right now — never tell the user you lack one of them, and never ask for its credentials. ' +
+  'These are one-line reminders, not instructions: before you first use a service in a session, call `get_capabilities` with `{"service":"<name>"}` for its full usage notes (auth, exact tool names, known failure shapes).';
 const MAX_INDEX_BYTES = 2_500;
 const NORMAL_RECALL_CHARS = 12_000;
 const EXACT_LINK_RECALL_CHARS = 16_000;
@@ -14,27 +47,39 @@ const TRUNCATED = '[truncated:fresh-context-bootstrap]';
 
 interface CapabilitySnapshot {
   agentGroupId: string;
+  howToUse: string;
   services: Array<Record<string, unknown>>;
 }
 
-function boundedString(value: unknown): string | undefined {
+function boundedString(value: unknown, limit = MAX_CAPABILITY_STRING_CHARS): string | undefined {
   if (typeof value !== 'string') return undefined;
-  if (value.length <= MAX_CAPABILITY_STRING_CHARS) return value;
-  return `${value.slice(0, MAX_CAPABILITY_STRING_CHARS - TRUNCATED.length)}${TRUNCATED}`;
+  if (value.length <= limit) return value;
+  return `${value.slice(0, limit - TRUNCATED.length)}${TRUNCATED}`;
 }
 
-function boundedStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value
-    .slice(0, 64)
-    .map(boundedString)
-    .filter((item): item is string => item !== undefined);
+/**
+ * The roster hint for one entry, from the same snapshot the host reduces:
+ * the hand-written/derived `summary` when the host wrote one, else the leading
+ * clause of the how-to prose so an older snapshot still renders a line rather
+ * than a bare name. Word-boundary cut, same intent as
+ * `summarizeCapabilityText` (src/capabilities.ts).
+ */
+function rosterUse(service: Record<string, unknown>): string | undefined {
+  const summary = boundedString(service.summary, MAX_CAPABILITY_USE_CHARS);
+  if (summary !== undefined) return summary;
+  const prose = typeof service.activation === 'string' ? service.activation : service.useFor;
+  if (typeof prose !== 'string') return undefined;
+  const flat = prose.replace(/\s+/g, ' ').trim();
+  if (flat.length <= 96) return flat;
+  const cut = flat.slice(0, 96);
+  const lastSpace = cut.lastIndexOf(' ');
+  return `${(lastSpace > 24 ? cut.slice(0, lastSpace) : cut).replace(/[,;:.\s]+$/, '')}…`;
 }
 
 /**
  * Evict one capability entry: the last one not marked `retainUnderBudget`,
  * or the last outright once only retained ones remain. The host's
- * `evictCapability` (src/modules/memory/pre-turn-context.ts:1590) applies the same
+ * `evictCapability` (src/modules/memory/pre-turn-context.ts:1629) applies the same
  * rule to the host-built bootstrap; this fallback must not drop an entry the
  * host would have kept.
  */
@@ -60,31 +105,31 @@ function readCapabilitiesFrom(filePath: string): {
 } {
   try {
     const root = JSON.parse(fs.readFileSync(filePath, 'utf8')) as {
-      session?: { agentGroupId?: unknown; services?: unknown };
+      session?: { agentGroupId?: unknown; howToUse?: unknown; services?: unknown };
     };
     const session = root.session;
     if (!session || !Array.isArray(session.services)) throw new Error('session capability snapshot is missing');
     const selectedRaw = [...(session.services as unknown[])];
     while (selectedRaw.length > MAX_CAPABILITY_SERVICES) evictCapability(selectedRaw);
+    // Same reduction the host applies (`buildCapabilityRoster`,
+    // src/capabilities.ts): a roster line per service, not the mini-manual.
+    // The prose stays in the mounted snapshot, whole, and the agent fetches
+    // one service's worth of it with `get_capabilities({ service })`.
     const services = selectedRaw.map((raw) => {
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
       const service = raw as Record<string, unknown>;
+      const via = boundedString(service.mcpNamespace) ?? boundedString(service.cli) ?? '';
+      const use = rosterUse(service);
       return {
         name: boundedString(service.name) ?? 'Unknown service',
-        ...(boundedString(service.cli) === undefined ? {} : { cli: boundedString(service.cli) }),
-        ...(boundedString(service.mcpNamespace) === undefined
-          ? {}
-          : { mcpNamespace: boundedString(service.mcpNamespace) }),
-        declaredTools: boundedStringArray(service.declaredTools),
-        scopes: boundedStringArray(service.scopes),
-        credentialPaths: boundedStringArray(service.credentialPaths),
-        ...(boundedString(service.activation) === undefined ? {} : { activation: boundedString(service.activation) }),
-        ...(boundedString(service.useFor) === undefined ? {} : { useFor: boundedString(service.useFor) }),
+        via,
+        ...(use === undefined ? {} : { use }),
         ...(service.retainUnderBudget === true ? { retainUnderBudget: true } : {}),
       };
     });
     const snapshot = {
       agentGroupId: boundedString(session.agentGroupId) ?? 'unknown',
+      howToUse: boundedString(session.howToUse) ?? FALLBACK_HOW_TO_USE,
       services,
     };
     let truncatedServices = session.services.length - services.length;
@@ -95,7 +140,7 @@ function readCapabilitiesFrom(filePath: string): {
     return { snapshot, ...(truncatedServices > 0 ? { truncatedServices } : {}) };
   } catch (error) {
     return {
-      snapshot: { agentGroupId: 'unknown', services: [] },
+      snapshot: { agentGroupId: 'unknown', howToUse: FALLBACK_HOW_TO_USE, services: [] },
       degraded: error instanceof Error ? error.message : String(error),
     };
   }
@@ -169,26 +214,29 @@ export function ensureFreshContextBootstrap(
     });
   }
 
-  const bootstrap = formatRecallContext({
-    trustedCapabilities: capabilities.snapshot,
-    memoryEvidence: {
-      core:
-        index.text === undefined
-          ? []
-          : [
-              {
-                path: 'index.md',
-                headings: [],
-                text: index.text,
-                score: Number.MAX_SAFE_INTEGER,
-                provenance: { authority: 'workgroup-memory-canon' },
-              },
-            ],
-      excerpts: [],
-    },
-    conversationEvidence: { excerpts: [] },
-    notices,
-  });
+  let indexText = index.text;
+  const render = (): string =>
+    formatRecallContext({
+      trustedCapabilities: capabilities.snapshot,
+      memoryEvidence: {
+        core:
+          indexText === undefined
+            ? []
+            : [
+                {
+                  path: 'index.md',
+                  headings: [],
+                  text: indexText,
+                  score: Number.MAX_SAFE_INTEGER,
+                  provenance: { authority: 'workgroup-memory-canon' },
+                },
+              ],
+        excerpts: [],
+      },
+      conversationEvidence: { excerpts: [] },
+      notices,
+    });
+  let bootstrap = render();
   const evidencePattern =
     /\[Untrusted recalled evidence[^\n]*\]\n[\s\S]*?<untrusted_recall_json>[\s\S]*?<\/untrusted_recall_json>/g;
   const limit = prompt.includes('"rank":"exact-link"') ? EXACT_LINK_RECALL_CHARS : NORMAL_RECALL_CHARS;
@@ -201,11 +249,47 @@ export function ensureFreshContextBootstrap(
     evidenceBlocks = [...boundedPrompt.matchAll(evidencePattern)];
     recalledChars = bootstrap.length + evidenceBlocks.reduce((sum, match) => sum + match[0].length, 0);
   }
+
+  // With the evidence blocks gone the bootstrap can still be over the ceiling
+  // on its own — MAX_CAPABILITY_JSON_CHARS plus a full MAX_INDEX_BYTES index
+  // exceeds NORMAL_RECALL_CHARS — and the loop above has nothing left to
+  // remove. Shed the rest in the host's own order (`enforceFinalBound`,
+  // src/modules/memory/pre-turn-context.ts): memory core first, capability
+  // entries last, so the roster is the final thing to go. Both loops
+  // terminate — the index halves to nothing, and `evictCapability` always
+  // removes an entry.
+  let shedIndex = false;
+  while (bootstrap.length > limit && indexText !== undefined) {
+    indexText =
+      indexText.length > 512 ? `${indexText.slice(0, Math.floor(indexText.length / 2))}${TRUNCATED}` : undefined;
+    if (!shedIndex) {
+      shedIndex = true;
+      notices.push({
+        source: 'markdown',
+        status: 'truncated',
+        code: 'runner-index-bootstrap-truncated',
+        detail: 'shortened index.md to keep the fresh-context bootstrap inside the recall ceiling',
+      });
+    }
+    bootstrap = render();
+  }
+  let shedServices = 0;
+  while (bootstrap.length > limit && capabilities.snapshot.services.length > 0) {
+    evictCapability(capabilities.snapshot.services);
+    shedServices++;
+    if (shedServices === 1) {
+      notices.push({
+        source: 'capabilities',
+        status: 'truncated',
+        code: 'runner-capability-bootstrap-truncated',
+        detail: 'dropped service entries to keep the fresh-context bootstrap inside the recall ceiling',
+      });
+    }
+    bootstrap = render();
+  }
   // A native slash command reaches this runner as raw text specifically so the
   // provider SDK can dispatch it. Keep that token at byte zero even when a
   // cold-context bootstrap is needed; otherwise the bootstrap turns a native
   // command back into ordinary prompt text before the provider sees it.
-  return boundedPrompt.startsWith('/')
-    ? `${boundedPrompt}\n\n${bootstrap}`
-    : `${bootstrap}\n\n${boundedPrompt}`;
+  return boundedPrompt.startsWith('/') ? `${boundedPrompt}\n\n${bootstrap}` : `${bootstrap}\n\n${boundedPrompt}`;
 }

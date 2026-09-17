@@ -103,8 +103,20 @@ export interface HostCapabilities {
 
 export interface SessionServicesSnapshot {
   agentGroupId: string;
+  /**
+   * The standing instruction that heads the pre-turn roster. Carried on the
+   * snapshot (rather than only in host code) so the runner's fresh-context
+   * fallback renders the SAME two sentences from the mounted
+   * `/workspace/capabilities.json` instead of keeping its own copy to drift
+   * (container/agent-runner/src/memory/bootstrap.ts).
+   */
+  howToUse?: string;
   services: Array<{
-    /** Human label, e.g. "Google Workspace". */
+    /**
+     * Human label, e.g. "Google Workspace". Also the lookup key for
+     * `get_capabilities({ service })`, which matches case-insensitively on
+     * this, on `cli`, and on `mcpNamespace` — so keep it short and typeable.
+     */
     name: string;
     /** CLI binary the agent invokes. Omitted for MCP-only services. */
     cli?: string;
@@ -118,6 +130,20 @@ export interface SessionServicesSnapshot {
     credentialPaths: string[];
     /** Concise activation instruction for the CLI, if any. */
     activation?: string;
+    /**
+     * The one line this service gets in the ALWAYS-ON pre-turn roster: what it
+     * is good for, short enough that every wired service fits the block. Aim
+     * at ~80 characters — the roster's whole job is awareness ("you have this,
+     * never say you don't"), and the how-to prose below (`useFor` /
+     * `activation`) is what the agent fetches on demand with
+     * `get_capabilities({ service })` before first use.
+     *
+     * Hand-written for the hand-written entries; derived from an MCP server's
+     * stored `description` for the derived ones (`summarizeCapabilityText`).
+     * Absent means the roster derives one from `activation`/`useFor`, which is
+     * a fallback, not the intent.
+     */
+    summary?: string;
     /**
      * When the host's cached copy of this credential expires (ISO-8601), for
      * short-TTL tokens like GitHub App installation tokens. Precision matters:
@@ -137,11 +163,11 @@ export interface SessionServicesSnapshot {
      * Never evicted by a capability budget while any entry without it can be
      * evicted instead. For an entry whose absence makes the agent deny an
      * ability it has. Honoured through `evictCapability`
-     * (src/modules/memory/pre-turn-context.ts:1590) at all three host eviction
-     * sites — the service-count limit (:1612), the total budget
-     * (:1664) and `enforceFinalBound` (:1710) — and by the runner's
+     * (src/modules/memory/pre-turn-context.ts:1629) at all three host eviction
+     * sites — the service-count limit (:1642), the total budget
+     * (:1695) and `enforceFinalBound` (:1741) — and by the runner's
      * fresh-context fallback through its own `evictCapability`
-     * (container/agent-runner/src/memory/bootstrap.ts:41, called at :68 and :92).
+     * (container/agent-runner/src/memory/bootstrap.ts:65, called at :92 and :116).
      */
     retainUnderBudget?: boolean;
   }>;
@@ -176,6 +202,91 @@ export function renderSessionCapabilities(snapshot: SessionServicesSnapshot): st
   }
   lines.push('');
   return lines.join('\n');
+}
+
+/**
+ * The two sentences that head the always-on capability roster.
+ *
+ * Sentence one is the whole reason the block exists: agents were telling
+ * users "I can't do that" about tools sitting wired in their own container.
+ * Sentence two is what makes the roster affordable — the mini-manual for any
+ * one service is a tool call away, so the block does not have to carry 23 of
+ * them (13,247 chars on the widest live group, against a 10,000 budget that
+ * silently dropped six services from the end, Hex and Looker among them).
+ */
+export const CAPABILITY_ROSTER_PREAMBLE =
+  'EVERY service listed here is wired into THIS session right now — never tell the user you lack one of them, and never ask for its credentials. ' +
+  'These are one-line reminders, not instructions: before you first use a service in a session, call `get_capabilities` with `{"service":"<name>"}` for its full usage notes (auth, exact tool names, known failure shapes).';
+
+/** One roster line: the name, how you reach it, and a short hint. */
+export interface CapabilityRosterEntry {
+  /** Lookup key for `get_capabilities({ service })`. */
+  name: string;
+  /** How the agent reaches it — `mcp__looker__*`, `gws`, `curl`, … */
+  via: string;
+  /** ~80-char hint. Absent only when a service carries no text at all. */
+  use?: string;
+  /** Short-TTL credential expiry; see SessionServicesSnapshot.services.expiresAt. */
+  expiresAt?: string;
+  /** See SessionServicesSnapshot.services.retainUnderBudget. */
+  retainUnderBudget?: boolean;
+}
+
+/** What the pre-turn block carries, in place of the full snapshot. */
+export interface CapabilityRoster {
+  agentGroupId: string;
+  howToUse: string;
+  services: CapabilityRosterEntry[];
+}
+
+/**
+ * Fallback hint for an entry authored without a `summary`: the leading clause
+ * of its how-to prose, cut at a word boundary so the line never ends mid-word.
+ *
+ * Cutting at a sentence end first keeps the common case readable; the
+ * character cut is the backstop for a first sentence that runs long.
+ */
+export function summarizeCapabilityText(text: string, limit = 96): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  if (flat.length <= limit) return flat;
+  const sentence = flat.slice(0, limit + 1).match(/^(.*?[.!?])\s/);
+  if (sentence?.[1] && sentence[1].length >= 24) return sentence[1];
+  const cut = flat.slice(0, limit);
+  const lastSpace = cut.lastIndexOf(' ');
+  return `${(lastSpace > 24 ? cut.slice(0, lastSpace) : cut).replace(/[,;:.\s]+$/, '')}…`;
+}
+
+/**
+ * Reduce a full services snapshot to the always-on roster.
+ *
+ * This is the shape the pre-turn block carries. It is deliberately lossy: the
+ * `useFor` / `activation` prose stays in `/workspace/capabilities.json`, whole
+ * and byte-identical, and reaches the agent through
+ * `get_capabilities({ service })`. Budget eviction
+ * (`src/modules/memory/pre-turn-context.ts`) still runs over the result, but
+ * on a roster this size it is a safety net rather than the thing that decides
+ * which services an agent is told it has.
+ */
+export function buildCapabilityRoster(snapshot: SessionServicesSnapshot): CapabilityRoster {
+  return {
+    agentGroupId: snapshot.agentGroupId,
+    howToUse: snapshot.howToUse ?? CAPABILITY_ROSTER_PREAMBLE,
+    services: snapshot.services.map((service) => {
+      const use = service.summary ?? rosterFallbackUse(service);
+      return {
+        name: service.name,
+        via: service.mcpNamespace ?? service.cli ?? '',
+        ...(use === undefined ? {} : { use }),
+        ...(service.expiresAt === undefined ? {} : { expiresAt: service.expiresAt }),
+        ...(service.retainUnderBudget ? { retainUnderBudget: true as const } : {}),
+      };
+    }),
+  };
+}
+
+function rosterFallbackUse(service: SessionServicesSnapshot['services'][number]): string | undefined {
+  const text = service.activation ?? service.useFor;
+  return text === undefined ? undefined : summarizeCapabilityText(text);
 }
 
 /** Env names we scope per-agent-group (must stay in sync with SCOPED_CREDENTIAL_VARS in container-runner). */
@@ -384,11 +495,18 @@ export function buildSessionServicesSnapshotFrom(
     const accounts = listAccounts(hostDir);
     const effective = scopes.size > 0 ? accounts.filter((a) => scopes.has(a)) : accounts;
     services.push({
-      name: 'Google Workspace (Gmail / Calendar / Drive / Docs / Sheets / Slides)',
+      // Short enough to be a roster line and a typeable `get_capabilities`
+      // key; the product list it used to carry moved into `summary`, which is
+      // where an ~80-char hint belongs.
+      name: 'Google Workspace',
       cli: 'gws',
       declaredTools: gwsDeclared,
       scopes: [...scopes].sort(),
       credentialPaths: effective.map((a) => `/home/node/.config/gws/accounts/${a}.json`),
+      summary:
+        effective.length > 0
+          ? `Gmail, Calendar, Drive, Docs, Sheets, Slides as ${effective.join(', ')} (export the creds file first)`
+          : 'Gmail, Calendar, Drive, Docs, Sheets, Slides — no authenticated account file on the host',
       activation:
         effective.length > 0
           ? `export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/<name>.json (valid names: ${effective.join(', ')}). Verify with \`gws auth status\` — WITHOUT this env var gws reports auth_method: none even though creds are mounted.`
@@ -408,6 +526,10 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: declaredMatchingTools(['snowflake']),
       scopes: effective,
       credentialPaths: ['/home/node/.snowflake/connections.toml'],
+      summary:
+        effective.length > 0
+          ? `Run SQL on the warehouse: \`snow sql -c ${effective[0]}\` (connections: ${effective.join(', ')})`
+          : 'SQL on the warehouse — no matching connection in connections.toml',
       activation:
         effective.length > 0
           ? `snow sql -q "SELECT ..." -c <connection>. Valid connections in this session: ${effective.join(', ')}.`
@@ -426,6 +548,10 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: declaredMatchingTools(['aws']),
       scopes: effective,
       credentialPaths: ['/home/node/.aws/credentials'],
+      summary:
+        effective.length > 0
+          ? `AWS CLI against profiles ${effective.join(', ')} (pass --profile)`
+          : 'AWS CLI — credentials mounted but no matching scoped profile',
       activation:
         effective.length > 0
           ? `aws --profile <name> <command>. Valid profiles in this session: ${effective.join(', ')}. Verify with \`aws sts get-caller-identity --profile <name>\`.`
@@ -445,6 +571,10 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: declaredMatchingTools(['dbt']),
       scopes: effective,
       credentialPaths: ['/home/node/.dbt/profiles.yml'],
+      summary:
+        effective.length > 0
+          ? `dbt CLI (run/compile/test/build) on profiles ${effective.join(', ')}`
+          : 'dbt CLI — profiles.yml mounted but no matching scoped profile',
       activation:
         effective.length > 0
           ? `dbt run --profile <name> --project-dir <path> (also compile/test/build). Valid profiles in this session: ${effective.join(', ')}.`
@@ -465,6 +595,7 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: [],
       scopes: [],
       credentialPaths: [],
+      summary: 'dbt Cloud Admin/Discovery REST — token already in your env, send no auth header of your own',
       activation: `Authenticated via \`DBT_CLOUD_API_TOKEN\` (resolved from host env \`${dbtCloudToken.name}\`)${
         dbtCloudUrl.set
           ? `, base URL via \`${dbtCloudUrl.name}\``
@@ -508,6 +639,9 @@ export function buildSessionServicesSnapshotFrom(
         declaredTools: declaredMatchingTools(['github']),
         scopes: scopeList,
         credentialPaths: [],
+        summary: resolved.set
+          ? '`gh` and the VCS CLI are pre-authenticated: repos, PRs, pushes, and CI/Actions status'
+          : 'GitHub declared but no token resolved on the host — ask the operator',
         activation: resolved.set
           ? `\`gh\` and \`git\` both pre-authenticated from host env \`${resolved.name}\`${githubTokenDeliveredAsEnv() ? `, forwarded to you as \`GITHUB_TOKEN\`` : ` and delivered as a read-only file at \`${GH_TOKEN_CONTAINER_PATH}\` — the git credential helper and the \`gh\` shim read it per invocation, so the host's hourly re-mint reaches you without a restart, and there is deliberately no \`GITHUB_TOKEN\` in your env`}${
               allowedOrgs.set ? `, restricted to orgs: \`${process.env[allowedOrgs.name]}\`` : ''
@@ -539,6 +673,9 @@ export function buildSessionServicesSnapshotFrom(
         declaredTools: declaredMatchingTools(['render']),
         scopes: scopeList,
         credentialPaths: [],
+        summary: apiKey.set
+          ? 'Render CLI: list services, tail logs, psql into managed Postgres'
+          : 'Render declared but RENDER_API_KEY is unset on the host — ask the operator',
         activation: apiKey.set
           ? `\`render\` CLI authenticated via \`RENDER_API_KEY\` (from host env \`${apiKey.name}\`${workspace.set ? `, workspace via \`${workspace.name}\`` : ''}). Common: \`render services -o json\`, \`render logs --service-id <id>\`, \`render psql --service-id <pg-id>\`.${scopedDbEnv.length > 0 ? ` Scoped DB URLs also injected as env vars: ${scopedDbEnv.join(', ')}.` : ''} DO NOT ask the user for the API key — it's already in your env.`
           : `render tool declared but RENDER_API_KEY not set at host — ask Operator.`,
@@ -549,13 +686,16 @@ export function buildSessionServicesSnapshotFrom(
   // Where the derived MCP entries land. The five universals that moved into
   // the fleet file (exa, deepwiki, context7, pocket, granola) were pushed
   // exactly here, and both capability budgets evict from the END
-  // (`evictCapability`, src/modules/memory/pre-turn-context.ts:1590-1595), so
+  // (`evictCapability`, src/modules/memory/pre-turn-context.ts:1629-1634), so
   // appending them instead would have moved every one of them into the
-  // eviction zone on the widest-wired groups — the ones measured at 19
-  // services / 8,954 chars before this change and 22 / 9,773 after, against a
-  // 10,000-char budget (`PRE_TURN_BOUNDS.capabilityTotalChars`) that eats
-  // backwards from the end. The entries are built at the end of this function, where every
-  // hand-written `mcpNamespace` is known, and spliced in at this index.
+  // eviction zone. The 19 -> 22 services / 8,954 -> 9,773 chars figure quoted
+  // in `src/capabilities.test.ts` is that file's own hermetic wide-group
+  // fixture, not a production group — the widest LIVE group measured 23
+  // services / 13,247 chars of raw snapshot when the roster replaced the
+  // full-prose block, i.e. six services past the 10,000-char budget
+  // (`PRE_TURN_BOUNDS.capabilityTotalChars`). The entries are built at the end
+  // of this function, where every hand-written `mcpNamespace` is known, and
+  // spliced in at this index.
   const derivedMcpIndex = services.length;
 
   // Linear — gated by tool entry. Container-runner injects when 'linear' is in
@@ -570,6 +710,7 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: declaredMatchingTools(['linear']),
       scopes: [],
       credentialPaths: [],
+      summary: 'Linear issue tracker: search/create/update issues, comments, projects, cycles',
       useFor:
         'Linear issue tracker via https://mcp.linear.app/mcp. Auth pre-injected (Authorization: Bearer). Use for: list/search/create/update issues, comments, projects, cycles, teams, users. Tools: `mcp__linear__*`.',
     });
@@ -587,6 +728,7 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: declaredMatchingTools(['datafold']),
       scopes: [],
       credentialPaths: [],
+      summary: 'Datafold: list data sources, query them, run Data Diff workflows',
       useFor:
         'Official Datafold Streamable HTTP MCP at https://app.datafold.com/mcp/. Auth pre-injected as `Authorization: Key ...`. Use for listing Datafold data sources, running queries against configured data sources, and managing Data Diff workflows. Tools appear under `mcp__datafold__*` after a fresh container wake.',
     });
@@ -599,11 +741,17 @@ export function buildSessionServicesSnapshotFrom(
   if (declared(['atlassian'])) {
     const baseUrl = resolveScopedEnvVar('ATLASSIAN_BASE_URL', folder);
     services.push({
-      name: 'Atlassian (Jira + Confluence)',
+      // Renamed from "Atlassian (Jira + Confluence)": the product list belongs
+      // in the roster hint, and the name doubles as the lookup key for
+      // `get_capabilities({ service })`.
+      name: 'Atlassian',
       mcpNamespace: 'mcp__atlassian__*',
       declaredTools: declaredMatchingTools(['atlassian']),
       scopes: [],
       credentialPaths: [],
+      summary: baseUrl.set
+        ? 'Jira + Confluence, ~72 tools: JQL/CQL search, issues, transitions, pages, comments'
+        : 'Jira + Confluence declared but ATLASSIAN_BASE_URL is unset — ask the operator',
       useFor: baseUrl.set
         ? `Jira + Confluence via sooperset/mcp-atlassian (direct REST against ${process.env[baseUrl.name]}). Auth pre-injected (Authorization: Basic). ~72 typed tools — Jira: \`mcp__atlassian__jira_search\`, \`jira_get_issue\`, \`jira_create_issue\`, \`jira_update_issue\`, \`jira_add_comment\`, \`jira_get_transitions\`, \`jira_transition_issue\`, project/sprint/board ops, attachments. Confluence: \`mcp__atlassian__confluence_search\`, \`confluence_get_page\`, \`confluence_create_page\`, \`confluence_update_page\`, \`confluence_get_comments\`. Use JQL for Jira search and CQL for Confluence search. NOT available via this surface: Compass and Teamwork Graph.`
         : `Atlassian tool declared but ATLASSIAN_BASE_URL is not configured for this agent group. Ask the operator to set the scoped host value before using Jira or Confluence.`,
@@ -628,6 +776,9 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: declaredMatchingTools(['dbt-mcp']),
       scopes: [],
       credentialPaths: [],
+      summary: credsReady
+        ? 'Model lineage/health, Semantic Layer metrics, execute_sql, job-run history (read-only)'
+        : 'dbt-mcp declared but its host credentials are incomplete — ask the operator',
       useFor: credsReady
         ? `dbt Cloud via dbt-labs/dbt-mcp on \`${process.env[host.name]}\` (prod env \`${process.env[prodEnvId.name]}\`). Discovery API (project intelligence): \`mcp__dbt-mcp__get_all_models\`, \`get_mart_models\`, \`get_model_details\`, \`get_model_parents\`, \`get_model_children\`, \`get_lineage\`, \`get_model_health\`, \`get_model_performance\`, \`get_related_models\`, \`get_exposures\`, \`get_all_macros\`, \`get_all_sources\`, \`search\`. Semantic Layer: \`list_metrics\`, \`query_metrics\`, \`list_saved_queries\`, \`get_dimensions\`, \`get_entities\`, \`get_metrics_compiled_sql\`. SQL on dbt Platform: \`execute_sql\`, \`text_to_sql\`. Admin API (read-only by default — \`trigger_job_run\`, \`cancel_job_run\`, \`retry_job_run\` are disabled): \`list_projects\`, \`list_jobs\`, \`get_job_details\`, \`list_jobs_runs\`, \`get_job_run_details\`, \`get_job_run_error\`, \`list_job_run_artifacts\`. dbt CLI and LSP toolsets are disabled (no local project mounted). For ad-hoc Cloud REST not exposed here, fall back to \`curl -H "Authorization: Token $DBT_CLOUD_API_TOKEN_${folder.toUpperCase().replace(/-/g, '_')}"\`.`
         : `dbt-mcp tool declared but credentials missing: ${[!host.set && 'DBT_HOST', !token.set && 'DBT_CLOUD_API_TOKEN', !prodEnvId.set && 'DBT_PROD_ENV_ID'].filter(Boolean).join(', ')} not set on host (looked for \`*_${folder.toUpperCase().replace(/-/g, '_')}\` then unscoped fallback). Ask the operator.`,
@@ -650,6 +801,9 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: declaredMatchingTools(['looker']),
       scopes: [],
       credentialPaths: [],
+      summary: credsReady
+        ? 'Query explores, run raw SQL, inspect LookML, run saved Looks and dashboards'
+        : 'Looker declared but its host credentials are incomplete — ask the operator',
       useFor: credsReady
         ? `Looker via Google's MCP Toolbox (--prebuilt looker), instance \`${process.env[baseUrl.name]}\`. Auth via API3 client_id/client_secret (resolved from host env \`${clientId.name}\`). Use for: LookML inspection (\`mcp__looker__get_projects\`, \`get_project_files\`, \`get_project_file\`), inline queries against explores (\`mcp__looker__query\`), raw SQL (\`mcp__looker__query_sql\`), rerunning a UI URL (\`mcp__looker__query_url\`), browsing models/explores/dimensions/measures, listing/running saved Looks and dashboards, warehouse schema introspection (\`get_connection_*\`). Gaps: scheduled plans, alerts, user/role admin, PDT controls — fall back to direct Looker REST API via \`curl\` if needed.`
         : `Looker tool declared but credentials missing: ${[!baseUrl.set && 'LOOKER_BASE_URL', !clientId.set && 'LOOKER_CLIENT_ID', !clientSecret.set && 'LOOKER_CLIENT_SECRET'].filter(Boolean).join(', ')} not set on host (looked for \`*_${folder.toUpperCase().replace(/-/g, '_')}\` then unscoped fallback). Ask the operator.`,
@@ -674,6 +828,9 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: declaredMatchingTools(['hex']),
       scopes: [],
       credentialPaths: ['/workspace/extra/.local/share/hex/default-credentials.json'],
+      summary: credsExist
+        ? 'Hex CLI: list/read/run projects and cells, export project YAML, Context Studio, guides'
+        : 'Hex declared but the host holds no `hex auth login` credentials — ask the operator',
       activation: credsExist
         ? `\`hex\` CLI ready. Skill at \`/app/skills/hex/SKILL.md\` documents the full command surface. Common verbs: \`hex projects list --json\`, \`hex project get <id> --json\`, \`hex cell list --project-id <id> --json\`, \`hex cell run <cell-id>\`, \`hex project run <id> --watch\`, \`hex suggestion list --json\` (Context Studio), \`hex guide preview\` then \`hex guide publish <preview-id>\`, \`hex project export <id> > project.yaml\`. Always pass \`--json\` when parsing programmatically. If \`hex auth status\` reports not authenticated, the host operator needs to re-run \`hex auth login\` — do NOT attempt OAuth from inside the container.`
         : `Hex tool declared but \`~/.local/share/hex/\` is empty on the host. Ask the operator to run \`hex auth login\` on the host once. Mount allowlist: \`/home/ubuntu\` is already covered (no /manage-mounts call needed).`,
@@ -702,7 +859,7 @@ export function buildSessionServicesSnapshotFrom(
   // `retainUnderBudget`: this entry is what stops the agent telling the owner
   // it can't read a Slack link, and it was the one the pre-turn capability
   // budget dropped (it sits late in this list and budget eviction pops from
-  // the end). See evictCapability, src/modules/memory/pre-turn-context.ts:1590.
+  // the end). See evictCapability, src/modules/memory/pre-turn-context.ts:1629.
   const mergedSecrets = mergeWorkgroupAndGroupSecrets(central.workgroupSecrets, cfg?.onecliSecrets);
   const hasSlackSecret = slackUserTokenSecrets(mergedSecrets, cfg?.slack_user_token?.onecli_secret_names).length > 0;
   if (hasSlackSecret) {
@@ -725,6 +882,10 @@ export function buildSessionServicesSnapshotFrom(
     const archive =
       '`resolve_thread_link` resolves a pasted Slack OR Discord permalink from the workgroup chat archive (`/workspace/archive.db`) in any session. ';
     let useFor: string;
+    // The roster line, not a shortened manual. The withheld branch is the one
+    // case where the hint changes what the agent may DO, so it says so first
+    // and in full — a truncated "WITHHELD…" would read as availability.
+    let summary: string;
     if (sessionKnown && !ownerSafe) {
       // Shared session: Slack is genuinely withheld here. Be explicit so the
       // agent does NOT try curl and does NOT promise the owner a read.
@@ -732,6 +893,8 @@ export function buildSessionServicesSnapshotFrom(
         'WITHHELD IN THIS SESSION (by design): this session is not one of the owner’s private/owner-safe Slack contexts (their 1:1 DM, or a messaging group in `slack_user_token.also_allowed_in`), so the Slack user token is NOT injected into your OneCLI agent. You CANNOT read the owner’s Slack DMs/channels/threads here — `curl https://slack.com/api/*` will fail auth. This protects the owner’s Slack from being queried by others through you. (Unrelated to `session_mode` — every channel is still per-thread; this is purely about whose Slack credentials are in scope.) ' +
         archive +
         'If you genuinely need live Slack here, tell the owner to add this messaging group to `slack_user_token.also_allowed_in`.';
+      summary =
+        'WITHHELD IN THIS SESSION — no live Slack read/write here, by design. Pasted permalinks still resolve from the chat archive.';
     } else if (sessionKnown) {
       useFor =
         'LIVE in THIS session: `curl https://slack.com/api/<method>` with NO auth header — the OneCLI gateway injects the owner’s user token; there is no Slack MCP. PERMALINK `…/archives/C0123/p1789080120758779` → channel `C0123`, ts `1789080120.758779` (dot before the last 6 digits); read it with `conversations.replies?channel=C0123&ts=<the link’s thread_ts if present, else that ts>`. Also `conversations.history`, `search.messages`, `users.info`, `conversations.list`, `auth.test`. ' +
@@ -739,11 +902,14 @@ export function buildSessionServicesSnapshotFrom(
         'FILES: `url_private` bytes live on `files.slack.com`, a SEPARATE credential. Try `curl -sSL -o <path> "<url_private>"`, no auth header, then check it: `text/html` or a leading `<!DOCTYPE` is Slack’s login page — that host is not wired here; say so and stop. Operator fix: a second vault entry, same token, host `files.slack.com`, path `*`, withheld like the first (see docs/slack-user-token.md). ' +
         archive +
         'Bottom line: never tell the owner you can’t read a Slack DM/thread/link without first trying `curl https://slack.com/api/auth.test` and the method above.';
+      summary = 'LIVE here: slack.com/api by curl with NO auth header — read DMs/channels/threads/permalinks';
     } else {
       useFor =
         'Scoped to owner-safe Slack contexts (NOT `session_mode`): the owner’s 1:1 DM or a messaging group in `slack_user_token.also_allowed_in`; withheld everywhere else. Where present, all Slack read/write is `curl https://slack.com/api/<method>` with NO auth header (the OneCLI gateway injects the user token) — `conversations.history`/`conversations.replies` for a permalink (`p1789080120758779` → ts `1789080120.758779`), `search.messages`, `users.info`, and `chat.postMessage` if the token has `chat:write`. There is no Slack MCP. ' +
         archive +
         'Bottom line: confirm for the current session with `curl https://slack.com/api/auth.test` or `get_capabilities` before telling the owner you can’t read something.';
+      summary =
+        'slack.com/api by curl with NO auth header — only in the owner’s own Slack contexts; confirm with auth.test';
     }
     services.push({
       name: 'Slack',
@@ -751,6 +917,7 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: [],
       scopes: [],
       credentialPaths: [],
+      summary,
       useFor,
       retainUnderBudget: true,
     });
@@ -769,6 +936,7 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: declaredMatchingTools(['cloudflare']),
       scopes: folder ? [folder] : [],
       credentialPaths: [],
+      summary: 'Cloudflare account APIs (DNS, Workers, Pages, R2) via docs → search → execute',
       useFor:
         'Official Cloudflare API MCP at https://mcp.cloudflare.com/mcp — auth pre-injected as `Authorization: Bearer`; do NOT ask for or send the token. Use `mcp__cloudflare-api__docs` for Cloudflare product documentation, `mcp__cloudflare-api__search` to locate the correct OpenAPI endpoint, then `mcp__cloudflare-api__execute` to call it. The server pre-selects the account from the token and exposes its `accountId` to execute code. Covers Cloudflare account APIs such as DNS, Workers, Pages, and R2 API endpoints, subject to the token’s granted permissions. Diagnosing Cloudflare auth failures — `mcp.cloudflare.com` and `api.cloudflare.com` are separately credentialed, so name the one that is actually broken instead of reporting "no Cloudflare access". `1000: Invalid API Token` does NOT by itself mean the token is bad — this install uses an ACCOUNT-scoped API token, and account tokens legitimately return `1000` on USER-scoped endpoints like `/user/tokens/verify`. Probe with an account-scoped call (`GET /accounts`) before concluding anything; a real `1000` there means the stored token is stale or rotated, and retrying cannot fix it. Never verify with `/user/tokens/verify` — it has produced a false "credential is dead" diagnosis twice. `1001 Missing "Authorization" header` from `api.cloudflare.com` means the opposite: nothing was injected on that host, because direct API access is wired separately (its own host-scoped OneCLI secret, or the OneCLI Cloudflare app connection) and may not be set up here. Distinguish them before concluding — `onecli apps get --provider cloudflare` shows whether the app connection exists (`connection: null` = not connected). Never add your own `Authorization` header to test any of this: on a host the gateway does not cover, your header is passed through and Cloudflare rejects its FORMAT (`6003`/`6111`), which reads like a token problem and has already caused a wrong diagnosis once. Send no header and read the error. Note `wrangler` is NOT installed in this container — deploys go through the REST API (Workers script upload, Pages Direct Upload), which is also the route that gets gateway injection. The separate S3-compatible access-key/secret pair is not exposed through this MCP; do not attempt AWS SDK/CLI access or claim direct S3 access unless a signing-capable S3 client is separately wired.',
     });
@@ -794,10 +962,21 @@ export function buildSessionServicesSnapshotFrom(
     }
     services.push({
       name: 'Wix',
-      cli: hasWixCli ? 'wix' : undefined,
+      // `curl` when only the REST secret is wired, not `undefined`: the roster
+      // renders `via` from `mcpNamespace ?? cli`, and this was the one entry
+      // that could produce a line with no "how you reach it" at all. `curl` is
+      // what every other gateway-injected REST entry here uses (Slack, SELECT,
+      // Profound, Fivetran), and it is a lookup handle for `get_capabilities`.
+      cli: hasWixCli ? 'wix' : 'curl',
       declaredTools: [],
       scopes: [],
       credentialPaths: hasWixCli ? ['/home/node/.wix/auth/account.json'] : [],
+      summary: [
+        hasWixSecret ? 'www.wixapis.com REST (you supply the wix-site-id / wix-account-id header)' : '',
+        hasWixCli ? '`wix` CLI for Velo page code and publish' : '',
+      ]
+        .filter(Boolean)
+        .join('; '),
       useFor: parts.join(' '),
     });
   }
@@ -809,11 +988,16 @@ export function buildSessionServicesSnapshotFrom(
     const selectOrg = resolveScopedEnvVar('SELECT_ORGANIZATION_ID', folder);
     const organizationPath = selectOrg.set ? process.env[selectOrg.name] : '<organization_id>';
     services.push({
-      name: 'SELECT (select.dev)',
+      // Renamed from "SELECT (select.dev)" — the domain belongs in the hint,
+      // and the name doubles as the `get_capabilities` lookup key.
+      name: 'SELECT',
       cli: 'curl',
       declaredTools: [],
       scopes: folder ? [folder] : [],
       credentialPaths: [],
+      summary: selectOrg.set
+        ? 'api.select.dev — Snowflake cost & usage analytics; routes are organization-scoped'
+        : 'api.select.dev — Snowflake cost & usage; SELECT_ORGANIZATION_ID unset, ask the operator',
       useFor: `Snowflake cost & usage analytics REST API at https://api.select.dev — auth pre-injected as \`Authorization: Bearer\` (send NO auth header; the OneCLI gateway adds it at the boundary). Routes are organization-scoped: \`GET /api/${organizationPath}/...\` (for example \`/users\` and \`/usage-group-sets\`). ${selectOrg.set ? 'The organization id is configured for this agent group.' : 'SELECT_ORGANIZATION_ID is not configured for this agent group; ask the operator to set the scoped host value before calling the API.'} SELECT validates the key against the organization in the path, so a wrong or missing organization can return 401 even when the key is valid. Docs: https://api-docs.select.dev/ (route index at /llms.txt).`,
     });
   }
@@ -828,6 +1012,7 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: [],
       scopes: folder ? [folder] : [],
       credentialPaths: [],
+      summary: 'api.tryprofound.com — AI-search visibility, citations, sentiment, referral reports',
       useFor:
         'Profound REST/reporting API at https://api.tryprofound.com — auth pre-injected as `X-API-Key` (send NO auth header; the OneCLI gateway adds it at the boundary). Use for Profound organization discovery and reports: `GET /v1/org/categories`, `/v1/org/domains`, `/v1/org/models`, `/v1/org/regions`; report pulls such as `POST /v1/reports/visibility`, `/citations`, `/sentiment`, `/query-fanouts`, `/v1/prompts/answers`, `/v2/reports/referrals`, and `/v2/reports/bots`.',
     });
@@ -843,6 +1028,7 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: [],
       scopes: [],
       credentialPaths: [],
+      summary: 'api.fivetran.com — inspect and manage ingestion groups, connectors, users',
       useFor:
         'Data-ingestion / connector management REST API at https://api.fivetran.com (e.g. `GET /v1/groups`, `/v1/connectors`, `/v1/users`). Auth pre-injected as `Authorization: Basic` (send NO auth header; the OneCLI gateway adds it at the boundary). Docs: https://fivetran.com/docs/rest-api.',
     });
@@ -874,7 +1060,7 @@ export function buildSessionServicesSnapshotFrom(
   // won the merge — a group that declares `littlebird` itself (all 24 do
   // today) holds the same capability. If every entry is retained the budget
   // still terminates: `evictCapability` pops the last one outright
-  // (src/modules/memory/pre-turn-context.ts:1594).
+  // (src/modules/memory/pre-turn-context.ts:1633).
   const fleetProvided = new Set(Object.keys(readFleetMcpServers()));
   const derived: SessionServicesSnapshot['services'] = [];
   for (const [name, server] of Object.entries(effectiveMcpServers(cfg))) {
@@ -893,13 +1079,33 @@ export function buildSessionServicesSnapshotFrom(
     // so `null` reaches here. One bad entry must not cost the whole snapshot —
     // an agent with no capability list is the worse failure by far.
     if (server === null || typeof server !== 'object') continue;
+    // Every string this block reads off a stored server goes through
+    // `storedString`. The type says these are strings, but a hand-edited
+    // container.json is not type-checked on the way in: `validateMcpServers`
+    // refuses only SSE (src/container-config.ts:575), and
+    // `parseMcpServerConfig`, which DOES type-check `displayName` and
+    // `description` (src/container-config.ts:445-452), only runs on CLI
+    // intake. Untyped values reaching the string helpers here throw, and this
+    // function's caller catches — so `buildPreTurnContext` degrades to an
+    // empty roster and `writeCapabilitiesSnapshot` logs and writes nothing.
+    // One malformed entry would hide every valid service, which is the same
+    // failure the `server === null` skip above exists to prevent.
+    const displayName = storedString(server.displayName);
+    const description = storedString(server.description);
     derived.push({
-      name: server.displayName ?? name.charAt(0).toUpperCase() + name.slice(1),
+      name: displayName ?? name.charAt(0).toUpperCase() + name.slice(1),
       mcpNamespace: `mcp__${name}__*`,
       declaredTools: declaredMatchingTools([name]),
       scopes: [],
       credentialPaths: [],
-      useFor: server.description ?? genericMcpUseFor(name, server),
+      // A stored server has no hand-written roster line, so derive one from
+      // the same `description` the full entry carries — its leading clause is
+      // written to say what the server is for, which is what the roster needs.
+      // With no description there is nothing to say but where it dials:
+      // `genericMcpUseFor`'s full sentence would spend ~60 roster characters
+      // restating the namespace that the entry's `via` already carries.
+      summary: description === undefined ? mcpEndpoint(server) : summarizeCapabilityText(description, 80),
+      useFor: description ?? genericMcpUseFor(name, server),
       ...(fleetProvided.has(name) ? { retainUnderBudget: true } : {}),
     });
   }
@@ -910,7 +1116,7 @@ export function buildSessionServicesSnapshotFrom(
   derived.sort((a, b) => Number(Boolean(b.retainUnderBudget)) - Number(Boolean(a.retainUnderBudget)));
   services.splice(derivedMcpIndex, 0, ...derived);
 
-  return { agentGroupId, services };
+  return { agentGroupId, howToUse: CAPABILITY_ROSTER_PREAMBLE, services };
 }
 
 /**
@@ -941,14 +1147,42 @@ function genericMcpUseFor(name: string, server: McpServerConfig): string {
  * `amplitude` entries on this install) — so printing `command` alone says "bun" for
  * all of them and identifies nothing. Print what the bridge dials instead; a
  * genuine local subprocess still prints its command.
+ *
+ * Keyed on the PRESENCE of `url`, not on `type`. `HttpMcpServerConfig.type` is
+ * required in the type (src/container-config.ts:109), but a hand-edited
+ * container.json reaches here unvalidated for this field — `validateMcpServers`
+ * refuses only SSE (src/container-config.ts:575) — and a `{ url }` entry with
+ * no `type` then narrowed to the stdio arm and printed `undefined`, because
+ * stdio's `command` is absent on it. Same defensive reasoning as the
+ * `server === null` skip above.
  */
 function mcpEndpoint(server: McpServerConfig): string {
-  if (server.type === 'http' || server.type === 'sse') return server.url;
-  const [script, endpoint] = server.args ?? [];
+  // Read as `unknown` rather than through the union's arms: the value came
+  // off disk, so its runtime shape may not match either arm (see `storedString`).
+  const stored = server as { url?: unknown; args?: unknown; command?: unknown };
+  const url = storedString(stored.url);
+  if (url !== undefined) return url;
+  const args = Array.isArray(stored.args) ? (stored.args as unknown[]) : [];
+  const [script, endpoint] = args;
   if (typeof script === 'string' && script.endsWith('remote-mcp-bridge.ts') && typeof endpoint === 'string') {
     return endpoint;
   }
-  return server.command;
+  return storedString(stored.command) ?? 'endpoint unknown';
+}
+
+/**
+ * A string field read off a stored MCP server, or `undefined` when the stored
+ * value is not a usable string.
+ *
+ * `McpServerConfig` types these as strings, but nothing type-checks a
+ * hand-edited `container.json` on the way in — see the block in
+ * `buildSessionServicesSnapshotFrom` where the derived entries are built.
+ * Every read of `displayName`, `description`, `url` and `command` in this file
+ * goes through here, so one bad value degrades that one field instead of
+ * throwing out of the whole snapshot.
+ */
+function storedString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== '' ? value : undefined;
 }
 
 export async function getHostCapabilities(
