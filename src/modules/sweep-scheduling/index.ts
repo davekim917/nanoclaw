@@ -127,9 +127,19 @@ export function registerSchedulingSweepDuties(): void {
     // production caller receives the sweep's session, never a raw handle and
     // never its own nested open on the same key.
     run: async (ctx) => {
-      const { session, mailbox } = asSessionContext(ctx);
+      const { session, mailbox, alive } = asSessionContext(ctx);
       const { handleRecurrence } = await import('../scheduling/recurrence.js');
       await handleRecurrence(mailbox!, session);
+      // The series-health observer for the opposite failure: an occurrence that
+      // never completes gives the fan-out above nothing to advance. Guarded on
+      // its own — it changes no state, so its throw must not fail the duty that
+      // keeps every schedule moving.
+      try {
+        const { escalateOverdueOccurrences } = await import('../scheduling/overdue.js');
+        await escalateOverdueOccurrences(mailbox!, session, alive);
+      } catch (err) {
+        log.warn('Overdue occurrence check failed', { sessionId: session.id, err });
+      }
     },
     // MODULE-HOOK:scheduling-recurrence:end
   });

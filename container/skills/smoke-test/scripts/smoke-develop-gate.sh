@@ -221,6 +221,29 @@ num_env FREEZE_STALE_SECONDS SMOKE_GATE_FREEZE_STALE_SECONDS 14400
 # (default, no behavior change for existing deployments); the wrapper sets the
 # policy. Counted from the last freeze OPEN, so campaign duration eats into it.
 num_env FREEZE_MIN_INTERVAL_SECONDS SMOKE_GATE_FREEZE_MIN_INTERVAL_SECONDS 0
+# Optional read-only view of smoke-pr-gate.sh's OWN state dir (its
+# SMOKE_GATE_STATE_DIR), so an open handoff can be classified by what the PR
+# gate actually did with the freeze PR. UNSET = INERT: nothing is read, no
+# payload gains a field, no alarm exists — byte-for-byte today's behaviour.
+#
+# Why it exists. Once a freeze is cut this gate only ever learned two things
+# about it: a ledger row (finished) or a closed PR (abandoned). Everything in
+# between was one silent `already_active`, and at the staleness ceiling the
+# coordinator was told to close a PR this gate admitted it could not see into.
+# On 2026-09-15..17 the PR-gate watcher series was wedged for ~56h: six
+# consecutive freezes were cut on schedule, never polled once (no per-PR state,
+# no run dir), aged out, and were closed — with no alarm and no accounting.
+#
+# INVARIANT 3: develop-only. smoke-pr-gate.sh has no handoff slot to classify;
+# it is the gate being observed.
+PR_STATE_DIR="${SMOKE_GATE_PR_STATE_DIR:-}"
+# How long an open handoff may sit with NO campaign ever claimed on it before
+# one latched `develop_freeze_unclaimed` wake. Must sit well under
+# FREEZE_STALE_SECONDS — the point is to hear about a dead watcher hours before
+# the stale path says "close it" — and above preview warm-up, because the PR
+# gate writes no per-PR state until the preview backend is live
+# (smoke-pr-gate.sh:4042-4050), so "no state yet" is normal for a young freeze.
+num_env HANDOFF_UNCLAIMED_SECONDS SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS 5400
 # Read HERE, not inline at the `timeout` call site. A use-site `${VAR:-90}`
 # bypasses num_env entirely: `timeout abc` exits 125, the stderr is swallowed
 # by the call's own `2>/dev/null`, FREEZE_JSON comes back empty, and the gate
@@ -659,6 +682,7 @@ num_env ACK_MAX_SILENCE_SECONDS SMOKE_GATE_ACK_MAX_SILENCE_SECONDS 86400
 # Left as-is rather than renamed: both gates' deployed prompts key on those
 # names, and the fix is a prompt-and-skill change, not a skill-only one.
 ACK_TRIGGERS="develop_unsettled develop_freeze_abandoned develop_freeze_stale
+  develop_freeze_unclaimed
   develop_freeze_ledger_tampered develop_freeze_failed gate_hold_tampered
   develop_run_overrun develop_hold_undecided preflight_failed
   gate_misconfigured gate_fetch_failed
@@ -1589,8 +1613,10 @@ fi
 relock_or_exit poll-state
 STATE="$(jq -c '.fetchFailures=0' <<<"$STATE")"
 
+# Optional second argument: a JSON object merged into `data` (null = nothing,
+# and the line is byte-identical to the one-argument form).
 emit_no_wake() {
-  local trigger="$1"
+  local trigger="$1" extra="${2:-null}"
   write_state "$STATE"
   jq -cn \
     --arg trigger "$trigger" \
@@ -1598,7 +1624,131 @@ emit_no_wake() {
     --arg backend "$BACKEND_SHA" \
     --arg frontend "$FRONTEND_SHA" \
     --argjson checks "$CHECK_TOTAL" \
-    '{wakeAgent:false,data:{schemaVersion:1,trigger:$trigger,sourceSha:$sha,backendDeploySha:$backend,frontendDeploySha:$frontend,checkCount:$checks}}'
+    --argjson extra "$extra" \
+    '{wakeAgent:false,data:({schemaVersion:1,trigger:$trigger,sourceSha:$sha,backendDeploySha:$backend,frontendDeploySha:$frontend,checkCount:$checks} + ($extra // {}))}'
+}
+
+# Classify an open handoff by the PR gate's own per-PR state. Read-only: never
+# takes smoke-pr-gate.sh's locks and never writes under PR_STATE_DIR — its
+# state writes are tmp+mv (smoke-pr-gate.sh:1329-1337), so a lockless read sees
+# a whole document or the previous one. Prints `null` when PR_STATE_DIR is
+# unset, else exactly one object whose `disposition` is one of:
+#   never_started        no per-PR state (the PR gate never got far enough to
+#                        write any), or state with no run ever claimed
+#   campaign_live        a run holds the slot and its newest liveness signal is
+#                        inside PROGRESS_STALE_SECONDS — the same rule and the
+#                        same knob as smoke-pr-gate.sh:1414-1427
+#   stalled              a run holds the slot, signal older than that
+#   terminal_unreported  the run reached a verdict this gate has no ledger row
+#                        for. Two shapes: `finishIntent` recorded for this
+#                        freeze SHA with the slot still held — finish writes the
+#                        intent first (smoke-pr-gate.sh:3343-3346) and exits
+#                        with the slot held when the ledger append fails
+#                        (:3663-3693); or `completedSha` committed (:3744-3751)
+#                        by a finish that had no ledger configured.
+# "Superseded" is not a fifth value here: it is what `develop_freeze_stale`
+# itself means, and that payload carries this object to say WHICH kind of
+# freeze was superseded. Only reached with no matching ledger row, so a
+# reported terminal outcome never gets this far. TOTAL: an unreadable state
+# file classifies as never_started (fail toward the alarm), never aborts.
+handoff_campaign_trace() {  # <freeze-pr> <freeze-sha>
+  local pr="$1" freeze_sha="$2" f out
+  [ -n "$PR_STATE_DIR" ] || { printf 'null'; return; }
+  case "$pr" in ''|*[!0-9]*) printf 'null'; return ;; esac
+  f="$PR_STATE_DIR/pr-$pr-state.json"
+  if [ ! -s "$f" ]; then
+    jq -cn --arg f "$f" '{disposition:"never_started",detail:"no_pr_gate_state",runId:null,lastSignalAt:null,verdictFile:null,prStateFile:$f}'
+    return
+  fi
+  out="$(jq -c --arg f "$f" --arg dir "$PR_STATE_DIR" --arg sha "$freeze_sha" \
+    --argjson now "$NOW_EPOCH" --argjson stale "$PROGRESS_STALE_SECONDS" '
+    def ts: ((strings | try fromdateiso8601 catch 0) // 0);
+    def str: ((strings | select(length > 0)) // null);
+    objects
+    | (.activeRunId | str) as $run
+    | (.completedRunId | str) as $done
+    | ((.finishIntent | objects) // {}) as $fi
+    | (.activeStartedAt | ts) as $started | (.activeProgressAt | ts) as $progress
+    | (if $progress > $started then .activeProgressAt else .activeStartedAt end | str) as $last
+    | ([$started, $progress] | max) as $lastEpoch
+    | if $sha != "" and (.completedSha | str) == $sha then
+        {disposition:"terminal_unreported",detail:"completed_without_ledger_row",runId:$done,
+         lastSignalAt:(.completedAt | str)}
+      elif $run != null and $sha != "" and ($fi.sha | str) == $sha and ($fi.runId | str) == $run then
+        {disposition:"terminal_unreported",detail:"finish_not_committed",runId:$run,
+         lastSignalAt:($fi.recordedAt | str)}
+      elif $run != null then
+        {disposition:(if ($now - $lastEpoch) < $stale then "campaign_live" else "stalled" end),
+         detail:null,runId:$run,lastSignalAt:$last}
+      else
+        {disposition:"never_started",detail:"observed_not_claimed",runId:null,lastSignalAt:null}
+      end
+    # runs/<runId>/verdict.json: smoke-pr-gate.sh:185.
+    | . + {verdictFile:(if .disposition == "terminal_unreported" and .runId != null
+                        then ($dir + "/runs/" + .runId + "/verdict.json") else null end),
+           prStateFile:$f}
+  ' "$f" 2>/dev/null)"
+  if [ -z "$out" ]; then
+    jq -cn --arg f "$f" '{disposition:"never_started",detail:"pr_gate_state_unreadable",runId:null,lastSignalAt:null,verdictFile:null,prStateFile:$f}'
+    return
+  fi
+  printf '%s' "$out"
+}
+
+# ONE latched `develop_freeze_unclaimed` wake per freeze PR (same latch shape
+# as ledgerTamperAlertFor; PR numbers never repeat, so the latch needs no reset
+# when the slot frees). Exits the poll when it fires, returns otherwise. The
+# slot is NOT freed and nothing says "close": the freeze is still worth
+# testing — what is broken is whatever should have picked it up. Reads/sets
+# $STATE. Inert when the trace is null (SMOKE_GATE_PR_STATE_DIR unset).
+emit_handoff_unclaimed() {  # <trace-json> <age-seconds> <freeze-pr> <target-sha>
+  local trace="$1" age="$2" pr="$3" target="$4"
+  [ "$trace" != null ] && [ -n "$trace" ] || return 0
+  [ "$(jq -r '.disposition' <<<"$trace")" = never_started ] || return 0
+  [ "$age" -ge "$HANDOFF_UNCLAIMED_SECONDS" ] || return 0
+  [ "$(jq -r '.handoffUnclaimedAlertFor // empty' <<<"$STATE")" != "$pr" ] || return 0
+  STATE="$(jq -c --arg pr "$pr" '.handoffUnclaimedAlertFor=$pr' <<<"$STATE")"
+  write_state "$STATE"
+  jq -cn --argjson pr "$pr" --arg sha "$target" --argjson age "$age" \
+    --argjson threshold "$HANDOFF_UNCLAIMED_SECONDS" --argjson staleAfter "$FREEZE_STALE_SECONDS" \
+    --argjson trace "$trace" \
+    '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_freeze_unclaimed",
+      freezePr:$pr,targetSha:$sha,ageSeconds:$age,unclaimedAfterSeconds:$threshold,
+      staleAfterSeconds:$staleAfter,campaignTrace:$trace,
+      hint:"This freeze PR has been open past the unclaimed window and no campaign has started on it. Do NOT close it and do not start a campaign from this wake. Find out why the PR gate has not picked it up — is the smoke-pr-gate.sh poll series running and reaching this PR (label, preview deploy, preflight)? — and report what you find. This alarm fires once per freeze; if nothing changes, the staleness ceiling will later supersede the freeze."}}'
+  exit 0
+}
+
+# The same alarm from the UNSETTLED branch. All other handoff bookkeeping sits
+# behind the settled check, but a never-started freeze means the PR-campaign
+# watcher is not running — which has nothing to do with develop's CI state, and
+# a watcher outage during a red develop must not be the silent one. Because
+# the ledger-adoption and abandonment steps have not run on this path, this
+# refuses to fire over either: a matching ledger row (finished — adoption
+# handles it once settled) or a freeze PR confirmed CLOSED/MERGED (abandonment
+# handles it). A failed PR lookup does NOT suppress: not knowing is no reason
+# for silence, and the lookup only happens on the one poll that would alarm.
+emit_handoff_unclaimed_unsettled() {
+  local pr target age trace
+  [ "$FREEZE_HANDOFF" = true ] && [ -n "$PR_STATE_DIR" ] || return 0
+  pr="$(jq -r '.handoffFreezePr // empty' <<<"$STATE")"
+  target="$(jq -r '.handoffTargetSha // empty' <<<"$STATE")"
+  [ -n "$pr" ] && [ -n "$target" ] || return 0
+  [ "$(jq -r '.handoffUnclaimedAlertFor // empty' <<<"$STATE")" != "$pr" ] || return 0
+  age="$(( NOW_EPOCH - $(epoch_or_zero "$(jq -r '.handoffOpenedAt // empty' <<<"$STATE")") ))"
+  [ "$age" -ge "$HANDOFF_UNCLAIMED_SECONDS" ] || return 0
+  trace="$(handoff_campaign_trace "$pr" "$(jq -r '.handoffFreezeSha // empty' <<<"$STATE")")"
+  [ "$(jq -r '.disposition // empty' <<<"$trace" 2>/dev/null)" = never_started ] || return 0
+  if [ -s "$HANDOFF_LEDGER" ] &&
+     [ -n "$(jq -cR --arg t "$target" --arg pr "$pr" \
+       'fromjson? | select(type == "object") | select(.targetSha == $t and (.freezePr | tostring) == $pr)' \
+       "$HANDOFF_LEDGER" 2>/dev/null | tail -1)" ]; then
+    return 0
+  fi
+  case "$(timeout 8 gh pr view "$pr" -R "$REPO" --json state 2>/dev/null | jq -r '.state // empty' 2>/dev/null)" in
+    CLOSED|MERGED) return 0 ;;
+  esac
+  emit_handoff_unclaimed "$trace" "$age" "$pr" "$target"
 }
 
 if [ "$CI_READY" != true ] || [ "$DEPLOY_READY" != true ]; then
@@ -1609,6 +1759,10 @@ if [ "$CI_READY" != true ] || [ "$DEPLOY_READY" != true ]; then
     STATE="$(jq -c --arg sha "$SOURCE_SHA" --arg now "$NOW" \
       '.unsettledSha=$sha | .unsettledSince=$now' <<<"$STATE")"
   fi
+  # After the unsettled-since bookkeeping above (so firing loses none of it),
+  # before the unsettled wake: if both are due, this poll says the watcher is
+  # down and the next says develop is stuck — each is latched, neither is lost.
+  emit_handoff_unclaimed_unsettled
   STUCK_FOR="$(( NOW_EPOCH - $(epoch_or_zero "$(jq -r '.unsettledSince // empty' <<<"$STATE")") ))"
   if [ "$STUCK_FOR" -ge "$UNSETTLED_ALERT_SECONDS" ] &&
      [ "$(jq -r '.unsettledWakeSha // empty' <<<"$STATE")" != "$SOURCE_SHA" ]; then
@@ -1699,6 +1853,7 @@ if [ "$FREEZE_HANDOFF" = true ]; then
       # handoffFreezePr/handoffTargetSha by hand. Fail-closed on the fetch
       # itself: a lookup problem means "cannot prove it is closed", so do
       # NOT reclaim — leave the handoff in place and let a later poll retry.
+      CAMPAIGN_TRACE="$(handoff_campaign_trace "$HANDOFF_PR" "$(jq -r '.handoffFreezeSha // empty' <<<"$STATE")")"
       FREEZE_PR_STATE="$(timeout 8 gh pr view "$HANDOFF_PR" -R "$REPO" --json state 2>/dev/null \
         | jq -r '.state // empty' 2>/dev/null)"
       if [ "$FREEZE_PR_STATE" = "CLOSED" ] || [ "$FREEZE_PR_STATE" = "MERGED" ]; then
@@ -1716,12 +1871,13 @@ if [ "$FREEZE_HANDOFF" = true ]; then
                         .handoffOpenedAt=null | .ledgerTamperAlertFor=null' <<<"$STATE")"
         write_state "$STATE"
         jq -cn --argjson pr "$HANDOFF_PR" --arg sha "$HANDOFF_TARGET" \
-          --arg publish "$PUBLISH_FILE" --arg hold "$HOLD_FILE" \
-          '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_freeze_abandoned",
+          --arg publish "$PUBLISH_FILE" --arg hold "$HOLD_FILE" --argjson trace "$CAMPAIGN_TRACE" \
+          '{wakeAgent:true,data:({schemaVersion:1,trigger:"develop_freeze_abandoned",
             freezePr:$pr,targetSha:$sha,
             hint:"Before assuming the campaign died, check whether it actually completed but failed only to report: inspect the hold/publish artifacts for this target SHA.",
             publishFile:(if $publish == "" then null else $publish end),
-            holdFile:(if $hold == "" then null else $hold end)}}'
+            holdFile:(if $hold == "" then null else $hold end)}
+            + (if $trace == null then {} else {campaignTrace:$trace} end))}'
         exit 0
       fi
       # Still open, but is it still worth testing? A freeze pins ONE develop
@@ -1748,12 +1904,29 @@ if [ "$FREEZE_HANDOFF" = true ]; then
                         .handoffOpenedAt=null | .ledgerTamperAlertFor=null' <<<"$STATE")"
         write_state "$STATE"
         jq -cn --argjson pr "$HANDOFF_PR" --arg sha "$HANDOFF_TARGET" \
-          --arg current "$SOURCE_SHA" --argjson age "$HANDOFF_AGE" \
-          '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_freeze_stale",
+          --arg current "$SOURCE_SHA" --argjson age "$HANDOFF_AGE" --argjson trace "$CAMPAIGN_TRACE" \
+          '{wakeAgent:true,data:({schemaVersion:1,trigger:"develop_freeze_stale",
             freezePr:$pr,targetSha:$sha,currentSha:$current,ageSeconds:$age,
-            hint:"This freeze is older than the staleness ceiling and develop has moved past it. Close the freeze PR (this also tears down its previews) unless a campaign is still live on it; a fresh freeze is cut on the next poll. Do not publish a verdict for a build nobody ships."}}'
+            hint:(
+              if $trace == null then
+                "This freeze is older than the staleness ceiling and develop has moved past it. Close the freeze PR (this also tears down its previews) unless a campaign is still live on it; a fresh freeze is cut on the next poll. Do not publish a verdict for a build nobody ships."
+              elif $trace.disposition == "campaign_live" then
+                ("This freeze is past the staleness ceiling and develop has moved on, but run " + ($trace.runId // "?") + " is LIVE on it. Do NOT close the freeze PR — that tears the previews out from under the run. The slot is freed and a fresh freeze is cut on the next poll; let the run finish and treat its verdict as describing a superseded build.")
+              elif $trace.disposition == "stalled" then
+                ("This freeze is past the staleness ceiling and develop has moved on. Run " + ($trace.runId // "?") + " still holds it but has sent no liveness signal since " + ($trace.lastSignalAt // "its claim") + ". Confirm that coordinator is dead before closing the freeze PR, and report the campaign as stalled — not as never run.")
+              elif $trace.disposition == "terminal_unreported" then
+                ("This freeze is past the staleness ceiling and develop has moved on, but run " + ($trace.runId // "?") + " already reached a terminal verdict that never reached the handoff ledger. Do NOT close it as untested: read verdictFile, retry the finish for that run if its slot is still held, and report the verdict as terminal-but-unreported.")
+              else
+                "This freeze is past the staleness ceiling, develop has moved past it, and NO campaign ever started on it (see campaignTrace.detail). It is superseded, not tested: close the freeze PR (this also tears down its previews) and report it as never-started — no verdict exists. A fresh freeze is cut on the next poll; if the PR-gate watcher is still not polling, that one strands the same way, so check it first."
+              end)}
+            + (if $trace == null then {} else {campaignTrace:$trace} end))}'
         exit 0
       fi
+      # Never started, and old enough that it should have been: see
+      # emit_handoff_unclaimed. Sits after abandonment and staleness so their
+      # ordering is untouched, and before the tamper latch so a standing
+      # tamper mismatch cannot shadow it (each fires once, consecutive polls).
+      emit_handoff_unclaimed "$CAMPAIGN_TRACE" "$HANDOFF_AGE" "$HANDOFF_PR" "$HANDOFF_TARGET"
       # Still open and still current enough. No ledger entry at all is silent (no news yet). A
       # mismatched (or malformed) entry is tamper evidence, same shape as
       # gate_hold_tampered: never adopt, never free the real handoff — one
@@ -1933,13 +2106,17 @@ if [ "$FREEZE_HANDOFF" = true ]; then
   HANDOFF_PR="$(jq -r '.handoffFreezePr // empty' <<<"$STATE")"
   if [ -n "$HANDOFF_PR" ]; then
     HANDOFF_TARGET="$(jq -r '.handoffTargetSha // empty' <<<"$STATE")"
+    # Every poll that holds a handoff says what it is holding (inert → null →
+    # the line is unchanged).
+    HANDOFF_EXTRA="$(handoff_campaign_trace "$HANDOFF_PR" "$(jq -r '.handoffFreezeSha // empty' <<<"$STATE")" |
+      jq -c --argjson pr "$HANDOFF_PR" 'if . == null then null else {freezePr:$pr,campaignTrace:.} end' 2>/dev/null)"
     if [ "$HANDOFF_TARGET" != "$SOURCE_SHA" ]; then
       if [ "$CANDIDATE_SHA" != "$SOURCE_SHA" ]; then
         STATE="$(jq -c --arg sha "$SOURCE_SHA" --arg now "$NOW" '.candidateSha=$sha | .candidateFirstSeen=$now' <<<"$STATE")"
       fi
-      emit_no_wake "queued_behind_active_run"
+      emit_no_wake "queued_behind_active_run" "${HANDOFF_EXTRA:-null}"
     else
-      emit_no_wake "already_active"
+      emit_no_wake "already_active" "${HANDOFF_EXTRA:-null}"
     fi
     exit 0
   fi

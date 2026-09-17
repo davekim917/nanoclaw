@@ -549,27 +549,31 @@ outside the stated scope.
 ### Journeys — saved walks, matched to the change before any model wakes
 
 An install may keep a **journey catalogue**, `journeys.json`, beside its
-standing instructions (shape and a fictional example:
-`references/journeys.example.json`; check one with `smoke-journeys.py validate`).
-A journey is a saved plain-English walk — `id` (its lane id, for life), `title`,
+standing instructions (fictional example: `references/journeys.example.json`;
+check one with `smoke-journeys.py validate`). A journey is a saved walk — `id` (its lane id, for life), `title`,
 `proves`, `evidence` (`browser` | `api` | `native-manual`), `entryPath`,
 `steps[]`, `endState` (including persistence after reload where claimed),
 `seats`, `seed`, `restore`, `checkpoints[]` (screens captured *during* the walk)
 — plus `consumes[]`, globs over the **whole repo**, not just its frontend: the
 migration, route file or taxonomy table whose change makes this walk relevant.
-A worker walks a journey from the catalogue alone — nobody re-derives how to
-reach a screen — and a backend-only change selects the screens that consume it.
+`excludePaths[]` (`{glob, reason}`) is applied **before** `consumes`, so no
+journey can rescue a path it hides: keep each exclusion narrow and reasoned.
+`validate` warns on a top-level or extension-wide one (`**/*.md` hides runtime
+release notes) and on any `consumes` glob an exclusion shadows.
+A worker walks it from the catalogue alone, and a backend-only change selects
+the screens that consume it.
 
 For a freeze campaign the gate matches `campaignRange`'s file list against the
-catalogue and states the result once, as `journeys`, in `check` and the
-`pr_build_settled` wake — pinned, with a snapshot of the catalogue and its
-sha256, by the first settled poll, so neither a catalogue edit nor a recovery
-wake can change a run's contract. No catalogue: no `journeys` key, and none of
-this applies. At intake:
+catalogue and states the result as `journeys` in `check` and the
+`pr_build_settled` wake. It reads the **pinned** range paths and is pinned with
+them at the first settled poll — immutable, in the shared lease directory, with
+a sha256-named catalogue snapshot — so no catalogue edit, recovery wake or
+second coordinator changes a run's contract (`pinState: invalid` ⇒ `full`,
+still offered). No catalogue: no `journeys` key. At intake:
 
 1. `smoke-journeys.py pin-run <run-dir> <journeys.pinFile>` copies the pin and
-   the snapshot into `<run-dir>/journeys/`. Workers and siblings read journeys
-   from that run copy, never from a group's private live file.
+   snapshot into `<run-dir>/journeys/`; workers and siblings read that copy,
+   never a group's private live file.
 2. **Every `matchedJourneys[]` entry becomes a contract lane with the journey
    id as its lane id** — `reason` says why it is there (`changed`, `floor`, or
    `range-unknown`). An `evidence: api` journey is scaffolded `--evidence
@@ -582,20 +586,30 @@ this applies. At intake:
    `mapped-to-journey` or `new-journey` (+ `journeyId`, which must be a lane),
    `no-user-facing-consumer` (+ `changedBehaviour`, and `evidence[]` citing at
    least one file saved in the run, normally the search below), or `unresolved`
-   (+ `reason`) — uncertainty terminates honestly rather than inventing an
-   answer. Adding a glob to the catalogue later does not erase the obligation.
-4. **Search the source even when globs matched.** For each changed backend
+   (+ `reason`), so uncertainty ends honestly. A glob added later erases nothing.
+4. **Search the source even when globs matched** — a broad glob (every
+   migration → one journey) can hide a second consumer. For each changed backend
    route, payload field, taxonomy id or feature flag, search the web and native
-   clients for the literal identifier and save the identifier, command and call
-   sites under the run. A broad glob (every migration → one journey) can hide a
-   second consumer. Hits suggest consumers; zero hits do not prove absence.
+   clients for the literal identifier; save the identifier, command and call
+   sites under the run. **For a deleted or renamed-away path, search at
+   `campaignRange.baselineSha`, not the head** — at the head its importers are
+   already gone, and "no importer" reads as dead code. Hits suggest consumers;
+   zero hits do not prove absence.
 5. **Preflight demonstrability and fixtures before dispatch**: deployed data and
    flags (`PREVIEW-STALE`, below), seat capability, fixture availability.
-   Fixtures are allocated per run **and side** — `QA-<runId>-<side>-*` — so two
+   Fixtures are allocated per run **and side** (`QA-<runId>-<side>-*`), so two
    owners on one seat cannot collide, and are cleaned up after a failure too.
    Every worker brief carries this sentence verbatim: "creating/deleting objects
    named QA-<runId>-* inside the QA tenant with a QA seat is pre-authorized;
    nothing else is."
+
+**A journey that only renders an area does not cover a changed backend
+behaviour.** For each one, name the endpoint or job and every affected web and
+native consumer, and record a concrete input or fixture, the expected result,
+the observed request/response, and the rendered result; for a write, reload and
+read it back. A loaded page, an unexercised path, an unavailable fixture or a
+missing deployment is `blocked` or `unresolved` with the missing proof named —
+never a pass, and neither a matcher hit nor a note in the catalogue stands in.
 
 **`route: "native-manual"`** — a non-empty change claimed entirely by
 `native-manual` journeys — spends nothing on a web campaign: source and CI
@@ -615,14 +629,14 @@ backend/data scope disposition, and samples the positive matches — a broad glo
 hides an omission as well as "no consumer".
 
 **Maintenance is reviewed, not append-only**: journeys are corrected, replaced
-and retired, with history in git. A first successful walk *qualifies* a new
-journey for promotion; it does not certify that its assertions test the claim.
-Owners and challengers propose changes as files in their run; **one publisher —
-the group's coordinator — applies them**: `SMOKE_LANE_ROLE=coordinator
+and retired, history in git. A first successful walk *qualifies* a journey for
+promotion; it does not certify its assertions. Owners and challengers propose
+changes as files in their run; **one publisher — the group's coordinator —
+applies them**: `SMOKE_LANE_ROLE=coordinator
 smoke-journeys.py publish <catalogue> <proposed> --expect-sha256 <digest the
 proposal was based on> --lock <state-dir>/control.lock` (schema and ids
-validated, stale digest refused, atomic replace). Deliberately absent: a runner,
-a step DSL, a replay cache, golden baselines, a dependency graph.
+validated, stale digest refused, atomic replace). There is deliberately no
+runner, step DSL, replay cache, golden baseline or dependency graph.
 
 ### The coverage floor — the part of the manifest the diff does not get a vote on
 
@@ -630,14 +644,11 @@ The manifest above is derived from the diff, every lane in §3 scopes from this
 campaign's own change — the acceptance lane included, since a PR body describes
 the PR — and a manifest built only that way tests whatever is actively
 regressing. Measured across one deployment's first 74 campaigns: a
-money-adjacent approval flow was walked in a browser **exactly once, ever** —
-that run's own manifest called it "never browser-tested before" — and never
-functionally again. A planning surface appeared in 22 of the 74, every
-appearance incidental to a style change that happened to touch the file, never
-once as a functional lane. An in-app assistant surface: 2 of 74, one of those an
-explicit full sweep rather than a campaign. Nothing regressed on those surfaces
-in that window; nothing was watching either. A very fast green suite over the
-same blind spots is what this section exists to prevent.
+money-adjacent approval flow was walked in a browser **exactly once, ever**; a
+planning surface appeared in 22, always incidental to a style change, never as
+a functional lane; an in-app assistant surface in 2. Nothing regressed on those
+surfaces in that window; nothing was watching either. A very fast green suite
+over the same blind spots is what this section exists to prevent.
 
 So: **changed-surface scoping decides what runs *extra*. It never decides what
 runs at all.** A small declared set of journeys is exercised against the
@@ -721,15 +732,10 @@ backend-only diff, not on a one-line change, not on a campaign that found
 nothing.
 
 **The skip rule below does not apply to floor entries, and this is not an
-exemption carved out of it.** That rule lets a browser check go unwritten when
-a source lane in the same campaign already proves the identical claim with a
-green spec. A floor entry's claim is composition on a deployed build: whether
-the connected flow still works end to end, through storage and the network, on
-the build actually being served. The counter-rule already names composition,
-deploy identity, persistence across reload and permission crossings as claims a
-green spec structurally cannot observe, and a floor entry is made of precisely
-those — there is no line in any spec that would have failed had the floor
-journey been broken in the browser. A floor entry whose claim *looks*
+exemption carved out of it.** A floor entry's claim is composition on a deployed
+build — the connected flow working end to end, through storage and the network,
+on the build being served — which that rule's own counter-rule already says a
+green spec structurally cannot observe. A floor entry whose claim *looks*
 spec-covered is the most tempting skip and the most expensive one: the unit
 assertion is green, nobody has walked the flow in weeks, and the run reports
 coverage it does not have.
@@ -801,10 +807,8 @@ journeys (and no floor table) mean the coordinator cannot compute a due entry;
 record `floor undeclared` on the run record, name it on the report's Untested
 line, and cap the run at `PASS_WITH_GAPS`. Do not invent a floor from the
 product — inventing one is the coordinator picking its own floor, which the
-nomination rule above exists to prevent. `PASS_WITH_GAPS` is deliberate rather
-than blocking: an install picking up this version keeps shipping, but never
-again reports an unqualified `PASS` while nobody has said which journeys must
-not silently break.
+nomination rule above exists to prevent. The cap is deliberate rather than
+blocking: the install keeps shipping, but never reports an unqualified `PASS`.
 
 ### Scoring permission crossings — a success is the defect
 
@@ -1026,7 +1030,8 @@ desktop and phone width into one labelled image. `smoke-journeys.py shots
 <run-dir>` prints the matched journeys' `captureRecipes` (`name`, `path`,
 click/wait `steps`) as `shots.json`; a journey's English steps are never fed to
 the capture script.
-`smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> <source-sha>`
+`smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> <source-sha>
+[baseline-url] [baseline-auth-state.json]`
 — pass the campaign's frozen `sourceSha` as the fourth argument so
 `manifest.json`'s `buildSha` records the SHA you already froze on rather
 than whatever (if anything) the served page exposes; omit it only when no
@@ -1058,11 +1063,29 @@ screen's leftover DOM/localStorage state (e.g. a nav drawer a prior screen's
 graded BROKEN as a pure capture artifact. Each screen's manifest entry
 carries `freshNavigation: true` as the record of this.
 
-**The phone capture waits for responsive transitions after its viewport
-resize.** Do not replace that settle step with a screenshot immediately after
-the 390px switch: a real PR campaign captured a drawer mid-slide and created a
-false visual finding. If the settle wait itself fails, the mobile entry is
-recorded as missing/partial instead of emitting timing-contaminated evidence.
+**Grade the viewport capture, never the full-page one.** Each width's `file`
+is viewport-sized, taken with CSS animations/transitions frozen and re-taken
+until the live page matches it (`settled`). `fullPage` (`*-full.png`) is
+context only: full-page stitching misplaces fixed/sticky headers and drawers
+and has produced false BROKEN findings. A tile badged `unsettled` is not
+evidence of breakage on its own. A capture whose final `location.pathname`
+is not the shot's `path` (or its declared `finalPath`, for a `steps` click
+that navigates on purpose) fails with both paths named — a bounce to a login
+route is never graded, and on the baseline it is a failed diff, never
+`changed`.
+
+**With a baseline url, judge what the build changed.** Each screen/width is
+also captured from the baseline with the identical recipe and pixel-diffed;
+`manifest.json` gains `diff: {status, pct, image, baseline, reason}` per
+width and the sheet orders tiles changed → diff failed → unchanged, each
+badged, with the diff overlay under a changed tile. Give a critic the head
+image, its `*-base.png` and `*-diff.png`, and ask what the change broke — an
+`unchanged` screen looked that way before this build. Baseline capture is
+strictly read-only (navigation, the declared `steps`, screenshot) and is the
+only thing a deployment's baseline url may be used for; a baseline failure
+records `diff.status: "failed"` with a reason and never touches the head
+capture. A baseline on another origin needs its own auth state file, under
+the same placement rule below.
 
 **Auth state is a live session token — never put it in the run dir or under
 the shared workgroup tree.** The script refuses both (`realpath`-checked
@@ -2008,7 +2031,7 @@ and cannot change the scheduled `poll` or ordinary `check` behavior.
 `pr_build_settled`. Its payload includes `coordinatorOwnerToken`; treat that
 opaque value as part of the run identity. Pass it explicitly to every gate
 verb above and export it as `SMOKE_GATE_OWNER` for every
-`smoke-run-scaffold.sh` contract, marker, and redispatch writer. Native lane
+`smoke-run-scaffold.sh` contract, marker, redispatch, and adopt writer. Native lane
 workers and the separate synthesis session receive the same token in their
 briefs. A caller must never copy `.activeLeaseOwner` from mutable PR state:
 after a reclaim that field names the successor, and adopting it would let a
@@ -2044,8 +2067,31 @@ bash /workspace/agent/smoke-pr-gate.sh claim \
 ```
 
 That same-run claim safely reacquires an expired lease without a human. A
-different token may reclaim only after expiry; it must then regenerate the
-completion contract before writing markers. `lease-renew` and `lease-release`
+different token may reclaim only after expiry — this is also what every `poll`
+recovery is, because `poll` mints a new token per wake (`resumedRunId:true`,
+and `contractAdoptionRequired:true` when the run already has a contract). The
+existing contract still names the predecessor, so `marker`/`redispatch` refuse
+with `different coordinator owner` until the recovery owner takes ONE of:
+
+```bash
+# SAME run id, SAME sourceSha — continue the campaign. Keeps every lane,
+# generation and marker; the original challenger deadline still applies.
+SMOKE_LANE_ROLE=coordinator SMOKE_GATE_OWNER=<your-token> \
+bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh adopt <run-dir> <source-sha>
+
+# Different sourceSha, a corrupt contract, or lanes you must redefine —
+# retire every existing marker.
+... smoke-run-scaffold.sh contract <run-dir> <source-sha> <lane>... --regenerate
+```
+
+Default to `adopt` on a same-SHA recovery: `--regenerate` throws away valid
+evidence that may be unrecoverable once previews are gone. `adopt` only works
+for the caller that currently holds the state, lease and PR authority, appends
+an `ownerAdoptions[]` entry (you adopted the contract; you did not author it —
+report it that way), and is a no-op on exact retry. It
+is never a way around a refusal: never reuse or look up the predecessor's
+token, and if `adopt` itself answers `caller owner does not match`, you are the
+stale one — STOP. `lease-renew` and `lease-release`
 never revive or remove an expired lease. Explicit operator `--takeover`
 restrictions remain the only way to replace a still-active different run.
 The low-level compatibility verb is `lease-claim <run-id> <owner-token> <pr>`
@@ -2113,15 +2159,33 @@ target**, and the gate states it once, in the facts (`check`) and the
   the `targetSha` of the newest handoff-ledger `GO` whose receipt validates
   (digest matches its run `verdict.json`, and the freeze commit / freeze PR
   really bind to that target). `BLOCKED`, `NO_GO` and `HUMAN_DECISION` never
-  move it. It is pinned per freeze head SHA, so every poll and recovery wake
-  of one campaign reports the same range. `baselineRunId`, `baselineResolved`
-  and `baselinePinned` say where it came from.
+  move it. `baselineRunId` and `baselineResolved` say where it came from.
+- **The whole range result is pinned** — one immutable file per freeze head,
+  `range-pin-<repo>-pr-<n>-<headSha>.json` in the **shared lease directory**
+  (same place as the leases, so a coordinator resuming the run from another
+  state dir reads the same pin), first write wins, never trimmed by the gate.
+  `campaignRange.pinState`: `valid` (read from the pin), `absent` (computed),
+  `invalid` (something unreadable is at the pin's path — unknown/`full`, still
+  offered, never recomputed over), `unavailable` (no shared directory —
+  unknown/`full`, **not offered**). Pinned at
+  the first *settled* `poll` of a freeze head: the range, its file list, the
+  migration/frontend facts and `campaignSize`/`sizeReason`. Every later
+  `poll`, `check` and recovery wake of that head reads the pin
+  (`baselinePinned: true`) instead of recomputing — a campaign opened as
+  unknown/`full` on a transient API failure stays unknown/`full`, and a
+  determinable one never changes under a running campaign. A new head SHA is a
+  new campaign with its own pin. `check` never writes a pin.
 - `migrationsInRange` — the migration files in that range, or **`null`** (never
   `[]`) when the range is unknown.
 
+The file list comes from the compare response, or — when that is at the
+endpoint's 300-file cap — from a diff of the two commits' recursive trees,
+which is complete (a rename appears as both its old and new path);
+`fileListMethod` says which (`compare` / `tree`).
+
 `determinable:false` (no validated GO, target behind/diverged from the
-baseline, a malformed or ≥300-file comparison, a failed fetch) means the range
-is **unknown**: `campaignSize` is `full` and `reason` says why. It does not
+baseline, a malformed comparison, a truncated or unreadable tree, a failed
+fetch) means the range is **unknown**: `campaignSize` is `full` and `reason` says why. It does not
 block the campaign. **Quote this range** — for the manifest and any range shown
 to a human — never one re-derived by hand. Journey selection (§2) already
 consumes it and nothing else; an unknown range selects `full`, never nothing.
@@ -2210,7 +2274,16 @@ step. A settled SHA while a handoff is open queues like any other
 `queued_behind_active_run` (one freeze at a time); a freeze PR closed with no
 verdict ever recorded wakes `develop_freeze_abandoned` once and frees the
 slot; a failing helper wakes `develop_freeze_failed`, throttled like a
-failing preflight command. In handoff mode the develop gate also refuses `claim`: chat-requested campaigns cut a freeze PR (`smoke-freeze-pr.sh`) and claim on the PR gate — shared dev is never a campaign environment.
+failing preflight command. With `SMOKE_GATE_PR_STATE_DIR` pointed at the PR
+gate's own state dir (read-only; unset = inert), every poll holding a handoff
+carries `campaignTrace.disposition` — `never_started`, `campaign_live`,
+`stalled` or `terminal_unreported` — and so do `develop_freeze_stale` and
+`develop_freeze_abandoned`, whose hint then says whether closing the PR is
+right. A freeze still `never_started` after
+`SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS` (default 5400) wakes
+`develop_freeze_unclaimed` once per freeze PR: do not close the PR or start a
+campaign from that wake — find out why the PR-gate poll series has not picked
+the freeze up, and report it. In handoff mode the develop gate also refuses `claim`: chat-requested campaigns cut a freeze PR (`smoke-freeze-pr.sh`) and claim on the PR gate — shared dev is never a campaign environment.
 
 The other half lives in `smoke-pr-gate.sh`'s `finish`: `SMOKE_GATE_PUBLISH_FILE`
 / `SMOKE_GATE_HOLD_FILE` / `SMOKE_GATE_HANDOFF_LEDGER` (all no-ops unless set,

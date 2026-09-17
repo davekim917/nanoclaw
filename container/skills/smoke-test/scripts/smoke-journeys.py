@@ -8,9 +8,9 @@ executes the steps; this only decides, deterministically and before any model
 wakes, WHICH journeys a change selects and which changed paths nothing claims.
 
   validate  <catalogue>
-  match     --catalogue <file> --state-dir <dir> --pin-key <key>
-            [--pin] [--unknown <reason>] [--size light|standard|full]
-            [--run-root <dir>] [--as-of <iso>]        (changed paths: JSON array on stdin)
+  match     --catalogue <file> [--snapshot-out <file>] [--unknown <reason>]
+            [--size light|standard|full] [--run-root <dir>] [--as-of <iso>]
+            (changed paths: JSON array on stdin, never argv)
   floor-due <catalogue> <run-root> [--size ...] [--as-of <iso>]
   pin-run   <run-dir> <gate-pin-file>
   shots     <run-dir>
@@ -92,6 +92,51 @@ def _glob_problem(g):
     return None
 
 
+def _exclude_entries(cat):
+    """excludePaths as [(glob, reason)]. An entry is `{glob, reason}`; a bare
+    string is still read (reason None) and `validate` warns about it."""
+    out = []
+    for e in cat.get("excludePaths", []) if isinstance(cat, dict) else []:
+        if isinstance(e, dict):
+            out.append((e.get("glob"), e.get("reason")))
+        else:
+            out.append((e, None))
+    return out
+
+
+def _sample_paths(glob):
+    """Concrete paths a glob would match, for the shadow check below."""
+    samples = []
+    for g in _globs.expand_braces(glob):
+        for deep in ("x", "x/y"):
+            segs = [deep if seg == "**" else seg.replace("*", "x").replace("?", "x") for seg in g.split("/")]
+            samples.append("/".join(segs))
+    return samples
+
+
+def catalogue_warnings(cat):
+    """Ways a VALID catalogue silently drops scope. The matcher strips
+    excludePaths BEFORE consumes, so an exclusion always wins: a consumes glob
+    it shadows selects nothing, and no journey can rescue a path a broad
+    exclusion hides. Warnings, not errors -- the catalogue still loads."""
+    warnings = []
+    entries = [(g, r) for g, r in _exclude_entries(cat) if _is_text(g)]
+    for g, reason in entries:
+        segs = g.split("/")
+        if segs[0] in ("**", "*") or segs[0].startswith("*") or (len(segs) == 2 and segs[1] == "**"):
+            warnings.append("excludePaths {!r} is a bare top-level or extension-wide wildcard; it hides every such path from every journey -- name the narrow area instead".format(g))
+        if not _is_text(reason):
+            warnings.append("excludePaths {!r} carries no reason".format(g))
+    rules = _globs.compile_rule_list([g for g, _ in entries])
+    for j in cat.get("journeys", []):
+        for g in j.get("consumes", []):
+            shadows = {_globs.match_first(p, rules) for p in _sample_paths(g)}
+            if shadows and None not in shadows:
+                warnings.append("journey {}: consumes {!r} can never match -- excludePaths {} is applied first".format(
+                    j.get("id"), g, ", ".join(repr(x) for x in sorted(shadows))))
+    return warnings
+
+
 def _unknown_keys(obj, allowed):
     return sorted(k for k in obj if k not in allowed and not k.startswith("_"))
 
@@ -109,10 +154,16 @@ def validate_catalogue(cat):
     if not isinstance(excludes, list):
         errors.append("excludePaths must be a list of globs")
     else:
-        for g in excludes:
-            problem = _glob_problem(g)
+        for e in excludes:
+            if isinstance(e, dict):
+                for k in _unknown_keys(e, {"glob", "reason"}):
+                    errors.append("excludePaths entry has unknown key {}".format(k))
+                if "reason" in e and not _is_text(e["reason"]):
+                    errors.append("excludePaths {!r} reason must be a non-empty string".format(e.get("glob")))
+                e = e.get("glob")
+            problem = _glob_problem(e)
             if problem:
-                errors.append("excludePaths glob {!r} {}".format(g, problem))
+                errors.append("excludePaths glob {!r} {}".format(e, problem))
     journeys = cat.get("journeys")
     if not isinstance(journeys, list):
         return errors + ["journeys must be a list"]
@@ -265,12 +316,13 @@ def floor_due(cat, run_root, size, as_of):
 
 def compute_selection(cat, digest, paths, unknown_reason, size, run_root, as_of):
     journeys = cat["journeys"]
-    exclude_rules = _globs.compile_rule_list(cat.get("excludePaths", []))
+    exclude_reasons = dict(_exclude_entries(cat))
+    exclude_rules = _globs.compile_rule_list(list(exclude_reasons))
     excluded, scope = [], []
     for p in paths:
         hit = _globs.match_first(p, exclude_rules)
         if hit:
-            excluded.append({"path": p, "glob": hit})
+            excluded.append({"path": p, "glob": hit, "reason": exclude_reasons[hit]})
         else:
             scope.append(p)
 
@@ -331,8 +383,8 @@ def compute_selection(cat, digest, paths, unknown_reason, size, run_root, as_of)
         "catalogueValid": True,
         "catalogueSha256": digest,
         "matchedJourneys": matched,
-        # Frozen with the pin: a glob added to the catalogue later does not
-        # take a path off this list.
+        # Frozen once the gate pins this selection: a glob added to the
+        # catalogue later does not take a path off this list.
         "unmappedPaths": [] if unknown_reason is not None else unmapped,
         "excludedPaths": [] if unknown_reason is not None else excluded,
         "unassessedNativeJourneys": unassessed_native,
@@ -370,17 +422,12 @@ def _write_atomic(path, data):
 
 
 def cmd_match(args):
-    if not re.match(r"^[A-Za-z0-9._-]{1,200}$", args.pin_key):
-        emit({"ok": False, "error": "pin key is not a safe path segment"}, 2)
-    pin_dir = os.path.join(args.state_dir, "journeys")
-    pin_file = os.path.join(pin_dir, "pin-{}.json".format(args.pin_key))
-
-    # A pinned selection IS the campaign's contract: later catalogue edits, a
-    # later poll, and a recovery wake all read it back unchanged.
-    pinned = _read_json(pin_file)
-    if isinstance(pinned, dict) and pinned.get("pinned") is True:
-        emit(pinned)
-
+    """Compute one selection. Pinning is NOT done here: a campaign's pin is
+    shared, immutable state the PR gate owns (journeys_pin_promote), beside
+    the range pin it is derived from. `--snapshot-out` hands the gate the exact
+    catalogue bytes this selection was computed from, so the snapshot it pins
+    is the one that was hashed, not a second read of a file that may have
+    moved."""
     try:
         paths = json.load(sys.stdin)
     except ValueError:
@@ -400,31 +447,9 @@ def cmd_match(args):
     else:
         selection = compute_selection(cat, digest, paths, unknown, args.size, args.run_root, as_of)
     selection.update({"pinned": False, "pinFile": None, "catalogueSnapshot": None})
-
-    if args.pin:
-        try:
-            os.makedirs(pin_dir, exist_ok=True)
-            if raw is not None:
-                snapshot = os.path.join(pin_dir, "catalogue-{}.json".format(digest))
-                if not os.path.exists(snapshot):
-                    _write_atomic(snapshot, raw)
-                selection["catalogueSnapshot"] = snapshot
-            selection.update({"pinned": True, "pinFile": pin_file, "pinnedAt": as_of.strftime("%Y-%m-%dT%H:%M:%SZ")})
-            fd, tmp = tempfile.mkstemp(dir=pin_dir, prefix=".tmp-pin-")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump(selection, fh, separators=(",", ":"))
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.link(tmp, pin_file)  # no-clobber: first writer wins
-            except FileExistsError:
-                winner = _read_json(pin_file)
-                if isinstance(winner, dict):
-                    selection = winner
-            finally:
-                os.unlink(tmp)
-        except OSError as exc:
-            selection.update({"pinned": False, "pinFile": None, "pinError": str(exc)})
+    if args.snapshot_out and raw is not None:
+        with open(args.snapshot_out, "wb") as fh:
+            fh.write(raw)
     emit(selection)
 
 
@@ -525,13 +550,22 @@ def cmd_barrier(args):
     # run's bookkeeping: a pin the gate wrote for this campaign must be in the
     # run byte-for-byte, so skipping pin-run (or pinning a narrowed copy) is a
     # refusal rather than a way out of every check below.
+    #
+    # Only a VALID pin can be adopted. Anything else at a pin's path (a symlink,
+    # a directory, truncated JSON) is what the gate itself reports as
+    # pinState:"invalid" -- scope unrecoverable, campaign `full`, no pinFile to
+    # hand to pin-run -- so there is nothing here to hold the run to.
     gate_pins = []
     for pin_path in args.gate_pin:
+        if os.path.islink(pin_path) or not os.path.isfile(pin_path):
+            continue
         try:
             with open(pin_path, "rb") as fh:
-                gate_pins.append((pin_path, fh.read()))
-        except OSError:
-            gate_pins.append((pin_path, None))
+                raw = fh.read()
+            if json.loads(raw.decode("utf-8")).get("pinned") is True:
+                gate_pins.append((pin_path, raw))
+        except (OSError, ValueError, UnicodeDecodeError, AttributeError):
+            continue
     if gate_pins:
         try:
             with open(selection_path, "rb") as fh:
@@ -690,7 +724,8 @@ def cmd_publish(args):
                 emit({"ok": False, "error": "this proposal changes floor membership or a floor journey's proves/maxIntervalDays/evidence; that is a human call -- pass --floor-authority <where it was approved>"}, 1)
         _write_atomic(os.path.abspath(args.catalogue), new_raw)
     emit({"ok": True, "catalogue": args.catalogue, "sha256": new_digest, "priorSha256": prior_digest,
-          "journeyCount": len(proposed["journeys"]), "floorAuthority": args.floor_authority or None})
+          "journeyCount": len(proposed["journeys"]), "floorAuthority": args.floor_authority or None,
+          "warnings": catalogue_warnings(proposed)})
 
 
 # --- cli --------------------------------------------------------------------
@@ -704,9 +739,7 @@ def main():
 
     p = sub.add_parser("match")
     p.add_argument("--catalogue", required=True)
-    p.add_argument("--state-dir", required=True)
-    p.add_argument("--pin-key", required=True)
-    p.add_argument("--pin", action="store_true")
+    p.add_argument("--snapshot-out", default="")
     p.add_argument("--unknown")
     p.add_argument("--size", default="standard")
     p.add_argument("--run-root", default="")
@@ -740,6 +773,7 @@ def main():
     if args.command == "validate":
         cat, digest, _, errors = load_catalogue(args.catalogue)
         emit({"ok": cat is not None, "sha256": digest, "errors": errors,
+              "warnings": catalogue_warnings(cat) if cat else [],
               "journeyCount": len(cat["journeys"]) if cat else 0}, 0 if cat is not None else 1)
     if args.command == "floor-due":
         cat, _, _, errors = load_catalogue(args.catalogue)

@@ -517,19 +517,23 @@ done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 # and whether it is TRUE is the challenger's question. A run with no pinned
 #
 # WHETHER a run owes this is the gate's decision, never the run's bookkeeping:
-# if the PR gate pinned a selection for this campaign (smoke-journeys.py match
-# --pin writes <gate-state>/journeys/pin-pr-<n>-<claimed sha>.json, and a
-# pr-owned contract's sourceSha IS that claimed sha — require_fenced_source_sha,
-# smoke-run-scaffold.sh:304), the run must hold those exact bytes. Skipping
-# pin-run is therefore a refusal, not an exit from every check below. Same
-# state-dir resolution as the scaffold's fence. No catalogue means no pin, and
-# a run with neither a pin nor a selection is untouched; an unreadable answer
+# if the PR gate pinned a selection for this campaign, the run must hold those
+# exact bytes, so skipping pin-run is a refusal, not an exit from every check
+# below. The pin is `journeys-pin-<repo>-pr-<n>-<head sha>.json` in the SHARED
+# lease directory (smoke-pr-gate.sh journeys_pin_file — campaign ownership is
+# shared, so a second coordinator's barrier finds it too), resolved from the
+# same two env vars the gate and the scaffold use; a pr-owned contract's
+# sourceSha IS that head sha (require_fenced_source_sha, smoke-run-scaffold.sh:309).
+# Only a VALID pin binds: an invalid one is what the gate itself reports as
+# unrecoverable/`full`, with nothing to adopt. No catalogue means no pin, and a
+# run with neither a pin nor a selection is untouched; an unreadable answer
 # fails closed.
+JOURNEY_LEASE_DIR="${SMOKE_GATE_LEASE_DIR:-${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases}"
 JOURNEY_PIN_ARGS=()
 if [ "$(jq -r '.ownershipKind' "$CONTRACT")" = pr ]; then
   while IFS= read -r gate_pin; do
     JOURNEY_PIN_ARGS+=(--gate-pin "$gate_pin")
-  done < <(compgen -G "${SMOKE_GATE_STATE_DIR:-/workspace/agent/smoke-gate}/journeys/pin-pr-*-$SOURCE_SHA.json" || true)
+  done < <(compgen -G "$JOURNEY_LEASE_DIR/journeys-pin-*-pr-*-$SOURCE_SHA.json" || true)
 fi
 if [ -e "$RUN_DIR/journeys/selection.json" ] || [ "${#JOURNEY_PIN_ARGS[@]}" -gt 0 ]; then
   journeys_result="$(python3 "$SCRIPT_DIR/smoke-journeys.py" barrier "$RUN_DIR" \

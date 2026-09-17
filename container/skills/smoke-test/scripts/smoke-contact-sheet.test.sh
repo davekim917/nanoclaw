@@ -17,9 +17,23 @@ trap 'rm -rf "$WORK"' EXIT
 #
 #   open <url>            containing FAIL-OPEN   -> exit 1
 #   click <selector>       containing FAIL-CLICK  -> exit 1
-#   screenshot --full <p>  path containing FAIL-SHOT -> exit 1
-#   eval <js>               always prints a fixed stub build sha
-#   wait 1600              fails when AGENT_BROWSER_STUB_FAIL_MOBILE_SETTLE=1
+#   open <url>            under https://baseline.test when
+#                         AGENT_BROWSER_STUB_FAIL_BASELINE=1 -> exit 1
+#   screenshot [--full] <p>  path containing FAIL-SHOT -> exit 1
+#   eval location.pathname  prints the path of the session's last `open`,
+#                           except: "/login" for the origin named by
+#                           AGENT_BROWSER_STUB_LOGIN_REDIRECT=head|baseline,
+#                           and "/moved" when that url contains NAVSTEP
+#   eval <js>               the freeze script prints "frozen" (exit 1 when
+#                           AGENT_BROWSER_STUB_FAIL_FREEZE=1); anything else
+#                           prints a fixed stub build sha
+#   --json diff screenshot --baseline <f> -o <out>
+#                           prints the real 0.33.0 JSON shape. A settle check
+#                           (<out> is the script's *.settle.png) matches unless
+#                           AGENT_BROWSER_STUB_UNSETTLED=1. A base-vs-head
+#                           diff matches unless the baseline path contains
+#                           CHANGED (4.5%, writes <out>) or MISMATCH
+#                           (dimensionMismatch); a missing baseline is exit 1.
 # Every other verb (state, set, find, wait, close) always succeeds.
 # ---------------------------------------------------------------------------
 STUB_BIN="$WORK/bin"
@@ -37,6 +51,7 @@ printf '%s\n' "\$*" >>"$STUB_LOG"
 
 SESSION=""
 if [ "\$1" = "--session" ]; then SESSION="\$2"; shift 2; fi
+if [ "\${1:-}" = "--json" ]; then shift; fi
 VERB="\${1:-}"
 shift || true
 
@@ -45,13 +60,49 @@ case "\$VERB" in
     exit 0
     ;;
   open)
+    printf '%s' "\${1:-}" >"$WORK/loc-\$SESSION"
     case "\${1:-}" in
       *FAIL-OPEN*) echo "stub: navigation failed" >&2; exit 1 ;;
+      https://baseline.test*)
+        if [ "\${AGENT_BROWSER_STUB_FAIL_BASELINE:-}" = 1 ]; then
+          echo "stub: baseline unreachable" >&2; exit 1
+        fi
+        echo "✓ stub open"; exit 0 ;;
       *) echo "✓ stub open"; exit 0 ;;
     esac
     ;;
   eval)
-    echo "stub-build-sha-123"
+    case "\${1:-}" in
+      location.pathname)
+        LOC="\$(cat "$WORK/loc-\$SESSION")"
+        case "\${AGENT_BROWSER_STUB_LOGIN_REDIRECT:-}:\$LOC" in
+          baseline:https://baseline.test*|head:https://example.test*) echo '"/login"'; exit 0 ;;
+        esac
+        case "\$LOC" in
+          *NAVSTEP*) echo '"/moved"' ;;
+          *) LOC="/\$(printf '%s' "\$LOC" | cut -d/ -f4-)"; echo "\"\${LOC%%[?#]*}\"" ;;
+        esac ;;
+      *smoke-contact-sheet-freeze*)
+        if [ "\${AGENT_BROWSER_STUB_FAIL_FREEZE:-}" = 1 ]; then
+          echo "stub: eval failed" >&2; exit 1
+        fi
+        echo '"frozen"' ;;
+      *) echo "stub-build-sha-123" ;;
+    esac
+    exit 0
+    ;;
+  diff)
+    BASELINE="\$3"; OUT="\$5"
+    [ -s "\$BASELINE" ] || { echo '{"success":false,"data":null,"error":"Failed to read baseline: No such file or directory (os error 2)"}'; exit 1; }
+    MATCH=true; PCT=0.0; PIXELS=0; MISMATCH=null
+    case "\$OUT:\$BASELINE" in
+      *.settle.png:*) [ "\${AGENT_BROWSER_STUB_UNSETTLED:-}" = 1 ] && { MATCH=false; PCT=1.0; PIXELS=11520; } ;;
+      *MISMATCH*-base.png) MATCH=false; PCT=100.0; PIXELS=1152000
+        MISMATCH='{"actual":{"height":844,"width":390},"expected":{"height":900,"width":1280}}' ;;
+      *CHANGED*-base.png) MATCH=false; PCT=4.5; PIXELS=51840 ;;
+    esac
+    [ "\$MATCH" = true ] || printf '%s' "$TINY_PNG_B64" | base64 -d >"\$OUT"
+    echo "{\"success\":true,\"data\":{\"diffPath\":\"\$OUT\",\"differentPixels\":\$PIXELS,\"dimensionMismatch\":\$MISMATCH,\"match\":\$MATCH,\"mismatchPercentage\":\$PCT,\"totalPixels\":1152000},\"error\":null}"
     exit 0
     ;;
   set)
@@ -86,10 +137,6 @@ case "\$VERB" in
     esac
     ;;
   wait)
-    if [ "\${AGENT_BROWSER_STUB_FAIL_MOBILE_SETTLE:-}" = 1 ] && [ "\${1:-}" = 1600 ]; then
-      echo "stub: mobile viewport did not settle" >&2
-      exit 1
-    fi
     exit 0
     ;;
   close)
@@ -175,18 +222,38 @@ GRID_SHOT_LINE="$(grep -n -- "^--session $GRID_SESSION screenshot --full .*sheet
   [ "$GRID_OPEN_LINE" -lt "$GRID_VIEWPORT_LINE" ] && [ "$GRID_VIEWPORT_LINE" -lt "$GRID_SHOT_LINE" ] \
   || { echo "happy path: grid must open, set viewport, then screenshot in its cold session" >&2; exit 1; }
 
-# Resizing down to phone width can start an app's responsive drawer transition.
-# The mobile shot must wait through the fixed settle interval after that
-# viewport change; the network-idle wait earlier in the flow happens before
-# either viewport is changed and cannot cover this transition.
-MOBILE_SESSION="$(awk '$1=="--session" && $3=="set" && $4=="viewport" && $5=="390" && $6=="844"{print $2; exit}' "$STUB_LOG")"
-[ -n "$MOBILE_SESSION" ] || { echo "happy path: no mobile viewport call recorded" >&2; exit 1; }
-MOBILE_VIEWPORT_LINE="$(grep -n -- "^--session $MOBILE_SESSION set viewport 390 844$" "$STUB_LOG" | head -1 | cut -d: -f1)"
-MOBILE_SETTLE_LINE="$(grep -n -- "^--session $MOBILE_SESSION wait 1600$" "$STUB_LOG" | head -1 | cut -d: -f1)"
-MOBILE_SHOT_LINE="$(grep -n -- "^--session $MOBILE_SESSION screenshot --full .*390.png$" "$STUB_LOG" | head -1 | cut -d: -f1)"
-[ -n "$MOBILE_VIEWPORT_LINE" ] && [ -n "$MOBILE_SETTLE_LINE" ] && [ -n "$MOBILE_SHOT_LINE" ] &&
-  [ "$MOBILE_VIEWPORT_LINE" -lt "$MOBILE_SETTLE_LINE" ] && [ "$MOBILE_SETTLE_LINE" -lt "$MOBILE_SHOT_LINE" ] \
-  || { echo "happy path: mobile capture must wait for the post-resize settle interval" >&2; exit 1; }
+# The graded image is a VIEWPORT capture taken frozen and settled: per width,
+# viewport -> freeze -> `screenshot <file>` (no --full) -> settle check against
+# that same file. The full-page image is a separate, clearly named context
+# file taken afterwards, and the manifest says which is which.
+for WIDTH in "1280 900" "390 844"; do
+  W="${WIDTH% *}"
+  SHOT="$RUN1/contact-sheet/shots/00-home-$W.png"
+  VIEWPORT_LINE="$(grep -n -- "scr00 set viewport $WIDTH\$" "$STUB_LOG" | head -1 | cut -d: -f1)"
+  FREEZE_LINE="$(grep -n -- 'scr00 eval .*smoke-contact-sheet-freeze' "$STUB_LOG" | awk -F: -v v="$VIEWPORT_LINE" '$1>v{print $1; exit}')"
+  SHOT_LINE="$(grep -n -- "scr00 screenshot $SHOT\$" "$STUB_LOG" | head -1 | cut -d: -f1)"
+  SETTLE_LINE="$(grep -n -- "scr00 --json diff screenshot --baseline $SHOT " "$STUB_LOG" | head -1 | cut -d: -f1)"
+  FULL_LINE="$(grep -n -- "scr00 screenshot --full .*00-home-$W-full.png\$" "$STUB_LOG" | head -1 | cut -d: -f1)"
+  [ -n "$VIEWPORT_LINE" ] && [ -n "$FREEZE_LINE" ] && [ -n "$SHOT_LINE" ] && [ -n "$SETTLE_LINE" ] && [ -n "$FULL_LINE" ] &&
+    [ "$VIEWPORT_LINE" -lt "$FREEZE_LINE" ] && [ "$FREEZE_LINE" -lt "$SHOT_LINE" ] &&
+    [ "$SHOT_LINE" -lt "$SETTLE_LINE" ] && [ "$SETTLE_LINE" -lt "$FULL_LINE" ] \
+    || { echo "happy path ($W): expected viewport, freeze, viewport screenshot, settle check, then the full-page context shot" >&2; exit 1; }
+done
+grep -q -- ' screenshot --full .*00-home-\(1280\|390\)\.png$' "$STUB_LOG" \
+  && { echo "happy path: the graded file must never be a --full capture" >&2; exit 1; }
+jq -e '.schemaVersion == 2 and .capture.graded == "viewport" and .capture.animationsFrozen == true and
+       ([.screens[] | .desktop, .mobile] | all(.graded == "viewport" and .settled == true and
+         (.fullPage | endswith("-full.png")) and (.file | endswith("-full.png") | not)))' \
+  "$RUN1/contact-sheet/manifest.json" >/dev/null \
+  || { echo "happy path: manifest must name the viewport capture as graded and the full-page file as context" >&2; exit 1; }
+# No baseline given: no baseline is touched and no diff key exists anywhere.
+jq -e '(has("baselineUrl") | not) and (.totals | has("diff") | not) and
+       ([.screens[] | .desktop, .mobile] | all(has("diff") | not))' "$RUN1/contact-sheet/manifest.json" >/dev/null \
+  || { echo "happy path: no baseline given, so the manifest must carry no diff fields" >&2; exit 1; }
+echo "$RESULT" | jq -e 'has("diff") | not' >/dev/null \
+  || { echo "happy path: no baseline given, so the result line must carry no diff counts" >&2; exit 1; }
+grep -q -- '-base[0-9]\|-base\.png\|-basepreflight' "$STUB_LOG" \
+  && { echo "happy path: no baseline given, so no baseline session or file may appear" >&2; exit 1; }
 
 # the click step's text= shorthand must translate to find text ... click, not
 # a raw `click "text=..."` call agent-browser does not understand.
@@ -195,7 +262,7 @@ grep -q ' find text Get started click' "$STUB_LOG" \
 grep -q ' click text=' "$STUB_LOG" \
   && { echo "happy path: text= step must never be passed straight to click" >&2; exit 1; }
 
-echo "1/10 happy path ok"
+echo "1/17 happy path ok"
 
 # --- 2. A failed screen stays as a placeholder, never silently dropped ------
 RUN2="$(fresh_run_dir failed-screen)"
@@ -224,7 +291,7 @@ grep -q 'FAILED' "$RUN2/contact-sheet/grid.html" \
 grep -q 'class="desktop placeholder"' "$RUN2/contact-sheet/grid.html" \
   || { echo "failed screen: expected a desktop placeholder div" >&2; exit 1; }
 
-echo "2/10 failed screen stays a placeholder ok"
+echo "2/17 failed screen stays a placeholder ok"
 
 # --- 3. The 8-screen cap ------------------------------------------------------
 RUN3="$(fresh_run_dir cap)"
@@ -240,7 +307,7 @@ echo "$RESULT" | jq -e '.ok == true and .requested == 10 and .capped == true and
 jq -e '.requested == 10 and .capped == true and (.screens | length) == 8' "$RUN3/contact-sheet/manifest.json" \
   >/dev/null || { echo "cap: manifest did not record the 8-screen cap correctly" >&2; exit 1; }
 
-echo "3/10 8-screen cap ok"
+echo "3/17 8-screen cap ok"
 
 # --- 4. Missing auth state: refuse, never touch the browser ------------------
 RUN4="$(fresh_run_dir no-auth)"
@@ -258,7 +325,7 @@ echo "$RESULT" | jq -e '.ok == false and (.error | test("auth state"))' >/dev/nu
   || { echo "missing auth state: expected a refusal naming the auth state: $RESULT" >&2; exit 1; }
 [ ! -s "$STUB_LOG" ] || { echo "missing auth state: agent-browser must never be invoked" >&2; exit 1; }
 
-echo "4/10 missing auth state refuses before touching the browser ok"
+echo "4/17 missing auth state refuses before touching the browser ok"
 
 # --- 5. Empty shots file: refuse -----------------------------------------------
 RUN5="$(fresh_run_dir empty-shots)"
@@ -284,7 +351,7 @@ set -e
 echo "$RESULT" | jq -e '.ok == false' >/dev/null \
   || { echo "missing shots file: expected a refusal: $RESULT" >&2; exit 1; }
 
-echo "5/10 empty/missing shots file refuses ok"
+echo "5/17 empty/missing shots file refuses ok"
 
 # --- 6. Auth state inside the run dir: refuse ---------------------------------
 # The auth state file holds a live session token; the run dir is a shared,
@@ -307,7 +374,7 @@ echo "$RESULT" | jq -e '.ok == false and (.error | test("run dir"))' >/dev/null 
   || { echo "auth in run dir: expected a refusal naming the run dir: $RESULT" >&2; exit 1; }
 [ ! -s "$STUB_LOG" ] || { echo "auth in run dir: agent-browser must never be invoked" >&2; exit 1; }
 
-echo "6/10 auth state inside the run dir refuses ok"
+echo "6/17 auth state inside the run dir refuses ok"
 
 # --- 7. Auth state under the shared workgroup tree: refuse --------------------
 # Override the workgroup root so the test never depends on /workspace/workgroup
@@ -341,7 +408,7 @@ RESULT="$(SMOKE_WORKGROUP_ROOT="$FAKE_WORKGROUP_ROOT" \
 echo "$RESULT" | jq -e '.ok == true' >/dev/null \
   || { echo "auth under workgroup root: a private auth path must still succeed: $RESULT" >&2; exit 1; }
 
-echo "7/10 auth state under the shared workgroup tree refuses ok"
+echo "7/17 auth state under the shared workgroup tree refuses ok"
 
 # --- 8. Caller-supplied source SHA rides through to the manifest verbatim ---
 # and the page is never sniffed for it (the stub's `eval` verb would answer
@@ -358,10 +425,10 @@ echo "$RESULT" | jq -e '.ok == true' >/dev/null \
   || { echo "source sha: unexpected result: $RESULT" >&2; exit 1; }
 jq -e --arg sha "$FROZEN_SHA" '.buildSha == $sha' "$RUN8/contact-sheet/manifest.json" >/dev/null \
   || { echo "source sha: expected manifest buildSha to be the caller-supplied sha" >&2; exit 1; }
-grep -q ' eval ' "$STUB_LOG" \
+grep -q ' eval (document' "$STUB_LOG" \
   && { echo "source sha: must not sniff the page for a build sha when the caller already supplied one" >&2; exit 1; }
 
-echo "8/10 caller-supplied source sha rides through to the manifest ok"
+echo "8/17 caller-supplied source sha rides through to the manifest ok"
 
 # --- 9. A malformed source SHA is refused, never written into the manifest --
 RUN9="$(fresh_run_dir bad-sha)"
@@ -387,7 +454,7 @@ done
 # behaviour (already covered by the happy path in test 1, which asserts
 # buildSha == "stub-build-sha-123" with no fourth argument given).
 
-echo "9/10 malformed source sha is refused, never written into the manifest ok"
+echo "9/17 malformed source sha is refused, never written into the manifest ok"
 
 # --- 10. Every screen gets its own fresh session (state load THEN open, in
 # that session, before any other screen's session is ever touched) — and the
@@ -457,7 +524,7 @@ cat >"$RUN10B/contact-sheet/shots.json" <<'JSON'
 JSON
 check_fresh_nav "$RUN10B" "/" "/pricing"
 
-echo "10/10 fresh session per screen, order-independent ok"
+echo "10/17 fresh session per screen, order-independent ok"
 
 # --- 11. A grid viewport failure is visible; it must never post a clipped sheet
 RUN11="$(fresh_run_dir grid-viewport-failure)"
@@ -478,22 +545,197 @@ echo "$RESULT" | jq -e '.ok == false and (.error | test("grid viewport"))' >/dev
 grep -q -- ' screenshot --full .*sheet.png$' "$STUB_LOG" \
   && { echo "grid viewport: must not screenshot a grid after viewport failure" >&2; exit 1; }
 
-echo "11/11 grid viewport failure is visible, no clipped sheet emitted"
+echo "11/17 grid viewport failure is visible, no clipped sheet emitted"
 
-# --- 12. A failed mobile settle emits no potentially mid-transition screenshot
-RUN12="$(fresh_run_dir mobile-settle-failure)"
+# --- 12. A page that never settles is captured but flagged, never silently graded
+RUN12="$(fresh_run_dir unsettled)"
 cat >"$RUN12/contact-sheet/shots.json" <<'JSON'
 [{ "name": "home", "path": "/" }]
 JSON
 
 : >"$STUB_LOG"
-RESULT="$(AGENT_BROWSER_STUB_FAIL_MOBILE_SETTLE=1 bash "$SCRIPT" "$RUN12" "https://example.test" "$AUTH_STATE")"
-echo "$RESULT" | jq -e '.ok == true and .captured == 1 and .failed == 0' >/dev/null || { echo "mobile settle: expected a desktop-only partial capture: $RESULT" >&2; exit 1; }
-jq -e '.screens[0].status == "partial" and .screens[0].desktop.captured == true and .screens[0].mobile.captured == false
-       and (.screens[0].mobile.reason | test("settle"))' "$RUN12/contact-sheet/manifest.json" >/dev/null || { echo "mobile settle: expected the unsafely timed mobile capture to be recorded as missing" >&2; exit 1; }
-[ ! -e "$RUN12/contact-sheet/shots/00-home-390.png" ] || { echo "mobile settle: must not write a screenshot after the settle wait fails" >&2; exit 1; }
-grep -q -- ' screenshot --full .*00-home-390.png$' "$STUB_LOG" && { echo "mobile settle: must not invoke screenshot after the settle wait fails" >&2; exit 1; }
+RESULT="$(AGENT_BROWSER_STUB_UNSETTLED=1 bash "$SCRIPT" "$RUN12" "https://example.test" "$AUTH_STATE")"
+echo "$RESULT" | jq -e '.ok == true and .captured == 1' >/dev/null || { echo "unsettled: unexpected result: $RESULT" >&2; exit 1; }
+jq -e '.screens[0].status == "captured" and .screens[0].desktop.settled == false and .screens[0].mobile.settled == false' \
+  "$RUN12/contact-sheet/manifest.json" >/dev/null || { echo "unsettled: expected settled:false on both widths" >&2; exit 1; }
+ATTEMPTS="$(grep -c -- ' screenshot .*00-home-390\.png$' "$STUB_LOG")"
+[ "$ATTEMPTS" -eq 4 ] || { echo "unsettled: expected 4 bounded capture attempts at 390, saw $ATTEMPTS" >&2; exit 1; }
+grep -q 'badge-failed">unsettled<' "$RUN12/contact-sheet/grid.html" \
+  || { echo "unsettled: expected an unsettled badge on the tile" >&2; exit 1; }
 
-echo "12/12 mobile settle failure stays visible, no timing-artifact screenshot emitted"
+# A freeze that cannot be applied fails the capture: an unfrozen image is
+# never emitted as graded evidence.
+RUN12B="$(fresh_run_dir freeze-failure)"
+cp "$RUN12/contact-sheet/shots.json" "$RUN12B/contact-sheet/shots.json"
+: >"$STUB_LOG"
+set +e
+RESULT="$(AGENT_BROWSER_STUB_FAIL_FREEZE=1 bash "$SCRIPT" "$RUN12B" "https://example.test" "$AUTH_STATE" "abcdef0123456789abcdef0123456789abcdef01")"
+EC=$?
+set -e
+[ "$EC" -eq 1 ] || { echo "freeze failure: expected exit 1 (zero screens captured), got $EC" >&2; exit 1; }
+jq -e '.screens[0].status == "failed" and (.screens[0].desktop.reason | test("freeze"))' \
+  "$RUN12B/contact-sheet/manifest.json" >/dev/null || { echo "freeze failure: expected a freeze reason" >&2; exit 1; }
+grep -q -- ' screenshot .*00-home' "$STUB_LOG" && { echo "freeze failure: must not screenshot an unfrozen page" >&2; exit 1; }
+
+echo "12/17 unsettled page is flagged; unfrozen page is never captured"
+
+# --- 13. Baseline diff: identical recipe, read-only, per-width diff, ordered sheet
+RUN13="$(fresh_run_dir baseline)"
+cat >"$RUN13/contact-sheet/shots.json" <<'JSON'
+[
+  { "name": "same", "path": "/same" },
+  { "name": "CHANGED-screen", "path": "/changed", "steps": ["click text=Pricing", "wait 200"] },
+  { "name": "MISMATCH-screen", "path": "/mismatch" }
+]
+JSON
+BASE_AUTH="$WORK/baseline-auth-state.json"
+printf '{"cookies":[],"origins":[]}' >"$BASE_AUTH"
+FROZEN_SHA="abcdef0123456789abcdef0123456789abcdef01"
+
+: >"$STUB_LOG"
+RESULT="$(bash "$SCRIPT" "$RUN13" "https://example.test" "$AUTH_STATE" "" "https://baseline.test/" "$BASE_AUTH")"
+echo "$RESULT" | jq -e '.ok == true and .captured == 3 and .diff == {changed:2, unchanged:2, failed:2}' >/dev/null \
+  || { echo "baseline: unexpected result: $RESULT" >&2; exit 1; }
+M13="$RUN13/contact-sheet/manifest.json"
+jq -e '.baselineUrl == "https://baseline.test/" and .totals.diff == {changed:2, unchanged:2, failed:2} and
+       [.screens[].name] == ["same", "CHANGED-screen", "MISMATCH-screen"]' "$M13" >/dev/null \
+  || { echo "baseline: manifest must record the baseline url, diff totals, and keep shots.json order" >&2; exit 1; }
+jq -e '.screens[0].desktop.diff == {status:"unchanged", pct:0, differentPixels:0, image:null, baseline:"shots/00-same-1280-base.png"}' \
+  "$M13" >/dev/null || { echo "baseline: unchanged screen recorded wrong: $(jq -c '.screens[0].desktop.diff' "$M13")" >&2; exit 1; }
+jq -e '.screens[1].mobile.diff == {status:"changed", pct:4.5, differentPixels:51840,
+        image:"shots/01-CHANGED-screen-390-diff.png", baseline:"shots/01-CHANGED-screen-390-base.png"}' \
+  "$M13" >/dev/null || { echo "baseline: changed screen recorded wrong: $(jq -c '.screens[1].mobile.diff' "$M13")" >&2; exit 1; }
+[ -s "$RUN13/contact-sheet/shots/01-CHANGED-screen-390-diff.png" ] && [ -s "$RUN13/contact-sheet/shots/01-CHANGED-screen-390-base.png" ] \
+  || { echo "baseline: expected the diff and baseline images on disk" >&2; exit 1; }
+jq -e '.screens[2].desktop.captured == true and .screens[2].desktop.diff.status == "failed" and
+       (.screens[2].desktop.diff.reason | test("dimension mismatch"))' "$M13" >/dev/null \
+  || { echo "baseline: a dimension mismatch must be a failed diff, never a 100% change" >&2; exit 1; }
+jq -e '.buildSha == "stub-build-sha-123"' "$M13" >/dev/null \
+  || { echo "baseline: an empty source-sha argument must still fall back to the head page sniff" >&2; exit 1; }
+
+# Sheet order: changed first, then diff-failed, then unchanged.
+ORDER="$(grep -o '<div class="label">[^<]*' "$RUN13/contact-sheet/grid.html" | sed 's/.*>//' | tr '\n' ' ')"
+[ "$ORDER" = "CHANGED-screen MISMATCH-screen same " ] || { echo "baseline: sheet order was: $ORDER" >&2; exit 1; }
+grep -q 'badge-changed">changed 4.50%<' "$RUN13/contact-sheet/grid.html" &&
+  grep -q 'badge-unchanged">unchanged<' "$RUN13/contact-sheet/grid.html" &&
+  grep -q 'badge-failed">diff failed: dimension mismatch' "$RUN13/contact-sheet/grid.html" &&
+  grep -q '<img class="mobile diff" src="shots/01-CHANGED-screen-390-diff.png">' "$RUN13/contact-sheet/grid.html" \
+  || { echo "baseline: expected changed/unchanged/failed badges and the diff overlay in the grid" >&2; exit 1; }
+
+# Identical recipe: strip the session name, the origin, the auth path and the
+# -base file suffix, and the baseline session's command list must equal the
+# head's minus the head-only commands (build-sha sniff, base-vs-head diff,
+# full-page context shot).
+normalize() {
+  grep -- "^--session [^ ]*-$1 " "$STUB_LOG" | cut -d' ' -f3- |
+    sed -e 's#https://[a-z]*\.test#ORIGIN#' -e "s#$AUTH_STATE\|$BASE_AUTH#AUTH#" -e 's#-base\.png#.png#g'
+}
+HEAD_RECIPE="$(normalize scr01 | grep -v -- '^eval (document\|^screenshot --full \| -o [^ ]*-diff\.png$')"
+BASE_RECIPE="$(normalize base01)"
+[ -n "$BASE_RECIPE" ] && [ "$HEAD_RECIPE" = "$BASE_RECIPE" ] || {
+  echo "baseline: head and baseline recipes differ" >&2
+  diff <(printf '%s\n' "$HEAD_RECIPE") <(printf '%s\n' "$BASE_RECIPE") >&2 || true
+  exit 1
+}
+# Read-only: a baseline session runs only these verbs, never a --full shot or
+# a build-sha sniff, and loads the baseline auth state, never the head's.
+BASE_VERBS="$(grep -- '^--session [^ ]*-base[0-9]* ' "$STUB_LOG" | cut -d' ' -f3- | sed 's/^--json //' | cut -d' ' -f1 | sort -u | tr '\n' ' ')"
+[ "$BASE_VERBS" = "close diff eval find open screenshot set state wait " ] \
+  || { echo "baseline: unexpected verbs in a baseline session: $BASE_VERBS" >&2; exit 1; }
+grep -- '^--session [^ ]*-base[0-9]* ' "$STUB_LOG" | grep -q -- '--full\|eval (document' \
+  && { echo "baseline: baseline sessions must never take a full-page shot or sniff a sha" >&2; exit 1; }
+grep -q -- "-base[0-9]* state load $AUTH_STATE\$" "$STUB_LOG" \
+  && { echo "baseline: baseline sessions must load the baseline auth state" >&2; exit 1; }
+grep -q -- 'baseline-auth-state\|auth-state.json' "$M13" "$RUN13/contact-sheet/grid.html" \
+  && { echo "baseline: no auth state path may reach the shared evidence" >&2; exit 1; }
+SESSIONS_USED="$(grep -o '^--session [^ ]*' "$STUB_LOG" | sort -u | wc -l)"
+CLOSED_SESSIONS="$(awk '$1=="--session" && $3=="close"{print $2}' "$STUB_LOG" | sort -u | wc -l)"
+[ "$SESSIONS_USED" -eq 9 ] && [ "$CLOSED_SESSIONS" -eq 9 ] \
+  || { echo "baseline: expected 9 sessions (2 preflights + 3 base + 3 head + grid) all closed, saw $SESSIONS_USED/$CLOSED_SESSIONS" >&2; exit 1; }
+
+echo "13/17 baseline diff: identical read-only recipe, per-width diff, ordered sheet ok"
+
+# --- 14. A baseline that cannot be captured degrades to "no diff", head untouched
+RUN14="$(fresh_run_dir baseline-down)"
+cat >"$RUN14/contact-sheet/shots.json" <<'JSON'
+[{ "name": "home", "path": "/" }]
+JSON
+RESULT="$(AGENT_BROWSER_STUB_FAIL_BASELINE=1 bash "$SCRIPT" "$RUN14" "https://example.test" "$AUTH_STATE" "$FROZEN_SHA" "https://baseline.test")"
+echo "$RESULT" | jq -e '.ok == true and .captured == 1 and .failed == 0 and .diff == {changed:0, unchanged:0, failed:2}' >/dev/null \
+  || { echo "baseline down: head capture must be unaffected: $RESULT" >&2; exit 1; }
+jq -e '.screens[0].status == "captured" and .screens[0].desktop.captured == true and
+       .screens[0].desktop.diff.status == "failed" and (.screens[0].desktop.diff.reason | test("baseline: open .*unreachable"))' \
+  "$RUN14/contact-sheet/manifest.json" >/dev/null || { echo "baseline down: expected a recorded reason" >&2; exit 1; }
+[ ! -e "$RUN14/contact-sheet/shots/00-home-1280-base.png" ] || { echo "baseline down: no baseline image expected" >&2; exit 1; }
+
+echo "14/17 baseline failure degrades to no diff with a reason ok"
+
+# --- 15. Baseline auth state obeys the same placement refusal ------------------
+RUN15="$(fresh_run_dir baseline-auth-in-rundir)"
+cp "$RUN14/contact-sheet/shots.json" "$RUN15/contact-sheet/shots.json"
+printf '{"cookies":[],"origins":[]}' >"$RUN15/contact-sheet/base-auth.json"
+: >"$STUB_LOG"
+set +e
+RESULT="$(bash "$SCRIPT" "$RUN15" "https://example.test" "$AUTH_STATE" "" "https://baseline.test" "$RUN15/contact-sheet/base-auth.json" 2>&1)"
+EC=$?
+set -e
+[ "$EC" -eq 2 ] || { echo "baseline auth in run dir: expected exit 2, got $EC" >&2; exit 1; }
+[ ! -s "$STUB_LOG" ] || { echo "baseline auth in run dir: agent-browser must never be invoked" >&2; exit 1; }
+set +e
+RESULT="$(bash "$SCRIPT" "$RUN15" "https://example.test" "$AUTH_STATE" "" "ftp://baseline.test" 2>&1)"
+EC=$?
+set -e
+[ "$EC" -eq 2 ] || { echo "bad baseline url: expected exit 2, got $EC" >&2; exit 1; }
+
+echo "15/17 baseline auth state placement and url are validated ok"
+
+# --- 16. A baseline bounced to a login route is a FAILED diff, never `changed`
+RUN16="$(fresh_run_dir baseline-login-redirect)"
+cat >"$RUN16/contact-sheet/shots.json" <<'JSON'
+[{ "name": "CHANGED-settings", "path": "/settings/?tab=pricing" }]
+JSON
+: >"$STUB_LOG"
+RESULT="$(AGENT_BROWSER_STUB_LOGIN_REDIRECT=baseline bash "$SCRIPT" "$RUN16" "https://example.test" "$AUTH_STATE" "$FROZEN_SHA" "https://baseline.test")"
+echo "$RESULT" | jq -e '.ok == true and .captured == 1 and .diff == {changed:0, unchanged:0, failed:2}' >/dev/null \
+  || { echo "baseline login redirect: unexpected result: $RESULT" >&2; exit 1; }
+jq -e '[.screens[0].desktop, .screens[0].mobile] | all(.captured == true and .diff.status == "failed" and
+        (.diff.reason | test("baseline: landed on /login, expected /settings ")))' \
+  "$RUN16/contact-sheet/manifest.json" >/dev/null \
+  || { echo "baseline login redirect: expected failed diffs naming both paths: $(jq -c '.screens[0].desktop' "$RUN16/contact-sheet/manifest.json")" >&2; exit 1; }
+ls "$RUN16/contact-sheet/shots/" | grep -q -- '-base\.png\|-diff\.png' \
+  && { echo "baseline login redirect: no login-page baseline or diff image may be kept" >&2; exit 1; }
+grep -q -- ' -o [^ ]*-diff\.png$' "$STUB_LOG" \
+  && { echo "baseline login redirect: must not diff against a redirected baseline" >&2; exit 1; }
+
+echo "16/17 redirected baseline is a failed diff with a reason, never changed ok"
+
+# --- 17. The head obeys the same rule; finalPath declares an intended navigation
+RUN17="$(fresh_run_dir head-login-redirect)"
+cp "$RUN16/contact-sheet/shots.json" "$RUN17/contact-sheet/shots.json"
+set +e
+RESULT="$(AGENT_BROWSER_STUB_LOGIN_REDIRECT=head bash "$SCRIPT" "$RUN17" "https://example.test" "$AUTH_STATE" "$FROZEN_SHA" "https://baseline.test")"
+EC=$?
+set -e
+[ "$EC" -eq 1 ] || { echo "head login redirect: expected exit 1 (zero screens captured), got $EC" >&2; exit 1; }
+jq -e '.screens[0].status == "failed" and .screens[0].desktop.file == null and
+       (.screens[0].desktop.reason | test("landed on /login, expected /settings ")) and
+       .screens[0].desktop.diff == {status:"failed", reason:"head not captured"}' \
+  "$RUN17/contact-sheet/manifest.json" >/dev/null || { echo "head login redirect: expected a failed head capture with both paths named" >&2; exit 1; }
+[ ! -e "$RUN17/contact-sheet/shots/00-CHANGED-settings-1280.png" ] \
+  || { echo "head login redirect: a login-page image must not be kept as the graded file" >&2; exit 1; }
+
+RUN17B="$(fresh_run_dir final-path)"
+cat >"$RUN17B/contact-sheet/shots.json" <<'JSON'
+[
+  { "name": "declared", "path": "/NAVSTEP", "steps": ["click text=Details"], "finalPath": "/moved/" },
+  { "name": "undeclared", "path": "/NAVSTEP", "steps": ["click text=Details"] }
+]
+JSON
+RESULT="$(bash "$SCRIPT" "$RUN17B" "https://example.test" "$AUTH_STATE" "$FROZEN_SHA")"
+jq -e '.screens[0].status == "captured" and .screens[1].status == "failed" and
+       (.screens[1].mobile.reason | test("landed on /moved, expected /NAVSTEP "))' \
+  "$RUN17B/contact-sheet/manifest.json" >/dev/null || { echo "finalPath: a declared navigation must capture, an undeclared one must fail" >&2; exit 1; }
+
+echo "17/17 redirected head fails with a reason; finalPath declares an intended navigation ok"
 
 echo "smoke contact sheet tests passed"

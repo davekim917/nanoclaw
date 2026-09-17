@@ -1,7 +1,10 @@
 {
   "_comment": "FICTIONAL example for a made-up 'Lantern Library' app (web + mobile monorepo). It documents the catalogue shape and is the test fixture for smoke-journeys.py. An install's real catalogue lives beside its standing instructions as journeys.json, never here.",
   "schemaVersion": 1,
-  "excludePaths": [".github/**", "docs/**", "**/*.md"],
+  "excludePaths": [
+    { "glob": "docs/internal/**", "reason": "contributor notes; never built, served or shipped" },
+    { "glob": "tools/lint/**", "reason": "lint rule sources; CI is the watcher and nothing a user runs loads them" }
+  ],
   "journeys": [
     {
       "id": "loan-desk-checkout",
