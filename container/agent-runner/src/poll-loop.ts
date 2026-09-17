@@ -28,6 +28,8 @@ import {
   advanceMemoryContextEpoch,
   beginProviderBusyScope,
   classifyTrigger,
+  hasChatOutboundAfter,
+  maxOutboundSeq,
   clearDoneProposal,
   clearStickyEffort,
   clearStickyModel,
@@ -1536,6 +1538,15 @@ function hasRealInbound(messages: MessageInRow[]): boolean {
   });
 }
 
+/**
+ * The person's message that engaged the agent, if the batch holds one: an
+ * admissible trigger (so not a /clear-style command — isAdmissibleTrigger),
+ * not a peer agent's, not host-authored.
+ */
+function triggeringHumanInbound(messages: MessageInRow[]): MessageInRow | undefined {
+  return messages.find((m) => isAdmissibleTrigger(m) && m.channel_type !== 'agent' && hasRealInbound([m]));
+}
+
 function isContinuationRecoveryBatch(messages: MessageInRow[]): boolean {
   if (hasRealInbound(messages)) return false;
   return messages.some((message) => {
@@ -1728,6 +1739,35 @@ export async function processQuery(
   let taskBlockNudged = false;
   // Complete <message> blocks already delivered from this turn's interim text.
   const deliveredInterimBlocks = new Set<string>();
+  // Set when a person's triggering message is admitted: the outbound watermark
+  // at that moment and the conversation it came from. Null when no such
+  // message is owed a reply. Read at an empty `result`. Decided from the
+  // admitted ROWS, not `trigger`: classifyTrigger is cost accounting and calls
+  // a batch holding both a task and a person's message `scheduled`
+  // (modules/mailbox/selection.ts, task check precedes chat).
+  // `routing.taskRun` is the OPENING batch's, on purpose: it is the same
+  // authority the result handler dispatches under, and in a task run final-text
+  // <message> blocks are inert (formatter.ts, RoutingContext.taskRun), so the
+  // nudge would ask for a reply that cannot be delivered.
+  type ReplyDebt = { sinceSeq: number; channelType: string | null; platformId: string | null };
+  // The channel is the PERSON'S row's, not the batch anchor's: extractRouting
+  // anchors a mixed batch on its task row (formatter.ts, "task row" anchor),
+  // which is the task's destination, not where the person is. "Has its own
+  // routing" is extractRouting's test — a platform_id (formatter.ts:307-311).
+  const replyDebt = (rows: MessageInRow[], from: RoutingContext): ReplyDebt | null => {
+    const human = routing.taskRun ? undefined : triggeringHumanInbound(rows);
+    if (!human) return null;
+    const own = human.platform_id != null;
+    return {
+      sinceSeq: maxOutboundSeq(),
+      channelType: own ? (human.channel_type ?? null) : from.channelType,
+      platformId: own ? human.platform_id : from.platformId,
+    };
+  };
+  let humanReplyOwed: ReplyDebt | null = replyDebt(
+    initialBatchIds.map((id) => getMessageIn(id)).filter((m): m is MessageInRow => m != null),
+    routing,
+  );
   // Retryable (e.g. SDK `api_retry`) events are the SDK's own mid-stream retry
   // signal, NOT a turn-ending error. Record the last one but keep consuming so
   // the SDK's internal retry can still produce a result; only surface it if the
@@ -2151,6 +2191,11 @@ export async function processQuery(
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;
+        // Every new check-in restarts the watermark: a progress message sent
+        // for the earlier request is not an answer to this one.
+        const pushedDebt = replyDebt(keep, followUpRouting);
+        const pushedHumanTrigger = pushedDebt !== null;
+        if (pushedDebt) humanReplyOwed = pushedDebt;
         // A later occurrence joining this stream is a SEPARATE fire and needs
         // its own outcome slot. Without this it answered into the first fire's
         // slot — or, once that was filled, vanished — so a frequently failing
@@ -2164,7 +2209,19 @@ export async function processQuery(
             taskTurns.push(admittedTurn);
           }
         }
-        const pushedId = pushToQuery(prompt, extractAttachments(keep));
+        // A push into a RUNNING turn is merged into it, and that turn's
+        // `result` may be an hour away. Text written between tool calls is
+        // never dispatched (only the result text is — dispatchResultText), so
+        // an "on it" typed there reaches nobody. Observed live 2026-09-17: a
+        // person's five check-ins over 23 hours were each answered that way
+        // and none was delivered.
+        const midTurnNote =
+          pushedHumanTrigger && !turnIdle
+            ? '\n\n<system>Reminder: text you write between tool calls is NOT ' +
+              'delivered. To answer now, call the `send_message` tool; otherwise answer in <message to="name"> ' +
+              'blocks when the turn ends.</system>'
+            : '';
+        const pushedId = pushToQuery(prompt + midTurnNote, extractAttachments(keep));
         if (admittedTurn && pushedId) admittedTurn.promptIds = [pushedId];
         archivePrompts.push({ prompt });
         admittedInbound = true;
@@ -2531,6 +2588,17 @@ export async function processQuery(
             if (!willRetryWrapping && !willRetryTaskBlocks) {
               completeDeliveredPrompt();
             }
+            // Settled when the person's conversation got a row, or the agent
+            // deliberately sent nothing (<internal> only, or the one nudge is
+            // spent). Blocks sent only ELSEWHERE leave it open, the same
+            // question hasChatOutboundAfter answers for send_message.
+            if (
+              humanReplyOwed &&
+              !willRetryWrapping &&
+              answersRunnerPrompt &&
+              ((sent === 0 && !hasUnwrapped) || hasChatOutboundAfter(humanReplyOwed.sinceSeq, humanReplyOwed))
+            )
+              humanReplyOwed = null;
           }
         } else {
           // `ProviderEvent.text` is `string | null`, so a terminal result can
@@ -2544,7 +2612,36 @@ export async function processQuery(
               event.answeredPrompts,
             );
           }
-          pauseAnsweredPrompt();
+          // An empty result is normally fine — the agent answered through
+          // `send_message`, or the message needed no answer. It is NOT fine
+          // when a person's triggering message is owed a reply and nothing
+          // readable was written since it was admitted: the wrapping nudge
+          // above keys on unwrapped RESULT text, so an agent that typed its
+          // answer between tool calls and then ended the turn empty got no
+          // nudge at all (2026-09-17, same thread as the mid-turn note).
+          // One nudge per batch, shared with the wrapping retry.
+          const replyOwed =
+            humanReplyOwed !== null &&
+            answersRunnerPrompt &&
+            event.isError !== true &&
+            !hasChatOutboundAfter(humanReplyOwed.sinceSeq, humanReplyOwed);
+          if (replyOwed && !unwrappedNudged) {
+            unwrappedNudged = true;
+            const names = getAllDestinations()
+              .map((d) => d.name)
+              .join(', ');
+            pushToQuery(
+              `<system>Your turn ended without delivering anything to the person who wrote to you. Text written ` +
+                `between tool calls is not delivered. Reply now in <message to="name">...</message> blocks ` +
+                `(destinations: ${names}), or, if no reply is warranted, answer with <internal>no reply</internal>.</system>`,
+            );
+            // Like the wrapping retry, the nudged result answers the SAME
+            // prompt. A continuation at the ledger head still has to be paused.
+            if (archivePrompts[0]?.continuationId) pauseAnsweredPrompt();
+          } else {
+            if (answersRunnerPrompt) humanReplyOwed = null;
+            pauseAnsweredPrompt();
+          }
         }
         // A provisional outcome stays only while a fire it could answer is open.
         if (provisional) {

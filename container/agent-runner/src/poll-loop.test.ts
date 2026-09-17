@@ -3241,6 +3241,315 @@ describe('error result with no <message> envelope', () => {
   });
 });
 
+describe("a person's message that got nothing delivered", () => {
+  // Live 2026-09-17: an agent answered five check-ins as text between tool
+  // calls and ended each turn with an empty result. Nothing was delivered and
+  // the wrapping nudge, which keys on unwrapped RESULT text, never fired.
+  // The debt is read off the admitted ROWS, so the initial batch needs one.
+  const human = (query: AgentQuery, ids = ['m1']) => {
+    insertMessage('m1', 'chat', { sender: 'Operator', senderId: 'U1', text: 'checking in' });
+    return processQuery(query, ERR_ROUTING, ids, 'claude', undefined, 'prompt', undefined, {});
+  };
+  const emptyTurn = (before?: () => Promise<unknown>) => {
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      await before?.();
+      yield { type: 'result', text: null };
+    }
+    const query: AgentQuery = {
+      push: (m: string) => void pushes.push(m),
+      end: () => {},
+      abort: () => {},
+      events: events(),
+    };
+    return { query, pushes };
+  };
+
+  it('nudges once when a human-triggered turn ends empty with nothing delivered', async () => {
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      yield { type: 'result', text: null };
+      yield { type: 'result', text: null };
+    }
+    await human({ push: (m: string) => void pushes.push(m), end: () => {}, abort: () => {}, events: events() });
+
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain('without delivering anything');
+  });
+
+  it('does not nudge when the agent answered through send_message mid-turn', async () => {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      await writeMessageOut({
+        id: 'sent-mid-turn',
+        kind: 'chat',
+        channel_type: 'discord',
+        platform_id: 'chan-1',
+        content: JSON.stringify({ text: 'on it' }),
+      });
+      yield { type: 'result', text: null };
+    }
+    await human({ push: (m: string) => void pushes.push(m), end: () => {}, abort: () => {}, events: events() });
+
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('does not count a status label as a delivered reply', async () => {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      await writeMessageOut({ id: 'label', kind: 'status', content: JSON.stringify({ text: '> thinking' }) });
+      yield { type: 'result', text: null };
+    }
+    await human({ push: (m: string) => void pushes.push(m), end: () => {}, abort: () => {}, events: events() });
+
+    expect(pushes).toHaveLength(1);
+  });
+
+  it('does not take a message to a peer agent or another channel for the reply', async () => {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    const { query, pushes } = emptyTurn(async () => {
+      await writeMessageOut({
+        id: 'to-peer',
+        kind: 'chat',
+        channel_type: 'agent',
+        platform_id: 'ag-peer',
+        content: JSON.stringify({ text: 'please take this' }),
+      });
+      await writeMessageOut({
+        id: 'elsewhere',
+        kind: 'chat',
+        channel_type: 'discord',
+        platform_id: 'chan-other',
+        content: JSON.stringify({ text: 'fyi' }),
+      });
+    });
+    await human(query);
+
+    expect(pushes).toHaveLength(1);
+  });
+
+  it('owes the person a reply when a task shares the initial batch with their message', async () => {
+    insertMessage('t1', 'task', { prompt: 'nightly digest' });
+    const { query, pushes } = emptyTurn();
+    await human(query, ['t1', 'm1']);
+
+    expect(pushes).toHaveLength(1);
+  });
+
+  // Loose on purpose: a false "not replied" makes the agent answer twice, and
+  // no single writer decides which thread a reply lands in (reads.ts).
+  it("counts any reply in the person's channel, whatever thread or key it carries", async () => {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    insertMessage('m1', 'chat', { sender: 'Operator', senderId: 'U1', text: 'checking in' });
+    for (const extra of [{ thread_id: 'chan-1:some-other-thread' }, { thread_id: null }]) {
+      const { query, pushes } = emptyTurn(() =>
+        writeMessageOut({
+          id: `loose-${String(extra.thread_id)}`,
+          kind: 'chat',
+          channel_type: 'discord',
+          platform_id: 'chan-1',
+          ...extra,
+          content: JSON.stringify({ text: 'update', threadKey: 'db-backup-42' }),
+        }),
+      );
+      await processQuery(
+        query,
+        { ...ERR_ROUTING, threadId: 'chan-1:T' },
+        ['m1'],
+        'claude',
+        undefined,
+        'p',
+        undefined,
+        {},
+      );
+      expect(pushes).toHaveLength(0);
+    }
+  });
+
+  it("scopes the debt to the person's own channel when the batch is anchored elsewhere", async () => {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, platform_id, channel_type, thread_id, content)
+         VALUES ('h1', 'chat', datetime('now'), 'pending', 1, 'chan-9', 'discord', NULL, ?)`,
+      )
+      .run(JSON.stringify({ sender: 'Operator', senderId: 'U1', text: 'status?' }));
+    // The batch routing (ERR_ROUTING) names chan-1 — a task row's destination.
+    const wrongPlace = emptyTurn(() =>
+      writeMessageOut({
+        id: 'to-anchor',
+        kind: 'chat',
+        channel_type: 'discord',
+        platform_id: 'chan-1',
+        content: JSON.stringify({ text: 'digest' }),
+      }),
+    );
+    await processQuery(wrongPlace.query, ERR_ROUTING, ['h1'], 'claude', undefined, 'p', undefined, {});
+    expect(wrongPlace.pushes).toHaveLength(1);
+
+    const rightPlace = emptyTurn(() =>
+      writeMessageOut({
+        id: 'to-person',
+        kind: 'chat',
+        channel_type: 'discord',
+        platform_id: 'chan-9',
+        content: JSON.stringify({ text: 'here' }),
+      }),
+    );
+    await processQuery(rightPlace.query, ERR_ROUTING, ['h1'], 'claude', undefined, 'p', undefined, {});
+    expect(rightPlace.pushes).toHaveLength(0);
+  });
+
+  it('counts a card as the reply', async () => {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    const { query, pushes } = emptyTurn(() =>
+      writeMessageOut({
+        id: 'card',
+        kind: 'chat-sdk',
+        channel_type: 'discord',
+        platform_id: 'chan-1',
+        content: JSON.stringify({ type: 'card', card: { title: 'Status' }, fallbackText: 'Status' }),
+      }),
+    );
+    await human(query);
+
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('with no routing to match, counts any non-agent reply and still ignores one to a peer', async () => {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    const unrouted = { ...ERR_ROUTING, platformId: null, channelType: null };
+    const toPeer = emptyTurn(() =>
+      writeMessageOut({
+        id: 'peer-only',
+        kind: 'chat',
+        channel_type: 'agent',
+        platform_id: 'ag-peer',
+        content: JSON.stringify({ text: 'take this' }),
+      }),
+    );
+    insertMessage('m1', 'chat', { sender: 'Operator', senderId: 'U1', text: 'checking in' });
+    await processQuery(toPeer.query, unrouted, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+    expect(toPeer.pushes).toHaveLength(1);
+
+    const answered = emptyTurn(() =>
+      writeMessageOut({ id: 'plain', kind: 'chat', content: JSON.stringify({ text: 'here' }) }),
+    );
+    await processQuery(answered.query, unrouted, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+    expect(answered.pushes).toHaveLength(0);
+  });
+
+  it('does not open a debt for a /clear command', async () => {
+    insertMessage('c1', 'chat', { sender: 'Operator', senderId: 'U1', text: '/clear' });
+    const { query, pushes } = emptyTurn();
+    await processQuery(query, ERR_ROUTING, ['c1'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('leaves an empty result alone when no person triggered the turn', async () => {
+    const { query, pushes } = makeResultQuery({ type: 'result', text: null });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('accepts a deliberate <internal> answer as the end of it', async () => {
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      yield { type: 'result', text: '<internal>no reply</internal>' };
+      yield { type: 'result', text: null };
+    }
+    await human({ push: (m: string) => void pushes.push(m), end: () => {}, abort: () => {}, events: events() });
+
+    expect(pushes).toHaveLength(0);
+  });
+
+  it("tells the agent mid-turn text is not delivered when a person's message is pushed into a running turn", async () => {
+    insertMessage('m-checkin', 'chat', { sender: 'Operator', senderId: 'U1', text: 'are you there' });
+    let sawPush!: () => void;
+    const pushed = new Promise<void>((resolve) => {
+      sawPush = resolve;
+    });
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      await pushed; // the turn is still running when the poll admits the row
+      yield { type: 'result', text: '<internal>answered through send_message</internal>' };
+    }
+    const query: AgentQuery = {
+      push: (m: string) => {
+        pushes.push(m);
+        sawPush();
+      },
+      end: () => {},
+      abort: () => {},
+      events: events(),
+    };
+
+    // Settings must match what the follow-up batch resolves to, or the poll ends the stream instead of pushing.
+    await processQuery(query, ERR_ROUTING, [], 'claude', undefined, 'initial', undefined, {
+      ultracode: false,
+      fast: false,
+    });
+
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain('are you there');
+    expect(pushes[0]).toContain('is NOT delivered');
+  }, 30_000);
+});
+
+describe('a check-in pushed after a progress message', () => {
+  it('is still owed a reply: the earlier progress message does not answer it', async () => {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    insertMessage('m1', 'chat', { sender: 'Operator', senderId: 'U1', text: 'do the thing' });
+    let sawPush!: () => void;
+    const pushed = new Promise<void>((resolve) => {
+      sawPush = resolve;
+    });
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      await writeMessageOut({
+        id: 'progress',
+        kind: 'chat',
+        channel_type: 'discord',
+        platform_id: 'chan-1',
+        content: JSON.stringify({ text: 'on it' }),
+      });
+      insertMessage('m-checkin', 'chat', { sender: 'Operator', senderId: 'U1', text: 'are you there' });
+      await pushed;
+      yield { type: 'result', text: null };
+    }
+    const query: AgentQuery = {
+      push: (m: string) => {
+        pushes.push(m);
+        sawPush();
+      },
+      end: () => {},
+      abort: () => {},
+      events: events(),
+    };
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {
+      ultracode: false,
+      fast: false,
+    });
+
+    expect(pushes).toHaveLength(2);
+    expect(pushes[0]).toContain('are you there');
+    expect(pushes[1]).toContain('without delivering anything');
+  }, 30_000);
+});
+
 describe('isCorruptionError', () => {
   it('matches the Docker Desktop macOS torn-read symptom', () => {
     expect(isCorruptionError('database disk image is malformed')).toBe(true);

@@ -178,6 +178,10 @@ export async function discoverProtectedResource(
   fetchImpl: FetchLike,
   mcpUrl: string,
 ): Promise<{ url: string; metadata: ProtectedResourceMetadata }> {
+  // The MCP URL is where the bearer token will be sent on every request, and
+  // the well-known candidates below are derived from it — so a cleartext
+  // `--url` is refused outright, before anything is probed (#876 P2-3).
+  assertHttpsEndpoint('--url', mcpUrl);
   const candidates: string[] = [];
   try {
     const advertised = await probeResourceMetadataUrl(fetchImpl, mcpUrl);
@@ -194,6 +198,11 @@ export async function discoverProtectedResource(
   const failures: string[] = [];
   for (const url of candidates) {
     try {
+      // `advertised` comes out of a WWW-Authenticate header, i.e. off the
+      // network: a cleartext metadata URL there could name any authorization
+      // server it liked. Refused per candidate, so a good well-known path
+      // still gets its turn.
+      assertHttpsEndpoint('resource_metadata', url);
       return { url, metadata: await getJson<ProtectedResourceMetadata>(fetchImpl, url) };
     } catch (err) {
       failures.push(`${url}: ${err instanceof Error ? err.message : String(err)}`);
