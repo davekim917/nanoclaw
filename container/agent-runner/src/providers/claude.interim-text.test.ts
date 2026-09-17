@@ -67,6 +67,22 @@ describe('interim_text', () => {
     expect(await interimTexts()).toEqual(['<message to="here">pushed the head</message>']);
   });
 
+  it('treats text placed after a tool call in the same message as mid-turn too', async () => {
+    sdkMessages.length = 0;
+    sdkMessages.push(
+      { type: 'system', subtype: 'init', session_id: 'sess-1' },
+      assistant([
+        { type: 'text', text: 'before' },
+        { type: 'tool_use', id: 'tu-1', name: 'Bash', input: {} },
+        { type: 'text', text: '<message to="here">after the call</message>' },
+      ]),
+      assistant([{ type: 'text', text: 'final' }]),
+      { type: 'result', subtype: 'success', result: 'final' },
+    );
+
+    expect(await interimTexts()).toEqual(['before\n<message to="here">after the call</message>']);
+  });
+
   it('never emits a subagent’s text', async () => {
     sdkMessages.length = 0;
     sdkMessages.push(

@@ -3267,6 +3267,7 @@ export class ClaudeProvider implements AgentProvider {
             // the tool call that spawned them; only the parent speaks to people.
             const topLevel = (message as { parent_tool_use_id?: string | null }).parent_tool_use_id == null;
             if (Array.isArray(blocks)) {
+              let sawToolUse = false;
               for (const block of blocks) {
                 const b = block as { type?: string; id?: string; name?: string; text?: unknown };
                 if (b.type === 'tool_use' && b.id && b.name) toolNameById.set(b.id, b.name);
@@ -3277,11 +3278,17 @@ export class ClaudeProvider implements AgentProvider {
                 // which the result carries — dropped there, never emitted twice.
                 if (b.type === 'text' && typeof b.text === 'string' && b.text.trim()) {
                   pendingAssistantText = pendingAssistantText ? `${pendingAssistantText}\n${b.text}` : b.text;
-                } else if (b.type === 'tool_use' && pendingAssistantText) {
-                  const text = pendingAssistantText;
-                  pendingAssistantText = null;
-                  yield { type: 'interim_text', text };
+                } else if (b.type === 'tool_use') {
+                  sawToolUse = true;
                 }
+              }
+              // A message that calls a tool is not the turn's last, so ALL the
+              // text buffered so far is mid-turn — text placed after the
+              // tool_use block in the same message included.
+              if (sawToolUse && pendingAssistantText) {
+                const text = pendingAssistantText;
+                pendingAssistantText = null;
+                yield { type: 'interim_text', text };
               }
             }
             // SDK task_notification only fires for multi-step planned tasks, so
