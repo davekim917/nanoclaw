@@ -3,7 +3,11 @@ import path from 'path';
 import { createHash } from 'crypto';
 
 import {
+  buildCapabilityRoster,
   buildSessionServicesSnapshotFrom,
+  CAPABILITY_ROSTER_PREAMBLE,
+  type CapabilityRoster,
+  type CapabilityRosterEntry,
   type SessionServicesCentral,
   type SessionServicesSnapshot,
 } from '../../capabilities.js';
@@ -55,14 +59,32 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   exactLinkCandidates: 32,
   exactLinkExcerpts: 8,
   capabilityServices: 32,
-  // Capability text is authored in-tree (capabilities.ts), not user input, and
-  // its whole job is to stop the agent denying an ability it has. At 600 this
-  // amputated exactly the part that does that work: the Slack entry's "never
-  // tell the owner you can't read a thread without trying X" bottom line, and
-  // GitHub's CI verbs, both sat past the cut. Six entries were over 600 —
-  // Slack, GitHub, Wix, Cloudflare, SELECT, Hex. 2500 clears the largest with
-  // headroom, so a kept entry is never clipped mid-sentence.
+  // Per-field cap for a roster entry. The block no longer carries the
+  // `useFor`/`activation` prose — that lives in `/workspace/capabilities.json`
+  // and reaches the agent through `get_capabilities({ service })` — so the
+  // only free text here is a ~80-char `summary`. 2500 stays as the ceiling
+  // rather than being tightened to the authoring target: it is what stops a
+  // pathological entry (a stored MCP `description` with no whitespace, say)
+  // from being clipped mid-sentence, and the roster budget below is what
+  // actually holds the block down.
   capabilityDetailChars: 2500,
+  // Hard cap on ONE roster hint. Authoring target is ~80; this is the backstop
+  // for a derived summary whose source text has no early word boundary
+  // (`summarizeCapabilityText`, src/capabilities.ts), and for the Slack
+  // WITHHELD line, which is deliberately longer than the target because it
+  // changes what the agent may do.
+  capabilityRosterUseChars: 160,
+  // What the whole roster block — preamble included — is expected to cost.
+  // NOT an eviction trigger; the eviction trigger is `capabilityTotalChars`
+  // below. This is the number a test pins the widest-wired shape against, so
+  // that a service added with a paragraph for a `summary` fails in CI instead
+  // of quietly re-creating the budget pressure the roster removed. Measured
+  // 2026-09-17 against the widest-wired group's real `container.json`: 23
+  // services, 3,314 chars and nothing evicted, where the full-prose block was
+  // 14,307 and the budget dropped six services off its end. The headroom to
+  // 4,000 is roughly five more services; the distance from there to
+  // `capabilityTotalChars` is the point — this trips long before eviction can.
+  capabilityRosterChars: 4_000,
   // Total budget for the capability block, enforced in boundedCapabilities.
   //
   // Load-bearing: `finalChars` below is a budget for the ENTIRE serialized
@@ -79,6 +101,16 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   // incident this cap was added to prevent. Only bootstrap rows carry the
   // block, and those are bounded by bootstrapFinalChars below, so this raise
   // cannot starve recall.
+  //
+  // Since the block became a roster this is a SAFETY NET, not the thing that
+  // decides what an agent is told it has. Raising the cap was never the fix:
+  // the widest live group had already grown to 13,247 chars of prose, and the
+  // budget was dropping six services off the end of it (Fivetran, Profound,
+  // SELECT, Hex, Looker, dbt-mcp) — so the agent was never told about tools it
+  // holds, which is the exact failure the block exists to prevent. The roster
+  // costs 3,314 for the same 23 services, so this cap should now be unreachable
+  // on real content; keep it, because an operator can put anything in a stored
+  // MCP `description`.
   capabilityTotalChars: 10_000,
   finalChars: 12_000,
   exactLinkFinalChars: 16_000,
@@ -171,7 +203,13 @@ export interface ConversationEvidenceExcerpt {
 export interface PreTurnContext {
   provider?: string;
   contextEpoch?: number;
-  trustedCapabilities?: SessionServicesSnapshot;
+  /**
+   * The always-on capability ROSTER, not the full services snapshot: one line
+   * per wired service plus the standing instruction that heads it. Full usage
+   * notes stay in `/workspace/capabilities.json` behind
+   * `get_capabilities({ service })`. See `boundedCapabilities`.
+   */
+  trustedCapabilities?: CapabilityRoster;
   memoryEvidence: {
     core: MemoryEvidenceExcerpt[];
     excerpts: MemoryEvidenceExcerpt[];
@@ -1576,16 +1614,17 @@ function archiveExcerpt(row: ArchiveEvidenceRow, score: number, passageText?: st
   };
 }
 
-type CapabilityService = SessionServicesSnapshot['services'][number];
+type CapabilityService = CapabilityRosterEntry;
 
 /**
  * Evict one capability entry for a budget: the LAST entry not marked
  * `retainUnderBudget`, or the last entry outright once only retained ones are
  * left. Both capability budgets evict from the end, and entries are pushed in
- * a fixed authoring order (the Slack entry is pushed at src/capabilities.ts:812, near the end), so without the mark whichever
- * service happens to be authored late is the one an agent loses — the Slack
- * entry was, on the widest-wired groups, and the agent then told the owner it
- * could not read a Slack link it could read.
+ * a fixed authoring order (the Slack entry is pushed near the end of
+ * `buildSessionServicesSnapshotFrom`, src/capabilities.ts), so without the
+ * mark whichever service happens to be authored late is the one an agent
+ * loses — the Slack entry was, on the widest-wired groups, and the agent then
+ * told the owner it could not read a Slack link it could read.
  */
 function evictCapability(services: CapabilityService[]): string | undefined {
   for (let index = services.length - 1; index >= 0; index--) {
@@ -1604,39 +1643,31 @@ function selectCapabilities(services: CapabilityService[], limit: number): Capab
   return selected;
 }
 
-/** Exported for direct test of the total-block budget — see pre-turn-context.test.ts. */
-export function boundedCapabilities(
-  snapshot: SessionServicesSnapshot,
-  notices: ContextNotice[],
-): SessionServicesSnapshot {
-  const selected = selectCapabilities(snapshot.services, PRE_TURN_BOUNDS.capabilityServices).map((service) => ({
+/**
+ * Reduce the session's full services snapshot to the bounded roster the
+ * pre-turn block carries.
+ *
+ * The roster is the awareness surface: every wired service, one line each,
+ * never evicted in practice. The mini-manual for any one of them stays in
+ * `/workspace/capabilities.json` byte-for-byte and reaches the agent through
+ * `get_capabilities({ service })`. Before this split the block carried all 23
+ * manuals for the widest-wired group (13,247 chars) and the budget below
+ * silently dropped the last six — so an agent holding Hex and Looker was never
+ * told it had them, which is precisely what the block exists to prevent.
+ *
+ * Exported for direct test of the total-block budget — see
+ * pre-turn-context.test.ts.
+ */
+export function boundedCapabilities(snapshot: SessionServicesSnapshot, notices: ContextNotice[]): CapabilityRoster {
+  const roster = buildCapabilityRoster(snapshot);
+  const selected = selectCapabilities(roster.services, PRE_TURN_BOUNDS.capabilityServices).map((service) => ({
     ...service,
     name: boundedText(service.name, PRE_TURN_BOUNDS.capabilityDetailChars, TRUNCATED_CAPABILITY_DETAIL),
-    cli:
-      service.cli === undefined
+    via: boundedText(service.via, PRE_TURN_BOUNDS.capabilityDetailChars, TRUNCATED_CAPABILITY_DETAIL),
+    use:
+      service.use === undefined
         ? undefined
-        : boundedText(service.cli, PRE_TURN_BOUNDS.capabilityDetailChars, TRUNCATED_CAPABILITY_DETAIL),
-    mcpNamespace:
-      service.mcpNamespace === undefined
-        ? undefined
-        : boundedText(service.mcpNamespace, PRE_TURN_BOUNDS.capabilityDetailChars, TRUNCATED_CAPABILITY_DETAIL),
-    declaredTools: service.declaredTools.map((value) =>
-      boundedText(value, PRE_TURN_BOUNDS.capabilityDetailChars, TRUNCATED_CAPABILITY_DETAIL),
-    ),
-    scopes: service.scopes.map((value) =>
-      boundedText(value, PRE_TURN_BOUNDS.capabilityDetailChars, TRUNCATED_CAPABILITY_DETAIL),
-    ),
-    credentialPaths: service.credentialPaths.map((value) =>
-      boundedText(value, PRE_TURN_BOUNDS.capabilityDetailChars, TRUNCATED_CAPABILITY_DETAIL),
-    ),
-    activation:
-      service.activation === undefined
-        ? undefined
-        : boundedText(service.activation, PRE_TURN_BOUNDS.capabilityDetailChars, TRUNCATED_CAPABILITY_DETAIL),
-    useFor:
-      service.useFor === undefined
-        ? undefined
-        : boundedText(service.useFor, PRE_TURN_BOUNDS.capabilityDetailChars, TRUNCATED_CAPABILITY_DETAIL),
+        : boundedText(service.use, PRE_TURN_BOUNDS.capabilityRosterUseChars, TRUNCATED_CAPABILITY_DETAIL),
     // Short-TTL credential expiry (e.g. GitHub App installation tokens). Not
     // free text — an ISO timestamp from the host — so it passes the bound
     // untouched. Dropped here it would never reach agents: this sanitizer is
@@ -1671,7 +1702,7 @@ export function boundedCapabilities(
       detail: `dropped ${droppedForBudget.length} service(s) over ${PRE_TURN_BOUNDS.capabilityTotalChars} chars: ${droppedForBudget.join(', ')}`,
     });
   }
-  return { agentGroupId: snapshot.agentGroupId, services: selected };
+  return { agentGroupId: roster.agentGroupId, howToUse: roster.howToUse, services: selected };
 }
 
 /**
@@ -1853,7 +1884,7 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   const seenEvidenceFingerprints = new Set(input.seenEvidenceFingerprints ?? []);
   const query = extractQueryText(input.normalizedContent);
   const bypassDedupe = CORRECTION_PATTERN.test(query);
-  let trustedCapabilities: SessionServicesSnapshot | undefined;
+  let trustedCapabilities: CapabilityRoster | undefined;
   if (includeBootstrap) {
     try {
       trustedCapabilities = boundedCapabilities(
@@ -1862,7 +1893,7 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
       );
     } catch (error) {
       if (!(error instanceof Error)) throw error;
-      trustedCapabilities = { agentGroupId: input.agentGroupId, services: [] };
+      trustedCapabilities = { agentGroupId: input.agentGroupId, howToUse: CAPABILITY_ROSTER_PREAMBLE, services: [] };
       notices.push({
         source: 'capabilities',
         status: 'degraded',

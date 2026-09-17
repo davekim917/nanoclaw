@@ -165,13 +165,14 @@ describe('buildSessionServicesSnapshot', () => {
   });
 
   it('keeps every authored capability detail inside the pre-turn truncation bound', async () => {
-    // boundedCapabilities clips `useFor`/`activation` at
-    // PRE_TURN_BOUNDS.capabilityDetailChars, and it clips from the END. These
-    // strings exist to stop the agent denying an ability it has, and the
-    // operative sentence — "never tell the owner you can't X without first
-    // trying Y" — is written last, so silent truncation removes exactly the
-    // part that does the work. Fail here instead: tighten the prose or raise
-    // the bound deliberately.
+    // These strings no longer ride in the pre-turn block — the roster does, and
+    // `get_capabilities({ service })` serves these whole. But the operative
+    // sentence of each one ("never tell the owner you can't X without first
+    // trying Y") is still written LAST, so any future clip from the END would
+    // remove exactly the part that does the work, and an entry that outgrows
+    // `capabilityDetailChars` is one the runner's fresh-context fallback would
+    // also have to shorten. Keep the ceiling as an authoring bound: fail here,
+    // then tighten the prose or raise the bound deliberately.
     //
     // Exercised through an OWNER-SAFE session, not a bare group-level snapshot.
     // Without a messaging group `sessionKnown` is false, which routes Slack to
@@ -472,13 +473,17 @@ describe('buildSessionServicesSnapshot', () => {
   it('survives the capability budget on a widest-wired group, universals intact', async () => {
     // The regression this pins: the derived MCP entries are appended to the
     // services array, and BOTH capability budgets evict from the END
-    // (`evictCapability`, src/modules/memory/pre-turn-context.ts:1590-1595).
-    // Appended, the migrated universals would be first out on exactly the
-    // groups that have the most wired — the widest group on this install
-    // measures 19 services / 8,954 chars before this PR and 22 / 9,773 after,
-    // against a 10,000-char budget. So they are spliced in where the five hardcoded blocks used to sit,
-    // and marked `retainUnderBudget` because a fleet default is the fleet's
-    // baseline, not a group's extra.
+    // (`evictCapability`, src/modules/memory/pre-turn-context.ts). Appended,
+    // the migrated universals would be first out on exactly the groups that
+    // have the most wired. So they are spliced in where the five hardcoded
+    // blocks used to sit, and marked `retainUnderBudget` because a fleet
+    // default is the fleet's baseline, not a group's extra.
+    //
+    // The "19 -> 22 services / 8,954 -> 9,773 chars" figure this comment used
+    // to quote is THIS fixture, not a production group. The fixture is
+    // modelled on the widest live group but is not it: that group measured 23
+    // services / 14,307 chars of raw snapshot on 2026-09-17, six services past
+    // the budget. See the roster test below for the live numbers.
     insertWorkgroup('wide-shop', ['Slack-User-Token-WideShop']);
     const ag = group('ag-wide-shop', 'wide-shop');
     await createGroupInWorkgroup(ag, 'wide-shop');
@@ -540,22 +545,23 @@ describe('buildSessionServicesSnapshot', () => {
       if (names.includes(later)) expect(names.indexOf('Pocket')).toBeLessThan(names.indexOf(later));
     }
 
-    // Then under real pressure. This hermetic fixture measures 19 services /
-    // ~7.6k chars, under `capabilityTotalChars`; the live group it is modelled
-    // on measures 22 / 9,773 — 227 chars of headroom, which one more wired
-    // service spends. Padding every entry reproduces that pressure here without
-    // pinning this test to one production group's text, and drives the same
-    // `evictCapability` the live path uses.
+    // Then under pressure. The block is a roster now, so natural content
+    // cannot reach `capabilityTotalChars`: the hint is capped at
+    // `capabilityRosterUseChars` (160), so even 32 maxed-out entries — the
+    // `capabilityServices` ceiling — come to roughly 8.3k of the 10k. The one
+    // input that still can is a long NAME, and that is operator-reachable: a
+    // stored MCP server's `displayName` is checked only for "non-empty
+    // string", with no length bound (src/container-config.ts:446), and
+    // becomes the entry's name verbatim. So pad names, and prove the
+    // safety net has not been left inert by the roster change.
+    const PAD = ' padding'.repeat(80);
     const pressured = {
       ...snapshot,
-      services: snapshot.services.map((service) => ({
-        ...service,
-        useFor: `${service.useFor ?? ''}${'x'.repeat(600)}`,
-      })),
+      services: snapshot.services.map((service) => ({ ...service, name: `${service.name}${PAD}` })),
     };
     const notices: ContextNotice[] = [];
     const bounded = boundedCapabilities(pressured, notices);
-    const survived = bounded.services.map((service) => service.name);
+    const survived = bounded.services.map((service) => service.name.replace(PAD, ''));
 
     expect(JSON.stringify(bounded.services).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.capabilityTotalChars);
     // Something HAD to go, or this is not a budget test at all.
@@ -575,6 +581,208 @@ describe('buildSessionServicesSnapshot', () => {
     expect(dropbox?.useFor).toContain('https://mcp.dropbox.com/mcp');
     expect(dropbox?.useFor).not.toContain('(bun)');
     expect(dropbox?.useFor?.length ?? 0).toBeLessThanOrEqual(120);
+  });
+
+  describe('always-on roster', () => {
+    const OWNER_SAFE_MG = 'mg-owner-dm-roster';
+
+    /**
+     * The widest-wired live group's shape (its `groups/<folder>/container.json`
+     * as of 2026-09-17), trimmed to what this hermetic file can build: its tool
+     * list, its two bridge-backed stdio MCP servers, and the workgroup secrets
+     * that light up Slack, SELECT, Profound and Fivetran.
+     */
+    async function widestGroup(): Promise<AgentGroup> {
+      insertWorkgroup('roster-shop', [
+        'Slack-User-Token-RosterShop',
+        'Select-RosterShop',
+        'Profound',
+        'Fivetran-RosterShop',
+      ]);
+      const ag = group('ag-roster-shop', 'roster-shop');
+      await createGroupInWorkgroup(ag, 'roster-shop');
+      writeContainerConfig(ag.folder, {
+        mcpServers: {
+          dropbox: {
+            type: 'stdio',
+            command: 'bun',
+            args: ['/app/src/remote-mcp-bridge.ts', 'https://mcp.dropbox.com/mcp'],
+            env: { REMOTE_MCP_NAME: 'dropbox', REMOTE_MCP_AUTHORIZATION: 'Bearer onecli-managed' },
+          },
+          amplitude: {
+            command: 'bun',
+            args: ['/app/src/remote-mcp-bridge.ts', 'https://mcp.amplitude.com/mcp'],
+            env: { REMOTE_MCP_NAME: 'amplitude', REMOTE_MCP_AUTHORIZATION: 'Bearer onecli-managed' },
+          },
+        },
+        packages: { apt: [], npm: [] },
+        additionalMounts: [],
+        skills: 'all',
+        tools: [
+          'granola',
+          'pocket',
+          'google-workspace:roster-shop',
+          'exa',
+          'snowflake:rs',
+          'github',
+          'looker',
+          'hex',
+          'atlassian',
+          'dbt-mcp',
+          'dbt:roster_shop_analytics',
+          'datafold',
+          'dropbox',
+          'aws:rs-a',
+          'aws:rs-b',
+        ],
+        slack_user_token: { enabled: true, also_allowed_in: [OWNER_SAFE_MG] },
+      } as Parameters<typeof writeContainerConfig>[1]);
+      vi.stubEnv('GITHUB_TOKEN', 'dummy');
+      return ag;
+    }
+
+    it('drops NOTHING on the widest-wired shape, and fits the roster budget', async () => {
+      // The whole point of the change. Before it, the block carried every
+      // service's full `useFor`/`activation` prose: the widest LIVE group
+      // measured 23 services / 14,307 chars against a 10,000-char budget that
+      // evicts from the end, so Fivetran, Profound, SELECT, Hex, Looker and
+      // dbt-mcp were never announced to that agent at all — the exact "I can't
+      // do that about a tool I have" failure the block exists to prevent.
+      // Same group as a roster: 23 services, 3,314 chars, nothing evicted.
+      // This fixture is that shape minus the env-gated `dbt Cloud` (curl)
+      // entry, which needs a host DBT_CLOUD_API_TOKEN this hermetic file does
+      // not stub: 22 services, 12,124 chars raw -> 3,128 as a roster.
+      const ag = await widestGroup();
+      const snapshot = await buildSessionServicesSnapshot(ag.id, OWNER_SAFE_MG);
+      const notices: ContextNotice[] = [];
+      const roster = boundedCapabilities(snapshot, notices);
+
+      expect(roster.services.map((s) => s.name)).toEqual(snapshot.services.map((s) => s.name));
+      expect(notices).toEqual([]);
+      expect(JSON.stringify(roster).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.capabilityRosterChars);
+      // Nothing survives without a hint, or the roster is just a name list.
+      expect(roster.services.filter((s) => (s.use ?? '') === '')).toEqual([]);
+      // Every entry says how it is reached.
+      expect(roster.services.filter((s) => s.via === '')).toEqual([]);
+      // The standing instruction rides with it — this is what stops the agent
+      // reading a bare list and still hedging about access.
+      expect(roster.howToUse).toContain('never tell the user you lack one of them');
+      expect(roster.howToUse).toContain('get_capabilities');
+    });
+
+    it('keeps every roster hint inside its bound', async () => {
+      // A hint clipped mid-word is the failure mode a per-field cap hides.
+      // Fail here instead, so a service added with a paragraph for a `summary`
+      // is caught at authoring time.
+      const ag = await widestGroup();
+      const snapshot = await buildSessionServicesSnapshot(ag.id, OWNER_SAFE_MG);
+      const oversized = snapshot.services
+        .filter((s) => (s.summary?.length ?? 0) > PRE_TURN_BOUNDS.capabilityRosterUseChars)
+        .map((s) => `${s.name}=${s.summary?.length}`);
+      expect(oversized).toEqual([]);
+    });
+
+    it('shows Slack as WITHHELD in a non-owner-safe session, and says so in the roster line', async () => {
+      // The safety statement has to survive the reduction: a roster line that
+      // reads like availability would have the agent promising the owner a
+      // Slack read it cannot perform here.
+      const ag = await widestGroup();
+      const snapshot = await buildSessionServicesSnapshot(ag.id, 'mg-shared-channel');
+      const roster = boundedCapabilities(snapshot, []);
+      const slack = roster.services.find((s) => s.name === 'Slack');
+      expect(slack?.use).toContain('WITHHELD IN THIS SESSION');
+      // ...and the full text is still there to be fetched on demand.
+      expect(snapshot.services.find((s) => s.name === 'Slack')?.useFor).toContain(
+        'WITHHELD IN THIS SESSION (by design)',
+      );
+    });
+
+    it('degrades one malformed stored field instead of losing the whole snapshot', async () => {
+      // Round 3, P2, reported for `description` and enumerated as a class:
+      // `displayName`, `description`, `url`, `args` and `command` are all typed
+      // as strings but none of them is type-checked on the way in from a
+      // hand-edited container.json — `validateMcpServers` refuses only SSE
+      // (src/container-config.ts:575) and `parseMcpServerConfig`, which does
+      // check them (src/container-config.ts:445-452), only runs on CLI intake.
+      // A throw here is caught by both callers, so `buildPreTurnContext`
+      // degrades to an EMPTY roster and `writeCapabilitiesSnapshot` writes
+      // nothing: one bad entry would hide every valid service.
+      insertWorkgroup('malformed', []);
+      const ag = group('ag-malformed', 'malformed');
+      await createGroupInWorkgroup(ag, 'malformed');
+      writeContainerConfig(ag.folder, {
+        mcpServers: {
+          nulldesc: { type: 'http', url: 'https://mcp.example.com/a', description: null },
+          objdesc: { type: 'http', url: 'https://mcp.example.com/b', description: { text: 'nope' } },
+          badname: { type: 'http', url: 'https://mcp.example.com/c', displayName: 42 },
+          badargs: { command: 'bun', args: 'not-an-array' },
+          badcommand: { command: 7 },
+        },
+        packages: { apt: [], npm: [] },
+        additionalMounts: [],
+        skills: 'all',
+        tools: [],
+      } as unknown as Parameters<typeof writeContainerConfig>[1]);
+
+      const snapshot = await buildSessionServicesSnapshot(ag.id);
+      const byName = (name: string) => snapshot.services.find((s) => s.name === name);
+
+      // Nothing threw, and every fleet universal is still here.
+      for (const universal of ['Pocket', 'Exa', 'Context7', 'DeepWiki', 'Granola', 'Littlebird']) {
+        expect(byName(universal), universal).toBeDefined();
+      }
+      // A bad `description` falls back to the generic line, as an absent one does.
+      expect(byName('Nulldesc')?.summary).toBe('https://mcp.example.com/a');
+      expect(byName('Objdesc')?.useFor).toContain('https://mcp.example.com/b');
+      // A bad `displayName` falls back to the capitalized server name.
+      expect(byName('Badname')).toBeDefined();
+      // A bad `args` / `command` says so instead of printing `undefined`.
+      expect(byName('Badargs')?.summary).toBe('bun');
+      expect(byName('Badcommand')?.summary).toBe('endpoint unknown');
+      for (const service of snapshot.services) expect(typeof service.summary).toBe('string');
+
+      // And the roster still renders every one of them.
+      const notices: ContextNotice[] = [];
+      const roster = boundedCapabilities(snapshot, notices);
+      expect(roster.services).toHaveLength(snapshot.services.length);
+      expect(notices).toEqual([]);
+    });
+
+    it('names the endpoint of a `{url}` entry that carries no `type`', async () => {
+      // `HttpMcpServerConfig.type` is required in the type
+      // (src/container-config.ts:109) but nothing validates it on the way in —
+      // `validateMcpServers` refuses only SSE (src/container-config.ts:575) —
+      // so a hand-edited container.json reaches the snapshot with `{ url }`
+      // alone. `mcpEndpoint` used to narrow that to the stdio arm and print
+      // `undefined` as the endpoint.
+      insertWorkgroup('untyped', []);
+      const ag = group('ag-untyped', 'untyped');
+      await createGroupInWorkgroup(ag, 'untyped');
+      writeContainerConfig(ag.folder, {
+        mcpServers: { untyped: { url: 'https://mcp.example.com/mcp' } },
+        packages: { apt: [], npm: [] },
+        additionalMounts: [],
+        skills: 'all',
+        tools: [],
+      } as unknown as Parameters<typeof writeContainerConfig>[1]);
+
+      const entry = (await buildSessionServicesSnapshot(ag.id)).services.find((s) => s.name === 'Untyped');
+      expect(entry?.useFor).toContain('https://mcp.example.com/mcp');
+      expect(entry?.useFor).not.toContain('undefined');
+      expect(entry?.summary).toBe('https://mcp.example.com/mcp');
+    });
+
+    it('derives a hint for a stored MCP server, and names the endpoint when it has no description', async () => {
+      const ag = await widestGroup();
+      const snapshot = await buildSessionServicesSnapshot(ag.id, OWNER_SAFE_MG);
+      // Fleet entry: derived from the stored `description`.
+      const pocket = snapshot.services.find((s) => s.name === 'Pocket');
+      expect(pocket?.summary).toBe('Personal knowledge / memory via https://public.heypocketai.com/mcp.');
+      // Group entry with no description: the endpoint it dials, not `bun`,
+      // and not a sentence restating the namespace `via` already carries.
+      const dropbox = snapshot.services.find((s) => s.name === 'Dropbox');
+      expect(dropbox?.summary).toBe('https://mcp.dropbox.com/mcp');
+    });
   });
 
   it('keeps the migrated universal text verbatim and never doubles an entry', async () => {
