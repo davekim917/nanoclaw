@@ -76,3 +76,55 @@ export function readDeliveredRow(messageOutId: string): DeliveredRow | undefined
     .prepare('SELECT status, platform_message_id, error FROM delivered WHERE message_out_id = ?')
     .get(messageOutId) as DeliveredRow | undefined;
 }
+
+/** Highest outbound seq written so far, 0 when none — a watermark for `hasChatOutboundAfter`. */
+export function maxOutboundSeq(): number {
+  const row = getOutboundDb().prepare('SELECT MAX(seq) AS seq FROM messages_out').get() as { seq: number | null };
+  return row.seq ?? 0;
+}
+
+/**
+ * Whether a reply the PERSON can read was written after `seq`. Asked of the DB
+ * rather than counted in-process because `send_message`/`send_file` run in the
+ * MCP server's own process (mcp-tools/server.ts) and write here directly.
+ *
+ * The two ways to be wrong are not equal. Answering "yes" wrongly skips a
+ * nudge, which is what happened before this existed. Answering "no" wrongly
+ * nudges an agent that already replied, and it replies twice. So this matches
+ * loosely and fails open:
+ *
+ *   - kind: `chat` (send_message, send_file, dispatched result blocks) and
+ *     `chat-sdk` (send_card / ask_user_question, mcp-tools/interactive.ts:93,156).
+ *     `status` is a progress label; `system` and `task_log` are host-facing.
+ *   - where: the person's channel + platform. A row to a peer agent or another
+ *     channel is `send_message(to: …)` delegating, not an answer.
+ *   - NOT the thread, and NOT `threadKey`. No single authority decides the
+ *     thread a reply lands in: the MCP tools stamp `getSessionRouting()`
+ *     (mcp-tools/core.ts:224), final-text blocks stamp the channel's newest
+ *     inbound row or the batch anchor (`sendToDestination`, poll-loop.ts), and
+ *     delivery re-parents null-thread rows under the turn or key anchor
+ *     (src/delivery.ts:1575-1588). Two review rounds each modelled that wrong
+ *     and produced a false "no"; any row in the person's channel counts.
+ *
+ * With no routing to match (legacy sessions), any non-agent row counts. An
+ * unreadable DB answers `true`.
+ */
+export function hasChatOutboundAfter(
+  seq: number,
+  conversation: { channelType: string | null; platformId: string | null },
+): boolean {
+  try {
+    const db = getOutboundDb();
+    const base = "SELECT 1 FROM messages_out WHERE seq > ? AND kind IN ('chat', 'chat-sdk')";
+    if (conversation.channelType === null || conversation.platformId === null) {
+      return db.prepare(`${base} AND channel_type IS NOT 'agent' LIMIT 1`).get(seq) != null;
+    }
+    return (
+      db
+        .prepare(`${base} AND channel_type = ? AND platform_id = ? LIMIT 1`)
+        .get(seq, conversation.channelType, conversation.platformId) != null
+    );
+  } catch {
+    return true;
+  }
+}
