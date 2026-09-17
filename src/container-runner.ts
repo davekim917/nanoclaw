@@ -3929,11 +3929,15 @@ export function resolveCodexAuthFallbacks(
  *
  * `Invalid group folder` (`src/group-folder.ts:21`, reached through
  * `stageOpenCodeAuth`'s defense-in-depth check on the scoped path) counts as
- * host state for the same reason: the folder grammar tightened over time, and
- * `groupFolderExistsOnDisk` says so in as many words, so a group minted under
- * the older grammar must lose the peer credential rather than become
- * unspawnable. Withholding also means the scoped path is never built, which is
- * strictly safer than proceeding.
+ * host state too: a live `agent_groups.folder` CAN fail the grammar, because
+ * not every creation path checks it. `toFolder` in
+ * `src/modules/permissions/channel-approval.ts:119` has no length cap, so a
+ * channel name of 65+ characters mints a folder the 64-char pattern refuses,
+ * and `setup/migrate-v2/groups.ts:78` carries v1 folder names over verbatim.
+ * The spawn path itself never checks the grammar, so such a group spawned fine
+ * before this PR; making the peer credential the one thing that renders it
+ * unspawnable would be a regression. Withholding also means the scoped path is
+ * never built, which is strictly safer than proceeding.
  */
 const HOST_STATE_REFUSAL = /^(Unsafe |Invalid group folder )/;
 
