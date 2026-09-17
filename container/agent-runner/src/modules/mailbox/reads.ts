@@ -84,12 +84,29 @@ export function maxOutboundSeq(): number {
 }
 
 /**
- * Whether anything a person can read was written after `seq`. Asked of the DB
+ * Whether a reply the PERSON can read was written after `seq`. Asked of the DB
  * rather than counted in-process because `send_message`/`send_file` run in the
  * MCP server's own process (mcp-tools/server.ts) and write here directly.
  * Only `chat` rows reach a person: `status` is a progress label, `system` and
- * `task_log` are host-facing.
+ * `task_log` are host-facing. A `chat` row to a peer agent or to some other
+ * channel is `send_message(to: …)` delegating, not an answer, so the row must
+ * land in the conversation the message came from. With no routing to match
+ * (legacy sessions), any non-agent chat row counts.
  */
-export function hasChatOutboundAfter(seq: number): boolean {
-  return getOutboundDb().prepare("SELECT 1 FROM messages_out WHERE seq > ? AND kind = 'chat' LIMIT 1").get(seq) != null;
+export function hasChatOutboundAfter(seq: number, channelType: string | null, platformId: string | null): boolean {
+  const db = getOutboundDb();
+  if (channelType === null || platformId === null) {
+    return (
+      db
+        .prepare("SELECT 1 FROM messages_out WHERE seq > ? AND kind = 'chat' AND channel_type IS NOT 'agent' LIMIT 1")
+        .get(seq) != null
+    );
+  }
+  return (
+    db
+      .prepare(
+        "SELECT 1 FROM messages_out WHERE seq > ? AND kind = 'chat' AND channel_type = ? AND platform_id = ? LIMIT 1",
+      )
+      .get(seq, channelType, platformId) != null
+  );
 }

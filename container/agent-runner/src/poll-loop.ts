@@ -1733,10 +1733,21 @@ export async function processQuery(
   let done = false;
   let unwrappedNudged = false;
   let taskBlockNudged = false;
-  // Outbound watermark taken when a person's triggering message was admitted
-  // and nothing has been delivered for it yet; null when no such message is
-  // owed a reply. Read at `result` (see nudgeUndeliveredHumanReply).
-  let humanReplyOwedSinceSeq: number | null = trigger === 'human' && !routing.taskRun ? maxOutboundSeq() : null;
+  // Set when a person's triggering message is admitted: the outbound watermark
+  // at that moment and the conversation it came from. Null when no such
+  // message is owed a reply. Read at an empty `result`. Decided from the
+  // admitted ROWS, not `trigger`: classifyTrigger is cost accounting and calls
+  // a batch holding both a task and a person's message `scheduled`
+  // (modules/mailbox/selection.ts, task check precedes chat).
+  type ReplyDebt = { sinceSeq: number; channelType: string | null; platformId: string | null };
+  const replyDebt = (rows: MessageInRow[], from: RoutingContext): ReplyDebt | null =>
+    !routing.taskRun && hasTriggeringHumanInbound(rows)
+      ? { sinceSeq: maxOutboundSeq(), channelType: from.channelType, platformId: from.platformId }
+      : null;
+  let humanReplyOwed: ReplyDebt | null = replyDebt(
+    initialBatchIds.map((id) => getMessageIn(id)).filter((m): m is MessageInRow => m != null),
+    routing,
+  );
   // Retryable (e.g. SDK `api_retry`) events are the SDK's own mid-stream retry
   // signal, NOT a turn-ending error. Record the last one but keep consuming so
   // the SDK's internal retry can still produce a result; only surface it if the
@@ -2160,8 +2171,11 @@ export async function processQuery(
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;
-        const pushedHumanTrigger = !routing.taskRun && hasTriggeringHumanInbound(keep);
-        if (pushedHumanTrigger && humanReplyOwedSinceSeq === null) humanReplyOwedSinceSeq = maxOutboundSeq();
+        // Every new check-in restarts the watermark: a progress message sent
+        // for the earlier request is not an answer to this one.
+        const pushedDebt = replyDebt(keep, followUpRouting);
+        const pushedHumanTrigger = pushedDebt !== null;
+        if (pushedDebt) humanReplyOwed = pushedDebt;
         // A later occurrence joining this stream is a SEPARATE fire and needs
         // its own outcome slot. Without this it answered into the first fire's
         // slot — or, once that was filled, vanished — so a frequently failing
@@ -2547,7 +2561,7 @@ export async function processQuery(
             }
             // Delivered, deliberately <internal>, or already nudged once: the
             // debt is settled either way. A pending wrapping retry keeps it.
-            if (!willRetryWrapping && answersRunnerPrompt) humanReplyOwedSinceSeq = null;
+            if (!willRetryWrapping && answersRunnerPrompt) humanReplyOwed = null;
           }
         } else {
           // `ProviderEvent.text` is `string | null`, so a terminal result can
@@ -2570,10 +2584,10 @@ export async function processQuery(
           // nudge at all (2026-09-17, same thread as the mid-turn note).
           // One nudge per batch, shared with the wrapping retry.
           const replyOwed =
-            humanReplyOwedSinceSeq !== null &&
+            humanReplyOwed !== null &&
             answersRunnerPrompt &&
             event.isError !== true &&
-            !hasChatOutboundAfter(humanReplyOwedSinceSeq);
+            !hasChatOutboundAfter(humanReplyOwed.sinceSeq, humanReplyOwed.channelType, humanReplyOwed.platformId);
           if (replyOwed && !unwrappedNudged) {
             unwrappedNudged = true;
             const names = getAllDestinations()
@@ -2588,7 +2602,7 @@ export async function processQuery(
             // prompt. A continuation at the ledger head still has to be paused.
             if (archivePrompts[0]?.continuationId) pauseAnsweredPrompt();
           } else {
-            if (answersRunnerPrompt) humanReplyOwedSinceSeq = null;
+            if (answersRunnerPrompt) humanReplyOwed = null;
             pauseAnsweredPrompt();
           }
         }
