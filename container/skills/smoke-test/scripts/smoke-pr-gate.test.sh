@@ -745,7 +745,7 @@ bash "$GATE" poll | jq -e '
 ' >/dev/null
 export STUB_COMPARE_EXIT=0
 
-# --- 5c..5k share one ready freeze and vary only the ledger / the compare ----
+# --- 5c..5j share one ready freeze and vary only the ledger / the compare ----
 range_case() { # <label> <jq-assertion over `check`>; expects fixture env already set
   local out
   out="$(bash "$GATE" check 13)"
