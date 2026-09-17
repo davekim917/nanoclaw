@@ -90,23 +90,25 @@ export function maxOutboundSeq(): number {
  * Only `chat` rows reach a person: `status` is a progress label, `system` and
  * `task_log` are host-facing. A `chat` row to a peer agent or to some other
  * channel is `send_message(to: …)` delegating, not an answer, so the row must
- * land in the conversation the message came from. With no routing to match
- * (legacy sessions), any non-agent chat row counts.
+ * land in the conversation the message came from — same channel, platform AND
+ * thread — and carry no `threadKey`: a keyed post keeps the triggering
+ * channel/platform on its row but delivery re-parents it under the key's own
+ * incident thread (src/delivery.ts, "Keyed thread anchor"). With no routing to
+ * match (legacy sessions), any un-keyed non-agent chat row counts.
  */
-export function hasChatOutboundAfter(seq: number, channelType: string | null, platformId: string | null): boolean {
+export function hasChatOutboundAfter(
+  seq: number,
+  conversation: { channelType: string | null; platformId: string | null; threadId: string | null },
+): boolean {
   const db = getOutboundDb();
-  if (channelType === null || platformId === null) {
-    return (
-      db
-        .prepare("SELECT 1 FROM messages_out WHERE seq > ? AND kind = 'chat' AND channel_type IS NOT 'agent' LIMIT 1")
-        .get(seq) != null
-    );
+  const base =
+    "SELECT 1 FROM messages_out WHERE seq > ? AND kind = 'chat' AND json_extract(content, '$.threadKey') IS NULL";
+  if (conversation.channelType === null || conversation.platformId === null) {
+    return db.prepare(`${base} AND channel_type IS NOT 'agent' LIMIT 1`).get(seq) != null;
   }
   return (
     db
-      .prepare(
-        "SELECT 1 FROM messages_out WHERE seq > ? AND kind = 'chat' AND channel_type = ? AND platform_id = ? LIMIT 1",
-      )
-      .get(seq, channelType, platformId) != null
+      .prepare(`${base} AND channel_type = ? AND platform_id = ? AND thread_id IS ? LIMIT 1`)
+      .get(seq, conversation.channelType, conversation.platformId, conversation.threadId) != null
   );
 }

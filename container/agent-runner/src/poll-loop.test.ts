@@ -3182,7 +3182,7 @@ describe("a person's message that got nothing delivered", () => {
     expect(pushes).toHaveLength(1);
   });
 
-  it('does not take a message to a peer agent or another channel for the reply', async () => {
+  it('does not take a message to a peer agent, another channel, another thread or a keyed incident for the reply', async () => {
     const { writeMessageOut } = await import('./db/messages-out.js');
     const { query, pushes } = emptyTurn(async () => {
       await writeMessageOut({
@@ -3191,6 +3191,21 @@ describe("a person's message that got nothing delivered", () => {
         channel_type: 'agent',
         platform_id: 'ag-peer',
         content: JSON.stringify({ text: 'please take this' }),
+      });
+      await writeMessageOut({
+        id: 'other-thread',
+        kind: 'chat',
+        channel_type: 'discord',
+        platform_id: 'chan-1',
+        thread_id: 'chan-1:some-other-thread',
+        content: JSON.stringify({ text: 'unrelated thread' }),
+      });
+      await writeMessageOut({
+        id: 'keyed-incident',
+        kind: 'chat',
+        channel_type: 'discord',
+        platform_id: 'chan-1',
+        content: JSON.stringify({ text: 'incident update', threadKey: 'db-backup-42' }),
       });
       await writeMessageOut({
         id: 'elsewhere',

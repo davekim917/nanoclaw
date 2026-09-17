@@ -1739,10 +1739,19 @@ export async function processQuery(
   // admitted ROWS, not `trigger`: classifyTrigger is cost accounting and calls
   // a batch holding both a task and a person's message `scheduled`
   // (modules/mailbox/selection.ts, task check precedes chat).
-  type ReplyDebt = { sinceSeq: number; channelType: string | null; platformId: string | null };
+  // `routing.taskRun` is the OPENING batch's, on purpose: it is the same
+  // authority the result handler dispatches under, and in a task run final-text
+  // <message> blocks are inert (formatter.ts, RoutingContext.taskRun), so the
+  // nudge would ask for a reply that cannot be delivered.
+  type ReplyDebt = { sinceSeq: number; channelType: string | null; platformId: string | null; threadId: string | null };
   const replyDebt = (rows: MessageInRow[], from: RoutingContext): ReplyDebt | null =>
     !routing.taskRun && hasTriggeringHumanInbound(rows)
-      ? { sinceSeq: maxOutboundSeq(), channelType: from.channelType, platformId: from.platformId }
+      ? {
+          sinceSeq: maxOutboundSeq(),
+          channelType: from.channelType,
+          platformId: from.platformId,
+          threadId: from.threadId,
+        }
       : null;
   let humanReplyOwed: ReplyDebt | null = replyDebt(
     initialBatchIds.map((id) => getMessageIn(id)).filter((m): m is MessageInRow => m != null),
@@ -2587,7 +2596,7 @@ export async function processQuery(
             humanReplyOwed !== null &&
             answersRunnerPrompt &&
             event.isError !== true &&
-            !hasChatOutboundAfter(humanReplyOwed.sinceSeq, humanReplyOwed.channelType, humanReplyOwed.platformId);
+            !hasChatOutboundAfter(humanReplyOwed.sinceSeq, humanReplyOwed);
           if (replyOwed && !unwrappedNudged) {
             unwrappedNudged = true;
             const names = getAllDestinations()
