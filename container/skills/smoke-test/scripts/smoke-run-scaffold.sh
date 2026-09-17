@@ -626,8 +626,8 @@ adopt)
   # CONTRACT ADOPTION — the fenced ownership transition for a recovered run.
   #
   # `smoke-pr-gate.sh poll` mints a fresh owner token on EVERY wake, same-run
-  # recovery included (smoke-pr-gate.sh:4337), and writes it to the lease
-  # (:4366), the PR authority (:4371) and the state (:4409-4416) — no line of
+  # recovery included (smoke-pr-gate.sh:4790), and writes it to the lease
+  # (:4819), the PR authority (:4824) and the state (:4862-4869) — no line of
   # that block touches the contract. The recovery owner
   # therefore passes begin_active_run_fence and then dies in
   # require_contract_owner, with `contract --regenerate` (which retires every
@@ -644,7 +644,7 @@ adopt)
   # Deliberately NOT changed: lanes, generations, requiredLaneMarkers, markers,
   # `createdAt`, and the gate's challengerDeadline (this script cannot write
   # gate state at all; the gate's own same-SHA recovery keeps the original,
-  # smoke-pr-gate.sh:4411-4415) — so valid prior evidence keeps validating and recovery
+  # smoke-pr-gate.sh:4864-4868) — so valid prior evidence keeps validating and recovery
   # buys no fresh time budget. The successor is recorded as an ADOPTER in
   # `ownerAdoptions[]`, never as the author.
   require_coordinator_role "a completion-contract ownership adoption"
@@ -659,9 +659,9 @@ adopt)
   require_fenced_source_sha "$SOURCE_SHA"
   # A task run's LIFETIME identity is the shared binding, not the private
   # slot: `task-finish` commits `.terminal` there FIRST
-  # (smoke-pr-gate.sh:3072-3083) and only afterwards removes the lease
-  # (smoke-pr-gate.sh:3132) and clears the private slot
-  # (smoke-pr-gate.sh:3142-3146), so a crash in between leaves state + lease looking live for a run that is already
+  # (smoke-pr-gate.sh:3480-3491) and only afterwards removes the lease
+  # (smoke-pr-gate.sh:3540) and clears the private slot
+  # (smoke-pr-gate.sh:3550-3554), so a crash in between leaves state + lease looking live for a run that is already
   # terminal. The task fence above reads only state and lease, so adoption
   # checks the binding itself. It is read under fd 8, which is the same
   # `task-lease-<runId>.lock` file the gate serializes binding writes on
@@ -732,7 +732,7 @@ adopt)
   # The history entry carries NOTHING derived from an owner value — no token
   # and no digest of one. An owner is not always a gate-minted 256-bit token:
   # task-claim takes an arbitrary caller-supplied owner and otherwise defaults
-  # to the hostname (smoke-pr-gate.sh:2775, DEFAULT_OWNER at :212), so an unsalted digest would be
+  # to the hostname (smoke-pr-gate.sh:3183, DEFAULT_OWNER at :212), so an unsalted digest would be
   # enumerable back to a reusable credential. `index` + `adoptedAt` record that
   # and when ownership changed hands; who holds it now is the token above.
   jq --arg owner "$FENCED_OWNER" --arg now "$(iso_now)" \
@@ -741,7 +741,7 @@ adopt)
        [{index:(((.ownerAdoptions // []) | length) + 1), adoptedAt:$now}])' \
     "$CONTRACT" > "$tmp"
   # Deterministic regression seam for a crash between validation and commit,
-  # same guard as smoke-pr-gate.sh:4388. Production wrappers never set it.
+  # same guard as smoke-pr-gate.sh:4841. Production wrappers never set it.
   if [ -n "${SMOKE_GATE_SHARED_ROOT+x}" ] && [ "$SMOKE_GATE_SHARED_ROOT" != /workspace/workgroup ] &&
      [ "${SMOKE_SCAFFOLD_TEST_CRASH_BEFORE_ADOPT_COMMIT:-}" = 1 ]; then
     kill -KILL "$$"
