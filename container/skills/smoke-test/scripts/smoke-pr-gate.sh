@@ -1731,17 +1731,30 @@ campaign_size_classify() {
 # coverage, and changing migrationsInRange, for the SAME run. Sizing is in the
 # pin for the same reason (the rules file can change between two polls).
 #
-# STORAGE INVARIANT: pins are IMMUTABLE and KEYED BY HEAD SHA, first write
-# wins. One file per (PR, head) — range-pins/pin-pr-<n>-<headSha>.json — created
-# with `ln`, which fails on EEXIST, so creation is atomic and can never replace
-# an existing pin whether or not the caller holds the PR lock. An evaluation of
-# head Y therefore cannot overwrite or remove the pin of head X: it addresses a
-# different file. (A single pin slot in the PR state could not give this: a
-# slow poll still holding an OLD head's result overwrote the slot after a newer
-# head had pinned unknown/`full` and opened its campaign, and the next poll of
-# the newer head recomputed — the very shrink the pin exists to prevent.)
-# range_pin_lookup and range_pin_promote are the ONLY code that touches these
-# files; check, poll and recovery all go through them. `check` only looks up.
+# STORAGE INVARIANT: a pin outlives and out-reaches everything that could
+# recompute it. range_pin_lookup and range_pin_promote are the ONLY code that
+# touches pins; check, poll and recovery all go through them.
+#   IMMUTABLE, KEYED BY HEAD SHA, first write wins. One file per (repo, PR,
+#     head), created with `ln` — which fails on EEXIST — so creation is atomic
+#     and can never replace an existing pin, PR lock held or not. An evaluation
+#     of head Y addresses a different file than head X's pin. (A single slot in
+#     the PR state could not give this: a slow poll holding an OLD head's
+#     result overwrote it after a newer head had pinned and opened its
+#     campaign.) Pins are never trimmed here: a trim can race the claim that
+#     would protect the pin. They are small; pruning belongs to evidence
+#     retention, which can see whether a head still has a non-terminal run.
+#   SHARED, like campaign ownership. A run can be resumed through the shared
+#     lease by a coordinator with a DIFFERENT private state dir; a pin under
+#     the first coordinator's STATE_DIR would be invisible to it and it would
+#     recompute. Pins live in LEASE_DIR — the same validated shared directory
+#     the leases and PR authority use (lease_dir_prepare) — repo-qualified.
+#     No usable shared directory means no pin can be kept: the head reports
+#     unknown/`full` and is NOT offered. Never a private pin.
+#   INVALID IS NOT ABSENT. Anything at a pin's path that is not a well-formed
+#     pin for that head — truncated, a symlink (dangling or not), a directory —
+#     is `invalid`: the original scope is unrecoverable, so the head reports
+#     unknown/`full` and is still OFFERED (a full campaign is the safe answer).
+#     It is never recomputed over, replaced, moved or deleted.
 RANGE_PIN_SHAPE='type == "object" and .schemaVersion == 1 and (.headSha | type == "string") and
   (.campaignRange | type == "object") and (.campaignRange.determinable | type == "boolean") and
   (.rangePaths | type == "array") and (.migrationFiles | type == "array") and
@@ -1749,58 +1762,73 @@ RANGE_PIN_SHAPE='type == "object" and .schemaVersion == 1 and (.headSha | type =
   (.migrationsDeterminable | type == "boolean") and
   ((.migrationsInRange | type) as $t | $t == "array" or $t == "null") and
   (.campaignSize | type == "string") and (.sizeReason | type == "string")'
-# Growth bound: the newest RANGE_PIN_KEEP pins of a PR are kept, plus — always —
-# the pin just promoted and the pin of the PR's active run. A freeze PR has one
-# head for its whole life in practice, so this only ever trims abandoned heads.
-RANGE_PIN_KEEP=8
-range_pin_dir()  { printf '%s/range-pins' "$STATE_DIR"; }
-range_pin_file() { printf '%s/range-pins/pin-pr-%s-%s.json' "$STATE_DIR" "$1" "$2"; }
-range_pin_args_ok() {
-  printf '%s' "${1:-}" | grep -Eq '^[0-9]+$' && printf '%s' "${2:-}" | grep -Eq '^[0-9a-f]{40}$'
+range_pin_file() {  # <pr> <head-sha>
+  printf '%s/range-pin-%s-pr-%s-%s.json' "$LEASE_DIR" \
+    "$(printf '%s' "$REPO" | sed -e 's#/#__#g' -e 's/[^A-Za-z0-9._-]/_/g')" "$1" "$2"
 }
-range_pin_lookup() {  # <pr> <head-sha>; prints the pin, or nothing
-  range_pin_args_ok "$1" "$2" || return 0
-  local f
+# Read-only twin of lease_dir_prepare's checks (that one creates the directory
+# and probes a write; `check` must not). Prints a reason and returns 1 when
+# pins cannot be trusted to be shared; a lease dir that does not exist yet is
+# fine — it simply holds no pins.
+range_pin_store_readable() {
+  local root dir
+  [ -d "$SHARED_LEASE_ROOT" ] || { printf 'shared lease root %s is missing' "$SHARED_LEASE_ROOT"; return 1; }
+  command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$SHARED_LEASE_ROOT" ||
+    { printf 'shared lease root %s is not a mounted filesystem' "$SHARED_LEASE_ROOT"; return 1; }
+  root="$(cd -P "$SHARED_LEASE_ROOT" 2>/dev/null && pwd -P)" ||
+    { printf 'shared lease root %s cannot be resolved' "$SHARED_LEASE_ROOT"; return 1; }
+  case "$LEASE_DIR" in
+    "$SHARED_LEASE_ROOT"/*|"$root"/*) ;;
+    *) printf 'lease directory %s is outside the shared root' "$LEASE_DIR"; return 1 ;;
+  esac
+  [ -e "$LEASE_DIR" ] || [ -L "$LEASE_DIR" ] || return 0
+  dir="$(cd -P "$LEASE_DIR" 2>/dev/null && pwd -P)" ||
+    { printf 'lease directory %s cannot be resolved' "$LEASE_DIR"; return 1; }
+  case "$dir" in
+    "$root"/*) ;;
+    *) printf 'lease directory resolves outside the shared root: %s' "$dir"; return 1 ;;
+  esac
+}
+# Prints ONE envelope: {state:"valid",pin} | {state:"absent"} |
+# {state:"invalid",reason} | {state:"unavailable",reason}.
+range_pin_lookup() {  # <pr> <head-sha>
+  local f why
+  if ! why="$(range_pin_store_readable)"; then
+    jq -cn --arg why "$why" '{state:"unavailable",reason:("range pins cannot be kept on shared storage (" + $why + ")")}'
+    return 0
+  fi
   f="$(range_pin_file "$1" "$2")"
-  [ -s "$f" ] || return 0
-  jq -c --arg h "$2" "select(($RANGE_PIN_SHAPE) and .headSha == \$h)" "$f" 2>/dev/null
+  if [ ! -e "$f" ] && [ ! -L "$f" ]; then jq -cn '{state:"absent"}'; return 0; fi
+  if [ -L "$f" ]; then why="a symlink"
+  elif [ ! -f "$f" ]; then why="not a regular file"
+  elif jq -c --arg h "$2" "if (($RANGE_PIN_SHAPE) and .headSha == \$h) then {state:\"valid\",pin:.} else error(\"shape\") end" \
+         "$f" 2>/dev/null; then return 0
+  else why="truncated or malformed"
+  fi
+  jq -cn --arg f "$f" --arg why "$why" \
+    '{state:"invalid",reason:("the range pin for this head (" + $f + ") is " + $why + ", so the scope it pinned cannot be recovered")}'
 }
 # Promote a candidate to THE pin for (pr, head). First write wins; a second
 # promotion for the same head changes nothing on disk. Returns 0 when this call
-# created the pin, 3 when a pin already existed (the caller's freshly computed
-# facts may disagree with it), 1 when no pin exists and none could be created.
-range_pin_promote() {  # <pr> <head-sha> <candidate-file> [<active-head-sha>]
-  local pr="$1" head="$2" candidate="$3" active="${4:-}" f tmp dir keep stale
-  range_pin_args_ok "$pr" "$head" || return 1
-  [ -z "$(range_pin_lookup "$pr" "$head")" ] || return 3
+# created the pin, 3 when something already occupies the pin's path (a pin, or
+# an invalid one — either way the caller's freshly computed facts are not what
+# the head is pinned to), 1 when no pin exists and none could be created.
+range_pin_promote() {  # <pr> <head-sha> <candidate-file>
+  local pr="$1" head="$2" candidate="$3" f tmp
+  printf '%s' "$pr" | grep -Eq '^[0-9]+$' && printf '%s' "$head" | grep -Eq '^[0-9a-f]{40}$' || return 1
+  lease_dir_prepare || { printf 'smoke-pr-gate: range pin not written: %s\n' "$LEASE_DIR_ERROR" >&2; return 1; }
   f="$(range_pin_file "$pr" "$head")"
-  dir="$(range_pin_dir)"
-  mkdir -p "$dir" 2>/dev/null || return 1
-  tmp="$(mktemp "$dir/.pin-pr-$pr.XXXXXX" 2>/dev/null)" || return 1
+  if [ -e "$f" ] || [ -L "$f" ]; then return 3; fi
+  tmp="$(mktemp "$LEASE_DIR/.range-pin-pr-$pr.XXXXXX" 2>/dev/null)" || return 1
   if ! jq -c --arg h "$head" --arg now "$(iso_now)" \
          "select(($RANGE_PIN_SHAPE) and .headSha == \$h) | . + {pinnedAt:\$now}" \
          "$candidate" > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
     rm -f "$tmp" 2>/dev/null; return 1
   fi
-  if [ -e "$f" ] && [ -z "$(range_pin_lookup "$pr" "$head")" ]; then
-    # Something is at the pin's path that is not a pin (pins are only ever
-    # linked in complete, so this is outside damage). It is moved aside, never
-    # deleted, so the head is not left unpinnable — and unofferable — forever.
-    mv "$f" "$f.invalid-$(date -u +%Y%m%dT%H%M%SZ)-$$" 2>/dev/null || true
-  fi
-  if ln "$tmp" "$f" 2>/dev/null; then
-    rm -f "$tmp" 2>/dev/null
-  else
-    rm -f "$tmp" 2>/dev/null
-    [ -n "$(range_pin_lookup "$pr" "$head")" ] && return 3
-    return 1
-  fi
-  keep="$(range_pin_file "$pr" "$active")"
-  while IFS= read -r stale; do
-    [ -n "$stale" ] && [ "$stale" != "$f" ] && [ "$stale" != "$keep" ] || continue
-    rm -f "$stale" 2>/dev/null
-  done < <(ls -1t "$dir"/pin-pr-"$pr"-*.json 2>/dev/null | grep -E "/pin-pr-$pr-[0-9a-f]{40}\.json\$" | tail -n +"$(( RANGE_PIN_KEEP + 1 ))")
-  return 0
+  if ln "$tmp" "$f" 2>/dev/null; then rm -f "$tmp" 2>/dev/null; return 0; fi
+  rm -f "$tmp" 2>/dev/null
+  if [ -e "$f" ] || [ -L "$f" ]; then return 3; fi
+  return 1
 }
 
 # --- Freeze-campaign baseline ------------------------------------------------
@@ -1856,8 +1884,15 @@ campaign_range_tree_files() {  # <baseline-sha> <target-sha>
     if ! tree="$(timeout 20 gh api "repos/$REPO/git/trees/$sha?recursive=1" </dev/null 2>/dev/null)"; then
       printf 'the %s tree could not be fetched' "$side"; return 1
     fi
+    # Every entry must carry a COMPLETE identity and a KNOWN type. A blob or
+    # commit entry missing its sha would compare as equal on both sides and
+    # drop a changed file as unchanged; an unknown type would be skipped.
     if ! jq -e '(.truncated | type == "boolean") and (.tree | type == "array") and
-                all(.tree[]; (.path | type == "string") and (.type | type == "string"))' \
+                all(.tree[]; (.path | type == "string") and (.path != "") and
+                  (.type == "tree" or
+                   ((.type == "blob" or .type == "commit") and
+                    (.mode | type == "string") and (.mode != "") and
+                    (.sha | type == "string") and (.sha != ""))))' \
          <<<"$tree" >/dev/null 2>&1; then
       printf 'the %s tree is malformed' "$side"; return 1
     fi
@@ -1868,7 +1903,7 @@ campaign_range_tree_files() {  # <baseline-sha> <target-sha>
   done
   jq -cn --slurpfile a <(printf '%s' "$base_tree") --slurpfile b <(printf '%s' "$target_tree") '
     def entries: [.tree[] | select(.type == "blob" or .type == "commit") |
-                  {key: .path, value: [(.mode // ""), .type, (.sha // "")]}] | from_entries;
+                  {key: .path, value: [.mode, .type, .sha]}] | from_entries;
     ($a[0] | entries) as $x | ($b[0] | entries) as $y |
     {files: [(($x | keys) + ($y | keys)) | unique | .[] | select($x[.] != $y[.]) | {filename: .}]}
   ' 2>/dev/null || { printf 'the tree diff could not be computed'; return 1; }
@@ -1932,7 +1967,7 @@ evaluate_pr() {
   local files_json files_len files_fetch_failed migrations_touched frontend_touched frontend_required is_freeze ci_sha
   local migration_files migrations_determinable target_files_json target_files_len
   local baseline_json baseline_sha range_determinable range_reason migrations_in_range campaign_range_json
-  local range_files_method range_paths_json range_pin="" range_pin_size_out=""
+  local range_files_method range_paths_json range_pin="" range_pin_size_out="" range_pin_state=absent
   local runs_json runs_len ci_total ci_pending ci_failed ci_succeeded ci_ready ci_truncated
   local services_json backend backend_id backend_url backend_deploy_sha backend_ready
   local frontend frontend_id frontend_url frontend_deploy_sha frontend_ready
@@ -2021,6 +2056,17 @@ evaluate_pr() {
     range_files_method=""
     target_files_json='{"files":[]}'
     range_pin="$(range_pin_lookup "$pr" "$head_sha")"
+    range_pin_state="$(jq -r '.state // "invalid"' <<<"$range_pin" 2>/dev/null)"
+    case "$range_pin_state" in
+      valid) range_pin="$(jq -c '.pin' <<<"$range_pin")" ;;
+      absent) range_pin="" ;;
+      invalid|unavailable)
+        # Nothing is fetched or recomputed: an invalid pin's scope is
+        # unrecoverable, and without shared storage no scope can be kept.
+        range_reason="$(jq -r '.reason // "the range pin for this head could not be read"' <<<"$range_pin" 2>/dev/null)"
+        range_pin="" ;;
+      *) range_pin_state=invalid; range_reason="the range pin for this head could not be read"; range_pin="" ;;
+    esac
     if [ -n "$range_pin" ]; then
       # This head's campaign range is pinned: read it, fetch nothing.
       range_determinable="$(jq -r '.campaignRange.determinable' <<<"$range_pin")"
@@ -2033,6 +2079,8 @@ evaluate_pr() {
       migrations_in_range="$(jq -c '.migrationsInRange' <<<"$range_pin")"
       campaign_range_json="$(jq -c '.campaignRange + {baselinePinned:true}' <<<"$range_pin")"
       range_pin_size_out="$(jq -c '{campaignSize, sizeReason}' <<<"$range_pin")"
+    elif [ "$range_pin_state" != absent ]; then
+      :
     elif [ -z "$ci_sha" ]; then
       range_reason="the freeze target commit could not be determined"
     else
@@ -2131,6 +2179,10 @@ evaluate_pr() {
           baselineResolved:($baseline.resolved // false),
           baselinePinned:false}')"
     fi
+    # pinState: valid (read from the pin) | absent (computed; poll may promote
+    # it) | invalid (unknown/full, offered, never promoted over) | unavailable
+    # (no shared pin storage: unknown/full, NOT offered).
+    campaign_range_json="$(jq -c --arg st "$range_pin_state" '. + {pinState:$st}' <<<"$campaign_range_json")"
   elif [ "$files_fetch_failed" = true ] || { [ "$files_len" -ge 100 ] 2>/dev/null; }; then
     # Ordinary (non-freeze) PR whose own diff we couldn't read — same
     # fail-closed default as migrations_touched above, and equally unable to
@@ -2185,7 +2237,7 @@ evaluate_pr() {
   # TMP_DIR). This function runs unlocked and in a subshell, so it never writes
   # a pin itself — `poll` promotes the candidate (range_pin_promote), and only
   # for a settled head. `check` has no TMP_DIR and writes nothing.
-  if [ "$is_freeze" = true ] && [ -z "$range_pin" ] && [ "$COMMAND" = poll ] && [ -n "${TMP_DIR:-}" ]; then
+  if [ "$is_freeze" = true ] && [ "$range_pin_state" = absent ] && [ "$COMMAND" = poll ] && [ -n "${TMP_DIR:-}" ]; then
     jq -e 'type == "array"' <<<"$range_paths_json" >/dev/null 2>&1 || range_paths_json='[]'
     [ "$range_determinable" = true ] || range_paths_json='[]'
     # Range-sized values (the path list, the migration lists) NEVER travel in
@@ -4414,20 +4466,32 @@ while IFS= read -r ROW; do
     fi
   fi
   # Pin the freeze campaign's WHOLE range result to this head SHA at the first
-  # settled evaluation (range_pin_promote: immutable, keyed by head, first
-  # write wins). These FACTS were computed before the lock. If they were not
-  # read from a pin and a pin for THIS head exists by now (rc 3), another poll
-  # pinned in between — drop this candidate for one cycle rather than wake on
-  # facts the pin may contradict; the next poll reads the pin. A settled freeze
-  # whose pin cannot be created (rc 1) is not offered either: an unpinned
-  # campaign is exactly what this exists to prevent. A stale evaluation of an
-  # OLDER head can at worst create that older head's own pin file; it cannot
-  # touch any other head's.
+  # settled evaluation (see the STORAGE INVARIANT above range_pin_lookup).
+  # These FACTS were computed before the lock, so by pinState:
+  #   valid       read from the pin — offer.
+  #   invalid     unknown/full, unrecoverable — offer; nothing is promoted over it.
+  #   absent      promote. rc 3: the path got occupied in between, so these
+  #               fresh facts are not what the head is pinned to — drop the
+  #               candidate for one cycle; the next poll reads what is there.
+  #               rc 1: no pin could be created — not offered: an unpinned
+  #               campaign is exactly what this exists to prevent.
+  #   unavailable no shared pin storage — not offered, said on stderr.
   RANGE_PIN_CONFLICT=false
-  if [ "$(jq -r '.isFreezePr == true and .settled == true and
-                 (.campaignRange.baselinePinned != true)' <<<"$FACTS")" = true ]; then
-    range_pin_promote "$PR" "$HEAD_SHA" "$TMP_DIR/range-pin-$PR.json" \
-      "$(jq -r '.activeSha // empty' <<<"$STATE")" || RANGE_PIN_CONFLICT=true
+  if [ "$(jq -r '.isFreezePr == true and .settled == true' <<<"$FACTS")" = true ]; then
+    case "$(jq -r '.campaignRange.pinState // "absent"' <<<"$FACTS")" in
+      valid|invalid) ;;
+      absent)
+        if range_pin_promote "$PR" "$HEAD_SHA" "$TMP_DIR/range-pin-$PR.json"; then
+          # These facts ARE the pin now; say so, so the wake and every later
+          # read of this head are the same object.
+          FACTS="$(jq -c '.campaignRange.pinState="valid" | .campaignRange.baselinePinned=true' <<<"$FACTS")"
+        else
+          RANGE_PIN_CONFLICT=true
+        fi ;;
+      *) RANGE_PIN_CONFLICT=true
+         printf 'smoke-pr-gate: freeze PR #%s is settled but not offered: %s\n' "$PR" \
+           "$(jq -r '.campaignRange.reason // "no shared range-pin storage"' <<<"$FACTS")" >&2 ;;
+    esac
   fi
   if [ "$STATE_DIRTY" = true ]; then
     write_pr_state "$PR" "$STATE"

@@ -2077,9 +2077,14 @@ target**, and the gate states it once, in the facts (`check`) and the
   really bind to that target). `BLOCKED`, `NO_GO` and `HUMAN_DECISION` never
   move it. `baselineRunId` and `baselineResolved` say where it came from.
 - **The whole range result is pinned** — one immutable file per freeze head,
-  `<state-dir>/range-pins/pin-pr-<n>-<headSha>.json`, first write wins, so no
-  evaluation of another head can overwrite it (newest 8 per PR are kept, plus
-  the active run's) — at the first *settled* `poll` of a freeze head: the range, its file list, the
+  `range-pin-<repo>-pr-<n>-<headSha>.json` in the **shared lease directory**
+  (same place as the leases, so a coordinator resuming the run from another
+  state dir reads the same pin), first write wins, never trimmed by the gate.
+  `campaignRange.pinState`: `valid` (read from the pin), `absent` (computed),
+  `invalid` (something unreadable is at the pin's path — unknown/`full`, still
+  offered, never recomputed over), `unavailable` (no shared directory —
+  unknown/`full`, **not offered**). Pinned at
+  the first *settled* `poll` of a freeze head: the range, its file list, the
   migration/frontend facts and `campaignSize`/`sizeReason`. Every later
   `poll`, `check` and recovery wake of that head reads the pin
   (`baselinePinned: true`) instead of recomputing — a campaign opened as
