@@ -663,6 +663,7 @@ ACK_TRIGGERS="develop_unsettled develop_freeze_abandoned develop_freeze_stale
   develop_run_overrun develop_hold_undecided preflight_failed
   gate_misconfigured gate_fetch_failed
   pr_preflight_failed pr_migrations_refused pr_warmup_stuck
+  pr_run_stalled
   pr_facts_unavailable pr_run_overrun"
 # ...of which only these two re-alarm on a plain timer against a stable reason
 # string, so only these two are silenceable. The other interval alarms

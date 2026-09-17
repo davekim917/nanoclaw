@@ -1497,6 +1497,25 @@ a hung browser. On that wake, check whether the run is actually progressing —
 lane markers landing, evidence files growing — and if it is not, stop its
 coordinator and take the slot with `--takeover`.
 
+**A dead run whose PR stopped settling rings once too (`pr_run_stalled`).**
+Same-run recovery only resumes a run whose PR still settles, the overrun alarm
+needs *fresh* progress, and `challenger-timeout` refuses once a disposition is
+filed — so a coordinator that died before synthesis, on a PR whose preview was
+then suspended or which was unlabeled or closed, used to sit claimed forever.
+`poll` now scans its own per-PR state (not the PR list) and, on an otherwise
+idle poll, wakes once per run id for any claimed run quiet for
+`SMOKE_GATE_PROGRESS_STALE_SECONDS` + `SMOKE_GATE_STALLED_GRACE_SECONDS`
+(default 30 + 30 min) whose PR is not a settle candidate. The wake mints
+nothing and changes no owner, lease or authority. On it: read
+`notSettling.reason` (`not_settled`, `head_moved`, `pr_closed`, `pr_merged`,
+`label_removed`, …). If `challengerDispositionFiled` is true the evidence is
+complete and only synthesis is owed — once `leaseLive` is false, resume the
+**same** run id with `claim <runId> <pr> <sourceSha>`, take over the completion
+contract first when `contractAdoptionRequired` is true, synthesize from the
+evidence on disk and `finish`. If the campaign is moot (PR closed, head moved),
+`claim` the run id the same way and `release` it. `null` for the disposition
+and contract fields means `SMOKE_GATE_RUN_ROOT` is unwired, not "absent".
+
 **A `--takeover` does not stop the incumbent; it only stops it from *counting*.**
 The gate records who it displaced, so the displaced run's next `progress`,
 `release`, or `finish` returns `STOP THIS CAMPAIGN` naming the takeover instead
