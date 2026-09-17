@@ -50,6 +50,9 @@ set -u
 # commit sha -> tree response, plus a log of which shas were asked for.
 [ -n "${STUB_TREES_BY_SHA+x}" ] || STUB_TREES_BY_SHA='{}'
 [ -n "${STUB_TREE_GET_EXIT+x}" ] || STUB_TREE_GET_EXIT=0
+# A fixture too big for one env string (the kernel caps each at 128 KiB, same
+# limit as an argv string) comes from a file instead: {sha: tree-response}.
+[ -n "${STUB_TREES_FILE+x}" ] || STUB_TREES_FILE=''
 
 sequenced_run_list() {
   local n=1 out count_file
@@ -134,6 +137,9 @@ case "$1" in
       TREE_SHA="${P##*/git/trees/}"; TREE_SHA="${TREE_SHA%%\?*}"
       [ -z "${STUB_TREE_GET_LOG:-}" ] || printf '%s\n' "$TREE_SHA" >> "$STUB_TREE_GET_LOG"
       [ "$STUB_TREE_GET_EXIT" = 0 ] || exit "$STUB_TREE_GET_EXIT"
+      if [ -n "$STUB_TREES_FILE" ]; then
+        jq -c --arg s "$TREE_SHA" '.[$s] // {}' "$STUB_TREES_FILE"; exit 0
+      fi
       jq -c --arg s "$TREE_SHA" '.[$s] // {}' <<<"$STUB_TREES_BY_SHA"; exit 0
     fi
     if printf '%s' "$P" | grep -qF '/git/trees'; then
@@ -292,7 +298,7 @@ reset_stubs() {
         STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS STUB_DEPLOYS_BY_SERVICE_JSON \
         STUB_COMPARE_FILES STUB_COMPARE_EXIT STUB_LOCK_PROBE STUB_LOCK_PROBE_FILE \
         STUB_PARENT_BY_COMMIT STUB_PULL_HEADS STUB_BINDING_EXIT STUB_COMPARE_LOG \
-        STUB_TREES_BY_SHA STUB_TREE_GET_EXIT STUB_TREE_GET_LOG \
+        STUB_TREES_BY_SHA STUB_TREE_GET_EXIT STUB_TREE_GET_LOG STUB_TREES_FILE \
         STUB_STATE_PROBE STUB_STATE_PROBE_FILE STUB_SUSPEND_SLEEP STUB_REPO_VIEW_EXIT \
         STUB_LEDGER_JQ_EMPTY_FILE STUB_SUSPEND_LOG \
         STUB_FRONTEND_HTML_EXIT STUB_FRONTEND_HTML STUB_BUNDLE_EXIT STUB_BUNDLE_JS \
@@ -1116,6 +1122,58 @@ bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.campaig
   .data.campaignRange.determinable == false' >/dev/null
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-late GO "$BASE_SHA" "$(sha b)" 5
 range_case 5j-unknown-pinned "$UNKNOWN_RANGE"' and .campaignRange.baselineSha == null and .campaignRange.baselinePinned == true'
+
+# 5j-iii. A range far past one argv string. Linux caps a single argument at
+# 128 KiB; a range-sized value passed to jq as --argjson would fail to EXEC,
+# the pin candidate would be dropped, and an otherwise-settled freeze would be
+# skipped forever. 5,200 changed paths (>200 KB as JSON, 600 of them
+# migrations) must pin, read back through check / poll / the recovery wake,
+# size and list migrations correctly, and still emit the wake.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+export STUB_COMPARE_FILES="$(python3 -c 'import json; print(json.dumps({"status":"ahead","ahead_by":900,"behind_by":0,"files":[{"filename": f"XZO-BACKEND/src/f{i}.ts"} for i in range(300)]}))')"
+export STUB_TREES_FILE="$STATE_DIR/big-trees.json"
+python3 - "$BASE_SHA" "$PARENT_SHA" > "$STUB_TREES_FILE" <<'PYF'
+import json, sys
+base, target = sys.argv[1], sys.argv[2]
+blob = lambda p, s: {"path": p, "type": "blob", "mode": "100644", "sha": s}
+paths = [f"XZO-BACKEND/src/modules/some/deeply/nested/feature/area/file_{i:05d}.ts" for i in range(4600)]
+paths += [f"XZO-BACKEND/migrations/{i:04d}_a_descriptively_named_migration_step.sql" for i in range(600)]
+print(json.dumps({base: {"truncated": False, "tree": [blob(p, "a") for p in paths]},
+                  target: {"truncated": False, "tree": [blob(p, "b") for p in paths]}}))
+PYF
+export SMOKE_SIZING_RULES="$STATE_DIR/rules-big.json"
+printf '%s' '{"full":["XZO-BACKEND/migrations/0599_*"],"lightAllowed":["XZO-FRONTEND/**"]}' > "$SMOKE_SIZING_RULES"
+T5J3_FIRST="$(bash "$GATE" poll)"
+jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and
+  .data.campaignRange.determinable == true and .data.campaignRange.fileListMethod == "tree" and
+  (.data.migrationsInRange | length) == 600 and .data.campaignSize == "full" and
+  (.data.sizeReason | test("0599_"))' <<<"$T5J3_FIRST" >/dev/null ||
+  { echo "5j-iii: a >128KiB range did not settle+wake: ${T5J3_FIRST:0:400}" >&2; exit 1; }
+T5J3_RUN="$(jq -r '.data.runId' <<<"$T5J3_FIRST")"
+[ "$(jq -c '.campaignRangePin.rangePaths' "$STATE_DIR/pr-13-state.json" | wc -c)" -gt 204800 ] ||
+  { echo "5j-iii: fixture is not past the size it exists to test" >&2; exit 1; }
+jq -e '(.campaignRangePin.rangePaths | length) == 5200 and (.campaignRangePin.migrationsInRange | length) == 600' \
+  "$STATE_DIR/pr-13-state.json" >/dev/null
+rm -f "$STUB_TREES_FILE"; export STUB_COMPARE_EXIT=1       # nothing to recompute from: reads must come from the pin
+T5J3_VIEW="$(bash "$GATE" check 13 | jq -c "$RANGE_VIEW")"
+jq -e '.campaignRange.baselinePinned == true and .campaignRange.determinable == true and
+  (.migrationsInRange | length) == 600 and (.migrationFiles | length) == 600 and
+  .migrationsTouched == true and .campaignSize == "full"' <<<"$T5J3_VIEW" >/dev/null ||
+  { echo "5j-iii: check did not read the large pin back" >&2; exit 1; }
+bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null
+T5J3_RECOVERY="$(recover_run "$T5J3_RUN")"
+jq -e --arg run "$T5J3_RUN" '.data.trigger == "pr_build_settled" and .data.recovery == true and
+  .data.runId == $run and (.data.migrationsInRange | length) == 600 and .data.campaignSize == "full"' \
+  <<<"$T5J3_RECOVERY" >/dev/null || { echo "5j-iii: no recovery wake for the large pin" >&2; exit 1; }
+[ "$(jq -c '.data | {campaignRange,migrationsInRange,campaignSize,sizeReason}' <<<"$T5J3_RECOVERY")" = \
+  "$(jq -c '{campaignRange,migrationsInRange,campaignSize,sizeReason}' <<<"$T5J3_VIEW")" ]
+export STUB_COMPARE_EXIT=0
+unset SMOKE_SIZING_RULES STUB_TREES_FILE
 unset -f recover_run
 unset -f range_case
 

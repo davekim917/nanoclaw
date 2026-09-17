@@ -1745,8 +1745,11 @@ range_pin_for_head() {  # <state-json> <head-sha>; prints the pin or nothing
 }
 
 # --- Freeze-campaign baseline ------------------------------------------------
-# A freeze PR's target sits ON the tracked branch (smoke-freeze-pr.sh parents
-# the marker commit on a SHA of SMOKE_GATE_BRANCH), so `compare/$BRANCH...target`
+# A freeze PR's target sits ON the tracked branch: smoke-freeze-pr.sh takes a
+# "full 40-character SHA on SMOKE_GATE_BRANCH" (smoke-freeze-pr.sh:22), creates
+# the marker commit with that SHA as its ONLY parent (`parents:[$parent]`,
+# $parent = $TARGET_SHA, smoke-freeze-pr.sh:100-104) and opens the PR against
+# that same branch (`--base "$BRANCH"`, smoke-freeze-pr.sh:120). So `compare/$BRANCH...target`
 # has a head that is an ancestor-or-equal of its base and is EMPTY for every
 # freeze — status "behind"/"identical", zero files. Migration facts, sizing and
 # the human-facing range all read that empty list as "nothing changed". The
@@ -1940,7 +1943,8 @@ evaluate_pr() {
   # a truncated tree / fetch failure / no validated GO all mean the range
   # is UNKNOWN: size `full`, migrationsInRange null — never `[]`, which would
   # claim a confirmed read. Same ahead-and-not-behind shape as the develop
-  # gate's deploy_lag_safe.
+  # gate's deploy_lag_safe (smoke-develop-gate.sh:1505-1514: status "ahead",
+  # behind 0, then its own <300 files guard).
   #
   # Range uncertainty deliberately does NOT clear fetch_ok. fetch_ok means
   # "readiness facts are missing" and clamps `settled` in `check` and skips the
@@ -2125,13 +2129,21 @@ evaluate_pr() {
   if [ "$is_freeze" = true ] && [ -z "$range_pin" ] && [ "$COMMAND" = poll ] && [ -n "${TMP_DIR:-}" ]; then
     jq -e 'type == "array"' <<<"$range_paths_json" >/dev/null 2>&1 || range_paths_json='[]'
     [ "$range_determinable" = true ] || range_paths_json='[]'
-    jq -cn --arg h "$head_sha" --argjson range "$campaign_range_json" --argjson paths "$range_paths_json" \
+    # Range-sized values (the path list, the migration lists) NEVER travel in
+    # argv: Linux caps a single argument at 128 KiB (MAX_ARG_STRLEN), a
+    # ~2,000-path range is past that, and a jq that cannot exec would drop the
+    # candidate and leave an otherwise-settled freeze skipped forever. They go
+    # through --slurpfile from a builtin printf (no exec, no limit). Same rule
+    # at every site below that carries them: the facts emit, check's output,
+    # the settle-candidate line, the pin promotion and the settled wake.
+    jq -cn --arg h "$head_sha" --argjson range "$campaign_range_json" \
+      --slurpfile lists <(printf '{"paths":%s,"mf":%s,"mir":%s}' "$range_paths_json" "$migration_files" "$migrations_in_range") \
       --argjson mt "$migrations_touched" --argjson ft "$frontend_touched" \
-      --argjson md "$migrations_determinable" --argjson mf "$migration_files" \
-      --argjson mir "$migrations_in_range" --arg size "$campaign_size" --arg sizeReason "$campaign_size_reason" \
-      '{schemaVersion:1,headSha:$h,campaignRange:$range,rangePaths:$paths,
+      --argjson md "$migrations_determinable" \
+      --arg size "$campaign_size" --arg sizeReason "$campaign_size_reason" \
+      '{schemaVersion:1,headSha:$h,campaignRange:$range,rangePaths:$lists[0].paths,
         migrationsTouched:$mt,frontendTouched:$ft,migrationsDeterminable:$md,
-        migrationFiles:$mf,migrationsInRange:$mir,campaignSize:$size,sizeReason:$sizeReason}' \
+        migrationFiles:$lists[0].mf,migrationsInRange:$lists[0].mir,campaignSize:$size,sizeReason:$sizeReason}' \
       > "$TMP_DIR/range-pin-$pr.json" 2>/dev/null || rm -f "$TMP_DIR/range-pin-$pr.json" 2>/dev/null
   fi
 
@@ -2300,6 +2312,14 @@ evaluate_pr() {
     settled=true
   fi
 
+  # The two migration lists are range-sized, so they reach jq through
+  # --slurpfile, never argv (see the MAX_ARG_STRLEN note at the pin candidate
+  # above). $migrationsInRange is still named on the argv below, so it is
+  # shadowed with `null` there and rebound from the file as the program's
+  # first step.
+  local range_lists_json
+  range_lists_json="$(printf '{"migrationFiles":%s,"migrationsInRange":%s}' "$migration_files" "$migrations_in_range")"
+  migrations_in_range=null
   jq -cn \
     --argjson pr "$pr" --arg headSha "$head_sha" \
     --argjson fetchOk "$fetch_ok" \
@@ -2316,14 +2336,16 @@ evaluate_pr() {
     --arg frontendPreviewId "$frontend_id" --arg frontendPreviewUrl "$frontend_url" \
     --arg frontendDeploySha "$frontend_deploy_sha" --argjson frontendReady "$frontend_ready" \
     --argjson healthzReady "$healthz_ready" --argjson settled "$settled" \
-    --argjson migrationFiles "$migration_files" --argjson migrationsDeterminable "$migrations_determinable" \
+    --slurpfile rangeLists <(printf '%s' "$range_lists_json") --argjson migrationsDeterminable "$migrations_determinable" \
     --arg campaignSize "$campaign_size" --arg sizeReason "$campaign_size_reason" \
     --arg backendSelectionMethod "$backend_method" --argjson backendCandidates "$backend_candidates_json" \
     --arg frontendSelectionMethod "$frontend_method" --argjson frontendCandidates "$frontend_candidates_json" \
     --argjson previewAmbiguous "$preview_ambiguous" --arg previewAmbiguityReason "$preview_ambiguity_text" \
     --argjson frontendEvidenceGap "$frontend_evidence_gap" \
     --argjson campaignRange "$campaign_range_json" --argjson migrationsInRange "$migrations_in_range" \
-    '({
+    '($rangeLists[0].migrationFiles) as $migrationFiles |
+     ($rangeLists[0].migrationsInRange) as $migrationsInRange |
+     ({
       pr: $pr, headSha: $headSha, fetchOk: $fetchOk,
       migrationsTouched: $migrationsTouched, frontendTouched: $frontendTouched,
       frontendRequired: $frontendRequired,
@@ -2581,7 +2603,7 @@ MISSING="$MISSING$BAD_NUMERIC_CONFIG"
   # independent of whatever evaluate_pr's own per-field fail-closed defaults
   # did, in case a future field is added there without updating this clamp.
   FACTS="$(jq -c 'if .fetchOk != true then .settled = false else . end' <<<"$FACTS")"
-  jq -cn --argjson facts "$FACTS" '{ok:true} + {eligible:true} + $facts'
+  jq -c '{ok:true} + {eligible:true} + .' <<<"$FACTS"
   exit 0
 fi
 
@@ -4337,8 +4359,8 @@ while IFS= read -r ROW; do
     if [ -n "$(range_pin_for_head "$STATE" "$HEAD_SHA")" ] || [ -z "$RANGE_PIN_CANDIDATE" ]; then
       RANGE_PIN_CONFLICT=true
     else
-      STATE="$(jq -c --arg now "$(iso_now)" --argjson pin "$RANGE_PIN_CANDIDATE" \
-        '.campaignRangePin=($pin + {pinnedAt:$now})' <<<"$STATE")"
+      STATE="$(jq -c --arg now "$(iso_now)" --slurpfile pin <(printf '%s' "$RANGE_PIN_CANDIDATE") \
+        '.campaignRangePin=($pin[0] + {pinnedAt:$now})' <<<"$STATE")"
       STATE_DIRTY=true
       RANGE_PIN_WRITING=true
     fi
@@ -4430,9 +4452,9 @@ while IFS= read -r ROW; do
   RECOVERY=false
   ABANDONED=""
   if [ -n "$ACTIVE_SHA" ]; then RECOVERY=true; ABANDONED="$ACTIVE_SHA"; fi
-  jq -cn --argjson pr "$PR" --argjson facts "$FACTS" --argjson recovery "$RECOVERY" --arg abandoned "$ABANDONED" \
-    '{pr:$pr,facts:$facts,recovery:$recovery,abandonedActiveSha:(if $abandoned == "" then null else $abandoned end)}' \
-    >> "$SETTLE_CANDIDATES"
+  jq -c --argjson pr "$PR" --argjson recovery "$RECOVERY" --arg abandoned "$ABANDONED" \
+    '. as $facts | {pr:$pr,facts:$facts,recovery:$recovery,abandonedActiveSha:(if $abandoned == "" then null else $abandoned end)}' \
+    <<<"$FACTS" >> "$SETTLE_CANDIDATES"
 done < <(jq -c '.[]' <<<"$PR_LIST_JSON")
 
 # At most one wake per poll: alarms first (lowest PR number wins), then
@@ -4734,10 +4756,10 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
   jq -cn \
     --arg repo "$REPO" --arg branch "$BRANCH" --argjson pr "$W_PR" --arg runId "$RUN_ID" \
     --arg ownerToken "$OWNER_TOKEN" \
-    --argjson facts "$FACTS" --argjson recovery "$RECOVERY" \
+    --slurpfile factsFile <(printf '%s' "$FACTS") --argjson recovery "$RECOVERY" \
     --arg abandoned "$ABANDONED" \
     --argjson resumedRunId "$RESUMED_RUN_ID" \
-    '{wakeAgent:true,data:({
+    '$factsFile[0] as $facts | {wakeAgent:true,data:({
       schemaVersion:1, trigger:"pr_build_settled",
       repo:$repo, branch:$branch, pr:$pr, runId:$runId, coordinatorOwnerToken:$ownerToken,
       resumedRunId:$resumedRunId,
