@@ -19,11 +19,13 @@ const MAX_CAPABILITY_STRING_CHARS = 600;
  * block carried five or six full manuals — a host-accepted shape (32 services,
  * 160-char hints, ~7KB) lost entries here alone.
  *
- * This can leave less room under `NORMAL_RECALL_CHARS` for evidence blocks,
- * and that ordering is deliberate: `enforceFinalBound` on the host sheds
- * conversation and memory excerpts BEFORE capability entries, so the fallback
- * shedding evidence to keep the roster matches it. Real rosters measure ~3.3k,
- * so this only bites on pathological input.
+ * This leaves less room under `NORMAL_RECALL_CHARS`, and at the extreme this
+ * bound plus a full `MAX_INDEX_BYTES` index exceeds it on its own. That is
+ * handled where the ceiling is enforced, in `ensureFreshContextBootstrap`,
+ * which sheds in the host's order: evidence blocks, then the index, then
+ * capability entries. The ordering is deliberate — `enforceFinalBound` on the
+ * host sacrifices capabilities last — and it only bites on pathological input,
+ * since real rosters measure ~3.3k.
  */
 const MAX_CAPABILITY_JSON_CHARS = 11_000;
 /** Roster hint cap. Mirrors PRE_TURN_BOUNDS.capabilityRosterUseChars on the host. */
@@ -212,26 +214,29 @@ export function ensureFreshContextBootstrap(
     });
   }
 
-  const bootstrap = formatRecallContext({
-    trustedCapabilities: capabilities.snapshot,
-    memoryEvidence: {
-      core:
-        index.text === undefined
-          ? []
-          : [
-              {
-                path: 'index.md',
-                headings: [],
-                text: index.text,
-                score: Number.MAX_SAFE_INTEGER,
-                provenance: { authority: 'workgroup-memory-canon' },
-              },
-            ],
-      excerpts: [],
-    },
-    conversationEvidence: { excerpts: [] },
-    notices,
-  });
+  let indexText = index.text;
+  const render = (): string =>
+    formatRecallContext({
+      trustedCapabilities: capabilities.snapshot,
+      memoryEvidence: {
+        core:
+          indexText === undefined
+            ? []
+            : [
+                {
+                  path: 'index.md',
+                  headings: [],
+                  text: indexText,
+                  score: Number.MAX_SAFE_INTEGER,
+                  provenance: { authority: 'workgroup-memory-canon' },
+                },
+              ],
+        excerpts: [],
+      },
+      conversationEvidence: { excerpts: [] },
+      notices,
+    });
+  let bootstrap = render();
   const evidencePattern =
     /\[Untrusted recalled evidence[^\n]*\]\n[\s\S]*?<untrusted_recall_json>[\s\S]*?<\/untrusted_recall_json>/g;
   const limit = prompt.includes('"rank":"exact-link"') ? EXACT_LINK_RECALL_CHARS : NORMAL_RECALL_CHARS;
@@ -243,6 +248,44 @@ export function ensureFreshContextBootstrap(
     boundedPrompt = boundedPrompt.replace(block, '');
     evidenceBlocks = [...boundedPrompt.matchAll(evidencePattern)];
     recalledChars = bootstrap.length + evidenceBlocks.reduce((sum, match) => sum + match[0].length, 0);
+  }
+
+  // With the evidence blocks gone the bootstrap can still be over the ceiling
+  // on its own — MAX_CAPABILITY_JSON_CHARS plus a full MAX_INDEX_BYTES index
+  // exceeds NORMAL_RECALL_CHARS — and the loop above has nothing left to
+  // remove. Shed the rest in the host's own order (`enforceFinalBound`,
+  // src/modules/memory/pre-turn-context.ts): memory core first, capability
+  // entries last, so the roster is the final thing to go. Both loops
+  // terminate — the index halves to nothing, and `evictCapability` always
+  // removes an entry.
+  let shedIndex = false;
+  while (bootstrap.length > limit && indexText !== undefined) {
+    indexText =
+      indexText.length > 512 ? `${indexText.slice(0, Math.floor(indexText.length / 2))}${TRUNCATED}` : undefined;
+    if (!shedIndex) {
+      shedIndex = true;
+      notices.push({
+        source: 'markdown',
+        status: 'truncated',
+        code: 'runner-index-bootstrap-truncated',
+        detail: 'shortened index.md to keep the fresh-context bootstrap inside the recall ceiling',
+      });
+    }
+    bootstrap = render();
+  }
+  let shedServices = 0;
+  while (bootstrap.length > limit && capabilities.snapshot.services.length > 0) {
+    evictCapability(capabilities.snapshot.services);
+    shedServices++;
+    if (shedServices === 1) {
+      notices.push({
+        source: 'capabilities',
+        status: 'truncated',
+        code: 'runner-capability-bootstrap-truncated',
+        detail: 'dropped service entries to keep the fresh-context bootstrap inside the recall ceiling',
+      });
+    }
+    bootstrap = render();
   }
   // A native slash command reaches this runner as raw text specifically so the
   // provider SDK can dispatch it. Keep that token at byte zero even when a

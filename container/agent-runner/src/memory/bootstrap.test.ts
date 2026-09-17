@@ -151,6 +151,34 @@ describe('ensureFreshContextBootstrap', () => {
     for (const service of services) expect(result).toContain(`"name":"${service.name}"`);
   });
 
+  it('keeps the generated bootstrap inside the recall ceiling, shedding the index before the roster', () => {
+    // Round 2, P2: raising the capability byte bound made the bootstrap able to
+    // exceed NORMAL_RECALL_CHARS on its own — the evidence-shedding loop only
+    // removes blocks already in the prompt, so with none there it returned an
+    // oversized bootstrap. Shed in the host's order instead: index first,
+    // capability entries last.
+    const services = Array.from({ length: 32 }, (_, index) => ({
+      name: `Service ${index} ${'n'.repeat(110)}`,
+      mcpNamespace: `mcp__service-${index}__*`,
+      summary: 'x'.repeat(160),
+    }));
+    fs.writeFileSync(CAPABILITIES, JSON.stringify({ session: { agentGroupId: 'agent-a', services } }));
+    fs.writeFileSync(INDEX, `# Canon\n${'Canon line that fills the index budget. '.repeat(120)}`);
+
+    const result = ensureFreshContextBootstrap('<message>hello</message>', {
+      capabilities: CAPABILITIES,
+      index: INDEX,
+    });
+    const bootstrap = result.slice(0, result.indexOf('<message>hello</message>'));
+
+    expect(bootstrap.length).toBeLessThanOrEqual(12_000);
+    expect(result).toContain('runner-index-bootstrap-truncated');
+    // The roster is the last thing sacrificed: the index went, the services
+    // did not.
+    expect(result).not.toContain('runner-capability-bootstrap-truncated');
+    for (const service of services) expect(result).toContain(`mcp__${service.mcpNamespace.slice(5, -3)}__*`);
+  });
+
   it('reports when runner-side capability bounding drops services', () => {
     // Past MAX_CAPABILITY_SERVICES (32), so the count limit fires. It used to
     // be exactly 32 and leant on the byte bound, which a host-accepted roster
