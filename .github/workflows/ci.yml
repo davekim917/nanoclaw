@@ -337,11 +337,15 @@ jobs:
 
   # A red nightly has no PR to block, so it has to make noise: one open issue,
   # commented on each further red night rather than a new issue per night.
-  # `issues: write` is scoped to this job alone, and it only ever runs on
-  # schedule/dispatch — trusted code from main, never a PR's.
+  # `issues: write` is scoped to this job alone, and it runs on `schedule`
+  # only — that is the one trigger guaranteed to be main's own workflow on
+  # main's own tree. A `workflow_dispatch --ref <branch>` runs the branch's
+  # copy of this file on the branch's tree, so its red is not main's (and
+  # its code must not hold a write scope): dispatch shows its result in the
+  # run itself (Codex, #880 round 1).
   report:
     needs: [correctness, bookkeeping]
-    if: failure() && github.event_name != 'pull_request'
+    if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     permissions:
       contents: read
