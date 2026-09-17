@@ -2076,8 +2076,10 @@ target**, and the gate states it once, in the facts (`check`) and the
   (digest matches its run `verdict.json`, and the freeze commit / freeze PR
   really bind to that target). `BLOCKED`, `NO_GO` and `HUMAN_DECISION` never
   move it. `baselineRunId` and `baselineResolved` say where it came from.
-- **The whole range result is pinned** (`campaignRangePin` in the PR state) at
-  the first *settled* `poll` of a freeze head: the range, its file list, the
+- **The whole range result is pinned** — one immutable file per freeze head,
+  `<state-dir>/range-pins/pin-pr-<n>-<headSha>.json`, first write wins, so no
+  evaluation of another head can overwrite it (newest 8 per PR are kept, plus
+  the active run's) — at the first *settled* `poll` of a freeze head: the range, its file list, the
   migration/frontend facts and `campaignSize`/`sizeReason`. Every later
   `poll`, `check` and recovery wake of that head reads the pin
   (`baselinePinned: true`) instead of recomputing — a campaign opened as

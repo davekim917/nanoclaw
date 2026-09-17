@@ -1719,19 +1719,29 @@ campaign_size_classify() {
 }
 
 # --- Freeze-campaign range pin -----------------------------------------------
-# ONE record, campaignRangePin in the PR state, holds EVERYTHING range-derived
-# for a freeze head: the campaignRange object (baseline, determinable, reason,
-# fileListMethod), the changed-path list, the migration/frontend facts read
-# from it, and the size verdict classified from it. `poll` writes it at the
-# first SETTLED evaluation of that head — the moment a campaign can be opened —
-# and from then on every `poll` and `check` of that head READS it instead of
+# A pin holds EVERYTHING range-derived for one freeze head: the campaignRange
+# object (baseline, determinable, reason, fileListMethod), the changed-path
+# list, the migration/frontend facts read from it, and the size verdict
+# classified from it. `poll` promotes one at the first SETTLED evaluation of
+# that head — the moment a campaign can be opened — and from then on every
+# `poll`, `check` and recovery wake of that head READS it instead of
 # recomputing. Pinning only the baseline was not enough: a transient compare
 # or tree failure opens a campaign as unknown/`full`, and a recomputing
 # recovery wake could come back determinable/`standard` — shrinking required
 # coverage, and changing migrationsInRange, for the SAME run. Sizing is in the
 # pin for the same reason (the rules file can change between two polls).
-# A different head SHA is a different campaign and gets its own pin. `check`
-# never writes: it reads a pin if one exists and otherwise computes.
+#
+# STORAGE INVARIANT: pins are IMMUTABLE and KEYED BY HEAD SHA, first write
+# wins. One file per (PR, head) — range-pins/pin-pr-<n>-<headSha>.json — created
+# with `ln`, which fails on EEXIST, so creation is atomic and can never replace
+# an existing pin whether or not the caller holds the PR lock. An evaluation of
+# head Y therefore cannot overwrite or remove the pin of head X: it addresses a
+# different file. (A single pin slot in the PR state could not give this: a
+# slow poll still holding an OLD head's result overwrote the slot after a newer
+# head had pinned unknown/`full` and opened its campaign, and the next poll of
+# the newer head recomputed — the very shrink the pin exists to prevent.)
+# range_pin_lookup and range_pin_promote are the ONLY code that touches these
+# files; check, poll and recovery all go through them. `check` only looks up.
 RANGE_PIN_SHAPE='type == "object" and .schemaVersion == 1 and (.headSha | type == "string") and
   (.campaignRange | type == "object") and (.campaignRange.determinable | type == "boolean") and
   (.rangePaths | type == "array") and (.migrationFiles | type == "array") and
@@ -1739,9 +1749,58 @@ RANGE_PIN_SHAPE='type == "object" and .schemaVersion == 1 and (.headSha | type =
   (.migrationsDeterminable | type == "boolean") and
   ((.migrationsInRange | type) as $t | $t == "array" or $t == "null") and
   (.campaignSize | type == "string") and (.sizeReason | type == "string")'
-range_pin_for_head() {  # <state-json> <head-sha>; prints the pin or nothing
-  jq -c --arg h "$2" ".campaignRangePin // empty | select(($RANGE_PIN_SHAPE) and .headSha == \$h)" \
-    <<<"$1" 2>/dev/null
+# Growth bound: the newest RANGE_PIN_KEEP pins of a PR are kept, plus — always —
+# the pin just promoted and the pin of the PR's active run. A freeze PR has one
+# head for its whole life in practice, so this only ever trims abandoned heads.
+RANGE_PIN_KEEP=8
+range_pin_dir()  { printf '%s/range-pins' "$STATE_DIR"; }
+range_pin_file() { printf '%s/range-pins/pin-pr-%s-%s.json' "$STATE_DIR" "$1" "$2"; }
+range_pin_args_ok() {
+  printf '%s' "${1:-}" | grep -Eq '^[0-9]+$' && printf '%s' "${2:-}" | grep -Eq '^[0-9a-f]{40}$'
+}
+range_pin_lookup() {  # <pr> <head-sha>; prints the pin, or nothing
+  range_pin_args_ok "$1" "$2" || return 0
+  local f
+  f="$(range_pin_file "$1" "$2")"
+  [ -s "$f" ] || return 0
+  jq -c --arg h "$2" "select(($RANGE_PIN_SHAPE) and .headSha == \$h)" "$f" 2>/dev/null
+}
+# Promote a candidate to THE pin for (pr, head). First write wins; a second
+# promotion for the same head changes nothing on disk. Returns 0 when this call
+# created the pin, 3 when a pin already existed (the caller's freshly computed
+# facts may disagree with it), 1 when no pin exists and none could be created.
+range_pin_promote() {  # <pr> <head-sha> <candidate-file> [<active-head-sha>]
+  local pr="$1" head="$2" candidate="$3" active="${4:-}" f tmp dir keep stale
+  range_pin_args_ok "$pr" "$head" || return 1
+  [ -z "$(range_pin_lookup "$pr" "$head")" ] || return 3
+  f="$(range_pin_file "$pr" "$head")"
+  dir="$(range_pin_dir)"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  tmp="$(mktemp "$dir/.pin-pr-$pr.XXXXXX" 2>/dev/null)" || return 1
+  if ! jq -c --arg h "$head" --arg now "$(iso_now)" \
+         "select(($RANGE_PIN_SHAPE) and .headSha == \$h) | . + {pinnedAt:\$now}" \
+         "$candidate" > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+    rm -f "$tmp" 2>/dev/null; return 1
+  fi
+  if [ -e "$f" ] && [ -z "$(range_pin_lookup "$pr" "$head")" ]; then
+    # Something is at the pin's path that is not a pin (pins are only ever
+    # linked in complete, so this is outside damage). It is moved aside, never
+    # deleted, so the head is not left unpinnable — and unofferable — forever.
+    mv "$f" "$f.invalid-$(date -u +%Y%m%dT%H%M%SZ)-$$" 2>/dev/null || true
+  fi
+  if ln "$tmp" "$f" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+  else
+    rm -f "$tmp" 2>/dev/null
+    [ -n "$(range_pin_lookup "$pr" "$head")" ] && return 3
+    return 1
+  fi
+  keep="$(range_pin_file "$pr" "$active")"
+  while IFS= read -r stale; do
+    [ -n "$stale" ] && [ "$stale" != "$f" ] && [ "$stale" != "$keep" ] || continue
+    rm -f "$stale" 2>/dev/null
+  done < <(ls -1t "$dir"/pin-pr-"$pr"-*.json 2>/dev/null | grep -E "/pin-pr-$pr-[0-9a-f]{40}\.json\$" | tail -n +"$(( RANGE_PIN_KEEP + 1 ))")
+  return 0
 }
 
 # --- Freeze-campaign baseline ------------------------------------------------
@@ -1774,8 +1833,8 @@ range_pin_for_head() {  # <state-json> <head-sha>; prints the pin or nothing
 # answer could not be established this call (a binding fetch failed);
 # `resolved:true` with a null baselineSha is the conclusive "no validated GO
 # exists". Stability across one campaign is not this function's job: the whole
-# range result, this baseline included, is pinned by campaignRangePin (see
-# range_pin_for_head).
+# range result, this baseline included, is pinned per head (see
+# range_pin_promote).
 BASELINE_CANDIDATE_LIMIT=10
 
 # Complete changed-file list between two commits, from their recursive trees.
@@ -1961,7 +2020,7 @@ evaluate_pr() {
     range_reason=""
     range_files_method=""
     target_files_json='{"files":[]}'
-    range_pin="$(range_pin_for_head "$(read_pr_state "$pr")" "$head_sha")"
+    range_pin="$(range_pin_lookup "$pr" "$head_sha")"
     if [ -n "$range_pin" ]; then
       # This head's campaign range is pinned: read it, fetch nothing.
       range_determinable="$(jq -r '.campaignRange.determinable' <<<"$range_pin")"
@@ -2116,7 +2175,7 @@ evaluate_pr() {
     fi
   fi
   local size_out campaign_size campaign_size_reason
-  # A pinned freeze range carries its size verdict too (see range_pin_for_head).
+  # A pinned freeze range carries its size verdict too (see range_pin_promote).
   size_out="${range_pin_size_out:-$(campaign_size_classify "$size_determinable" "$size_fail_reason" "$size_files_json")}"
   campaign_size="$(jq -r '.campaignSize' <<<"$size_out")"
   campaign_size_reason="$(jq -r '.sizeReason' <<<"$size_out")"
@@ -2124,7 +2183,7 @@ evaluate_pr() {
   # The pin CANDIDATE for this evaluation: exactly the range-derived values
   # emitted below, written where only `poll` can pick it up (its per-invocation
   # TMP_DIR). This function runs unlocked and in a subshell, so it never writes
-  # PR state itself — `poll` promotes the candidate under the PR lock, and only
+  # a pin itself — `poll` promotes the candidate (range_pin_promote), and only
   # for a settled head. `check` has no TMP_DIR and writes nothing.
   if [ "$is_freeze" = true ] && [ -z "$range_pin" ] && [ "$COMMAND" = poll ] && [ -n "${TMP_DIR:-}" ]; then
     jq -e 'type == "array"' <<<"$range_paths_json" >/dev/null 2>&1 || range_paths_json='[]'
@@ -4321,6 +4380,17 @@ while IFS= read -r ROW; do
     continue
   fi
 
+  # Deterministic regression seam for the evaluated-but-not-yet-promoted
+  # window (a slow poll holding an OLD head's facts). Production wrappers never
+  # set it — same guard as the post-bind seam below.
+  if [ -n "${SMOKE_GATE_SHARED_ROOT+x}" ] && [ "$SMOKE_GATE_SHARED_ROOT" != /workspace/workgroup ] &&
+     [ -n "${SMOKE_GATE_TEST_HOLD_BEFORE_RANGE_PIN_FILE:-}" ]; then
+    : > "$SMOKE_GATE_TEST_HOLD_BEFORE_RANGE_PIN_FILE.ready"
+    for _wait in $(seq 1 600); do
+      [ -e "$SMOKE_GATE_TEST_HOLD_BEFORE_RANGE_PIN_FILE" ] && break
+      /usr/bin/sleep 0.05 2>/dev/null || sleep 0.05
+    done
+  fi
   exec 9>"$(pr_lock_file "$PR")"
   if ! flock -w "$LOCK_WAIT" 9; then
     exec 9>&-
@@ -4344,29 +4414,23 @@ while IFS= read -r ROW; do
     fi
   fi
   # Pin the freeze campaign's WHOLE range result to this head SHA at the first
-  # settled evaluation (see range_pin_for_head). These FACTS were computed
-  # before the lock: if they were not read from a pin but a valid pin for this
-  # head exists now, another poll pinned in between — drop this candidate for
-  # one cycle rather than wake on facts the pin may contradict; the next poll
-  # reads the pin. A settled freeze whose pin cannot be written is not offered
-  # either: an unpinned campaign is exactly what this exists to prevent.
+  # settled evaluation (range_pin_promote: immutable, keyed by head, first
+  # write wins). These FACTS were computed before the lock. If they were not
+  # read from a pin and a pin for THIS head exists by now (rc 3), another poll
+  # pinned in between — drop this candidate for one cycle rather than wake on
+  # facts the pin may contradict; the next poll reads the pin. A settled freeze
+  # whose pin cannot be created (rc 1) is not offered either: an unpinned
+  # campaign is exactly what this exists to prevent. A stale evaluation of an
+  # OLDER head can at worst create that older head's own pin file; it cannot
+  # touch any other head's.
   RANGE_PIN_CONFLICT=false
-  RANGE_PIN_WRITING=false
   if [ "$(jq -r '.isFreezePr == true and .settled == true and
                  (.campaignRange.baselinePinned != true)' <<<"$FACTS")" = true ]; then
-    RANGE_PIN_CANDIDATE="$(range_pin_for_head "$(jq -cn --slurpfile c "$TMP_DIR/range-pin-$PR.json" \
-      '{campaignRangePin:$c[0]}' 2>/dev/null)" "$HEAD_SHA")"
-    if [ -n "$(range_pin_for_head "$STATE" "$HEAD_SHA")" ] || [ -z "$RANGE_PIN_CANDIDATE" ]; then
-      RANGE_PIN_CONFLICT=true
-    else
-      STATE="$(jq -c --arg now "$(iso_now)" --slurpfile pin <(printf '%s' "$RANGE_PIN_CANDIDATE") \
-        '.campaignRangePin=($pin[0] + {pinnedAt:$now})' <<<"$STATE")"
-      STATE_DIRTY=true
-      RANGE_PIN_WRITING=true
-    fi
+    range_pin_promote "$PR" "$HEAD_SHA" "$TMP_DIR/range-pin-$PR.json" \
+      "$(jq -r '.activeSha // empty' <<<"$STATE")" || RANGE_PIN_CONFLICT=true
   fi
   if [ "$STATE_DIRTY" = true ]; then
-    write_pr_state "$PR" "$STATE" || { [ "$RANGE_PIN_WRITING" != true ] || RANGE_PIN_CONFLICT=true; }
+    write_pr_state "$PR" "$STATE"
   fi
   flock -u 9
   exec 9>&-

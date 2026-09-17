@@ -999,6 +999,7 @@ export STUB_BINDING_EXIT=0
 # freeze head, and every later poll / check / recovery wake of that head reads
 # the pin instead of recomputing. RANGE_VIEW is every range-derived fact.
 RANGE_VIEW='{campaignRange,migrationsInRange,migrationsTouched,frontendTouched,migrationFiles,migrationsDeterminable,campaignSize,sizeReason}'
+pin_file() { printf '%s/range-pins/pin-pr-%s-%s.json' "$STATE_DIR" "$1" "$2"; }
 recover_run() { # <run-id> -> the recovery wake for that run
   expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$1.json"
   SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll
@@ -1026,12 +1027,13 @@ jq -e --arg base "$BASE_SHA" '.data.trigger == "pr_build_settled" and .data.reco
   { echo "5j: first poll: $T5J_FIRST" >&2; exit 1; }
 T5J_RUN="$(jq -r '.data.runId' <<<"$T5J_FIRST")"
 jq -e --arg base "$BASE_SHA" --arg head "$FREEZE_SHA" '
-  .campaignRangePin.headSha == $head and .campaignRangePin.campaignRange.baselineSha == $base and
-  .campaignRangePin.campaignRange.baselineRunId == "run-go-base" and
-  .campaignRangePin.rangePaths == ["XZO-BACKEND/src/other.ts"] and
-  .campaignRangePin.campaignSize == "standard" and (.campaignRangePin.pinnedAt | type == "string") and
-  (has("campaignBaseline") | not)' "$STATE_DIR/pr-13-state.json" >/dev/null ||
-  { echo "5j: pin record wrong: $(cat "$STATE_DIR/pr-13-state.json")" >&2; exit 1; }
+  .headSha == $head and .campaignRange.baselineSha == $base and
+  .campaignRange.baselineRunId == "run-go-base" and
+  .rangePaths == ["XZO-BACKEND/src/other.ts"] and
+  .campaignSize == "standard" and (.pinnedAt | type == "string")' "$(pin_file 13 "$FREEZE_SHA")" >/dev/null ||
+  { echo "5j: pin record wrong: $(cat "$(pin_file 13 "$FREEZE_SHA")")" >&2; exit 1; }
+# The pin lives in its own per-head file, not in a slot of the mutable PR state.
+jq -e '(has("campaignRangePin") or has("campaignBaseline")) | not' "$STATE_DIR/pr-13-state.json" >/dev/null
 T5J_VIEW="$(bash "$GATE" check 13 | jq -c "$RANGE_VIEW")"
 jq -e '.campaignRange.baselinePinned == true' <<<"$T5J_VIEW" >/dev/null
 # The wake and the pinned view agree on everything but the pinned flag itself.
@@ -1058,10 +1060,14 @@ freeze_ready_fixture 13 "$NEW_FREEZE" "$PARENT_SHA"
 range_case 5j-new-head '.campaignRange.baselineSha != $base and .campaignRange.baselinePinned == false and
   .migrationsInRange == ["XZO-BACKEND/migrations/400_later.sql"] and .campaignSize == "full"'
 bash "$GATE" poll >/dev/null
-jq -e --arg head "$NEW_FREEZE" --arg newer "$NEWER_SHA" '.campaignRangePin.headSha == $head and
-  .campaignRangePin.campaignRange.baselineSha == $newer and
-  .campaignRangePin.migrationsInRange == ["XZO-BACKEND/migrations/400_later.sql"]' \
-  "$STATE_DIR/pr-13-state.json" >/dev/null || { echo "5j: a new head did not get its own pin" >&2; exit 1; }
+jq -e --arg head "$NEW_FREEZE" --arg newer "$NEWER_SHA" '.headSha == $head and
+  .campaignRange.baselineSha == $newer and
+  .migrationsInRange == ["XZO-BACKEND/migrations/400_later.sql"]' \
+  "$(pin_file 13 "$NEW_FREEZE")" >/dev/null || { echo "5j: a new head did not get its own pin" >&2; exit 1; }
+# ...and the first head's pin is still there, untouched by the new head.
+[ "$(jq -c "$RANGE_VIEW"' | del(.campaignRange.baselinePinned)' <<<"$T5J_VIEW")" = \
+  "$(jq -c '{campaignRange,migrationsInRange,migrationsTouched,frontendTouched,migrationFiles,migrationsDeterminable,campaignSize,sizeReason} | del(.campaignRange.baselinePinned)' "$(pin_file 13 "$FREEZE_SHA")")" ] ||
+  { echo "5j: pinning a new head disturbed the old head's pin" >&2; exit 1; }
 unset SMOKE_SIZING_RULES STUB_COMPARE_LOG
 
 # 5j-ii. The P1: a NON-null baseline and a TRANSIENT compare failure at the
@@ -1107,7 +1113,7 @@ freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
 export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
 export STUB_COMPARE_EXIT=1 STUB_HEALTHZ_CODE=503
 bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null
-jq -e '(.campaignRangePin // null) == null' "$STATE_DIR/pr-13-state.json" >/dev/null ||
+[ ! -e "$(pin_file 13 "$FREEZE_SHA")" ] ||
   { echo "5j-ii: an unsettled poll pinned a range" >&2; exit 1; }
 export STUB_COMPARE_EXIT=0 STUB_HEALTHZ_CODE=200
 bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.campaignRange.determinable == true' >/dev/null
@@ -1155,10 +1161,10 @@ jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and
   (.data.sizeReason | test("0599_"))' <<<"$T5J3_FIRST" >/dev/null ||
   { echo "5j-iii: a >128KiB range did not settle+wake: ${T5J3_FIRST:0:400}" >&2; exit 1; }
 T5J3_RUN="$(jq -r '.data.runId' <<<"$T5J3_FIRST")"
-[ "$(jq -c '.campaignRangePin.rangePaths' "$STATE_DIR/pr-13-state.json" | wc -c)" -gt 204800 ] ||
+[ "$(jq -c '.rangePaths' "$(pin_file 13 "$FREEZE_SHA")" | wc -c)" -gt 204800 ] ||
   { echo "5j-iii: fixture is not past the size it exists to test" >&2; exit 1; }
-jq -e '(.campaignRangePin.rangePaths | length) == 5200 and (.campaignRangePin.migrationsInRange | length) == 600' \
-  "$STATE_DIR/pr-13-state.json" >/dev/null
+jq -e '(.rangePaths | length) == 5200 and (.migrationsInRange | length) == 600' \
+  "$(pin_file 13 "$FREEZE_SHA")" >/dev/null
 rm -f "$STUB_TREES_FILE"; export STUB_COMPARE_EXIT=1       # nothing to recompute from: reads must come from the pin
 T5J3_VIEW="$(bash "$GATE" check 13 | jq -c "$RANGE_VIEW")"
 jq -e '.campaignRange.baselinePinned == true and .campaignRange.determinable == true and
@@ -1174,7 +1180,112 @@ jq -e --arg run "$T5J3_RUN" '.data.trigger == "pr_build_settled" and .data.recov
   "$(jq -c '{campaignRange,migrationsInRange,campaignSize,sizeReason}' <<<"$T5J3_VIEW")" ]
 export STUB_COMPARE_EXIT=0
 unset SMOKE_SIZING_RULES STUB_TREES_FILE
-unset -f recover_run
+
+# 5j-iv. STORAGE INVARIANT: pins are immutable and keyed by head SHA. The
+# interleaving that broke the single-slot pin, driven through the gate's hold
+# seam: poll A has EVALUATED old head H1 and is paused before promotion; poll B
+# sees new head H2 during a compare outage, pins unknown/full and opens
+# campaign R; A resumes. A must not open a campaign, and must not disturb H2's
+# pin — so once the API recovers, check / poll / R's recovery wake still report
+# the pinned unknown/full instead of a recomputed determinable/standard.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+H1_SHA="$FREEZE_SHA"
+H2_SHA="$(sha 5)"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+freeze_ready_fixture 13 "$H1_SHA" "$PARENT_SHA"
+T5J4_HOLD="$STATE_DIR/hold-a"
+T5J4_A_OUT="$STATE_DIR/poll-a.out"
+SMOKE_GATE_TEST_HOLD_BEFORE_RANGE_PIN_FILE="$T5J4_HOLD" bash "$GATE" poll > "$T5J4_A_OUT" 2>/dev/null &
+T5J4_A_PID=$!
+for _ in $(seq 1 600); do [ -e "$T5J4_HOLD.ready" ] && break; /usr/bin/sleep 0.05; done
+[ -e "$T5J4_HOLD.ready" ] || { echo "5j-iv: poll A never reached the hold seam" >&2; exit 1; }
+[ ! -e "$(pin_file 13 "$H1_SHA")" ]                         # A has evaluated H1 but promoted nothing
+freeze_ready_fixture 13 "$H2_SHA" "$PARENT_SHA"
+export STUB_COMPARE_EXIT=1                                  # outage while B looks at H2
+T5J4_B="$(bash "$GATE" poll)"
+jq -e --arg h "$H2_SHA" '.data.trigger == "pr_build_settled" and .data.sourceSha == $h and
+  .data.campaignSize == "full" and .data.campaignRange.determinable == false' <<<"$T5J4_B" >/dev/null ||
+  { echo "5j-iv: poll B did not open R as unknown/full: $T5J4_B" >&2; exit 1; }
+T5J4_RUN="$(jq -r '.data.runId' <<<"$T5J4_B")"
+T5J4_PIN_BEFORE="$(cat "$(pin_file 13 "$H2_SHA")")"
+T5J4_INODE_BEFORE="$(stat -c '%i %Y' "$(pin_file 13 "$H2_SHA")")"
+: > "$T5J4_HOLD"                                            # A resumes with its stale H1 facts
+wait "$T5J4_A_PID"
+jq -e '.wakeAgent == false' "$T5J4_A_OUT" >/dev/null ||
+  { echo "5j-iv: the stale H1 poll opened a campaign: $(cat "$T5J4_A_OUT")" >&2; exit 1; }
+jq -e --arg h "$H2_SHA" --arg run "$T5J4_RUN" '.activeSha == $h and .activeRunId == $run' \
+  "$STATE_DIR/pr-13-state.json" >/dev/null
+[ "$(cat "$(pin_file 13 "$H2_SHA")")" = "$T5J4_PIN_BEFORE" ] ||
+  { echo "5j-iv: a stale evaluation of H1 disturbed H2's pin" >&2; exit 1; }
+export STUB_COMPARE_EXIT=0                                  # the API recovers
+range_case 5j-iv-check "$UNKNOWN_RANGE"' and .headSha == "'"$H2_SHA"'" and .campaignRange.baselinePinned == true and
+  .campaignRange.reason == "the baseline...target comparison could not be fetched"'
+bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null    # R is live; and this is a 2nd promotion attempt path
+# A second promotion for the same head is a byte-identical no-op (same inode,
+# same mtime, same bytes) — forced by handing poll freshly computed facts for a
+# head that is already pinned: check's view is the pin, the file is untouched.
+[ "$(cat "$(pin_file 13 "$H2_SHA")")" = "$T5J4_PIN_BEFORE" ]
+[ "$(stat -c '%i %Y' "$(pin_file 13 "$H2_SHA")")" = "$T5J4_INODE_BEFORE" ] ||
+  { echo "5j-iv: H2's pin file was rewritten" >&2; exit 1; }
+T5J4_RECOVERY="$(recover_run "$T5J4_RUN")"
+jq -e --arg run "$T5J4_RUN" '.data.trigger == "pr_build_settled" and .data.recovery == true and
+  .data.runId == $run and .data.campaignSize == "full" and
+  .data.campaignRange.determinable == false and .data.migrationsInRange == null' <<<"$T5J4_RECOVERY" >/dev/null ||
+  { echo "5j-iv: R recovered with a shrunk scope: $T5J4_RECOVERY" >&2; exit 1; }
+[ "$(cat "$(pin_file 13 "$H2_SHA")")" = "$T5J4_PIN_BEFORE" ]
+
+# 5j-v. Second promotion for the SAME head: poll A evaluates H fresh (API up,
+# determinable) and pauses; poll B pins H as unknown/full (API down) and opens
+# the campaign; A resumes holding a DIFFERENT, freshly computed result for the
+# very same head. First write wins: the pin is byte-identical, same inode, and
+# A — whose facts contradict the pin — wakes nobody.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+freeze_ready_fixture 13 "$H2_SHA" "$PARENT_SHA"
+T5J5_HOLD="$STATE_DIR/hold-a"
+SMOKE_GATE_TEST_HOLD_BEFORE_RANGE_PIN_FILE="$T5J5_HOLD" bash "$GATE" poll > "$STATE_DIR/poll-a.out" 2>/dev/null &
+T5J5_A_PID=$!
+for _ in $(seq 1 600); do [ -e "$T5J5_HOLD.ready" ] && break; /usr/bin/sleep 0.05; done
+[ -e "$T5J5_HOLD.ready" ] || { echo "5j-v: poll A never reached the hold seam" >&2; exit 1; }
+STUB_COMPARE_EXIT=1 bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and
+  .data.campaignRange.determinable == false' >/dev/null
+T5J5_PIN_BEFORE="$(cat "$(pin_file 13 "$H2_SHA")")"
+T5J5_INODE_BEFORE="$(stat -c '%i %Y' "$(pin_file 13 "$H2_SHA")")"
+: > "$T5J5_HOLD"
+wait "$T5J5_A_PID"
+jq -e '.wakeAgent == false' "$STATE_DIR/poll-a.out" >/dev/null ||
+  { echo "5j-v: the losing promotion still woke: $(cat "$STATE_DIR/poll-a.out")" >&2; exit 1; }
+[ "$(cat "$(pin_file 13 "$H2_SHA")")" = "$T5J5_PIN_BEFORE" ] &&
+  [ "$(stat -c '%i %Y' "$(pin_file 13 "$H2_SHA")")" = "$T5J5_INODE_BEFORE" ] ||
+  { echo "5j-v: a second promotion rewrote the pin" >&2; exit 1; }
+jq -e '.campaignRange.determinable == false' "$(pin_file 13 "$H2_SHA")" >/dev/null
+[ "$(ls "$STATE_DIR/range-pins" | wc -l)" -eq 1 ]            # no temp or duplicate left behind
+
+# 5j-vi. Growth bound: newest 8 pins per PR, plus — always — the active run's.
+# Eleven heads pinned in turn; the FIRST one owns the live campaign, so it is
+# the oldest file and would be the first trimmed if the bound ignored it.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+for T5J6_C in 0 1 2 3 4 5 6 7 8 9 a; do
+  freeze_ready_fixture 13 "$(sha "$T5J6_C")" "$PARENT_SHA"
+  bash "$GATE" poll >/dev/null
+done
+jq -e --arg h "$(sha 0)" '.activeSha == $h' "$STATE_DIR/pr-13-state.json" >/dev/null
+[ "$(ls "$STATE_DIR/range-pins" | wc -l)" -eq 9 ] ||
+  { echo "5j-vi: expected 8 newest + the active head's pin: $(ls "$STATE_DIR/range-pins")" >&2; exit 1; }
+[ -s "$(pin_file 13 "$(sha 0)")" ] && [ -s "$(pin_file 13 "$(sha a)")" ] && [ ! -e "$(pin_file 13 "$(sha 1)")" ] ||
+  { echo "5j-vi: the bound trimmed the wrong pins" >&2; exit 1; }
+unset -f recover_run pin_file
 unset -f range_case
 
 # --- 6. Migrations refusal: never settles; one throttled alarm wake --------
