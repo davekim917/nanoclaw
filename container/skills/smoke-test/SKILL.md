@@ -1970,7 +1970,7 @@ and cannot change the scheduled `poll` or ordinary `check` behavior.
 `pr_build_settled`. Its payload includes `coordinatorOwnerToken`; treat that
 opaque value as part of the run identity. Pass it explicitly to every gate
 verb above and export it as `SMOKE_GATE_OWNER` for every
-`smoke-run-scaffold.sh` contract, marker, and redispatch writer. Native lane
+`smoke-run-scaffold.sh` contract, marker, redispatch, and adopt writer. Native lane
 workers and the separate synthesis session receive the same token in their
 briefs. A caller must never copy `.activeLeaseOwner` from mutable PR state:
 after a reclaim that field names the successor, and adopting it would let a
@@ -2006,8 +2006,31 @@ bash /workspace/agent/smoke-pr-gate.sh claim \
 ```
 
 That same-run claim safely reacquires an expired lease without a human. A
-different token may reclaim only after expiry; it must then regenerate the
-completion contract before writing markers. `lease-renew` and `lease-release`
+different token may reclaim only after expiry — this is also what every `poll`
+recovery is, because `poll` mints a new token per wake (`resumedRunId:true`,
+and `contractAdoptionRequired:true` when the run already has a contract). The
+existing contract still names the predecessor, so `marker`/`redispatch` refuse
+with `different coordinator owner` until the recovery owner takes ONE of:
+
+```bash
+# SAME run id, SAME sourceSha — continue the campaign. Keeps every lane,
+# generation and marker; the original challenger deadline still applies.
+SMOKE_LANE_ROLE=coordinator SMOKE_GATE_OWNER=<your-token> \
+bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh adopt <run-dir> <source-sha>
+
+# Different sourceSha, a corrupt contract, or lanes you must redefine —
+# retire every existing marker.
+... smoke-run-scaffold.sh contract <run-dir> <source-sha> <lane>... --regenerate
+```
+
+Default to `adopt` on a same-SHA recovery: `--regenerate` throws away valid
+evidence that may be unrecoverable once previews are gone. `adopt` only works
+for the caller that currently holds the state, lease and PR authority, records
+the predecessor as a digest in `ownerAdoptions[]` (you adopted the contract;
+you did not author it — report it that way), and is a no-op on exact retry. It
+is never a way around a refusal: never reuse or look up the predecessor's
+token, and if `adopt` itself answers `caller owner does not match`, you are the
+stale one — STOP. `lease-renew` and `lease-release`
 never revive or remove an expired lease. Explicit operator `--takeover`
 restrictions remain the only way to replace a still-active different run.
 The low-level compatibility verb is `lease-claim <run-id> <owner-token> <pr>`

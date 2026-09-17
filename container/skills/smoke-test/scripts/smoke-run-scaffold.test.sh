@@ -171,12 +171,158 @@ for stale_verb in marker redispatch contract; do
 done
 [ "$(sha256sum "$STALE/completion-contract.json" | cut -d' ' -f1)" = "$STALE_CONTRACT_SHA" ]
 [ ! -e "$STALE/markers/B1.json" ]
-# The successor cannot inherit A's contract. It explicitly regenerates the
-# same-SHA contract under B's token before any B marker can count.
+# DELIBERATE CONTRACT CHANGE. This block used to assert
+# "the successor cannot inherit A's contract" with `--regenerate` as the only
+# exit. It still cannot inherit SILENTLY — an unadopted marker is refused, and
+# the refusal now names `adopt` — but a same-SHA successor may take the fenced
+# `adopt` transition (cases below). B here reclaimed on a DIFFERENT sourceSha,
+# which is a different campaign: adopt is refused and `--regenerate` remains
+# the only path.
 OUT="$(SMOKE_GATE_OWNER=owner-b scaffold marker "$STALE" B1 fail successor 2>&1 || true)"
-jq -e '.ok == false and (.error | test("different coordinator owner"))' <<<"$OUT" >/dev/null
+jq -e '.ok == false and (.error | test("different coordinator owner")) and (.error | test("adopt"))' <<<"$OUT" >/dev/null
+OUT="$(SMOKE_GATE_OWNER=owner-b scaffold adopt "$STALE" "$OTHER_SHA" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("different sourceSha")) and (.error | test("--regenerate"))' <<<"$OUT" >/dev/null || {
+  echo "expected a different-SHA adopt to be refused toward --regenerate, got: $OUT" >&2; exit 1; }
+# ...and naming the OLD sha does not get around it: the fence binds the verb to
+# the SHA this run actually claimed.
+OUT="$(SMOKE_GATE_OWNER=owner-b scaffold adopt "$STALE" "$SHA" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("does not match the SHA claimed"))' <<<"$OUT" >/dev/null
+[ "$(sha256sum "$STALE/completion-contract.json" | cut -d' ' -f1)" = "$STALE_CONTRACT_SHA" ]
 SMOKE_GATE_OWNER=owner-b scaffold contract "$STALE" "$OTHER_SHA" B1:browser --regenerate >/dev/null
 SMOKE_GATE_OWNER=owner-b scaffold marker "$STALE" B1 fail successor >/dev/null
+
+# --- Fenced adoption: same run id, same sourceSha, recovered under a new owner.
+# A wrote the contract, finished B1, re-dispatched S1 (generation 2) and wrote
+# its gen-2 marker, and never got to B2 — partially completed lane generations.
+ADOPT="$FIXTURE_BASE/adopt-run"
+mkdir -p "$ADOPT"
+gate_owns "$(basename "$ADOPT")" "$SHA" owner-a
+SMOKE_GATE_OWNER=owner-a scaffold contract "$ADOPT" "$SHA" B1:browser S1:source B2:browser >/dev/null
+SMOKE_GATE_OWNER=owner-a scaffold marker "$ADOPT" B1 fail 'by the original owner' >/dev/null
+SMOKE_GATE_OWNER=owner-a scaffold redispatch "$ADOPT" S1 >/dev/null
+SMOKE_GATE_OWNER=owner-a scaffold marker "$ADOPT" S1 completed 'gen 2 by the original owner' >/dev/null
+ADOPT_B1_HASH="$(sha256sum "$ADOPT/markers/B1.json" | cut -d' ' -f1)"
+ADOPT_S1_HASH="$(sha256sum "$ADOPT/markers/S1.json" | cut -d' ' -f1)"
+ADOPT_LANES="$(jq -c '[.lanes, .requiredLaneMarkers, .createdAt, .sourceSha, .runId]' "$ADOPT/completion-contract.json")"
+# The original owner adopting its own contract is the exact-retry no-op shape.
+ADOPT_BEFORE="$(sha256sum "$ADOPT/completion-contract.json" | cut -d' ' -f1)"
+SMOKE_GATE_OWNER=owner-a scaffold adopt "$ADOPT" "$SHA" |
+  jq -e '.ok == true and .adopted == false and .alreadyOwner == true and .adoptionCount == 0' >/dev/null
+[ "$(sha256sum "$ADOPT/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_BEFORE" ]
+
+# Recovery: the gate rebinds state, lease and authority to B on the SAME sha.
+gate_owns "$(basename "$ADOPT")" "$SHA" owner-b
+# Old owner still alive, BEFORE adoption: every verb, adopt included, dies on
+# the fence — never on the contract check, which A would otherwise still pass.
+for stale_verb in marker redispatch adopt contract; do
+  case "$stale_verb" in
+    marker) OUT="$(SMOKE_GATE_OWNER=owner-a scaffold marker "$ADOPT" B2 fail stale 2>&1 || true)" ;;
+    redispatch) OUT="$(SMOKE_GATE_OWNER=owner-a scaffold redispatch "$ADOPT" B1 2>&1 || true)" ;;
+    adopt) OUT="$(SMOKE_GATE_OWNER=owner-a scaffold adopt "$ADOPT" "$SHA" 2>&1 || true)" ;;
+    contract) OUT="$(SMOKE_GATE_OWNER=owner-a scaffold contract "$ADOPT" "$SHA" B1:source --regenerate 2>&1 || true)" ;;
+  esac
+  jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null || {
+    echo "expected pre-adoption stale owner $stale_verb to be refused by the fence, got: $OUT" >&2; exit 1; }
+done
+[ "$(sha256sum "$ADOPT/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_BEFORE" ]
+[ ! -e "$ADOPT/markers/B2.json" ]
+# The successor is still refused until it adopts explicitly.
+OUT="$(SMOKE_GATE_OWNER=owner-b scaffold marker "$ADOPT" B2 fail unadopted 2>&1 || true)"
+jq -e '.ok == false and (.error | test("different coordinator owner"))' <<<"$OUT" >/dev/null
+[ ! -e "$ADOPT/markers/B2.json" ]
+# A third identity that holds nothing cannot adopt either (the loser of two
+# competing recoveries is exactly this caller).
+OUT="$(SMOKE_GATE_OWNER=owner-c scaffold adopt "$ADOPT" "$SHA" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null
+# Role and expiry gates apply to adopt like every other write.
+OUT="$(SMOKE_LANE_ROLE=challenger SMOKE_GATE_OWNER=owner-b scaffold adopt "$ADOPT" "$SHA" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("SMOKE_LANE_ROLE"))' <<<"$OUT" >/dev/null
+jq '.expiresAt="2000-01-01T00:00:00Z"' "$SMOKE_GATE_LEASE_DIR/lease-$(basename "$ADOPT").json" > "$SMOKE_GATE_LEASE_DIR/.expired"
+mv "$SMOKE_GATE_LEASE_DIR/.expired" "$SMOKE_GATE_LEASE_DIR/lease-$(basename "$ADOPT").json"
+OUT="$(SMOKE_GATE_OWNER=owner-b scaffold adopt "$ADOPT" "$SHA" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("lease expired"))' <<<"$OUT" >/dev/null
+gate_owns "$(basename "$ADOPT")" "$SHA" owner-b
+[ "$(sha256sum "$ADOPT/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_BEFORE" ]
+
+# Crash between validation and the contract write: the live contract is
+# byte-identical (tmp + mv), and the retry succeeds.
+SMOKE_SCAFFOLD_TEST_CRASH_BEFORE_ADOPT_COMMIT=1 SMOKE_GATE_OWNER=owner-b \
+  scaffold adopt "$ADOPT" "$SHA" >/dev/null 2>&1 && {
+  echo "expected the crash seam to kill adopt before its commit" >&2; exit 1; } || true
+[ "$(sha256sum "$ADOPT/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_BEFORE" ]
+SMOKE_GATE_OWNER=owner-b scaffold adopt "$ADOPT" "$SHA" |
+  jq -e '.ok == true and .adopted == true and .adoptionCount == 1' >/dev/null
+
+# Only the owner binding moved. Lanes, generations, marker list, createdAt,
+# sourceSha and runId are untouched; no marker file was rewritten.
+[ "$(jq -c '[.lanes, .requiredLaneMarkers, .createdAt, .sourceSha, .runId]' "$ADOPT/completion-contract.json")" = "$ADOPT_LANES" ]
+[ "$(sha256sum "$ADOPT/markers/B1.json" | cut -d' ' -f1)" = "$ADOPT_B1_HASH" ]
+[ "$(sha256sum "$ADOPT/markers/S1.json" | cut -d' ' -f1)" = "$ADOPT_S1_HASH" ]
+# History records a DIGEST of the predecessor, never its token, and the
+# successor is an adopter — nothing anywhere names it as the author.
+jq -e --arg prior "$(printf '%s' owner-a | sha256sum | cut -d' ' -f1)" \
+      --arg by "$(printf '%s' owner-b | sha256sum | cut -d' ' -f1)" '
+  .coordinatorOwnerToken == "owner-b" and
+  (.ownerAdoptions | length == 1) and
+  .ownerAdoptions[0].priorOwnerDigest == $prior and
+  .ownerAdoptions[0].adoptedByDigest == $by and
+  (.ownerAdoptions[0].adoptedAt | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+' "$ADOPT/completion-contract.json" >/dev/null
+if grep -q 'owner-a' "$ADOPT/completion-contract.json"; then
+  echo "adoption stored the predecessor's token in the contract" >&2; exit 1
+fi
+# Exact retry is a no-op: same bytes, no second history entry.
+ADOPT_AFTER="$(sha256sum "$ADOPT/completion-contract.json" | cut -d' ' -f1)"
+SMOKE_GATE_OWNER=owner-b scaffold adopt "$ADOPT" "$SHA" |
+  jq -e '.ok == true and .adopted == false and .alreadyOwner == true and .adoptionCount == 1' >/dev/null
+[ "$(sha256sum "$ADOPT/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_AFTER" ]
+
+# Old owner still alive, AFTER adoption: still the fence, still nothing written.
+for stale_verb in marker redispatch adopt contract; do
+  case "$stale_verb" in
+    marker) OUT="$(SMOKE_GATE_OWNER=owner-a scaffold marker "$ADOPT" B2 fail stale 2>&1 || true)" ;;
+    redispatch) OUT="$(SMOKE_GATE_OWNER=owner-a scaffold redispatch "$ADOPT" B1 2>&1 || true)" ;;
+    adopt) OUT="$(SMOKE_GATE_OWNER=owner-a scaffold adopt "$ADOPT" "$SHA" 2>&1 || true)" ;;
+    contract) OUT="$(SMOKE_GATE_OWNER=owner-a scaffold contract "$ADOPT" "$SHA" B1:source --regenerate 2>&1 || true)" ;;
+  esac
+  jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null || {
+    echo "expected post-adoption stale owner $stale_verb to be refused by the fence, got: $OUT" >&2; exit 1; }
+done
+[ "$(sha256sum "$ADOPT/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_AFTER" ]
+[ ! -e "$ADOPT/markers/B2.json" ]
+
+# The successor finishes the missing lane. A's markers keep validating at the
+# generations A wrote them at, and the barrier goes ready without a regenerate.
+SMOKE_GATE_OWNER=owner-b scaffold marker "$ADOPT" B2 fail 'by the recovery owner' |
+  jq -e '.ok == true and .generation == 1' >/dev/null
+jq -e '.generation == 1' "$ADOPT/markers/B1.json" >/dev/null
+jq -e '.generation == 2' "$ADOPT/markers/S1.json" >/dev/null
+barrier "$ADOPT" lanes | jq -e '.ready == true' >/dev/null
+# redispatch works for the adopter too, and retires only the lane it names.
+SMOKE_GATE_OWNER=owner-b scaffold redispatch "$ADOPT" B2 | jq -e '.ok == true and .generation == 2' >/dev/null
+jq -e '[.lanes[] | {(.id): .generation}] | add == {"B1":1,"S1":2,"B2":2}' "$ADOPT/completion-contract.json" >/dev/null
+
+# Already-terminal run: the slot is gone, so there is nothing to adopt into.
+printf '{"schemaVersion":1,"pr":5,"activeRunId":null,"completedRunId":"%s"}\n' "$(basename "$ADOPT")" \
+  > "$GATE_STATE/pr-5-state.json"
+OUT="$(SMOKE_GATE_OWNER=owner-b scaffold adopt "$ADOPT" "$SHA" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("does not hold the gate"))' <<<"$OUT" >/dev/null
+
+# Nothing to adopt, and nothing legitimate to continue.
+NOCONTRACT="$FIXTURE_BASE/adopt-no-contract"
+mkdir -p "$NOCONTRACT"
+gate_owns "$(basename "$NOCONTRACT")" "$SHA" owner-b
+OUT="$(SMOKE_GATE_OWNER=owner-b scaffold adopt "$NOCONTRACT" "$SHA" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("nothing to adopt"))' <<<"$OUT" >/dev/null
+printf '{"schemaVersion":1,"runId":"%s","sourceSha":"%s","ownershipKind":"pr","coordinatorOwnerToken":null,"requiredLaneMarkers":[]}\n' \
+  "$(basename "$NOCONTRACT")" "$SHA" > "$NOCONTRACT/completion-contract.json"
+OUT="$(SMOKE_GATE_OWNER=owner-b scaffold adopt "$NOCONTRACT" "$SHA" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("no coordinator owner"))' <<<"$OUT" >/dev/null
+printf '{"schemaVersion":1,"sourceSha"' > "$NOCONTRACT/completion-contract.json"
+OUT="$(SMOKE_GATE_OWNER=owner-b scaffold adopt "$NOCONTRACT" "$SHA" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("truncated or corrupt"))' <<<"$OUT" >/dev/null
+OUT="$(SMOKE_GATE_OWNER=owner-b scaffold adopt "$NOCONTRACT" deadbeef 2>&1 || true)"
+jq -e '.ok == false and (.error | test("40-character"))' <<<"$OUT" >/dev/null
 
 # Separate private state roots are the original failure shape: A's state still
 # names A while B has reclaimed the one shared lease. Shared validation must

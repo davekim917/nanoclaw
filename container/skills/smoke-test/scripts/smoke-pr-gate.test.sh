@@ -1643,6 +1643,94 @@ jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and (.data.coo
   exit 1
 }
 
+# --- Recovery owner adopts the predecessor's contract -----------------------
+# End to end through the real poll: claim -> contract -> marker -> container
+# dies (lease expires, progress goes stale) -> poll recovers the SAME run id
+# under a freshly minted token -> the successor adopts, finishes the missing
+# lane and finishes the run, with the predecessor's marker still counting.
+# Owner tokens are never echoed: every failure message below names the step.
+SCAFFOLD="$SCRIPT_DIR/smoke-run-scaffold.sh"
+BARRIER="$SCRIPT_DIR/smoke-evidence-barrier.sh"
+export SMOKE_GATE_RUN_ROOT="$STATE_DIR/run-root"
+mkdir -p "$SMOKE_GATE_RUN_ROOT"
+jq -e '.data.resumedRunId == false and .data.contractAdoptionRequired == false' <<<"$NEXT_POLL" >/dev/null
+ADOPT_RUN="$(jq -r '.data.runId' <<<"$NEXT_POLL")"
+ADOPT_T1="$(jq -r '.data.coordinatorOwnerToken' <<<"$NEXT_POLL")"
+ADOPT_DIR="$SMOKE_GATE_RUN_ROOT/$ADOPT_RUN"
+mkdir -p "$ADOPT_DIR"
+ADOPT_DEADLINE="$(jq -r '.challengerDeadline' "$STATE_DIR/pr-126-state.json")"
+[ -n "$ADOPT_DEADLINE" ] && [ "$ADOPT_DEADLINE" != null ]
+scaffold_as() { local owner="$1"; shift; SMOKE_LANE_ROLE=coordinator SMOKE_GATE_OWNER="$owner" bash "$SCAFFOLD" "$@"; }
+scaffold_as "$ADOPT_T1" contract "$ADOPT_DIR" "$POLL_FAIL_SHA" B1:browser S1:source | jq -e '.ok == true' >/dev/null
+scaffold_as "$ADOPT_T1" marker "$ADOPT_DIR" B1 fail 'by the original owner' | jq -e '.ok == true' >/dev/null
+ADOPT_B1_HASH="$(sha256sum "$ADOPT_DIR/markers/B1.json" | cut -d' ' -f1)"
+# A live run is not recoverable: no second token is minted.
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates"' >/dev/null
+# The predecessor's container dies. A later deadline would be observable.
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$ADOPT_RUN.json"
+sleep 1
+# Two competing recoveries: exactly one poll wins the lease and is handed a
+# token; the other is refused by the shared authority and delivers none.
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll > "$STATE_DIR/recover-1.json" 2>/dev/null &
+RECOVER_PID_1=$!
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll > "$STATE_DIR/recover-2.json" 2>/dev/null &
+RECOVER_PID_2=$!
+wait "$RECOVER_PID_1" || true
+wait "$RECOVER_PID_2" || true
+[ "$(jq -s '[.[] | select(.data.trigger == "pr_build_settled")] | length' \
+  "$STATE_DIR/recover-1.json" "$STATE_DIR/recover-2.json")" -eq 1 ] || {
+  echo "expected exactly one competing recovery poll to win the run" >&2; exit 1; }
+RECOVERED="$(jq -sc '[.[] | select(.data.trigger == "pr_build_settled")][0]' \
+  "$STATE_DIR/recover-1.json" "$STATE_DIR/recover-2.json")"
+jq -e --arg run "$ADOPT_RUN" '.wakeAgent == true and .data.runId == $run and .data.resumedRunId == true and
+  .data.recovery == true and .data.contractAdoptionRequired == true' <<<"$RECOVERED" >/dev/null || {
+  echo "recovery wake did not resume the run id and flag the contract adoption" >&2; exit 1; }
+ADOPT_T2="$(jq -r '.data.coordinatorOwnerToken' <<<"$RECOVERED")"
+[ -n "$ADOPT_T2" ] && [ "$ADOPT_T2" != "$ADOPT_T1" ]
+jq -e --arg owner "$ADOPT_T2" '.activeLeaseOwner == $owner' "$STATE_DIR/pr-126-state.json" >/dev/null
+# No fresh time budget: the original challenger deadline survives recovery.
+[ "$(jq -r '.challengerDeadline' "$STATE_DIR/pr-126-state.json")" = "$ADOPT_DEADLINE" ] || {
+  echo "recovery replaced the original challenger deadline" >&2; exit 1; }
+# Before adoption: the predecessor is fenced, the successor is refused by the
+# contract, and a caller that lost the recovery race cannot adopt at all.
+OUT="$(scaffold_as "$ADOPT_T1" marker "$ADOPT_DIR" S1 fail stale 2>&1 || true)"
+jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null
+OUT="$(scaffold_as "$ADOPT_T2" marker "$ADOPT_DIR" S1 fail unadopted 2>&1 || true)"
+jq -e '.ok == false and (.error | test("different coordinator owner")) and (.error | test("adopt"))' <<<"$OUT" >/dev/null
+OUT="$(scaffold_as owner-lost-the-race adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null
+[ ! -e "$ADOPT_DIR/markers/S1.json" ]
+scaffold_as "$ADOPT_T2" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" | jq -e '.ok == true and .adopted == true and .adoptionCount == 1' >/dev/null
+scaffold_as "$ADOPT_T2" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" | jq -e '.ok == true and .adopted == false and .adoptionCount == 1' >/dev/null
+# After adoption the predecessor is still fenced on every scaffold verb and on
+# the gate's own terminal verb; its token is nowhere in the contract.
+for stale_verb in marker redispatch adopt; do
+  case "$stale_verb" in
+    marker) OUT="$(scaffold_as "$ADOPT_T1" marker "$ADOPT_DIR" S1 fail stale 2>&1 || true)" ;;
+    redispatch) OUT="$(scaffold_as "$ADOPT_T1" redispatch "$ADOPT_DIR" B1 2>&1 || true)" ;;
+    adopt) OUT="$(scaffold_as "$ADOPT_T1" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" 2>&1 || true)" ;;
+  esac
+  jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null || {
+    echo "post-adoption predecessor $stale_verb was not fenced" >&2; exit 1; }
+done
+OUT="$(bash "$GATE" finish "$POLL_FAIL_SHA" "$ADOPT_RUN" NO_GO "$ADOPT_T1" || true)"
+jq -e '.ok == false and (.error | test("caller owner"))' <<<"$OUT" >/dev/null
+if grep -qF "$ADOPT_T1" "$ADOPT_DIR/completion-contract.json"; then
+  echo "adoption left the predecessor's token in the contract" >&2; exit 1
+fi
+# The successor finishes the missing lane; the predecessor's marker is the
+# same bytes at the same generation and still satisfies the barrier.
+scaffold_as "$ADOPT_T2" marker "$ADOPT_DIR" S1 completed 'by the recovery owner' | jq -e '.ok == true and .generation == 1' >/dev/null
+[ "$(sha256sum "$ADOPT_DIR/markers/B1.json" | cut -d' ' -f1)" = "$ADOPT_B1_HASH" ]
+bash "$BARRIER" "$ADOPT_DIR" lanes | jq -e '.ready == true' >/dev/null
+[ "$(jq -r '.challengerDeadline' "$STATE_DIR/pr-126-state.json")" = "$ADOPT_DEADLINE" ]
+OUT="$(bash "$GATE" finish "$POLL_FAIL_SHA" "$ADOPT_RUN" NO_GO "$ADOPT_T2" || true)"
+jq -e '.ok == true' <<<"$OUT" >/dev/null || { echo "recovery owner could not finish the adopted run" >&2; exit 1; }
+# Already terminal: nothing holds the slot, so nothing can adopt into it.
+OUT="$(scaffold_as "$ADOPT_T2" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("does not hold the gate"))' <<<"$OUT" >/dev/null
+unset SMOKE_GATE_RUN_ROOT
+
 # --- INVARIANT 3: num_env rejects the classes it was built to stop --------
 # Mirror of the develop suite's case-53 extension. "All digits" admitted three
 # shapes, each a distinct silent failure: a leading zero is octal (or fatal) in
