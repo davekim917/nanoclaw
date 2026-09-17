@@ -3031,6 +3031,81 @@ describe('codex-review risk-scoped review requests', () => {
       expect(result.stderr).toContain('(marker inside a code fence or an HTML comment) verdict CHANGES');
     });
 
+    describe('hidden markers can only block, and every one of them is read', () => {
+      const receiptText = (verdict: string, findings: number): string => {
+        const body = independentReceipt(HEAD, verdict, findings, '2026-09-05T00:41:00Z').body as string;
+        return body.slice(body.indexOf('<!--'));
+      };
+      // Four backticks: a receipt's own three-backtick JSON fence cannot close it.
+      const unclosed = (...receipts: string[]): string => `\`\`\`\`ts\nconst unclosed = 1;\n\n${receipts.join('\n')}`;
+
+      it('reads a hidden CHANGES after a hidden CLEAR example in one comment: the CLEAR suppresses nothing', () => {
+        const root = tempRoot();
+        const real = independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:41:00Z');
+        legacy(root, { comments: [{ ...real, body: unclosed(receiptText('CLEAR', 0), receiptText('CHANGES', 1)) }] });
+
+        const result = runHelper(root, ['merge-check', '--head', HEAD]);
+        expect(result.status).toBe(24);
+        expect(result.stderr).toContain(
+          '(marker inside a code fence or an HTML comment) verdict CHANGES, blocking_findings 1',
+        );
+      });
+
+      it('reads a visible CHANGES after a visible CLEAR in one comment as a no', () => {
+        const root = tempRoot();
+        const real = independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:41:00Z');
+        legacy(root, { comments: [{ ...real, body: `${receiptText('CLEAR', 0)}\n${receiptText('CHANGES', 1)}` }] });
+
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(24);
+      });
+
+      it('reads a hidden CHANGES beside a visible CLEAR in one comment: a visible marker does not excuse the hidden ones', () => {
+        const root = tempRoot();
+        const real = independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:41:00Z');
+        legacy(root, {
+          comments: [{ ...real, body: `${receiptText('CLEAR', 0)}\n${unclosed(receiptText('CHANGES', 1))}` }],
+        });
+
+        const result = runHelper(root, ['merge-check', '--head', HEAD]);
+        expect(result.status).toBe(24);
+        expect(result.stderr).toContain(
+          '(marker inside a code fence or an HTML comment) verdict CHANGES, blocking_findings 1',
+        );
+      });
+
+      it.each([
+        ['hidden', (body: string) => unclosed(body)],
+        ['visible', (body: string) => body],
+      ])('does not let a hidden CLEAR in a newer comment mask an older %s CHANGES', (_case, wrap) => {
+        const root = tempRoot();
+        const older = independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z');
+        const newer = independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:40:00Z');
+        legacy(root, {
+          comments: [
+            { ...older, body: wrap(receiptText('CHANGES', 1)) },
+            { ...newer, body: unclosed(receiptText('CLEAR', 0)) },
+          ],
+        });
+
+        const result = runHelper(root, ['merge-check', '--head', HEAD]);
+        expect(result.status).toBe(24);
+        expect(result.stderr).toContain('verdict CHANGES, blocking_findings 1');
+      });
+
+      it("still lets a writer's later visible CLEAR clear an older hidden CHANGES", () => {
+        const root = tempRoot();
+        const older = independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z');
+        legacy(root, {
+          comments: [
+            { ...older, body: unclosed(receiptText('CHANGES', 1)) },
+            independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:40:00Z'),
+          ],
+        });
+
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+      });
+    });
+
     it('refuses a legacy head that is not the one named, before judging it', () => {
       const root = tempRoot();
       legacy(root);

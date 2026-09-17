@@ -1273,13 +1273,20 @@ ci_verdict() {
 # with zero blocking findings; anything else the newest one says is blocked, a
 # CHANGES verdict and a receipt whose JSON does not parse alike.
 #
+# One rule for what a comment says — visible: the newest visible decides;
+# hidden: can only block, and all hidden markers are read. Within one comment
+# every marker is read, visible and hidden alike and never the first alone:
+# any receipt among them that applies to this head and is not clear makes the
+# comment a no, and only a visible clear one, with no such no beside it, makes
+# it clear. So a clear receipt never suppresses another, before or after it.
+#
 # A marker quoted inside a code fence or an HTML comment is an example, not a
 # receipt, by the rule the Fixes-PR and Review-notes lines are read under, and
 # by the same reader: each marker line is swapped for a numbered sentinel and
 # the body goes through pr_body_text (pr-body.jq); a marker whose sentinel
-# survives stands in the open, and the receipt is the JSON after the first one
-# that does. Only such a receipt can be clear: a hidden one that reads clear
-# is dropped. A hidden one that does not read clear still counts: a fence left
+# survives stands in the open, and each marker's receipt is the JSON between it
+# and the next marker. Only a visible receipt can be clear: a hidden one that
+# reads clear is dropped. A hidden one that does not read clear still counts: a fence left
 # unclosed above a real CHANGES receipt hides it exactly as a quote would, and
 # the two cannot be told apart, so hiding can only ever block, never clear. (The substitute
 # receipt marker is matched against the raw body, so it has the quoting hole
@@ -1347,18 +1354,23 @@ independent_receipt_newest() {
       | select(($parts | length) > 1)
       | (($parts | length) - 1) as $markers
       | ({ body: ([ range(0; $markers) as $i | $parts[$i], "\n\u001f\($i)\u001f" ] + [ $parts[$markers] ] | join("")) } | pr_body_text) as $plain
-      | ([ range(0; $markers) | select(. as $i | $plain | test("(^|\n)\u001f\($i)\u001f[ \t]*\r?(\n|$)")) ] | first) as $open
-      | $parts[($open // 0) + 1] as $rest
-      | ([ $rest | capture($jsonRe) | .json | try fromjson catch null | objects ] | first) as $doc
-      | (if $doc != null then ($doc.head // null) else ([ $rest | capture($headRe) ] | first | .head) end) as $named
-      | select(($named | type) != "string" or $named == $head)
-      | ($doc != null and $doc.head == $head and $doc.verdict == "CLEAR" and $doc.blocking_findings == 0) as $clear
-      | select($open != null or ($clear | not))
-      | select(($clear | not) or ($c.login as $l | $denied | index($l) | not))
-      | $c + { clear: $clear,
-               said: ((if $open == null then "(marker inside a code fence or an HTML comment) " else "" end)
-                      + (if $doc == null then "its JSON block does not parse"
-                         else "verdict \($doc.verdict // "missing" | tostring), blocking_findings \($doc.blocking_findings // "missing" | tostring)" end)) } ] as $matches
+      | [ range(0; $markers) | select(. as $i | $plain | test("(^|\n)\u001f\($i)\u001f[ \t]*\r?(\n|$)")) ] as $visible
+      | [ range(0; $markers) as $i
+          | ($visible | index($i) != null) as $open
+          | $parts[$i + 1] as $rest
+          | ([ $rest | capture($jsonRe) | .json | try fromjson catch null | objects ] | first) as $doc
+          | (if $doc != null then ($doc.head // null) else ([ $rest | capture($headRe) ] | first | .head) end) as $named
+          | select(($named | type) != "string" or $named == $head)
+          | { open: $open,
+              clear: ($doc != null and $doc.head == $head and $doc.verdict == "CLEAR" and $doc.blocking_findings == 0),
+              said: (if $doc == null then "its JSON block does not parse"
+                     else "verdict \($doc.verdict // "missing" | tostring), blocking_findings \($doc.blocking_findings // "missing" | tostring)" end) } ] as $receipts
+      | ([ $receipts[] | select(.clear | not) ] | first) as $no
+      | if $no != null then
+          $c + { clear: false, said: ((if $no.open then "" else "(marker inside a code fence or an HTML comment) " end) + $no.said) }
+        elif any($receipts[]; .open and .clear) and ($c.login as $l | $denied | index($l) | not) then
+          $c + { clear: true, said: "" }
+        else empty end ] as $matches
     | ([ $matches[] | select((.idstr | canonical_id) | not) ] | first) as $bad
     | if $bad != null then
         "unknown\treceipt_order_unknown: an independent-review receipt for this head from \($bad.login) has no usable database id (fullDatabaseId=\(if $bad.idstr == "" then "null" else $bad.idstr end)), so which receipt is newest cannot be determined"
