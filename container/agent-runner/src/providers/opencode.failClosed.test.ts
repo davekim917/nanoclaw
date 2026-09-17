@@ -11,7 +11,7 @@ import {
   runtimeConfigKey,
   shouldBypassOpenCodeProxy,
 } from './opencode.js';
-import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
+import { MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 
 // The guard plugin path buildOpenCodeConfig probes via fs.existsSync. We never
 // touch the real filesystem here — every test stubs fs.existsSync so "present"
@@ -283,7 +283,7 @@ describe('effective-model OpenCode proxy routing', () => {
   });
 });
 
-describe('buildOpencodeServerEnv — secret strip (F2)', () => {
+describe('buildOpencodeServerEnv — child env hygiene (F2)', () => {
   // Snapshot/restore the secret keys we set so we never leak into sibling test
   // files (process.env is process-global under `bun test`).
   const SECRET_KEYS = ['ANTHROPIC_API_KEY', 'ANTHROPIC_API_KEY_2', 'CLAUDE_CODE_OAUTH_TOKEN', 'GMAIL_OAUTH_PATH'];
@@ -299,33 +299,33 @@ describe('buildOpencodeServerEnv — secret strip (F2)', () => {
     }
   });
 
-  it('test_oc_child_env_strips_secrets: every var from buildSecretEnvVarList() is absent from the child env', () => {
+  // Replaces test_oc_child_env_strips_secrets (codex #126 F2/F3). The provider
+  // credentials are DELIBERATELY no longer stripped: an OpenCode agent's bash
+  // tool and MCP children inherit the credential the container runs on, so
+  // `claude -p` works there the way `opencode run` and `codex exec` already did.
+  //
+  // MUTATION CHECK: re-adding any ANTHROPIC_API_KEY* / CLAUDE_CODE_OAUTH_TOKEN*
+  // name to the strip set in buildOpencodeServerEnv fails this test.
+  it('test_oc_child_env_keeps_provider_credentials: the container credential reaches opencode children', () => {
     process.env.ANTHROPIC_API_KEY = 'sk-ant-primary';
     process.env.ANTHROPIC_API_KEY_2 = 'sk-ant-fallback';
     process.env.CLAUDE_CODE_OAUTH_TOKEN = 'oauth-tok';
     process.env.GMAIL_OAUTH_PATH = '/secret/gmail-oauth.json';
 
-    const secretVars = buildSecretEnvVarList();
-    // Guard the test's own premise: the vars we set must be in the strip list.
-    expect(secretVars).toContain('ANTHROPIC_API_KEY');
-    expect(secretVars).toContain('ANTHROPIC_API_KEY_2');
-    expect(secretVars).toContain('CLAUDE_CODE_OAUTH_TOKEN');
-    expect(secretVars).toContain('GMAIL_OAUTH_PATH');
-
     const childEnv = buildOpencodeServerEnv(process.env, { permission: 'allow' });
-    for (const v of secretVars) {
-      expect(childEnv[v]).toBeUndefined();
-    }
+    expect(childEnv.ANTHROPIC_API_KEY).toBe('sk-ant-primary');
+    expect(childEnv.ANTHROPIC_API_KEY_2).toBe('sk-ant-fallback');
+    expect(childEnv.CLAUDE_CODE_OAUTH_TOKEN).toBe('oauth-tok');
+    expect(childEnv.GMAIL_OAUTH_PATH).toBe('/secret/gmail-oauth.json');
   });
 
   it('test_oc_child_env_preserves_nonsecret: non-secret env (PATH, HOME, NANOCLAW_*, OPENCODE_*) preserved + config injected', () => {
-    process.env.ANTHROPIC_API_KEY = 'sk-ant-strip-me';
     const base: NodeJS.ProcessEnv = {
       PATH: '/usr/bin:/bin',
       HOME: '/home/agent',
       NANOCLAW_IS_MAIN: '1',
       OPENCODE_MODEL: 'anthropic/claude-opus-4-8',
-      ANTHROPIC_API_KEY: 'sk-ant-strip-me',
+      ANTHROPIC_API_KEY: 'sk-ant-keep-me',
     };
     const config = { permission: 'allow', model: 'anthropic/claude-opus-4-8' };
     const childEnv = buildOpencodeServerEnv(base, config);
@@ -336,9 +336,9 @@ describe('buildOpencodeServerEnv — secret strip (F2)', () => {
     expect(childEnv.OPENCODE_MODEL).toBe('anthropic/claude-opus-4-8');
     // The serialized config is always injected for the child to read.
     expect(childEnv.OPENCODE_CONFIG_CONTENT).toBe(JSON.stringify(config));
-    // ...but ANTHROPIC_API_KEY (matched by buildSecretEnvVarList against
-    // process.env) is still stripped even though it was on `base`.
-    expect(childEnv.ANTHROPIC_API_KEY).toBeUndefined();
+    // buildOpencodeServerEnv reads only `base`, never process.env, and no longer
+    // removes the provider credential from it.
+    expect(childEnv.ANTHROPIC_API_KEY).toBe('sk-ant-keep-me');
   });
 
   it('test_oc_child_env_strips_mcp_header_secrets (codex #126): EXA/BRAINTRUST/GRANOLA stripped; data-tool secrets + proxy/CA/XDG kept', () => {
@@ -376,16 +376,15 @@ describe('buildOpencodeServerEnv — secret strip (F2)', () => {
     expect(childEnv.XDG_DATA_HOME).toBe('/opencode-xdg');
   });
 
-  it('imports the shared buildSecretEnvVarList (no duplication of the list)', () => {
-    // If buildOpencodeServerEnv hard-coded its own list, adding a brand-new
-    // secret to process.env that the shared list matches (an ANTHROPIC_API_KEY_N
-    // variant) would NOT be stripped. Proving the dynamic shared list drives the
-    // strip is the single-source assertion.
-    process.env.ANTHROPIC_API_KEY_7 = 'sk-ant-new-variant';
-    expect(buildSecretEnvVarList()).toContain('ANTHROPIC_API_KEY_7');
-    const childEnv = buildOpencodeServerEnv(process.env, { permission: 'allow' });
-    expect(childEnv.ANTHROPIC_API_KEY_7).toBeUndefined();
-    delete process.env.ANTHROPIC_API_KEY_7;
+  it('imports the shared MCP_HEADER_ONLY_SECRET_VARS (no duplication of the list)', () => {
+    // Single-source assertion: the strip set IS the shared constant, so the two
+    // agree element-for-element. A forked local copy in opencode.ts would drift
+    // from this the moment either side changed.
+    const base: NodeJS.ProcessEnv = { PATH: '/usr/bin' };
+    for (const v of MCP_HEADER_ONLY_SECRET_VARS) base[v] = `value-of-${v}`;
+    const childEnv = buildOpencodeServerEnv(base, { permission: 'allow' });
+    const removed = Object.keys(base).filter((k) => childEnv[k] === undefined);
+    expect(removed.sort()).toEqual([...MCP_HEADER_ONLY_SECRET_VARS].sort());
   });
 });
 
@@ -432,12 +431,19 @@ describe('buildOpenCodeConfig + buildOpencodeServerEnv — combined spawn (F3)',
     expect(cfg.model).toBe('anthropic/claude-opus-4-8');
     expect(cfg.mcp?.nanoclaw).toBeDefined();
 
-    // 3) That same config, when handed to the env builder, yields a secret-free
-    //    child env (the end-to-end fail-closed + env-strip pair).
+    // 3) That same config, when handed to the env builder, yields a child env
+    //    free of the MCP header-only secrets but carrying the container's own
+    //    provider credential (the end-to-end fail-closed + env-hygiene pair).
+    const savedKey = process.env.ANTHROPIC_API_KEY;
+    const savedExa = process.env.EXA_API_KEY;
     process.env.ANTHROPIC_API_KEY = 'sk-secret-combined';
+    process.env.EXA_API_KEY = 'exa-secret-combined';
     const childEnv = buildOpencodeServerEnv(process.env, cfg);
-    expect(childEnv.ANTHROPIC_API_KEY).toBeUndefined();
-    expect(buildSecretEnvVarList()).toContain('ANTHROPIC_API_KEY');
-    delete process.env.ANTHROPIC_API_KEY;
+    expect(childEnv.ANTHROPIC_API_KEY).toBe('sk-secret-combined');
+    expect(childEnv.EXA_API_KEY).toBeUndefined();
+    if (savedKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = savedKey;
+    if (savedExa === undefined) delete process.env.EXA_API_KEY;
+    else process.env.EXA_API_KEY = savedExa;
   });
 });

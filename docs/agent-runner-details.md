@@ -201,12 +201,41 @@ SDK message (so the idle timer stays honest) and maps recognized messages to `Pr
 - `MessageStream` for async iterable input (push-based follow-ups)
 - Resume via the SDK `resume` option keyed on the stored `continuation` (the SDK session ID) — no separate resume-at cursor
 - No explicit `allowedTools` list — enumerating one only risks silently dropping a new SDK built-in the next time the CLI adds one, and the query already runs under `bypassPermissions`, so every tool the SDK surfaces (including any registered MCP server's tools) is open by default; `SDK_DISALLOWED_TOOLS` blocks SDK builtins that collide with NanoClaw's own scheduling/interaction model (CronCreate/Delete/List, ScheduleWakeup, AskUserQuestion, Enter/ExitPlanMode, Enter/ExitWorktree)
-- **PreToolUse hook** records the current tool + its declared timeout to `container_state` (so the host sweep widens its stuck tolerance while a long Bash runs) and, as defense-in-depth, blocks any `SDK_DISALLOWED_TOOLS` call that slips through. It does **not** sanitize bash env vars — there is no such hook.
+- **PreToolUse hook** records the current tool + its declared timeout to `container_state` (so the host sweep widens its stuck tolerance while a long Bash runs) and, as defense-in-depth, blocks any `SDK_DISALLOWED_TOOLS` call that slips through
+- **Bash command rewrite** (`createBashCommandRewriteHook`, first in the Bash `PreToolUse` chain) redirects `codex exec` stdin to `/dev/null` and serializes jest runs behind a `flock`. It does **not** strip credentials from the command's environment — see "Credentials in container shells" below
 - **PostToolUse / PostToolUseFailure** hooks clear the in-flight tool
 - **Resource telemetry** samples cgroup v2 `memory.current`, `memory.peak`, `memory.max`, and `memory.events` every 15 seconds into `container_state`; the host sweep logs increases in `oom_kill`
 - **PreCompact** hook archives the transcript to `conversations/` before compaction
 - `maybeRotateContinuation` drops an oversized/aged transcript (default caps 12 MB / 14 days, both operator-overridable) so a cold container isn't killed reloading days of `.jsonl` before the host idle ceiling; `isSessionInvalid` clears a continuation whose transcript is gone
 - `additionalDirectories` for multi-directory access
+
+### Credentials in container shells
+
+A container's shell inherits the provider credential the container itself runs
+on. Codex and OpenCode always worked this way — their credentials are an on-disk
+`auth.json` that any subprocess can read (`src/providers/codex.ts:137`,
+`src/providers/opencode.ts:495`) — and Claude now matches: `ANTHROPIC_API_KEY*`
+and `CLAUDE_CODE_OAUTH_TOKEN*` stay in the environment of every Bash subprocess,
+scheduled task script, and OpenCode server child. So an agent can run
+`claude -p`, `codex exec` or `opencode run` headless inside its own session under
+the identity it is already running as, without asking anyone for a key.
+
+The credential boundary is **scope, not the bash env**: a group only ever holds
+its own group's ring; the git credential helper is URL-scoped, so its token is
+useless outside the allowlisted orgs; and OneCLI injects the real secret per
+request at the proxy boundary, leaving the container-side value a `placeholder`
+sentinel in the common case. Until 2026-09-17 a Bash `PreToolUse` hook prepended
+`unset <credential vars>` to every command — a v1 port whose premise the same
+module had already abandoned for the GitHub tokens and that the Codex/OpenCode
+auth files contradicted outright. It bought no containment, because the agent
+process holds the same credential and can spend it directly.
+
+One list is still stripped from every child environment:
+`MCP_HEADER_ONLY_SECRET_VARS` (`GRANOLA_ACCESS_TOKEN`, `EXA_API_KEY`,
+`BRAINTRUST_API_KEY`) — registration-time HTTP headers no shell ever needs.
+Data-tool credentials (`SNOWFLAKE_PASSWORD`, `DBT_*`, `OPENAI_API_KEY`) are
+deliberately kept, on both providers. See
+`container/agent-runner/src/providers/secret-env.ts`.
 
 ### Codex Provider
 

@@ -1,14 +1,44 @@
 /**
- * Secret env-var list for the Bash sanitize hook.
+ * Credential env-var patterns, plus the one list still stripped from child envs.
  *
  * SDK-FREE by design: this module MUST NOT import
  * `@anthropic-ai/claude-agent-sdk` (or anything that transitively pulls it in).
- * It is imported both by the Claude provider (claude.ts createSanitizeBashHook)
- * and by sibling adapters (e.g. the OpenCode guard) that have no SDK on their
- * path — keeping it dependency-free is the single-source contract.
+ * It is imported by the Claude provider, by sibling adapters (e.g. the OpenCode
+ * guard) that have no SDK on their path, and by the in-container `claude` review
+ * launcher — keeping it dependency-free is the single-source contract.
  *
- * This is the SINGLE SOURCE OF TRUTH for "which env vars get `unset` before a
- * Bash subprocess runs". Do not fork the list into an adapter.
+ * ── Credential model for container shells ──
+ *
+ * A container's shell inherits the provider credential the container itself
+ * runs on. That was already true for Codex and OpenCode, whose credentials sit
+ * in an on-disk `auth.json` any subprocess can read; it is now true for Claude
+ * too — ANTHROPIC_API_KEY* / CLAUDE_CODE_OAUTH_TOKEN* stay in the env of Bash
+ * subprocesses, so `claude -p`, `codex exec` and `opencode run` all work
+ * headless inside an agent's session under the same identity that agent runs on.
+ *
+ * The credential boundary is SCOPE, not the bash env:
+ *   - per-group credential rings — a group only ever holds its own keys;
+ *   - the URL-scoped git credential helper — a token useless outside the
+ *     allowlisted orgs (which is why NANOCLAW_GH_TOKEN / GH_TOKEN /
+ *     GITHUB_TOKEN were never stripped here either);
+ *   - OneCLI's per-request injection at the proxy boundary, where the
+ *     container-side value is frequently only the `placeholder` sentinel
+ *     (src/container-runner.ts:3974).
+ *
+ * Unsetting the Anthropic vars per Bash command was a v1 port whose premise —
+ * "a Bash subprocess must not be able to `printenv` a live secret" — this file
+ * already abandoned for the GitHub tokens, and which the Codex/OpenCode on-disk
+ * auth files contradict outright. It bought no containment (the agent process
+ * holds the same credential and can spend it) and cost every agent the ability
+ * to drive a headless Claude.
+ *
+ * GMAIL_OAUTH_PATH / GMAIL_CREDENTIALS_PATH went with them, for a different
+ * reason: nothing in `src/` or `container/` sets either one. The only mention
+ * left is an illustrative `channels/gmail.ts` snippet in docs/architecture.md:657,
+ * and trunk ships no channel adapter. They were two names that could never match.
+ *
+ * Still stripped: MCP_HEADER_ONLY_SECRET_VARS below — credentials a shell
+ * genuinely never needs, because they are registration-time HTTP headers.
  */
 
 // ANTHROPIC_API_KEY and its _N fallback variants (_2, _5, ...).
@@ -18,42 +48,18 @@ export const ANTHROPIC_KEY_RE = /^ANTHROPIC_API_KEY(_\d+)?$/;
 export const OAUTH_KEY_RE = /^CLAUDE_CODE_OAUTH_TOKEN(_\d+)?$/;
 
 /**
- * Secrets the SDK needs for API auth but that Bash subprocesses must not see.
- * Built lazily (reads `process.env` at call time) so late-bound env additions
- * — e.g. a key rotation that mirrors a new value into process.env — are
- * covered on the next Bash invocation.
- *
- * NANOCLAW_GH_TOKEN / GH_TOKEN / GITHUB_TOKEN are deliberately NOT in this
- * list. Stripping them would break the very thing the URL-scoped credential
- * helper is trying to enable: git invokes its helper via a subprocess that
- * inherits the Bash env, and the helper reads NANOCLAW_GH_TOKEN from there
- * to hand back to git. An agent that wants to exfiltrate the token can
- * `printenv` it — the mitigation is at the URL-scoped helper (token is
- * useless outside the allowlisted orgs) and at auth-level controls on
- * GitHub's side, not at the bash-env boundary.
- */
-export function buildSecretEnvVarList(): string[] {
-  return [
-    ...Object.keys(process.env).filter((k) => ANTHROPIC_KEY_RE.test(k)),
-    ...Object.keys(process.env).filter((k) => OAUTH_KEY_RE.test(k)),
-    'GMAIL_OAUTH_PATH',
-    'GMAIL_CREDENTIALS_PATH',
-  ];
-}
-
-/**
  * MCP / header-only secrets: passed to MCP servers as registration-time HTTP
  * headers (Exa, Braintrust) or short-lived rotating tokens (Granola), and never
  * needed by a Bash/tool subprocess. BOTH providers must strip these from any
  * child env they spawn so an unguarded `bash`/`printenv` can't read them — this
  * is the cross-provider env-hygiene parity bar (Claude via filterSdkEnv, OpenCode
- * via buildOpencodeServerEnv). Distinct from buildSecretEnvVarList() (the
- * always-unset auth list, env-derived): this is a fixed, deliberately-curated set.
+ * via buildOpencodeServerEnv, scheduled task scripts via scriptEnv).
  *
- * Deliberately NOT here: data-tool secrets that bash tools legitimately consume
- * from env (SNOWFLAKE_PASSWORD, DBT_* tokens, OPENAI_API_KEY, …) — stripping
- * those would break `snow`/`dbt`/etc. on BOTH providers. Single source of truth;
- * do not fork this list into an adapter. (codex #126)
+ * Deliberately NOT here: the provider credentials above (see the module header),
+ * nor data-tool secrets that bash tools legitimately consume from env
+ * (SNOWFLAKE_PASSWORD, DBT_* tokens, OPENAI_API_KEY, …) — stripping those would
+ * break `snow`/`dbt`/etc. on BOTH providers. Single source of truth; do not fork
+ * this list into an adapter. (codex #126)
  */
 export const MCP_HEADER_ONLY_SECRET_VARS: readonly string[] = [
   'GRANOLA_ACCESS_TOKEN',

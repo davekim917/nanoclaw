@@ -17,7 +17,7 @@ import {
   SDK_DISALLOWED_TOOLS,
   preToolUseHook,
   postToolUseHook,
-  createSanitizeBashHook,
+  createBashCommandRewriteHook,
   createSelfApprovalBlockHook,
   createBlockSnowflakeConnectorHook,
   createBlockGitCloneHook,
@@ -425,10 +425,10 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
     return first ?? { continue: true };
   }
 
-  // Bash-only chain. Order matters: sanitize first (so blocked commands
-  // also get the unset prefix stripped from logs); then the guardrails.
+  // Bash-only chain. Order matters: the command rewrite first, so every
+  // guardrail after it evaluates the same command text.
   const chain: HookCallback[] = [
-    createSanitizeBashHook(),
+    createBashCommandRewriteHook(),
     createManagedGitMaintenanceHook(),
     createSelfApprovalBlockHook(),
     createBlockSnowflakeConnectorHook(),

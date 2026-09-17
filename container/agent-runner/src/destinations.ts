@@ -132,9 +132,12 @@ export function buildSystemPromptAddendum(assistantName?: string, mode: SessionM
   }
 
   // Communication invariants the NanoClaw harness relies on across every
-  // session regardless of destination count — must land in the appended
-  // system prompt, not just the mounted CLAUDE.md files, because the
-  // CLAUDE.md path is sometimes unreliable (see V1_BEHAVIOR_AUDIT #25).
+  // session regardless of destination count. They must land in the APPENDED
+  // SYSTEM PROMPT, not only in the mounted CLAUDE.md files: a group can be
+  // spawned without its CLAUDE.md resolving (a missing or unreadable mount, a
+  // provider that weights project instructions differently), and a session that
+  // silently loses these rules produces garbage the user sees. The system
+  // prompt is the one channel every provider is guaranteed to read.
   sections.push(
     [
       '## Communication conventions',

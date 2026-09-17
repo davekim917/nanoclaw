@@ -66,10 +66,14 @@ const CWD = '/workspace/agent';
 
 async function main(): Promise<void> {
   const config = loadConfig();
-  // Cross-model reviews run from Bash, whose secret sanitization intentionally
-  // strips Claude credentials. Start the trusted runner-owned service before
-  // any provider snapshots process.env; it retains no client-provided env and
-  // reads the current runner env per request so native rotations stay visible.
+  // Cross-model reviews run from Bash, which now inherits the container's
+  // Claude credential. The service still earns its keep: it pins ONE slot of
+  // the credential ring per review and rotates on a pre-inference credential
+  // failure, redacts slot values out of the child's output, and caps the
+  // request/response bytes — none of which a bare `claude -p` does. Start it
+  // before any provider snapshots process.env; it retains no client-provided
+  // env and reads the current runner env per request so native rotations stay
+  // visible.
   let reviewService: Awaited<ReturnType<typeof startClaudeReviewService>> | undefined;
   delete process.env[CLAUDE_REVIEW_SOCKET_ENV];
   try {

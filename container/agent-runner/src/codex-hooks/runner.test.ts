@@ -88,20 +88,16 @@ describe('runPreToolUseChain — guardrails', () => {
     expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
   });
 
-  it('allows benign bash and merges sanitize prefix', async () => {
+  it('allows benign bash untouched — the rewrite hook has nothing to do', async () => {
     const out = (await runPreToolUseChain({
       tool_name: 'exec_command',
       tool_input: { command: 'ls -la' },
     })) as
       | { continue?: boolean }
       | { hookSpecificOutput?: { hookEventName?: string; updatedInput?: { command?: string } } };
-    if ('hookSpecificOutput' in out && out.hookSpecificOutput) {
-      // Sanitize wraps with `unset KEY...;` if any secret env vars exist.
-      // In the test env they may not, so updatedInput is optional.
-      expect(out.hookSpecificOutput.hookEventName).toBe('PreToolUse');
-    } else {
-      expect(out).toEqual({ continue: true });
-    }
+    // `ls -la` is neither `codex exec` nor a jest run, and no credential prefix
+    // is prepended any more, so the chain returns a plain continue.
+    expect(out).toEqual({ continue: true });
   });
 
   it('allows /tmp-only git clone', async () => {
@@ -109,7 +105,7 @@ describe('runPreToolUseChain — guardrails', () => {
       tool_name: 'exec_command',
       tool_input: { command: 'git clone https://github.com/x/y /tmp/y' },
     })) as { continue?: boolean; hookSpecificOutput?: { permissionDecision?: string } };
-    // Sanitize may insert updatedInput; assert nothing was denied.
+    // A chained hook may insert updatedInput; assert nothing was denied.
     expect(out.hookSpecificOutput?.permissionDecision).toBeUndefined();
   });
 
@@ -594,7 +590,7 @@ describe('runPreToolUseChain — one approval card per tool call (#833)', () => 
   });
 
   it('forwards the id codex supplied, not one derived from the rewritten command', async () => {
-    // createSanitizeBashHook rewrites the command earlier in this chain. The
+    // createBashCommandRewriteHook can rewrite the command earlier in this chain. The
     // claim key must still be built from the RAW tool_use_id — the plugin
     // adapter keys on that same raw value, and any divergence silently gives
     // each chain its own card again.

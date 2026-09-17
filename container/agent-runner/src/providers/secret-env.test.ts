@@ -1,74 +1,46 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect } from 'bun:test';
 import fs from 'fs';
 
-import { buildSecretEnvVarList, ANTHROPIC_KEY_RE, OAUTH_KEY_RE } from './secret-env.js';
+import { MCP_HEADER_ONLY_SECRET_VARS, ANTHROPIC_KEY_RE, OAUTH_KEY_RE } from './secret-env.js';
 
-describe('buildSecretEnvVarList', () => {
-  let savedEnv: Record<string, string | undefined> = {};
-  let touched: string[] = [];
-  const BASE_TOUCHED = [
-    'ANTHROPIC_API_KEY',
-    'ANTHROPIC_API_KEY_2',
-    'CLAUDE_CODE_OAUTH_TOKEN',
-    'CLAUDE_CODE_OAUTH_TOKEN_3',
-    'GMAIL_OAUTH_PATH',
-    'GMAIL_CREDENTIALS_PATH',
-    'NANOCLAW_GH_TOKEN',
-    'GH_TOKEN',
-    'GITHUB_TOKEN',
-  ];
+describe('secret-env', () => {
+  // test_header_only_list_is_exactly_the_mcp_headers — the ONLY list this module
+  // still exports for stripping. Provider credentials (Anthropic/OAuth), the GH
+  // tokens the URL-scoped git helper needs, and the never-produced GMAIL paths
+  // are all absent by design: a container's shell inherits the credential the
+  // container runs on, so `claude -p` works headless the way `codex exec` does.
+  //
+  // MUTATION CHECK: re-adding any ANTHROPIC_API_KEY* / CLAUDE_CODE_OAUTH_TOKEN*
+  // name to MCP_HEADER_ONLY_SECRET_VARS fails the exact-equality assertion here
+  // AND the "credentials survive" assertions in claude.guards.test.ts,
+  // opencode.failClosed.test.ts and task-script's env test.
+  it('test_header_only_list_is_exactly_the_mcp_headers', () => {
+    expect([...MCP_HEADER_ONLY_SECRET_VARS]).toEqual(['GRANOLA_ACCESS_TOKEN', 'EXA_API_KEY', 'BRAINTRUST_API_KEY']);
 
-  beforeEach(() => {
-    touched = [
-      ...new Set([
-        ...BASE_TOUCHED,
-        ...Object.keys(process.env).filter((key) => ANTHROPIC_KEY_RE.test(key) || OAUTH_KEY_RE.test(key)),
-      ]),
-    ];
-    savedEnv = {};
-    for (const k of touched) savedEnv[k] = process.env[k];
-    for (const k of touched) delete process.env[k];
-  });
-
-  afterEach(() => {
-    for (const k of touched) {
-      if (savedEnv[k] === undefined) delete process.env[k];
-      else process.env[k] = savedEnv[k];
+    for (const name of MCP_HEADER_ONLY_SECRET_VARS) {
+      expect(ANTHROPIC_KEY_RE.test(name)).toBe(false);
+      expect(OAUTH_KEY_RE.test(name)).toBe(false);
+    }
+    for (const never of [
+      'ANTHROPIC_API_KEY',
+      'ANTHROPIC_API_KEY_2',
+      'CLAUDE_CODE_OAUTH_TOKEN',
+      'CLAUDE_CODE_OAUTH_TOKEN_3',
+      'GMAIL_OAUTH_PATH',
+      'GMAIL_CREDENTIALS_PATH',
+      'NANOCLAW_GH_TOKEN',
+      'GH_TOKEN',
+      'GITHUB_TOKEN',
+      'SNOWFLAKE_PASSWORD',
+      'OPENAI_API_KEY',
+    ]) {
+      expect(MCP_HEADER_ONLY_SECRET_VARS).not.toContain(never);
     }
   });
 
-  // test_secret_env_list_stable — the list is single-source and deterministic:
-  // the two always-present GMAIL paths plus exactly the present Anthropic/OAuth
-  // key vars (base + _N), and nothing else. Asserts both the stable tail and
-  // that GH tokens are deliberately excluded.
-  it('test_secret_env_list_stable', () => {
-    // No Anthropic/OAuth keys set → only the two static GMAIL entries.
-    expect(buildSecretEnvVarList()).toEqual(['GMAIL_OAUTH_PATH', 'GMAIL_CREDENTIALS_PATH']);
-
-    // With keys present (incl. _N fallbacks) they appear; GH tokens never do.
-    process.env.ANTHROPIC_API_KEY = 'sk-base';
-    process.env.ANTHROPIC_API_KEY_2 = 'sk-fallback';
-    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'oauth-base';
-    process.env.CLAUDE_CODE_OAUTH_TOKEN_3 = 'oauth-fallback';
-    process.env.NANOCLAW_GH_TOKEN = 'ghp_should_not_appear';
-    process.env.GH_TOKEN = 'ghp_should_not_appear';
-    process.env.GITHUB_TOKEN = 'ghp_should_not_appear';
-
-    const list = buildSecretEnvVarList();
-    expect(list).toContain('ANTHROPIC_API_KEY');
-    expect(list).toContain('ANTHROPIC_API_KEY_2');
-    expect(list).toContain('CLAUDE_CODE_OAUTH_TOKEN');
-    expect(list).toContain('CLAUDE_CODE_OAUTH_TOKEN_3');
-    expect(list).toContain('GMAIL_OAUTH_PATH');
-    expect(list).toContain('GMAIL_CREDENTIALS_PATH');
-    // GH tokens are intentionally NOT stripped (git credential helper relies on them).
-    expect(list).not.toContain('NANOCLAW_GH_TOKEN');
-    expect(list).not.toContain('GH_TOKEN');
-    expect(list).not.toContain('GITHUB_TOKEN');
-    // The two static GMAIL paths are always the tail (stable ordering).
-    expect(list.slice(-2)).toEqual(['GMAIL_OAUTH_PATH', 'GMAIL_CREDENTIALS_PATH']);
-  });
-
+  // The regexes survive the removal of the unset list: claude-review-service.ts
+  // uses them to clear every credential slot from a review child's env before
+  // pinning exactly one (claude-review-service.ts:67-75).
   it('regexes match base + _N variants only', () => {
     expect(ANTHROPIC_KEY_RE.test('ANTHROPIC_API_KEY')).toBe(true);
     expect(ANTHROPIC_KEY_RE.test('ANTHROPIC_API_KEY_5')).toBe(true);
@@ -76,6 +48,16 @@ describe('buildSecretEnvVarList', () => {
     expect(OAUTH_KEY_RE.test('CLAUDE_CODE_OAUTH_TOKEN')).toBe(true);
     expect(OAUTH_KEY_RE.test('CLAUDE_CODE_OAUTH_TOKEN_2')).toBe(true);
     expect(OAUTH_KEY_RE.test('CLAUDE_CODE_OAUTH_TOKEN_FOO')).toBe(false);
+  });
+
+  // test_secret_env_no_unset_list — the module must not grow a replacement for
+  // the deleted buildSecretEnvVarList: no code here may read process.env at all.
+  // Comment prose about the old behaviour is fine, so comments are stripped first.
+  it('test_secret_env_no_unset_list', () => {
+    const raw = fs.readFileSync(new URL('./secret-env.ts', import.meta.url).pathname, 'utf-8');
+    const code = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+    expect(code).not.toContain('process.env');
+    expect(code).not.toContain('buildSecretEnvVarList');
   });
 
   // test_secret_env_no_sdk_import — secret-env.ts must stay free of the Claude

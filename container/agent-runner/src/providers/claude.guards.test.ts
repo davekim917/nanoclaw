@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import type { HookCallback, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 
 import {
-  createSanitizeBashHook,
+  createBashCommandRewriteHook,
   wrapJestSerialized,
   createSelfApprovalBlockHook,
   createBlockSnowflakeConnectorHook,
@@ -11,7 +11,6 @@ import {
   createEmailGateHook,
   resetGateClaimApiForTest,
 } from './claude.js';
-import { buildSecretEnvVarList } from './secret-env.js';
 import * as messagesOut from '../db/messages-out.js';
 import * as sessionRouting from '../db/session-routing.js';
 import * as deliveryAcks from '../db/delivery-acks.js';
@@ -45,6 +44,14 @@ async function runBashHook(
     permissionDecisionReason: hso?.permissionDecisionReason,
     raw: out,
   };
+}
+
+/** Drive createBashCommandRewriteHook and return the command it produced. */
+async function runRewriteHook(command: string): Promise<string> {
+  const input = { tool_name: 'Bash', tool_input: { command } } as unknown as PreToolUseHookInput;
+  const out = await createBashCommandRewriteHook()(input as Parameters<HookCallback>[0], EMPTY_CTX, EMPTY_OPTS);
+  const hso = (out as { hookSpecificOutput?: { updatedInput?: { command?: string } } })?.hookSpecificOutput;
+  return hso?.updatedInput?.command ?? command;
 }
 
 // ── E1: createSelfApprovalBlockHook delegates to the core ──
@@ -539,32 +546,38 @@ describe('E3 createEmailGateHook', () => {
     expect(r.permissionDecision).toBeUndefined(); // delivered ack → allow after gate
   });
 
-  it('sanitizer unset-prefix does NOT over-block a real --dry-run (strips exact prefix) — codex #126 F1', async () => {
-    // Reproduce the prod chain: createSanitizeBashHook prepends `unset <vars>
-    // 2>/dev/null; ` before the email gate sees the command. A legit dry-run must
-    // still bypass — the gate strips the exact reconstructed prefix first.
+  it('the Bash rewrite hook prepends NO unset prefix, so the gate sees what the agent typed', async () => {
+    // Was codex #126 F1: createBashCommandRewriteHook used to prepend
+    // `unset <vars> 2>/dev/null; `, which the email gate then had to strip so a
+    // legit --dry-run wasn't refused for starting with `unset` + `;`. The prefix
+    // is gone — a container's shell keeps the credential the container runs on —
+    // so the gate evaluates the raw command and both outcomes must still hold.
+    //
+    // MUTATION CHECK: restoring the unset prefix in createBashCommandRewriteHook
+    // fails the first two assertions below.
     const saved = process.env.ANTHROPIC_API_KEY;
-    process.env.ANTHROPIC_API_KEY = 'sk-test'; // ensure buildSecretEnvVarList is non-empty
+    process.env.ANTHROPIC_API_KEY = 'sk-test';
     try {
       process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts'; // inline path
       delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
-      const prefix = `unset ${buildSecretEnvVarList().join(' ')} 2>/dev/null; `;
-      // dry-run → bypass (allow, no staging) despite the sanitizer prefix
-      const dry = await runBashHook(
-        createEmailGateHook(),
-        `${prefix}gws gmail +send --to person8@fixture1.example.com --subject hi --body x --dry-run`,
-      );
+
+      const emailCommand = 'gws gmail +send --to person8@fixture1.example.com --subject hi --body x --dry-run';
+      const rewritten = await runRewriteHook(emailCommand);
+      expect(rewritten).toBe(emailCommand); // untouched: no unset, no wrap
+      expect(rewritten).not.toContain('ANTHROPIC_API_KEY');
+
+      // dry-run → bypass (allow, no staging)
+      const dry = await runBashHook(createEmailGateHook(), rewritten);
       expect(dry.permissionDecision).toBeUndefined();
       expect(gateCard()).toBeUndefined();
       expect(ackedRequestId).toBeNull();
 
-      // …but a real (non-dry-run) send behind the same prefix STILL gates: the
-      // strip only removes the known prefix, leaving the real send fully checked.
+      // …a real (non-dry-run) send STILL gates.
       staged.length = 0;
       ackToReturn = { status: 'delivered' };
       const real = await runBashHook(
         createEmailGateHook(),
-        `${prefix}gws gmail +send --to person25@fixture4.example.com --subject hi --body x`,
+        'gws gmail +send --to person25@fixture4.example.com --subject hi --body x',
       );
       const card = gateCard();
       expect(card).toBeDefined();
@@ -676,11 +689,51 @@ describe('createBlockCodexCompanionHook', () => {
   });
 });
 
-// ── createSanitizeBashHook: codex exec stdin /dev/null wrap ──
-describe('createSanitizeBashHook codex exec stdin fix', () => {
+// ── createBashCommandRewriteHook: the container credential reaches the shell ──
+describe('createBashCommandRewriteHook credential passthrough', () => {
+  const SLOTS = ['ANTHROPIC_API_KEY', 'ANTHROPIC_API_KEY_2', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN_3'];
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const k of SLOTS) {
+      saved[k] = process.env[k];
+      process.env[k] = 'test-value';
+    }
+  });
+  afterEach(() => {
+    for (const k of SLOTS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  // An agent must be able to run `claude -p` headless under the credential its
+  // own container runs on, the way `codex exec` and `opencode run` already
+  // could. MUTATION CHECK: restoring the `unset <vars> 2>/dev/null; ` prefix in
+  // createBashCommandRewriteHook fails every assertion here.
+  it('leaves an ordinary command byte-identical — no unset prefix, no rewrite', async () => {
+    for (const cmd of ['claude -p "review this"', 'printenv ANTHROPIC_API_KEY', 'ls -la /workspace']) {
+      const out = await runRewriteHook(cmd);
+      expect(out).toBe(cmd);
+      expect(out).not.toContain('unset ');
+    }
+  });
+
+  it('never names a credential slot in a rewritten command either', async () => {
+    // The two rewrites that DO fire (codex stdin, jest lock) must not reintroduce one.
+    for (const cmd of ['codex exec --yolo "x"', 'npx jest']) {
+      const out = await runRewriteHook(cmd);
+      expect(out).not.toBe(cmd); // a rewrite really did happen
+      for (const slot of SLOTS) expect(out).not.toContain(slot);
+    }
+  });
+});
+
+// ── createBashCommandRewriteHook: codex exec stdin /dev/null wrap ──
+describe('createBashCommandRewriteHook codex exec stdin fix', () => {
   async function sanitize(command: string): Promise<string | undefined> {
     const input = { tool_name: 'Bash', tool_input: { command } } as unknown as PreToolUseHookInput;
-    const out = await createSanitizeBashHook()(input as Parameters<HookCallback>[0], EMPTY_CTX, EMPTY_OPTS);
+    const out = await createBashCommandRewriteHook()(input as Parameters<HookCallback>[0], EMPTY_CTX, EMPTY_OPTS);
     const hso = (out as { hookSpecificOutput?: { updatedInput?: { command?: string } } })?.hookSpecificOutput;
     return hso?.updatedInput?.command;
   }
@@ -698,9 +751,13 @@ describe('createSanitizeBashHook codex exec stdin fix', () => {
   });
 
   it('does not double-redirect when stdin is already /dev/null', async () => {
-    const out = await sanitize('codex exec --yolo "x" </dev/null');
-    // Already has </dev/null → no group wrap added.
-    expect(out).not.toMatch(/\} <\/dev\/null$/);
+    const command = 'codex exec --yolo "x" </dev/null';
+    const out = await sanitize(command);
+    // Already has </dev/null → no group wrap added. With no credential prefix
+    // left to prepend either, the hook has nothing to rewrite and returns no
+    // updatedInput at all (claude.ts: `if (rewritten === command) return {}`).
+    expect(out).toBeUndefined();
+    expect(out ?? command).not.toMatch(/\} <\/dev\/null$/);
   });
 
   it('does not wrap non-codex commands', async () => {
@@ -736,9 +793,9 @@ describe('wrapJestSerialized', () => {
   });
 });
 
-describe('createSanitizeBashHook: jest serialization', () => {
+describe('createBashCommandRewriteHook: jest serialization', () => {
   const runHook = async (command: string): Promise<string> => {
-    const hook = createSanitizeBashHook();
+    const hook = createBashCommandRewriteHook();
     const res = (await hook(
       { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command } } as never,
       undefined as never,

