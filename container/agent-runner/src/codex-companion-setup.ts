@@ -137,16 +137,14 @@ const CONTAINER_CODEX_CONFIG_BASE = [
   'multi_agent = true',
   '',
   '[agents]',
-  // The GLOBAL default effort for every Codex subagent — the same value
-  // src/providers/codex.ts writes, so the companion and the provider path
-  // cannot disagree about what a Codex subagent runs at. It used to be
-  // rendered from the bootstrap plugin's worker-policy file; that file and its
-  // vendored constant are gone, so the value is stated here, unchanged.
+  // No `default_subagent_reasoning_effort` — deliberately the same as
+  // src/providers/codex.ts and the host's own config (operator, 2026-09-17):
+  // a Codex subagent runs at Codex's native default unless its spawn or its
+  // role names an effort.
   //
   // A plain literal, not a template: src/provider-surfaces.test.ts evaluates
   // THIS array literal in a bare `new Function` scope to compare it against the
   // host's, so the literal may reference only bindings that test supplies.
-  'default_subagent_reasoning_effort = "high"',
   'max_concurrent_threads_per_session = 4',
   '',
   ...['/workspace/agent', '/workspace/workgroup', '/workspace/worktrees', '/tmp'].flatMap((proj) => [
@@ -1150,6 +1148,8 @@ export function syncAgentSkillsMirror(runtime?: AgentRuntime): void {
   // repository. Never silent — an operator seeing a skill go missing needs the
   // reason in the log rather than in a diff of the mirror.
   if (result.refused.length > 0) {
-    log(`~/.agents/skills/: refused ${result.refused.length} path(s) outside their plugin: ${result.refused.join(', ')}`);
+    log(
+      `~/.agents/skills/: refused ${result.refused.length} path(s) outside their plugin: ${result.refused.join(', ')}`,
+    );
   }
 }
