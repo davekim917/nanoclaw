@@ -1851,6 +1851,15 @@ range_pin_promote() {  # <pr> <head-sha> <candidate-file>
 # the selection was computed from are kept beside it, content-addressed.
 JOURNEYS_PIN_SHAPE='type == "object" and .schemaVersion == 1 and (.selection | type == "string") and
   (.route | type == "string") and (.matchedJourneys | type == "array") and (.unmappedPaths | type == "array")'
+# AN EMPTY `full` IS NEVER PINNABLE. `full` means "walk everything", so a `full`
+# that names no journey at all (a crashed matcher, a catalogue nothing could be
+# read out of) is not a selection, it is the absence of one — and pinned, it
+# would switch journey obligations off for this head for good. Both the
+# candidate acceptance in journeys_select and journeys_pin_promote go through
+# this one predicate; a head without a candidate is not offered this cycle and
+# the next poll tries again.
+JOURNEYS_PINNABLE='(.selection != "full") or ((.matchedJourneys | length) > 0) or
+  (((.unassessedNativeJourneys // []) | length) > 0)'
 journeys_pin_file() {  # <pr> <head-sha>
   local f
   f="$(range_pin_file "$1" "$2")"
@@ -1895,15 +1904,19 @@ journeys_select() {  # <pr> <head-sha> <determinable> <fail-reason> <paths-json>
     rm -f "$snapshot_out" "$TMP_DIR/journeys-pin-$pr.json" 2>/dev/null
     args+=(--snapshot-out "$snapshot_out")
   fi
+  # A matcher that crashed, timed out, could not parse the catalogue, or came
+  # back with an empty `full` has selected NOTHING (JOURNEYS_PINNABLE): report
+  # it, leave no candidate — poll then cannot promote, does not offer the head
+  # this cycle and says why, and the next poll tries again.
   if ! out="$(printf '%s' "$paths_json" | timeout 20 python3 "$JOURNEYS_TOOL" match "${args[@]}" 2>/dev/null)" ||
      ! out="$(jq -ce "select($JOURNEYS_PIN_SHAPE) | . + {pinState:\"absent\"}" <<<"$out" 2>/dev/null)"; then
-    # A matcher that crashed or timed out has selected NOTHING, and that must
-    # never become the campaign's pinned contract (an immutable, empty `full`
-    # would switch off every journey check for this head for good). Report it,
-    # leave no candidate: poll then cannot promote, does not offer the head
-    # this cycle and says why, and the next poll tries again.
     [ -z "$snapshot_out" ] || rm -f "$snapshot_out" 2>/dev/null
-    journeys_full "journey matcher failed" absent
+    journeys_full "journey matcher failed (crash, timeout, or a catalogue that cannot be parsed)" absent
+    return 0
+  fi
+  if ! jq -e "$JOURNEYS_PINNABLE" <<<"$out" >/dev/null 2>&1; then
+    [ -z "$snapshot_out" ] || rm -f "$snapshot_out" 2>/dev/null
+    journeys_full "the selection is \`full\` but names no journey ($(jq -r '.reason // "no reason given"' <<<"$out"))" absent
     return 0
   fi
   [ -z "$snapshot_out" ] || printf '%s' "$out" > "$TMP_DIR/journeys-pin-$pr.json" 2>/dev/null || true
@@ -1936,7 +1949,7 @@ journeys_pin_promote() {  # <pr> <head-sha> <candidate> <snapshot-candidate>
   fi
   tmp="$(mktemp "$LEASE_DIR/.journeys-pin-pr-$pr.XXXXXX" 2>/dev/null)" || return 1
   if ! jq -c --arg h "$head" --arg now "$(iso_now)" --arg f "$f" --arg snap "$snap" \
-         "select($JOURNEYS_PIN_SHAPE) | . + {headSha:\$h, pinned:true, pinState:\"valid\", pinFile:\$f,
+         "select(($JOURNEYS_PIN_SHAPE) and ($JOURNEYS_PINNABLE)) | . + {headSha:\$h, pinned:true, pinState:\"valid\", pinFile:\$f,
             catalogueSnapshot:(if \$snap == \"\" then null else \$snap end), pinnedAt:\$now}" \
          "$candidate" > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
     rm -f "$tmp" 2>/dev/null; return 1

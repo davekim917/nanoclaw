@@ -568,8 +568,11 @@ catalogue and states the result as `journeys` in `check` and the
 `pr_build_settled` wake. It reads the **pinned** range paths and is pinned with
 them at the first settled poll — immutable, in the shared lease directory, with
 a sha256-named catalogue snapshot — so no catalogue edit, recovery wake or
-second coordinator changes a run's contract (`pinState: invalid` ⇒ `full`,
-still offered). No catalogue: no `journeys` key. At intake:
+second coordinator changes a run's contract. An empty `full` is never pinned
+(the head waits a cycle and retries). `pinState: invalid` ⇒ `full`, still
+offered, **naming nothing the barrier can enforce**: its scope is unrecoverable,
+so the owner walks every journey in the live catalogue, scaffolds a lane for
+each, and says on the report that the selection was rebuilt by hand. No catalogue: no `journeys` key. At intake:
 
 1. `smoke-journeys.py pin-run <run-dir> <journeys.pinFile>` copies the pin and
    snapshot into `<run-dir>/journeys/`; workers and siblings read that copy,

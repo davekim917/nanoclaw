@@ -1558,22 +1558,58 @@ unset SMOKE_GATE_RUN_ROOT
 journeys_fixture "$BACKEND_ONLY"
 cat > "$STUB_BIN/python3" <<'STUB'
 #!/usr/bin/env bash
-case " $* " in *smoke-journeys.py*) [ -z "${STUB_JOURNEYS_FAIL:-}" ] || exit 70 ;; esac
+case " $* " in *smoke-journeys.py*)
+  if [ -n "${STUB_JOURNEYS_OUT:-}" ]; then cat >/dev/null; printf '%s' "$STUB_JOURNEYS_OUT"; exit 0; fi
+  [ -z "${STUB_JOURNEYS_FAIL:-}" ] || exit 70 ;;
+esac
 exec /usr/bin/env -u STUB_JOURNEYS_FAIL "$REAL_PYTHON3" "$@"
 STUB
 chmod +x "$STUB_BIN/python3"
 export STUB_JOURNEYS_FAIL=1
-range_case 5k-matcher-failed '.journeys.selection == "full" and .journeys.reason == "journey matcher failed" and .journeys.pinState == "absent"'
+range_case 5k-matcher-failed '.journeys.selection == "full" and (.journeys.reason | test("^journey matcher failed")) and .journeys.pinState == "absent"'
 T5K_FAIL_ERR="$STATE_DIR/poll.err"
 bash "$GATE" poll 2>"$T5K_FAIL_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
   { echo "5k: a failed matcher's empty selection was offered" >&2; exit 1; }
-grep -q 'journey selection could not be pinned (journey matcher failed)' "$T5K_FAIL_ERR" ||
+grep -q 'journey selection could not be pinned (journey matcher failed' "$T5K_FAIL_ERR" ||
   { echo "5k: the unoffered head was silent: $(cat "$T5K_FAIL_ERR")" >&2; exit 1; }
 [ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: a failed matcher result was pinned" >&2; exit 1; }
 unset STUB_JOURNEYS_FAIL
 bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.journeys.pinned == true and
   .data.journeys.selection == "matched"' >/dev/null || { echo "5k: the retry after a matcher failure did not pin" >&2; exit 1; }
+# AN EMPTY `full` IS NEVER PINNABLE, whoever produces it. Hand the gate one
+# directly — a matcher that exits 0 with a well-shaped `full` naming nothing —
+# and it is refused at the same seam: no pin, not offered, says why.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_JOURNEYS_FAIL=1 STUB_JOURNEYS_OUT='{"schemaVersion":1,"selection":"full","reason":"hand-fed","route":"web","catalogueValid":false,"catalogueSha256":null,"matchedJourneys":[],"unmappedPaths":[],"excludedPaths":[],"unassessedNativeJourneys":[]}'
+range_case 5k-empty-full-refused '.journeys.selection == "full" and (.journeys.reason | test("names no journey \\(hand-fed\\)"))'
+bash "$GATE" poll 2>"$T5K_FAIL_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
+  { echo "5k: a hand-fed empty full selection was offered" >&2; exit 1; }
+grep -q 'could not be pinned (the selection is `full` but names no journey' "$T5K_FAIL_ERR"
+[ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: an empty full selection was pinned" >&2; exit 1; }
+unset STUB_JOURNEYS_FAIL STUB_JOURNEYS_OUT
 rm -f "$STUB_BIN/python3"
+
+# The real producers of that state: a catalogue that is truncated, or
+# unreadable, at the first settled poll. No pin, not offered, reason on stderr;
+# once the catalogue is repaired the next poll pins the real selection.
+for T5K_KIND in truncated unreadable; do
+  journeys_fixture "$BACKEND_ONLY"
+  case "$T5K_KIND" in
+    truncated)  head -c 200 "$JOURNEYS_EXAMPLE" > "$STATE_DIR/journeys.json" ;;
+    unreadable) chmod 000 "$STATE_DIR/journeys.json"; [ "$(id -u)" != 0 ] || continue ;;
+  esac
+  range_case "5k-$T5K_KIND-catalogue" '.journeys.selection == "full" and .journeys.pinState == "absent" and
+    (.journeys.reason | test("catalogue that cannot be parsed"))'
+  bash "$GATE" poll 2>"$T5K_FAIL_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
+    { echo "5k: a $T5K_KIND catalogue's empty selection was offered" >&2; exit 1; }
+  grep -q 'journey selection could not be pinned' "$T5K_FAIL_ERR" ||
+    { echo "5k: $T5K_KIND catalogue: the unoffered head was silent" >&2; exit 1; }
+  [ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: a $T5K_KIND catalogue was pinned" >&2; exit 1; }
+  chmod 644 "$STATE_DIR/journeys.json"; cp "$JOURNEYS_EXAMPLE" "$STATE_DIR/journeys.json"
+  bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.journeys.pinned == true and
+    .data.journeys.selection == "matched" and .data.journeys.unmappedPaths == ["api/src/reports/export.ts"]' >/dev/null ||
+    { echo "5k: repairing a $T5K_KIND catalogue did not pin the real selection" >&2; exit 1; }
+done
 
 # UNKNOWN range is "full", never an empty match.
 journeys_fixture "$BACKEND_ONLY"
@@ -1586,7 +1622,7 @@ range_case 5k-unknown '.campaignRange.determinable == false and .journeys.select
 journeys_fixture "$BACKEND_ONLY"
 printf '{"schemaVersion":1,"journeys":"nope"}' > "$STATE_DIR/journeys.json"
 range_case 5k-broken '.journeys.selection == "full" and .journeys.catalogueValid == false and
-  (.journeys.reason | test("unusable"))'
+  (.journeys.reason | test("names no journey.*unusable"))'
 # An ordinary PR has no campaignRange, so it gets no selection either.
 journeys_fixture "$BACKEND_ONLY"
 export STUB_PR_FILES='[{"filename":"api/src/loans/period.ts"}]'

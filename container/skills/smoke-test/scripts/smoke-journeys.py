@@ -173,8 +173,8 @@ def validate_catalogue(cat):
             if problem:
                 errors.append("excludePaths glob {!r} {}".format(e, problem))
     journeys = cat.get("journeys")
-    if not isinstance(journeys, list):
-        return errors + ["journeys must be a list"]
+    if not isinstance(journeys, list) or not journeys:
+        return errors + ["journeys must be a non-empty list"]
     seen = set()
     for i, j in enumerate(journeys):
         if not isinstance(j, dict):
@@ -473,6 +473,17 @@ def cmd_match(args):
 
     cat, digest, raw, errors = load_catalogue(args.catalogue)
     if cat is None:
+        # A catalogue nothing can be read OUT of (unreadable, truncated, not an
+        # object) selects nothing, and "nothing" must never look like a
+        # successful selection a caller could pin: fail, and let the caller
+        # retry. One that still parses owes whatever it can name (below).
+        try:
+            parsed = json.loads(raw.decode("utf-8")) if raw is not None else None
+        except (ValueError, UnicodeDecodeError):
+            parsed = None
+        if not isinstance(parsed, dict):
+            print(json.dumps({"ok": False, "error": "journey catalogue cannot be parsed: " + "; ".join(errors[:3])}), file=sys.stderr)
+            sys.exit(1)
         selection = broken_selection(digest, "; ".join(errors[:3]), raw)
     else:
         selection = compute_selection(cat, digest, paths, unknown, args.size, args.run_root, as_of)
@@ -723,9 +734,22 @@ def cmd_barrier(args):
 
 # --- publish ----------------------------------------------------------------
 
+def _without_notes(value):
+    """`_`-prefixed keys are notes, at any depth; everything else is content."""
+    if isinstance(value, dict):
+        return {k: _without_notes(v) for k, v in value.items() if not k.startswith("_")}
+    if isinstance(value, list):
+        return [_without_notes(v) for v in value]
+    return value
+
+
 def _floor_view(cat):
+    """The COMPLETE floor entries, by id. Not just the claim: a floor journey
+    whose steps, endState, seed or checkpoints were thinned still "proves" the
+    same sentence while testing less, so every field is the human's call. Dict
+    equality ignores key order; only `_` notes are left out."""
     return {
-        j["id"]: (j["proves"], j["maxIntervalDays"], j["evidence"])
+        j["id"]: _without_notes(j)
         for j in (cat or {}).get("journeys", []) if j.get("maxIntervalDays") is not None
     }
 
@@ -761,7 +785,7 @@ def cmd_publish(args):
         except (ValueError, UnicodeDecodeError, KeyError, TypeError, AttributeError):
             floor_changed = True
         if floor_changed and not _is_text(args.floor_authority):
-            emit({"ok": False, "error": "this proposal changes floor membership or a floor journey's proves/maxIntervalDays/evidence (a first publish that declares floor journeys included); that is a human call -- pass --floor-authority <where it was approved>"}, 1)
+            emit({"ok": False, "error": "this proposal changes floor membership or a floor journey (any field but a `_` note; a first publish that declares floor journeys included); that is a human call -- pass --floor-authority <where it was approved>"}, 1)
         _write_atomic(os.path.abspath(args.catalogue), new_raw)
     emit({"ok": True, "catalogue": args.catalogue, "sha256": new_digest, "priorSha256": prior_digest,
           "journeyCount": len(proposed["journeys"]), "floorAuthority": args.floor_authority or None,

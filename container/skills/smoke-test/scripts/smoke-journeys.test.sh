@@ -61,6 +61,7 @@ bad_catalogue 1-dup-id '.journeys[1].id = .journeys[0].id' 'duplicate id'
 bad_catalogue 1-lane-alphabet '.journeys[0].id = "has space"' 'id must match'
 # `platform: web|native` cannot say "API-only by design"; evidence can, and is closed.
 bad_catalogue 1-evidence '.journeys[0].evidence = "web"' 'evidence must be one of'
+bad_catalogue 1-empty 'del(.journeys[])' 'journeys must be a non-empty list'
 bad_catalogue 1-no-proves 'del(.journeys[0].proves)' 'proves must be'
 bad_catalogue 1-typo-key '.journeys[1].maxIntervalDay = 2' 'unknown key maxIntervalDay'
 bad_catalogue 1-no-consumes '.journeys[0].consumes = []' 'consumes must be'
@@ -135,8 +136,14 @@ expect 2-invalid-names-journeys '.selection == "full" and .catalogueValid == fal
   .matchedJourneys[0].evidence == "browser" and .matchedJourneys[1].evidence == "api" and .floor.due == ["branch-scope-crossing"]' \
   "$(CATALOGUE="$WORK/half-broken.json" match '["web/src/desk/a.tsx"]')"
 printf 'nope' > "$WORK/broken.json"
-expect 2-broken-catalogue '.selection == "full" and .catalogueValid == false and (.catalogueSha256 | length == 64)' \
-  "$(CATALOGUE="$WORK/broken.json" match '["web/src/desk/a.tsx"]')"
+# A catalogue NOTHING can be read out of selects nothing, and that must never
+# look like a selection somebody could pin: the matcher fails instead.
+for broken in "$WORK/broken.json" "$WORK/no-such-catalogue.json"; do
+  if OUT="$(CATALOGUE="$broken" match '["web/src/desk/a.tsx"]' 2>/dev/null)"; then fail "2-unparseable-catalogue: exit 0 with: $OUT"; fi
+  [ -z "$OUT" ] || fail "2-unparseable-catalogue: printed a selection: $OUT"
+done
+printf '["not","an","object"]' > "$WORK/array.json"
+if CATALOGUE="$WORK/array.json" match '[]' >/dev/null 2>&1; then fail "2-non-object-catalogue: exit 0"; fi
 
 # --- 3. floor cadence ---------------------------------------------------------
 # Same rule SKILL.md states: every overdue entry is due; else standard/full
@@ -407,6 +414,21 @@ jq 'del(.journeys[1])' "$WORK/p1.json" > "$WORK/p3.json"
 expect 7-floor-needs-authority '.ok == false and (.error | test("floor"))' "$(publish "$WORK/p3.json" --expect-sha256 "$D2")"
 jq '.journeys[1].maxIntervalDays = 30' "$WORK/p1.json" > "$WORK/p4.json"
 expect 7-floor-weakened '.ok == false and (.error | test("floor"))' "$(publish "$WORK/p4.json" --expect-sha256 "$D2")"
+# The COMPLETE floor entry is protected, not just its claim: thinning the walk
+# keeps "proves" intact while testing less. A `_` note is not content, and a
+# non-floor journey is nobody's floor.
+for edit in '.journeys[1].steps = ["Request the other branch once."]' '.journeys[1].endState = "a response comes back"' \
+            '.journeys[1].seed = "whatever is there"' '.journeys[1].seats = ["qa-north"]' '.journeys[1].consumes = ["api/src/fines/list.ts"]'; do
+  jq "$edit" "$WORK/p1.json" > "$WORK/pf.json"
+  expect "7-floor-field: $edit" '.ok == false and (.error | test("floor"))' "$(publish "$WORK/pf.json" --expect-sha256 "$D2")"
+done
+jq '.journeys[1]._evidence = "walked 2026-09-09" | .journeys[0].steps += ["Check the receipt."] | .journeys[0].endState = "x"' "$WORK/p1.json" > "$WORK/pn.json"
+expect 7-note-and-non-floor-free '.ok == true and .floorAuthority == null' "$(publish "$WORK/pn.json" --expect-sha256 "$D2")"
+DN="$(sha256sum < "$LIVE" | cut -d' ' -f1)"
+jq '.journeys[1].steps = ["Request the other branch once."]' "$WORK/pn.json" > "$WORK/pf.json"
+expect 7-floor-field-with-authority '.ok == true' "$(publish "$WORK/pf.json" --expect-sha256 "$DN" --floor-authority "operator decision 2026-09-11")"
+DF="$(sha256sum < "$LIVE" | cut -d' ' -f1)"
+expect 7-restore-p1 '.ok == true' "$(publish "$WORK/p1.json" --expect-sha256 "$DF" --floor-authority "restore")"
 jq 'del(.journeys[2])' "$WORK/p1.json" > "$WORK/p5.json"
 expect 7-retire-ordinary '.ok == true and .journeyCount == 2' "$(publish "$WORK/p5.json" --expect-sha256 "$D2")"
 D3="$(sha256sum < "$LIVE" | cut -d' ' -f1)"
