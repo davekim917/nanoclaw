@@ -208,6 +208,7 @@
     "src/db/migrations/079-host-inbound-provenance.ts": 100,
     "src/db/migrations/080-choice-receipt-release-scope.ts": 100,
     "src/db/migrations/081-thread-key-anchors.ts": 100,
+    "src/db/migrations/082-mcp-oauth-integrations.ts": 100,
     "src/modules/mailbox/errors.ts": 100,
     "src/modules/mailbox/host-inbound.ts": 96.9,
     "src/modules/mailbox/index.ts": 92.26,
