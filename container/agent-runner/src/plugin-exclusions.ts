@@ -64,9 +64,10 @@
  * check and can then never match anything. That is not a harmless typo:
  * `"codex"` with a trailing NUL or lone surrogate lands in the top-level
  * exclusion set, fails to match the real `codex` directory, and the plugin
- * mounts — and with `codexHostAuth` the host's Codex OAuth mount is admitted
- * with it. A credential-withholding exclusion silently turned into credential
- * delivery is exactly the fail-open this validator exists to prevent.
+ * mounts — and the host's Codex OAuth mount is admitted with it, since that
+ * mount rides on the plugin. A credential-withholding exclusion silently
+ * turned into credential delivery is exactly the fail-open this validator
+ * exists to prevent.
  *
  * Backslash, newline and DEL stay allowed, and the distinction is the whole
  * point: those are legal bytes in a real Linux directory name, so refusing them

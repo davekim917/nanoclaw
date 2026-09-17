@@ -30,7 +30,8 @@
  * `bun`, or `codex` child process.
  *
  * No-ops when:
- *   - the codex auth mount is absent (operator chose `codexHostAuth: false`)
+ *   - the codex auth mount is absent (the group withholds the `codex` plugin,
+ *     which is the only thing that mount now rides on)
  *   - we're already inside a Codex-provider session (Codex's own writer
  *     handles `~/.codex/config.toml` directly)
  */

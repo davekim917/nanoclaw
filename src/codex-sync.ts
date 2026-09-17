@@ -388,11 +388,16 @@ function syncOneCodexAgentsDir(target: string, sources: DiscoveredSubagent[]): O
  * - the global `~/.codex/agents/` (the HOST codex CLI's roster);
  * - `~/.codex-<folder>/agents/` for every per-group sibling dir that has an
  *   `auth.json` (host-CLI convenience for scoped logins);
- * - `groups/<folder>/.codex/agents/` for every group that runs codex — as
- *   provider (provider=codex) or as peer (codexHostAuth=true). This is the
- *   GROUP-OWNED dir containers actually read: the codex provider mounts it
- *   RO at /home/node/.codex/agents, and codex-companion-setup symlinks it
- *   into the peer runtime home. There is no host-dir fallback.
+ * - `groups/<folder>/.codex/agents/` for EVERY group. Codex host auth is no
+ *   longer a per-group grant, so every group can run codex — as its provider
+ *   or as a peer — and every group needs the roster. This is the GROUP-OWNED
+ *   dir containers actually read: the codex provider mounts it RO at
+ *   /home/node/.codex/agents, and codex-companion-setup symlinks it into the
+ *   peer runtime home. There is no host-dir fallback.
+ *
+ *   A readable `container.json` is still what makes a directory a group. The
+ *   filter it used to carry (provider=codex or codexHostAuth=true) is gone;
+ *   the existence check is not.
  */
 export function discoverCodexAgentTargets(groupsDir: string = GROUPS_DIR): string[] {
   const home = os.homedir();
@@ -424,11 +429,7 @@ export function discoverCodexAgentTargets(groupsDir: string = GROUPS_DIR): strin
     if (!entry.isDirectory()) continue;
     const configPath = path.join(groupsDir, entry.name, 'container.json');
     try {
-      const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as {
-        provider?: string;
-        codexHostAuth?: boolean;
-      };
-      if (parsed.provider !== 'codex' && parsed.codexHostAuth !== true) continue;
+      JSON.parse(fs.readFileSync(configPath, 'utf-8'));
     } catch {
       continue;
     }

@@ -41,8 +41,16 @@ export const SIBLING_BOUND_FIELDS: ReadonlySet<string> = new Set([
   'gitIdentity',
   // Provider-bound (the reason siblings exist)
   'provider',
-  'codexHostAuth',
   'codexAuthFallbacks',
+  // RETIRED KEY, deliberately still ignored. `codexHostAuth` no longer exists
+  // in the schema (the Codex host-auth mount is unconditional) and
+  // `materializeContainerConfig` drops it, but this comparison reads the RAW
+  // container.json (`src/cli/resources/groups.ts:954-960`) and today's files
+  // disagree on it (most claude/codex groups carry `true`, opencode siblings
+  // omit it, one group carries an explicit `false`). Dropping the entry
+  // would make parity-check report drift on a value nothing reads. Remove it
+  // once the key is gone from `groups/*/container.json`.
+  'codexHostAuth',
   // Operator-tunable runtime
   'model',
   'effort',

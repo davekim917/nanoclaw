@@ -155,6 +155,7 @@ import {
   type VolumeMount,
 } from './providers/provider-container-registry.js';
 import { buildContainerCodexConfig } from './providers/codex.js';
+import { OPENCODE_XDG_ENV, stageOpenCodeAuth } from './providers/opencode.js';
 import { getSessionClaudeMounts } from './session-claude-mounts.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { assertHostOwnedInboundDb, hostInboundMounts, migrateInboundDbToHostDir } from './modules/mailbox/index.js';
@@ -5088,8 +5089,8 @@ export async function buildMounts(
     // a segment past NAME_MAX — and each fix was one more item on a list with no
     // end, because "cannot name a file" is not enumerable from the string alone.
     // Every one of them lands the same way: the operator declares `codex`
-    // withheld, nothing matches, the plugin mounts, and with `codexHostAuth` the
-    // host's Codex OAuth session mounts with it.
+    // withheld, nothing matches, the plugin mounts, and the host's Codex OAuth
+    // session mounts with it.
     //
     // Here the question IS answerable, because here both sides are present. So
     // this is the rule that closes the class: every declared entry must equal an
@@ -5178,14 +5179,21 @@ export async function buildMounts(
       }
     }
 
-    // Host ~/.codex mount: opt-in via container.json `codexHostAuth: true`.
-    // RW because the Codex CLI rewrites auth.json on token refresh — RO
-    // breaks long-running sessions when access tokens expire. Token-theft
-    // risk is unchanged regardless of RO/RW (read access alone is enough),
-    // so the security improvement is the OPT-IN itself: pre-2026-05-03 the
-    // mount fired on every group that had the codex plugin available;
-    // now operators must explicitly grant Codex host auth per group.
-    if (containerConfig.codexHostAuth === true && !excluded.has('codex') && entries.includes('codex')) {
+    // Host ~/.codex mount: unconditional, so every container can drive
+    // `codex exec` headless with the fleet's own OAuth identity. RW because
+    // the Codex CLI rewrites auth.json on token refresh — RO breaks
+    // long-running sessions when access tokens expire. Token-theft risk is
+    // unchanged regardless of RO/RW (read access alone is enough).
+    //
+    // The withholding lever is `excludePlugins`, not a per-group auth flag: a
+    // group that must not reach Codex withholds the `codex` plugin and this
+    // mount goes with it — and the refusal above makes an exclusion that
+    // matches nothing fatal rather than silently fail-open. The
+    // `codexHostAuth: true` opt-in that gated this from 2026-05-03 is gone: the
+    // boundary it drew was PRESENCE, and the boundary that actually holds is
+    // SCOPE — a group's Codex identity is `~/.codex-<folder>` wherever one
+    // exists, resolved per group by `resolveCodexAuthDir` below.
+    if (!excluded.has('codex') && entries.includes('codex')) {
       const providerHasCodexMount = providerContribution.mounts?.some((m) => m.containerPath === '/home/node/.codex');
 
       // Primary host-codex mount fires only when the provider didn't
@@ -5264,6 +5272,31 @@ export async function buildMounts(
         }
       });
     }
+  }
+
+  // Host OpenCode credential, for every container that is not already an
+  // OpenCode session. Same staging the OpenCode provider does for its own auth
+  // step — one copy of that logic, called from both sides — so any agent can
+  // drive `opencode` headless with the fleet's own auth.json.
+  //
+  // AUTH ONLY. The provider also copies agent definitions, skills and carries
+  // opencode.db in this tree; those are provider session state, not a
+  // credential, and a Claude or Codex container has no use for them.
+  //
+  // NOT nested in the `~/plugins` block above: the Codex mount is there because
+  // it rides on the codex PLUGIN, and OpenCode has no plugin to ride on. The
+  // scope boundary is the same one the provider uses —
+  // `~/.local/share/opencode-<folder>/auth.json` where a group has its own
+  // account, the shared `~/.local/share/opencode/auth.json` otherwise.
+  if (provider !== 'opencode') {
+    mounts.push(
+      ...stageOpenCodeAuth(
+        sessionDir(agentGroup.id, session.id),
+        agentGroup.folder,
+        agentGroup.id,
+        process.env.HOME || os.homedir(),
+      ).mounts,
+    );
   }
 
   // Project source tree at /workspace/project (RO). Lets agents read the
@@ -6915,6 +6948,17 @@ async function buildContainerArgs(
   }
   for (const [key, value] of Object.entries(providerEnv)) {
     args.push('-e', `${key}=${value}`);
+  }
+
+  // The env half of the host OpenCode credential every non-OpenCode container
+  // carries (`buildMounts` stages the tree and mounts it). Same constant the
+  // OpenCode provider's own contribution spreads into its env above, which is
+  // why this is guarded on the same predicate — an OpenCode session would
+  // otherwise receive both copies.
+  if (provider !== 'opencode') {
+    for (const [key, value] of Object.entries(OPENCODE_XDG_ENV)) {
+      args.push('-e', `${key}=${value}`);
+    }
   }
 
   // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls

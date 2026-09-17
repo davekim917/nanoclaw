@@ -256,7 +256,7 @@ diff <(jq -S "$DEL" groups/${SOURCE_FOLDER}/container.json) \
 
 **Why `credentialFolder`**: container-runner's per-group credential lookups (LOOKER_*, DBT_*, GITHUB_TOKEN_*, RENDER_PG_*, GIT_AUTHOR_*, Snowflake, etc.) key on `<BASE>_<FOLDER_UPPER>`. Without this field a sibling folder like `example-retail-opencode` would look for `LOOKER_BASE_URL_EXAMPLE_RETAIL_OPENCODE`, which doesn't exist. `credentialFolder` redirects credential lookups to the source folder; identity-bound paths (container name, group dir mount, OpenCode auth dir) stay on the sibling's own folder.
 
-**Note: no `opencodeHostAuth` field** — the host-side opencode provider (`src/providers/opencode.ts`) always copies the per-group `auth.json` into the per-session XDG dir; there's no opt-in gate like `codexHostAuth`.
+**Note: no per-provider auth gate** — every container carries the Codex home and the OpenCode `auth.json` regardless of its provider (`src/container-runner.ts`, `stageOpenCodeAuth` in `src/providers/opencode.ts`). `codexHostAuth` is retired and ignored wherever it still appears on disk.
 
 ### 6a. Per-sibling OpenCode account
 

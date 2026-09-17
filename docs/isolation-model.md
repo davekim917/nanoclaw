@@ -9,7 +9,21 @@ one workgroup reads and edits the same canonical Markdown tree at
 surfaces; they are not memory stores. Use different workgroups whenever memory
 or archived conversation must not cross between agents.
 
-Credentials are scoped by agent group, not by shell: a group's container carries only its own ring, and its shell inherits it (`container/agent-runner/src/providers/secret-env.ts`).
+Agent credentials are not an isolation boundary, and were never a reliable one.
+Every container carries all three provider credentials whatever its own
+provider: the Claude ring as env, the host Codex home
+(`~/.codex-<folder>` where a group has its own, otherwise `~/.codex`) plus any
+`codexAuthFallbacks` homes, and the OpenCode `auth.json`
+(`~/.local/share/opencode-<folder>/auth.json`, otherwise the shared one) staged
+into a session-private XDG tree. So any agent can drive `claude -p`,
+`codex exec` or `opencode` headless with the fleet's own accounts.
+
+What *is* bounded is credential SCOPE, not presence — which account a group
+reaches, via the per-group ring and per-group home above — plus the one
+withholding lever, `excludePlugins: ["codex"]`, which withholds the Codex
+plugin and the credential that rides on it together. A per-group opt-in flag
+for Codex host auth (`codexHostAuth`) used to sit in front of the mount; it is
+gone, because presence was the wrong thing to gate.
 
 ## The Three Levels
 

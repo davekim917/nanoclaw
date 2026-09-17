@@ -255,7 +255,6 @@ jq --arg folder "${SIBLING_FOLDER}" --arg src "${SOURCE_FOLDER}" '
   | .agentGroupId = $folder
   | .credentialFolder = $src
   | .memory = { "enabled": true }
-  | .codexHostAuth = true
 ' groups/${SOURCE_FOLDER}/container.json > /tmp/cj-sibling.json && \
   mv /tmp/cj-sibling.json groups/${SIBLING_FOLDER}/container.json
 
@@ -472,7 +471,7 @@ Send a test @-mention in the sibling's channel: `@<sibling-bot-name> reply with 
 SDIR=$(ls -dt data/v2-sessions/${SIBLING_FOLDER}/sess-* 2>/dev/null | head -1)
 pnpm exec tsx scripts/q.ts "$SDIR/outbound.db" "SELECT content FROM messages_out ORDER BY rowid DESC LIMIT 1" \
   | grep -qiE "not authenticated|Invalid API key|401|Error:" \
-  && echo "❌ sibling returned an error — check codex auth (codexHostAuth) then 'ncl groups restart --id ${SIBLING_ID}'" \
+  && echo "❌ sibling returned an error — check codex auth then 'ncl groups restart --id ${SIBLING_ID}'" \
   || echo "✅ sibling produced a clean response — round-trip verified"
 ```
 
