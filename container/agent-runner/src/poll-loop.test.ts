@@ -3142,6 +3142,18 @@ describe('interim text — a <message> block written before a tool call', () => 
     expect(sentTexts()).toEqual(['head is 2c8cf18', 'and CI is green']);
   });
 
+  it('forgets interim deliveries at an empty result, so the next turn can say the same thing', async () => {
+    seedOrigin();
+    const block = '<message to="here">still running</message>';
+    await run([
+      { type: 'interim_text', text: block },
+      { type: 'result', text: null },
+      { type: 'result', text: block },
+    ]);
+
+    expect(sentTexts()).toEqual(['still running', 'still running']);
+  });
+
   it('leaves an unclosed block for the final text', async () => {
     seedOrigin();
     await run([

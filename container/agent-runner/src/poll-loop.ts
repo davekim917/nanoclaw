@@ -2346,6 +2346,11 @@ export async function processQuery(
         setProviderTurnExecuting(true);
       } else if (event.type === 'result') {
         sawResult = true; // the SDK produced output → any prior api_retry recovered
+        // Interim deliveries belong to the turn this result ends, whatever its
+        // text — an empty result must not leave them to eat the NEXT turn's
+        // identical block.
+        const interimThisTurn = [...deliveredInterimBlocks];
+        deliveredInterimBlocks.clear();
         // A turn that consumed none of the runner's prompts never answers a
         // task fire: the CLI's synthetic "Continue from where you left off."
         // turn on resuming an interrupted session, or a turn a background-task
@@ -2472,8 +2477,7 @@ export async function processQuery(
           // An agent that posted an update mid-turn often repeats it verbatim in
           // its final text; the person already has it.
           let finalText = event.text;
-          for (const block of deliveredInterimBlocks) finalText = finalText.split(block).join('');
-          deliveredInterimBlocks.clear();
+          for (const block of interimThisTurn) finalText = finalText.split(block).join('');
           const { sent, hasUnwrapped, taskBlocks } = await dispatchResultText(finalText, routing);
           const willRetryTaskBlocks = shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
           // With prompt ids a nudge's answer matches no fire, so only the id-less
