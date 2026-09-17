@@ -76,22 +76,19 @@ export function buildContainerCodexConfig(): string {
     'multi_agent = true',
     '',
     '[agents]',
-    // The GLOBAL default effort for every Codex subagent this container spawns.
-    // It used to be rendered from the bootstrap plugin's worker-policy file;
-    // that file and its vendored constant are gone, so the value is stated
-    // here — unchanged, so no container's subagent dispatch moves with this
-    // deletion. A native spawn's own `reasoning_effort` still overrides it per
-    // task, which is how a delegation asks for anything but this default — but
-    // a ROLE carrying `model_reasoning_effort` beats BOTH, because the role is
-    // applied AFTER the spawn argument and sets the effort unconditionally
-    // (codex-rs 0.154.0 core/src/tools/handlers/multi_agents/spawn.rs:97-107,
-    // core/src/agent/role.rs:191-193). `formatCodexAgentToml` writes that key
-    // for any agent `.md` with an `effort:` (src/claude-agent-md.ts), so the
-    // five delegation shims are exactly such roles.
+    // No `default_subagent_reasoning_effort` here, on purpose (operator,
+    // 2026-09-17, matching the host's own ~/.codex/config.toml): a Codex
+    // subagent runs at Codex's native default unless the spawn names a
+    // `reasoning_effort` or its ROLE carries `model_reasoning_effort` — the
+    // role is applied after the spawn argument and sets the effort
+    // unconditionally (codex-rs 0.154.0
+    // core/src/tools/handlers/multi_agents/spawn.rs:97-107,
+    // core/src/agent/role.rs:191-193), and `formatCodexAgentToml` writes that
+    // key for any agent `.md` with an `effort:` (src/claude-agent-md.ts), so
+    // the five `/orchestrate` shims each pin their own level.
     // Kept byte-identical with CONTAINER_CODEX_CONFIG_BASE in
     // container/agent-runner/src/codex-companion-setup.ts (parallel Bun tree,
     // no shared modules); src/provider-surfaces.test.ts proves the two agree.
-    'default_subagent_reasoning_effort = "high"',
     'max_concurrent_threads_per_session = 4',
     '',
     ...CONTAINER_TRUSTED_PROJECTS.flatMap((proj) => [`[projects."${proj}"]`, 'trust_level = "trusted"', '']),
