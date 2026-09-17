@@ -546,6 +546,83 @@ Give every check a stable ID. At minimum cover the applicable surfaces below:
 attached. Never call a run 100% complete when anything is blocked, skipped, or
 outside the stated scope.
 
+### Journeys — saved walks, matched to the change before any model wakes
+
+An install may keep a **journey catalogue**, `journeys.json`, beside its
+standing instructions (shape and a fictional example:
+`references/journeys.example.json`; check one with `smoke-journeys.py validate`).
+A journey is a saved plain-English walk — `id` (its lane id, for life), `title`,
+`proves`, `evidence` (`browser` | `api` | `native-manual`), `entryPath`,
+`steps[]`, `endState` (including persistence after reload where claimed),
+`seats`, `seed`, `restore`, `checkpoints[]` (screens captured *during* the walk)
+— plus `consumes[]`, globs over the **whole repo**, not just its frontend: the
+migration, route file or taxonomy table whose change makes this walk relevant.
+A worker walks a journey from the catalogue alone — nobody re-derives how to
+reach a screen — and a backend-only change selects the screens that consume it.
+
+For a freeze campaign the gate matches `campaignRange`'s file list against the
+catalogue and states the result once, as `journeys`, in `check` and the
+`pr_build_settled` wake — pinned, with a snapshot of the catalogue and its
+sha256, by the first settled poll, so neither a catalogue edit nor a recovery
+wake can change a run's contract. No catalogue: no `journeys` key, and none of
+this applies. At intake:
+
+1. `smoke-journeys.py pin-run <run-dir> <journeys.pinFile>` copies the pin and
+   the snapshot into `<run-dir>/journeys/`. Workers and siblings read journeys
+   from that run copy, never from a group's private live file.
+2. **Every `matchedJourneys[]` entry becomes a contract lane with the journey
+   id as its lane id** — `reason` says why it is there (`changed`, `floor`, or
+   `range-unknown`). An `evidence: api` journey is scaffolded `--evidence
+   <id>=api`; nothing else may be. `selection: "full"` (range unknown, or the
+   catalogue unusable — `reason` says which) selects every walkable journey,
+   and `unassessedNativeJourneys[]` go on the Untested line by name.
+3. **Every frozen `unmappedPaths[]` entry gets a scope disposition** in
+   `<run-dir>/journeys/scope-dispositions.json` — `{"dispositions":[{"paths":
+   [...], "disposition": ...}]}`, one rationale may cover related paths:
+   `mapped-to-journey` or `new-journey` (+ `journeyId`, which must be a lane),
+   `no-user-facing-consumer` (+ `changedBehaviour`, and `evidence[]` citing at
+   least one file saved in the run, normally the search below), or `unresolved`
+   (+ `reason`) — uncertainty terminates honestly rather than inventing an
+   answer. Adding a glob to the catalogue later does not erase the obligation.
+4. **Search the source even when globs matched.** For each changed backend
+   route, payload field, taxonomy id or feature flag, search the web and native
+   clients for the literal identifier and save the identifier, command and call
+   sites under the run. A broad glob (every migration → one journey) can hide a
+   second consumer. Hits suggest consumers; zero hits do not prove absence.
+5. **Preflight demonstrability and fixtures before dispatch**: deployed data and
+   flags (`PREVIEW-STALE`, below), seat capability, fixture availability.
+   Fixtures are allocated per run **and side** — `QA-<runId>-<side>-*` — so two
+   owners on one seat cannot collide, and are cleaned up after a failure too.
+   Every worker brief carries this sentence verbatim: "creating/deleting objects
+   named QA-<runId>-* inside the QA tenant with a QA seat is pre-authorized;
+   nothing else is."
+
+**`route: "native-manual"`** — a non-empty change claimed entirely by
+`native-manual` journeys — spends nothing on a web campaign: source and CI
+review, any overdue floor lane the gate listed, and one **manual packet** per
+journey: the actual app artifact and version, backend identity, scoped account
+and fixtures, the journey's steps and expected result, what to capture, the
+**named** tester, where the result is recorded, and the release boundary it
+gates. Issuing a packet is `completed`, never `pass`; `pass` needs the tester's
+recorded result under `<run-dir>/manual-results/`, filed against the journey id.
+
+`smoke-evidence-barrier.sh` enforces the **completeness** of all this — a lane
+per matched journey, a valid disposition per frozen path, the run's catalogue
+still hashing to its pin — and nothing about its truth. **Substance is the
+challenger's**: it `cmp`s `journeys/selection.json` against the gate's pin file,
+reviews every exclusion and every backend/data scope disposition, and samples
+the positive matches — a broad glob hides an omission as well as "no consumer".
+
+**Maintenance is reviewed, not append-only**: journeys are corrected, replaced
+and retired, with history in git. A first successful walk *qualifies* a new
+journey for promotion; it does not certify that its assertions test the claim.
+Owners and challengers propose changes as files in their run; **one publisher —
+the group's coordinator — applies them**: `SMOKE_LANE_ROLE=coordinator
+smoke-journeys.py publish <catalogue> <proposed> --expect-sha256 <digest the
+proposal was based on> --lock <state-dir>/control.lock` (schema and ids
+validated, stale digest refused, atomic replace). Deliberately absent: a runner,
+a step DSL, a replay cache, golden baselines, a dependency graph.
+
 ### The coverage floor — the part of the manifest the diff does not get a vote on
 
 The manifest above is derived from the diff, every lane in §3 scopes from this
@@ -566,37 +643,25 @@ runs at all.** A small declared set of journeys is exercised against the
 deployed build on a fixed cadence whether or not this campaign's diff came
 anywhere near them.
 
-**The floor list is deployment configuration, like every other concrete
-identity in this skill.** It lives in the deploying group's standing
-instructions beside the repo, environment, QA channel, run root, and credential
-locations — never here, because the journeys that matter belong to the
-deployment, not to the skill. What lives here is the contract the list must
-satisfy. Each floor entry declares six things, plus an optional seventh:
-
-| Field | What it must say |
-|---|---|
-| `id` | a stable lane id, unchanged for the life of the journey — staleness is computed on this key, so renaming it silently resets the clock |
-| `journey` | the ordered steps at a named grain, ending in an observable end state; written once here, never re-derived per campaign |
-| `proves` | the one claim the walk proves, phrased as "if this were broken, <which consequence below>" |
-| `seed` | the account, seat, tier, fixture, or data row the walk needs, and where it comes from |
-| `max_interval` | the longest this deployment tolerates going without this journey proven on a deployed build |
-| `restore` | how the walk's mutations are reverted, since it runs repeatedly against live-shaped data |
-| `evidence` (optional) | `api` when this entry's proof is an API contract by design — a guard that must not be exercised through the UI. Absent means the default: this entry proves itself with a browser journey and its pass marker must carry real screenshot/video evidence like any other floor lane. This is a per-entry declaration in the install's floor table, never a coordinator's after-the-fact call — inventing an exemption at run time is exactly the failure this field exists to prevent. |
-
-**A floor entry's `evidence: api` declaration in the standing instructions is
-inert until the coordinator carries it into the contract.** When scaffolding a
-`floor` lane for an entry declared `evidence: api`, pass that through to
-`smoke-run-scaffold.sh contract` with `--evidence <entry-id>=api` so the lane
-object in the contract itself says so:
+**A floor entry is a journey that carries `maxIntervalDays`** — the longest
+this deployment tolerates going without it proven on a deployed build. It is
+deployment data, never skill text. (An install that still keeps its floor as a
+table in its standing instructions reads the same fields from there.) Its `id`
+never changes: staleness is computed on that key, so renaming it silently
+resets the clock. Its `proves` is phrased "if this were broken, <which
+consequence below>". `evidence: api` means the proof is an API contract by
+design — a guard that must not be exercised through the UI. That is a catalogue
+declaration, never a coordinator's after-the-fact call, and it is inert until
+the contract carries it:
 
 ```bash
 bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh contract \
   <run-dir> <source-sha> <entry-id>:floor:'<title>' --evidence <entry-id>=api
 ```
 
-Omitting the flag for an entry the floor table marks `evidence: api` is a
-scaffolding bug, not a stricter run — the barrier below will refuse the pass
-marker for lacking browser evidence it was never going to have.
+Omit the flag and the barrier refuses the pass marker for lacking browser
+evidence it was never going to have; add it to a journey that is not `api` and
+the barrier refuses that too.
 
 **What earns a place on the floor — two questions, both answered with a
 citation rather than an adjective.**
@@ -629,59 +694,30 @@ anyone having to ask: name the consequence, name the watcher. If none of the
 five fit, it is ordinary changed-surface scope. If one fits and nothing watches
 it, it is floor-worthy but **not yet on the floor** — record it as a floor
 nomination in the run record, name it on the report, and do not start running
-it. Adding to the floor is a standing-instruction edit and therefore a human's
-call: a coordinator that can extend its own floor can also quietly shrink it.
+it. Changing the floor is a human's call — `publish` refuses one without
+`--floor-authority` — because a coordinator that can extend its own floor can
+also quietly shrink it.
 
-**Cadence: every standard or full campaign walks at least one floor entry,
-least-recently-passed first. A light campaign walks only entries already past
-their `max_interval`, usually none; standard and full campaigns and the
-install's scheduled sweep keep the floor fresh.** The flat option — walk the whole floor every campaign — was rejected on
-two grounds. At about three campaigns a day a five-entry floor becomes fifteen
-full browser journeys a day, which is exactly the re-derivation cost the skip
-rule below was written to remove; and a walk repeated ninety times a month
-without ever failing stops being walked carefully. A pure staleness budget with
-no per-campaign obligation was rejected too: it leaves the mechanism cold for
-days, and a mechanism nobody exercises is one nobody notices has broken. So,
-both, bounded:
+**Cadence is computed, not chosen.** Every entry past its `maxIntervalDays` is
+due, all of them — the ceiling is the deployment's own stated tolerance. If none
+is overdue, a standard or full campaign still owes the single
+least-recently-proven entry, and a light campaign owes nothing: walking the
+whole floor every campaign makes a walk nobody performs carefully, and a pure
+staleness budget leaves the mechanism cold for days. "Last proven" is read off
+the run root, not a ledger: the newest `pass` marker carrying the lane id, and
+only one that carries proof — browser media, or a run whose contract declared
+that lane `evidence: api`. The gate reports the answer as `journeys.floor`, and
+anyone can recompute it for any moment:
 
-- **Every standard or full campaign declares at least one lane of kind `floor`
-  in the contract, one lane per entry it walks, with the entry's `id` as the
-  lane id. Never zero** — not on a backend-only diff, not on a one-line
-  change, not on a campaign that found nothing. A light campaign's contract
-  may carry zero floor lanes, but only when no entry was actually overdue as
-  of that campaign's own timestamp — recomputable after the fact with the
-  same `jq` query below, so "light, so none" is never taken on faith.
-- **Which entries are due is computed, not chosen.** Every entry past its
-  `max_interval` is due, all of them, however many that is — the ceiling is the
-  deployment's own stated tolerance and nothing overrides it. If none are
-  overdue, the single least-recently-passed entry is due. A coordinator does not
-  get to pick the convenient one.
-- **"Last passed" is read off the run root, not off a ledger.** An entry's last
-  exercise is the newest `pass` marker carrying its lane id, anywhere under the
-  run root — but only a marker that actually carries proof counts: a `pass`
-  marker whose evidence is browser media, or one whose run declared this entry
-  `evidence: api` in its contract, at the time that run happened. A `pass` with
-  neither is not evidence of anything and must not reset the clock (see the
-  barrier rule below). Markers are already durable, already SHA-bound, and
-  already survive media retention, so this needs no new artifact and cannot be
-  asserted without leaving one:
+```bash
+python3 /app/skills/smoke-test/scripts/smoke-journeys.py floor-due \
+  <catalogue> <run-root> [--size light] [--as-of <run timestamp>]
+```
 
-  ```bash
-  for marker in <run-root>/*/markers/<entry-id>.json; do
-    [ -f "$marker" ] || continue
-    [ "$(jq -r '.status' "$marker")" = pass ] || continue
-    contract="$(dirname "$(dirname "$marker")")/completion-contract.json"
-    has_media="$(jq -r '[(.evidence // [])[] |
-      select(test("\\.(png|jpg|jpeg|webp|gif|mp4|webm)$"; "i"))] | length > 0' "$marker")"
-    is_api="$(jq -r --arg id "<entry-id>" \
-      '[.lanes[]? | select(.id == $id) | (.evidence == "api")][0] // false' \
-      "$contract" 2>/dev/null)"
-    { [ "$has_media" = true ] || [ "$is_api" = true ]; } && jq -r '.completedAt' "$marker"
-  done | sort | tail -1
-  ```
-
-At one entry per campaign a five-entry floor comes fully around every day or
-two. Against a measured once in seventy-four runs, that closes the whole gap.
+**Each due entry is one contract lane of kind `floor`, with the entry's `id` as
+the lane id. A standard or full campaign never declares zero** — not on a
+backend-only diff, not on a one-line change, not on a campaign that found
+nothing.
 
 **The skip rule below does not apply to floor entries, and this is not an
 exemption carved out of it.** That rule lets a browser check go unwritten when
@@ -745,43 +781,22 @@ because it is the same failure wearing a different name:
 
 **Checkable after the fact**, from a finished run's artifacts alone:
 
-- **The contract carries at least one lane of kind `floor`, unless it is a
-  light campaign with nothing overdue.** A non-light contract with none is a
-  campaign that ran with no floor at all, visible in one `jq` before any
-  evidence is read. A light contract with none is legitimate only when the
-  least-recently-passed query above, recomputed as of that run's timestamp,
-  also shows zero entries past `max_interval` — the same recomputation the
-  "Selection is recomputable" check below already runs.
-- **Every floor lane has a terminal marker.** The synthesis barrier enforced
-  that to publish, so a published run structurally has one; a missing or `void`
-  marker beside a published verdict means the barrier was bypassed.
-- **Each entry walked carries its own screenshot evidence on the frozen SHA**,
-  named in the marker's evidence list — the same bar as any other browser
-  lane, unless the contract declares that entry `evidence: api`. The barrier
-  enforces this directly: `smoke-evidence-barrier.sh` refuses readiness when a
-  `floor` lane's `pass` marker names no media file (png/jpg/jpeg/webp/gif/mp4/
-  webm) that exists under the run root, unless the lane's own contract entry
-  carries `evidence: "api"` — set only by `smoke-run-scaffold.sh contract
-  --evidence <lane-id>=api` at scaffold time, never inferred from the marker
-  or asserted after the fact. A published run with a floor `pass` and no
-  qualifying evidence means this check did not run, not that the entry was
-  legitimately API-only.
-- **Selection is recomputable.** Re-run the least-recently-passed query above as
-  of that run's timestamp. A run that walked a freshly-passed entry while
-  another sat past its ceiling shows up as a mismatch between what was due and
-  what the contract declared.
-- **The cross-run sweep is the one that matters.** For every declared entry,
-  find its newest passing floor marker anywhere under the run root. Any entry
-  whose newest is older than its `max_interval`, or that has none at all, is a
-  live coverage breach no matter how many green runs sit on top of it. That
-  single sweep is what surfaces a money-adjacent flow tested once in
-  seventy-four campaigns in the week it goes stale, rather than a year later.
-- **Post count is unchanged.** A floor lane is a browser lane, so the posting
-  contract's "one reply per browser lane whose evidence became durable" already
-  accounts for it. The floor earns no extra messages.
+- **`floor-due --as-of` the run's timestamp equals the contract's `floor`
+  lanes.** A non-light contract with none ran with no floor at all; a run that
+  walked a fresh entry while another sat past its ceiling shows as a mismatch.
+- **Every floor lane has a terminal marker, and every floor `pass` names browser
+  media that exists under the run root** unless its contract entry carries
+  `evidence: "api"` — the barrier enforces both, so a published run without them
+  means the barrier was bypassed, not that the entry was legitimately API-only.
+- **The cross-run sweep is the one that matters.** `floor-due` as of now: any
+  entry overdue, or never proven, is a live coverage breach no matter how many
+  green runs sit on top of it. That is what surfaces a money-adjacent flow
+  tested once in seventy-four campaigns in the week it goes stale.
+- **Post count is unchanged.** A floor lane is a browser lane; the posting
+  contract already accounts for it.
 
-**A deployment that has declared no floor still says so out loud.** Standing
-instructions with no floor list mean the coordinator cannot compute a due entry;
+**A deployment that has declared no floor still says so out loud.** No floor
+journeys (and no floor table) mean the coordinator cannot compute a due entry;
 record `floor undeclared` on the run record, name it on the report's Untested
 line, and cap the run at `PASS_WITH_GAPS`. Do not invent a floor from the
 product — inventing one is the coordinator picking its own floor, which the
@@ -1005,8 +1020,11 @@ markers elsewhere in this file applies here too, and the flag is optional
 
 ### Contact sheet
 
-At kickoff, once previews are live, capture every diff-touched screen at
-desktop and phone width into one labelled image:
+At kickoff, once previews are live, capture the selected journeys' screens at
+desktop and phone width into one labelled image. `smoke-journeys.py shots
+<run-dir>` prints the matched journeys' `captureRecipes` (`name`, `path`,
+click/wait `steps`) as `shots.json`; a journey's English steps are never fed to
+the capture script.
 `smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> <source-sha>`
 — pass the campaign's frozen `sourceSha` as the fourth argument so
 `manifest.json`'s `buildSha` records the SHA you already froze on rather
@@ -1152,10 +1170,10 @@ line. That is a real environment gap worth fixing, not a per-claim excuse.
 
 **`claim absent` is cross-checked against the diff, never taken on the PR's
 word.** The cheapest compliant PR body is one that states nothing, and nothing
-used to notice. Before recording `claim absent`, check whether the diff touched
-user-facing surface (the frontend path prefixes this deployment already
-configures for deploy-lag scoping are the same prefixes that matter here, plus
-any template, copy, or served-payload change). If it did:
+used to notice. Before recording `claim absent`, check whether the change has a
+user-facing consumer: any `changed` journey in the run's pinned selection, any
+scope disposition other than `no-user-facing-consumer`, or — with no catalogue —
+any frontend, template, copy, or served-payload path in the diff. If it does:
 
 - `claim absent` is still the honest verdict for THIS lane — the lane reports
   what the PR stated, and it must not invent claims (see anti-ceremony below).
@@ -1196,10 +1214,10 @@ any template, copy, or served-payload change). If it did:
 - **Every `not demonstrable` row carries a `blocked by:` naming a concrete
   missing thing, plus an artifact.** A row with neither, or with a `blocked by:`
   that only restates the verdict ("could not verify"), is an unaudited skip.
-- **Every `claim absent` result on a diff that touched user-facing paths
+- **Every `claim absent` result on a change with a user-facing consumer
   carries the `(unstated user-facing change: …)` note and a matching widening
-  of the UI adversary's manifest scope.** A bare `claim absent` next to a diff
-  full of frontend paths is the failure this cross-check exists to surface.
+  of the UI adversary's manifest scope.** A bare `claim absent` next to matched
+  journeys is the failure this cross-check exists to surface.
 - **Row count against a reread.** Compare the claim table against a manual
   reread of the frozen intent files: a claim present in the text but missing
   from the table is a silently dropped claim, and the lane failed at extraction
@@ -1866,7 +1884,7 @@ change must include a real-browser frontend lane even when the diff looks
 backend-only. Changed surface decides what a campaign runs *extra*; the
 coverage floor (§2) runs in every standard or full campaign regardless of the
 diff, including this one — a light campaign walks only whatever is already
-past its `max_interval` (§2), usually nothing. Run `full` for a
+past its `maxIntervalDays` (§2), usually nothing. Run `full` for a
 release candidate, a manually named feature, a high-risk label, or a scheduled
 nightly/weekly sweep. This preserves continuous coverage without paying for idle
 turns or rerunning an unchanged build.
@@ -2084,8 +2102,9 @@ target**, and the gate states it once, in the facts (`check`) and the
 `determinable:false` (no validated GO, target behind/diverged from the
 baseline, a malformed or ≥300-file comparison, a failed fetch) means the range
 is **unknown**: `campaignSize` is `full` and `reason` says why. It does not
-block the campaign. **Quote this range** — for route/consumer selection, the
-manifest, and any range shown to a human — never one re-derived by hand.
+block the campaign. **Quote this range** — for the manifest and any range shown
+to a human — never one re-derived by hand. Journey selection (§2) already
+consumes it and nothing else; an unknown range selects `full`, never nothing.
 
 #### Freeze intake: read the bound preview's deploy log first
 

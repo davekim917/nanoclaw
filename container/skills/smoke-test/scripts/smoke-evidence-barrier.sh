@@ -508,6 +508,27 @@ while IFS= read -r marker; do
   fi
 done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 
+# JOURNEY SELECTION. A run that pinned the gate's journey selection
+# (journeys/selection.json, written only by `smoke-journeys.py pin-run`) owes
+# two things the lane loop above cannot see: a contract lane for every matched
+# journey — whose terminal marker that loop then demands — and a scope
+# disposition for every frozen unmapped path. COMPLETENESS ONLY, the same
+# bargain as confirmedFindings: a disposition's presence proves bookkeeping,
+# and whether it is TRUE is the challenger's question. A run with no pinned
+# selection is unaffected; an unreadable answer fails closed.
+if [ -e "$RUN_DIR/journeys/selection.json" ]; then
+  journeys_result="$(python3 "$SCRIPT_DIR/smoke-journeys.py" barrier "$RUN_DIR" 2>/dev/null)" || journeys_result=""
+  if ! jq -e '(.missing | type == "array") and (.invalid | type == "array") and (.invalidReasons | type == "array")' \
+       <<<"$journeys_result" >/dev/null 2>&1; then
+    INVALID+=("journeys/selection.json")
+    INVALID_REASONS+=("journeys/selection.json: the journey completeness check could not run")
+  else
+    while IFS= read -r item; do MISSING+=("$item"); done < <(jq -r '.missing[] | select(length > 0)' <<<"$journeys_result")
+    while IFS= read -r item; do INVALID+=("$item"); done < <(jq -r '.invalid[] | select(length > 0)' <<<"$journeys_result")
+    while IFS= read -r item; do INVALID_REASONS+=("$item"); done < <(jq -r '.invalidReasons[] | select(length > 0)' <<<"$journeys_result")
+  fi
+fi
+
 if [ "$PHASE" = "synthesis" ]; then
   for required in coordinator/preliminary.md challenger/disposition.md; do
     if [ ! -s "$RUN_DIR/$required" ]; then

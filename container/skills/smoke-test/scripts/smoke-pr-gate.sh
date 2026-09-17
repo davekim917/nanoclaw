@@ -144,6 +144,12 @@ SIZING_RULES="${SMOKE_SIZING_RULES:-/workspace/agent/campaign-sizing.json}"
 # not /workspace/agent/) exercises the real classifier, not a stand-in.
 SIZING_CLASSIFIER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIZING_CLASSIFIER="$SIZING_CLASSIFIER_DIR/campaign-size-classify.py"
+# Journey catalogue (smoke-journeys.py): the install's saved QA journeys and
+# the repo paths each one consumes. Install data, like the sizing rules — an
+# ABSENT file means the install never adopted one and every output of this
+# gate is byte-identical to a gate that has never heard of journeys.
+JOURNEYS_CATALOGUE="${SMOKE_JOURNEYS_CATALOGUE:-/workspace/agent/journeys.json}"
+JOURNEYS_TOOL="$SIZING_CLASSIFIER_DIR/smoke-journeys.py"
 
 mkdir -p "$STATE_DIR"
 
@@ -1718,6 +1724,35 @@ campaign_size_classify() {
   printf '%s' "$out"
 }
 
+# Prints the freeze campaign's journey selection (one JSON object), or `null`
+# when the install has no catalogue. Consumes ONLY campaignRange's file list —
+# the same both-sides-of-a-rename list sizing reads — so selection can never
+# be computed off a different range than the one the campaign quotes. An
+# undeterminable range is `selection:"full"`, never an empty match. The
+# selection is pinned on the first SETTLED poll and read back verbatim from
+# then on (a recovery wake, or a catalogue edited mid-campaign, cannot change
+# a run's contract); `check` never pins, same as the baseline. A matcher that
+# crashes fails closed to `full`, same direction as the sizing classifier.
+journeys_select() {
+  local pr="$1" head_sha="$2" settled="$3" determinable="$4" fail_reason="$5" files_json="${6:-[]}" size="$7"
+  local out
+  local -a args
+  [ -e "$JOURNEYS_CATALOGUE" ] || [ -L "$JOURNEYS_CATALOGUE" ] || { printf 'null'; return 0; }
+  args=(--catalogue "$JOURNEYS_CATALOGUE" --state-dir "$STATE_DIR" --pin-key "pr-$pr-$head_sha"
+        --size "$size" --run-root "${SMOKE_GATE_RUN_ROOT:-}")
+  [ "$determinable" = true ] || args+=(--unknown "range not determinable: $fail_reason")
+  if [ "$COMMAND" = poll ] && [ "$settled" = true ]; then args+=(--pin); fi
+  if ! out="$(printf '%s' "$files_json" | timeout 20 python3 "$JOURNEYS_TOOL" match "${args[@]}" 2>/dev/null)" ||
+     ! jq -e 'type == "object" and (.selection | type == "string") and (.matchedJourneys | type == "array")' \
+       <<<"$out" >/dev/null 2>&1; then
+    jq -cn '{schemaVersion:1, selection:"full", reason:"journey matcher failed", route:"web",
+             catalogueValid:false, catalogueSha256:null, matchedJourneys:[], unmappedPaths:[],
+             excludedPaths:[], unassessedNativeJourneys:[], pinned:false, pinFile:null, catalogueSnapshot:null}'
+    return 0
+  fi
+  printf '%s' "$out"
+}
+
 # --- Freeze-campaign baseline ------------------------------------------------
 # A freeze PR's target sits ON the tracked branch (smoke-freeze-pr.sh parents
 # the marker commit on a SHA of SMOKE_GATE_BRANCH), so `compare/$BRANCH...target`
@@ -2181,6 +2216,12 @@ evaluate_pr() {
     settled=true
   fi
 
+  local journeys_json=null
+  if [ "$is_freeze" = true ]; then
+    journeys_json="$(journeys_select "$pr" "$head_sha" "$settled" "$size_determinable" \
+      "$size_fail_reason" "$size_files_json" "$campaign_size")"
+  fi
+
   jq -cn \
     --argjson pr "$pr" --arg headSha "$head_sha" \
     --argjson fetchOk "$fetch_ok" \
@@ -2204,6 +2245,7 @@ evaluate_pr() {
     --argjson previewAmbiguous "$preview_ambiguous" --arg previewAmbiguityReason "$preview_ambiguity_text" \
     --argjson frontendEvidenceGap "$frontend_evidence_gap" \
     --argjson campaignRange "$campaign_range_json" --argjson migrationsInRange "$migrations_in_range" \
+    --argjson journeys "$journeys_json" \
     '({
       pr: $pr, headSha: $headSha, fetchOk: $fetchOk,
       migrationsTouched: $migrationsTouched, frontendTouched: $frontendTouched,
@@ -2254,7 +2296,9 @@ evaluate_pr() {
       # range a human is shown quote it, never a range re-derived elsewhere.
       # migrationsInRange is null — never [] — whenever determinable is false.
       campaignRange: $campaignRange, migrationsInRange: $migrationsInRange
-    } else {} end))'
+    } else {} end)
+    # Present only when the install has a journey catalogue (journeys_select).
+    + (if $journeys != null then {journeys: $journeys} else {} end))'
 }
 
 # Minimal freeze-PR detection for `finish` only — NOT evaluate_pr, which does
@@ -4629,7 +4673,8 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
       recovery:$recovery,
       abandonedActiveSha:(if $abandoned == "" or $abandoned == "null" then null else $abandoned end)
     } + (if $facts.isFreezePr == true then
-      {campaignRange:$facts.campaignRange, migrationsInRange:$facts.migrationsInRange} else {} end))}'
+      {campaignRange:$facts.campaignRange, migrationsInRange:$facts.migrationsInRange} else {} end)
+      + (if $facts.journeys != null then {journeys:$facts.journeys} else {} end))}'
   exit 0
 fi
 

@@ -1,0 +1,70 @@
+{
+  "_comment": "FICTIONAL example for a made-up 'Lantern Library' app (web + mobile monorepo). It documents the catalogue shape and is the test fixture for smoke-journeys.py. An install's real catalogue lives beside its standing instructions as journeys.json, never here.",
+  "schemaVersion": 1,
+  "excludePaths": [".github/**", "docs/**", "**/*.md"],
+  "journeys": [
+    {
+      "id": "loan-desk-checkout",
+      "title": "Check a book out at the loan desk",
+      "proves": "a librarian can lend an available copy and the loan survives a reload",
+      "evidence": "browser",
+      "entryPath": "/desk",
+      "steps": [
+        "Sign in as the librarian seat and open the loan desk.",
+        "Search for the seeded title and pick the copy marked available.",
+        "Choose the seeded borrower, pick a loan period from the period menu, and confirm.",
+        "Reload the page and open the borrower's card."
+      ],
+      "endState": "the borrower's card lists the loan with the chosen period after a reload, and the copy shows as on loan",
+      "seats": ["qa-librarian"],
+      "seed": "one available copy titled QA-<runId>-<side>-atlas and one borrower QA-<runId>-<side>-reader, created by the walk",
+      "restore": "return the copy, then delete the QA-<runId>-<side>-* title and borrower",
+      "consumes": [
+        "web/src/desk/**",
+        "api/src/loans/**",
+        "api/migrations/*loan_period*"
+      ],
+      "checkpoints": ["desk with the copy selected", "period menu open", "borrower card after reload"],
+      "captureRecipes": [
+        { "name": "desk", "path": "/desk" },
+        { "name": "desk-periods", "path": "/desk", "steps": ["click text=Loan period", "wait 500"] }
+      ]
+    },
+    {
+      "id": "branch-scope-crossing",
+      "title": "A branch librarian cannot read another branch's fines",
+      "proves": "if this were broken, one branch would read another branch's borrower fines",
+      "evidence": "api",
+      "entryPath": "GET /api/fines?branch=<other>",
+      "steps": [
+        "With the north-branch seat's token, request the south branch's fines list.",
+        "With the south-branch seat's token, request the north branch's fines list."
+      ],
+      "endState": "both requests are refused with 403 and return no fine rows",
+      "seats": ["qa-north", "qa-south"],
+      "seed": "none, reads only",
+      "restore": "none, reads only",
+      "consumes": ["api/src/fines/**", "api/src/auth/**"],
+      "maxIntervalDays": 2,
+      "checkpoints": []
+    },
+    {
+      "id": "mobile-scan-return",
+      "title": "Return a book by scanning it in the mobile app",
+      "proves": "a borrower can return a loan from the phone camera flow",
+      "evidence": "native-manual",
+      "entryPath": "Mobile app, Loans tab",
+      "steps": [
+        "Open the Loans tab and tap Return on the seeded loan.",
+        "Scan the barcode printed in the packet.",
+        "Confirm the return."
+      ],
+      "endState": "the loan leaves the Loans tab and the web desk shows the copy as available",
+      "seats": ["qa-reader"],
+      "seed": "one open loan for the qa-reader seat on a copy named QA-<runId>-<side>-scan",
+      "restore": "delete the QA-<runId>-<side>-scan copy",
+      "consumes": ["mobile/**"],
+      "checkpoints": ["scanner open", "return confirmation"]
+    }
+  ]
+}

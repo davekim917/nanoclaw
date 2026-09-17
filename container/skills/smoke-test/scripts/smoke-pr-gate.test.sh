@@ -287,7 +287,7 @@ reset_stubs() {
         STUB_FRONTEND_HTML_EXIT STUB_FRONTEND_HTML STUB_BUNDLE_EXIT STUB_BUNDLE_JS \
         STUB_WAIT_CLOCK_FILE STUB_WAIT_CLOCK_COUNT STUB_WAIT_SLEEP_LOG \
         SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER \
-        SMOKE_GATE_OWNER SMOKE_GATE_LEASE_TTL_SECONDS 2>/dev/null || true
+        SMOKE_GATE_OWNER SMOKE_GATE_LEASE_TTL_SECONDS SMOKE_JOURNEYS_CATALOGUE 2>/dev/null || true
 }
 
 fresh_state() {
@@ -944,7 +944,96 @@ bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.campaig
   .data.campaignRange.determinable == false' >/dev/null
 seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-late GO "$BASE_SHA" "$(sha b)" 5
 range_case 5j-unknown-pinned "$UNKNOWN_RANGE"' and .campaignRange.baselineSha == null and .campaignRange.baselinePinned == true'
-unset -f range_case
+
+# --- 5k. Journey selection rides campaignRange (smoke-journeys.py) ----------
+# The catalogue is the fictional example under references/. Selection consumes
+# ONLY the baseline...target file list, is absent when the install has no
+# catalogue, and is pinned by the first settled poll.
+JOURNEYS_EXAMPLE="$SCRIPT_DIR/../references/journeys.example.json"
+journeys_fixture() { # <compare-files-json>; one ready freeze (PR 13) with a validated baseline
+  fresh_state
+  export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+    SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+  export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+  seed_ledger_receipt "$SMOKE_GATE_HANDOFF_LEDGER" run-go-base GO "$BASE_SHA" "$(sha b)" 5
+  freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
+  export STUB_COMPARE_FILES="$1"
+  cp "$JOURNEYS_EXAMPLE" "$STATE_DIR/journeys.json"
+  export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/journeys.json"
+}
+BACKEND_ONLY='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/migrations/0042_loan_period_options.sql"},{"filename":"api/src/reports/export.ts"},{"filename":"docs/changelog.md"}]}'
+
+# No catalogue: byte-identical. Env unset (default path absent) and env naming
+# an absent file give the same bytes, with no `journeys` key; and adopting a
+# catalogue ADDS that one key and changes nothing else.
+journeys_fixture "$BACKEND_ONLY"
+unset SMOKE_JOURNEYS_CATALOGUE
+T5K_UNSET="$(bash "$GATE" check 13)"
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/no-such-journeys.json"
+T5K_ABSENT="$(bash "$GATE" check 13)"
+[ "$T5K_UNSET" = "$T5K_ABSENT" ] || { echo "5k: an absent catalogue changed the facts" >&2; exit 1; }
+jq -e 'has("journeys") | not' <<<"$T5K_ABSENT" >/dev/null || { echo "5k: journeys key without a catalogue: $T5K_ABSENT" >&2; exit 1; }
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/journeys.json"
+T5K_WITH="$(bash "$GATE" check 13)"
+[ "$(jq -c 'del(.journeys)' <<<"$T5K_WITH")" = "$T5K_ABSENT" ] ||
+  { echo "5k: a catalogue changed facts other than .journeys" >&2; exit 1; }
+
+# A BACKEND-ONLY change selects its unchanged UI consumer up front; the path
+# nothing claims is listed; the infra exclusion is visible. `check` never pins.
+jq -e '.journeys.selection == "matched" and .journeys.route == "web" and .journeys.pinned == false and
+  [.journeys.matchedJourneys[] | select(.reason == "changed") | .id] == ["loan-desk-checkout"] and
+  .journeys.matchedJourneys[0].evidence == "browser" and
+  .journeys.unmappedPaths == ["api/src/reports/export.ts"] and
+  .journeys.excludedPaths == [{"path":"docs/changelog.md","glob":"docs/**"}]' <<<"$T5K_WITH" >/dev/null ||
+  { echo "5k: backend-only selection wrong: $T5K_WITH" >&2; exit 1; }
+[ ! -e "$STATE_DIR/journeys" ] || { echo "5k: check pinned a selection" >&2; exit 1; }
+
+# The settled poll pins it and the wake carries it, with the catalogue snapshot.
+T5K_POLL="$(bash "$GATE" poll)"
+jq -e '.data.trigger == "pr_build_settled" and .data.journeys.pinned == true and
+  .data.journeys.unmappedPaths == ["api/src/reports/export.ts"] and
+  (.data.journeys.catalogueSha256 | test("^[0-9a-f]{64}$"))' <<<"$T5K_POLL" >/dev/null ||
+  { echo "5k: wake payload carries no pinned selection: $T5K_POLL" >&2; exit 1; }
+T5K_SNAPSHOT="$(jq -r '.data.journeys.catalogueSnapshot' <<<"$T5K_POLL")"
+[ "$(sha256sum < "$T5K_SNAPSHOT" | cut -d' ' -f1)" = "$(jq -r '.data.journeys.catalogueSha256' <<<"$T5K_POLL")" ]
+# FROZEN: a glob added afterwards claims the path in the live catalogue, and
+# the campaign still owes the explanation it was opened with.
+jq '.journeys[0].consumes += ["api/src/reports/**"]' "$JOURNEYS_EXAMPLE" > "$STATE_DIR/journeys.json"
+range_case 5k-frozen '.journeys.pinned == true and .journeys.unmappedPaths == ["api/src/reports/export.ts"]'
+[ "$(bash "$GATE" check 13 | jq -c '.journeys')" = "$(jq -c '.data.journeys' <<<"$T5K_POLL")" ] ||
+  { echo "5k: the pinned selection moved after a catalogue edit" >&2; exit 1; }
+
+# NATIVE-ONLY: a non-empty scope claimed entirely by native-manual journeys
+# routes to the manual packet. One stray path keeps it a web campaign.
+journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"mobile/src/scan.tsx"},{"filename":"docs/mobile.md"}]}'
+range_case 5k-native '.journeys.route == "native-manual" and .journeys.unmappedPaths == [] and
+  [.journeys.matchedJourneys[].id] == ["mobile-scan-return"]'
+journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"mobile/src/scan.tsx"},{"filename":"api/src/reports/export.ts"}]}'
+range_case 5k-native-mixed '.journeys.route == "web" and .journeys.unmappedPaths == ["api/src/reports/export.ts"]'
+# A RENAME counts on both sides: a file moved out of a consumed area still selects it.
+journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/shared/period.ts","previous_filename":"api/src/loans/period.ts","status":"renamed"}]}'
+range_case 5k-rename '[.journeys.matchedJourneys[].id] == ["loan-desk-checkout"] and
+  .journeys.unmappedPaths == ["api/src/shared/period.ts"]'
+
+# UNKNOWN range is "full", never an empty match.
+journeys_fixture "$BACKEND_ONLY"
+rm -f "$SMOKE_GATE_HANDOFF_LEDGER"
+range_case 5k-unknown '.campaignRange.determinable == false and .journeys.selection == "full" and
+  (.journeys.reason | test("range not determinable")) and .journeys.route == "web" and
+  [.journeys.matchedJourneys[] | select(.reason == "range-unknown") | .id] == ["loan-desk-checkout","branch-scope-crossing"] and
+  .journeys.unassessedNativeJourneys == ["mobile-scan-return"]'
+# A catalogue that is present but broken is `full` with the reason, not silence.
+journeys_fixture "$BACKEND_ONLY"
+printf '{"schemaVersion":1,"journeys":"nope"}' > "$STATE_DIR/journeys.json"
+range_case 5k-broken '.journeys.selection == "full" and .journeys.catalogueValid == false and
+  (.journeys.reason | test("unusable"))'
+# An ordinary PR has no campaignRange, so it gets no selection either.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_PR_FILES='[{"filename":"api/src/loans/period.ts"}]'
+bash "$GATE" check 13 | jq -e '.isFreezePr == false and (has("journeys") | not)' >/dev/null ||
+  { echo "5k: an ordinary PR grew a journeys key" >&2; exit 1; }
+unset SMOKE_JOURNEYS_CATALOGUE
+unset -f range_case journeys_fixture
 
 # --- 6. Migrations refusal: never settles; one throttled alarm wake --------
 fresh_state
