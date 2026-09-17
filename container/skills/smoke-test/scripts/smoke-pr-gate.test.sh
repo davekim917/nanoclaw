@@ -1482,29 +1482,67 @@ range_case 5k-pinned-paths '.campaignRange.baselinePinned == true and .journeys.
   [.journeys.matchedJourneys[] | select(.reason == "changed") | .id] == ["loan-desk-checkout"] and
   .journeys.unmappedPaths == ["api/src/reports/export.ts"]'
 
-# INVALID IS NOT ABSENT: anything at the pin's path that is not a well-formed
-# pin means the selection is unrecoverable — `full`, said why, still OFFERED,
-# and never recomputed over, replaced or written through.
-for T5K_KIND in truncated dangling directory; do
+# INVALID IS NOT ABSENT, and RECOVERY IS THE GATE'S. Anything at the primary
+# pin's path that the one predicate refuses — truncated, a symlink, a
+# directory, or well-formed-looking bytes with no identity or snapshot — means
+# its scope is unrecoverable. The gate then computes a recovery selection
+# (every catalogue journey owed, the pinned range's unclaimed paths kept) and
+# promotes it ONCE as a second immutable shared file; the bad primary is never
+# recomputed over, replaced or written through.
+rpin_file() { printf '%s' "$(jpin_file "$1" "$2" | sed 's/\.json$/-recovery.json/')"; }
+T5K_ALL_RECOVERED='[.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"pin-recovered"},{"id":"branch-scope-crossing","reason":"pin-recovered"},{"id":"mobile-scan-return","reason":"pin-recovered"}]'
+for T5K_KIND in truncated dangling directory shape-only; do
   journeys_fixture "$BACKEND_ONLY"
   mkdir -p "$SMOKE_GATE_LEASE_DIR"
   case "$T5K_KIND" in
-    truncated) printf '{"schemaVersion":1,"selec' > "$(jpin_file 13 "$FREEZE_SHA")" ;;
-    dangling)  ln -s "$STATE_DIR/nowhere.json" "$(jpin_file 13 "$FREEZE_SHA")" ;;
-    directory) mkdir "$(jpin_file 13 "$FREEZE_SHA")" ;;
+    truncated)  printf '{"schemaVersion":1,"selec' > "$(jpin_file 13 "$FREEZE_SHA")" ;;
+    dangling)   ln -s "$STATE_DIR/nowhere.json" "$(jpin_file 13 "$FREEZE_SHA")" ;;
+    directory)  mkdir "$(jpin_file 13 "$FREEZE_SHA")" ;;
+    shape-only) printf '{"pinned":true,"matchedJourneys":[],"unmappedPaths":[]}' > "$(jpin_file 13 "$FREEZE_SHA")" ;;
   esac
-  range_case "5k-invalid-$T5K_KIND" '.journeys.pinState == "invalid" and .journeys.selection == "full" and
-    (.journeys.reason | test("cannot be recovered")) and .journeys.pinFile == null and
-    .journeys.invalidPinFile == "'"$(jpin_file 13 "$FREEZE_SHA")"'"'
-  bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and
-    .data.journeys.pinState == "invalid" and .data.journeys.selection == "full"' >/dev/null ||
-    { echo "5k: an invalid journeys pin ($T5K_KIND) made the freeze unofferable" >&2; exit 1; }
+  range_case "5k-invalid-$T5K_KIND" '.journeys.pinState == "recovery-absent" and .journeys.selection == "full" and
+    .journeys.recovery == true and .journeys.pinned == false and (.journeys | '"$T5K_ALL_RECOVERED"') and
+    .journeys.unmappedPaths == ["api/src/reports/export.ts"]'
+  [ ! -e "$(rpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: check wrote a recovery pin" >&2; exit 1; }
+  T5K_REC="$(bash "$GATE" poll)"
+  jq -e --arg f "$(rpin_file 13 "$FREEZE_SHA")" '.wakeAgent == true and .data.trigger == "pr_build_settled" and
+    .data.journeys.pinState == "recovered" and .data.journeys.pinned == true and .data.journeys.pinFile == $f and
+    (.data.journeys | '"$T5K_ALL_RECOVERED"')' <<<"$T5K_REC" >/dev/null ||
+    { echo "5k: an invalid primary pin ($T5K_KIND) was not recovered by the gate: ${T5K_REC:0:600}" >&2; exit 1; }
+  [ "$(jq -c '.data.journeys' <<<"$T5K_REC")" = "$(jq -c . "$(rpin_file 13 "$FREEZE_SHA")")" ]
   case "$T5K_KIND" in
-    truncated) [ "$(cat "$(jpin_file 13 "$FREEZE_SHA")")" = '{"schemaVersion":1,"selec' ] ;;
-    dangling)  [ -L "$(jpin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$STATE_DIR/nowhere.json" ] ;;
-    directory) [ -d "$(jpin_file 13 "$FREEZE_SHA")" ] ;;
+    truncated)  [ "$(cat "$(jpin_file 13 "$FREEZE_SHA")")" = '{"schemaVersion":1,"selec' ] ;;
+    dangling)   [ -L "$(jpin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$STATE_DIR/nowhere.json" ] ;;
+    directory)  [ -d "$(jpin_file 13 "$FREEZE_SHA")" ] ;;
+    shape-only) [ "$(cat "$(jpin_file 13 "$FREEZE_SHA")")" = '{"pinned":true,"matchedJourneys":[],"unmappedPaths":[]}' ] ;;
   esac
+  # Promoted once, immutable, shared: a catalogue edit, a re-poll and a second
+  # coordinator with another state dir all read the same recovery pin.
+  T5K_REC_SUM="$(sha256sum < "$(rpin_file 13 "$FREEZE_SHA")")"
+  jq 'del(.journeys[2])' "$JOURNEYS_EXAMPLE" > "$STATE_DIR/journeys.json"
+  bash "$GATE" poll >/dev/null
+  [ "$(sha256sum < "$(rpin_file 13 "$FREEZE_SHA")")" = "$T5K_REC_SUM" ]
+  T5K_OTHER="$(mktemp -d)"
+  [ "$(SMOKE_GATE_STATE_DIR="$T5K_OTHER" SMOKE_GATE_HANDOFF_LEDGER="$T5K_OTHER/none.jsonl" \
+       SMOKE_JOURNEYS_CATALOGUE="$T5K_OTHER/none.json" bash "$GATE" check 13 | jq -c '.journeys')" = \
+    "$(jq -c '.data.journeys' <<<"$T5K_REC")" ] ||
+    { echo "5k: a second coordinator did not read the shared recovery pin" >&2; exit 1; }
+  rm -rf "$T5K_OTHER"
 done
+# BOTH pins invalid: nothing can say what the run owes, so the head is NOT
+# offered, and stderr names both files.
+journeys_fixture "$BACKEND_ONLY"
+mkdir -p "$SMOKE_GATE_LEASE_DIR"
+printf '{"pinned":tr' > "$(jpin_file 13 "$FREEZE_SHA")"
+printf '{"pinned":true,"matchedJourneys":[],"unmappedPaths":[]}' > "$(rpin_file 13 "$FREEZE_SHA")"
+range_case 5k-both-invalid '.journeys.pinState == "invalid" and .journeys.selection == "full" and .journeys.matchedJourneys == [] and
+  (.journeys.reason | test("neither journeys pin for this head is valid"))'
+T5K_BOTH_ERR="$STATE_DIR/both.err"
+bash "$GATE" poll 2>"$T5K_BOTH_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
+  { echo "5k: a head with no valid journeys pin was offered" >&2; exit 1; }
+grep -q "not offered: neither journeys pin for this head is valid: $(jpin_file 13 "$FREEZE_SHA") .*$(rpin_file 13 "$FREEZE_SHA")" "$T5K_BOTH_ERR" ||
+  { echo "5k: both-invalid was silent: $(cat "$T5K_BOTH_ERR")" >&2; exit 1; }
+unset -f rpin_file
 
 # Range-sized selections never travel in argv: 5,200 changed paths nobody
 # claims (>200 KB of unmappedPaths) still pin, wake and read back.
@@ -1559,7 +1597,7 @@ unset SMOKE_GATE_RUN_ROOT
 journeys_fixture "$BACKEND_ONLY"
 cat > "$STUB_BIN/python3" <<'STUB'
 #!/usr/bin/env bash
-case " $* " in *smoke-journeys.py*)
+case " $* " in *"smoke-journeys.py match "*)
   if [ -n "${STUB_JOURNEYS_OUT:-}" ]; then cat >/dev/null; printf '%s' "$STUB_JOURNEYS_OUT"; exit 0; fi
   [ -z "${STUB_JOURNEYS_FAIL:-}" ] || exit 70 ;;
 esac
@@ -1581,11 +1619,12 @@ bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.journey
 # directly — a matcher that exits 0 with a well-shaped `full` naming nothing —
 # and it is refused at the same seam: no pin, not offered, says why.
 journeys_fixture "$BACKEND_ONLY"
-export STUB_JOURNEYS_FAIL=1 STUB_JOURNEYS_OUT='{"schemaVersion":1,"selection":"full","reason":"hand-fed","route":"web","catalogueValid":false,"catalogueSha256":null,"matchedJourneys":[],"unmappedPaths":[],"excludedPaths":[],"unassessedNativeJourneys":[]}'
-range_case 5k-empty-full-refused '.journeys.selection == "full" and (.journeys.reason | test("names no journey \\(hand-fed\\)"))'
+export STUB_JOURNEYS_FAIL=1 STUB_JOURNEYS_OUT='{"schemaVersion":1,"selection":"full","reason":"hand-fed","route":"web","recovery":false,"catalogueValid":true,"catalogueSha256":"0000000000000000000000000000000000000000000000000000000000000000","matchedJourneys":[],"unmappedPaths":[],"excludedPaths":[],"unassessedNativeJourneys":[]}'
+range_case 5k-empty-full-refused '.journeys.selection == "full" and .journeys.pinState == "absent" and
+  (.journeys.reason | test("not pinnable: it is `full` but names no journey \\(hand-fed\\)"))'
 bash "$GATE" poll 2>"$T5K_FAIL_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
   { echo "5k: a hand-fed empty full selection was offered" >&2; exit 1; }
-grep -q 'could not be pinned (the selection is `full` but names no journey' "$T5K_FAIL_ERR"
+grep -q 'could not be pinned (the computed selection is not pinnable: it is `full` but names no journey' "$T5K_FAIL_ERR"
 [ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: an empty full selection was pinned" >&2; exit 1; }
 unset STUB_JOURNEYS_FAIL STUB_JOURNEYS_OUT
 rm -f "$STUB_BIN/python3"

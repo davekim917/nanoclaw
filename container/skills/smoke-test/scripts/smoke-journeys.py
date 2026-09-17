@@ -12,9 +12,10 @@ wakes, WHICH journeys a change selects and which changed paths nothing claims.
             [--size light|standard|full] [--run-root <dir>] [--as-of <iso>]
             (changed paths: JSON array on stdin, never argv)
   floor-due <catalogue> <run-root> [--size ...] [--as-of <iso>]
-  pin-run   <run-dir> <gate-pin-file> [--catalogue <live catalogue>]   (needed only to rebuild after an INVALID pin)
+  pin-run   <run-dir> <gate-pin-file>
+  pin-check <pin-file> [--pr <n> --head <sha> --repo-slug <slug>] [--as-path <final path>] | --candidate (stdin)
   shots     <run-dir>
-  barrier   <run-dir> [--gate-pin <the ONE pin this campaign owns>]
+  barrier   <run-dir> [--gate-pin <the ONE primary pin this campaign owns> --pr <n> --head <sha>]
   publish   <catalogue> <proposed> --expect-sha256 <hex|absent> --lock <file>
             [--floor-authority <citation>]
 
@@ -272,30 +273,62 @@ def _read_json(path):
         return None
 
 
-def last_proven(run_root, journey_id):
-    """Newest completedAt of a `pass` marker for this lane id that carries
-    proof: browser media, or a run whose own contract declared the lane
-    evidence:"api". A pass with neither never resets the clock."""
-    newest = None
+def lane_problems(run_dir, contract, jid, evidence, is_floor, files_must_exist=True):
+    """Everything a journey-backed lane owes -- ONE rule, used by the barrier
+    (matched and disposition-linked lanes) and by floor cadence, so a pass the
+    barrier would refuse can never reset a clock. Returns [(artifact, why)].
+      floor journey   => lane kind `floor`;
+      api             => the catalogue grants the exemption and the contract
+                         carries it -- both ways, nothing else may;
+      browser         => a `pass` names browser media;
+      native-manual   => a `pass` names the tester's result under
+                         manual-results/ -- issuing the packet is `completed`.
+    `files_must_exist` is the barrier's bar (the run is live). Cadence reads old
+    runs whose media retention may have pruned, so it asks only what was cited."""
+    sel_rel, marker_rel = "journeys/selection.json", "markers/{}.json".format(jid)
+    lane = next((l for l in (contract.get("lanes") or []) if isinstance(l, dict) and l.get("id") == jid), {})
+    out = []
+    if is_floor and lane.get("kind") != "floor":
+        out.append((sel_rel, "journey {} is a floor journey but its lane is kind {!r}; scaffold it `{}:floor:<title>`".format(jid, lane.get("kind"), jid)))
+    declared = lane.get("evidence")
+    if declared == "api" and evidence != "api":
+        out.append((sel_rel, "lane {} is scaffolded --evidence api but its journey declares evidence {}".format(jid, evidence)))
+    elif evidence == "api" and declared != "api":
+        out.append((sel_rel, "journey {} declares evidence api but its lane was not scaffolded `--evidence {}=api`; regenerate the contract with it".format(jid, jid)))
+    marker = _read_json(os.path.join(run_dir, marker_rel))
+    if isinstance(marker, dict) and marker.get("status") == "pass":
+        cited = [e for e in (marker.get("evidence") or []) if isinstance(e, str)]
+        there = (lambda e: _run_file_ok(run_dir, e)) if files_must_exist else (lambda e: True)
+        if evidence == "browser" and not any(MEDIA_RE.search(e) and there(e) for e in cited):
+            out.append((marker_rel, "a browser journey passes only on browser media (png/jpg/jpeg/webp/gif/mp4/webm) in the run"))
+        if evidence == "native-manual" and not any(e.startswith("manual-results/") and there(e) for e in cited):
+            out.append((marker_rel, "a native-manual journey passes only on the named tester's recorded result under manual-results/ -- issuing the packet is `completed`, not `pass`"))
+    return out
+
+
+def last_proven(run_root, journey):
+    """Newest completedAt of a `pass` that PROVED this floor journey: the
+    marker belongs to its run's contract (declared lane, same sourceSha and
+    generation), and the lane satisfies lane_problems for the journey's
+    DECLARED evidence and floor kind. A text-only pass on a browser journey
+    mis-scaffolded as api proves nothing and resets nothing."""
+    jid, newest = journey["id"], None
     try:
         runs = sorted(os.listdir(run_root))
     except OSError:
         return None
     for run in runs:
-        marker = _read_json(os.path.join(run_root, run, "markers", journey_id + ".json"))
-        if not isinstance(marker, dict) or marker.get("status") != "pass":
+        run_dir = os.path.join(run_root, run)
+        marker = _read_json(os.path.join(run_dir, "markers", jid + ".json"))
+        contract = _read_json(os.path.join(run_dir, "completion-contract.json"))
+        if not isinstance(marker, dict) or marker.get("status") != "pass" or not isinstance(contract, dict):
             continue
-        evidence = marker.get("evidence") or []
-        has_media = any(isinstance(e, str) and MEDIA_RE.search(e) for e in evidence)
-        if not has_media:
-            contract = _read_json(os.path.join(run_root, run, "completion-contract.json"))
-            lanes = contract.get("lanes") if isinstance(contract, dict) else None
-            is_api = any(
-                isinstance(l, dict) and l.get("id") == journey_id and l.get("evidence") == "api"
-                for l in (lanes or [])
-            )
-            if not is_api:
-                continue
+        lane = next((l for l in (contract.get("lanes") or []) if isinstance(l, dict) and l.get("id") == jid), None)
+        if lane is None or marker.get("sourceSha") != contract.get("sourceSha") \
+                or marker.get("lane", jid) != jid or marker.get("generation", 1) != lane.get("generation", 1):
+            continue
+        if lane_problems(run_dir, contract, jid, journey["evidence"], True, files_must_exist=False):
+            continue
         done = _parse_iso(marker.get("completedAt"))
         if done is not None and (newest is None or done > newest):
             newest = done
@@ -317,7 +350,7 @@ def floor_due(cat, run_root, size, as_of):
                 "entries": [{"id": j["id"], "lastProvenAt": None, "overdue": True} for j in floor]}
     entries = []
     for j in floor:
-        proven = last_proven(run_root, j["id"])
+        proven = last_proven(run_root, j)
         overdue = proven is None or (as_of - proven).total_seconds() > j["maxIntervalDays"] * 86400
         entries.append({"id": j["id"], "lastProvenAt": proven.strftime("%Y-%m-%dT%H:%M:%SZ") if proven else None, "overdue": overdue})
     due = [e["id"] for e in entries if e["overdue"]]
@@ -328,7 +361,7 @@ def floor_due(cat, run_root, size, as_of):
 
 # --- match ------------------------------------------------------------------
 
-def compute_selection(cat, digest, paths, unknown_reason, size, run_root, as_of):
+def compute_selection(cat, digest, paths, unknown_reason, size, run_root, as_of, recover=False):
     journeys = cat["journeys"]
     exclude_reasons = dict(_exclude_entries(cat))
     exclude_rules = _globs.compile_rule_list(list(exclude_reasons))
@@ -359,7 +392,7 @@ def compute_selection(cat, digest, paths, unknown_reason, size, run_root, as_of)
         unknown_reason is None and bool(scope) and not unmapped
         and all(by_id[i]["evidence"] == "native-manual" for i in hits)
     )
-    route = "native-manual" if native_only else "web"
+    route = "native-manual" if native_only and not recover else "web"
 
     # A native-manual campaign spends nothing on the web build it did not
     # change, so it owes the floor what a light campaign does: overdue only.
@@ -368,14 +401,19 @@ def compute_selection(cat, digest, paths, unknown_reason, size, run_root, as_of)
     matched, unassessed_native = [], []
     for j in journeys:
         jid = j["id"]
-        if unknown_reason is not None:
+        if recover:
+            # The primary pin is unreadable, so what it owed is unknown: the
+            # recovery pin owes every journey the catalogue holds.
+            reason = "pin-recovered"
+        elif unknown_reason is not None:
             # An unknown range selects everything that can be walked. Native
             # journeys need a named human tester, so they are listed for the
-            # report instead of being turned into lanes nobody asked for.
-            if j["evidence"] == "native-manual":
+            # report instead of being turned into lanes nobody asked for --
+            # EXCEPT a due floor journey: cadence is owed whatever the range.
+            if j["evidence"] == "native-manual" and jid not in floor["due"]:
                 unassessed_native.append(jid)
                 continue
-            reason = "range-unknown"
+            reason = "floor" if j["evidence"] == "native-manual" else "range-unknown"
         elif jid in hits:
             reason = "changed"
         elif jid in floor["due"]:
@@ -391,8 +429,10 @@ def compute_selection(cat, digest, paths, unknown_reason, size, run_root, as_of)
 
     return {
         "schemaVersion": SCHEMA_VERSION,
-        "selection": "full" if unknown_reason is not None else "matched",
-        "reason": unknown_reason,
+        "selection": "full" if (unknown_reason is not None or recover) else "matched",
+        "reason": ("recovered: this head's primary journeys pin is invalid, so every catalogue journey is owed"
+                   + ("; " + unknown_reason if unknown_reason else "")) if recover else unknown_reason,
+        "recovery": recover,
         "route": route,
         "catalogueValid": True,
         "catalogueSha256": digest,
@@ -451,7 +491,7 @@ def cmd_match(args):
         # writes, so this only ever follows a hand edit.
         print(json.dumps({"ok": False, "error": "journey catalogue is unusable: " + "; ".join(errors[:3])}), file=sys.stderr)
         sys.exit(1)
-    selection = compute_selection(cat, digest, paths, unknown, args.size, args.run_root, as_of)
+    selection = compute_selection(cat, digest, paths, unknown, args.size, args.run_root, as_of, args.recover)
     selection.update({"pinned": False, "pinFile": None, "catalogueSnapshot": None})
     if args.snapshot_out and raw is not None:
         with open(args.snapshot_out, "wb") as fh:
@@ -466,84 +506,136 @@ def _run_paths(run_dir):
     return base, os.path.join(base, "selection.json"), os.path.join(base, "catalogue.json")
 
 
-def read_gate_pin(pin_path):
-    """(raw, invalid_reason) for whatever sits at a campaign's pin path. Same
-    reading as the gate's: a symlink, a non-file, unreadable or malformed bytes
-    are INVALID -- which is a state of its own, never "no pin"."""
-    if os.path.islink(pin_path):
-        return None, "a symlink"
-    if not os.path.isfile(pin_path):
-        return None, "not a regular file"
+# --- the ONE pin predicate ---------------------------------------------------
+# The run never authors what it is held to; only the gate does, in immutable
+# shared files -- and the gate (journeys_select, journeys_pin_promote), pin-run
+# and the barrier all judge a pin HERE. Shape alone is not validity: the bytes
+# {"pinned":true,"matchedJourneys":[],"unmappedPaths":[]} are invalid everywhere.
+
+HEX64, HEX40 = re.compile(r"^[0-9a-f]{64}$"), re.compile(r"^[0-9a-f]{40}$")
+
+
+def selection_problem(sel):
+    """Why this object is not a complete, pinnable selection, or None."""
+    if not isinstance(sel, dict) or sel.get("schemaVersion") != SCHEMA_VERSION:
+        return "not a schemaVersion {} selection".format(SCHEMA_VERSION)
+    if sel.get("selection") not in ("matched", "full") or sel.get("route") not in ("web", "native-manual"):
+        return "selection/route is missing or unknown"
+    if sel.get("catalogueValid") is not True or not isinstance(sel.get("catalogueSha256"), str) \
+            or not HEX64.match(sel["catalogueSha256"]):
+        return "it was not computed from a valid, hashed catalogue"
+    if not isinstance(sel.get("recovery"), bool):
+        return "recovery flag is missing"
+    for key in ("unmappedPaths", "unassessedNativeJourneys"):
+        if not isinstance(sel.get(key), list) or not all(isinstance(x, str) for x in sel[key]):
+            return "{} must be a list of strings".format(key)
+    matched = sel.get("matchedJourneys")
+    if not isinstance(matched, list) or not isinstance(sel.get("excludedPaths"), list):
+        return "matchedJourneys/excludedPaths must be lists"
+    for m in matched:
+        if not isinstance(m, dict) or not isinstance(m.get("id"), str) or not ID_RE.match(m["id"]) \
+                or not _is_text(m.get("reason")) or m.get("evidence") not in EVIDENCE_KINDS \
+                or not isinstance(m.get("floor"), bool):
+            return "a matchedJourneys entry is malformed"
+    # `full` means "walk everything": one that names nothing is the absence of
+    # a selection, and pinned it would switch journey obligations off.
+    if sel["selection"] == "full" and not matched and not sel["unassessedNativeJourneys"]:
+        return "it is `full` but names no journey ({})".format(sel.get("reason") or "no reason given")
+    return None
+
+
+def pin_name(slug, pr, head, recovery):
+    return "journeys-pin-{}-pr-{}-{}{}.json".format(slug, pr, head, "-recovery" if recovery else "")
+
+
+def check_pin(path, pr=None, head=None, slug=None, as_path=None):
+    """(state, reason, pin, raw, catalogue) for a journeys pin file; state is
+    absent | invalid | valid. Valid means: a regular file; a complete pinnable
+    selection; pinned for the repo/PR/head its own FILE NAME says (and the ones
+    the caller expects); and its content-addressed catalogue snapshot, beside
+    it, is a regular file that hashes to catalogueSha256, validates, and
+    declares the evidence/floor the pin claims for every journey it names.
+    `as_path` judges a not-yet-linked temp file as if it sat at its final path."""
+    final = as_path or path
+    if not os.path.lexists(path):
+        return "absent", None, None, None, None
+    if os.path.islink(path) or not os.path.isfile(path):
+        return "invalid", "a symlink or not a regular file", None, None, None
     try:
-        with open(pin_path, "rb") as fh:
+        with open(path, "rb") as fh:
             raw = fh.read()
-        if json.loads(raw.decode("utf-8")).get("pinned") is True:
-            return raw, None
-    except (OSError, ValueError, UnicodeDecodeError, AttributeError):
-        pass
-    return None, "unreadable, truncated or malformed"
+        pin = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return "invalid", "unreadable, truncated or malformed", None, None, None
+    problem = selection_problem(pin)
+    if problem is None and (pin.get("pinned") is not True or not isinstance(pin.get("headSha"), str)
+                            or not HEX40.match(pin["headSha"]) or isinstance(pin.get("pr"), bool)
+                            or not isinstance(pin.get("pr"), int) or not _is_text(pin.get("repoSlug"))):
+        problem = "it carries no pinned repo/PR/head identity"
+    if problem is None and os.path.basename(final) != pin_name(pin["repoSlug"], pin["pr"], pin["headSha"], pin["recovery"]):
+        problem = "its contents are pinned for another repo/PR/head (or pin kind) than its file name"
+    if problem is None:
+        for label, want, got in (("PR", pr, pin["pr"]), ("head", head, pin["headSha"]), ("repo", slug, pin["repoSlug"])):
+            if want is not None and str(want) != str(got):
+                problem = "it is pinned for {} {}, not {}".format(label, got, want)
+    cat = None
+    if problem is None:
+        snapshot = os.path.join(os.path.dirname(os.path.abspath(final)), "journeys-catalogue-{}.json".format(pin["catalogueSha256"]))
+        if os.path.basename(str(pin.get("catalogueSnapshot"))) != os.path.basename(snapshot):
+            problem = "catalogueSnapshot does not name its content-addressed snapshot"
+        elif os.path.islink(snapshot) or not os.path.isfile(snapshot):
+            problem = "its catalogue snapshot {} is missing or not a regular file".format(snapshot)
+        else:
+            cat, digest, _, errors = load_catalogue(snapshot)
+            if digest != pin["catalogueSha256"]:
+                problem, cat = "its catalogue snapshot does not hash to catalogueSha256", None
+            elif cat is None:
+                problem = "its catalogue snapshot is not a valid catalogue: {}".format("; ".join(errors[:2]))
+    if problem is None:
+        declared = {j["id"]: (j["evidence"], j.get("maxIntervalDays") is not None) for j in cat["journeys"]}
+        for m in pin["matchedJourneys"]:
+            if declared.get(m["id"]) != (m["evidence"], m["floor"]):
+                problem = "journey {} is not in its catalogue snapshot with that evidence/floor".format(m["id"])
+        if problem is None and pin["recovery"] and {m["id"] for m in pin["matchedJourneys"]} != set(declared):
+            problem = "a recovery pin must name every journey in its catalogue snapshot"
+    if problem is not None:
+        return "invalid", problem, None, None, None
+    return "valid", None, pin, raw, cat
 
 
-def rebuilt_selection(pin_path, why, cat, digest):
-    """What a run adopts when its campaign's pin is invalid. The pinned scope
-    is unrecoverable, so the run owes EVERY journey in the live catalogue, and
-    says the changed paths are unknown in one explicit disposition."""
-    return {
-        "schemaVersion": SCHEMA_VERSION, "selection": "full", "rebuilt": True,
-        "reason": "rebuilt: the gate's journeys pin {} is {}, so the scope it pinned cannot be recovered".format(pin_path, why),
-        "invalidPin": {"path": pin_path, "reason": why},
-        "route": "web", "catalogueValid": True, "catalogueSha256": digest,
-        "matchedJourneys": [{"id": j["id"], "reason": "scope-rebuilt", "evidence": j["evidence"],
-                             "floor": j.get("maxIntervalDays") is not None,
-                             "matchedPathCount": 0, "matchedPaths": []} for j in cat["journeys"]],
-        "unmappedPaths": [], "excludedPaths": [], "unassessedNativeJourneys": [], "pinned": False,
-    }
+def cmd_pin_check(args):
+    if args.candidate:
+        try:
+            problem = selection_problem(json.load(sys.stdin))
+        except ValueError:
+            problem = "not JSON"
+        emit({"state": "invalid" if problem else "valid", "reason": problem})
+    state, reason, pin, _, _ = check_pin(args.pin_file, args.pr, args.head, args.repo_slug, args.as_path or None)
+    emit({"state": state, "reason": reason, "pin": pin})
 
 
 def cmd_pin_run(args):
+    """Adopt a GATE-authored pin into the run, byte for byte. Nothing else can
+    become a run's selection: not a copy of a pin's contents, not an invalid
+    pin, and never anything assembled on the run side."""
     base, selection_path, catalogue_path = _run_paths(args.run_dir)
     if not os.path.isdir(args.run_dir):
         emit({"ok": False, "error": "run dir does not exist"}, 2)
-    if not os.path.lexists(args.pin_file):
-        emit({"ok": False, "error": "no gate pin at {} -- pass journeys.pinFile (or journeys.invalidPinFile) from the wake payload".format(args.pin_file)}, 1)
-    pin_raw, why = read_gate_pin(args.pin_file)
-    if pin_raw is None:
-        # An invalid pin never excuses the run: it adopts a REBUILT selection,
-        # from the live catalogue, which the barrier then enforces in full.
-        cat, digest, raw, errors = load_catalogue(args.catalogue) if args.catalogue else (None, None, None, ["pass --catalogue <live journeys.json>: this campaign's gate pin is {} and its selection must be rebuilt".format(why)])
-        if cat is None:
-            emit({"ok": False, "error": "cannot rebuild the selection", "errors": errors}, 1)
-        rebuilt_raw = json.dumps(rebuilt_selection(args.pin_file, why, cat, digest), separators=(",", ":")).encode("utf-8")
-        if os.path.exists(selection_path):
-            emit({"ok": False, "error": "this run already holds a selection; a run's journey contract is fixed once written"}, 1)
-        os.makedirs(base, exist_ok=True)
-        _write_atomic(catalogue_path, raw)
-        _write_atomic(selection_path, rebuilt_raw)
-        emit({"ok": True, "selection": selection_path, "catalogue": catalogue_path, "alreadyPinned": False, "rebuilt": True,
-              "next": "scaffold a lane per journey, and record one scope-rebuilt disposition in journeys/scope-dispositions.json"})
-    selection = json.loads(pin_raw.decode("utf-8"))
-    snapshot_raw = None
-    if selection.get("catalogueSnapshot"):
-        snapshot_raw = b""
-        try:
-            with open(selection["catalogueSnapshot"], "rb") as fh:
-                snapshot_raw = fh.read()
-        except OSError as exc:
-            emit({"ok": False, "error": "pinned catalogue snapshot could not be read: {}".format(exc)}, 1)
-        if sha256_bytes(snapshot_raw) != selection.get("catalogueSha256"):
-            emit({"ok": False, "error": "pinned catalogue snapshot does not hash to catalogueSha256"}, 1)
-    # Write-once, byte-for-byte: `cmp` against the gate's pin file is the
-    # challenger's whole check that nobody narrowed the scope on the way in.
+    state, reason, pin, pin_raw, _ = check_pin(args.pin_file)
+    if state != "valid":
+        emit({"ok": False, "error": "{} is not a valid gate pin ({}) -- pass journeys.pinFile from the wake payload exactly; when the primary pin is invalid the gate offers the campaign only with its recovery pin, and that is the pinFile it sends".format(args.pin_file, reason or "no file there")}, 1)
+    with open(os.path.join(os.path.dirname(os.path.abspath(args.pin_file)), os.path.basename(pin["catalogueSnapshot"])), "rb") as fh:
+        snapshot_raw = fh.read()
+    # Write-once, byte-for-byte.
     if os.path.exists(selection_path):
         with open(selection_path, "rb") as fh:
             if fh.read() != pin_raw:
                 emit({"ok": False, "error": "this run already pinned a different selection; a run's journey contract is fixed once written"}, 1)
-        emit({"ok": True, "selection": selection_path, "catalogue": catalogue_path if snapshot_raw else None, "alreadyPinned": True})
+        emit({"ok": True, "selection": selection_path, "catalogue": catalogue_path, "alreadyPinned": True})
     os.makedirs(base, exist_ok=True)
-    if snapshot_raw is not None:
-        _write_atomic(catalogue_path, snapshot_raw)
+    _write_atomic(catalogue_path, snapshot_raw)
     _write_atomic(selection_path, pin_raw)
-    emit({"ok": True, "selection": selection_path, "catalogue": catalogue_path if snapshot_raw else None, "alreadyPinned": False})
+    emit({"ok": True, "selection": selection_path, "catalogue": catalogue_path, "alreadyPinned": False})
 
 
 def cmd_shots(args):
@@ -595,115 +687,69 @@ def cmd_barrier(args):
             invalid.append(rel)
         reasons.append("{}: {}".format(rel, why))
 
-    # Whether this run owes a journey selection is the GATE's decision, not the
-    # run's bookkeeping. `--gate-pin` is the ONE path this campaign's pin lives
-    # at, and it is passed only when something is there. Valid: the run must
-    # hold those bytes. INVALID: never "no pin" -- the run must hold a REBUILT
-    # selection (pin-run writes it: every journey of the live catalogue), which
-    # everything below then enforces like any other.
-    pin_path = args.gate_pin
-    rebuilt_required = False
-    if pin_path:
-        gate_pin, why = read_gate_pin(pin_path)
-        try:
-            with open(selection_path, "rb") as fh:
-                run_raw = fh.read()
-        except OSError:
-            run_raw = None
-        run = _read_json(selection_path) if run_raw is not None else None
-        run = run if isinstance(run, dict) else {}
-        if gate_pin is None:
-            rebuilt_required = True
-            if run_raw is None:
-                bad(sel_rel, "this campaign's gate pin {} is {} -- that never switches journey checks off. Run `smoke-journeys.py pin-run {} {} --catalogue <live journeys.json>` to adopt a rebuilt selection (every journey in the catalogue), then scaffold a lane per journey".format(pin_path, why, run_dir, pin_path))
-            elif run.get("rebuilt") is not True or (run.get("invalidPin") or {}).get("path") != pin_path:
-                bad(sel_rel, "this campaign's gate pin {} is {}, so the run must hold the REBUILT selection pin-run writes for that pin, not this one".format(pin_path, why))
-        elif run_raw is None:
-            bad(sel_rel, "the gate pinned a journey selection for this campaign but the run never adopted it -- run `smoke-journeys.py pin-run {} {}`, then scaffold a lane per matched journey".format(run_dir, pin_path))
-        elif run_raw != gate_pin:
-            gate = json.loads(gate_pin.decode("utf-8"))
-            bad(sel_rel, "does not match this campaign's own gate pin {} (run adopted pinFile={} catalogueSha256={}; gate catalogueSha256={}) -- a run's journey contract is its OWN campaign's pin, byte for byte; re-run pin-run in a clean run dir".format(
-                pin_path, run.get("pinFile"), run.get("catalogueSha256"), gate.get("catalogueSha256")))
-        if invalid:
+    # Whether this run owes a journey selection, and WHAT it owes, are the
+    # gate's: `--gate-pin` is the one primary-pin path this campaign owns (passed
+    # only when something is there). The owning pin is the primary if check_pin
+    # says valid, else the gate's recovery pin if valid, else nothing -- and
+    # nothing is a refusal. Every requirement below is read from that pin and
+    # its verified snapshot in the shared lease dir; the run's own copies are
+    # only compared against them.
+    if not args.gate_pin:
+        if os.path.exists(selection_path):
+            bad(sel_rel, "this run holds a journey selection but no gate pin owns it (not a PR campaign, or no pin for its repo/PR/head in the shared lease dir) -- a selection is only ever the gate's, adopted with pin-run")
             emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
-    if not os.path.exists(selection_path):
         emit({"applies": False, "missing": [], "invalid": [], "invalidReasons": []})
-
-    selection = _read_json(selection_path)
-    if not isinstance(selection, dict) or not isinstance(selection.get("matchedJourneys"), list) \
-            or not isinstance(selection.get("unmappedPaths"), list):
-        bad(sel_rel, "not a pinned journey selection")
+    recovery_path = args.gate_pin[:-len(".json")] + "-recovery.json"
+    state, why, selection, gate_raw, cat = check_pin(args.gate_pin, args.pr, args.head)
+    owning = args.gate_pin
+    if state != "valid":
+        state, why2, selection, gate_raw, cat = check_pin(recovery_path, args.pr, args.head)
+        owning = recovery_path
+        if state != "valid":
+            bad(sel_rel, "this campaign's journeys pin {} is invalid ({}) and its recovery pin {} is {} -- neither can say what the run owes, so nothing clears it; the gate does not offer a head in this state".format(
+                args.gate_pin, why or "absent", recovery_path, why2 or "absent"))
+            emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
+    try:
+        with open(selection_path, "rb") as fh:
+            run_raw = fh.read()
+    except OSError:
+        run_raw = None
+    if run_raw is None:
+        bad(sel_rel, "the gate pinned a journey selection for this campaign but the run never adopted it -- run `smoke-journeys.py pin-run {} {}`, then scaffold a lane per matched journey".format(run_dir, owning))
+    elif run_raw != gate_raw:
+        run = _read_json(selection_path)
+        run = run if isinstance(run, dict) else {}
+        bad(sel_rel, "does not match this campaign's own gate pin {} (run adopted pinFile={} catalogueSha256={}; gate catalogueSha256={}) -- a run's journey contract is its OWN campaign's pin, byte for byte; re-run pin-run in a clean run dir".format(
+            owning, run.get("pinFile"), run.get("catalogueSha256"), selection["catalogueSha256"]))
+    if invalid:
         emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
+    # The copy workers read must be the snapshot the gate pinned.
+    try:
+        with open(catalogue_path, "rb") as fh:
+            if sha256_bytes(fh.read()) != selection["catalogueSha256"]:
+                bad(cat_rel, "does not hash to the gate pin's catalogueSha256 -- the run's catalogue was edited after it was pinned")
+    except OSError:
+        missing.append(cat_rel)
 
-    catalogue_ids, catalogue_evidence, catalogue_floor = set(), {}, {}
-    if selection.get("catalogueValid") is True:
-        try:
-            with open(catalogue_path, "rb") as fh:
-                raw = fh.read()
-            if sha256_bytes(raw) != selection.get("catalogueSha256"):
-                bad(cat_rel, "does not hash to the selection's catalogueSha256 -- the run's catalogue was edited after it was pinned")
-            else:
-                for j in json.loads(raw.decode("utf-8")).get("journeys", []):
-                    catalogue_ids.add(j.get("id"))
-                    catalogue_evidence[j.get("id")] = j.get("evidence")
-                    catalogue_floor[j.get("id")] = j.get("maxIntervalDays") is not None
-        except (OSError, ValueError, UnicodeDecodeError):
-            missing.append(cat_rel)
-
+    declared = {j["id"]: (j["evidence"], j.get("maxIntervalDays") is not None) for j in cat["journeys"]}
+    catalogue_ids = set(declared)
     contract = _read_json(os.path.join(run_dir, "completion-contract.json")) or {}
     required = set(contract.get("requiredLaneMarkers") or [])
-    lanes = {l.get("id"): l for l in (contract.get("lanes") or []) if isinstance(l, dict)}
 
     def has_lane(jid):
         return "markers/{}.json".format(jid) in required
 
-    def journey_lane_problem(jid, evidence, is_floor):
-        """Everything a journey-backed lane owes, in ONE place, for matched and
-        disposition-linked journeys alike.
-          floor journey   => lane kind `floor` (the barrier's floor-media bar and
-                             the cadence clock both key on it);
-          api             => the catalogue grants the exemption and the contract
-                             must carry it -- and nothing else may;
-          browser         => a `pass` names browser media that exists in the run,
-                             whatever the lane's kind;
-          native-manual   => a `pass` names the tester's recorded result under
-                             manual-results/ -- issuing the packet is `completed`."""
-        lane = lanes.get(jid, {})
-        marker_rel = "markers/{}.json".format(jid)
-        if is_floor and lane.get("kind") != "floor":
-            bad(sel_rel, "journey {} is a floor journey but its lane is kind {!r}; scaffold it `{}:floor:<title>`".format(jid, lane.get("kind"), jid))
-        declared = lane.get("evidence")
-        if declared == "api" and evidence != "api":
-            bad(sel_rel, "lane {} is scaffolded --evidence api but its journey declares evidence {}".format(jid, evidence))
-        elif evidence == "api" and declared != "api":
-            bad(sel_rel, "journey {} declares evidence api but its lane was not scaffolded `--evidence {}=api`; regenerate the contract with it".format(jid, jid))
-        marker = _read_json(os.path.join(run_dir, marker_rel))
-        if not isinstance(marker, dict) or marker.get("status") != "pass":
-            return
-        cited = [e for e in (marker.get("evidence") or []) if isinstance(e, str)]
-        if evidence == "browser" and not any(MEDIA_RE.search(e) and _run_file_ok(run_dir, e) for e in cited):
-            bad(marker_rel, "a browser journey passes only on browser media (png/jpg/jpeg/webp/gif/mp4/webm) that exists in the run")
-        if evidence == "native-manual" and not any(e.startswith("manual-results/") and _run_file_ok(run_dir, e) for e in cited):
-            bad(marker_rel, "a native-manual journey passes only on the named tester's recorded result under manual-results/ -- issuing the packet is `completed`, not `pass`")
+    def journey_lane_problem(jid):
+        # A journey the catalogue does not hold (a new-journey) has no api grant.
+        evidence, is_floor = declared.get(jid, ("browser", False))
+        for rel, problem in lane_problems(run_dir, contract, jid, evidence, is_floor):
+            bad(rel, problem)
 
     for m in selection["matchedJourneys"]:
-        jid = m.get("id")
-        if not has_lane(jid):
-            bad(sel_rel, "matched journey {} ({}) has no lane in the completion contract".format(jid, m.get("reason")))
+        if not has_lane(m["id"]):
+            bad(sel_rel, "matched journey {} ({}) has no lane in the completion contract".format(m["id"], m["reason"]))
             continue
-        journey_lane_problem(jid, m.get("evidence"), m.get("floor") is True)
-
-    # A rebuilt selection is only one if it owes the whole catalogue it carries,
-    # and it says so: the changed paths are unknown, in one explicit disposition.
-    if rebuilt_required or selection.get("rebuilt") is True:
-        named = {m.get("id") for m in selection["matchedJourneys"]}
-        for jid in sorted(i for i in catalogue_ids if i not in named):
-            bad(sel_rel, "rebuilt selection does not name catalogue journey {}".format(jid))
-        doc = _read_json(os.path.join(run_dir, disp_rel))
-        entries = doc.get("dispositions") if isinstance(doc, dict) else None
-        if not any(isinstance(d, dict) and d.get("disposition") == "scope-rebuilt" and _is_text(d.get("reason"))
-                   for d in (entries if isinstance(entries, list) else [])):
-            bad(disp_rel, "a rebuilt selection needs one {\"disposition\":\"scope-rebuilt\",\"reason\":...} entry: the changed paths are unknown and the record has to say so")
+        journey_lane_problem(m["id"])
 
     unmapped = selection["unmappedPaths"]
     if unmapped:
@@ -739,8 +785,7 @@ def cmd_barrier(args):
                     elif not has_lane(jid):
                         problem = "journey {} has no lane in the completion contract, so nothing proves it ran".format(jid)
                     else:
-                        # A journey the catalogue does not hold has no api grant.
-                        journey_lane_problem(jid, catalogue_evidence.get(jid, "browser"), catalogue_floor.get(jid, False))
+                        journey_lane_problem(jid)
                 elif kind == "no-user-facing-consumer":
                     cited = d.get("evidence")
                     if not _is_text(d.get("changedBehaviour")):
@@ -832,6 +877,7 @@ def main():
     p = sub.add_parser("match")
     p.add_argument("--catalogue", required=True)
     p.add_argument("--snapshot-out", default="")
+    p.add_argument("--recover", action="store_true")
     p.add_argument("--unknown")
     p.add_argument("--size", default="standard")
     p.add_argument("--run-root", default="")
@@ -846,7 +892,14 @@ def main():
     p = sub.add_parser("pin-run")
     p.add_argument("run_dir")
     p.add_argument("pin_file")
-    p.add_argument("--catalogue", default="")
+
+    p = sub.add_parser("pin-check")
+    p.add_argument("pin_file", nargs="?", default="")
+    p.add_argument("--candidate", action="store_true")
+    p.add_argument("--pr", type=int)
+    p.add_argument("--head")
+    p.add_argument("--repo-slug")
+    p.add_argument("--as-path", default="")
 
     p = sub.add_parser("shots")
     p.add_argument("run_dir")
@@ -854,6 +907,8 @@ def main():
     p = sub.add_parser("barrier")
     p.add_argument("run_dir")
     p.add_argument("--gate-pin", default="")
+    p.add_argument("--pr", type=int)
+    p.add_argument("--head")
 
     p = sub.add_parser("publish")
     p.add_argument("catalogue")
@@ -876,7 +931,7 @@ def main():
         if as_of is None:
             emit({"ok": False, "error": "--as-of is not an ISO timestamp"}, 2)
         emit(floor_due(cat, args.run_root, args.size, as_of))
-    {"match": cmd_match, "pin-run": cmd_pin_run, "shots": cmd_shots,
+    {"match": cmd_match, "pin-run": cmd_pin_run, "pin-check": cmd_pin_check, "shots": cmd_shots,
      "barrier": cmd_barrier, "publish": cmd_publish}[args.command](args)
 
 

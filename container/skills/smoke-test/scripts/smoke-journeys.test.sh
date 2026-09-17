@@ -24,8 +24,8 @@ NOW=2026-09-10T00:00:00Z
 # campaign owes the floor nothing and the fixtures below stay about matching.
 # (With no readable run root every floor journey is due — section 3.)
 FRESH_ROOT="$WORK/fresh-runs"; mkdir -p "$FRESH_ROOT/r0/markers"
-jq -n '{status:"pass",completedAt:"2026-09-09T12:00:00Z",evidence:["api.txt"]}' > "$FRESH_ROOT/r0/markers/branch-scope-crossing.json"
-jq -n '{lanes:[{id:"branch-scope-crossing",kind:"floor",evidence:"api"}]}' > "$FRESH_ROOT/r0/completion-contract.json"
+jq -n --arg sha "$SHA" '{sourceSha:$sha,status:"pass",completedAt:"2026-09-09T12:00:00Z",evidence:["api.txt"]}' > "$FRESH_ROOT/r0/markers/branch-scope-crossing.json"
+jq -n --arg sha "$SHA" '{sourceSha:$sha,lanes:[{id:"branch-scope-crossing",kind:"floor",evidence:"api",generation:1}]}' > "$FRESH_ROOT/r0/completion-contract.json"
 match() { # <paths-json> [extra args...] (later flags override these defaults)
   local paths="$1"; shift
   printf '%s' "$paths" | python3 "$TOOL" match --catalogue "$CATALOGUE" --as-of "$NOW" \
@@ -35,15 +35,18 @@ match() { # <paths-json> [extra args...] (later flags override these defaults)
 # (repo org/repo, PR 7, <head>): the selection plus pin fields, and the exact
 # catalogue bytes it was computed from, content-addressed. The gate's own
 # promotion is tested in smoke-pr-gate.test.sh 5k; this only builds its output.
-gate_pin() { # <lease-dir> <head-sha> <paths-json> [pr] [repo-slug] -> prints the pin file path
-  local dir="$1" head="$2" pr="${4:-7}" slug="${5:-org__repo}" out digest pin
+gate_pin() { # <lease-dir> <head-sha> <paths-json> [pr] [repo-slug] [recovery|""] [extra match args] -> pin path
+  local dir="$1" head="$2" pr="${4:-7}" slug="${5:-org__repo}" kind="${6:-}" out digest pin state=valid
+  local -a extra=(); [ -z "${7:-}" ] || read -r -a extra <<<"$7"
   mkdir -p "$dir"
-  out="$(match "$3" --snapshot-out "$dir/.snap")"   # light + fresh floor: nothing owed but the change
+  [ "$kind" != recovery ] || { extra+=(--recover); state=recovered; }
+  out="$(match "$3" --snapshot-out "$dir/.snap" ${extra[@]+"${extra[@]}"})"   # default: light + fresh floor
   digest="$(jq -r '.catalogueSha256' <<<"$out")"
   mv "$dir/.snap" "$dir/journeys-catalogue-$digest.json"
-  pin="$dir/journeys-pin-$slug-pr-$pr-$head.json"
-  jq -c --arg h "$head" --arg f "$pin" --arg s "$dir/journeys-catalogue-$digest.json" \
-    '. + {headSha:$h,pinned:true,pinState:"valid",pinFile:$f,catalogueSnapshot:$s,pinnedAt:"2026-09-10T00:00:00Z"}' \
+  pin="$dir/journeys-pin-$slug-pr-$pr-$head${kind:+-recovery}.json"
+  jq -c --arg h "$head" --argjson pr "$pr" --arg slug "$slug" --arg f "$pin" --arg st "$state" \
+    --arg s "$dir/journeys-catalogue-$digest.json" \
+    '. + {headSha:$h,pr:$pr,repoSlug:$slug,pinned:true,pinState:$st,pinFile:$f,catalogueSnapshot:$s,pinnedAt:"2026-09-10T00:00:00Z"}' \
     <<<"$out" > "$pin"
   printf '%s' "$pin"
 }
@@ -153,11 +156,12 @@ if CATALOGUE="$WORK/array.json" match '[]' >/dev/null 2>&1; then fail "2-non-obj
 # owes the least-recently-proven one and light owes none. A pass with neither
 # media nor an api-declared contract lane never resets the clock.
 ROOT="$WORK/runs"
-floor_run() { # <run> <completedAt> <evidence-json> <lane-evidence or "">
+floor_run() { # <run> <completedAt> <evidence-json> <lane-evidence or ""> [journey-id] [marker-sha]
   mkdir -p "$ROOT/$1/markers"
-  jq -n --arg at "$2" --argjson ev "$3" '{status:"pass",completedAt:$at,evidence:$ev}' \
-    > "$ROOT/$1/markers/branch-scope-crossing.json"
-  jq -n --arg e "$4" '{lanes:[{id:"branch-scope-crossing",kind:"floor"} + (if $e == "" then {} else {evidence:$e} end)]}' \
+  local id="${5:-branch-scope-crossing}" marker_sha="${6:-$SHA}"
+  jq -n --arg at "$2" --argjson ev "$3" --arg sha "$marker_sha" '{sourceSha:$sha,status:"pass",completedAt:$at,evidence:$ev}' \
+    > "$ROOT/$1/markers/$id.json"
+  jq -n --arg e "$4" --arg id "$id" --arg sha "$SHA" '{sourceSha:$sha,lanes:[{id:$id,kind:"floor",generation:1} + (if $e == "" then {} else {evidence:$e} end)]}' \
     > "$ROOT/$1/completion-contract.json"
 }
 # UNKNOWN HISTORY IS NOT FRESH HISTORY. An unset or missing run root (a config
@@ -177,6 +181,19 @@ expect 3-fresh-standard '.due == ["branch-scope-crossing"] and .entries[0].overd
 expect 3-fresh-light '.due == []' "$(python3 "$TOOL" floor-due "$CATALOGUE" "$ROOT" --size light --as-of "$NOW")"
 expect 3-overdue-light '.due == ["branch-scope-crossing"] and .entries[0].overdue == true' \
   "$(python3 "$TOOL" floor-due "$CATALOGUE" "$ROOT" --size light --as-of 2026-09-20T00:00:00Z)"
+# CADENCE USES THE BARRIER'S RULE (lane_problems), for the journey's DECLARED
+# evidence. A BROWSER floor journey mis-scaffolded as api, "passing" on a text
+# file, is a pass the barrier refuses — so it must not reset the clock either.
+# Nor does a marker that is not its own contract's (another build's sourceSha).
+jq '.journeys[0].maxIntervalDays = 3' "$EXAMPLE" > "$WORK/browser-floor.json"
+due_browser() { python3 "$TOOL" floor-due "$WORK/browser-floor.json" "$ROOT" --size light --as-of "$NOW" | jq -c '[.entries[] | select(.id == "loan-desk-checkout")][0]'; }
+floor_run r3 2026-09-09T18:00:00Z '["notes.txt"]' api loan-desk-checkout
+expect 3-mislabelled-api-pass-no-reset '.overdue == true and .lastProvenAt == null' "$(due_browser)"
+floor_run r4 2026-09-09T18:00:00Z '["desk.png"]' "" loan-desk-checkout "$(printf 'c%.0s' $(seq 40))"
+expect 3-foreign-marker-no-reset '.overdue == true and .lastProvenAt == null' "$(due_browser)"
+floor_run r5 2026-09-09T18:00:00Z '["desk.png"]' "" loan-desk-checkout
+expect 3-real-browser-pass-resets '.overdue == false and .lastProvenAt == "2026-09-09T18:00:00Z"' "$(due_browser)"
+rm -rf "$ROOT/r3" "$ROOT/r4" "$ROOT/r5"
 # In the matcher: the floor journey rides a change that never touched it...
 expect 3-match-floor '[.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"changed"},{"id":"branch-scope-crossing","reason":"floor"}]' \
   "$(match '["web/src/desk/a.tsx"]' --size standard --run-root "$ROOT")"
@@ -195,18 +212,26 @@ PIN_FILE="$(gate_pin "$WORK/lease4" "$SHA" '["api/src/reports/export.ts","web/sr
 
 # --- 5. pin-run + barrier -------------------------------------------------------
 RUN="$WORK/run-1"
-new_run() { # <lane-spec-json: [{id,kind,evidence?}]>
+LEASES="$WORK/empty-leases"   # the shared lease dir the barrier looks in; `adopt` points it at a pin's
+share_lease() { # <lease-dir> <pr>: the shared coordinator lease binding run-1 to its PR
+  mkdir -p "$1"; jq -n --argjson pr "$2" '{schemaVersion:1,pr:$pr,runId:"run-1",owner:"owner-1"}' > "$1/lease-run-1.json"
+}
+new_run() { # <lane-spec-json: [{id,kind,evidence?}]> — a PR campaign (#7) claimed on $SHA
   rm -rf "$RUN"; mkdir -p "$RUN/markers"
   jq -n --arg sha "$SHA" --argjson lanes "$1" '{schemaVersion:1,runId:"run-1",sourceSha:$sha,
-    coordinatorOwnerToken:null,ownershipKind:"develop",lanes:($lanes | map(. + {generation:1})),
+    coordinatorOwnerToken:"owner-1",ownershipKind:"pr",lanes:($lanes | map(. + {generation:1})),
     requiredLaneMarkers:($lanes | map("markers/" + .id + ".json"))}' > "$RUN/completion-contract.json"
+}
+adopt() { # <gate pin>: the campaign's lease dir is wherever its pin is; pin-run it into the run
+  LEASES="$(dirname "$1")"; share_lease "$LEASES" 7
+  python3 "$TOOL" pin-run "$RUN" "$1"
 }
 marker() { # <lane> <status> <evidence-json>
   jq -n --arg sha "$SHA" --arg lane "$1" --arg st "$2" --argjson ev "$3" \
     '{sourceSha:$sha,lane:$lane,generation:1,status:$st,completedAt:"2026-09-10T01:00:00Z",evidence:$ev}' \
     > "$RUN/markers/$1.json"
 }
-barrier() { bash "$BARRIER" "$RUN" lanes || true; }
+barrier() { SMOKE_GATE_LEASE_DIR="$LEASES" bash "$BARRIER" "$RUN" lanes || true; }
 
 # No pinned selection: the barrier is exactly what it was.
 new_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
@@ -214,6 +239,7 @@ expect 5-no-selection '.ready == true' "$(barrier)"
 
 # Pinned, but the matched journey was never given a lane, and the unmapped
 # path has no disposition: not ready, both named.
+LEASES="$(dirname "$PIN_FILE")"; share_lease "$LEASES" 7
 expect 5-pin-run '.ok == true and .alreadyPinned == false' "$(python3 "$TOOL" pin-run "$RUN" "$PIN_FILE")"
 cmp -s "$RUN/journeys/selection.json" "$PIN_FILE" || fail "5: run selection is not the gate pin's bytes"
 cmp -s "$RUN/journeys/catalogue.json" "$EXAMPLE" || fail "5: run catalogue is not the pinned snapshot"
@@ -227,7 +253,7 @@ expect 5-missing-lane-and-disposition '.ready == false and (.missing | index("jo
 
 # Lane declared but not terminal: the existing marker loop owns that.
 new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"report-export","kind":"lane"}]'
-python3 "$TOOL" pin-run "$RUN" "$PIN_FILE" >/dev/null
+adopt "$PIN_FILE" >/dev/null
 disposition() { printf '%s' "$1" > "$RUN/journeys/scope-dispositions.json"; }
 disposition '{"schemaVersion":1,"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"export consumers not traceable on this build"}]}'
 expect 5-marker-still-required '.ready == false and (.missing | index("markers/loan-desk-checkout.json"))' "$(barrier)"
@@ -269,7 +295,7 @@ expect 5-run-catalogue-edited 'any(.invalidReasons[]; test("edited after it was 
 # the tester's recorded result, never on the packet.
 NATIVE_PIN="$(gate_pin "$WORK/lease5" "$SHA" '["mobile/a.tsx","api/src/fines/list.ts"]')"
 new_run '[{"id":"mobile-scan-return","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"}]'
-python3 "$TOOL" pin-run "$RUN" "$NATIVE_PIN" >/dev/null
+adopt "$NATIVE_PIN" >/dev/null
 printf 'packet' > "$RUN/manual-packet.md"
 marker branch-scope-crossing blocked '[]'; marker mobile-scan-return completed '["manual-packet.md"]'
 expect 5-packet-issued-is-terminal '.ready == true' "$(barrier)"
@@ -279,20 +305,20 @@ mkdir -p "$RUN/manual-results"; printf 'passed on build 412 by the named tester'
 marker mobile-scan-return pass '["manual-results/mobile-scan-return.md"]'
 expect 5-recorded-result-passes '.ready == true' "$(barrier)"
 new_run '[{"id":"mobile-scan-return","kind":"floor","evidence":"api"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"}]'
-python3 "$TOOL" pin-run "$RUN" "$NATIVE_PIN" >/dev/null
+adopt "$NATIVE_PIN" >/dev/null
 marker branch-scope-crossing blocked '[]'; marker mobile-scan-return blocked '[]'
 expect 5-api-laundering 'any(.invalidReasons[]; test("scaffolded --evidence api but its journey declares evidence native-manual"))' "$(barrier)"
 # ...and the other way: an api journey whose lane was NOT scaffolded api reads
 # as a browser floor lane, where any media-looking file clears it and resets
 # the cadence clock for a proof that was never an API contract check.
 new_run '[{"id":"mobile-scan-return","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor"}]'
-python3 "$TOOL" pin-run "$RUN" "$NATIVE_PIN" >/dev/null
+adopt "$NATIVE_PIN" >/dev/null
 printf 'png' > "$RUN/shot.png"
 marker branch-scope-crossing pass '["shot.png"]'; marker mobile-scan-return blocked '[]'
 expect 5-api-journey-needs-api-lane '.ready == false and any(.invalidReasons[]; test("journey branch-scope-crossing declares evidence api but its lane was not scaffolded"))' "$(barrier)"
 # A disposition's journey is held to the same rule; a new-journey has no grant.
 new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"report-export","kind":"lane","evidence":"api"}]'
-python3 "$TOOL" pin-run "$RUN" "$PIN_FILE" >/dev/null
+adopt "$PIN_FILE" >/dev/null
 marker loan-desk-checkout blocked '[]'; marker report-export blocked '[]'
 disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"new-journey","journeyId":"report-export"}]}'
 expect 5-new-journey-no-api-grant 'any(.invalidReasons[]; test("lane report-export is scaffolded --evidence api"))' "$(barrier)"
@@ -303,15 +329,7 @@ expect 5-new-journey-no-api-grant 'any(.invalidReasons[]; test("lane report-expo
 # The barrier finds the pin in the SHARED lease dir, by the contract's sourceSha.
 GATE_LEASES="$WORK/shared/qa-coordinator/leases"
 GATE_PIN="$(gate_pin "$GATE_LEASES" "$SHA" '["api/src/reports/export.ts","web/src/desk/a.tsx"]')"
-share_lease() { # <lease-dir> <pr>: the shared coordinator lease binding run-1 to its PR
-  mkdir -p "$1"; jq -n --argjson pr "$2" '{schemaVersion:1,pr:$pr,runId:"run-1",owner:"owner-1"}' > "$1/lease-run-1.json"
-}
-pr_run() { # lanes as new_run, but claimed by a PR campaign (#7) on $SHA
-  new_run "$1"
-  share_lease "$GATE_LEASES" 7
-  jq '.ownershipKind = "pr" | .coordinatorOwnerToken = "owner-1"' "$RUN/completion-contract.json" > "$RUN/c.tmp"
-  mv "$RUN/c.tmp" "$RUN/completion-contract.json"
-}
+pr_run() { new_run "$1"; LEASES="$GATE_LEASES"; share_lease "$GATE_LEASES" 7; }
 gate_barrier() { SMOKE_GATE_LEASE_DIR="$GATE_LEASES" bash "$BARRIER" "$RUN" lanes || true; }
 pr_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
 NO_PIN_OUT="$(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$RUN" lanes)"
@@ -334,7 +352,7 @@ jq -c '.catalogueSha256 = "0000"' "$GATE_PIN" > "$RUN/journeys/selection.json"
 expect 5b-sha-mismatch 'any(.invalidReasons[]; test("catalogueSha256=0000; gate catalogueSha256=[0-9a-f]{64}"))' "$(gate_barrier)"
 # The real thing: pin-run, lanes, disposition => ready.
 pr_run '[{"id":"loan-desk-checkout","kind":"lane"}]'; marker loan-desk-checkout blocked '[]'
-python3 "$TOOL" pin-run "$RUN" "$GATE_PIN" >/dev/null
+adopt "$GATE_PIN" >/dev/null
 disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
 expect 5b-adopted '.ready == true' "$(gate_barrier)"
 # ONE OWNING PIN. Two more campaigns pinned the SAME head sha in the shared
@@ -357,9 +375,13 @@ cp "$PIN_FORK" "$RUN/journeys/selection.json"
 expect 5b-adopted-other-repo '.ready == false and any(.invalidReasons[];
   test("own gate pin .*journeys-pin-org__repo-pr-7-") and test("run adopted pinFile=.*other__fork"))' "$(repo_barrier org/repo)"
 expect 5b-fork-owns-its-own '.ready == true' "$(repo_barrier other/fork)"   # the same bytes ARE the fork campaign's own
-# A repo with no pin of its own for this (PR, head) is the no-pin case.
+# A repo with no pin of its own for this (PR, head) owns none of these: a
+# selection carried in anyway is nobody's, and without one it is the no-pin case.
 cp "$GATE_PIN" "$RUN/journeys/selection.json"
+expect 5b-third-repo-foreign-selection '.ready == false and any(.invalidReasons[]; test("no gate pin owns it"))' "$(repo_barrier third/repo)"
+mv "$RUN/journeys" "$WORK/journeys.aside"
 expect 5b-third-repo-no-pin '.ready == true' "$(repo_barrier third/repo)"
+mv "$WORK/journeys.aside" "$RUN/journeys"
 # The PR comes from the SHARED lease, never the run: without it the owning pin
 # cannot be identified, and that is a refusal, not "no pin".
 rm -f "$GATE_LEASES/lease-run-1.json"
@@ -368,75 +390,99 @@ jq -n '{schemaVersion:1,pr:7,runId:"run-1",owner:"owner-1",boundAt:"x"}' > "$GAT
 expect 5b-authority-fallback '.ready == true' "$(repo_barrier org/repo)"
 rm -f "$GATE_LEASES/pr-7-authority.json" "$PIN_PR8" "$PIN_FORK"
 
-# AN INVALID PIN IS NEVER "NO PIN" on the enforcing side either. Whatever sits
-# at this campaign's pin path and is not a well-formed pin (truncated, a
-# symlink, a directory) refuses the run until it adopts the REBUILT selection
-# pin-run writes — every journey of the live catalogue — and then holds it to
-# that: a lane per journey with the right kind and evidence, and one explicit
-# scope-rebuilt disposition, because the changed paths are unknown.
+# THE RUN NEVER AUTHORS WHAT IT IS HELD TO. An invalid primary pin is never "no
+# pin", and the only thing that can stand in for it is the GATE's recovery pin
+# (`…-recovery.json`: every catalogue journey owed) — judged by the same one
+# predicate the gate uses. Nothing assembled on the run side counts.
 ALL_LANES='[{"id":"loan-desk-checkout","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"},{"id":"mobile-scan-return","kind":"lane"}]'
-for kind in truncated symlink directory; do
-  rm -rf "$WORK/bad-leases"; share_lease "$WORK/bad-leases" 7
-  bad="$WORK/bad-leases/journeys-pin-org__repo-pr-7-$SHA.json"
+SHAPE_ONLY='{"pinned":true,"matchedJourneys":[],"unmappedPaths":[]}'
+for kind in truncated symlink directory shape-only; do
+  BAD_LEASES="$WORK/bad-leases-$kind"; rm -rf "$BAD_LEASES"; share_lease "$BAD_LEASES" 7
+  bad="$BAD_LEASES/journeys-pin-org__repo-pr-7-$SHA.json"
   case "$kind" in
     truncated) printf '{"pinned":tr' > "$bad" ;;
     symlink) ln -s "$GATE_PIN" "$bad" ;;
     directory) mkdir "$bad" ;;
+    shape-only) printf '%s' "$SHAPE_ONLY" > "$bad" ;;   # the gate's old jq check refused this; read_gate_pin took it
   esac
-  bad_barrier() { SMOKE_GATE_LEASE_DIR="$WORK/bad-leases" bash "$BARRIER" "$RUN" lanes || true; }
-  # An unrelated terminal lane and no selection: NOT ready, naming the command.
-  pr_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
-  expect "5b-invalid-pin-$kind-refuses" '.ready == false and any(.invalidReasons[]; test("never switches journey checks off") and test("pin-run .* --catalogue"))' "$(bad_barrier)"
-  # A VALID pin's bytes from elsewhere are not the rebuilt selection.
-  mkdir -p "$RUN/journeys"; cp "$GATE_PIN" "$RUN/journeys/selection.json"; cp "$EXAMPLE" "$RUN/journeys/catalogue.json"
-  expect "5b-invalid-pin-$kind-wrong-selection" 'any(.invalidReasons[]; test("must hold the REBUILT selection"))' "$(bad_barrier)"
-  # Rebuild, and the run is held to the whole catalogue.
-  pr_run "$ALL_LANES"
-  expect "5b-invalid-pin-$kind-needs-catalogue" '.ok == false' "$(python3 "$TOOL" pin-run "$RUN" "$bad" || true)"
-  expect "5b-invalid-pin-$kind-rebuild" '.ok == true and .rebuilt == true' "$(python3 "$TOOL" pin-run "$RUN" "$bad" --catalogue "$EXAMPLE")"
-  jq -e --arg p "$bad" '.rebuilt == true and .invalidPin.path == $p and .selection == "full" and
-    [.matchedJourneys[].id] == ["loan-desk-checkout","branch-scope-crossing","mobile-scan-return"]' "$RUN/journeys/selection.json" >/dev/null || fail "5b: rebuilt selection shape"
+  LEASES="$BAD_LEASES"
+  expect "5b-$kind-pin-check" '.state == "invalid"' "$(python3 "$TOOL" pin-check "$bad" --pr 7 --head "$SHA" --repo-slug org__repo)"
+  # No recovery pin: NOT ready, both files named, whatever the run holds.
+  new_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
+  expect "5b-$kind-no-recovery" '.ready == false and any(.invalidReasons[]; test("is invalid") and test("recovery pin .*-recovery.json is absent"))' "$(barrier)"
+  expect "5b-$kind-pin-run-refuses" '.ok == false and (.error | test("not a valid gate pin"))' "$(python3 "$TOOL" pin-run "$RUN" "$bad" || true)"
+  # A hand-written "rebuilt" selection (the retired run-side recovery) is just
+  # bytes that are not the gate's.
+  mkdir -p "$RUN/journeys"; cp "$EXAMPLE" "$RUN/journeys/catalogue.json"
+  jq -cn --arg p "$bad" '{schemaVersion:1,selection:"full",rebuilt:true,invalidPin:{path:$p},catalogueValid:false,matchedJourneys:[],unmappedPaths:[]}' > "$RUN/journeys/selection.json"
+  printf '{"dispositions":[{"disposition":"scope-rebuilt","reason":"x"}]}' > "$RUN/journeys/scope-dispositions.json"
+  expect "5b-$kind-hand-rebuilt-refused" '.ready == false' "$(barrier)"
+  # The gate's recovery pin owns the run: every journey, lane by lane.
+  RECOVERY="$(gate_pin "$BAD_LEASES" "$SHA" '["api/src/reports/export.ts","web/src/desk/a.tsx"]' 7 org__repo recovery)"
+  expect "5b-$kind-recovery-valid" '.state == "valid" and .pin.recovery == true and
+    [.pin.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"pin-recovered"},{"id":"branch-scope-crossing","reason":"pin-recovered"},{"id":"mobile-scan-return","reason":"pin-recovered"}] and
+    .pin.unmappedPaths == ["api/src/reports/export.ts"]' "$(python3 "$TOOL" pin-check "$RECOVERY" --pr 7 --head "$SHA")"
+  expect "5b-$kind-hand-rebuilt-still-refused" '.ready == false and any(.invalidReasons[]; test("does not match this campaign.s own gate pin .*-recovery.json"))' "$(barrier)"
+  new_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
+  expect "5b-$kind-recovery-must-be-adopted" 'any(.invalidReasons[]; test("pin-run .*-recovery.json"))' "$(barrier)"
+  new_run "$ALL_LANES"; adopt "$RECOVERY" >/dev/null
+  cmp -s "$RUN/journeys/selection.json" "$RECOVERY" || fail "5b: recovery adoption is not byte-for-byte"
   for lane in loan-desk-checkout branch-scope-crossing mobile-scan-return; do marker "$lane" blocked '[]'; done
-  expect "5b-invalid-pin-$kind-needs-disposition" '.ready == false and any(.invalidReasons[]; test("scope-rebuilt"))' "$(bad_barrier)"
-  disposition '{"dispositions":[{"disposition":"scope-rebuilt","reason":"gate pin invalid; changed paths unknown, whole catalogue walked"}]}'
-  expect "5b-invalid-pin-$kind-rebuilt-ready" '.ready == true' "$(bad_barrier)"
-  # One journey short is not the whole catalogue.
-  pr_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"}]'
-  python3 "$TOOL" pin-run "$RUN" "$bad" --catalogue "$EXAMPLE" >/dev/null
+  disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
+  expect "5b-$kind-recovered-ready" '.ready == true' "$(barrier)"
+  new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"}]'; adopt "$RECOVERY" >/dev/null
   marker loan-desk-checkout blocked '[]'; marker branch-scope-crossing blocked '[]'
-  disposition '{"dispositions":[{"disposition":"scope-rebuilt","reason":"x"}]}'
-  expect "5b-invalid-pin-$kind-lane-per-journey" 'any(.invalidReasons[]; test("matched journey mobile-scan-return \\(scope-rebuilt\\) has no lane"))' "$(bad_barrier)"
-  # A rebuilt selection thinned by hand no longer names its own catalogue.
-  jq -c 'del(.matchedJourneys[2])' "$RUN/journeys/selection.json" > "$RUN/journeys/s.tmp"; mv "$RUN/journeys/s.tmp" "$RUN/journeys/selection.json"
-  expect "5b-invalid-pin-$kind-thinned" 'any(.invalidReasons[]; test("rebuilt selection does not name catalogue journey mobile-scan-return"))' "$(bad_barrier)"
+  disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
+  expect "5b-$kind-recovery-lane-per-journey" 'any(.invalidReasons[]; test("matched journey mobile-scan-return \\(pin-recovered\\) has no lane"))' "$(barrier)"
+  # An invalid recovery pin is as good as none.
+  printf '%s' "$SHAPE_ONLY" > "$WORK/r.tmp"; cat "$WORK/r.tmp" > "$RECOVERY"
+  expect "5b-$kind-both-invalid" '.ready == false and any(.invalidReasons[]; test("neither can say what the run owes"))' "$(barrier)"
 done
-unset -f bad_barrier
-# The rebuild needs a USABLE live catalogue, and no pin at all is not a rebuild.
-pr_run "$ALL_LANES"
-expect 5b-rebuild-bad-catalogue '.ok == false' "$(python3 "$TOOL" pin-run "$RUN" "$bad" --catalogue "$WORK/half-broken.json" || true)"
-expect 5b-no-pin-file '.ok == false and (.error | test("no gate pin at"))' "$(python3 "$TOOL" pin-run "$RUN" "$WORK/nothing-here.json" --catalogue "$EXAMPLE" || true)"
+# A selection with NO gate pin behind it is not the gate's, so it is refused.
+new_run "$ALL_LANES"; LEASES="$WORK/empty-leases"; share_lease "$LEASES" 7
+mkdir -p "$RUN/journeys"; cp "$GATE_PIN" "$RUN/journeys/selection.json"
+expect 5b-selection-without-gate-pin '.ready == false and any(.invalidReasons[]; test("no gate pin owns it"))' "$(barrier)"
+expect 5b-no-pin-file '.ok == false' "$(python3 "$TOOL" pin-run "$RUN" "$WORK/nothing-here.json" || true)"
+
+# THE ONE PREDICATE, directly. Shape is not validity: identity and the snapshot count.
+expect 5b-check-valid '.state == "valid"' "$(python3 "$TOOL" pin-check "$GATE_PIN" --pr 7 --head "$SHA" --repo-slug org__repo)"
+expect 5b-check-absent '.state == "absent"' "$(python3 "$TOOL" pin-check "$WORK/nope.json" --pr 7 --head "$SHA")"
+expect 5b-check-other-pr '.state == "invalid" and (.reason | test("PR 7, not 8"))' "$(python3 "$TOOL" pin-check "$GATE_PIN" --pr 8 --head "$SHA")"
+expect 5b-check-other-repo '.state == "invalid" and (.reason | test("repo"))' "$(python3 "$TOOL" pin-check "$GATE_PIN" --pr 7 --head "$SHA" --repo-slug other__fork)"
+mkdir -p "$WORK/moved"; cp "$GATE_LEASES"/journeys-catalogue-*.json "$WORK/moved/"; cp "$GATE_PIN" "$WORK/moved/journeys-pin-org__repo-pr-9-$SHA.json"
+expect 5b-check-renamed '.state == "invalid" and (.reason | test("than its file name"))' "$(python3 "$TOOL" pin-check "$WORK/moved/journeys-pin-org__repo-pr-9-$SHA.json")"
+cp "$GATE_PIN" "$WORK/moved/"; for snap in "$WORK/moved"/journeys-catalogue-*.json; do echo >> "$snap"; done
+expect 5b-check-snapshot-tampered '.state == "invalid" and (.reason | test("does not hash"))' "$(python3 "$TOOL" pin-check "$WORK/moved/$(basename "$GATE_PIN")")"
+rm -f "$WORK/moved"/journeys-catalogue-*.json
+expect 5b-check-snapshot-missing '.state == "invalid" and (.reason | test("missing"))' "$(python3 "$TOOL" pin-check "$WORK/moved/$(basename "$GATE_PIN")")"
+jq -c '.matchedJourneys[0].evidence = "api"' "$GATE_PIN" > "$WORK/relabel.json"
+mkdir -p "$WORK/relabel"; cp "$GATE_LEASES"/journeys-catalogue-*.json "$WORK/relabel/"; mv "$WORK/relabel.json" "$WORK/relabel/$(basename "$GATE_PIN")"
+expect 5b-check-evidence-relabelled '.state == "invalid" and (.reason | test("not in its catalogue snapshot with that evidence"))' "$(python3 "$TOOL" pin-check "$WORK/relabel/$(basename "$GATE_PIN")")"
+expect 5b-candidate-empty-full '.state == "invalid" and (.reason | test("names no journey"))' \
+  "$(match '[]' --unknown x | jq -c '.matchedJourneys = [] | .unassessedNativeJourneys = []' | python3 "$TOOL" pin-check --candidate)"
+expect 5b-candidate-ok '.state == "valid"' "$(match '["web/src/desk/a.tsx"]' | python3 "$TOOL" pin-check --candidate)"
 
 # --- 5c. one lane rule for every journey-backed lane ------------------------------
 # A catalogue whose BROWSER journey is also a floor journey.
 jq '.journeys[0].maxIntervalDays = 3' "$EXAMPLE" > "$WORK/browser-floor.json"
 FLOOR_PIN="$(CATALOGUE="$WORK/browser-floor.json" gate_pin "$WORK/lease5c" "$SHA" '["web/src/desk/a.tsx","api/src/reports/export.ts"]')"
-floor_run() { # <loan-desk lane kind>; report-export is there for the disposition cases
+bf_run() { # <loan-desk lane kind>; report-export is there for the disposition cases
   new_run '[{"id":"loan-desk-checkout","kind":"'"$1"'"},{"id":"mobile-scan-return","kind":"lane"}]'
-  python3 "$TOOL" pin-run "$RUN" "$FLOOR_PIN" >/dev/null
+  adopt "$FLOOR_PIN" >/dev/null
   printf 'ok' > "$RUN/api.txt"; printf 'png' > "$RUN/desk.png"; marker mobile-scan-return blocked '[]'
   disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
 }
 # A floor journey scaffolded as an ordinary lane slips the barrier's floor-media
 # bar and never touches the cadence clock: refused, whatever it cites.
-floor_run lane; marker loan-desk-checkout pass '["api.txt"]'
+bf_run lane; marker loan-desk-checkout pass '["api.txt"]'
 expect 5c-floor-journey-needs-floor-kind '.ready == false and any(.invalidReasons[]; test("loan-desk-checkout is a floor journey but its lane is kind .lane."))' "$(barrier)"
-floor_run floor; marker loan-desk-checkout pass '["api.txt"]'
+bf_run floor; marker loan-desk-checkout pass '["api.txt"]'
 expect 5c-browser-pass-needs-media '.ready == false and any(.invalidReasons[]; test("browser"))' "$(barrier)"
-floor_run floor; marker loan-desk-checkout pass '["desk.png"]'
+bf_run floor; marker loan-desk-checkout pass '["desk.png"]'
 expect 5c-browser-floor-pass '.ready == true' "$(barrier)"
 # The media bar is the JOURNEY's, not the lane kind's: a non-floor browser
 # journey cannot pass on a text file either, nor on media that is not there.
-new_run '[{"id":"loan-desk-checkout","kind":"lane"}]'; python3 "$TOOL" pin-run "$RUN" "$PIN_FILE" >/dev/null
+new_run '[{"id":"loan-desk-checkout","kind":"lane"}]'; adopt "$PIN_FILE" >/dev/null
 disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
 printf 'ok' > "$RUN/api.txt"; marker loan-desk-checkout pass '["api.txt"]'
 expect 5c-browser-lane-text-only 'any(.invalidReasons[]; test("a browser journey passes only on browser media"))' "$(barrier)"
@@ -444,20 +490,41 @@ printf 'png' > "$RUN/desk.png"; marker loan-desk-checkout pass '["api.txt","desk
 expect 5c-browser-lane-with-media '.ready == true' "$(barrier)"
 # Disposition-linked journeys take the SAME helper: a native-manual journey
 # reached through mapped-to-journey passes only on the tester's result.
-floor_run floor; marker loan-desk-checkout blocked '[]'; printf 'packet' > "$RUN/packet.md"
+bf_run floor; marker loan-desk-checkout blocked '[]'; printf 'packet' > "$RUN/packet.md"
 marker mobile-scan-return pass '["packet.md"]'
 disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"mapped-to-journey","journeyId":"mobile-scan-return"}]}'
 expect 5c-disposition-native-needs-result 'any(.invalidReasons[]; test("named tester"))' "$(barrier)"
 disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"mapped-to-journey","journeyId":"loan-desk-checkout"}]}'
 marker mobile-scan-return blocked '[]'
-new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"mobile-scan-return","kind":"lane"}]'; python3 "$TOOL" pin-run "$RUN" "$FLOOR_PIN" >/dev/null
+new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"mobile-scan-return","kind":"lane"}]'; adopt "$FLOOR_PIN" >/dev/null
 marker loan-desk-checkout blocked '[]'; marker mobile-scan-return blocked '[]'
 disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"mapped-to-journey","journeyId":"loan-desk-checkout"}]}'
 expect 5c-disposition-floor-kind 'any(.invalidReasons[]; test("is a floor journey but its lane is kind"))' "$(barrier)"
 
+# DUE FLOOR JOURNEYS ARE MANDATORY MATCHES, native ones included. Unknown range
+# and no readable history: a native-manual floor journey is due, so it is a
+# required lane (packet/result shape), not an "unassessed" footnote.
+jq '.journeys[2].maxIntervalDays = 30' "$EXAMPLE" > "$WORK/native-floor.json"
+OUT="$(CATALOGUE="$WORK/native-floor.json" match '[]' --unknown "no GO" --run-root "")"
+expect 5c-native-floor-due-is-matched '.unassessedNativeJourneys == [] and
+  [.matchedJourneys[] | select(.id == "mobile-scan-return") | {reason,floor}] == [{"reason":"floor","floor":true}]' "$OUT"
+NF_PIN="$(CATALOGUE="$WORK/native-floor.json" gate_pin "$WORK/lease5d" "$SHA" '[]' 7 org__repo "" '--unknown no-GO --run-root /nonexistent')"
+new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"}]'; adopt "$NF_PIN" >/dev/null
+marker loan-desk-checkout blocked '[]'; marker branch-scope-crossing blocked '[]'
+expect 5c-native-floor-needs-lane 'any(.invalidReasons[]; test("matched journey mobile-scan-return \\(floor\\) has no lane"))' "$(barrier)"
+new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"},{"id":"mobile-scan-return","kind":"lane"}]'; adopt "$NF_PIN" >/dev/null
+for lane in loan-desk-checkout branch-scope-crossing mobile-scan-return; do marker "$lane" blocked '[]'; done
+expect 5c-native-floor-kind 'any(.invalidReasons[]; test("mobile-scan-return is a floor journey but its lane is kind"))' "$(barrier)"
+new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"},{"id":"mobile-scan-return","kind":"floor"}]'; adopt "$NF_PIN" >/dev/null
+for lane in loan-desk-checkout branch-scope-crossing; do marker "$lane" blocked '[]'; done
+printf 'packet' > "$RUN/packet.md"; marker mobile-scan-return pass '["packet.md"]'
+expect 5c-native-floor-packet-is-not-pass 'any(.invalidReasons[]; test("named tester"))' "$(barrier)"
+marker mobile-scan-return completed '["packet.md"]'
+expect 5c-native-floor-packet-issued '.ready == true' "$(barrier)"
+
 # --- 6. capture recipes --------------------------------------------------------
 new_run '[{"id":"loan-desk-checkout","kind":"lane"}]'
-python3 "$TOOL" pin-run "$RUN" "$PIN_FILE" >/dev/null
+adopt "$PIN_FILE" >/dev/null
 expect 6-shots '.ok == true and [.shots[].name] == ["desk","desk-periods"] and .shots[1].steps == ["click text=Loan period","wait 500"]' \
   "$(python3 "$TOOL" shots "$RUN")"
 

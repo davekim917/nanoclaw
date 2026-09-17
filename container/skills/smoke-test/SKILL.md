@@ -571,24 +571,26 @@ a sha256-named catalogue snapshot — so no catalogue edit, recovery wake or
 second coordinator changes a run's contract. An unusable catalogue (unreadable,
 unparseable, or failing `validate`) selects nothing: nothing is pinned, the head
 is not offered that cycle, stderr names the errors, and the next poll retries.
-`pinState: invalid` ⇒ `full`, still offered, its scope unrecoverable — and
-never an off switch: `pin-run <run-dir> <journeys.invalidPinFile> --catalogue
-<live catalogue>` adopts a **rebuilt** selection (every journey in the
-catalogue), and the barrier refuses the run until it holds one, with a lane per
-journey and one `{"disposition":"scope-rebuilt","reason":…}` entry. No catalogue: no `journeys` key. At intake:
+**The run never authors what it is held to.** If the primary pin is invalid its
+scope is unrecoverable, so the gate itself promotes a second immutable
+**recovery pin** (`pinState: recovered` — every catalogue journey owed, the
+pinned range's unclaimed paths kept) and sends that as `pinFile`; while neither
+pin is valid the head is not offered. Gate, `pin-run` and barrier judge a pin
+with one predicate (`smoke-journeys.py pin-check`). No catalogue: no `journeys` key. At intake:
 
 1. `smoke-journeys.py pin-run <run-dir> <journeys.pinFile>` copies the pin and
    snapshot into `<run-dir>/journeys/`; workers and siblings read that copy,
    never a group's private live file.
 2. **Every `matchedJourneys[]` entry becomes a contract lane with the journey
    id as its lane id** — `reason` says why it is there (`changed`, `floor`, or
-   `range-unknown`, `scope-rebuilt`). The barrier holds every journey-backed
+   `range-unknown`, `pin-recovered`). The barrier holds every journey-backed
    lane, disposition-linked ones included, to one rule: a floor journey's lane
    is kind `floor`; an `evidence: api` journey's lane **must** be scaffolded
    `--evidence <id>=api` and no other may be; a browser `pass` names media that
    exists in the run; a native-manual `pass` names the tester's result. `selection: "full"` (range unknown, or the
    catalogue unusable — `reason` says which) selects every walkable journey,
-   and `unassessedNativeJourneys[]` go on the Untested line by name.
+   and `unassessedNativeJourneys[]` go on the Untested line by name (a native
+   floor journey that is due is a matched lane, never just a listing).
 3. **Every frozen `unmappedPaths[]` entry gets a scope disposition** in
    `<run-dir>/journeys/scope-dispositions.json` — `{"dispositions":[{"paths":
    [...], "disposition": ...}]}`, one rationale may cover related paths:
@@ -728,7 +730,9 @@ whole floor every campaign makes a walk nobody performs carefully, and a pure
 staleness budget leaves the mechanism cold for days. "Last proven" is read off
 the run root, not a ledger: the newest `pass` marker carrying the lane id, and
 only one that carries proof — browser media, or a run whose contract declared
-that lane `evidence: api`. **Unknown history is not fresh history**: with no
+that lane `evidence: api` — judged by the barrier's own lane rule for the
+journey's declared evidence, so a pass the barrier would refuse resets nothing.
+**Unknown history is not fresh history**: with no
 readable run root (unset, or a missing mount) every floor journey is due, at any
 size. The gate reports the answer as `journeys.floor`; recompute it any time:
 

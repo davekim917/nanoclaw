@@ -524,11 +524,13 @@ done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 # shared, so a second coordinator's barrier finds it too), resolved from the
 # same two env vars the gate and the scaffold use; a pr-owned contract's
 # sourceSha IS that head sha (require_fenced_source_sha, smoke-run-scaffold.sh:309).
-# An INVALID pin (symlink, directory, truncated) is never "no pin": the run must
-# then hold the REBUILT selection `pin-run` writes for it — every journey in
-# the catalogue — and is held to that. No catalogue means no pin, and a run
-# with neither a pin nor a selection is untouched; an unreadable answer fails
-# closed.
+# The run never authors what it is held to. What sits at that path is judged by
+# `smoke-journeys.py`'s one pin predicate (the gate uses the same one): valid ⇒
+# the run must hold its bytes; invalid ⇒ the gate's RECOVERY pin beside it
+# (`…-recovery.json`, also gate-authored and immutable) owns the run instead;
+# neither valid ⇒ not ready. A selection in the run with no gate pin behind it
+# is refused too. No catalogue means no pin, and a run with neither a pin nor a
+# selection is untouched; an unreadable answer fails closed.
 JOURNEY_LEASE_DIR="${SMOKE_GATE_LEASE_DIR:-${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases}"
 #
 # ONE owning pin, never "any pin for this sha". The lease dir is shared, so two
@@ -572,7 +574,7 @@ if [ "$(jq -r '.ownershipKind' "$CONTRACT")" = pr ] &&
       JOURNEY_PIN_CANDIDATES+=("$gate_pin")
     done < <(compgen -G "$JOURNEY_LEASE_DIR/journeys-pin-$JOURNEY_REPO_SLUG-pr-$JOURNEY_PR-$SOURCE_SHA.json" || true)
     if [ "${#JOURNEY_PIN_CANDIDATES[@]}" -eq 1 ]; then
-      JOURNEY_PIN_ARGS=(--gate-pin "${JOURNEY_PIN_CANDIDATES[0]}")
+      JOURNEY_PIN_ARGS=(--gate-pin "${JOURNEY_PIN_CANDIDATES[0]}" --pr "$JOURNEY_PR" --head "$SOURCE_SHA")
     elif [ "${#JOURNEY_PIN_CANDIDATES[@]}" -gt 1 ]; then
       INVALID+=("journeys/selection.json")
       INVALID_REASONS+=("journeys/selection.json: ${#JOURNEY_PIN_CANDIDATES[@]} repositories pinned a journey selection for PR #$JOURNEY_PR at this head sha and SMOKE_GATE_REPO is unset, so this campaign's own pin is ambiguous — export SMOKE_GATE_REPO as the gate has it")

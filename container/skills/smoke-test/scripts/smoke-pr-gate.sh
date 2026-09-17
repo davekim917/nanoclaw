@@ -1849,118 +1849,139 @@ range_pin_promote() {  # <pr> <head-sha> <candidate-file>
 # lease_dir_prepare, `ln` fail-on-exists): shared LEASE_DIR, immutable, keyed by
 # (repo, PR, head), never trimmed, invalid is not absent. The catalogue bytes
 # the selection was computed from are kept beside it, content-addressed.
-JOURNEYS_PIN_SHAPE='type == "object" and .schemaVersion == 1 and (.selection | type == "string") and
-  (.route | type == "string") and (.matchedJourneys | type == "array") and (.unmappedPaths | type == "array")'
-# AN EMPTY `full` IS NEVER PINNABLE. `full` means "walk everything", so a `full`
-# that names no journey at all (a crashed matcher, a catalogue nothing could be
-# read out of) is not a selection, it is the absence of one — and pinned, it
-# would switch journey obligations off for this head for good. Both the
-# candidate acceptance in journeys_select and journeys_pin_promote go through
-# this one predicate; a head without a candidate is not offered this cycle and
-# the next poll tries again.
-JOURNEYS_PINNABLE='(.selection != "full") or ((.matchedJourneys | length) > 0) or
-  (((.unassessedNativeJourneys // []) | length) > 0)'
-journeys_pin_file() {  # <pr> <head-sha>
+# VALIDITY IS JUDGED IN ONE PLACE: `smoke-journeys.py pin-check`. This gate, the
+# barrier and pin-run all call it, so they cannot disagree about what a pin is
+# (complete pinnable selection + its own repo/PR/head + a catalogue snapshot
+# that verifies). There is no shape check of this gate's own.
+#
+# RECOVERY IS THE GATE'S, never the run's. When a head's primary pin is
+# identified but invalid, its scope is unrecoverable — so the gate computes a
+# recovery selection from the configured catalogue (every journey owed, the
+# pinned range's unclaimed paths kept) and promotes it as a SECOND immutable
+# fail-on-exists shared file for the same (repo, PR, head). The owning pin is
+# the primary if valid, else the recovery pin if valid; while neither is valid
+# the head is NOT offered. A run never authors what it is held to.
+journeys_repo_slug() { printf '%s' "$REPO" | sed -e 's#/#__#g' -e 's/[^A-Za-z0-9._-]/_/g'; }
+journeys_pin_file() {  # <pr> <head-sha> [recovery]
   local f
   f="$(range_pin_file "$1" "$2")"
-  printf '%s/journeys-pin-%s' "$LEASE_DIR" "${f##*/range-pin-}"
+  f="$LEASE_DIR/journeys-pin-${f##*/range-pin-}"
+  [ "${3:-}" != recovery ] || f="${f%.json}-recovery.json"
+  printf '%s' "$f"
 }
-journeys_full() {  # <reason> <pinState> [invalid-pin-file] — the fail-closed selection: full, said why
-  # invalidPinFile is what the owner hands to `smoke-journeys.py pin-run` to
-  # adopt a REBUILT selection; the barrier refuses the run without one.
-  jq -cn --arg reason "$1" --arg state "$2" --arg bad "${3:-}" \
+journeys_full() {  # <reason> <pinState> — the fail-closed selection: full, said why, never pinnable
+  jq -cn --arg reason "$1" --arg state "$2" \
     '{schemaVersion:1, selection:"full", reason:$reason, route:"web", catalogueValid:false,
       catalogueSha256:null, matchedJourneys:[], unmappedPaths:[], excludedPaths:[],
-      unassessedNativeJourneys:[], pinned:false, pinFile:null, catalogueSnapshot:null, pinState:$state}
-     + (if $bad == "" then {} else {invalidPinFile:$bad} end)'
+      unassessedNativeJourneys:[], pinned:false, pinFile:null, catalogueSnapshot:null, pinState:$state}'
+}
+journeys_pin_check() {  # <file> <pr> <head-sha> [--as-path <final>] — prints {state,reason,pin}
+  local file="$1" pr="$2" head="$3" out
+  shift 3
+  out="$(timeout 20 python3 "$JOURNEYS_TOOL" pin-check "$file" --pr "$pr" --head "$head" \
+           --repo-slug "$(journeys_repo_slug)" "$@" 2>/dev/null)" &&
+    jq -e '.state == "valid" or .state == "invalid" or .state == "absent"' <<<"$out" >/dev/null 2>&1 ||
+    out='{"state":"invalid","reason":"the pin could not be checked"}'
+  printf '%s' "$out"
 }
 # Prints the selection (one JSON object), or `null` when the install has no
 # catalogue AND this head has no journeys pin. Range-sized data reaches the
-# matcher on stdin, never argv. An undeterminable range is `selection:"full"`,
-# never an empty match; a matcher crash fails closed the same way.
+# matcher on stdin, never argv. pinState says where it came from:
+#   valid       the primary pin            absent          computed now, to be pinned
+#   recovered   the recovery pin           recovery-absent recovery computed now, to be pinned
+#   invalid / unavailable                  nothing usable — never offered
 journeys_select() {  # <pr> <head-sha> <determinable> <fail-reason> <paths-json> <size>
   local pr="$1" head_sha="$2" determinable="$3" fail_reason="$4" paths_json="${5:-[]}" size="$6"
-  local f why out err snapshot_out=""
+  local why out err primary recovery state="absent" snapshot_out="" candidate=""
   local -a args
   if ! why="$(range_pin_store_readable)"; then
     [ -e "$JOURNEYS_CATALOGUE" ] || [ -L "$JOURNEYS_CATALOGUE" ] || { printf 'null'; return 0; }
     journeys_full "journey selection cannot be pinned on shared storage ($why)" unavailable
     return 0
   fi
-  f="$(journeys_pin_file "$pr" "$head_sha")"
-  if [ -e "$f" ] || [ -L "$f" ]; then
-    if [ -L "$f" ]; then why="a symlink"
-    elif [ ! -f "$f" ]; then why="not a regular file"
-    elif jq -ce --arg h "$head_sha" "select(($JOURNEYS_PIN_SHAPE) and .pinned == true and .headSha == \$h)" "$f" 2>/dev/null; then
-      return 0
-    else why="truncated or malformed"
-    fi
-    journeys_full "the journeys pin for this head ($f) is $why, so the selection it pinned cannot be recovered" invalid "$f"
+  primary="$(journeys_pin_check "$(journeys_pin_file "$pr" "$head_sha")" "$pr" "$head_sha")"
+  case "$(jq -r '.state' <<<"$primary")" in
+    valid) jq -c '.pin' <<<"$primary"; return 0 ;;
+    invalid)
+      recovery="$(journeys_pin_check "$(journeys_pin_file "$pr" "$head_sha" recovery)" "$pr" "$head_sha")"
+      case "$(jq -r '.state' <<<"$recovery")" in
+        valid) jq -c '.pin' <<<"$recovery"; return 0 ;;
+        invalid)
+          journeys_full "neither journeys pin for this head is valid: $(journeys_pin_file "$pr" "$head_sha") ($(jq -r '.reason' <<<"$primary")); $(journeys_pin_file "$pr" "$head_sha" recovery) ($(jq -r '.reason' <<<"$recovery"))" invalid
+          return 0 ;;
+      esac
+      state="recovery-absent"
+      why="the primary journeys pin $(journeys_pin_file "$pr" "$head_sha") is invalid ($(jq -r '.reason' <<<"$primary")) and cannot be recovered from: " ;;
+    *) why="" ;;
+  esac
+  if [ ! -e "$JOURNEYS_CATALOGUE" ] && [ ! -L "$JOURNEYS_CATALOGUE" ]; then
+    [ "$state" = absent ] && { printf 'null'; return 0; }
+    journeys_full "${why}no journey catalogue is configured" invalid
     return 0
   fi
-  [ -e "$JOURNEYS_CATALOGUE" ] || [ -L "$JOURNEYS_CATALOGUE" ] || { printf 'null'; return 0; }
   args=(--catalogue "$JOURNEYS_CATALOGUE" --size "$size" --run-root "${SMOKE_GATE_RUN_ROOT:-}")
   [ "$determinable" = true ] || args+=(--unknown "range not determinable: $fail_reason")
+  [ "$state" = absent ] || args+=(--recover)
   # Like the range pin's candidate: written only where `poll` can promote it.
   if [ "$COMMAND" = poll ] && [ -n "${TMP_DIR:-}" ]; then
+    candidate="$TMP_DIR/journeys-pin-$pr.json"
     snapshot_out="$TMP_DIR/journeys-catalogue-$pr.json"
-    rm -f "$snapshot_out" "$TMP_DIR/journeys-pin-$pr.json" 2>/dev/null
+    rm -f "$snapshot_out" "$candidate" 2>/dev/null
     args+=(--snapshot-out "$snapshot_out")
   fi
-  # A matcher that crashed, timed out, was handed an unusable catalogue
-  # (unreadable, unparseable OR failing validation — one rule, it exits
-  # non-zero), or came back with an empty `full` has selected NOTHING
-  # (JOURNEYS_PINNABLE): report it with the matcher's own first errors, leave
-  # no candidate — poll then cannot promote, does not offer the head this cycle
-  # and says why, and the next poll tries again.
+  # A matcher that crashed, timed out, or was handed an unusable catalogue
+  # (unreadable, unparseable OR failing validation — it exits non-zero), or a
+  # result pin-check refuses (an empty `full` above all), has selected NOTHING:
+  # report it with the first errors and leave no candidate — poll then cannot
+  # promote, does not offer the head this cycle and says why, and retries.
   err="$(mktemp 2>/dev/null)" || err=/dev/null
-  if ! out="$(printf '%s' "$paths_json" | timeout 20 python3 "$JOURNEYS_TOOL" match "${args[@]}" 2>"$err")" ||
-     ! out="$(jq -ce "select($JOURNEYS_PIN_SHAPE) | . + {pinState:\"absent\"}" <<<"$out" 2>/dev/null)"; then
-    [ -z "$snapshot_out" ] || rm -f "$snapshot_out" 2>/dev/null
-    why="$(jq -r '.error // empty' "$err" 2>/dev/null | head -c 400)"
-    [ "$err" = /dev/null ] || rm -f "$err" 2>/dev/null
-    journeys_full "journey matcher failed: ${why:-crash or timeout}" absent
-    return 0
+  if ! out="$(printf '%s' "$paths_json" | timeout 20 python3 "$JOURNEYS_TOOL" match "${args[@]}" 2>"$err")"; then
+    why="${why}journey matcher failed: $(jq -r '.error // empty' "$err" 2>/dev/null | head -c 400)"
+    out=""
+  elif ! why="${why}$(printf '%s' "$out" | timeout 20 python3 "$JOURNEYS_TOOL" pin-check --candidate 2>/dev/null |
+                       jq -er 'if .state == "valid" then "" else "the computed selection is not pinnable: " + (.reason // "unknown") end' 2>/dev/null)"; then
+    why="journey matcher failed: its output could not be checked"; out=""
+  elif [ "$why" != "${why%not pinnable: *}" ]; then
+    out=""
   fi
   [ "$err" = /dev/null ] || rm -f "$err" 2>/dev/null
-  if ! jq -e "$JOURNEYS_PINNABLE" <<<"$out" >/dev/null 2>&1; then
+  if [ -z "$out" ]; then
     [ -z "$snapshot_out" ] || rm -f "$snapshot_out" 2>/dev/null
-    journeys_full "the selection is \`full\` but names no journey ($(jq -r '.reason // "no reason given"' <<<"$out"))" absent
+    journeys_full "${why%: }" "$state"
     return 0
   fi
-  [ -z "$snapshot_out" ] || printf '%s' "$out" > "$TMP_DIR/journeys-pin-$pr.json" 2>/dev/null || true
+  out="$(jq -c --arg state "$state" '. + {pinState:$state}' <<<"$out")"
+  [ -z "$candidate" ] || printf '%s' "$out" > "$candidate" 2>/dev/null || true
   printf '%s' "$out"
 }
-# Promote poll's candidate to THE journeys pin for (pr, head), catalogue
-# snapshot first. Same return contract as range_pin_promote: 0 created, 3 the
-# path is already occupied, 1 nothing could be created.
-journeys_pin_promote() {  # <pr> <head-sha> <candidate> <snapshot-candidate>
-  local pr="$1" head="$2" candidate="$3" snapshot="$4" f tmp digest snap=""
+# Promote poll's candidate to a journeys pin for (pr, head) — the primary, or
+# with `recovery` the recovery pin — catalogue snapshot first. Same return
+# contract as range_pin_promote: 0 created, 3 the path is already occupied,
+# 1 nothing could be created. The finished bytes are judged by pin-check AT
+# THEIR FINAL PATH before they are linked, so nothing invalid is ever pinned.
+journeys_pin_promote() {  # <pr> <head-sha> <candidate> <snapshot-candidate> [recovery]
+  local pr="$1" head="$2" candidate="$3" snapshot="$4" kind="${5:-}" f tmp digest snap state
   printf '%s' "$pr" | grep -Eq '^[0-9]+$' && printf '%s' "$head" | grep -Eq '^[0-9a-f]{40}$' || return 1
   lease_dir_prepare || { printf 'smoke-pr-gate: journeys pin not written: %s\n' "$LEASE_DIR_ERROR" >&2; return 1; }
-  f="$(journeys_pin_file "$pr" "$head")"
+  f="$(journeys_pin_file "$pr" "$head" "$kind")"
   if [ -e "$f" ] || [ -L "$f" ]; then return 3; fi
   digest="$(jq -r '.catalogueSha256 // empty' "$candidate" 2>/dev/null)" || return 1
-  if [ -n "$digest" ]; then
-    printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$' && [ -f "$snapshot" ] &&
-      [ "$(sha256sum < "$snapshot" | cut -d' ' -f1)" = "$digest" ] || return 1
-    snap="$LEASE_DIR/journeys-catalogue-$digest.json"
-    if [ ! -e "$snap" ] && [ ! -L "$snap" ]; then
-      tmp="$(mktemp "$LEASE_DIR/.journeys-catalogue.XXXXXX" 2>/dev/null)" || return 1
-      cat "$snapshot" > "$tmp" 2>/dev/null && { ln "$tmp" "$snap" 2>/dev/null || true; }
-      rm -f "$tmp" 2>/dev/null
-    fi
-    # Content-addressed, so an existing one is fine exactly when it verifies.
-    if [ -L "$snap" ] || [ ! -f "$snap" ] || [ "$(sha256sum < "$snap" | cut -d' ' -f1)" != "$digest" ]; then
-      printf 'smoke-pr-gate: journeys pin not written: catalogue snapshot %s does not verify\n' "$snap" >&2
-      return 1
-    fi
+  printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$' && [ -f "$snapshot" ] || return 1
+  snap="$LEASE_DIR/journeys-catalogue-$digest.json"
+  if [ ! -e "$snap" ] && [ ! -L "$snap" ]; then
+    tmp="$(mktemp "$LEASE_DIR/.journeys-catalogue.XXXXXX" 2>/dev/null)" || return 1
+    cat "$snapshot" > "$tmp" 2>/dev/null && { ln "$tmp" "$snap" 2>/dev/null || true; }
+    rm -f "$tmp" 2>/dev/null
   fi
+  state=valid; [ "$kind" != recovery ] || state=recovered
   tmp="$(mktemp "$LEASE_DIR/.journeys-pin-pr-$pr.XXXXXX" 2>/dev/null)" || return 1
-  if ! jq -c --arg h "$head" --arg now "$(iso_now)" --arg f "$f" --arg snap "$snap" \
-         "select(($JOURNEYS_PIN_SHAPE) and ($JOURNEYS_PINNABLE)) | . + {headSha:\$h, pinned:true, pinState:\"valid\", pinFile:\$f,
-            catalogueSnapshot:(if \$snap == \"\" then null else \$snap end), pinnedAt:\$now}" \
-         "$candidate" > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+  if ! jq -c --arg h "$head" --argjson pr "$pr" --arg slug "$(journeys_repo_slug)" --arg now "$(iso_now)" \
+         --arg f "$f" --arg snap "$snap" --arg state "$state" \
+         '. + {headSha:$h, pr:$pr, repoSlug:$slug, pinned:true, pinState:$state, pinFile:$f,
+               catalogueSnapshot:$snap, pinnedAt:$now}' "$candidate" > "$tmp" 2>/dev/null ||
+     [ "$(jq -r '.state' <<<"$(journeys_pin_check "$tmp" "$pr" "$head" --as-path "$f")")" != valid ]; then
+    printf 'smoke-pr-gate: journeys pin not written: %s\n' \
+      "$(jq -r '.reason // "candidate unreadable"' <<<"$(journeys_pin_check "$tmp" "$pr" "$head" --as-path "$f")")" >&2
     rm -f "$tmp" 2>/dev/null; return 1
   fi
   if ln "$tmp" "$f" 2>/dev/null; then rm -f "$tmp" 2>/dev/null; return 0; fi
@@ -4646,16 +4667,19 @@ while IFS= read -r ROW; do
            "$(jq -r '.campaignRange.reason // "no shared range-pin storage"' <<<"$FACTS")" >&2 ;;
     esac
   fi
-  # The journeys pin follows the range pin, by the same table: valid/invalid
-  # are offered as read; absent is promoted (rc 3 or 1 drops the candidate for
-  # this cycle); unavailable is not offered.
+  # The journeys pin follows the range pin. valid/recovered are offered as
+  # read; absent/recovery-absent are promoted (the primary, or the recovery pin
+  # beside an invalid primary; rc 3 or 1 drops the candidate for this cycle);
+  # invalid (neither pin usable) and unavailable are NOT offered, said on stderr.
   if [ "$RANGE_PIN_CONFLICT" != true ] &&
      [ "$(jq -r '.isFreezePr == true and .settled == true and (.journeys | type == "object")' <<<"$FACTS")" = true ]; then
+    JOURNEYS_KIND=""
     case "$(jq -r '.journeys.pinState // "absent"' <<<"$FACTS")" in
-      valid|invalid) ;;
-      absent)
-        if journeys_pin_promote "$PR" "$HEAD_SHA" "$TMP_DIR/journeys-pin-$PR.json" "$TMP_DIR/journeys-catalogue-$PR.json" &&
-           JOURNEYS_PINNED="$(jq -c --slurpfile j "$(journeys_pin_file "$PR" "$HEAD_SHA")" '.journeys=$j[0]' <<<"$FACTS" 2>/dev/null)" &&
+      valid|recovered) ;;
+      absent|recovery-absent)
+        [ "$(jq -r '.journeys.pinState' <<<"$FACTS")" = absent ] || JOURNEYS_KIND=recovery
+        if journeys_pin_promote "$PR" "$HEAD_SHA" "$TMP_DIR/journeys-pin-$PR.json" "$TMP_DIR/journeys-catalogue-$PR.json" "$JOURNEYS_KIND" &&
+           JOURNEYS_PINNED="$(jq -c --slurpfile j "$(journeys_pin_file "$PR" "$HEAD_SHA" "$JOURNEYS_KIND")" '.journeys=$j[0]' <<<"$FACTS" 2>/dev/null)" &&
            [ -n "$JOURNEYS_PINNED" ]; then
           FACTS="$JOURNEYS_PINNED"
         else
@@ -4665,7 +4689,7 @@ while IFS= read -r ROW; do
         fi ;;
       *) RANGE_PIN_CONFLICT=true
          printf 'smoke-pr-gate: freeze PR #%s is settled but not offered: %s\n' "$PR" \
-           "$(jq -r '.journeys.reason // "no shared journeys-pin storage"' <<<"$FACTS")" >&2 ;;
+           "$(jq -r '.journeys.reason // "no usable journeys pin"' <<<"$FACTS")" >&2 ;;
     esac
   fi
   if [ "$STATE_DIRTY" = true ]; then
