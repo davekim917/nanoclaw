@@ -324,12 +324,6 @@ require_contract_owner() {
     die "completion contract belongs to a different coordinator owner — STOP writing. If you are the RECOVERY owner of this same run on the same sourceSha, run 'adopt <run-dir> <source-sha>' once and retry; on a different sourceSha only 'contract --regenerate' applies. Otherwise STOP this campaign"
 }
 
-# Digest, never the token: the adoption history must not become a second place
-# a predecessor's credential can be read back from. Tokens minted by the gate
-# are 256 bits of sha256 over a kernel uuid (smoke-pr-gate.sh:231-238), so the
-# digest is not reversible by enumeration.
-owner_digest() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
-
 # A re-dispatched lane gets a newer generation before its replacement marker
 # lands. Preserve the prior raw marker at that boundary so recovering missing
 # evidence produces an auditable forward replay instead of rewriting history.
@@ -727,12 +721,16 @@ adopt)
     exit 0
   fi
   tmp="$(mktemp "$RUN_DIR/.completion-contract.XXXXXX")"
+  # The history entry carries NOTHING derived from an owner value — no token
+  # and no digest of one. An owner is not always a gate-minted 256-bit token:
+  # task-claim takes an arbitrary caller-supplied owner and otherwise defaults
+  # to the hostname (smoke-pr-gate.sh:2775), so an unsalted digest would be
+  # enumerable back to a reusable credential. `index` + `adoptedAt` record that
+  # and when ownership changed hands; who holds it now is the token above.
   jq --arg owner "$FENCED_OWNER" --arg now "$(iso_now)" \
-     --arg priorDigest "$(owner_digest "$PRIOR_OWNER")" \
-     --arg newDigest "$(owner_digest "$FENCED_OWNER")" \
     '.coordinatorOwnerToken = $owner |
      .ownerAdoptions = ((.ownerAdoptions // []) +
-       [{adoptedAt:$now, priorOwnerDigest:$priorDigest, adoptedByDigest:$newDigest}])' \
+       [{index:(((.ownerAdoptions // []) | length) + 1), adoptedAt:$now}])' \
     "$CONTRACT" > "$tmp"
   # Deterministic regression seam for a crash between validation and commit,
   # same guard as smoke-pr-gate.sh:4388. Production wrappers never set it.

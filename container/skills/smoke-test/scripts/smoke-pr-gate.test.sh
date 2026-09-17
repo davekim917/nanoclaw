@@ -1715,9 +1715,14 @@ for stale_verb in marker redispatch adopt; do
 done
 OUT="$(bash "$GATE" finish "$POLL_FAIL_SHA" "$ADOPT_RUN" NO_GO "$ADOPT_T1" || true)"
 jq -e '.ok == false and (.error | test("caller owner"))' <<<"$OUT" >/dev/null
-if grep -qF "$ADOPT_T1" "$ADOPT_DIR/completion-contract.json"; then
-  echo "adoption left the predecessor's token in the contract" >&2; exit 1
-fi
+for leaked in "$ADOPT_T1" "$(printf '%s' "$ADOPT_T1" | sha256sum | cut -d' ' -f1)" \
+              "$(printf '%s' "$ADOPT_T2" | sha256sum | cut -d' ' -f1)"; do
+  if grep -qF "$leaked" "$ADOPT_DIR/completion-contract.json"; then
+    echo "adoption left a predecessor token or an owner-derived digest in the contract" >&2; exit 1
+  fi
+done
+jq -e '.ownerAdoptions == [.ownerAdoptions[0]] and (.ownerAdoptions[0] | keys == ["adoptedAt","index"])' \
+  "$ADOPT_DIR/completion-contract.json" >/dev/null
 # The successor finishes the missing lane; the predecessor's marker is the
 # same bytes at the same generation and still satisfies the barrier.
 scaffold_as "$ADOPT_T2" marker "$ADOPT_DIR" S1 completed 'by the recovery owner' | jq -e '.ok == true and .generation == 1' >/dev/null

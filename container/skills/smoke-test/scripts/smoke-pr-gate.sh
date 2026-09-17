@@ -4430,7 +4430,7 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
 
   # A resumed run id whose completion contract already exists is bound to the
   # PREDECESSOR's token: `contract` stamps coordinatorOwnerToken once
-  # (smoke-run-scaffold.sh:496) and the token minted above is always new, so
+  # (smoke-run-scaffold.sh:490) and the token minted above is always new, so
   # the scaffold's require_contract_owner (smoke-run-scaffold.sh:320-325) will
   # refuse this wake's marker/redispatch until it runs `adopt`. Say so in the
   # wake rather than leaving the successor to discover it from a refusal.

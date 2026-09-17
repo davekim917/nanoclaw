@@ -258,19 +258,23 @@ SMOKE_GATE_OWNER=owner-b scaffold adopt "$ADOPT" "$SHA" |
 [ "$(jq -c '[.lanes, .requiredLaneMarkers, .createdAt, .sourceSha, .runId]' "$ADOPT/completion-contract.json")" = "$ADOPT_LANES" ]
 [ "$(sha256sum "$ADOPT/markers/B1.json" | cut -d' ' -f1)" = "$ADOPT_B1_HASH" ]
 [ "$(sha256sum "$ADOPT/markers/S1.json" | cut -d' ' -f1)" = "$ADOPT_S1_HASH" ]
-# History records a DIGEST of the predecessor, never its token, and the
-# successor is an adopter — nothing anywhere names it as the author.
-jq -e --arg prior "$(printf '%s' owner-a | sha256sum | cut -d' ' -f1)" \
-      --arg by "$(printf '%s' owner-b | sha256sum | cut -d' ' -f1)" '
+# History records THAT ownership changed hands and when — nothing derived from
+# either owner value: no token, and no digest of one (a task owner may be a
+# hostname, so an unsalted digest is enumerable). The successor is an adopter;
+# nothing anywhere names it as the author.
+jq -e '
   .coordinatorOwnerToken == "owner-b" and
   (.ownerAdoptions | length == 1) and
-  .ownerAdoptions[0].priorOwnerDigest == $prior and
-  .ownerAdoptions[0].adoptedByDigest == $by and
+  (.ownerAdoptions[0] | keys == ["adoptedAt","index"]) and
+  .ownerAdoptions[0].index == 1 and
   (.ownerAdoptions[0].adoptedAt | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
 ' "$ADOPT/completion-contract.json" >/dev/null
-if grep -q 'owner-a' "$ADOPT/completion-contract.json"; then
-  echo "adoption stored the predecessor's token in the contract" >&2; exit 1
-fi
+for leaked in owner-a "$(printf '%s' owner-a | sha256sum | cut -d' ' -f1)" \
+              "$(printf '%s' owner-b | sha256sum | cut -d' ' -f1)"; do
+  if grep -qF "$leaked" "$ADOPT/completion-contract.json"; then
+    echo "adoption stored a predecessor token or an owner-derived digest in the contract" >&2; exit 1
+  fi
+done
 # Exact retry is a no-op: same bytes, no second history entry.
 ADOPT_AFTER="$(sha256sum "$ADOPT/completion-contract.json" | cut -d' ' -f1)"
 SMOKE_GATE_OWNER=owner-b scaffold adopt "$ADOPT" "$SHA" |

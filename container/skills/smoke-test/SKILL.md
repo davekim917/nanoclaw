@@ -2025,9 +2025,9 @@ bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh adopt <run-dir> <sourc
 
 Default to `adopt` on a same-SHA recovery: `--regenerate` throws away valid
 evidence that may be unrecoverable once previews are gone. `adopt` only works
-for the caller that currently holds the state, lease and PR authority, records
-the predecessor as a digest in `ownerAdoptions[]` (you adopted the contract;
-you did not author it — report it that way), and is a no-op on exact retry. It
+for the caller that currently holds the state, lease and PR authority, appends
+an `ownerAdoptions[]` entry (you adopted the contract; you did not author it —
+report it that way), and is a no-op on exact retry. It
 is never a way around a refusal: never reuse or look up the predecessor's
 token, and if `adopt` itself answers `caller owner does not match`, you are the
 stale one — STOP. `lease-renew` and `lease-release`
