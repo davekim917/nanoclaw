@@ -13,7 +13,7 @@
  * `--device-endpoint`. When a server does publish one, this is the nicest flow
  * on an ssh session: no tunnel, no paste, no redirect at all.
  */
-import type { FetchLike } from './discovery.js';
+import { assertHttpsEndpoint, type FetchLike } from './discovery.js';
 import { OAuthTokenError, type TokenResponse } from './oauth-client.js';
 
 const DEVICE_TIMEOUT_MS = 15_000;
@@ -67,9 +67,13 @@ export async function requestDeviceAuthorization(
   return {
     deviceCode: parsed.device_code,
     userCode: parsed.user_code,
-    verificationUri,
+    // Printed for a human to open, so it is held to the same bar as a URL this
+    // host would fetch — see `assertHttpsEndpoint`'s note on the one gate.
+    verificationUri: assertHttpsEndpoint('verification_uri', verificationUri),
     verificationUriComplete:
-      typeof parsed.verification_uri_complete === 'string' ? parsed.verification_uri_complete : undefined,
+      typeof parsed.verification_uri_complete === 'string'
+        ? assertHttpsEndpoint('verification_uri_complete', parsed.verification_uri_complete)
+        : undefined,
     expiresInSeconds: typeof parsed.expires_in === 'number' ? parsed.expires_in : 900,
     // RFC 8628 §3.2: absent means 5 seconds.
     intervalSeconds: typeof parsed.interval === 'number' ? parsed.interval : 5,

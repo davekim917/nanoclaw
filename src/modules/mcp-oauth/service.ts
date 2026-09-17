@@ -184,17 +184,19 @@ export interface LoginResult {
 /** How long an opt-in loopback listener stays up by default. */
 export const DEFAULT_LISTEN_TIMEOUT_SECONDS = 600;
 
-export async function startLogin(input: LoginInput, fetchImpl: FetchLike = fetch): Promise<LoginResult> {
+export function startLogin(input: LoginInput, fetchImpl: FetchLike = fetch): Promise<LoginResult> {
   assertIntegrationName(input.name);
+  return withIntegrationLock(input.name, () => startLoginLocked(input, fetchImpl));
+}
 
+async function startLoginLocked(input: LoginInput, fetchImpl: FetchLike): Promise<LoginResult> {
   const group = await getAgentGroup(input.agentGroupId);
   if (!group) throw new Error(`Agent group not found: ${input.agentGroupId}`);
 
   const mcp = new URL(input.mcpUrl);
-  // Same reasoning as `--device-endpoint`: an `http:` issuer would have the
-  // authorization-server METADATA fetched in the clear, and every endpoint in a
-  // forged document would then pass the per-endpoint check further down.
-  if (input.issuer) assertHttpsEndpoint('--issuer', input.issuer);
+  // `--issuer` is NOT checked here: `discoverAuthorization` gates whichever
+  // issuer it is about to fetch from, override or discovered, which is the one
+  // place both arrive at (see `assertHttpsEndpoint`).
   const discovered = await discoverAuthorization(fetchImpl, input.mcpUrl, input.issuer);
 
   if (discovered.codeChallengeMethods.length > 0 && !discovered.codeChallengeMethods.includes('S256')) {
@@ -205,6 +207,22 @@ export async function startLogin(input: LoginInput, fetchImpl: FetchLike = fetch
   }
 
   const existingRow = await getMcpOAuthIntegration(input.name);
+  // An integration's group is IMMUTABLE. Silently moving `agent_group_id` would
+  // point `complete` at the new group's `container.json` while leaving the old
+  // group's declaration in place, and a declared secret is granted on every
+  // spawn (`src/onecli-secrets.ts:487`) — so the old group would keep a live
+  // bearer, and on a shared `--secret` would keep receiving refreshed ones. The
+  // two-step path is explicit about what it leaves behind, which a silent move
+  // is not.
+  if (existingRow && existingRow.agent_group_id !== input.agentGroupId) {
+    throw new Error(
+      `Integration "${input.name}" belongs to agent group ${existingRow.agent_group_id}. ` +
+        'An integration cannot change groups in place — the old group keeps its container.json ' +
+        'declaration and would keep being granted the bearer. To move it: ' +
+        `ncl integrations remove --name ${input.name}, then drop "${existingRow.bearer_secret_name}" ` +
+        "from that group's container.json onecliSecrets, then log in again under the new group.",
+    );
+  }
   // A re-login keeps the redirect URI the client was REGISTERED with, because
   // the authorization server stored that exact string and rejects an exchange
   // that does not match it. An explicit `--redirect-uri` or `--port` overrides
@@ -364,14 +382,14 @@ export async function startLogin(input: LoginInput, fetchImpl: FetchLike = fetch
         // for this name mints a new `pending.state`, and a late failure from the
         // attempt it superseded must not drag a newer — possibly already
         // successful — one back to `pending`.
-        void (async () => {
+        void withIntegrationLock(input.name, async () => {
           const current = readMcpOAuthBundle(input.name);
           if (current?.pending?.state !== state) return;
           await markMcpOAuthIntegration(input.name, {
             status: 'pending',
             status_detail: `device login failed: ${err instanceof Error ? err.message : String(err)}`,
           });
-        })().catch(() => undefined);
+        }).catch(() => undefined);
       });
 
     return {
@@ -400,22 +418,28 @@ export async function startLogin(input: LoginInput, fetchImpl: FetchLike = fetch
     // Same reason as the device poll: the URL has to reach the operator before
     // anything can arrive on this port.
     listener.captured
-      .then(async (capture) => {
-        const row = await getMcpOAuthIntegration(input.name);
-        const bundle = readMcpOAuthBundle(input.name);
-        if (!row || !bundle?.pending) return;
-        const code = assertAuthorizationCode(capture, bundle.pending.state);
-        const token = await exchangeAuthorizationCode(fetchImpl, {
-          tokenEndpoint: row.token_endpoint,
-          clientId: bundle.clientId,
-          clientSecret: bundle.clientSecret,
-          code,
-          codeVerifier: bundle.pending.codeVerifier,
-          redirectUri: row.redirect_uri,
-          resource: row.resource ?? undefined,
-        });
-        await finalizeToken(row, bundle, token, { newGrant: true });
-      })
+      .then((capture) =>
+        // Under the lock, and re-reading: by the time a redirect lands, a later
+        // `login`, a `complete` or a `remove` may have moved everything. The
+        // state check inside `assertAuthorizationCode` is what rejects a capture
+        // from a superseded attempt.
+        withIntegrationLock(input.name, async () => {
+          const row = await getMcpOAuthIntegration(input.name);
+          const bundle = readMcpOAuthBundle(input.name);
+          if (!row || !bundle?.pending) return;
+          const code = assertAuthorizationCode(capture, bundle.pending.state);
+          const token = await exchangeAuthorizationCode(fetchImpl, {
+            tokenEndpoint: row.token_endpoint,
+            clientId: bundle.clientId,
+            clientSecret: bundle.clientSecret,
+            code,
+            codeVerifier: bundle.pending.codeVerifier,
+            redirectUri: row.redirect_uri,
+            resource: row.resource ?? undefined,
+          });
+          await finalizeToken(row, bundle, token, { newGrant: true });
+        }),
+      )
       .catch((err: unknown) => {
         // Includes the ordinary "nobody used the tunnel" timeout. Never fatal:
         // the paste path is still open and is what the operator was told to use
@@ -445,7 +469,11 @@ export async function startLogin(input: LoginInput, fetchImpl: FetchLike = fetch
  * the bundle and comparing is enough because `login` is the only writer of
  * `pending`.
  */
-async function finishInBackground(name: string, attemptState: string, token: TokenResponse): Promise<void> {
+function finishInBackground(name: string, attemptState: string, token: TokenResponse): Promise<void> {
+  return withIntegrationLock(name, () => finishInBackgroundLocked(name, attemptState, token));
+}
+
+async function finishInBackgroundLocked(name: string, attemptState: string, token: TokenResponse): Promise<void> {
   const row = await getMcpOAuthIntegration(name);
   const bundle = readMcpOAuthBundle(name);
   if (!row || !bundle) return;
@@ -606,11 +634,18 @@ function assertAuthorizationCode(
  * reach the provider. A login happens once per integration, so the simplest
  * thing that always works is the one that is not opt-in.
  */
-export async function completeLogin(
+export function completeLogin(
   input: { name: string; redirectResponse: string },
   fetchImpl: FetchLike = fetch,
 ): Promise<CompleteResult> {
   assertIntegrationName(input.name);
+  return withIntegrationLock(input.name, () => completeLoginLocked(input, fetchImpl));
+}
+
+async function completeLoginLocked(
+  input: { name: string; redirectResponse: string },
+  fetchImpl: FetchLike,
+): Promise<CompleteResult> {
   const row = await getMcpOAuthIntegration(input.name);
   if (!row) throw new Error(`No integration named "${input.name}" — run \`ncl integrations login\` first.`);
   const bundle = readMcpOAuthBundle(input.name);
@@ -706,6 +741,44 @@ export function decideRefresh(row: McpOAuthIntegration, nowMs: number): RefreshD
     : { refresh: false, reason: 'within-window' };
 }
 
+/**
+ * Serializes every mutation of one integration — its row, its bundle file and
+ * its OneCLI secret are three stores that must move together.
+ *
+ * The case that needs it: a refresh reads a row and its bundle, then awaits the
+ * token endpoint. `remove --delete-secret` runs in that window and deletes all
+ * three. The refresh continuation then re-writes the bundle and recreates the
+ * vault secret, while its own UPDATE silently matches zero rows — and because
+ * `remove` deliberately leaves the group's `container.json` declaration alone,
+ * `applyOnecliSecrets` grants that resurrected secret again on the next spawn
+ * (`src/onecli-secrets.ts:487`). A credential that `ncl integrations list` says
+ * is gone would be live.
+ *
+ * In-process is sufficient and is the established shape: the host is one Node
+ * process and `src/onecli-secrets.ts:168` serializes its own read-modify-write
+ * against the same vault the same way.
+ */
+const integrationLocks = new Map<string, Promise<unknown>>();
+
+async function withIntegrationLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  const previous = integrationLocks.get(name) ?? Promise.resolve();
+  // Run whether the predecessor settled or threw — one failure must not wedge
+  // every later operation on this integration.
+  const run = previous.then(fn, fn);
+  const guarded = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  integrationLocks.set(name, guarded);
+  try {
+    return await run;
+  } finally {
+    // Drop the entry only when nothing queued behind us, so the map stays the
+    // size of the live integrations rather than growing forever.
+    if (integrationLocks.get(name) === guarded) integrationLocks.delete(name);
+  }
+}
+
 /** Warned-once set, so an integration needing a human says so on one tick, not
  *  every tick. Cleared when the row leaves `needs_login`. */
 const warnedNeedsLogin = new Set<string>();
@@ -733,120 +806,139 @@ export async function refreshExpiringMcpOAuthIntegrations(fetchImpl: FetchLike =
   const outcome: RefreshOutcome = { checked: 0, refreshed: [], failed: [], needsLogin: [] };
   const now = Date.now();
 
-  for (const row of rows) {
-    if (row.status !== 'needs_login') warnedNeedsLogin.delete(row.name);
-    const decision = decideRefresh(row, now);
+  for (const listed of rows) {
+    if (listed.status !== 'needs_login') warnedNeedsLogin.delete(listed.name);
+    const decision = decideRefresh(listed, now);
     if (!decision.refresh) continue;
     outcome.checked++;
-
-    const bundle = readMcpOAuthBundle(row.name);
-    if (!bundle?.refreshToken) {
-      if (!warnedNeedsLogin.has(row.name)) {
-        warnedNeedsLogin.add(row.name);
-        log.warn('MCP OAuth integration has no refresh token — re-login required', {
-          integration: row.name,
-          agentGroupId: row.agent_group_id,
-          mcpUrl: row.mcp_url,
-        });
-      }
-      await markMcpOAuthIntegration(row.name, {
-        status: 'needs_login',
-        status_detail: 'no refresh token on file — run `ncl integrations login`',
-      });
-      outcome.needsLogin.push(row.name);
-      continue;
-    }
-
-    try {
-      const token = await refreshAccessToken(fetchImpl, {
-        tokenEndpoint: row.token_endpoint,
-        clientId: bundle.clientId,
-        clientSecret: bundle.clientSecret,
-        refreshToken: bundle.refreshToken,
-        scopes: row.scopes ?? undefined,
-        resource: row.resource ?? undefined,
-      });
-
-      // Refresh-token ROTATION lands on disk FIRST, before the fallible OneCLI
-      // write. A server that returned a new refresh token has already
-      // invalidated the old one, so a crash after the secret write but before
-      // this one would leave a dead token on disk and turn a live grant into a
-      // forced human login. Ordered the other way round, the worst case is a
-      // fresh token on disk beside a stale bearer, which the next tick fixes.
-      // RFC 6749 §6 permits an omitted `refresh_token` on a refresh response and
-      // it means "keep the one you have" — which is why the fallback is correct
-      // HERE and wrong in `finalizeToken`'s new-grant path.
-      writeMcpOAuthBundle({
-        ...bundle,
-        refreshToken: token.refreshToken ?? bundle.refreshToken,
-        scopes: token.scope ?? bundle.scopes,
-        updatedAt: new Date().toISOString(),
-      });
-
-      const secret = await putOnecliBearerSecret(
-        {
-          name: row.bearer_secret_name,
-          hostPattern: row.host_pattern,
-          pathPattern: row.path_pattern,
-          headerName: 'Authorization',
-          valueFormat: `${token.tokenType || 'Bearer'} {value}`,
-        },
-        token.accessToken,
-      );
-
-      await markMcpOAuthIntegration(row.name, {
-        status: 'active',
-        status_detail: null,
-        expires_at: expiryFrom(token, Date.now()),
-        // Track a narrowing the server applied on this refresh, so the next one
-        // asks for what it actually has (see the note in `finalizeToken`).
-        scopes: token.scope ?? row.scopes,
-        bearer_secret_id: secret.id,
-        last_refresh_at: new Date().toISOString(),
-      });
-      outcome.refreshed.push(row.name);
-      log.info('MCP OAuth access token refreshed', {
-        integration: row.name,
-        reason: decision.reason,
-        expiresAt: expiryFrom(token, Date.now()),
-        rotatedRefreshToken: Boolean(token.refreshToken && token.refreshToken !== bundle.refreshToken),
-      });
-    } catch (err) {
-      if (isUnrecoverableGrantError(err)) {
-        // `invalid_client` / `unauthorized_client` condemn the REGISTRATION, not
-        // just the grant. Recording that is what makes the "run login again"
-        // advice true: without it the next login finds a stored clientId, skips
-        // dynamic registration, and replays the credentials the server just
-        // refused.
-        if (err instanceof OAuthTokenError && err.code !== 'invalid_grant') {
-          writeMcpOAuthBundle({ ...bundle, clientRejectedAt: new Date().toISOString() });
-        }
-        await markMcpOAuthIntegration(row.name, {
-          status: 'needs_login',
-          status_detail: `token endpoint rejected the grant: ${err instanceof Error ? err.message : String(err)}`,
-        });
-        outcome.needsLogin.push(row.name);
-        if (!warnedNeedsLogin.has(row.name)) {
-          warnedNeedsLogin.add(row.name);
-          log.warn('MCP OAuth refresh token rejected — re-login required', {
-            integration: row.name,
-            agentGroupId: row.agent_group_id,
-            mcpUrl: row.mcp_url,
-            err,
-          });
-        }
-        continue;
-      }
-      await markMcpOAuthIntegration(row.name, {
-        status: 'error',
-        status_detail: err instanceof Error ? err.message : String(err),
-      });
-      outcome.failed.push(row.name);
-      log.warn('MCP OAuth refresh failed — will retry next sweep', { integration: row.name, err });
-    }
+    await withIntegrationLock(listed.name, () => refreshOne(listed.name, decision, outcome, fetchImpl));
   }
 
   return outcome;
+}
+
+/**
+ * Refresh exactly one integration, under its lock.
+ *
+ * The row is RE-READ here rather than taken from the listing: the listing is a
+ * snapshot, and everything that could have changed it — a `complete`, a
+ * `remove`, an earlier tick still finishing — holds this same lock, so the read
+ * inside it is the current truth. A row that has gone means the integration was
+ * removed while this tick was queued behind it, and there is nothing to do.
+ */
+async function refreshOne(
+  name: string,
+  decision: RefreshDecision,
+  outcome: RefreshOutcome,
+  fetchImpl: FetchLike,
+): Promise<void> {
+  const row = await getMcpOAuthIntegration(name);
+  if (!row) return;
+  const bundle = readMcpOAuthBundle(row.name);
+  if (!bundle?.refreshToken) {
+    if (!warnedNeedsLogin.has(row.name)) {
+      warnedNeedsLogin.add(row.name);
+      log.warn('MCP OAuth integration has no refresh token — re-login required', {
+        integration: row.name,
+        agentGroupId: row.agent_group_id,
+        mcpUrl: row.mcp_url,
+      });
+    }
+    await markMcpOAuthIntegration(row.name, {
+      status: 'needs_login',
+      status_detail: 'no refresh token on file — run `ncl integrations login`',
+    });
+    outcome.needsLogin.push(row.name);
+    return;
+  }
+
+  try {
+    const token = await refreshAccessToken(fetchImpl, {
+      tokenEndpoint: row.token_endpoint,
+      clientId: bundle.clientId,
+      clientSecret: bundle.clientSecret,
+      refreshToken: bundle.refreshToken,
+      scopes: row.scopes ?? undefined,
+      resource: row.resource ?? undefined,
+    });
+
+    // Refresh-token ROTATION lands on disk FIRST, before the fallible OneCLI
+    // write. A server that returned a new refresh token has already
+    // invalidated the old one, so a crash after the secret write but before
+    // this one would leave a dead token on disk and turn a live grant into a
+    // forced human login. Ordered the other way round, the worst case is a
+    // fresh token on disk beside a stale bearer, which the next tick fixes.
+    // RFC 6749 §6 permits an omitted `refresh_token` on a refresh response and
+    // it means "keep the one you have" — which is why the fallback is correct
+    // HERE and wrong in `finalizeToken`'s new-grant path.
+    writeMcpOAuthBundle({
+      ...bundle,
+      refreshToken: token.refreshToken ?? bundle.refreshToken,
+      scopes: token.scope ?? bundle.scopes,
+      updatedAt: new Date().toISOString(),
+    });
+
+    const secret = await putOnecliBearerSecret(
+      {
+        name: row.bearer_secret_name,
+        hostPattern: row.host_pattern,
+        pathPattern: row.path_pattern,
+        headerName: 'Authorization',
+        valueFormat: `${token.tokenType || 'Bearer'} {value}`,
+      },
+      token.accessToken,
+    );
+
+    await markMcpOAuthIntegration(row.name, {
+      status: 'active',
+      status_detail: null,
+      expires_at: expiryFrom(token, Date.now()),
+      // Track a narrowing the server applied on this refresh, so the next one
+      // asks for what it actually has (see the note in `finalizeToken`).
+      scopes: token.scope ?? row.scopes,
+      bearer_secret_id: secret.id,
+      last_refresh_at: new Date().toISOString(),
+    });
+    outcome.refreshed.push(row.name);
+    log.info('MCP OAuth access token refreshed', {
+      integration: row.name,
+      reason: decision.reason,
+      expiresAt: expiryFrom(token, Date.now()),
+      rotatedRefreshToken: Boolean(token.refreshToken && token.refreshToken !== bundle.refreshToken),
+    });
+  } catch (err) {
+    if (isUnrecoverableGrantError(err)) {
+      // `invalid_client` / `unauthorized_client` condemn the REGISTRATION, not
+      // just the grant. Recording that is what makes the "run login again"
+      // advice true: without it the next login finds a stored clientId, skips
+      // dynamic registration, and replays the credentials the server just
+      // refused.
+      if (err instanceof OAuthTokenError && err.code !== 'invalid_grant') {
+        writeMcpOAuthBundle({ ...bundle, clientRejectedAt: new Date().toISOString() });
+      }
+      await markMcpOAuthIntegration(row.name, {
+        status: 'needs_login',
+        status_detail: `token endpoint rejected the grant: ${err instanceof Error ? err.message : String(err)}`,
+      });
+      outcome.needsLogin.push(row.name);
+      if (!warnedNeedsLogin.has(row.name)) {
+        warnedNeedsLogin.add(row.name);
+        log.warn('MCP OAuth refresh token rejected — re-login required', {
+          integration: row.name,
+          agentGroupId: row.agent_group_id,
+          mcpUrl: row.mcp_url,
+          err,
+        });
+      }
+      return;
+    }
+    await markMcpOAuthIntegration(row.name, {
+      status: 'error',
+      status_detail: err instanceof Error ? err.message : String(err),
+    });
+    outcome.failed.push(row.name);
+    log.warn('MCP OAuth refresh failed — will retry next sweep', { integration: row.name, err });
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -870,8 +962,12 @@ export interface RemoveResult {
  * secret is inert, a deleted one that something still declares fails the spawn
  * closed (`src/onecli-secrets.ts:432`).
  */
-export async function removeIntegration(name: string, options: { deleteSecret?: boolean } = {}): Promise<RemoveResult> {
+export function removeIntegration(name: string, options: { deleteSecret?: boolean } = {}): Promise<RemoveResult> {
   assertIntegrationName(name);
+  return withIntegrationLock(name, () => removeIntegrationLocked(name, options));
+}
+
+async function removeIntegrationLocked(name: string, options: { deleteSecret?: boolean }): Promise<RemoveResult> {
   const row = await getMcpOAuthIntegration(name);
   let removedSecret = false;
   if (options.deleteSecret && row) {

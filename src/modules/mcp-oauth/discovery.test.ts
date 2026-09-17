@@ -226,6 +226,35 @@ describe('discoverAuthorization', () => {
     );
   });
 
+  // Round-3 review F1: the earlier fix gated the four ENDPOINTS and the
+  // `--issuer` override, and missed the discovered issuer — which is the
+  // load-bearing one. Over cleartext the metadata DOCUMENT can be substituted
+  // wholesale, and every https endpoint inside a forged one passes the
+  // per-endpoint check.
+  it('refuses a cleartext issuer from the resource metadata, before fetching from it', async () => {
+    const calls: string[] = [];
+    const fetchImpl = routed(
+      {
+        'https://mcp.x.test/mcp': json({}, 401),
+        'https://mcp.x.test/.well-known/oauth-protected-resource': json({
+          authorization_servers: ['http://as.x.test'],
+        }),
+        'http://as.x.test/.well-known/oauth-authorization-server': json({
+          issuer: 'http://as.x.test',
+          authorization_endpoint: 'https://evil.x.test/auth',
+          token_endpoint: 'https://evil.x.test/tok',
+        }),
+      },
+      calls,
+    );
+
+    await expect(discoverAuthorization(fetchImpl, 'https://mcp.x.test/mcp')).rejects.toThrow(
+      /authorization_servers entry must be https/,
+    );
+    // Before the fetch: the forged document is never even read.
+    expect(calls).not.toContain('http://as.x.test/.well-known/oauth-authorization-server');
+  });
+
   it('demands an issuer when the resource metadata lists none', async () => {
     const fetchImpl = routed({
       'https://mcp.x.test/mcp': json({}, 401),

@@ -140,13 +140,13 @@ new value on the next request.
 
 ## What it refuses
 
-- **A cleartext endpoint.** Every `authorization_endpoint`, `token_endpoint`,
-  `registration_endpoint` and `device_authorization_endpoint` must be `https` (RFC 8414 §2) —
-  discovered or supplied by `--issuer` / `--device-endpoint`, which go through the same check.
-  Metadata arrives over the network, so an `http:` endpoint in it would put the authorization code,
-  the client secret and the refresh token on the wire in the clear, and an `http:` issuer would have
-  the metadata document itself fetched in the clear. There is no loopback exemption: the only
-  loopback URL in this flow is the redirect, which the browser resolves and this host never calls.
+- **Anything cleartext.** Every URL this flow fetches — the issuer it reads metadata from, the
+  authorization, token, registration and device endpoints, and the verification URI a device login
+  prints for you to open — must be `https` (RFC 8414 §2), whether it was discovered or supplied by
+  `--issuer` / `--device-endpoint`. The issuer is the load-bearing one: metadata fetched over
+  cleartext can be substituted wholesale, and every `https` endpoint inside a forged document would
+  pass a per-endpoint check. There is no loopback exemption — the only loopback URL here is the
+  redirect, which your browser resolves and this host never calls.
 - **A `plain` PKCE downgrade.** S256 or nothing, even where a server still advertises `plain`.
 - **A path-traversing integration name.** Names are `[a-z0-9-]`, because a name is a file name.
 
@@ -177,6 +177,15 @@ new access token, PATCHed over the same OneCLI secret.
 
 `ncl integrations refresh` runs the same pass on demand.
 
+## One group per integration
+
+An integration's `--group` is fixed at its first `login`. A re-login naming a different group is
+refused, because moving it silently would point `complete` at the new group's `container.json` while
+leaving the old group's declaration in place — and a declared secret is granted on every spawn, so
+the old group would keep a live bearer, and on a shared `--secret` would keep receiving refreshed
+ones. To move one: `remove` it, drop its secret from the old group's `container.json`
+`onecliSecrets`, then log in under the new group.
+
 ## Removing one
 
 ```bash
@@ -187,6 +196,14 @@ Deletes the registry row and the host-side bundle. The OneCLI secret and the `co
 declaration are left alone — the secret may predate the integration and other requests may match on
 it. `--delete-secret` also deletes it; remove it from `container.json` **first**, or the next spawn
 fails closed on an unresolvable declaration.
+
+**Drop the declaration too** unless you meant to keep the secret: a name left in `onecliSecrets` is
+re-granted to that group's OneCLI agent on every spawn, so a bearer whose integration is gone stays
+usable until someone edits the file.
+
+Removal is serialized against the refresher. Every mutation of one integration — row, bundle file and
+vault secret — runs under one per-name lock, so a removal that lands while a refresh is awaiting the
+token endpoint cannot be undone by that refresh's continuation recreating the bundle and the secret.
 
 ## Access
 

@@ -110,16 +110,27 @@ export function authorizationServerMetadataUrls(issuer: string): string[] {
 }
 
 /**
- * Every endpoint this module hands onward must be HTTPS.
+ * Every URL this flow will FETCH, or hand to a human to open, must be HTTPS.
  *
- * Discovery reads its endpoints out of a document fetched from the network, so
- * an attacker who can answer for the metadata host — or an operator who
- * mistypes `--issuer` — can name an `http:` token, registration or authorization
- * endpoint, and the authorization code, the client secret and the refresh token
- * would then cross the wire in cleartext. RFC 8414 §2 requires https for all of
- * them; nothing here accepts less. There is deliberately no loopback exemption:
- * the only loopback URL in this flow is the REDIRECT, which is a URI the browser
- * resolves and this host never calls.
+ * Three rounds of review found this one invariant at three different sites — the
+ * discovered endpoints, then `--device-endpoint`, then the discovered issuer —
+ * so it is enforced once, where a URL is SELECTED, rather than once per caller:
+ *
+ *   - `discoverAuthorization` gates the issuer it is about to fetch metadata
+ *     from, whichever way that issuer arrived (`--issuer` or
+ *     `authorization_servers[0]`). That is the load-bearing one: metadata
+ *     fetched over cleartext can be substituted wholesale, and every https
+ *     endpoint inside a forged document would then pass a per-endpoint check.
+ *   - `discoverAuthorization` gates the four endpoints it returns, so nothing
+ *     downstream can receive an http one.
+ *   - `device.ts` gates the verification URI it prints, because that is a URL a
+ *     human is being told to open.
+ *   - `service.ts` gates `--device-endpoint`, the one URL that does not pass
+ *     through discovery at all.
+ *
+ * RFC 8414 §2 requires https for all of them. There is deliberately no loopback
+ * exemption: the only loopback URL in this flow is the REDIRECT, which the
+ * operator's browser resolves and this host never issues a request to.
  */
 export function assertHttpsEndpoint(label: string, url: string): string {
   let parsed: URL;
@@ -241,6 +252,10 @@ export async function discoverAuthorization(
       `Protected-resource metadata at ${resourceDoc.url} lists no authorization_servers — pass --issuer explicitly.`,
     );
   }
+
+  // BEFORE the fetch, and for the discovered value as much as the override:
+  // this is the document every endpoint below is read out of.
+  assertHttpsEndpoint(issuerOverride ? '--issuer' : 'authorization_servers entry', issuer);
 
   const asDoc = await discoverAuthorizationServer(fetchImpl, issuer);
   return {

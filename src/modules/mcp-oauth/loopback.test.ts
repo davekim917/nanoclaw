@@ -135,6 +135,15 @@ describe('device grant', () => {
     expect(auth.verificationUri).toBe('https://g.test/device');
   });
 
+  it('refuses a cleartext verification URI rather than sending an operator to it', async () => {
+    await expect(
+      requestDeviceAuthorization(
+        async () => response({ device_code: 'dc', user_code: 'u', verification_uri: 'http://evil.test/device' }),
+        { deviceAuthorizationEndpoint: 'https://as.test/da', clientId: 'c' },
+      ),
+    ).rejects.toThrow(/verification_uri must be https/);
+  });
+
   it('keeps polling through authorization_pending and backs off on slow_down', async () => {
     const slept: number[] = [];
     const replies = [

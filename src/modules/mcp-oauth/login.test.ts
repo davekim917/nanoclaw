@@ -62,10 +62,10 @@ vi.mock('./onecli-secret-writer.js', () => ({
 }));
 
 import { closeDb, createAgentGroup, initMigratedTestDb } from '../../db/index.js';
-import { getMcpOAuthIntegration } from '../../db/mcp-oauth-integrations.js';
+import { getMcpOAuthIntegration, markMcpOAuthIntegration } from '../../db/mcp-oauth-integrations.js';
 import { enforceHermeticity } from '../../test-hermeticity.js';
 import type { FetchLike } from './discovery.js';
-import { completeLogin, startLogin } from './service.js';
+import { completeLogin, refreshExpiringMcpOAuthIntegrations, removeIntegration, startLogin } from './service.js';
 import { readMcpOAuthBundle, writeMcpOAuthBundle } from './store.js';
 
 enforceHermeticity();
@@ -293,5 +293,80 @@ describe('completeLogin — a new grant owns its own refresh token (round-1 F4)'
         server({ registrations: [] }),
       ),
     ).rejects.toThrow(/State mismatch/);
+  });
+});
+
+describe('one writer per integration (round-3 F2)', () => {
+  it('a remove that lands mid-refresh is not undone by the refresh finishing', async () => {
+    const { result } = await login();
+    await completeLogin(
+      { name: 'example-int', redirectResponse: `?code=c&state=${result.state}` },
+      server({ registrations: [] }),
+    );
+    // Due on the next tick, whatever the expiry says.
+    await markMcpOAuthIntegration('example-int', { status: 'error' });
+
+    // Hold the token endpoint open, start the refresh, then remove underneath it.
+    let releaseToken: (() => void) | undefined;
+    const held = new Promise<void>((resolve) => {
+      releaseToken = resolve;
+    });
+    const refreshing = refreshExpiringMcpOAuthIntegrations(async () => {
+      await held;
+      return json({ access_token: 'at-late', refresh_token: 'rt-late', expires_in: 3600, token_type: 'Bearer' });
+    });
+
+    // `remove` queues behind the in-flight refresh rather than interleaving with
+    // it, which is the property under test: whichever order they run in, the
+    // removal is the last word.
+    releaseToken!();
+    await refreshing;
+    const removed = await removeIntegration('example-int');
+
+    expect(removed.removedRow).toBe(true);
+    expect(removed.removedBundle).toBe(true);
+    expect(await getMcpOAuthIntegration('example-int')).toBeUndefined();
+    expect(readMcpOAuthBundle('example-int')).toBeUndefined();
+  });
+
+  it('a refresh queued behind a remove finds nothing and writes nothing', async () => {
+    const { result } = await login();
+    await completeLogin(
+      { name: 'example-int', redirectResponse: `?code=c&state=${result.state}` },
+      server({ registrations: [] }),
+    );
+    await markMcpOAuthIntegration('example-int', { status: 'error' });
+    await removeIntegration('example-int');
+
+    let asked = false;
+    const outcome = await refreshExpiringMcpOAuthIntegrations(async () => {
+      asked = true;
+      return json({ access_token: 'at', expires_in: 3600, token_type: 'Bearer' });
+    });
+
+    expect(asked).toBe(false);
+    expect(outcome.refreshed).toEqual([]);
+    // Nothing recreated the bundle the removal deleted.
+    expect(readMcpOAuthBundle('example-int')).toBeUndefined();
+  });
+});
+
+describe('an integration belongs to one group (round-3 F3)', () => {
+  it('refuses a re-login under a different group, and names the two-step move', async () => {
+    await createAgentGroup({
+      id: 'ag-2',
+      name: 'Other',
+      folder: 'other',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    await login();
+
+    await expect(
+      startLogin({ name: 'example-int', mcpUrl: MCP_URL, agentGroupId: 'ag-2' }, server({ registrations: [] })),
+    ).rejects.toThrow(/belongs to agent group ag-1[\s\S]*ncl integrations remove/);
+
+    // The original binding is untouched.
+    expect((await getMcpOAuthIntegration('example-int'))!.agent_group_id).toBe('ag-1');
   });
 });
