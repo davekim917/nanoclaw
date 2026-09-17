@@ -462,8 +462,9 @@ function receiptComment(
   };
 }
 
-// A review desk's receipt: the v1 marker, then one fenced JSON object. `json`
-// replaces the object's text, for a block that does not parse.
+// A review desk's receipt in the shape that can clear: the v1 marker first, one
+// fenced JSON object, and the desk's prose after it. `json` replaces the
+// object's text, for a block that does not parse.
 function independentReceipt(
   head: string,
   verdict: string,
@@ -482,7 +483,7 @@ function independentReceipt(
     authorAssociation,
     createdAt,
     fullDatabaseId: databaseId,
-    body: `Independent review at head \`${head.slice(0, 8)}\`: ${verdict}.\n\n<!-- independent-review-receipt:v1 -->\n\`\`\`json\n${json}\n\`\`\`\n`,
+    body: `<!-- independent-review-receipt:v1 -->\n\`\`\`json\n${json}\n\`\`\`\n\nIndependent review at head \`${head.slice(0, 8)}\`: ${verdict}.\n`,
   };
 }
 
@@ -3088,9 +3089,9 @@ describe('codex-review risk-scoped review requests', () => {
         expect(result.stderr).toContain('verdict CHANGES, blocking_findings 1');
       });
 
-      // A CLEAR clears only in the desk's shape: one marker, and nothing before it
-      // that could open a literal or hidden context. Each of these is a newer
-      // write-author comment over a real CHANGES, and none of them clears.
+      // A CLEAR clears only when its comment starts with the marker and holds no
+      // other. Each of these is a newer write-author comment over a real CHANGES,
+      // and none of them clears.
       it.each([
         ['an HTML comment and tilde fences interleaved', (r: string) => `<!--\n~~~\n-->\n~~~\n-->\n${r}`],
         ['a fence opened inside a blockquote', (r: string) => `> \`\`\`\n> quoted\n\n${r}`],
@@ -3100,6 +3101,11 @@ describe('codex-review risk-scoped review requests', () => {
         ['a <details> block', (r: string) => `<details><summary>sample</summary>\n\n${r}`],
         ['a <pre> block', (r: string) => `<PRE>\n${r}`],
         ['a second CLEAR marker in the same comment', (r: string) => `${r}\n${r}`],
+        ['a tag whose multiline attribute holds the receipt', (r: string) => `<div title='\n${r}'></div>`],
+        ['one line of prose', (r: string) => `Cleared.\n${r}`],
+        ['a zero-width space', (r: string) => `\u200B\n${r}`],
+        ['a no-break space', (r: string) => `\u00A0\n${r}`],
+        ['a second byte-order mark', (r: string) => `\uFEFF\uFEFF${r}`],
       ])('does not let a CLEAR preceded by %s clear the head', (_case, wrap) => {
         const root = tempRoot();
         const newer = independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:40:00Z');
@@ -3115,30 +3121,58 @@ describe('codex-review risk-scoped review requests', () => {
         expect(result.stderr).toContain('verdict CHANGES, blocking_findings 1');
       });
 
+      const PROSE_FIRST =
+        'Release desk — **independent review at head `aaaaaaaa`: CLEAR, 0 blocking findings.**\n\n' +
+        '1. **P2, non-blocking** — `repo.ts:848` authorizes only the current row.\n\n';
+
+      it('does not let a prose-then-marker CLEAR clear: it blocks nothing either, so it defers only when nothing says no', () => {
+        const root = tempRoot();
+        const newer = independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:40:00Z');
+        const proseFirst = { ...newer, body: PROSE_FIRST + receiptText('CLEAR', 0) };
+        legacy(root, { comments: [independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z'), proseFirst] });
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(24);
+
+        legacy(root, { comments: [proseFirst] });
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+      });
+
       it.each([
         ['write', 26],
         ['read', 24],
-      ])(
-        'reads a desk-shaped CLEAR (prose, list, inline code, marker, then its JSON fence) from a %s author as %i',
-        (permission, code) => {
-          const root = tempRoot();
-          const newer = independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:40:00Z');
-          const prose =
-            'Release desk — **independent review at head `aaaaaaaa`: CLEAR, 0 blocking findings.**\n\n' +
-            'Fresh-context read of the complete diff (<model>, high, 11 min). It confirms the claim:\n\n' +
-            '1. **P2, non-blocking** — `repo.ts:848` authorizes only the current row.\n' +
-            '- no `<!` anywhere, a > quote mark mid-line, and ``double ticks`` inline.\n\n';
-          legacy(root, {
-            comments: [
-              independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z'),
-              { ...newer, body: prose + receiptText('CLEAR', 0) },
-            ],
-          });
-          fs.writeFileSync(path.join(root, 'permission--release-desk'), `${permission}\n`);
+      ])('reads a marker-first CLEAR with its prose after it from a %s author as %i', (permission, code) => {
+        const root = tempRoot();
+        const newer = independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:40:00Z');
+        legacy(root, {
+          comments: [
+            independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z'),
+            {
+              ...newer,
+              body: `${receiptText('CLEAR', 0)}\n${PROSE_FIRST}\n    an indented line\n\n~~~\nand a fence\n~~~\n`,
+            },
+          ],
+        });
+        fs.writeFileSync(path.join(root, 'permission--release-desk'), `${permission}\n`);
 
-          expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(code);
-        },
-      );
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(code);
+      });
+
+      it.each([
+        ['blank lines', '\n\n'],
+        ['CRLF blank lines', '\r\n\r\n'],
+        ['a byte-order mark', '\uFEFF'],
+        ['a byte-order mark and blank lines', '\uFEFF\n \t\n'],
+      ])('still counts a CLEAR whose marker follows only %s', (_case, lead) => {
+        const root = tempRoot();
+        const newer = independentReceipt(HEAD, 'CLEAR', 0, '2026-09-05T00:40:00Z');
+        legacy(root, {
+          comments: [
+            independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z'),
+            { ...newer, body: lead + receiptText('CLEAR', 0) },
+          ],
+        });
+
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+      });
 
       it("still lets a writer's later visible CLEAR clear an older hidden CHANGES", () => {
         const root = tempRoot();
