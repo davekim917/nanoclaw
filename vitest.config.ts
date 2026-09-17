@@ -148,13 +148,16 @@ export default defineConfig({
     //
     // Issue #274 fixed the root cause: every fixture root now comes from
     // `uniqueTmpRoot` (src/test-setup.ts), and src/fixture-roots.test.ts fails
-    // if a fixed root comes back. Turning this back on is therefore now
-    // possible, but it is a separate deliberate change — cross-file
-    // parallelism exposes any other shared state (ports, env, docker names)
-    // that has never had to be correct, and it needs its own soak.
+    // if a fixed root comes back.
     //
-    // Tests within a file still run concurrently; only cross-file parallelism
-    // is off. Measured cost: ~9 minutes for the full suite.
+    // Turning it on was measured, not assumed (PR #873, 2026-09-17, on CI's
+    // hosted runner: 2 vCPU, 7.9 GB): serial takes 17–18 min for 519 files;
+    // `fileParallelism: true` took 27 min with `--coverage` and 16 min
+    // without, plus one contention timeout. The suite is CPU-bound, so two
+    // workers on two cores inflate each other's times (individual files ran
+    // 10–20x slower) and the second worker buys nothing. Leave this off until
+    // the runner has more cores than vitest would use as workers; re-measure
+    // there before flipping it.
     fileParallelism: false,
     // Scaled under --coverage only (see COVERAGE_TIMEOUT_MULTIPLIER above) — a plain
     // `vitest run` gets vitest's own unmodified defaults (5000/10000), not these.
