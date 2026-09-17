@@ -17,7 +17,7 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { composeNanoclawSession, type NanoclawMailboxSession } from '../mailbox/index.js';
-import { deleteOrphanProcessingClaims, getProcessingClaims } from '../mailbox/ops/sweep.js';
+import { ANSWERED_LOOKUP_CHUNK, deleteOrphanProcessingClaims, getProcessingClaims } from '../mailbox/ops/sweep.js';
 import {
   SWEEP_DUTY_INVENTORY,
   _listSweepRegistrationsForTesting,
@@ -448,6 +448,41 @@ describe('S2-PR9 — per-session core', () => {
       expect(statusOf(inDb, 'task-bad-due')).toBe('pending');
       expect(ctx.plan.dueCount).toBe(5);
       expect(warn).not.toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    it('sorts a mixed backlog larger than one lookup chunk with one grouped read per chunk', async () => {
+      const { inDb, outDb, mailbox } = makeSessionDbs();
+      const total = ANSWERED_LOOKUP_CHUNK + 7;
+      const expected: string[] = [];
+      for (let i = 0; i < total; i++) {
+        const id = `task-${String(i).padStart(4, '0')}`;
+        seedTask(inDb, id, i + 1, dueAt);
+        // Thirds: answered since due / answered only before due / unanswered.
+        if (i % 3 === 0) {
+          // An earlier reply too: the NEWEST one decides, as in the runner.
+          reply(outDb, `out-${id}-early`, id, beforeDue);
+          reply(outDb, `out-${id}`, id, afterDue);
+          expected.push(id);
+        } else if (i % 3 === 1) {
+          reply(outDb, `out-${id}`, id, beforeDue);
+        }
+      }
+      const prepare = vi.spyOn(outDb, 'prepare');
+      const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+
+      await registeredDuty(SWEEP_DUTY_INVENTORY.S2).run(sessionCtx(mailbox));
+
+      const completed = inDb
+        .prepare("SELECT id FROM messages_in WHERE status = 'completed' ORDER BY seq")
+        .all() as Array<{
+        id: string;
+      }>;
+      expect(completed.map((r) => r.id)).toEqual(expected);
+      expect(warn.mock.calls[0]![1]).toMatchObject({ messageIds: expected });
+      // Two chunks → two messages_out reads, however many rows were due.
+      expect(prepare.mock.calls.filter(([sql]) => sql.includes('FROM messages_out'))).toHaveLength(2);
+      prepare.mockRestore();
       warn.mockRestore();
     });
 

@@ -286,6 +286,9 @@ function answeredSinceDue(answeredAt: string, processAfter: string | null): bool
   return parseRunnerUtc(answeredAt) >= parseRunnerUtc(processAfter);
 }
 
+/** Ids per grouped `messages_out` read in `completeAnsweredPendingRows`. */
+export const ANSWERED_LOOKUP_CHUNK = 500;
+
 export function completeAnsweredPendingRows(inDb: Database.Database, outDb: Database.Database): string[] {
   migrateMessagesInTable(inDb);
   const due = inDb
@@ -299,15 +302,34 @@ export function completeAnsweredPendingRows(inDb: Database.Database, outDb: Data
     .all() as Array<{ id: string; processAfter: string | null }>;
   if (due.length === 0) return [];
 
-  const answeredAtStmt = outDb.prepare(
-    "SELECT MAX(timestamp) AS ts FROM messages_out WHERE in_reply_to = ? AND kind != 'status'",
-  );
+  // ONE grouped read per chunk, never one per due row: `messages_out.in_reply_to`
+  // is unindexed, so each lookup is a scan of the session's whole outbound
+  // history, and a backlog of due rows would multiply that inside the sweep's
+  // synchronous turn. Same statement shape as the runner's own read
+  // (selection.ts:311-322). Chunked under SQLite's bound-variable limit (999 on
+  // older builds).
+  const answeredAt = new Map<string, string>();
+  for (let start = 0; start < due.length; start += ANSWERED_LOOKUP_CHUNK) {
+    const ids = due.slice(start, start + ANSWERED_LOOKUP_CHUNK).map((row) => row.id);
+    const rows = outDb
+      .prepare(
+        `SELECT in_reply_to AS id, MAX(timestamp) AS ts
+           FROM messages_out
+          WHERE in_reply_to IN (${ids.map(() => '?').join(', ')})
+            AND kind != 'status'
+          GROUP BY in_reply_to`,
+      )
+      .all(...ids) as Array<{ id: string; ts: string }>;
+    for (const row of rows) answeredAt.set(row.id, row.ts);
+  }
+  if (answeredAt.size === 0) return [];
+
   const completeStmt = inDb.prepare("UPDATE messages_in SET status = 'completed' WHERE id = ? AND status = 'pending'");
   const backfilled: string[] = [];
   for (const { id, processAfter } of due) {
-    const answeredAt = (answeredAtStmt.get(id) as { ts: string | null }).ts;
-    if (answeredAt === null) continue;
-    if (!answeredSinceDue(answeredAt, processAfter)) continue;
+    const ts = answeredAt.get(id);
+    if (ts === undefined) continue;
+    if (!answeredSinceDue(ts, processAfter)) continue;
     if (hasProcessingAck(outDb, id)) continue;
     if (completeStmt.run(id).changes > 0) backfilled.push(id);
   }
