@@ -45,7 +45,7 @@ import { getAgentMailbox } from './mailbox/index.js';
 import { sessionContextPath, sessionDir, writeSessionContext } from './session-manager.js';
 import { inboundDbPath } from './mailbox/sqlite/paths.js';
 import { buildContainerCodexConfig } from './providers/codex.js';
-import { OPENCODE_XDG_ENV } from './providers/opencode.js';
+import { OPENCODE_STAGED_CONFIG_FILE, OPENCODE_XDG_ENV } from './providers/opencode.js';
 import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from './db/index.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { initGroupFilesystem } from './group-init.js';
@@ -1184,10 +1184,17 @@ describe('buildMounts agent surfaces', async () => {
 
     const xdgHost = path.join(sessionDir(ag.id, 's-opencode-auth'), 'opencode-xdg');
     expect(mounts).toContainEqual({ hostPath: xdgHost, containerPath: '/opencode-xdg', readonly: false });
-    // The credential crossed, and nothing else did.
+    // The credential crossed, plus the one-line default-model config, and
+    // nothing else did (agent/ and skill/ stayed on the host).
     const staged = path.join(xdgHost, 'opencode');
     expect(fs.readFileSync(path.join(staged, 'auth.json'), 'utf8')).toBe('{"opencode":{"type":"api"}}');
-    expect(fs.readdirSync(staged)).toEqual(['auth.json']);
+    expect(fs.readdirSync(staged).sort()).toEqual(['auth.json', OPENCODE_STAGED_CONFIG_FILE].sort());
+    // A bare `opencode run` in this container runs the fleet default model
+    // rather than OpenCode's own first-credentialed-provider guess (#884).
+    expect(JSON.parse(fs.readFileSync(path.join(staged, OPENCODE_STAGED_CONFIG_FILE), 'utf8'))).toEqual({
+      $schema: 'https://opencode.ai/config.json',
+      model: 'opencode-go/deepseek-v4.1-flash',
+    });
   });
 
   // The env half. `buildContainerArgs` is not reachable from a unit test
