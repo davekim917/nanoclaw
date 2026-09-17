@@ -42,12 +42,13 @@ function credentialSlotKey(providerName: string): string {
  * Claude's circular `CLAUDE_CODE_OAUTH_TOKEN` ring is the ONLY writer: it
  * stores the env var NAME (e.g. `CLAUDE_CODE_OAUTH_TOKEN_2`), never the
  * credential VALUE — a pointer into config the provider already holds, not a
- * secret. Forward-only pools deliberately do not use this key: Claude's
- * `ANTHROPIC_API_KEY_N` fallbacks (providers/claude.ts:2199, the comment in
- * `restorePersistedCredentialSlot`) and Codex's `fallbackHomes` cursor
- * (providers/codex.ts:1107-1123, `nextFallback` is process-local) both rely
- * on a respawn as their reset, and a persisted cursor that never wraps would
- * turn a recoverable dead end into a permanent one.
+ * secret. Claude's forward-only `ANTHROPIC_API_KEY_N` pool deliberately does
+ * not use this key (providers/claude.ts:2199, the comment in
+ * `restorePersistedCredentialSlot`): it relies on a respawn as its reset, and
+ * a persisted cursor that never wraps would turn a recoverable dead end into
+ * a permanent one. Codex's ring (`CodexProvider.rotateCodexHome`) is circular
+ * per turn and carries its active home in `process.env.CODEX_HOME`, so it
+ * has no cursor to persist either.
  */
 export function getCredentialSlot(providerName: string): string | undefined {
   return getValue(credentialSlotKey(providerName));

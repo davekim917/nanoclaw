@@ -11,6 +11,7 @@ import {
   augmentWithProxyEnv,
   copyRolloutToFallback,
   classifyCodexError,
+  earliestCodexSlotReset,
   extractImageGenerationPath,
   findNewestRolloutAcrossHomes,
   findRolloutFile,
@@ -963,22 +964,50 @@ describe('codex OAuth fallback — rotation primitives', () => {
       });
     });
 
-    it('rotateCodexHome walks through fallbacks and returns null when exhausted', () => {
-      withEnv({ CODEX_FALLBACK_HOMES: '/a:/b:/c' }, () => {
+    it('rotateCodexHome walks the ring after the current home, skipping homes tried this turn, and wraps to the primary', () => {
+      withEnv({ CODEX_HOME: '/p', CODEX_FALLBACK_HOMES: '/a:/b:/c' }, () => {
         const p = new CodexProvider();
-        expect(p.rotateCodexHome()).toBe('/a');
-        expect(p.rotateCodexHome()).toBe('/b');
-        expect(p.rotateCodexHome()).toBe('/c');
-        expect(p.rotateCodexHome()).toBeNull();
-        // Position sticks once exhausted — does not loop.
-        expect(p.rotateCodexHome()).toBeNull();
+        expect(p.codexHomeRing).toEqual(['/p', '/a', '/b', '/c']);
+        const tried = new Set<string>(['/p']);
+        expect(p.rotateCodexHome('/p', tried)).toBe('/a');
+        tried.add('/a');
+        expect(p.rotateCodexHome('/a', tried)).toBe('/b');
+        tried.add('/b');
+        expect(p.rotateCodexHome('/b', tried)).toBe('/c');
+        tried.add('/c');
+        // Every account tried this turn: exhausted, and stays so.
+        expect(p.rotateCodexHome('/c', tried)).toBeNull();
+        expect(p.rotateCodexHome('/c', tried)).toBeNull();
+      });
+    });
+
+    it('rotateCodexHome, starting a query on the last fallback, wraps back to the primary — the 2026-09-16 outage', () => {
+      // The container had rotated to its secondary on an earlier query; the
+      // secondary then hit its weekly limit. The forward-only cursor had
+      // nothing left and the whole provider was parked until the SECONDARY's
+      // reset. The ring must offer the primary again instead.
+      withEnv({ CODEX_HOME: '/p', CODEX_FALLBACK_HOMES: '/a' }, () => {
+        const p = new CodexProvider();
+        expect(p.rotateCodexHome('/a', new Set(['/a']))).toBe('/p');
+        expect(p.rotateCodexHome('/p', new Set(['/a', '/p']))).toBeNull();
       });
     });
 
     it('rotateCodexHome returns null immediately when no fallbacks configured', () => {
-      withEnv({ CODEX_FALLBACK_HOMES: undefined }, () => {
-        expect(new CodexProvider().rotateCodexHome()).toBeNull();
+      withEnv({ CODEX_HOME: '/p', CODEX_FALLBACK_HOMES: undefined }, () => {
+        expect(new CodexProvider().rotateCodexHome('/p', new Set(['/p']))).toBeNull();
       });
+    });
+
+    it('earliestCodexSlotReset picks the earliest stated reset and refuses to guess past a slot that stated none', () => {
+      expect(earliestCodexSlotReset([])).toBeNull();
+      expect(earliestCodexSlotReset(['2026-09-21T03:28:20.000Z', '2026-09-19T15:00:00.000Z'])).toBe(
+        '2026-09-19T15:00:00.000Z',
+      );
+      // An overload or system error carries no reset; one such slot means the
+      // ring's recovery time is unknown → the host's bounded backoff.
+      expect(earliestCodexSlotReset(['2026-09-21T03:28:20.000Z', null])).toBeNull();
+      expect(earliestCodexSlotReset(['not-a-date'])).toBeNull();
     });
 
     it('keeps the provider-lifetime primary home after rotation changes CODEX_HOME', () => {
@@ -992,10 +1021,12 @@ describe('codex OAuth fallback — rotation primitives', () => {
           const provider = new CodexProvider() as unknown as {
             primaryCodexHome: string;
             primaryHostCodexHome: string | undefined;
-            rotateCodexHome: () => string | null;
+            rotateCodexHome: (current: string, tried: ReadonlySet<string>) => string | null;
           };
 
-          expect(provider.rotateCodexHome()).toBe('/home/node/.codex-fallback');
+          expect(provider.rotateCodexHome('/home/node/.codex-primary', new Set(['/home/node/.codex-primary']))).toBe(
+            '/home/node/.codex-fallback',
+          );
           process.env.CODEX_HOME = '/home/node/.codex-fallback';
 
           expect(provider.primaryCodexHome).toBe('/home/node/.codex-primary');
@@ -1169,7 +1200,7 @@ describe('codex OAuth fallback — rotation primitives', () => {
         .join('\n');
 
       const refreshIdx = codeOnly.indexOf('refreshCodexAuthFromHost(currentCodexHome, self.primaryHostCodexHome)');
-      const fallbackIdx = codeOnly.indexOf('if (eligible && self.nextFallback < self.fallbackHomes.length)');
+      const fallbackIdx = codeOnly.indexOf('self.rotateCodexHome(currentCodexHome, triedHomes)');
       const surfaceIdx = codeOnly.indexOf('yield ev;');
       expect(refreshIdx).toBeGreaterThan(-1);
       expect(fallbackIdx).toBeGreaterThan(refreshIdx);

@@ -744,9 +744,9 @@ describe('codex usage stays container-respawn safe', () => {
 // the shared `formatCredentialRotationNotice` helper — codex.ts:1535-1540
 // appends it to whatever `resolveCodexRestartTransition` (called at
 // codex.ts:1519) produces for the resumed/restarted thread). No persistence
-// here: `fallbackHomes` is a
-// forward-only pool (see the doc comment on `CodexProvider.rotateCodexHome`
-// in codex.ts) and a container respawn is deliberately its only reset.
+// here: the ring's active home is `process.env.CODEX_HOME` (see the doc
+// comment on `CodexProvider.rotateCodexHome` in codex.ts), so a container
+// respawn starts on the primary.
 describe('CodexProvider OAuth-rotation notice', () => {
   it('rotates on UsageLimitExceeded and tells the resumed thread it was rotated', async () => {
     const binDir = path.join(tmpDir, 'bin');

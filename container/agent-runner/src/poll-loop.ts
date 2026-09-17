@@ -58,6 +58,7 @@ import {
   type TurnTrigger,
 } from './modules/mailbox/index.js';
 import { clearBatchAnchors, getBatchAnchor, setCurrentBatchAnchors } from './current-batch.js';
+import { modelBelongsToProvider } from './providers/model-vocabulary.js';
 import { formatCredentialRotationNotice } from './credential-rotation-notice.js';
 import {
   formatMessages,
@@ -410,7 +411,10 @@ async function checkpointTurnEnd(autosaveWorktrees: (reason: string) => Promise<
  */
 export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   const runnerId = randomUUID();
-  const processQueryFallbackOptions = { ignoreTaskFlagIntents: config.providerFallbackActive === true };
+  const processQueryFallbackOptions = {
+    ignoreTaskFlagIntents: config.providerFallbackActive === true,
+    providerFallbackActive: config.providerFallbackActive === true,
+  };
   const autosaveWorktrees = config.autosaveWorktrees ?? autoCommitDirtyWorktrees;
   const idleSuppressedContinuationIds = new Set<string>();
   const suppressContinuationUntilRealInbound = (id: string): void => {
@@ -719,6 +723,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     applyChatBudget(keep);
     const flagBatch = effectiveTurnSettings(keep, routing, config.providerName, config.providerFallbackActive === true);
+    if (flagBatch.ignoredModel !== undefined)
+      await noteIgnoredModel(
+        flagBatch.ignoredModel,
+        config.providerName,
+        config.providerFallbackActive === true,
+        routing,
+      );
     const effectiveModel = flagBatch.model;
     const effectiveEffort = flagBatch.effort;
     const effectiveUltracode = flagBatch.ultracode;
@@ -1707,7 +1718,9 @@ export async function processQuery(
   // never ended, so this call can outlive its container: the host reaps it
   // first, and an outcome held for the return is never written.
   onTaskOutcome?: (key: string, outcome: FireOutcome) => Promise<void>,
-  options: { ignoreTaskFlagIntents?: boolean } = {},
+  // `providerFallbackActive` selects the wording of the ignored-pin note on the
+  // follow-up path (`noteIgnoredModel`); the opening batch reads it off config.
+  options: { ignoreTaskFlagIntents?: boolean; providerFallbackActive?: boolean } = {},
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -2026,6 +2039,22 @@ export async function processQuery(
         const fb = applyFlagBatch(keep, extractRouting(keep), providerName, {
           ignoreTaskFlagIntents: options.ignoreTaskFlagIntents,
         });
+        // Same note as the opening batch: a `-m`/`-m1` for the other provider
+        // arriving mid-stream resolves to undefined — often equal to the live
+        // default, so nothing below restarts anything and the host's ⚙️ ack is
+        // the last word the user saw. Say it is being ignored here too.
+        if (fb.ignoredModel !== undefined) {
+          await noteIgnoredModel(
+            fb.ignoredModel,
+            providerName,
+            options.providerFallbackActive === true,
+            extractRouting(keep),
+          );
+          // Re-check after the await, as `applySettings` below does before
+          // claiming: the stream can end during this yield, and rows marked
+          // processing against a dead query sit claimed until stale detection.
+          if (done) return;
+        }
         const liveSettingsChanged =
           fb.model !== liveSettings.model ||
           fb.effort !== liveSettings.effort ||
@@ -2045,7 +2074,9 @@ export async function processQuery(
             // open input is what keeps a background subagent alive, so
             // end() here would kill the worker the busy hold protects.
             if (!turnIdle || resultScopeOpen || query.hasQueuedWork?.() || query.hasBackgroundWork?.()) {
-              log('Query settings changed but runtime context is immutable — deferring follow-up until the active query and result handling drain');
+              log(
+                'Query settings changed but runtime context is immutable — deferring follow-up until the active query and result handling drain',
+              );
               return;
             }
             log(
@@ -2497,7 +2528,10 @@ export async function processQuery(
           // streak — skipping it would leave the streak frozen at its last
           // failing value across a recovery.
           if (routing.taskRun && (event.answeredPrompts !== undefined || (!taskBlockNudged && answersRunnerPrompt))) {
-            await recordTaskTurn({ text: '', isError: event.isError === true, model: modelInForce }, event.answeredPrompts);
+            await recordTaskTurn(
+              { text: '', isError: event.isError === true, model: modelInForce },
+              event.answeredPrompts,
+            );
           }
           pauseAnsweredPrompt();
         }
@@ -3228,7 +3262,7 @@ export function applyFlagBatch(
   _routing: RoutingContext,
   providerName: string,
   options: { ignoreTaskFlagIntents?: boolean } = {},
-): { model?: string; effort?: string; ultracode?: boolean; fast: boolean } {
+): { model?: string; effort?: string; ultracode?: boolean; fast: boolean; ignoredModel?: string } {
   let intent: FlagIntent | undefined;
   for (const m of messages) {
     // Tasks carry flagIntent the same way chat messages do — used by scheduled
@@ -3277,7 +3311,19 @@ export function applyFlagBatch(
     }
   }
 
-  const model = intent?.turnModel ?? getStickyModel();
+  const requestedModel = intent?.turnModel ?? getStickyModel();
+  // A pin is admitted on the host against the PRIMARY provider's vocabulary
+  // (router.ts → `parseMessageFlags`) and the sticky persists in
+  // session_state, so under a spawn-time provider fallback it can name the
+  // other provider's model. Observed live 2026-09-16: `-m astra` earlier in a
+  // thread, codex parked, the claude fallback then asked the Anthropic API
+  // for `gpt-6-astra` on every turn of the session. Ignore it for THIS
+  // provider only — the sticky stays stored and applies again when the
+  // primary is back (or until the user re-pins after a provider migration);
+  // `ignoredModel` lets the caller say so once.
+  const model =
+    requestedModel !== undefined && !modelBelongsToProvider(requestedModel, providerName) ? undefined : requestedModel;
+  const ignoredModel = model === requestedModel ? undefined : requestedModel;
   // Effort here is USER INTENT ONLY (turn flag → sticky flag). Defaults are
   // provider business: the claude provider resolves the operator override
   // (NANOCLAW_EFFORT_OVERRIDE) and per-model-family defaults itself, because
@@ -3290,7 +3336,40 @@ export function applyFlagBatch(
   // perturb a Claude/OpenCode query or trigger a false mid-turn restart there.
   const fast = providerName === 'codex' ? (intent?.turnFast ?? getStickyFast() ?? false) : false;
 
-  return { model, effort, ultracode, fast };
+  return { model, effort, ultracode, fast, ...(ignoredModel !== undefined ? { ignoredModel } : {}) };
+}
+
+/**
+ * One chat line, once per cooldown, when a stored model pin is being ignored
+ * because it belongs to another provider (`applyFlagBatch`). The pin itself
+ * stays in session_state. What happens next depends on WHY the provider
+ * differs: under a spawn-time fallback (`fallbackActive`, the host's
+ * NANOCLAW_PROVIDER_FALLBACK_APPLIED marker — config.ts:85) the primary comes
+ * back on its own and the pin applies again; after a deliberate provider
+ * migration the new provider IS the primary, nothing reverts, and the user
+ * has to re-pin or clear it.
+ */
+async function noteIgnoredModel(
+  model: string,
+  providerName: string,
+  fallbackActive: boolean,
+  routing: RoutingContext,
+): Promise<void> {
+  const text =
+    `⚙️ model pin ${model} is not a ${providerName} model — ignored while this session runs on ${providerName}; ` +
+    (fallbackActive
+      ? `it applies again when the primary provider is back.`
+      : `set a ${providerName} model with -m <model>, or clear the pin with -m.`);
+  log(text);
+  if (!shouldPostInfraWarning(text)) return;
+  await writeMessageOut({
+    id: generateId(),
+    kind: 'chat',
+    platform_id: routing.platformId,
+    channel_type: routing.channelType,
+    thread_id: routing.threadId,
+    content: JSON.stringify({ text }),
+  });
 }
 
 /**
@@ -3337,7 +3416,7 @@ function effectiveTurnSettings(
   routing: RoutingContext,
   providerName: string,
   ignoreTaskFlagIntents = false,
-): { model?: string; effort?: string; ultracode?: boolean; fast: boolean } {
+): { model?: string; effort?: string; ultracode?: boolean; fast: boolean; ignoredModel?: string } {
   const flagBatch = applyFlagBatch(messages, routing, providerName, { ignoreTaskFlagIntents });
   const task = taskWakeIntent(messages, ignoreTaskFlagIntents);
   if (!task.isPureTaskWake) return flagBatch;

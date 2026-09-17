@@ -673,7 +673,10 @@ describe('native slash command thread context', () => {
       );
 
     const pair = getPendingMessages();
-    expect(pair.map((message) => message.id)).toEqual(['recall-threaded-wwbd-with-recall', 'threaded-wwbd-with-recall']);
+    expect(pair.map((message) => message.id)).toEqual([
+      'recall-threaded-wwbd-with-recall',
+      'threaded-wwbd-with-recall',
+    ]);
 
     const prompt = formatMessagesWithCommands(pair, true);
     expect(prompt.startsWith('/wwbd ?')).toBe(true);
@@ -841,6 +844,35 @@ describe('fast-mode flag application', () => {
     expect(applyFlagBatch(messages, routing, 'codex').fast).toBe(true);
     expect(applyFlagBatch([], routing, 'claude').fast).toBe(false);
     expect(applyFlagBatch([], routing, 'opencode').fast).toBe(false);
+  });
+});
+
+describe('model pin under a provider fallback', () => {
+  it('ignores a sticky model that belongs to another provider, keeps it stored, and reports it once', () => {
+    // Observed live 2026-09-16: `-m astra` pinned gpt-6-astra on a codex
+    // session; codex parked; the claude fallback container read the sticky
+    // and asked the Anthropic API for gpt-6-astra on every turn.
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi', flagIntent: { stickyModel: 'gpt-6-astra' } });
+    const messages = getPendingMessages();
+    const routing = extractRouting(messages);
+    expect(applyFlagBatch(messages, routing, 'codex')).toMatchObject({ model: 'gpt-6-astra' });
+
+    const onClaude = applyFlagBatch([], routing, 'claude');
+    expect(onClaude.model).toBeUndefined();
+    expect(onClaude.ignoredModel).toBe('gpt-6-astra');
+    expect(applyFlagBatch([], routing, 'opencode').model).toBeUndefined();
+
+    // The sticky survives the fallback: the primary gets it back verbatim.
+    expect(applyFlagBatch([], routing, 'codex')).toMatchObject({ model: 'gpt-6-astra' });
+    expect('ignoredModel' in applyFlagBatch([], routing, 'codex')).toBe(false);
+  });
+
+  it('a one-turn model flag is dropped the same way', () => {
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'once', flagIntent: { turnModel: 'claude-opus-5[1m]' } });
+    const messages = getPendingMessages();
+    const routing = extractRouting(messages);
+    expect(applyFlagBatch(messages, routing, 'codex')).toMatchObject({ ignoredModel: 'claude-opus-5[1m]' });
+    expect(applyFlagBatch(messages, routing, 'claude')).toMatchObject({ model: 'claude-opus-5[1m]' });
   });
 });
 
@@ -3724,7 +3756,9 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     const result = await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {});
 
     expect(pushed.some((m) => m.includes('was not delivered'))).toBe(true);
-    expect(result.taskTurns!.map((t) => t.outcome?.text)).toEqual(['<message to="someone">done, echo dropped</message>']);
+    expect(result.taskTurns!.map((t) => t.outcome?.text)).toEqual([
+      '<message to="someone">done, echo dropped</message>',
+    ]);
   });
 
   it('a batch after a live change is compared against the LIVE settings, not the creation snapshot', async () => {
@@ -3879,7 +3913,11 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
       yield { type: 'init', continuation: 'c1' };
       // A task-run message block requires a corrective nudge, but its outcome
       // write below intentionally holds result handling open first.
-      yield { type: 'result', text: '<message to="someone">not allowed for a task run</message>', answeredPrompts: ['p-initial'] };
+      yield {
+        type: 'result',
+        text: '<message to="someone">not allowed for a task run</message>',
+        answeredPrompts: ['p-initial'],
+      };
       await Bun.sleep(700);
       yield { type: 'result', text: 'nudge handled', answeredPrompts: ['p-nudge'] };
       await Bun.sleep(700);
