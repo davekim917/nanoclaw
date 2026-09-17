@@ -236,7 +236,8 @@ describe('formatCodexAgentToml carries `effort:` as model_reasoning_effort', () 
   test('each shim converts to its OWN level, not one shared value', () => {
     // The mutation this pins: before this mapping existed, all five shims
     // rendered to TOMLs that differed only in prose and every one of them ran
-    // at the global `[agents].default_subagent_reasoning_effort` ("high").
+    // at the global `[agents].default_subagent_reasoning_effort` ("high" then;
+    // the key is gone from the generated config since 2026-09-17).
     // Collecting the five emitted values and asserting they are five DISTINCT
     // ones fails both a dropped mapping (five missing keys) and a hardcoded
     // one (five identical keys) — asserting only that `worker-high` renders

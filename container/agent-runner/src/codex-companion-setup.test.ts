@@ -150,7 +150,9 @@ describe('buildRuntimeConfig', () => {
     expect(config).toContain('fast_mode = false');
     expect(config).toContain('multi_agent = true');
     expect(config).toContain('[agents]');
-    expect(config).toContain('default_subagent_reasoning_effort = "high"');
+    // Operator, 2026-09-17: no global subagent effort — Codex's native default
+    // unless the spawn or the role names one (matches the host config).
+    expect(config).not.toContain('default_subagent_reasoning_effort');
     expect(config).toContain('max_concurrent_threads_per_session = 4');
     expect(config).not.toContain('multi_agent_v2');
     expect(config).not.toContain('remote_control');
