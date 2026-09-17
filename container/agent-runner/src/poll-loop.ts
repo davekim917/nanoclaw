@@ -1726,6 +1726,8 @@ export async function processQuery(
   let done = false;
   let unwrappedNudged = false;
   let taskBlockNudged = false;
+  // Complete <message> blocks already delivered from this turn's interim text.
+  const deliveredInterimBlocks = new Set<string>();
   // Retryable (e.g. SDK `api_retry`) events are the SDK's own mid-stream retry
   // signal, NOT a turn-ending error. Record the last one but keep consuming so
   // the SDK's internal retry can still produce a result; only surface it if the
@@ -2467,7 +2469,12 @@ export async function processQuery(
               });
             }
           }
-          const { sent, hasUnwrapped, taskBlocks } = await dispatchResultText(event.text, routing);
+          // An agent that posted an update mid-turn often repeats it verbatim in
+          // its final text; the person already has it.
+          let finalText = event.text;
+          for (const block of deliveredInterimBlocks) finalText = finalText.split(block).join('');
+          deliveredInterimBlocks.clear();
+          const { sent, hasUnwrapped, taskBlocks } = await dispatchResultText(finalText, routing);
           const willRetryTaskBlocks = shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
           // With prompt ids a nudge's answer matches no fire, so only the id-less
           // path needs `taskBlockNudged` to keep it out of the next fire's slot.
@@ -2584,6 +2591,8 @@ export async function processQuery(
             'Use <message to="name"> blocks to address them. Bare text goes to the scratchpad fallback only.';
         }
         pushToQuery(ensureFreshContextBootstrap(reminder));
+      } else if (event.type === 'interim_text') {
+        for (const block of await dispatchInterimMessageBlocks(event.text, routing)) deliveredInterimBlocks.add(block);
       } else if (event.type === 'file') {
         await dispatchFileAttachment(event, routing);
       }
@@ -2827,6 +2836,28 @@ const STRAY_WRAPPER_RE = /<\/?message(?:\s+to="[^"]*")?\s*>/g;
 export interface TaskMessageBlock {
   to: string;
   body: string;
+}
+
+const COMPLETE_MESSAGE_BLOCK_RE = /<message\s+to="[^"]+"\s*>[\s\S]*?<\/message>/g;
+
+/**
+ * Deliver the complete `<message to="…">…</message>` blocks in text the agent
+ * wrote mid-turn (ProviderEvent `interim_text`), and return the blocks handed
+ * to delivery. Everything else in the text is narration between tool calls
+ * and is dropped — no origin fallback, no wrapping nudge: those belong to the
+ * turn's FINAL text, which is the agent's answer. An unclosed opener is left
+ * for the final text too; mid-turn is no place to guess where a body ends.
+ * Routing, the `here` alias and peer recovery are dispatchResultText's, so a
+ * block behaves the same wherever in the turn it was written. Task runs never
+ * deliver blocks (RoutingContext.taskRun), so nothing is attempted there.
+ */
+export async function dispatchInterimMessageBlocks(text: string, routing: RoutingContext): Promise<string[]> {
+  if (routing.taskRun) return [];
+  const blocks = text.match(COMPLETE_MESSAGE_BLOCK_RE) ?? [];
+  if (blocks.length === 0) return [];
+  const { sent } = await dispatchResultText(blocks.join('\n'), routing);
+  log(`Interim text: ${blocks.length} <message> block(s) written before a tool call, ${sent} delivered`);
+  return blocks;
 }
 
 /**

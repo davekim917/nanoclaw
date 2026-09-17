@@ -25,11 +25,7 @@ import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { appendActiveRuntimeContext } from '../runtime-context.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { shimCwd } from './cwd-shim.js';
-import {
-  parseSlotUsageSurvey,
-  surveyEntryToUsageResponse,
-  SLOT_USAGE_SURVEY_ENV,
-} from './claude-slot-usage.js';
+import { parseSlotUsageSurvey, surveyEntryToUsageResponse, SLOT_USAGE_SURVEY_ENV } from './claude-slot-usage.js';
 import { attachTurnEffort } from './turn-effort.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import { MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
@@ -1635,7 +1631,9 @@ export function createEmailGateHook(opts?: {
         // answers once and both guards honour that one answer.
         const peerAck = await awaitDeliveryAck(claim.requestId, 60 * 60 * 1000);
         if (!peerAck) {
-          return denyBash(`Email ${action} blocked: timed out waiting for admin approval. Do not retry — ask the user.`);
+          return denyBash(
+            `Email ${action} blocked: timed out waiting for admin approval. Do not retry — ask the user.`,
+          );
         }
         if (peerAck.status === 'delivered') return {};
         return denyBash(
@@ -1686,7 +1684,6 @@ export function createEmailGateHook(opts?: {
     return denyBash(`Email ${action} blocked: ${ack.error ?? 'admin declined'}. Do not retry — acknowledge briefly.`);
   };
 }
-
 
 // ── One approval card per tool call (Codex only) ──
 // In a Codex container this hook and the plugin's `codex-guard.ts` BOTH run on
@@ -2411,9 +2408,7 @@ export class ClaudeProvider implements AgentProvider {
       const active = this.oauthRing[ringIndex];
       this.env.CLAUDE_CODE_OAUTH_TOKEN = active.value;
       process.env.CLAUDE_CODE_OAUTH_TOKEN = active.value;
-      log(
-        `Resumed credential slot ${active.name} (ring ${ringIndex + 1}/${this.oauthRing.length}) from session state`,
-      );
+      log(`Resumed credential slot ${active.name} (ring ${ringIndex + 1}/${this.oauthRing.length}) from session state`);
       return;
     }
 
@@ -2681,6 +2676,9 @@ export class ClaudeProvider implements AgentProvider {
     // vouched for; any membership change that adds an id outside it drops
     // the evidence, and the release waits for the next idle.
     let backgroundHold = false;
+    // Top-level assistant text not yet known to be mid-turn or final — see the
+    // `assistant` branch and ProviderEvent `interim_text`.
+    let pendingAssistantText: string | null = null;
     let idleSeenWithHold = false;
     let idleCoveredTasks = new Set<string>();
 
@@ -2996,289 +2994,316 @@ export class ClaudeProvider implements AgentProvider {
       // inside the loop below, all of which fire before `aborted` is ever
       // set — still propagates unchanged.
       try {
-      for await (const message of sdkResult) {
-        if (aborted) return;
-        // A subagent hit the credential slot's quota (PostToolUse hook).
-        // Throw here so poll-loop's catch rotates the OAuth ring and replays
-        // the turn — identical to the result-branch throws below, which a
-        // subagent failure never reaches.
-        if (subagentQuotaError) throw new Error(subagentQuotaError);
-        messageCount++;
+        for await (const message of sdkResult) {
+          if (aborted) return;
+          // A subagent hit the credential slot's quota (PostToolUse hook).
+          // Throw here so poll-loop's catch rotates the OAuth ring and replays
+          // the turn — identical to the result-branch throws below, which a
+          // subagent failure never reaches.
+          if (subagentQuotaError) throw new Error(subagentQuotaError);
+          messageCount++;
 
-        // Yield activity for every SDK event so the poll loop knows the agent is working
-        yield { type: 'activity' };
-
-        if (message.type === 'system' && message.subtype === 'init') {
-          yield { type: 'init', continuation: message.session_id };
-        } else if (message.type === 'result') {
-          // `result` text exists only on subtype:"success"; error subtypes
-          // (e.g. a non-retryable 403 billing_error) carry their message in
-          // `errors[]` instead. Surface either so the poll-loop can deliver a
-          // billing/quota notice to the user rather than dropping the turn.
-          const m = message as {
-            result?: string;
-            is_error?: boolean;
-            errors?: string[];
-            // Typed from the SDK so a bump that drops the echo fails typecheck
-            // instead of silently making every result unprompted.
-            user_message_uuid?: (SDKResultSuccess | SDKResultError)['user_message_uuid'];
-            user_message_uuids?: (SDKResultSuccess | SDKResultError)['user_message_uuids'];
-            usage?: {
-              input_tokens?: number | null;
-              output_tokens?: number | null;
-              cache_creation_input_tokens?: number | null;
-              cache_read_input_tokens?: number | null;
-            };
-            total_cost_usd?: number;
-            modelUsage?: Record<string, ResultModelUsage>;
-            // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up):
-            // the SDK's own count of assistant/tool round-trips this turn made
-            // — the most authoritative `steps` signal of the three providers,
-            // since it comes straight from the harness rather than being
-            // inferred from the event stream.
-            num_turns?: number;
-          };
-          const text = m.result ?? (m.errors && m.errors.length > 0 ? m.errors.join('\n') : null);
-          // Retry-path guards run FIRST — these turn error text into a throw so
-          // poll-loop's rotation / recap / backoff machinery retries instead of
-          // posting the raw error to the user's channel.
-          if (text && QUOTA_RESULT_RE.test(text)) {
-            // Throw so poll-loop's catch path can rotate to the next OAuth
-            // fallback and retry instead of dispatching the quota message
-            // to the user.
-            throw new Error(`subscription_quota_exhausted: ${text}`);
-          }
-          if (text && SUBSCRIPTION_BLOCKED_RE.test(text)) {
-            // Org-disabled account: same rotation path as quota exhaustion,
-            // distinct marker for diagnosability.
-            throw new Error(`subscription_access_disabled: ${text}`);
-          }
-          if (text && POISONED_CONTINUATION_RE.test(text)) {
-            // Throw so poll-loop's isSessionInvalid branch clears the
-            // poisoned continuation and retries with a recap instead of
-            // dispatching the raw 400 to the user (and dead-stopping the
-            // session — the same history would fail every future turn).
-            throw new Error(text);
-          }
-          if (text && TRANSIENT_OVERLOAD_RESULT_RE.test(text)) {
-            // Throw so poll-loop's transient-overload branch backs off and
-            // retries the same prompt instead of posting the rate-limit error
-            // to the user's channel as the agent's reply.
-            throw new Error(`transient_overload: ${text}`);
-          }
-          const effortHeldAllTurn = effortTransitionsThisTurn === 0;
-          // Cleared BEFORE the yield, not after. The generator suspends at the
-          // yield below and poll-loop does its applySettings/push during that
-          // suspension, so a reset placed after it would wipe transitions that
-          // belong to the NEXT turn — the same erasure, one frame later.
-          effortTransitionsThisTurn = 0;
-          yield {
-            type: 'result',
-            text,
-            isError: m.is_error === true,
-            // The runner's prompts this turn consumed, as echoed. Cleared from
-            // the outstanding set before the yield, so hasQueuedWork is
-            // already truthful when poll-loop reads it at this result.
-            answeredPrompts: stream.answer([
-              ...(m.user_message_uuids ?? []),
-              ...(m.user_message_uuid ? [m.user_message_uuid] : []),
-            ]),
-            // Effort is a request parameter — no API bills it back, so it is
-            // stamped on here rather than read out of `modelUsage`. On a
-            // multi-model turn only the entry for `activeModel` gets it; the
-            // subagent entries stay NULL because we never set their effort.
-            // See providers/turn-effort.ts.
-            usage: attachTurnEffort(extractUsage(m), {
-              model: activeUsageModel,
-              // Unequal = the effort moved mid-turn, so no single value
-              // describes this aggregate. NULL both halves: `requested` is
-              // just as ambiguous as `effective` once the turn straddles a
-              // change, and a half-labelled row invites the same wrong read.
-              effective: effortHeldAllTurn ? activeEffort : null,
-              requested: effortHeldAllTurn ? activeRequestedEffort : null,
-            }),
-            steps: typeof m.num_turns === 'number' ? m.num_turns : null,
-            rateLimit: lastRateLimitInfo
-              ? {
-                  type: lastRateLimitInfo.rateLimitType ?? null,
-                  utilization: lastRateLimitInfo.utilization ?? null,
-                  resetsAt: resetsAtIso(lastRateLimitInfo.resetsAt),
-                }
-              : null,
-          };
-          lastRateLimitInfo = undefined; // scoped to the turn that just closed
-          // Throttled, fire-and-forget: samples plan utilization for THIS
-          // account whether or not the SDK had anything to warn about.
-          samplePlanUsage(sdkResult, who);
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
-          yield { type: 'error', message: 'API retry', retryable: true };
-        } else if (message.type === 'rate_limit_event') {
-          const info = (message as { rate_limit_info?: SdkRateLimitInfo }).rate_limit_info;
-          lastRateLimitInfo = info; // held for the `result` that closes this turn
-          // Kept alongside the pull, not replaced by it: the event carries a
-          // `status` (allowed_warning / rejected) the pull has no field for,
-          // and it is the fallback when the experimental pull is unavailable.
-          // `source` on the row says which path produced it.
-          recordRateLimitSamples([
-            {
-              source: 'rate_limit_event',
-              ...who,
-              subscriptionType: null,
-              available: true,
-              limitType: info?.rateLimitType ?? null,
-              utilization: info?.utilization ?? null,
-              resetsAt: resetsAtIso(info?.resetsAt),
-              status: info?.status ?? null,
-            },
-          ]);
-          const blocked = classifyRateLimitEvent(info);
-          if (!blocked) {
-            if (info?.status === 'allowed_warning') {
-              log(
-                `rate-limit warning: ${info.rateLimitType ?? 'window'} at ${
-                  info.utilization != null ? `${Math.round(info.utilization * 100)}%` : 'high'
-                } utilization`,
-              );
-            }
-          } else {
-            yield { type: 'error', message: blocked.message, retryable: false, classification: blocked.classification };
-          }
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
-          const meta = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata;
-          const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
-          // Not a `result`: the poll loop treats result text as the agent's turn
-          // output — a synthetic "Context compacted." result has no <message>
-          // block, so it triggers the "response was not delivered — please
-          // re-send" nudge and the agent duplicates its previous message.
-          // Compaction is bookkeeping: log it, count it as activity only.
-          log(`Context compacted${detail}.`);
+          // Yield activity for every SDK event so the poll loop knows the agent is working
           yield { type: 'activity' };
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
-          const tn = message as { summary?: string; status?: string; tool_use_id?: string };
-          const toolName = tn.tool_use_id ? toolNameById.get(tn.tool_use_id) : undefined;
-          // An ASYNC subagent's quota death lands HERE, not on the
-          // PostToolUse subagent-tool hook — its tool_result was just "Async agent
-          // launched successfully…", with nothing to match. The CLI folds this
-          // notification back in as a `<task-notification>` user message that
-          // auto-continues the turn, so left alone the parent runs on with a
-          // dead subagent and the credential ring never rotates.
-          const asyncQuotaError = subagentQuotaFromTaskNotification(tn, toolName);
-          if (asyncQuotaError) {
-            if (!subagentQuotaError) subagentQuotaError = asyncQuotaError;
-            const split = asyncQuotaError.indexOf(': ');
-            log(
-              `Subagent hit ${asyncQuotaError.slice(0, split)} — interrupting turn so poll-loop can rotate: ` +
-                asyncQuotaError.slice(split + 2),
-            );
-            // Yield the label BEFORE throwing: the throw unwinds straight to
-            // poll-loop's rotation catch, so this is the last chance to tell
-            // the user why their turn restarted.
-            yield {
-              type: 'progress',
-              message: formatBlockquoteLabel('↻', "subagent hit the credential slot's limit — rotating and retrying"),
+
+          if (message.type === 'system' && message.subtype === 'init') {
+            yield { type: 'init', continuation: message.session_id };
+          } else if (message.type === 'result') {
+            pendingAssistantText = null;
+            // `result` text exists only on subtype:"success"; error subtypes
+            // (e.g. a non-retryable 403 billing_error) carry their message in
+            // `errors[]` instead. Surface either so the poll-loop can deliver a
+            // billing/quota notice to the user rather than dropping the turn.
+            const m = message as {
+              result?: string;
+              is_error?: boolean;
+              errors?: string[];
+              // Typed from the SDK so a bump that drops the echo fails typecheck
+              // instead of silently making every result unprompted.
+              user_message_uuid?: (SDKResultSuccess | SDKResultError)['user_message_uuid'];
+              user_message_uuids?: (SDKResultSuccess | SDKResultError)['user_message_uuids'];
+              usage?: {
+                input_tokens?: number | null;
+                output_tokens?: number | null;
+                cache_creation_input_tokens?: number | null;
+                cache_read_input_tokens?: number | null;
+              };
+              total_cost_usd?: number;
+              modelUsage?: Record<string, ResultModelUsage>;
+              // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up):
+              // the SDK's own count of assistant/tool round-trips this turn made
+              // — the most authoritative `steps` signal of the three providers,
+              // since it comes straight from the harness rather than being
+              // inferred from the event stream.
+              num_turns?: number;
             };
-            try {
-              void sdkResult.interrupt()?.catch?.((err: unknown) => {
-                log(`Subagent quota interrupt failed: ${err instanceof Error ? err.message : String(err)}`);
-              });
-            } catch (err) {
-              log(`Subagent quota interrupt threw: ${err instanceof Error ? err.message : String(err)}`);
+            const text = m.result ?? (m.errors && m.errors.length > 0 ? m.errors.join('\n') : null);
+            // Retry-path guards run FIRST — these turn error text into a throw so
+            // poll-loop's rotation / recap / backoff machinery retries instead of
+            // posting the raw error to the user's channel.
+            if (text && QUOTA_RESULT_RE.test(text)) {
+              // Throw so poll-loop's catch path can rotate to the next OAuth
+              // fallback and retry instead of dispatching the quota message
+              // to the user.
+              throw new Error(`subscription_quota_exhausted: ${text}`);
             }
-            // Throw directly rather than waiting for the loop-top check: an
-            // interrupted stream may never emit another message.
-            throw new Error(subagentQuotaError);
-          }
-          if (shouldForwardTaskNotification(toolName)) {
-            const summary = tn.summary || 'Task notification';
-            const emoji = (tn.status && TASK_NOTIFICATION_EMOJI[tn.status]) || '🔧';
-            yield { type: 'progress', message: formatBlockquoteLabel(emoji, summary) };
-          }
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'background_tasks_changed') {
-          const payload = message as { tasks?: { task_id?: string; ambient?: boolean; task_type?: string }[] };
-          liveBackgroundTasks.clear();
-          for (const t of Array.isArray(payload.tasks) ? payload.tasks : []) {
-            if (t && typeof t.task_id === 'string' && t.ambient !== true) liveBackgroundTasks.add(t.task_id);
-          }
-          if (liveBackgroundTasks.size > 0) backgroundHold = true;
-          if (idleSeenWithHold) {
-            for (const id of liveBackgroundTasks) {
-              if (!idleCoveredTasks.has(id)) {
-                // Evidence and its scope go together: a snapshot without the
-                // flag is a dropped window nothing may consult.
-                idleSeenWithHold = false;
-                idleCoveredTasks = new Set();
-                break;
+            if (text && SUBSCRIPTION_BLOCKED_RE.test(text)) {
+              // Org-disabled account: same rotation path as quota exhaustion,
+              // distinct marker for diagnosability.
+              throw new Error(`subscription_access_disabled: ${text}`);
+            }
+            if (text && POISONED_CONTINUATION_RE.test(text)) {
+              // Throw so poll-loop's isSessionInvalid branch clears the
+              // poisoned continuation and retries with a recap instead of
+              // dispatching the raw 400 to the user (and dead-stopping the
+              // session — the same history would fail every future turn).
+              throw new Error(text);
+            }
+            if (text && TRANSIENT_OVERLOAD_RESULT_RE.test(text)) {
+              // Throw so poll-loop's transient-overload branch backs off and
+              // retries the same prompt instead of posting the rate-limit error
+              // to the user's channel as the agent's reply.
+              throw new Error(`transient_overload: ${text}`);
+            }
+            const effortHeldAllTurn = effortTransitionsThisTurn === 0;
+            // Cleared BEFORE the yield, not after. The generator suspends at the
+            // yield below and poll-loop does its applySettings/push during that
+            // suspension, so a reset placed after it would wipe transitions that
+            // belong to the NEXT turn — the same erasure, one frame later.
+            effortTransitionsThisTurn = 0;
+            yield {
+              type: 'result',
+              text,
+              isError: m.is_error === true,
+              // The runner's prompts this turn consumed, as echoed. Cleared from
+              // the outstanding set before the yield, so hasQueuedWork is
+              // already truthful when poll-loop reads it at this result.
+              answeredPrompts: stream.answer([
+                ...(m.user_message_uuids ?? []),
+                ...(m.user_message_uuid ? [m.user_message_uuid] : []),
+              ]),
+              // Effort is a request parameter — no API bills it back, so it is
+              // stamped on here rather than read out of `modelUsage`. On a
+              // multi-model turn only the entry for `activeModel` gets it; the
+              // subagent entries stay NULL because we never set their effort.
+              // See providers/turn-effort.ts.
+              usage: attachTurnEffort(extractUsage(m), {
+                model: activeUsageModel,
+                // Unequal = the effort moved mid-turn, so no single value
+                // describes this aggregate. NULL both halves: `requested` is
+                // just as ambiguous as `effective` once the turn straddles a
+                // change, and a half-labelled row invites the same wrong read.
+                effective: effortHeldAllTurn ? activeEffort : null,
+                requested: effortHeldAllTurn ? activeRequestedEffort : null,
+              }),
+              steps: typeof m.num_turns === 'number' ? m.num_turns : null,
+              rateLimit: lastRateLimitInfo
+                ? {
+                    type: lastRateLimitInfo.rateLimitType ?? null,
+                    utilization: lastRateLimitInfo.utilization ?? null,
+                    resetsAt: resetsAtIso(lastRateLimitInfo.resetsAt),
+                  }
+                : null,
+            };
+            lastRateLimitInfo = undefined; // scoped to the turn that just closed
+            // Throttled, fire-and-forget: samples plan utilization for THIS
+            // account whether or not the SDK had anything to warn about.
+            samplePlanUsage(sdkResult, who);
+          } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
+            yield { type: 'error', message: 'API retry', retryable: true };
+          } else if (message.type === 'rate_limit_event') {
+            const info = (message as { rate_limit_info?: SdkRateLimitInfo }).rate_limit_info;
+            lastRateLimitInfo = info; // held for the `result` that closes this turn
+            // Kept alongside the pull, not replaced by it: the event carries a
+            // `status` (allowed_warning / rejected) the pull has no field for,
+            // and it is the fallback when the experimental pull is unavailable.
+            // `source` on the row says which path produced it.
+            recordRateLimitSamples([
+              {
+                source: 'rate_limit_event',
+                ...who,
+                subscriptionType: null,
+                available: true,
+                limitType: info?.rateLimitType ?? null,
+                utilization: info?.utilization ?? null,
+                resetsAt: resetsAtIso(info?.resetsAt),
+                status: info?.status ?? null,
+              },
+            ]);
+            const blocked = classifyRateLimitEvent(info);
+            if (!blocked) {
+              if (info?.status === 'allowed_warning') {
+                log(
+                  `rate-limit warning: ${info.rateLimitType ?? 'window'} at ${
+                    info.utilization != null ? `${Math.round(info.utilization * 100)}%` : 'high'
+                  } utilization`,
+                );
+              }
+            } else {
+              yield {
+                type: 'error',
+                message: blocked.message,
+                retryable: false,
+                classification: blocked.classification,
+              };
+            }
+          } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
+            const meta = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata;
+            const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
+            // Not a `result`: the poll loop treats result text as the agent's turn
+            // output — a synthetic "Context compacted." result has no <message>
+            // block, so it triggers the "response was not delivered — please
+            // re-send" nudge and the agent duplicates its previous message.
+            // Compaction is bookkeeping: log it, count it as activity only.
+            log(`Context compacted${detail}.`);
+            yield { type: 'activity' };
+          } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
+            const tn = message as { summary?: string; status?: string; tool_use_id?: string };
+            const toolName = tn.tool_use_id ? toolNameById.get(tn.tool_use_id) : undefined;
+            // An ASYNC subagent's quota death lands HERE, not on the
+            // PostToolUse subagent-tool hook — its tool_result was just "Async agent
+            // launched successfully…", with nothing to match. The CLI folds this
+            // notification back in as a `<task-notification>` user message that
+            // auto-continues the turn, so left alone the parent runs on with a
+            // dead subagent and the credential ring never rotates.
+            const asyncQuotaError = subagentQuotaFromTaskNotification(tn, toolName);
+            if (asyncQuotaError) {
+              if (!subagentQuotaError) subagentQuotaError = asyncQuotaError;
+              const split = asyncQuotaError.indexOf(': ');
+              log(
+                `Subagent hit ${asyncQuotaError.slice(0, split)} — interrupting turn so poll-loop can rotate: ` +
+                  asyncQuotaError.slice(split + 2),
+              );
+              // Yield the label BEFORE throwing: the throw unwinds straight to
+              // poll-loop's rotation catch, so this is the last chance to tell
+              // the user why their turn restarted.
+              yield {
+                type: 'progress',
+                message: formatBlockquoteLabel('↻', "subagent hit the credential slot's limit — rotating and retrying"),
+              };
+              try {
+                void sdkResult.interrupt()?.catch?.((err: unknown) => {
+                  log(`Subagent quota interrupt failed: ${err instanceof Error ? err.message : String(err)}`);
+                });
+              } catch (err) {
+                log(`Subagent quota interrupt threw: ${err instanceof Error ? err.message : String(err)}`);
+              }
+              // Throw directly rather than waiting for the loop-top check: an
+              // interrupted stream may never emit another message.
+              throw new Error(subagentQuotaError);
+            }
+            if (shouldForwardTaskNotification(toolName)) {
+              const summary = tn.summary || 'Task notification';
+              const emoji = (tn.status && TASK_NOTIFICATION_EMOJI[tn.status]) || '🔧';
+              yield { type: 'progress', message: formatBlockquoteLabel(emoji, summary) };
+            }
+          } else if (
+            message.type === 'system' &&
+            (message as { subtype?: string }).subtype === 'background_tasks_changed'
+          ) {
+            const payload = message as { tasks?: { task_id?: string; ambient?: boolean; task_type?: string }[] };
+            liveBackgroundTasks.clear();
+            for (const t of Array.isArray(payload.tasks) ? payload.tasks : []) {
+              if (t && typeof t.task_id === 'string' && t.ambient !== true) liveBackgroundTasks.add(t.task_id);
+            }
+            if (liveBackgroundTasks.size > 0) backgroundHold = true;
+            if (idleSeenWithHold) {
+              for (const id of liveBackgroundTasks) {
+                if (!idleCoveredTasks.has(id)) {
+                  // Evidence and its scope go together: a snapshot without the
+                  // flag is a dropped window nothing may consult.
+                  idleSeenWithHold = false;
+                  idleCoveredTasks = new Set();
+                  break;
+                }
               }
             }
-          }
-          const releasedAtDrain = liveBackgroundTasks.size === 0 && idleSeenWithHold;
-          if (releasedAtDrain) {
-            // The CLI already went idle over these tasks: no idle will follow
-            // this drain, so this is the release (see idleSeenWithHold).
-            backgroundHold = false;
-            idleSeenWithHold = false;
-            idleCoveredTasks = new Set();
-          }
-          log(
-            `Background tasks: ${liveBackgroundTasks.size} live` +
-              (releasedAtDrain ? ' (hold released at drain)' : backgroundHold ? ' (hold)' : ''),
-          );
-          if (releasedAtDrain) yield { type: 'background_work', live: 0 };
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'session_state_changed') {
-          sessionStateSeen = true;
-          if ((message as { state?: string }).state === 'idle') {
-            const unansweredPrompts = stream.settle();
-            if (unansweredPrompts.length > 0) yield { type: 'settled', unansweredPrompts };
-            // Report the background level HERE, not at the membership change:
-            // on this CLI idle is withheld while background agents run and
-            // fires only once the bg-agent loop exits (sdk.d.ts on
-            // SDKSessionStateChangedMessage; CLI 2.1.272 changelog — headless
-            // sessions stopped reporting idle with agents still running,
-            // CLAUDE_CODE_BG_TASKS_REPORT_RUNNING defaults on). So `live: 0`
-            // at idle is the CLI confirming no follow-up turn is coming, and
-            // the poll-loop can lower the level it held for that work without
-            // opening a gap before a completion-started turn's `init`. The
-            // hold releases here for the same reason — or, for task types
-            // the CLI does not gate idle on, at the drain that follows an
-            // idle like this one (idleSeenWithHold).
-            if (liveBackgroundTasks.size === 0) backgroundHold = false;
-            else if (backgroundHold) {
-              idleSeenWithHold = true;
-              idleCoveredTasks = new Set(liveBackgroundTasks);
+            const releasedAtDrain = liveBackgroundTasks.size === 0 && idleSeenWithHold;
+            if (releasedAtDrain) {
+              // The CLI already went idle over these tasks: no idle will follow
+              // this drain, so this is the release (see idleSeenWithHold).
+              backgroundHold = false;
+              idleSeenWithHold = false;
+              idleCoveredTasks = new Set();
             }
-            yield { type: 'background_work', live: liveBackgroundTasks.size };
-          }
-        } else if (message.type === 'assistant') {
-          // Record tool_use id → name so a later task_notification can be
-          // classified (Agent/Task subagent vs backgrounded Bash). See
-          // shouldForwardTaskNotification.
-          const blocks = (message as { message?: { content?: unknown } }).message?.content;
-          if (Array.isArray(blocks)) {
-            for (const block of blocks) {
-              const b = block as { type?: string; id?: string; name?: string };
-              if (b.type === 'tool_use' && b.id && b.name) toolNameById.set(b.id, b.name);
-            }
-          }
-          // SDK task_notification only fires for multi-step planned tasks, so
-          // simple turns (single tool call, direct answers) never get a
-          // status line. Derive labels from thinking + tool_use blocks on
-          // each assistant turn. Thinking forwarding gives the user visibility
-          // into the reasoning process; the tool_use label shows what the
-          // agent chose to do next. Both honor TOOL_PROGRESS_MIN_INTERVAL_MS
-          // across the whole label group — throttling is a per-turn floor,
-          // not a per-label rate limit.
-          const labels = deriveProgressLabels(message);
-          if (labels.length > 0) {
-            const now = Date.now();
-            if (now - lastToolProgressAt >= TOOL_PROGRESS_MIN_INTERVAL_MS) {
-              for (const label of labels) {
-                yield { type: 'progress', message: label };
+            log(
+              `Background tasks: ${liveBackgroundTasks.size} live` +
+                (releasedAtDrain ? ' (hold released at drain)' : backgroundHold ? ' (hold)' : ''),
+            );
+            if (releasedAtDrain) yield { type: 'background_work', live: 0 };
+          } else if (
+            message.type === 'system' &&
+            (message as { subtype?: string }).subtype === 'session_state_changed'
+          ) {
+            sessionStateSeen = true;
+            if ((message as { state?: string }).state === 'idle') {
+              const unansweredPrompts = stream.settle();
+              if (unansweredPrompts.length > 0) yield { type: 'settled', unansweredPrompts };
+              // Report the background level HERE, not at the membership change:
+              // on this CLI idle is withheld while background agents run and
+              // fires only once the bg-agent loop exits (sdk.d.ts on
+              // SDKSessionStateChangedMessage; CLI 2.1.272 changelog — headless
+              // sessions stopped reporting idle with agents still running,
+              // CLAUDE_CODE_BG_TASKS_REPORT_RUNNING defaults on). So `live: 0`
+              // at idle is the CLI confirming no follow-up turn is coming, and
+              // the poll-loop can lower the level it held for that work without
+              // opening a gap before a completion-started turn's `init`. The
+              // hold releases here for the same reason — or, for task types
+              // the CLI does not gate idle on, at the drain that follows an
+              // idle like this one (idleSeenWithHold).
+              if (liveBackgroundTasks.size === 0) backgroundHold = false;
+              else if (backgroundHold) {
+                idleSeenWithHold = true;
+                idleCoveredTasks = new Set(liveBackgroundTasks);
               }
-              lastToolProgressAt = now;
+              yield { type: 'background_work', live: liveBackgroundTasks.size };
+            }
+          } else if (message.type === 'assistant') {
+            // Record tool_use id → name so a later task_notification can be
+            // classified (Agent/Task subagent vs backgrounded Bash). See
+            // shouldForwardTaskNotification.
+            const blocks = (message as { message?: { content?: unknown } }).message?.content;
+            // A subagent's assistant messages ride this stream too, tagged with
+            // the tool call that spawned them; only the parent speaks to people.
+            const topLevel = (message as { parent_tool_use_id?: string | null }).parent_tool_use_id == null;
+            if (Array.isArray(blocks)) {
+              for (const block of blocks) {
+                const b = block as { type?: string; id?: string; name?: string; text?: unknown };
+                if (b.type === 'tool_use' && b.id && b.name) toolNameById.set(b.id, b.name);
+                if (!topLevel) continue;
+                // Text is only known to be mid-turn once a tool call follows it
+                // (the CLI emits blocks as separate messages, so "follows" spans
+                // messages). Text still pending at `result` is the final text,
+                // which the result carries — dropped there, never emitted twice.
+                if (b.type === 'text' && typeof b.text === 'string' && b.text.trim()) {
+                  pendingAssistantText = pendingAssistantText ? `${pendingAssistantText}\n${b.text}` : b.text;
+                } else if (b.type === 'tool_use' && pendingAssistantText) {
+                  const text = pendingAssistantText;
+                  pendingAssistantText = null;
+                  yield { type: 'interim_text', text };
+                }
+              }
+            }
+            // SDK task_notification only fires for multi-step planned tasks, so
+            // simple turns (single tool call, direct answers) never get a
+            // status line. Derive labels from thinking + tool_use blocks on
+            // each assistant turn. Thinking forwarding gives the user visibility
+            // into the reasoning process; the tool_use label shows what the
+            // agent chose to do next. Both honor TOOL_PROGRESS_MIN_INTERVAL_MS
+            // across the whole label group — throttling is a per-turn floor,
+            // not a per-label rate limit.
+            const labels = deriveProgressLabels(message);
+            if (labels.length > 0) {
+              const now = Date.now();
+              if (now - lastToolProgressAt >= TOOL_PROGRESS_MIN_INTERVAL_MS) {
+                for (const label of labels) {
+                  yield { type: 'progress', message: label };
+                }
+                lastToolProgressAt = now;
+              }
             }
           }
         }
-      }
       } catch (err) {
         if (aborted) return;
         throw err;

@@ -574,6 +574,18 @@ export type ProviderEvent =
    * event (tool call, thinking, partial message, anything) so the
    * poll-loop's idle timer stays honest during long tool runs.
    */
+  /**
+   * Text the agent wrote and then kept working past — a tool call followed it
+   * inside the same turn, so it is NOT the turn's final text and the `result`
+   * will not carry it. The poll-loop delivers the complete
+   * `<message to="…">…</message>` blocks in it and drops the rest as the
+   * narration it is. Without this an agent that posts an update and carries on
+   * (rather than ending its turn) reaches nobody: observed live 2026-09-16/17,
+   * five correctly wrapped updates over a day, none delivered. Top-level
+   * assistant text only — never a subagent's. Providers whose protocol has no
+   * such text simply never emit it.
+   */
+  | { type: 'interim_text'; text: string }
   | { type: 'activity' }
   /**
    * The provider's underlying SDK auto-compacted the conversation context.
