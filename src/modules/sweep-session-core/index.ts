@@ -132,10 +132,11 @@ export function registerSessionCoreSweepDuties(): void {
     run: (ctx) => {
       const { session, mailbox } = asSessionContext(ctx);
       const answered = mailbox!.syncProcessingAcks();
-      // Not the normal completion path: each id is a row the runner would never
-      // select again and the host would have counted due forever.
+      // Not the normal completion path, and not a successful run: each id is a
+      // row the runner would never select again and the host would have counted
+      // due forever. Whatever its interrupted turn had left to do is NOT resumed.
       if (answered.length > 0) {
-        log.warn('Completed answered rows the runner left pending with no ack', {
+        log.warn('Closed answered-but-unfinished rows the runner will not resume (no ack left)', {
           sessionId: session.id,
           messageIds: answered,
         });

@@ -426,6 +426,15 @@ describe('S2-PR9 — per-session core', () => {
       reply(outDb, 'out-status', 'task-status-only', afterDue, 'status');
       // No reply at all.
       seedTask(inDb, 'task-unanswered', 3, dueAt);
+      // Malformed timestamps: the runner's `ts >= due` is false on NaN, so it
+      // would still select these — the host must not read NaN as "answered".
+      seedTask(inDb, 'task-bad-reply-ts', 4, dueAt);
+      reply(outDb, 'out-bad-ts', 'task-bad-reply-ts', 'not-a-timestamp');
+      // A Julian-day number is a time SQLite's datetime() accepts (2023, so the
+      // row IS due) and Date.parse does not.
+      seedTask(inDb, 'task-bad-due', 5, '2460000.5');
+      reply(outDb, 'out-bad-due', 'task-bad-due', afterDue);
+      expect(Number.isNaN(Date.parse('2460000.5Z'))).toBe(true);
       const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
 
       const ctx = sessionCtx(mailbox, { alive: true });
@@ -435,7 +444,9 @@ describe('S2-PR9 — per-session core', () => {
       expect(statusOf(inDb, 'task-early-reply')).toBe('pending');
       expect(statusOf(inDb, 'task-status-only')).toBe('pending');
       expect(statusOf(inDb, 'task-unanswered')).toBe('pending');
-      expect(ctx.plan.dueCount).toBe(3);
+      expect(statusOf(inDb, 'task-bad-reply-ts')).toBe('pending');
+      expect(statusOf(inDb, 'task-bad-due')).toBe('pending');
+      expect(ctx.plan.dueCount).toBe(5);
       expect(warn).not.toHaveBeenCalled();
       warn.mockRestore();
     });

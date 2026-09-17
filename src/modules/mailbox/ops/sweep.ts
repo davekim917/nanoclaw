@@ -6,7 +6,6 @@
 import type Database from 'better-sqlite3';
 
 import { migrateMessagesInTable } from '../schema.js';
-import { parseSqliteUtc } from '../sqlite-utc.js';
 
 /**
  * Earliest FUTURE process_after among pending rows, or null. Used by the host
@@ -255,7 +254,11 @@ export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Data
  * (observed live 2026-09-15: one series silent for 57 hours across two containers).
  *
  * The predicate is a strict mirror of the runner's, so this can only complete
- * a row the runner would never run. It is no grace period's business: the
+ * a row the runner would never run — including on malformed data: the runner's
+ * `ts >= parseDbUtc(process_after)` is false when either side is NaN, so the
+ * row stays selectable there, and `answeredSinceDue` below is the same POSITIVE
+ * comparison rather than its negation. Completing here means "answered, will
+ * not be resumed", never "ran successfully". It is no grace period's business: the
  * answer's timestamp and the row's `process_after` are both already written,
  * and only the host moves `process_after` (synchronously, not under this
  * call). A row carrying ANY ack is left alone — a live claim belongs to the
@@ -265,6 +268,24 @@ export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Data
  * Writes inbound only. The due filter is `countDueMessages`' own, so the rows
  * considered are exactly the rows that hold a session "due".
  */
+/**
+ * The runner's own timestamp reading, statement for statement (`parseDbUtc`,
+ * container/agent-runner/src/modules/mailbox/selection.ts:31-35) — the two
+ * package trees cannot share a module, and a looser or stricter parse here is
+ * exactly how the host and the runner would come to disagree again.
+ */
+function parseRunnerUtc(value: string): number {
+  let s = value.includes('T') ? value : value.replace(' ', 'T');
+  if (!/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(s)) s += 'Z';
+  return Date.parse(s);
+}
+
+/** `isResponded` (selection.ts:333-339): NaN on either side compares false → not answered. */
+function answeredSinceDue(answeredAt: string, processAfter: string | null): boolean {
+  if (processAfter === null) return true;
+  return parseRunnerUtc(answeredAt) >= parseRunnerUtc(processAfter);
+}
+
 export function completeAnsweredPendingRows(inDb: Database.Database, outDb: Database.Database): string[] {
   migrateMessagesInTable(inDb);
   const due = inDb
@@ -286,7 +307,7 @@ export function completeAnsweredPendingRows(inDb: Database.Database, outDb: Data
   for (const { id, processAfter } of due) {
     const answeredAt = (answeredAtStmt.get(id) as { ts: string | null }).ts;
     if (answeredAt === null) continue;
-    if (processAfter !== null && parseSqliteUtc(answeredAt) < parseSqliteUtc(processAfter)) continue;
+    if (!answeredSinceDue(answeredAt, processAfter)) continue;
     if (hasProcessingAck(outDb, id)) continue;
     if (completeStmt.run(id).changes > 0) backfilled.push(id);
   }
