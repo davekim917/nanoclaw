@@ -4428,9 +4428,28 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
   lease_fence_end
   task_binding_lock_end
 
+  # A resumed run id whose completion contract already exists is bound to the
+  # PREDECESSOR's token: `contract` stamps coordinatorOwnerToken once
+  # (smoke-run-scaffold.sh:491) and the token minted above is always new, so
+  # the scaffold's require_contract_owner (smoke-run-scaffold.sh:321-326) will
+  # refuse this wake's marker/redispatch until it runs `adopt`. Say so in the
+  # wake rather than leaving the successor to discover it from a refusal.
+  # Read-only, and `null` — not false — when the run
+  # root is unwired: absence is only evidence when presence was possible.
+  CONTRACT_ADOPTION_REQUIRED=false
+  if [ "$RESUMED_RUN_ID" = true ]; then
+    if [ -z "$CHALLENGER_RUN_ROOT" ] || [ ! -d "$CHALLENGER_RUN_ROOT" ]; then
+      CONTRACT_ADOPTION_REQUIRED=null
+    elif [ -n "$(jq -r '.coordinatorOwnerToken // empty' \
+           "$CHALLENGER_RUN_ROOT/$RUN_ID/completion-contract.json" 2>/dev/null || true)" ]; then
+      CONTRACT_ADOPTION_REQUIRED=true
+    fi
+  fi
+
   jq -cn \
     --arg repo "$REPO" --arg branch "$BRANCH" --argjson pr "$W_PR" --arg runId "$RUN_ID" \
     --arg ownerToken "$OWNER_TOKEN" \
+    --argjson contractAdoptionRequired "$CONTRACT_ADOPTION_REQUIRED" \
     --argjson facts "$FACTS" --argjson recovery "$RECOVERY" \
     --arg abandoned "$ABANDONED" \
     --argjson resumedRunId "$RESUMED_RUN_ID" \
@@ -4438,6 +4457,7 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
       schemaVersion:1, trigger:"pr_build_settled",
       repo:$repo, branch:$branch, pr:$pr, runId:$runId, coordinatorOwnerToken:$ownerToken,
       resumedRunId:$resumedRunId,
+      contractAdoptionRequired:$contractAdoptionRequired,
       sourceSha:$facts.headSha,
       previewUrl:$facts.backendPreviewUrl,
       frontendPreviewUrl:$facts.frontendPreviewUrl,
