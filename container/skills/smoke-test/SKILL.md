@@ -1026,7 +1026,8 @@ desktop and phone width into one labelled image. `smoke-journeys.py shots
 <run-dir>` prints the matched journeys' `captureRecipes` (`name`, `path`,
 click/wait `steps`) as `shots.json`; a journey's English steps are never fed to
 the capture script.
-`smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> <source-sha>`
+`smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> <source-sha>
+[baseline-url] [baseline-auth-state.json]`
 — pass the campaign's frozen `sourceSha` as the fourth argument so
 `manifest.json`'s `buildSha` records the SHA you already froze on rather
 than whatever (if anything) the served page exposes; omit it only when no
@@ -1058,11 +1059,29 @@ screen's leftover DOM/localStorage state (e.g. a nav drawer a prior screen's
 graded BROKEN as a pure capture artifact. Each screen's manifest entry
 carries `freshNavigation: true` as the record of this.
 
-**The phone capture waits for responsive transitions after its viewport
-resize.** Do not replace that settle step with a screenshot immediately after
-the 390px switch: a real PR campaign captured a drawer mid-slide and created a
-false visual finding. If the settle wait itself fails, the mobile entry is
-recorded as missing/partial instead of emitting timing-contaminated evidence.
+**Grade the viewport capture, never the full-page one.** Each width's `file`
+is viewport-sized, taken with CSS animations/transitions frozen and re-taken
+until the live page matches it (`settled`). `fullPage` (`*-full.png`) is
+context only: full-page stitching misplaces fixed/sticky headers and drawers
+and has produced false BROKEN findings. A tile badged `unsettled` is not
+evidence of breakage on its own. A capture whose final `location.pathname`
+is not the shot's `path` (or its declared `finalPath`, for a `steps` click
+that navigates on purpose) fails with both paths named — a bounce to a login
+route is never graded, and on the baseline it is a failed diff, never
+`changed`.
+
+**With a baseline url, judge what the build changed.** Each screen/width is
+also captured from the baseline with the identical recipe and pixel-diffed;
+`manifest.json` gains `diff: {status, pct, image, baseline, reason}` per
+width and the sheet orders tiles changed → diff failed → unchanged, each
+badged, with the diff overlay under a changed tile. Give a critic the head
+image, its `*-base.png` and `*-diff.png`, and ask what the change broke — an
+`unchanged` screen looked that way before this build. Baseline capture is
+strictly read-only (navigation, the declared `steps`, screenshot) and is the
+only thing a deployment's baseline url may be used for; a baseline failure
+records `diff.status: "failed"` with a reason and never touches the head
+capture. A baseline on another origin needs its own auth state file, under
+the same placement rule below.
 
 **Auth state is a live session token — never put it in the run dir or under
 the shared workgroup tree.** The script refuses both (`realpath`-checked
