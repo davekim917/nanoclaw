@@ -1751,6 +1751,38 @@ campaign_size_classify() {
 # including a recovery wake — reads it back here, so one campaign never sees
 # two ranges just because another GO (its own included) landed mid-run.
 BASELINE_CANDIDATE_LIMIT=10
+
+# Complete changed-file list between two commits, from their recursive trees:
+# changed = added ∪ removed ∪ blob-sha-differs, so a rename shows up as BOTH
+# its old and its new path (which is what sizing wants — see previous_filename
+# in the sizing block). Two API calls. Prints {"files":[{"filename":…},…]} and
+# returns 0; on any failure prints a short reason and returns 1. `truncated`
+# on either tree is a failure: GitHub truncates past its own entry/size limit
+# and a truncated tree is no more complete than the capped compare it replaces.
+# stdin is closed on the fetches: this runs inside poll's `while read` loop.
+campaign_range_tree_files() {  # <baseline-sha> <target-sha>
+  local side sha tree base_tree="" target_tree=""
+  for side in baseline target; do
+    [ "$side" = baseline ] && sha="$1" || sha="$2"
+    if ! tree="$(timeout 20 gh api "repos/$REPO/git/trees/$sha?recursive=1" </dev/null 2>/dev/null)"; then
+      printf 'the %s tree could not be fetched' "$side"; return 1
+    fi
+    if ! jq -e '(.truncated | type == "boolean") and (.tree | type == "array") and
+                all(.tree[]; (.path | type == "string") and (.type | type == "string"))' \
+         <<<"$tree" >/dev/null 2>&1; then
+      printf 'the %s tree is malformed' "$side"; return 1
+    fi
+    if [ "$(jq -r '.truncated' <<<"$tree")" != false ]; then
+      printf 'the %s tree is truncated' "$side"; return 1
+    fi
+    [ "$side" = baseline ] && base_tree="$tree" || target_tree="$tree"
+  done
+  jq -cn --slurpfile a <(printf '%s' "$base_tree") --slurpfile b <(printf '%s' "$target_tree") '
+    def blobs: [.tree[] | select(.type == "blob") | {key: .path, value: (.sha // "")}] | from_entries;
+    ($a[0] | blobs) as $x | ($b[0] | blobs) as $y |
+    {files: [(($x | keys) + ($y | keys)) | unique | .[] | select($x[.] != $y[.]) | {filename: .}]}
+  ' 2>/dev/null || { printf 'the tree diff could not be computed'; return 1; }
+}
 resolve_campaign_baseline() {  # <pr> <head-sha>
   local pr="$1" head_sha="$2" pin line n=0
   local l_target l_freeze l_pr l_run l_digest l_finished vfile vjson parent pr_head
@@ -1818,6 +1850,7 @@ evaluate_pr() {
   local files_json files_len files_fetch_failed migrations_touched frontend_touched frontend_required is_freeze ci_sha
   local migration_files migrations_determinable target_files_json target_files_len
   local baseline_json baseline_sha range_determinable range_reason migrations_in_range campaign_range_json
+  local range_files_method
   local runs_json runs_len ci_total ci_pending ci_failed ci_succeeded ci_ready ci_truncated
   local services_json backend backend_id backend_url backend_deploy_sha backend_ready
   local frontend frontend_id frontend_url frontend_deploy_sha frontend_ready
@@ -1880,10 +1913,11 @@ evaluate_pr() {
   # range a human or a route selector quotes) reads it and nothing else.
   #
   # Determinable only when the compare says the target is strictly AHEAD of
-  # the baseline (status "ahead", behind_by 0) with a complete (<300) non-empty
-  # file list, or when baseline == target (the one legitimately empty range —
-  # no fetch needed). behind / diverged / identical-with-different-SHAs /
-  # malformed / truncated / fetch failure / no validated GO all mean the range
+  # the baseline (status "ahead", behind_by 0) with a complete non-empty file
+  # list (compare's own below its 300 cap, else the recursive tree diff), or
+  # when baseline == target (the one legitimately empty range — no fetch
+  # needed). behind / diverged / identical-with-different-SHAs / malformed /
+  # a truncated tree / fetch failure / no validated GO all mean the range
   # is UNKNOWN: size `full`, migrationsInRange null — never `[]`, which would
   # claim a confirmed read. Same ahead-and-not-behind shape as the develop
   # gate's deploy_lag_safe.
@@ -1901,6 +1935,7 @@ evaluate_pr() {
     baseline_sha=""
     range_determinable=false
     range_reason=""
+    range_files_method=""
     target_files_json='{"files":[]}'
     if [ -z "$ci_sha" ]; then
       range_reason="the freeze target commit could not be determined"
@@ -1931,12 +1966,29 @@ evaluate_pr() {
       else
         target_files_len="$(jq -r '.files | length' <<<"$target_files_json")"
         if [ "$target_files_len" -ge 300 ] 2>/dev/null; then
-          range_reason="the baseline...target comparison is truncated (>=300 files)"
-          target_files_json='{"files":[]}'
+          # The compare endpoint caps `.files` at 300 and its pagination pages
+          # only COMMITS (page 2 carries no further files), so at the cap the
+          # list is incomplete — an artifact of that endpoint, not real
+          # uncertainty. The two recursive trees are complete, so the file list
+          # comes from them instead. Compare is still what vouched for
+          # ahead/behind above; a truncated, failed or malformed tree leaves
+          # the range unknown exactly as before.
+          if target_files_json="$(campaign_range_tree_files "$baseline_sha" "$ci_sha")"; then
+            range_files_method=tree
+            if [ "$(jq -r '.files | length' <<<"$target_files_json")" -eq 0 ] 2>/dev/null; then
+              range_reason="the baseline and target trees are identical although the SHAs differ"
+            else
+              range_determinable=true
+            fi
+          else
+            range_reason="the baseline...target comparison is at the 300-file cap and the complete tree diff is unavailable ($target_files_json)"
+            target_files_json='{"files":[]}'
+          fi
         elif [ "$target_files_len" -eq 0 ] 2>/dev/null; then
           range_reason="the baseline...target comparison is empty although the SHAs differ"
         else
           range_determinable=true
+          range_files_method=compare
         fi
       fi
     fi
@@ -1961,11 +2013,14 @@ evaluate_pr() {
     fi
     campaign_range_json="$(jq -cn --arg base "$baseline_sha" --arg target "$ci_sha" \
       --argjson determinable "$range_determinable" --arg reason "$range_reason" \
-      --argjson baseline "${baseline_json:-null}" \
+      --argjson baseline "${baseline_json:-null}" --arg method "$range_files_method" \
       '{baselineSha:(if $base == "" then null else $base end),
         targetSha:(if $target == "" then null else $target end),
         determinable:$determinable,
         reason:(if $determinable then null else $reason end),
+        # Which source produced the file list: "compare", "tree" (compare was
+        # at its 300-file cap), or null when no list was needed or obtained.
+        fileListMethod:(if $determinable and $method != "" then $method else null end),
         baselineRunId:($baseline.runId // null),
         baselineResolved:($baseline.resolved // false),
         baselinePinned:($baseline.pinned // false)}')"

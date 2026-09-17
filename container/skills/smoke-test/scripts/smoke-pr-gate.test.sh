@@ -46,6 +46,10 @@ set -u
 [ -n "${STUB_PARENT_BY_COMMIT+x}" ] || STUB_PARENT_BY_COMMIT='{}'
 [ -n "${STUB_PULL_HEADS+x}" ] || STUB_PULL_HEADS='{}'
 [ -n "${STUB_BINDING_EXIT+x}" ] || STUB_BINDING_EXIT=0
+# Recursive-tree GETs (the complete file list when compare is at its 300 cap):
+# commit sha -> tree response, plus a log of which shas were asked for.
+[ -n "${STUB_TREES_BY_SHA+x}" ] || STUB_TREES_BY_SHA='{}'
+[ -n "${STUB_TREE_GET_EXIT+x}" ] || STUB_TREE_GET_EXIT=0
 
 sequenced_run_list() {
   local n=1 out count_file
@@ -125,6 +129,12 @@ case "$1" in
     fi
     if printf '%s' "$P" | grep -qF '/git/blobs'; then
       cat >/dev/null; printf '%s' "$STUB_BLOB_RESPONSE"; exit 0
+    fi
+    if printf '%s' "$P" | grep -qF '/git/trees/' && printf '%s' "$P" | grep -qF 'recursive=1'; then
+      TREE_SHA="${P##*/git/trees/}"; TREE_SHA="${TREE_SHA%%\?*}"
+      [ -z "${STUB_TREE_GET_LOG:-}" ] || printf '%s\n' "$TREE_SHA" >> "$STUB_TREE_GET_LOG"
+      [ "$STUB_TREE_GET_EXIT" = 0 ] || exit "$STUB_TREE_GET_EXIT"
+      jq -c --arg s "$TREE_SHA" '.[$s] // {}' <<<"$STUB_TREES_BY_SHA"; exit 0
     fi
     if printf '%s' "$P" | grep -qF '/git/trees'; then
       cat >/dev/null; printf '%s' "$STUB_TREE_RESPONSE"; exit 0
@@ -282,6 +292,7 @@ reset_stubs() {
         STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS STUB_DEPLOYS_BY_SERVICE_JSON \
         STUB_COMPARE_FILES STUB_COMPARE_EXIT STUB_LOCK_PROBE STUB_LOCK_PROBE_FILE \
         STUB_PARENT_BY_COMMIT STUB_PULL_HEADS STUB_BINDING_EXIT STUB_COMPARE_LOG \
+        STUB_TREES_BY_SHA STUB_TREE_GET_EXIT STUB_TREE_GET_LOG \
         STUB_STATE_PROBE STUB_STATE_PROBE_FILE STUB_SUSPEND_SLEEP STUB_REPO_VIEW_EXIT \
         STUB_LEDGER_JQ_EMPTY_FILE STUB_SUSPEND_LOG \
         STUB_FRONTEND_HTML_EXIT STUB_FRONTEND_HTML STUB_BUNDLE_EXIT STUB_BUNDLE_JS \
@@ -834,11 +845,69 @@ range_case 5e '.campaignRange.baselineSha == $base and .campaignRange.targetSha 
 unset STUB_COMPARE_LOG
 freeze_ready_fixture 13 "$FREEZE_SHA" "$PARENT_SHA"
 
-# --- 5f. >=300 files: GitHub truncates the list, so the range is unknown —
-# and, unlike before, the campaign still runs (as `full`) instead of never.
-export STUB_COMPARE_FILES="$(python3 -c 'import json; print(json.dumps({"status":"ahead","ahead_by":40,"behind_by":0,"files":[{"filename": f"XZO-BACKEND/src/f{i}.ts"} for i in range(300)]}))')"
-range_case 5f "$UNKNOWN_RANGE and (.campaignRange.reason | test(\">=300\"))"
-bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and .data.campaignSize == "full"' >/dev/null
+# --- 5f. >=300 files. The compare endpoint caps `.files` at 300 (its paging
+# pages commits, not files), so at the cap the list is incomplete — but that
+# is an artifact of the endpoint, not real uncertainty. The file list then
+# comes from the two recursive trees: determinable, COMPLETE, and it names
+# migrations the capped compare list never showed. Live case: the first freeze
+# after the pinned GO spans 613 files, and would otherwise be unknown forever.
+CAPPED_COMPARE="$(python3 -c 'import json; print(json.dumps({"status":"ahead","ahead_by":40,"behind_by":0,"files":[{"filename": f"XZO-BACKEND/src/f{i}.ts"} for i in range(300)]}))')"
+tree_fixture() { # <n-changed> <truncated> -> STUB_TREES_BY_SHA for BASE_SHA / PARENT_SHA
+  STUB_TREES_BY_SHA="$(python3 - "$BASE_SHA" "$PARENT_SHA" "$1" "$2" <<'PYF'
+import json, sys
+base, target, n, truncated = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4] == "true"
+blob = lambda p, s: {"path": p, "type": "blob", "sha": s}
+same = [blob("README.md", "s0"), blob("XZO-BACKEND/src/same.ts", "s1"),
+        {"path": "XZO-BACKEND/src", "type": "tree", "sha": "t-will-differ"}]
+a = same + [blob(f"XZO-BACKEND/src/f{i}.ts", f"a{i}") for i in range(n)]
+b = [dict(e) for e in same] + [blob(f"XZO-BACKEND/src/f{i}.ts", f"b{i}") for i in range(n)]
+b[2]["sha"] = "t-differs"                       # a changed DIRECTORY entry is not a file
+a += [blob("XZO-BACKEND/migrations/9_old_name.sql", "m9"), blob("XZO-BACKEND/src/removed.ts", "r1")]
+b += [blob("XZO-FRONTEND/src/9_new_name.sql", "m9"),       # rename: same blob, both paths change
+      blob("XZO-BACKEND/migrations/301_added.sql", "m301")]
+print(json.dumps({base: {"sha": base, "truncated": False, "tree": a},
+                  target: {"sha": target, "truncated": truncated, "tree": b}}))
+PYF
+)"
+  export STUB_TREES_BY_SHA
+}
+export STUB_COMPARE_FILES="$CAPPED_COMPARE"
+export STUB_TREE_GET_LOG="$STATE_DIR/tree-get.log"
+tree_fixture 400 false
+range_case 5f-tree '.campaignRange.determinable == true and .campaignRange.reason == null and
+  .campaignRange.fileListMethod == "tree" and .fetchOk == true and .settled == true and
+  .migrationsTouched == true and .migrationsDeterminable == true and .frontendTouched == true and
+  .migrationsInRange == ["XZO-BACKEND/migrations/301_added.sql","XZO-BACKEND/migrations/9_old_name.sql"] and
+  .migrationFiles == .migrationsInRange'
+[ "$(sort "$STUB_TREE_GET_LOG" | tr '\n' ' ')" = "$(printf '%s\n%s\n' "$BASE_SHA" "$PARENT_SHA" | sort | tr '\n' ' ')" ] ||
+  { echo "5f: tree diff did not fetch exactly baseline+target: $(cat "$STUB_TREE_GET_LOG")" >&2; exit 1; }
+# The rename shows BOTH sides, so sizing still sees the path it moved OUT of;
+# unchanged blobs and the changed directory entry are not files in the range.
+export SMOKE_SIZING_RULES="$STATE_DIR/rules-tree.json"
+printf '%s' '{"full":["XZO-BACKEND/migrations/9_old_name.sql"],"lightAllowed":["XZO-FRONTEND/**"]}' > "$SMOKE_SIZING_RULES"
+range_case 5f-tree-rename '.campaignSize == "full" and (.sizeReason | test("9_old_name.sql"))'
+unset SMOKE_SIZING_RULES
+# Below the cap the compare list is used as-is and no tree is fetched.
+rm -f "$STUB_TREE_GET_LOG"
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
+range_case 5f-compare '.campaignRange.determinable == true and .campaignRange.fileListMethod == "compare"'
+[ ! -e "$STUB_TREE_GET_LOG" ] || { echo "5f: an uncapped compare still fetched trees" >&2; exit 1; }
+export STUB_COMPARE_FILES="$CAPPED_COMPARE"
+# The wake carries the tree-derived range too.
+bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and
+  .data.campaignRange.fileListMethod == "tree" and (.data.migrationsInRange | length) == 2' >/dev/null
+# Truncated tree / tree fetch failure / malformed tree: unknown, full, still settles.
+tree_fixture 400 true
+range_case 5f-tree-truncated "$UNKNOWN_RANGE and .campaignRange.fileListMethod == null and
+  (.campaignRange.reason | test(\"target tree is truncated\"))"
+tree_fixture 400 false
+export STUB_TREE_GET_EXIT=1
+range_case 5f-tree-fetch-failed "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"tree could not be fetched\"))"
+export STUB_TREE_GET_EXIT=0
+export STUB_TREES_BY_SHA='{}'
+range_case 5f-tree-malformed "$UNKNOWN_RANGE and (.campaignRange.reason | test(\"tree is malformed\"))"
+unset STUB_TREES_BY_SHA STUB_TREE_GET_LOG
+unset -f tree_fixture
 export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
 
 # --- 5g. No validated GO: no ledger configured, an empty one, and one that

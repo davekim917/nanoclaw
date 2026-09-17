@@ -2081,9 +2081,14 @@ target**, and the gate states it once, in the facts (`check`) and the
 - `migrationsInRange` — the migration files in that range, or **`null`** (never
   `[]`) when the range is unknown.
 
+The file list comes from the compare response, or — when that is at the
+endpoint's 300-file cap — from a diff of the two commits' recursive trees,
+which is complete (a rename appears as both its old and new path);
+`fileListMethod` says which (`compare` / `tree`).
+
 `determinable:false` (no validated GO, target behind/diverged from the
-baseline, a malformed or ≥300-file comparison, a failed fetch) means the range
-is **unknown**: `campaignSize` is `full` and `reason` says why. It does not
+baseline, a malformed comparison, a truncated or unreadable tree, a failed
+fetch) means the range is **unknown**: `campaignSize` is `full` and `reason` says why. It does not
 block the campaign. **Quote this range** — for route/consumer selection, the
 manifest, and any range shown to a human — never one re-derived by hand.
 
