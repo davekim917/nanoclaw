@@ -11,7 +11,6 @@ import { enforceHermeticity } from '../../test-hermeticity.js';
 import {
   assertIssuerMatches,
   assertResourceMatchesMcpUrl,
-  assertResourceUrlIsSecure,
   authorizationServerMetadataUrls,
   discoverAuthorization,
   parseWwwAuthenticate,
@@ -421,7 +420,7 @@ describe('RFC 9728 §3.3 — the protected-resource document must describe this 
     expect(() => assertResourceMatchesMcpUrl('https://mcp.x.test/mcp', 'https://mcp.x.test/mcp/v2')).not.toThrow();
   });
 
-  it('refuses the whole discovery when the answering document names another resource', async () => {
+  it('fails the whole discovery when no candidate document describes this resource', async () => {
     const fetchImpl = routed(
       liveRoutes(LIVE_SHAPES.amplitude, {
         resourceDoc: { ...LIVE_SHAPES.amplitude.resourceDoc, resource: 'https://someone-else.test' },
@@ -435,41 +434,33 @@ describe('RFC 9728 §3.3 — the protected-resource document must describe this 
   });
 });
 
-describe('transport gate on the resource side (issue #876 P2-3)', () => {
-  it('refuses an http MCP URL before any request is made', async () => {
+describe('cleartext is refused before anything is fetched (#876 P2-3)', () => {
+  it('refuses an http:// MCP URL without probing it', async () => {
     const calls: string[] = [];
-    const fetchImpl = routed({}, calls);
-    await expect(discoverAuthorization(fetchImpl, 'http://mcp.x.test/mcp')).rejects.toThrow(/MCP URL must be https/);
+    await expect(discoverAuthorization(routed({}, calls), 'http://mcp.example.com/mcp')).rejects.toThrow(
+      /--url must be https/,
+    );
+    // Nothing was probed: the bearer token would be sent to this URL.
     expect(calls).toEqual([]);
   });
 
-  it('refuses an http resource_metadata URL from the challenge instead of quietly falling back', async () => {
+  it('never fetches a cleartext resource_metadata URL from a challenge, and still tries the well-known paths', async () => {
     const calls: string[] = [];
     const fetchImpl = routed(
       {
-        'https://mcp.x.test/mcp': json({}, 401, {
-          'www-authenticate': 'Bearer resource_metadata="http://mcp.x.test/.well-known/oauth-protected-resource/mcp"',
-        }),
-        // A perfectly good well-known document sits right here. Falling back to
-        // it would hide the cleartext pointer entirely.
-        'https://mcp.x.test/.well-known/oauth-protected-resource/mcp': json({
-          resource: 'https://mcp.x.test/mcp',
-          authorization_servers: ['https://as.x.test'],
+        'https://mcp.example.com/mcp': json({}, 401, {
+          'www-authenticate': 'Bearer resource_metadata="http://evil.example.net/prm"',
         }),
       },
       calls,
     );
-    await expect(discoverAuthorization(fetchImpl, 'https://mcp.x.test/mcp')).rejects.toThrow(
-      /resource_metadata URL from WWW-Authenticate must be https/,
+    await expect(discoverAuthorization(fetchImpl, 'https://mcp.example.com/mcp')).rejects.toThrow(
+      /resource_metadata must be https/,
     );
-    expect(calls).not.toContain('http://mcp.x.test/.well-known/oauth-protected-resource/mcp');
-  });
-
-  it('allows http on loopback, which is the one place cleartext cannot be observed', () => {
-    expect(assertResourceUrlIsSecure('MCP URL', 'http://127.0.0.1:9000/mcp')).toBe('http://127.0.0.1:9000/mcp');
-    expect(assertResourceUrlIsSecure('MCP URL', 'http://localhost:9000/mcp')).toBe('http://localhost:9000/mcp');
-    expect(assertResourceUrlIsSecure('MCP URL', 'http://[::1]:9000/mcp')).toBe('http://[::1]:9000/mcp');
-    expect(() => assertResourceUrlIsSecure('MCP URL', 'http://127.0.0.1.evil.test/mcp')).toThrow(/must be https/);
+    // The advertised cleartext URL is named in the failure list but was never
+    // requested; the https well-known candidates were.
+    expect(calls).not.toContain('http://evil.example.net/prm');
+    expect(calls.some((u) => u.startsWith('https://mcp.example.com/.well-known/oauth-protected-resource'))).toBe(true);
   });
 });
 

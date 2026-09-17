@@ -160,17 +160,18 @@ new value on the next request.
   must be `https` (RFC 8414 §2), whether it was discovered or supplied by `--issuer` /
   `--device-endpoint`. The issuer is the load-bearing one: metadata fetched over cleartext can be
   substituted wholesale, and every `https` endpoint inside a forged document would pass a per-endpoint
-  check. There is one narrow exemption, and only for the two URLs that describe the _resource_: an
-  MCP server (and the `resource_metadata` URL it advertises) on `127.0.0.1`, `localhost` or `::1` may
-  be `http`, because that traffic never leaves this host. The authorization server gets no such
-  exemption, and the redirect is not fetched by this host at all — your browser resolves it.
+  check. There is no exemption, loopback included; the redirect is not fetched by this host at all —
+  your browser resolves it. A cleartext `--url` is refused before anything is probed, and a cleartext
+  `resource_metadata` URL from a challenge is skipped as a candidate, so the https well-known paths
+  still get their turn.
 - **An authorization server that does not own its own metadata.** RFC 8414 §3.3: the `issuer` in the
   metadata document must be identical — trailing slash aside — to the issuer URL the document was
   fetched for, and the field must be present. Without it, whoever controls `authorization_servers[0]`
   can hand back a document speaking for someone else, and that value is what the client-reuse check
   keys on.
 - **A protected-resource document describing something else.** RFC 9728 §3.3: its `resource` must
-  cover `--url`, matched by origin plus path prefix. Prefix rather than equality because the live
+  cover `--url`, matched by origin plus path prefix. Checked per candidate, like the two above, so a
+  generic document on a shared origin is skipped rather than ending the probe. Prefix rather than equality because the live
   servers differ — Dropbox and Littlebird name `…/mcp` exactly, Amplitude names its origin while
   serving MCP under `/mcp`.
 - **A second integration for the same group and URL.** Refused _before_ dynamic client registration:
