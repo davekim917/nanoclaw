@@ -82,6 +82,8 @@ const calls = vi.hoisted(() => ({
   hostScripts: [] as unknown[][],
   admissions: [] as unknown[][],
   recurrences: [] as unknown[][],
+  overdueChecks: [] as unknown[][],
+  overdueCheckFails: false,
   running: false,
   /** Runs inside `hasUnresolvedMoveIntent`, after its read and before it resolves — the S19 race window. */
   intentHook: null as null | (() => void),
@@ -244,6 +246,15 @@ vi.mock('../scheduling/recurrence.js', async (importOriginal) => {
     },
   };
 });
+
+/** The observer S18 runs after the fan-out; its behaviour is overdue.test.ts's. */
+vi.mock('../scheduling/overdue.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../scheduling/overdue.js')>()),
+  escalateOverdueOccurrences: async (...args: unknown[]) => {
+    calls.overdueChecks.push(args);
+    if (calls.overdueCheckFails) throw new Error('overdue check blew up');
+  },
+}));
 
 vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../orchestrator-dispatch/db/tasks.js')>();
@@ -440,6 +451,8 @@ beforeEach(async () => {
   calls.hostScripts = [];
   calls.admissions = [];
   calls.recurrences = [];
+  calls.overdueChecks = [];
+  calls.overdueCheckFails = false;
   calls.running = false;
   calls.admittedTasks = 0;
   calls.admitImpl = null;
@@ -552,6 +565,28 @@ describe('S2-PR11 scheduling + thread-close', () => {
     const bareCtx = makeCtx({ session, mailbox: sessionFor(bare) });
     await duty(SWEEP_DUTY_INVENTORY.S19).run(bareCtx);
     expect(calls.updates).toEqual([{ id: 'sess-task', patch: { status: 'closed' } }]);
+  });
+
+  it('S18 runs the overdue-occurrence observer with the window session, and survives its throw', async () => {
+    const db = freshInbound();
+    insertTaskRow(db, {
+      id: 'task-1',
+      seriesId: 'task-1',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily digest' }),
+    });
+    db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-1'`).run();
+    const mailbox = sessionFor(db);
+    const session = fakeSession();
+
+    calls.overdueCheckFails = true;
+    await duty(SWEEP_DUTY_INVENTORY.S18).run(makeCtx({ session, mailbox, alive: true }));
+
+    expect(calls.overdueChecks).toEqual([[mailbox, session, true]]);
+    // The fan-out still happened: the observer's throw cost the duty nothing.
+    expect(calls.recurrences).toHaveLength(1);
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM messages_in WHERE status = 'pending'`).get()).toEqual({ n: 1 });
   });
 
   // ─── F-11.3 ────────────────────────────────────────────────────────────────
