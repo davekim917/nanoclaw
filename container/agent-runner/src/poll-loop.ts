@@ -411,7 +411,10 @@ async function checkpointTurnEnd(autosaveWorktrees: (reason: string) => Promise<
  */
 export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   const runnerId = randomUUID();
-  const processQueryFallbackOptions = { ignoreTaskFlagIntents: config.providerFallbackActive === true };
+  const processQueryFallbackOptions = {
+    ignoreTaskFlagIntents: config.providerFallbackActive === true,
+    providerFallbackActive: config.providerFallbackActive === true,
+  };
   const autosaveWorktrees = config.autosaveWorktrees ?? autoCommitDirtyWorktrees;
   const idleSuppressedContinuationIds = new Set<string>();
   const suppressContinuationUntilRealInbound = (id: string): void => {
@@ -1715,7 +1718,9 @@ export async function processQuery(
   // never ended, so this call can outlive its container: the host reaps it
   // first, and an outcome held for the return is never written.
   onTaskOutcome?: (key: string, outcome: FireOutcome) => Promise<void>,
-  options: { ignoreTaskFlagIntents?: boolean } = {},
+  // `providerFallbackActive` selects the wording of the ignored-pin note on the
+  // follow-up path (`noteIgnoredModel`); the opening batch reads it off config.
+  options: { ignoreTaskFlagIntents?: boolean; providerFallbackActive?: boolean } = {},
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -2034,6 +2039,18 @@ export async function processQuery(
         const fb = applyFlagBatch(keep, extractRouting(keep), providerName, {
           ignoreTaskFlagIntents: options.ignoreTaskFlagIntents,
         });
+        // Same note as the opening batch: a `-m`/`-m1` for the other provider
+        // arriving mid-stream resolves to undefined — often equal to the live
+        // default, so nothing below restarts anything and the host's ⚙️ ack is
+        // the last word the user saw. Say it is being ignored here too.
+        if (fb.ignoredModel !== undefined) {
+          await noteIgnoredModel(
+            fb.ignoredModel,
+            providerName,
+            options.providerFallbackActive === true,
+            extractRouting(keep),
+          );
+        }
         const liveSettingsChanged =
           fb.model !== liveSettings.model ||
           fb.effort !== liveSettings.effort ||
