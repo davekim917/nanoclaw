@@ -485,6 +485,15 @@ export const OPENCODE_XDG_CONTAINER_PATH = '/opencode-xdg';
  * (`container/hex-wrapper.sh`), `gh` authenticates from `GH_TOKEN` via the
  * entrypoint shim rather than a config file (`container/entrypoint.sh`), and
  * git reads `$HOME/.gitconfig` or `GIT_CONFIG_GLOBAL` (same file).
+ *
+ * `XDG_CONFIG_HOME` here is in fact DEAD for the runner and every child it
+ * spawns: `container/entrypoint.sh:37` exports `XDG_CONFIG_HOME=/tmp/.chromium`
+ * (a crashpad workaround) after Docker applies this env, so only
+ * `XDG_DATA_HOME` survives. That is the one credential discovery needs —
+ * `auth.json` lives under `$XDG_DATA_HOME/opencode/`. Both vars are still
+ * declared: a `docker exec` shell skips the entrypoint and sees this pair, and
+ * an agent-authored `opencode` config would be looked for under
+ * `$XDG_CONFIG_HOME/opencode/`.
  */
 export const OPENCODE_XDG_ENV: Readonly<Record<string, string>> = Object.freeze({
   XDG_DATA_HOME: OPENCODE_XDG_CONTAINER_PATH,

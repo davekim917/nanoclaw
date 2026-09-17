@@ -11,12 +11,22 @@ or archived conversation must not cross between agents.
 
 Agent credentials are not an isolation boundary, and were never a reliable one.
 Every container carries all three provider credentials whatever its own
-provider: the Claude ring as env, the host Codex home
-(`~/.codex-<folder>` where a group has its own, otherwise `~/.codex`) plus any
-`codexAuthFallbacks` homes, and the OpenCode `auth.json`
-(`~/.local/share/opencode-<folder>/auth.json`, otherwise the shared one) staged
-into a session-private XDG tree. So any agent can drive `claude -p`,
-`codex exec` or `opencode` headless with the fleet's own accounts.
+provider, so any agent can drive `claude -p`, `codex exec` or `opencode`
+headless with the fleet's own accounts:
+
+- the **Claude** ring, as env;
+- the **Codex** `auth.json` from `~/.codex-<folder>` where a group has its own
+  home, otherwise `~/.codex`, plus any `codexAuthFallbacks` homes;
+- the **OpenCode** `auth.json` from `~/.local/share/opencode-<folder>`,
+  otherwise the shared `~/.local/share/opencode`.
+
+What crosses is the CREDENTIAL, not the host home. Every Codex home is staged
+per session: the container's `/home/node/.codex` (and each
+`/home/node/.codex-fallback-N`) is a session-owned directory with a generated
+`config.toml`, into which the host home's `auth.json` is bind-mounted as a
+single file so token refresh still writes back. The operator's `config.toml`,
+`hooks.json`, `hooks/`, `AGENTS.md` and transcripts never reach a container.
+OpenCode is staged the same way, into a session-private XDG tree.
 
 What *is* bounded is credential SCOPE, not presence — which account a group
 reaches, via the per-group ring and per-group home above — plus the one
@@ -24,6 +34,13 @@ withholding lever, `excludePlugins: ["codex"]`, which withholds the Codex
 plugin and the credential that rides on it together. A per-group opt-in flag
 for Codex host auth (`codexHostAuth`) used to sit in front of the mount; it is
 gone, because presence was the wrong thing to gate.
+
+Scope is *available*, not enforced by default. A per-group home exists only
+where an operator created one, and on this install almost none do: as of
+2026-09-17 no group has a `~/.codex-<folder>`, so all 27 share the one fleet
+Codex account, and only two have their own `~/.local/share/opencode-<folder>`.
+Read "bounded by scope" as a lever to pull per group, not a control that
+already holds.
 
 ## The Three Levels
 

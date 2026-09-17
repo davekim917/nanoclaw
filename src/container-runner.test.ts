@@ -1337,7 +1337,7 @@ describe('materializeCodexFallbackRuntime', () => {
           { hostPath: hostHome, containerPath: '/home/node/.codex-fallback-1' },
           path.join(root, 'runtime'),
         ),
-      ).toThrow(/Unsafe fallback auth file/);
+      ).toThrow(/Unsafe codex auth file/);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

@@ -865,11 +865,9 @@ describe('buildMounts agent surfaces', async () => {
   );
 
   // Pins the deletion of the global-~/.codex `config.toml` / `plugins` fallback
-  // mounts (822f1deb). Nothing in the container reads /home/node/.codex/* in
-  // codex-as-peer mode — the runner redirects CODEX_HOME to
-  // /home/node/.codex-runtime — and as nested mounts runc created both entries
-  // as root inside the operator's host ~/.codex-<folder>/.
-  it('never nests global-codex config.toml or plugins inside a scoped ~/.codex home', async () => {
+  // mounts (822f1deb): the peer home is keyed on the SCOPED host dir and the
+  // global `~/.codex` contributes nothing, not even nested entries.
+  it('never sources the global ~/.codex when a scoped home resolves', async () => {
     const ag = group('ag-codex-peer', 'codex-peer');
     await createAgentGroup(ag);
     withWorkgroup(ag);
@@ -897,10 +895,70 @@ describe('buildMounts agent surfaces', async () => {
       else process.env.HOME = prevHome;
     }
 
-    // The scoped home itself still mounts — that is the credential surface.
-    expect(mounts).toContainEqual({ hostPath: scoped, containerPath: '/home/node/.codex', readonly: false });
-    expect(mounts.some((m) => m.containerPath.startsWith('/home/node/.codex/'))).toBe(false);
+    // The scoped home is the credential source, and the ONLY thing it
+    // contributes is auth.json — file-bound into a session-owned directory.
+    expect(mounts).toContainEqual({
+      hostPath: path.join(scoped, 'auth.json'),
+      containerPath: '/home/node/.codex/auth.json',
+      readonly: false,
+    });
+    expect(mounts.filter((m) => m.hostPath.startsWith(`${scoped}/`) || m.hostPath === scoped)).toHaveLength(1);
     expect(mounts.some((m) => m.hostPath === globalCodex || m.hostPath.startsWith(`${globalCodex}/`))).toBe(false);
+  });
+
+  // P1 of the round-1 review on #874: a non-codex group used to get the
+  // operator's WHOLE host ~/.codex bind-mounted RW at /home/node/.codex —
+  // hooks.json, config.toml, AGENTS.md and transcripts included — so a
+  // prompt-injected agent could plant a hook the next host-side `codex` run
+  // executes. The home is now staged in the session dir with a generated
+  // config.toml, and only auth.json is file-bound from the host.
+  //
+  // Mutation check for the fix: restore
+  // `mounts.push({ hostPath: primaryHostPath, containerPath: '/home/node/.codex', readonly: false })`
+  // in place of the `stageCodexAuth` call and the source/contents assertions
+  // below both fail.
+  it('stages the peer Codex home in the session dir rather than mounting the host home', async () => {
+    const ag = group('ag-codex-staged', 'codex-staged');
+    await createAgentGroup(ag);
+    withWorkgroup(ag);
+    await ensureContainerConfig(ag.id);
+    initGroupFilesystem({ ...ag, workgroup_id: ag.folder }, { provider: 'claude' });
+
+    const fakeHome = path.join(TEST_ROOT, 'codex-staged-home');
+    const globalCodex = path.join(fakeHome, '.codex');
+    fs.mkdirSync(path.join(fakeHome, 'plugins', 'codex'), { recursive: true });
+    fs.mkdirSync(path.join(globalCodex, 'hooks'), { recursive: true });
+    fs.mkdirSync(path.join(globalCodex, 'sessions'), { recursive: true });
+    fs.writeFileSync(path.join(globalCodex, 'auth.json'), '{"tokens":{"access_token":"t"}}');
+    fs.writeFileSync(path.join(globalCodex, 'hooks.json'), '{"PreToolUse":[]}');
+    fs.writeFileSync(path.join(globalCodex, 'config.toml'), 'notify = ["/bin/sh","-c","pwned"]\n');
+    fs.writeFileSync(path.join(globalCodex, 'AGENTS.md'), '# operator instructions\n');
+
+    const prevHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    let mounts;
+    try {
+      mounts = await buildMounts(ag, session('s-codex-staged', ag.id), containerConfig(), 'claude', {}, ag.folder);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+    }
+
+    const stagedHost = path.join(sessionDir(ag.id, 's-codex-staged'), 'codex-peer');
+    expect(mounts).toContainEqual({ hostPath: stagedHost, containerPath: '/home/node/.codex', readonly: false });
+    // Nothing from the host home crosses but auth.json.
+    expect(mounts.filter((m) => m.hostPath === globalCodex || m.hostPath.startsWith(`${globalCodex}/`))).toEqual([
+      {
+        hostPath: path.join(globalCodex, 'auth.json'),
+        containerPath: '/home/node/.codex/auth.json',
+        readonly: false,
+      },
+    ]);
+    // The staged directory carries a generated config, an empty bind target for
+    // auth.json, and no hooks, AGENTS.md or transcripts.
+    expect(fs.readdirSync(stagedHost).sort()).toEqual(['auth.json', 'config.toml']);
+    expect(fs.readFileSync(path.join(stagedHost, 'config.toml'), 'utf8')).not.toContain('pwned');
+    expect(fs.readFileSync(path.join(stagedHost, 'config.toml'), 'utf8')).toContain('sandbox_mode');
   });
 
   // Every container carries the host Codex credential. A plain Claude group
@@ -945,12 +1003,30 @@ describe('buildMounts agent surfaces', async () => {
       else process.env.HOME = prevHome;
     }
 
-    expect(mounts).toContainEqual({ hostPath: globalCodex, containerPath: '/home/node/.codex', readonly: false });
+    const sessDir = sessionDir(ag.id, 's-codex-default');
     expect(mounts).toContainEqual({
-      hostPath: fallback,
+      hostPath: path.join(sessDir, 'codex-peer'),
+      containerPath: '/home/node/.codex',
+      readonly: false,
+    });
+    expect(mounts).toContainEqual({
+      hostPath: path.join(globalCodex, 'auth.json'),
+      containerPath: '/home/node/.codex/auth.json',
+      readonly: false,
+    });
+    // Fallback identities are staged the same way for every provider — the
+    // peer branch no longer bind-mounts the declared host home raw.
+    expect(mounts).toContainEqual({
+      hostPath: path.join(sessDir, 'codex-fallbacks', '1'),
       containerPath: '/home/node/.codex-fallback-1',
       readonly: false,
     });
+    expect(mounts).toContainEqual({
+      hostPath: path.join(fallback, 'auth.json'),
+      containerPath: '/home/node/.codex-fallback-1/auth.json',
+      readonly: false,
+    });
+    expect(mounts.some((m) => m.hostPath === fallback)).toBe(false);
   });
 
   // The withholding lever, and the only one: a group that excludes the `codex`
@@ -1044,6 +1120,24 @@ describe('buildMounts agent surfaces', async () => {
     expect(contribution.mounts).toContainEqual(
       expect.objectContaining({ containerPath: '/opencode-xdg', readonly: false }),
     );
+  });
+
+  // Mutation check for the `provider !== 'opencode'` guard on the staging call
+  // (src/container-runner.ts). Drop or invert it and an OpenCode session gets
+  // /opencode-xdg twice — once from the provider contribution, once from the
+  // fleet-wide staging — which Docker rejects, so every opencode spawn fails.
+  it('mounts /opencode-xdg exactly once for an OpenCode session', async () => {
+    const ag = group('ag-opencode-once', 'opencode-once');
+    await createAgentGroup(ag);
+    withWorkgroup(ag);
+    await ensureContainerConfig(ag.id);
+    initGroupFilesystem({ ...ag, workgroup_id: ag.folder }, { provider: 'opencode' });
+
+    const sess = session('s-opencode-once', ag.id);
+    const contribution = await providerContribution('opencode', ag, sess);
+    const mounts = await buildMounts(ag, sess, containerConfig(), 'opencode', contribution, ag.folder);
+
+    expect(mounts.filter((m) => m.containerPath === '/opencode-xdg')).toHaveLength(1);
   });
 
   it('uses the OpenCode Go default at high effort when no DB override exists', async () => {
