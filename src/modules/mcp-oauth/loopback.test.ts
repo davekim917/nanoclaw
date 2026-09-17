@@ -208,3 +208,29 @@ describe('device grant', () => {
     expect((err as OAuthTokenError).code).toBe('expired_token');
   });
 });
+
+// Issue #876 P3(a): `error` and `error_description` are copied out of the
+// redirect query and straight into the page. Unescaped, whatever put them
+// there gets script execution on an origin that can talk to this port.
+describe('the refusal page escapes what the redirect put in it', () => {
+  it('renders an injected tag as text, not as markup', async () => {
+    const listener = await startLoopbackListener(0, 5_000);
+    const payload = encodeURIComponent('<img src=x onerror="alert(1)">');
+    const page = await get(listener.port, `/callback?error=access_denied&error_description=${payload}`);
+
+    expect(page.status).toBe(400);
+    // No tag is opened, which is the whole of it — the attribute text that
+    // follows is inert once `<` cannot start an element.
+    expect(page.body).not.toContain('<img');
+    expect(page.body).toContain('&lt;img src=x onerror=&quot;alert(1)&quot;&gt;');
+    // The operator still gets the message itself.
+    expect(page.body).toContain('access_denied');
+  });
+
+  it('escapes an injected closing tag in `error` too', async () => {
+    const listener = await startLoopbackListener(0, 5_000);
+    const page = await get(listener.port, `/callback?error=${encodeURIComponent('</p><script>x</script>')}`);
+    expect(page.body).not.toContain('<script>');
+    expect(page.body).toContain('&lt;/p&gt;&lt;script&gt;');
+  });
+});

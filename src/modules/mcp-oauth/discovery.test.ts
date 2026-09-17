@@ -9,6 +9,8 @@ import { describe, expect, it } from 'vitest';
 
 import { enforceHermeticity } from '../../test-hermeticity.js';
 import {
+  assertIssuerMatches,
+  assertResourceMatchesMcpUrl,
   authorizationServerMetadataUrls,
   discoverAuthorization,
   parseWwwAuthenticate,
@@ -264,6 +266,174 @@ describe('discoverAuthorization', () => {
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #876 — the three bindings a discovery chain has to enforce
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The three integrations live on this host, captured VERBATIM from their
+ * well-known documents on 2026-09-17 with read-only GETs:
+ *
+ *   curl -s https://mcp.dropbox.com/.well-known/oauth-protected-resource/mcp
+ *   curl -s https://www.dropbox.com/.well-known/oauth-authorization-server
+ *   curl -s https://mcp.amplitude.com/.well-known/oauth-protected-resource
+ *   curl -s https://mcp.amplitude.com/.well-known/oauth-authorization-server
+ *   curl -s https://mcp.littlebird.ai/.well-known/oauth-protected-resource/mcp
+ *   curl -s https://mcp.littlebird.ai/.well-known/oauth-authorization-server
+ *
+ * They are the regression oracle for every check below: each one is a real
+ * refresh/re-login that must keep working, and between them they cover all
+ * three shapes the new rules have to tolerate — an equal resource (Dropbox,
+ * Littlebird), a resource that is only a PREFIX of the MCP URL (Amplitude), and
+ * an issuer published WITH a trailing slash (Littlebird).
+ */
+const LIVE_SHAPES = {
+  dropbox: {
+    mcpUrl: 'https://mcp.dropbox.com/mcp',
+    resourceDocUrl: 'https://mcp.dropbox.com/.well-known/oauth-protected-resource/mcp',
+    resourceDoc: {
+      resource: 'https://mcp.dropbox.com/mcp',
+      authorization_servers: ['https://www.dropbox.com'],
+      scopes_supported: ['account_info.read', 'files.metadata.read'],
+    },
+    asDocUrl: 'https://www.dropbox.com/.well-known/oauth-authorization-server',
+    asDoc: {
+      issuer: 'https://www.dropbox.com',
+      authorization_endpoint: 'https://www.dropbox.com/oauth2/authorize',
+      token_endpoint: 'https://api.dropboxapi.com/oauth2/token',
+      registration_endpoint: 'https://www.dropbox.com/oauth2/register',
+      code_challenge_methods_supported: ['plain', 'S256'],
+    },
+    expectedIssuer: 'https://www.dropbox.com',
+  },
+  amplitude: {
+    mcpUrl: 'https://mcp.amplitude.com/mcp',
+    resourceDocUrl: 'https://mcp.amplitude.com/.well-known/oauth-protected-resource',
+    resourceDoc: {
+      // NOT equal to the MCP URL — the origin, with MCP served under /mcp.
+      resource: 'https://mcp.amplitude.com',
+      authorization_servers: ['https://mcp.amplitude.com'],
+      scopes_supported: ['mcp:read', 'mcp:write'],
+    },
+    asDocUrl: 'https://mcp.amplitude.com/.well-known/oauth-authorization-server',
+    asDoc: {
+      issuer: 'https://mcp.amplitude.com',
+      authorization_endpoint: 'https://mcp.amplitude.com/authorize',
+      token_endpoint: 'https://mcp.amplitude.com/token',
+      registration_endpoint: 'https://mcp.amplitude.com/register',
+      code_challenge_methods_supported: ['S256'],
+    },
+    expectedIssuer: 'https://mcp.amplitude.com',
+  },
+  littlebird: {
+    mcpUrl: 'https://mcp.littlebird.ai/mcp',
+    resourceDocUrl: 'https://mcp.littlebird.ai/.well-known/oauth-protected-resource/mcp',
+    resourceDoc: {
+      resource: 'https://mcp.littlebird.ai/mcp',
+      // WITH a trailing slash, which is what makes the issuer comparison need
+      // normalizing at all.
+      authorization_servers: ['https://mcp.littlebird.ai/'],
+      scopes_supported: ['littlebird:mcp', 'openid', 'email'],
+      bearer_methods_supported: ['header'],
+    },
+    asDocUrl: 'https://mcp.littlebird.ai/.well-known/oauth-authorization-server',
+    asDoc: {
+      issuer: 'https://mcp.littlebird.ai/',
+      authorization_endpoint: 'https://mcp.littlebird.ai/authorize',
+      token_endpoint: 'https://mcp.littlebird.ai/token',
+      registration_endpoint: 'https://mcp.littlebird.ai/register',
+      code_challenge_methods_supported: ['S256'],
+    },
+    expectedIssuer: 'https://mcp.littlebird.ai/',
+  },
+} as const;
+
+type LiveShape = (typeof LIVE_SHAPES)[keyof typeof LIVE_SHAPES];
+
+function liveRoutes(
+  shape: LiveShape,
+  overrides: { resourceDoc?: Record<string, unknown>; asDoc?: Record<string, unknown> } = {},
+): Record<string, Response> {
+  return {
+    [shape.mcpUrl]: json({}, 401, {
+      'www-authenticate': `Bearer resource_metadata="${shape.resourceDocUrl}", error="invalid_token"`,
+    }),
+    [shape.resourceDocUrl]: json(overrides.resourceDoc ?? shape.resourceDoc),
+    [shape.asDocUrl]: json(overrides.asDoc ?? shape.asDoc),
+  };
+}
+
+describe('the three live integrations still pass discovery', () => {
+  it.each(Object.entries(LIVE_SHAPES))('%s', async (_name, shape) => {
+    const result = await discoverAuthorization(routed(liveRoutes(shape)), shape.mcpUrl);
+    expect(result.issuer).toBe(shape.expectedIssuer);
+    expect(result.tokenEndpoint).toBe(shape.asDoc.token_endpoint);
+    expect(result.resource).toBe(shape.resourceDoc.resource);
+  });
+});
+
+describe('RFC 8414 §3.3 — the AS metadata issuer must be the issuer it was fetched for', () => {
+  it('refuses a document that claims a different issuer', async () => {
+    const fetchImpl = routed(
+      liveRoutes(LIVE_SHAPES.dropbox, {
+        asDoc: { ...LIVE_SHAPES.dropbox.asDoc, issuer: 'https://evil.test' },
+      }),
+    );
+    await expect(discoverAuthorization(fetchImpl, LIVE_SHAPES.dropbox.mcpUrl)).rejects.toThrow(
+      /declares issuer "https:\/\/evil\.test"[\s\S]*fetched for[\s\S]*www\.dropbox\.com/,
+    );
+  });
+
+  it('refuses a document that declares no issuer at all', async () => {
+    const asDoc: Record<string, unknown> = { ...LIVE_SHAPES.dropbox.asDoc };
+    delete asDoc.issuer;
+    const fetchImpl = routed(liveRoutes(LIVE_SHAPES.dropbox, { asDoc }));
+    await expect(discoverAuthorization(fetchImpl, LIVE_SHAPES.dropbox.mcpUrl)).rejects.toThrow(/declares no issuer/);
+  });
+
+  it('normalizes the trailing slash and NOTHING else', () => {
+    // Littlebird's own shape, both ways round.
+    expect(() => assertIssuerMatches('https://mcp.littlebird.ai/', 'https://mcp.littlebird.ai', 'doc')).not.toThrow();
+    expect(() => assertIssuerMatches('https://mcp.littlebird.ai', 'https://mcp.littlebird.ai/', 'doc')).not.toThrow();
+    // A different path, host or port is a different issuer.
+    expect(() => assertIssuerMatches('https://mcp.littlebird.ai/t2', 'https://mcp.littlebird.ai', 'doc')).toThrow();
+    expect(() => assertIssuerMatches('https://other.littlebird.ai', 'https://mcp.littlebird.ai', 'doc')).toThrow();
+    expect(() => assertIssuerMatches('https://mcp.littlebird.ai:8443', 'https://mcp.littlebird.ai', 'doc')).toThrow();
+  });
+});
+
+describe('RFC 9728 §3.3 — the protected-resource document must describe this MCP URL', () => {
+  it.each(Object.values(LIVE_SHAPES))('accepts the live shape for $mcpUrl', (shape) => {
+    expect(() => assertResourceMatchesMcpUrl(shape.resourceDoc.resource, shape.mcpUrl)).not.toThrow();
+  });
+
+  it('refuses a document describing another origin', () => {
+    expect(() => assertResourceMatchesMcpUrl('https://evil.test/mcp', 'https://mcp.dropbox.com/mcp')).toThrow(
+      /RFC 9728 §3.3/,
+    );
+  });
+
+  it('refuses a sibling path, and a prefix that is not on a segment boundary', () => {
+    expect(() => assertResourceMatchesMcpUrl('https://mcp.x.test/other', 'https://mcp.x.test/mcp')).toThrow();
+    // "/mcp" must not be satisfied by "/mcp-admin".
+    expect(() => assertResourceMatchesMcpUrl('https://mcp.x.test/mcp', 'https://mcp.x.test/mcp-admin')).toThrow();
+    expect(() => assertResourceMatchesMcpUrl('https://mcp.x.test/mcp', 'https://mcp.x.test/mcp/v2')).not.toThrow();
+  });
+
+  it('fails the whole discovery when no candidate document describes this resource', async () => {
+    const fetchImpl = routed(
+      liveRoutes(LIVE_SHAPES.amplitude, {
+        resourceDoc: { ...LIVE_SHAPES.amplitude.resourceDoc, resource: 'https://someone-else.test' },
+      }),
+    );
+    await expect(discoverAuthorization(fetchImpl, LIVE_SHAPES.amplitude.mcpUrl)).rejects.toThrow(/RFC 9728 §3.3/);
+  });
+
+  it('tolerates a document with no resource at all — absence cannot forge a match', () => {
+    expect(() => assertResourceMatchesMcpUrl(undefined, 'https://mcp.x.test/mcp')).not.toThrow();
+  });
+});
+
 describe('cleartext is refused before anything is fetched (#876 P2-3)', () => {
   it('refuses an http:// MCP URL without probing it', async () => {
     const calls: string[] = [];
@@ -291,5 +461,67 @@ describe('cleartext is refused before anything is fetched (#876 P2-3)', () => {
     // requested; the https well-known candidates were.
     expect(calls).not.toContain('http://evil.example.net/prm');
     expect(calls.some((u) => u.startsWith('https://mcp.example.com/.well-known/oauth-protected-resource'))).toBe(true);
+  });
+});
+
+// #905 review round 2: the probe list includes the ROOT well-known path as a
+// fallback for a path-carrying issuer, and on a multi-tenant host that document
+// is complete and belongs to a different tenant. Checking the issuer after the
+// loop let that document end a discovery the tenant-specific candidate would
+// have completed.
+describe('a mismatched candidate is skipped, not fatal', () => {
+  const ISSUER = 'https://as.x.test/tenant-7';
+
+  it('keeps probing past a complete root document that belongs to another issuer', async () => {
+    const calls: string[] = [];
+    const fetchImpl = routed(
+      {
+        'https://mcp.x.test/mcp': json({}, 401),
+        'https://mcp.x.test/.well-known/oauth-protected-resource/mcp': json({
+          resource: 'https://mcp.x.test/mcp',
+          authorization_servers: [ISSUER],
+        }),
+        // Candidate 1 (…/oauth-authorization-server/tenant-7) 404s.
+        // Candidate 2: the host's root document — complete, and someone else's.
+        'https://as.x.test/.well-known/oauth-authorization-server': json({
+          issuer: 'https://as.x.test/tenant-1',
+          authorization_endpoint: 'https://as.x.test/tenant-1/authorize',
+          token_endpoint: 'https://as.x.test/tenant-1/token',
+        }),
+        // Candidate 3: the tenant's own document.
+        'https://as.x.test/.well-known/openid-configuration/tenant-7': json({
+          issuer: ISSUER,
+          authorization_endpoint: 'https://as.x.test/tenant-7/authorize',
+          token_endpoint: 'https://as.x.test/tenant-7/token',
+          code_challenge_methods_supported: ['S256'],
+        }),
+      },
+      calls,
+    );
+
+    const result = await discoverAuthorization(fetchImpl, 'https://mcp.x.test/mcp');
+    expect(result.issuer).toBe(ISSUER);
+    expect(result.tokenEndpoint).toBe('https://as.x.test/tenant-7/token');
+    // It really did read the other tenant's document and move on.
+    expect(calls).toContain('https://as.x.test/.well-known/oauth-authorization-server');
+  });
+
+  it('still fails, naming every mismatch, when NO candidate declares the right issuer', async () => {
+    const fetchImpl = routed({
+      'https://mcp.x.test/mcp': json({}, 401),
+      'https://mcp.x.test/.well-known/oauth-protected-resource/mcp': json({
+        resource: 'https://mcp.x.test/mcp',
+        authorization_servers: [ISSUER],
+      }),
+      'https://as.x.test/.well-known/oauth-authorization-server': json({
+        issuer: 'https://as.x.test/tenant-1',
+        authorization_endpoint: 'https://as.x.test/tenant-1/authorize',
+        token_endpoint: 'https://as.x.test/tenant-1/token',
+      }),
+    });
+
+    await expect(discoverAuthorization(fetchImpl, 'https://mcp.x.test/mcp')).rejects.toThrow(
+      /No authorization-server metadata for issuer[\s\S]*declares issuer "https:\/\/as\.x\.test\/tenant-1"/,
+    );
   });
 });

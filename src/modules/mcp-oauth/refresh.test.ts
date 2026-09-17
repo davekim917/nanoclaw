@@ -42,9 +42,13 @@ vi.mock('../../log.js', () => ({
 }));
 
 const secretWrites: { name: string; value: string }[] = [];
+/** Every call that REACHED the writer, successful or not — the backoff is only
+ *  observable as the number of attempts made during an outage. */
+const secretWriteAttempts = { count: 0 };
 let secretWriteFails = false;
 vi.mock('./onecli-secret-writer.js', () => ({
   putOnecliBearerSecret: async (spec: { name: string }, value: string) => {
+    secretWriteAttempts.count++;
     if (secretWriteFails) throw new Error('gateway unreachable');
     secretWrites.push({ name: spec.name, value });
     return { id: 'secret-uuid-1', name: spec.name };
@@ -66,6 +70,9 @@ import {
   decideRefresh,
   refreshExpiringMcpOAuthIntegrations,
   REFRESH_MARGIN_MS,
+  SECRET_WRITE_RETRY_BASE_MS,
+  SECRET_WRITE_RETRY_MAX_MS,
+  secretWriteRetryDelayMs,
   UNKNOWN_EXPIRY_REFRESH_INTERVAL_MS,
   _resetMcpOAuthWarnStateForTesting,
 } from './service.js';
@@ -114,6 +121,7 @@ function tokenResponse(body: unknown, status = 200): Response {
 beforeEach(async () => {
   await initMigratedTestDb();
   secretWrites.length = 0;
+  secretWriteAttempts.count = 0;
   secretWriteFails = false;
   logged.warn.length = 0;
   logged.info.length = 0;
@@ -390,5 +398,228 @@ describe('OAuthTokenError', () => {
   it('renders code and description together', () => {
     expect(new OAuthTokenError('invalid_grant', 400, 'expired').message).toBe('invalid_grant: expired');
     expect(new OAuthTokenError('invalid_grant', 400).message).toBe('invalid_grant');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #876 P3(b) and P3(c) — what two overlapping sweeps and a gateway outage
+// are allowed to cost at the PROVIDER.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('overlapping sweeps do not double-refresh (P3b)', () => {
+  async function seedDue(): Promise<void> {
+    const r = row({ expires_at: new Date(Date.now() + 60_000).toISOString() });
+    const { created_at: _c, updated_at: _u, ...insertable } = r;
+    await upsertMcpOAuthIntegration(insertable);
+    writeMcpOAuthBundle({
+      name: r.name,
+      clientId: 'client-1',
+      refreshToken: 'rt-old',
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  it('re-decides inside the lock, so the second pass finds the row no longer due', async () => {
+    await seedDue();
+    const grants: string[] = [];
+    const tokenEndpoint = async () => {
+      grants.push(`grant-${grants.length + 1}`);
+      return tokenResponse({
+        access_token: `at-${grants.length}`,
+        // Rotating, which is what makes the second grant destructive: it
+        // invalidates the token the first one just stored.
+        refresh_token: `rt-${grants.length}`,
+        expires_in: 3600,
+        token_type: 'Bearer',
+      });
+    };
+
+    const [first, second] = await Promise.all([
+      refreshExpiringMcpOAuthIntegrations(tokenEndpoint),
+      refreshExpiringMcpOAuthIntegrations(tokenEndpoint),
+    ]);
+
+    expect(grants).toEqual(['grant-1']);
+    expect([...first.refreshed, ...second.refreshed]).toEqual(['dropbox-files']);
+    expect(readMcpOAuthBundle('dropbox-files')!.refreshToken).toBe('rt-1');
+    // The pass that skipped did not count the row as due either.
+    expect(first.checked + second.checked).toBe(1);
+  });
+});
+
+describe('a OneCLI outage costs one grant, not one per minute (P3c)', () => {
+  async function seedDue(): Promise<void> {
+    const r = row({ expires_at: new Date(Date.now() + 60_000).toISOString() });
+    const { created_at: _c, updated_at: _u, ...insertable } = r;
+    await upsertMcpOAuthIntegration(insertable);
+    writeMcpOAuthBundle({
+      name: r.name,
+      clientId: 'client-1',
+      refreshToken: 'rt-old',
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  it('parks the minted token and retries the WRITE on a backoff, never the grant', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    try {
+      await seedDue();
+      secretWriteFails = true;
+
+      const grants: string[] = [];
+      const tokenEndpoint = async () => {
+        grants.push(`grant-${grants.length + 1}`);
+        return tokenResponse({
+          access_token: 'at-minted',
+          refresh_token: `rt-rotated-${grants.length}`,
+          expires_in: 3600,
+          token_type: 'Bearer',
+        });
+      };
+
+      const first = await refreshExpiringMcpOAuthIntegrations(tokenEndpoint);
+      expect(first.failed).toEqual(['dropbox-files']);
+      expect(grants).toEqual(['grant-1']);
+      const afterFirst = await getMcpOAuthIntegration('dropbox-files');
+      expect(afterFirst!.status).toBe('error');
+      expect(afterFirst!.status_detail).toContain('retrying the write');
+
+      // The row is `error`, so it is due on EVERY tick. Without the backoff
+      // this is where the provider gets hit once a minute for the length of
+      // the outage — and each grant rotates the refresh token.
+      for (let i = 0; i < 5; i++) await refreshExpiringMcpOAuthIntegrations(tokenEndpoint);
+      expect(grants).toEqual(['grant-1']);
+      expect(secretWrites).toEqual([]);
+      // …and the gateway is not hammered either: one attempt, then silence
+      // until the backoff window opens.
+      expect(secretWriteAttempts.count).toBe(1);
+
+      // The gateway comes back. The parked token — not a new one — lands.
+      vi.setSystemTime(NOW + SECRET_WRITE_RETRY_BASE_MS + 1000);
+      secretWriteFails = false;
+      const recovered = await refreshExpiringMcpOAuthIntegrations(tokenEndpoint);
+
+      expect(grants).toEqual(['grant-1']);
+      expect(recovered.refreshed).toEqual(['dropbox-files']);
+      expect(secretWrites).toEqual([{ name: 'Dropbox-Files', value: 'at-minted' }]);
+      const after = await getMcpOAuthIntegration('dropbox-files');
+      expect(after!.status).toBe('active');
+      expect(after!.status_detail).toBeNull();
+      // The rotation from the one grant that did happen is still on disk.
+      expect(readMcpOAuthBundle('dropbox-files')!.refreshToken).toBe('rt-rotated-1');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('backs off exponentially and stops at the cap', () => {
+    expect(secretWriteRetryDelayMs(1)).toBe(SECRET_WRITE_RETRY_BASE_MS);
+    expect(secretWriteRetryDelayMs(2)).toBe(2 * SECRET_WRITE_RETRY_BASE_MS);
+    expect(secretWriteRetryDelayMs(4)).toBe(8 * SECRET_WRITE_RETRY_BASE_MS);
+    expect(secretWriteRetryDelayMs(99)).toBe(SECRET_WRITE_RETRY_MAX_MS);
+    expect(SECRET_WRITE_RETRY_MAX_MS).toBe(15 * 60 * 1000);
+  });
+
+  it('gives up on a parked token the outage outlived, and mints a fresh one', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    try {
+      await seedDue();
+      secretWriteFails = true;
+      const grants: string[] = [];
+      const tokenEndpoint = async () => {
+        grants.push(`grant-${grants.length + 1}`);
+        return tokenResponse({ access_token: `at-${grants.length}`, expires_in: 3600, token_type: 'Bearer' });
+      };
+
+      await refreshExpiringMcpOAuthIntegrations(tokenEndpoint);
+      expect(grants).toEqual(['grant-1']);
+
+      // Past the parked token's own usable life. Writing it now would put a
+      // dead bearer in the vault, so the refresher must go back to the
+      // token endpoint.
+      secretWriteFails = false;
+      vi.setSystemTime(NOW + 3600 * 1000);
+      await refreshExpiringMcpOAuthIntegrations(tokenEndpoint);
+
+      expect(grants).toEqual(['grant-1', 'grant-2']);
+      expect(secretWrites).toEqual([{ name: 'Dropbox-Files', value: 'at-2' }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// #905 review round 2: a parked token with no stated `expires_in` had no clock,
+// so it was held forever — an outage longer than its real lifetime ended with a
+// dead bearer in the vault and no fresh grant ever attempted.
+describe('a parked token with no stated expiry is still bounded', () => {
+  async function seedDue(): Promise<void> {
+    const r = row({ expires_at: new Date(Date.now() + 60_000).toISOString() });
+    const { created_at: _c, updated_at: _u, ...insertable } = r;
+    await upsertMcpOAuthIntegration(insertable);
+    writeMcpOAuthBundle({
+      name: r.name,
+      clientId: 'client-1',
+      refreshToken: 'rt-old',
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  /** A server that states no `expires_in` at all. */
+  function endpoint(grants: string[]) {
+    return async () => {
+      grants.push(`grant-${grants.length + 1}`);
+      return tokenResponse({ access_token: `at-${grants.length}`, token_type: 'Bearer' });
+    };
+  }
+
+  it('re-mints once the unknown-expiry interval has passed', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    try {
+      await seedDue();
+      secretWriteFails = true;
+      const grants: string[] = [];
+      await refreshExpiringMcpOAuthIntegrations(endpoint(grants));
+      expect(grants).toEqual(['grant-1']);
+
+      secretWriteFails = false;
+      vi.setSystemTime(NOW + UNKNOWN_EXPIRY_REFRESH_INTERVAL_MS);
+      await refreshExpiringMcpOAuthIntegrations(endpoint(grants));
+
+      expect(grants).toEqual(['grant-1', 'grant-2']);
+      expect(secretWrites).toEqual([{ name: 'Dropbox-Files', value: 'at-2' }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stamps last_refresh_at with the MINT time on recovery, not the recovery time', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    try {
+      await seedDue();
+      secretWriteFails = true;
+      const grants: string[] = [];
+      await refreshExpiringMcpOAuthIntegrations(endpoint(grants));
+
+      // Recover well inside the interval; the token is still the one minted
+      // at NOW, so the 12-hour clock must keep running from NOW.
+      secretWriteFails = false;
+      vi.setSystemTime(NOW + 6 * 60 * 60 * 1000);
+      await refreshExpiringMcpOAuthIntegrations(endpoint(grants));
+
+      expect(grants).toEqual(['grant-1']);
+      const after = await getMcpOAuthIntegration('dropbox-files');
+      expect(after!.status).toBe('active');
+      expect(after!.expires_at).toBeNull();
+      expect(Date.parse(after!.last_refresh_at!)).toBe(NOW);
+      // …and the row is therefore due again 12 hours after the mint, not 18.
+      expect(decideRefresh({ ...after! }, NOW + UNKNOWN_EXPIRY_REFRESH_INTERVAL_MS).refresh).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
