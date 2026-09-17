@@ -1875,13 +1875,18 @@ journeys_full() {  # <reason> <pinState> — the fail-closed selection: full, sa
       catalogueSha256:null, matchedJourneys:[], unmappedPaths:[], excludedPaths:[],
       unassessedNativeJourneys:[], pinned:false, pinFile:null, catalogueSnapshot:null, pinState:$state}'
 }
-journeys_pin_check() {  # <file> <pr> <head-sha> [--as-path <final>] — prints {state,reason,pin}
+# A checker that FAILS TO RUN (timeout, crash, an output that is not a verdict)
+# is UNAVAILABLE, never "invalid": invalid is a verdict on bytes and licenses a
+# recovery pin, and a recovery started over a pin that was merely unreadable
+# for one poll would hand the campaign a different owner. Unavailable means
+# not offered this cycle, retried next.
+journeys_pin_check() {  # <file> <pr> <head-sha> [--owner | --as-path <final>] — prints {state,reason,pin,...}
   local file="$1" pr="$2" head="$3" out
   shift 3
   out="$(timeout 20 python3 "$JOURNEYS_TOOL" pin-check "$file" --pr "$pr" --head "$head" \
            --repo-slug "$(journeys_repo_slug)" "$@" 2>/dev/null)" &&
-    jq -e '.state == "valid" or .state == "invalid" or .state == "absent"' <<<"$out" >/dev/null 2>&1 ||
-    out='{"state":"invalid","reason":"the pin could not be checked"}'
+    jq -e '.state == "valid" or .state == "invalid" or .state == "absent" or .state == "unavailable"' <<<"$out" >/dev/null 2>&1 ||
+    out='{"state":"unavailable","reason":"the pin checker did not return a verdict"}'
   printf '%s' "$out"
 }
 # Prints the selection (one JSON object), or `null` when the install has no
@@ -1892,26 +1897,29 @@ journeys_pin_check() {  # <file> <pr> <head-sha> [--as-path <final>] — prints 
 #   invalid / unavailable                  nothing usable — never offered
 journeys_select() {  # <pr> <head-sha> <determinable> <fail-reason> <paths-json> <size>
   local pr="$1" head_sha="$2" determinable="$3" fail_reason="$4" paths_json="${5:-[]}" size="$6"
-  local why out err primary recovery state="absent" snapshot_out="" candidate=""
+  local why out err primary state="absent" snapshot_out="" candidate=""
   local -a args
   if ! why="$(range_pin_store_readable)"; then
     [ -e "$JOURNEYS_CATALOGUE" ] || [ -L "$JOURNEYS_CATALOGUE" ] || { printf 'null'; return 0; }
     journeys_full "journey selection cannot be pinned on shared storage ($why)" unavailable
     return 0
   fi
-  primary="$(journeys_pin_check "$(journeys_pin_file "$pr" "$head_sha")" "$pr" "$head_sha")"
+  # ONE owning-pin rule (smoke-journeys.py resolve_owner): a valid recovery pin
+  # owns, else the valid primary, else nothing; any unreadable pin ⇒ unavailable.
+  primary="$(journeys_pin_check "$(journeys_pin_file "$pr" "$head_sha")" "$pr" "$head_sha" --owner)"
   case "$(jq -r '.state' <<<"$primary")" in
     valid) jq -c '.pin' <<<"$primary"; return 0 ;;
+    unavailable)
+      journeys_full "a journeys pin for this head could not be checked ($(jq -r '.reason // "no verdict"' <<<"$primary")); nothing is decided on a pin nobody could read" unavailable
+      return 0 ;;
     invalid)
-      recovery="$(journeys_pin_check "$(journeys_pin_file "$pr" "$head_sha" recovery)" "$pr" "$head_sha")"
-      case "$(jq -r '.state' <<<"$recovery")" in
-        valid) jq -c '.pin' <<<"$recovery"; return 0 ;;
-        invalid)
-          journeys_full "neither journeys pin for this head is valid: $(journeys_pin_file "$pr" "$head_sha") ($(jq -r '.reason' <<<"$primary")); $(journeys_pin_file "$pr" "$head_sha" recovery) ($(jq -r '.reason' <<<"$recovery"))" invalid
-          return 0 ;;
-      esac
-      state="recovery-absent"
-      why="the primary journeys pin $(journeys_pin_file "$pr" "$head_sha") is invalid ($(jq -r '.reason' <<<"$primary")) and cannot be recovered from: " ;;
+      if [ "$(jq -r '.primary.state' <<<"$primary")" = invalid ] && [ "$(jq -r '.recovery.state' <<<"$primary")" = absent ]; then
+        state="recovery-absent"
+        why="the primary journeys pin $(journeys_pin_file "$pr" "$head_sha") is invalid ($(jq -r '.primary.reason' <<<"$primary")) and cannot be recovered from: "
+      else
+        journeys_full "$(jq -r '.reason' <<<"$primary")" invalid
+        return 0
+      fi ;;
     *) why="" ;;
   esac
   if [ ! -e "$JOURNEYS_CATALOGUE" ] && [ ! -L "$JOURNEYS_CATALOGUE" ]; then

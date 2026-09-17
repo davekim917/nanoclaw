@@ -576,7 +576,12 @@ scope is unrecoverable, so the gate itself promotes a second immutable
 **recovery pin** (`pinState: recovered` — every catalogue journey owed, the
 pinned range's unclaimed paths kept) and sends that as `pinFile`; while neither
 pin is valid the head is not offered. Gate, `pin-run` and barrier judge a pin
-with one predicate (`smoke-journeys.py pin-check`). No catalogue: no `journeys` key. At intake:
+and resolve its owner with one predicate (`smoke-journeys.py pin-check`; a
+recovery pin, once it exists, owns; a pin nobody can read is "unavailable",
+never invalid). Pins and contracts are integrity-checked against accidental
+corruption and cross-campaign mix-ups, not against the coordinator rewriting
+its own files; the challenger's `cmp` of the run selection against the gate pin
+and its review of the dispositions is the independence. No catalogue: no `journeys` key. At intake:
 
 1. `smoke-journeys.py pin-run <run-dir> <journeys.pinFile>` copies the pin and
    snapshot into `<run-dir>/journeys/`; workers and siblings read that copy,

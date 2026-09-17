@@ -546,10 +546,32 @@ JOURNEY_LEASE_DIR="${SMOKE_GATE_LEASE_DIR:-${SMOKE_GATE_SHARED_ROOT:-/workspace/
 #         does. Unset, the pin is still unique when only one repo has pinned
 #         this (PR, head); more than one is refused, not guessed.
 # Zero candidates is today's no-pin behaviour.
+#
+# TRUST BOUNDARY. These checks catch accidental corruption and cross-campaign
+# mix-ups, not a coordinator rewriting files it authored or holds write access
+# to (its own contract, a pin in the lease dir it also writes leases into) —
+# that actor is the harness's existing boundary, the same one the fenced
+# contract, markers and range pins rest on; independence is the challenger's.
+# Two cheap identity facts ARE already here, so they are checked whenever a
+# journeys pin exists for this sha: the contract's runId must be the run
+# directory's own name (the scaffold writes `basename "$RUN_DIR"`,
+# smoke-run-scaffold.sh:479), and a contract calling itself develop-owned while the
+# shared lease binds that run id to a PR campaign is refused.
 JOURNEY_PIN_ARGS=()
+if compgen -G "$JOURNEY_LEASE_DIR/journeys-pin-*-pr-*-$SOURCE_SHA.json" >/dev/null 2>&1; then
+  JOURNEY_RUN_ID="$(jq -r '.runId // empty' "$CONTRACT")"
+  JOURNEY_RUN_NAME="$(basename "$(realpath -e "$RUN_DIR" 2>/dev/null || printf '%s' "$RUN_DIR")")"
+  if [ "$JOURNEY_RUN_ID" != "$JOURNEY_RUN_NAME" ]; then
+    INVALID+=("$RUN_DIR/completion-contract.json")
+    INVALID_REASONS+=("completion-contract.json: runId \"$JOURNEY_RUN_ID\" is not this run directory's name \"$JOURNEY_RUN_NAME\" — a contract naming another campaign's run would borrow its PR and pin; the scaffold writes the directory's own name")
+  elif [ "$(jq -r '.ownershipKind' "$CONTRACT")" != pr ] && [ -f "$JOURNEY_LEASE_DIR/lease-$JOURNEY_RUN_ID.json" ] &&
+       jq -e '(.pr | type == "number")' "$JOURNEY_LEASE_DIR/lease-$JOURNEY_RUN_ID.json" >/dev/null 2>&1; then
+    INVALID+=("$RUN_DIR/completion-contract.json")
+    INVALID_REASONS+=("completion-contract.json: declares ownershipKind $(jq -r '.ownershipKind' "$CONTRACT") but the shared lease lease-$JOURNEY_RUN_ID.json binds this run to PR #$(jq -r '.pr' "$JOURNEY_LEASE_DIR/lease-$JOURNEY_RUN_ID.json") — a PR campaign cannot opt out of its journeys pin by relabelling its contract")
+  fi
+fi
 if [ "$(jq -r '.ownershipKind' "$CONTRACT")" = pr ] &&
    compgen -G "$JOURNEY_LEASE_DIR/journeys-pin-*-pr-*-$SOURCE_SHA.json" >/dev/null 2>&1; then
-  JOURNEY_RUN_ID="$(jq -r '.runId // empty' "$CONTRACT")"
   JOURNEY_PR=""
   if printf '%s' "$JOURNEY_RUN_ID" | grep -Eq '^[A-Za-z0-9._-]{1,200}$'; then
     JOURNEY_PR="$(jq -r 'select(type == "object" and (.pr | type == "number")) | .pr' \

@@ -1529,6 +1529,54 @@ for T5K_KIND in truncated dangling directory shape-only; do
     { echo "5k: a second coordinator did not read the shared recovery pin" >&2; exit 1; }
   rm -rf "$T5K_OTHER"
 done
+# STABLE OWNER: a recovery pin, once promoted, owns the campaign even if the
+# primary reads as valid again — the gate, the wake and a recovery wake all
+# keep reporting it (here: the invalid primary is swapped for a valid one).
+journeys_fixture "$BACKEND_ONLY"
+mkdir -p "$SMOKE_GATE_LEASE_DIR"
+printf '{"pinned":tr' > "$(jpin_file 13 "$FREEZE_SHA")"
+T5K_SO="$(bash "$GATE" poll)"
+jq -e '.data.journeys.pinState == "recovered"' <<<"$T5K_SO" >/dev/null || { echo "5k: stable-owner setup" >&2; exit 1; }
+T5K_SO_RUN="$(jq -r '.data.runId' <<<"$T5K_SO")"
+T5K_VALID_PRIMARY="$STATE_DIR/valid-primary.json"
+jq -c --arg f "$(jpin_file 13 "$FREEZE_SHA")" '.recovery = false | .pinState = "valid" | .pinFile = $f | .reason = null |
+  .matchedJourneys = [.matchedJourneys[0]] | .matchedJourneys[0].reason = "changed"' "$(rpin_file 13 "$FREEZE_SHA")" > "$T5K_VALID_PRIMARY"
+cat "$T5K_VALID_PRIMARY" > "$(jpin_file 13 "$FREEZE_SHA")"
+[ "$(python3 "$SCRIPT_DIR/smoke-journeys.py" pin-check "$(jpin_file 13 "$FREEZE_SHA")" --pr 13 --head "$FREEZE_SHA" --repo-slug org__repo | jq -r .state)" = valid ] ||
+  { echo "5k: stable-owner fixture: the swapped primary is not valid on its own" >&2; exit 1; }
+range_case 5k-stable-owner-check '.journeys.pinState == "recovered" and (.journeys.pinFile | test("-recovery.json$"))'
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$T5K_SO_RUN.json"
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.recovery == true and
+  .data.journeys.pinState == "recovered"' >/dev/null || { echo "5k: the recovery wake flipped back to the primary" >&2; exit 1; }
+
+# CHECKER UNAVAILABLE IS NOT INVALID: a pin-check that fails to run (a timeout,
+# a crash) is no verdict — no recovery pin is promoted, the head is not offered
+# this cycle and says why, and once the checker runs the PRIMARY owns.
+journeys_fixture "$BACKEND_ONLY"
+bash "$GATE" poll | jq -e '.data.journeys.pinState == "valid"' >/dev/null || { echo "5k: unavailable setup" >&2; exit 1; }
+T5K_UA_RUN="$(jq -r '.activeRunId' "$STATE_DIR/pr-13-state.json")"
+cat > "$STUB_BIN/python3" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in *"smoke-journeys.py pin-check "*) [ -z "${STUB_PINCHECK_FAIL:-}" ] || exit 70 ;; esac
+exec /usr/bin/env -u STUB_PINCHECK_FAIL "$REAL_PYTHON3" "$@"
+STUB
+chmod +x "$STUB_BIN/python3"
+export STUB_PINCHECK_FAIL=1
+range_case 5k-checker-unavailable '.journeys.pinState == "unavailable" and .journeys.selection == "full" and
+  (.journeys.reason | test("could not be checked")) and .journeys.matchedJourneys == []'
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$T5K_UA_RUN.json"
+T5K_UA_ERR="$STATE_DIR/ua.err"
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll 2>"$T5K_UA_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
+  { echo "5k: a head whose pin checker was unavailable was offered" >&2; exit 1; }
+grep -q 'not offered: a journeys pin for this head could not be checked' "$T5K_UA_ERR" ||
+  { echo "5k: checker-unavailable was silent: $(cat "$T5K_UA_ERR")" >&2; exit 1; }
+[ ! -e "$(rpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: an unavailable checker promoted a recovery pin" >&2; exit 1; }
+unset STUB_PINCHECK_FAIL; rm -f "$STUB_BIN/python3"
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll | jq -e --arg f "$(jpin_file 13 "$FREEZE_SHA")" '.data.trigger == "pr_build_settled" and
+  .data.journeys.pinState == "valid" and .data.journeys.pinFile == $f' >/dev/null ||
+  { echo "5k: after the checker returned, the primary did not own" >&2; exit 1; }
+[ ! -e "$(rpin_file 13 "$FREEZE_SHA")" ]
+
 # BOTH pins invalid: nothing can say what the run owes, so the head is NOT
 # offered, and stderr names both files.
 journeys_fixture "$BACKEND_ONLY"
@@ -1597,9 +1645,12 @@ unset SMOKE_GATE_RUN_ROOT
 journeys_fixture "$BACKEND_ONLY"
 cat > "$STUB_BIN/python3" <<'STUB'
 #!/usr/bin/env bash
-case " $* " in *"smoke-journeys.py match "*)
-  if [ -n "${STUB_JOURNEYS_OUT:-}" ]; then cat >/dev/null; printf '%s' "$STUB_JOURNEYS_OUT"; exit 0; fi
-  [ -z "${STUB_JOURNEYS_FAIL:-}" ] || exit 70 ;;
+case " $* " in
+  *"smoke-journeys.py match "*)
+    if [ -n "${STUB_JOURNEYS_OUT:-}" ]; then cat >/dev/null; printf '%s' "$STUB_JOURNEYS_OUT"; exit 0; fi
+    [ -z "${STUB_JOURNEYS_FAIL:-}" ] || exit 70 ;;
+  *"smoke-journeys.py pin-check "*)
+    [ -z "${STUB_PINCHECK_FAIL:-}" ] || exit 70 ;;
 esac
 exec /usr/bin/env -u STUB_JOURNEYS_FAIL "$REAL_PYTHON3" "$@"
 STUB

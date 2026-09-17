@@ -13,7 +13,8 @@ wakes, WHICH journeys a change selects and which changed paths nothing claims.
             (changed paths: JSON array on stdin, never argv)
   floor-due <catalogue> <run-root> [--size ...] [--as-of <iso>]
   pin-run   <run-dir> <gate-pin-file>
-  pin-check <pin-file> [--pr <n> --head <sha> --repo-slug <slug>] [--as-path <final path>] | --candidate (stdin)
+  pin-check <pin-file> [--pr <n> --head <sha> --repo-slug <slug>] [--as-path <final path>]
+            | --owner <primary-pin-file> ... (the one owning-pin rule) | --candidate (stdin)
   shots     <run-dir>
   barrier   <run-dir> [--gate-pin <the ONE primary pin this campaign owns> --pr <n> --head <sha>]
   publish   <catalogue> <proposed> --expect-sha256 <hex|absent> --lock <file>
@@ -306,11 +307,37 @@ def lane_problems(run_dir, contract, jid, evidence, is_floor, files_must_exist=T
     return out
 
 
+def pass_identity_problems(contract, marker, jid):
+    """The barrier's identity bar for a pass marker, as one shared function:
+    the lane is declared, sourceSha is present on BOTH sides and equal (never
+    null == null), the lane field agrees, the generation is the contract's,
+    completedAt is set, and evidence is a non-empty list of one-line paths."""
+    out = []
+    if not isinstance(contract, dict):
+        return ["the run has no readable contract"]
+    lane = next((l for l in (contract.get("lanes") or []) if isinstance(l, dict) and l.get("id") == jid), None)
+    if "markers/{}.json".format(jid) not in (contract.get("requiredLaneMarkers") or []):
+        out.append("lane {} is not declared in its run's contract".format(jid))
+    sha = contract.get("sourceSha")
+    if not (isinstance(sha, str) and HEX40.match(sha) and marker.get("sourceSha") == sha):
+        out.append("marker sourceSha is missing or differs from its run's contract")
+    if marker.get("lane", jid) != jid:
+        out.append("marker lane field does not match its file name")
+    want = (lane or {}).get("generation", 1)
+    if marker.get("generation", 1) != want:
+        out.append("marker generation {} is not the contract's {}".format(marker.get("generation", 1), want))
+    if not _is_text(marker.get("completedAt")):
+        out.append("completedAt is missing")
+    if not _text_list(marker.get("evidence"), allow_empty=False) or any("\n" in e or "\r" in e for e in marker["evidence"]):
+        out.append("a pass names no evidence")
+    return out
+
+
 def last_proven(run_root, journey):
     """Newest completedAt of a `pass` that PROVED this floor journey: the
-    marker belongs to its run's contract (declared lane, same sourceSha and
-    generation), and the lane satisfies lane_problems for the journey's
-    DECLARED evidence and floor kind. A text-only pass on a browser journey
+    marker passes pass_identity_problems (declared lane, same sourceSha and
+    generation, evidence cited) and the lane satisfies lane_problems for the
+    journey's DECLARED evidence and floor kind. A text-only pass on a browser journey
     mis-scaffolded as api proves nothing and resets nothing."""
     jid, newest = journey["id"], None
     try:
@@ -323,11 +350,11 @@ def last_proven(run_root, journey):
         contract = _read_json(os.path.join(run_dir, "completion-contract.json"))
         if not isinstance(marker, dict) or marker.get("status") != "pass" or not isinstance(contract, dict):
             continue
-        lane = next((l for l in (contract.get("lanes") or []) if isinstance(l, dict) and l.get("id") == jid), None)
-        if lane is None or marker.get("sourceSha") != contract.get("sourceSha") \
-                or marker.get("lane", jid) != jid or marker.get("generation", 1) != lane.get("generation", 1):
-            continue
-        if lane_problems(run_dir, contract, jid, journey["evidence"], True, files_must_exist=False):
+        # The COMPLETE pass-validity bar the barrier applies, relaxing only file
+        # existence (media retention prunes old runs): a pass the barrier would
+        # refuse today proves nothing and resets nothing.
+        if pass_identity_problems(contract, marker, jid) or \
+                lane_problems(run_dir, contract, jid, journey["evidence"], True, files_must_exist=False):
             continue
         done = _parse_iso(marker.get("completedAt"))
         if done is not None and (newest is None or done > newest):
@@ -557,16 +584,24 @@ def check_pin(path, pr=None, head=None, slug=None, as_path=None):
     declares the evidence/floor the pin claims for every journey it names.
     `as_path` judges a not-yet-linked temp file as if it sat at its final path."""
     final = as_path or path
-    if not os.path.lexists(path):
-        return "absent", None, None, None, None
-    if os.path.islink(path) or not os.path.isfile(path):
-        return "invalid", "a symlink or not a regular file", None, None, None
+    # UNAVAILABLE is not INVALID. "Invalid" is a verdict on the BYTES (they are
+    # there and they are wrong) and it licenses the gate to promote a recovery
+    # pin; a checker that could not read (a permission error, a vanished
+    # mount) has no verdict, and must never start a recovery for a pin that
+    # may be perfectly valid. The caller retries later.
     try:
+        if not os.path.lexists(path):
+            return "absent", None, None, None, None
+        if os.path.islink(path) or not os.path.isfile(path):
+            return "invalid", "a symlink or not a regular file", None, None, None
         with open(path, "rb") as fh:
             raw = fh.read()
+    except OSError as exc:
+        return "unavailable", "the pin could not be read: {}".format(exc), None, None, None
+    try:
         pin = json.loads(raw.decode("utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
-        return "invalid", "unreadable, truncated or malformed", None, None, None
+    except (ValueError, UnicodeDecodeError):
+        return "invalid", "truncated or malformed", None, None, None
     problem = selection_problem(pin)
     if problem is None and (pin.get("pinned") is not True or not isinstance(pin.get("headSha"), str)
                             or not HEX40.match(pin["headSha"]) or isinstance(pin.get("pr"), bool)
@@ -587,6 +622,8 @@ def check_pin(path, pr=None, head=None, slug=None, as_path=None):
             problem = "its catalogue snapshot {} is missing or not a regular file".format(snapshot)
         else:
             cat, digest, _, errors = load_catalogue(snapshot)
+            if digest is None:
+                return "unavailable", "its catalogue snapshot could not be read: {}".format("; ".join(errors[:1])), None, None, None
             if digest != pin["catalogueSha256"]:
                 problem, cat = "its catalogue snapshot does not hash to catalogueSha256", None
             elif cat is None:
@@ -603,7 +640,37 @@ def check_pin(path, pr=None, head=None, slug=None, as_path=None):
     return "valid", None, pin, raw, cat
 
 
+def resolve_owner(primary, pr=None, head=None, slug=None):
+    """THE owning pin for (repo, PR, head), decided in one place for the gate's
+    lookup, its promotion and the barrier: a valid RECOVERY pin owns if one
+    exists (it is only ever created after a definite invalid primary, so it
+    takes precedence and the owner can never flip back), else the valid
+    primary, else nothing. Any checker that is UNAVAILABLE makes the answer
+    unavailable -- no decision is taken on a pin nobody could read."""
+    recovery = primary[:-len(".json")] + "-recovery.json"
+    r_state, r_reason, r_pin, r_raw, r_cat = check_pin(recovery, pr, head, slug)
+    p_state, p_reason, p_pin, p_raw, p_cat = check_pin(primary, pr, head, slug)
+    out = {"primary": {"path": primary, "state": p_state, "reason": p_reason},
+           "recovery": {"path": recovery, "state": r_state, "reason": r_reason}}
+    if r_state == "valid":
+        out.update({"state": "valid", "owner": recovery, "pin": r_pin, "raw": r_raw, "cat": r_cat})
+    elif "unavailable" in (r_state, p_state):
+        out.update({"state": "unavailable", "owner": None, "reason": p_reason if p_state == "unavailable" else r_reason})
+    elif p_state == "valid":
+        out.update({"state": "valid", "owner": primary, "pin": p_pin, "raw": p_raw, "cat": p_cat})
+    elif p_state == "absent" and r_state == "absent":
+        out.update({"state": "absent", "owner": None})
+    else:
+        out.update({"state": "invalid", "owner": None,
+                    "reason": "neither journeys pin for this head is valid: {} ({}); {} ({})".format(
+                        primary, p_reason or "absent", recovery, r_reason or "absent")})
+    return out
+
+
 def cmd_pin_check(args):
+    if args.owner:
+        out = resolve_owner(args.pin_file, args.pr, args.head, args.repo_slug)
+        emit({k: v for k, v in out.items() if k not in ("raw", "cat")})
     if args.candidate:
         try:
             problem = selection_problem(json.load(sys.stdin))
@@ -699,16 +766,12 @@ def cmd_barrier(args):
             bad(sel_rel, "this run holds a journey selection but no gate pin owns it (not a PR campaign, or no pin for its repo/PR/head in the shared lease dir) -- a selection is only ever the gate's, adopted with pin-run")
             emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
         emit({"applies": False, "missing": [], "invalid": [], "invalidReasons": []})
-    recovery_path = args.gate_pin[:-len(".json")] + "-recovery.json"
-    state, why, selection, gate_raw, cat = check_pin(args.gate_pin, args.pr, args.head)
-    owning = args.gate_pin
-    if state != "valid":
-        state, why2, selection, gate_raw, cat = check_pin(recovery_path, args.pr, args.head)
-        owning = recovery_path
-        if state != "valid":
-            bad(sel_rel, "this campaign's journeys pin {} is invalid ({}) and its recovery pin {} is {} -- neither can say what the run owes, so nothing clears it; the gate does not offer a head in this state".format(
-                args.gate_pin, why or "absent", recovery_path, why2 or "absent"))
-            emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
+    owner = resolve_owner(args.gate_pin, args.pr, args.head)
+    if owner["state"] != "valid":
+        bad(sel_rel, "this campaign has no usable journeys pin ({}) -- nothing can say what the run owes, so nothing clears it; the gate does not offer a head in this state".format(
+            owner.get("reason") or "primary {}, recovery {}".format(owner["primary"]["state"], owner["recovery"]["state"])))
+        emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
+    owning, selection, gate_raw, cat = owner["owner"], owner["pin"], owner["raw"], owner["cat"]
     try:
         with open(selection_path, "rb") as fh:
             run_raw = fh.read()
@@ -744,6 +807,10 @@ def cmd_barrier(args):
         evidence, is_floor = declared.get(jid, ("browser", False))
         for rel, problem in lane_problems(run_dir, contract, jid, evidence, is_floor):
             bad(rel, problem)
+        marker = _read_json(os.path.join(run_dir, "markers", jid + ".json"))
+        if isinstance(marker, dict) and marker.get("status") == "pass":
+            for problem in pass_identity_problems(contract, marker, jid):
+                bad("markers/{}.json".format(jid), problem)
 
     for m in selection["matchedJourneys"]:
         if not has_lane(m["id"]):
@@ -896,6 +963,7 @@ def main():
     p = sub.add_parser("pin-check")
     p.add_argument("pin_file", nargs="?", default="")
     p.add_argument("--candidate", action="store_true")
+    p.add_argument("--owner", action="store_true")
     p.add_argument("--pr", type=int)
     p.add_argument("--head")
     p.add_argument("--repo-slug")
