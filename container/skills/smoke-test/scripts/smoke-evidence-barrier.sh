@@ -529,11 +529,54 @@ done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 # run with neither a pin nor a selection is untouched; an unreadable answer
 # fails closed.
 JOURNEY_LEASE_DIR="${SMOKE_GATE_LEASE_DIR:-${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases}"
+#
+# ONE owning pin, never "any pin for this sha". The lease dir is shared, so two
+# campaigns on one head sha (two PRs at the same commit, the same commit in two
+# repos) each have a pin there, and a run that could satisfy ANY of them could
+# adopt a sibling's narrower scope. The pin's identity is repo + PR + head:
+#   head  the contract's sourceSha (above);
+#   PR    the SHARED coordinator lease for the contract's runId, which binds a
+#         run id to its PR (lease-<runId>.json `.pr` — what the scaffold's fence
+#         checks at smoke-run-scaffold.sh:290), else the one pr-<n>-authority
+#         record naming this run. Never the run dir's own copy;
+#   repo  SMOKE_GATE_REPO, slugged exactly as smoke-pr-gate.sh range_pin_file
+#         does. Unset, the pin is still unique when only one repo has pinned
+#         this (PR, head); more than one is refused, not guessed.
+# Zero candidates is today's no-pin behaviour.
 JOURNEY_PIN_ARGS=()
-if [ "$(jq -r '.ownershipKind' "$CONTRACT")" = pr ]; then
-  while IFS= read -r gate_pin; do
-    JOURNEY_PIN_ARGS+=(--gate-pin "$gate_pin")
-  done < <(compgen -G "$JOURNEY_LEASE_DIR/journeys-pin-*-pr-*-$SOURCE_SHA.json" || true)
+if [ "$(jq -r '.ownershipKind' "$CONTRACT")" = pr ] &&
+   compgen -G "$JOURNEY_LEASE_DIR/journeys-pin-*-pr-*-$SOURCE_SHA.json" >/dev/null 2>&1; then
+  JOURNEY_RUN_ID="$(jq -r '.runId // empty' "$CONTRACT")"
+  JOURNEY_PR=""
+  if printf '%s' "$JOURNEY_RUN_ID" | grep -Eq '^[A-Za-z0-9._-]{1,200}$'; then
+    JOURNEY_PR="$(jq -r 'select(type == "object" and (.pr | type == "number")) | .pr' \
+      "$JOURNEY_LEASE_DIR/lease-$JOURNEY_RUN_ID.json" 2>/dev/null || true)"
+    if [ -z "$JOURNEY_PR" ]; then
+      JOURNEY_PR="$(for authority in "$JOURNEY_LEASE_DIR"/pr-*-authority.json; do
+          [ -f "$authority" ] || continue
+          jq -r --arg run "$JOURNEY_RUN_ID" 'select(type == "object" and .runId == $run and (.pr | type == "number")) | .pr' \
+            "$authority" 2>/dev/null || true
+        done | sort -u)"
+    fi
+  fi
+  if ! printf '%s' "$JOURNEY_PR" | grep -Eq '^[0-9]+$'; then
+    INVALID+=("journeys/selection.json")
+    INVALID_REASONS+=("journeys/selection.json: the gate pinned a journey selection for this head sha, but this run's PR cannot be read from the shared lease (lease-$JOURNEY_RUN_ID.json / pr-<n>-authority.json in $JOURNEY_LEASE_DIR), so the pin this campaign owns cannot be identified — refusing rather than binding to another campaign's")
+  else
+    JOURNEY_REPO_SLUG='*'
+    [ -z "${SMOKE_GATE_REPO:-}" ] ||
+      JOURNEY_REPO_SLUG="$(printf '%s' "$SMOKE_GATE_REPO" | sed -e 's#/#__#g' -e 's/[^A-Za-z0-9._-]/_/g')"
+    JOURNEY_PIN_CANDIDATES=()
+    while IFS= read -r gate_pin; do
+      JOURNEY_PIN_CANDIDATES+=("$gate_pin")
+    done < <(compgen -G "$JOURNEY_LEASE_DIR/journeys-pin-$JOURNEY_REPO_SLUG-pr-$JOURNEY_PR-$SOURCE_SHA.json" || true)
+    if [ "${#JOURNEY_PIN_CANDIDATES[@]}" -eq 1 ]; then
+      JOURNEY_PIN_ARGS=(--gate-pin "${JOURNEY_PIN_CANDIDATES[0]}")
+    elif [ "${#JOURNEY_PIN_CANDIDATES[@]}" -gt 1 ]; then
+      INVALID+=("journeys/selection.json")
+      INVALID_REASONS+=("journeys/selection.json: ${#JOURNEY_PIN_CANDIDATES[@]} repositories pinned a journey selection for PR #$JOURNEY_PR at this head sha and SMOKE_GATE_REPO is unset, so this campaign's own pin is ambiguous — export SMOKE_GATE_REPO as the gate has it")
+    fi
+  fi
 fi
 if [ -e "$RUN_DIR/journeys/selection.json" ] || [ "${#JOURNEY_PIN_ARGS[@]}" -gt 0 ]; then
   journeys_result="$(python3 "$SCRIPT_DIR/smoke-journeys.py" barrier "$RUN_DIR" \

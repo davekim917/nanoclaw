@@ -14,7 +14,7 @@ wakes, WHICH journeys a change selects and which changed paths nothing claims.
   floor-due <catalogue> <run-root> [--size ...] [--as-of <iso>]
   pin-run   <run-dir> <gate-pin-file>
   shots     <run-dir>
-  barrier   <run-dir> [--gate-pin <file>]...
+  barrier   <run-dir> [--gate-pin <the ONE pin this campaign owns>]
   publish   <catalogue> <proposed> --expect-sha256 <hex|absent> --lock <file>
             [--floor-authority <citation>]
 
@@ -555,32 +555,29 @@ def cmd_barrier(args):
     # a directory, truncated JSON) is what the gate itself reports as
     # pinState:"invalid" -- scope unrecoverable, campaign `full`, no pinFile to
     # hand to pin-run -- so there is nothing here to hold the run to.
-    gate_pins = []
-    for pin_path in args.gate_pin:
-        if os.path.islink(pin_path) or not os.path.isfile(pin_path):
-            continue
+    gate_pin = None
+    pin_path = args.gate_pin
+    if pin_path and not os.path.islink(pin_path) and os.path.isfile(pin_path):
         try:
             with open(pin_path, "rb") as fh:
                 raw = fh.read()
             if json.loads(raw.decode("utf-8")).get("pinned") is True:
-                gate_pins.append((pin_path, raw))
+                gate_pin = raw
         except (OSError, ValueError, UnicodeDecodeError, AttributeError):
-            continue
-    if gate_pins:
+            gate_pin = None
+    if gate_pin is not None:
         try:
             with open(selection_path, "rb") as fh:
                 run_raw = fh.read()
         except OSError:
             run_raw = None
         if run_raw is None:
-            bad(sel_rel, "the gate pinned a journey selection for this campaign but the run never adopted it -- run `smoke-journeys.py pin-run {} {}`, then scaffold a lane per matched journey".format(run_dir, gate_pins[0][0]))
-        elif not any(raw == run_raw for _, raw in gate_pins):
-            gate = _read_json(gate_pins[0][0])
-            run = _read_json(selection_path)
-            bad(sel_rel, "does not match the gate's pin {} (catalogueSha256 run={} gate={}) -- a run's journey contract is the gate's, byte for byte; re-run pin-run in a clean run dir".format(
-                gate_pins[0][0],
-                run.get("catalogueSha256") if isinstance(run, dict) else "unreadable",
-                gate.get("catalogueSha256") if isinstance(gate, dict) else "unreadable"))
+            bad(sel_rel, "the gate pinned a journey selection for this campaign but the run never adopted it -- run `smoke-journeys.py pin-run {} {}`, then scaffold a lane per matched journey".format(run_dir, pin_path))
+        elif run_raw != gate_pin:
+            gate, run = json.loads(gate_pin.decode("utf-8")), _read_json(selection_path)
+            run = run if isinstance(run, dict) else {}
+            bad(sel_rel, "does not match this campaign's own gate pin {} (run adopted pinFile={} catalogueSha256={}; gate catalogueSha256={}) -- a run's journey contract is its OWN campaign's pin, byte for byte; re-run pin-run in a clean run dir".format(
+                pin_path, run.get("pinFile"), run.get("catalogueSha256"), gate.get("catalogueSha256")))
         if invalid:
             emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
     if not os.path.exists(selection_path):
@@ -707,21 +704,18 @@ def cmd_publish(args):
             prior_raw, prior_digest = None, "absent"
         if prior_digest != args.expect_sha256:
             emit({"ok": False, "error": "catalogue changed since this proposal was based on it", "expected": args.expect_sha256, "actual": prior_digest}, 1)
-        prior = None
-        if prior_raw is not None:
-            try:
-                prior = json.loads(prior_raw.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                prior = None
         # Floor membership and proof claims are a human's call, not a
-        # publisher's: adding, dropping, or weakening one needs a citation.
-        if isinstance(prior, dict) and isinstance(prior.get("journeys"), list):
-            try:
-                floor_changed = _floor_view(prior) != _floor_view(proposed)
-            except (KeyError, TypeError, AttributeError):
-                floor_changed = True
-            if floor_changed and not _is_text(args.floor_authority):
-                emit({"ok": False, "error": "this proposal changes floor membership or a floor journey's proves/maxIntervalDays/evidence; that is a human call -- pass --floor-authority <where it was approved>"}, 1)
+        # publisher's: adding, dropping, or weakening one needs a citation. An
+        # ABSENT catalogue has an EMPTY floor -- so the first publish, which is
+        # the one that creates the floor, is held to it too. A prior that
+        # cannot be read is a floor nobody can compare against: refused alike.
+        try:
+            prior_floor = {} if prior_raw is None else _floor_view(json.loads(prior_raw.decode("utf-8")))
+            floor_changed = prior_floor != _floor_view(proposed)
+        except (ValueError, UnicodeDecodeError, KeyError, TypeError, AttributeError):
+            floor_changed = True
+        if floor_changed and not _is_text(args.floor_authority):
+            emit({"ok": False, "error": "this proposal changes floor membership or a floor journey's proves/maxIntervalDays/evidence (a first publish that declares floor journeys included); that is a human call -- pass --floor-authority <where it was approved>"}, 1)
         _write_atomic(os.path.abspath(args.catalogue), new_raw)
     emit({"ok": True, "catalogue": args.catalogue, "sha256": new_digest, "priorSha256": prior_digest,
           "journeyCount": len(proposed["journeys"]), "floorAuthority": args.floor_authority or None,
@@ -760,7 +754,7 @@ def main():
 
     p = sub.add_parser("barrier")
     p.add_argument("run_dir")
-    p.add_argument("--gate-pin", action="append", default=[])
+    p.add_argument("--gate-pin", default="")
 
     p = sub.add_parser("publish")
     p.add_argument("catalogue")

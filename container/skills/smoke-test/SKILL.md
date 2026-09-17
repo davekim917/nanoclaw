@@ -620,8 +620,8 @@ and fixtures, the journey's steps and expected result, what to capture, the
 gates. Issuing a packet is `completed`, never `pass`; `pass` needs the tester's
 recorded result under `<run-dir>/manual-results/`, filed against the journey id.
 
-`smoke-evidence-barrier.sh` enforces the **completeness** of all this — the
-gate's pin held byte-for-byte by the run (skipping `pin-run` is a refusal, not
+`smoke-evidence-barrier.sh` enforces the **completeness** of all this — this
+campaign's own gate pin (repo + PR + head) held byte-for-byte by the run (skipping `pin-run` is a refusal, not
 a way out), a lane per matched journey, a valid disposition per frozen path,
 the run's catalogue still hashing to its pin — and nothing about its truth.
 **Substance is the challenger's**: it reviews every exclusion and every
@@ -635,7 +635,8 @@ changes as files in their run; **one publisher — the group's coordinator —
 applies them**: `SMOKE_LANE_ROLE=coordinator
 smoke-journeys.py publish <catalogue> <proposed> --expect-sha256 <digest the
 proposal was based on> --lock <state-dir>/control.lock` (schema and ids
-validated, stale digest refused, atomic replace). There is deliberately no
+validated, stale digest refused, atomic replace; any floor change, the first
+publish included, needs `--floor-authority`). There is deliberately no
 runner, step DSL, replay cache, golden baseline or dependency graph.
 
 ### The coverage floor — the part of the manifest the diff does not get a vote on

@@ -28,13 +28,13 @@ match() { # <paths-json> [extra args...]
 # (repo org/repo, PR 7, <head>): the selection plus pin fields, and the exact
 # catalogue bytes it was computed from, content-addressed. The gate's own
 # promotion is tested in smoke-pr-gate.test.sh 5k; this only builds its output.
-gate_pin() { # <lease-dir> <head-sha> <paths-json> -> prints the pin file path
-  local dir="$1" head="$2" out digest pin
+gate_pin() { # <lease-dir> <head-sha> <paths-json> [pr] [repo-slug] -> prints the pin file path
+  local dir="$1" head="$2" pr="${4:-7}" slug="${5:-org__repo}" out digest pin
   mkdir -p "$dir"
   out="$(match "$3" --snapshot-out "$dir/.snap")"
   digest="$(jq -r '.catalogueSha256' <<<"$out")"
   mv "$dir/.snap" "$dir/journeys-catalogue-$digest.json"
-  pin="$dir/journeys-pin-org__repo-pr-7-$head.json"
+  pin="$dir/journeys-pin-$slug-pr-$pr-$head.json"
   jq -c --arg h "$head" --arg f "$pin" --arg s "$dir/journeys-catalogue-$digest.json" \
     '. + {headSha:$h,pinned:true,pinState:"valid",pinFile:$f,catalogueSnapshot:$s,pinnedAt:"2026-09-10T00:00:00Z"}' \
     <<<"$out" > "$pin"
@@ -248,8 +248,12 @@ expect 5-api-laundering 'any(.invalidReasons[]; test("scaffolded --evidence api 
 # The barrier finds the pin in the SHARED lease dir, by the contract's sourceSha.
 GATE_LEASES="$WORK/shared/qa-coordinator/leases"
 GATE_PIN="$(gate_pin "$GATE_LEASES" "$SHA" '["api/src/reports/export.ts","web/src/desk/a.tsx"]')"
-pr_run() { # lanes as new_run, but claimed by a PR campaign on $SHA
+share_lease() { # <lease-dir> <pr>: the shared coordinator lease binding run-1 to its PR
+  mkdir -p "$1"; jq -n --argjson pr "$2" '{schemaVersion:1,pr:$pr,runId:"run-1",owner:"owner-1"}' > "$1/lease-run-1.json"
+}
+pr_run() { # lanes as new_run, but claimed by a PR campaign (#7) on $SHA
   new_run "$1"
+  share_lease "$GATE_LEASES" 7
   jq '.ownershipKind = "pr" | .coordinatorOwnerToken = "owner-1"' "$RUN/completion-contract.json" > "$RUN/c.tmp"
   mv "$RUN/c.tmp" "$RUN/completion-contract.json"
 }
@@ -262,27 +266,59 @@ expect 5b-skipped-pin-run '.ready == false and (.invalid | index("journeys/selec
   any(.invalidReasons[]; test("never adopted it") and test("pin-run"))' "$(gate_barrier)"
 # A different head SHA's pin, or a develop-owned run, is not this campaign's.
 gate_pin "$WORK/other-leases" "$(printf 'b%.0s' $(seq 40))" '["web/src/desk/a.tsx"]' >/dev/null
+share_lease "$WORK/other-leases" 7
 expect 5b-other-head '.ready == true' "$(SMOKE_GATE_LEASE_DIR="$WORK/other-leases" bash "$BARRIER" "$RUN" lanes)"
 # The lease dir also resolves from the shared root alone, as the gate's does.
 expect 5b-shared-root-default '.ready == false' "$(SMOKE_GATE_SHARED_ROOT="$WORK/shared" bash "$BARRIER" "$RUN" lanes || true)"
 # Adopting a doctored copy (unmapped path dropped) is refused by bytes...
 mkdir -p "$RUN/journeys"; jq -c '.unmappedPaths = []' "$GATE_PIN" > "$RUN/journeys/selection.json"
 cp "$EXAMPLE" "$RUN/journeys/catalogue.json"
-expect 5b-narrowed-copy '.ready == false and any(.invalidReasons[]; test("does not match the gate.s pin"))' "$(gate_barrier)"
+expect 5b-narrowed-copy '.ready == false and any(.invalidReasons[]; test("does not match this campaign.s own gate pin"))' "$(gate_barrier)"
 # ...and so is a selection pinned from another catalogue version (sha mismatch).
 jq -c '.catalogueSha256 = "0000"' "$GATE_PIN" > "$RUN/journeys/selection.json"
-expect 5b-sha-mismatch 'any(.invalidReasons[]; test("catalogueSha256 run=0000 gate=[0-9a-f]{64}"))' "$(gate_barrier)"
+expect 5b-sha-mismatch 'any(.invalidReasons[]; test("catalogueSha256=0000; gate catalogueSha256=[0-9a-f]{64}"))' "$(gate_barrier)"
 # The real thing: pin-run, lanes, disposition => ready.
 pr_run '[{"id":"loan-desk-checkout","kind":"lane"}]'; marker loan-desk-checkout blocked '[]'
 python3 "$TOOL" pin-run "$RUN" "$GATE_PIN" >/dev/null
 disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
 expect 5b-adopted '.ready == true' "$(gate_barrier)"
+# ONE OWNING PIN. Two more campaigns pinned the SAME head sha in the shared
+# lease dir — another PR (#8) and the same PR number in another repo — each
+# with a NARROWER scope (nothing unmapped). The run binds to repo+PR+head, its
+# own: its own bytes stay ready, a sibling's bytes are refused by name.
+PIN_PR8="$(gate_pin "$GATE_LEASES" "$SHA" '["web/src/desk/a.tsx"]' 8)"
+expect 5b-sibling-pr-ignored '.ready == true' "$(gate_barrier)"
+cp "$PIN_PR8" "$RUN/journeys/selection.json"
+expect 5b-adopted-sibling-pr '.ready == false and any(.invalidReasons[];
+  test("own gate pin .*journeys-pin-org__repo-pr-7-") and test("run adopted pinFile=.*-pr-8-"))' "$(gate_barrier)"
+cp "$GATE_PIN" "$RUN/journeys/selection.json"
+PIN_FORK="$(gate_pin "$GATE_LEASES" "$SHA" '["web/src/desk/a.tsx"]' 7 other__fork)"
+# Two repos, same PR number and sha, and the barrier was not told which repo:
+# ambiguous is refused, never guessed.
+expect 5b-ambiguous-repo '.ready == false and any(.invalidReasons[]; test("2 repositories") and test("SMOKE_GATE_REPO"))' "$(gate_barrier)"
+repo_barrier() { SMOKE_GATE_REPO="$1" SMOKE_GATE_LEASE_DIR="$GATE_LEASES" bash "$BARRIER" "$RUN" lanes || true; }
+expect 5b-own-repo '.ready == true' "$(repo_barrier org/repo)"
+cp "$PIN_FORK" "$RUN/journeys/selection.json"
+expect 5b-adopted-other-repo '.ready == false and any(.invalidReasons[];
+  test("own gate pin .*journeys-pin-org__repo-pr-7-") and test("run adopted pinFile=.*other__fork"))' "$(repo_barrier org/repo)"
+expect 5b-fork-owns-its-own '.ready == true' "$(repo_barrier other/fork)"   # the same bytes ARE the fork campaign's own
+# A repo with no pin of its own for this (PR, head) is the no-pin case.
+cp "$GATE_PIN" "$RUN/journeys/selection.json"
+expect 5b-third-repo-no-pin '.ready == true' "$(repo_barrier third/repo)"
+# The PR comes from the SHARED lease, never the run: without it the owning pin
+# cannot be identified, and that is a refusal, not "no pin".
+rm -f "$GATE_LEASES/lease-run-1.json"
+expect 5b-no-lease '.ready == false and any(.invalidReasons[]; test("PR cannot be read from the shared lease"))' "$(repo_barrier org/repo)"
+jq -n '{schemaVersion:1,pr:7,runId:"run-1",owner:"owner-1",boundAt:"x"}' > "$GATE_LEASES/pr-7-authority.json"
+expect 5b-authority-fallback '.ready == true' "$(repo_barrier org/repo)"
+rm -f "$GATE_LEASES/pr-7-authority.json" "$PIN_PR8" "$PIN_FORK"
+
 # Only a VALID pin binds. What the gate reports as pinState:"invalid" (a
 # symlink, a directory, truncated JSON) has no selection to adopt, so it cannot
 # hold a run hostage — the campaign is already `full` by the gate's own word.
 pr_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
 for kind in truncated symlink directory; do
-  rm -rf "$WORK/bad-leases"; mkdir -p "$WORK/bad-leases"
+  rm -rf "$WORK/bad-leases"; share_lease "$WORK/bad-leases" 7
   bad="$WORK/bad-leases/journeys-pin-org__repo-pr-7-$SHA.json"
   case "$kind" in
     truncated) printf '{"pinned":tr' > "$bad" ;;
@@ -303,7 +339,14 @@ LIVE="$WORK/live/journeys.json"; LOCK="$WORK/live/control.lock"; mkdir -p "$WORK
 publish() { python3 "$TOOL" publish "$LIVE" "$@" --lock "$LOCK" || true; }
 expect 7-role '.ok == false and (.error | test("coordinator"))' "$(publish "$EXAMPLE" --expect-sha256 absent)"
 export SMOKE_LANE_ROLE=coordinator
-expect 7-first '.ok == true and .priorSha256 == "absent"' "$(publish "$EXAMPLE" --expect-sha256 absent)"
+# FIRST publish is the one that creates the floor: an absent catalogue has an
+# empty floor, so declaring floor journeys needs the authority like any change.
+expect 7-first-floor-needs-authority '.ok == false and (.error | test("floor"))' "$(publish "$EXAMPLE" --expect-sha256 absent)"
+[ ! -e "$LIVE" ] || fail "7: a refused first publish wrote the catalogue"
+jq 'del(.journeys[1])' "$EXAMPLE" > "$WORK/no-floor.json"
+expect 7-first-no-floor '.ok == true and .priorSha256 == "absent" and .floorAuthority == null' "$(publish "$WORK/no-floor.json" --expect-sha256 absent)"
+rm -f "$LIVE"
+expect 7-first '.ok == true and .priorSha256 == "absent"' "$(publish "$EXAMPLE" --expect-sha256 absent --floor-authority "operator decision 2026-09-01")"
 cmp -s "$LIVE" "$EXAMPLE" || fail "7: published bytes differ"
 D1="$(sha256sum < "$LIVE" | cut -d' ' -f1)"
 jq '.journeys[0].consumes += ["api/src/reports/**"]' "$EXAMPLE" > "$WORK/p1.json"
