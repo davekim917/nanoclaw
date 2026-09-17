@@ -12,6 +12,10 @@ on:
 # none.
 permissions:
   contents: read
+  # tested-tree (below) lists this repo's artifacts; listing needs actions:read.
+  # Still read-only: uploading an artifact uses the runner's own runtime token,
+  # not this one, so no write scope is granted anywhere.
+  actions: read
 
 # This repo is private on the GitHub Free plan: 2,000 Actions minutes/month, and
 # running out kills every job account-wide until the 1st (happened 2026-08-31).
@@ -43,8 +47,57 @@ concurrency:
 # 2026-09-08/09 that way. Neither job gets continue-on-error; the point is
 # telling the two kinds of red apart, not tolerating either.
 jobs:
-  correctness:
+  # A push to main re-runs `correctness` on a tree the PR run already proved
+  # green whenever nothing else landed between that run and the merge — 49% of
+  # merges (150 sampled, 2026-09-17), at ~20 min each. The PR run tests the
+  # merge ref (actions/checkout's default for pull_request), so its tree IS
+  # main's new tree in exactly that case; when the base moved, the merged tree
+  # was never tested and this job says so. `correctness` records each tree it
+  # passed as an empty artifact named by tree hash (its LAST step, never
+  # `if: always()`, so the marker exists only for a green job); this job looks
+  # the marker up. Anything but a definite hit — API error, expired marker —
+  # runs the tests, so the failure direction is "tested twice", never
+  # "tested never". `bookkeeping` always runs: it is 30s and its red means
+  # something different (see the split above).
+  #
+  # Not a new trust boundary: a PR can already edit this file, and its own
+  # run is what the merge gate reads, so forging a marker gains nothing a
+  # forged workflow didn't already have.
+  tested-tree:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    outputs:
+      already_green: ${{ steps.lookup.outputs.already_green }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Look up a green marker for this tree
+        id: lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tree=$(git rev-parse 'HEAD^{tree}')
+          hits=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=ci-green-tree-$tree&per_page=5" \
+            --jq '[.artifacts[] | select(.expired == false)] | length' || echo 0)
+          if [ "$hits" -gt 0 ]; then
+            echo "tree $tree passed correctness on a pull_request run; skipping the re-run"
+            echo "already_green=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tree $tree has no green marker (base moved before the merge, or the marker expired); running"
+            echo "already_green=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  correctness:
+    needs: [tested-tree]
+    # On pull_request tested-tree is skipped and its output is empty, so this
+    # is true; on push it is false only for a definite marker hit. `!cancelled()`
+    # rather than the implicit `success()` because a skipped `needs` job would
+    # otherwise skip this one too.
+    if: ${{ !cancelled() && needs.tested-tree.outputs.already_green != 'true' }}
+    runs-on: ubuntu-latest
+    # A wedged test otherwise runs to GitHub's 360-minute default; p90 for
+    # this job is 23 min (2026-09-17).
+    timeout-minutes: 45
     steps:
       # fetch-depth: 0 (full history), not actions/checkout@v4's default depth-1
       # shallow clone. scripts/review-notes.test.ts's citation checker resolves
@@ -254,6 +307,23 @@ jobs:
             container/agent-runner/coverage/lcov.info
             /tmp/coverage-risk-baseline-candidate.json
           retention-days: 14
+
+      # The marker tested-tree reads. Last step on purpose, and `success()` is
+      # spelled out because an explicit `if:` replaces the implicit one: the
+      # marker must exist only when every step above passed. pull_request only —
+      # a push tree never recurs on main.
+      - name: Record this tree as green
+        id: tree
+        if: success() && github.event_name == 'pull_request'
+        run: |
+          : > tested-tree.marker
+          echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: success() && github.event_name == 'pull_request'
+        with:
+          name: ci-green-tree-${{ steps.tree.outputs.tree }}
+          path: tested-tree.marker
+          retention-days: 7
 
   bookkeeping:
     runs-on: ubuntu-latest
