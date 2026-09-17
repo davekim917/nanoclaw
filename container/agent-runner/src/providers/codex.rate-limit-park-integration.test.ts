@@ -26,6 +26,7 @@ const ORIGINAL_ENV = {
   FAKE_CODEX_STATE: process.env.FAKE_CODEX_STATE,
   FAKE_CODEX_LOG: process.env.FAKE_CODEX_LOG,
   FAKE_CODEX_WEEKLY_BY_INSTANCE: process.env.FAKE_CODEX_WEEKLY_BY_INSTANCE,
+  FAKE_CODEX_RESET_BY_INSTANCE: process.env.FAKE_CODEX_RESET_BY_INSTANCE,
 };
 
 function restoreEnv(): void {
@@ -54,7 +55,9 @@ afterEach(() => {
 /**
  * Fake app-server. `FAKE_CODEX_WEEKLY_BY_INSTANCE` is a comma list of weekly
  * usedPercent per spawned instance (instance 1 first), so a test can make the
- * primary account look spent and the fallback fresh.
+ * primary account look spent and the fallback fresh. `FAKE_CODEX_RESET_BY_INSTANCE`
+ * is the matching list of weekly `resetsAt` epoch seconds (default RESET_S), so
+ * two spent accounts can state different resets.
  */
 function writeFakeCodex(binDir: string): void {
   fs.mkdirSync(binDir, { recursive: true });
@@ -71,6 +74,8 @@ const instance = previous + 1;
 fs.writeFileSync(statePath, String(instance));
 const weeklyByInstance = (process.env.FAKE_CODEX_WEEKLY_BY_INSTANCE ?? '20').split(',').map(Number);
 const weekly = weeklyByInstance[Math.min(instance, weeklyByInstance.length) - 1];
+const resetByInstance = (process.env.FAKE_CODEX_RESET_BY_INSTANCE ?? '${RESET_S}').split(',').map(Number);
+const resetS = resetByInstance[Math.min(instance, resetByInstance.length) - 1];
 
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
 const log = (value) => fs.appendFileSync(logPath, JSON.stringify({ instance, ...value }) + '\\n');
@@ -118,7 +123,7 @@ lines.on('line', (line) => {
         accountId: 'acct-' + instance,
         rateLimits: {
           primary: { usedPercent: 10, windowDurationMins: 300 },
-          secondary: { usedPercent: weekly, windowDurationMins: 10080, resetsAt: ${RESET_S} },
+          secondary: { usedPercent: weekly, windowDurationMins: 10080, resetsAt: resetS },
           planType: 'pro',
         },
       },
@@ -135,7 +140,7 @@ lines.on('line', (line) => {
     send({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: turnId, status: 'inProgress', items: [] } } });
     setTimeout(() => {
       // A sparse rolling push mid-turn: only the weekly window, one point up.
-      send({ method: 'account/rateLimits/updated', params: { rateLimits: { secondary: { usedPercent: weekly + 1, windowDurationMins: 10080, resetsAt: ${RESET_S} } } } });
+      send({ method: 'account/rateLimits/updated', params: { rateLimits: { secondary: { usedPercent: weekly + 1, windowDurationMins: 10080, resetsAt: resetS } } } });
       send({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId, delta: 'turn result' } });
       send({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: turnId, status: 'completed', items: [] } } });
     }, 5);
@@ -166,11 +171,15 @@ interface Run {
 
 async function run(opts: {
   weeklyByInstance: string;
+  /** Weekly `resetsAt` epoch seconds per spawned instance; every instance states RESET_S when unset. */
+  resetByInstance?: string;
   fallbackHomes?: string[];
   /** Substring of a CODEX_HOME whose hooks the fake reports as untrusted. */
   untrustedHomeMatch?: string;
   /** Capture a generator throw instead of propagating it, so the request log can still be read. */
   tolerateThrow?: boolean;
+  /** Consecutive queries on the SAME provider instance (default 1) — what a container's later turns are. */
+  queries?: number;
 }): Promise<Run> {
   const binDir = path.join(tmpDir, 'bin');
   const codexHome = path.join(tmpDir, 'codex-home');
@@ -187,6 +196,8 @@ async function run(opts: {
   process.env.FAKE_CODEX_STATE = statePath;
   process.env.FAKE_CODEX_LOG = logPath;
   process.env.FAKE_CODEX_WEEKLY_BY_INSTANCE = opts.weeklyByInstance;
+  if (opts.resetByInstance) process.env.FAKE_CODEX_RESET_BY_INSTANCE = opts.resetByInstance;
+  else delete process.env.FAKE_CODEX_RESET_BY_INSTANCE;
   if (opts.untrustedHomeMatch) process.env.FAKE_CODEX_UNTRUSTED_HOME_MATCH = opts.untrustedHomeMatch;
   else delete process.env.FAKE_CODEX_UNTRUSTED_HOME_MATCH;
   process.env.CODEX_HEALTH_PROBE_QUIET_MS = '60000';
@@ -195,18 +206,20 @@ async function run(opts: {
 
   const provider = new CodexProvider({ providerConfig: { reasoning_effort: 'medium' } });
   provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
-  const query = provider.query({ prompt: 'do the task', cwd: tmpDir });
   const events: Run['events'] = [];
   let thrown: string | undefined;
-  try {
-    for await (const event of query.events) {
-      events.push(event as Run['events'][number]);
-      if (event.type === 'result' || (event.type === 'error' && !event.retryable)) query.end();
+  for (let n = 0; n < (opts.queries ?? 1) && thrown === undefined; n++) {
+    const query = provider.query({ prompt: 'do the task', cwd: tmpDir });
+    try {
+      for await (const event of query.events) {
+        events.push(event as Run['events'][number]);
+        if (event.type === 'result' || (event.type === 'error' && !event.retryable)) query.end();
+      }
+    } catch (err) {
+      if (!opts.tolerateThrow) throw err;
+      thrown = err instanceof Error ? err.message : String(err);
+      query.end();
     }
-  } catch (err) {
-    if (!opts.tolerateThrow) throw err;
-    thrown = err instanceof Error ? err.message : String(err);
-    query.end();
   }
   const requests = fs.existsSync(logPath)
     ? fs
@@ -310,6 +323,49 @@ describe('Codex rate-limit read → park through gen()', () => {
       ['acct-1', 'codex:codex-home', 0.95],
       ['acct-2', 'codex:codex-fallback-1', 0.3],
     ]);
+  }, 5_000);
+
+  it('a container already on its fallback whose fallback then parks wraps back to the primary — the 2026-09-16 outage', async () => {
+    // Query 1: primary (96%) parks → fallback (30%) runs. Query 2 starts on the
+    // fallback (CODEX_HOME moved): it now parks (97%) → the ring offers the
+    // primary again (20%, its window rolled over) and the turn completes there.
+    // Before this the cursor was forward-only: query 2 had nothing left and the
+    // poll-loop parked the whole provider until the FALLBACK's reset.
+    const fallbackHome = path.join(tmpDir, 'codex-fallback-1');
+    fs.mkdirSync(fallbackHome, { recursive: true });
+    const { events, requests, spawned } = await run({
+      weeklyByInstance: '96,30,97,20',
+      fallbackHomes: [fallbackHome],
+      queries: 2,
+    });
+    expect(spawned).toBe(4);
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(requests.filter((r) => r.method === 'turn/start').map((r) => r.instance)).toEqual([2, 4]);
+    const rotations = events.filter((e) => e.type === 'progress' && String(e.message).includes('Codex OAuth rotating'));
+    expect(rotations.map((e) => String(e.message))).toEqual([
+      expect.stringContaining('→ account 2/2'),
+      expect.stringContaining('→ account 1/2'),
+    ]);
+    expect(events.filter((e) => e.type === 'result')).toHaveLength(2);
+  }, 5_000);
+
+  it('every account spent: one quota error carrying the EARLIEST reset in the ring, not the last account tried', async () => {
+    const fallbackHome = path.join(tmpDir, 'codex-fallback-1');
+    fs.mkdirSync(fallbackHome, { recursive: true });
+    // Primary resets a day later than RESET_S; the fallback resets at RESET_S.
+    // The host parks (agent_group, 'codex') on what this error says, so it must
+    // be the instant the FIRST account is back, whichever was tried last.
+    const { events, requests, spawned } = await run({
+      weeklyByInstance: '96,97',
+      resetByInstance: `${RESET_S + 86_400},${RESET_S}`,
+      fallbackHomes: [fallbackHome],
+    });
+    expect(spawned).toBe(2);
+    expect(requests.some((r) => r.method === 'turn/start')).toBe(false);
+    const errors = events.filter((e) => e.type === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ retryable: false, classification: 'quota', resetAt: RESET_ISO });
+    expect(String(errors[0]?.message)).toContain('all 2 Codex accounts tried this turn');
   }, 5_000);
 
   // The fail-closed wiring itself, driven through the real provider rather than

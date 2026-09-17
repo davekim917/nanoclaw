@@ -23,6 +23,7 @@ import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/cont
 import { appendActiveRuntimeContext } from '../runtime-context.js';
 import { setProviderHealthState, type ProviderHealthState } from '../modules/mailbox/index.js';
 import { formatCredentialRotationNotice } from '../credential-rotation-notice.js';
+import { CODEX_MODEL_RE } from './model-vocabulary.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import {
@@ -438,8 +439,8 @@ registerProviderConfigSchema('codex', codexConfigSchema);
 // 2026-06-10: sticky_model=claude-fable-5[1m] on a codex session), and a
 // claude id at thread/start would fail every turn of the session.
 
-/** Mirrors CODEX_VALID_MODEL_RE in the host's flag-parser (separate package trees). */
-export const CODEX_MODEL_RE = /^gpt-[a-z0-9][a-z0-9.-]*$/;
+/** Mirrors CODEX_VALID_MODEL_RE in the host's flag-parser (separate package trees); shared with the poll-loop's cross-provider pin drop. */
+export { CODEX_MODEL_RE };
 
 const CODEX_EFFORT_VALUES: ReadonlySet<string> = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 
@@ -932,8 +933,8 @@ export function refreshCodexAuthFromHost(activeCodexHome: string, hostCodexHome:
  * across homes. Primary holds the pre-rotation history; the fallback holds
  * the newer post-rotation history. When the container later dies (host-sweep
  * absolute-ceiling, idle timeout) and a fresh container spawns for the same
- * thread, `nextFallback` resets to 0 and `thread/resume` reads from primary
- * — finding the STALE pre-rotation rollout. Post-rotation turns are
+ * thread, it starts on the primary (`CODEX_HOME` is per process) and
+ * `thread/resume` reads from there — finding the STALE pre-rotation rollout. Post-rotation turns are
  * stranded on the fallback; if primary is still rate-limited, rotation
  * fires again and the *stale* primary rollout overwrites the *newer*
  * fallback rollout, destroying history.
@@ -1006,16 +1007,15 @@ export class CodexProvider implements AgentProvider {
    * Ordered fallback CODEX_HOME paths from the `CODEX_FALLBACK_HOMES` env
    * (colon-joined). Host's container-runner mounts each fallback `~/.codex*`
    * dir at `/home/node/.codex-fallback-N/` and forwards the env var. Used
-   * by the rotation routine in `gen()` to walk through alternate OAuth
-   * identities on `UsageLimitExceeded` / `ServerOverloaded` / coarse
-   * `systemError`. Cursor persists for the provider instance lifetime —
-   * once we've rotated to slot N, slot N+1 is the next target even across
-   * `query()` calls.
+   * with the primary as the ring `gen()` walks on `UsageLimitExceeded` /
+   * `ServerOverloaded` / coarse `systemError` (`rotateCodexHome`). The
+   * active home is `process.env.CODEX_HOME`: a rotation moves it and the next
+   * `query()` inherits it, so a container stays on the last account that
+   * worked until that one fails too.
    */
   readonly fallbackHomes: readonly string[];
   private readonly primaryCodexHome: string;
   private readonly primaryHostCodexHome: string | undefined;
-  private nextFallback = 0;
 
   constructor(options: ProviderOptions = {}) {
     // Native-first MCP wiring:
@@ -1120,26 +1120,38 @@ export class CodexProvider implements AgentProvider {
     }
   }
 
+  /** The credential ring in rotation order: the primary first, then each declared fallback. */
+  get codexHomeRing(): readonly string[] {
+    return [this.primaryCodexHome, ...this.fallbackHomes];
+  }
+
   /**
-   * Advance the rotation cursor and return the next fallback CODEX_HOME, or
-   * null when slots are exhausted. Position persists for the provider's
-   * lifetime but NOT across a container respawn — `nextFallback` is
-   * forward-only (never wraps, unlike `ClaudeProvider`'s circular OAuth
-   * ring), so a respawn is this pool's only reset. Restoring a persisted
-   * cursor onto a forward-only pool can only ever advance it, never reopen
-   * it: if the last fallback also fails, a restored cursor would sit past
-   * the end and the primary would never become eligible again, whereas an
-   * unpersisted respawn today resets to the primary and gives the whole
-   * pool another chance. `fallbackHomes` is therefore deliberately NOT
-   * persisted to session_state — see `ClaudeProvider.rotateApiKey`'s
-   * `ANTHROPIC_API_KEY_N` branch (providers/claude.ts:2308) for the same reasoning on the other
-   * forward-only pool this fleet has.
+   * The next CODEX_HOME to try after `current`: the ring walked circularly,
+   * skipping every home in `tried`; null once all of them have been tried.
+   *
+   * Circular on purpose. The cursor this replaces was forward-only for the
+   * life of the provider instance: once a container had rotated to its last
+   * fallback, that account's next park ended the query with nothing left to
+   * try, and the poll-loop reported the WHOLE provider unavailable until that
+   * account's reset — while the primary, rotated away from turns earlier, had
+   * long since recovered. Observed 2026-09-16: a group parked on codex until
+   * its secondary's 2026-09-21 weekly reset with a healthy primary.
+   * `tried` is per query, so every account is retried once per turn and only a
+   * turn on which ALL of them fail reaches the host (gen() then reports the
+   * ring's earliest reset, `earliestCodexSlotReset`). Nothing is persisted:
+   * `process.env.CODEX_HOME` carries the active home between queries, and a
+   * respawn starts on the primary.
    *
    * Exported as a method so the gen() body and unit tests can both drive it.
    */
-  rotateCodexHome(): string | null {
-    if (this.nextFallback >= this.fallbackHomes.length) return null;
-    return this.fallbackHomes[this.nextFallback++];
+  rotateCodexHome(current: string, tried: ReadonlySet<string>): string | null {
+    const ring = this.codexHomeRing;
+    const start = Math.max(0, ring.indexOf(current));
+    for (let step = 1; step <= ring.length; step++) {
+      const candidate = ring[(start + step) % ring.length];
+      if (!tried.has(candidate)) return candidate;
+    }
+    return null;
   }
 
   registerMemorySessionHook(hook: MemorySessionHookRegistration): void {
@@ -1250,6 +1262,13 @@ export class CodexProvider implements AgentProvider {
       // process.env.CODEX_HOME is unset — the codex CLI uses the same default.
       let currentCodexHome = resolveCodexConfigDir();
       let primaryAuthRefreshAttempted = false;
+      // Homes this query has already run on. A rotation adds its target and
+      // `rotateCodexHome` skips them, so one query tries each account at most
+      // once — the bound that keeps the rotation loop finite.
+      const triedHomes = new Set<string>([currentCodexHome]);
+      // The reset instant each failed account stated (null when its error
+      // carried none), in rotation order; read only once the ring is exhausted.
+      const slotResets: Array<string | null> = [];
 
       try {
         await initializeCodexAppServer(server);
@@ -1278,7 +1297,7 @@ export class CodexProvider implements AgentProvider {
         // Cross-container rollout repair. When a prior session rotated to a
         // fallback and that container later died, the fallback holds the
         // newest rollout — but the fresh container starts with
-        // currentCodexHome=primary (the rotation cursor resets per-instance).
+        // currentCodexHome=primary (`CODEX_HOME` is per process).
         // Without this pass, thread/resume would read the STALE pre-rotation
         // rollout from primary; if rotation fires again here, the in-session
         // rotation copy would write that stale rollout OVER the newer
@@ -1510,109 +1529,122 @@ export class CodexProvider implements AgentProvider {
                   rotateAndRetry = true;
                   break;
                 }
-                if (eligible && self.nextFallback < self.fallbackHomes.length) {
-                  const nextHome = self.rotateCodexHome();
-                  if (nextHome) {
-                    // Best-effort: copy the active rollout into the new
-                    // CODEX_HOME's sessions tree so thread/resume reconstructs
-                    // history inline. If the rollout doesn't exist yet (first
-                    // turn) or the copy fails, the new app-server falls back
-                    // to a fresh thread via STALE_THREAD_RE in
-                    // startOrResumeCodexThread — conversation context is lost
-                    // but the turn still completes.
-                    let rolloutCopied = false;
-                    if (threadId) {
-                      const src = findRolloutFile(threadId, currentCodexHome);
-                      if (src) {
-                        const dst = copyRolloutToFallback(src, currentCodexHome, nextHome);
-                        rolloutCopied = dst !== null;
-                      }
+                if (eligible) slotResets.push(ev.resetAt ?? null);
+                const nextHome = eligible ? self.rotateCodexHome(currentCodexHome, triedHomes) : null;
+                if (nextHome) {
+                  triedHomes.add(nextHome);
+                  // 1-based position in the ring (primary = 1), for the
+                  // status line and the notice to the resumed thread.
+                  const position = self.codexHomeRing.indexOf(nextHome) + 1;
+                  const ringSize = self.codexHomeRing.length;
+                  // Best-effort: copy the active rollout into the new
+                  // CODEX_HOME's sessions tree so thread/resume reconstructs
+                  // history inline. If the rollout doesn't exist yet (first
+                  // turn) or the copy fails, the new app-server falls back
+                  // to a fresh thread via STALE_THREAD_RE in
+                  // startOrResumeCodexThread — conversation context is lost
+                  // but the turn still completes.
+                  let rolloutCopied = false;
+                  if (threadId) {
+                    const src = findRolloutFile(threadId, currentCodexHome);
+                    if (src) {
+                      const dst = copyRolloutToFallback(src, currentCodexHome, nextHome);
+                      rolloutCopied = dst !== null;
                     }
-
-                    // Visible status — better than swallowing the rotation
-                    // silently. Uses progress so it flows through the same
-                    // edit-in-place surface as the thinking labels.
-                    yield {
-                      type: 'progress',
-                      message: formatBlockquoteLabel(
-                        '↻',
-                        `Codex OAuth rotating (${ev.classification}) → fallback ${self.nextFallback}/${self.fallbackHomes.length}` +
-                          (rolloutCopied ? ' (history preserved)' : ' (history reset)'),
-                      ),
-                    };
-
-                    // Tear down the wedged app-server, switch identity,
-                    // spawn fresh. CODEX_HOME on process.env is what the
-                    // app-server reads at spawn.
-                    turnTracker.server = null;
-                    turnTracker.threadId = null;
-                    turnTracker.currentTurnId = null;
-                    killCodexAppServer(server);
-                    process.env.CODEX_HOME = nextHome;
-                    currentCodexHome = nextHome;
-
-                    // config.toml / hooks.json / agents/ all live under CODEX_HOME,
-                    // so the new dir needs all three. The writers honor CODEX_HOME
-                    // (just switched above), so regenerating config + the guard hooks
-                    // lands them in the fallback home — without this the rotated
-                    // app-server runs UNGUARDED. agents/ is bind-mounted only at the
-                    // primary, so mirror the role definitions across explicitly. (codex #126)
-                    writeCodexMcpConfigToml(self.mcpServers);
-                    writeCodexHooksAndTrust();
-                    mirrorCodexAgentsToHome(self.primaryCodexHome, nextHome);
-
-                    server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
-                    turnTracker.server = server;
-                    attachCodexAutoApproval(server);
-                    await initializeCodexAppServer(server);
-                    // currentCodexHome was just switched to the fallback above;
-                    // the guard chain must be proven live in the NEW home too.
-                    await verifyCodexHookTrust(server, currentCodexHome);
-                    await rateLimits.bind(server, currentCodexHome);
-
-                    // Re-resume the thread on the new identity. If the
-                    // rollout copy succeeded, threadId stays the same and
-                    // history continues. If it didn't, startOrResume falls
-                    // back to a fresh thread via STALE_THREAD_RE and
-                    // returns a new id — re-emit init so the poll loop
-                    // updates its continuation.
-                    const previousThreadId: string | undefined = threadId;
-                    threadId = await startOrResumeCodexThread(server, threadId, threadParams);
-                    turnTracker.threadId = threadId ?? null;
-                    const transition = resolveCodexRestartTransition({
-                      previousThreadId,
-                      nextThreadId: threadId,
-                      originalText: text,
-                      initYielded,
-                    });
-                    // Credential rotation, specifically — unlike the
-                    // control-plane-recovery and primary-auth-refresh
-                    // branches above, this is the one where the PRIOR
-                    // credential actually hit its usage limit. Tell the
-                    // resumed/restarted thread explicitly so it doesn't read
-                    // its own prior turn's "rate limited" narrative (if any
-                    // survived into `attemptText`) as still describing this
-                    // attempt. Position is 1-based (primary = 1);
-                    // `self.nextFallback` was already advanced by
-                    // `rotateCodexHome()` above, so it equals that position.
-                    attemptText =
-                      `${transition.attemptText}\n\n` +
-                      formatCredentialRotationNotice({
-                        position: self.nextFallback + 1,
-                        ringSize: self.fallbackHomes.length + 1,
-                      });
-                    initYielded = transition.initYielded;
-                    if (transition.resetThreadDedupe) {
-                      resetCodexTurnAccumulatorThread(turnAccum);
-                    }
-
-                    rotateAndRetry = true;
-                    break; // exit for-await; the outer rotation while re-runs
                   }
+
+                  // Visible status — better than swallowing the rotation
+                  // silently. Uses progress so it flows through the same
+                  // edit-in-place surface as the thinking labels.
+                  yield {
+                    type: 'progress',
+                    message: formatBlockquoteLabel(
+                      '↻',
+                      `Codex OAuth rotating (${ev.classification}) → account ${position}/${ringSize}` +
+                        (rolloutCopied ? ' (history preserved)' : ' (history reset)'),
+                    ),
+                  };
+
+                  // Tear down the wedged app-server, switch identity,
+                  // spawn fresh. CODEX_HOME on process.env is what the
+                  // app-server reads at spawn.
+                  turnTracker.server = null;
+                  turnTracker.threadId = null;
+                  turnTracker.currentTurnId = null;
+                  killCodexAppServer(server);
+                  process.env.CODEX_HOME = nextHome;
+                  currentCodexHome = nextHome;
+
+                  // config.toml / hooks.json / agents/ all live under CODEX_HOME,
+                  // so the new dir needs all three. The writers honor CODEX_HOME
+                  // (just switched above), so regenerating config + the guard hooks
+                  // lands them in the fallback home — without this the rotated
+                  // app-server runs UNGUARDED. agents/ is bind-mounted only at the
+                  // primary, so mirror the role definitions across explicitly
+                  // (codex #126); the mirror is a no-op when the ring wraps back
+                  // to the primary (`mirrorCodexAgentsToHome` returns on src == dst).
+                  writeCodexMcpConfigToml(self.mcpServers);
+                  writeCodexHooksAndTrust();
+                  mirrorCodexAgentsToHome(self.primaryCodexHome, nextHome);
+
+                  server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
+                  turnTracker.server = server;
+                  attachCodexAutoApproval(server);
+                  await initializeCodexAppServer(server);
+                  // currentCodexHome was just switched to the fallback above;
+                  // the guard chain must be proven live in the NEW home too.
+                  await verifyCodexHookTrust(server, currentCodexHome);
+                  await rateLimits.bind(server, currentCodexHome);
+
+                  // Re-resume the thread on the new identity. If the
+                  // rollout copy succeeded, threadId stays the same and
+                  // history continues. If it didn't, startOrResume falls
+                  // back to a fresh thread via STALE_THREAD_RE and
+                  // returns a new id — re-emit init so the poll loop
+                  // updates its continuation.
+                  const previousThreadId: string | undefined = threadId;
+                  threadId = await startOrResumeCodexThread(server, threadId, threadParams);
+                  turnTracker.threadId = threadId ?? null;
+                  const transition = resolveCodexRestartTransition({
+                    previousThreadId,
+                    nextThreadId: threadId,
+                    originalText: text,
+                    initYielded,
+                  });
+                  // Credential rotation, specifically — unlike the
+                  // control-plane-recovery and primary-auth-refresh
+                  // branches above, this is the one where the PRIOR
+                  // credential actually hit its usage limit. Tell the
+                  // resumed/restarted thread explicitly so it doesn't read
+                  // its own prior turn's "rate limited" narrative (if any
+                  // survived into `attemptText`) as still describing this
+                  // attempt.
+                  attemptText =
+                    `${transition.attemptText}\n\n` + formatCredentialRotationNotice({ position, ringSize });
+                  initYielded = transition.initYielded;
+                  if (transition.resetThreadDedupe) {
+                    resetCodexTurnAccumulatorThread(turnAccum);
+                  }
+
+                  rotateAndRetry = true;
+                  break; // exit for-await; the outer rotation while re-runs
                 }
-                // Not eligible OR no fallback slots — original behavior:
-                // surface the error and end the query.
-                yield ev;
+                // Not eligible, or every account in the ring has failed this
+                // query: surface the error and end the query. When more than
+                // one account was tried, the error carries the ring's EARLIEST
+                // stated reset — the host parks the whole provider on that
+                // instant (poll-loop.ts `reportProviderUnavailable` →
+                // provider_health), and the provider is back the moment its
+                // first account is, not when its last one is.
+                if (triedHomes.size > 1) {
+                  yield {
+                    ...ev,
+                    resetAt: earliestCodexSlotReset(slotResets),
+                    message: `${ev.message} — all ${triedHomes.size} Codex accounts tried this turn`,
+                  };
+                } else {
+                  yield ev;
+                }
                 return;
               }
               // Stamp the effort this query is running at onto the turn's
@@ -2478,6 +2510,24 @@ export async function* parkedTurnEvents(park: CodexRateLimitPark): AsyncGenerato
     classification: 'quota',
     resetAt: park.resetsAt,
   };
+}
+
+/**
+ * When the ring is next expected to have a usable account: the earliest reset
+ * any failed account stated, or null when one of them stated none (an overload
+ * or system error carries no reset). Null hands the host its bounded backoff
+ * rather than a date from a different account — the safe direction
+ * (src/db/provider-health.ts `cooldownMs`).
+ */
+export function earliestCodexSlotReset(resets: ReadonlyArray<string | null>): string | null {
+  if (resets.length === 0) return null;
+  let earliest: { iso: string; ms: number } | null = null;
+  for (const iso of resets) {
+    const ms = iso === null ? Number.NaN : Date.parse(iso);
+    if (!Number.isFinite(ms)) return null;
+    if (earliest === null || ms < earliest.ms) earliest = { iso: iso as string, ms };
+  }
+  return earliest?.iso ?? null;
 }
 
 registerProvider('codex', (opts) => new CodexProvider(opts));
