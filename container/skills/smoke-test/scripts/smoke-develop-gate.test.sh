@@ -950,6 +950,58 @@ bash "$GATE" poll | jq -e '
   .data.trigger == "develop_freeze_unclaimed" and .data.campaignTrace.detail == "pr_gate_state_unreadable"
 ' >/dev/null || uc_fail "unreadable per-PR state did not fail toward the alarm"
 
+# Develop RED: every other handoff step waits for a settled build, this alarm
+# must not — a dead PR-gate watcher has nothing to do with develop's CI, and an
+# outage during a red develop would otherwise be exactly as silent as before.
+uc_open 64
+export SMOKE_GATE_PR_STATE_DIR="$PR_DIR" SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS=5400
+export STUB_FRONTEND_CI=failure
+uc_age 600
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_settled_build"' >/dev/null ||
+  uc_fail "young freeze alarmed on a red develop"
+uc_age 6000
+UC_OUT="$(bash "$GATE" poll)"
+jq -e --arg sha "$UC_TARGET" '
+  .wakeAgent == true and .data.trigger == "develop_freeze_unclaimed" and .data.freezePr == 64 and
+  .data.targetSha == $sha and .data.campaignTrace.disposition == "never_started"
+' <<<"$UC_OUT" >/dev/null || uc_fail "never-started freeze stayed silent while develop was red: $UC_OUT"
+jq -e '.handoffFreezePr == 64 and .handoffUnclaimedAlertFor == "64" and .unsettledSha != null' \
+  "$STATE_DIR2/develop-state.json" >/dev/null || uc_fail "red-develop alarm lost the slot or the unsettled bookkeeping"
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_settled_build"' >/dev/null ||
+  uc_fail "unclaimed alarm re-fired on a red develop"
+# ...and the latch is the same one: once develop goes green, no second wake.
+unset STUB_FRONTEND_CI
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "already_active"' >/dev/null ||
+  uc_fail "unclaimed alarm fired twice across red -> green"
+# Red develop, but the freeze is NOT never-started in any sense the settled
+# path would accept: closed PR (abandonment owns it), a matching ledger row
+# (adoption owns it), a live run. None may alarm from the unsettled branch.
+uc_open 65
+export SMOKE_GATE_PR_STATE_DIR="$PR_DIR" SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS=5400 STUB_FRONTEND_CI=failure
+uc_age 6000
+STUB_FREEZE_PR_STATE=CLOSED bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null ||
+  uc_fail "red develop alarmed over a closed freeze PR"
+jq -cn --arg t "$UC_TARGET" --arg f "$UC_FREEZE" \
+  '{schemaVersion:1,targetSha:$t,freezeSha:$f,freezePr:65,runId:"run-uc-65",verdict:"GO",finishedAt:"2026-09-15T12:00:00Z"}' \
+  >> "$STATE_DIR2/handoff-ledger.jsonl"
+bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null || uc_fail "red develop alarmed over a finished freeze"
+jq -e '.handoffUnclaimedAlertFor == null' "$STATE_DIR2/develop-state.json" >/dev/null
+uc_open 66
+export SMOKE_GATE_PR_STATE_DIR="$PR_DIR" SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS=5400 STUB_FRONTEND_CI=failure
+SMOKE_GATE_STATE_DIR="$PR_DIR" bash "$SCRIPT_DIR/smoke-pr-gate.sh" claim run-uc-66 66 "$UC_FREEZE" >/dev/null
+uc_age 6000
+bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null || uc_fail "red develop alarmed over a live campaign"
+# Env unset on a red develop: inert, exact historic line, no latch.
+uc_open 67
+export STUB_FRONTEND_CI=failure
+uc_age 9000
+UC_OUT="$(bash "$GATE" poll)"
+[ "$(jq -c '[.wakeAgent, .data.trigger, (.data | keys_unsorted)]' <<<"$UC_OUT")" = \
+  '[false,"waiting_for_settled_build",["schemaVersion","trigger","sourceSha","backendDeploySha","frontendDeploySha","checkCount"]]' ] ||
+  uc_fail "inert red-develop line changed: $UC_OUT"
+jq -e '.handoffUnclaimedAlertFor == null' "$STATE_DIR2/develop-state.json" >/dev/null
+unset STUB_FRONTEND_CI
+
 # Supersession, one case per disposition. Past BOTH windows with develop moved:
 # the stale wake still frees the slot, carries the trace, and only tells the
 # responder to close a freeze nothing is running on.
