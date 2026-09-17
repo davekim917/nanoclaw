@@ -721,7 +721,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     applyChatBudget(keep);
     const flagBatch = effectiveTurnSettings(keep, routing, config.providerName, config.providerFallbackActive === true);
     if (flagBatch.ignoredModel !== undefined)
-      await noteIgnoredModel(flagBatch.ignoredModel, config.providerName, routing);
+      await noteIgnoredModel(
+        flagBatch.ignoredModel,
+        config.providerName,
+        config.providerFallbackActive === true,
+        routing,
+      );
     const effectiveModel = flagBatch.model;
     const effectiveEffort = flagBatch.effort;
     const effectiveUltracode = flagBatch.ultracode;
@@ -3293,7 +3298,8 @@ export function applyFlagBatch(
   // thread, codex parked, the claude fallback then asked the Anthropic API
   // for `gpt-6-astra` on every turn of the session. Ignore it for THIS
   // provider only — the sticky stays stored and applies again when the
-  // primary is back; `ignoredModel` lets the caller say so once.
+  // primary is back (or until the user re-pins after a provider migration);
+  // `ignoredModel` lets the caller say so once.
   const model =
     requestedModel !== undefined && !modelBelongsToProvider(requestedModel, providerName) ? undefined : requestedModel;
   const ignoredModel = model === requestedModel ? undefined : requestedModel;
@@ -3315,12 +3321,24 @@ export function applyFlagBatch(
 /**
  * One chat line, once per cooldown, when a stored model pin is being ignored
  * because it belongs to another provider (`applyFlagBatch`). The pin itself
- * stays in session_state — it applies again when the primary provider is back.
+ * stays in session_state. What happens next depends on WHY the provider
+ * differs: under a spawn-time fallback (`fallbackActive`, the host's
+ * NANOCLAW_PROVIDER_FALLBACK_APPLIED marker — config.ts:85) the primary comes
+ * back on its own and the pin applies again; after a deliberate provider
+ * migration the new provider IS the primary, nothing reverts, and the user
+ * has to re-pin or clear it.
  */
-async function noteIgnoredModel(model: string, providerName: string, routing: RoutingContext): Promise<void> {
+async function noteIgnoredModel(
+  model: string,
+  providerName: string,
+  fallbackActive: boolean,
+  routing: RoutingContext,
+): Promise<void> {
   const text =
     `⚙️ model pin ${model} is not a ${providerName} model — ignored while this session runs on ${providerName}; ` +
-    `it applies again when the primary provider is back.`;
+    (fallbackActive
+      ? `it applies again when the primary provider is back.`
+      : `set a ${providerName} model with -m <model>, or clear the pin with -m.`);
   log(text);
   if (!shouldPostInfraWarning(text)) return;
   await writeMessageOut({
