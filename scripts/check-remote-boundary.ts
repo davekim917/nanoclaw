@@ -14,7 +14,7 @@
  *   - A hook only ever sees the objects one push carries, never the tree as a
  *     whole, so anything that landed before the gate existed stays invisible.
  *
- * CI cannot cover it either: `.github/workflows/ci.yml` runs the checker with
+ * CI cannot cover it either: `.github/workflows/ci-full.yml` runs the checker with
  * `--portable` (structural patterns only) because a GitHub runner has no
  * `data/v2.db`, and shipping the identifier registry to CI would publish the
  * very thing the registry exists to keep private.

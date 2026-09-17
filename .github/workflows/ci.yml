@@ -44,7 +44,7 @@ jobs:
           cache: pnpm
       - uses: oven-sh/setup-bun@v2
         with:
-          # Same pin as `correctness` below; keep the two together.
+          # Same pin as `correctness` in ci-full.yml; keep the two together.
           bun-version: 1.3.14
       - run: pnpm install --frozen-lockfile
       - name: Install agent-runner deps (Bun)

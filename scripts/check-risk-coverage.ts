@@ -48,7 +48,7 @@
  *                true, detailed: true })`, node_modules/@vitest/coverage-v8/dist/index.js)
  *                and applies `include`/`exclude` only when building the report — so
  *                a coverage run's CPU overhead is global to the process, not confined
- *                to risk:high files. See ci.yml for what that meant for one
+ *                to risk:high files. See ci-full.yml for what that meant for one
  *                CPU-heavy, unrelated test.
  *   - container: `bun run test -- --coverage --coverage-reporter=lcov` (from
  *                container/agent-runner) → container/agent-runner/coverage/lcov.info.
@@ -100,7 +100,7 @@
  *
  * Producing an honest baseline: this repo's host suite runs on a memory-constrained,
  * production-serving box that must never run the full vitest suite with coverage
- * (docs/specs/risk-based-review/plan.md). ci.yml's "Generate coverage baseline
+ * (docs/specs/risk-based-review/plan.md). ci-full.yml's "Generate coverage baseline
  * candidate" step runs `--write --bootstrap` against CI's own full-suite reports and
  * uploads the result as part of the `risk-coverage-reports` artifact — download THAT
  * file and commit it directly, rather than downloading the raw reports and running

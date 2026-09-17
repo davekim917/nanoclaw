@@ -58,7 +58,7 @@ const lane = process.env.VITEST_LANE;
  * (`Profiler.startPreciseCoverage({ callCount: true, detailed: true })`,
  * node_modules/@vitest/coverage-v8/dist/index.js) and applies `include`/`exclude` only
  * once building the report — see scripts/check-risk-coverage.ts's file header and
- * ci.yml for what that overhead meant for one CPU-heavy, unrelated test. Derived at run
+ * ci-full.yml for what that overhead meant for one CPU-heavy, unrelated test. Derived at run
  * time from `.github/labeler.yml` rather than hardcoded, so the coverage ratchet's
  * scope can never silently drift from the review gate's scope
  * (docs/specs/risk-based-review/plan.md, "Tests on risky paths").
