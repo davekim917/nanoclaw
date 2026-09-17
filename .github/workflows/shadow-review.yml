@@ -242,9 +242,17 @@ jobs:
           #    id is not part of the roster: without this, an operator pausing
           #    the Claude reviewer by commenting its id out still had that id
           #    resolved and used, in EITHER comment style. Model ids contain
-          #    neither delimiter, so nothing real is lost; a `//` inside some
-          #    other string would truncate that line, which can only cost a
-          #    match and so only ever fails loudly below.
+          #    neither delimiter, so nothing real is lost.
+          #
+          #    This is TEXT stripping, not a parse, and the limit is worth
+          #    stating plainly: a `//` inside a string or URL truncates that
+          #    line. Usually that only costs a match and fails loudly below,
+          #    but a roster that ALSO carries `'/*'`/`'*/'` string literals
+          #    around a later declaration can rebalance the delimiters and
+          #    resolve the wrong id. That shape is contrived — the real roster
+          #    (`scripts/reviewer-models.ts`) has no URL at all — and the
+          #    honest fix is to stop reading the file as text, which needs a
+          #    Node/tsx runtime this step does not have. Recorded, not fixed.
           # 2. Flatten to a single line, so the array literal can be matched as
           #    one expression whether it is written on one line or wrapped over
           #    several.
@@ -258,6 +266,12 @@ jobs:
           # the text after it read as live code. Any surviving delimiter means
           # the strip did not do what the matching below assumes, so refuse
           # rather than resolve from text we cannot account for.
+          #
+          # The one legitimate shape this refuses is a SINGLE-LINE docblock
+          # whose text contains a URL (`/** @see https://… */`): the `//` eats
+          # its `*/`. A multi-line docblock with a URL is fine, since its `*/`
+          # is on a later line. Refusing is the right side to err on, and the
+          # message says exactly what to change.
           if printf '%s' "$flat" | grep -qE '/\*|\*/'; then
             echo "unbalanced block comment after comment-stripping $ROSTER@$BASE_SHA — refusing to resolve a reviewer from it" >&2
             exit 1
