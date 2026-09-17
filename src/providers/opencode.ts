@@ -508,11 +508,33 @@ export interface StagedOpenCodeAuth {
 }
 
 /**
+ * The global OpenCode config every container's staged XDG tree carries:
+ * `$XDG_CONFIG_HOME/opencode/opencode.json`, holding only the fleet default
+ * model. Without it a bare `opencode run` in a shell has no configured model and
+ * no last-used one (the tree is fresh per session), so OpenCode falls to "the
+ * first model by internal priority" across every provider it finds a credential
+ * for — and in a Codex-group container, which also carries `OPENAI_API_KEY`,
+ * that landed on an OpenAI model whose OpenCode OAuth entry on the host was
+ * stale (#884, 2026-09-17: `Token refresh failed: 401`). The operator's rule:
+ * headless OpenCode runs its default model unless asked for another.
+ *
+ * Safe for the OpenCode provider's own container: its full config travels as
+ * `OPENCODE_CONFIG_CONTENT`, which OpenCode loads AFTER the global file and
+ * merges over it (opencode.ai/docs/config, "Precedence order": global config
+ * is 2 of 8, inline config is 6), and it sends its model per prompt besides.
+ */
+export const OPENCODE_STAGED_CONFIG_FILE = 'opencode.json';
+export function stagedOpenCodeConfig(): string {
+  return JSON.stringify({ $schema: 'https://opencode.ai/config.json', model: DEFAULT_OPENCODE_MODEL }, null, 2) + '\n';
+}
+
+/**
  * Stage the host OpenCode credential into a session-private XDG tree and return
  * the mount and env that reach it.
  *
- * AUTH ONLY, deliberately. Every container carries this so any agent can drive
- * `opencode` headless, and a credential is all that takes — agent definitions,
+ * AUTH plus the one-line default-model config, deliberately nothing more. Every
+ * container carries this so any agent can drive `opencode` headless, and a
+ * credential and a default model are all that takes — agent definitions,
  * skills and `opencode.db` are the OpenCode PROVIDER's session state and stay
  * with the provider's own contribution, which calls this for its auth step so
  * there is one copy of the staging logic rather than two.
@@ -542,6 +564,7 @@ export function stageOpenCodeAuth(
   }
   if (authContents) replaceUntrustedFile(opencodeSubdir, 'auth.json', authContents);
   else removeUntrustedPathEntry(opencodeSubdir, 'auth.json');
+  replaceUntrustedFile(opencodeSubdir, OPENCODE_STAGED_CONFIG_FILE, stagedOpenCodeConfig());
 
   return {
     mounts: [{ hostPath: opencodeDir, containerPath: OPENCODE_XDG_CONTAINER_PATH, readonly: false }],
