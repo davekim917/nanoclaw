@@ -446,8 +446,12 @@ export interface NanoclawMailboxSession extends MailboxSession {
    */
   expireClosedSessionPending(): number;
   getDueWakePriority(): 'interactive' | 'scheduled';
-  /** Fused: reads outbound processing_ack and writes inbound statuses in one action. */
-  syncProcessingAcks(): void;
+  /**
+   * Fused: reads outbound processing_ack and writes inbound statuses in one
+   * action. Returns the ids completed because the runner had already answered
+   * them with no ack left to sync (see the op).
+   */
+  syncProcessingAcks(): string[];
   /** Raw snake_case claim rows; upstream's `getProcessingClaims` returns the record shape. */
   getProcessingClaimRows(): ProcessingClaim[];
   /**
@@ -1198,7 +1202,7 @@ function forkOps(
     expireStalePending: (maxAgeMs) => expireStalePending(inbound, maxAgeMs),
     expireClosedSessionPending: () => expireClosedSessionPending(inbound),
     getDueWakePriority: () => getDueWakePriority(inbound),
-    syncProcessingAcks: () => readOutbound(undefined, (outbound) => syncProcessingAcks(inbound, outbound)),
+    syncProcessingAcks: () => readOutbound([], (outbound) => syncProcessingAcks(inbound, outbound)),
     // A never-woken session has no turn usage: empty is the honest answer here,
     // not the opener's throw (the rollup runs over every session every tick).
     listTurnUsageSince: (afterId) => readOutbound([], (outbound) => listTurnUsageSince(outbound, afterId)),
