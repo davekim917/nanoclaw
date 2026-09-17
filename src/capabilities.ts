@@ -859,14 +859,14 @@ export function buildSessionServicesSnapshotFrom(
     // A retired name still sitting in some group's container.json is deleted
     // from the merged map by the runner on every spawn
     // (container/agent-runner/src/retired-mcp-servers.ts:13, applied at
-    // container/agent-runner/src/index.ts:257), so advertising it would
+    // container/agent-runner/src/index.ts:256), so advertising it would
     // promise a tool that cannot exist — the exact failure docs/slack-user-token.md
     // documents. The entry stays in the spawn payload, where the runner logs
     // the drop for the operator; it just never reaches the agent's capability
     // list.
     if (RETIRED_MCP_SERVER_NAMES.has(name)) continue;
     // A hand-edited container.json can hold a malformed entry: the group file's
-    // `validateMcpServers` refuses only SSE (src/container-config.ts:573-589),
+    // `validateMcpServers` refuses only SSE (src/container-config.ts:573-590),
     // so `null` reaches here. One bad entry must not cost the whole snapshot —
     // an agent with no capability list is the worse failure by far.
     if (server === null || typeof server !== 'object') continue;
@@ -889,9 +889,9 @@ export function buildSessionServicesSnapshotFrom(
  * Deliberately says nothing about what the server does — that is the
  * `description` field's job — and names only the transport the agent needs to
  * reason about. The URL is safe to print: `parseMcpServerConfig` refuses a URL
- * carrying credentials at intake (src/container-config.ts:478-500), and the
+ * carrying credentials at intake (src/container-config.ts:477-501), and the
  * agent can read the same value in its own read-only container.json mount
- * (src/container-runner.ts:4873). `env` and `headers` are never rendered —
+ * (src/container-runner.ts:4877). `env` and `headers` are never rendered —
  * those DO hold injected values for the stdio servers this file's own gated
  * blocks build.
  */

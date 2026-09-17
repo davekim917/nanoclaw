@@ -112,7 +112,7 @@ export const DEFAULT_FLEET_MCP_SERVERS: Record<string, McpServerConfig> = {
 /**
  * Names the agent-runner deletes from the merged map on every spawn
  * (`RETIRED_MCP_SERVER_NAMES`, container/agent-runner/src/retired-mcp-servers.ts:13,
- * applied at container/agent-runner/src/index.ts:257). A fleet entry under one
+ * applied at container/agent-runner/src/index.ts:256). A fleet entry under one
  * of these would be dead config, and a capability entry for one would promise
  * the agent a tool that cannot exist — so the file refuses the name and the
  * capability snapshot skips it. `src/fleet-mcp-servers.test.ts` fails if this
@@ -130,7 +130,7 @@ function fail(message: string): never {
  * Shape-check one stored entry.
  *
  * `validateMcpServers` only refuses SSE and strips a provenance-less `cwd`
- * (src/container-config.ts:573-589), so it would pass `null` or an `http`
+ * (src/container-config.ts:573-590), so it would pass `null` or an `http`
  * entry with no `url` straight through to a container and to the capability
  * snapshot. Everything written through `ncl groups config add-mcp-server` has
  * already been through the full intake (`parseMcpServerConfig`); this is the
@@ -156,7 +156,7 @@ function validateFleetEntry(name: string, entry: McpServerConfig): void {
     fail(`server ${name} has unsupported transport ${JSON.stringify(server.type)}`);
   }
   // Every remaining field, by the same shapes `parseMcpServerConfig` enforces
-  // (src/container-config.ts:396-520) — minus its normalization. A wrong shape
+  // (src/container-config.ts:429-552) — minus its normalization. A wrong shape
   // here is inherited by EVERY group and only fails inside the container: a
   // string `args` survives `args.length > 0` and then throws on `.map` while
   // Codex writes its TOML (container/agent-runner/src/providers/codex-app-server.ts:749-750).
@@ -207,7 +207,7 @@ function validateFleetEntry(name: string, entry: McpServerConfig): void {
     } catch (error) {
       fail(`server ${name} url is not a valid URL: ${error instanceof Error ? error.message : String(error)}`);
     }
-    // Mirrors `parseMcpServerConfig` (src/container-config.ts:466-472): HTTPS,
+    // Mirrors `parseMcpServerConfig` (src/container-config.ts:473-476): HTTPS,
     // or plain HTTP only for a loopback host the gateway never sees.
     const loopback = ['localhost', '127.0.0.1', '[::1]', 'host.docker.internal'].includes(parsed.hostname);
     if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && loopback)) {
