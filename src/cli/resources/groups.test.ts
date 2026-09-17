@@ -40,6 +40,7 @@ import { createSession } from '../../db/sessions.js';
 import { recordDeliveryAttempt } from '../../db/coordination.js';
 import { dispatch } from '../dispatch.js';
 import { readContainerConfig } from '../../container-config.js';
+import { readFleetMcpServers } from '../../fleet-mcp-servers.js';
 import {
   ensureContainerConfig,
   getContainerConfig,
@@ -1096,5 +1097,78 @@ describe('groups config — the container.json + container_configs dual write ho
     expect(removed.ok).toBe(true);
     expect(readContainerConfig(folder).mcpServers.both).toBeUndefined();
     expect(JSON.parse((await getContainerConfig(id))!.mcp_servers).both).toBeUndefined();
+  });
+
+  it('config add/remove-mcp-server --fleet edits the fleet defaults, not a group', async () => {
+    const added = await dispatch(
+      {
+        id: 'req-fleet-add',
+        command: 'groups-config-add-mcp-server',
+        args: {
+          fleet: true,
+          name: 'acme',
+          url: 'https://mcp.acme.test/mcp',
+          description: 'Acme widgets.',
+          'display-name': 'Acme',
+        },
+      },
+      { caller: 'host' },
+    );
+    expect(added.ok).toBe(true);
+    expect(readFleetMcpServers().acme).toEqual({
+      type: 'http',
+      url: 'https://mcp.acme.test/mcp',
+      description: 'Acme widgets.',
+      displayName: 'Acme',
+    });
+    // The shipped defaults survive the write — a --fleet add is additive, not
+    // a replacement of the file.
+    expect(readFleetMcpServers().littlebird).toBeDefined();
+
+    const shown = await dispatch(
+      { id: 'req-fleet-get', command: 'groups-config-get', args: { fleet: true } },
+      { caller: 'host' },
+    );
+    expect(shown.ok).toBe(true);
+    if (!shown.ok) throw new Error('unreachable');
+    expect((shown.data as { mcp_servers: Record<string, unknown> }).mcp_servers.acme).toBeDefined();
+
+    const removed = await dispatch(
+      { id: 'req-fleet-remove', command: 'groups-config-remove-mcp-server', args: { fleet: true, name: 'acme' } },
+      { caller: 'host' },
+    );
+    expect(removed.ok).toBe(true);
+    expect(readFleetMcpServers().acme).toBeUndefined();
+  });
+
+  it('config add-mcp-server refuses a --description with no value', async () => {
+    // `--description` with nothing after it parses as boolean true
+    // (src/cli/parse-argv.ts:28); refusing it at intake beats writing `true`
+    // into every agent's capability list.
+    const res = await dispatch(
+      {
+        id: 'req-fleet-desc',
+        command: 'groups-config-add-mcp-server',
+        args: { fleet: true, name: 'acme', url: 'https://mcp.acme.test/mcp', description: true },
+      },
+      { caller: 'host' },
+    );
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error('unreachable');
+    expect(JSON.stringify(res.error)).toMatch(/description must be a string/);
+  });
+
+  it('config add-mcp-server refuses --fleet together with --id', async () => {
+    const res = await dispatch(
+      {
+        id: 'req-fleet-both',
+        command: 'groups-config-add-mcp-server',
+        args: { fleet: true, id: 'ag-whatever', name: 'acme', url: 'https://mcp.acme.test/mcp' },
+      },
+      { caller: 'host' },
+    );
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error('unreachable');
+    expect(JSON.stringify(res.error)).toMatch(/mutually exclusive/);
   });
 });

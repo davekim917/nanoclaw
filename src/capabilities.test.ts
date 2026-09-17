@@ -408,6 +408,59 @@ describe('buildSessionServicesSnapshot', () => {
     expect(names).not.toContain('Granola');
   });
 
+  it('describes every MCP server the container gets, including one only the group declares', async () => {
+    insertWorkgroup('derived', []);
+    const ag = group('ag-derived', 'derived');
+    await createGroupInWorkgroup(ag, 'derived');
+    writeContainerConfig(ag.folder, {
+      mcpServers: {
+        acme: { type: 'http', url: 'https://mcp.acme.test/mcp', description: 'Acme widgets.' },
+        plainly: { type: 'http', url: 'https://mcp.plain.test/mcp' },
+      },
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+      tools: [],
+    });
+
+    const services = (await buildSessionServicesSnapshot(ag.id)).services;
+
+    // Fleet default, inherited by every group with no per-group wiring at all.
+    const littlebird = services.find((s) => s.name === 'Littlebird');
+    expect(littlebird?.mcpNamespace).toBe('mcp__littlebird__*');
+    expect(littlebird?.useFor).toContain('Littlebird workspace');
+
+    // The group's own entry, described by its own `description`.
+    const acme = services.find((s) => s.name === 'Acme');
+    expect(acme?.mcpNamespace).toBe('mcp__acme__*');
+    expect(acme?.useFor).toBe('Acme widgets.');
+
+    // No description: a generic line that names the transport and claims
+    // nothing about what the server does.
+    const plainly = services.find((s) => s.name === 'Plainly');
+    expect(plainly?.useFor).toContain('https://mcp.plain.test/mcp');
+    expect(plainly?.useFor).toContain('mcp__plainly__*');
+  });
+
+  it('keeps the migrated universal text verbatim and never doubles an entry', async () => {
+    insertWorkgroup('universal', []);
+    const ag = group('ag-universal', 'universal');
+    await createGroupInWorkgroup(ag, 'universal');
+
+    const services = (await buildSessionServicesSnapshot(ag.id)).services;
+
+    expect(services.filter((s) => s.name === 'Pocket')).toHaveLength(1);
+    expect(services.find((s) => s.name === 'Pocket')?.useFor).toBe(
+      'Personal knowledge / memory via https://public.heypocketai.com/mcp. Auth pre-injected (Authorization: Bearer). Use Pocket tools to save references, recall prior context, search personal knowledge.',
+    );
+    expect(services.find((s) => s.name === 'Exa')?.useFor).toContain(
+      'Web search, research, and code context. Prefer exa over ad-hoc WebSearch/WebFetch',
+    );
+    expect(services.find((s) => s.name === 'DeepWiki')?.mcpNamespace).toBe('mcp__deepwiki__*');
+    expect(services.find((s) => s.name === 'Granola')?.useFor).toContain('Meeting transcripts + notes');
+    expect(services.find((s) => s.name === 'Context7')?.useFor).toContain('Live library / framework / SDK / API docs');
+  });
+
   it('test_capability_and_parity_output_omit_legacy_gitnexus_field', async () => {
     fs.mkdirSync(`${dirs.TEST_ROOT}/container/nanoclaw-plugin`, { recursive: true });
     fs.mkdirSync(`${dirs.TEST_ROOT}/plugins/gitnexus`, { recursive: true });

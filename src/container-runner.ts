@@ -198,6 +198,7 @@ import { assertStorageAdmissionInBackground } from './storage-maintenance-worker
 import { acquireStorageActivityLease, type StorageActivityLease } from './storage-activity.js';
 import { handleStoragePressureAlert } from './storage-pressure-alert.js';
 import { MemoryAdmissionController, type MemoryAdmissionPriority } from './memory-admission.js';
+import { effectiveMcpServers } from './fleet-mcp-servers.js';
 import type { AgentGroup, Session } from './types.js';
 
 export const DATAFOLD_MCP_SERVER = {
@@ -206,10 +207,27 @@ export const DATAFOLD_MCP_SERVER = {
   headers: { Authorization: 'Key onecli-managed' },
 } as const satisfies McpServerConfig;
 
+/**
+ * Host-only fields on a stored MCP entry: they exist for the capability
+ * snapshot and never for the provider. The container's map is built straight
+ * from this JSON (`container/agent-runner/src/index.ts:246`), whose
+ * `McpServerConfig` knows `instructions` but neither of these
+ * (`container/agent-runner/src/providers/types.ts:231`), so they are dropped
+ * at the boundary rather than handed to three providers' config translators.
+ */
+const HOST_ONLY_MCP_FIELDS = ['displayName', 'description'] as const;
+
 export function serializeMcpServersEnv(servers: Record<string, unknown>): string | null {
   const validated = validateMcpServers(servers as Record<string, McpServerConfig>);
   if (Object.keys(validated).length === 0) return null;
-  return `NANOCLAW_MCP_SERVERS=${JSON.stringify(validated)}`;
+  const forContainer = Object.fromEntries(
+    Object.entries(validated).map(([name, server]) => {
+      const copy = { ...(server as unknown as Record<string, unknown>) };
+      for (const field of HOST_ONLY_MCP_FIELDS) delete copy[field];
+      return [name, copy];
+    }),
+  );
+  return `NANOCLAW_MCP_SERVERS=${JSON.stringify(forContainer)}`;
 }
 
 /** Docker environment for an agent's explicit Git identity. */
@@ -7357,62 +7375,20 @@ async function buildContainerArgs(
     }
   }
 
-  // Assemble additional MCP servers: container.json's mcpServers (stdio
-  // subprocesses the group declares) plus universal HTTP/stdio MCPs
-  // (granola, deepwiki, context7, exa, pocket) injected when the relevant
-  // key is present on the host. Per-group mcpServers from container.json
-  // merged on top so groups can override. Use excludeMcpServers in
-  // container.json to opt OUT of specific universals per-group.
+  // Assemble additional MCP servers: the group's own container.json entries
+  // plus the fleet defaults it neither declares itself nor lists in
+  // `excludeMcpServers` — `effectiveMcpServers` (src/fleet-mcp-servers.ts) is
+  // the one implementation of that merge, and `src/capabilities.ts` describes
+  // exactly what it returns. Adding a tool for every group is an edit to
+  // `data/fleet-mcp-servers.json` (`ncl groups config add-mcp-server --fleet`),
+  // not an edit here.
   //
-  // Granola is a local stdio wrapper around the Granola REST API — replaces
-  // the hosted mcp.granola.ai/mcp endpoint (OAuth-only, tokens expired every
-  // few hours) with a static-key REST client auto-authed by OneCLI.
-  const mcpServers: Record<string, unknown> = { ...(containerConfig.mcpServers ?? {}) };
+  // What remains below is the set this file still has to build itself: servers
+  // gated on `tools` AND on scoped host credentials this function resolves.
+  const mcpServers: Record<string, unknown> = effectiveMcpServers(containerConfig);
   const mcpExcluded = new Set(containerConfig.excludeMcpServers ?? []);
   const canInject = (name: string): boolean => !mcpExcluded.has(name) && !mcpServers[name];
 
-  if (canInject('granola')) {
-    // Local stdio MCP wrapping Granola's REST API. Replaces the hosted
-    // mcp.granola.ai/mcp endpoint whose OAuth session tokens expired silently
-    // every few hours and left agents stuck on "Session expired. Please sign
-    // in again." OneCLI injects the static `grn_*` bearer token at the HTTPS
-    // proxy based on the `public-api.granola.ai` host pattern — see the
-    // `GranolaAPI` vault secret. No refresh worker needed.
-    mcpServers.granola = {
-      type: 'stdio',
-      command: 'bun',
-      args: ['/app/src/granola-mcp-server.ts'],
-    };
-  }
-  if (canInject('deepwiki')) {
-    mcpServers.deepwiki = { type: 'http', url: 'https://mcp.deepwiki.com/mcp' };
-  }
-  if (canInject('context7')) {
-    mcpServers.context7 = {
-      type: 'stdio',
-      command: 'npx',
-      args: ['-y', '@upstash/context7-mcp'],
-      env: {},
-    };
-  }
-  if (canInject('exa')) {
-    // Auth header injected by the OneCLI gateway proxy at request time
-    // (vault entry "Exa-MCP" → mcp.exa.ai).
-    mcpServers.exa = {
-      type: 'http',
-      url: 'https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa,agent_run',
-    };
-  }
-  if (canInject('pocket')) {
-    // Auth header injected by the OneCLI gateway proxy at request time
-    // (vault entry "Pocket" → public.heypocketai.com). Universal — the
-    // operator's physical meeting-recorder device, available to every group
-    // by default.
-    mcpServers.pocket = {
-      type: 'http',
-      url: 'https://public.heypocketai.com/mcp',
-    };
-  }
   if (canInject('linear') && isToolEnabled(containerConfig.tools, 'linear')) {
     // Auth header injected by the OneCLI gateway proxy at request time
     // (vault entry "Linear" → mcp.linear.app). Linear's hosted MCP accepts
