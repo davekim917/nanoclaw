@@ -199,6 +199,33 @@ describe('discoverAuthorization', () => {
     );
   });
 
+  // Round-1 review F2: metadata is fetched from the network, so an `http:`
+  // endpoint in it would put the authorization code, the client secret and the
+  // refresh token on the wire in cleartext.
+  it.each([
+    ['authorization_endpoint', { authorization_endpoint: 'http://as.x.test/auth' }],
+    ['token_endpoint', { token_endpoint: 'http://as.x.test/tok' }],
+    ['registration_endpoint', { registration_endpoint: 'http://as.x.test/reg' }],
+    ['device_authorization_endpoint', { device_authorization_endpoint: 'http://as.x.test/da' }],
+  ])('refuses a cleartext %s rather than sending credentials over it', async (label, override) => {
+    const fetchImpl = routed({
+      'https://mcp.x.test/mcp': json({}, 401),
+      'https://mcp.x.test/.well-known/oauth-protected-resource': json({
+        authorization_servers: ['https://as.x.test'],
+      }),
+      'https://as.x.test/.well-known/oauth-authorization-server': json({
+        issuer: 'https://as.x.test',
+        authorization_endpoint: 'https://as.x.test/auth',
+        token_endpoint: 'https://as.x.test/tok',
+        registration_endpoint: 'https://as.x.test/reg',
+        ...override,
+      }),
+    });
+    await expect(discoverAuthorization(fetchImpl, 'https://mcp.x.test/mcp')).rejects.toThrow(
+      new RegExp(`${label} must be https`),
+    );
+  });
+
   it('demands an issuer when the resource metadata lists none', async () => {
     const fetchImpl = routed({
       'https://mcp.x.test/mcp': json({}, 401),

@@ -26,6 +26,12 @@
  * subpaths under it are (`src/container-runner.ts:4443,4456,4485,4875,4972`),
  * and `mcp-oauth/` is not one of them.
  *
+ * WHAT IS NOT HERE: the ACCESS token. The exception this file represents is
+ * narrow — the credentials needed to MINT the next bearer, and nothing else. The
+ * bearer itself lives only in OneCLI, where the gateway injects it, so a read of
+ * this directory yields the means to ask for a token and never a token that
+ * works right now.
+ *
  * Mode 0700 on the directory and 0600 on each file, written through a
  * same-directory temp file and `rename` so a crash mid-write cannot leave a
  * truncated bundle where a valid one was.
@@ -49,10 +55,11 @@ export interface McpOAuthBundle {
   };
   refreshToken?: string;
   /**
-   * Kept so a re-`login` can revoke, and so `ncl integrations remove` can tell
-   * "there was a live grant" from "nothing was ever exchanged". Never logged.
+   * Set when the authorization server rejected this registration
+   * (`invalid_client` / `unauthorized_client`). A rejected client id is not
+   * reusable, so the next `login` must register a new one rather than replay it.
    */
-  accessToken?: string;
+  clientRejectedAt?: string;
   scopes?: string;
   updatedAt: string;
 }

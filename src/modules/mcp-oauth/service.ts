@@ -53,6 +53,7 @@ import {
   buildAuthorizeUrl,
   exchangeAuthorizationCode,
   isUnrecoverableGrantError,
+  OAuthTokenError,
   parseRedirectResponse,
   refreshAccessToken,
   registerClient,
@@ -200,20 +201,38 @@ export async function startLogin(input: LoginInput, fetchImpl: FetchLike = fetch
   }
 
   const existingRow = await getMcpOAuthIntegration(input.name);
-  // A re-login keeps the redirect URI the client was REGISTERED with unless the
-  // operator names a new one: the authorization server stored that exact string
-  // at registration and rejects an exchange that does not match it, so silently
-  // following a changed --port would break the very login it was meant to help.
-  const redirectUri = input.redirectUri ?? existingRow?.redirect_uri ?? defaultRedirectUri(input.port);
+  // A re-login keeps the redirect URI the client was REGISTERED with, because
+  // the authorization server stored that exact string and rejects an exchange
+  // that does not match it. An explicit `--redirect-uri` or `--port` overrides
+  // that — the operator is naming a new binding, and the reuse check below turns
+  // the mismatch into a re-registration rather than an exchange that would fail.
+  const redirectUri =
+    input.redirectUri ??
+    (input.port !== undefined ? defaultRedirectUri(input.port) : (existingRow?.redirect_uri ?? defaultRedirectUri()));
   const scopes = input.scopes ?? discovered.scopesSupported.join(' ');
 
-  // A re-login reuses the client already registered for this name. Re-running
+  // A re-login reuses the client already registered for this name — re-running
   // dynamic registration would mint a second client at the provider on every
-  // retry — providers do not garbage-collect those, and the operator would be
-  // the one to notice.
+  // retry, and providers do not garbage-collect those. But a registration is
+  // only reusable while the three things it was bound to still hold:
+  //
+  //   - the authorization server is the same one (a client id is issued BY an
+  //     issuer and means nothing at another);
+  //   - the redirect URI is the same string (the AS stored it at registration
+  //     and rejects an exchange that does not match), which is why an explicit
+  //     --redirect-uri or --port is a re-registration and not a silent mismatch;
+  //   - the AS has not since rejected it (`invalid_client` /
+  //     `unauthorized_client`, recorded by the refresher). Replaying a rejected
+  //     client id is precisely the case where "just run login again" would look
+  //     like it worked and fail at the exchange.
   const previous = readMcpOAuthBundle(input.name);
-  let clientId = previous?.clientId;
-  let clientSecret = previous?.clientSecret;
+  const reusable =
+    previous?.clientId &&
+    !previous.clientRejectedAt &&
+    (!existingRow?.issuer || existingRow.issuer === discovered.issuer) &&
+    (!existingRow?.redirect_uri || existingRow.redirect_uri === redirectUri);
+  let clientId = reusable ? previous?.clientId : undefined;
+  let clientSecret = reusable ? previous?.clientSecret : undefined;
   let registered: 'dynamic' | 'reused' = 'reused';
   if (!clientId) {
     if (!discovered.registrationEndpoint) {
@@ -241,10 +260,13 @@ export async function startLogin(input: LoginInput, fetchImpl: FetchLike = fetch
     name: input.name,
     clientId,
     clientSecret,
+    // A newly registered client has never been rejected; a reused one still
+    // carries whatever the refresher recorded, which is nothing (it would not
+    // have been reusable otherwise).
+    clientRejectedAt: undefined,
     // A re-login keeps the old refresh token until the new code is exchanged:
     // an abandoned login must not take a working integration down with it.
-    refreshToken: previous?.refreshToken,
-    accessToken: previous?.accessToken,
+    refreshToken: reusable ? previous?.refreshToken : undefined,
     scopes: scopes || undefined,
     pending: { state, codeVerifier: pkce.verifier, startedAt: new Date().toISOString() },
     updatedAt: new Date().toISOString(),
@@ -375,7 +397,7 @@ export async function startLogin(input: LoginInput, fetchImpl: FetchLike = fetch
           redirectUri: row.redirect_uri,
           resource: row.resource ?? undefined,
         });
-        await finalizeToken(row, bundle, token);
+        await finalizeToken(row, bundle, token, { newGrant: true });
       })
       .catch((err: unknown) => {
         // Includes the ordinary "nobody used the tunnel" timeout. Never fatal:
@@ -400,7 +422,7 @@ async function finishInBackground(name: string, token: TokenResponse): Promise<v
   const row = await getMcpOAuthIntegration(name);
   const bundle = readMcpOAuthBundle(name);
   if (!row || !bundle) return;
-  await finalizeToken(row, bundle, token);
+  await finalizeToken(row, bundle, token, { newGrant: true });
 }
 
 export interface CompleteResult {
@@ -416,39 +438,72 @@ export interface CompleteResult {
 /**
  * Everything that happens once a token is in hand, whichever of the three
  * flows produced it. Shared so the paste, loopback and device paths cannot
- * drift in what they leave behind — the bearer in OneCLI, the refresh token on
- * disk, the row, and the group's declaration.
+ * drift in what they leave behind — the refresh token on disk, the bearer in
+ * OneCLI, the row, and the group's declaration.
+ *
+ * ORDER IS LOAD-BEARING. The bundle is written BEFORE the OneCLI call, because
+ * the OneCLI call is the fallible one (a gateway that is down, a secret that was
+ * deleted underneath us) and a server that ROTATED its refresh token has already
+ * invalidated the old one by the time it answered. Writing OneCLI first and
+ * crashing would leave a dead token on disk and force a human login for a grant
+ * that is actually alive. The reverse failure is recoverable: fresh credentials
+ * on disk and a stale bearer in OneCLI, which the next refresh fixes by itself.
+ *
+ * `newGrant` distinguishes the two callers, and it is not cosmetic. On a REFRESH,
+ * RFC 6749 §6 lets the server omit `refresh_token` to mean "keep using the one
+ * you have", so falling back is required. On a NEW authorization-code grant an
+ * absent refresh token means the grant has none — falling back would resurrect
+ * the token that was just replaced (after an `invalid_grant` re-login, the dead
+ * one), report `hasRefreshToken: true`, mark the row active, and send the very
+ * next refresh straight back to `needs_login`.
  */
 async function finalizeToken(
   row: McpOAuthIntegration,
   bundle: McpOAuthBundle,
   token: TokenResponse,
+  options: { newGrant: boolean },
 ): Promise<CompleteResult> {
   const nowMs = Date.now();
-  const secret = await putOnecliBearerSecret(
-    {
-      name: row.bearer_secret_name,
-      hostPattern: row.host_pattern,
-      pathPattern: row.path_pattern,
-      headerName: 'Authorization',
-      valueFormat: `${token.tokenType || 'Bearer'} {value}`,
-    },
-    token.accessToken,
-  );
+  const refreshToken = options.newGrant ? token.refreshToken : (token.refreshToken ?? bundle.refreshToken);
 
   writeMcpOAuthBundle({
     ...bundle,
-    // A server that issues no refresh token on the exchange leaves the previous
-    // one in place rather than wiping it: for a re-login that is still the live
-    // grant, and for a first login there was nothing to lose.
-    refreshToken: token.refreshToken ?? bundle.refreshToken,
-    accessToken: token.accessToken,
+    refreshToken,
+    // A grant that succeeded clears any earlier rejection: this client id was
+    // just accepted by the authorization server.
+    clientRejectedAt: undefined,
     scopes: token.scope ?? bundle.scopes,
     pending: undefined,
     updatedAt: new Date().toISOString(),
   });
 
-  const hasRefreshToken = Boolean(token.refreshToken ?? bundle.refreshToken);
+  let secret;
+  try {
+    secret = await putOnecliBearerSecret(
+      {
+        name: row.bearer_secret_name,
+        hostPattern: row.host_pattern,
+        pathPattern: row.path_pattern,
+        headerName: 'Authorization',
+        valueFormat: `${token.tokenType || 'Bearer'} {value}`,
+      },
+      token.accessToken,
+    );
+  } catch (err) {
+    // The credentials are safe on disk; only the bearer failed to land. Park the
+    // row where the refresher will pick it up — `decideRefresh` retries `error`
+    // rows that carry an expiry, so the next sweep mints a fresh access token and
+    // writes the secret again, with no human involved.
+    await markMcpOAuthIntegration(row.name, {
+      status: 'error',
+      status_detail: `token minted but the OneCLI secret write failed: ${err instanceof Error ? err.message : String(err)}`,
+      expires_at: expiryFrom(token, nowMs),
+      last_refresh_at: new Date(nowMs).toISOString(),
+    });
+    throw err;
+  }
+
+  const hasRefreshToken = Boolean(refreshToken);
   await markMcpOAuthIntegration(row.name, {
     status: 'active',
     status_detail: hasRefreshToken
@@ -537,7 +592,7 @@ export async function completeLogin(
     resource: row.resource ?? undefined,
   });
 
-  return finalizeToken(row, bundle, token);
+  return finalizeToken(row, bundle, token, { newGrant: true });
 }
 
 /**
@@ -663,6 +718,22 @@ export async function refreshExpiringMcpOAuthIntegrations(fetchImpl: FetchLike =
         resource: row.resource ?? undefined,
       });
 
+      // Refresh-token ROTATION lands on disk FIRST, before the fallible OneCLI
+      // write. A server that returned a new refresh token has already
+      // invalidated the old one, so a crash after the secret write but before
+      // this one would leave a dead token on disk and turn a live grant into a
+      // forced human login. Ordered the other way round, the worst case is a
+      // fresh token on disk beside a stale bearer, which the next tick fixes.
+      // RFC 6749 §6 permits an omitted `refresh_token` on a refresh response and
+      // it means "keep the one you have" — which is why the fallback is correct
+      // HERE and wrong in `finalizeToken`'s new-grant path.
+      writeMcpOAuthBundle({
+        ...bundle,
+        refreshToken: token.refreshToken ?? bundle.refreshToken,
+        scopes: token.scope ?? bundle.scopes,
+        updatedAt: new Date().toISOString(),
+      });
+
       const secret = await putOnecliBearerSecret(
         {
           name: row.bearer_secret_name,
@@ -673,19 +744,6 @@ export async function refreshExpiringMcpOAuthIntegrations(fetchImpl: FetchLike =
         },
         token.accessToken,
       );
-
-      // Refresh-token ROTATION: a server that returns a new refresh token has
-      // invalidated the old one, so the store has to move before the next tick
-      // or the integration locks itself out. Written before the DB row for the
-      // same reason — a crash between the two leaves a usable token on disk and
-      // a stale expiry, which the next tick fixes, rather than the reverse.
-      writeMcpOAuthBundle({
-        ...bundle,
-        refreshToken: token.refreshToken ?? bundle.refreshToken,
-        accessToken: token.accessToken,
-        scopes: token.scope ?? bundle.scopes,
-        updatedAt: new Date().toISOString(),
-      });
 
       await markMcpOAuthIntegration(row.name, {
         status: 'active',
@@ -703,6 +761,14 @@ export async function refreshExpiringMcpOAuthIntegrations(fetchImpl: FetchLike =
       });
     } catch (err) {
       if (isUnrecoverableGrantError(err)) {
+        // `invalid_client` / `unauthorized_client` condemn the REGISTRATION, not
+        // just the grant. Recording that is what makes the "run login again"
+        // advice true: without it the next login finds a stored clientId, skips
+        // dynamic registration, and replays the credentials the server just
+        // refused.
+        if (err instanceof OAuthTokenError && err.code !== 'invalid_grant') {
+          writeMcpOAuthBundle({ ...bundle, clientRejectedAt: new Date().toISOString() });
+        }
         await markMcpOAuthIntegration(row.name, {
           status: 'needs_login',
           status_detail: `token endpoint rejected the grant: ${err instanceof Error ? err.message : String(err)}`,

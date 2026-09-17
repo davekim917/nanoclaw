@@ -42,8 +42,10 @@ vi.mock('../../log.js', () => ({
 }));
 
 const secretWrites: { name: string; value: string }[] = [];
+let secretWriteFails = false;
 vi.mock('./onecli-secret-writer.js', () => ({
   putOnecliBearerSecret: async (spec: { name: string }, value: string) => {
+    if (secretWriteFails) throw new Error('gateway unreachable');
     secretWrites.push({ name: spec.name, value });
     return { id: 'secret-uuid-1', name: spec.name };
   },
@@ -111,6 +113,7 @@ function tokenResponse(body: unknown, status = 200): Response {
 beforeEach(async () => {
   await initMigratedTestDb();
   secretWrites.length = 0;
+  secretWriteFails = false;
   logged.warn.length = 0;
   logged.info.length = 0;
   _resetMcpOAuthWarnStateForTesting();
@@ -186,7 +189,6 @@ describe('refreshExpiringMcpOAuthIntegrations', () => {
       name: r.name,
       clientId: 'client-1',
       refreshToken: refreshToken ?? undefined,
-      accessToken: 'at-old',
       scopes: r.scopes ?? undefined,
       updatedAt: new Date().toISOString(),
     });
@@ -282,6 +284,50 @@ describe('refreshExpiringMcpOAuthIntegrations', () => {
     // Rows are listed name-ascending, so `a-mr` takes the 503 and `b-mr` still runs.
     expect(outcome.failed).toEqual(['a-mr']);
     expect(outcome.refreshed).toEqual(['b-mr']);
+  });
+
+  // Round-1 review F1: the OneCLI write is the fallible step, and a server that
+  // rotated its refresh token has already killed the old one. Writing OneCLI
+  // first and crashing would leave a dead token on disk.
+  it('persists a rotated refresh token even when the OneCLI write then fails', async () => {
+    await seed();
+    secretWriteFails = true;
+
+    const outcome = await refreshExpiringMcpOAuthIntegrations(async () =>
+      tokenResponse({ access_token: 'at-new', refresh_token: 'rt-new', expires_in: 3600, token_type: 'Bearer' }),
+    );
+
+    expect(outcome.failed).toEqual(['dropbox-files']);
+    // The token that is now the only working one survived the failure.
+    expect(readMcpOAuthBundle('dropbox-files')!.refreshToken).toBe('rt-new');
+  });
+
+  // Round-1 review F5: the host-side exception covers the credentials needed to
+  // MINT a bearer, not a live bearer.
+  it('never writes an access token into the host bundle', async () => {
+    await seed();
+    await refreshExpiringMcpOAuthIntegrations(async () =>
+      tokenResponse({ access_token: 'at-new-secret-value', expires_in: 3600, token_type: 'Bearer' }),
+    );
+    const raw = fs.readFileSync(path.join(tmpRoot, 'mcp-oauth', 'dropbox-files.json'), 'utf-8');
+    expect(raw).not.toContain('at-new-secret-value');
+    expect(Object.keys(JSON.parse(raw) as object)).not.toContain('accessToken');
+  });
+
+  // Round-1 review F3: `invalid_client` condemns the REGISTRATION, so the next
+  // login has to register again instead of replaying the refused client id.
+  it('records a rejected client id, and leaves a plain invalid_grant unmarked', async () => {
+    await seed();
+    await refreshExpiringMcpOAuthIntegrations(async () => tokenResponse({ error: 'invalid_client' }, 401));
+    expect(readMcpOAuthBundle('dropbox-files')!.clientRejectedAt).toBeTruthy();
+
+    await initMigratedTestDb();
+    _resetMcpOAuthWarnStateForTesting();
+    await seed({ name: 'other-int', mcp_url: 'https://other.test/mcp' });
+    await refreshExpiringMcpOAuthIntegrations(async () => tokenResponse({ error: 'invalid_grant' }, 400));
+    // The grant is dead but the client is fine — re-registering would mint an
+    // orphan at the provider for nothing.
+    expect(readMcpOAuthBundle('other-int')!.clientRejectedAt).toBeUndefined();
   });
 
   it('bundle files are 0600 inside a 0700 directory', async () => {

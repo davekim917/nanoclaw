@@ -26,7 +26,7 @@ bridge died with `CONNECTION_CLOSED` on every spawn, until a human noticed and p
 | Thing | Where | Why there |
 |---|---|---|
 | Access token (the bearer) | OneCLI secret, injected at the proxy | The container never sees a credential; this is the existing model |
-| Refresh token, client id/secret | `data/mcp-oauth/<name>.json`, mode 0600 in a 0700 directory | OneCLI's API is **write-only** for secret values (see below), so a refresh token parked there could never be read back |
+| Refresh token, client id/secret | `data/mcp-oauth/<name>.json`, mode 0600 in a 0700 directory | OneCLI's API is **write-only** for secret values (see below), so a refresh token parked there could never be read back. The **access token is not here** — the exception covers what mints the next bearer, never a bearer that works right now |
 | Endpoints, scopes, secret name, expiry, status | `mcp_oauth_integrations` (migration 082) | Metadata only — no token material, so `ncl integrations list` is safe to read and to share |
 
 **Why the refresh token is not in OneCLI.** Verified against the live gateway on 2026-09-17,
@@ -79,6 +79,10 @@ With the tunnel up, approving in the browser completes the login by itself; conf
 costs nothing. `--port <n>` moves both the redirect URI and the listener together (they must match).
 `--listen-timeout <seconds>` defaults to 600. If the port will not bind, the command says so and you
 paste instead.
+
+Passing `--port` (or `--redirect-uri`) on a **re**-login changes the binding the authorization server
+stored at registration, so the next `login` registers a new client rather than replaying one the
+server would reject at the exchange. Leave both off and the re-login reuses the existing client.
 
 ### 3. `--device` (optional, only where the server publishes it)
 
@@ -134,6 +138,17 @@ ncl groups restart --id <agent-group-id>
 An already-running container does not need a restart for a later *refresh* — the gateway injects the
 new value on the next request.
 
+## What it refuses
+
+- **A cleartext endpoint.** Every discovered or overridden `authorization_endpoint`,
+  `token_endpoint`, `registration_endpoint` and `device_authorization_endpoint` must be `https`
+  (RFC 8414 §2). Metadata arrives over the network, so an `http:` endpoint in it would put the
+  authorization code, the client secret and the refresh token on the wire in the clear. There is no
+  loopback exemption: the only loopback URL in this flow is the redirect, which the browser resolves
+  and this host never calls.
+- **A `plain` PKCE downgrade.** S256 or nothing, even where a server still advertises `plain`.
+- **A path-traversing integration name.** Names are `[a-z0-9-]`, because a name is a file name.
+
 ## Staying fresh
 
 `mcp-oauth-refresh` (FORK4) runs in the 60-second host sweep, `tick:housekeeping` order 27, right
@@ -143,7 +158,13 @@ new access token, PATCHed over the same OneCLI secret.
 - **Refresh-token rotation** is persisted before the row is updated, so a server that reissues one on
   every refresh cannot lock the integration out.
 - **`invalid_grant` / `invalid_client` / `unauthorized_client`** move the row to `needs_login`, log
-  one WARN, and stop retrying. Only a fresh `login` clears it.
+  one WARN, and stop retrying. Only a fresh `login` clears it. The last two also condemn the
+  *registration*, which is recorded on the bundle so the next `login` registers a new client instead
+  of replaying the one the server just refused.
+- **A rotated refresh token reaches disk before the OneCLI write**, which is the fallible step. A
+  server that reissued one has already killed the old one, so the other order would turn a live grant
+  into a forced human login on any gateway hiccup. The reverse failure — fresh credentials on disk, a
+  stale bearer in OneCLI — parks the row in `error` and the next tick fixes it.
 - **Anything else** leaves the row in `error` with the old bearer untouched, and the next tick
   retries.
 - **No `expires_in`** from the server falls back to refreshing every 12 hours.

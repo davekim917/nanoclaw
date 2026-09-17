@@ -109,6 +109,31 @@ export function authorizationServerMetadataUrls(issuer: string): string[] {
   return [...new Set(candidates)];
 }
 
+/**
+ * Every endpoint this module hands onward must be HTTPS.
+ *
+ * Discovery reads its endpoints out of a document fetched from the network, so
+ * an attacker who can answer for the metadata host — or an operator who
+ * mistypes `--issuer` — can name an `http:` token, registration or authorization
+ * endpoint, and the authorization code, the client secret and the refresh token
+ * would then cross the wire in cleartext. RFC 8414 §2 requires https for all of
+ * them; nothing here accepts less. There is deliberately no loopback exemption:
+ * the only loopback URL in this flow is the REDIRECT, which is a URI the browser
+ * resolves and this host never calls.
+ */
+export function assertHttpsEndpoint(label: string, url: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`${label} is not a valid URL: ${url}`);
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new Error(`${label} must be https, got ${parsed.protocol}//… — refusing to send credentials in cleartext.`);
+  }
+  return url;
+}
+
 async function getJson<T>(fetchImpl: FetchLike, url: string): Promise<T> {
   const res = await fetchImpl(url, {
     method: 'GET',
@@ -221,10 +246,14 @@ export async function discoverAuthorization(
   return {
     resource: resourceDoc.metadata.resource,
     issuer: asDoc.metadata.issuer ?? issuer,
-    authorizationEndpoint: asDoc.metadata.authorization_endpoint!,
-    tokenEndpoint: asDoc.metadata.token_endpoint!,
-    registrationEndpoint: asDoc.metadata.registration_endpoint,
-    deviceAuthorizationEndpoint: asDoc.metadata.device_authorization_endpoint,
+    authorizationEndpoint: assertHttpsEndpoint('authorization_endpoint', asDoc.metadata.authorization_endpoint!),
+    tokenEndpoint: assertHttpsEndpoint('token_endpoint', asDoc.metadata.token_endpoint!),
+    registrationEndpoint: asDoc.metadata.registration_endpoint
+      ? assertHttpsEndpoint('registration_endpoint', asDoc.metadata.registration_endpoint)
+      : undefined,
+    deviceAuthorizationEndpoint: asDoc.metadata.device_authorization_endpoint
+      ? assertHttpsEndpoint('device_authorization_endpoint', asDoc.metadata.device_authorization_endpoint)
+      : undefined,
     grantTypesSupported: asDoc.metadata.grant_types_supported ?? [],
     // The resource's own list wins: it is the subset that means anything at
     // THIS endpoint. Dropbox's AS advertises 39 scopes, of which its MCP
