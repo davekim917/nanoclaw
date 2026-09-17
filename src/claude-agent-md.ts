@@ -53,11 +53,13 @@
  * string is that impl's only hard error; `parseClaudeAgentMd` already folds a
  * blank `effort:` to absent, and the emitter re-checks before writing.
  *
- * Without this key a role runs at the GLOBAL
- * `[agents].default_subagent_reasoning_effort` (`src/providers/codex.ts`) — how
- * all five `worker-{low,medium,high,xhigh,max}` shims came to run at `high`
- * while each description, a routing signal Codex's orchestrator reads,
- * advertised a different level.
+ * Without this key a role runs at Codex's native subagent default (the
+ * generated container config sets no `[agents].default_subagent_reasoning_effort`
+ * since 2026-09-17, matching the host) — and before that it ran at the global
+ * `"high"` the config used to carry, which is how all five
+ * `worker-{low,medium,high,xhigh,max}` shims came to run at `high` while each
+ * description, a routing signal Codex's orchestrator reads, advertised a
+ * different level.
  *
  * Two consequences of writing it, both intended, neither obvious:
  *

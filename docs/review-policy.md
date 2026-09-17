@@ -80,11 +80,12 @@ they are independent of each other:
   `scripts/reviewer-models-freshness.test.ts` fails if you skip the regen, and
   `assertConcreteModelId` refuses an alias, so the allowlist can never come to
   mean "whatever the runtime defaults to today".
-- **What a Codex subagent runs at.** The GLOBAL
-  `[agents].default_subagent_reasoning_effort` in the generated container
-  config, written identically by `src/providers/codex.ts` and
-  `container/agent-runner/src/codex-companion-setup.ts`. A native spawn's own
-  `reasoning_effort` overrides it per task.
+- **What a Codex subagent runs at.** Codex's native default: the generated
+  container config (written identically by `src/providers/codex.ts` and
+  `container/agent-runner/src/codex-companion-setup.ts`) sets no
+  `[agents].default_subagent_reasoning_effort`, matching the operator's host
+  config. A native spawn's own `reasoning_effort`, or a role's
+  `model_reasoning_effort`, sets it per task.
   `src/providers/codex.container-config.test.ts` and
   `container/agent-runner/src/codex-companion-setup.test.ts` assert the
   rendered line verbatim — deliberately literals, not a shared constant read

@@ -142,7 +142,9 @@ describe('codex provider container-config: agents/ mount', () => {
       expect(written).toContain('fast_mode = false');
       expect(written).toContain('multi_agent = true');
       expect(written).toContain('[agents]');
-      expect(written).toContain('default_subagent_reasoning_effort = "high"');
+      // Operator, 2026-09-17: no global subagent effort — Codex's native
+      // default unless the spawn or the role names one (matches the host config).
+      expect(written).not.toContain('default_subagent_reasoning_effort');
       expect(written).toContain('max_concurrent_threads_per_session = 4');
       expect(written).not.toContain('multi_agent_v2');
       expect(written).not.toContain('remote_control');
