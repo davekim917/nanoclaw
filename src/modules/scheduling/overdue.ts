@@ -44,26 +44,35 @@ import { parseSqliteUtc, sqliteUtcToIso } from '../mailbox/sqlite-utc.js';
 export const TASK_OVERDUE_ALERT_MS = 60 * 60 * 1000;
 
 /**
- * Floor between two alerts from this process. A fleet-wide cause (the host
- * cannot spawn at all) makes every session with a schedule overdue in the same
- * tick; the first DM says so and the rest arrive one per window instead of as a
- * burst. Un-sent alerts stay armed — nothing is stamped for them.
+ * Floor between two alert ATTEMPTS from this process — delivered or not.
+ *
+ * A fleet-wide cause (the host cannot spawn at all) makes every session with a
+ * schedule overdue in the same tick; the first DM says so and the rest arrive
+ * one per window instead of as a burst.
+ *
+ * It advances on a FAILED attempt too, deliberately. A failed attempt can cost
+ * the sweep up to `OPERATOR_ALERT_DEADLINE_MS` (src/operator-alert.ts), and if
+ * nobody is reachable, not advancing would have every overdue session spend
+ * that again on every tick. Holding the other alerts back costs nothing: they
+ * go to the same recipients, who were just shown to be unreachable. This gap
+ * decides only WHEN the next attempt happens; whether an occurrence still owes
+ * an alert is the `alerted` set's business, and a failed attempt leaves it owing.
  */
-export const TASK_OVERDUE_ALERT_MIN_GAP_MS = 5 * 60 * 1000;
+export const TASK_OVERDUE_ATTEMPT_MIN_GAP_MS = 5 * 60 * 1000;
 
-// One alert per occurrence per host process. In memory on purpose: a host
+// One DELIVERED alert per occurrence per host process. In memory on purpose: a host
 // restart clears it together with `process.uptime()` below, so a still-stuck
 // occurrence alerts again only after another full TASK_OVERDUE_ALERT_MS of
 // THIS host watching it — a repeat that is news, not spam. An occurrence id is
 // never reused (`task-<ms>-<rand>`, recurrence.ts), so an entry is only ever
 // stale, never wrong; stale ones are dropped per session below.
 const alerted = new Map<string, Set<string>>();
-let lastAlertAtMs = 0;
+let lastAttemptAtMs = 0;
 
-/** Test-only: forget every alert and the rate floor. */
+/** Test-only: forget every delivered alert and the attempt gap. */
 export function _resetOverdueAlertsForTesting(): void {
   alerted.clear();
-  lastAlertAtMs = 0;
+  lastAttemptAtMs = 0;
 }
 
 /**
@@ -116,7 +125,7 @@ export async function escalateOverdueOccurrences(
 
   for (const row of overdue) {
     if (seen?.has(row.id)) continue;
-    if (nowMs - lastAlertAtMs < TASK_OVERDUE_ALERT_MIN_GAP_MS) return;
+    if (nowMs - lastAttemptAtMs < TASK_OVERDUE_ATTEMPT_MIN_GAP_MS) return;
 
     const seriesId = row.seriesId ?? row.id;
     const group = await getAgentGroup(session.agent_group_id);
@@ -131,10 +140,13 @@ export async function escalateOverdueOccurrences(
       containerRunning,
     });
 
-    // Stamped only on a delivery that reached someone — same rule, and same
-    // reason, as task-failure-escalation (src/modules/sweep-task-escalation/index.ts:152-155).
-    lastAlertAtMs = nowMs;
+    // The attempt gap advances whatever happens next (see the constant).
+    lastAttemptAtMs = nowMs;
     const context = { source: 'task-overdue', seriesId, occurrenceId: row.id, sessionId: session.id };
+    // The OCCURRENCE is stamped only on a delivery that reached someone — same
+    // rule, and same reason, as task-failure-escalation
+    // (src/modules/sweep-task-escalation/index.ts:152-155). A failed attempt
+    // leaves it owing, to be retried once the attempt gap has passed.
     if (await notifyOperators(text, context)) {
       const stamped = alerted.get(session.id) ?? new Set<string>();
       stamped.add(row.id);

@@ -567,6 +567,15 @@ describe('S2-PR11 scheduling + thread-close', () => {
     expect(calls.updates).toEqual([{ id: 'sess-task', patch: { status: 'closed' } }]);
   });
 
+  it('an operator alert cannot outlast a sweep tick: its deadline sits far below the stall ceiling', async () => {
+    // operator-alert.ts states the relation as a literal (importing host-sweep
+    // there would close a cycle through container-runner); this is the pin.
+    const { OPERATOR_ALERT_DEADLINE_MS, OPERATOR_ALERT_STEP_TIMEOUT_MS } = await import('../../operator-alert.js');
+    const { SWEEP_TICK_STALL_MS } = await import('../../host-sweep.js');
+    expect(OPERATOR_ALERT_DEADLINE_MS * 10).toBeLessThanOrEqual(SWEEP_TICK_STALL_MS);
+    expect(OPERATOR_ALERT_STEP_TIMEOUT_MS).toBeLessThan(OPERATOR_ALERT_DEADLINE_MS);
+  });
+
   it('S18 runs the overdue-occurrence observer with the window session, and survives its throw', async () => {
     const db = freshInbound();
     insertTaskRow(db, {

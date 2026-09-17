@@ -28,7 +28,7 @@ vi.mock('../../container-config.js', async (importOriginal) => ({
 }));
 
 import {
-  TASK_OVERDUE_ALERT_MIN_GAP_MS,
+  TASK_OVERDUE_ATTEMPT_MIN_GAP_MS,
   TASK_OVERDUE_ALERT_MS,
   _resetOverdueAlertsForTesting,
   escalateOverdueOccurrences,
@@ -162,20 +162,33 @@ describe('escalateOverdueOccurrences', () => {
     expect(notify.calls).toEqual([]);
   });
 
-  it('leaves the alert armed when nobody was reached', async () => {
+  it('a failed delivery leaves the occurrence owing, and is not re-attempted inside the gap', async () => {
     const { inDb, mailbox } = makeSession();
     seed(inDb, 'task-wedged', 90 * MIN);
 
     notify.delivered = false;
     await escalateOverdueOccurrences(mailbox, session, true, NOW, UP_LONG);
-    notify.delivered = true;
-    await escalateOverdueOccurrences(mailbox, session, true, NOW + TASK_OVERDUE_ALERT_MIN_GAP_MS, UP_LONG);
-    await escalateOverdueOccurrences(mailbox, session, true, NOW + 2 * TASK_OVERDUE_ALERT_MIN_GAP_MS, UP_LONG);
+    expect(notify.calls).toHaveLength(1);
 
-    expect(notify.calls).toHaveLength(2);
+    // Inside the gap: every sweep tick comes back here, and none may spend
+    // another delivery deadline on recipients just shown to be unreachable —
+    // not for this occurrence, and not for another session's either.
+    notify.delivered = true;
+    const other = makeSession();
+    seed(other.inDb, 'task-other', 90 * MIN);
+    const otherSession = { id: 'sess-other', agent_group_id: 'ag-test' } as Session;
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + MIN, UP_LONG);
+    await escalateOverdueOccurrences(other.mailbox, otherSession, true, NOW + MIN, UP_LONG);
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + TASK_OVERDUE_ATTEMPT_MIN_GAP_MS - 1, UP_LONG);
+    expect(notify.calls).toHaveLength(1);
+
+    // Past the gap: still owing, so it alerts — and, delivered, never again.
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + TASK_OVERDUE_ATTEMPT_MIN_GAP_MS, UP_LONG);
+    await escalateOverdueOccurrences(mailbox, session, true, NOW + 2 * TASK_OVERDUE_ATTEMPT_MIN_GAP_MS, UP_LONG);
+    expect(notify.calls.map(([, c]) => c.occurrenceId)).toEqual(['task-wedged', 'task-wedged']);
   });
 
-  it('spaces a burst: one alert per gap, the rest stay armed', async () => {
+  it('spaces a burst: one attempt per gap, the rest stay owing', async () => {
     const a = makeSession();
     const b = makeSession();
     seed(a.inDb, 'task-a', 90 * MIN);
@@ -186,7 +199,7 @@ describe('escalateOverdueOccurrences', () => {
     await escalateOverdueOccurrences(b.mailbox, sessionB, false, NOW, UP_LONG);
     expect(notify.calls.map(([, c]) => c.occurrenceId)).toEqual(['task-a']);
 
-    await escalateOverdueOccurrences(b.mailbox, sessionB, false, NOW + TASK_OVERDUE_ALERT_MIN_GAP_MS, UP_LONG);
+    await escalateOverdueOccurrences(b.mailbox, sessionB, false, NOW + TASK_OVERDUE_ATTEMPT_MIN_GAP_MS, UP_LONG);
     expect(notify.calls.map(([, c]) => c.occurrenceId)).toEqual(['task-a', 'task-b']);
   });
 

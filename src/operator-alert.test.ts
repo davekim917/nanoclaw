@@ -25,7 +25,7 @@ vi.mock('./log.js', () => ({
   isSurvivableIoError: vi.fn(() => false),
 }));
 
-import { OPERATOR_ALERT_STEP_TIMEOUT_MS, notifyOperators } from './operator-alert.js';
+import { OPERATOR_ALERT_DEADLINE_MS, OPERATOR_ALERT_STEP_TIMEOUT_MS, notifyOperators } from './operator-alert.js';
 import { registerSecrets } from './secret-scrubber.js';
 
 beforeEach(() => {
@@ -90,6 +90,50 @@ describe('notifyOperators', () => {
 
       expect(await result).toBe(false);
       expect(mocks.deliver).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds the whole call, however many recipients hang', async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.roleRows = Array.from({ length: 25 }, (_, i) => ({ user_id: `slack:admin-${i}` }));
+      mocks.deliver.mockReset().mockImplementation(() => new Promise<string>(() => undefined));
+
+      let settled: boolean | undefined;
+      const result = notifyOperators('something broke').then((r) => (settled = r));
+      await vi.advanceTimersByTimeAsync(OPERATOR_ALERT_DEADLINE_MS - 1);
+      expect(settled).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(await result).toBe(false);
+      // The deadline, not the recipient count, decided how many were tried.
+      expect(mocks.deliver).toHaveBeenCalledTimes(
+        Math.ceil(OPERATOR_ALERT_DEADLINE_MS / OPERATOR_ALERT_STEP_TIMEOUT_MS),
+      );
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not start a send with no time left to wait for it', async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.roleRows = [{ user_id: 'slack:admin-1' }, { user_id: 'slack:admin-2' }];
+      // DM resolution answers, but the deadline has passed by the time it does.
+      mocks.ensureUserDm.mockReset().mockImplementation(async () => {
+        vi.setSystemTime(Date.now() + OPERATOR_ALERT_DEADLINE_MS);
+        return { channel_type: 'slack', platform_id: 'dm' };
+      });
+
+      expect(await notifyOperators('something broke')).toBe(false);
+
+      // An abandoned send can still land; one never started cannot.
+      expect(mocks.deliver).not.toHaveBeenCalled();
+      expect(mocks.ensureUserDm).toHaveBeenCalledTimes(1);
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
