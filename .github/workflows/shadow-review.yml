@@ -244,24 +244,30 @@ jobs:
           #    resolved and used, in EITHER comment style. Model ids contain
           #    neither delimiter, so nothing real is lost.
           #
-          #    This is TEXT stripping, not a parse, and the limit is exactly
-          #    that: `/*`, `*/` and `//` are treated as comment delimiters
-          #    wherever they appear, INCLUDING inside string literals. A
-          #    roster carrying `'/*'` and `'*/'` literals around a declaration
-          #    therefore comments that declaration out as far as this step is
-          #    concerned, and a second declaration after it resolves instead —
-          #    with NO `//` involved and with the delimiters still balanced, so
-          #    the check below cannot see it either. A `//` inside a string is
-          #    one more way into the same hole, not the cause of it.
+          #    This is TEXT stripping, not a parse, and there is ONE rule
+          #    behind every edge case below. `/*`, `*/` and `//` are comment
+          #    delimiters wherever they appear, string literals included; and
+          #    a `/*` left orphaned — because a `//` on its line ate its `*/`,
+          #    or because it was never a comment at all, like the `/*` inside
+          #    a `'**/*.ts'` glob — does not stay orphaned. It pairs with the
+          #    NEXT `*/` anywhere later in the flattened file, and everything
+          #    between the two disappears.
           #
-          #    Contrived, but not as narrow as a bare `'/*'`: two ordinary
-          #    globs (`'**/*.ts'` … `'src/**/x'`) pair with each other and do
-          #    it just as well. Not fixed here: the real roster
-          #    (`scripts/reviewer-models.ts`) contains no `http`, no glob and
-          #    no such literal, and the honest fix is to stop reading it as text,
-          #    which needs a Node/tsx runtime this step does not have. What
-          #    bounds the risk meanwhile is that the roster is read at the
-          #    PR's BASE sha, so landing such a literal takes a merged commit.
+          #    So the failure is: a declaration that sits between an orphaned
+          #    `/*` and some later `*/` is invisible to this step. If another
+          #    declaration follows, THAT one resolves — silently, exit 0, with
+          #    the delimiters balanced so the check below sees nothing wrong.
+          #    If none follows, it fails closed as "found 0". No `//` is
+          #    required: a pair of ordinary globs does it, and so does a glob
+          #    followed by any later docblock.
+          #
+          #    Not fixed here, because fixing it means parsing rather than
+          #    stripping, which needs a Node/tsx runtime this step does not
+          #    have. What bounds it: the real roster
+          #    (`scripts/reviewer-models.ts`) has no `http`, no glob and no
+          #    such literal; it is read at the PR's BASE sha, so landing one
+          #    takes a merged commit; and the roster is one short file whose
+          #    whole job is to name reviewers.
           # 2. Flatten to a single line, so the array literal can be matched as
           #    one expression whether it is written on one line or wrapped over
           #    several.
@@ -270,27 +276,29 @@ jobs:
           # would let `…['a']/**/const FRONTIER_MODELS=['b']` fuse into one
           # token and hide the second declaration from the duplicate check.
           flat=$(printf '%s' "$flat" | sed -E 's;/\*([^*]|\*+[^*/])*\*+/; ;g')
-          # Because `//` is stripped first, a `//` INSIDE a block comment eats
-          # that comment's `*/` and leaves the `/*` unclosed — which would make
-          # the text after it read as live code. Any surviving delimiter means
-          # the strip did not do what the matching below assumes, so refuse
-          # rather than resolve from text we cannot account for.
+          # A delimiter surviving the strip means some `/*` or `*/` had no
+          # partner anywhere in the file, so the text no longer means what the
+          # matching below assumes. Refuse rather than resolve from it.
           #
-          # It refuses more than that one case, all of them fail-CLOSED, and
-          # all of them legitimate TypeScript:
-          #   - any `/* … */` whose closing line holds a `//` BEFORE its `*/` —
-          #     a URL in a one-line block comment, or on the last line of a
-          #     docblock. Order is the whole of it: a `//` AFTER the `*/`
-          #     (`/* a */ // note`) is fine, and so is a URL on a middle line,
-          #     because in both the `*/` survives the line strip.
-          #   - a string literal holding an unpaired delimiter, e.g. a glob
-          #     like `'**/*.ts'`, whose `*/` has nothing to pair with. Note
-          #     this catches a LONE one. TWO such globs pair with each other
-          #     and fail OPEN instead, hiding whatever sits between them — the
-          #     same hole step 1 describes, reachable without a bare `'/*'`.
-          # The message names the delimiter and the fix, because "unbalanced"
-          # alone sends the reader looking for a broken comment when the cause
-          # is usually a URL or a glob in ordinary code.
+          # Be clear about what this does and does not buy, because the
+          # tempting reading is that it closes step 1's hole. It does not.
+          # It is the LAST-RESORT half of that one rule: an orphaned `/*` is
+          # caught here only when NO `*/` follows it in the whole file. When
+          # one does follow — another docblock further down, a second glob —
+          # the two pair up, the delimiters come out balanced, this check sees
+          # nothing, and step 1's silent wrong-id case is live. On this roster
+          # `FRONTIER_MODELS` is declared above several docblocks, so a `*/`
+          # to pair with is always available: treat step 1's bound (the roster
+          # is short, reviewed, and read at the base sha) as the real defence
+          # and this check as a backstop for the no-partner case only.
+          #
+          # What it does refuse is legitimate TypeScript, all fail-CLOSED:
+          # a one-line `/* … https://… */` or a docblock whose LAST line holds
+          # the URL (the `//` eats that line's `*/`; a `//` AFTER the `*/`, or
+          # a URL on a middle line, is fine), and a trailing glob like
+          # `'**/*.ts'` with no later `*/`. The message names the delimiter
+          # and the fix, because "unbalanced" alone sends the reader looking
+          # for a broken comment when the cause is a URL or a glob.
           if printf '%s' "$flat" | grep -qE '/\*|\*/'; then
             echo "unresolved /* or */ after comment-stripping $ROSTER@$BASE_SHA — refusing to resolve a reviewer from text this step cannot account for." >&2
             echo "Usual cause: a URL or other '//' on the SAME line as a block comment's '*/' (that '//' deletes the '*/'), or an unpaired '/*' or '*/' inside a string literal such as a '**/*.ts' glob." >&2
