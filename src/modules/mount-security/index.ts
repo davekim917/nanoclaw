@@ -284,7 +284,22 @@ function touchesMcpOAuthBundleRoot(realPath: string): boolean {
 
   const dataDirReal = getRealPath(DATA_DIR);
   if (dataDirReal === null) return true; // DATA_DIR itself unreadable — cannot verify, fail closed
-  return isPathContainedOrContains(path.join(dataDirReal, 'mcp-oauth'), realPath);
+  const bundleUnderRealDataDir = path.join(dataDirReal, 'mcp-oauth');
+  if (isPathContainedOrContains(bundleUnderRealDataDir, realPath)) return true;
+
+  // And the LEAF's own realpath (#905 review round 3). Resolving only DATA_DIR
+  // and appending the literal `mcp-oauth` component leaves the case where
+  // `data/mcp-oauth` is ITSELF a symlink to a directory elsewhere: the bundle
+  // writes follow it (`store.ts` writes through `path.join(DATA_DIR,
+  // 'mcp-oauth', …)`, which the OS resolves), so the target is where the
+  // refresh tokens actually are, and nothing above compares against it. Only
+  // when the leaf exists — `getRealPath` returns null otherwise, which is the
+  // pre-creation case the lexical check already covers.
+  for (const candidate of [bundleRootLiteral, bundleUnderRealDataDir]) {
+    const leafReal = getRealPath(candidate);
+    if (leafReal !== null && isPathContainedOrContains(leafReal, realPath)) return true;
+  }
+  return false;
 }
 
 /**

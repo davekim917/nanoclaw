@@ -285,3 +285,42 @@ describe('the MCP OAuth bundle directory is unreachable from above as well as be
     expect(mount(siblings).allowed).toBe(true);
   });
 });
+
+// #905 review round 3: resolving only DATA_DIR and appending the literal
+// `mcp-oauth` component misses the case where the LEAF is the symlink. Bundle
+// writes follow it, so the target is where the refresh tokens really live.
+describe('the bundle directory is protected through a symlinked leaf too', () => {
+  function mount(hostPath: string): ReturnType<typeof validateMount> {
+    writeAllowlist({ allowedRoots: [{ path: tmpDir, allowReadWrite: true }], blockedPatterns: [] });
+    return validateMount({ hostPath, readonly: true });
+  }
+
+  /** `<dataDir>/mcp-oauth` → `<tmpDir>/elsewhere/bundles`, nothing in the
+   *  target's own path spelling matching any pattern. */
+  function linkBundlesOutside(): string {
+    const target = path.join(tmpDir, 'elsewhere', 'bundles');
+    fs.mkdirSync(target, { recursive: true });
+    fs.mkdirSync(mockState.dataDir, { recursive: true });
+    fs.symlinkSync(target, path.join(mockState.dataDir, 'mcp-oauth'));
+    return target;
+  }
+
+  it('refuses the symlink target', () => {
+    const target = linkBundlesOutside();
+    const result = mount(target);
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toMatch(/MCP OAuth bundle directory/);
+  });
+
+  it('refuses an ancestor of the symlink target', () => {
+    linkBundlesOutside();
+    expect(mount(path.join(tmpDir, 'elsewhere')).allowed).toBe(false);
+  });
+
+  it('still allows an unrelated directory beside it', () => {
+    linkBundlesOutside();
+    const unrelated = path.join(tmpDir, 'elsewhere-but-unrelated');
+    fs.mkdirSync(unrelated, { recursive: true });
+    expect(mount(unrelated).allowed).toBe(true);
+  });
+});

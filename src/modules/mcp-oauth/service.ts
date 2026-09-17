@@ -602,7 +602,9 @@ async function finalizeToken(
     rememberPendingSecretWrite(row.name, token, expiryFrom(token, nowMs));
     await markMcpOAuthIntegration(row.name, {
       status: 'error',
-      status_detail: `token minted but the OneCLI secret write failed: ${err instanceof Error ? err.message : String(err)}`,
+      // The same wording the refresher's own write failure produces, so
+      // `ncl integrations list` reads the same whichever path parked the write.
+      status_detail: pendingWriteStatusDetail(row.name, err),
       expires_at: expiryFrom(token, nowMs),
       scopes: token.scope ?? row.scopes,
       last_refresh_at: new Date(nowMs).toISOString(),
