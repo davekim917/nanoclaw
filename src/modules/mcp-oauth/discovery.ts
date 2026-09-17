@@ -125,8 +125,8 @@ export function assertHttpsEndpoint(label: string, url: string): string {
   let parsed: URL;
   try {
     parsed = new URL(url);
-  } catch {
-    throw new Error(`${label} is not a valid URL: ${url}`);
+  } catch (err) {
+    throw new Error(`${label} is not a valid URL: ${url}`, { cause: err });
   }
   if (parsed.protocol !== 'https:') {
     throw new Error(`${label} must be https, got ${parsed.protocol}//… — refusing to send credentials in cleartext.`);
