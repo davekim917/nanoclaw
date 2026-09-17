@@ -1747,20 +1747,19 @@ export async function processQuery(
   // authority the result handler dispatches under, and in a task run final-text
   // <message> blocks are inert (formatter.ts, RoutingContext.taskRun), so the
   // nudge would ask for a reply that cannot be delivered.
-  type ReplyDebt = { sinceSeq: number; channelType: string | null; platformId: string | null; threadId: string | null };
-  // The conversation is the PERSON'S row's, not the batch anchor's:
-  // extractRouting anchors a mixed batch on its task row (formatter.ts, "task
-  // row" anchor), which is the task's destination, not where the person is.
-  // A row with no routing of its own falls back to the batch's.
+  type ReplyDebt = { sinceSeq: number; channelType: string | null; platformId: string | null };
+  // The channel is the PERSON'S row's, not the batch anchor's: extractRouting
+  // anchors a mixed batch on its task row (formatter.ts, "task row" anchor),
+  // which is the task's destination, not where the person is. "Has its own
+  // routing" is extractRouting's test — a platform_id (formatter.ts:307-311).
   const replyDebt = (rows: MessageInRow[], from: RoutingContext): ReplyDebt | null => {
     const human = routing.taskRun ? undefined : triggeringHumanInbound(rows);
     if (!human) return null;
-    const own = human.platform_id != null && human.channel_type != null;
+    const own = human.platform_id != null;
     return {
       sinceSeq: maxOutboundSeq(),
-      channelType: own ? human.channel_type : from.channelType,
+      channelType: own ? (human.channel_type ?? null) : from.channelType,
       platformId: own ? human.platform_id : from.platformId,
-      threadId: own ? (human.thread_id ?? null) : from.threadId,
     };
   };
   let humanReplyOwed: ReplyDebt | null = replyDebt(
@@ -2586,7 +2585,7 @@ export async function processQuery(
               humanReplyOwed &&
               !willRetryWrapping &&
               answersRunnerPrompt &&
-              (sent === 0 || hasChatOutboundAfter(humanReplyOwed.sinceSeq, humanReplyOwed))
+              ((sent === 0 && !hasUnwrapped) || hasChatOutboundAfter(humanReplyOwed.sinceSeq, humanReplyOwed))
             )
               humanReplyOwed = null;
           }

@@ -3182,7 +3182,7 @@ describe("a person's message that got nothing delivered", () => {
     expect(pushes).toHaveLength(1);
   });
 
-  it('does not take a message to a peer agent, another channel, another thread or a keyed incident for the reply', async () => {
+  it('does not take a message to a peer agent or another channel for the reply', async () => {
     const { writeMessageOut } = await import('./db/messages-out.js');
     const { query, pushes } = emptyTurn(async () => {
       await writeMessageOut({
@@ -3191,21 +3191,6 @@ describe("a person's message that got nothing delivered", () => {
         channel_type: 'agent',
         platform_id: 'ag-peer',
         content: JSON.stringify({ text: 'please take this' }),
-      });
-      await writeMessageOut({
-        id: 'other-thread',
-        kind: 'chat',
-        channel_type: 'discord',
-        platform_id: 'chan-1',
-        thread_id: 'chan-1:some-other-thread',
-        content: JSON.stringify({ text: 'unrelated thread' }),
-      });
-      await writeMessageOut({
-        id: 'keyed-incident',
-        kind: 'chat',
-        channel_type: 'discord',
-        platform_id: 'chan-1',
-        content: JSON.stringify({ text: 'incident update', threadKey: 'db-backup-42' }),
       });
       await writeMessageOut({
         id: 'elsewhere',
@@ -3228,6 +3213,70 @@ describe("a person's message that got nothing delivered", () => {
     expect(pushes).toHaveLength(1);
   });
 
+  // Loose on purpose: a false "not replied" makes the agent answer twice, and
+  // no single writer decides which thread a reply lands in (reads.ts).
+  it("counts any reply in the person's channel, whatever thread or key it carries", async () => {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    insertMessage('m1', 'chat', { sender: 'Operator', senderId: 'U1', text: 'checking in' });
+    for (const extra of [{ thread_id: 'chan-1:some-other-thread' }, { thread_id: null }]) {
+      const { query, pushes } = emptyTurn(() =>
+        writeMessageOut({
+          id: `loose-${String(extra.thread_id)}`,
+          kind: 'chat',
+          channel_type: 'discord',
+          platform_id: 'chan-1',
+          ...extra,
+          content: JSON.stringify({ text: 'update', threadKey: 'db-backup-42' }),
+        }),
+      );
+      await processQuery(
+        query,
+        { ...ERR_ROUTING, threadId: 'chan-1:T' },
+        ['m1'],
+        'claude',
+        undefined,
+        'p',
+        undefined,
+        {},
+      );
+      expect(pushes).toHaveLength(0);
+    }
+  });
+
+  it("scopes the debt to the person's own channel when the batch is anchored elsewhere", async () => {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, platform_id, channel_type, thread_id, content)
+         VALUES ('h1', 'chat', datetime('now'), 'pending', 1, 'chan-9', 'discord', NULL, ?)`,
+      )
+      .run(JSON.stringify({ sender: 'Operator', senderId: 'U1', text: 'status?' }));
+    // The batch routing (ERR_ROUTING) names chan-1 — a task row's destination.
+    const wrongPlace = emptyTurn(() =>
+      writeMessageOut({
+        id: 'to-anchor',
+        kind: 'chat',
+        channel_type: 'discord',
+        platform_id: 'chan-1',
+        content: JSON.stringify({ text: 'digest' }),
+      }),
+    );
+    await processQuery(wrongPlace.query, ERR_ROUTING, ['h1'], 'claude', undefined, 'p', undefined, {});
+    expect(wrongPlace.pushes).toHaveLength(1);
+
+    const rightPlace = emptyTurn(() =>
+      writeMessageOut({
+        id: 'to-person',
+        kind: 'chat',
+        channel_type: 'discord',
+        platform_id: 'chan-9',
+        content: JSON.stringify({ text: 'here' }),
+      }),
+    );
+    await processQuery(rightPlace.query, ERR_ROUTING, ['h1'], 'claude', undefined, 'p', undefined, {});
+    expect(rightPlace.pushes).toHaveLength(0);
+  });
+
   it('counts a card as the reply', async () => {
     const { writeMessageOut } = await import('./db/messages-out.js');
     const { query, pushes } = emptyTurn(() =>
@@ -3240,25 +3289,6 @@ describe("a person's message that got nothing delivered", () => {
       }),
     );
     await human(query);
-
-    expect(pushes).toHaveLength(0);
-  });
-
-  it('counts a keyed reply when the conversation is a thread: the key has no effect there', async () => {
-    const { writeMessageOut } = await import('./db/messages-out.js');
-    const threaded = { ...ERR_ROUTING, threadId: 'chan-1:T' };
-    const { query, pushes } = emptyTurn(() =>
-      writeMessageOut({
-        id: 'keyed-in-thread',
-        kind: 'chat',
-        channel_type: 'discord',
-        platform_id: 'chan-1',
-        thread_id: 'chan-1:T',
-        content: JSON.stringify({ text: 'restore is at 80%', threadKey: 'db-restore-9' }),
-      }),
-    );
-    insertMessage('m1', 'chat', { sender: 'Operator', senderId: 'U1', text: 'checking in' });
-    await processQuery(query, threaded, ['m1'], 'claude', undefined, 'prompt', undefined, {});
 
     expect(pushes).toHaveLength(0);
   });

@@ -88,42 +88,41 @@ export function maxOutboundSeq(): number {
  * rather than counted in-process because `send_message`/`send_file` run in the
  * MCP server's own process (mcp-tools/server.ts) and write here directly.
  *
- * What counts: `chat` (send_message, send_file, dispatched result blocks) and
- * `chat-sdk` (send_card / ask_user_question, mcp-tools/interactive.ts:93,156 —
- * a card is a documented way to answer). `status` is a progress label;
- * `system` and `task_log` are host-facing.
+ * The two ways to be wrong are not equal. Answering "yes" wrongly skips a
+ * nudge, which is what happened before this existed. Answering "no" wrongly
+ * nudges an agent that already replied, and it replies twice. So this matches
+ * loosely and fails open:
  *
- * Where it must land: the conversation the message came from — same channel,
- * platform AND thread. A row to a peer agent or another channel is
- * `send_message(to: …)` delegating, not an answer.
+ *   - kind: `chat` (send_message, send_file, dispatched result blocks) and
+ *     `chat-sdk` (send_card / ask_user_question, mcp-tools/interactive.ts:93,156).
+ *     `status` is a progress label; `system` and `task_log` are host-facing.
+ *   - where: the person's channel + platform. A row to a peer agent or another
+ *     channel is `send_message(to: …)` delegating, not an answer.
+ *   - NOT the thread, and NOT `threadKey`. No single authority decides the
+ *     thread a reply lands in: the MCP tools stamp `getSessionRouting()`
+ *     (mcp-tools/core.ts:224), final-text blocks stamp the channel's newest
+ *     inbound row or the batch anchor (`sendToDestination`, poll-loop.ts), and
+ *     delivery re-parents null-thread rows under the turn or key anchor
+ *     (src/delivery.ts:1575-1588). Two review rounds each modelled that wrong
+ *     and produced a false "no"; any row in the person's channel counts.
  *
- * `threadKey` only disqualifies a row when that conversation is un-threaded.
- * Delivery re-parents a keyed post under the key's own incident thread only
- * when the row has no thread_id (`keyAddr` requires `baseThreadId === null`,
- * src/delivery.ts:1575); with a thread_id the key has no effect and the post
- * lands in that thread (core.ts THREAD_KEY_DESCRIPTION says the same).
- *
- * With no routing to match (legacy sessions), any un-keyed non-agent row counts.
- * An unreadable row answers `true` — see the catch.
+ * With no routing to match (legacy sessions), any non-agent row counts. An
+ * unreadable DB answers `true`.
  */
 export function hasChatOutboundAfter(
   seq: number,
-  conversation: { channelType: string | null; platformId: string | null; threadId: string | null },
+  conversation: { channelType: string | null; platformId: string | null },
 ): boolean {
-  // Fails OPEN: json_extract throws on a row whose content is not JSON, and a
-  // nudge is a nicety — never worth killing the turn that asked.
   try {
     const db = getOutboundDb();
     const base = "SELECT 1 FROM messages_out WHERE seq > ? AND kind IN ('chat', 'chat-sdk')";
-    const unkeyed = "json_extract(content, '$.threadKey') IS NULL";
     if (conversation.channelType === null || conversation.platformId === null) {
-      return db.prepare(`${base} AND ${unkeyed} AND channel_type IS NOT 'agent' LIMIT 1`).get(seq) != null;
+      return db.prepare(`${base} AND channel_type IS NOT 'agent' LIMIT 1`).get(seq) != null;
     }
-    const keyClause = conversation.threadId === null ? ` AND ${unkeyed}` : '';
     return (
       db
-        .prepare(`${base} AND channel_type = ? AND platform_id = ? AND thread_id IS ?${keyClause} LIMIT 1`)
-        .get(seq, conversation.channelType, conversation.platformId, conversation.threadId) != null
+        .prepare(`${base} AND channel_type = ? AND platform_id = ? LIMIT 1`)
+        .get(seq, conversation.channelType, conversation.platformId) != null
     );
   } catch {
     return true;
