@@ -255,7 +255,12 @@ export function readFleetMcpServers(): Record<string, McpServerConfig> {
   try {
     contents = fs.readFileSync(FLEET_MCP_SERVERS_PATH, 'utf-8');
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { ...DEFAULT_FLEET_MCP_SERVERS };
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      // Copy each entry, not just the map: `validateMcpServers` mutates
+      // entries in place (src/container-config.ts:585), and these are the
+      // module-level defaults.
+      return Object.fromEntries(Object.entries(DEFAULT_FLEET_MCP_SERVERS).map(([name, entry]) => [name, { ...entry }]));
+    }
     throw error;
   }
   return parseFile(contents);
@@ -295,7 +300,13 @@ export function effectiveMcpServers(
   const excluded = new Set(config?.excludeMcpServers ?? []);
   for (const [name, entry] of Object.entries(readFleetMcpServers())) {
     if (excluded.has(name) || servers[name]) continue;
-    servers[name] = entry;
+    // A copy, not the entry itself: with no file on disk `readFleetMcpServers`
+    // hands back `DEFAULT_FLEET_MCP_SERVERS`' own objects, and
+    // `validateMcpServers` mutates what it is given in place
+    // (src/container-config.ts:585 deletes `cwd`). One caller's cleanup would
+    // otherwise edit the module-level defaults for every later caller in the
+    // process.
+    servers[name] = { ...entry };
   }
   return servers;
 }

@@ -21,7 +21,7 @@ import { buildSessionServicesSnapshot, getHostCapabilities, renderSessionCapabil
 import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from './db/index.js';
 import { writeContainerConfig } from './container-config.js';
 import { SIBLING_BOUND_FIELDS } from './sibling-parity.js';
-import { PRE_TURN_BOUNDS } from './modules/memory/pre-turn-context.js';
+import { PRE_TURN_BOUNDS, boundedCapabilities, type ContextNotice } from './modules/memory/pre-turn-context.js';
 import type { AgentGroup } from './types.js';
 
 function group(id: string, folder: string): AgentGroup {
@@ -467,6 +467,114 @@ describe('buildSessionServicesSnapshot', () => {
     expect(names).not.toContain('Broken');
     // The rest of the snapshot still builds.
     expect(names).toContain('Littlebird');
+  });
+
+  it('survives the capability budget on a widest-wired group, universals intact', async () => {
+    // The regression this pins: the derived MCP entries are appended to the
+    // services array, and BOTH capability budgets evict from the END
+    // (`evictCapability`, src/modules/memory/pre-turn-context.ts:1590-1595).
+    // Appended, the migrated universals would be first out on exactly the
+    // groups that have the most wired — the widest group on this install
+    // measures 19 services / 8,954 chars before this PR and 22 / 9,773 after,
+    // against a 10,000-char budget. So they are spliced in where the five hardcoded blocks used to sit,
+    // and marked `retainUnderBudget` because a fleet default is the fleet's
+    // baseline, not a group's extra.
+    insertWorkgroup('wide-shop', ['Slack-User-Token-WideShop']);
+    const ag = group('ag-wide-shop', 'wide-shop');
+    await createGroupInWorkgroup(ag, 'wide-shop');
+    const OWNER_SAFE_MG = 'mg-owner-dm-wide';
+    // The widest-wired group's real container.json shape, trimmed to what this
+    // file can build: its tool list, its three mcpServers (two
+    // remote-mcp-bridge stdio servers and one http), and owner-safe Slack.
+    writeContainerConfig(ag.folder, {
+      mcpServers: {
+        dropbox: {
+          type: 'stdio',
+          command: 'bun',
+          args: ['/app/src/remote-mcp-bridge.ts', 'https://mcp.dropbox.com/mcp'],
+          env: { REMOTE_MCP_NAME: 'dropbox', REMOTE_MCP_AUTHORIZATION: 'Bearer onecli-managed' },
+        },
+        amplitude: {
+          command: 'bun',
+          args: ['/app/src/remote-mcp-bridge.ts', 'https://mcp.amplitude.com/mcp'],
+          env: { REMOTE_MCP_NAME: 'amplitude', REMOTE_MCP_AUTHORIZATION: 'Bearer onecli-managed' },
+        },
+        littlebird: { type: 'http', url: 'https://mcp.littlebird.ai/mcp' },
+      },
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+      tools: [
+        'granola',
+        'pocket',
+        'google-workspace:wide-shop',
+        'exa',
+        'snowflake:ws',
+        'github',
+        'looker',
+        'hex',
+        'atlassian',
+        'dbt-mcp',
+        'dbt:wide_shop_analytics',
+        'datafold',
+        'dropbox',
+        'aws:ws-a',
+        'aws:ws-b',
+      ],
+      slack_user_token: { enabled: true, also_allowed_in: [OWNER_SAFE_MG] },
+    } as Parameters<typeof writeContainerConfig>[1]);
+
+    const snapshot = await buildSessionServicesSnapshot(ag.id, OWNER_SAFE_MG);
+    const universals = ['Pocket', 'Exa', 'Context7', 'DeepWiki', 'Granola', 'Littlebird'];
+
+    // Structure first: the fleet universals are marked retained, a
+    // group-specific server is not, and the derived block sits BEFORE the
+    // tool-gated entries that follow it — the position the hardcoded blocks
+    // held, so eviction order for everything else is unchanged.
+    for (const name of universals) {
+      expect(snapshot.services.find((service) => service.name === name)?.retainUnderBudget, name).toBe(true);
+    }
+    expect(snapshot.services.find((service) => service.name === 'Dropbox')?.retainUnderBudget).toBeUndefined();
+    const names = snapshot.services.map((service) => service.name);
+    for (const later of ['Datafold', 'Looker', 'Hex', 'Slack']) {
+      if (names.includes(later)) expect(names.indexOf('Pocket')).toBeLessThan(names.indexOf(later));
+    }
+
+    // Then under real pressure. This hermetic fixture measures 19 services /
+    // ~7.6k chars, under `capabilityTotalChars`; the live group it is modelled
+    // on measures 22 / 9,773 — 227 chars of headroom, which one more wired
+    // service spends. Padding every entry reproduces that pressure here without
+    // pinning this test to one production group's text, and drives the same
+    // `evictCapability` the live path uses.
+    const pressured = {
+      ...snapshot,
+      services: snapshot.services.map((service) => ({
+        ...service,
+        useFor: `${service.useFor ?? ''}${'x'.repeat(600)}`,
+      })),
+    };
+    const notices: ContextNotice[] = [];
+    const bounded = boundedCapabilities(pressured, notices);
+    const survived = bounded.services.map((service) => service.name);
+
+    expect(JSON.stringify(bounded.services).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.capabilityTotalChars);
+    // Something HAD to go, or this is not a budget test at all.
+    expect(survived.length).toBeLessThan(snapshot.services.length);
+    // ...and none of it was a fleet universal.
+    for (const name of universals) {
+      expect(survived, `${name} evicted by the capability budget`).toContain(name);
+    }
+    const droppedDetail = notices
+      .filter((notice) => notice.code === 'capability-total-budget' || notice.code === 'capability-count')
+      .map((notice) => notice.detail ?? '')
+      .join(' ');
+    for (const name of universals) expect(droppedDetail).not.toContain(name);
+
+    // A bridge-backed stdio server names the endpoint it dials, not `bun`.
+    const dropbox = snapshot.services.find((service) => service.name === 'Dropbox');
+    expect(dropbox?.useFor).toContain('https://mcp.dropbox.com/mcp');
+    expect(dropbox?.useFor).not.toContain('(bun)');
+    expect(dropbox?.useFor?.length ?? 0).toBeLessThanOrEqual(120);
   });
 
   it('keeps the migrated universal text verbatim and never doubles an entry', async () => {

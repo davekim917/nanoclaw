@@ -262,6 +262,24 @@ describe('the file:line citations in this PR\u2019s comments', () => {
       contains: 'args[key] = true',
       citedBy: 'why a valueless --description arrives as boolean true',
     },
+    {
+      file: 'src/modules/memory/pre-turn-context.ts',
+      line: 1590,
+      contains: 'function evictCapability',
+      citedBy: 'capabilities.ts — why the derived block is spliced, not appended',
+    },
+    {
+      file: 'src/modules/memory/pre-turn-context.ts',
+      line: 1594,
+      contains: 'services.pop()?.name',
+      citedBy: 'capabilities.ts — why an all-retained list still terminates',
+    },
+    {
+      file: 'src/container-config.ts',
+      line: 585,
+      contains: 'delete server.cwd',
+      citedBy: 'effectiveMcpServers — why fleet entries are handed out as copies',
+    },
   ];
 
   it.each(citations)('$file:$line still says what $citedBy claims', ({ file, line, contains }) => {

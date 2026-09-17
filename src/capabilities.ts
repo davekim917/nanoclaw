@@ -24,7 +24,7 @@ import { withCentralSync, withRawDb } from './db/central-lease.js';
 import { GROUPS_DIR } from './config.js';
 import { getRegisteredChannelNames } from './channels/channel-registry.js';
 import { readContainerConfig, type McpServerConfig } from './container-config.js';
-import { RETIRED_MCP_SERVER_NAMES, effectiveMcpServers } from './fleet-mcp-servers.js';
+import { RETIRED_MCP_SERVER_NAMES, effectiveMcpServers, readFleetMcpServers } from './fleet-mcp-servers.js';
 import { getAllAgentGroups, getAgentGroup, getWorkgroupOnecliSecrets } from './db/agent-groups.js';
 import type { AgentGroup } from './types.js';
 import { mergeWorkgroupAndGroupSecrets, slackUserTokenSecrets } from './onecli-secrets.js';
@@ -546,6 +546,18 @@ export function buildSessionServicesSnapshotFrom(
     }
   }
 
+  // Where the derived MCP entries land. The five universals that moved into
+  // the fleet file (exa, deepwiki, context7, pocket, granola) were pushed
+  // exactly here, and both capability budgets evict from the END
+  // (`evictCapability`, src/modules/memory/pre-turn-context.ts:1590-1595), so
+  // appending them instead would have moved every one of them into the
+  // eviction zone on the widest-wired groups — the ones measured at 19
+  // services / 8,954 chars before this change and 22 / 9,773 after, against a
+  // 10,000-char budget (`PRE_TURN_BOUNDS.capabilityTotalChars`) that eats
+  // backwards from the end. The entries are built at the end of this function, where every
+  // hand-written `mcpNamespace` is known, and spliced in at this index.
+  const derivedMcpIndex = services.length;
+
   // Linear — gated by tool entry. Container-runner injects when 'linear' is in
   // container.json.tools and the OneCLI gateway proxy injects auth at request
   // time (vault entry "Linear" → mcp.linear.app). Only surface in the
@@ -854,6 +866,17 @@ export function buildSessionServicesSnapshotFrom(
       .filter((namespace): namespace is string => typeof namespace === 'string')
       .map((namespace) => namespace.replace(/^mcp__/, '').replace(/__\*$/, '')),
   );
+  // Fleet entries are the fleet-wide baseline every group inherits; a
+  // group-specific server is the one a budget should give up first. Marking
+  // the baseline `retainUnderBudget` is the same mechanism #862 used for
+  // Slack, and for the same reason: an agent that loses the line stops
+  // believing it has the tool. Keyed on the fleet REGISTRY, not on which copy
+  // won the merge — a group that declares `littlebird` itself (all 24 do
+  // today) holds the same capability. If every entry is retained the budget
+  // still terminates: `evictCapability` pops the last one outright
+  // (src/modules/memory/pre-turn-context.ts:1594).
+  const fleetProvided = new Set(Object.keys(readFleetMcpServers()));
+  const derived: SessionServicesSnapshot['services'] = [];
   for (const [name, server] of Object.entries(effectiveMcpServers(cfg))) {
     if (describedMcpServers.has(name)) continue;
     // A retired name still sitting in some group's container.json is deleted
@@ -870,15 +893,22 @@ export function buildSessionServicesSnapshotFrom(
     // so `null` reaches here. One bad entry must not cost the whole snapshot —
     // an agent with no capability list is the worse failure by far.
     if (server === null || typeof server !== 'object') continue;
-    services.push({
+    derived.push({
       name: server.displayName ?? name.charAt(0).toUpperCase() + name.slice(1),
       mcpNamespace: `mcp__${name}__*`,
       declaredTools: declaredMatchingTools([name]),
       scopes: [],
       credentialPaths: [],
       useFor: server.description ?? genericMcpUseFor(name, server),
+      ...(fleetProvided.has(name) ? { retainUnderBudget: true } : {}),
     });
   }
+  // Fleet entries first inside the derived block, group-specific after, so the
+  // block reads in the order the hardcoded universals used to (exa, deepwiki,
+  // …) and a group's own servers sit later — nearer the end the budgets eat
+  // from. `Object.entries` would otherwise lead with the group's own map.
+  derived.sort((a, b) => Number(Boolean(b.retainUnderBudget)) - Number(Boolean(a.retainUnderBudget)));
+  services.splice(derivedMcpIndex, 0, ...derived);
 
   return { agentGroupId, services };
 }
@@ -887,20 +917,38 @@ export function buildSessionServicesSnapshotFrom(
  * Capability text for a stored MCP server that carries no `description`.
  *
  * Deliberately says nothing about what the server does — that is the
- * `description` field's job — and names only the transport the agent needs to
- * reason about. The URL is safe to print: `parseMcpServerConfig` refuses a URL
- * carrying credentials at intake (src/container-config.ts:477-501), and the
- * agent can read the same value in its own read-only container.json mount
+ * `description` field's job — and names only the endpoint the agent needs to
+ * reason about, in one short line: every derived entry costs the capability
+ * budget (`PRE_TURN_BOUNDS.capabilityTotalChars`), and a described server
+ * spends those characters saying something useful instead.
+ *
+ * A URL is safe to print: `parseMcpServerConfig` refuses one carrying
+ * credentials at intake (src/container-config.ts:477-501), and the agent reads
+ * the same value in its own read-only container.json mount
  * (src/container-runner.ts:4877). `env` and `headers` are never rendered —
- * those DO hold injected values for the stdio servers this file's own gated
- * blocks build.
+ * those DO carry placeholder credentials.
  */
 function genericMcpUseFor(name: string, server: McpServerConfig): string {
-  const transport = server.type === 'http' || server.type === 'sse' ? server.url : server.command;
-  return (
-    `MCP server \`${name}\` (${transport}); its tools are self-describing under \`mcp__${name}__*\`. ` +
-    'Auth, if any, is injected by the OneCLI gateway at the proxy boundary — send no credentials yourself.'
-  );
+  return `MCP server \`${name}\` (${mcpEndpoint(server)}); tools self-describe under \`mcp__${name}__*\`.`;
+}
+
+/**
+ * What to print as a server's endpoint.
+ *
+ * Every remote MCP this fork wires as stdio is the bridge pattern — `command:
+ * "bun"`, `args: ["/app/src/remote-mcp-bridge.ts", "<endpoint>"]` (see
+ * `container/agent-runner/src/remote-mcp-bridge.ts`, and the `dropbox` /
+ * `amplitude` entries on this install) — so printing `command` alone says "bun" for
+ * all of them and identifies nothing. Print what the bridge dials instead; a
+ * genuine local subprocess still prints its command.
+ */
+function mcpEndpoint(server: McpServerConfig): string {
+  if (server.type === 'http' || server.type === 'sse') return server.url;
+  const [script, endpoint] = server.args ?? [];
+  if (typeof script === 'string' && script.endsWith('remote-mcp-bridge.ts') && typeof endpoint === 'string') {
+    return endpoint;
+  }
+  return server.command;
 }
 
 export async function getHostCapabilities(
