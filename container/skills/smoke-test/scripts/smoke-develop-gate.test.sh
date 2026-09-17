@@ -308,7 +308,8 @@ fresh_state() {
         STUB_FRONTEND_SHA STUB_BACKEND_SHA STUB_FRONTEND_CI STUB_COMPARE_FILES \
         SMOKE_GATE_UNSETTLED_ALERT_SECONDS \
         SMOKE_GATE_FREEZE_HANDOFF SMOKE_GATE_FREEZE_HELPER SMOKE_GATE_HOLD_FILE \
-        STUB_FREEZE_EXIT STUB_FREEZE_JSON STUB_FREEZE_PR_STATE 2>/dev/null || true
+        STUB_FREEZE_EXIT STUB_FREEZE_JSON STUB_FREEZE_PR_STATE \
+        SMOKE_GATE_PR_STATE_DIR SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS 2>/dev/null || true
 }
 
 # 16. Backend-only merge: frontend deploy lags, nothing under frontend paths
@@ -825,6 +826,201 @@ jq -e '.data.trigger == "develop_freeze_opened"' <<<"$STALE_OUT" >/dev/null ||
 jq -e --arg sha "$MOVED_HEAD" '
   .data.trigger == "develop_freeze_opened" and .data.targetSha == $sha
 ' <<<"$STALE_OUT" >/dev/null
+
+# --- 33b. Handoff disposition (SMOKE_GATE_PR_STATE_DIR). An open freeze is
+# classified from the PR gate's own per-PR state, and a freeze no campaign ever
+# started on raises ONE latched develop_freeze_unclaimed well before the stale
+# path. Live: six consecutive freezes were cut, never polled, aged out and
+# closed with no alarm while the PR-gate watcher series was wedged.
+UC_TARGET="$(printf '1%.0s' $(seq 40))"
+UC_FREEZE="$(printf '2%.0s' $(seq 40))"
+UC_MOVED="$(printf '5%.0s' $(seq 40))"
+uc_open() {  # <pr> — fresh state dir with one open handoff on UC_TARGET
+  fresh_state
+  export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+  export SMOKE_GATE_FREEZE_STALE_SECONDS=14400
+  export STUB_SOURCE_SHA="$UC_TARGET"
+  export STUB_FREEZE_JSON="{\"prNumber\":$1,\"branch\":\"smoke/freeze-uc\",\"freezeSha\":\"$UC_FREEZE\",\"targetSha\":\"$UC_TARGET\"}"
+  bash "$GATE" poll >/dev/null
+  bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened"' >/dev/null
+  PR_DIR="$(mktemp -d)"
+}
+uc_age() {  # <seconds> — backdate the open handoff
+  jq --arg t "$(/usr/bin/date -u -d "@$(( $(/usr/bin/date -u +%s) - $1 ))" +'%Y-%m-%dT%H:%M:%SZ')" \
+    '.handoffOpenedAt=$t' "$STATE_DIR2/develop-state.json" > "$STATE_DIR2/develop-state.json.tmp" &&
+    mv "$STATE_DIR2/develop-state.json.tmp" "$STATE_DIR2/develop-state.json"
+}
+uc_ago() { /usr/bin/date -u -d "@$(( $(/usr/bin/date -u +%s) - $1 ))" +'%Y-%m-%dT%H:%M:%SZ'; }
+uc_fail() { echo "33b: $1" >&2; exit 1; }
+
+# Env unset = inert, byte-for-byte: no field on the no-wake line, the stale
+# payload keeps its exact key list and its exact hint, no alarm at any age.
+uc_open 60
+uc_age 9000
+UC_OUT="$(bash "$GATE" poll)"
+[ "$(jq -c '[.wakeAgent, (.data | keys_unsorted)]' <<<"$UC_OUT")" = \
+  '[false,["schemaVersion","trigger","sourceSha","backendDeploySha","frontendDeploySha","checkCount"]]' ] ||
+  uc_fail "inert no-wake line changed shape: $UC_OUT"
+jq -e '.handoffUnclaimedAlertFor == null' "$STATE_DIR2/develop-state.json" >/dev/null
+export STUB_SOURCE_SHA="$UC_MOVED" SMOKE_GATE_FREEZE_STALE_SECONDS=0
+UC_OUT="$(bash "$GATE" poll)"
+[ "$(jq -c '.data | keys_unsorted' <<<"$UC_OUT")" = \
+  '["schemaVersion","trigger","freezePr","targetSha","currentSha","ageSeconds","hint"]' ] ||
+  uc_fail "inert stale payload changed shape: $UC_OUT"
+[ "$(jq -r '.data.hint' <<<"$UC_OUT")" = "This freeze is older than the staleness ceiling and develop has moved past it. Close the freeze PR (this also tears down its previews) unless a campaign is still live on it; a fresh freeze is cut on the next poll. Do not publish a verdict for a build nobody ships." ] ||
+  uc_fail "inert stale hint changed: $UC_OUT"
+
+# Healthy delayed readiness: young freeze, PR gate has written nothing yet
+# (it writes no per-PR state until the preview backend is live) — classified,
+# silent, not latched.
+uc_open 61
+export SMOKE_GATE_PR_STATE_DIR="$PR_DIR" SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS=5400
+uc_age 600
+bash "$GATE" poll | jq -e '
+  .wakeAgent == false and .data.trigger == "already_active" and .data.freezePr == 61 and
+  .data.campaignTrace.disposition == "never_started" and
+  .data.campaignTrace.detail == "no_pr_gate_state"
+' >/dev/null || uc_fail "young unclaimed freeze was not a silent classified no-wake"
+jq -e '.handoffUnclaimedAlertFor == null' "$STATE_DIR2/develop-state.json" >/dev/null
+
+# No watcher: past the window with no per-PR state → exactly one wake. The slot
+# stays held and nothing tells the responder to close.
+uc_age 6000
+UC_OUT="$(bash "$GATE" poll)"
+jq -e --arg sha "$UC_TARGET" '
+  .wakeAgent == true and .data.trigger == "develop_freeze_unclaimed" and
+  .data.freezePr == 61 and .data.targetSha == $sha and .data.ageSeconds >= 6000 and
+  .data.unclaimedAfterSeconds == 5400 and .data.staleAfterSeconds == 14400 and
+  .data.campaignTrace.disposition == "never_started" and
+  (.data.hint | test("Do NOT close"))
+' <<<"$UC_OUT" >/dev/null || uc_fail "no-watcher freeze did not alarm: $UC_OUT"
+jq -e '.handoffFreezePr == 61 and .handoffUnclaimedAlertFor == "61"' "$STATE_DIR2/develop-state.json" >/dev/null
+# No repeated noise: latched for this freeze PR.
+for _ in 1 2; do
+  bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "already_active"' >/dev/null ||
+    uc_fail "unclaimed alarm re-fired for the same freeze PR"
+done
+# Cross-gate: the REAL smoke-pr-gate.sh claims it in its own state dir — so the
+# fields this gate reads are the ones that gate writes, not a fixture's guess —
+# and the classification follows, still silent.
+SMOKE_GATE_STATE_DIR="$PR_DIR" bash "$SCRIPT_DIR/smoke-pr-gate.sh" claim run-uc-61 61 "$UC_FREEZE" |
+  jq -e '.ok == true' >/dev/null || uc_fail "real PR-gate claim failed"
+bash "$GATE" poll | jq -e '
+  .wakeAgent == false and .data.campaignTrace.disposition == "campaign_live" and
+  .data.campaignTrace.runId == "run-uc-61"
+' >/dev/null || uc_fail "claimed freeze still reads never_started"
+
+# ...and when that run dies without finishing, the PR gate's release returns
+# the freeze to never_started (latched: no second wake for the same PR).
+SMOKE_GATE_STATE_DIR="$PR_DIR" bash "$SCRIPT_DIR/smoke-pr-gate.sh" release run-uc-61 | jq -e '.ok == true' >/dev/null
+bash "$GATE" poll | jq -e '
+  .wakeAgent == false and .data.campaignTrace.disposition == "never_started" and
+  .data.campaignTrace.detail == "observed_not_claimed"
+' >/dev/null || uc_fail "released freeze not reclassified never_started"
+# Stale-close race: the PR is closed between polls. Abandonment still wins (its
+# ordering is untouched) and now carries the trace; the latch does not block it.
+export STUB_FREEZE_PR_STATE=CLOSED
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "develop_freeze_abandoned" and
+  .data.freezePr == 61 and .data.campaignTrace.disposition == "never_started"
+' >/dev/null || uc_fail "closed freeze PR did not win over the unclaimed path"
+unset STUB_FREEZE_PR_STATE
+# The latch re-arms only because the freeze PR changed: a NEW freeze on the
+# same state dir alarms again. (Failed wake: the PR gate observed this one —
+# per-PR state exists — but no run ever claimed it.)
+export STUB_FREEZE_JSON="{\"prNumber\":62,\"branch\":\"smoke/freeze-uc2\",\"freezeSha\":\"$UC_FREEZE\",\"targetSha\":\"$UC_TARGET\"}"
+UC_OUT="$(bash "$GATE" poll)"
+jq -e '.data.trigger == "develop_freeze_opened"' <<<"$UC_OUT" >/dev/null || UC_OUT="$(bash "$GATE" poll)"
+jq -e '.data.trigger == "develop_freeze_opened" and .data.freezePr == 62' <<<"$UC_OUT" >/dev/null ||
+  uc_fail "slot did not re-freeze after abandonment: $UC_OUT"
+jq -cn --arg sha "$UC_FREEZE" '{schemaVersion:1,pr:62,activeRunId:null,deployLiveSha:$sha,completedSha:null}' \
+  > "$PR_DIR/pr-62-state.json"
+uc_age 6000
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "develop_freeze_unclaimed" and .data.freezePr == 62 and
+  .data.campaignTrace.detail == "observed_not_claimed"
+' >/dev/null || uc_fail "observed-but-unclaimed freeze did not alarm"
+bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null
+# An unreadable per-PR state file fails toward the alarm, never aborts the poll.
+uc_open 63
+export SMOKE_GATE_PR_STATE_DIR="$PR_DIR" SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS=5400
+printf 'not json\n' > "$PR_DIR/pr-63-state.json"
+uc_age 6000
+bash "$GATE" poll | jq -e '
+  .data.trigger == "develop_freeze_unclaimed" and .data.campaignTrace.detail == "pr_gate_state_unreadable"
+' >/dev/null || uc_fail "unreadable per-PR state did not fail toward the alarm"
+
+# Supersession, one case per disposition. Past BOTH windows with develop moved:
+# the stale wake still frees the slot, carries the trace, and only tells the
+# responder to close a freeze nothing is running on.
+uc_stale() {  # <pr> <pr-state-json or ""> → prints the stale poll line
+  uc_open "$1"
+  export SMOKE_GATE_PR_STATE_DIR="$PR_DIR" SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS=5400
+  [ -z "$2" ] || printf '%s\n' "$2" > "$PR_DIR/pr-$1-state.json"
+  uc_age 20000
+  export STUB_SOURCE_SHA="$UC_MOVED"
+  bash "$GATE" poll
+  jq -e '.handoffFreezePr == null' "$STATE_DIR2/develop-state.json" >/dev/null ||
+    uc_fail "stale wake for PR $1 did not free the slot"
+}
+# Never started: stale outranks the unclaimed alarm, and says what it is.
+uc_stale 70 "" | jq -e '
+  .data.trigger == "develop_freeze_stale" and .data.campaignTrace.disposition == "never_started" and
+  (.data.hint | test("NO campaign ever started")) and (.data.hint | test("never-started"))
+' >/dev/null || uc_fail "never-started supersession not accounted for"
+# Campaign live: never "close".
+uc_stale 71 "$(jq -cn --arg now "$(uc_ago 120)" --arg old "$(uc_ago 19000)" \
+  '{activeRunId:"run-uc-71",activeStartedAt:$old,activeProgressAt:$now}')" | jq -e '
+  .data.trigger == "develop_freeze_stale" and .data.campaignTrace.disposition == "campaign_live" and
+  .data.campaignTrace.runId == "run-uc-71" and (.data.hint | test("Do NOT close"))
+' >/dev/null || uc_fail "live campaign was told to close"
+# Claimed/hung run: slot held, liveness signal older than the progress window.
+uc_stale 72 "$(jq -cn --arg old "$(uc_ago 19000)" \
+  '{activeRunId:"run-uc-72",activeStartedAt:$old,activeProgressAt:$old}')" | jq -e '
+  .data.campaignTrace.disposition == "stalled" and .data.campaignTrace.runId == "run-uc-72" and
+  (.data.campaignTrace.lastSignalAt | type == "string") and (.data.hint | test("stalled"))
+' >/dev/null || uc_fail "hung run not classified stalled"
+# Failed ledger append after a valid finish: finish recorded its intent, the
+# ledger append failed, the slot stayed held for retry.
+uc_stale 73 "$(jq -cn --arg old "$(uc_ago 19000)" --arg sha "$UC_FREEZE" \
+  '{activeRunId:"run-uc-73",activeStartedAt:$old,activeProgressAt:$old,
+    finishIntent:{runId:"run-uc-73",sha:$sha,verdict:"NO_GO",finishedAt:$old,digest:"d",recordedAt:$old}}')" |
+  jq -e '
+  .data.campaignTrace.disposition == "terminal_unreported" and
+  .data.campaignTrace.detail == "finish_not_committed" and
+  (.data.campaignTrace.verdictFile | endswith("/runs/run-uc-73/verdict.json")) and (.data.hint | test("Do NOT close"))
+' >/dev/null || uc_fail "finish-without-ledger-row not classified terminal_unreported"
+# ...and the committed shape (a finish that had no ledger configured).
+uc_stale 74 "$(jq -cn --arg sha "$UC_FREEZE" \
+  '{activeRunId:null,completedSha:$sha,completedRunId:"run-uc-74",completedAt:"2026-09-15T12:00:00Z"}')" | jq -e '
+  .data.campaignTrace.disposition == "terminal_unreported" and
+  .data.campaignTrace.detail == "completed_without_ledger_row" and
+  .data.campaignTrace.runId == "run-uc-74"
+' >/dev/null || uc_fail "completed-without-ledger-row not classified terminal_unreported"
+# An intent for some OTHER sha is not this freeze's terminal state.
+uc_stale 75 "$(jq -cn --arg now "$(uc_ago 60)" \
+  '{activeRunId:"run-uc-75",activeStartedAt:$now,finishIntent:{runId:"run-uc-75",sha:"ffff"}}')" | jq -e '
+  .data.campaignTrace.disposition == "campaign_live"
+' >/dev/null || uc_fail "foreign finishIntent read as terminal"
+# A reported terminal outcome never reaches classification: the ledger row is
+# adopted exactly as before.
+uc_open 76
+export SMOKE_GATE_PR_STATE_DIR="$PR_DIR" SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS=5400
+uc_age 6000
+jq -cn --arg t "$UC_TARGET" --arg f "$UC_FREEZE" \
+  '{schemaVersion:1,targetSha:$t,freezeSha:$f,freezePr:76,runId:"run-uc-76",verdict:"GO",finishedAt:"2026-09-15T12:00:00Z"}' \
+  >> "$STATE_DIR2/handoff-ledger.jsonl"
+bash "$GATE" poll | jq -e '.data.trigger != "develop_freeze_unclaimed"' >/dev/null
+jq -e '.completedRunId == "run-uc-76" and .handoffFreezePr == null' "$STATE_DIR2/develop-state.json" >/dev/null ||
+  uc_fail "ledger adoption changed"
+# The new knob goes through num_env like every other; the trigger is ackable.
+uc_open 77
+SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS=90m bash "$GATE" poll | jq -e '
+  .data.trigger == "gate_misconfigured" and (.data.missing | index("SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS") != null)
+' >/dev/null || uc_fail "bad SMOKE_GATE_HANDOFF_UNCLAIMED_SECONDS was not named"
+bash "$GATE" ack develop_freeze_unclaimed "77" acked | jq -e '.ok == true and .silenceable == false' >/dev/null
+# Leave the ambient ceiling exactly as case 33 left it for the cases below.
+export SMOKE_GATE_FREEZE_STALE_SECONDS=0
 
 # --- 34. Campaign cadence floor: a settled head inside the cooldown does NOT
 # freeze (candidate preserved), and the first poll past it freezes whatever
