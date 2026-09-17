@@ -199,9 +199,10 @@ scan_tag() {
 # commit's snapshot. Those were the expensive half: .github/workflows/ci.yml
 # runs both tsc invocations on every PR, and lint runs nightly in ci-full.yml
 # (since 2026-09-17 the author lints before pushing — CLAUDE.md, Development;
-# `prebuild` still refuses a lint failure at build time). Measured measured on this host at load 1.15, eslint 68.1s and
-# tsc 23.4s against the boundary check's 27.8s, and `objects_for_ref` pays that
-# per PUSHED COMMIT, so a five-commit branch cost ~10 minutes.
+# `prebuild` still refuses a lint failure at build time). Measured on this
+# host at load 1.15: eslint 68.1s and tsc 23.4s against the boundary check's
+# 27.8s, and `objects_for_ref` pays that per PUSHED COMMIT, so a five-commit
+# branch cost ~10 minutes.
 #
 # That was survivable while this hook only ever ran for a deployer pushing from
 # the main checkout. It is not survivable now that it runs for every agent
