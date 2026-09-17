@@ -3210,6 +3210,17 @@ describe('interim text — a <message> block written before a tool call', () => 
     expect(sentTexts()).toEqual(['head is 2c8cf18']);
   });
 
+  it('keeps the code inside a real block, and still recognises its verbatim repeat', async () => {
+    seedOrigin();
+    const block = '<message to="here">head is `2c8cf18`, see `src/a.ts:12`\n```\n19 suites green\n```</message>';
+    await run([
+      { type: 'interim_text', text: `Posting. ${block}` },
+      { type: 'result', text: block },
+    ]);
+
+    expect(sentTexts()).toEqual(['head is `2c8cf18`, see `src/a.ts:12`\n```\n19 suites green\n```']);
+  });
+
   it('does not send a block the agent only quoted in code', async () => {
     seedOrigin();
     await run([

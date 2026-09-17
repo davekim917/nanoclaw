@@ -2965,7 +2965,15 @@ const CODE_SPAN_RE = /```[\s\S]*?```|`[^`\n]*`/g;
 export async function dispatchInterimMessageBlocks(text: string, routing: RoutingContext): Promise<string[]> {
   if (routing.taskRun) return [];
   const delivered: string[] = [];
-  for (const block of text.replace(CODE_SPAN_RE, '').match(COMPLETE_MESSAGE_BLOCK_RE) ?? []) {
+  // Mask, never delete: code spans are blanked to equal-length spaces only to
+  // decide WHERE blocks are, and each block is then cut from the original
+  // text — a real update keeps the backticked shas and fenced output in its
+  // body, and the recorded span is byte-identical to a verbatim repeat. A
+  // block wholly inside a code span has its own opener blanked, so it never
+  // matches.
+  const masked = text.replace(CODE_SPAN_RE, (span) => ' '.repeat(span.length));
+  for (const m of masked.matchAll(COMPLETE_MESSAGE_BLOCK_RE)) {
+    const block = text.slice(m.index, m.index + m[0].length);
     const { sent } = await dispatchResultText(block, routing, { blocksOnly: true });
     if (sent > 0) delivered.push(block);
   }
