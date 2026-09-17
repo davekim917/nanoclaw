@@ -78,7 +78,7 @@ Channel recovery is an adapter contract rather than a Discord special case. Befo
 6. `pnpm exec vitest run` (host tests)
 7. `bun run test` in `container/agent-runner/` (container tests; the package script adds the hermeticity tripwire preload, and the suite shares process-global session fixtures)
 
-Any failure fails the PR.
+A failure here does **not** fail a PR by itself: this workflow runs nightly on `main` and on demand. A red nightly opens or updates the issue "Nightly CI is red on main" (the `report` job, schedule runs only), to be fixed forward the same day. A PR is blocked only by its own `CI` typecheck run and, if someone dispatched `CI full` on that PR head (`gh workflow run ci-full.yml --ref <branch>`), by that run — the merge gate reads a red or unfinished run on the head as blocking. Everything else is the author's local test run before pushing (CLAUDE.md, Development).
 
 ## Test hermeticity
 
