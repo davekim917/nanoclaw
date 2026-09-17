@@ -49,7 +49,7 @@
 #       re-read, so the verdict may be stale — re-run merge-check
 #   26  merge-check: `merge=defer mode=legacy` — not risk-scoped, so SKILL.md Step 6's
 #       evidence rules decide this merge; never chain it into `gh pr merge`. A legacy
-#       head still gets 24 first when a status or check run its base branch requires is red on it
+#       head still gets 24 first when a check GitHub marks required for the PR is red on it
 #       (`required_red`) or the newest independent-review-receipt:v1 for it is not
 #       CLEAR (`independent_receipt_not_clear`) — legacy_precheck
 #   27  merge: merge-check allowed the head, but `gh pr merge` did not merge it
@@ -1370,110 +1370,55 @@ independent_receipt_newest() {
       end'
 }
 
-# The status contexts BASE_REF requires that are red on exactly HEAD, as
-# `<context>=<state>` joined by ", "; empty when none is. Required is what
-# GitHub itself enforces on the branch: its rulesets' required_status_checks
-# rules (`rules/branches/<branch>`) and classic branch protection's contexts
-# (the `protection` object `branches/<branch>` carries for any reader). Read
-# from GitHub, never from a list here, so the repo names its own gate. On a
-# plan without rulesets that endpoint answers 403 "Upgrade to GitHub Pro or
-# make this repository public to enable this feature." (read 2026-09-17 on a
-# private repo of a free account); no ruleset can exist there, so that one
-# answer is an empty list, and any other failure is no verdict.
-#
-# A required context is either a commit status or a check run (an Actions job,
-# or an app's check), and GitHub matches both by name, so both are read and
-# the newest report per context name decides, whichever kind it is: a status
-# by created_at, a check run by started_at (completed_at when it never
-# started). A success status under a newer failed check run of the same name
-# is red, and the reverse is not. Red is named by what is acceptable, so a
-# conclusion GitHub adds later is red until someone says otherwise, as in
-# ci_verdict: a status whose state is neither `success` nor `pending`, or a
-# completed check run whose conclusion is not `success`, `neutral` or
-# `skipped` (failure, timed_out, cancelled, action_required, startup_failure,
-# stale, none at all). What has not finished is left alone — pending, queued,
-# in_progress, or not reported at all: a Release approval
-# waiting on a person is not a defect in the head, which is what
-# CI_EXCLUDED_CONTEXTS protects in ci_verdict too, and GitHub holds the merge
-# for it anyway. Nothing about the head is read when the branch requires
-# nothing.
-#
-# A requirement can be pinned to one GitHub App: `integration_id` on a ruleset
-# entry, `app_id` on a classic `checks[]` entry (null or -1 there is any
-# source). The pin stays on the entry, and only reports eligible for an entry
-# are compared for it, so a same-named green from another source never hides
-# the pinned app's red. A check run is eligible when its `app.id` is the pin.
-# A commit status is never eligible for a pinned entry: GitHub matches it to
-# the app that created it, and the statuses API names only a creating user, so
-# that cannot be read; a pinned entry with no eligible report is not reported,
-# never green by proxy. An unpinned entry takes any report of its name. One
-# context can carry several entries (a ruleset's and classic protection's);
-# each is judged alone, and any red one refuses.
-required_status_red() {
-  local head="$1" branch rules status=0 protection required statuses checks
-  branch=$(jq -rn --arg r "$2" '$r | split("/") | map(@uri) | join("/")') || return 1
-  rules=$(gh api --paginate --slurp "repos/$REPO/rules/branches/$branch?per_page=100" 2>/dev/null) || status=$?
-  if [ "$status" -ne 0 ]; then
-    if printf '%s' "$rules" | jq -e '[ .. | objects | select(.status == "403" and ((.message // "") | startswith("Upgrade to GitHub"))) ] | length == 1' >/dev/null 2>&1; then
-      rules='[]'
-    else
-      echo "could not read the rules for branch $2 in $REPO" >&2
-      return 1
-    fi
-  fi
-  protection=$(gh api "repos/$REPO/branches/$branch") || return 1
-  required=$(printf '%s\n%s\n' "$rules" "$protection" | jq -cs '
-    def pin: if type == "number" and . > 0 then . else null end;
-    .[1].protection.required_status_checks as $classic
-    | [ .[0] | .. | objects | select(.type == "required_status_checks") | .parameters.required_status_checks[]?
-        | { context, app: (.integration_id | pin) } ]
-      + [ $classic.checks[]? | { context, app: (.app_id | pin) } ]
-      + [ $classic.contexts[]? | select(. as $c | any($classic.checks[]?; .context == $c) | not) | { context: ., app: null } ]
-    | map(select(.context | type == "string")) | unique') || return 1
-  if [ "$required" = '[]' ]; then return 0; fi
-  statuses=$(gh api --paginate --slurp "repos/$REPO/commits/$head/statuses?per_page=100") || return 1
-  checks=$(head_check_runs "$head") || return 1
-  printf '%s\n%s\n' "$statuses" "$checks" | jq -rs --argjson required "$required" '
-    [ ( .[0][][]? | { context, app: null, status: true, at: (.created_at // ""), id: (.id // 0), state,
-                      red: (.state != "success" and .state != "pending") } ),
-      ( .[1][]? | { context: .name, app: (.app_id // null), status: false, at: (.started_at // .completed_at // ""), id: (.id // 0),
-                    state: (if .status == "completed" then (.conclusion // "none") else (.status // "unknown") end),
-                    red: (.status == "completed" and (.conclusion | IN("success", "neutral", "skipped") | not)) } ) ] as $reports
-    | [ $required[] as $need
-        | [ $reports[] | select(.context == $need.context)
-            | select(if $need.app == null then true else (.status | not) and .app == $need.app end) ]
-        | max_by([.at, .id]) | select(. != null and .red)
-        | "\(.context)=\(.state)\(if $need.app != null then " (app \($need.app))" else "" end)" ]
-    | unique | join(", ")'
+# One page of the PR head's status rollup: every check run and commit status
+# GitHub counts on it, each with GitHub's own answer to whether this PR's base
+# requires it. A head nothing has reported on has no rollup at all (null, read
+# 2026-09-17 on a repo with no CI); that is an empty page, not a failed read.
+rollup_page() {
+  gh api graphql -f query='
+    query($owner:String!,$name:String!,$pr:Int!,$after:String){
+      repository(owner:$owner,name:$name){ pullRequest(number:$pr){
+        headRefOid statusCheckRollup{ contexts(first:100,after:$after){ pageInfo{hasNextPage endCursor} nodes{
+          __typename
+          ... on CheckRun{ name status conclusion isRequired(pullRequestNumber:$pr) }
+          ... on StatusContext{ context state isRequired(pullRequestNumber:$pr) }
+        } } }
+      } }
+    }' \
+    -F owner="$OWNER" -F name="$NAME" -F pr="$PR" -F after="$1" \
+    | jq -c 'if .data.repository.pullRequest != null and .data.repository.pullRequest.statusCheckRollup == null
+             then .data.repository.pullRequest.statusCheckRollup = { contexts: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } }
+             else . end'
 }
 
-# Every check run on exactly HEAD, as a JSON array of {name, status,
-# conclusion, started_at, completed_at, id, app_id}. `commits/<sha>/check-runs` is the
-# whole answer, apps' checks included, but it 403s ("Resource not accessible
-# by personal access token") under the narrower tokens container agents may
-# hold (ci_verdict's header). Under that one answer the head's Actions jobs
-# stand in: `actions/runs` is what ci_verdict already reads with those tokens,
-# a job's name is its check run's name, and `filter=latest` keeps a re-run's
-# replaced attempt out; each carries GitHub Actions' app id (15368, `app.id`
-# of every Actions check run, read 2026-09-17). Another app's check run is not
-# visible that way. Any other failure is no verdict.
-head_check_runs() {
-  local raw status=0 runs id jobs all='[]'
-  raw=$(gh api --paginate --slurp "repos/$REPO/commits/$1/check-runs?per_page=100" 2>/dev/null) || status=$?
-  if [ "$status" -eq 0 ]; then
-    printf '%s' "$raw" | jq -c '[ .[].check_runs[]? | { name, status, conclusion, started_at, completed_at, id, app_id: (.app.id // null) } ]'
-    return
-  fi
-  if ! printf '%s' "$raw" | jq -e '[ .. | objects | select(.status == "403" and ((.message // "") | startswith("Resource not accessible"))) ] | length >= 1' >/dev/null 2>&1; then
-    echo "could not read the check runs on $1 in $REPO" >&2
-    return 1
-  fi
-  runs=$(gh api --paginate --slurp "repos/$REPO/actions/runs?head_sha=$1&per_page=100") || return 1
-  for id in $(printf '%s' "$runs" | jq -r --arg head "$1" '.[].workflow_runs[]? | select(.head_sha == $head) | .id | numbers'); do
-    jobs=$(gh api --paginate --slurp "repos/$REPO/actions/runs/$id/jobs?per_page=100&filter=latest") || return 1
-    all=$(printf '%s\n%s\n' "$all" "$jobs" | jq -cs '.[0] + [ .[1][].jobs[]? | { name, status, conclusion, started_at, completed_at, id, app_id: 15368 } ]') || return 1
-  done
-  printf '%s' "$all"
+# The required checks that are red on exactly HEAD, as `<name>=<state>` joined
+# by ", "; empty when none is. Which checks are required, and which report
+# answers for each, is GitHub's to say and is asked, not re-derived:
+# `isRequired(pullRequestNumber:)` is its evaluation across rulesets and
+# classic protection, app pins, and a status and a check run sharing a name
+# (it requires both). Three review rounds re-deriving those rules one case at
+# a time is why none of them is restated here.
+#
+# Red is named by what is acceptable, as in ci_verdict, so a value GitHub adds
+# later is red: a required check run that is COMPLETED with a conclusion other
+# than SUCCESS, NEUTRAL or SKIPPED, or a required status whose state is not
+# SUCCESS, PENDING or EXPECTED. What has not finished or not reported is left
+# alone: a Release approval waiting on a person is not a defect in the head,
+# which is what CI_EXCLUDED_CONTEXTS protects in ci_verdict too, and GitHub
+# holds the merge for it anyway. The rollup is the PR head's, so every page
+# must name HEAD as that head; a failed or partial read is no verdict, and
+# there is no second source to fall back on.
+required_status_red() {
+  local pages
+  pages=$(paginate_connection statusCheckRollup.contexts rollup_page) || return 1
+  printf '%s\n' "$pages" | jq -rs --arg head "$1" '
+    if all(.[]; .data.repository.pullRequest.headRefOid == $head) | not
+    then error("the status rollup read is for another head than \($head)") else . end
+    | [ .[] | .data.repository.pullRequest.statusCheckRollup.contexts.nodes[] | select(.isRequired == true)
+        | if .__typename == "CheckRun"
+          then select(.status == "COMPLETED" and (.conclusion | IN("SUCCESS", "NEUTRAL", "SKIPPED") | not)) | "\(.name)=\(.conclusion // "none" | ascii_downcase)"
+          else select(.state | IN("SUCCESS", "PENDING", "EXPECTED") | not) | "\(.context)=\(.state // "none" | ascii_downcase)" end ]
+    | unique | join(", ")'
 }
 
 # What a legacy merge still answers to mechanically. merge-check defers a
@@ -1484,9 +1429,12 @@ head_check_runs() {
 # still Step 6's. No verdict (1) when either cannot be read.
 legacy_precheck() {
   local red receipt
-  red=$(required_status_red "$SCOPE_HEAD" "$SCOPE_BASE_REF") || exit 1
+  red=$(required_status_red "$SCOPE_HEAD") || {
+    echo "merge=error head=$SCOPE_HEAD: could not read which required checks are red on this head (GitHub status rollup); no verdict" >&2
+    exit 1
+  }
   if [ -n "$red" ]; then
-    echo "merge=refused head=$SCOPE_HEAD mode=legacy: required_red: $red — $SCOPE_BASE_REF requires that status and it is red on this head; fix what it reports, never merge around it" >&2
+    echo "merge=refused head=$SCOPE_HEAD mode=legacy: required_red: $red — GitHub requires it for this PR and it is red on this head; fix what it reports, never merge around it" >&2
     exit 24
   fi
   receipt=$(independent_receipt_state "$SCOPE_HEAD") || exit 1

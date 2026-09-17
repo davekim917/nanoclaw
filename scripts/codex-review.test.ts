@@ -149,39 +149,6 @@ if [ -n "$rest" ]; then
       printf ']'
       exit 0
       ;;
-    */commits/*/check-runs\\?*)
-      # check-runs--<sha>.json is every check run on that commit; absent = none. A
-      # .forbidden marker answers as GitHub does to a token that may not read checks,
-      # and a .error marker fails another way.
-      sha="\${rest#*/commits/}"
-      sha="\${sha%%/*}"
-      if [ -f "$MOCK_DIR/check-runs--$sha.forbidden" ]; then
-        echo '[{"message":"Resource not accessible by personal access token","status":"403"}]'
-        echo 'gh: Resource not accessible by personal access token (HTTP 403)' >&2
-        exit 1
-      fi
-      if [ -f "$MOCK_DIR/check-runs--$sha.error" ]; then
-        echo '[{"message":"Server Error","status":"500"}]'
-        echo 'gh: Server Error (HTTP 500)' >&2
-        exit 1
-      fi
-      printf '[{"total_count":0,"check_runs":'
-      if [ -f "$MOCK_DIR/check-runs--$sha.json" ]; then cat "$MOCK_DIR/check-runs--$sha.json"; else printf '[]'; fi
-      printf '}]'
-      exit 0
-      ;;
-    */actions/runs/*/jobs\\?*)
-      # jobs--<run id>.json is that run's jobs; absent = the read fails.
-      run="\${rest#*/actions/runs/}"
-      run="\${run%%/*}"
-      if [ ! -f "$MOCK_DIR/jobs--$run.json" ]; then
-        echo '{"message":"Not Found","status":"404"}'
-        echo 'gh: Not Found (HTTP 404)' >&2
-        exit 1
-      fi
-      printf '[{"total_count":0,"jobs":'; cat "$MOCK_DIR/jobs--$run.json"; printf '}]'
-      exit 0
-      ;;
     */collaborators/*/permission)
       # permission--<login> holds that login's repository permission (absent = write), as the
       # script's --jq .permission prints it; a .error marker makes the lookup fail.
@@ -193,34 +160,6 @@ if [ -n "$rest" ]; then
         exit 1
       fi
       if [ -f "$MOCK_DIR/permission--$login" ]; then cat "$MOCK_DIR/permission--$login"; else echo write; fi
-      exit 0
-      ;;
-    */rules/branches/*)
-      # rules--<branch>.json is the branch's active rules, as the API lists them; absent = none.
-      # A .noplan marker answers as GitHub does where rulesets are not on the plan, and a
-      # .error marker fails another way. gh prints an error body wrapped under --slurp too.
-      branch="\${rest#*/rules/branches/}"
-      branch="\${branch%%\\?*}"
-      if [ -f "$MOCK_DIR/rules--$branch.noplan" ]; then
-        echo '[{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","status":"403"}]'
-        echo 'gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)' >&2
-        exit 1
-      fi
-      if [ -f "$MOCK_DIR/rules--$branch.error" ]; then
-        echo '[{"message":"Server Error","status":"500"}]'
-        echo 'gh: Server Error (HTTP 500)' >&2
-        exit 1
-      fi
-      printf '['
-      if [ -f "$MOCK_DIR/rules--$branch.json" ]; then cat "$MOCK_DIR/rules--$branch.json"; else printf '[]'; fi
-      printf ']'
-      exit 0
-      ;;
-    */branches/*)
-      # branch--<branch>.json is the branch with its classic protection summary; absent = unprotected.
-      branch="\${rest#*/branches/}"
-      if [ -f "$MOCK_DIR/branch--$branch.json" ]; then cat "$MOCK_DIR/branch--$branch.json"
-      else printf '{"name":"%s","protection":{"enabled":false,"required_status_checks":{"enforcement_level":"off","contexts":[],"checks":[]}}}\\n' "$branch"; fi
       exit 0
       ;;
     */git/ref/heads/*)
@@ -276,6 +215,7 @@ for arg in "$@"; do
 done
 case "$query" in
   *userContentEdits*) connection=audit ;;
+  *statusCheckRollup*) connection=rollup ;;
   *reviewThreads*) connection=reviewThreads ;;
   *reviews*) connection=reviews ;;
   *reactions*) connection=reactions ;;
@@ -546,6 +486,30 @@ function independentReceipt(
   };
 }
 
+// The PR head's status rollup as GraphQL returns it: every check run and commit
+// status, each with GitHub's own `isRequired` for this PR. `null` = a head
+// nothing has reported on, which has no rollup at all.
+function rollupPage(nodes: Page[] | null, head = HEAD, hasNextPage = false, endCursor: string | null = null): Page {
+  return {
+    data: {
+      repository: {
+        pullRequest: {
+          headRefOid: head,
+          statusCheckRollup: nodes === null ? null : { contexts: { pageInfo: { hasNextPage, endCursor }, nodes } },
+        },
+      },
+    },
+  };
+}
+
+function rollupRun(name: string, status: string, conclusion: string | null, isRequired = true): Page {
+  return { __typename: 'CheckRun', name, status, conclusion, isRequired };
+}
+
+function rollupStatus(context: string, state: string, isRequired = true): Page {
+  return { __typename: 'StatusContext', context, state, isRequired };
+}
+
 // findings_json (the gate's payload) reads totalCount, which connectionPage omits.
 function threadsPage(nodes: unknown[]): Page {
   return {
@@ -576,6 +540,7 @@ function scopeFixture(
     reviews?: Page[];
     reactions?: Page[];
     threads?: Page[];
+    rollup?: Page[] | null;
     title?: string;
     body?: string;
   } = {},
@@ -616,6 +581,7 @@ function scopeFixture(
   writePage(root, 'reviews', 1, connectionPage('reviews', opts.reviews ?? []));
   writePage(root, 'reactions', 1, connectionPage('reactions', opts.reactions ?? []));
   writePage(root, 'reviewThreads', 1, threadsPage(opts.threads ?? []));
+  writePage(root, 'rollup', 1, rollupPage(opts.rollup === undefined ? [] : opts.rollup));
 }
 
 // Runs the helper with any arguments. Each run starts a fresh call log and
@@ -2697,76 +2663,108 @@ describe('codex-review risk-scoped review requests', () => {
   });
 
   describe('legacy precheck: the two facts a legacy merge answers to mechanically', () => {
-    // What the develop ruleset of the repo this was found in requires.
-    const REQUIRED = ['CI Gate', 'Release policy', 'Release approval'];
-
-    function requires(root: string, contexts: string[], branch = 'main'): void {
-      writeJson(root, `rules--${branch}.json`, [
-        { type: 'deletion' },
-        {
-          type: 'required_status_checks',
-          parameters: { required_status_checks: contexts.map((context) => ({ context })) },
-        },
-      ]);
+    function legacy(root: string, opts: { rollup?: Page[] | null; comments?: Page[] } = {}): void {
+      scopeFixture(root, { baseConfig: null, labels: [], rollup: opts.rollup, comments: opts.comments });
     }
 
-    function legacy(root: string, opts: { statuses?: Page[]; comments?: Page[]; required?: string[] } = {}): void {
-      scopeFixture(root, { baseConfig: null, labels: [], statuses: opts.statuses, comments: opts.comments });
-      requires(root, opts.required ?? REQUIRED);
-    }
-
+    // Which checks are required, and which report answers for each, is GitHub's
+    // answer (`isRequired`); these cases fix only what is read as red.
     it.each([
-      ['failure', 'Release policy=failure'],
-      ['error', 'Release policy=error'],
-      ['some_future_state', 'Release policy=some_future_state'],
-    ])('refuses (24) when a required status is %s on the head, and never defers', (state, named) => {
+      ['a required status is FAILURE', rollupStatus('Release policy', 'FAILURE'), 'Release policy=failure'],
+      ['a required status is ERROR', rollupStatus('Release policy', 'ERROR'), 'Release policy=error'],
+      [
+        'a required status has a state GitHub adds later',
+        rollupStatus('Release policy', 'SOME_FUTURE_STATE'),
+        'Release policy=some_future_state',
+      ],
+      ['a required check run concluded FAILURE', rollupRun('CI Gate', 'COMPLETED', 'FAILURE'), 'CI Gate=failure'],
+      ['a required check run concluded TIMED_OUT', rollupRun('CI Gate', 'COMPLETED', 'TIMED_OUT'), 'CI Gate=timed_out'],
+      ['a required check run concluded CANCELLED', rollupRun('CI Gate', 'COMPLETED', 'CANCELLED'), 'CI Gate=cancelled'],
+      [
+        'a required check run concluded ACTION_REQUIRED',
+        rollupRun('CI Gate', 'COMPLETED', 'ACTION_REQUIRED'),
+        'CI Gate=action_required',
+      ],
+      [
+        'a required check run concluded STARTUP_FAILURE',
+        rollupRun('CI Gate', 'COMPLETED', 'STARTUP_FAILURE'),
+        'CI Gate=startup_failure',
+      ],
+      ['a required check run concluded STALE', rollupRun('CI Gate', 'COMPLETED', 'STALE'), 'CI Gate=stale'],
+      [
+        'a required check run has a conclusion GitHub adds later',
+        rollupRun('CI Gate', 'COMPLETED', 'SOME_FUTURE_CONCLUSION'),
+        'CI Gate=some_future_conclusion',
+      ],
+      ['a required check run completed with no conclusion', rollupRun('CI Gate', 'COMPLETED', null), 'CI Gate=none'],
+    ])('refuses (24) when %s, and never defers', (_case, node, named) => {
       const root = tempRoot();
-      legacy(root, { statuses: [commitStatus('Release policy', state), commitStatus('Release approval', 'success')] });
+      legacy(root, { rollup: [rollupStatus('Release approval', 'SUCCESS'), node] });
 
       const result = runHelper(root, ['merge-check', '--head', HEAD]);
       expect(result.status).toBe(24);
       expect(result.stderr).toContain(`merge=refused head=${HEAD} mode=legacy: required_red: ${named}`);
       expect(result.stdout).not.toContain('merge=');
-      expect(result.calls).toContain('rest repos/example/repository/rules/branches/main?per_page=100\n');
     });
 
-    it('reads classic branch protection as required too', () => {
+    it.each([
+      ['a required status PENDING', rollupStatus('Release approval', 'PENDING')],
+      ['a required status EXPECTED', rollupStatus('Release approval', 'EXPECTED')],
+      ['a required check run IN_PROGRESS', rollupRun('CI Gate', 'IN_PROGRESS', null)],
+      ['a required check run QUEUED', rollupRun('CI Gate', 'QUEUED', null)],
+      ['a required check run NEUTRAL', rollupRun('CI Gate', 'COMPLETED', 'NEUTRAL')],
+      ['a required check run SKIPPED', rollupRun('CI Gate', 'COMPLETED', 'SKIPPED')],
+      ['a red status GitHub does not require', rollupStatus('ci/optional', 'FAILURE', false)],
+      ['a red check run GitHub does not require', rollupRun('lint', 'COMPLETED', 'FAILURE', false)],
+    ])('does not refuse on %s', (_case, node) => {
       const root = tempRoot();
-      legacy(root, { required: [], statuses: [commitStatus('ci/gate', 'failure')] });
-      writeJson(root, 'branch--main.json', {
-        name: 'main',
-        protection: { enabled: true, required_status_checks: { enforcement_level: 'everyone', contexts: ['ci/gate'] } },
-      });
-
-      const result = runHelper(root, ['merge-check', '--head', HEAD]);
-      expect(result.status).toBe(24);
-      expect(result.stderr).toContain('required_red: ci/gate=failure');
-    });
-
-    it('judges only the newest status per required context: a failure since replaced by success does not refuse', () => {
-      const root = tempRoot();
-      legacy(root, {
-        statuses: [
-          commitStatus('Release policy', 'failure', '2026-09-05T00:02:00Z'),
-          commitStatus('Release policy', 'success', '2026-09-05T00:03:00Z'),
-        ],
-      });
+      legacy(root, { rollup: [node] });
 
       expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
     });
 
-    it('does not refuse on a red status the branch does not require', () => {
+    it('takes a status and a check run of one name as two requirements: either one red refuses, whichever is green', () => {
       const root = tempRoot();
-      legacy(root, { statuses: [commitStatus('ci/optional', 'failure')] });
+      legacy(root, { rollup: [rollupStatus('CI Gate', 'SUCCESS'), rollupRun('CI Gate', 'COMPLETED', 'FAILURE')] });
+      const redRun = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(redRun.status).toBe(24);
+      expect(redRun.stderr).toContain('required_red: CI Gate=failure');
 
+      legacy(root, { rollup: [rollupStatus('CI Gate', 'FAILURE'), rollupRun('CI Gate', 'COMPLETED', 'SUCCESS')] });
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(24);
+
+      legacy(root, { rollup: [rollupStatus('CI Gate', 'SUCCESS'), rollupRun('CI Gate', 'COMPLETED', 'SUCCESS')] });
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+    });
+
+    it("leaves an app pin to GitHub: the pinned app's red run is the required one, another source's same-named green is not", () => {
+      const root = tempRoot();
+      legacy(root, {
+        rollup: [
+          rollupRun('CI Gate', 'COMPLETED', 'FAILURE', true),
+          rollupRun('CI Gate', 'COMPLETED', 'SUCCESS', false),
+        ],
+      });
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(24);
+
+      legacy(root, {
+        rollup: [
+          rollupRun('CI Gate', 'COMPLETED', 'FAILURE', false),
+          rollupRun('CI Gate', 'COMPLETED', 'SUCCESS', true),
+        ],
+      });
       expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
     });
 
     it('does not read a pending required Release approval as red: it defers, and ci-wait still reads green', () => {
       const root = tempRoot();
       legacy(root, {
-        statuses: [commitStatus('Release approval', 'pending'), commitStatus('Release policy', 'success')],
+        rollup: [rollupStatus('Release approval', 'PENDING'), rollupStatus('Release policy', 'SUCCESS')],
       });
+      writeJson(root, `statuses--${HEAD}.json`, [
+        commitStatus('Release approval', 'pending'),
+        commitStatus('Release policy', 'success'),
+      ]);
 
       const merge = runHelper(root, ['merge-check', '--head', HEAD]);
       expect(merge.status).toBe(26);
@@ -2779,117 +2777,34 @@ describe('codex-review risk-scoped review requests', () => {
       expect(wait.stdout + wait.stderr).not.toContain('ci_pending');
     });
 
-    function checkRun(
-      name: string,
-      status: string,
-      conclusion: string | null,
-      startedAt = '2026-09-05T00:02:00Z',
-    ): Page {
-      return { id: Date.parse(startedAt) / 1000, name, status, conclusion, started_at: startedAt, completed_at: null };
-    }
-
-    it.each([
-      'failure',
-      'timed_out',
-      'cancelled',
-      'action_required',
-      'startup_failure',
-      'stale',
-      'some_future_conclusion',
-    ])('refuses (24) when a required check run concluded %s', (conclusion) => {
+    it('reads every page of the rollup, and a head nothing has reported on as nothing red', () => {
       const root = tempRoot();
       legacy(root);
-      writeJson(root, `check-runs--${HEAD}.json`, [checkRun('CI Gate', 'completed', conclusion)]);
+      writePage(root, 'rollup', 1, rollupPage([rollupStatus('Release policy', 'SUCCESS')], HEAD, true, 'rollup-2'));
+      writePage(root, 'rollup', 2, rollupPage([rollupRun('CI Gate', 'COMPLETED', 'FAILURE')]));
+      const paged = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(paged.status).toBe(24);
+      expect(paged.stderr).toContain('required_red: CI Gate=failure');
 
-      const result = runHelper(root, ['merge-check', '--head', HEAD]);
-      expect(result.status).toBe(24);
-      expect(result.stderr).toContain(`mode=legacy: required_red: CI Gate=${conclusion}`);
-      expect(result.stdout).not.toContain('merge=');
-    });
-
-    it.each([
-      ['in_progress', checkRun('CI Gate', 'in_progress', null)],
-      ['queued', checkRun('CI Gate', 'queued', null)],
-      ['neutral', checkRun('CI Gate', 'completed', 'neutral')],
-      ['skipped', checkRun('CI Gate', 'completed', 'skipped')],
-      ['red but not required', checkRun('lint', 'completed', 'failure')],
-    ])('does not refuse on a check run that is %s', (_case, run) => {
-      const root = tempRoot();
-      legacy(root);
-      writeJson(root, `check-runs--${HEAD}.json`, [run]);
-
+      legacy(root, { rollup: null });
       expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
     });
 
-    it('lets the newest report per context name decide, across a status and a check run of one name', () => {
-      const root = tempRoot();
-      legacy(root, { statuses: [commitStatus('CI Gate', 'success', '2026-09-05T00:02:00Z')] });
-      writeJson(root, `check-runs--${HEAD}.json`, [
-        checkRun('CI Gate', 'completed', 'failure', '2026-09-05T00:03:00Z'),
-      ]);
-      const newerRun = runHelper(root, ['merge-check', '--head', HEAD]);
-      expect(newerRun.status).toBe(24);
-      expect(newerRun.stderr).toContain('required_red: CI Gate=failure');
-
-      legacy(root, { statuses: [commitStatus('CI Gate', 'success', '2026-09-05T00:04:00Z')] });
-      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
-
-      // A re-run in progress is newer than the failure it replaces.
-      legacy(root);
-      writeJson(root, `check-runs--${HEAD}.json`, [
-        checkRun('CI Gate', 'completed', 'failure', '2026-09-05T00:03:00Z'),
-        checkRun('CI Gate', 'in_progress', null, '2026-09-05T00:05:00Z'),
-      ]);
-      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
-    });
-
-    it("reads the head's Actions jobs when the token may not read check runs, and gives no verdict on any other failure", () => {
+    it('gives no verdict (1), never a defer, when the rollup cannot be read or is for another head', () => {
       const root = tempRoot();
       legacy(root);
-      fs.writeFileSync(path.join(root, `check-runs--${HEAD}.forbidden`), '');
-      const run = workflowRun('CI', 'completed', 'failure');
-      writeJson(root, 'runs.json', {
-        total_count: 2,
-        workflow_runs: [run, workflowRun('CI', 'completed', 'failure', undefined, OLD_HEAD)],
-      });
-      writeJson(root, `jobs--${run.id}.json`, [checkRun('CI Gate', 'completed', 'failure')]);
+      fs.writeFileSync(path.join(root, 'rollup-fail-1'), '');
+      const failed = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(failed.status).toBe(1);
+      expect(failed.stderr).toContain('could not read which required checks are red on this head');
+      expect(failed.stdout).not.toContain('merge=');
 
-      const result = runHelper(root, ['merge-check', '--head', HEAD]);
-      expect(result.status).toBe(24);
-      expect(result.stderr).toContain('required_red: CI Gate=failure');
-      expect(result.calls).toContain(`actions/runs/${run.id}/jobs?per_page=100&filter=latest`);
-
-      fs.rmSync(path.join(root, `check-runs--${HEAD}.forbidden`));
-      fs.writeFileSync(path.join(root, `check-runs--${HEAD}.error`), '');
-      const broken = runHelper(root, ['merge-check', '--head', HEAD]);
-      expect(broken.status).toBe(1);
-      expect(broken.stderr).toContain('could not read the check runs');
-      expect(broken.stdout).not.toContain('merge=');
-    });
-
-    it('reads nothing about the head when the branch requires nothing', () => {
-      const root = tempRoot();
-      legacy(root, { required: [], statuses: [commitStatus('Release policy', 'failure')] });
-
-      const result = runHelper(root, ['merge-check', '--head', HEAD]);
-      expect(result.status).toBe(26);
-      expect(result.calls).not.toContain('/statuses');
-      expect(result.calls).not.toContain('/check-runs');
-    });
-
-    it('treats the no-rulesets-on-this-plan 403 as nothing required, and any other rules failure as no verdict', () => {
-      const root = tempRoot();
-      legacy(root, { statuses: [commitStatus('Release policy', 'failure')] });
-      fs.rmSync(path.join(root, 'rules--main.json'));
-      fs.writeFileSync(path.join(root, 'rules--main.noplan'), '');
-      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
-
-      fs.rmSync(path.join(root, 'rules--main.noplan'));
-      fs.writeFileSync(path.join(root, 'rules--main.error'), '');
-      const broken = runHelper(root, ['merge-check', '--head', HEAD]);
-      expect(broken.status).toBe(1);
-      expect(broken.stderr).toContain('could not read the rules for branch main');
-      expect(broken.stdout).not.toContain('merge=');
+      fs.rmSync(path.join(root, 'rollup-fail-1'));
+      writePage(root, 'rollup', 1, rollupPage([rollupStatus('Release policy', 'SUCCESS')], OTHER_HEAD));
+      const moved = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(moved.status).toBe(1);
+      expect(moved.stderr).toContain(`the status rollup read is for another head than ${HEAD}`);
+      expect(moved.stdout).not.toContain('merge=');
     });
 
     it('refuses (24) when a newer independent CHANGES receipt follows an older approving substitute receipt', () => {
@@ -3116,109 +3031,6 @@ describe('codex-review risk-scoped review requests', () => {
       expect(result.stderr).toContain('(marker inside a code fence or an HTML comment) verdict CHANGES');
     });
 
-    describe('a required context pinned to one app', () => {
-      const ACTIONS = 15368;
-      function appRun(name: string, conclusion: string, appId: number, startedAt: string): Page {
-        return { ...checkRun(name, 'completed', conclusion, startedAt), app: { id: appId } };
-      }
-      function pinned(root: string, reports: { runs?: Page[]; statuses?: Page[] }, classic = false): void {
-        legacy(root, { required: [], statuses: reports.statuses });
-        if (classic)
-          writeJson(root, 'branch--main.json', {
-            name: 'main',
-            protection: {
-              enabled: true,
-              required_status_checks: { contexts: ['CI Gate'], checks: [{ context: 'CI Gate', app_id: ACTIONS }] },
-            },
-          });
-        else
-          writeJson(root, 'rules--main.json', [
-            {
-              type: 'required_status_checks',
-              parameters: { required_status_checks: [{ context: 'CI Gate', integration_id: ACTIONS }] },
-            },
-          ]);
-        writeJson(root, `check-runs--${HEAD}.json`, reports.runs ?? []);
-      }
-
-      it.each([
-        ['a ruleset integration_id', false],
-        ['a classic checks[] app_id', true],
-      ])(
-        "refuses on the pinned app's red run under a newer same-named green from another source (%s)",
-        (_case, classic) => {
-          const root = tempRoot();
-          pinned(
-            root,
-            {
-              runs: [
-                appRun('CI Gate', 'failure', ACTIONS, '2026-09-05T00:02:00Z'),
-                appRun('CI Gate', 'success', 999, '2026-09-05T00:05:00Z'),
-              ],
-              statuses: [commitStatus('CI Gate', 'success', '2026-09-05T00:06:00Z')],
-            },
-            classic,
-          );
-
-          const result = runHelper(root, ['merge-check', '--head', HEAD]);
-          expect(result.status).toBe(24);
-          expect(result.stderr).toContain(`required_red: CI Gate=failure (app ${ACTIONS})`);
-        },
-      );
-
-      it("ignores another source's red, run or status: a pinned context with no eligible report is not reported", () => {
-        const root = tempRoot();
-        pinned(root, {
-          runs: [appRun('CI Gate', 'failure', 999, '2026-09-05T00:05:00Z')],
-          statuses: [commitStatus('CI Gate', 'failure', '2026-09-05T00:06:00Z')],
-        });
-        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
-      });
-
-      it("defers once the pinned app's own newer run is green", () => {
-        const root = tempRoot();
-        pinned(root, {
-          runs: [
-            appRun('CI Gate', 'failure', ACTIONS, '2026-09-05T00:02:00Z'),
-            appRun('CI Gate', 'success', ACTIONS, '2026-09-05T00:05:00Z'),
-          ],
-        });
-        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
-      });
-
-      it('counts an Actions job standing in for a check run as the Actions app', () => {
-        const root = tempRoot();
-        pinned(root, {});
-        fs.writeFileSync(path.join(root, `check-runs--${HEAD}.forbidden`), '');
-        const run = workflowRun('CI', 'completed', 'failure');
-        writeJson(root, 'runs.json', { total_count: 1, workflow_runs: [run] });
-        writeJson(root, `jobs--${run.id}.json`, [checkRun('CI Gate', 'completed', 'failure')]);
-
-        const result = runHelper(root, ['merge-check', '--head', HEAD]);
-        expect(result.status).toBe(24);
-        expect(result.stderr).toContain(`CI Gate=failure (app ${ACTIONS})`);
-      });
-
-      it('leaves an unpinned context taking any report of its name, as before', () => {
-        const root = tempRoot();
-        legacy(root, { required: ['CI Gate'] });
-        writeJson(root, `check-runs--${HEAD}.json`, [
-          appRun('CI Gate', 'failure', ACTIONS, '2026-09-05T00:02:00Z'),
-          appRun('CI Gate', 'success', 999, '2026-09-05T00:05:00Z'),
-        ]);
-        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
-
-        writeJson(root, 'rules--main.json', [
-          {
-            type: 'required_status_checks',
-            parameters: { required_status_checks: [{ context: 'CI Gate', integration_id: null }] },
-          },
-        ]);
-        writeJson(root, `check-runs--${HEAD}.json`, [appRun('CI Gate', 'failure', 999, '2026-09-05T00:05:00Z')]);
-        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(24);
-      });
-    });
-
     it('refuses a legacy head that is not the one named, before judging it', () => {
       const root = tempRoot();
       legacy(root);
@@ -3226,7 +3038,7 @@ describe('codex-review risk-scoped review requests', () => {
       const result = runHelper(root, ['merge-check', '--head', OTHER_HEAD]);
       expect(result.status).toBe(24);
       expect(result.stderr).toContain(`the PR head is not ${OTHER_HEAD}`);
-      expect(result.calls).not.toContain('rules/branches');
+      expect(result.calls).not.toMatch(/^rollup /m);
     });
 
     it('gives no verdict (1), never a defer, when the comments cannot be read', () => {
@@ -3239,20 +3051,19 @@ describe('codex-review risk-scoped review requests', () => {
       expect(result.stdout).not.toContain('merge=');
     });
 
-    it('leaves a risk-scoped repo alone: no rules read, and neither fact changes its verdict', () => {
+    it('leaves a risk-scoped repo alone: no rollup read, and neither fact changes its verdict', () => {
       const root = tempRoot();
       scopeFixture(root, {
         labels: [],
         statuses: [commitStatus('Release policy', 'failure')],
+        rollup: [rollupStatus('Release policy', 'FAILURE')],
         comments: [independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z')],
       });
-      requires(root, REQUIRED);
 
       const result = runHelper(root, ['merge-check', '--head', HEAD]);
       expect(result.status).toBe(0);
       expect(result.stdout).toContain(`merge=allowed head=${HEAD} mode=risk-scoped verdict=skip ci=green`);
-      expect(result.calls).not.toContain('rules/branches');
-      expect(result.calls).not.toContain('/branches/main');
+      expect(result.calls).not.toMatch(/^rollup /m);
     });
   });
 
