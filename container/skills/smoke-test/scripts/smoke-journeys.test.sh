@@ -20,9 +20,16 @@ expect() { # <label> <jq-assertion> <json>
 SHA="$(printf 'a%.0s' $(seq 40))"
 NOW=2026-09-10T00:00:00Z
 
-match() { # <paths-json> [extra args...]
+# A run root where the one floor journey was proven yesterday, so a LIGHT
+# campaign owes the floor nothing and the fixtures below stay about matching.
+# (With no readable run root every floor journey is due — section 3.)
+FRESH_ROOT="$WORK/fresh-runs"; mkdir -p "$FRESH_ROOT/r0/markers"
+jq -n '{status:"pass",completedAt:"2026-09-09T12:00:00Z",evidence:["api.txt"]}' > "$FRESH_ROOT/r0/markers/branch-scope-crossing.json"
+jq -n '{lanes:[{id:"branch-scope-crossing",kind:"floor",evidence:"api"}]}' > "$FRESH_ROOT/r0/completion-contract.json"
+match() { # <paths-json> [extra args...] (later flags override these defaults)
   local paths="$1"; shift
-  printf '%s' "$paths" | python3 "$TOOL" match --catalogue "$CATALOGUE" --as-of "$NOW" "$@"
+  printf '%s' "$paths" | python3 "$TOOL" match --catalogue "$CATALOGUE" --as-of "$NOW" \
+    --size light --run-root "$FRESH_ROOT" "$@"
 }
 # What smoke-pr-gate.sh journeys_pin_promote leaves in the shared lease dir for
 # (repo org/repo, PR 7, <head>): the selection plus pin fields, and the exact
@@ -31,7 +38,7 @@ match() { # <paths-json> [extra args...]
 gate_pin() { # <lease-dir> <head-sha> <paths-json> [pr] [repo-slug] -> prints the pin file path
   local dir="$1" head="$2" pr="${4:-7}" slug="${5:-org__repo}" out digest pin
   mkdir -p "$dir"
-  out="$(match "$3" --snapshot-out "$dir/.snap")"
+  out="$(match "$3" --snapshot-out "$dir/.snap")"   # light + fresh floor: nothing owed but the change
   digest="$(jq -r '.catalogueSha256' <<<"$out")"
   mv "$dir/.snap" "$dir/journeys-catalogue-$digest.json"
   pin="$dir/journeys-pin-$slug-pr-$pr-$head.json"
@@ -58,6 +65,14 @@ bad_catalogue 1-no-proves 'del(.journeys[0].proves)' 'proves must be'
 bad_catalogue 1-typo-key '.journeys[1].maxIntervalDay = 2' 'unknown key maxIntervalDay'
 bad_catalogue 1-no-consumes '.journeys[0].consumes = []' 'consumes must be'
 bad_catalogue 1-match-all '.journeys[0].consumes = ["**"]' 'matches every path'
+# Judged per brace-EXPANDED alternative: `{**,api/**}` is `**` with a decoy,
+# and would claim every changed path, emptying unmappedPaths.
+bad_catalogue 1-brace-match-all '.journeys[0].consumes = ["{**,api/**}"]' 'consumes glob .* matches every path \(its alternative .\*\*. does\)'
+bad_catalogue 1-brace-match-all-tail '.journeys[0].consumes = ["{api,*}/**"]' 'matches every path'
+bad_catalogue 1-wildcard-spelling '.journeys[0].consumes = ["*?/**"]' 'matches every path'
+bad_catalogue 1-exclude-everything '.excludePaths += [{"glob":"{docs/x/**,**}","reason":"r"}]' 'excludePaths glob .* matches every path'
+jq '.journeys[0].consumes += ["{web,api}/src/**"]' "$EXAMPLE" > "$WORK/brace-ok.json"
+expect 1-brace-ok '.ok == true' "$(python3 "$TOOL" validate "$WORK/brace-ok.json")"
 # English never reaches the contact-sheet script: recipes are click/wait only.
 bad_catalogue 1-english-recipe '.journeys[0].captureRecipes[0].steps = ["Open the period menu"]' 'click/wait commands only'
 bad_catalogue 1-browser-checkpoints '.journeys[0].checkpoints = []' 'checkpoints'
@@ -73,6 +88,9 @@ warns() { # <label> <jq-edit> <warning-regex>
 }
 warns 1w-extension-wide '.excludePaths += [{"glob":"**/*.md","reason":"docs"}]' 'excludePaths .\\*\\*/\\*.md. is a bare top-level or extension-wide'
 warns 1w-top-level '.excludePaths += [{"glob":".github/**","reason":"ci"}]' 'bare top-level'
+warns 1w-brace-broad '.excludePaths += [{"glob":"{docs/x/**,.github/**}","reason":"r"}]' 'bare top-level'
+warns 1w-brace-shadow '.excludePaths += [{"glob":"{docs/x/**,.github/**}","reason":"r"}] | .journeys[2].consumes += [".github/workflows/{build,ship}-app.yml"]' \
+  'mobile-scan-return: consumes .* can never match'
 warns 1w-no-reason '.excludePaths += ["docs/archive/**"]' 'docs/archive/\\*\\*. carries no reason'
 # A consumes glob an exclusion shadows selects nothing, and says so...
 warns 1w-shadowed-md '.excludePaths += [{"glob":"**/*.md","reason":"docs"}] | .journeys[0].consumes += ["web/release-notes/**/*.md"]' \
@@ -82,7 +100,7 @@ warns 1w-shadowed-dir '.excludePaths += [{"glob":".github/**","reason":"ci"}] | 
 # ...which is the matcher's real behaviour, not a lint opinion: the workflow
 # that builds the installable app is excluded, never routed to its journey.
 jq '.excludePaths += [{"glob":".github/**","reason":"ci"}] | .journeys[2].consumes += [".github/workflows/build-app.yml"]' "$EXAMPLE" > "$WORK/shadow.json"
-expect 1w-exclusion-wins '.matchedJourneys == [] and .excludedPaths[0].glob == ".github/**"' \
+expect 1w-exclusion-wins '[.matchedJourneys[] | select(.reason == "changed")] == [] and .excludedPaths[0].glob == ".github/**"' \
   "$(printf '[".github/workflows/build-app.yml"]' | python3 "$TOOL" match --catalogue "$WORK/shadow.json" --as-of "$NOW")"
 # A partly-overlapping glob is not "never matches".
 jq '.excludePaths += [{"glob":"**/*.md","reason":"docs"}]' "$EXAMPLE" > "$WORK/warn.json"
@@ -110,6 +128,12 @@ expect 2-unknown '.selection == "full" and .reason == "no GO" and .unmappedPaths
   [.matchedJourneys[] | select(.reason == "range-unknown") | .id] == ["loan-desk-checkout","branch-scope-crossing"] and
   .unassessedNativeJourneys == ["mobile-scan-return"]' "$(match '[]' --unknown "no GO")"
 expect 2-unreadable-paths '.selection == "full" and (.reason | test("unreadable"))' "$(match 'not json')"
+# An unusable catalogue still owes every journey it can NAME (floor included).
+jq '.journeys[0].evidence = "web"' "$EXAMPLE" > "$WORK/half-broken.json"
+expect 2-invalid-names-journeys '.selection == "full" and .catalogueValid == false and
+  [.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"catalogue-invalid"},{"id":"branch-scope-crossing","reason":"catalogue-invalid"},{"id":"mobile-scan-return","reason":"catalogue-invalid"}] and
+  .matchedJourneys[0].evidence == "browser" and .matchedJourneys[1].evidence == "api" and .floor.due == ["branch-scope-crossing"]' \
+  "$(CATALOGUE="$WORK/half-broken.json" match '["web/src/desk/a.tsx"]')"
 printf 'nope' > "$WORK/broken.json"
 expect 2-broken-catalogue '.selection == "full" and .catalogueValid == false and (.catalogueSha256 | length == 64)' \
   "$(CATALOGUE="$WORK/broken.json" match '["web/src/desk/a.tsx"]')"
@@ -126,7 +150,14 @@ floor_run() { # <run> <completedAt> <evidence-json> <lane-evidence or "">
   jq -n --arg e "$4" '{lanes:[{id:"branch-scope-crossing",kind:"floor"} + (if $e == "" then {} else {evidence:$e} end)]}' \
     > "$ROOT/$1/completion-contract.json"
 }
-expect 3-no-root '.computed == false and .due == []' "$(python3 "$TOOL" floor-due "$CATALOGUE" "$WORK/none" --as-of "$NOW")"
+# UNKNOWN HISTORY IS NOT FRESH HISTORY. An unset or missing run root (a config
+# or mount failure) makes every floor journey due — at every size — never none.
+expect 3-missing-root '.computed == false and .due == ["branch-scope-crossing"] and (.reason | test("every floor journey is due"))' \
+  "$(python3 "$TOOL" floor-due "$CATALOGUE" "$WORK/none" --size light --as-of "$NOW")"
+expect 3-unset-root-match '[.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"changed"},{"id":"branch-scope-crossing","reason":"floor"}] and
+  .floor.computed == false and (.floor.reason | test("SMOKE_GATE_RUN_ROOT unset"))' "$(match '["web/src/desk/a.tsx"]' --run-root "")"
+expect 3-missing-root-native '.route == "native-manual" and [.matchedJourneys[].id] == ["branch-scope-crossing","mobile-scan-return"]' \
+  "$(match '["mobile/a.tsx"]' --run-root "$WORK/none")"
 floor_run r1 2026-09-09T12:00:00Z '["notes.txt"]' ""
 expect 3-unproven-pass-is-overdue '.computed == true and .due == ["branch-scope-crossing"] and .entries[0].lastProvenAt == null' \
   "$(python3 "$TOOL" floor-due "$CATALOGUE" "$ROOT" --as-of "$NOW")"
@@ -138,7 +169,7 @@ expect 3-overdue-light '.due == ["branch-scope-crossing"] and .entries[0].overdu
   "$(python3 "$TOOL" floor-due "$CATALOGUE" "$ROOT" --size light --as-of 2026-09-20T00:00:00Z)"
 # In the matcher: the floor journey rides a change that never touched it...
 expect 3-match-floor '[.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"changed"},{"id":"branch-scope-crossing","reason":"floor"}]' \
-  "$(match '["web/src/desk/a.tsx"]' --run-root "$ROOT")"
+  "$(match '["web/src/desk/a.tsx"]' --size standard --run-root "$ROOT")"
 # ...and a native-manual campaign owes the floor only what is overdue.
 expect 3-native-fresh-floor '.route == "native-manual" and [.matchedJourneys[].id] == ["mobile-scan-return"]' \
   "$(match '["mobile/a.tsx"]' --run-root "$ROOT")"
@@ -241,6 +272,20 @@ new_run '[{"id":"mobile-scan-return","kind":"floor","evidence":"api"},{"id":"bra
 python3 "$TOOL" pin-run "$RUN" "$NATIVE_PIN" >/dev/null
 marker branch-scope-crossing blocked '[]'; marker mobile-scan-return blocked '[]'
 expect 5-api-laundering 'any(.invalidReasons[]; test("scaffolded --evidence api but its journey declares evidence native-manual"))' "$(barrier)"
+# ...and the other way: an api journey whose lane was NOT scaffolded api reads
+# as a browser floor lane, where any media-looking file clears it and resets
+# the cadence clock for a proof that was never an API contract check.
+new_run '[{"id":"mobile-scan-return","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor"}]'
+python3 "$TOOL" pin-run "$RUN" "$NATIVE_PIN" >/dev/null
+printf 'png' > "$RUN/shot.png"
+marker branch-scope-crossing pass '["shot.png"]'; marker mobile-scan-return blocked '[]'
+expect 5-api-journey-needs-api-lane '.ready == false and any(.invalidReasons[]; test("journey branch-scope-crossing declares evidence api but its lane was not scaffolded"))' "$(barrier)"
+# A disposition's journey is held to the same rule; a new-journey has no grant.
+new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"report-export","kind":"lane","evidence":"api"}]'
+python3 "$TOOL" pin-run "$RUN" "$PIN_FILE" >/dev/null
+marker loan-desk-checkout blocked '[]'; marker report-export blocked '[]'
+disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"new-journey","journeyId":"report-export"}]}'
+expect 5-new-journey-no-api-grant 'any(.invalidReasons[]; test("lane report-export is scaffolded --evidence api"))' "$(barrier)"
 
 # --- 5b. enforcement follows the GATE's pin, not the run's bookkeeping ---------
 # A pr-owned run whose campaign the gate pinned cannot escape by skipping

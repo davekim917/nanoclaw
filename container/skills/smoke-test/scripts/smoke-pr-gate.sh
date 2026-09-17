@@ -1897,8 +1897,14 @@ journeys_select() {  # <pr> <head-sha> <determinable> <fail-reason> <paths-json>
   fi
   if ! out="$(printf '%s' "$paths_json" | timeout 20 python3 "$JOURNEYS_TOOL" match "${args[@]}" 2>/dev/null)" ||
      ! out="$(jq -ce "select($JOURNEYS_PIN_SHAPE) | . + {pinState:\"absent\"}" <<<"$out" 2>/dev/null)"; then
-    out="$(journeys_full "journey matcher failed" absent)"
+    # A matcher that crashed or timed out has selected NOTHING, and that must
+    # never become the campaign's pinned contract (an immutable, empty `full`
+    # would switch off every journey check for this head for good). Report it,
+    # leave no candidate: poll then cannot promote, does not offer the head
+    # this cycle and says why, and the next poll tries again.
     [ -z "$snapshot_out" ] || rm -f "$snapshot_out" 2>/dev/null
+    journeys_full "journey matcher failed" absent
+    return 0
   fi
   [ -z "$snapshot_out" ] || printf '%s' "$out" > "$TMP_DIR/journeys-pin-$pr.json" 2>/dev/null || true
   printf '%s' "$out"
@@ -4632,6 +4638,8 @@ while IFS= read -r ROW; do
           FACTS="$JOURNEYS_PINNED"
         else
           RANGE_PIN_CONFLICT=true
+          printf 'smoke-pr-gate: freeze PR #%s is settled but not offered this cycle: its journey selection could not be pinned (%s)\n' "$PR" \
+            "$(jq -r '.journeys.reason // "the pin path was taken, or no pin could be written"' <<<"$FACTS")" >&2
         fi ;;
       *) RANGE_PIN_CONFLICT=true
          printf 'smoke-pr-gate: freeze PR #%s is settled but not offered: %s\n' "$PR" \

@@ -85,10 +85,15 @@ def _glob_problem(g):
         return "is not a non-empty string"
     if g.startswith("/"):
         return "must be repo-relative (no leading /)"
-    # A match-everything glob leaves no path unmapped, which silences the one
-    # list that forces somebody to explain a change nothing claims.
-    if all(seg in ("**", "*") for seg in g.split("/")):
-        return "matches every path; name the consumed area"
+    # A match-everything glob leaves no path unmapped (or, as an exclusion, no
+    # path in scope), which silences the one list that forces somebody to
+    # explain a change nothing claims. Judged per brace-EXPANDED alternative --
+    # `{**,api/**}` is `**` with a decoy -- and a segment of only `*`/`?` is a
+    # wildcard however it is spelled (`*?`, `**?`).
+    for alt in _globs.expand_braces(g):
+        if all(seg != "" and set(seg) <= {"*", "?"} for seg in alt.split("/")):
+            return "matches every path{}; name the area".format(
+                "" if alt == g else " (its alternative {!r} does)".format(alt))
     return None
 
 
@@ -122,8 +127,11 @@ def catalogue_warnings(cat):
     warnings = []
     entries = [(g, r) for g, r in _exclude_entries(cat) if _is_text(g)]
     for g, reason in entries:
-        segs = g.split("/")
-        if segs[0] in ("**", "*") or segs[0].startswith("*") or (len(segs) == 2 and segs[1] == "**"):
+        broad = False
+        for alt in _globs.expand_braces(g):
+            segs = alt.split("/")
+            broad = broad or segs[0].startswith("*") or (len(segs) == 2 and set(segs[1]) <= {"*"})
+        if broad:
             warnings.append("excludePaths {!r} is a bare top-level or extension-wide wildcard; it hides every such path from every journey -- name the narrow area instead".format(g))
         if not _is_text(reason):
             warnings.append("excludePaths {!r} carries no reason".format(g))
@@ -297,10 +305,16 @@ def last_proven(run_root, journey_id):
 def floor_due(cat, run_root, size, as_of):
     """Which floor journeys this campaign owes. Every entry past its interval
     is due; when none is, a standard/full campaign owes the single
-    least-recently-proven one and a light campaign owes nothing."""
+    least-recently-proven one and a light campaign owes nothing. With no
+    readable history, all of them."""
     floor = [j for j in cat["journeys"] if j.get("maxIntervalDays") is not None]
     if not run_root or not os.path.isdir(run_root):
-        return {"computed": False, "reason": "no readable run root, so last-proven dates are unknown", "asOf": None, "due": [], "entries": []}
+        # Unknown history is not fresh history: a missing mount or an unset
+        # SMOKE_GATE_RUN_ROOT must never delete the floor. Every floor journey
+        # is due, whatever the campaign size, and the reason says why.
+        return {"computed": False, "asOf": None, "due": [j["id"] for j in floor],
+                "reason": "no readable run root ({}), so last-proven dates are unknown and every floor journey is due".format(run_root or "SMOKE_GATE_RUN_ROOT unset"),
+                "entries": [{"id": j["id"], "lastProvenAt": None, "overdue": True} for j in floor]}
     entries = []
     for j in floor:
         proven = last_proven(run_root, j["id"])
@@ -392,16 +406,32 @@ def compute_selection(cat, digest, paths, unknown_reason, size, run_root, as_of)
     }
 
 
-def broken_selection(digest, problem):
+def broken_selection(digest, problem, raw=None):
     """A catalogue that is present but unusable never reads as "no journeys
-    matched": the campaign is full and says why."""
+    matched": the campaign is full and says why. Whatever journeys can still be
+    NAMED out of it are owed -- a typo in one entry must not un-select the rest
+    (floor included). An unparseable file names none; the reason carries that."""
+    matched = []
+    try:
+        journeys = json.loads(raw.decode("utf-8")).get("journeys") if raw is not None else None
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        journeys = None
+    seen = set()
+    for j in journeys if isinstance(journeys, list) else []:
+        jid = j.get("id") if isinstance(j, dict) else None
+        if isinstance(jid, str) and ID_RE.match(jid) and jid not in seen:
+            seen.add(jid)
+            matched.append({"id": jid, "reason": "catalogue-invalid",
+                            "evidence": j.get("evidence") if j.get("evidence") in EVIDENCE_KINDS else "browser",
+                            "floor": j.get("maxIntervalDays") is not None, "matchedPathCount": 0, "matchedPaths": []})
     return {
         "schemaVersion": SCHEMA_VERSION, "selection": "full",
         "reason": "journey catalogue is unusable: {}".format(problem), "route": "web",
         "catalogueValid": False, "catalogueSha256": digest,
-        "matchedJourneys": [], "unmappedPaths": [], "excludedPaths": [],
+        "matchedJourneys": matched, "unmappedPaths": [], "excludedPaths": [],
         "unassessedNativeJourneys": [],
-        "floor": {"computed": False, "reason": "journey catalogue is unusable", "asOf": None, "due": [], "entries": []},
+        "floor": {"computed": False, "reason": "journey catalogue is unusable", "asOf": None,
+                  "due": [m["id"] for m in matched if m["floor"]], "entries": []},
     }
 
 
@@ -443,7 +473,7 @@ def cmd_match(args):
 
     cat, digest, raw, errors = load_catalogue(args.catalogue)
     if cat is None:
-        selection = broken_selection(digest, "; ".join(errors[:3]))
+        selection = broken_selection(digest, "; ".join(errors[:3]), raw)
     else:
         selection = compute_selection(cat, digest, paths, unknown, args.size, args.run_root, as_of)
     selection.update({"pinned": False, "pinFile": None, "catalogueSnapshot": None})
@@ -589,7 +619,7 @@ def cmd_barrier(args):
         bad(sel_rel, "not a pinned journey selection")
         emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
 
-    catalogue_ids = set()
+    catalogue_ids, catalogue_evidence = set(), {}
     if selection.get("catalogueValid") is True:
         try:
             with open(catalogue_path, "rb") as fh:
@@ -597,7 +627,9 @@ def cmd_barrier(args):
             if sha256_bytes(raw) != selection.get("catalogueSha256"):
                 bad(cat_rel, "does not hash to the selection's catalogueSha256 -- the run's catalogue was edited after it was pinned")
             else:
-                catalogue_ids = {j.get("id") for j in json.loads(raw.decode("utf-8")).get("journeys", [])}
+                for j in json.loads(raw.decode("utf-8")).get("journeys", []):
+                    catalogue_ids.add(j.get("id"))
+                    catalogue_evidence[j.get("id")] = j.get("evidence")
         except (OSError, ValueError, UnicodeDecodeError):
             missing.append(cat_rel)
 
@@ -608,14 +640,25 @@ def cmd_barrier(args):
     def has_lane(jid):
         return "markers/{}.json".format(jid) in required
 
+    def lane_evidence_problem(jid, evidence):
+        """The api exemption is the catalogue's to grant and the contract's to
+        carry -- BOTH ways. Scaffolded api for a journey that is not: any floor
+        pass skips the browser-evidence bar. Not scaffolded api for a journey
+        that is: the lane reads as a browser lane, so any media-looking file
+        clears it and resets a cadence clock for a proof that was never an
+        API contract check."""
+        declared = lanes.get(jid, {}).get("evidence")
+        if declared == "api" and evidence != "api":
+            bad(sel_rel, "lane {} is scaffolded --evidence api but its journey declares evidence {}".format(jid, evidence))
+        elif evidence == "api" and declared != "api":
+            bad(sel_rel, "journey {} declares evidence api but its lane was not scaffolded `--evidence {}=api`; regenerate the contract with it".format(jid, jid))
+
     for m in selection["matchedJourneys"]:
         jid, evidence = m.get("id"), m.get("evidence")
         if not has_lane(jid):
             bad(sel_rel, "matched journey {} ({}) has no lane in the completion contract".format(jid, m.get("reason")))
             continue
-        # The api exemption is the catalogue's to grant, never the scaffold's.
-        if lanes.get(jid, {}).get("evidence") == "api" and evidence != "api":
-            bad(sel_rel, "lane {} is scaffolded --evidence api but its journey declares evidence {}".format(jid, evidence))
+        lane_evidence_problem(jid, evidence)
         if evidence == "native-manual":
             marker = _read_json(os.path.join(run_dir, "markers", jid + ".json"))
             if isinstance(marker, dict) and marker.get("status") == "pass" and not any(
@@ -656,6 +699,9 @@ def cmd_barrier(args):
                         problem = "journeyId {} already exists in the pinned catalogue (use mapped-to-journey)".format(jid)
                     elif not has_lane(jid):
                         problem = "journey {} has no lane in the completion contract, so nothing proves it ran".format(jid)
+                    else:
+                        # A journey the catalogue does not hold has no api grant.
+                        lane_evidence_problem(jid, catalogue_evidence.get(jid, "browser"))
                 elif kind == "no-user-facing-consumer":
                     cited = d.get("evidence")
                     if not _is_text(d.get("changedBehaviour")):

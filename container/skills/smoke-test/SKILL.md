@@ -576,8 +576,9 @@ still offered). No catalogue: no `journeys` key. At intake:
    never a group's private live file.
 2. **Every `matchedJourneys[]` entry becomes a contract lane with the journey
    id as its lane id** — `reason` says why it is there (`changed`, `floor`, or
-   `range-unknown`). An `evidence: api` journey is scaffolded `--evidence
-   <id>=api`; nothing else may be. `selection: "full"` (range unknown, or the
+   `range-unknown`, `catalogue-invalid`). An `evidence: api` journey's lane
+   **must** be scaffolded `--evidence <id>=api` and no other lane may be — the
+   barrier refuses both directions. `selection: "full"` (range unknown, or the
    catalogue unusable — `reason` says which) selects every walkable journey,
    and `unassessedNativeJourneys[]` go on the Untested line by name.
 3. **Every frozen `unmappedPaths[]` entry gets a scope disposition** in
@@ -719,8 +720,9 @@ whole floor every campaign makes a walk nobody performs carefully, and a pure
 staleness budget leaves the mechanism cold for days. "Last proven" is read off
 the run root, not a ledger: the newest `pass` marker carrying the lane id, and
 only one that carries proof — browser media, or a run whose contract declared
-that lane `evidence: api`. The gate reports the answer as `journeys.floor`, and
-anyone can recompute it for any moment:
+that lane `evidence: api`. **Unknown history is not fresh history**: with no
+readable run root (unset, or a missing mount) every floor journey is due, at any
+size. The gate reports the answer as `journeys.floor`; recompute it any time:
 
 ```bash
 python3 /app/skills/smoke-test/scripts/smoke-journeys.py floor-due \

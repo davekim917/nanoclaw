@@ -1393,6 +1393,7 @@ unset -f recover_run pin_file
 # beside the range pin, by the same immutable primitives.
 jpin_file() { printf '%s/journeys-pin-org__repo-pr-%s-%s.json' "$SMOKE_GATE_LEASE_DIR" "$1" "$2"; }
 JOURNEYS_EXAMPLE="$SCRIPT_DIR/../references/journeys.example.json"
+REAL_PYTHON3="$(command -v python3)"; export REAL_PYTHON3
 journeys_fixture() { # <compare-files-json>; one ready freeze (PR 13) with a validated baseline
   fresh_state
   export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
@@ -1529,13 +1530,50 @@ unset STUB_TREES_FILE
 # routes to the manual packet. One stray path keeps it a web campaign.
 journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"mobile/src/scan.tsx"},{"filename":"docs/internal/mobile.md"}]}'
 range_case 5k-native '.journeys.route == "native-manual" and .journeys.unmappedPaths == [] and
-  [.journeys.matchedJourneys[].id] == ["mobile-scan-return"]'
+  [.journeys.matchedJourneys[] | select(.reason == "changed") | .id] == ["mobile-scan-return"]'
 journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"mobile/src/scan.tsx"},{"filename":"api/src/reports/export.ts"}]}'
 range_case 5k-native-mixed '.journeys.route == "web" and .journeys.unmappedPaths == ["api/src/reports/export.ts"]'
 # A RENAME counts on both sides: a file moved out of a consumed area still selects it.
 journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/shared/period.ts","previous_filename":"api/src/loans/period.ts","status":"renamed"}]}'
-range_case 5k-rename '[.journeys.matchedJourneys[].id] == ["loan-desk-checkout"] and
+range_case 5k-rename '[.journeys.matchedJourneys[] | select(.reason == "changed") | .id] == ["loan-desk-checkout"] and
   .journeys.unmappedPaths == ["api/src/shared/period.ts"]'
+
+# UNKNOWN floor history is not fresh history: with SMOKE_GATE_RUN_ROOT unset,
+# or pointing at a mount that is not there, every floor journey is due — a
+# config failure must never delete the floor — and a readable root computes it.
+journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"web/src/desk/a.tsx"}]}'
+FLOOR_ALL_DUE='.journeys.floor.computed == false and .journeys.floor.due == ["branch-scope-crossing"] and
+  [.journeys.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"changed"},{"id":"branch-scope-crossing","reason":"floor"}]'
+unset SMOKE_GATE_RUN_ROOT
+range_case 5k-floor-root-unset "$FLOOR_ALL_DUE and (.journeys.floor.reason | test(\"SMOKE_GATE_RUN_ROOT unset\"))"
+export SMOKE_GATE_RUN_ROOT="$STATE_DIR/no-such-mount"
+range_case 5k-floor-root-missing "$FLOOR_ALL_DUE"
+mkdir -p "$STATE_DIR/runs-root"; export SMOKE_GATE_RUN_ROOT="$STATE_DIR/runs-root"
+range_case 5k-floor-root-readable '.journeys.floor.computed == true and .journeys.floor.due == ["branch-scope-crossing"]'
+unset SMOKE_GATE_RUN_ROOT
+
+# A matcher that crashes selects nothing, and nothing is never pinned: the
+# facts say `full`, the head is not offered that cycle (and says why), no pin is
+# written, and the next poll — matcher working again — pins the real selection.
+journeys_fixture "$BACKEND_ONLY"
+cat > "$STUB_BIN/python3" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in *smoke-journeys.py*) [ -z "${STUB_JOURNEYS_FAIL:-}" ] || exit 70 ;; esac
+exec /usr/bin/env -u STUB_JOURNEYS_FAIL "$REAL_PYTHON3" "$@"
+STUB
+chmod +x "$STUB_BIN/python3"
+export STUB_JOURNEYS_FAIL=1
+range_case 5k-matcher-failed '.journeys.selection == "full" and .journeys.reason == "journey matcher failed" and .journeys.pinState == "absent"'
+T5K_FAIL_ERR="$STATE_DIR/poll.err"
+bash "$GATE" poll 2>"$T5K_FAIL_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
+  { echo "5k: a failed matcher's empty selection was offered" >&2; exit 1; }
+grep -q 'journey selection could not be pinned (journey matcher failed)' "$T5K_FAIL_ERR" ||
+  { echo "5k: the unoffered head was silent: $(cat "$T5K_FAIL_ERR")" >&2; exit 1; }
+[ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: a failed matcher result was pinned" >&2; exit 1; }
+unset STUB_JOURNEYS_FAIL
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.journeys.pinned == true and
+  .data.journeys.selection == "matched"' >/dev/null || { echo "5k: the retry after a matcher failure did not pin" >&2; exit 1; }
+rm -f "$STUB_BIN/python3"
 
 # UNKNOWN range is "full", never an empty match.
 journeys_fixture "$BACKEND_ONLY"
