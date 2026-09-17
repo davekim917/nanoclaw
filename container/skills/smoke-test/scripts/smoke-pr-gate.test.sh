@@ -1846,6 +1846,14 @@ stall_clear
 # PR 65's new run is live under the default window; PR 64's is aged explicitly.
 jq -c '.activeStartedAt="2000-01-01T00:00:00Z" | .activeProgressAt=null' "$STATE_DIR/pr-64-state.json" > "$STATE_DIR/pr-64-state.tmp"
 mv "$STATE_DIR/pr-64-state.tmp" "$STATE_DIR/pr-64-state.json"
+# The scan keys on pr-<n>-state.json and nothing else: range/journeys pin files
+# (shared lease dir, here also dropped beside the state) and an unparseable
+# state file are ignored, and the claimed run is still found.
+for STALL_DECOY in "$STATE_DIR" "$SMOKE_GATE_LEASE_DIR"; do
+  echo '{"activeRunId":"decoy","pr":1}' > "$STALL_DECOY/range-pin-v1-pr-64-$(sha 4).json"
+  echo '{"activeRunId":"decoy","pr":1}' > "$STALL_DECOY/journeys-pin-v1-pr-64-$(sha 4).json"
+done
+echo 'not json' > "$STATE_DIR/pr-1-state.json"
 bash "$GATE" poll | jq -e '.data.trigger == "pr_run_stalled" and .data.pr == 64 and .data.runId == "run-stall-dead"' >/dev/null
 [ "$(bash "$GATE" poll)" = "$IDLE_ONE" ] || { echo "7c: aged stalled alarm re-fired" >&2; exit 1; }
 # (2) Overrun and stalled are disjoint by predicate: a run that is still

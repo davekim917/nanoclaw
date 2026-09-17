@@ -1533,9 +1533,10 @@ nothing and changes no owner, lease or authority. On it: read
 `notSettling.reason` (`not_settled`, `head_moved`, `pr_closed`, `pr_merged`,
 `label_removed`, …). If `challengerDispositionFiled` is true the evidence is
 complete and only synthesis is owed — once `leaseLive` is false, resume the
-**same** run id with `claim <runId> <pr> <sourceSha>`, take over the completion
-contract first when `contractAdoptionRequired` is true, synthesize from the
-evidence on disk and `finish`. If the campaign is moot (PR closed, head moved),
+**same** run id with `claim <runId> <pr> <sourceSha>`, run
+`smoke-run-scaffold.sh adopt <run-dir> <sourceSha>` before any marker when
+`contractAdoptionRequired` is true (or `null`), synthesize from the evidence on
+disk and `finish`. If the campaign is moot (PR closed, head moved),
 `claim` the run id the same way and `release` it. `null` for the disposition
 and contract fields means `SMOKE_GATE_RUN_ROOT` is unwired, not "absent".
 

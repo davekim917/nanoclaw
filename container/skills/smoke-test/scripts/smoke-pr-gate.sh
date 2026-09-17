@@ -1273,6 +1273,23 @@ num_env CHALLENGER_TIMEOUT_SECONDS SMOKE_GATE_CHALLENGER_TIMEOUT_SECONDS 5400
 # was possible.
 CHALLENGER_RUN_ROOT="${SMOKE_GATE_RUN_ROOT:-}"
 challenger_disposition_file() { printf '%s/%s/challenger/disposition.md' "$CHALLENGER_RUN_ROOT" "$1"; }
+# Would a successor have to `adopt` this run's completion contract? The ONE
+# predicate, shared by the resumed `pr_build_settled` wake and `pr_run_stalled`.
+# `contract` stamps coordinatorOwnerToken once (smoke-run-scaffold.sh:491) and
+# every reclaim mints a new token, so the scaffold's require_contract_owner
+# (smoke-run-scaffold.sh:321-326) refuses a successor's marker/redispatch until
+# it runs `adopt`. Read-only, and `null` — not false — when the run root is
+# unwired: absence is only evidence when presence was possible.
+contract_adoption_required() {  # <runId> -> true | false | null
+  if [ -z "$CHALLENGER_RUN_ROOT" ] || [ ! -d "$CHALLENGER_RUN_ROOT" ]; then
+    printf 'null'
+  elif [ -n "$(jq -r '.coordinatorOwnerToken // empty' \
+         "$CHALLENGER_RUN_ROOT/$1/completion-contract.json" 2>/dev/null || true)" ]; then
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
 challenger_deadline_from_now() {
   date -u -d "@$(( $(date -u +%s) + CHALLENGER_TIMEOUT_SECONDS ))" +'%Y-%m-%dT%H:%M:%SZ'
 }
@@ -4455,9 +4472,15 @@ stalled_not_settling() {  # <pr> <state-json> -> reason object, or nothing when 
     jq -cn '{reason:"pr_not_listed"}'
     return
   fi
-  facts="$(cat "${TMP_DIR:-/nonexistent}/facts-$pr.json" 2>/dev/null || true)"
-  jq -e 'type == "object"' <<<"$facts" >/dev/null 2>&1 || facts='{}'
-  jq -cn --arg head "$head" --argjson facts "$facts" --argjson state "$state" '
+  # Facts carry a freeze campaign's range lists, which outgrow one argv string
+  # (MAX_ARG_STRLEN) — read from the file, never --argjson.
+  facts="${TMP_DIR:-/nonexistent}/facts-$pr.json"
+  if ! jq -e 'type == "object"' "$facts" >/dev/null 2>&1; then
+    facts="$TMP_DIR/facts-none.json"
+    printf '{}\n' > "$facts"
+  fi
+  jq -cn --arg head "$head" --slurpfile factsFile "$facts" --argjson state "$state" '
+    $factsFile[0] as $facts |
     ($facts | {fetchOk, settled, ciReady, ciPending, ciFailed, backendReady, frontendRequired,
                frontendReady, healthzReady, previewAmbiguous, migrationsTouched}) as $f |
     if $state.activeSha != $head then {reason:"head_moved", headSha:$head}
@@ -4524,18 +4547,11 @@ stalled_run_alarm() {  # prints one wake and returns 0, or prints nothing and re
   # Absence is only evidence when presence was possible (same rule as
   # `challenger-timeout`): with no readable run root these are null, not false.
   if [ -n "$CHALLENGER_RUN_ROOT" ] && [ -d "$CHALLENGER_RUN_ROOT" ]; then
-    dispo=false; contract=false; adopt=false
+    dispo=false; contract=false
     [ ! -s "$(challenger_disposition_file "$w_run")" ] || dispo=true
-    if [ -s "$CHALLENGER_RUN_ROOT/$w_run/completion-contract.json" ]; then
-      contract=true
-      # The contract binds the token of whoever authored it
-      # (smoke-run-scaffold.sh:479) and every reclaim mints a new one, so a
-      # successor's marker/redispatch is refused by require_contract_owner
-      # (smoke-run-scaffold.sh:311) until it takes the contract over.
-      [ -z "$(jq -r '.coordinatorOwnerToken // empty' \
-            "$CHALLENGER_RUN_ROOT/$w_run/completion-contract.json" 2>/dev/null || true)" ] || adopt=true
-    fi
+    [ ! -s "$CHALLENGER_RUN_ROOT/$w_run/completion-contract.json" ] || contract=true
   fi
+  adopt="$(contract_adoption_required "$w_run")"
   jq -cn --argjson state "$state" --argjson why "$w_why" --argjson now "$now" --argjson last "$last" \
     --argjson dispo "$dispo" --argjson contract "$contract" --argjson adopt "$adopt" \
     --argjson leaseLive "$(lease_is_live "$(read_lease "$w_run")")" \
@@ -4549,7 +4565,7 @@ stalled_run_alarm() {  # prints one wake and returns 0, or prints nothing and re
       completionContractExists:$contract, contractAdoptionRequired:$adopt,
       leaseLive:$leaseLive,
       notSettling:$why,
-      hint:"This run is still claimed but its coordinator stopped stamping progress, and its PR is no longer a settle candidate, so poll will never resume it. Nothing was reclaimed: no owner token, lease or authority changed. Decide: resume the SAME run id with `claim <runId> <pr> <sourceSha>` (allowed because progress is stale, once leaseLive is false; keeps the evidence and the challenger deadline) and carry it to `finish`, or abandon it with `claim` then `release`. This alarm fires once per run id."}}'
+      hint:"This run is still claimed but its coordinator stopped stamping progress, and its PR is no longer a settle candidate, so poll will never resume it. Nothing was reclaimed: no owner token, lease or authority changed. Decide: resume the SAME run id with `claim <runId> <pr> <sourceSha>` (allowed because progress is stale, once leaseLive is false; keeps the evidence and the challenger deadline), run `smoke-run-scaffold.sh adopt <run-dir> <sourceSha>` first when contractAdoptionRequired is true, and carry it to `finish`, or abandon it with `claim` then `release`. This alarm fires once per run id."}}'
   return 0
 }
 
@@ -5171,21 +5187,11 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
   task_binding_lock_end
 
   # A resumed run id whose completion contract already exists is bound to the
-  # PREDECESSOR's token: `contract` stamps coordinatorOwnerToken once
-  # (smoke-run-scaffold.sh:491) and the token minted above is always new, so
-  # the scaffold's require_contract_owner (smoke-run-scaffold.sh:321-326) will
-  # refuse this wake's marker/redispatch until it runs `adopt`. Say so in the
-  # wake rather than leaving the successor to discover it from a refusal.
-  # Read-only, and `null` — not false — when the run
-  # root is unwired: absence is only evidence when presence was possible.
+  # PREDECESSOR's token (see contract_adoption_required). Say so in the wake
+  # rather than leaving the successor to discover it from a refusal.
   CONTRACT_ADOPTION_REQUIRED=false
   if [ "$RESUMED_RUN_ID" = true ]; then
-    if [ -z "$CHALLENGER_RUN_ROOT" ] || [ ! -d "$CHALLENGER_RUN_ROOT" ]; then
-      CONTRACT_ADOPTION_REQUIRED=null
-    elif [ -n "$(jq -r '.coordinatorOwnerToken // empty' \
-           "$CHALLENGER_RUN_ROOT/$RUN_ID/completion-contract.json" 2>/dev/null || true)" ]; then
-      CONTRACT_ADOPTION_REQUIRED=true
-    fi
+    CONTRACT_ADOPTION_REQUIRED="$(contract_adoption_required "$RUN_ID")"
   fi
 
   jq -cn \
