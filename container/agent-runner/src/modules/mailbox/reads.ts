@@ -95,7 +95,13 @@ export function maxOutboundSeq(): number {
  *
  *   - kind: `chat` (send_message, send_file, dispatched result blocks) and
  *     `chat-sdk` (send_card / ask_user_question, mcp-tools/interactive.ts:93,156).
- *     `status` is a progress label; `system` and `task_log` are host-facing.
+ *     One `system` action also counts: `request_choice` posts a card the
+ *     person sees and returns without waiting (mcp-tools/request-choice.ts:208).
+ *     With no `to` it targets the session's own conversation and its row
+ *     carries no routing; with `to` the content names `channelType`/`platformId`.
+ *     Every other `system` action is host-facing or goes elsewhere
+ *     (`escalate_to_owner` → the owner's DM), as are `status` (a progress
+ *     label) and `task_log`.
  *   - where: the person's channel + platform. A row to a peer agent or another
  *     channel is `send_message(to: …)` delegating, not an answer.
  *   - NOT the thread, and NOT `threadKey`. No single authority decides the
@@ -115,13 +121,22 @@ export function hasChatOutboundAfter(
 ): boolean {
   try {
     const db = getOutboundDb();
-    const base = "SELECT 1 FROM messages_out WHERE seq > ? AND kind IN ('chat', 'chat-sdk')";
+    const base = 'SELECT 1 FROM messages_out WHERE seq > ?1';
+    const chat = "kind IN ('chat', 'chat-sdk')";
+    const card = "kind = 'system' AND json_extract(content, '$.action') = 'request_choice'";
+    const cardTo = "json_extract(content, '$.platformId')";
     if (conversation.channelType === null || conversation.platformId === null) {
-      return db.prepare(`${base} AND channel_type IS NOT 'agent' LIMIT 1`).get(seq) != null;
+      return (
+        db.prepare(`${base} AND ((${chat} AND channel_type IS NOT 'agent') OR (${card})) LIMIT 1`).get(seq) != null
+      );
     }
     return (
       db
-        .prepare(`${base} AND channel_type = ? AND platform_id = ? LIMIT 1`)
+        .prepare(
+          `${base} AND ((${chat} AND channel_type = ?2 AND platform_id = ?3)
+             OR (${card} AND (${cardTo} IS NULL
+               OR (${cardTo} = ?3 AND json_extract(content, '$.channelType') = ?2)))) LIMIT 1`,
+        )
         .get(seq, conversation.channelType, conversation.platformId) != null
     );
   } catch {

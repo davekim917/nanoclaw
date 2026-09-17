@@ -3467,6 +3467,34 @@ describe("a person's message that got nothing delivered", () => {
     expect(rightPlace.pushes).toHaveLength(0);
   });
 
+  it('counts a request_choice card posted into the conversation, not one sent elsewhere', async () => {
+    const { writeMessageOut } = await import('./db/messages-out.js');
+    const choice = (extra: object) => () =>
+      writeMessageOut({
+        id: `choice-${Math.random()}`,
+        kind: 'system',
+        content: JSON.stringify({ action: 'request_choice', choiceId: 'c1', question: 'Ship it?', ...extra }),
+      });
+    const here = emptyTurn(choice({}));
+    await human(here.query);
+    expect(here.pushes).toHaveLength(0);
+
+    const sameChannel = emptyTurn(choice({ to: 'main', channelType: 'discord', platformId: 'chan-1' }));
+    await processQuery(sameChannel.query, ERR_ROUTING, ['m1'], 'claude', undefined, 'p', undefined, {});
+    expect(sameChannel.pushes).toHaveLength(0);
+
+    const elsewhere = emptyTurn(choice({ to: 'ops', channelType: 'discord', platformId: 'chan-ops' }));
+    await processQuery(elsewhere.query, ERR_ROUTING, ['m1'], 'claude', undefined, 'p', undefined, {});
+    expect(elsewhere.pushes).toHaveLength(1);
+
+    // Another system action is host-facing and answers nobody.
+    const other = emptyTurn(() =>
+      writeMessageOut({ id: 'sys-x', kind: 'system', content: JSON.stringify({ action: 'schedule_task' }) }),
+    );
+    await processQuery(other.query, ERR_ROUTING, ['m1'], 'claude', undefined, 'p', undefined, {});
+    expect(other.pushes).toHaveLength(1);
+  });
+
   it('counts a card as the reply', async () => {
     const { writeMessageOut } = await import('./db/messages-out.js');
     const { query, pushes } = emptyTurn(() =>
