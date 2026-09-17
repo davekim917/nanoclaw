@@ -2050,6 +2050,10 @@ export async function processQuery(
             options.providerFallbackActive === true,
             extractRouting(keep),
           );
+          // Re-check after the await, as `applySettings` below does before
+          // claiming: the stream can end during this yield, and rows marked
+          // processing against a dead query sit claimed until stale detection.
+          if (done) return;
         }
         const liveSettingsChanged =
           fb.model !== liveSettings.model ||

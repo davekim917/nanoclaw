@@ -369,7 +369,7 @@ describe('Codex rate-limit read → park through gen()', () => {
 
   it('a later turn PUSHED into the same query gets a fresh ring: fallback parks → back to the primary', async () => {
     // Round-2 review finding: the poll-loop keeps one query open and pushes
-    // later turns into it (poll-loop.ts:1844). A tried-set scoped to the query
+    // later turns into it (poll-loop.ts `pushToQuery` → `query.push`). A tried-set scoped to the query
     // would keep both homes marked after turn 1's rotation, and turn 2's park
     // on the fallback would find nothing left — the outage again.
     //

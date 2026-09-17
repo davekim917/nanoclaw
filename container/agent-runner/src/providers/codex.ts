@@ -1342,8 +1342,8 @@ export class CodexProvider implements AgentProvider {
           // resetCodexTurnAccumulatorThread.
           const turnAccum = createCodexTurnAccumulator();
           // Ring state is per TURN, at this same boundary. The poll-loop keeps
-          // one query open and pushes later turns into it (poll-loop.ts:1844
-          // `query.push`), so a set scoped to the
+          // one query open and pushes later turns into it (poll-loop.ts
+          // `pushToQuery` → `query.push`), so a set scoped to the
           // query would keep every home marked tried after the first
           // rotation, and a later turn's park on the fallback would find
           // nothing left — the outage shape again. Homes this turn has run on:
@@ -1644,7 +1644,11 @@ export class CodexProvider implements AgentProvider {
                 // instant (poll-loop.ts `reportProviderUnavailable` →
                 // provider_health), and the provider is back the moment its
                 // first account is, not when its last one is.
-                if (triedHomes.size > 1) {
+                // Gated on `eligible` too: an ineligible error after a rotation
+                // (a control-plane failure past its cap on the fallback) has
+                // not tried the rest of the ring, so it keeps its own reset
+                // and message.
+                if (eligible && triedHomes.size > 1) {
                   yield {
                     ...ev,
                     resetAt: earliestCodexSlotReset(slotResets),
