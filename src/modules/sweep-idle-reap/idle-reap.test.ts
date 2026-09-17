@@ -65,28 +65,38 @@ describe('shouldReapIdleTaskContainer and shouldReapIdleChatContainer keep their
     const JUST_QUIET = NOW - CHAT_IDLE_REAP_MS + 1;
 
     it('reaps a chat container quiet past the floor with nothing pending', () => {
-      expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(true);
+      expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(true);
     });
 
     it('keeps a chat container inside the quiet floor', () => {
-      expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, JUST_QUIET, JUST_QUIET, NOW)).toBe(false);
+      expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, false, JUST_QUIET, JUST_QUIET, NOW)).toBe(false);
     });
 
     it('keeps a chat container while work is due or claimed', () => {
-      expect(shouldReapIdleChatContainer(THREAD, 1, 0, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
-      expect(shouldReapIdleChatContainer(THREAD, 0, 1, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
+      expect(shouldReapIdleChatContainer(THREAD, 1, 0, false, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
+      expect(shouldReapIdleChatContainer(THREAD, 0, 1, false, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
     });
 
     it('keeps a chat container with a pending work_continuation promise', () => {
-      expect(shouldReapIdleChatContainer(THREAD, 0, 0, true, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
+      expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, true, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
+    });
+
+    // The live failure (2026-09-16/17): the parent turn launched a background
+    // builder and ended; nothing is due, claimed or promised, and no outbound
+    // row is written until the builder finishes. Only the runner's flag says
+    // the container is working.
+    it('keeps a quiet chat container while the provider reports it is executing', () => {
+      expect(shouldReapIdleChatContainer(THREAD, 0, 0, true, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
     });
 
     it('keeps a chat container that has never produced output', () => {
-      expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, null, LONG_QUIET, NOW)).toBe(false);
+      expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, false, null, LONG_QUIET, NOW)).toBe(false);
     });
 
     it('never reaps a task-thread session through the chat policy', () => {
-      expect(shouldReapIdleChatContainer('system:tasks:task-1', 0, 0, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
+      expect(shouldReapIdleChatContainer('system:tasks:task-1', 0, 0, false, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(
+        false,
+      );
     });
 
     // The live failure: a user message arrives 16 min after the previous reply,
@@ -94,12 +104,12 @@ describe('shouldReapIdleTaskContainer and shouldReapIdleChatContainer keep their
     // into the turn before emitting its first status. Outbound alone cannot see
     // this; inbound can.
     it('keeps a chat container that just consumed a message but has not replied yet', () => {
-      expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, LONG_QUIET, JUST_QUIET, NOW)).toBe(false);
+      expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, false, LONG_QUIET, JUST_QUIET, NOW)).toBe(false);
     });
 
     it('still reaps when the newest inbound is also past the floor', () => {
-      expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, JUST_QUIET, LONG_QUIET, NOW)).toBe(false);
-      expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, LONG_QUIET, null, NOW)).toBe(true);
+      expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, false, JUST_QUIET, LONG_QUIET, NOW)).toBe(false);
+      expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, false, LONG_QUIET, null, NOW)).toBe(true);
     });
   });
 });
@@ -474,6 +484,24 @@ describe('the idle reaps win over ceiling enforcement in the exclusive chain', (
     expect(h.kills).toEqual([{ sessionId: session.id, reason: 'chat-idle-reap', depth: 0 }]);
     expect(h.oomWritten).toBe(0);
     expect(h.spawns).toEqual([]);
+  });
+
+  it('does not reap a quiet chat container whose provider is executing (background agent after the parent turn)', async () => {
+    const session = fakeSession('sess-chat-bg-hold');
+    h.sessions = [session];
+    h.running.add(session.id);
+    const quietSince = new Date(Date.now() - 60 * 60_000).toISOString();
+    // Same quiet as the case above, heartbeat NOT past the ceiling: the wiring
+    // must hand the container's own flag to the predicate, or S13 claims.
+    h.mailbox = fakeMailbox({
+      getContainerState: () => ({ provider_executing: 1 }),
+      latestOutboundTimestamp: () => quietSince,
+      latestInboundTimestamp: () => quietSince,
+    });
+
+    await _sweepOnceForTesting();
+
+    expect(h.kills).toEqual([]);
   });
 
   it('the declared chain is heal (10) -> idle task (20) -> idle chat (30) -> SLA (40, fallthrough)', () => {
