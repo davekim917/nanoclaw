@@ -958,13 +958,13 @@ by default. Use the `agent-browser` skill.
   confirmation behavior, accessibility, and visual hierarchy as testable parity
   candidates rather than subjective nits.
 - Record a short clip of each candidate finding's reproduction. See below.
+- Disposition every visual candidate (see "Visual candidates").
 - Restore mutated test data or list every residue that could not be restored.
 
 ### Reproduction clips
 
-A screenshot cannot show a transition, a state that flashes and disappears, or
-how long a spinner ran. A short clip can. `agent-browser` records the live
-session itself:
+A screenshot cannot show a transition, a flash, or how long a spinner ran; a
+short clip can:
 
 ```bash
 mkdir -p <run-dir>/clips
@@ -973,51 +973,38 @@ agent-browser record start <run-dir>/clips/<finding-id>.mp4
 agent-browser record stop
 ```
 
-Name the file `.mp4` — that yields H.264/yuv420p, which every chat platform
-plays inline. `.webm` also works but previews less reliably.
+Name the file `.mp4` (H.264/yuv420p plays inline everywhere; `.webm` previews
+less reliably).
 
 Scope, because an unwatched artifact is worse than none:
 
-- **Record the reproduction, never the campaign.** Start recording at the last
-  known-good state, run only the steps that produce the defect, stop. Target
-  20–60s. A recording that spans a whole lane is unwatchable and nobody opens
-  it.
-- **Clip defects, not passes.** Record while you reproduce a candidate — that is
-  the moment the repro is already in your hands. Delete the clip if the finding
-  is later refuted; attach only clips of confirmed findings. At most one clip
-  per finding plus its section 7 after-clip, and at most five clips per run.
-- **Never record authentication.** Recording captures typed keystrokes, so a
-  clip that spans a login publishes the password. Authenticate first, then
-  start recording. Any clip that captured a credential field gets deleted, not
-  trimmed. Authenticating first is necessary but NOT sufficient: `record start`
-  opens a fresh context that drops `localStorage`, so on a token-in-storage app
-  the clip begins logged out. Follow the capture/restore recipe in the
-  `agent-browser` skill, and prove the session survived `record start` before
-  walking the reproduction.
-- **A clip is supplementary and never substitutes for evidence.** The
-  screenshots, request/response capture, and console errors above remain
-  required. A clip alone never moves a candidate to `confirmed` — it shows what
-  happened, not why.
+- **Record the reproduction, never the campaign**: last known-good state, only
+  the steps that produce the defect, stop. Target 20–60s.
+- **Clip defects, not passes.** Record while you reproduce a candidate; delete
+  the clip if the finding is refuted. At most one clip per finding plus its
+  section 7 after-clip, and at most five per run.
+- **Never record authentication.** Recording captures keystrokes, so a clip
+  spanning a login publishes the password: authenticate first, and delete (not
+  trim) any clip that caught a credential field. `record start` opens a fresh
+  context that drops `localStorage`, so on a token-in-storage app follow the
+  `agent-browser` skill's capture/restore recipe and prove the session
+  survived before walking the reproduction.
+- **A clip is supplementary.** Screenshots, request/response capture and
+  console errors remain required; a clip alone never moves a candidate to
+  `confirmed`.
 - **Never block on it.** If `record start` errors (missing `ffmpeg`, no browser
-  lease), note it in the run record and continue. A clip is never a gate.
+  lease), record that and continue. A clip is never a gate.
 
-Attach clips with `send_file` to the run thread. Files under the run root are
-already inside the allowed prefixes, and the 50MB attachment cap is far above a
-60s clip.
+Attach clips with `send_file` to the run thread.
 
-**`smoke-evidence-barrier.sh` enforces this at the marker level.** A marker
-declaring `confirmedFindings: ["<id>", ...]` must carry, per id, either
-`clips/<id>.mp4` (a real, nonempty file) or a `clip-skipped: <id>: <reason>`
-line in its `evidence` array — silence fails the barrier, exactly like the
-`record start` failure above must still be recorded rather than dropped. A
-`status:"pass"` uses the same valid clip-skipped form; it is not treated as a
-missing file when it names one of that marker's confirmed findings and gives a
-non-empty reason. Set
-`confirmedFindings` with the scaffold, never by hand — `smoke-run-scaffold.sh
+**`smoke-evidence-barrier.sh` enforces this.** A marker declaring
+`confirmedFindings: ["<id>", ...]` must carry, per id, either `clips/<id>.mp4`
+(a real, nonempty file) or a `clip-skipped: <id>: <reason>` line in its
+`evidence` array — silence fails the barrier. A `status:"pass"`
+marker may cite that same clip-skipped line as evidence. Set
+`confirmedFindings` with the scaffold, never by hand: `smoke-run-scaffold.sh
 marker <run-dir> <lane-id> <status> [summary] [evidence-csv]
---confirmed-findings <id>[,<id>...]` — the same rule that forbids hand-written
-markers elsewhere in this file applies here too, and the flag is optional
-(omit it and the field is omitted, exactly as before this existed).
+--confirmed-findings <id>[,<id>...]` (optional; omitted, the field is omitted).
 
 ### Contact sheet
 
@@ -1028,68 +1015,98 @@ click/wait `steps`) as `shots.json`; a journey's English steps are never fed to
 the capture script.
 `smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> <source-sha>
 [baseline-url] [baseline-auth-state.json]`
-— pass the campaign's frozen `sourceSha` as the fourth argument so
-`manifest.json`'s `buildSha` records the SHA you already froze on rather
-than whatever (if anything) the served page exposes; omit it only when no
-frozen SHA is known yet, which falls back to sniffing the page for
-`meta[name="build-sha"]`, `window.__BUILD_SHA__`, or a `data-build-sha`
-attribute — the app may expose none of those, leaving `buildSha` empty. It
-reads caller-provided `<run-dir>/contact-sheet/shots.json` (capped at 8; the
-script itself is generic, no product knowledge) and writes `sheet.png` +
-`manifest.json`. A failed screen is `failed: <reason>` plus a placeholder
-tile, never dropped.
+— the fourth argument is the campaign's frozen `sourceSha`, recorded as
+`manifest.json`'s `buildSha`; without it the script sniffs the page for a
+build SHA and may record none. It reads `<run-dir>/contact-sheet/shots.json`
+(capped at 8; no product knowledge) and writes `sheet.png` + `manifest.json`.
+A failed screen is `failed: <reason>` plus a placeholder tile, never dropped.
 
 Post a campaign contact sheet as **two ordered sends to the same named channel
-destination**: first send the text-only kickoff root with `send_message`, then
-call `send_file` for `sheet.png` with no caption. Do not combine the kickoff
-text and sheet in one `send_file` call. Slack uploads files before it posts a
-caption; before the root exists that upload has no `thread_ts`, so it becomes
-a second channel-root message. Delivery processes the two outbound rows in
-order and attaches the second one under the fresh root's thread. A scheduled
-campaign must reserve exactly one additional chat slot for that reply; it is
-not permission for progress narration. Link the sheet from the verdict. A
-deployment may also run a fresh, read-only design critic on the shot PNGs —
-shadow only, posted but never gating the verdict.
+destination**: the text-only kickoff root with `send_message`, then `send_file`
+for `sheet.png` with no caption. Never one combined `send_file`: the upload
+precedes its caption, so with no root yet it becomes a second channel-root
+message. A scheduled campaign reserves exactly one additional chat slot for
+that reply, not for progress narration. Link the sheet from the verdict.
 
-**Every screen navigates in its own fresh `agent-browser` session** (never
-one shared session for the whole sheet), with the same saved auth state
-loaded fresh into each — never a fresh login. A shared session let one
-screen's leftover DOM/localStorage state (e.g. a nav drawer a prior screen's
-`steps` opened) bleed into later screenshots, which the shadow critic then
-graded BROKEN as a pure capture artifact. Each screen's manifest entry
-carries `freshNavigation: true` as the record of this.
+**Every screen navigates in its own fresh `agent-browser` session**, the same
+saved auth state loaded into each — never a fresh login. A shared session let
+one screen's leftover state (a nav drawer its `steps` opened) bleed into later
+screenshots, which the critic graded BROKEN as a pure capture artifact. The
+manifest records `freshNavigation: true`.
 
 **Grade the viewport capture, never the full-page one.** Each width's `file`
 is viewport-sized, taken with CSS animations/transitions frozen and re-taken
 until the live page matches it (`settled`). `fullPage` (`*-full.png`) is
-context only: full-page stitching misplaces fixed/sticky headers and drawers
-and has produced false BROKEN findings. A tile badged `unsettled` is not
-evidence of breakage on its own. A capture whose final `location.pathname`
-is not the shot's `path` (or its declared `finalPath`, for a `steps` click
-that navigates on purpose) fails with both paths named — a bounce to a login
-route is never graded, and on the baseline it is a failed diff, never
-`changed`.
+context only: stitching misplaces fixed/sticky headers and drawers and has
+produced false BROKEN findings. A capture whose final `location.pathname` is
+not the shot's `path` (or its declared `finalPath`) fails with both paths
+named — a bounce to a login route is never graded, and on the baseline it is
+a failed diff, never `changed`.
 
 **With a baseline url, judge what the build changed.** Each screen/width is
 also captured from the baseline with the identical recipe and pixel-diffed;
 `manifest.json` gains `diff: {status, pct, image, baseline, reason}` per
-width and the sheet orders tiles changed → diff failed → unchanged, each
-badged, with the diff overlay under a changed tile. Give a critic the head
+width and the sheet orders tiles changed → diff failed → unchanged, badged.
+Give the critic the head
 image, its `*-base.png` and `*-diff.png`, and ask what the change broke — an
-`unchanged` screen looked that way before this build. Baseline capture is
-strictly read-only (navigation, the declared `steps`, screenshot) and is the
-only thing a deployment's baseline url may be used for; a baseline failure
-records `diff.status: "failed"` with a reason and never touches the head
-capture. A baseline on another origin needs its own auth state file, under
-the same placement rule below.
+`unchanged` screen looked that way before this build and may go ungraded. Only
+an author-PR campaign passes a baseline: a freeze campaign's diff against
+production would be the whole release range. Baseline capture is strictly
+read-only (navigation, the declared `steps`, screenshot), the only use a
+deployment's baseline url has; a baseline failure records `diff.status:
+"failed"` with a reason and never touches the head capture. A baseline on
+another origin needs its own auth state file, placed as below.
 
 **Auth state is a live session token — never put it in the run dir or under
 the shared workgroup tree.** The script refuses both (`realpath`-checked
 against `<run-dir>` and `$SMOKE_WORKGROUP_ROOT`, default
-`/workspace/workgroup`) and never copies its content anywhere. Keep it at a
-private path like `/tmp/contact-sheet-auth-<runId>.json` and delete it once
-the sheet is captured — the script doesn't own that file and won't delete it
-for you.
+`/workspace/workgroup`) and never copies it. Keep it at a private path like
+`/tmp/contact-sheet-auth-<runId>.json` and delete it yourself once the sheet
+is captured.
+
+### Visual candidates — detection always ends owned
+
+The sheet and a fresh, read-only, screenshot-only design critic (the
+deployment's rubric, the build's own design system) only DETECT — a capture
+can be wrong, and the critic with it — but nothing they flag is "advisory". Pipe the
+critic's `GRADE · <shot filename> · <reason>` lines into
+`smoke-visual-candidates.py record-critic <run-dir> --rubric <file>`
+(`contact-sheet/critic.json`; a skipped screen is refused); a critic that could
+not run is recorded with `--unavailable <reason>`, never omitted.
+`list <run-dir>` names the **candidates**, one per screen and width:
+
+- the critic graded it `BROKEN`;
+- its capture failed, or the pinned journeys require a screen the manifest lacks;
+- it was captured `settled: false`;
+- the critic graded it `DEGRADED` **and** the baseline diff says this build
+  `changed` it — neither alone is a candidate;
+- `critic@sheet`, when the critic was recorded unavailable.
+
+The UI adversary reproduces each one interactively, in a viewport at that width
+on the bound build, and records exactly one disposition with `dispose <run-dir>
+<candidate> <disposition> --by <who> …`:
+
+| Disposition | Carries | Then |
+| --- | --- | --- |
+| `confirmed` | `--finding <id> --evidence <viewport capture>` | A normal section 4 finding — severity, clip, fix, re-verification. Its lane marker lists the id in `confirmedFindings`. |
+| `refuted-capture-artifact` | `--reason --evidence <viewport capture>` | `aggregate <run-root> known-artifacts` gives it to the next critic as known-acceptable, so it does not recur as a new BROKEN. |
+| `deferred` | `--owner --trigger` | Real but tolerable; a named owner and a concrete revisit trigger. |
+| `blocked` | `--reason` | Could not reproduce, honestly. The screen goes on the verdict's Untested line. |
+
+A failed capture is **missing evidence for that journey**: re-capture it, or
+record `confirmed`/`blocked` — never refuted or deferred unseen (`list` shows
+what each candidate allows). A re-capture voids the old critic record.
+
+`smoke-evidence-barrier.sh synthesis` refuses while a required sheet has no
+manifest, a sheet has no critic record, or a candidate lacks a valid
+disposition — the `confirmedFindings`→clip pattern, and likewise COMPLETENESS
+ONLY: whether a disposition is true is the UI adversary's and challenger's
+judgment. The critic is never a gate: any honest disposition clears readiness,
+so a screenshot-only suspicion cannot hold a release, and the verdict moves
+only through a `confirmed` finding's severity, so a confirmed user-blocking
+defect cannot be waved through. A run with no contact sheet and no capture-recipe
+journeys is untouched. The shared critic log is `aggregate <run-root>
+critic-log` — derived, never hand-appended.
 
 ### Backend and specification verifier
 

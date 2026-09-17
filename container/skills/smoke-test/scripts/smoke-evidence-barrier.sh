@@ -545,6 +545,32 @@ if [ -e "$RUN_DIR/journeys/selection.json" ] || [ "${#JOURNEY_PIN_ARGS[@]}" -gt 
   fi
 fi
 
+# VISUAL CANDIDATES. A contact sheet and its screenshot-only critic DETECT;
+# nothing they flag may end as "advisory" with no owner. Same bargain as
+# confirmedFindings above: COMPLETENESS ONLY. Every candidate (a critic BROKEN,
+# a failed or unsettled capture, a critic DEGRADED on a screen the baseline
+# diff says this build changed) owes exactly one recorded disposition, and a
+# sheet with no critic record is itself not ready — whether a disposition is
+# TRUE is the UI adversary's and the challenger's question. This gates
+# SYNTHESIS READINESS only and never reads or writes a verdict: a candidate
+# reaches the verdict solely as a `confirmed` finding, through that finding's
+# normal severity. A run with no contact-sheet dir and no pinned journey
+# selection has no user-visible surface on record and is untouched — the
+# candidate rule lives in smoke-visual-candidates.py, which is not even run.
+if [ "$PHASE" = "synthesis" ] &&
+   { [ -e "$RUN_DIR/contact-sheet" ] || [ -e "$RUN_DIR/journeys/selection.json" ]; }; then
+  visual_result="$(python3 "$SCRIPT_DIR/smoke-visual-candidates.py" barrier "$RUN_DIR" 2>/dev/null)" || visual_result=""
+  if ! jq -e '(.missing | type == "array") and (.invalid | type == "array") and (.invalidReasons | type == "array")' \
+       <<<"$visual_result" >/dev/null 2>&1; then
+    INVALID+=("contact-sheet/dispositions.json")
+    INVALID_REASONS+=("contact-sheet/dispositions.json: the visual candidate completeness check could not run")
+  else
+    while IFS= read -r item; do MISSING+=("$item"); done < <(jq -r '.missing[] | select(length > 0)' <<<"$visual_result")
+    while IFS= read -r item; do INVALID+=("$item"); done < <(jq -r '.invalid[] | select(length > 0)' <<<"$visual_result")
+    while IFS= read -r item; do INVALID_REASONS+=("$item"); done < <(jq -r '.invalidReasons[] | select(length > 0)' <<<"$visual_result")
+  fi
+fi
+
 if [ "$PHASE" = "synthesis" ]; then
   for required in coordinator/preliminary.md challenger/disposition.md; do
     if [ ! -s "$RUN_DIR/$required" ]; then
