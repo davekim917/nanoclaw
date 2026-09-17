@@ -249,5 +249,50 @@ run_block "$CASE" || fail "block exited nonzero with no credential"
 grep -q . "$CASE/gh.log" && fail "gh invoked with no credential configured"
 pass "no credential, no helper, no git config, no gh call"
 
+# =========================================================================
+echo "9. helper run from a scrubbed child environment (a provider's stdio MCP server)"
+# The Codex CLI rebuilds a stdio MCP child's environment from a short default
+# list plus the per-server env table, so the helper a parent installed is
+# reachable while the variables it reads may not be. `env -i` below is that
+# child. container/agent-runner/src/nanoclaw-mcp-env.ts decides what crosses.
+CASE="$ROOT/case9"
+TOKEN_FILE="$ROOT/case9-token"
+printf '%s\n' 'ghp_case9_secret' > "$TOKEN_FILE"
+chmod 0600 "$TOKEN_FILE"
+run_block "$CASE" GITHUB_TOKEN_FILE="$TOKEN_FILE" || fail "block exited nonzero in file mode"
+
+if out=$(env -i PATH="/usr/bin:/bin" HOME="$CASE" "$BIN/nanoclaw-git-creds" get 2>"$CASE/err.txt"); then
+  fail "helper succeeded in a child that was given no token location"
+fi
+[ -n "$out" ] && fail "helper printed to stdout with no token location: $out"
+[ -s "$CASE/err.txt" ] && fail "helper wrote to stderr with no token location: $(cat "$CASE/err.txt")"
+pass "no token location in the child: exit 1, silent"
+
+out=$(env -i PATH="/usr/bin:/bin" HOME="$CASE" GITHUB_TOKEN_FILE="$TOKEN_FILE" "$BIN/nanoclaw-git-creds" get) \
+  || fail "helper failed in a child that was given only the path"
+echo "$out" | grep -q '^password=ghp_case9_secret$' || fail "child given only the path did not resolve the token"
+pass "the path alone is enough — no credential value has to cross"
+
+: > "$CASE/gh.log"
+env -i PATH="$BIN:$STUBS:/usr/bin:/bin" HOME="$CASE" GH_STUB_LOG="$CASE/gh.log" GITHUB_TOKEN_FILE="$TOKEN_FILE" \
+  gh pr create >/dev/null || fail "gh shim failed in a child that was given only the path"
+grep -q '^GH_TOKEN=ghp_case9_secret$' "$CASE/gh.log" || fail "gh shim did not resolve the token from the path"
+pass "gh shim authenticates from the path alone"
+
+if [ "$(id -u)" = "0" ]; then
+  echo "  skip — running as root, cannot make the token file unreadable"
+else
+  chmod 0000 "$TOKEN_FILE"
+  if out=$(env -i PATH="/usr/bin:/bin" HOME="$CASE" GITHUB_TOKEN_FILE="$TOKEN_FILE" \
+    "$BIN/nanoclaw-git-creds" get 2>"$CASE/err.txt"); then
+    chmod 0600 "$TOKEN_FILE"
+    fail "helper succeeded against an unreadable token file"
+  fi
+  chmod 0600 "$TOKEN_FILE"
+  [ -n "$out" ] && fail "helper printed to stdout for an unreadable file: $out"
+  [ -s "$CASE/err.txt" ] && fail "helper wrote to stderr for an unreadable file: $(cat "$CASE/err.txt")"
+  pass "unreadable token file: exit 1, silent, no token text"
+fi
+
 echo
 echo "PASS — container GitHub credential wiring"
