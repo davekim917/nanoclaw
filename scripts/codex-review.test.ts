@@ -2974,6 +2974,158 @@ describe('codex-review risk-scoped review requests', () => {
       expect(result.stderr).toContain(why);
     });
 
+    // A trusted comment that only quotes a receipt, inside `wrap`.
+    function quoted(wrap: (receipt: string) => string, verdict: string, findings: number, createdAt: string): Page {
+      const real = independentReceipt(HEAD, verdict, findings, createdAt);
+      const receipt = (real.body as string).slice((real.body as string).indexOf('<!--'));
+      return { ...real, body: `For the record, the receipt shape is:\n\n${wrap(receipt)}\n` };
+    }
+    const FENCES: [string, (receipt: string) => string][] = [
+      ['a longer backtick fence', (r) => `\`\`\`\`text\n${r}\`\`\`\`\n`],
+      ['a tilde fence', (r) => `~~~\n${r}~~~\n`],
+      ['an HTML comment', (r) => `<!--\n${r}-->\n`],
+    ];
+
+    it.each(FENCES)('still refuses when a CLEAR receipt quoted inside %s follows a real CHANGES one', (_case, wrap) => {
+      const root = tempRoot();
+      legacy(root, {
+        comments: [
+          independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:28:00Z'),
+          quoted(wrap, 'CLEAR', 0, '2026-09-05T00:40:00Z'),
+        ],
+      });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('verdict CHANGES, blocking_findings 1');
+    });
+
+    it('drops a quoted CLEAR on its own, and reads the real receipt after a quoted one in the same comment', () => {
+      const root = tempRoot();
+      legacy(root, { comments: [quoted(FENCES[0][1], 'CLEAR', 0, '2026-09-05T00:40:00Z')] });
+      expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+
+      const real = independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:41:00Z');
+      const sample = quoted(FENCES[0][1], 'CLEAR', 0, '2026-09-05T00:41:00Z');
+      legacy(root, { comments: [{ ...real, body: `${sample.body as string}\n${real.body as string}` }] });
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('verdict CHANGES, blocking_findings 1');
+    });
+
+    it('lets a hidden marker block but never clear: a CHANGES receipt under a fence left unclosed still refuses', () => {
+      const root = tempRoot();
+      const real = independentReceipt(HEAD, 'CHANGES', 1, '2026-09-05T00:41:00Z');
+      legacy(root, { comments: [{ ...real, body: `\`\`\`ts\nconst unclosed = 1;\n\n${real.body as string}` }] });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('(marker inside a code fence or an HTML comment) verdict CHANGES');
+    });
+
+    describe('a required context pinned to one app', () => {
+      const ACTIONS = 15368;
+      function appRun(name: string, conclusion: string, appId: number, startedAt: string): Page {
+        return { ...checkRun(name, 'completed', conclusion, startedAt), app: { id: appId } };
+      }
+      function pinned(root: string, reports: { runs?: Page[]; statuses?: Page[] }, classic = false): void {
+        legacy(root, { required: [], statuses: reports.statuses });
+        if (classic)
+          writeJson(root, 'branch--main.json', {
+            name: 'main',
+            protection: {
+              enabled: true,
+              required_status_checks: { contexts: ['CI Gate'], checks: [{ context: 'CI Gate', app_id: ACTIONS }] },
+            },
+          });
+        else
+          writeJson(root, 'rules--main.json', [
+            {
+              type: 'required_status_checks',
+              parameters: { required_status_checks: [{ context: 'CI Gate', integration_id: ACTIONS }] },
+            },
+          ]);
+        writeJson(root, `check-runs--${HEAD}.json`, reports.runs ?? []);
+      }
+
+      it.each([
+        ['a ruleset integration_id', false],
+        ['a classic checks[] app_id', true],
+      ])(
+        "refuses on the pinned app's red run under a newer same-named green from another source (%s)",
+        (_case, classic) => {
+          const root = tempRoot();
+          pinned(
+            root,
+            {
+              runs: [
+                appRun('CI Gate', 'failure', ACTIONS, '2026-09-05T00:02:00Z'),
+                appRun('CI Gate', 'success', 999, '2026-09-05T00:05:00Z'),
+              ],
+              statuses: [commitStatus('CI Gate', 'success', '2026-09-05T00:06:00Z')],
+            },
+            classic,
+          );
+
+          const result = runHelper(root, ['merge-check', '--head', HEAD]);
+          expect(result.status).toBe(24);
+          expect(result.stderr).toContain(`required_red: CI Gate=failure (app ${ACTIONS})`);
+        },
+      );
+
+      it("ignores another source's red, run or status: a pinned context with no eligible report is not reported", () => {
+        const root = tempRoot();
+        pinned(root, {
+          runs: [appRun('CI Gate', 'failure', 999, '2026-09-05T00:05:00Z')],
+          statuses: [commitStatus('CI Gate', 'failure', '2026-09-05T00:06:00Z')],
+        });
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+      });
+
+      it("defers once the pinned app's own newer run is green", () => {
+        const root = tempRoot();
+        pinned(root, {
+          runs: [
+            appRun('CI Gate', 'failure', ACTIONS, '2026-09-05T00:02:00Z'),
+            appRun('CI Gate', 'success', ACTIONS, '2026-09-05T00:05:00Z'),
+          ],
+        });
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+      });
+
+      it('counts an Actions job standing in for a check run as the Actions app', () => {
+        const root = tempRoot();
+        pinned(root, {});
+        fs.writeFileSync(path.join(root, `check-runs--${HEAD}.forbidden`), '');
+        const run = workflowRun('CI', 'completed', 'failure');
+        writeJson(root, 'runs.json', { total_count: 1, workflow_runs: [run] });
+        writeJson(root, `jobs--${run.id}.json`, [checkRun('CI Gate', 'completed', 'failure')]);
+
+        const result = runHelper(root, ['merge-check', '--head', HEAD]);
+        expect(result.status).toBe(24);
+        expect(result.stderr).toContain(`CI Gate=failure (app ${ACTIONS})`);
+      });
+
+      it('leaves an unpinned context taking any report of its name, as before', () => {
+        const root = tempRoot();
+        legacy(root, { required: ['CI Gate'] });
+        writeJson(root, `check-runs--${HEAD}.json`, [
+          appRun('CI Gate', 'failure', ACTIONS, '2026-09-05T00:02:00Z'),
+          appRun('CI Gate', 'success', 999, '2026-09-05T00:05:00Z'),
+        ]);
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(26);
+
+        writeJson(root, 'rules--main.json', [
+          {
+            type: 'required_status_checks',
+            parameters: { required_status_checks: [{ context: 'CI Gate', integration_id: null }] },
+          },
+        ]);
+        writeJson(root, `check-runs--${HEAD}.json`, [appRun('CI Gate', 'failure', 999, '2026-09-05T00:05:00Z')]);
+        expect(runHelper(root, ['merge-check', '--head', HEAD]).status).toBe(24);
+      });
+    });
+
     it('refuses a legacy head that is not the one named, before judging it', () => {
       const root = tempRoot();
       legacy(root);

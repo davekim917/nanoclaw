@@ -531,7 +531,7 @@ RECEIPT_MARKER_RE='(^|\n)<!-- pr-review-loop:substitute-receipt head=(?<head>[0-
 # line, then one fenced JSON object carrying `head`, `verdict` and
 # `blocking_findings`. The repo that uses it owns the full field contract; the
 # legacy precheck (independent_receipt_state) reads only those three.
-INDEPENDENT_RECEIPT_MARKER_RE='(^|\n)<!-- independent-review-receipt:v1 -->[ \t]*\r?(?<rest>(\n[^\n]*)*)'
+INDEPENDENT_RECEIPT_MARKER_RE='(^|\n)<!-- independent-review-receipt:v1 -->[ \t]*\r?(?=\n|\z)'
 INDEPENDENT_RECEIPT_JSON_RE='\A\s*```json[ \t]*\r?\n(?<json>[\s\S]*?)\n[ \t]*```'
 INDEPENDENT_RECEIPT_HEAD_RE='"head"\s*:\s*"(?<head>[0-9a-f]{40})"'
 # The receipt body's human-readable "who reviewed" line, used to recover the
@@ -1271,7 +1271,20 @@ ci_verdict() {
 # receipt_outcome trusts and in the posting order it uses (receipt-order.jq):
 # `none`, `clear`, `blocked\t<why>` or `unknown\t<why>`. Clear is verdict CLEAR
 # with zero blocking findings; anything else the newest one says is blocked, a
-# CHANGES verdict and a receipt whose JSON does not parse alike. A receipt that
+# CHANGES verdict and a receipt whose JSON does not parse alike.
+#
+# A marker quoted inside a code fence or an HTML comment is an example, not a
+# receipt, by the rule the Fixes-PR and Review-notes lines are read under, and
+# by the same reader: each marker line is swapped for a numbered sentinel and
+# the body goes through pr_body_text (pr-body.jq); a marker whose sentinel
+# survives stands in the open, and the receipt is the JSON after the first one
+# that does. Only such a receipt can be clear: a hidden one that reads clear
+# is dropped. A hidden one that does not read clear still counts: a fence left
+# unclosed above a real CHANGES receipt hides it exactly as a quote would, and
+# the two cannot be told apart, so hiding can only ever block, never clear. (The substitute
+# receipt marker is matched against the raw body, so it has the quoting hole
+# too; it is left as it is here, because closing it the plain way would let an
+# unclosed fence in a reviewer's body hide a `changes` receipt.) A receipt that
 # names another head says nothing about this one. One that names no readable
 # head at all could be about this one, so it counts: a later clear receipt for
 # this head supersedes it, as it would a CHANGES. Substitute receipts are not
@@ -1286,17 +1299,26 @@ independent_receipt_state() {
   printf '%s\n' "$pages" | jq -rs -L "$HERE" --arg re "$INDEPENDENT_RECEIPT_MARKER_RE" \
     --arg jsonRe "$INDEPENDENT_RECEIPT_JSON_RE" --arg headRe "$INDEPENDENT_RECEIPT_HEAD_RE" --arg head "$1" '
     include "receipt-order";
+    include "pr-body";
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
       | { login: (.author.login // "someone"), at: .createdAt, idstr: ((.fullDatabaseId // "") | tostring) } as $c
-      | [ (.body // "") | capture($re) ] | first // empty
-      | .rest as $rest
+      | ((.body // "") | gsub("\u001f"; "")) as $raw
+      | [ $raw | splits($re) ] as $parts
+      | select(($parts | length) > 1)
+      | (($parts | length) - 1) as $markers
+      | ({ body: ([ range(0; $markers) as $i | $parts[$i], "\n\u001f\($i)\u001f" ] + [ $parts[$markers] ] | join("")) } | pr_body_text) as $plain
+      | ([ range(0; $markers) | select(. as $i | $plain | test("(^|\n)\u001f\($i)\u001f[ \t]*\r?(\n|$)")) ] | first) as $open
+      | $parts[($open // 0) + 1] as $rest
       | ([ $rest | capture($jsonRe) | .json | try fromjson catch null | objects ] | first) as $doc
       | (if $doc != null then ($doc.head // null) else ([ $rest | capture($headRe) ] | first | .head) end) as $named
       | select(($named | type) != "string" or $named == $head)
-      | $c + { clear: ($doc != null and $doc.head == $head and $doc.verdict == "CLEAR" and $doc.blocking_findings == 0),
-               said: (if $doc == null then "its JSON block does not parse"
-                      else "verdict \($doc.verdict // "missing" | tostring), blocking_findings \($doc.blocking_findings // "missing" | tostring)" end) } ] as $matches
+      | ($doc != null and $doc.head == $head and $doc.verdict == "CLEAR" and $doc.blocking_findings == 0) as $clear
+      | select($open != null or ($clear | not))
+      | $c + { clear: $clear,
+               said: ((if $open == null then "(marker inside a code fence or an HTML comment) " else "" end)
+                      + (if $doc == null then "its JSON block does not parse"
+                         else "verdict \($doc.verdict // "missing" | tostring), blocking_findings \($doc.blocking_findings // "missing" | tostring)" end)) } ] as $matches
     | ([ $matches[] | select((.idstr | canonical_id) | not) ] | first) as $bad
     | if $bad != null then
         "unknown\treceipt_order_unknown: an independent-review receipt for this head from \($bad.login) has no usable database id (fullDatabaseId=\(if $bad.idstr == "" then "null" else $bad.idstr end)), so which receipt is newest cannot be determined"
@@ -1332,6 +1354,18 @@ independent_receipt_state() {
 # CI_EXCLUDED_CONTEXTS protects in ci_verdict too, and GitHub holds the merge
 # for it anyway. Nothing about the head is read when the branch requires
 # nothing.
+#
+# A requirement can be pinned to one GitHub App: `integration_id` on a ruleset
+# entry, `app_id` on a classic `checks[]` entry (null or -1 there is any
+# source). The pin stays on the entry, and only reports eligible for an entry
+# are compared for it, so a same-named green from another source never hides
+# the pinned app's red. A check run is eligible when its `app.id` is the pin.
+# A commit status is never eligible for a pinned entry: GitHub matches it to
+# the app that created it, and the statuses API names only a creating user, so
+# that cannot be read; a pinned entry with no eligible report is not reported,
+# never green by proxy. An unpinned entry takes any report of its name. One
+# context can carry several entries (a ruleset's and classic protection's);
+# each is judged alone, and any red one refuses.
 required_status_red() {
   local head="$1" branch rules status=0 protection required statuses checks
   branch=$(jq -rn --arg r "$2" '$r | split("/") | map(@uri) | join("/")') || return 1
@@ -1346,38 +1380,45 @@ required_status_red() {
   fi
   protection=$(gh api "repos/$REPO/branches/$branch") || return 1
   required=$(printf '%s\n%s\n' "$rules" "$protection" | jq -cs '
-    [ .[0] | .. | objects | select(.type == "required_status_checks") | .parameters.required_status_checks[]?.context ]
-    + [ .[1].protection.required_status_checks.contexts[]?, .[1].protection.required_status_checks.checks[]?.context ]
-    | map(strings) | unique') || return 1
+    def pin: if type == "number" and . > 0 then . else null end;
+    .[1].protection.required_status_checks as $classic
+    | [ .[0] | .. | objects | select(.type == "required_status_checks") | .parameters.required_status_checks[]?
+        | { context, app: (.integration_id | pin) } ]
+      + [ $classic.checks[]? | { context, app: (.app_id | pin) } ]
+      + [ $classic.contexts[]? | select(. as $c | any($classic.checks[]?; .context == $c) | not) | { context: ., app: null } ]
+    | map(select(.context | type == "string")) | unique') || return 1
   if [ "$required" = '[]' ]; then return 0; fi
   statuses=$(gh api --paginate --slurp "repos/$REPO/commits/$head/statuses?per_page=100") || return 1
   checks=$(head_check_runs "$head") || return 1
   printf '%s\n%s\n' "$statuses" "$checks" | jq -rs --argjson required "$required" '
-    [ ( .[0][][]? | { context, at: (.created_at // ""), id: (.id // 0), state,
+    [ ( .[0][][]? | { context, app: null, status: true, at: (.created_at // ""), id: (.id // 0), state,
                       red: (.state == "failure" or .state == "error") } ),
-      ( .[1][]? | { context: .name, at: (.started_at // .completed_at // ""), id: (.id // 0),
+      ( .[1][]? | { context: .name, app: (.app_id // null), status: false, at: (.started_at // .completed_at // ""), id: (.id // 0),
                     state: (if .status == "completed" then (.conclusion // "none") else (.status // "unknown") end),
-                    red: (.status == "completed" and (.conclusion | IN("failure", "timed_out", "cancelled", "action_required"))) } ) ]
-    | map(select(.context as $c | $required | index($c)))
-    | group_by(.context) | map(max_by([.at, .id]))
-    | [ .[] | select(.red) | "\(.context)=\(.state)" ]
-    | join(", ")'
+                    red: (.status == "completed" and (.conclusion | IN("failure", "timed_out", "cancelled", "action_required"))) } ) ] as $reports
+    | [ $required[] as $need
+        | [ $reports[] | select(.context == $need.context)
+            | select(if $need.app == null then true else (.status | not) and .app == $need.app end) ]
+        | max_by([.at, .id]) | select(. != null and .red)
+        | "\(.context)=\(.state)\(if $need.app != null then " (app \($need.app))" else "" end)" ]
+    | unique | join(", ")'
 }
 
 # Every check run on exactly HEAD, as a JSON array of {name, status,
-# conclusion, started_at, completed_at, id}. `commits/<sha>/check-runs` is the
+# conclusion, started_at, completed_at, id, app_id}. `commits/<sha>/check-runs` is the
 # whole answer, apps' checks included, but it 403s ("Resource not accessible
 # by personal access token") under the narrower tokens container agents may
 # hold (ci_verdict's header). Under that one answer the head's Actions jobs
 # stand in: `actions/runs` is what ci_verdict already reads with those tokens,
 # a job's name is its check run's name, and `filter=latest` keeps a re-run's
-# replaced attempt out. An app's check run is not visible that way. Any other
-# failure is no verdict.
+# replaced attempt out; each carries GitHub Actions' app id (15368, `app.id`
+# of every Actions check run, read 2026-09-17). Another app's check run is not
+# visible that way. Any other failure is no verdict.
 head_check_runs() {
   local raw status=0 runs id jobs all='[]'
   raw=$(gh api --paginate --slurp "repos/$REPO/commits/$1/check-runs?per_page=100" 2>/dev/null) || status=$?
   if [ "$status" -eq 0 ]; then
-    printf '%s' "$raw" | jq -c '[ .[].check_runs[]? | { name, status, conclusion, started_at, completed_at, id } ]'
+    printf '%s' "$raw" | jq -c '[ .[].check_runs[]? | { name, status, conclusion, started_at, completed_at, id, app_id: (.app.id // null) } ]'
     return
   fi
   if ! printf '%s' "$raw" | jq -e '[ .. | objects | select(.status == "403" and ((.message // "") | startswith("Resource not accessible"))) ] | length >= 1' >/dev/null 2>&1; then
@@ -1387,7 +1428,7 @@ head_check_runs() {
   runs=$(gh api --paginate --slurp "repos/$REPO/actions/runs?head_sha=$1&per_page=100") || return 1
   for id in $(printf '%s' "$runs" | jq -r --arg head "$1" '.[].workflow_runs[]? | select(.head_sha == $head) | .id | numbers'); do
     jobs=$(gh api --paginate --slurp "repos/$REPO/actions/runs/$id/jobs?per_page=100&filter=latest") || return 1
-    all=$(printf '%s\n%s\n' "$all" "$jobs" | jq -cs '.[0] + [ .[1][].jobs[]? | { name, status, conclusion, started_at, completed_at, id } ]') || return 1
+    all=$(printf '%s\n%s\n' "$all" "$jobs" | jq -cs '.[0] + [ .[1][].jobs[]? | { name, status, conclusion, started_at, completed_at, id, app_id: 15368 } ]') || return 1
   done
   printf '%s' "$all"
 }
