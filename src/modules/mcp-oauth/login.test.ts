@@ -370,3 +370,67 @@ describe('an integration belongs to one group (round-3 F3)', () => {
     expect((await getMcpOAuthIntegration('example-int'))!.agent_group_id).toBe('ag-1');
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #876 P3(d) and P3(f) — two ways `login` used to leave debris behind.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('startLogin — a duplicate (group, URL) is refused BEFORE registration (P3f)', () => {
+  it('does not mint a client at the provider for a login the unique index will reject', async () => {
+    const registrations: string[] = [];
+    const fetchImpl = server({ registrations });
+
+    await startLogin({ name: 'example-int', mcpUrl: MCP_URL, agentGroupId: 'ag-1' }, fetchImpl);
+    expect(registrations).toHaveLength(1);
+
+    // Same group, same MCP URL, different handle: UNIQUE(agent_group_id,
+    // mcp_url) (migration 082:66) will refuse the row. The point of the check
+    // is WHERE it happens — a client minted here would be unreachable
+    // afterwards, and no provider in this flow collects them.
+    await expect(
+      startLogin({ name: 'example-dupe', mcpUrl: MCP_URL, agentGroupId: 'ag-1' }, fetchImpl),
+    ).rejects.toThrow(/already has an integration for https:\/\/mcp\.example\.test\/mcp: "example-int"/);
+
+    expect(registrations).toHaveLength(1);
+    expect(await getMcpOAuthIntegration('example-dupe')).toBeUndefined();
+    expect(readMcpOAuthBundle('example-dupe')).toBeUndefined();
+  });
+
+  it('still lets the SAME integration re-login against its own URL', async () => {
+    const registrations: string[] = [];
+    const fetchImpl = server({ registrations });
+    await startLogin({ name: 'example-int', mcpUrl: MCP_URL, agentGroupId: 'ag-1' }, fetchImpl);
+    const again = await startLogin({ name: 'example-int', mcpUrl: MCP_URL, agentGroupId: 'ag-1' }, fetchImpl);
+    expect(again.registered).toBe('reused');
+  });
+});
+
+describe('startLogin — the bearer secret id follows the NAME (P3d)', () => {
+  it('drops a stale id when --secret points at a different secret', async () => {
+    const fetchImpl = server({ registrations: [] });
+    await startLogin({ name: 'example-int', mcpUrl: MCP_URL, agentGroupId: 'ag-1' }, fetchImpl);
+    await completeLogin({ name: 'example-int', redirectResponse: 'code=c1' }, fetchImpl);
+
+    const connected = await getMcpOAuthIntegration('example-int');
+    expect(connected!.bearer_secret_id).toBe('secret-uuid-1');
+
+    // A re-login that adopts a DIFFERENT vault secret. Keeping the old id here
+    // is what made `remove --delete-secret` delete the wrong secret: it prefers
+    // `bearer_secret_id` over the name (`removeIntegrationLocked`).
+    await startLogin(
+      { name: 'example-int', mcpUrl: MCP_URL, agentGroupId: 'ag-1', secretName: 'Other-Secret' },
+      fetchImpl,
+    );
+    const after = await getMcpOAuthIntegration('example-int');
+    expect(after!.bearer_secret_name).toBe('Other-Secret');
+    expect(after!.bearer_secret_id).toBeNull();
+  });
+
+  it('keeps the id when the secret name is unchanged', async () => {
+    const fetchImpl = server({ registrations: [] });
+    await startLogin({ name: 'example-int', mcpUrl: MCP_URL, agentGroupId: 'ag-1' }, fetchImpl);
+    await completeLogin({ name: 'example-int', redirectResponse: 'code=c1' }, fetchImpl);
+    await startLogin({ name: 'example-int', mcpUrl: MCP_URL, agentGroupId: 'ag-1' }, fetchImpl);
+    expect((await getMcpOAuthIntegration('example-int'))!.bearer_secret_id).toBe('secret-uuid-1');
+  });
+});

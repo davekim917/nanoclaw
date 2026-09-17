@@ -23,11 +23,11 @@ bridge died with `CONNECTION_CLOSED` on every spawn, until a human noticed and p
 
 ## Where each piece of state lives
 
-| Thing | Where | Why there |
-|---|---|---|
-| Access token (the bearer) | OneCLI secret, injected at the proxy | The container never sees a credential; this is the existing model |
-| Refresh token, client id/secret | `data/mcp-oauth/<name>.json`, mode 0600 in a 0700 directory | OneCLI's API is **write-only** for secret values (see below), so a refresh token parked there could never be read back. The **access token is not here** — the exception covers what mints the next bearer, never a bearer that works right now |
-| Endpoints, scopes, secret name, expiry, status | `mcp_oauth_integrations` (migration 082) | Metadata only — no token material, so `ncl integrations list` is safe to read and to share |
+| Thing                                          | Where                                                       | Why there                                                                                                                                                                                                                                       |
+| ---------------------------------------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Access token (the bearer)                      | OneCLI secret, injected at the proxy                        | The container never sees a credential; this is the existing model                                                                                                                                                                               |
+| Refresh token, client id/secret                | `data/mcp-oauth/<name>.json`, mode 0600 in a 0700 directory | OneCLI's API is **write-only** for secret values (see below), so a refresh token parked there could never be read back. The **access token is not here** — the exception covers what mints the next bearer, never a bearer that works right now |
+| Endpoints, scopes, secret name, expiry, status | `mcp_oauth_integrations` (migration 082)                    | Metadata only — no token material, so `ncl integrations list` is safe to read and to share                                                                                                                                                      |
 
 **Why the refresh token is not in OneCLI.** Verified against the live gateway on 2026-09-17,
 `onecli@1.4.1`: `POST /api/secrets` → 201, `PATCH /api/secrets/{id}` with `{"value":…}` → 200
@@ -149,18 +149,33 @@ granted, however fresh its value is.
 ncl groups restart --id <agent-group-id>
 ```
 
-An already-running container does not need a restart for a later *refresh* — the gateway injects the
+An already-running container does not need a restart for a later _refresh_ — the gateway injects the
 new value on the next request.
 
 ## What it refuses
 
-- **Anything cleartext.** Every URL this flow fetches — the issuer it reads metadata from, the
-  authorization, token, registration and device endpoints, and the verification URI a device login
-  prints for you to open — must be `https` (RFC 8414 §2), whether it was discovered or supplied by
-  `--issuer` / `--device-endpoint`. The issuer is the load-bearing one: metadata fetched over
-  cleartext can be substituted wholesale, and every `https` endpoint inside a forged document would
-  pass a per-endpoint check. There is no loopback exemption — the only loopback URL here is the
-  redirect, which your browser resolves and this host never calls.
+- **Anything cleartext.** Every URL this flow fetches — `--url` itself, the `resource_metadata` URL
+  the server's 401 challenge advertises, the issuer it reads metadata from, the authorization, token,
+  registration and device endpoints, and the verification URI a device login prints for you to open —
+  must be `https` (RFC 8414 §2), whether it was discovered or supplied by `--issuer` /
+  `--device-endpoint`. The issuer is the load-bearing one: metadata fetched over cleartext can be
+  substituted wholesale, and every `https` endpoint inside a forged document would pass a per-endpoint
+  check. There is one narrow exemption, and only for the two URLs that describe the _resource_: an
+  MCP server (and the `resource_metadata` URL it advertises) on `127.0.0.1`, `localhost` or `::1` may
+  be `http`, because that traffic never leaves this host. The authorization server gets no such
+  exemption, and the redirect is not fetched by this host at all — your browser resolves it.
+- **An authorization server that does not own its own metadata.** RFC 8414 §3.3: the `issuer` in the
+  metadata document must be identical — trailing slash aside — to the issuer URL the document was
+  fetched for, and the field must be present. Without it, whoever controls `authorization_servers[0]`
+  can hand back a document speaking for someone else, and that value is what the client-reuse check
+  keys on.
+- **A protected-resource document describing something else.** RFC 9728 §3.3: its `resource` must
+  cover `--url`, matched by origin plus path prefix. Prefix rather than equality because the live
+  servers differ — Dropbox and Littlebird name `…/mcp` exactly, Amplitude names its origin while
+  serving MCP under `/mcp`.
+- **A second integration for the same group and URL.** Refused _before_ dynamic client registration:
+  the row would hit `UNIQUE(agent_group_id, mcp_url)` anyway, and discovering that after registering
+  leaves a client minted at the provider that nothing here can see or revoke.
 - **A `plain` PKCE downgrade.** S256 or nothing, even where a server still advertises `plain`.
 - **A path-traversing integration name.** Names are `[a-z0-9-]`, because a name is a file name.
 
@@ -174,12 +189,24 @@ new access token, PATCHed over the same OneCLI secret.
   every refresh cannot lock the integration out.
 - **`invalid_grant` / `invalid_client` / `unauthorized_client`** move the row to `needs_login`, log
   one WARN, and stop retrying. Only a fresh `login` clears it. The last two also condemn the
-  *registration*, which is recorded on the bundle so the next `login` registers a new client instead
+  _registration_, which is recorded on the bundle so the next `login` registers a new client instead
   of replaying the one the server just refused.
 - **A rotated refresh token reaches disk before the OneCLI write**, which is the fallible step. A
   server that reissued one has already killed the old one, so the other order would turn a live grant
   into a forced human login on any gateway hiccup. The reverse failure — fresh credentials on disk, a
   stale bearer in OneCLI — parks the row in `error` and the next tick fixes it.
+- **A OneCLI outage costs one grant, not one per minute.** When the token was minted and only the
+  vault write failed, the access token is held in memory and the sweep retries _the write_ — never
+  the grant — on a doubling backoff from 60 s to a 15-minute cap. Re-running the grant instead would
+  rotate the refresh token once a tick for the length of the outage. If the outage outlives the
+  parked token (it gets within the 10-minute refresh margin of its own expiry) the parked copy is
+  dropped and a fresh grant is taken, because writing a dead bearer to the vault buys nothing. A host
+  restart forgets the parked write and the next tick does a full refresh, which is correct — the
+  refresh token on disk is current.
+- **Two overlapping sweeps cannot both refresh one integration.** The decision to refresh is taken
+  again inside the per-integration lock, against the re-read row; the pass that was queued behind
+  finds the row no longer due and does nothing. Acting on the pre-lock snapshot would send a second
+  grant carrying a refresh token the first one had already rotated away.
 - **Anything else** leaves the row in `error` with the old bearer untouched. An `error` row is due
   on the **next tick regardless of its expiry** — the status is a statement about the last attempt,
   not about the token's clock — so a failure is retried in 60 seconds rather than when the token it

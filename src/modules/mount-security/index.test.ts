@@ -207,3 +207,41 @@ describe('managed git-hooks tree containment (#666 review B9)', () => {
     expect(result.effectiveReadonly).toBe(false);
   });
 });
+
+// Issue #876 hardening. Both patterns are credential-bearing directories that
+// the default list missed by one character or one word.
+describe('default blocked patterns cover the OAuth bundles and hyphenated key files', () => {
+  /** Create `<projectsDir>/<relative>` and offer it as a mount. */
+  function mountOf(relative: string): ReturnType<typeof validateMount> {
+    const hostPath = path.join(projectsDir, relative);
+    fs.mkdirSync(hostPath, { recursive: true });
+    writeAllowlist({ allowedRoots: [{ path: projectsDir, allowReadWrite: true }], blockedPatterns: [] });
+    return validateMount({ hostPath, readonly: true });
+  }
+
+  it('refuses the MCP OAuth bundle directory, where the refresh tokens live', () => {
+    const result = mountOf(path.join('data', 'mcp-oauth'));
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toMatch(/blocked pattern "mcp-oauth"/);
+  });
+
+  it('refuses a parent that merely CONTAINS the bundle directory', () => {
+    // `data/` is the realistic operator mistake: one entry, and the bundles
+    // are inside it.
+    fs.mkdirSync(path.join(projectsDir, 'nested', 'mcp-oauth'), { recursive: true });
+    const result = mountOf(path.join('mcp-oauth-backups'));
+    expect(result.allowed).toBe(false);
+  });
+
+  it('refuses the HYPHENATED private-key spelling, which `private_key` never matched', () => {
+    const result = mountOf('private-key');
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toMatch(/blocked pattern "private-key"/);
+    // The underscore spelling still matches, as before.
+    expect(mountOf('private_key').allowed).toBe(false);
+  });
+
+  it('leaves an ordinary directory alone', () => {
+    expect(mountOf('ordinary-repo').allowed).toBe(true);
+  });
+});

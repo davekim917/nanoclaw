@@ -41,6 +41,7 @@ import { getAgentGroup } from '../../db/agent-groups.js';
 import {
   deleteMcpOAuthIntegration,
   getMcpOAuthIntegration,
+  getMcpOAuthIntegrationByTarget,
   listMcpOAuthIntegrations,
   markMcpOAuthIntegration,
   upsertMcpOAuthIntegration,
@@ -223,6 +224,21 @@ async function startLoginLocked(input: LoginInput, fetchImpl: FetchLike): Promis
         "from that group's container.json onecliSecrets, then log in again under the new group.",
     );
   }
+  // BEFORE dynamic client registration, not after: the unique index on
+  // (agent_group_id, mcp_url) (migration 082:66) is enforced by the UPSERT far
+  // below, and by then `registerClient` has already minted a client at the
+  // provider. That client would be unreachable — no row and no bundle name it —
+  // and no provider in this flow garbage-collects one. Letting the INSERT
+  // discover the conflict costs a permanent stray registration per attempt.
+  const conflict = await getMcpOAuthIntegrationByTarget(input.agentGroupId, input.mcpUrl);
+  if (conflict && conflict.name !== input.name) {
+    throw new Error(
+      `Agent group ${input.agentGroupId} already has an integration for ${input.mcpUrl}: "${conflict.name}" ` +
+        `(status ${conflict.status}). Re-run login under that name, or ` +
+        `\`ncl integrations remove --name ${conflict.name}\` first.`,
+    );
+  }
+
   // A re-login keeps the redirect URI the client was REGISTERED with, because
   // the authorization server stored that exact string and rejects an exchange
   // that does not match it. An explicit `--redirect-uri` or `--port` overrides
@@ -307,7 +323,14 @@ async function startLoginLocked(input: LoginInput, fetchImpl: FetchLike): Promis
     scopes: scopes || null,
     redirect_uri: redirectUri,
     bearer_secret_name: bearerSecretName,
-    bearer_secret_id: existingRow?.bearer_secret_id ?? null,
+    // The id belongs to the NAME it was resolved for. A re-login that points
+    // `--secret` at a different name must drop it, or the row carries the new
+    // name beside the old secret's UUID — and `remove --delete-secret` prefers
+    // the id over the name (`removeIntegrationLocked`), so it would delete the
+    // secret the operator just stopped using and leave the one in use. The next
+    // `complete`/refresh writes the correct id back (`finalizeToken`).
+    bearer_secret_id:
+      existingRow && existingRow.bearer_secret_name === bearerSecretName ? existingRow.bearer_secret_id : null,
     host_pattern: mcp.hostname,
     path_pattern: mcp.pathname && mcp.pathname !== '/' ? mcp.pathname : null,
     // A re-login against a live integration stays `active` until the exchange
@@ -551,9 +574,10 @@ async function finalizeToken(
   } catch (err) {
     // The credentials are safe on disk; only the bearer failed to land. `error`
     // is due on the NEXT tick regardless of the expiry written here
-    // (`decideRefresh`), so the sweep re-mints and rewrites the secret without a
-    // human. If there is no refresh token to re-mint with, that same first retry
-    // is what moves the row to `needs_login` and says so.
+    // (`decideRefresh`), so the sweep retries without a human. What it retries
+    // is the WRITE and not the grant: the token just minted is parked in
+    // memory, and the sweep re-PATCHes the secret with it on a backoff.
+    rememberPendingSecretWrite(row.name, token, expiryFrom(token, nowMs));
     await markMcpOAuthIntegration(row.name, {
       status: 'error',
       status_detail: `token minted but the OneCLI secret write failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -563,6 +587,10 @@ async function finalizeToken(
     });
     throw err;
   }
+
+  // The bearer is in the vault, so any write parked by an earlier failure is
+  // superseded — retrying it would PATCH an older access token over this one.
+  pendingSecretWrites.delete(row.name);
 
   const hasRefreshToken = Boolean(refreshToken);
   await markMcpOAuthIntegration(row.name, {
@@ -779,12 +807,140 @@ async function withIntegrationLock<T>(name: string, fn: () => Promise<T>): Promi
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Parked vault writes
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** First retry one tick later; doubling, capped. */
+export const SECRET_WRITE_RETRY_BASE_MS = 60 * 1000;
+export const SECRET_WRITE_RETRY_MAX_MS = 15 * 60 * 1000;
+
+export function secretWriteRetryDelayMs(attempts: number): number {
+  const doubled = SECRET_WRITE_RETRY_BASE_MS * 2 ** Math.max(0, attempts - 1);
+  return Math.min(doubled, SECRET_WRITE_RETRY_MAX_MS);
+}
+
+/**
+ * An access token that was successfully MINTED and could not be written to the
+ * OneCLI secret.
+ *
+ * WHY IN MEMORY AND NOT IN THE BUNDLE. The bundle store holds the credentials
+ * that MINT a bearer and deliberately never the bearer itself (`store.ts`:
+ * "WHAT IS NOT HERE: the ACCESS token") — a read of that directory must not
+ * yield a token that works right now. Parking it in the host process keeps that
+ * true. The cost is that a host restart forgets the parked write, and the next
+ * sweep does a full refresh instead; that is correct, because the refresh token
+ * on disk is current and a restart is not a gateway outage.
+ */
+interface ParkedSecretWrite {
+  accessToken: string;
+  tokenType: string;
+  scope: string | null;
+  /** Expiry of THIS access token, so a token the outage outlived is dropped. */
+  expiresAt: string | null;
+  attempts: number;
+  nextAttemptAtMs: number;
+}
+
+const pendingSecretWrites = new Map<string, ParkedSecretWrite>();
+
+function rememberPendingSecretWrite(name: string, token: TokenResponse, expiresAt: string | null): void {
+  const attempts = (pendingSecretWrites.get(name)?.attempts ?? 0) + 1;
+  pendingSecretWrites.set(name, {
+    accessToken: token.accessToken,
+    tokenType: token.tokenType || 'Bearer',
+    scope: token.scope ?? null,
+    expiresAt,
+    attempts,
+    nextAttemptAtMs: Date.now() + secretWriteRetryDelayMs(attempts),
+  });
+}
+
+function pendingWriteStatusDetail(name: string, err: unknown): string {
+  const parked = pendingSecretWrites.get(name);
+  const wait = parked ? Math.round(secretWriteRetryDelayMs(parked.attempts) / 1000) : 0;
+  return (
+    `token minted but the OneCLI secret write failed: ${err instanceof Error ? err.message : String(err)} ` +
+    `(attempt ${parked?.attempts ?? 1}; retrying the write in ~${wait}s, not the grant)`
+  );
+}
+
+/**
+ * True once the parked token is too close to its own expiry to be worth
+ * writing. Uses the same margin the refresher admits a row on, so a token
+ * dropped here is immediately replaced by a fresh grant rather than leaving a
+ * gap. A token with no stated expiry is never spent by the clock — there is no
+ * clock to judge it by — and the backoff bounds the retries instead.
+ */
+function parkedTokenIsSpent(parked: ParkedSecretWrite, nowMs: number): boolean {
+  if (!parked.expiresAt) return false;
+  const expiresMs = Date.parse(parked.expiresAt);
+  if (!Number.isFinite(expiresMs)) return true;
+  return expiresMs - nowMs <= REFRESH_MARGIN_MS;
+}
+
+/** Retry ONLY the vault write, with the token that was already minted. */
+async function retryPendingSecretWrite(
+  row: McpOAuthIntegration,
+  parked: ParkedSecretWrite,
+  outcome: RefreshOutcome,
+): Promise<void> {
+  try {
+    const secret = await putOnecliBearerSecret(
+      {
+        name: row.bearer_secret_name,
+        hostPattern: row.host_pattern,
+        pathPattern: row.path_pattern,
+        headerName: 'Authorization',
+        valueFormat: `${parked.tokenType} {value}`,
+      },
+      parked.accessToken,
+    );
+    pendingSecretWrites.delete(row.name);
+    await markMcpOAuthIntegration(row.name, {
+      status: 'active',
+      status_detail: null,
+      expires_at: parked.expiresAt,
+      scopes: parked.scope ?? row.scopes,
+      bearer_secret_id: secret.id,
+      last_refresh_at: new Date().toISOString(),
+    });
+    // The same tail `finalizeToken` runs: a bearer the group does not declare
+    // is a bearer the agent is never granted (`src/onecli-secrets.ts`
+    // `applyOnecliSecrets`).
+    await ensureSecretDeclared(row.agent_group_id, row.bearer_secret_name);
+    outcome.refreshed.push(row.name);
+    log.info('MCP OAuth bearer write recovered', {
+      integration: row.name,
+      attempts: parked.attempts,
+      expiresAt: parked.expiresAt,
+    });
+  } catch (err) {
+    rememberPendingSecretWrite(
+      row.name,
+      { accessToken: parked.accessToken, tokenType: parked.tokenType, scope: parked.scope ?? undefined },
+      parked.expiresAt,
+    );
+    await markMcpOAuthIntegration(row.name, {
+      status: 'error',
+      status_detail: pendingWriteStatusDetail(row.name, err),
+    });
+    outcome.failed.push(row.name);
+    log.warn('MCP OAuth bearer write still failing — backing off', {
+      integration: row.name,
+      attempts: pendingSecretWrites.get(row.name)?.attempts,
+      err,
+    });
+  }
+}
+
 /** Warned-once set, so an integration needing a human says so on one tick, not
  *  every tick. Cleared when the row leaves `needs_login`. */
 const warnedNeedsLogin = new Set<string>();
 
 export function _resetMcpOAuthWarnStateForTesting(): void {
   warnedNeedsLogin.clear();
+  pendingSecretWrites.clear();
 }
 
 export interface RefreshOutcome {
@@ -808,10 +964,10 @@ export async function refreshExpiringMcpOAuthIntegrations(fetchImpl: FetchLike =
 
   for (const listed of rows) {
     if (listed.status !== 'needs_login') warnedNeedsLogin.delete(listed.name);
-    const decision = decideRefresh(listed, now);
-    if (!decision.refresh) continue;
-    outcome.checked++;
-    await withIntegrationLock(listed.name, () => refreshOne(listed.name, decision, outcome, fetchImpl));
+    // Cheap admission test on the snapshot. The decision that COUNTS is taken
+    // again inside the lock, against the re-read row.
+    if (!decideRefresh(listed, now).refresh) continue;
+    await withIntegrationLock(listed.name, () => refreshOne(listed.name, outcome, fetchImpl));
   }
 
   return outcome;
@@ -826,14 +982,39 @@ export async function refreshExpiringMcpOAuthIntegrations(fetchImpl: FetchLike =
  * inside it is the current truth. A row that has gone means the integration was
  * removed while this tick was queued behind it, and there is nothing to do.
  */
-async function refreshOne(
-  name: string,
-  decision: RefreshDecision,
-  outcome: RefreshOutcome,
-  fetchImpl: FetchLike,
-): Promise<void> {
+async function refreshOne(name: string, outcome: RefreshOutcome, fetchImpl: FetchLike): Promise<void> {
   const row = await getMcpOAuthIntegration(name);
   if (!row) return;
+
+  // RE-DECIDED HERE, not carried in from the listing. The listing was taken
+  // before the lock, and everything that changes the answer — a `complete`, an
+  // overlapping sweep that was queued ahead of this one, a `remove` — holds
+  // this same lock. Acting on the stale decision is how two passes both refresh
+  // the same integration: the first rotates the refresh token, the second sends
+  // the one it read from the snapshot, and a server that rotates on every
+  // refresh has already invalidated it. That costs a human re-login.
+  const decision = decideRefresh(row, Date.now());
+  if (!decision.refresh) return;
+  outcome.checked++;
+
+  // An earlier attempt minted a token and could not get it into the vault. The
+  // token endpoint is NOT called again for it: the grant succeeded, only the
+  // write failed, and re-running the grant against a server that rotates
+  // refresh tokens burns a rotation per tick for a vault that is down.
+  const parked = pendingSecretWrites.get(row.name);
+  if (parked) {
+    if (parkedTokenIsSpent(parked, Date.now())) {
+      // Outlived by the outage. A dead bearer is worth nothing in the vault, so
+      // stop retrying the write and fall through to a fresh grant.
+      pendingSecretWrites.delete(row.name);
+    } else if (Date.now() < parked.nextAttemptAtMs) {
+      return;
+    } else {
+      await retryPendingSecretWrite(row, parked, outcome);
+      return;
+    }
+  }
+
   const bundle = readMcpOAuthBundle(row.name);
   if (!bundle?.refreshToken) {
     if (!warnedNeedsLogin.has(row.name)) {
@@ -878,16 +1059,38 @@ async function refreshOne(
       updatedAt: new Date().toISOString(),
     });
 
-    const secret = await putOnecliBearerSecret(
-      {
-        name: row.bearer_secret_name,
-        hostPattern: row.host_pattern,
-        pathPattern: row.path_pattern,
-        headerName: 'Authorization',
-        valueFormat: `${token.tokenType || 'Bearer'} {value}`,
-      },
-      token.accessToken,
-    );
+    let secret;
+    try {
+      secret = await putOnecliBearerSecret(
+        {
+          name: row.bearer_secret_name,
+          hostPattern: row.host_pattern,
+          pathPattern: row.path_pattern,
+          headerName: 'Authorization',
+          valueFormat: `${token.tokenType || 'Bearer'} {value}`,
+        },
+        token.accessToken,
+      );
+    } catch (err) {
+      // Park the minted token and let the backoff own the retry, rather than
+      // falling into the generic handler below, which would leave the row due
+      // on every tick and send this integration back to the token endpoint once
+      // a minute for as long as the gateway is down.
+      rememberPendingSecretWrite(row.name, token, expiryFrom(token, Date.now()));
+      await markMcpOAuthIntegration(row.name, {
+        status: 'error',
+        status_detail: pendingWriteStatusDetail(row.name, err),
+      });
+      outcome.failed.push(row.name);
+      log.warn('MCP OAuth bearer write failed — token is minted, retrying the write only', {
+        integration: row.name,
+        attempts: pendingSecretWrites.get(row.name)?.attempts,
+        err,
+      });
+      return;
+    }
+
+    pendingSecretWrites.delete(row.name);
 
     await markMcpOAuthIntegration(row.name, {
       status: 'active',
@@ -976,6 +1179,7 @@ async function removeIntegrationLocked(name: string, options: { deleteSecret?: b
       : await findOnecliSecretByName(row.bearer_secret_name);
     if (ref) removedSecret = await deleteOnecliSecret(ref.id);
   }
+  pendingSecretWrites.delete(name);
   const removedBundle = deleteMcpOAuthBundle(name);
   const removedRow = await deleteMcpOAuthIntegration(name);
   return { name, removedRow, removedBundle, removedSecret, secretName: row?.bearer_secret_name ?? null };

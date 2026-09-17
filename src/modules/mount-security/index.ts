@@ -55,6 +55,19 @@ const DEFAULT_BLOCKED_PATTERNS = [
   'id_rsa',
   'id_ed25519',
   'private_key',
+  // The HYPHENATED spelling too. `private_key` alone missed the file this
+  // install actually has — a GitHub App key is conventionally
+  // `<app>.<date>.private-key.pem`, and the underscore pattern does not match
+  // it. Same credential class, one character apart.
+  'private-key',
+  // `data/mcp-oauth/` — the host-side OAuth bundles (`src/modules/mcp-oauth/store.ts`).
+  // Each holds a REFRESH token and a client secret: the means to mint a working
+  // bearer for a remote MCP server for as long as the grant lives. `DATA_DIR`
+  // is never bind-mounted and the spawn path mounts only named subpaths under
+  // it, so nothing reaches these today — this closes the one way an operator
+  // could hand them to a container by hand, an `additionalMounts` entry
+  // pointing at `data/` or at the bundle directory itself.
+  'mcp-oauth',
   '.secret',
 ];
 
