@@ -19,8 +19,8 @@
  * that git's real output matches the shapes `parseLsTree` / `parseLsFiles` /
  * `parseNumstat` expect, and that the script wires these functions together in
  * the right order. Those are covered by running the script for real — the CI job
- * (`.github/workflows/ci.yml`, "Upstream divergence ratchet") fetches the pinned
- * commit and runs the report on every PR, which is what makes the manifest's
+ * (`.github/workflows/ci-full.yml`, "Upstream divergence ratchet") fetches the pinned
+ * commit and runs the report nightly, which is what makes the manifest's
  * numbers verified rather than self-reported.
  */
 import { createHash } from 'node:crypto';

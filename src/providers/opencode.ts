@@ -41,7 +41,7 @@ import {
   resolvePluginRoots,
   resolveRealPath,
 } from '../plugin-skill-discovery.js';
-import { registerProviderContainerConfig } from './provider-container-registry.js';
+import { registerProviderContainerConfig, type VolumeMount } from './provider-container-registry.js';
 
 // Code-level opencode defaults — the floor under the per-group DB value
 // (container_configs), mirroring DEFAULT_OPUS_MODEL etc. for claude in
@@ -468,11 +468,67 @@ function resolveOpenCodeSourcePaths(
   };
 }
 
-registerProviderContainerConfig('opencode', async (ctx) => {
-  const opencodeDir = path.join(ctx.sessionDir, 'opencode-xdg');
+/** Container path the session XDG tree is mounted at, for every provider. */
+export const OPENCODE_XDG_CONTAINER_PATH = '/opencode-xdg';
+
+/**
+ * Env that points OpenCode at the staged XDG tree. Both vars name the same
+ * mount: OpenCode reads creds from `$XDG_DATA_HOME/opencode/` and agents from
+ * `$XDG_CONFIG_HOME/opencode/agent/`, and one tree serves both.
+ *
+ * Non-OpenCode containers get these too (see `stageOpenCodeAuth`). Nothing else
+ * in the image reads them: `gcloud` keys on `CLOUDSDK_CONFIG`
+ * (`container/agent-runner/src/gcp-auth-setup.ts:36`), the design-review
+ * Chromium sets its own per-run XDG dirs
+ * (`container/agent-runner/src/mcp-tools/design-review/render.ts:134`), the
+ * `hex` wrapper exports its own `XDG_DATA_HOME` per invocation
+ * (`container/hex-wrapper.sh`), `gh` authenticates from `GH_TOKEN` via the
+ * entrypoint shim rather than a config file (`container/entrypoint.sh`), and
+ * git reads `$HOME/.gitconfig` or `GIT_CONFIG_GLOBAL` (same file).
+ *
+ * `XDG_CONFIG_HOME` here is in fact DEAD for the runner and every child it
+ * spawns: `container/entrypoint.sh:37` exports `XDG_CONFIG_HOME=/tmp/.chromium`
+ * (a crashpad workaround) after Docker applies this env, so only
+ * `XDG_DATA_HOME` survives. That is the one credential discovery needs —
+ * `auth.json` lives under `$XDG_DATA_HOME/opencode/`. Both vars are still
+ * declared: a `docker exec` shell skips the entrypoint and sees this pair, and
+ * an agent-authored `opencode` config would be looked for under
+ * `$XDG_CONFIG_HOME/opencode/`.
+ */
+export const OPENCODE_XDG_ENV: Readonly<Record<string, string>> = Object.freeze({
+  XDG_DATA_HOME: OPENCODE_XDG_CONTAINER_PATH,
+  XDG_CONFIG_HOME: OPENCODE_XDG_CONTAINER_PATH,
+});
+
+export interface StagedOpenCodeAuth {
+  mounts: VolumeMount[];
+  env: Readonly<Record<string, string>>;
+  /** `<sessionDir>/opencode-xdg/opencode` — where the provider adds the rest. */
+  opencodeSubdir: string;
+}
+
+/**
+ * Stage the host OpenCode credential into a session-private XDG tree and return
+ * the mount and env that reach it.
+ *
+ * AUTH ONLY, deliberately. Every container carries this so any agent can drive
+ * `opencode` headless, and a credential is all that takes — agent definitions,
+ * skills and `opencode.db` are the OpenCode PROVIDER's session state and stay
+ * with the provider's own contribution, which calls this for its auth step so
+ * there is one copy of the staging logic rather than two.
+ *
+ * The directories were writable by the prior container, so every managed entry
+ * is recreated without following a path that container may have replaced with a
+ * symlink.
+ */
+export function stageOpenCodeAuth(
+  sessionDir: string,
+  agentGroupFolder: string | undefined,
+  agentGroupId: string,
+  hostHome: string | undefined,
+): StagedOpenCodeAuth {
+  const opencodeDir = path.join(sessionDir, 'opencode-xdg');
   const opencodeSubdir = path.join(opencodeDir, 'opencode');
-  // Both directories were writable by the prior container. Do not let
-  // mkdir/copy follow a symlink planted by that container on the next spawn.
   if (fs.lstatSync(opencodeDir, { throwIfNoEntry: false }) === undefined)
     fs.mkdirSync(opencodeDir, { recursive: true });
   assertRealDirectory(opencodeDir);
@@ -480,20 +536,32 @@ registerProviderContainerConfig('opencode', async (ctx) => {
   assertRealDirectory(opencodeSubdir);
 
   let authContents: Buffer | null = null;
+  if (hostHome) {
+    const source = resolveOpenCodeSourcePaths(agentGroupFolder, agentGroupId, hostHome);
+    if (fs.existsSync(source.authFile)) authContents = fs.readFileSync(source.authFile);
+  }
+  if (authContents) replaceUntrustedFile(opencodeSubdir, 'auth.json', authContents);
+  else removeUntrustedPathEntry(opencodeSubdir, 'auth.json');
+
+  return {
+    mounts: [{ hostPath: opencodeDir, containerPath: OPENCODE_XDG_CONTAINER_PATH, readonly: false }],
+    env: OPENCODE_XDG_ENV,
+    opencodeSubdir,
+  };
+}
+
+registerProviderContainerConfig('opencode', async (ctx) => {
+  const hostHome = ctx.hostEnv.HOME || os.homedir();
+  const staged = stageOpenCodeAuth(ctx.sessionDir, ctx.agentGroupFolder, ctx.agentGroupId, hostHome);
+  const opencodeSubdir = staged.opencodeSubdir;
+
   let hostAgentsDir: string | null = null;
   let hostSkillsDir: string | null = null;
-  const hostHome = ctx.hostEnv.HOME || os.homedir();
   if (hostHome) {
     const source = resolveOpenCodeSourcePaths(ctx.agentGroupFolder, ctx.agentGroupId, hostHome);
-    if (fs.existsSync(source.authFile)) authContents = fs.readFileSync(source.authFile);
     if (fs.existsSync(source.agentsDir)) hostAgentsDir = source.agentsDir;
     if (fs.existsSync(source.skillsDir)) hostSkillsDir = source.skillsDir;
   }
-
-  // Every managed entry may have been replaced while the prior container owned
-  // this RW mount. Recreate or clear each one without following its old path.
-  if (authContents) replaceUntrustedFile(opencodeSubdir, 'auth.json', authContents);
-  else removeUntrustedPathEntry(opencodeSubdir, 'auth.json');
 
   removeUntrustedPathEntry(opencodeSubdir, 'agent');
   if (hostAgentsDir) {
@@ -563,13 +631,13 @@ registerProviderContainerConfig('opencode', async (ctx) => {
   const modelProvider = slash > 0 ? model.slice(0, slash) : DEFAULT_OPENCODE_PROVIDER;
 
   const env: Record<string, string> = {
-    XDG_DATA_HOME: '/opencode-xdg',
-    // OpenCode reads agents from `$XDG_CONFIG_HOME/opencode/agent/` (verified
-    // empirically against opencode-ai@1.15.7). Pointing XDG_CONFIG_HOME at the
-    // same mount as XDG_DATA_HOME means opencode.jsonc / agent/ / auth.json /
-    // opencode.db all live in one /opencode-xdg/opencode/ tree — no second
-    // mount needed. Provider copies the per-sibling agent/*.md above.
-    XDG_CONFIG_HOME: '/opencode-xdg',
+    // XDG_DATA_HOME + XDG_CONFIG_HOME, both naming the one staged tree: agents
+    // come from `$XDG_CONFIG_HOME/opencode/agent/` and creds from
+    // `$XDG_DATA_HOME/opencode/` (verified empirically against
+    // opencode-ai@1.15.7), so opencode.jsonc / agent/ / auth.json / opencode.db
+    // all live in one /opencode-xdg/opencode/ tree and no second mount is
+    // needed. Provider copies the per-sibling agent/*.md above.
+    ...staged.env,
     // The child runtime adds opencode.ai only when the effective turn model
     // has a matching native auth record. The host cannot decide that from the
     // boot model because `-m` and channel defaults can change it later.
@@ -603,8 +671,5 @@ registerProviderContainerConfig('opencode', async (ctx) => {
   // registry handles the URL automatically. (Removed 2026-05-23 after the
   // earlier "force Go billing via base URL" hack proved unnecessary.)
 
-  return {
-    mounts: [{ hostPath: opencodeDir, containerPath: '/opencode-xdg', readonly: false }],
-    env,
-  };
+  return { mounts: staged.mounts, env };
 });

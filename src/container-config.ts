@@ -2,7 +2,7 @@
  * Container config types and access layer.
  *
  * `groups/<folder>/container.json` is the canonical source of truth for every
- * non-DB field (onecliSecrets, tools, credentialFolder, codexHostAuth,
+ * non-DB field (onecliSecrets, tools, credentialFolder, codexAuthFallbacks,
  * dailySummary, etc.) — read by `readContainerConfig`, written by
  * `writeContainerConfig`, modified directly on disk by skills and operators.
  *
@@ -818,26 +818,15 @@ export interface ContainerConfig {
   excludeMcpServers?: string[];
 
   /**
-   * When true, expose host Codex auth to the container. For provider=codex,
-   * the active `~/.codex` remains a session-local private copy, and the host
-   * Codex home is mounted separately as a read-only refresh source so long
-   * running containers can heal a stale copied auth.json. For codex-as-peer
-   * groups, the host Codex home is mounted directly. SECURITY: read access
-   * to auth.json is enough to exfiltrate the OAuth token. Default OFF — opt
-   * in only for groups that specifically need Codex host auth (e.g., the Codex
-   * agent provider, /codex:rescue use cases). Pre-2026-05-03 the mount was
-   * unconditional and RW; the cross-tenant audit forced it opt-in.
-   */
-  codexHostAuth?: boolean;
-
-  /**
    * When true, mount the host `~/.wix` directory into the container RW so the
    * Wix CLI uses the host's OAuth session (operator ran `wix login` once on the
    * host). RW because the CLI rewrites `~/.wix/auth/account.json` on token
    * refresh. Mounted straight to `/home/node/.wix` via a dedicated path in
    * container-runner — NOT `additionalMounts`, which `validateAdditionalMounts`
    * sandboxes under `/workspace/extra` (where the CLI's `os.homedir()`-based
-   * `~/.wix` lookup would never find it). Mirrors `codexHostAuth`. Default OFF.
+   * `~/.wix` lookup would never find it). Default OFF — unlike the Codex and
+   * OpenCode credentials, which every container carries, Wix is one tenant's
+   * CLI and has no fleet-wide use.
    */
   wixHostAuth?: boolean;
 
@@ -856,8 +845,10 @@ export interface ContainerConfig {
    * new CODEX_HOME. Conversation history is preserved (the rollout file
    * is self-contained — codex reconstructs history inline).
    *
-   * Inherits the existing `codexHostAuth: true` gate; entries are ignored
-   * when host-auth mounting is opt-out.
+   * Gated only by the `codex` plugin being mounted for the group — the same
+   * condition as the primary `~/.codex` mount, which is otherwise
+   * unconditional. Per-group by design: the primary identity is shared, the
+   * fallback identities are whatever this group was given.
    */
   codexAuthFallbacks?: string[];
 
@@ -1296,7 +1287,11 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
     providerFallback: raw.providerFallback,
     githubTokenEnv: raw.githubTokenEnv,
     excludePlugins: validateExcludePlugins(raw.excludePlugins),
-    codexHostAuth: raw.codexHostAuth,
+    // NB: no `codexHostAuth`. The field was removed when the Codex host-auth
+    // mount became unconditional; every existing `groups/*/container.json`
+    // still carries it. This projection is an ALLOWLIST — a key with no line
+    // here is dropped, silently and by construction — so those files keep
+    // parsing and the stale value reaches nothing.
     wixHostAuth: raw.wixHostAuth,
     codexAuthFallbacks: raw.codexAuthFallbacks,
     credentialFolder: raw.credentialFolder,

@@ -218,7 +218,7 @@ function citationExistenceProblems(fix: string, root: string): string[] {
   for (const { file, span, endLine, pinnedSha } of fileLineCitations(fix)) {
     if (pinnedSha) {
       if (!gitCommitResolvable(root, pinnedSha)) {
-        // A shallow CI checkout (.github/workflows/ci.yml uses actions/checkout@v4
+        // A shallow CI checkout (.github/workflows/ci-full.yml uses actions/checkout@v4
         // with no fetch-depth override, so depth 1) cannot resolve most historical
         // shas at all — the *only* case an unresolvable sha is expected, not a
         // mistake. Skipping unconditionally here (#730 P3 regression) let a
@@ -473,7 +473,7 @@ describe('docs/review-notes.md', () => {
   // #730 P3: fix 1 (an unresolvable pinned sha is a problem in a full clone)
   // must not turn a real, historical pin into a false failure in a genuinely
   // shallow checkout — proved against a real `--depth 1` clone of this repo,
-  // not a synthetic fixture. `.github/workflows/ci.yml`'s `correctness` job
+  // not a synthetic fixture. `.github/workflows/ci-full.yml`'s `correctness` job
   // (this test's own job) now uses `fetch-depth: 0` (#730 P3 round 3), but
   // `bookkeeping`'s checkout, a contributor's default local clone, and this
   // host's own (shallow from the upstream ratchet pin) all still can be, so
@@ -962,7 +962,7 @@ describe('citation existence, checked only when a root is given (#707 P3-d)', ()
   });
 
   // #730 P3: the one case an unresolvable pinned sha is expected, not a
-  // mistake — a genuinely shallow checkout (CI's: .github/workflows/ci.yml
+  // mistake — a genuinely shallow checkout (CI's: .github/workflows/ci-full.yml
   // uses actions/checkout@v4 with no fetch-depth override, so depth 1)
   // cannot resolve a real, historical commit at all. A real `--depth 1`
   // clone proves it, rather than asserting on a merely well-formed sha that

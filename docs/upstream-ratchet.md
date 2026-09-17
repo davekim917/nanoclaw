@@ -121,7 +121,7 @@ recomputes every entry against the pinned commit with five whole-tree git calls 
 `ls-files`, `diff --numstat`, `check-ignore --stdin` — about a third of a second warm) and classifies each
 path.
 
-**The numbers are checked in CI, not self-reported.** `.github/workflows/ci.yml` has an
+**The numbers are checked in CI, not self-reported.** `.github/workflows/ci-full.yml` has an
 `Upstream divergence ratchet` step that fetches the pinned commit by sha (`git fetch --depth=1 <url> <sha>`,
 which GitHub serves in well under a second) and runs the report. Without it a PR could regenerate the
 manifest with `--accept-all` and nothing would ever recheck the arithmetic. Exit 2 there means the fetch did

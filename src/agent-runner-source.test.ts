@@ -104,17 +104,27 @@ function makeFakeSourceDir(): string {
   return dir;
 }
 
+// `buildMounts` resolves ~/plugins and both credential homes from `$HOME`, and
+// stages the OpenCode credential it finds there. Give it an empty test home so a
+// case about the runner-source mount never touches — or copies — a real account.
+let savedHome: string | undefined;
+
 beforeEach(async () => {
   vi.clearAllMocks();
   resetAgentRunnerSourceForTesting();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
+  savedHome = process.env.HOME;
+  process.env.HOME = path.join(TEST_ROOT, 'home');
+  fs.mkdirSync(process.env.HOME, { recursive: true });
   await initTestDb();
   runMigrations(getRawDb());
 });
 
 afterEach(async () => {
   await closeDb();
+  if (savedHome === undefined) delete process.env.HOME;
+  else process.env.HOME = savedHome;
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   resetAgentRunnerSourceForTesting();
 });
