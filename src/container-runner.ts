@@ -209,11 +209,15 @@ export const DATAFOLD_MCP_SERVER = {
 
 /**
  * Host-only fields on a stored MCP entry: they exist for the capability
- * snapshot and never for the provider. The container's map is built straight
- * from this JSON (`container/agent-runner/src/index.ts:246`), whose
- * `McpServerConfig` knows `instructions` but neither of these
- * (`container/agent-runner/src/providers/types.ts:231`), so they are dropped
- * at the boundary rather than handed to three providers' config translators.
+ * snapshot and never for the provider. The container parses this JSON straight
+ * into its server map (`container/agent-runner/src/index.ts:246`) and hands
+ * each entry to a provider's translator; its own `McpServerConfig`
+ * (`container/agent-runner/src/providers/types.ts:260-298`) declares neither
+ * field, so they are dropped here rather than ridden along to three providers.
+ *
+ * `instructions` is deliberately NOT in this list. It is not part of that type
+ * either, but it already crosses the boundary today and this function is not
+ * the place to change what a running container receives.
  */
 const HOST_ONLY_MCP_FIELDS = ['displayName', 'description'] as const;
 

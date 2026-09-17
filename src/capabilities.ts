@@ -875,9 +875,9 @@ export function buildSessionServicesSnapshotFrom(
  * Deliberately says nothing about what the server does — that is the
  * `description` field's job — and names only the transport the agent needs to
  * reason about. The URL is safe to print: `parseMcpServerConfig` refuses a URL
- * carrying credentials at intake (src/container-config.ts:424-455), and the
+ * carrying credentials at intake (src/container-config.ts:478-500), and the
  * agent can read the same value in its own read-only container.json mount
- * (src/container-runner.ts:4855). `env` and `headers` are never rendered —
+ * (src/container-runner.ts:4873). `env` and `headers` are never rendered —
  * those DO hold injected values for the stdio servers this file's own gated
  * blocks build.
  */

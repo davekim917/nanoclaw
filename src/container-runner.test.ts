@@ -661,9 +661,10 @@ describe('serializeMcpServersEnv', () => {
     });
 
     const servers = JSON.parse(env!.replace(/^NANOCLAW_MCP_SERVERS=/, ''));
-    // `instructions` is part of the container's own McpServerConfig
-    // (container/agent-runner/src/providers/types.ts:231); displayName and
-    // description are not, and exist only for the capability snapshot.
+    // `instructions` already crosses the boundary today and keeps doing so;
+    // displayName and description are new host-only metadata and must not
+    // (container/agent-runner/src/providers/types.ts:260-298 declares none of
+    // the three).
     expect(servers.acme).toEqual({
       type: 'http',
       url: 'https://mcp.acme.test/mcp',
