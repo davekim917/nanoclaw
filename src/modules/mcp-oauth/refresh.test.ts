@@ -56,6 +56,7 @@ vi.mock('./onecli-secret-writer.js', () => ({
 import { closeDb, initMigratedTestDb } from '../../db/index.js';
 import {
   getMcpOAuthIntegration,
+  markMcpOAuthIntegration,
   upsertMcpOAuthIntegration,
   type McpOAuthIntegration,
 } from '../../db/mcp-oauth-integrations.js';
@@ -155,6 +156,20 @@ describe('decideRefresh', () => {
     expect(decideRefresh(row({ status: 'needs_login', expires_at: due }), NOW).refresh).toBe(false);
     // `error` IS retried — that is the difference between the two failure classes.
     expect(decideRefresh(row({ status: 'error', expires_at: due }), NOW).refresh).toBe(true);
+  });
+
+  // Round-2 review F1: `error` is a statement about the last ATTEMPT, not about
+  // the token's clock. Deferring it to the expiry window left a failed bearer
+  // write unusable for ~50 minutes of a one-hour token, and 12 hours when the
+  // server stated no expiry — the opposite of the next-sweep retry the status
+  // asks for.
+  it('retries an `error` row on the next tick whatever its expiry says', () => {
+    expect(
+      decideRefresh(row({ status: 'error', expires_at: new Date(NOW + 60 * 60 * 1000).toISOString() }), NOW),
+    ).toEqual({ refresh: true, reason: 'retry-after-error' });
+    expect(
+      decideRefresh(row({ status: 'error', expires_at: null, last_refresh_at: new Date(NOW).toISOString() }), NOW),
+    ).toEqual({ refresh: true, reason: 'retry-after-error' });
   });
 
   it('falls back to a fixed interval when the server stated no expiry', () => {
@@ -257,7 +272,7 @@ describe('refreshExpiringMcpOAuthIntegrations', () => {
     expect(after!.status).toBe('error');
     // The bearer in OneCLI is untouched — the old token may still have life.
     expect(secretWrites).toHaveLength(0);
-    expect(decideRefresh(after!, Date.now()).refresh).toBe(true);
+    expect(decideRefresh(after!, Date.now())).toEqual({ refresh: true, reason: 'retry-after-error' });
   });
 
   it('needs a login when the bundle has no refresh token at all', async () => {
@@ -328,6 +343,35 @@ describe('refreshExpiringMcpOAuthIntegrations', () => {
     // The grant is dead but the client is fine — re-registering would mint an
     // orphan at the provider for nothing.
     expect(readMcpOAuthBundle('other-int')!.clientRejectedAt).toBeUndefined();
+  });
+
+  // Round-2 review F2: a server may GRANT less than was asked for. Re-sending
+  // the requested set on the next refresh reads as an attempt to widen the
+  // grant, which a strict server answers with `invalid_scope` — a permanent
+  // retry loop.
+  it('records a narrowed scope and asks for exactly that next time', async () => {
+    await seed({ scopes: 'files.metadata.read files.content.write' });
+
+    let sent = '';
+    await refreshExpiringMcpOAuthIntegrations(async (_url, init) => {
+      sent = new URLSearchParams(String(init?.body)).get('scope') ?? '';
+      return tokenResponse({
+        access_token: 'at-new',
+        expires_in: 3600,
+        token_type: 'Bearer',
+        scope: 'files.metadata.read',
+      });
+    });
+    expect(sent).toBe('files.metadata.read files.content.write');
+    expect((await getMcpOAuthIntegration('dropbox-files'))!.scopes).toBe('files.metadata.read');
+
+    // Second pass: the row now carries the granted set, so that is what goes out.
+    await markMcpOAuthIntegration('dropbox-files', { status: 'error' });
+    await refreshExpiringMcpOAuthIntegrations(async (_url, init) => {
+      sent = new URLSearchParams(String(init?.body)).get('scope') ?? '';
+      return tokenResponse({ access_token: 'at-3', expires_in: 3600, token_type: 'Bearer' });
+    });
+    expect(sent).toBe('files.metadata.read');
   });
 
   it('bundle files are 0600 inside a 0700 directory', async () => {

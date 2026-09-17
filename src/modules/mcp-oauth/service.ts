@@ -48,7 +48,7 @@ import {
 } from '../../db/mcp-oauth-integrations.js';
 import { updateContainerConfig } from '../../container-config.js';
 import { log } from '../../log.js';
-import { discoverAuthorization, type FetchLike } from './discovery.js';
+import { assertHttpsEndpoint, discoverAuthorization, type FetchLike } from './discovery.js';
 import {
   buildAuthorizeUrl,
   exchangeAuthorizationCode,
@@ -191,6 +191,10 @@ export async function startLogin(input: LoginInput, fetchImpl: FetchLike = fetch
   if (!group) throw new Error(`Agent group not found: ${input.agentGroupId}`);
 
   const mcp = new URL(input.mcpUrl);
+  // Same reasoning as `--device-endpoint`: an `http:` issuer would have the
+  // authorization-server METADATA fetched in the clear, and every endpoint in a
+  // forged document would then pass the per-endpoint check further down.
+  if (input.issuer) assertHttpsEndpoint('--issuer', input.issuer);
   const discovered = await discoverAuthorization(fetchImpl, input.mcpUrl, input.issuer);
 
   if (discovered.codeChallengeMethods.length > 0 && !discovered.codeChallengeMethods.includes('S256')) {
@@ -319,7 +323,12 @@ export async function startLogin(input: LoginInput, fetchImpl: FetchLike = fetch
   };
 
   if (input.device) {
-    const deviceEndpoint = input.deviceEndpoint ?? discovered.deviceAuthorizationEndpoint;
+    // `--device-endpoint` bypasses discovery, so it bypassed discovery's HTTPS
+    // check too: over cleartext, a network attacker owns the device response and
+    // therefore the verification URL the operator is told to visit.
+    const deviceEndpoint = input.deviceEndpoint
+      ? assertHttpsEndpoint('--device-endpoint', input.deviceEndpoint)
+      : discovered.deviceAuthorizationEndpoint;
     if (!deviceEndpoint) {
       const advertises = discovered.grantTypesSupported.includes('device_code');
       throw new Error(
@@ -348,13 +357,21 @@ export async function startLogin(input: LoginInput, fetchImpl: FetchLike = fetch
       expiresInSeconds: authorization.expiresInSeconds,
       resource: input.noResourceIndicator ? undefined : discovered.resource,
     })
-      .then((token) => finishInBackground(input.name, token))
+      .then((token) => finishInBackground(input.name, state, token))
       .catch((err: unknown) => {
         log.warn('MCP OAuth device login did not complete', { integration: input.name, err });
-        void markMcpOAuthIntegration(input.name, {
-          status: 'pending',
-          status_detail: `device login failed: ${err instanceof Error ? err.message : String(err)}`,
-        }).catch(() => undefined);
+        // Only demote the attempt that is still outstanding. A second `login`
+        // for this name mints a new `pending.state`, and a late failure from the
+        // attempt it superseded must not drag a newer — possibly already
+        // successful — one back to `pending`.
+        void (async () => {
+          const current = readMcpOAuthBundle(input.name);
+          if (current?.pending?.state !== state) return;
+          await markMcpOAuthIntegration(input.name, {
+            status: 'pending',
+            status_detail: `device login failed: ${err instanceof Error ? err.message : String(err)}`,
+          });
+        })().catch(() => undefined);
       });
 
     return {
@@ -416,12 +433,26 @@ export async function startLogin(input: LoginInput, fetchImpl: FetchLike = fetch
   }
 }
 
-/** Finish a background (device) login and log the outcome — nobody is waiting
- *  on a return value by the time this runs. */
-async function finishInBackground(name: string, token: TokenResponse): Promise<void> {
+/**
+ * Finish a background (device) login and log the outcome — nobody is waiting on
+ * a return value by the time this runs.
+ *
+ * `attemptState` is the `pending.state` minted by the `login` that started this
+ * poll, and it is the attempt's identity. A second `login` for the same name
+ * overwrites the bundle with a new client, a new state and a new device code; a
+ * late success from the attempt it replaced would otherwise install a token
+ * minted for the OLD client over the newer grant, keyed only by name. Re-reading
+ * the bundle and comparing is enough because `login` is the only writer of
+ * `pending`.
+ */
+async function finishInBackground(name: string, attemptState: string, token: TokenResponse): Promise<void> {
   const row = await getMcpOAuthIntegration(name);
   const bundle = readMcpOAuthBundle(name);
   if (!row || !bundle) return;
+  if (bundle.pending?.state !== attemptState) {
+    log.warn('MCP OAuth device login completed for a superseded attempt — discarded', { integration: name });
+    return;
+  }
   await finalizeToken(row, bundle, token, { newGrant: true });
 }
 
@@ -490,14 +521,16 @@ async function finalizeToken(
       token.accessToken,
     );
   } catch (err) {
-    // The credentials are safe on disk; only the bearer failed to land. Park the
-    // row where the refresher will pick it up — `decideRefresh` retries `error`
-    // rows that carry an expiry, so the next sweep mints a fresh access token and
-    // writes the secret again, with no human involved.
+    // The credentials are safe on disk; only the bearer failed to land. `error`
+    // is due on the NEXT tick regardless of the expiry written here
+    // (`decideRefresh`), so the sweep re-mints and rewrites the secret without a
+    // human. If there is no refresh token to re-mint with, that same first retry
+    // is what moves the row to `needs_login` and says so.
     await markMcpOAuthIntegration(row.name, {
       status: 'error',
       status_detail: `token minted but the OneCLI secret write failed: ${err instanceof Error ? err.message : String(err)}`,
       expires_at: expiryFrom(token, nowMs),
+      scopes: token.scope ?? row.scopes,
       last_refresh_at: new Date(nowMs).toISOString(),
     });
     throw err;
@@ -510,6 +543,11 @@ async function finalizeToken(
       ? null
       : 'no refresh token issued — this bearer expires and cannot be renewed automatically',
     expires_at: expiryFrom(token, nowMs),
+    // The GRANTED set, which a server is free to narrow. The row is what the
+    // refresher sends back on `scope`, and re-sending the wider set it asked for
+    // reads as a request to widen the grant — `invalid_scope` on a strict
+    // server, and a permanent retry loop.
+    scopes: token.scope ?? row.scopes,
     bearer_secret_id: secret.id,
     last_refresh_at: new Date(nowMs).toISOString(),
   });
@@ -626,7 +664,7 @@ async function ensureSecretDeclared(agentGroupId: string, secretName: string): P
 
 export type RefreshDecision =
   | { refresh: false; reason: 'not-active' | 'no-expiry-yet' | 'within-window' }
-  | { refresh: true; reason: 'expiring' | 'expired' | 'unknown-expiry-interval' };
+  | { refresh: true; reason: 'expiring' | 'expired' | 'unknown-expiry-interval' | 'retry-after-error' };
 
 /**
  * Pure: should this row be refreshed right now?
@@ -638,6 +676,17 @@ export type RefreshDecision =
  */
 export function decideRefresh(row: McpOAuthIntegration, nowMs: number): RefreshDecision {
   if (row.status !== 'active' && row.status !== 'error') return { refresh: false, reason: 'not-active' };
+
+  // `error` means the LAST attempt failed, which is a statement about the
+  // attempt and not about the token's clock. Running it through the expiry
+  // window below would defer the retry until the token it could not deliver is
+  // nearly dead — about 50 minutes for a typical one-hour token, and 12 hours
+  // for one the server gave no `expires_in` for. Both contradict the
+  // retry-next-sweep this status exists to request. The terminal cases are
+  // still bounded: a dead grant becomes `needs_login` (which returns above) and
+  // a row with no refresh token on file becomes `needs_login` on its first
+  // retry, so "due every tick" cannot become an unbounded loop.
+  if (row.status === 'error') return { refresh: true, reason: 'retry-after-error' };
 
   if (!row.expires_at) {
     const lastMs = row.last_refresh_at ? Date.parse(row.last_refresh_at) : NaN;
@@ -749,6 +798,9 @@ export async function refreshExpiringMcpOAuthIntegrations(fetchImpl: FetchLike =
         status: 'active',
         status_detail: null,
         expires_at: expiryFrom(token, Date.now()),
+        // Track a narrowing the server applied on this refresh, so the next one
+        // asks for what it actually has (see the note in `finalizeToken`).
+        scopes: token.scope ?? row.scopes,
         bearer_secret_id: secret.id,
         last_refresh_at: new Date().toISOString(),
       });

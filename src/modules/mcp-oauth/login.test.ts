@@ -201,6 +201,32 @@ describe('startLogin — when a registration may be reused (round-1 F3)', () => 
   });
 });
 
+describe('startLogin — overrides go through the same HTTPS gate (round-2 F4)', () => {
+  it('refuses a cleartext --issuer, which would have the AS metadata fetched in the clear', async () => {
+    await expect(
+      startLogin(
+        { name: 'example-int', mcpUrl: MCP_URL, agentGroupId: 'ag-1', issuer: 'http://as.example.test' },
+        server({ registrations: [] }),
+      ),
+    ).rejects.toThrow(/--issuer must be https/);
+  });
+
+  it('refuses a cleartext --device-endpoint, which would hand an attacker the verification URL', async () => {
+    await expect(
+      startLogin(
+        {
+          name: 'example-int',
+          mcpUrl: MCP_URL,
+          agentGroupId: 'ag-1',
+          device: true,
+          deviceEndpoint: 'http://as.example.test/device',
+        },
+        server({ registrations: [] }),
+      ),
+    ).rejects.toThrow(/--device-endpoint must be https/);
+  });
+});
+
 describe('completeLogin — a new grant owns its own refresh token (round-1 F4)', () => {
   it('stores the refresh token the exchange returned and declares the secret', async () => {
     const { result } = await login();
@@ -231,6 +257,32 @@ describe('completeLogin — a new grant owns its own refresh token (round-1 F4)'
     expect(readMcpOAuthBundle('example-int')!.refreshToken).toBeUndefined();
     const row = await getMcpOAuthIntegration('example-int');
     expect(row!.status_detail).toMatch(/no refresh token issued/);
+  });
+
+  // Round-2 review F3: a background device poll is identified by name alone, so
+  // a late result from a superseded attempt could install a token minted for the
+  // old client over the newer grant.
+  it('discards a device result whose attempt has been superseded by a newer login', async () => {
+    const { result: first } = await login({ name: 'example-int' });
+    // A second login supersedes it: new state, new client binding.
+    const { result: second } = await login({ name: 'example-int', port: 9999 });
+    expect(second.state).not.toBe(first.state);
+
+    // The superseded attempt's code is refused on its state, which is the same
+    // guard `finishInBackground` applies to a device poll.
+    await expect(
+      completeLogin(
+        { name: 'example-int', redirectResponse: `?code=c&state=${first.state}` },
+        server({ registrations: [] }),
+      ),
+    ).rejects.toThrow(/State mismatch/);
+
+    // …and the current attempt still completes.
+    const done = await completeLogin(
+      { name: 'example-int', redirectResponse: `?code=c&state=${second.state}` },
+      server({ registrations: [] }),
+    );
+    expect(done.hasRefreshToken).toBe(true);
   });
 
   it('refuses a redirect whose state belongs to a different login', async () => {

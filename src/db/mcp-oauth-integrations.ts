@@ -111,11 +111,15 @@ export async function markMcpOAuthIntegration(
     expires_at?: string | null;
     bearer_secret_id?: string | null;
     last_refresh_at?: string | null;
+    /** The scope set the server actually GRANTED, which can be narrower than
+     *  what was asked for. Re-sending the requested set on refresh reads as an
+     *  attempt to widen the grant. */
+    scopes?: string | null;
   },
 ): Promise<void> {
   const sets = ['status = @status', 'updated_at = @now'];
   const params: Record<string, unknown> = { name, status: patch.status, now: new Date().toISOString() };
-  for (const key of ['status_detail', 'expires_at', 'bearer_secret_id', 'last_refresh_at'] as const) {
+  for (const key of ['status_detail', 'expires_at', 'bearer_secret_id', 'last_refresh_at', 'scopes'] as const) {
     if (patch[key] !== undefined) {
       sets.push(`${key} = @${key}`);
       params[key] = patch[key];

@@ -140,12 +140,13 @@ new value on the next request.
 
 ## What it refuses
 
-- **A cleartext endpoint.** Every discovered or overridden `authorization_endpoint`,
-  `token_endpoint`, `registration_endpoint` and `device_authorization_endpoint` must be `https`
-  (RFC 8414 §2). Metadata arrives over the network, so an `http:` endpoint in it would put the
-  authorization code, the client secret and the refresh token on the wire in the clear. There is no
-  loopback exemption: the only loopback URL in this flow is the redirect, which the browser resolves
-  and this host never calls.
+- **A cleartext endpoint.** Every `authorization_endpoint`, `token_endpoint`,
+  `registration_endpoint` and `device_authorization_endpoint` must be `https` (RFC 8414 §2) —
+  discovered or supplied by `--issuer` / `--device-endpoint`, which go through the same check.
+  Metadata arrives over the network, so an `http:` endpoint in it would put the authorization code,
+  the client secret and the refresh token on the wire in the clear, and an `http:` issuer would have
+  the metadata document itself fetched in the clear. There is no loopback exemption: the only
+  loopback URL in this flow is the redirect, which the browser resolves and this host never calls.
 - **A `plain` PKCE downgrade.** S256 or nothing, even where a server still advertises `plain`.
 - **A path-traversing integration name.** Names are `[a-z0-9-]`, because a name is a file name.
 
@@ -165,8 +166,13 @@ new access token, PATCHed over the same OneCLI secret.
   server that reissued one has already killed the old one, so the other order would turn a live grant
   into a forced human login on any gateway hiccup. The reverse failure — fresh credentials on disk, a
   stale bearer in OneCLI — parks the row in `error` and the next tick fixes it.
-- **Anything else** leaves the row in `error` with the old bearer untouched, and the next tick
-  retries.
+- **Anything else** leaves the row in `error` with the old bearer untouched. An `error` row is due
+  on the **next tick regardless of its expiry** — the status is a statement about the last attempt,
+  not about the token's clock — so a failure is retried in 60 seconds rather than when the token it
+  could not deliver is nearly dead.
+- **A narrowed grant is tracked.** If the server grants fewer scopes than were asked for, the row
+  records the granted set and the next refresh asks for exactly that; re-sending the wider set reads
+  as an attempt to widen the grant, which a strict server answers with `invalid_scope`.
 - **No `expires_in`** from the server falls back to refreshing every 12 hours.
 
 `ncl integrations refresh` runs the same pass on demand.
