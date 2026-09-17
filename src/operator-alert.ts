@@ -34,6 +34,43 @@ import { log } from './log.js';
 import { ensureUserDm } from './modules/permissions/user-dm.js';
 import { scrubSecrets } from './secret-scrubber.js';
 
+/**
+ * The whole call's deadline, and the cap on any one network step inside it.
+ *
+ * Every caller is a sweep duty awaiting this from inside a per-session or tick
+ * window. An adapter promise that never settles would hold that window open for
+ * good — the session stays in the driver's running set and every later tick
+ * skips it (`sessionsRunning`, src/host-sweep.ts:1118) — and merely SLOW
+ * recipients, tried one after another, could add up past the tick's own stall
+ * ceiling (`SWEEP_TICK_STALL_MS`, 15 min, src/host-sweep.ts:941), at which
+ * point the driver abandons the tick. An alert is never worth the sweep.
+ *
+ * So the bound is on the CALL, not on the recipient count: one sweep interval
+ * (60 s), a fifteenth of that ceiling, leaving a tick room for several alerts.
+ * It is a literal rather than an import because host-sweep.ts reaches this
+ * module through container-runner.ts → storage-pressure-alert.ts, and the
+ * cycle is not worth a constant; `scheduling.test.ts` pins the relation.
+ *
+ * The step cap exists only so failover survives: without it the first hung
+ * recipient would spend the whole deadline and the next would never be tried.
+ * Each step gets min(step cap, time remaining).
+ *
+ * Generous on purpose — a healthy DM send is sub-second, and the cost of a
+ * false timeout is a possible duplicate: the abandoned send may still land
+ * after this returns false and the caller re-alerts later.
+ */
+export const OPERATOR_ALERT_DEADLINE_MS = 60_000;
+export const OPERATOR_ALERT_STEP_TIMEOUT_MS = 20_000;
+
+/** Reject after `ms` so the recipient loop's `catch` treats a hang like a throw. */
+function bounded<T>(step: string, work: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`operator-alert: ${step} did not settle within ${ms}ms`)), ms);
+  });
+  return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
+}
+
 export async function notifyOperators(rawText: string, context: Record<string, unknown> = {}): Promise<boolean> {
   // Alerts quote things that failed, and what failed is often agent or command
   // output. `scrubSecrets` is applied on the normal outbound path in
@@ -72,9 +109,19 @@ export async function notifyOperators(rawText: string, context: Record<string, u
   // text out through every wired bot (observed live: one storage-pressure
   // episode -> a DM from every agent). Recipients are ordered owner-first;
   // later rows are failover only.
+  const deadlineMs = Date.now() + OPERATOR_ALERT_DEADLINE_MS;
+  const stepMs = (): number => Math.min(OPERATOR_ALERT_STEP_TIMEOUT_MS, deadlineMs - Date.now());
   for (const recipient of recipients) {
+    if (stepMs() <= 0) {
+      log.warn('operator-alert: deadline passed before every recipient was tried; alert undelivered', {
+        ...context,
+        deadlineMs: OPERATOR_ALERT_DEADLINE_MS,
+        text,
+      });
+      return false;
+    }
     try {
-      const dm = await ensureUserDm(recipient.user_id);
+      const dm = await bounded('DM resolution', ensureUserDm(recipient.user_id), stepMs());
       if (!dm) {
         log.warn('operator-alert: administrator is unreachable', { ...context, userId: recipient.user_id });
         continue;
@@ -90,14 +137,22 @@ export async function notifyOperators(rawText: string, context: Record<string, u
       // undeliverable exactly when it mattered. Dropping the instance here
       // would have shipped a second undeliverable path with a receipt that
       // still said `true` (Codex round 3).
-      await adapter.deliver(
-        dm.channel_type,
-        dm.platform_id,
-        null,
-        'chat',
-        JSON.stringify({ text }),
-        undefined,
-        dm.instance ?? dm.channel_type,
+      // Never START a send there is no time left to wait for: an abandoned
+      // send can still land, and the caller would alert again on top of it.
+      // The loop head logs the deadline and returns.
+      if (stepMs() <= 0) continue;
+      await bounded(
+        'delivery',
+        adapter.deliver(
+          dm.channel_type,
+          dm.platform_id,
+          null,
+          'chat',
+          JSON.stringify({ text }),
+          undefined,
+          dm.instance ?? dm.channel_type,
+        ),
+        stepMs(),
       );
       return true;
     } catch (err) {

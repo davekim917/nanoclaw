@@ -336,6 +336,49 @@ export function completeAnsweredPendingRows(inDb: Database.Database, outDb: Data
   return backfilled;
 }
 
+export interface OverdueRecurringRow {
+  id: string;
+  seriesId: string | null;
+  processAfter: string;
+}
+
+/**
+ * Recurring occurrences that have been DUE and wake-eligible since before
+ * `cutoffIso` while no container is working on anything in this session.
+ *
+ * The due filter is `countDueMessages`' own, narrowed to recurring rows that
+ * carry a `process_after`: these are the rows that hold a session "due" and
+ * that `expireStalePending` never reaps, so nothing else ever ends their wait.
+ *
+ * Empty when `outDb` holds ANY 'processing' claim: a container that has claimed
+ * work is busy, a due row queued behind its turn is not stuck, and a claim that
+ * stops moving is the claim-stuck rule's to judge, not this read's. A row with
+ * an ack of its own (any status) is likewise somebody's — see `hasProcessingAck`.
+ * `outDb` is null for a session that has never run a container: nothing can
+ * have claimed.
+ */
+export function listOverdueRecurringRows(
+  inDb: Database.Database,
+  outDb: Database.Database | null,
+  cutoffIso: string,
+): OverdueRecurringRow[] {
+  migrateMessagesInTable(inDb);
+  if (outDb && getProcessingClaims(outDb).length > 0) return [];
+  const rows = inDb
+    .prepare(
+      `SELECT id, series_id AS seriesId, process_after AS processAfter FROM messages_in
+       WHERE status = 'pending'
+         AND repo_fence_epoch IS NULL
+         AND trigger = 1
+         AND recurrence IS NOT NULL
+         AND process_after IS NOT NULL
+         AND datetime(process_after) <= datetime(?)
+       ORDER BY seq`,
+    )
+    .all(cutoffIso) as OverdueRecurringRow[];
+  return outDb ? rows.filter((row) => !hasProcessingAck(outDb, row.id)) : rows;
+}
+
 export interface ProcessingClaim {
   message_id: string;
   status_changed: string;
