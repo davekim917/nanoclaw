@@ -68,6 +68,7 @@ Add a class here, in the same PR, only when none of these fits.
 - `undeclared default migration` — a change to a default lands with no `[BREAKING]` CHANGELOG entry and migration path, so the installs that never configured the thing — the only ones the change moves — get no warning and no pre-deploy pin
 - `projection read` — a check, script or migration step reads a derived copy (a DB projection, a cache, a mirrored config row) instead of the store the runtime actually reads, so any drift between them makes the check report the opposite of what will happen
 - `destroy before replace` — a recovery path discards the old record before the step that would produce its replacement has succeeded, so when that step fails too, a good record is gone and nothing replaced it
+- `inherited claim` — a behavioural sentence about another module is carried into a rewrite, or rewritten from recollection, without re-reading the declaration it rests on; it reads as verified because it once was true of the thing it originally described, or because the general rule it invokes is real somewhere else, and the rewrite is exactly the moment it stops being checked
 
 ## Lessons
 

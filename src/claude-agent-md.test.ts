@@ -279,6 +279,19 @@ describe('formatCodexAgentToml carries `effort:` as model_reasoning_effort', () 
     );
   });
 
+  test('drops a multi-line effort instead of throwing and aborting the whole sync', () => {
+    // `extractScalar` joins a block scalar (`effort: |`) with newlines, and
+    // `tomlBasicString` throws on a newline. `syncCodexSubagents` wraps neither
+    // this call nor its write (src/codex-sync.ts:352-363), so a throw would
+    // abort the conversion of every role after this one AND skip the prune
+    // below that loop — not skip one bad file. Degrade to the no-key state,
+    // which is what this file rendered before the mapping existed.
+    const parsed = parseClaudeAgentMd('---\nname: a\ndescription: d\neffort: |\n  high\n  extra\n---\nbody\n');
+    expect(parsed?.effort).toContain('\n');
+    expect(() => formatCodexAgentToml(parsed!)).not.toThrow();
+    expect(formatCodexAgentToml(parsed!)).not.toContain('model_reasoning_effort');
+  });
+
   test('emits the key at the top level, above developer_instructions', () => {
     // It deserializes through `RawAgentRoleFileToml`'s `#[serde(flatten)]` into
     // `ConfigToml` (codex-rs agent-roles/src/agent_role_config.rs:20-28,
