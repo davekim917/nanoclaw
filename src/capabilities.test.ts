@@ -697,6 +697,57 @@ describe('buildSessionServicesSnapshot', () => {
       );
     });
 
+    it('degrades one malformed stored field instead of losing the whole snapshot', async () => {
+      // Round 3, P2, reported for `description` and enumerated as a class:
+      // `displayName`, `description`, `url`, `args` and `command` are all typed
+      // as strings but none of them is type-checked on the way in from a
+      // hand-edited container.json — `validateMcpServers` refuses only SSE
+      // (src/container-config.ts:575) and `parseMcpServerConfig`, which does
+      // check them (src/container-config.ts:445-452), only runs on CLI intake.
+      // A throw here is caught by both callers, so `buildPreTurnContext`
+      // degrades to an EMPTY roster and `writeCapabilitiesSnapshot` writes
+      // nothing: one bad entry would hide every valid service.
+      insertWorkgroup('malformed', []);
+      const ag = group('ag-malformed', 'malformed');
+      await createGroupInWorkgroup(ag, 'malformed');
+      writeContainerConfig(ag.folder, {
+        mcpServers: {
+          nulldesc: { type: 'http', url: 'https://mcp.example.com/a', description: null },
+          objdesc: { type: 'http', url: 'https://mcp.example.com/b', description: { text: 'nope' } },
+          badname: { type: 'http', url: 'https://mcp.example.com/c', displayName: 42 },
+          badargs: { command: 'bun', args: 'not-an-array' },
+          badcommand: { command: 7 },
+        },
+        packages: { apt: [], npm: [] },
+        additionalMounts: [],
+        skills: 'all',
+        tools: [],
+      } as unknown as Parameters<typeof writeContainerConfig>[1]);
+
+      const snapshot = await buildSessionServicesSnapshot(ag.id);
+      const byName = (name: string) => snapshot.services.find((s) => s.name === name);
+
+      // Nothing threw, and every fleet universal is still here.
+      for (const universal of ['Pocket', 'Exa', 'Context7', 'DeepWiki', 'Granola', 'Littlebird']) {
+        expect(byName(universal), universal).toBeDefined();
+      }
+      // A bad `description` falls back to the generic line, as an absent one does.
+      expect(byName('Nulldesc')?.summary).toBe('https://mcp.example.com/a');
+      expect(byName('Objdesc')?.useFor).toContain('https://mcp.example.com/b');
+      // A bad `displayName` falls back to the capitalized server name.
+      expect(byName('Badname')).toBeDefined();
+      // A bad `args` / `command` says so instead of printing `undefined`.
+      expect(byName('Badargs')?.summary).toBe('bun');
+      expect(byName('Badcommand')?.summary).toBe('endpoint unknown');
+      for (const service of snapshot.services) expect(typeof service.summary).toBe('string');
+
+      // And the roster still renders every one of them.
+      const notices: ContextNotice[] = [];
+      const roster = boundedCapabilities(snapshot, notices);
+      expect(roster.services).toHaveLength(snapshot.services.length);
+      expect(notices).toEqual([]);
+    });
+
     it('names the endpoint of a `{url}` entry that carries no `type`', async () => {
       // `HttpMcpServerConfig.type` is required in the type
       // (src/container-config.ts:109) but nothing validates it on the way in —

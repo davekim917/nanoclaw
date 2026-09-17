@@ -962,7 +962,12 @@ export function buildSessionServicesSnapshotFrom(
     }
     services.push({
       name: 'Wix',
-      cli: hasWixCli ? 'wix' : undefined,
+      // `curl` when only the REST secret is wired, not `undefined`: the roster
+      // renders `via` from `mcpNamespace ?? cli`, and this was the one entry
+      // that could produce a line with no "how you reach it" at all. `curl` is
+      // what every other gateway-injected REST entry here uses (Slack, SELECT,
+      // Profound, Fivetran), and it is a lookup handle for `get_capabilities`.
+      cli: hasWixCli ? 'wix' : 'curl',
       declaredTools: [],
       scopes: [],
       credentialPaths: hasWixCli ? ['/home/node/.wix/auth/account.json'] : [],
@@ -1074,8 +1079,21 @@ export function buildSessionServicesSnapshotFrom(
     // so `null` reaches here. One bad entry must not cost the whole snapshot —
     // an agent with no capability list is the worse failure by far.
     if (server === null || typeof server !== 'object') continue;
+    // Every string this block reads off a stored server goes through
+    // `storedString`. The type says these are strings, but a hand-edited
+    // container.json is not type-checked on the way in: `validateMcpServers`
+    // refuses only SSE (src/container-config.ts:575), and
+    // `parseMcpServerConfig`, which DOES type-check `displayName` and
+    // `description` (src/container-config.ts:445-452), only runs on CLI
+    // intake. Untyped values reaching the string helpers here throw, and this
+    // function's caller catches — so `buildPreTurnContext` degrades to an
+    // empty roster and `writeCapabilitiesSnapshot` logs and writes nothing.
+    // One malformed entry would hide every valid service, which is the same
+    // failure the `server === null` skip above exists to prevent.
+    const displayName = storedString(server.displayName);
+    const description = storedString(server.description);
     derived.push({
-      name: server.displayName ?? name.charAt(0).toUpperCase() + name.slice(1),
+      name: displayName ?? name.charAt(0).toUpperCase() + name.slice(1),
       mcpNamespace: `mcp__${name}__*`,
       declaredTools: declaredMatchingTools([name]),
       scopes: [],
@@ -1086,8 +1104,8 @@ export function buildSessionServicesSnapshotFrom(
       // With no description there is nothing to say but where it dials:
       // `genericMcpUseFor`'s full sentence would spend ~60 roster characters
       // restating the namespace that the entry's `via` already carries.
-      summary: server.description === undefined ? mcpEndpoint(server) : summarizeCapabilityText(server.description, 80),
-      useFor: server.description ?? genericMcpUseFor(name, server),
+      summary: description === undefined ? mcpEndpoint(server) : summarizeCapabilityText(description, 80),
+      useFor: description ?? genericMcpUseFor(name, server),
       ...(fleetProvided.has(name) ? { retainUnderBudget: true } : {}),
     });
   }
@@ -1139,13 +1157,32 @@ function genericMcpUseFor(name: string, server: McpServerConfig): string {
  * `server === null` skip above.
  */
 function mcpEndpoint(server: McpServerConfig): string {
-  if ('url' in server && typeof server.url === 'string') return server.url;
-  if (!('command' in server)) return 'endpoint unknown';
-  const [script, endpoint] = server.args ?? [];
+  // Read as `unknown` rather than through the union's arms: the value came
+  // off disk, so its runtime shape may not match either arm (see `storedString`).
+  const stored = server as { url?: unknown; args?: unknown; command?: unknown };
+  const url = storedString(stored.url);
+  if (url !== undefined) return url;
+  const args = Array.isArray(stored.args) ? (stored.args as unknown[]) : [];
+  const [script, endpoint] = args;
   if (typeof script === 'string' && script.endsWith('remote-mcp-bridge.ts') && typeof endpoint === 'string') {
     return endpoint;
   }
-  return server.command;
+  return storedString(stored.command) ?? 'endpoint unknown';
+}
+
+/**
+ * A string field read off a stored MCP server, or `undefined` when the stored
+ * value is not a usable string.
+ *
+ * `McpServerConfig` types these as strings, but nothing type-checks a
+ * hand-edited `container.json` on the way in — see the block in
+ * `buildSessionServicesSnapshotFrom` where the derived entries are built.
+ * Every read of `displayName`, `description`, `url` and `command` in this file
+ * goes through here, so one bad value degrades that one field instead of
+ * throwing out of the whole snapshot.
+ */
+function storedString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== '' ? value : undefined;
 }
 
 export async function getHostCapabilities(
