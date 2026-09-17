@@ -17,7 +17,7 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { composeNanoclawSession, type NanoclawMailboxSession } from '../mailbox/index.js';
-import { deleteOrphanProcessingClaims, getProcessingClaims } from '../mailbox/ops/sweep.js';
+import { ANSWERED_LOOKUP_CHUNK, deleteOrphanProcessingClaims, getProcessingClaims } from '../mailbox/ops/sweep.js';
 import {
   SWEEP_DUTY_INVENTORY,
   _listSweepRegistrationsForTesting,
@@ -332,6 +332,209 @@ describe('S2-PR9 — per-session core', () => {
       { id: 'm-recurring', status: 'pending' },
       { id: 'm-recent', status: 'pending' },
     ]);
+  });
+
+  // ── Answered-but-pending backfill ──────────────────────────────────────────
+  //
+  // The runner hides a pending row once messages_out holds a non-status reply
+  // to it written at/after its process_after (`isResponded`,
+  // container/agent-runner/src/modules/mailbox/selection.ts:333-339). Every
+  // case below is one side of that predicate, driven through the REGISTERED S2
+  // duty and read back through the due count S5 publishes.
+
+  describe('answered rows the runner left pending with no ack', () => {
+    const t0 = Date.now();
+    const dueAt = new Date(t0 - 20 * 60_000).toISOString();
+    const beforeDue = new Date(t0 - 30 * 60_000).toISOString();
+    const afterDue = new Date(t0 - 15 * 60_000).toISOString();
+
+    function seedTask(inDb: Database.Database, id: string, seq: number, processAfter: string | null, trigger = 1) {
+      inDb
+        .prepare(
+          `INSERT INTO messages_in
+             (id, seq, kind, timestamp, status, process_after, recurrence, series_id, trigger, content)
+           VALUES (?, ?, 'task', ?, 'pending', ?, '30 1 * * *', 'series-a', ?, '{}')`,
+        )
+        .run(id, seq, beforeDue, processAfter, trigger);
+    }
+    function reply(outDb: Database.Database, id: string, inReplyTo: string, at: string, kind = 'chat') {
+      const seq = (outDb.prepare('SELECT COALESCE(MAX(seq), -1) + 2 AS seq FROM messages_out').get() as { seq: number })
+        .seq;
+      outDb
+        .prepare('INSERT INTO messages_out (id, seq, in_reply_to, timestamp, kind, content) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(id, seq, inReplyTo, at, kind, '{}');
+    }
+    const statusOf = (inDb: Database.Database, id: string) =>
+      (inDb.prepare('SELECT status FROM messages_in WHERE id = ?').get(id) as { status: string }).status;
+    async function runPlanThroughDueCount(ctx: SweepSessionContext): Promise<void> {
+      const planDuties = _listSweepRegistrationsForTesting().duties.filter(
+        (d) => d.phase === 'session:plan' && d.order <= 40,
+      );
+      for (const duty of planDuties) await duty.run(ctx);
+    }
+
+    it('completes the wedged occurrence once, behind a RUNNING container, and hands it to recurrence', async () => {
+      const { inDb, outDb, mailbox } = makeSessionDbs();
+      seedTask(inDb, 'task-wedged', 1, dueAt);
+      // The kickoff the deferred turn posted before it hit the quota wall; the
+      // replacement container's startup then wiped the 'processing' claim.
+      reply(outDb, 'out-kickoff', 'task-wedged', afterDue);
+      mockIsContainerRunning.mockReturnValue(true);
+      expect(mailbox.countDueMessages()).toBe(1);
+
+      const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+      const ctx = sessionCtx(mailbox, { alive: true });
+      await runPlanThroughDueCount(ctx);
+
+      expect(statusOf(inDb, 'task-wedged')).toBe('completed');
+      expect(ctx.plan.dueCount).toBe(0);
+      // What S18's handleRecurrence reads to arm the next slot.
+      expect(mailbox.getCompletedRecurringRows().map((r) => r.id)).toEqual(['task-wedged']);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]![1]).toMatchObject({ sessionId: 'sess-test', messageIds: ['task-wedged'] });
+
+      // A second tick (duplicate availability event, host restart) finds
+      // nothing left to do.
+      await runPlanThroughDueCount(ctx);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(mailbox.getCompletedRecurringRows().map((r) => r.id)).toEqual(['task-wedged']);
+      warn.mockRestore();
+    });
+
+    it('completes it with no container at all — the restart-during-deferral shape — before the wake count', async () => {
+      const { inDb, outDb, mailbox } = makeSessionDbs();
+      seedTask(inDb, 'task-wedged', 1, dueAt);
+      reply(outDb, 'out-kickoff', 'task-wedged', afterDue);
+      const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+
+      const ctx = sessionCtx(mailbox, { alive: false });
+      await runPlanThroughDueCount(ctx);
+
+      expect(statusOf(inDb, 'task-wedged')).toBe('completed');
+      expect(ctx.plan.dueCount).toBe(0);
+      warn.mockRestore();
+    });
+
+    it('never completes a row the runner would still run', async () => {
+      const { inDb, outDb, mailbox } = makeSessionDbs();
+      // A sibling turn's reply stamped BEFORE this fire became due is not its
+      // answer (selection.ts:302-309, the series-poison rule).
+      seedTask(inDb, 'task-early-reply', 1, dueAt);
+      reply(outDb, 'out-early', 'task-early-reply', beforeDue);
+      // Progress rows are not answers.
+      seedTask(inDb, 'task-status-only', 2, dueAt);
+      reply(outDb, 'out-status', 'task-status-only', afterDue, 'status');
+      // No reply at all.
+      seedTask(inDb, 'task-unanswered', 3, dueAt);
+      // Malformed timestamps: the runner's `ts >= due` is false on NaN, so it
+      // would still select these — the host must not read NaN as "answered".
+      seedTask(inDb, 'task-bad-reply-ts', 4, dueAt);
+      reply(outDb, 'out-bad-ts', 'task-bad-reply-ts', 'not-a-timestamp');
+      // A Julian-day number is a time SQLite's datetime() accepts (2023, so the
+      // row IS due) and Date.parse does not.
+      seedTask(inDb, 'task-bad-due', 5, '2460000.5');
+      reply(outDb, 'out-bad-due', 'task-bad-due', afterDue);
+      expect(Number.isNaN(Date.parse('2460000.5Z'))).toBe(true);
+      const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+
+      const ctx = sessionCtx(mailbox, { alive: true });
+      mockIsContainerRunning.mockReturnValue(true);
+      await runPlanThroughDueCount(ctx);
+
+      expect(statusOf(inDb, 'task-early-reply')).toBe('pending');
+      expect(statusOf(inDb, 'task-status-only')).toBe('pending');
+      expect(statusOf(inDb, 'task-unanswered')).toBe('pending');
+      expect(statusOf(inDb, 'task-bad-reply-ts')).toBe('pending');
+      expect(statusOf(inDb, 'task-bad-due')).toBe('pending');
+      expect(ctx.plan.dueCount).toBe(5);
+      expect(warn).not.toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    it('sorts a mixed backlog larger than one lookup chunk with one grouped read per chunk', async () => {
+      const { inDb, outDb, mailbox } = makeSessionDbs();
+      const total = ANSWERED_LOOKUP_CHUNK + 7;
+      const expected: string[] = [];
+      for (let i = 0; i < total; i++) {
+        const id = `task-${String(i).padStart(4, '0')}`;
+        seedTask(inDb, id, i + 1, dueAt);
+        // Thirds: answered since due / answered only before due / unanswered.
+        if (i % 3 === 0) {
+          // An earlier reply too: the NEWEST one decides, as in the runner.
+          reply(outDb, `out-${id}-early`, id, beforeDue);
+          reply(outDb, `out-${id}`, id, afterDue);
+          expected.push(id);
+        } else if (i % 3 === 1) {
+          reply(outDb, `out-${id}`, id, beforeDue);
+        }
+      }
+      const prepare = vi.spyOn(outDb, 'prepare');
+      const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+
+      await registeredDuty(SWEEP_DUTY_INVENTORY.S2).run(sessionCtx(mailbox));
+
+      const completed = inDb
+        .prepare("SELECT id FROM messages_in WHERE status = 'completed' ORDER BY seq")
+        .all() as Array<{
+        id: string;
+      }>;
+      expect(completed.map((r) => r.id)).toEqual(expected);
+      expect(warn.mock.calls[0]![1]).toMatchObject({ messageIds: expected });
+      // Two chunks → two messages_out reads, however many rows were due.
+      expect(prepare.mock.calls.filter(([sql]) => sql.includes('FROM messages_out'))).toHaveLength(2);
+      prepare.mockRestore();
+      warn.mockRestore();
+    });
+
+    it('leaves a row carrying any ack to the duty that owns that ack', async () => {
+      const { inDb, outDb, mailbox } = makeSessionDbs();
+      // A live turn that has posted but not finished: the claim is the
+      // container's, and completing under it would cut recurrence loose
+      // mid-turn.
+      seedTask(inDb, 'task-live', 1, dueAt);
+      reply(outDb, 'out-live', 'task-live', afterDue);
+      outDb.prepare("INSERT INTO processing_ack VALUES ('task-live', 'processing', ?)").run(afterDue);
+      // A failed run that also posted: the terminal ack decides the status.
+      seedTask(inDb, 'task-failed', 2, dueAt);
+      reply(outDb, 'out-failed', 'task-failed', afterDue);
+      outDb.prepare("INSERT INTO processing_ack VALUES ('task-failed', 'script-skip:error', ?)").run(afterDue);
+      mockIsContainerRunning.mockReturnValue(true);
+      const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+
+      await registeredDuty(SWEEP_DUTY_INVENTORY.S2).run(sessionCtx(mailbox, { alive: true }));
+
+      expect(statusOf(inDb, 'task-live')).toBe('pending');
+      expect(statusOf(inDb, 'task-failed')).toBe('failed');
+      expect(warn).not.toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    it('only looks at rows that hold the session due', async () => {
+      const { inDb, outDb, mailbox } = makeSessionDbs();
+      const future = new Date(t0 + HOUR_MS).toISOString();
+      // Re-armed for later (retry backoff, task edit): not due, not ours.
+      seedTask(inDb, 'task-future', 1, future);
+      reply(outDb, 'out-future', 'task-future', afterDue);
+      // Un-admitted task rows are trigger=0 and never counted due.
+      seedTask(inDb, 'task-unadmitted', 2, dueAt, 0);
+      reply(outDb, 'out-unadmitted', 'task-unadmitted', afterDue);
+      // Chat has no process_after: any non-status reply answers it.
+      inDb
+        .prepare(
+          `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+           VALUES ('chat-answered', 3, 'chat', ?, 'pending', 1, '{}')`,
+        )
+        .run(dueAt);
+      reply(outDb, 'out-chat', 'chat-answered', beforeDue);
+      const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+
+      await registeredDuty(SWEEP_DUTY_INVENTORY.S2).run(sessionCtx(mailbox));
+
+      expect(statusOf(inDb, 'task-future')).toBe('pending');
+      expect(statusOf(inDb, 'task-unadmitted')).toBe('pending');
+      expect(statusOf(inDb, 'chat-answered')).toBe('completed');
+      warn.mockRestore();
+    });
   });
 
   // ── F-9.2 ──────────────────────────────────────────────────────────────────
