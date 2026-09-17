@@ -69,6 +69,7 @@ Add a class here, in the same PR, only when none of these fits.
 - `projection read` — a check, script or migration step reads a derived copy (a DB projection, a cache, a mirrored config row) instead of the store the runtime actually reads, so any drift between them makes the check report the opposite of what will happen
 - `destroy before replace` — a recovery path discards the old record before the step that would produce its replacement has succeeded, so when that step fails too, a good record is gone and nothing replaced it
 - `inherited claim` — a behavioural sentence about another module is carried into a rewrite, or rewritten from recollection, without re-reading the declaration it rests on; it reads as verified because it once was true of the thing it originally described, or because the general rule it invokes is real somewhere else, and the rewrite is exactly the moment it stops being checked
+- `upstream drift` — a fork change grows an upstream-owned file (one with a `src/upstream-ratchet.json` entry) with prose or structure that belongs in a fork-owned module, widening the surface an upstream merge can conflict on
 
 ## Lessons
 
