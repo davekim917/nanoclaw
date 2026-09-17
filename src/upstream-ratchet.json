@@ -397,7 +397,7 @@
 "docs/hardened-image.md":{"diff":231,"mode":"100644","sha256":null,"deleted":true},
 "docs/host-lifecycle-migration.md":{"diff":70,"mode":"100644","sha256":null,"deleted":true},
 "docs/isolation-model.md":{"diff":104,"mode":"100644","sha256":"e820fd2ca1d101360195960404d298d16574c43fd91cb456faf74c507c034117"},
-"docs/memory.md":{"diff":315,"mode":"100644","sha256":"5502d67dacae3dc0a2e76d92b3ff4423228ec15474f9739a8a13f0519c891945"},
+"docs/memory.md":{"diff":325,"mode":"100644","sha256":"3422086d485bcd91e7c44ba240ea36885602577d26cf58a12bc293fc6cf29074"},
 "docs/migration-dev.md":{"diff":18,"mode":"100644","sha256":"b2238220e2596ef444ac19d327edb94478fd425b3d48d788ec5fa6396be5f75d"},
 "docs/ncl-tasks-migration.md":{"diff":0,"mode":"100644","sha256":"c682611da7560bdac15a18457d90c2786c8cdfaf87d48695e047b38013650836"},
 "docs/ollama.md":{"diff":0,"mode":"100644","sha256":"ae8fcc1353d0aac86cea7b2f36f5cebe6aaaabcf2daad08763cbbf2999505347"},

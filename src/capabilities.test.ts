@@ -17,7 +17,7 @@ vi.mock('./config.js', async (importOriginal) => ({
   DATA_DIR: dirs.DATA_DIR,
 }));
 
-import { buildSessionServicesSnapshot, getHostCapabilities, renderSessionCapabilities } from './capabilities.js';
+import { buildSessionServicesSnapshot, getHostCapabilities } from './capabilities.js';
 import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from './db/index.js';
 import { writeContainerConfig } from './container-config.js';
 import { SIBLING_BOUND_FIELDS } from './sibling-parity.js';
@@ -159,9 +159,9 @@ describe('buildSessionServicesSnapshot', () => {
     expect(service?.useFor).toContain('mcp__cloudflare-api__execute');
     expect(service?.useFor).toContain('S3-compatible access-key/secret pair is not exposed');
 
-    const rendered = renderSessionCapabilities(await snapshot);
-    expect(rendered).toContain('**Cloudflare**');
-    expect(rendered).toContain('MCP `mcp__cloudflare-api__*`');
+    // ...and the roster line the agent actually reads names the same handle.
+    const entry = boundedCapabilities(await snapshot, []).services.find((s) => s.name === 'Cloudflare');
+    expect(entry?.via).toBe('mcp__cloudflare-api__*');
   });
 
   it('keeps every authored capability detail inside the pre-turn truncation bound', async () => {
@@ -372,9 +372,9 @@ describe('buildSessionServicesSnapshot', () => {
     expect(service?.useFor).toContain('X-API-Key');
     expect(service?.useFor).not.toContain('/app/skills/profound/SKILL.md');
 
-    const rendered = renderSessionCapabilities(await snapshot);
-    expect(rendered).toContain('**Profound**');
-    expect(rendered).toContain('Profound REST/reporting API');
+    const entry = boundedCapabilities(await snapshot, []).services.find((s) => s.name === 'Profound');
+    expect(entry?.via).toBe('curl');
+    expect(entry?.use).toContain('api.tryprofound.com');
   });
 
   it('does not surface Profound without the Profound OneCLI secret', async () => {
@@ -587,10 +587,40 @@ describe('buildSessionServicesSnapshot', () => {
     const OWNER_SAFE_MG = 'mg-owner-dm-roster';
 
     /**
+     * Every scoped host value a hand-written entry gates on. Stubbed present so
+     * the fixture below takes each entry's LONGEST branch — the "credentials
+     * missing, ask the operator" branches are shorter, so a fixture without
+     * these would measure a roster no live group has.
+     */
+    function stubScopedHostEnv(): void {
+      for (const name of [
+        'GITHUB_TOKEN',
+        'RENDER_API_KEY',
+        'RENDER_WORKSPACE_ID',
+        'DBT_CLOUD_API_TOKEN',
+        'DBT_CLOUD_API_URL',
+        'DBT_CLOUD_ACCOUNT_ID',
+        'DBT_HOST',
+        'DBT_PROD_ENV_ID',
+        'LOOKER_BASE_URL',
+        'LOOKER_CLIENT_ID',
+        'LOOKER_CLIENT_SECRET',
+        'ATLASSIAN_BASE_URL',
+        'SELECT_ORGANIZATION_ID',
+      ]) {
+        vi.stubEnv(name, `stub-${name.toLowerCase()}`);
+      }
+    }
+
+    /**
      * The widest-wired live group's shape (its `groups/<folder>/container.json`
-     * as of 2026-09-17), trimmed to what this hermetic file can build: its tool
-     * list, its two bridge-backed stdio MCP servers, and the workgroup secrets
-     * that light up Slack, SELECT, Profound and Fivetran.
+     * as of 2026-09-17), widened so EVERY hand-written entry in
+     * `buildSessionServicesSnapshotFrom` is present — Linear, Render,
+     * Cloudflare, Wix and the env-gated `dbt Cloud` (curl) entry are not on
+     * that one group, but a roster budget asserted only against the services
+     * one group happens to hold is a ratchet a newly added service can walk
+     * past. Every service this file can build is in here, so a long hint
+     * authored for any of them trips the budget assertion.
      */
     async function widestGroup(): Promise<AgentGroup> {
       insertWorkgroup('roster-shop', [
@@ -598,6 +628,8 @@ describe('buildSessionServicesSnapshot', () => {
         'Select-RosterShop',
         'Profound',
         'Fivetran-RosterShop',
+        'Cloudflare-RosterShop',
+        'Wix-RosterShop',
       ]);
       const ag = group('ag-roster-shop', 'roster-shop');
       await createGroupInWorkgroup(ag, 'roster-shop');
@@ -614,10 +646,16 @@ describe('buildSessionServicesSnapshot', () => {
             args: ['/app/src/remote-mcp-bridge.ts', 'https://mcp.amplitude.com/mcp'],
             env: { REMOTE_MCP_NAME: 'amplitude', REMOTE_MCP_AUTHORIZATION: 'Bearer onecli-managed' },
           },
+          'cloudflare-api': {
+            command: 'bun',
+            args: ['/app/src/remote-mcp-bridge.ts', 'https://mcp.cloudflare.com/mcp'],
+            env: { REMOTE_MCP_NAME: 'cloudflare-api', REMOTE_MCP_AUTHORIZATION: 'Bearer onecli-managed' },
+          },
         },
         packages: { apt: [], npm: [] },
         additionalMounts: [],
         skills: 'all',
+        wixHostAuth: true,
         tools: [
           'granola',
           'pocket',
@@ -632,14 +670,39 @@ describe('buildSessionServicesSnapshot', () => {
           'dbt:roster_shop_analytics',
           'datafold',
           'dropbox',
+          'linear',
+          'render',
           'aws:rs-a',
           'aws:rs-b',
         ],
         slack_user_token: { enabled: true, also_allowed_in: [OWNER_SAFE_MG] },
-      } as Parameters<typeof writeContainerConfig>[1]);
-      vi.stubEnv('GITHUB_TOKEN', 'dummy');
+      } as unknown as Parameters<typeof writeContainerConfig>[1]);
+      stubScopedHostEnv();
       return ag;
     }
+
+    /** Every entry this file's fixtures can produce a hand-written hint for. */
+    const HAND_WRITTEN = [
+      'Google Workspace',
+      'Snowflake',
+      'AWS',
+      'dbt',
+      'dbt Cloud',
+      'GitHub',
+      'Render',
+      'Linear',
+      'Datafold',
+      'Atlassian',
+      'dbt Cloud (dbt-mcp)',
+      'Looker',
+      'Hex',
+      'Slack',
+      'Cloudflare',
+      'Wix',
+      'SELECT',
+      'Profound',
+      'Fivetran',
+    ];
 
     it('drops NOTHING on the widest-wired shape, and fits the roster budget', async () => {
       // The whole point of the change. Before it, the block carried every
@@ -649,14 +712,17 @@ describe('buildSessionServicesSnapshot', () => {
       // dbt-mcp were never announced to that agent at all — the exact "I can't
       // do that about a tool I have" failure the block exists to prevent.
       // Same group as a roster: 23 services, 3,314 chars, nothing evicted.
-      // This fixture is that shape minus the env-gated `dbt Cloud` (curl)
-      // entry, which needs a host DBT_CLOUD_API_TOKEN this hermetic file does
-      // not stub: 22 services, 12,124 chars raw -> 3,128 as a roster.
+      // This fixture is that shape WIDENED to every hand-written entry, so it
+      // is larger than any one live group.
       const ag = await widestGroup();
       const snapshot = await buildSessionServicesSnapshot(ag.id, OWNER_SAFE_MG);
       const notices: ContextNotice[] = [];
       const roster = boundedCapabilities(snapshot, notices);
 
+      // The budget is only a ratchet if the fixture it measures holds every
+      // service a hint can be authored for.
+      const names = roster.services.map((s) => s.name);
+      for (const hand of HAND_WRITTEN) expect(names, hand).toContain(hand);
       expect(roster.services.map((s) => s.name)).toEqual(snapshot.services.map((s) => s.name));
       expect(notices).toEqual([]);
       expect(JSON.stringify(roster).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.capabilityRosterChars);
@@ -668,6 +734,132 @@ describe('buildSessionServicesSnapshot', () => {
       // reading a bare list and still hedging about access.
       expect(roster.howToUse).toContain('never tell the user you lack one of them');
       expect(roster.howToUse).toContain('get_capabilities');
+    });
+
+    describe('safety imperatives stay always-on', () => {
+      // The roster moved every service's how-to prose behind
+      // `get_capabilities`. That is right for reference an agent looks up
+      // BEFORE acting, and wrong for a prohibition: by the time it has run
+      // `wix login` or added its own Authorization header to explain a 401,
+      // the harm is done and the tool call that would have warned it was never
+      // made. These assertions are the contract that the class stays in the
+      // always-on text — as one preamble sentence, plus per-service instances
+      // on the entries whose specific mistake has actually been made.
+      //
+      // Two shapes, taken from the two live groups that hold the relevant
+      // services: one with GitHub + Google Workspace + a Cloudflare MCP + the
+      // Wix CLI, and one with GitHub + Google Workspace + Snowflake + dbt +
+      // Render + Linear + AWS.
+
+      async function cloudflareWixShaped(): Promise<AgentGroup> {
+        insertWorkgroup('nd-shop', ['Cloudflare-NdShop']);
+        const ag = group('ag-nd-shop', 'nd-shop');
+        await createGroupInWorkgroup(ag, 'nd-shop');
+        writeContainerConfig(ag.folder, {
+          mcpServers: {
+            'cloudflare-api': {
+              command: 'bun',
+              args: ['/app/src/remote-mcp-bridge.ts', 'https://mcp.cloudflare.com/mcp'],
+              env: { REMOTE_MCP_NAME: 'cloudflare-api', REMOTE_MCP_AUTHORIZATION: 'Bearer onecli-managed' },
+            },
+          },
+          packages: { apt: [], npm: [] },
+          additionalMounts: [],
+          skills: 'all',
+          wixHostAuth: true,
+          tools: ['github:nd-shop', 'granola', 'pocket', 'google-workspace:nd-shop', 'exa'],
+        } as unknown as Parameters<typeof writeContainerConfig>[1]);
+        vi.stubEnv('GITHUB_TOKEN', 'dummy');
+        return ag;
+      }
+
+      async function warehouseShaped(): Promise<AgentGroup> {
+        insertWorkgroup('il-shop', []);
+        const ag = group('ag-il-shop', 'il-shop');
+        await createGroupInWorkgroup(ag, 'il-shop');
+        writeContainerConfig(ag.folder, {
+          mcpServers: {},
+          packages: { apt: [], npm: [] },
+          additionalMounts: [],
+          skills: 'all',
+          tools: [
+            'github:il-shop',
+            'granola',
+            'snowflake:warehouse-a',
+            'dbt:warehouse-a-snowflake',
+            'google-workspace:il-shop',
+            'render:il-shop',
+            'exa',
+            'pocket',
+            'linear',
+            'aws:il',
+          ],
+        } as Parameters<typeof writeContainerConfig>[1]);
+        vi.stubEnv('GITHUB_TOKEN', 'dummy');
+        vi.stubEnv('RENDER_API_KEY', 'dummy');
+        return ag;
+      }
+
+      /** The whole always-on text an agent reads: preamble plus every hint. */
+      function rosterText(roster: ReturnType<typeof boundedCapabilities>): string {
+        return [roster.howToUse, ...roster.services.map((s) => `${s.name} — ${s.via} — ${s.use ?? ''}`)].join('\n');
+      }
+
+      it.each([
+        ['cloudflare+wix shape', () => cloudflareWixShaped()],
+        ['warehouse shape', () => warehouseShaped()],
+      ])('%s: the login/auth prohibition is in the always-on text', async (_label, makeGroup) => {
+        const ag = await makeGroup();
+        const text = rosterText(boundedCapabilities(await buildSessionServicesSnapshot(ag.id), []));
+
+        // The class, once, in the preamble — so a service with no hand-written
+        // hint is covered too.
+        expect(text).toContain('NEVER run an interactive login or auth command in this container');
+        expect(text).toContain('gh auth login');
+        expect(text).toContain('wix login');
+        expect(text).toContain('NEVER set your own `Authorization` header');
+        expect(text).toContain('report it to the operator instead of re-authenticating');
+
+        // Both shapes hold GitHub and Google Workspace, so both carry those
+        // per-service instances.
+        expect(text).toContain('Never run `gh auth login`');
+        expect(text).toContain('GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE');
+        expect(text).toContain('`auth_method: none`');
+      });
+
+      it('cloudflare+wix shape: the Cloudflare and Wix imperatives are on their own lines', async () => {
+        const ag = await cloudflareWixShaped();
+        const roster = boundedCapabilities(await buildSessionServicesSnapshot(ag.id), []);
+        const use = (name: string) => roster.services.find((s) => s.name === name)?.use ?? '';
+
+        // Two false "the credential is dead" calls came from this probe.
+        expect(use('Cloudflare')).toContain('Never verify with /user/tokens/verify');
+        expect(use('Cloudflare')).toContain('send no Authorization header of your own');
+        // This group has the mounted `~/.wix` but no Wix REST secret, so its
+        // line is the CLI half only — and that half carries its imperative.
+        expect(use('Wix')).toContain('never run `wix login`');
+        expect(use('Wix')).not.toContain('wixapis.com');
+      });
+
+      it('the Wix REST imperative rides the REST half of the line', async () => {
+        // A guessed site id writes to the WRONG SITE, so the rule belongs
+        // wherever the REST surface is advertised.
+        const ag = await widestGroup();
+        const roster = boundedCapabilities(await buildSessionServicesSnapshot(ag.id, OWNER_SAFE_MG), []);
+        const wix = roster.services.find((s) => s.name === 'Wix')?.use ?? '';
+        expect(wix).toContain('www.wixapis.com REST');
+        expect(wix).toContain('never hardcoded or guessed');
+        expect(wix).toContain('never run `wix login`');
+      });
+
+      it('no hint is clipped, so no imperative can be cut off the end', async () => {
+        // `boundedText` clips from the END and every imperative is written
+        // last, so a clip removes exactly the part that does the work. Prove
+        // the bound is not reached rather than trusting that it is not.
+        const ag = await widestGroup();
+        const roster = boundedCapabilities(await buildSessionServicesSnapshot(ag.id, OWNER_SAFE_MG), []);
+        expect(roster.services.filter((s) => (s.use ?? '').includes('[truncated'))).toEqual([]);
+      });
     });
 
     it('keeps every roster hint inside its bound', async () => {

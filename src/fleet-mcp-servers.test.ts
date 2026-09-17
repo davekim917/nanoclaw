@@ -264,13 +264,13 @@ describe('the file:line citations in this PR\u2019s comments', () => {
     },
     {
       file: 'src/modules/memory/pre-turn-context.ts',
-      line: 1629,
+      line: 1653,
       contains: 'function evictCapability',
       citedBy: 'capabilities.ts — why the derived block is spliced, not appended',
     },
     {
       file: 'src/modules/memory/pre-turn-context.ts',
-      line: 1633,
+      line: 1657,
       contains: 'services.pop()?.name',
       citedBy: 'capabilities.ts — why an all-retained list still terminates',
     },

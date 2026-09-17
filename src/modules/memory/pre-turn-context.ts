@@ -70,10 +70,19 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   capabilityDetailChars: 2500,
   // Hard cap on ONE roster hint. Authoring target is ~80; this is the backstop
   // for a derived summary whose source text has no early word boundary
-  // (`summarizeCapabilityText`, src/capabilities.ts), and for the Slack
-  // WITHHELD line, which is deliberately longer than the target because it
-  // changes what the agent may do.
-  capabilityRosterUseChars: 160,
+  // (`summarizeCapabilityText`, src/capabilities.ts), and for the hints that
+  // are deliberately longer because they change what the agent may DO — Slack
+  // WITHHELD, and the safety imperatives carried by GitHub, Cloudflare, Wix
+  // and Google Workspace.
+  //
+  // 200, up from 160: `boundedText` clips from the END, and an imperative
+  // ("never run `wix login`", "never verify with /user/tokens/verify") is
+  // written last in a hint for the same reason it is written last in the full
+  // prose — so a clip removes exactly the part that does the work. This is the
+  // same reasoning that took `capabilityDetailChars` from 600 to 2500. The cap
+  // is enforced, not advisory: `src/capabilities.test.ts` fails on an authored
+  // summary over it, so the clip stays unreachable rather than silent.
+  capabilityRosterUseChars: 200,
   // What the whole roster block — preamble included — is expected to cost.
   // NOT an eviction trigger; the eviction trigger is `capabilityTotalChars`
   // below. This is the number a test pins the widest-wired shape against, so
@@ -81,11 +90,26 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   // of quietly re-creating the budget pressure the roster removed. Measured
   // 2026-09-17 against the widest-wired group's real `container.json`: 23
   // services, 3,314 chars and nothing evicted, where the full-prose block was
-  // 14,307 and the budget dropped six services off its end. The headroom to
-  // 4,000 is roughly five more services; the distance from there to
-  // `capabilityTotalChars` is the point — this trips long before eviction can.
-  capabilityRosterChars: 4_000,
-  // Total budget for the capability block, enforced in boundedCapabilities.
+  // 14,307 and the budget dropped six services off its end.
+  //
+  // 5,200, up from 4,000, for two reasons that landed together. First, the
+  // safety imperatives moved back into the always-on text — the preamble
+  // gained the "never run an interactive login, never set your own
+  // Authorization header" sentence (822 chars now, from 360) and four hints
+  // gained their own — so the widest LIVE group went 3,314 -> 3,879. Second,
+  // the fixture this is asserted against was widened to hold EVERY
+  // hand-written entry rather than the ones one group happens to wire, since a
+  // budget measured over a subset is a ratchet a newly added service walks
+  // past; that fixture measures 4,530 over 27 services. The distance from
+  // there to `capabilityTotalChars` is the point: this trips long before
+  // eviction can.
+  capabilityRosterChars: 5_200,
+  // Eviction trigger for the capability block, enforced in
+  // `boundedCapabilities`. Measured over the SERVICES ARRAY only — it does not
+  // include the roster's `howToUse` preamble (~740 chars), so the block an
+  // agent actually receives is that much larger than this number. Compare
+  // `capabilityRosterChars` above, which is measured over the whole block and
+  // is the figure to reason about for context cost.
   //
   // Load-bearing: `finalChars` below is a budget for the ENTIRE serialized
   // context, and enforceFinalBound evicts in the order conversation excerpts →

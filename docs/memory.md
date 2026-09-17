@@ -135,12 +135,22 @@ require the agent to call it before declaring a service unavailable.
 
 What the bootstrap carries is a **roster**, not a set of manuals: one line per
 wired service — name, how it is reached (`gws`, `mcp__looker__*`, `curl`), and
-a hint of roughly 80 characters — headed by the two sentences that make it
+a hint of roughly 80 characters — headed by the three sentences that make it
 usable ("every service here is wired into this session"; "call
-`get_capabilities` with that service's name before first use"). The roster is
-what the capability budgets bound, and it is small enough that they never fire
-on real content: the widest-wired group measures 23 services / ~3.3k chars
-against a 10,000-char budget.
+`get_capabilities` with that service's name before first use"; "never run an
+interactive login and never set your own `Authorization` header"). The roster
+is what the capability budgets bound, and it is small enough that they never
+fire on real content: the widest-wired group measures 23 services / ~3.9k
+chars against a 10,000-char budget.
+
+That third sentence is the one class of text that deliberately does **not**
+move behind the tool call. The rest of a service's prose is reference an agent
+looks up before acting; a prohibition only works if it is read without having
+decided to look anything up, because by the time the agent has run `wix login`
+or added its own header to explain a 401, the harm is done and the call that
+would have warned it was never made. Individual services whose specific
+mistake has actually been made — GitHub, Cloudflare, Wix, Google Workspace —
+carry their instance in their own roster hint as well.
 
 The full `useFor` / `activation` prose for each service — auth setup, exact
 tool and endpoint names, known failure shapes — stays in the session's

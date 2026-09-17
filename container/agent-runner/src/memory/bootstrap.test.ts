@@ -74,6 +74,31 @@ describe('ensureFreshContextBootstrap', () => {
     expect(result).toContain('EVERY service listed here is wired into THIS session right now.');
   });
 
+  it('skips a malformed entry instead of emitting a nameless roster line', () => {
+    fs.writeFileSync(
+      CAPABILITIES,
+      JSON.stringify({
+        session: {
+          agentGroupId: 'agent-a',
+          services: [null, 'not-an-object', ['nope'], { name: 'Hex', cli: 'hex', summary: 'Hex CLI' }],
+        },
+      }),
+    );
+
+    const result = ensureFreshContextBootstrap('<message>hello</message>', {
+      capabilities: CAPABILITIES,
+      index: INDEX,
+    });
+
+    // A `{}` entry used to render as `{"name":"Unknown service","via":""}`,
+    // which an agent cannot distinguish from a service it holds and cannot
+    // name.
+    expect(result).not.toContain('Unknown service');
+    expect(result).toContain('"name":"Hex"');
+    // The three skipped entries are still accounted for.
+    expect(result).toContain('runner-capability-bootstrap-truncated');
+  });
+
   it('falls back to its own standing instruction for a snapshot written by an older host', () => {
     fs.writeFileSync(
       CAPABILITIES,
@@ -87,6 +112,10 @@ describe('ensureFreshContextBootstrap', () => {
 
     expect(result).toContain('never tell the user you lack one of them');
     expect(result).toContain('get_capabilities');
+    // The fallback carries the safety class too — an older host's snapshot
+    // must not be the one cold-context path where the prohibition is missing.
+    expect(result).toContain('NEVER run an interactive login or auth command in this container');
+    expect(result).toContain('NEVER set your own `Authorization` header');
   });
 
   it('derives a hint from the prose when an older snapshot carries no summary', () => {
@@ -138,7 +167,7 @@ describe('ensureFreshContextBootstrap', () => {
     const services = Array.from({ length: 32 }, (_, index) => ({
       name: `Service ${index}`,
       mcpNamespace: `mcp__service-${index}__*`,
-      summary: `x`.repeat(160),
+      summary: `x`.repeat(200),
     }));
     fs.writeFileSync(CAPABILITIES, JSON.stringify({ session: { agentGroupId: 'agent-a', services } }));
 
@@ -157,8 +186,13 @@ describe('ensureFreshContextBootstrap', () => {
     // removes blocks already in the prompt, so with none there it returned an
     // oversized bootstrap. Shed in the host's order instead: index first,
     // capability entries last.
+    //
+    // The pad is sized so the snapshot lands just UNDER
+    // MAX_CAPABILITY_JSON_CHARS (so `readCapabilitiesFrom` evicts nothing) but
+    // the snapshot plus a full index lands over NORMAL_RECALL_CHARS (so the
+    // index shed is what fires). Retune it if either constant moves.
     const services = Array.from({ length: 32 }, (_, index) => ({
-      name: `Service ${index} ${'n'.repeat(110)}`,
+      name: `Service ${index} ${'n'.repeat(80)}`,
       mcpNamespace: `mcp__service-${index}__*`,
       summary: 'x'.repeat(160),
     }));

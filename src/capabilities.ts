@@ -163,11 +163,11 @@ export interface SessionServicesSnapshot {
      * Never evicted by a capability budget while any entry without it can be
      * evicted instead. For an entry whose absence makes the agent deny an
      * ability it has. Honoured through `evictCapability`
-     * (src/modules/memory/pre-turn-context.ts:1629) at all three host eviction
-     * sites — the service-count limit (:1642), the total budget
-     * (:1695) and `enforceFinalBound` (:1741) — and by the runner's
+     * (src/modules/memory/pre-turn-context.ts:1653) at all three host eviction
+     * sites — the service-count limit (:1666), the total budget
+     * (:1719) and `enforceFinalBound` (:1765) — and by the runner's
      * fresh-context fallback through its own `evictCapability`
-     * (container/agent-runner/src/memory/bootstrap.ts:65, called at :92 and :116).
+     * (container/agent-runner/src/memory/bootstrap.ts:89, called at :116 and :143).
      */
     retainUnderBudget?: boolean;
   }>;
@@ -178,34 +178,7 @@ function hostDirExists(...parts: string[]): boolean {
 }
 
 /**
- * Render the per-session services snapshot as a CLAUDE.md fragment. Pushed
- * into the composed prompt (see claude-md-compose) so the agent reads its
- * ACTUALLY-WIRED services — Looker, Google Workspace, Snowflake, … — with
- * their activation steps on every turn, instead of guessing it lacks access
- * and rediscovering each session. Returns '' when nothing is wired so the
- * fragment is omitted entirely.
- */
-export function renderSessionCapabilities(snapshot: SessionServicesSnapshot): string {
-  if (snapshot.services.length === 0) return '';
-  const lines: string[] = [
-    '# Your wired capabilities (this session)',
-    '',
-    'The services below are wired into THIS container right now. Do NOT tell the user you lack access to them, and do NOT ask for their credentials — auth is already injected at spawn. Use them directly. For full host-wide detail you can also call `mcp__nanoclaw__get_capabilities`.',
-    '',
-  ];
-  for (const s of snapshot.services) {
-    const handle = s.cli ? `CLI \`${s.cli}\`` : s.mcpNamespace ? `MCP \`${s.mcpNamespace}\`` : '';
-    const scope = s.scopes.length > 0 ? ` — scopes: ${s.scopes.join(', ')}` : '';
-    lines.push(`- **${s.name}**${handle ? ` — ${handle}` : ''}${scope}`);
-    const detail = s.activation ?? s.useFor;
-    if (detail) lines.push(`  - ${detail}`);
-  }
-  lines.push('');
-  return lines.join('\n');
-}
-
-/**
- * The two sentences that head the always-on capability roster.
+ * The standing instruction that heads the always-on capability roster.
  *
  * Sentence one is the whole reason the block exists: agents were telling
  * users "I can't do that" about tools sitting wired in their own container.
@@ -213,10 +186,20 @@ export function renderSessionCapabilities(snapshot: SessionServicesSnapshot): st
  * one service is a tool call away, so the block does not have to carry 23 of
  * them (13,247 chars on the widest live group, against a 10,000 budget that
  * silently dropped six services from the end, Hex and Looker among them).
+ *
+ * Sentence three is the one class of text that must NOT be detail-on-demand.
+ * The rest of a service's prose is reference an agent looks up before acting;
+ * these are prohibitions that only work if the agent reads them WITHOUT having
+ * decided to look anything up — by the time it runs `wix login` or adds its
+ * own `Authorization` header to test a 401, the harm is done and the tool call
+ * that would have warned it was never made. Per-service instances live in the
+ * relevant roster hints; this sentence is the class, so a service with no
+ * hand-written hint is still covered.
  */
 export const CAPABILITY_ROSTER_PREAMBLE =
   'EVERY service listed here is wired into THIS session right now — never tell the user you lack one of them, and never ask for its credentials. ' +
-  'These are one-line reminders, not instructions: before you first use a service in a session, call `get_capabilities` with `{"service":"<name>"}` for its full usage notes (auth, exact tool names, known failure shapes).';
+  'These are one-line reminders, not instructions: before you first use a service in a session, call `get_capabilities` with `{"service":"<name>"}` for its full usage notes (auth, exact tool names, known failure shapes). ' +
+  'Credentials are injected for you at spawn, so NEVER run an interactive login or auth command in this container (`gh auth login`, `wix login`, `hex auth login`, `aws configure`, `aws sso login`, `snow login`, …) and NEVER set your own `Authorization` header on a gateway-injected service — the gateway overwrites it, so a 401 there is not evidence the credential is missing. If a credential genuinely fails, report it to the operator instead of re-authenticating.';
 
 /** One roster line: the name, how you reach it, and a short hint. */
 export interface CapabilityRosterEntry {
@@ -503,10 +486,19 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: gwsDeclared,
       scopes: [...scopes].sort(),
       credentialPaths: effective.map((a) => `/home/node/.config/gws/accounts/${a}.json`),
+      // Names the env var and the symptom, not just "export the creds file":
+      // this entry exists BECAUSE `gws auth status` reports `auth_method: none`
+      // when the var is unset, and an agent that reads only "export the creds
+      // file first" still has no way to recognise that report for what it is.
+      // Both branches name the env var AND the symptom. `gws auth status`
+      // reporting `auth_method: none` is the misreading this entry exists to
+      // prevent, and it misleads just as badly on the branch where the host
+      // has no account file yet — an agent that reads "no account file" and
+      // then sees `auth_method: none` has had its wrong conclusion confirmed.
       summary:
         effective.length > 0
-          ? `Gmail, Calendar, Drive, Docs, Sheets, Slides as ${effective.join(', ')} (export the creds file first)`
-          : 'Gmail, Calendar, Drive, Docs, Sheets, Slides — no authenticated account file on the host',
+          ? `Gmail/Calendar/Drive/Docs/Sheets/Slides (${effective.join(', ')}); export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE — \`auth_method: none\` means that var is unset, not missing creds`
+          : 'No gws account file on the host yet; once there is one, export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE — `auth_method: none` means that var is unset, not missing creds',
       activation:
         effective.length > 0
           ? `export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/<name>.json (valid names: ${effective.join(', ')}). Verify with \`gws auth status\` — WITHOUT this env var gws reports auth_method: none even though creds are mounted.`
@@ -640,8 +632,8 @@ export function buildSessionServicesSnapshotFrom(
         scopes: scopeList,
         credentialPaths: [],
         summary: resolved.set
-          ? '`gh` and the VCS CLI are pre-authenticated: repos, PRs, pushes, and CI/Actions status'
-          : 'GitHub declared but no token resolved on the host — ask the operator',
+          ? '`gh` and the VCS CLI are pre-authenticated: repos, PRs, pushes, and CI/Actions status. Never run `gh auth login`'
+          : 'GitHub declared but no token resolved on the host — ask the operator, do not run `gh auth login`',
         activation: resolved.set
           ? `\`gh\` and \`git\` both pre-authenticated from host env \`${resolved.name}\`${githubTokenDeliveredAsEnv() ? `, forwarded to you as \`GITHUB_TOKEN\`` : ` and delivered as a read-only file at \`${GH_TOKEN_CONTAINER_PATH}\` — the git credential helper and the \`gh\` shim read it per invocation, so the host's hourly re-mint reaches you without a restart, and there is deliberately no \`GITHUB_TOKEN\` in your env`}${
               allowedOrgs.set ? `, restricted to orgs: \`${process.env[allowedOrgs.name]}\`` : ''
@@ -686,7 +678,7 @@ export function buildSessionServicesSnapshotFrom(
   // Where the derived MCP entries land. The five universals that moved into
   // the fleet file (exa, deepwiki, context7, pocket, granola) were pushed
   // exactly here, and both capability budgets evict from the END
-  // (`evictCapability`, src/modules/memory/pre-turn-context.ts:1629-1634), so
+  // (`evictCapability`, src/modules/memory/pre-turn-context.ts:1653-1658), so
   // appending them instead would have moved every one of them into the
   // eviction zone. The 19 -> 22 services / 8,954 -> 9,773 chars figure quoted
   // in `src/capabilities.test.ts` is that file's own hermetic wide-group
@@ -859,7 +851,7 @@ export function buildSessionServicesSnapshotFrom(
   // `retainUnderBudget`: this entry is what stops the agent telling the owner
   // it can't read a Slack link, and it was the one the pre-turn capability
   // budget dropped (it sits late in this list and budget eviction pops from
-  // the end). See evictCapability, src/modules/memory/pre-turn-context.ts:1629.
+  // the end). See evictCapability, src/modules/memory/pre-turn-context.ts:1653.
   const mergedSecrets = mergeWorkgroupAndGroupSecrets(central.workgroupSecrets, cfg?.onecliSecrets);
   const hasSlackSecret = slackUserTokenSecrets(mergedSecrets, cfg?.slack_user_token?.onecli_secret_names).length > 0;
   if (hasSlackSecret) {
@@ -936,7 +928,14 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: declaredMatchingTools(['cloudflare']),
       scopes: folder ? [folder] : [],
       credentialPaths: [],
-      summary: 'Cloudflare account APIs (DNS, Workers, Pages, R2) via docs → search → execute',
+      // Both imperatives are always-on, not detail-on-demand: each one exists
+      // because the diagnosis it forbids was already made and believed — the
+      // `/user/tokens/verify` probe produced a false "credential is dead" call
+      // twice, and a self-added header makes Cloudflare reject its FORMAT,
+      // which reads like a token problem. An agent only reads the full entry
+      // if it already suspects it is wrong about something.
+      summary:
+        'Cloudflare account APIs (DNS, Workers, Pages, R2) via docs → search → execute. Never verify with /user/tokens/verify, and send no Authorization header of your own',
       useFor:
         'Official Cloudflare API MCP at https://mcp.cloudflare.com/mcp — auth pre-injected as `Authorization: Bearer`; do NOT ask for or send the token. Use `mcp__cloudflare-api__docs` for Cloudflare product documentation, `mcp__cloudflare-api__search` to locate the correct OpenAPI endpoint, then `mcp__cloudflare-api__execute` to call it. The server pre-selects the account from the token and exposes its `accountId` to execute code. Covers Cloudflare account APIs such as DNS, Workers, Pages, and R2 API endpoints, subject to the token’s granted permissions. Diagnosing Cloudflare auth failures — `mcp.cloudflare.com` and `api.cloudflare.com` are separately credentialed, so name the one that is actually broken instead of reporting "no Cloudflare access". `1000: Invalid API Token` does NOT by itself mean the token is bad — this install uses an ACCOUNT-scoped API token, and account tokens legitimately return `1000` on USER-scoped endpoints like `/user/tokens/verify`. Probe with an account-scoped call (`GET /accounts`) before concluding anything; a real `1000` there means the stored token is stale or rotated, and retrying cannot fix it. Never verify with `/user/tokens/verify` — it has produced a false "credential is dead" diagnosis twice. `1001 Missing "Authorization" header` from `api.cloudflare.com` means the opposite: nothing was injected on that host, because direct API access is wired separately (its own host-scoped OneCLI secret, or the OneCLI Cloudflare app connection) and may not be set up here. Distinguish them before concluding — `onecli apps get --provider cloudflare` shows whether the app connection exists (`connection: null` = not connected). Never add your own `Authorization` header to test any of this: on a host the gateway does not cover, your header is passed through and Cloudflare rejects its FORMAT (`6003`/`6111`), which reads like a token problem and has already caused a wrong diagnosis once. Send no header and read the error. Note `wrangler` is NOT installed in this container — deploys go through the REST API (Workers script upload, Pages Direct Upload), which is also the route that gets gateway injection. The separate S3-compatible access-key/secret pair is not exposed through this MCP; do not attempt AWS SDK/CLI access or claim direct S3 access unless a signing-capable S3 client is separately wired.',
     });
@@ -971,9 +970,14 @@ export function buildSessionServicesSnapshotFrom(
       declaredTools: [],
       scopes: [],
       credentialPaths: hasWixCli ? ['/home/node/.wix/auth/account.json'] : [],
+      // "never guessed" and "never `wix login`" are always-on: a guessed site
+      // id writes to the WRONG SITE, and neither mistake announces itself as a
+      // reason to go read the full entry first.
       summary: [
-        hasWixSecret ? 'www.wixapis.com REST (you supply the wix-site-id / wix-account-id header)' : '',
-        hasWixCli ? '`wix` CLI for Velo page code and publish' : '',
+        hasWixSecret
+          ? 'www.wixapis.com REST — add exactly one wix-site-id/wix-account-id header, taken from the user, never hardcoded or guessed'
+          : '',
+        hasWixCli ? '`wix` CLI for Velo code and publish; never run `wix login`' : '',
       ]
         .filter(Boolean)
         .join('; '),
@@ -1060,7 +1064,7 @@ export function buildSessionServicesSnapshotFrom(
   // won the merge — a group that declares `littlebird` itself (all 24 do
   // today) holds the same capability. If every entry is retained the budget
   // still terminates: `evictCapability` pops the last one outright
-  // (src/modules/memory/pre-turn-context.ts:1633).
+  // (src/modules/memory/pre-turn-context.ts:1657).
   const fleetProvided = new Set(Object.keys(readFleetMcpServers()));
   const derived: SessionServicesSnapshot['services'] = [];
   for (const [name, server] of Object.entries(effectiveMcpServers(cfg))) {
