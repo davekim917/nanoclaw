@@ -760,6 +760,12 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   // `src/modules/sweep-central/coordination-orphans.ts`.
   FORK2: 'coordination-orphans',
   FORK3: 'wiki-admission-recovery',
+  // Fork addition (2026-09-17): a remote MCP server authenticates with a
+  // short-lived OAuth access token, and the OneCLI secret injecting it used to
+  // hold a value a human pasted once. When it expired the gateway kept
+  // injecting the dead token and every spawn's stdio bridge died with
+  // CONNECTION_CLOSED. Body in `src/modules/mcp-oauth/`.
+  FORK4: 'mcp-oauth-refresh',
   S2: 'processing-ack-sync',
   S3: 'stale-pending-expiry',
   S4: 'pre-wake-orphan-claim-reset',
