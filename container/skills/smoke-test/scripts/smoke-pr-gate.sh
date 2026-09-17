@@ -1752,8 +1752,12 @@ campaign_size_classify() {
 # two ranges just because another GO (its own included) landed mid-run.
 BASELINE_CANDIDATE_LIMIT=10
 
-# Complete changed-file list between two commits, from their recursive trees:
-# changed = added ∪ removed ∪ blob-sha-differs, so a rename shows up as BOTH
+# Complete changed-file list between two commits, from their recursive trees.
+# An entry is compared on its FULL identity — mode + type + sha — for `blob`
+# and `commit` (submodule) entries, so a chmod-only change (same blob sha) and
+# a submodule bump are both in the list; `tree` entries are directories, not
+# files, and are excluded.
+# changed = added ∪ removed ∪ identity-differs, so a rename shows up as BOTH
 # its old and its new path (which is what sizing wants — see previous_filename
 # in the sizing block). Two API calls. Prints {"files":[{"filename":…},…]} and
 # returns 0; on any failure prints a short reason and returns 1. `truncated`
@@ -1778,8 +1782,9 @@ campaign_range_tree_files() {  # <baseline-sha> <target-sha>
     [ "$side" = baseline ] && base_tree="$tree" || target_tree="$tree"
   done
   jq -cn --slurpfile a <(printf '%s' "$base_tree") --slurpfile b <(printf '%s' "$target_tree") '
-    def blobs: [.tree[] | select(.type == "blob") | {key: .path, value: (.sha // "")}] | from_entries;
-    ($a[0] | blobs) as $x | ($b[0] | blobs) as $y |
+    def entries: [.tree[] | select(.type == "blob" or .type == "commit") |
+                  {key: .path, value: [(.mode // ""), .type, (.sha // "")]}] | from_entries;
+    ($a[0] | entries) as $x | ($b[0] | entries) as $y |
     {files: [(($x | keys) + ($y | keys)) | unique | .[] | select($x[.] != $y[.]) | {filename: .}]}
   ' 2>/dev/null || { printf 'the tree diff could not be computed'; return 1; }
 }
@@ -1850,7 +1855,7 @@ evaluate_pr() {
   local files_json files_len files_fetch_failed migrations_touched frontend_touched frontend_required is_freeze ci_sha
   local migration_files migrations_determinable target_files_json target_files_len
   local baseline_json baseline_sha range_determinable range_reason migrations_in_range campaign_range_json
-  local range_files_method
+  local range_files_method range_paths_json
   local runs_json runs_len ci_total ci_pending ci_failed ci_succeeded ci_ready ci_truncated
   local services_json backend backend_id backend_url backend_deploy_sha backend_ready
   local frontend frontend_id frontend_url frontend_deploy_sha frontend_ready
@@ -1992,10 +1997,19 @@ evaluate_pr() {
         fi
       fi
     fi
+    # ONE path list for everything range-derived below (migration facts,
+    # frontend fact, sizing): both the new AND the previous path of every
+    # entry. A file renamed or moved OUT of a prefix carries that prefix only
+    # in `previous_filename`, and a migration that left the migrations folder
+    # is still a changed migration — reading `.filename` alone reported
+    # migrationsTouched:false / migrationsInRange:[] for exactly that range.
+    range_paths_json='[]'
     if [ "$range_determinable" = true ]; then
-      migrations_touched="$(jq -r --arg p "$MIGRATIONS_PREFIX" 'any(.files[].filename; startswith($p))' <<<"$target_files_json")"
-      frontend_touched="$(jq -r --arg p "$FRONTEND_PREFIX" 'any(.files[].filename; startswith($p))' <<<"$target_files_json")"
-      migration_files="$(jq -c --arg p "$MIGRATIONS_PREFIX" '[.files[].filename | select(startswith($p))]' <<<"$target_files_json")"
+      range_paths_json="$(jq -c '[.files[] | .filename, (.previous_filename // empty)]' <<<"$target_files_json" 2>/dev/null)"
+      jq -e 'type == "array" and all(.[]; type == "string")' <<<"$range_paths_json" >/dev/null 2>&1 || range_paths_json=""
+      migrations_touched="$(jq -r --arg p "$MIGRATIONS_PREFIX" 'any(.[]; startswith($p))' <<<"$range_paths_json" 2>/dev/null)"
+      frontend_touched="$(jq -r --arg p "$FRONTEND_PREFIX" 'any(.[]; startswith($p))' <<<"$range_paths_json" 2>/dev/null)"
+      migration_files="$(jq -c --arg p "$MIGRATIONS_PREFIX" '[.[] | select(startswith($p))] | unique' <<<"$range_paths_json" 2>/dev/null)"
     fi
     if [ "$range_determinable" != true ] ||
        { [ "$migrations_touched" != true ] && [ "$migrations_touched" != false ]; } ||
@@ -2051,7 +2065,8 @@ evaluate_pr() {
       # `full` path (e.g. a migration or a scope module renamed into a UI
       # folder) must still classify off where it came from, not just where
       # it landed — classifying by new path alone could read as `light`.
-      size_files_json="$(jq -c '[.files[] | .filename, (.previous_filename // empty)]' <<<"$target_files_json" 2>/dev/null || printf '[]')"
+      # Same list the migration/frontend facts above were read from.
+      size_files_json="$range_paths_json"
     fi
   else
     if [ "$files_fetch_failed" = true ]; then

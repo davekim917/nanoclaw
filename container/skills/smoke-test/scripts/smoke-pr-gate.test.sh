@@ -829,7 +829,13 @@ export SMOKE_SIZING_RULES="$STATE_DIR/rules.json"
 printf '%s' '{"full":["XZO-BACKEND/migrations/**"],"lightAllowed":["XZO-FRONTEND/**"]}' > "$SMOKE_SIZING_RULES"
 export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"XZO-FRONTEND/src/moved.sql","previous_filename":"XZO-BACKEND/migrations/9_x.sql","status":"renamed"}]}'
 range_case 5d-renamed '.campaignRange.determinable == true and .campaignSize == "full" and
-  (.sizeReason | test("XZO-BACKEND/migrations/9_x.sql"))'
+  (.sizeReason | test("XZO-BACKEND/migrations/9_x.sql")) and
+  .migrationsTouched == true and .migrationsDeterminable == true and
+  .migrationsInRange == ["XZO-BACKEND/migrations/9_x.sql"] and .migrationFiles == .migrationsInRange and
+  .frontendTouched == true'
+# ...and the mirror image: moved OUT of the frontend prefix still reads frontendTouched.
+export STUB_COMPARE_FILES='{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"docs/moved.tsx","previous_filename":"XZO-FRONTEND/src/moved.tsx","status":"renamed"}]}'
+range_case 5d-renamed-frontend '.frontendTouched == true and .migrationsTouched == false and .migrationsInRange == []'
 unset SMOKE_SIZING_RULES
 
 # --- 5e. Identical: target IS the certified baseline. The one legitimately
@@ -856,13 +862,16 @@ tree_fixture() { # <n-changed> <truncated> -> STUB_TREES_BY_SHA for BASE_SHA / P
   STUB_TREES_BY_SHA="$(python3 - "$BASE_SHA" "$PARENT_SHA" "$1" "$2" <<'PYF'
 import json, sys
 base, target, n, truncated = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4] == "true"
-blob = lambda p, s: {"path": p, "type": "blob", "sha": s}
+blob = lambda p, s, mode="100644": {"path": p, "type": "blob", "mode": mode, "sha": s}
 same = [blob("README.md", "s0"), blob("XZO-BACKEND/src/same.ts", "s1"),
-        {"path": "XZO-BACKEND/src", "type": "tree", "sha": "t-will-differ"}]
+        {"path": "XZO-BACKEND/src", "type": "tree", "mode": "040000", "sha": "t-will-differ"}]
 a = same + [blob(f"XZO-BACKEND/src/f{i}.ts", f"a{i}") for i in range(n)]
 b = [dict(e) for e in same] + [blob(f"XZO-BACKEND/src/f{i}.ts", f"b{i}") for i in range(n)]
 b[2]["sha"] = "t-differs"                       # a changed DIRECTORY entry is not a file
 a += [blob("XZO-BACKEND/migrations/9_old_name.sql", "m9"), blob("XZO-BACKEND/src/removed.ts", "r1")]
+a += [blob("scripts/run.sh", "x1"), {"path": "vendor/lib", "type": "commit", "mode": "160000", "sha": "c1"}]
+b += [blob("scripts/run.sh", "x1", "100755"),              # chmod only: SAME blob sha, new mode
+      {"path": "vendor/lib", "type": "commit", "mode": "160000", "sha": "c2"}]  # submodule bump
 b += [blob("XZO-FRONTEND/src/9_new_name.sql", "m9"),       # rename: same blob, both paths change
       blob("XZO-BACKEND/migrations/301_added.sql", "m301")]
 print(json.dumps({base: {"sha": base, "truncated": False, "tree": a},
@@ -886,6 +895,16 @@ range_case 5f-tree '.campaignRange.determinable == true and .campaignRange.reaso
 export SMOKE_SIZING_RULES="$STATE_DIR/rules-tree.json"
 printf '%s' '{"full":["XZO-BACKEND/migrations/9_old_name.sql"],"lightAllowed":["XZO-FRONTEND/**"]}' > "$SMOKE_SIZING_RULES"
 range_case 5f-tree-rename '.campaignSize == "full" and (.sizeReason | test("9_old_name.sql"))'
+# Full entry identity, not path->blob-sha: a chmod-only change (same blob sha)
+# and a submodule bump (`commit` entry) are both in the list. Each is made the
+# ONLY `full` trigger in turn, so `full` can only come from that one path.
+printf '%s' '{"full":["scripts/run.sh"],"lightAllowed":["**"]}' > "$SMOKE_SIZING_RULES"
+range_case 5f-tree-chmod '.campaignSize == "full" and (.sizeReason | test("scripts/run.sh"))'
+printf '%s' '{"full":["vendor/lib"],"lightAllowed":["**"]}' > "$SMOKE_SIZING_RULES"
+range_case 5f-tree-submodule '.campaignSize == "full" and (.sizeReason | test("vendor/lib"))'
+# Control: an UNCHANGED blob and the changed directory entry never trigger.
+printf '%s' '{"full":["README.md","XZO-BACKEND/src"],"lightAllowed":["**"]}' > "$SMOKE_SIZING_RULES"
+range_case 5f-tree-unchanged '.campaignRange.determinable == true and .campaignSize != "full"'
 unset SMOKE_SIZING_RULES
 # Below the cap the compare list is used as-is and no tree is fetched.
 rm -f "$STUB_TREE_GET_LOG"
