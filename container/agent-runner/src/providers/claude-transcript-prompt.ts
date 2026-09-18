@@ -6,25 +6,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /** Past this size only the file's tail is read; the batch recorded this attempt is always near the end. */
 const TRANSCRIPT_PROMPT_TAIL_BYTES = 8 * 1024 * 1024;
-/** Clock slack between the runner's attempt start and the CLI's entry timestamps (same container clock). */
-const ATTEMPT_CLOCK_SLACK_MS = 1_000;
-
 /**
- * True only when the transcript at `transcriptPath` provably shows `text` to a
- * resume: a main-conversation user entry recorded during THIS attempt (its
- * timestamp is at or after `sinceMs`) contains it, with no compaction after it.
- * A credential-rotation retry asks this to decide whether it can point at the
- * batch instead of sending it again (measured 2026-09-18: 108 of 121 recent
- * retries re-sent a prompt already in the transcript).
+ * True only when a resume of the transcript at `transcriptPath` provably shows
+ * `text`: walking the parent chain back from the newest main-conversation entry
+ * (the way the SDK rebuilds history from a leaf's `parentUuid` ancestry), a user
+ * entry recorded during THIS attempt — timestamp at or after `sinceMs`, the
+ * batch's first-attempt start on the same container clock, no slack —
+ * contains it. A credential-rotation retry asks this to decide whether it can
+ * point at the batch instead of sending it again (measured 2026-09-18: 108 of
+ * 121 recent retries re-sent a prompt already in the transcript).
  *
  * Every doubt answers false, so the caller re-sends: a false negative costs
- * tokens, a false positive would drop the batch. Doubts include a read error,
- * an unparseable line (other than a blank line or the partial first line of a
- * tail read), a `compact_boundary` newer than the match (compaction may not have
- * kept it), and reaching entries older than the attempt without a match (an
- * identical older copy, e.g. a repeated webhook, is a different delivery).
- * Sidechain (subagent) entries are not part of the resumed conversation and
- * are skipped.
+ * tokens, a false positive would drop the batch. Doubts: a read error; an
+ * unparseable line (other than a blank line or a tail read's partial first
+ * line); a chain that reaches a `compact_boundary`, a missing or null parent,
+ * or an undated entry or one older than the attempt before matching. Only
+ * entries on the chain count, so an abandoned branch, a sidechain (subagent)
+ * or an entry the SDK would not load (no `uuid`) can never match.
  */
 export function transcriptContainsUserText(transcriptPath: string, text: string, sinceMs: number): boolean {
   if (!text || !Number.isFinite(sinceMs)) return false;
@@ -48,32 +46,35 @@ export function transcriptContainsUserText(transcriptPath: string, text: string,
   } catch {
     return false;
   }
+  const byUuid = new Map<string, Record<string, unknown>>();
+  let leaf: Record<string, unknown> | undefined;
   const lines = raw.split('\n');
-  const firstComplete = tailRead ? 1 : 0; // a tail read starts mid-line
-  const cutoff = sinceMs - ATTEMPT_CLOCK_SLACK_MS;
-  for (let i = lines.length - 1; i >= firstComplete; i--) {
+  for (let i = tailRead ? 1 : 0; i < lines.length; i++) {
     const line = lines[i]!;
     if (!line.trim()) continue;
     let entry: unknown;
     try {
       entry = JSON.parse(line);
     } catch {
-      return false; // corruption newer than any match: don't trust the file
+      return false;
     }
     if (!isRecord(entry)) return false;
-    if (entry.type === 'system' && entry.subtype === 'compact_boundary') return false;
-    if (entry.type !== 'user' || entry.isSidechain === true || !isRecord(entry.message)) continue;
-    const content = entry.message.content;
-    const userText =
-      typeof content === 'string'
-        ? content
-        : Array.isArray(content)
-          ? content.map((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? b.text : '')).join('')
-          : '';
-    if (!userText) continue; // tool results only
-    const at = typeof entry.timestamp === 'string' ? Date.parse(entry.timestamp) : NaN;
-    if (!(at >= cutoff)) return false; // older than this attempt, or undated: stop
-    if (userText.includes(text)) return true;
+    if (typeof entry.uuid !== 'string') continue; // queue ops, titles: not conversation
+    byUuid.set(entry.uuid, entry);
+    if (entry.isSidechain !== true) leaf = entry;
   }
-  return false;
+  for (let node = leaf; node; ) {
+    if (node.type === 'system' && node.subtype === 'compact_boundary') return false;
+    const at = typeof node.timestamp === 'string' ? Date.parse(node.timestamp) : NaN;
+    if (!(at >= sinceMs)) return false; // older than this attempt, or undated
+    if (node.type === 'user' && isRecord(node.message) && userTextOf(node.message.content).includes(text)) return true;
+    node = typeof node.parentUuid === 'string' ? byUuid.get(node.parentUuid) : undefined;
+  }
+  return false; // chain ended (null/missing parent) before a match
+}
+
+function userTextOf(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? b.text : '')).join('');
 }

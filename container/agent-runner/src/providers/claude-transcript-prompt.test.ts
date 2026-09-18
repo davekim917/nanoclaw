@@ -13,69 +13,80 @@ afterEach(() => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-const T0 = Date.parse('2026-09-18T12:00:00.000Z'); // attempt start
-const at = (offsetS: number) => new Date(T0 + offsetS * 1000).toISOString();
-const user = (content: unknown, offsetS: number, extra: Record<string, unknown> = {}) => ({
+const T0 = Date.parse('2026-09-18T12:00:00.000Z'); // the batch's first-attempt start
+const at = (offsetMs: number) => new Date(T0 + offsetMs).toISOString();
+type Entry = Record<string, unknown>;
+const user = (uuid: string, parent: string | null, content: unknown, offsetMs: number, extra: Entry = {}): Entry => ({
   type: 'user',
-  timestamp: at(offsetS),
+  uuid,
+  parentUuid: parent,
+  timestamp: at(offsetMs),
   message: { role: 'user', content },
   ...extra,
 });
-const assistant = (offsetS: number) => ({ type: 'assistant', timestamp: at(offsetS), message: { content: [] } });
-function write(lines: unknown[]): string {
+const assistant = (uuid: string, parent: string, offsetMs: number): Entry => ({
+  type: 'assistant',
+  uuid,
+  parentUuid: parent,
+  timestamp: at(offsetMs),
+  message: { content: [] },
+});
+function write(lines: Array<Entry | string>): string {
   const p = path.join(dir, 'session.jsonl');
   fs.writeFileSync(p, lines.map((l) => (typeof l === 'string' ? l : JSON.stringify(l))).join('\n') + '\n');
   return p;
 }
 const PROMPT = '<messages><message from="operator">Review the release queue once.</message></messages>';
+const has = (lines: Array<Entry | string>) => transcriptContainsUserText(write(lines), PROMPT, T0);
 
 describe('transcriptContainsUserText', () => {
-  it('finds the prompt recorded during this attempt (string or text blocks)', () => {
-    expect(transcriptContainsUserText(write([user('earlier', -60), user(PROMPT, 1), assistant(2)]), PROMPT, T0)).toBe(
-      true,
-    );
-    const blocks = user(
-      [
-        { type: 'text', text: PROMPT },
-        { type: 'image', source: {} },
-      ],
-      1,
-    );
-    expect(transcriptContainsUserText(write([blocks]), PROMPT, T0)).toBe(true);
+  it('finds the prompt this attempt recorded on the resumed chain (string or text blocks)', () => {
+    expect(
+      has([
+        user('a', null, 'earlier', -60_000),
+        assistant('b', 'a', -59_000),
+        user('c', 'b', PROMPT, 5),
+        assistant('d', 'c', 900),
+      ]),
+    ).toBe(true);
+    const blocks = [
+      { type: 'text', text: PROMPT },
+      { type: 'image', source: {} },
+    ];
+    expect(has([user('c', null, blocks, 5)])).toBe(true);
   });
 
-  it('rejects an identical OLDER copy — a repeated delivery is not this attempt', () => {
-    expect(transcriptContainsUserText(write([user(PROMPT, -300), assistant(-290)]), PROMPT, T0)).toBe(false);
+  it('rejects an identical copy from before the attempt started — even 1 ms before', () => {
+    expect(has([user('a', null, PROMPT, -1), assistant('b', 'a', 200)])).toBe(false);
   });
 
   it('still finds the original after an earlier pointer-only retry was recorded', () => {
-    const pointerRetry = user('<runner-retry-provenance>…</runner-retry-provenance>\n\nThe interrupted batch …', 5);
-    expect(transcriptContainsUserText(write([user(PROMPT, 1), assistant(2), pointerRetry]), PROMPT, T0)).toBe(true);
+    const pointer = '<runner-retry-provenance>…</runner-retry-provenance>\n\nThe interrupted batch …';
+    expect(has([user('c', null, PROMPT, 5), assistant('d', 'c', 100), user('e', 'd', pointer, 3000)])).toBe(true);
   });
 
-  it('answers false when compaction happened after the match', () => {
-    const lines = [user(PROMPT, 1), { type: 'system', subtype: 'compact_boundary', timestamp: at(3) }];
-    expect(transcriptContainsUserText(write(lines), PROMPT, T0)).toBe(false);
+  it('rejects a match on an abandoned branch the resumed leaf does not descend from', () => {
+    expect(
+      has([user('a', null, 'earlier', -60_000), user('x', 'a', PROMPT, 5), user('y', 'a', 'other branch', 50)]),
+    ).toBe(false);
   });
 
-  it('answers false when a newer line is corrupt', () => {
-    expect(transcriptContainsUserText(write([user(PROMPT, 1), '{not json']), PROMPT, T0)).toBe(false);
+  it('rejects when the chain crosses a compact_boundary or a missing parent', () => {
+    const boundary = { type: 'system', subtype: 'compact_boundary', uuid: 'k', parentUuid: 'c', timestamp: at(50) };
+    expect(has([user('c', null, PROMPT, 5), boundary, assistant('d', 'k', 60)])).toBe(false);
+    expect(has([assistant('d', 'gone', 60)])).toBe(false);
   });
 
-  it('skips sidechain (subagent) and tool-result-only user entries', () => {
-    const lines = [
-      user(PROMPT, 1),
-      user('subagent brief', 2, { isSidechain: true }),
-      user([{ type: 'tool_result', tool_use_id: 'x', content: 'ok' }], 3),
-    ];
-    expect(transcriptContainsUserText(write(lines), PROMPT, T0)).toBe(true);
-    expect(transcriptContainsUserText(write([user(PROMPT, 1, { isSidechain: true })]), PROMPT, T0)).toBe(false);
+  it('fails closed on corrupt lines and ignores entries the SDK would not load', () => {
+    expect(has([user('c', null, PROMPT, 5), '{not json'])).toBe(false);
+    expect(has([{ type: 'user', timestamp: at(5), message: { content: PROMPT } }])).toBe(false); // no uuid
+    expect(has([user('c', null, PROMPT, 5, { isSidechain: true })])).toBe(false);
+    expect(has([{ type: 'user', uuid: 'u', parentUuid: null, message: { content: PROMPT } }])).toBe(false); // undated
   });
 
-  it('answers false for a missing file, empty prompt, undated entry, or unrecorded prompt', () => {
+  it('answers false for a missing file, an empty prompt, or an unrecorded prompt', () => {
     expect(transcriptContainsUserText(path.join(dir, 'nope.jsonl'), PROMPT, T0)).toBe(false);
-    expect(transcriptContainsUserText(write([user(PROMPT, 1)]), '', T0)).toBe(false);
-    expect(transcriptContainsUserText(write([{ type: 'user', message: { content: PROMPT } }]), PROMPT, T0)).toBe(false);
-    expect(transcriptContainsUserText(write([user('something else', 1)]), PROMPT, T0)).toBe(false);
+    expect(transcriptContainsUserText(write([user('c', null, PROMPT, 5)]), '', T0)).toBe(false);
+    expect(has([user('c', null, 'something else', 5)])).toBe(false);
   });
 });
