@@ -217,3 +217,31 @@ describe('token grants', () => {
     ).rejects.toThrow(/no access_token/);
   });
 });
+
+// Issue #876 P3(e): the old test for "is this a query string?" was
+// `trimmed.includes('=')`, so a bare base64 code carrying its padding was
+// parsed as a parameter list — `URLSearchParams('AbC9==')` yields a parameter
+// NAMED `AbC9`, no `code`, and the operator was told their code was missing.
+describe('parseRedirectResponse — a bare code is not a query string', () => {
+  it('accepts a base64-padded code pasted on its own', () => {
+    expect(parseRedirectResponse('bDRkaXNwbGF5X25hbWU9dGVzdA==')).toEqual({ code: 'bDRkaXNwbGF5X25hbWU9dGVzdA==' });
+    expect(parseRedirectResponse('  QUJD=  ')).toEqual({ code: 'QUJD=' });
+  });
+
+  it('still reads a real query string, with or without a URL around it', () => {
+    expect(parseRedirectResponse('code=abc&state=st')).toMatchObject({ code: 'abc', state: 'st' });
+    expect(parseRedirectResponse('?code=abc&state=st')).toMatchObject({ code: 'abc', state: 'st' });
+    expect(parseRedirectResponse('http://127.0.0.1:8765/callback?code=abc&state=st')).toMatchObject({
+      code: 'abc',
+      state: 'st',
+    });
+    expect(parseRedirectResponse('http://127.0.0.1:8765/callback?error=access_denied')).toMatchObject({
+      error: 'access_denied',
+    });
+  });
+
+  it('does not mistake a code that merely CONTAINS an oauth-ish word for a query', () => {
+    // `code` only counts at the start or after an `&`.
+    expect(parseRedirectResponse('xcode=abc')).toEqual({ code: 'xcode=abc' });
+  });
+});

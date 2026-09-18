@@ -207,3 +207,120 @@ describe('managed git-hooks tree containment (#666 review B9)', () => {
     expect(result.effectiveReadonly).toBe(false);
   });
 });
+
+// Issue #876 hardening. Both patterns are credential-bearing directories that
+// the default list missed by one character or one word.
+describe('default blocked patterns cover the OAuth bundles and hyphenated key files', () => {
+  /** Create `<projectsDir>/<relative>` and offer it as a mount. */
+  function mountOf(relative: string): ReturnType<typeof validateMount> {
+    const hostPath = path.join(projectsDir, relative);
+    fs.mkdirSync(hostPath, { recursive: true });
+    writeAllowlist({ allowedRoots: [{ path: projectsDir, allowReadWrite: true }], blockedPatterns: [] });
+    return validateMount({ hostPath, readonly: true });
+  }
+
+  it('refuses the MCP OAuth bundle directory, where the refresh tokens live', () => {
+    const result = mountOf(path.join('data', 'mcp-oauth'));
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toMatch(/blocked pattern "mcp-oauth"/);
+  });
+
+  it('refuses a parent that merely CONTAINS the bundle directory', () => {
+    // `data/` is the realistic operator mistake: one entry, and the bundles
+    // are inside it.
+    fs.mkdirSync(path.join(projectsDir, 'nested', 'mcp-oauth'), { recursive: true });
+    const result = mountOf(path.join('mcp-oauth-backups'));
+    expect(result.allowed).toBe(false);
+  });
+
+  it('refuses the HYPHENATED private-key spelling, which `private_key` never matched', () => {
+    const result = mountOf('private-key');
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toMatch(/blocked pattern "private-key"/);
+    // The underscore spelling still matches, as before.
+    expect(mountOf('private_key').allowed).toBe(false);
+  });
+
+  it('leaves an ordinary directory alone', () => {
+    expect(mountOf('ordinary-repo').allowed).toBe(true);
+  });
+});
+
+// #905 review P1: a blocked PATTERN only inspects the mount's own path, so
+// `mcp-oauth` in the list closed the leaf and left every ancestor open —
+// `data/`, or a home directory, reaches the same bundles through the parent.
+describe('the MCP OAuth bundle directory is unreachable from above as well as below', () => {
+  function mount(hostPath: string, readonly = true): ReturnType<typeof validateMount> {
+    writeAllowlist({ allowedRoots: [{ path: tmpDir, allowReadWrite: true }], blockedPatterns: [] });
+    return validateMount({ hostPath, readonly });
+  }
+
+  it('refuses a READ-ONLY mount of DATA_DIR, the realistic operator mistake', () => {
+    fs.mkdirSync(path.join(mockState.dataDir, 'mcp-oauth'), { recursive: true });
+    const result = mount(mockState.dataDir);
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toMatch(/MCP OAuth bundle directory/);
+  });
+
+  it('refuses an ancestor above DATA_DIR too', () => {
+    fs.mkdirSync(path.join(mockState.dataDir, 'mcp-oauth'), { recursive: true });
+    expect(mount(tmpDir).allowed).toBe(false);
+  });
+
+  it('refuses it before the directory exists — no integration has been created yet', () => {
+    // Nothing named mcp-oauth on disk anywhere.
+    expect(fs.existsSync(path.join(mockState.dataDir, 'mcp-oauth'))).toBe(false);
+    expect(mount(mockState.dataDir).allowed).toBe(false);
+  });
+
+  it('refuses the bundle directory itself, read-only', () => {
+    const bundles = path.join(mockState.dataDir, 'mcp-oauth');
+    fs.mkdirSync(bundles, { recursive: true });
+    expect(mount(bundles).allowed).toBe(false);
+  });
+
+  it('leaves a sibling under DATA_DIR alone — this is a targeted refusal, not a ban on data/', () => {
+    const siblings = path.join(mockState.dataDir, 'workgroups');
+    fs.mkdirSync(siblings, { recursive: true });
+    expect(mount(siblings).allowed).toBe(true);
+  });
+});
+
+// #905 review round 3: resolving only DATA_DIR and appending the literal
+// `mcp-oauth` component misses the case where the LEAF is the symlink. Bundle
+// writes follow it, so the target is where the refresh tokens really live.
+describe('the bundle directory is protected through a symlinked leaf too', () => {
+  function mount(hostPath: string): ReturnType<typeof validateMount> {
+    writeAllowlist({ allowedRoots: [{ path: tmpDir, allowReadWrite: true }], blockedPatterns: [] });
+    return validateMount({ hostPath, readonly: true });
+  }
+
+  /** `<dataDir>/mcp-oauth` → `<tmpDir>/elsewhere/bundles`, nothing in the
+   *  target's own path spelling matching any pattern. */
+  function linkBundlesOutside(): string {
+    const target = path.join(tmpDir, 'elsewhere', 'bundles');
+    fs.mkdirSync(target, { recursive: true });
+    fs.mkdirSync(mockState.dataDir, { recursive: true });
+    fs.symlinkSync(target, path.join(mockState.dataDir, 'mcp-oauth'));
+    return target;
+  }
+
+  it('refuses the symlink target', () => {
+    const target = linkBundlesOutside();
+    const result = mount(target);
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toMatch(/MCP OAuth bundle directory/);
+  });
+
+  it('refuses an ancestor of the symlink target', () => {
+    linkBundlesOutside();
+    expect(mount(path.join(tmpDir, 'elsewhere')).allowed).toBe(false);
+  });
+
+  it('still allows an unrelated directory beside it', () => {
+    linkBundlesOutside();
+    const unrelated = path.join(tmpDir, 'elsewhere-but-unrelated');
+    fs.mkdirSync(unrelated, { recursive: true });
+    expect(mount(unrelated).allowed).toBe(true);
+  });
+});

@@ -29,8 +29,9 @@
  */
 import { execFile } from 'child_process';
 
-import { ONECLI_URL, ONECLI_API_KEY } from './config.js';
+import { ONECLI_URL } from './config.js';
 import { log } from './log.js';
+import { onecliAuthConfigLine, sanitizeCurlFailure } from './onecli-curl.js';
 
 interface OnecliAgent {
   id: string;
@@ -96,16 +97,37 @@ function isUuid(s: string): boolean {
  * `curl` rather than `fetch`: host `fetch` must never traverse the OneCLI
  * gateway proxy (`NODE_USE_ENV_PROXY` was stripped from the daemon env after
  * it broke every spawn on 2026-09-02), and curl's behavior here is proven.
+ *
+ * TWO THINGS NEVER CROSS ARGV, and both are why the callers below pass a
+ * `label` instead of building their own error text:
+ *
+ *   - the gateway API key. It goes on stdin as a curl config file
+ *     (`-K -`, `src/onecli-curl.ts`), so it is not in `/proc/<pid>/cmdline`.
+ *   - `execFile`'s error. Node composes its `.message` as
+ *     `Command failed: <the whole argv>`, which is how a key in argv reaches
+ *     every log line and DB column a caller writes. Failures are rethrown as a
+ *     sanitized `OnecliCurlError` naming the operation and curl's exit code.
+ *
+ * The cost of (2) is the HTTP status: `-f` collapses every non-2xx into exit
+ * 22, so a failure reads "HTTP error response" rather than "500". The gateway's
+ * own log has the status; a credential in this host's log does not go away.
  */
-function curl(args: string[]): Promise<string> {
+function curl(args: string[], label: string): Promise<string> {
+  const auth = onecliAuthConfigLine();
   return new Promise((resolve, reject) => {
-    execFile('curl', args, { encoding: 'utf-8' }, (error, stdout) => {
+    const child = execFile('curl', auth ? ['-K', '-', ...args] : args, { encoding: 'utf-8' }, (error, stdout) => {
       if (error) {
-        reject(error);
+        reject(sanitizeCurlFailure(label, error));
         return;
       }
       resolve(typeof stdout === 'string' ? stdout : String(stdout));
     });
+    if (auth) {
+      // An unhandled 'error' on this stream is an uncaught exception; the
+      // execFile callback reports the failure either way.
+      child.stdin?.on('error', () => undefined);
+      child.stdin?.end(auth);
+    }
   });
 }
 
@@ -213,8 +235,7 @@ async function withIdentityLock<T>(identity: string, fn: () => Promise<T>): Prom
 async function listViaApi(resource: 'agents' | 'secrets'): Promise<unknown[]> {
   const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
   const args = ['-fsS', ...CURL_TIMEOUT_ARGS, `${base}/api/${resource}?limit=10000`];
-  if (ONECLI_API_KEY) args.unshift('-H', `Authorization: Bearer ${ONECLI_API_KEY}`);
-  const out = await curl(args);
+  const out = await curl(args, `GET /api/${resource}`);
   const parsed = JSON.parse(out) as unknown;
   if (Array.isArray(parsed)) return parsed;
   const data = (parsed as { data?: unknown }).data;
@@ -229,9 +250,8 @@ async function listViaApi(resource: 'agents' | 'secrets'): Promise<unknown[]> {
 async function requestViaApi(method: 'GET' | 'PUT' | 'DELETE', path: string): Promise<unknown> {
   const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
   const args = ['-fsS', ...CURL_TIMEOUT_ARGS, '-X', method];
-  if (ONECLI_API_KEY) args.push('-H', `Authorization: Bearer ${ONECLI_API_KEY}`);
   args.push(`${base}/api/${path.replace(/^\//, '')}`);
-  const out = await curl(args);
+  const out = await curl(args, `${method} /api/${path.replace(/^\//, '')}`);
   return out.trim() ? (JSON.parse(out) as unknown) : undefined;
 }
 
@@ -243,10 +263,9 @@ async function requestViaApi(method: 'GET' | 'PUT' | 'DELETE', path: string): Pr
 async function createAgentViaApi(input: EnsureOnecliAgentInput): Promise<{ status: number; body: unknown }> {
   const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
   const args = ['-sS', ...CURL_TIMEOUT_ARGS, '-X', 'POST', '-H', 'Content-Type: application/json'];
-  if (ONECLI_API_KEY) args.push('-H', `Authorization: Bearer ${ONECLI_API_KEY}`);
   args.push('--data-binary', JSON.stringify(input), '-w', '\n%{http_code}', `${base}/v1/agents`);
 
-  const out = await curl(args);
+  const out = await curl(args, 'POST /v1/agents');
   const statusSeparator = out.lastIndexOf('\n');
   if (statusSeparator < 0) {
     throw new Error('Malformed OneCLI agent create response: missing HTTP status');
