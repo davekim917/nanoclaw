@@ -29,8 +29,12 @@ const DEFAULT_TIMEOUT_MS = 4_000;
 const MAX_EMAIL_CHARS = 12_000; // well inside Jev's 32k state budget; the head carries the ask
 
 export interface SupportTaxonomy {
-  /** Product rules, first match wins; tested against subject + body, case-insensitive. */
-  productRules?: { product: string; pattern: string }[];
+  /**
+   * Product rules, first match wins: a rule matches when any of its keywords
+   * appears as whole words in subject + body, case-insensitive. Keywords, not
+   * regexes, so matching is linear in the email and no rule can stall a dispatch.
+   */
+  productRules?: { product: string; keywords: string[] }[];
   defaultProduct?: string;
   /** Option key → plain-language description. `none` is added when absent. */
   features: Record<string, string>;
@@ -85,11 +89,18 @@ export function readGroupTaxonomy(path: string = TAXONOMY_PATH): SupportTaxonomy
   }
   const rules: unknown = parsed.productRules ?? [];
   if (!Array.isArray(rules)) throw new Error(`${path}: "productRules" must be an array`);
-  for (const rule of rules as { product?: unknown; pattern?: unknown }[]) {
-    if (!rule || typeof rule.product !== 'string' || !OPTION_KEY.test(rule.product) || typeof rule.pattern !== 'string') {
-      throw new Error(`${path}: each product rule needs a snake_case "product" and a string "pattern"`);
+  for (const rule of rules as { product?: unknown; keywords?: unknown }[]) {
+    const keywords = rule?.keywords;
+    if (
+      !rule ||
+      typeof rule.product !== 'string' ||
+      !OPTION_KEY.test(rule.product) ||
+      !Array.isArray(keywords) ||
+      keywords.length === 0 ||
+      !keywords.every((k) => typeof k === 'string' && words(k).length > 0)
+    ) {
+      throw new Error(`${path}: each product rule needs a snake_case "product" and a non-empty "keywords" list`);
     }
-    new RegExp(rule.pattern, 'i'); // an invalid pattern throws here, where the caller fails open
   }
   if (parsed.defaultProduct !== undefined && !OPTION_KEY.test(String(parsed.defaultProduct))) {
     throw new Error(`${path}: "defaultProduct" must be a snake_case key`);
@@ -114,9 +125,14 @@ function withNone(options: Record<string, string>, none: string): Record<string,
   return 'none' in options ? options : { ...options, none };
 }
 
+function words(text: string): string[] {
+  return text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
 export function productFor(taxonomy: SupportTaxonomy, text: string): string | null {
+  const haystack = ` ${words(text).join(' ')} `;
   for (const rule of taxonomy.productRules ?? []) {
-    if (new RegExp(rule.pattern, 'i').test(text)) return rule.product;
+    if (rule.keywords.some((k) => haystack.includes(` ${words(k).join(' ')} `))) return rule.product;
   }
   return taxonomy.defaultProduct ?? null;
 }
@@ -202,10 +218,9 @@ export function parseTriage(
   if (areaType !== 'general') {
     const options = areaType === 'feature' ? taxonomy.features : taxonomy.processes;
     const pick = chosen(answers[areaType], 'choice', withNone(options, ''));
-    if (!pick) return null;
+    const confidence = num(answers[areaType]?.confidence, 1);
+    if (!pick || confidence === null) return null; // a Choice always carries a confidence, `none` included
     if (pick !== 'none') {
-      const confidence = num(answers[areaType]?.confidence, 1);
-      if (confidence === null) return null;
       area = pick;
       areaConfidence = confidence;
     }

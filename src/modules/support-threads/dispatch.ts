@@ -199,9 +199,12 @@ export function supportTriage(raw: unknown): SupportTriageView | null {
   const product = t.product === null ? null : triageKey(t.product);
   if (t.product !== null && product === null) return null;
 
+  // No area is exactly (null, 0); an area needs a key and an in-range confidence. Nothing is repaired.
   let area: string | null = null;
   let areaConfidence = 0;
-  if (t.area !== null) {
+  if (t.area === null) {
+    if (t.areaConfidence !== 0) return null;
+  } else {
     area = triageKey(t.area);
     const confidence = inRange(t.areaConfidence, 1);
     if (!area || areaType === 'general' || confidence === null) return null;

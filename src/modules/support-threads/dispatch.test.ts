@@ -301,6 +301,8 @@ describe('handleDispatchSupportIssue — classify-on-arrival triage', () => {
       { ...TRIAGE, areaType: 'general' },
       { ...TRIAGE, areaConfidence: undefined },
       { ...TRIAGE, product: 'Not A Key!' },
+      { ...TRIAGE, area: null, areaConfidence: undefined },
+      { ...TRIAGE, area: null, areaConfidence: 0.7 },
     ];
     for (const [i, triage] of bad.entries()) {
       const id = `gthread-bad-${i}`;

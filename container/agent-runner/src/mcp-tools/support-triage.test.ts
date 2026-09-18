@@ -16,7 +16,7 @@ import { buildQuestions, productFor, readGroupTaxonomy, triageSupportEmail } fro
 import type { SupportTaxonomy, SupportTriage } from './support-triage.js';
 
 const TAXONOMY: SupportTaxonomy = {
-  productRules: [{ product: 'legacy_sunset', pattern: '\\blegacy\\b' }],
+  productRules: [{ product: 'legacy_sunset', keywords: ['legacy'] }],
   defaultProduct: 'main_product',
   features: { planner: 'The planner screen.', routes: 'Routes and visits.' },
   processes: { data_feeds: 'Nightly syncs and file drops.' },
@@ -71,6 +71,15 @@ describe('triageSupportEmail', () => {
   it('lets a product rule override the default', () => {
     expect(productFor(TAXONOMY, 'Can we change the Legacy filter?')).toBe('legacy_sunset');
     expect(productFor(TAXONOMY, 'Route planner broken')).toBe('main_product');
+    expect(productFor(TAXONOMY, 'our legacyfeed failed')).toBe('main_product'); // whole words only
+    const multi = { ...TAXONOMY, productRules: [{ product: 'two_word', keywords: ['Route Planner'] }] };
+    expect(productFor(multi, 'the route-planner is down')).toBe('two_word');
+  });
+
+  it('matches product keywords in linear time, even on a hostile email', () => {
+    const t0 = performance.now();
+    productFor(TAXONOMY, 'a'.repeat(200_000) + '!');
+    expect(performance.now() - t0).toBeLessThan(500);
   });
 
   it('adds a none option to both area questions and asks them speculatively together', () => {
@@ -110,6 +119,7 @@ describe('triageSupportEmail', () => {
       { ...GOOD, escaped_defect: { type: 'noul', noul: -0.2 } },
       { ...GOOD, escaped_defect: { type: 'choice', choice: 'yes', confidence: 0.9 } },
       { ...GOOD, feature: { type: 'choice', choice: 'routes' } },
+      { ...GOOD, feature: { type: 'choice', choice: 'none' } },
     ]) {
       expect(await triageSupportEmail(EMAIL, { ...deps, fetch: jevResponse(answers) })).toBeNull();
     }
@@ -126,7 +136,7 @@ describe('triageSupportEmail', () => {
 });
 
 describe('taxonomy validation — nothing in it may stop a dispatch', () => {
-  it('rejects an invalid product pattern or a non-snake_case key when the file is read', () => {
+  it('rejects a regex-style or empty product rule, or a non-snake_case key, when the file is read', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'taxonomy-'));
     const write = (t: unknown) => {
       const f = path.join(dir, `${Math.random()}.json`);
@@ -135,12 +145,14 @@ describe('taxonomy validation — nothing in it may stop a dispatch', () => {
     };
     expect(readGroupTaxonomy(write(TAXONOMY))).toEqual(TAXONOMY);
     expect(() => readGroupTaxonomy(write({ ...TAXONOMY, productRules: [{ product: 'x', pattern: '(' }] }))).toThrow();
+    expect(() => readGroupTaxonomy(write({ ...TAXONOMY, productRules: [{ product: 'x', keywords: [] }] }))).toThrow();
+    expect(() => readGroupTaxonomy(write({ ...TAXONOMY, productRules: [{ product: 'x', keywords: ['--'] }] }))).toThrow();
     expect(() => readGroupTaxonomy(write({ ...TAXONOMY, features: { 'Route Planner': 'x' } }))).toThrow();
     expect(() => readGroupTaxonomy(write({ ...TAXONOMY, defaultProduct: 'Main Product' }))).toThrow();
   });
 
-  it('fails open when a product rule throws at classification time', async () => {
-    const broken = { ...TAXONOMY, productRules: [{ product: 'x', pattern: '(' }] };
+  it('fails open when a product rule is malformed at classification time', async () => {
+    const broken = { ...TAXONOMY, productRules: [{ product: 'x' }] } as unknown as SupportTaxonomy;
     expect(await triageSupportEmail(EMAIL, { readTaxonomy: () => broken, fetch: jevResponse(GOOD), log: quiet })).toBeNull();
   });
 
