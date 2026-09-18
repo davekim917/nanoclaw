@@ -177,6 +177,23 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     expect(calls).toHaveLength(2);
   });
 
+  it('humanizes gate-verdict tokens in chat text before the adapter sees it', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutboundKind('ag-1', session.id, 'out-verdict', 'chat', 'telegram', 'telegram:123', {
+      text: 'Verdict: do not ship — `NO_GO`\n```\nNO_GO\n```',
+    });
+    const calls: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        calls.push(content);
+        return 'plat-verdict';
+      },
+    });
+    await deliverSessionMessages(session);
+    expect(calls.map((c) => JSON.parse(c).text)).toEqual(['Verdict: do not ship — No-go\n```\nNO_GO\n```']);
+  });
+
   it('deletes the orphan thinking-block on chat-final delivery, using the stored route', async () => {
     // Status posts to (telegram, telegram:123). Then a kind='chat' delivers.
     // Cleanup must fire deleteMessage with the SAME route the status was
