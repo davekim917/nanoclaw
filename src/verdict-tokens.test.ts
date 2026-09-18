@@ -28,25 +28,21 @@ describe('humanizeVerdictTokens', () => {
     );
   });
 
-  it('does not touch fenced code blocks', () => {
-    const text = 'Verdict NO_GO\n```\nverdict=NO_GO\n`HUMAN_DECISION`\n```\nafter NO_GO\n```NO_GO```\nend NO_GO';
-    expect(humanizeVerdictTokens(text)).toBe(
-      'Verdict No-go\n```\nverdict=NO_GO\n`HUMAN_DECISION`\n```\nafter No-go\n```NO_GO```\nend No-go',
-    );
+  it('rewrites the parenthesised inline form with trailing punctuation', () => {
+    expect(humanizeVerdictTokens('Verdict (`NO_GO`).')).toBe('Verdict (No-go).');
   });
 
-  it('closes a fence only on the same char at least as long (CommonMark)', () => {
-    const tilde = '~~~\n```\nNO_GO\n~~~\nafter NO_GO';
-    expect(humanizeVerdictTokens(tilde)).toBe('~~~\n```\nNO_GO\n~~~\nafter No-go');
-    const four = '````md\n```\nNO_GO\n```\nNO_GO\n````\nafter NO_GO';
-    expect(humanizeVerdictTokens(four)).toBe('````md\n```\nNO_GO\n```\nNO_GO\n````\nafter No-go');
-    const crlf = '```\r\nNO_GO\r\n```\r\nNO_GO';
-    expect(humanizeVerdictTokens(crlf)).toBe('```\r\nNO_GO\r\n```\r\nNo-go');
-  });
-
-  it('leaves everything after an unterminated fence untouched', () => {
-    const text = 'NO_GO\n```\nNO_GO\nstill code NO_GO';
-    expect(humanizeVerdictTokens(text)).toBe('No-go\n```\nNO_GO\nstill code NO_GO');
+  it('rewrites nothing in a message that carries any fence-like run', () => {
+    const untouched = [
+      'Verdict NO_GO\n```\nverdict=NO_GO\n```',
+      '```NO_GO```',
+      '~~~\n```\nNO_GO\n~~~\nafter NO_GO',
+      '````md\n```\nNO_GO\n```\n````',
+      'NO_GO\n```\nunterminated NO_GO',
+      '- ```\n  NO_GO\n  ```',
+      '> ```\n> NO_GO\n> ```',
+    ];
+    for (const s of untouched) expect(humanizeVerdictTokens(s)).toBe(s);
   });
 
   it('does not touch URLs, paths, queries or identifiers containing a token', () => {
@@ -68,7 +64,12 @@ describe('humanizeVerdictTokens', () => {
       'lower no_go',
       '`NO_GO_REASON`',
       '`verdict NO_GO`',
-      '``NO_GO``',
+      '`NO_GO`/result',
+      'https://example.com/`NO_GO`',
+      'reports/`NO_GO`/result',
+      '`toString`',
+      '`__proto__`',
+      'toString __proto__ constructor',
     ];
     for (const s of untouched) expect(humanizeVerdictTokens(s)).toBe(s);
   });

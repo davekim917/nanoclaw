@@ -181,7 +181,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     await seedAgentAndChannel();
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutboundKind('ag-1', session.id, 'out-verdict', 'chat', 'telegram', 'telegram:123', {
-      text: 'Verdict: do not ship — `NO_GO`\n```\nNO_GO\n```',
+      text: 'Verdict: do not ship — `NO_GO` on a/NO_GO/b',
     });
     const calls: string[] = [];
     setDeliveryAdapter({
@@ -191,7 +191,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
       },
     });
     await deliverSessionMessages(session);
-    expect(calls.map((c) => JSON.parse(c).text)).toEqual(['Verdict: do not ship — No-go\n```\nNO_GO\n```']);
+    expect(calls.map((c) => JSON.parse(c).text)).toEqual(['Verdict: do not ship — No-go on a/NO_GO/b']);
   });
 
   it('deletes the orphan thinking-block on chat-final delivery, using the stored route', async () => {
