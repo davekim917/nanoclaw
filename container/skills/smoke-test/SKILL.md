@@ -584,9 +584,10 @@ never invalid). Pins guard against corruption and cross-campaign mix-ups, not a
 coordinator rewriting its own files; the challenger's `cmp` of run selection
 against gate pin, and its review of the dispositions, is the independence. No
 catalogue, or an ordinary (non-freeze) PR: no `journeys` key and no pin.
-**Activate a catalogue only with no PR campaign in flight**: a campaign whose
-lease predates it cannot be told from one whose obligations were dropped, and
-the barrier refuses its run until it is re-claimed. At intake:
+**Activate a catalogue, and deploy this version, only with no PR campaign in
+flight**: a pr contract written before campaign identity existed
+(`schemaVersion` 1, no `pr`/`repoSlug`) is refused by the barrier until a
+fenced `adopt` backfills it — never read as "no pin". At intake:
 
 1. `smoke-journeys.py pin-run <run-dir> <journeys.pinFile>` copies the pin and
    snapshot into `<run-dir>/journeys/`; workers and siblings read that copy,
@@ -644,9 +645,11 @@ recorded result under `<run-dir>/manual-results/`, filed against the journey id.
 `smoke-evidence-barrier.sh` enforces the **completeness** of all this — this
 campaign's own gate pin (repo + PR + head), whenever the gate pinned one, held
 byte-for-byte by the run (skipping `pin-run` is then a refusal, not a way out,
-and so, wherever a catalogue exists, is a pin or lease it cannot probe — it
-looks the pin up by the lease's repo + PR + head, never by listing), a lane
-per matched journey, a valid disposition per frozen path,
+and so is a pin it cannot probe, catalogue or not — unreachable shared
+storage is a retryable fail-closed refusal, since the run's markers needed
+that same storage; it looks the pin up by the contract's `pr` + `repoSlug` +
+`sourceSha`, never by listing, never through the lease), a lane per matched
+journey, a valid disposition per frozen path,
 the run's catalogue still hashing to its pin — and nothing about its truth.
 **Substance is the challenger's**: it reviews every exclusion and every
 backend/data scope disposition, and samples the positive matches — a broad glob

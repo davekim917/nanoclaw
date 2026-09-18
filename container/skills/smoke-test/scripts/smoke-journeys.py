@@ -838,60 +838,22 @@ def _run_file_ok(run_dir, rel):
 LEASE_RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
 
 
-def campaign_identity(lease_dir, run_id, head, env_slug):
-    """Who this run is, from gate-authored records read by EXACT path, never by
-    listing a directory (a listing that fails reads as "no pin", the one answer
-    that switches every journey check off):
-      head  the contract's sourceSha;
-      PR    the shared lease for THIS run directory's name, lease-<runId>.json
-            (smoke-pr-gate.sh lease_acquire writes it, the scaffold's PR fence
-            reads it before any contract exists);
-      repo  the lease's repoSlug (lease_acquire records it), else SMOKE_GATE_REPO
-            slugged the same way, backfilling a lease written before the field.
-    With identity complete, `owner` is locate_owner's verdict on the one
-    primary pin and its recovery twin. `unavailable` names a probe that failed;
-    an absent or malformed lease, or no repo from either source, leaves the
-    identity incomplete (`slug` None) and the caller decides what that means."""
-    out = {"lease": "absent", "leasePath": None, "pr": None, "slug": None, "slugSource": None,
-           "unavailable": None, "owner": None}
-    real, why = canonical_lease_dir(lease_dir)
-    if real is None:
-        out["unavailable"] = why
-        return out
-    if not LEASE_RUN_ID_RE.match(run_id or ""):
-        return out
-    lease_path = os.path.join(real, "lease-{}.json".format(run_id))
-    out["leasePath"] = lease_path
-    probe, why = _probe_path(lease_path)
-    if probe == "unavailable":
-        out["unavailable"] = "the shared lease {} could not be probed: {}".format(lease_path, why)
-        return out
-    if probe == "absent":
-        return out
-    if probe != "file":
-        out["lease"] = "malformed"
-        return out
-    try:
-        with open(lease_path, "rb") as fh:
-            lease = json.loads(fh.read().decode("utf-8"))
-    except OSError as exc:
-        out["unavailable"] = "the shared lease {} could not be read: {}".format(lease_path, exc)
-        return out
-    except (ValueError, UnicodeDecodeError):
-        out["lease"] = "malformed"
-        return out
-    pr = lease.get("pr") if isinstance(lease, dict) else None
-    if isinstance(pr, bool) or not isinstance(pr, int) or pr < 1:
-        out["lease"] = "malformed"
-        return out
-    out["lease"], out["pr"] = "found", pr
-    if _is_text(lease.get("repoSlug")):
-        out["slug"], out["slugSource"] = lease["repoSlug"], "lease"
-    elif _is_text(env_slug):
-        out["slug"], out["slugSource"] = env_slug, "env"
-    if out["slug"] is not None:
-        out["owner"] = locate_owner(real, out["slug"], pr, head)
-    return out
+def lease_binding(lease_dir, run_id):
+    """(pr, repoSlug) from the shared lease for this run directory's name, or
+    None. NOT an identity source -- the contract is (cmd_barrier) -- but an
+    extra check: a contract calling itself develop/task-owned while the lease,
+    when it still exists, binds that run id to a PR that has a pin is a
+    relabelled PR campaign. Unreadable or absent means "no extra check"."""
+    real, _ = canonical_lease_dir(lease_dir)
+    if real is None or not LEASE_RUN_ID_RE.match(run_id or ""):
+        return None
+    lease = _read_json(os.path.join(real, "lease-{}.json".format(run_id)))
+    if not isinstance(lease, dict):
+        return None
+    pr = lease.get("pr")
+    if isinstance(pr, bool) or not isinstance(pr, int) or pr < 1 or not _is_text(lease.get("repoSlug")):
+        return None
+    return pr, lease["repoSlug"]
 
 
 def cmd_barrier(args):
@@ -908,15 +870,32 @@ def cmd_barrier(args):
         reasons.append("{}: {}".format(label or rel, why))
 
     # Whether this run owes a journey selection, and WHAT it owes, are the
-    # gate's, found by the campaign's identity (campaign_identity) and probed by
-    # exact path (locate_owner): the owning pin is the primary if check_pin says
-    # valid, else the gate's recovery pin if valid, else nothing -- and nothing
-    # is a refusal. Two confirmed-absent paths are "no pin", the legacy answer,
-    # byte for byte. Every requirement below is read from that pin and its
-    # verified snapshot in the shared lease dir; the run's own copies are only
-    # compared against them.
+    # gate's, found by the campaign's identity and probed by exact path
+    # (locate_owner): the owning pin is the primary if check_pin says valid,
+    # else the gate's recovery pin if valid, else nothing -- and nothing is a
+    # refusal. Two confirmed-absent paths are "no pin", the legacy answer, byte
+    # for byte. Every requirement below is read from that pin and its verified
+    # snapshot in the shared lease dir; the run's own copies are only compared
+    # against them.
+    #
+    # THE IDENTITY IS THE CONTRACT'S: sourceSha (the head), pr and repoSlug,
+    # stamped by the scaffold under the gate's fence (smoke-run-scaffold.sh
+    # contract, schemaVersion 2) and never changed by adopt or --regenerate.
+    # Nothing here reads the lease for identity (finish/release delete it), a
+    # directory listing, or a local catalogue (a second coordinator may have
+    # none) -- each was a lifetime mismatch that read as "no pin". A pr
+    # contract without identity -- schemaVersion 1, or v2 missing a field -- is
+    # refused, never legacy: the deploy is timed with no PR campaign in flight,
+    # and fenced `adopt` backfills an in-flight one. DELIBERATE: a probe that
+    # failed (unreachable shared storage) refuses a pr contract with or without
+    # a catalogue; a PR run cannot have written its markers without that same
+    # storage, so this is a retryable fail-closed refusal.
     contract_rel = os.path.join(run_dir, "completion-contract.json")
-    is_pr = args.ownership == "pr"
+    contract = _read_json(contract_rel)
+    contract = contract if isinstance(contract, dict) else {}
+    ownership = contract.get("ownershipKind")
+    is_pr = ownership == "pr"
+    head = contract.get("sourceSha")
 
     def legacy():
         if os.path.exists(selection_path):
@@ -924,58 +903,42 @@ def cmd_barrier(args):
             emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
         emit({"applies": False, "missing": [], "invalid": [], "invalidReasons": []})
 
-    # JOURNEYS APPLY ONLY WHERE A CATALOGUE EXISTS -- at the path the gate reads
-    # (smoke-pr-gate.sh JOURNEYS_CATALOGUE), the same short-circuit the gate's
-    # journeys_select takes. Without one no pin can have been produced, so the
-    # legacy answer is given here, before the lease or the lease directory is
-    # touched at all: an ordinary run on a no-catalogue install needs nothing
-    # but its own artifacts, whatever shared storage is doing. Everything
-    # below -- unreachable storage, a failed probe, an identity that cannot be
-    # completed -- is a refusal ONLY under this one condition.
-    cat_probe, cat_why = _probe_path(args.catalogue) if args.catalogue else ("absent", None)
-    if cat_probe == "absent":
+    # Unconditional identity facts: the contract's runId is this run
+    # directory's own name (a borrowed runId borrows nothing), whenever the
+    # contract carries one -- always, for a pr contract.
+    contract_run_id = contract.get("runId")
+    if contract_run_id != args.run_id and (is_pr or contract_run_id is not None):
+        bad(contract_rel, "runId \"{}\" is not this run directory's name \"{}\" -- a contract naming another campaign's run would borrow its PR and pin; the scaffold writes the directory's own name".format(
+            contract_run_id if contract_run_id is not None else "", args.run_id), "completion-contract.json")
+        emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
+
+    if not is_pr:
+        # A relabelled PR campaign: the shared lease, while it exists, binds
+        # this run id to a PR whose pin exists. The lease supplies no identity
+        # otherwise, so its absence is simply "no extra check".
+        bound = lease_binding(args.lease_dir, args.run_id) if _is_text(head) else None
+        if bound is not None:
+            probe = locate_owner(args.lease_dir, bound[1], bound[0], head)
+            if probe["state"] in ("valid", "invalid"):
+                bad(contract_rel, "declares ownershipKind {} but the shared lease lease-{}.json binds this run to PR #{} -- a PR campaign cannot opt out of its journeys pin by relabelling its contract".format(
+                    ownership, args.run_id, bound[0]), "completion-contract.json")
+                emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
         legacy()
 
-    ident = campaign_identity(args.lease_dir, args.run_id, args.head, args.repo_slug or None)
-    owner = ident["owner"]
-    pin_state = owner["state"] if owner else "absent"
-
-    if is_pr and ident["unavailable"]:
-        # A probe that failed is no answer: the campaign may be pinned. With
-        # identity read by name this can no longer be caused by a lease dir
-        # that merely cannot be listed -- search permission is enough.
-        bad(sel_rel, "this pr-owned campaign's journeys pin could not be looked up ({}) -- an unreachable answer is no answer, not \"no pin\"; refusing rather than treating the campaign as unpinned".format(ident["unavailable"]))
+    pr, slug = contract.get("pr"), contract.get("repoSlug")
+    if contract.get("schemaVersion") != 2:
+        bad(contract_rel, "this pr contract predates campaign identity (schemaVersion {}) -- the barrier looks the campaign's journeys pin up by the contract's pr + repoSlug + sourceSha; adopt it (the scaffold backfills identity under the gate fence) or regenerate it".format(
+            contract.get("schemaVersion")), "completion-contract.json")
         emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
-    if is_pr and ident["slug"] is None:
-        # Identity incomplete: nothing can be probed, and this install keeps a
-        # catalogue, so an unpinned campaign cannot be told from one whose
-        # obligations were dropped: a pr-owned run is refused naming what is
-        # missing. Migration precondition, stated in SKILL.md: activate a
-        # catalogue only with no PR campaign in flight.
-        what = ("its shared lease {} is {}".format(ident["leasePath"], ident["lease"]) if ident["lease"] != "found"
-                else "its shared lease {} carries no repoSlug and SMOKE_GATE_REPO is unset".format(ident["leasePath"]))
-        if cat_probe == "unavailable":
-            what += "; and the catalogue {} could not be probed: {}".format(args.catalogue, cat_why)
-        bad(sel_rel, "this install keeps a journey catalogue ({}) but this pr-owned campaign's identity cannot be completed -- {} -- so its pin cannot be looked up and an unpinned campaign cannot be told from one whose obligations were dropped; a lease written by a gate that records repoSlug, or SMOKE_GATE_REPO in the barrier's environment, completes it".format(args.catalogue, what))
+    if isinstance(pr, bool) or not isinstance(pr, int) or pr < 1 or not _is_text(slug) or not (_is_text(head) and HEX40.match(head)):
+        bad(contract_rel, "this pr contract carries no complete campaign identity (pr={!r}, repoSlug={!r}) -- the scaffold stamps both under the gate fence; adopt or regenerate it".format(pr, slug), "completion-contract.json")
         emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
-    # Two cheap identity facts, checked whenever a pin exists for this campaign:
-    # the contract's runId must be this run directory's own name (the lease was
-    # read by that name, so a borrowed runId borrows nothing), and a contract
-    # calling itself develop/task-owned while the shared lease binds this run
-    # to a PR is refused.
-    if pin_state != "absent":
-        contract_doc = _read_json(contract_rel)
-        contract_run_id = contract_doc.get("runId") if isinstance(contract_doc, dict) else None
-        if contract_run_id != args.run_id:
-            bad(contract_rel, "runId \"{}\" is not this run directory's name \"{}\" -- a contract naming another campaign's run would borrow its PR and pin; the scaffold writes the directory's own name".format(
-                contract_run_id if contract_run_id is not None else "", args.run_id), "completion-contract.json")
-            emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
-        if not is_pr and pin_state in ("valid", "invalid"):
-            bad(contract_rel, "declares ownershipKind {} but the shared lease lease-{}.json binds this run to PR #{} -- a PR campaign cannot opt out of its journeys pin by relabelling its contract".format(
-                args.ownership, args.run_id, ident["pr"]), "completion-contract.json")
-            emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
-    if not is_pr or pin_state == "absent":
+    owner = locate_owner(args.lease_dir, slug, pr, head)
+    if owner["state"] == "absent":
         legacy()
+    if owner["state"] == "unavailable":
+        bad(sel_rel, "this campaign has no usable journeys pin: it could not be looked up ({}) -- an unreachable answer is no answer, not \"no pin\"; refusing rather than treating the campaign as unpinned (retry when the shared lease directory is reachable)".format(owner.get("reason")))
+        emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
     if owner["state"] != "valid":
         bad(sel_rel, "this campaign has no usable journeys pin ({}) -- nothing can say what the run owes, so nothing clears it; the gate does not offer a head in this state".format(
             owner.get("reason") or "primary {}, recovery {}".format(owner["primary"]["state"], owner["recovery"]["state"])))
@@ -1185,10 +1148,6 @@ def main():
     p.add_argument("run_dir")
     p.add_argument("--lease-dir", required=True)
     p.add_argument("--run-id", required=True)
-    p.add_argument("--ownership", default="")
-    p.add_argument("--head", required=True)
-    p.add_argument("--repo-slug", default="")
-    p.add_argument("--catalogue", default="")
 
     p = sub.add_parser("publish")
     p.add_argument("catalogue")
