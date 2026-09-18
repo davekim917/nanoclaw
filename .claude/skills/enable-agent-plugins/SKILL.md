@@ -12,11 +12,10 @@ automatic: missing manifests, the OpenCode skill mirror, and always-on activatio
 Codex/OpenCode. Hook delivery is **conditional, and the condition is the manifest**:
 Claude always fires a plugin's SessionStart hook, Codex fires it only for a plugin it
 can register — one shipping `.codex-plugin/plugin.json` that declares a hook — and
-OpenCode has no plugin loader, so no hook path at all. A Codex-registerable plugin
-that ships a standing directive but declares no hook still needs the operator
-override below. Check the manifest rather than assuming from the plugin: which
-of `~/plugins` sits in that shape changes as repos are re-packaged, and an
-example named here goes stale without anything failing.
+OpenCode has no plugin loader, so no hook path at all. Check a plugin's manifest
+rather than assuming from its name: which of `~/plugins` declares a hook changes
+as repos are re-packaged, and an example named here goes stale without anything
+failing.
 
 ## Scope: container agent groups only — never a host CLI
 
