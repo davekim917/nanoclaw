@@ -56,7 +56,7 @@ import { openInboundDb as openInboundDbAt } from '../../modules/mailbox/openers.
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { insertTaskRow } from '../scheduling/db.js';
 import { wakeContainer } from '../../container-runner.js';
-import { handleDispatchSupportIssue, handleUpdateSupportTicket } from './dispatch.js';
+import { handleDispatchSupportIssue, handleUpdateSupportTicket, TRIAGE_CATEGORIES } from './dispatch.js';
 
 // `session-manager`'s ids-addressed inbound opener went away with the mailbox
 // seam's raw wrappers (PR 7). Production code opens sessions through the seam;
@@ -291,18 +291,32 @@ describe('handleDispatchSupportIssue — classify-on-arrival triage', () => {
     expect(seeded[0].content).toContain('depletions are off');
   });
 
-  it('clamps out-of-range numbers instead of rendering them', async () => {
+  it('drops a triage with an out-of-range number, an unknown category, or an area on a general email', async () => {
     await seed();
     const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const bad = [
+      { ...TRIAGE, urgency: 9 },
+      { ...TRIAGE, escapedDefect: -3 },
+      { ...TRIAGE, category: 'close_ticket' },
+      { ...TRIAGE, areaType: 'general' },
+      { ...TRIAGE, areaConfidence: undefined },
+      { ...TRIAGE, product: 'Not A Key!' },
+    ];
+    for (const [i, triage] of bad.entries()) {
+      const id = `gthread-bad-${i}`;
+      await handleDispatchSupportIssue({ ...dispatchContent(id, 'still delivered'), triage }, poller);
+      const seeded = inboundOf((await getSupportThread(id))!.session_id!);
+      expect(seeded[0].content).not.toContain('Automatic triage');
+      expect(seeded[0].content).toContain('still delivered');
+    }
+  });
 
-    await handleDispatchSupportIssue(
-      { ...dispatchContent('gthread-C', 'x'), triage: { ...TRIAGE, urgency: 9, escapedDefect: -3 } },
-      poller,
-    );
-
-    const seeded = inboundOf((await getSupportThread('gthread-C'))!.session_id!);
-    expect(seeded[0].content).toContain('urgency 2.0/2');
-    expect(seeded[0].content).toContain('user-facing defect likelihood 0.00');
+  it('knows exactly the categories the container asks Jev for', () => {
+    const src = fs.readFileSync('container/agent-runner/src/mcp-tools/support-triage.ts', 'utf8');
+    const block = src.slice(src.indexOf('const CATEGORIES'), src.indexOf('};', src.indexOf('const CATEGORIES')));
+    const keys = [...block.matchAll(/^\s{2}([a-z_]+):/gm)].map((m) => m[1]);
+    expect(keys.length).toBeGreaterThan(0);
+    expect(new Set(keys)).toEqual(TRIAGE_CATEGORIES);
   });
 });
 

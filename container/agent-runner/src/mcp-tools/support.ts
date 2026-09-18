@@ -89,6 +89,9 @@ export async function handleDispatchSupportIssue(
     subject: args.subject as string,
     sender: args.sender as string,
     bodyText: args.bodyText as string,
+  }).catch((e: unknown) => {
+    log(`dispatch_support_issue: triage threw, dispatching without it: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
   });
 
   await writeSupportAction(

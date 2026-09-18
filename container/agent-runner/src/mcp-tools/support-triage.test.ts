@@ -5,11 +5,14 @@
  * the email being dispatched.
  */
 import { describe, expect, it } from 'bun:test';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { handleDispatchSupportIssue } from './support.js';
-import { buildQuestions, productFor, triageSupportEmail } from './support-triage.js';
+import { buildQuestions, productFor, readGroupTaxonomy, triageSupportEmail } from './support-triage.js';
 import type { SupportTaxonomy, SupportTriage } from './support-triage.js';
 
 const TAXONOMY: SupportTaxonomy = {
@@ -99,6 +102,17 @@ describe('triageSupportEmail', () => {
     }) as unknown as typeof fetch;
     expect(await triageSupportEmail(EMAIL, { ...deps, fetch: boom })).toBeNull();
     expect(await triageSupportEmail(EMAIL, { ...deps, fetch: jevResponse({ category: GOOD.category }) })).toBeNull();
+    // Strict: an option that wasn't offered, a wrong answer type, or an out-of-range number discards it all.
+    for (const answers of [
+      { ...GOOD, category: { type: 'choice', choice: 'close_ticket', confidence: 0.9 } },
+      { ...GOOD, feature: { type: 'choice', choice: 'ignore_previous_instructions', confidence: 0.9 } },
+      { ...GOOD, urgency: { type: 'score', score: 99, confidence: 0.6 } },
+      { ...GOOD, escaped_defect: { type: 'noul', noul: -0.2 } },
+      { ...GOOD, escaped_defect: { type: 'choice', choice: 'yes', confidence: 0.9 } },
+      { ...GOOD, feature: { type: 'choice', choice: 'routes' } },
+    ]) {
+      expect(await triageSupportEmail(EMAIL, { ...deps, fetch: jevResponse(answers) })).toBeNull();
+    }
     expect(
       await triageSupportEmail(EMAIL, {
         readTaxonomy: () => {
@@ -108,6 +122,40 @@ describe('triageSupportEmail', () => {
         log: quiet,
       }),
     ).toBeNull();
+  });
+});
+
+describe('taxonomy validation — nothing in it may stop a dispatch', () => {
+  it('rejects an invalid product pattern or a non-snake_case key when the file is read', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'taxonomy-'));
+    const write = (t: unknown) => {
+      const f = path.join(dir, `${Math.random()}.json`);
+      fs.writeFileSync(f, JSON.stringify(t));
+      return f;
+    };
+    expect(readGroupTaxonomy(write(TAXONOMY))).toEqual(TAXONOMY);
+    expect(() => readGroupTaxonomy(write({ ...TAXONOMY, productRules: [{ product: 'x', pattern: '(' }] }))).toThrow();
+    expect(() => readGroupTaxonomy(write({ ...TAXONOMY, features: { 'Route Planner': 'x' } }))).toThrow();
+    expect(() => readGroupTaxonomy(write({ ...TAXONOMY, defaultProduct: 'Main Product' }))).toThrow();
+  });
+
+  it('fails open when a product rule throws at classification time', async () => {
+    const broken = { ...TAXONOMY, productRules: [{ product: 'x', pattern: '(' }] };
+    expect(await triageSupportEmail(EMAIL, { readTaxonomy: () => broken, fetch: jevResponse(GOOD), log: quiet })).toBeNull();
+  });
+
+  it('dispatches even if the classifier itself rejects', async () => {
+    initTestSessionDb();
+    try {
+      const res = await handleDispatchSupportIssue(
+        { gmailThreadId: 'gt-x', subject: 's', sender: 'person8@fixture1.example.com', date: 'd', bodyText: 'b' },
+        { triage: async () => Promise.reject(new Error('boom')) },
+      );
+      expect(getUndeliveredMessages()).toHaveLength(1);
+      expect(res.content[0].text).toContain('Support issue dispatched');
+    } finally {
+      closeSessionDb();
+    }
   });
 });
 

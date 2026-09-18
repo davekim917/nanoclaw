@@ -146,9 +146,11 @@ function announcementText(
 /**
  * Classify-on-arrival hint from the container's `dispatch_support_issue`
  * (container/agent-runner/src/mcp-tools/support-triage.ts). It is container-
- * supplied content, so only known fields of the right shape survive: option
- * keys are short snake_case tokens, numbers are clamped. Anything else drops the
- * whole hint — the email still dispatches exactly as without it.
+ * supplied content, so it is validated strictly: the category must be one of
+ * the fixed categories the container asks (TRIAGE_CATEGORIES, kept in step with
+ * that file's CATEGORIES), option keys are short snake_case tokens, a general
+ * email carries no area, and every number must already be in range. Anything
+ * else drops the whole hint — the email still dispatches exactly as without it.
  */
 export interface SupportTriageView {
   product: string | null;
@@ -163,8 +165,20 @@ export interface SupportTriageView {
 
 const TRIAGE_KEY = /^[a-z0-9_]{1,40}$/;
 
-function clampNum(v: unknown, max: number): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? Math.min(Math.max(v, 0), max) : null;
+export const TRIAGE_CATEGORIES = new Set([
+  'bug',
+  'question',
+  'access_request',
+  'data_request',
+  'feature_request',
+  'follow_up',
+  'acknowledgement',
+  'automated_notice',
+]);
+
+/** A number already inside [0, max], or null — out of range is malformed, never clamped. */
+function inRange(v: unknown, max: number): number | null {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= max ? v : null;
 }
 
 function triageKey(v: unknown): string | null {
@@ -176,22 +190,24 @@ export function supportTriage(raw: unknown): SupportTriageView | null {
   const t = raw as Record<string, unknown>;
   const areaType = t.areaType;
   if (areaType !== 'feature' && areaType !== 'process' && areaType !== 'general') return null;
-  const category = triageKey(t.category);
-  const categoryConfidence = clampNum(t.categoryConfidence, 1);
-  const urgency = clampNum(t.urgency, 2);
-  const escapedDefect = clampNum(t.escapedDefect, 1);
+  const category = typeof t.category === 'string' && TRIAGE_CATEGORIES.has(t.category) ? t.category : null;
+  const categoryConfidence = inRange(t.categoryConfidence, 1);
+  const urgency = inRange(t.urgency, 2);
+  const escapedDefect = inRange(t.escapedDefect, 1);
   if (!category || categoryConfidence === null || urgency === null || escapedDefect === null) return null;
-  const area = t.area === null ? null : triageKey(t.area);
-  return {
-    product: t.product === null ? null : triageKey(t.product),
-    areaType,
-    area,
-    areaConfidence: area ? (clampNum(t.areaConfidence, 1) ?? 0) : 0,
-    category,
-    categoryConfidence,
-    urgency,
-    escapedDefect,
-  };
+
+  const product = t.product === null ? null : triageKey(t.product);
+  if (t.product !== null && product === null) return null;
+
+  let area: string | null = null;
+  let areaConfidence = 0;
+  if (t.area !== null) {
+    area = triageKey(t.area);
+    const confidence = inRange(t.areaConfidence, 1);
+    if (!area || areaType === 'general' || confidence === null) return null;
+    areaConfidence = confidence;
+  }
+  return { product, areaType, area, areaConfidence, category, categoryConfidence, urgency, escapedDefect };
 }
 
 function triageArea(t: SupportTriageView): string {

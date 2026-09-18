@@ -83,14 +83,29 @@ export function readGroupTaxonomy(path: string = TAXONOMY_PATH): SupportTaxonomy
   if (!isOptionMap(parsed.features) || !isOptionMap(parsed.processes)) {
     throw new Error(`${path}: "features" and "processes" must be non-empty maps of option → description`);
   }
+  const rules: unknown = parsed.productRules ?? [];
+  if (!Array.isArray(rules)) throw new Error(`${path}: "productRules" must be an array`);
+  for (const rule of rules as { product?: unknown; pattern?: unknown }[]) {
+    if (!rule || typeof rule.product !== 'string' || !OPTION_KEY.test(rule.product) || typeof rule.pattern !== 'string') {
+      throw new Error(`${path}: each product rule needs a snake_case "product" and a string "pattern"`);
+    }
+    new RegExp(rule.pattern, 'i'); // an invalid pattern throws here, where the caller fails open
+  }
+  if (parsed.defaultProduct !== undefined && !OPTION_KEY.test(String(parsed.defaultProduct))) {
+    throw new Error(`${path}: "defaultProduct" must be a snake_case key`);
+  }
   return parsed;
 }
+
+/** Option keys reach the host, the agent's context and Slack; the host enforces the same shape. */
+const OPTION_KEY = /^[a-z0-9_]{1,40}$/;
 
 function isOptionMap(v: unknown): v is Record<string, string> {
   return (
     !!v &&
     typeof v === 'object' &&
     Object.keys(v).length > 0 &&
+    Object.keys(v).every((k) => OPTION_KEY.test(k)) &&
     Object.values(v as object).every((d) => typeof d === 'string')
   );
 }
@@ -151,33 +166,56 @@ export function buildQuestions(taxonomy: SupportTaxonomy): Record<string, unknow
   };
 }
 
+/** A number inside [0, max], or null. Out of range is malformed, not something to clamp. */
 function num(v: unknown, max: number): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? Math.min(Math.max(v, 0), max) : null;
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= max ? v : null;
 }
 
-export function parseTriage(answers: Record<string, JevAnswer>, product: string | null): SupportTriage | null {
-  const areaType = answers.area_type?.choice;
-  const category = answers.category?.choice;
-  const urgency = num(answers.urgency?.score, 2);
-  const escaped = num(answers.escaped_defect?.noul, 1);
+/** The chosen option, only if it is one of the options asked. */
+function chosen(answer: JevAnswer | undefined, type: string, options: Record<string, string>): string | null {
+  return answer?.type === type && typeof answer.choice === 'string' && Object.hasOwn(options, answer.choice)
+    ? answer.choice
+    : null;
+}
+
+/**
+ * Strict: any answer of the wrong type, an option that wasn't offered, or a
+ * number out of range discards the whole triage (fail-open), rather than
+ * passing a partial or repaired hint downstream.
+ */
+export function parseTriage(
+  answers: Record<string, JevAnswer>,
+  product: string | null,
+  taxonomy: SupportTaxonomy,
+): SupportTriage | null {
+  const areaType = chosen(answers.area_type, 'choice', { feature: '', process: '', general: '' }) as
+    | SupportTriage['areaType']
+    | null;
+  const category = chosen(answers.category, 'choice', CATEGORIES);
+  const urgency = answers.urgency?.type === 'score' ? num(answers.urgency.score, 2) : null;
+  const escaped = answers.escaped_defect?.type === 'noul' ? num(answers.escaped_defect.noul, 1) : null;
   const categoryConfidence = num(answers.category?.confidence, 1);
-  if (
-    (areaType !== 'feature' && areaType !== 'process' && areaType !== 'general') ||
-    typeof category !== 'string' ||
-    urgency === null ||
-    escaped === null ||
-    categoryConfidence === null
-  ) {
-    return null;
+  if (!areaType || !category || urgency === null || escaped === null || categoryConfidence === null) return null;
+
+  let area: string | null = null;
+  let areaConfidence = 0;
+  if (areaType !== 'general') {
+    const options = areaType === 'feature' ? taxonomy.features : taxonomy.processes;
+    const pick = chosen(answers[areaType], 'choice', withNone(options, ''));
+    if (!pick) return null;
+    if (pick !== 'none') {
+      const confidence = num(answers[areaType]?.confidence, 1);
+      if (confidence === null) return null;
+      area = pick;
+      areaConfidence = confidence;
+    }
   }
-  const areaAnswer = areaType === 'general' ? undefined : answers[areaType];
-  const area = areaAnswer?.choice && areaAnswer.choice !== 'none' ? areaAnswer.choice : null;
   return {
     model: TRIAGE_MODEL,
     product,
     areaType,
     area,
-    areaConfidence: area ? (num(areaAnswer?.confidence, 1) ?? 0) : 0,
+    areaConfidence,
     category,
     categoryConfidence,
     urgency,
@@ -199,18 +237,15 @@ export async function triageSupportEmail(
   }
   if (!taxonomy) return null;
 
-  const text = `${email.subject}\n${email.bodyText}`;
-  const product = productFor(taxonomy, text);
-  const body = JSON.stringify({
-    model: TRIAGE_MODEL,
-    state: {
-      subject: email.subject,
-      sender: email.sender,
-      email: email.bodyText.slice(0, MAX_EMAIL_CHARS),
-    },
-    questions: buildQuestions(taxonomy),
-  });
   try {
+    // Inside the try: nothing about this email or this taxonomy may stop the dispatch.
+    const bodyText = email.bodyText.slice(0, MAX_EMAIL_CHARS);
+    const product = productFor(taxonomy, `${email.subject}\n${bodyText}`);
+    const body = JSON.stringify({
+      model: TRIAGE_MODEL,
+      state: { subject: email.subject, sender: email.sender, email: bodyText },
+      questions: buildQuestions(taxonomy),
+    });
     const res = await (deps.fetch ?? fetch)(ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -222,11 +257,11 @@ export async function triageSupportEmail(
       return null;
     }
     const out = (await res.json()) as { answers?: Record<string, JevAnswer> };
-    const triage = parseTriage(out.answers ?? {}, product);
+    const triage = parseTriage(out.answers ?? {}, product, taxonomy);
     if (!triage) log('Jev answer malformed; dispatching without triage');
     return triage;
   } catch (e) {
-    log(`Jev unreachable (${e instanceof Error ? e.name : 'error'}); dispatching without triage`);
+    log(`triage failed (${e instanceof Error ? e.name : 'error'}); dispatching without triage`);
     return null;
   }
 }
