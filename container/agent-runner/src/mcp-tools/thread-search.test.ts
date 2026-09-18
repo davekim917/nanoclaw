@@ -298,6 +298,34 @@ describe('thread-search workgroup-pooled tests', () => {
     expect(text).toContain('3 match(es)');
   });
 
+  it('reads a thread across sibling adapters, and never across platforms', async () => {
+    const rows: [string, string, string][] = [
+      ['slack-acme', 'user', 'can someone check the deploy'],
+      ['slack-acme-codex', 'assistant', 'codex sibling: deploy is green'],
+      ['discord', 'assistant', 'unrelated discord message with a colliding id'],
+    ];
+    for (const [i, [channelType, role, text]] of rows.entries()) {
+      insertMsg(sharedDb, {
+        id: `msg-fam-${i}`,
+        agent_group_id: `ag-fam-${i}`,
+        channel_type: channelType,
+        platform_id: 'slack:C901',
+        thread_id: 'slack:C901:t1',
+        role,
+        sender_name: `s${i}`,
+        text,
+        sent_at: `2024-01-05T08:0${i}:00Z`,
+      });
+    }
+
+    const text = getText(
+      await readThreadTool.handler({ channel_type: 'slack-acme', platform_id: 'slack:C901', thread_id: 'slack:C901:t1' }),
+    );
+    expect(text).toContain('can someone check the deploy');
+    expect(text).toContain('codex sibling: deploy is green');
+    expect(text).not.toContain('unrelated discord message');
+  });
+
   // -----------------------------------------------------------------------
   // D2.3: read_thread returns messages from both sibling agent_groups
   // -----------------------------------------------------------------------

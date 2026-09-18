@@ -382,16 +382,22 @@ export const readThreadTool: McpToolDefinition = {
       );
     }
 
+    // Sibling agents in a workgroup archive the same channel under their own
+    // adapter's channel_type (slack-<group>). Match the whole platform family
+    // so the transcript includes every sibling's rows, not only this copy.
+    const family = routing.channelType.split('-')[0];
+    const familyLike = `${family}-%`;
+
     let resolvedThreadId = threadId;
     if (!resolvedThreadId) {
       try {
         const latest = db
           .prepare(
             `SELECT thread_id FROM messages_archive
-             WHERE channel_type = ? AND platform_id = ?
+             WHERE (channel_type = ? OR channel_type LIKE ?) AND platform_id = ?
              ORDER BY sent_at DESC LIMIT 1`,
           )
-          .get(routing.channelType, routing.platformId) as { thread_id: string | null } | undefined;
+          .get(family, familyLike, routing.platformId) as { thread_id: string | null } | undefined;
         resolvedThreadId = latest?.thread_id ?? null;
       } catch (e) {
         return err(`thread lookup failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -404,13 +410,13 @@ export const readThreadTool: McpToolDefinition = {
         .prepare(
           `SELECT role, sender_name, text, sent_at, channel_name
            FROM messages_archive
-           WHERE channel_type = ?
+           WHERE (channel_type = ? OR channel_type LIKE ?)
              AND platform_id = ?
              AND (thread_id = ? OR (thread_id IS NULL AND ? IS NULL))
            ORDER BY sent_at ASC
            LIMIT ?`,
         )
-        .all(routing.channelType, routing.platformId, resolvedThreadId, resolvedThreadId, limit) as TranscriptRow[];
+        .all(family, familyLike, routing.platformId, resolvedThreadId, resolvedThreadId, limit) as TranscriptRow[];
     } catch (e) {
       return err(`lookup failed: ${e instanceof Error ? e.message : String(e)}`);
     }
