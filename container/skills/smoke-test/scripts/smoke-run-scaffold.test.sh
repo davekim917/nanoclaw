@@ -34,7 +34,7 @@ gate_owns() {
   expires="$(date -u -d '@'$(( $(date -u +%s) + 3600 )) +'%Y-%m-%dT%H:%M:%SZ')"
   printf '{"schemaVersion":1,"pr":5,"activeRunId":"%s","activeSha":"%s","activeLeaseOwner":"%s"}\n' \
     "$run" "$active_sha" "$owner" > "$GATE_STATE/pr-5-state.json"
-  printf '{"schemaVersion":1,"pr":5,"owner":"%s","claimedAt":"%s","renewedAt":"%s","expiresAt":"%s"}\n' \
+  printf '{"schemaVersion":1,"pr":5,"owner":"%s","claimedAt":"%s","renewedAt":"%s","expiresAt":"%s","repoSlug":"org__repo"}\n' \
     "$owner" "$now" "$now" "$expires" > "$SMOKE_GATE_LEASE_DIR/lease-$run.json"
   printf '{"schemaVersion":1,"pr":5,"runId":"%s","owner":"%s","boundAt":"%s"}\n' \
     "$run" "$owner" "$now" > "$SMOKE_GATE_LEASE_DIR/pr-5-authority.json"
@@ -61,7 +61,8 @@ SMOKE_CONTRACT_EXTRA='{"environment":"https://dev.example","leasePolicy":"one at
 # The generated contract must satisfy the barrier's schema AND keep the richer
 # fields real runs read — the two shapes that drifted apart are now one file.
 jq -e '
-  .schemaVersion == 1 and
+  .schemaVersion == 2 and
+  .pr == 5 and .repoSlug == "org__repo" and
   (.requiredLaneMarkers | sort == ["markers/B1.json","markers/S1.json"]) and
   (.lanes | length == 2) and
   .markerDir == "markers" and
@@ -69,12 +70,14 @@ jq -e '
   .leasePolicy == "one at a time"
 ' "$FIXTURE_DIR/completion-contract.json" >/dev/null
 
-# Deployment extras must never be able to forge the fields the barrier checks.
-# (`--regenerate` because this is a deliberate same-SHA rewrite of a contract
-# that already exists — the re-scaffold guard refuses one without it.)
-SMOKE_CONTRACT_EXTRA="{\"sourceSha\":\"$OTHER_SHA\",\"requiredLaneMarkers\":[]}" \
+# Deployment extras must never be able to forge the fields the barrier checks
+# — the campaign identity included. (`--regenerate` because this is a
+# deliberate same-SHA rewrite of a contract that already exists — the
+# re-scaffold guard refuses one without it.)
+SMOKE_CONTRACT_EXTRA="{\"sourceSha\":\"$OTHER_SHA\",\"requiredLaneMarkers\":[],\"pr\":9,\"repoSlug\":\"evil__repo\",\"schemaVersion\":1}" \
   scaffold contract "$FIXTURE_DIR" "$SHA" B1:browser S1:source --regenerate >/dev/null
-jq -e --arg sha "$SHA" '.sourceSha == $sha and (.requiredLaneMarkers | length == 2)' \
+jq -e --arg sha "$SHA" '.sourceSha == $sha and (.requiredLaneMarkers | length == 2) and
+  .schemaVersion == 2 and .pr == 5 and .repoSlug == "org__repo"' \
   "$FIXTURE_DIR/completion-contract.json" >/dev/null
 
 # Valid JSON with an invalid UTC timestamp is not a usable shared lease.
@@ -826,6 +829,60 @@ jq -e '(.lanes[] | select(.id == "F1") | .evidence) == "api"' "$EVID_RUN/complet
 
 # Resume the ordinary fixture as its original owner, in case anything is ever
 # appended after this block.
+gate_owns "$(basename "$FIXTURE_DIR")"
+
+# --- Campaign identity lives in the fenced contract ---------------------------
+# The barrier looks a pr campaign's journeys pin up by the contract's
+# pr + repoSlug + sourceSha alone, so the scaffold stamps both under the gate
+# fence — pr from the fenced state, repoSlug from the gate's lease else
+# SMOKE_GATE_REPO normalized as journeys_repo_slug — and never lets them change.
+IDENT="$FIXTURE_BASE/run-ident"; mkdir -p "$IDENT"
+gate_owns "$(basename "$IDENT")"
+scaffold contract "$IDENT" "$SHA" B1:browser | jq -e '.ok == true' >/dev/null
+jq -e '.schemaVersion == 2 and .pr == 5 and .repoSlug == "org__repo"' "$IDENT/completion-contract.json" >/dev/null
+# Conflicting sources (lease vs env) are refused; neither source is refused.
+OUT="$(SMOKE_GATE_REPO=other/fork scaffold contract "$IDENT" "$SHA" B1:browser --regenerate 2>&1 || true)"
+jq -e '.ok == false and (.error | test("repo identity conflicts") and test("other__fork"))' <<<"$OUT" >/dev/null || {
+  echo "expected a lease/env repo conflict to be refused, got: $OUT" >&2; exit 1; }
+jq 'del(.repoSlug)' "$SMOKE_GATE_LEASE_DIR/lease-$(basename "$IDENT").json" > "$SMOKE_GATE_LEASE_DIR/.noslug"
+mv "$SMOKE_GATE_LEASE_DIR/.noslug" "$SMOKE_GATE_LEASE_DIR/lease-$(basename "$IDENT").json"
+OUT="$(scaffold contract "$IDENT" "$SHA" B1:browser --regenerate 2>&1 || true)"
+jq -e '.ok == false and (.error | test("repo identity is unknown") and test("SMOKE_GATE_REPO"))' <<<"$OUT" >/dev/null || {
+  echo "expected a contract with no repo identity to be refused, got: $OUT" >&2; exit 1; }
+# ...and the environment backfills a lease written before repoSlug existed.
+SMOKE_GATE_REPO=org/repo scaffold contract "$IDENT" "$SHA" B1:browser --regenerate | jq -e '.ok == true' >/dev/null
+jq -e '.repoSlug == "org__repo" and .pr == 5' "$IDENT/completion-contract.json" >/dev/null
+gate_owns "$(basename "$IDENT")"
+# Identity never changes: a rewrite or an adoption onto a contract naming
+# another repo or PR is refused.
+jq '.repoSlug = "other__fork"' "$IDENT/completion-contract.json" > "$IDENT/.c"; mv "$IDENT/.c" "$IDENT/completion-contract.json"
+OUT="$(scaffold contract "$IDENT" "$SHA" B1:browser --regenerate 2>&1 || true)"
+jq -e '.ok == false and (.error | test("bound to repo other__fork") and test("never changes"))' <<<"$OUT" >/dev/null || {
+  echo "expected a regenerate over another repo's contract to be refused, got: $OUT" >&2; exit 1; }
+gate_owns "$(basename "$IDENT")" "$SHA" owner-z   # the gate recovered the slot to a successor...
+OUT="$(SMOKE_GATE_OWNER=owner-z scaffold adopt "$IDENT" "$SHA" 2>&1 || true)"
+jq -e '.ok == false and (.error | test("bound to repo other__fork"))' <<<"$OUT" >/dev/null || {
+  echo "expected an adoption onto another repo's contract to be refused, got: $OUT" >&2; exit 1; }
+gate_owns "$(basename "$IDENT")"                   # ...and back to the original owner
+jq '.repoSlug = "org__repo" | .pr = 6' "$IDENT/completion-contract.json" > "$IDENT/.c"; mv "$IDENT/.c" "$IDENT/completion-contract.json"
+OUT="$(scaffold contract "$IDENT" "$SHA" B1:browser --regenerate 2>&1 || true)"
+jq -e '.ok == false and (.error | test("bound to PR #6, not #5"))' <<<"$OUT" >/dev/null || {
+  echo "expected a regenerate over another PR's contract to be refused, got: $OUT" >&2; exit 1; }
+# A contract that predates campaign identity (schemaVersion 1, no pr/repoSlug)
+# is backfilled by a fenced adoption — the already-owner retry included — so
+# an in-flight run is recovered with its evidence, not regenerated.
+jq '.schemaVersion = 1 | del(.pr) | del(.repoSlug)' "$IDENT/completion-contract.json" > "$IDENT/.c"; mv "$IDENT/.c" "$IDENT/completion-contract.json"
+scaffold marker "$IDENT" B1 fail 'before identity' | jq -e '.ok == true' >/dev/null
+scaffold adopt "$IDENT" "$SHA" | jq -e '.ok == true and .adopted == false and .alreadyOwner == true and .identityBackfilled == true' >/dev/null
+jq -e '.schemaVersion == 2 and .pr == 5 and .repoSlug == "org__repo" and ((.ownerAdoptions // []) | length == 0)' "$IDENT/completion-contract.json" >/dev/null
+scaffold adopt "$IDENT" "$SHA" | jq -e '.ok == true and .alreadyOwner == true and .identityBackfilled == false' >/dev/null
+jq '.schemaVersion = 1 | del(.pr) | del(.repoSlug)' "$IDENT/completion-contract.json" > "$IDENT/.c"; mv "$IDENT/.c" "$IDENT/completion-contract.json"
+gate_owns "$(basename "$IDENT")" "$SHA" owner-successor
+SMOKE_GATE_OWNER=owner-successor scaffold adopt "$IDENT" "$SHA" |
+  jq -e '.ok == true and .adopted == true and .identityBackfilled == true and .adoptionCount == 1' >/dev/null
+jq -e '.schemaVersion == 2 and .pr == 5 and .repoSlug == "org__repo" and .coordinatorOwnerToken == "owner-successor"' "$IDENT/completion-contract.json" >/dev/null
+jq -e '.status == "fail"' "$IDENT/markers/B1.json" >/dev/null   # the evidence survived
+SMOKE_GATE_OWNER=owner-successor barrier "$IDENT" lanes | jq -e '.ready == true' >/dev/null
 gate_owns "$(basename "$FIXTURE_DIR")"
 
 echo "smoke run scaffold tests passed"

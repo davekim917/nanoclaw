@@ -39,6 +39,12 @@ set -u
 [ -n "${STUB_BRANCH_EXISTS+x}" ] || STUB_BRANCH_EXISTS=false
 [ -n "${STUB_PR_LIST_EXIT+x}" ] || STUB_PR_LIST_EXIT=0
 [ -n "${STUB_PR_FILES_EXIT+x}" ] || STUB_PR_FILES_EXIT=0
+# The head commit itself (freeze_head_probe): parent from STUB_PARENT_BY_COMMIT /
+# STUB_PARENT_SHA, files per sha from STUB_COMMIT_FILES_BY_SHA, else the PR's
+# file list (and its exit code) — so every fixture that describes a freeze by
+# STUB_PR_FILES still describes its head that way.
+[ -n "${STUB_COMMIT_FILES_BY_SHA+x}" ] || STUB_COMMIT_FILES_BY_SHA='{}'
+[ -n "${STUB_COMMIT_GET_EXIT+x}" ] || STUB_COMMIT_GET_EXIT=0
 [ -n "${STUB_COMPARE_FILES+x}" ] || STUB_COMPARE_FILES='{"files":[]}'
 [ -n "${STUB_COMPARE_EXIT+x}" ] || STUB_COMPARE_EXIT=0
 # Freeze-campaign baseline binding (resolve_campaign_baseline): a ledger GO's
@@ -104,6 +110,22 @@ case "$1" in
         printf '%s' "$MAPPED"; exit 0
       fi
       printf '%s' "$STUB_PARENT_SHA"; exit 0
+    fi
+    if printf '%s' "$P" | grep -qE '^repos/[^/]+/[^/]+/commits/[0-9a-f]{40}$' && [ "$#" -eq 2 ]; then
+      C="${P##*/commits/}"
+      [ "$STUB_COMMIT_GET_EXIT" = 0 ] || exit "$STUB_COMMIT_GET_EXIT"
+      PARENT="$(jq -r --arg c "$C" '.[$c] // empty' <<<"$STUB_PARENT_BY_COMMIT")"
+      [ -n "$PARENT" ] || PARENT="$STUB_PARENT_SHA"
+      FILES="$(jq -c --arg c "$C" '.[$c] // empty' <<<"$STUB_COMMIT_FILES_BY_SHA")"
+      if [ -z "$FILES" ]; then
+        [ "$STUB_PR_FILES_EXIT" = 0 ] || exit "$STUB_PR_FILES_EXIT"
+        FILES="$STUB_PR_FILES"
+      fi
+      # The real endpoint always carries a per-file `status`; a fixture that
+      # names files only means "added" (a freeze's own shape).
+      # A comma-separated parent value serves a merge commit (several parents).
+      jq -cn --arg c "$C" --arg p "$PARENT" --argjson files "$FILES" \
+        '{sha:$c, parents:(if $p == "" then [] else ($p | split(",") | map({sha:.})) end), files:($files | map({status:"added"} + .))}'; exit 0
     fi
     if printf '%s' "$*" | grep -qF '.head.sha'; then
       [ "$STUB_BINDING_EXIT" = 0 ] || exit "$STUB_BINDING_EXIT"
@@ -294,7 +316,7 @@ reset_stubs() {
         STUB_RUN_LIST_SEQUENCE_FILE STUB_RUN_LIST_SEQUENCE_COUNT STUB_PARENT_SHA \
         STUB_COMMIT_TREE STUB_BLOB_RESPONSE STUB_TREE_RESPONSE STUB_COMMIT_RESPONSE \
         STUB_REF_RESPONSE STUB_REF_EXIT STUB_BRANCH_EXISTS STUB_PR_LIST_EXIT \
-        STUB_PR_FILES_EXIT STUB_PR_CREATE_EXIT STUB_NEW_PR_NUMBER STUB_SUSPEND_CODE \
+        STUB_PR_FILES_EXIT STUB_COMMIT_FILES_BY_SHA STUB_COMMIT_GET_EXIT STUB_PR_CREATE_EXIT STUB_NEW_PR_NUMBER STUB_SUSPEND_CODE \
         STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS STUB_DEPLOYS_BY_SERVICE_JSON \
         STUB_COMPARE_FILES STUB_COMPARE_EXIT STUB_LOCK_PROBE STUB_LOCK_PROBE_FILE \
         STUB_PARENT_BY_COMMIT STUB_PULL_HEADS STUB_BINDING_EXIT STUB_COMPARE_LOG \
@@ -726,14 +748,19 @@ bash "$GATE" check 10 | jq -e '.settled == false and .frontendReady == false' >/
 export STUB_FRONTEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$FREEZE_SHA\"}}]"
 export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"failure\",\"workflowName\":\"CI\"}]"
 bash "$GATE" check 10 | jq -e '.settled == false and .ciReady == false' >/dev/null
-# Missing target identity: still fetchOk:false, still never settles.
+# Missing target identity: still fetchOk:false, still never settles. The
+# head commit is the one record that says what a head is (freeze_head_probe:
+# its files AND its parent come from the same response), so "the target
+# cannot be determined" means that commit could not be read at all — nothing
+# is known, not even that this is a freeze — and a commit with no parent is a
+# root commit, not a freeze.
 export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
-export STUB_PARENT_SHA=''
+export STUB_COMMIT_GET_EXIT=1
 bash "$GATE" check 10 | jq -e '
-  .settled == false and .fetchOk == false and .ciSha == null and
-  .campaignRange.targetSha == null and .campaignRange.determinable == false and
-  .migrationsInRange == null and .campaignSize == "full"
+  .settled == false and .fetchOk == false and .isFreezePr == false and (has("campaignRange") | not)
 ' >/dev/null
+unset STUB_COMMIT_GET_EXIT
+export STUB_PARENT_SHA=''
 
 # --- 5b. An unreadable range is UNKNOWN, never "no migrations" — and it no
 # longer poisons readiness. Before, a failed compare cleared fetchOk, which
@@ -1393,6 +1420,7 @@ unset -f recover_run pin_file
 # beside the range pin, by the same immutable primitives.
 jpin_file() { printf '%s/journeys-pin-org__repo-pr-%s-%s.json' "$SMOKE_GATE_LEASE_DIR" "$1" "$2"; }
 JOURNEYS_EXAMPLE="$SCRIPT_DIR/../references/journeys.example.json"
+REAL_PYTHON3="$(command -v python3)"; export REAL_PYTHON3
 journeys_fixture() { # <compare-files-json>; one ready freeze (PR 13) with a validated baseline
   fresh_state
   export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
@@ -1420,6 +1448,28 @@ export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/journeys.json"
 T5K_WITH="$(bash "$GATE" check 13)"
 [ "$(jq -c 'del(.journeys)' <<<"$T5K_WITH")" = "$T5K_ABSENT" ] ||
   { echo "5k: a catalogue changed facts other than .journeys" >&2; exit 1; }
+
+# ...and with no catalogue and nothing at either pin path, no checker even runs:
+# a pin-check that would crash changes nothing (byte-identical), whereas a stray
+# pin with no catalogue is still judged.
+cat > "$STUB_BIN/python3" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in *"smoke-journeys.py pin-check "*) [ -z "${STUB_PINCHECK_FAIL:-}" ] || exit 70 ;; esac
+exec /usr/bin/env -u STUB_PINCHECK_FAIL "$REAL_PYTHON3" "$@"
+STUB
+chmod +x "$STUB_BIN/python3"
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/no-such-journeys.json" STUB_PINCHECK_FAIL=1
+[ "$(bash "$GATE" check 13)" = "$T5K_ABSENT" ] || { echo "5k: a crashing pin checker changed the no-catalogue facts" >&2; exit 1; }
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and (.data | has("journeys") | not)' >/dev/null ||
+  { echo "5k: a crashing pin checker made a no-catalogue freeze unofferable" >&2; exit 1; }
+unset STUB_PINCHECK_FAIL; rm -f "$STUB_BIN/python3"
+journeys_fixture "$BACKEND_ONLY"
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/no-such-journeys.json"
+mkdir -p "$SMOKE_GATE_LEASE_DIR"; printf '{"pinned":true,"matchedJourneys":[],"unmappedPaths":[]}' > "$(jpin_file 13 "$FREEZE_SHA")"
+range_case 5k-stray-pin-no-catalogue '.journeys.pinState == "invalid" and (.journeys.reason | test("no journey catalogue is configured"))'
+journeys_fixture "$BACKEND_ONLY"
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/journeys.json"
+T5K_WITH="$(bash "$GATE" check 13)"
 
 # A BACKEND-ONLY change selects its unchanged UI consumer up front; the path
 # nothing claims is listed; the infra exclusion is visible. `check` never pins.
@@ -1481,28 +1531,115 @@ range_case 5k-pinned-paths '.campaignRange.baselinePinned == true and .journeys.
   [.journeys.matchedJourneys[] | select(.reason == "changed") | .id] == ["loan-desk-checkout"] and
   .journeys.unmappedPaths == ["api/src/reports/export.ts"]'
 
-# INVALID IS NOT ABSENT: anything at the pin's path that is not a well-formed
-# pin means the selection is unrecoverable — `full`, said why, still OFFERED,
-# and never recomputed over, replaced or written through.
-for T5K_KIND in truncated dangling directory; do
+# INVALID IS NOT ABSENT, and RECOVERY IS THE GATE'S. Anything at the primary
+# pin's path that the one predicate refuses — truncated, a symlink, a
+# directory, or well-formed-looking bytes with no identity or snapshot — means
+# its scope is unrecoverable. The gate then computes a recovery selection
+# (every catalogue journey owed, the pinned range's unclaimed paths kept) and
+# promotes it ONCE as a second immutable shared file; the bad primary is never
+# recomputed over, replaced or written through.
+rpin_file() { printf '%s' "$(jpin_file "$1" "$2" | sed 's/\.json$/-recovery.json/')"; }
+T5K_ALL_RECOVERED='[.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"pin-recovered"},{"id":"branch-scope-crossing","reason":"pin-recovered"},{"id":"mobile-scan-return","reason":"pin-recovered"}]'
+for T5K_KIND in truncated dangling directory shape-only; do
   journeys_fixture "$BACKEND_ONLY"
   mkdir -p "$SMOKE_GATE_LEASE_DIR"
   case "$T5K_KIND" in
-    truncated) printf '{"schemaVersion":1,"selec' > "$(jpin_file 13 "$FREEZE_SHA")" ;;
-    dangling)  ln -s "$STATE_DIR/nowhere.json" "$(jpin_file 13 "$FREEZE_SHA")" ;;
-    directory) mkdir "$(jpin_file 13 "$FREEZE_SHA")" ;;
+    truncated)  printf '{"schemaVersion":1,"selec' > "$(jpin_file 13 "$FREEZE_SHA")" ;;
+    dangling)   ln -s "$STATE_DIR/nowhere.json" "$(jpin_file 13 "$FREEZE_SHA")" ;;
+    directory)  mkdir "$(jpin_file 13 "$FREEZE_SHA")" ;;
+    shape-only) printf '{"pinned":true,"matchedJourneys":[],"unmappedPaths":[]}' > "$(jpin_file 13 "$FREEZE_SHA")" ;;
   esac
-  range_case "5k-invalid-$T5K_KIND" '.journeys.pinState == "invalid" and .journeys.selection == "full" and
-    (.journeys.reason | test("cannot be recovered")) and .journeys.pinFile == null'
-  bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and
-    .data.journeys.pinState == "invalid" and .data.journeys.selection == "full"' >/dev/null ||
-    { echo "5k: an invalid journeys pin ($T5K_KIND) made the freeze unofferable" >&2; exit 1; }
+  range_case "5k-invalid-$T5K_KIND" '.journeys.pinState == "recovery-absent" and .journeys.selection == "full" and
+    .journeys.recovery == true and .journeys.pinned == false and (.journeys | '"$T5K_ALL_RECOVERED"') and
+    .journeys.unmappedPaths == ["api/src/reports/export.ts"]'
+  [ ! -e "$(rpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: check wrote a recovery pin" >&2; exit 1; }
+  T5K_REC="$(bash "$GATE" poll)"
+  jq -e --arg f "$(rpin_file 13 "$FREEZE_SHA")" '.wakeAgent == true and .data.trigger == "pr_build_settled" and
+    .data.journeys.pinState == "recovered" and .data.journeys.pinned == true and .data.journeys.pinFile == $f and
+    (.data.journeys | '"$T5K_ALL_RECOVERED"')' <<<"$T5K_REC" >/dev/null ||
+    { echo "5k: an invalid primary pin ($T5K_KIND) was not recovered by the gate: ${T5K_REC:0:600}" >&2; exit 1; }
+  [ "$(jq -c '.data.journeys' <<<"$T5K_REC")" = "$(jq -c . "$(rpin_file 13 "$FREEZE_SHA")")" ]
   case "$T5K_KIND" in
-    truncated) [ "$(cat "$(jpin_file 13 "$FREEZE_SHA")")" = '{"schemaVersion":1,"selec' ] ;;
-    dangling)  [ -L "$(jpin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$STATE_DIR/nowhere.json" ] ;;
-    directory) [ -d "$(jpin_file 13 "$FREEZE_SHA")" ] ;;
+    truncated)  [ "$(cat "$(jpin_file 13 "$FREEZE_SHA")")" = '{"schemaVersion":1,"selec' ] ;;
+    dangling)   [ -L "$(jpin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$STATE_DIR/nowhere.json" ] ;;
+    directory)  [ -d "$(jpin_file 13 "$FREEZE_SHA")" ] ;;
+    shape-only) [ "$(cat "$(jpin_file 13 "$FREEZE_SHA")")" = '{"pinned":true,"matchedJourneys":[],"unmappedPaths":[]}' ] ;;
   esac
+  # Promoted once, immutable, shared: a catalogue edit, a re-poll and a second
+  # coordinator with another state dir all read the same recovery pin.
+  T5K_REC_SUM="$(sha256sum < "$(rpin_file 13 "$FREEZE_SHA")")"
+  jq 'del(.journeys[2])' "$JOURNEYS_EXAMPLE" > "$STATE_DIR/journeys.json"
+  bash "$GATE" poll >/dev/null
+  [ "$(sha256sum < "$(rpin_file 13 "$FREEZE_SHA")")" = "$T5K_REC_SUM" ]
+  T5K_OTHER="$(mktemp -d)"
+  [ "$(SMOKE_GATE_STATE_DIR="$T5K_OTHER" SMOKE_GATE_HANDOFF_LEDGER="$T5K_OTHER/none.jsonl" \
+       SMOKE_JOURNEYS_CATALOGUE="$T5K_OTHER/none.json" bash "$GATE" check 13 | jq -c '.journeys')" = \
+    "$(jq -c '.data.journeys' <<<"$T5K_REC")" ] ||
+    { echo "5k: a second coordinator did not read the shared recovery pin" >&2; exit 1; }
+  rm -rf "$T5K_OTHER"
 done
+# STABLE OWNER: a recovery pin, once promoted, owns the campaign even if the
+# primary reads as valid again — the gate, the wake and a recovery wake all
+# keep reporting it (here: the invalid primary is swapped for a valid one).
+journeys_fixture "$BACKEND_ONLY"
+mkdir -p "$SMOKE_GATE_LEASE_DIR"
+printf '{"pinned":tr' > "$(jpin_file 13 "$FREEZE_SHA")"
+T5K_SO="$(bash "$GATE" poll)"
+jq -e '.data.journeys.pinState == "recovered"' <<<"$T5K_SO" >/dev/null || { echo "5k: stable-owner setup" >&2; exit 1; }
+T5K_SO_RUN="$(jq -r '.data.runId' <<<"$T5K_SO")"
+T5K_VALID_PRIMARY="$STATE_DIR/valid-primary.json"
+jq -c --arg f "$(jpin_file 13 "$FREEZE_SHA")" '.recovery = false | .pinState = "valid" | .pinFile = $f | .reason = null |
+  .matchedJourneys = [.matchedJourneys[0]] | .matchedJourneys[0].reason = "changed"' "$(rpin_file 13 "$FREEZE_SHA")" > "$T5K_VALID_PRIMARY"
+cat "$T5K_VALID_PRIMARY" > "$(jpin_file 13 "$FREEZE_SHA")"
+[ "$(python3 "$SCRIPT_DIR/smoke-journeys.py" pin-check "$(jpin_file 13 "$FREEZE_SHA")" --pr 13 --head "$FREEZE_SHA" --repo-slug org__repo | jq -r .state)" = valid ] ||
+  { echo "5k: stable-owner fixture: the swapped primary is not valid on its own" >&2; exit 1; }
+range_case 5k-stable-owner-check '.journeys.pinState == "recovered" and (.journeys.pinFile | test("-recovery.json$"))'
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$T5K_SO_RUN.json"
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.recovery == true and
+  .data.journeys.pinState == "recovered"' >/dev/null || { echo "5k: the recovery wake flipped back to the primary" >&2; exit 1; }
+
+# CHECKER UNAVAILABLE IS NOT INVALID: a pin-check that fails to run (a timeout,
+# a crash) is no verdict — no recovery pin is promoted, the head is not offered
+# this cycle and says why, and once the checker runs the PRIMARY owns.
+journeys_fixture "$BACKEND_ONLY"
+bash "$GATE" poll | jq -e '.data.journeys.pinState == "valid"' >/dev/null || { echo "5k: unavailable setup" >&2; exit 1; }
+T5K_UA_RUN="$(jq -r '.activeRunId' "$STATE_DIR/pr-13-state.json")"
+cat > "$STUB_BIN/python3" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in *"smoke-journeys.py pin-check "*) [ -z "${STUB_PINCHECK_FAIL:-}" ] || exit 70 ;; esac
+exec /usr/bin/env -u STUB_PINCHECK_FAIL "$REAL_PYTHON3" "$@"
+STUB
+chmod +x "$STUB_BIN/python3"
+export STUB_PINCHECK_FAIL=1
+range_case 5k-checker-unavailable '.journeys.pinState == "unavailable" and .journeys.selection == "full" and
+  (.journeys.reason | test("could not be checked")) and .journeys.matchedJourneys == []'
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$T5K_UA_RUN.json"
+T5K_UA_ERR="$STATE_DIR/ua.err"
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll 2>"$T5K_UA_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
+  { echo "5k: a head whose pin checker was unavailable was offered" >&2; exit 1; }
+grep -q 'not offered: a journeys pin for this head could not be checked' "$T5K_UA_ERR" ||
+  { echo "5k: checker-unavailable was silent: $(cat "$T5K_UA_ERR")" >&2; exit 1; }
+[ ! -e "$(rpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: an unavailable checker promoted a recovery pin" >&2; exit 1; }
+unset STUB_PINCHECK_FAIL; rm -f "$STUB_BIN/python3"
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll | jq -e --arg f "$(jpin_file 13 "$FREEZE_SHA")" '.data.trigger == "pr_build_settled" and
+  .data.journeys.pinState == "valid" and .data.journeys.pinFile == $f' >/dev/null ||
+  { echo "5k: after the checker returned, the primary did not own" >&2; exit 1; }
+[ ! -e "$(rpin_file 13 "$FREEZE_SHA")" ]
+
+# BOTH pins invalid: nothing can say what the run owes, so the head is NOT
+# offered, and stderr names both files.
+journeys_fixture "$BACKEND_ONLY"
+mkdir -p "$SMOKE_GATE_LEASE_DIR"
+printf '{"pinned":tr' > "$(jpin_file 13 "$FREEZE_SHA")"
+printf '{"pinned":true,"matchedJourneys":[],"unmappedPaths":[]}' > "$(rpin_file 13 "$FREEZE_SHA")"
+range_case 5k-both-invalid '.journeys.pinState == "invalid" and .journeys.selection == "full" and .journeys.matchedJourneys == [] and
+  (.journeys.reason | test("neither journeys pin for this head is valid"))'
+T5K_BOTH_ERR="$STATE_DIR/both.err"
+bash "$GATE" poll 2>"$T5K_BOTH_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
+  { echo "5k: a head with no valid journeys pin was offered" >&2; exit 1; }
+grep -q "not offered: neither journeys pin for this head is valid: $(jpin_file 13 "$FREEZE_SHA") .*$(rpin_file 13 "$FREEZE_SHA")" "$T5K_BOTH_ERR" ||
+  { echo "5k: both-invalid was silent: $(cat "$T5K_BOTH_ERR")" >&2; exit 1; }
+unset -f rpin_file
 
 # Range-sized selections never travel in argv: 5,200 changed paths nobody
 # claims (>200 KB of unmappedPaths) still pin, wake and read back.
@@ -1529,13 +1666,96 @@ unset STUB_TREES_FILE
 # routes to the manual packet. One stray path keeps it a web campaign.
 journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"mobile/src/scan.tsx"},{"filename":"docs/internal/mobile.md"}]}'
 range_case 5k-native '.journeys.route == "native-manual" and .journeys.unmappedPaths == [] and
-  [.journeys.matchedJourneys[].id] == ["mobile-scan-return"]'
+  [.journeys.matchedJourneys[] | select(.reason == "changed") | .id] == ["mobile-scan-return"]'
 journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"mobile/src/scan.tsx"},{"filename":"api/src/reports/export.ts"}]}'
 range_case 5k-native-mixed '.journeys.route == "web" and .journeys.unmappedPaths == ["api/src/reports/export.ts"]'
 # A RENAME counts on both sides: a file moved out of a consumed area still selects it.
 journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"api/src/shared/period.ts","previous_filename":"api/src/loans/period.ts","status":"renamed"}]}'
-range_case 5k-rename '[.journeys.matchedJourneys[].id] == ["loan-desk-checkout"] and
+range_case 5k-rename '[.journeys.matchedJourneys[] | select(.reason == "changed") | .id] == ["loan-desk-checkout"] and
   .journeys.unmappedPaths == ["api/src/shared/period.ts"]'
+
+# UNKNOWN floor history is not fresh history: with SMOKE_GATE_RUN_ROOT unset,
+# or pointing at a mount that is not there, every floor journey is due — a
+# config failure must never delete the floor — and a readable root computes it.
+journeys_fixture '{"status":"ahead","ahead_by":1,"behind_by":0,"files":[{"filename":"web/src/desk/a.tsx"}]}'
+FLOOR_ALL_DUE='.journeys.floor.computed == false and .journeys.floor.due == ["branch-scope-crossing"] and
+  [.journeys.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"changed"},{"id":"branch-scope-crossing","reason":"floor"}]'
+unset SMOKE_GATE_RUN_ROOT
+range_case 5k-floor-root-unset "$FLOOR_ALL_DUE and (.journeys.floor.reason | test(\"SMOKE_GATE_RUN_ROOT unset\"))"
+export SMOKE_GATE_RUN_ROOT="$STATE_DIR/no-such-mount"
+range_case 5k-floor-root-missing "$FLOOR_ALL_DUE"
+mkdir -p "$STATE_DIR/runs-root"; export SMOKE_GATE_RUN_ROOT="$STATE_DIR/runs-root"
+range_case 5k-floor-root-readable '.journeys.floor.computed == true and .journeys.floor.due == ["branch-scope-crossing"]'
+unset SMOKE_GATE_RUN_ROOT
+
+# A matcher that crashes selects nothing, and nothing is never pinned: the
+# facts say `full`, the head is not offered that cycle (and says why), no pin is
+# written, and the next poll — matcher working again — pins the real selection.
+journeys_fixture "$BACKEND_ONLY"
+cat > "$STUB_BIN/python3" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *"smoke-journeys.py match "*)
+    if [ -n "${STUB_JOURNEYS_OUT:-}" ]; then cat >/dev/null; printf '%s' "$STUB_JOURNEYS_OUT"; exit 0; fi
+    [ -z "${STUB_JOURNEYS_FAIL:-}" ] || exit 70 ;;
+  *"smoke-journeys.py pin-check "*)
+    [ -z "${STUB_PINCHECK_FAIL:-}" ] || exit 70 ;;
+esac
+exec /usr/bin/env -u STUB_JOURNEYS_FAIL "$REAL_PYTHON3" "$@"
+STUB
+chmod +x "$STUB_BIN/python3"
+export STUB_JOURNEYS_FAIL=1
+range_case 5k-matcher-failed '.journeys.selection == "full" and (.journeys.reason | test("^journey matcher failed")) and .journeys.pinState == "absent"'
+T5K_FAIL_ERR="$STATE_DIR/poll.err"
+bash "$GATE" poll 2>"$T5K_FAIL_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
+  { echo "5k: a failed matcher's empty selection was offered" >&2; exit 1; }
+grep -q 'journey selection could not be pinned (journey matcher failed' "$T5K_FAIL_ERR" ||
+  { echo "5k: the unoffered head was silent: $(cat "$T5K_FAIL_ERR")" >&2; exit 1; }
+[ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: a failed matcher result was pinned" >&2; exit 1; }
+unset STUB_JOURNEYS_FAIL
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.journeys.pinned == true and
+  .data.journeys.selection == "matched"' >/dev/null || { echo "5k: the retry after a matcher failure did not pin" >&2; exit 1; }
+# AN EMPTY `full` IS NEVER PINNABLE, whoever produces it. Hand the gate one
+# directly — a matcher that exits 0 with a well-shaped `full` naming nothing —
+# and it is refused at the same seam: no pin, not offered, says why.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_JOURNEYS_FAIL=1 STUB_JOURNEYS_OUT='{"schemaVersion":1,"selection":"full","reason":"hand-fed","route":"web","recovery":false,"catalogueValid":true,"catalogueSha256":"0000000000000000000000000000000000000000000000000000000000000000","matchedJourneys":[],"unmappedPaths":[],"excludedPaths":[],"unassessedNativeJourneys":[]}'
+range_case 5k-empty-full-refused '.journeys.selection == "full" and .journeys.pinState == "absent" and
+  (.journeys.reason | test("not pinnable: it is `full` but names no journey \\(hand-fed\\)"))'
+bash "$GATE" poll 2>"$T5K_FAIL_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
+  { echo "5k: a hand-fed empty full selection was offered" >&2; exit 1; }
+grep -q 'could not be pinned (the computed selection is not pinnable: it is `full` but names no journey' "$T5K_FAIL_ERR"
+[ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: an empty full selection was pinned" >&2; exit 1; }
+unset STUB_JOURNEYS_FAIL STUB_JOURNEYS_OUT
+rm -f "$STUB_BIN/python3"
+
+# The real producers of that state: a catalogue that is truncated, or
+# unreadable, at the first settled poll. No pin, not offered, reason on stderr;
+# once the catalogue is repaired the next poll pins the real selection.
+# ONE rule: a catalogue that parses but fails validation (one empty title) is
+# refused the same way — named journeys with no unmapped paths would let an
+# unclaimed change through.
+for T5K_KIND in truncated unreadable invalid; do
+  journeys_fixture "$BACKEND_ONLY"
+  case "$T5K_KIND" in
+    invalid)    jq '.journeys[0].title = ""' "$JOURNEYS_EXAMPLE" > "$STATE_DIR/journeys.json" ;;
+    truncated)  head -c 200 "$JOURNEYS_EXAMPLE" > "$STATE_DIR/journeys.json" ;;
+    unreadable) chmod 000 "$STATE_DIR/journeys.json"; [ "$(id -u)" != 0 ] || continue ;;
+  esac
+  range_case "5k-$T5K_KIND-catalogue" '.journeys.selection == "full" and .journeys.pinState == "absent" and
+    (.journeys.reason | test("journey matcher failed: journey catalogue is unusable")) and .journeys.matchedJourneys == []'
+  bash "$GATE" poll 2>"$T5K_FAIL_ERR" | jq -e '.wakeAgent == false' >/dev/null ||
+    { echo "5k: a $T5K_KIND catalogue's empty selection was offered" >&2; exit 1; }
+  grep -q 'journey selection could not be pinned (journey matcher failed: journey catalogue is unusable' "$T5K_FAIL_ERR" ||
+    { echo "5k: $T5K_KIND catalogue: the unoffered head was silent: $(cat "$T5K_FAIL_ERR")" >&2; exit 1; }
+  [ "$T5K_KIND" != invalid ] || grep -q 'title must be' "$T5K_FAIL_ERR" ||
+    { echo "5k: the validation error was not named: $(cat "$T5K_FAIL_ERR")" >&2; exit 1; }
+  [ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] || { echo "5k: a $T5K_KIND catalogue was pinned" >&2; exit 1; }
+  chmod 644 "$STATE_DIR/journeys.json"; cp "$JOURNEYS_EXAMPLE" "$STATE_DIR/journeys.json"
+  bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.journeys.pinned == true and
+    .data.journeys.selection == "matched" and .data.journeys.unmappedPaths == ["api/src/reports/export.ts"]' >/dev/null ||
+    { echo "5k: repairing a $T5K_KIND catalogue did not pin the real selection" >&2; exit 1; }
+done
 
 # UNKNOWN range is "full", never an empty match.
 journeys_fixture "$BACKEND_ONLY"
@@ -1548,12 +1768,175 @@ range_case 5k-unknown '.campaignRange.determinable == false and .journeys.select
 journeys_fixture "$BACKEND_ONLY"
 printf '{"schemaVersion":1,"journeys":"nope"}' > "$STATE_DIR/journeys.json"
 range_case 5k-broken '.journeys.selection == "full" and .journeys.catalogueValid == false and
-  (.journeys.reason | test("unusable"))'
+  (.journeys.reason | test("journey matcher failed: journey catalogue is unusable")) and .journeys.pinState == "absent"'
 # An ordinary PR has no campaignRange, so it gets no selection either.
 journeys_fixture "$BACKEND_ONLY"
 export STUB_PR_FILES='[{"filename":"api/src/loans/period.ts"}]'
 bash "$GATE" check 13 | jq -e '.isFreezePr == false and (has("journeys") | not)' >/dev/null ||
   { echo "5k: an ordinary PR grew a journeys key" >&2; exit 1; }
+# --- 5l. ADMISSION: a manual `claim` of a freeze head pins exactly as `poll`
+# does (pin_freeze_head), BEFORE it takes ownership. `check` never pins, so
+# check-then-claim used to admit a freeze with both pin paths absent — and the
+# barrier read that as legacy "no pin". Ordinary PRs and no-catalogue installs
+# are untouched.
+pin_file() { printf '%s/range-pin-org__repo-pr-%s-%s.json' "$SMOKE_GATE_LEASE_DIR" "$1" "$2"; }
+journeys_fixture "$BACKEND_ONLY"
+bash "$GATE" check 13 | jq -e '.settled == true and .campaignRange.pinState == "absent" and .journeys.pinState == "absent"' >/dev/null
+[ ! -e "$(pin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ]
+T5L_CLAIM="$(bash "$GATE" claim run-manual-13 13 "$FREEZE_SHA")"
+jq -e '.ok == true and .runId == "run-manual-13" and .campaignRange.pinState == "valid" and
+  .campaignRange.baselinePinned == true and .journeys.pinned == true and .journeys.pinState == "valid" and
+  .journeys.selection == "matched" and .journeys.unmappedPaths == ["api/src/reports/export.ts"]' <<<"$T5L_CLAIM" >/dev/null ||
+  { echo "5l: a manual freeze claim did not pin: $T5L_CLAIM" >&2; exit 1; }
+[ -s "$(pin_file 13 "$FREEZE_SHA")" ] && [ -s "$(jpin_file 13 "$FREEZE_SHA")" ] ||
+  { echo "5l: the claim reported pins that are not on shared storage" >&2; exit 1; }
+[ "$(jq -c '.journeys' <<<"$T5L_CLAIM")" = "$(jq -c '.' "$(jpin_file 13 "$FREEZE_SHA")")" ] ||
+  { echo "5l: the claim's journeys are not the pinned bytes" >&2; exit 1; }
+jq -e '.repoSlug == "org__repo" and .pr == 13' "$SMOKE_GATE_LEASE_DIR/lease-run-manual-13.json" >/dev/null
+bash "$GATE" check 13 | jq -e '.campaignRange.pinState == "valid" and .journeys.pinState == "valid"' >/dev/null
+# A later claim of the same head READS the pins — no second promote, bytes unchanged.
+T5L_RPIN="$(cat "$(pin_file 13 "$FREEZE_SHA")")"; T5L_JPIN="$(cat "$(jpin_file 13 "$FREEZE_SHA")")"
+bash "$GATE" release run-manual-13 | jq -e '.ok == true' >/dev/null
+bash "$GATE" claim run-manual-13b 13 "$FREEZE_SHA" | jq -e '.ok == true and .journeys.pinned == true and .campaignRange.pinState == "valid"' >/dev/null
+[ "$(cat "$(pin_file 13 "$FREEZE_SHA")")" = "$T5L_RPIN" ] && [ "$(cat "$(jpin_file 13 "$FREEZE_SHA")")" = "$T5L_JPIN" ] ||
+  { echo "5l: a second claim re-promoted a pin" >&2; exit 1; }
+bash "$GATE" release run-manual-13b >/dev/null
+# ...and a claim after `poll` already pinned reads poll's bytes (poll's own
+# settled wake owns the slot, so its run is released first — a manual claim of
+# a pinned head is the recovery shape, not a second pinning).
+journeys_fixture "$BACKEND_ONLY"
+T5L_POLL="$(bash "$GATE" poll)"
+jq -e '.data.trigger == "pr_build_settled" and .data.journeys.pinned == true' <<<"$T5L_POLL" >/dev/null
+T5L_RPIN="$(cat "$(pin_file 13 "$FREEZE_SHA")")"; T5L_JPIN="$(cat "$(jpin_file 13 "$FREEZE_SHA")")"
+bash "$GATE" release "$(jq -r '.data.runId' <<<"$T5L_POLL")" "$(jq -r '.data.coordinatorOwnerToken' <<<"$T5L_POLL")" | jq -e '.ok == true' >/dev/null
+bash "$GATE" claim run-after-poll 13 "$FREEZE_SHA" | jq -e '.ok == true and .journeys.pinned == true' >/dev/null
+[ "$(cat "$(pin_file 13 "$FREEZE_SHA")")" = "$T5L_RPIN" ] && [ "$(cat "$(jpin_file 13 "$FREEZE_SHA")")" = "$T5L_JPIN" ] ||
+  { echo "5l: a claim after poll re-promoted a pin" >&2; exit 1; }
+# No shared pin storage: refused, and NOTHING is owned — no lease, no slot.
+# Pins and leases share one store (range_pin_store_readable is the read-only
+# twin of lease_dir_prepare), so a missing shared root is refused by claim's
+# lease preflight before admission even runs; admission's own refusal is the
+# same outcome, and either way no ownership is written.
+journeys_fixture "$BACKEND_ONLY"
+T5L_UNAVAIL="$(SMOKE_GATE_SHARED_ROOT="$STATE_DIR/missing" SMOKE_GATE_LEASE_DIR="$STATE_DIR/missing/leases" \
+  bash "$GATE" claim run-unavail 13 "$FREEZE_SHA" 2>/dev/null)"
+jq -e '.ok == false and .runId == "run-unavail" and (.error |
+  test("^freeze campaign not admitted: .*cannot be kept on shared storage") or test("^shared coordinator lease unavailable"))' <<<"$T5L_UNAVAIL" >/dev/null ||
+  { echo "5l: unavailable pin storage did not refuse the claim: $T5L_UNAVAIL" >&2; exit 1; }
+[ ! -e "$STATE_DIR/missing/leases/lease-run-unavail.json" ] &&
+  { [ ! -e "$STATE_DIR/pr-13-state.json" ] || jq -e '.activeRunId == null' "$STATE_DIR/pr-13-state.json" >/dev/null; } ||
+  { echo "5l: a refused claim still took ownership" >&2; exit 1; }
+# A matcher failure: the range pins, the journeys cannot — refused, nothing owned.
+journeys_fixture "$BACKEND_ONLY"
+cat > "$STUB_BIN/python3" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in *"smoke-journeys.py match "*) [ -z "${STUB_JOURNEYS_FAIL:-}" ] || exit 70 ;; esac
+exec /usr/bin/env -u STUB_JOURNEYS_FAIL "$REAL_PYTHON3" "$@"
+STUB
+chmod +x "$STUB_BIN/python3"
+export STUB_JOURNEYS_FAIL=1
+T5L_MATCH="$(bash "$GATE" claim run-matchfail 13 "$FREEZE_SHA" 2>/dev/null)"
+jq -e '.ok == false and (.error | test("^freeze campaign not admitted: its journey selection could not be pinned \\(journey matcher failed"))' <<<"$T5L_MATCH" >/dev/null ||
+  { echo "5l: a failed matcher did not refuse the claim: $T5L_MATCH" >&2; exit 1; }
+[ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-matchfail.json" ] ||
+  { echo "5l: a refused claim left a journeys pin or a lease" >&2; exit 1; }
+unset STUB_JOURNEYS_FAIL; rm -f "$STUB_BIN/python3"
+bash "$GATE" claim run-matchok 13 "$FREEZE_SHA" | jq -e '.ok == true and .journeys.pinned == true' >/dev/null
+# No catalogue: a freeze claim pins the range only; no `journeys` key, no journeys pin.
+journeys_fixture "$BACKEND_ONLY"
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/no-such-journeys.json"
+T5L_NOCAT="$(bash "$GATE" claim run-nocat 13 "$FREEZE_SHA")"
+jq -e '.ok == true and .campaignRange.pinState == "valid" and (has("journeys") | not)' <<<"$T5L_NOCAT" >/dev/null ||
+  { echo "5l: no-catalogue freeze claim: $T5L_NOCAT" >&2; exit 1; }
+[ -s "$(pin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ]
+# An ORDINARY PR, catalogue or not: the claim neither evaluates nor pins — its
+# output carries neither key and shared storage stays empty of pins.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'
+T5L_ORD="$(bash "$GATE" claim run-ordinary 13 "$FREEZE_SHA")"
+jq -e '.ok == true and .pr == 13 and (has("campaignRange") | not) and (has("journeys") | not)' <<<"$T5L_ORD" >/dev/null ||
+  { echo "5l: an ordinary claim changed shape: $T5L_ORD" >&2; exit 1; }
+[ -z "$(find "$SMOKE_GATE_LEASE_DIR" -name '*-pin-*' -print -quit)" ] || { echo "5l: an ordinary claim wrote a pin" >&2; exit 1; }
+# ...but a head whose commit cannot be read is not KNOWN to be ordinary: refused.
+export STUB_COMMIT_GET_EXIT=1
+T5L_UNKNOWN="$(bash "$GATE" claim run-unknown-kind 14 "$FREEZE_SHA" || true)"
+jq -e '.ok == false and (.error | test("whether this head is a freeze is unknown"))' <<<"$T5L_UNKNOWN" >/dev/null ||
+  { echo "5l: a PR of unknown kind was admitted: $T5L_UNKNOWN" >&2; exit 1; }
+[ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-unknown-kind.json" ]
+unset STUB_COMMIT_GET_EXIT
+# HEAD BINDING. The PR advanced from freeze head H to an ordinary head J, so
+# its file list now describes J. A claim of H is classified by H's own commit —
+# a freeze — and pinned; it is never admitted unpinned. And the converse: an
+# ordinary H on a PR whose current head J is a freeze is an ordinary claim.
+journeys_fixture "$BACKEND_ONLY"
+T5L_J="$(sha 9)"
+export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'   # the PR's CURRENT (J) diff
+export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" '{($h):[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]}')"
+T5L_DRIFT="$(bash "$GATE" claim run-drift 13 "$FREEZE_SHA")"
+jq -e '.ok == true and .campaignRange.pinState == "valid" and .journeys.pinned == true' <<<"$T5L_DRIFT" >/dev/null ||
+  { echo "5l: a freeze head on an advanced PR was not pinned at claim: $T5L_DRIFT" >&2; exit 1; }
+[ -s "$(pin_file 13 "$FREEZE_SHA")" ] && [ -s "$(jpin_file 13 "$FREEZE_SHA")" ]
+bash "$GATE" release run-drift >/dev/null
+# poll shares the classifier: the listed head H is a freeze by its own commit.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'
+export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" '{($h):[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]}')"
+bash "$GATE" check 13 | jq -e '.isFreezePr == true and .settled == true' >/dev/null ||
+  { echo "5l: check classified a freeze head by the PR's current files" >&2; exit 1; }
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.isFreezePr == true and .data.journeys.pinned == true' >/dev/null ||
+  { echo "5l: poll classified a freeze head by the PR's current files" >&2; exit 1; }
+# The converse: H is ordinary by its own commit even though the PR's current head is a freeze.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" '{($h):[{"filename":"api/src/reports/export.ts"}]}')"
+T5L_ORD_H="$(bash "$GATE" claim run-ordinary-head 13 "$FREEZE_SHA")"
+jq -e '.ok == true and (has("campaignRange") | not) and (has("journeys") | not)' <<<"$T5L_ORD_H" >/dev/null ||
+  { echo "5l: an ordinary head was classified by the PR's current freeze files: $T5L_ORD_H" >&2; exit 1; }
+[ -z "$(find "$SMOKE_GATE_LEASE_DIR" -name '*-pin-*' -print -quit)" ]
+# A FREEZE IS EXACTLY THE SHAPE smoke-freeze-pr.sh BUILDS: one parent, the two
+# marker paths, both ADDED. An ordinary multi-commit PR whose head commit
+# removes markers added earlier lists the same two filenames — and is
+# ordinary: no freeze keys, the head's own CI (not the parent's) consulted,
+# an ordinary claim, and `finish` writes no handoff. So are a rename, a
+# modification, and the two markers added beside a third file.
+MARKERS='{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}'
+head_files() { export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" --argjson f "$1" '{($h):$f}')"; }
+for shape in \
+  "removed|[{\"filename\":\"XZO-BACKEND/.render-freeze\",\"status\":\"removed\"},{\"filename\":\"XZO-FRONTEND/.render-freeze\",\"status\":\"removed\"}]" \
+  "renamed|[{\"filename\":\"XZO-BACKEND/.render-freeze\",\"status\":\"renamed\",\"previous_filename\":\"XZO-BACKEND/.freeze\"},{\"filename\":\"XZO-FRONTEND/.render-freeze\"}]" \
+  "modified|[{\"filename\":\"XZO-BACKEND/.render-freeze\",\"status\":\"modified\"},{\"filename\":\"XZO-FRONTEND/.render-freeze\"}]" \
+  "extra-file|[$MARKERS,{\"filename\":\"api/src/x.ts\"}]" \
+  "two-parents|[$MARKERS]"; do
+  label="${shape%%|*}"; files="${shape#*|}"
+  journeys_fixture "$BACKEND_ONLY"
+  export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'
+  head_files "$files"
+  # A merge commit that happens to add both markers has two parents; the
+  # freeze commit has exactly one.
+  [ "$label" != two-parents ] ||
+    export STUB_PARENT_BY_COMMIT="$(jq -c --arg h "$FREEZE_SHA" --arg p "$PARENT_SHA,$BASE_SHA" '.[$h] = $p' <<<"$STUB_PARENT_BY_COMMIT")"
+  T5L_SHAPE="$(bash "$GATE" check 13)"
+  jq -e --arg head "$FREEZE_SHA" '.isFreezePr == false and (has("campaignRange") | not) and (has("journeys") | not) and .ciSha == $head' <<<"$T5L_SHAPE" >/dev/null ||
+    { echo "5l: a head whose markers are $label was classified as a freeze: $T5L_SHAPE" >&2; exit 1; }
+  T5L_SHAPE="$(bash "$GATE" claim "run-$label" 13 "$FREEZE_SHA")"
+  jq -e '.ok == true and (has("campaignRange") | not) and (has("journeys") | not)' <<<"$T5L_SHAPE" >/dev/null ||
+    { echo "5l: a claim of a head whose markers are $label took the freeze path: $T5L_SHAPE" >&2; exit 1; }
+  [ -z "$(find "$SMOKE_GATE_LEASE_DIR" -name '*-pin-*' -print -quit)" ] || { echo "5l: $label head was pinned" >&2; exit 1; }
+  T5L_SHAPE="$(SMOKE_GATE_PUBLISH_FILE="$STATE_DIR/dev-gate/latest-verdict.json" SMOKE_GATE_HOLD_FILE="$STATE_DIR/dev-gate/develop-hold.json" \
+    bash "$GATE" finish "$FREEZE_SHA" "run-$label" GO)"
+  jq -e '.ok == true and .handoff.written == false' <<<"$T5L_SHAPE" >/dev/null ||
+    { echo "5l: finish of a head whose markers are $label wrote a freeze handoff: $T5L_SHAPE" >&2; exit 1; }
+  [ ! -e "$STATE_DIR/dev-gate/latest-verdict.json" ] && [ ! -e "$STATE_DIR/dev-gate/develop-hold.json" ] ||
+    { echo "5l: finish of a $label head published a freeze verdict" >&2; exit 1; }
+done
+# ...and the real shape, both markers added onto one parent, is the freeze it always was.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'
+head_files "[$MARKERS]"
+bash "$GATE" check 13 | jq -e '.isFreezePr == true and .settled == true and .campaignRange.pinState == "absent"' >/dev/null ||
+  { echo "5l: the real freeze shape was not classified as a freeze" >&2; exit 1; }
+unset STUB_COMMIT_FILES_BY_SHA
+unset -f pin_file
+
 unset SMOKE_JOURNEYS_CATALOGUE
 unset -f range_case journeys_fixture jpin_file
 
@@ -2659,6 +3042,16 @@ bash "$GATE" claim run-standalone-bound 132 "$EXPIRED_SHA" owner-a | jq -e '.ok 
 STANDALONE_AUTH="$(cat "$SMOKE_GATE_LEASE_DIR/pr-132-authority.json")"
 bash "$GATE" lease-claim run-standalone-bound owner-a | jq -e '.ok == true and .lease.pr == 132' >/dev/null
 [ "$(cat "$SMOKE_GATE_LEASE_DIR/pr-132-authority.json")" = "$STANDALONE_AUTH" ]
+# The lease records the campaign's repo (repoSlug, slugged as journeys_pin_file
+# slugs it) — with the PR and the head, the identity smoke-evidence-barrier.sh
+# looks the campaign's journeys pin up by, by exact name. A re-acquire with no
+# REPO in its environment preserves it; a conflicting repo is refused, and the
+# lease is untouched.
+jq -e '.repoSlug == "org__repo"' "$SMOKE_GATE_LEASE_DIR/lease-run-standalone-bound.json" >/dev/null
+SMOKE_GATE_REPO= bash "$GATE" lease-claim run-standalone-bound owner-a | jq -e '.ok == true and .lease.repoSlug == "org__repo"' >/dev/null
+OUT="$(SMOKE_GATE_REPO=other/fork bash "$GATE" lease-claim run-standalone-bound owner-a 132 || true)"
+jq -e '.ok == false and (.error | test("bound to repo org__repo and cannot be re-acquired for repo other__fork"))' <<<"$OUT" >/dev/null
+jq -e '.repoSlug == "org__repo" and .pr == 132 and .owner == "owner-a"' "$SMOKE_GATE_LEASE_DIR/lease-run-standalone-bound.json" >/dev/null
 bash "$GATE" release run-standalone-bound owner-a | jq -e '.ok == true' >/dev/null
 
 # --- 30. malformed and non-shared lease storage fail closed -----------------

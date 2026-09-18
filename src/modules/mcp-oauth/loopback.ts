@@ -36,9 +36,28 @@ export interface LoopbackListener {
   close(): void;
 }
 
+/**
+ * Both interpolations below are attacker-influenced: `error` and
+ * `error_description` come straight off the redirect query string, which is
+ * whatever the authorization server (or anyone who can get the operator's
+ * browser to hit this port) put there. Unescaped, `error_description=<img
+ * src=x onerror=…>` executes in the operator's browser on a page served by
+ * this host — and the ONE thing a page on 127.0.0.1 has that a remote page
+ * does not is same-origin access to this port.
+ */
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 const PAGE = (title: string, body: string) =>
-  `<!doctype html><meta charset="utf-8"><title>${title}</title>` +
-  `<body style="font:16px/1.5 system-ui;margin:4rem auto;max-width:34rem"><h1>${title}</h1><p>${body}</p></body>`;
+  `<!doctype html><meta charset="utf-8"><title>${escapeHtml(title)}</title>` +
+  `<body style="font:16px/1.5 system-ui;margin:4rem auto;max-width:34rem"><h1>${escapeHtml(title)}</h1>` +
+  `<p>${escapeHtml(body)}</p></body>`;
 
 /**
  * Start the listener. Rejects if the port cannot be bound — the caller treats

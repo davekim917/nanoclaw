@@ -66,6 +66,27 @@ export function getMcpOAuthIntegration(name: string): Promise<McpOAuthIntegratio
 }
 
 /**
+ * The row occupying `UNIQUE(agent_group_id, mcp_url)` (migration 082:66), if
+ * any.
+ *
+ * Exists so `login` can find out that this (group, URL) pair is already taken
+ * BEFORE it registers a client: a dynamic registration that mints a client at
+ * the provider and then hits the unique index leaves a credential behind that
+ * nothing on this host can see or revoke, and providers do not garbage-collect
+ * those.
+ */
+export function getMcpOAuthIntegrationByTarget(
+  agentGroupId: string,
+  mcpUrl: string,
+): Promise<McpOAuthIntegration | undefined> {
+  return getDb().get<McpOAuthIntegration>(
+    `SELECT ${COLUMNS} FROM mcp_oauth_integrations WHERE agent_group_id = ? AND mcp_url = ?`,
+    agentGroupId,
+    mcpUrl,
+  );
+}
+
+/**
  * Upsert by name — `login` is re-runnable. A re-login against a live
  * integration must not orphan the row (or its OneCLI secret) by inserting a
  * second one, and must not lose `created_at`.

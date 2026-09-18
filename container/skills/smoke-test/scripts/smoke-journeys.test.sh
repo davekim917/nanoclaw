@@ -19,24 +19,41 @@ expect() { # <label> <jq-assertion> <json>
 }
 SHA="$(printf 'a%.0s' $(seq 40))"
 NOW=2026-09-10T00:00:00Z
+# Journeys apply only where a catalogue exists at the gate's path (section 5b):
+# this suite's default is the example catalogue, copied into $WORK below, and
+# `no_catalogue` runs a command against an absent one; the host's own must
+# never leak in. Env repo identity is unset: the lease carries it.
+export SMOKE_JOURNEYS_CATALOGUE="$WORK/journeys.json"
+no_catalogue() { SMOKE_JOURNEYS_CATALOGUE="$WORK/absent-catalogue.json" "$@"; }
+unset SMOKE_GATE_REPO
 
-match() { # <paths-json> [extra args...]
+# A run root where the one floor journey was proven yesterday, so a LIGHT
+# campaign owes the floor nothing and the fixtures below stay about matching.
+# (With no readable run root every floor journey is due — section 3.)
+FRESH_ROOT="$WORK/fresh-runs"; mkdir -p "$FRESH_ROOT/r0/markers"
+jq -n --arg sha "$SHA" '{sourceSha:$sha,status:"pass",completedAt:"2026-09-09T12:00:00Z",evidence:["api.txt"]}' > "$FRESH_ROOT/r0/markers/branch-scope-crossing.json"
+jq -n --arg sha "$SHA" '{sourceSha:$sha,requiredLaneMarkers:["markers/branch-scope-crossing.json"],lanes:[{id:"branch-scope-crossing",kind:"floor",evidence:"api",generation:1}]}' > "$FRESH_ROOT/r0/completion-contract.json"
+match() { # <paths-json> [extra args...] (later flags override these defaults)
   local paths="$1"; shift
-  printf '%s' "$paths" | python3 "$TOOL" match --catalogue "$CATALOGUE" --as-of "$NOW" "$@"
+  printf '%s' "$paths" | python3 "$TOOL" match --catalogue "$CATALOGUE" --as-of "$NOW" \
+    --size light --run-root "$FRESH_ROOT" "$@"
 }
 # What smoke-pr-gate.sh journeys_pin_promote leaves in the shared lease dir for
 # (repo org/repo, PR 7, <head>): the selection plus pin fields, and the exact
 # catalogue bytes it was computed from, content-addressed. The gate's own
 # promotion is tested in smoke-pr-gate.test.sh 5k; this only builds its output.
-gate_pin() { # <lease-dir> <head-sha> <paths-json> -> prints the pin file path
-  local dir="$1" head="$2" out digest pin
+gate_pin() { # <lease-dir> <head-sha> <paths-json> [pr] [repo-slug] [recovery|""] [extra match args] -> pin path
+  local dir="$1" head="$2" pr="${4:-7}" slug="${5:-org__repo}" kind="${6:-}" out digest pin state=valid
+  local -a extra=(); [ -z "${7:-}" ] || read -r -a extra <<<"$7"
   mkdir -p "$dir"
-  out="$(match "$3" --snapshot-out "$dir/.snap")"
+  [ "$kind" != recovery ] || { extra+=(--recover); state=recovered; }
+  out="$(match "$3" --snapshot-out "$dir/.snap" ${extra[@]+"${extra[@]}"})"   # default: light + fresh floor
   digest="$(jq -r '.catalogueSha256' <<<"$out")"
   mv "$dir/.snap" "$dir/journeys-catalogue-$digest.json"
-  pin="$dir/journeys-pin-org__repo-pr-7-$head.json"
-  jq -c --arg h "$head" --arg f "$pin" --arg s "$dir/journeys-catalogue-$digest.json" \
-    '. + {headSha:$h,pinned:true,pinState:"valid",pinFile:$f,catalogueSnapshot:$s,pinnedAt:"2026-09-10T00:00:00Z"}' \
+  pin="$dir/journeys-pin-$slug-pr-$pr-$head${kind:+-recovery}.json"
+  jq -c --arg h "$head" --argjson pr "$pr" --arg slug "$slug" --arg f "$pin" --arg st "$state" \
+    --arg s "$dir/journeys-catalogue-$digest.json" \
+    '. + {headSha:$h,pr:$pr,repoSlug:$slug,pinned:true,pinState:$st,pinFile:$f,catalogueSnapshot:$s,pinnedAt:"2026-09-10T00:00:00Z"}' \
     <<<"$out" > "$pin"
   printf '%s' "$pin"
 }
@@ -54,10 +71,19 @@ bad_catalogue 1-dup-id '.journeys[1].id = .journeys[0].id' 'duplicate id'
 bad_catalogue 1-lane-alphabet '.journeys[0].id = "has space"' 'id must match'
 # `platform: web|native` cannot say "API-only by design"; evidence can, and is closed.
 bad_catalogue 1-evidence '.journeys[0].evidence = "web"' 'evidence must be one of'
+bad_catalogue 1-empty 'del(.journeys[])' 'journeys must be a non-empty list'
 bad_catalogue 1-no-proves 'del(.journeys[0].proves)' 'proves must be'
 bad_catalogue 1-typo-key '.journeys[1].maxIntervalDay = 2' 'unknown key maxIntervalDay'
 bad_catalogue 1-no-consumes '.journeys[0].consumes = []' 'consumes must be'
 bad_catalogue 1-match-all '.journeys[0].consumes = ["**"]' 'matches every path'
+# Judged per brace-EXPANDED alternative: `{**,api/**}` is `**` with a decoy,
+# and would claim every changed path, emptying unmappedPaths.
+bad_catalogue 1-brace-match-all '.journeys[0].consumes = ["{**,api/**}"]' 'consumes glob .* matches every path \(its alternative .\*\*. does\)'
+bad_catalogue 1-brace-match-all-tail '.journeys[0].consumes = ["{api,*}/**"]' 'matches every path'
+bad_catalogue 1-wildcard-spelling '.journeys[0].consumes = ["*?/**"]' 'matches every path'
+bad_catalogue 1-exclude-everything '.excludePaths += [{"glob":"{docs/x/**,**}","reason":"r"}]' 'excludePaths glob .* matches every path'
+jq '.journeys[0].consumes += ["{web,api}/src/**"]' "$EXAMPLE" > "$WORK/brace-ok.json"
+expect 1-brace-ok '.ok == true' "$(python3 "$TOOL" validate "$WORK/brace-ok.json")"
 # English never reaches the contact-sheet script: recipes are click/wait only.
 bad_catalogue 1-english-recipe '.journeys[0].captureRecipes[0].steps = ["Open the period menu"]' 'click/wait commands only'
 bad_catalogue 1-browser-checkpoints '.journeys[0].checkpoints = []' 'checkpoints'
@@ -73,6 +99,9 @@ warns() { # <label> <jq-edit> <warning-regex>
 }
 warns 1w-extension-wide '.excludePaths += [{"glob":"**/*.md","reason":"docs"}]' 'excludePaths .\\*\\*/\\*.md. is a bare top-level or extension-wide'
 warns 1w-top-level '.excludePaths += [{"glob":".github/**","reason":"ci"}]' 'bare top-level'
+warns 1w-brace-broad '.excludePaths += [{"glob":"{docs/x/**,.github/**}","reason":"r"}]' 'bare top-level'
+warns 1w-brace-shadow '.excludePaths += [{"glob":"{docs/x/**,.github/**}","reason":"r"}] | .journeys[2].consumes += [".github/workflows/{build,ship}-app.yml"]' \
+  'mobile-scan-return: consumes .* can never match'
 warns 1w-no-reason '.excludePaths += ["docs/archive/**"]' 'docs/archive/\\*\\*. carries no reason'
 # A consumes glob an exclusion shadows selects nothing, and says so...
 warns 1w-shadowed-md '.excludePaths += [{"glob":"**/*.md","reason":"docs"}] | .journeys[0].consumes += ["web/release-notes/**/*.md"]' \
@@ -82,7 +111,7 @@ warns 1w-shadowed-dir '.excludePaths += [{"glob":".github/**","reason":"ci"}] | 
 # ...which is the matcher's real behaviour, not a lint opinion: the workflow
 # that builds the installable app is excluded, never routed to its journey.
 jq '.excludePaths += [{"glob":".github/**","reason":"ci"}] | .journeys[2].consumes += [".github/workflows/build-app.yml"]' "$EXAMPLE" > "$WORK/shadow.json"
-expect 1w-exclusion-wins '.matchedJourneys == [] and .excludedPaths[0].glob == ".github/**"' \
+expect 1w-exclusion-wins '[.matchedJourneys[] | select(.reason == "changed")] == [] and .excludedPaths[0].glob == ".github/**"' \
   "$(printf '[".github/workflows/build-app.yml"]' | python3 "$TOOL" match --catalogue "$WORK/shadow.json" --as-of "$NOW")"
 # A partly-overlapping glob is not "never matches".
 jq '.excludePaths += [{"glob":"**/*.md","reason":"docs"}]' "$EXAMPLE" > "$WORK/warn.json"
@@ -110,23 +139,46 @@ expect 2-unknown '.selection == "full" and .reason == "no GO" and .unmappedPaths
   [.matchedJourneys[] | select(.reason == "range-unknown") | .id] == ["loan-desk-checkout","branch-scope-crossing"] and
   .unassessedNativeJourneys == ["mobile-scan-return"]' "$(match '[]' --unknown "no GO")"
 expect 2-unreadable-paths '.selection == "full" and (.reason | test("unreadable"))' "$(match 'not json')"
+# ONE rule for every unusable catalogue. One that parses but fails validation
+# (here: one empty title) is refused exactly like one that does not parse — a
+# partial reading could name journeys while dropping every unclaimed path.
+jq '.journeys[0].title = ""' "$EXAMPLE" > "$WORK/half-broken.json"
+if OUT="$(CATALOGUE="$WORK/half-broken.json" match '["api/src/reports/export.ts"]' 2>"$WORK/half.err")"; then
+  fail "2-invalid-catalogue-refused: exit 0 with: $OUT"
+fi
+[ -z "$OUT" ] || fail "2-invalid-catalogue-refused: printed a selection: $OUT"
+expect 2-invalid-catalogue-says-why '.ok == false and (.error | test("unusable: journey loan-desk-checkout: title must be"))' "$(cat "$WORK/half.err")"
 printf 'nope' > "$WORK/broken.json"
-expect 2-broken-catalogue '.selection == "full" and .catalogueValid == false and (.catalogueSha256 | length == 64)' \
-  "$(CATALOGUE="$WORK/broken.json" match '["web/src/desk/a.tsx"]')"
+# A catalogue NOTHING can be read out of selects nothing, and that must never
+# look like a selection somebody could pin: the matcher fails instead.
+for broken in "$WORK/broken.json" "$WORK/no-such-catalogue.json"; do
+  if OUT="$(CATALOGUE="$broken" match '["web/src/desk/a.tsx"]' 2>/dev/null)"; then fail "2-unparseable-catalogue: exit 0 with: $OUT"; fi
+  [ -z "$OUT" ] || fail "2-unparseable-catalogue: printed a selection: $OUT"
+done
+printf '["not","an","object"]' > "$WORK/array.json"
+if CATALOGUE="$WORK/array.json" match '[]' >/dev/null 2>&1; then fail "2-non-object-catalogue: exit 0"; fi
 
 # --- 3. floor cadence ---------------------------------------------------------
 # Same rule SKILL.md states: every overdue entry is due; else standard/full
 # owes the least-recently-proven one and light owes none. A pass with neither
 # media nor an api-declared contract lane never resets the clock.
 ROOT="$WORK/runs"
-floor_run() { # <run> <completedAt> <evidence-json> <lane-evidence or "">
+floor_run() { # <run> <completedAt> <evidence-json> <lane-evidence or ""> [journey-id] [marker-sha]
   mkdir -p "$ROOT/$1/markers"
-  jq -n --arg at "$2" --argjson ev "$3" '{status:"pass",completedAt:$at,evidence:$ev}' \
-    > "$ROOT/$1/markers/branch-scope-crossing.json"
-  jq -n --arg e "$4" '{lanes:[{id:"branch-scope-crossing",kind:"floor"} + (if $e == "" then {} else {evidence:$e} end)]}' \
+  local id="${5:-branch-scope-crossing}" marker_sha="${6:-$SHA}"
+  jq -n --arg at "$2" --argjson ev "$3" --arg sha "$marker_sha" '{sourceSha:$sha,status:"pass",completedAt:$at,evidence:$ev}' \
+    > "$ROOT/$1/markers/$id.json"
+  jq -n --arg e "$4" --arg id "$id" --arg sha "$SHA" '{sourceSha:$sha,requiredLaneMarkers:["markers/" + $id + ".json"],lanes:[{id:$id,kind:"floor",generation:1} + (if $e == "" then {} else {evidence:$e} end)]}' \
     > "$ROOT/$1/completion-contract.json"
 }
-expect 3-no-root '.computed == false and .due == []' "$(python3 "$TOOL" floor-due "$CATALOGUE" "$WORK/none" --as-of "$NOW")"
+# UNKNOWN HISTORY IS NOT FRESH HISTORY. An unset or missing run root (a config
+# or mount failure) makes every floor journey due — at every size — never none.
+expect 3-missing-root '.computed == false and .due == ["branch-scope-crossing"] and (.reason | test("every floor journey is due"))' \
+  "$(python3 "$TOOL" floor-due "$CATALOGUE" "$WORK/none" --size light --as-of "$NOW")"
+expect 3-unset-root-match '[.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"changed"},{"id":"branch-scope-crossing","reason":"floor"}] and
+  .floor.computed == false and (.floor.reason | test("SMOKE_GATE_RUN_ROOT unset"))' "$(match '["web/src/desk/a.tsx"]' --run-root "")"
+expect 3-missing-root-native '.route == "native-manual" and [.matchedJourneys[].id] == ["branch-scope-crossing","mobile-scan-return"]' \
+  "$(match '["mobile/a.tsx"]' --run-root "$WORK/none")"
 floor_run r1 2026-09-09T12:00:00Z '["notes.txt"]' ""
 expect 3-unproven-pass-is-overdue '.computed == true and .due == ["branch-scope-crossing"] and .entries[0].lastProvenAt == null' \
   "$(python3 "$TOOL" floor-due "$CATALOGUE" "$ROOT" --as-of "$NOW")"
@@ -136,9 +188,59 @@ expect 3-fresh-standard '.due == ["branch-scope-crossing"] and .entries[0].overd
 expect 3-fresh-light '.due == []' "$(python3 "$TOOL" floor-due "$CATALOGUE" "$ROOT" --size light --as-of "$NOW")"
 expect 3-overdue-light '.due == ["branch-scope-crossing"] and .entries[0].overdue == true' \
   "$(python3 "$TOOL" floor-due "$CATALOGUE" "$ROOT" --size light --as-of 2026-09-20T00:00:00Z)"
+# CADENCE USES THE BARRIER'S RULE (lane_problems), for the journey's DECLARED
+# evidence. A BROWSER floor journey mis-scaffolded as api, "passing" on a text
+# file, is a pass the barrier refuses — so it must not reset the clock either.
+# Nor does a marker that is not its own contract's (another build's sourceSha).
+jq '.journeys[0].maxIntervalDays = 3' "$EXAMPLE" > "$WORK/browser-floor.json"
+due_browser() { python3 "$TOOL" floor-due "$WORK/browser-floor.json" "$ROOT" --size light --as-of "$NOW" | jq -c '[.entries[] | select(.id == "loan-desk-checkout")][0]'; }
+floor_run r3 2026-09-09T18:00:00Z '["notes.txt"]' api loan-desk-checkout
+expect 3-mislabelled-api-pass-no-reset '.overdue == true and .lastProvenAt == null' "$(due_browser)"
+floor_run r4 2026-09-09T18:00:00Z '["desk.png"]' "" loan-desk-checkout "$(printf 'c%.0s' $(seq 40))"
+expect 3-foreign-marker-no-reset '.overdue == true and .lastProvenAt == null' "$(due_browser)"
+floor_run r5 2026-09-09T18:00:00Z '["desk.png"]' "" loan-desk-checkout
+# (r5 never creates desk.png: a real relative media citation whose file
+# retention has since pruned still counts -- existence is the barrier's half.)
+expect 3-real-browser-pass-resets '.overdue == false and .lastProvenAt == "2026-09-09T18:00:00Z"' "$(due_browser)"
+rm -rf "$ROOT/r3" "$ROOT/r4" "$ROOT/r5"
+# CITATION VALIDITY IS NOT RELAXED with existence: a skip note that happens to
+# end in a media extension, an absolute path, or a traversal is not a citation
+# of run media, so it proves nothing and resets nothing.
+floor_run r5a 2026-09-09T18:00:00Z '["clip-skipped: F1: could not record capture.webm"]' "" loan-desk-checkout
+expect 3-skip-note-no-reset '.overdue == true and .lastProvenAt == null' "$(due_browser)"
+floor_run r5b 2026-09-09T18:00:00Z '["/tmp/desk.png"]' "" loan-desk-checkout
+expect 3-absolute-path-no-reset '.overdue == true and .lastProvenAt == null' "$(due_browser)"
+floor_run r5c 2026-09-09T18:00:00Z '["../other-run/desk.png"]' "" loan-desk-checkout
+expect 3-traversal-no-reset '.overdue == true and .lastProvenAt == null' "$(due_browser)"
+rm -rf "$ROOT/r5a" "$ROOT/r5b" "$ROOT/r5c"
+# ...and the barrier's COMPLETE pass bar: a pass citing nothing, or a marker
+# whose sourceSha is missing on both sides (null == null), proves nothing.
+floor_run r6 2026-09-09T18:00:00Z '[]' api
+expect 3-empty-evidence-no-reset '.entries[0].lastProvenAt == "2026-09-09T12:00:00Z"' "$(python3 "$TOOL" floor-due "$CATALOGUE" "$ROOT" --size light --as-of "$NOW" | jq -c '{entries:[.entries[] | select(.id == "branch-scope-crossing")]}')"
+rm -rf "$ROOT/r6"
+floor_run r7 2026-09-09T18:00:00Z '["api.txt"]' api
+jq 'del(.sourceSha)' "$ROOT/r7/markers/branch-scope-crossing.json" > "$ROOT/r7/m.tmp"; mv "$ROOT/r7/m.tmp" "$ROOT/r7/markers/branch-scope-crossing.json"
+jq 'del(.sourceSha)' "$ROOT/r7/completion-contract.json" > "$ROOT/r7/c.tmp"; mv "$ROOT/r7/c.tmp" "$ROOT/r7/completion-contract.json"
+expect 3-null-sha-no-reset '.entries[0].lastProvenAt == "2026-09-09T12:00:00Z"' "$(python3 "$TOOL" floor-due "$CATALOGUE" "$ROOT" --size light --as-of "$NOW" | jq -c '{entries:[.entries[] | select(.id == "branch-scope-crossing")]}')"
+rm -rf "$ROOT/r7"
+# A pair RE-FREEZE retires evidence gathered before it: the barrier refuses a
+# generation-1 pass after `refreeze` snapshotted generation 1 until the lane is
+# redispatched (refreeze-lanes.jq rl_stale_after_refreeze), and cadence reads
+# that same definition — the stale pass resets nothing; the gen-2 pass does.
+floor_run r8 2026-09-09T18:00:00Z '["api.txt"]' api
+mkdir -p "$ROOT/r8/coordinator"
+jq -n --arg sha "$SHA" '{history:[{at:"2026-09-09T17:00:00Z"}],freezeGeneration:2,
+  refreezeLaneSnapshot:{contractPresent:true,sourceSha:$sha,lanes:[{id:"branch-scope-crossing",generation:1}]}}' > "$ROOT/r8/coordinator/identity.json"
+expect 3-refreeze-stale-no-reset '.entries[0].lastProvenAt == "2026-09-09T12:00:00Z"' "$(python3 "$TOOL" floor-due "$CATALOGUE" "$ROOT" --size light --as-of "$NOW" | jq -c '{entries:[.entries[] | select(.id == "branch-scope-crossing")]}')"
+jq '.lanes[0].generation = 2' "$ROOT/r8/completion-contract.json" > "$ROOT/r8/c.tmp"; mv "$ROOT/r8/c.tmp" "$ROOT/r8/completion-contract.json"
+jq '.generation = 2' "$ROOT/r8/markers/branch-scope-crossing.json" > "$ROOT/r8/m.tmp"; mv "$ROOT/r8/m.tmp" "$ROOT/r8/markers/branch-scope-crossing.json"
+expect 3-redispatched-pass-resets '.entries[0].lastProvenAt == "2026-09-09T18:00:00Z"' "$(python3 "$TOOL" floor-due "$CATALOGUE" "$ROOT" --size light --as-of "$NOW" | jq -c '{entries:[.entries[] | select(.id == "branch-scope-crossing")]}')"
+printf 'not json' > "$ROOT/r8/coordinator/identity.json"   # unreadable identity: doubt never resets
+expect 3-unreadable-identity-no-reset '.entries[0].lastProvenAt == "2026-09-09T12:00:00Z"' "$(python3 "$TOOL" floor-due "$CATALOGUE" "$ROOT" --size light --as-of "$NOW" | jq -c '{entries:[.entries[] | select(.id == "branch-scope-crossing")]}')"
+rm -rf "$ROOT/r8"
 # In the matcher: the floor journey rides a change that never touched it...
 expect 3-match-floor '[.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"changed"},{"id":"branch-scope-crossing","reason":"floor"}]' \
-  "$(match '["web/src/desk/a.tsx"]' --run-root "$ROOT")"
+  "$(match '["web/src/desk/a.tsx"]' --size standard --run-root "$ROOT")"
 # ...and a native-manual campaign owes the floor only what is overdue.
 expect 3-native-fresh-floor '.route == "native-manual" and [.matchedJourneys[].id] == ["mobile-scan-return"]' \
   "$(match '["mobile/a.tsx"]' --run-root "$ROOT")"
@@ -154,18 +256,33 @@ PIN_FILE="$(gate_pin "$WORK/lease4" "$SHA" '["api/src/reports/export.ts","web/sr
 
 # --- 5. pin-run + barrier -------------------------------------------------------
 RUN="$WORK/run-1"
-new_run() { # <lane-spec-json: [{id,kind,evidence?}]>
+LEASES="$WORK/empty-leases"   # the shared lease dir the barrier looks in; `adopt` points it at a pin's
+share_lease() { # <lease-dir> <pr> [repo-slug]: the shared coordinator lease binding run-1 to its PR and repo,
+  # as smoke-pr-gate.sh lease_acquire writes it (repoSlug slugged like journeys_pin_file)
+  mkdir -p "$1"; jq -n --argjson pr "$2" --arg slug "${3:-org__repo}" \
+    '{schemaVersion:1,pr:$pr,runId:"run-1",owner:"owner-1",repoSlug:$slug}' > "$1/lease-run-1.json"
+}
+new_run() { # <lane-spec-json: [{id,kind,evidence?}]> — a PR campaign (#7, repo org/repo) claimed on $SHA,
+  # its contract carrying the campaign identity the scaffold stamps under the gate fence (schemaVersion 2)
   rm -rf "$RUN"; mkdir -p "$RUN/markers"
-  jq -n --arg sha "$SHA" --argjson lanes "$1" '{schemaVersion:1,runId:"run-1",sourceSha:$sha,
-    coordinatorOwnerToken:null,ownershipKind:"develop",lanes:($lanes | map(. + {generation:1})),
+  jq -n --arg sha "$SHA" --argjson lanes "$1" '{schemaVersion:2,runId:"run-1",sourceSha:$sha,pr:7,repoSlug:"org__repo",
+    coordinatorOwnerToken:"owner-1",ownershipKind:"pr",lanes:($lanes | map(. + {generation:1})),
     requiredLaneMarkers:($lanes | map("markers/" + .id + ".json"))}' > "$RUN/completion-contract.json"
+}
+contract_edit() { # <jq filter>: rewrite the run's contract in place
+  jq "$1" "$RUN/completion-contract.json" > "$RUN/c.tmp"; mv "$RUN/c.tmp" "$RUN/completion-contract.json"
+}
+adopt() { # <gate pin>: the campaign's lease dir is wherever its pin is; pin-run it into the run
+  LEASES="$(dirname "$1")"; share_lease "$LEASES" 7
+  python3 "$TOOL" pin-run "$RUN" "$1"
 }
 marker() { # <lane> <status> <evidence-json>
   jq -n --arg sha "$SHA" --arg lane "$1" --arg st "$2" --argjson ev "$3" \
     '{sourceSha:$sha,lane:$lane,generation:1,status:$st,completedAt:"2026-09-10T01:00:00Z",evidence:$ev}' \
     > "$RUN/markers/$1.json"
 }
-barrier() { bash "$BARRIER" "$RUN" lanes || true; }
+barrier() { SMOKE_GATE_LEASE_DIR="$LEASES" bash "$BARRIER" "$RUN" lanes || true; }
+share_lease "$LEASES" 7   # a lease and no pin is "no pin"; no lease at all is an incomplete identity (5b)
 
 # No pinned selection: the barrier is exactly what it was.
 new_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
@@ -173,6 +290,7 @@ expect 5-no-selection '.ready == true' "$(barrier)"
 
 # Pinned, but the matched journey was never given a lane, and the unmapped
 # path has no disposition: not ready, both named.
+LEASES="$(dirname "$PIN_FILE")"; share_lease "$LEASES" 7
 expect 5-pin-run '.ok == true and .alreadyPinned == false' "$(python3 "$TOOL" pin-run "$RUN" "$PIN_FILE")"
 cmp -s "$RUN/journeys/selection.json" "$PIN_FILE" || fail "5: run selection is not the gate pin's bytes"
 cmp -s "$RUN/journeys/catalogue.json" "$EXAMPLE" || fail "5: run catalogue is not the pinned snapshot"
@@ -186,7 +304,7 @@ expect 5-missing-lane-and-disposition '.ready == false and (.missing | index("jo
 
 # Lane declared but not terminal: the existing marker loop owns that.
 new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"report-export","kind":"lane"}]'
-python3 "$TOOL" pin-run "$RUN" "$PIN_FILE" >/dev/null
+adopt "$PIN_FILE" >/dev/null
 disposition() { printf '%s' "$1" > "$RUN/journeys/scope-dispositions.json"; }
 disposition '{"schemaVersion":1,"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"export consumers not traceable on this build"}]}'
 expect 5-marker-still-required '.ready == false and (.missing | index("markers/loan-desk-checkout.json"))' "$(barrier)"
@@ -228,7 +346,7 @@ expect 5-run-catalogue-edited 'any(.invalidReasons[]; test("edited after it was 
 # the tester's recorded result, never on the packet.
 NATIVE_PIN="$(gate_pin "$WORK/lease5" "$SHA" '["mobile/a.tsx","api/src/fines/list.ts"]')"
 new_run '[{"id":"mobile-scan-return","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"}]'
-python3 "$TOOL" pin-run "$RUN" "$NATIVE_PIN" >/dev/null
+adopt "$NATIVE_PIN" >/dev/null
 printf 'packet' > "$RUN/manual-packet.md"
 marker branch-scope-crossing blocked '[]'; marker mobile-scan-return completed '["manual-packet.md"]'
 expect 5-packet-issued-is-terminal '.ready == true' "$(barrier)"
@@ -238,9 +356,23 @@ mkdir -p "$RUN/manual-results"; printf 'passed on build 412 by the named tester'
 marker mobile-scan-return pass '["manual-results/mobile-scan-return.md"]'
 expect 5-recorded-result-passes '.ready == true' "$(barrier)"
 new_run '[{"id":"mobile-scan-return","kind":"floor","evidence":"api"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"}]'
-python3 "$TOOL" pin-run "$RUN" "$NATIVE_PIN" >/dev/null
+adopt "$NATIVE_PIN" >/dev/null
 marker branch-scope-crossing blocked '[]'; marker mobile-scan-return blocked '[]'
 expect 5-api-laundering 'any(.invalidReasons[]; test("scaffolded --evidence api but its journey declares evidence native-manual"))' "$(barrier)"
+# ...and the other way: an api journey whose lane was NOT scaffolded api reads
+# as a browser floor lane, where any media-looking file clears it and resets
+# the cadence clock for a proof that was never an API contract check.
+new_run '[{"id":"mobile-scan-return","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor"}]'
+adopt "$NATIVE_PIN" >/dev/null
+printf 'png' > "$RUN/shot.png"
+marker branch-scope-crossing pass '["shot.png"]'; marker mobile-scan-return blocked '[]'
+expect 5-api-journey-needs-api-lane '.ready == false and any(.invalidReasons[]; test("journey branch-scope-crossing declares evidence api but its lane was not scaffolded"))' "$(barrier)"
+# A disposition's journey is held to the same rule; a new-journey has no grant.
+new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"report-export","kind":"lane","evidence":"api"}]'
+adopt "$PIN_FILE" >/dev/null
+marker loan-desk-checkout blocked '[]'; marker report-export blocked '[]'
+disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"new-journey","journeyId":"report-export"}]}'
+expect 5-new-journey-no-api-grant 'any(.invalidReasons[]; test("lane report-export is scaffolded --evidence api"))' "$(barrier)"
 
 # --- 5b. enforcement follows the GATE's pin, not the run's bookkeeping ---------
 # A pr-owned run whose campaign the gate pinned cannot escape by skipping
@@ -248,11 +380,7 @@ expect 5-api-laundering 'any(.invalidReasons[]; test("scaffolded --evidence api 
 # The barrier finds the pin in the SHARED lease dir, by the contract's sourceSha.
 GATE_LEASES="$WORK/shared/qa-coordinator/leases"
 GATE_PIN="$(gate_pin "$GATE_LEASES" "$SHA" '["api/src/reports/export.ts","web/src/desk/a.tsx"]')"
-pr_run() { # lanes as new_run, but claimed by a PR campaign on $SHA
-  new_run "$1"
-  jq '.ownershipKind = "pr" | .coordinatorOwnerToken = "owner-1"' "$RUN/completion-contract.json" > "$RUN/c.tmp"
-  mv "$RUN/c.tmp" "$RUN/completion-contract.json"
-}
+pr_run() { new_run "$1"; LEASES="$GATE_LEASES"; share_lease "$GATE_LEASES" 7; }
 gate_barrier() { SMOKE_GATE_LEASE_DIR="$GATE_LEASES" bash "$BARRIER" "$RUN" lanes || true; }
 pr_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
 NO_PIN_OUT="$(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$RUN" lanes)"
@@ -262,39 +390,452 @@ expect 5b-skipped-pin-run '.ready == false and (.invalid | index("journeys/selec
   any(.invalidReasons[]; test("never adopted it") and test("pin-run"))' "$(gate_barrier)"
 # A different head SHA's pin, or a develop-owned run, is not this campaign's.
 gate_pin "$WORK/other-leases" "$(printf 'b%.0s' $(seq 40))" '["web/src/desk/a.tsx"]' >/dev/null
+share_lease "$WORK/other-leases" 7
 expect 5b-other-head '.ready == true' "$(SMOKE_GATE_LEASE_DIR="$WORK/other-leases" bash "$BARRIER" "$RUN" lanes)"
 # The lease dir also resolves from the shared root alone, as the gate's does.
 expect 5b-shared-root-default '.ready == false' "$(SMOKE_GATE_SHARED_ROOT="$WORK/shared" bash "$BARRIER" "$RUN" lanes || true)"
 # Adopting a doctored copy (unmapped path dropped) is refused by bytes...
 mkdir -p "$RUN/journeys"; jq -c '.unmappedPaths = []' "$GATE_PIN" > "$RUN/journeys/selection.json"
 cp "$EXAMPLE" "$RUN/journeys/catalogue.json"
-expect 5b-narrowed-copy '.ready == false and any(.invalidReasons[]; test("does not match the gate.s pin"))' "$(gate_barrier)"
+expect 5b-narrowed-copy '.ready == false and any(.invalidReasons[]; test("does not match this campaign.s own gate pin"))' "$(gate_barrier)"
 # ...and so is a selection pinned from another catalogue version (sha mismatch).
 jq -c '.catalogueSha256 = "0000"' "$GATE_PIN" > "$RUN/journeys/selection.json"
-expect 5b-sha-mismatch 'any(.invalidReasons[]; test("catalogueSha256 run=0000 gate=[0-9a-f]{64}"))' "$(gate_barrier)"
+expect 5b-sha-mismatch 'any(.invalidReasons[]; test("catalogueSha256=0000; gate catalogueSha256=[0-9a-f]{64}"))' "$(gate_barrier)"
 # The real thing: pin-run, lanes, disposition => ready.
 pr_run '[{"id":"loan-desk-checkout","kind":"lane"}]'; marker loan-desk-checkout blocked '[]'
-python3 "$TOOL" pin-run "$RUN" "$GATE_PIN" >/dev/null
+adopt "$GATE_PIN" >/dev/null
 disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
 expect 5b-adopted '.ready == true' "$(gate_barrier)"
-# Only a VALID pin binds. What the gate reports as pinState:"invalid" (a
-# symlink, a directory, truncated JSON) has no selection to adopt, so it cannot
-# hold a run hostage — the campaign is already `full` by the gate's own word.
-pr_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
-for kind in truncated symlink directory; do
-  rm -rf "$WORK/bad-leases"; mkdir -p "$WORK/bad-leases"
-  bad="$WORK/bad-leases/journeys-pin-org__repo-pr-7-$SHA.json"
+# ONE OWNING PIN. Two more campaigns pinned the SAME head sha in the shared
+# lease dir — another PR (#8) and the same PR number in another repo — each
+# with a NARROWER scope (nothing unmapped). The run binds to repo+PR+head, its
+# own: its own bytes stay ready, a sibling's bytes are refused by name.
+PIN_PR8="$(gate_pin "$GATE_LEASES" "$SHA" '["web/src/desk/a.tsx"]' 8)"
+expect 5b-sibling-pr-ignored '.ready == true' "$(gate_barrier)"
+cp "$PIN_PR8" "$RUN/journeys/selection.json"
+expect 5b-adopted-sibling-pr '.ready == false and any(.invalidReasons[];
+  test("own gate pin .*journeys-pin-org__repo-pr-7-") and test("run adopted pinFile=.*-pr-8-"))' "$(gate_barrier)"
+cp "$GATE_PIN" "$RUN/journeys/selection.json"
+PIN_FORK="$(gate_pin "$GATE_LEASES" "$SHA" '["web/src/desk/a.tsx"]' 7 other__fork)"
+# Two repos, same PR number and sha, in one shared lease dir: WHICH is this
+# campaign is the CONTRACT's `repoSlug` (stamped by the scaffold under the
+# gate fence from the gate's lease), never a guess, never the environment,
+# never the lease itself — the lease is deleted by finish, the contract stays.
+contract_repo() { contract_edit ".repoSlug = \"$1\""; }
+repo_barrier() { SMOKE_GATE_REPO="$1" SMOKE_GATE_LEASE_DIR="$GATE_LEASES" bash "$BARRIER" "$RUN" lanes || true; }
+expect 5b-own-repo '.ready == true' "$(gate_barrier)"
+expect 5b-env-is-not-identity '.ready == true' "$(repo_barrier other/fork)"   # the contract says org/repo
+share_lease "$GATE_LEASES" 7 other__fork
+expect 5b-lease-is-not-identity '.ready == true' "$(gate_barrier)"   # nor is the lease
+share_lease "$GATE_LEASES" 7
+cp "$PIN_FORK" "$RUN/journeys/selection.json"
+expect 5b-adopted-other-repo '.ready == false and any(.invalidReasons[];
+  test("own gate pin .*journeys-pin-org__repo-pr-7-") and test("run adopted pinFile=.*other__fork"))' "$(gate_barrier)"
+contract_repo other__fork
+expect 5b-fork-owns-its-own '.ready == true' "$(gate_barrier)"   # the same bytes ARE the fork campaign's own
+# A repo with no pin of its own for this (PR, head) owns none of these: a
+# selection carried in anyway is nobody's, and without one it is the no-pin case.
+contract_repo third__repo; cp "$GATE_PIN" "$RUN/journeys/selection.json"
+expect 5b-third-repo-foreign-selection '.ready == false and any(.invalidReasons[]; test("no gate pin owns it"))' "$(gate_barrier)"
+mv "$RUN/journeys" "$WORK/journeys.aside"
+expect 5b-third-repo-no-pin '.ready == true' "$(gate_barrier)"
+mv "$WORK/journeys.aside" "$RUN/journeys"
+contract_repo org__repo
+# IDENTITY OUTLIVES THE LEASE AND NEEDS NO LOCAL CATALOGUE. finish, release
+# and lease-release delete the shared lease; a second coordinator recovering
+# through the shared lease dir may keep no catalogue of its own. Neither
+# changes what the run owes, because the contract carries the identity.
+expect 5b-adopted-baseline '.ready == true' "$(gate_barrier)"
+T5B_OWED="$(gate_barrier)"
+rm -f "$GATE_LEASES/lease-run-1.json"
+[ "$(gate_barrier)" = "$T5B_OWED" ] || fail "5b-lease-deleted-same-answer: deleting the lease changed the answer"
+[ "$(no_catalogue gate_barrier)" = "$T5B_OWED" ] || fail "5b-no-catalogue-same-answer: a coordinator without a catalogue got a different answer"
+mv "$RUN/journeys" "$WORK/journeys.aside"
+expect 5b-second-coordinator-no-catalogue-enforced '.ready == false and any(.invalidReasons[]; test("never adopted it") and test("pin-run"))' "$(no_catalogue gate_barrier)"
+expect 5b-lease-deleted-still-enforced '.ready == false and any(.invalidReasons[]; test("never adopted it"))' "$(gate_barrier)"
+mv "$WORK/journeys.aside" "$RUN/journeys"
+# An ORDINARY completed PR (no pin for its identity) rechecked after finish:
+# the same ready answer, catalogue or not, lease or not.
+contract_repo third__repo; mv "$RUN/journeys" "$WORK/journeys.aside"
+T5B_ORD="$(gate_barrier)"
+expect 5b-ordinary-after-finish '.ready == true' "$T5B_ORD"
+[ "$(no_catalogue gate_barrier)" = "$T5B_ORD" ] || fail "5b-ordinary-after-finish-no-catalogue: not byte-identical"
+share_lease "$GATE_LEASES" 7
+[ "$(gate_barrier)" = "$T5B_ORD" ] || fail "5b-ordinary-with-lease: the lease changed an ordinary run's answer"
+mv "$WORK/journeys.aside" "$RUN/journeys"; contract_repo org__repo
+# ABSENT IDENTITY IS REFUSED, NEVER LEGACY. A pr contract that predates campaign
+# identity (schemaVersion 1) and a v2 one missing a field are both refused,
+# naming adopt/regenerate — the scaffold's fenced adopt backfills them.
+contract_edit '.schemaVersion = 1 | del(.pr) | del(.repoSlug)'
+expect 5b-v1-contract-refused '.ready == false and (.invalid[0] | test("completion-contract.json")) and
+  any(.invalidReasons[]; test("predates campaign identity") and test("adopt"))' "$(gate_barrier)"
+mv "$RUN/journeys" "$WORK/journeys.aside"
+expect 5b-v1-contract-refused-even-unpinned-shape '.ready == false and any(.invalidReasons[]; test("predates campaign identity"))' "$(no_catalogue gate_barrier)"
+mv "$WORK/journeys.aside" "$RUN/journeys"
+contract_edit '.schemaVersion = 2 | .pr = 7'
+expect 5b-v2-missing-repo-refused '.ready == false and any(.invalidReasons[]; test("no complete campaign identity"))' "$(gate_barrier)"
+contract_edit '.repoSlug = "org__repo" | del(.pr)'
+expect 5b-v2-missing-pr-refused '.ready == false and any(.invalidReasons[]; test("no complete campaign identity"))' "$(gate_barrier)"
+contract_edit '.pr = 7'
+expect 5b-identity-restored '.ready == true' "$(gate_barrier)"
+# The environment's repo is never consulted: a contract is complete on its own.
+expect 5b-env-ignored-with-identity '.ready == true' "$(SMOKE_GATE_REPO=other/fork gate_barrier)"
+# THE RUN NEVER AUTHORS WHAT IT IS HELD TO. An invalid primary pin is never "no
+# pin", and the only thing that can stand in for it is the GATE's recovery pin
+# (`…-recovery.json`: every catalogue journey owed) — judged by the same one
+# predicate the gate uses. Nothing assembled on the run side counts.
+ALL_LANES='[{"id":"loan-desk-checkout","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"},{"id":"mobile-scan-return","kind":"lane"}]'
+SHAPE_ONLY='{"pinned":true,"matchedJourneys":[],"unmappedPaths":[]}'
+for kind in truncated symlink directory shape-only; do
+  BAD_LEASES="$WORK/bad-leases-$kind"; rm -rf "$BAD_LEASES"; share_lease "$BAD_LEASES" 7
+  bad="$BAD_LEASES/journeys-pin-org__repo-pr-7-$SHA.json"
   case "$kind" in
     truncated) printf '{"pinned":tr' > "$bad" ;;
     symlink) ln -s "$GATE_PIN" "$bad" ;;
     directory) mkdir "$bad" ;;
+    shape-only) printf '%s' "$SHAPE_ONLY" > "$bad" ;;   # the gate's old jq check refused this; read_gate_pin took it
   esac
-  expect "5b-invalid-pin-$kind" '.ready == true' "$(SMOKE_GATE_LEASE_DIR="$WORK/bad-leases" bash "$BARRIER" "$RUN" lanes)"
+  LEASES="$BAD_LEASES"
+  expect "5b-$kind-pin-check" '.state == "invalid"' "$(python3 "$TOOL" pin-check "$bad" --pr 7 --head "$SHA" --repo-slug org__repo)"
+  # No recovery pin: NOT ready, both files named, whatever the run holds.
+  new_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
+  expect "5b-$kind-no-recovery" '.ready == false and any(.invalidReasons[]; test("no usable journeys pin") and test("neither journeys pin .*-recovery.json \\(absent\\)"))' "$(barrier)"
+  expect "5b-$kind-pin-run-refuses" '.ok == false and (.error | test("not a valid gate pin"))' "$(python3 "$TOOL" pin-run "$RUN" "$bad" || true)"
+  # A hand-written "rebuilt" selection (the retired run-side recovery) is just
+  # bytes that are not the gate's.
+  mkdir -p "$RUN/journeys"; cp "$EXAMPLE" "$RUN/journeys/catalogue.json"
+  jq -cn --arg p "$bad" '{schemaVersion:1,selection:"full",rebuilt:true,invalidPin:{path:$p},catalogueValid:false,matchedJourneys:[],unmappedPaths:[]}' > "$RUN/journeys/selection.json"
+  printf '{"dispositions":[{"disposition":"scope-rebuilt","reason":"x"}]}' > "$RUN/journeys/scope-dispositions.json"
+  expect "5b-$kind-hand-rebuilt-refused" '.ready == false' "$(barrier)"
+  # The gate's recovery pin owns the run: every journey, lane by lane.
+  RECOVERY="$(gate_pin "$BAD_LEASES" "$SHA" '["api/src/reports/export.ts","web/src/desk/a.tsx"]' 7 org__repo recovery)"
+  expect "5b-$kind-recovery-valid" '.state == "valid" and .pin.recovery == true and
+    [.pin.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"pin-recovered"},{"id":"branch-scope-crossing","reason":"pin-recovered"},{"id":"mobile-scan-return","reason":"pin-recovered"}] and
+    .pin.unmappedPaths == ["api/src/reports/export.ts"]' "$(python3 "$TOOL" pin-check "$RECOVERY" --pr 7 --head "$SHA")"
+  expect "5b-$kind-hand-rebuilt-still-refused" '.ready == false and any(.invalidReasons[]; test("does not match this campaign.s own gate pin .*-recovery.json"))' "$(barrier)"
+  new_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
+  expect "5b-$kind-recovery-must-be-adopted" 'any(.invalidReasons[]; test("pin-run .*-recovery.json"))' "$(barrier)"
+  new_run "$ALL_LANES"; adopt "$RECOVERY" >/dev/null
+  cmp -s "$RUN/journeys/selection.json" "$RECOVERY" || fail "5b: recovery adoption is not byte-for-byte"
+  for lane in loan-desk-checkout branch-scope-crossing mobile-scan-return; do marker "$lane" blocked '[]'; done
+  disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
+  expect "5b-$kind-recovered-ready" '.ready == true' "$(barrier)"
+  new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"}]'; adopt "$RECOVERY" >/dev/null
+  marker loan-desk-checkout blocked '[]'; marker branch-scope-crossing blocked '[]'
+  disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
+  expect "5b-$kind-recovery-lane-per-journey" 'any(.invalidReasons[]; test("matched journey mobile-scan-return \\(pin-recovered\\) has no lane"))' "$(barrier)"
+  # STABLE OWNER: a recovery pin, once it exists, owns — even if the primary
+  # later reads as valid again (a fixture swap here; a checker hiccup in life).
+  # The run holding the recovery bytes stays ready; primary bytes are refused.
+  case "$kind" in directory) rm -rf "$bad" ;; *) rm -f "$bad" ;; esac
+  cp "$GATE_PIN" "$bad"
+  expect "5b-$kind-owner-is-recovery" '.state == "valid" and (.owner | test("-recovery.json$")) and .primary.state == "valid"' \
+    "$(python3 "$TOOL" pin-check "$bad" --owner --pr 7 --head "$SHA")"
+  new_run "$ALL_LANES"; adopt "$RECOVERY" >/dev/null
+  for lane in loan-desk-checkout branch-scope-crossing mobile-scan-return; do marker "$lane" blocked '[]'; done
+  disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
+  expect "5b-$kind-recovery-still-owns" '.ready == true' "$(barrier)"
+  new_run '[{"id":"loan-desk-checkout","kind":"lane"}]'; adopt "$bad" >/dev/null   # adopts the now-valid primary bytes
+  marker loan-desk-checkout blocked '[]'; disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
+  expect "5b-$kind-primary-bytes-refused" '.ready == false and any(.invalidReasons[]; test("own gate pin .*-recovery.json"))' "$(barrier)"
+  # An invalid recovery pin is as good as none (primary back to invalid too).
+  printf '{"pinned":tr' > "$bad"
+  printf '%s' "$SHAPE_ONLY" > "$WORK/r.tmp"; cat "$WORK/r.tmp" > "$RECOVERY"
+  expect "5b-$kind-both-invalid" '.ready == false and any(.invalidReasons[]; test("no usable journeys pin") and test("neither journeys pin"))' "$(barrier)"
 done
+# UNAVAILABLE IS NOT INVALID: a pin (or its snapshot) nobody can read is no
+# verdict — the owner is undecided, the run is not ready, and nothing licenses
+# a recovery. (Skipped as root, where chmod 000 still reads.)
+if [ "$(id -u)" != 0 ]; then
+  U_LEASES="$WORK/unavail-leases"; rm -rf "$U_LEASES"; share_lease "$U_LEASES" 7
+  U_PIN="$(gate_pin "$U_LEASES" "$SHA" '["web/src/desk/a.tsx"]')"
+  new_run '[{"id":"loan-desk-checkout","kind":"lane"}]'; adopt "$U_PIN" >/dev/null; marker loan-desk-checkout blocked '[]'
+  chmod 000 "$U_PIN"
+  expect 5b-unavailable-pin '.state == "unavailable" and (.primary.reason | test("could not be read"))' "$(python3 "$TOOL" pin-check "$U_PIN" --owner --pr 7 --head "$SHA")"
+  expect 5b-unavailable-pin-barrier '.ready == false and any(.invalidReasons[]; test("no usable journeys pin") and test("could not be read"))' "$(barrier)"
+  chmod 644 "$U_PIN"; chmod 000 "$U_LEASES"/journeys-catalogue-*.json
+  expect 5b-unavailable-snapshot '.state == "unavailable" and (.primary.reason | test("snapshot could not be read"))' "$(python3 "$TOOL" pin-check "$U_PIN" --owner --pr 7 --head "$SHA")"
+  chmod 644 "$U_LEASES"/journeys-catalogue-*.json
+  expect 5b-available-again '.state == "valid" and .owner == "'"$U_PIN"'"' "$(python3 "$TOOL" pin-check "$U_PIN" --owner --pr 7 --head "$SHA")"
+fi
+
+# NOTHING IS ENUMERATED. The pin is looked up by the contract's identity and
+# probed by exact name, so a lease dir that can be SEARCHED but not LISTED
+# (0300) is a healthy install's — byte-identical — and a symlinked lease dir
+# is followed the way the gate and scaffold follow it. A probe that FAILED
+# (unreachable dir, EACCES on the pin, a leaf symlink where a pin should be)
+# is refused for a pr-owned run, naming what failed — DELIBERATELY with or
+# without a catalogue: a PR run could not have written its markers without
+# that same shared storage, so this is a retryable fail-closed refusal. A
+# develop-owned run never takes pin obligations from there and is unchanged.
+new_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
+NO_PIN_PR_OUT="$(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$RUN" lanes)"
+expect 5b-no-pin-baseline '.ready == true' "$NO_PIN_PR_OUT"
+[ "$(no_catalogue env SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$RUN" lanes)" = "$NO_PIN_PR_OUT" ] ||
+  fail "5b-no-catalogue-no-pin: the no-pin answer differs with and without a catalogue"
+MISSING_LEASES="$WORK/never-created-leases"
+expect 5b-lease-dir-missing-pr '.ready == false and (.invalid | index("journeys/selection.json")) and
+  any(.invalidReasons[]; test("could not be looked up") and test("never-created-leases") and test("could not be reached"))' \
+  "$(SMOKE_GATE_LEASE_DIR="$MISSING_LEASES" bash "$BARRIER" "$RUN" lanes || true)"
+expect 5b-lease-dir-missing-pr-no-catalogue '.ready == false and any(.invalidReasons[]; test("could not be looked up") and test("never-created-leases"))' \
+  "$(no_catalogue env SMOKE_GATE_LEASE_DIR="$MISSING_LEASES" bash "$BARRIER" "$RUN" lanes || true)"
+SYML_LEASES="$WORK/symlinked-leases"; ln -s "$GATE_LEASES" "$SYML_LEASES"
+expect 5b-lease-dir-symlink-followed '.ready == false and any(.invalidReasons[]; test("never adopted it") and test("pin-run"))' \
+  "$(SMOKE_GATE_LEASE_DIR="$SYML_LEASES" bash "$BARRIER" "$RUN" lanes || true)"
+mkdir -p "$WORK/symlink-root/qa-coordinator"; ln -s "$GATE_LEASES" "$WORK/symlink-root/qa-coordinator/leases"
+expect 5b-lease-dir-symlink-shared-root '.ready == false and any(.invalidReasons[]; test("never adopted it"))' \
+  "$(SMOKE_GATE_SHARED_ROOT="$WORK/symlink-root" bash "$BARRIER" "$RUN" lanes || true)"
+jq '.ownershipKind = "develop" | .coordinatorOwnerToken = null' "$RUN/completion-contract.json" > "$RUN/c.tmp"; mv "$RUN/c.tmp" "$RUN/completion-contract.json"
+DEVELOP_EMPTY_OUT="$(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$RUN" lanes)"
+expect 5b-lease-dir-develop-baseline '.ready == true' "$DEVELOP_EMPTY_OUT"
+[ "$(SMOKE_GATE_LEASE_DIR="$MISSING_LEASES" bash "$BARRIER" "$RUN" lanes)" = "$DEVELOP_EMPTY_OUT" ] ||
+  fail "5b-lease-dir-missing-develop: a develop-owned run's answer changed with the lease dir missing"
+if [ "$(id -u)" != 0 ]; then  # chmod still reads as root
+  UNSEARCHABLE="$WORK/unsearchable-leases"; share_lease "$UNSEARCHABLE" 7; chmod 000 "$UNSEARCHABLE"
+  [ "$(SMOKE_GATE_LEASE_DIR="$UNSEARCHABLE" bash "$BARRIER" "$RUN" lanes)" = "$DEVELOP_EMPTY_OUT" ] ||
+    fail "5b-lease-dir-unsearchable-develop: a develop-owned run's answer changed with the lease dir unreadable"
+  new_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
+  expect 5b-lease-dir-unsearchable-pr '.ready == false and (.invalid | index("journeys/selection.json")) and
+    any(.invalidReasons[]; test("could not be looked up") and test("unsearchable-leases") and test("Permission denied"))' \
+    "$(SMOKE_GATE_LEASE_DIR="$UNSEARCHABLE" bash "$BARRIER" "$RUN" lanes || true)"
+  expect 5b-lease-dir-unsearchable-pr-no-catalogue '.ready == false and any(.invalidReasons[]; test("could not be looked up") and test("Permission denied"))' \
+    "$(no_catalogue env SMOKE_GATE_LEASE_DIR="$UNSEARCHABLE" bash "$BARRIER" "$RUN" lanes || true)"
+  # Search-but-not-list (0300): named reads work, listing does not. No pin
+  # => the legacy answer, byte for byte, catalogue or not...
+  chmod 300 "$UNSEARCHABLE"
+  [ "$(SMOKE_GATE_LEASE_DIR="$UNSEARCHABLE" bash "$BARRIER" "$RUN" lanes)" = "$NO_PIN_PR_OUT" ] ||
+    fail "5b-lease-dir-0300-no-pin: a search-only lease dir with no pin is not byte-identical to the no-pin answer"
+  [ "$(no_catalogue env SMOKE_GATE_LEASE_DIR="$UNSEARCHABLE" bash "$BARRIER" "$RUN" lanes)" = "$NO_PIN_PR_OUT" ] ||
+    fail "5b-lease-dir-0300-no-catalogue: not byte-identical"
+  # ...and WITH a pin the pin is found and enforced, listing permission or not.
+  chmod 755 "$UNSEARCHABLE"; U300_PIN="$(gate_pin "$UNSEARCHABLE" "$SHA" '["web/src/desk/a.tsx"]')"; chmod 300 "$UNSEARCHABLE"
+  expect 5b-lease-dir-0300-pin-enforced '.ready == false and any(.invalidReasons[]; test("never adopted it") and test("pin-run"))' \
+    "$(SMOKE_GATE_LEASE_DIR="$UNSEARCHABLE" bash "$BARRIER" "$RUN" lanes || true)"
+  chmod 755 "$UNSEARCHABLE"
+  # The lease is not an identity source: unreadable, it changes nothing — the
+  # pin (still there) is found by the contract's identity and enforced.
+  chmod 000 "$UNSEARCHABLE/lease-run-1.json"
+  expect 5b-lease-unreadable-irrelevant '.ready == false and any(.invalidReasons[]; test("never adopted it"))' \
+    "$(SMOKE_GATE_LEASE_DIR="$UNSEARCHABLE" bash "$BARRIER" "$RUN" lanes || true)"
+  chmod 644 "$UNSEARCHABLE/lease-run-1.json"
+else
+  echo "note: lease-dir permission fixtures skipped (running as root, chmod still reads)" >&2
+fi
+# A RUN DIR REACHED THROUGH A SYMLINK (run-alias → run-storage) is fenced,
+# written and adopted as run-alias by the scaffold (basename, unresolved); the
+# barrier derives the same id. Ordinary, no pin ⇒ ready and byte-identical to
+# the no-pin answer; with a pin ⇒ enforced.
+ALIAS_RUN="$WORK/run-storage"; mkdir -p "$ALIAS_RUN/markers"; ln -s "$ALIAS_RUN" "$WORK/run-alias"
+jq -n --arg sha "$SHA" '{schemaVersion:2,runId:"run-alias",sourceSha:$sha,pr:7,repoSlug:"org__repo",
+  coordinatorOwnerToken:"owner-1",ownershipKind:"pr",lanes:[{id:"A1",kind:"lane",generation:1}],
+  requiredLaneMarkers:["markers/A1.json"]}' > "$ALIAS_RUN/completion-contract.json"
+jq -n --arg sha "$SHA" '{sourceSha:$sha,lane:"A1",generation:1,status:"blocked",completedAt:"2026-09-10T01:00:00Z",evidence:[]}' > "$ALIAS_RUN/markers/A1.json"
+[ "$(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$WORK/run-alias" lanes)" = "$NO_PIN_PR_OUT" ] ||
+  fail "5b-symlinked-run-dir-ordinary: not byte-identical to the no-pin answer: $(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$WORK/run-alias" lanes || true)"
+[ "$(no_catalogue env SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$WORK/run-alias" lanes)" = "$NO_PIN_PR_OUT" ] ||
+  fail "5b-symlinked-run-dir-ordinary-no-catalogue: not byte-identical"
+expect 5b-symlinked-run-dir-pinned '.ready == false and any(.invalidReasons[]; test("never adopted it") and test("pin-run"))' \
+  "$(SMOKE_GATE_LEASE_DIR="$GATE_LEASES" bash "$BARRIER" "$WORK/run-alias" lanes || true)"
+# A leaf symlink where the pin should be is INVALID, never followed and never "absent".
+LINK_LEASES="$WORK/leaf-link-leases"; share_lease "$LINK_LEASES" 7
+LINK_PIN="$(gate_pin "$WORK/leaf-link-src" "$SHA" '["web/src/desk/a.tsx"]')"
+ln -s "$LINK_PIN" "$LINK_LEASES/$(basename "$LINK_PIN")"
+expect 5b-leaf-symlink-pin-invalid '.state == "invalid" and (.reason | test("symlink"))' "$(python3 "$TOOL" pin-check "$LINK_LEASES/$(basename "$LINK_PIN")" --pr 7 --head "$SHA")"
+expect 5b-leaf-symlink-pin-barrier '.ready == false and any(.invalidReasons[]; test("no usable journeys pin") and test("symlink"))' \
+  "$(SMOKE_GATE_LEASE_DIR="$LINK_LEASES" bash "$BARRIER" "$RUN" lanes || true)"
+# Nothing in the barrier enumerates the lease dir any more: no compgen, find or
+# shell glob over it outside comments — the one lookup is by exact name in
+# smoke-journeys.py, whose probes keep their errno. And nothing reads a lease
+# for IDENTITY: the shell never opens lease-*.json, and the only lease read in
+# smoke-journeys.py is the relabel check's (lease_binding).
+[ "$(grep -v '^[[:space:]]*#' "$BARRIER" | grep -c 'compgen -G\|find "\$JOURNEY_LEASE_DIR\|\$JOURNEY_LEASE_DIR"*/[^"]*[*]\|in "\$JOURNEY_LEASE_DIR"/\|lease-\$')" = 0 ] ||
+  fail "5b-no-enumeration: smoke-evidence-barrier.sh enumerates the lease dir or reads a lease"
+[ "$(grep -c 'def campaign_identity' "$TOOL")" = 0 ] && [ "$(grep -c '"lease-{}.json"' "$TOOL")" = 1 ] ||
+  fail "5b-no-lease-identity: smoke-journeys.py reads the lease for identity"
+
+# A selection with NO gate pin behind it is not the gate's, so it is refused.
+new_run "$ALL_LANES"; LEASES="$WORK/empty-leases"; share_lease "$LEASES" 7
+mkdir -p "$RUN/journeys"; cp "$GATE_PIN" "$RUN/journeys/selection.json"
+expect 5b-selection-without-gate-pin '.ready == false and any(.invalidReasons[]; test("no gate pin owns it"))' "$(barrier)"
+expect 5b-no-pin-file '.ok == false' "$(python3 "$TOOL" pin-run "$RUN" "$WORK/nothing-here.json" || true)"
+# The two identity facts the barrier already has: a contract naming another
+# campaign's run, or calling itself develop-owned while the shared lease binds
+# its run id to a PR, is refused whenever a journeys pin exists for the sha.
+new_run '[{"id":"loan-desk-checkout","kind":"lane"}]'; adopt "$GATE_PIN" >/dev/null; marker loan-desk-checkout blocked '[]'
+disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
+expect 5b-identity-ok '.ready == true' "$(barrier)"
+jq '.runId = "run-2"' "$RUN/completion-contract.json" > "$RUN/c.tmp"; mv "$RUN/c.tmp" "$RUN/completion-contract.json"
+expect 5b-borrowed-run-id '.ready == false and any(.invalidReasons[]; test("runId .run-2. is not this run directory.s name .run-1."))' "$(barrier)"
+jq '.runId = "run-1" | .ownershipKind = "develop" | .coordinatorOwnerToken = null' "$RUN/completion-contract.json" > "$RUN/c.tmp"; mv "$RUN/c.tmp" "$RUN/completion-contract.json"
+rm -rf "$RUN/journeys"
+expect 5b-relabelled-develop '.ready == false and any(.invalidReasons[]; test("declares ownershipKind develop but the shared lease .* binds this run to PR #7"))' "$(barrier)"
+
+# THE ONE PREDICATE, directly. Shape is not validity: identity and the snapshot count.
+expect 5b-check-valid '.state == "valid"' "$(python3 "$TOOL" pin-check "$GATE_PIN" --pr 7 --head "$SHA" --repo-slug org__repo)"
+expect 5b-check-absent '.state == "absent"' "$(python3 "$TOOL" pin-check "$WORK/nope.json" --pr 7 --head "$SHA")"
+expect 5b-check-other-pr '.state == "invalid" and (.reason | test("PR 7, not 8"))' "$(python3 "$TOOL" pin-check "$GATE_PIN" --pr 8 --head "$SHA")"
+expect 5b-check-other-repo '.state == "invalid" and (.reason | test("repo"))' "$(python3 "$TOOL" pin-check "$GATE_PIN" --pr 7 --head "$SHA" --repo-slug other__fork)"
+mkdir -p "$WORK/moved"; cp "$GATE_LEASES"/journeys-catalogue-*.json "$WORK/moved/"; cp "$GATE_PIN" "$WORK/moved/journeys-pin-org__repo-pr-9-$SHA.json"
+expect 5b-check-renamed '.state == "invalid" and (.reason | test("than its file name"))' "$(python3 "$TOOL" pin-check "$WORK/moved/journeys-pin-org__repo-pr-9-$SHA.json")"
+cp "$GATE_PIN" "$WORK/moved/"; for snap in "$WORK/moved"/journeys-catalogue-*.json; do echo >> "$snap"; done
+expect 5b-check-snapshot-tampered '.state == "invalid" and (.reason | test("does not hash"))' "$(python3 "$TOOL" pin-check "$WORK/moved/$(basename "$GATE_PIN")")"
+rm -f "$WORK/moved"/journeys-catalogue-*.json
+expect 5b-check-snapshot-missing '.state == "invalid" and (.reason | test("missing"))' "$(python3 "$TOOL" pin-check "$WORK/moved/$(basename "$GATE_PIN")")"
+jq -c '.matchedJourneys[0].evidence = "api"' "$GATE_PIN" > "$WORK/relabel.json"
+mkdir -p "$WORK/relabel"; cp "$GATE_LEASES"/journeys-catalogue-*.json "$WORK/relabel/"; mv "$WORK/relabel.json" "$WORK/relabel/$(basename "$GATE_PIN")"
+expect 5b-check-evidence-relabelled '.state == "invalid" and (.reason | test("not in its catalogue snapshot with that evidence"))' "$(python3 "$TOOL" pin-check "$WORK/relabel/$(basename "$GATE_PIN")")"
+expect 5b-candidate-empty-full '.state == "invalid" and (.reason | test("names no journey"))' \
+  "$(match '[]' --unknown x | jq -c '.matchedJourneys = [] | .unassessedNativeJourneys = []' | python3 "$TOOL" pin-check --candidate)"
+expect 5b-candidate-ok '.state == "valid"' "$(match '["web/src/desk/a.tsx"]' | python3 "$TOOL" pin-check --candidate)"
+
+# --- 5c. one lane rule for every journey-backed lane ------------------------------
+# A catalogue whose BROWSER journey is also a floor journey.
+jq '.journeys[0].maxIntervalDays = 3' "$EXAMPLE" > "$WORK/browser-floor.json"
+FLOOR_PIN="$(CATALOGUE="$WORK/browser-floor.json" gate_pin "$WORK/lease5c" "$SHA" '["web/src/desk/a.tsx","api/src/reports/export.ts"]')"
+bf_run() { # <loan-desk lane kind>; report-export is there for the disposition cases
+  new_run '[{"id":"loan-desk-checkout","kind":"'"$1"'"},{"id":"mobile-scan-return","kind":"lane"}]'
+  adopt "$FLOOR_PIN" >/dev/null
+  printf 'ok' > "$RUN/api.txt"; printf 'png' > "$RUN/desk.png"; marker mobile-scan-return blocked '[]'
+  disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
+}
+# A floor journey scaffolded as an ordinary lane slips the barrier's floor-media
+# bar and never touches the cadence clock: refused, whatever it cites.
+bf_run lane; marker loan-desk-checkout pass '["api.txt"]'
+expect 5c-floor-journey-needs-floor-kind '.ready == false and any(.invalidReasons[]; test("loan-desk-checkout is a floor journey but its lane is kind .lane."))' "$(barrier)"
+bf_run floor; marker loan-desk-checkout pass '["api.txt"]'
+expect 5c-browser-pass-needs-media '.ready == false and any(.invalidReasons[]; test("browser"))' "$(barrier)"
+bf_run floor; marker loan-desk-checkout pass '["desk.png"]'
+expect 5c-browser-floor-pass '.ready == true' "$(barrier)"
+# The skip note that fooled cadence (section 3) is refused here too: not a citation.
+bf_run floor; marker loan-desk-checkout pass '["clip-skipped: F1: could not record capture.webm"]'
+expect 5c-skip-note-is-not-media '.ready == false and any(.invalidReasons[]; test("browser"))' "$(barrier)"
+# The media bar is the JOURNEY's, not the lane kind's: a non-floor browser
+# journey cannot pass on a text file either, nor on media that is not there.
+new_run '[{"id":"loan-desk-checkout","kind":"lane"}]'; adopt "$PIN_FILE" >/dev/null
+disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"unresolved","reason":"x"}]}'
+printf 'ok' > "$RUN/api.txt"; marker loan-desk-checkout pass '["api.txt"]'
+expect 5c-browser-lane-text-only 'any(.invalidReasons[]; test("a browser journey passes only on browser media"))' "$(barrier)"
+printf 'png' > "$RUN/desk.png"; marker loan-desk-checkout pass '["api.txt","desk.png"]'
+expect 5c-browser-lane-with-media '.ready == true' "$(barrier)"
+# Disposition-linked journeys take the SAME helper: a native-manual journey
+# reached through mapped-to-journey passes only on the tester's result.
+bf_run floor; marker loan-desk-checkout blocked '[]'; printf 'packet' > "$RUN/packet.md"
+marker mobile-scan-return pass '["packet.md"]'
+disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"mapped-to-journey","journeyId":"mobile-scan-return"}]}'
+expect 5c-disposition-native-needs-result 'any(.invalidReasons[]; test("named tester"))' "$(barrier)"
+disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"mapped-to-journey","journeyId":"loan-desk-checkout"}]}'
+marker mobile-scan-return blocked '[]'
+new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"mobile-scan-return","kind":"lane"}]'; adopt "$FLOOR_PIN" >/dev/null
+marker loan-desk-checkout blocked '[]'; marker mobile-scan-return blocked '[]'
+disposition '{"dispositions":[{"paths":["api/src/reports/export.ts"],"disposition":"mapped-to-journey","journeyId":"loan-desk-checkout"}]}'
+expect 5c-disposition-floor-kind 'any(.invalidReasons[]; test("is a floor journey but its lane is kind"))' "$(barrier)"
+
+# DUE FLOOR JOURNEYS ARE MANDATORY MATCHES, native ones included. Unknown range
+# and no readable history: a native-manual floor journey is due, so it is a
+# required lane (packet/result shape), not an "unassessed" footnote.
+jq '.journeys[2].maxIntervalDays = 30' "$EXAMPLE" > "$WORK/native-floor.json"
+OUT="$(CATALOGUE="$WORK/native-floor.json" match '[]' --unknown "no GO" --run-root "")"
+expect 5c-native-floor-due-is-matched '.unassessedNativeJourneys == [] and
+  [.matchedJourneys[] | select(.id == "mobile-scan-return") | {reason,floor}] == [{"reason":"floor","floor":true}]' "$OUT"
+NF_PIN="$(CATALOGUE="$WORK/native-floor.json" gate_pin "$WORK/lease5d" "$SHA" '[]' 7 org__repo "" '--unknown no-GO --run-root /nonexistent')"
+new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"}]'; adopt "$NF_PIN" >/dev/null
+marker loan-desk-checkout blocked '[]'; marker branch-scope-crossing blocked '[]'
+expect 5c-native-floor-needs-lane 'any(.invalidReasons[]; test("matched journey mobile-scan-return \\(floor\\) has no lane"))' "$(barrier)"
+new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"},{"id":"mobile-scan-return","kind":"lane"}]'; adopt "$NF_PIN" >/dev/null
+for lane in loan-desk-checkout branch-scope-crossing mobile-scan-return; do marker "$lane" blocked '[]'; done
+expect 5c-native-floor-kind 'any(.invalidReasons[]; test("mobile-scan-return is a floor journey but its lane is kind"))' "$(barrier)"
+new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"},{"id":"mobile-scan-return","kind":"floor"}]'; adopt "$NF_PIN" >/dev/null
+for lane in loan-desk-checkout branch-scope-crossing; do marker "$lane" blocked '[]'; done
+printf 'packet' > "$RUN/packet.md"; marker mobile-scan-return pass '["packet.md"]'
+expect 5c-native-floor-packet-is-not-pass 'any(.invalidReasons[]; test("named tester"))' "$(barrier)"
+marker mobile-scan-return completed '["packet.md"]'
+expect 5c-native-floor-packet-issued '.ready == true' "$(barrier)"
+
+# --- 5e. PARITY: the barrier and cadence accept and reject the SAME passes ----
+# Every evidence entry, every evidence kind, for a lane that carries a PINNED
+# journey, through the REAL barrier (generic bash pass_evidence_problem /
+# floor_evidence_problem / finding_clip_problem, unchanged from before this
+# PR, plus the Python journeys lane rule) and through last_proven (the same
+# Python primitive, files present), so the two cannot drift apart again: three
+# review rounds of #898 each found a pass the barrier refuses that cadence
+# counted. Rows are evidence lists; `V` is the kind's own valid citation
+# (browser media, api text, the tester's manual-results file). Expected values
+# are per kind (b a n). A native FLOOR journey's pass needs media beside the
+# tester's result, because the generic floor rule (media unless api) is not
+# changed here -- a follow-up may add a native declaration.
+PARITY_PIN_WEB="$(CATALOGUE="$WORK/browser-floor.json" gate_pin "$WORK/lease5e-web" "$SHA" '["web/src/desk/a.tsx"]' 7 org__repo "" '--run-root /nonexistent')"
+PARITY_PIN_NATIVE="$(CATALOGUE="$WORK/native-floor.json" gate_pin "$WORK/lease5e-native" "$SHA" '[]' 7 org__repo "" '--unknown no-GO --run-root /nonexistent')"
+PARITY_ROOT="$WORK/parity"; mkdir -p "$PARITY_ROOT"
+parity_case() { # <kind b|a|n> <label> <evidence-json with V placeholder> <confirmedFindings-json or ""> <expected b> <expected a> <expected n>
+  local kind="$1" label="$2" ev="$3" findings="$4" want jid cat pin valid out_b out_c e
+  case "$kind" in b) want="$5" ;; a) want="$6" ;; n) want="$7" ;; esac
+  case "$kind" in
+    b) jid=loan-desk-checkout; cat="$WORK/browser-floor.json"; pin="$PARITY_PIN_WEB"; valid="desk.png"
+       new_run '[{"id":"loan-desk-checkout","kind":"floor"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"}]'
+       adopt "$pin" >/dev/null; marker branch-scope-crossing blocked '[]' ;;
+    a) jid=branch-scope-crossing; cat="$WORK/browser-floor.json"; pin="$PARITY_PIN_WEB"; valid="api.txt"
+       new_run '[{"id":"loan-desk-checkout","kind":"floor"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"}]'
+       adopt "$pin" >/dev/null; marker loan-desk-checkout blocked '[]' ;;
+    n) jid=mobile-scan-return; cat="$WORK/native-floor.json"; pin="$PARITY_PIN_NATIVE"; valid="manual-results/tester.md"
+       new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"},{"id":"mobile-scan-return","kind":"floor"}]'
+       adopt "$pin" >/dev/null; marker loan-desk-checkout blocked '[]'; marker branch-scope-crossing blocked '[]' ;;
+  esac
+  ev="${ev//V/$valid}"
+  # Every relative, non-note citation exists as a nonempty file (existence is not under test here).
+  while IFS= read -r e; do
+    case "$e" in clip-skipped:*|/*|../*) continue ;; esac
+    mkdir -p "$RUN/$(dirname "$e")"; printf 'x' > "$RUN/$e"
+  done < <(jq -r '.[]' <<<"$ev")
+  jq -n --arg sha "$SHA" --arg lane "$jid" --argjson ev "$ev" --argjson f "${findings:-null}" \
+    '{sourceSha:$sha,lane:$lane,generation:1,status:"pass",completedAt:"2026-09-10T01:00:00Z",evidence:$ev}
+     + (if $f == null then {} else {confirmedFindings:$f} end)' > "$RUN/markers/$jid.json"
+  out_b="$(barrier | jq -r '.ready')"
+  rm -rf "$PARITY_ROOT/$kind-$label"; mkdir -p "$PARITY_ROOT/$kind-$label"; cp -r "$RUN" "$PARITY_ROOT/$kind-$label/run-1"
+  out_c="$(python3 "$TOOL" floor-due "$cat" "$PARITY_ROOT/$kind-$label" --as-of "$NOW" | jq -r --arg id "$jid" '[.entries[] | select(.id == $id)][0].lastProvenAt != null')"
+  [ "$out_b" = "$out_c" ] || fail "5e-parity-drift $kind/$label: barrier ready=$out_b but cadence proven=$out_c for evidence $ev"
+  [ "$out_b" = "$want" ] || fail "5e-parity-expected $kind/$label: both said $out_b, table says $want for evidence $ev"
+  printf '5e %s %-28s barrier=%s cadence=%s\n' "$kind" "$label" "$out_b" "$out_c" >&2
+}
+for kind in b a n; do #                                                                                       b     a     n
+  parity_case "$kind" valid-own-citation        '["V"]'                                                    ""       true  true  false
+  parity_case "$kind" skip-note-alone           '["clip-skipped: F1: no ffmpeg"]'                          '["F1"]' false false false
+  parity_case "$kind" skip-note-plus-valid      '["clip-skipped: F1: no ffmpeg","V"]'                      '["F1"]' true  true  false
+  parity_case "$kind" absolute                  '["/tmp/x.png"]'                                           ""       false false false
+  parity_case "$kind" traversal                 '["../other/x.png"]'                                       ""       false false false
+  parity_case "$kind" mixed-valid-plus-absolute '["V","/tmp/x.png"]'                                       ""       false false false
+  parity_case "$kind" mixed-valid-plus-traversal '["V","../x.png"]'                                        ""       false false false
+  parity_case "$kind" malformed-skip-note       '["clip-skipped: no finding here","V"]'                    ""       false false false
+  parity_case "$kind" skip-note-wrong-finding   '["clip-skipped: F2: no ffmpeg","V"]'                      '["F1"]' false false false
+  parity_case "$kind" empty                     '[]'                                                       ""       false false false
+  parity_case "$kind" finding-without-clip      '["V"]'                                                    '["F1"]' false false false
+  parity_case "$kind" finding-with-clip         '["clips/F1.mp4","V"]'                                     '["F1"]' true  true  true
+done
+# The kinds' own proof rules, cross-wise: media is not a tester's result and a
+# text file is not media -- for the barrier and for cadence alike; a native
+# floor walk with its result AND media clears both.
+parity_case b api-text-is-not-media           '["api.txt"]'                             "" false x x
+parity_case b manual-result-is-not-media      '["manual-results/tester.md"]'            "" false x x
+parity_case n media-is-not-a-tester-result    '["desk.png"]'                            "" x x false
+parity_case n result-plus-media               '["manual-results/tester.md","desk.png"]' "" x x true
+parity_case a media-is-fine-for-api           '["desk.png"]'                            "" x true x
+# A lane that carries NO journey keeps the generic barrier's behaviour, exactly
+# as before this PR: a pass citing only a well-formed skip note for its
+# confirmed finding clears, and a floor lane still needs browser media (a
+# tester's result alone does not clear it).
+GENERIC="$WORK/generic-run"; rm -rf "$GENERIC"; mkdir -p "$GENERIC/markers/" "$GENERIC/manual-results"
+jq -n --arg sha "$SHA" '{schemaVersion:2,runId:"generic-run",sourceSha:$sha,ownershipKind:"develop",coordinatorOwnerToken:null,
+  lanes:[{id:"G1",kind:"lane",generation:1},{id:"G2",kind:"floor",generation:1}],requiredLaneMarkers:["markers/G1.json","markers/G2.json"]}' > "$GENERIC/completion-contract.json"
+printf 'x' > "$GENERIC/manual-results/tester.md"; printf 'x' > "$GENERIC/desk.png"
+jq -n --arg sha "$SHA" '{sourceSha:$sha,lane:"G1",generation:1,status:"pass",completedAt:"2026-09-10T01:00:00Z",confirmedFindings:["F1"],evidence:["clip-skipped: F1: no ffmpeg"]}' > "$GENERIC/markers/G1.json"
+jq -n --arg sha "$SHA" '{sourceSha:$sha,lane:"G2",generation:1,status:"pass",completedAt:"2026-09-10T01:00:00Z",evidence:["desk.png"]}' > "$GENERIC/markers/G2.json"
+expect 5e-generic-skip-note-only-still-clears '.ready == true' "$(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$GENERIC" lanes || true)"
+jq '.evidence = ["manual-results/tester.md"]' "$GENERIC/markers/G2.json" > "$GENERIC/m.tmp"; mv "$GENERIC/m.tmp" "$GENERIC/markers/G2.json"
+expect 5e-generic-floor-still-needs-media '.ready == false and any(.invalidReasons[]; test("floor pass without browser evidence"))' \
+  "$(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$GENERIC" lanes || true)"
 
 # --- 6. capture recipes --------------------------------------------------------
 new_run '[{"id":"loan-desk-checkout","kind":"lane"}]'
-python3 "$TOOL" pin-run "$RUN" "$PIN_FILE" >/dev/null
+adopt "$PIN_FILE" >/dev/null
 expect 6-shots '.ok == true and [.shots[].name] == ["desk","desk-periods"] and .shots[1].steps == ["click text=Loan period","wait 500"]' \
   "$(python3 "$TOOL" shots "$RUN")"
 
@@ -303,7 +844,14 @@ LIVE="$WORK/live/journeys.json"; LOCK="$WORK/live/control.lock"; mkdir -p "$WORK
 publish() { python3 "$TOOL" publish "$LIVE" "$@" --lock "$LOCK" || true; }
 expect 7-role '.ok == false and (.error | test("coordinator"))' "$(publish "$EXAMPLE" --expect-sha256 absent)"
 export SMOKE_LANE_ROLE=coordinator
-expect 7-first '.ok == true and .priorSha256 == "absent"' "$(publish "$EXAMPLE" --expect-sha256 absent)"
+# FIRST publish is the one that creates the floor: an absent catalogue has an
+# empty floor, so declaring floor journeys needs the authority like any change.
+expect 7-first-floor-needs-authority '.ok == false and (.error | test("floor"))' "$(publish "$EXAMPLE" --expect-sha256 absent)"
+[ ! -e "$LIVE" ] || fail "7: a refused first publish wrote the catalogue"
+jq 'del(.journeys[1])' "$EXAMPLE" > "$WORK/no-floor.json"
+expect 7-first-no-floor '.ok == true and .priorSha256 == "absent" and .floorAuthority == null' "$(publish "$WORK/no-floor.json" --expect-sha256 absent)"
+rm -f "$LIVE"
+expect 7-first '.ok == true and .priorSha256 == "absent"' "$(publish "$EXAMPLE" --expect-sha256 absent --floor-authority "operator decision 2026-09-01")"
 cmp -s "$LIVE" "$EXAMPLE" || fail "7: published bytes differ"
 D1="$(sha256sum < "$LIVE" | cut -d' ' -f1)"
 jq '.journeys[0].consumes += ["api/src/reports/**"]' "$EXAMPLE" > "$WORK/p1.json"
@@ -319,6 +867,21 @@ jq 'del(.journeys[1])' "$WORK/p1.json" > "$WORK/p3.json"
 expect 7-floor-needs-authority '.ok == false and (.error | test("floor"))' "$(publish "$WORK/p3.json" --expect-sha256 "$D2")"
 jq '.journeys[1].maxIntervalDays = 30' "$WORK/p1.json" > "$WORK/p4.json"
 expect 7-floor-weakened '.ok == false and (.error | test("floor"))' "$(publish "$WORK/p4.json" --expect-sha256 "$D2")"
+# The COMPLETE floor entry is protected, not just its claim: thinning the walk
+# keeps "proves" intact while testing less. A `_` note is not content, and a
+# non-floor journey is nobody's floor.
+for edit in '.journeys[1].steps = ["Request the other branch once."]' '.journeys[1].endState = "a response comes back"' \
+            '.journeys[1].seed = "whatever is there"' '.journeys[1].seats = ["qa-north"]' '.journeys[1].consumes = ["api/src/fines/list.ts"]'; do
+  jq "$edit" "$WORK/p1.json" > "$WORK/pf.json"
+  expect "7-floor-field: $edit" '.ok == false and (.error | test("floor"))' "$(publish "$WORK/pf.json" --expect-sha256 "$D2")"
+done
+jq '.journeys[1]._evidence = "walked 2026-09-09" | .journeys[0].steps += ["Check the receipt."] | .journeys[0].endState = "x"' "$WORK/p1.json" > "$WORK/pn.json"
+expect 7-note-and-non-floor-free '.ok == true and .floorAuthority == null' "$(publish "$WORK/pn.json" --expect-sha256 "$D2")"
+DN="$(sha256sum < "$LIVE" | cut -d' ' -f1)"
+jq '.journeys[1].steps = ["Request the other branch once."]' "$WORK/pn.json" > "$WORK/pf.json"
+expect 7-floor-field-with-authority '.ok == true' "$(publish "$WORK/pf.json" --expect-sha256 "$DN" --floor-authority "operator decision 2026-09-11")"
+DF="$(sha256sum < "$LIVE" | cut -d' ' -f1)"
+expect 7-restore-p1 '.ok == true' "$(publish "$WORK/p1.json" --expect-sha256 "$DF" --floor-authority "restore")"
 jq 'del(.journeys[2])' "$WORK/p1.json" > "$WORK/p5.json"
 expect 7-retire-ordinary '.ok == true and .journeyCount == 2' "$(publish "$WORK/p5.json" --expect-sha256 "$D2")"
 D3="$(sha256sum < "$LIVE" | cut -d' ' -f1)"
