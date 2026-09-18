@@ -67,6 +67,12 @@ num_env() {  # <target-var> <env-var-name> <default>
 num_env ACTIVE_STALE_SECONDS SMOKE_GATE_ACTIVE_STALE_SECONDS 14400
 num_env PROGRESS_STALE_SECONDS SMOKE_GATE_PROGRESS_STALE_SECONDS 1800
 num_env OVERRUN_REALERT_SECONDS SMOKE_GATE_OVERRUN_REALERT_SECONDS 7200
+# How long past the liveness window a claimed run may sit dead before
+# `pr_run_stalled` rings. Same-run recovery gets first refusal: it fires on the
+# first poll past PROGRESS_STALE_SECONDS, but only for a PR that settles ON THAT
+# POLL, and one transiently failed fetch is enough to miss it. The grace keeps
+# that blip from costing a second wake for a run recovery is about to resume.
+num_env STALLED_GRACE_SECONDS SMOKE_GATE_STALLED_GRACE_SECONDS 1800
 # Same seam as the develop gate: one command run immediately before a
 # campaign opens, for preconditions the gate cannot see. Runs once per poll,
 # only when a settle candidate has actually been chosen — never per PR.
@@ -1285,6 +1291,26 @@ num_env CHALLENGER_TIMEOUT_SECONDS SMOKE_GATE_CHALLENGER_TIMEOUT_SECONDS 5400
 # was possible.
 CHALLENGER_RUN_ROOT="${SMOKE_GATE_RUN_ROOT:-}"
 challenger_disposition_file() { printf '%s/%s/challenger/disposition.md' "$CHALLENGER_RUN_ROOT" "$1"; }
+# Would a successor have to `adopt` this run's completion contract? The ONE
+# predicate, shared by the resumed `pr_build_settled` wake and `pr_run_stalled`.
+# `contract` stamps coordinatorOwnerToken once (smoke-run-scaffold.sh:545) and
+# every reclaim mints a new token, so the scaffold's require_contract_owner
+# (smoke-run-scaffold.sh:366-371) refuses a successor's marker/redispatch until
+# it runs `adopt`. Keyed on the token alone, so a schemaVersion 1 contract and
+# a schemaVersion 2 one (campaign identity beside the token) answer the same;
+# `adopt` backfills that identity itself (smoke-run-scaffold.sh:771-786).
+# Read-only, and `null` — not false — when the run root is unwired: absence is
+# only evidence when presence was possible.
+contract_adoption_required() {  # <runId> -> true | false | null
+  if [ -z "$CHALLENGER_RUN_ROOT" ] || [ ! -d "$CHALLENGER_RUN_ROOT" ]; then
+    printf 'null'
+  elif [ -n "$(jq -r '.coordinatorOwnerToken // empty' \
+         "$CHALLENGER_RUN_ROOT/$1/completion-contract.json" 2>/dev/null || true)" ]; then
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
 challenger_deadline_from_now() {
   date -u -d "@$(( $(date -u +%s) + CHALLENGER_TIMEOUT_SECONDS ))" +'%Y-%m-%dT%H:%M:%SZ'
 }
@@ -1328,6 +1354,7 @@ default_pr_state() {
     factsStuckAlertSha: null,
     overrunAlertRunId: null,
     overrunAlertAt: null,
+    stalledAlertRunId: null,
     displacedRunId: null,
     displacedAt: null,
     finishIntent: null,
@@ -4637,6 +4664,137 @@ if [ "$COMMAND" = "challenger-timeout" ]; then
   exit "$FINISH_RC"
 fi
 
+# ---------------------------------------------------------------------------
+# pr_run_stalled: a claimed run nothing else will ever look at again.
+#
+# Every other path that notices a dead run is reached THROUGH its PR: same-run
+# recovery needs the PR to settle on this poll, `pr_run_overrun` needs FRESH
+# progress (active_run_is_live), and `challenger-timeout` refuses once a
+# disposition exists. So a coordinator that dies after the challenger filed —
+# and whose preview is then suspended, torn down, unlabeled or closed — left a
+# run claimed forever with valid evidence and no terminal verdict, and nothing
+# anywhere said so. A PR that is closed or unlabeled is not even in `poll`'s
+# list, which is why this scans the per-PR STATE FILES, never the PR list.
+#
+# Precedence. Called only where `poll` would otherwise answer
+# `waiting_for_candidates` — so every existing alarm and every settle/recovery
+# wake outranks it, it can never delay a campaign, and a poll with no stalled
+# run prints byte-for-byte what it printed before. `pr_run_overrun` is disjoint
+# by predicate (live vs. not live). A listed PR whose facts say it settles is
+# skipped outright: recovery owns it and merely lost this poll to a lock or a
+# baseline-pin race.
+#
+# It reports; it never recovers. No owner token, lease or authority is minted
+# or rotated here — for a PR that no longer settles, taking the slot is a
+# decision (`claim <runId> <pr> <sourceSha>` resumes the published run id;
+# `release` abandons it), and this wake carries the facts to make it.
+#
+# Latched on the RUN id like the overrun alarm, but one-shot: a new run id
+# re-arms it for free and nothing re-rings the same run.
+stalled_not_settling() {  # <pr> <state-json> -> reason object, or nothing when recovery owns this PR
+  local pr="$1" state="$2" head facts
+  head="$(jq -r --argjson pr "$pr" '[.[] | select(.number == $pr)][0].headRefOid // empty' <<<"$PR_LIST_JSON" 2>/dev/null)"
+  if [ -z "$head" ]; then
+    jq -cn '{reason:"pr_not_listed"}'
+    return
+  fi
+  # Facts carry a freeze campaign's range lists, which outgrow one argv string
+  # (MAX_ARG_STRLEN) — read from the file, never --argjson.
+  facts="${TMP_DIR:-/nonexistent}/facts-$pr.json"
+  if ! jq -e 'type == "object"' "$facts" >/dev/null 2>&1; then
+    facts="$TMP_DIR/facts-none.json"
+    printf '{}\n' > "$facts"
+  fi
+  jq -cn --arg head "$head" --slurpfile factsFile "$facts" --argjson state "$state" '
+    $factsFile[0] as $facts |
+    ($facts | {fetchOk, settled, ciReady, ciPending, ciFailed, backendReady, frontendRequired,
+               frontendReady, healthzReady, previewAmbiguous, migrationsTouched}) as $f |
+    if $state.activeSha != $head then {reason:"head_moved", headSha:$head}
+    elif $facts.fetchOk != true then {reason:"facts_unavailable", headSha:$head}
+    elif $state.completedSha == $head then {reason:"head_sha_already_completed", headSha:$head}
+    elif ($facts.migrationsTouched == true and $facts.isFreezePr != true) then
+      {reason:"migrations_refused", headSha:$head, facts:$f}
+    elif $facts.settled != true then {reason:"not_settled", headSha:$head, facts:$f}
+    else empty end'
+}
+
+stalled_run_alarm() {  # prints one wake and returns 0, or prints nothing and returns 1
+  local f state pr run last quiet now why view w_pr="" w_run="" w_why=""
+  local dispo=null contract=null adopt=null
+  now="$(date -u +%s)"
+  for f in "$STATE_DIR"/pr-*-state.json; do
+    [ -e "$f" ] || continue
+    state="$(jq -c 'select(type == "object")' "$f" 2>/dev/null || true)"
+    [ -n "$state" ] || continue
+    run="$(jq -r '.activeRunId // empty' <<<"$state")"
+    [ -n "$run" ] || continue
+    [ "$(jq -r '.stalledAlertRunId // empty' <<<"$state")" != "$run" ] || continue
+    pr="$(jq -r '.pr // empty' <<<"$state")"
+    printf '%s' "$pr" | grep -Eq '^[1-9][0-9]*$' || continue
+    [ -z "$w_pr" ] || [ "$pr" -lt "$w_pr" ] || continue
+    last="$(epoch_or_zero "$(jq -r '.activeProgressAt // .activeStartedAt // empty' <<<"$state")")"
+    [ "$(( now - last ))" -ge "$(( PROGRESS_STALE_SECONDS + STALLED_GRACE_SECONDS ))" ] || continue
+    why="$(stalled_not_settling "$pr" "$state")"
+    [ -n "$why" ] || continue
+    w_pr="$pr"; w_run="$run"; w_why="$why"
+  done
+  [ -n "$w_pr" ] || return 1
+
+  exec 9>"$(pr_lock_file "$w_pr")"
+  if ! flock -w 5 9; then exec 9>&-; return 1; fi
+  state="$(read_pr_state "$w_pr")"
+  # Re-verify under the lock: a `progress`, `claim`, `finish` or another poll
+  # may have landed since the unlocked scan.
+  last="$(epoch_or_zero "$(jq -r '.activeProgressAt // .activeStartedAt // empty' <<<"$state")")"
+  if [ "$(jq -r '.activeRunId // empty' <<<"$state")" != "$w_run" ] ||
+     [ "$(jq -r '.stalledAlertRunId // empty' <<<"$state")" = "$w_run" ] ||
+     [ "$(( now - last ))" -lt "$(( PROGRESS_STALE_SECONDS + STALLED_GRACE_SECONDS ))" ] ||
+     ! write_pr_state "$w_pr" "$(jq -c --arg run "$w_run" '.stalledAlertRunId=$run' <<<"$state")"; then
+    flock -u 9; exec 9>&-
+    return 1
+  fi
+  flock -u 9; exec 9>&-
+
+  # One best-effort lookup, paid only by the poll that actually rings: a PR
+  # that fell out of the labeled-open list is closed, merged, unlabeled or
+  # rebased onto another base, and which one decides release vs. resume.
+  if [ "$(jq -r '.reason' <<<"$w_why")" = pr_not_listed ]; then
+    view="$(timeout 10 gh pr view "$w_pr" -R "$REPO" --json state,labels,baseRefName,headRefOid 2>/dev/null || true)"
+    if jq -e 'type == "object" and (.state | type == "string")' <<<"$view" >/dev/null 2>&1; then
+      w_why="$(jq -c --arg label "$LABEL" --arg base "$BRANCH" '
+        {reason:(if .state != "OPEN" then ("pr_" + (.state | ascii_downcase))
+                 elif ([.labels[]?.name] | index($label)) == null then "label_removed"
+                 elif (.baseRefName // $base) != $base then "base_changed"
+                 else "pr_not_listed" end),
+         prState:.state, labeled:(([.labels[]?.name] | index($label)) != null),
+         headSha:(.headRefOid // null)}' <<<"$view")"
+    fi
+  fi
+  # Absence is only evidence when presence was possible (same rule as
+  # `challenger-timeout`): with no readable run root these are null, not false.
+  if [ -n "$CHALLENGER_RUN_ROOT" ] && [ -d "$CHALLENGER_RUN_ROOT" ]; then
+    dispo=false; contract=false
+    [ ! -s "$(challenger_disposition_file "$w_run")" ] || dispo=true
+    [ ! -s "$CHALLENGER_RUN_ROOT/$w_run/completion-contract.json" ] || contract=true
+  fi
+  adopt="$(contract_adoption_required "$w_run")"
+  jq -cn --argjson state "$state" --argjson why "$w_why" --argjson now "$now" --argjson last "$last" \
+    --argjson dispo "$dispo" --argjson contract "$contract" --argjson adopt "$adopt" \
+    --argjson leaseLive "$(lease_is_live "$(read_lease "$w_run")")" \
+    '{wakeAgent:true,data:{schemaVersion:1,trigger:"pr_run_stalled",
+      pr:$state.pr, runId:$state.activeRunId, sourceSha:$state.activeSha,
+      activeStartedAt:$state.activeStartedAt, lastProgressAt:$state.activeProgressAt,
+      quietSeconds:($now - $last),
+      challengerDispositionFiled:$dispo, challengerDeadline:$state.challengerDeadline,
+      synthesisPending:($dispo == true),
+      finishIntentPending:($state.finishIntent != null),
+      completionContractExists:$contract, contractAdoptionRequired:$adopt,
+      leaseLive:$leaseLive,
+      notSettling:$why,
+      hint:"This run is still claimed but its coordinator stopped stamping progress, and its PR is no longer a settle candidate, so poll will never resume it. Nothing was reclaimed: no owner token, lease or authority changed. Decide: resume the SAME run id with `claim <runId> <pr> <sourceSha>` (allowed because progress is stale, once leaseLive is false; keeps the evidence and the challenger deadline), run `smoke-run-scaffold.sh adopt <run-dir> <sourceSha>` first when contractAdoptionRequired is true, and carry it to `finish`, or abandon it with `claim` then `release`. This alarm fires once per run id."}}'
+  return 0
+}
+
 if [ "$COMMAND" != "poll" ]; then
   jq -cn --arg command "$COMMAND" \
     '{ok:false,error:("unknown command: " + $command),
@@ -4733,6 +4891,8 @@ flock -u 8
 
 PR_COUNT="$(jq -r 'length' <<<"$PR_LIST_JSON")"
 if [ "$PR_COUNT" -eq 0 ]; then
+  # No labeled PR is exactly what a stalled run's PR looks like once it closes.
+  if stalled_run_alarm; then exit 0; fi
   jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"waiting_for_candidates",labeledPrCount:0}}'
   exit 0
 fi
@@ -4752,6 +4912,9 @@ while IFS= read -r ROW; do
   printf '%s' "$HEAD_SHA" | grep -Eq '^[0-9a-f]{40}$' || continue
 
   FACTS="$(evaluate_pr "$PR" "$HEAD_SHA" "$HEAD_REF")"
+  # Kept for stalled_not_settling, which names WHY a stalled run's PR is not
+  # being recovered from these same facts rather than a second fetch.
+  printf '%s\n' "$FACTS" > "$TMP_DIR/facts-$PR.json"
 
   # Facts incomplete — this PR cannot settle this poll. This used to be a bare
   # `continue`, which is how a permanently-unsettleable gate stayed silent for
@@ -5210,21 +5373,11 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
   task_binding_lock_end
 
   # A resumed run id whose completion contract already exists is bound to the
-  # PREDECESSOR's token: `contract` stamps coordinatorOwnerToken once
-  # (smoke-run-scaffold.sh:491) and the token minted above is always new, so
-  # the scaffold's require_contract_owner (smoke-run-scaffold.sh:321-326) will
-  # refuse this wake's marker/redispatch until it runs `adopt`. Say so in the
-  # wake rather than leaving the successor to discover it from a refusal.
-  # Read-only, and `null` — not false — when the run
-  # root is unwired: absence is only evidence when presence was possible.
+  # PREDECESSOR's token (see contract_adoption_required). Say so in the wake
+  # rather than leaving the successor to discover it from a refusal.
   CONTRACT_ADOPTION_REQUIRED=false
   if [ "$RESUMED_RUN_ID" = true ]; then
-    if [ -z "$CHALLENGER_RUN_ROOT" ] || [ ! -d "$CHALLENGER_RUN_ROOT" ]; then
-      CONTRACT_ADOPTION_REQUIRED=null
-    elif [ -n "$(jq -r '.coordinatorOwnerToken // empty' \
-           "$CHALLENGER_RUN_ROOT/$RUN_ID/completion-contract.json" 2>/dev/null || true)" ]; then
-      CONTRACT_ADOPTION_REQUIRED=true
-    fi
+    CONTRACT_ADOPTION_REQUIRED="$(contract_adoption_required "$RUN_ID")"
   fi
 
   jq -cn \
@@ -5251,6 +5404,8 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
       + (if $facts.journeys != null then {journeys:$facts.journeys} else {} end))}'
   exit 0
 fi
+
+if stalled_run_alarm; then exit 0; fi
 
 jq -cn --argjson count "$PR_COUNT" \
   '{wakeAgent:false,data:{schemaVersion:1,trigger:"waiting_for_candidates",labeledPrCount:$count}}'
