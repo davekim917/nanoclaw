@@ -95,7 +95,7 @@ Authenticate the refresh through the host's git credential helper.
 drops the mount (on OpenCode, whose skills come from the host mirror rather
 than that mount, it drops the mount and the ruleset and keeps the skills — see
 [skills-model.md](skills-model.md)). A sub-plugin path
-(`"bootstrap/plugins/orchestrate"`, or `"<repo>/<sub>"` for a repo that puts
+(`"bootstrap/plugins/wwbd"`, or `"<repo>/<sub>"` for a repo that puts
 its sub-plugins at the root) leaves the repo mounted whole — the files stay
 readable — and withholds that sub-plugin's REGISTRATION instead: the Claude SDK
 plugin list and its hooks, the Codex registration plan and its hook trust, the
