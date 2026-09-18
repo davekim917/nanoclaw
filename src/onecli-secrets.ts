@@ -43,6 +43,9 @@ interface OnecliAgent {
 interface OnecliSecret {
   id: string;
   name: string;
+  /** Where the gateway injects it; present on the list API's rows. */
+  hostPattern?: string | null;
+  pathPattern?: string | null;
 }
 
 interface OnecliAgentSecretGrant {
@@ -616,6 +619,42 @@ export function slackUserTokenSecrets(secrets: string[], explicitNames?: string[
 }
 
 /** Test hook — clears the in-memory caches so each test starts clean. */
+/**
+ * Declared secrets the gateway injects into DIRECT REST calls: a host pattern
+ * that is not an MCP endpoint (`mcp.*` host or `/mcp` path — those reach the
+ * agent through their MCP server, not curl). Returns the host so the roster
+ * says where the credential actually applies, never a name-based guess.
+ *
+ * Never blocks: this runs on the per-turn path, so it reads only the spawn
+ * path's secrets cache and refreshes a stale one in the background. A cold or
+ * failed cache yields [] — the roster omits the line rather than stalling a
+ * turn on the gateway (a hung gateway would otherwise cost every turn the
+ * full curl timeout).
+ */
+export function gatewayRestHosts(declarations: string[]): Array<{ name: string; host: string }> {
+  if (declarations.length === 0) return [];
+  if (!secretsCache || Date.now() - secretsCache.at >= SECRETS_CACHE_TTL_MS) {
+    void loadSecrets(false).catch(() => undefined);
+  }
+  const secrets = secretsCache?.secrets ?? [];
+  const byName = new Map(secrets.map((secret) => [secret.name, secret] as const));
+  const byId = new Map(secrets.map((secret) => [secret.id, secret] as const));
+  const out: Array<{ name: string; host: string }> = [];
+  for (const decl of declarations) {
+    const secret = isUuid(decl) ? byId.get(decl) : byName.get(decl);
+    const host = secret?.hostPattern?.trim();
+    if (!secret || !host) continue;
+    if (/^mcp[.-]/i.test(host) || /(^|\/)mcp(\/|$)/i.test(secret.pathPattern ?? '')) continue;
+    out.push({ name: secret.name, host });
+  }
+  return out;
+}
+
+/** Test seam: seed the secrets cache without touching the gateway. */
+export function __setSecretsCacheForTest(secrets: OnecliSecret[]): void {
+  secretsCache = { at: Date.now(), secrets };
+}
+
 export function __resetCachesForTest(): void {
   identifierToUuid.clear();
   secretsCache = null;
