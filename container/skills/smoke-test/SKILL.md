@@ -638,8 +638,9 @@ recorded result under `<run-dir>/manual-results/`, filed against the journey id.
 
 `smoke-evidence-barrier.sh` enforces the **completeness** of all this — this
 campaign's own gate pin (repo + PR + head), whenever the gate pinned one, held
-byte-for-byte by the run (skipping `pin-run` is then a refusal, not a way out),
-a lane per matched journey, a valid disposition per frozen path,
+byte-for-byte by the run (skipping `pin-run` is then a refusal, not a way out,
+and so is a lease directory it cannot list), a lane per matched journey, a
+valid disposition per frozen path,
 the run's catalogue still hashing to its pin — and nothing about its truth.
 **Substance is the challenger's**: it reviews every exclusion and every
 backend/data scope disposition, and samples the positive matches — a broad glob

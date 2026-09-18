@@ -238,6 +238,7 @@ PIN_FILE="$(gate_pin "$WORK/lease4" "$SHA" '["api/src/reports/export.ts","web/sr
 # --- 5. pin-run + barrier -------------------------------------------------------
 RUN="$WORK/run-1"
 LEASES="$WORK/empty-leases"   # the shared lease dir the barrier looks in; `adopt` points it at a pin's
+mkdir -p "$LEASES"            # readable and empty: "no pin", which a MISSING dir is not (5b-lease-dir-*)
 share_lease() { # <lease-dir> <pr>: the shared coordinator lease binding run-1 to its PR
   mkdir -p "$1"; jq -n --argjson pr "$2" '{schemaVersion:1,pr:$pr,runId:"run-1",owner:"owner-1"}' > "$1/lease-run-1.json"
 }
@@ -493,6 +494,39 @@ if [ "$(id -u)" != 0 ]; then
   chmod 644 "$U_LEASES"/journeys-catalogue-*.json
   expect 5b-available-again '.state == "valid" and .owner == "'"$U_PIN"'"' "$(python3 "$TOOL" pin-check "$U_PIN" --owner --pr 7 --head "$SHA")"
 fi
+
+# UNAVAILABLE STORAGE IS NOT "NO PIN". Pin discovery is ONE listing of the
+# shared lease dir (lease_dir_glob), and a listing that fails — the dir is
+# missing (a vanished mount) or cannot be read — is refused for a pr-owned run,
+# which already depends on that directory for its lease, naming the dir; a
+# develop-owned run never takes its pin obligations from there, so its answer
+# is unchanged. A readable empty directory stays byte-identical (5b above).
+new_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
+MISSING_LEASES="$WORK/never-created-leases"
+expect 5b-lease-dir-missing-pr '.ready == false and (.invalid | index("journeys/selection.json")) and
+  any(.invalidReasons[]; test("could not be looked up") and test("never-created-leases") and test("missing"))' \
+  "$(SMOKE_GATE_LEASE_DIR="$MISSING_LEASES" bash "$BARRIER" "$RUN" lanes || true)"
+jq '.ownershipKind = "develop" | .coordinatorOwnerToken = null' "$RUN/completion-contract.json" > "$RUN/c.tmp"; mv "$RUN/c.tmp" "$RUN/completion-contract.json"
+DEVELOP_EMPTY_OUT="$(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$RUN" lanes)"
+expect 5b-lease-dir-develop-baseline '.ready == true' "$DEVELOP_EMPTY_OUT"
+[ "$(SMOKE_GATE_LEASE_DIR="$MISSING_LEASES" bash "$BARRIER" "$RUN" lanes)" = "$DEVELOP_EMPTY_OUT" ] ||
+  fail "5b-lease-dir-missing-develop: a develop-owned run's answer changed with the lease dir missing"
+if [ "$(id -u)" != 0 ]; then  # chmod 000 still lists as root
+  UNLISTABLE="$WORK/unlistable-leases"; mkdir -p "$UNLISTABLE"; chmod 000 "$UNLISTABLE"
+  [ "$(SMOKE_GATE_LEASE_DIR="$UNLISTABLE" bash "$BARRIER" "$RUN" lanes)" = "$DEVELOP_EMPTY_OUT" ] ||
+    fail "5b-lease-dir-unlistable-develop: a develop-owned run's answer changed with the lease dir unreadable"
+  new_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
+  expect 5b-lease-dir-unlistable-pr '.ready == false and (.invalid | index("journeys/selection.json")) and
+    any(.invalidReasons[]; test("could not be looked up") and test("unlistable-leases") and test("could not be listed"))' \
+    "$(SMOKE_GATE_LEASE_DIR="$UNLISTABLE" bash "$BARRIER" "$RUN" lanes || true)"
+  chmod 755 "$UNLISTABLE"
+  [ "$(SMOKE_GATE_LEASE_DIR="$UNLISTABLE" bash "$BARRIER" "$RUN" lanes)" = "$(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$RUN" lanes)" ] ||
+    fail "5b-lease-dir-listable-again: a readable empty lease dir is not byte-identical to the no-pin answer"
+fi
+# Every discovery goes through the one primitive: no shell glob over the lease
+# dir survives outside lease_dir_glob, where a failed listing would read as "no match".
+[ "$(grep -c 'compgen -G "\$JOURNEY_LEASE_DIR\|in "\$JOURNEY_LEASE_DIR"/' "$BARRIER")" = 0 ] ||
+  fail "5b-one-discovery-primitive: smoke-evidence-barrier.sh globs the lease dir outside lease_dir_glob"
 
 # A selection with NO gate pin behind it is not the gate's, so it is refused.
 new_run "$ALL_LANES"; LEASES="$WORK/empty-leases"; share_lease "$LEASES" 7
