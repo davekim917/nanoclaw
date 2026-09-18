@@ -18,6 +18,7 @@ vi.mock('./config.js', async (importOriginal) => ({
 }));
 
 import { boundedNameList, buildSessionServicesSnapshot, getHostCapabilities } from './capabilities.js';
+import { __resetCachesForTest, __setSecretsCacheForTest } from './onecli-secrets.js';
 import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from './db/index.js';
 import { writeContainerConfig } from './container-config.js';
 import { SIBLING_BOUND_FIELDS } from './sibling-parity.js';
@@ -1186,5 +1187,81 @@ describe('GitHub App sentinel scoping', () => {
     expect(gh?.activation ?? '').toContain('HEALTHY App installation token');
     delete process.env.GITHUB_APP_ID;
     delete process.env.GITHUB_APP_INSTALLATION_ID;
+  });
+});
+
+describe('OneCLI gateway roster line', () => {
+  afterEach(() => __resetCachesForTest());
+
+  const vault = [
+    { id: '00000000-0000-0000-0000-000000000001', name: 'TypeSafe', hostPattern: 'api.typesafe.ai', pathPattern: null },
+    {
+      id: '00000000-0000-0000-0000-000000000002',
+      name: 'Littlebird',
+      hostPattern: 'mcp.littlebird.ai',
+      pathPattern: '/mcp',
+    },
+    { id: '00000000-0000-0000-0000-000000000003', name: 'Linear', hostPattern: 'api.example.com', pathPattern: '/mcp' },
+    {
+      id: '00000000-0000-0000-0000-000000000004',
+      name: 'Slack-Reader-Tenant',
+      hostPattern: 'slack.com',
+      pathPattern: null,
+    },
+    {
+      id: '00000000-0000-0000-0000-000000000005',
+      name: 'Anthropic',
+      hostPattern: 'api.anthropic.com',
+      pathPattern: null,
+    },
+    {
+      id: '00000000-0000-0000-0000-000000000006',
+      name: 'Google-Maps',
+      hostPattern: 'maps.googleapis.com',
+      pathPattern: null,
+    },
+  ];
+
+  async function rosterLine(secrets: string[]) {
+    __setSecretsCacheForTest(vault);
+    insertWorkgroup('wg-gw', secrets);
+    const g = group('ag-wg-gw', 'wg-gw');
+    await createGroupInWorkgroup(g, 'wg-gw');
+    const snap = await buildSessionServicesSnapshot(g.id);
+    return snap.services.find((service) => service.name === 'OneCLI gateway');
+  }
+
+  it('names the REST host of each granted gateway secret', async () => {
+    const entry = await rosterLine(['TypeSafe', 'Google-Maps']);
+    expect(entry?.scopes).toEqual(['api.typesafe.ai', 'maps.googleapis.com']);
+    expect(entry?.summary).toContain('no key in env');
+  });
+
+  it('never lists MCP-scoped, Slack or model-provider secrets', async () => {
+    expect(await rosterLine(['Littlebird', 'Linear', 'Slack-Reader-Tenant', 'Anthropic'])).toBeUndefined();
+  });
+
+  it('skips malformed vault rows instead of throwing on the turn path', async () => {
+    __setSecretsCacheForTest([
+      null,
+      { id: 'x', name: 'Broken', hostPattern: 42 },
+      { id: 7, name: 'NoId' },
+      ...vault,
+    ] as unknown as Parameters<typeof __setSecretsCacheForTest>[0]);
+    insertWorkgroup('wg-bad', ['Broken', 'NoId', 'TypeSafe']);
+    const g = group('ag-wg-bad', 'wg-bad');
+    await createGroupInWorkgroup(g, 'wg-bad');
+    const snap = await buildSessionServicesSnapshot(g.id);
+    expect(snap.services.find((service) => service.name === 'OneCLI gateway')?.scopes).toEqual(['api.typesafe.ai']);
+  });
+
+  it('omits the line when the secrets cache is cold instead of blocking the turn', async () => {
+    __resetCachesForTest();
+    insertWorkgroup('wg-cold', ['TypeSafe']);
+    const g = group('ag-wg-cold', 'wg-cold');
+    await createGroupInWorkgroup(g, 'wg-cold');
+    vi.stubEnv('ONECLI_URL', 'http://127.0.0.1:9');
+    const snap = await buildSessionServicesSnapshot(g.id);
+    expect(snap.services.some((service) => service.name === 'OneCLI gateway')).toBe(false);
   });
 });

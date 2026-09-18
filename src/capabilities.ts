@@ -27,7 +27,7 @@ import { readContainerConfig, type McpServerConfig } from './container-config.js
 import { RETIRED_MCP_SERVER_NAMES, effectiveMcpServers, readFleetMcpServers } from './fleet-mcp-servers.js';
 import { getAllAgentGroups, getAgentGroup, getWorkgroupOnecliSecrets } from './db/agent-groups.js';
 import type { AgentGroup } from './types.js';
-import { mergeWorkgroupAndGroupSecrets, slackUserTokenSecrets } from './onecli-secrets.js';
+import { gatewayRestHosts, mergeWorkgroupAndGroupSecrets, slackUserTokenSecrets } from './onecli-secrets.js';
 import { GITHUB_APP_SENTINEL, peekGitHubAppTokenExpiry } from './github-app-token.js';
 import { GH_TOKEN_CONTAINER_PATH, githubTokenDeliveredAsEnv } from './github-token-file.js';
 import { isOwnerSafeSlackSession } from './modules/permissions/slack-user-token-gate.js';
@@ -1149,8 +1149,38 @@ export function buildSessionServicesSnapshotFrom(
   derived.sort((a, b) => Number(Boolean(b.retainUnderBudget)) - Number(Boolean(a.retainUnderBudget)));
   services.splice(derivedMcpIndex, 0, ...derived);
 
+  // Secrets the gateway injects into DIRECT REST calls, named by the host they
+  // apply to (from OneCLI's own metadata, not the secret's name — a name does
+  // not prove REST injection; MCP-scoped secrets are excluded upstream).
+  // Derived from `mergedSecrets`, the declaration the spawn grants, so there is
+  // no second list. Without it, an agent that finds no `<SERVICE>_API_KEY` in
+  // env concludes the service is unwired and substitutes a stub.
+  const slackSecrets = new Set(slackUserTokenSecrets(mergedSecrets, cfg?.slack_user_token?.onecli_secret_names));
+  const restHosts = [
+    ...new Set(
+      gatewayRestHosts(mergedSecrets.filter((secret) => !slackSecrets.has(secret)))
+        // Slack has its own entry, which carries the owner-safe withholding rule.
+        .filter((entry) => !PROVIDER_SECRET.test(entry.name) && !/^slack(-|$)/i.test(entry.name))
+        .map((entry) => entry.host),
+    ),
+  ];
+  if (restHosts.length > 0) {
+    services.push({
+      name: 'OneCLI gateway',
+      cli: 'curl',
+      declaredTools: [],
+      scopes: restHosts,
+      credentialPaths: [],
+      summary: `${boundedNameList(restHosts)}: call directly; auth is injected, no key in env`,
+      useFor: `The gateway injects a credential into requests to: ${restHosts.join(', ')}. Call those hosts directly (curl, fetch, or the vendor SDK with any placeholder key). A missing \`<SERVICE>_API_KEY\` env var is expected there and is NOT evidence the service is unavailable; do not substitute a stub. A 401/403 from the host is the real signal; report it to the operator.`,
+    });
+  }
+
   return { agentGroupId, howToUse: CAPABILITY_ROSTER_PREAMBLE, services };
 }
+
+/** Model-provider keys: the runtime's own credential, not a service to call. */
+const PROVIDER_SECRET = /^(anthropic|openai|opencode)(-|$)/i;
 
 /**
  * Capability text for a stored MCP server that carries no `description`.
