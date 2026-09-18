@@ -2068,6 +2068,208 @@ bash "$GATE" claim run-rival 55 "$DUP_SHA" | jq -e '
 ' >/dev/null
 unset SMOKE_GATE_PROGRESS_STALE_SECONDS
 
+# --- 7c. pr_run_stalled: a claimed run whose PR stopped settling is not
+# invisible. The traced hole: the challenger files its disposition, the
+# coordinator dies before synthesis, progress goes stale, and the preview is
+# then suspended / the PR unlabeled or closed. `challenger-timeout` refuses (a
+# disposition exists), same-run recovery needs a PR that settles, and
+# `pr_run_overrun` needs FRESH progress — so nothing ever fired.
+IDLE_ONE='{"wakeAgent":false,"data":{"schemaVersion":1,"trigger":"waiting_for_candidates","labeledPrCount":1}}'
+IDLE_NONE='{"wakeAgent":false,"data":{"schemaVersion":1,"trigger":"waiting_for_candidates","labeledPrCount":0}}'
+stalled_fixture() { # <pr> <sha>: a settling ordinary PR plus a readable run root
+  fresh_state
+  export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+    SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+  export SMOKE_GATE_RUN_ROOT="$STATE_DIR/qa-runs"
+  mkdir -p "$SMOKE_GATE_RUN_ROOT"
+  export STUB_PR_LIST="[{\"number\":$1,\"headRefOid\":\"$2\",\"headRefName\":\"feature/stall\"}]"
+  export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+  export STUB_RUN_LIST="[{\"headSha\":\"$2\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+  export STUB_SERVICES="[{\"id\":\"srv-backend-pr-$1\",\"name\":\"XZO-DEV-BACKEND PR #$1\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-$1.onrender.com\"}}]"
+  export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$2\"}}]"
+  export STUB_HEALTHZ_CODE=200
+}
+# The coordinator's death, as the gate sees it: no stamp inside the window.
+stall_now() { export SMOKE_GATE_PROGRESS_STALE_SECONDS=0 SMOKE_GATE_STALLED_GRACE_SECONDS=0; }
+stall_clear() { unset SMOKE_GATE_PROGRESS_STALE_SECONDS SMOKE_GATE_STALLED_GRACE_SECONDS; }
+ownership_digest() { # <pr> <run>: state owner + lease + authority, for "nothing was minted"
+  { jq -c '[.activeRunId,.activeLeaseOwner,.activeStartedAt,.challengerDeadline]' "$STATE_DIR/pr-$1-state.json"
+    cat "$SMOKE_GATE_LEASE_DIR/lease-$2.json" "$SMOKE_GATE_LEASE_DIR/pr-$1-authority.json"; } | sha256sum
+}
+
+STALL_SHA="$(sha 6)"
+stalled_fixture 61 "$STALL_SHA"
+STALL_OPEN="$(bash "$GATE" poll)"
+jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled"' <<<"$STALL_OPEN" >/dev/null
+STALL_RUN="$(jq -r '.data.runId' <<<"$STALL_OPEN")"
+STALL_OWNER="$(jq -r '.data.coordinatorOwnerToken' <<<"$STALL_OPEN")"
+mkdir -p "$SMOKE_GATE_RUN_ROOT/$STALL_RUN/challenger"
+echo "disposition: no blocking findings" > "$SMOKE_GATE_RUN_ROOT/$STALL_RUN/challenger/disposition.md"
+# The contract as the scaffold writes it today (schemaVersion 2, campaign
+# identity beside the token, smoke-run-scaffold.sh:541-552); a legacy v1 one
+# is exercised on PR 64 below.
+jq -cn --arg o "$STALL_OWNER" --arg run "$STALL_RUN" --arg sha "$STALL_SHA" \
+  '{schemaVersion:2,runId:$run,sourceSha:$sha,coordinatorOwnerToken:$o,ownershipKind:"pr",pr:61,repoSlug:"org/repo"}' \
+  > "$SMOKE_GATE_RUN_ROOT/$STALL_RUN/completion-contract.json"
+# ...and the preview is suspended: the PR is still listed, it just never settles.
+export STUB_HEALTHZ_CODE=503
+# Fresh progress => silent, byte-identical to a gate that has no such alarm.
+[ "$(bash "$GATE" poll)" = "$IDLE_ONE" ] || { echo "7c: a live claimed run changed poll output" >&2; exit 1; }
+# Stale, but inside the grace that gives same-run recovery first refusal => silent.
+[ "$(SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll)" = "$IDLE_ONE" ] ||
+  { echo "7c: stalled alarm rang inside its grace window" >&2; exit 1; }
+jq -e '.stalledAlertRunId == null' "$STATE_DIR/pr-61-state.json" >/dev/null
+# The precondition of the hole, asserted rather than assumed: the timeout verb
+# refuses because a disposition exists.
+jq -c '.challengerDeadline="2000-01-01T00:00:00Z"' "$STATE_DIR/pr-61-state.json" > "$STATE_DIR/pr-61-state.tmp"
+mv "$STATE_DIR/pr-61-state.tmp" "$STATE_DIR/pr-61-state.json"
+bash "$GATE" challenger-timeout "$STALL_RUN" "$STALL_OWNER" | jq -e '
+  .ok == false and (.error | test("DID file a disposition"))' >/dev/null
+# A dead coordinator stops renewing too: its lease (900s) lapses well inside
+# the liveness window (1800s), so a stalled run normally reports leaseLive:false.
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$STALL_RUN.json"
+stall_now
+STALL_BEFORE="$(ownership_digest 61 "$STALL_RUN")"
+STALL_OUT="$(bash "$GATE" poll)"
+jq -e --arg run "$STALL_RUN" --arg sha "$STALL_SHA" '
+  .wakeAgent == true and .data.trigger == "pr_run_stalled" and
+  .data.pr == 61 and .data.runId == $run and .data.sourceSha == $sha and
+  .data.challengerDispositionFiled == true and .data.synthesisPending == true and
+  .data.completionContractExists == true and .data.contractAdoptionRequired == true and
+  .data.finishIntentPending == false and .data.leaseLive == false and
+  (.data.activeStartedAt | type == "string") and .data.quietSeconds >= 0 and
+  .data.notSettling.reason == "not_settled" and .data.notSettling.headSha == $sha and
+  .data.notSettling.facts.healthzReady == false and .data.notSettling.facts.backendReady == true
+' <<<"$STALL_OUT" >/dev/null || { echo "7c: expected pr_run_stalled, got: $STALL_OUT" >&2; exit 1; }
+# It reports; it never recovers. No token in the wake, nothing minted or rotated.
+if grep -q 'owner-[0-9a-f]\{8\}' <<<"$STALL_OUT"; then echo "7c: stalled wake leaked an owner token" >&2; exit 1; fi
+[ "$(ownership_digest 61 "$STALL_RUN")" = "$STALL_BEFORE" ] ||
+  { echo "7c: stalled alarm changed ownership of a non-settling PR" >&2; exit 1; }
+jq -e --arg run "$STALL_RUN" '.stalledAlertRunId == $run' "$STATE_DIR/pr-61-state.json" >/dev/null
+# Next poll => silent. Latched per run id, no interval re-ring.
+[ "$(bash "$GATE" poll)" = "$IDLE_ONE" ] || { echo "7c: stalled alarm re-fired on the next poll" >&2; exit 1; }
+# The preview comes back: existing same-run recovery is untouched by the latch.
+export STUB_HEALTHZ_CODE=200
+bash "$GATE" poll | jq -e --arg run "$STALL_RUN" '
+  .data.trigger == "pr_build_settled" and .data.recovery == true and
+  .data.resumedRunId == true and .data.runId == $run' >/dev/null
+stall_clear
+
+# Same run shape, but the PR STILL settles: existing recovery wins, the stalled
+# alarm neither fires nor latches, and the poll after that is silent.
+STALL_SHA="$(sha 7)"
+stalled_fixture 62 "$STALL_SHA"
+STALL_RUN="$(bash "$GATE" poll | jq -r '.data.runId')"
+mkdir -p "$SMOKE_GATE_RUN_ROOT/$STALL_RUN/challenger"
+echo "disposition" > "$SMOKE_GATE_RUN_ROOT/$STALL_RUN/challenger/disposition.md"
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$STALL_RUN.json"
+stall_now
+bash "$GATE" poll | jq -e --arg run "$STALL_RUN" '
+  .wakeAgent == true and .data.trigger == "pr_build_settled" and
+  .data.recovery == true and .data.resumedRunId == true and .data.runId == $run' >/dev/null
+jq -e '.stalledAlertRunId == null' "$STATE_DIR/pr-62-state.json" >/dev/null
+stall_clear
+[ "$(bash "$GATE" poll)" = "$IDLE_ONE" ] || { echo "7c: recovery and the stalled alarm double-fired" >&2; exit 1; }
+
+# The PR left the labeled-open list altogether (closed) — the case `poll`'s own
+# loop can never see. No disposition, unreadable contract: reported as such.
+STALL_SHA="$(sha 8)"
+stalled_fixture 63 "$STALL_SHA"
+STALL_OPEN="$(bash "$GATE" poll)"
+STALL_RUN="$(jq -r '.data.runId' <<<"$STALL_OPEN")"
+STALL_OWNER="$(jq -r '.data.coordinatorOwnerToken' <<<"$STALL_OPEN")"
+export STUB_PR_LIST='[]'
+export STUB_PR_VIEW="{\"state\":\"CLOSED\",\"labels\":[{\"name\":\"render-preview\"}],\"baseRefName\":\"develop\",\"headRefOid\":\"$STALL_SHA\"}"
+[ "$(bash "$GATE" poll)" = "$IDLE_NONE" ] || { echo "7c: live run on an unlisted PR changed poll output" >&2; exit 1; }
+stall_now
+# leaseLive is reported, not acted on: this lease has not lapsed yet.
+bash "$GATE" poll | jq -e --arg run "$STALL_RUN" '
+  .wakeAgent == true and .data.trigger == "pr_run_stalled" and .data.pr == 63 and .data.runId == $run and
+  .data.leaseLive == true and
+  .data.challengerDispositionFiled == false and .data.synthesisPending == false and
+  .data.completionContractExists == false and .data.contractAdoptionRequired == false and
+  .data.notSettling.reason == "pr_closed" and .data.notSettling.prState == "CLOSED"' >/dev/null
+[ "$(bash "$GATE" poll)" = "$IDLE_NONE" ] || { echo "7c: unlisted stalled alarm re-fired" >&2; exit 1; }
+# A NEW run id re-arms it. The responder's own path: resume the published run
+# id with `claim` (allowed once progress is stale and the dead owner's lease has
+# lapsed), release it, and a later run on the same PR that stalls the same way
+# alarms again.
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$STALL_RUN.json"
+STALL_RECLAIM="$(bash "$GATE" claim "$STALL_RUN" 63 "$STALL_SHA" owner-responder)"
+jq -e '.ok == true' <<<"$STALL_RECLAIM" >/dev/null
+bash "$GATE" release "$STALL_RUN" owner-responder | jq -e '.ok == true' >/dev/null
+[ "$(bash "$GATE" poll)" = "$IDLE_NONE" ] || { echo "7c: a released run still alarmed" >&2; exit 1; }
+bash "$GATE" claim run-stall-second 63 "$STALL_SHA" owner-second | jq -e '.ok == true' >/dev/null
+export STUB_PR_VIEW="{\"state\":\"OPEN\",\"labels\":[],\"baseRefName\":\"develop\",\"headRefOid\":\"$STALL_SHA\"}"
+bash "$GATE" poll | jq -e '
+  .data.trigger == "pr_run_stalled" and .data.runId == "run-stall-second" and
+  .data.notSettling.reason == "label_removed" and .data.notSettling.labeled == false' >/dev/null
+[ "$(bash "$GATE" poll)" = "$IDLE_NONE" ] || { echo "7c: re-armed stalled alarm re-fired" >&2; exit 1; }
+# Unwired run root: null, never false — absence is only evidence when presence
+# was possible. And an unreadable `gh pr view` leaves the honest generic reason.
+bash "$GATE" release run-stall-second owner-second | jq -e '.ok == true' >/dev/null
+bash "$GATE" claim run-stall-third 63 "$STALL_SHA" owner-third | jq -e '.ok == true' >/dev/null
+export STUB_PR_VIEW_EXIT=1
+SMOKE_GATE_RUN_ROOT= bash "$GATE" poll | jq -e '
+  .data.trigger == "pr_run_stalled" and .data.runId == "run-stall-third" and
+  .data.challengerDispositionFiled == null and .data.completionContractExists == null and
+  .data.contractAdoptionRequired == null and .data.synthesisPending == false and
+  .data.notSettling == {reason:"pr_not_listed"}' >/dev/null
+# A TERMINAL run is silent: finish it and the same poll says nothing.
+bash "$GATE" finish "$STALL_SHA" run-stall-third BLOCKED owner-third | jq -e '.ok == true' >/dev/null
+jq -e '.activeRunId == null and .completedRunId == "run-stall-third"' "$STATE_DIR/pr-63-state.json" >/dev/null
+[ "$(bash "$GATE" poll)" = "$IDLE_NONE" ] || { echo "7c: a terminal run alarmed as stalled" >&2; exit 1; }
+stall_clear
+
+# Precedence. (1) A settle candidate on ANOTHER PR outranks the stalled alarm —
+# it can never delay a campaign — and the alarm rings on the next idle poll.
+STALL_SHA="$(sha 5)"
+stalled_fixture 65 "$STALL_SHA"
+bash "$GATE" claim run-stall-dead 64 "$(sha 4)" owner-dead | jq -e '.ok == true' >/dev/null
+stall_now
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.pr == 65' >/dev/null
+jq -e '.stalledAlertRunId == null' "$STATE_DIR/pr-64-state.json" >/dev/null
+stall_clear
+# PR 65's new run is live under the default window; PR 64's is aged explicitly.
+jq -c '.activeStartedAt="2000-01-01T00:00:00Z" | .activeProgressAt=null' "$STATE_DIR/pr-64-state.json" > "$STATE_DIR/pr-64-state.tmp"
+mv "$STATE_DIR/pr-64-state.tmp" "$STATE_DIR/pr-64-state.json"
+# The scan keys on pr-<n>-state.json and nothing else: range/journeys pin files
+# (shared lease dir, here also dropped beside the state) and an unparseable
+# state file are ignored, and the claimed run is still found.
+for STALL_DECOY in "$STATE_DIR" "$SMOKE_GATE_LEASE_DIR"; do
+  echo '{"activeRunId":"decoy","pr":1}' > "$STALL_DECOY/range-pin-v1-pr-64-$(sha 4).json"
+  echo '{"activeRunId":"decoy","pr":1}' > "$STALL_DECOY/journeys-pin-v1-pr-64-$(sha 4).json"
+done
+echo 'not json' > "$STATE_DIR/pr-1-state.json"
+# A contract written before identity existed (schemaVersion 1) reads the same:
+# adoption is keyed on the token, and `adopt` backfills the identity itself.
+mkdir -p "$SMOKE_GATE_RUN_ROOT/run-stall-dead"
+jq -cn '{schemaVersion:1,coordinatorOwnerToken:"owner-dead"}' \
+  > "$SMOKE_GATE_RUN_ROOT/run-stall-dead/completion-contract.json"
+bash "$GATE" poll | jq -e '
+  .data.trigger == "pr_run_stalled" and .data.pr == 64 and .data.runId == "run-stall-dead" and
+  .data.completionContractExists == true and .data.contractAdoptionRequired == true' >/dev/null
+[ "$(bash "$GATE" poll)" = "$IDLE_ONE" ] || { echo "7c: aged stalled alarm re-fired" >&2; exit 1; }
+# (2) Overrun and stalled are disjoint by predicate: a run that is still
+# STAMPING past the ceiling is an overrun, never a stall, even at zero grace.
+STALL_SHA="$(sha 2)"
+stalled_fixture 66 "$STALL_SHA"
+bash "$GATE" claim run-stall-zombie 66 "$STALL_SHA" owner-zombie | jq -e '.ok == true' >/dev/null
+SMOKE_GATE_ACTIVE_STALE_SECONDS=0 SMOKE_GATE_STALLED_GRACE_SECONDS=0 bash "$GATE" poll | jq -e '
+  .data.trigger == "pr_run_overrun" and .data.runId == "run-stall-zombie"' >/dev/null
+jq -e '.stalledAlertRunId == null and .overrunAlertRunId == "run-stall-zombie"' "$STATE_DIR/pr-66-state.json" >/dev/null
+# No claimed run anywhere => byte-identical, even with the alarm at zero grace.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base STUB_PR_LIST='[]'
+stall_now
+[ "$(bash "$GATE" poll)" = "$IDLE_NONE" ] || { echo "7c: poll output changed with no claimed run" >&2; exit 1; }
+bash "$GATE" claim run-stall-done 67 "$(sha 1)" owner-done >/dev/null
+bash "$GATE" release run-stall-done owner-done >/dev/null
+[ "$(bash "$GATE" poll)" = "$IDLE_NONE" ] || { echo "7c: a released slot alarmed" >&2; exit 1; }
+stall_clear
+unset SMOKE_GATE_RUN_ROOT
+
 # --- 8. finish suspends the backend preview ---------------------------------
 fresh_state
 FINISH_SHA="$(sha 3)"

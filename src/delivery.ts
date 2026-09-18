@@ -46,6 +46,7 @@ import { allowedWikiOutbound, wikiEnrollment } from './wiki-admission/policy.js'
 import { isUnguarded, unguarded, type Unguarded } from './guard/index.js';
 import { log } from './log.js';
 import { scrubSecrets } from './secret-scrubber.js';
+import { humanizeOutboundContent } from './verdict-tokens.js';
 import { archiveMessage } from './message-archive.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
@@ -1382,7 +1383,7 @@ async function deliverMessage(
     }
 
     const existing = statusTracking.get(session.id);
-    const freshOutbound = scrubSecrets(msg.content);
+    const freshOutbound = humanizeOutboundContent(scrubSecrets(msg.content));
     const replacingExhaustedStatus = existing?.editExhausted === true;
     let outbound = freshOutbound;
     if (existing && !replacingExhaustedStatus) {
@@ -1527,7 +1528,10 @@ async function deliverMessage(
   // reaches the adapter. Defense-in-depth — OneCLI already keeps API keys
   // away from the agent, but scrub content anyway in case an agent ever
   // ends up with a secret (e.g. by reading a file) and tries to echo it.
-  const scrubbedContent = scrubSecrets(msg.content);
+  // Gate-verdict tokens (`NO_GO`, …) are rewritten to plain English here too:
+  // this is the one door every agent-authored chat post — send_message and
+  // final response text alike — passes through. See src/verdict-tokens.ts.
+  const scrubbedContent = humanizeOutboundContent(scrubSecrets(msg.content));
 
   // Final chat replies always post fresh (not as an edit of the in-flight
   // status bubble). When a user follow-up message arrives during the turn,

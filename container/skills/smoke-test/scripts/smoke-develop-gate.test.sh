@@ -1781,7 +1781,7 @@ unset STUB_FREEZE_EXIT STUB_FREEZE_JSON
 # either leaves the wake open or refiles under a develop trigger and clobbers
 # that slot.
 fresh_state
-for t in pr_preflight_failed pr_migrations_refused pr_warmup_stuck pr_facts_unavailable pr_run_overrun; do
+for t in pr_preflight_failed pr_migrations_refused pr_warmup_stuck pr_facts_unavailable pr_run_overrun pr_run_stalled; do
   bash "$GATE" ack "$t" "pr|some reason|44" acked | jq -e '
     .ok == true and .silenceable == false and .silencedUntil == null
   ' >/dev/null || { echo "$t is not record-only ackable" >&2; exit 1; }
@@ -1801,7 +1801,7 @@ ACK_TRIGGER_LIST="$(grep -zoP 'ACK_TRIGGERS="\K[^"]+' "$GATE" | tr -d '\0' | tr 
 # a partial or empty extraction is the failure mode this whole case exists for.
 [ -n "$ACK_TRIGGER_LIST" ] \
   || { echo "ACK_TRIGGERS extraction produced nothing — the parity loop below cannot fail" >&2; exit 1; }
-for t in pr_preflight_failed pr_migrations_refused pr_warmup_stuck pr_facts_unavailable pr_run_overrun; do
+for t in pr_preflight_failed pr_migrations_refused pr_warmup_stuck pr_facts_unavailable pr_run_overrun pr_run_stalled; do
   case " $ACK_TRIGGER_LIST " in
     *" $t "*) ;;
     *) echo "ACK_TRIGGERS extraction lost $t — the parity loop below cannot fail" >&2; exit 1 ;;
