@@ -267,7 +267,7 @@ describe('thread-search workgroup-pooled tests', () => {
       channel_name: 'docs',
     });
 
-    const result = await searchThreadsTool.handler({ query: 'workgroup pooled document', rerank: false });
+    const result = await searchThreadsTool.handler({ query: 'workgroup pooled document' });
 
     const text = getText(result);
     // Post-D1: both threads should appear in FTS results
@@ -275,6 +275,104 @@ describe('thread-search workgroup-pooled tests', () => {
     // Should return 2 thread hits (one per unique thread_id)
     expect(text).toMatch(/Found 2 thread/);
     expect(result.isError).toBeFalsy();
+  });
+
+  it('lists a thread once when sibling agents archived it under their own adapters', async () => {
+    for (const [i, channelType] of ['slack-acme', 'slack-acme-codex', 'slack-acme-opencode'].entries()) {
+      insertMsg(sharedDb, {
+        id: `msg-sib-${i}`,
+        agent_group_id: `ag-sib-${i}`,
+        channel_type: channelType,
+        platform_id: 'slack:C900',
+        thread_id: 'slack:C900:t1',
+        role: 'assistant',
+        sender_name: `bot${i}`,
+        text: `release checklist for the quarterly launch ${i}`,
+        sent_at: `2024-01-04T08:0${i}:00Z`,
+        channel_name: 'launch',
+      });
+    }
+
+    const text = getText(await searchThreadsTool.handler({ query: 'quarterly launch checklist' }));
+    expect(text).toMatch(/Found 1 thread/);
+    expect(text).toContain('3 match(es)');
+  });
+
+  it('reads a thread across sibling adapters, and never across platforms', async () => {
+    const rows: [string, string, string][] = [
+      ['slack-acme', 'user', 'can someone check the deploy'],
+      ['slack-acme-codex', 'assistant', 'codex sibling: deploy is green'],
+      ['discord', 'assistant', 'unrelated discord message with a colliding id'],
+    ];
+    for (const [i, [channelType, role, text]] of rows.entries()) {
+      insertMsg(sharedDb, {
+        id: `msg-fam-${i}`,
+        agent_group_id: `ag-fam-${i}`,
+        channel_type: channelType,
+        platform_id: 'slack:C901',
+        thread_id: 'slack:C901:t1',
+        role,
+        sender_name: `s${i}`,
+        text,
+        sent_at: `2024-01-05T08:0${i}:00Z`,
+      });
+    }
+
+    const text = getText(
+      await readThreadTool.handler({ channel_type: 'slack-acme', platform_id: 'slack:C901', thread_id: 'slack:C901:t1' }),
+    );
+    expect(text).toContain('can someone check the deploy');
+    expect(text).toContain('codex sibling: deploy is green');
+    expect(text).not.toContain('unrelated discord message');
+  });
+
+  it('never pools distinct platforms that share an unprefixed id (whatsapp vs whatsapp-cloud)', async () => {
+    for (const [i, channelType] of ['whatsapp', 'whatsapp-cloud'].entries()) {
+      insertMsg(sharedDb, {
+        id: `msg-wa-${i}`,
+        agent_group_id: `ag-wa-${i}`,
+        channel_type: channelType,
+        platform_id: '15550001111@s.whatsapp.net',
+        thread_id: null,
+        role: 'user',
+        sender_name: `wa${i}`,
+        text: `refund request number ${channelType}`,
+        sent_at: `2024-01-06T08:0${i}:00Z`,
+      });
+    }
+
+    expect(getText(await searchThreadsTool.handler({ query: 'refund request' }))).toMatch(/Found 2 thread/);
+    const text = getText(
+      await readThreadTool.handler({ channel_type: 'whatsapp', platform_id: '15550001111@s.whatsapp.net' }),
+    );
+    expect(text).toContain('refund request number whatsapp');
+    expect(text).not.toContain('refund request number whatsapp-cloud');
+  });
+
+  it("shows the caller's own copy even when only a sibling's reply matched", async () => {
+    getInboundDb().prepare("UPDATE session_routing SET channel_type = 'slack-acme' WHERE id = 1").run();
+    const rows: [string, string][] = [
+      ['slack-acme', 'hello team'],
+      ['slack-acme-codex', 'the quarterly forecast is ready'],
+    ];
+    for (const [i, [channelType, text]] of rows.entries()) {
+      insertMsg(sharedDb, {
+        id: `msg-own-${i}`,
+        agent_group_id: `ag-own-${i}`,
+        channel_type: channelType,
+        platform_id: 'slack:C902',
+        thread_id: 'slack:C902:t1',
+        role: 'assistant',
+        sender_name: `b${i}`,
+        text,
+        sent_at: `2024-01-07T08:0${i}:00Z`,
+      });
+    }
+
+    const text = getText(await searchThreadsTool.handler({ query: 'quarterly forecast' }));
+    expect(text).toMatch(/Found 1 thread/);
+    expect(text).toContain('slack-acme:slack:C902');
+    expect(text).not.toContain('slack-acme-codex');
   });
 
   // -----------------------------------------------------------------------
@@ -340,7 +438,6 @@ describe('thread-search workgroup-pooled tests', () => {
 
     const result = await searchThreadsTool.handler({
       query: 'isolated workgroup specific',
-      rerank: false,
     });
 
     const text = getText(result);
