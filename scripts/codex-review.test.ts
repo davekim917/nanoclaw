@@ -132,6 +132,29 @@ if [ -n "$rest" ]; then
       echo 'gh: Not Found (HTTP 404)' >&2
       exit 1
       ;;
+    */actions/runs/*/jobs\\?*)
+      # jobs--<run id>.json is that run's jobs page. Absent = the read fails.
+      id="\${rest#*/actions/runs/}"
+      id="\${id%%/*}"
+      if [ ! -f "$MOCK_DIR/jobs--$id.json" ]; then
+        echo '{"message":"Not Found","status":"404"}'
+        echo 'gh: Not Found (HTTP 404)' >&2
+        exit 1
+      fi
+      if printf '%s\\n' "$@" | grep -qx -- --slurp; then printf '['; cat "$MOCK_DIR/jobs--$id.json"; printf ']'; else cat "$MOCK_DIR/jobs--$id.json"; fi
+      exit 0
+      ;;
+    */actions/jobs/*)
+      # job--<job id>.json is that one job. Absent = the read fails.
+      id="\${rest##*/}"
+      if [ ! -f "$MOCK_DIR/job--$id.json" ]; then
+        echo '{"message":"Not Found","status":"404"}'
+        echo 'gh: Not Found (HTTP 404)' >&2
+        exit 1
+      fi
+      cat "$MOCK_DIR/job--$id.json"
+      exit 0
+      ;;
     */actions/runs\\?*)
       # runs-<n>.json answers the nth read of this endpoint in this run;
       # runs.json otherwise. Mirrors the git/ref/heads nth-read pattern below.
@@ -5215,5 +5238,193 @@ describe('codex-review review-notes rule: the same-second edit boundary', () => 
     expect(result.stdout).toContain(
       `review_notes_missing: whether a substitute receipt asked for changes is unknown: ${LOGIN} posted a comment at 2026-09-05T00:10:00Z and edited it at ${MERGED_AT}`,
     );
+  });
+});
+
+// Host CI (run-host-ci.sh posts `CI (host)`) standing in for an Actions workflow
+// GitHub never started. The never-started shape is the 2026-09-18 billing
+// lockout's, read live from run 35388540873's jobs: completed `failure`,
+// runner_id 0, runner_name "", no steps. A job that ran has a runner and steps.
+describe('codex-review host CI: a CI (host) success stands in only for a workflow GitHub never started', () => {
+  const HOST = 'CI (host)';
+
+  function actionsJob(started: boolean, conclusion = 'failure'): Page {
+    return started
+      ? {
+          id: 105741202176,
+          status: 'completed',
+          conclusion,
+          runner_id: 1000006727,
+          runner_name: 'GitHub Actions 1000006727',
+          steps: [{ name: 'Typecheck host', status: 'completed', conclusion }],
+        }
+      : { id: 105741202176, status: 'completed', conclusion, runner_id: 0, runner_name: '', steps: [] };
+  }
+
+  // A failed run on HEAD whose one job did (or did not) start.
+  function failedRun(root: string, started: boolean, name = 'CI', startedAt = '2026-09-05T00:01:00Z'): Page {
+    const run = workflowRun(name, 'completed', 'failure', startedAt);
+    writeJson(root, `jobs--${run.id as number}.json`, { total_count: 1, jobs: [actionsJob(started)] });
+    return run;
+  }
+
+  function mergeCheck(root: string, ci: (root: string) => Page[], statuses: Page[]) {
+    scopeFixture(root, { labels: [], ci: ci(root), statuses });
+    return runHelper(root, ['merge-check', '--head', HEAD]);
+  }
+
+  it('allows a head whose required CI never started when CI (host) succeeded on it, and says ci=host', () => {
+    const root = tempRoot();
+    const result = mergeCheck(root, (r) => [failedRun(r, false)], [commitStatus(HOST, 'success')]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`merge=allowed head=${HEAD} mode=risk-scoped verdict=skip ci=host`);
+    expect(result.stderr).toContain(
+      'ci_host: CI never started on Actions; the CI (host) success on this head stands in',
+    );
+  });
+
+  it('refuses a head whose required CI never started when no CI (host) status is on it', () => {
+    const root = tempRoot();
+    const result = mergeCheck(root, (r) => [failedRun(r, false)], []);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('ci_red: CI=not started (required;');
+    expect(result.stderr).toContain('run run-host-ci.sh');
+  });
+
+  it('refuses a required CI run that started and failed, whatever CI (host) says', () => {
+    const root = tempRoot();
+    const result = mergeCheck(root, (r) => [failedRun(r, true)], [commitStatus(HOST, 'success')]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('ci_red: CI=failure (required)');
+  });
+
+  it('refuses when CI (host) itself failed, even over a CI run that never started', () => {
+    const root = tempRoot();
+    const result = mergeCheck(root, (r) => [failedRun(r, false)], [commitStatus(HOST, 'failure')]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('CI (host)=failure');
+  });
+
+  it('judges only the newest CI (host) status: a failure superseded by a success allows, a success superseded by a failure refuses', () => {
+    const root = tempRoot();
+    const older = '2026-09-05T00:02:00Z';
+    const newer = '2026-09-05T00:03:00Z';
+    const recovered = mergeCheck(root, (r) => [failedRun(r, false)], [
+      commitStatus(HOST, 'failure', older),
+      commitStatus(HOST, 'success', newer),
+    ]);
+    expect(recovered.status).toBe(0);
+    const regressed = mergeCheck(root, (r) => [failedRun(r, false)], [
+      commitStatus(HOST, 'success', older),
+      commitStatus(HOST, 'failure', newer),
+    ]);
+    expect(regressed.status).toBe(24);
+  });
+
+  it('waits on a CI (host) run still pending rather than allowing', () => {
+    const root = tempRoot();
+    const result = mergeCheck(root, (r) => [failedRun(r, false)], [commitStatus(HOST, 'pending')]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('ci_pending: CI (host)=pending');
+  });
+
+  it('keeps a failed run red when its jobs cannot be read: not knowing it never started excuses nothing', () => {
+    const root = tempRoot();
+    const result = mergeCheck(root, () => [workflowRun('CI', 'completed', 'failure')], [commitStatus(HOST, 'success')]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('ci_red: CI=failure (required)');
+  });
+
+  it('does not take a CI (host) success on another head', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [], ci: [failedRun(root, false)], statuses: [] });
+    writeJson(root, `statuses--${OLD_HEAD}.json`, [commitStatus(HOST, 'success')]);
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('CI=not started (required;');
+  });
+
+  it('leaves normal Actions CI unchanged: green is ci=green, with or without a CI (host) status', () => {
+    const root = tempRoot();
+    const plain = mergeCheck(root, () => [workflowRun('CI', 'completed', 'success')], []);
+    expect(plain.status).toBe(0);
+    expect(plain.stdout).toContain('verdict=skip ci=green');
+    const alongside = mergeCheck(root, () => [workflowRun('CI', 'completed', 'success')], [
+      commitStatus(HOST, 'success'),
+    ]);
+    expect(alongside.status).toBe(0);
+    expect(alongside.stdout).toContain('verdict=skip ci=green');
+  });
+
+  it('leaves out a non-required workflow GitHub never started, as if it had not been triggered', () => {
+    const root = tempRoot();
+    const result = mergeCheck(
+      root,
+      (r) => [workflowRun('CI', 'completed', 'success'), failedRun(r, false, 'Label PR', '2026-09-05T00:01:30Z')],
+      [],
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('ci=green');
+  });
+
+  it('ci-wait reads a host-substituted head as green, and says ci=host', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    const run = failedRun(root, false);
+    writeJson(root, 'runs.json', { total_count: 2, workflow_runs: [labelRun('completed', 'success'), run] });
+    writeJson(root, `statuses--${HEAD}.json`, [commitStatus(HOST, 'success')]);
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`ci=host head=${HEAD}: ci_host:`);
+  });
+
+  it('audit counts a CI (host) success posted before the merge, and not one posted after it', () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: [],
+      ci: [failedRun(root, false)],
+      statuses: [commitStatus(HOST, 'success', '2026-09-05T02:00:00Z')],
+    });
+    const late = runHelper(root, ['audit']);
+    expect(late.status).toBe(28);
+    expect(late.stdout).toContain('CI=not started (required;');
+
+    auditFixture(root, { labels: [], ci: [failedRun(root, false)], statuses: [commitStatus(HOST, 'success')] });
+    const before = runHelper(root, ['audit']);
+    expect(before.status).toBe(0);
+    expect(before.stdout).toContain('ci=host');
+  });
+
+  describe('legacy repos: a required check run GitHub never started', () => {
+    const JOB = 105741202176;
+    const neverRun = (): Page => ({ ...rollupRun('CI Gate', 'COMPLETED', 'FAILURE'), databaseId: JOB });
+
+    function legacy(root: string, rollup: Page[], started: boolean | null): void {
+      scopeFixture(root, { baseConfig: null, labels: [], rollup });
+      fs.rmSync(path.join(root, `job--${JOB}.json`), { force: true });
+      if (started !== null) writeJson(root, `job--${JOB}.json`, actionsJob(started));
+    }
+
+    it('defers with ci=host when CI (host) succeeded on the head', () => {
+      const root = tempRoot();
+      legacy(root, [neverRun(), rollupStatus(HOST, 'SUCCESS', false)], false);
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(26);
+      expect(result.stdout).toContain('merge=defer mode=legacy ci=host:');
+      expect(result.stderr).toContain('required CI Gate never started on Actions');
+    });
+
+    it.each<[string, Page[], boolean | null]>([
+      ['no CI (host) status', [], false],
+      ['a CI (host) failure', [rollupStatus(HOST, 'FAILURE', false)], false],
+      ['a job that started and failed', [rollupStatus(HOST, 'SUCCESS', false)], true],
+      ['a job that cannot be read', [rollupStatus(HOST, 'SUCCESS', false)], null],
+    ])('refuses required_red with %s', (_case, extra, started) => {
+      const root = tempRoot();
+      legacy(root, [neverRun(), ...extra], started);
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('required_red: CI Gate=failure');
+    });
   });
 });
