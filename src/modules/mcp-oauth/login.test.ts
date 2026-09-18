@@ -45,8 +45,14 @@ vi.mock('../../log.js', () => ({
 // real repo path the hermeticity guard denylists — and it is not what these
 // cases are about.
 const declared: string[] = [];
+/** `fail` makes the locked rewrite throw, as a locked or unwritable
+ *  container.json would; `updates` counts the rewrites that were attempted. */
+const containerConfig = { fail: false, updates: 0 };
 vi.mock('../../container-config.js', () => ({
+  readContainerConfig: () => ({ onecliSecrets: [...declared] }),
   updateContainerConfig: async (folder: string, mutate: (c: { onecliSecrets?: string[] }) => void) => {
+    containerConfig.updates++;
+    if (containerConfig.fail) throw new Error('container.json lock timed out');
     const config: { onecliSecrets?: string[] } = { onecliSecrets: [...declared] };
     mutate(config);
     declared.length = 0;
@@ -55,8 +61,14 @@ vi.mock('../../container-config.js', () => ({
   },
 }));
 
+/** Every value that reached the vault, and a switch to take the vault down. */
+const vault = { fail: false, writes: [] as { name: string; value: string }[] };
 vi.mock('./onecli-secret-writer.js', () => ({
-  putOnecliBearerSecret: async (spec: { name: string }) => ({ id: 'secret-uuid-1', name: spec.name }),
+  putOnecliBearerSecret: async (spec: { name: string }, value: string) => {
+    if (vault.fail) throw new Error('gateway unreachable');
+    vault.writes.push({ name: spec.name, value });
+    return { id: 'secret-uuid-1', name: spec.name };
+  },
   findOnecliSecretByName: async () => undefined,
   deleteOnecliSecret: async () => true,
 }));
@@ -65,7 +77,13 @@ import { closeDb, createAgentGroup, initMigratedTestDb } from '../../db/index.js
 import { getMcpOAuthIntegration, markMcpOAuthIntegration } from '../../db/mcp-oauth-integrations.js';
 import { enforceHermeticity } from '../../test-hermeticity.js';
 import type { FetchLike } from './discovery.js';
-import { completeLogin, refreshExpiringMcpOAuthIntegrations, removeIntegration, startLogin } from './service.js';
+import {
+  _resetMcpOAuthWarnStateForTesting,
+  completeLogin,
+  refreshExpiringMcpOAuthIntegrations,
+  removeIntegration,
+  startLogin,
+} from './service.js';
 import { readMcpOAuthBundle, writeMcpOAuthBundle } from './store.js';
 
 enforceHermeticity();
@@ -129,6 +147,11 @@ async function login(over: Partial<Parameters<typeof startLogin>[0]> = {}, fetch
 beforeEach(async () => {
   await initMigratedTestDb();
   declared.length = 0;
+  containerConfig.fail = false;
+  containerConfig.updates = 0;
+  vault.fail = false;
+  vault.writes.length = 0;
+  _resetMcpOAuthWarnStateForTesting();
   fs.rmSync(path.join(tmpRoot, 'mcp-oauth'), { recursive: true, force: true });
   await createAgentGroup({
     id: 'ag-1',
@@ -140,6 +163,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.useRealTimers();
   await closeDb();
 });
 
@@ -453,5 +477,96 @@ describe('startLogin — concurrent logins for one target are serialized', () =>
     // The one that lost registered nothing at the provider — which is the
     // whole point, since nothing here could ever revoke it.
     expect(registrations).toHaveLength(1);
+  });
+});
+
+/** A connected integration, via the real login + complete path. */
+async function connected(): Promise<string> {
+  const { result } = await login();
+  await completeLogin(
+    { name: 'example-int', redirectResponse: `?code=c&state=${result.state}` },
+    server({ registrations: [] }),
+  );
+  return result.bearerSecretName;
+}
+
+function mints(accessToken: string): FetchLike {
+  return async () =>
+    json({ access_token: accessToken, refresh_token: 'rt-next', expires_in: 3600, token_type: 'Bearer' });
+}
+
+// #911 item 2: `removeIntegrationLocked` drops a parked write; a re-login did
+// not, so a `--secret` rename could leave one aimed at the NEW name.
+describe('startLogin — a re-login discards a parked vault write', () => {
+  it('never PATCHes the parked token into the secret a --secret rename just named', async () => {
+    await connected();
+
+    // Park a write: the row is due, the grant succeeds, the vault is down.
+    await markMcpOAuthIntegration('example-int', { status: 'error' });
+    vault.fail = true;
+    const parkedTick = await refreshExpiringMcpOAuthIntegrations(mints('at-parked'));
+    expect(parkedTick.failed).toEqual(['example-int']);
+    vault.fail = false;
+    vault.writes.length = 0;
+
+    await startLogin(
+      { name: 'example-int', mcpUrl: MCP_URL, agentGroupId: 'ag-1', secretName: 'Other-Secret' },
+      server({ registrations: [] }),
+    );
+
+    // Today the upsert demotes the parked (`error`) row to `pending`, which the
+    // refresher skips. Force it due again, past the write backoff (60 s after
+    // one attempt) but well inside the parked token's own life (1 h, so it is
+    // not dropped as spent), so what is under test is only whether the parked
+    // token is still there to be written.
+    await markMcpOAuthIntegration('example-int', { status: 'error' });
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + 5 * 60 * 1000);
+
+    await refreshExpiringMcpOAuthIntegrations(mints('at-fresh'));
+
+    expect(vault.writes).not.toContainEqual({ name: 'Other-Secret', value: 'at-parked' });
+    expect(vault.writes).toEqual([{ name: 'Other-Secret', value: 'at-fresh' }]);
+  });
+});
+
+// #911 item 3: `finalizeToken` marks the row active BEFORE declaring the
+// secret, so a declaration that failed there was never retried by anything.
+describe('a successful refresh re-declares the bearer secret', () => {
+  it('declares a secret that is missing from container.json', async () => {
+    const secretName = await connected();
+    // The declaration never landed (or was lost) — the row is still active.
+    declared.length = 0;
+
+    await markMcpOAuthIntegration('example-int', { status: 'error' });
+    const outcome = await refreshExpiringMcpOAuthIntegrations(mints('at-2'));
+
+    expect(outcome.refreshed).toEqual(['example-int']);
+    expect(declared).toEqual([secretName]);
+  });
+
+  it('does not rewrite container.json when the secret is already declared', async () => {
+    await connected();
+    containerConfig.updates = 0;
+
+    await markMcpOAuthIntegration('example-int', { status: 'error' });
+    await refreshExpiringMcpOAuthIntegrations(mints('at-2'));
+
+    expect(containerConfig.updates).toBe(0);
+  });
+
+  it('a failed declaration does not fail the refresh — the bearer is already in the vault', async () => {
+    await connected();
+    declared.length = 0;
+    containerConfig.fail = true;
+
+    await markMcpOAuthIntegration('example-int', { status: 'error' });
+    const outcome = await refreshExpiringMcpOAuthIntegrations(mints('at-2'));
+
+    expect(outcome.refreshed).toEqual(['example-int']);
+    expect(outcome.failed).toEqual([]);
+    // `error` would be due every tick — a fresh grant per minute for a config
+    // problem.
+    expect((await getMcpOAuthIntegration('example-int'))!.status).toBe('active');
   });
 });
