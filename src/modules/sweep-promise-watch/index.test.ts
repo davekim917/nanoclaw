@@ -275,6 +275,8 @@ describe('helpers', () => {
       { day: '2026-09-19', count: -100 },
       { day: '2026-09-19', count: 1.5 },
       { day: 'yesterday', count: 0 },
+      { day: '2026-99-99', count: 10 },
+      { day: '2026-02-31', count: 10 },
     ]) {
       fs.writeFileSync(file, JSON.stringify(bad));
       expect(fileCapStore(file).reserve('2026-09-19', 2)).toBe(false);

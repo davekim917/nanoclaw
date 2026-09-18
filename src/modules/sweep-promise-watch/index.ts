@@ -290,6 +290,13 @@ function readSnapshot(mailbox: NanoclawMailboxSession): SessionSnapshot {
 
 const CAP_FILE = path.join(DATA_DIR, 'promise-watch-nudges.json');
 
+/** A real UTC calendar day in YYYY-MM-DD form (rejects 2026-99-99 and 2026-02-31). */
+export function isCalendarDay(day: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return false;
+  const t = Date.parse(`${day}T00:00:00Z`);
+  return Number.isFinite(t) && new Date(t).toISOString().slice(0, 10) === day;
+}
+
 /**
  * The per-day count lives in a small host-owned file so a restart does not
  * reset it. A missing file is a fresh count; a file that exists but cannot be
@@ -303,7 +310,7 @@ export function fileCapStore(file: string = CAP_FILE): NudgeCapStore {
         const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as { day?: unknown; count?: unknown };
         if (
           typeof parsed.day !== 'string' ||
-          !/^\d{4}-\d{2}-\d{2}$/.test(parsed.day) ||
+          !isCalendarDay(parsed.day) ||
           typeof parsed.count !== 'number' ||
           !Number.isSafeInteger(parsed.count) ||
           parsed.count < 0
