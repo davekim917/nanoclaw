@@ -24,6 +24,7 @@ import glob
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 
@@ -32,26 +33,33 @@ sys.dont_write_bytecode = True
 SCHEMA_VERSION = 1
 BLOCK_VERSION = 1
 FENCE_LANG = "acceptance-v1"
-# An open fence line for the block. Closed fences are matched by FENCE_RE; the
-# two counts must agree or the body holds an unterminated block, which is
-# invalid rather than "no block" -- an author who opened one meant to write one.
-FENCE_OPEN_RE = re.compile(r"^[ \t]*`{3,}[ \t]*" + FENCE_LANG + r"[ \t]*$", re.M)
-FENCE_RE = re.compile(r"^[ \t]*(`{3,})[ \t]*" + FENCE_LANG + r"[ \t]*\n(.*?)^[ \t]*\1[ \t]*$",
-                      re.M | re.S)
+# A fence line, CommonMark style: three or more backticks OR tildes, up to
+# three spaces of indent. The open line carries the info string; the close
+# line is the same character, at least as long as the open, and nothing else.
+# Both characters are recognised everywhere (the block, the multi-fence rule,
+# stripping): a tilde block the parser ignored but a reader renders is a
+# place to hide a quote (#928 review 3). The language is the info string's
+# first word, as a renderer reads it; a trailing CR (a body saved with CRLF,
+# as GitHub's web editor does) is not part of the line.
+FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*(.*?)[ \t\r]*$")
 # `pr<n>/` is the freeze-campaign prefix (one block per carried PR); the rest
 # is the scaffold's lane-id alphabet (smoke-journeys.py ID_RE, :54).
 ITEM_ID_RE = re.compile(r"^(pr[0-9]+/)?[A-Za-z0-9_-]+$")
-SOURCE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+SOURCE_KEY_RE = re.compile(r"^(pr[0-9]+/)?[A-Za-z0-9_-]+$")
 SURFACE_RE = re.compile(r"^(web:\S.*|api:[A-Z]+ \S.*|native:\S.*)$")
 PLATFORMS = ("web", "native", "api")
 VERDICTS = ("met", "not_met", "not_demonstrable", "blocked")
 OBSERVED_KINDS = ("text", "dom", "api", "screenshot-only")
 EXCERPT_MAX = 500
 ITEM_REQUIRED = ("id", "source", "quote", "when", "then", "platform")
-ITEM_KEYS = set(ITEM_REQUIRED) | {"actor", "given", "negative", "derived"}
+ITEM_KEYS = set(ITEM_REQUIRED) | {"actor", "given", "negative"}
+# The doc (intent/acceptance.json) carries two more per item: `carrier` (the
+# PR body a pr-body quote is searched in) and `derived`.
+DOC_ITEM_KEYS = ITEM_KEYS | {"carrier", "derived"}
 THEN_KEYS = {"surface", "expect"}
 NEGATIVE_KEYS = {"given", "expect"}
 BLOCK_KEYS = {"v", "sources", "items", "reason"}
+DOC_KEYS = {"schemaVersion", "origin", "blocks", "sources", "items", "none", "problems"}
 ROW_KEYS = {"itemId", "verdict", "observed", "evidence", "blockedBy"}
 
 
@@ -75,11 +83,47 @@ def normalise(text):
     return " ".join(text.split())
 
 
+# --- fences -----------------------------------------------------------------
+
+def find_fences(body):
+    """Every acceptance-v1 fenced block in the body, in order, as
+    (start_line, end_line_or_None, content). A block runs from its open line
+    to the first matching close line -- same character, at least as long
+    (CommonMark 4.5) -- or, unterminated, to end of file. Lines inside a block
+    are never opens of another."""
+    lines = body.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        m = FENCE_LINE_RE.match(lines[i])
+        if not m or m.group(2).split(None, 1)[:1] != [FENCE_LANG]:
+            i += 1
+            continue
+        char, width = m.group(1)[0], len(m.group(1))
+        j = i + 1
+        while j < len(lines):
+            c = FENCE_LINE_RE.match(lines[j])
+            if c and c.group(1)[0] == char and len(c.group(1)) >= width and c.group(2) == "":
+                break
+            j += 1
+        if j < len(lines):
+            out.append((i, j, "\n".join(lines[i + 1:j])))
+            i = j + 1
+        else:
+            out.append((i, None, "\n".join(lines[i + 1:])))
+            break
+    return out
+
+
 def strip_fences(body):
-    """The PR body with EVERY acceptance-v1 fence removed. This is the text a
-    `pr-body` quote is searched in: a quote that lives only inside the block
-    would otherwise validate against itself (the consult's tautology)."""
-    return FENCE_RE.sub("", body)
+    """The PR body with EVERY acceptance-v1 block removed -- both fence
+    characters, and an unterminated block through end of file. This is the
+    text a `pr-body` quote is searched in: a quote that lives only inside a
+    block would otherwise validate against itself (the consult's tautology)."""
+    lines = body.split("\n")
+    drop = set()
+    for start, end, _ in find_fences(body):
+        drop.update(range(start, (len(lines) if end is None else end) + 1))
+    return "\n".join(l for k, l in enumerate(lines) if k not in drop)
 
 
 # --- block ------------------------------------------------------------------
@@ -87,20 +131,77 @@ def strip_fences(body):
 def parse_block(body):
     """(block_dict, problems). A body with no fence at all is (None, []);
     anything else wrong is (None, [why]) -- the lane then derives (§3)."""
-    opens = len(FENCE_OPEN_RE.findall(body))
-    fences = FENCE_RE.findall(body)
-    if opens == 0:
+    fences = find_fences(body)
+    if not fences:
         return None, []
-    if opens != len(fences):
+    if any(end is None for _, end, _ in fences):
         return None, ["an {} fence is not terminated".format(FENCE_LANG)]
     if len(fences) != 1:
         return None, ["{} {} fences; exactly one is allowed".format(len(fences), FENCE_LANG)]
     try:
-        block = json.loads(fences[0][1])
+        block = json.loads(fences[0][2])
     except ValueError as exc:
         return None, ["block is not valid JSON: {}".format(exc)]
     problems = validate_block(block)
     return (block if not problems else None), problems
+
+
+def validate_item(it, where, sources, allowed):
+    """ONE item rule, for the authored block and the derived doc alike (#928
+    review 5: a derived item missing when/then/platform passed)."""
+    errors = []
+    for k in _unknown_keys(it, allowed):
+        errors.append("{}: unknown key {}".format(where, k))
+    for k in ("quote", "when"):
+        if not _is_text(it.get(k)):
+            errors.append("{}: {} must be a non-empty string".format(where, k))
+    for k in ("actor", "given", "carrier"):
+        if k in it and not _is_text(it[k]):
+            errors.append("{}: {} must be a non-empty string".format(where, k))
+    if "derived" in it and not isinstance(it["derived"], bool):
+        errors.append("{}: derived must be a boolean".format(where))
+    if not _is_text(it.get("source")) or it["source"] not in sources:
+        errors.append("{}: source must name a key of sources".format(where))
+    then = it.get("then")
+    if not isinstance(then, dict):
+        errors.append("{}: then must be an object with surface and expect".format(where))
+    else:
+        for k in _unknown_keys(then, THEN_KEYS):
+            errors.append("{}: then has unknown key {}".format(where, k))
+        if not _is_text(then.get("surface")) or not SURFACE_RE.match(then["surface"]):
+            errors.append("{}: then.surface must be web:<route> | api:<METHOD> <path> | native:<screen>".format(where))
+        if not _is_text(then.get("expect")):
+            errors.append("{}: then.expect must be a non-empty string".format(where))
+    if it.get("platform") not in PLATFORMS:
+        errors.append("{}: platform must be one of {}".format(where, "|".join(PLATFORMS)))
+    neg = it.get("negative")
+    if neg is not None:
+        if not isinstance(neg, dict) or not _is_text(neg.get("expect")):
+            errors.append("{}: negative must be an object with expect (and optionally given)".format(where))
+        else:
+            for k in _unknown_keys(neg, NEGATIVE_KEYS):
+                errors.append("{}: negative has unknown key {}".format(where, k))
+            if "given" in neg and not _is_text(neg["given"]):
+                errors.append("{}: negative.given must be a non-empty string".format(where))
+    return errors
+
+
+def validate_items(items, sources, allowed):
+    errors, seen = [], set()
+    for i, it in enumerate(items):
+        if not isinstance(it, dict):
+            errors.append("items[{}] is not an object".format(i))
+            continue
+        iid = it.get("id")
+        where = "item {}".format(iid if isinstance(iid, str) else "#{}".format(i))
+        if not isinstance(iid, str) or not ITEM_ID_RE.match(iid):
+            errors.append("{}: id must match {}".format(where, ITEM_ID_RE.pattern))
+        elif iid in seen:
+            errors.append("{}: duplicate id".format(where))
+        else:
+            seen.add(iid)
+        errors.extend(validate_item(it, where, sources, allowed))
+    return errors
 
 
 def validate_block(block):
@@ -129,63 +230,19 @@ def validate_block(block):
         errors.append("reason belongs only with items \"none\"")
     if not isinstance(items, list) or not items:
         return errors + ["items must be a non-empty list or the string \"none\""]
-    seen = set()
-    for i, it in enumerate(items):
-        if not isinstance(it, dict):
-            errors.append("items[{}] is not an object".format(i))
-            continue
-        iid = it.get("id")
-        where = "item {}".format(iid if isinstance(iid, str) else "#{}".format(i))
-        if not isinstance(iid, str) or not ITEM_ID_RE.match(iid):
-            errors.append("{}: id must match {}".format(where, ITEM_ID_RE.pattern))
-        elif iid in seen:
-            errors.append("{}: duplicate id".format(where))
-        else:
-            seen.add(iid)
-        for k in _unknown_keys(it, ITEM_KEYS):
-            errors.append("{}: unknown key {}".format(where, k))
-        for k in ("quote", "when"):
-            if not _is_text(it.get(k)):
-                errors.append("{}: {} must be a non-empty string".format(where, k))
-        for k in ("actor", "given"):
-            if k in it and not _is_text(it[k]):
-                errors.append("{}: {} must be a non-empty string".format(where, k))
-        if "derived" in it and not isinstance(it["derived"], bool):
-            errors.append("{}: derived must be a boolean".format(where))
-        if not _is_text(it.get("source")) or it["source"] not in sources:
-            errors.append("{}: source must name a key of sources".format(where))
-        then = it.get("then")
-        if not isinstance(then, dict):
-            errors.append("{}: then must be an object with surface and expect".format(where))
-        else:
-            for k in _unknown_keys(then, THEN_KEYS):
-                errors.append("{}: then has unknown key {}".format(where, k))
-            if not _is_text(then.get("surface")) or not SURFACE_RE.match(then["surface"]):
-                errors.append("{}: then.surface must be web:<route> | api:<METHOD> <path> | native:<screen>".format(where))
-            if not _is_text(then.get("expect")):
-                errors.append("{}: then.expect must be a non-empty string".format(where))
-        if it.get("platform") not in PLATFORMS:
-            errors.append("{}: platform must be one of {}".format(where, "|".join(PLATFORMS)))
-        neg = it.get("negative")
-        if neg is not None:
-            if not isinstance(neg, dict) or not _is_text(neg.get("expect")):
-                errors.append("{}: negative must be an object with expect (and optionally given)".format(where))
-            else:
-                for k in _unknown_keys(neg, NEGATIVE_KEYS):
-                    errors.append("{}: negative has unknown key {}".format(where, k))
-                if "given" in neg and not _is_text(neg["given"]):
-                    errors.append("{}: negative.given must be a non-empty string".format(where))
-    return errors
+    return errors + validate_items(items, sources, ITEM_KEYS)
 
 
 # --- sources ----------------------------------------------------------------
 
 def source_path(request, carrier):
-    """The frozen file (relative to <run-dir>/intent/) a `sources` value names,
-    or None when the value is not one of the three forms. `pr-body` resolves
-    to the carrier the block was read from (`carrier`), so a freeze
+    """The frozen file (a bare name under <run-dir>/intent/) a `sources` value
+    names, or None when the value is not one of the three forms. `pr-body`
+    resolves to the item's carrier (carrier_of its id), so a freeze
     campaign's `pr1952/AC1` is searched in intent/pr-1952-body.md, never in
-    another carried PR's prose."""
+    another carried PR's prose. The name is DERIVED here, from the validated
+    request, every time it is needed -- a stored name is only ever compared
+    against it, never trusted (#928 review 1)."""
     if not isinstance(request, str):
         return None
     m = re.match(r"^issue#([0-9]+)$", request)
@@ -197,6 +254,15 @@ def source_path(request, carrier):
     if request == "pr-body":
         return carrier or "pr-body.md"
     return None
+
+
+def carrier_of(item_id):
+    """The PR body an item's `pr-body` source is searched in, DERIVED from its
+    id: `pr1952/AC1` -> pr-1952-body.md, an unprefixed id -> pr-body.md. A
+    stored `carrier` is only compared against this, never trusted -- it would
+    otherwise alias `pr-body` onto any file in intent/ (#928 review 1)."""
+    m = re.match(r"^pr([0-9]+)/", item_id) if isinstance(item_id, str) else None
+    return "pr-{}-body.md".format(m.group(1)) if m else "pr-body.md"
 
 
 def carriers(run_dir):
@@ -214,12 +280,40 @@ def carriers(run_dir):
     return out
 
 
-def _read_text(path):
+def read_frozen(run_dir, name):
+    """(text, reason) for one frozen source by its bare name. The file must be
+    a regular, non-symlink file directly under <run-dir>/intent/, itself a
+    real directory inside the run -- no symlinked component anywhere on the
+    way (#928 review 2: `open` follows links, so a correctly named issue-1.md
+    pointing at fabricated text read as the request)."""
+    if not _is_text(name) or "/" in name or name in (".", "..") or "\0" in name:
+        return None, "{!r} is not a bare file name".format(name)
+    root = os.path.realpath(run_dir)
+    intent = os.path.join(run_dir, "intent")
+    path = os.path.join(intent, name)
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return fh.read()
-    except (OSError, UnicodeDecodeError):
-        return None
+        if os.path.islink(intent):
+            return None, "intent/ is reached through a symlink"
+        if not stat.S_ISDIR(os.lstat(intent).st_mode):
+            return None, "intent/ is not a directory"
+        if os.path.realpath(intent) != os.path.join(root, "intent"):
+            return None, "intent/ does not resolve inside the run"
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            return None, "intent/{} is a symlink".format(name)
+        # O_NOFOLLOW closes the lstat->open window: a link swapped in after
+        # the check fails the open instead of being read.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None, "intent/{} is missing".format(name)
+    except OSError as exc:
+        return None, "intent/{} could not be read: {}".format(name, exc)
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            return None, "intent/{} is not a regular file".format(name)
+        try:
+            return fh.read().decode("utf-8"), None
+        except UnicodeDecodeError:
+            return None, "intent/{} is not UTF-8".format(name)
 
 
 def _read_json(path):
@@ -259,11 +353,12 @@ def cmd_extract(args):
     found = carriers(run_dir)
     if not found:
         emit({"ok": False, "error": "no intent/pr-body.md or intent/pr-<n>-body.md to extract from"}, 2)
-    items, sources, blocks, problems = [], {}, [], []
+    items, sources, blocks, none, problems = [], {}, [], [], []
     for carrier, prefix in found:
-        body = _read_text(os.path.join(intent, carrier))
+        body, why = read_frozen(run_dir, carrier)
         if body is None:
-            problems.append("{}: unreadable".format(carrier))
+            problems.append("{}: {}".format(carrier, why))
+            blocks.append({"carrier": carrier, "status": "invalid", "problems": [why]})
             continue
         block, why = parse_block(body)
         if block is None:
@@ -272,16 +367,15 @@ def cmd_extract(args):
             continue
         blocks.append({"carrier": carrier, "status": "none" if block["items"] == "none" else "present", "problems": []})
         for key, request in block["sources"].items():
-            sources[prefix + key] = {"request": request, "frozen": source_path(request, carrier)}
+            sources[prefix + key] = {"request": request}
         if block["items"] == "none":
-            sources[prefix + "_none"] = {"request": None, "frozen": None, "reason": block["reason"]}
+            none.append({"carrier": carrier, "reason": block["reason"]})
             continue
         for it in block["items"]:
             item = dict(it)
             item["id"] = prefix + it["id"]
             item["source"] = prefix + it["source"]
-            item["carrier"] = carrier
-            item.pop("derived", None)
+            item["carrier"] = carrier  # == carrier_of(item["id"]) by construction
             items.append(item)
     # ONE rule: any carrier without a valid block (invalid OR absent) means the
     # campaign has no authored contract, and the lane derives one for the
@@ -290,7 +384,8 @@ def cmd_extract(args):
     origin = "pr-body" if present and len(present) == len(blocks) else "absent"
     doc = {"schemaVersion": SCHEMA_VERSION, "origin": origin, "blocks": blocks,
            "sources": sources if origin == "pr-body" else {},
-           "items": items if origin == "pr-body" else [], "problems": problems}
+           "items": items if origin == "pr-body" else [],
+           "none": none if origin == "pr-body" else [], "problems": problems}
     _write_atomic(out_path, (json.dumps(doc, indent=2) + "\n").encode("utf-8"))
     emit({"ok": True, "origin": origin, "itemCount": len(doc["items"]), "blocks": blocks,
           "problems": problems, "path": out_path}, 0)
@@ -318,23 +413,32 @@ def _run_file_ok(run_dir, rel):
 def provenance(run_dir, doc):
     """Per item: (status, reason) where status is supported | unsupported.
     The quote must occur, whitespace-normalised, in the ONE frozen file its
-    named source resolves to -- with every acceptance-v1 fence stripped from a
-    pr-body carrier first. A source with no frozen file is `unfrozen`: its
-    items are unsupported, never silently trusted (§3)."""
-    intent = os.path.join(run_dir, "intent")
+    named source resolves to -- derived from the source's `request` and the
+    item's id (carrier_of) here, never read from the doc -- with every acceptance-v1
+    fence stripped from a pr-body carrier first. A source with no frozen file
+    is `unfrozen`: its items are unsupported, never silently trusted (§3)."""
     texts, out = {}, {}
     for it in doc.get("items", []):
         src = doc.get("sources", {}).get(it.get("source"))
-        frozen = src.get("frozen") if isinstance(src, dict) else None
-        if not frozen:
-            out[it["id"]] = ("unsupported", "source {!r} does not resolve to a frozen file".format(it.get("source")))
+        request = src.get("request") if isinstance(src, dict) else None
+        frozen = source_path(request, carrier_of(it["id"]))
+        if frozen is None:
+            out[it["id"]] = ("unsupported", "source {!r} names no valid request".format(it.get("source")))
+            continue
+        if request == "pr-body" and it.get("carrier", frozen) != frozen:
+            out[it["id"]] = ("unsupported", "item {} stores carrier {!r} but its id resolves to intent/{}".format(it["id"], it["carrier"], frozen))
+            continue
+        stored = src.get("frozen")
+        if stored is not None and stored != frozen:
+            out[it["id"]] = ("unsupported", "source {} stores frozen {!r} but its request resolves to intent/{}".format(it["source"], stored, frozen))
             continue
         if frozen not in texts:
-            body = _read_text(os.path.join(intent, frozen))
-            texts[frozen] = None if body is None else normalise(strip_fences(body))
-        if texts[frozen] is None:
-            out[it["id"]] = ("unsupported", "source {} is unfrozen: intent/{} is missing".format(it["source"], frozen))
-        elif normalise(it["quote"]) not in texts[frozen]:
+            body, why = read_frozen(run_dir, frozen)
+            texts[frozen] = (None, why) if body is None else (normalise(strip_fences(body)), None)
+        text, why = texts[frozen]
+        if text is None:
+            out[it["id"]] = ("unsupported", "source {} is unfrozen: {}".format(it["source"], why))
+        elif normalise(it["quote"]) not in text:
             out[it["id"]] = ("unsupported", "quote not found in intent/{} (acceptance-v1 fences stripped)".format(frozen))
         else:
             out[it["id"]] = ("supported", None)
@@ -342,8 +446,9 @@ def provenance(run_dir, doc):
 
 
 def doc_problems(doc):
-    """Structural problems of intent/acceptance.json itself: the extract
-    output, or the lane's derived file in the same shape."""
+    """Structural problems of intent/acceptance.json itself -- the extract
+    output, or the lane's derived file in the same shape, held to the same
+    item rule as the authored block."""
     if not isinstance(doc, dict) or doc.get("schemaVersion") != SCHEMA_VERSION:
         return ["intent/acceptance.json is not a schemaVersion {} document".format(SCHEMA_VERSION)]
     origin = doc.get("origin")
@@ -354,22 +459,26 @@ def doc_problems(doc):
         return ["items must be a list and sources an object"]
     if origin == "absent":
         return ["origin is absent: the PR body carried no valid block and nothing was derived -- derive the items from the frozen request sources (SKILL.md §3, Acceptance verifier)"]
-    problems, seen = [], set()
-    for i, it in enumerate(items):
-        if not isinstance(it, dict) or not isinstance(it.get("id"), str) or not ITEM_ID_RE.match(it["id"]):
-            problems.append("items[{}]: missing or malformed id".format(i))
+    problems = ["unknown top-level key {}".format(k) for k in _unknown_keys(doc, DOC_KEYS)]
+    for k, v in sources.items():
+        if (not SOURCE_KEY_RE.match(k) or not isinstance(v, dict) or _unknown_keys(v, {"request", "frozen"})
+                or source_path(v.get("request"), None) is None):
+            problems.append("sources.{}: must be {{request: issue#<n> | slack:<channel>/<thread> | pr-body}}".format(k))
+    problems.extend(validate_items(items, sources, DOC_ITEM_KEYS))
+    for it in items:
+        if not isinstance(it, dict) or not isinstance(it.get("id"), str):
             continue
-        if it["id"] in seen:
-            problems.append("item {}: duplicate id".format(it["id"]))
-        seen.add(it["id"])
-        if not _is_text(it.get("quote")):
-            problems.append("item {}: quote must be a non-empty string".format(it["id"]))
-        if not _is_text(it.get("source")) or it["source"] not in sources:
-            problems.append("item {}: source must name a key of sources".format(it["id"]))
         if origin == "derived" and it.get("derived") is not True:
             problems.append("item {}: a derived contract marks every item derived: true".format(it["id"]))
         if origin == "pr-body" and it.get("derived"):
             problems.append("item {}: an authored contract cannot carry derived items".format(it["id"]))
+    # An empty contract is a claim ("no user-observable effect") and must say
+    # so: `none: [{reason}]`, the doc form of the block's items "none".
+    none = doc.get("none", [])
+    if not isinstance(none, list) or not all(isinstance(n, dict) and _is_text(n.get("reason")) for n in none):
+        problems.append("none must be a list of {reason} entries")
+    elif not items and not none:
+        problems.append("an empty contract needs none: [{reason: ...}] saying why there is no user-observable effect")
     return problems
 
 

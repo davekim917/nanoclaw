@@ -51,9 +51,8 @@ OUT="$(extract)"
 expect 1-example '.ok == true and .origin == "pr-body" and .itemCount == 3 and .problems == [] and .blocks == [{"carrier":"pr-body.md","status":"present","problems":[]}]' "$OUT"
 DOC="$(cat "$RUN/intent/acceptance.json")"
 expect 1-doc '.schemaVersion == 1 and .origin == "pr-body" and [.items[].id] == ["AC1","AC2","AC3"] and
-  .sources.R1 == {"request":"issue#412","frozen":"issue-412.md"} and
-  .sources.R2.frozen == "slack-lantern-desk-1726000000.000100.md" and .sources.R3.frozen == "pr-body.md" and
-  (.items | all(.carrier == "pr-body.md" and (has("derived") | not)))' "$DOC"
+  .sources == {"R1":{"request":"issue#412"},"R2":{"request":"slack:lantern-desk/1726000000.000100"},"R3":{"request":"pr-body"}} and
+  .none == [] and (.items | all(.carrier == "pr-body.md" and (has("derived") | not)))' "$DOC"
 # Write-once: a second extract is refused unless forced.
 expect 1-write-once '.ok == false and (.error | test("written once"))' "$(extract)"
 expect 1-force '.ok == true' "$(extract --force)"
@@ -70,7 +69,7 @@ bad_block() { # <label> <jq-edit-or-raw-body-marker> <problem-regex> [raw]
   if [ "${4:-}" = raw ]; then new_run; printf '%s' "$2" > "$RUN/intent/pr-body.md"; else new_run "$(jq "$2" "$EXAMPLE")"; fi
   local out; out="$(extract)"
   jq -e --arg re "$3" '.ok == true and .origin == "absent" and .itemCount == 0 and any(.problems[]; test($re))' <<<"$out" >/dev/null || fail "$1: $out"
-  jq -e '.origin == "absent" and .items == [] and .sources == {}' "$RUN/intent/acceptance.json" >/dev/null || fail "$1: file: $(cat "$RUN/intent/acceptance.json")"
+  jq -e '.origin == "absent" and .items == [] and .sources == {} and .none == []' "$RUN/intent/acceptance.json" >/dev/null || fail "$1: file: $(cat "$RUN/intent/acceptance.json")"
 }
 bad_block 1-dup-id '.items[1].id = .items[0].id' 'duplicate id'
 bad_block 1-bad-id '.items[0].id = "has space"' 'id must match'
@@ -92,13 +91,28 @@ bad_block 1-reason-only-with-none '.reason = "x"' 'reason belongs only with item
 bad_block 1-not-json "$(block_body 'not json')" 'not valid JSON' raw
 bad_block 1-two-fences "$(block_body "$(cat "$EXAMPLE")")$(block_body '{"v":1}')" '2 acceptance-v1 fences' raw
 bad_block 1-unterminated "$(printf '## x\n\n```acceptance-v1\n{"v":1}\n')" 'not terminated' raw
+# Tilde fences are fences (CommonMark): one backtick block plus one tilde
+# block is two, and a tilde-only block is the block.
+bad_block 1-tilde-plus-backtick "$(block_body "$(cat "$EXAMPLE")")$(printf '\n~~~acceptance-v1\n{"v":1}\n~~~\n')" '2 acceptance-v1 fences' raw
+bad_block 1-tilde-unterminated "$(printf '~~~acceptance-v1\n{"v":1}\n')" 'not terminated' raw
+new_run; printf '## Summary\n\n%s.\n\n~~~~acceptance-v1\n%s\n~~~~~~\n' "$Q3" "$(cat "$EXAMPLE")" > "$RUN/intent/pr-body.md"
+expect 1-tilde-block-longer-close '.ok == true and .origin == "pr-body" and .itemCount == 3' "$(extract)"
+# A backtick close shorter than its open does not close; a longer one does.
+new_run; printf '## Summary\n\n%s.\n\n````acceptance-v1\n%s\n```\n' "$Q3" "$(cat "$EXAMPLE")" > "$RUN/intent/pr-body.md"
+expect 1-short-close-is-open '.origin == "absent" and any(.problems[]; test("not terminated"))' "$(extract)"
+new_run; printf '## Summary\n\n%s.\n\n```acceptance-v1\n%s\n`````\n' "$Q3" "$(cat "$EXAMPLE")" > "$RUN/intent/pr-body.md"
+expect 1-long-close-closes '.ok == true and .origin == "pr-body" and .itemCount == 3' "$(extract)"
 # No fence at all is also absent, with no problem to report: nothing was authored.
 new_run; printf '## Summary\n\nJust prose.\n' > "$RUN/intent/pr-body.md"
 expect 1-no-fence '.ok == true and .origin == "absent" and .problems == [] and .blocks[0].status == "absent"' "$(extract)"
 # `items: "none"` with a reason is a VALID, empty contract.
 new_run "$(jq '.items = "none" | .reason = "dependency bump, no user-observable effect"' "$EXAMPLE")"
 expect 1-none '.ok == true and .origin == "pr-body" and .itemCount == 0 and .blocks[0].status == "none"' "$(extract)"
-expect 1-none-doc '.sources["_none"].reason == "dependency bump, no user-observable effect"' "$(cat "$RUN/intent/acceptance.json")"
+expect 1-none-doc '.none == [{"carrier":"pr-body.md","reason":"dependency bump, no user-observable effect"}] and .items == []' "$(cat "$RUN/intent/acceptance.json")"
+# ...and check accepts it: an empty contract that says why.
+rows '[]'
+expect 1-none-check '.ok == true and .itemCount == 0' "$(check)"
+[ "$(report)" = "Acceptance: present(0) — 0 unsupported, 0 missing rows" ] || fail "1-none-sentence: $(report)"
 
 # A freeze campaign carries one block per PR: ids are prefixed `pr<n>/` and a
 # `pr-body` source resolves to THAT carrier, never another PR's prose.
@@ -107,7 +121,7 @@ block_body "$(jq '.items |= [.[0]]' "$EXAMPLE")" > "$RUN/intent/pr-1952-body.md"
 block_body "$(jq '.items |= [.[2]]' "$EXAMPLE")" > "$RUN/intent/pr-1953-body.md"
 expect 1-freeze '.ok == true and .origin == "pr-body" and .itemCount == 2' "$(extract)"
 expect 1-freeze-ids '[.items[] | {id, source, carrier}] == [{"id":"pr1952/AC1","source":"pr1952/R1","carrier":"pr-1952-body.md"},{"id":"pr1953/AC3","source":"pr1953/R3","carrier":"pr-1953-body.md"}] and
-  .sources["pr1953/R3"].frozen == "pr-1953-body.md"' "$(cat "$RUN/intent/acceptance.json")"
+  .sources["pr1953/R3"] == {"request":"pr-body"}' "$(cat "$RUN/intent/acceptance.json")"
 # One carried PR without a valid block makes the whole campaign unauthored.
 printf 'no block here\n' > "$RUN/intent/pr-1953-body.md"
 expect 1-freeze-half-authored '.origin == "absent" and .itemCount == 0 and (.blocks | map(.status)) == ["present","absent"]' "$(extract --force)"
@@ -132,6 +146,50 @@ expect 2-self-quoting '.ok == false and .provenance.AC3 == "unsupported" and
 # ...even when the block is the ONLY thing in the body.
 new_run; printf '```acceptance-v1\n%s\n```\n' "$(cat "$EXAMPLE")" > "$RUN/intent/pr-body.md"; extract >/dev/null
 expect 2-block-only-body '.provenance.AC3 == "unsupported" and .provenance.AC1 == "supported"' "$(check)"
+# STRIPPING COVERS EVERY FENCE KIND. The reviewer's case (#928 review 3): a
+# body whose backtick block is valid and whose tilde block holds the quote the
+# prose never said. extract refuses it (two fences); a derived contract over
+# that carrier must not find the quote either -- nor inside a block closed by
+# a longer fence, nor inside an unterminated one (stripped through EOF).
+pr_body_item() { # <quote> -> a derived doc with one pr-body item
+  jq -cn --arg q "$1" '{schemaVersion:1,origin:"derived",sources:{R3:{request:"pr-body"}},
+    items:[{id:"AC3",source:"R3",quote:$q,when:"open",then:{surface:"native:loans",expect:"x"},platform:"native",carrier:"pr-body.md",derived:true}]}' \
+    > "$RUN/intent/acceptance.json"
+}
+HIDDEN="the phone shows the fine in red"
+new_run; { block_body "$(cat "$EXAMPLE")"; printf '~~~acceptance-v1\n{"v":1,"note":"%s"}\n~~~\n' "$HIDDEN"; } > "$RUN/intent/pr-body.md"
+expect 2-tilde-hidden-extract '.origin == "absent"' "$(extract)"
+pr_body_item "$HIDDEN"
+expect 2-tilde-hidden-quote '.provenance.AC3 == "unsupported"' "$(check)"
+pr_body_item "$Q3"   # the prose outside both blocks still supports
+expect 2-tilde-prose-still-there '.provenance.AC3 == "supported"' "$(check)"
+new_run; printf 'prose %s\n```acceptance-v1\n%s\n`````\nafter\n' "$Q3" "$HIDDEN" > "$RUN/intent/pr-body.md"
+pr_body_item "$HIDDEN"
+expect 2-long-close-stripped '.provenance.AC3 == "unsupported"' "$(check)"
+new_run; printf 'prose %s\n```acceptance-v1\n{"v":1}\n\n%s\n' "$Q3" "$HIDDEN" > "$RUN/intent/pr-body.md"
+pr_body_item "$HIDDEN"
+expect 2-unterminated-stripped-to-eof '.provenance.AC3 == "unsupported"' "$(check)"
+pr_body_item "$Q3"
+expect 2-unterminated-prose-before '.provenance.AC3 == "supported"' "$(check)"
+# A CRLF body (GitHub's web editor) and an info string with more after the
+# language are still acceptance-v1 fences, as a renderer reads them.
+new_run; printf '```acceptance-v1\r\n%s\r\n```\r\nprose %s\r\n' "$HIDDEN" "$Q3" > "$RUN/intent/pr-body.md"
+pr_body_item "$HIDDEN"
+expect 2-crlf-stripped '.provenance.AC3 == "unsupported"' "$(check)"
+pr_body_item "$Q3"   # the CRLF close line closes: prose AFTER the block survives
+expect 2-crlf-prose-after '.provenance.AC3 == "supported"' "$(check)"
+new_run; block_body "$(cat "$EXAMPLE")" | sed 's/$/\r/' > "$RUN/intent/pr-body.md"
+expect 2-crlf-extract '.ok == true and .origin == "pr-body" and .itemCount == 3' "$(extract)"
+new_run; printf 'prose %s\n~~~ acceptance-v1 json\n%s\n~~~\n' "$Q3" "$HIDDEN" > "$RUN/intent/pr-body.md"
+pr_body_item "$HIDDEN"
+expect 2-info-suffix-stripped '.provenance.AC3 == "unsupported"' "$(check)"
+# `carrier` is derived from the item id, never trusted: a pr-body item stored
+# with carrier issue-412.md does not read the issue as the PR body.
+new_run; extract >/dev/null
+jq --arg q "$Q1" '.items[2].carrier = "issue-412.md" | .items[2].quote = $q' "$RUN/intent/acceptance.json" > "$RUN/intent/a.tmp"
+mv "$RUN/intent/a.tmp" "$RUN/intent/acceptance.json"
+expect 2-carrier-alias '.provenance.AC3 == "unsupported" and any(.unsupported[]; .reason | test("stores carrier .issue-412.md. but its id resolves to intent/pr-body.md"))' "$(check)"
+
 # A quote must match the named source, not any frozen file: AC1's words in the
 # Slack thread do not support an item that names the issue.
 new_run "$(jq '.items[0].source = "R2"' "$EXAMPLE")"; extract >/dev/null
@@ -139,6 +197,39 @@ expect 2-wrong-source '.provenance.AC1 == "unsupported" and (.unsupported[0].rea
 # An unfrozen source (named, never fetched) is unsupported, naming the file.
 new_run; rm "$RUN/intent/issue-412.md"; extract >/dev/null
 expect 2-unfrozen '.provenance.AC1 == "unsupported" and (.unsupported[0].reason | test("unfrozen: intent/issue-412.md is missing"))' "$(check)"
+# SOURCE BINDING IS DERIVED, NEVER TRUSTED (#928 reviews 1-2). A stored
+# `frozen` that differs from what the request resolves to -- another issue, a
+# traversal, an absolute path -- is unsupported, whatever is at that path.
+alias_frozen() { # <jq-edit on sources> : rewrite the extracted doc's sources
+  jq "$1" "$RUN/intent/acceptance.json" > "$RUN/intent/a.tmp"; mv "$RUN/intent/a.tmp" "$RUN/intent/acceptance.json"
+}
+new_run; extract >/dev/null
+printf 'Issue 2: %s\n' "$Q1" > "$RUN/intent/issue-2.md"
+alias_frozen '.sources.R1.frozen = "issue-2.md"'
+expect 2-alias-other-issue '.provenance.AC1 == "unsupported" and (.unsupported[0].reason | test("stores frozen .issue-2.md. but its request resolves to intent/issue-412.md"))' "$(check)"
+printf '%s\n' "$Q1" > "$RUN/evidence/A1/invented.txt"
+alias_frozen '.sources.R1.frozen = "../evidence/A1/invented.txt"'
+expect 2-alias-traversal '.provenance.AC1 == "unsupported"' "$(check)"
+alias_frozen ".sources.R1.frozen = \"$RUN/evidence/A1/invented.txt\""
+expect 2-alias-absolute '.provenance.AC1 == "unsupported"' "$(check)"
+alias_frozen '.sources.R1.frozen = "issue-412.md"'   # a stored name that AGREES is fine
+expect 2-alias-agreeing '.provenance.AC1 == "supported"' "$(check)"
+alias_frozen '.sources.R1.request = "issue#2"'       # the request decides: now it is issue-2.md
+expect 2-request-decides '.provenance.AC1 == "unsupported" and (.unsupported[0].reason | test("stores frozen .issue-412.md. but its request resolves to intent/issue-2.md"))' "$(check)"
+alias_frozen 'del(.sources.R1.frozen) | .sources.R1.request = "issue#2"'
+expect 2-request-decides-no-stored '.provenance.AC1 == "supported"' "$(check)"   # issue-2.md holds Q1
+alias_frozen '.sources.R1.request = "file:issue-412.md"'
+expect 2-request-form-checked 'any(.problems[]; test("sources.R1: must be"))' "$(check)"
+# A symlink anywhere on the way is refused: the file, or intent/ itself.
+new_run; extract >/dev/null
+mv "$RUN/intent/issue-412.md" "$RUN/evidence/A1/real-issue.md"; ln -s ../evidence/A1/real-issue.md "$RUN/intent/issue-412.md"
+expect 2-symlinked-source '.provenance.AC1 == "unsupported" and (.unsupported[0].reason | test("intent/issue-412.md is a symlink"))' "$(check)"
+new_run; extract >/dev/null
+mv "$RUN/intent" "$WORK/intent-aside"; ln -s "$WORK/intent-aside" "$RUN/intent"
+expect 2-symlinked-intent-dir '.ok == false and (.provenance | to_entries | all(.value == "unsupported")) and (.unsupported[0].reason | test("reached through a symlink"))' "$(check)"
+rm "$RUN/intent"; mv "$WORK/intent-aside" "$RUN/intent"
+expect 2-symlink-restored '.provenance.AC1 == "supported"' "$(check)"
+
 # Whitespace is normalised (issue-412.md wraps AC1 mid-sentence and holds a
 # tab); case and punctuation are not.
 new_run "$(jq '.items[0].quote |= ascii_upcase' "$EXAMPLE")"; extract >/dev/null
@@ -230,6 +321,24 @@ derived '.items[1].id = "AC1"'
 expect 4-derived-dup-id 'any(.problems[]; test("duplicate id"))' "$(check)"
 derived '.items[1].quote = "words the thread never said"'
 expect 4-derived-provenance '.provenance.AC2 == "unsupported"' "$(check)"
+# THE SAME ITEM RULE AS THE BLOCK (#928 review 5): a derived item missing
+# when/then/platform, or carrying an unknown key, is a problem, not a pass.
+derived 'del(.items[0].when) | del(.items[0].then) | del(.items[0].platform)'
+expect 4-derived-item-rule '.ok == false and any(.problems[]; test("item AC1: when must be")) and any(.problems[]; test("item AC1: then must be")) and any(.problems[]; test("item AC1: platform must be"))' "$(check)"
+derived '.items[0].then.surface = "/desk"'
+expect 4-derived-surface 'any(.problems[]; test("item AC1: then.surface must be"))' "$(check)"
+derived '.items[0].screenshot = "x.png"'
+expect 4-derived-unknown-key 'any(.problems[]; test("item AC1: unknown key screenshot"))' "$(check)"
+derived '.persist = true'
+expect 4-doc-unknown-key 'any(.problems[]; test("unknown top-level key persist"))' "$(check)"
+# An EMPTY derived contract is a claim and must say why: none: [{reason}].
+derived '.items = []'
+expect 4-derived-empty-needs-none '.ok == false and any(.problems[]; test("empty contract needs none"))' "$(check)"
+derived '.items = [] | .none = [{"reason":"dependency bump; the frozen thread asks for nothing user-observable"}]'
+expect 4-derived-empty-with-none '.ok == true and .itemCount == 0' "$(check)"
+[ "$(report)" = "Acceptance: derived(0) — 0 unsupported, 0 missing rows" ] || fail "4-sentence-derived-empty: $(report)"
+derived '.items = [] | .none = [{"why":"x"}]'
+expect 4-none-shape 'any(.problems[]; test("none must be a list of"))' "$(check)"
 # Doc-level garbage.
 printf 'nope' > "$RUN/intent/acceptance.json"
 expect 4-doc-garbage '.ok == false and any(.problems[]; test("unreadable or not JSON"))' "$(check)"
