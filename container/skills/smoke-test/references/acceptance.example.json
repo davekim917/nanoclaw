@@ -1,0 +1,38 @@
+{
+  "_comment": "FICTIONAL example for the made-up 'Lantern Library' app (same as journeys.example.json). This is the acceptance-v1 block an author puts in the PR body, fenced as ```acceptance-v1 ... ``` -- exactly one per PR. It documents the block shape and is the test fixture for smoke-acceptance.py; smoke-acceptance.test.sh freezes fictional request sources that contain each quote. Every quote must occur verbatim (whitespace-normalised) in the FROZEN request it names -- issue#<n> -> intent/issue-<n>.md, slack:<channel>/<thread> -> intent/slack-<channel>-<thread>.md, pr-body -> the PR body's prose with every acceptance-v1 fence stripped, so a quote that exists only inside this block is unsupported.",
+  "v": 1,
+  "sources": {
+    "R1": "issue#412",
+    "R2": "slack:lantern-desk/1726000000.000100",
+    "R3": "pr-body"
+  },
+  "items": [
+    {
+      "id": "AC1",
+      "source": "R1",
+      "quote": "a borrower with an overdue loan sees the fine on the borrower card before the librarian confirms a new loan",
+      "actor": "librarian seat",
+      "given": "borrower QA-reader has one overdue loan with a fine",
+      "when": "open the loan desk, pick QA-reader as the borrower",
+      "then": { "surface": "web:/desk", "expect": "the borrower card shows the fine amount; the confirm button is enabled" },
+      "negative": { "given": "the borrower has no overdue loan", "expect": "no fine line renders on the card" },
+      "platform": "web"
+    },
+    {
+      "id": "AC2",
+      "source": "R2",
+      "quote": "the fines list should refuse another branch's token with 403",
+      "when": "GET /api/fines?branch=south with the north-branch seat's token",
+      "then": { "surface": "api:GET /api/fines", "expect": "403 and no fine rows in the body" },
+      "platform": "api"
+    },
+    {
+      "id": "AC3",
+      "source": "R3",
+      "quote": "the Loans tab shows the fine beside the overdue loan",
+      "when": "open the Loans tab as QA-reader on the phone build",
+      "then": { "surface": "native:loans", "expect": "the overdue loan row carries the fine amount" },
+      "platform": "native"
+    }
+  ]
+}
