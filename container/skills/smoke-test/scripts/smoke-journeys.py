@@ -321,7 +321,9 @@ def pass_identity_problems(contract, marker, jid):
     """The barrier's identity bar for a pass marker, as one shared function:
     the lane is declared, sourceSha is present on BOTH sides and equal (never
     null == null), the lane field agrees, the generation is the contract's,
-    completedAt is set, and evidence is a non-empty list of one-line paths."""
+    completedAt is set, every evidence entry is valid for every evidence kind
+    (evidence_entry_problems) and every confirmed finding is accounted for
+    (finding_clip_problems). Only file existence is left to the barrier."""
     out = []
     if not isinstance(contract, dict):
         return ["the run has no readable contract"]
@@ -338,9 +340,73 @@ def pass_identity_problems(contract, marker, jid):
         out.append("marker generation {} is not the contract's {}".format(marker.get("generation", 1), want))
     if not _is_text(marker.get("completedAt")):
         out.append("completedAt is missing")
-    if not _text_list(marker.get("evidence"), allow_empty=False) or any("\n" in e or "\r" in e for e in marker["evidence"]):
-        out.append("a pass names no evidence")
+    out.extend(evidence_entry_problems(marker))
+    out.extend(finding_clip_problems(marker))
     return out
+
+
+def _clip_skip_ok(marker, entry):
+    """smoke-evidence-barrier.sh valid_clip_skip_entry: a `clip-skipped:
+    <finding>: <reason>` line is well-formed only for a finding the marker
+    confirms, with a non-empty reason."""
+    findings = marker.get("confirmedFindings")
+    if not isinstance(findings, list):
+        return False
+    for f in findings:
+        pfx = "clip-skipped: {}: ".format(f) if _is_text(f) else None
+        if pfx and entry.startswith(pfx) and len(entry) > len(pfx):
+            return True
+    return False
+
+
+def evidence_entry_problems(marker):
+    """EVERY evidence entry of a pass, for EVERY evidence kind, by the grammar
+    smoke-evidence-barrier.sh pass_evidence_problem parses it with -- minus
+    file existence, which is the barrier's half alone: a non-empty array of
+    one-line strings; a `clip-skipped:` entry must be a well-formed skip note
+    (its `case clip-skipped:*)`, :184-188); any other entry is a path that is
+    relative and inside the run (`/*|.|..|../*|*/../*|*/..`, :191-192); and at
+    least one entry must be a file -- a skip note excuses a recording, it is
+    never evidence. ANY invalid entry makes the pass not count, so a pass the
+    barrier refuses can never reset a floor clock (#898 review 12: an api pass
+    citing `/tmp/api.txt` was refused there and counted here)."""
+    ev = marker.get("evidence")
+    if not _text_list(ev, allow_empty=False) or any(len(e) == 0 or "\n" in e or "\r" in e for e in ev):
+        return ["a pass names no evidence"]
+    out, files = [], 0
+    for e in ev:
+        if e.startswith("clip-skipped:"):
+            if not _clip_skip_ok(marker, e):
+                out.append("clip-skipped evidence is not a nonempty skip reason for a confirmed finding: {}".format(e))
+            continue
+        if os.path.isabs(e) or e in (".", "..") or ".." in e.split("/"):
+            out.append("evidence path is absolute or escapes the run root: {}".format(e))
+            continue
+        files += 1
+    if not out and files == 0:
+        out.append("evidence names no file -- a clip-skipped note excuses a recording, it is not evidence")
+    return out
+
+
+def finding_clip_problems(marker):
+    """smoke-evidence-barrier.sh finding_clip_problem, minus file existence:
+    every confirmed finding needs `clips/<id>.mp4` cited or a well-formed
+    `clip-skipped: <id>: <reason>` line."""
+    if "confirmedFindings" not in marker:
+        return []
+    findings = marker.get("confirmedFindings")
+    if not _text_list(findings, allow_empty=True) or any(len(f) == 0 for f in findings):
+        return ["confirmedFindings must be an array of non-empty finding ids"]
+    ev = [e for e in (marker.get("evidence") or []) if isinstance(e, str)]
+    for f in findings:
+        if "/" in f or f in (".", ".."):
+            return ["confirmed finding id is not a safe path segment: {}".format(f)]
+        pfx = "clip-skipped: {}: ".format(f)
+        if any(e.startswith(pfx) and len(e) > len(pfx) for e in ev):
+            continue
+        if "clips/{}.mp4".format(f) not in ev:
+            return ["confirmed finding {} has no clip evidence".format(f)]
+    return []
 
 
 def stale_after_refreeze(run_dir, jid):

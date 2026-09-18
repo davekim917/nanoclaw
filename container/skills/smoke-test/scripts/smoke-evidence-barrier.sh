@@ -161,7 +161,7 @@ valid_clip_skip_entry() { # <marker-path> <evidence-entry>
 }
 
 pass_evidence_problem() {
-  local marker_path="$1" evidence_path candidate run_root resolved
+  local marker_path="$1" evidence_path candidate run_root resolved file_entries=0
 
   if ! jq -e '
     (.evidence | type == "array" and length > 0) and
@@ -214,7 +214,14 @@ pass_evidence_problem() {
       printf 'pass marker evidence file is empty: %s' "$evidence_path"
       return
     fi
+    file_entries=$(( file_entries + 1 ))
   done < <(jq -r '.evidence[]' "$marker_path")
+  # A skip note excuses a recording; it is never the affirmative evidence a
+  # pass claims. smoke-journeys.py evidence_entry_problems holds the same rule
+  # for cadence (its parity test pins the two together).
+  if [ "$file_entries" -eq 0 ]; then
+    printf 'pass marker evidence names no file: a clip-skipped note excuses a recording, it is not evidence'
+  fi
 }
 
 # A lane marker declaring one or more CONFIRMED findings (`.confirmedFindings`,
@@ -358,10 +365,16 @@ floor_evidence_problem() {
   [ "$(lane_kind "$lane_id")" = "floor" ] || return 0
   lane_declares_api_evidence "$lane_id" && return 0
 
+  # A floor walk is proven by browser media, or — for a native-manual journey,
+  # whose walk no browser records — by the tester's recorded result under
+  # manual-results/. Which of the two a given journey may use is the journeys
+  # lane rule's (smoke-journeys.py lane_problems: browser ⇒ media only,
+  # native-manual ⇒ manual-results/ only); this bash rule only refuses a floor
+  # pass that cites neither. A skip note is never either.
   if ! jq -e --arg ext "$FLOOR_MEDIA_EXTENSIONS" '
     any((.evidence // [])[];
       (startswith("clip-skipped: ") | not) and
-      test("\\.(" + $ext + ")$"; "i"))
+      (test("\\.(" + $ext + ")$"; "i") or startswith("manual-results/")))
   ' "$marker_path" >/dev/null 2>&1; then
     printf 'floor pass without browser evidence'
   fi

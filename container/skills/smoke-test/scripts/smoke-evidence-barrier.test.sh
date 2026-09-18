@@ -235,14 +235,24 @@ bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$CLIP_DIR" lanes \
   echo "expected a stated clip-skipped reason to clear the barrier with no clip file" >&2; exit 1; }
 
 # A pass marker uses the same evidence array and must accept this exact
-# well-formed skip form too. Treating every evidence string as a file path
-# would reject this as a missing file before finding_clip_problem got to
-# recognize the stated recording exception.
+# well-formed skip form as an ENTRY — treating every evidence string as a file
+# path would reject it as a missing file before finding_clip_problem got to
+# recognize the stated recording exception — but a skip note excuses a
+# recording, it is never the affirmative evidence a pass claims: a pass whose
+# evidence is ONLY a skip note is refused, and clears once it cites a file.
 jq '.status = "pass"' "$CLIP_DIR/markers/B1.json" >"$CLIP_DIR/markers/.marker.json"
+mv "$CLIP_DIR/markers/.marker.json" "$CLIP_DIR/markers/B1.json"
+RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$CLIP_DIR" lanes || true)"
+echo "$RESULT" | jq -e '(.ready == false) and (.invalidReasons[0] | contains("names no file"))' >/dev/null || {
+  echo "expected a pass marker citing only a clip-skipped note to be refused as evidence-less" >&2; echo "$RESULT" >&2; exit 1; }
+printf 'ok' > "$CLIP_DIR/b1.txt"
+jq '.evidence += ["b1.txt"]' "$CLIP_DIR/markers/B1.json" >"$CLIP_DIR/markers/.marker.json"
 mv "$CLIP_DIR/markers/.marker.json" "$CLIP_DIR/markers/B1.json"
 bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$CLIP_DIR" lanes \
   | jq -e '.ready == true' >/dev/null || {
-  echo "expected a pass marker with a stated clip-skipped reason to clear the barrier" >&2; exit 1; }
+  echo "expected a pass marker with a stated clip-skipped reason plus a real file to clear the barrier" >&2; exit 1; }
+jq '.evidence = ["clip-skipped: F1: no browser lease available"]' "$CLIP_DIR/markers/B1.json" >"$CLIP_DIR/markers/.marker.json"
+mv "$CLIP_DIR/markers/.marker.json" "$CLIP_DIR/markers/B1.json"
 
 # Passing a magic-looking non-file string is never enough: it must name one of
 # this marker's confirmed findings with a nonempty reason.
@@ -393,7 +403,9 @@ bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FLOOR_DIR" lanes \
 # A valid clip-skipped account is non-file evidence for a confirmed finding,
 # never visual proof of the floor journey itself. The reason deliberately ends
 # in .mp4 to prove a filename-looking suffix cannot manufacture browser media.
-jq '.confirmedFindings = ["F1"] | .evidence = ["clip-skipped: F1: recorder could not write clips/F1.mp4"]' \
+# (A real non-media file rides along so the pass is not refused earlier as
+# evidence-less — a skip note alone is never evidence, tested above.)
+jq '.confirmedFindings = ["F1"] | .evidence = ["clip-skipped: F1: recorder could not write clips/F1.mp4", "evidence/api-receipt.json"]' \
   "$FLOOR_DIR/markers/F1.json" >"$FLOOR_DIR/markers/.marker.json"
 mv "$FLOOR_DIR/markers/.marker.json" "$FLOOR_DIR/markers/F1.json"
 RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FLOOR_DIR" lanes || true)"

@@ -1044,7 +1044,10 @@ line in its `evidence` array — silence fails the barrier, exactly like the
 `record start` failure above must still be recorded rather than dropped. A
 `status:"pass"` uses the same valid clip-skipped form; it is not treated as a
 missing file when it names one of that marker's confirmed findings and gives a
-non-empty reason. Set
+non-empty reason — but it excuses a recording, it is not evidence: a pass must
+still cite at least one real file, and every entry must be a valid citation
+(relative, inside the run, or a well-formed skip note) for the barrier and for
+floor cadence alike. Set
 `confirmedFindings` with the scaffold, never by hand — `smoke-run-scaffold.sh
 marker <run-dir> <lane-id> <status> [summary] [evidence-csv]
 --confirmed-findings <id>[,<id>...]` — the same rule that forbids hand-written

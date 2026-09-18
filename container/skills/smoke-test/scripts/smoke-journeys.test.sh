@@ -751,6 +751,67 @@ expect 5c-native-floor-packet-is-not-pass 'any(.invalidReasons[]; test("named te
 marker mobile-scan-return completed '["packet.md"]'
 expect 5c-native-floor-packet-issued '.ready == true' "$(barrier)"
 
+# --- 5e. PARITY: the barrier and cadence accept and reject the SAME passes ----
+# Every evidence entry, every evidence kind, through the REAL barrier (bash,
+# pass_evidence_problem / floor_evidence_problem / finding_clip_problem, plus
+# the journeys lane rule) and through last_proven (Python, files present), so
+# the two implementations cannot drift apart again: three review rounds of
+# #898 each found a pass the barrier refuses that cadence counted. Rows are
+# evidence lists; `V` is the kind's own valid citation (browser media, api
+# text, the tester's manual-results file). Expected: b=browser a=api n=native.
+PARITY_PIN_WEB="$(CATALOGUE="$WORK/browser-floor.json" gate_pin "$WORK/lease5e-web" "$SHA" '["web/src/desk/a.tsx"]' 7 org__repo "" '--run-root /nonexistent')"
+PARITY_PIN_NATIVE="$(CATALOGUE="$WORK/native-floor.json" gate_pin "$WORK/lease5e-native" "$SHA" '[]' 7 org__repo "" '--unknown no-GO --run-root /nonexistent')"
+PARITY_ROOT="$WORK/parity"; mkdir -p "$PARITY_ROOT"
+parity_case() { # <kind b|a|n> <label> <evidence-json with V placeholder> <confirmedFindings-json or ""> <expected true|false>
+  local kind="$1" label="$2" ev="$3" findings="$4" want="$5" jid cat pin valid out_b out_c e
+  case "$kind" in
+    b) jid=loan-desk-checkout; cat="$WORK/browser-floor.json"; pin="$PARITY_PIN_WEB"; valid="desk.png"
+       new_run '[{"id":"loan-desk-checkout","kind":"floor"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"}]'
+       adopt "$pin" >/dev/null; marker branch-scope-crossing blocked '[]' ;;
+    a) jid=branch-scope-crossing; cat="$WORK/browser-floor.json"; pin="$PARITY_PIN_WEB"; valid="api.txt"
+       new_run '[{"id":"loan-desk-checkout","kind":"floor"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"}]'
+       adopt "$pin" >/dev/null; marker loan-desk-checkout blocked '[]' ;;
+    n) jid=mobile-scan-return; cat="$WORK/native-floor.json"; pin="$PARITY_PIN_NATIVE"; valid="manual-results/tester.md"
+       new_run '[{"id":"loan-desk-checkout","kind":"lane"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"},{"id":"mobile-scan-return","kind":"floor"}]'
+       adopt "$pin" >/dev/null; marker loan-desk-checkout blocked '[]'; marker branch-scope-crossing blocked '[]' ;;
+  esac
+  ev="${ev//V/$valid}"
+  # Every relative, non-note citation exists as a nonempty file (existence is not under test here).
+  while IFS= read -r e; do
+    case "$e" in clip-skipped:*|/*|../*) continue ;; esac
+    mkdir -p "$RUN/$(dirname "$e")"; printf 'x' > "$RUN/$e"
+  done < <(jq -r '.[]' <<<"$ev")
+  jq -n --arg sha "$SHA" --arg lane "$jid" --argjson ev "$ev" --argjson f "${findings:-null}" \
+    '{sourceSha:$sha,lane:$lane,generation:1,status:"pass",completedAt:"2026-09-10T01:00:00Z",evidence:$ev}
+     + (if $f == null then {} else {confirmedFindings:$f} end)' > "$RUN/markers/$jid.json"
+  out_b="$(barrier | jq -r '.ready')"
+  rm -rf "$PARITY_ROOT/$kind-$label"; mkdir -p "$PARITY_ROOT/$kind-$label"; cp -r "$RUN" "$PARITY_ROOT/$kind-$label/run-1"
+  out_c="$(python3 "$TOOL" floor-due "$cat" "$PARITY_ROOT/$kind-$label" --as-of "$NOW" | jq -r --arg id "$jid" '[.entries[] | select(.id == $id)][0].lastProvenAt != null')"
+  [ "$out_b" = "$out_c" ] || fail "5e-parity-drift $kind/$label: barrier ready=$out_b but cadence proven=$out_c for evidence $ev"
+  [ "$out_b" = "$want" ] || fail "5e-parity-expected $kind/$label: both said $out_b, table says $want for evidence $ev"
+  printf '5e %s %-28s barrier=%s cadence=%s\n' "$kind" "$label" "$out_b" "$out_c" >&2
+}
+for kind in b a n; do
+  parity_case "$kind" valid-own-citation        '["V"]'                                                    ""       true
+  parity_case "$kind" skip-note-alone           '["clip-skipped: F1: no ffmpeg"]'                          '["F1"]' false
+  parity_case "$kind" skip-note-plus-valid      '["clip-skipped: F1: no ffmpeg","V"]'                      '["F1"]' true
+  parity_case "$kind" absolute                  '["/tmp/x.png"]'                                           ""       false
+  parity_case "$kind" traversal                 '["../other/x.png"]'                                       ""       false
+  parity_case "$kind" mixed-valid-plus-absolute '["V","/tmp/x.png"]'                                       ""       false
+  parity_case "$kind" mixed-valid-plus-traversal '["V","../x.png"]'                                        ""       false
+  parity_case "$kind" malformed-skip-note       '["clip-skipped: no finding here","V"]'                    ""       false
+  parity_case "$kind" skip-note-wrong-finding   '["clip-skipped: F2: no ffmpeg","V"]'                      '["F1"]' false
+  parity_case "$kind" empty                     '[]'                                                       ""       false
+  parity_case "$kind" finding-without-clip      '["V"]'                                                    '["F1"]' false
+  parity_case "$kind" finding-with-clip         '["clips/F1.mp4","V"]'                                     '["F1"]' true
+done
+# The kinds' own proof rules, cross-wise: media is not a tester's result and a
+# text file is not media -- for the barrier and for cadence alike.
+parity_case b api-text-is-not-media           '["api.txt"]'                    "" false
+parity_case b manual-result-is-not-media      '["manual-results/tester.md"]'   "" false
+parity_case n media-is-not-a-tester-result    '["desk.png"]'                   "" false
+parity_case a media-is-fine-for-api           '["desk.png"]'                   "" true
+
 # --- 6. capture recipes --------------------------------------------------------
 new_run '[{"id":"loan-desk-checkout","kind":"lane"}]'
 adopt "$PIN_FILE" >/dev/null
