@@ -1007,7 +1007,8 @@ by default. Use the `agent-browser` skill.
   confirmation behavior, accessibility, and visual hierarchy as testable parity
   candidates rather than subjective nits.
 - Record a short clip of each candidate finding's reproduction. See below.
-- Disposition every visual candidate (see "Visual candidates").
+- With `SMOKE_VISUAL_DISPOSITIONS=1`, disposition every visual candidate (see
+  "Visual candidates").
 - Restore mutated test data or list every residue that could not be restored.
 
 ### Reproduction clips
@@ -1071,18 +1072,21 @@ destination**: the text-only kickoff root with `send_message`, then `send_file`
 for `sheet.png` with no caption. Never one combined `send_file`: the upload
 precedes its caption, so with no root yet it becomes a second channel-root
 message. A scheduled campaign reserves exactly one additional chat slot for
-that reply, not for progress narration. Link the sheet from the verdict.
+that reply, not for progress narration. Link the sheet from the verdict. A
+deployment may also run a fresh, read-only design critic on the shot PNGs —
+shadow only, posted but never gating the verdict.
 
 **Every screen navigates in its own fresh `agent-browser` session**, the same
 saved auth state loaded into each — never a fresh login. A shared session let
-one screen's open nav drawer bleed into later screenshots, graded BROKEN as a
-pure capture artifact. The manifest records `freshNavigation: true`.
+one screen's open nav drawer bleed into later screenshots, which the shadow
+critic then graded BROKEN as a pure capture artifact. The manifest records `freshNavigation: true`.
 
 **Grade the viewport capture, never the full-page one.** Each width's `file`
 is viewport-sized, taken with CSS animations/transitions frozen and re-taken
 until the live page matches it (`settled`). `fullPage` (`*-full.png`) is
 context only: stitching misplaces fixed/sticky headers and drawers and has
-produced false BROKEN findings. A capture whose final `location.pathname` is
+produced false BROKEN findings. A tile badged `unsettled` is not evidence of
+breakage on its own. A capture whose final `location.pathname` is
 not the shot's `path` (or its declared `finalPath`) fails with both paths
 named — a bounce to a login route is never graded, and on the baseline it is
 a failed diff, never `changed`.
@@ -1091,11 +1095,9 @@ a failed diff, never `changed`.
 also captured from the baseline with the identical recipe and pixel-diffed;
 `manifest.json` gains `diff: {status, pct, image, baseline, reason}` per
 width and the sheet orders tiles changed → diff failed → unchanged, badged.
-Give the critic the head
+Give a critic the head
 image, its `*-base.png` and `*-diff.png`, and ask what the change broke — an
-`unchanged` screen looked that way before this build and may go ungraded. Only
-an author-PR campaign passes a baseline: a freeze campaign's diff against
-production would be the whole release range. Baseline capture is strictly
+`unchanged` screen looked that way before this build. Baseline capture is strictly
 read-only (navigation, the declared `steps`, screenshot), the only use a
 deployment's baseline url has; a baseline failure records `diff.status:
 "failed"` with a reason and never touches the head capture. A baseline on
@@ -1109,48 +1111,45 @@ against `<run-dir>` and `$SMOKE_WORKGROUP_ROOT`, default
 
 ### Visual candidates — detection always ends owned
 
-The sheet and a fresh, read-only, screenshot-only design critic (the
-deployment's rubric, the build's own design system) only DETECT, yet nothing
-they flag is "advisory". Pipe the critic's `GRADE · <shot filename> · <reason>` lines into
-`smoke-visual-candidates.py record-critic <run-dir> --rubric <file>`
-(`contact-sheet/critic.json`; a skipped screen is refused); a critic that could
-not run is recorded with `--unavailable <reason>`, never omitted.
-`list <run-dir>` names the **candidates**, one per screen and width:
+**Only where the install exports `SMOKE_VISUAL_DISPOSITIONS=1`**; unset, the
+critic stays optional and shadow as above, and this section does not apply.
+Nothing the sheet or critic flags is then "advisory". Pipe the critic's
+`GRADE · <shot filename> · <reason>` lines into `smoke-visual-candidates.py
+record-critic <run-dir> --rubric <file>`; a critic that could not run is
+recorded with `--unavailable <reason>`, never omitted. `list <run-dir>` names
+the **candidates**, one per screen and width:
 
 - the critic graded it `BROKEN`;
 - its capture failed, or the pinned journeys require a screen the manifest lacks;
 - it was captured `settled: false`;
 - the critic graded it `DEGRADED` **and** the baseline diff says this build
-  `changed` it — neither alone is a candidate;
+  `changed` it;
 - `critic@sheet`, when the critic was recorded unavailable.
 
-The UI adversary reproduces each interactively, in a viewport at that width on
-the bound build, and records exactly one disposition with `dispose <run-dir>
-<candidate> <disposition> --by <who> …`:
+The UI adversary reproduces each in a viewport at that width on the bound
+build, and records exactly one disposition with `dispose <run-dir> <candidate>
+<disposition> --by <who> …`:
 
 | Disposition | Carries | Then |
 | --- | --- | --- |
-| `confirmed` | `--finding <id> --evidence <viewport capture>` | A normal section 4 finding; its lane marker lists the id in `confirmedFindings`. |
+| `confirmed` | `--finding <id> --evidence <viewport capture>` | A normal section 4 finding in `confirmedFindings`. |
 | `refuted-capture-artifact` | `--reason --evidence <viewport capture>` | `aggregate <run-root> known-artifacts` tells the next critic. |
 | `deferred` | `--owner --trigger` | Real but tolerable. |
-| `blocked` | `--reason` | Could not reproduce; goes on the verdict's Untested line. |
+| `blocked` | `--reason` | On the verdict's Untested line. |
 
 A failed capture is **missing evidence for that journey**: re-capture it, or
-record `confirmed`/`blocked` — never refuted or deferred unseen. Re-capturing
-voids the critic record.
+record `confirmed`/`blocked`. A disposition is bound to the capture and critic
+record it judged; a re-capture or re-grade voids it. Only an author-PR campaign
+passes a baseline url (a freeze campaign's diff is the whole release range).
 
-Both writers need `SMOKE_LANE_ROLE`, recorded as `side`. Refuting or deferring
-a `BROKEN` must come from the other side than the one that recorded the critic.
-The role is self-declared, as for markers — truth is the challenger's review.
+Both writers need `SMOKE_LANE_ROLE`, recorded as `side`; refuting or deferring
+a `BROKEN` must come from the side that did not record the critic.
 
-Where the install exports `SMOKE_VISUAL_DISPOSITIONS=1` (unset, nothing is
-enforced), `smoke-evidence-barrier.sh synthesis` refuses while a required sheet
-has no manifest, a sheet has no critic record, or a candidate lacks a valid
-disposition — the `confirmedFindings`→clip pattern, likewise COMPLETENESS
-ONLY. The critic is never a gate: any honest disposition clears readiness, so a
-screenshot-only suspicion cannot hold a release; the verdict moves only through
-a `confirmed` finding's severity, so a confirmed user-blocking defect is never
-waved through. `aggregate <run-root> critic-log` derives the shared critic log.
+`smoke-evidence-barrier.sh synthesis` refuses while a required sheet has no
+manifest or critic record, or a candidate lacks a valid disposition —
+COMPLETENESS ONLY, like the clip rule. Any honest disposition clears readiness;
+the verdict moves only through a `confirmed` finding's severity. `aggregate
+<run-root> critic-log` derives the shared critic log.
 
 ### Backend and specification verifier
 

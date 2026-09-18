@@ -15,7 +15,8 @@ It never touches the verdict; a candidate reaches the verdict only as a
                 (the critic's `GRADE · <shot filename> · <reason>` lines on stdin)
   record-critic <run-dir> --unavailable <reason>
   list          <run-dir>
-  dispose       <run-dir> <candidate> <disposition> --by <who>
+  dispose       <run-dir> <candidate> <disposition> --by <who>   (bound to the
+                current capture, and critic record for a critic candidate)
                 [--finding <id>] [--evidence <run-relative file>]
                 [--reason <text>] [--owner <who>] [--trigger <text>]
   barrier       <run-dir>
@@ -324,6 +325,34 @@ def disposition_problem(run_dir, entry, candidate, critic, check_lifecycle):
     return None
 
 
+def _critic_sha(run_dir):
+    try:
+        with open(os.path.join(run_dir, CRITIC_REL), "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def bound_identity(run_dir, manifest, candidate):
+    """What a disposition of this candidate is a judgment OF: the capture
+    (manifest generatedAt) and, for a candidate the critic raised, the exact
+    critic record (its sha256). A recapture or a regrade is a new detection,
+    so a disposition bound to the old one no longer owns the candidate."""
+    ident = {"manifestGeneratedAt": manifest.get("generatedAt")}
+    if any(k.startswith("critic-") for k in candidate["kinds"]):
+        ident["criticSha256"] = _critic_sha(run_dir)
+    return ident
+
+
+def stale_problem(entry, current):
+    bound = entry.get("boundTo")
+    if bound == current:
+        return None
+    return ("stale disposition: recorded against {} but the current detection is {} -- a recapture or regrade is a "
+            "new candidate; reproduce it again and re-run `dispose`").format(
+        json.dumps(bound, sort_keys=True), json.dumps(current, sort_keys=True))
+
+
 def load_dispositions(run_dir):
     path = os.path.join(run_dir, DISP_REL)
     if not os.path.exists(path):
@@ -400,26 +429,30 @@ def cmd_record_critic(args):
 # --- list / dispose ---------------------------------------------------------
 
 def cmd_list(args):
-    _, _, _, candidates = _state(args.run_dir)
+    _, manifest, _, candidates = _state(args.run_dir)
     dispositions = load_dispositions(args.run_dir) or []
     for c in candidates:
         mine = [d for d in dispositions if d.get("candidate") == c["candidate"]]
         c["allowed"] = allowed_dispositions(c["kinds"])
         c["disposition"] = mine[0] if len(mine) == 1 else None
+        c["stale"] = c["disposition"] is not None and \
+            stale_problem(c["disposition"], bound_identity(args.run_dir, manifest, c)) is not None
+        if c["stale"]:
+            c["disposition"] = None
     emit({"ok": True, "candidates": candidates,
           "undispositioned": [c["candidate"] for c in candidates if c["disposition"] is None]})
 
 
 def cmd_dispose(args):
     side = writer_side("a visual candidate disposition")
-    _, _, critic, candidates = _state(args.run_dir)
+    _, manifest, critic, candidates = _state(args.run_dir)
     candidate = next((c for c in candidates if c["candidate"] == args.candidate), None)
     if candidate is None:
         emit({"ok": False, "error": "{} is not a candidate in this run".format(args.candidate),
               "candidates": [c["candidate"] for c in candidates]}, 1)
     entry = {"candidate": args.candidate, "disposition": args.disposition, "kinds": candidate["kinds"],
              "screen": candidate["screen"], "width": candidate["width"], "side": side, "by": args.by,
-             "recordedAt": _now()}
+             "boundTo": bound_identity(args.run_dir, manifest, candidate), "recordedAt": _now()}
     for field in ("finding", "evidence", "reason", "owner", "trigger"):
         if getattr(args, field) is not None:
             entry[field] = getattr(args, field)
@@ -497,7 +530,8 @@ def cmd_barrier(args):
             add(invalid, rel, "visual candidate with no owner -- {}. Reproduce it in a viewport at that width on the bound build, then record one of: {}".format(
                 c["detail"], ", ".join(allowed_dispositions(c["kinds"]))))
         else:
-            problem = disposition_problem(run_dir, mine[0], c, critic, check_lifecycle=True)
+            problem = stale_problem(mine[0], bound_identity(run_dir, manifest, c)) or \
+                disposition_problem(run_dir, mine[0], c, critic, check_lifecycle=True)
             if problem:
                 add(invalid, rel, problem)
     done()

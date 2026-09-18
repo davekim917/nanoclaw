@@ -238,6 +238,30 @@ if dispose "$RUN" critic@sheet refuted-capture-artifact --reason x --evidence co
 dispose "$RUN" critic@sheet blocked --reason "critic provider down for the whole campaign window" >/dev/null
 barrier "$RUN" | jq -e '.ready == true' >/dev/null || fail "unrun critic, blocked => ready"
 
+# --- a disposition owns the detection it was made on, not the screen ---------
+RUN="$(new_run stale)"
+manifest "$RUN" 2026-09-17T10:00:00Z "$LANTERN"
+printf 'FINE · 01-lantern-1280.png · ok\nBROKEN · 01-lantern-390.png · drawer left open over the shelf\n' | critic "$RUN" >/dev/null
+printf 'png' >"$RUN/contact-sheet/repro.png"
+dispose "$RUN" lantern@mobile refuted-capture-artifact --reason "drawer left open by the capture recipe" --evidence contact-sheet/repro.png >/dev/null
+jq -e --arg sha "$(sha256sum "$RUN/contact-sheet/critic.json" | cut -d' ' -f1)" '.dispositions[0].boundTo ==
+  {manifestGeneratedAt:"2026-09-17T10:00:00Z",criticSha256:$sha}' "$RUN/contact-sheet/dispositions.json" >/dev/null ||
+  fail "dispose binds the capture and the critic record it judged"
+barrier "$RUN" | jq -e '.ready == true' >/dev/null || fail "fresh disposition => ready" "$(barrier "$RUN")"
+# Recapture and regrade: still BROKEN on the same screen, a different problem.
+manifest "$RUN" 2026-09-17T11:00:00Z "$LANTERN"
+printf 'FINE · 01-lantern-1280.png · ok\nBROKEN · 01-lantern-390.png · price column overflows the viewport\n' | critic "$RUN" >/dev/null
+barrier "$RUN" | jq -e '.ready == false and .invalid == ["contact-sheet/dispositions.json#lantern@mobile"]
+  and (.invalidReasons[0] | contains("stale disposition") and contains("2026-09-17T10:00:00Z") and contains("2026-09-17T11:00:00Z"))' >/dev/null ||
+  fail "a dismissal of the old BROKEN must not clear the new one" "$(barrier "$RUN")"
+python3 "$VC" list "$RUN" | jq -e '.undispositioned == ["lantern@mobile"] and .candidates[0].stale == true' >/dev/null || fail "list shows the stale disposition as unowned"
+dispose "$RUN" lantern@mobile refuted-capture-artifact --reason "drawer again" --evidence contact-sheet/repro.png >/dev/null
+barrier "$RUN" | jq -e '.ready == true' >/dev/null || fail "re-dispositioned => ready"
+# A regrade alone (same capture) is a new detection too.
+printf 'FINE · 01-lantern-1280.png · ok\nBROKEN · 01-lantern-390.png · badge overlaps title\n' | critic "$RUN" >/dev/null
+barrier "$RUN" | jq -e '.ready == false and (.invalidReasons[0] | contains("stale disposition"))' >/dev/null ||
+  fail "a regrade must not inherit the previous grade's disposition" "$(barrier "$RUN")"
+
 # --- derived shared views: refuted artifacts are kept for reuse -----------------
 RUN="$(new_run reuse)"
 manifest "$RUN" 2026-09-17T10:00:00Z "$LANTERN"
