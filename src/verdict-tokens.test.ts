@@ -20,6 +20,14 @@ describe('humanizeVerdictTokens', () => {
     expect(humanizeVerdictTokens('GO / `BLOCKED`')).toBe('GO / `BLOCKED`');
   });
 
+  it('rewrites tokens wrapped in prose or markdown punctuation', () => {
+    expect(humanizeVerdictTokens('`NO_GO`.')).toBe('No-go.');
+    expect(humanizeVerdictTokens('(NO_GO)')).toBe('(No-go)');
+    expect(humanizeVerdictTokens('**NO_GO**, "HUMAN_DECISION"; [BLOCKED_BUILD_IDENTITY]!')).toBe(
+      '**No-go**, "Needs a human decision"; [Blocked (build identity)]!',
+    );
+  });
+
   it('does not touch fenced code blocks', () => {
     const text = 'Verdict NO_GO\n```\nverdict=NO_GO\n`HUMAN_DECISION`\n```\nafter NO_GO\n```NO_GO```\nend NO_GO';
     expect(humanizeVerdictTokens(text)).toBe(
@@ -27,18 +35,40 @@ describe('humanizeVerdictTokens', () => {
     );
   });
 
-  it('does not touch identifiers, paths or URLs containing a token', () => {
+  it('closes a fence only on the same char at least as long (CommonMark)', () => {
+    const tilde = '~~~\n```\nNO_GO\n~~~\nafter NO_GO';
+    expect(humanizeVerdictTokens(tilde)).toBe('~~~\n```\nNO_GO\n~~~\nafter No-go');
+    const four = '````md\n```\nNO_GO\n```\nNO_GO\n````\nafter NO_GO';
+    expect(humanizeVerdictTokens(four)).toBe('````md\n```\nNO_GO\n```\nNO_GO\n````\nafter No-go');
+    const crlf = '```\r\nNO_GO\r\n```\r\nNO_GO';
+    expect(humanizeVerdictTokens(crlf)).toBe('```\r\nNO_GO\r\n```\r\nNo-go');
+  });
+
+  it('leaves everything after an unterminated fence untouched', () => {
+    const text = 'NO_GO\n```\nNO_GO\nstill code NO_GO';
+    expect(humanizeVerdictTokens(text)).toBe('No-go\n```\nNO_GO\nstill code NO_GO');
+  });
+
+  it('does not touch URLs, paths, queries or identifiers containing a token', () => {
     const untouched = [
       'task-NO_GO-x',
       'NO_GO_REASON',
       'MY_NO_GO',
+      '_NO_GO',
       'NO_GO2',
+      'NO_GO.md',
       'reports/NO_GO.md',
+      'a/NO_GO/b',
+      'C:\\NO_GO',
+      '#NO_GO',
+      '?NO_GO=1',
       'https://example.com/NO_GO',
+      'https://example.com/#NO_GO',
       'https://example.com/?v=NO_GO',
       'lower no_go',
       '`NO_GO_REASON`',
       '`verdict NO_GO`',
+      '``NO_GO``',
     ];
     for (const s of untouched) expect(humanizeVerdictTokens(s)).toBe(s);
   });

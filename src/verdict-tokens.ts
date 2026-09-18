@@ -18,25 +18,46 @@ const HUMAN: Record<string, string> = {
 };
 
 const NAMES = Object.keys(HUMAN).join('|');
-// Either the whole inline-code span `TOKEN`, or a bare whole-word TOKEN not
-// embedded in an identifier, path, URL or query (`task-NO_GO-x`,
-// `NO_GO_REASON`, `/NO_GO`, `?v=NO_GO`). A trailing sentence period is fine.
-const TOKEN = new RegExp(`\`(${NAMES})\`|(?<![\\w\\-/.=\`])(${NAMES})(?![\\w\\-/\`]|\\.\\w)`, 'g');
-const FENCE = /^\s*(```|~~~)/;
+// Allowlist, not exclusions: a token is rewritten only as a whole
+// whitespace-delimited word, optionally wrapped in markdown/prose punctuation.
+// Anything else in the word — `/`, `\`, `#`, `?`, `=`, `-`, letters — means it
+// is part of a URL, path, query or identifier, and the word is left alone.
+const WORD = new RegExp(`(?<=^|\\s)([(\\["'*]*)(${NAMES})([.,;:!?)\\]"'*]*)(?=\\s|$)`, 'g');
+// An inline code span: a backtick run closed by a run of the same length.
+const CODE_SPAN = /(`+)[\s\S]*?(?<!`)\1(?!`)/g;
+// CommonMark fences: an opening run of 3+ backticks (no backtick in the info
+// string) or tildes; closed only by a bare run of the same char, at least as long.
+const FENCE_OPEN = /^ {0,3}(`{3,}(?=[^`]*$)|~{3,})/;
+
+function humanizeLine(line: string): string {
+  let out = '';
+  let last = 0;
+  for (const m of line.matchAll(CODE_SPAN)) {
+    out += line.slice(last, m.index).replace(WORD, (_w, pre: string, t: string, post: string) => pre + HUMAN[t] + post);
+    // Only a span holding exactly one token, in single backticks, is rewritten.
+    out += m[0].slice(1, -1) in HUMAN && m[1] === '`' ? HUMAN[m[0].slice(1, -1)] : m[0];
+    last = m.index + m[0].length;
+  }
+  return out + line.slice(last).replace(WORD, (_w, pre: string, t: string, post: string) => pre + HUMAN[t] + post);
+}
 
 /** Rewrite gate tokens outside fenced code blocks. Pure and idempotent. */
 export function humanizeVerdictTokens(text: string): string {
-  let inFence = false;
+  let fence: string | null = null;
   return text
     .split('\n')
     .map((line) => {
-      const fence = FENCE.exec(line);
-      if (fence) {
-        // A one-line ```…``` span opens and closes on the same line.
-        if (!line.slice(fence[0].length).includes(fence[1])) inFence = !inFence;
+      if (fence !== null) {
+        const close = /^ {0,3}(`+|~+)\s*$/.exec(line);
+        if (close && close[1][0] === fence[0] && close[1].length >= fence.length) fence = null;
         return line;
       }
-      return inFence ? line : line.replace(TOKEN, (_m, code?: string, bare?: string) => HUMAN[(code ?? bare)!]);
+      const open = FENCE_OPEN.exec(line);
+      if (open) {
+        fence = open[1];
+        return line;
+      }
+      return humanizeLine(line);
     })
     .join('\n');
 }
