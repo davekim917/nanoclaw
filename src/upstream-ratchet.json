@@ -372,7 +372,7 @@
 "container/pull.sh":{"diff":328,"mode":"100755","sha256":null,"deleted":true},
 "container/skills/agent-browser/SKILL.md":{"diff":104,"mode":"100644","sha256":"41e99f43b9163fa7cb7326758795357eb3282d0d001b2f99c316ead0aeb38297"},
 "container/skills/frontend-engineer/SKILL.md":{"diff":28,"mode":"100644","sha256":"ae11d8f133f6428b6e71530b896e9ee2f4eddcd6c18e1d0d1251a0032dd7bc07"},
-"container/skills/onecli-gateway/SKILL.md":{"diff":20,"mode":"100644","sha256":"4f61a950a20beb1b3c84f48bc37da86d289281b63fd836f50c8500134b23484e"},
+"container/skills/onecli-gateway/SKILL.md":{"diff":27,"mode":"100644","sha256":"6ca28188a5710fe1f19c5f9e0a5fa671811bdfd7bcc29f4b5cf0c16a95db7dd3"},
 "container/skills/onecli-gateway/instructions.md":{"diff":7,"mode":"100644","sha256":null,"deleted":true},
 "container/skills/self-customize/SKILL.md":{"diff":4,"mode":"100644","sha256":"ac7f0be0dc870cbcb018b9a32d4779e926117b7863b51df5277f00b40a4d0ecf"},
 "container/skills/welcome/SKILL.md":{"diff":12,"mode":"100644","sha256":"7f6e97202f0fce5eacaf6c430d18faa27a23b98ac08469e98cb94b72ce681d34"},
