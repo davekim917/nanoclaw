@@ -162,7 +162,7 @@ function formatCredentialRetryPrompt(
     // The resumed transcript already shows the batch (provider.transcriptHasPrompt):
     // point at it rather than put a second copy in context for the rest of the session.
     (promptAlreadyInTranscript
-      ? 'The interrupted batch is the most recent inbound message above in this conversation; it is not repeated here.\n'
+      ? 'The interrupted batch is the inbound message this attempt already recorded above in this conversation; it is not repeated here.\n'
       : prompt)
   );
 }
@@ -769,6 +769,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // retry below replays this batch, so it carries the same media.
     const batchAttachments = extractAttachments(keep);
 
+    // When this batch's first attempt began — a rotation retry only trusts a
+    // transcript copy of the prompt recorded after this (transcriptHasPrompt).
+    const batchStartedAt = Date.now();
     const query = config.provider.query({
       prompt,
       attachments: batchAttachments,
@@ -1126,7 +1129,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             prompt,
             keep,
             rotation,
-            config.provider.transcriptHasPrompt?.(continuation, prompt) ?? false,
+            config.provider.transcriptHasPrompt?.(continuation, prompt, batchStartedAt) ?? false,
           );
           retryQuery = config.provider.query({
             prompt: retryPrompt,

@@ -305,8 +305,9 @@ describe('repository mount poll and tool admission barrier', () => {
       isSessionInvalid: () => false,
       isRetryable: () => true,
       rotateApiKey: () => ({ rotated: true }),
-      transcriptHasPrompt: (continuation: string | undefined, prompt: string) => {
+      transcriptHasPrompt: (continuation: string | undefined, prompt: string, sinceMs: number) => {
         asked.push({ continuation, prompt });
+        expect(sinceMs).toBeLessThanOrEqual(Date.now());
         return true;
       },
       query: (input: { prompt: string; continuation?: string }) => {

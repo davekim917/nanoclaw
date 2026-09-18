@@ -2546,10 +2546,10 @@ export class ClaudeProvider implements AgentProvider {
    * and re-injects the real token values, so direct callers bypass the
    * OneCLI proxy and use process.env directly.
    */
-  transcriptHasPrompt(continuation: string | undefined, prompt: string): boolean {
+  transcriptHasPrompt(continuation: string | undefined, prompt: string, sinceMs: number): boolean {
     if (!continuation) return false;
     const transcriptPath = findTranscriptPath(continuation);
-    return transcriptPath !== null && transcriptContainsUserText(transcriptPath, prompt);
+    return transcriptPath !== null && transcriptContainsUserText(transcriptPath, prompt, sinceMs);
   }
 
   rotateApiKey(): { rotated: boolean; slot?: string; position?: number; ringSize?: number } {
