@@ -261,6 +261,15 @@ barrier "$RUN" | jq -e '.ready == true' >/dev/null || fail "re-dispositioned => 
 printf 'FINE · 01-lantern-1280.png · ok\nBROKEN · 01-lantern-390.png · badge overlaps title\n' | critic "$RUN" >/dev/null
 barrier "$RUN" | jq -e '.ready == false and (.invalidReasons[0] | contains("stale disposition"))' >/dev/null ||
   fail "a regrade must not inherit the previous grade's disposition" "$(barrier "$RUN")"
+# The derived views ask the same question the barrier does: a stale refutation
+# neither resolves the new grade's critic-log row nor becomes a known artifact.
+python3 "$VC" aggregate "$TMP/runs" critic-log | jq -se '
+  any(.[]; .runId == "stale" and .screen == "lantern" and .width == "mobile" and .grade == "BROKEN"
+    and .disposition == null and .dispositionState == "stale")
+  and all(.[]; .runId != "stale" or .disposition == null)' >/dev/null ||
+  fail "critic-log must show a regraded BROKEN unresolved, not refuted" "$(python3 "$VC" aggregate "$TMP/runs" critic-log)"
+python3 "$VC" aggregate "$TMP/runs" known-artifacts | jq -e 'all(.knownCaptureArtifacts[]; .runId != "stale")' >/dev/null ||
+  fail "a stale refutation is not a known artifact"
 
 # --- derived shared views: refuted artifacts are kept for reuse -----------------
 RUN="$(new_run reuse)"

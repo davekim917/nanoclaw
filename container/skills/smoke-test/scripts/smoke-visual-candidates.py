@@ -344,13 +344,23 @@ def bound_identity(run_dir, manifest, candidate):
     return ident
 
 
-def stale_problem(entry, current):
-    bound = entry.get("boundTo")
-    if bound == current:
-        return None
-    return ("stale disposition: recorded against {} but the current detection is {} -- a recapture or regrade is a "
+def disposition_for(run_dir, manifest, candidate, dispositions):
+    """THE one join of a candidate to its disposition -- barrier, list and
+    aggregate all ask here, never by screen@width themselves.
+    (state, entry, why): state is none | duplicate | stale | current, and only
+    `current` means the entry owns THIS detection."""
+    mine = [d for d in dispositions if d.get("candidate") == candidate["candidate"]]
+    if not mine:
+        return "none", None, None
+    if len(mine) > 1:
+        return "duplicate", None, "{} dispositions recorded; a candidate has exactly one".format(len(mine))
+    bound, current = mine[0].get("boundTo"), bound_identity(run_dir, manifest, candidate)
+    if bound != current:
+        return "stale", mine[0], (
+            "stale disposition: recorded against {} but the current detection is {} -- a recapture or regrade is a "
             "new candidate; reproduce it again and re-run `dispose`").format(
-        json.dumps(bound, sort_keys=True), json.dumps(current, sort_keys=True))
+            json.dumps(bound, sort_keys=True), json.dumps(current, sort_keys=True))
+    return "current", mine[0], None
 
 
 def load_dispositions(run_dir):
@@ -432,13 +442,10 @@ def cmd_list(args):
     _, manifest, _, candidates = _state(args.run_dir)
     dispositions = load_dispositions(args.run_dir) or []
     for c in candidates:
-        mine = [d for d in dispositions if d.get("candidate") == c["candidate"]]
+        state, entry, _ = disposition_for(args.run_dir, manifest, c, dispositions)
         c["allowed"] = allowed_dispositions(c["kinds"])
-        c["disposition"] = mine[0] if len(mine) == 1 else None
-        c["stale"] = c["disposition"] is not None and \
-            stale_problem(c["disposition"], bound_identity(args.run_dir, manifest, c)) is not None
-        if c["stale"]:
-            c["disposition"] = None
+        c["disposition"] = entry if state == "current" else None
+        c["stale"] = state == "stale"
     emit({"ok": True, "candidates": candidates,
           "undispositioned": [c["candidate"] for c in candidates if c["disposition"] is None]})
 
@@ -520,18 +527,17 @@ def cmd_barrier(args):
         done()
     for c in compute_candidates(manifest, critic, journey_shots):
         rel = "{}#{}".format(DISP_REL, c["candidate"])
-        mine = [d for d in dispositions if d.get("candidate") == c["candidate"]]
-        if len(mine) > 1:
-            add(invalid, rel, "{} dispositions recorded; a candidate has exactly one".format(len(mine)))
-        elif not mine and "capture-failed" in c["kinds"]:
+        state, entry, why = disposition_for(run_dir, manifest, c, dispositions)
+        if state in ("duplicate", "stale"):
+            add(invalid, rel, why)
+        elif state == "none" and "capture-failed" in c["kinds"]:
             add(missing, rel, "MISSING EVIDENCE -- {} ({}). Re-capture the screen, or reproduce it live and record `confirmed`, or record `blocked` and report the screen untested".format(
                 c["candidate"], c["detail"]))
-        elif not mine:
+        elif state == "none":
             add(invalid, rel, "visual candidate with no owner -- {}. Reproduce it in a viewport at that width on the bound build, then record one of: {}".format(
                 c["detail"], ", ".join(allowed_dispositions(c["kinds"]))))
         else:
-            problem = stale_problem(mine[0], bound_identity(run_dir, manifest, c)) or \
-                disposition_problem(run_dir, mine[0], c, critic, check_lifecycle=True)
+            problem = disposition_problem(run_dir, entry, c, critic, check_lifecycle=True)
             if problem:
                 add(invalid, rel, problem)
     done()
@@ -549,20 +555,30 @@ def cmd_aggregate(args):
         critic = _read_json(critic_path)
         if not isinstance(critic, dict):
             continue
-        disp = {d.get("candidate"): d for d in (load_dispositions(run_dir) or [])}
+        # A disposition is attached only where disposition_for calls it
+        # current: a regrade's new BROKEN shows unresolved, never inheriting
+        # the old dismissal, and a stale refutation is no known artifact.
+        # A critic that does not cover the current manifest resolves nothing.
+        manifest = load_manifest(run_dir)
+        dispositions = load_dispositions(run_dir) or []
+        owned = {}
+        if manifest is not None and critic_problem(critic, manifest) is None:
+            for c in compute_candidates(manifest, critic, []):
+                owned[c["candidate"]] = disposition_for(run_dir, manifest, c, dispositions)
         if _is_text(critic.get("unavailable")):
             rows.append({"runId": run_id, "screen": None, "width": None, "grade": "NOT_RUN",
                          "reason": critic["unavailable"], "ts": critic.get("recordedAt")})
         for g in critic.get("grades") if isinstance(critic.get("grades"), list) else []:
             if not isinstance(g, dict):
                 continue
-            d = disp.get("{}@{}".format(g.get("screen"), g.get("width")))
+            state, d, _ = owned.get("{}@{}".format(g.get("screen"), g.get("width")), ("none", None, None))
             rows.append({"runId": run_id, "screen": g.get("screen"), "width": g.get("width"), "grade": g.get("grade"),
                          "reason": g.get("reason"), "ts": critic.get("recordedAt"),
-                         "disposition": d.get("disposition") if d else None})
-        for d in disp.values():
-            key = (d.get("screen"), d.get("width"), d.get("reason"))
-            if d.get("disposition") == "refuted-capture-artifact" and key not in seen:
+                         "disposition": d.get("disposition") if state == "current" else None,
+                         "dispositionState": state})
+        for state, d, _ in owned.values():
+            key = (d.get("screen"), d.get("width"), d.get("reason")) if d else None
+            if state == "current" and d.get("disposition") == "refuted-capture-artifact" and key not in seen:
                 seen.add(key)
                 artifacts.append({"screen": d.get("screen"), "width": d.get("width"), "reason": d.get("reason"),
                                   "runId": run_id, "recordedAt": d.get("recordedAt")})
