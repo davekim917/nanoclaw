@@ -68,19 +68,36 @@ barrier "$RUN" | jq -e '.ready == false and .missing == ["contact-sheet/manifest
 
 # Owed by the gate's pinned journeys even when the owner wrote no shots.json.
 RUN="$(new_run journeys-owed)"
-# Adopted the way a campaign adopts it: `pin-run` from the gate's pin + snapshot.
-echo '{"journeys":[{"id":"J1","captureRecipes":[{"name":"lantern","path":"/lantern"}]}]}' >"$TMP/catalogue-snapshot.json"
-jq -cn --arg snap "$TMP/catalogue-snapshot.json" --arg sha "$(sha256sum "$TMP/catalogue-snapshot.json" | cut -d' ' -f1)"   '{pinned:true,matchedJourneys:[{id:"J1"}],unmappedPaths:[],catalogueSnapshot:$snap,catalogueSha256:$sha}' >"$TMP/journeys-pin.json"
-python3 "$SCRIPT_DIR/smoke-journeys.py" pin-run "$RUN" "$TMP/journeys-pin.json" | jq -e '.ok' >/dev/null || fail "pin-run fixture"
-cmp -s "$RUN/journeys/selection.json" "$TMP/journeys-pin.json" || fail "pin-run stores the pin byte for byte"
+# Adopted the way a campaign adopts it: `pin-run` from a gate pin that
+# check_pin (smoke-journeys.py:744) calls valid -- computed by `match` from the
+# example catalogue, named for its repo/PR/head, its content-addressed snapshot
+# beside it -- exactly what smoke-pr-gate.sh journeys_pin_promote leaves in
+# the shared lease dir (the same recipe as smoke-journeys.test.sh gate_pin).
+# `web/src/desk/**` matches loan-desk-checkout, whose captureRecipes name the
+# screens `desk` and `desk-periods`.
+mkdir -p "$TMP/leases"
+JOURNEYS_OUT="$(printf '["web/src/desk/loan.ts"]' | python3 "$SCRIPT_DIR/smoke-journeys.py" match \
+  --catalogue "$SCRIPT_DIR/../references/journeys.example.json" --as-of 2026-09-17T00:00:00Z \
+  --snapshot-out "$TMP/leases/.snap")"
+JOURNEYS_DIGEST="$(jq -r '.catalogueSha256' <<<"$JOURNEYS_OUT")"
+mv "$TMP/leases/.snap" "$TMP/leases/journeys-catalogue-$JOURNEYS_DIGEST.json"
+PIN_FILE="$TMP/leases/journeys-pin-org__repo-pr-7-$SHA.json"
+jq -c --arg h "$SHA" --arg f "$PIN_FILE" --arg s "$TMP/leases/journeys-catalogue-$JOURNEYS_DIGEST.json" \
+  '. + {headSha:$h,pr:7,repoSlug:"org__repo",pinned:true,pinState:"valid",pinFile:$f,catalogueSnapshot:$s,pinnedAt:"2026-09-17T00:00:00Z"}' \
+  <<<"$JOURNEYS_OUT" >"$PIN_FILE"
+jq -e '.matchedJourneys | map(.id) | index("loan-desk-checkout") != null' "$PIN_FILE" >/dev/null || fail "pin fixture matched no capture-recipe journey" "$(cat "$PIN_FILE")"
+python3 "$SCRIPT_DIR/smoke-journeys.py" pin-run "$RUN" "$PIN_FILE" | jq -e '.ok' >/dev/null || fail "pin-run fixture" "$(python3 "$SCRIPT_DIR/smoke-journeys.py" pin-run "$RUN" "$PIN_FILE" || true)"
+cmp -s "$RUN/journeys/selection.json" "$PIN_FILE" || fail "pin-run stores the pin byte for byte"
+python3 "$SCRIPT_DIR/smoke-journeys.py" shots "$RUN" | jq -e '(.shots | map(.name)) == ["desk","desk-periods"]' >/dev/null ||
+  fail "shots does not read the adopted selection" "$(python3 "$SCRIPT_DIR/smoke-journeys.py" shots "$RUN")"
 python3 "$VC" barrier "$RUN" | jq -e '.missing == ["contact-sheet/manifest.json"]
   and (.invalidReasons[0] | contains("pinned journeys carry capture recipes"))' >/dev/null ||
   fail "pinned journeys with capture recipes owe a sheet"
 # ...and a screen they require that the manifest never attempted is missing evidence.
 manifest "$RUN" 2026-09-17T10:00:00Z "[$(screen other "$(w 01-other-1280.png)" "$(w 01-other-390.png)")]"
 printf 'FINE · 01-other-1280.png · ok\nFINE · 01-other-390.png · ok\n' | critic "$RUN" >/dev/null
-python3 "$VC" barrier "$RUN" | jq -e '(.missing | sort) == ["contact-sheet/dispositions.json#lantern@desktop","contact-sheet/dispositions.json#lantern@mobile"]' >/dev/null ||
-  fail "a journey-required screen absent from the manifest is missing evidence"
+python3 "$VC" barrier "$RUN" | jq -e '(.missing | sort) == ["contact-sheet/dispositions.json#desk-periods@desktop","contact-sheet/dispositions.json#desk-periods@mobile","contact-sheet/dispositions.json#desk@desktop","contact-sheet/dispositions.json#desk@mobile"]' >/dev/null ||
+  fail "a journey-required screen absent from the manifest is missing evidence" "$(python3 "$VC" barrier "$RUN")"
 
 # --- critic absent with a required sheet -------------------------------------
 RUN="$(new_run lantern)"
