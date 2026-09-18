@@ -33,11 +33,22 @@ const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-oauth-leak-'));
  *
  * SENTINEL is distinctive enough that a partial echo is still caught.
  */
-const { SENTINEL, logged, invocations } = vi.hoisted(() => ({
+const { SENTINEL, ACCESS_SENTINEL, logged, invocations, gateway } = vi.hoisted(() => ({
   SENTINEL: 'sk-onecli-SENTINEL-8f2a1c-DO-NOT-LEAK',
+  /** The OAuth ACCESS TOKEN the token endpoint mints (#911 item 1) — the other
+   *  secret on this path, carried in the PATCH/POST body. */
+  ACCESS_SENTINEL: 'at-ACCESS-SENTINEL-3c9e71-DO-NOT-LEAK',
   logged: [] as unknown[][],
   /** Every curl invocation the code under test made: argv and the stdin it wrote. */
   invocations: [] as { argv: string[]; stdin: string }[],
+  /**
+   * `down`: every call fails to connect — the secrets list fails first, so no
+   * call ever carries the access token. `write-fails`: the list succeeds and
+   * finds the secret, so the PATCH that CARRIES the token is really made, and
+   * then fails to connect. `write-echoes`: that PATCH answers HTTP 500 with a
+   * body echoing the whole request, as a misbehaving gateway might.
+   */
+  gateway: { mode: 'down' as 'down' | 'write-fails' | 'write-echoes' },
 }));
 
 vi.mock('../../config.js', async (importOriginal) => {
@@ -65,6 +76,7 @@ vi.mock('../../log.js', () => ({
 }));
 
 vi.mock('../../container-config.js', () => ({
+  readContainerConfig: () => ({}),
   updateContainerConfig: async () => ({}),
 }));
 
@@ -82,7 +94,18 @@ vi.mock('child_process', async () => {
         `Command failed: ${bin} ${argv.join(' ')}\ncurl: (7) Failed to connect to 127.0.0.1 port 10254`,
       );
       error.code = 7 as unknown as string;
-      queueMicrotask(() => done(error, '', ''));
+      // Decided in the microtask, after the caller has written the config to
+      // stdin (`curlJson` ends stdin synchronously after `execFile` returns).
+      queueMicrotask(() => {
+        const isList = record.stdin.includes('--request GET');
+        if (gateway.mode !== 'down' && isList) {
+          done(null, `[{"id":"secret-1","name":"Dropbox-MCP-Axis"}]\n200`, '');
+        } else if (gateway.mode === 'write-echoes') {
+          done(null, `${JSON.stringify({ error: 'rejected', request: record.stdin })}\n500`, '');
+        } else {
+          done(error, '', '');
+        }
+      });
       return {
         stdin: {
           on: () => undefined,
@@ -112,6 +135,7 @@ beforeEach(async () => {
   await initMigratedTestDb();
   invocations.length = 0;
   logged.length = 0;
+  gateway.mode = 'down';
   _resetMcpOAuthWarnStateForTesting();
 });
 
@@ -222,4 +246,55 @@ describe('a failed refresh publishes nothing sensitive', () => {
     expect(logged.length).toBeGreaterThan(0);
     for (const call of logged) expect(everyRendering(call)).not.toContain(SENTINEL);
   });
+
+  // #911 item 1. The case above never exercised the access token: the list
+  // call fails first, so no curl invocation ever carried it. These make the
+  // write that carries it really happen, then fail it both ways.
+  const mintsAccessSentinel: FetchLike = async () =>
+    ({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: async () =>
+        JSON.stringify({
+          access_token: ACCESS_SENTINEL,
+          refresh_token: 'rt-2',
+          expires_in: 3600,
+          token_type: 'Bearer',
+        }),
+    }) as unknown as Response;
+
+  it.each(['write-fails', 'write-echoes'] as const)(
+    'keeps the ACCESS TOKEN out of argv, status_detail and every log call when the vault write %s',
+    async (mode) => {
+      gateway.mode = mode;
+      await seedDueIntegration();
+
+      const outcome = await refreshExpiringMcpOAuthIntegrations(mintsAccessSentinel);
+      expect(outcome.failed).toEqual([NAME]);
+
+      // Non-vacuous: the token really was sent, on stdin.
+      expect(invocations.some((call) => call.stdin.includes(ACCESS_SENTINEL))).toBe(true);
+      for (const call of invocations) expect(call.argv.join(' ')).not.toContain(ACCESS_SENTINEL);
+
+      const row = await getMcpOAuthIntegration(NAME);
+      expect(row?.status).toBe('error');
+      expect(row?.status_detail).toContain('OneCLI secret write failed');
+      expect(row?.status_detail ?? '').not.toContain(ACCESS_SENTINEL);
+
+      expect(logged.length).toBeGreaterThan(0);
+      for (const call of logged) expect(everyRendering(call)).not.toContain(ACCESS_SENTINEL);
+    },
+  );
+
+  it.each(['write-fails', 'write-echoes'] as const)(
+    'keeps the ACCESS TOKEN out of the error the writer throws when the vault write %s',
+    async (mode) => {
+      gateway.mode = mode;
+      const err = await putOnecliBearerSecret({ ...SPEC }, ACCESS_SENTINEL).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(invocations.some((call) => call.stdin.includes(ACCESS_SENTINEL))).toBe(true);
+      expect(everyRendering(err)).not.toContain(ACCESS_SENTINEL);
+    },
+  );
 });
