@@ -11,7 +11,8 @@ vi.mock('./llm.js', async (importOriginal) => ({
 import { callHaiku } from './llm.js';
 import { maybeRenameNewThread, retryPendingThreadTitles, _resetRenamedThreadsForTest } from './topic-title.js';
 
-const THREAD_ID = 'discord:11111111111111111:22222222222222222:33333333333333333';
+const OPENER_ID = '33333333333333333';
+const THREAD_ID = `discord:11111111111111111:22222222222222222:${OPENER_ID}`;
 
 async function setupDb(): Promise<void> {
   await initTestDb();
@@ -57,7 +58,7 @@ describe('maybeRenameNewThread — durable idempotency (migration 062)', () => {
   });
 
   it('titles a genuinely new thread once', async () => {
-    await maybeRenameNewThread('discord', THREAD_ID, 'first message about EXAMPLE-1 rollout');
+    await maybeRenameNewThread('discord', THREAD_ID, 'first message about EXAMPLE-1 rollout', OPENER_ID);
     await waitUntil(() => fetchMock.mock.calls.length > 0);
 
     expect(callHaiku).toHaveBeenCalledTimes(1);
@@ -69,7 +70,7 @@ describe('maybeRenameNewThread — durable idempotency (migration 062)', () => {
 
   it('does NOT re-title an already-titled thread when a new session is created for it (the archival regression)', async () => {
     // First message on a brand-new thread — titles successfully.
-    await maybeRenameNewThread('discord', THREAD_ID, 'first message about EXAMPLE-1 rollout');
+    await maybeRenameNewThread('discord', THREAD_ID, 'first message about EXAMPLE-1 rollout', OPENER_ID);
     await waitUntil(async () => (await getThreadTitleRow(THREAD_ID))?.title != null);
     expect(callHaiku).toHaveBeenCalledTimes(1);
 
@@ -80,7 +81,7 @@ describe('maybeRenameNewThread — durable idempotency (migration 062)', () => {
     // maybeRenameNewThread again with created=true — but this text is a
     // FOLLOW-UP, not the thread's original opener.
     _resetRenamedThreadsForTest();
-    await maybeRenameNewThread('discord', THREAD_ID, 'a totally unrelated follow-up message weeks later');
+    await maybeRenameNewThread('discord', THREAD_ID, 'a totally unrelated follow-up message weeks later', OPENER_ID);
     // Give the (non-existent) second attempt a chance to run before asserting
     // it never did.
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -94,10 +95,22 @@ describe('maybeRenameNewThread — durable idempotency (migration 062)', () => {
     expect(row?.first_message).toBe('first message about EXAMPLE-1 rollout');
   });
 
+  it('does NOT title a thread the inbound message did not open (bot-opened or pre-existing thread)', async () => {
+    // A reply inside a thread the bot opened under its own post: the thread id
+    // is the bot post's snowflake, the reply has its own. No thread_titles row
+    // exists, and the router still calls in because the reply created a session.
+    await maybeRenameNewThread('discord', THREAD_ID, 'first human reply in a watcher thread', '44444444444444444');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(callHaiku).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await getThreadTitleRow(THREAD_ID)).toBeUndefined();
+  });
+
   it('resolves the sibling bot token for a discord-<suffix> channelType', async () => {
     process.env.DISCORD_BOT_TOKEN_EXAMPLE_AGENT = 'sibling-token';
     try {
-      await maybeRenameNewThread('discord-example-agent', THREAD_ID, 'sibling thread opener');
+      await maybeRenameNewThread('discord-example-agent', THREAD_ID, 'sibling thread opener', OPENER_ID);
       await waitUntil(() => fetchMock.mock.calls.length > 0);
 
       expect(fetchMock).toHaveBeenCalledTimes(1);

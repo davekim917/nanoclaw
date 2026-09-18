@@ -206,12 +206,25 @@ export async function maybeRenameNewThread(
   channelType: string,
   threadPlatformId: string | null,
   firstMessageText: string,
+  inboundMessageId: string,
 ): Promise<void> {
   if (!threadPlatformId) return;
   // Only Discord for now. Slack creates threads from the parent
   // message's ts (no rename possible without message edit). Telegram
   // is threadless. Others: add when they ship.
   if (!channelType.startsWith('discord')) return;
+
+  // Title only a thread that THIS message opened. A thread started from a
+  // message shares that message's snowflake (see installMessageThreadAutoCreate
+  // in src/channels/discord.ts), so the adapter's auto-thread on a root
+  // @mention has id === the @mention's id. Every other thread already has a
+  // name someone chose: a bot-opened one (keyed/task/turn anchors, named from
+  // the post's first line by installMessageThreadAutoCreate, or by
+  // discordCreateThread), a user-created one, or one titled before
+  // thread_titles existed. None of those has a thread_titles row, so without
+  // this check the first human reply in them — which creates a session —
+  // retitled the thread from that reply.
+  if (threadPlatformId.split(':').pop() !== inboundMessageId) return;
 
   // Durable idempotency check FIRST, before any other work: a thread that
   // already has a title must never be retitled — not across a host restart,
