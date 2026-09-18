@@ -25,7 +25,8 @@ const HAIKU_MODEL = 'claude-haiku-4-5-20251001';
 // Lazy-init proxy dispatcher — mirrors session-title-sweep.ts. Resolved on
 // first call so a service restart after env changes Just Works.
 let _envProxyDispatcher: Dispatcher | null | undefined;
-function getProxyDispatcher(): Dispatcher | null {
+/** The OneCLI gateway proxy dispatcher for host calls to external APIs, or null without proxy env. */
+export function getProxyDispatcher(): Dispatcher | null {
   if (_envProxyDispatcher !== undefined) return _envProxyDispatcher;
   const hasProxyEnv = !!(
     process.env['HTTPS_PROXY'] ||
