@@ -312,6 +312,15 @@ def lane_problems(run_dir, contract, jid, evidence, is_floor, files_must_exist=T
         there = (lambda e: _run_file_ok(run_dir, e)) if files_must_exist else (lambda e: True)
         if evidence == "browser" and not any(MEDIA_RE.search(e) and there(e) for e in cited):
             out.append((marker_rel, "a browser journey passes only on browser media (png/jpg/jpeg/webp/gif/mp4/webm) in the run"))
+        # The barrier's own floor rule (smoke-evidence-barrier.sh
+        # floor_evidence_problem: a `floor` lane's pass needs browser media
+        # unless its contract entry declares evidence api), held here too so a
+        # native-manual FLOOR journey's pass -- which that rule refuses without
+        # media -- never resets a clock the barrier would not let it reset.
+        # A native floor walk therefore needs media beside the tester's result
+        # until the floor rule learns a native declaration (follow-up).
+        if lane.get("kind") == "floor" and declared != "api" and not any(MEDIA_RE.search(e) and there(e) for e in cited):
+            out.append((marker_rel, "floor pass without browser evidence"))
         if evidence == "native-manual" and not any(e.startswith("manual-results/") and there(e) for e in cited):
             out.append((marker_rel, "a native-manual journey passes only on the named tester's recorded result under manual-results/ -- issuing the packet is `completed`, not `pass`"))
     return out

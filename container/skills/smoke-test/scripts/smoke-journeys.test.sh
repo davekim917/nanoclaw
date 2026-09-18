@@ -752,18 +752,23 @@ marker mobile-scan-return completed '["packet.md"]'
 expect 5c-native-floor-packet-issued '.ready == true' "$(barrier)"
 
 # --- 5e. PARITY: the barrier and cadence accept and reject the SAME passes ----
-# Every evidence entry, every evidence kind, through the REAL barrier (bash,
-# pass_evidence_problem / floor_evidence_problem / finding_clip_problem, plus
-# the journeys lane rule) and through last_proven (Python, files present), so
-# the two implementations cannot drift apart again: three review rounds of
-# #898 each found a pass the barrier refuses that cadence counted. Rows are
-# evidence lists; `V` is the kind's own valid citation (browser media, api
-# text, the tester's manual-results file). Expected: b=browser a=api n=native.
+# Every evidence entry, every evidence kind, for a lane that carries a PINNED
+# journey, through the REAL barrier (generic bash pass_evidence_problem /
+# floor_evidence_problem / finding_clip_problem, unchanged from before this
+# PR, plus the Python journeys lane rule) and through last_proven (the same
+# Python primitive, files present), so the two cannot drift apart again: three
+# review rounds of #898 each found a pass the barrier refuses that cadence
+# counted. Rows are evidence lists; `V` is the kind's own valid citation
+# (browser media, api text, the tester's manual-results file). Expected values
+# are per kind (b a n). A native FLOOR journey's pass needs media beside the
+# tester's result, because the generic floor rule (media unless api) is not
+# changed here -- a follow-up may add a native declaration.
 PARITY_PIN_WEB="$(CATALOGUE="$WORK/browser-floor.json" gate_pin "$WORK/lease5e-web" "$SHA" '["web/src/desk/a.tsx"]' 7 org__repo "" '--run-root /nonexistent')"
 PARITY_PIN_NATIVE="$(CATALOGUE="$WORK/native-floor.json" gate_pin "$WORK/lease5e-native" "$SHA" '[]' 7 org__repo "" '--unknown no-GO --run-root /nonexistent')"
 PARITY_ROOT="$WORK/parity"; mkdir -p "$PARITY_ROOT"
-parity_case() { # <kind b|a|n> <label> <evidence-json with V placeholder> <confirmedFindings-json or ""> <expected true|false>
-  local kind="$1" label="$2" ev="$3" findings="$4" want="$5" jid cat pin valid out_b out_c e
+parity_case() { # <kind b|a|n> <label> <evidence-json with V placeholder> <confirmedFindings-json or ""> <expected b> <expected a> <expected n>
+  local kind="$1" label="$2" ev="$3" findings="$4" want jid cat pin valid out_b out_c e
+  case "$kind" in b) want="$5" ;; a) want="$6" ;; n) want="$7" ;; esac
   case "$kind" in
     b) jid=loan-desk-checkout; cat="$WORK/browser-floor.json"; pin="$PARITY_PIN_WEB"; valid="desk.png"
        new_run '[{"id":"loan-desk-checkout","kind":"floor"},{"id":"branch-scope-crossing","kind":"floor","evidence":"api"}]'
@@ -791,26 +796,42 @@ parity_case() { # <kind b|a|n> <label> <evidence-json with V placeholder> <confi
   [ "$out_b" = "$want" ] || fail "5e-parity-expected $kind/$label: both said $out_b, table says $want for evidence $ev"
   printf '5e %s %-28s barrier=%s cadence=%s\n' "$kind" "$label" "$out_b" "$out_c" >&2
 }
-for kind in b a n; do
-  parity_case "$kind" valid-own-citation        '["V"]'                                                    ""       true
-  parity_case "$kind" skip-note-alone           '["clip-skipped: F1: no ffmpeg"]'                          '["F1"]' false
-  parity_case "$kind" skip-note-plus-valid      '["clip-skipped: F1: no ffmpeg","V"]'                      '["F1"]' true
-  parity_case "$kind" absolute                  '["/tmp/x.png"]'                                           ""       false
-  parity_case "$kind" traversal                 '["../other/x.png"]'                                       ""       false
-  parity_case "$kind" mixed-valid-plus-absolute '["V","/tmp/x.png"]'                                       ""       false
-  parity_case "$kind" mixed-valid-plus-traversal '["V","../x.png"]'                                        ""       false
-  parity_case "$kind" malformed-skip-note       '["clip-skipped: no finding here","V"]'                    ""       false
-  parity_case "$kind" skip-note-wrong-finding   '["clip-skipped: F2: no ffmpeg","V"]'                      '["F1"]' false
-  parity_case "$kind" empty                     '[]'                                                       ""       false
-  parity_case "$kind" finding-without-clip      '["V"]'                                                    '["F1"]' false
-  parity_case "$kind" finding-with-clip         '["clips/F1.mp4","V"]'                                     '["F1"]' true
+for kind in b a n; do #                                                                                       b     a     n
+  parity_case "$kind" valid-own-citation        '["V"]'                                                    ""       true  true  false
+  parity_case "$kind" skip-note-alone           '["clip-skipped: F1: no ffmpeg"]'                          '["F1"]' false false false
+  parity_case "$kind" skip-note-plus-valid      '["clip-skipped: F1: no ffmpeg","V"]'                      '["F1"]' true  true  false
+  parity_case "$kind" absolute                  '["/tmp/x.png"]'                                           ""       false false false
+  parity_case "$kind" traversal                 '["../other/x.png"]'                                       ""       false false false
+  parity_case "$kind" mixed-valid-plus-absolute '["V","/tmp/x.png"]'                                       ""       false false false
+  parity_case "$kind" mixed-valid-plus-traversal '["V","../x.png"]'                                        ""       false false false
+  parity_case "$kind" malformed-skip-note       '["clip-skipped: no finding here","V"]'                    ""       false false false
+  parity_case "$kind" skip-note-wrong-finding   '["clip-skipped: F2: no ffmpeg","V"]'                      '["F1"]' false false false
+  parity_case "$kind" empty                     '[]'                                                       ""       false false false
+  parity_case "$kind" finding-without-clip      '["V"]'                                                    '["F1"]' false false false
+  parity_case "$kind" finding-with-clip         '["clips/F1.mp4","V"]'                                     '["F1"]' true  true  true
 done
 # The kinds' own proof rules, cross-wise: media is not a tester's result and a
-# text file is not media -- for the barrier and for cadence alike.
-parity_case b api-text-is-not-media           '["api.txt"]'                    "" false
-parity_case b manual-result-is-not-media      '["manual-results/tester.md"]'   "" false
-parity_case n media-is-not-a-tester-result    '["desk.png"]'                   "" false
-parity_case a media-is-fine-for-api           '["desk.png"]'                   "" true
+# text file is not media -- for the barrier and for cadence alike; a native
+# floor walk with its result AND media clears both.
+parity_case b api-text-is-not-media           '["api.txt"]'                             "" false x x
+parity_case b manual-result-is-not-media      '["manual-results/tester.md"]'            "" false x x
+parity_case n media-is-not-a-tester-result    '["desk.png"]'                            "" x x false
+parity_case n result-plus-media               '["manual-results/tester.md","desk.png"]' "" x x true
+parity_case a media-is-fine-for-api           '["desk.png"]'                            "" x true x
+# A lane that carries NO journey keeps the generic barrier's behaviour, exactly
+# as before this PR: a pass citing only a well-formed skip note for its
+# confirmed finding clears, and a floor lane still needs browser media (a
+# tester's result alone does not clear it).
+GENERIC="$WORK/generic-run"; rm -rf "$GENERIC"; mkdir -p "$GENERIC/markers/" "$GENERIC/manual-results"
+jq -n --arg sha "$SHA" '{schemaVersion:2,runId:"generic-run",sourceSha:$sha,ownershipKind:"develop",coordinatorOwnerToken:null,
+  lanes:[{id:"G1",kind:"lane",generation:1},{id:"G2",kind:"floor",generation:1}],requiredLaneMarkers:["markers/G1.json","markers/G2.json"]}' > "$GENERIC/completion-contract.json"
+printf 'x' > "$GENERIC/manual-results/tester.md"; printf 'x' > "$GENERIC/desk.png"
+jq -n --arg sha "$SHA" '{sourceSha:$sha,lane:"G1",generation:1,status:"pass",completedAt:"2026-09-10T01:00:00Z",confirmedFindings:["F1"],evidence:["clip-skipped: F1: no ffmpeg"]}' > "$GENERIC/markers/G1.json"
+jq -n --arg sha "$SHA" '{sourceSha:$sha,lane:"G2",generation:1,status:"pass",completedAt:"2026-09-10T01:00:00Z",evidence:["desk.png"]}' > "$GENERIC/markers/G2.json"
+expect 5e-generic-skip-note-only-still-clears '.ready == true' "$(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$GENERIC" lanes || true)"
+jq '.evidence = ["manual-results/tester.md"]' "$GENERIC/markers/G2.json" > "$GENERIC/m.tmp"; mv "$GENERIC/m.tmp" "$GENERIC/markers/G2.json"
+expect 5e-generic-floor-still-needs-media '.ready == false and any(.invalidReasons[]; test("floor pass without browser evidence"))' \
+  "$(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$GENERIC" lanes || true)"
 
 # --- 6. capture recipes --------------------------------------------------------
 new_run '[{"id":"loan-desk-checkout","kind":"lane"}]'
