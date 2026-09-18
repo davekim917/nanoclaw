@@ -578,10 +578,10 @@ pinned range's unclaimed paths kept) and sends that as `pinFile`; while neither
 pin is valid the head is not offered. Gate, `pin-run` and barrier judge a pin
 and resolve its owner with one predicate (`smoke-journeys.py pin-check`; a
 recovery pin, once it exists, owns; a pin nobody can read is "unavailable",
-never invalid). Pins and contracts are integrity-checked against accidental
-corruption and cross-campaign mix-ups, not against the coordinator rewriting
-its own files; the challenger's `cmp` of the run selection against the gate pin
-and its review of the dispositions is the independence. No catalogue: no `journeys` key. At intake:
+never invalid). Pins guard against corruption and cross-campaign mix-ups, not a
+coordinator rewriting its own files; the challenger's `cmp` of run selection
+against gate pin, and its review of the dispositions, is the independence. No
+catalogue, or an ordinary (non-freeze) PR: no `journeys` key and no pin. At intake:
 
 1. `smoke-journeys.py pin-run <run-dir> <journeys.pinFile>` copies the pin and
    snapshot into `<run-dir>/journeys/`; workers and siblings read that copy,
@@ -602,7 +602,7 @@ and its review of the dispositions is the independence. No catalogue: no `journe
    `mapped-to-journey` or `new-journey` (+ `journeyId`, which must be a lane),
    `no-user-facing-consumer` (+ `changedBehaviour`, and `evidence[]` citing at
    least one file saved in the run, normally the search below), or `unresolved`
-   (+ `reason`), so uncertainty ends honestly. A glob added later erases nothing.
+   (+ `reason`). A glob added later erases nothing.
 4. **Search the source even when globs matched** — a broad glob (every
    migration → one journey) can hide a second consumer. For each changed backend
    route, payload field, taxonomy id or feature flag, search the web and native
@@ -637,8 +637,9 @@ gates. Issuing a packet is `completed`, never `pass`; `pass` needs the tester's
 recorded result under `<run-dir>/manual-results/`, filed against the journey id.
 
 `smoke-evidence-barrier.sh` enforces the **completeness** of all this — this
-campaign's own gate pin (repo + PR + head) held byte-for-byte by the run (skipping `pin-run` is a refusal, not
-a way out), a lane per matched journey, a valid disposition per frozen path,
+campaign's own gate pin (repo + PR + head), whenever the gate pinned one, held
+byte-for-byte by the run (skipping `pin-run` is then a refusal, not a way out),
+a lane per matched journey, a valid disposition per frozen path,
 the run's catalogue still hashing to its pin — and nothing about its truth.
 **Substance is the challenger's**: it reviews every exclusion and every
 backend/data scope disposition, and samples the positive matches — a broad glob
@@ -728,16 +729,13 @@ it. Changing the floor is a human's call — `publish` refuses one without
 also quietly shrink it.
 
 **Cadence is computed, not chosen.** Every entry past its `maxIntervalDays` is
-due, all of them — the ceiling is the deployment's own stated tolerance. If none
-is overdue, a standard or full campaign still owes the single
-least-recently-proven entry, and a light campaign owes nothing: walking the
-whole floor every campaign makes a walk nobody performs carefully, and a pure
-staleness budget leaves the mechanism cold for days. "Last proven" is read off
-the run root, not a ledger: the newest `pass` marker carrying the lane id, and
-only one that carries proof — browser media, or a run whose contract declared
-that lane `evidence: api` — judged by the barrier's own lane rule for the
-journey's declared evidence, so a pass the barrier would refuse resets nothing.
-**Unknown history is not fresh history**: with no
+due, all of them. If none is overdue, a standard or full campaign still owes
+the single least-recently-proven entry, and a light campaign owes nothing (a
+flat sweep breeds rote walks; a pure staleness budget sits cold for days).
+"Last proven" is read off the run root, not a ledger: the newest `pass` marker
+carrying the lane id, and only one that carries proof — browser media, or a run
+whose contract declared that lane `evidence: api` — so a pass the barrier would
+refuse resets nothing. **Unknown history is not fresh history**: with no
 readable run root (unset, or a missing mount) every floor journey is due, at any
 size. The gate reports the answer as `journeys.floor`; recompute it any time:
 
@@ -816,9 +814,9 @@ because it is the same failure wearing a different name:
   `evidence: "api"` — the barrier enforces both, so a published run without them
   means the barrier was bypassed, not that the entry was legitimately API-only.
 - **The cross-run sweep is the one that matters.** `floor-due` as of now: any
-  entry overdue, or never proven, is a live coverage breach no matter how many
-  green runs sit on top of it. That is what surfaces a money-adjacent flow
-  tested once in seventy-four campaigns in the week it goes stale.
+  entry overdue, or never proven, is a live coverage breach however many green
+  runs sit on top of it — the once-in-seventy-four flow caught the week it
+  goes stale.
 - **Post count is unchanged.** A floor lane is a browser lane; the posting
   contract already accounts for it.
 
@@ -1045,11 +1043,12 @@ markers elsewhere in this file applies here too, and the flag is optional
 
 ### Contact sheet
 
-At kickoff, once previews are live, capture the selected journeys' screens at
-desktop and phone width into one labelled image. `smoke-journeys.py shots
-<run-dir>` prints the matched journeys' `captureRecipes` (`name`, `path`,
-click/wait `steps`) as `shots.json`; a journey's English steps are never fed to
-the capture script.
+At kickoff, once previews are live, capture every diff-touched screen at
+desktop and phone width into one labelled image. When this run has a pinned
+journey selection, capture the matched journeys' screens instead:
+`smoke-journeys.py shots <run-dir>` prints their `captureRecipes` (`name`,
+`path`, click/wait `steps`) as `shots.json` (it refuses a run with no pin); a
+journey's English steps are never fed to the capture script.
 `smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> <source-sha>
 [baseline-url] [baseline-auth-state.json]`
 — pass the campaign's frozen `sourceSha` as the fourth argument so
@@ -1215,9 +1214,12 @@ line. That is a real environment gap worth fixing, not a per-claim excuse.
 **`claim absent` is cross-checked against the diff, never taken on the PR's
 word.** The cheapest compliant PR body is one that states nothing, and nothing
 used to notice. Before recording `claim absent`, check whether the change has a
-user-facing consumer: any `changed` journey in the run's pinned selection, any
-scope disposition other than `no-user-facing-consumer`, or — with no catalogue —
-any frontend, template, copy, or served-payload path in the diff. If it does:
+user-facing consumer. With a pinned journey selection: any `changed` journey in
+it, or any scope disposition other than `no-user-facing-consumer`. Without one
+(an ordinary PR, or no catalogue): whether the diff touched user-facing surface
+(the frontend path prefixes this deployment already configures for deploy-lag
+scoping are the same prefixes that matter here, plus any template, copy, or
+served-payload change). If it does:
 
 - `claim absent` is still the honest verdict for THIS lane — the lane reports
   what the PR stated, and it must not invent claims (see anti-ceremony below).
@@ -1261,7 +1263,8 @@ any frontend, template, copy, or served-payload path in the diff. If it does:
 - **Every `claim absent` result on a change with a user-facing consumer
   carries the `(unstated user-facing change: …)` note and a matching widening
   of the UI adversary's manifest scope.** A bare `claim absent` next to matched
-  journeys is the failure this cross-check exists to surface.
+  journeys, or a diff full of frontend paths, is the failure this cross-check
+  exists to surface.
 - **Row count against a reread.** Compare the claim table against a manual
   reread of the frozen intent files: a claim present in the text but missing
   from the table is a silently dropped claim, and the lane failed at extraction
@@ -2188,8 +2191,8 @@ which is complete (a rename appears as both its old and new path);
 baseline, a malformed comparison, a truncated or unreadable tree, a failed
 fetch) means the range is **unknown**: `campaignSize` is `full` and `reason` says why. It does not
 block the campaign. **Quote this range** — for the manifest and any range shown
-to a human — never one re-derived by hand. Journey selection (§2) already
-consumes it and nothing else; an unknown range selects `full`, never nothing.
+to a human — never one re-derived by hand. Journey selection (§2) consumes it
+too.
 
 #### Freeze intake: read the bound preview's deploy log first
 
