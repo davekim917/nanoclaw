@@ -555,9 +555,14 @@ done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 # own name.
 JOURNEY_LEASE_DIR="${SMOKE_GATE_LEASE_DIR:-${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases}"
 # The run directory's OWN name is the run id; the contract's runId is checked
-# against it (the scaffold writes `basename "$RUN_DIR"`), so a borrowed runId
-# borrows nothing.
-JOURNEY_RUN_NAME="$(basename "$(realpath -e "$RUN_DIR" 2>/dev/null || printf '%s' "$RUN_DIR")")"
+# against it, so a borrowed runId borrows nothing. Derived exactly as the
+# scaffold derives it — the UNRESOLVED `basename "$RUN_DIR"` (its fence
+# smoke-run-scaffold.sh:199, the contract's runId :532, adopt :769) — never
+# through realpath: a run dir reached through a symlink (run-alias →
+# run-storage) is fenced, written and adopted as run-alias, and resolving it
+# here rejected that legitimate contract (#898 review 11). File checks keep
+# their canonical paths (_run_file_ok resolves under the real run root).
+JOURNEY_RUN_NAME="$(basename "$RUN_DIR")"
 journeys_result="$(python3 "$SCRIPT_DIR/smoke-journeys.py" barrier "$RUN_DIR" \
   --lease-dir "$JOURNEY_LEASE_DIR" --run-id "$JOURNEY_RUN_NAME" 2>/dev/null)" || journeys_result=""
 if ! jq -e '(.missing | type == "array") and (.invalid | type == "array") and (.invalidReasons | type == "array")' \

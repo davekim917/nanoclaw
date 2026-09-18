@@ -300,7 +300,15 @@ def lane_problems(run_dir, contract, jid, evidence, is_floor, files_must_exist=T
         out.append((sel_rel, "journey {} declares evidence api but its lane was not scaffolded `--evidence {}=api`; regenerate the contract with it".format(jid, jid)))
     marker = _read_json(os.path.join(run_dir, marker_rel))
     if isinstance(marker, dict) and marker.get("status") == "pass":
-        cited = [e for e in (marker.get("evidence") or []) if isinstance(e, str)]
+        # ONE evidence rule in two halves: (a) citation validity -- a relative,
+        # in-run path that is a path at all (not a skip note) -- applied ALWAYS,
+        # by the barrier and by cadence; (b) file existence -- the barrier's
+        # only, because media retention prunes old runs. Before the split a
+        # browser-floor pass citing only `clip-skipped: F1: … capture.webm`
+        # matched the media extension once existence was relaxed, so cadence
+        # counted a walk the barrier refuses and the next light campaign
+        # omitted a still-unproven floor journey (#898 review 11).
+        cited = [e for e in (marker.get("evidence") or []) if _citation_ok(e)]
         there = (lambda e: _run_file_ok(run_dir, e)) if files_must_exist else (lambda e: True)
         if evidence == "browser" and not any(MEDIA_RE.search(e) and there(e) for e in cited):
             out.append((marker_rel, "a browser journey passes only on browser media (png/jpg/jpeg/webp/gif/mp4/webm) in the run"))
@@ -821,10 +829,22 @@ def cmd_shots(args):
 
 # --- barrier ----------------------------------------------------------------
 
+def _citation_ok(rel):
+    """Whether a pass marker's evidence entry is a CITATION of a run file at
+    all, by the grammar smoke-evidence-barrier.sh parses it with: the one
+    non-path form is a `clip-skipped: <finding>: <reason>` note (its `case
+    clip-skipped:*` branch, smoke-evidence-barrier.sh:184-188, and the floor
+    rule's `startswith("clip-skipped: ") | not`, :361-364), and a path is
+    relative and inside the run -- no absolute path, no `..` (:192). Says
+    nothing about whether the file is there; that is _run_file_ok's."""
+    return (_is_text(rel) and not rel.startswith("clip-skipped:")
+            and not os.path.isabs(rel) and ".." not in rel.split("/"))
+
+
 def _run_file_ok(run_dir, rel):
     """A cited evidence file must be a real, non-empty regular file inside the
     run -- the same bar smoke-evidence-barrier.sh sets for pass evidence."""
-    if not _is_text(rel) or os.path.isabs(rel) or ".." in rel.split("/"):
+    if not _citation_ok(rel):
         return False
     root = os.path.realpath(run_dir)
     candidate = os.path.join(run_dir, rel)

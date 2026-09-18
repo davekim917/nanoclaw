@@ -199,8 +199,20 @@ expect 3-mislabelled-api-pass-no-reset '.overdue == true and .lastProvenAt == nu
 floor_run r4 2026-09-09T18:00:00Z '["desk.png"]' "" loan-desk-checkout "$(printf 'c%.0s' $(seq 40))"
 expect 3-foreign-marker-no-reset '.overdue == true and .lastProvenAt == null' "$(due_browser)"
 floor_run r5 2026-09-09T18:00:00Z '["desk.png"]' "" loan-desk-checkout
+# (r5 never creates desk.png: a real relative media citation whose file
+# retention has since pruned still counts -- existence is the barrier's half.)
 expect 3-real-browser-pass-resets '.overdue == false and .lastProvenAt == "2026-09-09T18:00:00Z"' "$(due_browser)"
 rm -rf "$ROOT/r3" "$ROOT/r4" "$ROOT/r5"
+# CITATION VALIDITY IS NOT RELAXED with existence: a skip note that happens to
+# end in a media extension, an absolute path, or a traversal is not a citation
+# of run media, so it proves nothing and resets nothing.
+floor_run r5a 2026-09-09T18:00:00Z '["clip-skipped: F1: could not record capture.webm"]' "" loan-desk-checkout
+expect 3-skip-note-no-reset '.overdue == true and .lastProvenAt == null' "$(due_browser)"
+floor_run r5b 2026-09-09T18:00:00Z '["/tmp/desk.png"]' "" loan-desk-checkout
+expect 3-absolute-path-no-reset '.overdue == true and .lastProvenAt == null' "$(due_browser)"
+floor_run r5c 2026-09-09T18:00:00Z '["../other-run/desk.png"]' "" loan-desk-checkout
+expect 3-traversal-no-reset '.overdue == true and .lastProvenAt == null' "$(due_browser)"
+rm -rf "$ROOT/r5a" "$ROOT/r5b" "$ROOT/r5c"
 # ...and the barrier's COMPLETE pass bar: a pass citing nothing, or a marker
 # whose sourceSha is missing on both sides (null == null), proves nothing.
 floor_run r6 2026-09-09T18:00:00Z '[]' api
@@ -609,6 +621,21 @@ if [ "$(id -u)" != 0 ]; then  # chmod still reads as root
 else
   echo "note: lease-dir permission fixtures skipped (running as root, chmod still reads)" >&2
 fi
+# A RUN DIR REACHED THROUGH A SYMLINK (run-alias → run-storage) is fenced,
+# written and adopted as run-alias by the scaffold (basename, unresolved); the
+# barrier derives the same id. Ordinary, no pin ⇒ ready and byte-identical to
+# the no-pin answer; with a pin ⇒ enforced.
+ALIAS_RUN="$WORK/run-storage"; mkdir -p "$ALIAS_RUN/markers"; ln -s "$ALIAS_RUN" "$WORK/run-alias"
+jq -n --arg sha "$SHA" '{schemaVersion:2,runId:"run-alias",sourceSha:$sha,pr:7,repoSlug:"org__repo",
+  coordinatorOwnerToken:"owner-1",ownershipKind:"pr",lanes:[{id:"A1",kind:"lane",generation:1}],
+  requiredLaneMarkers:["markers/A1.json"]}' > "$ALIAS_RUN/completion-contract.json"
+jq -n --arg sha "$SHA" '{sourceSha:$sha,lane:"A1",generation:1,status:"blocked",completedAt:"2026-09-10T01:00:00Z",evidence:[]}' > "$ALIAS_RUN/markers/A1.json"
+[ "$(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$WORK/run-alias" lanes)" = "$NO_PIN_PR_OUT" ] ||
+  fail "5b-symlinked-run-dir-ordinary: not byte-identical to the no-pin answer: $(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$WORK/run-alias" lanes || true)"
+[ "$(no_catalogue env SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$WORK/run-alias" lanes)" = "$NO_PIN_PR_OUT" ] ||
+  fail "5b-symlinked-run-dir-ordinary-no-catalogue: not byte-identical"
+expect 5b-symlinked-run-dir-pinned '.ready == false and any(.invalidReasons[]; test("never adopted it") and test("pin-run"))' \
+  "$(SMOKE_GATE_LEASE_DIR="$GATE_LEASES" bash "$BARRIER" "$WORK/run-alias" lanes || true)"
 # A leaf symlink where the pin should be is INVALID, never followed and never "absent".
 LINK_LEASES="$WORK/leaf-link-leases"; share_lease "$LINK_LEASES" 7
 LINK_PIN="$(gate_pin "$WORK/leaf-link-src" "$SHA" '["web/src/desk/a.tsx"]')"
@@ -679,6 +706,9 @@ bf_run floor; marker loan-desk-checkout pass '["api.txt"]'
 expect 5c-browser-pass-needs-media '.ready == false and any(.invalidReasons[]; test("browser"))' "$(barrier)"
 bf_run floor; marker loan-desk-checkout pass '["desk.png"]'
 expect 5c-browser-floor-pass '.ready == true' "$(barrier)"
+# The skip note that fooled cadence (section 3) is refused here too: not a citation.
+bf_run floor; marker loan-desk-checkout pass '["clip-skipped: F1: could not record capture.webm"]'
+expect 5c-skip-note-is-not-media '.ready == false and any(.invalidReasons[]; test("browser"))' "$(barrier)"
 # The media bar is the JOURNEY's, not the lane kind's: a non-floor browser
 # journey cannot pass on a text file either, nor on media that is not there.
 new_run '[{"id":"loan-desk-checkout","kind":"lane"}]'; adopt "$PIN_FILE" >/dev/null
