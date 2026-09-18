@@ -38,6 +38,33 @@ function getDb(): Database | null {
   }
 }
 
+/**
+ * When sibling copies of one conversation pool into one.
+ *
+ * In a workgroup each sibling bot archives the same conversation under its
+ * own channel_type (`slack-acme`, `slack-acme-codex`, ...). Those multi-bot
+ * types reuse the base platform's adapter, which emits a platform_id carrying
+ * the BASE prefix (`slack:C123`) for every bot — `namespacedPlatformId` in
+ * src/platform-id.ts. That prefix is the evidence two rows are one
+ * conversation: pool on it, and only on it. Native adapters (WhatsApp,
+ * Signal, iMessage) emit unprefixed ids, and `whatsapp` / `whatsapp-cloud`
+ * are distinct platforms, not base and variant (`isChannelVariant`,
+ * src/types.ts) — those rows keep matching on their exact channel_type.
+ */
+export function channelFamily(channelType: string): string {
+  const dash = channelType.indexOf('-');
+  return dash > 0 ? channelType.slice(0, dash) : channelType;
+}
+
+export function isPooled(channelType: string, platformId: string): boolean {
+  return platformId.startsWith(`${channelFamily(channelType)}:`);
+}
+
+/** isPooled in SQL, over the row aliased `t`. */
+const POOLED_SQL = (t: string): string =>
+  `substr(${t}.platform_id, 1, instr(${t}.channel_type || '-', '-')) = ` +
+  `substr(${t}.channel_type, 1, instr(${t}.channel_type || '-', '-') - 1) || ':'`;
+
 function sanitizeFtsQuery(q: string): string {
   // FTS5 treats space-separated terms as implicit AND. For chat-sized
   // messages that's far too strict — "docker container build" almost
@@ -119,7 +146,14 @@ export const searchThreadsTool: McpToolDefinition = {
            )
            SELECT
              a.thread_id,
-             COALESCE(MAX(CASE WHEN a.channel_type = $own THEN a.channel_type END), MIN(a.channel_type)) AS channel_type,
+             CASE WHEN ${POOLED_SQL('a')}
+               THEN COALESCE(
+                 (SELECT b.channel_type FROM messages_archive b
+                   WHERE b.channel_type = $own AND b.platform_id = a.platform_id AND b.thread_id IS a.thread_id
+                   LIMIT 1),
+                 MIN(a.channel_type))
+               ELSE MIN(a.channel_type)
+             END AS channel_type,
              MAX(a.channel_name) AS channel_name,
              a.platform_id,
              MAX(a.sent_at) AS latest_message_at,
@@ -131,11 +165,8 @@ export const searchThreadsTool: McpToolDefinition = {
               LIMIT 1) AS first_snippet
            FROM messages_archive a
            JOIN matches m ON m.rowid = a.rowid
-           -- One row per thread. Sibling agents in a workgroup archive the
-           -- same thread under their own adapter's channel_type
-           -- (slack-<group>), so grouping on channel_type listed one thread
-           -- once per sibling. platform_id is already platform-qualified.
-           GROUP BY a.platform_id, a.thread_id
+           -- One row per conversation: sibling copies pool, see POOLED_SQL.
+           GROUP BY CASE WHEN ${POOLED_SQL('a')} THEN '' ELSE a.channel_type END, a.platform_id, a.thread_id
            ORDER BY best_score ASC
            LIMIT $limit`,
         )
@@ -382,11 +413,11 @@ export const readThreadTool: McpToolDefinition = {
       );
     }
 
-    // Sibling agents in a workgroup archive the same channel under their own
-    // adapter's channel_type (slack-<group>). Match the whole platform family
-    // so the transcript includes every sibling's rows, not only this copy.
-    const family = routing.channelType.split('-')[0];
-    const familyLike = `${family}-%`;
+    // Pooled conversations read every sibling's copy (see isPooled); anything
+    // else reads exactly its own channel_type.
+    const pooled = isPooled(routing.channelType, routing.platformId);
+    const family = pooled ? channelFamily(routing.channelType) : routing.channelType;
+    const familyLike = pooled ? `${family}-%` : null; // LIKE NULL never matches
 
     let resolvedThreadId = threadId;
     if (!resolvedThreadId) {

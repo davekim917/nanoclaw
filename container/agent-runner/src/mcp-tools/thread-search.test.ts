@@ -326,6 +326,55 @@ describe('thread-search workgroup-pooled tests', () => {
     expect(text).not.toContain('unrelated discord message');
   });
 
+  it('never pools distinct platforms that share an unprefixed id (whatsapp vs whatsapp-cloud)', async () => {
+    for (const [i, channelType] of ['whatsapp', 'whatsapp-cloud'].entries()) {
+      insertMsg(sharedDb, {
+        id: `msg-wa-${i}`,
+        agent_group_id: `ag-wa-${i}`,
+        channel_type: channelType,
+        platform_id: '15550001111@s.whatsapp.net',
+        thread_id: null,
+        role: 'user',
+        sender_name: `wa${i}`,
+        text: `refund request number ${channelType}`,
+        sent_at: `2024-01-06T08:0${i}:00Z`,
+      });
+    }
+
+    expect(getText(await searchThreadsTool.handler({ query: 'refund request' }))).toMatch(/Found 2 thread/);
+    const text = getText(
+      await readThreadTool.handler({ channel_type: 'whatsapp', platform_id: '15550001111@s.whatsapp.net' }),
+    );
+    expect(text).toContain('refund request number whatsapp');
+    expect(text).not.toContain('refund request number whatsapp-cloud');
+  });
+
+  it("shows the caller's own copy even when only a sibling's reply matched", async () => {
+    getInboundDb().prepare("UPDATE session_routing SET channel_type = 'slack-acme' WHERE id = 1").run();
+    const rows: [string, string][] = [
+      ['slack-acme', 'hello team'],
+      ['slack-acme-codex', 'the quarterly forecast is ready'],
+    ];
+    for (const [i, [channelType, text]] of rows.entries()) {
+      insertMsg(sharedDb, {
+        id: `msg-own-${i}`,
+        agent_group_id: `ag-own-${i}`,
+        channel_type: channelType,
+        platform_id: 'slack:C902',
+        thread_id: 'slack:C902:t1',
+        role: 'assistant',
+        sender_name: `b${i}`,
+        text,
+        sent_at: `2024-01-07T08:0${i}:00Z`,
+      });
+    }
+
+    const text = getText(await searchThreadsTool.handler({ query: 'quarterly forecast' }));
+    expect(text).toMatch(/Found 1 thread/);
+    expect(text).toContain('slack-acme:slack:C902');
+    expect(text).not.toContain('slack-acme-codex');
+  });
+
   // -----------------------------------------------------------------------
   // D2.3: read_thread returns messages from both sibling agent_groups
   // -----------------------------------------------------------------------
