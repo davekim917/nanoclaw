@@ -815,12 +815,27 @@ export async function addDiscordThreadMembers(
   threadId: string,
   userIds: () => Promise<string[]> = discordOwnerUserIds,
 ): Promise<void> {
+  let ids: string[];
   try {
-    for (const userId of await userIds()) {
-      await rest.put(Routes.threadMembers(threadId, userId));
-    }
+    ids = await userIds();
   } catch (err) {
-    log.warn('Discord thread member add failed', { threadId, err: err instanceof Error ? err.message : String(err) });
+    log.warn('Discord thread member lookup failed', {
+      threadId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+  // Per user, so one owner outside this guild (10007) doesn't skip the rest.
+  for (const userId of ids) {
+    try {
+      await rest.put(Routes.threadMembers(threadId, userId));
+    } catch (err) {
+      log.warn('Discord thread member add failed', {
+        threadId,
+        userId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 }
 
@@ -879,7 +894,8 @@ export function installMessageThreadAutoCreate(
         }
         await rest.post(Routes.threads(channelId, messageId), { body: { name } });
         log.info('Discord thread opened under anchor message', { channelId, messageId });
-        await addThreadMembers(rest, messageId);
+        // Not awaited: best-effort, and the retried post shouldn't wait on it.
+        void addThreadMembers(rest, messageId);
       } catch (createErr) {
         if ((createErr as { code?: unknown }).code !== RESTJSONErrorCodes.ThreadAlreadyCreatedForMessage) {
           log.warn('Discord thread auto-create failed', {
@@ -1029,7 +1045,7 @@ for (const ws of workspaces) {
       bridge.postParent = (platformId, text) => discordPostParent(rest, platformId, text);
       bridge.createThread = async (platformId, parentMessageId, title, firstMessage) => {
         const created = await discordCreateThread(rest, platformId, parentMessageId, title, firstMessage);
-        await addDiscordThreadMembers(rest, created.threadId);
+        void addDiscordThreadMembers(rest, created.threadId);
         return created;
       };
       return bridge;

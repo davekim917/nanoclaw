@@ -766,6 +766,13 @@ describe('addDiscordThreadMembers', () => {
     ]);
   });
 
+  it('keeps adding later users after one fails', async () => {
+    const rest = { put: vi.fn().mockRejectedValueOnce(new Error('Unknown Member')).mockResolvedValue(undefined) };
+    await addDiscordThreadMembers(rest, 'thread1', async () => ['111', '222']);
+    expect(rest.put).toHaveBeenCalledTimes(2);
+    expect(rest.put.mock.calls[1][0]).toBe('/channels/thread1/thread-members/222');
+  });
+
   it('swallows a failure so the thread still works', async () => {
     const rest = { put: vi.fn().mockRejectedValue(new Error('Missing Access')) };
     await expect(addDiscordThreadMembers(rest, 'thread1', async () => ['111'])).resolves.toBeUndefined();
