@@ -1747,6 +1747,98 @@ journeys_fixture "$BACKEND_ONLY"
 export STUB_PR_FILES='[{"filename":"api/src/loans/period.ts"}]'
 bash "$GATE" check 13 | jq -e '.isFreezePr == false and (has("journeys") | not)' >/dev/null ||
   { echo "5k: an ordinary PR grew a journeys key" >&2; exit 1; }
+# --- 5l. ADMISSION: a manual `claim` of a freeze head pins exactly as `poll`
+# does (pin_freeze_head), BEFORE it takes ownership. `check` never pins, so
+# check-then-claim used to admit a freeze with both pin paths absent — and the
+# barrier read that as legacy "no pin". Ordinary PRs and no-catalogue installs
+# are untouched.
+pin_file() { printf '%s/range-pin-org__repo-pr-%s-%s.json' "$SMOKE_GATE_LEASE_DIR" "$1" "$2"; }
+journeys_fixture "$BACKEND_ONLY"
+bash "$GATE" check 13 | jq -e '.settled == true and .campaignRange.pinState == "absent" and .journeys.pinState == "absent"' >/dev/null
+[ ! -e "$(pin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ]
+T5L_CLAIM="$(bash "$GATE" claim run-manual-13 13 "$FREEZE_SHA")"
+jq -e '.ok == true and .runId == "run-manual-13" and .campaignRange.pinState == "valid" and
+  .campaignRange.baselinePinned == true and .journeys.pinned == true and .journeys.pinState == "valid" and
+  .journeys.selection == "matched" and .journeys.unmappedPaths == ["api/src/reports/export.ts"]' <<<"$T5L_CLAIM" >/dev/null ||
+  { echo "5l: a manual freeze claim did not pin: $T5L_CLAIM" >&2; exit 1; }
+[ -s "$(pin_file 13 "$FREEZE_SHA")" ] && [ -s "$(jpin_file 13 "$FREEZE_SHA")" ] ||
+  { echo "5l: the claim reported pins that are not on shared storage" >&2; exit 1; }
+[ "$(jq -c '.journeys' <<<"$T5L_CLAIM")" = "$(jq -c '.' "$(jpin_file 13 "$FREEZE_SHA")")" ] ||
+  { echo "5l: the claim's journeys are not the pinned bytes" >&2; exit 1; }
+jq -e '.repoSlug == "org__repo" and .pr == 13' "$SMOKE_GATE_LEASE_DIR/lease-run-manual-13.json" >/dev/null
+bash "$GATE" check 13 | jq -e '.campaignRange.pinState == "valid" and .journeys.pinState == "valid"' >/dev/null
+# A later claim of the same head READS the pins — no second promote, bytes unchanged.
+T5L_RPIN="$(cat "$(pin_file 13 "$FREEZE_SHA")")"; T5L_JPIN="$(cat "$(jpin_file 13 "$FREEZE_SHA")")"
+bash "$GATE" release run-manual-13 | jq -e '.ok == true' >/dev/null
+bash "$GATE" claim run-manual-13b 13 "$FREEZE_SHA" | jq -e '.ok == true and .journeys.pinned == true and .campaignRange.pinState == "valid"' >/dev/null
+[ "$(cat "$(pin_file 13 "$FREEZE_SHA")")" = "$T5L_RPIN" ] && [ "$(cat "$(jpin_file 13 "$FREEZE_SHA")")" = "$T5L_JPIN" ] ||
+  { echo "5l: a second claim re-promoted a pin" >&2; exit 1; }
+bash "$GATE" release run-manual-13b >/dev/null
+# ...and a claim after `poll` already pinned reads poll's bytes (poll's own
+# settled wake owns the slot, so its run is released first — a manual claim of
+# a pinned head is the recovery shape, not a second pinning).
+journeys_fixture "$BACKEND_ONLY"
+T5L_POLL="$(bash "$GATE" poll)"
+jq -e '.data.trigger == "pr_build_settled" and .data.journeys.pinned == true' <<<"$T5L_POLL" >/dev/null
+T5L_RPIN="$(cat "$(pin_file 13 "$FREEZE_SHA")")"; T5L_JPIN="$(cat "$(jpin_file 13 "$FREEZE_SHA")")"
+bash "$GATE" release "$(jq -r '.data.runId' <<<"$T5L_POLL")" "$(jq -r '.data.coordinatorOwnerToken' <<<"$T5L_POLL")" | jq -e '.ok == true' >/dev/null
+bash "$GATE" claim run-after-poll 13 "$FREEZE_SHA" | jq -e '.ok == true and .journeys.pinned == true' >/dev/null
+[ "$(cat "$(pin_file 13 "$FREEZE_SHA")")" = "$T5L_RPIN" ] && [ "$(cat "$(jpin_file 13 "$FREEZE_SHA")")" = "$T5L_JPIN" ] ||
+  { echo "5l: a claim after poll re-promoted a pin" >&2; exit 1; }
+# No shared pin storage: refused, and NOTHING is owned — no lease, no slot.
+# Pins and leases share one store (range_pin_store_readable is the read-only
+# twin of lease_dir_prepare), so a missing shared root is refused by claim's
+# lease preflight before admission even runs; admission's own refusal is the
+# same outcome, and either way no ownership is written.
+journeys_fixture "$BACKEND_ONLY"
+T5L_UNAVAIL="$(SMOKE_GATE_SHARED_ROOT="$STATE_DIR/missing" SMOKE_GATE_LEASE_DIR="$STATE_DIR/missing/leases" \
+  bash "$GATE" claim run-unavail 13 "$FREEZE_SHA" 2>/dev/null)"
+jq -e '.ok == false and .runId == "run-unavail" and (.error |
+  test("^freeze campaign not admitted: .*cannot be kept on shared storage") or test("^shared coordinator lease unavailable"))' <<<"$T5L_UNAVAIL" >/dev/null ||
+  { echo "5l: unavailable pin storage did not refuse the claim: $T5L_UNAVAIL" >&2; exit 1; }
+[ ! -e "$STATE_DIR/missing/leases/lease-run-unavail.json" ] &&
+  { [ ! -e "$STATE_DIR/pr-13-state.json" ] || jq -e '.activeRunId == null' "$STATE_DIR/pr-13-state.json" >/dev/null; } ||
+  { echo "5l: a refused claim still took ownership" >&2; exit 1; }
+# A matcher failure: the range pins, the journeys cannot — refused, nothing owned.
+journeys_fixture "$BACKEND_ONLY"
+cat > "$STUB_BIN/python3" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in *"smoke-journeys.py match "*) [ -z "${STUB_JOURNEYS_FAIL:-}" ] || exit 70 ;; esac
+exec /usr/bin/env -u STUB_JOURNEYS_FAIL "$REAL_PYTHON3" "$@"
+STUB
+chmod +x "$STUB_BIN/python3"
+export STUB_JOURNEYS_FAIL=1
+T5L_MATCH="$(bash "$GATE" claim run-matchfail 13 "$FREEZE_SHA" 2>/dev/null)"
+jq -e '.ok == false and (.error | test("^freeze campaign not admitted: its journey selection could not be pinned \\(journey matcher failed"))' <<<"$T5L_MATCH" >/dev/null ||
+  { echo "5l: a failed matcher did not refuse the claim: $T5L_MATCH" >&2; exit 1; }
+[ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-matchfail.json" ] ||
+  { echo "5l: a refused claim left a journeys pin or a lease" >&2; exit 1; }
+unset STUB_JOURNEYS_FAIL; rm -f "$STUB_BIN/python3"
+bash "$GATE" claim run-matchok 13 "$FREEZE_SHA" | jq -e '.ok == true and .journeys.pinned == true' >/dev/null
+# No catalogue: a freeze claim pins the range only; no `journeys` key, no journeys pin.
+journeys_fixture "$BACKEND_ONLY"
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/no-such-journeys.json"
+T5L_NOCAT="$(bash "$GATE" claim run-nocat 13 "$FREEZE_SHA")"
+jq -e '.ok == true and .campaignRange.pinState == "valid" and (has("journeys") | not)' <<<"$T5L_NOCAT" >/dev/null ||
+  { echo "5l: no-catalogue freeze claim: $T5L_NOCAT" >&2; exit 1; }
+[ -s "$(pin_file 13 "$FREEZE_SHA")" ] && [ ! -e "$(jpin_file 13 "$FREEZE_SHA")" ]
+# An ORDINARY PR, catalogue or not: the claim neither evaluates nor pins — its
+# output carries neither key and shared storage stays empty of pins.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'
+T5L_ORD="$(bash "$GATE" claim run-ordinary 13 "$FREEZE_SHA")"
+jq -e '.ok == true and .pr == 13 and (has("campaignRange") | not) and (has("journeys") | not)' <<<"$T5L_ORD" >/dev/null ||
+  { echo "5l: an ordinary claim changed shape: $T5L_ORD" >&2; exit 1; }
+[ -z "$(find "$SMOKE_GATE_LEASE_DIR" -name '*-pin-*' -print -quit)" ] || { echo "5l: an ordinary claim wrote a pin" >&2; exit 1; }
+# ...but a PR whose file list cannot be fetched is not KNOWN to be ordinary: refused.
+export STUB_PR_FILES_EXIT=1
+T5L_UNKNOWN="$(bash "$GATE" claim run-unknown-kind 14 "$FREEZE_SHA" || true)"
+jq -e '.ok == false and (.error | test("whether this head is a freeze is unknown"))' <<<"$T5L_UNKNOWN" >/dev/null ||
+  { echo "5l: a PR of unknown kind was admitted: $T5L_UNKNOWN" >&2; exit 1; }
+[ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-unknown-kind.json" ]
+unset STUB_PR_FILES_EXIT
+unset -f pin_file
+
 unset SMOKE_JOURNEYS_CATALOGUE
 unset -f range_case journeys_fixture jpin_file
 

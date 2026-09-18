@@ -564,11 +564,13 @@ A worker walks it from the catalogue alone, and a backend-only change selects
 the screens that consume it.
 
 For a freeze campaign the gate matches `campaignRange`'s file list against the
-catalogue and states the result as `journeys` in `check` and the
-`pr_build_settled` wake. It reads the **pinned** range paths and is pinned with
-them at the first settled poll — immutable, in the shared lease directory, with
-a sha256-named catalogue snapshot — so no catalogue edit, recovery wake or
-second coordinator changes a run's contract. An unusable catalogue (unreadable,
+catalogue and states the result as `journeys` in `check`, the
+`pr_build_settled` wake and a manual `claim`. It reads the **pinned** range
+paths and is pinned with them at admission — the first settled poll, or a
+manual `claim` of a freeze head, which pins before it takes ownership and
+refuses a head it cannot pin (`check` never pins) — immutable, in the shared
+lease directory, with a sha256-named catalogue snapshot — so no catalogue edit,
+recovery wake or second coordinator changes a run's contract. An unusable catalogue (unreadable,
 unparseable, or failing `validate`) selects nothing: nothing is pinned, the head
 is not offered that cycle, stderr names the errors, and the next poll retries.
 **The run never authors what it is held to.** If the primary pin is invalid its

@@ -1956,8 +1956,9 @@ journeys_select() {  # <pr> <head-sha> <determinable> <fail-reason> <paths-json>
   args=(--catalogue "$JOURNEYS_CATALOGUE" --size "$size" --run-root "${SMOKE_GATE_RUN_ROOT:-}")
   [ "$determinable" = true ] || args+=(--unknown "range not determinable: $fail_reason")
   [ "$state" = absent ] || args+=(--recover)
-  # Like the range pin's candidate: written only where `poll` can promote it.
-  if [ "$COMMAND" = poll ] && [ -n "${TMP_DIR:-}" ]; then
+  # Like the range pin's candidate: written only where it can be promoted —
+  # `poll` and a freeze `claim` own a TMP_DIR (pin_freeze_head); `check` never does.
+  if [ -n "${TMP_DIR:-}" ]; then
     candidate="$TMP_DIR/journeys-pin-$pr.json"
     snapshot_out="$TMP_DIR/journeys-catalogue-$pr.json"
     rm -f "$snapshot_out" "$candidate" 2>/dev/null
@@ -2022,6 +2023,77 @@ journeys_pin_promote() {  # <pr> <head-sha> <candidate> <snapshot-candidate> [re
   rm -f "$tmp" 2>/dev/null
   if [ -e "$f" ] || [ -L "$f" ]; then return 3; fi
   return 1
+}
+
+# --- THE admission step for a freeze head -----------------------------------
+# NO path admits a freeze campaign without its immutable range pin and, when
+# the install keeps a catalogue, its journeys pin. `poll` reaches this at the
+# first settled evaluation before it offers the head; a manual `claim` of a
+# freeze head reaches it before it takes the lease. Same evaluation, same
+# promote primitives, same outcome table — and the same silence otherwise:
+# `check` never pins, `lease-claim` cannot start a campaign (no PR slot, no
+# authority — the scaffold's fence refuses a run no state names), task leases
+# are never freeze campaigns. Before this step existed, `check` then a manual
+# `claim` admitted a freeze with both pin paths absent, and the barrier read
+# that as legacy "no pin" (#898 review 8; #896 listed the same gap for the
+# range pin as not covered).
+#
+# Operates on the caller's FACTS for (PR, HEAD_SHA), computed unlocked by
+# evaluate_pr with a TMP_DIR holding its candidates; called under the PR lock.
+# Leaves RANGE_PIN_CONFLICT=true and PIN_REFUSAL (the reason) when the head is
+# NOT admissible, else RANGE_PIN_CONFLICT=false and FACTS rewritten to carry
+# what is now pinned. By range pinState:
+#   valid       read from the pin — admit.
+#   invalid     unknown/full, unrecoverable — admit; nothing is promoted over it.
+#   absent      promote. rc 3: the path got occupied in between, so these
+#               fresh facts are not what the head is pinned to — drop the
+#               candidate; the next evaluation reads what is there. rc 1: no
+#               pin could be created — not admitted: an unpinned campaign is
+#               exactly what this exists to prevent.
+#   unavailable no shared pin storage — not admitted, said on stderr.
+# Then the journeys pin follows the range pin: valid/recovered are admitted as
+# read; absent/recovery-absent are promoted (the primary, or the recovery pin
+# beside an invalid primary; rc 3 or 1 drops the candidate); invalid (neither
+# pin usable) and unavailable are NOT admitted, said on stderr. No catalogue
+# means no `journeys` key and nothing to pin.
+pin_freeze_head() {
+  local journeys_kind journeys_pinned
+  RANGE_PIN_CONFLICT=false; PIN_REFUSAL=""
+  case "$(jq -r '.campaignRange.pinState // "absent"' <<<"$FACTS")" in
+    valid|invalid) ;;
+    absent)
+      if range_pin_promote "$PR" "$HEAD_SHA" "$TMP_DIR/range-pin-$PR.json"; then
+        # These facts ARE the pin now; say so, so the wake and every later
+        # read of this head are the same object.
+        FACTS="$(jq -c '.campaignRange.pinState="valid" | .campaignRange.baselinePinned=true' <<<"$FACTS")"
+      else
+        RANGE_PIN_CONFLICT=true
+        PIN_REFUSAL="the range pin for this head could not be written this cycle (the pin path was taken by another evaluation, or no pin could be created); re-run to read what is there"
+      fi ;;
+    *) RANGE_PIN_CONFLICT=true
+       PIN_REFUSAL="$(jq -r '.campaignRange.reason // "no shared range-pin storage"' <<<"$FACTS")"
+       printf 'smoke-pr-gate: freeze PR #%s is settled but not offered: %s\n' "$PR" "$PIN_REFUSAL" >&2 ;;
+  esac
+  if [ "$RANGE_PIN_CONFLICT" != true ] && [ "$(jq -r '(.journeys | type == "object")' <<<"$FACTS")" = true ]; then
+    journeys_kind=""
+    case "$(jq -r '.journeys.pinState // "absent"' <<<"$FACTS")" in
+      valid|recovered) ;;
+      absent|recovery-absent)
+        [ "$(jq -r '.journeys.pinState' <<<"$FACTS")" = absent ] || journeys_kind=recovery
+        if journeys_pin_promote "$PR" "$HEAD_SHA" "$TMP_DIR/journeys-pin-$PR.json" "$TMP_DIR/journeys-catalogue-$PR.json" "$journeys_kind" &&
+           journeys_pinned="$(jq -c --slurpfile j "$(journeys_pin_file "$PR" "$HEAD_SHA" "$journeys_kind")" '.journeys=$j[0]' <<<"$FACTS" 2>/dev/null)" &&
+           [ -n "$journeys_pinned" ]; then
+          FACTS="$journeys_pinned"
+        else
+          RANGE_PIN_CONFLICT=true
+          PIN_REFUSAL="its journey selection could not be pinned ($(jq -r '.journeys.reason // "the pin path was taken, or no pin could be written"' <<<"$FACTS"))"
+          printf 'smoke-pr-gate: freeze PR #%s is settled but not offered this cycle: %s\n' "$PR" "$PIN_REFUSAL" >&2
+        fi ;;
+      *) RANGE_PIN_CONFLICT=true
+         PIN_REFUSAL="$(jq -r '.journeys.reason // "no usable journeys pin"' <<<"$FACTS")"
+         printf 'smoke-pr-gate: freeze PR #%s is settled but not offered: %s\n' "$PR" "$PIN_REFUSAL" >&2 ;;
+    esac
+  fi
 }
 
 # --- Freeze-campaign baseline ------------------------------------------------
@@ -2426,11 +2498,12 @@ evaluate_pr() {
   campaign_size_reason="$(jq -r '.sizeReason' <<<"$size_out")"
 
   # The pin CANDIDATE for this evaluation: exactly the range-derived values
-  # emitted below, written where only `poll` can pick it up (its per-invocation
-  # TMP_DIR). This function runs unlocked and in a subshell, so it never writes
-  # a pin itself — `poll` promotes the candidate (range_pin_promote), and only
-  # for a settled head. `check` has no TMP_DIR and writes nothing.
-  if [ "$is_freeze" = true ] && [ "$range_pin_state" = absent ] && [ "$COMMAND" = poll ] && [ -n "${TMP_DIR:-}" ]; then
+  # emitted below, written where only an ADMITTING command can pick it up (its
+  # per-invocation TMP_DIR). This function runs unlocked and in a subshell, so
+  # it never writes a pin itself — `poll` (for a settled head) and a freeze
+  # `claim` promote the candidate through pin_freeze_head. `check` has no
+  # TMP_DIR and writes nothing.
+  if [ "$is_freeze" = true ] && [ "$range_pin_state" = absent ] && [ -n "${TMP_DIR:-}" ]; then
     jq -e 'type == "array"' <<<"$range_paths_json" >/dev/null 2>&1 || range_paths_json='[]'
     [ "$range_determinable" = true ] || range_paths_json='[]'
     # Range-sized values (the path list, the migration lists) NEVER travel in
@@ -2952,6 +3025,32 @@ if [ "$COMMAND" = "claim" ]; then
     jq -cn '{ok:false,error:"claim requires the 40-character frozen head SHA"}'
     exit 2
   fi
+  # ADMISSION. A freeze head is claimed only with its pins (pin_freeze_head):
+  # evaluate it here, unlocked, exactly as `poll` does, with a TMP_DIR for the
+  # candidates; the promotion happens under the PR lock below, right before
+  # the lease is taken, and a head that cannot be pinned is refused. Whether
+  # this IS a freeze head is read from the PR's own file list, the same fact
+  # evaluate_pr keys on — and if that cannot be fetched the claim is refused
+  # too, because "not known to be a freeze" is not "not a freeze". An ordinary
+  # PR pays one API call and is otherwise untouched.
+  CLAIM_FREEZE=false
+  CLAIM_PROBE="$(detect_freeze "$PR" "$SHA")"
+  if [ "$(jq -r '.filesOk' <<<"$CLAIM_PROBE")" != true ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg sha "$SHA" \
+      '{ok:false,error:"could not fetch the PR file list, so whether this head is a freeze is unknown — a freeze campaign is never admitted without its pins; retry",pr:$pr,runId:$run,sha:$sha}'
+    exit 1
+  fi
+  if [ "$(jq -r '.isFreezePr' <<<"$CLAIM_PROBE")" = true ]; then
+    CLAIM_FREEZE=true
+    TMP_DIR="$(mktemp -d)"
+    trap 'rm -rf "$TMP_DIR"' EXIT
+    CLAIM_FACTS="$(evaluate_pr "$PR" "$SHA")"
+    if [ "$(jq -r '.fetchOk' <<<"$CLAIM_FACTS")" != true ]; then
+      jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg sha "$SHA" \
+        '{ok:false,error:"freeze campaign not admitted: its facts are incomplete this call (a fetch failed), so its range cannot be pinned; retry",pr:$pr,runId:$run,sha:$sha}'
+      exit 1
+    fi
+  fi
   # Run ids must be unique across the WHOLE gate, not just within one PR's
   # state file — finish/progress/release resolve a bare run id by scanning
   # every pr-*-state.json for the first match (find_pr_for_run), so two PRs
@@ -3043,6 +3142,18 @@ if [ "$COMMAND" = "claim" ]; then
         activeSha:(if $sha == "" then null else $sha end)}'
     exit 0
   fi
+  # A freeze head is pinned — or refused — before any ownership is written;
+  # a head `poll` already pinned is read, never re-promoted (bytes unchanged).
+  if [ "$CLAIM_FREEZE" = true ]; then
+    FACTS="$CLAIM_FACTS"; HEAD_SHA="$SHA"
+    pin_freeze_head
+    if [ "$RANGE_PIN_CONFLICT" = true ]; then
+      jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg sha "$SHA" --arg why "$PIN_REFUSAL" \
+        '{ok:false,error:("freeze campaign not admitted: " + $why),pr:$pr,runId:$run,sha:$sha}'
+      exit 0
+    fi
+    printf '%s' "$FACTS" > "$TMP_DIR/claim-facts.json"
+  fi
   # The slot check above proves no OTHER RUN owns this PR. It cannot prove no
   # other CONTAINER is running THIS run — the per-PR flock is process-local to
   # one filesystem view and both coordinators pass it. Take the durable lease
@@ -3128,12 +3239,19 @@ if [ "$COMMAND" = "claim" ]; then
   fi
   lease_fence_end
   task_binding_lock_end
+  # A freeze claim carries what it admitted — the pinned range and journey
+  # selection, the same objects `poll`'s settled wake carries — through
+  # --slurpfile, never argv (range-sized; see the MAX_ARG_STRLEN note in
+  # evaluate_pr). An ordinary claim's output is unchanged.
   jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg sha "$SHA" --arg took "$TOOK_OVER" \
     --argjson lease "$(jq -c '.lease' <<<"$LEASE_RESULT")" \
     --arg deadline "$(jq -r '.challengerDeadline' <<<"$STATE")" \
+    --slurpfile facts <(if [ "$CLAIM_FREEZE" = true ]; then cat "$TMP_DIR/claim-facts.json"; else printf '{}'; fi) \
     '{ok:true,runId:$run,pr:$pr,sha:$sha,
       tookOverFrom:(if $took == "" then null else $took end),
-      lease:$lease,challengerDeadline:$deadline}'
+      lease:$lease,challengerDeadline:$deadline}
+     + (if ($facts[0] | has("campaignRange")) then {campaignRange:$facts[0].campaignRange} else {} end)
+     + (if ($facts[0] | has("journeys")) then {journeys:$facts[0].journeys} else {} end)'
   exit 0
 fi
 
@@ -4673,58 +4791,13 @@ while IFS= read -r ROW; do
       STATE_DIRTY=true
     fi
   fi
-  # Pin the freeze campaign's WHOLE range result to this head SHA at the first
-  # settled evaluation (see the STORAGE INVARIANT above range_pin_lookup).
-  # These FACTS were computed before the lock, so by pinState:
-  #   valid       read from the pin — offer.
-  #   invalid     unknown/full, unrecoverable — offer; nothing is promoted over it.
-  #   absent      promote. rc 3: the path got occupied in between, so these
-  #               fresh facts are not what the head is pinned to — drop the
-  #               candidate for one cycle; the next poll reads what is there.
-  #               rc 1: no pin could be created — not offered: an unpinned
-  #               campaign is exactly what this exists to prevent.
-  #   unavailable no shared pin storage — not offered, said on stderr.
+  # Pin the freeze campaign's WHOLE range result, then its journey selection,
+  # to this head SHA at the first settled evaluation — pin_freeze_head, the ONE
+  # admission step, shared with a manual freeze `claim` (see the STORAGE
+  # INVARIANT above range_pin_lookup). Not pinned ⇒ not offered this cycle.
   RANGE_PIN_CONFLICT=false
   if [ "$(jq -r '.isFreezePr == true and .settled == true' <<<"$FACTS")" = true ]; then
-    case "$(jq -r '.campaignRange.pinState // "absent"' <<<"$FACTS")" in
-      valid|invalid) ;;
-      absent)
-        if range_pin_promote "$PR" "$HEAD_SHA" "$TMP_DIR/range-pin-$PR.json"; then
-          # These facts ARE the pin now; say so, so the wake and every later
-          # read of this head are the same object.
-          FACTS="$(jq -c '.campaignRange.pinState="valid" | .campaignRange.baselinePinned=true' <<<"$FACTS")"
-        else
-          RANGE_PIN_CONFLICT=true
-        fi ;;
-      *) RANGE_PIN_CONFLICT=true
-         printf 'smoke-pr-gate: freeze PR #%s is settled but not offered: %s\n' "$PR" \
-           "$(jq -r '.campaignRange.reason // "no shared range-pin storage"' <<<"$FACTS")" >&2 ;;
-    esac
-  fi
-  # The journeys pin follows the range pin. valid/recovered are offered as
-  # read; absent/recovery-absent are promoted (the primary, or the recovery pin
-  # beside an invalid primary; rc 3 or 1 drops the candidate for this cycle);
-  # invalid (neither pin usable) and unavailable are NOT offered, said on stderr.
-  if [ "$RANGE_PIN_CONFLICT" != true ] &&
-     [ "$(jq -r '.isFreezePr == true and .settled == true and (.journeys | type == "object")' <<<"$FACTS")" = true ]; then
-    JOURNEYS_KIND=""
-    case "$(jq -r '.journeys.pinState // "absent"' <<<"$FACTS")" in
-      valid|recovered) ;;
-      absent|recovery-absent)
-        [ "$(jq -r '.journeys.pinState' <<<"$FACTS")" = absent ] || JOURNEYS_KIND=recovery
-        if journeys_pin_promote "$PR" "$HEAD_SHA" "$TMP_DIR/journeys-pin-$PR.json" "$TMP_DIR/journeys-catalogue-$PR.json" "$JOURNEYS_KIND" &&
-           JOURNEYS_PINNED="$(jq -c --slurpfile j "$(journeys_pin_file "$PR" "$HEAD_SHA" "$JOURNEYS_KIND")" '.journeys=$j[0]' <<<"$FACTS" 2>/dev/null)" &&
-           [ -n "$JOURNEYS_PINNED" ]; then
-          FACTS="$JOURNEYS_PINNED"
-        else
-          RANGE_PIN_CONFLICT=true
-          printf 'smoke-pr-gate: freeze PR #%s is settled but not offered this cycle: its journey selection could not be pinned (%s)\n' "$PR" \
-            "$(jq -r '.journeys.reason // "the pin path was taken, or no pin could be written"' <<<"$FACTS")" >&2
-        fi ;;
-      *) RANGE_PIN_CONFLICT=true
-         printf 'smoke-pr-gate: freeze PR #%s is settled but not offered: %s\n' "$PR" \
-           "$(jq -r '.journeys.reason // "no usable journeys pin"' <<<"$FACTS")" >&2 ;;
-    esac
+    pin_freeze_head
   fi
   if [ "$STATE_DIRTY" = true ]; then
     write_pr_state "$PR" "$STATE"
