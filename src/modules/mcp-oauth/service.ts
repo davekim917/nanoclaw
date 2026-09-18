@@ -47,7 +47,7 @@ import {
   upsertMcpOAuthIntegration,
   type McpOAuthIntegration,
 } from '../../db/mcp-oauth-integrations.js';
-import { updateContainerConfig } from '../../container-config.js';
+import { readContainerConfig, updateContainerConfig } from '../../container-config.js';
 import { log } from '../../log.js';
 import { assertHttpsEndpoint, discoverAuthorization, type FetchLike } from './discovery.js';
 import {
@@ -363,6 +363,15 @@ async function startLoginLocked(input: LoginInput, fetchImpl: FetchLike): Promis
     expires_at: existingRow?.expires_at ?? null,
     last_refresh_at: existingRow?.last_refresh_at ?? null,
   });
+  // A write parked by an earlier failure belongs to the grant this login is
+  // replacing, and to the secret name the row carried then — `--secret` may
+  // just have changed it. `removeIntegrationLocked` drops it for the same
+  // reason. Not reachable as a stale PATCH today (a parked write always leaves
+  // the row `error`, which the upsert above demotes to `pending`, which
+  // `decideRefresh` skips), so this makes the invariant local instead of
+  // resting on that status coupling. After the upsert, not before: a login that
+  // fails earlier has changed nothing and must not discard the retry.
+  pendingSecretWrites.delete(input.name);
 
   const base: LoginResult = {
     name: input.name,
@@ -735,6 +744,12 @@ async function completeLoginLocked(
 async function ensureSecretDeclared(agentGroupId: string, secretName: string): Promise<boolean> {
   const group = await getAgentGroup(agentGroupId);
   if (!group) return false;
+  // Read-only fast path. The refresh path calls this on every successful
+  // refresh, and `updateContainerConfig` rewrites the file unconditionally
+  // (`src/container-config.ts:1547`, in place — `:1427`), so without this an
+  // already-declared secret would cost a locked rewrite of container.json per
+  // refresh. The locked read-modify-write below still decides the real answer.
+  if ((readContainerConfig(group.folder).onecliSecrets ?? []).includes(secretName)) return false;
   let added = false;
   await updateContainerConfig(group.folder, (config) => {
     const current = config.onecliSecrets ?? [];
@@ -1146,6 +1161,23 @@ async function refreshOne(name: string, outcome: RefreshOutcome, fetchImpl: Fetc
       bearer_secret_id: secret.id,
       last_refresh_at: new Date().toISOString(),
     });
+    // The same tail `finalizeToken` and `retryPendingSecretWrite` run (#911
+    // item 3). `finalizeToken` marks the row `active` BEFORE it declares the
+    // secret, so a declaration that failed there (container.json locked or
+    // unwritable) left an active integration whose bearer the group is never
+    // granted — and nothing after it ever declared it again. Its failure is
+    // logged, not rethrown: the bearer is already in the vault, and falling
+    // into the handler below would mark the row `error`, which is due every
+    // tick (`decideRefresh`) — a fresh grant per minute for a config problem.
+    try {
+      await ensureSecretDeclared(row.agent_group_id, row.bearer_secret_name);
+    } catch (err) {
+      log.warn('MCP OAuth bearer refreshed but declaring it in container.json failed', {
+        integration: row.name,
+        secretName: row.bearer_secret_name,
+        err,
+      });
+    }
     outcome.refreshed.push(row.name);
     log.info('MCP OAuth access token refreshed', {
       integration: row.name,

@@ -191,6 +191,15 @@ export function assertIssuerMatches(declared: string | undefined, requested: str
   }
 }
 
+/**
+ * RFC 9728 §3.3: the protected-resource document's `resource` must cover the
+ * MCP URL — same origin, and a path that is equal to or a segment-boundary
+ * prefix of it.
+ *
+ * An origin-only `resource` (empty path) therefore covers EVERY path on that
+ * origin. Deliberate, and forced by Amplitude: it declares
+ * `https://mcp.amplitude.com` while serving MCP at `/mcp`.
+ */
 export function assertResourceMatchesMcpUrl(resource: string | undefined, mcpUrl: string): void {
   if (resource === undefined) return;
   let declared: URL;
@@ -198,6 +207,16 @@ export function assertResourceMatchesMcpUrl(resource: string | undefined, mcpUrl
     declared = new URL(resource);
   } catch (err) {
     throw new Error(`Protected-resource metadata declares an invalid resource "${resource}"`, { cause: err });
+  }
+  // `new URL` accepts any scheme, so a URN parses and would otherwise reach the
+  // origin comparison below (its origin is the string "null") and be reported
+  // as covering a different resource — true, but not the actual problem.
+  if (declared.protocol !== 'https:' && declared.protocol !== 'http:') {
+    throw new Error(
+      `Protected-resource metadata declares resource "${resource}", which is not a URL ` +
+        '(RFC 9728 §2 requires an https URL). Refusing: it cannot be matched against ' +
+        `${mcpUrl}.`,
+    );
   }
   const target = new URL(mcpUrl);
   const trim = (p: string) => p.replace(/\/+$/, '');

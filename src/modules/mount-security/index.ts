@@ -233,26 +233,52 @@ function isPathContainedOrContains(root: string, candidate: string): boolean {
   return !asAncestor.startsWith('..') && !path.isAbsolute(asAncestor);
 }
 
-function touchesManagedGitHooksRoot(realPath: string): boolean {
+/**
+ * Result of a protected-tree containment check: `touches` when the mount
+ * reaches the tree, `unverifiable` when DATA_DIR itself cannot be resolved (so
+ * the realpath half of the check cannot run — callers fail closed, with a
+ * reason that says so rather than claiming the mount reaches the tree), and
+ * `null` when the mount is clear of it.
+ */
+type ProtectedTreeHit = 'touches' | 'unverifiable' | null;
+
+/**
+ * Shared containment check for a directory directly under DATA_DIR, in three
+ * passes: lexical (works before the leaf exists), under DATA_DIR's realpath
+ * (catches a symlinked alias of DATA_DIR), and the LEAF's own realpath
+ * (#905 review round 3, #909) — resolving only DATA_DIR and appending the
+ * literal leaf component misses a leaf that is ITSELF a symlink to a
+ * directory elsewhere. Writes and reads through `path.join(DATA_DIR, leaf,
+ * …)` follow that symlink, so its target is where the files really are.
+ */
+function touchesDataDirLeaf(leaf: string, realPath: string): ProtectedTreeHit {
+  const leafLiteral = path.join(DATA_DIR, leaf);
+  if (isPathContainedOrContains(leafLiteral, realPath)) return 'touches';
+
+  const dataDirReal = getRealPath(DATA_DIR);
+  if (dataDirReal === null) return 'unverifiable';
+  const leafUnderRealDataDir = path.join(dataDirReal, leaf);
+  if (isPathContainedOrContains(leafUnderRealDataDir, realPath)) return 'touches';
+
+  // Only when the leaf exists — `getRealPath` returns null otherwise (its
+  // catch above), which is the pre-creation case the lexical check covers.
+  for (const candidate of [leafLiteral, leafUnderRealDataDir]) {
+    const leafReal = getRealPath(candidate);
+    if (leafReal !== null && isPathContainedOrContains(leafReal, realPath)) return 'touches';
+  }
+  return null;
+}
+
+function touchesManagedGitHooksRoot(realPath: string): ProtectedTreeHit {
   // Lexical comparison first (#666 review P3-6/"nudge" follow-up): this
   // never requires data/managed-git-hooks/ to exist on disk at all, so it
   // still refuses a mount aimed there even before the very first host
-  // restart that creates the directory (realpathSync on a not-yet-existing
-  // path throws, which the realpath-based check below has to route
-  // around; the lexical check has no such gap in the first place).
-  const managedRootLiteral = path.join(DATA_DIR, 'managed-git-hooks');
-  if (isPathContainedOrContains(managedRootLiteral, realPath)) return true;
-
-  // Realpath comparison, rooted at DATA_DIR's OWN realpath rather than
-  // managed-git-hooks/'s (#666 review P3-6: "DATA_DIR always exists, even
-  // when the leaf doesn't") — this is what a purely lexical check alone
-  // would miss: a read-write mount through a symlinked ALIAS of DATA_DIR
-  // (or of managed-git-hooks itself) resolves to the same real target
-  // without matching the literal string.
-  const dataDirReal = getRealPath(DATA_DIR);
-  if (dataDirReal === null) return true; // DATA_DIR itself unreadable — cannot verify, fail closed
-  const managedRootReal = path.join(dataDirReal, 'managed-git-hooks');
-  return isPathContainedOrContains(managedRootReal, realPath);
+  // restart that creates the directory. Then realpath, rooted at DATA_DIR's
+  // OWN realpath (#666 review P3-6: "DATA_DIR always exists, even when the
+  // leaf doesn't") to catch a symlinked alias of DATA_DIR, and finally the
+  // leaf's own realpath (#909): a `data/managed-git-hooks` that is itself a
+  // symlink would otherwise let a read-write mount of its target through.
+  return touchesDataDirLeaf('managed-git-hooks', realPath);
 }
 
 /**
@@ -278,28 +304,8 @@ function touchesManagedGitHooksRoot(realPath: string): boolean {
  * been created yet), and the realpath form catches a symlinked alias of
  * `DATA_DIR` that resolves onto the same target without matching the string.
  */
-function touchesMcpOAuthBundleRoot(realPath: string): boolean {
-  const bundleRootLiteral = path.join(DATA_DIR, 'mcp-oauth');
-  if (isPathContainedOrContains(bundleRootLiteral, realPath)) return true;
-
-  const dataDirReal = getRealPath(DATA_DIR);
-  if (dataDirReal === null) return true; // DATA_DIR itself unreadable — cannot verify, fail closed
-  const bundleUnderRealDataDir = path.join(dataDirReal, 'mcp-oauth');
-  if (isPathContainedOrContains(bundleUnderRealDataDir, realPath)) return true;
-
-  // And the LEAF's own realpath (#905 review round 3). Resolving only DATA_DIR
-  // and appending the literal `mcp-oauth` component leaves the case where
-  // `data/mcp-oauth` is ITSELF a symlink to a directory elsewhere: the bundle
-  // writes follow it (`store.ts` writes through `path.join(DATA_DIR,
-  // 'mcp-oauth', …)`, which the OS resolves), so the target is where the
-  // refresh tokens actually are, and nothing above compares against it. Only
-  // when the leaf exists — `getRealPath` returns null otherwise, which is the
-  // pre-creation case the lexical check already covers.
-  for (const candidate of [bundleRootLiteral, bundleUnderRealDataDir]) {
-    const leafReal = getRealPath(candidate);
-    if (leafReal !== null && isPathContainedOrContains(leafReal, realPath)) return true;
-  }
-  return false;
+function touchesMcpOAuthBundleRoot(realPath: string): ProtectedTreeHit {
+  return touchesDataDirLeaf('mcp-oauth', realPath);
 }
 
 /**
@@ -435,7 +441,7 @@ export function validateMount(mount: AdditionalMount): MountValidationResult {
   // scan-policy repo's push depends on, regardless of what the allowlist
   // otherwise permits. Read-only mounts of the same tree are unaffected —
   // the allowlist's normal root/pattern checks still apply to those.
-  if (mount.readonly === false && touchesManagedGitHooksRoot(realPath)) {
+  if (mount.readonly === false && touchesManagedGitHooksRoot(realPath) === 'touches') {
     return {
       allowed: false,
       reason: `Path "${realPath}" is read-write inside the host-managed git-hooks tree — refused unconditionally`,
@@ -449,10 +455,24 @@ export function validateMount(mount: AdditionalMount): MountValidationResult {
   // happens to permit `data/` is exactly the mistake this exists to survive.
   // Ordered AFTER that one so a read-write mount of DATA_DIR keeps reporting
   // the git-hooks reason its own cases pin — both refuse it either way.
-  if (touchesMcpOAuthBundleRoot(realPath)) {
+  const oauthHit = touchesMcpOAuthBundleRoot(realPath);
+  if (oauthHit === 'touches') {
     return {
       allowed: false,
       reason: `Path "${realPath}" reaches the MCP OAuth bundle directory (refresh tokens) — refused unconditionally`,
+    };
+  }
+
+  // DATA_DIR itself cannot be resolved, so neither protected tree's realpath
+  // check could run (#911 item 4). Still fail closed — a symlinked alias could
+  // reach either tree and nothing here can tell — but say why, rather than
+  // claiming an unrelated mount reaches the bundles. The OAuth check runs for
+  // every mount, and both checks share `touchesDataDirLeaf`, so this one
+  // branch covers the git-hooks case too.
+  if (oauthHit === 'unverifiable') {
+    return {
+      allowed: false,
+      reason: `DATA_DIR "${DATA_DIR}" cannot be resolved, so whether "${realPath}" reaches the MCP OAuth bundle directory or the managed git-hooks tree cannot be verified — refused (fail closed)`,
     };
   }
 
