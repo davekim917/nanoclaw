@@ -52,6 +52,7 @@ import type {
 } from './types.js';
 import { autoCommitDirtyWorktrees } from '../worktree-autosave.js';
 import { createManagedGitMaintenanceHook } from '../managed-git-guard.js';
+import { transcriptContainsUserText } from './claude-transcript-prompt.js';
 
 // Per D9 / D7 / A6: the runtime schema is compiler-checked against the SDK.
 export const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const satisfies readonly EffortLevel[];
@@ -2545,6 +2546,12 @@ export class ClaudeProvider implements AgentProvider {
    * and re-injects the real token values, so direct callers bypass the
    * OneCLI proxy and use process.env directly.
    */
+  transcriptHasPrompt(continuation: string | undefined, prompt: string): boolean {
+    if (!continuation) return false;
+    const transcriptPath = findTranscriptPath(continuation);
+    return transcriptPath !== null && transcriptContainsUserText(transcriptPath, prompt);
+  }
+
   rotateApiKey(): { rotated: boolean; slot?: string; position?: number; ringSize?: number } {
     const usingOauth = !this.env.ANTHROPIC_API_KEY && Boolean(this.env.CLAUDE_CODE_OAUTH_TOKEN);
     if (usingOauth) {
