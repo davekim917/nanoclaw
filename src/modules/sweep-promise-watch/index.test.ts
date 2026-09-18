@@ -8,6 +8,7 @@ import { latestOutboundChat } from '../mailbox/ops/recovery.js';
 import type { Session } from '../../types.js';
 import {
   _resetPromiseWatchForTesting,
+  admissible,
   candidateReason,
   fileCapStore,
   MAX_AGE_MS,
@@ -85,6 +86,22 @@ describe('candidateReason — only a quiet, unarmed, agent-last session is asked
     ['continuation-saved', session('s'), snap({ hasContinuation: true })],
   ] as const)('rejects %s', (reason, s, sn) => {
     expect(candidateReason(s, sn, NOW)).toBe(reason);
+  });
+});
+
+describe('admissible — the check inside the synchronous admission block', () => {
+  it('admits only the same message on a still-eligible, unowned session', () => {
+    expect(admissible(session('s'), false, snap(), 'msg-1', NOW)).toBe(true);
+  });
+
+  it.each([
+    ['session gone', undefined, false, 'msg-1'],
+    ['archived since the scan', session('s', { archived_at: iso(1000) }), false, 'msg-1'],
+    ['closed since the scan', session('s', { status: 'closed' }), false, 'msg-1'],
+    ['a container is spawning or running', session('s'), true, 'msg-1'],
+    ['a newer chat replaced the promise', session('s'), false, 'msg-older'],
+  ] as const)('refuses when %s', (_label, fresh, owns, messageId) => {
+    expect(admissible(fresh, owns, snap(), messageId, NOW)).toBe(false);
   });
 });
 
@@ -254,5 +271,13 @@ describe('helpers', () => {
     expect(fileCapStore(file).reserve('2026-09-19', 2)).toBe(true); // a new day starts over
     fs.writeFileSync(file, '{not json');
     expect(fileCapStore(file).reserve('2026-09-19', 2)).toBe(false);
+    for (const bad of [
+      { day: '2026-09-19', count: -100 },
+      { day: '2026-09-19', count: 1.5 },
+      { day: 'yesterday', count: 0 },
+    ]) {
+      fs.writeFileSync(file, JSON.stringify(bad));
+      expect(fileCapStore(file).reserve('2026-09-19', 2)).toBe(false);
+    }
   });
 });

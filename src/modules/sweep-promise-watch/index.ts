@@ -38,7 +38,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { DATA_DIR } from '../../config.js';
-import { getSession, getSessionsActiveSince } from '../../db/sessions.js';
+import { containerOwnsOutbound } from '../../container-runner.js';
+import { withCentralSync, withRawDb } from '../../db/central-lease.js';
+import { getSessionsActiveSince } from '../../db/sessions.js';
 import { readEnvFile } from '../../env.js';
 import { registerSweepDuty, registerSweepDutySource, SWEEP_DUTY_INVENTORY, writeSystemWake } from '../../host-sweep.js';
 import { log } from '../../log.js';
@@ -112,6 +114,23 @@ export function candidateReason(
   if (snap.nextFutureProcessAfter) return 'wake-pending';
   if (snap.hasContinuation) return 'continuation-saved';
   return 'candidate';
+}
+
+/**
+ * The admission decision, taken inside the synchronous block right before the
+ * write: the session still exists, no container owns it (running, spawning or
+ * adopting — `containerOwnsOutbound`), the promising message is still its
+ * newest chat, and it is still a candidate.
+ */
+export function admissible(
+  fresh: Session | undefined,
+  containerOwns: boolean,
+  snap: SessionSnapshot,
+  messageId: string,
+  now: number,
+): boolean {
+  if (!fresh || containerOwns) return false;
+  return snap.latestChat?.id === messageId && candidateReason(fresh, snap, now) === 'candidate';
 }
 
 /** The promise question from the backtest (V2), plus scheduled-time wording it missed. */
@@ -282,7 +301,15 @@ export function fileCapStore(file: string = CAP_FILE): NudgeCapStore {
       let state = { day: '', count: 0 };
       try {
         const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as { day?: unknown; count?: unknown };
-        if (typeof parsed.day !== 'string' || typeof parsed.count !== 'number') throw new Error('malformed');
+        if (
+          typeof parsed.day !== 'string' ||
+          !/^\d{4}-\d{2}-\d{2}$/.test(parsed.day) ||
+          typeof parsed.count !== 'number' ||
+          !Number.isSafeInteger(parsed.count) ||
+          parsed.count < 0
+        ) {
+          throw new Error('malformed');
+        }
         state = { day: parsed.day, count: parsed.count };
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -315,24 +342,37 @@ function productionDeps(mode: PromiseWatchMode): ScanDeps {
     // Admission: re-read the session row and the mailbox, and write only if
     // the same message is still the newest chat and the session is still a
     // candidate. The Jev call is the gap this closes.
+    // Admission: the mailbox callback awaits ONLY the central lease. Inside
+    // it, one synchronous block re-reads the session row, checks container
+    // ownership (running, spawning or adopting), re-snapshots the mailbox and
+    // writes — nothing can interleave between the check and the insert: an
+    // archive or close needs the same lease, and a spawn registers in the
+    // in-memory map before it ever touches the row.
     nudge: async (session, messageId, text, p) => {
-      // Hold the mailbox first; the central re-read is the LAST await, and
-      // everything after it — snapshot, check, write — is synchronous, so no
-      // archive, close or spawn can land between the check and the insert.
-      const outcome = await withExistingMailboxSession(session.agent_group_id, session.id, async (mailbox) => {
-        const fresh = await getSession(session.id);
-        if (!fresh) return 'stale' as const;
-        const snap = readSnapshot(mailbox);
-        if (snap.latestChat?.id !== messageId || candidateReason(fresh, snap, Date.now()) !== 'candidate') {
-          return 'stale' as const;
-        }
-        const written = writeSystemWake(mailbox, fresh, `${NUDGE_ID_PREFIX}${messageId}`, text, {
-          kind: 'promise_nudge',
-          message_id: messageId,
-          p,
-        });
-        return written ? ('nudged' as const) : ('duplicate' as const);
-      });
+      const outcome = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+        withCentralSync((): NudgeOutcome => {
+          const fresh = withRawDb(
+            (db) => db.prepare('SELECT * FROM sessions WHERE id = ?').get(session.id) as Session | undefined,
+          );
+          if (
+            !admissible(
+              fresh,
+              fresh ? containerOwnsOutbound(fresh.id) : true,
+              readSnapshot(mailbox),
+              messageId,
+              Date.now(),
+            )
+          ) {
+            return 'stale';
+          }
+          const written = writeSystemWake(mailbox, fresh!, `${NUDGE_ID_PREFIX}${messageId}`, text, {
+            kind: 'promise_nudge',
+            message_id: messageId,
+            p,
+          });
+          return written ? 'nudged' : 'duplicate';
+        }, 'promise-watch admission'),
+      );
       return outcome ?? 'stale';
     },
     cap: fileCapStore(),
