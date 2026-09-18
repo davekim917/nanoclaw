@@ -115,6 +115,23 @@ export function latestOutboundTimestamp(outDb: Database.Database): string | null
   return row?.timestamp ?? null;
 }
 
+export interface OutboundChatRow {
+  id: string;
+  timestamp: string;
+  content: string;
+  in_reply_to: string | null;
+}
+
+/** The session's most recent outbound `chat` row (status edits excluded), or null. */
+export function latestOutboundChat(outDb: Database.Database): OutboundChatRow | null {
+  const row = outDb
+    .prepare(
+      "SELECT id, timestamp, content, in_reply_to FROM messages_out WHERE kind = 'chat' ORDER BY seq DESC LIMIT 1",
+    )
+    .get() as OutboundChatRow | undefined;
+  return row ?? null;
+}
+
 /**
  * Backfill a completed status on the host-owned inbound row whose reply was
  * already written. Deliberately narrower than `markMessageFailed`: only a row

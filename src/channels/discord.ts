@@ -24,6 +24,7 @@ import { Constants, MessageType, REST, RESTJSONErrorCodes, Routes } from 'discor
 
 import { readEnvFileMatching } from '../env.js';
 import { log } from '../log.js';
+import { getOwners } from '../modules/permissions/db/user-roles.js';
 import { transformOutsideProtectedRegions } from '../text-styles.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
@@ -687,6 +688,32 @@ export function extractDiscordChannelId(platformId: string): string {
   return parts[2] ?? platformId;
 }
 
+const SNOWFLAKE = /^\d+$/;
+
+/**
+ * Discord thread permalink, or null when one can't be built exactly.
+ *
+ * A thread id is `discord:{guildId}:{channelId}:{threadId}` (see
+ * makeFetchThreadAnchor above), and a Discord thread is itself a channel, so
+ * `https://discord.com/channels/{guildId}/{threadId}` opens it. Unlike Slack,
+ * no workspace URL is needed. A channel-level id, a DM (`@me`), or anything not
+ * made of snowflakes returns null rather than a guessed link.
+ */
+export function discordPermalink(threadId: string | null): string | null {
+  const parts = threadId?.split(':') ?? [];
+  if (parts.length !== 4 || parts[0] !== 'discord') return null;
+  const [, guildId, , thread] = parts;
+  if (!SNOWFLAKE.test(guildId) || !SNOWFLAKE.test(thread)) return null;
+  return `https://discord.com/channels/${guildId}/${thread}`;
+}
+
+/** Link to a Discord CHANNEL (`discord:{guildId}:{channelId}`), or null. */
+export function discordChannelPermalink(platformId: string): string | null {
+  const [scheme, guildId, channelId] = platformId.split(':');
+  if (scheme !== 'discord' || !SNOWFLAKE.test(guildId ?? '') || !SNOWFLAKE.test(channelId ?? '')) return null;
+  return `https://discord.com/channels/${guildId}/${channelId}`;
+}
+
 /**
  * Post a message to the top level of a Discord channel.
  * Exported for unit testing.
@@ -758,6 +785,58 @@ export function discordThreadNameFrom(content: string | undefined): string {
 export interface DiscordThreadRestClient {
   get(route: `/${string}`): Promise<unknown>;
   post(route: `/${string}`, options?: { body?: unknown }): Promise<unknown>;
+  put(route: `/${string}`): Promise<unknown>;
+}
+
+/**
+ * Discord snowflakes of the install's global owners. Owner user ids are
+ * `<channelType>:<snowflake>` with one row per Discord bot (`discord:`,
+ * `discord-codex:`, …) for the same human, so dedupe on the snowflake.
+ */
+async function discordOwnerUserIds(): Promise<string[]> {
+  const ids = new Set<string>();
+  for (const owner of await getOwners()) {
+    const [channelType, userId] = owner.user_id.split(':');
+    if (channelType?.startsWith('discord') && userId && /^\d+$/.test(userId)) ids.add(userId);
+  }
+  return [...ids];
+}
+
+/**
+ * Add the install's owners to a thread a bot just opened. Discord's channel
+ * sidebar lists only threads you are a member of; a thread opened from a
+ * user's @mention includes that user, but one a bot opens under its own post
+ * (keyed/task/turn anchors, createThread) has only the bot, so it stayed
+ * hidden until the owner replied in it. Best-effort: a failure leaves the
+ * thread working, just unlisted.
+ */
+export async function addDiscordThreadMembers(
+  rest: Pick<DiscordThreadRestClient, 'put'>,
+  threadId: string,
+  userIds: () => Promise<string[]> = discordOwnerUserIds,
+): Promise<void> {
+  let ids: string[];
+  try {
+    ids = await userIds();
+  } catch (err) {
+    log.warn('Discord thread member lookup failed', {
+      threadId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+  // Per user, so one owner outside this guild (10007) doesn't skip the rest.
+  for (const userId of ids) {
+    try {
+      await rest.put(Routes.threadMembers(threadId, userId));
+    } catch (err) {
+      log.warn('Discord thread member add failed', {
+        threadId,
+        userId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 }
 
 function isDiscordUnknownChannelError(err: unknown): boolean {
@@ -792,6 +871,7 @@ function isDiscordUnknownChannelError(err: unknown): boolean {
 export function installMessageThreadAutoCreate(
   adapter: ReturnType<typeof createDiscordAdapter>,
   rest: DiscordThreadRestClient,
+  addThreadMembers: (rest: DiscordThreadRestClient, threadId: string) => Promise<void> = addDiscordThreadMembers,
 ): void {
   const target = adapter as unknown as {
     postMessage: (threadId: string, message: unknown) => Promise<unknown>;
@@ -814,6 +894,8 @@ export function installMessageThreadAutoCreate(
         }
         await rest.post(Routes.threads(channelId, messageId), { body: { name } });
         log.info('Discord thread opened under anchor message', { channelId, messageId });
+        // Not awaited: best-effort, and the retried post shouldn't wait on it.
+        void addThreadMembers(rest, messageId);
       } catch (createErr) {
         if ((createErr as { code?: unknown }).code !== RESTJSONErrorCodes.ThreadAlreadyCreatedForMessage) {
           log.warn('Discord thread auto-create failed', {
@@ -958,9 +1040,14 @@ for (const ws of workspaces) {
         classifyRecoveryError: classifyDiscordRecoveryError,
         fetchThreadAnchor: makeFetchThreadAnchor(ws.botToken),
       });
+      bridge.permalink = (_platformId, threadId) => discordPermalink(threadId);
+      bridge.channelPermalink = (platformId) => discordChannelPermalink(platformId);
       bridge.postParent = (platformId, text) => discordPostParent(rest, platformId, text);
-      bridge.createThread = (platformId, parentMessageId, title, firstMessage) =>
-        discordCreateThread(rest, platformId, parentMessageId, title, firstMessage);
+      bridge.createThread = async (platformId, parentMessageId, title, firstMessage) => {
+        const created = await discordCreateThread(rest, platformId, parentMessageId, title, firstMessage);
+        void addDiscordThreadMembers(rest, created.threadId);
+        return created;
+      };
       return bridge;
     },
   });

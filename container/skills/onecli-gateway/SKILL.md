@@ -32,6 +32,13 @@ request — curl, Python, a CLI tool, whatever fits; if a tool insists on a
 locally-configured credential, pass any placeholder value, since the proxy
 replaces it with the real credential at request time.
 
+**A missing `<SERVICE>_API_KEY` env var is normal, not a missing
+credential.** Gateway-injected keys never enter the container, so their
+absence is not evidence the service is unavailable. Do not fall back to a
+stub or local stand-in; call the service first. TypeSafe (Jev,
+`api.typesafe.ai`) is one: call it directly, and if its SDK requires an
+`api_key`, pass a placeholder.
+
 **Exception — services with a mounted credential file use their own CLI,
 not the proxy.** Check `get_capabilities` first. Google Workspace
 (Gmail/Calendar/Drive) is the main one: use `gws` with the account file and

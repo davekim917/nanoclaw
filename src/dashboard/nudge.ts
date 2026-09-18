@@ -100,7 +100,8 @@ export const observatoryNudgeHandler: AuthHandler = async (req, _params, ctx) =>
   // to be a second copy of the same text, and it drifted the moment the
   // announce-what-you-did clause was removed from one of them.
   const who = ctx.user.display_name ?? ctx.user.id;
-  const prompt = buildNudgePrompt(claim, `Pushed forward by ${who} via the Observatory`);
+  const threadUrl = await threadPermalink(claim.threadId);
+  const prompt = buildNudgePrompt(claim, `Pushed forward by ${who} via the Observatory`, threadUrl);
 
   const res = await dispatch(
     {
@@ -127,5 +128,5 @@ export const observatoryNudgeHandler: AuthHandler = async (req, _params, ctx) =>
   recentNudges.set(dedupeKey, Date.now());
   const seriesId = (res.data as { series_id?: string } | null | undefined)?.series_id ?? null;
   log.info('observatory nudge', { userId: ctx.user.id, claimSlug, agentGroupId, channel: target.name, seriesId });
-  return json(200, { ok: true, seriesId, threadUrl: await threadPermalink(claim.threadId) });
+  return json(200, { ok: true, seriesId, threadUrl });
 };

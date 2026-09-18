@@ -10,12 +10,15 @@ import {
   resolveIncomingDiscordMentions,
   rewriteDiscordLinks,
   discordPostParent,
+  addDiscordThreadMembers,
   discordCreateThread,
   discordThreadNameFrom,
   installMessageThreadAutoCreate,
   type DiscordThreadRestClient,
   discoverDiscordRecoveryTargets,
   extractDiscordChannelId,
+  discordChannelPermalink,
+  discordPermalink,
   unwrapForwardedSnapshot,
   type DiscordBotIdentity,
   type DiscordRestClient,
@@ -681,6 +684,28 @@ describe('extractDiscordChannelId', () => {
   });
 });
 
+describe('discordPermalink', () => {
+  it('links a thread by guild and thread id — a Discord thread is itself a channel', () => {
+    expect(discordPermalink('discord:123456789000000001:123456789000000002:123456789000000003')).toBe(
+      'https://discord.com/channels/123456789000000001/123456789000000003',
+    );
+  });
+
+  it('declines anything it cannot link exactly', () => {
+    expect(discordPermalink(null)).toBeNull();
+    expect(discordPermalink('discord:123456789000000001:123456789000000002')).toBeNull(); // channel, not thread
+    expect(discordPermalink('discord:@me:123456789000000002:123456789000000003')).toBeNull();
+    expect(discordPermalink('slack:C0AAA:1786621514.008659')).toBeNull();
+  });
+
+  it('links a channel separately', () => {
+    expect(discordChannelPermalink('discord:123456789000000001:123456789000000002')).toBe(
+      'https://discord.com/channels/123456789000000001/123456789000000002',
+    );
+    expect(discordChannelPermalink('slack:C0AAA')).toBeNull();
+  });
+});
+
 describe('discordPostParent', () => {
   it('test_post_parent_returns_message_id: returns {messageId} from REST response', async () => {
     const mockRest: DiscordRestClient = {
@@ -731,6 +756,29 @@ describe('discordCreateThread', () => {
   });
 });
 
+describe('addDiscordThreadMembers', () => {
+  it('PUTs each user onto the thread', async () => {
+    const rest = { put: vi.fn().mockResolvedValue(undefined) };
+    await addDiscordThreadMembers(rest, 'thread1', async () => ['111', '222']);
+    expect(rest.put.mock.calls.map((c) => c[0])).toEqual([
+      '/channels/thread1/thread-members/111',
+      '/channels/thread1/thread-members/222',
+    ]);
+  });
+
+  it('keeps adding later users after one fails', async () => {
+    const rest = { put: vi.fn().mockRejectedValueOnce(new Error('Unknown Member')).mockResolvedValue(undefined) };
+    await addDiscordThreadMembers(rest, 'thread1', async () => ['111', '222']);
+    expect(rest.put).toHaveBeenCalledTimes(2);
+    expect(rest.put.mock.calls[1][0]).toBe('/channels/thread1/thread-members/222');
+  });
+
+  it('swallows a failure so the thread still works', async () => {
+    const rest = { put: vi.fn().mockRejectedValue(new Error('Missing Access')) };
+    await expect(addDiscordThreadMembers(rest, 'thread1', async () => ['111'])).resolves.toBeUndefined();
+  });
+});
+
 describe('discordThreadNameFrom', () => {
   it('uses the first non-empty line with Markdown punctuation stripped', () => {
     expect(discordThreadNameFrom('\n🔴 **High — not transient.** One prod job down\nmore')).toBe(
@@ -751,12 +799,17 @@ describe('installMessageThreadAutoCreate', () => {
   const unknownChannel = () => new Error('Discord API error: 404 {"message": "Unknown Channel", "code": 10003}');
   const anchor = 'discord:guild1:chan1:msg1';
 
+  let addMembers: ReturnType<typeof vi.fn<(rest: DiscordThreadRestClient, threadId: string) => Promise<void>>>;
+
   function setup(
     postMessage: ReturnType<typeof vi.fn>,
     rest: { get: ReturnType<typeof vi.fn>; post: ReturnType<typeof vi.fn> },
   ) {
     const adapter = { postMessage } as unknown as Parameters<typeof installMessageThreadAutoCreate>[0];
-    installMessageThreadAutoCreate(adapter, rest as unknown as DiscordThreadRestClient);
+    addMembers = vi
+      .fn<(rest: DiscordThreadRestClient, threadId: string) => Promise<void>>()
+      .mockResolvedValue(undefined);
+    installMessageThreadAutoCreate(adapter, rest as unknown as DiscordThreadRestClient, addMembers);
     return adapter as unknown as { postMessage: (t: string, m: unknown) => Promise<unknown> };
   }
 
@@ -775,6 +828,8 @@ describe('installMessageThreadAutoCreate', () => {
     });
     expect(postMessage).toHaveBeenCalledTimes(2);
     expect(postMessage.mock.calls[1][0]).toBe(anchor);
+    // The thread shares the anchor message's snowflake; its opener adds the owners.
+    expect(addMembers).toHaveBeenCalledWith(rest, 'msg1');
   });
 
   it('treats 160004 (thread already created by a racing sender) as success', async () => {
@@ -785,6 +840,8 @@ describe('installMessageThreadAutoCreate', () => {
 
     await expect(adapter.postMessage(anchor, {})).resolves.toEqual({ id: 'reply-1' });
     expect(postMessage).toHaveBeenCalledTimes(2);
+    // The racing sender opened it, so it adds the members.
+    expect(addMembers).not.toHaveBeenCalled();
   });
 
   it('rethrows the ORIGINAL error when the thread cannot be created, so callers keep their root fallback', async () => {

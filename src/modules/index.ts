@@ -97,6 +97,7 @@ import './sweep-session-core/index.js';
 // continuation-wake-eligibility, S9b container-wake, S15 kill-ceiling-notice,
 // S10 ceiling-kill-accountability.
 import './sweep-continuation/index.js';
+import './sweep-promise-watch/index.js';
 
 // Sweep duty family: scheduling + thread-close (S2-PR11) — thread-close-advance,
 // due-wake-admission, recurrence-fanout, spent-task-session-gc.

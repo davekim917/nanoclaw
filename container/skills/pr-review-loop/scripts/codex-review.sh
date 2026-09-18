@@ -507,6 +507,18 @@ run_gate() {
 RISK_LABEL_WORKFLOW='Risk label'
 # release-policy.py's own contexts are a policy gate, not CI: a pending human approval must never read as ci_pending.
 CI_EXCLUDED_CONTEXTS='["Release policy","Release approval"]'
+# The commit status run-host-ci.sh posts: the repository's declared CI, run on
+# a host against the exact head. It stands in for a required Actions workflow
+# only when GitHub never started that workflow's jobs (never_started_runs);
+# otherwise it is one more status, and red when it is red.
+HOST_CI_CONTEXT='CI (host)'
+# An Actions job GitHub never started: completed with no runner ever assigned
+# and no step run. That is the billing lockout's shape — "The job was not
+# started because recent account payments have failed..." (annotation on check
+# run 105741202176, run 35388540873, 2026-09-18: runner_id 0, runner_name "",
+# steps []) — against a job that ran and failed, which always has a runner and
+# steps (run 35185456083: runner "GitHub Actions 1000006727", 25 steps).
+NEVER_STARTED_JQ='def never_started: .status == "completed" and ((.steps // []) | length) == 0 and (.runner_id // 0) == 0 and (.runner_name // "") == "";'
 # The request marker, hidden in the rendered comment. It is how `request`
 # dedupes per head and counts rounds, and how `merge-check` learns when THIS
 # head's review was asked for. Its existing creation timestamp is also the
@@ -1235,11 +1247,22 @@ review_notes_state() {
 # finished run's updated_at is when it finished: runs sampled from 2026-08-20/21
 # each read updated_at within a second of their last job's completed_at, and a
 # re-run moves it. A commit status never changes once posted.
+#
+# A run GitHub never started (never_started_runs: no runner, no step — the
+# Actions billing lockout) is not evidence about the head either way. For a
+# required workflow it is red unless the newest HOST_CI_CONTEXT status on the
+# head is `pending` (a host run under way: ci_pending, so ci-wait waits) or
+# `success`; then the verdict is `ci_host: <workflows> ...`, which
+# every caller reads as green and reports as `ci=host`. A run that started and
+# failed stays red whatever the host status says, and a red host status is red
+# like any other. A non-required run that never started is left out, as if it
+# had not been triggered.
 ci_verdict() {
-  local runs statuses required="${CODEX_REVIEW_REQUIRED_WORKFLOWS:-CI}"
+  local runs statuses unstarted required="${CODEX_REVIEW_REQUIRED_WORKFLOWS:-CI}"
   runs=$(gh api --paginate --slurp "repos/$REPO/actions/runs?head_sha=$1&per_page=100") || return 1
   statuses=$(gh api --paginate --slurp "repos/$REPO/commits/$1/statuses?per_page=100") || return 1
-  printf '%s\n%s\n' "$runs" "$statuses" | jq -rs --arg head "$1" --arg labeler "$RISK_LABEL_WORKFLOW" --arg requiredList "$required" --argjson excluded "$CI_EXCLUDED_CONTEXTS" --arg asof "$GATE_AS_OF" '
+  unstarted=$(never_started_runs "$1" "$runs") || return 1
+  printf '%s\n%s\n' "$runs" "$statuses" | jq -rs --arg head "$1" --arg labeler "$RISK_LABEL_WORKFLOW" --arg requiredList "$required" --argjson excluded "$CI_EXCLUDED_CONTEXTS" --arg asof "$GATE_AS_OF" --argjson unstarted "$unstarted" --arg hostContext "$HOST_CI_CONTEXT" '
     ( $requiredList | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) ) as $required
     | ( [ .[0][].workflow_runs[]?
         | select(.head_sha == $head)
@@ -1251,10 +1274,16 @@ ci_verdict() {
     | ( [ .[1][][]? | select(.context as $c | $excluded | index($c) | not)
           | select($asof == "" or (.created_at // "") <= $asof) ]
         | group_by(.context) | map(max_by([.created_at // "", .id // 0])) ) as $statuses
-    | ( [ $runs[] | select(.status == "completed")
+    | ( [ $statuses[] | select(.context == $hostContext) | .state ] | first // "none" ) as $hostState
+    | ($hostState == "success") as $hostGreen
+    | ( [ $runs[] | select(.status == "completed" and (.id | IN($unstarted[]))) ] ) as $never
+    | ( [ $never[] | select(.name as $n | $required | index($n) != null) ] ) as $neverRequired
+    | ( if $hostGreen then [ $neverRequired[] | .name ] else [] end ) as $hosted
+    | ( [ $runs[] | select(.status == "completed" and (.id | IN($unstarted[]) | not))
           | (.name as $n | $required | index($n) != null) as $isRequired
           | select((.conclusion // "") as $c | if $isRequired then $c != "success" else ($c | IN("success", "neutral", "skipped") | not) end)
           | "\(.name)=\(.conclusion // "none")\(if $isRequired then " (required)" else "" end)" ]
+        + ( if $hostGreen or $hostState == "pending" then [] else [ $neverRequired[] | "\(.name)=not started (required; GitHub never started its jobs and no \($hostContext) success is on this head — run run-host-ci.sh)" ] end )
         + [ $statuses[] | select(.state != "success" and .state != "pending") | "\(.context)=\(.state)" ] ) as $red
     | [ $required[] | . as $n | select(any($runs[]; .name == $n) | not) ] as $missing
     | ( [ $runs[] | select(.status != "completed") | "\(.name)=\(.status)" ]
@@ -1263,7 +1292,30 @@ ci_verdict() {
       elif ($red | length) > 0 then "ci_red: " + ($red | join(", "))
       elif ($missing | length) > 0 then "ci_missing: " + ($missing | join(", ")) + " — required, but no run on this head"
       elif ($pending | length) > 0 then "ci_pending: " + ($pending | join(", "))
+      elif ($hosted | length) > 0 then "ci_host: " + ($hosted | join(", ")) + " never started on Actions; the \($hostContext) success on this head stands in"
       else empty end'
+}
+
+# The ids, as a JSON array, of the Actions runs on head $1 (from $2, the
+# slurped actions/runs pages) whose jobs GitHub never started: completed
+# `failure`, at least one job, every job never_started (NEVER_STARTED_JQ) and
+# one of them `failure`. Only failed runs are asked about, one jobs read each.
+# A jobs read that fails leaves its run out, which keeps it red: not knowing
+# whether a run started is never a reason to excuse it. Under `audit`, runs
+# created after GATE_AS_OF are not asked about (ci_verdict drops them anyway).
+never_started_runs() {
+  local ids id jobs out='[]'
+  ids=$(printf '%s\n' "$2" | jq -r --arg head "$1" --arg asof "$GATE_AS_OF" '
+    [ .[].workflow_runs[]? | select(.head_sha == $head and .status == "completed" and .conclusion == "failure")
+      | select($asof == "" or (.created_at // "") <= $asof) | .id ] | unique | .[]') || return 1
+  for id in $ids; do
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+    jobs=$(gh api --paginate --slurp "repos/$REPO/actions/runs/$id/jobs?per_page=100" 2>/dev/null) || continue
+    if printf '%s\n' "$jobs" | jq -e "$NEVER_STARTED_JQ"' [ .[].jobs[]? ] | length > 0 and all(.[]; never_started) and any(.[]; .conclusion == "failure")' >/dev/null 2>&1; then
+      out=$(jq -cn --argjson o "$out" --argjson id "$id" '$o + [$id]') || return 1
+    fi
+  done
+  printf '%s\n' "$out"
 }
 
 # The newest independent-review-receipt:v1 for exactly HEAD, from the authors
@@ -1387,7 +1439,7 @@ rollup_page() {
       repository(owner:$owner,name:$name){ pullRequest(number:$pr){
         headRefOid statusCheckRollup{ contexts(first:100,after:$after){ pageInfo{hasNextPage endCursor} nodes{
           __typename
-          ... on CheckRun{ name status conclusion isRequired(pullRequestNumber:$pr) }
+          ... on CheckRun{ databaseId name status conclusion isRequired(pullRequestNumber:$pr) }
           ... on StatusContext{ context state isRequired(pullRequestNumber:$pr) }
         } } }
       } }
@@ -1415,17 +1467,39 @@ rollup_page() {
 # holds the merge for it anyway. The rollup is the PR head's, so every page
 # must name HEAD as that head; a failed or partial read is no verdict, and
 # there is no second source to fall back on.
+#
+# Output is `<red>\t<hosted>`. A required check run that concluded FAILURE
+# because GitHub never started it (its Actions job, read by the check run's
+# databaseId, is never_started — NEVER_STARTED_JQ) is not red when the
+# rollup's HOST_CI_CONTEXT status on this head is SUCCESS; it is named in
+# <hosted> instead. As in ci_verdict, a job read that fails keeps it red.
 required_status_red() {
-  local pages
+  local pages rollup candidates id job unstarted='[]'
   pages=$(paginate_connection statusCheckRollup.contexts rollup_page) || return 1
-  printf '%s\n' "$pages" | jq -rs --arg head "$1" '
+  rollup=$(printf '%s\n' "$pages" | jq -cs --arg head "$1" '
     if all(.[]; .data.repository.pullRequest.headRefOid == $head) | not
     then error("the status rollup read is for another head than \($head)") else . end
-    | [ .[] | .data.repository.pullRequest.statusCheckRollup.contexts.nodes[] | select(.isRequired == true)
+    | [ .[] | .data.repository.pullRequest.statusCheckRollup.contexts.nodes[] ]') || return 1
+  candidates=$(printf '%s\n' "$rollup" | jq -r --arg ctx "$HOST_CI_CONTEXT" '
+    if any(.[]; .__typename == "StatusContext" and .context == $ctx and .state == "SUCCESS")
+    then [ .[] | select(.__typename == "CheckRun" and .isRequired == true and .status == "COMPLETED" and .conclusion == "FAILURE")
+           | .databaseId | select(type == "number") ] | unique | .[]
+    else empty end') || return 1
+  for id in $candidates; do
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+    job=$(gh api "repos/$REPO/actions/jobs/$id" 2>/dev/null) || continue
+    if printf '%s\n' "$job" | jq -e "$NEVER_STARTED_JQ"' never_started and .conclusion == "failure"' >/dev/null 2>&1; then
+      unstarted=$(jq -cn --argjson o "$unstarted" --argjson id "$id" '$o + [$id]') || return 1
+    fi
+  done
+  printf '%s\n' "$rollup" | jq -r --argjson unstarted "$unstarted" '
+    [ .[] | select(.isRequired == true) ] as $required
+    | [ $required[] | select(.__typename == "CheckRun" and (.databaseId | IN($unstarted[]))) | .name ] as $hosted
+    | [ $required[] | select((.__typename == "CheckRun" and (.databaseId | IN($unstarted[]))) | not)
         | if .__typename == "CheckRun"
           then select(.status == "COMPLETED" and (.conclusion | IN("SUCCESS", "NEUTRAL", "SKIPPED") | not)) | "\(.name)=\(.conclusion // "none" | ascii_downcase)"
           else select(.state | IN("SUCCESS", "PENDING", "EXPECTED") | not) | "\(.context)=\(.state // "none" | ascii_downcase)" end ]
-    | unique | join(", ")'
+    | "\(unique | join(", "))\t\($hosted | unique | join(", "))"'
 }
 
 # What a legacy merge still answers to mechanically. merge-check defers a
@@ -1434,12 +1508,16 @@ required_status_red() {
 # against both already written down. These two facts need no judgement, so
 # they refuse (24) before the defer; everything else about a legacy merge is
 # still Step 6's. No verdict (1) when either cannot be read.
+LEGACY_CI_HOST=""
 legacy_precheck() {
-  local red receipt
-  red=$(required_status_red "$SCOPE_HEAD") || {
+  local red_out red receipt
+  red_out=$(required_status_red "$SCOPE_HEAD") || {
     echo "merge=error head=$SCOPE_HEAD: could not read which required checks are red on this head (GitHub status rollup); no verdict" >&2
     exit 1
   }
+  red="${red_out%%$'\t'*}"
+  LEGACY_CI_HOST="${red_out#*$'\t'}"
+  [ "$LEGACY_CI_HOST" != "$red_out" ] || LEGACY_CI_HOST=""
   if [ -n "$red" ]; then
     echo "merge=refused head=$SCOPE_HEAD mode=legacy: required_red: $red — GitHub requires it for this PR and it is red on this head; fix what it reports, never merge around it" >&2
     exit 24
@@ -1466,7 +1544,7 @@ legacy_precheck() {
 # never read a defer as a pass. Its base is re-read first, since a base that
 # moved may have opted in since.
 merge_check_main() {
-  local want="" pr_text fix_link ci receipt_raw receipt receipt_reviewer notes markers since observation claim_now_iso claims
+  local want="" pr_text fix_link ci ci_word receipt_raw receipt receipt_reviewer notes markers since observation claim_now_iso claims
   while [ $# -gt 0 ]; do
     case "$1" in
       --head)
@@ -1483,6 +1561,11 @@ merge_check_main() {
     fi
     legacy_precheck
     refuse_if_base_moved
+    if [ -n "$LEGACY_CI_HOST" ]; then
+      echo "merge-check: required $LEGACY_CI_HOST never started on Actions; the $HOST_CI_CONTEXT success on this head stands in" >&2
+      echo "merge=defer mode=legacy ci=host: $REPO is not risk-scoped; the existing Step-6 evidence rules apply"
+      exit 26
+    fi
     echo "merge=defer mode=legacy: $REPO is not risk-scoped; the existing Step-6 evidence rules apply"
     exit 26
   fi
@@ -1518,10 +1601,17 @@ merge_check_main() {
   # No branch protection holds this line, so merge-check does, whatever the
   # verdict: every check run on exactly this head, completed green.
   ci=$(ci_verdict "$SCOPE_HEAD") || exit 1
-  if [ -n "$ci" ]; then
-    echo "merge=refused head=$SCOPE_HEAD: $ci" >&2
-    exit 24
-  fi
+  case "$ci" in
+    '') ci_word=green ;;
+    ci_host:*)
+      ci_word=host
+      echo "merge-check: $ci" >&2
+      ;;
+    *)
+      echo "merge=refused head=$SCOPE_HEAD: $ci" >&2
+      exit 24
+      ;;
+  esac
   # A substitute reviewer who read exactly this head and said no outranks
   # everything else here: `changes` refuses under either verdict, a clean
   # Codex review included, until a later receipt for this head approves.
@@ -1556,7 +1646,7 @@ merge_check_main() {
   esac
   if [ "$SCOPE_VERDICT" = skip ]; then
     refuse_if_base_moved
-    echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=skip ci=green base=$SCOPE_BASE: $SCOPE_REASON"
+    echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=skip ci=$ci_word base=$SCOPE_BASE: $SCOPE_REASON"
     exit 0
   fi
   # verdict=review: the latest substitute receipt for THIS head approves, or
@@ -1577,7 +1667,7 @@ merge_check_main() {
       exit 24
     fi
     refuse_if_base_moved
-    echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=review ci=green base=$SCOPE_BASE: the latest substitute receipt for this head approves ($receipt_reviewer)"
+    echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=review ci=$ci_word base=$SCOPE_BASE: the latest substitute receipt for this head approves ($receipt_reviewer)"
     exit 0
   fi
   markers=$(request_markers) || exit 1
@@ -1590,7 +1680,7 @@ merge_check_main() {
   case "$observation" in
     codex=clean*)
       refuse_if_base_moved
-      echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=review ci=green base=$SCOPE_BASE: $observation"
+      echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=review ci=$ci_word base=$SCOPE_BASE: $observation"
       ;;
     *)
       echo "merge=refused head=$SCOPE_HEAD verdict=review: $observation; latest substitute receipt: ${receipt:-none}" >&2
@@ -1739,6 +1829,10 @@ ci_wait_main() {
         case "$verdict" in
           '')
             echo "ci=green head=$head"
+            exit 0
+            ;;
+          ci_host:*)
+            echo "ci=host head=$head: $verdict"
             exit 0
             ;;
           ci_red:*)
@@ -2346,10 +2440,14 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
         ;;
     esac
     ci=$(ci_verdict "$audit_head") || { echo "audit=error $where: could not read CI on the head" >&2; exit 1; }
-    if [ -n "$ci" ]; then
-      echo "audit=violation $where: $ci"
-      exit 28
-    fi
+    case "$ci" in
+      '') ;;
+      ci_host:*) where="$where ci=host" ;;
+      *)
+        echo "audit=violation $where: $ci"
+        exit 28
+        ;;
+    esac
     receipt_raw=$(receipt_outcome "$audit_head") || { echo "audit=error $where: could not read receipts" >&2; exit 1; }
     receipt="${receipt_raw%%$'\t'*}"
     receipt_reviewer="${receipt_raw#*$'\t'}"

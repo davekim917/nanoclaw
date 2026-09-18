@@ -104,6 +104,15 @@ export interface AgentProvider {
   rotateApiKey?(): { rotated: boolean; slot?: string; position?: number; ringSize?: number };
 
   /**
+   * Whether the transcript that resuming `continuation` would load provably
+   * shows `prompt` — recorded as a user message at or after `sinceMs` (the
+   * interrupted attempt's start), with nothing since that could drop it from
+   * the resumed context. A credential-rotation retry then points at it instead
+   * of sending the batch a second time. Absent, or false, means re-send it.
+   */
+  transcriptHasPrompt?(continuation: string | undefined, prompt: string, sinceMs: number): boolean;
+
+  /**
    * Reset the per-turn rotation cycle budget. Rotation is circular — on a
    * retryable error the poll-loop keeps calling `rotateApiKey` to cycle
    * through the whole credential pool (wrapping back to the primary) until

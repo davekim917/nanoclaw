@@ -122,9 +122,12 @@ export function transientOverloadDelayMs(n: number, rand: number = Math.random()
 
 /**
  * Credential rotation starts a fresh provider query, so its prompt is seen a
- * second time even though the inbound rows remain one unfinished batch. Keep
- * the original prompt intact after provenance that distinguishes this retry
- * from a new delivery without claiming the interrupted attempt had no effects.
+ * second time even though the inbound rows remain one unfinished batch.
+ * Provenance distinguishes this retry from a new delivery without claiming the
+ * interrupted attempt had no effects. The original prompt follows it, unless the
+ * resumed transcript already holds it (`promptAlreadyInTranscript`, from
+ * `provider.transcriptHasPrompt`) — then a one-line pointer replaces it, so the
+ * batch is not in context twice for the rest of the session.
  *
  * `rotation` is the result of the `rotateApiKey()` call (providers/claude.ts:2308)
  * that triggered this retry. When it reports `rotated: true` with a position/ringSize, a second
@@ -140,6 +143,7 @@ function formatCredentialRetryPrompt(
   prompt: string,
   batch: MessageInRow[],
   rotation?: { rotated: boolean; position?: number; ringSize?: number },
+  promptAlreadyInTranscript = false,
 ): string {
   const task = batch.find((message) => message.kind === 'task');
   const occurrence = task ? ` Task occurrence ID: ${JSON.stringify(task.id)}.` : '';
@@ -155,7 +159,11 @@ function formatCredentialRetryPrompt(
     'Before repeating side effects, inspect durable effects already produced, then continue the unfinished work.\n' +
     '</runner-retry-provenance>\n\n' +
     rotationNotice +
-    prompt
+    // The resumed transcript already shows the batch (provider.transcriptHasPrompt):
+    // point at it rather than put a second copy in context for the rest of the session.
+    (promptAlreadyInTranscript
+      ? 'The interrupted batch is the inbound message this attempt already recorded above in this conversation; it is not repeated here.\n'
+      : prompt)
   );
 }
 
@@ -761,6 +769,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // retry below replays this batch, so it carries the same media.
     const batchAttachments = extractAttachments(keep);
 
+    // When this batch's first attempt began — a rotation retry only trusts a
+    // transcript copy of the prompt recorded after this (transcriptHasPrompt).
+    const batchStartedAt = Date.now();
     const query = config.provider.query({
       prompt,
       attachments: batchAttachments,
@@ -1114,7 +1125,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         if (!repositoryRecoveryAllowed()) break;
         let retryQuery: AgentQuery | undefined;
         try {
-          const retryPrompt = formatCredentialRetryPrompt(prompt, keep, rotation);
+          const retryPrompt = formatCredentialRetryPrompt(
+            prompt,
+            keep,
+            rotation,
+            config.provider.transcriptHasPrompt?.(continuation, prompt, batchStartedAt) ?? false,
+          );
           retryQuery = config.provider.query({
             prompt: retryPrompt,
             attachments: batchAttachments,
