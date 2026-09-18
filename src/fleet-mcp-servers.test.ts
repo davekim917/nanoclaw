@@ -264,13 +264,13 @@ describe('the file:line citations in this PR\u2019s comments', () => {
     },
     {
       file: 'src/modules/memory/pre-turn-context.ts',
-      line: 1590,
+      line: 1653,
       contains: 'function evictCapability',
       citedBy: 'capabilities.ts — why the derived block is spliced, not appended',
     },
     {
       file: 'src/modules/memory/pre-turn-context.ts',
-      line: 1594,
+      line: 1657,
       contains: 'services.pop()?.name',
       citedBy: 'capabilities.ts — why an all-retained list still terminates',
     },
@@ -279,6 +279,24 @@ describe('the file:line citations in this PR\u2019s comments', () => {
       line: 585,
       contains: 'delete server.cwd',
       citedBy: 'effectiveMcpServers — why fleet entries are handed out as copies',
+    },
+    {
+      file: 'src/container-config.ts',
+      line: 109,
+      contains: "type: 'http'",
+      citedBy: 'mcpEndpoint — why it keys on `url` presence, not on `type`',
+    },
+    {
+      file: 'src/container-config.ts',
+      line: 575,
+      contains: "server?.type === 'sse'",
+      citedBy: 'mcpEndpoint — the ONLY transport validateMcpServers refuses',
+    },
+    {
+      file: 'src/container-config.ts',
+      line: 446,
+      contains: "displayName.trim() === ''",
+      citedBy: 'capability budget tests — a service name has no length bound',
     },
   ];
 

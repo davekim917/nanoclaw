@@ -27,7 +27,7 @@ if [ ! -s "$CONTRACT" ]; then
 fi
 
 if ! jq -e '
-  .schemaVersion == 1 and
+  (.schemaVersion == 1 or .schemaVersion == 2) and
   (.sourceSha | type == "string" and test("^[0-9a-f]{40}$")) and
   (.requiredLaneMarkers | type == "array" and length > 0) and
   all(.requiredLaneMarkers[]; type == "string" and length > 0)
@@ -514,7 +514,7 @@ done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 # journey — whose terminal marker that loop then demands — and a scope
 # disposition for every frozen unmapped path. COMPLETENESS ONLY, the same
 # bargain as confirmedFindings: a disposition's presence proves bookkeeping,
-# and whether it is TRUE is the challenger's question. A run with no pinned
+# and whether it is TRUE is the challenger's question.
 #
 # WHETHER a run owes this is the gate's decision, never the run's bookkeeping:
 # if the PR gate pinned a selection for this campaign, the run must hold those
@@ -522,31 +522,57 @@ done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 # below. The pin is `journeys-pin-<repo>-pr-<n>-<head sha>.json` in the SHARED
 # lease directory (smoke-pr-gate.sh journeys_pin_file — campaign ownership is
 # shared, so a second coordinator's barrier finds it too), resolved from the
-# same two env vars the gate and the scaffold use; a pr-owned contract's
-# sourceSha IS that head sha (require_fenced_source_sha, smoke-run-scaffold.sh:309).
-# Only a VALID pin binds: an invalid one is what the gate itself reports as
-# unrecoverable/`full`, with nothing to adopt. No catalogue means no pin, and a
-# run with neither a pin nor a selection is untouched; an unreadable answer
-# fails closed.
+# same two env vars the gate and the scaffold use.
+#
+# IDENTITY IS THE CONTRACT'S. The pin is found by the campaign's identity and
+# probed by its exact name — never by listing the directory, and never from
+# state with a different lifetime than the run: ten review rounds of #898
+# found, in turn, a listing that failed reading as "no pin" (compgen, then
+# find), a live lease that finish/release delete, and a local catalogue a
+# second coordinator may not have — each one switching every check below off.
+# The identity now travels in the fenced completion contract, written once by
+# the scaffold under the gate's fence (smoke-run-scaffold.sh contract,
+# schemaVersion 2: `pr` from the fenced state, `repoSlug` from the gate's
+# lease else SMOKE_GATE_REPO, beside `sourceSha`, the head) and never changed
+# by adopt or --regenerate (require_contract_identity_unchanged). All of it
+# lives in `smoke-journeys.py barrier` (locate_owner → resolve_owner →
+# check_pin, exception-preserving lstat/open, the same predicate the gate
+# uses), which reads the contract itself. Verdicts, for a pr-owned contract:
+# two confirmed-absent pin paths ⇒ the legacy no-pin answer, byte for byte; a
+# valid pin ⇒ the run must hold its bytes; invalid ⇒ the gate's RECOVERY pin
+# beside it owns instead, neither valid ⇒ not ready; a probe that FAILED
+# (unreachable shared storage, EACCES on the pin) ⇒ not ready — DELIBERATELY
+# with or without a catalogue: a PR run cannot have written its markers
+# without that same shared storage, so this is a retryable fail-closed
+# refusal, not a new dependency; a contract that predates campaign identity
+# (schemaVersion 1) or a v2 one missing pr/repoSlug ⇒ not ready, naming
+# adopt/regenerate, because absent identity was the fail-open every round
+# chased. A develop/task contract never takes pin obligations from the lease
+# dir and is untouched, except that one whose lease (when it exists) binds it
+# to a PR that has a pin is refused for relabelling itself. The run never
+# authors what it is held to; a selection with no gate pin behind it is
+# refused too. Unconditionally: the contract's runId is this run directory's
+# own name.
 JOURNEY_LEASE_DIR="${SMOKE_GATE_LEASE_DIR:-${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases}"
-JOURNEY_PIN_ARGS=()
-if [ "$(jq -r '.ownershipKind' "$CONTRACT")" = pr ]; then
-  while IFS= read -r gate_pin; do
-    JOURNEY_PIN_ARGS+=(--gate-pin "$gate_pin")
-  done < <(compgen -G "$JOURNEY_LEASE_DIR/journeys-pin-*-pr-*-$SOURCE_SHA.json" || true)
-fi
-if [ -e "$RUN_DIR/journeys/selection.json" ] || [ "${#JOURNEY_PIN_ARGS[@]}" -gt 0 ]; then
-  journeys_result="$(python3 "$SCRIPT_DIR/smoke-journeys.py" barrier "$RUN_DIR" \
-    ${JOURNEY_PIN_ARGS[@]+"${JOURNEY_PIN_ARGS[@]}"} 2>/dev/null)" || journeys_result=""
-  if ! jq -e '(.missing | type == "array") and (.invalid | type == "array") and (.invalidReasons | type == "array")' \
-       <<<"$journeys_result" >/dev/null 2>&1; then
-    INVALID+=("journeys/selection.json")
-    INVALID_REASONS+=("journeys/selection.json: the journey completeness check could not run")
-  else
-    while IFS= read -r item; do MISSING+=("$item"); done < <(jq -r '.missing[] | select(length > 0)' <<<"$journeys_result")
-    while IFS= read -r item; do INVALID+=("$item"); done < <(jq -r '.invalid[] | select(length > 0)' <<<"$journeys_result")
-    while IFS= read -r item; do INVALID_REASONS+=("$item"); done < <(jq -r '.invalidReasons[] | select(length > 0)' <<<"$journeys_result")
-  fi
+# The run directory's OWN name is the run id; the contract's runId is checked
+# against it, so a borrowed runId borrows nothing. Derived exactly as the
+# scaffold derives it — the UNRESOLVED `basename "$RUN_DIR"` (its fence
+# smoke-run-scaffold.sh:199, the contract's runId :532, adopt :769) — never
+# through realpath: a run dir reached through a symlink (run-alias →
+# run-storage) is fenced, written and adopted as run-alias, and resolving it
+# here rejected that legitimate contract (#898 review 11). File checks keep
+# their canonical paths (_run_file_ok resolves under the real run root).
+JOURNEY_RUN_NAME="$(basename "$RUN_DIR")"
+journeys_result="$(python3 "$SCRIPT_DIR/smoke-journeys.py" barrier "$RUN_DIR" \
+  --lease-dir "$JOURNEY_LEASE_DIR" --run-id "$JOURNEY_RUN_NAME" 2>/dev/null)" || journeys_result=""
+if ! jq -e '(.missing | type == "array") and (.invalid | type == "array") and (.invalidReasons | type == "array")' \
+     <<<"$journeys_result" >/dev/null 2>&1; then
+  INVALID+=("journeys/selection.json")
+  INVALID_REASONS+=("journeys/selection.json: the journey completeness check could not run")
+else
+  while IFS= read -r item; do MISSING+=("$item"); done < <(jq -r '.missing[] | select(length > 0)' <<<"$journeys_result")
+  while IFS= read -r item; do INVALID+=("$item"); done < <(jq -r '.invalid[] | select(length > 0)' <<<"$journeys_result")
+  while IFS= read -r item; do INVALID_REASONS+=("$item"); done < <(jq -r '.invalidReasons[] | select(length > 0)' <<<"$journeys_result")
 fi
 
 # VISUAL CANDIDATES. A contact sheet and its screenshot-only critic DETECT;

@@ -25,9 +25,11 @@
  */
 import { execFile } from 'child_process';
 
-import { ONECLI_URL, ONECLI_API_KEY } from '../../config.js';
+import { ONECLI_URL } from '../../config.js';
+import { curlConfigEscape, onecliAuthConfigLine, sanitizeCurlFailure } from '../../onecli-curl.js';
 
-const CURL_TIMEOUT_ARGS = ['--connect-timeout', '2', '--max-time', '10'] as const;
+const CURL_CONNECT_TIMEOUT_SECONDS = 2;
+const CURL_MAX_TIME_SECONDS = 10;
 
 export interface OnecliSecretRef {
   id: string;
@@ -48,9 +50,40 @@ function base(): string {
 }
 
 /**
- * Run curl with the request body on STDIN. The body is the only place a token
- * ever appears, and stdin is not visible in `/proc/<pid>/cmdline`.
+ * The whole request as a curl CONFIG FILE, fed on stdin (`curl -K -`).
  *
+ * NOTHING SENSITIVE IS IN ARGV. Two things on this path are secrets: the
+ * gateway API key and the access token in the body. `/proc/<pid>/cmdline` is
+ * world-readable, and — the reason this was a finding rather than a nicety —
+ * Node builds an `execFile` error's `.message` out of the full argv, and this
+ * module's callers write that message into `mcp_oauth_integrations.status_detail`
+ * and a `log.warn` (`service.ts` `finalizeToken` / `refreshOne`). Anything in
+ * argv is one gateway outage away from being in the DB and in the logs.
+ *
+ * The body moves into the config for a mechanical reason: `-K -` and
+ * `--data-binary @-` both want stdin, so only one of them can have it. Escaping
+ * is {@link curlConfigEscape}, verified against curl 8.5.0.
+ */
+function curlConfig(method: 'POST' | 'PATCH' | 'DELETE' | 'GET', url: string, body?: unknown): string {
+  const lines = [
+    '--silent',
+    '--show-error',
+    `--connect-timeout ${CURL_CONNECT_TIMEOUT_SECONDS}`,
+    `--max-time ${CURL_MAX_TIME_SECONDS}`,
+    `--request ${method}`,
+    `--url "${curlConfigEscape(url)}"`,
+  ];
+  const auth = onecliAuthConfigLine();
+  if (auth) lines.push(auth.trimEnd());
+  if (body !== undefined) {
+    lines.push('--header "Content-Type: application/json"');
+    lines.push(`--data-binary "${curlConfigEscape(JSON.stringify(body))}"`);
+  }
+  lines.push('--write-out "\\n%{http_code}"');
+  return `${lines.join('\n')}\n`;
+}
+
+/**
  * `-f` is deliberately NOT used: the caller needs the status code to tell a
  * 409-style conflict from a real failure, and `-f` collapses every non-2xx into
  * exit code 22. The status is appended by `-w` instead. The response body is
@@ -62,28 +95,25 @@ function curlJson(
   path: string,
   body?: unknown,
 ): Promise<{ status: number; body: unknown }> {
-  const args = ['-sS', ...CURL_TIMEOUT_ARGS, '-X', method];
-  if (ONECLI_API_KEY) args.push('-H', `Authorization: Bearer ${ONECLI_API_KEY}`);
-  if (body !== undefined) {
-    args.push('-H', 'Content-Type: application/json', '--data-binary', '@-');
-  }
-  args.push('-w', '\n%{http_code}', `${base()}/api/${path.replace(/^\//, '')}`);
+  const label = `${method} /api/${path.replace(/^\//, '')}`;
+  const config = curlConfig(method, `${base()}/api/${path.replace(/^\//, '')}`, body);
 
   return new Promise((resolve, reject) => {
-    const child = execFile('curl', args, { encoding: 'utf-8' }, (error, stdout) => {
+    const child = execFile('curl', ['-K', '-'], { encoding: 'utf-8' }, (error, stdout) => {
       if (error) {
-        reject(error);
+        // Sanitized: never `error.message`, which is `Command failed: <argv>`.
+        reject(sanitizeCurlFailure(label, error));
         return;
       }
       const out = typeof stdout === 'string' ? stdout : String(stdout);
       const sep = out.lastIndexOf('\n');
       if (sep < 0) {
-        reject(new Error(`Malformed OneCLI response for ${method} ${path}: missing HTTP status`));
+        reject(new Error(`Malformed OneCLI response for ${label}: missing HTTP status`));
         return;
       }
       const status = Number(out.slice(sep + 1).trim());
       if (!Number.isInteger(status) || status < 100 || status > 599) {
-        reject(new Error(`Malformed OneCLI response for ${method} ${path}: invalid HTTP status`));
+        reject(new Error(`Malformed OneCLI response for ${label}: invalid HTTP status`));
         return;
       }
       const text = out.slice(0, sep).trim();
@@ -97,9 +127,12 @@ function curlJson(
       }
       resolve({ status, body: parsed });
     });
-    if (body !== undefined) {
-      child.stdin?.end(JSON.stringify(body));
-    }
+    // `error` on the stream, not just on the process: a curl that exits before
+    // reading its config makes this write EPIPE, and an unhandled 'error' event
+    // on a stream is an uncaught exception. The execFile callback reports the
+    // failure either way.
+    child.stdin?.on('error', () => undefined);
+    child.stdin?.end(config);
   });
 }
 

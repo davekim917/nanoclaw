@@ -154,8 +154,18 @@ export function parseRedirectResponse(pasted: string): {
 } {
   const trimmed = pasted.trim();
   const queryStart = trimmed.indexOf('?');
-  const query = queryStart >= 0 ? trimmed.slice(queryStart + 1) : trimmed.includes('=') ? trimmed : '';
-  if (!query) return { code: trimmed || undefined };
+  const candidate = queryStart >= 0 ? trimmed.slice(queryStart + 1) : trimmed;
+  // A BARE CODE IS NOT A QUERY STRING, even when it contains `=`. The old test
+  // was `trimmed.includes('=')`, which mis-read any base64 code carrying its
+  // padding (`…Ab9==`) as a parameter list: `URLSearchParams` then yields a
+  // parameter NAMED after the code, `code` is absent, and the operator is told
+  // "No authorization code found in the pasted value" about a code that is
+  // right there. Decide on the presence of a parameter this flow actually
+  // uses instead — those names cannot appear in a bare token by accident.
+  if (!/(^|&)(code|state|error|error_description)=/.test(candidate)) {
+    return { code: trimmed || undefined };
+  }
+  const query = candidate;
   // Strip a fragment: some servers append one, and it is never part of the query.
   const params = new URLSearchParams(query.split('#')[0]);
   return {

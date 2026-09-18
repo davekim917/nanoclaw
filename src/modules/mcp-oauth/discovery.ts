@@ -145,6 +145,73 @@ export function assertHttpsEndpoint(label: string, url: string): string {
   return url;
 }
 
+/**
+ * RFC 8414 §3.3: the `issuer` in an authorization-server metadata document MUST
+ * be identical to the issuer URL the document was fetched for.
+ *
+ * Without it, whoever controls `authorization_servers[0]` — or a well-known
+ * document on that origin — can hand back a document claiming to speak for a
+ * different issuer, and the value is then stored on the row and used as the
+ * client-reuse key (`service.ts`, `existingRow.issuer === discovered.issuer`).
+ * The check is what makes "this client id belongs to this issuer" true.
+ *
+ * NORMALIZED ON THE TRAILING SLASH ONLY, because the live documents disagree
+ * about it and nothing else (verified 2026-09-17):
+ *
+ *   Dropbox     asked `https://www.dropbox.com`    declared the same
+ *   Amplitude   asked `https://mcp.amplitude.com`  declared the same
+ *   Littlebird  asked `https://mcp.littlebird.ai/` declared `https://mcp.littlebird.ai/`
+ *
+ * Littlebird's resource document lists its authorization server WITH the
+ * trailing slash and its metadata declares it the same way, so all three match
+ * exactly today; the normalization is there so the one that publishes
+ * `https://host` while being discovered as `https://host/` does not become a
+ * support ticket. No other normalization is applied — case, port and path are
+ * compared verbatim, because each of those is a different server as far as RFC
+ * 8414 is concerned.
+ *
+ * A MISSING `issuer` is refused. RFC 8414 §2 makes it REQUIRED, all three live
+ * servers send it, and treating absence as "fine" would make the check
+ * opt-out-able by the very document it is checking.
+ */
+export function assertIssuerMatches(declared: string | undefined, requested: string, documentUrl: string): void {
+  const normalize = (u: string) => u.replace(/\/+$/, '');
+  if (declared === undefined) {
+    throw new Error(
+      `Authorization-server metadata at ${documentUrl} declares no issuer (RFC 8414 §2 requires one). ` +
+        'Refusing: there is nothing to bind the document to ' +
+        `${requested}.`,
+    );
+  }
+  if (normalize(declared) !== normalize(requested)) {
+    throw new Error(
+      `Authorization-server metadata at ${documentUrl} declares issuer "${declared}", but it was fetched for ` +
+        `"${requested}" (RFC 8414 §3.3 requires them to be identical). Refusing.`,
+    );
+  }
+}
+
+export function assertResourceMatchesMcpUrl(resource: string | undefined, mcpUrl: string): void {
+  if (resource === undefined) return;
+  let declared: URL;
+  try {
+    declared = new URL(resource);
+  } catch (err) {
+    throw new Error(`Protected-resource metadata declares an invalid resource "${resource}"`, { cause: err });
+  }
+  const target = new URL(mcpUrl);
+  const trim = (p: string) => p.replace(/\/+$/, '');
+  const declaredPath = trim(declared.pathname);
+  const targetPath = trim(target.pathname);
+  const pathMatches = declaredPath === '' || targetPath === declaredPath || targetPath.startsWith(`${declaredPath}/`);
+  if (declared.origin !== target.origin || !pathMatches) {
+    throw new Error(
+      `Protected-resource metadata declares resource "${resource}", which does not cover ${mcpUrl} ` +
+        '(RFC 9728 §3.3). Refusing: this document describes a different resource.',
+    );
+  }
+}
+
 async function getJson<T>(fetchImpl: FetchLike, url: string): Promise<T> {
   const res = await fetchImpl(url, {
     method: 'GET',
@@ -178,6 +245,10 @@ export async function discoverProtectedResource(
   fetchImpl: FetchLike,
   mcpUrl: string,
 ): Promise<{ url: string; metadata: ProtectedResourceMetadata }> {
+  // The MCP URL is where the bearer token will be sent on every request, and
+  // the well-known candidates below are derived from it — so a cleartext
+  // `--url` is refused outright, before anything is probed (#876 P2-3).
+  assertHttpsEndpoint('--url', mcpUrl);
   const candidates: string[] = [];
   try {
     const advertised = await probeResourceMetadataUrl(fetchImpl, mcpUrl);
@@ -194,7 +265,20 @@ export async function discoverProtectedResource(
   const failures: string[] = [];
   for (const url of candidates) {
     try {
-      return { url, metadata: await getJson<ProtectedResourceMetadata>(fetchImpl, url) };
+      // `advertised` comes out of a WWW-Authenticate header, i.e. off the
+      // network: a cleartext metadata URL there could name any authorization
+      // server it liked. Refused per candidate, so a good well-known path
+      // still gets its turn.
+      assertHttpsEndpoint('resource_metadata', url);
+      const metadata = await getJson<ProtectedResourceMetadata>(fetchImpl, url);
+      // RFC 9728 §3.3, as another per-candidate ACCEPTANCE test rather than a
+      // verdict on the probe — the same shape the transport check above and the
+      // issuer check in `discoverAuthorizationServer` use. A document that
+      // answers but describes a different resource is skipped with its reason
+      // recorded, so a generic well-known document on a shared origin cannot
+      // end a discovery the path-specific one would have completed.
+      assertResourceMatchesMcpUrl(metadata.resource, mcpUrl);
+      return { url, metadata };
     } catch (err) {
       failures.push(`${url}: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -213,7 +297,17 @@ export async function discoverAuthorizationServer(
   for (const url of authorizationServerMetadataUrls(issuer)) {
     try {
       const metadata = await getJson<AuthorizationServerMetadata>(fetchImpl, url);
-      if (metadata.authorization_endpoint && metadata.token_endpoint) return { url, metadata };
+      if (metadata.authorization_endpoint && metadata.token_endpoint) {
+        // RFC 8414 §3.3 is an ACCEPTANCE test for a candidate, not a verdict on
+        // the whole probe (#905 review round 2). The probe list deliberately
+        // includes the ROOT well-known path as a fallback for a path-carrying
+        // issuer, and on a multi-tenant host that document is complete and
+        // belongs to somebody else. Checking it after the loop let that
+        // document abort a discovery the issuer-specific candidate two entries
+        // later would have completed.
+        assertIssuerMatches(metadata.issuer, issuer, url);
+        return { url, metadata };
+      }
       failures.push(`${url}: no authorization_endpoint/token_endpoint`);
     } catch (err) {
       failures.push(`${url}: ${err instanceof Error ? err.message : String(err)}`);
@@ -257,9 +351,17 @@ export async function discoverAuthorization(
   // this is the document every endpoint below is read out of.
   assertHttpsEndpoint(issuerOverride ? '--issuer' : 'authorization_servers entry', issuer);
 
+  // The issuer match is enforced INSIDE `discoverAuthorizationServer`, as a
+  // candidate acceptance test — a document that fails it is skipped and the
+  // next candidate is tried, rather than ending the probe.
   const asDoc = await discoverAuthorizationServer(fetchImpl, issuer);
   return {
     resource: resourceDoc.metadata.resource,
+    // The metadata value, not the one we asked for: they are now known to be
+    // equal up to a trailing slash, and storing the server's own spelling keeps
+    // every already-stored row (`mcp_oauth_integrations.issuer`) byte-identical
+    // to what a re-login computes — which is what the client-reuse predicate in
+    // `service.ts` compares.
     issuer: asDoc.metadata.issuer ?? issuer,
     authorizationEndpoint: assertHttpsEndpoint('authorization_endpoint', asDoc.metadata.authorization_endpoint!),
     tokenEndpoint: assertHttpsEndpoint('token_endpoint', asDoc.metadata.token_endpoint!),

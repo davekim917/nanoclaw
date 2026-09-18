@@ -12,9 +12,7 @@ automatic: missing manifests, the OpenCode skill mirror, and always-on activatio
 Codex/OpenCode. Hook delivery is **conditional, and the condition is the manifest**:
 Claude always fires a plugin's SessionStart hook, Codex fires it only for a plugin it
 can register — one shipping `.codex-plugin/plugin.json` that declares a hook — and
-OpenCode has no plugin loader, so no hook path at all. A Codex-registerable plugin
-that declares no hook (bootstrap's `orchestrate` today, which ships both
-manifests) still needs the operator override below.
+OpenCode has no plugin loader, so no hook path at all.
 
 ## Scope: container agent groups only — never a host CLI
 
@@ -206,7 +204,7 @@ next spawn, and the enabler run is just a verification pass.
    | remove from `~/plugins` | effective | effective | **does not remove already-synced skills** |
 
    A sub-plugin path is written into the group's `container.json` by hand —
-   `"excludePlugins": ["bootstrap/plugins/orchestrate"]` — and the enabler's
+   `"excludePlugins": ["bootstrap/plugins/wwbd"]` — and the enabler's
    `--exclude` flag does not produce one. Both sub-plugin layouts the container-side
    walkers descend are accepted: `<repo>/plugins/<sub>` and `<repo>/<sub>`, and a
    malformed entry throws rather than being silently ignored.
