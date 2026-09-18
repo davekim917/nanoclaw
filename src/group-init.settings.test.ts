@@ -133,4 +133,18 @@ describe('skillOverrides (listing diet)', () => {
     expect(spy.mock.calls.filter(([target]) => target === file)).toHaveLength(0);
     spy.mockRestore();
   });
+
+  it("keeps a group's own skill overrides when adding ours", async () => {
+    const ag = await makeGroup('ag-own');
+    initGroupFilesystem(ag, {});
+    const file = path.join(TEST_ROOT, 'data', 'v2-sessions', ag.id, '.claude-shared', 'settings.json');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    s.skillOverrides = { 'custom-skill': 'off', loop: 'on' };
+    fs.writeFileSync(file, JSON.stringify(s, null, 2) + '\n');
+    initGroupFilesystem(ag, {});
+    const after = JSON.parse(fs.readFileSync(file, 'utf-8')).skillOverrides;
+    expect(after['custom-skill']).toBe('off');
+    expect(after.loop).toBe('user-invocable-only');
+    expect(after['update-config']).toBe('user-invocable-only');
+  });
 });

@@ -221,8 +221,25 @@ function ensureRequiredSettings(settingsFile: string): boolean {
     }
   }
   for (const [k, v] of Object.entries(REQUIRED_SETTINGS)) {
-    // By value: an object setting (skillOverrides) is never `===` the parsed copy.
-    if (JSON.stringify(settings[k]) !== JSON.stringify(v)) {
+    const cur = settings[k];
+    const isMap = (x: unknown): x is Record<string, unknown> => !!x && typeof x === 'object' && !Array.isArray(x);
+    if (isMap(v)) {
+      // Object setting (skillOverrides): merge our entries into the group's
+      // map. Replacing it would drop an override the group set itself and
+      // silently re-enable that skill.
+      const merged: Record<string, unknown> = isMap(cur) ? { ...cur } : {};
+      let dirty = !isMap(cur);
+      for (const [ek, ev] of Object.entries(v)) {
+        if (merged[ek] !== ev) {
+          merged[ek] = ev;
+          dirty = true;
+        }
+      }
+      if (dirty) {
+        settings[k] = merged;
+        changed = true;
+      }
+    } else if (JSON.stringify(cur) !== JSON.stringify(v)) {
       settings[k] = v;
       changed = true;
     }
