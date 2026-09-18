@@ -105,6 +105,13 @@ if [ "$1" = pr ]; then
   fi
   exit 0
 fi
+# gh api user: the account the gate runs as, MOCK_GH_USER; unset = the read fails.
+if [ "$1" = api ] && [ "$2" = user ]; then
+  printf 'api user\\n' >> "$MOCK_CALLS"
+  [ -n "\${MOCK_GH_USER:-}" ] || { echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1; }
+  echo "$MOCK_GH_USER"
+  exit 0
+fi
 rest=""
 for arg in "$@"; do
   case "$arg" in repos/*) rest="$arg" ;; esac
@@ -452,8 +459,10 @@ function workflowRun(
   };
 }
 
-function commitStatus(context: string, state: string, createdAt = '2026-09-05T00:02:00Z'): Page {
-  return { id: Date.parse(createdAt) / 1000, context, state, created_at: createdAt };
+// `creator` defaults to the account runHelper allows to post host CI
+// (CODEX_REVIEW_HOST_CI_POSTERS=fleet-bot); only a CI (host) status reads it.
+function commitStatus(context: string, state: string, createdAt = '2026-09-05T00:02:00Z', creator = 'fleet-bot'): Page {
+  return { id: Date.parse(createdAt) / 1000, context, state, created_at: createdAt, creator: { login: creator } };
 }
 
 // `reviewer` defaults to an allowed model so existing approve-path fixtures
@@ -530,8 +539,8 @@ function rollupRun(name: string, status: string, conclusion: string | null, isRe
   return { __typename: 'CheckRun', name, status, conclusion, isRequired };
 }
 
-function rollupStatus(context: string, state: string, isRequired = true): Page {
-  return { __typename: 'StatusContext', context, state, isRequired };
+function rollupStatus(context: string, state: string, isRequired = true, creator = 'fleet-bot'): Page {
+  return { __typename: 'StatusContext', context, state, isRequired, creator: { login: creator } };
 }
 
 // findings_json (the gate's payload) reads totalCount, which connectionPage omits.
@@ -652,6 +661,7 @@ exit 64
       MOCK_SLEEP_LOG: sleepLog,
       REVIEW_ROUND_CAP: '',
       CODEX_REVIEW_REQUIRED_WORKFLOWS: '',
+      CODEX_REVIEW_HOST_CI_POSTERS: 'fleet-bot',
       ...env,
     },
   });
@@ -5395,6 +5405,121 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
     expect(before.stdout).toContain('ci=host');
   });
 
+  // A run is excused only when EVERY job never started: a run with one job
+  // that ran is a run that started (#931, found by an any-for-all mutation).
+  it('keeps a run red when one of its jobs started, though another never did', () => {
+    const root = tempRoot();
+    const result = mergeCheck(
+      root,
+      (r) => {
+        const run = workflowRun('CI', 'completed', 'failure');
+        writeJson(r, `jobs--${run.id as number}.json`, { total_count: 2, jobs: [actionsJob(false), actionsJob(true)] });
+        return [run];
+      },
+      [commitStatus(HOST, 'success')],
+    );
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('ci_red: CI=failure (required)');
+  });
+
+  // Each conjunct of never_started on its own: no runner id, no runner name,
+  // and no step. A job with any one of them ran.
+  it.each<[string, Page]>([
+    ['a runner id, but no runner name and no step', { runner_id: 5, runner_name: '', steps: [] }],
+    ['a runner name, but no runner id and no step', { runner_id: 0, runner_name: 'GitHub Actions 5', steps: [] }],
+    ['a step, but no runner', { runner_id: 0, runner_name: '', steps: [{ name: 'Set up job', status: 'completed' }] }],
+  ])('counts a job with %s as started, so its failure stays red', (_case, shape) => {
+    const root = tempRoot();
+    const result = mergeCheck(
+      root,
+      (r) => {
+        const run = workflowRun('CI', 'completed', 'failure');
+        writeJson(r, `jobs--${run.id as number}.json`, {
+          total_count: 1,
+          jobs: [{ ...actionsJob(false), ...shape }],
+        });
+        return [run];
+      },
+      [commitStatus(HOST, 'success')],
+    );
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('ci_red: CI=failure (required)');
+  });
+
+  // Who posted the CI (host) status (#931): a commit status is writable by any
+  // token with statuses:write, so only an allowed poster's stands in.
+  describe('who may post CI (host)', () => {
+    function mergeCheckAs(root: string, statuses: Page[], env: Record<string, string>) {
+      scopeFixture(root, { labels: [], ci: [failedRun(root, false)], statuses });
+      return runHelper(root, ['merge-check', '--head', HEAD], env);
+    }
+
+    it('refuses a CI (host) success from an account that is not an allowed poster', () => {
+      const root = tempRoot();
+      const result = mergeCheckAs(root, [commitStatus(HOST, 'success', undefined, 'someone-else')], {});
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('CI=not started (required;');
+      expect(result.stderr).toContain('no CI (host) success from fleet-bot is on this head');
+    });
+
+    it("does not let a newer success from someone else hide an allowed poster's failure", () => {
+      const root = tempRoot();
+      const result = mergeCheckAs(
+        root,
+        [
+          commitStatus(HOST, 'failure', '2026-09-05T00:02:00Z'),
+          commitStatus(HOST, 'success', '2026-09-05T00:03:00Z', 'someone-else'),
+        ],
+        {},
+      );
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('CI=not started (required;');
+    });
+
+    it('takes the allowlist from CODEX_REVIEW_HOST_CI_POSTERS, comma-separated', () => {
+      const root = tempRoot();
+      const result = mergeCheckAs(root, [commitStatus(HOST, 'success', undefined, 'second')], {
+        CODEX_REVIEW_HOST_CI_POSTERS: 'first, second',
+      });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('ci=host');
+      expect(result.calls).not.toContain('api user');
+    });
+
+    it('defaults to the account the gate itself runs as', () => {
+      const root = tempRoot();
+      const same = mergeCheckAs(root, [commitStatus(HOST, 'success', undefined, 'gate-account')], {
+        CODEX_REVIEW_HOST_CI_POSTERS: '',
+        MOCK_GH_USER: 'gate-account',
+      });
+      expect(same.status).toBe(0);
+      expect(same.stdout).toContain('ci=host');
+      expect(same.calls).toContain('api user');
+      const other = mergeCheckAs(root, [commitStatus(HOST, 'success', undefined, 'gate-account')], {
+        CODEX_REVIEW_HOST_CI_POSTERS: '',
+        MOCK_GH_USER: 'another-account',
+      });
+      expect(other.status).toBe(24);
+    });
+
+    it('allows no one when nothing is configured and the identity cannot be read', () => {
+      const root = tempRoot();
+      const result = mergeCheckAs(root, [commitStatus(HOST, 'success')], { CODEX_REVIEW_HOST_CI_POSTERS: '' });
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('set CODEX_REVIEW_HOST_CI_POSTERS');
+    });
+
+    it('never reads the identity for a head with nothing to excuse', () => {
+      const root = tempRoot();
+      const result = mergeCheck(root, () => [workflowRun('CI', 'completed', 'success')], [
+        commitStatus(HOST, 'success'),
+      ]);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('ci=green');
+      expect(result.calls).not.toContain('api user');
+    });
+  });
+
   describe('legacy repos: a required check run GitHub never started', () => {
     const JOB = 105741202176;
     const neverRun = (): Page => ({ ...rollupRun('CI Gate', 'COMPLETED', 'FAILURE'), databaseId: JOB });
@@ -5414,11 +5539,32 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
       expect(result.stderr).toContain('required CI Gate never started on Actions');
     });
 
+    // XZO's shape: the ruleset requires `CI Gate` by name, and run-host-ci.sh
+    // posts a `CI Gate` status beside `CI (host)` when the declaration stands
+    // in for it. The gate reads the pair the same way as `CI (host)` alone.
+    it('defers with ci=host beside a CI Gate stand-in status, and refuses when the stand-in is red', () => {
+      const root = tempRoot();
+      legacy(root, [neverRun(), rollupStatus('CI Gate', 'SUCCESS'), rollupStatus(HOST, 'SUCCESS', false)], false);
+      const green = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(green.status).toBe(26);
+      expect(green.stdout).toContain('merge=defer mode=legacy ci=host:');
+
+      legacy(root, [neverRun(), rollupStatus('CI Gate', 'FAILURE'), rollupStatus(HOST, 'FAILURE', false)], false);
+      const red = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(red.status).toBe(24);
+      expect(red.stderr).toContain('required_red: CI Gate=failure');
+    });
+
     it.each<[string, Page[], boolean | null]>([
       ['no CI (host) status', [], false],
       ['a CI (host) failure', [rollupStatus(HOST, 'FAILURE', false)], false],
       ['a job that started and failed', [rollupStatus(HOST, 'SUCCESS', false)], true],
       ['a job that cannot be read', [rollupStatus(HOST, 'SUCCESS', false)], null],
+      [
+        'a CI (host) success from an account that is not an allowed poster',
+        [rollupStatus(HOST, 'SUCCESS', false, 'someone-else')],
+        false,
+      ],
     ])('refuses required_red with %s', (_case, extra, started) => {
       const root = tempRoot();
       legacy(root, [neverRun(), ...extra], started);

@@ -510,15 +510,9 @@ CI_EXCLUDED_CONTEXTS='["Release policy","Release approval"]'
 # The commit status run-host-ci.sh posts: the repository's declared CI, run on
 # a host against the exact head. It stands in for a required Actions workflow
 # only when GitHub never started that workflow's jobs (never_started_runs);
-# otherwise it is one more status, and red when it is red.
+# otherwise it is one more status, and red when it is red. What "never started"
+# means is never-started.jq, shared with run-host-ci.sh.
 HOST_CI_CONTEXT='CI (host)'
-# An Actions job GitHub never started: completed with no runner ever assigned
-# and no step run. That is the billing lockout's shape — "The job was not
-# started because recent account payments have failed..." (annotation on check
-# run 105741202176, run 35388540873, 2026-09-18: runner_id 0, runner_name "",
-# steps []) — against a job that ran and failed, which always has a runner and
-# steps (run 35185456083: runner "GitHub Actions 1000006727", 25 steps).
-NEVER_STARTED_JQ='def never_started: .status == "completed" and ((.steps // []) | length) == 0 and (.runner_id // 0) == 0 and (.runner_name // "") == "";'
 # The request marker, hidden in the rendered comment. It is how `request`
 # dedupes per head and counts rounds, and how `merge-check` learns when THIS
 # head's review was asked for. Its existing creation timestamp is also the
@@ -1257,12 +1251,20 @@ review_notes_state() {
 # failed stays red whatever the host status says, and a red host status is red
 # like any other. A non-required run that never started is left out, as if it
 # had not been triggered.
+#
+# Which host status counts is decided by who posted it: only a HOST_CI_CONTEXT
+# status whose creator is in host_ci_posters stands in, and the newest such
+# status is the one judged. One from anyone else stands in for nothing (it is
+# still an ordinary status, so it is red when it is red).
 ci_verdict() {
-  local runs statuses unstarted required="${CODEX_REVIEW_REQUIRED_WORKFLOWS:-CI}"
+  local runs statuses unstarted posters='[]' required="${CODEX_REVIEW_REQUIRED_WORKFLOWS:-CI}"
   runs=$(gh api --paginate --slurp "repos/$REPO/actions/runs?head_sha=$1&per_page=100") || return 1
   statuses=$(gh api --paginate --slurp "repos/$REPO/commits/$1/statuses?per_page=100") || return 1
   unstarted=$(never_started_runs "$1" "$runs") || return 1
-  printf '%s\n%s\n' "$runs" "$statuses" | jq -rs --arg head "$1" --arg labeler "$RISK_LABEL_WORKFLOW" --arg requiredList "$required" --argjson excluded "$CI_EXCLUDED_CONTEXTS" --arg asof "$GATE_AS_OF" --argjson unstarted "$unstarted" --arg hostContext "$HOST_CI_CONTEXT" '
+  # Only asked when something could be excused, so a healthy head never pays
+  # for (or fails on) the identity read.
+  if [ "$unstarted" != '[]' ]; then posters=$(host_ci_posters); fi
+  printf '%s\n%s\n' "$runs" "$statuses" | jq -rs --arg head "$1" --arg labeler "$RISK_LABEL_WORKFLOW" --arg requiredList "$required" --argjson excluded "$CI_EXCLUDED_CONTEXTS" --arg asof "$GATE_AS_OF" --argjson unstarted "$unstarted" --arg hostContext "$HOST_CI_CONTEXT" --argjson posters "$posters" '
     ( $requiredList | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) ) as $required
     | ( [ .[0][].workflow_runs[]?
         | select(.head_sha == $head)
@@ -1274,7 +1276,9 @@ ci_verdict() {
     | ( [ .[1][][]? | select(.context as $c | $excluded | index($c) | not)
           | select($asof == "" or (.created_at // "") <= $asof) ]
         | group_by(.context) | map(max_by([.created_at // "", .id // 0])) ) as $statuses
-    | ( [ $statuses[] | select(.context == $hostContext) | .state ] | first // "none" ) as $hostState
+    | ( [ .[1][][]? | select(.context == $hostContext and ((.creator.login // "") | IN($posters[])))
+          | select($asof == "" or (.created_at // "") <= $asof) ]
+        | if length == 0 then "none" else max_by([.created_at // "", .id // 0]).state end ) as $hostState
     | ($hostState == "success") as $hostGreen
     | ( [ $runs[] | select(.status == "completed" and (.id | IN($unstarted[]))) ] ) as $never
     | ( [ $never[] | select(.name as $n | $required | index($n) != null) ] ) as $neverRequired
@@ -1283,7 +1287,7 @@ ci_verdict() {
           | (.name as $n | $required | index($n) != null) as $isRequired
           | select((.conclusion // "") as $c | if $isRequired then $c != "success" else ($c | IN("success", "neutral", "skipped") | not) end)
           | "\(.name)=\(.conclusion // "none")\(if $isRequired then " (required)" else "" end)" ]
-        + ( if $hostGreen or $hostState == "pending" then [] else [ $neverRequired[] | "\(.name)=not started (required; GitHub never started its jobs and no \($hostContext) success is on this head — run run-host-ci.sh)" ] end )
+        + ( if $hostGreen or $hostState == "pending" then [] else [ $neverRequired[] | "\(.name)=not started (required; GitHub never started its jobs and no \($hostContext) success from \(if ($posters | length) == 0 then "an allowed poster (none could be resolved: set CODEX_REVIEW_HOST_CI_POSTERS)" else ($posters | join("/")) end) is on this head — run run-host-ci.sh)" ] end )
         + [ $statuses[] | select(.state != "success" and .state != "pending") | "\(.context)=\(.state)" ] ) as $red
     | [ $required[] | . as $n | select(any($runs[]; .name == $n) | not) ] as $missing
     | ( [ $runs[] | select(.status != "completed") | "\(.name)=\(.status)" ]
@@ -1296,9 +1300,32 @@ ci_verdict() {
       else empty end'
 }
 
+# Who may post a HOST_CI_CONTEXT status that stands in for Actions, as a JSON
+# array of logins: CODEX_REVIEW_HOST_CI_POSTERS (comma-separated) when set,
+# else the one account this script itself authenticates as. A commit status
+# is writable by anything holding `statuses:write` on the repo — a
+# collaborator's token, another App, or a PR's own workflow token posting as
+# github-actions[bot] — and without this any of them could post `CI (host)`
+# success on a head and excuse a required workflow that never ran. The
+# default is this script's own login because the fleet runs this gate and
+# run-host-ci.sh with the same credential: one GITHUB_TOKEN per agent group,
+# resolved by resolveGitHubToken (src/github-token.ts:8-19) and handed to the
+# container as one file every git/gh call reads (src/github-token-file.ts:
+# 36-38), so the account run-host-ci.sh posts as is the account this reads
+# here. The repo owner is not a usable default: in an org-owned repo the
+# owner is the org, which never authors a status — only a user or App does. An empty answer (the identity
+# read failed and nothing is configured) allows no one, so nothing stands in.
+host_ci_posters() {
+  local list="${CODEX_REVIEW_HOST_CI_POSTERS:-}"
+  if [ -z "$list" ]; then
+    list=$(gh api user --jq .login 2>/dev/null) || list=""
+  fi
+  jq -cn --arg list "$list" '$list | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))'
+}
+
 # The ids, as a JSON array, of the Actions runs on head $1 (from $2, the
 # slurped actions/runs pages) whose jobs GitHub never started: completed
-# `failure`, at least one job, every job never_started (NEVER_STARTED_JQ) and
+# `failure`, at least one job, every job never_started (never-started.jq) and
 # one of them `failure`. Only failed runs are asked about, one jobs read each.
 # A jobs read that fails leaves its run out, which keeps it red: not knowing
 # whether a run started is never a reason to excuse it. Under `audit`, runs
@@ -1311,7 +1338,7 @@ never_started_runs() {
   for id in $ids; do
     [[ "$id" =~ ^[0-9]+$ ]] || continue
     jobs=$(gh api --paginate --slurp "repos/$REPO/actions/runs/$id/jobs?per_page=100" 2>/dev/null) || continue
-    if printf '%s\n' "$jobs" | jq -e "$NEVER_STARTED_JQ"' [ .[].jobs[]? ] | length > 0 and all(.[]; never_started) and any(.[]; .conclusion == "failure")' >/dev/null 2>&1; then
+    if printf '%s\n' "$jobs" | jq -e -L "$HERE" 'include "never-started"; [ .[].jobs[]? ] | length > 0 and all(.[]; never_started) and any(.[]; .conclusion == "failure")' >/dev/null 2>&1; then
       out=$(jq -cn --argjson o "$out" --argjson id "$id" '$o + [$id]') || return 1
     fi
   done
@@ -1440,7 +1467,7 @@ rollup_page() {
         headRefOid statusCheckRollup{ contexts(first:100,after:$after){ pageInfo{hasNextPage endCursor} nodes{
           __typename
           ... on CheckRun{ databaseId name status conclusion isRequired(pullRequestNumber:$pr) }
-          ... on StatusContext{ context state isRequired(pullRequestNumber:$pr) }
+          ... on StatusContext{ context state creator{ login } isRequired(pullRequestNumber:$pr) }
         } } }
       } }
     }' \
@@ -1470,25 +1497,31 @@ rollup_page() {
 #
 # Output is `<red>\t<hosted>`. A required check run that concluded FAILURE
 # because GitHub never started it (its Actions job, read by the check run's
-# databaseId, is never_started — NEVER_STARTED_JQ) is not red when the
-# rollup's HOST_CI_CONTEXT status on this head is SUCCESS; it is named in
-# <hosted> instead. As in ci_verdict, a job read that fails keeps it red.
+# databaseId, is never_started — never-started.jq) is not red when the
+# rollup's HOST_CI_CONTEXT status on this head is SUCCESS and was posted by an
+# allowed poster (host_ci_posters); it is named in <hosted> instead. The rollup
+# carries only the newest status per context, so a newer one from anyone else
+# hides an allowed success and the check run stays red. As in ci_verdict, a
+# job read that fails keeps it red.
 required_status_red() {
-  local pages rollup candidates id job unstarted='[]'
+  local pages rollup candidates id job posters='[]' unstarted='[]'
   pages=$(paginate_connection statusCheckRollup.contexts rollup_page) || return 1
   rollup=$(printf '%s\n' "$pages" | jq -cs --arg head "$1" '
     if all(.[]; .data.repository.pullRequest.headRefOid == $head) | not
     then error("the status rollup read is for another head than \($head)") else . end
     | [ .[] | .data.repository.pullRequest.statusCheckRollup.contexts.nodes[] ]') || return 1
-  candidates=$(printf '%s\n' "$rollup" | jq -r --arg ctx "$HOST_CI_CONTEXT" '
-    if any(.[]; .__typename == "StatusContext" and .context == $ctx and .state == "SUCCESS")
+  if printf '%s\n' "$rollup" | jq -e --arg ctx "$HOST_CI_CONTEXT" 'any(.[]; .__typename == "StatusContext" and .context == $ctx and .state == "SUCCESS")' >/dev/null; then
+    posters=$(host_ci_posters)
+  fi
+  candidates=$(printf '%s\n' "$rollup" | jq -r --arg ctx "$HOST_CI_CONTEXT" --argjson posters "$posters" '
+    if any(.[]; .__typename == "StatusContext" and .context == $ctx and .state == "SUCCESS" and ((.creator.login // "") | IN($posters[])))
     then [ .[] | select(.__typename == "CheckRun" and .isRequired == true and .status == "COMPLETED" and .conclusion == "FAILURE")
            | .databaseId | select(type == "number") ] | unique | .[]
     else empty end') || return 1
   for id in $candidates; do
     [[ "$id" =~ ^[0-9]+$ ]] || continue
     job=$(gh api "repos/$REPO/actions/jobs/$id" 2>/dev/null) || continue
-    if printf '%s\n' "$job" | jq -e "$NEVER_STARTED_JQ"' never_started and .conclusion == "failure"' >/dev/null 2>&1; then
+    if printf '%s\n' "$job" | jq -e -L "$HERE" 'include "never-started"; never_started and .conclusion == "failure"' >/dev/null 2>&1; then
       unstarted=$(jq -cn --argjson o "$unstarted" --argjson id "$id" '$o + [$id]') || return 1
     fi
   done

@@ -38,10 +38,25 @@ function ciRunSteps(): string[] {
     });
 }
 
-function declaredSteps(): string[] {
-  const lines = fs.readFileSync(DECLARATION, 'utf8').split('\n');
-  const start = lines.indexOf('set -euo pipefail');
-  expect(start).toBeGreaterThan(0);
+/**
+ * The declaration's commands: every line after `set -euo pipefail`, blanks and
+ * comments dropped. `set -euo pipefail` must be the first line of code — only
+ * the shebang, blank lines and comments may come before it — because a line
+ * above it runs before anything this test compares: an `exit 0` there, or a
+ * `pnpm() { :; }` that shadows pnpm, would leave every compared line intact
+ * and run nothing (#931, found by mutation).
+ */
+function declaredSteps(text: string): string[] {
+  const lines = text.split('\n');
+  const start = lines.findIndex((line) => {
+    const trimmed = line.trim();
+    return trimmed !== '' && !trimmed.startsWith('#');
+  });
+  if (start < 0 || lines[start] !== 'set -euo pipefail') {
+    throw new Error(
+      `the first line of code must be exactly \`set -euo pipefail\`, found ${JSON.stringify(lines[start] ?? null)}`,
+    );
+  }
   return lines
     .slice(start + 1)
     .map((line) => line.trim())
@@ -52,11 +67,26 @@ describe('.github/host-ci.sh mirrors ci.yml', () => {
   it("runs exactly ci.yml's pull_request-lane run steps, in order", () => {
     const steps = ciRunSteps();
     expect(steps.length).toBeGreaterThan(0);
-    expect(declaredSteps()).toEqual(steps);
+    expect(declaredSteps(fs.readFileSync(DECLARATION, 'utf8'))).toEqual(steps);
   });
 
   it('is a strict bash script', () => {
     const text = fs.readFileSync(DECLARATION, 'utf8');
     expect(text.startsWith('#!/usr/bin/env bash\n')).toBe(true);
+  });
+
+  // The comparison itself, against the mutations that once passed it.
+  it.each([
+    ['an early exit', '#!/usr/bin/env bash\n# header\nexit 0\nset -euo pipefail\npnpm exec tsc --noEmit\n'],
+    ['a shadowing function', '#!/usr/bin/env bash\npnpm() { :; }\nset -euo pipefail\npnpm exec tsc --noEmit\n'],
+    ['no strict mode at all', '#!/usr/bin/env bash\npnpm exec tsc --noEmit\n'],
+    ['a weaker strict mode', '#!/usr/bin/env bash\nset -eu\npnpm exec tsc --noEmit\n'],
+  ])('refuses a declaration with code before strict mode: %s', (_case, text) => {
+    expect(() => declaredSteps(text)).toThrow('first line of code');
+  });
+
+  it('counts a shadowing function after strict mode as a step, so the comparison fails', () => {
+    const text = '#!/usr/bin/env bash\n# a comment\nset -euo pipefail\npnpm() { :; }\npnpm exec tsc --noEmit\n';
+    expect(declaredSteps(text)).toEqual(['pnpm() { :; }', 'pnpm exec tsc --noEmit']);
   });
 });
