@@ -178,6 +178,7 @@ import {
   hasDueRecoveryWake,
   hasNonStatusReplyTo,
   latestInboundTimestamp,
+  latestOutboundChat,
   latestOutboundTimestamp,
   latestRecoveryMarkerId,
   latestRecoveryMarkerTimestamp,
@@ -189,6 +190,7 @@ import {
   writeOutboundDirectRow,
   type DirectOutboundRow,
   type InboundMessageRouting,
+  type OutboundChatRow,
 } from './ops/recovery.js';
 
 export { SessionDbMissingError, SessionDbUnopenableError } from './openers.js';
@@ -201,7 +203,7 @@ export {
   type HostWorkContinuation,
 } from './ops/continuation.js';
 export { writeOutboundDirectRow } from './ops/recovery.js';
-export type { DirectOutboundRow, InboundMessageRouting } from './ops/recovery.js';
+export type { DirectOutboundRow, InboundMessageRouting, OutboundChatRow } from './ops/recovery.js';
 export { INTERACTIVE_WAKE_MAX_AGE_MS, type ContainerState as ForkContainerStateRow } from './ops/sweep.js';
 export { readRepoIngressFence } from './ops/fence.js';
 export {
@@ -608,6 +610,8 @@ export interface NanoclawMailboxSession extends MailboxSession {
   readMessageRouting(messageId: string): InboundMessageRouting | undefined;
   latestInboundTimestamp(): string | null;
   latestOutboundTimestamp(): string | null;
+  /** Most recent outbound `chat` row (status edits excluded), or null. */
+  latestOutboundChat(): OutboundChatRow | null;
   markInboundCompletedIfPending(messageId: string): void;
   outboundHasContentLike(marker: string): boolean;
   outboundHasRecentContentLike(marker: string, withinSeconds: number): boolean;
@@ -1276,6 +1280,7 @@ function forkOps(
     readMessageRouting: (messageId) => readMessageRouting(inbound, messageId),
     latestInboundTimestamp: () => latestInboundTimestamp(inbound),
     latestOutboundTimestamp: () => readOutbound(null, latestOutboundTimestamp),
+    latestOutboundChat: () => readOutbound(null, latestOutboundChat),
     markInboundCompletedIfPending: (messageId) => markInboundCompletedIfPending(inbound, messageId),
     outboundHasContentLike: (marker) => readOutbound(false, (outbound) => outboundHasContentLike(outbound, marker)),
     outboundHasRecentContentLike: (marker, withinSeconds) =>

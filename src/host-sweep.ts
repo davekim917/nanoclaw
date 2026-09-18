@@ -766,6 +766,10 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   // injecting the dead token and every spawn's stdio bridge died with
   // CONNECTION_CLOSED. Body in `src/modules/mcp-oauth/`.
   FORK4: 'mcp-oauth-refresh',
+  // Fork addition (2026-09-18): an agent's promise of later work with nothing
+  // armed to keep it ("I'll confirm tomorrow") was dropped whenever the session
+  // went quiet. Body in `src/modules/sweep-promise-watch/`.
+  FORK5: 'promise-watch',
   S2: 'processing-ack-sync',
   S3: 'stale-pending-expiry',
   S4: 'pre-wake-orphan-claim-reset',
