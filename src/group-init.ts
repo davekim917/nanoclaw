@@ -115,6 +115,32 @@ const REQUIRED_SETTINGS: Record<string, unknown> = {
   // (Codex/OpenCode have no output-style concept); tone for those providers
   // still comes from the CLAUDE.md voice slot.
   outputStyle: 'Concise',
+  // Every model call re-reads the skill listing (~6.8k tokens across ~100
+  // skills, measured 2026-09-18). Zero-use bundled skills are hidden from the
+  // agent but stay callable as `/name` (`user-invocable-only`); rarely used
+  // ones keep their name, drop the description (`name-only`). Plugin skills
+  // are not covered by skillOverrides — those are withheld per group with
+  // container.json `excludePlugins`.
+  skillOverrides: {
+    'update-config': 'user-invocable-only',
+    'keybindings-help': 'user-invocable-only',
+    'fewer-permission-prompts': 'user-invocable-only',
+    schedule: 'user-invocable-only',
+    loop: 'user-invocable-only',
+    run: 'user-invocable-only',
+    simplify: 'user-invocable-only',
+    init: 'user-invocable-only',
+    'security-review': 'user-invocable-only',
+    'code-review': 'user-invocable-only',
+    'workflow-authoring': 'user-invocable-only',
+    'claude-api': 'name-only',
+    welcome: 'name-only',
+    'vercel-cli': 'name-only',
+    hex: 'name-only',
+    'frontend-engineer': 'name-only',
+    'self-customize': 'name-only',
+    'slack-a2a-rooms': 'name-only',
+  },
 };
 
 // Pre-compaction hook (container-side): runs before the SDK auto-compacts so
@@ -195,7 +221,8 @@ function ensureRequiredSettings(settingsFile: string): boolean {
     }
   }
   for (const [k, v] of Object.entries(REQUIRED_SETTINGS)) {
-    if (settings[k] !== v) {
+    // By value: an object setting (skillOverrides) is never `===` the parsed copy.
+    if (JSON.stringify(settings[k]) !== JSON.stringify(v)) {
       settings[k] = v;
       changed = true;
     }

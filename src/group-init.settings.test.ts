@@ -105,3 +105,32 @@ describe('quota env reconciliation (PR #810 F2)', () => {
     expect(after.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
   });
 });
+
+describe('skillOverrides (listing diet)', () => {
+  it('hides zero-use bundled skills but keeps them /name-invocable, on new and existing groups', async () => {
+    const ag = await makeGroup('ag-skills');
+    initGroupFilesystem(ag, {});
+    const file = path.join(TEST_ROOT, 'data', 'v2-sessions', ag.id, '.claude-shared', 'settings.json');
+    const fresh = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(fresh.skillOverrides['update-config']).toBe('user-invocable-only');
+    expect(fresh.skillOverrides['claude-api']).toBe('name-only');
+    // No entry may use 'off' — that would make a skill uninvocable even by name.
+    expect(Object.values(fresh.skillOverrides)).not.toContain('off');
+
+    // An existing group predating the key picks it up on the next spawn.
+    delete fresh.skillOverrides;
+    fs.writeFileSync(file, JSON.stringify(fresh, null, 2) + '\n');
+    initGroupFilesystem(ag, {});
+    expect(JSON.parse(fs.readFileSync(file, 'utf-8')).skillOverrides.loop).toBe('user-invocable-only');
+  });
+
+  it('does not rewrite settings.json on every spawn once the object setting already matches', async () => {
+    const ag = await makeGroup('ag-stable');
+    initGroupFilesystem(ag, {});
+    const file = path.join(TEST_ROOT, 'data', 'v2-sessions', ag.id, '.claude-shared', 'settings.json');
+    const spy = vi.spyOn(fs, 'writeFileSync');
+    initGroupFilesystem(ag, {});
+    expect(spy.mock.calls.filter(([target]) => target === file)).toHaveLength(0);
+    spy.mockRestore();
+  });
+});
