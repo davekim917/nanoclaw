@@ -1007,6 +1007,8 @@ by default. Use the `agent-browser` skill.
   confirmation behavior, accessibility, and visual hierarchy as testable parity
   candidates rather than subjective nits.
 - Record a short clip of each candidate finding's reproduction. See below.
+- With `SMOKE_VISUAL_DISPOSITIONS=1`, disposition every visual candidate (see
+  "Visual candidates").
 - Restore mutated test data or list every residue that could not be restored.
 
 ### Reproduction clips
@@ -1140,6 +1142,48 @@ against `<run-dir>` and `$SMOKE_WORKGROUP_ROOT`, default
 private path like `/tmp/contact-sheet-auth-<runId>.json` and delete it once
 the sheet is captured — the script doesn't own that file and won't delete it
 for you.
+
+### Visual candidates — detection always ends owned
+
+**Only where the install exports `SMOKE_VISUAL_DISPOSITIONS=1`**; unset, the
+critic stays optional and shadow as above, and this section does not apply.
+Nothing the sheet or critic flags is then "advisory". Pipe the critic's
+`GRADE · <shot filename> · <reason>` lines into `smoke-visual-candidates.py
+record-critic <run-dir> --rubric <file>`; a critic that could not run is
+recorded with `--unavailable <reason>`, never omitted. `list <run-dir>` names
+the **candidates**, one per screen and width:
+
+- the critic graded it `BROKEN`;
+- its capture failed, or the pinned journeys require a screen the manifest lacks;
+- it was captured `settled: false`;
+- the critic graded it `DEGRADED` **and** the baseline diff says this build
+  `changed` it;
+- `critic@sheet`, when the critic was recorded unavailable.
+
+The UI adversary reproduces each in a viewport at that width on the bound
+build, and records exactly one disposition with `dispose <run-dir> <candidate>
+<disposition> --by <who> …`:
+
+| Disposition | Carries | Then |
+| --- | --- | --- |
+| `confirmed` | `--finding <id> --evidence <viewport capture>` | A normal section 4 finding in `confirmedFindings`. |
+| `refuted-capture-artifact` | `--reason --evidence <viewport capture>` | `aggregate <run-root> known-artifacts` tells the next critic. |
+| `deferred` | `--owner --trigger` | Real but tolerable. |
+| `blocked` | `--reason` | On the verdict's Untested line. |
+
+A failed capture is **missing evidence for that journey**: re-capture it, or
+record `confirmed`/`blocked`. A disposition is bound to the capture and critic
+record it judged; a re-capture or re-grade voids it. Only an author-PR campaign
+passes a baseline url (a freeze campaign's diff is the whole release range).
+
+Both writers need `SMOKE_LANE_ROLE`, recorded as `side`; refuting or deferring
+a `BROKEN` must come from the side that did not record the critic.
+
+`smoke-evidence-barrier.sh synthesis` refuses while a required sheet has no
+manifest or critic record, or a candidate lacks a valid disposition —
+COMPLETENESS ONLY, like the clip rule. Any honest disposition clears readiness;
+the verdict moves only through a `confirmed` finding's severity. `aggregate
+<run-root> critic-log` derives the shared critic log.
 
 ### Backend and specification verifier
 
