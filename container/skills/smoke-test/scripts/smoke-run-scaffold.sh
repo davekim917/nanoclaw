@@ -195,8 +195,9 @@ prepare_lease_dir() {
 
 begin_active_run_fence() {  # <artifact description>
   local description="$1" state_dir="${SMOKE_GATE_STATE_DIR:-}" run_id f count=0
-  local state owner pr lease authority expires_epoch state_kind=""
+  local state owner pr lease authority expires_epoch state_kind="" lease_slug env_slug
   run_id="$(basename "$RUN_DIR")"
+  FENCED_PR=""; FENCED_REPO_SLUG=""; FENCED_REPO_CONFLICT=""
   [ -n "$state_dir" ] || die "SMOKE_GATE_STATE_DIR is unset — the run's gate claim cannot be verified, so $description is refused"
   FENCED_STATE_FILE=""
   for f in "$state_dir"/pr-*-state.json; do
@@ -294,6 +295,25 @@ begin_active_run_fence() {  # <artifact description>
   done
   expires_epoch="$(date -u -d "$(jq -r '.expiresAt' <<<"$lease")" +%s 2>/dev/null || printf 0)"
   [ "$(date -u +%s)" -lt "$expires_epoch" ] || die "shared coordinator lease expired — STOP this campaign"
+  # CAMPAIGN IDENTITY, taken under this fence and stamped into the contract:
+  # `pr` from the fenced state (the lease agreed, above) and `repoSlug` from
+  # the gate-authored lease (smoke-pr-gate.sh lease_acquire records it), else
+  # SMOKE_GATE_REPO normalized exactly as smoke-pr-gate.sh journeys_repo_slug
+  # does. The barrier reads the campaign's journeys pin by these two plus the
+  # contract's sourceSha, from the contract alone — never from the lease
+  # (finish/release delete it), a directory listing, or a local catalogue (a
+  # second coordinator may have none). Both sources present and disagreeing is
+  # a conflict; neither is an identity that cannot be completed; either is
+  # refused where the identity is written (require_fenced_campaign_identity).
+  FENCED_PR="$pr"
+  lease_slug="$(jq -r '.repoSlug // empty' <<<"$lease")"
+  env_slug=""
+  [ -z "${SMOKE_GATE_REPO:-}" ] ||
+    env_slug="$(printf '%s' "$SMOKE_GATE_REPO" | sed -e 's#/#__#g' -e 's/[^A-Za-z0-9._-]/_/g')"
+  if [ -n "$lease_slug" ] && [ -n "$env_slug" ] && [ "$lease_slug" != "$env_slug" ]; then
+    FENCED_REPO_CONFLICT="the shared lease records repo $lease_slug but SMOKE_GATE_REPO normalizes to $env_slug"
+  fi
+  FENCED_REPO_SLUG="${lease_slug:-$env_slug}"
   authority="$(jq -c --argjson pr "$pr" '
     select(type == "object" and .schemaVersion == 1 and .pr == $pr and
       (.runId|type == "string" and length > 0) and
@@ -304,6 +324,31 @@ begin_active_run_fence() {  # <artifact description>
   [ "$(jq -r '.runId' <<<"$authority")" = "$run_id" ] &&
     [ "$(jq -r '.owner' <<<"$authority")" = "$DEFAULT_OWNER" ] ||
     die "shared PR authority belongs to another run or owner — STOP this campaign"
+}
+
+# The contract is the durable record of a pr campaign's identity, so it is
+# written (or backfilled) only with a complete, unconflicted one.
+require_fenced_campaign_identity() {  # <artifact description>
+  [ "$FENCED_STATE_KIND" = pr ] || return 0
+  [ -z "$FENCED_REPO_CONFLICT" ] ||
+    die "campaign repo identity conflicts ($FENCED_REPO_CONFLICT) — refusing $1"
+  [ -n "$FENCED_REPO_SLUG" ] ||
+    die "campaign repo identity is unknown: the shared lease carries no repoSlug and SMOKE_GATE_REPO is unset — refusing $1; claim through a gate that records repoSlug, or export SMOKE_GATE_REPO"
+  printf '%s' "$FENCED_PR" | grep -Eq '^[0-9]+$' || die "active PR state has no valid PR number — refusing $1"
+}
+
+# A pr contract's identity never changes after it is written: a rewrite
+# (contract --regenerate) or an adoption onto a contract that names another
+# PR or repo is a different campaign, and is refused.
+require_contract_identity_unchanged() {  # <artifact description>
+  local prior_pr prior_slug
+  [ "$FENCED_STATE_KIND" = pr ] || return 0
+  prior_pr="$(jq -r 'if type == "object" and (.pr | type) == "number" then .pr else "" end' "$CONTRACT" 2>/dev/null || printf '')"
+  prior_slug="$(jq -r 'if type == "object" and (.repoSlug | type) == "string" then .repoSlug else "" end' "$CONTRACT" 2>/dev/null || printf '')"
+  [ -z "$prior_pr" ] || [ "$prior_pr" = "$FENCED_PR" ] ||
+    die "completion contract is bound to PR #$prior_pr, not #$FENCED_PR — a contract's campaign identity never changes; refusing $1"
+  [ -z "$prior_slug" ] || [ "$prior_slug" = "$FENCED_REPO_SLUG" ] ||
+    die "completion contract is bound to repo $prior_slug, not $FENCED_REPO_SLUG — a contract's campaign identity never changes; refusing $1"
 }
 
 require_fenced_source_sha() {
@@ -376,6 +421,7 @@ contract)
   [ "$#" -gt 0 ] || die "contract requires at least one lane"
   begin_active_run_fence "the completion contract"
   require_fenced_source_sha "$SOURCE_SHA"
+  require_fenced_campaign_identity "the completion contract"
 
   # Same-SHA re-scaffold guard.
   #
@@ -400,6 +446,7 @@ contract)
   # possible moment to fail open.
   GENERATION=1
   if [ -e "$CONTRACT" ]; then
+    require_contract_identity_unchanged "the completion contract rewrite"
     PRIOR_SHA="$(jq -r 'if (type == "object" and (.sourceSha | type) == "string")
                         then .sourceSha else "" end' "$CONTRACT" 2>/dev/null || printf '')"
     printf '%s' "$PRIOR_SHA" | grep -Eq '^[0-9a-f]{40}$' || PRIOR_SHA=""
@@ -469,9 +516,15 @@ contract)
 
   # Deployment-specific fields (environment, leasePolicy, frontendDeploySha…)
   # merge in from $SMOKE_CONTRACT_EXTRA so this script never grows tenant knobs.
+  # Every fenced field — identity included — is written AFTER it and wins.
   EXTRA="${SMOKE_CONTRACT_EXTRA:-{\}}"
   jq -e 'type == "object"' <<<"$EXTRA" >/dev/null 2>&1 ||
     die "SMOKE_CONTRACT_EXTRA must be a JSON object"
+  # schemaVersion 2: a pr contract carries its campaign identity (pr, repoSlug)
+  # beside sourceSha and ownershipKind; develop/task contracts carry none.
+  IDENTITY='{}'
+  [ "$FENCED_STATE_KIND" != pr ] ||
+    IDENTITY="$(jq -cn --argjson pr "$FENCED_PR" --arg slug "$FENCED_REPO_SLUG" '{pr:$pr, repoSlug:$slug}')"
 
   mkdir -p "$RUN_DIR/markers"
   tmp="$(mktemp "$RUN_DIR/.completion-contract.XXXXXX")"
@@ -484,8 +537,9 @@ contract)
     --argjson lanes "$LANES" \
     --argjson markers "$MARKERS" \
     --argjson extra "$EXTRA" \
+    --argjson identity "$IDENTITY" \
     '$extra + {
-      schemaVersion: 1,
+      schemaVersion: 2,
       runId: $runId,
       sourceSha: $sha,
       coordinatorOwnerToken:(if $owner == "" then null else $owner end),
@@ -495,7 +549,7 @@ contract)
       markerDir: "markers",
       terminalStatuses: ["pass","fail","blocked","void","completed"],
       createdAt: $now
-    }' > "$tmp"
+    } + $identity' > "$tmp"
   mv "$tmp" "$CONTRACT"
   jq -cn --arg path "$CONTRACT" --argjson lanes "$LANES" \
     '{ok:true,contract:$path,laneCount:($lanes|length)}'
@@ -704,7 +758,7 @@ adopt)
       die "this task run is already terminal in the shared task binding — nothing to adopt; re-run the exact task-finish to reconcile the lease and private slot"
   fi
   [ -s "$CONTRACT" ] || die "no completion contract at $CONTRACT — nothing to adopt; write it with the contract command"
-  jq -e 'type == "object" and .schemaVersion == 1 and
+  jq -e 'type == "object" and (.schemaVersion == 1 or .schemaVersion == 2) and
          (.sourceSha | type) == "string" and (.requiredLaneMarkers | type) == "array" and
          ((.ownerAdoptions // []) | type) == "array"' "$CONTRACT" >/dev/null 2>&1 ||
     die "completion contract at $CONTRACT does not read as a scaffold contract (truncated or corrupt) — adoption would bless lane definitions this script cannot see; use 'contract --regenerate'"
@@ -714,6 +768,22 @@ adopt)
     die "completion contract ownershipKind does not match this run's active $FENCED_STATE_KIND slot — refusing adoption"
   [ "$(jq -r '.runId // empty' "$CONTRACT")" = "$(basename "$RUN_DIR")" ] ||
     die "completion contract names a different run — refusing adoption"
+  # Identity: never changed by an adoption, and BACKFILLED into a contract
+  # written before it existed (schemaVersion 1, or one missing pr/repoSlug),
+  # bumping it to 2 — so an in-flight run can be recovered without losing its
+  # evidence. The already-owner retry below backfills too, without a history
+  # entry: it is the same owner, the same campaign, now carrying its identity.
+  require_fenced_campaign_identity "a completion-contract ownership adoption"
+  require_contract_identity_unchanged "a completion-contract ownership adoption"
+  IDENTITY_BACKFILL=false
+  if [ "$FENCED_STATE_KIND" = pr ] &&
+     [ "$(jq -r --argjson pr "$FENCED_PR" --arg slug "$FENCED_REPO_SLUG" \
+            '.schemaVersion == 2 and .pr == $pr and .repoSlug == $slug' "$CONTRACT")" != true ]; then
+    IDENTITY_BACKFILL=true
+  fi
+  IDENTITY='{}'
+  [ "$IDENTITY_BACKFILL" != true ] ||
+    IDENTITY="$(jq -cn --argjson pr "$FENCED_PR" --arg slug "$FENCED_REPO_SLUG" '{schemaVersion:2, pr:$pr, repoSlug:$slug}')"
   PRIOR_OWNER="$(jq -r '.coordinatorOwnerToken // empty' "$CONTRACT")"
   # A null token on a pr/task contract did not come from a live claim
   # (smoke-evidence-barrier.sh:55-70 refuses it too); there is nothing
@@ -723,9 +793,14 @@ adopt)
   # Exact retry: the contract already names the caller. No write, no second
   # history entry — byte-identical file.
   if [ "$PRIOR_OWNER" = "$FENCED_OWNER" ]; then
-    jq -cn --arg path "$CONTRACT" \
+    if [ "$IDENTITY_BACKFILL" = true ]; then
+      tmp="$(mktemp "$RUN_DIR/.completion-contract.XXXXXX")"
+      jq --argjson identity "$IDENTITY" '. + $identity' "$CONTRACT" > "$tmp"
+      mv "$tmp" "$CONTRACT"
+    fi
+    jq -cn --arg path "$CONTRACT" --argjson backfilled "$IDENTITY_BACKFILL" \
       --argjson adoptions "$(jq -c '(.ownerAdoptions // []) | length' "$CONTRACT")" \
-      '{ok:true,contract:$path,adopted:false,alreadyOwner:true,adoptionCount:$adoptions}'
+      '{ok:true,contract:$path,adopted:false,alreadyOwner:true,adoptionCount:$adoptions,identityBackfilled:$backfilled}'
     exit 0
   fi
   tmp="$(mktemp "$RUN_DIR/.completion-contract.XXXXXX")"
@@ -735,8 +810,9 @@ adopt)
   # to the hostname (smoke-pr-gate.sh:3183, DEFAULT_OWNER at :212), so an unsalted digest would be
   # enumerable back to a reusable credential. `index` + `adoptedAt` record that
   # and when ownership changed hands; who holds it now is the token above.
-  jq --arg owner "$FENCED_OWNER" --arg now "$(iso_now)" \
-    '.coordinatorOwnerToken = $owner |
+  jq --arg owner "$FENCED_OWNER" --arg now "$(iso_now)" --argjson identity "$IDENTITY" \
+    '. + $identity |
+     .coordinatorOwnerToken = $owner |
      .ownerAdoptions = ((.ownerAdoptions // []) +
        [{index:(((.ownerAdoptions // []) | length) + 1), adoptedAt:$now}])' \
     "$CONTRACT" > "$tmp"
@@ -747,9 +823,9 @@ adopt)
     kill -KILL "$$"
   fi
   mv "$tmp" "$CONTRACT"
-  jq -cn --arg path "$CONTRACT" \
+  jq -cn --arg path "$CONTRACT" --argjson backfilled "$IDENTITY_BACKFILL" \
     --argjson adoptions "$(jq -c '.ownerAdoptions | length' "$CONTRACT")" \
-    '{ok:true,contract:$path,adopted:true,alreadyOwner:false,adoptionCount:$adoptions}'
+    '{ok:true,contract:$path,adopted:true,alreadyOwner:false,adoptionCount:$adoptions,identityBackfilled:$backfilled}'
   ;;
 
 *)
