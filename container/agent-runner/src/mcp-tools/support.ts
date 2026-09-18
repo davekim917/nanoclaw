@@ -14,6 +14,8 @@
 import { writeMessageOut } from '../db/messages-out.js';
 import type { WriteMessageOut } from '../db/messages-out.js';
 import { registerTools } from './server.js';
+import { describeTriage, triageSupportEmail } from './support-triage.js';
+import type { SupportTriage } from './support-triage.js';
 import type { McpToolDefinition } from './types.js';
 
 const SQLITE_LOCK_RETRY_DELAYS_MS = [50, 100, 250, 500] as const;
@@ -67,6 +69,55 @@ export async function writeSupportAction(
   }
 }
 
+type DispatchDependencies = SupportActionWriteDependencies & {
+  triage?: (email: { subject: string; sender: string; bodyText: string }) => Promise<SupportTriage | null>;
+};
+
+export async function handleDispatchSupportIssue(
+  args: Record<string, unknown>,
+  dependencies: DispatchDependencies = {},
+): Promise<ReturnType<typeof ok> | ReturnType<typeof err>> {
+  const gmailThreadId = args.gmailThreadId as string;
+  if (!gmailThreadId) return err('gmailThreadId is required');
+  for (const field of ['subject', 'sender', 'date', 'bodyText'] as const) {
+    if (typeof args[field] !== 'string') return err(`${field} is required`);
+  }
+
+  // Classify on arrival (opt-in via the group's support-taxonomy.json). Fail-open:
+  // null just means the email is dispatched without triage, as before.
+  const triage = await (dependencies.triage ?? triageSupportEmail)({
+    subject: args.subject as string,
+    sender: args.sender as string,
+    bodyText: args.bodyText as string,
+  });
+
+  await writeSupportAction(
+    {
+      id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      kind: 'system',
+      content: JSON.stringify({
+        action: 'dispatch_support_issue',
+        gmailThreadId,
+        linearIssue: (args.linearIssue as string) || null,
+        linearTeam: (args.linearTeam as string) || null,
+        subject: (args.subject as string) || null,
+        sender: (args.sender as string) || null,
+        date: (args.date as string) || null,
+        bodyText: (args.bodyText as string) || null,
+        lastMessageId: (args.lastMessageId as string) || null,
+        triage,
+      }),
+    },
+    dependencies,
+  );
+
+  log(`dispatch_support_issue: ${gmailThreadId}${triage ? ' (triaged)' : ''}`);
+  return ok(
+    `Support issue dispatched (gmail thread ${gmailThreadId}). It now has its own Slack thread + session.` +
+      (triage ? `\n${describeTriage(triage)}` : ''),
+  );
+}
+
 export const dispatchSupportIssue: McpToolDefinition = {
   tool: {
     name: 'dispatch_support_issue',
@@ -97,32 +148,7 @@ export const dispatchSupportIssue: McpToolDefinition = {
       required: ['gmailThreadId', 'subject', 'sender', 'date', 'bodyText'],
     },
   },
-  async handler(args) {
-    const gmailThreadId = args.gmailThreadId as string;
-    if (!gmailThreadId) return err('gmailThreadId is required');
-    for (const field of ['subject', 'sender', 'date', 'bodyText'] as const) {
-      if (typeof args[field] !== 'string') return err(`${field} is required`);
-    }
-
-    await writeSupportAction({
-      id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      kind: 'system',
-      content: JSON.stringify({
-        action: 'dispatch_support_issue',
-        gmailThreadId,
-        linearIssue: (args.linearIssue as string) || null,
-        linearTeam: (args.linearTeam as string) || null,
-        subject: (args.subject as string) || null,
-        sender: (args.sender as string) || null,
-        date: (args.date as string) || null,
-        bodyText: (args.bodyText as string) || null,
-        lastMessageId: (args.lastMessageId as string) || null,
-      }),
-    });
-
-    log(`dispatch_support_issue: ${gmailThreadId}`);
-    return ok(`Support issue dispatched (gmail thread ${gmailThreadId}). It now has its own Slack thread + session.`);
-  },
+  handler: (args) => handleDispatchSupportIssue(args),
 };
 
 export const updateSupportTicket: McpToolDefinition = {
@@ -134,7 +160,10 @@ export const updateSupportTicket: McpToolDefinition = {
       type: 'object' as const,
       properties: {
         linearIssue: { type: 'string', description: 'Linear issue identifier you created (e.g. "EXAMPLE-123").' },
-        linearTeam: { type: 'string', description: 'Linear team the issue is on ("EXAMPLE" or "Example Data"). Optional.' },
+        linearTeam: {
+          type: 'string',
+          description: 'Linear team the issue is on ("EXAMPLE" or "Example Data"). Optional.',
+        },
       },
       required: ['linearIssue'],
     },

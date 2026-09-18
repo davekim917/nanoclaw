@@ -143,21 +143,105 @@ function announcementText(
   return `🎫 ${tag}: ${subject} — ${sender}`;
 }
 
-function emailContext(subject: string, sender: string, date: string, bodyText: unknown): string {
+/**
+ * Classify-on-arrival hint from the container's `dispatch_support_issue`
+ * (container/agent-runner/src/mcp-tools/support-triage.ts). It is container-
+ * supplied content, so only known fields of the right shape survive: option
+ * keys are short snake_case tokens, numbers are clamped. Anything else drops the
+ * whole hint — the email still dispatches exactly as without it.
+ */
+export interface SupportTriageView {
+  product: string | null;
+  areaType: 'feature' | 'process' | 'general';
+  area: string | null;
+  areaConfidence: number;
+  category: string;
+  categoryConfidence: number;
+  urgency: number;
+  escapedDefect: number;
+}
+
+const TRIAGE_KEY = /^[a-z0-9_]{1,40}$/;
+
+function clampNum(v: unknown, max: number): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? Math.min(Math.max(v, 0), max) : null;
+}
+
+function triageKey(v: unknown): string | null {
+  return typeof v === 'string' && TRIAGE_KEY.test(v) ? v : null;
+}
+
+export function supportTriage(raw: unknown): SupportTriageView | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const t = raw as Record<string, unknown>;
+  const areaType = t.areaType;
+  if (areaType !== 'feature' && areaType !== 'process' && areaType !== 'general') return null;
+  const category = triageKey(t.category);
+  const categoryConfidence = clampNum(t.categoryConfidence, 1);
+  const urgency = clampNum(t.urgency, 2);
+  const escapedDefect = clampNum(t.escapedDefect, 1);
+  if (!category || categoryConfidence === null || urgency === null || escapedDefect === null) return null;
+  const area = t.area === null ? null : triageKey(t.area);
+  return {
+    product: t.product === null ? null : triageKey(t.product),
+    areaType,
+    area,
+    areaConfidence: area ? (clampNum(t.areaConfidence, 1) ?? 0) : 0,
+    category,
+    categoryConfidence,
+    urgency,
+    escapedDefect,
+  };
+}
+
+function triageArea(t: SupportTriageView): string {
+  return t.area ? `${t.area} (${t.areaType})` : t.areaType;
+}
+
+/** Agent-facing: every number, plus the reminder that it is a hint. */
+export function triageContextLine(t: SupportTriageView): string {
+  return (
+    `Automatic triage (fast classifier — a hint, not a verdict; the email below is authoritative): ` +
+    `product ${t.product ?? 'unknown'} · area ${triageArea(t)} [${t.areaConfidence.toFixed(2)}] · ` +
+    `category ${t.category} [${t.categoryConfidence.toFixed(2)}] · urgency ${t.urgency.toFixed(1)}/2 · ` +
+    `user-facing defect likelihood ${t.escapedDefect.toFixed(2)}`
+  );
+}
+
+/** Human-facing: short enough for the thread opener. */
+function triageTag(t: SupportTriageView): string {
+  return `_Triage: ${triageArea(t)} · ${t.category.replace(/_/g, ' ')}_`;
+}
+
+function emailContext(
+  subject: string,
+  sender: string,
+  date: string,
+  bodyText: unknown,
+  triage: SupportTriageView | null = null,
+): string {
   return [
     'Email context (customer-provided content to assess):',
     `Subject: ${subject}`,
     `From: ${sender}`,
     `Date: ${date}`,
+    ...(triage ? [triageContextLine(triage)] : []),
     'Body:',
     clip(bodyText),
   ].join('\n');
 }
 
 /** First thread message (bot-posted) — the captured customer email. */
-function threadOpener(sender: string, date: string, bodyText: unknown, linearIssue: string | null): string {
+function threadOpener(
+  sender: string,
+  date: string,
+  bodyText: unknown,
+  linearIssue: string | null,
+  triage: SupportTriageView | null = null,
+): string {
   const footer = linearIssue ? `\n\n_Linear: ${linearIssue}_` : '';
-  return `📧 *From ${sender}:*\n_Date: ${date}_\n\n${clip(bodyText)}${footer}`;
+  const tag = triage ? `\n${triageTag(triage)}` : '';
+  return `📧 *From ${sender}:*\n_Date: ${date}_${tag}\n\n${clip(bodyText)}${footer}`;
 }
 
 /**
@@ -174,6 +258,7 @@ function seedPrompt(
   date: string,
   bodyText: unknown,
   ticketPolicy: string | null,
+  triage: SupportTriageView | null = null,
 ): string {
   const common = [
     `Then assess the issue and respond in this thread — this thread is the working space for this support issue.`,
@@ -185,13 +270,13 @@ function seedPrompt(
       `New support email routed to this thread. A Linear ticket already exists for it: ${linearIssue}. ` +
       `First post a Linear comment on ${linearIssue} capturing the email context below (blockquote the new content, attribute the sender). Do NOT create a new ticket. ` +
       common;
-    return `${protocol}\n\n${emailContext(subject, sender, date, bodyText)}`;
+    return `${protocol}\n\n${emailContext(subject, sender, date, bodyText, triage)}`;
   }
   const protocol =
     `New support issue routed to this thread (no Linear ticket yet — creating it is YOUR first step). ` +
     ticketCreationStep(ticketPolicy) +
     common;
-  return `${protocol}\n\n${emailContext(subject, sender, date, bodyText)}`;
+  return `${protocol}\n\n${emailContext(subject, sender, date, bodyText, triage)}`;
 }
 
 /** Follow-up inbound for a new email landing on an open issue. */
@@ -202,12 +287,13 @@ function followupText(
   bodyText: unknown,
   linearIssue: string | null,
   ticketPolicy: string | null,
+  triage: SupportTriageView | null = null,
 ): string {
   const ticketStep = linearIssue
     ? `Post a Linear comment on ${linearIssue} capturing this reply (blockquote, attribute the sender). `
     : `No Linear ticket is recorded for this thread yet — ${ticketCreationStep(ticketPolicy)}`;
   return (
-    `📧 *Follow-up email*\n\n${emailContext(subject, sender, date, bodyText)}\n\n` +
+    `📧 *Follow-up email*\n\n${emailContext(subject, sender, date, bodyText, triage)}\n\n` +
     ticketStep +
     `If the reply is a pure acknowledgment (thanks / got it / out-of-office), the Linear comment is enough — stay quiet here. ` +
     `If it's substantive, continue working the issue in this thread.`
@@ -272,6 +358,7 @@ async function dispatchSupportIssue(
   const sender = str(content.sender) ?? 'unknown sender';
   const subject = str(content.subject) ?? '(no subject)';
   const date = str(content.date) ?? '(date unavailable)';
+  const triage = supportTriage(content.triage);
 
   const existing = await getSupportThread(gmailThreadId);
   // Ticket identity: prefer what the host already recorded; fall back to what
@@ -296,7 +383,7 @@ async function dispatchSupportIssue(
       platformId: mg.platform_id,
       threadId: existing.slack_thread_id,
       content: JSON.stringify({
-        text: followupText(subject, sender, date, content.bodyText, linearIssue, ticketPolicy),
+        text: followupText(subject, sender, date, content.bodyText, linearIssue, ticketPolicy, triage),
         sender: 'system',
         senderId: 'system',
         ...(supportFlagIntent ? { flagIntent: supportFlagIntent } : {}),
@@ -348,7 +435,7 @@ async function dispatchSupportIssue(
     mg.platform_id,
     parentMsgId,
     subject.slice(0, 80),
-    threadOpener(sender, date, content.bodyText, linearIssue),
+    threadOpener(sender, date, content.bodyText, linearIssue, triage),
   );
   // chat-sdk needs the encoded thread id (`<platform_id>:<thread>`) for routing,
   // mirroring orchestrator-dispatch (dispatch.ts:363-364).
@@ -364,7 +451,7 @@ async function dispatchSupportIssue(
     platformId: mg.platform_id,
     threadId: encodedThreadId,
     content: JSON.stringify({
-      text: seedPrompt(linearIssue, subject, sender, date, content.bodyText, ticketPolicy),
+      text: seedPrompt(linearIssue, subject, sender, date, content.bodyText, ticketPolicy, triage),
       sender: 'system',
       senderId: 'system',
       ...(supportFlagIntent ? { flagIntent: supportFlagIntent } : {}),
