@@ -636,15 +636,21 @@ export function gatewayRestHosts(declarations: string[]): Array<{ name: string; 
   if (!secretsCache || Date.now() - secretsCache.at >= SECRETS_CACHE_TTL_MS) {
     void loadSecrets(false).catch(() => undefined);
   }
-  const secrets = secretsCache?.secrets ?? [];
+  // Rows are cached unvalidated (the spawn path only reads id/name); this runs
+  // on the per-turn path, so skip anything malformed rather than throw.
+  const secrets = (Array.isArray(secretsCache?.secrets) ? secretsCache.secrets : []).filter(
+    (secret): secret is OnecliSecret =>
+      typeof secret === 'object' && secret !== null && typeof secret.id === 'string' && typeof secret.name === 'string',
+  );
   const byName = new Map(secrets.map((secret) => [secret.name, secret] as const));
   const byId = new Map(secrets.map((secret) => [secret.id, secret] as const));
   const out: Array<{ name: string; host: string }> = [];
   for (const decl of declarations) {
     const secret = isUuid(decl) ? byId.get(decl) : byName.get(decl);
-    const host = secret?.hostPattern?.trim();
+    const host = typeof secret?.hostPattern === 'string' ? secret.hostPattern.trim() : '';
     if (!secret || !host) continue;
-    if (/^mcp[.-]/i.test(host) || /(^|\/)mcp(\/|$)/i.test(secret.pathPattern ?? '')) continue;
+    const path = typeof secret.pathPattern === 'string' ? secret.pathPattern : '';
+    if (/^mcp[.-]/i.test(host) || /(^|\/)mcp(\/|$)/i.test(path)) continue;
     out.push({ name: secret.name, host });
   }
   return out;

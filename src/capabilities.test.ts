@@ -1241,6 +1241,20 @@ describe('OneCLI gateway roster line', () => {
     expect(await rosterLine(['Littlebird', 'Linear', 'Slack-Reader-Tenant', 'Anthropic'])).toBeUndefined();
   });
 
+  it('skips malformed vault rows instead of throwing on the turn path', async () => {
+    __setSecretsCacheForTest([
+      null,
+      { id: 'x', name: 'Broken', hostPattern: 42 },
+      { id: 7, name: 'NoId' },
+      ...vault,
+    ] as unknown as Parameters<typeof __setSecretsCacheForTest>[0]);
+    insertWorkgroup('wg-bad', ['Broken', 'NoId', 'TypeSafe']);
+    const g = group('ag-wg-bad', 'wg-bad');
+    await createGroupInWorkgroup(g, 'wg-bad');
+    const snap = await buildSessionServicesSnapshot(g.id);
+    expect(snap.services.find((service) => service.name === 'OneCLI gateway')?.scopes).toEqual(['api.typesafe.ai']);
+  });
+
   it('omits the line when the secrets cache is cold instead of blocking the turn', async () => {
     __resetCachesForTest();
     insertWorkgroup('wg-cold', ['TypeSafe']);
