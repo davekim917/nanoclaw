@@ -1149,7 +1149,58 @@ export function buildSessionServicesSnapshotFrom(
   derived.sort((a, b) => Number(Boolean(b.retainUnderBudget)) - Number(Boolean(a.retainUnderBudget)));
   services.splice(derivedMcpIndex, 0, ...derived);
 
+  // Gateway-injected API-key secrets that no entry above describes. Derived
+  // from `mergedSecrets` — the same workgroup ∪ group declaration the spawn
+  // grants — so there is no second list to keep in step. Without this line an
+  // agent that finds no `<SERVICE>_API_KEY` in its env concludes the service
+  // is unwired and falls back to a stub, when the gateway injects the key at
+  // request time (the key never enters the container by design).
+  const gatewayOnly = gatewayOnlySecretNames(mergedSecrets, services, cfg?.slack_user_token?.onecli_secret_names);
+  if (gatewayOnly.length > 0) {
+    services.push({
+      name: 'OneCLI gateway',
+      cli: 'curl',
+      declaredTools: [],
+      scopes: gatewayOnly,
+      credentialPaths: [],
+      summary: `${boundedNameList(gatewayOnly)}: call their APIs directly; auth is injected, no key in env`,
+      useFor: `Granted OneCLI secrets with no dedicated entry: ${gatewayOnly.join(', ')}. The gateway injects each one's credential into requests to its host, so call the API directly (curl, fetch, or the vendor SDK with any placeholder key). A missing \`<SERVICE>_API_KEY\` env var is expected and is NOT evidence the service is unavailable; do not substitute a stub. A 401/403 from the host is the real signal — report it to the operator.`,
+      retainUnderBudget: true,
+    });
+  }
+
   return { agentGroupId, howToUse: CAPABILITY_ROSTER_PREAMBLE, services };
+}
+
+/**
+ * Secret names worth listing on the gateway line: granted to this group, not
+ * already described by a hand-written or MCP-derived entry (matched by name
+ * first name token, e.g. `Render-Tenant` → Render, `Exa-MCP` → exa,
+ * `GranolaAPI` → granola), not the Slack
+ * user token (withheld outside owner-safe sessions, and has its own entry),
+ * and not the model provider's own key.
+ */
+export function gatewayOnlySecretNames(
+  mergedSecrets: string[],
+  services: Array<{ name: string; mcpNamespace?: string }>,
+  slackSecretNames?: string[],
+): string[] {
+  const covered = services.flatMap((service) => {
+    const keys = [service.name];
+    if (service.mcpNamespace) keys.push(service.mcpNamespace.replace(/^mcp__/, '').replace(/__\*$/, ''));
+    return keys.map((key) => key.toLowerCase().split(/[^a-z0-9]+/)[0]!).filter((key) => key.length > 0);
+  });
+  const slack = new Set(slackUserTokenSecrets(mergedSecrets, slackSecretNames));
+  const PROVIDER_KEYS = /^(anthropic|openai|opencode)(-|$)/i;
+  return mergedSecrets.filter((secret) => {
+    if (slack.has(secret) || PROVIDER_KEYS.test(secret) || /^slack(-|$)/i.test(secret)) return false;
+    // `GranolaAPI` → granola: a credential suffix glued to the name.
+    const head = secret
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)[0]!
+      .replace(/(api|key|token)$/, '');
+    return !covered.includes(head);
+  });
 }
 
 /**

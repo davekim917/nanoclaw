@@ -17,7 +17,12 @@ vi.mock('./config.js', async (importOriginal) => ({
   DATA_DIR: dirs.DATA_DIR,
 }));
 
-import { boundedNameList, buildSessionServicesSnapshot, getHostCapabilities } from './capabilities.js';
+import {
+  boundedNameList,
+  buildSessionServicesSnapshot,
+  gatewayOnlySecretNames,
+  getHostCapabilities,
+} from './capabilities.js';
 import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from './db/index.js';
 import { writeContainerConfig } from './container-config.js';
 import { SIBLING_BOUND_FIELDS } from './sibling-parity.js';
@@ -1186,5 +1191,61 @@ describe('GitHub App sentinel scoping', () => {
     expect(gh?.activation ?? '').toContain('HEALTHY App installation token');
     delete process.env.GITHUB_APP_ID;
     delete process.env.GITHUB_APP_INSTALLATION_ID;
+  });
+});
+
+describe('gatewayOnlySecretNames', () => {
+  // A real tenant's merged declaration (workgroup ∪ group), names genericized.
+  const merged = [
+    'Slack-Reader-Tenant',
+    'Exa-MCP',
+    'Pocket',
+    'Littlebird',
+    'TypeSafe',
+    'Anthropic',
+    'GranolaAPI',
+    'Exa',
+    'Linear',
+    'Render-Tenant',
+  ];
+  const services = [
+    { name: 'Linear', mcpNamespace: 'mcp__linear__*' },
+    { name: 'Render' },
+    { name: 'Slack' },
+    { name: 'exa', mcpNamespace: 'mcp__exa__*' },
+    { name: 'granola', mcpNamespace: 'mcp__granola__*' },
+  ];
+
+  it('lists gateway-injected secrets no entry describes, and nothing else', () => {
+    expect(gatewayOnlySecretNames(merged, services)).toEqual(['Pocket', 'Littlebird', 'TypeSafe']);
+  });
+
+  it('never lists the Slack user token or a model-provider key', () => {
+    const out = gatewayOnlySecretNames(['Slack-User-Owner', 'Anthropic', 'OpenAI', 'opencode-go'], []);
+    expect(out).toEqual([]);
+  });
+
+  it('puts a workgroup-granted gateway secret on the roster as one line', async () => {
+    insertWorkgroup('wg-gw', ['TypeSafe', 'Anthropic']);
+    const g = group('ag-wg-gw', 'wg-gw');
+    await createGroupInWorkgroup(g, 'wg-gw');
+    const snap = await buildSessionServicesSnapshot(g.id);
+    const entry = snap.services.find((service) => service.name === 'OneCLI gateway');
+    expect(entry?.scopes).toEqual(['TypeSafe']);
+    expect(entry?.summary).toContain('TypeSafe');
+    expect(entry?.summary).toContain('no key in env');
+    expect(entry?.retainUnderBudget).toBe(true);
+  });
+
+  it('adds no gateway line when every granted secret is covered or excluded', async () => {
+    insertWorkgroup('wg-none', ['Anthropic']);
+    const g = group('ag-wg-none', 'wg-none');
+    await createGroupInWorkgroup(g, 'wg-none');
+    const snap = await buildSessionServicesSnapshot(g.id);
+    expect(snap.services.some((service) => service.name === 'OneCLI gateway')).toBe(false);
+  });
+
+  it('matches a covered service by the leading name token only', () => {
+    expect(gatewayOnlySecretNames(['Render-Tenant', 'Renderly'], [{ name: 'Render' }])).toEqual(['Renderly']);
   });
 });
