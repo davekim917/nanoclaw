@@ -105,6 +105,10 @@ expect 1-long-close-closes '.ok == true and .origin == "pr-body" and .itemCount 
 # No fence at all is also absent, with no problem to report: nothing was authored.
 new_run; printf '## Summary\n\nJust prose.\n' > "$RUN/intent/pr-body.md"
 expect 1-no-fence '.ok == true and .origin == "absent" and .problems == [] and .blocks[0].status == "absent"' "$(extract)"
+# `pr<n>/` is extract's prefix, never an author's: an authored source key or
+# item id carrying one is refused (#928 review 2, finding 1).
+bad_block 1-prefixed-source-key '.sources["pr2/R1"] = .sources.R1 | .items[0].source = "pr2/R1" | del(.sources.R1)' 'sources.pr2/R1: key must match'
+bad_block 1-prefixed-item-id '.items[0].id = "pr2/AC1"' 'id must match'
 # `items: "none"` with a reason is a VALID, empty contract.
 new_run "$(jq '.items = "none" | .reason = "dependency bump, no user-observable effect"' "$EXAMPLE")"
 expect 1-none '.ok == true and .origin == "pr-body" and .itemCount == 0 and .blocks[0].status == "none"' "$(extract)"
@@ -125,6 +129,13 @@ expect 1-freeze-ids '[.items[] | {id, source, carrier}] == [{"id":"pr1952/AC1","
 # One carried PR without a valid block makes the whole campaign unauthored.
 printf 'no block here\n' > "$RUN/intent/pr-1953-body.md"
 expect 1-freeze-half-authored '.origin == "absent" and .itemCount == 0 and (.blocks | map(.status)) == ["present","absent"]' "$(extract --force)"
+# The reviewer's collision: a single-PR block naming `pr2/R1: issue#1` beside
+# carried PR 2's `R1: issue#2` must not let an item quoting only issue 2 pass.
+new_run "$(jq '.sources = {"pr2/R1":"issue#1"} | .items = [.items[0] | .source = "pr2/R1" | .quote = "only issue two says this"]' "$EXAMPLE")"
+printf 'only issue two says this\n' > "$RUN/intent/issue-2.md"
+block_body "$(jq '.sources = {"R1":"issue#2"} | .items = [.items[0] | .source = "R1" | .id = "AC9" | .quote = "only issue two says this"]' "$EXAMPLE")" > "$RUN/intent/pr-2-body.md"
+expect 1-collision '.origin == "absent" and .blocks[0].status == "invalid" and any(.problems[]; test("pr-body.md: sources.pr2/R1: key must match"))' "$(extract)"
+expect 1-collision-check '.ok == false and .provenance == {}' "$(check)"
 
 # --- 2. check: provenance -------------------------------------------------------
 new_run; extract >/dev/null
@@ -142,47 +153,57 @@ python3 "$TOOL" check "$RUN" --lane A1 >/dev/null || fail "2-lane-flag"
 new_run "$(jq '.items[2].quote = "the phone shows the fine in red"' "$EXAMPLE")"; extract >/dev/null
 rows "[$(row AC1 met '[]'),$(row AC2 met '[]'),$(row AC3 met '[]')]"
 expect 2-self-quoting '.ok == false and .provenance.AC3 == "unsupported" and
-  (.unsupported | map(.id)) == ["AC3"] and (.unsupported[0].reason | test("fences stripped"))' "$(check)"
+  (.unsupported | map(.id)) == ["AC3"] and (.unsupported[0].reason | test("its acceptance-v1 block removed"))' "$(check)"
 # ...even when the block is the ONLY thing in the body.
 new_run; printf '```acceptance-v1\n%s\n```\n' "$(cat "$EXAMPLE")" > "$RUN/intent/pr-body.md"; extract >/dev/null
 expect 2-block-only-body '.provenance.AC3 == "unsupported" and .provenance.AC1 == "supported"' "$(check)"
-# STRIPPING COVERS EVERY FENCE KIND. The reviewer's case (#928 review 3): a
-# body whose backtick block is valid and whose tilde block holds the quote the
-# prose never said. extract refuses it (two fences); a derived contract over
-# that carrier must not find the quote either -- nor inside a block closed by
-# a longer fence, nor inside an unterminated one (stripped through EOF).
+# PROVENANCE FAILS CLOSED ON CONTENT, NOT SYNTAX (#928 review 2, finding 2).
+# The pr-body search text is the frozen body minus the ONE extracted block. If
+# `acceptance-v1` still occurs anywhere in what is left -- in whatever Markdown
+# form, or in none -- the PR body is unavailable and every item citing it is
+# unsupported, even one whose quote really is in the prose. No parser has to
+# recognise the form that hides a quote.
 pr_body_item() { # <quote> -> a derived doc with one pr-body item
   jq -cn --arg q "$1" '{schemaVersion:1,origin:"derived",sources:{R3:{request:"pr-body"}},
     items:[{id:"AC3",source:"R3",quote:$q,when:"open",then:{surface:"native:loans",expect:"x"},platform:"native",carrier:"pr-body.md",derived:true}]}' \
     > "$RUN/intent/acceptance.json"
 }
 HIDDEN="the phone shows the fine in red"
-new_run; { block_body "$(cat "$EXAMPLE")"; printf '~~~acceptance-v1\n{"v":1,"note":"%s"}\n~~~\n' "$HIDDEN"; } > "$RUN/intent/pr-body.md"
-expect 2-tilde-hidden-extract '.origin == "absent"' "$(extract)"
-pr_body_item "$HIDDEN"
-expect 2-tilde-hidden-quote '.provenance.AC3 == "unsupported"' "$(check)"
-pr_body_item "$Q3"   # the prose outside both blocks still supports
-expect 2-tilde-prose-still-there '.provenance.AC3 == "supported"' "$(check)"
-new_run; printf 'prose %s\n```acceptance-v1\n%s\n`````\nafter\n' "$Q3" "$HIDDEN" > "$RUN/intent/pr-body.md"
-pr_body_item "$HIDDEN"
-expect 2-long-close-stripped '.provenance.AC3 == "unsupported"' "$(check)"
-new_run; printf 'prose %s\n```acceptance-v1\n{"v":1}\n\n%s\n' "$Q3" "$HIDDEN" > "$RUN/intent/pr-body.md"
-pr_body_item "$HIDDEN"
-expect 2-unterminated-stripped-to-eof '.provenance.AC3 == "unsupported"' "$(check)"
-pr_body_item "$Q3"
-expect 2-unterminated-prose-before '.provenance.AC3 == "supported"' "$(check)"
-# A CRLF body (GitHub's web editor) and an info string with more after the
-# language are still acceptance-v1 fences, as a renderer reads them.
+UNAVAILABLE='.provenance.AC3 == "unsupported" and (.unsupported[0].reason | test("R3 is unavailable: the PR body mentions acceptance-v1 outside its one block"))'
+hidden_form() { # <label> <extra markdown appended after the one real block>
+  new_run; { block_body "$(cat "$EXAMPLE")"; printf '\n%s\n' "$2"; } > "$RUN/intent/pr-body.md"
+  pr_body_item "$HIDDEN"; expect "$1-hidden-quote" "$UNAVAILABLE" "$(check)"
+  pr_body_item "$Q3";     expect "$1-prose-quote" "$UNAVAILABLE" "$(check)"
+}
+hidden_form 2-blockquote "$(printf '> ```acceptance-v1\n> {"note":"%s"}\n> ```' "$HIDDEN")"
+hidden_form 2-list "$(printf -- '- first\n- second\n\n    ```acceptance-v1\n    %s\n    ```' "$HIDDEN")"
+hidden_form 2-nested-list "$(printf -- '- outer\n  - inner\n\n        ```acceptance-v1\n        %s\n        ```' "$HIDDEN")"
+hidden_form 2-second-tilde "$(printf '~~~acceptance-v1\n{"note":"%s"}\n~~~' "$HIDDEN")"
+hidden_form 2-info-suffix "$(printf '~~~ acceptance-v1 json\n%s\n~~~' "$HIDDEN")"
+hidden_form 2-unterminated "$(printf '```acceptance-v1\n%s' "$HIDDEN")"
+hidden_form 2-prose-mention "The acceptance-v1 block above says $HIDDEN."
+# ...and extract agrees where it can see the second fence: the campaign derives.
+new_run; { block_body "$(cat "$EXAMPLE")"; printf '\n~~~acceptance-v1\n{"v":1}\n~~~\n'; } > "$RUN/intent/pr-body.md"
+expect 2-second-fence-extract '.origin == "absent"' "$(extract)"
+# The normal single block still supports a quote in the PR description prose
+# -- before or after the block, closed by a longer fence, or saved with CRLF --
+# and never one that lives only inside the block.
+new_run; pr_body_item "$Q3"
+expect 2-one-block-prose '.provenance.AC3 == "supported"' "$(check)"
+pr_body_item "$(jq -r '.items[0].then.expect' "$EXAMPLE")"
+expect 2-one-block-self '.provenance.AC3 == "unsupported" and (.unsupported[0].reason | test("block removed"))' "$(check)"
+new_run; printf 'prose\n```acceptance-v1\n%s\n`````\nafter %s\n' "$HIDDEN" "$Q3" > "$RUN/intent/pr-body.md"
+pr_body_item "$HIDDEN"; expect 2-long-close-hidden '.provenance.AC3 == "unsupported"' "$(check)"
+pr_body_item "$Q3";     expect 2-long-close-prose-after '.provenance.AC3 == "supported"' "$(check)"
 new_run; printf '```acceptance-v1\r\n%s\r\n```\r\nprose %s\r\n' "$HIDDEN" "$Q3" > "$RUN/intent/pr-body.md"
-pr_body_item "$HIDDEN"
-expect 2-crlf-stripped '.provenance.AC3 == "unsupported"' "$(check)"
-pr_body_item "$Q3"   # the CRLF close line closes: prose AFTER the block survives
-expect 2-crlf-prose-after '.provenance.AC3 == "supported"' "$(check)"
+pr_body_item "$HIDDEN"; expect 2-crlf-hidden '.provenance.AC3 == "unsupported"' "$(check)"
+pr_body_item "$Q3";     expect 2-crlf-prose-after '.provenance.AC3 == "supported"' "$(check)"
 new_run; block_body "$(cat "$EXAMPLE")" | sed 's/$/\r/' > "$RUN/intent/pr-body.md"
 expect 2-crlf-extract '.ok == true and .origin == "pr-body" and .itemCount == 3' "$(extract)"
-new_run; printf 'prose %s\n~~~ acceptance-v1 json\n%s\n~~~\n' "$Q3" "$HIDDEN" > "$RUN/intent/pr-body.md"
-pr_body_item "$HIDDEN"
-expect 2-info-suffix-stripped '.provenance.AC3 == "unsupported"' "$(check)"
+# Only the PR body is held to this: an issue that mentions acceptance-v1 is
+# still searched as frozen.
+new_run; printf 'see acceptance-v1\n' >> "$RUN/intent/issue-412.md"; extract >/dev/null
+expect 2-issue-mention '.provenance.AC1 == "supported"' "$(check)"
 # `carrier` is derived from the item id, never trusted: a pr-body item stored
 # with carrier issue-412.md does not read the issue as the PR body.
 new_run; extract >/dev/null
@@ -229,6 +250,31 @@ mv "$RUN/intent" "$WORK/intent-aside"; ln -s "$WORK/intent-aside" "$RUN/intent"
 expect 2-symlinked-intent-dir '.ok == false and (.provenance | to_entries | all(.value == "unsupported")) and (.unsupported[0].reason | test("reached through a symlink"))' "$(check)"
 rm "$RUN/intent"; mv "$WORK/intent-aside" "$RUN/intent"
 expect 2-symlink-restored '.provenance.AC1 == "supported"' "$(check)"
+# The parent-directory race (#928 review 2, finding 3): intent/ is swapped for
+# a link to a directory of fabricated sources AFTER it was opened. The read
+# must still come from the directory that was verified.
+mkdir -p "$WORK/fake"; printf 'fabricated\n' > "$WORK/fake/issue-412.md"
+RACE="$(python3 - "$TOOL" "$RUN" "$WORK/fake" <<'PY'
+import importlib.util, os, sys
+sys.dont_write_bytecode = True
+tool, run, fake = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("acc", tool)
+acc = importlib.util.module_from_spec(spec); spec.loader.exec_module(acc)
+real_open = os.open
+def racing_open(path, flags, *a, **kw):
+    fd = real_open(path, flags, *a, **kw)
+    if flags & os.O_DIRECTORY:   # just opened intent/: swap it for a link
+        os.rename(os.path.join(run, "intent"), os.path.join(run, "intent-aside"))
+        os.symlink(fake, os.path.join(run, "intent"))
+    return fd
+acc.os.open = racing_open
+text, why = acc.read_frozen(run, "issue-412.md")
+os.unlink(os.path.join(run, "intent"))
+os.rename(os.path.join(run, "intent-aside"), os.path.join(run, "intent"))
+print("fabricated" if text and "fabricated" in text else "verified" if text else "error:" + why)
+PY
+)"
+[ "$RACE" = verified ] || fail "2-parent-dir-race: $RACE"
 
 # Whitespace is normalised (issue-412.md wraps AC1 mid-sentence and holds a
 # tab); case and punctuation are not.

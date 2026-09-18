@@ -1310,7 +1310,8 @@ so: `"items":[]` plus `"none":[{"reason":"…"}]`. A missing row is a
 completeness failure; an unknown `itemId` is reported and ignored. Cite the
 file in the lane marker's `evidence[]`. **Provenance is mechanical**: each
 `quote` must occur (whitespace-normalised) in the one frozen file its named
-source resolves to, with every `acceptance-v1` fence stripped — a quote that
+source resolves to. The PR body is searched with its one block removed, and
+is unavailable if `acceptance-v1` appears anywhere else in it — a quote that
 lives only inside a block is `unsupported`. The coordinator runs `check`
 before synthesis; the barrier never reads it.
 

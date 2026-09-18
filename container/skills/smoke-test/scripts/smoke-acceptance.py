@@ -20,6 +20,7 @@ Every command prints one JSON object except `report`, which prints the sentence.
 Stdlib only, no network, never writes outside <run-dir>/intent/.
 """
 import argparse
+import errno
 import glob
 import json
 import os
@@ -33,19 +34,18 @@ sys.dont_write_bytecode = True
 SCHEMA_VERSION = 1
 BLOCK_VERSION = 1
 FENCE_LANG = "acceptance-v1"
-# A fence line, CommonMark style: three or more backticks OR tildes, up to
-# three spaces of indent. The open line carries the info string; the close
-# line is the same character, at least as long as the open, and nothing else.
-# Both characters are recognised everywhere (the block, the multi-fence rule,
-# stripping): a tilde block the parser ignored but a reader renders is a
-# place to hide a quote (#928 review 3). The language is the info string's
-# first word, as a renderer reads it; a trailing CR (a body saved with CRLF,
-# as GitHub's web editor does) is not part of the line.
+# A top-level fence line, for EXTRACTION only: three or more backticks or
+# tildes, up to three spaces of indent; the close line is the same character,
+# at least as long, and nothing else. A trailing CR (GitHub's web editor saves
+# CRLF) is not part of the line. Provenance does not rely on this parser
+# recognising every Markdown form a fence can take -- see pr_body_text.
 FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*(.*?)[ \t\r]*$")
-# `pr<n>/` is the freeze-campaign prefix (one block per carried PR); the rest
-# is the scaffold's lane-id alphabet (smoke-journeys.py ID_RE, :54).
-ITEM_ID_RE = re.compile(r"^(pr[0-9]+/)?[A-Za-z0-9_-]+$")
-SOURCE_KEY_RE = re.compile(r"^(pr[0-9]+/)?[A-Za-z0-9_-]+$")
+# The scaffold's lane-id alphabet (smoke-journeys.py ID_RE, :54). An authored
+# block uses it bare; `pr<n>/` is added by extract for a freeze campaign (one
+# block per carried PR), so only the merged doc may carry it -- an authored
+# `pr2/R1` would collide with carried PR 2's `R1` (#928 review 2, finding 1).
+AUTHORED_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+DOC_ID_RE = re.compile(r"^(pr[0-9]+/)?[A-Za-z0-9_-]+$")
 SURFACE_RE = re.compile(r"^(web:\S.*|api:[A-Z]+ \S.*|native:\S.*)$")
 PLATFORMS = ("web", "native", "api")
 VERDICTS = ("met", "not_met", "not_demonstrable", "blocked")
@@ -95,7 +95,7 @@ def find_fences(body):
     out, i = [], 0
     while i < len(lines):
         m = FENCE_LINE_RE.match(lines[i])
-        if not m or m.group(2).split(None, 1)[:1] != [FENCE_LANG]:
+        if not m or m.group(2) != FENCE_LANG:
             i += 1
             continue
         char, width = m.group(1)[0], len(m.group(1))
@@ -114,16 +114,25 @@ def find_fences(body):
     return out
 
 
-def strip_fences(body):
-    """The PR body with EVERY acceptance-v1 block removed -- both fence
-    characters, and an unterminated block through end of file. This is the
-    text a `pr-body` quote is searched in: a quote that lives only inside a
-    block would otherwise validate against itself (the consult's tautology)."""
+def pr_body_text(body):
+    """(text, reason): the text a `pr-body` quote is searched in -- the frozen
+    body with the ONE extracted block's lines removed -- or (None, why) when
+    the string acceptance-v1 still occurs anywhere in what is left. That
+    fails closed on CONTENT, not syntax: a second block in a blockquote, a
+    list item, a nested list, a tilde fence, an unterminated fence, or a plain
+    mention all leave the string behind, so the body cannot support a quote
+    and no Markdown form this script does not parse can hide one (#928 review
+    2, finding 2). A quote that lives only inside the block never validates
+    against itself."""
     lines = body.split("\n")
-    drop = set()
-    for start, end, _ in find_fences(body):
-        drop.update(range(start, (len(lines) if end is None else end) + 1))
-    return "\n".join(l for k, l in enumerate(lines) if k not in drop)
+    fences = find_fences(body)
+    if fences and fences[0][1] is not None:
+        start, end = fences[0][0], fences[0][1]
+        lines = lines[:start] + lines[end + 1:]
+    rest = "\n".join(lines)
+    if FENCE_LANG in rest.lower():
+        return None, "the PR body mentions {} outside its one block".format(FENCE_LANG)
+    return rest, None
 
 
 # --- block ------------------------------------------------------------------
@@ -186,7 +195,7 @@ def validate_item(it, where, sources, allowed):
     return errors
 
 
-def validate_items(items, sources, allowed):
+def validate_items(items, sources, allowed, id_re):
     errors, seen = [], set()
     for i, it in enumerate(items):
         if not isinstance(it, dict):
@@ -194,8 +203,8 @@ def validate_items(items, sources, allowed):
             continue
         iid = it.get("id")
         where = "item {}".format(iid if isinstance(iid, str) else "#{}".format(i))
-        if not isinstance(iid, str) or not ITEM_ID_RE.match(iid):
-            errors.append("{}: id must match {}".format(where, ITEM_ID_RE.pattern))
+        if not isinstance(iid, str) or not id_re.match(iid):
+            errors.append("{}: id must match {}".format(where, id_re.pattern))
         elif iid in seen:
             errors.append("{}: duplicate id".format(where))
         else:
@@ -217,8 +226,8 @@ def validate_block(block):
         errors.append("sources must be a non-empty object of {key: request}")
         sources = {}
     for k, v in sources.items():
-        if not SOURCE_KEY_RE.match(k) or not _is_text(v):
-            errors.append("sources.{}: key must match {} and name a request".format(k, SOURCE_KEY_RE.pattern))
+        if not AUTHORED_ID_RE.match(k) or not _is_text(v):
+            errors.append("sources.{}: key must match {} and name a request".format(k, AUTHORED_ID_RE.pattern))
         elif source_path(v, None) is None:
             errors.append("sources.{}: {!r} is not issue#<n>, slack:<channel>/<thread> or pr-body".format(k, v))
     items = block.get("items")
@@ -230,7 +239,7 @@ def validate_block(block):
         errors.append("reason belongs only with items \"none\"")
     if not isinstance(items, list) or not items:
         return errors + ["items must be a non-empty list or the string \"none\""]
-    return errors + validate_items(items, sources, ITEM_KEYS)
+    return errors + validate_items(items, sources, ITEM_KEYS, AUTHORED_ID_RE)
 
 
 # --- sources ----------------------------------------------------------------
@@ -281,32 +290,33 @@ def carriers(run_dir):
 
 
 def read_frozen(run_dir, name):
-    """(text, reason) for one frozen source by its bare name. The file must be
-    a regular, non-symlink file directly under <run-dir>/intent/, itself a
-    real directory inside the run -- no symlinked component anywhere on the
-    way (#928 review 2: `open` follows links, so a correctly named issue-1.md
-    pointing at fabricated text read as the request)."""
+    """(text, reason) for one frozen source by its bare name: a regular file
+    directly in <run-dir>/intent/, read with no symlink followed at either
+    step. intent/ is opened ONCE with O_DIRECTORY|O_NOFOLLOW and the source is
+    opened relative to that descriptor (openat), so swapping intent/ or the
+    file for a link after any check cannot redirect the read -- the
+    descriptor already names the verified directory (#928 review 2, finding
+    3). O_NONBLOCK keeps a FIFO planted under the name from hanging the open;
+    fstat then refuses anything but a regular file."""
     if not _is_text(name) or "/" in name or name in (".", "..") or "\0" in name:
         return None, "{!r} is not a bare file name".format(name)
-    root = os.path.realpath(run_dir)
-    intent = os.path.join(run_dir, "intent")
-    path = os.path.join(intent, name)
+    nofollow = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
-        if os.path.islink(intent):
-            return None, "intent/ is reached through a symlink"
-        if not stat.S_ISDIR(os.lstat(intent).st_mode):
-            return None, "intent/ is not a directory"
-        if os.path.realpath(intent) != os.path.join(root, "intent"):
-            return None, "intent/ does not resolve inside the run"
-        if stat.S_ISLNK(os.lstat(path).st_mode):
-            return None, "intent/{} is a symlink".format(name)
-        # O_NOFOLLOW closes the lstat->open window: a link swapped in after
-        # the check fails the open instead of being read.
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except FileNotFoundError:
-        return None, "intent/{} is missing".format(name)
+        dfd = os.open(os.path.join(run_dir, "intent"), nofollow | os.O_DIRECTORY)
     except OSError as exc:
-        return None, "intent/{} could not be read: {}".format(name, exc)
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            return None, "intent/ is reached through a symlink or is not a directory"
+        return None, "intent/ could not be opened: {}".format(exc.strerror)
+    try:
+        fd = os.open(name, nofollow, dir_fd=dfd)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return None, "intent/{} is missing".format(name)
+        if exc.errno == errno.ELOOP:
+            return None, "intent/{} is a symlink".format(name)
+        return None, "intent/{} could not be read: {}".format(name, exc.strerror)
+    finally:
+        os.close(dfd)
     with os.fdopen(fd, "rb") as fh:
         if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
             return None, "intent/{} is not a regular file".format(name)
@@ -365,6 +375,15 @@ def cmd_extract(args):
             blocks.append({"carrier": carrier, "status": "invalid" if why else "absent", "problems": why})
             problems.extend("{}: {}".format(carrier, w) for w in why)
             continue
+        # Authored keys are bare (AUTHORED_ID_RE), so prefix+key cannot
+        # collide across carriers; refuse anyway rather than let one block's
+        # source overwrite another's (#928 review 2, finding 1).
+        clash = sorted(prefix + k for k in block["sources"] if prefix + k in sources)
+        if clash:
+            why = ["source key {} is already taken by another carried PR".format(k) for k in clash]
+            blocks.append({"carrier": carrier, "status": "invalid", "problems": why})
+            problems.extend("{}: {}".format(carrier, w) for w in why)
+            continue
         blocks.append({"carrier": carrier, "status": "none" if block["items"] == "none" else "present", "problems": []})
         for key, request in block["sources"].items():
             sources[prefix + key] = {"request": request}
@@ -414,9 +433,10 @@ def provenance(run_dir, doc):
     """Per item: (status, reason) where status is supported | unsupported.
     The quote must occur, whitespace-normalised, in the ONE frozen file its
     named source resolves to -- derived from the source's `request` and the
-    item's id (carrier_of) here, never read from the doc -- with every acceptance-v1
-    fence stripped from a pr-body carrier first. A source with no frozen file
-    is `unfrozen`: its items are unsupported, never silently trusted (§3)."""
+    item's id (carrier_of) here, never read from the doc. A pr-body carrier is
+    searched as pr_body_text leaves it (its one block removed, or unavailable).
+    A source with no frozen file is `unfrozen`: its items are unsupported,
+    never silently trusted (§3)."""
     texts, out = {}, {}
     for it in doc.get("items", []):
         src = doc.get("sources", {}).get(it.get("source"))
@@ -434,12 +454,18 @@ def provenance(run_dir, doc):
             continue
         if frozen not in texts:
             body, why = read_frozen(run_dir, frozen)
-            texts[frozen] = (None, why) if body is None else (normalise(strip_fences(body)), None)
+            if body is None:
+                why = "unfrozen: " + why
+            elif request == "pr-body":
+                body, why = pr_body_text(body)
+                why = why and "unavailable: " + why
+            texts[frozen] = (None, why) if body is None else (normalise(body), None)
         text, why = texts[frozen]
         if text is None:
-            out[it["id"]] = ("unsupported", "source {} is unfrozen: {}".format(it["source"], why))
+            out[it["id"]] = ("unsupported", "source {} is {}".format(it["source"], why))
         elif normalise(it["quote"]) not in text:
-            out[it["id"]] = ("unsupported", "quote not found in intent/{} (acceptance-v1 fences stripped)".format(frozen))
+            out[it["id"]] = ("unsupported", "quote not found in intent/{}{}".format(
+                frozen, " (its acceptance-v1 block removed)" if request == "pr-body" else ""))
         else:
             out[it["id"]] = ("supported", None)
     return out
@@ -461,10 +487,10 @@ def doc_problems(doc):
         return ["origin is absent: the PR body carried no valid block and nothing was derived -- derive the items from the frozen request sources (SKILL.md §3, Acceptance verifier)"]
     problems = ["unknown top-level key {}".format(k) for k in _unknown_keys(doc, DOC_KEYS)]
     for k, v in sources.items():
-        if (not SOURCE_KEY_RE.match(k) or not isinstance(v, dict) or _unknown_keys(v, {"request", "frozen"})
+        if (not DOC_ID_RE.match(k) or not isinstance(v, dict) or _unknown_keys(v, {"request", "frozen"})
                 or source_path(v.get("request"), None) is None):
             problems.append("sources.{}: must be {{request: issue#<n> | slack:<channel>/<thread> | pr-body}}".format(k))
-    problems.extend(validate_items(items, sources, DOC_ITEM_KEYS))
+    problems.extend(validate_items(items, sources, DOC_ITEM_KEYS, DOC_ID_RE))
     for it in items:
         if not isinstance(it, dict) or not isinstance(it.get("id"), str):
             continue
