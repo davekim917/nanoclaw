@@ -37,6 +37,9 @@ export async function askJev(
   options: { timeoutMs?: number; fetch?: JevFetch } = {},
 ): Promise<Record<string, JevAnswer>> {
   const dispatcher = options.fetch ? null : getProxyDispatcher();
+  // Fail closed: without the gateway proxy nothing injects the credential, and
+  // the request body would still leave the host. Never send it direct.
+  if (!options.fetch && !dispatcher) throw new Error('TypeSafe: no OneCLI gateway proxy configured');
   const fetchImpl: JevFetch =
     options.fetch ??
     ((url, init) =>

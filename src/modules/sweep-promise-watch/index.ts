@@ -23,8 +23,9 @@
  * or above PROMISE_THRESHOLD counts (precision 0.92 on 150 hand-labelled
  * finals at that threshold).
  *
- * Modes (`NANOCLAW_PROMISE_WATCH`): `off`, `shadow` (default — log the decision,
- * wake nothing), `nudge` (write the wake row). A nudge can make an agent speak
+ * Modes (`NANOCLAW_PROMISE_WATCH`): `off` (default — agent text leaves the host
+ * for TypeSafe only when an operator opts in), `shadow` (log the decision, wake
+ * nothing), `nudge` (write the wake row). A nudge can make an agent speak
  * in a client-facing channel, so production decisions are read in shadow
  * before it is switched on. A wake row's id is keyed by the promising message,
  * so no message is ever nudged twice, and NUDGE_DAILY_CAP — counted in a
@@ -56,13 +57,15 @@ export const NUDGE_ID_PREFIX = 'promise-nudge-';
 
 export type PromiseWatchMode = 'off' | 'shadow' | 'nudge';
 
+/** Opt-in: agent text goes to a third party (TypeSafe), so anything but an explicit mode is off. */
 export function promiseWatchMode(raw: string | undefined): PromiseWatchMode {
-  return raw === 'off' || raw === 'nudge' ? raw : 'shadow';
+  return raw === 'shadow' || raw === 'nudge' ? raw : 'off';
 }
 
 /** What the scan reads from one session's DBs. */
 export interface SessionSnapshot {
   latestChat: { id: string; timestamp: string; text: string } | null;
+  latestInboundAt: string | null;
   nextFutureProcessAfter: string | null;
   dueCount: number;
   hasContinuation: boolean;
@@ -85,14 +88,23 @@ export function candidateReason(
   if (!snap.latestChat || !snap.latestChat.text.trim()) return 'no-chat';
   const chatAt = Date.parse(snap.latestChat.timestamp);
   if (!Number.isFinite(chatAt)) return 'bad-timestamp';
-  // "Nothing happened since" is read from the host's own clock, never from an
-  // inbound row's timestamp (that one is the adapter's). The host stamps
-  // last_active on every inbound insert and every container start
-  // (session-manager.ts), and the container writes the chat's timestamp from
-  // the same kernel clock — so rows that arrived mid-turn, before the final
-  // chat, do not count, and anything after it does.
+  // "Nothing happened since" takes the later of two signals, and a tie counts
+  // as activity. sessions.last_active is the host's clock, stamped on routed
+  // inbound and container start (session-manager.ts) — it catches a row whose
+  // adapter timestamp reads earlier than its arrival. The newest inbound row's
+  // own timestamp catches host writers that insert directly without bumping
+  // last_active (host-restart notes, CLI delivery actions). Both only ever ADD
+  // activity, so each covers the other's blind spot and neither can create a
+  // false "quiet". Rows that arrived mid-turn, before the final chat, carry
+  // earlier stamps on both and correctly do not count.
   const lastActive = session.last_active ? Date.parse(session.last_active) : NaN;
-  if (Number.isFinite(lastActive) && lastActive > chatAt) return 'activity-after';
+  const lastInbound = snap.latestInboundAt ? Date.parse(snap.latestInboundAt) : NaN;
+  if (
+    (Number.isFinite(lastActive) && lastActive >= chatAt) ||
+    (Number.isFinite(lastInbound) && lastInbound >= chatAt)
+  ) {
+    return 'activity-after';
+  }
   const age = now - chatAt;
   if (age < QUIET_MS) return 'too-recent';
   if (age > MAX_AGE_MS) return 'too-old';
@@ -149,8 +161,8 @@ export type NudgeOutcome = 'nudged' | 'duplicate' | 'stale';
 
 /** Durable per-day nudge count, so a host restart does not reset the cap. */
 export interface NudgeCapStore {
-  count(day: string): number;
-  increment(day: string): void;
+  /** Take one of today's `cap` slots; false when none is left or the count cannot be trusted. */
+  reserve(day: string, cap: number): boolean;
 }
 
 export interface ScanDeps {
@@ -214,7 +226,10 @@ export async function scanOnce(deps: ScanDeps): Promise<{ asked: number; promise
       log.info('promise-watch: would nudge (shadow)', fields);
       continue;
     }
-    if (deps.cap.count(day) >= NUDGE_DAILY_CAP) {
+    // Reserve before writing: a crash after the wake row lands must not leave
+    // it uncounted. A reservation the admission then refuses is simply lost,
+    // which errs toward fewer nudges.
+    if (!deps.cap.reserve(day, NUDGE_DAILY_CAP)) {
       // Not decided: tomorrow's allowance may still reach it inside the window.
       log.warn('promise-watch: daily nudge cap reached, skipping', fields);
       continue;
@@ -229,7 +244,6 @@ export async function scanOnce(deps: ScanDeps): Promise<{ asked: number; promise
     }
     decided.set(chat.id, now);
     if (outcome === 'nudged') {
-      deps.cap.increment(day);
       nudged += 1;
       log.info('promise-watch: nudged', fields);
     } else {
@@ -248,6 +262,7 @@ function readSnapshot(mailbox: NanoclawMailboxSession): SessionSnapshot {
   const row = mailbox.latestOutboundChat();
   return {
     latestChat: row ? { id: row.id, timestamp: row.timestamp, text: chatText(row.content) } : null,
+    latestInboundAt: mailbox.latestInboundTimestamp(),
     nextFutureProcessAfter: mailbox.getNextFutureProcessAfter(),
     dueCount: mailbox.countDueMessages(),
     hasContinuation: mailbox.readWorkContinuation() !== null,
@@ -256,29 +271,31 @@ function readSnapshot(mailbox: NanoclawMailboxSession): SessionSnapshot {
 
 const CAP_FILE = path.join(DATA_DIR, 'promise-watch-nudges.json');
 
-/** The per-day count lives in a small host-owned file so a restart does not reset it. */
+/**
+ * The per-day count lives in a small host-owned file so a restart does not
+ * reset it. A missing file is a fresh count; a file that exists but cannot be
+ * read or parsed fails CLOSED — no slot is granted until it is repaired.
+ */
 export function fileCapStore(file: string = CAP_FILE): NudgeCapStore {
-  const read = (): { day: string; count: number } => {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as { day?: unknown; count?: unknown };
-      return typeof parsed.day === 'string' && typeof parsed.count === 'number'
-        ? { day: parsed.day, count: parsed.count }
-        : { day: '', count: 0 };
-    } catch {
-      return { day: '', count: 0 }; // absent or unreadable: nothing counted yet
-    }
-  };
   return {
-    count: (day) => {
-      const state = read();
-      return state.day === day ? state.count : 0;
-    },
-    increment: (day) => {
-      const state = read();
-      const next = { day, count: state.day === day ? state.count + 1 : 1 };
+    reserve: (day, cap) => {
+      let state = { day: '', count: 0 };
+      try {
+        const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as { day?: unknown; count?: unknown };
+        if (typeof parsed.day !== 'string' || typeof parsed.count !== 'number') throw new Error('malformed');
+        state = { day: parsed.day, count: parsed.count };
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+          log.warn('promise-watch: nudge cap file unreadable, refusing to nudge', { file, err });
+          return false;
+        }
+      }
+      const count = state.day === day ? state.count : 0;
+      if (count >= cap) return false;
       const tmp = `${file}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(next));
+      fs.writeFileSync(tmp, JSON.stringify({ day, count: count + 1 }));
       fs.renameSync(tmp, file);
+      return true;
     },
   };
 }
@@ -299,9 +316,12 @@ function productionDeps(mode: PromiseWatchMode): ScanDeps {
     // the same message is still the newest chat and the session is still a
     // candidate. The Jev call is the gap this closes.
     nudge: async (session, messageId, text, p) => {
-      const fresh = await getSession(session.id);
-      if (!fresh) return 'stale';
-      const outcome = await withExistingMailboxSession(fresh.agent_group_id, fresh.id, (mailbox) => {
+      // Hold the mailbox first; the central re-read is the LAST await, and
+      // everything after it — snapshot, check, write — is synchronous, so no
+      // archive, close or spawn can land between the check and the insert.
+      const outcome = await withExistingMailboxSession(session.agent_group_id, session.id, async (mailbox) => {
+        const fresh = await getSession(session.id);
+        if (!fresh) return 'stale' as const;
         const snap = readSnapshot(mailbox);
         if (snap.latestChat?.id !== messageId || candidateReason(fresh, snap, Date.now()) !== 'candidate') {
           return 'stale' as const;

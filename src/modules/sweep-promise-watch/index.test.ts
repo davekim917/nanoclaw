@@ -48,6 +48,7 @@ function snap(over: Partial<SessionSnapshot> = {}): SessionSnapshot {
       timestamp: iso(QUIET_MS + 60_000),
       text: "I'll confirm tomorrow the nightly succeeded.",
     },
+    latestInboundAt: iso(QUIET_MS + 120_000),
     nextFutureProcessAfter: null,
     dueCount: 0,
     hasContinuation: false,
@@ -66,11 +67,18 @@ describe('candidateReason — only a quiet, unarmed, agent-last session is asked
     ['container-live', session('s', { container_status: 'running' }), snap()],
     ['no-chat', session('s'), snap({ latestChat: null })],
     ['activity-after', session('s', { last_active: iso(QUIET_MS) }), snap()],
+    // A host writer that inserts directly (restart note) without bumping last_active.
+    ['activity-after', session('s'), snap({ latestInboundAt: iso(QUIET_MS) })],
+    // A tie counts as activity.
+    ['activity-after', session('s', { last_active: iso(QUIET_MS + 60_000) }), snap()],
     ['too-recent', session('s'), snap({ latestChat: { id: 'm', timestamp: iso(QUIET_MS - 60_000), text: 'x' } })],
     [
       'too-old',
       session('s', { last_active: iso(MAX_AGE_MS + 120_000) }),
-      snap({ latestChat: { id: 'm', timestamp: iso(MAX_AGE_MS + 60_000), text: 'x' } }),
+      snap({
+        latestChat: { id: 'm', timestamp: iso(MAX_AGE_MS + 60_000), text: 'x' },
+        latestInboundAt: iso(MAX_AGE_MS + 120_000),
+      }),
     ],
     ['wake-due', session('s'), snap({ dueCount: 1 })],
     ['wake-pending', session('s'), snap({ nextFutureProcessAfter: new Date(NOW + 3_600_000).toISOString() })],
@@ -83,9 +91,15 @@ describe('candidateReason — only a quiet, unarmed, agent-last session is asked
 describe('scanOnce', () => {
   beforeEach(() => _resetPromiseWatchForTesting());
 
-  function memoryCap(): NudgeCapStore {
-    const counts = new Map<string, number>();
-    return { count: (d) => counts.get(d) ?? 0, increment: (d) => void counts.set(d, (counts.get(d) ?? 0) + 1) };
+  function memoryCap(counts = new Map<string, number>()): NudgeCapStore {
+    return {
+      reserve: (d, cap) => {
+        const n = counts.get(d) ?? 0;
+        if (n >= cap) return false;
+        counts.set(d, n + 1);
+        return true;
+      },
+    };
   }
 
   function deps(over: Partial<ScanDeps> & { snaps?: Record<string, SessionSnapshot> } = {}) {
@@ -174,8 +188,7 @@ describe('scanOnce', () => {
   });
 
   it('keeps the daily cap across a restart (the cap store outlives process state)', async () => {
-    const cap = memoryCap();
-    for (let i = 0; i < NUDGE_DAILY_CAP; i++) cap.increment('2026-09-18');
+    const cap = memoryCap(new Map([['2026-09-18', NUDGE_DAILY_CAP]]));
     _resetPromiseWatchForTesting();
     const { d, nudge } = deps({ cap });
     expect((await scanOnce(d)).nudged).toBe(0);
@@ -195,10 +208,10 @@ describe('scanOnce', () => {
 });
 
 describe('helpers', () => {
-  it('defaults to shadow for anything but off/nudge', () => {
-    expect(promiseWatchMode(undefined)).toBe('shadow');
-    expect(promiseWatchMode('yes')).toBe('shadow');
-    expect(promiseWatchMode('off')).toBe('off');
+  it('is opt-in: anything but an explicit shadow/nudge is off', () => {
+    expect(promiseWatchMode(undefined)).toBe('off');
+    expect(promiseWatchMode('yes')).toBe('off');
+    expect(promiseWatchMode('shadow')).toBe('shadow');
     expect(promiseWatchMode('nudge')).toBe('nudge');
   });
 
@@ -232,16 +245,14 @@ describe('helpers', () => {
     expect(candidateReason(s, snap(), NOW)).toBe('candidate');
   });
 
-  it('persists the nudge count per day in a file', () => {
+  it('reserves nudge slots per day in a file, and fails closed on a corrupt one', () => {
     const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'pw-')), 'cap.json');
     const a = fileCapStore(file);
-    expect(a.count('2026-09-18')).toBe(0);
-    a.increment('2026-09-18');
-    a.increment('2026-09-18');
-    const b = fileCapStore(file);
-    expect(b.count('2026-09-18')).toBe(2);
-    expect(b.count('2026-09-19')).toBe(0);
-    b.increment('2026-09-19');
-    expect(b.count('2026-09-19')).toBe(1);
+    expect(a.reserve('2026-09-18', 2)).toBe(true);
+    expect(a.reserve('2026-09-18', 2)).toBe(true);
+    expect(fileCapStore(file).reserve('2026-09-18', 2)).toBe(false); // survives a new store (restart)
+    expect(fileCapStore(file).reserve('2026-09-19', 2)).toBe(true); // a new day starts over
+    fs.writeFileSync(file, '{not json');
+    expect(fileCapStore(file).reserve('2026-09-19', 2)).toBe(false);
   });
 });
