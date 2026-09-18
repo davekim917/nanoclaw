@@ -1383,7 +1383,7 @@ async function deliverToAgent(
   // sibling actually responding to the user names the thread.
   if (created && wake) {
     const firstText = parsedContent.text ?? '';
-    if (firstText) await maybeRenameNewThread(event.channelType, effectiveThreadId, firstText);
+    if (firstText) await maybeRenameNewThread(event.channelType, effectiveThreadId, firstText, event.message.id);
   }
 
   // Persist any base64-encoded attachments from chat-sdk-bridge onto the

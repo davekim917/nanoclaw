@@ -429,6 +429,26 @@ describe('RFC 9728 §3.3 — the protected-resource document must describe this 
     await expect(discoverAuthorization(fetchImpl, LIVE_SHAPES.amplitude.mcpUrl)).rejects.toThrow(/RFC 9728 §3.3/);
   });
 
+  it('lets an origin-only resource cover every path on its origin — Amplitude declares its origin and serves /mcp', () => {
+    expect(() =>
+      assertResourceMatchesMcpUrl('https://mcp.amplitude.com', 'https://mcp.amplitude.com/mcp'),
+    ).not.toThrow();
+    // Every path, by design — not just the one Amplitude uses.
+    expect(() =>
+      assertResourceMatchesMcpUrl('https://mcp.amplitude.com/', 'https://mcp.amplitude.com/any/other/path'),
+    ).not.toThrow();
+    // Still bounded by the origin.
+    expect(() => assertResourceMatchesMcpUrl('https://mcp.amplitude.com', 'https://amplitude.com/mcp')).toThrow(
+      /does not cover/,
+    );
+  });
+
+  it('says "not a URL" for a URN-shaped resource, rather than "does not cover" (#911)', () => {
+    const attempt = () => assertResourceMatchesMcpUrl('urn:example:mcp-server', 'https://mcp.x.test/mcp');
+    expect(attempt).toThrow(/is not a URL/);
+    expect(attempt).not.toThrow(/does not cover/);
+  });
+
   it('tolerates a document with no resource at all — absence cannot forge a match', () => {
     expect(() => assertResourceMatchesMcpUrl(undefined, 'https://mcp.x.test/mcp')).not.toThrow();
   });

@@ -52,6 +52,7 @@ import type {
 } from './types.js';
 import { autoCommitDirtyWorktrees } from '../worktree-autosave.js';
 import { createManagedGitMaintenanceHook } from '../managed-git-guard.js';
+import { transcriptContainsUserText } from './claude-transcript-prompt.js';
 
 // Per D9 / D7 / A6: the runtime schema is compiler-checked against the SDK.
 export const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const satisfies readonly EffortLevel[];
@@ -2534,9 +2535,8 @@ export class ClaudeProvider implements AgentProvider {
    * respawn is its only reset — see the comment in that branch below.
    *
    * Process-wide propagation: rotations are mirrored to `process.env` so
-   * other in-process consumers that issue direct Anthropic calls — the
-   * thread-search Haiku rerank, future MCP tools, anything reading
-   * process.env — pick up the active credential without their own
+   * other in-process consumers that issue direct Anthropic calls — future
+   * MCP tools, anything reading process.env — pick up the active credential without their own
    * rotation logic. Safe because (a) container code reads env fresh at
    * call time (no module-load captures), (b) Bash subprocesses inherit
    * the same rotated value, so a `claude -p` an agent launches signs with
@@ -2545,6 +2545,12 @@ export class ClaudeProvider implements AgentProvider {
    * and re-injects the real token values, so direct callers bypass the
    * OneCLI proxy and use process.env directly.
    */
+  transcriptHasPrompt(continuation: string | undefined, prompt: string, sinceMs: number): boolean {
+    if (!continuation) return false;
+    const transcriptPath = findTranscriptPath(continuation);
+    return transcriptPath !== null && transcriptContainsUserText(transcriptPath, prompt, sinceMs);
+  }
+
   rotateApiKey(): { rotated: boolean; slot?: string; position?: number; ringSize?: number } {
     const usingOauth = !this.env.ANTHROPIC_API_KEY && Boolean(this.env.CLAUDE_CODE_OAUTH_TOKEN);
     if (usingOauth) {

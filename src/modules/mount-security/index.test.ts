@@ -324,3 +324,71 @@ describe('the bundle directory is protected through a symlinked leaf too', () =>
     expect(mount(unrelated).allowed).toBe(true);
   });
 });
+
+// #909: the git-hooks check had the same shape the bundle check had before
+// #905 round 3 — it resolved DATA_DIR and appended the literal leaf, so a
+// `data/managed-git-hooks` that is itself a symlink left its target open.
+describe('the managed git-hooks tree is protected through a symlinked leaf too', () => {
+  function mount(hostPath: string, readonly: boolean): ReturnType<typeof validateMount> {
+    writeAllowlist({ allowedRoots: [{ path: tmpDir, allowReadWrite: true }], blockedPatterns: [] });
+    return validateMount({ hostPath, readonly });
+  }
+
+  /** `<dataDir>/managed-git-hooks` → `<tmpDir>/hooks-elsewhere/tree`. */
+  function linkHooksOutside(): string {
+    const target = path.join(tmpDir, 'hooks-elsewhere', 'tree');
+    fs.mkdirSync(path.join(target, 'scan'), { recursive: true });
+    fs.symlinkSync(target, path.join(mockState.dataDir, 'managed-git-hooks'));
+    return target;
+  }
+
+  it('refuses a read-write mount of the symlink target', () => {
+    const target = linkHooksOutside();
+    const result = mount(target, false);
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toMatch(/host-managed git-hooks tree/);
+  });
+
+  it('refuses a read-write mount under the symlink target, and of its ancestor', () => {
+    const target = linkHooksOutside();
+    expect(mount(path.join(target, 'scan'), false).reason).toMatch(/host-managed git-hooks tree/);
+    expect(mount(path.join(tmpDir, 'hooks-elsewhere'), false).reason).toMatch(/host-managed git-hooks tree/);
+  });
+
+  it('still allows a read-only mount of the target — the guard is RW-only', () => {
+    const target = linkHooksOutside();
+    expect(mount(target, true).allowed).toBe(true);
+  });
+
+  it('still allows an unrelated read-write directory beside it', () => {
+    linkHooksOutside();
+    const unrelated = path.join(tmpDir, 'hooks-elsewhere-unrelated');
+    fs.mkdirSync(unrelated, { recursive: true });
+    expect(mount(unrelated, false).allowed).toBe(true);
+  });
+});
+
+// #911 item 4: when DATA_DIR itself cannot be resolved the realpath half of
+// both protected-tree checks cannot run. Refusing is right (fail closed); the
+// reason must say that, not claim the mount reaches the OAuth bundles.
+describe('an unresolvable DATA_DIR fails closed with an accurate reason', () => {
+  beforeEach(() => {
+    mockState.dataDir = path.join(tmpDir, 'no-such-data-dir');
+    writeAllowlist({ allowedRoots: [{ path: projectsDir, allowReadWrite: true }], blockedPatterns: [] });
+  });
+
+  it('refuses an unrelated read-only mount and names DATA_DIR as the reason', () => {
+    const result = validateMount({ hostPath: repoDir, readonly: true });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toMatch(/DATA_DIR ".*no-such-data-dir" cannot be resolved/);
+    // Not the old claim, which asserted the unrelated mount reaches the bundles.
+    expect(result.reason).not.toMatch(/reaches the MCP OAuth bundle directory \(refresh tokens\)/);
+  });
+
+  it('refuses an unrelated read-write mount with the same reason, not the git-hooks one', () => {
+    const result = validateMount({ hostPath: repoDir, readonly: false });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toMatch(/cannot be resolved/);
+    expect(result.reason).not.toMatch(/host-managed git-hooks tree/);
+  });
+});

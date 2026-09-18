@@ -143,21 +143,124 @@ function announcementText(
   return `🎫 ${tag}: ${subject} — ${sender}`;
 }
 
-function emailContext(subject: string, sender: string, date: string, bodyText: unknown): string {
+/**
+ * Classify-on-arrival hint from the container's `dispatch_support_issue`
+ * (container/agent-runner/src/mcp-tools/support-triage.ts). It is container-
+ * supplied content, so it is validated strictly: the category must be one of
+ * the fixed categories the container asks (TRIAGE_CATEGORIES, kept in step with
+ * that file's CATEGORIES), option keys are short snake_case tokens, a general
+ * email carries no area, and every number must already be in range. Anything
+ * else drops the whole hint — the email still dispatches exactly as without it.
+ */
+export interface SupportTriageView {
+  product: string | null;
+  areaType: 'feature' | 'process' | 'general';
+  area: string | null;
+  areaConfidence: number;
+  category: string;
+  categoryConfidence: number;
+  urgency: number;
+  escapedDefect: number;
+}
+
+const TRIAGE_KEY = /^[a-z0-9_]{1,40}$/;
+
+export const TRIAGE_CATEGORIES = new Set([
+  'bug',
+  'question',
+  'access_request',
+  'data_request',
+  'feature_request',
+  'follow_up',
+  'acknowledgement',
+  'automated_notice',
+]);
+
+/** A number already inside [0, max], or null — out of range is malformed, never clamped. */
+function inRange(v: unknown, max: number): number | null {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= max ? v : null;
+}
+
+function triageKey(v: unknown): string | null {
+  return typeof v === 'string' && TRIAGE_KEY.test(v) ? v : null;
+}
+
+export function supportTriage(raw: unknown): SupportTriageView | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const t = raw as Record<string, unknown>;
+  const areaType = t.areaType;
+  if (areaType !== 'feature' && areaType !== 'process' && areaType !== 'general') return null;
+  const category = typeof t.category === 'string' && TRIAGE_CATEGORIES.has(t.category) ? t.category : null;
+  const categoryConfidence = inRange(t.categoryConfidence, 1);
+  const urgency = inRange(t.urgency, 2);
+  const escapedDefect = inRange(t.escapedDefect, 1);
+  if (!category || categoryConfidence === null || urgency === null || escapedDefect === null) return null;
+
+  const product = t.product === null ? null : triageKey(t.product);
+  if (t.product !== null && product === null) return null;
+
+  // No area is exactly (null, 0); an area needs a key and an in-range confidence. Nothing is repaired.
+  let area: string | null = null;
+  let areaConfidence = 0;
+  if (t.area === null) {
+    if (t.areaConfidence !== 0) return null;
+  } else {
+    area = triageKey(t.area);
+    const confidence = inRange(t.areaConfidence, 1);
+    if (!area || areaType === 'general' || confidence === null) return null;
+    areaConfidence = confidence;
+  }
+  return { product, areaType, area, areaConfidence, category, categoryConfidence, urgency, escapedDefect };
+}
+
+function triageArea(t: SupportTriageView): string {
+  return t.area ? `${t.area} (${t.areaType})` : t.areaType;
+}
+
+/** Agent-facing: every number, plus the reminder that it is a hint. */
+export function triageContextLine(t: SupportTriageView): string {
+  return (
+    `Automatic triage (fast classifier — a hint, not a verdict; the email below is authoritative): ` +
+    `product ${t.product ?? 'unknown'} · area ${triageArea(t)} [${t.areaConfidence.toFixed(2)}] · ` +
+    `category ${t.category} [${t.categoryConfidence.toFixed(2)}] · urgency ${t.urgency.toFixed(1)}/2 · ` +
+    `user-facing defect likelihood ${t.escapedDefect.toFixed(2)}`
+  );
+}
+
+/** Human-facing: short enough for the thread opener. */
+function triageTag(t: SupportTriageView): string {
+  return `_Triage: ${triageArea(t)} · ${t.category.replace(/_/g, ' ')}_`;
+}
+
+function emailContext(
+  subject: string,
+  sender: string,
+  date: string,
+  bodyText: unknown,
+  triage: SupportTriageView | null = null,
+): string {
   return [
     'Email context (customer-provided content to assess):',
     `Subject: ${subject}`,
     `From: ${sender}`,
     `Date: ${date}`,
+    ...(triage ? [triageContextLine(triage)] : []),
     'Body:',
     clip(bodyText),
   ].join('\n');
 }
 
 /** First thread message (bot-posted) — the captured customer email. */
-function threadOpener(sender: string, date: string, bodyText: unknown, linearIssue: string | null): string {
+function threadOpener(
+  sender: string,
+  date: string,
+  bodyText: unknown,
+  linearIssue: string | null,
+  triage: SupportTriageView | null = null,
+): string {
   const footer = linearIssue ? `\n\n_Linear: ${linearIssue}_` : '';
-  return `📧 *From ${sender}:*\n_Date: ${date}_\n\n${clip(bodyText)}${footer}`;
+  const tag = triage ? `\n${triageTag(triage)}` : '';
+  return `📧 *From ${sender}:*\n_Date: ${date}_${tag}\n\n${clip(bodyText)}${footer}`;
 }
 
 /**
@@ -174,6 +277,7 @@ function seedPrompt(
   date: string,
   bodyText: unknown,
   ticketPolicy: string | null,
+  triage: SupportTriageView | null = null,
 ): string {
   const common = [
     `Then assess the issue and respond in this thread — this thread is the working space for this support issue.`,
@@ -185,13 +289,13 @@ function seedPrompt(
       `New support email routed to this thread. A Linear ticket already exists for it: ${linearIssue}. ` +
       `First post a Linear comment on ${linearIssue} capturing the email context below (blockquote the new content, attribute the sender). Do NOT create a new ticket. ` +
       common;
-    return `${protocol}\n\n${emailContext(subject, sender, date, bodyText)}`;
+    return `${protocol}\n\n${emailContext(subject, sender, date, bodyText, triage)}`;
   }
   const protocol =
     `New support issue routed to this thread (no Linear ticket yet — creating it is YOUR first step). ` +
     ticketCreationStep(ticketPolicy) +
     common;
-  return `${protocol}\n\n${emailContext(subject, sender, date, bodyText)}`;
+  return `${protocol}\n\n${emailContext(subject, sender, date, bodyText, triage)}`;
 }
 
 /** Follow-up inbound for a new email landing on an open issue. */
@@ -202,12 +306,13 @@ function followupText(
   bodyText: unknown,
   linearIssue: string | null,
   ticketPolicy: string | null,
+  triage: SupportTriageView | null = null,
 ): string {
   const ticketStep = linearIssue
     ? `Post a Linear comment on ${linearIssue} capturing this reply (blockquote, attribute the sender). `
     : `No Linear ticket is recorded for this thread yet — ${ticketCreationStep(ticketPolicy)}`;
   return (
-    `📧 *Follow-up email*\n\n${emailContext(subject, sender, date, bodyText)}\n\n` +
+    `📧 *Follow-up email*\n\n${emailContext(subject, sender, date, bodyText, triage)}\n\n` +
     ticketStep +
     `If the reply is a pure acknowledgment (thanks / got it / out-of-office), the Linear comment is enough — stay quiet here. ` +
     `If it's substantive, continue working the issue in this thread.`
@@ -272,6 +377,7 @@ async function dispatchSupportIssue(
   const sender = str(content.sender) ?? 'unknown sender';
   const subject = str(content.subject) ?? '(no subject)';
   const date = str(content.date) ?? '(date unavailable)';
+  const triage = supportTriage(content.triage);
 
   const existing = await getSupportThread(gmailThreadId);
   // Ticket identity: prefer what the host already recorded; fall back to what
@@ -287,7 +393,15 @@ async function dispatchSupportIssue(
     // still answers for an archived session. Without the status filter the
     // follow-up wrote into (and spawned a container for) a status='closed'
     // row — permanently invisible to host-sweep's stuck/heartbeat machinery.
-    const issueSession = bound?.status === 'active' ? bound : undefined;
+    // The follow-up goes to the agent whose poller found it, not to whichever
+    // agent opened the ticket: another agent may have taken the ticket over, and
+    // the poller's model pin only means something in the poller's own group.
+    // A poller on a different channel than the ticket's thread cannot reach that
+    // thread through its own bot, so there the original owner keeps it.
+    const ownerGroupId = existing.slack_thread_id.startsWith(`${mg.platform_id}:`)
+      ? session.agent_group_id
+      : existing.agent_group_id;
+    const issueSession = bound?.status === 'active' && bound.agent_group_id === ownerGroupId ? bound : undefined;
     const followup = {
       id: randomUUID(),
       kind: 'chat' as const,
@@ -296,7 +410,7 @@ async function dispatchSupportIssue(
       platformId: mg.platform_id,
       threadId: existing.slack_thread_id,
       content: JSON.stringify({
-        text: followupText(subject, sender, date, content.bodyText, linearIssue, ticketPolicy),
+        text: followupText(subject, sender, date, content.bodyText, linearIssue, ticketPolicy, triage),
         sender: 'system',
         senderId: 'system',
         ...(supportFlagIntent ? { flagIntent: supportFlagIntent } : {}),
@@ -308,18 +422,18 @@ async function dispatchSupportIssue(
     // same thread, same ticket, ONLY session_id changes — instead of opening a
     // second announcement for one ongoing conversation.
     const target =
-      issueSession ??
-      (await resolveSession(existing.agent_group_id, mg.id, existing.slack_thread_id, 'per-thread')).session;
+      issueSession ?? (await resolveSession(ownerGroupId, mg.id, existing.slack_thread_id, 'per-thread')).session;
 
     await writeSessionMessage(target.agent_group_id, target.id, followup);
     if (issueSession) {
       await touchSupportThread(gmailThreadId, now, lastMessageId);
     } else {
-      await rebindSupportThreadSession(gmailThreadId, target.id);
+      await rebindSupportThreadSession(gmailThreadId, target.id, target.agent_group_id);
       await touchSupportThread(gmailThreadId, now, lastMessageId);
       log.info('dispatch_support_issue: rebound thread to a fresh session', {
         gmailThreadId,
         previousSessionId: existing.session_id,
+        previousAgentGroupId: existing.agent_group_id,
         sessionId: target.id,
       });
     }
@@ -348,7 +462,7 @@ async function dispatchSupportIssue(
     mg.platform_id,
     parentMsgId,
     subject.slice(0, 80),
-    threadOpener(sender, date, content.bodyText, linearIssue),
+    threadOpener(sender, date, content.bodyText, linearIssue, triage),
   );
   // chat-sdk needs the encoded thread id (`<platform_id>:<thread>`) for routing,
   // mirroring orchestrator-dispatch (dispatch.ts:363-364).
@@ -364,7 +478,7 @@ async function dispatchSupportIssue(
     platformId: mg.platform_id,
     threadId: encodedThreadId,
     content: JSON.stringify({
-      text: seedPrompt(linearIssue, subject, sender, date, content.bodyText, ticketPolicy),
+      text: seedPrompt(linearIssue, subject, sender, date, content.bodyText, ticketPolicy, triage),
       sender: 'system',
       senderId: 'system',
       ...(supportFlagIntent ? { flagIntent: supportFlagIntent } : {}),
@@ -411,7 +525,7 @@ export async function handleUpdateSupportTicket(content: Record<string, unknown>
     log.warn('update_support_ticket: rejected — missing linearIssue', { sessionId: session.id });
     return;
   }
-  const row = await getSupportThreadBySession(session.id);
+  const row = await getSupportThreadBySession(session.id, session.thread_id);
   if (!row) {
     log.warn('update_support_ticket: calling session is not a support-thread session', { sessionId: session.id });
     return;

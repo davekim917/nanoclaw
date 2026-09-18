@@ -347,13 +347,11 @@ spec_sources, intent_sources, started_at, orchestrator, lane_models,
 frontend_owner, auth_account_alias
 ```
 
-**Freeze the intent text the same way you freeze the SHA.** §1 pins the build;
-nothing used to pin the prose the acceptance lane reads, so extraction ran
-against whatever the PR body said at that moment. Someone reordering or
-narrowing a claim mid-campaign got it verified in its easier form — and the
-lane's own after-the-fact check ("every quoted source line appears verbatim in
-the PR body") then validated against the edited text, so the audit passed too.
-A mutable intent source audited against itself proves nothing.
+**Freeze the intent text the same way you freeze the SHA.** Extraction used
+to run against whatever the PR body said at that moment, so a claim narrowed
+mid-campaign got verified in its easier form and the lane's own quote check
+validated against the edited text. A mutable intent source audited against
+itself proves nothing.
 
 So at freeze time, before any lane starts, copy each intent source into the run
 directory and hash it:
@@ -369,6 +367,25 @@ Record each path and its `sha256` in the run record's `intent_sources`. **The
 frozen copies are the intent of record**: the acceptance lane extracts from
 them, quotes from them, and the after-the-fact check verifies against them —
 never against the live body.
+
+**Acceptance contract (contract steps).** Active only when the QA pair's
+standing instructions say `Acceptance contract (XZO pilot): active`; every
+step marked *(contract)* applies then and never otherwise, and without that
+line this skill runs exactly as before. *(contract)* Also freeze every request
+the PR body's `acceptance-v1` block (`references/acceptance.example.json`)
+names in `sources` — `issue#<n>` via `gh issue view` as `intent/issue-<n>.md`,
+`slack:<channel>/<thread_id>` via `read_thread` as
+`intent/slack-<channel>-<thread>.md` — hashed into `intent_sources`. An
+unreachable source stays `unfrozen`; its items read `unsupported`. Then,
+before any lane starts:
+
+```bash
+python3 /app/skills/smoke-test/scripts/smoke-acceptance.py extract <run-dir>
+```
+
+It writes `intent/acceptance.json` (`origin: pr-body`; freeze campaigns
+prefix ids `pr<n>/`). An invalid block, or none, leaves `origin: absent` with
+the reasons, and the acceptance lane derives the contract (below).
 
 Re-hash the live bodies when the acceptance lane runs. A mismatch is **not**
 fatal and does not void the run: record it on the acceptance result as
@@ -1184,12 +1201,8 @@ that source must never be the diff:
   `<run-dir>/intent/*.md` is what §1 pinned at freeze time; extract and quote
   from those files only. A findings issue's expected/actual fields are a second
   independent intent source when one exists, and it is frozen the same way.
-- **Re-hash the live bodies before extracting.** If any `sha256` differs from
-  the one in `intent_sources`, record `intent_drift: <path> (frozen <sha8> →
-  live <sha8>)` on this lane's result and carry it to the report's Untested
-  line. Then verify the frozen text anyway. Never re-extract from the live body
-  and never drop the drift note — the whole point is that a mid-campaign edit
-  is visible to the reader rather than quietly becoming the thing verified.
+- **Re-hash the live bodies before extracting** and record any drift exactly
+  as §1 says; never re-extract from the live body.
 - **Extract every stated, user-visible claim** — something a person could
   observe in the running product (a value that renders differently, a state
   that becomes reachable, an error that becomes possible). Quote the source
@@ -1273,14 +1286,10 @@ served-payload change). If it does:
   fabricated scope, not evidence. Checking against the live PR body is what let
   a mid-campaign edit launder itself; `intent/` cannot be edited after the fact
   without changing a hash the run record already published.
+- *(contract)* **`smoke-acceptance.py check <run-dir>` passes** (below).
 - **`intent/` must exist and its hashes must match `intent_sources`.** A run
   whose acceptance lane produced a claim table with no frozen intent files
   skipped the freeze — that is visible without rereading anything.
-- **Every `met`/`not met` row carries an attached screenshot.** A bare verdict
-  is not a verified one.
-- **Every `not demonstrable` row carries a `blocked by:` naming a concrete
-  missing thing, plus an artifact.** A row with neither, or with a `blocked by:`
-  that only restates the verdict ("could not verify"), is an unaudited skip.
 - **Every `claim absent` result on a change with a user-facing consumer
   carries the `(unstated user-facing change: …)` note and a matching widening
   of the UI adversary's manifest scope.** A bare `claim absent` next to matched
@@ -1291,15 +1300,36 @@ served-payload change). If it does:
   from the table is a silently dropped claim, and the lane failed at extraction
   even when every listed row is honest.
 
+*(contract)* **Request-sourced items with stable ids.** The lane also works
+from `intent/acceptance.json` (§1 `extract`). If it reads `origin: absent`, or `items` is empty while the
+diff cross-check above found a user-facing consumer, derive the items yourself
+from the frozen request sources — never the diff, never the PR prose — into
+the same file with `origin: derived` and every item `derived: true`. Then
+write `evidence/<lane>/acceptance-results.json`, one row per item:
+
+```json
+{"itemId":"AC1","verdict":"met|not_met|not_demonstrable|blocked",
+ "observed":{"kind":"text|dom|api|screenshot-only","excerpt":"≤500 chars"},
+ "evidence":["evidence/A1/ac1.png"],"blockedBy":null}
+```
+
+`met`/`not_met` need an existing evidence file and a nonempty excerpt;
+`not_demonstrable` keeps the blocker-plus-artifact rule above; `blocked` means
+never attempted because the lane or environment stopped — `blockedBy`
+required, never coverage. A derived contract with no user-observable item says
+so: `"items":[]` plus `"none":[{"reason":"…"}]`. A missing row is a
+completeness failure; an unknown `itemId` is reported and ignored. Cite the
+file in the lane marker's `evidence[]`. **Provenance is mechanical**: each
+`quote` must occur (whitespace-normalised) in the one frozen file its named
+source resolves to. The PR body is searched with its one block removed, and
+is unavailable if `acceptance-v1` appears anywhere else in it — a quote that
+lives only inside a block is `unsupported`. The coordinator runs `check`
+before synthesis; the barrier never reads it.
+
 **This lane runs in addition to the diff-derived lanes above, never instead
-of them.** A claim nobody wrote in the PR or issue cannot be extracted, so
-this lane has a blind spot the seam lanes cover — a defect never promised as
-behavior (a broken button nobody claimed would work) is exactly what the UI
-adversary and backend verifier exist to catch. The reverse blind spot is
-theirs: a diff-derived manifest never asks whether the feature does what it
-was asked to do, only whether the code is internally coherent, which is the
-gap this lane exists to close. Neither lane substitutes for the other, and
-neither should be cut in the name of simplifying the manifest.
+of them.** A defect never promised as behavior is the seam lanes' to catch;
+whether the feature does what was asked is this lane's. Neither substitutes
+for the other.
 
 **`not demonstrable` never rounds up to a pass.** A claim nobody could
 confirm is not evidence the feature works; it is evidence the run cannot say.
@@ -1318,6 +1348,16 @@ boundary, share frozen specifications and raw evidence, never conclusions before
 each side's own conclusion is durable. The independent challenger must sample
 checks that passed — including acceptance claims marked `met` — not only
 reported failures; otherwise it cannot challenge false clears.
+
+*(contract)* **Obligations first, then the contract.** The challenger enumerates the request's obligations from the frozen
+sources alone — never the diff, never the PR prose — into
+`challenger/request-obligations.json` (`[{"id":"O1","source":"R1","quote":"…",
+"observable":"…"}]`) *before* reading `intent/acceptance.json`, the same
+ordering discipline as the disposition. Then `challenger/acceptance-check.json`
+maps both ways: each obligation `covered|narrowed|missing` (item id if any),
+each item `supported|narrowed|unsupported`. A `met` on a narrowed or
+unsupported item never covers an obligation; those stay as diagnostics.
+`missing` obligations are Untested-line entries and `DISSENT` inputs.
 
 ## 4. Challenge every candidate finding
 
@@ -1497,7 +1537,8 @@ screenshots:
 - Frontend: <journeys completed>, <n> screenshots and <n> clips (attached)
 - Findings: <each in one plain-language line with severity, or "none confirmed">
 - Fixes: <PRs and deployed SHAs, or none>
-- Untested: <explicit list, or "nothing in scope">
+- Untested: <explicit list, or "nothing in scope"; *(contract)* plus the
+  `smoke-acceptance.py report` sentence>
 - Challenge: <challenger chat language> — <one clause of substance>
 - Full run record: <durable link — publish `run-record.md` where this
   channel's readers can click it (a PR comment, an issue, a dashboard; the
