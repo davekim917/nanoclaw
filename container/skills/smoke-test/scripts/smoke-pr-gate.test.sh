@@ -1422,6 +1422,28 @@ T5K_WITH="$(bash "$GATE" check 13)"
 [ "$(jq -c 'del(.journeys)' <<<"$T5K_WITH")" = "$T5K_ABSENT" ] ||
   { echo "5k: a catalogue changed facts other than .journeys" >&2; exit 1; }
 
+# ...and with no catalogue and nothing at either pin path, no checker even runs:
+# a pin-check that would crash changes nothing (byte-identical), whereas a stray
+# pin with no catalogue is still judged.
+cat > "$STUB_BIN/python3" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in *"smoke-journeys.py pin-check "*) [ -z "${STUB_PINCHECK_FAIL:-}" ] || exit 70 ;; esac
+exec /usr/bin/env -u STUB_PINCHECK_FAIL "$REAL_PYTHON3" "$@"
+STUB
+chmod +x "$STUB_BIN/python3"
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/no-such-journeys.json" STUB_PINCHECK_FAIL=1
+[ "$(bash "$GATE" check 13)" = "$T5K_ABSENT" ] || { echo "5k: a crashing pin checker changed the no-catalogue facts" >&2; exit 1; }
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and (.data | has("journeys") | not)' >/dev/null ||
+  { echo "5k: a crashing pin checker made a no-catalogue freeze unofferable" >&2; exit 1; }
+unset STUB_PINCHECK_FAIL; rm -f "$STUB_BIN/python3"
+journeys_fixture "$BACKEND_ONLY"
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/no-such-journeys.json"
+mkdir -p "$SMOKE_GATE_LEASE_DIR"; printf '{"pinned":true,"matchedJourneys":[],"unmappedPaths":[]}' > "$(jpin_file 13 "$FREEZE_SHA")"
+range_case 5k-stray-pin-no-catalogue '.journeys.pinState == "invalid" and (.journeys.reason | test("no journey catalogue is configured"))'
+journeys_fixture "$BACKEND_ONLY"
+export SMOKE_JOURNEYS_CATALOGUE="$STATE_DIR/journeys.json"
+T5K_WITH="$(bash "$GATE" check 13)"
+
 # A BACKEND-ONLY change selects its unchanged UI consumer up front; the path
 # nothing claims is listed; the infra exclusion is visible. `check` never pins.
 jq -e '.journeys.selection == "matched" and .journeys.route == "web" and .journeys.pinned == false and

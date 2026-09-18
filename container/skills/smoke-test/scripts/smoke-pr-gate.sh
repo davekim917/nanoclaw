@@ -1904,6 +1904,14 @@ journeys_select() {  # <pr> <head-sha> <determinable> <fail-reason> <paths-json>
     journeys_full "journey selection cannot be pinned on shared storage ($why)" unavailable
     return 0
   fi
+  # No catalogue and nothing at either pin path: the install never adopted
+  # journeys, so no checker runs and the facts are byte-identical to a gate that
+  # has never heard of them. Anything at either path is still judged.
+  if [ ! -e "$JOURNEYS_CATALOGUE" ] && [ ! -L "$JOURNEYS_CATALOGUE" ] &&
+     [ ! -e "$(journeys_pin_file "$pr" "$head_sha")" ] && [ ! -L "$(journeys_pin_file "$pr" "$head_sha")" ] &&
+     [ ! -e "$(journeys_pin_file "$pr" "$head_sha" recovery)" ] && [ ! -L "$(journeys_pin_file "$pr" "$head_sha" recovery)" ]; then
+    printf 'null'; return 0
+  fi
   # ONE owning-pin rule (smoke-journeys.py resolve_owner): a valid recovery pin
   # owns, else the valid primary, else nothing; any unreadable pin ⇒ unavailable.
   primary="$(journeys_pin_check "$(journeys_pin_file "$pr" "$head_sha")" "$pr" "$head_sha" --owner)"

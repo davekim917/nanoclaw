@@ -33,6 +33,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 
@@ -333,6 +334,31 @@ def pass_identity_problems(contract, marker, jid):
     return out
 
 
+def stale_after_refreeze(run_dir, jid):
+    """True when a pair re-freeze retired this lane's evidence and nothing
+    redispatched it -- or when that cannot be told. The rule is
+    rl_stale_after_refreeze in refreeze-lanes.jq, the ONE definition the
+    barrier and `smoke-pair-identity.sh finish` read; it is invoked here
+    exactly as smoke-evidence-barrier.sh invokes it, never mirrored."""
+    identity = os.path.join(run_dir, "coordinator", "identity.json")
+    if not os.path.exists(identity):
+        return False
+    contract = os.path.join(run_dir, "completion-contract.json")
+    try:
+        out = subprocess.run(
+            ["jq", "-cs", "-L", _HERE, "--slurpfile", "c", contract,
+             'include "refreeze-lanes"; if length != 1 then {error: "identity.json is not exactly one JSON document"} '
+             'else .[0] | rl_stale_after_refreeze(if ($c | length) == 1 then $c[0] else "unparsable" end) end',
+             identity],
+            capture_output=True, text=True, timeout=20, check=False)
+        verdict = json.loads(out.stdout) if out.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        verdict = None
+    if not isinstance(verdict, dict) or verdict.get("error"):
+        return True
+    return jid in (verdict.get("stale") or [])
+
+
 def last_proven(run_root, journey):
     """Newest completedAt of a `pass` that PROVED this floor journey: the
     marker passes pass_identity_problems (declared lane, same sourceSha and
@@ -354,7 +380,8 @@ def last_proven(run_root, journey):
         # existence (media retention prunes old runs): a pass the barrier would
         # refuse today proves nothing and resets nothing.
         if pass_identity_problems(contract, marker, jid) or \
-                lane_problems(run_dir, contract, jid, journey["evidence"], True, files_must_exist=False):
+                lane_problems(run_dir, contract, jid, journey["evidence"], True, files_must_exist=False) or \
+                stale_after_refreeze(run_dir, jid):
             continue
         done = _parse_iso(marker.get("completedAt"))
         if done is not None and (newest is None or done > newest):

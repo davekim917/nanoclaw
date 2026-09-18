@@ -204,6 +204,21 @@ jq 'del(.sourceSha)' "$ROOT/r7/markers/branch-scope-crossing.json" > "$ROOT/r7/m
 jq 'del(.sourceSha)' "$ROOT/r7/completion-contract.json" > "$ROOT/r7/c.tmp"; mv "$ROOT/r7/c.tmp" "$ROOT/r7/completion-contract.json"
 expect 3-null-sha-no-reset '.entries[0].lastProvenAt == "2026-09-09T12:00:00Z"' "$(python3 "$TOOL" floor-due "$CATALOGUE" "$ROOT" --size light --as-of "$NOW" | jq -c '{entries:[.entries[] | select(.id == "branch-scope-crossing")]}')"
 rm -rf "$ROOT/r7"
+# A pair RE-FREEZE retires evidence gathered before it: the barrier refuses a
+# generation-1 pass after `refreeze` snapshotted generation 1 until the lane is
+# redispatched (refreeze-lanes.jq rl_stale_after_refreeze), and cadence reads
+# that same definition — the stale pass resets nothing; the gen-2 pass does.
+floor_run r8 2026-09-09T18:00:00Z '["api.txt"]' api
+mkdir -p "$ROOT/r8/coordinator"
+jq -n --arg sha "$SHA" '{history:[{at:"2026-09-09T17:00:00Z"}],freezeGeneration:2,
+  refreezeLaneSnapshot:{contractPresent:true,sourceSha:$sha,lanes:[{id:"branch-scope-crossing",generation:1}]}}' > "$ROOT/r8/coordinator/identity.json"
+expect 3-refreeze-stale-no-reset '.entries[0].lastProvenAt == "2026-09-09T12:00:00Z"' "$(python3 "$TOOL" floor-due "$CATALOGUE" "$ROOT" --size light --as-of "$NOW" | jq -c '{entries:[.entries[] | select(.id == "branch-scope-crossing")]}')"
+jq '.lanes[0].generation = 2' "$ROOT/r8/completion-contract.json" > "$ROOT/r8/c.tmp"; mv "$ROOT/r8/c.tmp" "$ROOT/r8/completion-contract.json"
+jq '.generation = 2' "$ROOT/r8/markers/branch-scope-crossing.json" > "$ROOT/r8/m.tmp"; mv "$ROOT/r8/m.tmp" "$ROOT/r8/markers/branch-scope-crossing.json"
+expect 3-redispatched-pass-resets '.entries[0].lastProvenAt == "2026-09-09T18:00:00Z"' "$(python3 "$TOOL" floor-due "$CATALOGUE" "$ROOT" --size light --as-of "$NOW" | jq -c '{entries:[.entries[] | select(.id == "branch-scope-crossing")]}')"
+printf 'not json' > "$ROOT/r8/coordinator/identity.json"   # unreadable identity: doubt never resets
+expect 3-unreadable-identity-no-reset '.entries[0].lastProvenAt == "2026-09-09T12:00:00Z"' "$(python3 "$TOOL" floor-due "$CATALOGUE" "$ROOT" --size light --as-of "$NOW" | jq -c '{entries:[.entries[] | select(.id == "branch-scope-crossing")]}')"
+rm -rf "$ROOT/r8"
 # In the matcher: the floor journey rides a change that never touched it...
 expect 3-match-floor '[.matchedJourneys[] | {id,reason}] == [{"id":"loan-desk-checkout","reason":"changed"},{"id":"branch-scope-crossing","reason":"floor"}]' \
   "$(match '["web/src/desk/a.tsx"]' --size standard --run-root "$ROOT")"
