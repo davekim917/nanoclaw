@@ -267,7 +267,7 @@ describe('thread-search workgroup-pooled tests', () => {
       channel_name: 'docs',
     });
 
-    const result = await searchThreadsTool.handler({ query: 'workgroup pooled document', rerank: false });
+    const result = await searchThreadsTool.handler({ query: 'workgroup pooled document' });
 
     const text = getText(result);
     // Post-D1: both threads should appear in FTS results
@@ -275,6 +275,27 @@ describe('thread-search workgroup-pooled tests', () => {
     // Should return 2 thread hits (one per unique thread_id)
     expect(text).toMatch(/Found 2 thread/);
     expect(result.isError).toBeFalsy();
+  });
+
+  it('lists a thread once when sibling agents archived it under their own adapters', async () => {
+    for (const [i, channelType] of ['slack-acme', 'slack-acme-codex', 'slack-acme-opencode'].entries()) {
+      insertMsg(sharedDb, {
+        id: `msg-sib-${i}`,
+        agent_group_id: `ag-sib-${i}`,
+        channel_type: channelType,
+        platform_id: 'slack:C900',
+        thread_id: 'slack:C900:t1',
+        role: 'assistant',
+        sender_name: `bot${i}`,
+        text: `release checklist for the quarterly launch ${i}`,
+        sent_at: `2024-01-04T08:0${i}:00Z`,
+        channel_name: 'launch',
+      });
+    }
+
+    const text = getText(await searchThreadsTool.handler({ query: 'quarterly launch checklist' }));
+    expect(text).toMatch(/Found 1 thread/);
+    expect(text).toContain('3 match(es)');
   });
 
   // -----------------------------------------------------------------------
@@ -340,7 +361,6 @@ describe('thread-search workgroup-pooled tests', () => {
 
     const result = await searchThreadsTool.handler({
       query: 'isolated workgroup specific',
-      rerank: false,
     });
 
     const text = getText(result);

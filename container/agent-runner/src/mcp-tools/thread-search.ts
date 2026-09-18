@@ -38,88 +38,6 @@ function getDb(): Database | null {
   }
 }
 
-/**
- * Semantic rerank of FTS candidates via Haiku. The FTS layer hands us a
- * BM25-ranked candidate pool; this LLM pass ("which of these threads is
- * actually about X?") tightens the top-K. Direct fetch (no SDK) — one
- * prompt, one response, ~1s latency. Falls back to BM25 order on any
- * failure or when no Anthropic credential is configured.
- *
- * Auth: prefers ANTHROPIC_API_KEY (x-api-key); falls back to
- * CLAUDE_CODE_OAUTH_TOKEN (Authorization: Bearer + oauth-2025-04-20
- * beta header) for Claude Max subscription deployments.
- */
-const HAIKU_MODEL = 'claude-haiku-4-5-20251001';
-const RERANK_CAP = 20; // at most this many candidates go to the LLM
-const RERANK_TIMEOUT_MS = 5_000;
-
-interface RerankCandidate {
-  id: number; // 1-based position in the input list
-  snippet: string;
-  channel: string;
-}
-
-function buildAnthropicAuthHeaders(): Record<string, string> | null {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (apiKey) {
-    return { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' };
-  }
-  const oauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-  if (oauth) {
-    return {
-      authorization: `Bearer ${oauth}`,
-      'anthropic-version': '2023-06-01',
-      'anthropic-beta': 'oauth-2025-04-20',
-    };
-  }
-  return null;
-}
-
-async function haikuRerank(query: string, candidates: RerankCandidate[]): Promise<number[] | null> {
-  const auth = buildAnthropicAuthHeaders();
-  if (!auth) return null;
-  const baseUrl = (process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/+$/, '');
-  const prompt =
-    `You are reranking chat thread search results by relevance to the user's query.\n\n` +
-    `Query: ${JSON.stringify(query)}\n\n` +
-    `Candidates (id: channel — snippet):\n` +
-    candidates.map((c) => `${c.id}: ${c.channel} — ${c.snippet.slice(0, 240)}`).join('\n') +
-    `\n\nReturn ONLY a JSON array of ids in best-to-worst relevance order, like [3,1,2]. No prose.`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), RERANK_TIMEOUT_MS);
-  try {
-    const res = await fetch(`${baseUrl}/v1/messages`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...auth,
-      },
-      body: JSON.stringify({
-        model: HAIKU_MODEL,
-        max_tokens: 256,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      log(`rerank HTTP ${res.status}`);
-      return null;
-    }
-    const body = (await res.json()) as { content?: Array<{ type: string; text?: string }> };
-    const text = body.content?.find((b) => b.type === 'text')?.text ?? '';
-    const m = text.match(/\[[\d,\s]+\]/);
-    if (!m) return null;
-    const ids = JSON.parse(m[0]) as number[];
-    if (!Array.isArray(ids) || ids.some((n) => !Number.isInteger(n))) return null;
-    return ids;
-  } catch (e) {
-    log(`rerank failed: ${e instanceof Error ? e.message : String(e)}`);
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 function sanitizeFtsQuery(q: string): string {
   // FTS5 treats space-separated terms as implicit AND. For chat-sized
   // messages that's far too strict — "docker container build" almost
@@ -149,17 +67,12 @@ export const searchThreadsTool: McpToolDefinition = {
   tool: {
     name: 'search_threads',
     description:
-      'Full-text search of past conversations in this agent group. Returns threads ranked by relevance (BM25, then optional Haiku semantic rerank), with a snippet around each match. Use when the user asks things like "find the thread where we discussed X" or "what did we decide about Y last week".',
+      'Full-text search of past conversations in this agent group. Returns threads ranked by relevance (BM25), with a snippet around each match. Use when the user asks things like "find the thread where we discussed X" or "what did we decide about Y last week".',
     inputSchema: {
       type: 'object' as const,
       properties: {
         query: { type: 'string', description: 'Keywords or phrase to search for.' },
         limit: { type: 'number', description: 'Max thread hits to return (default 10, max 30).' },
-        rerank: {
-          type: 'boolean',
-          description:
-            'Semantic rerank of FTS candidates via Haiku. Default true. Set false to skip the LLM call (faster, FTS-only).',
-        },
       },
       required: ['query'],
     },
@@ -167,7 +80,6 @@ export const searchThreadsTool: McpToolDefinition = {
   handler: async (args: Record<string, unknown>) => {
     const query = typeof args.query === 'string' ? args.query : '';
     const limit = typeof args.limit === 'number' ? Math.min(Math.max(1, args.limit), 30) : 10;
-    const rerank = args.rerank !== false; // opt-out, default on
     if (!query.trim()) return err('query is required');
 
     const db = getDb();
@@ -176,9 +88,14 @@ export const searchThreadsTool: McpToolDefinition = {
     const sanitized = sanitizeFtsQuery(query);
     if (!sanitized) return ok('No searchable tokens in query.');
 
-    // Pull up to RERANK_CAP candidates if reranking; otherwise just
-    // `limit`. The LLM re-orders the wider pool and we truncate after.
-    const ftsLimit = rerank ? Math.max(limit, RERANK_CAP) : limit;
+    // A thread's copy under the caller's own adapter wins the displayed
+    // channel_type, so read_thread on the result reads the caller's copy.
+    let ownChannelType = '';
+    try {
+      ownChannelType = getSessionRouting().channel_type ?? '';
+    } catch {
+      // best-effort: without routing, any sibling's copy is shown
+    }
     let rows: SearchHitRow[];
     try {
       rows = db
@@ -202,7 +119,7 @@ export const searchThreadsTool: McpToolDefinition = {
            )
            SELECT
              a.thread_id,
-             a.channel_type,
+             COALESCE(MAX(CASE WHEN a.channel_type = $own THEN a.channel_type END), MIN(a.channel_type)) AS channel_type,
              MAX(a.channel_name) AS channel_name,
              a.platform_id,
              MAX(a.sent_at) AS latest_message_at,
@@ -214,53 +131,27 @@ export const searchThreadsTool: McpToolDefinition = {
               LIMIT 1) AS first_snippet
            FROM messages_archive a
            JOIN matches m ON m.rowid = a.rowid
-           GROUP BY a.thread_id, a.channel_type, a.platform_id
+           -- One row per thread. Sibling agents in a workgroup archive the
+           -- same thread under their own adapter's channel_type
+           -- (slack-<group>), so grouping on channel_type listed one thread
+           -- once per sibling. platform_id is already platform-qualified.
+           GROUP BY a.platform_id, a.thread_id
            ORDER BY best_score ASC
            LIMIT $limit`,
         )
-        .all({ $q: sanitized, $limit: ftsLimit }) as SearchHitRow[];
+        .all({ $q: sanitized, $limit: limit, $own: ownChannelType }) as SearchHitRow[];
     } catch (e) {
       return err(`FTS search failed: ${e instanceof Error ? e.message : String(e)}`);
     }
 
     if (rows.length === 0) return ok('No threads matched that query.');
 
-    // Semantic rerank when we have >1 candidate and reranking is on. On
-    // any failure, fall back to FTS recency order — never block.
-    let rerankLabel = '';
-    if (rerank && rows.length > 1) {
-      const candidates: RerankCandidate[] = rows.map((r, i) => ({
-        id: i + 1,
-        channel: r.channel_name ? `#${r.channel_name}` : `${r.channel_type}:${r.platform_id}`,
-        snippet: r.first_snippet ?? '',
-      }));
-      const order = await haikuRerank(query, candidates);
-      if (order && order.length > 0) {
-        const seen = new Set<number>();
-        const reordered: SearchHitRow[] = [];
-        for (const id of order) {
-          const idx = id - 1;
-          if (idx >= 0 && idx < rows.length && !seen.has(idx)) {
-            reordered.push(rows[idx]);
-            seen.add(idx);
-          }
-        }
-        // Append any candidates the LLM omitted, preserving FTS order.
-        rows.forEach((r, i) => {
-          if (!seen.has(i)) reordered.push(r);
-        });
-        rows = reordered;
-        rerankLabel = ' (reranked)';
-      }
-    }
-    rows = rows.slice(0, limit);
-
     const lines = rows.map((r, i) => {
       const where = r.channel_name ? `#${r.channel_name}` : `${r.channel_type}:${r.platform_id}`;
       const loc = r.thread_id ? `${where} thread=${r.thread_id}` : where;
       return `${i + 1}. ${loc}\n   ${r.match_count} match(es), latest ${r.latest_message_at}\n   …${r.first_snippet ?? ''}…`;
     });
-    return ok(`Found ${rows.length} thread(s)${rerankLabel}:\n\n${lines.join('\n\n')}`);
+    return ok(`Found ${rows.length} thread(s):\n\n${lines.join('\n\n')}`);
   },
 };
 
