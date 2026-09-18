@@ -16,6 +16,8 @@ import {
   type DiscordThreadRestClient,
   discoverDiscordRecoveryTargets,
   extractDiscordChannelId,
+  discordChannelPermalink,
+  discordPermalink,
   unwrapForwardedSnapshot,
   type DiscordBotIdentity,
   type DiscordRestClient,
@@ -678,6 +680,28 @@ describe('extractDiscordChannelId', () => {
 
   it('test_returns_raw_id_when_no_prefix', () => {
     expect(extractDiscordChannelId('channel-id-X')).toBe('channel-id-X');
+  });
+});
+
+describe('discordPermalink', () => {
+  it('links a thread by guild and thread id — a Discord thread is itself a channel', () => {
+    expect(discordPermalink('discord:123456789000000001:123456789000000002:123456789000000003')).toBe(
+      'https://discord.com/channels/123456789000000001/123456789000000003',
+    );
+  });
+
+  it('declines anything it cannot link exactly', () => {
+    expect(discordPermalink(null)).toBeNull();
+    expect(discordPermalink('discord:123456789000000001:123456789000000002')).toBeNull(); // channel, not thread
+    expect(discordPermalink('discord:@me:123456789000000002:123456789000000003')).toBeNull();
+    expect(discordPermalink('slack:C0AAA:1786621514.008659')).toBeNull();
+  });
+
+  it('links a channel separately', () => {
+    expect(discordChannelPermalink('discord:123456789000000001:123456789000000002')).toBe(
+      'https://discord.com/channels/123456789000000001/123456789000000002',
+    );
+    expect(discordChannelPermalink('slack:C0AAA')).toBeNull();
   });
 });
 

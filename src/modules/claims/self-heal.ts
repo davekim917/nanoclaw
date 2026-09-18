@@ -269,6 +269,25 @@ function claimStateLine(claim: BoardClaim): string {
 }
 
 /**
+ * The claim thread's link, for any post these prompts sanction.
+ *
+ * Those posts often land top-level in a channel, away from the thread that holds
+ * the context. A human who gets "blocked on you, answer by Friday" there either
+ * has to go find the thread or answers under the alert. Answering under the alert
+ * starts a second thread on the same topic, one the owning agent's session is not
+ * reading. The link sends them back to the right thread. It is resolved host-side
+ * because the agent cannot build it: a thread id carries no workspace URL (that is
+ * learned at adapter init, slack-mentions.ts `slackPermalink`). Null (no adapter
+ * could build one) adds nothing, so the prompt reads as it did before links.
+ */
+function threadLinkLine(threadUrl: string | null | undefined): string {
+  return threadUrl
+    ? `Include this link to the claim's thread in that message: ${threadUrl} — and ask them to reply THERE, where ` +
+        `the context is, not under your post. A reply to the alert itself starts a second thread on the same topic.\n`
+    : '';
+}
+
+/**
  * The push-it-forward contract, composed entirely from the claim file.
  *
  * Shared by the human path (dashboard/nudge.ts, `origin` = who clicked) and the
@@ -287,7 +306,7 @@ function claimStateLine(claim: BoardClaim): string {
  * a board cannot show is a human who owes a decision, so that is the one thing
  * that posts.
  */
-export function buildNudgePrompt(claim: BoardClaim, origin: string): string {
+export function buildNudgePrompt(claim: BoardClaim, origin: string, threadUrl?: string | null): string {
   const claimSh = 'bash /app/skills/work-claims/claim.sh';
   return (
     `${origin} — the claim \`${claim.slug}\` has stopped moving.\n` +
@@ -300,8 +319,9 @@ export function buildNudgePrompt(claim: BoardClaim, origin: string): string {
     `\`${claimSh} park ${claim.slug} "waiting on <person-or-agent>: <what you asked>"\`, AND post ONE message that ` +
     `@-mentions whoever owes it. The mention is what delivers the ask — a notification to a human, a wake to an agent; ` +
     `a plain name reaches neither. Write it to stand alone — say which claim, what is blocked, and who owes the answer; ` +
-    `it may land at the top of a channel rather than in the thread you are reading this in.\n\n` +
-    `Post NOTHING for 1 or 2. The claims board and the Observatory already show claim state, so announcing a finish, ` +
+    `it may land at the top of a channel rather than in the thread you are reading this in.\n` +
+    threadLinkLine(threadUrl) +
+    `\nPost NOTHING for 1 or 2. The claims board and the Observatory already show claim state, so announcing a finish, ` +
     `a release or a park duplicates what a human can already see — and your standing instructions forbid it. Option 3 ` +
     `is the ONLY sanctioned post here, because a blocked hand-off is the one thing no board can show. Do not hedge by ` +
     `posting anyway.\n` +
@@ -334,7 +354,7 @@ export const NUDGE_TASK_QUIET_ARGS = { quiet_status: true, chat_limit: 1 } as co
  * board, so announcing it is duplication. Declining is not visible anywhere,
  * so declining is what posts.
  */
-export function buildTakeoverPrompt(claim: BoardClaim): string {
+export function buildTakeoverPrompt(claim: BoardClaim, threadUrl?: string | null): string {
   const claimSh = 'bash /app/skills/work-claims/claim.sh';
   return (
     `Self-heal takeover — the claim \`${claim.slug}\`, owned by ${claim.owner}, has been stale through two ` +
@@ -344,7 +364,9 @@ export function buildTakeoverPrompt(claim: BoardClaim): string {
     `1. Take it over — \`${claimSh} take ${claim.slug} <hours> "<takeover: what you are picking up>"\` — then work it. ` +
     `Post nothing: the take rewrites the owner on the board, which is where anyone looking will read it.\n` +
     `2. Post ONE message saying why this should NOT be taken over (already done, superseded, blocked on a named human) ` +
-    `— that reason is the one thing the board cannot show. If it is done, also release it: \`${claimSh} release ${claim.slug}\`.\n\n` +
+    `— that reason is the one thing the board cannot show. If it is done, also release it: \`${claimSh} release ${claim.slug}\`.\n` +
+    threadLinkLine(threadUrl) +
+    `\n` +
     `Do not silently leave it: this is the last automatic step, and after it the claim just sits red on the board.`
   );
 }
@@ -369,7 +391,7 @@ export function buildTakeoverPrompt(claim: BoardClaim): string {
  * ask has to reach someone. Either way this fires once — `applyDecision` stamps
  * `auto_heal_exhausted_at` on delivery, and the claim is then left red forever.
  */
-export function buildHumanEscalationPrompt(claim: BoardClaim): string {
+export function buildHumanEscalationPrompt(claim: BoardClaim, threadUrl?: string | null): string {
   const claimSh = 'bash /app/skills/work-claims/claim.sh';
   const hours = Math.max(0, Math.round(claim.staleMs / 3600000));
   const who = namedHuman(claim.note);
@@ -384,8 +406,9 @@ export function buildHumanEscalationPrompt(claim: BoardClaim): string {
     `👉 @<person> — <the decision or action you need, and by when>\n` +
     `The @-mention is the whole point: it is what raises a notification. A plain name reaches nobody, and writing ` +
     `one is how this claim got here. Write the message to stand alone — name the claim, what is blocked, and what ` +
-    `you need — because it may land at the top of a channel rather than in the thread you are reading this in.\n\n` +
-    `This is the LAST automatic step for this claim. Nothing will ask again.`
+    `you need — because it may land at the top of a channel rather than in the thread you are reading this in.\n` +
+    threadLinkLine(threadUrl) +
+    `\nThis is the LAST automatic step for this claim. Nothing will ask again.`
   );
 }
 
@@ -424,6 +447,8 @@ export interface SelfHealDeps {
   ) => Promise<SelfHealTarget | null>;
   /** One-shot task into the claim's own thread. Returns false on failure. */
   createTask?: (input: SelfHealTaskInput) => Promise<boolean>;
+  /** Human-clickable link to a thread id, or null. Defaults to the board's own resolver. */
+  resolveThreadUrl?: (threadId: string) => Promise<string | null>;
   enabled?: boolean;
   takeoverEnabled?: boolean;
 }
@@ -819,6 +844,11 @@ async function defaultCreateTask(input: SelfHealTaskInput): Promise<boolean> {
   return true;
 }
 
+async function defaultResolveThreadUrl(threadId: string): Promise<string | null> {
+  const { threadPermalink } = await import('../../dashboard/api/observatory.js');
+  return threadPermalink(threadId);
+}
+
 let lastRanAtMs = 0;
 
 /** Test-only, same precedent as _resetNudgeDedupeForTesting. */
@@ -851,6 +881,7 @@ export async function sweepClaimsSelfHeal(
   const resolveOwner = deps.resolveOwner ?? defaultResolveOwner;
   const resolveSibling = deps.resolveSibling ?? defaultResolveSibling;
   const createTask = deps.createTask ?? defaultCreateTask;
+  const resolveThreadUrl = deps.resolveThreadUrl ?? defaultResolveThreadUrl;
 
   const outcomes: SelfHealOutcome[] = [];
   for (const workgroupId of listWorkgroupDirs(root)) {
@@ -890,6 +921,7 @@ export async function sweepClaimsSelfHeal(
         resolveOwner,
         resolveSibling,
         createTask,
+        resolveThreadUrl,
       });
       outcomes.push(outcome);
     }
@@ -908,6 +940,7 @@ async function applyDecision(args: {
   resolveOwner: NonNullable<SelfHealDeps['resolveOwner']>;
   resolveSibling: NonNullable<SelfHealDeps['resolveSibling']>;
   createTask: NonNullable<SelfHealDeps['createTask']>;
+  resolveThreadUrl: NonNullable<SelfHealDeps['resolveThreadUrl']>;
 }): Promise<SelfHealOutcome> {
   const { workgroupId, claim, root, decision, now, enabled, takeoverEnabled } = args;
   const base = { workgroupId, slug: claim.slug, action: decision.action, reason: decision.reason };
@@ -942,14 +975,20 @@ async function applyDecision(args: {
     return { ...base, applied: false, reason: decision.action === 'takeover' ? 'no-sibling' : 'owner-unresolved' };
   }
 
+  // Link the thread the work lives in: the delivery thread for a task-series
+  // claim (its own thread is a task session, never a place a human can open),
+  // else the claim's thread. `null` delivery means channel-level: nothing to link.
+  const contextThread = target.deliverThreadId !== undefined ? target.deliverThreadId : claim.threadId;
+  const threadUrl = contextThread ? await args.resolveThreadUrl(contextThread) : null;
   const prompt =
     decision.action === 'takeover'
-      ? buildTakeoverPrompt(claim)
+      ? buildTakeoverPrompt(claim, threadUrl)
       : decision.action === 'escalate-human'
-        ? buildHumanEscalationPrompt(claim)
+        ? buildHumanEscalationPrompt(claim, threadUrl)
         : buildNudgePrompt(
             claim,
             `Automatic nudge ${decision.nudge} of ${SELF_HEAL_MAX_NUDGES} from the host (self-heal)`,
+            threadUrl,
           );
 
   if (!enabled) {

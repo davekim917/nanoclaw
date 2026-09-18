@@ -132,6 +132,7 @@ function deps(dir: string, over: Partial<SelfHealDeps> = {}): SelfHealDeps & { s
       sent.push(input);
       return true;
     }),
+    resolveThreadUrl: vi.fn(async () => null),
     sent,
     ...over,
   };
@@ -535,6 +536,17 @@ describe('prompt builders', () => {
     expect(buildNudgePrompt(board, 'x')).toContain('30h past due');
   });
 
+  it('puts the thread link in every builder when there is one, and nothing when there is not', () => {
+    for (const build of [
+      (u?: string | null) => buildNudgePrompt(board, 'x', u),
+      (u?: string | null) => buildTakeoverPrompt(board, u),
+    ]) {
+      expect(build('https://x/thread')).toContain('https://x/thread');
+      expect(build(null)).not.toContain('reply THERE');
+      expect(build()).toBe(build(null));
+    }
+  });
+
   it('offers takeover only two options, and never "finish it"', () => {
     const prompt = buildTakeoverPrompt(board);
     expect(prompt).toContain('owned by ava');
@@ -883,6 +895,36 @@ describe('human-blocked claims — a suppression window, not an exemption', () =
     expect(prompt).toContain('@-mentions the operator');
     // It must not read as a nudge: there is no work to push here.
     expect(prompt).not.toContain('Automatic nudge');
+  });
+
+  it('links the claim thread so the human answers there, not under the alert', async () => {
+    const url = 'https://acme.slack.com/archives/C0AAA/p1786621514008659?thread_ts=1786621514.008659&cid=C0AAA';
+    const resolveThreadUrl = vi.fn(async () => url);
+    const d = deps(root({ held: blocked(40) }), { resolveThreadUrl });
+    await sweepClaimsSelfHeal(NOW, d);
+
+    expect(resolveThreadUrl).toHaveBeenCalledWith('slack:C0AAA:1786621514.008659');
+    expect(d.sent[0].prompt).toContain(url);
+    expect(d.sent[0].prompt).toContain('reply THERE');
+  });
+
+  it('links the delivery thread for a task-series claim, never its task-session thread', async () => {
+    const resolveThreadUrl = vi.fn(async () => 'https://x/thread');
+    const d = deps(root({ held: blocked(40) }), {
+      resolveThreadUrl,
+      resolveOwner: vi.fn(async () => ({ ...OWNER, deliverThreadId: 'slack:C0BBB:1786000000.000001' })),
+    });
+    await sweepClaimsSelfHeal(NOW, d);
+    expect(resolveThreadUrl).toHaveBeenCalledWith('slack:C0BBB:1786000000.000001');
+
+    const channelOnly = vi.fn(async () => 'unused');
+    const d2 = deps(root({ held: blocked(40) }), {
+      resolveThreadUrl: channelOnly,
+      resolveOwner: vi.fn(async () => ({ ...OWNER, deliverThreadId: null })),
+    });
+    await sweepClaimsSelfHeal(NOW, d2);
+    expect(channelOnly).not.toHaveBeenCalled();
+    expect(d2.sent[0].prompt).not.toContain('reply THERE');
   });
 
   it('reads the person straight out of the note, however the note names them', () => {

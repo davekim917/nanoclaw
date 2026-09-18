@@ -687,6 +687,32 @@ export function extractDiscordChannelId(platformId: string): string {
   return parts[2] ?? platformId;
 }
 
+const SNOWFLAKE = /^\d+$/;
+
+/**
+ * Discord thread permalink, or null when one can't be built exactly.
+ *
+ * A thread id is `discord:{guildId}:{channelId}:{threadId}` (see
+ * makeFetchThreadAnchor above), and a Discord thread is itself a channel, so
+ * `https://discord.com/channels/{guildId}/{threadId}` opens it. Unlike Slack,
+ * no workspace URL is needed. A channel-level id, a DM (`@me`), or anything not
+ * made of snowflakes returns null rather than a guessed link.
+ */
+export function discordPermalink(threadId: string | null): string | null {
+  const parts = threadId?.split(':') ?? [];
+  if (parts.length !== 4 || parts[0] !== 'discord') return null;
+  const [, guildId, , thread] = parts;
+  if (!SNOWFLAKE.test(guildId) || !SNOWFLAKE.test(thread)) return null;
+  return `https://discord.com/channels/${guildId}/${thread}`;
+}
+
+/** Link to a Discord CHANNEL (`discord:{guildId}:{channelId}`), or null. */
+export function discordChannelPermalink(platformId: string): string | null {
+  const [scheme, guildId, channelId] = platformId.split(':');
+  if (scheme !== 'discord' || !SNOWFLAKE.test(guildId ?? '') || !SNOWFLAKE.test(channelId ?? '')) return null;
+  return `https://discord.com/channels/${guildId}/${channelId}`;
+}
+
 /**
  * Post a message to the top level of a Discord channel.
  * Exported for unit testing.
@@ -958,6 +984,8 @@ for (const ws of workspaces) {
         classifyRecoveryError: classifyDiscordRecoveryError,
         fetchThreadAnchor: makeFetchThreadAnchor(ws.botToken),
       });
+      bridge.permalink = (_platformId, threadId) => discordPermalink(threadId);
+      bridge.channelPermalink = (platformId) => discordChannelPermalink(platformId);
       bridge.postParent = (platformId, text) => discordPostParent(rest, platformId, text);
       bridge.createThread = (platformId, parentMessageId, title, firstMessage) =>
         discordCreateThread(rest, platformId, parentMessageId, title, firstMessage);
