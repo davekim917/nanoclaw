@@ -2105,7 +2105,11 @@ STALL_RUN="$(jq -r '.data.runId' <<<"$STALL_OPEN")"
 STALL_OWNER="$(jq -r '.data.coordinatorOwnerToken' <<<"$STALL_OPEN")"
 mkdir -p "$SMOKE_GATE_RUN_ROOT/$STALL_RUN/challenger"
 echo "disposition: no blocking findings" > "$SMOKE_GATE_RUN_ROOT/$STALL_RUN/challenger/disposition.md"
-jq -cn --arg o "$STALL_OWNER" '{schemaVersion:1,coordinatorOwnerToken:$o}' \
+# The contract as the scaffold writes it today (schemaVersion 2, campaign
+# identity beside the token, smoke-run-scaffold.sh:541-552); a legacy v1 one
+# is exercised on PR 64 below.
+jq -cn --arg o "$STALL_OWNER" --arg run "$STALL_RUN" --arg sha "$STALL_SHA" \
+  '{schemaVersion:2,runId:$run,sourceSha:$sha,coordinatorOwnerToken:$o,ownershipKind:"pr",pr:61,repoSlug:"org/repo"}' \
   > "$SMOKE_GATE_RUN_ROOT/$STALL_RUN/completion-contract.json"
 # ...and the preview is suspended: the PR is still listed, it just never settles.
 export STUB_HEALTHZ_CODE=503
@@ -2237,7 +2241,14 @@ for STALL_DECOY in "$STATE_DIR" "$SMOKE_GATE_LEASE_DIR"; do
   echo '{"activeRunId":"decoy","pr":1}' > "$STALL_DECOY/journeys-pin-v1-pr-64-$(sha 4).json"
 done
 echo 'not json' > "$STATE_DIR/pr-1-state.json"
-bash "$GATE" poll | jq -e '.data.trigger == "pr_run_stalled" and .data.pr == 64 and .data.runId == "run-stall-dead"' >/dev/null
+# A contract written before identity existed (schemaVersion 1) reads the same:
+# adoption is keyed on the token, and `adopt` backfills the identity itself.
+mkdir -p "$SMOKE_GATE_RUN_ROOT/run-stall-dead"
+jq -cn '{schemaVersion:1,coordinatorOwnerToken:"owner-dead"}' \
+  > "$SMOKE_GATE_RUN_ROOT/run-stall-dead/completion-contract.json"
+bash "$GATE" poll | jq -e '
+  .data.trigger == "pr_run_stalled" and .data.pr == 64 and .data.runId == "run-stall-dead" and
+  .data.completionContractExists == true and .data.contractAdoptionRequired == true' >/dev/null
 [ "$(bash "$GATE" poll)" = "$IDLE_ONE" ] || { echo "7c: aged stalled alarm re-fired" >&2; exit 1; }
 # (2) Overrun and stalled are disjoint by predicate: a run that is still
 # STAMPING past the ceiling is an overrun, never a stall, even at zero grace.
