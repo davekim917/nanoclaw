@@ -2797,11 +2797,17 @@ evaluate_pr() {
 }
 
 # THE freeze identity, bound to the immutable head. A freeze commit is the one
-# smoke-freeze-pr.sh makes — one parent, the frozen target, and a tree that
-# adds exactly the two marker files (smoke-freeze-pr.sh:100-104,
-# FREEZE_MARKER_BACKEND/FRONTEND) — so the commit endpoint's own `files` (its
-# diff against that parent) and `parents` say what THIS sha is, whatever the
-# PR's branch has moved on to. The PR file list said only what the PR's
+# smoke-freeze-pr.sh makes — exactly one parent, the frozen target
+# (`parents:[$parent]`, smoke-freeze-pr.sh:100-104), and a tree that ADDS
+# exactly the two marker files onto the target's tree (`base_tree` + two new
+# blob entries, smoke-freeze-pr.sh:87-92, FREEZE_MARKER_BACKEND/FRONTEND) — so
+# the commit endpoint's own `files` (its diff against that parent) and
+# `parents` say what THIS sha is, whatever the PR's branch has moved on to.
+# EXACTLY that shape: two files, both marker paths, each `status: added` with
+# no `previous_filename`. An ordinary PR whose final commit DELETES markers it
+# added earlier, or renames or modifies one, lists the same two filenames and
+# is not a freeze (#898 review 13: it was classified as one, so evaluate_pr
+# checked the parent's CI and claim/finish took freeze paths). The PR file list said only what the PR's
 # CURRENT head is, and every classifier read it: `claim … H` after the PR
 # advanced to an ordinary J classified H by J's files, skipped pin_freeze_head
 # and admitted H unpinned; `poll`'s evaluation shared the seam (#898 review
@@ -2819,7 +2825,9 @@ freeze_head_probe() {  # <sha> → {ok, isFreeze, targetSha}
     commit='{"parents":[],"files":[]}'
   fi
   is_freeze="$(jq -r --arg a "$FREEZE_MARKER_BACKEND" --arg b "$FREEZE_MARKER_FRONTEND" '
-    (.files | length == 2) and ((.files | map(.filename) | sort) == ([$a,$b] | sort))
+    (.parents | length == 1) and
+    (.files | length == 2) and ((.files | map(.filename) | sort) == ([$a,$b] | sort)) and
+    all(.files[]; .status == "added" and (has("previous_filename") | not))
   ' <<<"$commit" 2>/dev/null)"
   [ "$is_freeze" = true ] || is_freeze=false
   [ "$is_freeze" != true ] || target="$(jq -r '.parents[0].sha // empty' <<<"$commit")"

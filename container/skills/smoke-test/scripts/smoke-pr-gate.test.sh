@@ -121,8 +121,11 @@ case "$1" in
         [ "$STUB_PR_FILES_EXIT" = 0 ] || exit "$STUB_PR_FILES_EXIT"
         FILES="$STUB_PR_FILES"
       fi
+      # The real endpoint always carries a per-file `status`; a fixture that
+      # names files only means "added" (a freeze's own shape).
+      # A comma-separated parent value serves a merge commit (several parents).
       jq -cn --arg c "$C" --arg p "$PARENT" --argjson files "$FILES" \
-        '{sha:$c, parents:(if $p == "" then [] else [{sha:$p}] end), files:$files}'; exit 0
+        '{sha:$c, parents:(if $p == "" then [] else ($p | split(",") | map({sha:.})) end), files:($files | map({status:"added"} + .))}'; exit 0
     fi
     if printf '%s' "$*" | grep -qF '.head.sha'; then
       [ "$STUB_BINDING_EXIT" = 0 ] || exit "$STUB_BINDING_EXIT"
@@ -745,14 +748,19 @@ bash "$GATE" check 10 | jq -e '.settled == false and .frontendReady == false' >/
 export STUB_FRONTEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$FREEZE_SHA\"}}]"
 export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"failure\",\"workflowName\":\"CI\"}]"
 bash "$GATE" check 10 | jq -e '.settled == false and .ciReady == false' >/dev/null
-# Missing target identity: still fetchOk:false, still never settles.
+# Missing target identity: still fetchOk:false, still never settles. The
+# head commit is the one record that says what a head is (freeze_head_probe:
+# its files AND its parent come from the same response), so "the target
+# cannot be determined" means that commit could not be read at all — nothing
+# is known, not even that this is a freeze — and a commit with no parent is a
+# root commit, not a freeze.
 export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
-export STUB_PARENT_SHA=''
+export STUB_COMMIT_GET_EXIT=1
 bash "$GATE" check 10 | jq -e '
-  .settled == false and .fetchOk == false and .ciSha == null and
-  .campaignRange.targetSha == null and .campaignRange.determinable == false and
-  .migrationsInRange == null and .campaignSize == "full"
+  .settled == false and .fetchOk == false and .isFreezePr == false and (has("campaignRange") | not)
 ' >/dev/null
+unset STUB_COMMIT_GET_EXIT
+export STUB_PARENT_SHA=''
 
 # --- 5b. An unreadable range is UNKNOWN, never "no migrations" — and it no
 # longer poisons readiness. Before, a failed compare cleared fetchOk, which
@@ -1884,6 +1892,48 @@ T5L_ORD_H="$(bash "$GATE" claim run-ordinary-head 13 "$FREEZE_SHA")"
 jq -e '.ok == true and (has("campaignRange") | not) and (has("journeys") | not)' <<<"$T5L_ORD_H" >/dev/null ||
   { echo "5l: an ordinary head was classified by the PR's current freeze files: $T5L_ORD_H" >&2; exit 1; }
 [ -z "$(find "$SMOKE_GATE_LEASE_DIR" -name '*-pin-*' -print -quit)" ]
+# A FREEZE IS EXACTLY THE SHAPE smoke-freeze-pr.sh BUILDS: one parent, the two
+# marker paths, both ADDED. An ordinary multi-commit PR whose head commit
+# removes markers added earlier lists the same two filenames — and is
+# ordinary: no freeze keys, the head's own CI (not the parent's) consulted,
+# an ordinary claim, and `finish` writes no handoff. So are a rename, a
+# modification, and the two markers added beside a third file.
+MARKERS='{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}'
+head_files() { export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" --argjson f "$1" '{($h):$f}')"; }
+for shape in \
+  "removed|[{\"filename\":\"XZO-BACKEND/.render-freeze\",\"status\":\"removed\"},{\"filename\":\"XZO-FRONTEND/.render-freeze\",\"status\":\"removed\"}]" \
+  "renamed|[{\"filename\":\"XZO-BACKEND/.render-freeze\",\"status\":\"renamed\",\"previous_filename\":\"XZO-BACKEND/.freeze\"},{\"filename\":\"XZO-FRONTEND/.render-freeze\"}]" \
+  "modified|[{\"filename\":\"XZO-BACKEND/.render-freeze\",\"status\":\"modified\"},{\"filename\":\"XZO-FRONTEND/.render-freeze\"}]" \
+  "extra-file|[$MARKERS,{\"filename\":\"api/src/x.ts\"}]" \
+  "two-parents|[$MARKERS]"; do
+  label="${shape%%|*}"; files="${shape#*|}"
+  journeys_fixture "$BACKEND_ONLY"
+  export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'
+  head_files "$files"
+  # A merge commit that happens to add both markers has two parents; the
+  # freeze commit has exactly one.
+  [ "$label" != two-parents ] ||
+    export STUB_PARENT_BY_COMMIT="$(jq -c --arg h "$FREEZE_SHA" --arg p "$PARENT_SHA,$BASE_SHA" '.[$h] = $p' <<<"$STUB_PARENT_BY_COMMIT")"
+  T5L_SHAPE="$(bash "$GATE" check 13)"
+  jq -e --arg head "$FREEZE_SHA" '.isFreezePr == false and (has("campaignRange") | not) and (has("journeys") | not) and .ciSha == $head' <<<"$T5L_SHAPE" >/dev/null ||
+    { echo "5l: a head whose markers are $label was classified as a freeze: $T5L_SHAPE" >&2; exit 1; }
+  T5L_SHAPE="$(bash "$GATE" claim "run-$label" 13 "$FREEZE_SHA")"
+  jq -e '.ok == true and (has("campaignRange") | not) and (has("journeys") | not)' <<<"$T5L_SHAPE" >/dev/null ||
+    { echo "5l: a claim of a head whose markers are $label took the freeze path: $T5L_SHAPE" >&2; exit 1; }
+  [ -z "$(find "$SMOKE_GATE_LEASE_DIR" -name '*-pin-*' -print -quit)" ] || { echo "5l: $label head was pinned" >&2; exit 1; }
+  T5L_SHAPE="$(SMOKE_GATE_PUBLISH_FILE="$STATE_DIR/dev-gate/latest-verdict.json" SMOKE_GATE_HOLD_FILE="$STATE_DIR/dev-gate/develop-hold.json" \
+    bash "$GATE" finish "$FREEZE_SHA" "run-$label" GO)"
+  jq -e '.ok == true and .handoff.written == false' <<<"$T5L_SHAPE" >/dev/null ||
+    { echo "5l: finish of a head whose markers are $label wrote a freeze handoff: $T5L_SHAPE" >&2; exit 1; }
+  [ ! -e "$STATE_DIR/dev-gate/latest-verdict.json" ] && [ ! -e "$STATE_DIR/dev-gate/develop-hold.json" ] ||
+    { echo "5l: finish of a $label head published a freeze verdict" >&2; exit 1; }
+done
+# ...and the real shape, both markers added onto one parent, is the freeze it always was.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'
+head_files "[$MARKERS]"
+bash "$GATE" check 13 | jq -e '.isFreezePr == true and .settled == true and .campaignRange.pinState == "absent"' >/dev/null ||
+  { echo "5l: the real freeze shape was not classified as a freeze" >&2; exit 1; }
 unset STUB_COMMIT_FILES_BY_SHA
 unset -f pin_file
 
