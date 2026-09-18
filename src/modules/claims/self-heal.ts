@@ -276,8 +276,9 @@ function claimStateLine(claim: BoardClaim): string {
  * has to go find the thread or answers under the alert. Answering under the alert
  * starts a second thread on the same topic, one the owning agent's session is not
  * reading. The link sends them back to the right thread. It is resolved host-side
- * because the agent cannot build it: a thread id carries no workspace URL (that is
- * learned at adapter init, slack-mentions.ts `slackPermalink`). Null (no adapter
+ * because the agent cannot build it: a Slack thread id carries no workspace URL.
+ * `slackPermalink` reads it from the bot identity (slack-mentions.ts:114), which
+ * `auth.test` fills at adapter init (slack-mentions.ts:572). Null (no adapter
  * could build one) adds nothing, so the prompt reads as it did before links.
  */
 function threadLinkLine(threadUrl: string | null | undefined): string {
