@@ -440,7 +440,7 @@ write_lease() {  # <runId> <json>
 # The claimant re-reads after writing and verifies it still holds the lease, so
 # two claimants racing the same expiry cannot both believe they won.
 lease_acquire() {  # <runId> <owner> <pr> [quiet]
-  local run="$1" owner="$2" pr="$3" quiet="${4:-}" cur prior_claimed now next back
+  local run="$1" owner="$2" pr="$3" quiet="${4:-}" cur prior_claimed now next back slug prior_slug
   if ! lease_dir_prepare; then
     [ -n "$quiet" ] || emit_lease_dir_error "$run" "lease-claim"
     return 1
@@ -490,15 +490,33 @@ lease_acquire() {  # <runId> <owner> <pr> [quiet]
     flock -u 6; exec 6>&-
     return 1
   fi
+  # The lease also records WHICH REPO the campaign is for, slugged exactly as
+  # range_pin_file / journeys_pin_file slug it: with the PR and the head it is
+  # the identity smoke-evidence-barrier.sh looks the campaign's journeys pin up
+  # by, by exact name, never by listing the lease dir. REPO may be absent on a
+  # re-acquire (lease-claim, a same-owner reclaim): an existing repoSlug is
+  # then preserved; a conflicting one is refused, because a run id names one
+  # campaign for its on-disk lifetime and the pins are named after it.
+  slug=""; [ -z "$REPO" ] || slug="$(journeys_repo_slug)"
+  prior_slug="$(jq -r '.repoSlug // empty' <<<"$cur")"
+  if [ -n "$slug" ] && [ -n "$prior_slug" ] && [ "$slug" != "$prior_slug" ]; then
+    [ -n "$quiet" ] || jq -cn --arg run "$run" --arg owner "$owner" --arg slug "$slug" --arg prior "$prior_slug" \
+      '{ok:false,error:("this run id is bound to repo " + $prior + " and cannot be re-acquired for repo " + $slug),
+        runId:$run,requestedBy:$owner,leaseRepoSlug:$prior,requestedRepoSlug:$slug}'
+    flock -u 6; exec 6>&-
+    return 1
+  fi
+  [ -n "$slug" ] || slug="$prior_slug"
   # Same owner re-claiming keeps its original claimedAt — the campaign started
   # when it started, and only the expiry moves.
   prior_claimed=""
   [ "$(jq -r '.owner // empty' <<<"$cur")" = "$owner" ] &&
     prior_claimed="$(jq -r '.claimedAt // empty' <<<"$cur")"
   now="$(iso_now)"
-  next="$(jq -cn --arg owner "$owner" --argjson pr "$pr" --arg now "$now" \
+  next="$(jq -cn --arg owner "$owner" --argjson pr "$pr" --arg now "$now" --arg slug "$slug" \
     --arg claimed "${prior_claimed:-$now}" --arg exp "$(lease_expiry_from_now)" \
-    '{schemaVersion:1,pr:$pr,owner:$owner,claimedAt:$claimed,renewedAt:$now,expiresAt:$exp}')"
+    '{schemaVersion:1,pr:$pr,owner:$owner,claimedAt:$claimed,renewedAt:$now,expiresAt:$exp}
+     + (if $slug == "" then {} else {repoSlug:$slug} end)')"
   if ! write_lease "$run" "$next"; then
     [ -n "$quiet" ] || jq -cn --arg run "$run" --arg dir "$LEASE_DIR" \
       '{ok:false,error:("could not write the lease file under " + $dir +

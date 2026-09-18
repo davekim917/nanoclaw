@@ -2661,6 +2661,16 @@ bash "$GATE" claim run-standalone-bound 132 "$EXPIRED_SHA" owner-a | jq -e '.ok 
 STANDALONE_AUTH="$(cat "$SMOKE_GATE_LEASE_DIR/pr-132-authority.json")"
 bash "$GATE" lease-claim run-standalone-bound owner-a | jq -e '.ok == true and .lease.pr == 132' >/dev/null
 [ "$(cat "$SMOKE_GATE_LEASE_DIR/pr-132-authority.json")" = "$STANDALONE_AUTH" ]
+# The lease records the campaign's repo (repoSlug, slugged as journeys_pin_file
+# slugs it) — with the PR and the head, the identity smoke-evidence-barrier.sh
+# looks the campaign's journeys pin up by, by exact name. A re-acquire with no
+# REPO in its environment preserves it; a conflicting repo is refused, and the
+# lease is untouched.
+jq -e '.repoSlug == "org__repo"' "$SMOKE_GATE_LEASE_DIR/lease-run-standalone-bound.json" >/dev/null
+SMOKE_GATE_REPO= bash "$GATE" lease-claim run-standalone-bound owner-a | jq -e '.ok == true and .lease.repoSlug == "org__repo"' >/dev/null
+OUT="$(SMOKE_GATE_REPO=other/fork bash "$GATE" lease-claim run-standalone-bound owner-a 132 || true)"
+jq -e '.ok == false and (.error | test("bound to repo org__repo and cannot be re-acquired for repo other__fork"))' <<<"$OUT" >/dev/null
+jq -e '.repoSlug == "org__repo" and .pr == 132 and .owner == "owner-a"' "$SMOKE_GATE_LEASE_DIR/lease-run-standalone-bound.json" >/dev/null
 bash "$GATE" release run-standalone-bound owner-a | jq -e '.ok == true' >/dev/null
 
 # --- 30. malformed and non-shared lease storage fail closed -----------------

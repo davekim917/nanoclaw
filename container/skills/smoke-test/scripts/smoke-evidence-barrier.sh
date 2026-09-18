@@ -514,7 +514,7 @@ done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 # journey — whose terminal marker that loop then demands — and a scope
 # disposition for every frozen unmapped path. COMPLETENESS ONLY, the same
 # bargain as confirmedFindings: a disposition's presence proves bookkeeping,
-# and whether it is TRUE is the challenger's question. A run with no pinned
+# and whether it is TRUE is the challenger's question.
 #
 # WHETHER a run owes this is the gate's decision, never the run's bookkeeping:
 # if the PR gate pinned a selection for this campaign, the run must hold those
@@ -522,147 +522,60 @@ done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 # below. The pin is `journeys-pin-<repo>-pr-<n>-<head sha>.json` in the SHARED
 # lease directory (smoke-pr-gate.sh journeys_pin_file — campaign ownership is
 # shared, so a second coordinator's barrier finds it too), resolved from the
-# same two env vars the gate and the scaffold use; a pr-owned contract's
-# sourceSha IS that head sha (require_fenced_source_sha, smoke-run-scaffold.sh:309).
-# The run never authors what it is held to. What sits at that path is judged by
-# `smoke-journeys.py`'s one pin predicate (the gate uses the same one): valid ⇒
-# the run must hold its bytes; invalid ⇒ the gate's RECOVERY pin beside it
-# (`…-recovery.json`, also gate-authored and immutable) owns the run instead;
-# neither valid ⇒ not ready. A selection in the run with no gate pin behind it
-# is refused too. No catalogue means no pin, and a run with neither a pin nor a
-# selection is untouched; an unreadable answer fails closed.
+# same two env vars the gate and the scaffold use.
+#
+# IDENTITY, NOT ENUMERATION. The pin is found by the campaign's identity and
+# probed by its exact name — never by listing the directory. Four review rounds
+# of #898 each found a listing that failed reading as "no pin" (compgen, then
+# find: EACCES, a vanished mount, a symlinked lease dir not followed, a
+# search-only 0300 dir refusing a healthy run), and "no pin" is the one answer
+# that switches every check below off. All of it now lives in one place,
+# `smoke-journeys.py barrier` (campaign_identity → locate_owner → resolve_owner
+# → check_pin, exception-preserving lstat/open, the same predicate the gate
+# uses), given:
+#   head  the contract's sourceSha — a pr-owned contract's sourceSha IS the
+#         head (require_fenced_source_sha, smoke-run-scaffold.sh:309);
+#   PR    the gate-authored shared lease for THIS run directory's own name,
+#         lease-<runId>.json, read by exact path — what the scaffold's PR fence
+#         reads before any contract is written (smoke-run-scaffold.sh:288);
+#   repo  the lease's repoSlug (smoke-pr-gate.sh lease_acquire records it), else
+#         SMOKE_GATE_REPO slugged as the gate slugs it, backfilling a lease
+#         written before the field existed.
+# Verdicts, for a pr-owned contract: two confirmed-absent pin paths ⇒ the
+# legacy no-pin answer, byte for byte (search permission on the lease dir is
+# enough; listing permission is irrelevant); a valid pin ⇒ the run must hold
+# its bytes; invalid ⇒ the gate's RECOVERY pin beside it owns instead, neither
+# valid ⇒ not ready; a probe that FAILED (unreachable dir, EACCES on the lease
+# or the pin) ⇒ not ready, whatever the catalogue says; identity that cannot be
+# completed (no lease, or a legacy lease without repoSlug and no
+# SMOKE_GATE_REPO) ⇒ decided by whether this install keeps a catalogue at the
+# path the gate reads (smoke-pr-gate.sh:151): none ⇒ legacy, since no pin can
+# have been produced; one ⇒ not ready, naming the missing identity. A
+# develop/task contract never takes pin obligations from the lease dir and is
+# untouched by any of this, except that one whose lease binds it to a PR that
+# has a pin is refused for relabelling itself. The run never authors what it is
+# held to; a selection in the run with no gate pin behind it is refused too.
 JOURNEY_LEASE_DIR="${SMOKE_GATE_LEASE_DIR:-${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases}"
-#
-# ONE owning pin, never "any pin for this sha". The lease dir is shared, so two
-# campaigns on one head sha (two PRs at the same commit, the same commit in two
-# repos) each have a pin there, and a run that could satisfy ANY of them could
-# adopt a sibling's narrower scope. The pin's identity is repo + PR + head:
-#   head  the contract's sourceSha (above);
-#   PR    the SHARED coordinator lease for the contract's runId, which binds a
-#         run id to its PR (lease-<runId>.json `.pr` — what the scaffold's fence
-#         checks at smoke-run-scaffold.sh:290), else the one pr-<n>-authority
-#         record naming this run. Never the run dir's own copy;
-#   repo  SMOKE_GATE_REPO, slugged exactly as smoke-pr-gate.sh range_pin_file
-#         does. Unset, the pin is still unique when only one repo has pinned
-#         this (PR, head); more than one is refused, not guessed.
-# Zero candidates is today's no-pin behaviour.
-#
-# TRUST BOUNDARY. These checks catch accidental corruption and cross-campaign
-# mix-ups, not a coordinator rewriting files it authored or holds write access
-# to (its own contract, a pin in the lease dir it also writes leases into) —
-# that actor is the harness's existing boundary, the same one the fenced
-# contract, markers and range pins rest on; independence is the challenger's.
-# Two cheap identity facts ARE already here, so they are checked whenever a
-# journeys pin exists for this sha: the contract's runId must be the run
-# directory's own name (the scaffold writes `basename "$RUN_DIR"`,
-# smoke-run-scaffold.sh:479), and a contract calling itself develop-owned while the
-# shared lease binds that run id to a PR campaign is refused.
-#
-# ONE DISCOVERY PRIMITIVE. Every "which pins are in the shared lease dir"
-# question below goes through lease_dir_glob, because a listing that FAILS must
-# never read as a listing that found nothing: `compgen -G` and a bare glob
-# answer "no match" for EACCES, an I/O error and a vanished mount alike, and
-# that answer used to skip every check below — synthesis could go ready with
-# every matched journey and every unmapped-path obligation dropped, with no
-# file rewritten by anyone. First line of the output is one of:
-#   none                   the directory was listed and nothing matched
-#   found                  then one matching path per line, sorted
-#   unavailable <reason>   missing, not a directory, or the listing failed
-# WHO refuses on "unavailable" is decided at the call site, by ownership: a
-# pr-owned contract already depends on this directory — the scaffold's PR fence
-# creates it (smoke-run-scaffold.sh:188) and reads the run's lease from it
-# (smoke-run-scaffold.sh:288) before any contract is written — so refusing when
-# it cannot be listed changes nothing in a healthy install. A develop/task
-# contract's pin obligations never come from it, so for one "unavailable" is
-# handled as "none", exactly as before. A readable directory with no pin is
-# byte-for-byte today's no-pin behaviour.
-lease_dir_glob() { # <glob> — one level of $JOURNEY_LEASE_DIR, no descent
-  local errs matches rc
-  if [ ! -d "$JOURNEY_LEASE_DIR" ]; then
-    printf 'unavailable shared lease directory %s is missing or not a directory\n' "$JOURNEY_LEASE_DIR"
-    return 0
-  fi
-  errs="$(mktemp)"
-  matches="$(find "$JOURNEY_LEASE_DIR" -mindepth 1 -maxdepth 1 -name "$1" -print 2>"$errs")" && rc=0 || rc=$?
-  if [ "$rc" -ne 0 ] || [ -s "$errs" ]; then
-    printf 'unavailable shared lease directory %s could not be listed: %s\n' \
-      "$JOURNEY_LEASE_DIR" "$(tr '\n' ' ' <"$errs" | sed -e 's/[[:space:]]*$//')"
-    rm -f "$errs"; return 0
-  fi
-  rm -f "$errs"
-  if [ -z "$matches" ]; then printf 'none\n'; return 0; fi
-  printf 'found\n'; LC_ALL=C sort <<<"$matches"
-}
-JOURNEY_PIN_ARGS=()
-JOURNEY_OWNERSHIP="$(jq -r '.ownershipKind' "$CONTRACT")"
-JOURNEY_PINS_FOR_SHA="$(lease_dir_glob "journeys-pin-*-pr-*-$SOURCE_SHA.json")"
-JOURNEY_PINS_STATE="${JOURNEY_PINS_FOR_SHA%%$'\n'*}"
-if [ "$JOURNEY_PINS_STATE" != none ] && [ "$JOURNEY_PINS_STATE" != found ] && [ "$JOURNEY_OWNERSHIP" = pr ]; then
+JOURNEY_CATALOGUE="${SMOKE_JOURNEYS_CATALOGUE:-/workspace/agent/journeys.json}"
+JOURNEY_REPO_SLUG=""
+[ -z "${SMOKE_GATE_REPO:-}" ] ||
+  JOURNEY_REPO_SLUG="$(printf '%s' "$SMOKE_GATE_REPO" | sed -e 's#/#__#g' -e 's/[^A-Za-z0-9._-]/_/g')"
+# The run directory's OWN name is the run id the lease is looked up by; the
+# contract's runId is checked against it (the scaffold writes `basename
+# "$RUN_DIR"`, smoke-run-scaffold.sh:479), so a borrowed runId borrows nothing.
+JOURNEY_RUN_NAME="$(basename "$(realpath -e "$RUN_DIR" 2>/dev/null || printf '%s' "$RUN_DIR")")"
+journeys_result="$(python3 "$SCRIPT_DIR/smoke-journeys.py" barrier "$RUN_DIR" \
+  --lease-dir "$JOURNEY_LEASE_DIR" --run-id "$JOURNEY_RUN_NAME" \
+  --ownership "$(jq -r '.ownershipKind' "$CONTRACT")" --head "$SOURCE_SHA" \
+  --repo-slug "$JOURNEY_REPO_SLUG" --catalogue "$JOURNEY_CATALOGUE" 2>/dev/null)" || journeys_result=""
+if ! jq -e '(.missing | type == "array") and (.invalid | type == "array") and (.invalidReasons | type == "array")' \
+     <<<"$journeys_result" >/dev/null 2>&1; then
   INVALID+=("journeys/selection.json")
-  INVALID_REASONS+=("journeys/selection.json: this pr-owned campaign's journeys pin could not be looked up — ${JOURNEY_PINS_STATE#unavailable } — and an unlistable directory is no answer, not \"no pin\"; refusing rather than treating the campaign as unpinned")
-fi
-if [ "$JOURNEY_PINS_STATE" = found ]; then
-  JOURNEY_RUN_ID="$(jq -r '.runId // empty' "$CONTRACT")"
-  JOURNEY_RUN_NAME="$(basename "$(realpath -e "$RUN_DIR" 2>/dev/null || printf '%s' "$RUN_DIR")")"
-  if [ "$JOURNEY_RUN_ID" != "$JOURNEY_RUN_NAME" ]; then
-    INVALID+=("$RUN_DIR/completion-contract.json")
-    INVALID_REASONS+=("completion-contract.json: runId \"$JOURNEY_RUN_ID\" is not this run directory's name \"$JOURNEY_RUN_NAME\" — a contract naming another campaign's run would borrow its PR and pin; the scaffold writes the directory's own name")
-  elif [ "$JOURNEY_OWNERSHIP" != pr ] && [ -f "$JOURNEY_LEASE_DIR/lease-$JOURNEY_RUN_ID.json" ] &&
-       jq -e '(.pr | type == "number")' "$JOURNEY_LEASE_DIR/lease-$JOURNEY_RUN_ID.json" >/dev/null 2>&1; then
-    INVALID+=("$RUN_DIR/completion-contract.json")
-    INVALID_REASONS+=("completion-contract.json: declares ownershipKind $JOURNEY_OWNERSHIP but the shared lease lease-$JOURNEY_RUN_ID.json binds this run to PR #$(jq -r '.pr' "$JOURNEY_LEASE_DIR/lease-$JOURNEY_RUN_ID.json") — a PR campaign cannot opt out of its journeys pin by relabelling its contract")
-  fi
-fi
-if [ "$JOURNEY_OWNERSHIP" = pr ] && [ "$JOURNEY_PINS_STATE" = found ]; then
-  JOURNEY_PR=""
-  if printf '%s' "$JOURNEY_RUN_ID" | grep -Eq '^[A-Za-z0-9._-]{1,200}$'; then
-    JOURNEY_PR="$(jq -r 'select(type == "object" and (.pr | type == "number")) | .pr' \
-      "$JOURNEY_LEASE_DIR/lease-$JOURNEY_RUN_ID.json" 2>/dev/null || true)"
-    if [ -z "$JOURNEY_PR" ]; then
-      JOURNEY_AUTHORITIES="$(lease_dir_glob 'pr-*-authority.json')"
-      [ "${JOURNEY_AUTHORITIES%%$'\n'*}" != found ] ||
-        JOURNEY_PR="$(tail -n +2 <<<"$JOURNEY_AUTHORITIES" | while IFS= read -r authority; do
-            [ -f "$authority" ] || continue
-            jq -r --arg run "$JOURNEY_RUN_ID" 'select(type == "object" and .runId == $run and (.pr | type == "number")) | .pr' \
-              "$authority" 2>/dev/null || true
-          done | sort -u)"
-    fi
-  fi
-  if ! printf '%s' "$JOURNEY_PR" | grep -Eq '^[0-9]+$'; then
-    INVALID+=("journeys/selection.json")
-    INVALID_REASONS+=("journeys/selection.json: the gate pinned a journey selection for this head sha, but this run's PR cannot be read from the shared lease (lease-$JOURNEY_RUN_ID.json / pr-<n>-authority.json in $JOURNEY_LEASE_DIR), so the pin this campaign owns cannot be identified — refusing rather than binding to another campaign's")
-  else
-    JOURNEY_REPO_SLUG='*'
-    [ -z "${SMOKE_GATE_REPO:-}" ] ||
-      JOURNEY_REPO_SLUG="$(printf '%s' "$SMOKE_GATE_REPO" | sed -e 's#/#__#g' -e 's/[^A-Za-z0-9._-]/_/g')"
-    # This campaign's own pin is filtered out of the ONE listing above, never
-    # re-globbed: a second listing could fail where the first succeeded.
-    JOURNEY_PIN_CANDIDATES=()
-    while IFS= read -r gate_pin; do
-      case "$(basename "$gate_pin")" in
-        journeys-pin-$JOURNEY_REPO_SLUG-pr-$JOURNEY_PR-$SOURCE_SHA.json) JOURNEY_PIN_CANDIDATES+=("$gate_pin") ;;
-      esac
-    done < <(tail -n +2 <<<"$JOURNEY_PINS_FOR_SHA")
-    if [ "${#JOURNEY_PIN_CANDIDATES[@]}" -eq 1 ]; then
-      JOURNEY_PIN_ARGS=(--gate-pin "${JOURNEY_PIN_CANDIDATES[0]}" --pr "$JOURNEY_PR" --head "$SOURCE_SHA")
-    elif [ "${#JOURNEY_PIN_CANDIDATES[@]}" -gt 1 ]; then
-      INVALID+=("journeys/selection.json")
-      INVALID_REASONS+=("journeys/selection.json: ${#JOURNEY_PIN_CANDIDATES[@]} repositories pinned a journey selection for PR #$JOURNEY_PR at this head sha and SMOKE_GATE_REPO is unset, so this campaign's own pin is ambiguous — export SMOKE_GATE_REPO as the gate has it")
-    fi
-  fi
-fi
-if [ -e "$RUN_DIR/journeys/selection.json" ] || [ "${#JOURNEY_PIN_ARGS[@]}" -gt 0 ]; then
-  journeys_result="$(python3 "$SCRIPT_DIR/smoke-journeys.py" barrier "$RUN_DIR" \
-    ${JOURNEY_PIN_ARGS[@]+"${JOURNEY_PIN_ARGS[@]}"} 2>/dev/null)" || journeys_result=""
-  if ! jq -e '(.missing | type == "array") and (.invalid | type == "array") and (.invalidReasons | type == "array")' \
-       <<<"$journeys_result" >/dev/null 2>&1; then
-    INVALID+=("journeys/selection.json")
-    INVALID_REASONS+=("journeys/selection.json: the journey completeness check could not run")
-  else
-    while IFS= read -r item; do MISSING+=("$item"); done < <(jq -r '.missing[] | select(length > 0)' <<<"$journeys_result")
-    while IFS= read -r item; do INVALID+=("$item"); done < <(jq -r '.invalid[] | select(length > 0)' <<<"$journeys_result")
-    while IFS= read -r item; do INVALID_REASONS+=("$item"); done < <(jq -r '.invalidReasons[] | select(length > 0)' <<<"$journeys_result")
-  fi
+  INVALID_REASONS+=("journeys/selection.json: the journey completeness check could not run")
+else
+  while IFS= read -r item; do MISSING+=("$item"); done < <(jq -r '.missing[] | select(length > 0)' <<<"$journeys_result")
+  while IFS= read -r item; do INVALID+=("$item"); done < <(jq -r '.invalid[] | select(length > 0)' <<<"$journeys_result")
+  while IFS= read -r item; do INVALID_REASONS+=("$item"); done < <(jq -r '.invalidReasons[] | select(length > 0)' <<<"$journeys_result")
 fi
 
 if [ "$PHASE" = "synthesis" ]; then

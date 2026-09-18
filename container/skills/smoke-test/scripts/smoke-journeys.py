@@ -33,6 +33,7 @@ import importlib.util
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -602,6 +603,61 @@ def pin_name(slug, pr, head, recovery):
     return "journeys-pin-{}-pr-{}-{}{}.json".format(slug, pr, head, "-recovery" if recovery else "")
 
 
+def _probe_path(path):
+    """("file" | "other" | "absent" | "unavailable", reason) for one exact path,
+    by lstat, keeping the errno. ENOENT is "absent" only when it is CONFIRMED:
+    the path is not there under a parent that can be stat'ed, or the parent
+    itself (or an ancestor) is confirmed not to exist / not to be a directory,
+    in which case nothing can be there either -- the gate legitimately checks
+    a pin in a lease dir it has not created yet. EACCES, EIO and every other
+    error on the path or its parent is "unavailable": no verdict. A symlink is
+    "other" (never followed)."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        parent = os.path.dirname(os.path.abspath(path))
+        try:
+            if not stat.S_ISDIR(os.stat(parent).st_mode):
+                return "absent", None
+        except (FileNotFoundError, NotADirectoryError):
+            return "absent", None
+        except OSError as exc:
+            return "unavailable", "{} could not be reached: {}".format(parent, exc)
+        return "absent", None
+    except OSError as exc:
+        return "unavailable", str(exc)
+    if stat.S_ISREG(st.st_mode):
+        return "file", None
+    return "other", "a symlink or not a regular file"
+
+
+def canonical_lease_dir(lease_dir):
+    """(real path, None) for the shared lease dir, following a symlinked
+    configuration the way the gate (smoke-pr-gate.sh lease_dir_prepare, `cd -P`)
+    and the scaffold (smoke-run-scaffold.sh prepare_lease_dir) do; (None,
+    reason) when it cannot be reached -- which is unavailable, never "empty"."""
+    if not _is_text(lease_dir):
+        return None, "no shared lease directory configured"
+    try:
+        real = os.path.realpath(lease_dir, strict=True)
+        if not stat.S_ISDIR(os.stat(real).st_mode):
+            return None, "{} is not a directory".format(real)
+    except OSError as exc:
+        return None, "shared lease directory {} could not be reached: {}".format(lease_dir, exc)
+    return real, None
+
+
+def locate_owner(lease_dir, slug, pr, head):
+    """THE campaign's owning pin by exact path -- repo + PR + head name the one
+    primary pin and its recovery twin, both probed by resolve_owner. Nothing
+    is enumerated: two confirmed-absent paths are "no pin"; a probe that
+    failed is unavailable and is refused upstream."""
+    real, why = canonical_lease_dir(lease_dir)
+    if real is None:
+        return {"state": "unavailable", "owner": None, "reason": why, "primary": None, "recovery": None}
+    return resolve_owner(os.path.join(real, pin_name(slug, pr, head, False)), pr, head, slug)
+
+
 def check_pin(path, pr=None, head=None, slug=None, as_path=None):
     """(state, reason, pin, raw, catalogue) for a journeys pin file; state is
     absent | invalid | valid. Valid means: a regular file; a complete pinnable
@@ -616,11 +672,20 @@ def check_pin(path, pr=None, head=None, slug=None, as_path=None):
     # pin; a checker that could not read (a permission error, a vanished
     # mount) has no verdict, and must never start a recovery for a pin that
     # may be perfectly valid. The caller retries later.
+    # ABSENT is a confirmed ENOENT under a reachable parent, never the silence
+    # of a probe that failed: `lexists()` answers False for EACCES, EIO and a
+    # vanished mount alike, and "no pin" is the one answer that switches every
+    # journey check off. Nothing here enumerates a directory -- a pin is looked
+    # up by its exact name, so search permission on the lease dir is all that
+    # is needed and listing permission is irrelevant.
+    probe, why = _probe_path(path)
+    if probe == "unavailable":
+        return "unavailable", "the pin could not be probed: {}".format(why), None, None, None
+    if probe == "absent":
+        return "absent", None, None, None, None
+    if probe != "file":
+        return "invalid", "a symlink or not a regular file", None, None, None
     try:
-        if not os.path.lexists(path):
-            return "absent", None, None, None, None
-        if os.path.islink(path) or not os.path.isfile(path):
-            return "invalid", "a symlink or not a regular file", None, None, None
         with open(path, "rb") as fh:
             raw = fh.read()
     except OSError as exc:
@@ -645,7 +710,9 @@ def check_pin(path, pr=None, head=None, slug=None, as_path=None):
         snapshot = os.path.join(os.path.dirname(os.path.abspath(final)), "journeys-catalogue-{}.json".format(pin["catalogueSha256"]))
         if os.path.basename(str(pin.get("catalogueSnapshot"))) != os.path.basename(snapshot):
             problem = "catalogueSnapshot does not name its content-addressed snapshot"
-        elif os.path.islink(snapshot) or not os.path.isfile(snapshot):
+        elif _probe_path(snapshot)[0] == "unavailable":
+            return "unavailable", "its catalogue snapshot could not be probed: {}".format(_probe_path(snapshot)[1]), None, None, None
+        elif _probe_path(snapshot)[0] != "file":
             problem = "its catalogue snapshot {} is missing or not a regular file".format(snapshot)
         else:
             cat, digest, _, errors = load_catalogue(snapshot)
@@ -768,6 +835,65 @@ def _run_file_ok(run_dir, rel):
     )
 
 
+LEASE_RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+
+
+def campaign_identity(lease_dir, run_id, head, env_slug):
+    """Who this run is, from gate-authored records read by EXACT path, never by
+    listing a directory (a listing that fails reads as "no pin", the one answer
+    that switches every journey check off):
+      head  the contract's sourceSha;
+      PR    the shared lease for THIS run directory's name, lease-<runId>.json
+            (smoke-pr-gate.sh lease_acquire writes it, the scaffold's PR fence
+            reads it before any contract exists);
+      repo  the lease's repoSlug (lease_acquire records it), else SMOKE_GATE_REPO
+            slugged the same way, backfilling a lease written before the field.
+    With identity complete, `owner` is locate_owner's verdict on the one
+    primary pin and its recovery twin. `unavailable` names a probe that failed;
+    an absent or malformed lease, or no repo from either source, leaves the
+    identity incomplete (`slug` None) and the caller decides what that means."""
+    out = {"lease": "absent", "leasePath": None, "pr": None, "slug": None, "slugSource": None,
+           "unavailable": None, "owner": None}
+    real, why = canonical_lease_dir(lease_dir)
+    if real is None:
+        out["unavailable"] = why
+        return out
+    if not LEASE_RUN_ID_RE.match(run_id or ""):
+        return out
+    lease_path = os.path.join(real, "lease-{}.json".format(run_id))
+    out["leasePath"] = lease_path
+    probe, why = _probe_path(lease_path)
+    if probe == "unavailable":
+        out["unavailable"] = "the shared lease {} could not be probed: {}".format(lease_path, why)
+        return out
+    if probe == "absent":
+        return out
+    if probe != "file":
+        out["lease"] = "malformed"
+        return out
+    try:
+        with open(lease_path, "rb") as fh:
+            lease = json.loads(fh.read().decode("utf-8"))
+    except OSError as exc:
+        out["unavailable"] = "the shared lease {} could not be read: {}".format(lease_path, exc)
+        return out
+    except (ValueError, UnicodeDecodeError):
+        out["lease"] = "malformed"
+        return out
+    pr = lease.get("pr") if isinstance(lease, dict) else None
+    if isinstance(pr, bool) or not isinstance(pr, int) or pr < 1:
+        out["lease"] = "malformed"
+        return out
+    out["lease"], out["pr"] = "found", pr
+    if _is_text(lease.get("repoSlug")):
+        out["slug"], out["slugSource"] = lease["repoSlug"], "lease"
+    elif _is_text(env_slug):
+        out["slug"], out["slugSource"] = env_slug, "env"
+    if out["slug"] is not None:
+        out["owner"] = locate_owner(real, out["slug"], pr, head)
+    return out
+
+
 def cmd_barrier(args):
     """Completeness only. Whether a disposition is TRUE, or a matched journey
     was walked well, is the challenger's question, not this one's."""
@@ -776,24 +902,72 @@ def cmd_barrier(args):
     missing, invalid, reasons = [], [], []
     sel_rel, cat_rel, disp_rel = "journeys/selection.json", "journeys/catalogue.json", "journeys/scope-dispositions.json"
 
-    def bad(rel, why):
+    def bad(rel, why, label=None):
         if rel not in invalid:
             invalid.append(rel)
-        reasons.append("{}: {}".format(rel, why))
+        reasons.append("{}: {}".format(label or rel, why))
 
     # Whether this run owes a journey selection, and WHAT it owes, are the
-    # gate's: `--gate-pin` is the one primary-pin path this campaign owns (passed
-    # only when something is there). The owning pin is the primary if check_pin
-    # says valid, else the gate's recovery pin if valid, else nothing -- and
-    # nothing is a refusal. Every requirement below is read from that pin and
-    # its verified snapshot in the shared lease dir; the run's own copies are
-    # only compared against them.
-    if not args.gate_pin:
+    # gate's, found by the campaign's identity (campaign_identity) and probed by
+    # exact path (locate_owner): the owning pin is the primary if check_pin says
+    # valid, else the gate's recovery pin if valid, else nothing -- and nothing
+    # is a refusal. Two confirmed-absent paths are "no pin", the legacy answer,
+    # byte for byte. Every requirement below is read from that pin and its
+    # verified snapshot in the shared lease dir; the run's own copies are only
+    # compared against them.
+    contract_rel = os.path.join(run_dir, "completion-contract.json")
+    is_pr = args.ownership == "pr"
+    ident = campaign_identity(args.lease_dir, args.run_id, args.head, args.repo_slug or None)
+    owner = ident["owner"]
+    pin_state = owner["state"] if owner else "absent"
+
+    def legacy():
         if os.path.exists(selection_path):
             bad(sel_rel, "this run holds a journey selection but no gate pin owns it (not a PR campaign, or no pin for its repo/PR/head in the shared lease dir) -- a selection is only ever the gate's, adopted with pin-run")
             emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
         emit({"applies": False, "missing": [], "invalid": [], "invalidReasons": []})
-    owner = resolve_owner(args.gate_pin, args.pr, args.head)
+
+    if is_pr and ident["unavailable"]:
+        # A probe that failed is no answer: the campaign may be pinned. With
+        # identity read by name this can no longer be caused by a lease dir
+        # that merely cannot be listed -- search permission is enough.
+        bad(sel_rel, "this pr-owned campaign's journeys pin could not be looked up ({}) -- an unreachable answer is no answer, not \"no pin\"; refusing rather than treating the campaign as unpinned".format(ident["unavailable"]))
+        emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
+    if is_pr and ident["slug"] is None:
+        # Identity incomplete: nothing can be probed. Decided by whether THIS
+        # install keeps a catalogue (the path the gate reads, smoke-pr-gate.sh
+        # JOURNEYS_CATALOGUE): without one no pin can ever have been produced,
+        # so the legacy answer holds; with one an unpinned campaign cannot be
+        # told from one whose obligations were dropped, so a pr-owned run is
+        # refused naming what is missing. Migration precondition, stated in
+        # SKILL.md: activate a catalogue only with no PR campaign in flight.
+        cat_probe, cat_why = _probe_path(args.catalogue) if args.catalogue else ("absent", None)
+        if cat_probe != "absent":
+            what = ("its shared lease {} is {}".format(ident["leasePath"], ident["lease"]) if ident["lease"] != "found"
+                    else "its shared lease {} carries no repoSlug and SMOKE_GATE_REPO is unset".format(ident["leasePath"]))
+            if cat_probe == "unavailable":
+                what += "; and the catalogue {} could not be probed: {}".format(args.catalogue, cat_why)
+            bad(sel_rel, "this install keeps a journey catalogue ({}) but this pr-owned campaign's identity cannot be completed -- {} -- so its pin cannot be looked up and an unpinned campaign cannot be told from one whose obligations were dropped; a lease written by a gate that records repoSlug, or SMOKE_GATE_REPO in the barrier's environment, completes it".format(args.catalogue, what))
+            emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
+        legacy()
+    # Two cheap identity facts, checked whenever a pin exists for this campaign:
+    # the contract's runId must be this run directory's own name (the lease was
+    # read by that name, so a borrowed runId borrows nothing), and a contract
+    # calling itself develop/task-owned while the shared lease binds this run
+    # to a PR is refused.
+    if pin_state != "absent":
+        contract_doc = _read_json(contract_rel)
+        contract_run_id = contract_doc.get("runId") if isinstance(contract_doc, dict) else None
+        if contract_run_id != args.run_id:
+            bad(contract_rel, "runId \"{}\" is not this run directory's name \"{}\" -- a contract naming another campaign's run would borrow its PR and pin; the scaffold writes the directory's own name".format(
+                contract_run_id if contract_run_id is not None else "", args.run_id), "completion-contract.json")
+            emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
+        if not is_pr and pin_state in ("valid", "invalid"):
+            bad(contract_rel, "declares ownershipKind {} but the shared lease lease-{}.json binds this run to PR #{} -- a PR campaign cannot opt out of its journeys pin by relabelling its contract".format(
+                args.ownership, args.run_id, ident["pr"]), "completion-contract.json")
+            emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
+    if not is_pr or pin_state == "absent":
+        legacy()
     if owner["state"] != "valid":
         bad(sel_rel, "this campaign has no usable journeys pin ({}) -- nothing can say what the run owes, so nothing clears it; the gate does not offer a head in this state".format(
             owner.get("reason") or "primary {}, recovery {}".format(owner["primary"]["state"], owner["recovery"]["state"])))
@@ -1001,9 +1175,12 @@ def main():
 
     p = sub.add_parser("barrier")
     p.add_argument("run_dir")
-    p.add_argument("--gate-pin", default="")
-    p.add_argument("--pr", type=int)
-    p.add_argument("--head")
+    p.add_argument("--lease-dir", required=True)
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--ownership", default="")
+    p.add_argument("--head", required=True)
+    p.add_argument("--repo-slug", default="")
+    p.add_argument("--catalogue", default="")
 
     p = sub.add_parser("publish")
     p.add_argument("catalogue")

@@ -19,6 +19,10 @@ expect() { # <label> <jq-assertion> <json>
 }
 SHA="$(printf 'a%.0s' $(seq 40))"
 NOW=2026-09-10T00:00:00Z
+# The barrier decides an incomplete campaign identity by whether THIS install
+# keeps a catalogue (section 5b); the host running this suite must not.
+export SMOKE_JOURNEYS_CATALOGUE="$WORK/absent-catalogue.json"
+unset SMOKE_GATE_REPO
 
 # A run root where the one floor journey was proven yesterday, so a LIGHT
 # campaign owes the floor nothing and the fixtures below stay about matching.
@@ -239,8 +243,10 @@ PIN_FILE="$(gate_pin "$WORK/lease4" "$SHA" '["api/src/reports/export.ts","web/sr
 RUN="$WORK/run-1"
 LEASES="$WORK/empty-leases"   # the shared lease dir the barrier looks in; `adopt` points it at a pin's
 mkdir -p "$LEASES"            # readable and empty: "no pin", which a MISSING dir is not (5b-lease-dir-*)
-share_lease() { # <lease-dir> <pr>: the shared coordinator lease binding run-1 to its PR
-  mkdir -p "$1"; jq -n --argjson pr "$2" '{schemaVersion:1,pr:$pr,runId:"run-1",owner:"owner-1"}' > "$1/lease-run-1.json"
+share_lease() { # <lease-dir> <pr> [repo-slug]: the shared coordinator lease binding run-1 to its PR and repo,
+  # as smoke-pr-gate.sh lease_acquire writes it (repoSlug slugged like journeys_pin_file)
+  mkdir -p "$1"; jq -n --argjson pr "$2" --arg slug "${3:-org__repo}" \
+    '{schemaVersion:1,pr:$pr,runId:"run-1",owner:"owner-1",repoSlug:$slug}' > "$1/lease-run-1.json"
 }
 new_run() { # <lane-spec-json: [{id,kind,evidence?}]> — a PR campaign (#7) claimed on $SHA
   rm -rf "$RUN"; mkdir -p "$RUN/markers"
@@ -392,29 +398,55 @@ expect 5b-adopted-sibling-pr '.ready == false and any(.invalidReasons[];
   test("own gate pin .*journeys-pin-org__repo-pr-7-") and test("run adopted pinFile=.*-pr-8-"))' "$(gate_barrier)"
 cp "$GATE_PIN" "$RUN/journeys/selection.json"
 PIN_FORK="$(gate_pin "$GATE_LEASES" "$SHA" '["web/src/desk/a.tsx"]' 7 other__fork)"
-# Two repos, same PR number and sha, and the barrier was not told which repo:
-# ambiguous is refused, never guessed.
-expect 5b-ambiguous-repo '.ready == false and any(.invalidReasons[]; test("2 repositories") and test("SMOKE_GATE_REPO"))' "$(gate_barrier)"
+# Two repos, same PR number and sha, in one shared lease dir: WHICH is this
+# campaign is the gate-authored lease's `repoSlug`, never a guess and never
+# the environment (SMOKE_GATE_REPO only backfills a lease written before the
+# field existed, below).
+lease_repo() { share_lease "$GATE_LEASES" 7 "$1"; }
 repo_barrier() { SMOKE_GATE_REPO="$1" SMOKE_GATE_LEASE_DIR="$GATE_LEASES" bash "$BARRIER" "$RUN" lanes || true; }
-expect 5b-own-repo '.ready == true' "$(repo_barrier org/repo)"
+expect 5b-own-repo '.ready == true' "$(gate_barrier)"
+expect 5b-env-does-not-override-lease '.ready == true' "$(repo_barrier other/fork)"   # the lease says org/repo; env is not identity
 cp "$PIN_FORK" "$RUN/journeys/selection.json"
 expect 5b-adopted-other-repo '.ready == false and any(.invalidReasons[];
-  test("own gate pin .*journeys-pin-org__repo-pr-7-") and test("run adopted pinFile=.*other__fork"))' "$(repo_barrier org/repo)"
-expect 5b-fork-owns-its-own '.ready == true' "$(repo_barrier other/fork)"   # the same bytes ARE the fork campaign's own
+  test("own gate pin .*journeys-pin-org__repo-pr-7-") and test("run adopted pinFile=.*other__fork"))' "$(gate_barrier)"
+lease_repo other__fork
+expect 5b-fork-owns-its-own '.ready == true' "$(gate_barrier)"   # the same bytes ARE the fork campaign's own
 # A repo with no pin of its own for this (PR, head) owns none of these: a
 # selection carried in anyway is nobody's, and without one it is the no-pin case.
-cp "$GATE_PIN" "$RUN/journeys/selection.json"
-expect 5b-third-repo-foreign-selection '.ready == false and any(.invalidReasons[]; test("no gate pin owns it"))' "$(repo_barrier third/repo)"
+lease_repo third__repo; cp "$GATE_PIN" "$RUN/journeys/selection.json"
+expect 5b-third-repo-foreign-selection '.ready == false and any(.invalidReasons[]; test("no gate pin owns it"))' "$(gate_barrier)"
 mv "$RUN/journeys" "$WORK/journeys.aside"
-expect 5b-third-repo-no-pin '.ready == true' "$(repo_barrier third/repo)"
+expect 5b-third-repo-no-pin '.ready == true' "$(gate_barrier)"
 mv "$WORK/journeys.aside" "$RUN/journeys"
-# The PR comes from the SHARED lease, never the run: without it the owning pin
-# cannot be identified, and that is a refusal, not "no pin".
+lease_repo org__repo
+# IDENTITY THAT CANNOT BE COMPLETED — no lease (the gate's finish removes it),
+# or a legacy lease without repoSlug and no SMOKE_GATE_REPO — is decided by
+# whether THIS install keeps a catalogue: without one no pin can ever have been
+# produced, so the legacy answer holds; with one an unpinned campaign cannot be
+# told from one whose obligations were dropped, so a pr-owned run is refused,
+# naming what is missing. With SMOKE_GATE_REPO set, a legacy lease is backfilled.
+with_catalogue() { SMOKE_JOURNEYS_CATALOGUE="$CATALOGUE" "$@"; }
+jq 'del(.repoSlug)' "$GATE_LEASES/lease-run-1.json" > "$GATE_LEASES/.legacy"; mv "$GATE_LEASES/.legacy" "$GATE_LEASES/lease-run-1.json"
+expect 5b-legacy-lease-catalogue-unset-repo '.ready == false and (.invalid | index("journeys/selection.json")) and
+  any(.invalidReasons[]; test("keeps a journey catalogue") and test("carries no repoSlug and SMOKE_GATE_REPO is unset"))' "$(with_catalogue gate_barrier)"
+expect 5b-legacy-lease-catalogue-env-backfill '.ready == true' "$(with_catalogue repo_barrier org/repo)"
+cp "$PIN_FORK" "$RUN/journeys/selection.json"
+expect 5b-legacy-lease-env-backfill-enforces '.ready == false and any(.invalidReasons[]; test("run adopted pinFile=.*other__fork"))' "$(with_catalogue repo_barrier org/repo)"
+cp "$GATE_PIN" "$RUN/journeys/selection.json"
+expect 5b-legacy-lease-no-catalogue-unset-repo '.ready == false and any(.invalidReasons[]; test("no gate pin owns it"))' "$(gate_barrier)"   # legacy answer: a selection nobody owns
+mv "$RUN/journeys" "$WORK/journeys.aside"
+expect 5b-legacy-lease-no-catalogue-no-selection '.ready == true' "$(gate_barrier)"
+expect 5b-legacy-lease-no-catalogue-env-backfill '.ready == false and any(.invalidReasons[]; test("never adopted it"))' "$(repo_barrier org/repo)"
+mv "$WORK/journeys.aside" "$RUN/journeys"
 rm -f "$GATE_LEASES/lease-run-1.json"
-expect 5b-no-lease '.ready == false and any(.invalidReasons[]; test("PR cannot be read from the shared lease"))' "$(repo_barrier org/repo)"
-jq -n '{schemaVersion:1,pr:7,runId:"run-1",owner:"owner-1",boundAt:"x"}' > "$GATE_LEASES/pr-7-authority.json"
-expect 5b-authority-fallback '.ready == true' "$(repo_barrier org/repo)"
-rm -f "$GATE_LEASES/pr-7-authority.json" "$PIN_PR8" "$PIN_FORK"
+expect 5b-no-lease-catalogue '.ready == false and any(.invalidReasons[]; test("keeps a journey catalogue") and test("lease-run-1.json is absent"))' "$(with_catalogue gate_barrier)"
+expect 5b-no-lease-catalogue-env-does-not-help '.ready == false and any(.invalidReasons[]; test("lease-run-1.json is absent"))' "$(with_catalogue repo_barrier org/repo)"
+expect 5b-no-lease-no-catalogue '.ready == false and any(.invalidReasons[]; test("no gate pin owns it"))' "$(gate_barrier)"
+mv "$RUN/journeys" "$WORK/journeys.aside"
+expect 5b-no-lease-no-catalogue-no-selection '.ready == true' "$(gate_barrier)"
+mv "$WORK/journeys.aside" "$RUN/journeys"
+lease_repo org__repo
+rm -f "$PIN_PR8" "$PIN_FORK"
 
 # THE RUN NEVER AUTHORS WHAT IT IS HELD TO. An invalid primary pin is never "no
 # pin", and the only thing that can stand in for it is the GATE's recovery pin
@@ -495,38 +527,68 @@ if [ "$(id -u)" != 0 ]; then
   expect 5b-available-again '.state == "valid" and .owner == "'"$U_PIN"'"' "$(python3 "$TOOL" pin-check "$U_PIN" --owner --pr 7 --head "$SHA")"
 fi
 
-# UNAVAILABLE STORAGE IS NOT "NO PIN". Pin discovery is ONE listing of the
-# shared lease dir (lease_dir_glob), and a listing that fails — the dir is
-# missing (a vanished mount) or cannot be read — is refused for a pr-owned run,
-# which already depends on that directory for its lease, naming the dir; a
-# develop-owned run never takes its pin obligations from there, so its answer
-# is unchanged. A readable empty directory stays byte-identical (5b above).
+# NOTHING IS ENUMERATED. The pin is looked up by the campaign's identity and
+# probed by exact name, so a lease dir that can be SEARCHED but not LISTED
+# (0300) is a healthy no-catalogue install's — byte-identical — and a symlinked
+# lease dir is followed the way the gate and scaffold follow it. A probe that
+# FAILED (unreachable dir, EACCES on the lease or the pin, a leaf symlink where
+# a pin should be) is refused for a pr-owned run, naming what failed; a
+# develop-owned run never takes pin obligations from there and is unchanged.
 new_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
+NO_PIN_PR_OUT="$(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$RUN" lanes)"
 MISSING_LEASES="$WORK/never-created-leases"
 expect 5b-lease-dir-missing-pr '.ready == false and (.invalid | index("journeys/selection.json")) and
-  any(.invalidReasons[]; test("could not be looked up") and test("never-created-leases") and test("missing"))' \
+  any(.invalidReasons[]; test("could not be looked up") and test("never-created-leases") and test("could not be reached"))' \
   "$(SMOKE_GATE_LEASE_DIR="$MISSING_LEASES" bash "$BARRIER" "$RUN" lanes || true)"
+SYML_LEASES="$WORK/symlinked-leases"; ln -s "$GATE_LEASES" "$SYML_LEASES"
+expect 5b-lease-dir-symlink-followed '.ready == false and any(.invalidReasons[]; test("never adopted it") and test("pin-run"))' \
+  "$(SMOKE_GATE_LEASE_DIR="$SYML_LEASES" bash "$BARRIER" "$RUN" lanes || true)"
+mkdir -p "$WORK/symlink-root/qa-coordinator"; ln -s "$GATE_LEASES" "$WORK/symlink-root/qa-coordinator/leases"
+expect 5b-lease-dir-symlink-shared-root '.ready == false and any(.invalidReasons[]; test("never adopted it"))' \
+  "$(SMOKE_GATE_SHARED_ROOT="$WORK/symlink-root" bash "$BARRIER" "$RUN" lanes || true)"
 jq '.ownershipKind = "develop" | .coordinatorOwnerToken = null' "$RUN/completion-contract.json" > "$RUN/c.tmp"; mv "$RUN/c.tmp" "$RUN/completion-contract.json"
 DEVELOP_EMPTY_OUT="$(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$RUN" lanes)"
 expect 5b-lease-dir-develop-baseline '.ready == true' "$DEVELOP_EMPTY_OUT"
 [ "$(SMOKE_GATE_LEASE_DIR="$MISSING_LEASES" bash "$BARRIER" "$RUN" lanes)" = "$DEVELOP_EMPTY_OUT" ] ||
   fail "5b-lease-dir-missing-develop: a develop-owned run's answer changed with the lease dir missing"
-if [ "$(id -u)" != 0 ]; then  # chmod 000 still lists as root
-  UNLISTABLE="$WORK/unlistable-leases"; mkdir -p "$UNLISTABLE"; chmod 000 "$UNLISTABLE"
-  [ "$(SMOKE_GATE_LEASE_DIR="$UNLISTABLE" bash "$BARRIER" "$RUN" lanes)" = "$DEVELOP_EMPTY_OUT" ] ||
-    fail "5b-lease-dir-unlistable-develop: a develop-owned run's answer changed with the lease dir unreadable"
+if [ "$(id -u)" != 0 ]; then  # chmod still reads as root
+  UNSEARCHABLE="$WORK/unsearchable-leases"; share_lease "$UNSEARCHABLE" 7; chmod 000 "$UNSEARCHABLE"
+  [ "$(SMOKE_GATE_LEASE_DIR="$UNSEARCHABLE" bash "$BARRIER" "$RUN" lanes)" = "$DEVELOP_EMPTY_OUT" ] ||
+    fail "5b-lease-dir-unsearchable-develop: a develop-owned run's answer changed with the lease dir unreadable"
   new_run '[{"id":"A1","kind":"lane"}]'; marker A1 blocked '[]'
-  expect 5b-lease-dir-unlistable-pr '.ready == false and (.invalid | index("journeys/selection.json")) and
-    any(.invalidReasons[]; test("could not be looked up") and test("unlistable-leases") and test("could not be listed"))' \
-    "$(SMOKE_GATE_LEASE_DIR="$UNLISTABLE" bash "$BARRIER" "$RUN" lanes || true)"
-  chmod 755 "$UNLISTABLE"
-  [ "$(SMOKE_GATE_LEASE_DIR="$UNLISTABLE" bash "$BARRIER" "$RUN" lanes)" = "$(SMOKE_GATE_LEASE_DIR="$WORK/empty-leases" bash "$BARRIER" "$RUN" lanes)" ] ||
-    fail "5b-lease-dir-listable-again: a readable empty lease dir is not byte-identical to the no-pin answer"
+  expect 5b-lease-dir-unsearchable-pr '.ready == false and (.invalid | index("journeys/selection.json")) and
+    any(.invalidReasons[]; test("could not be looked up") and test("unsearchable-leases") and test("Permission denied"))' \
+    "$(SMOKE_GATE_LEASE_DIR="$UNSEARCHABLE" bash "$BARRIER" "$RUN" lanes || true)"
+  # Search-but-not-list (0300): named reads work, listing does not. No
+  # catalogue, no pin => the legacy answer, byte for byte...
+  chmod 300 "$UNSEARCHABLE"
+  [ "$(SMOKE_GATE_LEASE_DIR="$UNSEARCHABLE" bash "$BARRIER" "$RUN" lanes)" = "$NO_PIN_PR_OUT" ] ||
+    fail "5b-lease-dir-0300-no-pin: a search-only lease dir with no pin is not byte-identical to the no-pin answer"
+  # ...and WITH a pin the pin is found and enforced, listing permission or not.
+  chmod 755 "$UNSEARCHABLE"; U300_PIN="$(gate_pin "$UNSEARCHABLE" "$SHA" '["web/src/desk/a.tsx"]')"; chmod 300 "$UNSEARCHABLE"
+  expect 5b-lease-dir-0300-pin-enforced '.ready == false and any(.invalidReasons[]; test("never adopted it") and test("pin-run"))' \
+    "$(SMOKE_GATE_LEASE_DIR="$UNSEARCHABLE" bash "$BARRIER" "$RUN" lanes || true)"
+  chmod 755 "$UNSEARCHABLE"
+  # EACCES on the lease itself is a failed probe, not "no lease".
+  chmod 000 "$UNSEARCHABLE/lease-run-1.json"
+  expect 5b-lease-unreadable-pr '.ready == false and any(.invalidReasons[]; test("could not be looked up") and test("lease-run-1.json could not be read"))' \
+    "$(SMOKE_GATE_LEASE_DIR="$UNSEARCHABLE" bash "$BARRIER" "$RUN" lanes || true)"
+  chmod 644 "$UNSEARCHABLE/lease-run-1.json"
+else
+  echo "note: lease-dir permission fixtures skipped (running as root, chmod still reads)" >&2
 fi
-# Every discovery goes through the one primitive: no shell glob over the lease
-# dir survives outside lease_dir_glob, where a failed listing would read as "no match".
-[ "$(grep -c 'compgen -G "\$JOURNEY_LEASE_DIR\|in "\$JOURNEY_LEASE_DIR"/' "$BARRIER")" = 0 ] ||
-  fail "5b-one-discovery-primitive: smoke-evidence-barrier.sh globs the lease dir outside lease_dir_glob"
+# A leaf symlink where the pin should be is INVALID, never followed and never "absent".
+LINK_LEASES="$WORK/leaf-link-leases"; share_lease "$LINK_LEASES" 7
+LINK_PIN="$(gate_pin "$WORK/leaf-link-src" "$SHA" '["web/src/desk/a.tsx"]')"
+ln -s "$LINK_PIN" "$LINK_LEASES/$(basename "$LINK_PIN")"
+expect 5b-leaf-symlink-pin-invalid '.state == "invalid" and (.reason | test("symlink"))' "$(python3 "$TOOL" pin-check "$LINK_LEASES/$(basename "$LINK_PIN")" --pr 7 --head "$SHA")"
+expect 5b-leaf-symlink-pin-barrier '.ready == false and any(.invalidReasons[]; test("no usable journeys pin") and test("symlink"))' \
+  "$(SMOKE_GATE_LEASE_DIR="$LINK_LEASES" bash "$BARRIER" "$RUN" lanes || true)"
+# Nothing in the barrier enumerates the lease dir any more: no compgen, find or
+# shell glob over it outside comments — the one lookup is by exact name in
+# smoke-journeys.py, whose probes keep their errno.
+[ "$(grep -v '^[[:space:]]*#' "$BARRIER" | grep -c 'compgen -G\|find "\$JOURNEY_LEASE_DIR\|\$JOURNEY_LEASE_DIR"*/[^"]*[*]\|in "\$JOURNEY_LEASE_DIR"/')" = 0 ] ||
+  fail "5b-no-enumeration: smoke-evidence-barrier.sh enumerates the lease dir"
 
 # A selection with NO gate pin behind it is not the gate's, so it is refused.
 new_run "$ALL_LANES"; LEASES="$WORK/empty-leases"; share_lease "$LEASES" 7
