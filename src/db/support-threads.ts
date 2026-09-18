@@ -88,8 +88,22 @@ export async function upsertSupportThread(t: UpsertSupportThread, now: string): 
  * `update_support_ticket` handler — keying on the CALLING session id means the
  * agent never supplies a cross-row key (same security posture as scheduling).
  */
-export function getSupportThreadBySession(sessionId: string): Promise<SupportThread | undefined> {
-  return getDb().get<SupportThread>('SELECT * FROM support_threads WHERE session_id = ?', sessionId);
+export function getSupportThreadBySession(
+  sessionId: string,
+  sessionThreadId: string | null,
+): Promise<SupportThread | undefined> {
+  // Any agent working the ticket's Slack thread may record the ticket, not only
+  // the session the row is bound to. Both keys are host-authored (the session
+  // row's id and thread_id), so the agent still supplies no cross-row key.
+  return getDb().get<SupportThread>(
+    `SELECT * FROM support_threads
+      WHERE session_id = ? OR (? IS NOT NULL AND slack_thread_id = ?)
+      ORDER BY (session_id = ?) DESC LIMIT 1`,
+    sessionId,
+    sessionThreadId,
+    sessionThreadId,
+    sessionId,
+  );
 }
 
 /** Record the Linear ticket a per-issue session created for its thread. */
@@ -139,11 +153,17 @@ export async function touchSupportThread(
  * upsert path) would mint a new Slack thread and a duplicate announcement for
  * what is, to everyone involved, an ongoing conversation.
  */
-export async function rebindSupportThreadSession(gmailThreadId: string, sessionId: string): Promise<void> {
-  await getDb().run('UPDATE support_threads SET session_id = @sessionId WHERE gmail_thread_id = @gmailThreadId', {
-    gmailThreadId,
-    sessionId,
-  });
+export async function rebindSupportThreadSession(
+  gmailThreadId: string,
+  sessionId: string,
+  agentGroupId: string,
+): Promise<void> {
+  // messaging_group_id is deliberately left alone: it names the bot that posted
+  // the parent announcement, and only that bot can edit it.
+  await getDb().run(
+    'UPDATE support_threads SET session_id = @sessionId, agent_group_id = @agentGroupId WHERE gmail_thread_id = @gmailThreadId',
+    { gmailThreadId, sessionId, agentGroupId },
+  );
 }
 
 export async function closeSupportThread(gmailThreadId: string, now: string): Promise<void> {

@@ -393,7 +393,15 @@ async function dispatchSupportIssue(
     // still answers for an archived session. Without the status filter the
     // follow-up wrote into (and spawned a container for) a status='closed'
     // row — permanently invisible to host-sweep's stuck/heartbeat machinery.
-    const issueSession = bound?.status === 'active' ? bound : undefined;
+    // The follow-up goes to the agent whose poller found it, not to whichever
+    // agent opened the ticket: another agent may have taken the ticket over, and
+    // the poller's model pin only means something in the poller's own group.
+    // A poller on a different channel than the ticket's thread cannot reach that
+    // thread through its own bot, so there the original owner keeps it.
+    const ownerGroupId = existing.slack_thread_id.startsWith(`${mg.platform_id}:`)
+      ? session.agent_group_id
+      : existing.agent_group_id;
+    const issueSession = bound?.status === 'active' && bound.agent_group_id === ownerGroupId ? bound : undefined;
     const followup = {
       id: randomUUID(),
       kind: 'chat' as const,
@@ -414,18 +422,18 @@ async function dispatchSupportIssue(
     // same thread, same ticket, ONLY session_id changes — instead of opening a
     // second announcement for one ongoing conversation.
     const target =
-      issueSession ??
-      (await resolveSession(existing.agent_group_id, mg.id, existing.slack_thread_id, 'per-thread')).session;
+      issueSession ?? (await resolveSession(ownerGroupId, mg.id, existing.slack_thread_id, 'per-thread')).session;
 
     await writeSessionMessage(target.agent_group_id, target.id, followup);
     if (issueSession) {
       await touchSupportThread(gmailThreadId, now, lastMessageId);
     } else {
-      await rebindSupportThreadSession(gmailThreadId, target.id);
+      await rebindSupportThreadSession(gmailThreadId, target.id, target.agent_group_id);
       await touchSupportThread(gmailThreadId, now, lastMessageId);
       log.info('dispatch_support_issue: rebound thread to a fresh session', {
         gmailThreadId,
         previousSessionId: existing.session_id,
+        previousAgentGroupId: existing.agent_group_id,
         sessionId: target.id,
       });
     }
@@ -517,7 +525,7 @@ export async function handleUpdateSupportTicket(content: Record<string, unknown>
     log.warn('update_support_ticket: rejected — missing linearIssue', { sessionId: session.id });
     return;
   }
-  const row = await getSupportThreadBySession(session.id);
+  const row = await getSupportThreadBySession(session.id, session.thread_id);
   if (!row) {
     log.warn('update_support_ticket: calling session is not a support-thread session', { sessionId: session.id });
     return;
