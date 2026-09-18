@@ -89,8 +89,8 @@ async function seed(): Promise<void> {
   });
 }
 
-function inboundOf(sessionId: string): Array<{ thread_id: string | null; content: string }> {
-  const db = new Database(`${TEST_DIR}/v2-sessions/ag-1/${sessionId}/inbound.db`, { readonly: true });
+function inboundOf(sessionId: string, agentGroupId = 'ag-1'): Array<{ thread_id: string | null; content: string }> {
+  const db = new Database(`${TEST_DIR}/v2-sessions/${agentGroupId}/${sessionId}/inbound.db`, { readonly: true });
   try {
     return db.prepare("SELECT thread_id, content FROM messages_in WHERE kind = 'chat'").all() as Array<{
       thread_id: string | null;
@@ -476,6 +476,71 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
   });
 });
 
+/** A sibling agent with its own bot on a channel: same chat address, own instance. */
+async function seedSibling(id: string, mgId: string, platformId: string): Promise<void> {
+  await createAgentGroup({
+    id,
+    name: `Sibling ${id}`,
+    folder: `sibling-${id}`,
+    agent_provider: null,
+    created_at: now(),
+  });
+  await createMessagingGroup({
+    id: mgId,
+    channel_type: `slack-${id}`,
+    platform_id: platformId,
+    name: '#support',
+    is_group: 1,
+    unknown_sender_policy: 'public',
+    created_at: now(),
+  });
+}
+
+describe('handleDispatchSupportIssue — a ticket another agent opened', () => {
+  it('routes a follow-up to the agent whose poller found it, in the same thread', async () => {
+    await seed();
+    await seedSibling('ag-2', 'mg-2', 'slack:C1');
+    const { session: opener } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), opener);
+    const opened = (await getSupportThread('gthread-A'))!;
+
+    const { session: poller } = await resolveSession('ag-2', 'mg-2', null, 'shared');
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'customer replied'), poller);
+
+    const row = (await getSupportThread('gthread-A'))!;
+    expect(createThread).toHaveBeenCalledTimes(1);
+    expect(row.agent_group_id).toBe('ag-2');
+    expect(row.session_id).not.toBe(opened.session_id);
+    // The announcement's bot is unchanged: only it can edit that message.
+    expect(row.messaging_group_id).toBe(opened.messaging_group_id);
+    const target = (await getSession(row.session_id!))!;
+    expect(target.agent_group_id).toBe('ag-2');
+    expect(target.messaging_group_id).toBe('mg-2');
+    const msgs = inboundOf(row.session_id!, 'ag-2');
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].thread_id).toBe('slack:C1:thread-ts-1');
+    expect(msgs[0].content).toContain('customer replied');
+    // Nothing more reached the opener's session.
+    expect(inboundOf(opened.session_id!)).toHaveLength(1);
+  });
+
+  it('keeps the original owner when the poller sits on a different channel', async () => {
+    await seed();
+    await seedSibling('ag-2', 'mg-2', 'slack:C2');
+    const { session: opener } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), opener);
+    const opened = (await getSupportThread('gthread-A'))!;
+
+    const { session: poller } = await resolveSession('ag-2', 'mg-2', null, 'shared');
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'customer replied'), poller);
+
+    const row = (await getSupportThread('gthread-A'))!;
+    expect(row.agent_group_id).toBe('ag-1');
+    expect(row.session_id).toBe(opened.session_id);
+    expect(inboundOf(opened.session_id!)).toHaveLength(2);
+  });
+});
+
 describe('handleUpdateSupportTicket', () => {
   it('records the ticket by calling-session and edits the announcement', async () => {
     await seed();
@@ -503,6 +568,22 @@ describe('handleUpdateSupportTicket', () => {
       messageId: 'parent-ts-1',
       text: '🎫 EXAMPLE EXAMPLE-200: Depletions look wrong — Jane <jane@acme.com>',
     });
+  });
+
+  it('accepts the ticket from another agent working the same thread', async () => {
+    await seed();
+    await seedSibling('ag-2', 'mg-2', 'slack:C1');
+    const { session: opener } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), opener);
+    const row = (await getSupportThread('gthread-A'))!;
+    const { session: helper } = await resolveSession('ag-2', 'mg-2', row.slack_thread_id, 'per-thread');
+
+    await handleUpdateSupportTicket(
+      { action: 'update_support_ticket', linearIssue: 'EXAMPLE-201', linearTeam: 'EXAMPLE' },
+      helper,
+    );
+
+    expect((await getSupportThread('gthread-A'))!.linear_issue).toBe('EXAMPLE-201');
   });
 
   it('ignores a call from a non-support session', async () => {

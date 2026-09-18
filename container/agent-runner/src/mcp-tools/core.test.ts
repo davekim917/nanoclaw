@@ -115,6 +115,24 @@ describe('send_message MCP tool — default replies in the current conversation'
     expect(out[0].platform_id).toBe('slack:DTEST00009');
     expect(out[0].thread_id).toBeNull();
   });
+
+  it('explicit `to` naming this channel through its own bot keeps the thread', async () => {
+    // A sibling agent reached this thread through another bot's connection;
+    // its own destination for the channel is a different channel_type.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('support', 'Support', 'channel', 'slack-sibling', 'slack:CTEST00004', NULL)`,
+      )
+      .run();
+
+    await sendMessage.handler({ to: 'support', text: 'update on the ticket' });
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].channel_type).toBe('slack-sibling');
+    expect(out[0].thread_id).toBe('slack:CTEST00004:1780316121.601669');
+  });
 });
 
 describe('send_message / send_file MCP tools — thread_key', () => {
