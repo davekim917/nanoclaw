@@ -84,6 +84,21 @@ describe('transcriptContainsUserText', () => {
     expect(has([{ type: 'user', uuid: 'u', parentUuid: null, message: { content: PROMPT } }])).toBe(false); // undated
   });
 
+  it('rejects a branch inside the attempt, whichever leaf the SDK would pick', () => {
+    const sys = { type: 'system', subtype: 'informational', uuid: 's', parentUuid: 'x', timestamp: at(100) };
+    expect(
+      has([user('a', null, 'earlier', -60_000), user('x', 'a', PROMPT, 5), user('y', 'a', 'sibling', 50), sys]),
+    ).toBe(false);
+  });
+
+  it('rejects malformed conversation entries: empty uuid, absent parentUuid, non-user role', () => {
+    expect(has([user('', null, PROMPT, 5)])).toBe(false);
+    const noParent = user('c', null, PROMPT, 5);
+    delete noParent.parentUuid;
+    expect(has([noParent])).toBe(false);
+    expect(has([{ ...user('c', null, PROMPT, 5), message: { role: 'assistant', content: PROMPT } }])).toBe(false);
+  });
+
   it('answers false for a missing file, an empty prompt, or an unrecorded prompt', () => {
     expect(transcriptContainsUserText(path.join(dir, 'nope.jsonl'), PROMPT, T0)).toBe(false);
     expect(transcriptContainsUserText(write([user('c', null, PROMPT, 5)]), '', T0)).toBe(false);
