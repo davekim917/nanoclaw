@@ -293,6 +293,70 @@ describe('repository mount poll and tool admission barrier', () => {
     }
   }, 5_000);
 
+  it('points at the interrupted batch instead of re-sending it when the resumed transcript already holds it', async () => {
+    insertMessage('task-occurrence-dedup', 'task', { prompt: 'Review the release queue once.' });
+    setContinuation('claude', 'retry-dedup-session');
+    const queryInputs: Array<{ prompt: string; continuation?: string }> = [];
+    const asked: Array<{ continuation?: string; prompt: string }> = [];
+    let queryCalls = 0;
+    const provider = {
+      supportsNativeSlashCommands: false,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      isRetryable: () => true,
+      rotateApiKey: () => ({ rotated: true }),
+      transcriptHasPrompt: (continuation: string | undefined, prompt: string, sinceMs: number) => {
+        asked.push({ continuation, prompt });
+        expect(sinceMs).toBeLessThanOrEqual(Date.now());
+        return true;
+      },
+      query: (input: { prompt: string; continuation?: string }) => {
+        queryInputs.push(input);
+        queryCalls += 1;
+        const attempt = queryCalls;
+        async function* events(): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'retry-dedup-session' };
+          if (attempt === 1) throw new Error('retryable upstream failure');
+          yield { type: 'result', text: 'Reviewed the release queue.' };
+        }
+        return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+      },
+    };
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+
+    try {
+      const deadline = Date.now() + 3_000;
+      while (
+        (
+          getOutboundDb()
+            .prepare('SELECT status FROM processing_ack WHERE message_id = ?')
+            .get('task-occurrence-dedup') as { status: string } | undefined
+        )?.status !== 'completed'
+      ) {
+        if (Date.now() >= deadline) throw new Error('timed out waiting for credential-rotation retry completion');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      expect(queryInputs).toHaveLength(2);
+      // The provider was asked about the exact prompt and continuation the retry resumes.
+      expect(asked).toEqual([{ continuation: 'retry-dedup-session', prompt: queryInputs[0].prompt }]);
+      expect(queryInputs[1].prompt).toContain('<runner-retry-provenance>');
+      expect(queryInputs[1].prompt).toContain('Task occurrence ID: "task-occurrence-dedup".');
+      expect(queryInputs[1].prompt).toContain('it is not repeated here');
+      expect(queryInputs[1].prompt).not.toContain(queryInputs[0].prompt);
+    } finally {
+      abort.abort();
+      await loop;
+    }
+  }, 5_000);
+
   // A Claude stream outlives its result (claude.ts ends it only on
   // end()/abort), and a task stream is never ended: ending one closes the CLI's
   // stdin while it may still run a queued turn, and every hook callback on that
