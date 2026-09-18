@@ -917,15 +917,28 @@ def cmd_barrier(args):
     # compared against them.
     contract_rel = os.path.join(run_dir, "completion-contract.json")
     is_pr = args.ownership == "pr"
-    ident = campaign_identity(args.lease_dir, args.run_id, args.head, args.repo_slug or None)
-    owner = ident["owner"]
-    pin_state = owner["state"] if owner else "absent"
 
     def legacy():
         if os.path.exists(selection_path):
             bad(sel_rel, "this run holds a journey selection but no gate pin owns it (not a PR campaign, or no pin for its repo/PR/head in the shared lease dir) -- a selection is only ever the gate's, adopted with pin-run")
             emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
         emit({"applies": False, "missing": [], "invalid": [], "invalidReasons": []})
+
+    # JOURNEYS APPLY ONLY WHERE A CATALOGUE EXISTS -- at the path the gate reads
+    # (smoke-pr-gate.sh JOURNEYS_CATALOGUE), the same short-circuit the gate's
+    # journeys_select takes. Without one no pin can have been produced, so the
+    # legacy answer is given here, before the lease or the lease directory is
+    # touched at all: an ordinary run on a no-catalogue install needs nothing
+    # but its own artifacts, whatever shared storage is doing. Everything
+    # below -- unreachable storage, a failed probe, an identity that cannot be
+    # completed -- is a refusal ONLY under this one condition.
+    cat_probe, cat_why = _probe_path(args.catalogue) if args.catalogue else ("absent", None)
+    if cat_probe == "absent":
+        legacy()
+
+    ident = campaign_identity(args.lease_dir, args.run_id, args.head, args.repo_slug or None)
+    owner = ident["owner"]
+    pin_state = owner["state"] if owner else "absent"
 
     if is_pr and ident["unavailable"]:
         # A probe that failed is no answer: the campaign may be pinned. With
@@ -934,22 +947,17 @@ def cmd_barrier(args):
         bad(sel_rel, "this pr-owned campaign's journeys pin could not be looked up ({}) -- an unreachable answer is no answer, not \"no pin\"; refusing rather than treating the campaign as unpinned".format(ident["unavailable"]))
         emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
     if is_pr and ident["slug"] is None:
-        # Identity incomplete: nothing can be probed. Decided by whether THIS
-        # install keeps a catalogue (the path the gate reads, smoke-pr-gate.sh
-        # JOURNEYS_CATALOGUE): without one no pin can ever have been produced,
-        # so the legacy answer holds; with one an unpinned campaign cannot be
-        # told from one whose obligations were dropped, so a pr-owned run is
-        # refused naming what is missing. Migration precondition, stated in
-        # SKILL.md: activate a catalogue only with no PR campaign in flight.
-        cat_probe, cat_why = _probe_path(args.catalogue) if args.catalogue else ("absent", None)
-        if cat_probe != "absent":
-            what = ("its shared lease {} is {}".format(ident["leasePath"], ident["lease"]) if ident["lease"] != "found"
-                    else "its shared lease {} carries no repoSlug and SMOKE_GATE_REPO is unset".format(ident["leasePath"]))
-            if cat_probe == "unavailable":
-                what += "; and the catalogue {} could not be probed: {}".format(args.catalogue, cat_why)
-            bad(sel_rel, "this install keeps a journey catalogue ({}) but this pr-owned campaign's identity cannot be completed -- {} -- so its pin cannot be looked up and an unpinned campaign cannot be told from one whose obligations were dropped; a lease written by a gate that records repoSlug, or SMOKE_GATE_REPO in the barrier's environment, completes it".format(args.catalogue, what))
-            emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
-        legacy()
+        # Identity incomplete: nothing can be probed, and this install keeps a
+        # catalogue, so an unpinned campaign cannot be told from one whose
+        # obligations were dropped: a pr-owned run is refused naming what is
+        # missing. Migration precondition, stated in SKILL.md: activate a
+        # catalogue only with no PR campaign in flight.
+        what = ("its shared lease {} is {}".format(ident["leasePath"], ident["lease"]) if ident["lease"] != "found"
+                else "its shared lease {} carries no repoSlug and SMOKE_GATE_REPO is unset".format(ident["leasePath"]))
+        if cat_probe == "unavailable":
+            what += "; and the catalogue {} could not be probed: {}".format(args.catalogue, cat_why)
+        bad(sel_rel, "this install keeps a journey catalogue ({}) but this pr-owned campaign's identity cannot be completed -- {} -- so its pin cannot be looked up and an unpinned campaign cannot be told from one whose obligations were dropped; a lease written by a gate that records repoSlug, or SMOKE_GATE_REPO in the barrier's environment, completes it".format(args.catalogue, what))
+        emit({"applies": True, "missing": missing, "invalid": invalid, "invalidReasons": reasons})
     # Two cheap identity facts, checked whenever a pin exists for this campaign:
     # the contract's runId must be this run directory's own name (the lease was
     # read by that name, so a borrowed runId borrows nothing), and a contract

@@ -2264,13 +2264,19 @@ evaluate_pr() {
     [ "$migrations_touched" = true ] || [ "$migrations_touched" = false ] || migrations_touched=true
     [ "$frontend_touched" = true ] || [ "$frontend_touched" = false ] || frontend_touched=true
   fi
-  is_freeze="$(jq -r --arg a "$FREEZE_MARKER_BACKEND" --arg b "$FREEZE_MARKER_FRONTEND" '
-    (length == 2) and ((map(.filename) | sort) == ([$a,$b] | sort))
-  ' <<<"$files_json" 2>/dev/null)"
+  # WHAT this head is — freeze or ordinary — is read off the HEAD COMMIT
+  # itself (freeze_head_probe), never off the PR's current file list: the
+  # list describes whatever head the PR has moved on to, so a freeze head H
+  # evaluated after the PR advanced to an ordinary J was classified by J's
+  # files and admitted unpinned (#898 review 9). The PR file list above still
+  # feeds an ordinary PR's migrationsTouched/frontendTouched.
+  local freeze_probe
+  freeze_probe="$(freeze_head_probe "$head_sha")"
+  is_freeze="$(jq -r '.isFreeze' <<<"$freeze_probe")"
   [ "$is_freeze" = true ] || is_freeze=false
-
+  [ "$(jq -r '.ok' <<<"$freeze_probe")" = true ] || fetch_ok=false
   if [ "$is_freeze" = true ]; then
-    ci_sha="$(timeout 8 gh api "repos/$REPO/commits/$head_sha" --jq '.parents[0].sha // empty' 2>/dev/null)"
+    ci_sha="$(jq -r '.targetSha // empty' <<<"$freeze_probe")"
     [ -n "$ci_sha" ] || { ci_sha=""; fetch_ok=false; }
   else
     ci_sha="$head_sha"
@@ -2790,39 +2796,46 @@ evaluate_pr() {
     + (if $journeys != null then {journeys: $journeys} else {} end))'
 }
 
-# Minimal freeze-PR detection for `finish` only — NOT evaluate_pr, which does
-# far more (CI/deploy/healthz) that finish has no use for.
-# ponytail: duplicates evaluate_pr's ~8-line files-diff/marker check rather
-# than threading a shared helper through two call sites with very different
-# needs (finish wants exactly 2 fetches total; reusing evaluate_pr here would
-# cost 4 more — check-runs, services, two deploy lookups, a healthz curl —
-# entirely wasted, since finish already has its own verdict from the caller).
-#
-# `filesOk` distinguishes "not a freeze PR" from "could not tell". A failed
-# fetch collapses to files_json='[]' and therefore isFreezePr:false, which the
-# caller treats identically to an ordinary PR: no hold, no publish, no ledger
-# line, handoff.written:false with reason NULL, and an ok:true finish. That is
-# a freeze-run verdict silently dropped on the floor — evaluate_pr fails closed
-# on this exact fetch, this did not even report it. Reporting only; the
-# caller's behaviour for a genuine non-freeze PR is unchanged.
-detect_freeze() {
-  local pr="$1" sha="$2" files_json is_freeze target_sha files_ok=true
-  if ! files_json="$(timeout 10 gh api "repos/$REPO/pulls/$pr/files?per_page=100" 2>/dev/null)" ||
-     ! jq -e 'type == "array"' <<<"$files_json" >/dev/null 2>&1; then
-    files_ok=false
-    files_json='[]'
+# THE freeze identity, bound to the immutable head. A freeze commit is the one
+# smoke-freeze-pr.sh makes — one parent, the frozen target, and a tree that
+# adds exactly the two marker files (smoke-freeze-pr.sh:100-104,
+# FREEZE_MARKER_BACKEND/FRONTEND) — so the commit endpoint's own `files` (its
+# diff against that parent) and `parents` say what THIS sha is, whatever the
+# PR's branch has moved on to. The PR file list said only what the PR's
+# CURRENT head is, and every classifier read it: `claim … H` after the PR
+# advanced to an ordinary J classified H by J's files, skipped pin_freeze_head
+# and admitted H unpinned; `poll`'s evaluation shared the seam (#898 review
+# 9). One fetch, one primitive, every classifier — evaluate_pr (check, poll,
+# claim's admission) and detect_freeze (finish, claim) — reads it.
+# `ok:false` means the commit could not be read (a fetch or shape failure):
+# "not known to be a freeze", which no caller treats as "not a freeze".
+# `targetSha` is null for a freeze whose parent is missing; evaluate_pr then
+# fails closed exactly as before (fetchOk:false, never settles).
+freeze_head_probe() {  # <sha> → {ok, isFreeze, targetSha}
+  local sha="$1" commit ok=true is_freeze=false target=""
+  if ! commit="$(timeout 10 gh api "repos/$REPO/commits/$sha" 2>/dev/null)" ||
+     ! jq -e 'type == "object" and (.parents | type == "array") and (.files | type == "array")' <<<"$commit" >/dev/null 2>&1; then
+    ok=false
+    commit='{"parents":[],"files":[]}'
   fi
   is_freeze="$(jq -r --arg a "$FREEZE_MARKER_BACKEND" --arg b "$FREEZE_MARKER_FRONTEND" '
-    (length == 2) and ((map(.filename) | sort) == ([$a,$b] | sort))
-  ' <<<"$files_json" 2>/dev/null)"
+    (.files | length == 2) and ((.files | map(.filename) | sort) == ([$a,$b] | sort))
+  ' <<<"$commit" 2>/dev/null)"
   [ "$is_freeze" = true ] || is_freeze=false
-  target_sha=""
-  if [ "$is_freeze" = true ]; then
-    target_sha="$(timeout 8 gh api "repos/$REPO/commits/$sha" --jq '.parents[0].sha // empty' 2>/dev/null)"
-  fi
-  jq -cn --argjson isFreeze "$is_freeze" --argjson filesOk "$files_ok" --arg target "$target_sha" \
-    '{isFreezePr:$isFreeze, filesOk:$filesOk,
-      targetSha:(if $target == "" then null else $target end)}'
+  [ "$is_freeze" != true ] || target="$(jq -r '.parents[0].sha // empty' <<<"$commit")"
+  jq -cn --argjson ok "$ok" --argjson isFreeze "$is_freeze" --arg target "$target" \
+    '{ok:$ok, isFreeze:$isFreeze, targetSha:(if $target == "" then null else $target end)}'
+}
+# Minimal freeze detection for `finish` and `claim` — NOT evaluate_pr, which
+# does far more (CI/deploy/healthz) that neither has a use for before it knows
+# the head is a freeze. `filesOk` distinguishes "not a freeze" from "could not
+# tell" (the probe's ok): finish reports it — a failed probe used to collapse to
+# isFreezePr:false and drop a freeze-run verdict on the floor silently — and
+# claim refuses on it, because a freeze campaign is never admitted unpinned.
+detect_freeze() {
+  local pr="$1" sha="$2" probe
+  probe="$(freeze_head_probe "$sha")"
+  jq -c '{isFreezePr:.isFreeze, filesOk:.ok, targetSha:.targetSha}' <<<"$probe"
 }
 
 COMMAND="${1:-poll}"
@@ -3029,15 +3042,16 @@ if [ "$COMMAND" = "claim" ]; then
   # evaluate it here, unlocked, exactly as `poll` does, with a TMP_DIR for the
   # candidates; the promotion happens under the PR lock below, right before
   # the lease is taken, and a head that cannot be pinned is refused. Whether
-  # this IS a freeze head is read from the PR's own file list, the same fact
-  # evaluate_pr keys on — and if that cannot be fetched the claim is refused
-  # too, because "not known to be a freeze" is not "not a freeze". An ordinary
-  # PR pays one API call and is otherwise untouched.
+  # this IS a freeze head is read off the head commit itself (freeze_head_probe,
+  # the same fact evaluate_pr keys on — never the PR's current file list, which
+  # describes whatever head the PR has moved on to) — and if that cannot be
+  # fetched the claim is refused too, because "not known to be a freeze" is not
+  # "not a freeze". An ordinary PR pays one API call and is otherwise untouched.
   CLAIM_FREEZE=false
   CLAIM_PROBE="$(detect_freeze "$PR" "$SHA")"
   if [ "$(jq -r '.filesOk' <<<"$CLAIM_PROBE")" != true ]; then
     jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg sha "$SHA" \
-      '{ok:false,error:"could not fetch the PR file list, so whether this head is a freeze is unknown — a freeze campaign is never admitted without its pins; retry",pr:$pr,runId:$run,sha:$sha}'
+      '{ok:false,error:"could not read the head commit, so whether this head is a freeze is unknown — a freeze campaign is never admitted without its pins; retry",pr:$pr,runId:$run,sha:$sha}'
     exit 1
   fi
   if [ "$(jq -r '.isFreezePr' <<<"$CLAIM_PROBE")" = true ]; then

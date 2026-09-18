@@ -39,6 +39,12 @@ set -u
 [ -n "${STUB_BRANCH_EXISTS+x}" ] || STUB_BRANCH_EXISTS=false
 [ -n "${STUB_PR_LIST_EXIT+x}" ] || STUB_PR_LIST_EXIT=0
 [ -n "${STUB_PR_FILES_EXIT+x}" ] || STUB_PR_FILES_EXIT=0
+# The head commit itself (freeze_head_probe): parent from STUB_PARENT_BY_COMMIT /
+# STUB_PARENT_SHA, files per sha from STUB_COMMIT_FILES_BY_SHA, else the PR's
+# file list (and its exit code) — so every fixture that describes a freeze by
+# STUB_PR_FILES still describes its head that way.
+[ -n "${STUB_COMMIT_FILES_BY_SHA+x}" ] || STUB_COMMIT_FILES_BY_SHA='{}'
+[ -n "${STUB_COMMIT_GET_EXIT+x}" ] || STUB_COMMIT_GET_EXIT=0
 [ -n "${STUB_COMPARE_FILES+x}" ] || STUB_COMPARE_FILES='{"files":[]}'
 [ -n "${STUB_COMPARE_EXIT+x}" ] || STUB_COMPARE_EXIT=0
 # Freeze-campaign baseline binding (resolve_campaign_baseline): a ledger GO's
@@ -104,6 +110,19 @@ case "$1" in
         printf '%s' "$MAPPED"; exit 0
       fi
       printf '%s' "$STUB_PARENT_SHA"; exit 0
+    fi
+    if printf '%s' "$P" | grep -qE '^repos/[^/]+/[^/]+/commits/[0-9a-f]{40}$' && [ "$#" -eq 2 ]; then
+      C="${P##*/commits/}"
+      [ "$STUB_COMMIT_GET_EXIT" = 0 ] || exit "$STUB_COMMIT_GET_EXIT"
+      PARENT="$(jq -r --arg c "$C" '.[$c] // empty' <<<"$STUB_PARENT_BY_COMMIT")"
+      [ -n "$PARENT" ] || PARENT="$STUB_PARENT_SHA"
+      FILES="$(jq -c --arg c "$C" '.[$c] // empty' <<<"$STUB_COMMIT_FILES_BY_SHA")"
+      if [ -z "$FILES" ]; then
+        [ "$STUB_PR_FILES_EXIT" = 0 ] || exit "$STUB_PR_FILES_EXIT"
+        FILES="$STUB_PR_FILES"
+      fi
+      jq -cn --arg c "$C" --arg p "$PARENT" --argjson files "$FILES" \
+        '{sha:$c, parents:(if $p == "" then [] else [{sha:$p}] end), files:$files}'; exit 0
     fi
     if printf '%s' "$*" | grep -qF '.head.sha'; then
       [ "$STUB_BINDING_EXIT" = 0 ] || exit "$STUB_BINDING_EXIT"
@@ -294,7 +313,7 @@ reset_stubs() {
         STUB_RUN_LIST_SEQUENCE_FILE STUB_RUN_LIST_SEQUENCE_COUNT STUB_PARENT_SHA \
         STUB_COMMIT_TREE STUB_BLOB_RESPONSE STUB_TREE_RESPONSE STUB_COMMIT_RESPONSE \
         STUB_REF_RESPONSE STUB_REF_EXIT STUB_BRANCH_EXISTS STUB_PR_LIST_EXIT \
-        STUB_PR_FILES_EXIT STUB_PR_CREATE_EXIT STUB_NEW_PR_NUMBER STUB_SUSPEND_CODE \
+        STUB_PR_FILES_EXIT STUB_COMMIT_FILES_BY_SHA STUB_COMMIT_GET_EXIT STUB_PR_CREATE_EXIT STUB_NEW_PR_NUMBER STUB_SUSPEND_CODE \
         STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS STUB_DEPLOYS_BY_SERVICE_JSON \
         STUB_COMPARE_FILES STUB_COMPARE_EXIT STUB_LOCK_PROBE STUB_LOCK_PROBE_FILE \
         STUB_PARENT_BY_COMMIT STUB_PULL_HEADS STUB_BINDING_EXIT STUB_COMPARE_LOG \
@@ -1830,13 +1849,42 @@ T5L_ORD="$(bash "$GATE" claim run-ordinary 13 "$FREEZE_SHA")"
 jq -e '.ok == true and .pr == 13 and (has("campaignRange") | not) and (has("journeys") | not)' <<<"$T5L_ORD" >/dev/null ||
   { echo "5l: an ordinary claim changed shape: $T5L_ORD" >&2; exit 1; }
 [ -z "$(find "$SMOKE_GATE_LEASE_DIR" -name '*-pin-*' -print -quit)" ] || { echo "5l: an ordinary claim wrote a pin" >&2; exit 1; }
-# ...but a PR whose file list cannot be fetched is not KNOWN to be ordinary: refused.
-export STUB_PR_FILES_EXIT=1
+# ...but a head whose commit cannot be read is not KNOWN to be ordinary: refused.
+export STUB_COMMIT_GET_EXIT=1
 T5L_UNKNOWN="$(bash "$GATE" claim run-unknown-kind 14 "$FREEZE_SHA" || true)"
 jq -e '.ok == false and (.error | test("whether this head is a freeze is unknown"))' <<<"$T5L_UNKNOWN" >/dev/null ||
   { echo "5l: a PR of unknown kind was admitted: $T5L_UNKNOWN" >&2; exit 1; }
 [ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-unknown-kind.json" ]
-unset STUB_PR_FILES_EXIT
+unset STUB_COMMIT_GET_EXIT
+# HEAD BINDING. The PR advanced from freeze head H to an ordinary head J, so
+# its file list now describes J. A claim of H is classified by H's own commit —
+# a freeze — and pinned; it is never admitted unpinned. And the converse: an
+# ordinary H on a PR whose current head J is a freeze is an ordinary claim.
+journeys_fixture "$BACKEND_ONLY"
+T5L_J="$(sha 9)"
+export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'   # the PR's CURRENT (J) diff
+export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" '{($h):[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]}')"
+T5L_DRIFT="$(bash "$GATE" claim run-drift 13 "$FREEZE_SHA")"
+jq -e '.ok == true and .campaignRange.pinState == "valid" and .journeys.pinned == true' <<<"$T5L_DRIFT" >/dev/null ||
+  { echo "5l: a freeze head on an advanced PR was not pinned at claim: $T5L_DRIFT" >&2; exit 1; }
+[ -s "$(pin_file 13 "$FREEZE_SHA")" ] && [ -s "$(jpin_file 13 "$FREEZE_SHA")" ]
+bash "$GATE" release run-drift >/dev/null
+# poll shares the classifier: the listed head H is a freeze by its own commit.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_PR_FILES='[{"filename":"api/src/reports/export.ts"}]'
+export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" '{($h):[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]}')"
+bash "$GATE" check 13 | jq -e '.isFreezePr == true and .settled == true' >/dev/null ||
+  { echo "5l: check classified a freeze head by the PR's current files" >&2; exit 1; }
+bash "$GATE" poll | jq -e '.data.trigger == "pr_build_settled" and .data.isFreezePr == true and .data.journeys.pinned == true' >/dev/null ||
+  { echo "5l: poll classified a freeze head by the PR's current files" >&2; exit 1; }
+# The converse: H is ordinary by its own commit even though the PR's current head is a freeze.
+journeys_fixture "$BACKEND_ONLY"
+export STUB_COMMIT_FILES_BY_SHA="$(jq -cn --arg h "$FREEZE_SHA" '{($h):[{"filename":"api/src/reports/export.ts"}]}')"
+T5L_ORD_H="$(bash "$GATE" claim run-ordinary-head 13 "$FREEZE_SHA")"
+jq -e '.ok == true and (has("campaignRange") | not) and (has("journeys") | not)' <<<"$T5L_ORD_H" >/dev/null ||
+  { echo "5l: an ordinary head was classified by the PR's current freeze files: $T5L_ORD_H" >&2; exit 1; }
+[ -z "$(find "$SMOKE_GATE_LEASE_DIR" -name '*-pin-*' -print -quit)" ]
+unset STUB_COMMIT_FILES_BY_SHA
 unset -f pin_file
 
 unset SMOKE_JOURNEYS_CATALOGUE

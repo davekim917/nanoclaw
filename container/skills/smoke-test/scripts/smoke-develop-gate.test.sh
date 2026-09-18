@@ -101,13 +101,14 @@ case "$1 $2" in
       */compare/*)
         printf '{"status":"%s","behind_by":0,"files":%s}' \
           "${STUB_COMPARE_STATUS:-ahead}" "${STUB_COMPARE_FILES:-[]}" ;;
-      # The PR gate's `claim` reads the PR's file list to decide whether the
-      # head is a freeze (a freeze is admitted only with its pins, which
-      # needs the PR gate's whole evaluation surface — smoke-pr-gate.test.sh
-      # 5l covers that). This suite's cross-gate claim (33b) exercises the
-      # state fields the PR gate writes, so the PR is served as an ordinary
-      # diff and the claim stays the plain ownership path.
-      */pulls/*/files*) echo '[]' ;;
+      # The PR gate's `claim` reads the head COMMIT (freeze_head_probe) to
+      # decide whether the head is a freeze — a freeze is admitted only with
+      # its pins, which needs the PR gate's whole evaluation surface
+      # (smoke-pr-gate.test.sh 5l covers that). This suite's cross-gate claim
+      # (33b) exercises the state fields the PR gate writes, so the head is
+      # served as an ordinary commit and the claim stays the plain ownership
+      # path. The develop gate's own parent lookup (--jq) is unaffected.
+      */commits/*) if [ "$#" -eq 2 ]; then printf '{"sha":"%s","parents":[{"sha":"p"}],"files":[]}' "${2##*/commits/}"; else echo '{}'; fi ;;
       *) echo '{}' ;;
     esac ;;
 esac

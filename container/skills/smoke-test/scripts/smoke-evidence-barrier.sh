@@ -546,15 +546,17 @@ done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 # enough; listing permission is irrelevant); a valid pin ⇒ the run must hold
 # its bytes; invalid ⇒ the gate's RECOVERY pin beside it owns instead, neither
 # valid ⇒ not ready; a probe that FAILED (unreachable dir, EACCES on the lease
-# or the pin) ⇒ not ready, whatever the catalogue says; identity that cannot be
-# completed (no lease, or a legacy lease without repoSlug and no
-# SMOKE_GATE_REPO) ⇒ decided by whether this install keeps a catalogue at the
-# path the gate reads (smoke-pr-gate.sh:151): none ⇒ legacy, since no pin can
-# have been produced; one ⇒ not ready, naming the missing identity. A
-# develop/task contract never takes pin obligations from the lease dir and is
-# untouched by any of this, except that one whose lease binds it to a PR that
-# has a pin is refused for relabelling itself. The run never authors what it is
-# held to; a selection in the run with no gate pin behind it is refused too.
+# or the pin) ⇒ not ready; identity that cannot be completed (no lease, or a
+# legacy lease without repoSlug and no SMOKE_GATE_REPO) ⇒ not ready, naming
+# the missing identity. ALL OF IT ONLY WHERE A CATALOGUE EXISTS at the path
+# the gate reads (smoke-pr-gate.sh:151): without one journeys do not apply, no
+# pin can have been produced, and the legacy answer is given before the lease
+# or the lease directory is touched at all — the gate's own no-catalogue
+# short-circuit, stated once. A develop/task contract never takes pin
+# obligations from the lease dir and is untouched by any of this, except that
+# one whose lease binds it to a PR that has a pin is refused for relabelling
+# itself. The run never authors what it is held to; a selection in the run
+# with no gate pin behind it is refused too.
 JOURNEY_LEASE_DIR="${SMOKE_GATE_LEASE_DIR:-${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases}"
 JOURNEY_CATALOGUE="${SMOKE_JOURNEYS_CATALOGUE:-/workspace/agent/journeys.json}"
 JOURNEY_REPO_SLUG=""
