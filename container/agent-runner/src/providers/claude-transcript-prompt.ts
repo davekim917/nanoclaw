@@ -120,7 +120,9 @@ export function transcriptContainsUserText(transcriptPath: string, text: string,
       // reconstructed, even when it is not on the chain (a terminal
       // `compact_boundary` is nobody's parent). The resume then loads the
       // summary, not the batch — captured against SDK 0.3.278 / CLI 2.1.278.
-      return lastCompactionAt < (position.get(node.uuid as string) ?? Number.MAX_SAFE_INTEGER);
+      // `?? -1` keeps the doubt fail-closed: every entry in `byId` has a
+      // position, so a miss would mean this walk left the data it parsed.
+      return lastCompactionAt < (position.get(node.uuid as string) ?? -1);
     }
     seen.add(node.uuid as string);
     const parentUuid = node.parentUuid;
