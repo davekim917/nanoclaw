@@ -278,36 +278,74 @@ def gate_states():
     return states, bad
 
 
-# The gate's one-shot alarm latches (smoke-pr-gate.sh:5118-5147): a poll that
-# emits the alarm first writes the latch, so an alarm lost between the poll
-# returning and the queue write would never be emitted again.
-LATCHES = (("refusedAlertSha", "pr_migrations_refused"), ("warmupAlertSha", "pr_warmup_stuck"),
-           ("factsStuckAlertSha", "pr_facts_unavailable"), ("overrunAlertRunId", "pr_run_overrun"))
+# EVERY latch the gate writes before emitting a wakeAgent:true alarm. The
+# gate writes the latch first, so an alarm lost between the poll returning and
+# the queue write is not emitted again: never, for the per-PR latches, and not
+# for up to 6h, for the control-file ones. Audited against every wakeAgent
+# emission in smoke-pr-gate.sh (the other two: pr_build_settled is a claim,
+# and the coordinator_lease_unavailable/gate_* ones are the control latches).
+#   per-PR state (pr-<n>-state.json), keyed by head SHA or run id:
+#     refusedAlertSha / warmupAlertSha / factsStuckAlertSha   :5122-5129, :5145
+#     overrunAlertRunId (+ overrunAlertAt, re-arms)           :5131, :5145-5147
+#     stalledAlertRunId                                       :4783 (checked :4762)
+#   control.json, rate-limited wakes (the timestamp moves on each emission):
+#     leaseFailureWakeAt   coordinator_lease_unavailable     :1463
+#     lastMisconfigWakeAt  gate_misconfigured                :4858
+#     lastFailureWakeAt    gate_fetch_failed                 :4908
+#     preflightWakeAt      pr_preflight_failed               :5245 (cleared :5222)
+PR_LATCHES = {"refusedAlertSha": "pr_migrations_refused", "warmupAlertSha": "pr_warmup_stuck",
+              "factsStuckAlertSha": "pr_facts_unavailable", "overrunAlertRunId": "pr_run_overrun",
+              "stalledAlertRunId": "pr_run_stalled"}
+RUN_KEYED = ("overrunAlertRunId", "stalledAlertRunId")
+CONTROL_LATCHES = {"leaseFailureWakeAt": "coordinator_lease_unavailable",
+                   "lastMisconfigWakeAt": "gate_misconfigured", "lastFailureWakeAt": "gate_fetch_failed",
+                   "preflightWakeAt": "pr_preflight_failed"}
+CONTROL_TRIGGERS = {t: f for f, t in CONTROL_LATCHES.items()}
 
 
-def latch_map(states):
+def read_control():
+    """(control.json dict, error). Missing is {} (a gate that never wrote it)."""
+    doc, err = read_json(os.path.join(STATE_DIR, "control.json"))
+    if err == "missing":
+        return {}, None
+    if err or not isinstance(doc, dict):
+        return None, err or "not an object"
+    return doc, None
+
+
+def latch_map(states, control):
     out = {}
     for pr, st in states.items():
-        for field, trigger in LATCHES:
+        for field in PR_LATCHES:
             v = st.get(field)
             if isinstance(v, str) and v:
                 if field == "overrunAlertRunId":
                     # Overrun re-arms for the same run (overrunAlertAt moves).
                     v = "{}@{}".format(v, st.get("overrunAlertAt") or "")
                 out["{}:{}".format(pr, field)] = v
+    for field in CONTROL_LATCHES:
+        v = control.get(field)
+        if isinstance(v, str) and v:
+            out["control:" + field] = v
     return out
 
 
-def alarm_fingerprint(wake):
+def alarm_fingerprint(wake, control):
+    """One fingerprint for the poll path and the latch path alike."""
+    field = CONTROL_TRIGGERS.get(wake.get("trigger"))
+    if field:
+        return "control:{}@{}".format(field, control.get(field) or "-")
     key = wake.get("runId") if wake.get("trigger") in ("pr_run_overrun", "pr_run_stalled") else None
     key = key or wake.get("sourceSha") or wake.get("runId") or "-"
     return "{}:{}".format(wake.get("pr"), key)
 
 
-def queue_alarm(wake):
+def queue_alarm(wake, control):
     """Durable, once per fingerprint: wrapper/alarms/<fp>.json."""
     wake = dict(wake)
-    wake.setdefault("fingerprint", alarm_fingerprint(wake))
+    if wake.get("fingerprint") and "gateFingerprint" not in wake:
+        wake["gateFingerprint"] = wake["fingerprint"]
+    wake["fingerprint"] = alarm_fingerprint(wake, control)
     wake.setdefault("queuedAt", FIRE)
     _, fp, _ = ctl.gate_alarm_ids(wake, now)
     try:
@@ -405,7 +443,10 @@ def main():
         if not os.path.lexists(latches_path):
             # Baseline: latches set before this controller ever polled were
             # the legacy coordinator's alarms, not ours to re-post.
-            write(["wrapper", "latches.json"], json.dumps(latch_map(states), sort_keys=True))
+            control0, cerr0 = read_control()
+            if control0 is None:
+                finish({"skipped": "gate control.json unreadable ({}): no latch baseline".format(cerr0)})
+            write(["wrapper", "latches.json"], json.dumps(latch_map(states, control0), sort_keys=True))
     if not os.path.lexists(cutover):
         legacy = sorted(st["activeRunId"] for st in states.values()
                         if isinstance(st.get("activeRunId"), str) and st.get("activeClaimant") != "controller")
@@ -419,16 +460,27 @@ def main():
     acked, acked_err = read_json(latches_path)
     if acked_err or not isinstance(acked, dict):
         finish({"skipped": "wrapper/latches.json unreadable: {}".format(acked_err or "not an object")})
-    current = latch_map(states)
+    control, cerr = read_control()
+    if control is None:
+        finish({"skipped": "gate control.json unreadable ({}): latches cannot be reconciled".format(cerr)})
+    current = latch_map(states, control)
     for name, value in sorted(current.items()):
         if acked.get(name) == value:
             continue
         pr, field = name.split(":", 1)
-        trigger = dict(LATCHES)[field]
-        run_key = value.split("@", 1)[0] if field == "overrunAlertRunId" else None
-        fp = queue_alarm({"schemaVersion": 1, "trigger": trigger, "pr": int(pr),
-                          "sourceSha": None if run_key else value, "runId": run_key,
-                          "recoveredFromGateLatch": True})
+        if pr == "control":
+            wake = {"schemaVersion": 1, "trigger": CONTROL_LATCHES[field], "recoveredFromGateLatch": True,
+                    "latchedAt": value}
+            if field == "preflightWakeAt":
+                m = re.match(r"^pr\|.*\|(\d+)$", str(control.get("preflightFingerprint") or ""))
+                wake.update({"pr": int(m.group(1)) if m else None, "reason": control.get("preflightReason")})
+        else:
+            run_key = value.split("@", 1)[0] if field in RUN_KEYED else None
+            wake = {"schemaVersion": 1, "trigger": PR_LATCHES[field], "pr": int(pr),
+                    "sourceSha": None if run_key else value, "runId": run_key, "recoveredFromGateLatch": True}
+            if field == "stalledAlertRunId":
+                wake["sourceSha"] = states.get(int(pr), {}).get("activeSha")
+        fp = queue_alarm(wake, control)
         log("gate latch {} had no queued alarm; recovered as {}".format(name, fp))
         summary.setdefault("recoveredAlarms", []).append(fp)
     if current != acked:
@@ -463,10 +515,19 @@ def main():
         if poll.get("wakeAgent") is True and data.get("trigger") not in (None, "pr_build_settled"):
             # An alarm: the gate has latched it and will not emit it again.
             # Queued durably first, then the latch is acknowledged.
-            queue_alarm(data)
+            # Fingerprinted from the latch this poll just wrote.
             states_now, bad_now = gate_states()
-            if not bad_now:
-                write(["wrapper", "latches.json"], json.dumps(latch_map(states_now), sort_keys=True))
+            control_now, cerr_now = read_control()
+            if control_now is None and data.get("trigger") in CONTROL_TRIGGERS:
+                # Its fingerprint is the latch timestamp we cannot read; the
+                # latch itself is durable, so next fire's recovery queues it
+                # under the right fingerprint (queuing a guess here would post
+                # it twice).
+                log("control alarm {} left to latch recovery: control.json {}".format(data.get("trigger"), cerr_now))
+            else:
+                queue_alarm(data, control_now or {})
+            if not bad_now and control_now is not None:
+                write(["wrapper", "latches.json"], json.dumps(latch_map(states_now, control_now), sort_keys=True))
         else:
             poll_path = write(["wrapper", "inputs", "poll.json"], json.dumps(poll, sort_keys=True))
         if data.get("trigger") == "pr_build_settled" and ctl.RUN_ID_RE.match(str(data.get("runId") or "")):

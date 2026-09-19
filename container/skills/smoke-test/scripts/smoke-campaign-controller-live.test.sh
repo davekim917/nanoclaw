@@ -227,8 +227,8 @@ WAKES=()
 # SMOKE_CONTROLLER_CRASH_AT spec) kills the first fire that reaches it; that
 # tick is then re-run without it. The second run of each fire must perform
 # nothing.
-campaign() { # last-tick
-  local n now crashed=false w1 w2
+campaign() { # last-tick   (CRASH2: a second kill, armed once CRASH has fired)
+  local n now crashed=false crashed2=false w1 w2
   WAKES=()
   WAKE_TIMES=()
   claim "${DEADLINE:-}"
@@ -247,6 +247,14 @@ campaign() { # last-tick
         inputs_from_fakes  # the retry is a later process: it sees what the dead one did
         step_ok "$now" "${extra[@]}"
       fi
+    elif [ -n "${CRASH2:-}" ] && [ "$crashed" = true ] && [ "$crashed2" = false ]; then
+      SMOKE_CONTROLLER_CRASH_AT="$CRASH2" step "$now" "${extra[@]}"
+      [ "$STEP_RC" = 0 ] || [ "$STEP_RC" = 137 ] || fail "crash2 fire $now rc=$STEP_RC $STEP_OUT"
+      if [ "$STEP_RC" = 137 ]; then
+        crashed2=true
+        inputs_from_fakes
+        step_ok "$now" "${extra[@]}"
+      fi
     else
       step_ok "$now" "${extra[@]}"
     fi
@@ -261,6 +269,7 @@ campaign() { # last-tick
     [ -n "${FAULTY:-}" ] || [ "$w1" = "$w2" ] || fail "the second run of fire $now performed $((w2 - w1)) effect(s) (crash=${CRASH:-none}): $(tail -n +"$((l1 + 1))" "$FAKE_LOG" | jq -c '[.tool,.op,.argv[0:3]]' | tr '\n' ' ') first run: $STEP_OUT"
   done
   [ -z "${CRASH:-}" ] || [ "$crashed" = true ] || fail "crash point $CRASH was never reached"
+  [ -z "${CRASH2:-}" ] || [ "$crashed2" = true ] || fail "second crash point $CRASH2 was never reached"
 }
 
 # Each external effect exactly once: every message id's key once (no second
@@ -626,5 +635,84 @@ for label, obs in cases.items():
 st = Stub(base("enqueued", "enqueued"))
 assert ctl.Controller.pick_owner_wake(st)["step"] == "lanes", "a live, due step is still offered"
 PY
+
+# --- 10. review round 2 (PR #945) -------------------------------------------------
+# A one-shot alarm is settled by its send obligation, never by a journaled
+# flag. A kill BEFORE its intent re-raises it on the next fire; a kill AFTER
+# its intent replays the SAME attempt; every case ends with exactly one
+# enqueued message for the alarm, and that one delivered.
+one_alarm() { # label alarm-slot [run]
+  local k; k="$(key "${3:-$RUN}" send "$2")"
+  [ "$(jq -r --arg k "$k" '.messages | keys | map(select(startswith($k))) | length' "$C/fake/enqueue.json" 2>/dev/null || echo 0)" = 1 ] \
+    || fail "$1: exactly one enqueued message for $2: $(jq -c '.messages | keys' "$C/fake/enqueue.json" 2>/dev/null)"
+  jr "[.[] | select(.key==\"$k\")] | last | .state == \"delivered\"" | grep -qx true \
+    || fail "$1: the $2 alarm ends delivered: $(jr "[.[] | select(.key==\"$k\") | .state]")"
+}
+# verdict.json on file, the slot gone, and a completed state that names another
+# run (or this one): the gate's finish cannot be confirmed / was someone else's.
+gate_finished_elsewhere() { # completedRunId
+  mkdir -p "$C/state/runs/$RUN"
+  jq -cn --arg run "$RUN" --arg sha "$SHA" '{schemaVersion:1,runId:$run,sha:$sha,verdict:"BLOCKED"}' \
+    >"$C/state/runs/$RUN/verdict.json"
+  jq -c --arg done "$1" '.activeRunId=null | .activeLeaseOwner=null | .activeClaimant=null
+    | .completedRunId=$done | .completedVerdict="BLOCKED"' "$C/state/pr-$PR-state.json" >"$C/state/pr.tmp"
+  mv "$C/state/pr.tmp" "$C/state/pr-$PR-state.json"
+}
+recovery_fires() { # crash-spec first-tick: kill the first fire there, then keep firing
+  local n now extra
+  for n in $(seq "$2" $(($2 + 4))); do
+    now="$(tick_time "$n")"
+    extra=()
+    [ "$n" = 0 ] && extra=(--poll-json "$C/wake.json")
+    inputs_from_fakes
+    if [ "$n" = "$2" ]; then
+      SMOKE_CONTROLLER_CRASH_AT="$1" step "$now" "${extra[@]}"
+      [ "$STEP_RC" = 137 ] || fail "crash point $1 was never reached (rc=$STEP_RC): $STEP_OUT $(cat "$C/stderr")"
+      inputs_from_fakes
+    fi
+    step_ok "$now" "${extra[@]}"
+  done
+}
+UNCONF="alarm:finish-unconfirmed:${RUN: -40}"
+for point in "after-intent:send:$UNCONF" "before-intent:send:$UNCONF"; do
+  new_case "unconfirmed-${point%%:*}"
+  claim; wake_json
+  gate_finished_elsewhere xzo-pr-pr7-bbbbbbbbbbbb-20260918T120000Z
+  recovery_fires "$point" 0
+  one_alarm "finish unconfirmed, killed ${point%%:*}" "$UNCONF"
+  [ "$(jq -s '[.[] | select(.tool=="gate")] | length' "$FAKE_LOG")" = 0 ] \
+    || fail "finish unconfirmed: no gate verb on a finish it cannot confirm"
+  jr '[.[] | select(.kind=="run") | .detail.finishUnconfirmed] | any' | grep -qx true \
+    || fail "finish unconfirmed: the state is still recorded"
+done
+# The same rule for an event alarm: a foreign finish is alarmed BEFORE the run
+# is marked done, so a kill between them re-enters the path.
+FOREIGN="alarm:foreign-finish:${RUN: -40}"
+for point in "before-intent:send:$FOREIGN" "after-intent:send:$FOREIGN"; do
+  new_case "foreign-${point%%:*}"
+  claim; wake_json
+  gate_finished_elsewhere "$RUN"
+  recovery_fires "$point" 0
+  one_alarm "foreign finish, killed ${point%%:*}" "$FOREIGN"
+  jr '[.[] | select(.kind=="run")] | last | .state == "done"' | grep -qx true \
+    || fail "foreign finish: the run still closes"
+done
+# ...and for the condition alarms the finding names: dispatch-ambiguous (a
+# second kill, after the first made the dispatch ambiguous) and owner overdue.
+AMB="alarm:dispatch-ambiguous:$(key "$RUN" dispatch critic | cut -c1-12)"
+for point in "before-intent:send:$AMB" "after-intent:send:$AMB"; do
+  new_case "ambiguous-alarm-${point%%:*}"
+  CRASH=after-intent:dispatch:critic CRASH2="$point" campaign 10
+  one_alarm "dispatch ambiguous, killed ${point%%:*}" "$AMB"
+  [ "$(finish_verdict)" = '"BLOCKED"' ] || fail "dispatch ambiguous: still BLOCKED: $(finish_verdict)"
+done
+OVERDUE="alarm:overdue:$(key "$RUN" owner lanes | cut -c1-12)"
+for point in "before-intent:send:$OVERDUE" "after-intent:send:$OVERDUE"; do
+  new_case "overdue-alarm-${point%%:*}"
+  STALL=8 DEADLINE=2026-09-18T14:00:00Z CRASH="$point" campaign 20
+  one_alarm "owner overdue, killed ${point%%:*}" "$OVERDUE"
+  [ "$(finish_verdict)" = '"GO"' ] || fail "owner overdue: a late-but-complete step still finishes GO: $(finish_verdict)"
+done
+unset STALL DEADLINE UNCONF FOREIGN AMB OVERDUE
 
 echo "smoke campaign controller live tests passed"

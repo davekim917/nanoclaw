@@ -253,6 +253,72 @@ printf '{not json' >"$OUT/wrapper/alarms/broken.json"
 fire
 [ "$(d .stepped)" = false ] && [ -e "$OUT/wrapper/alarms/broken.json" ] || fail "an unreadable queued alarm is kept: $OUTPUT"
 
+# --- EVERY gate latch is recovered, not just four (review round 2, #1) -------------
+# stalledAlertRunId (smoke-pr-gate.sh:4783, checked :4762) and the control-file
+# wakes (:1463, :4858, :4908, :5245). The gate wrote the latch; the worker died
+# before queueing: the next fire recovers it and posts it exactly once.
+posted() { jq --arg p "$1" '[.messages // {} | .[] | select(.fingerprint | startswith($p))] | length' "$C/fake/enqueue.json" 2>/dev/null || echo 0; }
+new_case latch-stalled
+fire   # baseline: nothing latched yet
+jq -cn --arg run "$RUN" --arg sha "$SHA" '{schemaVersion:1,pr:7,activeRunId:$run,activeSha:$sha,
+  activeLeaseOwner:"owner-x",challengerDeadline:"2099-01-01T00:00:00Z",stalledAlertRunId:$run}' \
+  >"$C/agent/state/pr-7-state.json"
+: >"$FAKE_LOG"
+fire
+[ "$(d '.recoveredAlarms | length')" = 1 ] && d '.recoveredAlarms[0]' | grep -q "pr_run_stalled:7:$RUN" \
+  || fail "a lost pr_run_stalled is recovered from stalledAlertRunId, keyed by its run: $OUTPUT"
+calls '[.[] | select(.op=="poll")] | length == 0' | grep -qx true || fail "the recovered stall alarm is drained before polling"
+[ "$(posted pr_run_stalled)" = 1 ] || fail "the recovered stall alarm is posted: $(cat "$C/fake/enqueue.json")"
+fire; fire
+[ "$(posted pr_run_stalled)" = 1 ] || fail "the recovered stall alarm is posted once, ever"
+# The poll path: the gate emits the stall wake after latching it; the ack of the
+# latch is lost; recovery re-queues the SAME fingerprint, so no second post.
+jq -c '.stalledAlertRunId=null | .activeRunId="xzo-pr-pr7-bbbbbbbbbbbb-20260918T110000Z"' "$C/agent/state/pr-7-state.json" >"$C/s.tmp"
+mv "$C/s.tmp" "$C/agent/state/pr-7-state.json"
+fire   # acknowledges the cleared latch
+cat >"$C/poll-next.sh" <<SH
+jq -c '.stalledAlertRunId=.activeRunId' '$C/agent/state/pr-7-state.json' >'$C/s.tmp'
+mv '$C/s.tmp' '$C/agent/state/pr-7-state.json'
+jq -cn '{wakeAgent:true,data:{schemaVersion:1,trigger:"pr_run_stalled",pr:7,runId:"xzo-pr-pr7-bbbbbbbbbbbb-20260918T110000Z",
+  sourceSha:"$SHA",quietSeconds:4000}}'
+SH
+fire
+[ "$(posted pr_run_stalled)" = 2 ] || fail "the polled stall alarm (a new run) is posted: $(jq -c '.messages' "$C/fake/enqueue.json")"
+jq 'with_entries(select(.key != "7:stalledAlertRunId"))' "$OUT/wrapper/latches.json" >"$C/l.tmp"
+mv "$C/l.tmp" "$OUT/wrapper/latches.json"
+fire
+[ "$(d '.recoveredAlarms | length')" = 1 ] || fail "the unacknowledged stall latch is re-queued: $OUTPUT"
+[ "$(posted pr_run_stalled)" = 2 ] || fail "poll and latch paths share the run-keyed fingerprint: no second post"
+
+new_case latch-control
+fire   # baseline
+jq -cn '{lastMisconfigWakeAt:"2026-09-18T10:00:00Z"}' >"$C/agent/state/control.json"
+: >"$FAKE_LOG"
+fire
+[ "$(d '.recoveredAlarms | length')" = 1 ] || fail "a lost gate_misconfigured wake is recovered from control.json: $OUTPUT"
+[ "$(posted gate_misconfigured)" = 1 ] || fail "the recovered control alarm is posted: $(cat "$C/fake/enqueue.json" 2>/dev/null)"
+fire
+[ "$(posted gate_misconfigured)" = 1 ] || fail "the recovered control alarm is posted once"
+# The gate re-arms 6h later: a new timestamp is a new emission, posted once more.
+jq -c '.lastMisconfigWakeAt="2026-09-18T16:00:00Z"' "$C/agent/state/control.json" >"$C/c.tmp"
+mv "$C/c.tmp" "$C/agent/state/control.json"
+fire
+[ "$(posted gate_misconfigured)" = 2 ] || fail "a re-armed control wake is a new alarm"
+# Poll path for a control wake: queued under the timestamp the poll just wrote,
+# so a lost ack re-queues the same fingerprint.
+cat >"$C/poll-next.sh" <<SH
+jq -c '.lastFailureWakeAt="2026-09-18T17:00:00Z"' '$C/agent/state/control.json' >'$C/c.tmp'
+mv '$C/c.tmp' '$C/agent/state/control.json'
+jq -cn '{ok:false,settled:false,wakeAgent:true,data:{schemaVersion:1,trigger:"gate_fetch_failed",settled:false,consecutiveFailures:3}}'
+SH
+fire
+[ "$(posted gate_fetch_failed)" = 1 ] || fail "a polled control alarm is posted: $(jq -c '.messages' "$C/fake/enqueue.json")"
+jq 'with_entries(select(.key != "control:lastFailureWakeAt"))' "$OUT/wrapper/latches.json" >"$C/l.tmp"
+mv "$C/l.tmp" "$OUT/wrapper/latches.json"
+fire
+[ "$(d '.recoveredAlarms | length')" = 1 ] || fail "the unacknowledged control latch is re-queued: $OUTPUT"
+[ "$(posted gate_fetch_failed)" = 1 ] || fail "poll and latch paths share the control fingerprint: no second post"
+
 # --- a failing or slow poll still steps; a forged child line never escapes --------
 new_case poll-fails
 printf '5\n' >"$C/poll-sleep"
