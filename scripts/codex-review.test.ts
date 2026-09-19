@@ -207,6 +207,20 @@ if [ -n "$rest" ]; then
       printf '{"ref":"refs/heads/%s","object":{"sha":"%s","type":"commit"}}\\n' "$branch" "$(cat "$target")"
       exit 0
       ;;
+    */rules/branches/*)
+      # rules--<branch>.json is the branch's active rules. Absent = the read fails.
+      branch="\${rest##*/rules/branches/}"
+      [ -f "$MOCK_DIR/rules--$branch.json" ] || { echo '{"message":"Not Found","status":"404"}'; echo 'gh: Not Found (HTTP 404)' >&2; exit 1; }
+      printf '['; cat "$MOCK_DIR/rules--$branch.json"; printf ']'
+      exit 0
+      ;;
+    */branches/*/protection)
+      # protection.json = classic protection is on; absent = GitHub's "Branch not protected" 404.
+      if [ -f "$MOCK_DIR/protection.json" ]; then cat "$MOCK_DIR/protection.json"; exit 0; fi
+      echo '{"message":"Branch not protected","status":"404"}'
+      echo 'gh: Branch not protected (HTTP 404)' >&2
+      exit 1
+      ;;
     */compare/*)
       # compare--<base>...<head>.json is the comparison of exactly those two. Absent = the read fails.
       basehead="\${rest#*/compare/}"
@@ -246,6 +260,7 @@ done
 case "$query" in
   *userContentEdits*) connection=audit ;;
   *statusCheckRollup*) connection=rollup ;;
+  *adminReadiness*) connection=adminReadiness ;;
   *reviewThreads*) connection=reviewThreads ;;
   *reviews*) connection=reviews ;;
   *reactions*) connection=reactions ;;
@@ -5476,6 +5491,15 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
       expect(result.stderr).toContain('CI=not started (required;');
     });
 
+    it('compares logins case-insensitively, as GitHub does', () => {
+      const root = tempRoot();
+      const result = mergeCheckAs(root, [commitStatus(HOST, 'success', undefined, 'Fleet-Bot')], {
+        CODEX_REVIEW_HOST_CI_POSTERS: 'FLEET-bot',
+      });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('ci=host');
+    });
+
     it('takes the allowlist from CODEX_REVIEW_HOST_CI_POSTERS, comma-separated', () => {
       const root = tempRoot();
       const result = mergeCheckAs(root, [commitStatus(HOST, 'success', undefined, 'second')], {
@@ -5535,8 +5559,149 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
       legacy(root, [neverRun(), rollupStatus(HOST, 'SUCCESS', false)], false);
       const result = runHelper(root, ['merge-check', '--head', HEAD]);
       expect(result.status).toBe(26);
-      expect(result.stdout).toContain('merge=defer mode=legacy ci=host:');
+      expect(result.stdout).toContain('merge=defer mode=legacy ci=host admin=');
       expect(result.stderr).toContain('required CI Gate never started on Actions');
+    });
+
+    // admin=ready is the only verdict that licenses `gh pr merge --admin`:
+    // the bypass lifts every hold, so every rule but the never-started check
+    // must already be met. XZO's shape: required CI Gate, Release policy and
+    // Release approval, and review threads that must be resolved.
+    describe('admin readiness (the --admin bypass)', () => {
+      const RULES = [
+        { type: 'deletion', parameters: null },
+        { type: 'non_fast_forward', parameters: null },
+        {
+          type: 'pull_request',
+          parameters: {
+            required_approving_review_count: 0,
+            required_review_thread_resolution: true,
+            require_extra_approval_for_unattributed_changes: true,
+            require_code_owner_review: false,
+            require_last_push_approval: false,
+            required_reviewers: [],
+          },
+        },
+        {
+          type: 'required_status_checks',
+          parameters: {
+            required_status_checks: [
+              { context: 'CI Gate' },
+              { context: 'Release policy' },
+              { context: 'Release approval' },
+            ],
+          },
+        },
+      ];
+      type Pr = { threads?: boolean[]; approvals?: string[]; unattributed?: boolean; head?: string };
+      function prPage(pr: Pr = {}): Page {
+        return {
+          data: {
+            repository: {
+              pullRequest: {
+                headRefOid: pr.head ?? HEAD,
+                author: { login: 'author' },
+                reviewThreads: {
+                  totalCount: (pr.threads ?? []).length,
+                  nodes: (pr.threads ?? []).map((isResolved) => ({ isResolved })),
+                },
+                latestOpinionatedReviews: {
+                  totalCount: (pr.approvals ?? []).length,
+                  nodes: (pr.approvals ?? []).map((login) => ({ state: 'APPROVED', author: { login } })),
+                },
+                commits: {
+                  totalCount: 1,
+                  nodes: [{ commit: { author: { user: pr.unattributed ? null : { login: 'author' } } } }],
+                },
+              },
+            },
+          },
+        };
+      }
+      const GREEN = [rollupStatus('Release policy', 'SUCCESS'), rollupStatus('Release approval', 'SUCCESS')];
+      function admin(root: string, rollup: Page[], pr: Pr = {}, rules: Page[] | null = RULES) {
+        legacy(root, [neverRun(), rollupStatus(HOST, 'SUCCESS', false), ...rollup], false);
+        fs.rmSync(path.join(root, 'rules--main.json'), { force: true });
+        if (rules !== null) writeJson(root, 'rules--main.json', rules);
+        writeJson(root, 'adminReadiness-1.json', prPage(pr));
+        return runHelper(root, ['merge-check', '--head', HEAD]);
+      }
+
+      it('is ready when the only non-green required check is the never-started one host CI covers', () => {
+        const result = admin(tempRoot(), GREEN);
+        expect(result.status).toBe(26);
+        expect(result.stdout).toContain('merge=defer mode=legacy ci=host admin=ready:');
+      });
+
+      it.each<[string, Page[], Pr, string]>([
+        [
+          'Release approval pending',
+          [rollupStatus('Release policy', 'SUCCESS'), rollupStatus('Release approval', 'PENDING')],
+          {},
+          'Release approval=pending',
+        ],
+        [
+          'Release approval not yet posted',
+          [rollupStatus('Release policy', 'SUCCESS')],
+          {},
+          'Release approval=not reported',
+        ],
+        ['an unresolved review thread', GREEN, { threads: [true, false] }, '1 unresolved review thread(s)'],
+        [
+          'an unattributed commit and no approval',
+          GREEN,
+          { unattributed: true },
+          '0 of 1 required approving review(s)',
+        ],
+        [
+          'another required check still running',
+          [...GREEN, rollupRun('Lint', 'IN_PROGRESS', null)],
+          {},
+          'Lint=in_progress/none',
+        ],
+      ])('is not ready with %s', (_case, rollup, pr, why) => {
+        const result = admin(tempRoot(), rollup, pr);
+        expect(result.status).toBe(26);
+        expect(result.stdout).toContain('merge=defer mode=legacy ci=host admin=not-ready:');
+        expect(result.stdout).toContain(why);
+        expect(result.stdout).not.toContain('admin=ready');
+      });
+
+      it('never gets as far as admin readiness when another required status is red', () => {
+        const result = admin(tempRoot(), [
+          rollupStatus('Release policy', 'FAILURE'),
+          rollupStatus('Release approval', 'SUCCESS'),
+        ]);
+        expect(result.status).toBe(24);
+        expect(result.stderr).toContain('required_red: Release policy=failure');
+        expect(result.stdout).not.toContain('admin=');
+      });
+
+      it('counts an approval against the extra one an unattributed commit needs, but not the author approving themself', () => {
+        expect(admin(tempRoot(), GREEN, { unattributed: true, approvals: ['reviewer'] }).stdout).toContain(
+          'admin=ready',
+        );
+        expect(admin(tempRoot(), GREEN, { unattributed: true, approvals: ['author'] }).stdout).toContain(
+          'admin=not-ready',
+        );
+      });
+
+      it.each<[string, Page[] | null, boolean, string]>([
+        ['the rules cannot be read', null, false, 'could not read the rules'],
+        [
+          'a rule type it does not model',
+          [...RULES, { type: 'update', parameters: null }],
+          false,
+          'rules this does not evaluate: update',
+        ],
+        ['classic branch protection', RULES, true, 'classic branch protection'],
+      ])('is not ready when %s', (_case, rules, classic, why) => {
+        const root = tempRoot();
+        if (classic) writeJson(root, 'protection.json', { url: 'x' });
+        const result = admin(root, GREEN, {}, rules);
+        expect(result.stdout).toContain('admin=not-ready');
+        expect(result.stdout).toContain(why);
+      });
     });
 
     it.each<[string, Page[], boolean | null]>([

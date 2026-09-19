@@ -48,7 +48,9 @@
 #   25  merge-check: the base branch moved while the check ran, or could not be
 #       re-read, so the verdict may be stale — re-run merge-check
 #   26  merge-check: `merge=defer mode=legacy` — not risk-scoped, so SKILL.md Step 6's
-#       evidence rules decide this merge; never chain it into `gh pr merge`. A legacy
+#       evidence rules decide this merge; never chain it into `gh pr merge`. With
+#       `ci=host` it also says `admin=ready` or `admin=not-ready: <why>`
+#       (admin_readiness); only `admin=ready` licenses `gh pr merge --admin`. A legacy
 #       head still gets 24 first when a check GitHub marks required for the PR is red on it
 #       (`required_red`) or the newest independent-review-receipt:v1 for it is not
 #       CLEAR (`independent_receipt_not_clear`) — legacy_precheck
@@ -1276,7 +1278,7 @@ ci_verdict() {
     | ( [ .[1][][]? | select(.context as $c | $excluded | index($c) | not)
           | select($asof == "" or (.created_at // "") <= $asof) ]
         | group_by(.context) | map(max_by([.created_at // "", .id // 0])) ) as $statuses
-    | ( [ .[1][][]? | select(.context == $hostContext and ((.creator.login // "") | IN($posters[])))
+    | ( [ .[1][][]? | select(.context == $hostContext and ((.creator.login // "") | ascii_downcase | IN($posters[])))
           | select($asof == "" or (.created_at // "") <= $asof) ]
         | if length == 0 then "none" else max_by([.created_at // "", .id // 0]).state end ) as $hostState
     | ($hostState == "success") as $hostGreen
@@ -1320,7 +1322,9 @@ host_ci_posters() {
   if [ -z "$list" ]; then
     list=$(gh api user --jq .login 2>/dev/null) || list=""
   fi
-  jq -cn --arg list "$list" '$list | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))'
+  # Lower-cased: GitHub logins are case-insensitive, and callers compare the
+  # lower-cased creator.login against this.
+  jq -cn --arg list "$list" '$list | split(",") | map(gsub("^\\s+|\\s+$"; "") | ascii_downcase) | map(select(length > 0))'
 }
 
 # The ids, as a JSON array, of the Actions runs on head $1 (from $2, the
@@ -1495,7 +1499,7 @@ rollup_page() {
 # must name HEAD as that head; a failed or partial read is no verdict, and
 # there is no second source to fall back on.
 #
-# Output is `<red>\t<hosted>`. A required check run that concluded FAILURE
+# Output is `<red>\t<hosted>\t<hosted check-run ids as JSON>`. A required check run that concluded FAILURE
 # because GitHub never started it (its Actions job, read by the check run's
 # databaseId, is never_started — never-started.jq) is not red when the
 # rollup's HOST_CI_CONTEXT status on this head is SUCCESS and was posted by an
@@ -1514,7 +1518,7 @@ required_status_red() {
     posters=$(host_ci_posters)
   fi
   candidates=$(printf '%s\n' "$rollup" | jq -r --arg ctx "$HOST_CI_CONTEXT" --argjson posters "$posters" '
-    if any(.[]; .__typename == "StatusContext" and .context == $ctx and .state == "SUCCESS" and ((.creator.login // "") | IN($posters[])))
+    if any(.[]; .__typename == "StatusContext" and .context == $ctx and .state == "SUCCESS" and ((.creator.login // "") | ascii_downcase | IN($posters[])))
     then [ .[] | select(.__typename == "CheckRun" and .isRequired == true and .status == "COMPLETED" and .conclusion == "FAILURE")
            | .databaseId | select(type == "number") ] | unique | .[]
     else empty end') || return 1
@@ -1532,7 +1536,7 @@ required_status_red() {
         | if .__typename == "CheckRun"
           then select(.status == "COMPLETED" and (.conclusion | IN("SUCCESS", "NEUTRAL", "SKIPPED") | not)) | "\(.name)=\(.conclusion // "none" | ascii_downcase)"
           else select(.state | IN("SUCCESS", "PENDING", "EXPECTED") | not) | "\(.context)=\(.state // "none" | ascii_downcase)" end ]
-    | "\(unique | join(", "))\t\($hosted | unique | join(", "))"'
+    | "\(unique | join(", "))\t\($hosted | unique | join(", "))\t\($unstarted | tojson)"'
 }
 
 # What a legacy merge still answers to mechanically. merge-check defers a
@@ -1542,6 +1546,7 @@ required_status_red() {
 # they refuse (24) before the defer; everything else about a legacy merge is
 # still Step 6's. No verdict (1) when either cannot be read.
 LEGACY_CI_HOST=""
+LEGACY_CI_HOST_IDS='[]'
 legacy_precheck() {
   local red_out red receipt
   red_out=$(required_status_red "$SCOPE_HEAD") || {
@@ -1551,6 +1556,9 @@ legacy_precheck() {
   red="${red_out%%$'\t'*}"
   LEGACY_CI_HOST="${red_out#*$'\t'}"
   [ "$LEGACY_CI_HOST" != "$red_out" ] || LEGACY_CI_HOST=""
+  LEGACY_CI_HOST_IDS="${LEGACY_CI_HOST#*$'\t'}"
+  [ "$LEGACY_CI_HOST_IDS" != "$LEGACY_CI_HOST" ] || LEGACY_CI_HOST_IDS='[]'
+  LEGACY_CI_HOST="${LEGACY_CI_HOST%%$'\t'*}"
   if [ -n "$red" ]; then
     echo "merge=refused head=$SCOPE_HEAD mode=legacy: required_red: $red — GitHub requires it for this PR and it is red on this head; fix what it reports, never merge around it" >&2
     exit 24
@@ -1567,6 +1575,81 @@ legacy_precheck() {
       exit 1
       ;;
   esac
+}
+
+# Whether an admin bypass (`gh pr merge --admin`) of the base branch's rules
+# would skip ONLY what host CI already answered for: prints `ready` or
+# `not-ready\t<why>`. required_status_red leaves PENDING/EXPECTED and
+# unreported checks alone because GitHub holds the merge for them, and GitHub
+# also holds it for unresolved review threads and missing approvals — but
+# --admin lifts every hold at once. So `ready` needs, read live from the
+# branch's rules (repos/<r>/rules/branches/<base>) and the PR:
+#   - every required context (from the rules, plus every rollup context
+#     GitHub marks required) reported and green, except the never-started
+#     check runs an allowed CI (host) success covers ($1, their databaseIds);
+#   - no unresolved review thread when the rules require resolution;
+#   - enough approving reviews for required_approving_review_count, plus one
+#     when require_extra_approval_for_unattributed_changes is on and any
+#     commit's author maps to no GitHub account;
+#   - no rule type, app-pinned check, or classic protection it does not model.
+# Anything it cannot read is `not-ready`, never `ready`.
+admin_readiness() {
+  local hosted="$1" rules protection pages rollup pr why
+  rules=$(gh api --paginate --slurp "repos/$REPO/rules/branches/$SCOPE_BASE_REF" 2>/dev/null | jq -c 'flatten') || {
+    printf 'not-ready\tcould not read the rules of %s' "$SCOPE_BASE_REF"; return 0; }
+  if protection=$(gh api "repos/$REPO/branches/$SCOPE_BASE_REF/protection" 2>/dev/null); then
+    printf 'not-ready\t%s has classic branch protection, which this does not evaluate' "$SCOPE_BASE_REF"; return 0
+  fi
+  printf '%s' "$protection" | jq -e '.message == "Branch not protected"' >/dev/null 2>&1 || {
+    printf 'not-ready\tcould not read the classic protection of %s' "$SCOPE_BASE_REF"; return 0; }
+  pages=$(paginate_connection statusCheckRollup.contexts rollup_page) || {
+    printf 'not-ready\tcould not read the status rollup'; return 0; }
+  rollup=$(printf '%s\n' "$pages" | jq -cs --arg head "$SCOPE_HEAD" '
+    if all(.[]; .data.repository.pullRequest.headRefOid == $head) | not then error("rollup for another head") else . end
+    | [ .[] | .data.repository.pullRequest.statusCheckRollup.contexts.nodes[] ]') || {
+    printf 'not-ready\tcould not read the status rollup'; return 0; }
+  pr=$(gh api graphql -f query='
+    query adminReadiness($owner:String!,$name:String!,$pr:Int!){
+      repository(owner:$owner,name:$name){ pullRequest(number:$pr){
+        headRefOid author{ login }
+        reviewThreads(first:100){ totalCount nodes{ isResolved } }
+        latestOpinionatedReviews(first:100){ totalCount nodes{ state author{ login } } }
+        commits(first:100){ totalCount nodes{ commit{ author{ user{ login } } } } }
+      } }
+    }' -F owner="$OWNER" -F name="$NAME" -F pr="$PR" 2>/dev/null | jq -ce '.data.repository.pullRequest | objects') || {
+    printf 'not-ready\tcould not read the PR review threads, reviews and commits'; return 0; }
+  why=$(jq -rn --argjson rules "$rules" --argjson rollup "$rollup" --argjson pr "$pr" --argjson hosted "$hosted" --arg head "$SCOPE_HEAD" '
+    def green: if .__typename == "CheckRun"
+      then (.databaseId | IN($hosted[])) or (.status == "COMPLETED" and (.conclusion | IN("SUCCESS", "NEUTRAL", "SKIPPED")))
+      else .state == "SUCCESS" end;
+    def ctxname: .name // .context;
+    def shown: if .__typename == "CheckRun" then "\(.status // "none" | ascii_downcase)/\(.conclusion // "none" | ascii_downcase)" else (.state // "none" | ascii_downcase) end;
+    ( [ $rules[] | .type ] - ["deletion", "non_fast_forward", "pull_request", "required_status_checks"] | unique ) as $unmodeled
+    | ( [ $rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[] ] ) as $checks
+    | ( [ $rules[] | select(.type == "pull_request") | .parameters ] ) as $prRules
+    | ( [ $checks[] | .context ] + [ $rollup[] | select(.isRequired == true) | ctxname ] | unique ) as $required
+    | ( [ $required[] | . as $c | [ $rollup[] | select(ctxname == $c) ] as $nodes
+          | if ($nodes | length) == 0 then "\($c)=not reported"
+            else ($nodes[] | select(green | not) | "\($c)=\(shown)") end ] | unique ) as $notGreen
+    | ( [ $pr.commits.nodes[] | select(.commit.author.user == null) ] | length ) as $unattributed
+    | ( [ $pr.latestOpinionatedReviews.nodes[] | select(.state == "APPROVED" and (.author.login // "") != ($pr.author.login // "")) | .author.login ] | unique | length ) as $approvals
+    | ( [ $pr.reviewThreads.nodes[] | select(.isResolved | not) ] | length ) as $unresolved
+    | [ ( if $pr.headRefOid != $head then "the PR head moved to \($pr.headRefOid)" else empty end ),
+        ( if ($unmodeled | length) > 0 then "rules this does not evaluate: \($unmodeled | join(", "))" else empty end ),
+        ( $checks[] | select(.integration_id != null) | "required check \(.context) is pinned to an app, which this does not evaluate" ),
+        ( if ($notGreen | length) > 0 then "required, not green: \($notGreen | join(", "))" else empty end ),
+        ( if $pr.reviewThreads.totalCount > 100 or $pr.latestOpinionatedReviews.totalCount > 100 or $pr.commits.totalCount > 100
+          then "over 100 review threads, reviews or commits, not read in full" else empty end ),
+        ( $prRules[]
+          | ( if .required_review_thread_resolution == true and $unresolved > 0 then "\($unresolved) unresolved review thread(s), and the rules require resolution" else empty end ),
+            ( (.require_extra_approval_for_unattributed_changes == true and $unattributed > 0) as $extra
+              | ((.required_approving_review_count // 0) + (if $extra then 1 else 0 end)) as $need
+              | if $approvals < $need then "\($approvals) of \($need) required approving review(s)\(if $extra then " (one extra because \($unattributed) commit(s) have no GitHub-attributed author)" else "" end)" else empty end ),
+            ( if .require_code_owner_review == true or .require_last_push_approval == true or ((.required_reviewers // []) | length) > 0
+              then "code-owner, last-push or named-reviewer requirements, which this does not evaluate" else empty end ) )
+      ] | join("; ")') || {
+    printf 'not-ready\tcould not evaluate the rules'; return 0; }
+  if [ -z "$why" ]; then printf 'ready'; else printf 'not-ready\t%s' "$why"; fi
 }
 
 # merge-check's decision, for the merge-check command and for `merge`, which
@@ -1595,8 +1678,15 @@ merge_check_main() {
     legacy_precheck
     refuse_if_base_moved
     if [ -n "$LEGACY_CI_HOST" ]; then
+      local admin
       echo "merge-check: required $LEGACY_CI_HOST never started on Actions; the $HOST_CI_CONTEXT success on this head stands in" >&2
-      echo "merge=defer mode=legacy ci=host: $REPO is not risk-scoped; the existing Step-6 evidence rules apply"
+      admin=$(admin_readiness "$LEGACY_CI_HOST_IDS")
+      if [ "$admin" = ready ]; then
+        echo "merge=defer mode=legacy ci=host admin=ready: $REPO is not risk-scoped; the existing Step-6 evidence rules apply, and every other rule on $SCOPE_BASE_REF is met, so an admin bypass skips only the never-started check"
+      else
+        echo "merge-check: admin=not-ready: ${admin#*$'\t'}" >&2
+        echo "merge=defer mode=legacy ci=host admin=not-ready: $REPO is not risk-scoped; the existing Step-6 evidence rules apply; never bypass the rules for this head — ${admin#*$'\t'}"
+      fi
       exit 26
     fi
     echo "merge=defer mode=legacy: $REPO is not risk-scoped; the existing Step-6 evidence rules apply"

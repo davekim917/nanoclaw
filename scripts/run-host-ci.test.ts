@@ -34,7 +34,7 @@ function setup(
     declaration?: string | null;
     state?: string;
     fetched?: string;
-    cross?: boolean;
+    cross?: boolean | null;
     commentFails?: boolean;
   } = {},
 ) {
@@ -57,7 +57,7 @@ function setup(
       headRefOid: HEAD,
       baseRefName: 'develop',
       baseRefOid: BASE,
-      isCrossRepository: opts.cross ?? false,
+      isCrossRepository: opts.cross === undefined ? false : opts.cross,
     }),
   );
   if (opts.commentFails) fs.writeFileSync(path.join(root, 'comment.fail'), '');
@@ -277,6 +277,26 @@ exit 0
     expect(result.stderr).toContain('isCrossRepository=true');
     expect(result.calls).not.toContain('fetch');
     expect(result.statuses).toEqual([]);
+  });
+
+  it('refuses a PR whose origin GitHub does not report: only an explicit false runs', () => {
+    const ctx = setup({ cross: null });
+    const result = run(ctx);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('isCrossRepository=null');
+    expect(result.calls).not.toContain('fetch');
+    expect(result.statuses).toEqual([]);
+  });
+
+  it('does not wait on a background process the declaration left holding its output', () => {
+    // Without the group kill, tee waits the full 300s for this sleep to close
+    // the pipe, and spawnSync's 60s timeout kills the run (status null).
+    const ctx = setup({ declaration: 'set -euo pipefail\nsleep 300 &\necho left-a-child\n' });
+    const started = Date.now();
+    const result = run(ctx);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('left-a-child');
+    expect(Date.now() - started).toBeLessThan(30_000);
   });
 
   it('refuses when the fetched commit is not the head', () => {

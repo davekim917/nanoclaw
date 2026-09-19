@@ -201,7 +201,18 @@ rc=0
   cd "$src"
   export CI=true HOST_CI=1 HOST_CI_REPO="$repo" HOST_CI_PR="$pr" HOST_CI_HEAD="$head"
   export HOST_CI_BASE_REF="$base_ref" HOST_CI_BASE_SHA="$base_sha" HOST_CI_VITEST_LOCK="$vitest_lock"
-  flock "$lock" timeout --kill-after=30 "$timeout_s" ionice -c3 nice -n 10 bash "$DECLARATION"
+  # `timeout` makes itself a process-group leader (it calls setpgid unless
+  # --foreground), so the declaration and everything it starts share one group
+  # whose id is timeout's pid, recorded here through the exec. Anything the
+  # declaration left running in the background still holds this pipe open,
+  # and tee would wait on it forever; it is killed with its group once the
+  # declaration itself has finished.
+  pgid_file="$scratch/declaration.pgid"
+  rc=0
+  flock "$lock" bash -c 'echo "$$" > "$1"; shift; exec "$@"' _ "$pgid_file" \
+    timeout --kill-after=30 "$timeout_s" ionice -c3 nice -n 10 bash "$DECLARATION" || rc=$?
+  if [ -s "$pgid_file" ]; then kill -KILL -- "-$(cat "$pgid_file")" 2>/dev/null || true; fi
+  exit "$rc"
 ) 2>&1 | tee -a "$log" || rc=$?
 elapsed=$(( $(date +%s) - start ))
 
