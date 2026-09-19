@@ -7,8 +7,9 @@
 # It runs next to the legacy coordinator and changes nothing it does. Each fire:
 #   1. reads the gate env file (SMOKE_CONTROLLER_ENV_FILE, default
 #      /workspace/agent/smoke-gate-env.sh) AS DATA -- see Guarantees;
-#      SMOKE_CONTROLLER_MODE there is the kill switch (unset or `off` = do
-#      nothing; `shadow` = run);
+#      SMOKE_CONTROLLER_MODE there is the kill switch. Shadow is ON by default
+#      (unset = `shadow`), because shadow is provably inert; `off` = do
+#      nothing; anything else is refused;
 #   2. `init`s the controller journal ONCE per out-dir. The controller keeps one
 #      journal for every run (smoke-campaign-controller.py:264-353) and `init`
 #      refuses an existing one (:325-330). A sentinel records that init
@@ -394,7 +395,7 @@ for k, v in cfg.items():
         os.environ.pop(k, None)
     else:
         os.environ[k] = v
-MODE = os.environ.get("SMOKE_CONTROLLER_MODE") or "off"
+MODE = os.environ.get("SMOKE_CONTROLLER_MODE") or "shadow"
 summary["mode"] = MODE
 if MODE == "off":
     finish()
