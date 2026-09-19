@@ -679,8 +679,8 @@ export function validateGitIdentity(value: unknown): GitIdentity | undefined {
 }
 
 /**
- * Smallest honoured `autoCompactWindow`. CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80
- * fires at 80% of the window; below ~100k a large standing-instruction set
+ * Smallest honoured `autoCompactWindow`. Compaction fires at the CLI's default
+ * percentage of the window; below ~100k a large standing-instruction set
  * (~14k tokens on the heaviest group) plus a few tool results would compact every handful
  * of calls, and the session would lose more context to summaries than the
  * window saves.
@@ -754,7 +754,7 @@ export interface ContainerConfig {
   /**
    * Claude Code auto-compact window (tokens) for this group's containers —
    * `CLAUDE_CODE_AUTO_COMPACT_WINDOW` at spawn. Absent = the fleet default
-   * (1,000,000, the [1m] capacity). Lowering it makes compaction fire earlier
+   * (600,000). Lowering it makes compaction fire earlier
    * and bounds the per-step context a long session carries. Not mirrored to
    * the DB; only the spawn path reads it. docs/specs/quota-burn/plan.md §0.5.
    */

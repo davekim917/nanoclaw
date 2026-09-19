@@ -28,16 +28,28 @@ export type ClaudeSpawnConfig = Pick<
  * settings pin can never disagree with the `-e` the spawn path sends.
  *
  * Auto-compact window default: Claude Code 2.1+ has a built-in window well
- * under 200k even on a [1m] model; 1_000_000 matches the [1m] capacity so
- * CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80 fires around 800k. A group lowers it via
+ * under 200k even on a [1m] model. It was 1_000_000 — the [1m] capacity — with
+ * CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80 firing compaction around 800k. Both moved
+ * on 2026-09-19 (operator decision): the window is 600_000 and the percentage
+ * override is gone, so the CLI's own default percentage decides where
+ * compaction lands within that window. Compaction ITSELF is unchanged either
+ * way — fast-jev-compaction registers a `session.compact` hook, which runs for
+ * whichever trigger fires, so these two values move WHEN a session compacts,
+ * never HOW. A group lowers it via
  * container.json `autoCompactWindow` (§0.5). Subagent caps: CLI defaults are
- * depth 3 / concurrency 20; the orchestrate contract forbids workers
- * re-delegating (depth 1 enforces it) and concurrency 3 bounds the
- * five-hour-meter burst (§0.1/0.2).
+ * depth 3 / concurrency 20; these sit under that to bound the five-hour-meter
+ * burst (§0.1/0.2).
+ *
+ * Raised 2026-09-19 from depth 1 / concurrency 3 to match the operator's own
+ * host settings, so a container fans out the same way an interactive session
+ * does. Depth 1 previously enforced the orchestrate contract's ban on workers
+ * re-delegating; at depth 2 that ban is contract-only, carried by the
+ * orchestrate role definitions rather than by the CLI refusing the spawn. The
+ * worst-case concurrent fan-out this permits is 5 × 5, not 5.
  */
-export const DEFAULT_CLAUDE_AUTO_COMPACT_WINDOW = 1_000_000;
-export const CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH = '1';
-export const CLAUDE_MAX_CONCURRENT_SUBAGENTS = '3';
+export const DEFAULT_CLAUDE_AUTO_COMPACT_WINDOW = 600_000;
+export const CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH = '2';
+export const CLAUDE_MAX_CONCURRENT_SUBAGENTS = '5';
 
 /** What the claude spawn branch will put in the container's environment. */
 export interface ClaudeSpawnDefaults {

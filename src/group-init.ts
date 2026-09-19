@@ -28,12 +28,9 @@ const REQUIRED_ENV: Record<string, string> = {
   // Deliberately leave BASH_DEFAULT_TIMEOUT_MS unset so ordinary Bash calls
   // retain Claude Code's shorter default timeout.
   BASH_MAX_TIMEOUT_MS: '3600000',
-  // Auto-compact at 80% of context window instead of SDK default (~97%).
-  // Prevents sessions from hitting the hard context limit and triggering
-  // silent model fallback on upstream 400 errors.
-  CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '80',
+  // CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is no longer pinned — see DEPRECATED_ENV.
   // CLAUDE_CODE_AUTO_COMPACT_WINDOW used to be pinned here at 1_000_000. It is
-  // now per-group (container.json `autoCompactWindow`, default 1M) and passed
+  // now per-group (container.json `autoCompactWindow`, default 600k) and passed
   // via docker -e at spawn (claudeSpawnEnv) — see DEPRECATED_ENV below.
   // The subagent caps are fleet constants, so they CAN be pinned here: same
   // value as the spawn `-e` (both read the constants in claude-spawn-defaults.ts),
@@ -84,6 +81,13 @@ const DEPRECATED_ENV: readonly string[] = [
   // docs/specs/quota-burn/plan.md §0.5). A settings.json pin would shadow the
   // per-group value for every session in the group, so scrub it.
   'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  // Dropped 2026-09-19 (operator decision) together with the window move to
+  // 600k. The CLI's own default percentage now decides where compaction lands;
+  // fast-jev-compaction's `session.compact` hook does the compaction whichever
+  // trigger fires it, so the percentage only moves WHEN, not HOW. Listed here
+  // so the 80 this module pinned into every existing group's settings.json is
+  // scrubbed on next init rather than shadowing the new behaviour forever.
+  'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE',
 ];
 
 // Nanoclaw-managed top-level settings. Same reconciliation semantics as

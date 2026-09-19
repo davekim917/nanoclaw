@@ -89,12 +89,18 @@ describe('quota env reconciliation (PR #810 F2)', () => {
     expect(fresh.env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH).toBe(CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH);
     expect(fresh.env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS).toBe(CLAUDE_MAX_CONCURRENT_SUBAGENTS);
     expect(fresh.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
+    expect(fresh.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE).toBeUndefined();
 
     // Seed the shadowing shape: a hand-edit (or a pre-#810 file) with values
     // that disagree with the spawn `-e`.
     fresh.env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH = '5';
     fresh.env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS = '20';
     fresh.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = '1000000';
+    // Every group initialized before 2026-09-19 carries this, because
+    // REQUIRED_ENV pinned it. Removing it from REQUIRED_ENV alone would leave
+    // the 80 in place in each existing file; only the DEPRECATED_ENV listing
+    // scrubs it, and this is the assertion that holds that apart.
+    fresh.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = '80';
     fs.writeFileSync(file, JSON.stringify(fresh, null, 2) + '\n');
 
     initGroupFilesystem(ag, {}); // next spawn
@@ -103,6 +109,7 @@ describe('quota env reconciliation (PR #810 F2)', () => {
     expect(after.env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH).toBe(CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH);
     expect(after.env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS).toBe(CLAUDE_MAX_CONCURRENT_SUBAGENTS);
     expect(after.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
+    expect(after.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE).toBeUndefined();
   });
 });
 

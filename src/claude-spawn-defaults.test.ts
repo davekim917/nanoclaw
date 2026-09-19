@@ -183,11 +183,11 @@ describe('claudeSpawnEnv', () => {
       '-e',
       'NANOCLAW_EFFORT_OVERRIDE=medium',
       '-e',
-      'CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000',
+      'CLAUDE_CODE_AUTO_COMPACT_WINDOW=600000',
       '-e',
-      'CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1',
+      'CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2',
       '-e',
-      'CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=3',
+      'CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=5',
       '-e',
       'CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1',
     ]);
@@ -205,9 +205,9 @@ describe('claudeSpawnEnv', () => {
       ANTHROPIC_DEFAULT_OPUS_MODEL: DEFAULT_OPUS_MODEL,
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5-20251001',
-      CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
-      CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: '1',
-      CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: '3',
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: '600000',
+      CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: '2',
+      CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: '5',
       CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: '1',
     });
     expect(env).toHaveLength(16);
@@ -316,8 +316,8 @@ describe('claudeSpawnEnv — quota caps', () => {
     // The plan §0.5 shape: one group's container.json → 400000.
     const env = pairs(claudeSpawnEnv(cfg({ autoCompactWindow: 400000 })));
     expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('400000');
-    expect(env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH).toBe('1');
-    expect(env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS).toBe('3');
+    expect(env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH).toBe('2');
+    expect(env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS).toBe('5');
   });
 
   it('is emitted by both container-runner spawn branches and nowhere else', () => {

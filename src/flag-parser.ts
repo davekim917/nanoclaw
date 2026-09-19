@@ -71,7 +71,7 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
   // containers (DEFAULT_SONNET_MODEL in container-runner.ts). Unlike opus/fable,
   // Sonnet 5 ALWAYS runs at 1M on the Anthropic API — there's no 200K variant
   // and no [1m] suffix to select — so the opus-style [1m] window pin doesn't
-  // apply (the global CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000 handles compaction
+  // apply (the global CLAUDE_CODE_AUTO_COMPACT_WINDOW=600000 handles compaction
   // sizing). The pre-5 Sonnet 4.x aliases were dropped — this fork only runs
   // Sonnet 5.
   sonnet5: 'claude-sonnet-5',
