@@ -1901,9 +1901,6 @@ export function discoverPlugins(
       continue;
     }
     for (const sub of subs) {
-      // `<repo>/deprecated/` holds retired plugins kept for reference; the host
-      // skill discovery skips it too (src/plugin-skill-discovery.ts:518).
-      if (sub === 'deprecated') continue;
       const subPath = path.join(repoPath, sub);
       const subRel = `${entry}/${sub}`;
       if (isExcludedPluginPath(subRel, excluded)) continue;
@@ -1916,6 +1913,10 @@ export function discoverPlugins(
         addPlugin(subPath);
         continue;
       }
+      // `<repo>/deprecated/` (no manifest of its own) holds retired plugins kept
+      // for reference; the host skill discovery skips them too
+      // (src/plugin-skill-discovery.ts:518).
+      if (sub === 'deprecated') continue;
       let sub2s: string[] = [];
       try {
         sub2s = fs.readdirSync(subPath);

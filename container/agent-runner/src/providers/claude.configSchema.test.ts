@@ -244,6 +244,12 @@ describe('Claude plugin discovery', () => {
         fs.writeFileSync(path.join(dir, '.claude-plugin', 'plugin.json'), '{"name":"x"}');
       }
       expect(discoverPlugins(pluginsRoot).plugins).toEqual([{ type: 'local', path: live }]);
+
+      // A plugin that is itself named `deprecated` still loads.
+      const named = path.join(pluginsRoot, 'other', 'deprecated');
+      fs.mkdirSync(path.join(named, '.claude-plugin'), { recursive: true });
+      fs.writeFileSync(path.join(named, '.claude-plugin', 'plugin.json'), '{"name":"deprecated"}');
+      expect(discoverPlugins(pluginsRoot).plugins).toContainEqual({ type: 'local', path: named });
     } finally {
       fs.rmSync(pluginsRoot, { recursive: true, force: true });
     }
