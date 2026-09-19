@@ -84,11 +84,36 @@ describe('transcriptContainsUserText', () => {
     expect(has([{ type: 'user', uuid: 'u', parentUuid: null, message: { content: PROMPT } }])).toBe(false); // undated
   });
 
-  it('rejects a branch inside the attempt, whichever leaf the SDK would pick', () => {
-    const sys = { type: 'system', subtype: 'informational', uuid: 's', parentUuid: 'x', timestamp: at(100) };
+  it('accepts a match on the resumed chain even when an abandoned sibling branch exists', () => {
+    // The newest user/assistant entry is `d`, so the resumed chain is d → x → a;
+    // `y` hangs off `a` and is never loaded. Before 2026-09-19 a sibling anywhere
+    // in the attempt vetoed the pointer, which is what made this check answer
+    // false for every live retry. A `system` line on the chain does not block it.
+    const sys = { type: 'system', subtype: 'informational', uuid: 's', parentUuid: 'x', timestamp: at(80) };
     expect(
-      has([user('a', null, 'earlier', -60_000), user('x', 'a', PROMPT, 5), user('y', 'a', 'sibling', 50), sys]),
-    ).toBe(false);
+      has([
+        user('a', null, 'earlier', -60_000),
+        user('x', 'a', PROMPT, 5),
+        user('y', 'a', 'sibling', 50),
+        sys,
+        assistant('d', 's', 100),
+      ]),
+    ).toBe(true);
+  });
+
+  it('accepts a chain whose entries hang off lines this walk skips (the live shape)', () => {
+    // Real transcripts interleave entries whose parents are queue ops, titles and
+    // sidechain roots — lines with no `uuid` or `isSidechain: true`. They make the
+    // recorded entries look like several roots; none of them is on the resumed chain.
+    const orphan = { type: 'user', uuid: 'o', parentUuid: 'queue-op', timestamp: at(20), message: { role: 'user', content: 'queued' } };
+    expect(
+      has([
+        { type: 'queue', content: 'no uuid at all' },
+        user('c', null, PROMPT, 5),
+        orphan,
+        assistant('d', 'c', 900),
+      ]),
+    ).toBe(true);
   });
 
   it('rejects malformed conversation entries: empty uuid, absent parentUuid, non-user role', () => {
@@ -97,6 +122,50 @@ describe('transcriptContainsUserText', () => {
     delete noParent.parentUuid;
     expect(has([noParent])).toBe(false);
     expect(has([{ ...user('c', null, PROMPT, 5), message: { role: 'assistant', content: PROMPT } }])).toBe(false);
+  });
+
+  it('rejects a late progress entry that hangs off an abandoned branch', () => {
+    // Reproduced against SDK 0.3.278 / CLI 2.1.278 (PR #948 review): the resume
+    // loads a → y, so pointing at x would drop the batch. Only user/assistant
+    // entries may start the walk.
+    const progress = { type: 'progress', uuid: 'p', parentUuid: 'x', timestamp: at(120) };
+    expect(
+      has([user('a', null, 'ROOT', -60_000), user('x', 'a', PROMPT, 5), user('y', 'a', 'OTHER_BRANCH', 50), progress]),
+    ).toBe(false);
+  });
+
+  it('rejects a file that repeats a uuid, which could hide a compact_boundary', () => {
+    // Same review: re-appending the pre-compaction entry made it `newest`, so the
+    // walk returned true without ever visiting the boundary that orphaned it.
+    const boundary = { type: 'system', subtype: 'compact_boundary', uuid: 'k', parentUuid: 'x', timestamp: at(50) };
+    const summary = user('y', 'k', 'SUMMARY', 60, { isCompactSummary: true });
+    expect(
+      has([user('a', null, 'ROOT', -60_000), user('x', 'a', PROMPT, 5), boundary, summary, user('x', 'a', PROMPT, 70)]),
+    ).toBe(false);
+  });
+
+  it('rejects a compaction written after the match, including a terminal one', () => {
+    // PR #948 review round 2, captured against SDK 0.3.278 / CLI 2.1.278: a
+    // terminal compact_boundary is nobody's parent, so the chain walk never
+    // reaches it, but the resume loads the summary and not the batch.
+    const terminal = { type: 'system', subtype: 'compact_boundary', uuid: 'k', parentUuid: 'x', timestamp: at(90) };
+    expect(has([user('a', null, 'ROOT', -60_000), user('x', 'a', PROMPT, 5), terminal])).toBe(false);
+  });
+
+  it('rejects a sidechain entry that reuses a main-conversation uuid', () => {
+    // Same review: the sidechain copy shadows the batch on resume, and skipping
+    // sidechains before the duplicate check let it through.
+    const shadow = user('x', 'a', 'SIDE', 40, { isSidechain: true });
+    expect(
+      has([user('a', null, 'ROOT', -60_000), user('x', 'a', PROMPT, 5), shadow, assistant('z', 'x', 100)]),
+    ).toBe(false);
+  });
+
+  it('refuses a non-boolean isSidechain rather than reading it as main conversation', () => {
+    // PR #948 review round 3: the SDK excluded entries marked "true" or 1, so
+    // treating them as main conversation pointed at a batch the resume omits.
+    expect(has([user('a', null, 'ROOT', -60_000), user('x', 'a', PROMPT, 5, { isSidechain: 'true' })])).toBe(false);
+    expect(has([user('a', null, 'ROOT', -60_000), user('x', 'a', PROMPT, 5, { isSidechain: 1 })])).toBe(false);
   });
 
   it('answers false for a missing file, an empty prompt, or an unrecorded prompt', () => {
