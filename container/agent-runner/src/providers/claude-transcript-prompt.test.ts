@@ -161,6 +161,13 @@ describe('transcriptContainsUserText', () => {
     ).toBe(false);
   });
 
+  it('refuses a non-boolean isSidechain rather than reading it as main conversation', () => {
+    // PR #948 review round 3: the SDK excluded entries marked "true" or 1, so
+    // treating them as main conversation pointed at a batch the resume omits.
+    expect(has([user('a', null, 'ROOT', -60_000), user('x', 'a', PROMPT, 5, { isSidechain: 'true' })])).toBe(false);
+    expect(has([user('a', null, 'ROOT', -60_000), user('x', 'a', PROMPT, 5, { isSidechain: 1 })])).toBe(false);
+  });
+
   it('answers false for a missing file, an empty prompt, or an unrecorded prompt', () => {
     expect(transcriptContainsUserText(path.join(dir, 'nope.jsonl'), PROMPT, T0)).toBe(false);
     expect(transcriptContainsUserText(write([user('c', null, PROMPT, 5)]), '', T0)).toBe(false);
