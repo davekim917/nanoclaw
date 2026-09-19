@@ -8,7 +8,9 @@ import {
   mergeWorkgroupAndGroupSecrets,
   resolveSecretUuids,
   slackUserTokenSecrets,
+  typesafeKeyPlaceholderEnv,
   __resetCachesForTest,
+  __setSecretsCacheForTest,
   __test,
 } from './onecli-secrets.js';
 
@@ -882,5 +884,49 @@ describe('#319 review r2 — cold-cache stampede', () => {
     // spawn for a secret that exists.
     await expect(resolveSecretUuids(['Added-Late'])).resolves.toEqual(['eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee']);
     expect(listings).toBe(2);
+  });
+});
+
+describe('typesafeKeyPlaceholderEnv — gated on the api.typesafe.ai grant', () => {
+  const typesafe = {
+    id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+    name: 'TypeSafe',
+    type: 'generic',
+    hostPattern: 'api.typesafe.ai',
+    pathPattern: null,
+  };
+  const other = {
+    id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+    name: 'Pocket',
+    type: 'generic',
+    hostPattern: 'public.heypocketai.com',
+    pathPattern: null,
+  };
+  beforeEach(() => __setSecretsCacheForTest([typesafe, other] as never));
+
+  test('a Claude container granted TypeSafe gets a placeholder key', () => {
+    expect(typesafeKeyPlaceholderEnv('claude', ['Pocket', 'TypeSafe'])).toEqual([
+      '-e',
+      'TYPESAFE_API_KEY=onecli-gateway-injected',
+    ]);
+  });
+
+  test('a grant by UUID counts the same as by name', () => {
+    expect(typesafeKeyPlaceholderEnv('claude', [typesafe.id])).toHaveLength(2);
+  });
+
+  test("no TypeSafe grant, no key: the plugin never sends that group's text", () => {
+    expect(typesafeKeyPlaceholderEnv('claude', ['Pocket'])).toEqual([]);
+    expect(typesafeKeyPlaceholderEnv('claude', [])).toEqual([]);
+  });
+
+  test('non-Claude providers never get it', () => {
+    expect(typesafeKeyPlaceholderEnv('codex', ['TypeSafe'])).toEqual([]);
+    expect(typesafeKeyPlaceholderEnv('opencode', ['TypeSafe'])).toEqual([]);
+  });
+
+  test('a cold cache yields no key (safe fallback, not a throw)', () => {
+    __resetCachesForTest();
+    expect(typesafeKeyPlaceholderEnv('claude', ['TypeSafe'])).toEqual([]);
   });
 });

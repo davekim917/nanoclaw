@@ -235,6 +235,10 @@ export function claudeSpawnEnv(
     `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=${CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH}`,
     '-e',
     `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=${CLAUDE_MAX_CONCURRENT_SUBAGENTS}`,
+    // Loads `~/plugins` function-hook plugins (fast-jev-compaction today).
+    // A group opts out with container.json `excludePlugins`, like any plugin.
+    '-e',
+    'CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1',
   );
   return env;
 }

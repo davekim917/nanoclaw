@@ -124,6 +124,7 @@ import {
   ensureOnecliAgent,
   mergeWorkgroupAndGroupSecrets,
   slackUserTokenSecrets,
+  typesafeKeyPlaceholderEnv,
 } from './onecli-secrets.js';
 import {
   reconcileWorkgroupMemory,
@@ -7137,6 +7138,7 @@ async function buildContainerArgs(
       });
       await applyOnecliSecrets(identity, effectiveSecrets);
       effectiveIdentifier = identity;
+      args.push(...typesafeKeyPlaceholderEnv(provider, effectiveSecrets));
     }
     // Instrumented + retried once for the proved-transient class; see
     // `src/onecli-apply.ts` for why one retry and why only for that class.
