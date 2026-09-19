@@ -127,16 +127,22 @@ d() { jq -r "$1" <<<"$DATA"; }
 calls() { grep -c "^$1 " "$FAKE_LOG" || true; }
 jrn() { jq -s -c "$1" "$OUT/journal.ndjson"; }
 
-# --- kill switch: unset mode does nothing -----------------------------------
+# --- kill switch: explicit off does nothing; unset defaults to shadow ------
 new_case off
-write_env ""
+write_env off
 fire
-[ "$(d .mode)" = off ] && [ "$(d .stepped)" = false ] || fail "unset SMOKE_CONTROLLER_MODE must be off: $DATA"
+[ "$(d .mode)" = off ] && [ "$(d .stepped)" = false ] || fail "SMOKE_CONTROLLER_MODE=off must do nothing: $DATA"
 [ ! -e "$OUT" ] || fail "mode off must not create the out-dir"
 write_env live
 fire
 [ "$(d .stepped)" = false ] && d .skipped | grep -q unsupported || fail "an unknown mode is refused: $DATA"
 [ ! -s "$FAKE_LOG" ] || fail "mode off/unsupported must call nothing: $(cat "$FAKE_LOG")"
+
+# --- default: unset mode runs shadow -----------------------------------------
+new_case default-on
+write_env ""
+fire
+[ "$(d .mode)" = shadow ] && [ "$(d .stepped)" = true ] || fail "unset SMOKE_CONTROLLER_MODE must default to shadow: $DATA"
 
 # --- first fire: init once, no claims, no fetches ----------------------------
 new_case init
