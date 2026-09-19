@@ -1901,6 +1901,9 @@ export function discoverPlugins(
       continue;
     }
     for (const sub of subs) {
+      // `<repo>/deprecated/` holds retired plugins kept for reference; the host
+      // skill discovery skips it too (src/plugin-skill-discovery.ts:518).
+      if (sub === 'deprecated') continue;
       const subPath = path.join(repoPath, sub);
       const subRel = `${entry}/${sub}`;
       if (isExcludedPluginPath(subRel, excluded)) continue;

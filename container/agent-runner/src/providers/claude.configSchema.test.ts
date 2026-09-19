@@ -234,6 +234,21 @@ describe('Claude plugin discovery', () => {
     }
   });
 
+  it('never loads a retired plugin under <repo>/deprecated/', () => {
+    const pluginsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-plugin-deprecated-'));
+    try {
+      const live = path.join(pluginsRoot, 'bootstrap', 'plugins', 'wwbd');
+      const retired = path.join(pluginsRoot, 'bootstrap', 'deprecated', 'bootstrap-commands');
+      for (const dir of [live, retired]) {
+        fs.mkdirSync(path.join(dir, '.claude-plugin'), { recursive: true });
+        fs.writeFileSync(path.join(dir, '.claude-plugin', 'plugin.json'), '{"name":"x"}');
+      }
+      expect(discoverPlugins(pluginsRoot).plugins).toEqual([{ type: 'local', path: live }]);
+    } finally {
+      fs.rmSync(pluginsRoot, { recursive: true, force: true });
+    }
+  });
+
   it('gives a declared Bootstrap Bash-email guard sole ownership of the gate', () => {
     const pluginsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-plugin-owner-'));
     const originalPluginsRoot = process.env.CLAUDE_PLUGINS_ROOT;
