@@ -346,7 +346,7 @@
 "container/agent-runner/src/providers/claude.recorded.test.ts":{"diff":201,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/providers/claude.rotate.test.ts":{"diff":20,"mode":"100644","sha256":"8db333aaa34ebb463e996435129181a3f50b0c7b173be79b6ba637aea7229a54"},
 "container/agent-runner/src/providers/claude.tool-collisions.test.ts":{"diff":32,"mode":"100644","sha256":null,"deleted":true},
-"container/agent-runner/src/providers/claude.ts":{"diff":3426,"mode":"100644","sha256":"6a468eafd28eb46281c063d1fa6019e00476776982cb630a11135e448f0473bf"},
+"container/agent-runner/src/providers/claude.ts":{"diff":3430,"mode":"100644","sha256":"74192ca6b149f847befe6fc4603e0cb5c53df4ed35206347f9c9db89c96cc548"},
 "container/agent-runner/src/providers/cwd-shim.test.ts":{"diff":0,"mode":"100644","sha256":"511df68ac4475c09abdbb2765f2010cc885dc0a91efa518630bcd0f98dfb271b"},
 "container/agent-runner/src/providers/cwd-shim.ts":{"diff":5,"mode":"100644","sha256":"54d8b2efebab1d773e236f887744c14c41902e4cb94c372e349fa7c74cf4e773"},
 "container/agent-runner/src/providers/factory.test.ts":{"diff":75,"mode":"100644","sha256":"7db6305adf2e14daee71bb0e29b6c884dc8fdd60446dbabb1fb7139f734f3dda"},
