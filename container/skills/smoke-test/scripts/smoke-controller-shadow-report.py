@@ -25,6 +25,12 @@ intents or two effect decisions for one key+attempt), false GO, escalations
     failed check (the spec's "or any validation check failed");
   - a campaign with no collected actuals is scored `incomplete`, and the bar
     it feeds reads UNKNOWN, never PASS;
+  - duplicates are scanned over every shadow journal and decision record in
+    the window, active and stuck campaigns included, not only finished ones;
+  - verdict agreement: actual non-GO -> controller GO is false GO (FAIL);
+    actual GO -> controller non-GO is expected under the stricter GO rule but
+    must name its failed check (none named: FAIL), and every such mismatch
+    turns an otherwise-passing report into `pass: "needs-review"`;
   - fire health comes from the wrapper's fires.ndjson: hard errors (controller
     rc != 0), journal errors, decision-less fires, and any re-init after the
     first (a journal treated as empty).
@@ -357,6 +363,85 @@ def bar(ok, unknown=False):
     return "UNKNOWN" if unknown else ("PASS" if ok else "FAIL")
 
 
+def window_duplicates(shadow_dir, journal, since, until):
+    """Controller-caused duplicates over EVERY shadow record in the window,
+    not just finished campaigns: a stuck or still-active campaign counts too.
+    Same two rules as the replay (smoke-campaign-replay.py:494-509): a second
+    plain intent for one key+attempt, or a second effect decision for one
+    type+key+attempt that was not a post-reconcile marker search. A repeat
+    counts when the repeating record falls inside the window."""
+    def inside(rec):
+        t = parse_iso(rec.get("at"))
+        return t is not None and t >= since and (until is None or t <= until)
+
+    by_run = {}
+    seen, intents = set(), 0
+    for r in journal:
+        if r.get("_unparsable") or r.get("state") != "intent":
+            continue
+        det = r.get("detail") or {}
+        if det.get("ambiguous") or det.get("overdue") or det.get("outcome"):
+            continue
+        k = (r.get("key"), r.get("attempt", 1))
+        if k in seen and inside(r):
+            intents += 1
+            by_run[r.get("runId")] = by_run.get(r.get("runId"), 0) + 1
+        seen.add(k)
+    effects = 0
+    try:
+        entries = sorted(os.listdir(shadow_dir))
+    except OSError:
+        entries = []
+    for run_id in entries:
+        path = os.path.join(shadow_dir, run_id, "decisions.ndjson")
+        if run_id == "wrapper" or not os.path.isfile(path):
+            continue
+        eff = set()
+        for d in read_ndjson(path):
+            if d.get("_unparsable") or not d.get("effect") or d.get("afterReconcile"):
+                continue
+            k = (d.get("type"), d.get("key") or d.get("verb") or d.get("slot"), d.get("attempt", 1))
+            if k in eff and inside(d):
+                effects += 1
+                by_run[run_id] = by_run.get(run_id, 0) + 1
+            eff.add(k)
+    return {"intents": intents, "effects": effects, "byRun": by_run}
+
+
+def overall(bars):
+    """True only when every bar PASSes; "needs-review" when the only non-PASS
+    bars are NEEDS_REVIEW (every hard bar holds, a human reads the listed
+    mismatches); False on any FAIL or UNKNOWN."""
+    results = {b["result"] for b in bars.values()}
+    if results <= {"PASS"}:
+        return True
+    if results <= {"PASS", "NEEDS_REVIEW"}:
+        return "needs-review"
+    return False
+
+
+def verdict_agreement(rows):
+    """Controller vs real verdict, for mismatches that are not a false GO
+    (that is its own hard bar). The controller's GO rule is deliberately
+    stricter than today's coordinator, so an actual GO the controller holds
+    at BLOCKED/NO_GO is expected -- but only with the failed check it named
+    (its finish decision's failedChecks, smoke-campaign-controller.py:569-624).
+    Unexplained: FAIL. Explained, or any other non-GO mismatch: a human reads
+    it (NEEDS_REVIEW)."""
+    unexplained, review = [], []
+    for r in rows:
+        if not r["verdictMismatch"] or r["controllerVerdict"] == "GO":
+            continue
+        checks = [c for c in (r.get("failedChecks") or []) if isinstance(c, str) and c.strip()]
+        item = {"runId": r["runId"], "actual": r["actualVerdict"], "controller": r["controllerVerdict"],
+                "failedChecks": checks}
+        (unexplained if r["actualVerdict"] == "GO" and not checks else review).append(item)
+    result = "FAIL" if unexplained else ("NEEDS_REVIEW" if review else "PASS")
+    return {"value": len(unexplained) + len(review), "unexplained": unexplained, "needsReview": review,
+            "want": "0 unexplained; every GO the controller withholds names its failed check",
+            "result": result}
+
+
 def report(args):
     replay = load_replay()
     since = parse_iso(args.since)
@@ -380,7 +465,8 @@ def report(args):
     incomplete = [r["runId"] for r in rows if r["incomplete"]]
     missed = sorted("{}:{}".format(r["runId"], o) for r in rows for o in r["missedObligations"])
     missed += sorted("{}:issues x{}".format(r["runId"], r["issuesMissed"]) for r in rows if r["issuesMissed"])
-    dups = sum(r["duplicateIntents"] + r["duplicateEffects"] for r in rows)
+    dup_scan = window_duplicates(args.shadow_dir, journal, since, until)
+    dups = dup_scan["intents"] + dup_scan["effects"]
     false_go = [r["runId"] for r in rows if r["falseGo"]]
     turn_rows = [r for r in rows if r["actualCoordinatorTurns"] is not None]
     turns = sum(r["actualCoordinatorTurns"] for r in turn_rows)
@@ -391,8 +477,11 @@ def report(args):
     bars = {
         "missedObligations": {"value": len(missed), "detail": missed, "want": 0,
                               "result": bar(not missed, unknown=bool(incomplete) and not missed)},
-        "controllerCausedDuplicates": {"value": dups, "want": 0, "result": bar(dups == 0)},
+        "controllerCausedDuplicates": {"value": dups, "intents": dup_scan["intents"], "effects": dup_scan["effects"],
+                                       "byRun": dup_scan["byRun"], "scope": "every shadow record in the window",
+                                       "want": 0, "result": bar(dups == 0)},
         "falseGo": {"value": len(false_go), "detail": false_go, "want": 0, "result": bar(not false_go)},
+        "verdictAgreement": verdict_agreement(rows),
         "journalTreatedAsEmpty": {"value": health["reinitsAfterFirst"], "want": 0,
                                   "result": bar(health["reinitsAfterFirst"] == 0)},
         "coordinationReduction": {"value": None if reduction is None else round(reduction, 3),
@@ -409,7 +498,7 @@ def report(args):
     }
     out = {
         "window": [iso(since), iso(until) if until else None],
-        "pass": all(b["result"] == "PASS" for b in bars.values()),
+        "pass": overall(bars),
         "bars": bars, "fireHealth": health, "incompleteActuals": incomplete,
         "controllerGo": sum(r["controllerVerdict"] == "GO" for r in rows),
         "verdictMismatches": sorted("{} {}->{}".format(r["runId"], r["actualVerdict"], r["controllerVerdict"])
@@ -432,8 +521,9 @@ def report(args):
 def render_md(out):
     b = out["bars"]
     lines = ["# Controller shadow report", "",
-             "Window {} .. {}. Overall: **{}**.".format(out["window"][0], out["window"][1] or "now",
-                                                        "PASS" if out["pass"] else "NOT PASSING"), "",
+             "Window {} .. {}. Overall: **{}**.".format(
+                 out["window"][0], out["window"][1] or "now",
+                 {True: "PASS", "needs-review": "NEEDS REVIEW"}.get(out["pass"], "NOT PASSING")), "",
              "| Bar | Value | Want | Result |", "|---|---|---|---|"]
     cr = b["coordinationReduction"]
     rows = [
@@ -441,6 +531,8 @@ def render_md(out):
         ("Controller-caused duplicates", b["controllerCausedDuplicates"]["value"], "0",
          b["controllerCausedDuplicates"]["result"]),
         ("Would-be false GO", b["falseGo"]["value"], "0", b["falseGo"]["result"]),
+        ("Verdict mismatches (non-GO controller)", b["verdictAgreement"]["value"], "0 unexplained",
+         b["verdictAgreement"]["result"]),
         ("Journal treated as empty", b["journalTreatedAsEmpty"]["value"], "0", b["journalTreatedAsEmpty"]["result"]),
         ("Coordination wakes vs coordinator turns",
          "{} vs {} ({} avoided, {})".format(cr["controllerCoordinationWakes"], cr["actualCoordinatorTurns"],
@@ -461,8 +553,17 @@ def render_md(out):
                   " (their missed-obligation count is a floor)."]
     if b["missedObligations"]["detail"]:
         lines += ["", "Missed: " + ", ".join(b["missedObligations"]["detail"])]
-    if out["verdictMismatches"]:
-        lines += ["", "Verdict mismatches: " + ", ".join(out["verdictMismatches"])]
+    va = b["verdictAgreement"]
+    for label, items in (("Unexplained (controller named no failed check)", va["unexplained"]),
+                         ("For review", va["needsReview"])):
+        if items:
+            lines += ["", "{}:".format(label)]
+            lines += ["- {} {} -> {}: {}".format(i["runId"], i["actual"], i["controller"],
+                                                 "; ".join(i["failedChecks"]) or "no failed check named")
+                      for i in items]
+    if b["controllerCausedDuplicates"]["byRun"]:
+        lines += ["", "Duplicates by run: " + ", ".join("{} x{}".format(k, v) for k, v in
+                                                        sorted(b["controllerCausedDuplicates"]["byRun"].items()))]
     lines += ["", "| Campaign | Actual | Controller | Finished by | Missed | Escalations | Turns | Owner wakes |",
               "|---|---|---|---|---|---|---|---|"]
     for r in out["campaigns"]:

@@ -5,8 +5,11 @@
 # are traps that must never run. Covers: kill switch, one-time init (a lost
 # journal is never re-created), the synthesized claiming wake, input-fetch
 # failure -> decision-less fire, budget overrun (a hanging gh), ncl only for a
-# bare dispatch intent, the counterfactual hold, the no-wake last line, and
-# "no write outside the out-dir".
+# bare non-ambiguous dispatch intent, the counterfactual hold, the no-wake last
+# line, "no write outside the out-dir", symlinked out-dir / wrapper dir / *.tmp
+# / fires.ndjson (and a hard-linked fires.ndjson), config read as data (exit,
+# hang and non-literal lines), a hung worker hard-killed inside its budget, and
+# budget validation ("08", 0, 1e3, 200, -5 rejected; 110 is the cap).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -195,6 +198,13 @@ jq -e '.[0].name == "ctl-deadbeef-0a1b" and .[0].id == "ctl-deadbeef-0a1b"' "$OU
   || fail "series ids are passed as task names: $(cat "$OUT/wrapper/inputs/tasks.json")"
 fire FAKE_NCL=fail
 [ "$(d .skipped)" = "input fetch failed" ] || fail "ncl failure is decision-less: $DATA"
+# Once the controller has marked the intent ambiguous (smoke-campaign-controller.py:863-866)
+# it never reconciles from tasks again, so ncl (and its transport writes) stop.
+jq -cn --arg run "$RUN" --arg k "$k" '{v:1,at:"2026-09-18T10:06:00Z",fire:"f",runId:$run,kind:"dispatch",slot:"critic",
+  key:$k,state:"intent",attempt:1,mode:"shadow",detail:{ambiguous:true}}' >>"$OUT/journal.ndjson"
+: >"$FAKE_LOG"
+fire
+[ "$(calls ncl)" = 0 ] || fail "an ambiguous intent needs no ncl read: $(cat "$FAKE_LOG")"
 
 # --- counterfactual hold: a just-finished run still looks active -------------
 new_case hold
@@ -238,6 +248,85 @@ write_env shadow
 fire
 d .skipped | grep -q "overlaps the gate state dir" || fail "out-dir overlapping gate state is refused: $DATA"
 [ ! -e "$OUT" ] || fail "refused overlap must not create the out-dir"
+
+# --- symlinks inside or at the out-dir are never followed ---------------------
+new_case sym-out
+mkdir -p "$C/elsewhere"
+ln -s "$C/elsewhere" "$OUT"
+fire
+d .skipped | grep -q "out-dir refused" || fail "a symlinked out-dir is refused: $DATA"
+[ -z "$(ls -A "$C/elsewhere")" ] || fail "nothing is written through a symlinked out-dir: $(ls -A "$C/elsewhere")"
+[ "$(calls gh)" = 0 ] || fail "a refused out-dir runs nothing"
+
+new_case sym-wrap
+mkdir -p "$C/elsewhere" "$OUT"
+ln -s "$C/elsewhere" "$OUT/wrapper"
+fire
+d .skipped | grep -q "out-dir refused" || fail "a symlinked wrapper dir is refused: $DATA"
+[ -z "$(ls -A "$C/elsewhere")" ] || fail "nothing is written through a symlinked wrapper dir"
+[ ! -e "$OUT/journal.ndjson" ] || fail "a refused wrapper dir must stop the fire before init"
+
+new_case sym-files
+claim; contract
+fire
+[ "$(d .stepped)" = true ] || fail "setup fire steps: $DATA"
+echo victim >"$C/victim"
+echo victim >"$C/victim-log"
+ln -s "$C/victim" "$OUT/wrapper/inputs/pr-heads.json.tmp"
+ln -s "$C/victim" "$OUT/wrapper/claims-seen.json.tmp"
+ln -sfn "$C/victim" "$OUT/wrapper/inputs/tasks.json"
+mv "$OUT/wrapper/fires.ndjson" "$T/fires.keep"
+ln -s "$C/victim-log" "$OUT/wrapper/fires.ndjson"
+fire
+[ "$(cat "$C/victim")" = victim ] && [ "$(cat "$C/victim-log")" = victim ] \
+  || fail "a write followed a planted symlink: $(cat "$C/victim" "$C/victim-log")"
+[ "$(d .stepped)" = true ] || fail "planted *.tmp / target symlinks are replaced, not fatal: $DATA"
+[ -f "$OUT/wrapper/inputs/pr-heads.json" ] && [ ! -L "$OUT/wrapper/inputs/pr-heads.json" ] \
+  && [ ! -L "$OUT/wrapper/inputs/tasks.json" ] || fail "inputs are regular files after the fire"
+[ -L "$OUT/wrapper/fires.ndjson" ] && d .fireLogError | grep -qi "refusing" \
+  || fail "a symlinked fires.ndjson is refused (not followed, not replaced) and reported: $DATA"
+rm "$OUT/wrapper/fires.ndjson"
+# A hard link to an outside file is refused too (controller's single-link rule).
+ln "$C/victim-log" "$OUT/wrapper/fires.ndjson"
+fire
+[ "$(cat "$C/victim-log")" = victim ] && d .fireLogError | grep -q "hard links" \
+  || fail "a hard-linked fires.ndjson is refused: $DATA"
+
+# --- config is data: exit / hang / non-literal lines cannot take over ---------
+new_case cfg-exit
+{ echo 'exit 0'; echo 'sleep 300'; echo 'while :; do :; done'; cat "$C/env.sh"; } >"$C/env2.sh"
+mv "$C/env2.sh" "$C/env.sh"
+fire
+[ "$ELAPSED" -le 10 ] || fail "config lines must not execute (took ${ELAPSED}s)"
+[ "$(d .mode)" = shadow ] && [ "$(d .stepped)" = true ] || fail "exit/sleep lines are ignored, exports still read: $DATA"
+echo 'export SMOKE_GATE_STATE_DIR="$HOME/elsewhere"' >>"$C/env.sh"
+fire
+[ "$(d .stepped)" = false ] && [ "$(d '.refusedKeys[0]')" = SMOKE_GATE_STATE_DIR ] \
+  || fail "a non-literal value for a used key skips the fire: $DATA"
+
+# --- the hard wall clock: a hung worker still ends with the line -------------
+new_case hang
+fire SMOKE_CONTROLLER_SHADOW_TEST_HANG=1 SMOKE_CONTROLLER_SHADOW_BUDGET_SECONDS=8
+[ "$ELAPSED" -le 10 ] || fail "a hung worker overran an 8s budget: ${ELAPSED}s"
+[ "$(d .skipped)" = "fire exceeded its budget and was killed" ] || fail "hung worker: $DATA"
+tail -1 "$OUT/wrapper/fires.ndjson" | jq -e '.skipped == "fire exceeded its budget and was killed"' >/dev/null \
+  || fail "the killed fire is logged"
+fire SMOKE_CONTROLLER_SHADOW_TEST_HANG=ignore-term SMOKE_CONTROLLER_SHADOW_BUDGET_SECONDS=8
+[ "$ELAPSED" -le 11 ] || fail "a SIGTERM-proof worker must be SIGKILLed by budget+2: ${ELAPSED}s"
+[ "$(d .rc)" = 137 ] && [ "$(d .skipped)" = "fire exceeded its budget and was killed" ] || fail "SIGKILLed worker: $DATA"
+
+# --- budget validation: decimal 1..110 only ----------------------------------
+new_case budget
+for b in 08 0 1e3 200 -5; do
+  fire SMOKE_CONTROLLER_SHADOW_BUDGET_SECONDS="$b"
+  [ "$(d .budgetRejected)" = "$b" ] && [ "$(d .budgetSeconds)" = 100 ] && [ "$(d .stepped)" = true ] \
+    || fail "budget $b must be rejected for the 100s default: $DATA"
+  [ "$ELAPSED" -le 100 ] || fail "budget $b fire overran"
+done
+fire SMOKE_CONTROLLER_SHADOW_BUDGET_SECONDS=110
+[ "$(d .budgetRejected)" = null ] && [ "$(d .stepped)" = true ] || fail "110 is the accepted cap: $DATA"
+grep -q '^BUDGET_MAX=110$' "$W" && grep -q 'timeout -k 2 "\$BUDGET"' "$W" \
+  || fail "hard kill must land by 110 + 2 s, under the runner's 120 s"
 
 # --- default out-dir: a sibling of the run root ------------------------------
 new_case default-out

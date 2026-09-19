@@ -134,6 +134,79 @@ jq -e '.fireHealth | .fires == 4 and .hardErrors == 1 and .journalErrors == 1 an
   || fail "fire health: $(jq -c .fireHealth "$T/r.json")"
 rm "$T/shadow/wrapper/fires.ndjson"
 
+# (f) duplicates are scanned over every shadow record in the window, including
+# a campaign the gate never finished (still active or stuck).
+ACTIVE=xzo-pr-pr9999-aaaaaaaaaaaa-20260910T000000Z
+mkdir -p "$T/shadow/$ACTIVE"
+{
+  eff='"type":"send","class":"mechanical","reason":"r","key":"kA","effect":"shadow_refused","attempt":1,"runId":"'"$ACTIVE"'","fire":"f"'
+  echo "{$eff,\"at\":\"2026-08-01T00:00:00Z\"}"   # before the window: first sighting only
+  echo "{$eff,\"at\":\"2026-09-10T00:00:00Z\"}"   # repeat inside the window: counts
+  echo "{$eff,\"at\":\"2026-09-10T00:10:00Z\",\"afterReconcile\":true}"  # marker search: never a duplicate
+} >"$T/shadow/$ACTIVE/decisions.ndjson"
+for at in 2026-09-10T00:00:00Z 2026-09-10T00:10:00Z; do
+  echo '{"v":1,"at":"'"$at"'","fire":"f","runId":"'"$ACTIVE"'","kind":"send","slot":"root","key":"kB","state":"intent","attempt":1,"mode":"shadow"}' \
+    >>"$T/shadow/journal.ndjson"
+done
+report
+jq -e --arg run "$ACTIVE" '.bars.controllerCausedDuplicates | .value == 2 and .intents == 1 and .effects == 1
+  and .byRun[$run] == 2 and .result == "FAIL"' "$T/r.json" >/dev/null \
+  || fail "duplicates in an unfinished campaign must count: $(rj '.bars.controllerCausedDuplicates')"
+[ "$(rj '.campaigns | length')" = 4 ] || fail "an unfinished campaign is scanned for duplicates, not scored"
+rm -rf "$T/shadow/${ACTIVE:?}"
+cp "$T/journal.bak" "$T/shadow/journal.ndjson"
+report
+# The corpus itself has one: pr1968 was GO, and the stricter controller holds
+# it at BLOCKED naming its open gap and finding -- listed for review.
+jq -e --arg run "$RUN1968" '.bars.verdictAgreement | .result == "NEEDS_REVIEW" and (.unexplained | length) == 0
+  and (.needsReview | length) == 1 and .needsReview[0].runId == $run and (.needsReview[0].failedChecks | length) > 0' \
+  "$T/r.json" >/dev/null || fail "corpus GO->BLOCKED is listed with its named checks: $(rj '.bars.verdictAgreement')"
+
+# (g) verdict agreement under the stricter GO rule
+ctl_verdict() { # runId verdict failedChecksJson
+  echo '{"v":1,"at":"2026-09-18T20:00:00Z","fire":"f","runId":"'"$1"'","kind":"gate","slot":"finish","key":"inj-'"$1"'","state":"done","attempt":1,"mode":"shadow","detail":{"verdict":"'"$2"'"}}' \
+    >>"$T/shadow/journal.ndjson"
+  cp "$T/shadow/$1/decisions.ndjson" "$T/dec-$1.bak"
+  echo '{"type":"finish","class":"mechanical","reason":"x","verdict":"'"$2"'","failedChecks":'"$3"',"runId":"'"$1"'","at":"2026-09-18T20:00:00Z","fire":"f"}' \
+    >>"$T/shadow/$1/decisions.ndjson"
+}
+restore() { cp "$T/journal.bak" "$T/shadow/journal.ndjson"; cp "$T/dec-$1.bak" "$T/shadow/$1/decisions.ndjson"; }
+# g1: actual GO, controller BLOCKED naming its failed check -> listed, NEEDS_REVIEW
+ctl_verdict "$RUN1968" BLOCKED '["pr head unverified (no current PR head supplied)"]'
+report
+jq -e --arg run "$RUN1968" '.bars.verdictAgreement | .result == "NEEDS_REVIEW" and (.unexplained | length) == 0
+  and .needsReview == [{"runId":$run,"actual":"GO","controller":"BLOCKED","failedChecks":["pr head unverified (no current PR head supplied)"]}]' \
+  "$T/r.json" >/dev/null || fail "named GO->BLOCKED is listed for review: $(rj '.bars.verdictAgreement')"
+grep -q "$RUN1968 GO -> BLOCKED: pr head unverified" "$T/r.md" || fail "markdown lists the reviewed mismatch"
+[ "$(rj '.bars.falseGo.result')" = PASS ] || fail "GO->BLOCKED is not a false GO"
+restore "$RUN1968"
+# g2: actual GO, controller BLOCKED naming nothing -> FAIL
+ctl_verdict "$RUN1968" BLOCKED '[]'
+report
+jq -e --arg run "$RUN1968" '.bars.verdictAgreement | .result == "FAIL" and .unexplained[0].runId == $run' "$T/r.json" \
+  >/dev/null || fail "unexplained GO->BLOCKED fails: $(rj '.bars.verdictAgreement')"
+grep -q "no failed check named" "$T/r.md" || fail "markdown flags the unexplained mismatch"
+restore "$RUN1968"
+# g3: actual non-GO, controller GO -> false GO (hard FAIL), not a review item
+ctl_verdict "$RUN1606" GO '[]'
+report
+jq -e --arg run "$RUN1606" '.bars.falseGo.result == "FAIL" and .bars.falseGo.detail == [$run]
+  and ([.bars.verdictAgreement.needsReview[], .bars.verdictAgreement.unexplained[] | select(.runId == $run)] | length) == 0
+  and .pass == false' "$T/r.json" >/dev/null \
+  || fail "non-GO -> GO is a false GO: $(jq -c '.bars.falseGo, .bars.verdictAgreement' "$T/r.json")"
+restore "$RUN1606"
+# The overall rule: NEEDS_REVIEW alone gives "needs-review"; any FAIL/UNKNOWN gives false.
+python3 - "$REP" <<'PY' || fail "overall pass rule"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("rep", sys.argv[1])
+rep = importlib.util.module_from_spec(spec); spec.loader.exec_module(rep)
+b = lambda *rs: {str(i): {"result": r} for i, r in enumerate(rs)}
+assert rep.overall(b("PASS", "PASS")) is True
+assert rep.overall(b("PASS", "NEEDS_REVIEW")) == "needs-review"
+assert rep.overall(b("NEEDS_REVIEW", "FAIL")) is False
+assert rep.overall(b("PASS", "UNKNOWN")) is False
+PY
+
 # --- collect: gh, outbound.db, transcripts, owner steps ----------------------
 C="$T/collect"
 RUN=demo-pr-pr7-aaaaaaaaaaaa-20260918T100000Z
