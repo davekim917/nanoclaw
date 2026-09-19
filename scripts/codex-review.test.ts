@@ -105,6 +105,13 @@ if [ "$1" = pr ]; then
   fi
   exit 0
 fi
+# gh api user: the account the gate runs as, MOCK_GH_USER; unset = the read fails.
+if [ "$1" = api ] && [ "$2" = user ]; then
+  printf 'api user\\n' >> "$MOCK_CALLS"
+  [ -n "\${MOCK_GH_USER:-}" ] || { echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1; }
+  echo "$MOCK_GH_USER"
+  exit 0
+fi
 rest=""
 for arg in "$@"; do
   case "$arg" in repos/*) rest="$arg" ;; esac
@@ -200,6 +207,20 @@ if [ -n "$rest" ]; then
       printf '{"ref":"refs/heads/%s","object":{"sha":"%s","type":"commit"}}\\n' "$branch" "$(cat "$target")"
       exit 0
       ;;
+    */rules/branches/*)
+      # rules--<branch>.json is the branch's active rules. Absent = the read fails.
+      branch="\${rest##*/rules/branches/}"
+      [ -f "$MOCK_DIR/rules--$branch.json" ] || { echo '{"message":"Not Found","status":"404"}'; echo 'gh: Not Found (HTTP 404)' >&2; exit 1; }
+      printf '['; cat "$MOCK_DIR/rules--$branch.json"; printf ']'
+      exit 0
+      ;;
+    */branches/*/protection)
+      # protection.json = classic protection is on; absent = GitHub's "Branch not protected" 404.
+      if [ -f "$MOCK_DIR/protection.json" ]; then cat "$MOCK_DIR/protection.json"; exit 0; fi
+      echo '{"message":"Branch not protected","status":"404"}'
+      echo 'gh: Branch not protected (HTTP 404)' >&2
+      exit 1
+      ;;
     */compare/*)
       # compare--<base>...<head>.json is the comparison of exactly those two. Absent = the read fails.
       basehead="\${rest#*/compare/}"
@@ -239,6 +260,7 @@ done
 case "$query" in
   *userContentEdits*) connection=audit ;;
   *statusCheckRollup*) connection=rollup ;;
+  *adminReadiness*) connection=adminReadiness ;;
   *reviewThreads*) connection=reviewThreads ;;
   *reviews*) connection=reviews ;;
   *reactions*) connection=reactions ;;
@@ -452,8 +474,10 @@ function workflowRun(
   };
 }
 
-function commitStatus(context: string, state: string, createdAt = '2026-09-05T00:02:00Z'): Page {
-  return { id: Date.parse(createdAt) / 1000, context, state, created_at: createdAt };
+// `creator` defaults to the account runHelper allows to post host CI
+// (CODEX_REVIEW_HOST_CI_POSTERS=fleet-bot); only a CI (host) status reads it.
+function commitStatus(context: string, state: string, createdAt = '2026-09-05T00:02:00Z', creator = 'fleet-bot'): Page {
+  return { id: Date.parse(createdAt) / 1000, context, state, created_at: createdAt, creator: { login: creator } };
 }
 
 // `reviewer` defaults to an allowed model so existing approve-path fixtures
@@ -530,8 +554,8 @@ function rollupRun(name: string, status: string, conclusion: string | null, isRe
   return { __typename: 'CheckRun', name, status, conclusion, isRequired };
 }
 
-function rollupStatus(context: string, state: string, isRequired = true): Page {
-  return { __typename: 'StatusContext', context, state, isRequired };
+function rollupStatus(context: string, state: string, isRequired = true, creator = 'fleet-bot'): Page {
+  return { __typename: 'StatusContext', context, state, isRequired, creator: { login: creator } };
 }
 
 // findings_json (the gate's payload) reads totalCount, which connectionPage omits.
@@ -652,6 +676,7 @@ exit 64
       MOCK_SLEEP_LOG: sleepLog,
       REVIEW_ROUND_CAP: '',
       CODEX_REVIEW_REQUIRED_WORKFLOWS: '',
+      CODEX_REVIEW_HOST_CI_POSTERS: 'fleet-bot',
       ...env,
     },
   });
@@ -5395,6 +5420,130 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
     expect(before.stdout).toContain('ci=host');
   });
 
+  // A run is excused only when EVERY job never started: a run with one job
+  // that ran is a run that started (#931, found by an any-for-all mutation).
+  it('keeps a run red when one of its jobs started, though another never did', () => {
+    const root = tempRoot();
+    const result = mergeCheck(
+      root,
+      (r) => {
+        const run = workflowRun('CI', 'completed', 'failure');
+        writeJson(r, `jobs--${run.id as number}.json`, { total_count: 2, jobs: [actionsJob(false), actionsJob(true)] });
+        return [run];
+      },
+      [commitStatus(HOST, 'success')],
+    );
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('ci_red: CI=failure (required)');
+  });
+
+  // Each conjunct of never_started on its own: no runner id, no runner name,
+  // and no step. A job with any one of them ran.
+  it.each<[string, Page]>([
+    ['a runner id, but no runner name and no step', { runner_id: 5, runner_name: '', steps: [] }],
+    ['a runner name, but no runner id and no step', { runner_id: 0, runner_name: 'GitHub Actions 5', steps: [] }],
+    ['a step, but no runner', { runner_id: 0, runner_name: '', steps: [{ name: 'Set up job', status: 'completed' }] }],
+  ])('counts a job with %s as started, so its failure stays red', (_case, shape) => {
+    const root = tempRoot();
+    const result = mergeCheck(
+      root,
+      (r) => {
+        const run = workflowRun('CI', 'completed', 'failure');
+        writeJson(r, `jobs--${run.id as number}.json`, {
+          total_count: 1,
+          jobs: [{ ...actionsJob(false), ...shape }],
+        });
+        return [run];
+      },
+      [commitStatus(HOST, 'success')],
+    );
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('ci_red: CI=failure (required)');
+  });
+
+  // Who posted the CI (host) status (#931): a commit status is writable by any
+  // token with statuses:write, so only an allowed poster's stands in.
+  describe('who may post CI (host)', () => {
+    function mergeCheckAs(root: string, statuses: Page[], env: Record<string, string>) {
+      scopeFixture(root, { labels: [], ci: [failedRun(root, false)], statuses });
+      return runHelper(root, ['merge-check', '--head', HEAD], env);
+    }
+
+    it('refuses a CI (host) success from an account that is not an allowed poster', () => {
+      const root = tempRoot();
+      const result = mergeCheckAs(root, [commitStatus(HOST, 'success', undefined, 'someone-else')], {});
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('CI=not started (required;');
+      expect(result.stderr).toContain('no CI (host) success from fleet-bot is on this head');
+    });
+
+    it("does not let a newer success from someone else hide an allowed poster's failure", () => {
+      const root = tempRoot();
+      const result = mergeCheckAs(
+        root,
+        [
+          commitStatus(HOST, 'failure', '2026-09-05T00:02:00Z'),
+          commitStatus(HOST, 'success', '2026-09-05T00:03:00Z', 'someone-else'),
+        ],
+        {},
+      );
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('CI=not started (required;');
+    });
+
+    it('compares logins case-insensitively, as GitHub does', () => {
+      const root = tempRoot();
+      const result = mergeCheckAs(root, [commitStatus(HOST, 'success', undefined, 'Fleet-Bot')], {
+        CODEX_REVIEW_HOST_CI_POSTERS: 'FLEET-bot',
+      });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('ci=host');
+    });
+
+    it('takes the allowlist from CODEX_REVIEW_HOST_CI_POSTERS, comma-separated', () => {
+      const root = tempRoot();
+      const result = mergeCheckAs(root, [commitStatus(HOST, 'success', undefined, 'second')], {
+        CODEX_REVIEW_HOST_CI_POSTERS: 'first, second',
+      });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('ci=host');
+      expect(result.calls).not.toContain('api user');
+    });
+
+    it('defaults to the account the gate itself runs as', () => {
+      const root = tempRoot();
+      const same = mergeCheckAs(root, [commitStatus(HOST, 'success', undefined, 'gate-account')], {
+        CODEX_REVIEW_HOST_CI_POSTERS: '',
+        MOCK_GH_USER: 'gate-account',
+      });
+      expect(same.status).toBe(0);
+      expect(same.stdout).toContain('ci=host');
+      expect(same.calls).toContain('api user');
+      const other = mergeCheckAs(root, [commitStatus(HOST, 'success', undefined, 'gate-account')], {
+        CODEX_REVIEW_HOST_CI_POSTERS: '',
+        MOCK_GH_USER: 'another-account',
+      });
+      expect(other.status).toBe(24);
+    });
+
+    it('allows no one when nothing is configured and the identity cannot be read', () => {
+      const root = tempRoot();
+      const result = mergeCheckAs(root, [commitStatus(HOST, 'success')], { CODEX_REVIEW_HOST_CI_POSTERS: '' });
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('set CODEX_REVIEW_HOST_CI_POSTERS');
+    });
+
+    it('never reads the identity for a head with nothing to excuse', () => {
+      const root = tempRoot();
+      const result = mergeCheck(root, () => [workflowRun('CI', 'completed', 'success')], [
+        commitStatus(HOST, 'success'),
+      ]);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('ci=green');
+      expect(result.calls).not.toContain('api user');
+    });
+  });
+
   describe('legacy repos: a required check run GitHub never started', () => {
     const JOB = 105741202176;
     const neverRun = (): Page => ({ ...rollupRun('CI Gate', 'COMPLETED', 'FAILURE'), databaseId: JOB });
@@ -5410,8 +5559,149 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
       legacy(root, [neverRun(), rollupStatus(HOST, 'SUCCESS', false)], false);
       const result = runHelper(root, ['merge-check', '--head', HEAD]);
       expect(result.status).toBe(26);
-      expect(result.stdout).toContain('merge=defer mode=legacy ci=host:');
+      expect(result.stdout).toContain('merge=defer mode=legacy ci=host admin=');
       expect(result.stderr).toContain('required CI Gate never started on Actions');
+    });
+
+    // admin=ready is the only verdict that licenses `gh pr merge --admin`:
+    // the bypass lifts every hold, so every rule but the never-started check
+    // must already be met. XZO's shape: required CI Gate, Release policy and
+    // Release approval, and review threads that must be resolved.
+    describe('admin readiness (the --admin bypass)', () => {
+      const RULES = [
+        { type: 'deletion', parameters: null },
+        { type: 'non_fast_forward', parameters: null },
+        {
+          type: 'pull_request',
+          parameters: {
+            required_approving_review_count: 0,
+            required_review_thread_resolution: true,
+            require_extra_approval_for_unattributed_changes: true,
+            require_code_owner_review: false,
+            require_last_push_approval: false,
+            required_reviewers: [],
+          },
+        },
+        {
+          type: 'required_status_checks',
+          parameters: {
+            required_status_checks: [
+              { context: 'CI Gate' },
+              { context: 'Release policy' },
+              { context: 'Release approval' },
+            ],
+          },
+        },
+      ];
+      type Pr = { threads?: boolean[]; approvals?: string[]; unattributed?: boolean; head?: string };
+      function prPage(pr: Pr = {}): Page {
+        return {
+          data: {
+            repository: {
+              pullRequest: {
+                headRefOid: pr.head ?? HEAD,
+                author: { login: 'author' },
+                reviewThreads: {
+                  totalCount: (pr.threads ?? []).length,
+                  nodes: (pr.threads ?? []).map((isResolved) => ({ isResolved })),
+                },
+                latestOpinionatedReviews: {
+                  totalCount: (pr.approvals ?? []).length,
+                  nodes: (pr.approvals ?? []).map((login) => ({ state: 'APPROVED', author: { login } })),
+                },
+                commits: {
+                  totalCount: 1,
+                  nodes: [{ commit: { author: { user: pr.unattributed ? null : { login: 'author' } } } }],
+                },
+              },
+            },
+          },
+        };
+      }
+      const GREEN = [rollupStatus('Release policy', 'SUCCESS'), rollupStatus('Release approval', 'SUCCESS')];
+      function admin(root: string, rollup: Page[], pr: Pr = {}, rules: Page[] | null = RULES) {
+        legacy(root, [neverRun(), rollupStatus(HOST, 'SUCCESS', false), ...rollup], false);
+        fs.rmSync(path.join(root, 'rules--main.json'), { force: true });
+        if (rules !== null) writeJson(root, 'rules--main.json', rules);
+        writeJson(root, 'adminReadiness-1.json', prPage(pr));
+        return runHelper(root, ['merge-check', '--head', HEAD]);
+      }
+
+      it('is ready when the only non-green required check is the never-started one host CI covers', () => {
+        const result = admin(tempRoot(), GREEN);
+        expect(result.status).toBe(26);
+        expect(result.stdout).toContain('merge=defer mode=legacy ci=host admin=ready:');
+      });
+
+      it.each<[string, Page[], Pr, string]>([
+        [
+          'Release approval pending',
+          [rollupStatus('Release policy', 'SUCCESS'), rollupStatus('Release approval', 'PENDING')],
+          {},
+          'Release approval=pending',
+        ],
+        [
+          'Release approval not yet posted',
+          [rollupStatus('Release policy', 'SUCCESS')],
+          {},
+          'Release approval=not reported',
+        ],
+        ['an unresolved review thread', GREEN, { threads: [true, false] }, '1 unresolved review thread(s)'],
+        [
+          'an unattributed commit and no approval',
+          GREEN,
+          { unattributed: true },
+          '0 of 1 required approving review(s)',
+        ],
+        [
+          'another required check still running',
+          [...GREEN, rollupRun('Lint', 'IN_PROGRESS', null)],
+          {},
+          'Lint=in_progress/none',
+        ],
+      ])('is not ready with %s', (_case, rollup, pr, why) => {
+        const result = admin(tempRoot(), rollup, pr);
+        expect(result.status).toBe(26);
+        expect(result.stdout).toContain('merge=defer mode=legacy ci=host admin=not-ready:');
+        expect(result.stdout).toContain(why);
+        expect(result.stdout).not.toContain('admin=ready');
+      });
+
+      it('never gets as far as admin readiness when another required status is red', () => {
+        const result = admin(tempRoot(), [
+          rollupStatus('Release policy', 'FAILURE'),
+          rollupStatus('Release approval', 'SUCCESS'),
+        ]);
+        expect(result.status).toBe(24);
+        expect(result.stderr).toContain('required_red: Release policy=failure');
+        expect(result.stdout).not.toContain('admin=');
+      });
+
+      it('counts an approval against the extra one an unattributed commit needs, but not the author approving themself', () => {
+        expect(admin(tempRoot(), GREEN, { unattributed: true, approvals: ['reviewer'] }).stdout).toContain(
+          'admin=ready',
+        );
+        expect(admin(tempRoot(), GREEN, { unattributed: true, approvals: ['author'] }).stdout).toContain(
+          'admin=not-ready',
+        );
+      });
+
+      it.each<[string, Page[] | null, boolean, string]>([
+        ['the rules cannot be read', null, false, 'could not read the rules'],
+        [
+          'a rule type it does not model',
+          [...RULES, { type: 'update', parameters: null }],
+          false,
+          'rules this does not evaluate: update',
+        ],
+        ['classic branch protection', RULES, true, 'classic branch protection'],
+      ])('is not ready when %s', (_case, rules, classic, why) => {
+        const root = tempRoot();
+        if (classic) writeJson(root, 'protection.json', { url: 'x' });
+        const result = admin(root, GREEN, {}, rules);
+        expect(result.stdout).toContain('admin=not-ready');
+        expect(result.stdout).toContain(why);
+      });
     });
 
     it.each<[string, Page[], boolean | null]>([
@@ -5419,6 +5709,11 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
       ['a CI (host) failure', [rollupStatus(HOST, 'FAILURE', false)], false],
       ['a job that started and failed', [rollupStatus(HOST, 'SUCCESS', false)], true],
       ['a job that cannot be read', [rollupStatus(HOST, 'SUCCESS', false)], null],
+      [
+        'a CI (host) success from an account that is not an allowed poster',
+        [rollupStatus(HOST, 'SUCCESS', false, 'someone-else')],
+        false,
+      ],
     ])('refuses required_red with %s', (_case, extra, started) => {
       const root = tempRoot();
       legacy(root, [neverRun(), ...extra], started);

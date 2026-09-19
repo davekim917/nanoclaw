@@ -17,7 +17,7 @@ permissions:
 # ~25 PRs a day, which burned ~1,750 min/day in mid-September 2026 — parallelism
 # and dropping `--coverage` were both measured and did not help (PR #873,
 # vitest.config.ts). So this workflow, the pull_request lane, is typechecks
-# only (~1.5 min): correctness before merge is the author's job — run the
+# plus one seconds-long drift test (~1.5 min): correctness before merge is the author's job — run the
 # tests for what you touched locally (CLAUDE.md, Development). The full suite
 # lives in ci-full.yml (nightly + on demand) under its own workflow name; see
 # that file for why the name matters to the merge gate.
@@ -56,3 +56,8 @@ jobs:
         run: pnpm exec tsc -p tsconfig.scripts.json --noEmit
       - name: Typecheck container
         run: pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
+      # The one test this lane runs (~seconds): .github/host-ci.sh must stay
+      # exactly this job's steps, and a drift found only by the nightly would
+      # already have let a host-CI stand-in run less than CI does.
+      - name: Host CI declaration mirrors this workflow
+        run: pnpm exec vitest run scripts/host-ci-declaration.test.ts --maxWorkers=1
