@@ -33,9 +33,7 @@ describe('renderMemorySection', () => {
     expect(section).toContain(OKF_SECTION_HEADING);
     expect(section).toContain('YAML frontmatter containing a');
     expect(section).toContain('`type` is always the first frontmatter line');
-    expect(section).toContain(
-      'Open Knowledge Format (OKF) v0.1 bundle: one Markdown\nconcept per file, opened by a short YAML frontmatter with a `type`',
-    );
+    expect(section).toContain('OKF v0.1: one concept/file, YAML frontmatter with `type`');
   });
 
   it('renders lifecycle guidance without reading canonical memory bytes', () => {
