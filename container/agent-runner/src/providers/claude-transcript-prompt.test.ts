@@ -144,6 +144,23 @@ describe('transcriptContainsUserText', () => {
     ).toBe(false);
   });
 
+  it('rejects a compaction written after the match, including a terminal one', () => {
+    // PR #948 review round 2, captured against SDK 0.3.278 / CLI 2.1.278: a
+    // terminal compact_boundary is nobody's parent, so the chain walk never
+    // reaches it, but the resume loads the summary and not the batch.
+    const terminal = { type: 'system', subtype: 'compact_boundary', uuid: 'k', parentUuid: 'x', timestamp: at(90) };
+    expect(has([user('a', null, 'ROOT', -60_000), user('x', 'a', PROMPT, 5), terminal])).toBe(false);
+  });
+
+  it('rejects a sidechain entry that reuses a main-conversation uuid', () => {
+    // Same review: the sidechain copy shadows the batch on resume, and skipping
+    // sidechains before the duplicate check let it through.
+    const shadow = user('x', 'a', 'SIDE', 40, { isSidechain: true });
+    expect(
+      has([user('a', null, 'ROOT', -60_000), user('x', 'a', PROMPT, 5), shadow, assistant('z', 'x', 100)]),
+    ).toBe(false);
+  });
+
   it('answers false for a missing file, an empty prompt, or an unrecorded prompt', () => {
     expect(transcriptContainsUserText(path.join(dir, 'nope.jsonl'), PROMPT, T0)).toBe(false);
     expect(transcriptContainsUserText(write([user('c', null, PROMPT, 5)]), '', T0)).toBe(false);

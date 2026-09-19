@@ -64,7 +64,11 @@ export function transcriptContainsUserText(transcriptPath: string, text: string,
     return false;
   }
   const byId = new Map<string, Record<string, unknown>>();
+  const seenUuids = new Set<string>();
+  const position = new Map<string, number>();
   let newest: Record<string, unknown> | undefined;
+  let lastCompactionAt = -1;
+  let seq = 0;
   const lines = raw.split('\n');
   for (let i = tailRead ? 1 : 0; i < lines.length; i++) {
     const line = lines[i]!;
@@ -76,16 +80,21 @@ export function transcriptContainsUserText(transcriptPath: string, text: string,
       return false;
     }
     if (!isRecord(entry)) return false;
-    if (!('uuid' in entry) || entry.isSidechain === true) continue; // queue ops, titles, subagents
+    if (!('uuid' in entry)) continue; // queue ops, titles
     if (typeof entry.uuid !== 'string' || !entry.uuid) return false;
+    // Duplicate detection runs BEFORE sidechains are dropped: a sidechain entry
+    // that reuses a main-conversation uuid shadows it on resume — verified
+    // against SDK 0.3.278 / CLI 2.1.278, where the captured request carried the
+    // sidechain's text and not the batch (PR #948 review round 2).
+    if (seenUuids.has(entry.uuid)) return false;
+    seenUuids.add(entry.uuid);
+    if (entry.isSidechain === true) continue; // subagent turns are not resumed here
     if (!('parentUuid' in entry) || (entry.parentUuid !== null && typeof entry.parentUuid !== 'string')) return false;
     if (typeof entry.timestamp !== 'string' || Number.isNaN(Date.parse(entry.timestamp))) return false;
-    // A repeated uuid means the file can describe two different chains under one
-    // id, and the last write would decide which one this walk sees. Re-appending
-    // a pre-compaction entry that way reaches the batch without ever visiting
-    // the `compact_boundary` that orphaned it, so refuse the whole file.
-    if (byId.has(entry.uuid)) return false;
     byId.set(entry.uuid, entry);
+    position.set(entry.uuid, seq);
+    if (entry.type === 'system' && entry.subtype === 'compact_boundary') lastCompactionAt = seq;
+    seq += 1;
     // Only a `user`/`assistant` entry can be the leaf a resume starts from.
     // Verified against SDK 0.3.278 / CLI 2.1.278 by capturing the resumed
     // request: with `user a → user x → user y` and a later `progress p → x`
@@ -107,7 +116,11 @@ export function transcriptContainsUserText(transcriptPath: string, text: string,
       Date.parse(node.timestamp as string) >= sinceMs &&
       userTextOf(node.message.content).includes(text)
     ) {
-      return true;
+      // A compaction written AFTER the match ends the conversation this walk
+      // reconstructed, even when it is not on the chain (a terminal
+      // `compact_boundary` is nobody's parent). The resume then loads the
+      // summary, not the batch — captured against SDK 0.3.278 / CLI 2.1.278.
+      return lastCompactionAt < (position.get(node.uuid as string) ?? Number.MAX_SAFE_INTEGER);
     }
     seen.add(node.uuid as string);
     const parentUuid = node.parentUuid;
