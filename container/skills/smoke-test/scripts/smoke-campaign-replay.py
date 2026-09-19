@@ -599,6 +599,12 @@ def summarize(entry, mode, records, decisions, fires, dup_records, dup_effects, 
     # one key+attempt that were not a post-reconcile marker search.
     seen, dup_intents = set(), 0
     for r in records:
+        detail = r.get("detail") or {}
+        # An alarm's obligation record (detail.alarm, no attempt: journaled
+        # before, and independently of, any delivery attempt) is not an
+        # attempt intent -- the attempt that follows it is the first one.
+        if detail.get("alarm") and not r.get("attempt"):
+            continue
         if r["state"] == "intent" and not (r.get("detail") or {}).get("ambiguous") \
                 and not (r.get("detail") or {}).get("overdue") and not (r.get("detail") or {}).get("outcome"):
             k = (r["key"], r.get("attempt", 1))

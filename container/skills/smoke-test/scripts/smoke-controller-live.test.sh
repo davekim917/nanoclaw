@@ -131,7 +131,12 @@ echo "export SMOKE_GATE_CLAIMANT=controller" >>"$C/env.sh"
 fire
 [ "$WAKE" = false ] && [ "$(d '.misconfigured[0]')" = SMOKE_GATE_CLAIMANT ] \
   || fail "a claimant in the shared env file would tag legacy gate calls: $OUTPUT"
-[ ! -s "$FAKE_LOG" ] || fail "a claimant in the env file must call nothing"
+# Fail-closed: no gate/gh/ncl call at all; its one effect is the per-day
+# wrapper-error alarm (review round 3: every fail-closed end alarms).
+calls '[.[] | select(.tool != "enqueue")] | length == 0' | grep -qx true \
+  || fail "a claimant in the env file must call nothing but the alarm: $(cat "$FAKE_LOG")"
+[ "$(jq '.messages | keys | map(select(startswith("ctl.wrapper-error."))) | length' "$C/fake/enqueue.json")" = 1 ] \
+  || fail "a misconfigured live fire posts its wrapper-error alarm: $OUTPUT"
 
 # --- first live fire: cutover before poll, claim, intake wake --------------------
 new_case flip
@@ -340,6 +345,127 @@ for b in 08 0 1e3 200; do
 done
 grep -q '^BUDGET_MAX=110$' "$W" && grep -q 'timeout -k 2 "\$BUDGET"' "$W" \
   || fail "hard kill must land by 110 + 2 s, under the runner's 120 s"
+
+# --- every fail-closed worker end alarms, once a day (review round 3) -------------
+# $1 case, $2 description. The fire must fail closed, call no gate verb,
+# and leave exactly one ctl.wrapper-error.<day> post however often it repeats.
+wrapper_alarmed() {
+  [ "$WAKE" = false ] && [ "$(d .failClosed)" = wrapper-error ] && [ "$(d .alarmSent)" = true ] \
+    || fail "$1: $2 must fail closed WITH its alarm: $OUTPUT"
+  calls '[.[] | select(.tool=="gate" and .op=="poll")] | length == 0' | grep -qx true \
+    || fail "$1: a fail-closed fire never polls: $(cat "$FAKE_LOG")"
+  [ "$(jq '.messages | keys | map(select(startswith("ctl.wrapper-error."))) | length' "$C/fake/enqueue.json")" = 1 ] \
+    || fail "$1: exactly one wrapper-error post: $(cat "$C/fake/enqueue.json")"
+}
+# Codex round-3 repro 2: an unreadable control.json after the cutover.
+new_case control-unreadable
+fire
+printf '{"torn' >"$C/agent/state/control.json"
+: >"$FAKE_LOG"
+fire
+wrapper_alarmed control-unreadable "an unreadable control.json"
+fire
+wrapper_alarmed control-unreadable "a repeat of the same failure (same id, replayed, not re-posted)"
+# Gate state unreadable.
+new_case state-unreadable
+fire
+printf 'not json' >"$C/agent/state/pr-7-state.json"
+: >"$FAKE_LOG"
+fire
+wrapper_alarmed state-unreadable "an unreadable pr state file"
+# Another fire holds wrapper.lock.
+new_case lock-held
+fire
+: >"$FAKE_LOG"
+(
+  exec 9>"$OUT/wrapper/wrapper.lock"
+  flock 9
+  fire
+  printf '%s\n' "$OUTPUT" >"$C/lock-out"
+)
+OUTPUT="$(cat "$C/lock-out")"; DATA="$(jq -c .data <<<"$OUTPUT")"; WAKE="$(jq -r .wakeAgent <<<"$OUTPUT")"
+wrapper_alarmed lock-held "a held wrapper.lock"
+# An input fetch that blocks the step (gh cannot read a head the run needs).
+new_case input-fails
+fire
+jq -cn --arg run "$RUN" --arg sha "$SHA" --arg tok "$TOKEN" \
+  '{schemaVersion:1,pr:7,activeRunId:$run,activeSha:$sha,activeLeaseOwner:$tok,activeClaimant:"controller",
+    challengerDeadline:"2099-01-01T00:00:00Z"}' >"$C/agent/state/pr-7-state.json"
+: >"$FAKE_LOG"
+fire SMOKE_CONTROLLER_LIVE_GH_CMD=false
+[ "$WAKE" = false ] && [ "$(d .failClosed)" = wrapper-error ] && [ "$(d .alarmSent)" = true ] \
+  && [ "$(jq '.messages | keys | map(select(startswith("ctl.wrapper-error."))) | length' "$C/fake/enqueue.json")" = 1 ] \
+  || fail "input-fails: a blocked input fetch fails closed with its alarm: $OUTPUT"
+# An exception nothing anticipated (wrapper/tmp is a file: makedirs raises).
+new_case uncaught
+fire
+rm -rf "$OUT/wrapper/tmp"; : >"$OUT/wrapper/tmp"
+: >"$FAKE_LOG"
+fire
+wrapper_alarmed uncaught "an uncaught exception"
+d .skipped | grep -q '^uncaught FileExistsError' || fail "uncaught: routed through the excepthook: $OUTPUT"
+# A fire killed outright (after the worker's own deadline, so it had no time
+# to alarm) leaves wrapper/fire-open; the NEXT fire alarms for it and steps.
+new_case killed
+fire
+[ ! -e "$OUT/wrapper/fire-open" ] || fail "killed: a completed fire closes its marker"
+: >"$OUT/wrapper/fire-open"
+fire
+[ "$(d .previousFireUnclosed)" = true ] && [ "$(d .previousFireAlarmSent)" = true ] && [ "$(d .stepped)" = true ] \
+  || fail "killed: the next fire alarms for an unclosed one, then steps: $OUTPUT"
+[ "$(jq '.messages | keys | map(select(startswith("ctl.wrapper-error."))) | length' "$C/fake/enqueue.json")" = 1 ] \
+  && [ ! -e "$OUT/wrapper/fire-open" ] || fail "killed: one post, marker closed"
+# A fail-closed end whose alarm cannot be taken keeps the marker, so the next
+# fire re-offers it (same id) -- the alarm is never lost to a failed enqueue.
+new_case alarm-unsent
+fire
+printf '{"torn' >"$C/agent/state/control.json"
+fire SMOKE_CONTROLLER_LIVE_ENQUEUE_CMD=false
+[ "$(d .alarmSent)" = false ] && [ -e "$OUT/wrapper/fire-open" ] || fail "alarm-unsent: marker kept: $OUTPUT"
+python3 -c 'import json;print(json.dumps({"schemaVersion":1}))' >"$C/agent/state/control.json"
+fire
+[ "$(d .previousFireAlarmSent)" = true ] && [ "$(d .stepped)" = true ] \
+  || fail "alarm-unsent: the next fire posts the lost alarm: $OUTPUT"
+
+# --- structure: every worker exit is end_fire; only _emit leaves the process ------
+python3 - "$SCRIPT_DIR/smoke-controller-live-worker.py" <<'PY' || fail "worker exit structure (see above)"
+import ast, sys
+tree = ast.parse(open(sys.argv[1]).read())
+funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+errs = []
+def calls_in(node, name):
+    return [c for c in ast.walk(node) if isinstance(c, ast.Call) and
+            ((isinstance(c.func, ast.Name) and c.func.id == name) or
+             (isinstance(c.func, ast.Attribute) and c.func.attr == name))]
+# 1. The process leaves only through _emit (os._exit), nothing else exits.
+for n in ast.walk(tree):
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in ("_exit", "exit"):
+        owner = [f for f in funcs.values() if n in list(ast.walk(f))]
+        if [f.name for f in owner] != ["_emit"]:
+            errs.append("exit call outside _emit at line {}".format(n.lineno))
+    if isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call) and getattr(n.exc.func, "id", "") == "SystemExit":
+        errs.append("raise SystemExit at line {}".format(n.lineno))
+# 2. _emit is called only by end_fire.
+for f in funcs.values():
+    if f.name != "end_fire" and calls_in(f, "_emit"):
+        errs.append("_emit called from {}".format(f.name))
+if [c for c in calls_in(tree, "_emit") if not any(c in list(ast.walk(f)) for f in funcs.values())]:
+    errs.append("_emit called at module level")
+# 3. main() never returns early: its end is end_fire, not a return.
+if [r for r in ast.walk(funcs["main"]) if isinstance(r, ast.Return)]:
+    errs.append("main() has a return statement")
+# 4. Exactly two non-failure ends, each named.
+oks = [kw.value.value for c in calls_in(tree, "end_fire") for kw in c.keywords if kw.arg == "ok"]
+if sorted(oks) != ["not-live", "stepped"]:
+    errs.append("non-failure ends are {}, want not-live + stepped".format(oks))
+# 5. Anything uncaught still ends through end_fire.
+if not any(isinstance(n, ast.Assign) and any(ast.unparse(t) == "sys.excepthook" for t in n.targets)
+           for n in tree.body):
+    errs.append("no sys.excepthook")
+for e in errs:
+    print("worker structure:", e)
+sys.exit(1 if errs else 0)
+PY
 
 # --- structure: only final() writes to the runner's stdout -------------------------
 [ "$(grep -c '>&3' "$W")" = 2 ] || fail "expected exactly final()'s two fd-3 writes"

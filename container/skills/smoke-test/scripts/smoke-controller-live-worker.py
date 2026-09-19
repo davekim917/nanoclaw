@@ -57,8 +57,11 @@ def log(msg):
     print("smoke-controller-live: " + msg, file=sys.stderr)
 
 
-def remaining():
-    return DEADLINE - time.time()
+ALARM_RESERVE = 12  # seconds kept back from ordinary work for the fail-closed alarm
+
+
+def remaining(reserve=True):
+    return DEADLINE - (ALARM_RESERVE if reserve else 0) - time.time()
 
 
 def read_json(path):
@@ -76,7 +79,52 @@ def under(path, root):
     return real == real_root or real.startswith(real_root + os.sep)
 
 
-def finish(extra=None):
+# The process env first (the env file may be what is unreadable); the env
+# file, once applied, overrides it.
+SEND_TO = os.environ.get("SMOKE_CONTROLLER_SEND_TO", "")
+MARKER_OPEN = False  # wrapper/fire-open written this fire
+# The per-day chat alarm for each fail-closed kind. The text is CONSTANT per
+# kind and day: enqueue-send replays an id only with the same payload
+# (enqueue-send.ts, `mismatch` otherwise), so the varying reason stays in the
+# fire log, never in the post.
+FAIL_TEXT = {
+    "journal-invalid": ("Smoke controller (live) stopped: its journal failed validation. No run is being advanced "
+                        "and nothing new is claimed until a human repairs or moves {out}/journal.ndjson. The fire "
+                        "log ({out}/wrapper/fires.ndjson) has the error."),
+    "wrapper-error": ("Smoke controller (live) is failing closed: a fire could not complete, so no run was advanced "
+                      "and nothing new was claimed by it. It retries every fire; this is posted once a day while it "
+                      "persists. The reason is in the fire log ({out}/wrapper/fires.ndjson) or the task's output."),
+}
+
+
+def _wrapper_alarm(kind):
+    """Enqueue the per-day fail-closed alarm straight through enqueue-send
+    (the journaled path may be exactly what is broken). Idempotent on its id,
+    so every failing fire re-offers it and the helper replays it as the same
+    row. True once the helper answered ok."""
+    if not SEND_TO:
+        summary["alarmUnavailable"] = "no SMOKE_CONTROLLER_SEND_TO to post to"
+        return False
+    day = FIRE[:10].replace("-", "")
+    text = FAIL_TEXT[kind].format(out=OUT or "(out-dir not resolved)")
+    budget = min(20, remaining(reserve=False) - 1)
+    rc, out, err = run(ENQUEUE.split() + ["--id", "ctl.{}.{}#1".format(kind, day), "--to", SEND_TO, "--text", text,
+                                          "--thread-key", "ctl.{}-{}".format(kind, day),
+                                          "--run-id", "ctl.wrapper.{}".format(day),  # the helper budgets per run id
+                                          "--fire", FIRE, "--fingerprint", kind],
+                       budget, os.environ.copy(), reserve=False)
+    try:
+        ok = rc is not None and json.loads((out or "").strip().splitlines()[-1]).get("ok") is True
+    except (ValueError, IndexError, AttributeError):
+        ok = False
+    if not ok:
+        log("{} alarm not enqueued: rc={} {}".format(kind, rc, (err or "").strip()[:160]))
+    return ok
+
+
+def _emit(extra):
+    """Write the fire log and the one stdout line, then exit. Called ONLY by
+    end_fire (the structure test enforces it)."""
     global FINISHING
     FINISHING = True
     if extra:
@@ -98,6 +146,28 @@ def finish(extra=None):
     os._exit(0)
 
 
+def end_fire(extra, ok=None, kind="wrapper-error"):
+    """THE only way a fire ends. `ok` names one of the two non-failure ends
+    ("stepped": the controller step completed; "not-live": the kill switch is
+    off, so the wrapper must touch nothing). Every other end is FAIL-CLOSED:
+    the per-day alarm is enqueued first, then the fire ends. wrapper/fire-open
+    is cleared only by an end that is not a failure or whose alarm was taken,
+    so a fire killed outright is alarmed by the next fire instead."""
+    global FINISHING
+    assert ok in (None, "stepped", "not-live"), ok
+    FINISHING = True  # a second SIGTERM during the alarm must not re-enter
+    alarmed = False
+    if ok is None:
+        alarmed = _wrapper_alarm(kind)
+        summary.update({"failClosed": kind, "alarmSent": alarmed})
+    if MARKER_OPEN and (ok is not None or alarmed):
+        try:
+            os.unlink(os.path.join(OUT, "wrapper", "fire-open"))
+        except OSError:
+            pass
+    _emit(extra)
+
+
 def on_term(signum, frame):
     if FINISHING:
         return
@@ -106,17 +176,29 @@ def on_term(signum, frame):
             os.killpg(CHILD.pid, signal.SIGKILL)
         except OSError:
             pass
-    finish({"stepped": False, "ownerWake": None, "skipped": "fire exceeded its budget and was killed"})
+    end_fire({"stepped": False, "ownerWake": None, "skipped": "fire exceeded its budget and was killed"})
 
 
 signal.signal(signal.SIGTERM, on_term)
 
 
-def run(argv, timeout, env):
-    """(rc, stdout, stderr); rc None = timed out / not runnable."""
+def on_uncaught(exc_type, exc, tb):
+    """Any exception nothing else caught is a fail-closed end too."""
+    if FINISHING:
+        return
+    end_fire({"stepped": False, "skipped": "uncaught {}: {}".format(exc_type.__name__, exc)[:300]})
+
+
+sys.excepthook = on_uncaught
+
+
+def run(argv, timeout, env, reserve=True):
+    """(rc, stdout, stderr); rc None = timed out / not runnable. Ordinary work
+    stops ALARM_RESERVE short of the deadline; only the fail-closed alarm
+    (reserve=False) may use that time."""
     import subprocess
     global CHILD
-    budget = min(timeout, remaining() - MARGIN)
+    budget = min(timeout, remaining(reserve) - (MARGIN if reserve else 0))
     if budget < 1:
         return None, "", "no budget left"
     try:
@@ -181,7 +263,7 @@ def load_config(path):
 # -- config -----------------------------------------------------------------------
 cfg, refused, cfg_err = load_config(ENV_FILE)
 if cfg is None:
-    finish({"skipped": "env file unreadable", "envFile": ENV_FILE, "error": cfg_err})
+    end_fire({"skipped": "env file unreadable", "envFile": ENV_FILE, "error": cfg_err})
 for k, v in cfg.items():
     if v is None:
         os.environ.pop(k, None)
@@ -191,43 +273,46 @@ MODE = os.environ.get("SMOKE_CONTROLLER_MODE") or "shadow"
 summary["mode"] = MODE
 if MODE != "live":
     # Not live: nothing at all. The legacy PR gate task (or the shadow series)
-    # owns this state; this wrapper must not poll, claim or post.
-    finish({"skipped": "SMOKE_CONTROLLER_MODE is {!r}, not live: the live wrapper does nothing".format(MODE)})
+    # owns this state; this wrapper must not poll, claim or post. The kill
+    # switch being off is not a failure, so it is the one silent end.
+    end_fire({"skipped": "SMOKE_CONTROLLER_MODE is {!r}, not live: the live wrapper does nothing".format(MODE)},
+             ok="not-live")
+# Known before any other check, so every later fail-closed end can post.
+SEND_TO = os.environ.get("SMOKE_CONTROLLER_SEND_TO", "")
 if "SMOKE_GATE_CLAIMANT" in refused:
-    finish({"skipped": "the env file names SMOKE_GATE_CLAIMANT: every gate caller sources it, so it would mark "
+    end_fire({"skipped": "the env file names SMOKE_GATE_CLAIMANT: every gate caller sources it, so it would mark "
                        "legacy calls as the controller's. Remove it; this wrapper sets it per call.",
             "misconfigured": ["SMOKE_GATE_CLAIMANT"]})
 if refused:
-    finish({"skipped": "env file assigns a non-literal value", "refusedKeys": sorted(set(refused))})
+    end_fire({"skipped": "env file assigns a non-literal value", "refusedKeys": sorted(set(refused))})
 STATE_DIR = os.environ.get("SMOKE_GATE_STATE_DIR", "")
 RUN_ROOT = os.environ.get("SMOKE_GATE_RUN_ROOT", "")
 REPO = os.environ.get("SMOKE_GATE_REPO", "")
-SEND_TO = os.environ.get("SMOKE_CONTROLLER_SEND_TO", "")
 GATE_CMD = os.environ.get("SMOKE_CONTROLLER_GATE_CMD") or "/workspace/agent/smoke-pr-gate.sh"
 POLL_TIMEOUT = int(os.environ.get("SMOKE_CONTROLLER_POLL_TIMEOUT") or 45) \
     if (os.environ.get("SMOKE_CONTROLLER_POLL_TIMEOUT") or "45").isdigit() else 45
 missing = [n for n, v in (("SMOKE_GATE_STATE_DIR", STATE_DIR), ("SMOKE_GATE_RUN_ROOT", RUN_ROOT),
                           ("SMOKE_GATE_REPO", REPO), ("SMOKE_CONTROLLER_SEND_TO", SEND_TO)) if not v]
 if missing:
-    finish({"skipped": "live needs " + ", ".join(missing), "misconfigured": missing})
+    end_fire({"skipped": "live needs " + ", ".join(missing), "misconfigured": missing})
 if not os.path.isfile(GATE_CMD):
-    finish({"skipped": "gate wrapper {} is not a file".format(GATE_CMD), "misconfigured": ["SMOKE_CONTROLLER_GATE_CMD"]})
+    end_fire({"skipped": "gate wrapper {} is not a file".format(GATE_CMD), "misconfigured": ["SMOKE_CONTROLLER_GATE_CMD"]})
 if not os.path.isdir(STATE_DIR):
-    finish({"skipped": "SMOKE_GATE_STATE_DIR is not a directory", "inputErrors": 1})
+    end_fire({"skipped": "SMOKE_GATE_STATE_DIR is not a directory", "inputErrors": 1})
 OUT = os.path.abspath(os.environ.get("SMOKE_CONTROLLER_OUT_DIR") or
                       os.path.join(os.path.dirname(RUN_ROOT.rstrip("/")), "controller"))
 for root, name in ((STATE_DIR, "gate state dir"), (RUN_ROOT, "run root")):
     if under(OUT, root) or under(root, OUT):
-        finish({"skipped": "out-dir overlaps the {}".format(name)})
+        end_fire({"skipped": "out-dir overlaps the {}".format(name)})
 if remaining() < 20:
-    finish({"skipped": "budget exhausted before start"})
+    end_fire({"skipped": "budget exhausted before start"})
 
 try:
     spec = importlib.util.spec_from_file_location("smoke_campaign_controller", CTL)
     ctl = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ctl)
 except Exception as exc:  # noqa: BLE001
-    finish({"skipped": "controller not loadable: {}".format(exc)})
+    end_fire({"skipped": "controller not loadable: {}".format(exc)})
 try:
     try:
         st = os.lstat(OUT)
@@ -238,17 +323,28 @@ try:
         raise ctl.ControllerError("out-dir is not a real directory (symlink?)")
     ctl.write_contained_atomic(OUT, ["wrapper", ".probe"], "")
 except (OSError, ctl.ControllerError) as exc:
-    finish({"skipped": "out-dir refused: {}".format(exc)})
+    end_fire({"skipped": "out-dir refused: {}".format(exc)})
 WRAP = os.path.join(OUT, "wrapper")
 WRITABLE = True
 try:
     lock_fd = ctl.open_contained(OUT, ["wrapper", "wrapper.lock"], os.O_RDWR | os.O_CREAT)
     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 except BlockingIOError:
-    finish({"skipped": "another live fire holds wrapper.lock"})
+    end_fire({"skipped": "another live fire holds wrapper.lock"})
 except (OSError, ctl.ControllerError) as exc:
     WRITABLE = False
-    finish({"skipped": "wrapper.lock refused: {}".format(exc)})
+    end_fire({"skipped": "wrapper.lock refused: {}".format(exc)})
+# A fire that died without reaching end_fire (the supervisor's hard kill lands
+# after the worker's deadline, so its alarm had no time) left this marker. It
+# is a fail-closed end nobody alarmed: this fire alarms for it, then goes on.
+if os.path.lexists(os.path.join(WRAP, "fire-open")):
+    log("the previous fire ended without closing (killed?)")
+    summary["previousFireUnclosed"] = True
+    summary["previousFireAlarmSent"] = _wrapper_alarm("wrapper-error")
+_marker_fd = ctl.open_contained(OUT, ["wrapper", "fire-open"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+os.write(_marker_fd, (FIRE + "\n").encode("utf-8"))
+os.close(_marker_fd)
+MARKER_OPEN = True
 
 tmp = os.path.join(WRAP, "tmp")
 os.makedirs(tmp, exist_ok=True)
@@ -363,29 +459,9 @@ def alarm_queue():
 
 def journal_fail_closed(reason, detail):
     """The journal is not trustworthy: no progress stamp, no poll, no step.
-    One chat alarm per day, straight through enqueue-send (idempotent on its
-    id), because the journaled alarm path is exactly what is broken."""
-    day = FIRE[:10].replace("-", "")
-    # Constant per day: the helper replays an id only with the SAME payload
-    # (enqueue-send.ts, mismatch otherwise), so the varying detail stays in
-    # the fire log, not the post.
-    text = ("Smoke controller (live) stopped: its journal failed validation. No run is being advanced and "
-            "nothing new is claimed until a human repairs or moves {}. The fire log ({}) has the error.").format(
-        os.path.join(OUT, "journal.ndjson"), os.path.join(WRAP, "fires.ndjson"))
-    sent = False
-    try:
-        text_path = ctl.write_contained_atomic(OUT, ["wrapper", "journal-invalid.txt"], text + "\n")
-        rc, out, err = run(ENQUEUE.split() + ["--id", "ctl.journal-invalid.{}#1".format(day), "--to", SEND_TO,
-                                              "--text-file", text_path,
-                                              "--thread-key", "ctl.journal-invalid-{}".format(day),
-                                              # per day: the helper's budget is per run id
-                                              "--run-id", "ctl.journal.{}".format(day), "--fire", FIRE,
-                                              "--fingerprint", "journal-invalid"], 30, CHILD_ENV)
-        sent = rc is not None and (ctl.last_json_line(out) or {}).get("ok") is True
-    except (OSError, ctl.ControllerError) as exc:
-        log("journal alarm not staged: {}".format(exc))
-    finish({"stepped": False, "skipped": "journal failed validation: " + reason,
-            "alarm": "controller_journal_error", "alarmSent": sent, "error": detail[:300]})
+    Its own per-day alarm kind, through the one fail-closed exit."""
+    end_fire({"stepped": False, "skipped": "journal failed validation: " + reason,
+              "alarm": "controller_journal_error", "error": detail[:300]}, kind="journal-invalid")
 
 
 def fold_journal():
@@ -411,7 +487,7 @@ def main():
             rc, out, err = run(["python3", CTL, "init", "--out-dir", OUT, "--lock-timeout", "5"], 20, CHILD_ENV)
             doc = ctl.last_json_line(out) if rc == 0 else None
             if not (doc and doc.get("initialized")):
-                finish({"skipped": "controller init did not complete", "controllerRc": rc,
+                end_fire({"skipped": "controller init did not complete", "controllerRc": rc,
                         "error": ((out or "") + (err or "")).strip()[-300:]})
             summary["initialized"] = True
         write(["wrapper", "initialized"], FIRE + "\n")
@@ -422,10 +498,10 @@ def main():
     rc, out, err = run(["python3", CTL, "validate", "--out-dir", OUT, "--lock-timeout", "5"], 20, CHILD_ENV)
     doc = ctl.last_json_line(out) if rc is not None else None
     if not isinstance(doc, dict):
-        finish({"skipped": "journal validation did not answer", "controllerRc": rc,
+        end_fire({"skipped": "journal validation did not answer", "controllerRc": rc,
                 "error": (err or "").strip()[-300:]})
     if doc.get("skipped"):
-        finish({"skipped": "journal validation: " + str(doc["skipped"])})
+        end_fire({"skipped": "journal validation: " + str(doc["skipped"])})
     if not doc.get("valid"):
         journal_fail_closed(str(doc.get("alarm") or "invalid"), str(doc.get("error") or (err or "").strip()))
     try:
@@ -439,13 +515,13 @@ def main():
     states, bad = gate_states()
     if not os.path.lexists(cutover) or not os.path.lexists(latches_path):
         if bad:
-            finish({"skipped": "cannot write the cutover: gate state unreadable ({})".format(", ".join(bad))})
+            end_fire({"skipped": "cannot write the cutover: gate state unreadable ({})".format(", ".join(bad))})
         if not os.path.lexists(latches_path):
             # Baseline: latches set before this controller ever polled were
             # the legacy coordinator's alarms, not ours to re-post.
             control0, cerr0 = read_control()
             if control0 is None:
-                finish({"skipped": "gate control.json unreadable ({}): no latch baseline".format(cerr0)})
+                end_fire({"skipped": "gate control.json unreadable ({}): no latch baseline".format(cerr0)})
             write(["wrapper", "latches.json"], json.dumps(latch_map(states, control0), sort_keys=True))
     if not os.path.lexists(cutover):
         legacy = sorted(st["activeRunId"] for st in states.values()
@@ -456,13 +532,13 @@ def main():
 
     # -- gate alarm latches the queue has not seen (the poll-return crash window) ---
     if bad:
-        finish({"skipped": "gate state unreadable ({}): latches cannot be reconciled".format(", ".join(bad))})
+        end_fire({"skipped": "gate state unreadable ({}): latches cannot be reconciled".format(", ".join(bad))})
     acked, acked_err = read_json(latches_path)
     if acked_err or not isinstance(acked, dict):
-        finish({"skipped": "wrapper/latches.json unreadable: {}".format(acked_err or "not an object")})
+        end_fire({"skipped": "wrapper/latches.json unreadable: {}".format(acked_err or "not an object")})
     control, cerr = read_control()
     if control is None:
-        finish({"skipped": "gate control.json unreadable ({}): latches cannot be reconciled".format(cerr)})
+        end_fire({"skipped": "gate control.json unreadable ({}): latches cannot be reconciled".format(cerr)})
     current = latch_map(states, control)
     for name, value in sorted(current.items()):
         if acked.get(name) == value:
@@ -604,7 +680,7 @@ def main():
     if input_errors:
         for e in input_errors:
             log("input fetch failed: " + e)
-        finish({"skipped": "input fetch failed", "inputErrors": len(input_errors)})
+        end_fire({"skipped": "input fetch failed", "inputErrors": len(input_errors)})
     heads_path = write(["wrapper", "inputs", "pr-heads.json"], json.dumps(heads, sort_keys=True))
     tasks_path = write(["wrapper", "inputs", "tasks.json"], json.dumps(tasks))
     receipts_path = write(["wrapper", "inputs", "receipts.json"], json.dumps(receipts, sort_keys=True))
@@ -612,7 +688,7 @@ def main():
     # -- the step ---------------------------------------------------------------------
     step_budget = remaining() - MARGIN
     if step_budget < 15:
-        finish({"skipped": "budget too small for the step ({:.0f}s left)".format(remaining())})
+        end_fire({"skipped": "budget too small for the step ({:.0f}s left)".format(remaining())})
     argv = ["python3", CTL, "step", "--out-dir", OUT, "--gate-state-dir", STATE_DIR, "--run-root", RUN_ROOT,
             "--pr-heads-json", heads_path, "--tasks-json", tasks_path, "--receipts-json", receipts_path,
             "--cutover-json", cutover, "--repo", REPO, "--send-to", SEND_TO, "--gate-cmd", GATE_CMD,
@@ -633,12 +709,12 @@ def main():
     res = ctl.last_json_line(out) or {}
     if rc is None:
         log("controller step killed: {}".format(err))
-        finish({"skipped": "controller step timed out", "stepped": False})
+        end_fire({"skipped": "controller step timed out", "stepped": False})
     if rc != 0 or not res.get("ok"):
-        finish({"stepped": False, "controllerError": res.get("alarm") or "rc={}".format(rc),
+        end_fire({"stepped": False, "controllerError": res.get("alarm") or "rc={}".format(rc),
                 "error": str(res.get("error") or (err or "").strip())[:300]})
     if res.get("skipped"):
-        finish({"stepped": False, "skipped": "controller: " + str(res["skipped"])})
+        end_fire({"stepped": False, "skipped": "controller: " + str(res["skipped"])})
     # Queued alarms the journal now holds are drained (any state: a budget
     # refusal records nothing and so stays queued for the next fire).
     try:
@@ -665,13 +741,13 @@ def main():
                 os.unlink(os.path.join(WRAP, "wakes", run_id))
             except OSError:
                 pass
-    finish({"stepped": True, "runs": res.get("runs") or [], "decisions": res.get("decisions", 0),
+    end_fire({"stepped": True, "runs": res.get("runs") or [], "decisions": res.get("decisions", 0),
             "effectsPerformed": res.get("effectsPerformed", 0),
             "alarms": sorted({a.get("trigger") for a in res.get("alarms") or [] if isinstance(a, dict)}),
-            "ownerWake": res.get("ownerWake")})
+            "ownerWake": res.get("ownerWake")}, ok="stepped")
 
 
 try:
     main()
-except (OSError, ctl.ControllerError) as exc:
-    finish({"stepped": False, "skipped": "containment or IO refused: {}".format(exc)[:300]})
+except Exception as exc:  # noqa: BLE001 -- every failure ends through end_fire
+    end_fire({"stepped": False, "skipped": "fire failed: {}: {}".format(type(exc).__name__, exc)[:300]})

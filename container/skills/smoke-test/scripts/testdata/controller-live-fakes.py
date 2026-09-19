@@ -104,11 +104,17 @@ def enqueue(argv):
     db = load("enqueue.json", {"messages": {}, "fires": {}})
     mid, run, fire = opt(argv, "--id"), opt(argv, "--run-id"), opt(argv, "--fire")
     fp = opt(argv, "--fingerprint")
-    try:
-        with open(opt(argv, "--text-file")) as fh:
-            text = fh.read()
-    except (OSError, TypeError) as exc:
-        return "invalid", out({"ok": False, "code": "invalid", "error": str(exc)}, 2)
+    # --text or --text-file, never both (enqueue-send.ts:428-433).
+    if "--text" in argv and "--text-file" in argv:
+        return "invalid", out({"ok": False, "code": "invalid", "error": "pass --text or --text-file, not both"}, 2)
+    if "--text" in argv:
+        text = opt(argv, "--text", "")
+    else:
+        try:
+            with open(opt(argv, "--text-file")) as fh:
+                text = fh.read()
+        except (OSError, TypeError) as exc:
+            return "invalid", out({"ok": False, "code": "invalid", "error": str(exc)}, 2)
     files = opts(argv, "--file")
     for f in files:
         if not os.path.isfile(f):

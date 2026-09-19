@@ -563,7 +563,11 @@ for i in $(seq 1 15); do seed send "x$i" done 1; done
 step_ok 2026-09-18T10:00:00Z
 echo "$STEP_OUT" | jq -e '[.alarms[] | select(.trigger=="controller_send_budget")] | length >= 1' >/dev/null \
   || fail "a 16th send in one run must be refused: $STEP_OUT"
-dq '[.[] | select(.type=="send")] | length == 0' | grep -qx true || fail "no send past the budget"
+dq '[.[] | select(.type=="send" and (.slot | startswith("alarm:") | not))] | length == 0' | grep -qx true \
+  || fail "no ordinary send past the budget"
+# ...but the refusal's own alarm is journaled and rides the separate alarm lane.
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:send-budget:")))] | length >= 1' | grep -qx true \
+  || fail "the budget refusal journals its alarm: $(jr '[.[] | select(.kind=="send") | .slot] | unique')"
 
 # --- challenger timeout: the gate verb is the terminal verb ----------------
 

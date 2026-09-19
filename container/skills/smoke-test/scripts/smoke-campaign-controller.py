@@ -184,6 +184,12 @@ def send_id(key, attempt):
     return "{}#{}".format(key, attempt)
 
 
+def is_alarm_send(run_id, slot):
+    """An alarm post: a run's `alarm:*` slot, or any send of a pseudo-run
+    (gate alarms, cutover holds). Alarms ride their own budget lane."""
+    return str(slot).startswith("alarm:") or str(run_id).startswith(PSEUDO_PREFIX)
+
+
 def gate_alarm_ids(wake, now):
     """(pseudo run, fingerprint, send slot) for one gate alarm wake. Shared by
     the controller and the live worker's queue drain, so "is this queued
@@ -634,6 +640,8 @@ ALARM_WORDS = {
     "controller_dispatch_failed": "a judgment task could not be created",
     "controller_foreign_finish": "someone other than the controller finished this run",
     "controller_cutover_legacy_run": "a run claimed before the cutover surfaced; it stays with the legacy coordinator",
+    "controller_run_released": "this run lost its gate slot without a verdict; its open steps were abandoned",
+    "controller_finish_unconfirmed": "verdict.json exists but the gate's completed state does not confirm the finish",
 }
 ONESHOT_TEXT = {
     "critic": (
@@ -1509,40 +1517,46 @@ class Controller:
         append_decision(self.journal.dir, d)
         return d
 
-    def alarm(self, run_id, trigger, fingerprint, detail, send=True):
-        a = {"trigger": trigger, "runId": run_id, "fingerprint": fingerprint, "detail": detail}
-        self.alarms.append(a)
-        self.decide(run_id, None, "alarm", "mechanical", trigger, fingerprint=fingerprint, detail=detail)
-        if send:
-            self.send(run_id, "alarm", "alarm:{}".format(fingerprint), fingerprint=fingerprint,
-                      hint={"trigger": trigger, "detail": detail})
+    def ensure_alarm(self, run_id, trigger, fingerprint, detail, slot=None, hint=None, thread_key=None):
+        """The ONLY way an alarm is raised.
 
-    def ensure_alarm(self, run_id, trigger, fingerprint, detail):
-        """The ONLY way a one-shot alarm is raised. Its send obligation, keyed
-        by the fixed fingerprint, is what settles it -- never a journaled flag.
-        Called on EVERY fire its condition holds (and, for an event, BEFORE the
-        state record that ends the path), so a fire killed before the intent
-        raises it next time, and one killed after the intent replays the SAME
-        attempt (send(): stored hint, idempotent key#attempt) until a receipt
-        settles it. True when raised now, False when it already existed."""
-        key = obligation_key(run_id, "send", "alarm:" + fingerprint)
-        ob = self.obligations().get(key)
-        if ob is None:
-            self.alarm(run_id, trigger, fingerprint, detail)
-            return True
-        if ob["state"] not in TERMINAL_OK | {"abandoned", "failed_terminal"} and key not in self.driven:
-            self.send(run_id, "alarm", ob["slot"], fingerprint=ob["detail"].get("fingerprint"),
-                      hint=ob["detail"].get("hint"), thread_key=ob["detail"].get("threadKey"))
-        return False
+        1. Its send obligation is JOURNALED first, unconditionally: an intent
+           at attempt 0 (no message id minted yet), outside every budget. A
+           caller that is about to terminalize a source calls this first, so
+           no terminal state is ever written without its alarm on record.
+        2. Delivery is a separate step (send()), metered by the ALARM lane of
+           the budget -- its own per-fire slots, and its own helper budget id
+           (<runId>.alarms), so ordinary sends cannot starve it. A delivery
+           the lane refuses this fire rolls to the next, where open alarms are
+           drained before any run is stepped.
+        Called on EVERY fire its condition holds, and never gated on a flag:
+        the obligation, not a flag, is what settles it. True when raised now."""
+        slot = slot or "alarm:" + fingerprint
+        key = obligation_key(run_id, "send", slot)
+        raised = key not in self.obligations()
+        if raised:
+            self.alarms.append({"trigger": trigger, "runId": run_id, "fingerprint": fingerprint, "detail": detail})
+            self.decide(run_id, None, "alarm", "mechanical", trigger, fingerprint=fingerprint, detail=detail)
+            rec = {"fingerprint": fingerprint, "hint": hint or {"trigger": trigger, "detail": detail}, "alarm": True}
+            if thread_key:
+                rec["threadKey"] = thread_key
+            crash_point("before-intent", "send", slot)
+            self.record(run_id, "send", slot, "intent", None, rec)
+            crash_point("after-journal", "send", slot)
+        if key not in self.driven:
+            self.send(run_id, "alarm", slot)
+        return raised
 
     # -- effects ------------------------------------------------------------
 
-    def _budget_refusal(self, run_id, fingerprint):
-        """(scope, reason) or None. scope `fire` clears next fire; `run` and
-        `fingerprint` never clear."""
-        obs = [o for o in self.obligations().values() if o["runId"] == run_id and o["kind"] == "send"]
+    def _budget_refusal(self, run_id, fingerprint, lane):
+        """(scope, reason) or None, within one LANE (alarm or ordinary): each
+        lane has the helper's limits on its own, so the two never starve each
+        other. scope `fire` clears next fire; `run` and `fingerprint` never."""
+        obs = [o for o in self.obligations().values()
+               if o["runId"] == run_id and o["kind"] == "send" and is_alarm_send(run_id, o["slot"]) == lane]
         sent_attempts = sum(o["attempt"] for o in obs)
-        if self.fire_sends.get(run_id, 0) >= BUDGET_PER_FIRE:
+        if self.fire_sends.get((run_id, lane), 0) >= BUDGET_PER_FIRE:
             return "fire", "per-fire budget {} reached".format(BUDGET_PER_FIRE)
         if sent_attempts >= BUDGET_PER_RUN:
             return "run", "per-run budget {} reached".format(BUDGET_PER_RUN)
@@ -1554,13 +1568,21 @@ class Controller:
         return None
 
     def _budget_refused(self, run_id, phase, slot, attempt, scope, reason):
-        """Over budget: no send. A per-fire refusal waits for the next fire; a
+        """Over budget: no delivery. A per-fire refusal waits for the next fire
+        (an alarm's journaled intent stays open and is drained first). A
         per-run or per-fingerprint one never clears, so the obligation goes
-        failed_terminal -- which permits only finish BLOCKED (spec rev 3)."""
-        self.alarms.append({"trigger": "controller_send_budget", "runId": run_id, "detail": reason, "slot": slot})
+        failed_terminal -- which permits only finish BLOCKED (spec rev 3) --
+        and, for an ordinary send, its alarm is journaled BEFORE that."""
         self.decide(run_id, phase, "alarm", "mechanical", "controller_send_budget", slot=slot, detail=reason)
         if scope == "fire":
+            if not is_alarm_send(run_id, slot):
+                self.alarms.append({"trigger": "controller_send_budget", "runId": run_id, "detail": reason,
+                                    "slot": slot})
             return "budget"
+        key = obligation_key(run_id, "send", slot)
+        if not is_alarm_send(run_id, slot):
+            self.ensure_alarm(run_id, "controller_send_budget", "send-budget:{}".format(key[:12]),
+                              {"slot": slot, "reason": reason})
         self.record(run_id, "send", slot, "failed_terminal", attempt or None,
                     {"reason": "controller_send_budget: {}".format(reason)})
         return "failed_terminal"
@@ -1576,7 +1598,7 @@ class Controller:
             # Alarm intent BEFORE the terminal record: a kill between the two
             # re-runs this path next fire (the obligation is still open),
             # never a terminal state with no alarm behind it.
-            if not slot.startswith("alarm:"):
+            if not is_alarm_send(run_id, slot):
                 self.ensure_alarm(run_id, trigger, "{}:{}".format(trigger, obligation_key(run_id, kind, slot)[:12]),
                                   {"slot": slot, "error": result.get("error")})
             self.record(run_id, kind, slot, "failed_terminal", attempt, dict(detail, reason="{} failures".format(n)))
@@ -1585,7 +1607,7 @@ class Controller:
         return "intent"
 
     def _send_exhausted(self, run_id, slot, key, attempt):
-        if not slot.startswith("alarm:"):
+        if not is_alarm_send(run_id, slot):
             self.ensure_alarm(run_id, "controller_send_failed", "send-failed:{}".format(key[:12]),
                               {"slot": slot, "attempts": attempt})
         self.record(run_id, "send", slot, "failed_terminal", attempt, {"reason": "{} attempts failed".format(attempt)})
@@ -1618,35 +1640,46 @@ class Controller:
             if attempt >= MAX_SEND_ATTEMPTS:
                 return self._send_exhausted(run_id, slot, key, attempt)
             ob = self.obligations().get(key)
-        if ob and ob["state"] == "intent":
+        lane = is_alarm_send(run_id, slot)
+        if ob:
+            # An intent (a replayed attempt, or a journaled alarm) carries its
+            # journaled payload; otherwise the caller's wins where it gave one.
+            replay = ob["state"] == "intent"
+            if replay or hint is None:
+                hint = ob["detail"].get("hint", hint)
+            if replay or thread_key is None:
+                thread_key = ob["detail"].get("threadKey", thread_key)
+            if replay or fingerprint is None:
+                fingerprint = ob["detail"].get("fingerprint", fingerprint)
+        if ob and ob["state"] == "intent" and attempt > 0:
             # Latest record is the intent itself, so no outcome was journaled:
             # killed between intent and enqueue. The helper is idempotent on
             # key#attempt (INSERT ... ON CONFLICT(id) DO NOTHING + read-back),
             # so re-running the SAME attempt is safe and is not a new send.
             next_attempt = attempt
-            hint = ob["detail"].get("hint", hint)
-            thread_key = ob["detail"].get("threadKey", thread_key)
-            fingerprint = ob["detail"].get("fingerprint", fingerprint)
         else:
+            # A new attempt: nothing yet, a definitive failed receipt, or a
+            # journaled alarm (intent at attempt 0) not yet delivered.
             next_attempt = attempt + 1
-            refusal = self._budget_refusal(run_id, fingerprint)
+            refusal = self._budget_refusal(run_id, fingerprint, lane)
             if refusal:
                 return self._budget_refused(run_id, phase, slot, attempt, *refusal)
             detail = {}
-            if fingerprint:
-                detail["fingerprint"] = fingerprint
-            if hint:
-                detail["hint"] = hint
-            if thread_key:
-                detail["threadKey"] = thread_key
-            crash_point("before-intent", "send", slot)
+            if not ob:
+                if fingerprint:
+                    detail["fingerprint"] = fingerprint
+                if hint:
+                    detail["hint"] = hint
+                if thread_key:
+                    detail["threadKey"] = thread_key
+                crash_point("before-intent", "send", slot)
             self.record(run_id, "send", slot, "intent", next_attempt, detail or None)
             crash_point("after-intent", "send", slot)
         mid = send_id(key, next_attempt)
-        self.fire_sends[run_id] = self.fire_sends.get(run_id, 0) + 1
+        self.fire_sends[(run_id, lane)] = self.fire_sends.get((run_id, lane), 0) + 1
         result = self.effects.perform({"type": "send", "runId": run_id, "slot": slot, "messageId": mid,
                                        "threadKey": thread_key or run_id, "fingerprint": fingerprint,
-                                       "hint": hint or {}})
+                                       "hint": hint or {}, "budgetRun": (run_id + ".alarms") if lane else run_id})
         self.decide(run_id, phase, "send", "mechanical", "obligation due", slot=slot, key=key, attempt=next_attempt,
                     messageId=mid, effect=result["outcome"])
         crash_point("after-effect", "send", slot)
@@ -1911,9 +1944,12 @@ class Controller:
         trigger = wake.get("trigger")
         pseudo, fp, slot = gate_alarm_ids(wake, self.now)
         day = pseudo.rsplit(".", 1)[-1]
-        self.decide(pseudo, None, "alarm", "mechanical", trigger, fingerprint=fp)
-        self.send(pseudo, "alarm", slot, fingerprint=fp, hint={"gateAlarm": wake},
-                  thread_key=re.sub(r"[^A-Za-z0-9._:-]", "-", "gate-{}-{}".format(day, fp))[:120])
+        # Journaled before delivery like every alarm, so a budget-refused
+        # delivery still leaves the obligation (and the live worker's queue
+        # entry is drained only once that obligation exists).
+        if not self.ensure_alarm(pseudo, trigger, fp, None, slot=slot, hint={"gateAlarm": wake},
+                                 thread_key=re.sub(r"[^A-Za-z0-9._:-]", "-", "gate-{}-{}".format(day, fp))[:120]):
+            self.decide(pseudo, None, "alarm", "mechanical", trigger, fingerprint=fp)
 
     def _poll_alarm(self, wake, obs):
         if wake.get("trigger") == "pr_run_stalled" and wake.get("runId") and \
@@ -2121,10 +2157,16 @@ class Controller:
             if own_finish and own_finish["state"] == "done":
                 return self.post_finish(run_id, pr, own_finish["detail"].get("verdict"), external=False)
         if claim is None:
-            # Not active and not finished: reclaimed or released. Pre-finish
-            # obligations are abandoned with the reason on record.
+            # Not active and not finished: reclaimed or released. The alarm is
+            # journaled FIRST; then pre-finish obligations are abandoned with
+            # the reason on record -- except alarm posts, which still deliver.
+            if self.live:
+                self.ensure_alarm(run_id, "controller_run_released", "released:{}".format(run_id[-40:]),
+                                  {"reason": "run no longer holds the gate slot and has no verdict"})
+            obs = self.obligations()
             for ob in obs.values():
-                if ob["runId"] == run_id and ob["state"] not in ("done", "delivered", "abandoned", "failed_terminal"):
+                if ob["runId"] == run_id and ob["state"] not in ("done", "delivered", "abandoned", "failed_terminal") \
+                        and not (ob["kind"] == "send" and is_alarm_send(run_id, ob["slot"])):
                     self.record(run_id, ob["kind"], ob["slot"], "abandoned", ob["attempt"] or None,
                                 {"reason": "run no longer holds the gate slot"})
             self.decide(run_id, "released", "log", "mechanical", "run lost the slot without a verdict")
@@ -2467,17 +2509,21 @@ class Controller:
             self.send(ob["runId"], "alarm", ob["slot"], fingerprint=ob["detail"].get("fingerprint"),
                       hint=ob["detail"].get("hint"), thread_key=ob["detail"].get("threadKey"))
 
-    def _settle_pseudo_sends(self):
-        """Gate-alarm and cutover sends belong to no campaign, so no step_run
-        re-offers them."""
-        self._settle_open_alarms(lambda ob: ob["runId"].startswith(PSEUDO_PREFIX))
-
     def _settle_alarm_sends(self, run_id):
         """A run's alarm posts, settled before the GO barrier reads them, or it
         waits on a post delivered long ago and reads its age as unreceipted."""
         self._settle_open_alarms(lambda ob: ob["runId"] == run_id and ob["slot"].startswith("alarm:"))
 
+    def _drain_alarms(self):
+        """Every open alarm post, whatever its run's phase (or a done run's):
+        a journaled-undelivered alarm (intent@0), a killed-after-intent one,
+        an enqueued one awaiting its receipt, a failed receipt to retry."""
+        self._settle_open_alarms(lambda ob: is_alarm_send(ob["runId"], ob["slot"]) and ob["runId"] not in self.legacy)
+
     def fire_once(self):
+        # Alarms carried over from an earlier fire go FIRST, before any run
+        # can spend this fire on ordinary work.
+        self._drain_alarms()
         self.reconcile_claims()
         runs = set(self.journal.runs()) | set(self.gate.active_claims())
         summary = []
@@ -2487,12 +2533,8 @@ class Controller:
             phase = self.step_run(run_id)
             if phase:
                 summary.append({"runId": run_id, "phase": phase})
-        # Every run's alarm posts, in whatever phase (or already done): an
-        # alarm raised by an event is re-offered by no condition, so this is
-        # what carries a killed-after-intent alarm to its receipt.
-        self._settle_open_alarms(lambda ob: ob["slot"].startswith("alarm:") and
-                                 not ob["runId"].startswith(PSEUDO_PREFIX) and ob["runId"] not in self.legacy)
-        self._settle_pseudo_sends()
+        # ...and those raised during this fire, if a lane slot is left.
+        self._drain_alarms()
         return summary
 
     def pick_owner_wake(self):

@@ -382,6 +382,11 @@ def window_duplicates(shadow_dir, journal, since, until):
         det = r.get("detail") or {}
         if det.get("ambiguous") or det.get("overdue") or det.get("outcome"):
             continue
+        # An alarm's obligation record (journaled before, and independently
+        # of, any delivery attempt, so it carries no attempt) is not an
+        # attempt intent: the attempt that follows it is the first one.
+        if det.get("alarm") and not r.get("attempt"):
+            continue
         k = (r.get("key"), r.get("attempt", 1))
         if k in seen and inside(r):
             intents += 1

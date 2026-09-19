@@ -411,14 +411,17 @@ dq '[.[] | select(.type=="finish")] | last | .failedChecks | map(select(contains
 new_case budget-controller
 # The controller's own count: 15 journaled attempts, so enqueue is never called.
 for i in $(seq 1 15); do
-  jq -cn --arg run "$RUN" --arg k "$(key "$RUN" send "alarm:old$i")" --arg s "alarm:old$i" \
+  jq -cn --arg run "$RUN" --arg k "$(key "$RUN" send "old$i")" --arg s "old$i" \
     '{v:1,at:"2026-09-18T09:59:00Z",fire:"seed",runId:$run,kind:"send",slot:$s,key:$k,state:"delivered",attempt:1,mode:"live"}' \
     >>"$C/out/journal.ndjson"
 done
 campaign 9
 [ "$(finish_verdict)" = '"BLOCKED"' ] || fail "controller-side budget: BLOCKED: $(finish_verdict)"
-[ "$(jq -s '[.[] | select(.tool=="enqueue")] | length' "$FAKE_LOG")" = 0 ] \
-  || fail "an over-budget send never reaches the helper"
+budget_ids() { jq -s -c '[.[] | select(.tool=="enqueue") | .argv as $a | ($a | index("--run-id")) as $i | $a[$i + 1]] | unique' "$FAKE_LOG"; }
+[ "$(budget_ids)" = "[\"$RUN.alarms\"]" ] \
+  || fail "an over-budget send never reaches the helper; only the alarm lane does: $(budget_ids)"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:send-budget:")))] | last | .state == "delivered"' \
+  | grep -qx true || fail "the budget refusal's alarm is delivered in its own lane"
 new_case failed-receipts
 FAIL_RECEIPTS="$(key "$RUN" send root)" campaign 12
 jr "[.[] | select(.kind==\"send\" and .slot==\"root\")] | last | .state == \"failed_terminal\"" | grep -qx true \
@@ -714,5 +717,125 @@ for point in "before-intent:send:$OVERDUE" "after-intent:send:$OVERDUE"; do
   [ "$(finish_verdict)" = '"GO"' ] || fail "owner overdue: a late-but-complete step still finishes GO: $(finish_verdict)"
 done
 unset STALL DEADLINE UNCONF FOREIGN AMB OVERDUE
+
+# --- 11. review round 3: no terminal transition without its alarm -----------------
+# The property, over every terminal or failure transition the controller can
+# make: by the end of the fire that records it, the journal holds that
+# transition's alarm obligation. Journaling is unconditional and outside every
+# budget; DELIVERY is a separate, budgeted step, so the property holds just as
+# well when the send budget is already spent (the alarm is then an open
+# intent@0, drained on a later fire, never a terminal state with no alarm).
+alarm_property() { # label required-alarm-slot-prefix
+  python3 - "$C/out/journal.ndjson" "$1" "$2" <<'PY' || fail "$1: terminal transition without its alarm (above)"
+import json, sys
+path, label, want = sys.argv[1], sys.argv[2], sys.argv[3]
+obs = {}
+for line in open(path):
+    if not line.strip():
+        continue
+    r = json.loads(line)
+    o = obs.setdefault(r["key"], {"runId": r["runId"], "kind": r["kind"], "slot": r["slot"], "detail": {}})
+    o["state"] = r["state"]
+    o["detail"].update(r.get("detail") or {})
+alarms = {}
+for o in obs.values():
+    if o["kind"] == "send" and (o["slot"].startswith("alarm:") or o["runId"].startswith("ctl.")):
+        alarms.setdefault(o["runId"], []).append(o)
+errs = []
+for o in obs.values():
+    if o["state"] not in ("failed_terminal", "abandoned"):
+        continue
+    if o["kind"] == "send" and (o["slot"].startswith("alarm:") or o["runId"].startswith("ctl.")):
+        continue   # an alarm IS the alarm; nothing alarms about it
+    if not alarms.get(o["runId"]):
+        errs.append("{} {}:{} is {} with no alarm obligation on the run".format(
+            o["runId"][-12:], o["kind"], o["slot"], o["state"]))
+hit = [o for rid in alarms for o in alarms[rid] if o["slot"].startswith(want)]
+if not hit:
+    errs.append("no alarm obligation {}* (have: {})".format(
+        want, sorted({o["slot"] for rid in alarms for o in alarms[rid]})))
+for o in hit:
+    if o["state"] == "abandoned":
+        errs.append("{} was abandoned instead of settled".format(o["slot"]))
+for e in errs:
+    print("{}: {}".format(label, e))
+sys.exit(1 if errs else 0)
+PY
+}
+# "The budget is already spent": both lanes, the controller's side (journaled
+# attempts) and the helper's (its own table), so no delivery is possible at all.
+spend_budget() {
+  local i
+  for i in $(seq 1 15); do
+    jq -cn --arg run "$RUN" --arg k "$(key "$RUN" send "spent$i")" --arg s "spent$i" \
+      '{v:1,at:"2026-09-18T09:59:00Z",fire:"seed",runId:$run,kind:"send",slot:$s,key:$k,state:"delivered",attempt:1,mode:"live"}' \
+      >>"$C/out/journal.ndjson"
+    jq -cn --arg run "$RUN" --arg k "$(key "$RUN" send "alarm:spent$i")" --arg s "alarm:spent$i" \
+      '{v:1,at:"2026-09-18T09:59:00Z",fire:"seed",runId:$run,kind:"send",slot:$s,key:$k,state:"delivered",attempt:1,mode:"live"}' \
+      >>"$C/out/journal.ndjson"
+  done
+  python3 - "$C/fake" "$RUN" <<'PY'
+import json, os, sys
+fake, run = sys.argv[1], sys.argv[2]
+msgs = {"spent-{}#1".format(i): {"text": "x", "to": "r", "threadKey": run, "files": [], "runId": rid,
+                                 "fingerprint": None, "seq": 2 * i + 1, "at": "x"}
+        for rid in (run, run + ".alarms") for i in range(15)}
+json.dump({"messages": msgs, "fires": {}}, open(os.path.join(fake, "enqueue.json"), "w"))
+PY
+}
+# Each transition, driven the shortest way that reaches it.
+transition() { # name
+  case "$1" in
+    receipts-exhausted) FAIL_RECEIPTS="$(key "$RUN" send root)" campaign 12 ;;
+    send-budget)        campaign 9 ;;
+    dispatch-ambiguous) CRASH=after-intent:dispatch:critic campaign 10 ;;
+    dispatch-failed)    jq -cn '{"ncl:create":["refuse"]}' >"$C/fake/faults.json"; campaign 10 ;;
+    gate-refused)       jq -cn '{"gate:finish":["refuse"]}' >"$C/fake/faults.json"; FINDING=F1 campaign 12 ;;
+    overdue)            STALL=8 DEADLINE=2026-09-18T14:00:00Z campaign 20; unset STALL DEADLINE ;;
+    released)           claim; wake_json
+                        inputs_from_fakes; step_ok "$(tick_time 0)" --poll-json "$C/wake.json"
+                        jq -c '.activeRunId=null | .activeLeaseOwner=null | .activeClaimant=null' \
+                          "$C/state/pr-$PR-state.json" >"$C/state/pr.tmp"
+                        mv "$C/state/pr.tmp" "$C/state/pr-$PR-state.json"
+                        inputs_from_fakes; step_ok "$(tick_time 1)" ;;
+    no-authority)       claim "" ""; wake_json
+                        inputs_from_fakes; step_ok "$(tick_time 0)" ;;
+    foreign-finish)     claim; wake_json; inputs_from_fakes; step_ok "$(tick_time 0)" --poll-json "$C/wake.json"
+                        gate_finished_elsewhere "$RUN"
+                        inputs_from_fakes; step_ok "$(tick_time 1)" ;;
+    finish-unconfirmed) claim; wake_json; inputs_from_fakes; step_ok "$(tick_time 0)" --poll-json "$C/wake.json"
+                        gate_finished_elsewhere xzo-pr-pr7-bbbbbbbbbbbb-20260918T120000Z
+                        inputs_from_fakes; step_ok "$(tick_time 1)" ;;
+  esac
+}
+for variant in budgeted spent; do
+  for t in receipts-exhausted:send-failed send-budget:send-budget dispatch-ambiguous:dispatch-ambiguous \
+           dispatch-failed:dispatch-failed gate-refused:gate-refused overdue:overdue released:released \
+           no-authority:no-authority foreign-finish:foreign-finish finish-unconfirmed:finish-unconfirmed; do
+    name="${t%%:*}"
+    want="${t##*:}"
+    # With no budget left the root send is refused before it can ever exhaust
+    # its receipts, so that transition becomes the budget refusal instead.
+    [ "$variant" = spent ] && [ "$name" = receipts-exhausted ] && want=send-budget
+    new_case "prop-$variant-$name"
+    if [ "$variant" = spent ]; then
+      spend_budget
+    elif [ "$name" = send-budget ]; then
+      spend_budget   # the transition IS a budget refusal, so it needs one
+    fi
+    transition "$name"
+    alarm_property "$variant/$name" "alarm:$want:"
+    if [ "$variant" = budgeted ] && [ "$name" != send-budget ]; then
+      jq -s -e --arg p "alarm:$want:" '[.[] | select(.kind=="send" and (.slot | startswith($p)))] | last
+        | .state == "delivered" or .state == "enqueued"' "$C/out/journal.ndjson" >/dev/null \
+        || fail "$name: within budget the alarm is actually delivered"
+    else
+      # Spent: journaled anyway, and never silently dropped.
+      jq -s -e --arg p "alarm:$want:" '[.[] | select(.kind=="send" and (.slot | startswith($p)))] | length > 0' \
+        "$C/out/journal.ndjson" >/dev/null || fail "$name: the alarm is journaled even with no budget left"
+    fi
+  done
+done
+unset variant name t want
 
 echo "smoke campaign controller live tests passed"
