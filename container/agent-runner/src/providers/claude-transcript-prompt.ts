@@ -9,20 +9,34 @@ const TRANSCRIPT_PROMPT_TAIL_BYTES = 8 * 1024 * 1024;
 /**
  * True only when `text` is provably in what a resume of the transcript at
  * `transcriptPath` will load. A credential-rotation retry asks this to decide
- * whether it can point at the batch instead of sending it again (measured
- * 2026-09-18: 108 of 121 recent retries re-sent a prompt already recorded).
+ * whether it can point at the batch instead of sending it again
+ * (poll-loop.ts:1128 → `formatCredentialRetryPrompt`, poll-loop.ts:142).
  *
- * Rather than re-implement the SDK's leaf selection, it demands a shape where
- * every leaf choice agrees: the main-conversation entries recorded during THIS
- * attempt (timestamp at or after `sinceMs`, the batch's first-attempt start on
- * the same container clock) form one straight parent chain — exactly one of
- * them hangs off an earlier entry, no two share a parent — with no
- * compaction, and one of them is a well-formed `user`-role entry containing
- * `text`. Every doubt answers false, so the caller re-sends: a false negative
- * costs tokens, a false positive would drop the batch. Doubts include a read
- * error, any unparseable line (a tail read's partial first line excepted),
- * a branch, a `compact_boundary`, and a malformed conversation entry (empty
- * `uuid`, absent or non-string `parentUuid`, undated).
+ * The resumed context is the parent chain ending at the newest
+ * main-conversation entry, so that is what this walks: from the last such
+ * entry back through `parentUuid`, answering true at a well-formed `user`-role
+ * entry that contains `text` and was recorded during THIS attempt (timestamp
+ * at or after `sinceMs`, the batch's first-attempt start on the same container
+ * clock). Entries off that chain are irrelevant — orphans and side branches
+ * are not loaded, so they no longer veto the pointer.
+ *
+ * Every doubt answers false, so the caller re-sends: a false negative costs
+ * tokens, a false positive would drop the batch. Doubts include a read error,
+ * any unparseable line (a tail read's partial first line excepted), a
+ * malformed conversation entry (empty `uuid`, absent or non-string
+ * `parentUuid`, undated), a `compact_boundary` reached before the match (what
+ * a resume loads then is a summary, not the batch), a chain that leaves the
+ * read window or reaches the transcript root without matching, and a cycle.
+ *
+ * History: this first shipped demanding that every entry recorded during the
+ * attempt form ONE straight chain (`roots === 1`). Real transcripts never have
+ * that shape — the harness writes entries whose parents are lines this walk
+ * skips — so the check answered false for every live retry: 0 of 93 rotation
+ * retries in the 2026-09-19 fleet sample used the pointer, though 74 of them
+ * were recorded on the resumed chain and provably safe to point at (the retry
+ * entry itself descends from the earlier copy in 74 of the 76 cases where one
+ * exists; the other 2 have a compaction between them, which this still
+ * refuses).
  */
 export function transcriptContainsUserText(transcriptPath: string, text: string, sinceMs: number): boolean {
   if (!text || !Number.isFinite(sinceMs)) return false;
@@ -46,7 +60,8 @@ export function transcriptContainsUserText(transcriptPath: string, text: string,
   } catch {
     return false;
   }
-  const attempt: Record<string, unknown>[] = [];
+  const byId = new Map<string, Record<string, unknown>>();
+  let newest: Record<string, unknown> | undefined;
   const lines = raw.split('\n');
   for (let i = tailRead ? 1 : 0; i < lines.length; i++) {
     const line = lines[i]!;
@@ -61,30 +76,32 @@ export function transcriptContainsUserText(transcriptPath: string, text: string,
     if (!('uuid' in entry) || entry.isSidechain === true) continue; // queue ops, titles, subagents
     if (typeof entry.uuid !== 'string' || !entry.uuid) return false;
     if (!('parentUuid' in entry) || (entry.parentUuid !== null && typeof entry.parentUuid !== 'string')) return false;
-    const at = typeof entry.timestamp === 'string' ? Date.parse(entry.timestamp) : NaN;
-    if (Number.isNaN(at)) return false;
-    if (at >= sinceMs) attempt.push(entry);
+    if (typeof entry.timestamp !== 'string' || Number.isNaN(Date.parse(entry.timestamp))) return false;
+    byId.set(entry.uuid, entry);
+    newest = entry;
   }
-  if (attempt.length === 0) return false;
-  const ids = new Set(attempt.map((e) => e.uuid as string));
-  const parents = new Set<unknown>();
-  let roots = 0;
-  let matched = false;
-  for (const e of attempt) {
-    if (e.type === 'system' && e.subtype === 'compact_boundary') return false;
-    if (parents.has(e.parentUuid)) return false; // two entries share a parent: a branch
-    parents.add(e.parentUuid);
-    if (typeof e.parentUuid !== 'string' || !ids.has(e.parentUuid)) roots += 1;
+  if (!newest) return false;
+  // Walk the resumed chain, newest first. `seen` is the cycle guard: a
+  // transcript that points back into itself would otherwise loop forever.
+  const seen = new Set<string>();
+  let node: Record<string, unknown> | undefined = newest;
+  while (node) {
+    if (node.type === 'system' && node.subtype === 'compact_boundary') return false;
     if (
-      e.type === 'user' &&
-      isRecord(e.message) &&
-      e.message.role === 'user' &&
-      userTextOf(e.message.content).includes(text)
+      node.type === 'user' &&
+      isRecord(node.message) &&
+      node.message.role === 'user' &&
+      Date.parse(node.timestamp as string) >= sinceMs &&
+      userTextOf(node.message.content).includes(text)
     ) {
-      matched = true;
+      return true;
     }
+    seen.add(node.uuid as string);
+    const parentUuid = node.parentUuid;
+    if (typeof parentUuid !== 'string' || seen.has(parentUuid)) return false;
+    node = byId.get(parentUuid);
   }
-  return roots === 1 && matched;
+  return false; // the chain left the read window before matching
 }
 
 function userTextOf(content: unknown): string {

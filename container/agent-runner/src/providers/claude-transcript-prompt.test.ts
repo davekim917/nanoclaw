@@ -84,11 +84,29 @@ describe('transcriptContainsUserText', () => {
     expect(has([{ type: 'user', uuid: 'u', parentUuid: null, message: { content: PROMPT } }])).toBe(false); // undated
   });
 
-  it('rejects a branch inside the attempt, whichever leaf the SDK would pick', () => {
+  it('accepts a match on the resumed chain even when an abandoned sibling branch exists', () => {
+    // `s` is newest, so the resumed chain is s → x → a; `y` hangs off `a` and is
+    // never loaded. Before 2026-09-19 a sibling anywhere in the attempt vetoed
+    // the pointer, which is what made this check answer false for every live retry.
     const sys = { type: 'system', subtype: 'informational', uuid: 's', parentUuid: 'x', timestamp: at(100) };
     expect(
       has([user('a', null, 'earlier', -60_000), user('x', 'a', PROMPT, 5), user('y', 'a', 'sibling', 50), sys]),
-    ).toBe(false);
+    ).toBe(true);
+  });
+
+  it('accepts a chain whose entries hang off lines this walk skips (the live shape)', () => {
+    // Real transcripts interleave entries whose parents are queue ops, titles and
+    // sidechain roots — lines with no `uuid` or `isSidechain: true`. They make the
+    // recorded entries look like several roots; none of them is on the resumed chain.
+    const orphan = { type: 'user', uuid: 'o', parentUuid: 'queue-op', timestamp: at(20), message: { role: 'user', content: 'queued' } };
+    expect(
+      has([
+        { type: 'queue', content: 'no uuid at all' },
+        user('c', null, PROMPT, 5),
+        orphan,
+        assistant('d', 'c', 900),
+      ]),
+    ).toBe(true);
   });
 
   it('rejects malformed conversation entries: empty uuid, absent parentUuid, non-user role', () => {
