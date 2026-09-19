@@ -1590,6 +1590,39 @@ than a competing summary. The synthesis barrier is mandatory even for `BLOCKED`
 or `NO_GO`: a blocked lane still writes a terminal marker, so fail-closed does
 not require racing its worker.
 
+### Machine-readable verdict files (additive)
+
+These two files feed the shadow campaign controller
+(`scripts/smoke-campaign-controller.py`). They add records and change
+nothing else: the barrier, `finish`, and the posted verdict stay exactly as
+above. A run that lacks them still finishes the same way today. Only the
+shadow controller records it as unable to reach `GO`.
+
+- **Challenger**: in the `challenger/challenge.complete.json` it already
+  writes, add `dissents`: one entry per disputed finding, `[{"id": "<finding
+  id or D-n>"}]`, with unique, non-empty ids. Use `[]` only with
+  `disposition: "CLEAR"`.
+- **Coordinator-side owner**: at synthesis, after the barrier clears and
+  before `finish`, write `synthesis.json` at the run root:
+
+  ```json
+  {"schemaVersion": 1, "runId": "<runId>", "sourceSha": "<frozen 40-hex>",
+   "verdict": "GO|NO_GO|HUMAN_DECISION|BLOCKED",
+   "laneGenerations": {"<laneId>": <contract lane generation>},
+   "findings": [{"id": "F-1", "blocking": true, "confirmed": true, "disposition": "fixed-verified"}],
+   "gaps": [{"lane": "<laneId>", "disposition": "not-blocking:<reason>"}],
+   "dissents": [{"id": "<challenger dissent id>", "disposition": "refuted:<run-relative evidence path>"}]}
+  ```
+
+  Give every confirmed finding, every lane without a passing marker, and
+  every id in the challenger's `dissents` its own disposition. A disposition
+  must be `fixed-verified`, `not-blocking:<reason>`, or
+  `refuted:<path>`, where the path names a non-empty file inside the run.
+  `verdict` is the verdict you pass to `finish`. Never widen it to fit the
+  file. If an item has no closed disposition, write the item anyway and
+  leave its disposition open (for example, `"open"`). The controller then
+  reports that item.
+
 ## Continuous channel profile
 
 Continuous QA does not mean keeping models running continuously. Use a recurring
