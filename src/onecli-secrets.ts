@@ -656,6 +656,27 @@ export function gatewayRestHosts(declarations: string[]): Array<{ name: string; 
   return out;
 }
 
+const TYPESAFE_HOST = 'api.typesafe.ai';
+
+/**
+ * Placeholder `TYPESAFE_API_KEY` for a Claude container whose grants already
+ * route `api.typesafe.ai` through the gateway. fast-jev-compaction (a
+ * `~/plugins` function-hook plugin) refuses to run with no key
+ * (`~/plugins/fast-jev-compaction/hooks/fast-jev.ts:170`), but the real key is
+ * injected at the proxy, so the container only needs a non-empty stand-in.
+ *
+ * Gated on the grant, not set fleet-wide: the grant is the clearance to send
+ * that group's text to TypeSafe. Without it the plugin throws before any
+ * request and falls back to the built-in summary (`fast-jev.ts:283-288`).
+ * Reads the cache `applyOnecliSecrets` has just warmed; a cold cache yields no
+ * key, which is the same safe fallback.
+ */
+export function typesafeKeyPlaceholderEnv(provider: string, grantedSecrets: string[]): string[] {
+  if (provider !== 'claude') return [];
+  if (!gatewayRestHosts(grantedSecrets).some((h) => h.host === TYPESAFE_HOST)) return [];
+  return ['-e', 'TYPESAFE_API_KEY=onecli-gateway-injected'];
+}
+
 /** Test seam: seed the secrets cache without touching the gateway. */
 export function __setSecretsCacheForTest(secrets: OnecliSecret[]): void {
   secretsCache = { at: Date.now(), secrets };
