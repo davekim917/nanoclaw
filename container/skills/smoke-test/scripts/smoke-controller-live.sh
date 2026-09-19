@@ -12,16 +12,26 @@
 #
 # Each fire (the worker, smoke-controller-live-worker.py):
 #   1. reads the gate env file AS DATA (the shadow wrapper's rules);
-#   2. on the first live fire, writes <out>/cutover.json naming every run the
+#   2. validates the whole journal (`controller validate`: torn tail, record
+#      schema, born and per-record mode) under control.lock. An invalid
+#      journal stops the fire BEFORE any gate effect: no progress stamp, no
+#      poll, one chat alarm per day straight through enqueue-send;
+#   3. on the first live fire, writes <out>/cutover.json naming every run the
 #      gate has claimed right now: those finish under the legacy coordinator
 #      and the controller never acts on them. Written once, never rewritten;
-#   3. stamps gate `progress` for each controller run, then runs the gate's
-#      `poll` with SMOKE_GATE_CLAIMANT=controller, so a new claim is recorded
-#      as the controller's (smoke-pr-gate.sh claimant_guard) and its wake --
-#      with the owner token -- reaches only the controller;
-#   4. reads PR heads (gh), delivery receipts (this session's inbound.db) and,
+#   4. queues, durably (wrapper/alarms/), any one-shot gate alarm latch it
+#      has not acknowledged (wrapper/latches.json): the alarm a fire lost
+#      between the poll returning and the queue write;
+#   5. stamps gate `progress` for each controller run, then -- only when the
+#      alarm queue is empty -- runs the gate's `poll` with
+#      SMOKE_GATE_CLAIMANT=controller, so a new claim is recorded as the
+#      controller's (smoke-pr-gate.sh claimant_guard) and its wake -- with the
+#      owner token -- reaches only the controller. An alarm wake is queued
+#      before its latch is acknowledged;
+#   6. reads PR heads (gh), delivery receipts (this session's inbound.db) and,
 #      only when a dispatch intent needs reconciling, `ncl tasks list`;
-#   5. runs one controller `step` in live mode.
+#   7. runs one controller `step` in live mode, which journals every queued
+#      alarm; entries the journal holds are then removed from the queue.
 #
 # Output: the LAST stdout line is always {"wakeAgent":<bool>,"data":{...}}.
 # wakeAgent is true ONLY when the step returned an owner judgment step, and

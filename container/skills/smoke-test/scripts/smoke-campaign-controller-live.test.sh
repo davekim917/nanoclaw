@@ -170,14 +170,15 @@ world() { # tick
 tick_time() { python3 -c 'import datetime,sys; print((datetime.datetime(2026,9,18,10,0,tzinfo=datetime.timezone.utc)+datetime.timedelta(minutes=10*int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$1"; }
 
 inputs_from_fakes() { # receipts: every enqueued message delivered unless FAIL_RECEIPTS; tasks from ncl
-  python3 - "$C" "${FAIL_RECEIPTS:-}" <<'PY'
+  python3 - "$C" "${FAIL_RECEIPTS:-}" "${MISSING_RECEIPTS:-}" <<'PY'
 import json, os, sys
-c, fail = sys.argv[1], sys.argv[2]
+c, fail, missing = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
     msgs = json.load(open(os.path.join(c, "fake", "enqueue.json")))["messages"]
 except FileNotFoundError:
     msgs = {}
-json.dump({mid: ("failed" if fail and fail in mid else "delivered") for mid in msgs}, open(os.path.join(c, "receipts.json"), "w"))
+json.dump({mid: ("failed" if fail and fail in mid else "delivered") for mid in msgs
+           if not (missing and missing in mid)}, open(os.path.join(c, "receipts.json"), "w"))
 try:
     tasks = json.load(open(os.path.join(c, "fake", "ncl.json")))["tasks"]
 except FileNotFoundError:
@@ -229,6 +230,7 @@ WAKES=()
 campaign() { # last-tick
   local n now crashed=false w1 w2
   WAKES=()
+  WAKE_TIMES=()
   claim "${DEADLINE:-}"
   wake_json
   for n in $(seq 0 "$1"); do
@@ -249,7 +251,7 @@ campaign() { # last-tick
       step_ok "$now" "${extra[@]}"
     fi
     w="$(jq -c '.ownerWake' <<<"$STEP_OUT")"
-    [ "$w" = null ] || WAKES+=("$(jq -r '.step' <<<"$w")")
+    [ "$w" = null ] || { WAKES+=("$(jq -r '.step' <<<"$w")"); WAKE_TIMES+=("$now"); }
     w1="$(writes)"
     l1="$(wc -l <"$FAKE_LOG")"
     step_ok "$now" "${extra[@]}"
@@ -529,5 +531,100 @@ step_ok 2026-09-18T10:00:00Z --poll-json "$C/wake.json"
 : >"$R/controller/brief-intake.ack"
 step_ok 2026-09-18T10:01:00Z
 [ "$(jq -r '.ownerWake' <<<"$STEP_OUT")" = null ] || fail "an acked brief is not re-offered: $STEP_OUT"
+
+# --- 9. review round 1 (PR #945) ---------------------------------------------------
+# a) A crash inside the gate's finish, between verdict.json and the slot
+#    cleanup: the run is not done, nothing post-finish runs, and the gate's own
+#    crash-safe finish is re-run until its completed state agrees.
+new_case partial-finish
+jq -cn '{"gate:finish":["partial"]}' >"$C/fake/faults.json"
+FAULTY=1 FINDING=F1 campaign 12
+assert_once partial-finish
+python3 - "$FAKE_LOG" <<'PY' || fail "partial finish: freeze-close must follow the COMPLETED finish"
+import json, sys
+calls = [json.loads(l) for l in open(sys.argv[1])]
+ops = [(c["tool"], c["op"]) for c in calls]
+partial = ops.index(("gate", "partial"))
+done = ops.index(("gate", "finish"))
+closed = ops.index(("gh", "closed"))
+assert partial < done < closed, ops
+PY
+jr '[.[] | select(.kind=="gate" and .slot=="finish-resume" and .state=="done")] | length >= 1' | grep -qx true \
+  || fail "partial finish: resumed through the gate's own finish"
+jr '[.[] | select(.kind=="run")] | (last.state == "done") and (map(.detail.gateCompleted) | any)' | grep -qx true \
+  || fail "partial finish: the run closes only on the gate's completion receipt"
+[ "$(finish_verdict)" = '"GO"' ] || fail "partial finish: the resumed finish keeps the verdict: $(finish_verdict)"
+
+# b) A delivery receipt that never arrives: alarmed once within the SLA, the
+#    send keeps its one message id (never a second attempt), no finish.
+new_case receipt-missing
+VKEY="$(key "$RUN" send verdict)"
+MISSING_RECEIPTS="$VKEY" campaign 14
+jr '[.[] | select(.kind=="send" and (.slot|startswith("alarm:overdue:")))] | group_by(.key) | length == 1' \
+  | grep -qx true || fail "missing receipt: exactly one overdue alarm: $(jr '[.[]|select(.kind=="send")|.slot]|unique')"
+dq '[.[] | select(.type=="alarm" and .reason=="controller_obligation_overdue" and .detail.obligation=="send:verdict")] | length == 1' \
+  | grep -qx true || fail "missing receipt: the alarm names send:verdict"
+[ "$(jq -r --arg k "$VKEY" '.messages | keys | map(select(startswith($k))) | length' "$C/fake/enqueue.json")" = 1 ] \
+  || fail "missing receipt: the verdict send is never re-attempted"
+[ "$(jq -s '[.[] | select(.tool=="gate" and (.op=="finish" or .op=="challenger-timeout"))] | length' "$FAKE_LOG")" = 0 ] \
+  || fail "missing receipt: no finish while the verdict post is unconfirmed"
+alarm_at="$(dq '[.[] | select(.reason=="controller_obligation_overdue")] | first | .at')"
+sent_at="$(jr "[.[] | select(.key==\"$VKEY\" and .state==\"enqueued\")] | first | .at")"
+python3 - "$sent_at" "$alarm_at" <<'PY' || fail "missing receipt: alarm within one fire of the SLA ($sent_at -> $alarm_at)"
+import datetime as d, json, sys
+p = lambda s: d.datetime.strptime(json.loads(s), "%Y-%m-%dT%H:%M:%SZ")
+gap = (p(sys.argv[2]) - p(sys.argv[1])).total_seconds()
+assert 1800 < gap <= 1800 + 600, gap
+PY
+unset VKEY
+
+# c) The challenger deadline passes on the fire the lanes step first comes
+#    due: timeout first, no owner wake for a step the run will never use.
+new_case timeout-before-judgment
+STALL=30 DEADLINE=2026-09-18T10:15:00Z campaign 8
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "timeout: BLOCKED: $(finish_verdict)"
+jr '[.[] | select(.kind=="gate" and .slot=="challenger-timeout" and .state=="done")] | length == 1' | grep -qx true \
+  || fail "timeout: challenger-timeout is the terminal verb"
+for i in "${!WAKES[@]}"; do
+  [ "${WAKES[$i]}" != lanes ] || fail "timeout: an owner wake for lanes at ${WAKE_TIMES[$i]} after the deadline"
+  [[ "${WAKE_TIMES[$i]}" < 2026-09-18T10:15:00Z ]] || fail "timeout: owner wake ${WAKES[$i]} at ${WAKE_TIMES[$i]} after the deadline"
+done
+jr '[.[] | select(.kind=="owner" and .slot=="lanes")] | length == 0' | grep -qx true \
+  || fail "timeout: the lanes judgment is never even scheduled: $(jr '[.[]|select(.kind=="owner")]')"
+unset STALL DEADLINE
+# d) A wake queued earlier in a fire whose step was abandoned (or whose run
+#    finished) later in the SAME fire is never offered, nor re-enqueued.
+python3 -B - "$CTL" <<'PY' || fail "abandoned: pick_owner_wake filters on the fire's final state"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ctl", sys.argv[1])
+ctl = importlib.util.module_from_spec(spec); spec.loader.exec_module(ctl)
+run = "xzo-pr-pr7-aaaaaaaaaaaa-20260918T100000Z"
+k = lambda kind, slot: ctl.obligation_key(run, kind, slot)
+class Stub:
+    live, fire = True, "f1"
+    def __init__(self, obs):
+        self.obs, self.recorded = obs, []
+        self.owner_wakes = [{"runId": run, "step": "lanes", "brief": "b", "key": k("owner", "lanes"), "since": "t"}]
+    def obligations(self):
+        return self.obs
+    def record(self, *a):
+        self.recorded.append(a)
+def ob(kind, slot, state):
+    return {"key": k(kind, slot), "runId": run, "kind": kind, "slot": slot, "state": state, "detail": {}, "history": []}
+base = lambda lanes, run_state: {k("owner", "lanes"): ob("owner", "lanes", lanes), k("run", "claim"): ob("run", "claim", run_state)}
+cases = {
+    "step abandoned": base("abandoned", "enqueued"),
+    "run done": base("enqueued", "done"),
+    "verdict frozen": dict(base("enqueued", "enqueued"), **{k("verdict", "validated"): ob("verdict", "validated", "done")}),
+    "terminal verb journaled": dict(base("enqueued", "enqueued"),
+                                    **{k("gate", "challenger-timeout"): ob("gate", "challenger-timeout", "intent")}),
+}
+for label, obs in cases.items():
+    st = Stub(obs)
+    got = ctl.Controller.pick_owner_wake(st)
+    assert got is None and not st.recorded, (label, got, st.recorded)
+st = Stub(base("enqueued", "enqueued"))
+assert ctl.Controller.pick_owner_wake(st)["step"] == "lanes", "a live, due step is still offered"
+PY
 
 echo "smoke campaign controller live tests passed"

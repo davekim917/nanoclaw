@@ -182,6 +182,77 @@ fire
 jq -s -e '[.[] | select(.kind=="send" and .slot=="root")] | last | .state == "delivered"' "$OUT/journal.ndjson" >/dev/null \
   || fail "the delivered row in inbound.db settles the root send: $(tail -3 "$OUT/journal.ndjson")"
 
+# --- an invalid journal: no progress, no poll, one alarm (review round 1, #3) ------
+for variant in torn schema; do
+  new_case "journal-$variant"
+  fire   # initializes the journal
+  jq -cn --arg run "$RUN" --arg tok "$TOKEN" \
+    '{v:1,at:"2026-09-18T10:00:00Z",fire:"f",runId:$run,kind:"run",slot:"claim",key:"k1",state:"enqueued",attempt:1,
+      mode:"live",detail:{pr:7,ownerToken:$tok}}' >>"$OUT/journal.ndjson"
+  jq -cn --arg run "$RUN" --arg sha "$SHA" --arg tok "$TOKEN" \
+    '{schemaVersion:1,pr:7,activeRunId:$run,activeSha:$sha,activeLeaseOwner:$tok,activeClaimant:"controller",
+      challengerDeadline:"2099-01-01T00:00:00Z"}' >"$C/agent/state/pr-7-state.json"
+  if [ "$variant" = torn ]; then
+    printf '{"v":1,"key":"k2","runId":"x","state":"int' >>"$OUT/journal.ndjson"
+  else
+    # Parses, and the old wrapper-side fold accepted it; not a valid record.
+    jq -cn '{v:1,key:"k2",runId:"x",kind:"run",slot:"claim",state:"bogus"}' >>"$OUT/journal.ndjson"
+  fi
+  : >"$FAKE_LOG"
+  fire
+  [ "$WAKE" = false ] && [ "$(d .alarm)" = controller_journal_error ] || fail "$variant journal: fails closed: $OUTPUT"
+  calls '[.[] | select(.tool=="gate")] | length == 0' | grep -qx true \
+    || fail "$variant journal: no progress stamp and no poll on an invalid journal: $(cat "$FAKE_LOG")"
+  [ "$(jq '.messages | keys | map(select(startswith("ctl.journal-invalid."))) | length' "$C/fake/enqueue.json")" = 1 ] \
+    || fail "$variant journal: one alarm post"
+  fire
+  [ "$(jq '.messages | length' "$C/fake/enqueue.json")" = 1 ] || fail "$variant journal: the alarm is not re-posted"
+  calls '[.[] | select(.tool=="gate")] | length == 0' | grep -qx true || fail "$variant journal: still no gate call"
+done
+
+# --- one-shot gate alarms survive the poll-return crash window (review round 1, #4) --
+new_case alarm-latch
+# A latch set before this controller ever polled is the legacy's alarm: baseline.
+jq -cn '{schemaVersion:1,pr:5,warmupAlertSha:"dddddddddddddddddddddddddddddddddddddddd"}' >"$C/agent/state/pr-5-state.json"
+fire
+[ "$(jq '.messages // {} | length' "$C/fake/enqueue.json" 2>/dev/null || echo 0)" = 0 ] \
+  || fail "a pre-cutover latch is not re-posted: $(cat "$C/fake/enqueue.json")"
+# The gate latched an alarm and the worker died before queueing it: only the
+# latch is left. The next fire recovers it, drains it BEFORE polling, posts once.
+jq -cn '{schemaVersion:1,pr:5,warmupAlertSha:"dddddddddddddddddddddddddddddddddddddddd",
+  refusedAlertSha:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}' >"$C/agent/state/pr-5-state.json"
+: >"$FAKE_LOG"
+fire
+[ "$(d '.recoveredAlarms | length')" = 1 ] || fail "the lost alarm is recovered from the gate latch: $OUTPUT"
+calls '[.[] | select(.op=="poll")] | length == 0' | grep -qx true || fail "a queued alarm is drained before the next poll"
+[ "$(d .alarmsQueued)" = 0 ] && [ -z "$(ls -A "$OUT/wrapper/alarms")" ] || fail "the drained alarm leaves the queue: $OUTPUT"
+[ "$(jq '[.messages[] | select(.fingerprint | startswith("pr_migrations_refused"))] | length' "$C/fake/enqueue.json")" = 1 ] \
+  || fail "the recovered alarm is posted once: $(jq -c '.messages' "$C/fake/enqueue.json")"
+fire
+[ "$(jq '.messages | length' "$C/fake/enqueue.json")" = 1 ] || fail "a recovered alarm is posted once, ever"
+# A poll that emits an alarm: queued durably, then the latch acknowledged. If
+# the acknowledgment is lost, the latch path re-queues the SAME fingerprint and
+# the journal dedupes it.
+cat >"$C/poll-next.sh" <<SH
+jq -c '.factsStuckAlertSha="ffffffffffffffffffffffffffffffffffffffff"' '$C/agent/state/pr-5-state.json' >'$C/s.tmp'
+mv '$C/s.tmp' '$C/agent/state/pr-5-state.json'
+jq -cn '{wakeAgent:true,data:{schemaVersion:1,trigger:"pr_facts_unavailable",pr:5,
+  sourceSha:"ffffffffffffffffffffffffffffffffffffffff",migrationFiles:[],migrationsDeterminable:false,runId:null,activeAgeSeconds:null}}'
+SH
+fire
+[ "$(jq '[.messages[] | select(.fingerprint | startswith("pr_facts_unavailable"))] | length' "$C/fake/enqueue.json")" = 1 ] \
+  || fail "a polled alarm is posted: $OUTPUT $(jq -c '.messages' "$C/fake/enqueue.json")"
+jq 'with_entries(select(.key != "5:factsStuckAlertSha"))' "$OUT/wrapper/latches.json" >"$C/l.tmp"
+mv "$C/l.tmp" "$OUT/wrapper/latches.json"
+fire
+[ "$(d '.recoveredAlarms | length')" = 1 ] || fail "the unacknowledged latch is re-queued: $OUTPUT"
+[ "$(jq '[.messages[] | select(.fingerprint | startswith("pr_facts_unavailable"))] | length' "$C/fake/enqueue.json")" = 1 ] \
+  || fail "poll and latch paths share one fingerprint: never a second post"
+# An unreadable queued alarm refuses the step rather than dropping it.
+printf '{not json' >"$OUT/wrapper/alarms/broken.json"
+fire
+[ "$(d .stepped)" = false ] && [ -e "$OUT/wrapper/alarms/broken.json" ] || fail "an unreadable queued alarm is kept: $OUTPUT"
+
 # --- a failing or slow poll still steps; a forged child line never escapes --------
 new_case poll-fails
 printf '5\n' >"$C/poll-sleep"

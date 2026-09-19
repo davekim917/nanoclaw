@@ -613,7 +613,15 @@ step_ok 2026-09-18T10:10:00Z
 mkdir -p "$C/state/runs/$RUN"
 jq -cn --arg run "$RUN" --arg sha "$SHA" '{schemaVersion:1,sha:$sha,runId:$run,verdict:"NO_GO",finishedAt:"2026-09-18T10:15:00Z"}' \
   >"$C/state/runs/$RUN/verdict.json"
-jq -cn --argjson pr "$PR" '{schemaVersion:1,pr:$pr,activeRunId:null}' >"$C/state/pr-$PR-state.json"
+# verdict.json alone is a PARTIAL finish (the gate writes it before hold/ledger
+# and slot cleanup, smoke-pr-gate.sh:4160-4176): never closed from it.
+step_ok 2026-09-18T10:15:00Z
+jr '[.[] | select(.kind=="run")] | last | .state != "done"' | grep -qx true \
+  || fail "a partial gate finish (slot still held) must not close the run"
+dq '[.[] | select(.reason=="gate finish partial: verdict.json written, slot still held")] | length >= 1' \
+  | grep -qx true || fail "a partial gate finish waits"
+jq -cn --argjson pr "$PR" --arg run "$RUN" \
+  '{schemaVersion:1,pr:$pr,activeRunId:null,completedRunId:$run,completedVerdict:"NO_GO"}' >"$C/state/pr-$PR-state.json"
 step_ok 2026-09-18T10:20:00Z
 jr '[.[] | select(.kind=="run")] | last | .state == "done" and .detail.finishedBy == "gate"' | grep -qx true \
   || fail "an external finish closes the run"
@@ -678,7 +686,7 @@ jr '[.[] | select(.runId == ".." or .runId == ".hidden")] | length == 0' | grep 
   || fail "a dot run id must never be journaled: $(jr .)"
 [ ! -e "$C/decisions.ndjson" ] && [ ! -e "$C/out/../decisions.ndjson" ] && [ ! -e "$C/out/.hidden" ] \
   || fail "a dot run id escaped --out-dir"
-python3 - "$CTL" <<'PY' || fail "RUN_ID_RE must refuse dot components"
+python3 -B - "$CTL" <<'PY' || fail "RUN_ID_RE must refuse dot components"
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("ctl", sys.argv[1]); m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)

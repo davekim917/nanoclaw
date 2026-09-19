@@ -18,13 +18,18 @@ call, in order:
   fail-after    the write happens, then the call reports an error (the
                 ambiguous case: the effect landed but the caller cannot know)
   refuse        (gate only) a definitive refusal
+  partial       (gate finish only) verdict.json is written, then the call
+                dies before the hold/ledger work and the slot cleanup
 
 The fakes mirror the real contracts the controller depends on:
   enqueue  INSERT ... ON CONFLICT(id) DO NOTHING + read-back: a repeated id
            with the same payload is `replay`, a different one `mismatch`; the
            helper's own budget (enqueue-send.ts CONTROLLER_SEND_BUDGET).
   gate     owner-token and claimant checks (smoke-pr-gate.sh claimant_guard),
-           `finish` writes verdict.json and clears the slot.
+           `finish` writes verdict.json FIRST and only then clears the slot
+           and records completedRunId/completedVerdictDigest; a repeated
+           finish with the same facts resumes from verdict.json
+           (smoke-pr-gate.sh:4002-4027, :4160-4176, :4557-4563).
   gh       comments/issues carry whatever body was written; `api ... --jq .[]`
            lists them one JSON object per line.
   ncl      `tasks create` returns {ok, data:{series_id}}; `tasks list` lists them.
@@ -267,6 +272,18 @@ def gate(argv):
             return "fail", out({"ok": False, "error": "lock busy", "retryable": True})
         if f == "refuse":
             return "refused", out({"ok": False, "error": "injected refusal"})
+        resumed = None
+        vfile = os.path.join(gs, "runs", run, "verdict.json")
+        if verb != "progress" and os.path.exists(vfile):
+            existing = json.load(open(vfile))
+            want = argv[3] if verb == "finish" else "BLOCKED"
+            if verb == "finish" and (existing.get("sha"), existing.get("verdict")) != (argv[1], want):
+                return "verdict-conflict", out({"ok": False, "error": "a different verdict is already recorded"}, 2)
+            for _, other in states():
+                if other.get("completedRunId") == run and other.get("activeRunId") != run:
+                    return "idempotent", out({"ok": True, "idempotent": True, "verdict": existing.get("verdict"),
+                                              "finishedAt": existing.get("finishedAt")})
+            resumed = existing
         p, st = find(run)
         if st is None:
             return "not-active", out({"ok": False, "error": "not the active run (reclaimed or finished)"})
@@ -286,16 +303,30 @@ def gate(argv):
             return "go-refused", out({"ok": False, "error": "GO is REFUSED"}, 2)
         rd = os.path.join(gs, "runs", run)
         os.makedirs(rd, exist_ok=True)
-        at = now_iso()
-        write(os.path.join(rd, "verdict.json"), {"schemaVersion": 1, "sha": st.get("activeSha"), "runId": run,
-                                                 "verdict": verdict, "finishedAt": at})
+        vpath = os.path.join(rd, "verdict.json")
+        if resumed:
+            at = resumed["finishedAt"]
+        else:
+            at = now_iso()
+            # The real gate's canonical payload: compact, fixed key order, one
+            # trailing newline; the digest is over the compact string.
+            with open(vpath + ".tmp", "w") as fh:
+                fh.write(json.dumps({"schemaVersion": 1, "sha": st.get("activeSha"), "runId": run,
+                                     "verdict": verdict, "finishedAt": at}, separators=(",", ":")) + "\n")
+            os.replace(vpath + ".tmp", vpath)
+        if verb == "challenger-timeout":
+            st["challengerDisposition"] = "no-disposition"
+            write(p, st)
+        if f == "partial":
+            return "partial", 1  # died after verdict.json, slot still held
+        with open(vpath, "rb") as fh:
+            digest = hashlib.sha256(fh.read().rstrip(b"\n")).hexdigest()
         pr = st.get("pr")
         write(os.path.join(gs, "pr-{}-verdict.json".format(pr)), {"runId": run, "verdict": verdict,
                                                                    "sha": st.get("activeSha")})
-        st.update({"completedRunId": run, "completedVerdict": verdict, "completedAt": at, "activeRunId": None,
+        st.update({"completedRunId": run, "completedVerdict": verdict, "completedAt": at,
+                   "completedVerdictDigest": digest, "activeRunId": None,
                    "activeSha": None, "activeLeaseOwner": None, "activeClaimant": None})
-        if verb == "challenger-timeout":
-            st["challengerDisposition"] = "no-disposition"
         write(p, st)
         if f == "fail-after":
             return "fail-after", 1  # killed after the write, no output

@@ -123,6 +123,10 @@ POST_FINISH_SLOTS = ("freeze-close",)
 # Journal kinds whose obligations must all be receipted before a GO finish.
 PRE_FINISH_KINDS = ("send", "gh", "dispatch")
 OWNER_STEP_SLA_SECONDS = 3600
+# A send awaiting its delivery receipt, or a GitHub write awaiting its marker
+# read-back, older than this raises controller_obligation_overdue (once). It
+# never resends: a missing receipt is ambiguous and keeps its message id.
+RECEIPT_SLA_SECONDS = 1800
 CRITIC_WAIT_SECONDS = 1200
 # The fresh critic's machine-readable output (new contract; its brief asks for
 # {screens:[{screen, grade, reason}]}). Today its lines live only in
@@ -178,6 +182,19 @@ def obligation_key(run_id, kind, slot):
 
 def send_id(key, attempt):
     return "{}#{}".format(key, attempt)
+
+
+def gate_alarm_ids(wake, now):
+    """(pseudo run, fingerprint, send slot) for one gate alarm wake. Shared by
+    the controller and the live worker's queue drain, so "is this queued
+    alarm journaled yet" asks the same question the controller answers. The
+    day comes from when the wake was queued, not when it was drained."""
+    day = (parse_iso(wake.get("queuedAt")) or now).strftime("%Y%m%d")
+    fp = wake.get("fingerprint") or wake.get("runId") or hashlib.sha256(
+        json.dumps({k: v for k, v in wake.items() if k not in ("schemaVersion", "queuedAt")},
+                   sort_keys=True).encode()).hexdigest()[:16]
+    fp = re.sub(r"[^A-Za-z0-9._:-]", "-", "{}:{}".format(wake.get("trigger"), fp))[:150]
+    return PSEUDO_PREFIX + "gate." + day, fp, "gate:{}".format(fp)
 
 
 def crash_point(point, kind="", slot=""):
@@ -1180,6 +1197,39 @@ class GateView:
             return {"error": err}
         return doc
 
+    def finish_state(self, run_id, verdict_doc):
+        """Has the gate's `finish` COMPLETED for this run, not just written
+        verdict.json? The gate writes verdict.json first (smoke-pr-gate.sh:
+        4160-4176), then suspend/publish/hold/ledger, and only then clears the
+        slot and records completedRunId/completedVerdict/completedVerdictDigest
+        in one state write (:4557-4563). So:
+          "held"      the slot is still this run's: finish is partial;
+          "complete"  the completed state names this run and agrees with
+                      verdict.json (verdict, and digest when recorded);
+          "unknown"   neither: a successor overwrote the receipt, or the slot
+                      moved without one."""
+        for st in self.pr_states.values():
+            if st.get("activeRunId") == run_id:
+                return "held"
+        for st in self.pr_states.values():
+            if st.get("completedRunId") != run_id:
+                continue
+            if st.get("completedVerdict") not in (None, verdict_doc.get("verdict")):
+                return "unknown"
+            digest = st.get("completedVerdictDigest")
+            if digest:
+                try:
+                    with open(os.path.join(self.dir, "runs", run_id, "verdict.json"), "rb") as fh:
+                        raw = fh.read()
+                except OSError:
+                    return "unknown"
+                # verdict_digest hashes the compact payload; the file holds it
+                # plus one newline (smoke-pr-gate.sh:205-211, :4170).
+                if hashlib.sha256(raw.rstrip(b"\n")).hexdigest() != digest:
+                    return "unknown"
+            return "complete"
+        return "unknown"
+
     def pr_verdict(self, pr):
         doc, _ = read_json_file(os.path.join(self.dir, "pr-{}-verdict.json".format(pr)))
         return doc
@@ -1396,6 +1446,7 @@ class Controller:
         self.tasks = self._load_json_arg(args.tasks_json, [])
         self.pr_heads = {str(k): v for k, v in self._load_json_arg(args.pr_heads_json, {}).items()}
         self.poll = self._load_json_arg(args.poll_json, None)
+        self.queued_alarms = self._load_alarm_queue(getattr(args, "alarm_queue_dir", None))
         # Cutover (live only): runs the gate had claimed when this controller
         # first went live. They finish under the legacy coordinator; this
         # controller never records, steps, stamps or finishes them.
@@ -1429,6 +1480,23 @@ class Controller:
         if detail:
             rec["detail"] = detail
         return self.journal.append(rec)
+
+    def _load_alarm_queue(self, qdir):
+        """Gate alarm wakes the live worker queued (wrapper/alarms/*.json).
+        An unreadable entry refuses the fire: dropping it would lose a one-shot
+        alarm the gate has already latched."""
+        if not qdir:
+            return []
+        out = []
+        for name in sorted(os.listdir(qdir)):
+            if not name.endswith(".json"):
+                continue
+            doc, err = read_json_file(os.path.join(qdir, name))
+            wake = doc.get("data") if isinstance(doc, dict) else None
+            if err or not isinstance(wake, dict) or not wake.get("trigger"):
+                raise ControllerError("queued gate alarm {} unreadable: {}".format(name, err or "no data.trigger"))
+            out.append(wake)
+        return out
 
     def decide(self, run_id, phase, dtype, cls, reason, **extra):
         d = {"at": iso(self.now), "fire": self.fire, "runId": run_id, "phase": phase, "type": dtype,
@@ -1614,7 +1682,7 @@ class Controller:
             return "intent"
         return self._effect_failed(run_id, "gh", slot, 1, result, "controller_gh_failed")
 
-    def gate_verb(self, run_id, phase, verb, argv_tail, verdict):
+    def gate_verb(self, run_id, phase, verb, argv_tail, verdict, effect_verb=None):
         key = obligation_key(run_id, "gate", verb)
         ob = self.obligations().get(key)
         if ob and ob["state"] in TERMINAL_OK | {"failed_terminal"}:
@@ -1627,7 +1695,8 @@ class Controller:
         # and `challenger-timeout` refuses once the slot is gone or a
         # disposition exists (smoke-pr-gate.sh:4575-4625) -- so an intent with
         # no recorded outcome is simply re-offered.
-        result = self.effects.perform({"type": "gate", "runId": run_id, "verb": verb, "args": argv_tail})
+        result = self.effects.perform({"type": "gate", "runId": run_id, "verb": effect_verb or verb,
+                                       "args": argv_tail})
         self.decide(run_id, phase, "gate", "mechanical", "obligation due", verb=verb, args=argv_tail,
                     effect=result["outcome"])
         crash_point("after-effect", "gate", verb)
@@ -1733,6 +1802,8 @@ class Controller:
             if ob and ob["state"] not in ("done", "abandoned"):
                 self.record(run_id, "owner", step, "done", 1)
             return "done"
+        if ob and ob["state"] in ("abandoned", "failed_terminal"):
+            return ob["state"]  # never re-enqueued
         if not ob or ob["state"] == "intent":
             if not ob:
                 self.record(run_id, "owner", step, "intent", 1)
@@ -1803,15 +1874,19 @@ class Controller:
 
     def _gate_alarm(self, wake):
         trigger = wake.get("trigger")
-        day = self.now.strftime("%Y%m%d")
-        pseudo = PSEUDO_PREFIX + "gate." + day
-        fp = wake.get("fingerprint") or wake.get("runId") or hashlib.sha256(
-            json.dumps({k: v for k, v in wake.items() if k not in ("schemaVersion",)}, sort_keys=True).encode()
-        ).hexdigest()[:16]
-        fp = re.sub(r"[^A-Za-z0-9._:-]", "-", "{}:{}".format(trigger, fp))[:150]
+        pseudo, fp, slot = gate_alarm_ids(wake, self.now)
+        day = pseudo.rsplit(".", 1)[-1]
         self.decide(pseudo, None, "alarm", "mechanical", trigger, fingerprint=fp)
-        self.send(pseudo, "alarm", "gate:{}".format(fp), fingerprint=fp, hint={"gateAlarm": wake},
+        self.send(pseudo, "alarm", slot, fingerprint=fp, hint={"gateAlarm": wake},
                   thread_key=re.sub(r"[^A-Za-z0-9._:-]", "-", "gate-{}-{}".format(day, fp))[:120])
+
+    def _poll_alarm(self, wake, obs):
+        if wake.get("trigger") == "pr_run_stalled" and wake.get("runId") and \
+                wake["runId"] not in self.legacy and obligation_key(wake["runId"], "run", "claim") in obs:
+            # One of OUR runs stopped stamping: the controller itself was
+            # down. It is resumable only by a human (the wake's own hint).
+            self.decide(wake["runId"], None, "escalate", "coordination_model", "pr_run_stalled on a controller run")
+        self._gate_alarm(wake)
 
     def reconcile_claims(self):
         obs = self.obligations()
@@ -1822,13 +1897,15 @@ class Controller:
         # one the controller has no words for is posted verbatim, never dropped.
         is_alarm = isinstance(wake, dict) and wake.get("trigger") not in (None, "pr_build_settled") and \
             isinstance(self.poll, dict) and self.poll.get("wakeAgent") is True
+        if self.live:
+            # The live worker queues every alarm wake durably before stepping
+            # (the gate latches it and will not emit it again), and passes
+            # them here; each is journaled by its fingerprint, so a replay of
+            # a queue entry already journaled is not a second post.
+            for queued in self.queued_alarms:
+                self._poll_alarm(queued, obs)
         if is_alarm and self.live:
-            if wake.get("trigger") == "pr_run_stalled" and wake.get("runId") and \
-                    wake["runId"] not in self.legacy and obligation_key(wake["runId"], "run", "claim") in obs:
-                # One of OUR runs stopped stamping: the controller itself was
-                # down. It is resumable only by a human (the wake's own hint).
-                self.decide(wake["runId"], None, "escalate", "coordination_model", "pr_run_stalled on a controller run")
-            self._gate_alarm(wake)
+            self._poll_alarm(wake, obs)
         elif isinstance(wake, dict) and wake.get("trigger") == "pr_build_settled" and wake.get("runId"):
             run = wake["runId"]
             if run in self.legacy:
@@ -1881,6 +1958,87 @@ class Controller:
         self.decide(run_id, None, "escalate", "coordination_model", "controller_no_authority")
         return False
 
+    def _finish_receipt(self, run_id, run_ob, verdict_doc):
+        """complete | held | unknown. Our own terminal verb answering ok is a
+        completion receipt (the gate prints ok only after its final state
+        write). One observed completion is journaled, so a successor run later
+        overwriting completedRunId cannot un-complete this one."""
+        if (run_ob or {}).get("detail", {}).get("gateCompleted"):
+            return "complete"
+        obs = self.obligations()
+        own_ok = any((obs.get(obligation_key(run_id, "gate", v)) or {}).get("detail", {}).get("outcome") == "ok"
+                     for v in TERMINAL_VERBS + ("finish-resume",))
+        fin = "complete" if own_ok else self.gate.finish_state(run_id, verdict_doc)
+        if fin == "complete" and run_ob and run_ob["state"] not in ("done", "abandoned"):
+            self.record(run_id, "run", "claim", run_ob["state"], 1, {"gateCompleted": True})
+        return fin
+
+    def _finish_incomplete(self, run_id, run_ob, claim, verdict_doc, fin):
+        """verdict.json exists but the gate's finish has not completed. Live,
+        with authority, re-run the gate's crash-safe `finish` with the verdict
+        already on file: it resumes from verdict.json (smoke-pr-gate.sh:
+        4002-4027, RUN_VERDICT_RESUMED) and redoes the idempotent hold/ledger
+        and slot cleanup. Shadow waits. A completion that cannot be confirmed
+        at all is alarmed once and escalated; it never reaches post_finish."""
+        verdict = verdict_doc.get("verdict")
+        if fin == "unknown":
+            if run_ob and not run_ob["detail"].get("finishUnconfirmed"):
+                self.record(run_id, "run", "claim", run_ob["state"], 1, {"finishUnconfirmed": True})
+                self.alarm(run_id, "controller_finish_unconfirmed", "finish-unconfirmed:{}".format(run_id[-40:]),
+                           {"verdict": verdict})
+            self.decide(run_id, "verdict", "escalate", "coordination_model",
+                        "verdict.json exists but the gate's completed state does not confirm it")
+            return "verdict"
+        if not self.live:
+            self.decide(run_id, "verdict", "wait", "wait",
+                        "gate finish partial: verdict.json written, slot still held", verdict=verdict)
+            return "verdict"
+        if claim is None or not self._authority(run_id, run_ob, claim):
+            return "held"
+        ob = self.obligations().get(obligation_key(run_id, "gate", "finish-resume"))
+        if ob and ob["state"] == "done":
+            # Resumed ok this fire; the next fire's state read confirms it.
+            return "verdict"
+        if ob and ob["state"] == "failed_terminal":
+            return "verdict"
+        # An unanswered resume is simply re-offered: the gate's finish is
+        # idempotent on the same terminal facts.
+        self.gate_verb(run_id, "verdict", "finish-resume",
+                       [verdict_doc.get("sha") or claim.get("sha"), run_id, verdict], verdict, effect_verb="finish")
+        return "verdict"
+
+    def _alarm_overdue(self, run_id, phase):
+        """Every pre-finish obligation stuck past its SLA raises its own alarm,
+        once. A missing receipt otherwise waits silently, while the
+        controller's progress stamps keep the gate's stale-run detection
+        quiet. Never a resend: the obligation keeps its message id. (The
+        gate's pr_run_overrun fires on claim AGE whatever the stamps say,
+        smoke-pr-gate.sh:5025-5048: the run-level backstop.)"""
+        obs = self.obligations()
+        for ob in list(obs.values()):
+            if ob["runId"] != run_id or ob["kind"] not in PRE_FINISH_KINDS or ob["slot"] in POST_FINISH_SLOTS:
+                continue
+            if ob["state"] not in ("intent", "enqueued") or ob["slot"].startswith("alarm:"):
+                continue
+            if ob["kind"] == "dispatch" and ob["detail"].get("ambiguous"):
+                continue  # already escalated as ambiguous
+            since = None
+            for rec in reversed(ob["history"]):
+                if rec.get("state") != ob["state"]:
+                    break
+                since = rec.get("at")
+            started = parse_iso(since)
+            sla = OWNER_STEP_SLA_SECONDS if ob["kind"] == "dispatch" else RECEIPT_SLA_SECONDS
+            if not started or (self.now - started).total_seconds() <= sla:
+                continue
+            fp = "overdue:{}".format(ob["key"][:12])
+            if obligation_key(run_id, "send", "alarm:" + fp) in obs:
+                continue
+            label = "{}:{}".format(ob["kind"], ob["slot"])
+            self.alarm(run_id, "controller_obligation_overdue", fp,
+                       {"obligation": label, "state": ob["state"], "since": since})
+            self.decide(run_id, phase, "escalate", "coordination_model", "obligation overdue", obligation=label)
+
     # -- one run ------------------------------------------------------------
 
     def step_run(self, run_id):
@@ -1899,6 +2057,12 @@ class Controller:
                         error=verdict_doc.get("error"))
             return "unknown"
         if verdict_doc:
+            fin = self._finish_receipt(run_id, run_ob, verdict_doc)
+            if fin != "complete":
+                # verdict.json alone is NOT a finished run: the gate writes it
+                # before hold/ledger/slot cleanup. Never post_finish (and so
+                # never freeze-close) until the gate's completed state agrees.
+                return self._finish_incomplete(run_id, run_ob, claim, verdict_doc, fin)
             for verb in TERMINAL_VERBS:
                 own = obs.get(obligation_key(run_id, "gate", verb))
                 if own and own["state"] == "intent":
@@ -1937,6 +2101,8 @@ class Controller:
             ka = self.effects.keepalive(run_id, run_ob["detail"].get("ownerToken"))
             if ka and not ka.get("ok"):
                 self.decide(run_id, None, "log", "mechanical", "progress stamp failed", error=ka.get("error"))
+
+        self._alarm_overdue(run_id, None)
 
         # -- phase derivation (derived, never stored) --
         if not run.exists or run.contract_error:
@@ -2003,17 +2169,25 @@ class Controller:
 
         lanes = run.barrier("lanes")
         if not lanes.get("ready"):
+            # Timeout BEFORE judgment: a run the challenger deadline ends this
+            # fire must not wake its owner for a step it will never use.
+            timed = self._maybe_challenger_timeout(run_id, claim, run)
+            if timed:
+                return timed
             self.owner_step(run_id, "lanes", "lanes", done=False)
             if lanes.get("invalid"):
                 self.decide(run_id, "lanes", "escalate", "coordination_model",
                             "lane evidence invalid (redispatch is a judgment call)",
                             invalid=lanes.get("invalid"), reasons=(lanes.get("invalidReasons") or [])[:3])
-            return self._maybe_challenger_timeout(run_id, claim, run) or "lanes"
+            return "lanes"
         self.owner_step(run_id, "lanes", "lanes", done=True)
 
         if not run.has("coordinator/preliminary.md"):
+            timed = self._maybe_challenger_timeout(run_id, claim, run)
+            if timed:
+                return timed
             self.owner_step(run_id, "preliminary", "preliminary", done=False)
-            return self._maybe_challenger_timeout(run_id, claim, run) or "preliminary"
+            return "preliminary"
         self.owner_step(run_id, "preliminary", "preliminary", done=True)
 
         if not run.has("challenger/disposition.md"):
@@ -2277,7 +2451,24 @@ class Controller:
         """At most ONE owner wake per fire: the task's one session runs one
         judgment turn at a time. Oldest due step first; a brief written this
         fire counts as its first offer, a re-offer is journaled."""
-        live = [w for w in self.owner_wakes if self.live]
+        obs = self.obligations()
+
+        def still_due(w):
+            # Filtered against the FINAL state of the fire: a step queued
+            # early may since have been abandoned, or its run finished, timed
+            # out or had its verdict frozen.
+            ob = obs.get(w["key"])
+            if not ob or ob["state"] != "enqueued":
+                return False
+            run_ob = obs.get(obligation_key(w["runId"], "run", "claim"))
+            if not run_ob or run_ob["state"] in ("done", "abandoned"):
+                return False
+            if obligation_key(w["runId"], "verdict", "validated") in obs:
+                return False
+            return not any(obligation_key(w["runId"], "gate", v) in obs
+                           for v in TERMINAL_VERBS + ("finish-resume",))
+
+        live = [w for w in self.owner_wakes if self.live and still_due(w)]
         if not live:
             return None
         wake = sorted(live, key=lambda w: (str(w.get("since")), w["runId"], w["step"]))[0]
@@ -2331,13 +2522,14 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
     env = os.environ.get
-    for name in ("init", "step"):
+    for name in ("init", "step", "validate"):
         s = sub.add_parser(name)
         s.add_argument("--shadow", action="store_true", help="force shadow mode whatever SMOKE_CONTROLLER_MODE says")
         s.add_argument("--out-dir", default=env("SMOKE_CONTROLLER_OUT_DIR") or env("SMOKE_CONTROLLER_SHADOW_DIR"))
         s.add_argument("--gate-state-dir", default=env("SMOKE_GATE_STATE_DIR"))
         s.add_argument("--run-root", default=env("SMOKE_GATE_RUN_ROOT"))
         s.add_argument("--poll-json")
+        s.add_argument("--alarm-queue-dir", help="live: queued gate alarm wakes (the live worker's durable queue)")
         s.add_argument("--receipts-json")
         s.add_argument("--tasks-json")
         s.add_argument("--pr-heads-json")
@@ -2377,6 +2569,13 @@ def main(argv=None):
         if args.command == "init":
             journal.init()
             print(json.dumps({"ok": True, "mode": mode, "initialized": journal.path}))
+            return 0
+        if args.command == "validate":
+            # The full load (torn tail, record schema, born mode, per-record
+            # mode) under control.lock, with no effect: the live worker runs
+            # this BEFORE any progress stamp or poll.
+            journal.load()
+            print(json.dumps({"ok": True, "mode": mode, "valid": True, "records": len(journal.records)}))
             return 0
         effects = EffectLayer(mode, live_config(args) if mode == "live" else None)
         if mode == "live" and not args.run_root:

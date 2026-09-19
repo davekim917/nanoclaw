@@ -278,6 +278,78 @@ def gate_states():
     return states, bad
 
 
+# The gate's one-shot alarm latches (smoke-pr-gate.sh:5118-5147): a poll that
+# emits the alarm first writes the latch, so an alarm lost between the poll
+# returning and the queue write would never be emitted again.
+LATCHES = (("refusedAlertSha", "pr_migrations_refused"), ("warmupAlertSha", "pr_warmup_stuck"),
+           ("factsStuckAlertSha", "pr_facts_unavailable"), ("overrunAlertRunId", "pr_run_overrun"))
+
+
+def latch_map(states):
+    out = {}
+    for pr, st in states.items():
+        for field, trigger in LATCHES:
+            v = st.get(field)
+            if isinstance(v, str) and v:
+                if field == "overrunAlertRunId":
+                    # Overrun re-arms for the same run (overrunAlertAt moves).
+                    v = "{}@{}".format(v, st.get("overrunAlertAt") or "")
+                out["{}:{}".format(pr, field)] = v
+    return out
+
+
+def alarm_fingerprint(wake):
+    key = wake.get("runId") if wake.get("trigger") in ("pr_run_overrun", "pr_run_stalled") else None
+    key = key or wake.get("sourceSha") or wake.get("runId") or "-"
+    return "{}:{}".format(wake.get("pr"), key)
+
+
+def queue_alarm(wake):
+    """Durable, once per fingerprint: wrapper/alarms/<fp>.json."""
+    wake = dict(wake)
+    wake.setdefault("fingerprint", alarm_fingerprint(wake))
+    wake.setdefault("queuedAt", FIRE)
+    _, fp, _ = ctl.gate_alarm_ids(wake, now)
+    try:
+        ctl.write_contained_once(OUT, ["wrapper", "alarms", fp + ".json"],
+                                 json.dumps({"wakeAgent": True, "data": wake}, sort_keys=True) + "\n")
+    except FileExistsError:
+        pass
+    return fp
+
+
+def alarm_queue():
+    qdir = os.path.join(WRAP, "alarms")
+    return sorted(n for n in os.listdir(qdir) if n.endswith(".json")) if os.path.isdir(qdir) else []
+
+
+def journal_fail_closed(reason, detail):
+    """The journal is not trustworthy: no progress stamp, no poll, no step.
+    One chat alarm per day, straight through enqueue-send (idempotent on its
+    id), because the journaled alarm path is exactly what is broken."""
+    day = FIRE[:10].replace("-", "")
+    # Constant per day: the helper replays an id only with the SAME payload
+    # (enqueue-send.ts, mismatch otherwise), so the varying detail stays in
+    # the fire log, not the post.
+    text = ("Smoke controller (live) stopped: its journal failed validation. No run is being advanced and "
+            "nothing new is claimed until a human repairs or moves {}. The fire log ({}) has the error.").format(
+        os.path.join(OUT, "journal.ndjson"), os.path.join(WRAP, "fires.ndjson"))
+    sent = False
+    try:
+        text_path = ctl.write_contained_atomic(OUT, ["wrapper", "journal-invalid.txt"], text + "\n")
+        rc, out, err = run(ENQUEUE.split() + ["--id", "ctl.journal-invalid.{}#1".format(day), "--to", SEND_TO,
+                                              "--text-file", text_path,
+                                              "--thread-key", "ctl.journal-invalid-{}".format(day),
+                                              # per day: the helper's budget is per run id
+                                              "--run-id", "ctl.journal.{}".format(day), "--fire", FIRE,
+                                              "--fingerprint", "journal-invalid"], 30, CHILD_ENV)
+        sent = rc is not None and (ctl.last_json_line(out) or {}).get("ok") is True
+    except (OSError, ctl.ControllerError) as exc:
+        log("journal alarm not staged: {}".format(exc))
+    finish({"stepped": False, "skipped": "journal failed validation: " + reason,
+            "alarm": "controller_journal_error", "alarmSent": sent, "error": detail[:300]})
+
+
 def fold_journal():
     folded = {}
     path = os.path.join(OUT, "journal.ndjson")
@@ -306,24 +378,63 @@ def main():
             summary["initialized"] = True
         write(["wrapper", "initialized"], FIRE + "\n")
 
+    # -- the journal is validated in full BEFORE any gate effect ---------------------
+    # Torn tail, record schema, born mode and per-record mode, under
+    # control.lock (the controller's own load). Never "empty" on error.
+    rc, out, err = run(["python3", CTL, "validate", "--out-dir", OUT, "--lock-timeout", "5"], 20, CHILD_ENV)
+    doc = ctl.last_json_line(out) if rc is not None else None
+    if not isinstance(doc, dict):
+        finish({"skipped": "journal validation did not answer", "controllerRc": rc,
+                "error": (err or "").strip()[-300:]})
+    if doc.get("skipped"):
+        finish({"skipped": "journal validation: " + str(doc["skipped"])})
+    if not doc.get("valid"):
+        journal_fail_closed(str(doc.get("alarm") or "invalid"), str(doc.get("error") or (err or "").strip()))
+    try:
+        folded = fold_journal()
+    except (OSError, ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+        journal_fail_closed("unreadable after validation", str(exc))
+
     # -- cutover: once, BEFORE this controller's first poll ------------------------
     cutover = os.path.join(OUT, "cutover.json")
+    latches_path = os.path.join(WRAP, "latches.json")
     states, bad = gate_states()
-    if not os.path.lexists(cutover):
+    if not os.path.lexists(cutover) or not os.path.lexists(latches_path):
         if bad:
             finish({"skipped": "cannot write the cutover: gate state unreadable ({})".format(", ".join(bad))})
+        if not os.path.lexists(latches_path):
+            # Baseline: latches set before this controller ever polled were
+            # the legacy coordinator's alarms, not ours to re-post.
+            write(["wrapper", "latches.json"], json.dumps(latch_map(states), sort_keys=True))
+    if not os.path.lexists(cutover):
         legacy = sorted(st["activeRunId"] for st in states.values()
                         if isinstance(st.get("activeRunId"), str) and st.get("activeClaimant") != "controller")
         ctl.write_contained_once(OUT, ["cutover.json"], json.dumps(
             {"schemaVersion": 1, "flippedAt": FIRE, "legacyRuns": legacy}, sort_keys=True) + "\n")
         summary["cutover"] = {"legacyRuns": legacy}
 
+    # -- gate alarm latches the queue has not seen (the poll-return crash window) ---
+    if bad:
+        finish({"skipped": "gate state unreadable ({}): latches cannot be reconciled".format(", ".join(bad))})
+    acked, acked_err = read_json(latches_path)
+    if acked_err or not isinstance(acked, dict):
+        finish({"skipped": "wrapper/latches.json unreadable: {}".format(acked_err or "not an object")})
+    current = latch_map(states)
+    for name, value in sorted(current.items()):
+        if acked.get(name) == value:
+            continue
+        pr, field = name.split(":", 1)
+        trigger = dict(LATCHES)[field]
+        run_key = value.split("@", 1)[0] if field == "overrunAlertRunId" else None
+        fp = queue_alarm({"schemaVersion": 1, "trigger": trigger, "pr": int(pr),
+                          "sourceSha": None if run_key else value, "runId": run_key,
+                          "recoveredFromGateLatch": True})
+        log("gate latch {} had no queued alarm; recovered as {}".format(name, fp))
+        summary.setdefault("recoveredAlarms", []).append(fp)
+    if current != acked:
+        write(["wrapper", "latches.json"], json.dumps(current, sort_keys=True))
+
     # -- keep our claims live, then poll (the poll may reclaim a stale run) --------
-    try:
-        folded = fold_journal()
-    except (OSError, ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
-        log("journal not readable for input planning ({}); controller will decide".format(exc))
-        folded = {}
     tokens = {ob["runId"]: ob["detail"].get("ownerToken") for ob in folded.values()
               if ob.get("kind") == "run" and ob.get("slot") == "claim" and ob.get("state") not in ("done", "abandoned")}
     for st in states.values():
@@ -333,20 +444,35 @@ def main():
             rc, out, err = run(["bash", GATE_CMD, "progress", run_id, tokens[run_id]], 20, GATE_ENV)
             if not (ctl.last_json_line(out) or {}).get("ok"):
                 log("progress stamp for {} failed: {}".format(run_id, (err or out or "").strip()[:120]))
-    rc, out, err = run(["bash", GATE_CMD, "poll"], POLL_TIMEOUT, GATE_ENV)
-    poll = ctl.last_json_line(out) if rc is not None else None
+    poll = None
     poll_path = None
+    pending_alarms = alarm_queue()
+    if pending_alarms:
+        # Queued alarms are drained into the journal BEFORE the next poll: a
+        # queue that never drains must not let polls keep claiming runs.
+        summary["pollSkipped"] = "{} queued gate alarm(s) to drain first".format(len(pending_alarms))
+    else:
+        rc, out, err = run(["bash", GATE_CMD, "poll"], POLL_TIMEOUT, GATE_ENV)
+        poll = ctl.last_json_line(out) if rc is not None else None
+        if not isinstance(poll, dict):
+            log("gate poll gave no result: rc={} {}".format(rc, (err or "").strip()[:160]))
+            summary["pollError"] = True
     if isinstance(poll, dict):
-        poll_path = write(["wrapper", "inputs", "poll.json"], json.dumps(poll, sort_keys=True))
         data = poll.get("data") if isinstance(poll.get("data"), dict) else {}
         summary["pollTrigger"] = data.get("trigger")
+        if poll.get("wakeAgent") is True and data.get("trigger") not in (None, "pr_build_settled"):
+            # An alarm: the gate has latched it and will not emit it again.
+            # Queued durably first, then the latch is acknowledged.
+            queue_alarm(data)
+            states_now, bad_now = gate_states()
+            if not bad_now:
+                write(["wrapper", "latches.json"], json.dumps(latch_map(states_now), sort_keys=True))
+        else:
+            poll_path = write(["wrapper", "inputs", "poll.json"], json.dumps(poll, sort_keys=True))
         if data.get("trigger") == "pr_build_settled" and ctl.RUN_ID_RE.match(str(data.get("runId") or "")):
             # Kept until the controller journals the claim, so a fire killed
             # between the poll and the step does not lose the wake's fields.
             write(["wrapper", "wakes", data["runId"] + ".json"], json.dumps(poll, sort_keys=True))
-    else:
-        log("gate poll gave no result: rc={} {}".format(rc, (err or "").strip()[:160]))
-        summary["pollError"] = True
     states, bad = gate_states()
     active = {st["activeRunId"]: pr for pr, st in states.items() if isinstance(st.get("activeRunId"), str)}
     if not (isinstance(poll, dict) and (poll.get("data") or {}).get("trigger") == "pr_build_settled"):
@@ -439,6 +565,8 @@ def main():
             argv += [flag, os.environ[key]]
     if poll_path:
         argv += ["--poll-json", poll_path]
+    if alarm_queue():
+        argv += ["--alarm-queue-dir", os.path.join(WRAP, "alarms")]
     rc, out, err = run(argv, step_budget, CHILD_ENV)
     summary["controllerRc"] = rc
     res = ctl.last_json_line(out) or {}
@@ -450,6 +578,24 @@ def main():
                 "error": str(res.get("error") or (err or "").strip())[:300]})
     if res.get("skipped"):
         finish({"stepped": False, "skipped": "controller: " + str(res["skipped"])})
+    # Queued alarms the journal now holds are drained (any state: a budget
+    # refusal records nothing and so stays queued for the next fire).
+    try:
+        folded_after = fold_journal()
+    except (OSError, ValueError, KeyError, TypeError, UnicodeDecodeError):
+        folded_after = {}
+    for name in alarm_queue():
+        doc, _ = read_json(os.path.join(WRAP, "alarms", name))
+        wake = doc.get("data") if isinstance(doc, dict) else None
+        if not isinstance(wake, dict):
+            continue
+        pseudo, _, slot = ctl.gate_alarm_ids(wake, now)
+        if ctl.obligation_key(pseudo, "send", slot) in folded_after:
+            try:
+                os.unlink(os.path.join(WRAP, "alarms", name))
+            except OSError:
+                pass
+    summary["alarmsQueued"] = len(alarm_queue())
     # Settled claims no longer need their saved wake.
     for run_id in list(os.listdir(os.path.join(WRAP, "wakes")) if os.path.isdir(os.path.join(WRAP, "wakes")) else []):
         rid = run_id[:-5]
