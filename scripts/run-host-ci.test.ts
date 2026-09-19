@@ -349,6 +349,26 @@ exit 0
       expect(result.calls).not.toContain('POST');
     });
 
+    it('runs a declaration from HOST_CI_OVERLAY over a head that has none', () => {
+      const ctx = setup({ state: 'MERGED', declaration: null });
+      const overlay = path.join(ctx.root, 'overlay');
+      fs.mkdirSync(path.join(overlay, '.github'), { recursive: true });
+      fs.writeFileSync(path.join(overlay, '.github', 'host-ci.sh'), 'set -euo pipefail\necho overlaid\n');
+      const result = run(ctx, ['--pr', '7', '--repo', 'example/repository', '--dry-run'], { HOST_CI_OVERLAY: overlay });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('overlaid');
+      expect(result.statuses).toEqual([]);
+    });
+
+    it('refuses HOST_CI_OVERLAY without --dry-run, before fetching anything', () => {
+      const ctx = setup();
+      const result = run(ctx, undefined, { HOST_CI_OVERLAY: ctx.root });
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain('--dry-run only');
+      expect(result.calls).toBe('');
+      expect(result.statuses).toEqual([]);
+    });
+
     it('reports a failing declaration with exit 1, still posting nothing', () => {
       const ctx = setup({ declaration: 'set -euo pipefail\nexit 4\n' });
       const result = run(ctx, ['--pr', '7', '--repo', 'example/repository', '--dry-run']);

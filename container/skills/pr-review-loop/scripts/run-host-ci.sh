@@ -12,7 +12,10 @@
 #
 # --dry-run runs everything the same way and reports what it would post, but
 # posts nothing (no status, no comment) and also accepts a PR that is already
-# merged or closed, so a declaration can be timed against history.
+# merged or closed, so a declaration can be timed against history. With
+# HOST_CI_OVERLAY=<dir> (--dry-run only) that directory's files are copied
+# over the checked-out head first, uncommitted — how a declaration that is not
+# on that head yet (a new one, under review) is tried against a past PR.
 #
 # What merge-check does with it (codex-review.sh, ci_verdict and
 # legacy_precheck): a `CI (host)` success on the exact head stands in for a
@@ -30,9 +33,14 @@
 #
 # (one per line). Each is posted alongside `CI (host)`, with the same state,
 # ONLY when every Actions job of that name on this head is one GitHub never
-# started (never-started.jq, the predicate merge-check uses) — so it can
-# satisfy a branch rule that requires that context by name, and it is never
-# posted over a real Actions result or while Actions is healthy. Decided once,
+# started (never-started.jq, the predicate merge-check uses), so it is never
+# posted over a real Actions result or while Actions is healthy. It does NOT
+# turn a branch rule that requires that name green on its own: "If a check and
+# a commit status have the same name, both must pass when that name is
+# required" (GitHub docs, Troubleshooting required status checks), and the
+# never-started check run is still there, failed. What it gives is the host
+# verdict under the name the rule and people look for; merging still takes the
+# rule's bypass, after merge-check reads `ci=host`. Decided once,
 # before the run: a stand-in that got `pending` is always resolved with the
 # run's verdict. `CI (host)`, `Release policy` and `Release approval` cannot
 # be named.
@@ -89,6 +97,11 @@ while [ $# -gt 0 ]; do
 done
 timeout_s="${HOST_CI_TIMEOUT_SECONDS:-2400}"
 [[ "$timeout_s" =~ ^[1-9][0-9]*$ ]] || { echo "run-host-ci: HOST_CI_TIMEOUT_SECONDS must be a positive whole number" >&2; exit 2; }
+overlay="${HOST_CI_OVERLAY:-}"
+if [ -n "$overlay" ]; then
+  [ "$dry_run" = 1 ] || { echo "run-host-ci: HOST_CI_OVERLAY is for --dry-run only — a posted status comes from the head's own declaration" >&2; exit 2; }
+  [ -d "$overlay" ] || { echo "run-host-ci: HOST_CI_OVERLAY=$overlay is not a directory" >&2; exit 2; }
+fi
 
 for tool in git gh jq flock ionice nice timeout mktemp tee tail; do
   command -v "$tool" >/dev/null || { echo "run-host-ci: $tool is not installed" >&2; exit 1; }
@@ -195,6 +208,10 @@ git -C "$src" fetch -q --depth=1 --no-tags "https://github.com/$repo.git" "$head
 git -C "$src" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
 got=$(git -C "$src" rev-parse HEAD)
 [ "$got" = "$head" ] || { echo "run-host-ci: fetched $got, not $head" >&2; exit 1; }
+if [ -n "$overlay" ]; then
+  cp -R "$overlay/." "$src/"
+  echo "run-host-ci: --dry-run with $overlay copied over the head (uncommitted)" >&2
+fi
 
 if [ ! -f "$src/$DECLARATION" ]; then
   echo "run-host-ci: $repo declares no host CI at $head — add $DECLARATION (the CI-equivalent commands, run with bash from the repo root) in that repository. Refusing to guess its commands." >&2
