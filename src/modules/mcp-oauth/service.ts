@@ -760,6 +760,43 @@ async function ensureSecretDeclared(agentGroupId: string, secretName: string): P
   return added;
 }
 
+/**
+ * The inverse of `ensureSecretDeclared`: drop these spellings of the bearer
+ * from the group's `container.json` `onecliSecrets`, leaving every other
+ * declaration exactly as it was. Only `remove --delete-secret` calls it, and
+ * only just before deleting the secret they name (#929).
+ *
+ * `spellings` is the secret NAME and, when the vault ref resolved, its UUID:
+ * `onecliSecrets` accepts either (`resolveSecretUuids`,
+ * `src/onecli-secrets.ts:449`), `ensureSecretDeclared` only ever writes the
+ * name, but an operator may have declared the UUID by hand — and once the
+ * secret is deleted, a leftover declaration in EITHER spelling aborts the
+ * spawn. Matching is exact, as `matchDeclarations` compares
+ * (`src/onecli-secrets.ts:473`).
+ *
+ * Returns true when at least one declaration was removed.
+ */
+async function ensureSecretUndeclared(agentGroupId: string, spellings: string[]): Promise<boolean> {
+  const group = await getAgentGroup(agentGroupId);
+  // No group means no `container.json` to declare anything in, so there is
+  // nothing to undo. Not a failure: the caller's delete is still correct.
+  if (!group) return false;
+  const drop = new Set(spellings);
+  // Read-only fast path, the mirror of `ensureSecretDeclared`'s: a rewrite of
+  // container.json takes the file lock, and an integration whose bearer was
+  // never declared is the common case for a hand-made `--secret`.
+  if (!(readContainerConfig(group.folder).onecliSecrets ?? []).some((name) => drop.has(name))) return false;
+  let removed = false;
+  await updateContainerConfig(group.folder, (config) => {
+    const current = config.onecliSecrets ?? [];
+    const kept = current.filter((name) => !drop.has(name));
+    if (kept.length === current.length) return;
+    config.onecliSecrets = kept;
+    removed = true;
+  });
+  return removed;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Refresh
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1229,6 +1266,8 @@ export interface RemoveResult {
   removedRow: boolean;
   removedBundle: boolean;
   removedSecret: boolean;
+  /** True when this call dropped the bearer from the group's `onecliSecrets`. */
+  undeclaredSecret: boolean;
   secretName: string | null;
 }
 
@@ -1236,10 +1275,24 @@ export interface RemoveResult {
  * Forget an integration. The OneCLI secret is left alone unless
  * `deleteSecret` is asked for: it may be one the operator made by hand and
  * other things may match on it, and an accidental delete is not recoverable
- * from here — the vault has no read-back. The group's `container.json`
- * declaration is left alone for the same reason; an undeclared-but-present
- * secret is inert, a deleted one that something still declares fails the spawn
- * closed (`src/onecli-secrets.ts:432`).
+ * from here — the vault has no read-back.
+ *
+ * `deleteSecret` also drops the bearer from the group's `container.json`
+ * `onecliSecrets`, because the two must move together (#929). Leaving that to
+ * the operator as a separate step left a window the refresher could land in:
+ * `refreshOne` re-declares the bearer on every successful refresh
+ * (`service.ts:1210`), so a refresh between a hand edit and this call
+ * re-declared a name this call was about to delete, and `applyOnecliSecrets`
+ * aborts the spawn on a declaration it cannot resolve
+ * (`src/onecli-secrets.ts:464`) — every spawn for that group, until someone
+ * edited the file again. Both run under the same per-name lock
+ * (`withIntegrationLock`, taken by `removeIntegration` and by
+ * `refreshExpiringMcpOAuthIntegrations` at `service.ts:1066`), so doing it here
+ * closes the window rather than narrowing it.
+ *
+ * Plain `remove` still leaves the declaration alone: an
+ * undeclared-but-present secret is inert, but an undeclared one the operator
+ * still wants granted is a 401 they did not ask for.
  */
 export function removeIntegration(name: string, options: { deleteSecret?: boolean } = {}): Promise<RemoveResult> {
   assertIntegrationName(name);
@@ -1249,14 +1302,55 @@ export function removeIntegration(name: string, options: { deleteSecret?: boolea
 async function removeIntegrationLocked(name: string, options: { deleteSecret?: boolean }): Promise<RemoveResult> {
   const row = await getMcpOAuthIntegration(name);
   let removedSecret = false;
+  let undeclaredSecret = false;
   if (options.deleteSecret && row) {
     const ref = row.bearer_secret_id
       ? { id: row.bearer_secret_id, name: row.bearer_secret_name }
       : await findOnecliSecretByName(row.bearer_secret_name);
-    if (ref) removedSecret = await deleteOnecliSecret(ref.id);
+    // UNDECLARE FIRST, and abort the whole removal if it fails. The two orders
+    // fail in very different ways: declaration-then-delete leaves a group
+    // declaring a secret that no longer exists, which fails EVERY spawn closed
+    // and needs a hand edit to escape; delete-then-declaration leaves at worst
+    // a declaration of a name that is simply not in the vault yet — and here,
+    // because nothing is deleted when the undeclare throws, it leaves the
+    // integration exactly as it was, so re-running the same command is the
+    // whole recovery.
+    try {
+      undeclaredSecret = await ensureSecretUndeclared(row.agent_group_id, [
+        row.bearer_secret_name,
+        ...(ref ? [ref.id] : []),
+      ]);
+    } catch (err) {
+      log.error('MCP OAuth remove --delete-secret aborted: could not undeclare the bearer in container.json', {
+        integration: name,
+        agentGroupId: row.agent_group_id,
+        secretName: row.bearer_secret_name,
+        err,
+      });
+      throw new Error(
+        `Could not remove "${row.bearer_secret_name}" from the onecliSecrets of agent group ${row.agent_group_id}: ` +
+          `${err instanceof Error ? err.message : String(err)}. Nothing was deleted — the integration, its bearer ` +
+          `secret and the declaration are all untouched. Fix the container.json write and run the same command again.`,
+        { cause: err },
+      );
+    }
+    if (ref) {
+      // The declaration is already gone, so a failure here cannot produce the
+      // spawn-abort shape. It leaves an orphan secret in the vault, which is
+      // inert and named in the error, and the row untouched, so a retry
+      // resolves the same ref again.
+      removedSecret = await deleteOnecliSecret(ref.id);
+    }
   }
   pendingSecretWrites.delete(name);
   const removedBundle = deleteMcpOAuthBundle(name);
   const removedRow = await deleteMcpOAuthIntegration(name);
-  return { name, removedRow, removedBundle, removedSecret, secretName: row?.bearer_secret_name ?? null };
+  return {
+    name,
+    removedRow,
+    removedBundle,
+    removedSecret,
+    undeclaredSecret,
+    secretName: row?.bearer_secret_name ?? null,
+  };
 }

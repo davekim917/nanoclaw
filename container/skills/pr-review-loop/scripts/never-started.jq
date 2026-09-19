@@ -9,3 +9,9 @@
 # whether a `CI (host)` status may stand in for a required workflow. Loaded
 # with `jq -L <this directory>` and `include "never-started";`.
 def never_started: .status == "completed" and ((.steps // []) | length) == 0 and (.runner_id // 0) == 0 and (.runner_name // "") == "";
+
+# The same question about a whole ATTEMPT of a run, given its jobs listing as
+# `--paginate --slurp` prints it (an array of pages, each `{jobs: [...]}`):
+# at least one job, every one of them never_started, and one of them `failure`.
+# A run with no jobs at all answers false — not knowing is never an excuse.
+def run_never_started: [ .[].jobs[]? ] | length > 0 and all(.[]; never_started) and any(.[]; .conclusion == "failure");

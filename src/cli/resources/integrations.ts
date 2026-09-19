@@ -335,13 +335,28 @@ registerResource({
           name: 'delete_secret',
           type: 'boolean',
           description:
-            "Also delete the OneCLI bearer secret. Remove it from the group's container.json first, or the next spawn fails closed.",
+            "Also delete the OneCLI bearer secret, and drop it from the group's container.json onecliSecrets first, in one step under the same lock the refresher takes.",
         },
       ],
       handler: async (args) =>
         removeIntegration(String(args.name), {
           deleteSecret: flag(args.delete_secret),
         }),
+      formatHuman: (data) => {
+        const d = data as Awaited<ReturnType<typeof removeIntegration>>;
+        const lines = [
+          `removed: ${d.name}`,
+          `registry row: ${d.removedRow ? 'deleted' : 'not found'}`,
+          `oauth bundle: ${d.removedBundle ? 'deleted' : 'not found'}`,
+        ];
+        if (d.secretName) {
+          lines.push(`bearer secret ${d.secretName}: ${d.removedSecret ? 'deleted from the vault' : 'left in place'}`);
+          lines.push(
+            `container.json declaration: ${d.undeclaredSecret ? 'removed' : 'left in place (it was not declared, or --delete-secret was not given)'}`,
+          );
+        }
+        return lines.join('\n');
+      },
     },
 
     refresh: {

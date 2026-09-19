@@ -225,8 +225,9 @@ An integration's `--group` is fixed at its first `login`. A re-login naming a di
 refused, because moving it silently would point `complete` at the new group's `container.json` while
 leaving the old group's declaration in place — and a declared secret is granted on every spawn, so
 the old group would keep a live bearer, and on a shared `--secret` would keep receiving refreshed
-ones. To move one: `remove` it, drop its secret from the old group's `container.json`
-`onecliSecrets`, then log in under the new group.
+ones. To move one: `remove --delete-secret` it (which drops the old group's declaration for you),
+then log in under the new group. To keep the old secret, plain `remove` it and drop the declaration
+from the old group's `container.json` `onecliSecrets` by hand.
 
 ## Removing one
 
@@ -236,16 +237,31 @@ ncl integrations remove --name dropbox-files
 
 Deletes the registry row and the host-side bundle. The OneCLI secret and the `container.json`
 declaration are left alone — the secret may predate the integration and other requests may match on
-it. `--delete-secret` also deletes it; remove it from `container.json` **first**, or the next spawn
-fails closed on an unresolvable declaration.
+it.
 
-**Drop the declaration too** unless you meant to keep the secret: a name left in `onecliSecrets` is
-re-granted to that group's OneCLI agent on every spawn, so a bearer whose integration is gone stays
-usable until someone edits the file.
+```bash
+ncl integrations remove --name dropbox-files --delete-secret
+```
 
-Removal is serialized against the refresher. Every mutation of one integration — row, bundle file and
-vault secret — runs under one per-name lock, so a removal that lands while a refresh is awaiting the
-token endpoint cannot be undone by that refresh's continuation recreating the bundle and the secret.
+`--delete-secret` is the **single step** that ends an integration: it drops the bearer from the
+group's `container.json` `onecliSecrets` and *then* deletes the vault secret, both inside the
+per-integration lock. Editing `container.json` by hand first is no longer needed, and is now the
+worse order: a refresh landing between the hand edit and the command re-declares the bearer
+(every successful refresh re-declares it), and the delete that follows leaves the group declaring a
+secret that does not exist — which aborts **every** spawn for that group until someone edits the
+file again.
+
+If the `container.json` write fails, nothing is deleted and the integration is left exactly as it
+was; run the same command again once the file is writable.
+
+**After a plain `remove`, drop the declaration yourself** unless you meant to keep the secret: a
+name left in `onecliSecrets` is re-granted to that group's OneCLI agent on every spawn, so a bearer
+whose integration is gone stays usable until someone edits the file.
+
+Removal is serialized against the refresher. Every mutation of one integration — row, bundle file,
+vault secret and, on `--delete-secret`, the `container.json` declaration — runs under one per-name
+lock, so a removal that lands while a refresh is awaiting the token endpoint cannot be undone by
+that refresh's continuation recreating the bundle, the secret or the declaration.
 
 ## Access
 

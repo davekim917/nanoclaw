@@ -61,8 +61,9 @@ vi.mock('../../container-config.js', () => ({
   },
 }));
 
-/** Every value that reached the vault, and a switch to take the vault down. */
-const vault = { fail: false, writes: [] as { name: string; value: string }[] };
+/** Every value that reached the vault, every id deleted from it, and a switch
+ *  to take the vault down. */
+const vault = { fail: false, writes: [] as { name: string; value: string }[], deleted: [] as string[] };
 vi.mock('./onecli-secret-writer.js', () => ({
   putOnecliBearerSecret: async (spec: { name: string }, value: string) => {
     if (vault.fail) throw new Error('gateway unreachable');
@@ -70,7 +71,10 @@ vi.mock('./onecli-secret-writer.js', () => ({
     return { id: 'secret-uuid-1', name: spec.name };
   },
   findOnecliSecretByName: async () => undefined,
-  deleteOnecliSecret: async () => true,
+  deleteOnecliSecret: async (id: string) => {
+    vault.deleted.push(id);
+    return true;
+  },
 }));
 
 import { closeDb, createAgentGroup, initMigratedTestDb } from '../../db/index.js';
@@ -151,6 +155,7 @@ beforeEach(async () => {
   containerConfig.updates = 0;
   vault.fail = false;
   vault.writes.length = 0;
+  vault.deleted.length = 0;
   _resetMcpOAuthWarnStateForTesting();
   fs.rmSync(path.join(tmpRoot, 'mcp-oauth'), { recursive: true, force: true });
   await createAgentGroup({
@@ -568,5 +573,104 @@ describe('a successful refresh re-declares the bearer secret', () => {
     // `error` would be due every tick — a fresh grant per minute for a config
     // problem.
     expect((await getMcpOAuthIntegration('example-int'))!.status).toBe('active');
+  });
+});
+
+// #929: `remove --delete-secret` used to leave the group's `container.json`
+// declaration behind, and the docs made dropping it a manual step to run
+// FIRST. A refresh landing in that gap re-declared the bearer
+// (`refreshOne`'s tail), and the delete that followed left the group declaring
+// a secret that does not exist — which aborts EVERY spawn for that group
+// (`resolveSecretUuids` throws on an unresolvable declaration,
+// `src/onecli-secrets.ts:464`).
+describe('remove --delete-secret undeclares the bearer before deleting it (#929)', () => {
+  it('drops the declaration and deletes the secret in one call', async () => {
+    const secretName = await connected();
+    expect(declared).toEqual([secretName]);
+
+    const removed = await removeIntegration('example-int', { deleteSecret: true });
+
+    expect(removed.undeclaredSecret).toBe(true);
+    expect(removed.removedSecret).toBe(true);
+    expect(declared).toEqual([]);
+    expect(vault.deleted).toEqual(['secret-uuid-1']);
+  });
+
+  it('leaves the declaration and the secret alone without --delete-secret', async () => {
+    const secretName = await connected();
+
+    const removed = await removeIntegration('example-int');
+
+    expect(removed.undeclaredSecret).toBe(false);
+    expect(removed.removedSecret).toBe(false);
+    expect(declared).toEqual([secretName]);
+    expect(vault.deleted).toEqual([]);
+  });
+
+  it('removes only the bearer, leaving every other declaration in place', async () => {
+    const secretName = await connected();
+    declared.length = 0;
+    declared.push('Unrelated-One', secretName, 'Unrelated-Two');
+
+    await removeIntegration('example-int', { deleteSecret: true });
+
+    expect(declared).toEqual(['Unrelated-One', 'Unrelated-Two']);
+  });
+
+  // `onecliSecrets` accepts a name OR a UUID, and once the secret is deleted a
+  // leftover declaration in either spelling aborts the spawn the same way.
+  it('drops a declaration written as the secret UUID', async () => {
+    await connected();
+    declared.length = 0;
+    declared.push('Unrelated-One', 'secret-uuid-1');
+
+    const removed = await removeIntegration('example-int', { deleteSecret: true });
+
+    expect(removed.undeclaredSecret).toBe(true);
+    expect(declared).toEqual(['Unrelated-One']);
+  });
+
+  // Ordering: the undeclare is first BECAUSE its failure must not be able to
+  // produce the declared-but-deleted shape. Nothing is deleted, so re-running
+  // the same command is the whole recovery.
+  it('deletes nothing when the container.json write fails, and leaves the integration intact', async () => {
+    const secretName = await connected();
+    containerConfig.fail = true;
+
+    await expect(removeIntegration('example-int', { deleteSecret: true })).rejects.toThrow(/Nothing was deleted/);
+
+    expect(vault.deleted).toEqual([]);
+    expect(declared).toEqual([secretName]);
+    expect(await getMcpOAuthIntegration('example-int')).toBeDefined();
+    expect(readMcpOAuthBundle('example-int')).toBeDefined();
+  });
+
+  it('never rewrites container.json when the bearer was not declared there', async () => {
+    await connected();
+    declared.length = 0;
+    containerConfig.updates = 0;
+
+    const removed = await removeIntegration('example-int', { deleteSecret: true });
+
+    expect(removed.undeclaredSecret).toBe(false);
+    expect(containerConfig.updates).toBe(0);
+    expect(removed.removedSecret).toBe(true);
+  });
+
+  // The whole point of doing it here rather than in the operator's hands: both
+  // run under `withIntegrationLock`, so whichever order they take, a refresh
+  // cannot leave the declaration behind the removal.
+  it('a refresh racing the removal cannot leave the bearer declared', async () => {
+    await connected();
+    await markMcpOAuthIntegration('example-int', { status: 'error' });
+
+    const [, removed] = await Promise.all([
+      refreshExpiringMcpOAuthIntegrations(mints('at-late')),
+      removeIntegration('example-int', { deleteSecret: true }),
+    ]);
+
+    expect(removed.undeclaredSecret).toBe(true);
+    expect(declared).toEqual([]);
+    expect(await getMcpOAuthIntegration('example-int')).toBeUndefined();
   });
 });
