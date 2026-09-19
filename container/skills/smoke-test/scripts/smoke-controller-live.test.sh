@@ -411,21 +411,51 @@ fire
 [ ! -e "$OUT/wrapper/fire-open" ] || fail "killed: a completed fire closes its marker"
 : >"$OUT/wrapper/fire-open"
 fire
-[ "$(d .previousFireUnclosed)" = true ] && [ "$(d .previousFireAlarmSent)" = true ] && [ "$(d .stepped)" = true ] \
-  || fail "killed: the next fire alarms for an unclosed one, then steps: $OUTPUT"
+[ "$(d .previousFireUnclosed)" = true ] && [ "$(d '.alarmsOwedAtStart|tojson')" = '["wrapper-error"]' ] && [ "$(d .stepped)" = true ] \
+  || fail "killed: the next fire owes and posts the alarm for an unclosed one, then steps: $OUTPUT"
 [ "$(jq '.messages | keys | map(select(startswith("ctl.wrapper-error."))) | length' "$C/fake/enqueue.json")" = 1 ] \
-  && [ ! -e "$OUT/wrapper/fire-open" ] || fail "killed: one post, marker closed"
-# A fail-closed end whose alarm cannot be taken keeps the marker, so the next
-# fire re-offers it (same id) -- the alarm is never lost to a failed enqueue.
+  && [ ! -e "$OUT/wrapper/fire-open" ] && [ ! -e "$OUT/wrapper/pending-alarms/wrapper-error" ] \
+  || fail "killed: one post, marker closed, debt settled"
+[ "$(d '.alarmsOwed|tojson')" = null ] || fail "killed: nothing still owed: $OUTPUT"
+# A fail-closed end whose alarm cannot be taken owes it in the LEDGER, so the
+# next fire re-offers it (same id) -- never lost to a failed enqueue.
 new_case alarm-unsent
 fire
 printf '{"torn' >"$C/agent/state/control.json"
 fire SMOKE_CONTROLLER_LIVE_ENQUEUE_CMD=false
-[ "$(d .alarmSent)" = false ] && [ -e "$OUT/wrapper/fire-open" ] || fail "alarm-unsent: marker kept: $OUTPUT"
+[ "$(d .alarmSent)" = false ] && [ -e "$OUT/wrapper/pending-alarms/wrapper-error" ] \
+  && [ "$(d '.alarmsOwed|tojson')" = '["wrapper-error"]' ] || fail "alarm-unsent: the debt is ledgered: $OUTPUT"
 python3 -c 'import json;print(json.dumps({"schemaVersion":1}))' >"$C/agent/state/control.json"
 fire
-[ "$(d .previousFireAlarmSent)" = true ] && [ "$(d .stepped)" = true ] \
-  || fail "alarm-unsent: the next fire posts the lost alarm: $OUTPUT"
+[ "$(d '.alarmsOwedAtStart|tojson')" = '["wrapper-error"]' ] && [ "$(d .stepped)" = true ] \
+  && [ ! -e "$OUT/wrapper/pending-alarms/wrapper-error" ] \
+  || fail "alarm-unsent: the next fire posts the lost alarm and settles it: $OUTPUT"
+
+# --- a pending alarm is a ledger, cleared only by its own post (review round 4, #1) --
+# Codex repro: fail the alarm, repair the fault, fail the alarm AGAIN during
+# recovery. The fire now succeeds on its own terms -- and must still not
+# report a clean outcome, nor drop the debt, until the post is taken.
+new_case alarm-ledger
+fire
+printf '{"torn' >"$C/agent/state/control.json"
+fire SMOKE_CONTROLLER_LIVE_ENQUEUE_CMD=false
+[ "$(d .alarmSent)" = false ] && [ -e "$OUT/wrapper/pending-alarms/wrapper-error" ] \
+  || fail "alarm-ledger: the failing fire owes an alarm: $OUTPUT"
+python3 -c 'import json;print(json.dumps({"schemaVersion":1}))' >"$C/agent/state/control.json"
+fire SMOKE_CONTROLLER_LIVE_ENQUEUE_CMD=false
+[ "$(d .stepped)" = true ] && [ -e "$OUT/wrapper/pending-alarms/wrapper-error" ] \
+  || fail "alarm-ledger: a succeeding fire does NOT clear another fire's debt: $OUTPUT"
+[ "$(d .failClosed)" = pending-alarm ] && [ "$(d '.alarmsOwed|tojson')" = '["wrapper-error"]' ] \
+  && [ "$(d .degraded)" != null ] \
+  || fail "alarm-ledger: a fire that still owes an alarm is never reported clean: $OUTPUT"
+[ ! -e "$C/fake/enqueue.json" ] || [ "$(jq '.messages | length' "$C/fake/enqueue.json")" = 0 ] \
+  || fail "alarm-ledger: nothing was posted yet: $(cat "$C/fake/enqueue.json")"
+fire
+[ "$(d '.alarmsOwedAtStart|tojson')" = '["wrapper-error"]' ] && [ "$(d '.alarmsOwed|tojson')" = null ] \
+  && [ "$(d .failClosed)" = null ] && [ ! -e "$OUT/wrapper/pending-alarms/wrapper-error" ] \
+  || fail "alarm-ledger: the fire that takes the post settles the debt and is clean: $OUTPUT"
+[ "$(jq '.messages | keys | map(select(startswith("ctl.wrapper-error."))) | length' "$C/fake/enqueue.json")" = 1 ] \
+  || fail "alarm-ledger: exactly one post across all four fires: $(cat "$C/fake/enqueue.json")"
 
 # --- structure: every worker exit is end_fire; only _emit leaves the process ------
 python3 - "$SCRIPT_DIR/smoke-controller-live-worker.py" <<'PY' || fail "worker exit structure (see above)"
@@ -458,7 +488,20 @@ if [r for r in ast.walk(funcs["main"]) if isinstance(r, ast.Return)]:
 oks = [kw.value.value for c in calls_in(tree, "end_fire") for kw in c.keywords if kw.arg == "ok"]
 if sorted(oks) != ["not-live", "stepped"]:
     errs.append("non-failure ends are {}, want not-live + stepped".format(oks))
-# 5. Anything uncaught still ends through end_fire.
+# 5. A ledger entry is cleared in ONE place, inside the alarm that took it,
+#    and "pending-alarms" is touched only by the three ledger functions.
+settle_owner = {f.name for f in funcs.values() if calls_in(f, "alarm_settle")}
+if settle_owner != {"_wrapper_alarm"}:
+    errs.append("alarm_settle called from {}, want only _wrapper_alarm".format(sorted(settle_owner)))
+for n in ast.walk(tree):
+    if isinstance(n, ast.Constant) and n.value == "pending-alarms":
+        owner = [f.name for f in funcs.values() if n in list(ast.walk(f))]
+        if owner not in (["alarm_owed"], ["alarm_pending"], ["alarm_settle"]):
+            errs.append("pending-alarms touched outside the ledger at line {}".format(n.lineno))
+# 6. end_fire refuses a clean report while anything is owed.
+if not calls_in(funcs["end_fire"], "alarm_pending"):
+    errs.append("end_fire does not consult the ledger")
+# 7. Anything uncaught still ends through end_fire.
 if not any(isinstance(n, ast.Assign) and any(ast.unparse(t) == "sys.excepthook" for t in n.targets)
            for n in tree.body):
     errs.append("no sys.excepthook")

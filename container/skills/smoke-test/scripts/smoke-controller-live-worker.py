@@ -83,6 +83,7 @@ def under(path, root):
 # file, once applied, overrides it.
 SEND_TO = os.environ.get("SMOKE_CONTROLLER_SEND_TO", "")
 MARKER_OPEN = False  # wrapper/fire-open written this fire
+ALARM_TRIED = set()  # kinds already offered to the helper this fire
 # The per-day chat alarm for each fail-closed kind. The text is CONSTANT per
 # kind and day: enqueue-send replays an id only with the same payload
 # (enqueue-send.ts, `mismatch` otherwise), so the varying reason stays in the
@@ -97,11 +98,69 @@ FAIL_TEXT = {
 }
 
 
+def alarm_owed(kind, reason):
+    """The pending-alarm LEDGER: an alarm this wrapper owes, on disk, written
+    BEFORE the enqueue is attempted. It is independent of how any fire ends --
+    only that alarm's own successful enqueue clears it (alarm_settle), never a
+    later fire succeeding. One entry per kind; the first reason sticks."""
+    if not (WRITABLE and OUT):
+        return
+    try:
+        fd = ctl.open_contained(OUT, ["wrapper", "pending-alarms", kind],
+                                os.O_WRONLY | os.O_CREAT | os.O_EXCL, make_dirs=True)
+    except FileExistsError:
+        return  # already owed, since an earlier fire
+    except (OSError, ctl.ControllerError) as exc:
+        summary["ledgerError"] = str(exc)[:200]
+        return
+    try:
+        os.write(fd, (json.dumps({"kind": kind, "reason": str(reason)[:200], "since": FIRE}) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def alarm_pending():
+    """The kinds still owed, oldest debt first by name. Empty before the
+    out-dir resolves: a fire that fails that early has no ledger to read, and
+    re-detects its fault every fire anyway."""
+    if not OUT:
+        return []
+    try:
+        return sorted(os.listdir(os.path.join(OUT, "wrapper", "pending-alarms")))
+    except OSError:
+        return []
+
+
+def alarm_settle(kind):
+    """Clear one ledger entry. Called from exactly ONE place: _wrapper_alarm,
+    on the helper's ok. The structure test enforces that."""
+    if not OUT:
+        return
+    try:
+        os.unlink(os.path.join(OUT, "wrapper", "pending-alarms", kind))
+    except OSError:
+        pass
+
+
+def drain_pending_alarms():
+    """Alarms owed by earlier fires go out before this fire does anything
+    else, whatever this fire turns out to do."""
+    owed = alarm_pending()
+    if owed:
+        summary["alarmsOwedAtStart"] = owed
+        for kind in owed:
+            _wrapper_alarm(kind)
+
+
 def _wrapper_alarm(kind):
     """Enqueue the per-day fail-closed alarm straight through enqueue-send
     (the journaled path may be exactly what is broken). Idempotent on its id,
     so every failing fire re-offers it and the helper replays it as the same
-    row. True once the helper answered ok."""
+    row. True once the helper answered ok -- and only then is the ledger
+    entry cleared. At most one attempt per kind per fire."""
+    if kind in ALARM_TRIED:
+        return False
+    ALARM_TRIED.add(kind)
     if not SEND_TO:
         summary["alarmUnavailable"] = "no SMOKE_CONTROLLER_SEND_TO to post to"
         return False
@@ -117,7 +176,9 @@ def _wrapper_alarm(kind):
         ok = rc is not None and json.loads((out or "").strip().splitlines()[-1]).get("ok") is True
     except (ValueError, IndexError, AttributeError):
         ok = False
-    if not ok:
+    if ok:
+        alarm_settle(kind)
+    else:
         log("{} alarm not enqueued: rc={} {}".format(kind, rc, (err or "").strip()[:160]))
     return ok
 
@@ -156,11 +217,20 @@ def end_fire(extra, ok=None, kind="wrapper-error"):
     global FINISHING
     assert ok in (None, "stepped", "not-live"), ok
     FINISHING = True  # a second SIGTERM during the alarm must not re-enter
-    alarmed = False
     if ok is None:
-        alarmed = _wrapper_alarm(kind)
-        summary.update({"failClosed": kind, "alarmSent": alarmed})
-    if MARKER_OPEN and (ok is not None or alarmed):
+        alarm_owed(kind, extra.get("skipped") or extra.get("controllerError") or kind)
+        summary.update({"failClosed": kind, "alarmSent": _wrapper_alarm(kind)})
+    owed = alarm_pending()
+    if owed:
+        # An unresolved debt outranks this fire's own outcome: a fire that
+        # still owes an alarm is NEVER reported as a clean one, and the ledger
+        # entry stays for the next fire to drain.
+        summary["alarmsOwed"] = owed
+        summary.setdefault("failClosed", "pending-alarm")
+        summary["degraded"] = "alarm(s) owed and not enqueued: {}".format(", ".join(owed))
+    if MARKER_OPEN:
+        # fire-open only ever means "a fire started and did not reach this
+        # function" -- what is owed lives in the ledger, not in this marker.
         try:
             os.unlink(os.path.join(OUT, "wrapper", "fire-open"))
         except OSError:
@@ -340,7 +410,10 @@ except (OSError, ctl.ControllerError) as exc:
 if os.path.lexists(os.path.join(WRAP, "fire-open")):
     log("the previous fire ended without closing (killed?)")
     summary["previousFireUnclosed"] = True
-    summary["previousFireAlarmSent"] = _wrapper_alarm("wrapper-error")
+    alarm_owed("wrapper-error", "a previous fire was killed before it could end")
+# Debts first: anything owed by an earlier fire is offered before this fire
+# claims, polls or steps, and stays owed until its own enqueue succeeds.
+drain_pending_alarms()
 _marker_fd = ctl.open_contained(OUT, ["wrapper", "fire-open"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
 os.write(_marker_fd, (FIRE + "\n").encode("utf-8"))
 os.close(_marker_fd)

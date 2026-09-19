@@ -118,6 +118,12 @@ BUDGET_PER_FIRE = 4
 BUDGET_PER_RUN = 15
 BUDGET_PER_FINGERPRINT = 2
 
+# The CLOSED allowlist of step outcomes. A step that answers anything else --
+# "unknown", a malformed gate artifact, an unforeseen exception -- is a silent
+# failure, and the boundary below alarms on it. A new phase is added HERE; a
+# path that forgets to alarm is caught rather than lost.
+STEP_OUTCOMES = frozenset((None, "released", "held", "intake", "lanes", "preliminary",
+                           "await_challenger", "synthesis", "verdict", "finished"))
 TERMINAL_VERBS = ("finish", "challenger-timeout")
 POST_FINISH_SLOTS = ("freeze-close",)
 # Journal kinds whose obligations must all be receipted before a GO finish.
@@ -641,6 +647,7 @@ ALARM_WORDS = {
     "controller_foreign_finish": "someone other than the controller finished this run",
     "controller_cutover_legacy_run": "a run claimed before the cutover surfaced; it stays with the legacy coordinator",
     "controller_run_released": "this run lost its gate slot without a verdict; its open steps were abandoned",
+    "controller_step_failed": "a step for this run ended in a way the controller does not know how to act on",
     "controller_finish_unconfirmed": "verdict.json exists but the gate's completed state does not confirm the finish",
 }
 ONESHOT_TEXT = {
@@ -1443,6 +1450,7 @@ class Controller:
         self.fire = fire
         self.decisions = []
         self.alarms = []
+        self.step_errors = []  # steps whose outcome was not on the allowlist
         self.owner_wakes = []
         # Obligation keys whose intent THIS process journaled and has not yet
         # attempted. Never inferred from the journal: an intent that existed
@@ -2113,6 +2121,32 @@ class Controller:
 
     # -- one run ------------------------------------------------------------
 
+    def step_run_guarded(self, run_id):
+        """THE step-return boundary, and the only place a step outcome is
+        judged: known-good outcomes pass, everything else journals an alarm
+        (idempotent, keyed by run and cause) before it is returned. The check
+        lives here rather than in the failing paths because deleting a
+        per-path ensure_alarm reintroduces a silent return, while deleting
+        this one fails the property test."""
+        detail = None
+        try:
+            phase = self.step_run(run_id)
+        except ControllerError as exc:
+            phase, cause = "error", "step-error"
+            detail = {"error": str(exc)[:300]}
+        except Exception as exc:  # noqa: BLE001 -- an unforeseen step fault is still an alarm
+            phase, cause = "error", "step-error"
+            detail = {"error": "{}: {}".format(type(exc).__name__, str(exc)[:200])}
+        else:
+            if phase in STEP_OUTCOMES:
+                return phase
+            cause = "step-outcome"
+            detail = {"outcome": str(phase)[:80]}
+        self.step_errors.append(dict(detail, runId=run_id, cause=cause))
+        self.ensure_alarm(run_id, "controller_step_failed",
+                          "{}:{}".format(cause, run_id[-24:]), detail)
+        return phase
+
     def step_run(self, run_id):
         obs = self.obligations()
         run_ob = obs.get(obligation_key(run_id, "run", "claim"))
@@ -2530,7 +2564,7 @@ class Controller:
         for run_id in sorted(runs):
             if not RUN_ID_RE.match(run_id) or run_id.startswith(PSEUDO_PREFIX) or run_id in self.legacy:
                 continue
-            phase = self.step_run(run_id)
+            phase = self.step_run_guarded(run_id)
             if phase:
                 summary.append({"runId": run_id, "phase": phase})
         # ...and those raised during this fire, if a lane slot is left.
@@ -2684,7 +2718,8 @@ def main(argv=None):
                           "effectsRefused": len(effects.performed) if mode == "shadow" else 0,
                           "effectsPerformed": len(effects.performed) if mode == "live" else 0,
                           "ownerWake": owner_wake,
-                          "alarms": ctl.alarms, "gateStateErrors": gate.errors}, sort_keys=True))
+                          "alarms": ctl.alarms, "stepErrors": ctl.step_errors,
+                          "gateStateErrors": gate.errors}, sort_keys=True))
         return 0
     except ControllerError as exc:
         alarm = "controller_journal_error" if isinstance(exc, JournalError) else "controller_error"

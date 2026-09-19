@@ -806,12 +806,46 @@ transition() { # name
     finish-unconfirmed) claim; wake_json; inputs_from_fakes; step_ok "$(tick_time 0)" --poll-json "$C/wake.json"
                         gate_finished_elsewhere xzo-pr-pr7-bbbbbbbbbbbb-20260918T120000Z
                         inputs_from_fakes; step_ok "$(tick_time 1)" ;;
+    # Codex round-4 repro 2: the gate's verdict.json cannot be parsed. The step
+    # answers "unknown" -- not on the allowlist -- so the boundary alarms.
+    malformed-verdict)  claim; wake_json; inputs_from_fakes; step_ok "$(tick_time 0)" --poll-json "$C/wake.json"
+                        mkdir -p "$C/state/runs/$RUN"; printf '{"verdict":' >"$C/state/runs/$RUN/verdict.json"
+                        inputs_from_fakes; step_ok "$(tick_time 1)"
+                        inputs_from_fakes; step_ok "$(tick_time 2)" ;;
+    # An unforeseen fault inside a step is the same boundary, other arm.
+    step-error)         claim; wake_json; inputs_from_fakes; step_ok "$(tick_time 0)" --poll-json "$C/wake.json"
+                        inputs_from_fakes; step_raising "$(tick_time 1)" ;;
   esac
+}
+
+# Runs one step with Controller.step_run raising, to prove the boundary catches
+# what no path anticipated (a fault that cannot be staged through the fakes).
+step_raising() { # now
+  local now="$1"
+  local -a a
+  mapfile -t a < <(live_args)
+  cat >"$C/raise.py" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ctl_under_test", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+def boom(self, run_id):
+    raise RuntimeError("an unforeseen step fault")
+m.Controller.step_run = boom
+sys.exit(m.main(sys.argv[2:]))
+PY
+  set +e
+  STEP_OUT="$(SMOKE_CONTROLLER_MODE=live python3 -B "$C/raise.py" "$CTL" step "${a[@]}" --now "$now" --fire "$now" 2>"$C/stderr")"
+  STEP_RC=$?
+  set -e
+  [ "$STEP_RC" = 0 ] || fail "step-error: the boundary absorbs the fault (rc $STEP_RC): $(tail -3 "$C/stderr")"
+  jq -e '.stepErrors | length == 1 and (.[0].cause == "step-error")' <<<"$STEP_OUT" >/dev/null     || fail "step-error: the fire reports the failed step: $STEP_OUT"
 }
 for variant in budgeted spent; do
   for t in receipts-exhausted:send-failed send-budget:send-budget dispatch-ambiguous:dispatch-ambiguous \
            dispatch-failed:dispatch-failed gate-refused:gate-refused overdue:overdue released:released \
-           no-authority:no-authority foreign-finish:foreign-finish finish-unconfirmed:finish-unconfirmed; do
+           no-authority:no-authority foreign-finish:foreign-finish finish-unconfirmed:finish-unconfirmed \
+           malformed-verdict:step-outcome step-error:step-error; do
     name="${t%%:*}"
     want="${t##*:}"
     # With no budget left the root send is refused before it can ever exhaust
