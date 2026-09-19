@@ -797,5 +797,95 @@ jr '[.[] | select(.kind=="gate")] | length == 0' | grep -qx true || fail "a CLEA
 dq '[.[] | select(.type=="escalate" and .reason=="owner step overdue")] | length == 1' | grep -qx true \
   || fail "it escalates instead"
 
+# --- round 2: hard links are refused (Codex r2 #1) ------------------------------
+
+# A hard link passes O_NOFOLLOW and resolves under --out-dir, but shares its
+# inode with a file outside: refused, the fire fails closed, the file is intact.
+new_case hardlinkdecisions
+claim; contract
+seed run claim enqueued 1 '{"pr":7}'
+mkdir -p "$C/out/$RUN"
+printf 'outside\n' >"$T/outside-hardlink.ndjson"
+ln "$T/outside-hardlink.ndjson" "$C/out/$RUN/decisions.ndjson"
+step 2026-09-18T10:00:00Z
+[ "$STEP_RC" = 3 ] || fail "a hard-linked decisions file must fail the fire closed (rc=$STEP_RC): $STEP_OUT"
+echo "$STEP_OUT" | jq -e '.ok == false and (.error | test("hard links"))' >/dev/null || fail "names the hard link: $STEP_OUT"
+[ "$(cat "$T/outside-hardlink.ndjson")" = "outside" ] || fail "the outside file was modified through a hard link"
+
+new_case hardlinkjournal
+claim
+printf '' >"$T/outside-journal.ndjson"
+rm "$C/out/journal.ndjson"
+ln "$T/outside-journal.ndjson" "$C/out/journal.ndjson"
+step 2026-09-18T10:00:00Z
+[ "$STEP_RC" = 3 ] || fail "a hard-linked journal must be a hard error (rc=$STEP_RC): $STEP_OUT"
+echo "$STEP_OUT" | jq -e '.alarm == "controller_journal_error"' >/dev/null || fail "journal alarm: $STEP_OUT"
+[ ! -s "$T/outside-journal.ndjson" ] || fail "the outside journal was written through a hard link"
+
+# --- round 2: a re-run of the SAME fire after an effect reconciles (Codex r2 #2)
+
+# Crash AFTER the freeze-close effect, then re-run with the SAME fire id: the
+# persisted intent is from a dead process, so the retry searches its marker
+# (writeOnlyIfMarkerAbsent) instead of writing blind.
+new_case samefire-freeze
+ready_run CLEAR
+seed run claim enqueued 1 '{"pr":7,"isFreezePr":true}'
+synthesis GO
+set +e
+SMOKE_CONTROLLER_CRASH_AT=after-effect:gh:freeze-close step 2026-09-18T10:00:00Z
+set -e
+[ "$STEP_RC" = 137 ] || fail "injected crash after the freeze-close effect (rc=$STEP_RC)"
+step_ok 2026-09-18T10:00:00Z
+dq '[.[] | select(.type=="gh" and .slot=="freeze-close") | .afterReconcile] == [false, true]' | grep -qx true \
+  || fail "same-fire retry after the effect must reconcile, not write blind: $(dq '[.[] | select(.type=="gh" and .slot=="freeze-close")]')"
+jr '[.[] | select(.kind=="gh" and .slot=="freeze-close" and .state=="done")] | length == 1' | grep -qx true \
+  || fail "the close is done exactly once"
+
+# The same property for every other effect kind, each crashed after its effect
+# and re-run with the same fire id.
+new_case samefire-issue
+ready_run CLEAR
+marker B1 2 fail '["F1"]'
+seed run claim enqueued 1 '{"pr":7}'
+synthesis NO_GO
+set +e
+SMOKE_CONTROLLER_CRASH_AT=after-effect:gh:issue:F1 step 2026-09-18T10:00:00Z
+set -e
+[ "$STEP_RC" = 137 ] || fail "injected crash after the issue effect (rc=$STEP_RC)"
+step_ok 2026-09-18T10:00:00Z
+dq '[.[] | select(.type=="gh" and .slot=="issue:F1") | .afterReconcile] == [false, true]' | grep -qx true \
+  || fail "same-fire issue retry must reconcile: $(dq '[.[] | select(.type=="gh")]')"
+jr '[.[] | select(.kind=="gh" and .slot=="issue:F1" and .state=="done")] | length == 1' | grep -qx true \
+  || fail "the issue is filed once"
+
+new_case samefire-send
+claim; contract
+seed run claim enqueued 1 '{"pr":7}'
+set +e
+SMOKE_CONTROLLER_CRASH_AT=after-effect:send:root step 2026-09-18T10:10:00Z
+set -e
+[ "$STEP_RC" = 137 ] || fail "injected crash after the root send effect (rc=$STEP_RC)"
+step_ok 2026-09-18T10:10:00Z
+k="$(key "$RUN" send root)"
+jq -r 'select(.type=="send" and .slot=="root") | .messageId' "$C/out/$RUN/decisions.ndjson" >"$C/mids"
+[ "$(wc -l <"$C/mids")" = 2 ] && [ "$(sort -u "$C/mids")" = "$k#1" ] \
+  || fail "the same-fire re-offer must reuse $k#1 (a helper replay), got $(cat "$C/mids")"
+jr "[.[] | select(.key==\"$k\" and .state==\"intent\")] | length == 1" | grep -qx true \
+  || fail "no second intent (attempt) for a same-fire retry"
+
+new_case samefire-dispatch
+claim; contract
+mkdir -p "$R/contact-sheet"
+seed run claim enqueued 1 '{"pr":7}'
+set +e
+SMOKE_CONTROLLER_CRASH_AT=after-effect:dispatch:critic step 2026-09-18T10:10:00Z
+set -e
+[ "$STEP_RC" = 137 ] || fail "injected crash after the dispatch effect (rc=$STEP_RC)"
+step_ok 2026-09-18T10:10:00Z
+dq '[.[] | select(.type=="dispatch")] | length == 1' | grep -qx true \
+  || fail "a same-fire retry must never recreate the task: $(dq '[.[] | select(.type=="dispatch")]')"
+dq '[.[] | select(.type=="escalate" and .reason=="controller_dispatch_ambiguous")] | length == 1' | grep -qx true \
+  || fail "the bare intent is escalated as ambiguous"
+
 [ ! -e "$T/effects.log" ] || fail "shadow invoked an effect command: $(cat "$T/effects.log")"
 echo "smoke campaign controller tests passed"

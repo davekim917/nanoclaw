@@ -63,6 +63,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -241,6 +242,15 @@ def open_contained(root, parts, flags, mode=0o644, make_dirs=False):
         os.close(dfd)
     try:
         _contained(fd, root)
+        # A hard link passes O_NOFOLLOW and resolves under root, yet writes an
+        # inode shared with a file elsewhere: only a regular file with exactly
+        # one link is ours to write.
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ControllerError("refusing controller file {}/{}: not a regular file".format(root, "/".join(parts)))
+        if st.st_nlink != 1:
+            raise ControllerError("refusing controller file {}/{}: {} hard links (must be 1)".format(
+                root, "/".join(parts), st.st_nlink))
     except ControllerError:
         os.close(fd)
         raise
@@ -645,6 +655,11 @@ class Controller:
         self.fire = fire
         self.decisions = []
         self.alarms = []
+        # Obligation keys whose intent THIS process journaled and has not yet
+        # attempted. Never inferred from the journal: an intent that existed
+        # when the process started may have been attempted by a fire that died
+        # (same fire id or not), so it always goes through reconciliation.
+        self.planned = set()
         self.fire_sends = {}
         self.receipts = self._load_json_arg(args.receipts_json, {})
         self.tasks = self._load_json_arg(args.tasks_json, [])
@@ -774,11 +789,12 @@ class Controller:
         ob = self.obligations().get(key)
         if ob and ob["state"] in TERMINAL_OK | {"abandoned", "failed_terminal"}:
             return ob["state"]
-        # An intent planned earlier in THIS fire (post_finish journals the
+        # An intent this process planned moments ago (post_finish journals the
         # freeze close before marking the run done) has not been attempted yet;
-        # any other bare intent has an unknown outcome.
-        planned_now = bool(ob and ob["detail"].get("planned") and len(ob["history"]) == 1
-                           and ob["history"][0].get("fire") == self.fire)
+        # any other bare intent -- including one from an earlier invocation of
+        # the SAME fire -- has an unknown outcome and is reconciled.
+        planned_now = key in self.planned
+        self.planned.discard(key)
         reconcile = bool(ob and ob["state"] == "intent" and not planned_now)
         if reconcile:
             # Outcome unknown (timeout, 5xx, or a crash): never retried blind.
@@ -1189,6 +1205,7 @@ class Controller:
         # that the done early-return (step_run) still reconciles.
         if is_freeze and obligation_key(run_id, "gh", "freeze-close") not in obs:
             self.record(run_id, "gh", "freeze-close", "intent", 1, {"planned": True})
+            self.planned.add(obligation_key(run_id, "gh", "freeze-close"))
         obs = self.obligations()
         if run_key in obs and obs[run_key]["state"] not in ("done", "abandoned"):
             self.record(run_id, "run", "claim", "done", 1, {"verdict": verdict, "finishedBy": "gate" if external else
