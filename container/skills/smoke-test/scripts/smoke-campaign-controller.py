@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Durable PR smoke-campaign controller -- SHADOW ONLY in this revision.
+"""Durable PR smoke-campaign controller: shadow or live.
 
 One fire = one `step`: read gate state, run artifacts and the obligation
 journal; derive each run's phase; decide the next mechanical action; journal
@@ -7,16 +7,37 @@ the intent BEFORE the action; hand the action to the effect layer; journal the
 outcome. The model is woken only for judgment (owner steps, fresh critic).
 Spec: jev-smoke-sweep/CONTROLLER-SPEC.md rev 3 (s2 design, s3 shadow).
 
-SHADOW IS A HARD PROPERTY, NOT A CONVENTION. Every external effect -- a chat
-send, a GitHub write, an `ncl tasks create`, a gate verb -- goes through
-EffectLayer.perform(), and the only EffectLayer this file contains refuses
-every effect and returns `shadow_refused`. There is no live implementation to
-switch to: any SMOKE_CONTROLLER_MODE other than off|shadow is refused at
-startup (exit 3), and `--shadow` forces shadow whatever the env says. Subprocesses are limited to READ_ONLY_COMMANDS (the evidence barrier,
-which only reads -- smoke-evidence-barrier.sh has no write path, and the
-`smoke-journeys.py barrier` it calls reads only; its sole writer
-`_write_atomic` serves `pin-run`/`match`). The controller's own writes are its
-shadow journal, its decisions log, and its lock file, all under --out-dir.
+ONE EFFECT LAYER, TWO MODES. Every external effect -- a chat send, a GitHub
+write, an `ncl tasks create`, a gate verb, an owner brief -- goes through
+EffectLayer.perform(). In shadow it refuses every effect and returns
+`shadow_refused`; in live it performs it. The step engine above it is the same
+code in both modes: every journal, obligation, GO and BLOCKED rule is shared,
+and live changes only what perform() does and what its outcome records.
+SMOKE_CONTROLLER_MODE is off|shadow|live (default off); `--shadow` forces
+shadow whatever the env says. A journal written in one mode is refused by the
+other (JournalError), so a shadow journal can never drive live effects.
+
+Subprocesses start at ONE call site, spawn(), against an allowlist: in shadow
+only READ_ONLY_COMMANDS (the evidence barrier, which only reads --
+smoke-evidence-barrier.sh has no write path, and the `smoke-journeys.py
+barrier` it calls reads only; its sole writer `_write_atomic` serves
+`pin-run`/`match`). Live adds the configured gate wrapper, gh, ncl and the
+enqueue-send helper, and only EffectLayer's live methods pass that list. The
+controller's own writes are its journal, decisions log and lock file under
+--out-dir; live adds send payloads there and owner briefs under
+<run-root>/<runId>/controller/.
+
+Live (s2): gate verbs via the deployed gate wrapper with the claim's owner
+token; GitHub writes carry `<!-- smoke-ctl:<key> -->` and are search -> act ->
+read back; chat via enqueue-send (id key#attempt, threadKey = runId, its own
+send budget); critic/adjudicator one-shots via `ncl tasks create` (dispatch
+intent journaled before create, an ambiguous one held); owner steps via a
+brief file plus the wrapper's wakeAgent. Cutover: the first live fire writes
+<out-dir>/cutover.json naming every run already claimed; those finish under
+the legacy coordinator and this controller never acts on them. A run claimed
+after the flip is claimed by the gate `poll` inside the live wrapper, whose
+wake (and owner token) reaches only this controller, so `finish` refuses
+anyone else (smoke-pr-gate.sh:4090-4095).
 
 Journal (append-only ndjson, fsync'd, under <out-dir>/control.lock):
   {v, at, fire, runId, kind, slot, key, state, attempt, detail}
@@ -63,6 +84,8 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import signal
 import stat
 import subprocess
 import sys
@@ -71,6 +94,7 @@ import time
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BARRIER = os.path.join(SCRIPT_DIR, "smoke-evidence-barrier.sh")
 READ_ONLY_COMMANDS = {("bash", BARRIER)}
+MODES = ("off", "shadow", "live")
 # In-process seam for the offline replay harness only: a callable
 # (run_dir, phase) -> barrier dict. The CLI never sets it. The replay needs it
 # because today's barrier refuses every historical PR contract before reading a
@@ -112,6 +136,15 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 VERDICTS = {"GO", "NO_GO", "HUMAN_DECISION", "BLOCKED"}
 PASS_STATUSES = {"pass"}
+# Journal run ids for sends that belong to no campaign: gate alarms (one
+# budget per UTC day) and cutover holds. Never a gate run id (those carry the
+# deployment's run prefix), never stepped as a campaign.
+PSEUDO_PREFIX = "ctl."
+# Consecutive helper/GitHub failures of ONE attempt before it goes terminal.
+MAX_EFFECT_FAILURES = 3
+# Wakes offered for one owner brief before the controller stops re-offering
+# it (the owner acks with controller/brief-<step>.ack as its first act).
+OWNER_WAKE_OFFERS = 3
 
 
 class ControllerError(Exception):
@@ -257,12 +290,105 @@ def open_contained(root, parts, flags, mode=0o644, make_dirs=False):
     return fd
 
 
+def _open_dir_contained(root, parts, make_dirs):
+    """fd of root/<parts...>, every component opened O_NOFOLLOW, verified under root."""
+    for part in parts:
+        if not part or part in (".", "..") or "/" in part:
+            raise ControllerError("refusing unsafe path component {!r}".format(part))
+    dfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            if make_dirs:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=dfd)
+                except FileExistsError:
+                    pass
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+            except OSError as exc:
+                raise ControllerError("refusing controller path {}/{}: {}".format(root, part, exc))
+            os.close(dfd)
+            dfd = nxt
+        _contained(dfd, root)
+    except BaseException:
+        os.close(dfd)
+        raise
+    return dfd
+
+
+def write_contained_atomic(root, parts, data):
+    """Replace root/<parts...> atomically: a fresh O_EXCL|O_NOFOLLOW temp in the
+    same verified directory, fsync, rename. A rename replaces a symlink or a
+    hard link at the name rather than writing through it, so an existing
+    link can never carry the write outside root (an O_TRUNC open would
+    truncate the link target before any check could run)."""
+    dfd = _open_dir_contained(root, parts[:-1], make_dirs=True)
+    try:
+        tmp = ".{}.{}.tmp".format(parts[-1], os.getpid())
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+        try:
+            view = memoryview(data.encode("utf-8") if isinstance(data, str) else data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, parts[-1], src_dir_fd=dfd, dst_dir_fd=dfd)
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+    return os.path.join(root, *parts)
+
+
+def write_contained_once(root, parts, data):
+    """Create root/<parts...> exactly once (O_EXCL); return (path, created).
+    An existing file is kept -- it is the payload an earlier attempt already
+    committed to, and a replay must send the same bytes."""
+    path = os.path.join(root, *parts)
+    dfd = _open_dir_contained(root, parts[:-1], make_dirs=True)
+    try:
+        # Written in full to a temp, then link()ed into place: link() fails
+        # with EEXIST instead of replacing, so the name only ever holds a
+        # complete payload and a crash mid-write leaves just a stray temp.
+        tmp = ".{}.{}.tmp".format(parts[-1], os.getpid())
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+        try:
+            view = memoryview(data.encode("utf-8") if isinstance(data, str) else data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.link(tmp, parts[-1], src_dir_fd=dfd, dst_dir_fd=dfd, follow_symlinks=False)
+            created = True
+        except FileExistsError:
+            created = False
+        os.unlink(tmp, dir_fd=dfd)
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+    if not created:
+        # The existing entry must still be a regular single-link file under root.
+        os.close(open_contained(root, parts, os.O_RDONLY))
+    return path, created
+
+
 # ---------------------------------------------------------------------------
 # journal
 
 
 class Journal:
-    def __init__(self, out_dir):
+    def __init__(self, out_dir, mode=None):
+        self.mode = mode
         self.dir = out_dir
         self.path = os.path.join(out_dir, "journal.ndjson")
         self.lock_path = os.path.join(out_dir, "control.lock")
@@ -305,6 +431,14 @@ class Journal:
             raise JournalError("journal unreadable at {}: {}".format(self.path, exc))
         if raw and not raw.endswith(b"\n"):
             raise JournalError("journal {} ends in a torn (unterminated) record -- refusing to act".format(self.path))
+        if self.mode:
+            # The mode a journal was created in (journal.mode, written by
+            # init). An empty journal has no records to carry it. A journal
+            # with no sidecar predates it, and every such journal was shadow.
+            born = self._born_mode()
+            if born != self.mode:
+                raise JournalError("journal {} was created in {} mode; refusing to run it in {} mode".format(
+                    self.path, born, self.mode))
         records = []
         for n, line in enumerate(raw.split(b"\n"), 1):
             if not line.strip():
@@ -316,14 +450,37 @@ class Journal:
             if (not isinstance(rec, dict) or rec.get("v") != JOURNAL_VERSION or rec.get("state") not in STATES
                     or not isinstance(rec.get("key"), str) or not isinstance(rec.get("runId"), str)):
                 raise JournalError("journal {} line {} is not a valid v{} record".format(self.path, n, JOURNAL_VERSION))
+            if self.mode and rec.get("mode") not in (None, self.mode):
+                # A shadow journal records assumed outcomes (shadowAssumed): read
+                # by live, they would read as effects that already happened.
+                raise JournalError("journal {} line {} was written in {} mode; refusing to run it in {} mode".format(
+                    self.path, n, rec.get("mode"), self.mode))
             records.append(rec)
         self.records = []
         self._obs = {}
         for rec in records:
             self._fold(rec)
 
+    def _born_mode(self):
+        try:
+            fd = open_contained(self.dir, ["journal.mode"], os.O_RDONLY)
+            with os.fdopen(fd, "rb") as fh:
+                return fh.read(64).decode("utf-8", "replace").strip()
+        except FileNotFoundError:
+            return "shadow"
+        except (OSError, ControllerError) as exc:
+            raise JournalError("journal mode file under {} refused: {}".format(self.dir, exc))
+
     def init(self):
         os.makedirs(self.dir, exist_ok=True)
+        if os.path.lexists(self.path):
+            # Checked before the mode file is touched, so an init against an
+            # existing journal can never relabel it (init holds control.lock).
+            raise JournalError("journal already exists at {} -- init never truncates".format(self.path))
+        if self.mode:
+            # Before the journal: a crash between the two leaves no journal,
+            # and the next init rewrites the same mode.
+            write_contained_atomic(self.dir, ["journal.mode"], self.mode + "\n")
         try:
             fd = open_contained(self.dir, ["journal.ndjson"], os.O_WRONLY | os.O_CREAT | os.O_EXCL)
         except FileExistsError:
@@ -379,33 +536,601 @@ class Journal:
 # effect layer -- the single choke point for external effects
 
 
-class EffectLayer:
-    """PR 1: shadow only. perform() never executes anything."""
+def spawn(argv, timeout, allowed, env=None):
+    """THE subprocess call site. (rc, stdout, stderr); rc None = not run or
+    timed out. argv must start with one of the `allowed` prefixes. The child
+    gets its own process group and the whole group is killed on timeout, so
+    a grandchild holding the pipes open cannot outlive the budget."""
+    argv = [str(a) for a in argv]
+    if not any(tuple(argv[:len(p)]) == tuple(p) for p in allowed):
+        raise ControllerError("refusing to run non-allowlisted command: {}".format(argv[:2]))
+    if timeout < 1:
+        return None, "", "no time left in this fire"
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env, start_new_session=True)
+    except OSError as exc:
+        return None, "", str(exc)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.communicate()
+        return None, "", "timed out after {:.0f}s".format(timeout)
+    return proc.returncode, out, err
 
-    def __init__(self, mode):
-        if mode != "shadow":
-            raise ControllerError("mode {!r} is not implemented: this build is shadow-only".format(mode))
-        self.mode = mode
-        self.performed = []
 
-    def perform(self, effect):
-        # The would-be effect is recorded, never run. No subprocess, no socket,
-        # no file outside --out-dir is touched on this path.
-        self.performed.append(effect)
-        return {"outcome": "shadow_refused"}
+def last_json_line(text):
+    for line in reversed((text or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                doc = json.loads(line)
+            except ValueError:
+                return None
+            return doc if isinstance(doc, dict) else None
+    return None
 
 
 def run_read_only(argv, timeout=60):
-    if (argv[0], argv[1]) not in READ_ONLY_COMMANDS:
-        raise ControllerError("refusing to run non-allowlisted command: {}".format(argv[:2]))
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return None, str(exc)
-    try:
-        return json.loads(proc.stdout.strip().splitlines()[-1]), None
-    except (ValueError, IndexError):
-        return None, "unparsable output (rc={})".format(proc.returncode)
+    rc, out, err = spawn(argv, timeout, READ_ONLY_COMMANDS)
+    if rc is None:
+        return None, err
+    doc = last_json_line(out)
+    if doc is None:
+        return None, "unparsable output (rc={})".format(rc)
+    return doc, None
+
+
+# Chat language for the machine verdicts (SKILL.md s8): a human never reads a
+# bare token.
+VERDICT_CHAT = {
+    "GO": "Safe to ship",
+    "NO_GO": "Do not ship this build",
+    "HUMAN_DECISION": "Needs a human call (holds promotion until answered)",
+    "BLOCKED": "Could not test honestly",
+}
+GATE_ALARM_TEXT = {
+    "gate_misconfigured": "The PR smoke watcher is blocked: the gate is misconfigured (missing: {missing}).",
+    "gate_fetch_failed": "The PR smoke watcher is blocked: listing PRs on GitHub failed {consecutiveFailures} times in a row.",
+    "pr_migrations_refused": ("PR #{pr} changes backend migrations, so its preview can never be booted safely "
+                              "against the shared dev database. No campaign."),
+    "pr_warmup_stuck": ("PR #{pr}'s backend preview is live but /healthz has not turned healthy in time. "
+                        "No campaign yet; the watcher settles it once the preview is ready."),
+    "pr_run_stalled": ("The smoke campaign {runId} on PR #{pr} stopped stamping progress. Resume or abandon it: "
+                       "that is a human call."),
+    "pr_preflight_failed": "PR #{pr}'s preflight check failed ({reason}); no campaign.",
+    "coordinator_lease_unavailable": "The PR smoke watcher could not take the coordinator lease.",
+}
+ALARM_WORDS = {
+    "controller_send_failed": "a chat post could not be delivered after its retries",
+    "controller_send_budget": "the controller's chat budget for this run is spent",
+    "controller_dispatch_ambiguous": "a judgment task may or may not have started; it is held for a human",
+    "controller_obligation_overdue": "a step is past its deadline",
+    "controller_verdict_superseded": "a GO no longer holds, so the run finishes BLOCKED",
+    "controller_gh_failed": "a GitHub write failed",
+    "controller_gate_refused": "the gate refused a terminal verb",
+    "controller_no_authority": "this run's claim token is not held by the controller",
+    "controller_dispatch_failed": "a judgment task could not be created",
+    "controller_foreign_finish": "someone other than the controller finished this run",
+    "controller_cutover_legacy_run": "a run claimed before the cutover surfaced; it stays with the legacy coordinator",
+}
+ONESHOT_TEXT = {
+    "critic": (
+        "Fresh design check for smoke run {runId} (PR #{pr}, build {sha12}). Dispatch a fresh provider-native "
+        "`qa-design-critic` (model and effort from its agent definition) in the foreground with the graded "
+        "viewport PNGs in {run}/contact-sheet/, the {run}/contact-sheet/design-system/ folder and, for each tile "
+        "manifest.json marks `changed`, its *-base.png and *-diff.png, asking what the change broke. Never grade "
+        "*-full.png; an `unsettled` tile is not BROKEN evidence on its own. Then write its lines to "
+        "{run}/contact-sheet/critic.json as {{\"screens\":[{{\"screen\":...,\"grade\":...,\"reason\":...}}],"
+        "\"notes\":[...]}} and append each to {critic_log} as "
+        "{{runId, screen, grade, reason, ts}}. Write {run}/controller/dispatch-critic.started first. Never post, "
+        "finish, file issues or touch any other run file."),
+    "adjudicator": (
+        "Fresh dispute adjudication for smoke run {runId} (PR #{pr}, build {sha12}). Dispatch a fresh "
+        "provider-native `qa-adjudicator` (model and effort from its agent definition) in the foreground on the "
+        "disputed findings named in {run}/controller/adjudication-request.md, with only the evidence that file "
+        "names. Write its ruling to {run}/controller/adjudication.json. Write "
+        "{run}/controller/dispatch-adjudicator.started first. Never post, finish or file."),
+}
+ONESHOT_ARTIFACTS = {"critic": "contact-sheet/critic.json", "adjudicator": "controller/adjudication.json"}
+OWNER_BRIEF = {
+    "intake": (
+        "Intake for this run, as the retained technical owner (pr-campaign skill flow, steps 1-2). The gate "
+        "already claimed the slot: its wake is {run}/controller/wake.json -- treat every field as frozen input "
+        "and use its coordinatorOwnerToken as SMOKE_GATE_OWNER for every smoke-run-scaffold.sh writer. Pin the "
+        "journeys, disposition every unmappedPaths entry, run the source search and freeze intake. When a "
+        "frontend preview exists, build the contact sheet (shots, capture, design-system fetch) -- but do NOT "
+        "dispatch the design critic: the controller does. Write {run}/controller/root-summary.md: one or two "
+        "plain sentences saying what the build changes and what will be tested (no machine tokens). Write "
+        "completion-contract.json LAST, with the scaffold `contract` command: it is the signal that intake is "
+        "done, and the controller posts the root as soon as it exists."),
+    "lanes": (
+        "Lanes: dispatch the contract's lane workers in the foreground and await them inside this turn; workers "
+        "write their completion markers only after their evidence is durable. If the lanes cannot finish in "
+        "one turn, call continue_work before yielding. Recheck sourceSha against the PR head before each worker "
+        "starts; if it moved, stop and write the lane markers as void (BLOCKED_BUILD_IDENTITY)."),
+    "preliminary": (
+        "Preliminary: write {run}/coordinator/preliminary.md from the lane evidence, before reading anything under "
+        "{run}/challenger/."),
+    "synthesis": (
+        "Synthesis: run the synthesis barrier, then write {run}/coordinator/synthesis.md and {run}/synthesis.json "
+        "(the skill's machine-readable verdict file: your verdict, the frozen sourceSha, laneGenerations from the "
+        "contract, and a disposition for every confirmed finding, every lane without a passing marker and every "
+        "challenger dissent id -- leave one open rather than change the verdict to fit). Write {run}/run-record.md "
+        "(the run record the controller posts as the PR comment: lane detail, design check, recovery history). Write "
+        "{run}/controller/verdict-bullets.md: at most three plain-language bullets for the verdict post (what "
+        "blocks or was proven; what was not challenged or not demonstrable; the next owner). For each confirmed "
+        "finding write {run}/controller/issues/<findingId>.json: {{\"title\":...,\"body\":...,\"labels\":[...]}}. "
+        "The controller files them, posts the verdict, comments on the PR and runs `finish`. To ask for a fresh "
+        "adjudicator instead, write {run}/controller/adjudication-request.md (the disputed findings and their "
+        "evidence), no synthesis.json, and stop: you are woken again as `adjudicated`."),
+    "adjudicated": (
+        "Adjudicated: the fresh adjudicator's ruling is in {run}/controller/adjudication.json. Apply it and finish "
+        "the synthesis exactly as the `synthesis` step describes (synthesis.md, synthesis.json, run-record.md, "
+        "verdict-bullets.md, issue files)."),
+}
+
+
+class EffectLayer:
+    """The single choke point for external effects.
+
+    shadow: perform() records the would-be effect and returns shadow_refused;
+    nothing runs. live: perform() runs the effect and returns its outcome:
+      send        enqueued | replay | budget | failed | unknown
+      gh          done | failed | unknown
+      gate        ok | refused | unknown
+      ncl_create  created(taskId) | failed | unknown
+      owner_wake  brief_written | failed
+    `unknown` means the outcome could not be established (timeout, 5xx, a
+    crash of the helper): the obligation stays open and the next fire
+    reconciles it -- never a blind retry.
+    """
+
+    LIVE_REQUIRED = ("repo", "send_to", "gate_cmd", "enqueue_cmd", "gh_cmd", "ncl_cmd")
+
+    def __init__(self, mode, cfg=None):
+        if mode not in ("shadow", "live"):
+            raise ControllerError("mode {!r} is not an effect mode (shadow|live)".format(mode))
+        self.mode = mode
+        self.cfg = dict(cfg or {})
+        self.performed = []
+        self.ctl = None
+        if mode == "live":
+            missing = [k for k in self.LIVE_REQUIRED if not self.cfg.get(k)]
+            if missing:
+                raise ControllerError("live mode needs {}".format(", ".join("--" + k.replace("_", "-") for k in missing)))
+            self.gate = ["bash", self.cfg["gate_cmd"]]
+            self.gh = shlex.split(self.cfg["gh_cmd"])
+            self.ncl = shlex.split(self.cfg["ncl_cmd"])
+            self.enqueue = shlex.split(self.cfg["enqueue_cmd"])
+            self.allowed = [tuple(self.gate), tuple(self.gh), tuple(self.ncl), tuple(self.enqueue)]
+
+    def bind(self, ctl):
+        self.ctl = ctl
+
+    def perform(self, effect):
+        self.performed.append(effect)
+        if self.mode != "live":
+            # The would-be effect is recorded, never run. No subprocess, no
+            # socket, no file outside --out-dir is touched on this path.
+            return {"outcome": "shadow_refused"}
+        handler = {"send": self._send, "gh": self._gh, "gate": self._gate, "ncl_create": self._dispatch,
+                   "owner_wake": self._owner_wake}.get(effect.get("type"))
+        if handler is None:
+            raise ControllerError("unknown effect type {!r}".format(effect.get("type")))
+        try:
+            return handler(effect)
+        except ControllerError as exc:
+            return {"outcome": "failed", "error": str(exc)[:300]}
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return {"outcome": "unknown", "error": "{}: {}".format(type(exc).__name__, exc)[:300]}
+
+    def keepalive(self, run_id, token):
+        """Live: stamp gate `progress` so the claim stays live (a run goes
+        reclaimable PROGRESS_STALE_SECONDS after its last stamp,
+        smoke-pr-gate.sh:1464-1478). Not an obligation and never counted as an
+        effect: shadow is a no-op."""
+        if self.mode != "live":
+            return None
+        rc, out, err = self._run(self.gate + ["progress", run_id, token], 20)
+        doc = last_json_line(out) if rc is not None else None
+        if doc and doc.get("ok") is True:
+            return {"ok": True}
+        return {"ok": False, "error": (doc or {}).get("error") or err or "rc={}".format(rc)}
+
+    # -- plumbing -------------------------------------------------------------
+
+    def _left(self):
+        deadline = self.cfg.get("deadline")
+        return (deadline - time.time() - 2) if deadline else 60
+
+    def _run(self, argv, timeout):
+        env = None
+        if tuple(argv[:len(self.gate)]) == tuple(self.gate):
+            # Every gate verb the controller runs is the controller's: the
+            # gate refuses progress/finish/challenger-timeout on a run whose
+            # recorded claimant differs (smoke-pr-gate.sh claimant_guard).
+            env = dict(os.environ, SMOKE_GATE_CLAIMANT="controller")
+        return spawn(argv, min(timeout, self._left()), self.allowed, env=env)
+
+    def _claim(self, run_id):
+        ob = self.ctl.obligations().get(obligation_key(run_id, "run", "claim")) or {}
+        detail = ob.get("detail") or {}
+        claim = self.ctl.gate.active_claims().get(run_id) or {}
+        pr = detail.get("pr") or claim.get("pr") or self.ctl.gate.pr_for_run(run_id)
+        sha = claim.get("sha") or detail.get("sha") or ""
+        return {"pr": pr, "sha": sha, "token": detail.get("ownerToken"), "deadline": claim.get("deadline"),
+                "wake": detail.get("wake")}
+
+    def _run_dir(self, run_id):
+        return os.path.join(self.ctl.args.run_root, run_id)
+
+    def _read_text(self, path, limit=60000):
+        try:
+            if not nonempty_file(path):
+                return None
+            with open(path, "rb") as fh:
+                return fh.read(limit).decode("utf-8", "replace").strip()
+        except OSError:
+            return None
+
+    def _payload_dir(self, run_id):
+        return ["payloads", run_id]
+
+    # -- send -------------------------------------------------------------------
+
+    def _render(self, effect):
+        """(text, files). Deterministic from the run's artifacts; rendered once
+        per attempt id and persisted, so a replay re-sends identical bytes."""
+        run_id, slot = effect["runId"], effect["slot"]
+        hint = effect.get("hint") or {}
+        if run_id.startswith(PSEUDO_PREFIX) and hint.get("gateAlarm") is not None:
+            data = hint.get("gateAlarm") or {}
+            tmpl = GATE_ALARM_TEXT.get(data.get("trigger"))
+            fields = {k: data.get(k) for k in ("missing", "consecutiveFailures", "pr", "runId", "reason")}
+            try:
+                text = tmpl.format(**fields) if tmpl else None
+            except (KeyError, IndexError):
+                text = None
+            if not text:
+                text = "The PR smoke gate raised {}: {}".format(data.get("trigger"), json.dumps(data, sort_keys=True)[:600])
+            return text, []
+        if run_id.startswith(PSEUDO_PREFIX):
+            trig = hint.get("trigger") or "alarm"
+            detail = hint.get("detail")
+            return "**Smoke controller alarm — {}**\n{}".format(
+                ALARM_WORDS.get(trig, trig), json.dumps(detail, sort_keys=True)[:600] if detail else ""), []
+        c = self._claim(run_id)
+        run = self._run_dir(run_id)
+        pr_line = "PR #{} (https://github.com/{}/pull/{})".format(c["pr"], self.cfg["repo"], c["pr"])
+        tail = "Run `{}` · build `{}`".format(run_id, (c["sha"] or "")[:12])
+        if slot == "root":
+            summary = self._read_text(os.path.join(run, "controller", "root-summary.md"), 1500) or \
+                "What changed and what will be tested is in the run record."
+            deadline = parse_iso(c["deadline"])
+            when = deadline.astimezone().strftime("%a %H:%M %Z") if deadline else "the gate's deadline"
+            lines = []
+            critic, err = read_json_file(os.path.join(run, CRITIC_ARTIFACT))
+            if not err and isinstance(critic, dict):
+                for s in critic.get("screens") or []:
+                    if isinstance(s, dict):
+                        lines.append("- {} · {} — {}".format(s.get("grade"), s.get("screen"), s.get("reason")))
+                for note in critic.get("notes") or []:
+                    lines.append("- NOTE · {}".format(note))
+            design = "\n".join(lines[:12]) if lines else "- not in by the root post; see the run record"
+            text = ("**Smoke campaign started — {}**\n{}\n{} please challenge every declared lane once its evidence "
+                    "lands, and file your own disposition before reading the preliminary. Deadline {}. The frozen "
+                    "build identity and both preview hosts are in the run record.\nDesign check:\n{}\n{}").format(
+                pr_line, summary, self.cfg.get("challenger_mention") or "Challenger:", when, design, tail)
+            return text, []
+        if slot == "root-sheet":
+            return "", [os.path.join(run, "contact-sheet", "sheet.png")]
+        if slot == "verdict":
+            verdict = hint.get("verdict")
+            failed = hint.get("failedChecks") or []
+            bullets = []
+            syn, _ = read_json_file(os.path.join(run, "synthesis.json"))
+            if isinstance(syn, dict) and syn.get("verdict") == verdict:
+                owned = self._read_text(os.path.join(run, "controller", "verdict-bullets.md"), 3000) or ""
+                bullets = [ln.strip() for ln in owned.splitlines() if ln.strip()][:3]
+            if failed:
+                bullets = ["- Not cleared: {}".format("; ".join(str(f) for f in failed[:2]))] + bullets[:2]
+            bullets = [b if b.startswith(("-", "*", "•")) else "- " + b for b in bullets]
+            text = "**{} — {}**\n{}\n- Full run record: the run-record comment on {}\n{}".format(
+                pr_line, VERDICT_CHAT.get(verdict, verdict), "\n".join(bullets), pr_line, tail).replace("\n\n", "\n")
+            return text, []
+        if slot.startswith("alarm:"):
+            trig = hint.get("trigger") or "alarm"
+            detail = hint.get("detail")
+            text = "**Smoke controller alarm — {}** ({})\n{}\n{}".format(
+                ALARM_WORDS.get(trig, trig), pr_line, json.dumps(detail, sort_keys=True)[:600] if detail else "",
+                tail).replace("\n\n", "\n")
+            return text, []
+        raise ControllerError("no renderer for send slot {!r}".format(slot))
+
+    def _send(self, effect):
+        run_id, mid = effect["runId"], effect["messageId"]
+        name = mid.replace("#", "-")
+        root = self.ctl.journal.dir
+        doc_parts = self._payload_dir(run_id) + [name + ".json"]
+        doc_path = os.path.join(root, *doc_parts)
+        existing, err = read_json_file(doc_path)
+        if err == "missing":
+            text, files = self._render(effect)
+            write_contained_once(root, doc_parts, json.dumps({"text": text, "files": files}, sort_keys=True))
+            existing, err = read_json_file(doc_path)
+        if err or not isinstance(existing, dict):
+            raise ControllerError("send payload {} unreadable: {}".format(doc_path, err))
+        text_path, _ = write_contained_once(root, self._payload_dir(run_id) + [name + ".txt"], existing.get("text") or "")
+        argv = self.enqueue + ["--id", mid, "--to", self.cfg["send_to"], "--text-file", text_path,
+                               "--thread-key", effect["threadKey"], "--run-id", effect.get("budgetRun") or run_id,
+                               "--fire", self.ctl.fire]
+        if effect.get("fingerprint"):
+            argv += ["--fingerprint", effect["fingerprint"]]
+        for f in existing.get("files") or []:
+            argv += ["--file", f]
+        if self.cfg.get("outbox_root"):
+            argv += ["--outbox-root", self.cfg["outbox_root"]]
+        rc, out, errtext = self._run(argv, 30)
+        doc = last_json_line(out) if rc is not None else None
+        if not doc:
+            return {"outcome": "unknown", "error": (errtext or "no output")[:300]}
+        if doc.get("ok") is True and doc.get("outcome") in ("enqueued", "replay"):
+            return {"outcome": doc["outcome"], "seq": doc.get("seq")}
+        code = doc.get("code")
+        if code == "budget":
+            return {"outcome": "budget", "error": doc.get("error")}
+        if code in ("invalid", "mismatch"):
+            return {"outcome": "failed", "error": "{}: {}".format(code, doc.get("error"))[:300]}
+        return {"outcome": "unknown", "error": str(doc.get("error"))[:300]}
+
+    # -- GitHub -------------------------------------------------------------------
+
+    def _gh_json_lines(self, api_path, timeout=25):
+        """(objects, error) from `gh api <path> --paginate --jq '.[]'`."""
+        rc, out, err = self._run(self.gh + ["api", api_path, "--paginate", "--jq", ".[]"], timeout)
+        if rc != 0:
+            return None, (err or "rc={}".format(rc)).strip()[:200]
+        objs = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                doc = json.loads(line)
+            except ValueError:
+                return None, "unparsable gh api output"
+            if isinstance(doc, dict):
+                objs.append(doc)
+        return objs, None
+
+    def _since(self, run_id, kind, slot):
+        ob = self.ctl.obligations().get(obligation_key(run_id, kind, slot))
+        started = parse_iso(ob["history"][0].get("at")) if ob else None
+        return iso((started or self.ctl.now) - dt.timedelta(minutes=10))
+
+    def _gh(self, effect):
+        run_id, slot, marker = effect["runId"], effect["slot"], effect["marker"]
+        c = self._claim(run_id)
+        repo, pr = self.cfg["repo"], c["pr"]
+        if not pr:
+            return {"outcome": "failed", "error": "no PR number for this run"}
+        since = self._since(run_id, "gh", slot)
+        root = self.ctl.journal.dir
+        key = obligation_key(run_id, "gh", slot)
+        if slot == "freeze-close":
+            state = self._pr_state(pr)
+            if state in ("CLOSED", "MERGED"):
+                return {"outcome": "done", "via": "search", "state": state}
+            if state is None:
+                return {"outcome": "unknown", "error": "gh pr view failed"}
+            self._run(self.gh + ["pr", "close", str(pr), "-R", repo], 30)
+            state = self._pr_state(pr)
+            if state in ("CLOSED", "MERGED"):
+                return {"outcome": "done", "via": "write", "state": state}
+            return {"outcome": "unknown", "error": "pr still {} after close".format(state)}
+        if slot == "pr-comment":
+            api = "repos/{}/issues/{}/comments?since={}&per_page=100".format(repo, pr, since)
+            found, err = self._find_marker(api, marker)
+            if err:
+                return {"outcome": "unknown", "error": err}
+            if found:
+                return {"outcome": "done", "via": "search", "url": found}
+            body = self._run_record(run_id, c, effect.get("hint") or {})
+            path, _ = write_contained_once(root, self._payload_dir(run_id) + [key[:16] + "-pr-comment.md"],
+                                           "{}\n{}\n".format(marker, body))
+            self._run(self.gh + ["pr", "comment", str(pr), "-R", repo, "--body-file", path], 30)
+            found, err = self._find_marker(api, marker)
+            if found:
+                return {"outcome": "done", "via": "write", "url": found}
+            return {"outcome": "unknown", "error": err or "comment not found on read-back"}
+        if slot.startswith("issue:"):
+            fid = slot[len("issue:"):]
+            api = "repos/{}/issues?state=all&since={}&per_page=100".format(repo, since)
+            found, err = self._find_marker(api, marker)
+            if err:
+                return {"outcome": "unknown", "error": err}
+            if found:
+                return {"outcome": "done", "via": "search", "url": found}
+            title, body, labels = self._issue_content(run_id, fid, c)
+            # SI: dedup against open smoke-finding issues by normalized title.
+            rc, out, errtext = self._run(self.gh + ["issue", "list", "-R", repo, "--label", "smoke-finding", "--state",
+                                                    "open", "--limit", "500", "--json", "number,title,url"], 25)
+            if rc != 0:
+                return {"outcome": "unknown", "error": (errtext or "issue list rc={}".format(rc))[:200]}
+            try:
+                open_issues = json.loads(out or "[]")
+            except ValueError:
+                return {"outcome": "unknown", "error": "unparsable gh issue list output"}
+            norm = normalize_title(title)
+            for issue in open_issues if isinstance(open_issues, list) else []:
+                if isinstance(issue, dict) and normalize_title(issue.get("title")) == norm:
+                    return {"outcome": "done", "via": "dedup", "url": issue.get("url"), "duplicateOf": issue.get("number")}
+            path, _ = write_contained_once(root, self._payload_dir(run_id) + [key[:16] + "-issue.md"],
+                                           "{}\n{}\n".format(body, marker))
+            argv = self.gh + ["issue", "create", "-R", repo, "--title", title, "--body-file", path]
+            for label in labels:
+                argv += ["--label", label]
+            self._run(argv, 30)
+            found, err = self._find_marker(api, marker)
+            if found:
+                return {"outcome": "done", "via": "write", "url": found}
+            return {"outcome": "unknown", "error": err or "issue not found on read-back"}
+        return {"outcome": "failed", "error": "no GitHub handler for slot {!r}".format(slot)}
+
+    def _run_record(self, run_id, claim, hint):
+        """The PR's run-record comment body. The owner's prose where it wrote
+        any -- run-record.md, else synthesis.md (27 of the 30 replayed runs
+        wrote it at the run root; the legacy prompt names coordinator/) --
+        otherwise a record rendered from synthesis.json and the verdict, so a
+        finished run always gets its comment."""
+        run = self._run_dir(run_id)
+        for rel in ("run-record.md", "synthesis.md", os.path.join("coordinator", "synthesis.md")):
+            text = self._read_text(os.path.join(run, rel))
+            if text:
+                return text
+        verdict = hint.get("verdict")
+        lines = ["# Smoke run record", "", "Run `{}` on build `{}`: **{}**.".format(
+            run_id, (claim["sha"] or "")[:12], VERDICT_CHAT.get(verdict, verdict or "no verdict"))]
+        for f in hint.get("failedChecks") or []:
+            lines.append("- Not cleared: {}".format(f))
+        syn, err = read_json_file(os.path.join(run, "synthesis.json"))
+        if not err and isinstance(syn, dict):
+            for f in syn.get("findings") or []:
+                if isinstance(f, dict):
+                    lines.append("- Finding {}: {}".format(f.get("id"), f.get("disposition") or "no disposition"))
+        lines += ["", "The owner wrote no prose record; lane evidence is in the run directory."]
+        return "\n".join(lines)
+
+    def _find_marker(self, api, marker):
+        objs, err = self._gh_json_lines(api)
+        if err:
+            return None, err
+        for o in objs:
+            if marker in str(o.get("body") or ""):
+                return o.get("html_url") or o.get("url") or "found", None
+        return None, None
+
+    def _pr_state(self, pr):
+        rc, out, _ = self._run(self.gh + ["pr", "view", str(pr), "-R", self.cfg["repo"], "--json", "state"], 20)
+        if rc != 0:
+            return None
+        try:
+            return str(json.loads(out).get("state") or "").upper() or None
+        except (ValueError, AttributeError):
+            return None
+
+    def _issue_content(self, run_id, fid, claim):
+        run = self._run_dir(run_id)
+        labels = ["smoke-finding"]
+        doc, err = read_json_file(os.path.join(run, "controller", "issues", "{}.json".format(fid)))
+        if safe_component(fid) and not err and isinstance(doc, dict) and isinstance(doc.get("title"), str) \
+                and doc["title"].strip():
+            for label in doc.get("labels") or []:
+                if isinstance(label, str) and label.strip() and label not in labels:
+                    labels.append(label.strip())
+            return doc["title"].strip()[:250], str(doc.get("body") or "").strip() or doc["title"], labels
+        # The owner did not write the finding's issue file: file the machine
+        # record rather than hold the run on it.
+        syn, _ = read_json_file(os.path.join(run, "synthesis.json"))
+        finding = next((f for f in (syn or {}).get("findings") or [] if isinstance(f, dict) and f.get("id") == fid), {})
+        title = "Smoke finding {} on PR #{}".format(fid, claim["pr"])
+        body = "Confirmed by smoke run `{}` on build `{}`.\n\n```json\n{}\n```\n\nEvidence: see the run record.".format(
+            run_id, (claim["sha"] or "")[:12], json.dumps(finding, sort_keys=True, indent=1)[:4000])
+        return title, body, labels
+
+    # -- gate ---------------------------------------------------------------------
+
+    def _gate(self, effect):
+        run_id, verb = effect["runId"], effect["verb"]
+        token = self._claim(run_id)["token"]
+        if not token:
+            return {"outcome": "refused", "error": "no owner token: this controller did not receive the claim"}
+        argv = self.gate + [verb] + list(effect["args"]) + [token]
+        rc, out, err = self._run(argv, 60)
+        doc = last_json_line(out) if rc is not None else None
+        if not doc:
+            return {"outcome": "unknown", "error": (err or "no output")[:300]}
+        if doc.get("ok") is True:
+            keep = {k: doc[k] for k in ("verdict", "finishedAt", "idempotent", "handoff", "verdictDigest") if k in doc}
+            return {"outcome": "ok", "result": keep}
+        error = str(doc.get("error") or "")
+        if "busy" in error or "not the active run" in error or doc.get("retryable") is True:
+            # Transient, or the slot moved: the next fire's derivation sees the
+            # verdict / release and settles it.
+            return {"outcome": "unknown", "error": error[:300]}
+        return {"outcome": "refused", "error": error[:300]}
+
+    # -- ncl one-shots ------------------------------------------------------------
+
+    def _dispatch(self, effect):
+        run_id, slot = effect["runId"], effect["slot"]
+        c = self._claim(run_id)
+        tmpl = ONESHOT_TEXT.get(slot)
+        if not tmpl:
+            return {"outcome": "failed", "error": "no one-shot brief for slot {!r}".format(slot)}
+        prompt = tmpl.format(runId=run_id, pr=c["pr"], sha12=(c["sha"] or "")[:12], run=self._run_dir(run_id),
+                           critic_log=self.cfg.get("critic_log") or "the workgroup design-critic log") + \
+            "\n\n" + effect["marker"]
+        argv = self.ncl + ["tasks", "create", "--name", effect["name"], "--prompt", prompt,
+                           "--process-after", iso(self.ctl.now), "--isolated", "--mute-chat", "--json"]
+        if self.cfg.get("oneshot_model"):
+            argv += ["--model", self.cfg["oneshot_model"]]
+        if self.cfg.get("oneshot_effort"):
+            argv += ["--effort", self.cfg["oneshot_effort"]]
+        rc, out, err = self._run(argv, 40)
+        try:
+            doc = json.loads(out) if rc is not None and out.strip() else None
+        except ValueError:
+            doc = None
+        if not isinstance(doc, dict):
+            return {"outcome": "unknown", "error": (err or "no output")[:300]}
+        if doc.get("ok") is True and isinstance(doc.get("data"), dict) and doc["data"].get("series_id"):
+            return {"outcome": "created", "taskId": doc["data"]["series_id"]}
+        if doc.get("ok") is False:
+            return {"outcome": "failed", "error": str((doc.get("error") or {}).get("message") or doc.get("error"))[:300]}
+        return {"outcome": "unknown", "error": "unrecognized ncl response"}
+
+    # -- owner briefs -------------------------------------------------------------
+
+    def _owner_wake(self, effect):
+        run_id, step = effect["runId"], effect["step"]
+        c = self._claim(run_id)
+        run = self._run_dir(run_id)
+        head = ("# Controller brief: {step}\n\nRun `{run_id}` · PR #{pr} · build `{sha}` · run dir {run}\n\n"
+                "You are the retained owner. Do only this step, write only artifacts, then stop: never post to chat, "
+                "never run a gate verb (`finish`, `challenger-timeout`, `release`), never file or comment on GitHub. "
+                "The controller does all of that from what you write.\n\n").format(
+            step=step, run_id=run_id, pr=c["pr"], sha=c["sha"], run=run)
+        body = OWNER_BRIEF.get(step, "Step {}: see the owner router.".format(step)).format(run=run)
+        root = self.ctl.args.run_root
+        if step == "intake" and c.get("wake"):
+            write_contained_atomic(root, [run_id, "controller", "wake.json"],
+                                   json.dumps(c["wake"], sort_keys=True, indent=1) + "\n")
+        write_contained_atomic(root, [run_id, "controller", "brief-{}.md".format(step)], head + body + "\n")
+        return {"outcome": "brief_written", "brief": os.path.join(run, "controller", "brief-{}.md".format(step))}
+
+
+def frozen_terminal_verb(detail):
+    """The gate verb a frozen verdict finishes with. Journals written before
+    the verb was recorded carry it only in the failed check's wording."""
+    if detail.get("terminalVerb") in TERMINAL_VERBS:
+        return detail["terminalVerb"]
+    if any(str(f).startswith("challenger-timeout:") for f in detail.get("failedChecks") or []):
+        return "challenger-timeout"
+    return "finish"
+
+
+def safe_component(name):
+    return isinstance(name, str) and bool(re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", name))
+
+
+def normalize_title(title):
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", str(title or "").lower()).split())
 
 
 # ---------------------------------------------------------------------------
@@ -439,8 +1164,12 @@ class GateView:
         for pr, st in self.pr_states.items():
             run = st.get("activeRunId")
             if run:
+                # activeLeaseOwner is the claim's owner token (poll writes it
+                # with the slot, smoke-pr-gate.sh:5362-5366); live reads it
+                # only to recover a claim whose wake was lost.
                 out[run] = {"pr": pr, "sha": st.get("activeSha"), "deadline": st.get("challengerDeadline"),
-                            "disposition": st.get("challengerDisposition")}
+                            "disposition": st.get("challengerDisposition"), "owner": st.get("activeLeaseOwner"),
+                            "claimant": st.get("activeClaimant")}
         return out
 
     def run_verdict(self, run_id):
@@ -651,10 +1380,12 @@ class Controller:
         self.journal = journal
         self.gate = gate
         self.effects = effects
+        self.live = effects.mode == "live"
         self.now = now
         self.fire = fire
         self.decisions = []
         self.alarms = []
+        self.owner_wakes = []
         # Obligation keys whose intent THIS process journaled and has not yet
         # attempted. Never inferred from the journal: an intent that existed
         # when the process started may have been attempted by a fire that died
@@ -665,6 +1396,16 @@ class Controller:
         self.tasks = self._load_json_arg(args.tasks_json, [])
         self.pr_heads = {str(k): v for k, v in self._load_json_arg(args.pr_heads_json, {}).items()}
         self.poll = self._load_json_arg(args.poll_json, None)
+        # Cutover (live only): runs the gate had claimed when this controller
+        # first went live. They finish under the legacy coordinator; this
+        # controller never records, steps, stamps or finishes them.
+        self.legacy = set()
+        if self.live:
+            cut = self._load_json_arg(getattr(args, "cutover_json", None), None)
+            if not isinstance(cut, dict) or not isinstance(cut.get("legacyRuns"), list):
+                raise ControllerError("live mode needs a readable --cutover-json {legacyRuns:[...]} -- refusing to "
+                                      "guess which claimed runs belong to the legacy coordinator")
+            self.legacy = {r for r in cut["legacyRuns"] if isinstance(r, str)}
 
     @staticmethod
     def _load_json_arg(path, default):
@@ -704,24 +1445,56 @@ class Controller:
         self.alarms.append(a)
         self.decide(run_id, None, "alarm", "mechanical", trigger, fingerprint=fingerprint, detail=detail)
         if send:
-            self.send(run_id, "alarm", "alarm:{}".format(fingerprint), fingerprint=fingerprint)
+            self.send(run_id, "alarm", "alarm:{}".format(fingerprint), fingerprint=fingerprint,
+                      hint={"trigger": trigger, "detail": detail})
 
     # -- effects ------------------------------------------------------------
 
     def _budget_refusal(self, run_id, fingerprint):
+        """(scope, reason) or None. scope `fire` clears next fire; `run` and
+        `fingerprint` never clear."""
         obs = [o for o in self.obligations().values() if o["runId"] == run_id and o["kind"] == "send"]
         sent_attempts = sum(o["attempt"] for o in obs)
         if self.fire_sends.get(run_id, 0) >= BUDGET_PER_FIRE:
-            return "per-fire budget {} reached".format(BUDGET_PER_FIRE)
+            return "fire", "per-fire budget {} reached".format(BUDGET_PER_FIRE)
         if sent_attempts >= BUDGET_PER_RUN:
-            return "per-run budget {} reached".format(BUDGET_PER_RUN)
+            return "run", "per-run budget {} reached".format(BUDGET_PER_RUN)
         if fingerprint:
             same = [o for o in obs if o["detail"].get("fingerprint") == fingerprint]
             if sum(o["attempt"] for o in same) >= BUDGET_PER_FINGERPRINT:
-                return "per-fingerprint budget {} reached for {}".format(BUDGET_PER_FINGERPRINT, fingerprint)
+                return "fingerprint", "per-fingerprint budget {} reached for {}".format(BUDGET_PER_FINGERPRINT,
+                                                                                         fingerprint)
         return None
 
-    def send(self, run_id, phase, slot, fingerprint=None):
+    def _budget_refused(self, run_id, phase, slot, attempt, scope, reason):
+        """Over budget: no send. A per-fire refusal waits for the next fire; a
+        per-run or per-fingerprint one never clears, so the obligation goes
+        failed_terminal -- which permits only finish BLOCKED (spec rev 3)."""
+        self.alarms.append({"trigger": "controller_send_budget", "runId": run_id, "detail": reason, "slot": slot})
+        self.decide(run_id, phase, "alarm", "mechanical", "controller_send_budget", slot=slot, detail=reason)
+        if scope == "fire":
+            return "budget"
+        self.record(run_id, "send", slot, "failed_terminal", attempt or None,
+                    {"reason": "controller_send_budget: {}".format(reason)})
+        return "failed_terminal"
+
+    def _effect_failed(self, run_id, kind, slot, attempt, result, trigger):
+        """A failed/unknown effect leaves the SAME attempt open (its re-run is
+        idempotent: enqueue-send replays by id, GitHub searches its marker).
+        MAX_EFFECT_FAILURES in a row make it terminal."""
+        ob = self.obligations().get(obligation_key(run_id, kind, slot)) or {"detail": {}}
+        n = int(ob["detail"].get("effectFailures") or 0) + 1
+        detail = {"effectFailures": n, "outcome": result.get("outcome"), "error": result.get("error")}
+        if n >= MAX_EFFECT_FAILURES:
+            self.record(run_id, kind, slot, "failed_terminal", attempt, dict(detail, reason="{} failures".format(n)))
+            if not slot.startswith("alarm:"):
+                self.alarm(run_id, trigger, "{}:{}".format(trigger, obligation_key(run_id, kind, slot)[:12]),
+                           {"slot": slot, "error": result.get("error")})
+            return "failed_terminal"
+        self.record(run_id, kind, slot, "intent", attempt, detail)
+        return "intent"
+
+    def send(self, run_id, phase, slot, fingerprint=None, hint=None, thread_key=None):
         """Chat send obligation with attempt-scoped ids and receipt recovery."""
         key = obligation_key(run_id, "send", slot)
         ob = self.obligations().get(key)
@@ -754,20 +1527,28 @@ class Controller:
             # key#attempt (INSERT ... ON CONFLICT(id) DO NOTHING + read-back),
             # so re-running the SAME attempt is safe and is not a new send.
             next_attempt = attempt
+            hint = ob["detail"].get("hint", hint)
+            thread_key = ob["detail"].get("threadKey", thread_key)
+            fingerprint = ob["detail"].get("fingerprint", fingerprint)
         else:
             next_attempt = attempt + 1
             refusal = self._budget_refusal(run_id, fingerprint)
             if refusal:
-                self.alarms.append({"trigger": "controller_send_budget", "runId": run_id, "detail": refusal, "slot": slot})
-                self.decide(run_id, phase, "alarm", "mechanical", "controller_send_budget", slot=slot, detail=refusal)
-                return "budget"
-            self.record(run_id, "send", slot, "intent", next_attempt,
-                        {"fingerprint": fingerprint} if fingerprint else None)
+                return self._budget_refused(run_id, phase, slot, attempt, *refusal)
+            detail = {}
+            if fingerprint:
+                detail["fingerprint"] = fingerprint
+            if hint:
+                detail["hint"] = hint
+            if thread_key:
+                detail["threadKey"] = thread_key
+            self.record(run_id, "send", slot, "intent", next_attempt, detail or None)
             crash_point("after-intent", "send", slot)
         mid = send_id(key, next_attempt)
         self.fire_sends[run_id] = self.fire_sends.get(run_id, 0) + 1
         result = self.effects.perform({"type": "send", "runId": run_id, "slot": slot, "messageId": mid,
-                                       "threadKey": run_id})
+                                       "threadKey": thread_key or run_id, "fingerprint": fingerprint,
+                                       "hint": hint or {}})
         self.decide(run_id, phase, "send", "mechanical", "obligation due", slot=slot, key=key, attempt=next_attempt,
                     messageId=mid, effect=result["outcome"])
         crash_point("after-effect", "send", slot)
@@ -777,13 +1558,20 @@ class Controller:
             self.record(run_id, "send", slot, "done", next_attempt, {"outcome": "shadow_refused", "shadowAssumed": True})
             return "done"
         if result["outcome"] in ("enqueued", "replay"):
-            self.record(run_id, "send", slot, "enqueued", next_attempt, {"messageId": mid})
+            self.record(run_id, "send", slot, "enqueued", next_attempt, {"messageId": mid, "outcome": result["outcome"]})
+            if result["outcome"] == "replay" and self.receipts.get(mid) in ("delivered", "failed"):
+                # A replay after a crash: the row was already there, and its
+                # receipt may be too -- settle it now rather than a fire later.
+                return self.send(run_id, phase, slot, fingerprint=fingerprint, hint=hint, thread_key=thread_key)
             return "enqueued"
-        # Any other outcome leaves the intent open; the same attempt id is
-        # re-offered next fire and the helper's read-back settles it.
-        return "intent"
+        if result["outcome"] == "budget":
+            # The helper's own budget (same limits, same transaction as the
+            # insert) refused: its per-fire count clears next fire.
+            scope = "fire" if "per-fire" in str(result.get("error")) else "run"
+            return self._budget_refused(run_id, phase, slot, next_attempt, scope, result.get("error"))
+        return self._effect_failed(run_id, "send", slot, next_attempt, result, "controller_send_failed")
 
-    def github(self, run_id, phase, slot):
+    def github(self, run_id, phase, slot, hint=None):
         """GitHub write: marker-carrying body; ambiguous outcomes reconcile by search."""
         key = obligation_key(run_id, "gh", slot)
         ob = self.obligations().get(key)
@@ -807,19 +1595,29 @@ class Controller:
             crash_point("after-intent", "gh", slot)
         else:
             crash_point("after-intent", "gh", slot)
-        result = self.effects.perform({"type": "gh", "runId": run_id, "slot": slot,
+        result = self.effects.perform({"type": "gh", "runId": run_id, "slot": slot, "hint": hint or {},
                                        "marker": "<!-- smoke-ctl:{} -->".format(key),
                                        "writeOnlyIfMarkerAbsent": reconcile})
         self.decide(run_id, phase, "gh", "mechanical", "obligation due", slot=slot, key=key, effect=result["outcome"],
                     afterReconcile=reconcile)
         crash_point("after-effect", "gh", slot)
-        self.record(run_id, "gh", slot, "done", 1, {"outcome": result["outcome"], "shadowAssumed": True})
-        return "done"
+        if result["outcome"] == "shadow_refused":
+            self.record(run_id, "gh", slot, "done", 1, {"outcome": result["outcome"], "shadowAssumed": True})
+            return "done"
+        if result["outcome"] == "done":
+            self.record(run_id, "gh", slot, "done", 1, {k: result[k] for k in ("outcome", "via", "url", "state",
+                                                                                "duplicateOf") if k in result})
+            return "done"
+        if result["outcome"] == "unknown":
+            # Stays a bare intent: the next fire reconciles by marker search.
+            self.record(run_id, "gh", slot, "intent", 1, {"outcome": "unknown", "error": result.get("error")})
+            return "intent"
+        return self._effect_failed(run_id, "gh", slot, 1, result, "controller_gh_failed")
 
     def gate_verb(self, run_id, phase, verb, argv_tail, verdict):
         key = obligation_key(run_id, "gate", verb)
         ob = self.obligations().get(key)
-        if ob and ob["state"] in TERMINAL_OK:
+        if ob and ob["state"] in TERMINAL_OK | {"failed_terminal"}:
             return ob["state"]
         if not ob:
             self.record(run_id, "gate", verb, "intent", 1, {"args": argv_tail, "verdict": verdict})
@@ -833,19 +1631,37 @@ class Controller:
         self.decide(run_id, phase, "gate", "mechanical", "obligation due", verb=verb, args=argv_tail,
                     effect=result["outcome"])
         crash_point("after-effect", "gate", verb)
-        self.record(run_id, "gate", verb, "done", 1, {"outcome": result["outcome"], "shadowAssumed": True,
-                                                       "args": argv_tail, "verdict": verdict})
-        return "done"
+        if result["outcome"] in ("shadow_refused", "ok"):
+            detail = {"outcome": result["outcome"], "args": argv_tail, "verdict": verdict}
+            if result["outcome"] == "shadow_refused":
+                detail["shadowAssumed"] = True
+            else:
+                detail["result"] = result.get("result")
+            self.record(run_id, "gate", verb, "done", 1, detail)
+            return "done"
+        if result["outcome"] == "refused":
+            # The gate said no (owner mismatch, GO after no-disposition, ...):
+            # never retried into the same refusal; a human owns it.
+            self.record(run_id, "gate", verb, "failed_terminal", 1, {"error": result.get("error"), "verdict": verdict})
+            self.alarm(run_id, "controller_gate_refused", "gate-refused:{}".format(key[:12]),
+                       {"verb": verb, "verdict": verdict, "error": result.get("error")})
+            self.decide(run_id, phase, "escalate", "coordination_model", "controller_gate_refused", verb=verb)
+            return "failed_terminal"
+        self.record(run_id, "gate", verb, "intent", 1, {"outcome": result["outcome"], "error": result.get("error")})
+        return "intent"
 
     def dispatch(self, run_id, phase, slot, artifact_rel, run):
         """Fresh judgment one-shot (critic/adjudicator) via `ncl tasks create`.
 
         Journals dispatch intent BEFORE create. An intent with no recorded
         outcome is AMBIGUOUS: `ncl tasks list` shows only pending/paused tasks,
-        so absence there does not prove absence. Never recreated; escalated.
+        so absence there does not prove absence. It is reconciled from a live
+        task with the ctl-<key8> slug or the one-shot's start/output file,
+        and otherwise never recreated: escalated.
         """
         key = obligation_key(run_id, "dispatch", slot)
         slug = "ctl-{}".format(key[:8])
+        started_rel = "controller/dispatch-{}.started".format(slot)
         ob = self.obligations().get(key)
         if run.has(artifact_rel):
             if not ob or ob["state"] != "done":
@@ -856,10 +1672,17 @@ class Controller:
         if ob and ob["state"] == "intent":
             # A bare intent means the fire died between journaling it and
             # recording the create's outcome (see the enqueued record below).
-            live =[t for t in self.tasks if isinstance(t, dict) and (t.get("name") or "").startswith(slug)]
-            if live:
-                self.record(run_id, "dispatch", slot, "enqueued", 1, {"taskId": live[0].get("id"), "reconciled": True})
+            live = [t for t in self.tasks if isinstance(t, dict) and (t.get("name") or "").startswith(slug)]
+            if live or run.has(started_rel):
+                self.record(run_id, "dispatch", slot, "enqueued", 1, {
+                    "taskId": live[0].get("id") if live else None, "reconciled": True,
+                    "via": "task" if live else started_rel})
                 return "enqueued"
+            if any(h.get("fire") == self.fire for h in ob["history"]):
+                # The intent was journaled in THIS fire: the task listing was
+                # captured before it, so its silence proves nothing yet. Judge
+                # it against the next fire's listing, never recreate.
+                return "intent"
             if not ob["detail"].get("ambiguous"):
                 self.record(run_id, "dispatch", slot, "intent", 1, {"ambiguous": True})
                 self.alarm(run_id, "controller_dispatch_ambiguous", "dispatch-ambiguous:{}".format(key[:12]),
@@ -886,25 +1709,60 @@ class Controller:
         if result.get("taskId"):
             self.record(run_id, "dispatch", slot, "enqueued", 1, {"taskId": result["taskId"]})
             return "enqueued"
-        # Timeout or unknown: the intent stays bare and is reconciled next fire.
+        if result["outcome"] == "failed":
+            # ncl answered ok:false: the host refused the create, so no task
+            # exists. Terminal (never recreated blind), escalated, GO blocked.
+            self.record(run_id, "dispatch", slot, "failed_terminal", 1, {"error": result.get("error")})
+            self.alarm(run_id, "controller_dispatch_failed", "dispatch-failed:{}".format(key[:12]),
+                       {"slot": slot, "error": result.get("error")})
+            return "failed_terminal"
+        # Timeout or unknown: the intent stays bare (no outcome state) and is
+        # reconciled from the next fire's task listing.
+        self.record(run_id, "dispatch", slot, "intent", 1, {"outcome": "unknown", "error": result.get("error")})
         return "intent"
 
     def owner_step(self, run_id, phase, step, done):
+        """Judgment step for the retained owner. The wake is an effect: live
+        writes <run>/controller/brief-<step>.md and the wrapper returns
+        wakeAgent:true with {step, runId, brief}; shadow refuses it. A bare
+        intent (a fire that died before the brief) is re-offered."""
         key = obligation_key(run_id, "owner", step)
         ob = self.obligations().get(key)
+        brief = "controller/brief-{}.md".format(step)
         if done:
-            if ob and ob["state"] != "done":
+            if ob and ob["state"] not in ("done", "abandoned"):
                 self.record(run_id, "owner", step, "done", 1)
             return "done"
-        if not ob:
-            self.record(run_id, "owner", step, "intent", 1)
-            self.decide(run_id, phase, "wake_owner", "judgment", "owner step due", step=step,
-                        brief="controller/brief-{}.md".format(step), wakeAgent=True)
+        if not ob or ob["state"] == "intent":
+            if not ob:
+                self.record(run_id, "owner", step, "intent", 1)
+                crash_point("after-intent", "owner", step)
+            result = self.effects.perform({"type": "owner_wake", "runId": run_id, "step": step})
+            self.decide(run_id, phase, "wake_owner", "judgment", "owner step due", step=step, key=key, brief=brief,
+                        wakeAgent=True, effect=result["outcome"], afterReconcile=bool(ob))
+            crash_point("after-effect", "owner", step)
+            if result["outcome"] in ("shadow_refused", "brief_written"):
+                self.record(run_id, "owner", step, "enqueued", 1, {"brief": brief, "outcome": result["outcome"]})
+                self.owner_wakes.append({"runId": run_id, "step": step, "brief": result.get("brief") or brief,
+                                         "key": key, "since": iso(self.now)})
+                return "enqueued"
             return "intent"
+        if ob["state"] == "enqueued" and ob["detail"].get("outcome") == "brief_written" and \
+                not os.path.lexists(os.path.join(self.args.run_root, run_id, "controller",
+                                                 "brief-{}.ack".format(step))):
+            # A written brief is only a wake once a woken owner acks it (the
+            # router's first act). One wake per fire (fire_once picks); an
+            # un-acked brief is re-offered up to OWNER_WAKE_OFFERS times, then
+            # left to the SLA below.
+            if int(ob["detail"].get("offers") or 1) < OWNER_WAKE_OFFERS:
+                self.owner_wakes.append({"runId": run_id, "step": step,
+                                         "brief": os.path.join(self.args.run_root, run_id, brief), "key": key,
+                                         "since": ob["history"][0].get("at")})
         started = parse_iso(ob["history"][0].get("at"))
-        if ob["state"] == "intent" and started and (self.now - started).total_seconds() > OWNER_STEP_SLA_SECONDS:
+        if ob["state"] in ("intent", "enqueued") and started and \
+                (self.now - started).total_seconds() > OWNER_STEP_SLA_SECONDS:
             if not ob["detail"].get("overdue"):
-                self.record(run_id, "owner", step, "intent", 1, {"overdue": True})
+                self.record(run_id, "owner", step, ob["state"], 1, {"overdue": True})
                 self.alarm(run_id, "controller_obligation_overdue", "overdue:{}".format(key[:12]),
                            {"obligation": "owner:{}".format(step)})
                 # There is no timeout verdict for a silent owner (the spec's
@@ -917,30 +1775,111 @@ class Controller:
 
     # -- per-fire reconciliation --------------------------------------------
 
+    def _claim_detail(self, wake, origin, claim=None):
+        detail = {"origin": origin, "pr": wake.get("pr") if wake else claim["pr"],
+                  "sha": wake.get("sourceSha") if wake else claim["sha"]}
+        if wake:
+            detail["isFreezePr"] = wake.get("isFreezePr")
+        if self.live:
+            token = (wake or {}).get("coordinatorOwnerToken") or (claim or {}).get("owner")
+            detail["ownerToken"] = token
+            detail["wake"] = wake or {"trigger": "pr_build_settled", "runId": None, "pr": claim["pr"],
+                                      "sourceSha": claim["sha"], "coordinatorOwnerToken": token,
+                                      "recoveredFromGateState": True}
+        return detail
+
+    def _legacy_hold(self, run_id, why):
+        """A legacy run surfaced to the controller (a poll wake after its
+        coordinator went quiet). It is never adopted: journaled under the
+        cutover pseudo-run, alarmed once, left to a human."""
+        pseudo = PSEUDO_PREFIX + "cutover"
+        key = obligation_key(pseudo, "hold", run_id)
+        if key not in self.obligations():
+            self.record(pseudo, "hold", run_id, "done", 1, {"reason": why})
+            self.alarm(pseudo, "controller_cutover_legacy_run", "legacy:{}".format(run_id[-40:]),
+                       {"legacyRunId": run_id, "reason": why})
+        self.decide(pseudo, None, "escalate", "coordination_model", "legacy run left to its coordinator",
+                    legacyRunId=run_id, why=why)
+
+    def _gate_alarm(self, wake):
+        trigger = wake.get("trigger")
+        day = self.now.strftime("%Y%m%d")
+        pseudo = PSEUDO_PREFIX + "gate." + day
+        fp = wake.get("fingerprint") or wake.get("runId") or hashlib.sha256(
+            json.dumps({k: v for k, v in wake.items() if k not in ("schemaVersion",)}, sort_keys=True).encode()
+        ).hexdigest()[:16]
+        fp = re.sub(r"[^A-Za-z0-9._:-]", "-", "{}:{}".format(trigger, fp))[:150]
+        self.decide(pseudo, None, "alarm", "mechanical", trigger, fingerprint=fp)
+        self.send(pseudo, "alarm", "gate:{}".format(fp), fingerprint=fp, hint={"gateAlarm": wake},
+                  thread_key=re.sub(r"[^A-Za-z0-9._:-]", "-", "gate-{}-{}".format(day, fp))[:120])
+
     def reconcile_claims(self):
         obs = self.obligations()
         claims = self.gate.active_claims()
         wake = (self.poll or {}).get("data") if isinstance(self.poll, dict) else None
-        if isinstance(wake, dict) and wake.get("trigger") == "pr_build_settled" and wake.get("runId"):
+        # Live: every wakeAgent:true poll result that is not a claim is an
+        # alarm the legacy coordinator posted (PRP "Non-campaign triggers");
+        # one the controller has no words for is posted verbatim, never dropped.
+        is_alarm = isinstance(wake, dict) and wake.get("trigger") not in (None, "pr_build_settled") and \
+            isinstance(self.poll, dict) and self.poll.get("wakeAgent") is True
+        if is_alarm and self.live:
+            if wake.get("trigger") == "pr_run_stalled" and wake.get("runId") and \
+                    wake["runId"] not in self.legacy and obligation_key(wake["runId"], "run", "claim") in obs:
+                # One of OUR runs stopped stamping: the controller itself was
+                # down. It is resumable only by a human (the wake's own hint).
+                self.decide(wake["runId"], None, "escalate", "coordination_model", "pr_run_stalled on a controller run")
+            self._gate_alarm(wake)
+        elif isinstance(wake, dict) and wake.get("trigger") == "pr_build_settled" and wake.get("runId"):
             run = wake["runId"]
-            if RUN_ID_RE.match(run) and obligation_key(run, "run", "claim") not in obs:
-                # The gate's poll has already claimed; this is the first record
-                # of the run. A kill right here is recovered below on the next
-                # fire from gate state (controller_orphan_claim).
-                crash_point("before-run-record", "run", "claim")
-                self.record(run, "run", "claim", "enqueued", 1, {
-                    "origin": "poll-wake", "pr": wake.get("pr"), "sha": wake.get("sourceSha"),
-                    "isFreezePr": wake.get("isFreezePr")})
-                crash_point("after-run-record", "run", "claim")
+            if run in self.legacy:
+                self._legacy_hold(run, "poll reclaimed a legacy run (resumedRunId={})".format(wake.get("resumedRunId")))
+            elif RUN_ID_RE.match(run) and not run.startswith(PSEUDO_PREFIX):
+                key = obligation_key(run, "run", "claim")
+                if key not in obs:
+                    # The gate's poll has already claimed; this is the first record
+                    # of the run. A kill right here is recovered below on the next
+                    # fire from gate state (controller_orphan_claim).
+                    crash_point("before-run-record", "run", "claim")
+                    self.record(run, "run", "claim", "enqueued", 1, self._claim_detail(wake, "poll-wake"))
+                    crash_point("after-run-record", "run", "claim")
+                elif self.live and wake.get("coordinatorOwnerToken") and \
+                        obs[key]["detail"].get("ownerToken") != wake["coordinatorOwnerToken"] and \
+                        obs[key]["state"] not in ("done", "abandoned"):
+                    # Our own poll reclaimed our own stale run (the controller
+                    # was down past PROGRESS_STALE_SECONDS): the wake carries the
+                    # new token, and only the wake may hand one over.
+                    self.record(run, "run", "claim", "enqueued", 1, dict(self._claim_detail(wake, "poll-reclaim"),
+                                                                         reclaimed=True))
                 obs = self.obligations()
         for run, claim in sorted(claims.items()):
-            if not RUN_ID_RE.match(run):
+            if not RUN_ID_RE.match(run) or run.startswith(PSEUDO_PREFIX) or run in self.legacy:
                 continue
             if obligation_key(run, "run", "claim") not in obs:
-                self.record(run, "run", "claim", "enqueued", 1, {"origin": "recovered", "pr": claim["pr"],
-                                                                "sha": claim["sha"]})
+                self.record(run, "run", "claim", "enqueued", 1, self._claim_detail(None, "recovered", claim))
                 self.alarms.append({"trigger": "controller_orphan_claim", "runId": run, "pr": claim["pr"]})
                 self.decide(run, None, "log", "mechanical", "controller_orphan_claim", pr=claim["pr"])
+
+    def _authority(self, run_id, run_ob, claim):
+        """Live: may this controller act on the run? Its journaled token must
+        be the one the gate holds. A token that changed without our own wake
+        means someone else holds the slot: never act, alarm once. The gate
+        must ALSO record the claim as the controller's (activeClaimant, set by
+        a `poll` run with SMOKE_GATE_CLAIMANT=controller; smoke-pr-gate.sh
+        claimant_guard): a legacy-claimed run is never ours even when its
+        token is readable from a run file."""
+        if not self.live:
+            return True
+        token = (run_ob or {}).get("detail", {}).get("ownerToken")
+        holder = claim.get("owner")
+        if token and holder and token == holder and claim.get("claimant") == "controller":
+            return True
+        if not (run_ob or {}).get("detail", {}).get("noAuthority"):
+            self.record(run_id, "run", "claim", run_ob["state"] if run_ob else "enqueued", 1, {"noAuthority": True})
+            self.alarm(run_id, "controller_no_authority", "no-authority:{}".format(run_id[-40:]),
+                       {"journaled": bool(token), "gateHolder": bool(holder),
+                        "tokenMatch": bool(token and token == holder), "claimant": claim.get("claimant")})
+        self.decide(run_id, None, "escalate", "coordination_model", "controller_no_authority")
+        return False
 
     # -- one run ------------------------------------------------------------
 
@@ -960,6 +1899,18 @@ class Controller:
                         error=verdict_doc.get("error"))
             return "unknown"
         if verdict_doc:
+            for verb in TERMINAL_VERBS:
+                own = obs.get(obligation_key(run_id, "gate", verb))
+                if own and own["state"] == "intent":
+                    # Our own terminal verb ran and the fire died before its
+                    # outcome was journaled: verdict.json is that outcome.
+                    self.record(run_id, "gate", verb, "done", 1, {
+                        "outcome": "reconciled", "verdict": verdict_doc.get("verdict"),
+                        "via": "gate runs/<runId>/verdict.json"})
+                    self.decide(run_id, "verdict", "gate_reconcile", "mechanical",
+                                "terminal verb outcome recovered from verdict.json", verb=verb,
+                                verdict=verdict_doc.get("verdict"))
+                    return self.post_finish(run_id, pr, verdict_doc.get("verdict"), external=False)
             return self.post_finish(run_id, pr, verdict_doc.get("verdict"), external=True)
         if claim is None and pr in self.gate.error_prs:
             # Absence is only evidence when presence was readable.
@@ -978,6 +1929,14 @@ class Controller:
                                 {"reason": "run no longer holds the gate slot"})
             self.decide(run_id, "released", "log", "mechanical", "run lost the slot without a verdict")
             return "released"
+        if not self._authority(run_id, run_ob, claim):
+            return "held"
+        if self.live:
+            # Keep the claim live: a run goes reclaimable PROGRESS_STALE_SECONDS
+            # after its last stamp (smoke-pr-gate.sh:1464-1478).
+            ka = self.effects.keepalive(run_id, run_ob["detail"].get("ownerToken"))
+            if ka and not ka.get("ok"):
+                self.decide(run_id, None, "log", "mechanical", "progress stamp failed", error=ka.get("error"))
 
         # -- phase derivation (derived, never stored) --
         if not run.exists or run.contract_error:
@@ -1010,6 +1969,24 @@ class Controller:
         # under the fresh root -- never before the root row exists.
         if run.has("contact-sheet/sheet.png") and root in ("enqueued", "delivered", "done"):
             self.send(run_id, "lanes", "root-sheet")
+
+        # A verdict validated on an earlier fire is settled from the barrier on
+        # every later one, whatever the phase files now say: live receipts
+        # land a fire after the send, and a late challenger disposition must
+        # not park a frozen challenger-timeout BLOCKED back in `lanes` (found
+        # by the live replay, pr1896: finish slipped 57h). A frozen non-GO is
+        # replayed as is; a frozen GO is re-validated and can only fall.
+        vob = self.obligations().get(obligation_key(run_id, "verdict", "validated"))
+        if vob and vob["state"] == "done":
+            frozen = vob["detail"].get("verdict")
+            syn_doc, syn_err = run.synthesis()
+            if frozen == "GO":
+                verdict, failed = validate_synthesis(run, claim.get("sha"), self.pr_heads.get(str(pr)),
+                                                     run.barrier("synthesis"), run.last_identity_check())
+            else:
+                verdict, failed = frozen, vob["detail"].get("failedChecks") or []
+            return self.pre_finish(run_id, pr, verdict, failed, syn_doc if not syn_err else {},
+                                   terminal_verb=frozen_terminal_verb(vob["detail"]))
 
         # An owner may conclude BLOCKED or HUMAN_DECISION before the barriers
         # are ready (lanes that cannot be repaired). Neither verdict can clear
@@ -1062,12 +2039,32 @@ class Controller:
             if timed:
                 return timed
             self.owner_step(run_id, "synthesis", "synthesis", done=False)
-            return "synthesis"
+            adj = self._adjudication(run_id, run)
+            return adj or "synthesis"
         self.owner_step(run_id, "synthesis", "synthesis", done=True)
+        self._adjudication(run_id, run)
 
         head = self.pr_heads.get(str(pr))
         verdict, failed = validate_synthesis(run, claim.get("sha"), head, syn_barrier, run.last_identity_check())
         return self.pre_finish(run_id, pr, verdict, failed, synthesis_doc if not syn_err else {})
+
+    def _adjudication(self, run_id, run):
+        """The owner asks for a fresh adjudicator by writing
+        controller/adjudication-request.md (and no synthesis.json yet). The
+        controller dispatches the muted one-shot; when its ruling lands the
+        owner is woken again (`adjudicated`) to finish synthesis. The request
+        is a pre-finish dispatch obligation, so an unanswered one blocks GO."""
+        if not run.has("controller/adjudication-request.md"):
+            return None
+        state = self.dispatch(run_id, "synthesis", "adjudicator", ONESHOT_ARTIFACTS["adjudicator"], run)
+        if state == "done":
+            if not run.has("synthesis.json"):
+                self.owner_step(run_id, "synthesis", "adjudicated", done=False)
+            else:
+                self.owner_step(run_id, "synthesis", "adjudicated", done=True)
+            return None
+        self.decide(run_id, "synthesis", "wait", "wait", "adjudication pending", state=state)
+        return "synthesis"
 
     def _maybe_synthesis_overdue_blocked(self, run_id, pr, run):
         """Ruling on spec gap 3: the challenger concluded BLOCKED and the owner's
@@ -1076,7 +2073,7 @@ class Controller:
         the replay (pr1945, pr1953): the historical coordinator finished BLOCKED
         straight from the challenger and never wrote a synthesis."""
         ob = self.obligations().get(obligation_key(run_id, "owner", "synthesis"))
-        if not ob or ob["state"] != "intent":
+        if not ob or ob["state"] not in ("intent", "enqueued"):
             return None
         started = parse_iso(ob["history"][0].get("at"))
         if not started or (self.now - started).total_seconds() <= OWNER_STEP_SLA_SECONDS:
@@ -1108,7 +2105,8 @@ class Controller:
         # a non-GO is never changed after its post.
         vob = self.obligations().get(obligation_key(run_id, "verdict", "validated"))
         if vob is None:
-            self.record(run_id, "verdict", "validated", "done", 1, {"verdict": verdict, "failedChecks": failed})
+            self.record(run_id, "verdict", "validated", "done", 1, {"verdict": verdict, "failedChecks": failed,
+                                                                    "terminalVerb": terminal_verb})
         else:
             frozen = vob["detail"].get("verdict")
             if frozen == "GO" and verdict != "GO":
@@ -1120,6 +2118,7 @@ class Controller:
                 verdict = "BLOCKED"
             elif frozen != "GO":
                 verdict, failed = frozen, vob["detail"].get("failedChecks") or []
+                terminal_verb = frozen_terminal_verb(vob["detail"])
         self.decide(run_id, phase, "validate", "mechanical", "verdict validated", verdict=verdict, failedChecks=failed)
         findings = []
         for f in (synthesis_doc or {}).get("findings") or []:
@@ -1133,17 +2132,22 @@ class Controller:
         states = []
         for fid in findings:
             states.append(("gh", "issue:{}".format(fid), self.github(run_id, phase, "issue:{}".format(fid))))
-        states.append(("send", "verdict", self.send(run_id, phase, "verdict")))
-        states.append(("gh", "pr-comment", self.github(run_id, phase, "pr-comment")))
+        states.append(("send", "verdict", self.send(run_id, phase, "verdict",
+                                                    hint={"verdict": verdict, "failedChecks": failed[:4]})))
+        states.append(("gh", "pr-comment", self.github(run_id, phase, "pr-comment",
+                                                       hint={"verdict": verdict, "failedChecks": failed[:4]})))
+        self._settle_alarm_sends(run_id)
         # failed_terminal and dispatch-ambiguous obligations keep their
         # escalation evidence and permit ONLY finish BLOCKED (spec rev 3).
         blocking = []
         for ob in self.obligations().values():
             if ob["runId"] != run_id:
                 continue
-            if ob["state"] == "failed_terminal":
+            if ob["state"] == "failed_terminal" and ob["kind"] != "gate":
                 blocking.append("obligation {}:{} is failed_terminal".format(ob["kind"], ob["slot"]))
-            elif ob["kind"] == "dispatch" and ob["state"] == "intent" and ob["detail"].get("ambiguous"):
+            elif ob["kind"] == "dispatch" and ob["detail"].get("ambiguous"):
+                # Sticky (spec rev 3): once escalated, a late artifact does not
+                # clear the hold -- a human does, by finishing the run.
                 blocking.append("obligation dispatch:{} is ambiguous".format(ob["slot"]))
         if blocking and verdict != "BLOCKED":
             failed = failed + blocking
@@ -1159,7 +2163,7 @@ class Controller:
                     continue
                 if ob["state"] in TERMINAL_OK:
                     continue
-                if ob["kind"] == "dispatch" and ob["slot"] == "critic" and run.has(CRITIC_ARTIFACT):
+                if ob["kind"] == "dispatch" and run.has(ONESHOT_ARTIFACTS.get(ob["slot"], CRITIC_ARTIFACT)):
                     continue  # its evidence is in; dispatch() records done on its next pass
                 started = parse_iso(ob["history"][0].get("at"))
                 age = (self.now - started).total_seconds() if started else OWNER_STEP_SLA_SECONDS + 1
@@ -1210,9 +2214,14 @@ class Controller:
         if run_key in obs and obs[run_key]["state"] not in ("done", "abandoned"):
             self.record(run_id, "run", "claim", "done", 1, {"verdict": verdict, "finishedBy": "gate" if external else
                                                           "controller"})
+            if external and self.live:
+                # Someone else finished a controller run (a person, or a legacy
+                # session that ignored the cutover): say so, never silently.
+                self.alarm(run_id, "controller_foreign_finish", "foreign-finish:{}".format(run_id[-40:]),
+                           {"verdict": verdict})
             # Owner steps still waiting are moot once the verdict is written.
             for ob in list(self.obligations().values()):
-                if ob["runId"] == run_id and ob["kind"] == "owner" and ob["state"] == "intent":
+                if ob["runId"] == run_id and ob["kind"] == "owner" and ob["state"] in ("intent", "enqueued"):
                     self.record(run_id, "owner", ob["slot"], "abandoned", 1, {"reason": "run finished"})
             crash_point("after-run-done", "run", "claim")
         if is_freeze or obligation_key(run_id, "gh", "freeze-close") in self.obligations():
@@ -1232,17 +2241,55 @@ class Controller:
 
     # -- fire ---------------------------------------------------------------
 
+    def _settle_pseudo_sends(self):
+        """Gate-alarm and cutover sends belong to no campaign, so no step_run
+        re-offers them: settle their receipts (and failed-receipt retries)
+        here."""
+        for ob in list(self.obligations().values()):
+            if ob["runId"].startswith(PSEUDO_PREFIX) and ob["kind"] == "send" and ob["state"] in ("intent", "enqueued"):
+                self.send(ob["runId"], "alarm", ob["slot"], fingerprint=ob["detail"].get("fingerprint"),
+                          hint=ob["detail"].get("hint"), thread_key=ob["detail"].get("threadKey"))
+
+    def _settle_alarm_sends(self, run_id):
+        """A run's alarm posts are raised once and re-offered by no phase:
+        settle their receipts here, or the GO barrier waits on a post that
+        was delivered long ago and reads its age as an unreceipted one."""
+        for ob in list(self.obligations().values()):
+            if ob["runId"] == run_id and ob["kind"] == "send" and ob["slot"].startswith("alarm:") \
+                    and ob["state"] in ("intent", "enqueued"):
+                self.send(run_id, "alarm", ob["slot"], fingerprint=ob["detail"].get("fingerprint"),
+                          hint=ob["detail"].get("hint"), thread_key=ob["detail"].get("threadKey"))
+
     def fire_once(self):
         self.reconcile_claims()
         runs = set(self.journal.runs()) | set(self.gate.active_claims())
         summary = []
         for run_id in sorted(runs):
-            if not RUN_ID_RE.match(run_id):
+            if not RUN_ID_RE.match(run_id) or run_id.startswith(PSEUDO_PREFIX) or run_id in self.legacy:
                 continue
             phase = self.step_run(run_id)
             if phase:
                 summary.append({"runId": run_id, "phase": phase})
+        self._settle_pseudo_sends()
         return summary
+
+    def pick_owner_wake(self):
+        """At most ONE owner wake per fire: the task's one session runs one
+        judgment turn at a time. Oldest due step first; a brief written this
+        fire counts as its first offer, a re-offer is journaled."""
+        live = [w for w in self.owner_wakes if self.live]
+        if not live:
+            return None
+        wake = sorted(live, key=lambda w: (str(w.get("since")), w["runId"], w["step"]))[0]
+        ob = self.obligations().get(wake["key"]) or {"detail": {}}
+        detail = ob["detail"]
+        if detail.get("offerFire") != self.fire:
+            # A re-run of the SAME fire (a supervisor retry, or a fire killed
+            # before the wrapper printed its line) re-emits the wake without
+            # counting another offer.
+            offers = 1 if detail.get("offerFire") is None else int(detail.get("offers") or 1) + 1
+            self.record(wake["runId"], "owner", wake["step"], "enqueued", 1, {"offers": offers, "offerFire": self.fire})
+        return {"step": wake["step"], "runId": wake["runId"], "brief": wake["brief"]}
 
 
 # ---------------------------------------------------------------------------
@@ -1252,8 +2299,8 @@ class Controller:
 def resolve_mode(args):
     env = os.environ.get("SMOKE_CONTROLLER_MODE", "off")
     mode = "shadow" if args.shadow else env
-    if mode not in ("off", "shadow"):
-        raise ControllerError("SMOKE_CONTROLLER_MODE={!r} is not supported by this build (off|shadow only)".format(mode))
+    if mode not in MODES:
+        raise ControllerError("SMOKE_CONTROLLER_MODE={!r} is not a mode (off|shadow|live)".format(mode))
     return mode
 
 
@@ -1270,15 +2317,26 @@ def append_decision(out_dir, decision):
         os.close(fd)
 
 
+def live_config(args):
+    return {
+        "repo": args.repo, "send_to": args.send_to, "gate_cmd": args.gate_cmd, "gh_cmd": args.gh_cmd,
+        "ncl_cmd": args.ncl_cmd, "enqueue_cmd": args.enqueue_cmd, "outbox_root": args.outbox_root,
+        "critic_log": args.critic_log, "challenger_mention": args.challenger_mention,
+        "oneshot_model": args.oneshot_model, "oneshot_effort": args.oneshot_effort,
+        "deadline": args.deadline_epoch,
+    }
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
+    env = os.environ.get
     for name in ("init", "step"):
         s = sub.add_parser(name)
-        s.add_argument("--shadow", action="store_true", help="force shadow mode (the only implemented mode)")
-        s.add_argument("--out-dir", default=os.environ.get("SMOKE_CONTROLLER_SHADOW_DIR"))
-        s.add_argument("--gate-state-dir", default=os.environ.get("SMOKE_GATE_STATE_DIR"))
-        s.add_argument("--run-root", default=os.environ.get("SMOKE_GATE_RUN_ROOT"))
+        s.add_argument("--shadow", action="store_true", help="force shadow mode whatever SMOKE_CONTROLLER_MODE says")
+        s.add_argument("--out-dir", default=env("SMOKE_CONTROLLER_OUT_DIR") or env("SMOKE_CONTROLLER_SHADOW_DIR"))
+        s.add_argument("--gate-state-dir", default=env("SMOKE_GATE_STATE_DIR"))
+        s.add_argument("--run-root", default=env("SMOKE_GATE_RUN_ROOT"))
         s.add_argument("--poll-json")
         s.add_argument("--receipts-json")
         s.add_argument("--tasks-json")
@@ -1286,6 +2344,21 @@ def main(argv=None):
         s.add_argument("--now")
         s.add_argument("--fire")
         s.add_argument("--lock-timeout", type=float, default=30.0)
+        # live only
+        s.add_argument("--cutover-json")
+        s.add_argument("--repo", default=env("SMOKE_GATE_REPO"))
+        s.add_argument("--send-to", default=env("SMOKE_CONTROLLER_SEND_TO"))
+        s.add_argument("--gate-cmd", default=env("SMOKE_CONTROLLER_GATE_CMD"))
+        s.add_argument("--gh-cmd", default=env("SMOKE_CONTROLLER_GH_CMD") or "gh")
+        s.add_argument("--ncl-cmd", default=env("SMOKE_CONTROLLER_NCL_CMD") or "ncl")
+        s.add_argument("--enqueue-cmd", default=env("SMOKE_CONTROLLER_ENQUEUE_CMD") or "bun /app/src/cli/enqueue-send.ts")
+        s.add_argument("--outbox-root", default=env("SMOKE_CONTROLLER_OUTBOX_ROOT"))
+        s.add_argument("--critic-log", default=env("SMOKE_CONTROLLER_CRITIC_LOG"))
+        s.add_argument("--challenger-mention", default=env("SMOKE_CONTROLLER_CHALLENGER_MENTION"))
+        s.add_argument("--oneshot-model", default=env("SMOKE_CONTROLLER_ONESHOT_MODEL"))
+        s.add_argument("--oneshot-effort", default=env("SMOKE_CONTROLLER_ONESHOT_EFFORT"))
+        s.add_argument("--deadline-epoch", type=float, default=None,
+                       help="live: no effect subprocess may run past this wall-clock time")
     args = p.parse_args(argv)
     journal = None
     try:
@@ -1293,10 +2366,11 @@ def main(argv=None):
         if mode == "off":
             print(json.dumps({"ok": True, "mode": "off", "wakeAgent": False}))
             return 0
-        out_dir = args.out_dir or (os.path.join(args.gate_state_dir, "controller-shadow") if args.gate_state_dir else None)
+        out_dir = args.out_dir or (os.path.join(args.gate_state_dir, "controller-shadow" if mode == "shadow" else
+                                                "controller") if args.gate_state_dir else None)
         if not out_dir:
             raise ControllerError("no --out-dir and no SMOKE_GATE_STATE_DIR")
-        journal = Journal(out_dir)
+        journal = Journal(out_dir, mode)
         if not journal.lock(args.lock_timeout):
             print(json.dumps({"ok": True, "mode": mode, "wakeAgent": False, "skipped": "control.lock busy"}))
             return 0
@@ -1304,16 +2378,23 @@ def main(argv=None):
             journal.init()
             print(json.dumps({"ok": True, "mode": mode, "initialized": journal.path}))
             return 0
-        effects = EffectLayer(mode)
+        effects = EffectLayer(mode, live_config(args) if mode == "live" else None)
+        if mode == "live" and not args.run_root:
+            raise ControllerError("live mode needs --run-root")
         journal.load()
         now = parse_iso(args.now) if args.now else dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
         if now is None:
             raise ControllerError("--now {!r} is not ISO-8601".format(args.now))
         gate = GateView(args.gate_state_dir)
         ctl = Controller(args, journal, gate, effects, now, args.fire or iso(now))
+        effects.bind(ctl)
         summary = ctl.fire_once()
+        owner_wake = ctl.pick_owner_wake()
         print(json.dumps({"ok": True, "mode": mode, "wakeAgent": False, "fire": ctl.fire, "runs": summary,
-                          "decisions": len(ctl.decisions), "effectsRefused": len(effects.performed),
+                          "decisions": len(ctl.decisions),
+                          "effectsRefused": len(effects.performed) if mode == "shadow" else 0,
+                          "effectsPerformed": len(effects.performed) if mode == "live" else 0,
+                          "ownerWake": owner_wake,
                           "alarms": ctl.alarms, "gateStateErrors": gate.errors}, sort_keys=True))
         return 0
     except ControllerError as exc:

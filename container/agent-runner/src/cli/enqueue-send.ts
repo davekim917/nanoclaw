@@ -1,8 +1,17 @@
 #!/usr/bin/env bun
 /**
  * enqueue-send — idempotent, model-free chat send for the smoke campaign
- * controller (CONTROLLER-SPEC rev 3 s2, "Model-free sends"). NOT wired into
- * any task yet: the controller ships shadow-only and never calls it.
+ * controller (CONTROLLER-SPEC rev 3 s2, "Model-free sends"). The live
+ * controller runs it from its task script as
+ *
+ *   bun /app/src/cli/enqueue-send.ts --id <key>#<attempt> --to <destination> \
+ *     --text-file <path> --thread-key <runId> --run-id <runId> --fire <fire> \
+ *     [--fingerprint <fp>] [--file <abs path>]... [--outbox-root <dir>]
+ *
+ * in the task's own session, the same transport `ncl` uses (cli/ncl.ts:
+ * 272-273): the task-script process starts the session mailbox itself. The
+ * runner source is a boot snapshot (src/agent-runner-source.ts), so a change
+ * here reaches containers only after a host restart.
  *
  * Same path as `send_message`/`send_file` (mcp-tools/core.ts): resolve a named
  * destination, stage attachments at <outbox>/<id>/<name>, write one
@@ -388,6 +397,17 @@ export function enqueueSend(input: EnqueueSendInput): EnqueueSendResult & { ok: 
 // ---------------------------------------------------------------------------
 // CLI
 
+// A text file the caller names but that cannot be read is a deterministic
+// input fault (exit 2), not a transient one: the controller retries `error`
+// (exit 1) as an unknown outcome, and a retry cannot make the file appear.
+function readTextFile(file: string): string {
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    throw new EnqueueSendError('invalid', `text file unreadable: ${file} (${(err as Error).message})`);
+  }
+}
+
 export function parseEnqueueArgv(argv: string[]): EnqueueSendInput & { textFile?: string } {
   const out: Record<string, string> = {};
   const files: string[] = [];
@@ -410,7 +430,7 @@ export function parseEnqueueArgv(argv: string[]): EnqueueSendInput & { textFile?
   return {
     id: out.id ?? '',
     to: out.to ?? '',
-    text: 'text-file' in out ? fs.readFileSync(out['text-file'], 'utf8') : (out.text ?? ''),
+    text: 'text-file' in out ? readTextFile(out['text-file']) : (out.text ?? ''),
     threadKey: out['thread-key'] ?? '',
     runId: out['run-id'] ?? '',
     fire: out.fire ?? '',

@@ -319,6 +319,24 @@ describe('cli exit contract', () => {
     expect(over).toMatchObject({ exit: 3, out: { ok: false, code: 'budget', alarm: 'controller_send_budget' } });
   });
 
+  test('2 (invalid, not a retryable error) when --text-file cannot be read', async () => {
+    const r = await run([
+      '--id',
+      `${KEY}#1`,
+      '--to',
+      'campaign-room',
+      '--text-file',
+      '/nonexistent/smoke-ctl.txt',
+      '--thread-key',
+      RUN,
+      '--run-id',
+      RUN,
+      '--fire',
+      'f1',
+    ]);
+    expect(r).toMatchObject({ exit: 2, out: { ok: false, code: 'invalid' } });
+  });
+
   test('4 on a payload mismatch for an existing id', async () => {
     enqueueSend(input({ text: 'first' }));
     const r = await run(base(`${KEY}#1`, 'second'));

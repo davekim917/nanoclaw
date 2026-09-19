@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tests for smoke-campaign-controller.py (shadow mode, PR 1).
+# Tests for smoke-campaign-controller.py (shadow mode; live mode is in
+# smoke-campaign-controller-live.test.sh).
 #
 # Covers the spec's fault injections (CONTROLLER-SPEC rev 3 s3): kill between
 # gate claim and the journal write, between intent and enqueue, between
@@ -140,8 +141,12 @@ echo "$out" | jq -e '.mode == "off" and .ok == true' >/dev/null || fail "default
 set +e
 out="$(SMOKE_CONTROLLER_MODE=live python3 "$CTL" step --out-dir "$C/out" --gate-state-dir "$C/state")"; rc=$?
 set -e
-[ "$rc" = 3 ] || fail "SMOKE_CONTROLLER_MODE=live must be refused (rc=$rc)"
-echo "$out" | jq -e '.ok == false and (.error | contains("off|shadow only"))' >/dev/null || fail "live refusal: $out"
+[ "$rc" = 3 ] || fail "SMOKE_CONTROLLER_MODE=live without its config must be refused (rc=$rc)"
+echo "$out" | jq -e '.ok == false and (.error | contains("live mode needs"))' >/dev/null || fail "live refusal: $out"
+set +e
+out="$(SMOKE_CONTROLLER_MODE=bogus python3 "$CTL" step --out-dir "$C/out" --gate-state-dir "$C/state")"; rc=$?
+set -e
+[ "$rc" = 3 ] && echo "$out" | jq -e '.error | contains("off|shadow|live")' >/dev/null || fail "unknown mode: $out"
 out="$(SMOKE_CONTROLLER_MODE=live python3 "$CTL" step --shadow --out-dir "$C/out" --gate-state-dir "$C/state" --run-root "$C/runs")"
 echo "$out" | jq -e '.mode == "shadow"' >/dev/null || fail "--shadow must win over the env: $out"
 out="$(SMOKE_CONTROLLER_MODE=shadow python3 "$CTL" step --out-dir "$C/out" --gate-state-dir "$C/state" --run-root "$C/runs")"
@@ -884,8 +889,13 @@ set -e
 step_ok 2026-09-18T10:10:00Z
 dq '[.[] | select(.type=="dispatch")] | length == 1' | grep -qx true \
   || fail "a same-fire retry must never recreate the task: $(dq '[.[] | select(.type=="dispatch")]')"
-dq '[.[] | select(.type=="escalate" and .reason=="controller_dispatch_ambiguous")] | length == 1' | grep -qx true \
-  || fail "the bare intent is escalated as ambiguous"
+dq '[.[] | select(.type=="escalate" and .reason=="controller_dispatch_ambiguous")] | length == 0' | grep -qx true \
+  || fail "a same-fire retry cannot judge the intent: its task listing predates the create"
+step_ok 2026-09-18T10:20:00Z
+dq '[.[] | select(.type=="dispatch")] | length == 1' | grep -qx true \
+  || fail "the next fire must never recreate the task either"
+dq '[.[] | select(.type=="escalate" and .reason=="controller_dispatch_ambiguous")] | length >= 1' | grep -qx true \
+  || fail "the bare intent is escalated as ambiguous once a later listing still lacks it"
 
 [ ! -e "$T/effects.log" ] || fail "shadow invoked an effect command: $(cat "$T/effects.log")"
 echo "smoke campaign controller tests passed"
