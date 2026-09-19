@@ -5539,22 +5539,6 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
       expect(result.stderr).toContain('required CI Gate never started on Actions');
     });
 
-    // XZO's shape: the ruleset requires `CI Gate` by name, and run-host-ci.sh
-    // posts a `CI Gate` status beside `CI (host)` when the declaration stands
-    // in for it. The gate reads the pair the same way as `CI (host)` alone.
-    it('defers with ci=host beside a CI Gate stand-in status, and refuses when the stand-in is red', () => {
-      const root = tempRoot();
-      legacy(root, [neverRun(), rollupStatus('CI Gate', 'SUCCESS'), rollupStatus(HOST, 'SUCCESS', false)], false);
-      const green = runHelper(root, ['merge-check', '--head', HEAD]);
-      expect(green.status).toBe(26);
-      expect(green.stdout).toContain('merge=defer mode=legacy ci=host:');
-
-      legacy(root, [neverRun(), rollupStatus('CI Gate', 'FAILURE'), rollupStatus(HOST, 'FAILURE', false)], false);
-      const red = runHelper(root, ['merge-check', '--head', HEAD]);
-      expect(red.status).toBe(24);
-      expect(red.stderr).toContain('required_red: CI Gate=failure');
-    });
-
     it.each<[string, Page[], boolean | null]>([
       ['no CI (host) status', [], false],
       ['a CI (host) failure', [rollupStatus(HOST, 'FAILURE', false)], false],

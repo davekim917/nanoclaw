@@ -6,8 +6,7 @@
 #
 # Exit codes: 0 the declared CI passed and `success` was posted; 1 it failed (or
 # the status could not be posted, or the PR was refused) and `failure` was
-# posted where possible; 2 usage, or a declaration naming a context it may not
-# stand in for; 3 the repository declares no host CI at that head (nothing
+# posted where possible; 2 usage; 3 the repository declares no host CI at that head (nothing
 # posted); 12 the PR head is not --head.
 #
 # --dry-run runs everything the same way and reports what it would post, but
@@ -26,24 +25,13 @@
 # workflow that ran and failed stays red whatever this posts, and a `CI (host)`
 # failure is a red status like any other.
 #
-# Stand-in contexts. A declaration may name, in its leading comment block, the
-# status contexts its run is equivalent to:
-#
-#   # host-ci-context: CI Gate
-#
-# (one per line). Each is posted alongside `CI (host)`, with the same state,
-# ONLY when every Actions job of that name on this head is one GitHub never
-# started (never-started.jq, the predicate merge-check uses), so it is never
-# posted over a real Actions result or while Actions is healthy. It does NOT
-# turn a branch rule that requires that name green on its own: "If a check and
-# a commit status have the same name, both must pass when that name is
-# required" (GitHub docs, Troubleshooting required status checks), and the
-# never-started check run is still there, failed. What it gives is the host
-# verdict under the name the rule and people look for; merging still takes the
-# rule's bypass, after merge-check reads `ci=host`. Decided once,
-# before the run: a stand-in that got `pending` is always resolved with the
-# run's verdict. `CI (host)`, `Release policy` and `Release approval` cannot
-# be named.
+# It posts `CI (host)` only, never a context an Actions check also uses: a
+# branch rule requiring a name that both a check run and a commit status carry
+# needs BOTH to pass ("If a check and a commit status have the same name, both
+# must pass when that name is required" — GitHub docs, Troubleshooting required
+# status checks), so a status named after a never-started Actions check cannot
+# satisfy that rule anyway. Such a repo merges through its rule's bypass once
+# merge-check reads `ci=host` (SKILL.md).
 #
 # The commands are the repository's, never this script's: `.github/host-ci.sh`
 # at the PR head, run with bash from the checkout root. A repository without one
@@ -77,10 +65,8 @@
 # over the same https remote gh authenticates.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST_CI_CONTEXT='CI (host)'
 DECLARATION='.github/host-ci.sh'
-RESERVED_CONTEXTS=("$HOST_CI_CONTEXT" 'Release policy' 'Release approval')
 
 usage() { echo "usage: run-host-ci.sh [--pr <n>] [--head <sha>] [--repo <owner/name>] [--dry-run]" >&2; exit 2; }
 
@@ -174,31 +160,6 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Whether $1 may be posted as a stand-in: at least one Actions job of exactly
-# that name on this head, and every one of them never started and failed.
-# Read through actions/runs and each run's jobs — the endpoints merge-check
-# reads — never commits/<sha>/check-runs, which 403s under the narrower
-# tokens container agents hold. Any read that fails is a no. Sets `why`.
-why=""
-standin_allowed() {
-  local runs ids id jobs verdict
-  runs=$(gh api --paginate --slurp "repos/$repo/actions/runs?head_sha=$head&per_page=100" 2>/dev/null) || { why="could not read the Actions runs on this head"; return 1; }
-  ids=$(printf '%s\n' "$runs" | jq -r --arg head "$head" '[ .[].workflow_runs[]? | select(.head_sha == $head) | .id ] | unique | .[]') || { why="could not read the Actions runs on this head"; return 1; }
-  local found=0
-  for id in $ids; do
-    [[ "$id" =~ ^[0-9]+$ ]] || { why="an Actions run on this head has id \"$id\""; return 1; }
-    jobs=$(gh api --paginate --slurp "repos/$repo/actions/runs/$id/jobs?per_page=100" 2>/dev/null) || { why="could not read the jobs of run $id"; return 1; }
-    verdict=$(printf '%s\n' "$jobs" | jq -r -L "$HERE" --arg name "$1" 'include "never-started";
-      [ .[].jobs[]? | select(.name == $name) ] | if length == 0 then "none" elif all(.[]; never_started and .conclusion == "failure") then "never" else "started" end') || { why="could not read the jobs of run $id"; return 1; }
-    case "$verdict" in
-      none) ;;
-      never) found=1 ;;
-      *) why="Actions started a \"$1\" job on this head (run $id) — a real result, never overwritten"; return 1 ;;
-    esac
-  done
-  [ "$found" = 1 ] || { why="no Actions job named \"$1\" is on this head (yet)"; return 1; }
-}
-
 scratch=$(mktemp -d "${HOST_CI_SCRATCH:-${TMPDIR:-/tmp}}/host-ci.XXXXXX")
 src="$scratch/src"
 git init -q "$src"
@@ -218,33 +179,7 @@ if [ ! -f "$src/$DECLARATION" ]; then
   exit 3
 fi
 
-# The leading comment block only: the shebang, blank lines and `#` lines up
-# to the first line of code.
-mapfile -t declared < <(awk '
-  NR == 1 && /^#!/ { next }
-  /^[[:space:]]*$/ { next }
-  /^#/ { if (match($0, /^#[[:space:]]*host-ci-context:[[:space:]]*/)) { v = substr($0, RLENGTH + 1); sub(/[[:space:]]+$/, "", v); print v }; next }
-  { exit }' "$src/$DECLARATION")
-standins=()
-for ctx in "${declared[@]}"; do
-  if [ -z "$ctx" ] || [ "${#ctx}" -gt 100 ]; then
-    echo "run-host-ci: $DECLARATION declares an empty or over-long host-ci-context" >&2
-    exit 2
-  fi
-  for reserved in "${RESERVED_CONTEXTS[@]}"; do
-    if [ "$ctx" = "$reserved" ]; then
-      echo "run-host-ci: $DECLARATION declares host-ci-context \"$ctx\", which host CI may never stand in for" >&2
-      exit 2
-    fi
-  done
-  if standin_allowed "$ctx"; then
-    standins+=("$ctx")
-    echo "run-host-ci: will stand in for \"$ctx\": Actions never started it on $head" >&2
-  else
-    echo "run-host-ci: not standing in for \"$ctx\": $why" >&2
-  fi
-done
-contexts=("$HOST_CI_CONTEXT" "${standins[@]}")
+contexts=("$HOST_CI_CONTEXT")
 
 mkdir -p "$log_dir"
 log="$log_dir/${repo//\//_}-pr$pr-${head:0:12}-$(date -u +%Y%m%dT%H%M%SZ).log"
@@ -294,11 +229,7 @@ body="$scratch/comment.md"
 {
   printf '<!-- run-host-ci head=%s verdict=%s -->\n' "$head" "$verdict"
   printf '**Host CI: %s** on `%s` — %s.\n\n' "$verdict" "$head" "$summary"
-  if [ "${#standins[@]}" -gt 0 ]; then
-    printf 'Posted as `%s` and, standing in because Actions never started them on this head, %s.\n\n' "$HOST_CI_CONTEXT" "$(printf '`%s` ' "${standins[@]}")"
-  else
-    printf 'Posted as `%s`.\n\n' "$HOST_CI_CONTEXT"
-  fi
+  printf 'Posted as `%s`.\n\n' "$HOST_CI_CONTEXT"
   printf 'Full log on %s: `%s`\n\n<details><summary>Last 80 lines</summary>\n\n````text\n' "$host_name" "$log"
   tail -n 80 "$log" | sed 's/````/` ` ` `/g'
   printf '````\n\n</details>\n'

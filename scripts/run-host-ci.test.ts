@@ -29,29 +29,12 @@ afterEach(() => {
 });
 
 type Status = { state: string; context: string; description: string; sha: string; target_url: string };
-type Job = {
-  name: string;
-  status: string;
-  conclusion: string;
-  runner_id: number;
-  runner_name: string;
-  steps: unknown[];
-};
-
-// A job GitHub never started (the billing lockout's shape) or one that ran.
-function job(name: string, started: boolean, conclusion = 'failure'): Job {
-  return started
-    ? { name, status: 'completed', conclusion, runner_id: 7, runner_name: 'GitHub Actions 7', steps: [{ name: 'x' }] }
-    : { name, status: 'completed', conclusion, runner_id: 0, runner_name: '', steps: [] };
-}
-
 function setup(
   opts: {
     declaration?: string | null;
     state?: string;
     fetched?: string;
     cross?: boolean;
-    runs?: Record<number, Job[] | null>;
     commentFails?: boolean;
   } = {},
 ) {
@@ -77,14 +60,6 @@ function setup(
       isCrossRepository: opts.cross ?? false,
     }),
   );
-  // The Actions runs on HEAD, each with its jobs; null = that run's jobs read fails.
-  const runs = opts.runs ?? {};
-  fs.writeFileSync(
-    path.join(root, 'runs.json'),
-    JSON.stringify({ workflow_runs: Object.keys(runs).map((id) => ({ id: Number(id), head_sha: HEAD })) }),
-  );
-  for (const [id, jobs] of Object.entries(runs))
-    if (jobs !== null) fs.writeFileSync(path.join(root, `jobs--${id}.json`), JSON.stringify({ jobs }));
   if (opts.commentFails) fs.writeFileSync(path.join(root, 'comment.fail'), '');
   fs.writeFileSync(
     path.join(bin, 'gh'),
@@ -113,15 +88,6 @@ if [ "$1" = api ] && [ "$2" = -X ] && [ "$3" = POST ]; then
       ;;
   esac
 fi
-rest=""
-for arg in "$@"; do case "$arg" in repos/*) rest="$arg" ;; esac; done
-case "$rest" in
-  */actions/runs\\?head_sha=*) printf '['; cat "$MOCK_DIR/runs.json"; printf ']'; exit 0 ;;
-  */actions/runs/*/jobs\\?*)
-    id="\${rest#*/actions/runs/}"; id="\${id%%/*}"
-    [ -f "$MOCK_DIR/jobs--$id.json" ] || { echo 'gh: Not Found (HTTP 404)' >&2; exit 1; }
-    printf '['; cat "$MOCK_DIR/jobs--$id.json"; printf ']'; exit 0 ;;
-esac
 echo "unexpected gh $*" >&2; exit 64
 `,
     { mode: 0o755 },
@@ -337,13 +303,12 @@ exit 0
     it('runs the declaration, even on a merged PR, and posts nothing', () => {
       const ctx = setup({
         state: 'MERGED',
-        declaration: '# host-ci-context: CI Gate\nset -euo pipefail\necho ran\n',
-        runs: { 11: [job('CI Gate', false)] },
+        declaration: 'set -euo pipefail\necho ran\n',
       });
       const result = run(ctx, ['--pr', '7', '--repo', 'example/repository', '--dry-run']);
       expect(result.status).toBe(0);
       expect(result.stdout).toContain('ran');
-      expect(result.stdout).toMatch(/host-ci=success .* dry-run=1 .*would-post="CI \(host\),CI Gate"/);
+      expect(result.stdout).toMatch(/host-ci=success .* dry-run=1 .*would-post="CI \(host\)"/);
       expect(result.statuses).toEqual([]);
       expect(result.comment).toBeNull();
       expect(result.calls).not.toContain('POST');
@@ -376,105 +341,5 @@ exit 0
       expect(result.stdout).toContain('host-ci=failure');
       expect(result.statuses).toEqual([]);
     });
-  });
-
-  describe('stand-in contexts (# host-ci-context:)', () => {
-    const declaration = '#!/usr/bin/env bash\n# A declaration.\n# host-ci-context: CI Gate\nset -euo pipefail\ntrue\n';
-
-    it('posts the declared context beside CI (host) when Actions never started it on this head', () => {
-      const ctx = setup({ declaration, runs: { 11: [job('CI Gate', false)], 12: [job('changes', false)] } });
-      const result = run(ctx);
-      expect(result.status).toBe(0);
-      expect(states(result.statuses)).toEqual([
-        ['CI (host)', 'pending'],
-        ['CI Gate', 'pending'],
-        ['CI (host)', 'success'],
-        ['CI Gate', 'success'],
-      ]);
-      expect(result.statuses.every((s) => s.sha === HEAD)).toBe(true);
-      expect(result.statuses[3].target_url).toBe(COMMENT_URL);
-      expect(result.comment).toContain('`CI Gate`');
-    });
-
-    it('posts the run verdict on the stand-in too: a failed run fails it', () => {
-      const ctx = setup({
-        declaration: '# host-ci-context: CI Gate\nset -euo pipefail\nexit 1\n',
-        runs: { 11: [job('CI Gate', false)] },
-      });
-      const result = run(ctx);
-      expect(result.status).toBe(1);
-      expect(states(result.statuses)).toEqual([
-        ['CI (host)', 'pending'],
-        ['CI Gate', 'pending'],
-        ['CI (host)', 'failure'],
-        ['CI Gate', 'failure'],
-      ]);
-    });
-
-    it.each<[string, Record<number, Job[] | null>, string]>([
-      ['Actions ran it (healthy)', { 11: [job('CI Gate', true, 'success')] }, 'a real result'],
-      ['Actions ran it and it failed', { 11: [job('CI Gate', true)] }, 'a real result'],
-      [
-        'a rerun started, beside one that never did',
-        { 11: [job('CI Gate', false)], 12: [job('CI Gate', true)] },
-        'a real result',
-      ],
-      ['no job of that name is on the head', { 11: [job('Other', false)] }, 'no Actions job named'],
-      ['its jobs cannot be read', { 11: null }, 'could not read the jobs'],
-    ])('never posts it when %s', (_case, runs, reason) => {
-      const ctx = setup({ declaration, runs });
-      const result = run(ctx);
-      expect(result.status).toBe(0);
-      expect(result.stderr).toContain(`not standing in for "CI Gate": `);
-      expect(result.stderr).toContain(reason);
-      expect(result.statuses.map((s) => s.context)).toEqual(['CI (host)', 'CI (host)']);
-    });
-
-    it('fails the stand-in too when interrupted', () => {
-      const ctx = setup({
-        declaration: `# host-ci-context: CI Gate
-set -euo pipefail
-p=$$ top=""
-while [ "$p" -gt 1 ]; do
-  if tr '\\0' '\\n' < /proc/$p/environ 2>/dev/null | grep -qxF "MOCK_DIR=$MOCK_DIR" \\
-    && tr '\\0' ' ' < /proc/$p/cmdline | grep -qF 'run-host-ci.sh'; then top=$p; fi
-  p=$(awk '{print $4}' /proc/$p/stat)
-done
-kill -TERM "$top"
-exit 0
-`,
-        runs: { 11: [job('CI Gate', false)] },
-      });
-      const result = run(ctx);
-      expect(result.status).toBe(143);
-      expect(states(result.statuses)).toEqual([
-        ['CI (host)', 'pending'],
-        ['CI Gate', 'pending'],
-        ['CI (host)', 'failure'],
-        ['CI Gate', 'failure'],
-      ]);
-    });
-
-    it('reads only the leading comment block', () => {
-      const ctx = setup({
-        declaration: 'set -euo pipefail\n# host-ci-context: CI Gate\ntrue\n',
-        runs: { 11: [job('CI Gate', false)] },
-      });
-      const result = run(ctx);
-      expect(result.status).toBe(0);
-      expect(result.statuses.map((s) => s.context)).toEqual(['CI (host)', 'CI (host)']);
-    });
-
-    it.each(['CI (host)', 'Release policy', 'Release approval'])(
-      'refuses a declaration that names %s, posting nothing',
-      (name) => {
-        const ctx = setup({ declaration: `# host-ci-context: ${name}\nset -euo pipefail\ntrue\n` });
-        const result = run(ctx);
-        expect(result.status).toBe(2);
-        expect(result.stderr).toContain('may never stand in for');
-        expect(result.statuses).toEqual([]);
-        expect(result.scratchLeft).toEqual([]);
-      },
-    );
   });
 });

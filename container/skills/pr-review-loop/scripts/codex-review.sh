@@ -511,7 +511,7 @@ CI_EXCLUDED_CONTEXTS='["Release policy","Release approval"]'
 # a host against the exact head. It stands in for a required Actions workflow
 # only when GitHub never started that workflow's jobs (never_started_runs);
 # otherwise it is one more status, and red when it is red. What "never started"
-# means is never-started.jq, shared with run-host-ci.sh.
+# means is never-started.jq.
 HOST_CI_CONTEXT='CI (host)'
 # The request marker, hidden in the rendered comment. It is how `request`
 # dedupes per head and counts rounds, and how `merge-check` learns when THIS
