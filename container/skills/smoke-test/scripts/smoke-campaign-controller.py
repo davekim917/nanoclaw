@@ -37,9 +37,22 @@ synthesis.json (the owner's machine-readable verdict; new contract, s2):
   synthesis to disposition each; it never trusts the synthesis' own list as
   complete. Anything short of that maps GO to BLOCKED naming the failed check.
 
+challenger/challenge.complete.json dissent inventory (new contract, s2):
+  {..., disposition: CLEAR|<other>, dissents:[<id> | {id}]}
+  The authoritative list of dissent ids. Every id needs a closed disposition
+  in synthesis.dissents. A non-CLEAR challenger with no readable inventory
+  (absent, not a list, an empty or duplicate id) is BLOCKED: completeness
+  cannot be established. Today's challenger writes only prose
+  (challenger/disposition.md), so no historical run can reach GO past a
+  non-CLEAR challenger.
+
+Path containment: runIds must start with an alphanumeric (no `.`/`..`), and
+every controller write (journal, lock, decisions) is opened relative to a
+directory fd with O_NOFOLLOW and checked to resolve under --out-dir.
+
 Test-only fault injection: SMOKE_CONTROLLER_CRASH_AT=<point>[:<kind>[:<slot>]]
 exits 137 at that point (points: before-run-record, after-run-record,
-after-intent, after-effect).
+after-intent, after-effect, after-run-done).
 """
 
 import argparse
@@ -82,6 +95,8 @@ BUDGET_PER_FINGERPRINT = 2
 
 TERMINAL_VERBS = ("finish", "challenger-timeout")
 POST_FINISH_SLOTS = ("freeze-close",)
+# Journal kinds whose obligations must all be receipted before a GO finish.
+PRE_FINISH_KINDS = ("send", "gh", "dispatch")
 OWNER_STEP_SLA_SECONDS = 3600
 CRITIC_WAIT_SECONDS = 1200
 # The fresh critic's machine-readable output (new contract; its brief asks for
@@ -91,7 +106,9 @@ CRITIC_ARTIFACT = "contact-sheet/critic.json"
 POST_FINISH_SLA_SECONDS = 3600
 CLOSED_DISPOSITION = re.compile(r"^(fixed-verified|not-blocking:.+|refuted:.+)$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+# First character alphanumeric: `.`, `..` and dot-files are never run ids, so a
+# run id can never name a directory outside --out-dir or --run-root.
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 VERDICTS = {"GO", "NO_GO", "HUMAN_DECISION", "BLOCKED"}
 PASS_STATUSES = {"pass"}
 
@@ -178,6 +195,59 @@ def safe_run_relative(run_dir, rel):
 
 
 # ---------------------------------------------------------------------------
+# contained writes
+
+
+def _contained(fd, root):
+    """The opened fd must resolve under root (Linux /proc; refused elsewhere)."""
+    try:
+        real = os.readlink("/proc/self/fd/{}".format(fd))
+    except OSError as exc:
+        raise ControllerError("cannot verify where a controller write resolves: {}".format(exc))
+    real_root = os.path.realpath(root)
+    if real != real_root and not real.startswith(real_root + os.sep):
+        raise ControllerError("controller write resolved outside {}: {}".format(real_root, real))
+
+
+def open_contained(root, parts, flags, mode=0o644, make_dirs=False):
+    """Open root/<parts...> without following a symlink at any component
+    below root, and verify the result resolves under root. Returns an fd."""
+    for part in parts:
+        if not part or part in (".", "..") or "/" in part:
+            raise ControllerError("refusing unsafe path component {!r}".format(part))
+    dfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            if make_dirs:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=dfd)
+                except FileExistsError:
+                    pass
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+            except OSError as exc:
+                raise ControllerError("refusing controller path {}/{}: {}".format(root, part, exc))
+            os.close(dfd)
+            dfd = nxt
+        try:
+            fd = os.open(parts[-1], flags | os.O_NOFOLLOW, mode, dir_fd=dfd)
+        except FileNotFoundError:
+            raise
+        except FileExistsError:
+            raise
+        except OSError as exc:
+            raise ControllerError("refusing controller file {}/{}: {}".format(root, "/".join(parts), exc))
+    finally:
+        os.close(dfd)
+    try:
+        _contained(fd, root)
+    except ControllerError:
+        os.close(fd)
+        raise
+    return fd
+
+
+# ---------------------------------------------------------------------------
 # journal
 
 
@@ -192,7 +262,7 @@ class Journal:
 
     def lock(self, timeout=30.0):
         os.makedirs(self.dir, exist_ok=True)
-        self._lock_fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        self._lock_fd = open_contained(self.dir, ["control.lock"], os.O_RDWR | os.O_CREAT)
         deadline = time.monotonic() + timeout
         while True:
             try:
@@ -214,8 +284,11 @@ class Journal:
 
     def load(self):
         try:
-            with open(self.path, "rb") as fh:
+            fd = open_contained(self.dir, ["journal.ndjson"], os.O_RDONLY)
+            with os.fdopen(fd, "rb") as fh:
                 raw = fh.read()
+        except ControllerError as exc:
+            raise JournalError("journal at {} refused: {}".format(self.path, exc))
         except FileNotFoundError:
             raise JournalError("journal missing at {} -- refusing to treat it as empty (run `init` once to create it)".format(self.path))
         except OSError as exc:
@@ -242,7 +315,7 @@ class Journal:
     def init(self):
         os.makedirs(self.dir, exist_ok=True)
         try:
-            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            fd = open_contained(self.dir, ["journal.ndjson"], os.O_WRONLY | os.O_CREAT | os.O_EXCL)
         except FileExistsError:
             raise JournalError("journal already exists at {} -- init never truncates".format(self.path))
         os.fsync(fd)
@@ -260,7 +333,7 @@ class Journal:
         rec = dict(rec)
         rec["v"] = JOURNAL_VERSION
         line = (json.dumps(rec, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-        fd = os.open(self.path, os.O_WRONLY | os.O_APPEND)
+        fd = open_contained(self.dir, ["journal.ndjson"], os.O_WRONLY | os.O_APPEND)
         try:
             os.write(fd, line)
             os.fsync(fd)
@@ -452,6 +525,32 @@ class RunView:
 # verdict validation (no false clear)
 
 
+def dissent_inventory(challenge):
+    """(ids, error). The challenger's own list of dissent ids is authoritative;
+    the synthesis' list is never taken as complete. A non-CLEAR challenger
+    without a readable inventory fails closed."""
+    raw = challenge.get("dissents")
+    clear = challenge.get("disposition") == "CLEAR"
+    if raw is None:
+        if clear:
+            return [], None
+        return [], "challenger {} with no dissent inventory (challenge.complete.json dissents[])".format(
+            challenge.get("disposition"))
+    if not isinstance(raw, list):
+        return [], "challenger dissent inventory is not a list"
+    ids = []
+    for item in raw:
+        did = item.get("id") if isinstance(item, dict) else item
+        if not isinstance(did, str) or not did.strip():
+            return [], "challenger dissent inventory has an entry with no id"
+        if did in ids:
+            return [], "challenger dissent inventory repeats id {}".format(did)
+        ids.append(did)
+    if not clear and not ids:
+        return [], "challenger {} with an empty dissent inventory".format(challenge.get("disposition"))
+    return ids, None
+
+
 def validate_synthesis(run, claim_sha, pr_head, synthesis_barrier, identity):
     """Returns (verdict, failed_checks). GO only when every check passes."""
     doc, err = run.synthesis()
@@ -516,13 +615,17 @@ def validate_synthesis(run, claim_sha, pr_head, synthesis_barrier, identity):
     challenge = run.challenge_complete()
     if challenge is None:
         failed.append("challenger outcome not machine-readable (challenger/challenge.complete.json missing)")
-    elif challenge.get("disposition") != "CLEAR":
-        dissents = [d for d in doc.get("dissents") or [] if isinstance(d, dict)]
-        if not dissents:
-            failed.append("challenger {} with no dissent dispositioned".format(challenge.get("disposition")))
-        for d in dissents:
-            if not closed(d.get("disposition")):
-                failed.append("dissent {} has no closed disposition".format(d.get("id")))
+    else:
+        inventory, inv_err = dissent_inventory(challenge)
+        if inv_err:
+            failed.append(inv_err)
+        dissent_disp = {}
+        for d in doc.get("dissents") or []:
+            if isinstance(d, dict) and isinstance(d.get("id"), str):
+                dissent_disp.setdefault(d["id"], d.get("disposition"))
+        for did in inventory:
+            if not closed(dissent_disp.get(did)):
+                failed.append("dissent {} has no closed disposition".format(did))
     if failed:
         return "BLOCKED", failed
     return "GO", []
@@ -671,15 +774,22 @@ class Controller:
         ob = self.obligations().get(key)
         if ob and ob["state"] in TERMINAL_OK | {"abandoned", "failed_terminal"}:
             return ob["state"]
-        reconcile = bool(ob and ob["state"] == "intent")
+        # An intent planned earlier in THIS fire (post_finish journals the
+        # freeze close before marking the run done) has not been attempted yet;
+        # any other bare intent has an unknown outcome.
+        planned_now = bool(ob and ob["detail"].get("planned") and len(ob["history"]) == 1
+                           and ob["history"][0].get("fire") == self.fire)
+        reconcile = bool(ob and ob["state"] == "intent" and not planned_now)
         if reconcile:
             # Outcome unknown (timeout, 5xx, or a crash): never retried blind.
             # The effect is a search for <!-- smoke-ctl:<key> --> that writes
             # only when the marker is absent -- so it is not a second write.
             self.decide(run_id, phase, "gh_reconcile", "mechanical", "prior outcome unknown; search marker before write",
                         slot=slot, marker="<!-- smoke-ctl:{} -->".format(key))
-        else:
+        elif not planned_now:
             self.record(run_id, "gh", slot, "intent", 1)
+            crash_point("after-intent", "gh", slot)
+        else:
             crash_point("after-intent", "gh", slot)
         result = self.effects.perform({"type": "gh", "runId": run_id, "slot": slot,
                                        "marker": "<!-- smoke-ctl:{} -->".format(key),
@@ -932,6 +1042,9 @@ class Controller:
                     self.decide(run_id, "synthesis", "wait", "wait", "synthesis barrier not ready",
                                 missing=syn_barrier.get("missing"))
                 return "synthesis"
+            timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)
+            if timed:
+                return timed
             self.owner_step(run_id, "synthesis", "synthesis", done=False)
             return "synthesis"
         self.owner_step(run_id, "synthesis", "synthesis", done=True)
@@ -939,6 +1052,26 @@ class Controller:
         head = self.pr_heads.get(str(pr))
         verdict, failed = validate_synthesis(run, claim.get("sha"), head, syn_barrier, run.last_identity_check())
         return self.pre_finish(run_id, pr, verdict, failed, synthesis_doc if not syn_err else {})
+
+    def _maybe_synthesis_overdue_blocked(self, run_id, pr, run):
+        """Ruling on spec gap 3: the challenger concluded BLOCKED and the owner's
+        synthesis step is past its SLA -> finish BLOCKED with no model. It can
+        never produce GO (the verdict is fixed here), so it is fail-safe. Seen in
+        the replay (pr1945, pr1953): the historical coordinator finished BLOCKED
+        straight from the challenger and never wrote a synthesis."""
+        ob = self.obligations().get(obligation_key(run_id, "owner", "synthesis"))
+        if not ob or ob["state"] != "intent":
+            return None
+        started = parse_iso(ob["history"][0].get("at"))
+        if not started or (self.now - started).total_seconds() <= OWNER_STEP_SLA_SECONDS:
+            return None
+        challenge = run.challenge_complete()
+        if not isinstance(challenge, dict) or challenge.get("disposition") != "BLOCKED":
+            return None
+        self.decide(run_id, "synthesis", "log", "mechanical",
+                    "synthesis overdue after challenger BLOCKED; finishing BLOCKED model-free")
+        return self.pre_finish(run_id, pr, "BLOCKED", [
+            "synthesis overdue ({}s) and challenger disposition BLOCKED".format(OWNER_STEP_SLA_SECONDS)], {})
 
     def _maybe_challenger_timeout(self, run_id, claim, run):
         deadline = parse_iso(claim.get("deadline"))
@@ -999,6 +1132,27 @@ class Controller:
         if blocking and verdict != "BLOCKED":
             failed = failed + blocking
             verdict = "BLOCKED"
+        if verdict == "GO":
+            # GO needs EVERY journaled pre-finish obligation receipted -- not just
+            # the ones assembled above: a critic still enqueued, a root post or
+            # alarm awaiting its receipt. Young ones are waited on; one older
+            # than the owner SLA can no longer be assumed to land, so GO is
+            # refused (BLOCKED, naming it) rather than waited on forever.
+            for ob in self.obligations().values():
+                if ob["runId"] != run_id or ob["kind"] not in PRE_FINISH_KINDS or ob["slot"] in POST_FINISH_SLOTS:
+                    continue
+                if ob["state"] in TERMINAL_OK:
+                    continue
+                if ob["kind"] == "dispatch" and ob["slot"] == "critic" and run.has(CRITIC_ARTIFACT):
+                    continue  # its evidence is in; dispatch() records done on its next pass
+                started = parse_iso(ob["history"][0].get("at"))
+                age = (self.now - started).total_seconds() if started else OWNER_STEP_SLA_SECONDS + 1
+                label = "{}:{} is {}".format(ob["kind"], ob["slot"], ob["state"])
+                if age > OWNER_STEP_SLA_SECONDS:
+                    failed = failed + ["obligation {} after {}s (GO needs it receipted)".format(label, int(age))]
+                    verdict = "BLOCKED"
+                elif (ob["kind"], ob["slot"]) not in {(k, sl) for k, sl, _ in states}:
+                    states.append((ob["kind"], ob["slot"], "enqueued" if ob["state"] == "enqueued" else "intent"))
         pending = [s for s in states if s[2] in ("intent", "enqueued", "budget")]
         if pending:
             self.decide(run_id, phase, "wait", "wait", "pre-finish obligations pending", pending=pending)
@@ -1026,6 +1180,16 @@ class Controller:
     def post_finish(self, run_id, pr, verdict, external):
         obs = self.obligations()
         run_key = obligation_key(run_id, "run", "claim")
+        is_freeze = (obs.get(run_key) or {}).get("detail", {}).get("isFreezePr")
+        pv = self.gate.pr_verdict(pr) if pr else None
+        if isinstance(pv, dict) and pv.get("runId") == run_id and isinstance(pv.get("handoff"), dict):
+            is_freeze = bool(pv["handoff"].get("written") or pv["handoff"].get("targetSha"))
+        # Required post-finish obligations are journaled BEFORE the run is
+        # marked done, so a crash between the two leaves an open obligation
+        # that the done early-return (step_run) still reconciles.
+        if is_freeze and obligation_key(run_id, "gh", "freeze-close") not in obs:
+            self.record(run_id, "gh", "freeze-close", "intent", 1, {"planned": True})
+        obs = self.obligations()
         if run_key in obs and obs[run_key]["state"] not in ("done", "abandoned"):
             self.record(run_id, "run", "claim", "done", 1, {"verdict": verdict, "finishedBy": "gate" if external else
                                                           "controller"})
@@ -1033,11 +1197,8 @@ class Controller:
             for ob in list(self.obligations().values()):
                 if ob["runId"] == run_id and ob["kind"] == "owner" and ob["state"] == "intent":
                     self.record(run_id, "owner", ob["slot"], "abandoned", 1, {"reason": "run finished"})
-        is_freeze = (obs.get(run_key) or {}).get("detail", {}).get("isFreezePr")
-        pv = self.gate.pr_verdict(pr) if pr else None
-        if isinstance(pv, dict) and pv.get("runId") == run_id and isinstance(pv.get("handoff"), dict):
-            is_freeze = bool(pv["handoff"].get("written") or pv["handoff"].get("targetSha"))
-        if is_freeze:
+            crash_point("after-run-done", "run", "claim")
+        if is_freeze or obligation_key(run_id, "gh", "freeze-close") in self.obligations():
             key = obligation_key(run_id, "gh", "freeze-close")
             ob = self.obligations().get(key)
             if ob and ob["state"] == "intent":
@@ -1083,9 +1244,8 @@ def append_decision(out_dir, decision):
     run_id = decision.get("runId") or "_global"
     if run_id != "_global" and not RUN_ID_RE.match(run_id):
         run_id = "_global"
-    run_dir = os.path.join(out_dir, run_id)
-    os.makedirs(run_dir, exist_ok=True)
-    fd = os.open(os.path.join(run_dir, "decisions.ndjson"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    fd = open_contained(out_dir, [run_id, "decisions.ndjson"], os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+                        make_dirs=True)
     try:
         os.write(fd, (json.dumps(decision, sort_keys=True) + "\n").encode("utf-8"))
         os.fsync(fd)

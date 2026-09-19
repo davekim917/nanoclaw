@@ -23,12 +23,18 @@
  *    silently returns -1 when refused. The controller has its own, enforced
  *    here in the same transaction as the insert: per run per fire, per run,
  *    per alarm fingerprint. A replay never consumes budget.
+ *  - Attachment bytes are part of the payload. Each staged file's sha256 is
+ *    written to session_state (`controller_send_files:<id>`) in the same
+ *    transaction as the row, and outlives the host's cleanup of <outbox>/<id>/,
+ *    so a replay compares bytes, not just names. A row whose digest record is
+ *    missing or unreadable never verifies as a replay.
  *  - Output is one JSON line; exit codes are the contract (below).
  *
  * Exit: 0 enqueued|replay, 2 invalid input, 3 controller_send_budget,
  *       4 payload mismatch for an existing id, 1 anything else.
  */
 import '../modules/index.js';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -108,7 +114,10 @@ export function resolveNamedRouting(to: string): Routing {
 interface StagedFile {
   name: string;
   bytes: Buffer;
+  sha256: string;
 }
+
+type FileDigests = Array<{ name: string; sha256: string }>;
 
 function readAttachment(filePath: string): StagedFile {
   if (!path.isAbsolute(filePath))
@@ -126,7 +135,8 @@ function readAttachment(filePath: string): StagedFile {
   if (!stat.isFile() || stat.size === 0)
     throw new EnqueueSendError('invalid', `attachment is empty or not a file: ${filePath}`);
   if (stat.size > MAX_FILE_BYTES) throw new EnqueueSendError('invalid', `attachment too large: ${filePath}`);
-  return { name: path.basename(real), bytes: fs.readFileSync(real) };
+  const bytes = fs.readFileSync(real);
+  return { name: path.basename(real), bytes, sha256: crypto.createHash('sha256').update(bytes).digest('hex') };
 }
 
 function validate(input: EnqueueSendInput): void {
@@ -153,6 +163,38 @@ interface BudgetState {
 
 function budgetKey(runId: string): string {
   return `controller_send_budget:${runId}`;
+}
+
+function digestKey(id: string): string {
+  return `controller_send_files:${id}`;
+}
+
+/** The digests recorded with an existing row; null when absent or unreadable. */
+function readDigests(id: string): FileDigests | null {
+  const row = getOutboundDb().prepare('SELECT value FROM session_state WHERE key = ?').get(digestKey(id)) as
+    | { value: string }
+    | undefined;
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.value) as unknown;
+    if (
+      Array.isArray(parsed) &&
+      parsed.every(
+        (d) => d && typeof d === 'object' && typeof d.name === 'string' && /^[0-9a-f]{64}$/.test(String(d.sha256)),
+      )
+    ) {
+      return parsed as FileDigests;
+    }
+  } catch {
+    // fall through: unreadable is not "no files"
+  }
+  return null;
+}
+
+function sameDigests(stored: FileDigests | null, wanted: FileDigests): boolean {
+  if (wanted.length === 0) return stored === null;
+  if (stored === null || stored.length !== wanted.length) return false;
+  return stored.every((d, i) => d.name === wanted[i].name && d.sha256 === wanted[i].sha256);
 }
 
 function readBudget(runId: string): BudgetState {
@@ -215,6 +257,7 @@ export function enqueueSend(input: EnqueueSendInput): EnqueueSendResult & { ok: 
   const routing = resolveNamedRouting(input.to);
   const attachments = (input.files ?? []).map(readAttachment);
   const names = attachments.map((a) => a.name);
+  const digests: FileDigests = attachments.map((a) => ({ name: a.name, sha256: a.sha256 }));
   if (new Set(names).size !== names.length) throw new EnqueueSendError('invalid', 'attachment names must be unique');
   const content = JSON.stringify(
     names.length
@@ -245,6 +288,12 @@ export function enqueueSend(input: EnqueueSendInput): EnqueueSendResult & { ok: 
         throw new EnqueueSendError(
           'mismatch',
           `id ${input.id} already holds a different payload; refusing to overwrite`,
+        );
+      }
+      if (!sameDigests(readDigests(input.id), digests)) {
+        throw new EnqueueSendError(
+          'mismatch',
+          `id ${input.id} already holds different attachment bytes (or no digest record); refusing to overwrite`,
         );
       }
       return { ok: true, outcome: 'replay', id: input.id, seq: existing.seq };
@@ -308,6 +357,11 @@ export function enqueueSend(input: EnqueueSendInput): EnqueueSendResult & { ok: 
     const back = select.get(input.id) as (RowPayload & { seq: number }) | undefined;
     if (!back || !samePayload(back, wanted)) {
       throw new EnqueueSendError('mismatch', `read-back of ${input.id} does not match the payload written`);
+    }
+    if (inserted.changes === 1 && digests.length) {
+      outbound
+        .prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run(digestKey(input.id), JSON.stringify(digests), new Date().toISOString());
     }
     if (inserted.changes === 1) {
       const fireCount = budget.fire === input.fire ? budget.fireCount : 0;

@@ -234,6 +234,27 @@ describe('attachments', () => {
     expect(fs.existsSync(path.join(tmp, 'outbox', `${KEY}#1`))).toBe(false);
   });
 
+  test('same id, same file name, changed bytes: refused as a mismatch even after the staged copy is cleared', () => {
+    const file = path.join(tmp, 'sheet.png');
+    fs.writeFileSync(file, 'png-bytes');
+    enqueueSend(input({ files: [file] }));
+    // The host clears <outbox>/<id>/ after delivery; the digest record stays.
+    fs.rmSync(path.join(tmp, 'outbox', `${KEY}#1`), { recursive: true });
+    fs.writeFileSync(file, 'other-bytes');
+    expect(code(() => enqueueSend(input({ files: [file] })))).toBe('mismatch');
+    fs.writeFileSync(file, 'png-bytes');
+    expect(enqueueSend(input({ files: [file] })).outcome).toBe('replay');
+    expect(rows()).toHaveLength(1);
+  });
+
+  test('a row with files but no readable digest record never verifies as a replay', () => {
+    const file = path.join(tmp, 'sheet.png');
+    fs.writeFileSync(file, 'png-bytes');
+    enqueueSend(input({ files: [file] }));
+    getOutboundDb().prepare('DELETE FROM session_state WHERE key = ?').run(`controller_send_files:${KEY}#1`);
+    expect(code(() => enqueueSend(input({ files: [file] })))).toBe('mismatch');
+  });
+
   test("the send_file allowlist applies to the real path, so a symlink can't carry a host file out", () => {
     const link = path.join(tmp, 'passwd.png');
     fs.symlinkSync('/etc/passwd', link);
@@ -314,7 +335,7 @@ describe('parity with send_message', () => {
       closeSessionDb();
       initTestSessionDb();
       seedDestination('campaign-room', 'slack', 'slack:C0SMOKE');
-      seedSessionRouting(...session);
+      seedSessionRouting(session[0], session[1], session[2]);
       await sendMessage.handler({ to: 'campaign-room', text: 'hello', thread_key: RUN });
       enqueueSend(input({ text: 'hello' }));
       const [viaTool, viaHelper] = getOutboundDb()

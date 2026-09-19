@@ -90,10 +90,12 @@ marker() { # lane gen status [confirmedFindings-json]
 
 lanes_pass() { marker A1 1 pass; marker B1 2 pass; }
 
-parent_conclusions() { # [challenger-disposition]
+parent_conclusions() { # [challenger-disposition] [dissent-ids-json]
   printf 'prelim\n' >"$R/coordinator/preliminary.md"
   printf 'disposition\n' >"$R/challenger/disposition.md"
-  jq -cn --arg d "${1:-CLEAR}" '{schemaVersion:1,lane:"challenger",status:"completed",disposition:$d}' \
+  jq -cn --arg d "${1:-CLEAR}" --argjson ids "${2:-null}" \
+    '{schemaVersion:1,lane:"challenger",status:"completed",disposition:$d}
+     + (if $ids == null then {} else {dissents:$ids} end)' \
     >"$R/challenger/challenge.complete.json"
   printf '{"label":"end","verdict":"ok"}\n' >"$R/coordinator/identity-checks.ndjson"
 }
@@ -406,9 +408,21 @@ expect_blocked findingopen '.gaps = [{lane:"B1",disposition:"not-blocking:flaky 
 expect_blocked refuted-missing \
   '.gaps = [{lane:"B1",disposition:"refuted:evidence/nope.png"}] | .findings = [{id:"F1",confirmed:true,disposition:"fixed-verified"}]' \
   "gap: lane B1" finding_lane
-dissent() { parent_conclusions DISSENT; }
-expect_blocked dissent '.' "challenger DISSENT" dissent
+# The dissent inventory is the challenger's own (challenge.complete.json
+# dissents[]); the synthesis' list is never taken as complete.
+dissent() { parent_conclusions DISSENT '["D1"]'; }
+dissent_two() { parent_conclusions DISSENT '["D1",{"id":"D2"}]'; }
+dissent_noinv() { parent_conclusions DISSENT; }
+dissent_badinv() { parent_conclusions DISSENT '["D1","D1"]'; }
+expect_blocked dissent '.' "dissent D1 has no closed disposition" dissent
 expect_blocked dissent-open '.dissents = [{id:"D1",disposition:"open"}]' "dissent D1" dissent
+# Codex r1 #2: D1+D2 in the challenger, only D1 dispositioned -> BLOCKED on D2.
+expect_blocked dissent-partial '.dissents = [{id:"D1",disposition:"refuted:evidence/A1.png"}]' \
+  "dissent D2 has no closed disposition" dissent_two
+expect_blocked dissent-noinventory '.dissents = [{id:"D1",disposition:"refuted:evidence/A1.png"}]' \
+  "no dissent inventory" dissent_noinv
+expect_blocked dissent-dupinventory '.dissents = [{id:"D1",disposition:"refuted:evidence/A1.png"}]' \
+  "repeats id D1" dissent_badinv
 no_complete() { rm -f "$R/challenger/challenge.complete.json"; }
 expect_blocked nocomplete '.' "not machine-readable" no_complete
 identity_bad() { printf '{"label":"end","verdict":"mismatch"}\n' >>"$R/coordinator/identity-checks.ndjson"; }
@@ -428,6 +442,8 @@ expect_go closed-finding \
   '.gaps = [{lane:"B1",disposition:"refuted:evidence/B1.png"}] | .findings = [{id:"F1",confirmed:true,disposition:"not-blocking:cosmetic, tracked"}]' \
   finding_lane
 expect_go dissent-closed '.dissents = [{id:"D1",disposition:"refuted:evidence/A1.png"}]' dissent
+expect_go dissent-both-closed \
+  '.dissents = [{id:"D1",disposition:"refuted:evidence/A1.png"},{id:"D2",disposition:"not-blocking:copy only"}]' dissent_two
 
 # Non-GO verdicts pass through when bound: the owner's call stands.
 new_case nogo
@@ -642,6 +658,144 @@ step_ok 2026-09-18T11:10:00Z
 step_ok 2026-09-18T11:20:00Z
 dq '[.[] | select(.type=="escalate" and .reason=="owner step overdue")] | length == 1' | grep -qx true \
   || fail "an overdue owner step escalates exactly once: $(dq '[.[] | select(.type=="escalate")]')"
+
+# --- path containment (Codex r1 #1) -------------------------------------------
+
+# A `..` run id -- from a poll wake or from gate state -- is never a run: no
+# journal record, and nothing is written at <out-dir>/.. .
+new_case dotdot
+claim
+jq -cn '{wakeAgent:true,data:{trigger:"pr_build_settled",runId:"..",pr:7,sourceSha:"x"}}' >"$C/wake.json"
+jq -cn '{schemaVersion:1,pr:8,activeRunId:"..",activeSha:"x"}' >"$C/state/pr-8-state.json"
+jq -cn '{schemaVersion:1,pr:9,activeRunId:".hidden",activeSha:"x"}' >"$C/state/pr-9-state.json"
+step_ok 2026-09-18T10:00:00Z --poll-json "$C/wake.json"
+jr '[.[] | select(.runId == ".." or .runId == ".hidden")] | length == 0' | grep -qx true \
+  || fail "a dot run id must never be journaled: $(jr .)"
+[ ! -e "$C/decisions.ndjson" ] && [ ! -e "$C/out/../decisions.ndjson" ] && [ ! -e "$C/out/.hidden" ] \
+  || fail "a dot run id escaped --out-dir"
+python3 - "$CTL" <<'PY' || fail "RUN_ID_RE must refuse dot components"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ctl", sys.argv[1]); m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+assert not any(m.RUN_ID_RE.match(x) for x in (".", "..", ".hidden", "../x", "a/b", ""))
+assert m.RUN_ID_RE.match("xzo-pr-pr7-aaaaaaaaaaaa-20260918T100000Z")
+PY
+
+# A symlinked decisions file is refused (O_NOFOLLOW), the fire fails closed,
+# and the link's target is never created or written.
+new_case symlinkdecisions
+claim; contract
+seed run claim enqueued 1 '{"pr":7}'
+mkdir -p "$C/out/$RUN"
+ln -s "$T/outside-decisions.ndjson" "$C/out/$RUN/decisions.ndjson"
+step 2026-09-18T10:00:00Z
+[ "$STEP_RC" = 3 ] || fail "a symlinked decisions file must fail the fire closed (rc=$STEP_RC): $STEP_OUT"
+echo "$STEP_OUT" | jq -e '.ok == false and (.error | test("refusing controller file"))' >/dev/null \
+  || fail "the refusal names the path: $STEP_OUT"
+[ ! -e "$T/outside-decisions.ndjson" ] || fail "a decision was written through the symlink"
+
+# A symlinked run decisions DIRECTORY is refused the same way.
+new_case symlinkrundir
+claim; contract
+seed run claim enqueued 1 '{"pr":7}'
+mkdir -p "$T/outside-dir"
+ln -s "$T/outside-dir" "$C/out/$RUN"
+step 2026-09-18T10:00:00Z
+[ "$STEP_RC" = 3 ] || fail "a symlinked run dir must fail the fire closed (rc=$STEP_RC): $STEP_OUT"
+[ -z "$(ls -A "$T/outside-dir")" ] || fail "a decision was written through the symlinked dir"
+
+# --- GO waits on / refuses EVERY unreceipted pre-finish obligation (Codex r1 #3)
+
+# A root post still awaiting its receipt holds GO; the receipt releases it.
+new_case go-rootpending
+ready_run CLEAR
+seed run claim enqueued 1 '{"pr":7}'
+seed send root intent 1
+seed send root enqueued 1
+synthesis GO
+step_ok 2026-09-18T10:00:00Z
+jr '[.[] | select(.kind=="gate")] | length == 0' | grep -qx true \
+  || fail "GO must not finish while the root post awaits its receipt: $(jr '[.[] | select(.kind=="gate")]')"
+dq '[.[] | select(.reason=="pre-finish obligations pending") | .pending[] | select(.[0]=="send" and .[1]=="root")] | length >= 1' \
+  | grep -qx true || fail "the pending root send is named: $(dq '[.[] | select(.type=="wait")]')"
+jq -cn --arg id "$(key "$RUN" send root)#1" '{($id):"delivered"}' >"$C/receipts.json"
+step_ok 2026-09-18T10:10:00Z
+[ "$(finish_verdict)" = '"GO"' ] || fail "once receipted, GO finishes: $(finish_verdict)"
+
+# The reviewer's repro: a critic enqueued but never answered. Past the critic
+# wait the root goes out, but GO waits on the critic, and once the critic is
+# older than the owner SLA the GO is refused as BLOCKED naming it.
+new_case go-criticpending
+ready_run CLEAR
+mkdir -p "$R/contact-sheet"
+seed run claim enqueued 1 '{"pr":7}'
+seed dispatch critic enqueued 1 '{"shadowAssumed":true,"taskId":null}'
+synthesis GO
+step_ok 2026-09-18T10:30:00Z
+jr '[.[] | select(.kind=="gate")] | length == 0' | grep -qx true \
+  || fail "an enqueued critic must hold GO: $(jr '[.[] | select(.kind=="gate")]')"
+step_ok 2026-09-18T11:00:00Z
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "a critic unreceipted past the SLA refuses GO: $(finish_verdict)"
+dq '[.[] | select(.type=="finish") | .failedChecks[]] | any(test("dispatch:critic is enqueued"))' | grep -qx true \
+  || fail "the BLOCKED names the critic: $(dq '[.[] | select(.type=="finish")]')"
+# Its output arriving in time instead lets the GO through.
+new_case go-criticin
+ready_run CLEAR
+mkdir -p "$R/contact-sheet"
+seed run claim enqueued 1 '{"pr":7}'
+seed dispatch critic enqueued 1 '{"shadowAssumed":true,"taskId":null}'
+printf '{"screens":[]}\n' >"$R/contact-sheet/critic.json"
+synthesis GO
+step_ok 2026-09-18T10:30:00Z
+[ "$(finish_verdict)" = '"GO"' ] || fail "a critic whose output is in does not hold GO: $(finish_verdict)"
+
+# --- post-finish obligations are journaled before the run is done (r1 #4) ---
+
+new_case freezecrash
+ready_run CLEAR
+seed run claim enqueued 1 '{"pr":7,"isFreezePr":true}'
+synthesis GO
+set +e
+SMOKE_CONTROLLER_CRASH_AT=after-run-done step 2026-09-18T10:00:00Z
+set -e
+[ "$STEP_RC" = 137 ] || fail "injected crash between run done and freeze close (rc=$STEP_RC)"
+jr 'map("\(.kind):\(.slot):\(.state)") as $s | ($s | index("gh:freeze-close:intent")) < ($s | index("run:claim:done"))' \
+  | grep -qx true || fail "the freeze close must be journaled before the run is done: $(jr 'map("\(.kind):\(.slot):\(.state)")')"
+jr '[.[] | select(.kind=="gh" and .slot=="freeze-close" and .state=="done")] | length == 0' | grep -qx true \
+  || fail "the crash lands before the close"
+step_ok 2026-09-18T10:10:00Z
+jr '[.[] | select(.kind=="gh" and .slot=="freeze-close" and .state=="done")] | length == 1' | grep -qx true \
+  || fail "the next fire reconciles the open freeze close despite the run being done: $(jr .)"
+dq '[.[] | select(.type=="gh" and .slot=="freeze-close")] | length == 1 and .[0].afterReconcile == true' | grep -qx true \
+  || fail "the recovered close searches its marker first, never writes blind: $(dq '[.[] | select(.type=="gh")]')"
+step_ok 2026-09-18T10:20:00Z
+jr '[.[] | select(.kind=="gh" and .slot=="freeze-close" and .state=="done")] | length == 1' | grep -qx true \
+  || fail "the close is done once"
+
+# --- ruling on spec gap 3: challenger BLOCKED + synthesis overdue -> BLOCKED -
+
+new_case synth-overdue-blocked
+ready_run BLOCKED
+seed run claim enqueued 1 '{"pr":7}'
+step_ok 2026-09-18T10:00:00Z
+dq '[.[] | select(.type=="wake_owner" and .step=="synthesis")] | length == 1' | grep -qx true || fail "synthesis owner step"
+step_ok 2026-09-18T10:50:00Z
+jr '[.[] | select(.kind=="gate")] | length == 0' | grep -qx true || fail "within the SLA the owner is waited on"
+step_ok 2026-09-18T11:10:00Z
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "overdue synthesis after challenger BLOCKED finishes BLOCKED: $(finish_verdict)"
+dq '[.[] | select(.type=="escalate")] | length == 0' | grep -qx true \
+  || fail "this path needs no model: $(dq '[.[] | select(.type=="escalate")]')"
+dq '[.[] | select(.type=="finish") | .failedChecks[]] | any(test("synthesis overdue"))' | grep -qx true \
+  || fail "the finish names why"
+# The same silence after a CLEAR challenger is NOT finished: a human decides.
+new_case synth-overdue-clear
+ready_run CLEAR
+seed run claim enqueued 1 '{"pr":7}'
+step_ok 2026-09-18T10:00:00Z
+step_ok 2026-09-18T11:10:00Z
+jr '[.[] | select(.kind=="gate")] | length == 0' | grep -qx true || fail "a CLEAR challenger never short-cuts to a verdict"
+dq '[.[] | select(.type=="escalate" and .reason=="owner step overdue")] | length == 1' | grep -qx true \
+  || fail "it escalates instead"
 
 [ ! -e "$T/effects.log" ] || fail "shadow invoked an effect command: $(cat "$T/effects.log")"
 echo "smoke campaign controller tests passed"
