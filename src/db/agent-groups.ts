@@ -103,6 +103,31 @@ export async function getWorkgroupOnecliSecretsById(workgroupId: string): Promis
   return parseSecrets(row);
 }
 
+/**
+ * Every workgroup's OneCLI secret declarations, keyed by workgroup id.
+ *
+ * For the one caller that has to ask "does ANY workgroup still declare this
+ * secret?" rather than "what does this group inherit?": `ncl integrations
+ * remove --delete-secret`, which must refuse instead of deleting a vault
+ * secret some other declaration site still names. The merge is union-only —
+ * "per-group secrets are appended additively. Neither list can subtract from
+ * the other" (`mergeWorkgroupAndGroupSecrets`, `src/onecli-secrets.ts:566`) —
+ * so a group's own `container.json` can never take back a workgroup
+ * declaration, and deleting a secret a workgroup still names aborts every
+ * spawn of every group in it (`src/onecli-secrets.ts:464`, reached from
+ * `src/container-runner.ts:7077`).
+ *
+ * Installs have tens of workgroups, not thousands, and this runs once per
+ * `--delete-secret`, so it reads them all rather than pushing a LIKE match
+ * into SQL against a JSON text column.
+ */
+export async function getAllWorkgroupOnecliSecrets(): Promise<{ id: string; secrets: string[] }[]> {
+  const rows = await getDb().all<{ id: string; secrets: string }>(
+    'SELECT id, onecli_secrets AS secrets FROM workgroups',
+  );
+  return rows.map((row) => ({ id: row.id, secrets: parseSecrets(row) }));
+}
+
 function parseSecrets(row: { secrets: string } | undefined): string[] {
   if (!row) return [];
   try {

@@ -335,13 +335,40 @@ registerResource({
           name: 'delete_secret',
           type: 'boolean',
           description:
-            "Also delete the OneCLI bearer secret. Remove it from the group's container.json first, or the next spawn fails closed.",
+            "Also delete the OneCLI bearer secret, dropping it from the owning group's container.json onecliSecrets first, under the same lock the refresher takes. REFUSES, deleting nothing, if the secret is declared anywhere this cannot edit — any workgroup's onecli_secrets, or another group's container.json — because the spawn takes the union of those and a deleted secret they still declare aborts every spawn that inherits it.",
         },
       ],
       handler: async (args) =>
         removeIntegration(String(args.name), {
           deleteSecret: flag(args.delete_secret),
         }),
+      formatHuman: (data) => {
+        const d = data as Awaited<ReturnType<typeof removeIntegration>>;
+        const lines = [
+          `removed: ${d.name}`,
+          `registry row: ${d.removedRow ? 'deleted' : 'not found'}`,
+          `oauth bundle: ${d.removedBundle ? 'deleted' : 'not found'}`,
+        ];
+        // Only ever speak about the declaration on the path that touches it.
+        // Without --delete-secret nothing here looked at where the bearer is
+        // declared, and saying "left in place" would be a claim this command
+        // did not check. With it, the refusal above has already proved the
+        // owning group's file was the only site.
+        if (d.secretName && d.deleteSecretRequested) {
+          lines.push(
+            `bearer secret ${d.secretName}: ${d.removedSecret ? 'deleted from the vault' : 'not found in the vault'}`,
+          );
+          lines.push(
+            `container.json declaration: ${d.undeclaredSecret ? 'removed (it was the only one)' : 'none to remove'}`,
+          );
+        } else if (d.secretName) {
+          lines.push(
+            `bearer secret ${d.secretName}: left in the vault, and every declaration of it is untouched — drop them ` +
+              'unless you meant to keep granting it (a declared secret is re-granted on every spawn)',
+          );
+        }
+        return lines.join('\n');
+      },
     },
 
     refresh: {

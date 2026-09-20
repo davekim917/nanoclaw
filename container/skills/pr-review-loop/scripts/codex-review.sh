@@ -1262,7 +1262,7 @@ ci_verdict() {
   local runs statuses unstarted posters='[]' required="${CODEX_REVIEW_REQUIRED_WORKFLOWS:-CI}"
   runs=$(gh api --paginate --slurp "repos/$REPO/actions/runs?head_sha=$1&per_page=100") || return 1
   statuses=$(gh api --paginate --slurp "repos/$REPO/commits/$1/statuses?per_page=100") || return 1
-  unstarted=$(never_started_runs "$1" "$runs") || return 1
+  unstarted=$(never_started_runs "$1" "$runs" "$required") || return 1
   # Only asked when something could be excused, so a healthy head never pays
   # for (or fails on) the identity read.
   if [ "$unstarted" != '[]' ]; then posters=$(host_ci_posters); fi
@@ -1328,25 +1328,88 @@ host_ci_posters() {
 }
 
 # The ids, as a JSON array, of the Actions runs on head $1 (from $2, the
-# slurped actions/runs pages) whose jobs GitHub never started: completed
-# `failure`, at least one job, every job never_started (never-started.jq) and
-# one of them `failure`. Only failed runs are asked about, one jobs read each.
-# A jobs read that fails leaves its run out, which keeps it red: not knowing
-# whether a run started is never a reason to excuse it. Under `audit`, runs
-# created after GATE_AS_OF are not asked about (ci_verdict drops them anyway).
+# slurped actions/runs pages) that GitHub never started — the only runs a
+# `CI (host)` success is allowed to stand in for. A run qualifies when every
+# ATTEMPT of it is `run_never_started` (never-started.jq: at least one job,
+# every job with no runner and no step, one of them `failure`) AND no other
+# completed run of the same WORKFLOW on this head is a real red.
+#
+# "Real red" here is ci_verdict's own standard, which is PER-REQUIRED-NESS and
+# is why $3 exists — the comma-separated required-workflow names, as
+# ci_verdict resolved them. For a required workflow it is `.conclusion !=
+# "success"`: a `timed_out`, `cancelled`, `neutral`, `skipped` or
+# `startup_failure` run is red there, so letting one go by would excuse a newer
+# never-started run over a genuine red. For every other workflow it is
+# `.conclusion` not in success/neutral/skipped, exactly as ci_verdict scores
+# them — applying the stricter rule to those would take the never-started
+# excuse away from a workflow whose older run was merely skipped, or
+# `cancelled` by an ordinary `concurrency: cancel-in-progress`, and refuse
+# merges the gate used to allow. $3 empty means no workflow gets the strict
+# rule.
+#
+# Only `failure` runs cost a jobs read: that is the only conclusion the lockout
+# produces, so every other red conclusion disqualifies its workflow name
+# outright, for free.
+#
+# Both of those are #937 C. A never-started run is evidence about GitHub, not
+# about the head, so it is excusable — but a genuine red of the same required
+# check on the same head is evidence about the head, and a re-run that never
+# started must not hide it. Re-running takes both shapes: `Re-run jobs` keeps
+# the run id and bumps `run_attempt` (so the earlier attempt's jobs are only
+# visible under `/attempts/<n>/jobs`), a fresh trigger makes a second run of
+# the same workflow name (and ci_verdict keeps only the newest per name, so
+# the older one would go unseen). Either way ONE genuine failure disqualifies
+# the whole workflow name here, not just that one run.
+#
+# Fail closed throughout: only failed runs are asked about, and anything that
+# cannot be read or does not prove never-started — a failed jobs read, an
+# unparseable id, a run with no jobs — disqualifies its workflow name rather
+# than being skipped. Cost is one jobs read per failed run, plus one per
+# earlier attempt of one. Under `audit`, runs created after GATE_AS_OF are not
+# asked about (ci_verdict drops them anyway).
 never_started_runs() {
-  local ids id jobs out='[]'
-  ids=$(printf '%s\n' "$2" | jq -r --arg head "$1" --arg asof "$GATE_AS_OF" '
-    [ .[].workflow_runs[]? | select(.head_sha == $head and .status == "completed" and .conclusion == "failure")
-      | select($asof == "" or (.created_at // "") <= $asof) | .id ] | unique | .[]') || return 1
-  for id in $ids; do
-    [[ "$id" =~ ^[0-9]+$ ]] || continue
-    jobs=$(gh api --paginate --slurp "repos/$REPO/actions/runs/$id/jobs?per_page=100" 2>/dev/null) || continue
-    if printf '%s\n' "$jobs" | jq -e -L "$HERE" 'include "never-started"; [ .[].jobs[]? ] | length > 0 and all(.[]; never_started) and any(.[]; .conclusion == "failure")' >/dev/null 2>&1; then
-      out=$(jq -cn --argjson o "$out" --argjson id "$id" '$o + [$id]') || return 1
+  local rows kind id attempt name jobs a endpoint clean candidates='[]' disqualified='[]'
+  rows=$(printf '%s\n' "$2" | jq -r --arg head "$1" --arg asof "$GATE_AS_OF" --arg requiredList "${3-}" '
+    ( $requiredList | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) ) as $required
+    | [ .[].workflow_runs[]? | select(.head_sha == $head and .status == "completed")
+      | select($asof == "" or (.created_at // "") <= $asof)
+      # ci_verdict scores a required workflow and any other one differently;
+      # matching it exactly is the whole point of $required here.
+      | select((.conclusion // "") as $c | if (.name // "") | IN($required[])
+               then $c != "success" else ($c | IN("success", "neutral", "skipped") | not) end)
+      # `ask` needs a jobs read to tell the lockout shape from a real failure;
+      # `red` is already a real red and only costs its workflow name.
+      | { kind: (if .conclusion == "failure" then "ask" else "red" end), id: .id, attempt: (.run_attempt // 1), name: (.name // "") } ]
+    | unique_by(.id) | .[] | "\(.kind)\t\(.id)\t\(.attempt)\t\(.name)"') || return 1
+  while IFS=$'\t' read -r kind id attempt name; do
+    [ -n "$id" ] || continue
+    if [ "$kind" = red ]; then
+      disqualified=$(jq -cn --argjson d "$disqualified" --arg n "$name" '$d + [$n]') || return 1
+      continue
     fi
-  done
-  printf '%s\n' "$out"
+    clean=1
+    if [[ "$id" =~ ^[0-9]+$ ]]; then
+      [[ "$attempt" =~ ^[0-9]+$ ]] && [ "$attempt" -ge 1 ] || attempt=1
+      # Newest attempt first, so the common single-attempt run costs one read.
+      for (( a = attempt; a >= 1; a-- )); do
+        if [ "$a" -eq "$attempt" ]; then
+          endpoint="repos/$REPO/actions/runs/$id/jobs?per_page=100"
+        else
+          endpoint="repos/$REPO/actions/runs/$id/attempts/$a/jobs?per_page=100"
+        fi
+        jobs=$(gh api --paginate --slurp "$endpoint" 2>/dev/null) || { clean=0; break; }
+        printf '%s\n' "$jobs" | jq -e -L "$HERE" 'include "never-started"; run_never_started' >/dev/null 2>&1 || { clean=0; break; }
+      done
+    else
+      clean=0
+    fi
+    if [ "$clean" = 1 ]; then
+      candidates=$(jq -cn --argjson c "$candidates" --argjson id "$id" --arg n "$name" '$c + [{ id: $id, name: $n }]') || return 1
+    else
+      disqualified=$(jq -cn --argjson d "$disqualified" --arg n "$name" '$d + [$n]') || return 1
+    fi
+  done <<< "$rows"
+  jq -cn --argjson c "$candidates" --argjson d "$disqualified" '[ $c[] | select(.name | IN($d[]) | not) | .id ]'
 }
 
 # The newest independent-review-receipt:v1 for exactly HEAD, from the authors
@@ -1501,14 +1564,15 @@ rollup_page() {
 #
 # Output is `<red>\t<hosted>\t<hosted check-run ids as JSON>`. A required check run that concluded FAILURE
 # because GitHub never started it (its Actions job, read by the check run's
-# databaseId, is never_started — never-started.jq) is not red when the
-# rollup's HOST_CI_CONTEXT status on this head is SUCCESS and was posted by an
-# allowed poster (host_ci_posters); it is named in <hosted> instead. The rollup
+# databaseId, is never_started — never-started.jq, AND its run is one
+# never_started_runs vouches for on this head) is not red when the rollup's
+# HOST_CI_CONTEXT status on this head is SUCCESS and was posted by an allowed
+# poster (host_ci_posters); it is named in <hosted> instead. The rollup
 # carries only the newest status per context, so a newer one from anyone else
 # hides an allowed success and the check run stays red. As in ci_verdict, a
 # job read that fails keeps it red.
 required_status_red() {
-  local pages rollup candidates id job posters='[]' unstarted='[]'
+  local pages rollup candidates id job posters='[]' unstarted='[]' runs excusable='[]'
   pages=$(paginate_connection statusCheckRollup.contexts rollup_page) || return 1
   rollup=$(printf '%s\n' "$pages" | jq -cs --arg head "$1" '
     if all(.[]; .data.repository.pullRequest.headRefOid == $head) | not
@@ -1522,12 +1586,27 @@ required_status_red() {
     then [ .[] | select(.__typename == "CheckRun" and .isRequired == true and .status == "COMPLETED" and .conclusion == "FAILURE")
            | .databaseId | select(type == "number") ] | unique | .[]
     else empty end') || return 1
+  # Which RUNS on this head are excusable at all (#937 C). The check run alone
+  # cannot answer it: its job never started, but an earlier attempt of the same
+  # run, or an earlier run of the same workflow, may hold a genuine red that
+  # the rollup no longer shows — the rollup carries only the newest check run
+  # per name. Read once, and only when something could be excused.
+  if [ -n "$candidates" ]; then
+    runs=$(gh api --paginate --slurp "repos/$REPO/actions/runs?head_sha=$1&per_page=100") || return 1
+    # No workflow gets the required-only standard here: on the rollup side a
+    # check run that concluded NEUTRAL or SKIPPED is green whether or not it is
+    # required (the `green` set below, and `ci_verdict`'s non-required set),
+    # so an older neutral/skipped run must not disqualify its workflow.
+    excusable=$(never_started_runs "$1" "$runs" "") || return 1
+  fi
   for id in $candidates; do
     [[ "$id" =~ ^[0-9]+$ ]] || continue
     job=$(gh api "repos/$REPO/actions/jobs/$id" 2>/dev/null) || continue
-    if printf '%s\n' "$job" | jq -e -L "$HERE" 'include "never-started"; never_started and .conclusion == "failure"' >/dev/null 2>&1; then
-      unstarted=$(jq -cn --argjson o "$unstarted" --argjson id "$id" '$o + [$id]') || return 1
-    fi
+    printf '%s\n' "$job" | jq -e -L "$HERE" 'include "never-started"; never_started and .conclusion == "failure"' >/dev/null 2>&1 || continue
+    # And its run must be one of the excusable ones. A job whose run_id names
+    # no such run — including a job read that carries no run_id — stays red.
+    printf '%s\n' "$job" | jq -e --argjson excusable "$excusable" '(.run_id // null) as $r | $r != null and ($r | IN($excusable[]))' >/dev/null 2>&1 || continue
+    unstarted=$(jq -cn --argjson o "$unstarted" --argjson id "$id" '$o + [$id]') || return 1
   done
   printf '%s\n' "$rollup" | jq -r --argjson unstarted "$unstarted" '
     [ .[] | select(.isRequired == true) ] as $required
@@ -1588,11 +1667,42 @@ legacy_precheck() {
 #     GitHub marks required) reported and green, except the never-started
 #     check runs an allowed CI (host) success covers ($1, their databaseIds);
 #   - no unresolved review thread when the rules require resolution;
-#   - enough approving reviews for required_approving_review_count, plus one
-#     when require_extra_approval_for_unattributed_changes is on and any
-#     commit's author maps to no GitHub account;
+#   - `reviewDecision` APPROVED or null (#937 B3). This is GitHub's OWN
+#     computed answer to "is the review requirement met" — APPROVED |
+#     CHANGES_REQUESTED | REVIEW_REQUIRED, null when the PR requires no review
+#     — and it already counts only approvals from accounts with write access,
+#     which is the part this script has no business recomputing. It replaced
+#     the approval ARITHMETIC that used to live here (approving reviews
+#     counted against required_approving_review_count). A value outside that
+#     set is a state GitHub added later, and is not-ready;
+#   - no approving review owed by the base RULES, independently of the above:
+#     `required_approving_review_count > 0`, or
+#     require_extra_approval_for_unattributed_changes with a commit whose
+#     author maps to no GitHub account. Both are fail-closed rather than
+#     counted, because `reviewDecision` is NOT a substitute for reading them.
+#     Measured, not assumed: Illysium-ai/XZO ruleset 21204871 is `active` on
+#     the default branch with `require_extra_approval_for_unattributed_changes:
+#     true`, and XZO PR #1965 — open, based on that branch, three commits with
+#     no GitHub-attributed author — reports `reviewDecision: null`. So
+#     reviewDecision does not surface that rule's review parameters, and the
+#     sibling parameter in the same rule object cannot be assumed to fare
+#     better. Neither refuses anything on this fleet today
+#     (required_approving_review_count is 0 everywhere);
+#   - no CHANGES_REQUESTED review from anyone but the author (#937 B1). Kept
+#     alongside reviewDecision, not folded into it: `reviewDecision` is null
+#     on a repo whose rules require no review, so it says nothing there, while
+#     a requested change is still a hold --admin would lift. Deliberately NOT
+#     narrowed with `latestOpinionatedReviews(writersOnly: true)` — a
+#     non-writer's "please change this" does not block GitHub, but it is
+#     exactly the kind of thing an admin bypass should not run over;
+#   - no strict_required_status_checks_policy (#937 B2): that is GitHub's
+#     "require branches to be up to date before merging", which is a fact about
+#     the base moving, not about this head, and nothing here evaluates it;
 #   - no rule type, app-pinned check, or classic protection it does not model.
 # Anything it cannot read is `not-ready`, never `ready`.
+#
+# Deliberately NOT modelled, because no repo in this fleet has the rule it
+# would guard: a required_status_checks parameter allow-list.
 admin_readiness() {
   local hosted="$1" rules protection pages rollup pr why
   rules=$(gh api --paginate --slurp "repos/$REPO/rules/branches/$SCOPE_BASE_REF" 2>/dev/null | jq -c 'flatten') || {
@@ -1611,7 +1721,7 @@ admin_readiness() {
   pr=$(gh api graphql -f query='
     query adminReadiness($owner:String!,$name:String!,$pr:Int!){
       repository(owner:$owner,name:$name){ pullRequest(number:$pr){
-        headRefOid author{ login }
+        headRefOid author{ login } reviewDecision
         reviewThreads(first:100){ totalCount nodes{ isResolved } }
         latestOpinionatedReviews(first:100){ totalCount nodes{ state author{ login } } }
         commits(first:100){ totalCount nodes{ commit{ author{ user{ login } } } } }
@@ -1626,25 +1736,31 @@ admin_readiness() {
     def shown: if .__typename == "CheckRun" then "\(.status // "none" | ascii_downcase)/\(.conclusion // "none" | ascii_downcase)" else (.state // "none" | ascii_downcase) end;
     ( [ $rules[] | .type ] - ["deletion", "non_fast_forward", "pull_request", "required_status_checks"] | unique ) as $unmodeled
     | ( [ $rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[] ] ) as $checks
+    | ( any($rules[]; .type == "required_status_checks" and .parameters.strict_required_status_checks_policy == true) ) as $strict
     | ( [ $rules[] | select(.type == "pull_request") | .parameters ] ) as $prRules
     | ( [ $checks[] | .context ] + [ $rollup[] | select(.isRequired == true) | ctxname ] | unique ) as $required
     | ( [ $required[] | . as $c | [ $rollup[] | select(ctxname == $c) ] as $nodes
           | if ($nodes | length) == 0 then "\($c)=not reported"
             else ($nodes[] | select(green | not) | "\($c)=\(shown)") end ] | unique ) as $notGreen
     | ( [ $pr.commits.nodes[] | select(.commit.author.user == null) ] | length ) as $unattributed
-    | ( [ $pr.latestOpinionatedReviews.nodes[] | select(.state == "APPROVED" and (.author.login // "") != ($pr.author.login // "")) | .author.login ] | unique | length ) as $approvals
+    | ( [ $pr.latestOpinionatedReviews.nodes[] | select(.state == "CHANGES_REQUESTED" and (.author.login // "") != ($pr.author.login // "")) | .author.login // "(unknown)" ] | unique ) as $changesRequested
     | ( [ $pr.reviewThreads.nodes[] | select(.isResolved | not) ] | length ) as $unresolved
     | [ ( if $pr.headRefOid != $head then "the PR head moved to \($pr.headRefOid)" else empty end ),
         ( if ($unmodeled | length) > 0 then "rules this does not evaluate: \($unmodeled | join(", "))" else empty end ),
         ( $checks[] | select(.integration_id != null) | "required check \(.context) is pinned to an app, which this does not evaluate" ),
+        ( if $strict then "the base requires the branch to be up to date, which this does not evaluate" else empty end ),
         ( if ($notGreen | length) > 0 then "required, not green: \($notGreen | join(", "))" else empty end ),
+        ( if ($changesRequested | length) > 0 then "changes requested by \($changesRequested | join(", "))" else empty end ),
+        ( if ($pr.reviewDecision // "none") | IN("none", "APPROVED") | not
+          then "GitHub reports reviewDecision=\($pr.reviewDecision)" else empty end ),
         ( if $pr.reviewThreads.totalCount > 100 or $pr.latestOpinionatedReviews.totalCount > 100 or $pr.commits.totalCount > 100
           then "over 100 review threads, reviews or commits, not read in full" else empty end ),
         ( $prRules[]
           | ( if .required_review_thread_resolution == true and $unresolved > 0 then "\($unresolved) unresolved review thread(s), and the rules require resolution" else empty end ),
-            ( (.require_extra_approval_for_unattributed_changes == true and $unattributed > 0) as $extra
-              | ((.required_approving_review_count // 0) + (if $extra then 1 else 0 end)) as $need
-              | if $approvals < $need then "\($approvals) of \($need) required approving review(s)\(if $extra then " (one extra because \($unattributed) commit(s) have no GitHub-attributed author)" else "" end)" else empty end ),
+            ( if (.required_approving_review_count // 0) > 0
+              then "the base rules require \(.required_approving_review_count) approving review(s), and reviewDecision does not surface that ruleset parameter" else empty end ),
+            ( if .require_extra_approval_for_unattributed_changes == true and $unattributed > 0
+              then "an extra approving review is required because \($unattributed) commit(s) have no GitHub-attributed author, and reviewDecision does not surface that ruleset parameter either" else empty end ),
             ( if .require_code_owner_review == true or .require_last_push_approval == true or ((.required_reviewers // []) | length) > 0
               then "code-owner, last-push or named-reviewer requirements, which this does not evaluate" else empty end ) )
       ] | join("; ")') || {

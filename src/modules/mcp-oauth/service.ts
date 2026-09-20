@@ -37,7 +37,7 @@
  * Nothing here ever tries to open a browser on this host: no `xdg-open`, no
  * `$DISPLAY`, no `BROWSER`.
  */
-import { getAgentGroup } from '../../db/agent-groups.js';
+import { getAgentGroup, getAllAgentGroups, getAllWorkgroupOnecliSecrets } from '../../db/agent-groups.js';
 import {
   deleteMcpOAuthIntegration,
   getMcpOAuthIntegration,
@@ -233,7 +233,7 @@ async function startLoginLocked(input: LoginInput, fetchImpl: FetchLike): Promis
   // An integration's group is IMMUTABLE. Silently moving `agent_group_id` would
   // point `complete` at the new group's `container.json` while leaving the old
   // group's declaration in place, and a declared secret is granted on every
-  // spawn (`src/onecli-secrets.ts:487`) — so the old group would keep a live
+  // spawn (`src/onecli-secrets.ts:517`) — so the old group would keep a live
   // bearer, and on a shared `--secret` would keep receiving refreshed ones. The
   // two-step path is explicit about what it leaves behind, which a silent move
   // is not.
@@ -243,7 +243,9 @@ async function startLoginLocked(input: LoginInput, fetchImpl: FetchLike): Promis
         'An integration cannot change groups in place — the old group keeps its container.json ' +
         'declaration and would keep being granted the bearer. To move it: ' +
         `ncl integrations remove --name ${input.name}, then drop "${existingRow.bearer_secret_name}" ` +
-        "from that group's container.json onecliSecrets, then log in again under the new group.",
+        "from that group's container.json onecliSecrets — and from its workgroup's onecli_secrets if it " +
+        'is declared there too — then log in again under the new group. Not --delete-secret: a --secret ' +
+        'may name a secret other groups are granted, and deleting it takes it from all of them.',
     );
   }
   // BEFORE dynamic client registration, not after: the unique index on
@@ -733,7 +735,7 @@ async function completeLoginLocked(
  * Add the bearer secret to the group's `container.json` `onecliSecrets`, which
  * is what actually grants it: `applyOnecliSecrets` reconciles the group's OneCLI
  * agent to EXACTLY that declared set on every spawn
- * (`src/onecli-secrets.ts:487`), so a secret missing from the file is a secret
+ * (`src/onecli-secrets.ts:517`), so a secret missing from the file is a secret
  * the agent is not granted, however fresh its value is. That is half of today's
  * MCP failure class: the bearer secret exists in the vault, is fresh, and is
  * simply not named in that group's `container.json` — so the agent is never
@@ -758,6 +760,43 @@ async function ensureSecretDeclared(agentGroupId: string, secretName: string): P
     added = true;
   });
   return added;
+}
+
+/**
+ * The inverse of `ensureSecretDeclared`: drop these spellings of the bearer
+ * from the group's `container.json` `onecliSecrets`, leaving every other
+ * declaration exactly as it was. Only `remove --delete-secret` calls it, and
+ * only just before deleting the secret they name (#929).
+ *
+ * `spellings` is the secret NAME and, when the vault ref resolved, its UUID:
+ * `onecliSecrets` accepts either (`resolveSecretUuids`,
+ * `src/onecli-secrets.ts:449`), `ensureSecretDeclared` only ever writes the
+ * name, but an operator may have declared the UUID by hand — and once the
+ * secret is deleted, a leftover declaration in EITHER spelling aborts the
+ * spawn. Matching is exact, as `matchDeclarations` compares
+ * (`src/onecli-secrets.ts:473`).
+ *
+ * Returns true when at least one declaration was removed.
+ */
+async function ensureSecretUndeclared(agentGroupId: string, spellings: string[]): Promise<boolean> {
+  const group = await getAgentGroup(agentGroupId);
+  // No group means no `container.json` to declare anything in, so there is
+  // nothing to undo. Not a failure: the caller's delete is still correct.
+  if (!group) return false;
+  const drop = new Set(spellings);
+  // Read-only fast path, the mirror of `ensureSecretDeclared`'s: a rewrite of
+  // container.json takes the file lock, and an integration whose bearer was
+  // never declared is the common case for a hand-made `--secret`.
+  if (!(readContainerConfig(group.folder).onecliSecrets ?? []).some((name) => drop.has(name))) return false;
+  let removed = false;
+  await updateContainerConfig(group.folder, (config) => {
+    const current = config.onecliSecrets ?? [];
+    const kept = current.filter((name) => !drop.has(name));
+    if (kept.length === current.length) return;
+    config.onecliSecrets = kept;
+    removed = true;
+  });
+  return removed;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -818,7 +857,7 @@ export function decideRefresh(row: McpOAuthIntegration, nowMs: number): RefreshD
  * vault secret, while its own UPDATE silently matches zero rows — and because
  * `remove` deliberately leaves the group's `container.json` declaration alone,
  * `applyOnecliSecrets` grants that resurrected secret again on the next spawn
- * (`src/onecli-secrets.ts:487`). A credential that `ncl integrations list` says
+ * (`src/onecli-secrets.ts:517`). A credential that `ncl integrations list` says
  * is gone would be live.
  *
  * In-process is sufficient and is the established shape: the host is one Node
@@ -1229,6 +1268,15 @@ export interface RemoveResult {
   removedRow: boolean;
   removedBundle: boolean;
   removedSecret: boolean;
+  /** Whether `--delete-secret` was asked for. The declaration is only ever
+   *  touched then, so it is what tells a formatter which line to print. */
+  deleteSecretRequested: boolean;
+  /** True when this call dropped the bearer from the owning group's
+   *  `container.json` `onecliSecrets`. Only meaningful alongside
+   *  `deleteSecretRequested`, which is the only path that reaches it — and by
+   *  then no OTHER site declares it, because a site elsewhere refuses the
+   *  whole call. */
+  undeclaredSecret: boolean;
   secretName: string | null;
 }
 
@@ -1236,27 +1284,211 @@ export interface RemoveResult {
  * Forget an integration. The OneCLI secret is left alone unless
  * `deleteSecret` is asked for: it may be one the operator made by hand and
  * other things may match on it, and an accidental delete is not recoverable
- * from here — the vault has no read-back. The group's `container.json`
- * declaration is left alone for the same reason; an undeclared-but-present
- * secret is inert, a deleted one that something still declares fails the spawn
- * closed (`src/onecli-secrets.ts:432`).
+ * from here — the vault has no read-back.
+ *
+ * `deleteSecret` is SUBTRACTIVE-OR-NOTHING (#929). It refuses unless the
+ * owning group's own `container.json` is the only thing that still depends on
+ * the bearer, and then drops it there before deleting the vault secret.
+ * `findForeignSecretDeclarations` is the scan and lists what counts.
+ *
+ * Why a refusal and not a wider edit. A declaration lives in two kinds of
+ * place, and the spawn takes their UNION: the workgroup's
+ * `workgroups.onecli_secrets` and the group's own `container.json`
+ * `onecliSecrets` (`mergeWorkgroupAndGroupSecrets`,
+ * `src/onecli-secrets.ts:566` — "neither list can subtract from the other";
+ * merged at `src/container-runner.ts:7077`). So an edit to one group's file
+ * cannot take back a workgroup declaration, and it cannot touch a sibling's
+ * file at all. Deleting a secret any of those still names makes
+ * `resolveSecretUuids` throw (`src/onecli-secrets.ts:464`) and aborts EVERY
+ * spawn that inherits it — for a workgroup-level declaration that is every
+ * group in the workgroup, not just this one. Refusing keeps the property the
+ * whole path is built on: either the declaration and the secret both go, or
+ * nothing does.
+ *
+ * Why the removal does the group-level undeclare at all, rather than leaving
+ * it to the operator as it used to: `refreshOne` re-declares the bearer on
+ * every successful refresh (`service.ts:1210`), so a refresh between a hand
+ * edit and this call re-declared the name this call was about to delete —
+ * producing exactly the spawn-abort above. Both run under the same per-name
+ * lock (`withIntegrationLock`, taken by `removeIntegration` and by
+ * `refreshExpiringMcpOAuthIntegrations` at `service.ts:1066`), so doing it
+ * here closes that window rather than narrowing it.
+ *
+ * Plain `remove` still leaves the declaration alone everywhere: an
+ * undeclared-but-present secret is inert, but an undeclared one the operator
+ * still wants granted is a 401 they did not ask for.
  */
 export function removeIntegration(name: string, options: { deleteSecret?: boolean } = {}): Promise<RemoveResult> {
   assertIntegrationName(name);
   return withIntegrationLock(name, () => removeIntegrationLocked(name, options));
 }
 
+/** One thing that still depends on the bearer, for the refusal to name. */
+interface SecretDeclarationSite {
+  /** What the operator has to edit. */
+  where: string;
+  /** How to edit it. */
+  fix: string;
+  /** The spelling found there — the name, or the secret's vault UUID. */
+  declared: string;
+}
+
+/**
+ * Everything that still depends on this bearer and that `--delete-secret`
+ * cannot itself take care of. Empty means the delete may proceed. Three
+ * sources, all of which survive an edit to the owning group's own
+ * `container.json`:
+ *
+ *   1. any workgroup's `onecli_secrets` — inherited by every member group,
+ *      and the owner's OWN workgroup is not exempt, because the merge is
+ *      union-only and this group's file cannot subtract from it;
+ *   2. any OTHER group's `container.json` — nothing here edits a sibling's
+ *      config;
+ *   3. any other integration IN THIS GROUP pointing at the same bearer. Two
+ *      integrations can share a `--secret` (the unique index is on
+ *      (agent_group_id, mcp_url), `migration 082:66`), and deleting it takes
+ *      the credential the survivor needs and the group's only declaration of
+ *      it. That one self-heals — the survivor's next refresh re-creates the
+ *      secret and re-declares it — but `decideRefresh` only fires inside the
+ *      expiry margin, so "eventually" can be hours of 401s.
+ *
+ * Both spellings are matched for 1 and 2 because `onecliSecrets` accepts
+ * either a name or a vault UUID (`resolveSecretUuids`,
+ * `src/onecli-secrets.ts:449`), compared exactly (`matchDeclarations`,
+ * `:473`) — and once the secret is gone, a leftover declaration in either one
+ * aborts the spawn. Source 3 matches on `bearer_secret_name`, which is what a
+ * row stores.
+ *
+ * The group files are read with `readContainerConfig` deliberately, not a
+ * stricter reader: it answers `emptyConfig()` for both an absent file
+ * (`src/container-config.ts:1283`) and one it cannot parse (`:1290`), and the
+ * spawn path asks the same question through the same function
+ * (`readContainerConfigForSpawn`, `:1310`, non-strict unless an operator
+ * spawn fence is up). A scan that disagreed with the thing it is protecting
+ * would refuse on declarations the spawn never sees.
+ *
+ * NOT closed, deliberately: the window between this scan and the delete. Both
+ * run under `withIntegrationLock(name)`, but a sibling integration's
+ * `ensureSecretDeclared` runs under a DIFFERENT name's lock and
+ * `scripts/set-workgroup-secrets.ts` is a separate process, so a declaration
+ * can appear in between. It is milliseconds wide, needs a shared `--secret`,
+ * and closing it would mean holding a lock across every group's config for
+ * the length of a vault round-trip — more cost, and more ways to wedge, than
+ * the window is worth.
+ */
+async function findForeignSecretDeclarations(
+  ownerGroupId: string,
+  integrationName: string,
+  spellings: string[],
+): Promise<SecretDeclarationSite[]> {
+  const wanted = new Set(spellings);
+  const sites: SecretDeclarationSite[] = [];
+  for (const workgroup of await getAllWorkgroupOnecliSecrets()) {
+    for (const declared of workgroup.secrets) {
+      if (!wanted.has(declared)) continue;
+      sites.push({
+        where: `workgroup ${workgroup.id} (workgroups.onecli_secrets) declares "${declared}"`,
+        fix: `pnpm exec tsx scripts/set-workgroup-secrets.ts ${workgroup.id} --secrets <the list without "${declared}">`,
+        declared,
+      });
+    }
+  }
+  for (const group of await getAllAgentGroups()) {
+    if (group.id === ownerGroupId) continue;
+    for (const declared of readContainerConfig(group.folder).onecliSecrets ?? []) {
+      if (!wanted.has(declared)) continue;
+      sites.push({
+        where: `agent group ${group.id} (groups/${group.folder}/container.json onecliSecrets) declares "${declared}"`,
+        fix: `remove "${declared}" from groups/${group.folder}/container.json`,
+        declared,
+      });
+    }
+  }
+  for (const other of await listMcpOAuthIntegrations()) {
+    if (other.name === integrationName) continue;
+    if (!wanted.has(other.bearer_secret_name)) continue;
+    sites.push({
+      where: `integration ${other.name} (agent group ${other.agent_group_id}) uses "${other.bearer_secret_name}" as its bearer`,
+      fix: `remove it too, or re-run its login with a different --secret`,
+      declared: other.bearer_secret_name,
+    });
+  }
+  return sites;
+}
+
 async function removeIntegrationLocked(name: string, options: { deleteSecret?: boolean }): Promise<RemoveResult> {
   const row = await getMcpOAuthIntegration(name);
+  const deleteSecretRequested = Boolean(options.deleteSecret);
   let removedSecret = false;
-  if (options.deleteSecret && row) {
+  let undeclaredSecret = false;
+  if (deleteSecretRequested && row) {
     const ref = row.bearer_secret_id
       ? { id: row.bearer_secret_id, name: row.bearer_secret_name }
       : await findOnecliSecretByName(row.bearer_secret_name);
-    if (ref) removedSecret = await deleteOnecliSecret(ref.id);
+    const spellings = [row.bearer_secret_name, ...(ref ? [ref.id] : [])];
+    // REFUSE BEFORE ANYTHING IS TOUCHED if anything this call cannot edit
+    // still depends on the bearer. See the note on
+    // `findForeignSecretDeclarations`: the spawn takes the union of the
+    // workgroup list and the group's own, so deleting the secret under a
+    // workgroup declaration would abort every spawn in that workgroup.
+    const foreign = await findForeignSecretDeclarations(row.agent_group_id, name, spellings);
+    if (foreign.length > 0) {
+      log.error('MCP OAuth remove --delete-secret refused: the bearer is still in use outside this group', {
+        integration: name,
+        agentGroupId: row.agent_group_id,
+        secretName: row.bearer_secret_name,
+        sites: foreign.map((site) => site.where),
+      });
+      throw new Error(
+        `Refusing to delete "${row.bearer_secret_name}": ${foreign.length} other place(s) this command cannot edit ` +
+          `still depend on it, and deleting it would break them. Nothing was deleted.\n` +
+          foreign.map((site) => `  - ${site.where} — ${site.fix}`).join('\n') +
+          `\nClear those first, then run this again. To end the integration without touching the secret, use ` +
+          `\`ncl integrations remove --name ${name}\` on its own.`,
+      );
+    }
+    // UNDECLARE FIRST, and abort the whole removal if it fails. The two orders
+    // fail in very different ways: declaration-then-delete leaves a group
+    // declaring a secret that no longer exists, which fails EVERY spawn closed
+    // and needs a hand edit to escape; delete-then-declaration leaves at worst
+    // a declaration of a name that is simply not in the vault yet — and here,
+    // because nothing is deleted when the undeclare throws, it leaves the
+    // integration exactly as it was, so re-running the same command is the
+    // whole recovery.
+    try {
+      undeclaredSecret = await ensureSecretUndeclared(row.agent_group_id, spellings);
+    } catch (err) {
+      log.error('MCP OAuth remove --delete-secret aborted: could not undeclare the bearer in container.json', {
+        integration: name,
+        agentGroupId: row.agent_group_id,
+        secretName: row.bearer_secret_name,
+        err,
+      });
+      throw new Error(
+        `Could not remove "${row.bearer_secret_name}" from the onecliSecrets of agent group ${row.agent_group_id}: ` +
+          `${err instanceof Error ? err.message : String(err)}. Nothing was deleted — the integration, its bearer ` +
+          `secret and the declaration are all untouched. Fix the container.json write and run the same command again.`,
+        { cause: err },
+      );
+    }
+    if (ref) {
+      // The declaration is already gone, so a failure here cannot produce the
+      // spawn-abort shape. It leaves an orphan secret in the vault, which is
+      // inert and named in the error, and the row untouched, so a retry
+      // resolves the same ref again.
+      removedSecret = await deleteOnecliSecret(ref.id);
+    }
   }
   pendingSecretWrites.delete(name);
   const removedBundle = deleteMcpOAuthBundle(name);
   const removedRow = await deleteMcpOAuthIntegration(name);
-  return { name, removedRow, removedBundle, removedSecret, secretName: row?.bearer_secret_name ?? null };
+  return {
+    name,
+    removedRow,
+    removedBundle,
+    removedSecret,
+    deleteSecretRequested,
+    undeclaredSecret,
+    secretName: row?.bearer_secret_name ?? null,
+  };
 }

@@ -226,7 +226,10 @@ refused, because moving it silently would point `complete` at the new group's `c
 leaving the old group's declaration in place — and a declared secret is granted on every spawn, so
 the old group would keep a live bearer, and on a shared `--secret` would keep receiving refreshed
 ones. To move one: `remove` it, drop its secret from the old group's `container.json`
-`onecliSecrets`, then log in under the new group.
+`onecliSecrets`, then log in under the new group — the same order `startLogin`'s own refusal prints.
+Do **not** reach for `--delete-secret` here: a `--secret` may name a secret that predates the
+integration and that other groups are granted (`Littlebird` on this install is exactly that), and
+deleting it to move one integration takes it away from all of them.
 
 ## Removing one
 
@@ -236,16 +239,52 @@ ncl integrations remove --name dropbox-files
 
 Deletes the registry row and the host-side bundle. The OneCLI secret and the `container.json`
 declaration are left alone — the secret may predate the integration and other requests may match on
-it. `--delete-secret` also deletes it; remove it from `container.json` **first**, or the next spawn
-fails closed on an unresolvable declaration.
+it.
 
-**Drop the declaration too** unless you meant to keep the secret: a name left in `onecliSecrets` is
-re-granted to that group's OneCLI agent on every spawn, so a bearer whose integration is gone stays
-usable until someone edits the file.
+```bash
+ncl integrations remove --name dropbox-files --delete-secret
+```
 
-Removal is serialized against the refresher. Every mutation of one integration — row, bundle file and
-vault secret — runs under one per-name lock, so a removal that lands while a refresh is awaiting the
-token endpoint cannot be undone by that refresh's continuation recreating the bundle and the secret.
+`--delete-secret` is **subtractive or nothing**. It refuses, deleting nothing, unless the owning
+group's own `container.json` is the only thing that still depends on the bearer; when it is, it
+drops the declaration there and *then* deletes the vault secret, both inside the per-integration
+lock.
+
+The refusal is the important half, because a declaration lives in two kinds of place and the spawn
+takes their **union** — `workgroups.onecli_secrets` merged with the group's own
+`onecliSecrets`, where neither list can subtract from the other. Deleting a secret that any
+workgroup still declares aborts **every spawn of every group in that workgroup**, not just this
+one; deleting one another group's `container.json` still names breaks that group. Two integrations
+in one group can also share a `--secret`, and deleting it takes the credential the survivor needs.
+So the command lists everything it found and what to do about it, and stops:
+
+```
+Refusing to delete "Littlebird": 7 other place(s) this command cannot edit still depend on it, and
+deleting it would break them. Nothing was deleted.
+  - workgroup main (workgroups.onecli_secrets) declares "Littlebird" — pnpm exec tsx scripts/set-workgroup-secrets.ts main --secrets <the list without "Littlebird">
+  …
+Clear those first, then run this again. To end the integration without touching the secret, use
+`ncl integrations remove --name littlebird` on its own.
+```
+
+Both spellings a declaration can take are matched — the secret's name and its vault UUID, either of
+which `onecliSecrets` accepts — because once the secret is gone, a leftover declaration in either
+one fails the spawn the same way.
+
+Why the owning group's own undeclare happens here rather than by hand first: every successful
+refresh re-declares the bearer, so a refresh landing between a hand edit and this command
+re-declares the name it is about to delete. The two run under one lock, so doing it here closes
+that window. If the `container.json` write fails, nothing is deleted and the integration is left
+exactly as it was; run the same command again once the file is writable.
+
+**After a plain `remove`, drop the declaration yourself** unless you meant to keep the secret: a
+name left in `onecliSecrets` — at either level — is re-granted on every spawn, so a bearer whose
+integration is gone stays usable until someone edits it out.
+
+Removal is serialized against the refresher. Every mutation of one integration — row, bundle file,
+vault secret and, on `--delete-secret`, the owning group's `container.json` declaration — runs under
+one per-name lock, so a removal that lands while a refresh is awaiting the token endpoint cannot be
+undone by that refresh's continuation recreating the bundle, the secret or the declaration.
 
 ## Access
 

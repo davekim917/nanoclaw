@@ -139,6 +139,21 @@ if [ -n "$rest" ]; then
       echo 'gh: Not Found (HTTP 404)' >&2
       exit 1
       ;;
+    */actions/runs/*/attempts/*/jobs\\?*)
+      # jobs--<run id>--attempt-<n>.json is that EARLIER attempt's jobs page
+      # (the newest attempt is served by the plain /jobs route below). Absent =
+      # the read fails.
+      id="\${rest#*/actions/runs/}"
+      attempt="\${id#*/attempts/}"; attempt="\${attempt%%/*}"
+      id="\${id%%/*}"
+      if [ ! -f "$MOCK_DIR/jobs--$id--attempt-$attempt.json" ]; then
+        echo '{"message":"Not Found","status":"404"}'
+        echo 'gh: Not Found (HTTP 404)' >&2
+        exit 1
+      fi
+      if printf '%s\\n' "$@" | grep -qx -- --slurp; then printf '['; cat "$MOCK_DIR/jobs--$id--attempt-$attempt.json"; printf ']'; else cat "$MOCK_DIR/jobs--$id--attempt-$attempt.json"; fi
+      exit 0
+      ;;
     */actions/runs/*/jobs\\?*)
       # jobs--<run id>.json is that run's jobs page. Absent = the read fails.
       id="\${rest#*/actions/runs/}"
@@ -5273,23 +5288,49 @@ describe('codex-review review-notes rule: the same-second edit boundary', () => 
 describe('codex-review host CI: a CI (host) success stands in only for a workflow GitHub never started', () => {
   const HOST = 'CI (host)';
 
-  function actionsJob(started: boolean, conclusion = 'failure'): Page {
+  // `runId` is the Actions run this job belongs to; required_status_red reads
+  // it back off the job to ask whether that whole RUN is excusable (#937 C).
+  function actionsJob(started: boolean, conclusion = 'failure', runId?: number): Page {
+    const base = { id: 105741202176, status: 'completed', conclusion, ...(runId === undefined ? {} : { run_id: runId }) };
     return started
       ? {
-          id: 105741202176,
-          status: 'completed',
-          conclusion,
+          ...base,
           runner_id: 1000006727,
           runner_name: 'GitHub Actions 1000006727',
           steps: [{ name: 'Typecheck host', status: 'completed', conclusion }],
         }
-      : { id: 105741202176, status: 'completed', conclusion, runner_id: 0, runner_name: '', steps: [] };
+      : { ...base, runner_id: 0, runner_name: '', steps: [] };
   }
 
   // A failed run on HEAD whose one job did (or did not) start.
   function failedRun(root: string, started: boolean, name = 'CI', startedAt = '2026-09-05T00:01:00Z'): Page {
     const run = workflowRun(name, 'completed', 'failure', startedAt);
-    writeJson(root, `jobs--${run.id as number}.json`, { total_count: 1, jobs: [actionsJob(started)] });
+    writeJson(root, `jobs--${run.id as number}.json`, {
+      total_count: 1,
+      jobs: [actionsJob(started, 'failure', run.id as number)],
+    });
+    return run;
+  }
+
+  // A failed run that has been re-run IN PLACE: one run id, `attempts.length`
+  // attempts, `attempts[i]` saying whether attempt i+1 started. GitHub serves
+  // the newest attempt's jobs at the plain /jobs route and the earlier ones at
+  // /attempts/<n>/jobs; `undefined` writes no fixture for an attempt, so that
+  // read 404s. The run id lives in one place here — it has to agree with three
+  // file names, and the fixtures that spelled it out each time were the reason
+  // this helper exists.
+  function rerunRun(root: string, attempts: (boolean | undefined)[], name = 'CI'): Page {
+    const run = workflowRun(name, 'completed', 'failure');
+    const runId = run.id as number;
+    run.run_attempt = attempts.length;
+    attempts.forEach((started, i) => {
+      if (started === undefined) return;
+      const newest = i === attempts.length - 1;
+      writeJson(root, newest ? `jobs--${runId}.json` : `jobs--${runId}--attempt-${i + 1}.json`, {
+        total_count: 1,
+        jobs: [actionsJob(started, 'failure', runId)],
+      });
+    });
     return run;
   }
 
@@ -5461,6 +5502,169 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
     expect(result.stderr).toContain('ci_red: CI=failure (required)');
   });
 
+  // A run with no jobs at all proves nothing, and neither does one whose jobs
+  // never reached a `failure` — the lockout's shape is a job GitHub FAILED
+  // without starting, and `run_never_started` asks for exactly that (#937 D,
+  // the `any(.conclusion == "failure")` conjunct, which no fixture exercised
+  // on its own because every one of them concluded `failure`).
+  it.each<[string, Page[]]>([
+    ['its jobs listing is empty', []],
+    [
+      'no job of it concluded failure, only cancelled',
+      [{ id: 1, status: 'completed', conclusion: 'cancelled', runner_id: 0, runner_name: '', steps: [] }],
+    ],
+  ])('keeps a failed run red when %s', (_case, jobs) => {
+    const root = tempRoot();
+    const result = mergeCheck(
+      root,
+      (r) => {
+        const run = workflowRun('CI', 'completed', 'failure');
+        writeJson(r, `jobs--${run.id as number}.json`, { total_count: jobs.length, jobs });
+        return [run];
+      },
+      [commitStatus(HOST, 'success')],
+    );
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('ci_red: CI=failure (required)');
+  });
+
+  // #937 C: a never-started run must not HIDE a genuine red of the same
+  // required workflow on the same head. Two shapes produce that, and both are
+  // invisible to ci_verdict's own view, which keeps only the newest run per
+  // workflow name and reads only the newest attempt of it.
+  describe('a never-started run never excuses a genuine red of the same workflow', () => {
+    it('refuses when an older run of the same workflow really failed', () => {
+      const root = tempRoot();
+      const result = mergeCheck(
+        root,
+        (r) => {
+          // Newest first in the fixture, so the order of the listing is not
+          // what is doing the work: ci_verdict keeps the newest by start time.
+          const genuine = failedRun(r, true, 'CI', '2026-09-05T00:01:00Z');
+          const rerun = failedRun(r, false, 'CI', '2026-09-05T00:05:00Z');
+          return [genuine, rerun];
+        },
+        [commitStatus(HOST, 'success')],
+      );
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('ci_red: CI=failure (required)');
+    });
+
+    // ci_verdict's standard for a required workflow is `conclusion !=
+    // "success"`, not just `failure`. A genuinely-executed older run that
+    // ended any other way is red there, so it has to disqualify a newer
+    // never-started run of the same name — otherwise the gate answers
+    // `ci=host` over a real red. These cost no jobs read: the conclusion
+    // alone settles it.
+    it.each<[string, string | null]>([
+      ['timed_out', 'timed_out'],
+      ['cancelled', 'cancelled'],
+      ['startup_failure', 'startup_failure'],
+      ['neutral', 'neutral'],
+      ['skipped', 'skipped'],
+      ['action_required', 'action_required'],
+      ['completed with no conclusion at all', null],
+    ])('refuses when an older run of the same workflow ended %s', (_case, conclusion) => {
+      const root = tempRoot();
+      const result = mergeCheck(
+        root,
+        (r) => [
+          workflowRun('CI', 'completed', conclusion, '2026-09-05T00:01:00Z'),
+          failedRun(r, false, 'CI', '2026-09-05T00:05:00Z'),
+        ],
+        [commitStatus(HOST, 'success')],
+      );
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('ci_red: CI=failure (required)');
+    });
+
+    it('still allows when the older run of the same workflow SUCCEEDED', () => {
+      const root = tempRoot();
+      const result = mergeCheck(
+        root,
+        (r) => [
+          workflowRun('CI', 'completed', 'success', '2026-09-05T00:01:00Z'),
+          failedRun(r, false, 'CI', '2026-09-05T00:05:00Z'),
+        ],
+        [commitStatus(HOST, 'success')],
+      );
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('ci=host');
+    });
+
+    // …and the stricter standard is REQUIRED-ONLY, because ci_verdict scores
+    // a non-required workflow with `neutral`/`skipped` as green. `cancelled`
+    // is not green there, so it still disqualifies — it is the routine output
+    // of `concurrency: cancel-in-progress`, and a non-required workflow whose
+    // older run was cancelled is red on its own account anyway.
+    it.each<[string, number]>([
+      ['skipped', 0],
+      ['neutral', 0],
+      ['cancelled', 24],
+    ])('scores a NON-required workflow whose older run was %s the way ci_verdict does', (conclusion, status) => {
+      const root = tempRoot();
+      const result = mergeCheck(
+        root,
+        (r) => [
+          workflowRun('CI', 'completed', 'success'),
+          workflowRun('Docs', 'completed', conclusion, '2026-09-05T00:01:30Z'),
+          failedRun(r, false, 'Docs', '2026-09-05T00:05:00Z'),
+        ],
+        [commitStatus(HOST, 'success')],
+      );
+      expect(result.status).toBe(status);
+      if (status === 0) {
+        // The never-started Docs run keeps its excuse, and because Docs is not
+        // required, an excused run is simply left out — the head is plain green.
+        expect(result.stdout).toContain('ci=green');
+      } else {
+        expect(result.stderr).toContain('Docs=failure');
+      }
+    });
+
+    it('refuses when an earlier ATTEMPT of the same run really failed', () => {
+      const root = tempRoot();
+      const result = mergeCheck(root, (r) => [rerunRun(r, [true, false])], [commitStatus(HOST, 'success')]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('ci_red: CI=failure (required)');
+    });
+
+    it('refuses when an earlier attempt cannot be read at all', () => {
+      const root = tempRoot();
+      const result = mergeCheck(root, (r) => [rerunRun(r, [undefined, false])], [commitStatus(HOST, 'success')]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('ci_red: CI=failure (required)');
+    });
+
+    it('still allows when every attempt of the run never started', () => {
+      const root = tempRoot();
+      const result = mergeCheck(root, (r) => [rerunRun(r, [false, false])], [commitStatus(HOST, 'success')]);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('ci=host');
+    });
+
+    it('disqualifies only the workflow that really failed, not another that never started', () => {
+      const root = tempRoot();
+      scopeFixture(root, {
+        labels: [],
+        ci: [
+          failedRun(root, true, 'Lint', '2026-09-05T00:01:00Z'),
+          failedRun(root, false, 'CI', '2026-09-05T00:02:00Z'),
+        ],
+        statuses: [commitStatus(HOST, 'success')],
+      });
+      const result = runHelper(root, ['merge-check', '--head', HEAD], {
+        CODEX_REVIEW_REQUIRED_WORKFLOWS: 'CI,Lint',
+      });
+      expect(result.status).toBe(24);
+      // Lint really failed, so it is red…
+      expect(result.stderr).toContain('ci_red: Lint=failure (required)');
+      // …and it did not disqualify CI, which host CI still covers.
+      expect(result.stderr).not.toContain('CI=failure');
+      expect(result.stderr).not.toContain('CI=not started');
+    });
+  });
+
   // Who posted the CI (host) status (#931): a commit status is writable by any
   // token with statuses:write, so only an allowed poster's stands in.
   describe('who may post CI (host)', () => {
@@ -5546,12 +5750,28 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
 
   describe('legacy repos: a required check run GitHub never started', () => {
     const JOB = 105741202176;
+    const RUN = 4242;
     const neverRun = (): Page => ({ ...rollupRun('CI Gate', 'COMPLETED', 'FAILURE'), databaseId: JOB });
 
-    function legacy(root: string, rollup: Page[], started: boolean | null): void {
-      scopeFixture(root, { baseConfig: null, labels: [], rollup });
+    // The rollup's check run and the Actions run it belongs to. Both are read:
+    // the check run's own job says whether IT started, and the run listing says
+    // whether any other run or attempt of `CI Gate` on this head has a genuine
+    // red the rollup no longer shows (#937 C). `runJobs` overrides what the
+    // run's newest attempt looks like; by default it matches `started`.
+    function legacy(
+      root: string,
+      rollup: Page[],
+      started: boolean | null,
+      opts: { runJobs?: Page[]; run?: Page; extraCi?: Page[] } = {},
+    ): void {
+      const run = { ...workflowRun('CI Gate', 'completed', 'failure'), id: RUN, ...(opts.run ?? {}) };
+      scopeFixture(root, { baseConfig: null, labels: [], rollup, ci: [run, ...(opts.extraCi ?? [])] });
+      writeJson(root, `jobs--${RUN}.json`, {
+        total_count: 1,
+        jobs: opts.runJobs ?? [actionsJob(started ?? false, 'failure', RUN)],
+      });
       fs.rmSync(path.join(root, `job--${JOB}.json`), { force: true });
-      if (started !== null) writeJson(root, `job--${JOB}.json`, actionsJob(started));
+      if (started !== null) writeJson(root, `job--${JOB}.json`, actionsJob(started, 'failure', RUN));
     }
 
     it('defers with ci=host when CI (host) succeeded on the head', () => {
@@ -5593,22 +5813,34 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
           },
         },
       ];
-      type Pr = { threads?: boolean[]; approvals?: string[]; unattributed?: boolean; head?: string };
+      type Pr = {
+        threads?: boolean[];
+        approvals?: string[];
+        changesRequested?: string[];
+        unattributed?: boolean;
+        head?: string;
+        // GitHub's own computed review state. `null` — the default, and what a
+        // repo whose rules require no review reports — is what the existing
+        // ready-path fixtures need.
+        reviewDecision?: string | null;
+      };
       function prPage(pr: Pr = {}): Page {
+        const reviews = [
+          ...(pr.approvals ?? []).map((login) => ({ state: 'APPROVED', author: { login } })),
+          ...(pr.changesRequested ?? []).map((login) => ({ state: 'CHANGES_REQUESTED', author: { login } })),
+        ];
         return {
           data: {
             repository: {
               pullRequest: {
                 headRefOid: pr.head ?? HEAD,
                 author: { login: 'author' },
+                reviewDecision: pr.reviewDecision ?? null,
                 reviewThreads: {
                   totalCount: (pr.threads ?? []).length,
                   nodes: (pr.threads ?? []).map((isResolved) => ({ isResolved })),
                 },
-                latestOpinionatedReviews: {
-                  totalCount: (pr.approvals ?? []).length,
-                  nodes: (pr.approvals ?? []).map((login) => ({ state: 'APPROVED', author: { login } })),
-                },
+                latestOpinionatedReviews: { totalCount: reviews.length, nodes: reviews },
                 commits: {
                   totalCount: 1,
                   nodes: [{ commit: { author: { user: pr.unattributed ? null : { login: 'author' } } } }],
@@ -5648,10 +5880,34 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
         ],
         ['an unresolved review thread', GREEN, { threads: [true, false] }, '1 unresolved review thread(s)'],
         [
-          'an unattributed commit and no approval',
+          'an unattributed commit, which owes an extra approving review',
           GREEN,
           { unattributed: true },
-          '0 of 1 required approving review(s)',
+          'an extra approving review is required because 1 commit(s) have no GitHub-attributed author',
+        ],
+        [
+          'GitHub still requiring review',
+          GREEN,
+          { reviewDecision: 'REVIEW_REQUIRED' },
+          'GitHub reports reviewDecision=REVIEW_REQUIRED',
+        ],
+        [
+          'GitHub reporting changes requested',
+          GREEN,
+          { reviewDecision: 'CHANGES_REQUESTED' },
+          'GitHub reports reviewDecision=CHANGES_REQUESTED',
+        ],
+        [
+          'a review decision GitHub added after this was written',
+          GREEN,
+          { reviewDecision: 'SOMETHING_NEW' },
+          'GitHub reports reviewDecision=SOMETHING_NEW',
+        ],
+        [
+          'changes requested by a reviewer',
+          GREEN,
+          { changesRequested: ['reviewer'] },
+          'changes requested by reviewer',
         ],
         [
           'another required check still running',
@@ -5677,13 +5933,91 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
         expect(result.stdout).not.toContain('admin=');
       });
 
-      it('counts an approval against the extra one an unattributed commit needs, but not the author approving themself', () => {
-        expect(admin(tempRoot(), GREEN, { unattributed: true, approvals: ['reviewer'] }).stdout).toContain(
-          'admin=ready',
+      // #937 B3. `reviewDecision` is GitHub's own answer to "is the review
+      // requirement met", so it is asked rather than recomputed — but it is
+      // NOT a substitute for reading the base rules. Measured: XZO ruleset
+      // 21204871 is active on the default branch with
+      // require_extra_approval_for_unattributed_changes: true, and XZO PR
+      // #1965 (open, on that branch, 3 unattributed commits) reports
+      // reviewDecision: null. So reviewDecision does not surface that rule's
+      // review parameters, and the sibling parameter in the same rule object
+      // cannot be assumed to fare better. Both authorities, both fail-closed.
+      const withApprovalCount = (count: number): Page[] =>
+        RULES.map((rule) =>
+          rule.type === 'pull_request'
+            ? { ...rule, parameters: { ...(rule.parameters as Page), required_approving_review_count: count } }
+            : rule,
         );
-        expect(admin(tempRoot(), GREEN, { unattributed: true, approvals: ['author'] }).stdout).toContain(
-          'admin=not-ready',
+
+      it('refuses a required_approving_review_count even when reviewDecision says APPROVED', () => {
+        const result = admin(tempRoot(), GREEN, { reviewDecision: 'APPROVED' }, withApprovalCount(2));
+        expect(result.stdout).toContain('admin=not-ready');
+        expect(result.stdout).toContain('the base rules require 2 approving review(s)');
+      });
+
+      // The fail-open shape this guards: a rulesets-only repo with a non-zero
+      // count, no approvals, and reviewDecision null as it is on XZO.
+      it('refuses a required_approving_review_count when reviewDecision says nothing at all', () => {
+        const result = admin(tempRoot(), GREEN, {}, withApprovalCount(2));
+        expect(result.stdout).toContain('admin=not-ready');
+        expect(result.stdout).toContain('the base rules require 2 approving review(s)');
+      });
+
+      it('does no counting of its own: approvals neither create nor satisfy a requirement', () => {
+        // Approvals with the count at 0 (the fleet's actual shape) stay ready…
+        expect(admin(tempRoot(), GREEN, { approvals: ['reviewer'] }).stdout).toContain('admin=ready');
+        // …and approvals never satisfy a positive count.
+        expect(
+          admin(tempRoot(), GREEN, { approvals: ['a', 'b', 'c'] }, withApprovalCount(1)).stdout,
+        ).toContain('admin=not-ready');
+      });
+
+      it('still refuses the extra approval an unattributed commit owes, whatever reviewDecision says', () => {
+        const result = admin(tempRoot(), GREEN, { unattributed: true, reviewDecision: 'APPROVED' });
+        expect(result.stdout).toContain('admin=not-ready');
+        expect(result.stdout).toContain('an extra approving review is required because 1 commit(s)');
+      });
+
+      // #937 B1. A CHANGES_REQUESTED review is a hold --admin lifts, and the
+      // author's own state is never one (GitHub does not let you request
+      // changes on your own PR), so only a non-author's counts.
+      it('is not ready on changes requested by anyone but the author, naming them', () => {
+        const result = admin(tempRoot(), GREEN, { changesRequested: ['reviewer', 'other'] });
+        expect(result.stdout).toContain('admin=not-ready');
+        expect(result.stdout).toMatch(/changes requested by (other, reviewer|reviewer, other)/);
+      });
+
+      it('ignores a CHANGES_REQUESTED review whose author is the PR author', () => {
+        expect(admin(tempRoot(), GREEN, { changesRequested: ['author'] }).stdout).toContain('admin=ready');
+      });
+
+      // #937 B2. `strict_required_status_checks_policy` is GitHub's "require
+      // branches to be up to date before merging" — a fact about the base
+      // having moved, which nothing here evaluates.
+      it('is not ready when the base requires the branch to be up to date', () => {
+        const rules = RULES.map((rule) =>
+          rule.type === 'required_status_checks'
+            ? {
+                ...rule,
+                parameters: { ...(rule.parameters as Page), strict_required_status_checks_policy: true },
+              }
+            : rule,
         );
+        const result = admin(tempRoot(), GREEN, {}, rules);
+        expect(result.stdout).toContain('admin=not-ready');
+        expect(result.stdout).toContain('the base requires the branch to be up to date');
+      });
+
+      it('is ready when strict_required_status_checks_policy is explicitly false', () => {
+        const rules = RULES.map((rule) =>
+          rule.type === 'required_status_checks'
+            ? {
+                ...rule,
+                parameters: { ...(rule.parameters as Page), strict_required_status_checks_policy: false },
+              }
+            : rule,
+        );
+        expect(admin(tempRoot(), GREEN, {}, rules).stdout).toContain('admin=ready');
       });
 
       it.each<[string, Page[] | null, boolean, string]>([
@@ -5717,6 +6051,108 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
     ])('refuses required_red with %s', (_case, extra, started) => {
       const root = tempRoot();
       legacy(root, [neverRun(), ...extra], started);
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('required_red: CI Gate=failure');
+    });
+
+    // #937 C on the rollup side. The rollup carries only the NEWEST check run
+    // per name, so a genuine red of the same required check earlier on this
+    // head is invisible to it; required_status_red must go to the Actions runs
+    // for the head to see it, and refuse.
+    describe('a never-started check run never excuses a genuine red of the same workflow', () => {
+      const HOST_OK = [rollupStatus(HOST, 'SUCCESS', false)];
+
+      it('refuses when the run behind the check run really failed, whatever the one job says', () => {
+        const root = tempRoot();
+        // The job the rollup points at never started, but a SECOND job of the
+        // same run did and failed — the run is not excusable.
+        legacy(root, [neverRun(), ...HOST_OK], false, {
+          runJobs: [actionsJob(false, 'failure', 4242), actionsJob(true, 'failure', 4242)],
+        });
+        const result = runHelper(root, ['merge-check', '--head', HEAD]);
+        expect(result.status).toBe(24);
+        expect(result.stderr).toContain('required_red: CI Gate=failure');
+      });
+
+      it('refuses when an earlier ATTEMPT of that run really failed', () => {
+        const root = tempRoot();
+        legacy(root, [neverRun(), ...HOST_OK], false, { run: { run_attempt: 2 } });
+        writeJson(root, 'jobs--4242--attempt-1.json', {
+          total_count: 1,
+          jobs: [actionsJob(true, 'failure', 4242)],
+        });
+        const result = runHelper(root, ['merge-check', '--head', HEAD]);
+        expect(result.status).toBe(24);
+        expect(result.stderr).toContain('required_red: CI Gate=failure');
+      });
+
+      it('refuses when an older run of the same workflow really failed', () => {
+        const root = tempRoot();
+        const older = { ...workflowRun('CI Gate', 'completed', 'failure', '2026-09-04T00:01:00Z'), id: 4141 };
+        legacy(root, [neverRun(), ...HOST_OK], false, { extraCi: [older] });
+        writeJson(root, 'jobs--4141.json', { total_count: 1, jobs: [actionsJob(true, 'failure', 4141)] });
+        const result = runHelper(root, ['merge-check', '--head', HEAD]);
+        expect(result.status).toBe(24);
+        expect(result.stderr).toContain('required_red: CI Gate=failure');
+      });
+
+      it('refuses when the job read carries no run_id to vouch for', () => {
+        const root = tempRoot();
+        legacy(root, [neverRun(), ...HOST_OK], false);
+        // A job as GitHub returns it, minus run_id: nothing ties it to a run
+        // this head has, so it cannot be excused.
+        writeJson(root, `job--${JOB}.json`, actionsJob(false));
+        const result = runHelper(root, ['merge-check', '--head', HEAD]);
+        expect(result.status).toBe(24);
+        expect(result.stderr).toContain('required_red: CI Gate=failure');
+      });
+
+      it('refuses when the head has no Actions run behind the check run at all', () => {
+        const root = tempRoot();
+        legacy(root, [neverRun(), ...HOST_OK], false, { run: { head_sha: OLD_HEAD } });
+        const result = runHelper(root, ['merge-check', '--head', HEAD]);
+        expect(result.status).toBe(24);
+        expect(result.stderr).toContain('required_red: CI Gate=failure');
+      });
+    });
+
+    // #937 D. On this side every fixture flipped both never_started conjuncts
+    // together (`actionsJob(started)`), so a mutation that dropped either one
+    // on its own went unseen.
+    it.each<[string, Page]>([
+      ['a runner id, but no runner name and no step', { runner_id: 5, runner_name: '', steps: [] }],
+      ['a runner name, but no runner id and no step', { runner_id: 0, runner_name: 'GitHub Actions 5', steps: [] }],
+      ['a step, but no runner', { runner_id: 0, runner_name: '', steps: [{ name: 'Set up job', status: 'completed' }] }],
+    ])('refuses required_red for a check-run job with %s', (_case, shape) => {
+      const root = tempRoot();
+      const job = { ...actionsJob(false, 'failure', 4242), ...shape };
+      legacy(root, [neverRun(), rollupStatus(HOST, 'SUCCESS', false)], false, { runJobs: [job] });
+      writeJson(root, `job--${JOB}.json`, job);
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('required_red: CI Gate=failure');
+    });
+
+    // #937 D. Every CI (host) fixture used the lower-case login
+    // `fleet-bot`, so the `ascii_downcase` both sides of the poster compare
+    // depend on was never exercised here. GitHub logins are case-insensitive.
+    it('takes a CI (host) success whose creator login differs only in case', () => {
+      const root = tempRoot();
+      legacy(root, [neverRun(), rollupStatus(HOST, 'SUCCESS', false, 'Fleet-Bot')], false);
+      const result = runHelper(root, ['merge-check', '--head', HEAD], {
+        CODEX_REVIEW_HOST_CI_POSTERS: 'Fleet-BOT',
+      });
+      expect(result.status).toBe(26);
+      expect(result.stdout).toContain('merge=defer mode=legacy ci=host');
+    });
+
+    // #937 D. One required context can be reported twice, as a check run AND
+    // as a commit status. The never-started excuse covers the check run only —
+    // a red status of the same name is still red.
+    it('refuses when the excused check run shares its name with a red status context', () => {
+      const root = tempRoot();
+      legacy(root, [neverRun(), rollupStatus('CI Gate', 'FAILURE'), rollupStatus(HOST, 'SUCCESS', false)], false);
       const result = runHelper(root, ['merge-check', '--head', HEAD]);
       expect(result.status).toBe(24);
       expect(result.stderr).toContain('required_red: CI Gate=failure');
