@@ -45,11 +45,17 @@ vi.mock('../../log.js', () => ({
 // real repo path the hermeticity guard denylists — and it is not what these
 // cases are about.
 const declared: string[] = [];
+/** Every OTHER group's `groups/<folder>/container.json`, by folder. The
+ *  `--delete-secret` refusal scans these, so the reader has to answer per
+ *  folder rather than handing every group the same list. */
+const otherGroupsDeclared: Record<string, string[]> = {};
 /** `fail` makes the locked rewrite throw, as a locked or unwritable
  *  container.json would; `updates` counts the rewrites that were attempted. */
 const containerConfig = { fail: false, updates: 0 };
 vi.mock('../../container-config.js', () => ({
-  readContainerConfig: () => ({ onecliSecrets: [...declared] }),
+  readContainerConfig: (folder: string) => ({
+    onecliSecrets: folder === 'example' ? [...declared] : [...(otherGroupsDeclared[folder] ?? [])],
+  }),
   updateContainerConfig: async (folder: string, mutate: (c: { onecliSecrets?: string[] }) => void) => {
     containerConfig.updates++;
     if (containerConfig.fail) throw new Error('container.json lock timed out');
@@ -77,7 +83,7 @@ vi.mock('./onecli-secret-writer.js', () => ({
   },
 }));
 
-import { closeDb, createAgentGroup, initMigratedTestDb } from '../../db/index.js';
+import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
 import { getMcpOAuthIntegration, markMcpOAuthIntegration } from '../../db/mcp-oauth-integrations.js';
 import { enforceHermeticity } from '../../test-hermeticity.js';
 import type { FetchLike } from './discovery.js';
@@ -151,6 +157,7 @@ async function login(over: Partial<Parameters<typeof startLogin>[0]> = {}, fetch
 beforeEach(async () => {
   await initMigratedTestDb();
   declared.length = 0;
+  for (const folder of Object.keys(otherGroupsDeclared)) delete otherGroupsDeclared[folder];
   containerConfig.fail = false;
   containerConfig.updates = 0;
   vault.fail = false;
@@ -672,5 +679,121 @@ describe('remove --delete-secret undeclares the bearer before deleting it (#929)
     expect(removed.undeclaredSecret).toBe(true);
     expect(declared).toEqual([]);
     expect(await getMcpOAuthIntegration('example-int')).toBeUndefined();
+  });
+});
+
+// #929, the half a group-level undeclare cannot reach. The spawn grants the
+// UNION of `workgroups.onecli_secrets` and the group's own `onecliSecrets`
+// (`mergeWorkgroupAndGroupSecrets`, `src/onecli-secrets.ts:566`), and neither
+// list can subtract from the other — so deleting a secret another site still
+// declares aborts every spawn that inherits it. `--delete-secret` refuses
+// instead, and deletes nothing.
+describe('remove --delete-secret refuses when the bearer is declared elsewhere (#929)', () => {
+  /** A workgroup declaring `secrets`, with `ag-1` a member of it. */
+  function workgroupDeclaring(id: string, secrets: string[], withOwner = true): void {
+    const db = getRawDb();
+    db.prepare(`INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES (?, ?, ?)`).run(
+      id,
+      JSON.stringify(secrets),
+      new Date().toISOString(),
+    );
+    if (withOwner) db.prepare(`UPDATE agent_groups SET workgroup_id = ? WHERE id = ?`).run(id, 'ag-1');
+  }
+
+  /** A second agent group whose own container.json declares `secrets`. */
+  async function siblingDeclaring(secrets: string[]): Promise<void> {
+    await createAgentGroup({
+      id: 'ag-2',
+      name: 'Sibling',
+      folder: 'sibling',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    otherGroupsDeclared.sibling = secrets;
+  }
+
+  /** Nothing moved: no vault delete, the declaration intact, the row intact. */
+  async function expectUntouched(secretName: string): Promise<void> {
+    expect(vault.deleted).toEqual([]);
+    expect(declared).toEqual([secretName]);
+    expect(await getMcpOAuthIntegration('example-int')).toBeDefined();
+    expect(readMcpOAuthBundle('example-int')).toBeDefined();
+  }
+
+  // The owning group's OWN workgroup is not exempt: its declaration reaches
+  // this group too, and this group's file cannot take it back.
+  it('refuses when the owning group’s own workgroup declares the bearer', async () => {
+    const secretName = await connected();
+    workgroupDeclaring('main', [secretName, 'Unrelated']);
+
+    await expect(removeIntegration('example-int', { deleteSecret: true })).rejects.toThrow(
+      /Refusing to delete .* still declared in 1 place/s,
+    );
+    await expectUntouched(secretName);
+  });
+
+  it('refuses when any other workgroup declares it, and names every one of them', async () => {
+    const secretName = await connected();
+    workgroupDeclaring('main', [secretName]);
+    workgroupDeclaring('illysium', [secretName], false);
+
+    const err = await removeIntegration('example-int', { deleteSecret: true }).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain('still declared in 2 place(s)');
+    expect((err as Error).message).toContain('workgroup main (workgroups.onecli_secrets)');
+    expect((err as Error).message).toContain('workgroup illysium (workgroups.onecli_secrets)');
+    // The message has to be actionable, not just a refusal.
+    expect((err as Error).message).toContain('scripts/set-workgroup-secrets.ts main');
+    expect((err as Error).message).toContain('ncl integrations remove --name example-int');
+    await expectUntouched(secretName);
+  });
+
+  it("refuses when another group's container.json declares it", async () => {
+    const secretName = await connected();
+    await siblingDeclaring(['Unrelated', secretName]);
+
+    const err = await removeIntegration('example-int', { deleteSecret: true }).catch((e: Error) => e);
+    expect((err as Error).message).toContain('groups/sibling/container.json');
+    await expectUntouched(secretName);
+  });
+
+  // `onecliSecrets` takes a name or a vault UUID, and a leftover declaration
+  // in either spelling aborts the spawn once the secret is gone.
+  it('refuses on a foreign declaration written as the vault UUID', async () => {
+    const secretName = await connected();
+    workgroupDeclaring('main', ['secret-uuid-1']);
+
+    const err = await removeIntegration('example-int', { deleteSecret: true }).catch((e: Error) => e);
+    expect((err as Error).message).toContain('declares "secret-uuid-1"');
+    await expectUntouched(secretName);
+  });
+
+  it('proceeds when the other sites declare only unrelated secrets', async () => {
+    const secretName = await connected();
+    workgroupDeclaring('main', ['Anthropic', 'Exa']);
+    await siblingDeclaring(['Anthropic']);
+
+    const removed = await removeIntegration('example-int', { deleteSecret: true });
+
+    expect(removed.undeclaredSecret).toBe(true);
+    expect(removed.removedSecret).toBe(true);
+    expect(declared).toEqual([]);
+    expect(vault.deleted).toEqual(['secret-uuid-1']);
+    expect(secretName).toBe('ExampleInt-MCP-Example');
+  });
+
+  // Plain `remove` deletes no secret, so a foreign declaration is no reason to
+  // refuse it — and refusing would strand the row.
+  it('does not refuse a plain remove over a foreign declaration', async () => {
+    const secretName = await connected();
+    workgroupDeclaring('main', [secretName]);
+
+    const removed = await removeIntegration('example-int');
+
+    expect(removed.removedRow).toBe(true);
+    expect(removed.deleteSecretRequested).toBe(false);
+    expect(removed.undeclaredSecret).toBe(false);
+    expect(vault.deleted).toEqual([]);
+    expect(declared).toEqual([secretName]);
   });
 });

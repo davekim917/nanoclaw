@@ -1332,7 +1332,15 @@ host_ci_posters() {
 # `CI (host)` success is allowed to stand in for. A run qualifies when every
 # ATTEMPT of it is `run_never_started` (never-started.jq: at least one job,
 # every job with no runner and no step, one of them `failure`) AND no other
-# failed run of the same WORKFLOW on this head is anything else.
+# completed run of the same WORKFLOW on this head is a real red.
+#
+# "Real red" here is ci_verdict's own standard for a required workflow,
+# `.conclusion != "success"` — not just `failure`. A `timed_out`, `cancelled`,
+# `neutral`, `skipped` or `startup_failure` run of a required workflow is red
+# there, so letting one of those go by would excuse a newer never-started run
+# over a genuine red and answer `ci=host` on it. Only `failure` runs cost a
+# jobs read: they are the only conclusion the lockout produces, so every other
+# non-success conclusion disqualifies its workflow name outright, for free.
 #
 # Both of those are #937 C. A never-started run is evidence about GitHub, not
 # about the head, so it is excusable — but a genuine red of the same required
@@ -1351,14 +1359,21 @@ host_ci_posters() {
 # earlier attempt of one. Under `audit`, runs created after GATE_AS_OF are not
 # asked about (ci_verdict drops them anyway).
 never_started_runs() {
-  local rows id attempt name jobs a endpoint clean candidates='[]' disqualified='[]'
+  local rows kind id attempt name jobs a endpoint clean candidates='[]' disqualified='[]'
   rows=$(printf '%s\n' "$2" | jq -r --arg head "$1" --arg asof "$GATE_AS_OF" '
-    [ .[].workflow_runs[]? | select(.head_sha == $head and .status == "completed" and .conclusion == "failure")
+    [ .[].workflow_runs[]? | select(.head_sha == $head and .status == "completed")
       | select($asof == "" or (.created_at // "") <= $asof)
-      | { id: .id, attempt: (.run_attempt // 1), name: (.name // "") } ]
-    | unique_by(.id) | .[] | "\(.id)\t\(.attempt)\t\(.name)"') || return 1
-  while IFS=$'\t' read -r id attempt name; do
+      | select((.conclusion // "") != "success")
+      # `ask` needs a jobs read to tell the lockout shape from a real failure;
+      # `red` is already a real red and only costs its workflow name.
+      | { kind: (if .conclusion == "failure" then "ask" else "red" end), id: .id, attempt: (.run_attempt // 1), name: (.name // "") } ]
+    | unique_by(.id) | .[] | "\(.kind)\t\(.id)\t\(.attempt)\t\(.name)"') || return 1
+  while IFS=$'\t' read -r kind id attempt name; do
     [ -n "$id" ] || continue
+    if [ "$kind" = red ]; then
+      disqualified=$(jq -cn --argjson d "$disqualified" --arg n "$name" '$d + [$n]') || return 1
+      continue
+    fi
     clean=1
     if [[ "$id" =~ ^[0-9]+$ ]]; then
       [[ "$attempt" =~ ^[0-9]+$ ]] && [ "$attempt" -ge 1 ] || attempt=1
@@ -1635,25 +1650,37 @@ legacy_precheck() {
 #     GitHub marks required) reported and green, except the never-started
 #     check runs an allowed CI (host) success covers ($1, their databaseIds);
 #   - no unresolved review thread when the rules require resolution;
-#   - no CHANGES_REQUESTED review from anyone but the author (#937 B1): a
-#     requested change is a hold --admin lifts, and no rule has to be on for
-#     GitHub to show it;
-#   - no approving review required AT ALL — required_approving_review_count,
-#     plus one when require_extra_approval_for_unattributed_changes is on and
-#     any commit's author maps to no GitHub account. Any positive requirement
-#     is not-ready, rather than counted (#937 B3): GitHub counts only approvals
-#     from accounts with write access, this cannot tell which of them have it,
-#     and counting the rest would answer `ready` on approvals GitHub rejects.
-#     No repo in this fleet requires one, so this costs nothing today;
+#   - `reviewDecision` APPROVED or null (#937 B3). This is GitHub's OWN
+#     computed answer to "is the review requirement met" — APPROVED |
+#     CHANGES_REQUESTED | REVIEW_REQUIRED, null when the PR requires no review
+#     — and it already counts only approvals from accounts with write access,
+#     which is the part this script has no business recomputing. It replaces
+#     the approval ARITHMETIC that used to live here (approving reviews
+#     counted against required_approving_review_count); asking GitHub is both
+#     correct and cheaper than modelling it. A value outside that set is a
+#     state GitHub added later, and is not-ready;
+#   - no CHANGES_REQUESTED review from anyone but the author (#937 B1). Kept
+#     alongside reviewDecision, not folded into it: `reviewDecision` is null
+#     on a repo whose rules require no review, so it says nothing there, while
+#     a requested change is still a hold --admin would lift. Deliberately NOT
+#     narrowed with `latestOpinionatedReviews(writersOnly: true)` — a
+#     non-writer's "please change this" does not block GitHub, but it is
+#     exactly the kind of thing an admin bypass should not run over;
+#   - no extra approval owed for unattributed changes: when
+#     require_extra_approval_for_unattributed_changes is on and any commit's
+#     author maps to no GitHub account, this stays not-ready. It is the one
+#     approval fact kept out of reviewDecision's hands, because whether that
+#     rulesets-only parameter feeds reviewDecision is not something this could
+#     verify on any repo available to it — and an unverified premise about
+#     another system's behaviour is what this check exists to avoid;
 #   - no strict_required_status_checks_policy (#937 B2): that is GitHub's
 #     "require branches to be up to date before merging", which is a fact about
 #     the base moving, not about this head, and nothing here evaluates it;
 #   - no rule type, app-pinned check, or classic protection it does not model.
 # Anything it cannot read is `not-ready`, never `ready`.
 #
-# Deliberately NOT modelled, because no repo in this fleet has the rule they
-# would guard: per-reviewer write-access lookups (B3 answers not-ready before
-# an approval could matter) and a required_status_checks parameter allow-list.
+# Deliberately NOT modelled, because no repo in this fleet has the rule it
+# would guard: a required_status_checks parameter allow-list.
 admin_readiness() {
   local hosted="$1" rules protection pages rollup pr why
   rules=$(gh api --paginate --slurp "repos/$REPO/rules/branches/$SCOPE_BASE_REF" 2>/dev/null | jq -c 'flatten') || {
@@ -1672,7 +1699,7 @@ admin_readiness() {
   pr=$(gh api graphql -f query='
     query adminReadiness($owner:String!,$name:String!,$pr:Int!){
       repository(owner:$owner,name:$name){ pullRequest(number:$pr){
-        headRefOid author{ login }
+        headRefOid author{ login } reviewDecision
         reviewThreads(first:100){ totalCount nodes{ isResolved } }
         latestOpinionatedReviews(first:100){ totalCount nodes{ state author{ login } } }
         commits(first:100){ totalCount nodes{ commit{ author{ user{ login } } } } }
@@ -1702,13 +1729,14 @@ admin_readiness() {
         ( if $strict then "the base requires the branch to be up to date, which this does not evaluate" else empty end ),
         ( if ($notGreen | length) > 0 then "required, not green: \($notGreen | join(", "))" else empty end ),
         ( if ($changesRequested | length) > 0 then "changes requested by \($changesRequested | join(", "))" else empty end ),
+        ( if ($pr.reviewDecision // "none") | IN("none", "APPROVED") | not
+          then "GitHub reports reviewDecision=\($pr.reviewDecision)" else empty end ),
         ( if $pr.reviewThreads.totalCount > 100 or $pr.latestOpinionatedReviews.totalCount > 100 or $pr.commits.totalCount > 100
           then "over 100 review threads, reviews or commits, not read in full" else empty end ),
         ( $prRules[]
           | ( if .required_review_thread_resolution == true and $unresolved > 0 then "\($unresolved) unresolved review thread(s), and the rules require resolution" else empty end ),
-            ( (.require_extra_approval_for_unattributed_changes == true and $unattributed > 0) as $extra
-              | ((.required_approving_review_count // 0) + (if $extra then 1 else 0 end)) as $need
-              | if $need > 0 then "\($need) approving review(s) required\(if $extra then " (one because \($unattributed) commit(s) have no GitHub-attributed author)" else "" end), and this does not evaluate them: GitHub counts only approvals from accounts with write access, which is not read here" else empty end ),
+            ( if .require_extra_approval_for_unattributed_changes == true and $unattributed > 0
+              then "an extra approving review is required because \($unattributed) commit(s) have no GitHub-attributed author, and reviewDecision is not known to model that rule" else empty end ),
             ( if .require_code_owner_review == true or .require_last_push_approval == true or ((.required_reviewers // []) | length) > 0
               then "code-owner, last-push or named-reviewer requirements, which this does not evaluate" else empty end ) )
       ] | join("; ")') || {

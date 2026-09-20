@@ -5312,6 +5312,28 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
     return run;
   }
 
+  // A failed run that has been re-run IN PLACE: one run id, `attempts.length`
+  // attempts, `attempts[i]` saying whether attempt i+1 started. GitHub serves
+  // the newest attempt's jobs at the plain /jobs route and the earlier ones at
+  // /attempts/<n>/jobs; `undefined` writes no fixture for an attempt, so that
+  // read 404s. The run id lives in one place here — it has to agree with three
+  // file names, and the fixtures that spelled it out each time were the reason
+  // this helper exists.
+  function rerunRun(root: string, attempts: (boolean | undefined)[], name = 'CI'): Page {
+    const run = workflowRun(name, 'completed', 'failure');
+    const runId = run.id as number;
+    run.run_attempt = attempts.length;
+    attempts.forEach((started, i) => {
+      if (started === undefined) return;
+      const newest = i === attempts.length - 1;
+      writeJson(root, newest ? `jobs--${runId}.json` : `jobs--${runId}--attempt-${i + 1}.json`, {
+        total_count: 1,
+        jobs: [actionsJob(started, 'failure', runId)],
+      });
+    });
+    return run;
+  }
+
   function mergeCheck(root: string, ci: (root: string) => Page[], statuses: Page[]) {
     scopeFixture(root, { labels: [], ci: ci(root), statuses });
     return runHelper(root, ['merge-check', '--head', HEAD]);
@@ -5528,59 +5550,65 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
       expect(result.stderr).toContain('ci_red: CI=failure (required)');
     });
 
-    it('refuses when an earlier ATTEMPT of the same run really failed', () => {
+    // ci_verdict's standard for a required workflow is `conclusion !=
+    // "success"`, not just `failure`. A genuinely-executed older run that
+    // ended any other way is red there, so it has to disqualify a newer
+    // never-started run of the same name — otherwise the gate answers
+    // `ci=host` over a real red. These cost no jobs read: the conclusion
+    // alone settles it.
+    it.each<[string, string | null]>([
+      ['timed_out', 'timed_out'],
+      ['cancelled', 'cancelled'],
+      ['startup_failure', 'startup_failure'],
+      ['neutral', 'neutral'],
+      ['skipped', 'skipped'],
+      ['action_required', 'action_required'],
+      ['completed with no conclusion at all', null],
+    ])('refuses when an older run of the same workflow ended %s', (_case, conclusion) => {
       const root = tempRoot();
       const result = mergeCheck(
         root,
-        (r) => {
-          const run = { ...workflowRun('CI', 'completed', 'failure'), run_attempt: 2 };
-          writeJson(r, `jobs--${run.id as number}.json`, {
-            total_count: 1,
-            jobs: [actionsJob(false, 'failure', run.id as number)],
-          });
-          writeJson(r, `jobs--${run.id as number}--attempt-1.json`, {
-            total_count: 1,
-            jobs: [actionsJob(true, 'failure', run.id as number)],
-          });
-          return [run];
-        },
+        (r) => [
+          workflowRun('CI', 'completed', conclusion, '2026-09-05T00:01:00Z'),
+          failedRun(r, false, 'CI', '2026-09-05T00:05:00Z'),
+        ],
         [commitStatus(HOST, 'success')],
       );
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('ci_red: CI=failure (required)');
+    });
+
+    it('still allows when the older run of the same workflow SUCCEEDED', () => {
+      const root = tempRoot();
+      const result = mergeCheck(
+        root,
+        (r) => [
+          workflowRun('CI', 'completed', 'success', '2026-09-05T00:01:00Z'),
+          failedRun(r, false, 'CI', '2026-09-05T00:05:00Z'),
+        ],
+        [commitStatus(HOST, 'success')],
+      );
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('ci=host');
+    });
+
+    it('refuses when an earlier ATTEMPT of the same run really failed', () => {
+      const root = tempRoot();
+      const result = mergeCheck(root, (r) => [rerunRun(r, [true, false])], [commitStatus(HOST, 'success')]);
       expect(result.status).toBe(24);
       expect(result.stderr).toContain('ci_red: CI=failure (required)');
     });
 
     it('refuses when an earlier attempt cannot be read at all', () => {
       const root = tempRoot();
-      const result = mergeCheck(
-        root,
-        (r) => {
-          const run = { ...workflowRun('CI', 'completed', 'failure'), run_attempt: 2 };
-          writeJson(r, `jobs--${run.id as number}.json`, {
-            total_count: 1,
-            jobs: [actionsJob(false, 'failure', run.id as number)],
-          });
-          // No jobs--<id>--attempt-1.json: the read 404s.
-          return [run];
-        },
-        [commitStatus(HOST, 'success')],
-      );
+      const result = mergeCheck(root, (r) => [rerunRun(r, [undefined, false])], [commitStatus(HOST, 'success')]);
       expect(result.status).toBe(24);
       expect(result.stderr).toContain('ci_red: CI=failure (required)');
     });
 
     it('still allows when every attempt of the run never started', () => {
       const root = tempRoot();
-      const result = mergeCheck(
-        root,
-        (r) => {
-          const run = { ...workflowRun('CI', 'completed', 'failure'), run_attempt: 2 };
-          for (const name of [`jobs--${run.id as number}.json`, `jobs--${run.id as number}--attempt-1.json`])
-            writeJson(r, name, { total_count: 1, jobs: [actionsJob(false, 'failure', run.id as number)] });
-          return [run];
-        },
-        [commitStatus(HOST, 'success')],
-      );
+      const result = mergeCheck(root, (r) => [rerunRun(r, [false, false])], [commitStatus(HOST, 'success')]);
       expect(result.status).toBe(0);
       expect(result.stdout).toContain('ci=host');
     });
@@ -5761,6 +5789,10 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
         changesRequested?: string[];
         unattributed?: boolean;
         head?: string;
+        // GitHub's own computed review state. `null` — the default, and what a
+        // repo whose rules require no review reports — is what the existing
+        // ready-path fixtures need.
+        reviewDecision?: string | null;
       };
       function prPage(pr: Pr = {}): Page {
         const reviews = [
@@ -5773,6 +5805,7 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
               pullRequest: {
                 headRefOid: pr.head ?? HEAD,
                 author: { login: 'author' },
+                reviewDecision: pr.reviewDecision ?? null,
                 reviewThreads: {
                   totalCount: (pr.threads ?? []).length,
                   nodes: (pr.threads ?? []).map((isResolved) => ({ isResolved })),
@@ -5817,10 +5850,28 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
         ],
         ['an unresolved review thread', GREEN, { threads: [true, false] }, '1 unresolved review thread(s)'],
         [
-          'an unattributed commit, which needs an approving review',
+          'an unattributed commit, which owes an extra approving review',
           GREEN,
           { unattributed: true },
-          '1 approving review(s) required (one because 1 commit(s) have no GitHub-attributed author)',
+          'an extra approving review is required because 1 commit(s) have no GitHub-attributed author',
+        ],
+        [
+          'GitHub still requiring review',
+          GREEN,
+          { reviewDecision: 'REVIEW_REQUIRED' },
+          'GitHub reports reviewDecision=REVIEW_REQUIRED',
+        ],
+        [
+          'GitHub reporting changes requested',
+          GREEN,
+          { reviewDecision: 'CHANGES_REQUESTED' },
+          'GitHub reports reviewDecision=CHANGES_REQUESTED',
+        ],
+        [
+          'a review decision GitHub added after this was written',
+          GREEN,
+          { reviewDecision: 'SOMETHING_NEW' },
+          'GitHub reports reviewDecision=SOMETHING_NEW',
         ],
         [
           'changes requested by a reviewer',
@@ -5852,40 +5903,35 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
         expect(result.stdout).not.toContain('admin=');
       });
 
-      // #937 B3. GitHub counts an approving review only from an account with
-      // write access, and nothing here reads permissions — so an approval that
-      // looks like it satisfies the rule may not, and counting it would answer
-      // `ready` on a merge GitHub still holds. Any positive requirement is
-      // not-ready instead, approvals or no approvals. No repo in this fleet
-      // requires one (davekim917/nanoclaw is a free-plan private repo with no
-      // rulesets available at all; Illysium-ai/XZO's ruleset 21204871 has
-      // required_approving_review_count: 0), so this refuses nothing today.
-      it('does not count approvals: any required approving review is not-ready', () => {
-        expect(admin(tempRoot(), GREEN, { unattributed: true, approvals: ['reviewer'] }).stdout).toContain(
-          'admin=not-ready',
-        );
-        expect(admin(tempRoot(), GREEN, { unattributed: true, approvals: ['reviewer'] }).stdout).toContain(
-          'GitHub counts only approvals from accounts with write access',
-        );
-        expect(admin(tempRoot(), GREEN, { unattributed: true, approvals: ['author'] }).stdout).toContain(
-          'admin=not-ready',
-        );
-        // …and with nothing requiring one, it is still ready.
-        expect(admin(tempRoot(), GREEN, { approvals: ['reviewer'] }).stdout).toContain('admin=ready');
-      });
-
-      // #937 B3, the other half: a required_approving_review_count on its own,
-      // with no unattributed commit, is refused too.
-      it('is not ready when the rules require an approving review outright', () => {
+      // #937 B3. `reviewDecision` is GitHub's own answer to "is the review
+      // requirement met", and it already counts only write-access approvals —
+      // so this asks it instead of counting approvals itself. Verified live:
+      // `PullRequest.reviewDecision` exists with enum
+      // CHANGES_REQUESTED | APPROVED | REVIEW_REQUIRED.
+      it('takes reviewDecision as the authority instead of counting approvals', () => {
+        // A rule that requires an approval, with GitHub saying it is met.
         const rules = RULES.map((rule) =>
           rule.type === 'pull_request'
             ? { ...rule, parameters: { ...(rule.parameters as Page), required_approving_review_count: 1 } }
             : rule,
         );
-        const result = admin(tempRoot(), GREEN, { approvals: ['reviewer'] }, rules);
+        expect(admin(tempRoot(), GREEN, { reviewDecision: 'APPROVED' }, rules).stdout).toContain('admin=ready');
+        // The same rule with GitHub saying it is not.
+        expect(admin(tempRoot(), GREEN, { reviewDecision: 'REVIEW_REQUIRED' }, rules).stdout).toContain(
+          'admin=not-ready',
+        );
+        // And no arithmetic of our own: an approving review with no decision
+        // from GitHub neither creates nor satisfies a requirement.
+        expect(admin(tempRoot(), GREEN, { approvals: ['reviewer'] }, rules).stdout).toContain('admin=ready');
+      });
+
+      // The one approval fact kept out of reviewDecision's hands: whether that
+      // rulesets-only parameter feeds reviewDecision could not be verified on
+      // any repo available here, so it stays its own fail-closed check.
+      it('still refuses the extra approval an unattributed commit owes, whatever reviewDecision says', () => {
+        const result = admin(tempRoot(), GREEN, { unattributed: true, reviewDecision: 'APPROVED' });
         expect(result.stdout).toContain('admin=not-ready');
-        expect(result.stdout).toContain('1 approving review(s) required');
-        expect(result.stdout).not.toContain('one because');
+        expect(result.stdout).toContain('an extra approving review is required because 1 commit(s)');
       });
 
       // #937 B1. A CHANGES_REQUESTED review is a hold --admin lifts, and the
