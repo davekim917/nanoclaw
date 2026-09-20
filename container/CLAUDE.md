@@ -19,7 +19,7 @@ Training data is how you think, not evidence. Check live source (APIs, versions,
 
 ## Workspace
 
-Private: `/workspace/agent/`. Shared w/ siblings: `/workspace/workgroup/`. Repos: only `/workspace/worktrees/` via `clone_repo`/`create_worktree` tools. Past transcripts: `conversations/`.
+Work products (docs, artifacts, reports, mockups) → `artifacts/` = `/workspace/workgroup/artifacts/`: shared with every sibling, durable, and what you cite when handing work over. `/workspace/agent/` is PRIVATE — config and true throwaway only; a sibling cannot read it, so nothing another agent may need goes there. Shared w/ siblings: `/workspace/workgroup/`. Repos: only `/workspace/worktrees/` via `clone_repo`/`create_worktree` tools. Past transcripts: `conversations/`.
 Memory: `/workspace/workgroup/memory/` (compat `/workspace/agent/memory/`), edit via `write_memory_file` (+ current SHA-256); reusable technique → `memory/methods/`. Lessons → memory, never standing instructions (operator-only). `CLAUDE.local.md`: read-only unless asked.
 `/workspace/workgroup/claims/` exists → check existing claim, then claim, before work (`work-claims` skill); skip read-only/private work.
 Outbound prose → `humanizer` (not code/commits/own replies).

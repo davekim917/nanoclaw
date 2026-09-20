@@ -6,6 +6,11 @@
  *    - logs/migration-036.log (pairings, standalone, suffix_strip_unmatched)
  *    - logs/migration-036-secrets.log (per-workgroup intersection of member secrets)
  *    Then DROP the temp table.
+ * 2. Guarantee the shared work-product directory, and each member's compat
+ *    link to it, for every workgroup whose `/workspace/workgroup` mount is
+ *    actually made (`ensureWorkgroupWorkDirs` applies the mount's own
+ *    predicate per workgroup; a link to an unmounted target is worse than no
+ *    link).
  * Idempotent — re-running on already-reconciled state is a no-op. On FS failure, throws
  * (caller in src/index.ts logs and exits process.exit(1)).
  */
@@ -16,6 +21,7 @@ import type Database from 'better-sqlite3';
 
 import { log } from '../../log.js';
 import { readContainerConfig } from '../../container-config.js';
+import { ensureWorkgroupWorkDirs } from './shared-dirs.js';
 
 export function reconcileWorkgroupFsState(db: Database.Database): void {
   // ── 1. Drain migration-036 report if present ──────────────────────────
@@ -43,6 +49,15 @@ export function reconcileWorkgroupFsState(db: Database.Database): void {
     db.prepare(`DROP TABLE _migration036_report`).run();
     log.info('reconcileWorkgroupFsState: drained migration-036 report');
   }
+
+  // ── 2. Shared work-product directory + per-member compat links ─────────
+  // Runs on every boot, unlike the one-time report drain above: a workgroup or
+  // member added since the last boot needs it. Which workgroups it acts on is
+  // decided inside, by the mount predicate. One member losing a race, or one
+  // unusable workgroup row, warns and is skipped rather than stopping the host
+  // booting. The one uncontained throw is the workgroups enumeration itself:
+  // an unreadable central DB is fail-closed here, exactly as it is for step 1.
+  ensureWorkgroupWorkDirs(db);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

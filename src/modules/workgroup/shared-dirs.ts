@@ -29,7 +29,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-import { DATA_DIR, GROUPS_DIR } from '../../config.js';
+import { DATA_DIR, GROUPS_DIR, WORKGROUP_SHARED_FS } from '../../config.js';
 import type { RawStatements } from '../../db/central-lease.js';
 import { log } from '../../log.js';
 
@@ -82,10 +82,25 @@ export interface WorkgroupMemoryDirs {
 }
 
 const MEMORY_MANIFEST = '.memory-migration.json';
+/**
+ * The per-workgroup consolidation marker. Also the second half of the
+ * `/workspace/workgroup` mount predicate in container-runner.ts: the mount is
+ * made when `WORKGROUP_SHARED_FS` is set OR this file is present, so a
+ * workgroup migrated before the flag was turned off keeps its mount.
+ */
+const MIGRATION_MARKER = '.migrated';
 // Canonical memory has its own lossless inventory/migration/reconciliation
 // lifecycle below. The older generic shared-directory migrator must never move,
 // adopt, repoint, or report this name, even during crash recovery.
-const RESERVED_SHARED_DIR_NAMES = new Set(['memory']);
+/** The workgroup's shared work-product directory, in the house rather than a bedroom. */
+export const SHARED_WORK_DIR_NAME = 'artifacts';
+// `memory` has its own lifecycle (above); `artifacts` is created empty and
+// ahead of the migrator by `ensureWorkgroupWorkDirs`, which breaks the move
+// loop's premise that a present `dst` is a COMPLETE one (the interrupted-move
+// branch at the `isRealDir(src)` arm deletes `src` on that basis). Reserving
+// the name keeps it out of every discovery source, including the wgDir
+// crash-recovery scan that would otherwise re-add it on every boot.
+const RESERVED_SHARED_DIR_NAMES = new Set(['memory', SHARED_WORK_DIR_NAME]);
 const MEMORY_TEMPLATES_DIR = fileURLToPath(
   new URL('../../../container/agent-runner/src/memory/templates/', import.meta.url),
 );
@@ -652,7 +667,7 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
   if (!plan) return; // no seed data to consolidate
   const { seedDir, wgDir, siblingFolders, shared, candidates } = plan;
 
-  const markerPath = path.join(wgDir, '.migrated');
+  const markerPath = path.join(wgDir, MIGRATION_MARKER);
   // RE-RUNS EVERY STARTUP, deliberately. This used to `return` here on the
   // marker, which made the shared tree a one-shot snapshot of whenever it first
   // ran. On one install a workgroup's marker predated a later seed dir by two
@@ -772,6 +787,113 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
     /* report log is best-effort */
   }
   log.info('reconcileWorkgroupSharedDirs: migrated', { workgroupId, moved: report.moved });
+}
+
+/**
+ * Guarantee every workgroup has ONE shared place for work products, reachable
+ * from every member's own folder.
+ *
+ * Why this cannot ride on `reconcileWorkgroupSharedDirs`: that pass only moves
+ * a directory it DISCOVERS, and every one of its three discovery sources reads
+ * existing state — a readdir of the seed member's folder (`planWorkgroupSharedDirs`,
+ * the `sources`/`conversations`/`isGitRepo` scan), the union of any dir a
+ * sibling already symlinks, and a readdir of `wgDir` for crash recovery. A
+ * workgroup whose seed never had this directory therefore never gets one, and
+ * every sibling writes work products into its own private `/workspace/agent`.
+ * That is the mechanism behind an agent reporting a sibling's file as
+ * unreachable.
+ *
+ * This function creates `data/workgroups/<id>/artifacts/` and links each member
+ * to it. `SHARED_WORK_DIR_NAME` is in `RESERVED_SHARED_DIR_NAMES`, so the
+ * generic migrator treats the name as owned here and never moves, adopts,
+ * repoints or reports it — without that, creating `dst` empty and ahead of the
+ * migrator makes its `existsSync(dst)` arm read "interrupted move" and delete a
+ * seed's real `artifacts/`.
+ *
+ * Gated per workgroup on the SAME predicate as the `/workspace/workgroup` mount
+ * (`WORKGROUP_SHARED_FS`, or a `.migrated` marker): without that mount the link
+ * target does not exist in the container, and `container/CLAUDE.md` would be
+ * sending work products into container-local storage that `--rm` destroys.
+ *
+ * Links only where nothing is there. `ensureCompatSymlink` replaces any
+ * non-matching symlink, which is correct for its own callers — they repoint a
+ * name AFTER moving its content — but wrong here, where nothing is moved: a
+ * member whose `artifacts` is a host-resolvable relative link would be
+ * retargeted at an empty directory and its content left unreachable.
+ *
+ * Idempotent, and cheap enough to run on every boot: a settled workgroup does
+ * one `mkdirSync` on an existing dir plus one `lstat` per member.
+ */
+export function ensureWorkgroupWorkDirs(db: RawStatements, dirs: { groupsDir?: string; dataDir?: string } = {}): void {
+  const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
+  const dataDir = dirs.dataDir ?? DATA_DIR;
+  const target = `${WORKGROUP_CONTAINER_PATH}/${SHARED_WORK_DIR_NAME}`;
+  const workgroups = db.prepare(`SELECT id FROM workgroups`).all() as Array<{ id: string }>;
+  for (const wg of workgroups) {
+    // Per workgroup, because this runs BEFORE runBootMountQuiescence proves
+    // container absence (src/main.ts) — every check-then-act below spans a
+    // window in which the previous host's containers still hold these
+    // directories read-write. An agent creating `artifacts` between the lstat
+    // and the symlinkSync is an EEXIST, and one uncaught throw here is
+    // `process.exit(1)` in reconcileWorkgroupFsState's caller: a whole host
+    // that will not boot because one member lost one race. Nothing here is
+    // destructive and the next boot's lstat sees the entry, so warn and carry
+    // on. A bad `workgroups` row is caught the same way rather than being
+    // permanently fatal.
+    try {
+      ensureOneWorkgroupWorkDir(db, wg.id, { groupsDir, dataDir, target });
+    } catch (err) {
+      log.warn('ensureWorkgroupWorkDirs: skipped workgroup', { workgroupId: wg.id, err });
+    }
+  }
+}
+
+function ensureOneWorkgroupWorkDir(
+  db: RawStatements,
+  workgroupId: string,
+  ctx: { groupsDir: string; dataDir: string; target: string },
+): void {
+  assertTrustedPathSegment(workgroupId, 'workgroup id');
+  const wgDir = workgroupSharedDir(workgroupId, ctx.dataDir);
+  // Same predicate as the mount in container-runner.ts. A link whose target
+  // is not mounted is worse than no link.
+  if (!WORKGROUP_SHARED_FS && !fs.existsSync(path.join(wgDir, MIGRATION_MARKER))) return;
+  fs.mkdirSync(path.join(wgDir, SHARED_WORK_DIR_NAME), { recursive: true });
+  const members = db.prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`).all(workgroupId) as Array<{
+    folder: string;
+  }>;
+  for (const member of members) {
+    assertTrustedPathSegment(member.folder, 'agent group folder');
+    const memberDir = path.join(ctx.groupsDir, member.folder);
+    // A member whose folder has not been created yet is not an error: the
+    // group's first spawn runs initGroupFilesystem, and the next boot links
+    // it. Creating the folder here would race that scaffold.
+    if (!fs.existsSync(memberDir)) continue;
+    const linkPath = path.join(memberDir, SHARED_WORK_DIR_NAME);
+    const st = lstatOrNull(linkPath);
+    if (st) {
+      if (st.isSymbolicLink() && safeReadlink(linkPath) === ctx.target) continue; // already correct
+      // Anything else — a real dir, or a link addressing something this
+      // function did not put there — is somebody's content. Say so and leave
+      // it. A member that keeps its own real directory here does NOT share it:
+      // its agent still reads the instruction pointing at the shared tree, so
+      // this line is the only signal of the divergence.
+      log.warn('ensureWorkgroupWorkDirs: member already has an entry at the shared work dir name', {
+        workgroupId,
+        member: member.folder,
+        name: SHARED_WORK_DIR_NAME,
+        kind: st.isSymbolicLink() ? `symlink -> ${safeReadlink(linkPath) ?? '?'}` : 'real entry',
+      });
+      continue;
+    }
+    try {
+      fs.symlinkSync(ctx.target, linkPath);
+    } catch (err) {
+      // Lost the lstat→symlink race with a live container. Not destructive;
+      // the next boot's lstat takes the branch above.
+      log.warn('ensureWorkgroupWorkDirs: could not link member', { workgroupId, member: member.folder, err });
+    }
+  }
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
