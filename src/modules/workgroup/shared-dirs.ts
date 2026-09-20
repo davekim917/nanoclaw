@@ -774,6 +774,54 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
   log.info('reconcileWorkgroupSharedDirs: migrated', { workgroupId, moved: report.moved });
 }
 
+/** The workgroup's shared work-product directory, in the house rather than a bedroom. */
+export const SHARED_WORK_DIR_NAME = 'artifacts';
+
+/**
+ * Guarantee every workgroup has ONE shared place for work products, reachable
+ * from every member's own folder.
+ *
+ * Why this cannot ride on `reconcileWorkgroupSharedDirs`: that pass only shares
+ * a directory that ALREADY EXISTS as a real dir in the seed member's group
+ * folder — its candidate set is a readdir of that folder (the `shared`/
+ * `candidates` scan above), and it is additionally gated on
+ * `workgroupNeedsConsolidation`. So a workgroup that was consolidated before
+ * this directory existed, or created after it, gets nothing, and every sibling
+ * writes work products into its own private `/workspace/agent`. That is the
+ * mechanism behind an agent reporting a sibling's file as unreachable.
+ *
+ * Creates `data/workgroups/<id>/artifacts/` and drops the same
+ * container-absolute compat symlink every other shared dir uses into each
+ * member's group folder, so a relative `artifacts/` written from the
+ * container's working directory (`/workspace/agent`) resolves through the
+ * `/workspace/workgroup` mount. Nothing is moved and nothing is read: a member
+ * holding a REAL entry at that name keeps it, because `ensureCompatSymlink`
+ * warns and refuses rather than clobbering.
+ *
+ * Idempotent, and cheap enough to run on every boot: a settled workgroup does
+ * one `mkdirSync` on an existing dir plus one `lstat` per member.
+ */
+export function ensureWorkgroupWorkDirs(db: RawStatements, dirs: { groupsDir?: string; dataDir?: string } = {}): void {
+  const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
+  const dataDir = dirs.dataDir ?? DATA_DIR;
+  const workgroups = db.prepare(`SELECT id FROM workgroups`).all() as Array<{ id: string }>;
+  for (const wg of workgroups) {
+    const wgDir = workgroupSharedDir(wg.id, dataDir);
+    fs.mkdirSync(path.join(wgDir, SHARED_WORK_DIR_NAME), { recursive: true });
+    const members = db.prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`).all(wg.id) as Array<{
+      folder: string;
+    }>;
+    for (const member of members) {
+      const memberDir = path.join(groupsDir, member.folder);
+      // A member whose folder has not been created yet is not an error: the
+      // group's first spawn runs initGroupFilesystem, and the next boot links
+      // it. Creating the folder here would race that scaffold.
+      if (!fs.existsSync(memberDir)) continue;
+      ensureCompatSymlink(memberDir, SHARED_WORK_DIR_NAME);
+    }
+  }
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 function isGitRepo(dir: string): boolean {

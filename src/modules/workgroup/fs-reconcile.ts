@@ -6,6 +6,8 @@
  *    - logs/migration-036.log (pairings, standalone, suffix_strip_unmatched)
  *    - logs/migration-036-secrets.log (per-workgroup intersection of member secrets)
  *    Then DROP the temp table.
+ * 2. Guarantee every workgroup's shared work-product directory and each
+ *    member's compat link to it (`ensureWorkgroupWorkDirs`).
  * Idempotent — re-running on already-reconciled state is a no-op. On FS failure, throws
  * (caller in src/index.ts logs and exits process.exit(1)).
  */
@@ -16,6 +18,7 @@ import type Database from 'better-sqlite3';
 
 import { log } from '../../log.js';
 import { readContainerConfig } from '../../container-config.js';
+import { ensureWorkgroupWorkDirs } from './shared-dirs.js';
 
 export function reconcileWorkgroupFsState(db: Database.Database): void {
   // ── 1. Drain migration-036 report if present ──────────────────────────
@@ -43,6 +46,11 @@ export function reconcileWorkgroupFsState(db: Database.Database): void {
     db.prepare(`DROP TABLE _migration036_report`).run();
     log.info('reconcileWorkgroupFsState: drained migration-036 report');
   }
+
+  // ── 2. Shared work-product directory + per-member compat links ─────────
+  // Unconditional: unlike the report drain above this is not a one-time
+  // migration, and a workgroup or member added since the last boot needs it.
+  ensureWorkgroupWorkDirs(db);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
