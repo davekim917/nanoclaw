@@ -1603,7 +1603,10 @@ task at `scripts/smoke-controller-live.sh`, the controller drives new PR
 campaigns itself: the gate verbs, chat posts, GitHub writes and one-shots are
 its job, and the retained owner only does the judgment step it is woken for,
 per `references/controller-owner-router.md`. Runs claimed before that flip
-finish under the coordinator flow above.
+finish under the coordinator flow above. A fire that cannot complete wakes the
+owner with a `failure` slug instead of a step; the owner then posts one
+operator alarm and takes no campaign action — same router file, "A failure
+wake".
 
 - **Challenger**: in the `challenger/challenge.complete.json` it already
   writes, add `dissents`: one entry per disputed finding, `[{"id": "<finding

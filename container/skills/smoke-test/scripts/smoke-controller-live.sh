@@ -15,7 +15,7 @@
 #   2. validates the whole journal (`controller validate`: torn tail, record
 #      schema, born and per-record mode) under control.lock. An invalid
 #      journal stops the fire BEFORE any gate effect: no progress stamp, no
-#      poll, one chat alarm per day straight through enqueue-send;
+#      poll, and the fire reports itself as a failure wake;
 #   3. on the first live fire, writes <out>/cutover.json naming every run the
 #      gate has claimed right now: those finish under the legacy coordinator
 #      and the controller never acts on them. Written once, never rewritten;
@@ -34,10 +34,28 @@
 #      alarm; entries the journal holds are then removed from the queue.
 #
 # Output: the LAST stdout line is always {"wakeAgent":<bool>,"data":{...}}.
-# wakeAgent is true ONLY when the step returned an owner judgment step, and
-# then data carries {step, runId, brief} (the brief is
-# <run>/controller/brief-<step>.md) for the owner router prompt. Everything
-# else -- a skipped fire, a crash, a timeout -- is wakeAgent:false.
+# It wakes the owner for exactly two reasons:
+#   - a due owner judgment step: data carries {step, runId, brief} (the brief
+#     is <run>/controller/brief-<step>.md) for the owner router prompt;
+#   - a fire that failed closed: data carries {failure, detail, fire}, and the
+#     owner posts ONE operator alarm and takes no campaign action
+#     (references/controller-owner-router.md). This is the wrapper's only
+#     reporting mechanism -- it posts nothing itself, because a fire that
+#     cannot complete cannot be trusted to run a send either.
+# Only the two named non-failure ends -- the completed step and the kill
+# switch being off -- are wakeAgent:false.
+#
+# What that does NOT cover, and is accepted: a fire whose whole task script is
+# killed prints no line at all, so it reports nothing -- the host discards the
+# output and resolves the occurrence `failed` with no wake
+# (src/modules/scheduling/host-script.ts:361, 383, 490-499). Only those
+# unreported fires feed the failure streak that auto-pauses the series after 8
+# and notifies the owner (src/modules/scheduling/recurrence.ts:128-147): a
+# REPORTED failure is a wakeAgent:true occurrence, which the container resolves
+# completed, so it never counts toward that streak and never backs off. A
+# persistent reported fault therefore wakes the owner every fire, by design;
+# the owner's per-cause daily send id is what keeps it to one post a day
+# (container/agent-runner/src/cli/enqueue-send.ts:24-28, a replay).
 #
 # Guarantees (as the shadow wrapper, smoke-controller-shadow.sh):
 #   - stdout moves to fd 3 on the first line; only final() writes there.
@@ -59,16 +77,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 final() { # <data-json> -- the only write to the runner's stdout
   local data="${1:-}"
   if ! jq -e 'type == "object"' <<<"$data" >/dev/null 2>&1; then
-    data="$(jq -cn --arg e "fire summary missing or not JSON" '{error:$e}' 2>/dev/null)" || data='{}'
+    data="$(jq -cn --arg d "the fire printed no usable summary; see the task's stderr" --arg fire "${NOW:-}" \
+      '{failure:"worker-output-invalid",detail:$d,fire:$fire,stepped:false,
+        note:"this cause repeats every fire while it persists, so you may have reported it already: post the alarm under the same per-cause daily id, which replays instead of duplicating"}' 2>/dev/null)" ||
+      data='{"failure":"worker-output-invalid","detail":"the fire printed no usable summary","stepped":false}'
   fi
-  # Wake only for a well-formed owner step, and put {step, runId, brief} on top.
+  # Two reasons to wake: a well-formed owner step (with {step, runId, brief} on
+  # top), or ANY fire that failed closed -- `failure` is the wrapper's whole
+  # reporting mechanism, so it must never be rendered as a quiet false.
   jq -cn --argjson d "$data" '
     ($d.ownerWake // null) as $w
     | if ($w | type) == "object" and ($w.step | type) == "string" and ($w.runId | type) == "string"
          and ($w.brief | type) == "string" and $d.stepped == true
       then {wakeAgent:true, data:({step:$w.step, runId:$w.runId, brief:$w.brief} + ($d | del(.ownerWake)))}
+      elif ($d.failure | type) == "string" and ($d.failure | length) > 0
+      then {wakeAgent:true, data:($d | del(.ownerWake))}
       else {wakeAgent:false, data:$d} end' >&3 2>/dev/null ||
-    printf '%s\n' '{"wakeAgent":false,"data":{"error":"final line could not be rendered"}}' >&3
+    printf '%s\n' '{"wakeAgent":true,"data":{"failure":"final-line-unrenderable","detail":"the fire summary could not be rendered (jq unavailable or refused)"}}' >&3
   exit 0
 }
 
@@ -92,13 +117,18 @@ export PYTHONDONTWRITEBYTECODE=1
 
 DATA="$(timeout -k 2 "$BUDGET" python3 "$SCRIPT_DIR/smoke-controller-live-worker.py")"
 RC=$?
+NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if [ -z "$DATA" ]; then
+  # The worker never got to speak. That is a failure like any other, and it
+  # carries the same {failure, detail, fire} the worker's own ends do, so
+  # final() wakes the owner instead of reporting a silent false.
   case "$RC" in
-    124|137) WHY="fire exceeded its budget and was killed" ;;
-    *) WHY="wrapper failed before its summary (see stderr)" ;;
+    124|137) WHY="fire exceeded its budget and was killed"; SLUG="fire-killed" ;;
+    *) WHY="wrapper failed before its summary (see stderr)"; SLUG="worker-no-output" ;;
   esac
-  DATA="$(jq -cn --argjson rc "$RC" --arg why "$WHY" --arg fire "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{mode:null,fire:$fire,stepped:false,skipped:$why,rc:$rc}' 2>/dev/null)"
+  DATA="$(jq -cn --argjson rc "$RC" --arg why "$WHY" --arg slug "$SLUG" --arg fire "$NOW" \
+    '{mode:null,fire:$fire,stepped:false,skipped:$why,failure:$slug,detail:$why,rc:$rc,
+      note:"this cause repeats every fire while it persists, so you may have reported it already: post the alarm under the same per-cause daily id, which replays instead of duplicating"}' 2>/dev/null)"
 fi
 DATA="$(printf '%s\n' "$DATA" | tail -n 1)"
 if [ -n "$BUDGET_REJECTED" ]; then

@@ -411,6 +411,43 @@ def write_contained_once(root, parts, data):
     return path, created
 
 
+def unlink_contained(root, parts):
+    """Remove root/<parts...> through the same O_NOFOLLOW walk as the writes:
+    the leaf is unlinked relative to a directory fd no symlinked component
+    could have redirected, so a swapped directory cannot carry a delete
+    outside root (Codex PR #945 round 5, finding 4). An absent leaf, or an
+    absent/refused parent, is not an error -- there is nothing to remove."""
+    try:
+        dfd = _open_dir_contained(root, parts[:-1], make_dirs=False)
+    except (OSError, ControllerError):
+        return False
+    try:
+        os.unlink(parts[-1], dir_fd=dfd)
+        return True
+    except (FileNotFoundError, IsADirectoryError):
+        return False
+    finally:
+        os.close(dfd)
+
+
+def listdir_contained(root, parts):
+    """Sorted names in root/<parts...>, listed through the O_NOFOLLOW walk. A
+    directory that does not exist is []; one that cannot be walked or read --
+    a symlink, a permission refusal -- RAISES, because reading "empty" off an
+    unreadable directory is how state silently disappears (round 5, finding
+    3)."""
+    try:
+        dfd = _open_dir_contained(root, parts, make_dirs=False)
+    except ControllerError:
+        if not os.path.lexists(os.path.join(root, *parts)):
+            return []
+        raise
+    try:
+        return sorted(os.listdir(dfd))
+    finally:
+        os.close(dfd)
+
+
 # ---------------------------------------------------------------------------
 # journal
 

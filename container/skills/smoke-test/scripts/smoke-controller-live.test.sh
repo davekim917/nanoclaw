@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Tests for smoke-controller-live.sh, the LIVE task-script wrapper: the final
-# line contract (wakeAgent true ONLY for a due owner step, with {step, runId,
-# brief}), the kill switch (not live = nothing runs), the cutover file written
-# once before the first poll, the claimant the poll runs with, progress before
-# poll, receipts read from the session's inbound.db, a hard budget, and poll
-# failures that still step.
+# line contract (wakeAgent true for a due owner step, with {step, runId,
+# brief}, OR for a fire that failed closed, with {failure, detail, fire, note};
+# false only for the two named non-failure ends), the kill switch (not live =
+# nothing runs), the cutover file written once before the first poll, the
+# claimant the poll runs with, progress before poll, receipts read from the
+# session's inbound.db, a hard budget, and poll failures that still step.
+# The wrapper posts nothing itself: the owner does, on a failure wake.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -123,20 +125,30 @@ done
 new_case misconfigured
 write_env live skip-send-to
 fire
-[ "$WAKE" = false ] && [ "$(d '.misconfigured[0]')" = SMOKE_CONTROLLER_SEND_TO ] || fail "live without a destination: $OUTPUT"
+[ "$WAKE" = true ] && [ "$(d .failure)" = misconfigured ] && [ "$(d '.misconfigured[0]')" = SMOKE_CONTROLLER_SEND_TO ] \
+  || fail "live without a destination: $OUTPUT"
+[ -n "$(d .detail)" ] && [ "$(d .detail)" != null ] && [ "$(d .fire)" != null ] \
+  || fail "every failure carries {failure, detail, fire}: $OUTPUT"
 [ ! -s "$FAKE_LOG" ] || fail "a misconfigured live fire must call nothing"
+# Codex round-5 finding 2: a fault BEFORE the out-dir resolves used to bypass
+# the ledger silently. It is now the same wake as any other.
+new_case early-fault
+rm -f "$C/bin/gate.sh"
+fire
+[ "$WAKE" = true ] && [ "$(d .failure)" = misconfigured ] && [ ! -e "$OUT" ] \
+  || fail "a fault before the out-dir resolves still reports: $OUTPUT"
 
 new_case claimant-in-env
 echo "export SMOKE_GATE_CLAIMANT=controller" >>"$C/env.sh"
 fire
-[ "$WAKE" = false ] && [ "$(d '.misconfigured[0]')" = SMOKE_GATE_CLAIMANT ] \
+[ "$WAKE" = true ] && [ "$(d .failure)" = misconfigured ] && [ "$(d '.misconfigured[0]')" = SMOKE_GATE_CLAIMANT ] \
   || fail "a claimant in the shared env file would tag legacy gate calls: $OUTPUT"
-# Fail-closed: no gate/gh/ncl call at all; its one effect is the per-day
-# wrapper-error alarm (review round 3: every fail-closed end alarms).
-calls '[.[] | select(.tool != "enqueue")] | length == 0' | grep -qx true \
-  || fail "a claimant in the env file must call nothing but the alarm: $(cat "$FAKE_LOG")"
-[ "$(jq '.messages | keys | map(select(startswith("ctl.wrapper-error."))) | length' "$C/fake/enqueue.json")" = 1 ] \
-  || fail "a misconfigured live fire posts its wrapper-error alarm: $OUTPUT"
+# Fail-closed: no call of any kind. The wrapper does not post -- the wake is
+# the report (review round 5: the alarm ledger and the wrapper's own send are
+# deleted; the owner posts).
+calls 'length == 0' | grep -qx true \
+  || fail "a claimant in the env file must call nothing at all: $(cat "$FAKE_LOG")"
+[ ! -e "$C/fake/enqueue.json" ] || fail "the wrapper never enqueues anything itself: $(cat "$C/fake/enqueue.json")"
 
 # --- first live fire: cutover before poll, claim, intake wake --------------------
 new_case flip
@@ -205,13 +217,14 @@ for variant in torn schema; do
   fi
   : >"$FAKE_LOG"
   fire
-  [ "$WAKE" = false ] && [ "$(d .alarm)" = controller_journal_error ] || fail "$variant journal: fails closed: $OUTPUT"
+  [ "$WAKE" = true ] && [ "$(d .failure)" = journal-invalid ] && [ "$(d .alarm)" = controller_journal_error ] \
+    || fail "$variant journal: fails closed and reports: $OUTPUT"
   calls '[.[] | select(.tool=="gate")] | length == 0' | grep -qx true \
     || fail "$variant journal: no progress stamp and no poll on an invalid journal: $(cat "$FAKE_LOG")"
-  [ "$(jq '.messages | keys | map(select(startswith("ctl.journal-invalid."))) | length' "$C/fake/enqueue.json")" = 1 ] \
-    || fail "$variant journal: one alarm post"
+  [ ! -e "$C/fake/enqueue.json" ] || fail "$variant journal: the wrapper posts nothing itself"
   fire
-  [ "$(jq '.messages | length' "$C/fake/enqueue.json")" = 1 ] || fail "$variant journal: the alarm is not re-posted"
+  [ "$WAKE" = true ] && [ "$(d .failure)" = journal-invalid ] \
+    || fail "$variant journal: a persistent fault re-reports every fire: $OUTPUT"
   calls '[.[] | select(.tool=="gate")] | length == 0' | grep -qx true || fail "$variant journal: still no gate call"
 done
 
@@ -336,7 +349,8 @@ rm "$C/env.sh"
 mkfifo "$C/env.sh"   # opening it blocks the worker forever
 fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6
 [ "$ELAPSED" -le 9 ] || fail "a hung worker overran a 6 s budget: ${ELAPSED}s"
-[ "$WAKE" = false ] && [ "$(d .skipped)" = "fire exceeded its budget and was killed" ] || fail "hung worker: $OUTPUT"
+[ "$WAKE" = true ] && [ "$(d .failure)" = fire-killed ] \
+  && [ "$(d .skipped)" = "fire exceeded its budget and was killed" ] || fail "hung worker: $OUTPUT"
 new_case budget
 for b in 08 0 1e3 200; do
   write_env off
@@ -346,16 +360,19 @@ done
 grep -q '^BUDGET_MAX=110$' "$W" && grep -q 'timeout -k 2 "\$BUDGET"' "$W" \
   || fail "hard kill must land by 110 + 2 s, under the runner's 120 s"
 
-# --- every fail-closed worker end alarms, once a day (review round 3) -------------
-# $1 case, $2 description. The fire must fail closed, call no gate verb,
-# and leave exactly one ctl.wrapper-error.<day> post however often it repeats.
-wrapper_alarmed() {
-  [ "$WAKE" = false ] && [ "$(d .failClosed)" = wrapper-error ] && [ "$(d .alarmSent)" = true ] \
-    || fail "$1: $2 must fail closed WITH its alarm: $OUTPUT"
+# --- every fail-closed worker end wakes the owner with its cause (round 5) --------
+# $1 case, $2 description, $3 expected failure slug. The fire must fail closed,
+# report itself as wakeAgent:true with {failure, detail, fire, note}, call no
+# gate verb, and post NOTHING itself -- the owner is the one that posts.
+wrapper_failed() {
+  [ "$WAKE" = true ] && [ "$(d .failure)" = "$3" ] \
+    || fail "$1: $2 must fail closed as a '$3' wake: $OUTPUT"
+  [ "$(d .detail)" != null ] && [ -n "$(d .detail)" ] && [ "$(d .fire)" != null ] && [ "$(d .note)" != null ] \
+    || fail "$1: the wake must carry {failure, detail, fire, note}: $OUTPUT"
   calls '[.[] | select(.tool=="gate" and .op=="poll")] | length == 0' | grep -qx true \
     || fail "$1: a fail-closed fire never polls: $(cat "$FAKE_LOG")"
-  [ "$(jq '.messages | keys | map(select(startswith("ctl.wrapper-error."))) | length' "$C/fake/enqueue.json")" = 1 ] \
-    || fail "$1: exactly one wrapper-error post: $(cat "$C/fake/enqueue.json")"
+  [ ! -e "$C/fake/enqueue.json" ] || [ "$(jq '.messages | length' "$C/fake/enqueue.json")" = 0 ] \
+    || fail "$1: the wrapper must post nothing: $(cat "$C/fake/enqueue.json")"
 }
 # Codex round-3 repro 2: an unreadable control.json after the cutover.
 new_case control-unreadable
@@ -363,16 +380,16 @@ fire
 printf '{"torn' >"$C/agent/state/control.json"
 : >"$FAKE_LOG"
 fire
-wrapper_alarmed control-unreadable "an unreadable control.json"
+wrapper_failed control-unreadable "an unreadable control.json" gate-control-unreadable
 fire
-wrapper_alarmed control-unreadable "a repeat of the same failure (same id, replayed, not re-posted)"
+wrapper_failed control-unreadable "a repeat of the same failure" gate-control-unreadable
 # Gate state unreadable.
 new_case state-unreadable
 fire
 printf 'not json' >"$C/agent/state/pr-7-state.json"
 : >"$FAKE_LOG"
 fire
-wrapper_alarmed state-unreadable "an unreadable pr state file"
+wrapper_failed state-unreadable "an unreadable pr state file" gate-state-unreadable
 # Another fire holds wrapper.lock.
 new_case lock-held
 fire
@@ -384,7 +401,7 @@ fire
   printf '%s\n' "$OUTPUT" >"$C/lock-out"
 )
 OUTPUT="$(cat "$C/lock-out")"; DATA="$(jq -c .data <<<"$OUTPUT")"; WAKE="$(jq -r .wakeAgent <<<"$OUTPUT")"
-wrapper_alarmed lock-held "a held wrapper.lock"
+wrapper_failed lock-held "a held wrapper.lock" lock-held
 # An input fetch that blocks the step (gh cannot read a head the run needs).
 new_case input-fails
 fire
@@ -393,73 +410,122 @@ jq -cn --arg run "$RUN" --arg sha "$SHA" --arg tok "$TOKEN" \
     challengerDeadline:"2099-01-01T00:00:00Z"}' >"$C/agent/state/pr-7-state.json"
 : >"$FAKE_LOG"
 fire SMOKE_CONTROLLER_LIVE_GH_CMD=false
-[ "$WAKE" = false ] && [ "$(d .failClosed)" = wrapper-error ] && [ "$(d .alarmSent)" = true ] \
-  && [ "$(jq '.messages | keys | map(select(startswith("ctl.wrapper-error."))) | length' "$C/fake/enqueue.json")" = 1 ] \
-  || fail "input-fails: a blocked input fetch fails closed with its alarm: $OUTPUT"
+[ "$WAKE" = true ] && [ "$(d .failure)" = input-fetch-failed ] && [ "$(d .note)" != null ] \
+  || fail "input-fails: a blocked input fetch fails closed and reports: $OUTPUT"
+[ ! -e "$C/fake/enqueue.json" ] || [ "$(jq '.messages | length' "$C/fake/enqueue.json")" = 0 ] \
+  || fail "input-fails: the wrapper posts nothing itself"
 # An exception nothing anticipated (wrapper/tmp is a file: makedirs raises).
 new_case uncaught
 fire
 rm -rf "$OUT/wrapper/tmp"; : >"$OUT/wrapper/tmp"
 : >"$FAKE_LOG"
 fire
-wrapper_alarmed uncaught "an uncaught exception"
+wrapper_failed uncaught "an uncaught exception" uncaught-exception
 d .skipped | grep -q '^uncaught FileExistsError' || fail "uncaught: routed through the excepthook: $OUTPUT"
-# A fire killed outright (after the worker's own deadline, so it had no time
-# to alarm) leaves wrapper/fire-open; the NEXT fire alarms for it and steps.
-new_case killed
+# A controller child that cannot answer (its own control.lock is held for
+# longer than the fire's --lock-timeout) is a failure too.
+new_case controller-refuses
+fire
+: >"$FAKE_LOG"
+(
+  exec 8>"$OUT/control.lock"
+  flock 8
+  fire
+  printf '%s\n' "$OUTPUT" >"$C/refused-out"
+)
+OUTPUT="$(cat "$C/refused-out")"; DATA="$(jq -c .data <<<"$OUTPUT")"; WAKE="$(jq -r .wakeAgent <<<"$OUTPUT")"
+[ "$WAKE" = true ] && [ "$(d .failure)" = journal-unvalidated ] && [ "$(d .stepped)" = false ] \
+  || fail "controller-refuses: a controller child that cannot answer fails closed: $OUTPUT"
+
+new_case killed-fire
 fire
 [ ! -e "$OUT/wrapper/fire-open" ] || fail "killed: a completed fire closes its marker"
 : >"$OUT/wrapper/fire-open"
 fire
-[ "$(d .previousFireUnclosed)" = true ] && [ "$(d '.alarmsOwedAtStart|tojson')" = '["wrapper-error"]' ] && [ "$(d .stepped)" = true ] \
-  || fail "killed: the next fire owes and posts the alarm for an unclosed one, then steps: $OUTPUT"
-[ "$(jq '.messages | keys | map(select(startswith("ctl.wrapper-error."))) | length' "$C/fake/enqueue.json")" = 1 ] \
-  && [ ! -e "$OUT/wrapper/fire-open" ] && [ ! -e "$OUT/wrapper/pending-alarms/wrapper-error" ] \
-  || fail "killed: one post, marker closed, debt settled"
-[ "$(d '.alarmsOwed|tojson')" = null ] || fail "killed: nothing still owed: $OUTPUT"
-# A fail-closed end whose alarm cannot be taken owes it in the LEDGER, so the
-# next fire re-offers it (same id) -- never lost to a failed enqueue.
-new_case alarm-unsent
-fire
-printf '{"torn' >"$C/agent/state/control.json"
-fire SMOKE_CONTROLLER_LIVE_ENQUEUE_CMD=false
-[ "$(d .alarmSent)" = false ] && [ -e "$OUT/wrapper/pending-alarms/wrapper-error" ] \
-  && [ "$(d '.alarmsOwed|tojson')" = '["wrapper-error"]' ] || fail "alarm-unsent: the debt is ledgered: $OUTPUT"
-python3 -c 'import json;print(json.dumps({"schemaVersion":1}))' >"$C/agent/state/control.json"
-fire
-[ "$(d '.alarmsOwedAtStart|tojson')" = '["wrapper-error"]' ] && [ "$(d .stepped)" = true ] \
-  && [ ! -e "$OUT/wrapper/pending-alarms/wrapper-error" ] \
-  || fail "alarm-unsent: the next fire posts the lost alarm and settles it: $OUTPUT"
-
-# --- a pending alarm is a ledger, cleared only by its own post (review round 4, #1) --
-# Codex repro: fail the alarm, repair the fault, fail the alarm AGAIN during
-# recovery. The fire now succeeds on its own terms -- and must still not
-# report a clean outcome, nor drop the debt, until the post is taken.
-new_case alarm-ledger
-fire
-printf '{"torn' >"$C/agent/state/control.json"
-fire SMOKE_CONTROLLER_LIVE_ENQUEUE_CMD=false
-[ "$(d .alarmSent)" = false ] && [ -e "$OUT/wrapper/pending-alarms/wrapper-error" ] \
-  || fail "alarm-ledger: the failing fire owes an alarm: $OUTPUT"
-python3 -c 'import json;print(json.dumps({"schemaVersion":1}))' >"$C/agent/state/control.json"
-fire SMOKE_CONTROLLER_LIVE_ENQUEUE_CMD=false
-[ "$(d .stepped)" = true ] && [ -e "$OUT/wrapper/pending-alarms/wrapper-error" ] \
-  || fail "alarm-ledger: a succeeding fire does NOT clear another fire's debt: $OUTPUT"
-[ "$(d .failClosed)" = pending-alarm ] && [ "$(d '.alarmsOwed|tojson')" = '["wrapper-error"]' ] \
-  && [ "$(d .degraded)" != null ] \
-  || fail "alarm-ledger: a fire that still owes an alarm is never reported clean: $OUTPUT"
+# fire-open is FORENSICS ONLY now: it records that the previous fire never
+# reached end_fire, and it neither owes an alarm nor blocks this fire.
+[ "$(d .previousFireUnclosed)" = true ] && [ "$(d .stepped)" = true ] && [ "$WAKE" = false ] \
+  || fail "killed: the next fire records the unclosed marker and steps: $OUTPUT"
+[ ! -e "$OUT/wrapper/fire-open" ] || fail "killed: the marker is closed again"
 [ ! -e "$C/fake/enqueue.json" ] || [ "$(jq '.messages | length' "$C/fake/enqueue.json")" = 0 ] \
-  || fail "alarm-ledger: nothing was posted yet: $(cat "$C/fake/enqueue.json")"
+  || fail "killed: no wrapper post: $(cat "$C/fake/enqueue.json")"
+[ ! -e "$OUT/wrapper/pending-alarms" ] || fail "killed: there is no alarm ledger any more"
+
+# --- Codex round-5 repros 1 and 3: unwritable and unreadable wrapper state ---------
+# 1. An out-dir the fire cannot write used to lose the alarm silently. It is a
+#    reported failure now.
+new_case out-dir-unwritable
 fire
-[ "$(d '.alarmsOwedAtStart|tojson')" = '["wrapper-error"]' ] && [ "$(d '.alarmsOwed|tojson')" = null ] \
-  && [ "$(d .failClosed)" = null ] && [ ! -e "$OUT/wrapper/pending-alarms/wrapper-error" ] \
-  || fail "alarm-ledger: the fire that takes the post settles the debt and is clean: $OUTPUT"
-[ "$(jq '.messages | keys | map(select(startswith("ctl.wrapper-error."))) | length' "$C/fake/enqueue.json")" = 1 ] \
-  || fail "alarm-ledger: exactly one post across all four fires: $(cat "$C/fake/enqueue.json")"
+chmod 500 "$OUT/wrapper"
+: >"$FAKE_LOG"
+fire
+chmod 700 "$OUT/wrapper"
+[ "$WAKE" = true ] && [ "$(d .failure)" = out-dir-refused ] \
+  || fail "out-dir-unwritable: an unwritable wrapper dir reports: $OUTPUT"
+calls '[.[] | select(.tool=="gate" and .op=="poll")] | length == 0' | grep -qx true \
+  || fail "out-dir-unwritable: it must not poll: $(cat "$FAKE_LOG")"
+# 3. An unreadable wrapper directory must never read as "nothing there".
+new_case alarms-unreadable
+fire
+mkdir -p "$OUT/wrapper/alarms"
+chmod 000 "$OUT/wrapper/alarms"
+: >"$FAKE_LOG"
+fire
+chmod 755 "$OUT/wrapper/alarms"
+[ "$WAKE" = true ] && [ "$(d .failure)" = fire-failed ] \
+  || fail "alarms-unreadable: an unreadable alarm queue fails closed, never empty: $OUTPUT"
+
+# --- Codex round-5 repro 4: nothing outside the out-dir is ever unlinked -----------
+# Every directory the fire deletes from is reached through the containment
+# walk, so a swapped/symlinked directory cannot carry the delete out.
+new_case symlink-escape
+fire
+mkdir -p "$C/outside"
+: >"$C/outside/victim.json"
+: >"$C/outside/wrapper-error"
+rm -rf "$OUT/wrapper/wakes" "$OUT/wrapper/alarms"
+ln -s "$C/outside" "$OUT/wrapper/wakes"
+ln -s "$C/outside" "$OUT/wrapper/alarms"
+: >"$FAKE_LOG"
+fire
+[ -e "$C/outside/victim.json" ] && [ -e "$C/outside/wrapper-error" ] \
+  || fail "symlink-escape: a file outside the out-dir was unlinked: $OUTPUT"
+[ -L "$OUT/wrapper/wakes" ] && [ -L "$OUT/wrapper/alarms" ] || fail "symlink-escape: the symlinks themselves stand"
+grep -q "pending-alarms" "$SCRIPT_DIR/smoke-controller-live-worker.py" \
+  && fail "the pending-alarm ledger must be gone" || true
+# The primitive itself, directly: a symlinked directory component refuses both
+# the delete and the listing; it never deletes through and never reads empty.
+PYTHONDONTWRITEBYTECODE=1 python3 - "$SCRIPT_DIR/smoke-campaign-controller.py" "$C" <<'PY' || fail "containment primitives (see above)"
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("ctl", sys.argv[1])
+ctl = importlib.util.module_from_spec(spec); spec.loader.exec_module(ctl)
+root, outside = os.path.join(sys.argv[2], "root"), os.path.join(sys.argv[2], "elsewhere")
+os.makedirs(os.path.join(root, "real"), exist_ok=True); os.makedirs(outside, exist_ok=True)
+open(os.path.join(outside, "victim"), "w").close()
+open(os.path.join(root, "real", "mine"), "w").close()
+link = os.path.join(root, "linked")
+os.path.lexists(link) or os.symlink(outside, link)
+errs = []
+ctl.unlink_contained(root, ["linked", "victim"])
+if not os.path.exists(os.path.join(outside, "victim")):
+    errs.append("unlink_contained deleted through a symlinked directory")
+if not ctl.unlink_contained(root, ["real", "mine"]):
+    errs.append("unlink_contained did not remove its own file")
+try:
+    ctl.listdir_contained(root, ["linked"])
+    errs.append("listdir_contained listed through a symlinked directory")
+except ctl.ControllerError:
+    pass
+if ctl.listdir_contained(root, ["absent"]) != []:
+    errs.append("an absent directory must list as empty")
+for e in errs:
+    print("containment:", e)
+sys.exit(1 if errs else 0)
+PY
 
 # --- structure: every worker exit is end_fire; only _emit leaves the process ------
 python3 - "$SCRIPT_DIR/smoke-controller-live-worker.py" <<'PY' || fail "worker exit structure (see above)"
-import ast, sys
+import ast, re, sys
 tree = ast.parse(open(sys.argv[1]).read())
 funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
 errs = []
@@ -488,20 +554,42 @@ if [r for r in ast.walk(funcs["main"]) if isinstance(r, ast.Return)]:
 oks = [kw.value.value for c in calls_in(tree, "end_fire") for kw in c.keywords if kw.arg == "ok"]
 if sorted(oks) != ["not-live", "stepped"]:
     errs.append("non-failure ends are {}, want not-live + stepped".format(oks))
-# 5. A ledger entry is cleared in ONE place, inside the alarm that took it,
-#    and "pending-alarms" is touched only by the three ledger functions.
-settle_owner = {f.name for f in funcs.values() if calls_in(f, "alarm_settle")}
-if settle_owner != {"_wrapper_alarm"}:
-    errs.append("alarm_settle called from {}, want only _wrapper_alarm".format(sorted(settle_owner)))
+# 5. There is no alarm ledger and no wrapper-side send: the wake IS the report.
+src = open(sys.argv[1]).read()
+for banned in ("pending-alarms", "alarm_owed", "alarm_settle", "alarm_pending", "_wrapper_alarm", "FAIL_TEXT"):
+    if banned in src:
+        errs.append("the deleted alarm ledger is back: {}".format(banned))
+if "ENQUEUE.split()" in src:  # the controller is handed --enqueue-cmd; the wrapper never runs it
+    errs.append("the wrapper runs the enqueue-send CLI itself")
+# 6. Every fail-closed end carries a stable cause slug, and the two named
+#    non-failure ends carry none.
+for c in calls_in(tree, "end_fire"):
+    kw = {k.arg: k.value for k in c.keywords}
+    if "ok" in kw:
+        if "failure" in kw:
+            errs.append("a non-failure end names a failure at line {}".format(c.lineno))
+        continue
+    if "failure" not in kw or not isinstance(kw["failure"], ast.Constant) or not kw["failure"].value:
+        errs.append("fail-closed end without a stable failure slug at line {}".format(c.lineno))
+        continue
+    # The owner posts the alarm under this slug, so every slug must be a legal
+    # enqueue-send id/fingerprint/thread-key (cli/enqueue-send.ts:66-68,
+    # mcp-tools/core.ts THREAD_KEY_PATTERN): hyphens, never underscores.
+    slug = kw["failure"].value
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,60}$", slug):
+        errs.append("failure slug {!r} is not a legal send id/fingerprint".format(slug))
+# 7. end_fire sets failure/detail/fire (fire is on the summary from the start).
+body = ast.unparse(funcs["end_fire"])
+for key in ("failure", "detail", "note"):
+    if "'{}'".format(key) not in body:
+        errs.append("end_fire does not set {}".format(key))
+# 8. NOTHING is deleted through a path a symlinked directory could redirect
+#    (round 5, finding 4): every delete goes through ctl.unlink_contained.
 for n in ast.walk(tree):
-    if isinstance(n, ast.Constant) and n.value == "pending-alarms":
-        owner = [f.name for f in funcs.values() if n in list(ast.walk(f))]
-        if owner not in (["alarm_owed"], ["alarm_pending"], ["alarm_settle"]):
-            errs.append("pending-alarms touched outside the ledger at line {}".format(n.lineno))
-# 6. end_fire refuses a clean report while anything is owed.
-if not calls_in(funcs["end_fire"], "alarm_pending"):
-    errs.append("end_fire does not consult the ledger")
-# 7. Anything uncaught still ends through end_fire.
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in ("unlink", "rmdir", "remove") \
+            and isinstance(n.func.value, ast.Name) and n.func.value.id == "os":
+        errs.append("uncontained os.{} at line {}".format(n.func.attr, n.lineno))
+# 9. Anything uncaught still ends through end_fire.
 if not any(isinstance(n, ast.Assign) and any(ast.unparse(t) == "sys.excepthook" for t in n.targets)
            for n in tree.body):
     errs.append("no sys.excepthook")
@@ -514,7 +602,27 @@ PY
 [ "$(grep -c '>&3' "$W")" = 2 ] || fail "expected exactly final()'s two fd-3 writes"
 [ "$(sed -n '/^final() {/,/^}/p' "$W" | grep -c '>&3')" = 2 ] || fail "every fd-3 write must be inside final()"
 grep -q "exec 3>&1 1>&2" "$W" || fail "stdout must be moved to fd 3 before anything runs"
-[ "$(grep -c 'wakeAgent:true' "$W")" = 1 ] && sed -n '/^final() {/,/^}/p' "$W" | grep -q 'wakeAgent:true' \
-  || fail "wakeAgent:true is rendered in exactly one place, inside final()"
+# Renderings of a true wake ({wakeAgent:true ...} in jq, "wakeAgent":true in the
+# literal fallback), comments excluded: all of them, and exactly three, live in
+# final() -- the owner step, any failure, and the jq-less fallback.
+renders() { grep -v '^[[:space:]]*#' | grep -c 'wakeAgent"\?:true'; }
+[ "$(renders <"$W")" = "$(sed -n '/^final() {/,/^}/p' "$W" | renders)" ] \
+  || fail "every wakeAgent:true rendering must be inside final()"
+[ "$(sed -n '/^final() {/,/^}/p' "$W" | renders)" = 3 ] \
+  || fail "final() renders a true wake for the owner step, for a failure, and in the jq-less fallback"
+
+# --- the supervisor's OWN failure paths wake too, and never silently false ---------
+# (the hung-worker case above is the timeout half: rc 124 -> fire-killed.)
+new_case supervisor-empty
+fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6 PYTHONHOME=/nonexistent   # the interpreter never starts
+[ "$WAKE" = true ] && [ "$(d .failure)" = worker-no-output ] && [ "$(d .note)" != null ] \
+  || fail "a worker that printed nothing is reported, not a silent false: $OUTPUT"
+new_case supervisor-garbage
+mkdir -p "$C/shim"
+printf '#!/usr/bin/env bash\necho "not json at all"\n' >"$C/shim/python3"
+chmod +x "$C/shim/python3"
+fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6 PATH="$C/shim:$PATH"
+[ "$WAKE" = true ] && [ "$(d .failure)" = worker-output-invalid ] \
+  || fail "a worker line that is not JSON is reported, not a silent false: $OUTPUT"
 
 echo "smoke controller live wrapper tests passed"
