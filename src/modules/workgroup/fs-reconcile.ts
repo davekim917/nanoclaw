@@ -21,7 +21,7 @@ import type Database from 'better-sqlite3';
 
 import { log } from '../../log.js';
 import { readContainerConfig } from '../../container-config.js';
-import { ensureWorkgroupWorkDirs } from './shared-dirs.js';
+import { ensureWorkgroupWorkDirs, pruneDanglingWorkgroupCompatLinks } from './shared-dirs.js';
 
 export function reconcileWorkgroupFsState(db: Database.Database): void {
   // ── 1. Drain migration-036 report if present ──────────────────────────
@@ -58,6 +58,13 @@ export function reconcileWorkgroupFsState(db: Database.Database): void {
   // booting. The one uncontained throw is the workgroups enumeration itself:
   // an unreadable central DB is fail-closed here, exactly as it is for step 1.
   ensureWorkgroupWorkDirs(db);
+
+  // ── 3. Prune compat links whose shared target is gone ──────────────────
+  // Runs AFTER the step above, which is the only thing that legitimately adds
+  // a name to the shared tree during this boot: pruning first would judge
+  // `artifacts` against a listing taken before it was created. Contained the
+  // same way — a workgroup whose shared tree cannot be listed prunes nothing.
+  pruneDanglingWorkgroupCompatLinks(db);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
