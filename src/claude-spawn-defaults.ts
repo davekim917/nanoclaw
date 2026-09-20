@@ -42,10 +42,21 @@ export type ClaudeSpawnConfig = Pick<
  *
  * Raised 2026-09-19 from depth 1 / concurrency 3 to match the operator's own
  * host settings, so a container fans out the same way an interactive session
- * does. Depth 1 previously enforced the orchestrate contract's ban on workers
- * re-delegating; at depth 2 that ban is contract-only, carried by the
- * orchestrate role definitions rather than by the CLI refusing the spawn. The
- * worst-case concurrent fan-out this permits is 5 × 5, not 5.
+ * does. Depth 1 previously PREVENTED a worker from delegating further; depth 2
+ * allows it, which is the intent — nothing forbids re-delegation now, and the
+ * installed orchestrate worker definitions never did
+ * (`~/plugins/bootstrap/plugins/orchestrate/agents/worker-high.md:8` just says
+ * to execute the prompt).
+ *
+ * Concurrency is NOT per-parent, so depth 2 does not square it: the pinned CLI
+ * shares one running-subagent counter and task registry across nested agents,
+ * so 5 is 5 slots for the whole session (excluding the main agent) and depth
+ * only decides how they may nest. It is not an absolute ceiling over every
+ * mechanism either — resumes can bypass admission and agent teams count
+ * separately. Verified against the CLI pinned in container/Dockerfile and
+ * https://code.claude.com/docs/en/sub-agents#concurrent-subagent-limit
+ * (an earlier revision of this comment claimed a 5 × 5 worst case; that was
+ * wrong, and wrong in the direction that understates the budget's tightness).
  */
 export const DEFAULT_CLAUDE_AUTO_COMPACT_WINDOW = 600_000;
 export const CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH = '2';
