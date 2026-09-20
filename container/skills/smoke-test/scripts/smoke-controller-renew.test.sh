@@ -18,7 +18,11 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-R="$SCRIPT_DIR/smoke-controller-renew.sh"
+# Overridable so a reviewer can point the same suite at an older revision of
+# the script and see which assertions the fix is carrying:
+#   git show <sha>:container/skills/smoke-test/scripts/smoke-controller-renew.sh > /tmp/old.sh
+#   SMOKE_RENEW_SCRIPT=/tmp/old.sh bash smoke-controller-renew.test.sh
+R="${SMOKE_RENEW_SCRIPT:-$SCRIPT_DIR/smoke-controller-renew.sh}"
 GATE="$SCRIPT_DIR/smoke-pr-gate.sh"
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
@@ -27,7 +31,15 @@ unset SMOKE_CONTROLLER_MODE SMOKE_CONTROLLER_OUT_DIR SMOKE_CONTROLLER_GATE_CMD S
   SMOKE_GATE_RUN_ROOT SMOKE_GATE_STATE_DIR SMOKE_GATE_SHARED_ROOT SMOKE_GATE_LEASE_DIR \
   SMOKE_GATE_CLAIMANT SMOKE_CONTROLLER_RENEW_CEILING_SECONDS FAKE_CLOCK_OFFSET || true
 
-fail() { echo "FAIL: $*" >&2; exit 1; }
+# SMOKE_RENEW_TEST_CONTINUE=1 records failures instead of stopping at the
+# first, so one run against an older revision shows every assertion the fix
+# is carrying rather than only the earliest.
+FAILURES=0
+fail() {
+  echo "FAIL: $*" >&2
+  FAILURES=$((FAILURES + 1))
+  [ -n "${SMOKE_RENEW_TEST_CONTINUE:-}" ] || exit 1
+}
 PASSES=0
 ok() { PASSES=$((PASSES + 1)); }
 
@@ -394,6 +406,62 @@ tick
 [ "$(field '.data.status')" = journal-unreadable ] || fail "a corrupt line must refuse the tick: $LAST"
 [ "$(field '.data.renewed | length')" = 0 ] || fail "renewed against a corrupt journal"
 ok
+
+# A COMPLETE corrupt record — newline-terminated — is not an interrupted
+# append and must never be dropped, even as the last line. (Codex P2: at
+# 3f4bf2b6 any unparseable final line was dropped and the tick renewed from
+# the older records.)
+new_case corrupt-terminated
+START="$(/usr/bin/date -u +%s)"
+claim_files "$START"
+in_flight_at "$START"
+FAKE_CLOCK_OFFSET=300
+printf 'CORRUPT\n' >>"$JOURNAL"
+tick
+[ "$(field '.data.status')" = journal-unreadable ] ||
+  fail "a newline-terminated corrupt line must refuse the tick: $LAST"
+[ "$(field '.data.renewed | length')" = 0 ] || fail "renewed past a complete corrupt record"
+ok
+# The refusal names the line, so the failure is recorded and not just silent.
+grep -q 'journal line' <<<"$(field '.data.detail')" || fail "the refusal did not name the line: $LAST"
+ok
+
+# A record that parses but fails the schema check fails the tick closed too —
+# including a claim in a state this tick does not understand, which at
+# 3f4bf2b6 qualified as OPEN ("not done and not abandoned") and was renewed.
+new_case bad-claim-state
+START="$(/usr/bin/date -u +%s)"
+claim_files "$START"
+in_flight_at "$START"
+jrec run claim weird $((START + 10)) '{"ownerToken":"'"$TOKEN"'"}'
+FAKE_CLOCK_OFFSET=300
+tick
+[ "$(field '.data.status')" = journal-unreadable ] ||
+  fail "an unknown claim state must refuse the tick, not read as open: $LAST"
+[ "$(field '.data.renewed | length')" = 0 ] || fail "renewed under an unknown claim state"
+ok
+# Same for a record missing a required field, and for a non-object detail.
+new_case bad-schema
+START="$(/usr/bin/date -u +%s)"
+claim_files "$START"
+in_flight_at "$START"
+printf '{"at":"%s","runId":"%s","kind":"owner","slot":"lanes","state":"enqueued","key":"k-owner-lanes","detail":"nope","v":1}\n' \
+  "$(iso "$START")" "$RUN" >>"$JOURNAL"
+FAKE_CLOCK_OFFSET=300
+tick
+[ "$(field '.data.status')" = journal-unreadable ] || fail "a non-object detail must refuse the tick: $LAST"
+ok
+new_case missing-field
+START="$(/usr/bin/date -u +%s)"
+claim_files "$START"
+in_flight_at "$START"
+printf '{"at":"%s","runId":"%s","kind":"owner","slot":"lanes","key":"k-owner-lanes","v":1}\n' \
+  "$(iso "$START")" "$RUN" >>"$JOURNAL"
+FAKE_CLOCK_OFFSET=300
+tick
+[ "$(field '.data.status')" = journal-unreadable ] || fail "a record with no state must refuse the tick: $LAST"
+ok
+
 new_case nojournal
 claim_files
 rm -f "$JOURNAL"
@@ -423,4 +491,35 @@ ok
 grep -q 'not well formed' <<<"$(field '.data.skipped[0].reason')" || fail "a bad run id was not refused: $LAST"
 ok
 
+# `..` is legal by charset and a directory escape as a path component, so the
+# gate rejects it by name (smoke-pr-gate.sh:202) and so must this tick. At
+# 3f4bf2b6 it was accepted: the ack lookup resolved to <run-root>/../controller
+# and, with an ack planted there, the tick called the gate. Planting it here
+# is what makes this a regression rather than a shape assertion.
+new_case dotdot
+export SMOKE_CONTROLLER_GATE_CMD="$STUB"
+export GATE_LOG="$C/gate.log"
+: >"$GATE_LOG"
+cat >"$STUB" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$GATE_LOG"
+echo '{"ok":true,"leaseRenewed":true}'
+SH
+chmod +x "$STUB"
+mkdir -p "$C/controller"
+: >"$C/controller/brief-lanes.ack"
+START="$(/usr/bin/date -u +%s)"
+printf '{"at":"%s","runId":"..","kind":"run","slot":"claim","state":"enqueued","key":"k-dd-claim","detail":{"ownerToken":"%s"},"v":1}\n' \
+  "$(iso "$START")" "$TOKEN" >>"$JOURNAL"
+printf '{"at":"%s","runId":"..","kind":"owner","slot":"lanes","state":"enqueued","key":"k-dd-owner","v":1}\n' \
+  "$(iso "$START")" >>"$JOURNAL"
+FAKE_CLOCK_OFFSET=300
+tick
+[ "$(field '.data.renewed | length')" = 0 ] || fail "renewed a run id of '..': $LAST"
+[ ! -s "$GATE_LOG" ] || fail "the gate was called for a run id of '..': $(cat "$GATE_LOG")"
+grep -q 'not well formed' <<<"$(field '.data.skipped[0].reason')" || fail "'..' was not refused by name: $LAST"
+ok
+unset SMOKE_CONTROLLER_GATE_CMD GATE_LOG
+
+[ "$FAILURES" = 0 ] || { echo "$FAILURES assertion group(s) FAILED" >&2; exit 1; }
 echo "PASS ($PASSES assertions)"

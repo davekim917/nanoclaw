@@ -168,11 +168,40 @@ fi
 
 # -- which runs have an owner step genuinely in flight ------------------------
 # Read-only fold of the append-only journal, no lock: the controller appends
-# whole records under its own lock and this tick writes nothing, so the worst
-# a concurrent append can do is leave a torn LAST line. That one is dropped;
-# an unparseable line ANYWHERE ELSE refuses the whole tick (nothing renewed),
-# because a journal we cannot read is not evidence that a step is held.
-CANDIDATES="$(jq -cRn --argjson now "$NOW_EPOCH" '
+# whole records with one write under its own lock and this tick writes
+# nothing, so the only damage a concurrent append can do is leave the LAST
+# line UNTERMINATED. That is the only line this tick may drop, and only when
+# the file does not end in a newline — a newline-terminated line that does not
+# parse is complete corruption, not an interrupted append, and it refuses the
+# whole tick. So does any record that fails the schema check below. A journal
+# we cannot read in full is not evidence that a step is held, and the refusal
+# is recorded in the tick's own line.
+#
+# Does the file end in a newline? `$(...)` strips trailing newlines, so an
+# empty capture of the last byte means the last byte WAS one (or the file is
+# empty); anything else means the final line is torn.
+JOURNAL_TORN_TAIL=0
+[ -n "$(tail -c 1 -- "$JOURNAL" 2>/dev/null)" ] && JOURNAL_TORN_TAIL=1
+
+JQ_ERR="$(mktemp "${TMPDIR:-/tmp}/smoke-renew-jq.XXXXXX" 2>/dev/null)" || JQ_ERR=/dev/null
+trap 'rm -f -- "$JQ_ERR" 2>/dev/null || true' EXIT
+
+CANDIDATES="$(jq -cRn --argjson now "$NOW_EPOCH" --argjson torn "$JOURNAL_TORN_TAIL" '
+  # The controller records exactly these states for the two kinds this tick
+  # reads (smoke-campaign-controller.py record() call sites for kind "run" and
+  # kind "owner"). Anything else is a journal this tick does not understand,
+  # and an ununderstood state must never be read as "the claim is open".
+  def known_states: ["intent","enqueued","done","abandoned","failed_terminal"];
+  def str($f): ($f | type) == "string" and ($f | length) > 0;
+  def check($ln):
+    if (str(.key) and str(.at) and str(.runId) and str(.kind) and str(.slot) and str(.state)) | not
+      then error("journal line \($ln): record is missing a required field")
+    elif (has("detail") and (.detail | type) != "object")
+      then error("journal line \($ln): detail is not an object")
+    # `.state` has to be bound first: inside index() the input is the array.
+    elif ((.kind == "run" or .kind == "owner") and (.state as $s | known_states | index($s)) == null)
+      then error("journal line \($ln): unknown \(.kind) state")
+    else . end;
   [inputs] as $raw
   | ($raw | length) as $n
   | [ $raw
@@ -180,8 +209,8 @@ CANDIDATES="$(jq -cRn --argjson now "$NOW_EPOCH" '
       | select(.value | test("^[[:space:]]*$") | not)
       | . as $e
       | (try ($e.value | fromjson) catch null) as $rec
-      | if ($rec | type) == "object" then $rec
-        elif $e.key == $n - 1 then empty
+      | if ($rec | type) == "object" then ($rec | check($e.key + 1))
+        elif $torn == 1 and $e.key == $n - 1 then empty
         else error("journal line \($e.key + 1) is not a JSON object")
         end ] as $recs
   | (reduce $recs[] as $r ({};
@@ -190,16 +219,20 @@ CANDIDATES="$(jq -cRn --argjson now "$NOW_EPOCH" '
         firstAt: (.[$r.key].firstAt // $r.at),
         detail: ((.[$r.key].detail // {}) + ($r.detail // {}))
       })) as $obs
+  # An OPEN claim is named positively. "not done and not abandoned" admitted
+  # every state the schema check has not seen, which is the wrong default for
+  # the one field that decides whether a run may be renewed at all.
   | ([ $obs[]
        | select(.kind == "run" and .slot == "claim"
-                and (.state == "done" or .state == "abandoned" | not))
+                and (.state == "intent" or .state == "enqueued"))
        | {key: .runId, value: (.detail.ownerToken // "")} ] | from_entries) as $tokens
   | [ $obs[]
       | select(.kind == "owner" and .state == "enqueued")
       | {runId: .runId, step: .slot, token: ($tokens[.runId] // ""),
          age: (try ($now - (.firstAt | fromdateiso8601)) catch null)} ]
-  | .[]' <"$JOURNAL" 2>/dev/null)" || \
-  final journal-unreadable "the controller journal could not be folded; nothing renewed"
+  | .[]' <"$JOURNAL" 2>"$JQ_ERR")" || \
+  final journal-unreadable \
+    "the controller journal could not be folded; nothing renewed: $(tr -d '\000' <"$JQ_ERR" 2>/dev/null | tail -n 1 | cut -c1-200)"
 
 [ -n "$CANDIDATES" ] || final idle "no owner step is enqueued"
 
@@ -217,10 +250,14 @@ while IFS= read -r candidate; do
   TOKEN="$(jq -r '.token // ""' <<<"$candidate")"
   AGE="$(jq -r '.age // "null"' <<<"$candidate")"
 
-  # Charset-checked before either value reaches a path or the gate: the run id
-  # is the gate's own (smoke-pr-gate.sh run_id_ok) and the step is a
-  # controller slot. Anything else is refused rather than sanitized.
-  if ! [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]{1,200}$ ]] || ! [[ "$STEP" =~ ^[a-z][a-z0-9-]{0,40}$ ]]; then
+  # Charset-checked before either value reaches a path or the gate. This is
+  # the gate's own rule, `..` rejection included (smoke-pr-gate.sh:202,
+  # run_id_ok): the charset alone admits `..`, which is a legal run id by
+  # charset and a directory escape as a path component — the ack lookup below
+  # builds a path out of it. The step is a controller slot. Anything else is
+  # refused by name rather than sanitized.
+  if ! [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]{1,200}$ ]] || [ "$RUN_ID" = ".." ] ||
+     ! [[ "$STEP" =~ ^[a-z][a-z0-9-]{0,40}$ ]]; then
     note "$RUN_ID" "$STEP" "refused: run id or step is not well formed"
     continue
   fi
