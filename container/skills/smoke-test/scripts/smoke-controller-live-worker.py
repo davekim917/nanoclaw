@@ -119,6 +119,20 @@ def alarm_payload(slug):
             "text": ALARM_TEXT.format(slug=slug)}
 
 
+# What a failing fire reports itself with. `data.alarm` is the owner's routing
+# payload and NOTHING else -- the owner reads {to,id,threadKey,...} off it, so
+# a string there makes the prescribed send impossible. A per-cause label lives
+# in its own field (`controllerAlarm`).
+#
+# Round 7: `journal_fail_closed` passed `"alarm": "controller_journal_error"`
+# as ordinary detail and _emit's `update()` silently replaced the payload with
+# that string. Fixed at the root, in two places that each stop it alone: these
+# fields are written AFTER the caller's detail, so detail can never overwrite
+# them; and the structure test refuses any `end_fire` call site that names one.
+REPORT_FIELDS = ("failure", "detail", "note", "alarm", "outDir")
+report = {}
+
+
 def _emit(extra):
     """Write the fire log and the one stdout line, then exit. Called ONLY by
     end_fire (the structure test enforces it)."""
@@ -126,6 +140,7 @@ def _emit(extra):
     FINISHING = True
     if extra:
         summary.update(extra)
+    summary.update(report)  # the report outranks per-call detail, always
     summary["elapsedSeconds"] = round(time.time() - START, 1)
     if log_lines:
         summary["log"] = log_lines[-5:]
@@ -161,11 +176,11 @@ def end_fire(extra, ok=None, failure="wrapper-error"):
     assert ok in (None, "stepped", "not-live"), ok
     FINISHING = True  # a second SIGTERM while the fire ends must not re-enter
     if ok is None:
-        summary.update({"failure": failure,
-                        "detail": str(extra.get("skipped") or extra.get("controllerError") or failure)[:300],
-                        "note": REPEAT_NOTE,
-                        "outDir": OUT,
-                        "alarm": alarm_payload(failure)})
+        report.update({"failure": failure,
+                       "detail": str(extra.get("skipped") or extra.get("controllerError") or failure)[:300],
+                       "note": REPEAT_NOTE,
+                       "outDir": OUT,
+                       "alarm": alarm_payload(failure)})
     if MARKER_OPEN:
         # fire-open means exactly one thing: a fire started and did not reach
         # this function. It carries no obligation and gates nothing.
@@ -474,8 +489,10 @@ def alarm_queue():
 def journal_fail_closed(reason, detail):
     """The journal is not trustworthy: no progress stamp, no poll, no step.
     Its own cause slug, through the one fail-closed exit."""
+    # The controller's own alarm name goes in `controllerAlarm`: `alarm` is the
+    # owner's routing payload (round 7) and nothing may share it.
     end_fire({"stepped": False, "skipped": "journal failed validation: " + reason,
-              "alarm": "controller_journal_error", "error": detail[:300]}, failure="journal-invalid")
+              "controllerAlarm": "controller_journal_error", "error": detail[:300]}, failure="journal-invalid")
 
 
 def fold_journal():

@@ -113,6 +113,26 @@ fire() { # [env assignments...]
 d() { jq -r "$1" <<<"$DATA"; }
 calls() { jq -s -c "$1" "$FAKE_LOG"; }
 
+# $1 case, $2 slug. The wake carries a ready-to-run enqueue-send: an id and a
+# fingerprint the helper's patterns accept, a non-empty fire (it rejects an
+# empty one, cli/enqueue-send.ts:157), a thread key, and the exact text. The
+# text never names the fire or the detail, because the id is per cause per day
+# and a different payload under it is a mismatch, not a replay.
+alarm_selfcontained() {
+  local day
+  day="$(d .fire | cut -c1-10 | tr -d -)"
+  [ "$(d .alarm.id)" = "ctl.failure.$2.$day#1" ] && [ "$(d .alarm.fingerprint)" = "$2" ] \
+    && [ "$(d .alarm.threadKey)" = "ctl.failure-$2-$day" ] && [ "$(d .alarm.runId)" = "ctl.wrapper.$day" ] \
+    || fail "$1: the wake must carry the alarm's ids: $OUTPUT"
+  [ -n "$(d .alarm.fire)" ] && [ "$(d .alarm.fire)" != null ] && [ -n "$(d .alarm.text)" ] \
+    && [ "$(d .alarm.text)" != null ] || fail "$1: the wake must carry a fire and the post text: $OUTPUT"
+  d .alarm.text | grep -q "UNCERTAIN" || fail "$1: the post must not claim the fire changed nothing: $OUTPUT"
+  if d .alarm.text | grep -qF "$(d .fire)"; then
+    fail "$1: the post text carries the fire timestamp, so tomorrow's replay is a mismatch: $OUTPUT"
+  fi
+  return 0
+}
+
 # --- kill switch: anything but live does nothing ---------------------------------
 for m in "" shadow off; do
   new_case "not-live-${m:-unset}"
@@ -217,8 +237,13 @@ for variant in torn schema; do
   fi
   : >"$FAKE_LOG"
   fire
-  [ "$WAKE" = true ] && [ "$(d .failure)" = journal-invalid ] && [ "$(d .alarm)" = controller_journal_error ] \
+  [ "$WAKE" = true ] && [ "$(d .failure)" = journal-invalid ] \
+    && [ "$(d .controllerAlarm)" = controller_journal_error ] \
     || fail "$variant journal: fails closed and reports: $OUTPUT"
+  # Round 7: the per-cause label used to land ON `data.alarm`, replacing the
+  # owner's routing payload with a string, so the prescribed send could not run.
+  [ "$(d '.alarm|type')" = object ] || fail "$variant journal: data.alarm must stay the routing payload: $OUTPUT"
+  alarm_selfcontained "journal-$variant" journal-invalid
   calls '[.[] | select(.tool=="gate")] | length == 0' | grep -qx true \
     || fail "$variant journal: no progress stamp and no poll on an invalid journal: $(cat "$FAKE_LOG")"
   [ ! -e "$C/fake/enqueue.json" ] || fail "$variant journal: the wrapper posts nothing itself"
@@ -359,26 +384,6 @@ for b in 08 0 1e3 200; do
 done
 grep -q '^BUDGET_MAX=110$' "$W" && grep -q 'timeout -k 2 "\$BUDGET"' "$W" \
   || fail "hard kill must land by 110 + 2 s, under the runner's 120 s"
-
-# $1 case, $2 slug. The wake carries a ready-to-run enqueue-send: an id and a
-# fingerprint the helper's patterns accept, a non-empty fire (it rejects an
-# empty one, cli/enqueue-send.ts:157), a thread key, and the exact text. The
-# text never names the fire or the detail, because the id is per cause per day
-# and a different payload under it is a mismatch, not a replay.
-alarm_selfcontained() {
-  local day
-  day="$(d .fire | cut -c1-10 | tr -d -)"
-  [ "$(d .alarm.id)" = "ctl.failure.$2.$day#1" ] && [ "$(d .alarm.fingerprint)" = "$2" ] \
-    && [ "$(d .alarm.threadKey)" = "ctl.failure-$2-$day" ] && [ "$(d .alarm.runId)" = "ctl.wrapper.$day" ] \
-    || fail "$1: the wake must carry the alarm's ids: $OUTPUT"
-  [ -n "$(d .alarm.fire)" ] && [ "$(d .alarm.fire)" != null ] && [ -n "$(d .alarm.text)" ] \
-    && [ "$(d .alarm.text)" != null ] || fail "$1: the wake must carry a fire and the post text: $OUTPUT"
-  d .alarm.text | grep -q "UNCERTAIN" || fail "$1: the post must not claim the fire changed nothing: $OUTPUT"
-  if d .alarm.text | grep -qF "$(d .fire)"; then
-    fail "$1: the post text carries the fire timestamp, so tomorrow's replay is a mismatch: $OUTPUT"
-  fi
-  return 0
-}
 
 # --- every fail-closed worker end wakes the owner with its cause (round 5) --------
 # $1 case, $2 description, $3 expected failure slug. The fire must fail closed,
@@ -639,6 +644,17 @@ for c in calls_in(tree, "end_fire"):
     slug = kw["failure"].value
     if not re.match(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,60}$", slug):
         errs.append("failure slug {!r} is not a legal send id/fingerprint".format(slug))
+# 6b. No end_fire call site may pass a field the report owns -- `data.alarm` in
+#     particular is the owner's routing payload, and a string there makes the
+#     prescribed send impossible (round 7: journal_fail_closed passed
+#     "alarm": "controller_journal_error" and _emit's update() replaced it).
+RESERVED = {"failure", "detail", "note", "alarm", "outDir"}
+for c in calls_in(tree, "end_fire"):
+    arg = c.args[0] if c.args else None
+    if isinstance(arg, ast.Dict):
+        taken = sorted(k.value for k in arg.keys if isinstance(k, ast.Constant) and k.value in RESERVED)
+        if taken:
+            errs.append("end_fire at line {} passes report-owned field(s) {}".format(c.lineno, taken))
 # 7. end_fire sets failure/detail/fire (fire is on the summary from the start).
 body = ast.unparse(funcs["end_fire"])
 for key in ("failure", "detail", "note"):
@@ -723,6 +739,31 @@ fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6 PATH="$C/shim:$PATH" PYTHONHOME=/non
   || fail "no jq: the line must still carry fire and note: $OUTPUT"
 alarm_selfcontained supervisor-nojq worker-no-output
 [ "$(d .alarm.to)" = null ] || fail "no destination in the process env: alarm.to is null, not invented: $OUTPUT"
+# Round 7: a destination is operator-supplied configuration. Without jq the
+# line is built by printf, so every interpolated value has to be escaped or the
+# one hard guarantee -- a final line that parses -- is gone. `fire` already
+# checked that the output is one line of well-formed JSON; this pins the value
+# through it unchanged.
+WEIRD='QA "Campaign" \ tab	end
+next'
+fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6 PATH="$C/shim:$PATH" PYTHONHOME=/nonexistent \
+  SMOKE_CONTROLLER_SEND_TO="$WEIRD"
+[ "$(d .alarm.to)" = "$WEIRD" ] \
+  || fail "no jq: a destination with a quote, a backslash, a tab and a newline must survive verbatim: $OUTPUT"
+[ "$(d .failure)" = worker-no-output ] || fail "no jq: the cause survives the escaping too: $OUTPUT"
+# Round 7: the WORKER's own cause must survive a missing jq. Here the worker
+# runs and fails closed for a real reason (no destination configured), and only
+# jq is gone -- the line must still say `misconfigured`.
+new_case worker-cause-nojq
+write_env live skip-send-to
+mkdir -p "$C/shim"
+printf '#!/usr/bin/env bash\nexit 127\n' >"$C/shim/jq"
+chmod +x "$C/shim/jq"
+fire PATH="$C/shim:$PATH"
+[ "$WAKE" = true ] && [ "$(d .failure)" = misconfigured ] \
+  || fail "no jq: the worker's own cause must not be replaced by worker-output-invalid: $OUTPUT"
+d .detail | grep -q "misconfigured" || fail "no jq: the detail names the recovered cause: $OUTPUT"
+alarm_selfcontained worker-cause-nojq misconfigured
 # ... and when the operator exports the destination on the task's script line,
 # even a failure that never read the env file can address its alarm.
 fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6 PATH="$C/shim:$PATH" PYTHONHOME=/nonexistent \

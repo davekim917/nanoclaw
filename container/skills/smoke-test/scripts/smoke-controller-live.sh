@@ -101,29 +101,65 @@ NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
 NOTE="this cause repeats every fire while it persists, so you may have reported it already: post the alarm under the same per-cause daily id, which replays instead of duplicating"
 ALARM_TEXT="Smoke controller (live): a fire failed closed ({slug}). It stopped part-way, so this fire's effects are UNCERTAIN -- a run may have been claimed, a post or a GitHub write may have landed. Before acting, check the gate state for a run claimed but not advanced, and the controller's journal and fire log. No further fire will advance that run while the cause persists. Posted once a day per cause."
 # Set when the SUPERVISOR itself decides the fire failed, so a line it has to
-# build without jq still names the real cause.
+# build without jq still names the real cause. WORKER_SLUG is the same thing
+# for a cause the WORKER named: read straight out of its line, no jq.
 FAIL_SLUG=""
 FAIL_WHY=""
+WORKER_SLUG=""
+
+jesc() { # <string> -- the body of a JSON string, escaped with bash alone
+  # NOT decoration: the destination is operator-supplied configuration, and one
+  # with a quote in it (`QA "Campaign"`) used to produce a malformed final line
+  # -- breaking the wrapper's one hard guarantee on the path that exists for
+  # when everything else is broken (round 7). Backslash first, or it would
+  # escape the escapes. The last expansion maps any remaining C0 control
+  # character to a space; JSON forbids them raw and this line has no jq to
+  # encode them.
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  s="${s//[$'\001'-$'\010'$'\013'$'\014'$'\016'-$'\037'$'\177']/ }"
+  printf '%s' "$s"
+}
 
 fail_json() { # <slug> <detail> -- a failure line built with NO tool but bash
   # Every field the owner needs to post the alarm, including `fire` (the daily
   # id is keyed by it, and enqueue-send refuses an empty fire,
-  # container/agent-runner/src/cli/enqueue-send.ts:157). Built with printf, so
-  # it survives a missing jq, and quoting only ever interpolates values this
-  # script itself produced.
-  local slug="$1" detail="$2" day="${NOW:0:10}"
+  # container/agent-runner/src/cli/enqueue-send.ts:157). Built with printf so
+  # it survives a missing jq, and EVERY interpolated value goes through jesc.
+  local slug detail day to
+  slug="$(jesc "$1")"
+  detail="$(jesc "$2")"
+  day="${NOW:0:10}"
   day="${day//-/}"
+  if [ -n "${SMOKE_CONTROLLER_SEND_TO:-}" ]; then to="\"$(jesc "$SMOKE_CONTROLLER_SEND_TO")\""; else to=null; fi
   printf '{"wakeAgent":true,"data":{"failure":"%s","detail":"%s","fire":"%s","stepped":false,"note":"%s","alarm":{"to":%s,"id":"ctl.failure.%s.%s#1","threadKey":"ctl.failure-%s-%s","runId":"ctl.wrapper.%s","fingerprint":"%s","fire":"%s","text":"%s"}}}\n' \
-    "$slug" "$detail" "$NOW" "$NOTE" \
-    "$(if [ -n "${SMOKE_CONTROLLER_SEND_TO:-}" ]; then printf '"%s"' "$SMOKE_CONTROLLER_SEND_TO"; else printf null; fi)" \
-    "$slug" "$day" "$slug" "$day" "$day" "$slug" "$NOW" "${ALARM_TEXT//\{slug\}/$slug}"
+    "$slug" "$detail" "$(jesc "$NOW")" "$(jesc "$NOTE")" "$to" \
+    "$slug" "$day" "$slug" "$day" "$day" "$slug" "$(jesc "$NOW")" \
+    "$(jesc "${ALARM_TEXT//\{slug\}/$1}")"
 }
 
 final() { # <data-json> -- the only write to the runner's stdout
   local data="${1:-}"
   if ! jq -e 'type == "object"' <<<"$data" >/dev/null 2>&1; then
-    fail_json "${FAIL_SLUG:-worker-output-invalid}" \
-      "${FAIL_WHY:-the fire printed no usable summary; see the task stderr}" >&3
+    # Whose cause is it? The supervisor's when it decided the fire failed
+    # (FAIL_SLUG); otherwise the WORKER's own slug, read out of its line
+    # without jq (round 7 -- a real cause was being replaced by
+    # "worker-output-invalid" merely because jq was missing); and only when
+    # neither is known does the line say the summary was unusable.
+    local slug detail
+    slug="${FAIL_SLUG:-${WORKER_SLUG:-worker-output-invalid}}"
+    if [ -n "$FAIL_WHY" ]; then
+      detail="$FAIL_WHY"
+    elif [ -n "$WORKER_SLUG" ]; then
+      detail="the worker reported $WORKER_SLUG; its summary could not be rendered here"
+    else
+      detail="the fire printed no usable summary; see the task stderr"
+    fi
+    fail_json "$slug" "$detail" >&3
     exit 0
   fi
   # Two reasons to wake: a well-formed owner step (with {step, runId, brief} on
@@ -161,6 +197,12 @@ export PYTHONDONTWRITEBYTECODE=1
 
 DATA="$(timeout -k 2 "$BUDGET" python3 "$SCRIPT_DIR/smoke-controller-live-worker.py")"
 RC=$?
+# The worker's own cause, taken from the raw line before anything can rewrite
+# it, with bash's regex engine rather than jq: the whole point is to still have
+# it when jq is gone. Bounded to the slug charset and length the worker emits.
+if [[ "$DATA" =~ \"failure\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9][A-Za-z0-9._:-]{0,63})\" ]]; then
+  WORKER_SLUG="${BASH_REMATCH[1]}"
+fi
 if [ -z "$DATA" ]; then
   # The worker never got to speak. That is a failure like any other, and it
   # carries the same fields the worker's own ends do, so final() wakes the
