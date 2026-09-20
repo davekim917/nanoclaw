@@ -1261,9 +1261,22 @@ function pruneOneWorkgroupCompatLinks(
 ): void {
   assertTrustedPathSegment(workgroupId, 'workgroup id');
   const wgDir = workgroupSharedDir(workgroupId, ctx.dataDir);
-  // Same predicate as the mount: where `/workspace/workgroup` is not mounted
-  // these links are not this mechanism's to judge.
-  if (!WORKGROUP_SHARED_FS && !fs.existsSync(path.join(wgDir, MIGRATION_MARKER))) return;
+  // The marker, NOT the mount predicate the other steps use. A link of the
+  // shape this function deletes can only have been written by
+  // `migrateWorkgroup`, which writes the marker at `:782` — so no marker means
+  // nothing of that shape is this function's to judge. (`ensureWorkgroupWorkDirs`
+  // also writes a compat link under the flag alone, but only for `artifacts`,
+  // which is reserved and never reaches the loop below.)
+  //
+  // Accepting the flag alone here would be fail-OPEN in the shape most likely
+  // to occur. If `wgDir` is lost — an unmounted volume, a partial restore, an
+  // agent's `rm -rf` — the marker goes with it, and step 2's
+  // `mkdirSync(wgDir/artifacts, { recursive: true })` (`:861`) RECREATES the
+  // directory before this runs. The listing below then succeeds, returning
+  // `['artifacts']`, and every real name reads as gone: on a six-member
+  // workgroup that is every compat link deleted in one boot. The
+  // `readdir`-throws bail cannot catch it, because nothing throws.
+  if (!fs.existsSync(path.join(wgDir, MIGRATION_MARKER))) return;
 
   // One listing, and a failure means "cannot tell", never "nothing is there".
   let sharedNames: Set<string>;

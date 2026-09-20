@@ -139,7 +139,9 @@ describe('pruneDanglingWorkgroupCompatLinks', () => {
 
   it('leaves a clone-as-codex relative sibling link', () => {
     markMigrated();
-    fs.mkdirSync(path.join(groupsDir, 'wgx', 'sources'), { recursive: true });
+    // Deliberately NO real `groups/wgx/sources`: with one, clause 6 (the seed
+    // real-dir guard) keeps the link before the shape clause is ever consulted,
+    // and this test stops killing the mutation it exists for.
     linkInto('wgx-codex', 'sources', '../wgx/sources');
 
     run();
