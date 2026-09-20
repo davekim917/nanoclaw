@@ -20,8 +20,19 @@
  * The same check runs again at admission, right before the wake row is written.
  * Only then is the message sent to TypeSafe's Jev with one question — does it
  * commit to further work on the agent's own initiative — and a probability at
- * or above PROMISE_THRESHOLD counts (precision 0.92 on 150 hand-labelled
- * finals at that threshold).
+ * or above PROMISE_THRESHOLD counts.
+ *
+ * On that threshold, honestly: it was chosen against 150 hand-labelled finals
+ * that measured precision 0.92, but **that labelled set was never checked in**,
+ * so the figure cannot be re-derived and this comment should not be read as
+ * evidence for it. Two consequences. The threshold is carried over validly only
+ * because PROMISE_QUESTION has never been reworded (`git log -p --follow` shows
+ * no line removing it since `eac501613` introduced both together) — a threshold
+ * does not survive a reword of its question. And until a labelled set exists in
+ * the repo, a reworded question is not merely unvalidated but *unvalidatable*:
+ * there is nothing to derive a new threshold against. Anything resting on this
+ * classifier's precision should rest on flags hand-read during `shadow`, which
+ * are checkable, not on 0.92.
  *
  * Modes (`NANOCLAW_PROMISE_WATCH`): `off` (default — agent text leaves the host
  * for TypeSafe only when an operator opts in), `shadow` (log the decision, wake
