@@ -696,6 +696,72 @@ describe('formatSystemMessage', () => {
     expect(result).toContain('SipTrue DNS is managed in Wix.');
     expect(result).not.toContain('[Trusted runtime capability state]');
     expect(result).not.toContain('[Untrusted recalled evidence - malformed structured payload]');
+    // Host-side bookkeeping never reaches the prompt — see the projection
+    // comment above formatRecallContext. The stored row keeps it for dedup.
+    expect(result).not.toContain('memory:fingerprint');
+  });
+
+  it('sends an excerpt as content, not as host bookkeeping', () => {
+    insertMessage('sys-projection', 'system', {
+      subtype: 'recall_context',
+      provider: 'claude',
+      contextEpoch: 1,
+      memoryEvidence: { core: [], excerpts: [] },
+      conversationEvidence: {
+        excerpts: [
+          {
+            id: 'msg-1',
+            agentGroupId: 'ag-abc',
+            messagingGroupId: 'mg-def',
+            channelType: 'slack-acme',
+            channelName: '#build-room',
+            platformId: 'slack:C0BM',
+            threadId: 'slack:C0BM:1789845373.759269',
+            role: 'assistant',
+            senderId: 'ag-abc',
+            senderName: 'Reviewer',
+            text: 'The release gate refused an incomplete consensus.',
+            sentAt: '2026-09-19T19:39:11.947Z',
+            rank: 'current-thread',
+            score: 51001057065,
+            fingerprint: 'conversation:fingerprint',
+            provenance: { authority: 'host-message-archive', archiveId: 'msg-1' },
+          },
+        ],
+      },
+      notices: [],
+    });
+
+    const result = formatMessages(getPendingMessages());
+
+    // What the agent needs to read and cite the excerpt.
+    expect(result).toContain('The release gate refused an incomplete consensus.');
+    expect(result).toContain('Reviewer');
+    expect(result).toContain('#build-room');
+    expect(result).toContain('"msg-1"');
+    expect(result).toContain('current-thread');
+    // What only the host reads — 43% of this block on live traffic.
+    expect(result).not.toContain('conversation:fingerprint');
+    expect(result).not.toContain('host-message-archive');
+    expect(result).not.toContain('slack:C0BM');
+    expect(result).not.toContain('mg-def');
+    expect(result).not.toContain('51001057065');
+  });
+
+  it('passes a misshapen evidence payload through rather than dropping it', () => {
+    insertMessage('sys-odd-shape', 'system', {
+      subtype: 'recall_context',
+      provider: 'claude',
+      contextEpoch: 1,
+      memoryEvidence: { core: [], excerpts: 'not-an-array' },
+      conversationEvidence: { excerpts: ['a bare string excerpt'] },
+      notices: [],
+    });
+
+    const result = formatMessages(getPendingMessages());
+
+    expect(result).toContain('not-an-array');
+    expect(result).toContain('a bare string excerpt');
   });
 
   it('test_formatSystemMessage_action_result', () => {
