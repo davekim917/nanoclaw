@@ -89,7 +89,7 @@ export function buildContainerCodexConfig(): string {
     // Kept byte-identical with CONTAINER_CODEX_CONFIG_BASE in
     // container/agent-runner/src/codex-companion-setup.ts (parallel Bun tree,
     // no shared modules); src/provider-surfaces.test.ts proves the two agree.
-    'max_concurrent_threads_per_session = 4',
+    'max_concurrent_threads_per_session = 5',
     '',
     ...CONTAINER_TRUSTED_PROJECTS.flatMap((proj) => [`[projects."${proj}"]`, 'trust_level = "trusted"', '']),
   ].join('\n');

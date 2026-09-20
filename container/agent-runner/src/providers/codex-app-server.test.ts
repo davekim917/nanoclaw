@@ -308,12 +308,16 @@ describe('createCodexConfigOverrides', () => {
   it('uses the configured native subagent concurrency default', () => {
     const overrides = createCodexConfigOverrides();
     expect(overrides).toContain('features.multi_agent=true');
-    expect(overrides).toContain('agents.max_concurrent_threads_per_session=4');
+    expect(overrides).toContain('agents.max_concurrent_threads_per_session=5');
   });
 
   it('honors the validated per-group native subagent concurrency override', () => {
-    expect(createCodexConfigOverrides({ max_concurrent_threads_per_session: 5 })).toContain(
-      'agents.max_concurrent_threads_per_session=5',
+    // NOT the default value. This asserted 5 while the default was 4, so when
+    // the default moved to 5 it kept passing — and would keep passing if the
+    // override were ignored entirely. A test whose expectation equals the
+    // fallback cannot observe the behaviour it names.
+    expect(createCodexConfigOverrides({ max_concurrent_threads_per_session: 7 })).toContain(
+      'agents.max_concurrent_threads_per_session=7',
     );
   });
 

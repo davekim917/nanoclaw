@@ -153,7 +153,7 @@ describe('buildRuntimeConfig', () => {
     // Operator, 2026-09-17: no global subagent effort — Codex's native default
     // unless the spawn or the role names one (matches the host config).
     expect(config).not.toContain('default_subagent_reasoning_effort');
-    expect(config).toContain('max_concurrent_threads_per_session = 4');
+    expect(config).toContain('max_concurrent_threads_per_session = 5');
     expect(config).not.toContain('multi_agent_v2');
     expect(config).not.toContain('remote_control');
     expect(config).toContain('[projects."/workspace/agent"]');

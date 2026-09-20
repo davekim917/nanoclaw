@@ -6485,10 +6485,13 @@ async function buildContainerArgs(
   // Allow long foreground worker-codex calls without lengthening the default
   // timeout for ordinary Bash calls.
   args.push('-e', 'BASH_MAX_TIMEOUT_MS=3600000');
-  args.push('-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80');
-  // CLAUDE_CODE_AUTO_COMPACT_WINDOW (paired with the percentage above) and the
-  // subagent caps are emitted by claudeSpawnEnv (src/claude-spawn-defaults.ts)
-  // so the wiki spawn branch above, which returns early, gets the same values.
+  // CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80 was emitted here until 2026-09-19.
+  // Dropped with the window move to 600k: compaction now lands wherever the
+  // CLI's own default percentage puts it, and fast-jev-compaction's
+  // `session.compact` hook does the compaction whichever trigger fires it.
+  // CLAUDE_CODE_AUTO_COMPACT_WINDOW and the subagent caps are emitted by
+  // claudeSpawnEnv (src/claude-spawn-defaults.ts) so the wiki spawn branch
+  // above, which returns early, gets the same values.
   // (Removed 2026-06-10: CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 +
   // MAX_THINKING_TOKENS=127999. They forced the CLI's legacy fixed-budget
   // thinking mode for explicit 4-6 selections so thinking blocks stayed

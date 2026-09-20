@@ -145,7 +145,7 @@ const CONTAINER_CODEX_CONFIG_BASE = [
   // A plain literal, not a template: src/provider-surfaces.test.ts evaluates
   // THIS array literal in a bare `new Function` scope to compare it against the
   // host's, so the literal may reference only bindings that test supplies.
-  'max_concurrent_threads_per_session = 4',
+  'max_concurrent_threads_per_session = 5',
   '',
   ...['/workspace/agent', '/workspace/workgroup', '/workspace/worktrees', '/tmp'].flatMap((proj) => [
     `[projects."${proj}"]`,

@@ -28,16 +28,39 @@ export type ClaudeSpawnConfig = Pick<
  * settings pin can never disagree with the `-e` the spawn path sends.
  *
  * Auto-compact window default: Claude Code 2.1+ has a built-in window well
- * under 200k even on a [1m] model; 1_000_000 matches the [1m] capacity so
- * CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80 fires around 800k. A group lowers it via
+ * under 200k even on a [1m] model. It was 1_000_000 — the [1m] capacity — with
+ * CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80 firing compaction around 800k. Both moved
+ * on 2026-09-19 (operator decision): the window is 600_000 and the percentage
+ * override is gone, so the CLI's own default percentage decides where
+ * compaction lands within that window. Compaction ITSELF is unchanged either
+ * way — fast-jev-compaction registers a `session.compact` hook, which runs for
+ * whichever trigger fires, so these two values move WHEN a session compacts,
+ * never HOW. A group lowers it via
  * container.json `autoCompactWindow` (§0.5). Subagent caps: CLI defaults are
- * depth 3 / concurrency 20; the orchestrate contract forbids workers
- * re-delegating (depth 1 enforces it) and concurrency 3 bounds the
- * five-hour-meter burst (§0.1/0.2).
+ * depth 3 / concurrency 20; these sit under that to bound the five-hour-meter
+ * burst (§0.1/0.2).
+ *
+ * Raised 2026-09-19 from depth 1 / concurrency 3 to match the operator's own
+ * host settings, so a container fans out the same way an interactive session
+ * does. Depth 1 previously PREVENTED a worker from delegating further; depth 2
+ * allows it, which is the intent — nothing forbids re-delegation now, and the
+ * installed orchestrate worker definitions never did
+ * (`~/plugins/bootstrap/plugins/orchestrate/agents/worker-high.md:8` just says
+ * to execute the prompt).
+ *
+ * Concurrency is NOT per-parent, so depth 2 does not square it: the pinned CLI
+ * shares one running-subagent counter and task registry across nested agents,
+ * so 5 is 5 slots for the whole session (excluding the main agent) and depth
+ * only decides how they may nest. It is not an absolute ceiling over every
+ * mechanism either — resumes can bypass admission and agent teams count
+ * separately. Verified against the CLI pinned in container/Dockerfile and
+ * https://code.claude.com/docs/en/sub-agents#concurrent-subagent-limit
+ * (an earlier revision of this comment claimed a 5 × 5 worst case; that was
+ * wrong, and wrong in the direction that understates the budget's tightness).
  */
-export const DEFAULT_CLAUDE_AUTO_COMPACT_WINDOW = 1_000_000;
-export const CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH = '1';
-export const CLAUDE_MAX_CONCURRENT_SUBAGENTS = '3';
+export const DEFAULT_CLAUDE_AUTO_COMPACT_WINDOW = 600_000;
+export const CLAUDE_MAX_SUBAGENT_SPAWN_DEPTH = '2';
+export const CLAUDE_MAX_CONCURRENT_SUBAGENTS = '5';
 
 /** What the claude spawn branch will put in the container's environment. */
 export interface ClaudeSpawnDefaults {

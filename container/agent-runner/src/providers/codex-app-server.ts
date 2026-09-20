@@ -948,4 +948,4 @@ export function createCodexConfigOverrides(
 // workload warrants it. This constant is what actually binds: it is passed as a
 // `-c agents.max_concurrent_threads_per_session=` override at app-server spawn
 // (createCodexConfigOverrides above), which beats the generated config.toml.
-export const DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION = 4;
+export const DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION = 5;
