@@ -7,6 +7,11 @@
   run    replay every corpus campaign through smoke-campaign-controller.py in
          shadow, one fire per */10 tick (each fire executed TWICE), and compare
          the controller's decisions with what actually happened.
+         --effects live runs the same timeline in LIVE mode against the
+         recording fakes (testdata/controller-live-fakes.py): the gate, gh, ncl
+         and enqueue-send are real subprocesses with state, receipts are read
+         back from what was enqueued, and the owner acks each brief. It then
+         also counts, from the fakes' own state, any effect performed twice.
 
 Timeline model. A campaign is claimed at its runId timestamp (the poll that
 claimed it wakes the first fire). Artifacts appear at their recorded mtimes (the
@@ -336,6 +341,9 @@ def replay_barrier(run_dir, phase):
 
 
 def load_controller():
+    # No __pycache__ beside the shipped scripts (smoke-acceptance.test.sh
+    # rejects bytecode there), however the replay is invoked.
+    sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location("smoke_campaign_controller", CONTROLLER_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -372,9 +380,67 @@ def _synthesis_doc(entry, verdict, mode):
             "gaps": [], "dissents": []}
 
 
-def replay_one(ctl, entry, mode, work):
+FAKES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "controller-live-fakes.py")
+LIVE_TOKEN = "owner-replay"
+
+
+def _fake_writes(log):
+    if not os.path.exists(log):
+        return 0
+    return sum(1 for line in open(log) if json.loads(line)["op"] in (
+        "enqueued", "commented", "created", "closed", "finish", "challenger-timeout", "fail-after"))
+
+
+def _fake_duplicates(fake, log):
+    """Effects performed more than once, read from the fakes' own state."""
+    def load(name, default):
+        try:
+            return json.load(open(os.path.join(fake, name)))
+        except FileNotFoundError:
+            return default
+    dups = 0
+    keys = {}
+    for mid in load("enqueue.json", {"messages": {}})["messages"]:
+        k = mid.split("#")[0]
+        keys[k] = keys.get(k, 0) + 1
+    dups += sum(n - 1 for n in keys.values())
+    gh = load("gh.json", {"comments": {}, "issues": []})
+    bodies = [c["body"] for cs in gh["comments"].values() for c in cs] + [i["body"] for i in gh["issues"]]
+    markers = {}
+    for b in bodies:
+        for m in re.findall(r"<!-- smoke-ctl:[0-9a-f]{64} -->", b):
+            markers[m] = markers.get(m, 0) + 1
+    dups += sum(n - 1 for n in markers.values())
+    calls = [json.loads(line) for line in open(log)] if os.path.exists(log) else []
+    dups += max(0, sum(1 for c in calls if c["tool"] == "gate" and c["op"] in ("finish", "challenger-timeout")) - 1)
+    names = {}
+    for t in load("ncl.json", {"tasks": []})["tasks"]:
+        names[t["name"]] = names.get(t["name"], 0) + 1
+    dups += sum(n - 1 for n in names.values())
+    return dups, {"sends": len(load("enqueue.json", {"messages": {}})["messages"]), "ghWrites": len(bodies),
+                  "tasks": sum(names.values()), "gateTerminal": sum(
+                      1 for c in calls if c["tool"] == "gate" and c["op"] in ("finish", "challenger-timeout"))}
+
+
+def _live_inputs(fake, base):
+    try:
+        msgs = json.load(open(os.path.join(fake, "enqueue.json")))["messages"]
+    except FileNotFoundError:
+        msgs = {}
+    with open(os.path.join(base, "receipts.json"), "w") as fh:
+        json.dump({mid: "delivered" for mid in msgs}, fh)
+    try:
+        tasks = json.load(open(os.path.join(fake, "ncl.json")))["tasks"]
+    except FileNotFoundError:
+        tasks = []
+    with open(os.path.join(base, "tasks.json"), "w") as fh:
+        json.dump([{"id": t["series_id"], "name": t["series_id"], "status": t["status"]} for t in tasks], fh)
+
+
+def replay_one(ctl, entry, mode, work, effects="shadow"):
     run, pr, sha = entry["runId"], entry["pr"], entry["sourceSha"]
-    base = os.path.join(work, mode, run)
+    live = effects == "live"
+    base = os.path.join(work, "live", mode, run) if live else os.path.join(work, mode, run)
     state, root, out = (os.path.join(base, d) for d in ("state", "runs", "out"))
     run_dir = os.path.join(root, run)
     os.makedirs(state)
@@ -391,7 +457,29 @@ def replay_one(ctl, entry, mode, work):
         text = buf.getvalue().strip()
         return rc, (json.loads(text.splitlines()[-1]) if text else {})
 
-    rc, _ = call(["init", "--shadow", "--out-dir", out, "--gate-state-dir", state])
+    fake = os.path.join(base, "fake")
+    flog = os.path.join(fake, "calls.ndjson")
+    live_argv = []
+    if live:
+        os.makedirs(fake)
+        os.environ.update({"SMOKE_CONTROLLER_MODE": "live", "FAKE_STATE": fake, "FAKE_LOG": flog,
+                           "FAKE_GATE_STATE": state})
+        with open(os.path.join(fake, "gh.json"), "w") as fh:
+            json.dump({"comments": {}, "issues": [], "prs": {str(pr): {"state": "OPEN"}}}, fh)
+        gate_sh = os.path.join(base, "gate.sh")
+        with open(gate_sh, "w") as fh:
+            fh.write("#!/usr/bin/env bash\nexec python3 {} gate \"$@\"\n".format(FAKES_PATH))
+        with open(os.path.join(base, "cutover.json"), "w") as fh:
+            json.dump({"legacyRuns": []}, fh)
+        live_argv = ["--cutover-json", os.path.join(base, "cutover.json"), "--repo", "acme/app",
+                     "--send-to", "campaign-room", "--gate-cmd", gate_sh,
+                     "--gh-cmd", "python3 " + FAKES_PATH + " gh", "--ncl-cmd", "python3 " + FAKES_PATH + " ncl",
+                     "--enqueue-cmd", "python3 " + FAKES_PATH + " enqueue",
+                     "--receipts-json", os.path.join(base, "receipts.json"),
+                     "--tasks-json", os.path.join(base, "tasks.json")]
+        rc, _ = call(["init", "--out-dir", out, "--gate-state-dir", state])
+    else:
+        rc, _ = call(["init", "--shadow", "--out-dir", out, "--gate-state-dir", state])
     assert rc == 0
     heads = os.path.join(base, "heads.json")
     with open(heads, "w") as fh:
@@ -399,11 +487,13 @@ def replay_one(ctl, entry, mode, work):
     wake = os.path.join(base, "wake.json")
     with open(wake, "w") as fh:
         json.dump({"wakeAgent": True, "data": {"trigger": "pr_build_settled", "runId": run, "pr": pr,
-                                               "sourceSha": sha, "isFreezePr": entry["isFreezePr"]}}, fh)
+                                               "sourceSha": sha, "isFreezePr": entry["isFreezePr"],
+                                               "coordinatorOwnerToken": LIVE_TOKEN}}, fh)
     state_file = os.path.join(state, "pr-{}-state.json".format(pr))
     with open(state_file, "w") as fh:
         json.dump({"schemaVersion": 1, "pr": pr, "activeRunId": run, "activeSha": sha,
-                   "challengerDeadline": iso(deadline), "challengerDisposition": None}, fh)
+                   "challengerDeadline": iso(deadline), "challengerDisposition": None,
+                   "activeLeaseOwner": LIVE_TOKEN, "activeClaimant": "controller"}, fh)
 
     # A file's recorded time is its LAST write. Evidence a marker cites existed
     # when the marker was written, so it appears no later than that marker
@@ -450,20 +540,29 @@ def replay_one(ctl, entry, mode, work):
             elif kind == "synthesis":
                 _write(os.path.join(run_dir, "synthesis.json"), payload)
             ei += 1
-        argv = ["step", "--shadow", "--out-dir", out, "--gate-state-dir", state, "--run-root", root,
-                "--pr-heads-json", heads, "--now", iso(t)]
+        if live:
+            # The retained owner acks each brief as its first act (router).
+            ctl_dir = os.path.join(run_dir, "controller")
+            for name in os.listdir(ctl_dir) if os.path.isdir(ctl_dir) else []:
+                if name.startswith("brief-") and name.endswith(".md"):
+                    open(os.path.join(ctl_dir, name[:-3] + ".ack"), "a").close()
+            _live_inputs(fake, base)
+        argv = ["step"] + ([] if live else ["--shadow"]) + ["--out-dir", out, "--gate-state-dir", state,
+                                                            "--run-root", root, "--pr-heads-json", heads,
+                                                            "--now", iso(t), "--fire", iso(t)] + live_argv
         if first:
             argv += ["--poll-json", wake]
         results = []
-        for rep in (0, 1):  # every fire replayed twice
+        for rep in (0, 1):  # every fire replayed twice, on the same inputs
             before = sum(1 for _ in open(journal))
+            wbefore = _fake_writes(flog) if live else 0
             rc, res = call(argv)
             after = sum(1 for _ in open(journal))
             if rc != 0 or res.get("skipped"):  # a skipped fire is a replay that did not happen
                 hard_errors.append({"at": iso(t), "rc": rc, "result": res})
             if rep == 1:
                 dup_records += after - before
-                dup_effects += res.get("effectsRefused", 0)
+                dup_effects += res.get("effectsRefused", 0) if not live else _fake_writes(flog) - wbefore
             results.append(res)
         fires.append({"at": iso(t), "runs": results[0].get("runs", []), "alarms": results[0].get("alarms", [])})
         first = False
@@ -474,7 +573,13 @@ def replay_one(ctl, entry, mode, work):
     records = [json.loads(l) for l in open(journal)]
     dpath = os.path.join(out, run, "decisions.ndjson")
     decisions = [json.loads(l) for l in open(dpath)] if os.path.exists(dpath) else []
-    return summarize(entry, mode, records, decisions, fires, dup_records, dup_effects, hard_errors)
+    result = summarize(entry, mode, records, decisions, fires, dup_records, dup_effects, hard_errors)
+    if live:
+        os.environ.pop("SMOKE_CONTROLLER_MODE", None)
+        fake_dups, counts = _fake_duplicates(fake, flog)
+        result["duplicateEffects"] += fake_dups
+        result["liveEffects"] = counts
+    return result
 
 
 def summarize(entry, mode, records, decisions, fires, dup_records, dup_effects, hard_errors):
@@ -494,6 +599,12 @@ def summarize(entry, mode, records, decisions, fires, dup_records, dup_effects, 
     # one key+attempt that were not a post-reconcile marker search.
     seen, dup_intents = set(), 0
     for r in records:
+        detail = r.get("detail") or {}
+        # An alarm's obligation record (detail.alarm, no attempt: journaled
+        # before, and independently of, any delivery attempt) is not an
+        # attempt intent -- the attempt that follows it is the first one.
+        if detail.get("alarm") and not r.get("attempt"):
+            continue
         if r["state"] == "intent" and not (r.get("detail") or {}).get("ambiguous") \
                 and not (r.get("detail") or {}).get("overdue") and not (r.get("detail") or {}).get("outcome"):
             k = (r["key"], r.get("attempt", 1))
@@ -567,7 +678,7 @@ def run(args):
     ctl = load_controller()
     work = tempfile.mkdtemp(prefix="ctl-replay-")
     try:
-        results = [replay_one(ctl, e, mode, work) for mode in args.modes.split(",") for e in entries]
+        results = [replay_one(ctl, e, mode, work, args.effects) for mode in args.modes.split(",") for e in entries]
     finally:
         if not args.keep:
             shutil.rmtree(work, ignore_errors=True)
@@ -617,6 +728,9 @@ def aggregate(results):
             "rootLagMin": _dist([r["rootLagMin"] for r in rs if r["rootLagMin"] is not None]),
             "alarms": sorted({a for r in rs for a in r["alarms"]}),
         }
+        live_counts = [r["liveEffects"] for r in rs if "liveEffects" in r]
+        if live_counts:
+            m["liveEffects"] = {k: sum(c[k] for c in live_counts) for k in live_counts[0]}
         m["pass"] = m["falseGo"] == 0 and m["duplicates"] == 0 and m["hardErrors"] == 0
         ok = ok and m["pass"]
         report["modes"][mode] = m
@@ -654,6 +768,8 @@ def main(argv=None):
     r.add_argument("--runs")
     r.add_argument("--json-out")
     r.add_argument("--keep", action="store_true")
+    r.add_argument("--effects", choices=("shadow", "live"), default="shadow",
+                   help="live: run the controller in live mode against the recording fakes")
     s = sub.add_parser("scan", help="exit 1 if the file holds credential-shaped content")
     s.add_argument("path")
     bb = sub.add_parser("barrier", help="the replay readiness check, for inspection")

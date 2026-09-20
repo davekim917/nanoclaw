@@ -319,10 +319,75 @@ describe('cli exit contract', () => {
     expect(over).toMatchObject({ exit: 3, out: { ok: false, code: 'budget', alarm: 'controller_send_budget' } });
   });
 
+  test('2 (invalid, not a retryable error) when --text-file cannot be read', async () => {
+    const r = await run([
+      '--id',
+      `${KEY}#1`,
+      '--to',
+      'campaign-room',
+      '--text-file',
+      '/nonexistent/smoke-ctl.txt',
+      '--thread-key',
+      RUN,
+      '--run-id',
+      RUN,
+      '--fire',
+      'f1',
+    ]);
+    expect(r).toMatchObject({ exit: 2, out: { ok: false, code: 'invalid' } });
+  });
+
   test('4 on a payload mismatch for an existing id', async () => {
     enqueueSend(input({ text: 'first' }));
     const r = await run(base(`${KEY}#1`, 'second'));
     expect(r).toMatchObject({ exit: 4, out: { ok: false, code: 'mismatch' } });
+  });
+});
+
+describe("the live wrapper's failure alarm", () => {
+  // The exact `data.alarm` a failing fire emits (smoke-controller-live-worker.py
+  // alarm_payload / smoke-controller-live.sh fail_json), captured from a real
+  // fire. The owner copies these straight onto the CLI
+  // (references/controller-owner-router.md, "A failure wake"), so if this stops
+  // being accepted, the wrapper's only way out is gone.
+  const alarm = {
+    to: 'campaign-room',
+    id: 'ctl.failure.gate-control-unreadable.20260920#1',
+    threadKey: 'ctl.failure-gate-control-unreadable-20260920',
+    runId: 'ctl.wrapper.20260920',
+    fingerprint: 'gate-control-unreadable',
+    fire: '2026-09-20T00:36:02Z',
+    text:
+      'Smoke controller (live): a fire failed closed (gate-control-unreadable). It stopped part-way, so this ' +
+      "fire's effects are UNCERTAIN -- a run may have been claimed, a post or a GitHub write may have landed. " +
+      "Before acting, check the gate state for a run claimed but not advanced, and the controller's journal and " +
+      'fire log. No further fire will advance that run while the cause persists. Posted once a day per cause.',
+  };
+  const send = (): ReturnType<typeof enqueueSend> =>
+    enqueueSend({ ...alarm, outboxRoot: path.join(tmp, 'outbox') });
+
+  test('the wake payload is accepted as written, and the next fire replays it', () => {
+    expect(send().outcome).toBe('enqueued');
+    expect(send().outcome).toBe('replay');
+    expect(rows()).toHaveLength(1);
+    expect(JSON.parse(rows()[0].content).text).toBe(alarm.text);
+  });
+
+  test('the cause slug is legal in the id, the fingerprint and the thread key', () => {
+    expect(code(() => send())).toBe('ok');
+    // Both spellings pass — ID_PATTERN/FINGERPRINT_PATTERN's class `._:-`
+    // includes the underscore. The wrapper spells its slugs with hyphens as
+    // house style, not because `_` would be refused. What IS refused is a
+    // character outside that class, which is what makes the slug worth pinning.
+    expect(code(() => enqueueSend({ ...alarm, id: alarm.id.replace(/-/g, '_') }))).toBe('ok');
+    expect(code(() => enqueueSend({ ...alarm, id: `${KEY}#1`, fingerprint: 'gate control unreadable' }))).toBe(
+      'invalid',
+    );
+    expect(code(() => enqueueSend({ ...alarm, id: 'ctl.failure.slug/20260920#1' }))).toBe('invalid');
+  });
+
+  test('an empty fire is refused, which is why the supervisor always carries one', () => {
+    expect(code(() => enqueueSend({ ...alarm, fire: '' }))).toBe('invalid');
   });
 });
 

@@ -222,6 +222,18 @@ num_env LEASE_TTL_SECONDS SMOKE_GATE_LEASE_TTL_SECONDS 900
 # separate gate processes over a campaign and all of them must count as the
 # same owner; two containers must not. $HOSTNAME is the container id.
 DEFAULT_OWNER="${SMOKE_GATE_OWNER:-${HOSTNAME:-unknown-host}}"
+# Cutover between the legacy coordinator and the smoke campaign controller
+# (smoke-campaign-controller.py, live mode). The controller's task script runs
+# `poll` with SMOKE_GATE_CLAIMANT=controller, and the claim records it as
+# activeClaimant. progress/release/finish/challenger-timeout then refuse any
+# caller whose SMOKE_GATE_CLAIMANT differs from the run's: a legacy session
+# cannot finish a controller run, and the controller cannot finish a run the
+# legacy coordinator claimed before the flip. Empty = legacy (the default).
+CLAIMANT="${SMOKE_GATE_CLAIMANT:-}"
+case "$CLAIMANT" in
+  ""|controller) ;;
+  *) printf '{"ok":false,"error":"SMOKE_GATE_CLAIMANT must be empty or controller"}\n'; exit 2 ;;
+esac
 # Per-PR history stays deployment-local. Coordinator authority does not: every
 # coordinator must see the same lease files and locks through the workgroup
 # mount. SMOKE_GATE_SHARED_ROOT is a test seam; deployments leave it unset.
@@ -1321,6 +1333,20 @@ challenger_deadline_from_now() {
 # transient contention miss on a mandatory `progress` stamp could end a healthy
 # campaign. `retryable:true` plus the `gate_lock_busy:` prefix is the stable,
 # greppable "wait and retry" signal; the not-active refusals carry neither.
+claimant_guard() { # <state-json> <pr> <runId> <command>; refuses (exit 0) on mismatch
+  local stored
+  stored="$(jq -r '.activeClaimant // empty' <<<"$1")"
+  [ "$stored" = "$CLAIMANT" ] && return 0
+  jq -cn --argjson pr "$2" --arg run "$3" --arg cmd "$4" --arg stored "$stored" --arg caller "$CLAIMANT" \
+    '{ok:false,claimantMismatch:true,
+      error:("this run is driven by " + (if $stored == "" then "the legacy coordinator" else "the smoke campaign controller" end) +
+             " and this caller is " + (if $caller == "" then "the legacy coordinator" else "the controller" end) +
+             " - " + $cmd + " refused, nothing changed. Never both act on one run."),
+      pr:$pr,runId:$run,runClaimant:(if $stored == "" then null else $stored end),
+      callerClaimant:(if $caller == "" then null else $caller end)}'
+  exit 0
+}
+
 emit_lock_busy() {
   jq -cn --arg phase "$1" --arg pr "${2:-}" \
     '{ok:false,
@@ -3259,11 +3285,12 @@ if [ "$COMMAND" = "claim" ]; then
   # reclaim reset the clock hourly and made `challenger-timeout` unreachable
   # — pr1432 looped ~4h "stuck waiting on challenger" (2026-09-02).
   STATE="$(jq -c --arg sha "$SHA" --arg now "$NOW" --arg run "$RUN_ID" --arg owner "$OWNER" --arg took "$TOOK_OVER" \
-    --arg deadline "$(challenger_deadline_from_now)" \
+    --arg deadline "$(challenger_deadline_from_now)" --arg claimant "$CLAIMANT" \
     '(if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
       then .challengerDeadline else $deadline end) as $dl |
      .activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=$now |
      .activeLeaseOwner=$owner |
+     .activeClaimant=(if $claimant == "" then null else $claimant end) |
      .displacedRunId=(if $took == "" then null else $took end) |
      .displacedAt=(if $took == "" then null else $now end) |
      .challengerDeadline=$dl |
@@ -3459,6 +3486,7 @@ if [ "$COMMAND" = "progress" ]; then
       '{ok:false,error:"caller owner does not match the owner recorded by claim - STOP this campaign",pr:$pr,runId:$run,requestedBy:$owner,claimedBy:(if $stored == "" then null else $stored end)}'
     exit 0
   fi
+  claimant_guard "$STATE" "$PR" "$RUN_ID" "$COMMAND"
   if ! lease_fence_begin "$PR" "$RUN_ID" "$OWNER" "$COMMAND"; then
     exit 0
   fi
@@ -3513,11 +3541,12 @@ if [ "$COMMAND" = "release" ]; then
       '{ok:false,error:"caller owner does not match the owner recorded by claim - nothing released",pr:$pr,runId:$run,requestedBy:$owner,claimedBy:(if $stored == "" then null else $stored end)}'
     exit 0
   fi
+  claimant_guard "$STATE" "$PR" "$RUN_ID" "$COMMAND"
   if ! lease_fence_begin "$PR" "$RUN_ID" "$OWNER" "$COMMAND"; then
     exit 0
   fi
   STATE="$(jq -c '.activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null |
-     .activeLeaseOwner=null | .challengerDeadline=null | .finishIntent=null' <<<"$STATE")"
+     .activeLeaseOwner=null | .activeClaimant=null | .challengerDeadline=null | .finishIntent=null' <<<"$STATE")"
   # Remove the PR binding and run lease together under the shared locks. Any
   # later failure restores both identities before releasing the fence.
   if ! remove_pr_authority_fenced "$PR" "$RUN_ID" "$OWNER"; then
@@ -4095,6 +4124,7 @@ if [ "$COMMAND" = "finish" ]; then
       '{ok:false,error:"caller owner does not match the owner recorded by claim - no terminal effect attempted",pr:$pr,runId:$run,requestedBy:$owner,claimedBy:(if $stored == "" then null else $stored end)}'
     exit 0
   fi
+  claimant_guard "$STATE" "$PR" "$RUN_ID" "$COMMAND"
   # This shared fence remains held through every terminal effect and the final
   # state transition. Expiry may pass while network work runs, but no successor
   # can reclaim until this locked transition either completes or the process
@@ -4530,7 +4560,7 @@ if [ "$COMMAND" = "finish" ]; then
     '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
      .completedVerdictDigest=$digest | .finishIntent=null |
      .activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null |
-     .activeLeaseOwner=null | .challengerDeadline=null' <<<"$STATE")"
+     .activeLeaseOwner=null | .activeClaimant=null | .challengerDeadline=null' <<<"$STATE")"
   if ! write_pr_state "$PR" "$STATE"; then
     RESTORED=false
     if lease_restore_fenced "$RUN_ID" "$FENCED_LEASE_JSON" &&
@@ -4587,6 +4617,7 @@ if [ "$COMMAND" = "challenger-timeout" ]; then
       '{ok:false,error:"caller owner does not match the owner recorded by claim - challenger timeout refused",pr:$pr,runId:$run,requestedBy:$owner,claimedBy:(if $stored == "" then null else $stored end)}'
     exit 0
   fi
+  claimant_guard "$STATE" "$PR" "$RUN_ID" "$COMMAND"
   DEADLINE="$(jq -r '.challengerDeadline // empty' <<<"$STATE")"
   if [ -z "$DEADLINE" ]; then
     jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
@@ -5351,11 +5382,12 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
   NOW="$(iso_now)"
   # Same-SHA recovery keeps the original challenger deadline (see `claim`).
   STATE="$(jq -c --arg sha "$HEAD_SHA" --arg now "$NOW" --arg run "$RUN_ID" --arg owner "$OWNER_TOKEN" \
-    --arg deadline "$(challenger_deadline_from_now)" \
+    --arg deadline "$(challenger_deadline_from_now)" --arg claimant "$CLAIMANT" \
     '(if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
       then .challengerDeadline else $deadline end) as $dl |
      .activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=null |
      .activeLeaseOwner=$owner |
+     .activeClaimant=(if $claimant == "" then null else $claimant end) |
      .challengerDeadline=$dl |
      .challengerDisposition=null | .challengerTimedOutAt=null | .finishIntent=null' <<<"$STATE")"
   if ! write_pr_state "$W_PR" "$STATE"; then

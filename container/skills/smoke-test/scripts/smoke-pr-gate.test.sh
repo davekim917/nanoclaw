@@ -3023,6 +3023,38 @@ AFTER_EXP="$(jq -r '.expiresAt' "$SMOKE_GATE_LEASE_DIR/lease-run-same-state.json
 [ "$(date -u -d "$AFTER_EXP" +%s)" -ge "$(date -u -d "$BEFORE_EXP" +%s)" ]
 bash "$GATE" release run-same-state owner-b | jq -e '.ok == true and .leaseReleased == true' >/dev/null
 
+# --- 29b. claimant: the controller and the legacy coordinator never both act -
+# A claim made with SMOKE_GATE_CLAIMANT=controller (the live controller's poll)
+# is recorded as activeClaimant; progress/finish/release/challenger-timeout
+# refuse a caller whose claimant differs, with the right owner token or not.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=30
+CTL_SHA="$(sha 7)"
+SMOKE_GATE_CLAIMANT=controller bash "$GATE" claim run-ctl 122 "$CTL_SHA" owner-ctl | jq -e '.ok == true' >/dev/null
+jq -e '.activeClaimant == "controller"' "$STATE_DIR/pr-122-state.json" >/dev/null
+for verb in progress release challenger-timeout; do
+  OUT="$(bash "$GATE" "$verb" run-ctl owner-ctl || true)"
+  jq -e '.ok == false and .claimantMismatch == true and .runClaimant == "controller"' <<<"$OUT" >/dev/null || {
+    echo "legacy caller $verb on a controller run must be refused: $OUT" >&2; exit 1; }
+done
+OUT="$(bash "$GATE" finish "$CTL_SHA" run-ctl GO owner-ctl || true)"
+jq -e '.ok == false and .claimantMismatch == true' <<<"$OUT" >/dev/null || { echo "legacy finish: $OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/runs/run-ctl/verdict.json" ]
+SMOKE_GATE_CLAIMANT=controller bash "$GATE" progress run-ctl owner-ctl | jq -e '.ok == true' >/dev/null
+bash "$GATE" claim run-leg 123 "$CTL_SHA" owner-leg | jq -e '.ok == true' >/dev/null
+jq -e '.activeClaimant == null' "$STATE_DIR/pr-123-state.json" >/dev/null
+OUT="$(SMOKE_GATE_CLAIMANT=controller bash "$GATE" finish "$CTL_SHA" run-leg NO_GO owner-leg || true)"
+jq -e '.ok == false and .claimantMismatch == true and .runClaimant == null' <<<"$OUT" >/dev/null || {
+  echo "the controller must not finish a legacy run: $OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/runs/run-leg/verdict.json" ]
+bash "$GATE" progress run-leg owner-leg | jq -e '.ok == true' >/dev/null
+OUT="$(SMOKE_GATE_CLAIMANT=bogus bash "$GATE" progress run-leg owner-leg || true)"
+jq -e '.ok == false and (.error | test("SMOKE_GATE_CLAIMANT"))' <<<"$OUT" >/dev/null
+SMOKE_GATE_CLAIMANT=controller bash "$GATE" release run-ctl owner-ctl | jq -e '.ok == true' >/dev/null
+jq -e '.activeClaimant == null and .activeRunId == null' "$STATE_DIR/pr-122-state.json" >/dev/null
+bash "$GATE" release run-leg owner-leg | jq -e '.ok == true' >/dev/null
+
 # Expiry ends standalone renew/release authority. Recovery is the serialized
 # same-run claim using the original token, never reviving an expired lease.
 fresh_state
