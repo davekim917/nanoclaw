@@ -938,9 +938,12 @@ function ensureOneWorkgroupWorkDir(
  * opposite of `sameFilesystem`'s own "unknown → copy" advice — written for the
  * migrator, where copy is the safe fallback, and wrong for this caller.
  *
- * Failures are per entry: one unreadable file does not abandon the rest, the
- * failed entry's claim is released so its real name is still free, and the
- * next boot retries whatever is left.
+ * Failures are per entry: one unreadable file does not abandon the rest, a
+ * HANDLED failure releases the entry's claim so its real name is still free,
+ * and the next boot retries whatever is left. A hard death (SIGKILL, power
+ * loss) between the claim and the move runs no release: it leaves an empty
+ * claim at the real name, which the next boot moves aside to
+ * `.from-<member>` rather than reclaiming. No bytes are lost either way.
  */
 function consolidateMemberWorkDir(
   memberWorkDir: string,
@@ -974,11 +977,16 @@ function consolidateMemberWorkDir(
       const dstName = claimSharedName(sharedWorkDir, name, srcIsDir, ctx);
       if (dstName === null) continue;
       const dst = path.join(sharedWorkDir, dstName);
+      // The rename CONSUMES the claim. Anything that throws after it — the
+      // copy branch's source removal — must not run the release, which would
+      // delete the content just moved.
+      let consumed = false;
       try {
         if (strategy === 'rename') {
           // Over this function's own claim, made moments ago: a sibling that
           // tried the same name in between lost to EEXIST, not to us.
           fs.renameSync(src, dst);
+          consumed = true;
         } else {
           const staging = path.join(sharedWorkDir, `.${dstName}.${process.pid}.partial`);
           try {
@@ -991,6 +999,7 @@ function consolidateMemberWorkDir(
             // a filled directory claim fails ENOTEMPTY instead, which is the
             // outcome we want.
             fs.renameSync(staging, dst);
+            consumed = true;
           } finally {
             fs.rmSync(staging, { recursive: true, force: true }); // ours, by pid
           }
@@ -1004,12 +1013,7 @@ function consolidateMemberWorkDir(
         // `artifacts/<name>` reads zero bytes rather than an error — a worse
         // shape than a missing file. rmdir fails ENOTEMPTY if a sibling filled
         // a directory claim, which is the right answer: that content stays.
-        try {
-          if (srcIsDir) fs.rmdirSync(dst);
-          else fs.unlinkSync(dst);
-        } catch {
-          /* somebody else's now, or already gone — either way not ours to remove */
-        }
+        if (!consumed) releaseClaim(dst, srcIsDir);
         log.warn('ensureWorkgroupWorkDirs: could not move entry into the shared tree', { ...ctx, name, err });
         continue;
       }
@@ -1063,6 +1067,7 @@ function claimSharedName(
   isDir: boolean,
   ctx: { workgroupId: string; member: string },
 ): string | null {
+  let lastErr: unknown;
   const claim = (candidate: string): boolean => {
     const at = path.join(sharedWorkDir, candidate);
     try {
@@ -1072,7 +1077,8 @@ function claimSharedName(
         fs.closeSync(fs.openSync(at, 'wx')); // EEXIST if taken
       }
       return true;
-    } catch {
+    } catch (err) {
+      lastErr = err; // EACCES and ENOSPC land here too — don't report them as "taken"
       return false;
     }
   };
@@ -1083,12 +1089,35 @@ function claimSharedName(
   // same member, or any file a sibling wrote — the shared tree is read-write
   // to all of them, so this cannot be narrowed further from here. Either way
   // the entry stays put, and `rmdirSync` below then refuses the directory.
-  log.warn('ensureWorkgroupWorkDirs: name taken in the shared tree, left in place', {
+  log.warn('ensureWorkgroupWorkDirs: could not claim a name in the shared tree, left in place', {
     ...ctx,
     name,
     attempted: aside,
+    err: lastErr,
   });
   return null;
+}
+
+/**
+ * Give back a claim whose move never happened.
+ *
+ * A claim reserves a NAME; it says nothing about what is inside it by the time
+ * the release runs. `rmdir` already refuses a directory a sibling has written
+ * into (`ENOTEMPTY`) — the file half needs the same refusal made explicit, or
+ * a sibling writing into the zero-byte claim between the failed move and here
+ * loses those bytes. Still a check-then-act, but it declines the reachable
+ * case the same way its directory twin does.
+ */
+function releaseClaim(dst: string, isDir: boolean): void {
+  try {
+    if (isDir) {
+      fs.rmdirSync(dst); // ENOTEMPTY if a sibling filled it — their content stays
+    } else if (fs.statSync(dst).size === 0) {
+      fs.unlinkSync(dst);
+    }
+  } catch {
+    /* somebody else's now, or already gone — either way not ours to remove */
+  }
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

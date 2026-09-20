@@ -280,7 +280,7 @@ describe('ensureWorkgroupWorkDirs', () => {
     expect(realRename).toBeDefined();
   });
 
-  it('releasing a claim never takes content a sibling put inside it', () => {
+  it('releasing a directory claim never takes content a sibling put inside it', () => {
     markMigrated();
     run();
     fs.unlinkSync(linkAt('wgx-codex'));
@@ -291,7 +291,7 @@ describe('ensureWorkgroupWorkDirs', () => {
 
     // The sibling writes into the directory claim, then the move fails: the
     // release must be an rmdir that refuses, not a recursive delete.
-    const spy = vi.spyOn(fs, 'renameSync').mockImplementationOnce(((from: fs.PathLike, to: fs.PathLike) => {
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementationOnce(((_from: fs.PathLike, to: fs.PathLike) => {
       fs.writeFileSync(path.join(to as string, 'sibling.md'), 'written mid-boot');
       throw new Error('EIO');
     }) as typeof fs.renameSync);
@@ -303,6 +303,31 @@ describe('ensureWorkgroupWorkDirs', () => {
 
     expect(fs.readFileSync(path.join(sharedWorkDir(), 'proj', 'sibling.md'), 'utf8')).toBe('written mid-boot');
     expect(fs.readFileSync(path.join(own, 'proj', 'mine.md'), 'utf8')).toBe('the members');
+  });
+
+  it('releasing a file claim never takes bytes a sibling wrote into it', () => {
+    // The directory half is protected by rmdir refusing ENOTEMPTY. The file
+    // half needs its own check, or a sibling that writes into our zero-byte
+    // claim between the failed rename and the release loses those bytes.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, 'report.md'), 'the members');
+
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementationOnce(((_from: fs.PathLike, to: fs.PathLike) => {
+      fs.writeFileSync(to as string, 'SIBLING WROTE THIS');
+      throw new Error('EIO');
+    }) as typeof fs.renameSync);
+    try {
+      run();
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md'), 'utf8')).toBe('SIBLING WROTE THIS');
+    expect(fs.readFileSync(path.join(own, 'report.md'), 'utf8')).toBe('the members');
   });
 
   it('leaves the member alone when the move strategy cannot be proven', () => {
