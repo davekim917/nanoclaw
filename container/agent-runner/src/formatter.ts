@@ -658,10 +658,28 @@ function collisionSafeJson(value: unknown, indent?: number): string {
  *
  * Projecting at render time rather than trimming what the host stores is what
  * keeps dedup working: the row keeps every field, and only the prompt loses the
- * ones with no reader. `id` stays — an agent citing recalled evidence in a run
- * record needs something to name it by.
+ * ones with no reader.
+ *
+ * `channelType`, `platformId` and `threadId` stay because they are a tool
+ * contract, not bookkeeping: they are exactly the locator `read_thread` resolves
+ * a thread from (`mcp-tools/thread-search.ts:386-389`), so dropping them would
+ * take away the agent's only deterministic way to open an excerpt's source
+ * thread. `id` does NOT stay: the container's archive projection collapses
+ * sibling copies to `MIN(id)` (src/db/per-agent-projections.ts:229), so a
+ * recalled id need not exist in the archive the container can read, and no tool
+ * accepts one as a locator.
  */
-const CONVERSATION_EXCERPT_FIELDS = ['id', 'role', 'senderName', 'channelName', 'sentAt', 'rank', 'text'] as const;
+const CONVERSATION_EXCERPT_FIELDS = [
+  'role',
+  'senderName',
+  'channelName',
+  'channelType',
+  'platformId',
+  'threadId',
+  'sentAt',
+  'rank',
+  'text',
+] as const;
 const MEMORY_EXCERPT_FIELDS = ['path', 'headings', 'text'] as const;
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

@@ -738,14 +738,20 @@ describe('formatSystemMessage', () => {
     expect(result).toContain('The release gate refused an incomplete consensus.');
     expect(result).toContain('Reviewer');
     expect(result).toContain('#build-room');
-    expect(result).toContain('"msg-1"');
     expect(result).toContain('current-thread');
+    // The read_thread locator (mcp-tools/thread-search.ts:386-389) is a tool
+    // contract, not bookkeeping — it stays.
+    expect(result).toContain('slack:C0BM');
+    expect(result).toContain('slack-acme');
     // What only the host reads — 43% of this block on live traffic.
     expect(result).not.toContain('conversation:fingerprint');
     expect(result).not.toContain('host-message-archive');
-    expect(result).not.toContain('slack:C0BM');
     expect(result).not.toContain('mg-def');
+    expect(result).not.toContain('ag-abc');
     expect(result).not.toContain('51001057065');
+    // Not a locator any tool accepts, and the container's archive collapses
+    // sibling copies to MIN(id) (src/db/per-agent-projections.ts:229).
+    expect(result).not.toContain('"id":"msg-1"');
   });
 
   it('passes a misshapen evidence payload through rather than dropping it', () => {
