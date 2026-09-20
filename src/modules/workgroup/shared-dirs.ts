@@ -938,8 +938,9 @@ function ensureOneWorkgroupWorkDir(
  * opposite of `sameFilesystem`'s own "unknown → copy" advice — written for the
  * migrator, where copy is the safe fallback, and wrong for this caller.
  *
- * Failures are per entry: one unreadable file does not abandon the rest, and
- * the next boot retries whatever is left.
+ * Failures are per entry: one unreadable file does not abandon the rest, the
+ * failed entry's claim is released so its real name is still free, and the
+ * next boot retries whatever is left.
  */
 function consolidateMemberWorkDir(
   memberWorkDir: string,
@@ -980,12 +981,35 @@ function consolidateMemberWorkDir(
           fs.renameSync(src, dst);
         } else {
           const staging = path.join(sharedWorkDir, `.${dstName}.${process.pid}.partial`);
-          fs.cpSync(src, staging, { recursive: true, verbatimSymlinks: true });
-          fs.rmSync(dst, { recursive: true, force: true }); // our own empty claim
-          fs.renameSync(staging, dst);
+          try {
+            fs.cpSync(src, staging, { recursive: true, verbatimSymlinks: true });
+            // Straight over the claim, exactly as the rename branch does. NOT
+            // rmSync(dst) first: that would drop the reservation — unreserving
+            // the name for the length of one more syscall, which is the defect
+            // the claim exists to close — and it would recursively delete a
+            // directory claim a sibling had since written into. Renaming onto
+            // a filled directory claim fails ENOTEMPTY instead, which is the
+            // outcome we want.
+            fs.renameSync(staging, dst);
+          } finally {
+            fs.rmSync(staging, { recursive: true, force: true }); // ours, by pid
+          }
           fs.rmSync(src, { recursive: true, force: true });
         }
       } catch (err) {
+        // Release the claim. Without this the move's destination keeps a
+        // zero-byte file or empty directory under the entry's REAL name,
+        // forever: no later boot reclaims it, the content lands at
+        // `.from-<member>` instead, and an agent following the instruction to
+        // `artifacts/<name>` reads zero bytes rather than an error — a worse
+        // shape than a missing file. rmdir fails ENOTEMPTY if a sibling filled
+        // a directory claim, which is the right answer: that content stays.
+        try {
+          if (srcIsDir) fs.rmdirSync(dst);
+          else fs.unlinkSync(dst);
+        } catch {
+          /* somebody else's now, or already gone — either way not ours to remove */
+        }
         log.warn('ensureWorkgroupWorkDirs: could not move entry into the shared tree', { ...ctx, name, err });
         continue;
       }

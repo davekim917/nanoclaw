@@ -250,6 +250,61 @@ describe('ensureWorkgroupWorkDirs', () => {
     expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md'), 'utf8')).toBe('the members own');
   });
 
+  it('releases the claim when a move fails, so the real name is still free next boot', () => {
+    // A claim left behind burns the entry's REAL name permanently: the content
+    // lands at `.from-<member>` and an agent following the instruction to
+    // `artifacts/<name>` reads zero bytes instead of an error.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, 'report.md'), 'THE ONLY COPY');
+
+    const realRename = fs.renameSync;
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementationOnce(() => {
+      throw new Error('EIO');
+    });
+    try {
+      run(); // boot 1: the move fails
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.existsSync(path.join(sharedWorkDir(), 'report.md'))).toBe(false);
+    expect(fs.readFileSync(path.join(own, 'report.md'), 'utf8')).toBe('THE ONLY COPY');
+
+    run(); // boot 2: retries, and gets the real name
+
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md'), 'utf8')).toBe('THE ONLY COPY');
+    expect(fs.existsSync(path.join(sharedWorkDir(), 'report.md.from-wgx-codex'))).toBe(false);
+    expect(realRename).toBeDefined();
+  });
+
+  it('releasing a claim never takes content a sibling put inside it', () => {
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.mkdirSync(path.join(own, 'proj'));
+    fs.writeFileSync(path.join(own, 'proj', 'mine.md'), 'the members');
+
+    // The sibling writes into the directory claim, then the move fails: the
+    // release must be an rmdir that refuses, not a recursive delete.
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementationOnce(((from: fs.PathLike, to: fs.PathLike) => {
+      fs.writeFileSync(path.join(to as string, 'sibling.md'), 'written mid-boot');
+      throw new Error('EIO');
+    }) as typeof fs.renameSync);
+    try {
+      run();
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'proj', 'sibling.md'), 'utf8')).toBe('written mid-boot');
+    expect(fs.readFileSync(path.join(own, 'proj', 'mine.md'), 'utf8')).toBe('the members');
+  });
+
   it('leaves the member alone when the move strategy cannot be proven', () => {
     // sameFilesystem answers "different" when stat fails, which sends its
     // caller down the copy path. Copy is the branch with the unguarded window,
