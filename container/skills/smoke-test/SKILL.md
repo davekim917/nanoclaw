@@ -1608,6 +1608,43 @@ owner with a `failure` slug instead of a step; the owner then posts one
 operator alarm and takes no campaign action — same router file, "A failure
 wake".
 
+#### The claim renewer (required alongside the live controller)
+
+A live controller needs a second, script-only series: `scripts/smoke-controller-renew.sh`.
+
+```bash
+ncl tasks create --name smoke-controller-renew \
+  --recurrence '*/5 * * * *' \
+  --script 'bash /app/skills/smoke-test/scripts/smoke-controller-renew.sh' \
+  --prompt 'Never runs: this series gates every fire.'
+```
+
+Without it, a judgment step longer than the gate's 900-second lease strands
+its run. The lease's only stamp is `progress`, and neither party can issue one
+during a long step: the controller's series arms its next occurrence only when
+the current one resolves, so it cannot fire while the owner's turn is running,
+and the owner is refused `progress` as a claimant mismatch. On PR #2022 that
+cost a 13-lane step four lane markers and finished the run `BLOCKED`
+(XZO #2024).
+
+The renewer is its own series, so its own session and container: neither the
+owner's turn nor the controller's cadence can hold it up. Each tick reads the
+controller's journal read-only and stamps `progress` for a run only while all
+of these hold — an owner obligation whose newest record is `enqueued`, its
+`<run>/controller/brief-<step>.ack` present (the owner writes that ack first
+and withdraws it to hand the step back), an open `run/claim` obligation
+carrying the owner token, and the step younger than the 3600-second ceiling
+(`OWNER_STEP_SLA_SECONDS`, the same clock the controller calls a step overdue
+on). Past the ceiling it stops and the existing overdue path takes over.
+
+It renews and does nothing else — no claim, finish, release, poll, post or
+journal write — and it never wakes an agent: every tick's last line is
+`wakeAgent:false`. Every failure path renews nothing, so a renewer that dies,
+is paused or is misconfigured degrades to the claim expiring on its own TTL,
+never to a run that looks alive while nothing is working it. It shares the
+controller's kill switch: `SMOKE_CONTROLLER_MODE` other than `live` makes a
+tick a no-op.
+
 - **Challenger**: in the `challenger/challenge.complete.json` it already
   writes, add `dissents`: one entry per disputed finding, `[{"id": "<finding
   id or D-n>"}]`, with unique, non-empty ids. Use `[]` only with
