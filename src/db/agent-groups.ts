@@ -122,7 +122,9 @@ export async function getWorkgroupOnecliSecretsById(workgroupId: string): Promis
  * into SQL against a JSON text column.
  */
 export async function getAllWorkgroupOnecliSecrets(): Promise<{ id: string; secrets: string[] }[]> {
-  const rows = await getDb().all<{ id: string; secrets: string }>('SELECT id, onecli_secrets AS secrets FROM workgroups');
+  const rows = await getDb().all<{ id: string; secrets: string }>(
+    'SELECT id, onecli_secrets AS secrets FROM workgroups',
+  );
   return rows.map((row) => ({ id: row.id, secrets: parseSecrets(row) }));
 }
 

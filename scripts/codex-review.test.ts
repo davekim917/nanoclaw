@@ -5592,6 +5592,36 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
       expect(result.stdout).toContain('ci=host');
     });
 
+    // …and the stricter standard is REQUIRED-ONLY, because ci_verdict scores
+    // a non-required workflow with `neutral`/`skipped` as green. `cancelled`
+    // is not green there, so it still disqualifies — it is the routine output
+    // of `concurrency: cancel-in-progress`, and a non-required workflow whose
+    // older run was cancelled is red on its own account anyway.
+    it.each<[string, number]>([
+      ['skipped', 0],
+      ['neutral', 0],
+      ['cancelled', 24],
+    ])('scores a NON-required workflow whose older run was %s the way ci_verdict does', (conclusion, status) => {
+      const root = tempRoot();
+      const result = mergeCheck(
+        root,
+        (r) => [
+          workflowRun('CI', 'completed', 'success'),
+          workflowRun('Docs', 'completed', conclusion, '2026-09-05T00:01:30Z'),
+          failedRun(r, false, 'Docs', '2026-09-05T00:05:00Z'),
+        ],
+        [commitStatus(HOST, 'success')],
+      );
+      expect(result.status).toBe(status);
+      if (status === 0) {
+        // The never-started Docs run keeps its excuse, and because Docs is not
+        // required, an excused run is simply left out — the head is plain green.
+        expect(result.stdout).toContain('ci=green');
+      } else {
+        expect(result.stderr).toContain('Docs=failure');
+      }
+    });
+
     it('refuses when an earlier ATTEMPT of the same run really failed', () => {
       const root = tempRoot();
       const result = mergeCheck(root, (r) => [rerunRun(r, [true, false])], [commitStatus(HOST, 'success')]);
@@ -5904,30 +5934,44 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
       });
 
       // #937 B3. `reviewDecision` is GitHub's own answer to "is the review
-      // requirement met", and it already counts only write-access approvals —
-      // so this asks it instead of counting approvals itself. Verified live:
-      // `PullRequest.reviewDecision` exists with enum
-      // CHANGES_REQUESTED | APPROVED | REVIEW_REQUIRED.
-      it('takes reviewDecision as the authority instead of counting approvals', () => {
-        // A rule that requires an approval, with GitHub saying it is met.
-        const rules = RULES.map((rule) =>
+      // requirement met", so it is asked rather than recomputed — but it is
+      // NOT a substitute for reading the base rules. Measured: XZO ruleset
+      // 21204871 is active on the default branch with
+      // require_extra_approval_for_unattributed_changes: true, and XZO PR
+      // #1965 (open, on that branch, 3 unattributed commits) reports
+      // reviewDecision: null. So reviewDecision does not surface that rule's
+      // review parameters, and the sibling parameter in the same rule object
+      // cannot be assumed to fare better. Both authorities, both fail-closed.
+      const withApprovalCount = (count: number): Page[] =>
+        RULES.map((rule) =>
           rule.type === 'pull_request'
-            ? { ...rule, parameters: { ...(rule.parameters as Page), required_approving_review_count: 1 } }
+            ? { ...rule, parameters: { ...(rule.parameters as Page), required_approving_review_count: count } }
             : rule,
         );
-        expect(admin(tempRoot(), GREEN, { reviewDecision: 'APPROVED' }, rules).stdout).toContain('admin=ready');
-        // The same rule with GitHub saying it is not.
-        expect(admin(tempRoot(), GREEN, { reviewDecision: 'REVIEW_REQUIRED' }, rules).stdout).toContain(
-          'admin=not-ready',
-        );
-        // And no arithmetic of our own: an approving review with no decision
-        // from GitHub neither creates nor satisfies a requirement.
-        expect(admin(tempRoot(), GREEN, { approvals: ['reviewer'] }, rules).stdout).toContain('admin=ready');
+
+      it('refuses a required_approving_review_count even when reviewDecision says APPROVED', () => {
+        const result = admin(tempRoot(), GREEN, { reviewDecision: 'APPROVED' }, withApprovalCount(2));
+        expect(result.stdout).toContain('admin=not-ready');
+        expect(result.stdout).toContain('the base rules require 2 approving review(s)');
       });
 
-      // The one approval fact kept out of reviewDecision's hands: whether that
-      // rulesets-only parameter feeds reviewDecision could not be verified on
-      // any repo available here, so it stays its own fail-closed check.
+      // The fail-open shape this guards: a rulesets-only repo with a non-zero
+      // count, no approvals, and reviewDecision null as it is on XZO.
+      it('refuses a required_approving_review_count when reviewDecision says nothing at all', () => {
+        const result = admin(tempRoot(), GREEN, {}, withApprovalCount(2));
+        expect(result.stdout).toContain('admin=not-ready');
+        expect(result.stdout).toContain('the base rules require 2 approving review(s)');
+      });
+
+      it('does no counting of its own: approvals neither create nor satisfy a requirement', () => {
+        // Approvals with the count at 0 (the fleet's actual shape) stay ready…
+        expect(admin(tempRoot(), GREEN, { approvals: ['reviewer'] }).stdout).toContain('admin=ready');
+        // …and approvals never satisfy a positive count.
+        expect(
+          admin(tempRoot(), GREEN, { approvals: ['a', 'b', 'c'] }, withApprovalCount(1)).stdout,
+        ).toContain('admin=not-ready');
+      });
+
       it('still refuses the extra approval an unattributed commit owes, whatever reviewDecision says', () => {
         const result = admin(tempRoot(), GREEN, { unattributed: true, reviewDecision: 'APPROVED' });
         expect(result.stdout).toContain('admin=not-ready');

@@ -84,7 +84,11 @@ vi.mock('./onecli-secret-writer.js', () => ({
 }));
 
 import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
-import { getMcpOAuthIntegration, markMcpOAuthIntegration } from '../../db/mcp-oauth-integrations.js';
+import {
+  getMcpOAuthIntegration,
+  markMcpOAuthIntegration,
+  upsertMcpOAuthIntegration,
+} from '../../db/mcp-oauth-integrations.js';
 import { enforceHermeticity } from '../../test-hermeticity.js';
 import type { FetchLike } from './discovery.js';
 import {
@@ -727,7 +731,7 @@ describe('remove --delete-secret refuses when the bearer is declared elsewhere (
     workgroupDeclaring('main', [secretName, 'Unrelated']);
 
     await expect(removeIntegration('example-int', { deleteSecret: true })).rejects.toThrow(
-      /Refusing to delete .* still declared in 1 place/s,
+      /Refusing to delete .* 1 other place\(s\) this command cannot edit/s,
     );
     await expectUntouched(secretName);
   });
@@ -739,7 +743,7 @@ describe('remove --delete-secret refuses when the bearer is declared elsewhere (
 
     const err = await removeIntegration('example-int', { deleteSecret: true }).catch((e: Error) => e);
     expect(err).toBeInstanceOf(Error);
-    expect((err as Error).message).toContain('still declared in 2 place(s)');
+    expect((err as Error).message).toContain('2 other place(s) this command cannot edit');
     expect((err as Error).message).toContain('workgroup main (workgroups.onecli_secrets)');
     expect((err as Error).message).toContain('workgroup illysium (workgroups.onecli_secrets)');
     // The message has to be actionable, not just a refusal.
@@ -766,6 +770,50 @@ describe('remove --delete-secret refuses when the bearer is declared elsewhere (
     const err = await removeIntegration('example-int', { deleteSecret: true }).catch((e: Error) => e);
     expect((err as Error).message).toContain('declares "secret-uuid-1"');
     await expectUntouched(secretName);
+  });
+
+  // Two integrations in one group can share a `--secret` (the unique index is
+  // on (agent_group_id, mcp_url)). Deleting it takes the credential the
+  // survivor needs and the group's only declaration of it.
+  /** A second integration in `ag-1`, seeded at the row level: the login flow
+   *  would need a whole second discovery stub, and the scan reads the row. */
+  async function siblingIntegration(bearerSecretName: string): Promise<void> {
+    await upsertMcpOAuthIntegration({
+      name: 'sibling-int',
+      agent_group_id: 'ag-1',
+      mcp_url: 'https://other.example.test/mcp',
+      resource: null,
+      authorization_endpoint: 'https://as.example.test/authorize',
+      token_endpoint: 'https://as.example.test/token',
+      registration_endpoint: null,
+      issuer: 'https://as.example.test',
+      scopes: 'a.read',
+      redirect_uri: 'http://127.0.0.1:8765/callback',
+      bearer_secret_name: bearerSecretName,
+      bearer_secret_id: null,
+      host_pattern: 'other.example.test',
+      path_pattern: '/mcp',
+      status: 'active',
+      status_detail: null,
+      expires_at: null,
+      last_refresh_at: null,
+    });
+  }
+
+  it('refuses when another integration in the same group shares the bearer', async () => {
+    const secretName = await connected();
+    await siblingIntegration(secretName);
+
+    const err = await removeIntegration('example-int', { deleteSecret: true }).catch((e: Error) => e);
+    expect((err as Error).message).toContain(`integration sibling-int (agent group ag-1) uses "${secretName}"`);
+    await expectUntouched(secretName);
+  });
+
+  it('proceeds when another integration in the group uses a different bearer', async () => {
+    await connected();
+    await siblingIntegration('Other-Secret');
+
+    expect((await removeIntegration('example-int', { deleteSecret: true })).removedSecret).toBe(true);
   });
 
   it('proceeds when the other sites declare only unrelated secrets', async () => {

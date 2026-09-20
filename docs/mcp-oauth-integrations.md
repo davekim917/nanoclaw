@@ -246,23 +246,25 @@ ncl integrations remove --name dropbox-files --delete-secret
 ```
 
 `--delete-secret` is **subtractive or nothing**. It refuses, deleting nothing, unless the owning
-group's own `container.json` is the only place the bearer is declared; when it is, it drops the
-declaration there and *then* deletes the vault secret, both inside the per-integration lock.
+group's own `container.json` is the only thing that still depends on the bearer; when it is, it
+drops the declaration there and *then* deletes the vault secret, both inside the per-integration
+lock.
 
 The refusal is the important half, because a declaration lives in two kinds of place and the spawn
 takes their **union** — `workgroups.onecli_secrets` merged with the group's own
 `onecliSecrets`, where neither list can subtract from the other. Deleting a secret that any
 workgroup still declares aborts **every spawn of every group in that workgroup**, not just this
-one; deleting one another group's `container.json` still names breaks that group. So the command
-lists each site and what to edit, and stops:
+one; deleting one another group's `container.json` still names breaks that group. Two integrations
+in one group can also share a `--secret`, and deleting it takes the credential the survivor needs.
+So the command lists everything it found and what to do about it, and stops:
 
 ```
-Refusing to delete "Littlebird": it is still declared in 7 place(s) this command cannot edit, and
-deleting it would abort every spawn that inherits the declaration. Nothing was deleted.
+Refusing to delete "Littlebird": 7 other place(s) this command cannot edit still depend on it, and
+deleting it would break them. Nothing was deleted.
   - workgroup main (workgroups.onecli_secrets) declares "Littlebird" — pnpm exec tsx scripts/set-workgroup-secrets.ts main --secrets <the list without "Littlebird">
   …
-Drop those declarations first, then run this again. To end the integration without touching the
-secret, use `ncl integrations remove --name littlebird` on its own.
+Clear those first, then run this again. To end the integration without touching the secret, use
+`ncl integrations remove --name littlebird` on its own.
 ```
 
 Both spellings a declaration can take are matched — the secret's name and its vault UUID, either of
