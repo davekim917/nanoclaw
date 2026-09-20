@@ -199,9 +199,10 @@ describe('pruneDanglingWorkgroupCompatLinks', () => {
     );
   });
 
-  // The listing counts a NAME, not a resolvable path. An `existsSync`
-  // re-confirm before the unlink would disagree with it here and prune a link
-  // whose shared entry exists but does not resolve.
+  // Regression guard only: `sharedNames.has` short-circuits before the
+  // re-confirm, so this shape kills no mutation on its own — the raced test
+  // below is what covers `lstat` vs `existsSync`. Kept because it pins the
+  // listing's name semantics against a future resolve-based rewrite.
   it('keeps a link whose shared entry is itself a dangling symlink', () => {
     markMigrated();
     fs.symlinkSync('/nonexistent-target', path.join(workgroupSharedDir('wgx', dataDir), 'wt-indirect'));
@@ -235,6 +236,43 @@ describe('pruneDanglingWorkgroupCompatLinks', () => {
 
     readdir.mockRestore();
     expect(exists(memberLink('wgx', 'wt-raced'))).toBe(true);
+  });
+
+  // The clause the source calls the one that matters. The `lstat` re-confirm
+  // masks it in every other fixture, so this is the only shape that kills it:
+  // the shared tree disappears AFTER its listing succeeded, so every re-confirm
+  // answers "gone" and only the listing stands between a transient mount fault
+  // and deleting the workgroup's entire compat layer.
+  it('keeps links when the shared tree vanishes after its listing succeeded', () => {
+    markMigrated();
+    const wgDir = workgroupSharedDir('wgx', dataDir);
+    sharedEntry('wt-live');
+    linkInto('wgx', 'wt-live');
+    const realReaddir = fs.readdirSync;
+    const readdir = vi.spyOn(fs, 'readdirSync').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      const out = (realReaddir as unknown as (...a: unknown[]) => unknown)(p, ...rest);
+      if (String(p) === wgDir) fs.rmSync(wgDir, { recursive: true, force: true });
+      return out;
+    }) as typeof fs.readdirSync);
+
+    run();
+
+    readdir.mockRestore();
+    expect(exists(memberLink('wgx', 'wt-live'))).toBe(true);
+  });
+
+  // reconcileWorkgroupSharedDirs re-derives the established shared set from
+  // these links later in the same boot: a sibling link whose name the seed
+  // still holds as a real dir is unioned back in. Pruning it first un-shares
+  // that directory silently.
+  it('keeps a sibling link whose name the seed still holds as a real dir', () => {
+    markMigrated();
+    fs.mkdirSync(path.join(groupsDir, 'wgx', 'dbt-scratch'), { recursive: true });
+    linkInto('wgx-codex', 'dbt-scratch');
+
+    run();
+
+    expect(exists(memberLink('wgx-codex', 'dbt-scratch'))).toBe(true);
   });
 
   it('reports what it removed', () => {

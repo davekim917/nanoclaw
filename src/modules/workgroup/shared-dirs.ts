@@ -1304,6 +1304,16 @@ function pruneOneWorkgroupCompatLinks(
       // dangling symlink — the opposite of what the listing decided. This can
       // only ever KEEP more links than the listing did.
       if (lstatOrNull(path.join(wgDir, entry.name))) continue;
+      // `reconcileWorkgroupSharedDirs` runs LATER in this same boot
+      // (main.ts:515) and re-derives the established shared set from exactly
+      // these links: a sibling symlink whose name the seed still holds as a
+      // real dir is unioned back in (the union at `:567`, gated on
+      // `isRealDir(seedEntry)` at `:582`; seed folder == workgroup id, `:542`).
+      // Deleting one first would silently un-share that directory —
+      // it falls into `candidates` and stays private to the seed, with no
+      // warn. Keep the link and let the migrator re-point it; the empty
+      // `wgDir` entry it is waiting for is the migrator's to create.
+      if (isRealDir(path.join(ctx.groupsDir, workgroupId, entry.name))) continue;
       try {
         fs.unlinkSync(linkPath);
         pruned.push(entry.name);

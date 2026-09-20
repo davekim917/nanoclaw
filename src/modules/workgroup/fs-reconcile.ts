@@ -60,8 +60,11 @@ export function reconcileWorkgroupFsState(db: Database.Database): void {
   ensureWorkgroupWorkDirs(db);
 
   // ── 3. Prune compat links whose shared target is gone ──────────────────
-  // After step 2, which must not be judged against a listing taken before it
-  // created `artifacts`. It is NOT the boot's last writer to the shared tree:
+  // After step 2, which creates `wgDir` itself (shared-dirs.ts:861) when the
+  // flag is on — run first, the listing below throws ENOENT and every
+  // flag-on-but-unmigrated workgroup prunes nothing and warns each boot. (Not
+  // for `artifacts`: that name is reserved and never considered here.)
+  // Step 3 is NOT the boot's last writer to the shared tree:
   // this whole function runs at src/main.ts:683, and runBootMountQuiescence at
   // :693 then calls reconcileWorkgroupSharedDirs (:515) and the memory gate
   // (:521), both of which add names after this prune has read its listing.
