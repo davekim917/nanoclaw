@@ -218,6 +218,63 @@ describe('ensureWorkgroupWorkDirs', () => {
     expect(fs.readlinkSync(linkAt('wgx-codex'))).toBe(LINK_TARGET);
   });
 
+  it('claims the destination name before moving, rather than checking it is free', () => {
+    // The shared tree is read-write in every sibling container and this runs
+    // before quiescence. `existsSync` then `rename` leaves a window in which
+    // another claimant sees the same free name; a `wx` create / non-recursive
+    // mkdir loses EEXIST in the kernel instead. The observable difference is
+    // that the destination ALREADY EXISTS when the move runs — a check-based
+    // implementation renames onto a name nothing has reserved.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, 'report.md'), 'the members own');
+    fs.mkdirSync(path.join(own, 'nested'));
+
+    const dstExistedAtMove: boolean[] = [];
+    const realRename = fs.renameSync;
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      dstExistedAtMove.push(fs.existsSync(to as string));
+      return realRename(from, to);
+    });
+    try {
+      run();
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(dstExistedAtMove.length).toBe(2); // the file and the directory
+    expect(dstExistedAtMove).toEqual([true, true]);
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md'), 'utf8')).toBe('the members own');
+  });
+
+  it('leaves the member alone when the move strategy cannot be proven', () => {
+    // sameFilesystem answers "different" when stat fails, which sends its
+    // caller down the copy path. Copy is the branch with the unguarded window,
+    // so an unprovable device must decline instead of choosing it.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, 'work.md'), 'kept');
+    const realStat = fs.statSync;
+    const spy = vi.spyOn(fs, 'statSync').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      if (String(p) === own) throw new Error('EIO');
+      return (realStat as (...a: unknown[]) => fs.Stats)(p, ...rest);
+    }) as typeof fs.statSync);
+    try {
+      run();
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(fs.readFileSync(path.join(own, 'work.md'), 'utf8')).toBe('kept');
+    expect(fs.existsSync(path.join(sharedWorkDir(), 'work.md'))).toBe(false);
+  });
+
   it('keeps the directory, and everything in it, when an entry cannot be moved', () => {
     markMigrated();
     run();
@@ -239,6 +296,28 @@ describe('ensureWorkgroupWorkDirs', () => {
     expect(fs.readFileSync(path.join(sharedWorkDir(), 'movable.md'), 'utf8')).toBe('this one can');
     expect(fs.existsSync(path.join(own, 'movable.md'))).toBe(false);
     expect(vi.mocked(log.warn)).toHaveBeenCalled();
+  });
+
+  it('a partly-consolidated member survives the migrator with its unmoved work', () => {
+    // The state this consolidation newly makes routine: an entry that could not
+    // move leaves a REAL artifacts/ in the member folder — the #952 F1 shape,
+    // where the reservation is the only thing standing between that directory
+    // and the migrator's interrupted-move arm. Without it the ONLY copy is
+    // destroyed: never moved to the shared tree, then rmSync'd as the source.
+    markMigrated();
+    run();
+    fs.writeFileSync(path.join(sharedWorkDir(), 'report.md'), 'shared');
+    fs.writeFileSync(path.join(sharedWorkDir(), 'report.md.from-wgx'), 'an earlier consolidation');
+    fs.unlinkSync(linkAt('wgx'));
+    const seedWork = linkAt('wgx');
+    fs.mkdirSync(seedWork);
+    fs.writeFileSync(path.join(seedWork, 'report.md'), 'THE ONLY COPY');
+    fs.mkdirSync(path.join(groupsDir, 'wgx', 'sources'), { recursive: true });
+
+    run();
+    reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+
+    expect(fs.readFileSync(path.join(seedWork, 'report.md'), 'utf8')).toBe('THE ONLY COPY');
   });
 
   it('consolidates an empty directory by simply linking it', () => {

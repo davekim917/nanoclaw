@@ -909,20 +909,34 @@ function ensureOneWorkgroupWorkDir(
  * Drain a member's own real `artifacts/` into the workgroup's shared tree, so
  * the caller can replace it with the compat link.
  *
- * The rules are chosen so this can run unattended on every boot:
+ * Every path here is writable by a live container: the shared tree is mounted
+ * read-write into every sibling, this runs before `runBootMountQuiescence`
+ * proves container absence, and the member's own folder is that member's
+ * `/workspace/agent`. The rules below are what makes that survivable.
  *
- * - **Nothing is ever overwritten.** An entry whose name is free in the shared
- *   tree moves under its own name. One whose name is taken moves to
- *   `<name>.from-<member>` — the content still becomes shared, which is the
- *   point, and neither side loses a byte. Renaming rather than merging also
- *   keeps the operation decidable without reading file contents.
- * - **Each entry moves atomically**, by `rename` within one filesystem, else
- *   copy-to-hidden-staging → `rename` → remove source. A crash can leave a
- *   `.<name>.partial` behind, never a half-populated destination.
- * - **The source directory is removed only when empty**, by `rmdirSync`, which
- *   refuses a non-empty directory. So a member whose entries could not all be
- *   moved keeps its directory and its content, and the caller's warning names
- *   it. There is no path here that deletes something it did not first copy.
+ * - **A destination name is CLAIMED, not checked.** `existsSync` then `rename`
+ *   is a TOCTOU, and `rename(2)` replaces an existing file silently — a
+ *   sibling writing that name inside the window would be destroyed with no
+ *   trace. `claimSharedName` instead creates the destination with `wx` / a
+ *   non-recursive `mkdir`, both of which fail `EEXIST` atomically, and the
+ *   move then renames over this function's OWN claim.
+ * - **A taken name is not merged.** It moves to `<name>.from-<member>`, so the
+ *   content still becomes shared and neither side loses a byte; taken twice,
+ *   the entry stays put. Both `name` (a `readdir` component) and
+ *   `ctx.member` (`assertTrustedPathSegment` at the call site) are single safe
+ *   segments, so the derived names are too.
+ * - **The source directory is removed with `rmdirSync`**, which fails
+ *   `ENOTEMPTY` rather than recursing. A member whose entries could not all
+ *   move keeps its directory and everything in it.
+ *
+ * The cross-device branch is the one place that copies instead of renaming,
+ * and its source removal spans the whole copy — bytes written into the source
+ * during it are lost. It cannot be made atomic without a rewrite this does not
+ * need, so it is entered only when the two paths are PROVEN to be on different
+ * filesystems. An unreadable `stat` is not that proof: it skips the member for
+ * this boot rather than picking the destructive strategy, which is the
+ * opposite of `sameFilesystem`'s own "unknown → copy" advice — written for the
+ * migrator, where copy is the safe fallback, and wrong for this caller.
  *
  * Failures are per entry: one unreadable file does not abandon the rest, and
  * the next boot retries whatever is left.
@@ -940,37 +954,34 @@ function consolidateMemberWorkDir(
     return;
   }
   if (entries.length > 0) {
-    const strategy: 'rename' | 'copy' = sameFilesystem(memberWorkDir, sharedWorkDir) ? 'rename' : 'copy';
+    const strategy = moveStrategy(memberWorkDir, sharedWorkDir);
+    if (strategy === null) {
+      log.warn('ensureWorkgroupWorkDirs: cannot prove a safe move strategy, leaving the member alone', ctx);
+      return;
+    }
     const moved: string[] = [];
     const renamed: string[] = [];
     for (const name of entries) {
       const src = path.join(memberWorkDir, name);
-      let dstName = name;
-      if (fs.existsSync(path.join(sharedWorkDir, dstName))) {
-        dstName = `${name}.from-${ctx.member}`;
-        // Taken twice over: the previous consolidation of this same member
-        // already landed here, so the two are the same content or the operator
-        // has renamed around it. Leave this one for a human either way.
-        if (fs.existsSync(path.join(sharedWorkDir, dstName))) {
-          log.warn('ensureWorkgroupWorkDirs: name taken in the shared tree, left in place', {
-            ...ctx,
-            name,
-            attempted: dstName,
-          });
-          continue;
-        }
+      let srcIsDir: boolean;
+      try {
+        srcIsDir = fs.lstatSync(src).isDirectory();
+      } catch (err) {
+        log.warn('ensureWorkgroupWorkDirs: could not stat entry', { ...ctx, name, err });
+        continue;
       }
+      const dstName = claimSharedName(sharedWorkDir, name, srcIsDir, ctx);
+      if (dstName === null) continue;
       const dst = path.join(sharedWorkDir, dstName);
       try {
         if (strategy === 'rename') {
+          // Over this function's own claim, made moments ago: a sibling that
+          // tried the same name in between lost to EEXIST, not to us.
           fs.renameSync(src, dst);
         } else {
-          // Hidden staging, for the same reason the dir migrator uses one: a
-          // crash mid-copy must not leave something at `dst` that a later run
-          // reads as a completed move.
-          const staging = path.join(sharedWorkDir, `.${dstName}.partial`);
-          fs.rmSync(staging, { recursive: true, force: true });
+          const staging = path.join(sharedWorkDir, `.${dstName}.${process.pid}.partial`);
           fs.cpSync(src, staging, { recursive: true, verbatimSymlinks: true });
+          fs.rmSync(dst, { recursive: true, force: true }); // our own empty claim
           fs.renameSync(staging, dst);
           fs.rmSync(src, { recursive: true, force: true });
         }
@@ -991,10 +1002,69 @@ function consolidateMemberWorkDir(
     }
   }
   try {
-    fs.rmdirSync(memberWorkDir); // refuses a non-empty dir — nothing unmoved is lost
+    fs.rmdirSync(memberWorkDir); // ENOTEMPTY rather than recursing — nothing unmoved is lost
   } catch {
     /* entries remain; the caller's warning names the member and the next boot retries */
   }
+}
+
+/**
+ * `rename` when both paths are proven to be on one filesystem, `copy` when
+ * they are proven to be on two, and `null` when neither is proven.
+ *
+ * Deliberately not `sameFilesystem`, whose `catch` answers "different" so its
+ * caller takes the copy path. That is the safe default for the directory
+ * migrator; here copy is the branch with the unguarded window, so an unknown
+ * device must decline rather than choose it.
+ */
+function moveStrategy(a: string, b: string): 'rename' | 'copy' | null {
+  try {
+    return fs.statSync(a).dev === fs.statSync(b).dev ? 'rename' : 'copy';
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reserve a name in the shared tree for `name`, returning the name actually
+ * claimed, or `null` when nothing could be.
+ *
+ * The claim is the atomicity: `wx` and a non-recursive `mkdir` both fail
+ * `EEXIST` in the kernel, so two hosts, or a host and a live container, cannot
+ * both believe they own the name. The caller then renames over its own claim.
+ */
+function claimSharedName(
+  sharedWorkDir: string,
+  name: string,
+  isDir: boolean,
+  ctx: { workgroupId: string; member: string },
+): string | null {
+  const claim = (candidate: string): boolean => {
+    const at = path.join(sharedWorkDir, candidate);
+    try {
+      if (isDir) {
+        fs.mkdirSync(at); // non-recursive: EEXIST if taken
+      } else {
+        fs.closeSync(fs.openSync(at, 'wx')); // EEXIST if taken
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (claim(name)) return name;
+  const aside = `${name}.from-${ctx.member}`;
+  if (claim(aside)) return aside;
+  // Both names are taken. The second may be an earlier consolidation of this
+  // same member, or any file a sibling wrote — the shared tree is read-write
+  // to all of them, so this cannot be narrowed further from here. Either way
+  // the entry stays put, and `rmdirSync` below then refuses the directory.
+  log.warn('ensureWorkgroupWorkDirs: name taken in the shared tree, left in place', {
+    ...ctx,
+    name,
+    attempted: aside,
+  });
+  return null;
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
