@@ -195,6 +195,33 @@ export interface ScanDeps {
   cap: NudgeCapStore;
 }
 
+/**
+ * The flagged message as the log should carry it.
+ *
+ * This was `slice(0, 160)`, and head-truncation is exactly the wrong shape for
+ * what is being logged. The first real flag (2026-09-19) carried its
+ * promise — "it's mine to close. Next action after this." — two thirds into a
+ * 3,125-character message, so the excerpt showed only the opening sentence,
+ * which read as a flat answer. A reviewer judged it a false positive from that
+ * excerpt alone. Hand-reading the full row reversed the call, and the flag
+ * turned out to be real enough to become a P1.
+ *
+ * So: the whole message, whitespace collapsed, and when it is too long for a
+ * log line, HEAD AND TAIL rather than head alone — a commitment lands at the
+ * end of a message at least as often as at the start. Jev returns a
+ * probability, not a span, so there is no "matched sentence" to extract; the
+ * text has to be carried and read.
+ */
+const LOG_TEXT_LIMIT = 4_000;
+const LOG_TEXT_EDGE = 1_800;
+
+export function flaggedText(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  if (flat.length <= LOG_TEXT_LIMIT) return flat;
+  const dropped = flat.length - LOG_TEXT_EDGE * 2;
+  return `${flat.slice(0, LOG_TEXT_EDGE)} […${dropped} chars omitted…] ${flat.slice(-LOG_TEXT_EDGE)}`;
+}
+
 /** Decided message ids, so a candidate is asked about once per process, not every scan. */
 const decided = new Map<string, number>();
 
@@ -238,8 +265,18 @@ export async function scanOnce(deps: ScanDeps): Promise<{ asked: number; promise
     }
     promises += 1;
 
+    // Two consumers, two lengths. The LOG carries the whole message because a
+    // human has to judge the flag from it; the NUDGE quotes a short opening
+    // back to the agent, which only needs to identify which message is meant
+    // and must not paste a 3,000-character wall into its next turn.
     const excerpt = chat.text.replace(/\s+/g, ' ').trim().slice(0, 160);
-    const fields = { sessionId: session.id, agentGroupId: session.agent_group_id, messageId: chat.id, p, excerpt };
+    const fields = {
+      sessionId: session.id,
+      agentGroupId: session.agent_group_id,
+      messageId: chat.id,
+      p,
+      text: flaggedText(chat.text),
+    };
     if (deps.mode !== 'nudge') {
       decided.set(chat.id, now);
       log.info('promise-watch: would nudge (shadow)', fields);
