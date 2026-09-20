@@ -21,7 +21,7 @@ import type Database from 'better-sqlite3';
 
 import { log } from '../../log.js';
 import { readContainerConfig } from '../../container-config.js';
-import { ensureWorkgroupWorkDirs } from './shared-dirs.js';
+import { ensureWorkgroupWorkDirs, pruneDanglingWorkgroupCompatLinks } from './shared-dirs.js';
 
 export function reconcileWorkgroupFsState(db: Database.Database): void {
   // ── 1. Drain migration-036 report if present ──────────────────────────
@@ -58,6 +58,26 @@ export function reconcileWorkgroupFsState(db: Database.Database): void {
   // booting. The one uncontained throw is the workgroups enumeration itself:
   // an unreadable central DB is fail-closed here, exactly as it is for step 1.
   ensureWorkgroupWorkDirs(db);
+
+  // ── 3. Prune compat links whose shared target is gone ──────────────────
+  // Order is NOT load-bearing between steps 2 and 3, and two earlier attempts
+  // to say why it was were both wrong. Step 3 requires the `.migrated` marker,
+  // which lives inside the shared tree, so it acts only where that tree
+  // already exists — nothing step 2 creates can change its answer, and the one
+  // name step 2 adds (`artifacts`) is reserved and never considered. Kept in
+  // this order only so a boot's shared-tree writes precede its reads.
+  //
+  // Step 3 is NOT the boot's last writer to the shared tree:
+  // this whole function runs at src/main.ts:683, and runBootMountQuiescence at
+  // :693 then calls reconcileWorkgroupSharedDirs (:515) and the memory gate
+  // (:521), both of which add names after this prune has read its listing.
+  // That is safe for two separate reasons, not one — `memory` and `artifacts`
+  // are held by RESERVED_SHARED_DIR_NAMES and never considered here, and
+  // migrateWorkgroup writes a name's shared entry before its compat link
+  // (shared-dirs.ts:723/:731 precede :742), so a link this prune could see can
+  // never be newer than its target. Contained the same way as step 2 — a
+  // workgroup whose shared tree cannot be listed prunes nothing.
+  pruneDanglingWorkgroupCompatLinks(db);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

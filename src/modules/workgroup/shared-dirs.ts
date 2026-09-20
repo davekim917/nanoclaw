@@ -1198,3 +1198,163 @@ function sameFilesystem(a: string, b: string): boolean {
     return false; // unknown → assume different → caller uses the safe copy path
   }
 }
+
+/**
+ * Remove a member's workgroup compat symlinks whose shared target is gone.
+ *
+ * `migrateWorkgroup` drops `<name> -> /workspace/workgroup/<name>` into the
+ * seed and every sibling for each consolidated name, and re-runs every boot.
+ * It only ever ADDS: when an agent later deletes the shared entry those links
+ * stay, one per member, dangling inside every container at `/workspace/agent/`
+ * forever. Nothing else prunes them — on this install 137 had accumulated
+ * across 18 of 24 groups, the oldest three months old, mirrored sibling for
+ * sibling because that is how they are created.
+ *
+ * The blast radius if the predicate is wrong is every compat link in the
+ * fleet, so it is deliberately narrow — an entry is removed only when ALL of:
+ *
+ * - the workgroup carries the `.migrated` marker (see the gate's own comment:
+ *   the flag alone is fail-OPEN here, unlike in the steps that copy it);
+ * - it is a symlink. This one is a FAST PATH, not the guarantee: `readlink`
+ *   below already fails on every real entry, so a real directory survives on
+ *   the clause after this one even with this removed — no test can kill it
+ *   alone, and it is kept because saying so explicitly is cheaper to read than
+ *   re-deriving it;
+ * - its text is EXACTLY `/workspace/workgroup/<its own name>`, the one shape
+ *   `ensureCompatSymlink` writes. An agent's `foo -> /workspace/workgroup/bar`
+ *   or a clone-as-codex `../<seed>/x` is somebody else's link and is left;
+ * - its name is not in `RESERVED_SHARED_DIR_NAMES`, which dedicated
+ *   reconcilers own and repair rather than delete;
+ * - the name is absent from a SUCCESSFUL `readdir` of the shared tree;
+ * - it is STILL absent on a re-confirming `lstat` taken immediately before the
+ *   unlink, which closes the window between that listing and this member's
+ *   scan;
+ * - the SEED holds no real dir of that name. That one is not hygiene: the
+ *   sibling union at `:567` re-derives the shared set from exactly these
+ *   links later in the same boot, so deleting one silently un-shares a
+ *   directory. Do not remove it without reading that union.
+ *
+ * The `readdir` clause is why the listing is read once per workgroup and a
+ * failure returns instead of continuing. `existsSync` per link would answer
+ * "gone" for every name the moment the shared tree is unreadable — a transient
+ * mount problem would then delete every compat link in the workgroup, which is
+ * the one outcome worse than the stale links this removes.
+ *
+ * Deleting a broken symlink destroys no data, so unlike the movers here this
+ * needs no claim protocol: a container racing it either sees the link or does
+ * not, and both answers were already wrong before the unlink.
+ */
+export function pruneDanglingWorkgroupCompatLinks(
+  db: RawStatements,
+  dirs: { groupsDir?: string; dataDir?: string } = {},
+): void {
+  const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
+  const dataDir = dirs.dataDir ?? DATA_DIR;
+  const workgroups = db.prepare(`SELECT id FROM workgroups`).all() as Array<{ id: string }>;
+  for (const wg of workgroups) {
+    // Contained per workgroup for the same reason as `ensureWorkgroupWorkDirs`:
+    // this runs before `runBootMountQuiescence`, and one bad row or one lost
+    // race must not be a host that will not boot.
+    try {
+      pruneOneWorkgroupCompatLinks(db, wg.id, { groupsDir, dataDir });
+    } catch (err) {
+      log.warn('pruneDanglingWorkgroupCompatLinks: skipped workgroup', { workgroupId: wg.id, err });
+    }
+  }
+}
+
+function pruneOneWorkgroupCompatLinks(
+  db: RawStatements,
+  workgroupId: string,
+  ctx: { groupsDir: string; dataDir: string },
+): void {
+  assertTrustedPathSegment(workgroupId, 'workgroup id');
+  const wgDir = workgroupSharedDir(workgroupId, ctx.dataDir);
+  // The marker, NOT the mount predicate the other steps use. A link of the
+  // shape this function deletes can only have been written by
+  // `migrateWorkgroup`, which writes the marker at `:782` — so no marker means
+  // nothing of that shape is this function's to judge. (`ensureWorkgroupWorkDirs`
+  // also writes a compat link under the flag alone, but only for `artifacts`,
+  // which is reserved and never reaches the loop below.)
+  //
+  // Accepting the flag alone here would be fail-OPEN in the shape most likely
+  // to occur. If `wgDir` is lost — an unmounted volume, a partial restore, an
+  // agent's `rm -rf` — the marker goes with it, and step 2's
+  // `mkdirSync(wgDir/artifacts, { recursive: true })` (`:861`) RECREATES the
+  // directory before this runs. The listing below then succeeds, returning
+  // `['artifacts']`, and every real name reads as gone: on a six-member
+  // workgroup that is every compat link deleted in one boot. The
+  // `readdir`-throws bail cannot catch it, because nothing throws.
+  if (!fs.existsSync(path.join(wgDir, MIGRATION_MARKER))) return;
+
+  // One listing, and a failure means "cannot tell", never "nothing is there".
+  let sharedNames: Set<string>;
+  try {
+    sharedNames = new Set(fs.readdirSync(wgDir));
+  } catch (err) {
+    log.warn('pruneDanglingWorkgroupCompatLinks: shared tree unreadable, pruned nothing', { workgroupId, err });
+    return;
+  }
+
+  const members = db.prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`).all(workgroupId) as Array<{
+    folder: string;
+  }>;
+  for (const member of members) {
+    assertTrustedPathSegment(member.folder, 'agent group folder');
+    const memberDir = path.join(ctx.groupsDir, member.folder);
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(memberDir, { withFileTypes: true });
+    } catch {
+      continue; // folder not scaffolded yet, or unreadable — nothing to judge
+    }
+    const pruned: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isSymbolicLink()) continue;
+      if (RESERVED_SHARED_DIR_NAMES.has(entry.name)) continue;
+      if (sharedNames.has(entry.name)) continue;
+      const linkPath = path.join(memberDir, entry.name);
+      if (safeReadlink(linkPath) !== `${WORKGROUP_CONTAINER_PATH}/${entry.name}`) continue;
+      // The listing above was taken before this member was scanned, and this
+      // runs before runBootMountQuiescence proves containers are gone, so a
+      // live agent can have created the target in between — `mkdir
+      // /workspace/workgroup/foo` then `ln -s` into its own bedroom. Without
+      // this the link is unlinked while its target exists, which is wrong at
+      // the moment it happens rather than already-wrong. `lstat`, NOT
+      // `existsSync`: the listing counts a name whether or not it resolves, so
+      // `existsSync` here would prune links whose shared entry is itself a
+      // dangling symlink — the opposite of what the listing decided. This can
+      // only ever KEEP more links than the listing did.
+      if (lstatOrNull(path.join(wgDir, entry.name))) continue;
+      // `reconcileWorkgroupSharedDirs` runs LATER in this same boot
+      // (main.ts:515) and re-derives the established shared set from exactly
+      // these links: a sibling symlink whose name the seed still holds as a
+      // real dir is unioned back in (the union at `:567`, gated on
+      // `isRealDir(seedEntry)` at `:582`; seed folder == workgroup id, `:542`).
+      // Deleting one first would silently un-share that directory —
+      // it falls into `candidates` and stays private to the seed, with no
+      // warn. Keep the link and let the migrator re-point it; the empty
+      // `wgDir` entry it is waiting for is the migrator's to create.
+      if (isRealDir(path.join(ctx.groupsDir, workgroupId, entry.name))) continue;
+      try {
+        fs.unlinkSync(linkPath);
+        pruned.push(entry.name);
+      } catch (err) {
+        log.warn('pruneDanglingWorkgroupCompatLinks: could not remove link', {
+          workgroupId,
+          member: member.folder,
+          name: entry.name,
+          err,
+        });
+      }
+    }
+    if (pruned.length > 0) {
+      log.info('pruneDanglingWorkgroupCompatLinks: removed dangling compat links', {
+        workgroupId,
+        member: member.folder,
+        count: pruned.length,
+        names: pruned.sort(),
+      });
+    }
+  }
+}
