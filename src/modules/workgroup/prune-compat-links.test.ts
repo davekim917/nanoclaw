@@ -172,10 +172,10 @@ describe('pruneDanglingWorkgroupCompatLinks', () => {
     expect(exists(memberLink('wgx', 'memory'))).toBe(true);
   });
 
-  // The mount predicate: with no mount, `/workspace/workgroup/<name>` is not
-  // this mechanism's to judge.
-  it('prunes nothing in a workgroup with no shared-fs mount', () => {
-    // no markMigrated() and WORKGROUP_SHARED_FS is off under test
+  // The marker gate: a link of this shape can only come from migrateWorkgroup,
+  // which writes the marker, so without one nothing here is ours to judge.
+  it('prunes nothing in a workgroup with no migration marker', () => {
+    // no markMigrated()
     fs.mkdirSync(workgroupSharedDir('wgx', dataDir), { recursive: true });
     linkInto('wgx', 'wt-dead');
 

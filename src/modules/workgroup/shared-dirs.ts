@@ -1213,6 +1213,8 @@ function sameFilesystem(a: string, b: string): boolean {
  * The blast radius if the predicate is wrong is every compat link in the
  * fleet, so it is deliberately narrow — an entry is removed only when ALL of:
  *
+ * - the workgroup carries the `.migrated` marker (see the gate's own comment:
+ *   the flag alone is fail-OPEN here, unlike in the steps that copy it);
  * - it is a symlink. This one is a FAST PATH, not the guarantee: `readlink`
  *   below already fails on every real entry, so a real directory survives on
  *   the clause after this one even with this removed — no test can kill it
@@ -1223,13 +1225,20 @@ function sameFilesystem(a: string, b: string): boolean {
  *   or a clone-as-codex `../<seed>/x` is somebody else's link and is left;
  * - its name is not in `RESERVED_SHARED_DIR_NAMES`, which dedicated
  *   reconcilers own and repair rather than delete;
- * - the name is absent from a SUCCESSFUL `readdir` of the shared tree.
+ * - the name is absent from a SUCCESSFUL `readdir` of the shared tree;
+ * - it is STILL absent on a re-confirming `lstat` taken immediately before the
+ *   unlink, which closes the window between that listing and this member's
+ *   scan;
+ * - the SEED holds no real dir of that name. That one is not hygiene: the
+ *   sibling union at `:567` re-derives the shared set from exactly these
+ *   links later in the same boot, so deleting one silently un-shares a
+ *   directory. Do not remove it without reading that union.
  *
- * That last clause is why the listing is read once per workgroup and a failure
- * returns instead of continuing. `existsSync` per link would answer "gone" for
- * every name the moment the shared tree is unreadable or not yet created — a
- * transient mount problem would then delete every compat link in the
- * workgroup, which is the one outcome worse than the stale links this removes.
+ * The `readdir` clause is why the listing is read once per workgroup and a
+ * failure returns instead of continuing. `existsSync` per link would answer
+ * "gone" for every name the moment the shared tree is unreadable — a transient
+ * mount problem would then delete every compat link in the workgroup, which is
+ * the one outcome worse than the stale links this removes.
  *
  * Deleting a broken symlink destroys no data, so unlike the movers here this
  * needs no claim protocol: a container racing it either sees the link or does
