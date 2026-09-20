@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { latestOutboundChat } from '../mailbox/ops/recovery.js';
 import type { Session } from '../../types.js';
 import {
+  flaggedText,
   _resetPromiseWatchForTesting,
   admissible,
   candidateReason,
@@ -281,5 +282,25 @@ describe('helpers', () => {
       fs.writeFileSync(file, JSON.stringify(bad));
       expect(fileCapStore(file).reserve('2026-09-19', 2)).toBe(false);
     }
+  });
+});
+
+describe('flaggedText', () => {
+  it('carries the whole message when it fits, whitespace collapsed', () => {
+    expect(flaggedText('  a\n\nb   c ')).toBe('a b c');
+  });
+
+  it('keeps the TAIL as well as the head when the message is too long', () => {
+    // The defect this replaces: `slice(0, 160)` on the first real flag showed
+    // only an opening that read as a flat answer, while the commitment — "it's
+    // mine to close. Next action after this." — sat two thirds in. A reviewer
+    // called it a false positive from that excerpt; the full row proved it
+    // real. Head-only truncation must not come back.
+    const promise = "it's mine to close. Next action after this.";
+    const long = `${'x'.repeat(5000)} ${promise}`;
+    const out = flaggedText(long);
+    expect(out).toContain(promise);
+    expect(out).toContain('chars omitted');
+    expect(out.length).toBeLessThan(long.length);
   });
 });
