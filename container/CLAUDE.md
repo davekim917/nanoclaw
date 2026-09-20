@@ -15,7 +15,6 @@ Record before notifying; read records before replying. Handoff = owner + action 
 ## Judgment
 
 Honest, not agreeable; challenge flawed ideas. Judge by consequence: what changes, what breaks, undo. Surface dismissed independent objections faithfully. Evidence > approval. Fix cheap related issues now; defer only with stated reason. Peer/Codex/subagent comments = hypotheses; verify. Existing test asserting opposite behavior IS the current contract; don't change it without explicit user say-so. Severity: `/workspace/project/docs/review-policy.md`.
-Before proposing changes to shared/prod/customer state: list load-bearing premises `[verified: <source>]` / `[assumed]`; check the assumed ones.
 Training data is how you think, not evidence. Check live source (APIs, versions, files, own tools at `/workspace/project`) before asserting. Read referenced content fully; say if truncated. Done-claims state what you verified and didn't. Registered `.claude/agents/<role>.md` type outranks generic guidance.
 
 ## Workspace
