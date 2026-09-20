@@ -11,7 +11,10 @@
 # and its control arm (no renewer -> the lease expires, which is the pre-fix
 # behaviour and the renewer-killed degradation); a step that completes; an
 # abandoned run; the ceiling; a withdrawn/absent ack; the kill switch; a torn
-# journal tail (tolerated) vs a corrupt middle line (refuses the tick); the
+# journal tail (tolerated) vs a complete corrupt record or a bad schema
+# (refuses the tick); the freshness window, including a quiet-but-fresh owner,
+# a resumed one, and a live CHALLENGER that must not keep a silent owner's
+# claim alive; both clamp-down-only overrides; a run id of `..`; the
 # never-wake guarantee; "renewal and nothing else" (no claim/finish/release/
 # poll, no write under the run root); the claimant the gate is called with;
 # and the env-file rules.
@@ -29,7 +32,8 @@ trap 'rm -rf "$T"' EXIT
 
 unset SMOKE_CONTROLLER_MODE SMOKE_CONTROLLER_OUT_DIR SMOKE_CONTROLLER_GATE_CMD SMOKE_CONTROLLER_ENV_FILE \
   SMOKE_GATE_RUN_ROOT SMOKE_GATE_STATE_DIR SMOKE_GATE_SHARED_ROOT SMOKE_GATE_LEASE_DIR \
-  SMOKE_GATE_CLAIMANT SMOKE_CONTROLLER_RENEW_CEILING_SECONDS FAKE_CLOCK_OFFSET || true
+  SMOKE_GATE_CLAIMANT SMOKE_CONTROLLER_RENEW_CEILING_SECONDS SMOKE_CONTROLLER_RENEW_FRESHNESS_SECONDS \
+  FAKE_CLOCK_OFFSET || true
 
 # SMOKE_RENEW_TEST_CONTINUE=1 records failures instead of stopping at the
 # first, so one run against an older revision shows every assertion the fix
@@ -127,6 +131,40 @@ jrec() { # <kind> <slot> <state> <at-epoch> [detail-json]
 ack()   { : >"$C/runs/$RUN/controller/brief-$1.ack"; }
 unack() { rm -f "$C/runs/$RUN/controller/brief-$1.ack"; }
 
+# The owner's live container writing artifacts under the run. File mtimes are
+# real time while `date` is shimmed, so every simulated write is stamped at
+# the SHIFTED now -- otherwise a fixture would read as an hour stale the
+# moment the clock moves.
+owner_writes() { # [epoch, default = shifted now]
+  local at="${1:-$(date -u +%s)}"
+  mkdir -p "$C/runs/$RUN/evidence"
+  : >"$C/runs/$RUN/evidence/progress.txt"
+  touch -d "@$at" "$C/runs/$RUN/evidence/progress.txt"
+}
+# The CHALLENGER writing under its own directory. Same run, different session,
+# and explicitly not evidence that the coordinator's owner is alive.
+challenger_writes() { # [epoch, default = shifted now]
+  local at="${1:-$(date -u +%s)}"
+  mkdir -p "$C/runs/$RUN/challenger"
+  : >"$C/runs/$RUN/challenger/disposition.md"
+  touch -d "@$at" "$C/runs/$RUN/challenger/disposition.md"
+}
+
+# A gate that logs its argv and always succeeds. Used by cases that assert
+# what the tick DECIDED, so the real lease's state cannot colour the answer.
+STUB="$T/stub-gate.sh"
+use_stub_gate() {
+  cat >"$STUB" <<'SH'
+#!/usr/bin/env bash
+printf '%s claimant=%s\n' "$*" "${SMOKE_GATE_CLAIMANT:-}" >>"$GATE_LOG"
+echo '{"ok":true,"leaseRenewed":true}'
+SH
+  chmod +x "$STUB"
+  export SMOKE_CONTROLLER_GATE_CMD="$STUB"
+  export GATE_LOG="$C/gate.log"
+  : >"$GATE_LOG"
+}
+
 tick() { LAST="$(bash "$R" 2>>"$C/renew.err")"; }
 field() { jq -r "$1" <<<"$LAST" 2>/dev/null; }
 
@@ -148,7 +186,12 @@ in_flight_at() { # <started-epoch>
   jrec owner lanes intent "$1"
   jrec owner lanes enqueued "$1" '{"brief":"controller/brief-lanes.md","outcome":"brief_written"}'
   ack lanes
+  owner_writes "$1"
 }
+
+# One tick with the owner having just written, which is what a working turn
+# looks like between ticks.
+tick_working() { owner_writes; tick; }
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. THE REGRESSION (XZO #2024) — an owner step longer than the lease TTL.
@@ -187,7 +230,7 @@ in_flight_at "$START"
 # turn and the controller's cadence.
 for OFFSET in 300 600 900 1200 1500 1800 2100 2400 2700 3000; do
   FAKE_CLOCK_OFFSET="$OFFSET"
-  tick
+  tick_working
   [ "$(field '.wakeAgent')" = false ] || fail "the renewer woke an agent at +$OFFSET"
   [ "$(field '.data.renewed | length')" = 1 ] || fail "no renewal at +$OFFSET: $LAST"
   [ "$(field '.data.renewed[0].step')" = lanes ] || fail "renewed the wrong step at +$OFFSET"
@@ -208,7 +251,7 @@ START="$(/usr/bin/date -u +%s)"
 claim_files "$START"
 in_flight_at "$START"
 FAKE_CLOCK_OFFSET=300
-tick
+tick_working
 [ "$(field '.data.renewed | length')" = 1 ] || fail "expected one renewal while in flight"
 jrec owner lanes done $((START + 400))
 FAKE_CLOCK_OFFSET=600
@@ -256,11 +299,13 @@ in_flight_at "$START"
 # the boundary to mean anything.
 for OFFSET in 300 600 900 1200 1500 1800 2100 2400 2700 3000 3300 3400; do
   FAKE_CLOCK_OFFSET="$OFFSET"
-  tick
+  tick_working
 done
 [ "$(field '.data.renewed | length')" = 1 ] || fail "should still renew just inside the ceiling: $LAST"
+# The owner is still writing here, so the ceiling — not freshness — is what
+# stops the renewal.
 FAKE_CLOCK_OFFSET=3700
-tick
+tick_working
 [ "$(field '.data.renewed | length')" = 0 ] || fail "renewed past the ceiling: $LAST"
 grep -q 'past the 3600s ceiling' <<<"$(field '.data.skipped[0].reason')" ||
   fail "wrong ceiling reason: $LAST"
@@ -277,9 +322,11 @@ START="$(/usr/bin/date -u +%s)"
 claim_files "$START"
 in_flight_at "$START"
 FAKE_CLOCK_OFFSET=120
+owner_writes
 SMOKE_CONTROLLER_RENEW_CEILING_SECONDS=60 tick
 [ "$(field '.data.renewed | length')" = 0 ] || fail "a lowered ceiling was not honoured"
 FAKE_CLOCK_OFFSET=5000
+owner_writes
 SMOKE_CONTROLLER_RENEW_CEILING_SECONDS=99999 tick
 [ "$(field '.data.renewed | length')" = 0 ] || fail "the ceiling was raised above 3600"
 ok
@@ -291,16 +338,16 @@ claim_files "$START"
 jrec run claim enqueued "$START" '{"origin":"poll-wake","pr":7,"ownerToken":"'"$TOKEN"'"}'
 jrec owner lanes enqueued "$START" '{"brief":"controller/brief-lanes.md","outcome":"brief_written"}'
 FAKE_CLOCK_OFFSET=300
-tick
+tick_working
 [ "$(field '.data.renewed | length')" = 0 ] || fail "renewed a brief nobody acked"
 grep -q 'brief-lanes.ack absent' <<<"$(field '.data.skipped[0].reason')" || fail "wrong reason: $LAST"
 ok
 # The owner withdraws its ack to hand the step back — renewal stops there too.
 ack lanes
-tick
+tick_working
 [ "$(field '.data.renewed | length')" = 1 ] || fail "an acked step should be renewed"
 unack lanes
-tick
+tick_working
 [ "$(field '.data.renewed | length')" = 0 ] || fail "renewed after the ack was withdrawn"
 ok
 # A bare `intent` (a fire that died before writing the brief) is not in flight.
@@ -315,22 +362,100 @@ tick
 [ "$(field '.data.status')" = idle ] || fail "a bare intent must not be renewed: $LAST"
 ok
 
+echo "== 5b. freshness: the ack says the step was TAKEN, the run tree says it is WORKED =="
+# The ack is written once and never refreshed (router :31 creates it; the
+# controller only tests existence, :1966, and re-offers only while it is
+# ABSENT, :1961-1972). So an owner that crashes after acking would otherwise
+# be renewed to the ceiling. Freshness is measured on coordinator-side writes.
+new_case stale-owner
+START="$(/usr/bin/date -u +%s)"
+claim_files "$START"
+in_flight_at "$START"      # writes one artifact, at START, and nothing after
+# Quiet but inside the window: renewal continues. A step is not required to
+# write on every single tick — 1200 s is 4.7x the largest gap measured on the
+# real 46-minute lanes step (253 s).
+for OFFSET in 300 600 1000; do
+  FAKE_CLOCK_OFFSET="$OFFSET"
+  tick
+  [ "$(field '.data.renewed | length')" = 1 ] ||
+    fail "a quiet-but-fresh owner must still be renewed at +$OFFSET: $LAST"
+done
+ok
+# Past the window with nothing written: the owner is gone, renewal stops.
+# (Lease still live here — the lapse is asserted below, after it runs out.)
+FAKE_CLOCK_OFFSET=1300
+tick
+[ "$(field '.data.renewed | length')" = 0 ] || fail "renewed an owner that stopped writing: $LAST"
+grep -q 'no coordinator-side write for' <<<"$(field '.data.skipped[0].reason')" ||
+  fail "wrong staleness reason: $LAST"
+ok
+# A write inside the window puts it back in flight — this is the multi-wake
+# step `continue_work` produces, and the case the ack's own mtime can never
+# see, because the ack is written once and never again.
+FAKE_CLOCK_OFFSET=1400
+owner_writes
+tick
+[ "$(field '.data.renewed | length')" = 1 ] || fail "a resumed owner must be renewed again: $LAST"
+ok
+# Now let it go quiet for good: renewal stops and the claim expires on its own
+# TTL, which is the whole point — the degradation is claim expiry.
+FAKE_CLOCK_OFFSET=2700
+tick
+[ "$(field '.data.renewed | length')" = 0 ] || fail "renewed a permanently silent owner: $LAST"
+[ "$(lease_held)" = false ] || fail "a stale owner's lease must lapse"
+ok
+
+# The CHALLENGER is the other side of the campaign, in its own session. Its
+# writes say nothing about the coordinator's owner, and the lease being
+# renewed is the coordinator's — so a healthy challenger must not hold a dead
+# owner's claim open.
+new_case challenger-only
+use_stub_gate              # a decision test: the real lease must not colour it
+START="$(/usr/bin/date -u +%s)"
+claim_files "$START"
+in_flight_at "$START"
+mkdir -p "$C/runs/$RUN/challenger"
+# Ticks only PAST the freshness window, so the owner's single write at START
+# is stale and the challenger's writes are the only fresh thing on disk.
+for OFFSET in 1300 1500 1700; do
+  FAKE_CLOCK_OFFSET="$OFFSET"
+  challenger_writes          # the challenger is alive and working
+  tick                       # the owner has written nothing since START
+done
+[ "$(field '.data.renewed | length')" = 0 ] ||
+  fail "a live challenger kept a silent owner's claim alive: $LAST"
+grep -q 'no coordinator-side write for' <<<"$(field '.data.skipped[0].reason')" ||
+  fail "challenger writes were counted as coordinator activity: $LAST"
+[ ! -s "$GATE_LOG" ] || fail "the gate was called for a silent owner: $(cat "$GATE_LOG")"
+ok
+# Same fixture, owner writing too: it is the OWNER's write that matters.
+FAKE_CLOCK_OFFSET=1300
+owner_writes
+tick
+[ "$(field '.data.renewed | length')" = 1 ] || fail "an owner writing alongside the challenger must renew: $LAST"
+ok
+
+# The freshness override clamps DOWN only, exactly like the ceiling.
+new_case freshness-override
+use_stub_gate              # decision-only: a dead lease must not stand in for
+                           # the window being honoured
+START="$(/usr/bin/date -u +%s)"
+claim_files "$START"
+in_flight_at "$START"
+FAKE_CLOCK_OFFSET=200
+SMOKE_CONTROLLER_RENEW_FRESHNESS_SECONDS=60 tick
+[ "$(field '.data.renewed | length')" = 0 ] || fail "a lowered freshness window was not honoured: $LAST"
+FAKE_CLOCK_OFFSET=1300
+SMOKE_CONTROLLER_RENEW_FRESHNESS_SECONDS=99999 tick
+[ "$(field '.data.renewed | length')" = 0 ] || fail "the freshness window was raised above 1200: $LAST"
+ok
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 6. STUB GATE — what the tick invokes, and what it must never invoke.
 # ═════════════════════════════════════════════════════════════════════════════
 echo "== 6. renewal and nothing else =="
-STUB="$T/stub-gate.sh"
-cat >"$STUB" <<'SH'
-#!/usr/bin/env bash
-printf '%s claimant=%s\n' "$*" "${SMOKE_GATE_CLAIMANT:-}" >>"$GATE_LOG"
-echo '{"ok":true,"leaseRenewed":true}'
-SH
-chmod +x "$STUB"
-
 new_case stub
-export SMOKE_CONTROLLER_GATE_CMD="$STUB"
-export GATE_LOG="$C/gate.log"
-: >"$GATE_LOG"
+use_stub_gate
 START="$(/usr/bin/date -u +%s)"
 claim_files "$START"
 in_flight_at "$START"
@@ -497,15 +622,7 @@ ok
 # and, with an ack planted there, the tick called the gate. Planting it here
 # is what makes this a regression rather than a shape assertion.
 new_case dotdot
-export SMOKE_CONTROLLER_GATE_CMD="$STUB"
-export GATE_LOG="$C/gate.log"
-: >"$GATE_LOG"
-cat >"$STUB" <<'SH'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >>"$GATE_LOG"
-echo '{"ok":true,"leaseRenewed":true}'
-SH
-chmod +x "$STUB"
+use_stub_gate
 mkdir -p "$C/controller"
 : >"$C/controller/brief-lanes.ack"
 START="$(/usr/bin/date -u +%s)"
