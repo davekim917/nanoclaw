@@ -1293,6 +1293,17 @@ function pruneOneWorkgroupCompatLinks(
       if (sharedNames.has(entry.name)) continue;
       const linkPath = path.join(memberDir, entry.name);
       if (safeReadlink(linkPath) !== `${WORKGROUP_CONTAINER_PATH}/${entry.name}`) continue;
+      // The listing above was taken before this member was scanned, and this
+      // runs before runBootMountQuiescence proves containers are gone, so a
+      // live agent can have created the target in between — `mkdir
+      // /workspace/workgroup/foo` then `ln -s` into its own bedroom. Without
+      // this the link is unlinked while its target exists, which is wrong at
+      // the moment it happens rather than already-wrong. `lstat`, NOT
+      // `existsSync`: the listing counts a name whether or not it resolves, so
+      // `existsSync` here would prune links whose shared entry is itself a
+      // dangling symlink — the opposite of what the listing decided. This can
+      // only ever KEEP more links than the listing did.
+      if (lstatOrNull(path.join(wgDir, entry.name))) continue;
       try {
         fs.unlinkSync(linkPath);
         pruned.push(entry.name);

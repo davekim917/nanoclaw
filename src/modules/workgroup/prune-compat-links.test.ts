@@ -189,6 +189,52 @@ describe('pruneDanglingWorkgroupCompatLinks', () => {
 
     expect(() => run()).not.toThrow();
     expect(exists(memberLink('wgx', 'wt-dead'))).toBe(false);
+    // Without this the test passes either way: `wgx` is scanned first, so
+    // `wt-dead` is already gone before the missing folder throws, and the
+    // outer per-workgroup catch swallows the throw so `not.toThrow()` holds.
+    // What the guard actually buys is that the workgroup is not abandoned.
+    expect(vi.mocked(log.warn)).not.toHaveBeenCalledWith(
+      'pruneDanglingWorkgroupCompatLinks: skipped workgroup',
+      expect.anything(),
+    );
+  });
+
+  // The listing counts a NAME, not a resolvable path. An `existsSync`
+  // re-confirm before the unlink would disagree with it here and prune a link
+  // whose shared entry exists but does not resolve.
+  it('keeps a link whose shared entry is itself a dangling symlink', () => {
+    markMigrated();
+    fs.symlinkSync('/nonexistent-target', path.join(workgroupSharedDir('wgx', dataDir), 'wt-indirect'));
+    linkInto('wgx', 'wt-indirect');
+
+    run();
+
+    expect(exists(memberLink('wgx', 'wt-indirect'))).toBe(true);
+  });
+
+  // The window the re-confirm closes: the shared listing is taken before this
+  // member is scanned, so a live container can create the target in between.
+  // Hiding the name from the listing while it is real on disk is that race,
+  // made deterministic. A dangling symlink is the payload because it separates
+  // `lstat` (the name is taken) from `existsSync` (it does not resolve) — the
+  // difference between keeping the link and pruning it.
+  it('keeps a link whose target appeared after the shared listing was taken', () => {
+    markMigrated();
+    const wgDir = workgroupSharedDir('wgx', dataDir);
+    fs.symlinkSync('/nonexistent-target', path.join(wgDir, 'wt-raced'));
+    linkInto('wgx', 'wt-raced');
+    const realReaddir = fs.readdirSync;
+    const readdir = vi.spyOn(fs, 'readdirSync').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      const out = (realReaddir as unknown as (...a: unknown[]) => unknown)(p, ...rest);
+      // Only the shared-tree listing is doctored; the member scan is real.
+      if (String(p) === wgDir) return (out as string[]).filter((n) => n !== 'wt-raced');
+      return out;
+    }) as typeof fs.readdirSync);
+
+    run();
+
+    readdir.mockRestore();
+    expect(exists(memberLink('wgx', 'wt-raced'))).toBe(true);
   });
 
   it('reports what it removed', () => {
