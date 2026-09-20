@@ -101,7 +101,7 @@ describe('ensureWorkgroupWorkDirs', () => {
 
   // ── F1 regression: the generic migrator must never touch this name ─────────
 
-  it('does not let the shared-dir migrator delete a seed folder holding a real artifacts/', () => {
+  it('does not let the shared-dir migrator destroy a seed folder holding a real artifacts/', () => {
     // A group created between boots writes work products before anything links
     // it — exactly what container/CLAUDE.md now tells agents to do.
     const seedWork = path.join(groupsDir, 'wgx', SHARED_WORK_DIR_NAME);
@@ -116,9 +116,11 @@ describe('ensureWorkgroupWorkDirs', () => {
     run();
     reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
 
-    // Creating the shared dir empty and ahead of the migrator used to make its
-    // `existsSync(dst)` arm read "interrupted move" and rmSync the source.
-    expect(fs.readFileSync(path.join(seedWork, 'q3-report.md'), 'utf8')).toBe('a week of work');
+    // Consolidated into the house, not destroyed. Creating the shared dir
+    // empty and ahead of the migrator used to make its `existsSync(dst)` arm
+    // read "interrupted move" and rmSync the source with nothing moved.
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'q3-report.md'), 'utf8')).toBe('a week of work');
+    expect(fs.readlinkSync(seedWork)).toBe(LINK_TARGET);
   });
 
   it('never lets the migrator claim the reserved name as something it moved', () => {
@@ -176,19 +178,235 @@ describe('ensureWorkgroupWorkDirs', () => {
 
   // ── Never clobber ──────────────────────────────────────────────────────────
 
-  it('never clobbers a member that already holds a real directory at that name', () => {
+  // ── Consolidation ──────────────────────────────────────────────────────────
+  // A member holding its own real artifacts/ IS the divergence this mechanism
+  // exists to end: its agent reads an instruction naming the shared tree while
+  // writing where no sibling can read.
+
+  it("moves a member's own real directory into the shared tree and links it", () => {
     markMigrated();
     const own = linkAt('wgx-codex');
     fs.mkdirSync(own);
-    fs.writeFileSync(path.join(own, 'private.md'), 'mine');
+    fs.writeFileSync(path.join(own, 'roadmap.html'), 'a week of work');
+    fs.mkdirSync(path.join(own, 'nested'));
+    fs.writeFileSync(path.join(own, 'nested', 'data.json'), '{}');
 
     run();
 
-    expect(fs.lstatSync(own).isSymbolicLink()).toBe(false);
-    expect(fs.readFileSync(path.join(own, 'private.md'), 'utf8')).toBe('mine');
-    expect(vi.mocked(log.warn)).toHaveBeenCalled();
-    // The sibling that had nothing is still linked, and the shared dir exists.
+    // The member is now a link to the house, and the work is IN the house.
+    expect(fs.readlinkSync(own)).toBe(LINK_TARGET);
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'roadmap.html'), 'utf8')).toBe('a week of work');
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'nested', 'data.json'), 'utf8')).toBe('{}');
+    // Which means the sibling reaches it: wgx resolves the same shared tree.
     expect(fs.readlinkSync(linkAt('wgx'))).toBe(LINK_TARGET);
+  });
+
+  it('never overwrites: a colliding name is moved aside, not merged or dropped', () => {
+    markMigrated();
+    run(); // creates the shared tree and links wgx
+    fs.writeFileSync(path.join(sharedWorkDir(), 'report.md'), 'the shared one');
+    // wgx-codex was linked by that first run; give it its own dir again, as a
+    // group that wrote before it was ever linked would have.
+    fs.unlinkSync(linkAt('wgx-codex'));
+    fs.mkdirSync(linkAt('wgx-codex'));
+    fs.writeFileSync(path.join(linkAt('wgx-codex'), 'report.md'), 'the private one');
+
+    run();
+
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md'), 'utf8')).toBe('the shared one');
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md.from-wgx-codex'), 'utf8')).toBe('the private one');
+    expect(fs.readlinkSync(linkAt('wgx-codex'))).toBe(LINK_TARGET);
+  });
+
+  it('claims the destination name before moving, rather than checking it is free', () => {
+    // The shared tree is read-write in every sibling container and this runs
+    // before quiescence. `existsSync` then `rename` leaves a window in which
+    // another claimant sees the same free name; a `wx` create / non-recursive
+    // mkdir loses EEXIST in the kernel instead. The observable difference is
+    // that the destination ALREADY EXISTS when the move runs — a check-based
+    // implementation renames onto a name nothing has reserved.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, 'report.md'), 'the members own');
+    fs.mkdirSync(path.join(own, 'nested'));
+
+    const dstExistedAtMove: boolean[] = [];
+    const realRename = fs.renameSync;
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      dstExistedAtMove.push(fs.existsSync(to as string));
+      return realRename(from, to);
+    });
+    try {
+      run();
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(dstExistedAtMove.length).toBe(2); // the file and the directory
+    expect(dstExistedAtMove).toEqual([true, true]);
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md'), 'utf8')).toBe('the members own');
+  });
+
+  it('releases the claim when a move fails, so the real name is still free next boot', () => {
+    // A claim left behind burns the entry's REAL name permanently: the content
+    // lands at `.from-<member>` and an agent following the instruction to
+    // `artifacts/<name>` reads zero bytes instead of an error.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, 'report.md'), 'THE ONLY COPY');
+
+    const realRename = fs.renameSync;
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementationOnce(() => {
+      throw new Error('EIO');
+    });
+    try {
+      run(); // boot 1: the move fails
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.existsSync(path.join(sharedWorkDir(), 'report.md'))).toBe(false);
+    expect(fs.readFileSync(path.join(own, 'report.md'), 'utf8')).toBe('THE ONLY COPY');
+
+    run(); // boot 2: retries, and gets the real name
+
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md'), 'utf8')).toBe('THE ONLY COPY');
+    expect(fs.existsSync(path.join(sharedWorkDir(), 'report.md.from-wgx-codex'))).toBe(false);
+    expect(realRename).toBeDefined();
+  });
+
+  it('releasing a directory claim never takes content a sibling put inside it', () => {
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.mkdirSync(path.join(own, 'proj'));
+    fs.writeFileSync(path.join(own, 'proj', 'mine.md'), 'the members');
+
+    // The sibling writes into the directory claim, then the move fails: the
+    // release must be an rmdir that refuses, not a recursive delete.
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementationOnce(((_from: fs.PathLike, to: fs.PathLike) => {
+      fs.writeFileSync(path.join(to as string, 'sibling.md'), 'written mid-boot');
+      throw new Error('EIO');
+    }) as typeof fs.renameSync);
+    try {
+      run();
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'proj', 'sibling.md'), 'utf8')).toBe('written mid-boot');
+    expect(fs.readFileSync(path.join(own, 'proj', 'mine.md'), 'utf8')).toBe('the members');
+  });
+
+  it('releasing a file claim never takes bytes a sibling wrote into it', () => {
+    // The directory half is protected by rmdir refusing ENOTEMPTY. The file
+    // half needs its own check, or a sibling that writes into our zero-byte
+    // claim between the failed rename and the release loses those bytes.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, 'report.md'), 'the members');
+
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementationOnce(((_from: fs.PathLike, to: fs.PathLike) => {
+      fs.writeFileSync(to as string, 'SIBLING WROTE THIS');
+      throw new Error('EIO');
+    }) as typeof fs.renameSync);
+    try {
+      run();
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md'), 'utf8')).toBe('SIBLING WROTE THIS');
+    expect(fs.readFileSync(path.join(own, 'report.md'), 'utf8')).toBe('the members');
+  });
+
+  it('leaves the member alone when the move strategy cannot be proven', () => {
+    // sameFilesystem answers "different" when stat fails, which sends its
+    // caller down the copy path. Copy is the branch with the unguarded window,
+    // so an unprovable device must decline instead of choosing it.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, 'work.md'), 'kept');
+    const realStat = fs.statSync;
+    const spy = vi.spyOn(fs, 'statSync').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      if (String(p) === own) throw new Error('EIO');
+      return (realStat as (...a: unknown[]) => fs.Stats)(p, ...rest);
+    }) as typeof fs.statSync);
+    try {
+      run();
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(fs.readFileSync(path.join(own, 'work.md'), 'utf8')).toBe('kept');
+    expect(fs.existsSync(path.join(sharedWorkDir(), 'work.md'))).toBe(false);
+  });
+
+  it('keeps the directory, and everything in it, when an entry cannot be moved', () => {
+    markMigrated();
+    run();
+    fs.writeFileSync(path.join(sharedWorkDir(), 'report.md'), 'shared');
+    fs.writeFileSync(path.join(sharedWorkDir(), 'report.md.from-wgx-codex'), 'an earlier consolidation');
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, 'report.md'), 'cannot land anywhere');
+    fs.writeFileSync(path.join(own, 'movable.md'), 'this one can');
+
+    run();
+
+    // Both destination names are taken, so this entry stays put — and because
+    // it does, the directory is not empty and is NOT removed.
+    expect(fs.lstatSync(own).isSymbolicLink()).toBe(false);
+    expect(fs.readFileSync(path.join(own, 'report.md'), 'utf8')).toBe('cannot land anywhere');
+    // The entry that could move still did.
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'movable.md'), 'utf8')).toBe('this one can');
+    expect(fs.existsSync(path.join(own, 'movable.md'))).toBe(false);
+    expect(vi.mocked(log.warn)).toHaveBeenCalled();
+  });
+
+  it('a partly-consolidated member survives the migrator with its unmoved work', () => {
+    // The state this consolidation newly makes routine: an entry that could not
+    // move leaves a REAL artifacts/ in the member folder — the #952 F1 shape,
+    // where the reservation is the only thing standing between that directory
+    // and the migrator's interrupted-move arm. Without it the ONLY copy is
+    // destroyed: never moved to the shared tree, then rmSync'd as the source.
+    markMigrated();
+    run();
+    fs.writeFileSync(path.join(sharedWorkDir(), 'report.md'), 'shared');
+    fs.writeFileSync(path.join(sharedWorkDir(), 'report.md.from-wgx'), 'an earlier consolidation');
+    fs.unlinkSync(linkAt('wgx'));
+    const seedWork = linkAt('wgx');
+    fs.mkdirSync(seedWork);
+    fs.writeFileSync(path.join(seedWork, 'report.md'), 'THE ONLY COPY');
+    fs.mkdirSync(path.join(groupsDir, 'wgx', 'sources'), { recursive: true });
+
+    run();
+    reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+
+    expect(fs.readFileSync(path.join(seedWork, 'report.md'), 'utf8')).toBe('THE ONLY COPY');
+  });
+
+  it('consolidates an empty directory by simply linking it', () => {
+    markMigrated();
+    fs.mkdirSync(linkAt('wgx-codex'));
+
+    run();
+
+    expect(fs.readlinkSync(linkAt('wgx-codex'))).toBe(LINK_TARGET);
   });
 
   it('leaves a symlink that addresses somewhere else alone, with its content still reachable', () => {
