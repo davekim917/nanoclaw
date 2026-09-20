@@ -121,17 +121,56 @@ describe('ensureWorkgroupWorkDirs', () => {
     expect(fs.readFileSync(path.join(seedWork, 'q3-report.md'), 'utf8')).toBe('a week of work');
   });
 
-  it('keeps the name out of the migrator even when the shared dir already exists', () => {
+  it('never lets the migrator claim the reserved name as something it moved', () => {
+    // Same shape as the regression above, asserting the OTHER consequence: the
+    // marker is the reversal record, so a name listed there is one the migrator
+    // believes it owns and will keep repointing.
+    const seedWork = path.join(groupsDir, 'wgx', SHARED_WORK_DIR_NAME);
+    fs.mkdirSync(seedWork, { recursive: true });
+    fs.writeFileSync(path.join(seedWork, 'q3-report.md'), 'a week of work');
+    fs.mkdirSync(path.join(groupsDir, 'wgx', 'sources'), { recursive: true });
     markMigrated();
-    run();
-    fs.writeFileSync(path.join(sharedWorkDir(), 'shared-note.md'), 'kept');
 
+    run();
     reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
 
-    expect(fs.readFileSync(path.join(sharedWorkDir(), 'shared-note.md'), 'utf8')).toBe('kept');
-    // And it is not claimed as something the migrator moved.
-    const report = path.join(workgroupSharedDir('wgx', dataDir), '.migrated');
-    expect(fs.readFileSync(report, 'utf8')).not.toContain(SHARED_WORK_DIR_NAME);
+    const report = fs.readFileSync(path.join(workgroupSharedDir('wgx', dataDir), '.migrated'), 'utf8');
+    expect(report).toContain('sources');
+    expect(report).not.toContain(SHARED_WORK_DIR_NAME);
+  });
+
+  // ── Boot survivability ─────────────────────────────────────────────────────
+  // This runs before runBootMountQuiescence proves container absence, so every
+  // check-then-act below races a live container. An uncaught throw here is
+  // process.exit(1) in reconcileWorkgroupFsState's caller — a host that will
+  // not boot because one member lost one race.
+
+  it('does not throw a whole boot away over one unusable workgroup row', () => {
+    db.prepare(`INSERT INTO workgroups (id) VALUES (?)`).run('../escape');
+    markMigrated();
+
+    expect(() => run()).not.toThrow();
+
+    // The healthy workgroup is still served.
+    expect(fs.readlinkSync(linkAt('wgx'))).toBe(LINK_TARGET);
+    expect(vi.mocked(log.warn)).toHaveBeenCalledWith(
+      'ensureWorkgroupWorkDirs: skipped workgroup',
+      expect.objectContaining({ workgroupId: '../escape' }),
+    );
+  });
+
+  it('does not throw when a member folder is unwritable', () => {
+    markMigrated();
+    const memberDir = path.join(groupsDir, 'wgx-codex');
+    fs.chmodSync(memberDir, 0o500); // no write: symlinkSync throws EACCES
+    try {
+      expect(() => run()).not.toThrow();
+    } finally {
+      fs.chmodSync(memberDir, 0o700);
+    }
+
+    // The sibling that could be linked still was.
+    expect(fs.readlinkSync(linkAt('wgx'))).toBe(LINK_TARGET);
   });
 
   // ── Never clobber ──────────────────────────────────────────────────────────
@@ -192,10 +231,14 @@ describe('ensureWorkgroupWorkDirs', () => {
     expect(fs.statSync(sharedWorkDir('wgy')).isDirectory()).toBe(true);
   });
 
-  it('refuses a workgroup id that is not one safe path segment', () => {
+  it('creates nothing outside the workgroups root for an unsafe id', () => {
     db.prepare(`INSERT INTO workgroups (id) VALUES (?)`).run('../escape');
+    markMigrated();
 
-    expect(() => run()).toThrow(/Invalid workgroup id/);
+    run();
+
+    expect(fs.existsSync(path.join(dataDir, '..', 'escape'))).toBe(false);
+    expect(fs.existsSync(path.join(dataDir, 'escape'))).toBe(false);
   });
 });
 

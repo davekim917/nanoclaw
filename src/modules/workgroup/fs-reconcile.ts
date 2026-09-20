@@ -6,8 +6,11 @@
  *    - logs/migration-036.log (pairings, standalone, suffix_strip_unmatched)
  *    - logs/migration-036-secrets.log (per-workgroup intersection of member secrets)
  *    Then DROP the temp table.
- * 2. Guarantee every workgroup's shared work-product directory and each
- *    member's compat link to it (`ensureWorkgroupWorkDirs`).
+ * 2. Guarantee the shared work-product directory, and each member's compat
+ *    link to it, for every workgroup whose `/workspace/workgroup` mount is
+ *    actually made (`ensureWorkgroupWorkDirs` applies the mount's own
+ *    predicate per workgroup; a link to an unmounted target is worse than no
+ *    link).
  * Idempotent — re-running on already-reconciled state is a no-op. On FS failure, throws
  * (caller in src/index.ts logs and exits process.exit(1)).
  */
@@ -48,8 +51,10 @@ export function reconcileWorkgroupFsState(db: Database.Database): void {
   }
 
   // ── 2. Shared work-product directory + per-member compat links ─────────
-  // Unconditional: unlike the report drain above this is not a one-time
-  // migration, and a workgroup or member added since the last boot needs it.
+  // Runs on every boot, unlike the one-time report drain above: a workgroup or
+  // member added since the last boot needs it. Which workgroups it acts on is
+  // decided inside, by the mount predicate. It never throws out of here — one
+  // member losing a race must not stop the host booting.
   ensureWorkgroupWorkDirs(db);
 }
 

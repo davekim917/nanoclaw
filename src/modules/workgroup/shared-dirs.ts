@@ -830,37 +830,68 @@ export function ensureWorkgroupWorkDirs(db: RawStatements, dirs: { groupsDir?: s
   const target = `${WORKGROUP_CONTAINER_PATH}/${SHARED_WORK_DIR_NAME}`;
   const workgroups = db.prepare(`SELECT id FROM workgroups`).all() as Array<{ id: string }>;
   for (const wg of workgroups) {
-    assertTrustedPathSegment(wg.id, 'workgroup id');
-    const wgDir = workgroupSharedDir(wg.id, dataDir);
-    // Same predicate as the mount in container-runner.ts. A link whose target
-    // is not mounted is worse than no link.
-    if (!WORKGROUP_SHARED_FS && !fs.existsSync(path.join(wgDir, MIGRATION_MARKER))) continue;
-    fs.mkdirSync(path.join(wgDir, SHARED_WORK_DIR_NAME), { recursive: true });
-    const members = db.prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`).all(wg.id) as Array<{
-      folder: string;
-    }>;
-    for (const member of members) {
-      assertTrustedPathSegment(member.folder, 'agent group folder');
-      const memberDir = path.join(groupsDir, member.folder);
-      // A member whose folder has not been created yet is not an error: the
-      // group's first spawn runs initGroupFilesystem, and the next boot links
-      // it. Creating the folder here would race that scaffold.
-      if (!fs.existsSync(memberDir)) continue;
-      const linkPath = path.join(memberDir, SHARED_WORK_DIR_NAME);
-      const st = lstatOrNull(linkPath);
-      if (st) {
-        if (st.isSymbolicLink() && safeReadlink(linkPath) === target) continue; // already correct
-        // Anything else — a real dir, or a link addressing something this
-        // function did not put there — is somebody's content. Say so and leave it.
-        log.warn('ensureWorkgroupWorkDirs: member already has an entry at the shared work dir name', {
-          workgroupId: wg.id,
-          member: member.folder,
-          name: SHARED_WORK_DIR_NAME,
-          kind: st.isSymbolicLink() ? `symlink -> ${safeReadlink(linkPath) ?? '?'}` : 'real entry',
-        });
-        continue;
-      }
-      fs.symlinkSync(target, linkPath);
+    // Per workgroup, because this runs BEFORE runBootMountQuiescence proves
+    // container absence (src/main.ts) — every check-then-act below spans a
+    // window in which the previous host's containers still hold these
+    // directories read-write. An agent creating `artifacts` between the lstat
+    // and the symlinkSync is an EEXIST, and one uncaught throw here is
+    // `process.exit(1)` in reconcileWorkgroupFsState's caller: a whole host
+    // that will not boot because one member lost one race. Nothing here is
+    // destructive and the next boot's lstat sees the entry, so warn and carry
+    // on. A bad `workgroups` row is caught the same way rather than being
+    // permanently fatal.
+    try {
+      ensureOneWorkgroupWorkDir(db, wg.id, { groupsDir, dataDir, target });
+    } catch (err) {
+      log.warn('ensureWorkgroupWorkDirs: skipped workgroup', { workgroupId: wg.id, err });
+    }
+  }
+}
+
+function ensureOneWorkgroupWorkDir(
+  db: RawStatements,
+  workgroupId: string,
+  ctx: { groupsDir: string; dataDir: string; target: string },
+): void {
+  assertTrustedPathSegment(workgroupId, 'workgroup id');
+  const wgDir = workgroupSharedDir(workgroupId, ctx.dataDir);
+  // Same predicate as the mount in container-runner.ts. A link whose target
+  // is not mounted is worse than no link.
+  if (!WORKGROUP_SHARED_FS && !fs.existsSync(path.join(wgDir, MIGRATION_MARKER))) return;
+  fs.mkdirSync(path.join(wgDir, SHARED_WORK_DIR_NAME), { recursive: true });
+  const members = db.prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`).all(workgroupId) as Array<{
+    folder: string;
+  }>;
+  for (const member of members) {
+    assertTrustedPathSegment(member.folder, 'agent group folder');
+    const memberDir = path.join(ctx.groupsDir, member.folder);
+    // A member whose folder has not been created yet is not an error: the
+    // group's first spawn runs initGroupFilesystem, and the next boot links
+    // it. Creating the folder here would race that scaffold.
+    if (!fs.existsSync(memberDir)) continue;
+    const linkPath = path.join(memberDir, SHARED_WORK_DIR_NAME);
+    const st = lstatOrNull(linkPath);
+    if (st) {
+      if (st.isSymbolicLink() && safeReadlink(linkPath) === ctx.target) continue; // already correct
+      // Anything else — a real dir, or a link addressing something this
+      // function did not put there — is somebody's content. Say so and leave
+      // it. A member that keeps its own real directory here does NOT share it:
+      // its agent still reads the instruction pointing at the shared tree, so
+      // this line is the only signal of the divergence.
+      log.warn('ensureWorkgroupWorkDirs: member already has an entry at the shared work dir name', {
+        workgroupId,
+        member: member.folder,
+        name: SHARED_WORK_DIR_NAME,
+        kind: st.isSymbolicLink() ? `symlink -> ${safeReadlink(linkPath) ?? '?'}` : 'real entry',
+      });
+      continue;
+    }
+    try {
+      fs.symlinkSync(ctx.target, linkPath);
+    } catch (err) {
+      // Lost the lstat→symlink race with a live container. Not destructive;
+      // the next boot's lstat takes the branch above.
+      log.warn('ensureWorkgroupWorkDirs: could not link member', { workgroupId, member: member.folder, err });
     }
   }
 }
