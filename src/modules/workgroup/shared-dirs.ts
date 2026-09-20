@@ -870,14 +870,23 @@ function ensureOneWorkgroupWorkDir(
     // it. Creating the folder here would race that scaffold.
     if (!fs.existsSync(memberDir)) continue;
     const linkPath = path.join(memberDir, SHARED_WORK_DIR_NAME);
-    const st = lstatOrNull(linkPath);
+    let st = lstatOrNull(linkPath);
+    if (st?.isSymbolicLink() && safeReadlink(linkPath) === ctx.target) continue; // already correct
+    if (st?.isDirectory()) {
+      // A member that kept its own real directory here is the divergence this
+      // whole mechanism exists to end: its agent reads an instruction naming
+      // the shared tree while writing into private storage no sibling can
+      // read. Consolidate it, then fall through and link.
+      consolidateMemberWorkDir(linkPath, path.join(wgDir, SHARED_WORK_DIR_NAME), {
+        workgroupId,
+        member: member.folder,
+      });
+      st = lstatOrNull(linkPath);
+    }
     if (st) {
-      if (st.isSymbolicLink() && safeReadlink(linkPath) === ctx.target) continue; // already correct
-      // Anything else — a real dir, or a link addressing something this
-      // function did not put there — is somebody's content. Say so and leave
-      // it. A member that keeps its own real directory here does NOT share it:
-      // its agent still reads the instruction pointing at the shared tree, so
-      // this line is the only signal of the divergence.
+      // Still something here: a file, or a symlink addressing content this
+      // function did not put there (the clone-as-codex `../<seed>/x` shape).
+      // Nothing was moved, so repointing would strand what it addresses.
       log.warn('ensureWorkgroupWorkDirs: member already has an entry at the shared work dir name', {
         workgroupId,
         member: member.folder,
@@ -893,6 +902,98 @@ function ensureOneWorkgroupWorkDir(
       // the next boot's lstat takes the branch above.
       log.warn('ensureWorkgroupWorkDirs: could not link member', { workgroupId, member: member.folder, err });
     }
+  }
+}
+
+/**
+ * Drain a member's own real `artifacts/` into the workgroup's shared tree, so
+ * the caller can replace it with the compat link.
+ *
+ * The rules are chosen so this can run unattended on every boot:
+ *
+ * - **Nothing is ever overwritten.** An entry whose name is free in the shared
+ *   tree moves under its own name. One whose name is taken moves to
+ *   `<name>.from-<member>` — the content still becomes shared, which is the
+ *   point, and neither side loses a byte. Renaming rather than merging also
+ *   keeps the operation decidable without reading file contents.
+ * - **Each entry moves atomically**, by `rename` within one filesystem, else
+ *   copy-to-hidden-staging → `rename` → remove source. A crash can leave a
+ *   `.<name>.partial` behind, never a half-populated destination.
+ * - **The source directory is removed only when empty**, by `rmdirSync`, which
+ *   refuses a non-empty directory. So a member whose entries could not all be
+ *   moved keeps its directory and its content, and the caller's warning names
+ *   it. There is no path here that deletes something it did not first copy.
+ *
+ * Failures are per entry: one unreadable file does not abandon the rest, and
+ * the next boot retries whatever is left.
+ */
+function consolidateMemberWorkDir(
+  memberWorkDir: string,
+  sharedWorkDir: string,
+  ctx: { workgroupId: string; member: string },
+): void {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(memberWorkDir);
+  } catch (err) {
+    log.warn('ensureWorkgroupWorkDirs: could not read member work dir', { ...ctx, err });
+    return;
+  }
+  if (entries.length > 0) {
+    const strategy: 'rename' | 'copy' = sameFilesystem(memberWorkDir, sharedWorkDir) ? 'rename' : 'copy';
+    const moved: string[] = [];
+    const renamed: string[] = [];
+    for (const name of entries) {
+      const src = path.join(memberWorkDir, name);
+      let dstName = name;
+      if (fs.existsSync(path.join(sharedWorkDir, dstName))) {
+        dstName = `${name}.from-${ctx.member}`;
+        // Taken twice over: the previous consolidation of this same member
+        // already landed here, so the two are the same content or the operator
+        // has renamed around it. Leave this one for a human either way.
+        if (fs.existsSync(path.join(sharedWorkDir, dstName))) {
+          log.warn('ensureWorkgroupWorkDirs: name taken in the shared tree, left in place', {
+            ...ctx,
+            name,
+            attempted: dstName,
+          });
+          continue;
+        }
+      }
+      const dst = path.join(sharedWorkDir, dstName);
+      try {
+        if (strategy === 'rename') {
+          fs.renameSync(src, dst);
+        } else {
+          // Hidden staging, for the same reason the dir migrator uses one: a
+          // crash mid-copy must not leave something at `dst` that a later run
+          // reads as a completed move.
+          const staging = path.join(sharedWorkDir, `.${dstName}.partial`);
+          fs.rmSync(staging, { recursive: true, force: true });
+          fs.cpSync(src, staging, { recursive: true, verbatimSymlinks: true });
+          fs.renameSync(staging, dst);
+          fs.rmSync(src, { recursive: true, force: true });
+        }
+      } catch (err) {
+        log.warn('ensureWorkgroupWorkDirs: could not move entry into the shared tree', { ...ctx, name, err });
+        continue;
+      }
+      moved.push(name);
+      if (dstName !== name) renamed.push(`${name} -> ${dstName}`);
+    }
+    if (moved.length > 0) {
+      log.info('ensureWorkgroupWorkDirs: consolidated member work dir', {
+        ...ctx,
+        strategy,
+        moved: moved.length,
+        renamedOnCollision: renamed,
+      });
+    }
+  }
+  try {
+    fs.rmdirSync(memberWorkDir); // refuses a non-empty dir — nothing unmoved is lost
+  } catch {
+    /* entries remain; the caller's warning names the member and the next boot retries */
   }
 }
 

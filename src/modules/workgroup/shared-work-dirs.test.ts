@@ -101,7 +101,7 @@ describe('ensureWorkgroupWorkDirs', () => {
 
   // ── F1 regression: the generic migrator must never touch this name ─────────
 
-  it('does not let the shared-dir migrator delete a seed folder holding a real artifacts/', () => {
+  it('does not let the shared-dir migrator destroy a seed folder holding a real artifacts/', () => {
     // A group created between boots writes work products before anything links
     // it — exactly what container/CLAUDE.md now tells agents to do.
     const seedWork = path.join(groupsDir, 'wgx', SHARED_WORK_DIR_NAME);
@@ -116,9 +116,11 @@ describe('ensureWorkgroupWorkDirs', () => {
     run();
     reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
 
-    // Creating the shared dir empty and ahead of the migrator used to make its
-    // `existsSync(dst)` arm read "interrupted move" and rmSync the source.
-    expect(fs.readFileSync(path.join(seedWork, 'q3-report.md'), 'utf8')).toBe('a week of work');
+    // Consolidated into the house, not destroyed. Creating the shared dir
+    // empty and ahead of the migrator used to make its `existsSync(dst)` arm
+    // read "interrupted move" and rmSync the source with nothing moved.
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'q3-report.md'), 'utf8')).toBe('a week of work');
+    expect(fs.readlinkSync(seedWork)).toBe(LINK_TARGET);
   });
 
   it('never lets the migrator claim the reserved name as something it moved', () => {
@@ -176,19 +178,76 @@ describe('ensureWorkgroupWorkDirs', () => {
 
   // ── Never clobber ──────────────────────────────────────────────────────────
 
-  it('never clobbers a member that already holds a real directory at that name', () => {
+  // ── Consolidation ──────────────────────────────────────────────────────────
+  // A member holding its own real artifacts/ IS the divergence this mechanism
+  // exists to end: its agent reads an instruction naming the shared tree while
+  // writing where no sibling can read.
+
+  it("moves a member's own real directory into the shared tree and links it", () => {
     markMigrated();
     const own = linkAt('wgx-codex');
     fs.mkdirSync(own);
-    fs.writeFileSync(path.join(own, 'private.md'), 'mine');
+    fs.writeFileSync(path.join(own, 'roadmap.html'), 'a week of work');
+    fs.mkdirSync(path.join(own, 'nested'));
+    fs.writeFileSync(path.join(own, 'nested', 'data.json'), '{}');
 
     run();
 
-    expect(fs.lstatSync(own).isSymbolicLink()).toBe(false);
-    expect(fs.readFileSync(path.join(own, 'private.md'), 'utf8')).toBe('mine');
-    expect(vi.mocked(log.warn)).toHaveBeenCalled();
-    // The sibling that had nothing is still linked, and the shared dir exists.
+    // The member is now a link to the house, and the work is IN the house.
+    expect(fs.readlinkSync(own)).toBe(LINK_TARGET);
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'roadmap.html'), 'utf8')).toBe('a week of work');
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'nested', 'data.json'), 'utf8')).toBe('{}');
+    // Which means the sibling reaches it: wgx resolves the same shared tree.
     expect(fs.readlinkSync(linkAt('wgx'))).toBe(LINK_TARGET);
+  });
+
+  it('never overwrites: a colliding name is moved aside, not merged or dropped', () => {
+    markMigrated();
+    run(); // creates the shared tree and links wgx
+    fs.writeFileSync(path.join(sharedWorkDir(), 'report.md'), 'the shared one');
+    // wgx-codex was linked by that first run; give it its own dir again, as a
+    // group that wrote before it was ever linked would have.
+    fs.unlinkSync(linkAt('wgx-codex'));
+    fs.mkdirSync(linkAt('wgx-codex'));
+    fs.writeFileSync(path.join(linkAt('wgx-codex'), 'report.md'), 'the private one');
+
+    run();
+
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md'), 'utf8')).toBe('the shared one');
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md.from-wgx-codex'), 'utf8')).toBe('the private one');
+    expect(fs.readlinkSync(linkAt('wgx-codex'))).toBe(LINK_TARGET);
+  });
+
+  it('keeps the directory, and everything in it, when an entry cannot be moved', () => {
+    markMigrated();
+    run();
+    fs.writeFileSync(path.join(sharedWorkDir(), 'report.md'), 'shared');
+    fs.writeFileSync(path.join(sharedWorkDir(), 'report.md.from-wgx-codex'), 'an earlier consolidation');
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, 'report.md'), 'cannot land anywhere');
+    fs.writeFileSync(path.join(own, 'movable.md'), 'this one can');
+
+    run();
+
+    // Both destination names are taken, so this entry stays put — and because
+    // it does, the directory is not empty and is NOT removed.
+    expect(fs.lstatSync(own).isSymbolicLink()).toBe(false);
+    expect(fs.readFileSync(path.join(own, 'report.md'), 'utf8')).toBe('cannot land anywhere');
+    // The entry that could move still did.
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'movable.md'), 'utf8')).toBe('this one can');
+    expect(fs.existsSync(path.join(own, 'movable.md'))).toBe(false);
+    expect(vi.mocked(log.warn)).toHaveBeenCalled();
+  });
+
+  it('consolidates an empty directory by simply linking it', () => {
+    markMigrated();
+    fs.mkdirSync(linkAt('wgx-codex'));
+
+    run();
+
+    expect(fs.readlinkSync(linkAt('wgx-codex'))).toBe(LINK_TARGET);
   });
 
   it('leaves a symlink that addresses somewhere else alone, with its content still reachable', () => {
