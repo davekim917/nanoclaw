@@ -360,6 +360,26 @@ done
 grep -q '^BUDGET_MAX=110$' "$W" && grep -q 'timeout -k 2 "\$BUDGET"' "$W" \
   || fail "hard kill must land by 110 + 2 s, under the runner's 120 s"
 
+# $1 case, $2 slug. The wake carries a ready-to-run enqueue-send: an id and a
+# fingerprint the helper's patterns accept, a non-empty fire (it rejects an
+# empty one, cli/enqueue-send.ts:157), a thread key, and the exact text. The
+# text never names the fire or the detail, because the id is per cause per day
+# and a different payload under it is a mismatch, not a replay.
+alarm_selfcontained() {
+  local day
+  day="$(d .fire | cut -c1-10 | tr -d -)"
+  [ "$(d .alarm.id)" = "ctl.failure.$2.$day#1" ] && [ "$(d .alarm.fingerprint)" = "$2" ] \
+    && [ "$(d .alarm.threadKey)" = "ctl.failure-$2-$day" ] && [ "$(d .alarm.runId)" = "ctl.wrapper.$day" ] \
+    || fail "$1: the wake must carry the alarm's ids: $OUTPUT"
+  [ -n "$(d .alarm.fire)" ] && [ "$(d .alarm.fire)" != null ] && [ -n "$(d .alarm.text)" ] \
+    && [ "$(d .alarm.text)" != null ] || fail "$1: the wake must carry a fire and the post text: $OUTPUT"
+  d .alarm.text | grep -q "UNCERTAIN" || fail "$1: the post must not claim the fire changed nothing: $OUTPUT"
+  if d .alarm.text | grep -qF "$(d .fire)"; then
+    fail "$1: the post text carries the fire timestamp, so tomorrow's replay is a mismatch: $OUTPUT"
+  fi
+  return 0
+}
+
 # --- every fail-closed worker end wakes the owner with its cause (round 5) --------
 # $1 case, $2 description, $3 expected failure slug. The fire must fail closed,
 # report itself as wakeAgent:true with {failure, detail, fire, note}, call no
@@ -369,6 +389,9 @@ wrapper_failed() {
     || fail "$1: $2 must fail closed as a '$3' wake: $OUTPUT"
   [ "$(d .detail)" != null ] && [ -n "$(d .detail)" ] && [ "$(d .fire)" != null ] && [ "$(d .note)" != null ] \
     || fail "$1: the wake must carry {failure, detail, fire, note}: $OUTPUT"
+  # Round 6: the owner must be able to post WITHOUT re-reading the
+  # configuration that just failed, so the wake carries the whole send.
+  alarm_selfcontained "$1" "$3"
   calls '[.[] | select(.tool=="gate" and .op=="poll")] | length == 0' | grep -qx true \
     || fail "$1: a fail-closed fire never polls: $(cat "$FAKE_LOG")"
   [ ! -e "$C/fake/enqueue.json" ] || [ "$(jq '.messages | length' "$C/fake/enqueue.json")" = 0 ] \
@@ -518,6 +541,42 @@ except ctl.ControllerError:
     pass
 if ctl.listdir_contained(root, ["absent"]) != []:
     errs.append("an absent directory must list as empty")
+# Round 6: an ancestor nobody can traverse is NOT absence. `lexists` says
+# false for both, so answering [] here would drop the live alarm queue.
+os.makedirs(os.path.join(root, "shut", "alarms"), exist_ok=True)
+open(os.path.join(root, "shut", "alarms", "owed.json"), "w").close()
+os.chmod(os.path.join(root, "shut"), 0o000)
+try:
+    got = ctl.listdir_contained(root, ["shut", "alarms"])
+    errs.append("unreadable ancestry listed as {!r} instead of raising".format(got))
+except ctl.ControllerError:
+    pass
+finally:
+    os.chmod(os.path.join(root, "shut"), 0o755)
+if ctl.listdir_contained(root, ["shut", "alarms"]) != ["owed.json"]:
+    errs.append("a readable directory must list its entries")
+# Round 6: the root itself is pinned by (st_dev, st_ino) at first use, so a
+# root swapped for a symlink to somewhere else is refused, not followed.
+outside2 = os.path.join(sys.argv[2], "elsewhere2")
+os.makedirs(os.path.join(outside2, "real"), exist_ok=True)
+open(os.path.join(outside2, "real", "mine"), "w").close()
+swapped = os.path.join(sys.argv[2], "swapped")
+os.makedirs(os.path.join(swapped, "real"), exist_ok=True)
+open(os.path.join(swapped, "real", "mine"), "w").close()
+ctl.listdir_contained(swapped, ["real"])          # pins this identity
+os.rename(swapped, swapped + ".gone")             # ... and now it is a different directory
+os.symlink(outside2, swapped)
+for name, call in (("unlink_contained", lambda: ctl.unlink_contained(swapped, ["real", "mine"])),
+                   ("listdir_contained", lambda: ctl.listdir_contained(swapped, ["real"]))):
+    try:
+        call()
+    except ctl.ControllerError:
+        continue
+    if name == "unlink_contained" and os.path.exists(os.path.join(outside2, "real", "mine")):
+        continue  # refused without raising is fine for a delete
+    errs.append("{} followed a swapped root".format(name))
+if not os.path.exists(os.path.join(outside2, "real", "mine")):
+    errs.append("a swapped root carried a delete outside the pinned directory")
 for e in errs:
     print("containment:", e)
 sys.exit(1 if errs else 0)
@@ -574,7 +633,9 @@ for c in calls_in(tree, "end_fire"):
         continue
     # The owner posts the alarm under this slug, so every slug must be a legal
     # enqueue-send id/fingerprint/thread-key (cli/enqueue-send.ts:66-68,
-    # mcp-tools/core.ts THREAD_KEY_PATTERN): hyphens, never underscores.
+    # mcp-tools/core.ts THREAD_KEY_PATTERN). Those classes also allow `_`; the
+    # narrower spelling below is house style, and what it really buys is
+    # keeping a space, a slash or a `#` out of an id the owner pastes.
     slug = kw["failure"].value
     if not re.match(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,60}$", slug):
         errs.append("failure slug {!r} is not a legal send id/fingerprint".format(slug))
@@ -599,17 +660,40 @@ sys.exit(1 if errs else 0)
 PY
 
 # --- structure: only final() writes to the runner's stdout -------------------------
-[ "$(grep -c '>&3' "$W")" = 2 ] || fail "expected exactly final()'s two fd-3 writes"
-[ "$(sed -n '/^final() {/,/^}/p' "$W" | grep -c '>&3')" = 2 ] || fail "every fd-3 write must be inside final()"
+[ "$(grep -c '>&3' "$W")" = "$(sed -n '/^final() {/,/^}/p' "$W" | grep -c '>&3')" ] \
+  || fail "every fd-3 write must be inside final()"
+[ "$(sed -n '/^final() {/,/^}/p' "$W" | grep -c '>&3')" = 3 ] \
+  || fail "final() writes fd 3 in exactly three places: the jq render and its two fail_json fallbacks"
 grep -q "exec 3>&1 1>&2" "$W" || fail "stdout must be moved to fd 3 before anything runs"
-# Renderings of a true wake ({wakeAgent:true ...} in jq, "wakeAgent":true in the
-# literal fallback), comments excluded: all of them, and exactly three, live in
-# final() -- the owner step, any failure, and the jq-less fallback.
+# Renderings of a true wake ({wakeAgent:true ...} in jq, "wakeAgent":true in
+# fail_json's printf), comments excluded: all of them live in final() or in
+# fail_json, which only final() calls.
 renders() { grep -v '^[[:space:]]*#' | grep -c 'wakeAgent"\?:true'; }
-[ "$(renders <"$W")" = "$(sed -n '/^final() {/,/^}/p' "$W" | renders)" ] \
-  || fail "every wakeAgent:true rendering must be inside final()"
-[ "$(sed -n '/^final() {/,/^}/p' "$W" | renders)" = 3 ] \
-  || fail "final() renders a true wake for the owner step, for a failure, and in the jq-less fallback"
+[ "$(renders <"$W")" = "$(sed -n '/^final() {/,/^}/p;/^fail_json() {/,/^}/p' "$W" | renders)" ] \
+  || fail "every wakeAgent:true rendering must be inside final() or fail_json"
+[ "$(grep -c 'fail_json ' "$W")" = 3 ] \
+  && [ "$(sed -n '/^final() {/,/^}/p' "$W" | grep -c 'fail_json ')" = 2 ] \
+  || fail "fail_json is called twice inside final() and once in the empty-output branch, nowhere else"
+# The two places a failure line can be rendered must render the SAME text: the
+# owner posts one id per cause per day and enqueue-send refuses that id with a
+# different payload, so drift between them would silently become a mismatch.
+python3 - "$W" "$SCRIPT_DIR/smoke-controller-live-worker.py" <<'PY' || fail "alarm text drift (see above)"
+import re, sys
+sh, py = (open(p).read() for p in sys.argv[1:3])
+def sh_var(name):
+    return re.search(r'^%s="(.*)"$' % name, sh, re.M).group(1)
+def py_const(name):
+    m = re.search(r'^%s = \(?(".*?")\)?\n(?=[A-Z_]|\n|def )' % name, py, re.M | re.S)
+    return "".join(re.findall(r'"([^"]*)"', m.group(1)))
+errs = []
+if sh_var("NOTE") != py_const("REPEAT_NOTE"):
+    errs.append("NOTE differs from the worker's REPEAT_NOTE")
+if sh_var("ALARM_TEXT") != py_const("ALARM_TEXT"):
+    errs.append("ALARM_TEXT differs from the worker's ALARM_TEXT")
+for e in errs:
+    print("alarm text:", e)
+sys.exit(1 if errs else 0)
+PY
 
 # --- the supervisor's OWN failure paths wake too, and never silently false ---------
 # (the hung-worker case above is the timeout half: rc 124 -> fire-killed.)
@@ -624,5 +708,31 @@ chmod +x "$C/shim/python3"
 fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6 PATH="$C/shim:$PATH"
 [ "$WAKE" = true ] && [ "$(d .failure)" = worker-output-invalid ] \
   || fail "a worker line that is not JSON is reported, not a silent false: $OUTPUT"
+alarm_selfcontained supervisor-garbage worker-output-invalid
+# Round 6: without jq the line is built by bash alone, and STILL carries fire,
+# note and the whole alarm -- the owner cannot build the daily id without the
+# fire, and enqueue-send rejects an empty one (cli/enqueue-send.ts:157).
+new_case supervisor-nojq
+mkdir -p "$C/shim"
+printf '#!/usr/bin/env bash\nexit 127\n' >"$C/shim/jq"
+chmod +x "$C/shim/jq"
+fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6 PATH="$C/shim:$PATH" PYTHONHOME=/nonexistent
+[ "$WAKE" = true ] && [ "$(d .failure)" = worker-no-output ] \
+  || fail "no jq: the supervisor still names the real cause: $OUTPUT"
+[ -n "$(d .fire)" ] && [ "$(d .fire)" != null ] && [ "$(d .note)" != null ] \
+  || fail "no jq: the line must still carry fire and note: $OUTPUT"
+alarm_selfcontained supervisor-nojq worker-no-output
+[ "$(d .alarm.to)" = null ] || fail "no destination in the process env: alarm.to is null, not invented: $OUTPUT"
+# ... and when the operator exports the destination on the task's script line,
+# even a failure that never read the env file can address its alarm.
+fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6 PATH="$C/shim:$PATH" PYTHONHOME=/nonexistent \
+  SMOKE_CONTROLLER_SEND_TO=campaign-room
+[ "$(d .alarm.to)" = campaign-room ] || fail "no jq: the destination from the task env reaches the wake: $OUTPUT"
+# The same, for a worker failure whose cause IS the env file.
+new_case env-unreadable
+rm -f "$C/env.sh"; mkfifo "$C/env.sh"
+fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6 SMOKE_CONTROLLER_SEND_TO=campaign-room
+[ "$WAKE" = true ] && [ "$(d .alarm.to)" = campaign-room ] \
+  || fail "a fire hung on the env file still reports somewhere to post: $OUTPUT"
 
 echo "smoke controller live wrapper tests passed"

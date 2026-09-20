@@ -8,7 +8,11 @@ woke you for exactly one of two reasons. **Read `scriptOutput` first.**
 below and do only that; nothing else in this file applies.
 
 ```json
-{ "failure": "<cause slug>", "detail": "<short text>", "fire": "<iso>", "note": "..." }
+{ "failure": "<cause slug>", "detail": "<short text>", "fire": "<iso>", "note": "...",
+  "outDir": "<controller out-dir or null>",
+  "alarm": { "to": "<destination or null>", "id": "ctl.failure.<slug>.<YYYYMMDD>#1",
+             "threadKey": "...", "runId": "...", "fingerprint": "<slug>",
+             "fire": "<iso>", "text": "<the exact post text>" } }
 ```
 
 Otherwise one judgment step is due and `scriptOutput` is:
@@ -46,27 +50,36 @@ the brief names, write its artifacts, and stop.
 The wrapper posts nothing itself — you are its only way out. Do exactly two
 things, and nothing else:
 
-1. Post ONE operator alarm to the campaign room, through the same helper the
-   controller uses. Source `/workspace/agent/smoke-gate-env.sh` first, then,
-   with `DAY` the `fire` date as `YYYYMMDD` and `SLUG` the `failure` value
-   verbatim (slugs are hyphenated, which the id and fingerprint patterns
-   accept; an underscore would be rejected as invalid input):
+1. Post ONE operator alarm, copying the values straight out of `data.alarm`.
+   **Do not source `/workspace/agent/smoke-gate-env.sh`, and do not look
+   anything up.** That file is part of what may have failed — if it is
+   unreadable or blocks (a FIFO), sourcing it hangs your turn the same way it
+   hung the fire. Everything the send needs is already in the wake:
 
    ```bash
-   SLUG=<the failure value>; DAY=<the fire date, YYYYMMDD>
    bun /app/src/cli/enqueue-send.ts \
-     --id "ctl.failure.$SLUG.$DAY#1" --to "$SMOKE_CONTROLLER_SEND_TO" \
-     --text "Smoke controller (live): a fire failed closed ($SLUG). No run was advanced and nothing new was claimed. The reason is in the task's run log (\`ncl tasks runs\`) and the controller's wrapper/fires.ndjson. Posted once a day per cause while it persists." \
-     --thread-key "ctl.failure-$SLUG-$DAY" --run-id "ctl.wrapper.$DAY" \
-     --fire "<the fire value>" --fingerprint "$SLUG"
+     --id "<alarm.id>" --to "<alarm.to>" --text "<alarm.text>" \
+     --thread-key "<alarm.threadKey>" --run-id "<alarm.runId>" \
+     --fire "<alarm.fire>" --fingerprint "<alarm.fingerprint>"
    ```
 
-   The id and the text are constant per cause per day ON PURPOSE: the same id
-   with the same payload is a `replay` (exit 0, no second row, no budget
-   consumed), and a *different* payload under that id is refused as a
-   `mismatch` — so keep `detail` and the fire timestamp out of the post text
-   and put them in your reply. (`--fire` and `--run-id` are budget
-   accounting, not payload, so they may vary.)
+   Pass every value **verbatim**, `alarm.text` included. The id and the text are constant
+   per cause per day ON PURPOSE: the same id with the same payload is a
+   `replay` (exit 0, no second row, no budget consumed), and a *different*
+   payload under that id is refused as a `mismatch`. Anything you want to add
+   — `detail`, `fire`, `outDir`, what you found — goes in your reply, never in
+   the post text.
+
+   **If `alarm.to` is `null`** the fire failed before it could resolve the
+   destination. Do not go looking in the env file. Send the same post to the
+   campaign room — the QA room this series already posts its campaign updates
+   to — resolving its name from `ncl destinations list --json`, which is a
+   different mechanism entirely and cannot be blocked by the gate env file.
+   If two rooms look plausible, pick the one the controller's earlier posts
+   went to (`<outDir>/journal.ndjson`, `kind: "send"` records) and say in your
+   reply which you chose. If no destination resolves at all, do not retry in
+   a loop: say so plainly in your reply and stop — your reply is the report of
+
    This is the one send this task may make, and it is not affected by the
    mute: `enqueue-send` is its own process and writes the outbound row
    directly (`cli/enqueue-send.ts:286,347-351`), so it never reaches
@@ -76,8 +89,16 @@ things, and nothing else:
    `send_message` call, by contrast, IS dropped.
 
 2. Take no campaign action at all. No gate verb, no `step`, no brief, no
-   artifacts, no GitHub. The fire already stopped before any gate effect; your
-   job is to make the failure visible, not to work around it.
+   artifacts, no GitHub. Your job is to make the failure visible, not to work
+   around it.
+
+   **The fire's effects are uncertain, not empty.** It may have failed after
+   the gate's `poll` claimed a run, or after a controller step performed real
+   effects (a post, an issue, a PR comment, a terminal verb). Read before you
+   conclude anything: `<outDir>/wrapper/fires.ndjson` (this fire and the ones
+   before it), `<outDir>/journal.ndjson` (what the controller committed to),
+   and the gate state for a run claimed but not advanced. Put what you found
+   in your reply; the post text stays as it is.
 
 The `note` in the wake is literal: the same cause re-reports on every fire
 while it persists, so the alarm you post may be a replay of one you posted

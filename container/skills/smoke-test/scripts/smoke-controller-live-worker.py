@@ -86,8 +86,37 @@ def under(path, root):
     return real == real_root or real.startswith(real_root + os.sep)
 
 
-SEND_TO = ""  # the controller's post destination; read from the env file below
+# The controller's post destination. Read from the PROCESS env first, so a
+# failure that is itself about the env file (unreadable, a FIFO, a refused
+# value) still carries somewhere to report to, and overridden by the env file
+# when that can be read. Operators who want the first kind of failure to reach
+# chat export it on the task's script line as well as in the env file.
+SEND_TO = os.environ.get("SMOKE_CONTROLLER_SEND_TO", "")
 MARKER_OPEN = False  # wrapper/fire-open written this fire
+# CONSTANT per cause per day -- it is posted under an id keyed by exactly
+# that, and enqueue-send refuses the same id with a different payload
+# (cli/enqueue-send.ts:294-308). So: no timestamps, no paths, no detail; those
+# ride in `data` and belong in the owner's reply, not in the post. It does NOT
+# claim the fire changed nothing: a fire can fail after the gate's poll
+# claimed a run, or after a step performed effects (round 6).
+ALARM_TEXT = ("Smoke controller (live): a fire failed closed ({slug}). It stopped part-way, so this fire's effects are "
+              "UNCERTAIN -- a run may have been claimed, a post or a GitHub write may have landed. Before acting, "
+              "check the gate state for a run claimed but not advanced, and the controller's journal and fire log. "
+              "No further fire will advance that run while the cause persists. Posted once a day per cause.")
+
+
+def alarm_payload(slug):
+    """Everything the owner needs to post this alarm, resolved HERE: the fire
+    that failed is the last thing in a position to resolve any of it, and the
+    owner must not have to re-read the configuration that just failed."""
+    day = FIRE[:10].replace("-", "")
+    return {"to": SEND_TO or None,
+            "id": "ctl.failure.{}.{}#1".format(slug, day),
+            "threadKey": "ctl.failure-{}-{}".format(slug, day),
+            "runId": "ctl.wrapper.{}".format(day),
+            "fingerprint": slug,
+            "fire": FIRE,
+            "text": ALARM_TEXT.format(slug=slug)}
 
 
 def _emit(extra):
@@ -134,7 +163,9 @@ def end_fire(extra, ok=None, failure="wrapper-error"):
     if ok is None:
         summary.update({"failure": failure,
                         "detail": str(extra.get("skipped") or extra.get("controllerError") or failure)[:300],
-                        "note": REPEAT_NOTE})
+                        "note": REPEAT_NOTE,
+                        "outDir": OUT,
+                        "alarm": alarm_payload(failure)})
     if MARKER_OPEN:
         # fire-open means exactly one thing: a fire started and did not reach
         # this function. It carries no obligation and gates nothing.
@@ -256,7 +287,8 @@ if MODE != "live":
     # switch being off is not a failure, so it is the one silent end.
     end_fire({"skipped": "SMOKE_CONTROLLER_MODE is {!r}, not live: the live wrapper does nothing".format(MODE)},
              ok="not-live")
-SEND_TO = os.environ.get("SMOKE_CONTROLLER_SEND_TO", "")
+# The env file's value now overrides the process env read at the top.
+SEND_TO = os.environ.get("SMOKE_CONTROLLER_SEND_TO", "") or SEND_TO
 if "SMOKE_GATE_CLAIMANT" in refused:
     end_fire({"skipped": "the env file names SMOKE_GATE_CLAIMANT: every gate caller sources it, so it would mark "
                        "legacy calls as the controller's. Remove it; this wrapper sets it per call.",

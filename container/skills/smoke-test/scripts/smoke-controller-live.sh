@@ -69,18 +69,62 @@
 #     Live effects leave it by design: the gate's state and lease files (poll,
 #     progress, finish), GitHub, chat rows in this session's outbound.db, task
 #     rows via ncl, and owner briefs under <run-root>/<runId>/controller/.
+#
+# TRUST BOUNDARY (read before adding more hardening here). The out-dir lives
+# inside this workgroup's own directory, and the only writers are this agent
+# group's containers -- no other tenant, no untrusted process, nothing
+# reachable from outside the host. So the containment in this wrapper and in
+# smoke-campaign-controller.py (O_NOFOLLOW walks, contained unlink/listdir,
+# the pinned root identity) is there to survive ACCIDENTS: a stale symlink
+# left by an earlier run, a half-cleaned directory, a path that moved under a
+# long fire, a mount that came back different. It is NOT a defence against a
+# hostile writer inside the workgroup -- against that, anything with write
+# access to the out-dir can also rewrite the journal and the gate state, so
+# the fix would be elsewhere entirely. Do not add further adversarial
+# hardening of our own directory here; it buys nothing and it is what turned
+# this file over five review rounds.
 set -uo pipefail
 exec 3>&1 1>&2
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# The fire's clock, taken before anything can fail. `date` first; bash's own
+# time format is the fallback, so a failure line still carries a `fire` when
+# nothing external runs.
+NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+[ -n "$NOW" ] || NOW="$(TZ=UTC printf '%(%Y-%m-%dT%H:%M:%SZ)T' -1)"
+# Both kept CHARACTER-FOR-CHARACTER identical to the worker's REPEAT_NOTE and
+# ALARM_TEXT (smoke-controller-live-worker.py): the owner posts one id per
+# cause per day and enqueue-send refuses that id with a different payload
+# (cli/enqueue-send.ts:294-308), so the two places that can render a failure
+# must render the same text. smoke-controller-live.test.sh compares them.
+NOTE="this cause repeats every fire while it persists, so you may have reported it already: post the alarm under the same per-cause daily id, which replays instead of duplicating"
+ALARM_TEXT="Smoke controller (live): a fire failed closed ({slug}). It stopped part-way, so this fire's effects are UNCERTAIN -- a run may have been claimed, a post or a GitHub write may have landed. Before acting, check the gate state for a run claimed but not advanced, and the controller's journal and fire log. No further fire will advance that run while the cause persists. Posted once a day per cause."
+# Set when the SUPERVISOR itself decides the fire failed, so a line it has to
+# build without jq still names the real cause.
+FAIL_SLUG=""
+FAIL_WHY=""
+
+fail_json() { # <slug> <detail> -- a failure line built with NO tool but bash
+  # Every field the owner needs to post the alarm, including `fire` (the daily
+  # id is keyed by it, and enqueue-send refuses an empty fire,
+  # container/agent-runner/src/cli/enqueue-send.ts:157). Built with printf, so
+  # it survives a missing jq, and quoting only ever interpolates values this
+  # script itself produced.
+  local slug="$1" detail="$2" day="${NOW:0:10}"
+  day="${day//-/}"
+  printf '{"wakeAgent":true,"data":{"failure":"%s","detail":"%s","fire":"%s","stepped":false,"note":"%s","alarm":{"to":%s,"id":"ctl.failure.%s.%s#1","threadKey":"ctl.failure-%s-%s","runId":"ctl.wrapper.%s","fingerprint":"%s","fire":"%s","text":"%s"}}}\n' \
+    "$slug" "$detail" "$NOW" "$NOTE" \
+    "$(if [ -n "${SMOKE_CONTROLLER_SEND_TO:-}" ]; then printf '"%s"' "$SMOKE_CONTROLLER_SEND_TO"; else printf null; fi)" \
+    "$slug" "$day" "$slug" "$day" "$day" "$slug" "$NOW" "${ALARM_TEXT//\{slug\}/$slug}"
+}
+
 final() { # <data-json> -- the only write to the runner's stdout
   local data="${1:-}"
   if ! jq -e 'type == "object"' <<<"$data" >/dev/null 2>&1; then
-    data="$(jq -cn --arg d "the fire printed no usable summary; see the task's stderr" --arg fire "${NOW:-}" \
-      '{failure:"worker-output-invalid",detail:$d,fire:$fire,stepped:false,
-        note:"this cause repeats every fire while it persists, so you may have reported it already: post the alarm under the same per-cause daily id, which replays instead of duplicating"}' 2>/dev/null)" ||
-      data='{"failure":"worker-output-invalid","detail":"the fire printed no usable summary","stepped":false}'
+    fail_json "${FAIL_SLUG:-worker-output-invalid}" \
+      "${FAIL_WHY:-the fire printed no usable summary; see the task stderr}" >&3
+    exit 0
   fi
   # Two reasons to wake: a well-formed owner step (with {step, runId, brief} on
   # top), or ANY fire that failed closed -- `failure` is the wrapper's whole
@@ -93,7 +137,7 @@ final() { # <data-json> -- the only write to the runner's stdout
       elif ($d.failure | type) == "string" and ($d.failure | length) > 0
       then {wakeAgent:true, data:($d | del(.ownerWake))}
       else {wakeAgent:false, data:$d} end' >&3 2>/dev/null ||
-    printf '%s\n' '{"wakeAgent":true,"data":{"failure":"final-line-unrenderable","detail":"the fire summary could not be rendered (jq unavailable or refused)"}}' >&3
+    fail_json final-line-unrenderable "the fire summary could not be rendered (jq unavailable or refused)" >&3
   exit 0
 }
 
@@ -117,18 +161,17 @@ export PYTHONDONTWRITEBYTECODE=1
 
 DATA="$(timeout -k 2 "$BUDGET" python3 "$SCRIPT_DIR/smoke-controller-live-worker.py")"
 RC=$?
-NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if [ -z "$DATA" ]; then
   # The worker never got to speak. That is a failure like any other, and it
-  # carries the same {failure, detail, fire} the worker's own ends do, so
-  # final() wakes the owner instead of reporting a silent false.
+  # carries the same fields the worker's own ends do, so final() wakes the
+  # owner instead of reporting a silent false. FAIL_SLUG/FAIL_WHY are what
+  # final() falls back to when it cannot build the line with jq either.
   case "$RC" in
-    124|137) WHY="fire exceeded its budget and was killed"; SLUG="fire-killed" ;;
-    *) WHY="wrapper failed before its summary (see stderr)"; SLUG="worker-no-output" ;;
+    124|137) FAIL_WHY="fire exceeded its budget and was killed"; FAIL_SLUG="fire-killed" ;;
+    *) FAIL_WHY="wrapper failed before its summary (see stderr)"; FAIL_SLUG="worker-no-output" ;;
   esac
-  DATA="$(jq -cn --argjson rc "$RC" --arg why "$WHY" --arg slug "$SLUG" --arg fire "$NOW" \
-    '{mode:null,fire:$fire,stepped:false,skipped:$why,failure:$slug,detail:$why,rc:$rc,
-      note:"this cause repeats every fire while it persists, so you may have reported it already: post the alarm under the same per-cause daily id, which replays instead of duplicating"}' 2>/dev/null)"
+  DATA="$(fail_json "$FAIL_SLUG" "$FAIL_WHY" |
+    jq -c --arg why "$FAIL_WHY" --argjson rc "$RC" '.data + {mode:null,skipped:$why,rc:$rc}' 2>/dev/null)"
 fi
 DATA="$(printf '%s\n' "$DATA" | tail -n 1)"
 if [ -n "$BUDGET_REJECTED" ]; then

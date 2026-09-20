@@ -272,13 +272,38 @@ def _contained(fd, root):
         raise ControllerError("controller write resolved outside {}: {}".format(real_root, real))
 
 
+_ROOT_IDENTITY = {}
+
+
+def _open_root(root):
+    """Open the containment root, pinned to ONE identity per process: the
+    first open records (st_dev, st_ino) and every later open of the same path
+    must match it. The root open cannot use O_NOFOLLOW (an install may
+    legitimately reach the out-dir through a symlinked parent), so without
+    this a root replaced between two calls would simply be followed to its new
+    target and every containment check below it would pass against the WRONG
+    directory (Codex PR #945 round 6). Returns an fd the caller owns."""
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        st = os.fstat(fd)
+        ident = (st.st_dev, st.st_ino)
+        first = _ROOT_IDENTITY.setdefault(root, ident)
+        if first != ident:
+            raise ControllerError(
+                "refusing controller root {}: it is no longer the directory first validated".format(root))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def open_contained(root, parts, flags, mode=0o644, make_dirs=False):
     """Open root/<parts...> without following a symlink at any component
     below root, and verify the result resolves under root. Returns an fd."""
     for part in parts:
         if not part or part in (".", "..") or "/" in part:
             raise ControllerError("refusing unsafe path component {!r}".format(part))
-    dfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    dfd = _open_root(root)
     try:
         for part in parts[:-1]:
             if make_dirs:
@@ -324,7 +349,7 @@ def _open_dir_contained(root, parts, make_dirs):
     for part in parts:
         if not part or part in (".", "..") or "/" in part:
             raise ControllerError("refusing unsafe path component {!r}".format(part))
-    dfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    dfd = _open_root(root)
     try:
         for part in parts:
             if make_dirs:
@@ -335,7 +360,12 @@ def _open_dir_contained(root, parts, make_dirs):
             try:
                 nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
             except OSError as exc:
-                raise ControllerError("refusing controller path {}/{}: {}".format(root, part, exc))
+                # The errno rides along: a caller has to tell "this directory
+                # is not there" (ENOENT) from "I could not look" (EACCES,
+                # ELOOP, ENOTDIR), and the message alone cannot (round 6).
+                err = ControllerError("refusing controller path {}/{}: {}".format(root, part, exc))
+                err.errno = exc.errno
+                raise err
             os.close(dfd)
             dfd = nxt
         _contained(dfd, root)
@@ -431,15 +461,18 @@ def unlink_contained(root, parts):
 
 
 def listdir_contained(root, parts):
-    """Sorted names in root/<parts...>, listed through the O_NOFOLLOW walk. A
-    directory that does not exist is []; one that cannot be walked or read --
-    a symlink, a permission refusal -- RAISES, because reading "empty" off an
-    unreadable directory is how state silently disappears (round 5, finding
-    3)."""
+    """Sorted names in root/<parts...>, listed through the O_NOFOLLOW walk.
+    ONLY a genuine ENOENT is []; every other errno RAISES -- a symlinked
+    component (ELOOP), a permission refusal anywhere in the ancestry
+    (EACCES), a non-directory (ENOTDIR). Reading "empty" off a directory
+    nobody could look into is how live state silently disappears: this lists
+    the gate's alarm queue (round 5 finding 3; round 6 corrected the test for
+    absence, which `os.path.lexists` also fails on an unreadable ancestor,
+    reporting "not there" for "could not look")."""
     try:
         dfd = _open_dir_contained(root, parts, make_dirs=False)
-    except ControllerError:
-        if not os.path.lexists(os.path.join(root, *parts)):
+    except ControllerError as exc:
+        if getattr(exc, "errno", None) == errno.ENOENT:
             return []
         raise
     try:
