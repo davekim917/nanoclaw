@@ -1608,6 +1608,71 @@ owner with a `failure` slug instead of a step; the owner then posts one
 operator alarm and takes no campaign action — same router file, "A failure
 wake".
 
+#### The claim renewer (required alongside the live controller)
+
+A live controller needs a second, script-only series: `scripts/smoke-controller-renew.sh`.
+
+```bash
+ncl tasks create --name smoke-controller-renew \
+  --recurrence '*/5 * * * *' \
+  --script 'bash /app/skills/smoke-test/scripts/smoke-controller-renew.sh' \
+  --prompt 'Never runs: this series gates every fire.'
+```
+
+Without it, a judgment step longer than the gate's 900-second lease strands
+its run. The lease's only stamp is `progress`, and neither party can issue one
+during a long step: the controller's series arms its next occurrence only when
+the current one resolves, so it cannot fire while the owner's turn is running,
+and the owner is refused `progress` as a claimant mismatch. On PR #2022 that
+cost a 13-lane step four lane markers and finished the run `BLOCKED`
+(XZO #2024).
+
+The renewer is its own series, so its own session and container: neither the
+owner's turn nor the controller's cadence can hold it up. Each tick reads the
+controller's journal read-only and stamps `progress` for a run only while all
+five of these hold:
+
+1. an owner obligation whose newest journal record is `enqueued`;
+2. `<run>/controller/brief-<step>.ack` present — the owner's first act on a
+   judgment wake, so this is what says the step was *taken*;
+3. the coordinator side of the run tree written to within the last 1200
+   seconds — this is what says the step is still being *worked*;
+4. an open `run/claim` obligation carrying the owner token;
+5. the step younger than the 3600-second ceiling (`OWNER_STEP_SLA_SECONDS`,
+   the same clock the controller calls a step overdue on).
+
+Condition 3 is not redundant with condition 2. **The ack is written once and
+never refreshed** — the router creates it, the controller only tests it for
+existence and re-offers a wake only while it is *absent*, and a step that
+continues through `continue_work` resumes in-session without re-running the
+router's first act. Its mtime is the time of the first wake and nothing else,
+so an owner that crashes after acking would otherwise be renewed all the way
+to the ceiling. Freshness is therefore measured as `max(ack mtime, newest
+mtime under <run>/ excluding <run>/challenger/)`. Measured on PR #2022's
+46-minute lanes step: 507 writes, largest gap between them 253 s — 1200 s
+clears that by 4.7×. **`<run>/challenger/` is excluded on purpose**: the
+challenger runs in its own session with its own lifetime, and the lease being
+renewed is the coordinator's, so a live challenger must not be able to hold a
+dead owner's claim open.
+
+**The bound, stated honestly.** Renewal continues while the owner is still
+writing under the run. After the owner dies it stops within one freshness
+window (≤ 1200 s), or sooner if the controller reconciles the step to `done`
+or `abandoned` first — whichever comes first — and in the worst case the
+3600-second ceiling stops it. It does not stop instantly. Both windows have
+env overrides (`SMOKE_CONTROLLER_RENEW_FRESHNESS_SECONDS`,
+`SMOKE_CONTROLLER_RENEW_CEILING_SECONDS`) that can only clamp them **down**;
+an out-of-range value is ignored rather than honoured upward.
+
+It renews and does nothing else — no claim, finish, release, poll, post or
+journal write — and it never wakes an agent: every tick's last line is
+`wakeAgent:false`. Every failure path renews nothing, including a journal it
+cannot read in full and a run tree it cannot scan, so a renewer that dies, is
+paused or is misconfigured degrades to the claim expiring on its own TTL,
+never to a run that looks alive while nothing is working it. It shares the
+controller's kill switch: `SMOKE_CONTROLLER_MODE` other than `live` makes a
+tick a no-op.
+
 - **Challenger**: in the `challenger/challenge.complete.json` it already
   writes, add `dissents`: one entry per disputed finding, `[{"id": "<finding
   id or D-n>"}]`, with unique, non-empty ids. Use `[]` only with
