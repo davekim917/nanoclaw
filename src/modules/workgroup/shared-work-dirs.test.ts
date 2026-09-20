@@ -159,18 +159,19 @@ describe('ensureWorkgroupWorkDirs', () => {
     );
   });
 
-  it('does not throw when a member folder is unwritable', () => {
+  it('links the rest of the workgroup when one member folder is unwritable', () => {
     markMigrated();
-    const memberDir = path.join(groupsDir, 'wgx-codex');
+    // The FIRST member by rowid, so the failure lands mid-loop: symlinkSync's
+    // own catch is what lets the loop continue. With only the outer
+    // per-workgroup catch the remaining members are skipped.
+    const memberDir = path.join(groupsDir, 'wgx');
     fs.chmodSync(memberDir, 0o500); // no write: symlinkSync throws EACCES
     try {
       expect(() => run()).not.toThrow();
+      expect(fs.readlinkSync(linkAt('wgx-codex'))).toBe(LINK_TARGET);
     } finally {
       fs.chmodSync(memberDir, 0o700);
     }
-
-    // The sibling that could be linked still was.
-    expect(fs.readlinkSync(linkAt('wgx'))).toBe(LINK_TARGET);
   });
 
   // ── Never clobber ──────────────────────────────────────────────────────────
@@ -234,11 +235,15 @@ describe('ensureWorkgroupWorkDirs', () => {
   it('creates nothing outside the workgroups root for an unsafe id', () => {
     db.prepare(`INSERT INTO workgroups (id) VALUES (?)`).run('../escape');
     markMigrated();
+    // Where `../escape` resolves to, marked so the mount gate PASSES — without
+    // this the row returns at the gate and the traversal oracle never bites.
+    const escaped = path.resolve(dataDir, 'workgroups', '../escape');
+    fs.mkdirSync(escaped, { recursive: true });
+    fs.writeFileSync(path.join(escaped, '.migrated'), '{}');
 
     run();
 
-    expect(fs.existsSync(path.join(dataDir, '..', 'escape'))).toBe(false);
-    expect(fs.existsSync(path.join(dataDir, 'escape'))).toBe(false);
+    expect(fs.existsSync(path.join(escaped, SHARED_WORK_DIR_NAME))).toBe(false);
   });
 });
 

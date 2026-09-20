@@ -53,8 +53,10 @@ export function reconcileWorkgroupFsState(db: Database.Database): void {
   // ── 2. Shared work-product directory + per-member compat links ─────────
   // Runs on every boot, unlike the one-time report drain above: a workgroup or
   // member added since the last boot needs it. Which workgroups it acts on is
-  // decided inside, by the mount predicate. It never throws out of here — one
-  // member losing a race must not stop the host booting.
+  // decided inside, by the mount predicate. One member losing a race, or one
+  // unusable workgroup row, warns and is skipped rather than stopping the host
+  // booting. The one uncontained throw is the workgroups enumeration itself:
+  // an unreadable central DB is fail-closed here, exactly as it is for step 1.
   ensureWorkgroupWorkDirs(db);
 }
 
