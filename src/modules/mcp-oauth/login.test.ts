@@ -83,7 +83,7 @@ vi.mock('./onecli-secret-writer.js', () => ({
   },
 }));
 
-import { closeDb, createAgentGroup, getRawDb, initMigratedTestDb } from '../../db/index.js';
+import { closeDb, createAgentGroup, getDb, initMigratedTestDb } from '../../db/index.js';
 import {
   getMcpOAuthIntegration,
   markMcpOAuthIntegration,
@@ -694,14 +694,15 @@ describe('remove --delete-secret undeclares the bearer before deleting it (#929)
 // instead, and deletes nothing.
 describe('remove --delete-secret refuses when the bearer is declared elsewhere (#929)', () => {
   /** A workgroup declaring `secrets`, with `ag-1` a member of it. */
-  function workgroupDeclaring(id: string, secrets: string[], withOwner = true): void {
-    const db = getRawDb();
-    db.prepare(`INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES (?, ?, ?)`).run(
+  async function workgroupDeclaring(id: string, secrets: string[], withOwner = true): Promise<void> {
+    const db = getDb();
+    await db.run(
+      `INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES (?, ?, ?)`,
       id,
       JSON.stringify(secrets),
       new Date().toISOString(),
     );
-    if (withOwner) db.prepare(`UPDATE agent_groups SET workgroup_id = ? WHERE id = ?`).run(id, 'ag-1');
+    if (withOwner) await db.run(`UPDATE agent_groups SET workgroup_id = ? WHERE id = ?`, id, 'ag-1');
   }
 
   /** A second agent group whose own container.json declares `secrets`. */
@@ -728,7 +729,7 @@ describe('remove --delete-secret refuses when the bearer is declared elsewhere (
   // this group too, and this group's file cannot take it back.
   it('refuses when the owning group’s own workgroup declares the bearer', async () => {
     const secretName = await connected();
-    workgroupDeclaring('main', [secretName, 'Unrelated']);
+    await workgroupDeclaring('main', [secretName, 'Unrelated']);
 
     await expect(removeIntegration('example-int', { deleteSecret: true })).rejects.toThrow(
       /Refusing to delete .* 1 other place\(s\) this command cannot edit/s,
@@ -738,8 +739,8 @@ describe('remove --delete-secret refuses when the bearer is declared elsewhere (
 
   it('refuses when any other workgroup declares it, and names every one of them', async () => {
     const secretName = await connected();
-    workgroupDeclaring('main', [secretName]);
-    workgroupDeclaring('other-team', [secretName], false);
+    await workgroupDeclaring('main', [secretName]);
+    await workgroupDeclaring('other-team', [secretName], false);
 
     const err = await removeIntegration('example-int', { deleteSecret: true }).catch((e: Error) => e);
     expect(err).toBeInstanceOf(Error);
@@ -765,7 +766,7 @@ describe('remove --delete-secret refuses when the bearer is declared elsewhere (
   // in either spelling aborts the spawn once the secret is gone.
   it('refuses on a foreign declaration written as the vault UUID', async () => {
     const secretName = await connected();
-    workgroupDeclaring('main', ['secret-uuid-1']);
+    await workgroupDeclaring('main', ['secret-uuid-1']);
 
     const err = await removeIntegration('example-int', { deleteSecret: true }).catch((e: Error) => e);
     expect((err as Error).message).toContain('declares "secret-uuid-1"');
@@ -818,7 +819,7 @@ describe('remove --delete-secret refuses when the bearer is declared elsewhere (
 
   it('proceeds when the other sites declare only unrelated secrets', async () => {
     const secretName = await connected();
-    workgroupDeclaring('main', ['Anthropic', 'Exa']);
+    await workgroupDeclaring('main', ['Anthropic', 'Exa']);
     await siblingDeclaring(['Anthropic']);
 
     const removed = await removeIntegration('example-int', { deleteSecret: true });
@@ -834,7 +835,7 @@ describe('remove --delete-secret refuses when the bearer is declared elsewhere (
   // refuse it — and refusing would strand the row.
   it('does not refuse a plain remove over a foreign declaration', async () => {
     const secretName = await connected();
-    workgroupDeclaring('main', [secretName]);
+    await workgroupDeclaring('main', [secretName]);
 
     const removed = await removeIntegration('example-int');
 

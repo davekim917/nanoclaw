@@ -158,17 +158,48 @@ describe('src/notify-owner.ts', () => {
     const cwd = process.cwd();
     try {
       process.chdir(elsewhere);
-      const { notifyOwner: fresh } = await import('./notify-owner.js');
-      // No dbPath/rootDir. The defaults must name THIS checkout's central DB,
-      // never the directory we happen to be standing in. Asserting against
-      // `elsewhere` rather than os.tmpdir() matters because the checkout
-      // itself can live under /tmp (gate worktrees do), which made the
-      // cruder assertion fail for the wrong reason.
-      const result = await fresh({ title: 'T', body: 'B' });
-      expect(result.code).toBe(2); // no owner row / no DB under test
-      expect(result.message).toContain(path.join(installRoot, 'data', 'v2.db'));
+      // Calling notifyOwner() with no dbPath used to be the oracle here, and it
+      // was not hermetic: it reads `<install>/data/v2.db`, which is absent in a
+      // fresh CI clone (giving the expected code 2) but PRESENT in a working
+      // install — where the call resolved a real owner DM and DELIVERED the
+      // fixture alert to it, then failed on `code` being 0.
+      //
+      // So the DB open is stubbed instead: `opened` records the path the
+      // default actually reached, and the throw sends the run down the code-2
+      // branch without any file or network. That keeps the oracle on the
+      // WIRING (notify-owner.ts:136 passes OWNER_DB_PATH when no dbPath is
+      // given), which asserting the exported constant alone does not prove.
+      //
+      // `vi.resetModules()` is load-bearing: without it the dynamic import
+      // returns the instance the static import at the top of this file already
+      // evaluated, whose constants were computed under the ORIGINAL cwd, so the
+      // case passed even with the constants derived from process.cwd() — the
+      // mutation Codex ran against this file and it survived. Re-evaluating
+      // under `elsewhere` is what restores the kill. Asserting against
+      // `elsewhere` rather than os.tmpdir() matters because the checkout itself
+      // can live under /tmp (gate worktrees do), which made a cruder assertion
+      // fail for the wrong reason.
+      vi.resetModules();
+      const opened: string[] = [];
+      vi.doMock('better-sqlite3', () => ({
+        default: class StubDatabase {
+          constructor(file: string) {
+            opened.push(file);
+            throw new Error('stubbed: this case must never open a real central DB');
+          }
+        },
+      }));
+      const fresh = await import('./notify-owner.js');
+      expect(fresh.OWNER_DB_PATH).toBe(path.join(installRoot, 'data', 'v2.db'));
+      expect(fresh.INSTALL_ROOT).toBe(installRoot);
+
+      const result = await fresh.notifyOwner({ title: 'T', body: 'B' });
+      expect(opened).toEqual([path.join(installRoot, 'data', 'v2.db')]);
+      expect(result.code).toBe(2);
       expect(result.message).not.toContain(elsewhere);
     } finally {
+      vi.doUnmock('better-sqlite3');
+      vi.resetModules();
       process.chdir(cwd);
       fs.rmSync(elsewhere, { recursive: true, force: true });
     }

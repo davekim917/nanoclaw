@@ -211,9 +211,9 @@ export const DATAFOLD_MCP_SERVER = {
 /**
  * Host-only fields on a stored MCP entry: they exist for the capability
  * snapshot and never for the provider. The container parses this JSON straight
- * into its server map (`container/agent-runner/src/index.ts:246`) and hands
+ * into its server map (`container/agent-runner/src/index.ts:245`) and hands
  * each entry to a provider's translator; its own `McpServerConfig`
- * (`container/agent-runner/src/providers/types.ts:260-298`) declares neither
+ * (`container/agent-runner/src/providers/types.ts:269-307`) declares neither
  * field, so they are dropped here rather than ridden along to three providers.
  *
  * `instructions` is deliberately NOT in this list. It is not part of that type

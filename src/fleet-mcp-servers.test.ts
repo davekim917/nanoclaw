@@ -204,19 +204,19 @@ describe('the file:line citations in this PR\u2019s comments', () => {
     },
     {
       file: 'container/agent-runner/src/index.ts',
-      line: 256,
+      line: 255,
       contains: 'dropRetiredMcpServers(mcpServers',
       citedBy: 'where a retired name is deleted from the merged map',
     },
     {
       file: 'container/agent-runner/src/index.ts',
-      line: 246,
+      line: 245,
       contains: 'JSON.parse(process.env.NANOCLAW_MCP_SERVERS)',
       citedBy: 'serializeMcpServersEnv — who parses the payload',
     },
     {
       file: 'container/agent-runner/src/providers/types.ts',
-      line: 260,
+      line: 269,
       contains: 'export type McpServerConfig',
       citedBy: 'serializeMcpServersEnv — the type that declares no host-only fields',
     },
@@ -252,7 +252,7 @@ describe('the file:line citations in this PR\u2019s comments', () => {
     },
     {
       file: 'src/container-runner.ts',
-      line: 4877,
+      line: 4878,
       contains: "containerPath: '/workspace/agent/container.json'",
       citedBy: 'genericMcpUseFor — the agent already reads this file',
     },

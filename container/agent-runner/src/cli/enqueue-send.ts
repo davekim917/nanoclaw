@@ -50,8 +50,7 @@ import path from 'path';
 import { getSessionRouting } from '../db/session-routing.js';
 import { findByName } from '../destinations.js';
 import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
-import { createOutboundRecord } from '../mailbox/model.generated.js';
-import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
+import { writeControllerSendRow } from '../modules/mailbox/controller-send.js';
 import { isAllowedFilePath, parseThreadKey } from '../mcp-tools/core.js';
 
 // Controller-send budget. Measured over the 30 finished PR smoke campaigns of
@@ -170,59 +169,13 @@ interface BudgetState {
   fingerprints: Record<string, number>;
 }
 
-function budgetKey(runId: string): string {
-  return `controller_send_budget:${runId}`;
-}
-
-function digestKey(id: string): string {
-  return `controller_send_files:${id}`;
-}
-
-/** The digests recorded with an existing row; null when absent or unreadable. */
-function readDigests(id: string): FileDigests | null {
-  const row = getOutboundDb().prepare('SELECT value FROM session_state WHERE key = ?').get(digestKey(id)) as
-    | { value: string }
-    | undefined;
-  if (!row) return null;
-  try {
-    const parsed = JSON.parse(row.value) as unknown;
-    if (
-      Array.isArray(parsed) &&
-      parsed.every(
-        (d) => d && typeof d === 'object' && typeof d.name === 'string' && /^[0-9a-f]{64}$/.test(String(d.sha256)),
-      )
-    ) {
-      return parsed as FileDigests;
-    }
-  } catch {
-    // fall through: unreadable is not "no files"
-  }
-  return null;
-}
-
+// The session-DB reads and the insert transaction live in the mailbox module
+// (modules/mailbox/controller-send.ts); this file keeps the budget POLICY
+// below, the payload comparisons, and the CLI's error taxonomy.
 function sameDigests(stored: FileDigests | null, wanted: FileDigests): boolean {
   if (wanted.length === 0) return stored === null;
   if (stored === null || stored.length !== wanted.length) return false;
   return stored.every((d, i) => d.name === wanted[i].name && d.sha256 === wanted[i].sha256);
-}
-
-function readBudget(runId: string): BudgetState {
-  const row = getOutboundDb().prepare('SELECT value FROM session_state WHERE key = ?').get(budgetKey(runId)) as
-    | { value: string }
-    | undefined;
-  if (!row) return { total: 0, fire: '', fireCount: 0, fingerprints: {} };
-  try {
-    const parsed = JSON.parse(row.value) as BudgetState;
-    return {
-      total: Number(parsed.total) || 0,
-      fire: String(parsed.fire ?? ''),
-      fireCount: Number(parsed.fireCount) || 0,
-      fingerprints: parsed.fingerprints && typeof parsed.fingerprints === 'object' ? parsed.fingerprints : {},
-    };
-  } catch {
-    // An unreadable counter must not read as "nothing sent": refuse.
-    throw new EnqueueSendError('budget', `controller send budget state for ${runId} is unreadable`);
-  }
 }
 
 export function budgetRefusal(state: BudgetState, fire: string, fingerprint: string | null | undefined): string | null {
@@ -283,115 +236,28 @@ export function enqueueSend(input: EnqueueSendInput): EnqueueSendResult & { ok: 
     content,
   };
 
-  const outbound = getOutboundDb();
-  const inbound = getInboundDb();
-  const select = outbound.prepare(
-    'SELECT seq, kind, platform_id, channel_type, thread_id, in_reply_to, deliver_after, content FROM messages_out WHERE id = ?',
-  );
-  outbound.exec('BEGIN IMMEDIATE');
-  try {
-    const existing = select.get(input.id) as (RowPayload & { seq: number }) | undefined;
-    if (existing) {
-      outbound.exec('ROLLBACK');
-      if (!samePayload(existing, wanted)) {
-        throw new EnqueueSendError(
-          'mismatch',
-          `id ${input.id} already holds a different payload; refusing to overwrite`,
-        );
-      }
-      if (!sameDigests(readDigests(input.id), digests)) {
-        throw new EnqueueSendError(
-          'mismatch',
-          `id ${input.id} already holds different attachment bytes (or no digest record); refusing to overwrite`,
-        );
-      }
-      return { ok: true, outcome: 'replay', id: input.id, seq: existing.seq };
-    }
-
-    const budget = readBudget(input.runId);
-    const refusal = budgetRefusal(budget, input.fire, input.fingerprint);
-    if (refusal) throw new EnqueueSendError('budget', refusal);
-
-    // Staged before the row exists, as send_file does (core.ts:386-391): the
-    // host reads <outbox>/<id>/ when it delivers the row. A crash after
-    // staging leaves only a directory the retry overwrites.
-    if (attachments.length) {
+  const result = writeControllerSendRow({
+    id: input.id,
+    runId: input.runId,
+    fire: input.fire,
+    fingerprint: input.fingerprint,
+    wanted,
+    digests,
+    stageAttachments: () => {
+      if (!attachments.length) return;
       const dir = path.join(input.outboxRoot ?? DEFAULT_OUTBOX_ROOT, input.id);
       fs.mkdirSync(dir, { recursive: true });
       for (const a of attachments) fs.writeFileSync(path.join(dir, a.name), a.bytes);
-    }
-
-    // Sequence rule of sqliteWriteMessageOut (mailbox/sqlite/operations.ts:
-    // 133-144): the container claims odd numbers above every row on both sides.
-    const maxOut = (
-      outbound.prepare('SELECT COALESCE(MAX(seq), 0) AS value FROM messages_out').get() as { value: number }
-    ).value;
-    const maxIn = (inbound.prepare('SELECT COALESCE(MAX(seq), 0) AS value FROM messages_in').get() as { value: number })
-      .value;
-    const max = Math.max(maxOut, maxIn);
-    const sequence = max % 2 === 0 ? max + 1 : max + 2;
-    const record = createOutboundRecord(
-      {
-        id: input.id,
-        kind: 'chat',
-        platformId: routing.platform_id,
-        channelType: routing.channel_type,
-        threadId: routing.thread_id,
-        content,
-      },
-      sequence,
-      new Date().toISOString(),
-    );
-    const inserted = outbound
-      .prepare(
-        `INSERT INTO messages_out
-           (id, seq, in_reply_to, timestamp, deliver_after, recurrence, kind, platform_id, channel_type, thread_id, content)
-         VALUES
-           ($id, $seq, $in_reply_to, $timestamp, $deliver_after, $recurrence, $kind, $platform_id, $channel_type, $thread_id, $content)
-         ON CONFLICT(id) DO NOTHING`,
-      )
-      .run({
-        $id: record.id,
-        $seq: record.sequence,
-        $in_reply_to: record.inReplyTo,
-        $timestamp: record.timestamp,
-        $deliver_after: record.deliverAfter,
-        $recurrence: record.recurrence,
-        $kind: record.kind,
-        $platform_id: record.platformId,
-        $channel_type: record.channelType,
-        $thread_id: record.threadId,
-        $content: record.content,
-      });
-    const back = select.get(input.id) as (RowPayload & { seq: number }) | undefined;
-    if (!back || !samePayload(back, wanted)) {
-      throw new EnqueueSendError('mismatch', `read-back of ${input.id} does not match the payload written`);
-    }
-    if (inserted.changes === 1 && digests.length) {
-      outbound
-        .prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
-        .run(digestKey(input.id), JSON.stringify(digests), new Date().toISOString());
-    }
-    if (inserted.changes === 1) {
-      const fireCount = budget.fire === input.fire ? budget.fireCount : 0;
-      const next: BudgetState = {
-        total: budget.total + 1,
-        fire: input.fire,
-        fireCount: fireCount + 1,
-        fingerprints: input.fingerprint
-          ? { ...budget.fingerprints, [input.fingerprint]: (budget.fingerprints[input.fingerprint] ?? 0) + 1 }
-          : budget.fingerprints,
-      };
-      outbound
-        .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
-        .run(budgetKey(input.runId), JSON.stringify(next), new Date().toISOString());
-    }
-    outbound.exec('COMMIT');
-    return { ok: true, outcome: inserted.changes === 1 ? 'enqueued' : 'replay', id: input.id, seq: back.seq };
-  } catch (err) {
-    if (outbound.inTransaction) outbound.exec('ROLLBACK');
-    throw err;
-  }
+    },
+    samePayload,
+    sameDigests,
+    budgetRefusal,
+    mismatchError: (message) => new EnqueueSendError('mismatch', message),
+    budgetError: (message) => new EnqueueSendError('budget', message),
+    unreadableBudgetError: (runId) =>
+      new EnqueueSendError('budget', `controller send budget state for ${runId} is unreadable`),
+  });
+  return { ok: true, outcome: result.outcome, id: input.id, seq: result.seq };
 }
 
 // ---------------------------------------------------------------------------

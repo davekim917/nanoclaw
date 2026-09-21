@@ -1101,7 +1101,7 @@ export function buildSessionServicesSnapshotFrom(
     // A retired name still sitting in some group's container.json is deleted
     // from the merged map by the runner on every spawn
     // (container/agent-runner/src/retired-mcp-servers.ts:13, applied at
-    // container/agent-runner/src/index.ts:256), so advertising it would
+    // container/agent-runner/src/index.ts:255), so advertising it would
     // promise a tool that cannot exist — the exact failure docs/slack-user-token.md
     // documents. The entry stays in the spawn payload, where the runner logs
     // the drop for the operator; it just never reaches the agent's capability
@@ -1194,7 +1194,7 @@ const PROVIDER_SECRET = /^(anthropic|openai|opencode)(-|$)/i;
  * A URL is safe to print: `parseMcpServerConfig` refuses one carrying
  * credentials at intake (src/container-config.ts:477-501), and the agent reads
  * the same value in its own read-only container.json mount
- * (src/container-runner.ts:4877). `env` and `headers` are never rendered —
+ * (src/container-runner.ts:4878). `env` and `headers` are never rendered —
  * those DO carry placeholder credentials.
  */
 function genericMcpUseFor(name: string, server: McpServerConfig): string {
