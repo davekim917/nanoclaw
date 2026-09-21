@@ -47,6 +47,7 @@ export const LEGACY_INBOUND_PATH_ALLOWLIST: ReadonlyMap<string, string> = new Ma
   ['src/modules/sweep-scheduled-move/index.ts', 'existsSync only — never opened'],
   ['scripts/list-scheduled-tasks.ts', 'existsSync, then a { readonly: true } open'],
   ['scripts/verify-workgroup-memory-runtime.ts', '{ readonly: true, fileMustExist: true } open'],
+  ['scripts/jev-shadow/turns.ts', '{ readonly: true, fileMustExist: true } open'],
   ['scripts/inventory-tasks-by-provider.ts', '{ readonly: true } open'],
   ['scripts/lookback.ts', '{ readonly: true } opens'],
   ['scripts/fleet-drift.ts', '{ readonly: true } open'],
