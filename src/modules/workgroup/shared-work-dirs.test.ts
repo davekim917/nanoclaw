@@ -1,3 +1,4 @@
+import * as crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -13,6 +14,13 @@ import {
   SHARED_WORK_DIR_NAME,
   workgroupSharedDir,
 } from './shared-dirs.js';
+
+// Passthrough, so a test can assert the hold name comes from the CSPRNG and
+// not from anything an observer could reproduce.
+vi.mock('crypto', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('crypto')>();
+  return { ...actual, randomBytes: vi.fn(actual.randomBytes) };
+});
 
 vi.mock('../../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
@@ -218,19 +226,15 @@ describe('ensureWorkgroupWorkDirs', () => {
     expect(fs.readlinkSync(linkAt('wgx-codex'))).toBe(LINK_TARGET);
   });
 
-  it('claims the destination name before moving, rather than checking it is free', () => {
-    // The shared tree is read-write in every sibling container and this runs
-    // before quiescence. `existsSync` then `rename` leaves a window in which
-    // another claimant sees the same free name; a `wx` create / non-recursive
-    // mkdir loses EEXIST in the kernel instead. The observable difference is
-    // that the destination ALREADY EXISTS when the move runs — a check-based
-    // implementation renames onto a name nothing has reserved.
+  it('claims a directory name before moving it, rather than checking it is free', () => {
+    // Directories cannot be hard-linked, so a directory is published by claim
+    // then rename. The observable difference from a check-based implementation
+    // is that the destination ALREADY EXISTS when the rename runs.
     markMigrated();
     run();
     fs.unlinkSync(linkAt('wgx-codex'));
     const own = linkAt('wgx-codex');
     fs.mkdirSync(own);
-    fs.writeFileSync(path.join(own, 'report.md'), 'the members own');
     fs.mkdirSync(path.join(own, 'nested'));
 
     const dstExistedAtMove: boolean[] = [];
@@ -245,15 +249,290 @@ describe('ensureWorkgroupWorkDirs', () => {
       spy.mockRestore();
     }
 
-    expect(dstExistedAtMove.length).toBe(2); // the file and the directory
-    expect(dstExistedAtMove).toEqual([true, true]);
-    expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md'), 'utf8')).toBe('the members own');
+    expect(dstExistedAtMove).toEqual([true]);
+    expect(fs.statSync(path.join(sharedWorkDir(), 'nested')).isDirectory()).toBe(true);
   });
 
-  it('releases the claim when a move fails, so the real name is still free next boot', () => {
-    // A claim left behind burns the entry's REAL name permanently: the content
-    // lands at `.from-<member>` and an agent following the instruction to
-    // `artifacts/<name>` reads zero bytes instead of an error.
+  it("never loses a sibling's write into the file's destination name", () => {
+    // #958. rename(2) replaces a file silently, so any implementation that
+    // renames onto the name — even over a zero-byte reservation it made itself
+    // — loses whatever a sibling wrote there in between. The sibling's write
+    // is injected at the last moment before the publishing syscall, whichever
+    // one the implementation uses.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, 'report.md'), 'MEMBER BYTES');
+    const dst = path.join(sharedWorkDir(), 'report.md');
+
+    let injected = false;
+    const siblingWrites = (to: fs.PathLike) => {
+      if (!injected && to === dst) {
+        injected = true;
+        fs.writeFileSync(dst, 'SIBLING BYTES'); // a normal truncating write
+      }
+    };
+    const realRename = fs.renameSync;
+    const realLink = fs.linkSync;
+    const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      siblingWrites(to);
+      return realRename(from, to);
+    });
+    const linkSpy = vi.spyOn(fs, 'linkSync').mockImplementation((from, to) => {
+      siblingWrites(to);
+      return realLink(from, to);
+    });
+    try {
+      run();
+    } finally {
+      renameSpy.mockRestore();
+      linkSpy.mockRestore();
+    }
+
+    expect(injected).toBe(true);
+    expect(fs.readFileSync(dst, 'utf8')).toBe('SIBLING BYTES');
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md.from-wgx-codex'), 'utf8')).toBe('MEMBER BYTES');
+  });
+
+  it("never loses the member's own save during the publish", () => {
+    // #967 review. The member's container is live at boot, and publishing by
+    // `link(src, dst)` then `unlink(src)` removes whatever is at that PATH,
+    // not the inode just linked. An agent saving the file the ordinary atomic
+    // way (write a temp, rename it over the name) inside that window had its
+    // new version deleted while the shared tree kept the old one. Taking the
+    // name by rename first makes the member's save a separate entry instead.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    const realName = path.join(own, 'report.md');
+    fs.writeFileSync(realName, 'OLD');
+
+    // The member saves a new version as soon as its bytes have been linked in.
+    let saved = false;
+    const realLink = fs.linkSync;
+    const spy = vi.spyOn(fs, 'linkSync').mockImplementation((from, to) => {
+      const r = realLink(from, to);
+      if (!saved) {
+        saved = true;
+        const tmp = path.join(own, '.report.md.swp');
+        fs.writeFileSync(tmp, 'MEMBER NEW EDIT');
+        fs.renameSync(tmp, realName); // an ordinary atomic save
+      }
+      return r;
+    });
+    try {
+      run();
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(saved).toBe(true);
+    const published = fs.readFileSync(path.join(sharedWorkDir(), 'report.md'), 'utf8');
+    expect(published).toBe('OLD');
+    // The new version still exists somewhere — in the member, or published
+    // beside the old one. What it must never be is gone.
+    const survivors = [
+      fs.existsSync(realName) ? fs.readFileSync(realName, 'utf8') : null,
+      fs.existsSync(path.join(sharedWorkDir(), 'report.md.from-wgx-codex'))
+        ? fs.readFileSync(path.join(sharedWorkDir(), 'report.md.from-wgx-codex'), 'utf8')
+        : null,
+    ];
+    expect(survivors).toContain('MEMBER NEW EDIT');
+  });
+
+  it('giving back a hold never replaces a file the member wrote meanwhile', () => {
+    // The publish fails, so the hold wants its real name back — but the live
+    // member has already written a new file there. The hold keeps its hidden
+    // name and is resumed next boot; the member's file is never replaced.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    const realName = path.join(own, 'report.md');
+    fs.writeFileSync(realName, 'HELD BYTES');
+
+    const spy = vi.spyOn(fs, 'linkSync').mockImplementationOnce(() => {
+      fs.writeFileSync(realName, 'MEMBER WROTE A NEW ONE'); // the name is free again, and taken
+      throw Object.assign(new Error('EIO'), { code: 'EIO' });
+    });
+    try {
+      run();
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(fs.readFileSync(realName, 'utf8')).toBe('MEMBER WROTE A NEW ONE');
+    const heldName = fs.readdirSync(own).find((n) => /^\.report\.md\.[0-9a-f]{12}\.publishing$/.test(n));
+    expect(heldName).toBeDefined();
+    expect(fs.readFileSync(path.join(own, heldName as string), 'utf8')).toBe('HELD BYTES');
+
+    run(); // next boot: both reach the shared tree, neither overwrites the other
+
+    const shared = fs.readdirSync(sharedWorkDir()).sort();
+    expect(shared).toContain('report.md');
+    expect(shared).toContain('report.md.from-wgx-codex');
+    const contents = shared
+      .filter((n) => n.startsWith('report.md'))
+      .map((n) => fs.readFileSync(path.join(sharedWorkDir(), n), 'utf8'))
+      .sort();
+    expect(contents).toEqual(['HELD BYTES', 'MEMBER WROTE A NEW ONE']);
+  });
+
+  it("giving a hold back never destroys a save the member made in the release's own window", () => {
+    // Round 2. The release is the last place the hold's real name is written,
+    // and the member's container is live. Whatever syscall puts the hold back
+    // must refuse an occupied name in the kernel, not check first: the probe
+    // injects the member's atomic save immediately before that syscall, so a
+    // check-then-act implementation has already decided the name was free.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    const realName = path.join(own, 'report.md');
+    fs.writeFileSync(realName, 'HELD BYTES');
+
+    const shared = sharedWorkDir();
+    let injected = false;
+    const realLink = fs.linkSync;
+    const realRename = fs.renameSync;
+    // The member saves a new version just before the hold is put back.
+    const injectIfRelease = (to: fs.PathLike) => {
+      if (!injected && String(to) === realName) {
+        injected = true;
+        const tmp = path.join(own, '.report.md.swp');
+        fs.writeFileSync(tmp, 'MEMBER NEW EDIT');
+        realRename(tmp, realName);
+      }
+    };
+    const linkSpy = vi.spyOn(fs, 'linkSync').mockImplementation((from, to) => {
+      if (String(to).startsWith(shared)) throw Object.assign(new Error('EIO'), { code: 'EIO' }); // publish fails
+      injectIfRelease(to);
+      return realLink(from, to);
+    });
+    const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (String(from).includes('.publishing')) injectIfRelease(to);
+      return realRename(from, to);
+    });
+    try {
+      run();
+    } finally {
+      linkSpy.mockRestore();
+      renameSpy.mockRestore();
+    }
+
+    expect(injected).toBe(true);
+    const everywhere = fs.readdirSync(own).map((n) => fs.readFileSync(path.join(own, n), 'utf8'));
+    expect(everywhere).toContain('MEMBER NEW EDIT'); // the member's save
+    expect(everywhere).toContain('HELD BYTES'); // and the bytes being published
+  });
+
+  it('never derives a name of `.` or `..` from a member dotfile', () => {
+    // `...<hex>.publishing` and `....<hex>.publishing` both match the hold
+    // pattern and capture `.` / `..`, which address the shared tree itself and
+    // its parent.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, '...0123456789ab.publishing'), 'DOT');
+    fs.writeFileSync(path.join(own, '....0123456789ab.publishing'), 'DOTDOT');
+
+    run();
+
+    const shared = sharedWorkDir();
+    const names = fs.readdirSync(shared);
+    expect(names).toContain('...0123456789ab.publishing'); // published under its own literal name
+    expect(names).toContain('....0123456789ab.publishing');
+    expect(fs.readFileSync(path.join(shared, '...0123456789ab.publishing'), 'utf8')).toBe('DOT');
+    expect(fs.readFileSync(path.join(shared, '....0123456789ab.publishing'), 'utf8')).toBe('DOTDOT');
+    // Nothing was written to the workgroup root, one level above the shared tree.
+    expect(fs.readdirSync(path.dirname(shared)).filter((n) => n.includes('from-wgx-codex'))).toEqual([]);
+  });
+
+  it('resumes a publish a previous boot died in the middle of', () => {
+    // The hold is named so the next boot can find it: bytes already taken off
+    // their real name must not sit in the member folder forever.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, '.report.md.0123456789ab.publishing'), 'HELD BYTES');
+
+    run();
+
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md'), 'utf8')).toBe('HELD BYTES');
+    expect(fs.existsSync(path.join(sharedWorkDir(), '.report.md.0123456789ab.publishing'))).toBe(false);
+    expect(fs.readlinkSync(own)).toBe(LINK_TARGET);
+  });
+
+  it('holds an entry under a name the live member cannot guess', () => {
+    // `rename(2)` cannot refuse an occupied name, so the ONLY thing keeping
+    // step 1 off a file the member wrote is that the hold path is unforgeable.
+    // A derivable hold name would need a check before the rename, and a check
+    // is exactly what a live member's write races.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, 'report.md'), 'MEMBER BYTES');
+
+    // Publishing fails, so the boot leaves its hold behind to be inspected.
+    const spy = vi.spyOn(fs, 'linkSync').mockImplementation(() => {
+      throw Object.assign(new Error('EIO'), { code: 'EIO' });
+    });
+    try {
+      run();
+    } finally {
+      spy.mockRestore();
+    }
+
+    const held = fs.readdirSync(own).filter((n) => n.endsWith('.publishing'));
+    expect(held).toHaveLength(1);
+    expect(held[0]).not.toBe('.report.md.publishing'); // not derivable from the entry name
+    expect(held[0]).toMatch(/^\.report\.md\.[0-9a-f]{12}\.publishing$/);
+    // Shape and per-call uniqueness are not the property: a counter has both
+    // and resets every boot, so it is fully forgeable. The segment has to come
+    // from the CSPRNG, with enough bits that it cannot be guessed in the
+    // microseconds before the rename.
+    const randomCalls = vi.mocked(crypto.randomBytes).mock.calls;
+    expect(randomCalls.length).toBeGreaterThan(0);
+    expect(Math.min(...randomCalls.map((c) => Number(c[0])))).toBeGreaterThanOrEqual(6);
+    expect(held[0]).toContain((vi.mocked(crypto.randomBytes).mock.results.at(-1)?.value as Buffer).toString('hex'));
+    expect(fs.readFileSync(path.join(own, held[0]), 'utf8')).toBe('MEMBER BYTES');
+
+    // The member writes the name again and a second boot also fails. A
+    // derivable hold path would land on the first hold and `rename(2)` would
+    // replace it silently; an unforgeable one cannot collide, so both sets of
+    // bytes are still there.
+    fs.writeFileSync(path.join(own, 'report.md'), 'THE SECOND ONE');
+    const spy2 = vi.spyOn(fs, 'linkSync').mockImplementation(() => {
+      throw Object.assign(new Error('EIO'), { code: 'EIO' });
+    });
+    try {
+      run();
+    } finally {
+      spy2.mockRestore();
+    }
+    const holds = fs.readdirSync(own).filter((n) => n.endsWith('.publishing'));
+    expect(holds).toHaveLength(2);
+    expect(holds.map((n) => fs.readFileSync(path.join(own, n), 'utf8')).sort()).toEqual([
+      'MEMBER BYTES',
+      'THE SECOND ONE',
+    ]);
+  });
+
+  it('a failed file move leaves the real name free for the next boot', () => {
+    // With no claim there is nothing to give back: a failed link must leave
+    // no zero-byte file at the real name for an agent to read as the artifact.
     markMigrated();
     run();
     fs.unlinkSync(linkAt('wgx-codex'));
@@ -261,9 +540,8 @@ describe('ensureWorkgroupWorkDirs', () => {
     fs.mkdirSync(own);
     fs.writeFileSync(path.join(own, 'report.md'), 'THE ONLY COPY');
 
-    const realRename = fs.renameSync;
-    const spy = vi.spyOn(fs, 'renameSync').mockImplementationOnce(() => {
-      throw new Error('EIO');
+    const spy = vi.spyOn(fs, 'linkSync').mockImplementationOnce(() => {
+      throw Object.assign(new Error('EIO'), { code: 'EIO' });
     });
     try {
       run(); // boot 1: the move fails
@@ -277,7 +555,25 @@ describe('ensureWorkgroupWorkDirs', () => {
 
     expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md'), 'utf8')).toBe('THE ONLY COPY');
     expect(fs.existsSync(path.join(sharedWorkDir(), 'report.md.from-wgx-codex'))).toBe(false);
-    expect(realRename).toBeDefined();
+  });
+
+  it('finishes a file a previous boot linked but never unlinked, without duplicating it', () => {
+    // A hard death between link and unlink leaves one inode under two names.
+    // The next boot must recognise its own link, not move it aside as a
+    // collision.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, 'report.md'), 'MEMBER BYTES');
+    fs.linkSync(path.join(own, 'report.md'), path.join(sharedWorkDir(), 'report.md'));
+
+    run();
+
+    expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md'), 'utf8')).toBe('MEMBER BYTES');
+    expect(fs.existsSync(path.join(sharedWorkDir(), 'report.md.from-wgx-codex'))).toBe(false);
+    expect(fs.readlinkSync(own)).toBe(LINK_TARGET);
   });
 
   it('releasing a directory claim never takes content a sibling put inside it', () => {
@@ -303,31 +599,6 @@ describe('ensureWorkgroupWorkDirs', () => {
 
     expect(fs.readFileSync(path.join(sharedWorkDir(), 'proj', 'sibling.md'), 'utf8')).toBe('written mid-boot');
     expect(fs.readFileSync(path.join(own, 'proj', 'mine.md'), 'utf8')).toBe('the members');
-  });
-
-  it('releasing a file claim never takes bytes a sibling wrote into it', () => {
-    // The directory half is protected by rmdir refusing ENOTEMPTY. The file
-    // half needs its own check, or a sibling that writes into our zero-byte
-    // claim between the failed rename and the release loses those bytes.
-    markMigrated();
-    run();
-    fs.unlinkSync(linkAt('wgx-codex'));
-    const own = linkAt('wgx-codex');
-    fs.mkdirSync(own);
-    fs.writeFileSync(path.join(own, 'report.md'), 'the members');
-
-    const spy = vi.spyOn(fs, 'renameSync').mockImplementationOnce(((_from: fs.PathLike, to: fs.PathLike) => {
-      fs.writeFileSync(to as string, 'SIBLING WROTE THIS');
-      throw new Error('EIO');
-    }) as typeof fs.renameSync);
-    try {
-      run();
-    } finally {
-      spy.mockRestore();
-    }
-
-    expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md'), 'utf8')).toBe('SIBLING WROTE THIS');
-    expect(fs.readFileSync(path.join(own, 'report.md'), 'utf8')).toBe('the members');
   });
 
   it('leaves the member alone when the move strategy cannot be proven', () => {
