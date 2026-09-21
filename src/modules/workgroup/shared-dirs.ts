@@ -944,12 +944,14 @@ function ensureOneWorkgroupWorkDir(
  * migrator, where copy is the safe fallback, and wrong for this caller.
  *
  * Failures are per entry: one unreadable file does not abandon the rest, and
- * the next boot retries whatever is left. A file linked but not yet unlinked
- * from the member (a hard death, or a failed unlink) is recognised next boot
- * as the same inode and finished rather than duplicated. A hard death between
- * a directory claim and its move leaves an empty directory at the real name,
- * which the next boot moves aside to `.from-<member>`. No bytes are lost
- * either way.
+ * the next boot retries whatever is left. A file interrupted mid-publish is
+ * left holding its bytes under `.<name>.publishing` and resumes next boot;
+ * under the rename strategy an already-linked file is additionally recognised
+ * by inode and simply finished, while under copy it republishes to
+ * `.from-<member>` (a duplicate, never a loss). A hard death between a
+ * directory claim and its move leaves an empty directory at the real name,
+ * which the next boot moves aside to `.from-<member>`. No bytes are lost in
+ * any of these.
  */
 function consolidateMemberWorkDir(
   memberWorkDir: string,
@@ -971,8 +973,13 @@ function consolidateMemberWorkDir(
     }
     const moved: string[] = [];
     const renamed: string[] = [];
-    for (const name of entries) {
-      const src = path.join(memberWorkDir, name);
+    for (const entry of entries) {
+      // `.<name>.publishing` is this function's own hold from an earlier boot
+      // that died mid-publish: the bytes of `<name>`, already moved off their
+      // real name. Publish them under the name they were taken from.
+      const leftover = HELD_NAME.exec(entry);
+      const name = leftover ? leftover[1] : entry;
+      const src = path.join(memberWorkDir, entry);
       let srcIsDir: boolean;
       try {
         srcIsDir = fs.lstatSync(src).isDirectory();
@@ -982,7 +989,7 @@ function consolidateMemberWorkDir(
       }
       const dstName = srcIsDir
         ? publishDir(src, sharedWorkDir, name, strategy, ctx)
-        : publishFile(src, sharedWorkDir, name, strategy, ctx);
+        : publishFile(src, sharedWorkDir, name, strategy, ctx, leftover !== null);
       if (dstName === null) continue;
       moved.push(name);
       if (dstName !== name) renamed.push(`${name} -> ${dstName}`);
@@ -1040,15 +1047,37 @@ function warnNoName(name: string, ctx: PublishCtx, err?: unknown): void {
   });
 }
 
+/** This function's own hold on an entry whose real name it has already taken. */
+const HELD_NAME = /^\.(.+)\.publishing$/;
+
 /**
  * Publish a non-directory entry into the shared tree and return the name it
  * landed under, or `null` when it stays in the member (logged).
  *
- * `link(2)` is the whole atomicity story. On one filesystem the member's own
- * inode is linked straight in; across two, a copy is first made at a
- * pid-private staging name inside the shared tree and THAT is linked. The
- * source is unlinked only after the link exists, so the content always has at
- * least one name.
+ * Three steps, in this order, because each one closes a window the others
+ * cannot:
+ *
+ * 1. **`rename` the entry off its real name**, to `.<name>.publishing` beside
+ *    it. This is the member-side reservation. `unlink`ing the source after the
+ *    link instead would remove whatever sits at that PATH — and the member's
+ *    own container is live here, so an agent saving the file (write temp,
+ *    rename over it) between the link and the unlink would have its new
+ *    version deleted while the shared tree kept the old one. After the rename
+ *    the member may recreate `<name>` freely; this function never touches that
+ *    path again, and the next boot publishes it as a separate entry.
+ * 2. **`link` the held bytes into the shared tree**, which fails `EEXIST` in
+ *    the kernel. That is the sibling-side reservation: the shared name appears
+ *    only with content already in it, and a name a sibling holds stays theirs
+ *    — ours goes to `<name>.from-<member>`. Cross-device, where `link(2)`
+ *    cannot reach, the held bytes are copied to a staging name in the shared
+ *    tree and that copy is linked.
+ * 3. **Remove the hold**, which by then is a second name for a published
+ *    inode.
+ *
+ * A death between 1 and 3 leaves `.<name>.publishing` in the member folder.
+ * The name is deliberately derivable rather than keyed by pid: the next boot
+ * recognises it, resumes at step 2 (`heldAlready`), and no bytes are stranded
+ * under a name nothing looks for.
  */
 function publishFile(
   src: string,
@@ -1056,17 +1085,30 @@ function publishFile(
   name: string,
   strategy: 'rename' | 'copy',
   ctx: PublishCtx,
+  heldAlready = false,
 ): string | null {
-  let staging: string | null = null;
+  const held = heldAlready ? src : path.join(path.dirname(src), `.${name}.publishing`);
+  let staged: string | null = null;
+  let landed: string | null = null;
   try {
-    let from = src;
-    if (strategy === 'copy') {
-      staging = path.join(sharedWorkDir, `.${name}.${process.pid}.partial`);
-      fs.rmSync(staging, { force: true }); // ours, by pid: a leftover of this same pid
-      fs.cpSync(src, staging, { verbatimSymlinks: true });
-      from = staging;
+    if (!heldAlready) {
+      if (lstatOrNull(held)) {
+        // A hold for this name already exists and `name` is real again: the
+        // member recreated it after an interrupted publish. That hold is its
+        // own readdir entry and is published on its own; leave both alone
+        // rather than overwriting the older bytes with the newer.
+        log.warn('ensureWorkgroupWorkDirs: an unfinished hold already exists for this name', { ...ctx, name });
+        return null;
+      }
+      fs.renameSync(src, held); // takes the name atomically
     }
-    let landed: string | null = null;
+    let from = held;
+    if (strategy === 'copy') {
+      staged = path.join(sharedWorkDir, `.${name}.from-${ctx.member}.publishing`);
+      fs.rmSync(staged, { force: true }); // a leftover copy; the held bytes are still intact
+      fs.cpSync(held, staged, { verbatimSymlinks: true });
+      from = staged;
+    }
     for (const candidate of candidateNames(name, ctx)) {
       const dst = path.join(sharedWorkDir, candidate);
       try {
@@ -1076,7 +1118,7 @@ function publishFile(
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
         // Taken — unless it is this very inode, which an earlier boot linked
-        // and died before unlinking the source. Then only the unlink is left.
+        // and died before removing the hold. Then only the cleanup is left.
         if (sameInode(from, dst)) {
           landed = candidate;
           break;
@@ -1085,16 +1127,39 @@ function publishFile(
     }
     if (landed === null) {
       warnNoName(name, ctx);
+      releaseHold(held, name, ctx);
       return null;
     }
-    fs.unlinkSync(src);
+    fs.rmSync(held, { force: true }); // a second name for the published inode
     return landed;
   } catch (err) {
     log.warn('ensureWorkgroupWorkDirs: could not move entry into the shared tree', { ...ctx, name, err });
+    if (landed === null) releaseHold(held, name, ctx);
     return null;
   } finally {
-    // A second name for the published inode, or a copy that never got one.
-    if (staging) fs.rmSync(staging, { force: true });
+    // Only ever the copy branch's own staging. Removed once the link exists
+    // (it is then a second name for it) and also when nothing landed, because
+    // `held` still holds the bytes either way.
+    if (staged) fs.rmSync(staged, { force: true });
+  }
+}
+
+/**
+ * Give an unpublished hold its real name back, so the entry is where its agent
+ * expects it and the next boot retries from the ordinary path.
+ *
+ * Only when nothing occupies that name: the member's container is live, and
+ * the whole reason the hold exists is that the member may have written a new
+ * `<name>` since. That newer file is never replaced — the hold keeps its
+ * hidden name and is resumed next boot instead.
+ */
+function releaseHold(held: string, name: string, ctx: PublishCtx): void {
+  const real = path.join(path.dirname(held), name);
+  try {
+    if (lstatOrNull(real)) return; // the member wrote a new one — never clobber it
+    fs.renameSync(held, real);
+  } catch (err) {
+    log.warn('ensureWorkgroupWorkDirs: left an unfinished hold in the member folder', { ...ctx, name, err });
   }
 }
 
