@@ -1,3 +1,5 @@
+import { renderWorkOutcome } from './outcome-reporting-schema.js';
+import { claimWorkOutcome, settleWorkOutcome } from './db/work-outcome-receipts.js';
 /**
  * Outbound message delivery.
  * Polls session outbound DBs for undelivered messages, delivers through channel adapters.
@@ -869,7 +871,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
         // and agent-to-agent internal traffic aren't operator-visible
         // and would otherwise keep dormant sessions out of the stale
         // lane forever. Mirrors the typing-indicator gate below.
-        if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
+        if (!result.recordOnly && msg.kind !== 'system' && msg.channel_type !== 'agent') {
           const tag = outboundKindTag(msg);
           try {
             await bumpLastOutbound(session.id, tag);
@@ -897,7 +899,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
       // back. Skip the pause for internal traffic (system actions,
       // agent-to-agent routing) — the user doesn't see those and
       // shouldn't get a gap in their typing indicator for them.
-      if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
+      if (!result.recordOnly && msg.kind !== 'system' && msg.channel_type !== 'agent') {
         pauseTypingRefreshAfterDelivery(session.id);
       }
     } catch (err) {
@@ -1077,7 +1079,8 @@ async function deliverMessage(
     in_reply_to: string | null;
   },
   session: Session,
-): Promise<{ platformMsgId?: string; deferAck?: true }> {
+): Promise<{ platformMsgId?: string; deferAck?: true; recordOnly?: true }> {
+  if (msg.kind === 'work_log') return { recordOnly: true };
   assertChannelRoutingConsistency({ channelType: msg.channel_type, platformId: msg.platform_id });
 
   if (!deliveryAdapter) {
@@ -1087,11 +1090,15 @@ async function deliverMessage(
 
   const content = JSON.parse(msg.content);
 
+  let quietOutcomes = false;
+  let externalOutcomeChannels: string[] = [];
   const wikiGroup = await getAgentGroup(session.agent_group_id);
   if (wikiGroup) {
     const { readContainerConfig } = await import('./container-config.js');
     // Enrollment, not the model's tool list, constrains raw outbound rows too.
     const cfg = readContainerConfig(wikiGroup.folder);
+    quietOutcomes = cfg.outcomeReporting === true;
+    externalOutcomeChannels = cfg.outcomeReportingExternalChannels ?? [];
     if (wikiEnrollment(wikiGroup.id, cfg.wikiMaintenance === true)) {
       if (!allowedWikiOutbound(msg.kind, content.action))
         throw new Error('Wiki maintenance outbound capability denied');
@@ -1328,6 +1335,7 @@ async function deliverMessage(
   // spawn thread. Edit-in-place and the on-chat orphan delete are bypassed
   // so progress survives the final answer.
   if (msg.kind === 'status') {
+    if (quietOutcomes && content.reporting?.version === 1) return { recordOnly: true };
     if (!msg.channel_type || !msg.platform_id) {
       log.warn('Status message missing routing fields, dropping', { id: msg.id });
       return {};
@@ -1541,7 +1549,16 @@ async function deliverMessage(
   // thinking bubble remains a single growing message; only the final
   // answer separates out into its own message at the bottom.
 
-  const baseThreadId = msg.thread_id && msg.thread_id.length > 0 ? msg.thread_id : null;
+  const isRoutineOutcome = content.reporting?.version === 1 && content.reporting.purpose === 'outcome';
+  let baseThreadId = msg.thread_id && msg.thread_id.length > 0 ? msg.thread_id : null;
+  if (isRoutineOutcome && session.messaging_group_id === null && isTaskThread(session.thread_id)) {
+    // A recurring task's old conversation is not the new human work item's thread.
+    baseThreadId = null;
+    const item = renderWorkOutcome(content.reporting.summary, content.reporting.outcome).key;
+    const slackRequest = /^slack:[^:]+:([^:]+):(\d{10})(\d{6})$/.exec(item);
+    if (slackRequest && msg.platform_id === `slack:${slackRequest[1]}`)
+      baseThreadId = `${msg.platform_id}:${slackRequest[2]}.${slackRequest[3]}`;
+  }
 
   // Rolling task-session thread anchor (fleet-hardening Phase 1.4). A task
   // session is 1:1 with a series (thread_id = system:tasks:<seriesId>, see
@@ -1574,7 +1591,7 @@ async function deliverMessage(
   // keeps its open incidents, and per messaging group — the resolved
   // (channel, address, instance) above — so two adapter instances wired to one
   // conversation never share a parent.
-  const threadKey = readThreadKey(content, msg.id, session.id);
+  const threadKey = isRoutineOutcome ? null : readThreadKey(content, msg.id, session.id);
   const keyAddr: ThreadKeyAddress | null =
     threadKey !== null && baseThreadId === null && deliverMessagingGroupId !== undefined
       ? { agentGroupId: session.agent_group_id, messagingGroupId: deliverMessagingGroupId, threadKey }
@@ -1582,14 +1599,19 @@ async function deliverMessage(
   const keyedEligible = keyAddr !== null;
 
   const taskAnchorEligible =
-    !keyedEligible && isTaskSessionPost && baseThreadId === null && !(await isThreadAnchorExempt(session));
+    !isRoutineOutcome &&
+    !keyedEligible &&
+    isTaskSessionPost &&
+    baseThreadId === null &&
+    !(await isThreadAnchorExempt(session));
 
   // Per-turn channel-root threading (see ChatThreadAnchor above) — everything
   // that isn't a task-session post. Only engages when the agent didn't
   // already target a thread (thread_id null) and the turn has an inbound
   // anchor (in_reply_to set). The first message of the turn posts at root
   // and is recorded below; later messages of the same turn reply under it.
-  const turnAnchorEligible = !taskAnchorEligible && baseThreadId === null && msg.in_reply_to != null;
+  const turnAnchorEligible =
+    !isRoutineOutcome && !taskAnchorEligible && baseThreadId === null && msg.in_reply_to != null;
 
   let effectiveThreadId = baseThreadId;
   let usedAnchor = false;
@@ -1637,6 +1659,38 @@ async function deliverMessage(
     }
   }
 
+  let outcomeClaim: { workgroup: string; key: string } | undefined;
+  if (content.reporting?.version === 1 && content.reporting.purpose === 'outcome') {
+    if (externalOutcomeChannels.includes(msg.platform_id))
+      throw new Error(
+        'This channel has an existing terminal reporter. Hand off the outcome through that route; do not post a competing report.',
+      );
+    const rendered = renderWorkOutcome(content.reporting.summary, content.reporting.outcome);
+    if (content.text !== rendered.text || content.operation || content.files)
+      throw new Error('Malformed outcome envelope');
+    if (!wikiGroup?.workgroup_id) throw new Error('Outcome reporting requires actual workgroup membership');
+    const claim = await claimWorkOutcome({
+      workgroup_id: wikiGroup.workgroup_id,
+      work_item: rendered.key,
+      message_id: msg.id,
+      session_id: session.id,
+      channel_type: msg.channel_type,
+      platform_id: msg.platform_id,
+      thread_id: effectiveThreadId,
+      content: scrubbedContent,
+    });
+    if (!claim.claimed) {
+      if (claim.receipt.platform_id !== msg.platform_id)
+        throw new Error(
+          'This work item already belongs to another reporting destination; inspect its receipt rather than reposting.',
+        );
+      if (claim.receipt.state === 'delivered')
+        return { platformMsgId: claim.receipt.platform_message_id ?? undefined, recordOnly: true };
+      // Never re-send a claim whose platform acceptance is unknown, including after restart.
+      return { deferAck: true };
+    }
+    outcomeClaim = { workgroup: wikiGroup.workgroup_id, key: rendered.key };
+  }
   let platformMsgId: string | undefined;
   try {
     platformMsgId = await deliveryAdapter.deliver(
@@ -1649,6 +1703,16 @@ async function deliverMessage(
       deliverInstance,
     );
   } catch (err) {
+    if (outcomeClaim) {
+      await settleWorkOutcome(
+        outcomeClaim.workgroup,
+        outcomeClaim.key,
+        undefined,
+        scrubSecrets(err instanceof Error ? err.message : String(err)).slice(0, 1000),
+      );
+      log.error('Outcome delivery uncertain; reconcile receipt before retrying', { id: msg.id, sessionId: session.id });
+      return { deferAck: true };
+    }
     if (!usedAnchor) throw err;
     // Platforms disagree on whether a parent message is addressable as a thread.
     // Slack threads on the parent's ts; Discord's adapter opens a thread on first use
@@ -1687,6 +1751,11 @@ async function deliverMessage(
       files,
       deliverInstance,
     );
+  }
+
+  if (outcomeClaim) {
+    // Persist BEFORE anchor/archive bookkeeping, so their failure cannot re-send the outcome.
+    await settleWorkOutcome(outcomeClaim.workgroup, outcomeClaim.key, platformMsgId);
   }
 
   // Record a fresh root post as the anchor for what follows. Only when we

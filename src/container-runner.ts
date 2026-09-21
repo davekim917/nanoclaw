@@ -6593,6 +6593,9 @@ async function buildContainerArgs(
     }
   }
 
+  // Spawn-only capability: old containers retain their existing explicit-human reply path.
+  if (containerConfig.outcomeReporting === true) args.push('-e', 'NANOCLAW_OUTCOME_REPORTING=1');
+
   // Per-channel default tone profile — ports v1's "always-on tone" feature.
   // Precedence: per-channel wiring (messaging_group_agents.default_tone) →
   // per-agent container.json `tone` → unset (agent falls back to the

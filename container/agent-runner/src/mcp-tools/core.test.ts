@@ -525,3 +525,105 @@ describe('send_file allowlist (Group G — workgroup shared tree)', () => {
     expect(isAllowedFilePath('/workspace/workgroup/x')).toBe(true);
   });
 });
+
+describe('outcome reporting send_message contract', () => {
+  beforeEach(() => {
+    process.env.NANOCLAW_OUTCOME_REPORTING = '1';
+    getInboundDb().exec(
+      'CREATE TABLE IF NOT EXISTS session_routing (id INTEGER PRIMARY KEY,channel_type TEXT,platform_id TEXT,thread_id TEXT)',
+    );
+    getInboundDb().exec("INSERT OR REPLACE INTO session_routing VALUES (1,'slack','slack:TEST','slack:TEST:123')");
+  });
+  afterEach(() => {
+    delete process.env.NANOCLAW_OUTCOME_REPORTING;
+  });
+
+  it('records progress durably, refuses unlabeled narration, preserves internal handoffs', async () => {
+    const progress = await sendMessage.handler({ text: 'Checking CI', purpose: 'progress' });
+    expect(progress.content[0].text).toContain('Recorded internally');
+    expect(getUndeliveredMessages()[0].kind).toBe('work_log');
+    const rejected = await sendMessage.handler({ text: 'I will report later' });
+    expect(rejected.isError).toBe(true);
+    await sendMessage.handler({ to: 'peer', text: 'Review the changed ownership guard.' });
+    expect(getUndeliveredMessages().filter((row) => row.kind === 'chat')).toHaveLength(1);
+  });
+
+  it('truthfully refuses a muted outcome without queuing or waiting for an acknowledgment', async () => {
+    const { setChatLimit } = await import('../modules/mailbox/index.js');
+    setChatLimit(0);
+    try {
+      const result = await sendMessage.handler({
+        purpose: 'outcome',
+        text: 'Fixed.',
+        outcome: {
+          workItem: 'https://github.com/org/repo/pull/17',
+          verified: 'Tests passed',
+          evidence: 'https://github.com/org/repo/pull/17',
+        },
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).not.toContain('queued');
+      expect(getUndeliveredMessages()).toHaveLength(0);
+    } finally {
+      setChatLimit(null);
+    }
+  });
+
+  it('rejects oversized and noncanonical outcomes before writing, never truncates them', async () => {
+    for (const args of [
+      {
+        text: 'x'.repeat(321),
+        outcome: {
+          workItem: 'https://github.com/org/repo/pull/5',
+          verified: 'checks passed',
+          evidence: 'https://github.com/org/repo/pull/5',
+        },
+      },
+      {
+        text: 'Fixed',
+        outcome: {
+          workItem: 'review-round-2',
+          verified: 'checks passed',
+          evidence: 'https://github.com/org/repo/pull/5',
+        },
+      },
+    ]) {
+      expect((await sendMessage.handler({ purpose: 'outcome', ...args })).isError).toBe(true);
+    }
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it.each(['delivered', 'failed'])('reports the host acknowledgment truthfully (%s)', async (status) => {
+    const pending = sendMessage.handler({
+      purpose: 'outcome',
+      text: 'Checkout fixed.',
+      outcome: {
+        workItem: 'https://github.com/org/repo/pull/17',
+        verified: 'Tests passed',
+        evidence: 'https://github.com/org/repo/pull/17',
+      },
+    });
+    let rows = getUndeliveredMessages();
+    for (let n = 0; n < 100 && rows.length === 0; n++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      rows = getUndeliveredMessages();
+    }
+    expect(rows).toHaveLength(1);
+    getInboundDb()
+      .prepare('INSERT INTO delivered (message_out_id,status,platform_message_id,delivered_at) VALUES (?,?,?,?)')
+      .run(rows[0].id, status, status === 'delivered' ? 'platform-confirmed' : null, new Date().toISOString());
+    const result = await pending;
+    expect(result.content[0].text).toContain(status === 'delivered' ? 'receipt confirmed' : 'not delivered');
+    expect(result.isError === true).toBe(status === 'failed');
+  });
+
+  it.each(['reply', 'urgent', 'decision', 'handoff'])(
+    'preserves %s without applying the routine outcome cap',
+    async (purpose) => {
+      expect(
+        (await sendMessage.handler({ purpose, text: 'Requested or material information. '.repeat(60) })).isError,
+      ).not.toBe(true);
+      expect(getUndeliveredMessages()[0].kind).toBe('chat');
+    },
+  );
+});
