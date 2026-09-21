@@ -470,6 +470,7 @@ describe('legacy CLAUDE.local.md: hostile shapes', () => {
     await expect(composeGroupClaudeMd(ag, 'claude')).resolves.not.toThrow();
 
     expect(fs.statSync(localPath(ag.folder)).isDirectory()).toBe(true);
+    expect(vi.mocked(log.warn)).toHaveBeenCalledWith(LEGACY_WARN, { group: ag.folder, kind: 'other' });
   });
 
   // Anything past a placeholder's size is content by definition and is never
@@ -479,8 +480,12 @@ describe('legacy CLAUDE.local.md: hostile shapes', () => {
     await seed(ag);
     fs.mkdirSync(path.join(GROUPS_DIR, ag.folder), { recursive: true });
     fs.writeFileSync(localPath(ag.folder), ' '.repeat(8192)); // whitespace, but over the cap
+    const readSpy = vi.spyOn(fs, 'readSync');
 
     await composeGroupClaudeMd(ag, 'claude');
+
+    expect(readSpy).not.toHaveBeenCalled();
+    readSpy.mockRestore();
 
     expect(fs.existsSync(localPath(ag.folder))).toBe(true);
     expect(vi.mocked(log.warn)).toHaveBeenCalledWith(LEGACY_WARN, { group: ag.folder, kind: 'file' });

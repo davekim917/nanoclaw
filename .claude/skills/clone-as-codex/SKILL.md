@@ -74,6 +74,13 @@ Capture the `id` value — it's an `ag-...` string. Every later SQL statement th
 SOURCE_FOLDER=<source-folder>             # e.g. example-labs
 SOURCE_ID=$(pnpm exec tsx scripts/q.ts data/v2.db "select id from agent_groups where folder='${SOURCE_FOLDER}'" | tr -d '\n')
 test -n "${SOURCE_ID}" || { echo "ERROR: source group '${SOURCE_FOLDER}' not found"; exit 1; }
+# The sibling inherits the source's persona by linking standing-instructions.md.
+# A source whose persona still sits in the retired CLAUDE.local.md (e.g. straight
+# out of the v1 migrator) would clone into a sibling with NO persona and no
+# warning. Check before any bot app or env var is created.
+if [ -s groups/${SOURCE_FOLDER}/CLAUDE.local.md ] && [ ! -s groups/${SOURCE_FOLDER}/standing-instructions.md ]; then
+  echo "ERROR: ${SOURCE_FOLDER} keeps its persona in CLAUDE.local.md — move it to standing-instructions.md first"; exit 1
+fi
 # Workgroup the sibling must JOIN — the SOURCE's workgroup, not the sibling's
 # own folder. This is what grants shared chat-archive and
 # workgroup-level OneCLI secrets. For a primary source it equals the folder;
@@ -185,13 +192,6 @@ cd groups/${SIBLING_FOLDER}
 # link that stays inside the workgroup. Conditional — absent if the source has
 # none. Do NOT link CLAUDE.md or AGENTS.md: the composer overwrites both every
 # spawn.
-# A source that still keeps its persona in the retired CLAUDE.local.md (e.g.
-# straight out of the v1 migrator) would give this sibling NO persona and no
-# warning — the composer no longer reads that file. Stop and move it first.
-if [ -s ../${SOURCE_FOLDER}/CLAUDE.local.md ] && [ ! -e ../${SOURCE_FOLDER}/standing-instructions.md ]; then
-  echo "Source ${SOURCE_FOLDER} keeps its persona in CLAUDE.local.md. Move it to standing-instructions.md, then re-run." >&2
-  exit 1
-fi
 [ -f ../${SOURCE_FOLDER}/standing-instructions.md ] && ln -sfn ../${SOURCE_FOLDER}/standing-instructions.md standing-instructions.md
 
 if [ -f "${WG_DIR_ABS}/.migrated" ]; then

@@ -590,9 +590,14 @@ export async function composeGroupClaudeMd(
  * OpenCode it is invisible, while Claude Code still loads it natively: the
  * one-provider-only reach this retirement exists to end. Moving its content
  * is an edit to an agent's identity, which is the operator's call, not this
- * function's. A symlink is never followed or read here; only an entry this
- * function can see is empty is deleted.
+ * function's. A symlink is never followed or read here.
+ *
+ * One window is accepted, not closed: the unlink is by name, so a write the
+ * container lands between the read and the unlink is lost. Only the container
+ * can race it, into a file it has no reason to write, for microseconds.
  */
+const PLACEHOLDER_MAX_BYTES = 4096;
+
 function retireLegacyLocalFile(groupFolder: string, groupDir: string): void {
   const localFile = path.join(groupDir, 'CLAUDE.local.md');
   const warnLegacy = (kind: string): void =>
@@ -609,7 +614,10 @@ function retireLegacyLocalFile(groupFolder: string, groupDir: string): void {
   // writer, and fstat on the fd judges the object actually opened.
   let fd: number;
   try {
-    fd = fs.openSync(localFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    fd = fs.openSync(
+      localFile,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK | fs.constants.O_NOCTTY,
+    );
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ENOENT') return; // absent — the settled state
@@ -628,9 +636,14 @@ function retireLegacyLocalFile(groupFolder: string, groupDir: string): void {
     if (st.isFile()) {
       kind = 'file';
       // A placeholder is 0 bytes (a trimmed one a few more); anything larger is
-      // content by definition, and is never read — so a huge planted file costs
-      // nothing here.
-      empty = st.size <= 4096 && fs.readFileSync(fd, 'utf-8').trim() === '';
+      // content by definition. The read is BOUNDED as well as gated: the size
+      // is from fstat, and a container growing the file after it must not turn
+      // this into an unbounded read on the host's main thread.
+      if (st.size <= PLACEHOLDER_MAX_BYTES) {
+        const buf = Buffer.alloc(PLACEHOLDER_MAX_BYTES + 1);
+        const n = fs.readSync(fd, buf, 0, buf.length, 0);
+        empty = n <= PLACEHOLDER_MAX_BYTES && buf.toString('utf-8', 0, n).trim() === '';
+      }
     }
   } catch {
     /* unreadable: treated as content, never deleted blind */
