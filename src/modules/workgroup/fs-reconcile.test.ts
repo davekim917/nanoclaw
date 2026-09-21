@@ -31,6 +31,27 @@ vi.mock('../../log.js', () => ({
   isSurvivableIoError: vi.fn(() => false),
 }));
 
+// Steps 2 and 3 of the reconciler (`ensureWorkgroupWorkDirs`,
+// `pruneDanglingWorkgroupCompatLinks`) take no directory arguments from this
+// caller, so without this they resolve the LIVE `GROUPS_DIR` / `DATA_DIR` —
+// this install's real `groups/` and `data/workgroups/`. Today nothing happens
+// there only because the fixture DB's `workgroups` table is empty and both
+// steps iterate it; the first case that seeds a workgroup row would run the
+// real consolidation and the real prune against the install, moving files and
+// deleting compat links. That is safety by emptiness, so pin it structurally.
+// Paths only — `vi.hoisted` runs before this file's imports, so nothing here
+// may touch `fs`/`os`/`path`. The directories are created in `beforeEach`.
+const { TEST_DIRS } = vi.hoisted(() => {
+  const base = `${process.env.TMPDIR ?? '/tmp'}/test-reconcile-${process.pid}-${Math.random().toString(16).slice(2)}`;
+  return { TEST_DIRS: { groups: `${base}/groups`, data: `${base}/data`, base } };
+});
+
+vi.mock('../../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../config.js')>()),
+  GROUPS_DIR: TEST_DIRS.groups,
+  DATA_DIR: TEST_DIRS.data,
+}));
+
 import { reconcileWorkgroupFsState } from './fs-reconcile.js';
 
 // -----------------------------------------------------------------------
@@ -81,6 +102,8 @@ let tmpDir: string;
 beforeEach(() => {
   // Redirect process.cwd() so logs/ go to a temp dir, not the repo root.
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'test-reconcile-'));
+  fs.mkdirSync(TEST_DIRS.groups, { recursive: true });
+  fs.mkdirSync(TEST_DIRS.data, { recursive: true });
   origCwd = process.cwd();
   process.chdir(tmpDir);
 });
@@ -88,6 +111,7 @@ beforeEach(() => {
 afterEach(() => {
   process.chdir(origCwd);
   fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.rmSync(TEST_DIRS.base, { recursive: true, force: true });
 });
 
 // -----------------------------------------------------------------------
@@ -95,6 +119,42 @@ afterEach(() => {
 // -----------------------------------------------------------------------
 
 describe('reconcileWorkgroupFsState', () => {
+  // ── T0: the reconciler's own filesystem reach is scoped ─────────────
+  it('does its filesystem work under the configured dirs, never the live install', () => {
+    // Steps 2 and 3 take no directory arguments from this caller. With a
+    // workgroup row present they create the shared work dir, link every
+    // member, and prune compat links — real, destructive filesystem work.
+    // Before this file mocked `../../config.js`, the only thing keeping that
+    // off this install's `groups/` and `data/workgroups/` was that no case
+    // here seeded such a row.
+    const db = makeDb();
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES (?, ?, ?)`).run('wgt', 'WGT', now);
+    db.prepare(`INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at) VALUES (?, ?, ?, ?, ?)`).run(
+      'ag-1',
+      'WGT seed',
+      'wgt',
+      'wgt',
+      now,
+    );
+    const memberDir = path.join(TEST_DIRS.groups, 'wgt');
+    fs.mkdirSync(memberDir, { recursive: true });
+    // The mount predicate this step shares with container-runner.
+    fs.mkdirSync(path.join(TEST_DIRS.data, 'workgroups', 'wgt'), { recursive: true });
+    fs.writeFileSync(path.join(TEST_DIRS.data, 'workgroups', 'wgt', '.migrated'), '{}');
+
+    reconcileWorkgroupFsState(db);
+
+    // It landed in the configured tree...
+    expect(fs.existsSync(path.join(TEST_DIRS.data, 'workgroups', 'wgt', 'artifacts'))).toBe(true);
+    expect(fs.readlinkSync(path.join(memberDir, 'artifacts'))).toBe('/workspace/workgroup/artifacts');
+    // ...and nowhere near this repo, whose `data/` and `groups/` are the live
+    // install's. `wgt` is not a real workgroup, so its presence there would
+    // mean the reconciler had written outside the configured dirs.
+    expect(fs.existsSync(path.join(origCwd, 'data', 'workgroups', 'wgt'))).toBe(false);
+    expect(fs.existsSync(path.join(origCwd, 'groups', 'wgt'))).toBe(false);
+  });
+
   // ── T1: drain migration report ──────────────────────────────────────
   it('test_writes_logs_when_migration_report_present', async () => {
     const db = makeDb();
