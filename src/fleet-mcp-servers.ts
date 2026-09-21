@@ -112,7 +112,7 @@ export const DEFAULT_FLEET_MCP_SERVERS: Record<string, McpServerConfig> = {
 /**
  * Names the agent-runner deletes from the merged map on every spawn
  * (`RETIRED_MCP_SERVER_NAMES`, container/agent-runner/src/retired-mcp-servers.ts:13,
- * applied at container/agent-runner/src/index.ts:256). A fleet entry under one
+ * applied at container/agent-runner/src/index.ts:255). A fleet entry under one
  * of these would be dead config, and a capability entry for one would promise
  * the agent a tool that cannot exist — so the file refuses the name and the
  * capability snapshot skips it. `src/fleet-mcp-servers.test.ts` fails if this
