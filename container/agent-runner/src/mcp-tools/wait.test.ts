@@ -92,4 +92,57 @@ describe('wait', () => {
     expect((await wait.handler({ minutes: 1, prompt: 'x', extra: true })).isError).toBe(true);
     expect(systemRows()).toHaveLength(0);
   });
+
+  it('submits a keyed request without promising a new wake time or route', async () => {
+    const result = await wait.handler({
+      minutes: 5,
+      prompt: 'owned recovery',
+      dedupe_key: 'demo/42/abc/worker-recovery',
+    });
+    expect(result.isError).toBeUndefined();
+    expect(systemRows()[0].dedupe_key).toBe('demo/42/abc/worker-recovery');
+    const text = JSON.stringify(result.content);
+    expect(text).toContain('request submitted');
+    expect(text).toContain('first accepted request');
+    expect(text).toContain('route');
+    expect(text).toContain('row is retained');
+    expect(text).not.toContain('Wake scheduled');
+  });
+
+  it('preserves independent transport IDs and omits the optional key for unkeyed calls', async () => {
+    await wait.handler({ minutes: 5, prompt: 'first' });
+    await wait.handler({ minutes: 5, prompt: 'second' });
+    const rows = systemRows();
+    expect(rows).toHaveLength(2);
+    expect(rows[0].wake_id).not.toBe(rows[1].wake_id);
+    expect(rows.every((row) => !Object.hasOwn(row, 'dedupe_key'))).toBe(true);
+  });
+
+  it('accepts key length boundaries without normalization', async () => {
+    for (const dedupe_key of ['a', 'A' + 'b'.repeat(199), 'demo#42/head._:1/recovery-1']) {
+      expect((await wait.handler({ minutes: 5, prompt: 'check', dedupe_key })).isError).toBeUndefined();
+      expect(systemRows().at(-1)?.dedupe_key).toBe(dedupe_key);
+    }
+  });
+
+  it('rejects invalid optional keys instead of falling back to an unkeyed wake', async () => {
+    for (const dedupe_key of [
+      '',
+      null,
+      undefined,
+      1,
+      {},
+      'x'.repeat(201),
+      ' key',
+      'key ',
+      'key\n',
+      'key\t',
+      'key\0',
+      'café',
+      '/key',
+    ]) {
+      expect((await wait.handler({ minutes: 5, prompt: 'check', dedupe_key })).isError).toBe(true);
+    }
+    expect(systemRows()).toHaveLength(0);
+  });
 });
