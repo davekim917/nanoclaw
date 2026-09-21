@@ -185,6 +185,13 @@ cd groups/${SIBLING_FOLDER}
 # link that stays inside the workgroup. Conditional — absent if the source has
 # none. Do NOT link CLAUDE.md or AGENTS.md: the composer overwrites both every
 # spawn.
+# A source that still keeps its persona in the retired CLAUDE.local.md (e.g.
+# straight out of the v1 migrator) would give this sibling NO persona and no
+# warning — the composer no longer reads that file. Stop and move it first.
+if [ -s ../${SOURCE_FOLDER}/CLAUDE.local.md ] && [ ! -e ../${SOURCE_FOLDER}/standing-instructions.md ]; then
+  echo "Source ${SOURCE_FOLDER} keeps its persona in CLAUDE.local.md. Move it to standing-instructions.md, then re-run." >&2
+  exit 1
+fi
 [ -f ../${SOURCE_FOLDER}/standing-instructions.md ] && ln -sfn ../${SOURCE_FOLDER}/standing-instructions.md standing-instructions.md
 
 if [ -f "${WG_DIR_ABS}/.migrated" ]; then

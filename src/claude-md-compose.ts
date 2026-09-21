@@ -595,36 +595,60 @@ export async function composeGroupClaudeMd(
  */
 function retireLegacyLocalFile(groupFolder: string, groupDir: string): void {
   const localFile = path.join(groupDir, 'CLAUDE.local.md');
-  let st: fs.Stats;
+  const warnLegacy = (kind: string): void =>
+    log.warn(
+      'Legacy CLAUDE.local.md is no longer composed; only Claude loads it. Move its content into standing-instructions.md',
+      { group: groupFolder, kind },
+    );
+
+  // ONE open, then every judgment on that descriptor. The folder is a live
+  // container's read-write /workspace/agent, so a lstat-then-read-then-rm by
+  // name can be raced: swap in a FIFO after the lstat and a blocking read hangs
+  // the host's main thread — every group, not one. O_NOFOLLOW refuses a symlink
+  // (ELOOP), O_NONBLOCK makes a FIFO open return instead of waiting for a
+  // writer, and fstat on the fd judges the object actually opened.
+  let fd: number;
   try {
-    st = fs.lstatSync(localFile);
+    fd = fs.openSync(localFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   } catch (err) {
-    // Absent is the settled state. Anything else is not absence: say so and
-    // leave the entry alone rather than fail the spawn over a retired file.
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log.warn('Could not inspect legacy CLAUDE.local.md; left untouched', {
-        group: groupFolder,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return; // absent — the settled state
+    if (code === 'ELOOP') return warnLegacy('symlink'); // never followed, never removed
+    log.warn('Could not inspect legacy CLAUDE.local.md; left untouched', {
+      group: groupFolder,
+      error: err instanceof Error ? err.message : String(err),
+    });
     return;
   }
-  if (st.isFile()) {
-    let empty = false;
-    try {
-      empty = fs.readFileSync(localFile, 'utf-8').trim() === '';
-    } catch {
-      /* unreadable: fall through to the warning, never delete blind */
+
+  let empty = false;
+  let kind = 'other';
+  try {
+    const st = fs.fstatSync(fd);
+    if (st.isFile()) {
+      kind = 'file';
+      // A placeholder is 0 bytes (a trimmed one a few more); anything larger is
+      // content by definition, and is never read — so a huge planted file costs
+      // nothing here.
+      empty = st.size <= 4096 && fs.readFileSync(fd, 'utf-8').trim() === '';
     }
-    if (empty) {
-      fs.rmSync(localFile, { force: true });
-      return;
-    }
+  } catch {
+    /* unreadable: treated as content, never deleted blind */
+  } finally {
+    fs.closeSync(fd);
   }
-  log.warn(
-    'Legacy CLAUDE.local.md is no longer composed; only Claude loads it. Move its content into standing-instructions.md',
-    { group: groupFolder, kind: st.isSymbolicLink() ? 'symlink' : st.isFile() ? 'file' : 'other' },
-  );
+  if (!empty) return warnLegacy(kind);
+
+  try {
+    fs.unlinkSync(localFile);
+  } catch (err) {
+    // A container replaced it since the read (a directory, say). Nothing was
+    // lost and the spawn must not fail over a retired file; next spawn retries.
+    log.warn('Could not remove empty legacy CLAUDE.local.md; left for next spawn', {
+      group: groupFolder,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 /**

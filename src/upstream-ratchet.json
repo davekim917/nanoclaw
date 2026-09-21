@@ -820,7 +820,7 @@
 "src/mailbox/sqlite/tasks.test.ts":{"diff":0,"mode":"100644","sha256":"b382adcc0bcf57e9b2d311e8bedb2edf6d638818e54057df4f481e6056dcbc9a"},
 "src/mailbox/sqlite/tasks.ts":{"diff":0,"mode":"100644","sha256":"3309ea5c0ae33af72e95bb4e77145b75916c9416cd31cd81ccbe604079b5d0e9"},
 "src/mailbox/types.ts":{"diff":0,"mode":"100644","sha256":"49c4db08d0b1bfccf4620d587952ccef83b6e0fcea84b285aebd47ba44251215"},
-"src/memory-migration-contract.test.ts":{"diff":465,"mode":"100644","sha256":"d474ffefc41f98340d5688c6cb09ef32bfab49075dcb7509cbbeb412e8848483"},
+"src/memory-migration-contract.test.ts":{"diff":464,"mode":"100644","sha256":"f8251670025a48122b096acd4f65914ca665a012c5038682486263b842b7048d"},
 "src/migrate-claude-memory-settings.ts":{"diff":0,"mode":"100644","sha256":"c6d57d2e074111e8e52bd9fa341335ad1de1595929167f0e6a89c1ce7a26bca8"},
 "src/modules/agent-to-agent/agent-route.test.ts":{"diff":519,"mode":"100644","sha256":"f4942446b1fcca3e365bb343c789c29f758399fce4954dd4861689b5314c8f14"},
 "src/modules/agent-to-agent/agent-route.ts":{"diff":619,"mode":"100644","sha256":"c0c3ff3851ad83e750908c2ca45d1ad6507174fbd512033715f5dc8775a16698"},

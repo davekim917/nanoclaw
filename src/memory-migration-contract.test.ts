@@ -241,8 +241,9 @@ describe('dependent provider and v1 migration surfaces', () => {
   });
 
   it('keeps deterministic v1 copy and cutover surfaces on the separate instruction contract', () => {
-    // The v1 migrator still produces CLAUDE.local.md; the composer now retires
-    // it into standing-instructions.md. Neither ever routes it to memory.
+    // The v1 migrator still produces CLAUDE.local.md; the composer no longer
+    // composes it and points the operator at standing-instructions.md. Neither
+    // ever routes it to memory.
     for (const surface of [v1MigrationShell, v1GroupsMigration]) {
       expect(surface).toMatch(/CLAUDE\.local\.md[\s\S]{0,220}standing instruction/i);
     }

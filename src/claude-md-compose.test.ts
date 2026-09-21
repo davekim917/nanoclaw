@@ -1,3 +1,4 @@
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -431,6 +432,58 @@ describe('legacy CLAUDE.local.md is retired', () => {
     expect(fs.lstatSync(localPath(ag.folder)).isSymbolicLink()).toBe(true);
     expect(fs.existsSync(target)).toBe(true);
     expect(vi.mocked(log.warn)).toHaveBeenCalledWith(LEGACY_WARN, { group: ag.folder, kind: 'symlink' });
+  });
+});
+
+describe('legacy CLAUDE.local.md: hostile shapes', () => {
+  const localPath = (folder: string): string => path.join(GROUPS_DIR, folder, 'CLAUDE.local.md');
+  const LEGACY_WARN =
+    'Legacy CLAUDE.local.md is no longer composed; only Claude loads it. Move its content into standing-instructions.md';
+
+  beforeEach(() => {
+    vi.mocked(log.warn).mockClear();
+  });
+
+  // The group folder is a live container's read-write /workspace/agent. A FIFO
+  // here must not block the host: a blocking open waits for a writer forever,
+  // on the main thread, for every group. A regression does NOT fail this test
+  // cleanly — the open is a synchronous syscall vitest's timeout cannot
+  // interrupt — it hangs the suite, which the CI job timeout then kills. That
+  // hang is the host outage, reproduced.
+  it('does not block on a FIFO, and leaves it in place', async () => {
+    const ag = group('ag-local-fifo', 'local-fifo');
+    await seed(ag);
+    fs.mkdirSync(path.join(GROUPS_DIR, ag.folder), { recursive: true });
+    execFileSync('mkfifo', [localPath(ag.folder)]);
+
+    await composeGroupClaudeMd(ag, 'claude');
+
+    expect(fs.lstatSync(localPath(ag.folder)).isFIFO()).toBe(true);
+    expect(vi.mocked(log.warn)).toHaveBeenCalledWith(LEGACY_WARN, { group: ag.folder, kind: 'other' });
+  }, 5000);
+
+  it('leaves a directory named CLAUDE.local.md alone and does not fail the spawn', async () => {
+    const ag = group('ag-local-dir', 'local-dir');
+    await seed(ag);
+    fs.mkdirSync(localPath(ag.folder), { recursive: true });
+
+    await expect(composeGroupClaudeMd(ag, 'claude')).resolves.not.toThrow();
+
+    expect(fs.statSync(localPath(ag.folder)).isDirectory()).toBe(true);
+  });
+
+  // Anything past a placeholder's size is content by definition and is never
+  // read — a planted multi-GB file costs a stat, not a buffer.
+  it('treats a large file as content without reading it', async () => {
+    const ag = group('ag-local-big', 'local-big');
+    await seed(ag);
+    fs.mkdirSync(path.join(GROUPS_DIR, ag.folder), { recursive: true });
+    fs.writeFileSync(localPath(ag.folder), ' '.repeat(8192)); // whitespace, but over the cap
+
+    await composeGroupClaudeMd(ag, 'claude');
+
+    expect(fs.existsSync(localPath(ag.folder))).toBe(true);
+    expect(vi.mocked(log.warn)).toHaveBeenCalledWith(LEGACY_WARN, { group: ag.folder, kind: 'file' });
   });
 });
 
