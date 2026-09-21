@@ -359,7 +359,9 @@ describe('ensureWorkgroupWorkDirs', () => {
     }
 
     expect(fs.readFileSync(realName, 'utf8')).toBe('MEMBER WROTE A NEW ONE');
-    expect(fs.readFileSync(path.join(own, '.report.md.publishing'), 'utf8')).toBe('HELD BYTES');
+    const heldName = fs.readdirSync(own).find((n) => /^\.report\.md\.[0-9a-f]{12}\.publishing$/.test(n));
+    expect(heldName).toBeDefined();
+    expect(fs.readFileSync(path.join(own, heldName as string), 'utf8')).toBe('HELD BYTES');
 
     run(); // next boot: both reach the shared tree, neither overwrites the other
 
@@ -423,24 +425,25 @@ describe('ensureWorkgroupWorkDirs', () => {
   });
 
   it('never derives a name of `.` or `..` from a member dotfile', () => {
-    // `...publishing` and `....publishing` both match the hold pattern and
-    // capture `.` / `..`, which address the shared tree itself and its parent.
+    // `...<hex>.publishing` and `....<hex>.publishing` both match the hold
+    // pattern and capture `.` / `..`, which address the shared tree itself and
+    // its parent.
     markMigrated();
     run();
     fs.unlinkSync(linkAt('wgx-codex'));
     const own = linkAt('wgx-codex');
     fs.mkdirSync(own);
-    fs.writeFileSync(path.join(own, '...publishing'), 'DOT');
-    fs.writeFileSync(path.join(own, '....publishing'), 'DOTDOT');
+    fs.writeFileSync(path.join(own, '...0123456789ab.publishing'), 'DOT');
+    fs.writeFileSync(path.join(own, '....0123456789ab.publishing'), 'DOTDOT');
 
     run();
 
     const shared = sharedWorkDir();
     const names = fs.readdirSync(shared);
-    expect(names).toContain('...publishing'); // published under its own literal name
-    expect(names).toContain('....publishing');
-    expect(fs.readFileSync(path.join(shared, '...publishing'), 'utf8')).toBe('DOT');
-    expect(fs.readFileSync(path.join(shared, '....publishing'), 'utf8')).toBe('DOTDOT');
+    expect(names).toContain('...0123456789ab.publishing'); // published under its own literal name
+    expect(names).toContain('....0123456789ab.publishing');
+    expect(fs.readFileSync(path.join(shared, '...0123456789ab.publishing'), 'utf8')).toBe('DOT');
+    expect(fs.readFileSync(path.join(shared, '....0123456789ab.publishing'), 'utf8')).toBe('DOTDOT');
     // Nothing was written to the workgroup root, one level above the shared tree.
     expect(fs.readdirSync(path.dirname(shared)).filter((n) => n.includes('from-wgx-codex'))).toEqual([]);
   });
@@ -453,54 +456,62 @@ describe('ensureWorkgroupWorkDirs', () => {
     fs.unlinkSync(linkAt('wgx-codex'));
     const own = linkAt('wgx-codex');
     fs.mkdirSync(own);
-    fs.writeFileSync(path.join(own, '.report.md.publishing'), 'HELD BYTES');
+    fs.writeFileSync(path.join(own, '.report.md.0123456789ab.publishing'), 'HELD BYTES');
 
     run();
 
     expect(fs.readFileSync(path.join(sharedWorkDir(), 'report.md'), 'utf8')).toBe('HELD BYTES');
-    expect(fs.existsSync(path.join(sharedWorkDir(), '.report.md.publishing'))).toBe(false);
+    expect(fs.existsSync(path.join(sharedWorkDir(), '.report.md.0123456789ab.publishing'))).toBe(false);
     expect(fs.readlinkSync(own)).toBe(LINK_TARGET);
   });
 
-  it('a new file at a held name never overwrites the held bytes', () => {
-    // Both exist at once: `.report.md.publishing` (bytes taken off the name by
-    // an interrupted boot) and a fresh `report.md` the member wrote since. If
-    // the fresh one is processed first, taking its name with `rename` would
-    // land straight on the hold — and `rename(2)` replaces a file silently.
-    // readdir order is not defined, so it is pinned here.
+  it('holds an entry under a name the live member cannot guess', () => {
+    // `rename(2)` cannot refuse an occupied name, so the ONLY thing keeping
+    // step 1 off a file the member wrote is that the hold path is unforgeable.
+    // A derivable hold name would need a check before the rename, and a check
+    // is exactly what a live member's write races.
     markMigrated();
     run();
     fs.unlinkSync(linkAt('wgx-codex'));
     const own = linkAt('wgx-codex');
     fs.mkdirSync(own);
-    fs.writeFileSync(path.join(own, '.report.md.publishing'), 'HELD BYTES');
-    fs.writeFileSync(path.join(own, 'report.md'), 'THE NEW ONE');
+    fs.writeFileSync(path.join(own, 'report.md'), 'MEMBER BYTES');
 
-    const realReaddir = fs.readdirSync;
-    const spy = vi.spyOn(fs, 'readdirSync').mockImplementation(((dir: fs.PathLike, ...rest: unknown[]) => {
-      const out = (realReaddir as (d: fs.PathLike, ...r: unknown[]) => unknown)(dir, ...rest);
-      if (String(dir) === own && Array.isArray(out)) {
-        return [...(out as string[])].sort().reverse(); // 'report.md' before the hold
-      }
-      return out;
-    }) as typeof fs.readdirSync);
+    // Publishing fails, so the boot leaves its hold behind to be inspected.
+    const spy = vi.spyOn(fs, 'linkSync').mockImplementation(() => {
+      throw Object.assign(new Error('EIO'), { code: 'EIO' });
+    });
     try {
       run();
     } finally {
       spy.mockRestore();
     }
 
-    const surviving = fs
-      .readdirSync(sharedWorkDir())
-      .filter((n) => n.startsWith('report.md'))
-      .map((n) => fs.readFileSync(path.join(sharedWorkDir(), n), 'utf8'));
-    const inMember = fs
-      .readdirSync(own)
-      .filter((n) => n.includes('report.md'))
-      .map((n) => fs.readFileSync(path.join(own, n), 'utf8'));
-    const everywhere = [...surviving, ...inMember];
-    expect(everywhere).toContain('HELD BYTES');
-    expect(everywhere).toContain('THE NEW ONE');
+    const held = fs.readdirSync(own).filter((n) => n.endsWith('.publishing'));
+    expect(held).toHaveLength(1);
+    expect(held[0]).not.toBe('.report.md.publishing'); // not derivable from the entry name
+    expect(held[0]).toMatch(/^\.report\.md\.[0-9a-f]{12}\.publishing$/);
+    expect(fs.readFileSync(path.join(own, held[0]), 'utf8')).toBe('MEMBER BYTES');
+
+    // The member writes the name again and a second boot also fails. A
+    // derivable hold path would land on the first hold and `rename(2)` would
+    // replace it silently; an unforgeable one cannot collide, so both sets of
+    // bytes are still there.
+    fs.writeFileSync(path.join(own, 'report.md'), 'THE SECOND ONE');
+    const spy2 = vi.spyOn(fs, 'linkSync').mockImplementation(() => {
+      throw Object.assign(new Error('EIO'), { code: 'EIO' });
+    });
+    try {
+      run();
+    } finally {
+      spy2.mockRestore();
+    }
+    const holds = fs.readdirSync(own).filter((n) => n.endsWith('.publishing'));
+    expect(holds).toHaveLength(2);
+    expect(holds.map((n) => fs.readFileSync(path.join(own, n), 'utf8')).sort()).toEqual([
+      'MEMBER BYTES',
+      'THE SECOND ONE',
+    ]);
   });
 
   it('a failed file move leaves the real name free for the next boot', () => {

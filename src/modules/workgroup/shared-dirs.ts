@@ -25,6 +25,7 @@
  * existing `/workspace/agent/<name>` reader paths keep working with no repoint.
  */
 import { createHash } from 'crypto';
+import { randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -1053,8 +1054,19 @@ function warnNoName(name: string, ctx: PublishCtx, err?: unknown): void {
   });
 }
 
-/** This function's own hold on an entry whose real name it has already taken. */
-const HELD_NAME = /^\.(.+)\.publishing$/;
+/**
+ * This function's own hold on an entry whose real name it has already taken.
+ *
+ * Recognised by PATTERN, never derived: the random segment is what makes the
+ * hold path unforgeable, so `rename(2)` — which cannot refuse a name — can
+ * still be used to take it. A guess-able hold name would need a check before
+ * that rename, and a check is what a live member's write races.
+ */
+const HELD_NAME = /^\.(.+)\.[0-9a-f]{12}\.publishing$/;
+
+function newHoldPath(dir: string, name: string): string {
+  return path.join(dir, `.${name}.${randomBytes(6).toString('hex')}.publishing`);
+}
 
 /**
  * Publish a non-directory entry into the shared tree and return the name it
@@ -1063,14 +1075,17 @@ const HELD_NAME = /^\.(.+)\.publishing$/;
  * Three steps, in this order, because each one closes a window the others
  * cannot:
  *
- * 1. **`rename` the entry off its real name**, to `.<name>.publishing` beside
- *    it. This is the member-side reservation. `unlink`ing the source after the
- *    link instead would remove whatever sits at that PATH — and the member's
- *    own container is live here, so an agent saving the file (write temp,
- *    rename over it) between the link and the unlink would have its new
+ * 1. **`rename` the entry off its real name**, to `.<name>.<random>.publishing`
+ *    beside it. This is the member-side reservation. `unlink`ing the source
+ *    after the link instead would remove whatever sits at that PATH — and the
+ *    member's own container is live here, so an agent saving the file (write
+ *    temp, rename over it) between the link and the unlink would have its new
  *    version deleted while the shared tree kept the old one. After the rename
  *    the member may recreate `<name>` freely; this function never touches that
  *    path again, and the next boot publishes it as a separate entry.
+ *    `rename(2)` cannot refuse an occupied name, so the hold path is made
+ *    UNFORGEABLE rather than checked: 48 random bits the live member cannot
+ *    guess, recognised next boot by pattern.
  * 2. **`link` the held bytes into the shared tree**, which fails `EEXIST` in
  *    the kernel. That is the sibling-side reservation: the shared name appears
  *    only with content already in it, and a name a sibling holds stays theirs
@@ -1080,10 +1095,9 @@ const HELD_NAME = /^\.(.+)\.publishing$/;
  * 3. **Remove the hold**, which by then is a second name for a published
  *    inode.
  *
- * A death between 1 and 3 leaves `.<name>.publishing` in the member folder.
- * The name is deliberately derivable rather than keyed by pid: the next boot
- * recognises it, resumes at step 2 (`heldAlready`), and no bytes are stranded
- * under a name nothing looks for.
+ * A death between 1 and 3 leaves the hold in the member folder. `HELD_NAME`
+ * matches it on the next boot, which resumes at step 2 (`heldAlready`), so no
+ * bytes are stranded under a name nothing looks for.
  */
 function publishFile(
   src: string,
@@ -1093,20 +1107,18 @@ function publishFile(
   ctx: PublishCtx,
   heldAlready = false,
 ): string | null {
-  const held = heldAlready ? src : path.join(path.dirname(src), `.${name}.publishing`);
+  const held = heldAlready ? src : newHoldPath(path.dirname(src), name);
+  let holdMade = heldAlready;
   let staged: string | null = null;
   let landed: string | null = null;
   try {
     if (!heldAlready) {
-      if (lstatOrNull(held)) {
-        // A hold for this name already exists and `name` is real again: the
-        // member recreated it after an interrupted publish. That hold is its
-        // own readdir entry and is published on its own; leave both alone
-        // rather than overwriting the older bytes with the newer.
-        log.warn('ensureWorkgroupWorkDirs: an unfinished hold already exists for this name', { ...ctx, name });
-        return null;
-      }
-      fs.renameSync(src, held); // takes the name atomically
+      // Nothing can be at `held`: the name carries 48 random bits a live
+      // member cannot guess, so this rename lands on an unused name without a
+      // check in front of it. An earlier boot's hold has a different random
+      // segment, is its own readdir entry, and is published on its own.
+      fs.renameSync(src, held);
+      holdMade = true;
     }
     let from = held;
     if (strategy === 'copy') {
@@ -1140,7 +1152,9 @@ function publishFile(
     return landed;
   } catch (err) {
     log.warn('ensureWorkgroupWorkDirs: could not move entry into the shared tree', { ...ctx, name, err });
-    if (landed === null) releaseHold(held, name, ctx);
+    // Only when there is a hold to give back: a rename that itself threw made
+    // none, and `releaseHold` would then warn about one that never existed.
+    if (landed === null && holdMade) releaseHold(held, name, ctx);
     return null;
   } finally {
     // Only ever the copy branch's own staging. Removed once the link exists
