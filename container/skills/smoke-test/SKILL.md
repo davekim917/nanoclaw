@@ -1611,6 +1611,18 @@ owner with a `failure` slug instead of a step; the owner then posts one
 operator alarm and takes no campaign action — same router file, "A failure
 wake".
 
+The controller wrappers are the machine half of "source the install env file
+before every direct scaffold/barrier call" above: they read that file AS DATA
+(never sourced — a task script cannot execute it) and put **every** literal
+assignment it makes into the environment their children run in, because the
+evidence barrier is spawned by the controller directly and has no other way to
+learn `SMOKE_GATE_LEASE_DIR`. The install's file is the list of keys; the
+wrappers withhold only names that decide how a process runs rather than what
+the campaign is (`PATH`, `LD_*`, `PYTHON*`, shell hooks, their own test seams)
+and `SMOKE_GATE_CLAIMANT`, which the live wrapper refuses outright. Add a key
+to the env file and it simply reaches the gate, the barrier and the scaffold —
+there is no second list to update.
+
 #### The claim renewer (required alongside the live controller)
 
 A live controller needs a second, script-only series: `scripts/smoke-controller-renew.sh`.

@@ -513,6 +513,46 @@ sed -i "s|export SMOKE_CONTROLLER_OUT_DIR=.*|export SMOKE_CONTROLLER_OUT_DIR=\"\
 tick
 [ "$(field '.data.status')" = misconfigured ] || fail "a non-literal value was not refused: $LAST"
 ok
+# The env file is the list of keys, not a copy of it kept in this tick
+# (XZO #2047). A name outside the four this tick reads for itself must still
+# reach the gate call -- here the gate is invoked directly, so its lease dir
+# comes from nowhere else -- and a name the tick has never heard of must pass
+# through rather than be dropped or crash.
+new_case env-is-the-list
+claim_files
+in_flight_at "$(/usr/bin/date -u +%s)"
+# A lease dir that is NOT the gate's own fallback
+# ($SMOKE_GATE_SHARED_ROOT/qa-coordinator/leases, smoke-pr-gate.sh:241), named
+# only by the env file -- the install's shape, and the one that strands when
+# the key is dropped: the gate call then looks somewhere with no lease.
+PR_LEASES="$C/wg/pr-gate/leases"
+mkdir -p "$PR_LEASES"
+mv "$C/wg/qa-coordinator/leases/lease-$RUN.json" "$C/wg/qa-coordinator/leases/pr-$PR-authority.json" \
+   "$PR_LEASES/"
+unset SMOKE_GATE_LEASE_DIR      # only the env file can supply it now
+write_env live "export SMOKE_GATE_LEASE_DIR='$PR_LEASES'" \
+  "export SMOKE_GATE_FUTURE_KNOB='tomorrow'" \
+  "export PATH='/nonexistent-from-the-env-file'" \
+  "export LD_PRELOAD='/nonexistent/evil.so'"
+tick
+[ "$(field '.data.renewed | length')" = 1 ] \
+  || fail "the lease dir from the env file never reached the gate call: $LAST"
+ok
+export SMOKE_GATE_LEASE_DIR="$PR_LEASES"
+# A non-literal value is refused for any name the file may set, not just the
+# four -- guessing it would run the tick under configuration nobody wrote.
+write_env live 'export SMOKE_GATE_LEASE_DIR="$HOME/leases"'
+tick
+[ "$(field '.data.status')" = misconfigured ] \
+  || fail "a non-literal value outside the old four-key list was not refused: $LAST"
+grep -q SMOKE_GATE_LEASE_DIR <<<"$(field '.data.detail')" || fail "the refusal did not name the key: $LAST"
+ok
+# `unset` still clears, over the same widened set.
+write_env live "export SMOKE_GATE_LEASE_DIR='$PR_LEASES'" \
+  "export SMOKE_GATE_FUTURE_KNOB='tomorrow'" "unset SMOKE_GATE_FUTURE_KNOB"
+tick
+[ "$(field '.data.status')" != misconfigured ] || fail "an unset line must not read as non-literal: $LAST"
+ok
 
 echo "== 8. an unreadable journal renews nothing =="
 new_case torn

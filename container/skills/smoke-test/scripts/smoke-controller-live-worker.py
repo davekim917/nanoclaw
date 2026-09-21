@@ -35,17 +35,62 @@ GH = os.environ.get("SMOKE_CONTROLLER_LIVE_GH_CMD", "gh")
 NCL = os.environ.get("SMOKE_CONTROLLER_LIVE_NCL_CMD", "ncl")
 ENQUEUE = os.environ.get("SMOKE_CONTROLLER_LIVE_ENQUEUE_CMD", "bun /app/src/cli/enqueue-send.ts")
 INBOUND_DB = os.environ.get("SMOKE_CONTROLLER_LIVE_INBOUND_DB", "/workspace/inbound.db")
-CONFIG_KEYS = (
-    "SMOKE_CONTROLLER_MODE", "SMOKE_CONTROLLER_OUT_DIR", "SMOKE_CONTROLLER_SEND_TO", "SMOKE_CONTROLLER_GATE_CMD",
-    "SMOKE_CONTROLLER_CHALLENGER_MENTION", "SMOKE_CONTROLLER_CRITIC_LOG", "SMOKE_CONTROLLER_ONESHOT_MODEL",
-    "SMOKE_CONTROLLER_ONESHOT_EFFORT", "SMOKE_CONTROLLER_POLL_TIMEOUT",
-    "SMOKE_GATE_STATE_DIR", "SMOKE_GATE_RUN_ROOT", "SMOKE_GATE_REPO",
-)
+# THE ENV FILE IS THE LIST OF KEYS. Every literal assignment in it is
+# configuration and is passed through, because the file is the INSTALL's and
+# a copy of its key names kept here goes stale the first time the install adds
+# one. That is XZO #2047: this file carried a 12-name allowlist while the
+# install's env file defined 17, so SMOKE_GATE_LEASE_DIR was dropped. An
+# install's deployment gate wrapper sources the file itself (`. <its
+# dir>/smoke-gate-env.sh`, then exec the skill's gate), so ITS lease dir stayed
+# right -- but the evidence barrier is spawned by the controller directly, with this
+# process's environment (smoke-campaign-controller.py:1393 -> run_read_only ->
+# spawn, :638-650, env=None), and it read the fallback
+# ${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases
+# (smoke-evidence-barrier.sh:556). No pin for the campaign lives there, so
+# smoke-journeys.py's barrier took the "no gate pin owns it" path (:997) and
+# every campaign stranded at the lanes barrier.
+#
+# So this pass-through is NOT redundant with the gate sourcing the file. The
+# barrier has no way to source it, and the skill's own gate does not source
+# anything either -- smoke-pr-gate.sh:241 reads SMOKE_GATE_LEASE_DIR from
+# whatever environment its caller hands it, so an install that points
+# SMOKE_CONTROLLER_GATE_CMD straight at the skill gets its whole configuration
+# from here too. The file is read as DATA, never sourced (that is the
+# supervisor's guarantee), so the pass-through is what carries it.
+#
+# NOT_CONFIG is the inverse rule, and it is short because it names only what
+# this file owns: values that say how this process and its children RUN rather
+# than what the campaign IS. A name here is IGNORED -- exactly as every
+# unlisted name was ignored before -- so denying one takes nothing away that
+# used to work. SMOKE_GATE_CLAIMANT is deliberately NOT here: it keeps its own,
+# louder refusal in load_config below.
+NOT_CONFIG = frozenset((
+    # This wrapper's own seams, read from the process env above and documented
+    # there as process-env-only. SMOKE_CONTROLLER_CRASH_AT is the controller's
+    # kill-injection seam (smoke-campaign-controller.py:212-213, os._exit) and
+    # reaches it through CHILD_ENV, so the file must not be able to set it.
+    "SMOKE_CONTROLLER_ENV_FILE", "SMOKE_CONTROLLER_SCRIPT_DIR", "SMOKE_CONTROLLER_CRASH_AT",
+    "SMOKE_CONTROLLER_LIVE_START", "SMOKE_CONTROLLER_LIVE_BUDGET", "SMOKE_CONTROLLER_LIVE_GH_CMD",
+    "SMOKE_CONTROLLER_LIVE_NCL_CMD", "SMOKE_CONTROLLER_LIVE_ENQUEUE_CMD", "SMOKE_CONTROLLER_LIVE_INBOUND_DB",
+    # Interpreter, loader and shell control. Every one of these is inherited
+    # through CHILD_ENV by `bash <gate wrapper>`, gh, ncl and the barrier, so
+    # honouring one would let a file this wrapper deliberately reads AS DATA
+    # choose the code its children load -- the guarantee the supervisor
+    # advertises (smoke-controller-live.sh).
+    "PATH", "IFS", "ENV", "BASH_ENV", "SHELLOPTS", "BASHOPTS", "CDPATH", "GLOBIGNORE", "PS4",
+))
+NOT_CONFIG_PREFIXES = ("LD_", "DYLD_", "BASH_FUNC_", "PYTHON")
 MARGIN = 3
 STATE_RE = re.compile(r"^pr-(\d+)-state\.json$")
 ASSIGN_RE = re.compile(r"""^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(?:'([^']*)'|"([^"$`\\]*)"|([^\s'"$`\\;&|<>()]*))\s*(?:#.*)?$""")
 NAME_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=")
 UNSET_RE = re.compile(r"^unset\s+([A-Za-z_][A-Za-z0-9_\s]*)$")
+
+
+def is_config(name):
+    """A name the env file is allowed to set. See NOT_CONFIG."""
+    return name not in NOT_CONFIG and not name.startswith(NOT_CONFIG_PREFIXES)
+
 
 now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 FIRE = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -248,8 +293,10 @@ def run(argv, timeout, env):
 
 def load_config(path):
     """The shadow wrapper's rules: only `[export] NAME=<literal>` / `unset NAME`
-    for CONFIG_KEYS count; anything else is ignored; a non-literal value for a
-    key skips the fire."""
+    count, for every name the file mentions except the NOT_CONFIG ones, which
+    are ignored; anything that is not one of those two line shapes is ignored;
+    a non-literal value for a name the file IS allowed to set skips the fire
+    rather than guess it."""
     cfg, refused = {}, []
     if not os.path.exists(path):
         return cfg, refused, None
@@ -271,16 +318,16 @@ def load_config(path):
         m = UNSET_RE.match(s)
         if m:
             for name in m.group(1).split():
-                if name in CONFIG_KEYS:
+                if is_config(name):
                     cfg[name] = None
             continue
         m = ASSIGN_RE.match(s)
         if m:
-            if m.group(1) in CONFIG_KEYS:
+            if is_config(m.group(1)):
                 cfg[m.group(1)] = next(g for g in m.group(2, 3, 4) if g is not None)
             continue
         m = NAME_RE.match(s)
-        if m and m.group(1) in CONFIG_KEYS:
+        if m and is_config(m.group(1)):
             refused.append(m.group(1))
     return cfg, refused, None
 

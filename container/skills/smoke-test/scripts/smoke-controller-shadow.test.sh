@@ -25,6 +25,7 @@ mkdir -p "$SHIM"
 cat >"$SHIM/gh" <<'SH'
 #!/usr/bin/env bash
 echo "gh $*" >>"$FAKE_LOG"
+[ -z "${FAKE_ENV:-}" ] || env | sort >"$FAKE_ENV"   # what the env file handed the children
 echo '{"wakeAgent":true,"data":{"from":"gh stdout"}}' >&2
 case "${FAKE_GH:-ok}" in
   fail) echo "HTTP 502" >&2; exit 1 ;;
@@ -353,6 +354,42 @@ n_fd3="$(grep -c '>&3' "$W")"
 [ "$(sed -n '/^final() {/,/^}/p' "$W" | grep -c '>&3')" = 2 ] || fail "every fd-3 write must be inside final()"
 grep -q "exec 3>&1 1>&2" "$W" || fail "stdout must be moved to fd 3 before anything runs"
 ! grep -q 'wakeAgent:true\|"wakeAgent": *true\|wakeAgent=true' "$W" || fail "the wrapper must never render wakeAgent true"
+
+# --- the env file is the list of keys (XZO #2047) ----------------------------
+# This wrapper used to keep its own allowlist of names owned by the INSTALL's
+# env file, so a key the install added -- SMOKE_GATE_LEASE_DIR -- was dropped
+# and the evidence barrier the controller step spawns with this environment
+# (smoke-campaign-controller.py:1393 -> spawn :638-650, env=None) fell back to
+# a lease dir holding no pin (smoke-evidence-barrier.sh:556). NOT_CONFIG is the
+# only thing withheld now, and it is ignored, exactly as an unlisted name was.
+new_case env-is-the-list
+claim; contract
+{
+  echo "export SMOKE_GATE_FUTURE_KNOB='tomorrow'"
+  echo "export PATH='/nonexistent-from-the-env-file'"
+  echo "export LD_PRELOAD='/nonexistent/evil.so'"
+  echo "export SMOKE_GATE_CLAIMANT='controller'"
+  echo "export SMOKE_CONTROLLER_SHADOW_TEST_HANG='1'"
+} >>"$C/env.sh"
+FAKE_ENV="$C/gh-env.txt" fire
+[ -s "$C/gh-env.txt" ] || fail "the gh child never ran, so this proves nothing: $DATA"
+genv() { sed -n "s/^$1=//p" "$C/gh-env.txt" | tail -n 1; }
+[ "$(genv SMOKE_GATE_LEASE_DIR)" = "$C/wg/leases" ] \
+  || fail "the configured lease dir never reached the child: $(genv SMOKE_GATE_LEASE_DIR)"
+[ "$(genv SMOKE_GATE_FUTURE_KNOB)" = tomorrow ] \
+  || fail "a key this wrapper has never heard of was dropped: the file is the list of keys"
+[ "$(genv PATH)" != /nonexistent-from-the-env-file ] || fail "the env file set PATH for every child"
+for k in LD_PRELOAD SMOKE_GATE_CLAIMANT SMOKE_CONTROLLER_SHADOW_TEST_HANG; do
+  ! grep -q "^$k=" "$C/gh-env.txt" || fail "$k came from the env file: it is runtime, not configuration"
+done
+# A non-literal value still skips the fire and names the key, for every name
+# the file is allowed to set.
+new_case env-nonliteral
+claim; contract
+echo 'export SMOKE_GATE_LEASE_DIR="$HOME/leases"' >>"$C/env.sh"
+fire
+[ "$(d '.refusedKeys[0]')" = SMOKE_GATE_LEASE_DIR ] && d .skipped | grep -q "non-literal" \
+  || fail "a non-literal value must skip the fire and name the key: $DATA"
 
 [ ! -e "$T/traps.log" ] || fail "a trap command ran: $(cat "$T/traps.log")"
 echo "smoke controller shadow wrapper tests passed"

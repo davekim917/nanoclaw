@@ -37,6 +37,7 @@ new_case() {
   # cutover existed when it ran); every other verb is the recording fake.
   cat >"$C/bin/gate.sh" <<SH
 #!/usr/bin/env bash
+env | sort >'$C/gate-env.txt'   # what the env file actually handed the children
 if [ "\$1" = poll ]; then
   jq -cn --arg cl "\${SMOKE_GATE_CLAIMANT:-}" --argjson cut "\$([ -e '$C/wg/controller/cutover.json' ] && echo true || echo false)" \
     '{tool:"gate",op:"poll",claimant:\$cl,cutoverExisted:\$cut}' >>'$FAKE_LOG'
@@ -775,5 +776,141 @@ rm -f "$C/env.sh"; mkfifo "$C/env.sh"
 fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6 SMOKE_CONTROLLER_SEND_TO=campaign-room
 [ "$WAKE" = true ] && [ "$(d .alarm.to)" = campaign-room ] \
   || fail "a fire hung on the env file still reports somewhere to post: $OUTPUT"
+
+# --- the env file is the list of keys (XZO #2047) --------------------------------
+# The install's env file is the single source of truth for SMOKE_GATE_*. This
+# wrapper used to re-declare a 12-name allowlist of its own while the install's
+# file defined 17, so eleven names -- SMOKE_GATE_LEASE_DIR among them -- were
+# dropped silently. The deployed gate WRAPPER sources that file itself, so the
+# gate's own lease dir stayed right; but the evidence barrier is spawned by the
+# controller with this process's environment (smoke-campaign-controller.py:1393
+# -> run_read_only -> spawn :638-650, env=None) and fell back to
+# ${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases
+# (smoke-evidence-barrier.sh:556). No pin for the campaign lives there, so the
+# journeys barrier took its "no gate pin owns it" path (smoke-journeys.py:997)
+# and the campaign stranded at the lanes barrier with no verdict.
+genv() { sed -n "s/^$1=//p" "$C/gate-env.txt" | tail -n 1; }
+has_genv() { grep -q "^$1=" "$C/gate-env.txt"; }
+write_env_full() { # the shape of a real install's file: every SMOKE_GATE_* it sets
+  {
+    echo 'set -u'
+    echo "export SMOKE_GATE_REPO='acme/app'"
+    echo "export SMOKE_GATE_BRANCH='develop'"
+    echo "export SMOKE_GATE_BACKEND_SERVICE='srv-back'"
+    echo "export SMOKE_GATE_FRONTEND_SERVICE='srv-front'"
+    echo "export SMOKE_GATE_LABEL='render-preview'"
+    echo "export SMOKE_GATE_RUN_PREFIX='xzo-pr'"
+    echo "export SMOKE_GATE_STATE_DIR='$C/agent/state'"
+    echo "export SMOKE_GATE_LEASE_DIR='$C/wg/leases'"
+    echo "export SMOKE_GATE_RUN_ROOT='$C/wg/runs'"
+    echo "export SMOKE_JOURNEYS_CATALOGUE='$C/agent/journeys.json'"
+    echo "export SMOKE_GATE_PUBLISH_FILE='$C/wg/latest-verdict.json'"
+    echo "export SMOKE_GATE_HOLD_FILE='$C/wg/develop-hold.json'"
+    echo "export SMOKE_GATE_HANDOFF_LEDGER='$C/agent/handoff-ledger.jsonl'"
+    # A single-quoted literal that CONTAINS $ and " -- accepted, as the real
+    # install's preflight command is.
+    echo "export SMOKE_GATE_PREFLIGHT_CMD='QA_LOGIN_URL=\"\${SMOKE_GATE_PREFLIGHT_TARGET_URL%/}/users/login\" true'"
+    echo "export SMOKE_CONTROLLER_MODE='live'"
+    echo "export SMOKE_CONTROLLER_SEND_TO='campaign-room'"
+    echo "export SMOKE_CONTROLLER_CHALLENGER_MENTION='@Gilfoyle'"
+    echo "export SMOKE_CONTROLLER_GATE_CMD='$C/bin/gate.sh'"
+  } >"$C/env.sh"
+}
+
+new_case env-is-the-list
+write_env_full
+# A name this wrapper has never heard of: the install owns its file, so a key
+# added there must reach the children, not crash or be dropped.
+echo "export SMOKE_GATE_FUTURE_KNOB='tomorrow'" >>"$C/env.sh"
+# The campaign shape that stranded: a gate pin in the CONFIGURED lease dir,
+# adopted into the run. (The barrier's own rules are smoke-journeys.test.sh's;
+# this asserts only which lease dir the controller's children are handed.)
+CATA="$SCRIPT_DIR/../references/journeys.example.json"
+mkdir -p "$C/wg/leases" "$R"
+printf '%s' '["api/src/reports/export.ts","web/src/desk/a.tsx"]' \
+  | python3 "$SCRIPT_DIR/smoke-journeys.py" match --catalogue "$CATA" --as-of 2026-09-18T10:00:00Z \
+      --size light --run-root "$C/wg/runs" --snapshot-out "$C/wg/leases/.snap" >"$C/match.json"
+DIGEST="$(jq -r .catalogueSha256 "$C/match.json")"
+mv "$C/wg/leases/.snap" "$C/wg/leases/journeys-catalogue-$DIGEST.json"
+PIN="$C/wg/leases/journeys-pin-acme__app-pr-$PR-$SHA.json"
+jq -c --arg h "$SHA" --argjson pr "$PR" --arg f "$PIN" --arg s "$C/wg/leases/journeys-catalogue-$DIGEST.json" \
+  '. + {headSha:$h,pr:$pr,repoSlug:"acme__app",pinned:true,pinState:"valid",pinFile:$f,catalogueSnapshot:$s,
+        pinnedAt:"2026-09-18T10:00:00Z"}' "$C/match.json" >"$PIN"
+jq -cn --arg run "$RUN" --argjson pr "$PR" '{schemaVersion:1,pr:$pr,runId:$run,owner:"owner-1",repoSlug:"acme__app"}' \
+  >"$C/wg/leases/lease-$RUN.json"
+mkdir -p "$R/markers" "$R/evidence"
+jq -cn --arg run "$RUN" --arg sha "$SHA" --argjson pr "$PR" \
+  '{schemaVersion:2,runId:$run,pr:$pr,repoSlug:"acme__app",sourceSha:$sha,ownershipKind:"pr",
+    coordinatorOwnerToken:"owner-1",lanes:[{id:"A1",kind:"lane",generation:1}],
+    requiredLaneMarkers:["markers/A1.json"]}' >"$R/completion-contract.json"
+printf 'shot\n' >"$R/evidence/A1.png"
+jq -cn --arg sha "$SHA" '{schemaVersion:1,lane:"A1",sourceSha:$sha,generation:1,status:"blocked",
+  completedAt:"2026-09-18T10:15:00Z",evidence:["evidence/A1.png"]}' >"$R/markers/A1.json"
+python3 "$SCRIPT_DIR/smoke-journeys.py" pin-run "$R" "$PIN" >/dev/null
+fire
+[ "$(d .failure)" = null ] || fail "a fire under a full install env file must not fail: $OUTPUT"
+[ "$(genv SMOKE_GATE_LEASE_DIR)" = "$C/wg/leases" ] \
+  || fail "the configured lease dir never reached the gate child: $(genv SMOKE_GATE_LEASE_DIR)"
+for k in SMOKE_GATE_BRANCH SMOKE_GATE_BACKEND_SERVICE SMOKE_GATE_FRONTEND_SERVICE SMOKE_GATE_LABEL \
+         SMOKE_GATE_RUN_PREFIX SMOKE_JOURNEYS_CATALOGUE SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE \
+         SMOKE_GATE_HANDOFF_LEDGER SMOKE_GATE_PREFLIGHT_CMD SMOKE_GATE_FUTURE_KNOB; do
+  has_genv "$k" || fail "the env file's $k was dropped: the file is the list of keys, not this wrapper"
+done
+[ "$(genv SMOKE_GATE_PREFLIGHT_CMD)" = 'QA_LOGIN_URL="${SMOKE_GATE_PREFLIGHT_TARGET_URL%/}/users/login" true' ] \
+  || fail "a single-quoted literal containing \$ was mangled: $(genv SMOKE_GATE_PREFLIGHT_CMD)"
+# ...and that lease dir is the one the run's pin lives in, so the lanes barrier
+# resolves the campaign's pin instead of stranding on "no gate pin owns it".
+BARRIER_SH="$SCRIPT_DIR/smoke-evidence-barrier.sh"
+NO_PIN='no gate pin owns it|could not be looked up'
+GOOD="$(SMOKE_GATE_LEASE_DIR="$(genv SMOKE_GATE_LEASE_DIR)" bash "$BARRIER_SH" "$R" lanes || true)"
+jq -e --arg re "$NO_PIN" '[(.invalidReasons // [])[] | select(test($re))] | length == 0' <<<"$GOOD" >/dev/null \
+  || fail "the lanes barrier still cannot find the campaign's pin: $GOOD"
+# The pre-fix environment, for contrast: the lease dir dropped, the barrier on
+# its fallback, the campaign stranded.
+STRANDED="$(env -u SMOKE_GATE_LEASE_DIR SMOKE_GATE_SHARED_ROOT="$C/wg/absent" bash "$BARRIER_SH" "$R" lanes || true)"
+jq -e --arg re "$NO_PIN" '[(.invalidReasons // [])[] | select(test($re))] | length > 0' <<<"$STRANDED" >/dev/null \
+  || fail "the contrast case is not the strand this fixes, so the test proves nothing: $STRANDED"
+
+# Names that say how a process RUNS, not what the campaign is, are ignored --
+# exactly as every name outside the old allowlist was. If PATH were honoured
+# the fire could not run bash or jq at all.
+new_case env-not-config
+write_env_full
+{
+  echo "export PATH='/nonexistent-from-the-env-file'"
+  echo "export LD_PRELOAD='/nonexistent/evil.so'"
+  echo "export PYTHONPATH='/nonexistent/py'"
+  echo "export BASH_ENV='/nonexistent/rc.sh'"
+  echo "export SMOKE_CONTROLLER_LIVE_GH_CMD='/nonexistent/gh'"
+  echo "export SMOKE_CONTROLLER_CRASH_AT='poll'"
+  echo "export SMOKE_CONTROLLER_ENV_FILE='/nonexistent/other-env.sh'"
+} >>"$C/env.sh"
+fire
+[ "$(d .failure)" = null ] || fail "runtime names in the env file must be ignored, not fatal: $OUTPUT"
+[ "$(genv PATH)" != /nonexistent-from-the-env-file ] || fail "the env file set PATH for every child"
+for k in LD_PRELOAD PYTHONPATH BASH_ENV SMOKE_CONTROLLER_CRASH_AT; do
+  ! has_genv "$k" || fail "$k came from the env file: it chooses how a child runs, not what it does"
+done
+[ "$(genv SMOKE_CONTROLLER_LIVE_GH_CMD)" != /nonexistent/gh ] \
+  || fail "the env file overrode a process-env-only seam"
+
+# A non-literal value is still refused for the whole fire, now for any name the
+# file is allowed to set -- never guessed, never silently dropped.
+new_case env-nonliteral
+write_env_full
+echo 'export SMOKE_GATE_LEASE_DIR="$HOME/leases"' >>"$C/env.sh"
+fire
+[ "$WAKE" = true ] && [ "$(d .failure)" = misconfigured ] \
+  && [ "$(d '.refusedKeys[0]')" = SMOKE_GATE_LEASE_DIR ] \
+  || fail "a non-literal value must skip the fire and name the key: $OUTPUT"
+
+# `unset` still clears, for the same widened set of names.
+new_case env-unset
+write_env_full
+echo 'unset SMOKE_GATE_LEASE_DIR SMOKE_GATE_LABEL' >>"$C/env.sh"
+fire
+[ "$(d .failure)" = null ] || fail "an unset in the env file must not fail the fire: $OUTPUT"
+! has_genv SMOKE_GATE_LEASE_DIR || fail "unset SMOKE_GATE_LEASE_DIR did not clear it"
+! has_genv SMOKE_GATE_LABEL || fail "unset SMOKE_GATE_LABEL did not clear it"
 
 echo "smoke controller live wrapper tests passed"
