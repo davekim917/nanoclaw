@@ -26,6 +26,7 @@ import {
   isAdmissibleTrigger,
   isAupRefusal,
   isCorruptionError,
+  noteIgnoredModel,
   processQuery,
   formatMessagesWithCommands,
   runPollLoop,
@@ -937,6 +938,59 @@ describe('model pin under a provider fallback', () => {
     const routing = extractRouting(messages);
     expect(applyFlagBatch(messages, routing, 'codex')).toMatchObject({ ignoredModel: 'claude-opus-5[1m]' });
     expect(applyFlagBatch(messages, routing, 'claude')).toMatchObject({ model: 'claude-opus-5[1m]' });
+  });
+
+  // applyFlagBatch above decides that the pin is ignored; these cover what the
+  // user is actually told about it. The two texts are NOT interchangeable:
+  // under a spawn-time fallback the primary provider comes back on its own and
+  // the stored pin applies again, so telling the user to re-pin would make them
+  // undo a pin that is about to be correct; after a deliberate provider
+  // migration nothing reverts, so omitting the instruction leaves the pin dead
+  // with no way to know it. `fallbackActive` is the only thing that separates
+  // them (poll-loop.ts:3534).
+  function onlyChatText(): string[] {
+    return getUndeliveredMessages()
+      .filter((m) => m.kind === 'chat')
+      .map((m) => (JSON.parse(m.content) as { text: string }).text);
+  }
+
+  it('under a provider fallback, says the pin applies again when the primary is back', async () => {
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi' });
+    const routing = extractRouting(getPendingMessages());
+
+    await noteIgnoredModel('gpt-6-astra', 'claude', true, routing);
+
+    const posted = onlyChatText();
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toContain('model pin gpt-6-astra is not a claude model');
+    expect(posted[0]).toContain('it applies again when the primary provider is back.');
+    // The migration instruction must NOT appear: the pin is not dead here.
+    expect(posted[0]).not.toContain('clear the pin');
+  });
+
+  it('outside a fallback, tells the user how to re-pin or clear it', async () => {
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi' });
+    const routing = extractRouting(getPendingMessages());
+
+    await noteIgnoredModel('gpt-6-astra', 'claude', false, routing);
+
+    const posted = onlyChatText();
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toContain('set a claude model with -m <model>, or clear the pin with -m.');
+    expect(posted[0]).not.toContain('applies again');
+  });
+
+  it('posts once per cooldown, not once per turn', async () => {
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi' });
+    const routing = extractRouting(getPendingMessages());
+
+    await noteIgnoredModel('gpt-6-astra', 'claude', true, routing);
+    await noteIgnoredModel('gpt-6-astra', 'claude', true, routing);
+
+    // shouldPostInfraWarning (modules/mailbox/session-state.ts:365) suppresses
+    // the identical second text inside the cooldown, so a session that reads
+    // the pin on every turn does not narrate it on every turn.
+    expect(onlyChatText()).toHaveLength(1);
   });
 });
 

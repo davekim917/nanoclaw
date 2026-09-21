@@ -3618,7 +3618,7 @@ export function applyFlagBatch(
  * migration the new provider IS the primary, nothing reverts, and the user
  * has to re-pin or clear it.
  */
-async function noteIgnoredModel(
+export async function noteIgnoredModel(
   model: string,
   providerName: string,
   fallbackActive: boolean,
