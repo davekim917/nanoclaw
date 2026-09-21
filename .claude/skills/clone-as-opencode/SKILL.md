@@ -11,15 +11,15 @@ Create `groups/<source>-opencode/` from `groups/<source>/`. The opencode sibling
 - **Workgroup memory canon** — `data/workgroups/<workgroup-id>/memory` on the
   host and `/workspace/workgroup/memory` in every sibling container.
   `/workspace/agent/memory` is only the compatibility link.
-- **CLAUDE.local.md** — symlinked to the source file when present so its
-  standing instruction state is preserved byte-for-byte. It is not a memory
-  root and never becomes part of the workgroup memory canon.
+- **standing-instructions.md** — symlinked to the source file when present, so
+  every sibling reads one persona. It is not a memory root and never becomes
+  part of the workgroup memory canon.
 - **Repos** — symlinked top-level dirs that contain `.git/`.
 - **sources/** — ordinary knowledge files, shared across the workgroup.
 - **conversations/** — transcript archive; both agents see each other's archived turns.
 - **Thread worktree** — when `NANOCLAW_THREAD_WORKTREES=1`, both siblings in the same platform thread mount the same `data/v2-threads/<thread-id>/worktrees/<repo>/` host path. Uncommitted edits flow across.
 
-> Under workgroup shared-FS (`data/workgroups/<wg>/.migrated` present), the **Repos / sources / conversations** links point at the container-absolute `/workspace/workgroup/<name>` mount instead of `../<source>/` — Step 4 detects the mode and reproduces exactly what `reconcileWorkgroupSharedDirs` already did for the existing siblings. **CLAUDE.local.md** stays a relative link in both modes because it is group/provider instruction state, not memory.
+> Under workgroup shared-FS (`data/workgroups/<wg>/.migrated` present), the **Repos / sources / conversations** links point at the container-absolute `/workspace/workgroup/<name>` mount instead of `../<source>/` — Step 4 detects the mode and reproduces exactly what `reconcileWorkgroupSharedDirs` already did for the existing siblings. **standing-instructions.md** stays a relative link in both modes because it is group/provider instruction state, not memory.
 
 `container.json` for the new sibling gets `provider: "opencode"` and `memory.enabled: true`.
 
@@ -169,13 +169,14 @@ WG_DIR_ABS="$(pwd)/data/workgroups/${SOURCE_WORKGROUP}"
 mkdir -p groups/${SIBLING_FOLDER}
 cd groups/${SIBLING_FOLDER}
 
-# Shared standing instructions: preserve the source's CLAUDE.local.md
-# byte-for-byte. This is group/provider instruction state, not memory. It is a
-# loose FILE, so a RELATIVE symlink is correct in BOTH shared-FS modes and
-# container-runner realpath-overlays it into the sibling container. Conditional
-# — absent if the source has none. Do NOT symlink CLAUDE.md: the composer
-# overwrites it every spawn.
-[ -f ../${SOURCE_FOLDER}/CLAUDE.local.md ] && ln -sfn ../${SOURCE_FOLDER}/CLAUDE.local.md CLAUDE.local.md
+# Shared standing instructions: link the source's standing-instructions.md so
+# the whole sibling set reads ONE persona file and cannot drift. This is
+# group/provider instruction state, not memory. A RELATIVE link is correct in
+# both shared-FS modes: the composer resolves it host-side, and only follows a
+# link that stays inside the workgroup. Conditional — absent if the source has
+# none. Do NOT link CLAUDE.md or AGENTS.md: the composer overwrites both every
+# spawn.
+[ -f ../${SOURCE_FOLDER}/standing-instructions.md ] && ln -sfn ../${SOURCE_FOLDER}/standing-instructions.md standing-instructions.md
 
 if [ -f "${WG_DIR_ABS}/.migrated" ]; then
   # Shared-FS live: the source's repos + sources + conversations have moved to

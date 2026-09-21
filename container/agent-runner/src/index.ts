@@ -109,9 +109,8 @@ async function main(): Promise<void> {
   // Runtime-generated system-prompt addendum: agent identity + communication
   // invariants + live destinations map. Rest of the system prompt (per-module
   // instructions, per-channel formatting) is loaded by Claude Code from
-  // /workspace/agent/CLAUDE.md (composed base + module fragments). Per-group
-  // standing operator customizations live in
-  // /workspace/agent/CLAUDE.local.md (auto-loaded); durable memory lives in
+  // /workspace/agent/CLAUDE.md (the group's standing instructions + composed
+  // base + module fragments); durable memory lives in
   // /workspace/agent/memory/. Canonical bytes enter each admissible turn only
   // through paired untrusted recall; the provider lifecycle hook supplies
   // trusted static handling and write guidance.

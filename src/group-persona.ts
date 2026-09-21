@@ -37,9 +37,8 @@ export function stageGroupPersona(groupDir: string, instructions: string): boole
  * Read a group's standing instructions. Symlinks are followed ONLY when they
  * resolve inside the groups tree.
  *
- * Sibling agents that build together share one instruction set — the same
- * shape `CLAUDE.local.md` already uses, where the sibling's path is a symlink
- * to the source group's file. Sharing the file makes drift impossible rather
+ * Sibling agents that build together share one instruction set: the
+ * sibling's path is a symlink to the source group's file. Sharing the file makes drift impossible rather
  * than merely detectable: a trio of siblings had silently diverged — two
  * running a stale revision of a rule, one missing five whole sections
  * including its QA-closure rules — because every edit landed on one copy.
@@ -54,7 +53,7 @@ export function stageGroupPersona(groupDir: string, instructions: string): boole
  * — never the whole groups tree. A workgroup is the data-pool boundary and a
  * container mounts only its own group directory, so a sibling in a *different*
  * workgroup is not already-reachable content: following a link there would
- * inject another tenant's `CLAUDE.local.md` or memory into this prompt. The
+ * inject another tenant's standing instructions or memory into this prompt. The
  * default is own-directory-only so a caller that forgets the set fails closed.
  * Anything resolving outside is refused and the persona omitted.
  */

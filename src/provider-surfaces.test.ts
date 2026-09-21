@@ -361,7 +361,7 @@ describe('container instruction contracts', async () => {
 });
 
 describe('initGroupFilesystem agent surfaces', async () => {
-  it('preserves local instructions and stages default Claude support files', async () => {
+  it('stages standing instructions and default Claude support files, never a CLAUDE.local.md', async () => {
     const ag = group('ag-default', 'default-group');
     await createAgentGroup(ag);
 
@@ -370,7 +370,8 @@ describe('initGroupFilesystem agent surfaces', async () => {
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     const claudeDir = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared');
     expect(fs.readFileSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE), 'utf-8')).toBe('hello\n');
-    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'utf-8')).toBe('');
+    expect(fs.existsSync(path.join(groupDir, 'CLAUDE.local.md'))).toBe(false);
+    expect(fs.existsSync(path.join(claudeDir, 'settings.json'))).toBe(true);
     // Host-owned placeholder for the nested spawn-template.md mount — without
     // it Docker creates the destination in this folder root-owned.
     expect(fs.readFileSync(path.join(groupDir, 'spawn-template.md'), 'utf-8')).toBe('');
@@ -484,7 +485,9 @@ describe('initGroupFilesystem agent surfaces', async () => {
     initGroupFilesystem(ag, { provider: 'not-registered' });
 
     const groupDir = path.join(GROUPS_DIR, ag.folder);
-    expect(fs.existsSync(path.join(groupDir, 'CLAUDE.local.md'))).toBe(true);
+    // Default surfaces = the Claude state dir, now that no placeholder file is written.
+    expect(fs.existsSync(path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared', 'settings.json'))).toBe(true);
+    expect(fs.existsSync(path.join(groupDir, 'CLAUDE.local.md'))).toBe(false);
     expect(fs.existsSync(path.join(groupDir, 'memory'))).toBe(false);
   });
 });
@@ -509,7 +512,7 @@ describe('initGroupFilesystem legacy seed isolation', async () => {
     }
 
     expect(fs.readFileSync(seedFile)).toEqual(seedBytes);
-    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'utf-8')).toBe('');
+    expect(fs.existsSync(path.join(groupDir, 'CLAUDE.local.md'))).toBe(false);
     expect(fs.existsSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE))).toBe(false);
     expect(fs.existsSync(path.join(groupDir, 'memory'))).toBe(false);
   });

@@ -4800,9 +4800,9 @@ export async function buildMounts(
     // Docker resolves a mount DESTINATION through the container's own
     // filesystem, and /workspace/agent is this group dir — so a relative
     // symlink that escapes upward redirects the destination out of the group
-    // mount and back into the session-dir bind at /workspace (clone-as-codex's
-    // `CLAUDE.local.md -> ../<seed>/CLAUDE.local.md` really attaches at
-    // /workspace/<seed>/CLAUDE.local.md). runc then creates that parent as
+    // mount and back into the session-dir bind at /workspace (a clone-as-codex
+    // sibling link `sources -> ../<seed>/sources` really attaches at
+    // /workspace/<seed>/sources). runc then creates that parent as
     // ROOT, and host-side session reclaim can never delete it. Declare the
     // path Docker is going to use anyway, so the /workspace stub pre-creation
     // in spawnContainer creates it as the host user first.

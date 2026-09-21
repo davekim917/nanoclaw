@@ -241,8 +241,13 @@ describe('dependent provider and v1 migration surfaces', () => {
   });
 
   it('keeps deterministic v1 copy and cutover surfaces on the separate instruction contract', () => {
-    for (const surface of [v1MigrationShell, v1GroupsMigration, claudeMdComposeSource]) {
+    // The v1 migrator still produces CLAUDE.local.md; the composer now retires
+    // it into standing-instructions.md. Neither ever routes it to memory.
+    for (const surface of [v1MigrationShell, v1GroupsMigration]) {
       expect(surface).toMatch(/CLAUDE\.local\.md[\s\S]{0,220}standing instruction/i);
+    }
+    expect(claudeMdComposeSource).toMatch(/CLAUDE\.local\.md[\s\S]{0,600}standing-instructions\.md/);
+    for (const surface of [v1MigrationShell, v1GroupsMigration, claudeMdComposeSource]) {
       expect(surface).not.toMatch(
         /CLAUDE\.local\.md[\s\S]{0,220}\/migrate-memory|\/migrate-memory[\s\S]{0,220}CLAUDE\.local\.md/i,
       );
@@ -272,14 +277,14 @@ describe('clone and OpenClaw migration surfaces', () => {
     }
   });
 
-  it('keeps CLAUDE.local.md as standing instruction state rather than per-group memory', () => {
+  it('shares the persona as standing instruction state rather than per-group memory', () => {
     for (const surface of [cloneAsCodexSkill, cloneAsOpenCodeSkill]) {
-      expect(surface).toMatch(
-        /CLAUDE\.local\.md[\s\S]{0,180}(?:standing instructions|instruction state)[\s\S]{0,180}not (?:a )?memory/i,
-      );
-      expect(surface).toMatch(/preserv(?:e|ed)[\s\S]{0,180}byte-for-byte/i);
+      expect(surface).toMatch(/standing-instructions\.md[\s\S]{0,180}persona[\s\S]{0,180}not (?:a )?memory/i);
+      // One file for the whole sibling set: a link, never a copy that can drift.
+      expect(surface).toContain('ln -sfn ../${SOURCE_FOLDER}/standing-instructions.md standing-instructions.md');
+      // The retired file must not be re-created for a new sibling.
+      expect(surface).not.toMatch(/ln -sfn[^\n]*CLAUDE\.local\.md/);
       expect(surface).not.toMatch(/per-group memory/i);
-      expect(surface).not.toMatch(/CLAUDE\.local\.md[\s\S]{0,180}(?:siblings remember|share memory)/i);
     }
   });
 

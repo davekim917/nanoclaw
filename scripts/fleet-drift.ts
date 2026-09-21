@@ -27,15 +27,14 @@
  *   3b. instructionStack (no history, no band): a banned-pattern scan for
  *      dates/issue-refs/"Current Focus" headers over container/CLAUDE.md, the
  *      repo-root CLAUDE.md (the dev-facing doc, not the in-container agent
- *      surface) and every group's standing files (persona + CLAUDE.local.md,
- *      symlinks resolved, a shared file flagged once fleet-wide), plus a
- *      safety walk of the composed doc each container agent actually receives
- *      — provider-aware (container.json): codex/opencode read their on-disk
- *      AGENTS.md directly (their harnesses embed CLAUDE.local.md there at
- *      compose time); claude/default walk CLAUDE.md's own @-import chain and
- *      CLAUDE.local.md, since Claude Code auto-discovers it independently and
- *      AGENTS.md is only a spawn-time snapshot that can miss a newer local
- *      edit. No byte ceilings — see checkInstructionStack.
+ *      surface) and every group's standing files (persona, plus a legacy
+ *      CLAUDE.local.md if one is present — symlinks resolved, a shared file
+ *      flagged once fleet-wide), plus a safety walk of the composed doc each
+ *      container agent actually receives — provider-aware (container.json):
+ *      codex/opencode read their on-disk AGENTS.md directly; claude/default
+ *      walk CLAUDE.md's own @-import chain and any legacy CLAUDE.local.md,
+ *      which Claude Code still auto-discovers even though compose retired
+ *      it. No byte ceilings — see checkInstructionStack.
  *      docs/specs/instruction-stack-prune/plan.md.
  *   4. On breach, file one GitHub issue per breached metric on the origin repo
  *      via `gh`, labeled `fleet-drift`. An already-open issue whose title
@@ -428,7 +427,11 @@ import { scanBannedPatterns } from './instruction-surface.js';
 
 export { scanBannedPatterns };
 
-/** A group's standing-instructions file plus its CLAUDE.local.md. */
+/**
+ * A group's standing-instructions file, plus the retired CLAUDE.local.md.
+ * Compose no longer creates or composes the latter, but Claude Code still
+ * auto-loads one if it exists, so a leftover is still scanned.
+ */
 const GROUP_STANDING_FILENAMES = ['standing-instructions.md', 'CLAUDE.local.md'];
 
 export interface InstructionStackBreach {
@@ -564,9 +567,9 @@ function readGroupStandingFiles(
  *
  * Scanned per real file fleet-wide, not per group: sibling groups commonly
  * symlink some or all of their standing files to one source group (e.g. a
- * codex/opencode sibling → its Claude counterpart), and a normal clone shares
- * only SOME of them (one common CLAUDE.local.md, each group keeping its own
- * persona). Keying on the resolved real path reports a shared file's hit
+ * codex/opencode sibling → its Claude counterpart), and a clone can share
+ * only SOME of them (one common persona across a sibling trio, another group
+ * in the same workgroup keeping its own). Keying on the resolved real path reports a shared file's hit
  * once, scoped to every group that reaches it, however the sharing is shaped.
  */
 export function checkGroupStandingPatterns(groupsRoot: string): InstructionStackBreach[] {
@@ -752,15 +755,14 @@ function makeFlattenGuard(
  * anything unsafe along that chain is reported rather than read. Source
  * depends on which harness actually reads it (container.json's `provider`):
  *
- * - codex/opencode: their harnesses don't auto-discover CLAUDE.local.md —
- *   compose embeds it raw into AGENTS.md at spawn time, so AGENTS.md alone
- *   IS the complete artifact.
+ * - codex/opencode: AGENTS.md alone IS the complete artifact; their harnesses
+ *   read nothing else from the group folder.
  * - claude/default: compose already writes CLAUDE.md fully flat (no
  *   `@`-imports left to resolve — the flatten call below is a no-op unless a
- *   group's CLAUDE.md predates that cutover), but Claude Code auto-discovers
- *   CLAUDE.local.md independently, and AGENTS.md is only regenerated at spawn
- *   time, so it can miss a CLAUDE.local.md edited since. Walk CLAUDE.md's own
- *   import chain plus CLAUDE.local.md instead of trusting that snapshot.
+ *   group's CLAUDE.md predates that cutover), but Claude Code auto-discovers a
+ *   CLAUDE.local.md independently of compose. Compose retired that file, yet a
+ *   leftover still loads, so walk CLAUDE.md's own chain plus any
+ *   CLAUDE.local.md rather than trusting AGENTS.md's spawn-time snapshot.
  *
  * The flatten call's OUTPUT is deliberately discarded — it is made for its
  * `validateRead` gate, the only thing that walks nested `@`-imports and can

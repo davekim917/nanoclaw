@@ -39,7 +39,7 @@ flowchart TB
   end
 
   subgraph Groups["Agent Group Filesystem (groups/*)"]
-    Folder["CLAUDE.md / CLAUDE.local.md<br/>provider + identity instructions<br/>per-group skills<br/>container.json (materialized from container_configs)"]
+    Folder["standing-instructions.md → composed CLAUDE.md / AGENTS.md<br/>provider + identity instructions<br/>per-group skills<br/>container.json (materialized from container_configs)"]
   end
 
   subgraph Workgroup["Workgroup Filesystem (data/workgroups/*)"]

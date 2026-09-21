@@ -204,7 +204,7 @@ describe('legacy call — no provider, no provider_config', () => {
     expect(fs.readFileSync(path.join(TEST_GROUPS_DIR, 'legacy', STANDING_INSTRUCTIONS_FILE), 'utf8')).toBe(
       'be helpful\n',
     );
-    expect(fs.readFileSync(path.join(TEST_GROUPS_DIR, 'legacy', 'CLAUDE.local.md'), 'utf8')).toBe('');
+    expect(fs.existsSync(path.join(TEST_GROUPS_DIR, 'legacy', 'CLAUDE.local.md'))).toBe(false);
     expect(
       fs.existsSync(path.join(TEST_DATA_DIR, 'workgroups', 'legacy', 'memory', 'memories', 'imported-agent-memory.md')),
     ).toBe(false);

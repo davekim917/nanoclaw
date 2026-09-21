@@ -77,7 +77,7 @@ See [docs/v1-to-v2-changes.md](docs/v1-to-v2-changes.md) for what's different an
 
 - **Multi-channel messaging** — WhatsApp, Telegram, Discord, Slack, Microsoft Teams, iMessage, Matrix, Google Chat, Webex, Linear, GitHub, WeChat, and email via Resend. Installed on demand with `/add-<channel>` skills. Run one or many at the same time.
 - **Flexible isolation** — connect each channel to an agent in its own workgroup for full privacy, share one agent across many channels with separate conversations, or fold multiple channels into a single shared session so one conversation spans many surfaces. Pick per channel via `/manage-channels`. See [docs/isolation-model.md](docs/isolation-model.md).
-- **Workgroup memory, per-agent identity** — every workgroup has one canonical Markdown memory tree shared by all sibling agent groups. Each agent group keeps its own `CLAUDE.md`/`CLAUDE.local.md` instructions, provider identity, container, and routing. Different workgroups remain isolated.
+- **Workgroup memory, per-agent identity** — every workgroup has one canonical Markdown memory tree shared by all sibling agent groups. Each agent group keeps its own standing instructions, provider identity, container, and routing. Different workgroups remain isolated.
 - **Scheduled tasks**: recurring jobs executed by the agent, with optional [script gates](docs/scheduled-tasks.md) that avoid waking it when there is no work
 - **Web access** — search and fetch content from the web
 - **Container isolation** — agents are sandboxed in Docker containers (macOS/Linux/WSL2)
