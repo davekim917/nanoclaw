@@ -553,6 +553,53 @@ write_env live "export SMOKE_GATE_LEASE_DIR='$PR_LEASES'" \
 tick
 [ "$(field '.data.status')" != misconfigured ] || fail "an unset line must not read as non-literal: $LAST"
 ok
+# A line OUTSIDE the config namespace is inert -- not config, and above all not
+# a reason to stop renewing. Refusing over one would be persistent campaign
+# failure from a benign file, the same outage class this fix is about.
+write_env live "export SMOKE_GATE_LEASE_DIR='$PR_LEASES'" \
+  'EXTRA="$HOME/cache"' 'MY_TOOL_ARGS="--out=$(pwd)"' "export BUN_OPTIONS='--preload=/nonexistent/pre.cjs'"
+tick
+[ "$(field '.data.status')" != misconfigured ] \
+  || fail "a foreign line must be ignored, not stop the tick: $LAST"
+[ "$(field '.data.renewed | length')" = 1 ] \
+  || fail "the tick must renew normally alongside a foreign line: $LAST"
+ok
+
+# --- imported config never touches this script's own variables --------------
+# The tick's internals are ours and can be renamed at any time, so no deny list
+# can protect them in general: config goes into the CHILD environment only.
+# CEILING_MAX is the renewal ceiling added for XZO #2024; NOW stamps the final
+# line. At 760e6220c the env file could overwrite both.
+new_case env-cannot-clobber-internals
+START="$(/usr/bin/date -u +%s)"
+claim_files "$START"
+in_flight_at "$START"
+write_env live "export CEILING_MAX='9999'" "export NOW='not-a-timestamp'" \
+  "export JOURNAL='/nonexistent/journal.ndjson'" "export RESULT_RENEWED='[\"forged\"]'"
+FAKE_CLOCK_OFFSET=3700
+tick_working   # the owner IS writing, so the ceiling is what must stop this
+[ "$(field '.data.renewed | length')" = 0 ] \
+  || fail "the env file raised the renewal ceiling: $LAST"
+grep -q 'past the 3600s ceiling' <<<"$(field '.data.skipped[0].reason')" \
+  || fail "the ceiling the env file tried to move is not the one that fired: $LAST"
+ok
+[ -n "$LAST" ] && jq -e '.wakeAgent == false and (.data.tick | test("^[0-9]{4}-"))' <<<"$LAST" >/dev/null \
+  || fail "the env file broke the final-line contract: $LAST"
+ok
+jq -e '.data.renewed == [] and (.data.skipped | type == "array")' <<<"$LAST" >/dev/null \
+  || fail "the env file reached the tick's result accumulators: $LAST"
+ok
+# ...and the gate call still receives the file's real config, because that is
+# where imported values are supposed to land.
+new_case env-reaches-child-only
+claim_files
+in_flight_at "$(/usr/bin/date -u +%s)"
+use_stub_gate
+write_env live "export SMOKE_GATE_FUTURE_KNOB='tomorrow'" "export CEILING_MAX='9999'"
+tick
+[ "$(field '.data.renewed | length')" = 1 ] || fail "stub-gate renewal did not happen: $LAST"
+grep -q 'claimant=controller' "$GATE_LOG" || fail "the gate call lost its claimant: $(cat "$GATE_LOG")"
+ok
 
 echo "== 8. an unreadable journal renews nothing =="
 new_case torn

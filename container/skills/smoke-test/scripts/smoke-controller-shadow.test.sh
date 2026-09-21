@@ -368,10 +368,13 @@ claim; contract
   echo "export SMOKE_GATE_FUTURE_KNOB='tomorrow'"
   echo "export PATH='/nonexistent-from-the-env-file'"
   echo "export LD_PRELOAD='/nonexistent/evil.so'"
+  echo "export BUN_OPTIONS='--preload=/nonexistent/pre.cjs'"
   echo "export SMOKE_GATE_CLAIMANT='controller'"
   echo "export SMOKE_CONTROLLER_SHADOW_TEST_HANG='1'"
+  echo 'EXTRA="$HOME/cache"'
 } >>"$C/env.sh"
 FAKE_ENV="$C/gh-env.txt" fire
+[ "$(d .skipped)" = null ] || fail "a line outside the config namespace must not skip the fire: $DATA"
 [ -s "$C/gh-env.txt" ] || fail "the gh child never ran, so this proves nothing: $DATA"
 genv() { sed -n "s/^$1=//p" "$C/gh-env.txt" | tail -n 1; }
 [ "$(genv SMOKE_GATE_LEASE_DIR)" = "$C/wg/leases" ] \
@@ -379,7 +382,7 @@ genv() { sed -n "s/^$1=//p" "$C/gh-env.txt" | tail -n 1; }
 [ "$(genv SMOKE_GATE_FUTURE_KNOB)" = tomorrow ] \
   || fail "a key this wrapper has never heard of was dropped: the file is the list of keys"
 [ "$(genv PATH)" != /nonexistent-from-the-env-file ] || fail "the env file set PATH for every child"
-for k in LD_PRELOAD SMOKE_GATE_CLAIMANT SMOKE_CONTROLLER_SHADOW_TEST_HANG; do
+for k in LD_PRELOAD BUN_OPTIONS EXTRA SMOKE_GATE_CLAIMANT SMOKE_CONTROLLER_SHADOW_TEST_HANG; do
   ! grep -q "^$k=" "$C/gh-env.txt" || fail "$k came from the env file: it is runtime, not configuration"
 done
 # A non-literal value still skips the fire and names the key, for every name

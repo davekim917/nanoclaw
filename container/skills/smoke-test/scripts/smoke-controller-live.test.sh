@@ -874,6 +874,11 @@ jq -e --arg re "$NO_PIN" '[(.invalidReasons // [])[] | select(test($re))] | leng
 # Names that say how a process RUNS, not what the campaign is, are ignored --
 # exactly as every name outside the old allowlist was. If PATH were honoured
 # the fire could not run bash or jq at all.
+# Only the install's own namespace is configuration. Everything else -- shell
+# and loader hooks, and BUN_OPTIONS, whose `--preload` makes Bun execute a
+# module before its main script (and this wrapper's enqueue command is Bun) --
+# is ignored, exactly as it was before the pass-through. If PATH were honoured
+# the fire could not run bash or jq at all.
 new_case env-not-config
 write_env_full
 {
@@ -881,6 +886,8 @@ write_env_full
   echo "export LD_PRELOAD='/nonexistent/evil.so'"
   echo "export PYTHONPATH='/nonexistent/py'"
   echo "export BASH_ENV='/nonexistent/rc.sh'"
+  echo "export BUN_OPTIONS='--preload=/nonexistent/pre.cjs'"
+  echo "export NODE_OPTIONS='--require=/nonexistent/pre.cjs'"
   echo "export SMOKE_CONTROLLER_LIVE_GH_CMD='/nonexistent/gh'"
   echo "export SMOKE_CONTROLLER_CRASH_AT='poll'"
   echo "export SMOKE_CONTROLLER_ENV_FILE='/nonexistent/other-env.sh'"
@@ -888,11 +895,27 @@ write_env_full
 fire
 [ "$(d .failure)" = null ] || fail "runtime names in the env file must be ignored, not fatal: $OUTPUT"
 [ "$(genv PATH)" != /nonexistent-from-the-env-file ] || fail "the env file set PATH for every child"
-for k in LD_PRELOAD PYTHONPATH BASH_ENV SMOKE_CONTROLLER_CRASH_AT; do
+for k in LD_PRELOAD PYTHONPATH BASH_ENV BUN_OPTIONS NODE_OPTIONS SMOKE_CONTROLLER_CRASH_AT; do
   ! has_genv "$k" || fail "$k came from the env file: it chooses how a child runs, not what it does"
 done
 [ "$(genv SMOKE_CONTROLLER_LIVE_GH_CMD)" != /nonexistent/gh ] \
   || fail "the env file overrode a process-env-only seam"
+
+# An ordinary line outside the namespace is INERT, not fatal. Refusing the fire
+# over one would be the same outage class this change is fixing: a benign file
+# stopping every campaign until someone rewrites it.
+new_case env-foreign-nonliteral
+write_env_full
+{
+  echo 'EXTRA="$HOME/cache"'
+  echo 'MY_TOOL_ARGS="--out=$(pwd)"'
+  echo 'PATH="$PATH:/opt/x"'
+} >>"$C/env.sh"
+fire
+[ "$(d .failure)" = null ] && [ "$(d .refusedKeys)" = null ] \
+  || fail "a non-literal line outside the config namespace must stay ignored: $OUTPUT"
+[ "$(genv SMOKE_GATE_LEASE_DIR)" = "$C/wg/leases" ] \
+  || fail "the fire did not proceed normally alongside a foreign line: $OUTPUT"
 
 # A non-literal value is still refused for the whole fire, now for any name the
 # file is allowed to set -- never guessed, never silently dropped.
