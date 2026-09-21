@@ -11,8 +11,12 @@
  *    actually made (`ensureWorkgroupWorkDirs` applies the mount's own
  *    predicate per workgroup; a link to an unmounted target is worse than no
  *    link).
- * Idempotent — re-running on already-reconciled state is a no-op. On FS failure, throws
- * (caller in src/index.ts logs and exits process.exit(1)).
+ * 3. Prune member compat links whose shared target is gone
+ *    (`pruneDanglingWorkgroupCompatLinks`).
+ * Idempotent — re-running on already-reconciled state is a no-op. Only step 1
+ * and the workgroups enumeration throw on failure (the caller, src/main.ts:682,
+ * logs and exits process.exit(1)); steps 2 and 3 warn and skip per workgroup
+ * and per member, so one lost race cannot stop the host booting.
  */
 import fs from 'fs';
 import path from 'path';
@@ -68,9 +72,9 @@ export function reconcileWorkgroupFsState(db: Database.Database): void {
   // this order only so a boot's shared-tree writes precede its reads.
   //
   // Step 3 is NOT the boot's last writer to the shared tree:
-  // this whole function runs at src/main.ts:683, and runBootMountQuiescence at
-  // :693 then calls reconcileWorkgroupSharedDirs (:515) and the memory gate
-  // (:521), both of which add names after this prune has read its listing.
+  // this whole function runs at src/main.ts:682, and runBootMountQuiescence at
+  // :692 then calls reconcileWorkgroupSharedDirs (:514) and the memory gate
+  // (:520), both of which add names after this prune has read its listing.
   // That is safe for two separate reasons, not one — `memory` and `artifacts`
   // are held by RESERVED_SHARED_DIR_NAMES and never considered here, and
   // migrateWorkgroup writes a name's shared entry before its compat link

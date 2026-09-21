@@ -914,12 +914,17 @@ function ensureOneWorkgroupWorkDir(
  * proves container absence, and the member's own folder is that member's
  * `/workspace/agent`. The rules below are what makes that survivable.
  *
- * - **A destination name is CLAIMED, not checked.** `existsSync` then `rename`
- *   is a TOCTOU, and `rename(2)` replaces an existing file silently — a
- *   sibling writing that name inside the window would be destroyed with no
- *   trace. `claimSharedName` instead creates the destination with `wx` / a
- *   non-recursive `mkdir`, both of which fail `EEXIST` atomically, and the
- *   move then renames over this function's OWN claim.
+ * - **A file is published with `link(2)`, never renamed onto a name.**
+ *   `rename(2)` replaces an existing file silently, so anything that renames
+ *   onto a name in this tree — even over a reservation it made itself — can
+ *   destroy bytes a sibling wrote there. `link` fails `EEXIST` in the kernel:
+ *   the name appears only with the content already in it, and a name that is
+ *   taken stays the sibling's. There is no claim, so there is nothing to
+ *   release and no empty name for a hard death to leave behind.
+ * - **A directory is published by claim, then rename.** Directories cannot be
+ *   hard-linked. A non-recursive `mkdir` reserves the name (`EEXIST` if taken),
+ *   and renaming onto a directory fails `ENOTEMPTY` if a sibling has written
+ *   into the claim — the kernel's refusal, not a check.
  * - **A taken name is not merged.** It moves to `<name>.from-<member>`, so the
  *   content still becomes shared and neither side loses a byte; taken twice,
  *   the entry stays put. Both `name` (a `readdir` component) and
@@ -938,12 +943,13 @@ function ensureOneWorkgroupWorkDir(
  * opposite of `sameFilesystem`'s own "unknown → copy" advice — written for the
  * migrator, where copy is the safe fallback, and wrong for this caller.
  *
- * Failures are per entry: one unreadable file does not abandon the rest, a
- * HANDLED failure releases the entry's claim so its real name is still free,
- * and the next boot retries whatever is left. A hard death (SIGKILL, power
- * loss) between the claim and the move runs no release: it leaves an empty
- * claim at the real name, which the next boot moves aside to
- * `.from-<member>` rather than reclaiming. No bytes are lost either way.
+ * Failures are per entry: one unreadable file does not abandon the rest, and
+ * the next boot retries whatever is left. A file linked but not yet unlinked
+ * from the member (a hard death, or a failed unlink) is recognised next boot
+ * as the same inode and finished rather than duplicated. A hard death between
+ * a directory claim and its move leaves an empty directory at the real name,
+ * which the next boot moves aside to `.from-<member>`. No bytes are lost
+ * either way.
  */
 function consolidateMemberWorkDir(
   memberWorkDir: string,
@@ -974,49 +980,10 @@ function consolidateMemberWorkDir(
         log.warn('ensureWorkgroupWorkDirs: could not stat entry', { ...ctx, name, err });
         continue;
       }
-      const dstName = claimSharedName(sharedWorkDir, name, srcIsDir, ctx);
+      const dstName = srcIsDir
+        ? publishDir(src, sharedWorkDir, name, strategy, ctx)
+        : publishFile(src, sharedWorkDir, name, strategy, ctx);
       if (dstName === null) continue;
-      const dst = path.join(sharedWorkDir, dstName);
-      // The rename CONSUMES the claim. Anything that throws after it — the
-      // copy branch's source removal — must not run the release, which would
-      // delete the content just moved.
-      let consumed = false;
-      try {
-        if (strategy === 'rename') {
-          // Over this function's own claim, made moments ago: a sibling that
-          // tried the same name in between lost to EEXIST, not to us.
-          fs.renameSync(src, dst);
-          consumed = true;
-        } else {
-          const staging = path.join(sharedWorkDir, `.${dstName}.${process.pid}.partial`);
-          try {
-            fs.cpSync(src, staging, { recursive: true, verbatimSymlinks: true });
-            // Straight over the claim, exactly as the rename branch does. NOT
-            // rmSync(dst) first: that would drop the reservation — unreserving
-            // the name for the length of one more syscall, which is the defect
-            // the claim exists to close — and it would recursively delete a
-            // directory claim a sibling had since written into. Renaming onto
-            // a filled directory claim fails ENOTEMPTY instead, which is the
-            // outcome we want.
-            fs.renameSync(staging, dst);
-            consumed = true;
-          } finally {
-            fs.rmSync(staging, { recursive: true, force: true }); // ours, by pid
-          }
-          fs.rmSync(src, { recursive: true, force: true });
-        }
-      } catch (err) {
-        // Release the claim. Without this the move's destination keeps a
-        // zero-byte file or empty directory under the entry's REAL name,
-        // forever: no later boot reclaims it, the content lands at
-        // `.from-<member>` instead, and an agent following the instruction to
-        // `artifacts/<name>` reads zero bytes rather than an error — a worse
-        // shape than a missing file. rmdir fails ENOTEMPTY if a sibling filled
-        // a directory claim, which is the right answer: that content stays.
-        if (!consumed) releaseClaim(dst, srcIsDir);
-        log.warn('ensureWorkgroupWorkDirs: could not move entry into the shared tree', { ...ctx, name, err });
-        continue;
-      }
       moved.push(name);
       if (dstName !== name) renamed.push(`${name} -> ${dstName}`);
     }
@@ -1053,71 +1020,155 @@ function moveStrategy(a: string, b: string): 'rename' | 'copy' | null {
   }
 }
 
-/**
- * Reserve a name in the shared tree for `name`, returning the name actually
- * claimed, or `null` when nothing could be.
- *
- * The claim is the atomicity: `wx` and a non-recursive `mkdir` both fail
- * `EEXIST` in the kernel, so two hosts, or a host and a live container, cannot
- * both believe they own the name. The caller then renames over its own claim.
- */
-function claimSharedName(
-  sharedWorkDir: string,
-  name: string,
-  isDir: boolean,
-  ctx: { workgroupId: string; member: string },
-): string | null {
-  let lastErr: unknown;
-  const claim = (candidate: string): boolean => {
-    const at = path.join(sharedWorkDir, candidate);
-    try {
-      if (isDir) {
-        fs.mkdirSync(at); // non-recursive: EEXIST if taken
-      } else {
-        fs.closeSync(fs.openSync(at, 'wx')); // EEXIST if taken
-      }
-      return true;
-    } catch (err) {
-      lastErr = err; // EACCES and ENOSPC land here too — don't report them as "taken"
-      return false;
-    }
-  };
-  if (claim(name)) return name;
-  const aside = `${name}.from-${ctx.member}`;
-  if (claim(aside)) return aside;
+type PublishCtx = { workgroupId: string; member: string };
+
+/** The member's own name first, then the aside name a collision falls back to. */
+function candidateNames(name: string, ctx: PublishCtx): [string, string] {
+  return [name, `${name}.from-${ctx.member}`];
+}
+
+function warnNoName(name: string, ctx: PublishCtx, err?: unknown): void {
   // Both names are taken. The second may be an earlier consolidation of this
-  // same member, or any file a sibling wrote — the shared tree is read-write
+  // same member, or anything a sibling wrote — the shared tree is read-write
   // to all of them, so this cannot be narrowed further from here. Either way
-  // the entry stays put, and `rmdirSync` below then refuses the directory.
+  // the entry stays put, and the caller's `rmdirSync` then refuses the member.
   log.warn('ensureWorkgroupWorkDirs: could not claim a name in the shared tree, left in place', {
     ...ctx,
     name,
-    attempted: aside,
-    err: lastErr,
+    attempted: candidateNames(name, ctx)[1],
+    err,
   });
-  return null;
 }
 
 /**
- * Give back a claim whose move never happened.
+ * Publish a non-directory entry into the shared tree and return the name it
+ * landed under, or `null` when it stays in the member (logged).
  *
- * A claim reserves a NAME; it says nothing about what is inside it by the time
- * the release runs. `rmdir` already refuses a directory a sibling has written
- * into (`ENOTEMPTY`) — the file half needs the same refusal made explicit, or
- * a sibling writing into the zero-byte claim between the failed move and here
- * loses those bytes. Still a check-then-act, but it declines the reachable
- * case the same way its directory twin does.
+ * `link(2)` is the whole atomicity story. On one filesystem the member's own
+ * inode is linked straight in; across two, a copy is first made at a
+ * pid-private staging name inside the shared tree and THAT is linked. The
+ * source is unlinked only after the link exists, so the content always has at
+ * least one name.
  */
-function releaseClaim(dst: string, isDir: boolean): void {
+function publishFile(
+  src: string,
+  sharedWorkDir: string,
+  name: string,
+  strategy: 'rename' | 'copy',
+  ctx: PublishCtx,
+): string | null {
+  let staging: string | null = null;
   try {
-    if (isDir) {
-      fs.rmdirSync(dst); // ENOTEMPTY if a sibling filled it — their content stays
-    } else if (fs.statSync(dst).size === 0) {
-      fs.unlinkSync(dst);
+    let from = src;
+    if (strategy === 'copy') {
+      staging = path.join(sharedWorkDir, `.${name}.${process.pid}.partial`);
+      fs.rmSync(staging, { force: true }); // ours, by pid: a leftover of this same pid
+      fs.cpSync(src, staging, { verbatimSymlinks: true });
+      from = staging;
     }
-  } catch {
-    /* somebody else's now, or already gone — either way not ours to remove */
+    let landed: string | null = null;
+    for (const candidate of candidateNames(name, ctx)) {
+      const dst = path.join(sharedWorkDir, candidate);
+      try {
+        fs.linkSync(from, dst);
+        landed = candidate;
+        break;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+        // Taken — unless it is this very inode, which an earlier boot linked
+        // and died before unlinking the source. Then only the unlink is left.
+        if (sameInode(from, dst)) {
+          landed = candidate;
+          break;
+        }
+      }
+    }
+    if (landed === null) {
+      warnNoName(name, ctx);
+      return null;
+    }
+    fs.unlinkSync(src);
+    return landed;
+  } catch (err) {
+    log.warn('ensureWorkgroupWorkDirs: could not move entry into the shared tree', { ...ctx, name, err });
+    return null;
+  } finally {
+    // A second name for the published inode, or a copy that never got one.
+    if (staging) fs.rmSync(staging, { force: true });
   }
+}
+
+/**
+ * Publish a directory: claim the name with a non-recursive `mkdir`, then
+ * rename (or copy then rename) over that claim. Returns the name used, or
+ * `null` when the directory stays in the member (logged).
+ *
+ * Directories cannot be hard-linked, so a claim is unavoidable here. It is
+ * safe for a directory in a way it is not for a file: renaming onto a
+ * directory a sibling has written into fails `ENOTEMPTY`, and giving back a
+ * claim is an `rmdir` that fails the same way — the kernel refuses in both
+ * places, so nothing a sibling put there can be replaced or removed.
+ */
+function publishDir(
+  src: string,
+  sharedWorkDir: string,
+  name: string,
+  strategy: 'rename' | 'copy',
+  ctx: PublishCtx,
+): string | null {
+  let dstName: string | null = null;
+  let lastErr: unknown;
+  for (const candidate of candidateNames(name, ctx)) {
+    try {
+      fs.mkdirSync(path.join(sharedWorkDir, candidate)); // non-recursive: EEXIST if taken
+      dstName = candidate;
+      break;
+    } catch (err) {
+      lastErr = err; // EACCES and ENOSPC land here too — don't report them as "taken"
+    }
+  }
+  if (dstName === null) {
+    warnNoName(name, ctx, lastErr);
+    return null;
+  }
+  const dst = path.join(sharedWorkDir, dstName);
+  // The rename CONSUMES the claim. Anything that throws after it — the copy
+  // branch's source removal — must not give the claim back, which would
+  // remove the content just moved.
+  let consumed = false;
+  try {
+    if (strategy === 'rename') {
+      fs.renameSync(src, dst);
+      consumed = true;
+    } else {
+      const staging = path.join(sharedWorkDir, `.${dstName}.${process.pid}.partial`);
+      try {
+        fs.cpSync(src, staging, { recursive: true, verbatimSymlinks: true });
+        fs.renameSync(staging, dst); // ENOTEMPTY if a sibling filled the claim
+        consumed = true;
+      } finally {
+        fs.rmSync(staging, { recursive: true, force: true }); // ours, by pid
+      }
+      fs.rmSync(src, { recursive: true, force: true });
+    }
+    return dstName;
+  } catch (err) {
+    if (!consumed) {
+      try {
+        fs.rmdirSync(dst); // ENOTEMPTY if a sibling filled it — their content stays
+      } catch {
+        /* somebody else's now, or already gone — either way not ours to remove */
+      }
+    }
+    log.warn('ensureWorkgroupWorkDirs: could not move entry into the shared tree', { ...ctx, name, err });
+    return consumed ? dstName : null;
+  }
+}
+
+function sameInode(a: string, b: string): boolean {
+  const sa = lstatOrNull(a);
+  const sb = lstatOrNull(b);
+  return !!sa && !!sb && sa.dev === sb.dev && sa.ino === sb.ino;
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
