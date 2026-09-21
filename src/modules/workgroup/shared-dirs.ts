@@ -24,8 +24,7 @@
  * resolves correctly inside the container via the mount, so
  * existing `/workspace/agent/<name>` reader paths keep working with no repoint.
  */
-import { createHash } from 'crypto';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -1092,8 +1091,13 @@ function newHoldPath(dir: string, name: string): string {
  *    — ours goes to `<name>.from-<member>`. Cross-device, where `link(2)`
  *    cannot reach, the held bytes are copied to a staging name in the shared
  *    tree and that copy is linked.
- * 3. **Remove the hold**, which by then is a second name for a published
- *    inode.
+ * 3. **Remove the hold.** By then it is a second name for a published inode —
+ *    but the removal is by PATH, and once step 1 has run the hold is an
+ *    ordinary visible entry in the member's live folder. A member writing
+ *    there in the microseconds before this `rmSync` loses those bytes. POSIX
+ *    has no unlink-by-inode, so the window cannot be closed; the hold's name
+ *    is unguessable in ADVANCE, which is what step 1 needs, and merely obscure
+ *    afterwards.
  *
  * A death between 1 and 3 leaves the hold in the member folder. `HELD_NAME`
  * matches it on the next boot, which resumes at step 2 (`heldAlready`), so no
@@ -1148,7 +1152,7 @@ function publishFile(
       releaseHold(held, name, ctx);
       return null;
     }
-    fs.rmSync(held, { force: true }); // a second name for the published inode
+    fs.rmSync(held, { force: true }); // by path: see step 3 on the window this leaves
     return landed;
   } catch (err) {
     log.warn('ensureWorkgroupWorkDirs: could not move entry into the shared tree', { ...ctx, name, err });
@@ -1179,7 +1183,7 @@ function releaseHold(held: string, name: string, ctx: PublishCtx): void {
   const real = path.join(path.dirname(held), name);
   try {
     fs.linkSync(held, real); // EEXIST if the member wrote a new one
-    fs.rmSync(held, { force: true }); // a second name for the same inode
+    fs.rmSync(held, { force: true }); // by path: see step 3 on the window this leaves
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'EEXIST') return; // theirs; resumed next boot
     log.warn('ensureWorkgroupWorkDirs: left an unfinished hold in the member folder', { ...ctx, name, err });

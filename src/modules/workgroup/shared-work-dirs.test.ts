@@ -1,3 +1,4 @@
+import * as crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -13,6 +14,13 @@ import {
   SHARED_WORK_DIR_NAME,
   workgroupSharedDir,
 } from './shared-dirs.js';
+
+// Passthrough, so a test can assert the hold name comes from the CSPRNG and
+// not from anything an observer could reproduce.
+vi.mock('crypto', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('crypto')>();
+  return { ...actual, randomBytes: vi.fn(actual.randomBytes) };
+});
 
 vi.mock('../../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
@@ -491,6 +499,14 @@ describe('ensureWorkgroupWorkDirs', () => {
     expect(held).toHaveLength(1);
     expect(held[0]).not.toBe('.report.md.publishing'); // not derivable from the entry name
     expect(held[0]).toMatch(/^\.report\.md\.[0-9a-f]{12}\.publishing$/);
+    // Shape and per-call uniqueness are not the property: a counter has both
+    // and resets every boot, so it is fully forgeable. The segment has to come
+    // from the CSPRNG, with enough bits that it cannot be guessed in the
+    // microseconds before the rename.
+    const randomCalls = vi.mocked(crypto.randomBytes).mock.calls;
+    expect(randomCalls.length).toBeGreaterThan(0);
+    expect(Math.min(...randomCalls.map((c) => Number(c[0])))).toBeGreaterThanOrEqual(6);
+    expect(held[0]).toContain((vi.mocked(crypto.randomBytes).mock.results.at(-1)?.value as Buffer).toString('hex'));
     expect(fs.readFileSync(path.join(own, held[0]), 'utf8')).toBe('MEMBER BYTES');
 
     // The member writes the name again and a second boot also fails. A
