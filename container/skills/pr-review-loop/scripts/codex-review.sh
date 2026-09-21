@@ -1680,10 +1680,10 @@ legacy_precheck() {
 #     require_extra_approval_for_unattributed_changes with a commit whose
 #     author maps to no GitHub account. Both are fail-closed rather than
 #     counted, because `reviewDecision` is NOT a substitute for reading them.
-#     Measured, not assumed: Illysium-ai/XZO ruleset 21204871 is `active` on
+#     Measured, not assumed: a production repository has an `active` ruleset on
 #     the default branch with `require_extra_approval_for_unattributed_changes:
-#     true`, and XZO PR #1965 — open, based on that branch, three commits with
-#     no GitHub-attributed author — reports `reviewDecision: null`. So
+#     true`, and an open PR based on that branch has three commits with
+#     no GitHub-attributed author but reports `reviewDecision: null`. So
 #     reviewDecision does not surface that rule's review parameters, and the
 #     sibling parameter in the same rule object cannot be assumed to fare
 #     better. Neither refuses anything on this fleet today

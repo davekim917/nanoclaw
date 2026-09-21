@@ -739,13 +739,13 @@ describe('remove --delete-secret refuses when the bearer is declared elsewhere (
   it('refuses when any other workgroup declares it, and names every one of them', async () => {
     const secretName = await connected();
     workgroupDeclaring('main', [secretName]);
-    workgroupDeclaring('illysium', [secretName], false);
+    workgroupDeclaring('other-team', [secretName], false);
 
     const err = await removeIntegration('example-int', { deleteSecret: true }).catch((e: Error) => e);
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).toContain('2 other place(s) this command cannot edit');
     expect((err as Error).message).toContain('workgroup main (workgroups.onecli_secrets)');
-    expect((err as Error).message).toContain('workgroup illysium (workgroups.onecli_secrets)');
+    expect((err as Error).message).toContain('workgroup other-team (workgroups.onecli_secrets)');
     // The message has to be actionable, not just a refusal.
     expect((err as Error).message).toContain('scripts/set-workgroup-secrets.ts main');
     expect((err as Error).message).toContain('ncl integrations remove --name example-int');
