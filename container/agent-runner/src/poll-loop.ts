@@ -63,6 +63,7 @@ import {
 } from './modules/mailbox/index.js';
 import { clearBatchAnchors, getBatchAnchor, setCurrentBatchAnchors } from './current-batch.js';
 import { modelBelongsToProvider } from './providers/model-vocabulary.js';
+import { formatLocalTime, TIMEZONE } from './timezone.js';
 import { formatCredentialRotationNotice } from './credential-rotation-notice.js';
 import {
   formatMessages,
@@ -213,7 +214,7 @@ function generateId(): string {
 
 type ProviderErrorEvent = Extract<ProviderEvent, { type: 'error' }>;
 
-class ProviderEventError extends Error {
+export class ProviderEventError extends Error {
   readonly retryable: boolean;
   readonly classification: string | undefined;
 
@@ -741,6 +742,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         config.providerName,
         config.providerFallbackActive === true,
         routing,
+        flagBatch.ignoredModelWasExplicit === true,
       );
     const effectiveModel = flagBatch.model;
     const effectiveEffort = flagBatch.effort;
@@ -1392,15 +1394,97 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }
       }
 
+      // Model-scoped quota recovery: the PIN is spent, not the provider.
+      //
+      // A provider account's quota is not one pool. Measured live
+      // 2026-09-21 22:35Z: a group pinned to `claude-fable-5-1[1m]` was
+      // rejected on window `seven_day_overage_included` across all four
+      // OAuth slots, the credential ring above was declared spent, and the
+      // host rerouted the session to the codex fallback — while two SIBLING
+      // sessions of the SAME agent group ran `claude-opus-5[1m]` to
+      // completion at 22:35:25Z and 22:37:57Z (`turn_usage`). The ordinary
+      // `seven_day` window was at 0.92 and still serving. Only the pinned
+      // tier was out.
+      //
+      // The rotation above replays the SAME model on every credential
+      // (`model: effectiveModel`), so a model-scoped window rejects every
+      // slot in the ring and looks exactly like a dead account. Dropping the
+      // pin re-queries on the group's configured model, because `undefined`
+      // means "no per-turn override" and each provider then resolves its own
+      // default (claude: NANOCLAW_CLAUDE_MODEL; codex and opencode: their own
+      // config surfaces). That is why this is NOT gated on providerName — a
+      // codex group pinned to a limited `gpt-*` model reaches it the same way
+      // before falling back to claude.
+      //
+      // Deliberately ONE attempt on ONE credential, not a second ring pass:
+      // if the group's own default model is also rejected here, the account
+      // really is spent and the provider report below is correct. The cost of
+      // being wrong in that direction is one request.
+      const quotaExhausted = config.provider.isQuotaExhausted?.(err) ?? isProviderQuotaExhausted(err);
+      if (!recovered && repositoryRecoveryAllowed() && quotaExhausted && effectiveModel !== undefined) {
+        log(`Quota rejection while pinned to ${effectiveModel} — retrying once on the group's default model`);
+        let retryQuery: AgentQuery | undefined;
+        try {
+          retryQuery = config.provider.query({
+            prompt,
+            attachments: batchAttachments,
+            continuation,
+            cwd: config.cwd,
+            systemContext: config.systemContext,
+            model: undefined,
+            effort: effectiveEffort,
+            ultracode: effectiveUltracode,
+            fast: effectiveFast,
+          });
+          const retryResult = await processQuery(
+            retryQuery,
+            routing,
+            processingIds,
+            config.providerName,
+            config.provider.onExchangeComplete?.bind(config.provider),
+            prompt,
+            continuation,
+            { model: undefined, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
+            runnerId,
+            undefined,
+            suppressContinuationUntilRealInbound,
+            trigger,
+            reportTaskOutcome,
+            processQueryFallbackOptions,
+          );
+          mergeTaskTurns(retryResult.taskTurns);
+          if (retryResult.continuation && retryResult.continuation !== continuation) {
+            continuation = retryResult.continuation;
+            setContinuation(config.providerName, continuation);
+          }
+          recovered = true;
+          // Clear the pin only when it was STICKY. A one-off `-m` on this
+          // message has nothing to clear, and clearing then would silently
+          // retire a pin the user never stored. Clearing a sticky one is what
+          // keeps the next turn of this session off the spent tier instead of
+          // paying this recovery again on every message until the window
+          // resets.
+          const stickyWasPinned = getStickyModel() === effectiveModel;
+          if (stickyWasPinned) clearStickyModel();
+          await noteModelQuotaFallback(effectiveModel, stickyWasPinned, err, routing);
+        } catch (retryErr) {
+          retryQuery?.abort();
+          log(
+            `Retry on the group's default model also failed: ` +
+              `${retryErr instanceof Error ? retryErr.message : String(retryErr)}`,
+          );
+        }
+      }
+
       // A spent provider account is not a turn failure the user can act on.
       // When a fallback is declared, report it and stay silent: the host
       // respawns this session on the fallback and the requeued message is
       // answered there, so the conversation shows a slow reply rather than
       // an error the reader can do nothing about.
-      // Ask the provider first — it knows its own error vocabulary and
-      // surfaces quota in more than one shape. Fall back to the classified
-      // event form for providers that don't implement the hook.
-      const quotaExhausted = config.provider.isQuotaExhausted?.(err) ?? isProviderQuotaExhausted(err);
+      // `quotaExhausted` is computed above, at the model-drop retry — the
+      // provider is asked first there (it knows its own error vocabulary and
+      // surfaces quota in more than one shape), with the classified event
+      // form as the fallback for providers that don't implement the hook.
       // Any failure the in-turn recovery could not fix means this provider is
       // not currently usable for this group — a spent account, a wedged
       // app-server, a dead credential. Record it either way so the next spawn
@@ -2111,6 +2195,7 @@ export async function processQuery(
             providerName,
             options.providerFallbackActive === true,
             extractRouting(keep),
+            fb.ignoredModelWasExplicit === true,
           );
           // Re-check after the await, as `applySettings` below does before
           // claiming: the stream can end during this yield, and rows marked
@@ -3531,7 +3616,19 @@ export function applyFlagBatch(
   _routing: RoutingContext,
   providerName: string,
   options: { ignoreTaskFlagIntents?: boolean } = {},
-): { model?: string; effort?: string; ultracode?: boolean; fast: boolean; ignoredModel?: string } {
+): {
+  model?: string;
+  effort?: string;
+  ultracode?: boolean;
+  fast: boolean;
+  ignoredModel?: string;
+  /**
+   * The ignored pin came from an `-m` typed in THIS batch, not from a sticky
+   * stored before the outage. Only a fresh one is an operator asking for the
+   * primary provider back; a leftover sticky would ask on every single turn.
+   */
+  ignoredModelWasExplicit?: boolean;
+} {
   let intent: FlagIntent | undefined;
   for (const m of messages) {
     // Tasks carry flagIntent the same way chat messages do — used by scheduled
@@ -3593,6 +3690,11 @@ export function applyFlagBatch(
   const model =
     requestedModel !== undefined && !modelBelongsToProvider(requestedModel, providerName) ? undefined : requestedModel;
   const ignoredModel = model === requestedModel ? undefined : requestedModel;
+  // `turnModel`/`stickyModel` are only set when this batch actually carried a
+  // `-m`; `getStickyModel()` above reads the stored one, which is not a fresh
+  // request for anything.
+  const ignoredModelWasExplicit =
+    ignoredModel !== undefined && (intent?.turnModel !== undefined || intent?.stickyModel !== undefined);
   // Effort here is USER INTENT ONLY (turn flag → sticky flag). Defaults are
   // provider business: the claude provider resolves the operator override
   // (NANOCLAW_EFFORT_OVERRIDE) and per-model-family defaults itself, because
@@ -3605,7 +3707,42 @@ export function applyFlagBatch(
   // perturb a Claude/OpenCode query or trigger a false mid-turn restart there.
   const fast = providerName === 'codex' ? (intent?.turnFast ?? getStickyFast() ?? false) : false;
 
-  return { model, effort, ultracode, fast, ...(ignoredModel !== undefined ? { ignoredModel } : {}) };
+  return {
+    model,
+    effort,
+    ultracode,
+    fast,
+    ...(ignoredModel !== undefined ? { ignoredModel, ignoredModelWasExplicit } : {}),
+  };
+}
+
+/**
+ * Ask the host to end this group's provider-fallback window early.
+ *
+ * The container cannot route itself: the provider is chosen at spawn, from
+ * `provider_health`, which only the host writes. This is the mirror of
+ * `reportProviderUnavailable` — that one records an outage, this one says the
+ * operator wants the primary tried anyway — and it is deliberately the weaker
+ * of the two: it only CLEARS a window, and only for the reporting session's
+ * own agent group.
+ *
+ * Worst case if the primary really is still spent: one failing turn, which
+ * re-records the window and puts the session straight back on the fallback.
+ * That is the honest answer to an explicit request, and it is bounded —
+ * only a freshly typed `-m` reaches here.
+ */
+async function requestPrimaryProviderRetry(requestedModel: string): Promise<void> {
+  try {
+    await writeMessageOut({
+      id: generateId(),
+      kind: 'system',
+      content: JSON.stringify({ action: 'provider_retry_primary', requestedModel: requestedModel.slice(0, 200) }),
+    });
+  } catch (err) {
+    // Best-effort, exactly like the outage report: a failed write must not
+    // swallow the chat line that tells the user what happened.
+    log(`Failed to request a primary-provider retry: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 /**
@@ -3623,12 +3760,66 @@ export async function noteIgnoredModel(
   providerName: string,
   fallbackActive: boolean,
   routing: RoutingContext,
+  explicit = false,
 ): Promise<void> {
+  // A `-m` TYPED NOW, while the session is serving from a fallback, is an
+  // operator asking for the primary provider back — the router already
+  // validated it against the PRIMARY's vocabulary before it reached the DB
+  // (src/router.ts `parseMessageFlags`), which is exactly why it reads as
+  // "not a ${providerName} model" here. Before this, that request had no
+  // effect at all: the pin was dropped and the user was told to wait out a
+  // window they cannot see. Ask the host to reopen the primary instead.
+  //
+  // Gated on `explicit` because the same ignore fires for a sticky stored
+  // BEFORE the outage, which would otherwise ask on every turn and hold the
+  // group in a re-probe loop for the whole window.
+  const requestingPrimary = fallbackActive && explicit;
+  if (requestingPrimary) await requestPrimaryProviderRetry(model);
   const text =
     `⚙️ model pin ${model} is not a ${providerName} model — ignored while this session runs on ${providerName}; ` +
-    (fallbackActive
-      ? `it applies again when the primary provider is back.`
-      : `set a ${providerName} model with -m <model>, or clear the pin with -m.`);
+    (requestingPrimary
+      ? `asking the host to return this session to its primary provider now.`
+      : fallbackActive
+        ? `it applies again when the primary provider is back.`
+        : `set a ${providerName} model with -m <model>, or clear the pin with -m.`);
+  log(text);
+  if (!shouldPostInfraWarning(text)) return;
+  await writeMessageOut({
+    id: generateId(),
+    kind: 'chat',
+    platform_id: routing.platformId,
+    channel_type: routing.channelType,
+    thread_id: routing.threadId,
+    content: JSON.stringify({ text }),
+  });
+}
+
+/**
+ * One chat line when a model-scoped quota rejection was recovered by dropping
+ * the pin and re-running the turn on the group's configured model.
+ *
+ * Said out loud rather than swallowed, because the turn the user reads was
+ * answered by a DIFFERENT model than the one they pinned, and nothing else in
+ * the transcript would say so. `cleared` distinguishes the two outcomes the
+ * next turn depends on: a sticky pin is retired (re-pin when the window
+ * resets), a one-off `-m` never persisted and needs no action.
+ *
+ * `resetAt` is the provider's own stated recovery instant when it gave one
+ * (ProviderEvent error `resetAt`) — rendered in the install timezone like
+ * every other agent-facing time (`formatLocalTime`), never raw ISO.
+ */
+export async function noteModelQuotaFallback(
+  pinnedModel: string,
+  cleared: boolean,
+  err: unknown,
+  routing: RoutingContext,
+): Promise<void> {
+  const resetAt = err instanceof ProviderEventError ? (err.event.resetAt ?? null) : null;
+  const when = resetAt ? ` Its window resets ${formatLocalTime(resetAt, TIMEZONE)}.` : '';
+  const text =
+    `⚙️ ${pinnedModel} is out of quota — ran this turn on the group's default model instead.` +
+    when +
+    (cleared ? ` The pin is cleared; re-pin with \`-m ${pinnedModel}\` when you want it back.` : '');
   log(text);
   if (!shouldPostInfraWarning(text)) return;
   await writeMessageOut({
@@ -3685,7 +3876,14 @@ function effectiveTurnSettings(
   routing: RoutingContext,
   providerName: string,
   ignoreTaskFlagIntents = false,
-): { model?: string; effort?: string; ultracode?: boolean; fast: boolean; ignoredModel?: string } {
+): {
+  model?: string;
+  effort?: string;
+  ultracode?: boolean;
+  fast: boolean;
+  ignoredModel?: string;
+  ignoredModelWasExplicit?: boolean;
+} {
   const flagBatch = applyFlagBatch(messages, routing, providerName, { ignoreTaskFlagIntents });
   const task = taskWakeIntent(messages, ignoreTaskFlagIntents);
   if (!task.isPureTaskWake) return flagBatch;
