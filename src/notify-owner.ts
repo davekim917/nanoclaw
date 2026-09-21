@@ -63,8 +63,8 @@ import { formatLocalStamp, isValidTimezone } from './timezone.js';
  * repo root), so the two `'..'` segments resolve to the repo root the same
  * way regardless of which of the two this file lives in.
  */
-const INSTALL_ROOT = path.resolve(fileURLToPath(import.meta.url), '..', '..');
-const OWNER_DB_PATH = path.join(INSTALL_ROOT, 'data', 'v2.db');
+export const INSTALL_ROOT = path.resolve(fileURLToPath(import.meta.url), '..', '..');
+export const OWNER_DB_PATH = path.join(INSTALL_ROOT, 'data', 'v2.db');
 
 export interface OwnerDm {
   platformId: string;

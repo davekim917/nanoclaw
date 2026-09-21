@@ -158,16 +158,22 @@ describe('src/notify-owner.ts', () => {
     const cwd = process.cwd();
     try {
       process.chdir(elsewhere);
-      const { notifyOwner: fresh } = await import('./notify-owner.js');
-      // No dbPath/rootDir. The defaults must name THIS checkout's central DB,
-      // never the directory we happen to be standing in. Asserting against
-      // `elsewhere` rather than os.tmpdir() matters because the checkout
-      // itself can live under /tmp (gate worktrees do), which made the
-      // cruder assertion fail for the wrong reason.
-      const result = await fresh({ title: 'T', body: 'B' });
-      expect(result.code).toBe(2); // no owner row / no DB under test
-      expect(result.message).toContain(path.join(installRoot, 'data', 'v2.db'));
-      expect(result.message).not.toContain(elsewhere);
+      // Assert the DEFAULTS themselves, not the result of running with them.
+      // Calling notifyOwner() with no dbPath used to be the oracle here, and
+      // it was not hermetic: it reads `<install>/data/v2.db`, which does not
+      // exist in a fresh CI clone (giving the expected code 2) but DOES exist
+      // in a working install — where the call resolved a real owner DM and
+      // DELIVERED the fixture alert to it, then failed on `code` being 0.
+      // The guarantee under test is that the defaults come from this module's
+      // own location rather than process.cwd(); the exported constants carry
+      // that, and reading them sends nothing. Asserting against `elsewhere`
+      // rather than os.tmpdir() matters because the checkout itself can live
+      // under /tmp (gate worktrees do), which made a cruder assertion fail for
+      // the wrong reason.
+      const fresh = await import('./notify-owner.js');
+      expect(fresh.OWNER_DB_PATH).toBe(path.join(installRoot, 'data', 'v2.db'));
+      expect(fresh.INSTALL_ROOT).toBe(installRoot);
+      expect(fresh.OWNER_DB_PATH).not.toContain(elsewhere);
     } finally {
       process.chdir(cwd);
       fs.rmSync(elsewhere, { recursive: true, force: true });
