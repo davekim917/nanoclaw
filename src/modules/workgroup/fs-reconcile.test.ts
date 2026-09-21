@@ -39,10 +39,13 @@ vi.mock('../../log.js', () => ({
 // steps iterate it; the first case that seeds a workgroup row would run the
 // real consolidation and the real prune against the install, moving files and
 // deleting compat links. That is safety by emptiness, so pin it structurally.
-// Paths only — `vi.hoisted` runs before this file's imports, so nothing here
-// may touch `fs`/`os`/`path`. The directories are created in `beforeEach`.
+// `vi.hoisted` runs before this file's own imports, so nothing here may use
+// `fs`/`os`/`path` — but `globalThis.uniqueTmpRoot` (src/test-setup.ts:39) is
+// available, because setupFiles run before the test module is evaluated. It
+// also registers the root for `afterAll` cleanup, so a crashed run does not
+// leak it. The directories themselves are created in `beforeEach`.
 const { TEST_DIRS } = vi.hoisted(() => {
-  const base = `${process.env.TMPDIR ?? '/tmp'}/test-reconcile-${process.pid}-${Math.random().toString(16).slice(2)}`;
+  const base = globalThis.uniqueTmpRoot('fs-reconcile');
   return { TEST_DIRS: { groups: `${base}/groups`, data: `${base}/data`, base } };
 });
 
