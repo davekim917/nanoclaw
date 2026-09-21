@@ -46,10 +46,10 @@ front of a headless Codex worker, or a Codex wrapper in front of a Claude worker
 
 | Role | Default runtime | Responsibility |
 |---|---|---|
-| Coordinator outer agent | Claude Sonnet 5, xhigh effort | Routes inputs, holds the run's gate authority, and publishes the retained owner's one consolidated verdict after the evidence barrier. |
-| Challenger outer agent | GPT-5.6 Terra, xhigh effort | Routes an independent assignment, checks the disposition barrier, and publishes its owner's one challenge reply. |
-| Retained `qa-smoke-worker` on Claude | Claude Fable 5.1, medium effort | Owns its assigned side's investigation, coverage, execution, findings, severity, and preliminary/disposition/synthesis. |
-| Retained `qa-smoke-worker` on Codex | GPT-6 Astra, medium effort | Owns the same responsibilities in a separate provider-native context. |
+| Coordinator outer agent | Actual configured primary/fallback | Routes inputs, holds the run's gate authority, and publishes the retained owner's one consolidated verdict after the evidence barrier. |
+| Challenger outer agent | Actual configured primary/fallback | Routes an independent assignment, checks the disposition barrier, and publishes its owner's one challenge reply. |
+| Retained `qa-smoke-worker` on Claude | Installed qualified Claude profile and runtime effort | Owns its assigned side's investigation, coverage, execution, findings, severity, and preliminary/disposition/synthesis. |
+| Retained `qa-smoke-worker` on Codex | Installed qualified Codex profile and runtime effort | Owns the same responsibilities in a separate provider-native context. |
 
 The same role name resolves to its provider-native definition. Use one retained
 technical owner per side and cohesive assignment; owners execute tools directly
@@ -63,22 +63,21 @@ rules. They do not send chat, file issues, mutate labels or finish the gate.
 The coordinator never launches the other provider through a wrapper; ask the
 paired challenger for the independent cross-family pass instead.
 
-**Dispatch and effort are runtime settings.** Start the owner with the installed
-native QA profile, or with a scoped CLI invocation of the provider when an
-explicit effort or an exact-session resume is needed. Give a CLI-started owner
-the full installed QA role body, this skill, standing instructions, exact scope
-and authority in its stdin brief; nothing selects the QA role for you.
-Use `CLAUDE_CODE_EFFORT_LEVEL=medium claude -p --model 'claude-fable-5-1[1m]' --effort medium`
-or `codex exec -m gpt-6-astra -c model_reasoning_effort=medium`, run from the
-actual working directory. An explicit effort change repeats the flag on the
-same CLI session's resume, or uses a verified supported native runtime field.
-Claude's native Agent tool has no per-call effort input; use the installed
-medium profile or a child-scoped `CLAUDE_CODE_EFFORT_LEVEL`. Do not set a
-fleet-wide environment override, describe effort only in prose, or silently
-switch models. A scoped CLI invocation adds no permission bypass.
+**Dispatch and effort are runtime settings.** Use the actual active provider's
+installed qualified native QA profile; its model/effort settings govern, not a
+model name or default written in this generic skill. Preserve configured
+primary/fallback and task pins. An explicit user override uses supported native
+settings and is recorded; prose is not an effort override. A new bounded Codex
+owner sets `fork_turns: "none"` with a self-contained brief: full applicable QA
+role and standing constraints, frozen scope/authority, evidence, acceptance
+criteria and write ownership. Reuse its same native handle for all substantive
+steps. Missing profile/unsupported dispatch is visible owned recovery, not
+permission to run judgment on the coordinator or wrap the opposite provider.
+Existing explicitly authorized CLI-owned sessions retain their own exact
+transport/session requirements; switching to one is not a native-child resume.
 
 Record default, requested and actual model/effort separately in the existing
-run record, plus transport, parent session, runtime home, owner handle, and
+run record, plus transport, original parent session, owner handle, and
 assigned scope. Mark unavailable runtime metadata unverified. Retain the same
 owner for corrections and remaining work. Native handles resume only through
 the spawning parent; a CLI session resumes only on its own session UUID with
@@ -93,6 +92,8 @@ record: old owner, why resume is unavailable, preserved preliminary/evidence,
 and exact remaining work. Start one replacement frontier owner for that
 remainder; do not restart completed lanes or pretend its inherited evidence is
 new. A failed resume is not authority to silently replay or switch transports.
+A recovered root or matching runtime-home path alone never proves same-child
+continuity; verify a successful same-child resume or mark it unavailable.
 Other owner replacements require the same explicit, evidence-backed recovery
 decision and the existing run-ownership rules. No parallel duplicate owner.
 
@@ -277,8 +278,10 @@ bash /app/skills/smoke-test/scripts/smoke-evidence-barrier.sh <run-dir> disposit
 
 `ready:true` means both conclusions are durable — the challenger's own, and the
 coordinator's preliminary — so the post can no longer contaminate a conclusion
-that does not exist yet. Anything else names what is missing; wait and re-ask,
-do not post. The gate deliberately does NOT require the coordinator's lane
+that does not exist yet. Anything else names what is missing; preserve the owner
+and checkpoint, then use the existing controller/watcher observation or
+bounded deadline. Do not keep a technical owner polling an unchanged barrier,
+and do not post. The gate deliberately does NOT require the coordinator's lane
 markers: the challenger must never queue behind the lanes it exists to
 challenge.
 
@@ -975,8 +978,8 @@ never collapse the required lanes or their evidence to reduce worker count.
 
 ### UI adversary
 
-The challenger's retained frontier owner executes this lane at medium effort
-by default. Use the `agent-browser` skill.
+The challenger's same retained frontier owner executes this lane at its
+installed runtime settings. Use the `agent-browser` skill.
 
 - Start from a clean browser state, then repeat important paths with saved auth.
 - Own the browser authentication lease. If another lane owns it, do not retry
@@ -1187,8 +1190,8 @@ the verdict moves only through a `confirmed` finding's severity. `aggregate
 
 ### Backend and specification verifier
 
-The coordinator's retained frontier owner executes this lane at medium effort
-by default.
+The coordinator's same retained frontier owner executes this lane at its
+installed runtime settings.
 
 - Trace the changed source and its production-relevant call path.
 - **Read the CI check-run result for the frozen SHA before re-running a suite
@@ -1221,8 +1224,8 @@ by default.
 
 ### Acceptance verifier
 
-The coordinator's same retained frontier owner executes this lane at medium
-effort by default. Declare it separately in the contract
+The coordinator's same retained frontier owner executes this lane at its
+installed runtime settings. Declare it separately in the contract
 like any other lane (e.g. `A1:acceptance:'Forecast column dash rendering'`) so
 its marker gates synthesis the same way every other lane's does.
 
@@ -1401,9 +1404,9 @@ candidate -> confirmed | refuted | reclassified | blocked
 confirmed -> planned -> fixed -> deployed -> verified
 ```
 
-For every candidate, have the challenger or one of its independently briefed
-workers try to disprove it using the exact build and reproduction. The
-coordinator performs the same challenge on challenger-originated candidates.
+For every candidate, have the challenger's same independent retained owner
+try to disprove it using the exact build and reproduction. The
+coordinator's retained owner performs the same challenge on challenger-originated candidates.
 Append corrections; never delete the original claim.
 Record:
 
@@ -2582,8 +2585,9 @@ is not implemented by this script; it is a separate, later decision.
 
 ## Cost controls
 
-- One retained frontier owner per QA side, Fable/Astra at medium by default.
-  Sonnet/Terra outer coordinators stay on logistics and gated publication.
+- One retained qualified owner per QA side at its installed model/effort.
+  Outer coordinators stay on logistics and gated publication, whatever their
+  configured primary/fallback model.
   Preserve every required coverage lane and the independent cross-family pair.
 - Resume the same owner for corrections; use a documented remaining-work
   handoff only when the session boundary prevents valid resume.

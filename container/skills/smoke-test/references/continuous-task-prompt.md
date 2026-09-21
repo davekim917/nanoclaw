@@ -12,7 +12,12 @@ the skill; around 8 fits it.
 
 The deterministic pre-task gate has already run. Its JSON is in
 `scriptOutput`. Follow the coordinator's standing instructions and read the
-`/smoke-test` skill before acting.
+`/smoke-test` skill before acting. The outer agent routes/logs/publishes; its one retained
+qualified provider-native owner performs all technical analysis, coverage,
+checks and preliminary/synthesis. New bounded Codex owners use
+`fork_turns: "none"` plus self-contained role/scope/evidence/acceptance context.
+Reuse the same available handle across lanes and corrections; follow the
+standing recorded-recovery rule when continuity is unavailable.
 
 If `scriptOutput.trigger` is not `develop_build_settled`, do not smoke an
 unknown build. Diagnose only the watcher evidence named by the trigger and use
@@ -61,13 +66,13 @@ For `develop_build_settled`:
    Resolve the browser credential location from the group's standing
    instructions and mounts. Do not print or copy its values, search other agent
    folders, or reset the shared account.
-4. Assign non-overlapping manifest checks to the coordinator's native
-   `qa-smoke-worker` workers. For every user-visible changed surface, exercise
+4. Assign all of this side's non-overlapping manifest checks to its same retained
+   `qa-smoke-worker` owner. For every user-visible changed surface, exercise
    a connected real-browser journey against the deployed dev frontend and
    capture screenshots, request evidence, console evidence, save/reload
    persistence, failure/boundary behavior, parity/polish, and cleanup. A
    backend-only result cannot clear a user-visible change.
-   - **Dispatch every worker in the foreground and await it inside this turn.**
+   - **Await the retained owner inside this turn.**
      Never start a background agent and end the turn expecting its notification
      to wake you: background agents live inside the container, and the host
      reaps a scheduled-task container within seconds of the turn going idle, so
@@ -85,7 +90,7 @@ For `develop_build_settled`:
      <qa-run-root>/<runId> lanes
    ```
 
-   Do not continue until it returns `ready:true`. Then write
+   Do not continue until it returns `ready:true`. Then obtain the same owner's
    `coordinator/preliminary.md` before reading the challenger's disposition. Do
    not send another chat message from this scheduled turn. The challenger
    writes its independent `challenger/disposition.md` and

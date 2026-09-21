@@ -751,10 +751,11 @@ OWNER_BRIEF = {
         "completion-contract.json LAST, with the scaffold `contract` command: it is the signal that intake is "
         "done, and the controller posts the root as soon as it exists."),
     "lanes": (
-        "Lanes: dispatch the contract's lane workers in the foreground and await them inside this turn; workers "
-        "write their completion markers only after their evidence is durable. If the lanes cannot finish in "
-        "one turn, call continue_work before yielding. Recheck sourceSha against the PR head before each worker "
-        "starts; if it moved, stop and write the lane markers as void (BLOCKED_BUILD_IDENTITY)."),
+        "Lanes: the same retained qa-smoke-worker executes this side's declared lanes and writes markers only "
+        "after evidence is durable; it does not spawn lane workers. The outer coordinator awaits that owner. "
+        "If the work cannot finish in one turn, checkpoint and call continue_work before yielding; this does "
+        "not prove same-child continuity after replacement. Recheck sourceSha against the PR head before "
+        "each lane; if it moved, stop and write the lane markers as void (BLOCKED_BUILD_IDENTITY)."),
     "preliminary": (
         "Preliminary: write {run}/coordinator/preliminary.md from the lane evidence, before reading anything under "
         "{run}/challenger/."),
