@@ -927,9 +927,10 @@ function ensureOneWorkgroupWorkDir(
  *   into the claim — the kernel's refusal, not a check.
  * - **A taken name is not merged.** It moves to `<name>.from-<member>`, so the
  *   content still becomes shared and neither side loses a byte; taken twice,
- *   the entry stays put. Both `name` (a `readdir` component) and
- *   `ctx.member` (`assertTrustedPathSegment` at the call site) are single safe
- *   segments, so the derived names are too.
+ *   the entry stays put. `name` is either a `readdir` component or the capture
+ *   of `HELD_NAME` from one, with `.` and `..` rejected at the call site, and
+ *   `ctx.member` passed `assertTrustedPathSegment` there — so the derived
+ *   names are single safe segments too.
  * - **The source directory is removed with `rmdirSync`**, which fails
  *   `ENOTEMPTY` rather than recursing. A member whose entries could not all
  *   move keeps its directory and everything in it.
@@ -977,7 +978,12 @@ function consolidateMemberWorkDir(
       // `.<name>.publishing` is this function's own hold from an earlier boot
       // that died mid-publish: the bytes of `<name>`, already moved off their
       // real name. Publish them under the name they were taken from.
-      const leftover = HELD_NAME.exec(entry);
+      const held = HELD_NAME.exec(entry);
+      // `.` and `..` are not names: a member file called `...publishing`
+      // captures one, and the derived path would address the shared tree
+      // itself or its parent. Publish such an entry under its own literal
+      // name instead.
+      const leftover = held && held[1] !== '.' && held[1] !== '..' ? held : null;
       const name = leftover ? leftover[1] : entry;
       const src = path.join(memberWorkDir, entry);
       let srcIsDir: boolean;
@@ -1148,17 +1154,20 @@ function publishFile(
  * Give an unpublished hold its real name back, so the entry is where its agent
  * expects it and the next boot retries from the ordinary path.
  *
- * Only when nothing occupies that name: the member's container is live, and
- * the whole reason the hold exists is that the member may have written a new
- * `<name>` since. That newer file is never replaced — the hold keeps its
- * hidden name and is resumed next boot instead.
+ * `link` then remove, NOT `lstat` then `rename`. The member's container is
+ * live and the whole reason a hold exists is that the member may write a new
+ * `<name>` at any moment; `rename(2)` would replace that file silently, and a
+ * check before it is the same window this function's caller was rewritten to
+ * remove. `EEXIST` from `link` is the kernel refusing instead — the hold then
+ * keeps its hidden name and is resumed on the next boot.
  */
 function releaseHold(held: string, name: string, ctx: PublishCtx): void {
   const real = path.join(path.dirname(held), name);
   try {
-    if (lstatOrNull(real)) return; // the member wrote a new one — never clobber it
-    fs.renameSync(held, real);
+    fs.linkSync(held, real); // EEXIST if the member wrote a new one
+    fs.rmSync(held, { force: true }); // a second name for the same inode
   } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return; // theirs; resumed next boot
     log.warn('ensureWorkgroupWorkDirs: left an unfinished hold in the member folder', { ...ctx, name, err });
   }
 }

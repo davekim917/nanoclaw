@@ -373,6 +373,78 @@ describe('ensureWorkgroupWorkDirs', () => {
     expect(contents).toEqual(['HELD BYTES', 'MEMBER WROTE A NEW ONE']);
   });
 
+  it("giving a hold back never destroys a save the member made in the release's own window", () => {
+    // Round 2. The release is the last place the hold's real name is written,
+    // and the member's container is live. Whatever syscall puts the hold back
+    // must refuse an occupied name in the kernel, not check first: the probe
+    // injects the member's atomic save immediately before that syscall, so a
+    // check-then-act implementation has already decided the name was free.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    const realName = path.join(own, 'report.md');
+    fs.writeFileSync(realName, 'HELD BYTES');
+
+    const shared = sharedWorkDir();
+    let injected = false;
+    const realLink = fs.linkSync;
+    const realRename = fs.renameSync;
+    // The member saves a new version just before the hold is put back.
+    const injectIfRelease = (to: fs.PathLike) => {
+      if (!injected && String(to) === realName) {
+        injected = true;
+        const tmp = path.join(own, '.report.md.swp');
+        fs.writeFileSync(tmp, 'MEMBER NEW EDIT');
+        realRename(tmp, realName);
+      }
+    };
+    const linkSpy = vi.spyOn(fs, 'linkSync').mockImplementation((from, to) => {
+      if (String(to).startsWith(shared)) throw Object.assign(new Error('EIO'), { code: 'EIO' }); // publish fails
+      injectIfRelease(to);
+      return realLink(from, to);
+    });
+    const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (String(from).includes('.publishing')) injectIfRelease(to);
+      return realRename(from, to);
+    });
+    try {
+      run();
+    } finally {
+      linkSpy.mockRestore();
+      renameSpy.mockRestore();
+    }
+
+    expect(injected).toBe(true);
+    const everywhere = fs.readdirSync(own).map((n) => fs.readFileSync(path.join(own, n), 'utf8'));
+    expect(everywhere).toContain('MEMBER NEW EDIT'); // the member's save
+    expect(everywhere).toContain('HELD BYTES'); // and the bytes being published
+  });
+
+  it('never derives a name of `.` or `..` from a member dotfile', () => {
+    // `...publishing` and `....publishing` both match the hold pattern and
+    // capture `.` / `..`, which address the shared tree itself and its parent.
+    markMigrated();
+    run();
+    fs.unlinkSync(linkAt('wgx-codex'));
+    const own = linkAt('wgx-codex');
+    fs.mkdirSync(own);
+    fs.writeFileSync(path.join(own, '...publishing'), 'DOT');
+    fs.writeFileSync(path.join(own, '....publishing'), 'DOTDOT');
+
+    run();
+
+    const shared = sharedWorkDir();
+    const names = fs.readdirSync(shared);
+    expect(names).toContain('...publishing'); // published under its own literal name
+    expect(names).toContain('....publishing');
+    expect(fs.readFileSync(path.join(shared, '...publishing'), 'utf8')).toBe('DOT');
+    expect(fs.readFileSync(path.join(shared, '....publishing'), 'utf8')).toBe('DOTDOT');
+    // Nothing was written to the workgroup root, one level above the shared tree.
+    expect(fs.readdirSync(path.dirname(shared)).filter((n) => n.includes('from-wgx-codex'))).toEqual([]);
+  });
+
   it('resumes a publish a previous boot died in the middle of', () => {
     // The hold is named so the next boot can find it: bytes already taken off
     // their real name must not sit in the member folder forever.
