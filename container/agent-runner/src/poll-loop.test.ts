@@ -4763,3 +4763,158 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(taskLogRows()).toHaveLength(0);
   });
 });
+
+describe('outcome reporting — quiet work and expected replies', () => {
+  beforeEach(() => {
+    process.env.NANOCLAW_OUTCOME_REPORTING = '1';
+  });
+  afterEach(() => {
+    delete process.env.NANOCLAW_OUTCOME_REPORTING;
+  });
+
+  it.each(['claude', 'codex'])(
+    'keeps internal output from clearing reply debt and nudges via the tool once (%s)',
+    async (provider) => {
+      insertMessage('outcome-human', 'chat', { sender: 'Operator', senderId: 'U1', text: 'What changed?' });
+      const pushes: string[] = [];
+      async function* events(): AsyncGenerator<ProviderEvent> {
+        yield { type: 'init', continuation: 'outcome-session' };
+        yield { type: 'result', text: 'I am checking the build.' };
+        yield { type: 'result', text: '<message to="here">More checking.</message>' };
+      }
+      await processQuery(
+        {
+          push: (text) => {
+            pushes.push(text);
+          },
+          end: () => {},
+          abort: () => {},
+          events: events(),
+        },
+        ERR_ROUTING,
+        ['outcome-human'],
+        provider,
+        undefined,
+        'prompt',
+        undefined,
+        {},
+      );
+      expect(pushes).toHaveLength(1);
+      expect(pushes[0]).toContain('send_message');
+      expect(pushes[0]).toContain('purpose="reply"');
+      expect(getUndeliveredMessages().filter((row) => row.kind === 'chat')).toHaveLength(0);
+      expect(getUndeliveredMessages().filter((row) => row.kind === 'work_log')).toHaveLength(2);
+    },
+  );
+
+  it('allows a real human reply and does not add a duplicate final summary', async () => {
+    const { sendMessage } = await import('./mcp-tools/core.js');
+    insertMessage('outcome-human', 'chat', { sender: 'Operator', senderId: 'U1', text: 'Details please' });
+    getInboundDb().exec(
+      'CREATE TABLE IF NOT EXISTS session_routing (id INTEGER PRIMARY KEY,channel_type TEXT,platform_id TEXT,thread_id TEXT)',
+    );
+    getInboundDb()
+      .prepare('INSERT OR REPLACE INTO session_routing VALUES (1,?,?,NULL)')
+      .run(ERR_ROUTING.channelType, ERR_ROUTING.platformId);
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'outcome-session' };
+      await sendMessage.handler({ purpose: 'reply', text: 'Requested detailed explanation. '.repeat(80) });
+      yield { type: 'result', text: 'Short duplicate summary.' };
+    }
+    await processQuery(
+      {
+        push: (text) => {
+          pushes.push(text);
+        },
+        end: () => {},
+        abort: () => {},
+        events: events(),
+      },
+      ERR_ROUTING,
+      ['outcome-human'],
+      'codex',
+      undefined,
+      'prompt',
+      undefined,
+      {},
+    );
+    expect(pushes).toHaveLength(0);
+    expect(getUndeliveredMessages().filter((row) => row.kind === 'chat')).toHaveLength(1);
+    expect(getUndeliveredMessages().filter((row) => row.kind === 'work_log')).toHaveLength(1);
+  });
+
+  it('retains scheduled and interim message attempts durably with their recovery blocks', async () => {
+    for (const blocksOnly of [true, false]) {
+      const result = await dispatchResultText(
+        '<message to="here">Requested decision summary</message>',
+        { ...ERR_ROUTING, taskRun: true },
+        { blocksOnly },
+      );
+      expect(result.sent).toBe(0);
+      expect(result.taskBlocks).toEqual([{ to: 'here', body: 'Requested decision summary' }]);
+    }
+    expect(getUndeliveredMessages().filter((row) => row.kind === 'work_log')).toHaveLength(2);
+  });
+
+  it.each(['missing', 'sent', 'muted', 'narration', 'interim'])(
+    'nudges only unsent explicit task message attempts (%s)',
+    async (mode) => {
+      const { setChatLimit } = await import('./modules/mailbox/index.js');
+      const { writeMessageOut } = await import('./db/messages-out.js');
+      const pushes: string[] = [];
+      const routing = { ...ERR_ROUTING, taskRun: true };
+      const block = '<message to="here">Requested decision summary</message>';
+      async function* events(): AsyncGenerator<ProviderEvent> {
+        yield { type: 'init', continuation: 'task-outcome' };
+        if (mode === 'sent')
+          await writeMessageOut({
+            id: 'already-reported',
+            kind: 'chat',
+            channel_type: routing.channelType,
+            platform_id: routing.platformId,
+            content: JSON.stringify({ text: 'Already sent through explicit tool' }),
+          });
+        if (mode === 'interim') yield { type: 'interim_text', text: block };
+        yield {
+          type: 'result',
+          text: mode === 'interim' ? null : mode === 'narration' ? 'Internal sweep completed.' : block,
+        };
+        yield { type: 'result', text: mode === 'narration' ? 'Still unchanged.' : block };
+      }
+      setChatLimit(mode === 'muted' ? 0 : null);
+      try {
+        await processQuery(
+          {
+            push: (text) => {
+              pushes.push(text);
+            },
+            end: () => {},
+            abort: () => {},
+            events: events(),
+          },
+          routing,
+          [],
+          'codex',
+          undefined,
+          'prompt',
+          undefined,
+          {},
+        );
+        expect(pushes).toHaveLength(mode === 'missing' || mode === 'interim' ? 1 : 0);
+        if (pushes.length) expect(pushes[0]).toContain('purpose="reply"');
+      } finally {
+        setChatLimit(null);
+      }
+    },
+  );
+
+  it('records final narration without treating it as sent', async () => {
+    const result = await dispatchResultText(
+      '<message to="here">I will report when reviews land.</message>',
+      ERR_ROUTING,
+    );
+    expect(result.sent).toBe(0);
+    expect(getUndeliveredMessages()[0].kind).toBe('work_log');
+  });
+});

@@ -1,3 +1,4 @@
+import { outcomeReportingEnabled, OUTCOME_REPLY_NUDGE } from './outcome-reporting.js';
 import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'node:crypto';
@@ -51,6 +52,7 @@ import {
   resetWorkContinuationForRealInbound,
   retainCompleteRecallUnits,
   setChatLimit,
+  chatBudgetExhausted,
   setProviderTurnExecuting,
   setStickyEffort,
   setStickyFast,
@@ -1753,8 +1755,10 @@ export async function processQuery(
   let done = false;
   let unwrappedNudged = false;
   let taskBlockNudged = false;
+  let notificationWatermark = maxOutboundSeq();
   // Complete <message> blocks already delivered from this turn's interim text.
   const deliveredInterimBlocks = new Set<string>();
+  const suppressedInterimTaskBlocks: TaskMessageBlock[] = [];
   // Set when a person's triggering message is admitted: the outbound watermark
   // at that moment and the conversation it came from. Null when no such
   // message is owed a reply. Read at an empty `result`. Decided from the
@@ -2207,6 +2211,7 @@ export async function processQuery(
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;
+        notificationWatermark = maxOutboundSeq();
         // Every new check-in restarts the watermark: a progress message sent
         // for the earlier request is not an answer to this one.
         const pushedDebt = replyDebt(keep, followUpRouting);
@@ -2424,6 +2429,7 @@ export async function processQuery(
         // identical block.
         const interimThisTurn = [...deliveredInterimBlocks];
         deliveredInterimBlocks.clear();
+        const interimTaskBlocks = suppressedInterimTaskBlocks.splice(0);
         // A turn that consumed none of the runner's prompts never answers a
         // task fire: the CLI's synthetic "Continue from where you left off."
         // turn on resuming an interrupted session, or a turn a background-task
@@ -2549,10 +2555,19 @@ export async function processQuery(
           }
           // An agent that posted an update mid-turn often repeats it verbatim in
           // its final text; the person already has it.
-          const { sent, hasUnwrapped, taskBlocks } = await dispatchResultText(event.text, routing, {
+          const {
+            sent,
+            hasUnwrapped,
+            taskBlocks: finalTaskBlocks,
+          } = await dispatchResultText(event.text, routing, {
             alreadyDelivered: new Set(interimThisTurn),
           });
-          const willRetryTaskBlocks = shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
+          const taskBlocks = [...interimTaskBlocks, ...finalTaskBlocks];
+          const willRetryTaskBlocks =
+            shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged) &&
+            (!outcomeReportingEnabled() ||
+              (!chatBudgetExhausted() &&
+                !hasChatOutboundAfter(notificationWatermark, { channelType: null, platformId: null })));
           // With prompt ids a nudge's answer matches no fire, so only the id-less
           // path needs `taskBlockNudged` to keep it out of the next fire's slot.
           if (routing.taskRun && (event.answeredPrompts !== undefined || (!taskBlockNudged && answersRunnerPrompt)))
@@ -2574,12 +2589,23 @@ export async function processQuery(
             });
             pauseAnsweredPrompt();
           } else {
+            const outcomeReplyMissing =
+              outcomeReportingEnabled() &&
+              humanReplyOwed !== null &&
+              answersRunnerPrompt &&
+              !hasChatOutboundAfter(humanReplyOwed.sinceSeq, humanReplyOwed) &&
+              !/^\s*<internal>\s*no reply\s*<\/internal>\s*$/i.test(event.text);
+            const willNudgeOutcomeReply = outcomeReplyMissing && !unwrappedNudged;
             const willRetryWrapping = hasUnwrapped && !unwrappedNudged;
+            if (willNudgeOutcomeReply) {
+              unwrappedNudged = true;
+              pushToQuery(OUTCOME_REPLY_NUDGE);
+            }
             notifyExchangeComplete(onExchangeComplete, {
               prompt: archivePrompts[0]?.prompt ?? initialPrompt,
               result: event.text,
               continuation: queryContinuation ?? initialContinuation,
-              status: hasUnwrapped || willRetryTaskBlocks ? 'undelivered' : 'completed',
+              status: hasUnwrapped || willRetryTaskBlocks || outcomeReplyMissing ? 'undelivered' : 'completed',
             });
             if (willRetryWrapping) {
               unwrappedNudged = true;
@@ -2601,7 +2627,7 @@ export async function processQuery(
             }
             // The wrapping-retry result answers the SAME user prompt — keep it
             // queued so the retry archives against it, not the nudge text.
-            if (!willRetryWrapping && !willRetryTaskBlocks) {
+            if (!willRetryWrapping && !willRetryTaskBlocks && !willNudgeOutcomeReply) {
               completeDeliveredPrompt();
             }
             // Settled when the person's conversation got a row, or the agent
@@ -2611,8 +2637,10 @@ export async function processQuery(
             if (
               humanReplyOwed &&
               !willRetryWrapping &&
+              !willNudgeOutcomeReply &&
               answersRunnerPrompt &&
-              ((sent === 0 && !hasUnwrapped) || hasChatOutboundAfter(humanReplyOwed.sinceSeq, humanReplyOwed))
+              ((sent === 0 && !hasUnwrapped && !outcomeReplyMissing) ||
+                hasChatOutboundAfter(humanReplyOwed.sinceSeq, humanReplyOwed))
             )
               humanReplyOwed = null;
           }
@@ -2636,6 +2664,22 @@ export async function processQuery(
           // answer between tool calls and then ended the turn empty got no
           // nudge at all (2026-09-17, same thread as the mid-turn note).
           // One nudge per batch, shared with the wrapping retry.
+          if (
+            outcomeReportingEnabled() &&
+            shouldNudgeTaskBlocks(routing.taskRun, interimTaskBlocks, taskBlockNudged) &&
+            !chatBudgetExhausted() &&
+            !hasChatOutboundAfter(notificationWatermark, { channelType: null, platformId: null })
+          ) {
+            taskBlockNudged = true;
+            pushToQuery(
+              buildTaskBlockNudge(
+                interimTaskBlocks,
+                getAllDestinations()
+                  .map((d) => d.name)
+                  .join(', '),
+              ),
+            );
+          }
           const replyOwed =
             humanReplyOwed !== null &&
             answersRunnerPrompt &&
@@ -2647,9 +2691,11 @@ export async function processQuery(
               .map((d) => d.name)
               .join(', ');
             pushToQuery(
-              `<system>Your turn ended without delivering anything to the person who wrote to you. Unwrapped text ` +
-                `written between tool calls is not delivered. Reply now in <message to="name">...</message> blocks ` +
-                `(destinations: ${names}), or, if no reply is warranted, answer with <internal>no reply</internal>.</system>`,
+              outcomeReportingEnabled()
+                ? OUTCOME_REPLY_NUDGE
+                : `<system>Your turn ended without delivering anything to the person who wrote to you. Unwrapped text ` +
+                    `written between tool calls is not delivered. Reply now in <message to="name">...</message> blocks ` +
+                    `(destinations: ${names}), or, if no reply is warranted, answer with <internal>no reply</internal>.</system>`,
             );
             // Like the wrapping retry, the nudged result answers the SAME
             // prompt. A continuation at the ledger head still has to be paused.
@@ -2709,7 +2755,10 @@ export async function processQuery(
         }
         pushToQuery(ensureFreshContextBootstrap(reminder));
       } else if (event.type === 'interim_text') {
-        for (const block of await dispatchInterimMessageBlocks(event.text, routing)) deliveredInterimBlocks.add(block);
+        for (const block of await dispatchInterimMessageBlocks(event.text, routing, (blocks) =>
+          suppressedInterimTaskBlocks.push(...blocks),
+        ))
+          deliveredInterimBlocks.add(block);
       } else if (event.type === 'file') {
         await dispatchFileAttachment(event, routing);
       }
@@ -2827,7 +2876,10 @@ export async function handleEvent(event: ProviderEvent, routing: RoutingContext)
         platform_id: routing.platformId,
         channel_type: routing.channelType,
         thread_id: routing.threadId,
-        content: JSON.stringify({ text: event.message }),
+        content: JSON.stringify({
+          text: event.message,
+          ...(outcomeReportingEnabled() ? { reporting: { version: 1, purpose: 'progress' } } : {}),
+        }),
       });
       break;
     case 'file':
@@ -2978,8 +3030,12 @@ const CODE_SPAN_RE = /```[\s\S]*?```|`[^`\n]*`/g;
  * very tool call that follows this text. Task runs never deliver blocks
  * (RoutingContext.taskRun), so nothing is attempted there.
  */
-export async function dispatchInterimMessageBlocks(text: string, routing: RoutingContext): Promise<string[]> {
-  if (routing.taskRun) return [];
+export async function dispatchInterimMessageBlocks(
+  text: string,
+  routing: RoutingContext,
+  onSuppressedTaskBlocks?: (blocks: TaskMessageBlock[]) => void,
+): Promise<string[]> {
+  if (routing.taskRun && !outcomeReportingEnabled()) return [];
   const delivered: string[] = [];
   // Mask, never delete: code spans are blanked to equal-length spaces only to
   // decide WHERE blocks are, and each block is then cut from the original
@@ -2990,7 +3046,8 @@ export async function dispatchInterimMessageBlocks(text: string, routing: Routin
   const masked = text.replace(CODE_SPAN_RE, (span) => ' '.repeat(span.length));
   for (const m of masked.matchAll(COMPLETE_MESSAGE_BLOCK_RE)) {
     const block = text.slice(m.index, m.index + m[0].length);
-    const { sent } = await dispatchResultText(block, routing, { blocksOnly: true });
+    const { sent, taskBlocks } = await dispatchResultText(block, routing, { blocksOnly: true });
+    if (taskBlocks.length) onSuppressedTaskBlocks?.(taskBlocks);
     if (sent > 0) delivered.push(block);
   }
   if (delivered.length > 0) log(`Interim text: ${delivered.length} <message> block(s) delivered before a tool call`);
@@ -3042,6 +3099,33 @@ export async function dispatchResultText(
   let m: RegExpExecArray | null;
   while ((m = MESSAGE_OPENER_RE.exec(text)) !== null) {
     openers.push({ index: m.index, endIndex: MESSAGE_OPENER_RE.lastIndex, toName: m[1] });
+  }
+
+  if (outcomeReportingEnabled()) {
+    // Keep every suppressed block durable, including task and mid-turn output.
+    if (text.trim())
+      await writeMessageOut({
+        id: generateId(),
+        kind: 'work_log',
+        in_reply_to: routing.inReplyTo,
+        platform_id: routing.platformId,
+        channel_type: routing.channelType,
+        thread_id: routing.threadId,
+        content: JSON.stringify({ text }),
+      });
+    const taskBlocks = routing.taskRun
+      ? openers
+          .map((opener, i) => {
+            const next = openers[i + 1]?.index ?? text.length;
+            const close = text.indexOf(MESSAGE_CLOSER, opener.endIndex);
+            return {
+              to: opener.toName,
+              body: text.slice(opener.endIndex, close !== -1 && close <= next ? close : next).trim(),
+            };
+          })
+          .filter((block) => block.to && block.body)
+      : [];
+    return { sent: 0, hasUnwrapped: false, taskBlocks };
   }
 
   let sent = 0;
@@ -3220,6 +3304,9 @@ export function buildTaskBlockNudge(taskBlocks: TaskMessageBlock[], destinationN
     `${blocks}\n` +
     'If and only if any of it still needs to be sent, call send_message with an explicit to destination. ' +
     'If it was already sent or no notification is required, do not send it again. ' +
+    (outcomeReportingEnabled()
+      ? 'Use purpose="reply" for a requested answer or purpose="outcome" with its canonical item and evidence only when the original work item finishes. Routine progress stays internal; preserve required approval routes. '
+      : '') +
     `Your destinations: ${escapePromptXml(destinationNames)}. ` +
     'The original task result is already recorded in the run log; do not repeat it.</system>'
   );

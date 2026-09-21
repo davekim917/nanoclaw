@@ -715,6 +715,10 @@ export type { ExcludedPlugins } from './plugin-exclusions.js';
 
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
+  /** Opt-in per-work-item reporting. Activated only in freshly spawned runners. */
+  outcomeReporting?: boolean;
+  /** Physical channel addresses whose routine outcomes belong to an existing external reporter. */
+  outcomeReportingExternalChannels?: string[];
   /** Host-enrolled wiki actors fail closed if their private policy is absent. */
   wikiMaintenance?: boolean;
   mcpServers: Record<string, McpServerConfig>;
@@ -1316,6 +1320,10 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
 
   return {
     wikiMaintenance: raw.wikiMaintenance,
+    outcomeReporting: raw.outcomeReporting === true,
+    outcomeReportingExternalChannels: Array.isArray(raw.outcomeReportingExternalChannels)
+      ? raw.outcomeReportingExternalChannels.filter((value): value is string => typeof value === 'string')
+      : [],
     mcpServers: validateMcpServers(raw.mcpServers ?? {}),
     packages: {
       apt: raw.packages?.apt ?? [],

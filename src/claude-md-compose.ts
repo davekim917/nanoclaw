@@ -27,6 +27,7 @@
  * sources are documented inline above.
  */
 import fs from 'fs';
+import { OUTCOME_REPORTING_INSTRUCTIONS } from './outcome-reporting-instructions.js';
 import os from 'os';
 import path from 'path';
 
@@ -358,6 +359,8 @@ export async function composeGroupClaudeMd(
     ? validateMcpServers(JSON.parse(configRow.mcp_servers) as Record<string, McpServerConfig>)
     : {};
   const desired = new Map<string, string>();
+  if (readContainerConfig(group.folder).outcomeReporting === true)
+    desired.set('zz-outcome-reporting.md', OUTCOME_REPORTING_INSTRUCTIONS);
 
   if (options.workgroupReadAccessInstructions) {
     if (!options.workgroupId)

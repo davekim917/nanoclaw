@@ -2749,3 +2749,248 @@ describe('deliverSessionMessages — ask_question ids', () => {
     expect(await getPendingQuestion('q-agent-1')).toMatchObject({ session_id: session.id, message_out_id: 'out-ask' });
   });
 });
+
+describe('per-work-item outcome delivery', () => {
+  async function prepare() {
+    await seedAgentAndChannel();
+    getRawDb().prepare('INSERT INTO workgroups (id,created_at) VALUES (?,?)').run('outcomes', now());
+    getRawDb().prepare('UPDATE agent_groups SET workgroup_id=? WHERE id=?').run('outcomes', 'ag-1');
+    fs.mkdirSync(`${TEST_DIR}/groups/test-agent`, { recursive: true });
+    fs.writeFileSync(`${TEST_DIR}/groups/test-agent/container.json`, JSON.stringify({ outcomeReporting: true }));
+    return (await resolveSession('ag-1', 'mg-1', null, 'shared')).session;
+  }
+  async function outcome(workItem = 'https://github.com/Example-org/Checkout/pull/17') {
+    const { renderWorkOutcome } = await import('./outcome-reporting-schema.js');
+    const summary = 'The checkout fix merged to develop.';
+    const data = {
+      workItem,
+      verified: 'Post-merge checks passed.',
+      evidence: 'https://github.com/Example-org/Checkout/pull/17',
+    };
+    return {
+      text: renderWorkOutcome(summary, data).text,
+      reporting: { version: 1, purpose: 'outcome', summary, outcome: data },
+    };
+  }
+
+  it('retains routine records without platform calls and preserves legacy human replies and native questions', async () => {
+    const session = await prepare();
+    const deliver = vi.fn().mockResolvedValue('question-or-reply');
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind('ag-1', session.id, 'internal', 'work_log', 'telegram', 'telegram:123', {
+      text: 'Checking again',
+    });
+    insertOutboundKind('ag-1', session.id, 'progress', 'status', 'telegram', 'telegram:123', {
+      text: 'Thinking',
+      reporting: { version: 1, purpose: 'progress' },
+    });
+    await deliverSessionMessages(session);
+    expect(deliver).not.toHaveBeenCalled();
+    insertOutboundKind('ag-1', session.id, 'legacy-human', 'chat', 'telegram', 'telegram:123', {
+      text: 'Answer from an older runner',
+    });
+    insertOutboundKind('ag-1', session.id, 'question', 'chat-sdk', 'telegram', 'telegram:123', {
+      type: 'ask_question',
+      questionId: 'q-outcome',
+      title: 'Choose scope',
+      question: 'Which product scope?',
+      options: ['A', 'B'],
+    });
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(getRawDb().prepare('SELECT last_outbound_at FROM sessions WHERE id=?').get(session.id)).toBeTruthy();
+  });
+
+  it('dedupes normalized work items across concurrent sibling sessions and later replay', async () => {
+    const first = await prepare();
+    await createAgentGroup({
+      id: 'ag-2',
+      name: 'Sibling',
+      folder: 'sibling',
+      agent_provider: null,
+      workgroup_id: 'outcomes',
+      created_at: now(),
+    });
+    const second = (await resolveSession('ag-2', 'mg-1', null, 'shared')).session;
+    const deliver = vi.fn().mockResolvedValue('platform-outcome');
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind('ag-1', first.id, 'outcome-a', 'chat', 'telegram', 'telegram:123', await outcome());
+    insertOutboundKind(
+      'ag-2',
+      second.id,
+      'outcome-b',
+      'chat',
+      'telegram',
+      'telegram:123',
+      await outcome('https://github.com/example-ORG/checkout/pull/17?presentation=1'),
+    );
+    await Promise.all([deliverSessionMessages(first), deliverSessionMessages(second)]);
+    await deliverSessionMessages(second);
+    insertOutboundKind('ag-2', second.id, 'outcome-replay', 'chat', 'telegram', 'telegram:123', await outcome());
+    await deliverSessionMessages(second);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(getRawDb().prepare('SELECT state,platform_message_id FROM work_outcome_receipts').all()).toEqual([
+      { state: 'delivered', platform_message_id: 'platform-outcome' },
+    ]);
+    // A later real correction is not swallowed by the terminal receipt.
+    insertOutboundKind('ag-2', second.id, 'correction', 'chat', 'telegram', 'telegram:123', {
+      text: 'Rollback: post-merge verification was wrong.',
+      reporting: { version: 1, purpose: 'urgent' },
+    });
+    await deliverSessionMessages(second);
+    expect(deliver).toHaveBeenCalledTimes(2);
+  });
+
+  it('gives unrelated scheduled work outcomes independent roots instead of the daily task thread', async () => {
+    await prepare();
+    const session = (await resolveTaskSession('ag-1', 'outcome-series')).session;
+    // Scheduled tasks retain the existing destination permission requirement.
+    getRawDb()
+      .prepare(
+        "INSERT OR IGNORE INTO agent_destinations (agent_group_id,local_name,target_type,target_id,created_at) VALUES ('ag-1','test','channel','mg-1',?)",
+      )
+      .run(now());
+    const deliver = vi.fn().mockResolvedValueOnce('first-item').mockResolvedValueOnce('second-item');
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'item-one',
+      'chat',
+      'telegram',
+      'telegram:123',
+      await outcome(),
+      null,
+      'fire-one',
+    );
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'item-two',
+      'chat',
+      'telegram',
+      'telegram:123',
+      await outcome('https://github.com/Example-org/Checkout/pull/18'),
+      null,
+      'fire-two',
+    );
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(deliver.mock.calls.map((call) => call[2])).toEqual([null, null]);
+  });
+
+  it('holds an ambiguous platform result across replay, without acknowledging success or retrying', async () => {
+    const session = await prepare();
+    const deliver = vi.fn().mockRejectedValue(new Error('response lost after acceptance'));
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind('ag-1', session.id, 'unknown', 'chat', 'telegram', 'telegram:123', await outcome());
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    insertOutboundKind('ag-1', session.id, 'unknown-copy', 'chat', 'telegram', 'telegram:123', await outcome());
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(getRawDb().prepare('SELECT state FROM work_outcome_receipts').get()).toEqual({ state: 'uncertain' });
+    expect(getDeliveredIds(openInboundDb('ag-1', session.id)).has('unknown')).toBe(false);
+  });
+
+  it('preserves legacy status and acknowledges successful adapter return without an id', async () => {
+    const session = await prepare();
+    const deliver = vi.fn().mockResolvedValue(undefined);
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind('ag-1', session.id, 'old-status', 'status', 'telegram', 'telegram:123', {
+      text: 'Legacy status',
+    });
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    insertOutboundKind('ag-1', session.id, 'no-id', 'chat', 'telegram', 'telegram:123', await outcome());
+    await deliverSessionMessages(session);
+    insertOutboundKind('ag-1', session.id, 'no-id-copy', 'chat', 'telegram', 'telegram:123', await outcome());
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(getDeliveredIds(openInboundDb('ag-1', session.id)).has('no-id')).toBe(true);
+    expect(getRawDb().prepare('SELECT state,platform_message_id FROM work_outcome_receipts').get()).toEqual({
+      state: 'delivered',
+      platform_message_id: null,
+    });
+  });
+
+  it('reconciles verified non-delivery and allows only the original queued row to retry', async () => {
+    const reconciliationModule = '../scripts/outcome-receipts.js';
+    const { reconcileOutcome } = await import(reconciliationModule);
+    const first = await prepare();
+    await createAgentGroup({
+      id: 'ag-2',
+      name: 'Sibling',
+      folder: 'sibling',
+      agent_provider: null,
+      workgroup_id: 'outcomes',
+      created_at: now(),
+    });
+    const second = (await resolveSession('ag-2', 'mg-1', null, 'shared')).session;
+    const deliver = vi.fn().mockRejectedValueOnce(new Error('socket disconnected')).mockResolvedValue('recovered');
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind('ag-1', first.id, 'retry-original', 'chat', 'telegram', 'telegram:123', await outcome());
+    await deliverSessionMessages(first);
+    const receipt = getRawDb().prepare('SELECT updated_at,resolution FROM work_outcome_receipts').get() as {
+      updated_at: string;
+      resolution: string;
+    };
+    expect(receipt.resolution).toContain('socket disconnected');
+    reconcileOutcome(getRawDb(), {
+      action: 'confirm-not-sent',
+      workgroup: 'outcomes',
+      workItem: 'https://github.com/example-org/checkout/pull/17',
+      expectedUpdatedAt: receipt.updated_at,
+      reason: 'Platform readback verified no post was accepted.',
+    });
+    insertOutboundKind('ag-2', second.id, 'retry-sibling', 'chat', 'telegram', 'telegram:123', await outcome());
+    await deliverSessionMessages(second);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(getDeliveredIds(openInboundDb('ag-2', second.id)).has('retry-sibling')).toBe(false);
+    await deliverSessionMessages(first);
+    await deliverSessionMessages(second);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(getRawDb().prepare('SELECT state,message_id FROM work_outcome_receipts').get()).toEqual({
+      state: 'delivered',
+      message_id: 'retry-original',
+    });
+  });
+
+  it('rejects unauthorized destinations before claiming an outcome', async () => {
+    const session = await prepare();
+    await createMessagingGroup({
+      id: 'mg-private',
+      channel_type: 'telegram',
+      platform_id: 'telegram:private',
+      name: 'Private',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    const deliver = vi.fn().mockResolvedValue('unexpected');
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind('ag-1', session.id, 'denied-outcome', 'chat', 'telegram', 'telegram:private', await outcome());
+    await deliverSessionMessages(session);
+    expect(deliver).not.toHaveBeenCalled();
+    expect(getRawDb().prepare('SELECT COUNT(*) AS n FROM work_outcome_receipts').get()).toEqual({ n: 0 });
+  });
+
+  it('makes external terminal lanes exclusive without blocking direct replies or approvals', async () => {
+    const session = await prepare();
+    fs.writeFileSync(
+      `${TEST_DIR}/groups/test-agent/container.json`,
+      JSON.stringify({ outcomeReporting: true, outcomeReportingExternalChannels: ['telegram:123'] }),
+    );
+    const deliver = vi.fn().mockResolvedValue('reply');
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind('ag-1', session.id, 'external-terminal', 'chat', 'telegram', 'telegram:123', await outcome());
+    for (let i = 0; i < 3; i++) await deliverSessionMessages(session);
+    expect(deliver).not.toHaveBeenCalled();
+    insertOutboundKind('ag-1', session.id, 'external-reply', 'chat', 'telegram', 'telegram:123', {
+      text: 'The detail you requested.',
+      reporting: { version: 1, purpose: 'reply' },
+    });
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
+  });
+});

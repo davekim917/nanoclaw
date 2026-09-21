@@ -928,3 +928,20 @@ describe('excludePlugins', () => {
     });
   });
 });
+
+describe('outcome reporting opt-in', () => {
+  it('requires literal true and round-trips external routine-report channels', () => {
+    writeGroupConfig('outcome-config', {
+      outcomeReporting: true,
+      outcomeReportingExternalChannels: ['slack:RELEASES'],
+      model: 'unchanged-model',
+    });
+    const config = readContainerConfig('outcome-config');
+    expect(config.outcomeReporting).toBe(true);
+    expect(config.outcomeReportingExternalChannels).toEqual(['slack:RELEASES']);
+    writeContainerConfig('outcome-config', config);
+    expect(readContainerConfig('outcome-config').model).toBe('unchanged-model');
+    writeGroupConfig('outcome-not-opted', { outcomeReporting: 'true' });
+    expect(readContainerConfig('outcome-not-opted').outcomeReporting).toBe(false);
+  });
+});

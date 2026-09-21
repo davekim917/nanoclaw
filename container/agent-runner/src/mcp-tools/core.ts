@@ -7,6 +7,8 @@
  * the host side in delivery.ts via the agent_destinations table.
  */
 import crypto from 'crypto';
+import { outcomeReportingEnabled } from '../outcome-reporting.js';
+import { OUTCOME_PURPOSES, renderWorkOutcome } from '../outcome-reporting-schema.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -268,7 +270,31 @@ export const sendMessage: McpToolDefinition = {
           type: 'string',
           description: 'Destination name (e.g., "family", "worker-1"). Optional when replying in this conversation.',
         },
-        text: { type: 'string', description: 'Message content' },
+        text: {
+          type: 'string',
+          description: 'Message content; for outcome, the short product result and why it matters.',
+        },
+        purpose: {
+          type: 'string',
+          enum: [...OUTCOME_PURPOSES],
+          description:
+            'Required for opted-in channel sends. Progress stays internal; outcome is one finished human work item; reply is requested human interaction; urgent/decision preserve real incidents and authority; handoff is actionable coordination.',
+        },
+        outcome: {
+          type: 'object',
+          properties: {
+            workItem: {
+              type: 'string',
+              description:
+                'Original GitHub PR/issue or Slack human request permalink. Reuse through all phases/retries.',
+            },
+            verified: { type: 'string' },
+            evidence: { type: 'string', description: 'Accessible HTTPS evidence link.' },
+            remaining: { type: 'string' },
+            needsYou: { type: 'string' },
+          },
+          required: ['workItem', 'verified', 'evidence'],
+        },
         thread_key: { type: 'string', description: THREAD_KEY_DESCRIPTION },
       },
       required: ['text'],
@@ -279,7 +305,7 @@ export const sendMessage: McpToolDefinition = {
     if (!rawText) return err('text is required');
     const normalized = normalizeToolMessageText(rawText, 'send_message');
     if ('error' in normalized) return err(normalized.error);
-    const text = normalized.text;
+    let text = normalized.text;
     if (!text) return err('text is required');
 
     const key = parseThreadKey(args.thread_key);
@@ -288,19 +314,61 @@ export const sendMessage: McpToolDefinition = {
     const routing = resolveRouting(args.to as string | undefined);
     if ('error' in routing) return err(routing.error);
 
+    const policy = outcomeReportingEnabled() && routing.channel_type !== 'agent';
+    const purpose = args.purpose;
+    if (policy && !OUTCOME_PURPOSES.some((value) => value === purpose))
+      return err(
+        'Choose an explicit purpose: progress stays internal; outcome, reply, urgent, decision or actionable handoff may reach the channel.',
+      );
+    if (policy && purpose === 'outcome') {
+      try {
+        text = renderWorkOutcome(text, args.outcome).text;
+      } catch (error) {
+        return err(error instanceof Error ? error.message : String(error));
+      }
+    }
+    const internal = policy && purpose === 'progress';
     const id = generateId();
-    const denial = chatSendDenial();
+    const denial = internal ? null : chatSendDenial();
     if (denial) return err(denial);
     const seq = await writeMessageOut({
       id,
       in_reply_to: getCurrentInReplyTo(),
-      kind: 'chat',
+      kind: internal ? 'work_log' : 'chat',
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
       thread_id: routing.thread_id,
-      content: JSON.stringify(key.threadKey ? { text, threadKey: key.threadKey } : { text }),
+      content: JSON.stringify({
+        text,
+        ...(key.threadKey ? { threadKey: key.threadKey } : {}),
+        ...(policy
+          ? {
+              reporting: {
+                version: 1,
+                purpose,
+                ...(purpose === 'outcome' ? { outcome: args.outcome, summary: normalized.text } : {}),
+              },
+            }
+          : {}),
+      }),
     });
 
+    if (seq < 0)
+      return err(
+        'Message was not queued: chat budget or mute rejected it. Use the existing authorized outbox/card route where required.',
+      );
+    if (internal) return ok(`Recorded internally (id: ${seq}); no channel message was sent.`);
+    if (policy && purpose === 'outcome') {
+      const ack = await awaitDeliveryAck(id, 5000);
+      if (!ack)
+        return ok(
+          `Outcome queued (id: ${seq}); delivery unconfirmed. Reuse the same work item; do not report delivery as confirmed or create a replacement key.`,
+        );
+      if (ack.status === 'failed') return err(`Outcome not delivered: ${ack.error ?? 'host rejected delivery'}`);
+      return ok(
+        `Outcome receipt confirmed (id: ${seq}, platform_message_id: ${ack.platformMessageId ?? 'unknown'}). This may reuse an already delivered report; do not post a second summary.`,
+      );
+    }
     log(`send_message: #${seq} → ${routing.resolvedName}`);
     return ok(`Message sent to ${routing.resolvedName} (id: ${seq})`);
   },

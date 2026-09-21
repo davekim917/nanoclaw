@@ -1201,3 +1201,25 @@ describe("sub-plugin always-on: the plugin's own always-on.md (OpenCode only)", 
     }
   });
 });
+
+describe('opt-in outcome reporting instruction parity', () => {
+  it.each(['claude', 'codex'])('adds the contract only to enabled groups (%s)', async (provider) => {
+    const enabled = group('ag-outcome-enabled', 'outcome-enabled');
+    await seed(enabled);
+    writePersona(enabled.folder, 'Existing independent review and approval authority remains.\n');
+    fs.writeFileSync(
+      path.join(GROUPS_DIR, enabled.folder, 'container.json'),
+      JSON.stringify({ outcomeReporting: true }),
+    );
+    await composeGroupClaudeMd(enabled, provider);
+    expect(docOf(enabled.folder)).toContain('## Work-item reporting');
+    expect(docOf(enabled.folder)).toContain('Required approvals, exact scope, holds and deadlines remain binding');
+    expect(fs.readFileSync(path.join(GROUPS_DIR, enabled.folder, 'AGENTS.md'), 'utf8')).toContain(
+      '## Work-item reporting',
+    );
+    const disabled = group('ag-outcome-disabled', 'outcome-disabled');
+    await seed(disabled);
+    await composeGroupClaudeMd(disabled, provider);
+    expect(docOf(disabled.folder)).not.toContain('## Work-item reporting');
+  });
+});
