@@ -4,9 +4,9 @@ NanoClaw decouples messaging channels from agent groups. When you connect a chan
 
 Memory has a separate, explicit boundary: the workgroup. Every agent group in
 one workgroup reads and edits the same canonical Markdown tree at
-`data/workgroups/<workgroup-id>/memory`. Agent-group `CLAUDE.md` and
-`CLAUDE.local.md` files remain provider, identity, and standing instruction
-surfaces; they are not memory stores. Use different workgroups whenever memory
+`data/workgroups/<workgroup-id>/memory`. An agent group's `standing-instructions.md`
+(composed into `CLAUDE.md`/`AGENTS.md`) holds provider, identity, and standing
+instructions; it is not a memory store. Use different workgroups whenever memory
 or archived conversation must not cross between agents.
 
 Agent credentials are not an isolation boundary, and were never a reliable one.
@@ -145,7 +145,7 @@ intentional workgroup siblings.
 ```
 workgroups (one canonical memory tree and archive)
     ↑ 1:many
-agent_groups (workspace, CLAUDE.md/CLAUDE.local.md instructions, personality)
+agent_groups (workspace, standing-instructions.md, personality)
     ↕ many-to-many
 messaging_groups (a specific channel/chat/group on a platform)
     via

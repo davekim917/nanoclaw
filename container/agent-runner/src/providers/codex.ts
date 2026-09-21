@@ -486,7 +486,7 @@ This session allows up to ${maxConcurrentThreadsPerSession} concurrent subagents
 // instructions) reach Codex through AGENTS.md, which the app-server
 // auto-loads as its project doc from cwd (`/workspace/agent` — see
 // poll-loop's caller in index.ts). This function used to also read and
-// @-import-resolve CLAUDE.md/CLAUDE.local.md by hand and fold that in here
+// @-import-resolve CLAUDE.md and its local companion file by hand and fold that in here
 // too, which doubled ~26KB of instructions into every turn's context and
 // left two copies of every rule that could drift out of sync. AGENTS.md is
 // now the single instruction surface for Codex.

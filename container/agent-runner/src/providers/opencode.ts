@@ -592,9 +592,9 @@ function spawnOpencodeServer(
 // prompt wrapping). The removed `readAgentInstructionsForPrompt` (formerly
 // called from here) sent the same AGENTS.md content a SECOND time on every
 // turn, plus a `/workspace/global` half that was already dead:
-// `groups/global/` was deleted by the v2 migration (migrateGroupsToClaudeLocal),
-// so that mount never fires and every group's own AGENTS.md already carries
-// the shared base + CLAUDE.local.md via composeGroupClaudeMd. No reach
+// `groups/global/` was deleted by the v2 migration, so that mount never fires
+// and every group's own AGENTS.md already carries the standing instructions +
+// shared base via composeGroupClaudeMd. No reach
 // regression — just dedup, same shape as the Codex per-turn duplication fix.
 // `systemInstructions` below combines the trusted resolved runtime identity,
 // static memory guidance, and dynamic per-turn content (tone profile,

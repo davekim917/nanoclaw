@@ -38,7 +38,6 @@ Customizations route through the v2 entity model: users → messaging groups →
 | `data/v2.db`                               | Central DB: users, roles, agent_groups, messaging_groups, wirings, container_configs                                         |
 | `data/v2-sessions/<session>/`              | Per-session `inbound.db` (host→container) + `outbound.db` (container→host)                                                   |
 | `groups/<folder>/standing-instructions.md` | Provider-neutral role/persona source composed into generated `CLAUDE.md` and `AGENTS.md` for default agent surfaces at spawn |
-| `groups/<folder>/CLAUDE.local.md`          | Operator-curated local instructions included in the composed provider documents                                              |
 | `groups/<folder>/container.json`           | Authoritative per-group runtime config; `ncl groups config update` keeps its DB projection in sync                           |
 | `data/workgroups/<workgroup-id>/memory/`   | Canonical Markdown memory shared by every sibling in the workgroup                                                           |
 
@@ -82,10 +81,10 @@ Questions to ask:
 
 Implementation:
 
-- Shared role, persona, and instructions live in `groups/<folder>/standing-instructions.md`; operator-local instructions live in `CLAUDE.local.md`. `CLAUDE.md` and `AGENTS.md` are generated at spawn for default agent surfaces; edit the source, not either generated file.
+- Role, persona, and standing instructions live in one file, `groups/<folder>/standing-instructions.md`. `CLAUDE.md` and `AGENTS.md` are generated at spawn for default agent surfaces; edit the source, not either generated file.
 - Durable facts, decisions, and knowledge live in the workgroup memory canon.
   Use `write_memory_file` for ordinary agent edits; do not put memory into
-  `CLAUDE.md` or `CLAUDE.local.md`. Use `/migrate-memory` for legacy stores.
+  `CLAUDE.md` or `standing-instructions.md`. Use `/migrate-memory` for legacy stores.
 - Container runtime behavior (provider, model, packages, MCP servers) is authored in `groups/<folder>/container.json`; use `ncl groups config get/update --id <group-id>` so the central projection and authoritative file remain synchronized.
 
 ### Adding New Commands

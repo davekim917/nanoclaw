@@ -292,7 +292,7 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
       workgroup_id: workgroupId,
     };
 
-    // STEP 1: Create folder + baseline container.json + CLAUDE.local.md + skills
+    // STEP 1: Create folder + baseline container.json + skills
     //         symlinks. initGroupFilesystem is idempotent; writes an empty
     //         container.json via initContainerConfig.
     initGroupFilesystem(newGroup, { instructions: instructions ?? undefined });

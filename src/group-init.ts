@@ -311,14 +311,6 @@ export function initGroupFilesystem(
     initialized.push(STANDING_INSTRUCTIONS_FILE);
   }
 
-  if (defaultSurfaces) {
-    const claudeLocalFile = path.join(groupDir, 'CLAUDE.local.md');
-    if (!entryExists(claudeLocalFile)) {
-      fs.writeFileSync(claudeLocalFile, '');
-      initialized.push('CLAUDE.local.md');
-    }
-  }
-
   // The host-shared spawn template is nested-mounted at
   // /workspace/agent/spawn-template.md (container-runner.ts), and
   // /workspace/agent IS this folder — so without a placeholder Docker creates

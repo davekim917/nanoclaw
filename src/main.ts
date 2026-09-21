@@ -23,7 +23,6 @@ import {
 } from './build-info.js';
 import { DATA_DIR, HOST_LEASE_TTL_MS, REPO_ROOT } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
-import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { shadowWrite } from './db/coordination.js';
 import { getDb, getRawDb, initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
@@ -835,9 +834,6 @@ export async function main(): Promise<void> {
   // 1c. Backfill container_configs from legacy container.json files.
   // Idempotent — skips groups that already have a config row.
   await backfillContainerConfigs();
-
-  // 1d. One-time filesystem cutover — idempotent, no-op after first run.
-  migrateGroupsToClaudeLocal();
 
   // 2. (The storage-activity reset moved ahead of adoption, above.)
 

@@ -6,8 +6,8 @@ Original requirements and design decisions from the project creator.
 > context; its CLAUDE.md-based global/per-group memory model is not the current
 > v2 contract. Current v2 uses one canonical Markdown tree at
 > `data/workgroups/<workgroup-id>/memory`, shared by every sibling agent group.
-> Agent-group `CLAUDE.md` and `CLAUDE.local.md` files hold provider, identity,
-> persona, and standing instructions, not memory. See [memory.md](memory.md) and
+> An agent group's `standing-instructions.md` (composed into `CLAUDE.md`/`AGENTS.md`)
+> holds provider, identity, persona, and standing instructions, not memory. See [memory.md](memory.md) and
 > [workgroups.md](workgroups.md). Do not use the historical memory instructions
 > below as an operator runbook.
 
