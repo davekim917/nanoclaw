@@ -62,10 +62,12 @@
 #     did -- exited, crashed, printed nothing or was killed. A config line
 #     such as `exit 0` or a hanging command therefore cannot skip that line.
 #   - The config file is read by the worker AS DATA, never sourced: only
-#     `[export] NAME=<literal>` and `unset NAME` lines for the names in
-#     CONFIG_KEYS count; every other line (set -u, echo, exit, sleep, ...) is
-#     ignored, and an allowed name assigned anything but a literal (e.g.
-#     "$HOME/x") skips the fire rather than guess its value.
+#     `[export] NAME=<literal>` and `unset NAME` lines count, and only for
+#     `SMOKE_*` names (the install's config namespace) that are not NOT_CONFIG
+#     (this wrapper's own seams and the claimant). Every other line -- another
+#     namespace, set -u, echo, exit, sleep, ... -- is ignored, and a name the
+#     file IS allowed to set, assigned anything but a literal (e.g. "$HOME/x"),
+#     skips the fire rather than guess its value.
 #   - Budget: SMOKE_CONTROLLER_SHADOW_BUDGET_SECONDS (process env only, never
 #     the config file), decimal 1..110 with no leading zero; anything else
 #     ("08", "1e3", "200") falls back to 100 and is reported as
@@ -155,12 +157,35 @@ SCRIPT_DIR = os.environ["SMOKE_CONTROLLER_SCRIPT_DIR"]
 CTL = os.path.join(SCRIPT_DIR, "smoke-campaign-controller.py")
 ENV_FILE = os.environ.get("SMOKE_CONTROLLER_ENV_FILE", "/workspace/agent/smoke-gate-env.sh")
 TEST_HANG = os.environ.get("SMOKE_CONTROLLER_SHADOW_TEST_HANG", "")  # test-only; never read from config
-CONFIG_KEYS = (
-    "SMOKE_CONTROLLER_MODE", "SMOKE_CONTROLLER_SHADOW_DIR", "SMOKE_CONTROLLER_SHADOW_HOLD_SECONDS",
-    "SMOKE_CONTROLLER_SHADOW_GH_TIMEOUT", "SMOKE_CONTROLLER_SHADOW_NCL_TIMEOUT",
-    "SMOKE_CONTROLLER_SHADOW_STEP_TIMEOUT", "SMOKE_CONTROLLER_SHADOW_STEP_MIN_SECONDS",
-    "SMOKE_GATE_STATE_DIR", "SMOKE_GATE_RUN_ROOT", "SMOKE_GATE_REPO",
-)
+# THE ENV FILE IS THE LIST OF KEYS -- see the live worker
+# (smoke-controller-live-worker.py, same rule, same reason: XZO #2047, where a
+# hardcoded allowlist here dropped SMOKE_GATE_LEASE_DIR and the evidence
+# barrier this wrapper's controller step spawns
+# (smoke-campaign-controller.py:1393 -> spawn, :638-650, env=None) fell back to
+# a lease dir holding no pin, smoke-evidence-barrier.sh:556). NOT_CONFIG is the
+# inverse: names that say how this process and its children RUN rather than
+# what the campaign IS. A name here is IGNORED, exactly as every name outside
+# the old allowlist was, so nothing that worked stops working.
+# WITHIN ONE NAMESPACE: the `SMOKE_` prefix the install's configuration owns.
+# Not a list, so it cannot drift -- a new SMOKE_ key works with no change here
+# -- while PATH, IFS, the shell hooks, LD_PRELOAD, PYTHONPATH and BUN_OPTIONS
+# (`--preload` runs a module before Bun's main script) are simply not this
+# file's configuration and stay IGNORED, exactly as before XZO #2047.
+CONFIG_PREFIX = "SMOKE_"
+# NOT_CONFIG is then only for the dangerous names inside that namespace. Each
+# is IGNORED, which is what the old allowlist did, so nothing that worked stops.
+NOT_CONFIG = frozenset((
+    # Authority, never configuration. The live worker refuses the whole fire
+    # over this one (smoke-controller-live-worker.py load_config); shadow
+    # performs nothing and simply ignores it, so the file cannot start stamping
+    # shadow's children as the controller either.
+    "SMOKE_GATE_CLAIMANT",
+    # This wrapper's own seams, read from the process env above and documented
+    # there (or in the Guarantees block) as process-env-only.
+    "SMOKE_CONTROLLER_ENV_FILE", "SMOKE_CONTROLLER_SCRIPT_DIR", "SMOKE_CONTROLLER_CRASH_AT",
+    "SMOKE_CONTROLLER_SHADOW_START", "SMOKE_CONTROLLER_SHADOW_BUDGET",
+    "SMOKE_CONTROLLER_SHADOW_BUDGET_SECONDS", "SMOKE_CONTROLLER_SHADOW_TEST_HANG",
+))
 MARGIN = 3
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 STATE_RE = re.compile(r"^pr-(\d+)-state\.json$")
@@ -356,6 +381,12 @@ def run(argv, timeout, env=None):
 
 
 # -- config, as data ------------------------------------------------------------------
+def is_config(name):
+    """A name the env file is allowed to set: inside the install's namespace,
+    and not one of the dangerous names in it. See CONFIG_PREFIX / NOT_CONFIG."""
+    return name.startswith(CONFIG_PREFIX) and name not in NOT_CONFIG
+
+
 def load_config(path):
     """({name: value|None}, [names with a non-literal value], error)."""
     cfg, refused = {}, []
@@ -373,16 +404,16 @@ def load_config(path):
         m = UNSET_RE.match(s)
         if m:
             for name in m.group(1).split():
-                if name in CONFIG_KEYS:
+                if is_config(name):
                     cfg[name] = None
             continue
         m = ASSIGN_RE.match(s)
         if m:
-            if m.group(1) in CONFIG_KEYS:
+            if is_config(m.group(1)):
                 cfg[m.group(1)] = next(g for g in m.group(2, 3, 4) if g is not None)
             continue
         m = NAME_RE.match(s)
-        if m and m.group(1) in CONFIG_KEYS:
+        if m and is_config(m.group(1)):
             refused.append(m.group(1))
     return cfg, refused, None
 

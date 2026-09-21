@@ -1611,6 +1611,31 @@ owner with a `failure` slug instead of a step; the owner then posts one
 operator alarm and takes no campaign action — same router file, "A failure
 wake".
 
+The controller wrappers are the machine half of "source the install env file
+before every direct scaffold/barrier call" above: they read that file AS DATA
+(never sourced — a task script cannot execute it) and put every literal
+`SMOKE_*` assignment it makes into the environment their children run in,
+because the evidence barrier is spawned by the controller directly and has no
+other way to learn `SMOKE_GATE_LEASE_DIR`. Add a `SMOKE_` key to the env file
+and it simply reaches the gate, the barrier and the scaffold — there is no
+second list to update.
+
+Two scope rules keep that from becoming a hole:
+
+- **`SMOKE_*` only.** That prefix is the namespace this skill's configuration
+  owns, so anything else in the file — `PATH`, `LD_PRELOAD`, `PYTHONPATH`,
+  `BASH_ENV`, `BUN_OPTIONS` (its `--preload` runs a module before Bun's main
+  script), or an operator's own `EXTRA=…` — is not configuration. It is
+  ignored, never inherited and never a reason to refuse a fire. Inside the
+  namespace the wrappers still withhold their own process-env-only seams and
+  `SMOKE_GATE_CLAIMANT`, which the live wrapper and the renewer refuse
+  outright. A malformed `SMOKE_` value still stops the fire loudly rather than
+  being guessed.
+- **Into the child environment, never the wrapper's own variables.** The shell
+  wrappers build the child's environment explicitly instead of exporting into
+  themselves; otherwise the file could rename their internals — the renewer's
+  ceiling, its clock — and switch off a safety control by naming it.
+
 #### The claim renewer (required alongside the live controller)
 
 A live controller needs a second, script-only series: `scripts/smoke-controller-renew.sh`.

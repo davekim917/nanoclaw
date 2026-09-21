@@ -157,50 +157,109 @@ final() { # <status> <detail-or-empty>
 command -v jq >/dev/null 2>&1 || final no-jq "jq is unavailable; nothing renewed"
 
 # -- configuration, read as DATA ---------------------------------------------
-# Same rule as the live wrapper (smoke-controller-live-worker.py:249-284): the
-# gate env file is configuration, not code, so it is never sourced here. Only
-# `[export] NAME='literal'` lines for the four keys this tick needs are read,
-# and the file overrides the process env. SMOKE_GATE_CLAIMANT is never taken
-# from it -- the gate wrapper sources that file for every caller, so a
-# claimant there would stamp the legacy coordinator's calls as the
-# controller's; this tick sets it per call instead.
+# Same rule as the live wrapper (smoke-controller-live-worker.py, load_config):
+# the gate env file is configuration, not code, so it is never sourced here.
+# Only `[export] NAME='literal'` and `unset NAME` lines are read, and the file
+# overrides the process env.
+#
+# THE ENV FILE IS THE LIST OF KEYS, WITHIN ONE NAMESPACE. This tick used to
+# read a hardcoded four, which is the XZO #2047 shape: a list of names owned by
+# a DIFFERENT file goes stale the moment the install adds one, silently. It now
+# reads every `SMOKE_*` name the file mentions, so a new SMOKE_ key works with
+# no change here.
+#
+# The prefix is the scope, and it is not a list that can drift -- it is the
+# namespace the install's configuration owns (verified: every key in the
+# deployed env files is SMOKE_*, and the whole skill's env vocabulary is
+# SMOKE_*). Everything else -- PATH, LD_PRELOAD, PYTHONPATH, BASH_ENV,
+# BUN_OPTIONS (`--preload` runs a module before Bun's main script) -- is simply
+# not this file's configuration and is IGNORED, exactly as it was before
+# XZO #2047. not_config() below is only for the dangerous SMOKE_ names.
 ENV_FILE="${SMOKE_CONTROLLER_ENV_FILE:-/workspace/agent/smoke-gate-env.sh}"
-env_value() { # <key> -- last literal assignment in the env file, or empty
+CONFIG_PREFIX=SMOKE_
+not_config() { # <name> -- 0 when a SMOKE_ name still must not come from the file
+  case "$1" in
+    # This tick's own seam, and the one name that is authority rather than
+    # configuration (refused outright just below, before this loop runs).
+    SMOKE_CONTROLLER_ENV_FILE|SMOKE_GATE_CLAIMANT) return 0 ;;
+  esac
+  return 1
+}
+# Every name the file assigns or unsets, first mention first, deduplicated.
+env_names() {
   [ -f "$ENV_FILE" ] || return 0
-  sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$1=('([^']*)'|\"([^\"\$\`\\\\]*)\"|([^[:space:]'\"\$\`\\\\;&|<>()]*))[[:space:]]*(#.*)?\$/\3\4\5/p" \
+  {
+    sed -n -E 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*$/\2/p' "$ENV_FILE"
+    sed -n -E 's/^[[:space:]]*unset[[:space:]]+([A-Za-z_][A-Za-z0-9_[:space:]]*)$/\1/p' "$ENV_FILE" | tr -s '[:space:]' '\n'
+  } 2>/dev/null | awk 'NF && !seen[$0]++'
+}
+env_value() { # <key> -- "=<value>" for the last accepted literal, else empty.
+  # The "=" prefix is what distinguishes an EMPTY literal (`FOO=`, which is a
+  # value) from "no literal assignment at all" (which is a refusal below).
+  [ -f "$ENV_FILE" ] || return 0
+  sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$1=('([^']*)'|\"([^\"\$\`\\\\]*)\"|([^[:space:]'\"\$\`\\\\;&|<>()]*))[[:space:]]*(#.*)?\$/=\3\4\5/p" \
     "$ENV_FILE" 2>/dev/null | tail -n 1
 }
 if [ -f "$ENV_FILE" ] && grep -Eq '\bSMOKE_GATE_CLAIMANT\b' "$ENV_FILE" 2>/dev/null; then
   # The gate wrapper sources this file for every caller, so a claimant in it
   # would override the one this tick passes per call -- and would stamp the
   # legacy coordinator's calls as the controller's. Same refusal as the live
-  # worker (smoke-controller-live-worker.py:307-311).
+  # worker (smoke-controller-live-worker.py, the SMOKE_GATE_CLAIMANT branch of
+  # load_config and the end_fire it feeds).
   final misconfigured "the env file names SMOKE_GATE_CLAIMANT; nothing renewed"
 fi
-for key in SMOKE_CONTROLLER_MODE SMOKE_CONTROLLER_OUT_DIR SMOKE_CONTROLLER_GATE_CMD SMOKE_GATE_RUN_ROOT; do
-  if [ -f "$ENV_FILE" ] && grep -Eq "^[[:space:]]*unset[[:space:]]+([A-Za-z_][A-Za-z0-9_]*[[:space:]]+)*$key([[:space:]]|\$)" "$ENV_FILE" 2>/dev/null; then
-    unset "$key"
+# CONFIG NEVER TOUCHES THIS SHELL'S OWN VARIABLES. It is collected into a map
+# that becomes the GATE CALL's environment and nothing else. `export
+# "$key=$value"` here would let the env file rename this script's internals --
+# the ceiling, the clock, the journal path -- which no deny list can fix in
+# general, because those names are OURS and may change at any time. Observed
+# (Codex review, PR #968): CEILING_MAX=9999 in the file disabled the renewal
+# ceiling, and `unset NOW` made the tick exit with no JSON at all, breaking the
+# final-line contract.
+declare -A CFG_SET=()     # SMOKE_ name -> the literal value the file assigns
+declare -A CFG_UNSET=()   # SMOKE_ name -> set when the file unsets it
+for key in $(env_names); do
+  case "$key" in "$CONFIG_PREFIX"*) ;; *) continue ;; esac
+  not_config "$key" && continue
+  if grep -Eq "^[[:space:]]*unset[[:space:]]+([A-Za-z_][A-Za-z0-9_]*[[:space:]]+)*$key([[:space:]]|\$)" "$ENV_FILE" 2>/dev/null; then
+    CFG_UNSET[$key]=1
     continue
   fi
   value="$(env_value "$key")"
   if [ -n "$value" ]; then
-    export "$key=$value"
-  elif [ -f "$ENV_FILE" ] && grep -Eq "^[[:space:]]*(export[[:space:]]+)?$key=" "$ENV_FILE" 2>/dev/null; then
+    CFG_SET[$key]="${value#=}"
+  else
     # Assigned, but not to a literal this reader accepts. Falling back to the
     # process env would run under configuration the operator did not write.
+    # Only SMOKE_ names reach here, so an ordinary line the file happens to
+    # carry (EXTRA="$HOME/cache") is ignored, as it always was.
     final misconfigured "the env file assigns a non-literal value to $key; nothing renewed"
   fi
 done
+# The effective value of one config name, for this tick's OWN decisions: the
+# file's, else the process env's, and empty when the file unsets it. Reads
+# only -- it assigns nothing.
+cfg() { # <name>
+  local n="$1"
+  [ -z "${CFG_UNSET[$n]:-}" ] || return 0
+  if [ -n "${CFG_SET[$n]+x}" ]; then printf '%s' "${CFG_SET[$n]}"; return 0; fi
+  printf '%s' "${!n-}"
+}
+# The gate call's environment: this process's, with the file's config applied
+# on top. Built once, passed explicitly, never exported here.
+GATE_ENV=(env)
+[ "${#CFG_UNSET[@]}" -eq 0 ] || for n in "${!CFG_UNSET[@]}"; do GATE_ENV+=(-u "$n"); done
+[ "${#CFG_SET[@]}" -eq 0 ] || for n in "${!CFG_SET[@]}"; do GATE_ENV+=("$n=${CFG_SET[$n]}"); done
 
-MODE="${SMOKE_CONTROLLER_MODE:-shadow}"
+MODE="$(cfg SMOKE_CONTROLLER_MODE)"; MODE="${MODE:-shadow}"
 [ "$MODE" = live ] || final not-live "SMOKE_CONTROLLER_MODE is '$MODE', not live: this tick does nothing"
 
-RUN_ROOT="${SMOKE_GATE_RUN_ROOT:-}"
+RUN_ROOT="$(cfg SMOKE_GATE_RUN_ROOT)"
 [ -n "$RUN_ROOT" ] || final misconfigured "SMOKE_GATE_RUN_ROOT is unset"
-GATE_CMD="${SMOKE_CONTROLLER_GATE_CMD:-/workspace/agent/smoke-pr-gate.sh}"
+GATE_CMD="$(cfg SMOKE_CONTROLLER_GATE_CMD)"; GATE_CMD="${GATE_CMD:-/workspace/agent/smoke-pr-gate.sh}"
 [ -f "$GATE_CMD" ] || final misconfigured "gate wrapper $GATE_CMD is not a file"
 # Same derivation as the live worker (smoke-controller-live-worker.py:329-330).
-OUT="${SMOKE_CONTROLLER_OUT_DIR:-$(dirname "${RUN_ROOT%/}")/controller}"
+OUT="$(cfg SMOKE_CONTROLLER_OUT_DIR)"; OUT="${OUT:-$(dirname "${RUN_ROOT%/}")/controller}"
 JOURNAL="$OUT/journal.ndjson"
 [ -f "$JOURNAL" ] || final no-journal "no controller journal at $JOURNAL"
 
@@ -374,7 +433,12 @@ while IFS= read -r candidate; do
     continue
   fi
 
-  GATE_OUT="$(SMOKE_GATE_CLAIMANT=controller SMOKE_GATE_LOCK_WAIT_SECONDS="${SMOKE_GATE_LOCK_WAIT_SECONDS:-2}" \
+  # GATE_ENV carries the file's config into the CHILD only; the claimant and
+  # the lock wait are this tick's, applied after it (env takes NAME=value
+  # arguments left to right, and neither name can be in the map -- the
+  # claimant is refused outright above).
+  GATE_OUT="$("${GATE_ENV[@]}" SMOKE_GATE_CLAIMANT=controller \
+    SMOKE_GATE_LOCK_WAIT_SECONDS="${SMOKE_GATE_LOCK_WAIT_SECONDS:-2}" \
     timeout -k 2 "$GATE_CALL_TIMEOUT" bash "$GATE_CMD" progress "$RUN_ID" "$TOKEN" 2>/dev/null | tail -n 1)"
   # `.ok // true` would be wrong twice over: jq's `//` treats a literal false
   # as empty, and a missing `ok` is not a success.
