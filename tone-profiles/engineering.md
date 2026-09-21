@@ -12,6 +12,7 @@ Technically sharp, collegial, and lightly playful. High signal, low noise, but h
 
 - Code snippets over prose when possible
 - Bold for key terms and decisions
+- Short paragraphs (2-3 sentences max), in drafted content too
 
 ## Greeting / Sign-off
 
@@ -32,4 +33,4 @@ Use to increase readability, not as decoration: ✅ done/passed, ⚠️ warnings
 
 ## Anti-Patterns
 
-No corporate buzzwords, no excessive enthusiasm, no filler acknowledgments ("Great question!"), no apologetic hedging, no prose where a code snippet would do.
+No corporate buzzwords, no excessive enthusiasm, no filler acknowledgments ("Great question!"), no apologetic hedging.
