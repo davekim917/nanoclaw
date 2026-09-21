@@ -15,6 +15,7 @@ import {
   type MessageInRow,
 } from './db/messages-in.js';
 import { getConfig } from './config.js';
+import { formatStatusSubtext, setTurnSettings } from './turn-status.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { touchHeartbeat } from './heartbeat.js';
@@ -1942,6 +1943,10 @@ export async function processQuery(
   // resolved to. Recording the request wrote NULL to task_run_outcomes for
   // exactly the fires this change reroutes.
   let modelInForce = query.resolvedModel ?? querySettings.model;
+  // The status subtext reads the same resolved value, for the same reason the
+  // comment above gives: what the turn REQUESTED can be nothing at all, and a
+  // line that says "you are on the group default" answers nothing.
+  setTurnSettings(modelInForce, querySettings.effort, querySettings.ultracode);
   /**
    * What the live stream is ACTUALLY set to. `querySettings` is the immutable
    * creation snapshot, so once a live settings change lands it stops
@@ -2300,6 +2305,10 @@ export async function processQuery(
             // Same read as at creation — one source, so a retarget and an open
             // cannot disagree about what ran.
             modelInForce = query.resolvedModel ?? fb.model;
+            // A mid-turn `-m`/`-e` retargets the live stream, so every message
+            // written after this point is genuinely on the new settings and the
+            // subtext has to move with them.
+            setTurnSettings(modelInForce, fb.effort, fb.ultracode);
             // The stream has moved; the comparison baseline moves with it, or
             // the next batch is measured against a snapshot that no longer
             // describes anything.
@@ -3558,6 +3567,23 @@ export async function autoAppendTaskLog(text: string, isError = false, model?: s
   log(`Task run log auto-appended from final text${isError ? ' (provider flagged the turn an error)' : ''}`);
 }
 
+/**
+ * Is this group's status subtext turned on?
+ *
+ * Never throws. `getConfig()` throws when the config was never loaded, and a
+ * footer is decoration — it must not be able to take a reply down with it. An
+ * unreadable config answers NO rather than yes: the flag exists so a group can
+ * ask for silence, and honouring that ask is the one outcome that matters if
+ * we cannot tell which group this is.
+ */
+function statusSubtextEnabled(): boolean {
+  try {
+    return getConfig().statusSubtext;
+  } catch {
+    return false;
+  }
+}
+
 async function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): Promise<void> {
   const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
@@ -3569,11 +3595,29 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
   // Dashboard messages can have no routing stamp in a freshly bound session.
   // Only that origin may inherit the resolved session route. A routed inbound,
   // including an explicit channel-root null, remains authoritative.
-  const threadId = destRouting
-    ? destRouting.threadId
-    : channelType === routing.channelType && platformId === routing.platformId
-      ? routing.threadId
-      : null;
+  const ownConversation = channelType === routing.channelType && platformId === routing.platformId;
+  const threadId = destRouting ? destRouting.threadId : ownConversation ? routing.threadId : null;
+  // Status subtext — the agent's own voice only.
+  //
+  // This is the one chokepoint every `<message to="…">` block passes through,
+  // including the `here` alias, the peer-as-destination recovery and the
+  // unwrapped-text origin fallback, so stamping here covers each of them
+  // without twelve write sites each growing their own copy.
+  //
+  // `ownConversation` is the whole gate, and it is deliberately narrow: the
+  // line describes the machinery answering YOU, so it belongs under a reply in
+  // the thread you are in and nowhere else. A cross-destination send — a
+  // sibling agent's DM, another channel, or a message the operator asked the
+  // agent to relay on their behalf — carries somebody else's words to somebody
+  // else's conversation, and stamping our model and context onto that would be
+  // both noise and a small leak of how the fleet is configured.
+  //
+  // Known gap, accepted: "post in THIS thread, as me" resolves to the origin
+  // and is stamped. No routing fact distinguishes it from a normal reply; only
+  // the agent's intent does. The alternative — a suppress flag on the sending
+  // tool — fails in the worse direction, because an agent that forgets to pass
+  // it stamps the operator's words rather than merely missing a line.
+  const subtext = ownConversation && statusSubtextEnabled() ? formatStatusSubtext() : null;
   await writeMessageOut({
     id: generateId(),
     // Batch anchor, not the channel's latest inbound row — see the poison
@@ -3583,7 +3627,7 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
     platform_id: platformId,
     channel_type: channelType,
     thread_id: threadId,
-    content: JSON.stringify({ text: body }),
+    content: JSON.stringify(subtext ? { text: body, subtext } : { text: body }),
   });
 }
 

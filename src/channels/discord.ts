@@ -1020,6 +1020,18 @@ for (const ws of workspaces) {
         // (the link rewriter only touches markdown links and bare URLs, never
         // mention syntax).
         transformOutboundMarkdown: (text) => rewriteDiscordLinks(resolveDiscordMentions(text)),
+        // Discord's own small-print syntax: `-# ` at the START of a line
+        // renders that line smaller and grayed (subtext, added 2024, desktop
+        // and mobile). It is ordinary message markdown, so unlike Slack this
+        // needs no payload surgery — the line just rides along in the body.
+        //
+        // The marker only fires at the start of a line with nothing before it,
+        // hence the explicit newline; `transformOutboundMarkdown` above has
+        // already run over the body by the time this is called, and it must
+        // not run over the footer (the footer contains no mentions or links,
+        // and re-running the rewriter over it would be a no-op at best).
+        renderSubtext: (body, subtext) =>
+          'markdown' in body ? { ...body, markdown: `${body.markdown}\n-# ${subtext}` } : body,
         // Inbound counterpart: turn the raw `<@snowflake>` form Discord
         // delivers into `@bot_username` for any sibling bot, so the agent
         // can address its peer by name instead of guessing.

@@ -12,6 +12,7 @@ import { createOpencodeClient as createOpencodeQuestionClient } from '@opencode-
 
 import { memoryContextForSessionStart, type MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { appendActiveRuntimeContext } from '../runtime-context.js';
+import { recordContextTokens } from '../turn-status.js';
 import { registerProvider } from './provider-registry.js';
 import type {
   AgentProvider,
@@ -1489,6 +1490,27 @@ export class OpenCodeProvider implements AgentProvider {
                     if (info.sessionID) sessionByMessageId.set(info.id, info.sessionID);
                     if (info.error) erroredMessageIds.add(info.id);
                     if (info.role === 'assistant') assistantUsageById.set(info.id, info);
+                    // Context occupancy for the status subtext. Unlike the
+                    // usage sum above this IS filtered to the turn's own
+                    // session: a subagent runs in its own session with its own
+                    // window, and its prompt size says nothing about ours.
+                    //
+                    // OpenCode follows Anthropic's convention, not OpenAI's —
+                    // `tokens.input` and `tokens.cache.read` are DISJOINT, so
+                    // occupancy is their sum. The measurement in
+                    // sumOpenCodeTurnUsage's header settles it: over one
+                    // session the per-message `input` summed to 325,382 while
+                    // `cache.read` summed to 1,927,040, which is impossible if
+                    // the cached figure were a subset of the input one.
+                    //
+                    // Latest-wins, and `message.updated` re-fires as a message
+                    // streams, so the value converges on that message's final
+                    // reading with no dedupe needed.
+                    if (info.role === 'assistant' && info.sessionID === turnSessionId) {
+                      const t = info.tokens;
+                      const occupancy = (t?.input ?? 0) + (t?.cache?.read ?? 0) + (t?.cache?.write ?? 0);
+                      if (occupancy > 0) recordContextTokens(occupancy);
+                    }
                   }
                   break;
                 }

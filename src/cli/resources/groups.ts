@@ -517,7 +517,8 @@ registerResource({
         '--memory-swap-limit-mb, --cpus, --cpu-shares, --pids-limit. ' +
         '--timezone takes an IANA id like "Europe/Lisbon" ("" clears back to the install default). Tasks created or edited afterwards use the new zone; an already-armed occurrence keeps its absolute fire time and the series moves onto the new grid at its next re-arm. The container clock follows after a restart. ' +
         '--provider REFUSES the switch when any armed scheduled-task pin would be invalid under the new provider (model/effort vocabularies do not nest: claude has ultracode, codex has ultra, opencode has neither and no xhigh). ' +
-        'Task pins are never rewritten for you and there is no --force: clear the refusal with `ncl tasks repin --target-provider <new>`, which validates against the provider you are moving TO and therefore works before the switch.',
+        'Task pins are never rewritten for you and there is no --force: clear the refusal with `ncl tasks repin --target-provider <new>`, which validates against the provider you are moving TO and therefore works before the switch. ' +
+        "--status-subtext on|off controls the small model/effort/context line under this group's own replies (on everywhere by default; turn it off for a group whose conversations include people outside the fleet). It is written to container.json only and takes effect at the next restart.",
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -559,6 +560,20 @@ registerResource({
           updates.cli_scope = scope;
         }
 
+        // container.json-only, no DB projection: the flag is read by the
+        // in-container runner and by nothing on the host, so a column in
+        // `container_configs` — whose job is the `-m`/`-e` flag vocabulary,
+        // task-pin validation and image builds — would be a second copy with
+        // no reader.
+        const statusSubtextArg = args['status-subtext'] ?? args.status_subtext;
+        let statusSubtext: boolean | undefined;
+        if (statusSubtextArg !== undefined) {
+          const raw = String(statusSubtextArg).toLowerCase();
+          if (raw === 'on' || raw === 'true') statusSubtext = true;
+          else if (raw === 'off' || raw === 'false') statusSubtext = false;
+          else throw new Error('--status-subtext must be one of: on, off');
+        }
+
         const memoryRequestMb = optionalIntegerArg(args, 'memory-request-mb', 'memory_request_mb');
         const memoryLimitMb = optionalIntegerArg(args, 'memory-limit-mb', 'memory_limit_mb');
         const memorySwapLimitMb = optionalIntegerArg(args, 'memory-swap-limit-mb', 'memory_swap_limit_mb');
@@ -573,9 +588,9 @@ registerResource({
           cpuShares !== undefined ||
           pidsLimit !== undefined;
 
-        if (Object.keys(updates).length === 0 && !hasResourceUpdate) {
+        if (Object.keys(updates).length === 0 && !hasResourceUpdate && statusSubtext === undefined) {
           throw new Error(
-            'Nothing to update — provide a scalar config flag or one of: --memory-request-mb, --memory-limit-mb, --memory-swap-limit-mb, --cpus, --cpu-shares, --pids-limit',
+            'Nothing to update — provide a scalar config flag, --status-subtext, or one of: --memory-request-mb, --memory-limit-mb, --memory-swap-limit-mb, --cpus, --cpu-shares, --pids-limit',
           );
         }
 
@@ -675,6 +690,17 @@ registerResource({
             // `--timezone ""` maps to null here, which must ERASE the field so
             // the spawn falls back to the install timezone.
             if (updates.timezone !== undefined) config.timezone = updates.timezone ?? undefined;
+            return config;
+          });
+        }
+
+        if (statusSubtext !== undefined) {
+          // `true` ERASES the key rather than writing it, so a group that is
+          // simply on the default carries no field. Only the opt-out is
+          // recorded, which keeps "what has this group changed?" answerable by
+          // reading the file.
+          await updateContainerConfig(group.folder, (config) => {
+            config.statusSubtext = statusSubtext ? undefined : false;
             return config;
           });
         }

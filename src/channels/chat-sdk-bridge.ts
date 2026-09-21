@@ -228,6 +228,17 @@ export async function resolveQuotedReply(
   }
 }
 
+/**
+ * The message body the bridge hands `adapter.postMessage`.
+ *
+ * `markdown` is the normal path; `raw` is the pre-rendered native-syntax path
+ * taken when an adapter declares `transformOutboundText`. `subtext` is an
+ * OPTIONAL extension this fork's Slack adapter reads in its postMessage
+ * wrapper — the Chat SDK's own postable types have no field for small print,
+ * and adapters that do not look for it ignore it harmlessly.
+ */
+export type OutboundBody = ({ markdown: string } | { raw: string }) & { subtext?: string };
+
 export interface ChatSdkBridgeConfig {
   adapter: Adapter;
   /**
@@ -277,6 +288,23 @@ export interface ChatSdkBridgeConfig {
    * pre-existing raw-delivery contract).
    */
   transformOutboundMarkdown?: (markdown: string) => string;
+  /**
+   * How this platform renders the status subtext — the small, de-emphasized
+   * line under an agent's own reply naming the model, effort and context it
+   * ran on (`container/agent-runner/src/turn-status.ts`).
+   *
+   * Takes the body the bridge was about to post and returns it with the
+   * subtext attached however the platform expresses "small print": Discord
+   * appends a `-# ` line to the markdown, Slack hands the adapter a field its
+   * postMessage wrapper turns into a Block Kit `context` block.
+   *
+   * OPT-IN ON PURPOSE. An adapter that does not declare this gets no subtext
+   * at all, rather than a generic fallback. Every platform can render extra
+   * text; not every platform can render it as small print, and a line of
+   * full-size body text repeating "opus-5 · high · 142k context" under every
+   * reply is worse in a conversation than simply not having the line.
+   */
+  renderSubtext?: (body: OutboundBody, subtext: string) => OutboundBody;
   /**
    * Re-verify a platform-claimed mention against the final inbound text.
    * Called only when the platform said isMention; returning false demotes
@@ -520,6 +548,16 @@ export function parseRetryAfterMs(err: unknown): number | null {
   return 1000;
 }
 
+/**
+ * Characters reserved beside the subtext itself when budgeting a chunk.
+ *
+ * Covers the separator an inline renderer adds — Discord's is a newline plus
+ * the three-character `-# ` marker. Four would do; the margin is here so a
+ * renderer that adds a blank line or a bullet does not silently push a
+ * maximum-length message over the platform's cap.
+ */
+const SUBTEXT_BUDGET_OVERHEAD = 8;
+
 const MAX_RATE_LIMIT_RETRIES = 3;
 const RATE_LIMIT_BUFFER_MS = 100;
 const CARD_TITLE_MAX_CODE_POINTS = 150;
@@ -706,8 +744,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   // the adapter doesn't re-parse them as CommonMark and mangle links.
   // Markdown-preserving transforms keep `markdown` delivery so adapter
   // rich-block features (Slack Block Kit tables, etc.) still fire.
-  const wrapBody = (text: string): { markdown: string } | { raw: string } =>
-    config.transformOutboundText ? { raw: text } : { markdown: text };
+  const wrapBody = (text: string): OutboundBody => (config.transformOutboundText ? { raw: text } : { markdown: text });
   let chat: Chat;
   let state: SqliteStateAdapter;
   let setupConfig: ChannelSetup;
@@ -1501,18 +1538,42 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // Chat replies (kind='chat') keep the original multi-chunk
         // behavior: they're real content the user wants in full, and the
         // 429 retry below ensures all chunks land.
+        // Status subtext — model/effort/context, stamped by the runner onto the
+        // agent's own replies only (poll-loop.ts sendToDestination). Rendered
+        // for chat replies; a 'status' thought-balloon is transient narration
+        // the host deletes when the real reply lands, so a footer on it is
+        // noise that outlives nothing.
+        const subtext =
+          message.kind === 'chat' &&
+          typeof content.subtext === 'string' &&
+          content.subtext.trim() &&
+          config.renderSubtext
+            ? content.subtext.trim()
+            : null;
+        // Reserve the footer's room in the per-message budget BEFORE splitting.
+        // Discord spends it inside the message text, so a body split to exactly
+        // the limit and then appended to would be rejected by the platform; the
+        // few characters cost nothing on a channel (Slack) that spends it in a
+        // separate block instead. Reserving before the split rather than
+        // trimming after keeps the fix in one place regardless of which
+        // rendering the adapter chose.
+        const subtextBudget = subtext ? subtext.length + SUBTEXT_BUDGET_OVERHEAD : 0;
+        const textLimit = config.maxTextLength ? Math.max(1, config.maxTextLength - subtextBudget) : undefined;
         const chunks: string[] =
-          config.maxTextLength && text.length > config.maxTextLength
+          textLimit && text.length > textLimit
             ? message.kind === 'status'
-              ? [splitForLimit(text, config.maxTextLength)[0].trimEnd() + '…']
-              : splitForLimit(text, config.maxTextLength)
+              ? [splitForLimit(text, textLimit)[0].trimEnd() + '…']
+              : splitForLimit(text, textLimit)
             : [text];
         let firstId: string | undefined;
         let chunkTid = tid;
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
           const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
-          const body = wrapBody(chunk);
+          // Last chunk only: one reply gets one footer, wherever the splitter
+          // happened to cut it.
+          const base = wrapBody(chunk);
+          const body = subtext && i === chunks.length - 1 ? config.renderSubtext!(base, subtext) : base;
           let attempt = 0;
           let chunkPosted = false;
           while (!chunkPosted) {

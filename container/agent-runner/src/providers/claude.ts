@@ -23,6 +23,7 @@ import { recordRateLimitSamples, type AccountIdentity, type RateLimitSample } fr
 import { getCredentialSlot, setCredentialSlot } from '../modules/mailbox/session-state.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { appendActiveRuntimeContext } from '../runtime-context.js';
+import { recordContextTokens } from '../turn-status.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { shimCwd } from './cwd-shim.js';
 import { parseSlotUsageSurvey, surveyEntryToUsageResponse, SLOT_USAGE_SURVEY_ENV } from './claude-slot-usage.js';
@@ -3283,6 +3284,31 @@ export class ClaudeProvider implements AgentProvider {
             // A subagent's assistant messages ride this stream too, tagged with
             // the tool call that spawned them; only the parent speaks to people.
             const topLevel = (message as { parent_tool_use_id?: string | null }).parent_tool_use_id == null;
+            // Context occupancy for the status subtext: this message's `usage`
+            // is the API response's own report of the request that produced it,
+            // so its prompt side IS what the window currently holds. Anthropic
+            // splits that prompt across three counters — `input_tokens` counts
+            // only the UNCACHED remainder, with the cached prefix reported
+            // separately as `cache_read_input_tokens` and any freshly written
+            // cache segment as `cache_creation_input_tokens` — so occupancy is
+            // the sum. Reading `input_tokens` alone would show a few hundred
+            // tokens on a warm thread and render a full window as near-empty.
+            // Top-level only: a subagent's usage measures ITS window, not ours.
+            if (topLevel) {
+              const usage = message.message?.usage;
+              if (usage) {
+                // Nullable in the SDK's own types, and a null must read as
+                // "nothing cached", never as a missing term that quietly
+                // shrinks the total.
+                const count = (value: number | null | undefined): number =>
+                  typeof value === 'number' && Number.isFinite(value) ? value : 0;
+                const occupancy =
+                  count(usage.input_tokens) +
+                  count(usage.cache_read_input_tokens) +
+                  count(usage.cache_creation_input_tokens);
+                if (occupancy > 0) recordContextTokens(occupancy);
+              }
+            }
             if (Array.isArray(blocks)) {
               let sawToolUse = false;
               for (const block of blocks) {

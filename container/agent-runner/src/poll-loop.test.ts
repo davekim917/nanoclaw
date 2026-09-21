@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 
 import { evaluateAdmission, registerAdmissionGate } from './admission-gate.js';
-import { _resetConfig, loadConfig } from './config.js';
+import { _resetConfig, _setConfigForTest, loadConfig } from './config.js';
 import { clearStaleProcessingAcks, setContainerToolInFlight } from './db/container-state.js';
 import { setContinuation } from './db/session-state.js';
 import { getRequestCandidates, rememberRequestCandidates } from './modules/mailbox/session-state.js';
@@ -46,6 +46,7 @@ import {
   queueWorkContinuation,
 } from './modules/mailbox/index.js';
 import { MockProvider } from './providers/mock.js';
+import { recordContextTokens, resetTurnStatus, setTurnSettings } from './turn-status.js';
 import { postToolUseHook, preToolUseHook } from './providers/claude.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -5314,5 +5315,125 @@ describe('outcome reporting — quiet work and expected replies', () => {
     );
     expect(result.sent).toBe(0);
     expect(getUndeliveredMessages()[0].kind).toBe('work_log');
+  });
+});
+
+describe('dispatchResultText — status subtext', () => {
+  // The rule this pins: the model/effort/context line describes the machinery
+  // answering YOU, so it belongs under a reply in the conversation you are in
+  // and nowhere else. A cross-destination send carries someone else's words to
+  // someone else's room — including a message the operator asked the agent to
+  // relay on their behalf — and must go out clean.
+  function seedDestination(name: string, channelType: string, platformId: string): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES (?, ?, 'channel', ?, ?, NULL)`,
+      )
+      .run(name, name, channelType, platformId);
+  }
+
+  function routing(channelType: string | null, platformId: string | null) {
+    return { channelType, platformId, threadId: null, inReplyTo: null, quietStatus: false };
+  }
+
+  const subtextOf = (row: { content: string }): string | undefined =>
+    (JSON.parse(row.content) as { subtext?: string }).subtext;
+
+  beforeEach(() => {
+    _resetConfig();
+    _setConfigForTest({});
+    resetTurnStatus();
+    setTurnSettings('claude-opus-5[1m]', 'xhigh');
+    recordContextTokens(142_400);
+  });
+
+  afterEach(() => {
+    resetTurnStatus();
+    _resetConfig();
+  });
+
+  it('stamps a reply addressed to the current conversation with to="here"', async () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+
+    await dispatchResultText('<message to="here">All set.</message>', routing('slack', 'C-MAIN'));
+
+    expect(subtextOf(getUndeliveredMessages()[0])).toBe('opus-5 · xhigh · 142k context');
+  });
+
+  it('stamps a reply that names the origin destination explicitly', async () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+
+    await dispatchResultText('<message to="slack-main">All set.</message>', routing('slack', 'C-MAIN'));
+
+    expect(subtextOf(getUndeliveredMessages()[0])).toBe('opus-5 · xhigh · 142k context');
+  });
+
+  it('stamps unwrapped text that falls back to the origin', async () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+
+    await dispatchResultText('I forgot to wrap this, but it is still my answer.', routing('slack', 'C-MAIN'));
+
+    expect(subtextOf(getUndeliveredMessages()[0])).toBe('opus-5 · xhigh · 142k context');
+  });
+
+  it('does NOT stamp a send to another channel — the relay-on-my-behalf case', async () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+    seedDestination('slack-other', 'slack', 'C-OTHER');
+
+    await dispatchResultText(
+      '<message to="slack-other">The operator asked me to pass this along.</message>',
+      routing('slack', 'C-MAIN'),
+    );
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].platform_id).toBe('C-OTHER');
+    expect(subtextOf(out[0])).toBeUndefined();
+  });
+
+  it('does NOT stamp a send to another platform', async () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+    seedDestination('discord-side', 'discord', 'chan-9');
+
+    await dispatchResultText('<message to="discord-side">over here</message>', routing('slack', 'C-MAIN'));
+
+    expect(subtextOf(getUndeliveredMessages()[0])).toBeUndefined();
+  });
+
+  it('stamps each destination independently when one turn addresses both', async () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+    seedDestination('slack-other', 'slack', 'C-OTHER');
+
+    await dispatchResultText(
+      '<message to="here">answering you</message><message to="slack-other">forwarding</message>',
+      routing('slack', 'C-MAIN'),
+    );
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(2);
+    const byChannel = Object.fromEntries(out.map((row) => [row.platform_id, subtextOf(row)]));
+    expect(byChannel['C-MAIN']).toBe('opus-5 · xhigh · 142k context');
+    expect(byChannel['C-OTHER']).toBeUndefined();
+  });
+
+  it('stamps nothing for a group that opted out', async () => {
+    _resetConfig();
+    _setConfigForTest({ statusSubtext: false });
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+
+    await dispatchResultText('<message to="here">All set.</message>', routing('slack', 'C-MAIN'));
+
+    expect(subtextOf(getUndeliveredMessages()[0])).toBeUndefined();
+  });
+
+  it('omits the field entirely when the turn resolved nothing to report', async () => {
+    resetTurnStatus();
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+
+    await dispatchResultText('<message to="here">All set.</message>', routing('slack', 'C-MAIN'));
+
+    const content = JSON.parse(getUndeliveredMessages()[0].content) as Record<string, unknown>;
+    expect(content).toEqual({ text: 'All set.' });
   });
 });

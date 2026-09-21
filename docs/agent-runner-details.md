@@ -914,6 +914,67 @@ The provider name comes from the `provider` key in `/workspace/agent/container.j
 
 `ProviderConfig` contains provider-specific settings (API keys, model overrides, etc.) passed via environment variables — not via the interface. Each provider reads what it needs from `env`.
 
+## Status Subtext
+
+A long-lived thread drifts: `-m`/`-e` were set twenty turns ago and nobody remembers what took
+effect. Every reply an agent posts **into its own conversation** carries a small, de-emphasized
+line naming what produced it:
+
+```
+opus-5 · xhigh · 142k context
+```
+
+**What it is made of.** `container/agent-runner/src/turn-status.ts` holds three facts and renders
+them; missing parts are simply omitted. Model and effort come from `modelInForce` in
+`poll-loop.ts` — the provider's RESOLVED model, not what was requested, since an unpinned turn
+requests nothing. `ultracode` displaces the effort level it forces, because printing `xhigh`
+would hide the orchestration half of that setting.
+
+**Where the context figure comes from.** Each provider reports a finished number rather than raw
+fields, because the arithmetic is provider-specific and getting it wrong is silent:
+
+| Provider | Source | Occupancy |
+|---|---|---|
+| Claude | assistant message `usage` | `input + cache_read + cache_creation` — Anthropic's three prompt counters are **disjoint** |
+| Codex | `thread/tokenUsage/updated` → `last` | `totalTokens`, which is Codex's own `tokens_in_context_window()`. `cachedInputTokens` is a **subset** of `inputTokens` here, so summing them double-counts |
+| OpenCode | assistant `message.updated`, turn session only | `input + cache.read + cache.write` — disjoint, like Anthropic |
+
+It is a LATEST-WINS reading of the most recent request, never a per-turn delta. This is why it
+does **not** ride `TurnUsageInfo`: that seam's numbers go through `toTurnDelta`, and context
+occupancy is an absolute reading that must not be differenced.
+
+**Whose voice gets stamped.** `sendToDestination` (`poll-loop.ts`) is the single chokepoint every
+`<message to="…">` block passes through, and it stamps only when the destination resolves to the
+session's own conversation. A cross-destination send — a sibling agent's DM, another channel, or
+a message the operator asked the agent to relay on their behalf — goes out clean. `send_file`
+captions, `edit_message`, `add_reaction` and the runner's own infra notices are never stamped.
+
+*Known gap, accepted:* "post in THIS thread, as me" resolves to the origin and is stamped. No
+routing fact distinguishes it from a normal reply. A suppress flag on the sending tool was
+rejected as the worse failure: an agent that forgets to pass it stamps the operator's words.
+
+**Rendering is per platform and opt-in.** An adapter declares `renderSubtext` on its bridge
+config; one that does not gets no subtext at all, because a full-size line of telemetry under
+every reply is worse than no line.
+
+- **Slack** — a Block Kit `context` block. A Slack message carries either `markdown_text` **or**
+  `blocks`, never both, so `src/channels/slack-subtext.ts` wraps the adapter's Web client and
+  rewrites the finished payload into `[{type:'markdown'}, {type:'context'}]`. It wraps the client
+  rather than `postMessage` so the adapter's mention resolution and emoji normalization still
+  run. A drift guard in `slack-subtext.test.ts` fails if the vendored adapter renames either seam.
+- **Discord** — `-# ` at line start (Discord's native subtext). Ordinary message markdown, so no
+  payload surgery.
+
+The bridge reserves the footer's room *before* splitting an oversize reply, so an appended footer
+cannot push the final chunk past the platform's cap, and stamps the last chunk only.
+
+**Opting out.** On for every group by default. `ncl groups config update --id <group> --status-subtext off`
+writes `"statusSubtext": false` into that group's `container.json` (no DB projection — nothing on
+the host reads it) and takes effect at the next restart. Turning it back `on` erases the key
+rather than writing `true`, so only a deliberate opt-out is ever recorded. A config the runner
+cannot read fails **closed**: the flag exists so a group can ask for silence, and honouring that
+ask is what matters when we cannot tell which group we are.
+
 ## Agent-Runner Properties
 
 - MCP server is a separate Node process spawned by the provider (via `mcpServers` config)
