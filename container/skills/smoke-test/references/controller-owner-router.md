@@ -23,8 +23,8 @@ Otherwise one judgment step is due and `scriptOutput` is:
 
 The controller does all of the mechanics: the gate's `poll`, `progress` and
 `finish`, every chat post, the design critic and adjudicator one-shots, issue
-filing, the PR comment and the freeze-PR close. You do the one judgment step
-the brief names, write its artifacts, and stop.
+filing, the PR comment and the freeze-PR close. You route the one judgment step
+to the retained technical owner, verify its artifact receipt, and stop.
 
 ## Every judgment wake
 
@@ -34,7 +34,11 @@ the brief names, write its artifacts, and stop.
 2. Read the brief end to end, then read the `/smoke-test` skill. The standing
    "Retained technical ownership" rules apply unchanged: one retained
    provider-native `qa-smoke-worker` owns every substantive QA decision, and
-   the two QA sides stay independent.
+   the two QA sides stay independent. Reuse the same available native handle
+   across intake, lanes, preliminary and synthesis; a step is not a new owner.
+   For a new bounded Codex owner use `fork_turns: "none"` and the full scoped
+   brief/role context. Missing continuity requires a recorded recovery decision
+   preserving old evidence, not silent replacement or replay.
 3. Do only that step. Write only the artifacts the brief names, under
    `<run>/`. Source `/workspace/agent/smoke-gate-env.sh` before any direct
    `smoke-run-scaffold.sh` or `smoke-evidence-barrier.sh` call. For a scaffold
@@ -43,7 +47,9 @@ the brief names, write its artifacts, and stop.
 4. Stop when the step's artifacts are written. The next controller fire picks
    them up. If the step genuinely cannot finish in one turn (usually lanes),
    call `continue_work({ task })` before yielding and resume from durable
-   state.
+   state. This does not guarantee the child survives a turn/container boundary.
+   After the step is durable, do not poll the next gate with the worker: the
+   existing controller observations and deadlines own that transition.
 
 ## A failure wake
 
@@ -130,7 +136,7 @@ suppress it.
 | step | done when this exists | you write |
 |---|---|---|
 | `intake` | `completion-contract.json` (written LAST) | journeys pin, unmapped-path dispositions, contract via the scaffold, the contact sheet when a frontend preview exists, `controller/root-summary.md` (1–2 plain sentences: what changes, what is tested) |
-| `lanes` | every lane marker passes the `lanes` barrier | lane workers' evidence and markers (dispatch in the foreground, await in this turn) |
+| `lanes` | every lane marker passes the `lanes` barrier | same retained owner's lane evidence and markers (await in this turn) |
 | `preliminary` | `coordinator/preliminary.md` | the preliminary, written before reading anything under `challenger/` |
 | `synthesis` | `synthesis.json` | `coordinator/synthesis.md`, `synthesis.json`, `run-record.md`, `controller/verdict-bullets.md` (at most three plain-language bullets, no machine tokens), `controller/issues/<findingId>.json` per confirmed finding |
 | `adjudicated` | `synthesis.json` | the synthesis, now with the adjudicator's ruling applied |
