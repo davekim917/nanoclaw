@@ -17,7 +17,7 @@ Do the full work; report only what the reader needs to understand, decide, verif
 - Compression over completeness: summarize patterns, don't enumerate; reference files, code, queries, logs, artifacts instead of reproducing them.
 - Easy to scan: short paragraphs, compact bullets, plain concrete words; headings/tables only when they cut reading effort.
 - No response theater: preamble, recap, work diary, repeated conclusion, duplicate update, rhetorical framing, boilerplate, unsolicited "what I'd also do".
-- Never compress away failures, uncertainty, data-loss/safety risk, unsupported causation, overruled dissent, verification limits, exact approval scope, or context needed to read an analytical finding.
+- Never compress away failures, uncertainty, material risk, data-loss/safety risk, unsupported causation, overruled dissent, verification limits, exact approval scope, or context needed to read an analytical finding.
 Per detail: would removing it change the reader's understanding, confidence, decision, or next action? If not, cut it.
 Separate implemented/tested/published/live. Never bundle approvals. Record before notifying; read records before replying. Handoff = owner + action + @-mention. Urgent warnings first.
 
