@@ -46,7 +46,7 @@ INBOUND_DB = os.environ.get("SMOKE_CONTROLLER_LIVE_INBOUND_DB", "/workspace/inbo
 # process's environment (smoke-campaign-controller.py:1393 -> run_read_only ->
 # spawn, :638-650, env=None), and it read the fallback
 # ${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases
-# (smoke-evidence-barrier.sh:722). No pin for the campaign lives there, so
+# (smoke-evidence-barrier.sh:739). No pin for the campaign lives there, so
 # smoke-journeys.py's barrier took the "no gate pin owns it" path (:997) and
 # every campaign stranded at the lanes barrier.
 #

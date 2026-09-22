@@ -658,10 +658,10 @@ pi_expect synthesis '(.invalidReasons[0] | contains("not a frozen pair") and con
 # for the contract's own rules, so these assert only on identity.json.)
 jq '.ownershipKind = "pr" | .coordinatorOwnerToken = "tok-pi-fixture-0001" | .pr = 9001 | .runId = "pi run with spaces"' "$PI/completion-contract.json" > "$PI/c.tmp" && mv "$PI/c.tmp" "$PI/completion-contract.json"
 jq -c '. + {expectedSourceSha:"2222222222222222222222222222222222222222"}' "$PI/id.good" > "$PI/coordinator/identity.json"
-pi_expect synthesis '(.invalid | index("coordinator/identity.json")) != null and any(.invalidReasons[]; contains("expectedSourceSha does not name"))' \
+pi_expect synthesis '(.invalid | index("coordinator/identity.json")) != null and any(.invalidReasons[]; contains("names a different build"))' \
   "a PR freeze naming another sourceSha must refuse"
 jq -c --arg s "$PI_SHA" '. + {expectedSourceSha:$s} | .backend.commit = "3333333333333333333333333333333333333333"' "$PI/id.good" > "$PI/coordinator/identity.json"
-pi_expect synthesis '(.invalid | index("coordinator/identity.json")) != null and any(.invalidReasons[]; contains("frozen commits are not"))' \
+pi_expect synthesis '(.invalid | index("coordinator/identity.json")) != null and any(.invalidReasons[]; contains("the frozen commits are not"))' \
   "a PR freeze whose commits are not the sourceSha must refuse"
 jq -c --arg s "$PI_SHA" '. + {expectedSourceSha:$s}' "$PI/id.good" > "$PI/coordinator/identity.json"
 pi_expect synthesis '(.invalid | index("coordinator/identity.json")) == null' "a well-formed PR freeze must not be refused"

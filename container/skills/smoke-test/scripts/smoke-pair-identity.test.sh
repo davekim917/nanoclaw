@@ -463,33 +463,85 @@ expect_rc "$(run finish "$RUN16")" 3 pr-finish-blocks-source-mismatch
 out | grep -Fq "finish: source mismatch" ||
   fail "pr-finish-blocks-source-mismatch: finish did not preserve BLOCKED semantics"
 
-# --- 8. A re-freeze keeps the PR source binding (#1039 closing review, P1) --
-# `refreeze` rebuilds identity.json from the live read; it used to carry only
-# `history`, dropping the expectedSourceSha `start` wrote. The barrier's shape
-# check then refused the re-frozen record on every fire, so a PR run that took
-# the sanctioned drift recovery could never reach GO. Sequence: PR contract ->
-# start -> ok -> backend redeploy -> drift -> refreeze -> ok.
-RUN17="$T/run17"; mkdir -p "$RUN17"
-cat >"$RUN17/completion-contract.json" <<JSON
-{"schemaVersion":1,"sourceSha":"$SRC_SHA","ownershipKind":"pr","pairIdentity":"required","requiredLaneMarkers":[]}
-JSON
-mk dep-fe000000017 live "$SRC_SHA" > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"
-mk dep-be000000017 live "$SRC_SHA" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
-expect_rc "$(run start "$RUN17")" 0 pr-refreeze-start
-expect_rc "$(run check "$RUN17" before-redeploy)" 0 pr-refreeze-first-check
-mk dep-be000000018 live "$SRC_SHA" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
-expect_rc "$(run check "$RUN17" after-redeploy)" 3 pr-refreeze-drift
-expect_rc "$(run refreeze "$RUN17" "backend redeployed at the same source")" 0 pr-refreeze
-jq -e --arg sha "$SRC_SHA" '.freezeGeneration == 2 and .expectedSourceSha == $sha
-    and .frontend.commit == $sha and .backend.commit == $sha and .backend.deploy == "dep-be000000018"' \
-  "$RUN17/coordinator/identity.json" >/dev/null ||
-  fail "pr-refreeze: the re-frozen record dropped the PR source binding: $(cat "$RUN17/coordinator/identity.json")"
-expect_rc "$(run check "$RUN17" after-refreeze)" 0 pr-refreeze-check
-# The barrier must accept the re-frozen record as a frozen pair. This hand-made
-# pr contract is incomplete for the contract's own rules, so assert only on
-# identity.json -- the file the regression refused.
-BOUT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$RUN17" lanes 2>/dev/null || true)"
-jq -e '(.invalid | index("coordinator/identity.json")) == null' <<<"$BOUT" >/dev/null ||
-  fail "pr-refreeze-barrier: the barrier refused the re-frozen identity.json: $BOUT"
+# --- 8. The barrier accepts every record either writer produces, in either --
+#        contract order, and refuses a pair frozen for another build
+# There are exactly two writers of identity.json, `start` and `refreeze`, and
+# each writes expectedSourceSha only when a PR contract already exists. Two
+# closing reviews of #1039 found the barrier's frozen-record check refusing a
+# legitimate record from one writer path (refreeze, then start-before-contract),
+# so this drives every writer x contract-order combination through the real
+# verbs. Each contract names a required lane: with none, the barrier exits in
+# its prelude and never reaches the identity block, and an assertion that
+# identity.json was not refused passes vacuously -- so every accept below also
+# requires `has("phase")` (only a full barrier pass emits it) and the record on
+# disk.
+PR_OWNER_TOKEN="tok-pi-test-0001"
+pr_contract() { # <run> <sha> [ownershipKind]
+  jq -n --arg s "$2" --arg k "${3:-pr}" --arg r "$(basename "$1")" --arg t "$PR_OWNER_TOKEN" \
+    '{schemaVersion:2,sourceSha:$s,ownershipKind:$k,pairIdentity:"required",
+      requiredLaneMarkers:["markers/X.json"],lanes:[{id:"X",kind:"lane",generation:1}]}
+     + (if $k == "pr" then {coordinatorOwnerToken:$t,pr:9001,runId:$r,repoSlug:"acme/app"} else {} end)' \
+    > "$1/completion-contract.json"
+}
+serve_pair() { # <n> <frontend commit> <backend commit>
+  mk "$(printf 'dep-fe%09d' "$1")" live "$2" > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"
+  mk "$(printf 'dep-be%09d' "$1")" live "$3" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+}
+identity_verdict() { # <run> -> accept | refuse:<reason> | vacuous:<why>
+  local o
+  [ -s "$1/coordinator/identity.json" ] || { echo "vacuous:nothing frozen"; return; }
+  o="$(bash "$BARRIER" "$1" lanes 2>/dev/null || true)"
+  jq -e 'has("phase")' <<<"$o" >/dev/null 2>&1 || { echo "vacuous:barrier exited before the identity block: $o"; return; }
+  jq -r 'if (.invalid | index("coordinator/identity.json")) != null
+         then "refuse:" + ([.invalidReasons[] | select(startswith("coordinator/identity.json"))][0])
+         elif (.missing | index("coordinator/identity.json")) != null then "vacuous:identity.json listed missing"
+         else "accept" end' <<<"$o"
+}
+expect_accept() { local got; got="$(identity_verdict "$1")"; [ "$got" = accept ] || fail "$2: expected the barrier to accept the frozen record, got $got"; }
+expect_refuse() { # <run> <reason substring> <label>
+  local got; got="$(identity_verdict "$1")"
+  case "$got" in refuse:*"$2"*) ;; *) fail "$3: expected a refusal naming '$2', got $got" ;; esac
+}
+n8=0; run8() { n8=$((n8 + 1)); R8="$T/run8-$n8"; mkdir -p "$R8"; }
+
+# 8a. contract -> start: the ordinary order.
+run8; serve_pair 81 "$SRC_SHA" "$SRC_SHA"; pr_contract "$R8" "$SRC_SHA"
+expect_rc "$(run start "$R8")" 0 m8a-start; expect_accept "$R8" m8a
+# 8b. start BEFORE the contract (supported: SKILL.md "Every run, from the
+#     coordinator freezing before dispatch"): no expectedSourceSha is written,
+#     and its absence must not refuse -- the commits bind the pair.
+run8; serve_pair 82 "$SRC_SHA" "$SRC_SHA"; expect_rc "$(run start "$R8")" 0 m8b-start
+jq -e 'has("expectedSourceSha") | not' "$R8/coordinator/identity.json" >/dev/null || fail "m8b: fixture premise: start wrote expectedSourceSha with no contract"
+pr_contract "$R8" "$SRC_SHA"; expect_accept "$R8" m8b
+# 8c. start -> refreeze, both before the contract -> contract.
+run8; serve_pair 83 "$SRC_SHA" "$SRC_SHA"; expect_rc "$(run start "$R8")" 0 m8c-start
+serve_pair 84 "$SRC_SHA" "$SRC_SHA"; expect_rc "$(run refreeze "$R8" "redeployed before dispatch")" 0 m8c-refreeze
+pr_contract "$R8" "$SRC_SHA"; expect_accept "$R8" m8c
+# 8d. contract -> start -> redeploy -> drift -> refreeze: refreeze keeps the
+#     binding start wrote (#1039 closing review 1).
+run8; serve_pair 85 "$SRC_SHA" "$SRC_SHA"; pr_contract "$R8" "$SRC_SHA"
+expect_rc "$(run start "$R8")" 0 m8d-start; expect_rc "$(run check "$R8" before)" 0 m8d-check
+serve_pair 86 "$SRC_SHA" "$SRC_SHA"; expect_rc "$(run check "$R8" after-redeploy)" 3 m8d-drift
+expect_rc "$(run refreeze "$R8" "backend redeployed at the same source")" 0 m8d-refreeze
+jq -e --arg s "$SRC_SHA" '.freezeGeneration == 2 and .expectedSourceSha == $s' "$R8/coordinator/identity.json" >/dev/null ||
+  fail "m8d: the re-frozen record dropped the PR source binding: $(cat "$R8/coordinator/identity.json")"
+expect_accept "$R8" m8d
+# 8e. start -> contract -> refreeze.
+run8; serve_pair 87 "$SRC_SHA" "$SRC_SHA"; expect_rc "$(run start "$R8")" 0 m8e-start; pr_contract "$R8" "$SRC_SHA"
+serve_pair 88 "$SRC_SHA" "$SRC_SHA"; expect_rc "$(run refreeze "$R8" "redeployed")" 0 m8e-refreeze; expect_accept "$R8" m8e
+# 8f. The develop pair frozen before the PR contract existed is bound to
+#     another build: refused, naming refreeze as the repair -- which works.
+run8; serve_pair 89 "$A" "$B"; expect_rc "$(run start "$R8")" 0 m8f-start; pr_contract "$R8" "$SRC_SHA"
+expect_refuse "$R8" "bound to a different build" m8f; expect_refuse "$R8" "refreeze" m8f-names-repair
+serve_pair 90 "$SRC_SHA" "$SRC_SHA"; expect_rc "$(run refreeze "$R8" "froze the develop pair before the contract")" 0 m8f-refreeze
+expect_accept "$R8" m8f-repaired
+# 8g. The contract regenerated onto a new build after the freeze: the recorded
+#     expectedSourceSha names the old one. Refused; refreeze on the new pair repairs it.
+run8; serve_pair 91 "$SRC_SHA" "$SRC_SHA"; pr_contract "$R8" "$SRC_SHA"; expect_rc "$(run start "$R8")" 0 m8g-start
+pr_contract "$R8" "$SRC_SHA2"; expect_refuse "$R8" "names a different build" m8g
+serve_pair 92 "$SRC_SHA2" "$SRC_SHA2"; expect_rc "$(run refreeze "$R8" "new build")" 0 m8g-refreeze; expect_accept "$R8" m8g-repaired
+# 8h. A develop contract binds no source: a split pair is accepted in either order.
+run8; serve_pair 93 "$A" "$B"; pr_contract "$R8" "$SRC_SHA" develop; expect_rc "$(run start "$R8")" 0 m8h-start; expect_accept "$R8" m8h
+run8; serve_pair 94 "$A" "$B"; expect_rc "$(run start "$R8")" 0 m8h2-start; pr_contract "$R8" "$SRC_SHA" develop; expect_accept "$R8" m8h2
 
 echo "smoke pair identity tests passed"
