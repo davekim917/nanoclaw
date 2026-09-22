@@ -42,11 +42,28 @@ const DISCOVERY_ROOTS = [path.join(REPO_ROOT, 'container'), path.join(REPO_ROOT,
 allowSubprocess(['bash']);
 enforceHermeticity();
 
-/** Give each suite generous headroom over vitest's 5s default: the slowest
- * discovered suite (smoke-pr-gate.test.sh) runs real poll/claim loops with
- * short internal sleeps and takes 80-100s on this host; smoke-develop-gate.test.sh
- * takes ~30s. The rest finish in a few seconds. */
+/** Per-suite budget, generous over vitest's 5s default. Most suites finish in
+ * seconds; this is a hang detector, not a performance target. */
 const SUITE_TIMEOUT_MS = 400_000;
+
+/**
+ * Suites measured to need more than SUITE_TIMEOUT_MS, each with its own budget
+ * and the measurement behind it. Timed on pristine main 44838b67 (2026-09-22),
+ * run exactly as this file runs them, throttled: controller-live did not finish
+ * inside 450s (the builder measured 523s with #2092's cases added); pr-gate took
+ * 430s (462s on the #2092 branch). Both run hundreds of real controller fires
+ * or poll/claim loops -- they are long, not hung. A budget here is still a hang
+ * detector: roughly 1.7x the slowest measurement. Every path is asserted to
+ * exist below, so a rename cannot silently fall back to the default.
+ */
+const SLOW_SUITE_TIMEOUT_MS: Readonly<Record<string, number>> = {
+  'container/skills/smoke-test/scripts/smoke-campaign-controller-live.test.sh': 900_000,
+  'container/skills/smoke-test/scripts/smoke-pr-gate.test.sh': 800_000,
+};
+
+function suiteTimeoutMs(relPath: string): number {
+  return SLOW_SUITE_TIMEOUT_MS[relPath] ?? SUITE_TIMEOUT_MS;
+}
 
 /**
  * Suites that cannot run in this hermetic CI sandbox (Docker, a real browser,
@@ -153,6 +170,15 @@ describe('every container skill shell test suite (*.test.sh)', () => {
     expect(ALL_SUITES).toContain('container/skills/agent-browser/scripts/ab-net-redact.test.sh');
     // Proves the scripts/ root is actually walked, not just container/.
     expect(ALL_SUITES).toContain('scripts/check-onecli-gateway-fds.test.sh');
+  });
+
+  it('every slow-suite budget names a suite that still exists and is not excluded', () => {
+    for (const relPath of Object.keys(SLOW_SUITE_TIMEOUT_MS)) {
+      expect(
+        RUNNABLE_SUITES,
+        `slow-suite budget for ${relPath} names no runnable suite — update or remove it`,
+      ).toContain(relPath);
+    }
   });
 
   it('every excluded suite path still exists', () => {
@@ -264,23 +290,41 @@ describe('every container skill shell test suite (*.test.sh)', () => {
 
   for (const relPath of RUNNABLE_SUITES) {
     const suitePath = path.join(REPO_ROOT, relPath);
+    const budgetMs = suiteTimeoutMs(relPath);
     it(
       `passes: ${relPath}`,
       () => {
         const freshHome = mkdtempSync(path.join(tmpdir(), 'skill-shell-test-home-'));
         try {
-          execFileSync('bash', [suitePath], {
-            encoding: 'utf-8',
-            stdio: ['ignore', 'pipe', 'pipe'],
-            env: buildSuiteEnv(freshHome),
-          });
+          // The budget is enforced on the suite's whole PROCESS GROUP.
+          // execFileSync is synchronous, so vitest's own timeout cannot
+          // interrupt it: without this a suite that really hangs blocks the run
+          // forever, and one that is merely slow is reported "timed out" only
+          // after it has finished anyway. coreutils `timeout` runs the suite in
+          // its own process group and KILLs the group, so a hung grandchild
+          // (the 09-13 orphans were a `trash` under a suite, alive 9 days) dies
+          // with it instead of outliving the run. execFileSync's own timeout
+          // is the backstop if `timeout` itself wedges.
+          execFileSync(
+            'bash',
+            ['-c', 'exec timeout -s KILL "$0" bash "$1"', `${Math.ceil(budgetMs / 1000)}s`, suitePath],
+            {
+              encoding: 'utf-8',
+              stdio: ['ignore', 'pipe', 'pipe'],
+              env: buildSuiteEnv(freshHome),
+              timeout: budgetMs + 15_000,
+              killSignal: 'SIGKILL',
+            },
+          );
         } catch (err) {
           throw new Error(formatShellSuiteFailure(relPath, err));
         } finally {
           rmSync(freshHome, { recursive: true, force: true });
         }
       },
-      SUITE_TIMEOUT_MS,
+      // Headroom over both kills above, so one of them is what fires and the
+      // suite's output reaches formatShellSuiteFailure.
+      budgetMs + 30_000,
     );
   }
 });
