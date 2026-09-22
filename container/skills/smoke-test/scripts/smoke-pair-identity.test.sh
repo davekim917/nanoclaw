@@ -463,4 +463,33 @@ expect_rc "$(run finish "$RUN16")" 3 pr-finish-blocks-source-mismatch
 out | grep -Fq "finish: source mismatch" ||
   fail "pr-finish-blocks-source-mismatch: finish did not preserve BLOCKED semantics"
 
+# --- 8. A re-freeze keeps the PR source binding (#1039 closing review, P1) --
+# `refreeze` rebuilds identity.json from the live read; it used to carry only
+# `history`, dropping the expectedSourceSha `start` wrote. The barrier's shape
+# check then refused the re-frozen record on every fire, so a PR run that took
+# the sanctioned drift recovery could never reach GO. Sequence: PR contract ->
+# start -> ok -> backend redeploy -> drift -> refreeze -> ok.
+RUN17="$T/run17"; mkdir -p "$RUN17"
+cat >"$RUN17/completion-contract.json" <<JSON
+{"schemaVersion":1,"sourceSha":"$SRC_SHA","ownershipKind":"pr","pairIdentity":"required","requiredLaneMarkers":[]}
+JSON
+mk dep-fe000000017 live "$SRC_SHA" > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"
+mk dep-be000000017 live "$SRC_SHA" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+expect_rc "$(run start "$RUN17")" 0 pr-refreeze-start
+expect_rc "$(run check "$RUN17" before-redeploy)" 0 pr-refreeze-first-check
+mk dep-be000000018 live "$SRC_SHA" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+expect_rc "$(run check "$RUN17" after-redeploy)" 3 pr-refreeze-drift
+expect_rc "$(run refreeze "$RUN17" "backend redeployed at the same source")" 0 pr-refreeze
+jq -e --arg sha "$SRC_SHA" '.freezeGeneration == 2 and .expectedSourceSha == $sha
+    and .frontend.commit == $sha and .backend.commit == $sha and .backend.deploy == "dep-be000000018"' \
+  "$RUN17/coordinator/identity.json" >/dev/null ||
+  fail "pr-refreeze: the re-frozen record dropped the PR source binding: $(cat "$RUN17/coordinator/identity.json")"
+expect_rc "$(run check "$RUN17" after-refreeze)" 0 pr-refreeze-check
+# The barrier must accept the re-frozen record as a frozen pair. This hand-made
+# pr contract is incomplete for the contract's own rules, so assert only on
+# identity.json -- the file the regression refused.
+BOUT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$RUN17" lanes 2>/dev/null || true)"
+jq -e '(.invalid | index("coordinator/identity.json")) == null' <<<"$BOUT" >/dev/null ||
+  fail "pr-refreeze-barrier: the barrier refused the re-frozen identity.json: $BOUT"
+
 echo "smoke pair identity tests passed"

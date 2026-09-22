@@ -307,11 +307,15 @@ PY
     NOW_ISO="$(date -u +%FT%TZ)"
     PAYLOAD="$(jq -c \
       --argjson old "$OLD" --arg reason "$REASON" --arg at "$NOW_ISO" --argjson gen "$NEW_GEN" \
-      --argjson snap "$SNAP" \
+      --argjson snap "$SNAP" --arg expected "$EXPECTED_SOURCE_SHA" \
       '. + {freezeGeneration: $gen, refreezeLaneSnapshot: $snap,
             history: (($old.history // []) + [{
               frontend: $old.frontend, backend: $old.backend, readAt: $old.readAt,
-              reason: $reason, refrozenAt: $at}])}' <<<"$P")" || {
+              reason: $reason, refrozenAt: $at}])}
+       # The re-frozen record is a frozen pair like any other: it keeps the
+       # source binding `start` wrote, or the barrier refuses it as not a
+       # frozen pair (smoke-evidence-barrier.sh, shape check) on every fire.
+       + (if $expected == "" then {} else {expectedSourceSha: $expected} end)' <<<"$P")" || {
       echo "REFUSED: could not build the re-frozen payload (exit 2)" >&2; exit 2; }
     python3 - "$RUN/coordinator" "$PAYLOAD" <<'PY'
 import json, os, sys, tempfile

@@ -560,7 +560,7 @@ done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 #   - the latest check at this generation not `ok` (an `unreadable` read):
 #     INVALID until a fresh check reads the pair.
 #   - a record line that is not JSON: INVALID, whatever its generation, as
-#     `finish` refuses it (smoke-pair-identity.sh:379-381) — a check only appends,
+#     `finish` refuses it (smoke-pair-identity.sh:383-385) — a check only appends,
 #     so it cannot heal.
 # The MISSING -> INVALID transitions are deliberate: the controller re-offers
 # an acknowledged step when `invalid[]` changes and never on `missing[]`
@@ -662,7 +662,7 @@ elif [ "$PAIR_IDENTITY_MODE" = required ] && [ -z "${refreeze_error:-}" ]; then
         ;;
       damaged)
         # A further check appends after the damage and does not repair it;
-        # `finish` refuses the same file (smoke-pair-identity.sh:379-381).
+        # `finish` refuses the same file (smoke-pair-identity.sh:383-385).
         INVALID+=("$IDENTITY_CHECKS_REL")
         INVALID_REASONS+=("$IDENTITY_CHECKS_REL: $checks_reason — the check record is damaged and another check cannot repair it (it only appends); do not edit it by hand: conclude BLOCKED, or escalate if the pair evidence matters to this verdict")
         ;;
