@@ -6,6 +6,7 @@ import path from 'path';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { MEMORY_SESSION_HOOK } from '../memory/session-hook.js';
 import { CodexProvider } from './codex.js';
+import { formatStatusSubtext, resetTurnStatus, setTurnSettings } from '../turn-status.js';
 
 /**
  * `thread/tokenUsage/updated` fires once per MODEL REQUEST, not once per turn,
@@ -267,5 +268,40 @@ describe('CodexProvider token usage', () => {
     // A coverage gap must stay visible as a NULL-token row (see TurnUsageInfo),
     // never as a fabricated all-zero turn.
     expect(await runTurnUsage([])).toBeUndefined();
+  }, 10_000);
+});
+
+describe('CodexProvider context occupancy (status subtext)', () => {
+  // Wiring proof for the subtext's context figure, driven through the same
+  // fake app-server as the usage assertions above. The arithmetic choice is
+  // argued in context-occupancy.test.ts; what is pinned here is that the
+  // provider actually reads it off a live `thread/tokenUsage/updated` frame.
+  beforeEach(() => resetTurnStatus());
+  afterEach(() => resetTurnStatus());
+
+  it('reads the window off the LAST request of the turn, not the sum', async () => {
+    // The usage ledger SUMS these three `last` figures (that is the test at
+    // the top of this file). Occupancy must not: the window holds what the
+    // final request carried, not the total of every request's prompt.
+    setTurnSettings('gpt-5.4-codex', 'xhigh');
+    await runTurnUsage([
+      { last: [127058, 119552, 305, 77], total: [8116919, 7769856, 25671, 12693] },
+      { last: [127391, 126720, 156, 45], total: [8244310, 7896576, 25827, 12738] },
+      { last: [129606, 126720, 6860, 2955], total: [8373916, 8023296, 32687, 15693] },
+    ]);
+
+    // totalTokens of the final request = 129,606 + 6,860 = 136,466.
+    expect(formatStatusSubtext()).toBe('gpt-5.4-codex · xhigh · 136k context');
+  });
+
+  it('shows this turn`s window, not the resumed thread`s lifetime total', async () => {
+    // A respawned container resumes a long-lived codex thread, so the first
+    // notification carries an 8.3M thread-scoped `total` beside a small
+    // `last`. Reading `total` would render "8378k context" for a window
+    // holding a few thousand tokens.
+    setTurnSettings('gpt-5.4-codex', 'high');
+    await runTurnUsage([{ last: [4210, 3900, 118, 40], total: [8378126, 8027196, 32805, 15733] }]);
+
+    expect(formatStatusSubtext()).toBe('gpt-5.4-codex · high · 4.3k context');
   }, 10_000);
 });

@@ -24,6 +24,40 @@ import { getCredentialSlot, setCredentialSlot } from '../modules/mailbox/session
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { appendActiveRuntimeContext } from '../runtime-context.js';
 import { recordContextTokens } from '../turn-status.js';
+
+/**
+ * Tokens occupying the context window, from one API response's `usage`.
+ *
+ * ANTHROPIC'S THREE PROMPT COUNTERS ARE DISJOINT. `input_tokens` counts only
+ * the UNCACHED remainder of the prompt; the cached prefix is reported
+ * separately as `cache_read_input_tokens` and a freshly written cache segment
+ * as `cache_creation_input_tokens`. Occupancy is therefore the SUM. Reading
+ * `input_tokens` alone is the silent failure this function exists to prevent:
+ * on a warm thread it is a few hundred tokens, so a nearly full window would
+ * render as almost empty.
+ *
+ * Contrast providers/codex.ts, where `cachedInputTokens` is a SUBSET of
+ * `inputTokens` and the same sum would double-count. Each provider converts
+ * its own report to a finished number for exactly this reason.
+ *
+ * Returns 0 when there is nothing usable — `recordContextTokens` ignores it,
+ * so a response with no usage leaves the previous reading standing rather
+ * than zeroing the display.
+ */
+export function claudeContextOccupancy(usage: {
+  input_tokens?: number | null;
+  cache_read_input_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+} | null | undefined): number {
+  if (!usage) return 0;
+  // Nullable in the SDK's own types, and a null must read as "nothing cached",
+  // never as a missing term that quietly shrinks the total.
+  const count = (value: number | null | undefined): number =>
+    typeof value === 'number' && Number.isFinite(value) ? value : 0;
+  return (
+    count(usage.input_tokens) + count(usage.cache_read_input_tokens) + count(usage.cache_creation_input_tokens)
+  );
+}
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { shimCwd } from './cwd-shim.js';
 import { parseSlotUsageSurvey, surveyEntryToUsageResponse, SLOT_USAGE_SURVEY_ENV } from './claude-slot-usage.js';
@@ -3294,21 +3328,7 @@ export class ClaudeProvider implements AgentProvider {
             // the sum. Reading `input_tokens` alone would show a few hundred
             // tokens on a warm thread and render a full window as near-empty.
             // Top-level only: a subagent's usage measures ITS window, not ours.
-            if (topLevel) {
-              const usage = message.message?.usage;
-              if (usage) {
-                // Nullable in the SDK's own types, and a null must read as
-                // "nothing cached", never as a missing term that quietly
-                // shrinks the total.
-                const count = (value: number | null | undefined): number =>
-                  typeof value === 'number' && Number.isFinite(value) ? value : 0;
-                const occupancy =
-                  count(usage.input_tokens) +
-                  count(usage.cache_read_input_tokens) +
-                  count(usage.cache_creation_input_tokens);
-                if (occupancy > 0) recordContextTokens(occupancy);
-              }
-            }
+            if (topLevel) recordContextTokens(claudeContextOccupancy(message.message?.usage));
             if (Array.isArray(blocks)) {
               let sawToolUse = false;
               for (const block of blocks) {

@@ -43,12 +43,18 @@ let ultracode = false;
  * Record the context occupancy observed on a provider request.
  *
  * Called per request, not per turn: a turn makes many round trips and the
- * latest one is the honest reading. Non-finite and negative values are ignored
- * rather than rendered — a provider that reports nothing usable should leave
- * the figure off the line, not print `NaN context`.
+ * latest one is the honest reading.
+ *
+ * ZERO IS REJECTED ALONG WITH negatives and non-finites. Every real request
+ * carries a prompt, so 0 never means "the window is empty" — it means the
+ * provider reported nothing usable, which is how each provider's occupancy
+ * helper signals an absent or empty usage block. Accepting it would let a
+ * mid-turn frame that happens to carry no usage overwrite a good reading and
+ * render `0 context` under the reply. The guard lives HERE rather than at the
+ * three provider call sites so no future caller can forget it.
  */
 export function recordContextTokens(tokens: number | null | undefined): void {
-  if (typeof tokens !== 'number' || !Number.isFinite(tokens) || tokens < 0) return;
+  if (typeof tokens !== 'number' || !Number.isFinite(tokens) || tokens <= 0) return;
   contextTokens = Math.round(tokens);
 }
 

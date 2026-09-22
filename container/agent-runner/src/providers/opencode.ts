@@ -13,6 +13,32 @@ import { createOpencodeClient as createOpencodeQuestionClient } from '@opencode-
 import { memoryContextForSessionStart, type MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { appendActiveRuntimeContext } from '../runtime-context.js';
 import { recordContextTokens } from '../turn-status.js';
+
+/**
+ * Tokens occupying the context window, from one assistant message's `tokens`.
+ *
+ * OPENCODE FOLLOWS ANTHROPIC'S CONVENTION, NOT OPENAI'S — `input` and
+ * `cache.read` are DISJOINT, so occupancy is their sum plus any cache write.
+ * The measurement in `sumOpenCodeTurnUsage`'s header settles it rather than
+ * leaving it to inference: over one real session the per-message `input`
+ * summed to 325,382 while `cache.read` summed to 1,927,040, which is
+ * impossible if the cached figure were a subset of the input one.
+ *
+ * Contrast providers/codex.ts, where cached input IS a subset and this same
+ * sum would double-count the cached prefix.
+ *
+ * Returns 0 when there is nothing usable, which `recordContextTokens` ignores
+ * — a message with no token report leaves the previous reading standing
+ * rather than zeroing the display.
+ */
+export function openCodeContextOccupancy(
+  tokens: { input?: number; output?: number; cache?: { read?: number; write?: number } } | undefined,
+): number {
+  if (!tokens) return 0;
+  const count = (value: number | undefined): number =>
+    typeof value === 'number' && Number.isFinite(value) ? value : 0;
+  return count(tokens.input) + count(tokens.cache?.read) + count(tokens.cache?.write);
+}
 import { registerProvider } from './provider-registry.js';
 import type {
   AgentProvider,
@@ -1507,9 +1533,7 @@ export class OpenCodeProvider implements AgentProvider {
                     // streams, so the value converges on that message's final
                     // reading with no dedupe needed.
                     if (info.role === 'assistant' && info.sessionID === turnSessionId) {
-                      const t = info.tokens;
-                      const occupancy = (t?.input ?? 0) + (t?.cache?.read ?? 0) + (t?.cache?.write ?? 0);
-                      if (occupancy > 0) recordContextTokens(occupancy);
+                      recordContextTokens(openCodeContextOccupancy(info.tokens));
                     }
                   }
                   break;
