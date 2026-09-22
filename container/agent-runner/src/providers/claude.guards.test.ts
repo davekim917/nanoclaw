@@ -6,6 +6,9 @@ import {
   wrapJestSerialized,
   createSelfApprovalBlockHook,
   createBlockSnowflakeConnectorHook,
+  createBlockSnowflakeEmptyQueryHook,
+  snowNeedsDevNullStdin,
+  snowHasEmptyQueryArgument,
   createBlockGitCloneHook,
   createBlockCodexCompanionHook,
   createEmailGateHook,
@@ -1013,5 +1016,119 @@ describe('createEmailGateHook — one approval card per tool call', () => {
     await expect(runWithToolUseId('exec-abc')).rejects.toThrow(/outbound.db unavailable/);
     expect(rec().abandoned).toEqual(['key:exec-abc|request_bash_gate']);
     expect(rec().published).toEqual([]);
+  });
+});
+
+// ── S1: `snow` open-stdin hang (2026-09-22 production incident) ──
+//
+// snowflake-cli 3.23.0 treats an empty `--query` as "no source" and falls back
+// to `sys.stdin.read()` (commands.py:175-176). The Bash tool's fd 0 is a unix
+// socket that never writes and never closes, so that read blocks forever: the
+// thread went silent for 30 minutes and the user's follow-ups were swallowed.
+describe('S1 snow stdin rewrite', () => {
+  it('gives a plain `snow sql --query` invocation /dev/null on stdin', async () => {
+    const out = await runRewriteHook('snow sql -c mr --query "$(cat /tmp/why0.sql)"');
+    expect(out).toBe('{ snow sql -c mr --query "$(cat /tmp/why0.sql)" ; } </dev/null');
+  });
+
+  it('rewrites the INCIDENT command verbatim', async () => {
+    // The exact argv shape recovered from /proc/<pid>/cmdline on 2026-09-22.
+    const incident = 'snow sql -c mr --query "$(cat /tmp/why0.sql)"';
+    expect(snowNeedsDevNullStdin(incident)).toBe(true);
+    expect(await runRewriteHook(incident)).toContain('</dev/null');
+  });
+
+  it('leaves a pipeline that FEEDS snow untouched', async () => {
+    const piped = 'cat query.sql | snow sql -i';
+    expect(snowNeedsDevNullStdin(piped)).toBe(false);
+    expect(await runRewriteHook(piped)).toBe(piped);
+  });
+
+  it('leaves an explicit -i / --stdin untouched', async () => {
+    for (const cmd of ['snow sql -i', 'snow sql --stdin --format json']) {
+      expect(snowNeedsDevNullStdin(cmd)).toBe(false);
+      expect(await runRewriteHook(cmd)).toBe(cmd);
+    }
+  });
+
+  it('leaves a heredoc untouched — the wrap would break its terminator', async () => {
+    const hd = 'snow sql <<EOF\nselect 1;\nEOF';
+    expect(snowNeedsDevNullStdin(hd)).toBe(false);
+    expect(await runRewriteHook(hd)).toBe(hd);
+  });
+
+  it('leaves a trailing `&` untouched — `{ cmd & ; }` is a syntax error', async () => {
+    const bg = 'snow sql --query "select 1" &';
+    expect(snowNeedsDevNullStdin(bg)).toBe(false);
+    expect(await runRewriteHook(bg)).toBe(bg);
+  });
+
+  it('does not double-wrap a command that already redirects stdin to /dev/null', async () => {
+    const already = 'snow sql --query "select 1" </dev/null';
+    expect(await runRewriteHook(already)).toBe(already);
+  });
+
+  it('still rewrites when snow OUTPUT is piped, and when a query contains `<`', async () => {
+    // `snow … | jq` — the pipe is snow's stdout; its stdin is still the open
+    // socket. And a `<` inside the query text is not a redirect.
+    expect(snowNeedsDevNullStdin('snow sql --query "select 1" | jq .')).toBe(true);
+    expect(snowNeedsDevNullStdin('snow sql --query "select * from t where a < 5"')).toBe(true);
+  });
+
+  it('`snow … < file.sql` is rewritten but the inner redirect still wins', async () => {
+    // Skipping every `<` would skip most real queries. Shell precedence makes
+    // the wrap harmless here: the inner redirect binds closer than the group's.
+    const out = await runRewriteHook('snow sql < q.sql');
+    expect(out).toBe('{ snow sql < q.sql ; } </dev/null');
+  });
+
+  it('ignores commands that merely mention snow', async () => {
+    expect(snowNeedsDevNullStdin('echo snowflake')).toBe(false);
+    expect(snowNeedsDevNullStdin('grep -r snow .')).toBe(false);
+  });
+
+  it('wraps a codex+snow command exactly once', async () => {
+    const out = await runRewriteHook('codex exec "x" && snow sql --query "select 1"');
+    expect(out.match(/<\/dev\/null/g)).toHaveLength(1);
+  });
+});
+
+// ── S2: `snow --query ""` is always a collapsed substitution ──
+describe('S2 createBlockSnowflakeEmptyQueryHook', () => {
+  it('denies an empty double-quoted --query', async () => {
+    const r = await runBashHook(createBlockSnowflakeEmptyQueryHook(), 'snow sql -c mr --query ""');
+    expect(r.permissionDecision).toBe('deny');
+    expect(r.permissionDecisionReason).toContain('EMPTY --query');
+  });
+
+  it('denies -q, --query=, and whitespace-only values', async () => {
+    for (const cmd of [`snow sql -q ''`, `snow sql --query=''`, 'snow sql --query "   "', 'snow sql --query=']) {
+      const r = await runBashHook(createBlockSnowflakeEmptyQueryHook(), cmd);
+      expect(r.permissionDecision).toBe('deny');
+    }
+  });
+
+  it('allows a real query, including one that is a substitution', async () => {
+    for (const cmd of [
+      'snow sql --query "select 1"',
+      'snow sql -c mr --query "$(cat /tmp/why0.sql)"',
+      "snow sql --query 'select * from t'",
+      'snow sql -i',
+    ]) {
+      const r = await runBashHook(createBlockSnowflakeEmptyQueryHook(), cmd);
+      expect(r.permissionDecision).toBeUndefined();
+    }
+  });
+
+  it('does not fire for a non-snow command', async () => {
+    const r = await runBashHook(createBlockSnowflakeEmptyQueryHook(), 'psql --query ""');
+    expect(r.permissionDecision).toBeUndefined();
+  });
+
+  it('is stateless across calls (the module-level /g regex resets lastIndex)', async () => {
+    expect(snowHasEmptyQueryArgument('snow sql --query ""')).toBe(true);
+    expect(snowHasEmptyQueryArgument('snow sql --query ""')).toBe(true);
+    expect(snowHasEmptyQueryArgument('snow sql --query "select 1"')).toBe(false);
+    expect(snowHasEmptyQueryArgument('snow sql --query "select 1"')).toBe(false);
   });
 });

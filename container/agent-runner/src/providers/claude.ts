@@ -1086,6 +1086,90 @@ export function createSubagentQuotaHook(options: {
 const CODEX_EXEC_RE = /\bcodex\s+exec\b/;
 const ALREADY_DEVNULL_STDIN_RE = /<\s*\/dev\/null\b/;
 
+// ── `snow` (Snowflake CLI): the same open-stdin hazard, a worse failure mode ──
+//
+// snowflake-cli 3.23.0's `sql` command treats an EMPTY `--query` as "no source
+// given" and then READS STDIN:
+//   snowflake/cli/_plugins/sql/commands.py:175-176
+//   `if no_source_provided and not sys.stdin.isatty(): maybe_pipe = sys.stdin.read()`
+// The Bash tool's fd 0 is a unix socket that is never written and never closed,
+// so that read blocks forever. No query reaches Snowflake, nothing is printed,
+// and the turn only ends when the harness backgrounds the command at the
+// agent's self-declared timeout.
+//
+// Observed live 2026-09-22: a production Discord thread silent for 30 minutes
+// after `snow sql -c mr --query "$(cat /tmp/why0.sql)"` — /tmp/why0.sql was
+// never written, so the substitution collapsed and argv's last element was the
+// empty string (confirmed from /proc/<pid>/cmdline; the process sat in
+// `wchan = unix_stream_data_wait`). Messages the user sent meanwhile were
+// swallowed.
+//
+// Handing snow `/dev/null` on stdin turns that infinite block into an immediate
+// EOF: snow exits with its own "no query" error, which is a visible failure the
+// agent can act on. This is NOT a wall-clock timeout — a legitimately long
+// Snowflake query is untouched, because it has already sent its query and is
+// waiting on the server, not on fd 0.
+//
+// Commands that legitimately feed snow on stdin keep their stdin:
+//   • `… | snow …` and `snow … -i` / `--stdin` are skipped outright (no
+//     rewrite at all). Shell precedence alone would already protect the pipe —
+//     an inner/pipe redirect binds closer than the group's, the same argument
+//     CODEX_EXEC_RE relies on above — but a wrongly rewritten piped query would
+//     silently read /dev/null and return nothing, so it is skipped explicitly
+//     too. A missed rewrite costs only today's behaviour.
+//   • `snow … < file.sql` is NOT skipped and does not need to be: the inner
+//     redirect binds closer than the group's `</dev/null`, so snow still reads
+//     the file. Skipping on any `<` would also skip every query containing a
+//     `<` comparison, which is most of them.
+//
+// Two more skips are about the WRAP's syntax, not about stdin, and are
+// load-bearing:
+//   • a heredoc — `wrapDevNullStdin` appends `; } </dev/null` after the last
+//     line, and a heredoc terminator must be alone on its line, so wrapping a
+//     heredoc command produces a shell syntax error;
+//   • a trailing `&` — `{ cmd & ; }` is a bash syntax error.
+/** `… | snow`: a single pipe (not `||`) feeding snow, allowing `VAR=x` prefixes. */
+const SNOW_PIPED_INTO_RE = /(?:^|[^|])\|\s*(?:\w+=\S+\s+)*(?:[^\s;&|()]*\/)?snow(?:\s|$)/;
+/** `-i` / `--stdin` as a real argv token, checked only inside a snow segment. */
+const SNOW_STDIN_FLAG_RE = /(?:^|\s)(?:-i|--stdin)(?=\s|$)/;
+const HEREDOC_RE = /<</;
+const TRAILING_BACKGROUND_RE = /&\s*$/;
+/** Shell separators that end one simple command. */
+const SHELL_SEGMENT_SPLIT_RE = /[;\n]|&&|\|\||\||&/;
+/** Leading `VAR=value` assignments on a simple command. */
+const ENV_ASSIGN_PREFIX_RE = /^\w+=\S*\s+/;
+
+/**
+ * True when `snow` is the COMMAND of this simple command, not just a word in
+ * it. `grep -r snow .` and `echo snowflake` are arguments and must not be
+ * rewritten or denied; `SNOWFLAKE_HOME=/x snow sql …` and `/usr/bin/snow sql …`
+ * are invocations and must be.
+ */
+function segmentInvokesSnow(segment: string): boolean {
+  let rest = segment.trim().replace(/^[({\s]+/, '');
+  while (ENV_ASSIGN_PREFIX_RE.test(rest)) rest = rest.replace(ENV_ASSIGN_PREFIX_RE, '');
+  const first = rest.split(/\s+/, 1)[0] ?? '';
+  return /(?:^|\/)snow$/.test(first);
+}
+
+/** True when any simple command in `command` invokes the `snow` CLI. */
+function invokesSnow(command: string): boolean {
+  return command.split(SHELL_SEGMENT_SPLIT_RE).some(segmentInvokesSnow);
+}
+
+/** True when a `snow` invocation should be given `/dev/null` on stdin. Exported for tests. */
+export function snowNeedsDevNullStdin(command: string): boolean {
+  if (!invokesSnow(command)) return false;
+  if (HEREDOC_RE.test(command)) return false;
+  if (TRAILING_BACKGROUND_RE.test(command)) return false;
+  if (SNOW_PIPED_INTO_RE.test(command)) return false;
+  for (const segment of command.split(SHELL_SEGMENT_SPLIT_RE)) {
+    if (!segmentInvokesSnow(segment)) continue;
+    if (SNOW_STDIN_FLAG_RE.test(segment)) return false;
+  }
+  return true;
+}
+
 // Two concurrent jest runs will OOM-kill this container no matter how each one
 // is configured. On 2026-08-09 one agent had two background suites going and
 // its container was OOM-killed 109 times in a single session; two siblings hit
@@ -1136,7 +1220,8 @@ export function wrapJestSerialized(command: string): string {
 
 /**
  * Rewrites a Bash command before it runs: `/dev/null` stdin for `codex exec`
- * (CODEX_EXEC_RE) and the jest serialization lock (wrapJestSerialized). No
+ * (CODEX_EXEC_RE) and for `snow` (snowNeedsDevNullStdin), and the jest
+ * serialization lock (wrapJestSerialized). No
  * `unset <secrets>` prefix any more — see secret-env.ts's header.
  */
 export function createBashCommandRewriteHook(): HookCallback {
@@ -1144,10 +1229,13 @@ export function createBashCommandRewriteHook(): HookCallback {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;
     if (!command) return {};
-    const wrapCodexStdin = CODEX_EXEC_RE.test(command) && !ALREADY_DEVNULL_STDIN_RE.test(command);
+    // One wrap serves both open-stdin hangs (`codex exec` and `snow`); a
+    // command that hits both still gets exactly one `{ … ; } </dev/null`.
+    const wrapDevNullStdin =
+      (CODEX_EXEC_RE.test(command) || snowNeedsDevNullStdin(command)) && !ALREADY_DEVNULL_STDIN_RE.test(command);
 
     let rewritten = command;
-    if (wrapCodexStdin) rewritten = `{ ${rewritten} ; } </dev/null`;
+    if (wrapDevNullStdin) rewritten = `{ ${rewritten} ; } </dev/null`;
     // After the codex wrap, so a `codex exec` that itself runs jest keeps its
     // /dev/null stdin.
     if (JEST_RE.test(command) && !ALREADY_FLOCKED_RE.test(command)) {
@@ -1299,6 +1387,69 @@ export function createBlockSnowflakeConnectorHook(): HookCallback {
 
     // Fallback: shared core unavailable/threw — apply the inline policy, fail-closed.
     if (SNOWFLAKE_CONNECTOR_EXEC_RE.test(command)) return denyBash(SNOWFLAKE_CONNECTOR_BLOCK_MSG);
+    return {};
+  };
+}
+
+// ── Block `snow` with an empty --query ──
+// `snow sql --query ""` is never intentional. It is what a collapsed shell
+// substitution looks like: `--query "$(cat missing.sql)"`, `--query "$QUERY"`
+// with QUERY unset, a `set -u`-less pipeline whose upstream produced nothing.
+// The CLI does not reject it — commands.py:175-176 reads it as "no source
+// given" and falls back to `sys.stdin.read()` (see snowNeedsDevNullStdin's header),
+// which in this container never returns.
+//
+// The /dev/null stdin rewrite above already removes the HANG. This removes the
+// silence around it: instead of snow exiting with a generic CLI usage error
+// several layers from the cause, the agent is told the query argument came out
+// empty and pointed at the substitution that produced it.
+//
+// LIMITATION, and it is the important one: this check runs on the PRE-EXPANSION
+// command text. `--query "$(cat /tmp/why0.sql)"` — the 2026-09-22 incident's
+// exact shape — is NOT statically empty and is NOT caught here. Only the
+// /dev/null rewrite covers that case. This hook catches the literal forms
+// (`--query ""`, `--query=''`, `-q "   "`).
+//
+// Inline-only, deliberately: unlike evaluateSelfApproval / evaluateSnowflakeConnector
+// this policy has no counterpart in the shared bootstrap guard core, and adding
+// one would put a NanoClaw-specific rule in a separate repo for no gain. Same
+// reasoning as createBlockCodexCompanionHook above — there is nothing to keep
+// in sync, so there is no fail-closed fallback to write either.
+const SNOW_QUERY_FLAG_RE = /(?:^|\s)(?:-q|--query)(?:=("[^"]*"|'[^']*'|\S*)|\s+("[^"]*"|'[^']*'|\S+))/g;
+const SNOW_EMPTY_QUERY_BLOCK_MSG =
+  'Blocked: `snow` was called with an EMPTY --query/-q argument. The query text is empty, which means the ' +
+  'substitution that was supposed to produce it collapsed — most often `$(cat <file>)` where the file was never ' +
+  'written, or an unset variable. Snowflake CLI does not reject an empty --query: it treats it as "no query ' +
+  'given" and reads stdin instead, which in this container never ends, so the command would hang until the turn ' +
+  'dies. Check the file or variable that was supposed to hold the query (`ls -l <file>`, `cat <file>`), fix it, ' +
+  'then re-run with the query text actually present.';
+
+/** True when the command passes an empty/whitespace-only value to snow's -q/--query. Exported for tests. */
+export function snowHasEmptyQueryArgument(command: string): boolean {
+  for (const segment of command.split(SHELL_SEGMENT_SPLIT_RE)) {
+    if (!segmentInvokesSnow(segment)) continue;
+    SNOW_QUERY_FLAG_RE.lastIndex = 0;
+    for (let m = SNOW_QUERY_FLAG_RE.exec(segment); m !== null; m = SNOW_QUERY_FLAG_RE.exec(segment)) {
+      const raw = m[1] ?? m[2] ?? '';
+      // Strip ONE layer of matched quotes — that is what the shell would do to
+      // a literal `""` / `''`. Anything else (a `$(…)`, a bare word) is left
+      // alone and therefore reads as non-empty: the conservative direction.
+      const value =
+        raw.length >= 2 && ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'")))
+          ? raw.slice(1, -1)
+          : raw;
+      if (value.trim() === '') return true;
+    }
+  }
+  return false;
+}
+
+export function createBlockSnowflakeEmptyQueryHook(): HookCallback {
+  return async (input) => {
+    const pre = input as PreToolUseHookInput;
+    const command = (pre.tool_input as { command?: string })?.command;
+    if (!command) return {};
+    if (snowHasEmptyQueryArgument(command)) return denyBash(SNOW_EMPTY_QUERY_BLOCK_MSG);
     return {};
   };
 }
@@ -2924,6 +3075,7 @@ export class ClaudeProvider implements AgentProvider {
                 createManagedGitMaintenanceHook(),
                 createSelfApprovalBlockHook(),
                 createBlockSnowflakeConnectorHook(),
+                createBlockSnowflakeEmptyQueryHook(),
                 createBlockGitCloneHook(),
                 createBlockCodexCompanionHook(),
                 ...(pluginOwnsBashEmailGate ? [] : [createEmailGateHook()]),
