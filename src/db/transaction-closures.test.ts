@@ -103,6 +103,7 @@ export const OTHER_SQLITE_RAW_TRANSACTION_FILES: readonly string[] = [
   'src/modules/mailbox/ops/ingress.ts',
   'src/modules/mailbox/ops/session-state.ts',
   'src/modules/mailbox/ops/sweep.ts',
+  'src/modules/mailbox/ops/task-dispatch.ts',
   'src/modules/mailbox/ops/tasks.ts',
   'src/modules/mailbox/schema.ts',
   'src/wiki-admission/store.ts',
