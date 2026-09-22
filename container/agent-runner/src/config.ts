@@ -41,6 +41,21 @@ export interface RunnerConfig {
    * surfacing a dead-end error to the user.
    */
   providerFallback?: { provider: string; model?: string; effort?: string };
+
+  /**
+   * Stamp the model/effort/context subtext under this group's own replies.
+   *
+   * ON unless the group's container.json says `"statusSubtext": false`. The
+   * line is operator telemetry, and the groups that want it silenced are the
+   * ones whose conversations include people outside the fleet — so the opt-out
+   * is per group rather than a fleet switch.
+   *
+   * Only an explicit `false` disables it. A missing key, a null, or a
+   * non-boolean is the default ON: a malformed config must not silently strip
+   * a signal the operator is relying on, and "off" is the state that has to be
+   * asked for.
+   */
+  statusSubtext: boolean;
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -146,6 +161,7 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
       undefined,
     fallbackApplied: onFallback,
     providerFallback: declaredFallback || undefined,
+    statusSubtext: raw.statusSubtext !== false,
   };
 }
 
@@ -177,4 +193,15 @@ export function getConfig(): RunnerConfig {
 /** Reset cached config — for use in tests only. */
 export function _resetConfig(): void {
   _config = null;
+}
+
+/**
+ * Test seam — install a parsed config without reading the file.
+ *
+ * `loadConfig` reads one fixed absolute path that does not exist outside a
+ * container, so a test that needs a NON-default field (a group that opted out
+ * of the status subtext, say) has no other way to express it.
+ */
+export function _setConfigForTest(raw: Record<string, unknown>): void {
+  _config = parseRawConfig(raw);
 }

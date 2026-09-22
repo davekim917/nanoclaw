@@ -23,6 +23,41 @@ import { recordRateLimitSamples, type AccountIdentity, type RateLimitSample } fr
 import { getCredentialSlot, setCredentialSlot } from '../modules/mailbox/session-state.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { appendActiveRuntimeContext } from '../runtime-context.js';
+import { recordContextTokens } from '../turn-status.js';
+
+/**
+ * Tokens occupying the context window, from one API response's `usage`.
+ *
+ * ANTHROPIC'S THREE PROMPT COUNTERS ARE DISJOINT. `input_tokens` counts only
+ * the UNCACHED remainder of the prompt; the cached prefix is reported
+ * separately as `cache_read_input_tokens` and a freshly written cache segment
+ * as `cache_creation_input_tokens`. Occupancy is therefore the SUM. Reading
+ * `input_tokens` alone is the silent failure this function exists to prevent:
+ * on a warm thread it is a few hundred tokens, so a nearly full window would
+ * render as almost empty.
+ *
+ * Contrast providers/codex.ts, where `cachedInputTokens` is a SUBSET of
+ * `inputTokens` and the same sum would double-count. Each provider converts
+ * its own report to a finished number for exactly this reason.
+ *
+ * Returns 0 when there is nothing usable — `recordContextTokens` ignores it,
+ * so a response with no usage leaves the previous reading standing rather
+ * than zeroing the display.
+ */
+export function claudeContextOccupancy(usage: {
+  input_tokens?: number | null;
+  cache_read_input_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+} | null | undefined): number {
+  if (!usage) return 0;
+  // Nullable in the SDK's own types, and a null must read as "nothing cached",
+  // never as a missing term that quietly shrinks the total.
+  const count = (value: number | null | undefined): number =>
+    typeof value === 'number' && Number.isFinite(value) ? value : 0;
+  return (
+    count(usage.input_tokens) + count(usage.cache_read_input_tokens) + count(usage.cache_creation_input_tokens)
+  );
+}
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { shimCwd } from './cwd-shim.js';
 import { parseSlotUsageSurvey, surveyEntryToUsageResponse, SLOT_USAGE_SURVEY_ENV } from './claude-slot-usage.js';
@@ -3283,6 +3318,17 @@ export class ClaudeProvider implements AgentProvider {
             // A subagent's assistant messages ride this stream too, tagged with
             // the tool call that spawned them; only the parent speaks to people.
             const topLevel = (message as { parent_tool_use_id?: string | null }).parent_tool_use_id == null;
+            // Context occupancy for the status subtext: this message's `usage`
+            // is the API response's own report of the request that produced it,
+            // so its prompt side IS what the window currently holds. Anthropic
+            // splits that prompt across three counters — `input_tokens` counts
+            // only the UNCACHED remainder, with the cached prefix reported
+            // separately as `cache_read_input_tokens` and any freshly written
+            // cache segment as `cache_creation_input_tokens` — so occupancy is
+            // the sum. Reading `input_tokens` alone would show a few hundred
+            // tokens on a warm thread and render a full window as near-empty.
+            // Top-level only: a subagent's usage measures ITS window, not ours.
+            if (topLevel) recordContextTokens(claudeContextOccupancy(message.message?.usage));
             if (Array.isArray(blocks)) {
               let sawToolUse = false;
               for (const block of blocks) {
@@ -3449,6 +3495,19 @@ export class ClaudeProvider implements AgentProvider {
       // creation and mid-stream retarget cannot report different things.
       get resolvedModel() {
         return activeModel;
+      },
+      // Live view of `activeEffort` — the effort that actually RAN, after the
+      // precedence chain (`-e` → group config → env override → family default,
+      // :2784) and the `clampEffortForModel` safety drop (:2788). A getter for
+      // the same reason as resolvedModel: applySettings reassigns it on a
+      // mid-stream retarget (:3559).
+      //
+      // The status subtext needs this, not the request: `querySettings.effort`
+      // holds USER INTENT only (the contract applyFlagBatch states at
+      // poll-loop.ts:3789), so a group carrying its effort in container.json
+      // requests nothing and a clamped turn requests something it never ran at.
+      get resolvedEffort() {
+        return activeEffort ?? null;
       },
       abort: () => {
         aborted = true;

@@ -625,6 +625,35 @@ describe('groups CLI resource config', () => {
     expect(JSON.parse((await getContainerConfig(id))!.mcp_servers).datafold).toMatchObject({ type: 'http' });
   });
 
+  // Round three: `config update --status-subtext off` wrote the file but
+  // `config get` never reported it, so an operator could not tell a deliberate
+  // opt-out from a group riding the default without reading container.json.
+  it('test_groups_config_get_reports_status_subtext_stored_and_effective', async () => {
+    const id = 'ag-subtext-visible';
+    const folder = 'subtext-visible';
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await ensureContainerConfig(id);
+
+    const before = await dispatch({ id: 'req-st-1', command: 'groups-config-get', args: { id } }, { caller: 'host' });
+    expect(before.ok).toBe(true);
+    // Riding the default: nothing stored, effective ON.
+    const beforeData = (before as { ok: true; data: Record<string, unknown> }).data;
+    expect(beforeData.status_subtext).toBeNull();
+    expect(beforeData.effective_status_subtext).toBe(true);
+
+    const off = await dispatch(
+      { id: 'req-st-2', command: 'groups-config-update', args: { id, 'status-subtext': 'off' } },
+      { caller: 'host' },
+    );
+    expect(off.ok).toBe(true);
+
+    const after = await dispatch({ id: 'req-st-3', command: 'groups-config-get', args: { id } }, { caller: 'host' });
+    // A deliberate opt-out is now distinguishable from the default.
+    const afterData = (after as { ok: true; data: Record<string, unknown> }).data;
+    expect(afterData.status_subtext).toBe(false);
+    expect(afterData.effective_status_subtext).toBe(false);
+  });
+
   it('test_groups_config_add_mcp_server_rejects_an_unsafe_remote_url', async () => {
     const id = 'ag-remote-mcp-bad';
     const folder = 'remote-mcp-bad';
