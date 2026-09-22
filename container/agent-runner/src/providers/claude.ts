@@ -657,13 +657,73 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
 }
 
 /**
+ * Tool calls this query currently has in flight, keyed by the SDK's
+ * `tool_use_id` (sdk.d.ts:2589 PreToolUse, :2508 PostToolUse, :2489
+ * PostToolUseFailure — every one of the three carries it).
+ *
+ * WHY A KEYED MAP AND NOT A MATCHER. `postToolUseHook` is registered without a
+ * matcher and used to clear `container_state` unconditionally, so with tools
+ * running in PARALLEL the first one to finish erased the state belonging to a
+ * still-running Bash — and `activeOperationTimeoutMs`
+ * (src/modules/sweep-container-health/index.ts:545-548) then returns null, which
+ * collapses the host's ceiling back to ABSOLUTE_CEILING_MS and its claim
+ * tolerance back to CLAIM_STUCK_MS. A matcher cannot fix that: `matcher: 'Bash'`
+ * still cannot tell TWO parallel Bash calls apart, and it would additionally
+ * stop clearing state that a non-Bash tool set. Identity is the only thing that
+ * distinguishes the calls, so the clear keys on identity.
+ *
+ * The published row is the WIDEST declared timeout still in flight, not the most
+ * recent: while a 30-minute Bash is running, a Read that starts and finishes
+ * inside it must not narrow the host's tolerance back down.
+ *
+ * LEAK, bounded and deliberate: a tool DENIED by another PreToolUse hook never
+ * reaches PostToolUse, so its entry stays. That can only make the host MORE
+ * patient (a wider ceiling), never less, and it is bounded twice — the map is
+ * reset when a query is created and again on every `result` (a turn that has
+ * ended has no foreground tool in flight; a backgrounded Bash no longer blocks
+ * the turn, so not tracking it is correct).
+ */
+const toolsInFlight = new Map<string, { tool: string; declaredTimeoutMs: number | null }>();
+
+/** Write `container_state` from the widest-declared call still in flight. */
+function publishToolInFlight(): void {
+  let widest: { tool: string; declaredTimeoutMs: number | null } | null = null;
+  for (const entry of toolsInFlight.values()) {
+    if (widest === null || (entry.declaredTimeoutMs ?? 0) > (widest.declaredTimeoutMs ?? 0)) widest = entry;
+  }
+  try {
+    if (widest === null) clearContainerToolInFlight();
+    else setContainerToolInFlight(widest.tool, widest.declaredTimeoutMs);
+  } catch (err) {
+    log(`Tool in-flight: failed to write container_state: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Forget every tracked call and clear the row. Called at query creation and on `result`. */
+export function resetToolInFlightTracking(): void {
+  if (toolsInFlight.size === 0) return;
+  toolsInFlight.clear();
+  publishToolInFlight();
+}
+
+/**
  * PreToolUse hook: record the current tool + its declared timeout so the host
  * sweep can widen its stuck tolerance while Bash is running a long-declared
  * script. Defense-in-depth: if SDK_DISALLOWED_TOOLS slips through somehow,
  * block the call here instead of letting the agent hang.
+ *
+ * MUST stay registered in the claude provider's `PreToolUse` table. It is the
+ * ONLY writer of `container_state.current_tool` / `tool_started_at` /
+ * `tool_declared_timeout_ms`, and without it the host kills every
+ * claude-provider container at the 30-minute idle ceiling no matter how long
+ * the agent declared its Bash call would take. That registration has been lost
+ * in upstream merge resolution repeatedly (wired at 6a815190c 2026-04-20, lost
+ * again at ceb3fcd1a 2026-07-24; `git log -S'hooks: [preToolUseHook]'` shows no
+ * ordinary commit ever removing it) — `claude.preToolUse-registration.test.ts`
+ * exists to make the seventh loss fail CI instead of production.
  */
 export const preToolUseHook: HookCallback = async (input) => {
-  const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
+  const i = input as { tool_name?: string; tool_input?: Record<string, unknown>; tool_use_id?: string };
   const toolName = i.tool_name ?? '';
   if (SDK_DISALLOWED_TOOLS.includes(toolName)) {
     return {
@@ -675,21 +735,22 @@ export const preToolUseHook: HookCallback = async (input) => {
   // tool: no declared timeout.
   const declaredTimeoutMs =
     toolName === 'Bash' && typeof i.tool_input?.timeout === 'number' ? (i.tool_input.timeout as number) : null;
-  try {
-    setContainerToolInFlight(toolName, declaredTimeoutMs);
-  } catch (err) {
-    log(`PreToolUse: failed to record container_state: ${err instanceof Error ? err.message : String(err)}`);
-  }
+  toolsInFlight.set(i.tool_use_id ?? '', { tool: toolName, declaredTimeoutMs });
+  publishToolInFlight();
   return { continue: true };
 };
 
-/** Clear in-flight tool on PostToolUse / PostToolUseFailure. */
-export const postToolUseHook: HookCallback = async () => {
-  try {
-    clearContainerToolInFlight();
-  } catch (err) {
-    log(`PostToolUse: failed to clear container_state: ${err instanceof Error ? err.message : String(err)}`);
-  }
+/**
+ * Clear in-flight tool on PostToolUse / PostToolUseFailure — but only the call
+ * that actually finished. A missing `tool_use_id` falls back to clearing
+ * everything, which is exactly the behaviour this hook had before, so an SDK
+ * that stops supplying it degrades to today rather than to a stuck row.
+ */
+export const postToolUseHook: HookCallback = async (input) => {
+  const id = (input as { tool_use_id?: string })?.tool_use_id;
+  if (typeof id === 'string' && id.length > 0) toolsInFlight.delete(id);
+  else toolsInFlight.clear();
+  publishToolInFlight();
   return { continue: true };
 };
 
@@ -2939,6 +3000,10 @@ export class ClaudeProvider implements AgentProvider {
     // consumer, which the SDK's own cleanup does not reliably observe.
     const queryAbortController = new AbortController();
 
+    // Outer bound on the in-flight leak described on `toolsInFlight`: a fresh
+    // query has no tool running, whatever a denied call from the last one left.
+    resetToolInFlightTracking();
+
     const sdkResult = (sdkQueryOverride ?? sdkQuery)({
       prompt: stream,
       options: {
@@ -2980,6 +3045,19 @@ export class ClaudeProvider implements AgentProvider {
                 createBashCommandRewriteHook({ closeStdin: true }),
               ],
             },
+            // NO MATCHER, deliberately, and LAST. `preToolUseHook` records
+            // `container_state` for EVERY tool (that is what lets the host
+            // widen its ceiling past ABSOLUTE_CEILING_MS for a long-declared
+            // Bash) and enforces SDK_DISALLOWED_TOOLS as defense-in-depth,
+            // which no Bash matcher would ever reach. Last so that for a Bash
+            // call the block hooks above get their say first; a tool they deny
+            // never reaches PostToolUse, and `toolsInFlight`'s own comment
+            // covers what that leaves behind.
+            //
+            // DO NOT DROP THIS ENTRY IN A MERGE RESOLUTION. It has been lost
+            // six times; claude.preToolUse-registration.test.ts asserts it is
+            // here.
+            { hooks: [preToolUseHook] },
           ],
           PostToolUse: [
             { hooks: [postToolUseHook] },
@@ -3128,6 +3206,11 @@ export class ClaudeProvider implements AgentProvider {
             yield { type: 'init', continuation: message.session_id };
           } else if (message.type === 'result') {
             pendingAssistantText = null;
+            // Inner bound on the in-flight leak (`toolsInFlight`): a turn that
+            // has produced its result has no FOREGROUND tool left running. A
+            // backgrounded Bash keeps running but no longer blocks the turn, so
+            // it is correctly not holding the host's ceiling open either.
+            resetToolInFlightTracking();
             // `result` text exists only on subtype:"success"; error subtypes
             // (e.g. a non-retryable 403 billing_error) carry their message in
             // `errors[]` instead. Surface either so the poll-loop can deliver a
