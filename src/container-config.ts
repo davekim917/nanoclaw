@@ -1317,10 +1317,12 @@ export function readContainerConfigForSpawn(folder: string, requireAuthoritative
 
 function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerConfig {
   validateContainerResources(raw.resources);
+  if (raw.outcomeReporting !== undefined && typeof raw.outcomeReporting !== 'boolean')
+    throw new Error('outcomeReporting must be a boolean when present');
 
   return {
     wikiMaintenance: raw.wikiMaintenance,
-    outcomeReporting: typeof raw.outcomeReporting === 'boolean' ? raw.outcomeReporting : undefined,
+    outcomeReporting: raw.outcomeReporting,
     outcomeReportingExternalChannels: Array.isArray(raw.outcomeReportingExternalChannels)
       ? raw.outcomeReportingExternalChannels.filter((value): value is string => typeof value === 'string')
       : [],

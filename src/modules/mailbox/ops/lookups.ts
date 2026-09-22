@@ -147,6 +147,10 @@ export function getRecoverableLifecycleStatus(
   outbound: Database.Database,
   outboundId?: string,
 ): RecoverableLifecycleStatus | null {
+  const deliveredReceipt = inbound.prepare(
+    "SELECT platform_message_id FROM delivered WHERE message_out_id = ? AND status = 'delivered'",
+  );
+  const isDelivered = inbound.prepare("SELECT 1 FROM delivered WHERE message_out_id = ? AND status = 'delivered'");
   const rows = outbound
     .prepare(
       `SELECT id, seq, channel_type, platform_id, thread_id, content
@@ -173,27 +177,18 @@ export function getRecoverableLifecycleStatus(
     }
     if (content.reporting?.version !== 1 || content.reporting?.purpose !== 'liveness') continue;
     if (!row.channel_type || !row.platform_id) continue;
-    const delivered = inbound
-      .prepare("SELECT platform_message_id FROM delivered WHERE message_out_id = ? AND status = 'delivered'")
-      .get(row.id) as { platform_message_id: string | null } | undefined;
-    if (!delivered?.platform_message_id) continue;
+    const deliveryReceipt = deliveredReceipt.get(row.id) as { platform_message_id: string | null } | undefined;
+    if (!deliveryReceipt?.platform_message_id) continue;
     const laterPublicIds = outbound
-      .prepare("SELECT id FROM messages_out WHERE seq > ? AND kind IN ('chat','chat-sdk')")
-      .all(row.seq) as Array<{ id: string }>;
-    if (
-      laterPublicIds.some(
-        ({ id }) =>
-          inbound.prepare("SELECT 1 FROM delivered WHERE message_out_id = ? AND status = 'delivered'").get(id) !==
-          undefined,
-      )
-    )
-      return null;
+      .prepare("SELECT id FROM messages_out WHERE seq > ? AND kind IN ('chat','chat-sdk') ORDER BY seq DESC")
+      .iterate(row.seq) as Iterable<{ id: string }>;
+    for (const { id } of laterPublicIds) if (isDelivered.get(id) !== undefined) return null;
     return {
       outboundId: row.id,
       channelType: row.channel_type,
       platformId: row.platform_id,
       threadId: row.thread_id,
-      platformMessageId: delivered.platform_message_id,
+      platformMessageId: deliveryReceipt.platform_message_id,
     };
   }
   return null;

@@ -942,9 +942,10 @@ describe('outcome reporting fleet default', () => {
     expect(config.outcomeReportingExternalChannels).toEqual(['slack:RELEASES']);
     writeContainerConfig('outcome-config', config);
     expect(readContainerConfig('outcome-config').model).toBe('unchanged-model');
-    writeGroupConfig('outcome-not-opted', { outcomeReporting: 'true' });
-    expect(readContainerConfig('outcome-not-opted').outcomeReporting).toBeUndefined();
-    expect(effectiveOutcomeReporting(readContainerConfig('outcome-not-opted'))).toBe(true);
+    for (const malformed of ['true', 'false', null]) {
+      writeGroupConfig('outcome-malformed', { outcomeReporting: malformed });
+      expect(() => readContainerConfig('outcome-malformed')).toThrow('outcomeReporting must be a boolean');
+    }
     writeGroupConfig('outcome-rollback', { outcomeReporting: false });
     expect(effectiveOutcomeReporting(readContainerConfig('outcome-rollback'))).toBe(false);
     writeGroupConfig('outcome-absent', { model: 'unchanged' });

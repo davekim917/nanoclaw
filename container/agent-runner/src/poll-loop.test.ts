@@ -7,7 +7,7 @@ import { evaluateAdmission, registerAdmissionGate } from './admission-gate.js';
 import { _resetConfig, loadConfig } from './config.js';
 import { clearStaleProcessingAcks, setContainerToolInFlight } from './db/container-state.js';
 import { getRequestCandidates, rememberRequestCandidates, setContinuation } from './db/session-state.js';
-import { setStickyModel, setStickyEffort } from './modules/mailbox/session-state.js';
+import { clearPrimaryRetryRequest, setStickyModel, setStickyEffort } from './modules/mailbox/session-state.js';
 import { getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
@@ -27,6 +27,8 @@ import {
   isAupRefusal,
   isCorruptionError,
   noteIgnoredModel,
+  noteModelQuotaFallback,
+  ProviderEventError,
   processQuery,
   formatMessagesWithCommands,
   runPollLoop,
@@ -980,6 +982,100 @@ describe('model pin under a provider fallback', () => {
     expect(posted[0]).not.toContain('applies again');
   });
 
+  // The pin is ignored either way; what separates these two is WHO asked.
+  // A sticky stored before the outage is not a request for anything — it is
+  // just still there — while an `-m` typed during the outage is an operator
+  // asking for the primary provider back, and before this it did nothing at
+  // all (measured 2026-09-21 22:38Z: `-m opus` on a group parked on codex,
+  // pin discarded, session stayed on codex).
+  function retryRequests(): string[] {
+    return getUndeliveredMessages()
+      .filter((m) => m.kind === 'system')
+      .map((m) => JSON.parse(m.content) as { action?: string; requestedModel?: string })
+      .filter((c) => c.action === 'provider_retry_primary')
+      .map((c) => c.requestedModel ?? '');
+  }
+
+  it('a freshly typed -m under a fallback asks the host for the primary back', async () => {
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi' });
+    const routing = extractRouting(getPendingMessages());
+
+    await noteIgnoredModel('opus', 'codex', true, routing, true);
+
+    expect(retryRequests()).toEqual(['opus']);
+    const posted = onlyChatText();
+    expect(posted[0]).toContain('asking the host to return this session to its primary provider now.');
+    // The wait-it-out wording would now be a lie — something IS happening.
+    expect(posted[0]).not.toContain('applies again');
+  });
+
+  it('asks at most once per cooldown — the request causes the respawn that would re-ask', async () => {
+    // The loop this brakes: the request makes the host clear the window and
+    // respawn; if the primary is still spent that spawn fails, the outage is
+    // re-recorded, the session lands back on the fallback, and the triggering
+    // message is STILL pending with its flagIntent — so it asks again. Each
+    // cycle costs a container start, and the request resets the failure
+    // streak, so the backoff ladder never grows to damp it.
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi' });
+    const routing = extractRouting(getPendingMessages());
+
+    await noteIgnoredModel('opus', 'codex', true, routing, true);
+    await noteIgnoredModel('opus', 'codex', true, routing, true);
+    await noteIgnoredModel('sonnet', 'codex', true, routing, true);
+
+    expect(retryRequests()).toEqual(['opus']);
+  });
+
+  it('a session back on its primary may ask again', async () => {
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi' });
+    const routing = extractRouting(getPendingMessages());
+
+    await noteIgnoredModel('opus', 'codex', true, routing, true);
+    // The round trip that proves the last request worked: a turn ran on the
+    // primary. runPollLoop clears the claim on any non-fallback turn.
+    clearPrimaryRetryRequest();
+    await noteIgnoredModel('opus', 'codex', true, routing, true);
+
+    expect(retryRequests()).toEqual(['opus', 'opus']);
+  });
+
+  it('a leftover sticky asks for nothing — it would ask on every turn', async () => {
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi' });
+    const routing = extractRouting(getPendingMessages());
+
+    await noteIgnoredModel('opus', 'codex', true, routing, false);
+
+    expect(retryRequests()).toEqual([]);
+    expect(onlyChatText()[0]).toContain('it applies again when the primary provider is back.');
+  });
+
+  it('outside a fallback an explicit -m asks for nothing: there is no window to clear', async () => {
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi' });
+    const routing = extractRouting(getPendingMessages());
+
+    await noteIgnoredModel('opus', 'codex', false, routing, true);
+
+    expect(retryRequests()).toEqual([]);
+    expect(onlyChatText()[0]).toContain('set a codex model with -m <model>');
+  });
+
+  it('applyFlagBatch marks a pin explicit only when this batch carried the flag', () => {
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'go', flagIntent: { stickyModel: 'claude-opus-5[1m]' } });
+    const messages = getPendingMessages();
+    const routing = extractRouting(messages);
+
+    // The batch that carries the `-m`: explicit.
+    expect(applyFlagBatch(messages, routing, 'codex')).toMatchObject({
+      ignoredModel: 'claude-opus-5[1m]',
+      ignoredModelWasExplicit: true,
+    });
+    // Every later turn reads the same pin out of session_state: not explicit.
+    expect(applyFlagBatch([], routing, 'codex')).toMatchObject({
+      ignoredModel: 'claude-opus-5[1m]',
+      ignoredModelWasExplicit: false,
+    });
+  });
+
   it('posts once per cooldown, not once per turn', async () => {
     insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi' });
     const routing = extractRouting(getPendingMessages());
@@ -991,6 +1087,78 @@ describe('model pin under a provider fallback', () => {
     // the identical second text inside the cooldown, so a session that reads
     // the pin on every turn does not narrate it on every turn.
     expect(onlyChatText()).toHaveLength(1);
+  });
+});
+
+describe('model-scoped quota: the pin is spent, not the provider', () => {
+  // Measured 2026-09-21 22:35Z: a session pinned to claude-fable-5-1[1m] was
+  // rejected on window `seven_day_overage_included` across all four OAuth
+  // slots and the host rerouted it to the codex fallback, while two SIBLING
+  // sessions of the same group completed turns on claude-opus-5[1m] seconds
+  // later, at 22:35:25Z and 22:37:57Z
+  // (`turn_usage`). The account was not spent; the pinned tier was. What the
+  // user is told has to distinguish those, and has to say what happened to
+  // their pin — nothing else in the transcript reveals that a different model
+  // answered them.
+  function onlyChatText(): string[] {
+    return getUndeliveredMessages()
+      .filter((m) => m.kind === 'chat')
+      .map((m) => (JSON.parse(m.content) as { text: string }).text);
+  }
+
+  it('names the spent model, says the default answered, and says the sticky pin is gone', async () => {
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi' });
+    const routing = extractRouting(getPendingMessages());
+
+    await noteModelQuotaFallback('claude-fable-5-1[1m]', true, new Error('Rate limit'), routing);
+
+    const posted = onlyChatText();
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toContain('claude-fable-5-1[1m] is out of quota');
+    expect(posted[0]).toContain("ran this turn on the group's default model instead");
+    expect(posted[0]).toContain('re-pin with `-m claude-fable-5-1[1m]`');
+  });
+
+  it('does not tell the user to re-pin a one-off -m they never stored', async () => {
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi' });
+    const routing = extractRouting(getPendingMessages());
+
+    await noteModelQuotaFallback('claude-fable-5-1[1m]', false, new Error('Rate limit'), routing);
+
+    const posted = onlyChatText();
+    expect(posted[0]).toContain('is out of quota');
+    // There is no pin to clear and none to restore — saying so would send the
+    // user after a setting that does not exist.
+    expect(posted[0]).not.toContain('re-pin');
+    expect(posted[0]).not.toContain('cleared');
+  });
+
+  it('carries the provider MEASURED reset when the error had one, in local time', async () => {
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi' });
+    const routing = extractRouting(getPendingMessages());
+    const err = new ProviderEventError({
+      type: 'error',
+      message: 'Rate limit [seven_day_overage_included]',
+      retryable: false,
+      classification: 'quota',
+      resetAt: '2026-09-24T16:00:00.000Z',
+    });
+
+    await noteModelQuotaFallback('claude-fable-5-1[1m]', true, err, routing);
+
+    const posted = onlyChatText();
+    expect(posted[0]).toContain('Its window resets ');
+    // Rendered, never raw ISO — `formatLocalTime` is the one display seam.
+    expect(posted[0]).not.toContain('2026-09-24T16:00:00.000Z');
+  });
+
+  it('says nothing about a reset the provider did not state', async () => {
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi' });
+    const routing = extractRouting(getPendingMessages());
+
+    await noteModelQuotaFallback('gpt-6-astra', true, new Error('usage limit reached'), routing);
+
+    expect(onlyChatText()[0]).not.toContain('window resets');
   });
 });
 

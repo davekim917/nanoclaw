@@ -284,10 +284,12 @@ interface StatusTrack {
   lifecycle?: boolean;
 }
 const statusTracking = new Map<string, StatusTrack>();
+const lifecycleRecoveryMisses = new Set<string>();
 
 /** Simulates host-process memory loss while leaving durable mailbox rows intact. */
 export function _resetStatusTrackingForTest(): void {
   statusTracking.clear();
+  lifecycleRecoveryMisses.clear();
 }
 
 /**
@@ -368,16 +370,25 @@ async function stopSessionLifecycleStatus(
       }
     }
   }
+  lifecycleRecoveryMisses.add(sessionId);
   statusTracking.delete(sessionId);
 }
 
 async function recoverLifecycleStatus(sessionId: string, outboundId?: string): Promise<StatusTrack | undefined> {
+  if (!outboundId && lifecycleRecoveryMisses.has(sessionId)) return undefined;
   const session = await getSession(sessionId);
-  if (!session) return undefined;
+  if (!session) {
+    if (!outboundId) lifecycleRecoveryMisses.add(sessionId);
+    return undefined;
+  }
   const recovered = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
     mailbox.getRecoverableLifecycleStatus(outboundId),
   );
-  if (!recovered) return undefined;
+  if (!recovered) {
+    if (!outboundId) lifecycleRecoveryMisses.add(sessionId);
+    return undefined;
+  }
+  lifecycleRecoveryMisses.delete(sessionId);
   const origin = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
   const mg =
     origin && origin.channel_type === recovered.channelType && origin.platform_id === recovered.platformId
@@ -419,6 +430,7 @@ async function dropOrphanStatus(
       });
     }
   }
+  if (opts.recoverLifecycle && !opts.skip) lifecycleRecoveryMisses.add(sessionId);
   statusTracking.delete(sessionId);
 }
 
@@ -1536,6 +1548,8 @@ async function deliverMessage(
         inReplyTo: msg.in_reply_to,
         lifecycle: content.reporting?.version === 1 && content.reporting?.purpose === 'liveness',
       });
+      if (content.reporting?.version === 1 && content.reporting?.purpose === 'liveness')
+        lifecycleRecoveryMisses.delete(session.id);
     }
     if (replacedStatus && platformMsgId) {
       if (deliveryAdapter.deleteMessage) {
@@ -1811,6 +1825,15 @@ async function deliverMessage(
       content: scrubbedContent,
     });
     if (!claim.claimed) {
+      if (claim.receipt.session_id !== session.id) {
+        const receiptSession = await getSession(claim.receipt.session_id);
+        if (!receiptSession || receiptSession.agent_group_id !== session.agent_group_id)
+          throw new Error(
+            `Outcome not published: another agent owns the existing receipt` +
+              `${claim.receipt.platform_message_id ? ` (${claim.receipt.platform_message_id})` : ''}. ` +
+              'Merge this result through that owner report or use an explicitly requested separate reply.',
+          );
+      }
       if (claim.receipt.platform_id !== msg.platform_id)
         throw new Error(
           'This work item already belongs to another reporting destination; inspect its receipt rather than reposting.',
@@ -1940,7 +1963,9 @@ async function deliverMessage(
     // got tracked before the session was classified as a spawn child.
     const isSpawnChild = await isSpawnChildSession(session.id);
     await dropOrphanStatus(session.id, { skip: isSpawnChild, recoverLifecycle: true });
+  }
 
+  if (msg.kind === 'chat') {
     // Mirror agent replies into the central archive (2.9). Scrubbed text
     // so any accidentally-included secret stays out of searchable history.
     try {

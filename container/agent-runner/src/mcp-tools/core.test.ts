@@ -464,6 +464,7 @@ describe('outcome reporting send_message contract', () => {
     setChatLimit(0);
     try {
       publishRequestCandidates([{ sequence: 2, messageId: 'platform-message:agent' }]);
+      delete process.env.NANOCLAW_SESSION_ID;
       const single = await sendMessage.handler({
         purpose: 'outcome',
         text: 'Fixed.',
@@ -471,6 +472,7 @@ describe('outcome reporting send_message contract', () => {
       });
       expect(single.isError).toBe(true);
       expect(single.content[0].text).not.toContain('requestId');
+      expect(single.content[0].text).not.toContain('Harness session identity is unavailable');
 
       publishRequestCandidates([
         { sequence: 2, messageId: 'platform-message:agent' },

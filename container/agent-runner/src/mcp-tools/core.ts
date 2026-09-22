@@ -334,9 +334,13 @@ export const sendMessage: McpToolDefinition = {
         let trustedRequest: TrustedRequestIdentity | undefined;
         if (rawOutcome?.workItem === undefined) {
           const candidate = resolveRequestCandidate(rawOutcome?.requestId);
-          const sessionId = process.env.NANOCLAW_SESSION_ID;
-          if (!sessionId) throw new Error('Harness session identity is unavailable');
-          trustedRequest = { sessionId, messageId: candidate.messageId, sequence: candidate.sequence };
+          // The runner validates only that this request id came from its trusted candidate set.
+          // The host reopens that inbound row and derives the authoritative origin key.
+          trustedRequest = {
+            sessionId: 'runner-validation',
+            messageId: candidate.messageId,
+            sequence: candidate.sequence,
+          };
           reportedOutcome = { ...rawOutcome, requestId: candidate.sequence };
         }
         text = renderWorkOutcome(text, reportedOutcome, trustedRequest).text;

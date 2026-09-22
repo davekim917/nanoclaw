@@ -319,7 +319,7 @@ function buildDestinationsSection(mode: SessionMode, structuredReporting: boolea
   lines.push(
     structuredReporting
       ? 'Public replies use the `send_message` tool with an explicit purpose. Omit `to` for the current conversation; pass a named destination only when the request explicitly asks you to reach a different channel, agent, or DM. Final and interim model text is an internal work record and is not delivered.'
-      : 'Prefer the `send_message` tool for public replies. Omit `to` for the current conversation; pass a named destination only when the request explicitly asks you to reach a different channel, agent, or DM. Legacy final-text compatibility remains active, so never place private notes in final output.',
+      : 'Legacy final-response delivery is active: wrap public final text in `<message to="name">...</message>` (`to="here"` for this conversation) and put private scratchpad text in `<internal>...</internal>`. You may instead use `send_message`; omit `to` for this conversation and name a destination only when the request asks for another channel, agent, or DM.',
   );
   lines.push('');
   lines.push(

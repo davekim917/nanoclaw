@@ -40,7 +40,7 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
     const prompt = buildSystemPromptAddendum('Casa');
 
     expect(prompt).toContain('Omit `to` for the current conversation');
-    expect(prompt).toContain('Omit `to` for the current conversation');
+    expect(prompt).toContain('You can send messages to the following destinations');
     expect(prompt).toContain('`casa`');
     expect(prompt).toContain('`whatsapp-mg-17780`');
   });
@@ -66,7 +66,9 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
     delete process.env.NANOCLAW_OUTCOME_REPORTING;
     seedDestination('casa', 'Casa', 'whatsapp', 'person17@fixture6.example.com');
     const prompt = buildSystemPromptAddendum('Casa');
-    expect(prompt).toContain('Legacy final-text compatibility remains active');
+    expect(prompt).toContain('Legacy final-response delivery is active');
+    expect(prompt).toContain('<message to="name">');
+    expect(prompt).toContain('<internal>...</internal>');
     expect(prompt).not.toContain('Final and interim model text is an internal work record');
     expect(prompt).not.toContain('send a brief acknowledgment');
   });

@@ -2781,6 +2781,7 @@ describe('per-work-item outcome delivery', () => {
     sequence: number,
     platformMessageId: string,
     sourceRoute = { channelType: 'telegram', platformId: 'telegram:123' },
+    summary = 'The requested work is complete.',
   ): { text: string; reporting: object } {
     const inbound = openInboundDbAt(inboundDbPath(agentGroupId, sessionId));
     const rowId = `${platformMessageId}:${agentGroupId}`;
@@ -2799,7 +2800,6 @@ describe('per-work-item outcome delivery', () => {
         JSON.stringify({ text: 'Do the work', platformMsgId: platformMessageId }),
       );
     inbound.close();
-    const summary = 'The requested work is complete.';
     const data = { requestId: sequence, verified: 'Focused checks passed.' };
     const trusted = {
       sessionId,
@@ -2834,11 +2834,21 @@ describe('per-work-item outcome delivery', () => {
       questionId: 'q-outcome',
       title: 'Choose scope',
       question: 'Which product scope?',
+      text: 'Interactive card payload, not an assistant chat reply.',
       options: ['A', 'B'],
     });
     await deliverSessionMessages(session);
     expect(deliver).toHaveBeenCalledTimes(2);
     expect(getRawDb().prepare('SELECT last_outbound_at FROM sessions WHERE id=?').get(session.id)).toBeTruthy();
+    const archive = new Database(`${TEST_DIR}/archive.db`, { readonly: true });
+    try {
+      expect(archive.prepare('SELECT id FROM messages_archive WHERE id = ?').get('legacy-human')).toEqual({
+        id: 'legacy-human',
+      });
+      expect(archive.prepare('SELECT id FROM messages_archive WHERE id = ?').get('question')).toBeUndefined();
+    } finally {
+      archive.close();
+    }
   });
 
   it('dedupes normalized work items across concurrent sibling sessions and later replay', async () => {
@@ -2865,8 +2875,17 @@ describe('per-work-item outcome delivery', () => {
       await outcome('https://github.com/example-ORG/checkout/pull/17?presentation=1'),
     );
     await Promise.all([deliverSessionMessages(first), deliverSessionMessages(second)]);
-    await deliverSessionMessages(second);
+    const owner = getRawDb().prepare('SELECT session_id FROM work_outcome_receipts').get() as { session_id: string };
+    const sibling = owner.session_id === first.id ? second : first;
+    // The non-owner's conflicting result remains retryable for three delivery
+    // attempts, then becomes a truthful failed row instead of a false ACK.
+    await deliverSessionMessages(sibling);
+    await deliverSessionMessages(sibling);
     insertOutboundKind('ag-2', second.id, 'outcome-replay', 'chat', 'telegram', 'telegram:123', await outcome());
+    // A replay from the owner records the existing receipt immediately; a
+    // replay from the sibling exhausts the same recoverable ownership conflict.
+    await deliverSessionMessages(second);
+    await deliverSessionMessages(second);
     await deliverSessionMessages(second);
     expect(deliver).toHaveBeenCalledTimes(1);
     expect(getRawDb().prepare('SELECT state,platform_message_id FROM work_outcome_receipts').all()).toEqual([
@@ -2881,7 +2900,7 @@ describe('per-work-item outcome delivery', () => {
     expect(deliver).toHaveBeenCalledTimes(2);
   });
 
-  it('dedupes one trusted platform request across sibling sessions without requiring an external URL', async () => {
+  it('dedupes one trusted platform request but reports a different sibling outcome as unpublished', async () => {
     const first = await prepare();
     await createAgentGroup({
       id: 'ag-2',
@@ -2910,9 +2929,19 @@ describe('per-work-item outcome delivery', () => {
       'chat',
       'telegram',
       'telegram:123',
-      opaqueOutcome('ag-2', second.id, 8, 'platform-request-1'),
+      opaqueOutcome(
+        'ag-2',
+        second.id,
+        8,
+        'platform-request-1',
+        { channelType: 'telegram', platformId: 'telegram:123' },
+        'The sibling completed a different authorized slice.',
+      ),
     );
-    await Promise.all([deliverSessionMessages(first), deliverSessionMessages(second)]);
+    await deliverSessionMessages(first);
+    await deliverSessionMessages(second);
+    await deliverSessionMessages(second);
+    await deliverSessionMessages(second);
     expect(deliver).toHaveBeenCalledTimes(1);
     const receipt = getRawDb().prepare('SELECT work_item,state FROM work_outcome_receipts').get() as {
       work_item: string;
@@ -2920,6 +2949,14 @@ describe('per-work-item outcome delivery', () => {
     };
     expect(receipt.work_item).toMatch(/^request:v1:[0-9a-f]{64}$/);
     expect(receipt.state).toBe('delivered');
+    const siblingInbound = openInboundDb('ag-2', second.id);
+    expect(
+      siblingInbound.prepare('SELECT status,error FROM delivered WHERE message_out_id = ?').get('opaque-b'),
+    ).toMatchObject({
+      status: 'failed',
+      error: expect.stringContaining('another agent owns the existing receipt'),
+    });
+    siblingInbound.close();
   });
 
   it('rejects an opaque outcome keyed to an agent-authored inbound row', async () => {
