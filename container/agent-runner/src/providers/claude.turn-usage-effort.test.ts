@@ -438,7 +438,7 @@ describe('claude turn effort -> turn_usage row', () => {
     await runTurnAndRecord({ model: 'opus' });
 
     expect(getTurnUsageRows().map((r) => [r.model, r.effort])).toEqual([
-      ['claude-opus-5[1m]', 'high'],
+      ['claude-opus-5[1m]', 'medium'],
       ['claude-sonnet-5', null],
     ]);
   });
@@ -474,8 +474,8 @@ describe('claude turn effort -> turn_usage row', () => {
     // available by reading defaultEffortForModel.
     expect(rows[0]).toMatchObject({
       model: 'claude-opus-5[1m]',
-      effort: 'high',
-      effort_requested: 'high',
+      effort: 'medium',
+      effort_requested: 'medium',
     });
   });
 
@@ -530,7 +530,7 @@ describe('claude turn effort -> turn_usage row', () => {
 
     const rows = getTurnUsageRows();
     expect(rows.map((r) => [r.model, r.effort])).toEqual([
-      ['claude-opus-5[1m]', 'high'],
+      ['claude-opus-5[1m]', 'medium'],
       ['claude-sonnet-5', null],
       ['claude-haiku-4-5-20251001', null],
     ]);

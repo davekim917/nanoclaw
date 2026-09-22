@@ -51,10 +51,15 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
   // -5-0), like fable/sonnet. 1M context is the model's default AND maximum,
   // but we still pin `[1m]` — the CLI only grants the 1M auto-compact window
   // unconditionally when the id literally carries the tag (see
-  // ensureOpus1mSuffix). Same $5/$25 per MTok as Opus 4.8. This is what the
-  // bare `opus` alias resolves to (DEFAULT_OPUS_MODEL in container-runner.ts).
+  // ensureOpus1mSuffix). Same $5/$25 per MTok as Opus 4.8.
   opus5: 'claude-opus-5[1m]',
   'opus-5': 'claude-opus-5[1m]',
+  // Opus 5.5: two-segment version scheme again (claude-opus-5-5). Needs
+  // claude-code >= 2.1.280 — 2.1.278's binary has no reference to the id.
+  // This is what the bare `opus` alias resolves to (DEFAULT_OPUS_MODEL below).
+  opus55: 'claude-opus-5-5[1m]',
+  'opus5-5': 'claude-opus-5-5[1m]',
+  'opus-5-5': 'claude-opus-5-5[1m]',
   // Fable 5.1 (GA 2026-09-01): two-segment version scheme (claude-fable-5-1),
   // like opus-4-8. 1M-context-only in this fork, same policy as opus. NOTE:
   // $10/$50 per MTok — 2x Opus 4.8; opt-in via flag, never a default. Bare
@@ -89,7 +94,7 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
 // (messaging_group_agents.default_model/effort) and per-group
 // (container.json defaultModel/defaultEffort) layers can still override.
 // Per-session flags (-m / -e) and sticky config override on top of those.
-export const DEFAULT_OPUS_MODEL = 'claude-opus-5[1m]';
+export const DEFAULT_OPUS_MODEL = 'claude-opus-5-5[1m]';
 export const DEFAULT_SONNET_MODEL = 'claude-sonnet-5';
 export const DEFAULT_HAIKU_MODEL = 'claude-haiku-4-5-20251001';
 
@@ -183,9 +188,10 @@ const MODEL_EFFORT_SUPPORT: Record<string, ReadonlySet<EffortLevel>> = {
   // Same 1M-only policy. Bare `opus` resolves here once DEFAULT_OPUS_MODEL
   // points at 4.8 (container-runner.ts).
   'claude-opus-4-8[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
-  // Opus 5: full effort ladder (low | medium | high | xhigh | max). Bare `opus`
-  // resolves here — DEFAULT_OPUS_MODEL points at it (container-runner.ts).
+  // Opus 5: full effort ladder (low | medium | high | xhigh | max).
   'claude-opus-5[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
+  // Opus 5.5: same full ladder. Bare `opus` resolves here (DEFAULT_OPUS_MODEL).
+  'claude-opus-5-5[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
   // Fable 5: full effort surface (docs/en/build-with-claude/effort, verified
   // 2026-06-09). Adaptive thinking is ALWAYS ON for fable — `disabled` is
   // rejected by the API — so effort is the only depth control.
