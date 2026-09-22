@@ -1070,34 +1070,77 @@ describe('universal /dev/null stdin wrap', () => {
     expect(after.out).toContain('STDIN:[]'); // the second read /dev/null
   }, 20_000);
 
-  it('(c) a trailing heredoc terminator, `# comment`, and `&` still parse and run', async () => {
-    const cases: Array<[string, string]> = [
-      ["cat <<'EOF'\nhello from heredoc\nEOF", 'hello from heredoc'],
-      ['echo kept # trailing comment', 'kept'],
-      ['echo backgrounded &', 'backgrounded'],
-    ];
-    for (const [cmd, expected] of cases) {
-      const wrapped = await runRewriteHook(cmd);
-      expect(wrapped).not.toBe(cmd); // really wrapped
-      const r = await run(wrapped);
-      expect(r.hung).toBe(false);
-      expect(r.code).toBe(0);
-      expect(r.out).toContain(expected);
-    }
-  }, 20_000);
+  // Every shape must behave EXACTLY as it does unwrapped: same exit code, same
+  // stdout. The two marked ← regressed under the earlier brace-group wrap
+  // (`{\n<cmd>\n} </dev/null`), where they swallowed the closing `}` and
+  // became `syntax error: unexpected end of file` (rc 2).
+  const SHAPES: Array<[string, string]> = [
+    ['plain', 'echo plain'],
+    ['heredoc terminated', "cat <<'EOF'\nhello from heredoc\nEOF"],
+    ['heredoc unterminated ←', 'cat <<EOF\nno terminator line'],
+    ['trailing backslash ←', 'echo a \\'],
+    ['mid-command continuation', 'echo a \\\n  b'],
+    ['loop', 'for i in 1 2 3; do echo "n$i"; done'],
+    ['exit 3', 'echo before; exit 3'],
+    ['"}" in a string', 'echo "}"'],
+    ['trailing &', 'echo backgrounded &'],
+    ['trailing # comment', 'echo kept # trailing comment'],
+  ];
 
-  it('(d) a brace group, not a subshell: `cd` survives the wrap', async () => {
+  it('(c) every shell shape keeps its raw exit code and output under the prefix', async () => {
+    const rows: string[] = [];
+    for (const [name, cmd] of SHAPES) {
+      const wrapped = await runRewriteHook(cmd);
+      expect(wrapped).not.toBe(cmd); // really rewritten
+      const raw = await run(cmd);
+      const rew = await run(wrapped);
+      rows.push(`${name.padEnd(26)} raw rc=${raw.code} rewritten rc=${rew.code}`);
+      expect(raw.hung).toBe(false);
+      expect(rew.hung).toBe(false);
+      expect(rew.code).toBe(raw.code);
+      expect(rew.out).toBe(raw.out);
+    }
+    console.log(`  ${rows.join('\n  ')}`);
+  }, 60_000);
+
+  it('(d) same shell, no subshell: `cd` persists past the command', async () => {
     const wrapped = await runRewriteHook('cd /tmp && pwd');
-    // The trailing `pwd` runs AFTER the wrap closes — a subshell would lose the cd.
     const r = await run(`${wrapped}\npwd`);
     expect(r.out.trim().split('\n')).toEqual(['/tmp', '/tmp']);
+  });
+
+  it("(g) inside the harness's own `eval '<cmd>' && pwd -P >| <cwdfile>` the cwd capture still works", async () => {
+    // Claude Code runs a Bash call as bash -c "… && eval '<cmd>' && pwd -P >| <cwdfile>",
+    // the command in argv (observed on this host via /proc/$$/cmdline), so
+    // `exec </dev/null` inside the eval closes only the socket nobody writes.
+    const cwdFile = path.join(dir, 'cwd-capture');
+    const harness = (cmd: string) => `eval '${cmd.replace(/'/g, `'"'"'`)}' && pwd -P >| ${cwdFile}`;
+    const wrapped = await runRewriteHook(`cd /tmp && echo 'moved'; cat`); // `cat` would hang on the open stdin
+    const r = await run(harness(wrapped));
+    expect(r.hung).toBe(false);
+    expect(r.code).toBe(0);
+    expect(r.out).toBe('moved\n');
+    expect(fs.readFileSync(cwdFile, 'utf8').trim()).toBe('/tmp');
+  });
+
+  it('(h) the jest lock still works after the exec line (prefix outermost)', async () => {
+    // A harmless stand-in for the jest command: `cat` proves the lock's inner
+    // `bash -c` inherited /dev/null rather than the open socket.
+    const wrapped = wrapDevNullStdin(wrapJestSerialized('echo jest-ok; cat'));
+    expect(wrapped.startsWith('exec </dev/null\n')).toBe(true);
+    const r = await run(wrapped);
+    expect(r.hung).toBe(false);
+    expect(r.code).toBe(0);
+    expect(r.out).toBe('jest-ok\n');
+    // And the real hook produces exactly that order for a jest command.
+    expect(await runRewriteHook('npx jest')).toBe(wrapDevNullStdin(wrapJestSerialized('npx jest')));
   });
 
   it('(e) is not applied twice', async () => {
     const once = await runRewriteHook('snow sql --query "select 1"');
     expect(await runRewriteHook(once)).toBe(once);
     expect(wrapDevNullStdin(once)).toBe(once);
-    expect(once.match(/<\/dev\/null/g)).toHaveLength(1);
+    expect(once.match(/exec <\/dev\/null/g)).toHaveLength(1);
   });
 
   it('(f) quoted text containing `snow sql --query ""` is not denied and runs', async () => {

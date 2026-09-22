@@ -1094,25 +1094,25 @@ export function createSubagentQuotaHook(options: {
 // a piped snow exempting a later unpiped one, separators inside quotes. The
 // wrap is now unconditional and there is nothing to detect.
 //
-// `{\n<command>\n} </dev/null`:
-//   • Inner redirects bind tighter than the group's, so `… | snow sql -i`,
+// `exec </dev/null` on its own line, before the command:
+//   • A PREFIX, with no closing token, so nothing the command ends with can
+//     collide with the wrap. A brace group (`{\n<cmd>\n} </dev/null`) turned
+//     two shapes bash accepts today into hard syntax errors: a heredoc with no
+//     terminator line and a trailing line-continuation `\` both swallowed the
+//     closing `}`.
+//   • Redirects on individual commands still override it, so `… | snow sql -i`,
 //     `cmd < file` and heredocs keep their own stdin.
-//   • Newlines, not `;`: a trailing heredoc terminator must be alone on its
-//     line, a trailing `# comment` must not swallow the `}`, and `cmd &` is
-//     legal before a newline but `cmd & ;` is a syntax error.
-//   • A brace group, not a subshell: `cd` and `export` persist, which the
-//     harness's cwd tracking relies on.
+//   • Same shell, no subshell: `cd` and `export` persist. The harness runs
+//     `bash -c "… && eval '<cmd>' && pwd -P >| <cwdfile>"` with the command
+//     in argv, not on stdin, so closing fd 0 inside the eval cannot cut the
+//     harness off from its own input.
 //   • NOT a wall-clock timeout: a legitimately long query is waiting on the
 //     server, not on fd 0, and runs as long as it needs.
-// Known limits: a command ending in a line-continuation `\` or in a heredoc
-// with no terminator line joins the closing `}` and becomes a syntax error.
-const STDIN_WRAP_OPEN = '{\n';
-const STDIN_WRAP_CLOSE = '\n} </dev/null';
+const STDIN_PREFIX = 'exec </dev/null\n';
 
-/** Wrap a command so its stdin is /dev/null. Idempotent. Exported for tests. */
+/** Give a command /dev/null on stdin. Idempotent. Exported for tests. */
 export function wrapDevNullStdin(command: string): string {
-  if (command.startsWith(STDIN_WRAP_OPEN) && command.endsWith(STDIN_WRAP_CLOSE)) return command;
-  return `${STDIN_WRAP_OPEN}${command}${STDIN_WRAP_CLOSE}`;
+  return command.startsWith(STDIN_PREFIX) ? command : `${STDIN_PREFIX}${command}`;
 }
 
 // Two concurrent jest runs will OOM-kill this container no matter how each one
@@ -1172,7 +1172,7 @@ export function wrapJestSerialized(command: string): string {
  * Registered LAST in the Bash PreToolUse list. It is the only hook that
  * returns `updatedInput`, and every other Bash hook is a guard written against
  * the command as the agent typed it (the email gate's bypass check, for
- * example, fails closed on `{`, `<` and newlines). Whether the CLI hands a
+ * example, fails closed on `<` and newlines). Whether the CLI hands a
  * later hook an earlier hook's `updatedInput` or runs them all on the original
  * input, last means no guard ever sees the wrapper.
  */
@@ -1186,7 +1186,7 @@ export function createBashCommandRewriteHook(): HookCallback {
     if (JEST_RE.test(command) && !ALREADY_FLOCKED_RE.test(command)) {
       rewritten = wrapJestSerialized(rewritten);
     }
-    // Outermost, so jest's inner `bash -c` inherits /dev/null too.
+    // Prefix goes outermost, so jest's inner `bash -c` inherits /dev/null too.
     rewritten = wrapDevNullStdin(rewritten);
     if (rewritten === command) return {};
 
