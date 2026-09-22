@@ -5922,3 +5922,69 @@ describe('status subtext — round-two regressions', () => {
     expect(subtexts[1]).toBe('opus-5 · xhigh');
   });
 });
+
+/**
+ * A mid-turn push used to be `markCompleted` on the line after `pushToQuery` —
+ * terminal seconds after arrival, with no evidence the model had consumed it.
+ * `completed` is what the host syncs onto `messages_in.status`
+ * (src/modules/mailbox/ops/sweep.ts:207) and nothing re-delivers a completed
+ * row, so a turn that died before reading the push took the message with it.
+ * 2026-09-22: a person's check-ins during a 30-minute wedged turn were acked
+ * and lost, and the thread stayed silent.
+ */
+describe('a follow-up pushed mid-turn is acked only once consumed', () => {
+  const ackStatus = (id: string): string | undefined =>
+    (
+      getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as
+        | { status: string }
+        | undefined
+    )?.status;
+  const inboundStatus = (id: string): string | undefined =>
+    (getInboundDb().prepare('SELECT status FROM messages_in WHERE id = ?').get(id) as { status: string } | undefined)
+      ?.status;
+
+  /** Runs a query whose turn stays open until the poll admits a row. */
+  function runWithMidTurnPush(afterPush: 'result' | 'die'): Promise<string | undefined> {
+    insertMessage('m-checkin', 'chat', { sender: 'Operator', senderId: 'U1', text: 'are you there' });
+    let sawPush!: () => void;
+    const pushed = new Promise<void>((resolve) => {
+      sawPush = resolve;
+    });
+    let ackWhileRunning: string | undefined;
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      await pushed; // the turn is still running when the poll admits the row
+      ackWhileRunning = ackStatus('m-checkin');
+      if (afterPush === 'result') yield { type: 'result', text: '<internal>read it</internal>' };
+      // 'die': the stream ends with the push never answered.
+    }
+    const query: AgentQuery = {
+      push: () => sawPush(),
+      end: () => {},
+      abort: () => {},
+      events: events(),
+    };
+    // Settings must match what the follow-up batch resolves to, or the poll
+    // ends the stream instead of pushing.
+    return processQuery(query, ERR_ROUTING, [], 'claude', undefined, 'initial', undefined, {
+      ultracode: false,
+      fast: false,
+    }).then(() => ackWhileRunning);
+  }
+
+  it('holds a non-terminal `processing` claim while the turn runs, then completes at `result`', async () => {
+    const ackWhileRunning = await runWithMidTurnPush('result');
+    // The regression: this used to already read 'completed'.
+    expect(ackWhileRunning).toBe('processing');
+    expect(ackStatus('m-checkin')).toBe('completed');
+  }, 30_000);
+
+  it('RELEASES the claim when the stream ends without a result, so the row is re-delivered', async () => {
+    const ackWhileRunning = await runWithMidTurnPush('die');
+    expect(ackWhileRunning).toBe('processing');
+    // Released, not completed: no ack row at all, inbound still pending.
+    expect(ackStatus('m-checkin')).toBeUndefined();
+    expect(inboundStatus('m-checkin')).toBe('pending');
+    expect(getPendingMessages().map((m) => m.id)).toContain('m-checkin');
+  }, 30_000);
+});

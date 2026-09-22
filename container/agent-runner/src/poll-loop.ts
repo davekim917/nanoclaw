@@ -2063,6 +2063,37 @@ export async function processQuery(
     { prompt: initialPrompt, ...(initialContinuationId ? { continuationId: initialContinuationId } : {}) },
   ];
 
+  /**
+   * Follow-up rows pushed into this query whose ack is not terminal yet.
+   *
+   * A mid-turn push used to be `markCompleted` on the line after
+   * `pushToQuery` — seconds after the message arrived, with no evidence the
+   * model had consumed it. `completed` is the terminal ack the host syncs onto
+   * `messages_in.status` (`syncProcessingAcks`, src/modules/mailbox/ops/sweep.ts:207),
+   * and once a row is `completed` nothing re-delivers it: the wake duty stops
+   * counting it due and `completeAnsweredPendingRows` never looks at it. So a
+   * turn that died before it ever read the push took the message with it.
+   * Observed live 2026-09-22: a person's messages during a 30-minute wedged
+   * turn were acked and lost, and the thread stayed silent.
+   *
+   * These ids are now drained at the same place the INITIAL batch is — the
+   * turn's `result`, which for the claude provider settles everything pushed
+   * into it so far (a push is merged into the running turn; claude.ts's
+   * generator only exits on end/abort). If the turn never produces a result,
+   * the rows keep their non-terminal `processing` claim, the next container's
+   * `clearStaleProcessingAcks` drops the orphan claim, and the still-`pending`
+   * inbound row is selected again. Redelivery, not loss — the designed recovery
+   * (host-sweep.ts's comment at the poll interval: "if something is truly
+   * stuck, the host will kill the container and messages get reset to pending").
+   */
+  let pendingFollowUpIds: string[] = [];
+  const completePendingFollowUps = (): void => {
+    if (pendingFollowUpIds.length === 0) return;
+    const ids = pendingFollowUpIds;
+    pendingFollowUpIds = [];
+    markCompleted(ids);
+  };
+
   const requeueLedgerHead = (suppress: boolean): void => {
     const continuationId = archivePrompts[0]?.continuationId;
     if (!continuationId) return;
@@ -2463,7 +2494,13 @@ export async function processQuery(
         if (admittedTurn && pushedId) admittedTurn.promptIds = [pushedId];
         archivePrompts.push({ prompt });
         admittedInbound = true;
-        markCompleted(keptIds);
+        // NOT markCompleted here — see `pendingFollowUpIds`. The claim stays
+        // `processing` until a `result` proves the model consumed the push.
+        pendingFollowUpIds.push(...keptIds);
+        // Deliberately no touchHeartbeat() here: that would restart the idle
+        // ceiling on every inbound message. A claim held across a long silent
+        // tool is forgiven host-side instead — `decideStuckAction`'s
+        // tool-in-flight rule (src/modules/sweep-container-health/index.ts).
       } catch (err) {
         pollFailed = true;
         // Without this catch the rejection escapes the void IIFE and Node
@@ -2736,6 +2773,11 @@ export async function processQuery(
         // mid-turn, or the message may not need a response at all — either
         // way the per-turn work for these rows is finished.
         markCompleted(initialBatchIds);
+        // Same instant, same reason, for anything pushed into this turn
+        // mid-flight. A push is merged into the running turn, so this result
+        // settles it too — that is the one moment at which "the model consumed
+        // it" is actually true. See `pendingFollowUpIds`.
+        completePendingFollowUps();
         if (event.text) {
           // AUP refusal fast-fail: when Anthropic's content policy filter
           // fires mid-task, the SDK returns a terminal chat response with
@@ -3016,6 +3058,25 @@ export async function processQuery(
     // Floor for the abort/throw paths, which never reach a `result`.
     closeResultScope();
     setProviderTurnExecuting(false);
+    // A push that never got its `result` (abort, throw, a stream ended for a
+    // command) must NOT keep a claim the runner will then filter out of every
+    // later selection: the container stays alive across queries, so nothing
+    // would clear it until the container exits and the message would be
+    // silently undeliverable in the meantime. Release the claim instead — the
+    // inbound row is still `pending`, so the next query re-selects it. This is
+    // the same op the repository-fence deferral uses (poll-loop.ts:1536) and it
+    // is deliberately a RELEASE, never a `markCompleted`: completing is what
+    // lost the message in the first place.
+    if (pendingFollowUpIds.length > 0) {
+      const unconsumed = pendingFollowUpIds;
+      pendingFollowUpIds = [];
+      try {
+        releaseProcessingClaims(unconsumed);
+        log(`Released ${unconsumed.length} follow-up claim(s) the stream ended without consuming`);
+      } catch (err) {
+        log(`Failed to release unconsumed follow-up claims: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 
   return { continuation: queryContinuation, taskTurns };

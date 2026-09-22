@@ -1987,3 +1987,82 @@ describe('post-kill writes yield to a replacement container', () => {
     expect(f.state()).toBe('claims=0 notices=1');
   });
 });
+
+// A mid-turn follow-up's claim is held until the turn's `result`
+// (container/agent-runner/src/poll-loop.ts, `pendingFollowUpIds`). A turn inside
+// a long silent tool emits no event, so the heartbeat stays older than the
+// claim. The claim rule must not read that as a wedge while a tool that began
+// BEFORE the claim is still in flight — and the ceiling must not move.
+describe('decideStuckAction: a claim made while an earlier tool is still in flight', () => {
+  const MIN = 60 * 1000;
+  const claimedAt = BASE - 5 * MIN; // age 5 min > CLAIM_STUCK_MS
+  const claim = { message_id: 'm-followup', status_changed: new Date(claimedAt).toISOString() };
+  // A non-Bash tool, so no declared timeout widens the tolerance and the new
+  // rule is the only thing that can forgive the claim.
+  const readStartedAt = (ms: number) => ({
+    current_tool: 'Read',
+    tool_declared_timeout_ms: null,
+    tool_started_at: new Date(ms).toISOString(),
+  });
+  const heartbeatBeforeClaim = BASE - 12 * MIN; // older than the claim, inside the ceiling
+
+  it('(a) forgives the claim when the tool started before it', () => {
+    expect(CLAIM_STUCK_MS).toBeLessThan(BASE - claimedAt);
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: heartbeatBeforeClaim,
+      containerState: readStartedAt(BASE - 10 * MIN),
+      claims: [claim],
+    });
+    expect(res).toEqual({ action: 'ok' });
+  });
+
+  it('(b) still kills the claim with no tool in flight (unchanged)', () => {
+    for (const containerState of [
+      null,
+      { current_tool: null, tool_declared_timeout_ms: null, tool_started_at: new Date(BASE - 10 * MIN).toISOString() },
+    ]) {
+      const res = decideStuckAction({
+        now: BASE,
+        heartbeatMtimeMs: heartbeatBeforeClaim,
+        containerState,
+        claims: [claim],
+      });
+      expect(res.action).toBe('kill-claim');
+    }
+  });
+
+  it('(c) still kills the claim when the tool started AFTER it', () => {
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: heartbeatBeforeClaim,
+      containerState: readStartedAt(BASE - 2 * MIN),
+      claims: [claim],
+    });
+    expect(res.action).toBe('kill-claim');
+  });
+
+  it('(d) the ceiling still fires while a tool is in flight', () => {
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: BASE - ABSOLUTE_CEILING_MS - MIN,
+      containerState: readStartedAt(BASE - 40 * MIN),
+      claims: [claim],
+    });
+    expect(res.action).toBe('kill-ceiling');
+    if (res.action !== 'kill-ceiling') return;
+    expect(res.ceilingMs).toBe(ABSOLUTE_CEILING_MS);
+  });
+
+  it('(e) an unparseable or missing tool_started_at gives no forgiveness', () => {
+    for (const tool_started_at of ['not-a-timestamp', '', null]) {
+      const res = decideStuckAction({
+        now: BASE,
+        heartbeatMtimeMs: heartbeatBeforeClaim,
+        containerState: { current_tool: 'Read', tool_declared_timeout_ms: null, tool_started_at },
+        claims: [claim],
+      });
+      expect(res.action).toBe('kill-claim');
+    }
+  });
+});
