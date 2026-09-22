@@ -31,7 +31,9 @@ import {
   classifyTrigger,
   hasChatOutboundAfter,
   maxOutboundSeq,
+  claimPrimaryRetryRequest,
   clearDoneProposal,
+  clearPrimaryRetryRequest,
   clearStickyEffort,
   clearStickyModel,
   clearStickyUltracode,
@@ -736,6 +738,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     applyChatBudget(keep);
     const flagBatch = effectiveTurnSettings(keep, routing, config.providerName, config.providerFallbackActive === true);
+    // Running on the primary is the evidence that any earlier request for it
+    // (or simply the window expiring) worked, so the cooldown claim is spent.
+    // Without this a session that asked once could not ask again for 30
+    // minutes even after a clean round-trip back to the primary and a fresh
+    // outage. The helper reads before it deletes, so a session that never
+    // asked writes nothing.
+    if (config.providerFallbackActive !== true) clearPrimaryRetryRequest();
     if (flagBatch.ignoredModel !== undefined)
       await noteIgnoredModel(
         flagBatch.ignoredModel,
@@ -3736,17 +3745,27 @@ export function applyFlagBatch(
  * That is the honest answer to an explicit request, and it is bounded —
  * only a freshly typed `-m` reaches here.
  */
-async function requestPrimaryProviderRetry(requestedModel: string): Promise<void> {
+async function requestPrimaryProviderRetry(requestedModel: string): Promise<boolean> {
+  // The claim is the loop brake — see PRIMARY_RETRY_REQUEST_COOLDOWN_MS. The
+  // request makes the host respawn this session, and if the primary is still
+  // spent the triggering message comes back pending with its `flagIntent`
+  // intact and would ask again, forever, on a failure streak this very
+  // request keeps resetting to zero.
+  if (!claimPrimaryRetryRequest()) return false;
   try {
     await writeMessageOut({
       id: generateId(),
       kind: 'system',
       content: JSON.stringify({ action: 'provider_retry_primary', requestedModel: requestedModel.slice(0, 200) }),
     });
+    return true;
   } catch (err) {
     // Best-effort, exactly like the outage report: a failed write must not
-    // swallow the chat line that tells the user what happened.
+    // swallow the chat line that tells the user what happened. The claim is
+    // deliberately NOT released — a write that may or may not have landed is
+    // not a reason to try again inside the cooldown.
     log(`Failed to request a primary-provider retry: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
   }
 }
 
@@ -3778,8 +3797,7 @@ export async function noteIgnoredModel(
   // Gated on `explicit` because the same ignore fires for a sticky stored
   // BEFORE the outage, which would otherwise ask on every turn and hold the
   // group in a re-probe loop for the whole window.
-  const requestingPrimary = fallbackActive && explicit;
-  if (requestingPrimary) await requestPrimaryProviderRetry(model);
+  const requestingPrimary = fallbackActive && explicit && (await requestPrimaryProviderRetry(model));
   const text =
     `⚙️ model pin ${model} is not a ${providerName} model — ignored while this session runs on ${providerName}; ` +
     (requestingPrimary

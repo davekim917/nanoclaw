@@ -7,7 +7,7 @@ import { evaluateAdmission, registerAdmissionGate } from './admission-gate.js';
 import { _resetConfig, loadConfig } from './config.js';
 import { clearStaleProcessingAcks, setContainerToolInFlight } from './db/container-state.js';
 import { setContinuation } from './db/session-state.js';
-import { setStickyModel, setStickyEffort } from './modules/mailbox/session-state.js';
+import { clearPrimaryRetryRequest, setStickyModel, setStickyEffort } from './modules/mailbox/session-state.js';
 import { getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
@@ -1007,6 +1007,36 @@ describe('model pin under a provider fallback', () => {
     expect(posted[0]).toContain('asking the host to return this session to its primary provider now.');
     // The wait-it-out wording would now be a lie — something IS happening.
     expect(posted[0]).not.toContain('applies again');
+  });
+
+  it('asks at most once per cooldown — the request causes the respawn that would re-ask', async () => {
+    // The loop this brakes: the request makes the host clear the window and
+    // respawn; if the primary is still spent that spawn fails, the outage is
+    // re-recorded, the session lands back on the fallback, and the triggering
+    // message is STILL pending with its flagIntent — so it asks again. Each
+    // cycle costs a container start, and the request resets the failure
+    // streak, so the backoff ladder never grows to damp it.
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi' });
+    const routing = extractRouting(getPendingMessages());
+
+    await noteIgnoredModel('opus', 'codex', true, routing, true);
+    await noteIgnoredModel('opus', 'codex', true, routing, true);
+    await noteIgnoredModel('sonnet', 'codex', true, routing, true);
+
+    expect(retryRequests()).toEqual(['opus']);
+  });
+
+  it('a session back on its primary may ask again', async () => {
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi' });
+    const routing = extractRouting(getPendingMessages());
+
+    await noteIgnoredModel('opus', 'codex', true, routing, true);
+    // The round trip that proves the last request worked: a turn ran on the
+    // primary. runPollLoop clears the claim on any non-fallback turn.
+    clearPrimaryRetryRequest();
+    await noteIgnoredModel('opus', 'codex', true, routing, true);
+
+    expect(retryRequests()).toEqual(['opus', 'opus']);
   });
 
   it('a leftover sticky asks for nothing — it would ask on every turn', async () => {

@@ -372,6 +372,60 @@ export function shouldPostInfraWarning(text: string): boolean {
   return true;
 }
 
+/* ─── Primary-provider retry request ───────────────────────────────────────── */
+
+const PRIMARY_RETRY_REQUEST_KEY = 'primary_retry_requested_at';
+
+/**
+ * Floor between two `provider_retry_primary` requests from one session.
+ *
+ * This is a LOOP BRAKE, not a nicety. The request makes the host clear the
+ * group's outage window and respawn the session; if the primary is still
+ * spent, that spawn fails, the outage is re-recorded, and the session lands
+ * back on the fallback — where the very message that triggered the request is
+ * still pending, still carrying its `flagIntent`, and would ask again. Each
+ * cycle is a container start, and because the request also resets the failure
+ * streak the backoff ladder never grows to damp it.
+ *
+ * 30 minutes is chosen against that cycle (~1-2 min), not against the user:
+ * one honest attempt, then the ordinary cooldown does its job. A user who
+ * genuinely waits and asks again gets a second attempt.
+ */
+export const PRIMARY_RETRY_REQUEST_COOLDOWN_MS = 30 * 60 * 1000;
+
+/**
+ * Claim the right to ask the host for the primary provider back, at most once
+ * per cooldown. Returns false when a request from this session is still
+ * recent — the caller then says nothing new rather than asking again.
+ *
+ * Stored in `session_state`, so the claim SURVIVES the respawn the request
+ * itself causes. An in-memory guard would be reset by the very restart it
+ * exists to bound, which is the whole failure mode.
+ */
+export function claimPrimaryRetryRequest(nowMs = Date.now()): boolean {
+  const previous = sqliteGetState(PRIMARY_RETRY_REQUEST_KEY);
+  if (previous) {
+    const age = nowMs - Date.parse(previous.value);
+    // An unparseable stamp is treated as expired, not as a live claim: failing
+    // toward one extra request is safer than a session that can never ask.
+    if (Number.isFinite(age) && age >= 0 && age < PRIMARY_RETRY_REQUEST_COOLDOWN_MS) return false;
+  }
+  setValue(PRIMARY_RETRY_REQUEST_KEY, new Date(nowMs).toISOString());
+  return true;
+}
+
+/**
+ * Forget the claim, so a session that is demonstrably back on its primary can
+ * ask again the next time it is parked. Called when a turn completes on the
+ * primary — the evidence that the last request (or the clock) worked.
+ */
+export function clearPrimaryRetryRequest(): void {
+  // Read first: this runs on every turn of every healthy session, and a
+  // session that never asked must not author a DELETE per turn.
+  if (sqliteGetState(PRIMARY_RETRY_REQUEST_KEY) === undefined) return;
+  deleteValue(PRIMARY_RETRY_REQUEST_KEY);
+}
+
 /* ─── Done proposal ────────────────────────────────────────────────────────── */
 
 const DONE_PROPOSAL_KEY = 'done_proposal';
