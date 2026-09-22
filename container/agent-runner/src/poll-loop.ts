@@ -737,9 +737,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     clearCurrentLifecycleStatus();
     if (outcomeReportingEnabled() && !routing.taskRun && triggeringHumanLivenessInbound(keep) && !routing.quietStatus) {
       const lifecycleStatusId = generateId();
+      const lifecycleAnchor =
+        routing.channelType && routing.platformId
+          ? (getBatchAnchor(routing.channelType, routing.platformId) ?? routing.inReplyTo)
+          : routing.inReplyTo;
       await writeMessageOut({
         id: lifecycleStatusId,
-        in_reply_to: routing.inReplyTo,
+        in_reply_to: lifecycleAnchor,
         kind: 'status',
         platform_id: routing.platformId,
         channel_type: routing.channelType,
