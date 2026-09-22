@@ -5,7 +5,9 @@
  * covered in container/agent-runner/src/fresh-context-task.test.ts.
  */
 import Database from 'better-sqlite3';
+import crypto from 'crypto';
 import fs from 'fs';
+import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../config.js', async () => {
@@ -23,7 +25,8 @@ vi.mock('../../container-runner.js', async (importOriginal) => ({
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-fresh-context') }));
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
+import { closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
+import { getDb, initDb } from '../../db/connection.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { getSession } from '../../db/sessions.js';
 import { admitDueTaskContexts, resolveTaskSession, withExistingMailboxSession } from '../../session-manager.js';
@@ -56,8 +59,14 @@ async function run(command: string, args: Record<string, unknown>) {
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  await initTestDb();
-  runMigrations(getRawDb());
+  // Migrated through a throwaway handle so this file never names the raw
+  // central handle (src/db/raw-db-ratchet.test.ts), as in
+  // src/stop-intent-recovery.test.ts:299-305.
+  const dbPath = path.join(TEST_DIR, `central-${crypto.randomUUID()}.db`);
+  const migrated = new Database(dbPath);
+  runMigrations(migrated);
+  migrated.close();
+  await initDb(dbPath, { role: 'test' });
   await createAgentGroup({
     id: 'ag-1',
     name: 'ag-1',
@@ -155,9 +164,10 @@ describe('--continuous', () => {
     expect(again.created).toBe(false);
     expect(again.session.id).toBe(sessionId);
     expect(await getSession(sessionId)).toEqual(before);
-    const rows = getRawDb()
-      .prepare('SELECT id FROM sessions WHERE thread_id = ?')
-      .all(`system:tasks:${seriesId}`) as Array<{ id: string }>;
+    const rows = await getDb().all<{ id: string }>(
+      'SELECT id FROM sessions WHERE thread_id = ?',
+      `system:tasks:${seriesId}`,
+    );
     expect(rows.map((r) => r.id)).toEqual([sessionId]);
   });
 });
