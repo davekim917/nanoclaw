@@ -34,18 +34,21 @@ import { openInboundDb as openInboundDbAt } from './modules/mailbox/openers.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { getTaskThreadAnchor, setTaskThreadAnchor } from './db/task-thread-anchors.js';
 import { getRawDb } from './db/connection.js';
-import { createPendingApproval, getPendingApproval, getPendingQuestion } from './db/sessions.js';
+import { createPendingApproval, deletePendingApproval, getPendingApproval, getPendingQuestion } from './db/sessions.js';
 import {
+  _resetStatusTrackingForTest,
   _threadKeyLockWaitersForTest,
   clearSessionStatusOnKill,
   deliverSessionMessages,
   registerDeliveryAction,
   setDeliveryAdapter,
+  settleSessionStatusAfterPublicDelivery,
   assertChannelRoutingConsistency,
 } from './delivery.js';
 import { unguarded } from './guard/index.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 import { isContainerRunning } from './container-runner.js';
+import { renderWorkOutcome } from './outcome-reporting-schema.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -329,6 +332,214 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     // tracking) must not throw or re-delete a vanished platform message.
     await clearSessionStatusOnKill(session.id);
     expect(deletes).toEqual(['plat-status-1']);
+  });
+
+  it('removes a stopped lifecycle row when a queued reply lands after the container was killed', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    const deliveries: Array<{ kind: string; content: Record<string, unknown> }> = [];
+    const deletes: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, kind, content) {
+        deliveries.push({ kind, content: JSON.parse(content) as Record<string, unknown> });
+        if (deliveries.length === 1) return 'plat-lifecycle-1';
+        if (kind === 'chat') return 'plat-reply-1';
+        return undefined;
+      },
+      async deleteMessage(_channelType, _platformId, _threadId, messageId) {
+        deletes.push(messageId);
+      },
+    });
+
+    insertOutboundKind('ag-1', session.id, 'lifecycle-1', 'status', 'telegram', 'telegram:123', {
+      text: 'Accepted · working',
+      reporting: { version: 1, purpose: 'liveness', state: 'working' },
+    });
+    await deliverSessionMessages(session);
+    insertOutboundKind('ag-1', session.id, 'queued-reply', 'chat', 'telegram', 'telegram:123', {
+      text: 'The queued work completed.',
+      reporting: { version: 1, purpose: 'reply' },
+    });
+
+    await clearSessionStatusOnKill(session.id);
+    expect(deliveries[1]).toMatchObject({
+      kind: 'status',
+      content: { operation: 'edit', messageId: 'plat-lifecycle-1', text: 'Stopped.' },
+    });
+
+    await deliverSessionMessages(session);
+    expect(deliveries.at(-1)).toMatchObject({ kind: 'chat', content: { text: 'The queued work completed.' } });
+    expect(deletes).toEqual(['plat-lifecycle-1']);
+  });
+
+  it.each(['unsupported', 'throws'] as const)(
+    'keeps same-route approval settlement terminal when status deletion is %s',
+    async (deleteMode) => {
+      await seedAgentAndChannel();
+      const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+      const events: string[] = [];
+      setDeliveryAdapter({
+        async deliver(_channelType, _platformId, _threadId, kind, content) {
+          const parsed = JSON.parse(content) as { operation?: string; text?: string };
+          events.push(parsed.operation === 'edit' ? `edit:${parsed.text}` : `post:${kind}`);
+          return kind === 'status' && !parsed.operation ? 'plat-lifecycle-approval' : undefined;
+        },
+        ...(deleteMode === 'throws'
+          ? {
+              async deleteMessage() {
+                const inbound = openInboundDb('ag-1', session.id);
+                const receipt = inbound
+                  .prepare('SELECT platform_message_id,lifecycle_terminal_at FROM delivered WHERE message_out_id = ?')
+                  .get('lifecycle-approval') as {
+                  platform_message_id: string;
+                  lifecycle_terminal_at: string | null;
+                };
+                inbound.close();
+                expect(receipt.platform_message_id).toBe('plat-lifecycle-approval');
+                expect(receipt.lifecycle_terminal_at).not.toBeNull();
+                events.push('delete:throws');
+                throw new Error('delete unsupported by adapter');
+              },
+            }
+          : {}),
+      });
+      insertOutboundKind('ag-1', session.id, 'lifecycle-approval', 'status', 'telegram', 'telegram:123', {
+        text: 'Accepted · working',
+        reporting: { version: 1, purpose: 'liveness', state: 'working' },
+      });
+      await deliverSessionMessages(session);
+      await createPendingApproval({
+        approval_id: `approval-${deleteMode}`,
+        request_id: `approval-${deleteMode}`,
+        action: 'test_action',
+        payload: '{}',
+        created_at: now(),
+        title: 'Approve?',
+        options_json: '[]',
+        session_id: session.id,
+        agent_group_id: 'ag-1',
+        channel_type: 'telegram',
+        platform_id: 'telegram:123',
+        thread_id: null,
+      });
+
+      await settleSessionStatusAfterPublicDelivery(session.id, {
+        conversation: { channelType: 'telegram', platformId: 'telegram:123', threadId: null },
+        waitWhenElsewhere: true,
+      });
+      await deletePendingApproval(`approval-${deleteMode}`);
+      _resetStatusTrackingForTest();
+      insertOutboundKind('ag-1', session.id, `turn-end-${deleteMode}`, 'system', null as never, null as never, {
+        action: 'turn_end',
+        lifecycleStatusId: 'lifecycle-approval',
+      });
+      await deliverSessionMessages(session);
+
+      expect(events).toContain('edit:Response delivered.');
+      expect(events.some((event) => event.includes('Stopped'))).toBe(false);
+      const inbound = openInboundDb('ag-1', session.id);
+      const receipt = inbound
+        .prepare('SELECT platform_message_id,lifecycle_terminal_at FROM delivered WHERE message_out_id = ?')
+        .get('lifecycle-approval') as { platform_message_id: string; lifecycle_terminal_at: string | null };
+      expect(receipt.platform_message_id).toBe('plat-lifecycle-approval');
+      expect(receipt.lifecycle_terminal_at).not.toBeNull();
+      inbound.close();
+    },
+  );
+
+  it('keeps an off-route pending approval visible as waiting across turn_end and host memory loss', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const edits: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, kind, content) {
+        const parsed = JSON.parse(content) as { operation?: string; text?: string };
+        if (parsed.operation === 'edit') edits.push(parsed.text ?? '');
+        return kind === 'status' && !parsed.operation ? 'plat-off-route' : undefined;
+      },
+      async deleteMessage() {
+        throw new Error('must not delete an off-route waiting line');
+      },
+    });
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'lifecycle-off-route',
+      'status',
+      'telegram',
+      'telegram:123',
+      {
+        text: 'Accepted · working',
+        reporting: { version: 1, purpose: 'liveness', state: 'working' },
+      },
+      'thread-a',
+    );
+    await deliverSessionMessages(session);
+    await createPendingApproval({
+      approval_id: 'approval-off-route',
+      request_id: 'approval-off-route',
+      action: 'test_action',
+      payload: '{}',
+      created_at: now(),
+      title: 'Approve?',
+      options_json: '[]',
+      session_id: session.id,
+      agent_group_id: 'ag-1',
+      channel_type: 'telegram',
+      platform_id: 'telegram:123',
+      thread_id: 'thread-b',
+    });
+
+    await settleSessionStatusAfterPublicDelivery(session.id, {
+      conversation: { channelType: 'telegram', platformId: 'telegram:123', threadId: 'thread-b' },
+      waitWhenElsewhere: true,
+    });
+    _resetStatusTrackingForTest();
+    insertOutboundKind('ag-1', session.id, 'turn-end-off-route', 'system', null as never, null as never, {
+      action: 'turn_end',
+      lifecycleStatusId: 'lifecycle-off-route',
+    });
+    await deliverSessionMessages(session);
+
+    expect(edits).toEqual(['Waiting for approval.', 'Waiting for approval.']);
+    const inbound = openInboundDb('ag-1', session.id);
+    expect(
+      inbound
+        .prepare('SELECT lifecycle_terminal_at FROM delivered WHERE message_out_id = ?')
+        .get('lifecycle-off-route'),
+    ).toEqual({ lifecycle_terminal_at: null });
+    inbound.close();
+  });
+
+  it('acks one public send even when lifecycle receipt settlement loses its central DB', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    let publicSends = 0;
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, kind) {
+        if (kind === 'status') return 'plat-working-db-loss';
+        publicSends += 1;
+        await closeDb();
+        return 'plat-public-db-loss';
+      },
+    });
+    insertOutboundKind('ag-1', session.id, 'working-db-loss', 'status', 'telegram', 'telegram:123', {
+      text: 'Accepted · working',
+      reporting: { version: 1, purpose: 'liveness', state: 'working' },
+    });
+    await deliverSessionMessages(session);
+    insertOutboundKind('ag-1', session.id, 'public-db-loss', 'chat', 'telegram', 'telegram:123', {
+      text: 'The result was delivered.',
+      reporting: { version: 1, purpose: 'reply' },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(publicSends).toBe(1);
+    const inbound = openInboundDb('ag-1', session.id);
+    expect(getDeliveredIds(inbound).has('public-db-loss')).toBe(true);
+    inbound.close();
   });
 
   it('resets the status line on a new turn when the prior turn posted no chat-final', async () => {
@@ -2474,6 +2685,46 @@ describe('deliverSessionMessages — deferAck system actions', () => {
     expect(ids.has('out-after')).toBe(true);
     expect(outcome).toBe('pending');
   });
+
+  it('keeps lifecycle state for deferred and internal system actions', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    registerDeliveryAction(
+      'test_defer_without_public_delivery',
+      async () => ({ deferAck: true }) as const,
+      unguarded('test-only deferred internal action'),
+    );
+    registerDeliveryAction(
+      'test_internal_delivery_action',
+      async () => undefined,
+      unguarded('test-only completed internal action'),
+    );
+
+    const deletes: string[] = [];
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-working';
+      },
+      async deleteMessage(_channelType, _platformId, _threadId, messageId) {
+        deletes.push(messageId);
+      },
+    });
+    insertOutboundKind('ag-1', session.id, 'working', 'status', 'telegram', 'telegram:123', {
+      text: 'Accepted · working',
+      reporting: { version: 1, purpose: 'liveness', state: 'working' },
+    });
+    await deliverSessionMessages(session);
+
+    insertAt(session.id, 'deferred', '2026-09-01T00:00:02.000Z', 'system', {
+      action: 'test_defer_without_public_delivery',
+    });
+    insertAt(session.id, 'internal', '2026-09-01T00:00:03.000Z', 'system', {
+      action: 'test_internal_delivery_action',
+    });
+    await deliverSessionMessages(session);
+
+    expect(deletes).toEqual([]);
+  });
 });
 
 /**
@@ -2748,6 +2999,66 @@ describe('deliverSessionMessages — ask_question ids', () => {
     expect(calls).toHaveLength(1);
     expect(await getPendingQuestion('q-agent-1')).toMatchObject({ session_id: session.id, message_out_id: 'out-ask' });
   });
+
+  it('clears lifecycle state only after an ask_question card is delivered', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const events: string[] = [];
+    let posts = 0;
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, kind) {
+        posts += 1;
+        events.push(`post:${kind}`);
+        return posts === 1 ? 'plat-working' : 'plat-question';
+      },
+      async deleteMessage(_channelType, _platformId, _threadId, messageId) {
+        events.push(`delete:${messageId}`);
+      },
+    });
+    insertOutboundKind('ag-1', session.id, 'working', 'status', 'telegram', 'telegram:123', {
+      text: 'Accepted · working',
+      reporting: { version: 1, purpose: 'liveness', state: 'working' },
+    });
+    await deliverSessionMessages(session);
+    insertOutboundKind('ag-1', session.id, 'out-ask', 'chat-sdk', 'telegram', 'telegram:123', ask('q-agent-2'));
+
+    await deliverSessionMessages(session);
+
+    expect(posts).toBe(2);
+    expect(events).toEqual(['post:status', 'post:chat-sdk', 'delete:plat-working']);
+    expect(await getPendingQuestion('q-agent-2')).toMatchObject({ session_id: session.id, message_out_id: 'out-ask' });
+  });
+
+  it('keeps lifecycle state when an ask_question card fails to post', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const events: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, kind) {
+        events.push(`post:${kind}`);
+        if (kind === 'chat-sdk') throw new Error('card rejected');
+        return 'plat-working';
+      },
+      async deleteMessage(_channelType, _platformId, _threadId, messageId) {
+        events.push(`delete:${messageId}`);
+      },
+    });
+    insertOutboundKind('ag-1', session.id, 'working', 'status', 'telegram', 'telegram:123', {
+      text: 'Accepted · working',
+      reporting: { version: 1, purpose: 'liveness', state: 'working' },
+    });
+    await deliverSessionMessages(session);
+    insertOutboundKind('ag-1', session.id, 'out-ask', 'chat-sdk', 'telegram', 'telegram:123', ask('q-agent-3'));
+
+    await deliverSessionMessages(session);
+
+    expect(events).toEqual(['post:status', 'post:chat-sdk']);
+    const inbound = openInboundDb('ag-1', session.id);
+    expect(
+      inbound.prepare('SELECT lifecycle_terminal_at FROM delivered WHERE message_out_id = ?').get('working'),
+    ).toEqual({ lifecycle_terminal_at: null });
+    inbound.close();
+  });
 });
 
 describe('per-work-item outcome delivery', () => {
@@ -2773,6 +3084,45 @@ describe('per-work-item outcome delivery', () => {
     };
   }
 
+  function opaqueOutcome(
+    agentGroupId: string,
+    sessionId: string,
+    sequence: number,
+    platformMessageId: string,
+    sourceRoute = { channelType: 'telegram', platformId: 'telegram:123' },
+    summary = 'The requested work is complete.',
+    sourceContent: Record<string, unknown> = {},
+  ): { text: string; reporting: object } {
+    const inbound = openInboundDbAt(inboundDbPath(agentGroupId, sessionId));
+    const rowId = `${platformMessageId}:${agentGroupId}`;
+    inbound
+      .prepare(
+        `INSERT INTO messages_in
+         (id,seq,kind,timestamp,status,trigger,platform_id,channel_type,content)
+         VALUES (?,?, 'chat', ?, 'completed', 1, ?, ?, ?)`,
+      )
+      .run(
+        rowId,
+        sequence,
+        now(),
+        sourceRoute.platformId,
+        sourceRoute.channelType,
+        JSON.stringify({ text: 'Do the work', platformMsgId: platformMessageId, ...sourceContent }),
+      );
+    inbound.close();
+    const data = { requestId: sequence, verified: 'Focused checks passed.' };
+    const trusted = {
+      sessionId,
+      messageId: rowId,
+      sequence,
+      origin: { ...sourceRoute, platformMessageId },
+    };
+    return {
+      text: renderWorkOutcome(summary, data, trusted).text,
+      reporting: { version: 1, purpose: 'outcome', summary, outcome: data },
+    };
+  }
+
   it('retains routine records without platform calls and preserves legacy human replies and native questions', async () => {
     const session = await prepare();
     const deliver = vi.fn().mockResolvedValue('question-or-reply');
@@ -2794,11 +3144,21 @@ describe('per-work-item outcome delivery', () => {
       questionId: 'q-outcome',
       title: 'Choose scope',
       question: 'Which product scope?',
+      text: 'Interactive card payload, not an assistant chat reply.',
       options: ['A', 'B'],
     });
     await deliverSessionMessages(session);
     expect(deliver).toHaveBeenCalledTimes(2);
     expect(getRawDb().prepare('SELECT last_outbound_at FROM sessions WHERE id=?').get(session.id)).toBeTruthy();
+    const archive = new Database(`${TEST_DIR}/archive.db`, { readonly: true });
+    try {
+      expect(archive.prepare('SELECT id FROM messages_archive WHERE id = ?').get('legacy-human')).toEqual({
+        id: 'legacy-human',
+      });
+      expect(archive.prepare('SELECT id FROM messages_archive WHERE id = ?').get('question')).toBeUndefined();
+    } finally {
+      archive.close();
+    }
   });
 
   it('dedupes normalized work items across concurrent sibling sessions and later replay', async () => {
@@ -2825,8 +3185,17 @@ describe('per-work-item outcome delivery', () => {
       await outcome('https://github.com/example-ORG/checkout/pull/17?presentation=1'),
     );
     await Promise.all([deliverSessionMessages(first), deliverSessionMessages(second)]);
-    await deliverSessionMessages(second);
+    const owner = getRawDb().prepare('SELECT session_id FROM work_outcome_receipts').get() as { session_id: string };
+    const sibling = owner.session_id === first.id ? second : first;
+    // The non-owner's conflicting result remains retryable for three delivery
+    // attempts, then becomes a truthful failed row instead of a false ACK.
+    await deliverSessionMessages(sibling);
+    await deliverSessionMessages(sibling);
     insertOutboundKind('ag-2', second.id, 'outcome-replay', 'chat', 'telegram', 'telegram:123', await outcome());
+    // A replay from the owner records the existing receipt immediately; a
+    // replay from the sibling exhausts the same recoverable ownership conflict.
+    await deliverSessionMessages(second);
+    await deliverSessionMessages(second);
     await deliverSessionMessages(second);
     expect(deliver).toHaveBeenCalledTimes(1);
     expect(getRawDb().prepare('SELECT state,platform_message_id FROM work_outcome_receipts').all()).toEqual([
@@ -2839,6 +3208,124 @@ describe('per-work-item outcome delivery', () => {
     });
     await deliverSessionMessages(second);
     expect(deliver).toHaveBeenCalledTimes(2);
+  });
+
+  it('dedupes one trusted platform request but reports a different sibling outcome as unpublished', async () => {
+    const first = await prepare();
+    await createAgentGroup({
+      id: 'ag-2',
+      name: 'Sibling',
+      folder: 'sibling',
+      agent_provider: null,
+      workgroup_id: 'outcomes',
+      created_at: now(),
+    });
+    const second = (await resolveSession('ag-2', 'mg-1', null, 'shared')).session;
+    const deliver = vi.fn().mockResolvedValue('one-platform-outcome');
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind(
+      'ag-1',
+      first.id,
+      'opaque-a',
+      'chat',
+      'telegram',
+      'telegram:123',
+      opaqueOutcome('ag-1', first.id, 2, 'platform-request-1'),
+    );
+    insertOutboundKind(
+      'ag-2',
+      second.id,
+      'opaque-b',
+      'chat',
+      'telegram',
+      'telegram:123',
+      opaqueOutcome(
+        'ag-2',
+        second.id,
+        8,
+        'platform-request-1',
+        { channelType: 'telegram', platformId: 'telegram:123' },
+        'The sibling completed a different authorized slice.',
+      ),
+    );
+    await deliverSessionMessages(first);
+    await deliverSessionMessages(second);
+    await deliverSessionMessages(second);
+    await deliverSessionMessages(second);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const receipt = getRawDb().prepare('SELECT work_item,state FROM work_outcome_receipts').get() as {
+      work_item: string;
+      state: string;
+    };
+    expect(receipt.work_item).toMatch(/^request:v1:[0-9a-f]{64}$/);
+    expect(receipt.state).toBe('delivered');
+    const siblingInbound = openInboundDb('ag-2', second.id);
+    expect(
+      siblingInbound.prepare('SELECT status,error FROM delivered WHERE message_out_id = ?').get('opaque-b'),
+    ).toMatchObject({
+      status: 'failed',
+      error: expect.stringContaining('another agent owns the existing receipt'),
+    });
+    siblingInbound.close();
+  });
+
+  it('rejects an opaque outcome keyed to an agent-authored inbound row', async () => {
+    const session = await prepare();
+    const deliver = vi.fn().mockResolvedValue('must-not-deliver');
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'agent-keyed-outcome',
+      'chat',
+      'telegram',
+      'telegram:123',
+      opaqueOutcome('ag-1', session.id, 2, 'agent-handoff-1', {
+        channelType: 'agent',
+        platformId: 'agent:peer',
+      }),
+    );
+    await deliverSessionMessages(session);
+    expect(deliver).not.toHaveBeenCalled();
+    expect(getRawDb().prepare('SELECT COUNT(*) AS count FROM work_outcome_receipts').get()).toEqual({ count: 0 });
+  });
+
+  it('rejects an opaque outcome from a trusted bot author even when flat sender fields look human', async () => {
+    const session = await prepare();
+    const deliver = vi.fn().mockResolvedValue('must-not-deliver');
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'bot-keyed-outcome',
+      'chat',
+      'telegram',
+      'telegram:123',
+      opaqueOutcome(
+        'ag-1',
+        session.id,
+        2,
+        'platform-bot-1',
+        { channelType: 'telegram', platformId: 'telegram:123' },
+        'The automated request is complete.',
+        { sender: 'Operator', senderId: 'U1', author: { isBot: true } },
+      ),
+    );
+
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+
+    expect(deliver).not.toHaveBeenCalled();
+    expect(getRawDb().prepare('SELECT COUNT(*) AS count FROM work_outcome_receipts').get()).toEqual({ count: 0 });
+    const inbound = openInboundDb('ag-1', session.id);
+    expect(
+      inbound.prepare('SELECT status,error FROM delivered WHERE message_out_id = ?').get('bot-keyed-outcome'),
+    ).toMatchObject({
+      status: 'failed',
+      error: expect.stringContaining('not an original human request'),
+    });
+    inbound.close();
   });
 
   it('gives unrelated scheduled work outcomes independent roots instead of the daily task thread', async () => {
@@ -2879,6 +3366,61 @@ describe('per-work-item outcome delivery', () => {
     expect(deliver.mock.calls.map((call) => call[2])).toEqual([null, null]);
   });
 
+  it('accepts an admitted task occurrence as a host-validated opaque outcome root', async () => {
+    await prepare();
+    const session = (await resolveTaskSession('ag-1', 'opaque-task-series')).session;
+    getRawDb()
+      .prepare(
+        "INSERT OR IGNORE INTO agent_destinations (agent_group_id,local_name,target_type,target_id,created_at) VALUES ('ag-1','test','channel','mg-1',?)",
+      )
+      .run(now());
+    const inbound = openInboundDbAt(inboundDbPath('ag-1', session.id));
+    inbound
+      .prepare(
+        `INSERT INTO messages_in
+         (id,seq,kind,timestamp,status,trigger,platform_id,channel_type,content)
+         VALUES ('opaque-task-occurrence',22,'task',?,'completed',1,NULL,NULL,?)`,
+      )
+      .run(now(), JSON.stringify({ prompt: 'Run the scheduled audit.' }));
+    inbound.close();
+    const data = { requestId: 22, verified: 'Focused checks passed.' };
+    const rendered = renderWorkOutcome('The scheduled audit is complete.', data, {
+      sessionId: session.id,
+      messageId: 'opaque-task-occurrence',
+      sequence: 22,
+    });
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'opaque-task-outcome',
+      'chat',
+      'telegram',
+      'telegram:123',
+      {
+        text: rendered.text,
+        reporting: {
+          version: 1,
+          purpose: 'outcome',
+          summary: 'The scheduled audit is complete.',
+          outcome: data,
+        },
+      },
+      null,
+      'opaque-task-occurrence',
+    );
+    const deliver = vi.fn().mockResolvedValue('opaque-task-platform-message');
+    setDeliveryAdapter({ deliver });
+
+    await deliverSessionMessages(session);
+
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(getRawDb().prepare('SELECT work_item,state,platform_message_id FROM work_outcome_receipts').get()).toEqual({
+      work_item: rendered.key,
+      state: 'delivered',
+      platform_message_id: 'opaque-task-platform-message',
+    });
+  });
+
   it('holds an ambiguous platform result across replay, without acknowledging success or retrying', async () => {
     const session = await prepare();
     const deliver = vi.fn().mockRejectedValue(new Error('response lost after acceptance'));
@@ -2912,6 +3454,66 @@ describe('per-work-item outcome delivery', () => {
       state: 'delivered',
       platform_message_id: null,
     });
+  });
+
+  it('keeps old untyped status public, suppresses typed narration, and recovers typed liveness after host memory loss', async () => {
+    const session = await prepare();
+    const deliver = vi
+      .fn()
+      .mockResolvedValueOnce('legacy-status')
+      .mockResolvedValueOnce('lifecycle-status')
+      .mockResolvedValue(undefined);
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind('ag-1', session.id, 'legacy', 'status', 'telegram', 'telegram:123', { text: 'Legacy status' });
+    insertOutboundKind('ag-1', session.id, 'narration', 'status', 'telegram', 'telegram:123', {
+      text: 'Model narration',
+      reporting: { version: 1, purpose: 'progress' },
+    });
+    insertOutboundKind('ag-1', session.id, 'lifecycle', 'status', 'telegram', 'telegram:123', {
+      text: 'Accepted · working',
+      reporting: { version: 1, purpose: 'liveness', state: 'working' },
+    });
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    _resetStatusTrackingForTest();
+    insertOutboundKind('ag-1', session.id, 'ended', 'system', null as never, null as never, {
+      action: 'turn_end',
+      lifecycleStatusId: 'lifecycle',
+    });
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(3);
+    expect(JSON.parse(deliver.mock.calls[2][4])).toMatchObject({
+      operation: 'edit',
+      messageId: 'lifecycle-status',
+      text: 'Stopped before sending a reply.',
+    });
+  });
+
+  it('removes a durable typed liveness row when a reply lands after host memory loss', async () => {
+    const session = await prepare();
+    const deliver = vi.fn().mockResolvedValueOnce('lifecycle-status').mockResolvedValueOnce('public-reply');
+    const deleteMessage = vi.fn().mockResolvedValue(undefined);
+    setDeliveryAdapter({ deliver, deleteMessage });
+    insertOutboundKind('ag-1', session.id, 'lifecycle', 'status', 'telegram', 'telegram:123', {
+      text: 'Accepted · working',
+      reporting: { version: 1, purpose: 'liveness', state: 'working' },
+    });
+    await deliverSessionMessages(session);
+    for (let index = 0; index < 40; index++) {
+      insertOutboundKind('ag-1', session.id, `progress-${index}`, 'status', 'telegram', 'telegram:123', {
+        text: `Internal progress ${index}`,
+        reporting: { version: 1, purpose: 'progress' },
+      });
+    }
+    await deliverSessionMessages(session);
+    _resetStatusTrackingForTest();
+    insertOutboundKind('ag-1', session.id, 'reply', 'chat', 'telegram', 'telegram:123', {
+      text: 'The requested answer.',
+      reporting: { version: 1, purpose: 'reply' },
+    });
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(deleteMessage).toHaveBeenCalledWith('telegram', 'telegram:123', null, 'lifecycle-status', 'telegram');
   });
 
   it('reconciles verified non-delivery and allows only the original queued row to retry', async () => {
@@ -2992,5 +3594,21 @@ describe('per-work-item outcome delivery', () => {
     });
     await deliverSessionMessages(session);
     expect(deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses an agent-group receipt scope when a legacy group has no workgroup membership', async () => {
+    await seedAgentAndChannel();
+    fs.mkdirSync(`${TEST_DIR}/groups/test-agent`, { recursive: true });
+    fs.writeFileSync(`${TEST_DIR}/groups/test-agent/container.json`, JSON.stringify({}));
+    const session = (await resolveSession('ag-1', 'mg-1', null, 'shared')).session;
+    const deliver = vi.fn().mockResolvedValue('legacy-group-outcome');
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind('ag-1', session.id, 'legacy-group', 'chat', 'telegram', 'telegram:123', await outcome());
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(getRawDb().prepare('SELECT workgroup_id,state FROM work_outcome_receipts').get()).toEqual({
+      workgroup_id: 'agent-group:ag-1',
+      state: 'delivered',
+    });
   });
 });

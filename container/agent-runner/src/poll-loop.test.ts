@@ -6,7 +6,7 @@ import path from 'path';
 import { evaluateAdmission, registerAdmissionGate } from './admission-gate.js';
 import { _resetConfig, loadConfig } from './config.js';
 import { clearStaleProcessingAcks, setContainerToolInFlight } from './db/container-state.js';
-import { setContinuation } from './db/session-state.js';
+import { getRequestCandidates, rememberRequestCandidates, setContinuation } from './db/session-state.js';
 import { clearPrimaryRetryRequest, setStickyModel, setStickyEffort } from './modules/mailbox/session-state.js';
 import { getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getAgentMailbox } from './mailbox/index.js';
@@ -20,6 +20,7 @@ import {
   dispatchResultText,
   applyChatBudget,
   applyFlagBatch,
+  buildTaskBlockNudge,
   buildProviderUnavailableReport,
   buildWorkContinuationPrompt,
   handleEvent,
@@ -4993,6 +4994,180 @@ describe('outcome reporting — quiet work and expected replies', () => {
   afterEach(() => {
     delete process.env.NANOCLAW_OUTCOME_REPORTING;
   });
+
+  it('describes both supported task outcome identities and keeps evidence optional', () => {
+    const nudge = buildTaskBlockNudge([{ to: 'operator', body: 'Completed the requested audit.' }], 'operator');
+    expect(nudge).toContain('supported workItem URL or harness request id');
+    expect(nudge).toContain('evidence is optional');
+    expect(nudge).not.toContain('canonical item and evidence');
+  });
+
+  it('retains original human request ids and excludes host or agent-authored triggers', () => {
+    rememberRequestCandidates([
+      {
+        id: 'agent-handoff',
+        seq: 1,
+        kind: 'chat-sdk',
+        trigger: 1,
+        channel_type: 'agent',
+        content: JSON.stringify({ sender: 'Peer', text: 'handoff' }),
+      },
+      {
+        id: 'host-note',
+        seq: 2,
+        kind: 'chat',
+        trigger: 1,
+        channel_type: 'slack',
+        content: JSON.stringify({ origin: 'host', text: 'restart note' }),
+      },
+      {
+        id: 'platform-bot',
+        seq: 3,
+        kind: 'chat-sdk',
+        trigger: 1,
+        channel_type: 'slack',
+        content: JSON.stringify({
+          sender: 'Operator',
+          senderId: 'U1',
+          author: { isBot: true },
+          text: 'I look human in the flat fields.',
+        }),
+      },
+      {
+        id: 'human-request',
+        seq: 4,
+        kind: 'chat',
+        trigger: 1,
+        channel_type: 'slack',
+        content: JSON.stringify({ sender: 'Operator', senderId: 'U1', text: 'Do the work.' }),
+      },
+    ]);
+    expect(getRequestCandidates()).toEqual([{ sequence: 4, messageId: 'human-request' }]);
+  });
+
+  it('retains each admitted recurring task occurrence as its own request candidate', () => {
+    rememberRequestCandidates([
+      {
+        id: 'recurring-task:first',
+        seq: 41,
+        kind: 'task',
+        trigger: 1,
+        channel_type: null,
+        content: JSON.stringify({ prompt: 'Run the audit.' }),
+      },
+      {
+        id: 'recurring-task:next',
+        seq: 42,
+        kind: 'task',
+        trigger: 1,
+        channel_type: null,
+        content: JSON.stringify({ prompt: 'Run the audit.' }),
+      },
+    ]);
+
+    expect(getRequestCandidates()).toEqual([
+      { sequence: 41, messageId: 'recurring-task:first' },
+      { sequence: 42, messageId: 'recurring-task:next' },
+    ]);
+  });
+
+  it('emits one deterministic liveness row and ties turn-end cleanup to it', async () => {
+    insertMessage('liveness-human', 'chat', { sender: 'Operator', senderId: 'U1', text: 'Run the check.' });
+    const provider = {
+      supportsNativeSlashCommands: false,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      isRetryable: () => false,
+      query: () => {
+        async function* events(): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'liveness-session' };
+          yield { type: 'result', text: '<internal>done</internal>' };
+        }
+        return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+      },
+    };
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+    try {
+      const deadline = Date.now() + 3_000;
+      let turnEnd: { content: string } | undefined;
+      while (!turnEnd) {
+        turnEnd = getOutboundDb()
+          .prepare("SELECT content FROM messages_out WHERE kind = 'system' ORDER BY seq DESC LIMIT 1")
+          .get() as { content: string } | undefined;
+        if (Date.now() >= deadline) throw new Error('timed out waiting for turn-end lifecycle cleanup');
+        if (!turnEnd) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const statuses = getOutboundDb()
+        .prepare("SELECT id,content FROM messages_out WHERE kind = 'status' ORDER BY seq")
+        .all() as Array<{ id: string; content: string }>;
+      expect(statuses).toHaveLength(1);
+      expect(JSON.parse(statuses[0]!.content)).toEqual({
+        text: 'Accepted · working',
+        reporting: { version: 1, purpose: 'liveness', state: 'working' },
+      });
+      expect(JSON.parse(turnEnd.content)).toEqual({ action: 'turn_end', lifecycleStatusId: statuses[0]!.id });
+    } finally {
+      abort.abort();
+      await loop;
+    }
+  }, 5_000);
+
+  it('does not emit human liveness for an explicitly bot-authored platform trigger', async () => {
+    insertMessage(
+      'liveness-bot',
+      'chat-sdk',
+      { sender: 'Sibling bot', senderId: 'B1', author: { isBot: true }, text: 'Handoff.' },
+      { trigger: 1 },
+    );
+    const provider = {
+      supportsNativeSlashCommands: false,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      isRetryable: () => false,
+      query: () => {
+        async function* events(): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'bot-liveness-session' };
+          yield { type: 'result', text: '<internal>done</internal>' };
+        }
+        return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+      },
+    };
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+    try {
+      const deadline = Date.now() + 3_000;
+      let turnEnd: { content: string } | undefined;
+      while (!turnEnd) {
+        turnEnd = getOutboundDb()
+          .prepare("SELECT content FROM messages_out WHERE kind = 'system' ORDER BY seq DESC LIMIT 1")
+          .get() as { content: string } | undefined;
+        if (Date.now() >= deadline) throw new Error('timed out waiting for bot-authored turn completion');
+        if (!turnEnd) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(getOutboundDb().prepare("SELECT COUNT(*) AS count FROM messages_out WHERE kind = 'status'").get()).toEqual(
+        {
+          count: 0,
+        },
+      );
+      expect(JSON.parse(turnEnd.content)).toEqual({ action: 'turn_end' });
+    } finally {
+      abort.abort();
+      await loop;
+    }
+  }, 5_000);
 
   it.each(['claude', 'codex'])(
     'keeps internal output from clearing reply debt and nudges via the tool once (%s)',

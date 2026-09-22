@@ -1202,8 +1202,8 @@ describe("sub-plugin always-on: the plugin's own always-on.md (OpenCode only)", 
   });
 });
 
-describe('opt-in outcome reporting instruction parity', () => {
-  it.each(['claude', 'codex'])('adds the contract only to enabled groups (%s)', async (provider) => {
+describe('default-on outcome reporting instruction parity', () => {
+  it.each(['claude', 'codex', 'opencode'])('adds the contract unless explicitly disabled (%s)', async (provider) => {
     const enabled = group('ag-outcome-enabled', 'outcome-enabled');
     await seed(enabled);
     writePersona(enabled.folder, 'Existing independent review and approval authority remains.\n');
@@ -1212,13 +1212,22 @@ describe('opt-in outcome reporting instruction parity', () => {
       JSON.stringify({ outcomeReporting: true }),
     );
     await composeGroupClaudeMd(enabled, provider);
-    expect(docOf(enabled.folder)).toContain('## Work-item reporting');
-    expect(docOf(enabled.folder)).toContain('Required approvals, exact scope, holds and deadlines remain binding');
+    const enabledDoc = docOf(enabled.folder);
+    expect(enabledDoc).toContain('## Work-item reporting');
+    expect(enabledDoc).toContain('Required approvals, exact scope, holds and deadlines remain binding');
+    expect(enabledDoc).not.toContain('Final/interim model text');
+    expect(enabledDoc).not.toContain('outcome.requestId');
+    expect(enabledDoc).not.toContain('send a brief acknowledgment');
     expect(fs.readFileSync(path.join(GROUPS_DIR, enabled.folder, 'AGENTS.md'), 'utf8')).toContain(
       '## Work-item reporting',
     );
     const disabled = group('ag-outcome-disabled', 'outcome-disabled');
     await seed(disabled);
+    fs.mkdirSync(path.join(GROUPS_DIR, disabled.folder), { recursive: true });
+    fs.writeFileSync(
+      path.join(GROUPS_DIR, disabled.folder, 'container.json'),
+      JSON.stringify({ outcomeReporting: false }),
+    );
     await composeGroupClaudeMd(disabled, provider);
     expect(docOf(disabled.folder)).not.toContain('## Work-item reporting');
   });

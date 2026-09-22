@@ -1,6 +1,6 @@
 import fs from 'fs';
 import { describe, it, expect } from 'vitest';
-import { canonicalWorkItem, renderWorkOutcome } from './outcome-reporting-schema.js';
+import { canonicalWorkItem, renderWorkOutcome, requestWorkItem } from './outcome-reporting-schema.js';
 
 describe('outcome wire contract', () => {
   it('normalizes durable identities, rejects phases and preserves separate work items', () => {
@@ -19,7 +19,7 @@ describe('outcome wire contract', () => {
       canonicalWorkItem('https://github.com/org/repo/pull/17'),
     );
   });
-  it('rejects long or missing evidence rather than producing an unreadable/truncated report', () => {
+  it('rejects long or invalid evidence while allowing a concise outcome without a URL', () => {
     const evidence = {
       workItem: 'https://github.com/org/repo/pull/17',
       verified: 'Tests passed',
@@ -28,6 +28,22 @@ describe('outcome wire contract', () => {
     expect(() => renderWorkOutcome('x'.repeat(321), evidence)).toThrow();
     expect(() => renderWorkOutcome('Fixed', { ...evidence, evidence: '/workspace/report.md' })).toThrow();
     expect(renderWorkOutcome('Checkout works again.', evidence).text).toContain('No action needed.');
+    expect(
+      renderWorkOutcome('Checkout works again.', { workItem: evidence.workItem, verified: 'Tests passed' }).text,
+    ).not.toContain('Details:');
+  });
+  it('derives shared opaque keys from a trusted platform origin and session fallback otherwise', () => {
+    const a = {
+      sessionId: 'session-a',
+      messageId: 'platform-1:agent-a',
+      sequence: 2,
+      origin: { channelType: 'discord', platformId: 'discord:g:c', platformMessageId: 'platform-1' },
+    };
+    const b = { ...a, sessionId: 'session-b', messageId: 'platform-1:agent-b', sequence: 8 };
+    expect(requestWorkItem(a)).toBe(requestWorkItem(b));
+    expect(requestWorkItem({ ...a, origin: undefined })).not.toBe(requestWorkItem({ ...b, origin: undefined }));
+    expect(renderWorkOutcome('Done.', { requestId: 2, verified: 'Checked' }, a).key).toBe(requestWorkItem(a));
+    expect(() => renderWorkOutcome('Done.', { requestId: 4, verified: 'Checked' }, a)).toThrow();
   });
   it('keeps host and separately packaged runner validation identical', () => {
     expect(fs.readFileSync('container/agent-runner/src/outcome-reporting-schema.ts', 'utf8')).toBe(

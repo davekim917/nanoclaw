@@ -29,7 +29,7 @@ import {
   getSession,
   updatePendingApprovalMessageId,
 } from '../../db/sessions.js';
-import { getDeliveryAdapter } from '../../delivery.js';
+import { getDeliveryAdapter, settleSessionStatusAfterPublicDelivery } from '../../delivery.js';
 import { requestWake } from '../../request-wake.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -507,6 +507,15 @@ export async function requestApprovalOutcome(opts: RequestApprovalOptions): Prom
     await notifyAgent(session, `${action} failed: could not deliver approval request to ${destination.label}.`);
     return 'failed';
   }
+
+  await settleSessionStatusAfterPublicDelivery(session.id, {
+    conversation: {
+      channelType: destination.channelType,
+      platformId: destination.platformId,
+      threadId: destination.threadId,
+    },
+    waitWhenElsewhere: true,
+  });
 
   log.info('Approval requested', { action, approvalId, agentName, target: destination.label, deliveryTarget });
   return 'posted';

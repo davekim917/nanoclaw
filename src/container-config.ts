@@ -715,7 +715,7 @@ export type { ExcludedPlugins } from './plugin-exclusions.js';
 
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
-  /** Opt-in per-work-item reporting. Activated only in freshly spawned runners. */
+  /** Structured reporting override. Absent is the fleet default; false is rollback. */
   outcomeReporting?: boolean;
   /** Physical channel addresses whose routine outcomes belong to an existing external reporter. */
   outcomeReportingExternalChannels?: string[];
@@ -1317,10 +1317,12 @@ export function readContainerConfigForSpawn(folder: string, requireAuthoritative
 
 function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerConfig {
   validateContainerResources(raw.resources);
+  if (raw.outcomeReporting !== undefined && typeof raw.outcomeReporting !== 'boolean')
+    throw new Error('outcomeReporting must be a boolean when present');
 
   return {
     wikiMaintenance: raw.wikiMaintenance,
-    outcomeReporting: raw.outcomeReporting === true,
+    outcomeReporting: raw.outcomeReporting,
     outcomeReportingExternalChannels: Array.isArray(raw.outcomeReportingExternalChannels)
       ? raw.outcomeReportingExternalChannels.filter((value): value is string => typeof value === 'string')
       : [],
@@ -1369,6 +1371,11 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
     workgroup_id: raw.workgroup_id,
     slack_user_token: raw.slack_user_token,
   };
+}
+
+/** Fleet default without materializing it into operator-owned container.json. */
+export function effectiveOutcomeReporting(config: Pick<ContainerConfig, 'outcomeReporting'>): boolean {
+  return config.outcomeReporting !== false;
 }
 
 /**

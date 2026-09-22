@@ -16,6 +16,7 @@ import {
   getDestinationRows,
   type DestinationRow,
 } from './modules/mailbox/index.js';
+import { outcomeReportingEnabled } from './outcome-reporting.js';
 
 export interface DestinationEntry {
   name: string;
@@ -142,7 +143,9 @@ export function buildSystemPromptAddendum(assistantName?: string, mode: SessionM
       // Meta-response prohibition: without it the agent occasionally emits
       // "No response requested." as its entire turn, which reaches the
       // user as garbage.
-      'If a user message does not seem to call for a reply, send a brief acknowledgment or ask a clarifying question — do not produce meta-responses like "No response requested." or "The user\'s message does not require a response." Those are internal judgments, not content to deliver.',
+      outcomeReportingEnabled()
+        ? 'The harness posts the bounded receipt/liveness state. Answer explicit requests and questions through the structured tools; do not add a second acknowledgment or emit meta-responses like "No response requested."'
+        : 'Answer explicit requests and questions directly. Do not emit meta-responses like "No response requested." or claim that a user message does not require a response.',
       '',
       // Credential-in-chat hard rule (v1 ff24bd9 / 4e6c12b): prevents
       // agents asking users to paste API keys / tokens into chat.
@@ -150,7 +153,7 @@ export function buildSystemPromptAddendum(assistantName?: string, mode: SessionM
     ].join('\n'),
   );
 
-  sections.push(buildDestinationsSection(mode));
+  sections.push(buildDestinationsSection(mode, outcomeReportingEnabled()));
 
   return sections.join('\n\n');
 }
@@ -237,7 +240,7 @@ function buildPeersSection(peers: PeerEntry[]): string | null {
   return lines.join('\n');
 }
 
-function buildDestinationsSection(mode: SessionMode): string {
+function buildDestinationsSection(mode: SessionMode, structuredReporting: boolean): string {
   const all = getAllDestinations();
   const lines = ['## Sending messages', ''];
 
@@ -258,7 +261,7 @@ function buildDestinationsSection(mode: SessionMode): string {
 
   if (mode.kind === 'task') {
     lines.push(
-      'This is an isolated task run with no attached chat. Only notify someone when the task asks you to. For a user-visible message, call `send_message({ to: "name", text: "..." })`; for a file, call `send_file` with `to`. Always pass the explicit named destination.',
+      'This is an isolated task run with no attached chat. Only notify someone when the task asks you to. For a user-visible message, call `send_message` with an explicit named destination and purpose; for a file, call `send_file` with `to`. Always pass the explicit named destination.',
     );
 
     // A task run has no `here` — every send must name a destination, and the
@@ -314,20 +317,19 @@ function buildDestinationsSection(mode: SessionMode): string {
   }
 
   lines.push(
-    'Wrap every delivered message in a `<message …>` block. Use `<message to="here">…</message>` for the current conversation — the thread/channel this request came from. `to="here"` is the default and is always correct for progress updates and the results of the work you were asked to do. Use `<message to="name">…</message>` with a destination name from the list above ONLY to reach a DIFFERENT channel or DM, and only when the request explicitly asks for it. Include several blocks in one response to address several destinations. `<internal>…</internal>` marks thinking you don\'t want sent.',
-  );
-  lines.push('');
-  lines.push(
-    '`to="here"` is the default when replying to an incoming message. The inbound `<message>` tag\'s `from="name"` attribute still identifies where the request came from — naming that destination explicitly is equivalent to `here`. Pick a different destination when the request asks for it (e.g., "tell Laura that…").',
+    structuredReporting
+      ? 'Public replies use the `send_message` tool with an explicit purpose. Omit `to` for the current conversation; pass a named destination only when the request explicitly asks you to reach a different channel, agent, or DM. Final and interim model text is an internal work record and is not delivered.'
+      : 'Legacy final-response delivery is active: wrap public final text in `<message to="name">...</message>` (`to="here"` for this conversation) and put private scratchpad text in `<internal>...</internal>`. You may instead use `send_message`; omit `to` for this conversation and name a destination only when the request asks for another channel, agent, or DM.',
   );
   lines.push('');
   lines.push(
     'Keep the WHOLE conversation in the place it started. Progress updates, interim status, and the final result for work you were asked to do all go back to the destination the request came `from` — including across a long, multi-step task (e.g. a `/team-auto` run or a loop). Do NOT redirect status or completion reports to someone\'s DM, even the owner\'s, just because it feels like "telling them" — that splits the conversation across two places. Address a DM or a different channel ONLY when the person explicitly asked you to message there.',
   );
   lines.push('');
-  lines.push(
-    'The `send_message` MCP tool is the same delivery, available mid-turn — handy for a quick acknowledgment ("on it") before a slow tool call. Omit its `to` argument to post in the current conversation (this is the default and works no matter how many destinations you have); pass `to` only to reach a destination OTHER than the one you\'re working in. Each `send_message` call and each final-response `<message>` block lands as its own message in the conversation, so they read as a sequence rather than as one combined reply.',
-  );
+  if (structuredReporting)
+    lines.push(
+      'The harness posts bounded accepted/working state for a human-triggered turn. Use `send_message` for requested replies, a completed outcome, a material decision or urgent correction, and actionable handoffs. `purpose="progress"` records work internally. Do not send a second acknowledgment or unchanged status.',
+    );
   return lines.join('\n');
 }
 

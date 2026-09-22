@@ -88,6 +88,18 @@ export function markDeliveryFailed(db: Database.Database, messageOutId: string, 
   ).run(messageOutId, errorMessage ?? null, new Date().toISOString());
 }
 
+/** Mark an existing delivered lifecycle row as terminal without changing its delivery identity. */
+export function markLifecycleTerminal(db: Database.Database, messageOutId: string): boolean {
+  const result = db
+    .prepare(
+      `UPDATE delivered
+       SET lifecycle_terminal_at = COALESCE(lifecycle_terminal_at, ?)
+       WHERE message_out_id = ? AND status = 'delivered'`,
+    )
+    .run(new Date().toISOString(), messageOutId);
+  return result.changes > 0;
+}
+
 /**
  * The quiet-delivery gate's view of a session's outbound file.
  *

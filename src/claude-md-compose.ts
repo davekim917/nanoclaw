@@ -32,7 +32,12 @@ import os from 'os';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
-import { readContainerConfig, validateMcpServers, type McpServerConfig } from './container-config.js';
+import {
+  effectiveOutcomeReporting,
+  readContainerConfig,
+  validateMcpServers,
+  type McpServerConfig,
+} from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { isExcludedPluginPath, splitExcludedPlugins } from './plugin-exclusions.js';
 import { flattenClaudeMd } from './agents-md-flatten.js';
@@ -359,7 +364,7 @@ export async function composeGroupClaudeMd(
     ? validateMcpServers(JSON.parse(configRow.mcp_servers) as Record<string, McpServerConfig>)
     : {};
   const desired = new Map<string, string>();
-  if (readContainerConfig(group.folder).outcomeReporting === true)
+  if (effectiveOutcomeReporting(readContainerConfig(group.folder)))
     desired.set('zz-outcome-reporting.md', OUTCOME_REPORTING_INSTRUCTIONS);
 
   if (options.workgroupReadAccessInstructions) {

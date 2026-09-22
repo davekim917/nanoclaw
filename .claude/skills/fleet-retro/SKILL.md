@@ -1,117 +1,64 @@
 ---
 name: fleet-retro
-description: On-demand host-session retro of a workgroup's multi-agent development workflow. Use when the operator asks to review how the fleet has been behaving, evaluate whether workflow controls are working, run a workflow retro/eval, or check a workgroup's process health. Triggers on "fleet retro", "workflow eval", "how has the fleet been behaving", "are the controls working". Host session only — never run from a container agent.
+description: Run an on-demand, evidence-bounded host audit of one workgroup's multi-agent workflow. Use when the operator asks for a fleet retro, workflow evaluation, control-health review, or assessment of how a named workgroup has been behaving. Host session only; never run from a container agent.
 ---
 
-# Fleet retro — host-session workflow review
+# Fleet retro
 
-You are the only vantage point with cross-group access AND the ability to
-change enforcement points. This skill is the codified *looking*: which
-surfaces to pull, in what order, what healthy looks like, and the rule that
-every finding ends as a shipped fix, a dispatched fix, or a named human
-decision — never as prose alone.
+Audit the named workgroup from a host session. This is a scoped evaluation, not a standing monitor, automatic full-fleet sweep, release action, or grant of authority.
 
-Takes a workgroup folder name as its argument (`/fleet-retro <workgroup>`).
-Paths below use `$WG = data/workgroups/<workgroup>` and the workgroup's agent
-group folders under `groups/`. Where this install keeps a surface elsewhere,
-follow the convention, not this file.
+Resolve the workgroup and its agent groups first. Read histories only when existing authority explicitly permits that workgroup scope; never collect credentials or unrelated personal data. Start with metadata—time window, work-item identities, session/container start times, message kinds, task occurrences, receipts and delivery acknowledgments—then inspect the smallest content sample needed to explain the evidence. Do not pull unrelated groups merely because the host can access them.
 
-## Principles
+## Establish the question and sample
 
-- **Count against the authoritative source, never artifacts that describe
-  it.** The gate ledger over filesystem sweeps; the DB over a board; the
-  executing task's stored script over same-named files on disk.
-- **Read what the fleet already wrote before re-deriving.** Agents record as
-  they work; this retro is the only retro *event*. Their records are input.
-- **Absence is only evidence when presence was possible.** "Ran and found
-  nothing" ≠ "did not run". Date every event; prefer DB/ledger timestamps.
-- **Fix-or-dispatch discipline**: small defect in a control you own → fix in
-  this session, through the same gates the fleet uses. Larger → dispatch to
-  the owning lane with a claim. Human-scoped → the decision list, with the
-  exact action named. Silently dropping a finding fails the retro.
-- **Peer-check anything consequential** you conclude — a cross-family
-  reviewer on any control you patch.
+- Use the operator's requested window and concern. If either is absent, choose a recent bounded window and state it.
+- Read prior decisions, machinery notes and retro records before re-deriving them. Treat agent-authored claims as leads until verified.
+- Choose contextual samples for the question: a completed human work item, a current interrupt, a release/QA path when relevant, or a suspected noisy producer. Do not automatically walk every PR, campaign, task or room.
+- Before proposing or assigning work, read the owning record or thread through its latest message. Do not dispatch unknown work or duplicate work already owned. A retro does not force delegation; retain the technical owner through build, test and repair while the coordinator verifies evidence. Keep required consequential independent review and dissent separate.
 
-## Phase 1 — harvest the fleet's own records (cheapest signal first)
+## Keep evidence layers separate
 
-- `$WG/releases/decisions.md` — rulings since the last retro (tail from the
-  last dated retro entry). What changed, what got overruled.
-- `$WG/releases/machinery.md` — new facts and bumped `seen:` counts; a
-  rediscovered fact is a findability failure.
-- Recent QA campaign run trees (under the workgroup's QA lane dir) — read the
-  dissent lines and "untested / limits" sections of terminal syntheses, not
-  the whole trees. A raised-and-overruled objection is the highest-value line.
-- Fleet-authored edits to control files: `git -C data/workgroups log --stat`
-  since the last retro. Verify any edit to an enforcement script before
-  blessing it (parse, tests, live-run evidence) — fleet edits are hypotheses
-  with good provenance, not pre-verified.
+Report each claim at the strongest layer actually observed:
 
-## Phase 2 — enforcement health (stored queries, never hand counts)
+1. source implements the behavior;
+2. the installed/runtime artifact contains it;
+3. activation occurred;
+4. a fresh container naturally exercised it;
+5. the intended outcome or measured benefit was observed.
 
-- Required-check publisher: its append log (publishes/hour, state
-  transitions, `inputs unreadable` bursts) and the service journal for
-  crashes. Any PR red on the same predicate for days = a stuck input or a
-  check defect — decide which by reading the named predicate.
-- Attribution ledger (`claims/ledger.ndjson` or equivalent): every merge in
-  the window has a row; execution events never appear in human gate files.
-- Gate ledger vs verdict artifacts: one terminal marker per run, digests
-  consistent, `reconciliation_required` count is zero or explained.
-- Re-verification queue: inflow (merges) vs drain (independent executions).
-  A queue that only grows is the old 144-item disguise returning.
-- Instruction-surface audit (`ops/instruction-budget.sh` or equivalent):
-  over-budget files = conversion backlog, not trim orders.
-- Scheduled-task inventory (`ncl tasks list`): no scheduled wake holds a
-  production-mutation capability outside the pre-authorized at-head-ship
-  rule; spot-read any task whose prompt changed since the last retro.
+Do not collapse these layers. A restart, green test, merge or enabled flag is not proof of fresh behavior or lower human burden. A fresh container can reuse an old session id; determine freshness from container/runtime evidence rather than conversation-row novelty. Conversely, an old surviving container may retain an earlier runner snapshot.
 
-## Phase 3 — the rooms
+Model, role and dispatch evidence also stays literal. Saved role pins, explicit model/effort arguments and Jev provenance describe intended selection; verify actual runtime metadata before claiming what ran. For a new bounded Codex worker, require the explicit native fresh-context control. Claude's native context/session mechanics are separate; do not infer one runtime's semantics from the other.
 
-Read the workgroup's process and QA channels since the last retro (Slack API
-by channel id, or the archive DB). Healthy: terminal digests, interrupts,
-dissent lines, handoffs-with-permalinks; volume low. Unhealthy: narration,
-re-derived state, acknowledgment loops, alert noise. Note WHO is generating
-any noise — the fix is usually one instruction or one alert filter, not a
-lecture. Before assigning any work you conclude is needed: **read the thread
-where that work would live, to its last message** — the fleet may already be
-doing it, and a duplicate dispatch from the host is the same failure the
-rules exist to prevent (this skill's author committed it once).
+## Interpret records correctly
 
-## Phase 4 — lifecycle spot-checks (one of each, end to end)
+- `work_log` is a durable record, not a developer notification.
+- Status rows and status edits are not counts of human notifications.
+- Task/turn rows are not distinct scheduled wakes. Identify actual task occurrences and continuation chains.
+- Zero native outcome receipts is a defect only when an eligible completed human work item should have produced one through that route. It can be expected when the sole release/QA reporter delivered instead; without a route-specific denominator, report the observation as inconclusive.
+- A queued outcome is not delivered. Verify its native delivery acknowledgment or platform receipt.
+- Native delivery receipts and the sole release/QA reporter's publication record are distinct evidence. Preserve the existing sole reporter; do not create a competing terminal post.
 
-Pick ONE recent instance of each and walk it against the contract:
-- a merged PR: labels → recipes → check state → ship record (if required) →
-  merge → ledger row → issue lifecycle label → queue row;
-- a terminal campaign: lease → deadline → verdict artifact → digest →
-  dissent line → handoff;
-- a human decision: raised → routed → answered or aging (and whether
-  settled-by-silence items carry dated defaults).
-A spot-check that fails promotes to a full sweep of that surface.
+Evaluate reporting by human work item—feature, defect, PR, request or QA campaign—not by model turn, phase, worker or review round. Where the outcome contract applies, expect one concise contextual completion per finished work item: truthful implemented/merged/deployed/verified state, why it matters, remaining action and an evidence/detail link. Do not substitute a default digest. Keep detailed execution, dissent and corrections in durable records. Preserve genuine incidents, required approvals, explicit human replies, requested detail, actionable handoffs and explicitly requested report formats. Preserve brief receipt acknowledgments and occasional factual liveness updates during long-running work: the current step and whether it is active, waiting or blocked. Do not count these as noise merely because they are not completions. Detailed execution narration, repeated unchanged checks and agent-to-agent acknowledgment loops stay in records; never claim activity without current evidence.
 
-## Phase 5 — measurement rules, only when due
+## Inspect controls proportionally
 
-If a pre-committed measurement rule exists (frozen thresholds, observation
-window), evaluate it ONLY when its window has elapsed — never peek early,
-never re-litigate thresholds after evidence exists. Record "measured
-unnecessary" as a success outcome where the numbers say so. The invoking
-operator satisfies the evaluator-is-not-the-author rule.
+Check only controls implicated by the question or sample. Examples include claims/ownership, required checks, verdict reconciliation, re-verification, scheduled tasks, release outbox, QA barriers and instruction budgets. Use authoritative stores and stored queries where available; never substitute a board, digest or filesystem artifact for its source of truth.
 
-## Phase 6 — close the loop
+For a sampled lifecycle, compare the actual path with its current contract. Escalate to a broader sweep only when the sample exposes a concrete systemic failure or the operator requests it. Do not treat silence as settlement, approval or an independent evaluation. Operator invocation authorizes the audit itself; it does not make the operator an independent evaluator or authorize fixes, publication, deployment, messages, new timers or scheduled retries.
 
-- Ship or dispatch every mechanical finding (see fix-or-dispatch above).
-- An incident-class defect closed this retro follows the permanent-check
-  rule: a regression test, tripwire, or deterministic gate ships with the
-  fix — or the report records a dated reason why none is practical.
-- Update the fleet's records the same way agents must: ruling to
-  decisions.md first, then the instruction; machinery line for any new tool
-  fact; commit control-record changes (or confirm the journal timer will).
-- Deliver the report: a control table (live / drifting / defective, with the
-  verification command per row), defects found with their fix state, the
-  human-decision list with exact actions, and — as an artifact when the
-  operator will share or revisit it — the same table published.
+## Deliver the retro
 
-## What this skill is not
+Lead with the bounded conclusion. For each material finding, state:
 
-Not scheduled (on-demand only — a cron'd retro manufactures exhaust), not a
-substitute for the fleet's continuous records, not a re-run of a prior
-retro's conclusions (read them, verify only what's load-bearing), and never
-run from inside a container.
+- the affected human work item or control;
+- observed evidence and its layer;
+- impact on developers or delivery;
+- current owner or the exact decision needed;
+- uncertainty or the next observation required.
+
+Distinguish healthy, drifting, defective and unproven. Record real interruptions and explicitly requested reports rather than counting them as noise. Recommend the smallest correction at the actual control seam, but mutate or dispatch only within existing authority. Never invent a deadline, timer, owner, approval, or at-head shipping permission.
+
+Link the durable records instead of reproducing their detail. If measurement has a precommitted window or threshold, evaluate it only when due and preserve its original denominator. Otherwise label the result as an observation, not an outcome claim.
+
+Useful implementation pointers when the audit concerns outcome reporting: `src/outcome-reporting-instructions.ts`, the record-only `work_log` path in `src/delivery.ts`, and the spawn-scoped flag in `container/agent-runner/src/outcome-reporting.ts`.

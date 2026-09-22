@@ -5,10 +5,12 @@ import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js'
 import { buildSystemPromptAddendum } from './destinations.js';
 
 beforeEach(() => {
+  process.env.NANOCLAW_OUTCOME_REPORTING = '1';
   initTestSessionDb();
 });
 
 afterEach(() => {
+  delete process.env.NANOCLAW_OUTCOME_REPORTING;
   closeSessionDb();
 });
 
@@ -37,19 +39,19 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
 
     const prompt = buildSystemPromptAddendum('Casa');
 
-    expect(prompt).toContain('`to="here"` is the default when replying to an incoming message');
-    expect(prompt).toContain('from="name"');
+    expect(prompt).toContain('Omit `to` for the current conversation');
+    expect(prompt).toContain('You can send messages to the following destinations');
     expect(prompt).toContain('`casa`');
     expect(prompt).toContain('`whatsapp-mg-17780`');
   });
 
-  it('describes message wrapping for a single destination', () => {
+  it('describes structured tool delivery for a single destination', () => {
     seedDestination('casa', 'Casa', 'whatsapp', 'person17@fixture6.example.com');
 
     const prompt = buildSystemPromptAddendum('Casa');
 
-    expect(prompt).toContain('Wrap every delivered message');
-    expect(prompt).toContain('<message to="name">');
+    expect(prompt).toContain('Public replies use the `send_message` tool');
+    expect(prompt).not.toContain('Wrap every delivered message');
     expect(prompt).toContain('`casa`');
   });
 
@@ -60,14 +62,24 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
     expect(prompt).not.toContain('default to addressing');
   });
 
-  it('includes default-routing and wrapping instructions for single destination', () => {
+  it('does not promise internal final text under explicit legacy rollback', () => {
+    delete process.env.NANOCLAW_OUTCOME_REPORTING;
+    seedDestination('casa', 'Casa', 'whatsapp', 'person17@fixture6.example.com');
+    const prompt = buildSystemPromptAddendum('Casa');
+    expect(prompt).toContain('Legacy final-response delivery is active');
+    expect(prompt).toContain('<message to="name">');
+    expect(prompt).toContain('<internal>...</internal>');
+    expect(prompt).not.toContain('Final and interim model text is an internal work record');
+    expect(prompt).not.toContain('send a brief acknowledgment');
+  });
+
+  it('includes current-conversation structured routing for one destination', () => {
     seedDestination('casa', 'Casa', 'whatsapp', 'person17@fixture6.example.com');
 
     const prompt = buildSystemPromptAddendum('Casa');
 
-    expect(prompt).toContain('Wrap every delivered message');
-    expect(prompt).toContain('<message to="name">');
-    expect(prompt).toContain('`to="here"` is the default when replying to an incoming message');
+    expect(prompt).toContain('Public replies use the `send_message` tool');
+    expect(prompt).toContain('Omit `to` for the current conversation');
     expect(prompt).toContain('`casa`');
   });
 
@@ -77,7 +89,7 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
     const prompt = buildSystemPromptAddendum('Casa', { kind: 'task', taskId: 'daily-briefing-a25c' });
 
     expect(prompt).toContain('isolated task run');
-    expect(prompt).toContain('send_message({ to: "name"');
+    expect(prompt).toContain('call `send_message` with an explicit named destination and purpose');
     expect(prompt).toContain('tasks/daily-briefing-a25c.md');
     expect(prompt).toContain('Only notify someone when the task asks');
     expect(prompt).not.toContain('<message to=');

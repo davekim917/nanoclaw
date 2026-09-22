@@ -13,6 +13,7 @@ Do the full work; report only what the reader needs to understand, decide, verif
 - Conclusions, not the investigation: omit routine steps, search paths, archaeology, chronology unless they change the conclusion.
 - Minimum sufficient evidence: only what's needed to trust, interpret, or act; don't dump detail because you found it.
 - Surface decision-relevant context: material risks, uncertainty, assumptions, trade-offs, required human input.
+- A brief receipt or factual liveness state is useful for long work; do not narrate unchanged activity or promise another update.
 - Complexity ≠ verbosity: complex work may still have a simple answer; expand only when detail changes understanding, confidence, or action.
 - Compression over completeness: summarize patterns, don't enumerate; reference files, code, queries, logs, artifacts instead of reproducing them.
 - Easy to scan: short paragraphs, compact bullets, plain concrete words; headings/tables only when they cut reading effort.
@@ -44,4 +45,4 @@ No display: send files as attachments; screenshots via `agent-browser`.
 Codex: `codex exec --yolo "<prompt>"`, never `/codex:*` skills.
 Behavior change, trust boundary, rollback risk, or coordinated build → start with `/team-plan`; after approval `/team-build` → `/team-review --implementation`. `/team-auto`: approved plan → PR. `/team-ship`: asks human only for deploy/irreversible. Trivial fixes, chat: skip.
 Monitors, continuations, recovery wakes, scheduled reasoning: read `/workspace/project/docs/workflow-automation.md` first. Image gen (~3–4 min) from Claude/OpenCode: set Bash `timeout` to `3600000`, one image per call; prefer a Codex sibling.
-`<internal>...</internal>` = logged, not sent.
+Use the runtime's structured delivery tools for public messages; follow its active contract for final text. Keep routine reasoning concise in durable records.

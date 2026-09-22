@@ -5,7 +5,7 @@
  * baseline plus: `repo_ingress_fence`, `messages_in.repo_fence_epoch` /
  * `.repo_fence_original_trigger` and their four guard triggers,
  * `idx_messages_in_series_seq`, `session_routing.spawn_task_id` / `.session_id`,
- * `delivered.error`, and the `container_state` provider/memory columns. Every
+ * `delivered.error` / `.lifecycle_terminal_at`, and the `container_state` provider/memory columns. Every
  * migration here is idempotent and guarded by `PRAGMA table_info`, so it is
  * safe to run on every open — that lazy, on-open shape IS the upgrade path for
  * session DBs (there is no central migration for them).
@@ -75,6 +75,9 @@ export function migrateDeliveredTable(db: Database.Database): void {
   }
   if (!cols.has('error')) {
     db.prepare('ALTER TABLE delivered ADD COLUMN error TEXT').run();
+  }
+  if (!cols.has('lifecycle_terminal_at')) {
+    db.prepare('ALTER TABLE delivered ADD COLUMN lifecycle_terminal_at TEXT').run();
   }
 }
 

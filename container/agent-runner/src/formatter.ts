@@ -530,6 +530,7 @@ function originAttr(msg: MessageInRow): string {
 function formatTaskMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
   const from = originAttr(msg);
+  const idAttr = msg.seq != null ? ` id="${msg.seq}"` : '';
   // `time` is the occurrence's SCHEDULED time, not the row's creation time.
   // For a recurring series the successor row is inserted the moment the
   // previous run completes (recurrence.ts insert-then-clear), so its
@@ -565,7 +566,7 @@ function formatTaskMessage(msg: MessageInRow): string {
   // mcp-tools/request-choice.ts. Escape after stripping the legacy contract
   // (its markers are plain ASCII, unaffected by escaping either way).
   parts.push('Instructions:', escapeXml(stripLegacyTaskContract(content.prompt || '')));
-  return `<task${from} time="${escapeXml(time)}" current_time="${escapeXml(currentTime)}">${parts.join('\n')}</task>`;
+  return `<task${idAttr}${from} time="${escapeXml(time)}" current_time="${escapeXml(currentTime)}">${parts.join('\n')}</task>`;
 }
 
 const LEGACY_TASK_CONTRACT_MARKERS = [
@@ -860,11 +861,7 @@ function parseContent(json: string): any {
 // non-string attachment `type`, ...) used to throw out of escapeXml and fail
 // the whole formatting batch instead of just that one field.
 function escapeXml(value: unknown): string {
-  return String(value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+  return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 /**

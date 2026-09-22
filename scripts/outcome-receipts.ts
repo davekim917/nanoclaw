@@ -4,6 +4,12 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { canonicalWorkItem } from '../src/outcome-reporting-schema.js';
 
+const REQUEST_KEY = /^request:v1:[0-9a-f]{64}$/;
+
+function receiptKey(value: string): string {
+  return REQUEST_KEY.test(value) ? value : canonicalWorkItem(value);
+}
+
 export function reconcileOutcome(
   db: Database.Database,
   input: {
@@ -16,7 +22,7 @@ export function reconcileOutcome(
   },
 ): void {
   if (!input.reason.trim()) throw new Error('A reconciliation reason and external evidence are required');
-  const key = canonicalWorkItem(input.workItem);
+  const key = receiptKey(input.workItem);
   const timestamp = new Date().toISOString();
   db.transaction(() => {
     const row = db
@@ -27,7 +33,7 @@ export function reconcileOutcome(
     const note = JSON.stringify({ at: timestamp, action: input.action, reason: input.reason }) + '\n';
     if (input.action === 'rekey') {
       if (row.state !== 'delivered') throw new Error('Resolve unknown delivery before correcting a work-item identity');
-      const replacement = canonicalWorkItem(input.value);
+      const replacement = receiptKey(input.value ?? '');
       db.prepare(
         `UPDATE work_outcome_receipts SET work_item=?,updated_at=?,resolution=COALESCE(resolution,'')||?
         WHERE workgroup_id=? AND work_item=?`,

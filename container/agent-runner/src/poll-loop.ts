@@ -1,4 +1,5 @@
 import { outcomeReportingEnabled, OUTCOME_REPLY_NUDGE } from './outcome-reporting.js';
+import { isAdmissibleOutcomeRequestSource } from './outcome-reporting-schema.js';
 import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'node:crypto';
@@ -20,8 +21,12 @@ import { touchHeartbeat } from './heartbeat.js';
 import { clearStaleProcessingAcks } from './db/container-state.js';
 import {
   clearContinuation,
+  clearCurrentLifecycleStatus,
   clearCurrentInReplyTo,
+  getCurrentLifecycleStatus,
   migrateLegacyContinuation,
+  rememberRequestCandidates,
+  setCurrentLifecycleStatus,
   setContinuation,
   setCurrentInReplyTo,
 } from './db/session-state.js';
@@ -529,6 +534,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           config.provider.resetRotationCycle?.();
           setCurrentInReplyTo(routing.inReplyTo);
           setCurrentBatchAnchors(sourceBatch);
+          rememberRequestCandidates(sourceBatch);
           let query: AgentQuery | undefined;
           const abortDirectQuery = () => query?.abort();
           try {
@@ -726,6 +732,24 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // (same prompt/continuation, so the cause hasn't changed).
     const trigger = classifyTrigger(keep);
     markProcessing(keptIds);
+    rememberRequestCandidates(keep);
+    clearCurrentLifecycleStatus();
+    if (outcomeReportingEnabled() && !routing.taskRun && triggeringHumanLivenessInbound(keep) && !routing.quietStatus) {
+      const lifecycleStatusId = generateId();
+      await writeMessageOut({
+        id: lifecycleStatusId,
+        in_reply_to: routing.inReplyTo,
+        kind: 'status',
+        platform_id: routing.platformId,
+        channel_type: routing.channelType,
+        thread_id: routing.threadId,
+        content: JSON.stringify({
+          text: 'Accepted · working',
+          reporting: { version: 1, purpose: 'liveness', state: 'working' },
+        }),
+      });
+      setCurrentLifecycleStatus(lifecycleStatusId);
+    }
     if (hasRealInbound(keep)) {
       resetWorkContinuationForRealInbound();
       // Real input means the thread is not finished after all — retract any
@@ -1663,6 +1687,19 @@ function triggeringHumanInbound(messages: MessageInRow[]): MessageInRow | undefi
   return messages.find((m) => isAdmissibleTrigger(m) && m.channel_type !== 'agent' && hasRealInbound([m]));
 }
 
+/** Narrower human-only predicate for the new public accepted/working line. */
+function triggeringHumanLivenessInbound(messages: MessageInRow[]): MessageInRow | undefined {
+  return triggeringHumanInbound(
+    messages.filter((message) => {
+      try {
+        return isAdmissibleOutcomeRequestSource(message.kind, JSON.parse(message.content));
+      } catch {
+        return true;
+      }
+    }),
+  );
+}
+
 function isContinuationRecoveryBatch(messages: MessageInRow[]): boolean {
   if (hasRealInbound(messages)) return false;
   return messages.some((message) => {
@@ -2307,6 +2344,7 @@ export async function processQuery(
         const followUpRouting = extractRouting(keep);
         setCurrentInReplyTo(followUpRouting.inReplyTo);
         setCurrentBatchAnchors(keep);
+        rememberRequestCandidates(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;
@@ -2337,9 +2375,12 @@ export async function processQuery(
         // and none was delivered.
         const midTurnNote =
           pushedHumanTrigger && !turnIdle
-            ? '\n\n<system>Reminder: unwrapped text you write between tool calls is NOT delivered. ' +
-              'To answer now, write a complete <message to="name">...</message> block or call the ' +
-              '`send_message` tool.</system>'
+            ? outcomeReportingEnabled()
+              ? '\n\n<system>Reminder: text written between tool calls is an internal work record. ' +
+                'To answer now, call send_message with purpose="reply".</system>'
+              : '\n\n<system>Reminder: unwrapped text you write between tool calls is NOT delivered. ' +
+                'To answer now, write a complete <message to="name">...</message> block or call the ' +
+                '`send_message` tool.</system>'
             : '';
         const pushedId = pushToQuery(prompt + midTurnNote, extractAttachments(keep));
         if (admittedTurn && pushedId) admittedTurn.promptIds = [pushedId];
@@ -2850,7 +2891,9 @@ export async function processQuery(
           const names = destinations.map((d) => d.name).join(', ');
           reminder +=
             ` Reminder: you have ${destinations.length} destinations (${names}). ` +
-            'Use <message to="name"> blocks to address them. Bare text goes to the scratchpad fallback only.';
+            (outcomeReportingEnabled()
+              ? 'Use send_message with an explicit purpose to address them; omit to for the current conversation.'
+              : 'Use <message to="name"> blocks to address them. Bare text goes to the scratchpad fallback only.');
         }
         pushToQuery(ensureFreshContextBootstrap(reminder));
       } else if (event.type === 'interim_text') {
@@ -3177,7 +3220,13 @@ export async function dispatchInterimMessageBlocks(
  * assume inbound rows are already marked completed when this row lands.
  */
 async function emitTurnEnd(): Promise<void> {
-  await writeMessageOut({ id: generateId(), kind: 'system', content: JSON.stringify({ action: 'turn_end' }) });
+  const lifecycleStatusId = getCurrentLifecycleStatus();
+  await writeMessageOut({
+    id: generateId(),
+    kind: 'system',
+    content: JSON.stringify({ action: 'turn_end', ...(lifecycleStatusId ? { lifecycleStatusId } : {}) }),
+  });
+  clearCurrentLifecycleStatus();
 }
 
 export async function dispatchResultText(
@@ -3404,7 +3453,7 @@ export function buildTaskBlockNudge(taskBlocks: TaskMessageBlock[], destinationN
     'If and only if any of it still needs to be sent, call send_message with an explicit to destination. ' +
     'If it was already sent or no notification is required, do not send it again. ' +
     (outcomeReportingEnabled()
-      ? 'Use purpose="reply" for a requested answer or purpose="outcome" with its canonical item and evidence only when the original work item finishes. Routine progress stays internal; preserve required approval routes. '
+      ? 'Use purpose="reply" for a requested answer or purpose="outcome" with the original supported workItem URL or harness request id only when the original work item finishes; evidence is optional. Routine progress stays internal; preserve required approval routes. '
       : '') +
     `Your destinations: ${escapePromptXml(destinationNames)}. ` +
     'The original task result is already recorded in the run log; do not repeat it.</system>'

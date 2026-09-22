@@ -9,6 +9,7 @@
  * on file and resumes cleanly if the user flips back.
  */
 import { getAgentMailbox } from '../mailbox/index.js';
+import { isAdmissibleOutcomeRequestSource } from '../outcome-reporting-schema.js';
 
 const LEGACY_KEY = 'sdk_session_id';
 
@@ -110,4 +111,90 @@ export function getCurrentInReplyTo(): string | null {
   const age = Date.now() - new Date(row.updatedAt).getTime();
   if (!Number.isFinite(age) || age > IN_REPLY_TO_MAX_AGE_MS) return null;
   return row.value;
+}
+
+export interface RequestCandidate {
+  sequence: number;
+  messageId: string;
+}
+
+const REQUEST_CANDIDATES_KEY = 'request_candidates';
+const MAX_REQUEST_CANDIDATES = 32;
+
+/** Retain trusted original inbound identities across retries and clarification turns. */
+export function rememberRequestCandidates(
+  messages: Array<{
+    id: string;
+    seq: number | null;
+    kind: string;
+    trigger: number;
+    channel_type: string | null;
+    content: string;
+  }>,
+): void {
+  const previous = getRequestCandidates();
+  const bySequence = new Map(previous.map((candidate) => [candidate.sequence, candidate]));
+  for (const message of messages) {
+    let eligible = message.kind === 'task';
+    if ((message.kind === 'chat' || message.kind === 'chat-sdk') && message.channel_type !== 'agent') {
+      try {
+        eligible = isAdmissibleOutcomeRequestSource(message.kind, JSON.parse(message.content));
+      } catch {
+        eligible = false;
+      }
+    }
+    if (message.trigger === 1 && Number.isSafeInteger(message.seq) && (message.seq as number) > 0 && eligible) {
+      bySequence.set(message.seq as number, { sequence: message.seq as number, messageId: message.id });
+    }
+  }
+  const candidates = [...bySequence.values()].sort((a, b) => a.sequence - b.sequence).slice(-MAX_REQUEST_CANDIDATES);
+  if (candidates.length > 0) setValue(REQUEST_CANDIDATES_KEY, JSON.stringify(candidates));
+}
+
+export function getRequestCandidates(): RequestCandidate[] {
+  const raw = getValue(REQUEST_CANDIDATES_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (value): value is RequestCandidate =>
+        !!value &&
+        typeof value === 'object' &&
+        Number.isSafeInteger((value as RequestCandidate).sequence) &&
+        (value as RequestCandidate).sequence > 0 &&
+        typeof (value as RequestCandidate).messageId === 'string' &&
+        (value as RequestCandidate).messageId.length > 0,
+    );
+  } catch {
+    return [];
+  }
+}
+
+export function resolveRequestCandidate(sequence: unknown): RequestCandidate {
+  const candidates = getRequestCandidates();
+  if (sequence === undefined && candidates.length === 1) return candidates[0];
+  if (!Number.isSafeInteger(sequence) || (sequence as number) < 1)
+    throw new Error(
+      candidates.length > 1
+        ? 'requestId is required when several original requests are available'
+        : 'No admissible original request is available',
+    );
+  const candidate = candidates.find((value) => value.sequence === sequence);
+  if (!candidate) throw new Error('requestId is not an admissible original request for this session');
+  return candidate;
+}
+
+const LIFECYCLE_STATUS_KEY = 'current_lifecycle_status';
+
+export function setCurrentLifecycleStatus(id: string): void {
+  setValue(LIFECYCLE_STATUS_KEY, id);
+}
+
+export function getCurrentLifecycleStatus(): string | null {
+  return getValue(LIFECYCLE_STATUS_KEY) ?? null;
+}
+
+export function clearCurrentLifecycleStatus(): void {
+  deleteValue(LIFECYCLE_STATUS_KEY);
 }

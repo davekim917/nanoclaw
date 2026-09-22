@@ -33,6 +33,12 @@ function publishInReplyTo(id: string, ageMs = 0): void {
     .run('current_in_reply_to', id, updatedAt);
 }
 
+function publishRequestCandidates(candidates: Array<{ sequence: number; messageId: string }>): void {
+  getOutboundDb()
+    .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+    .run('request_candidates', JSON.stringify(candidates), new Date().toISOString());
+}
+
 beforeEach(() => {
   initTestSessionDb();
   // Seed a peer agent destination
@@ -219,45 +225,14 @@ describe('send_message / send_file MCP tools — thread_key', () => {
   });
 });
 
-describe('send_message MCP tool — final-output envelope normalization', () => {
-  it('removes an accidentally nested final-output envelope before writing the chat text', async () => {
-    await sendMessage.handler({ to: 'peer', text: '<message to="here">the actual reply</message>' });
+describe('send_message MCP tool — obsolete routing envelopes', () => {
+  it('rejects a complete legacy envelope and tells the caller to use structured routing', async () => {
+    const result = await sendMessage.handler({ to: 'peer', text: '<message to="here">the actual reply</message>' });
 
-    const out = getUndeliveredMessages();
-    expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toBe('the actual reply');
-  });
-
-  it('uses the current conversation when the tool omits `to`, regardless of the envelope destination', async () => {
-    const db = getInboundDb();
-    db.exec(
-      'CREATE TABLE IF NOT EXISTS session_routing (id INTEGER PRIMARY KEY, channel_type TEXT, platform_id TEXT, thread_id TEXT)',
-    );
-    db.prepare(
-      "INSERT INTO session_routing (id, channel_type, platform_id, thread_id) VALUES (1, 'slack', 'C-CURRENT', 'thread-current')",
-    ).run();
-
-    await sendMessage.handler({ text: '<message to="other">reply in place</message>' });
-
-    const [out] = getUndeliveredMessages();
-    expect(out.platform_id).toBe('C-CURRENT');
-    expect(out.thread_id).toBe('thread-current');
-    expect(JSON.parse(out.content).text).toBe('reply in place');
-  });
-
-  it('keeps the explicit tool destination authoritative over the envelope destination', async () => {
-    getInboundDb()
-      .prepare(
-        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
-         VALUES ('other', 'Other', 'agent', NULL, NULL, 'ag-other')`,
-      )
-      .run();
-
-    await sendMessage.handler({ to: 'peer', text: '<message to="other">reply to peer</message>' });
-
-    const [out] = getUndeliveredMessages();
-    expect(out.platform_id).toBe('ag-peer');
-    expect(JSON.parse(out.content).text).toBe('reply to peer');
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('obsolete');
+    expect(result.content[0].text).toContain('Pass the body directly');
+    expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
   it('preserves plain text, ordinary XML, inline XML examples, and fenced examples unchanged', async () => {
@@ -329,7 +304,7 @@ describe('send_message MCP tool — final-output envelope normalization', () => 
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
-  it('normalizes a legitimate 1MB body instead of failing closed the way a backtracking regex would', async () => {
+  it('recognizes and rejects a 1MB legacy envelope without a regex size cliff', async () => {
     // Regression: a tempered-token regex (`(?:(?!<\/message>)[\s\S])*`)
     // re-runs its lookahead at every character, and under Bun/JSC that
     // silently fails to match on legitimate bodies at roughly 688KB+ — no
@@ -341,21 +316,23 @@ describe('send_message MCP tool — final-output envelope normalization', () => 
       text: `<message to="here">${bigBody}</message>`,
     });
 
-    expect(result.isError).toBeUndefined();
-    const out = getUndeliveredMessages();
-    expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toBe(bigBody);
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('obsolete');
+    expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
-  it('applies the same normalization to edit_message text', async () => {
+  it('applies the same rejection to edit_message text', async () => {
     await sendMessage.handler({ to: 'peer', text: 'original reply' });
     const [original] = getUndeliveredMessages();
 
-    await editMessage.handler({ messageId: original.seq, text: '<message to="here">edited reply</message>' });
+    const result = await editMessage.handler({
+      messageId: original.seq,
+      text: '<message to="here">edited reply</message>',
+    });
 
-    const out = getUndeliveredMessages();
-    expect(out).toHaveLength(2);
-    expect(JSON.parse(out[1].content)).toMatchObject({ operation: 'edit', text: 'edited reply' });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('obsolete');
+    expect(getUndeliveredMessages()).toHaveLength(1);
   });
 });
 
@@ -391,7 +368,7 @@ describe('send_file MCP tool — caption envelope normalization', () => {
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
-  it('passes a complete envelope through to the file checks', async () => {
+  it('rejects a complete envelope before the file checks', async () => {
     const result = await sendFile.handler({
       to: 'peer',
       path: '/nonexistent-send-file-test/report.html',
@@ -399,65 +376,7 @@ describe('send_file MCP tool — caption envelope normalization', () => {
     });
 
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('File not found');
-  });
-
-  it('strips a complete envelope from the caption end-to-end, through a successful delivery', async () => {
-    // Only the rejection paths above stop before writeMessageOut. This
-    // exercises the full success path: a real file under an allowed prefix,
-    // the caption stripped of its envelope, and the host's delivery ack
-    // (written directly to `delivered`, the same table delivery.ts writes)
-    // resolving the handler's awaitDeliveryAck wait.
-    //
-    // The handler stages the outgoing file under the hardcoded /workspace/
-    // outbox/<id>/ — that path only exists inside the agent container, not
-    // on the host this test runs on, so mkdirSync/writeFileSync are spied
-    // for just that prefix and left real for everything else (reading the
-    // real source file below, under an allowed /tmp/ prefix).
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-send-file-'));
-    const filePath = path.join(tmpDir, 'report.txt');
-    fs.writeFileSync(filePath, 'file contents');
-
-    const realMkdirSync = fs.mkdirSync.bind(fs);
-    const realWriteFileSync = fs.writeFileSync.bind(fs);
-    const mkdirSpy = spyOn(fs, 'mkdirSync').mockImplementation((target, opts) => {
-      if (typeof target === 'string' && target.startsWith('/workspace/outbox')) return undefined;
-      return realMkdirSync(target, opts as never);
-    });
-    const writeFileSpy = spyOn(fs, 'writeFileSync').mockImplementation((target, data, opts) => {
-      if (typeof target === 'string' && target.startsWith('/workspace/outbox')) return undefined;
-      return realWriteFileSync(target, data as never, opts as never);
-    });
-
-    try {
-      const handlerPromise = sendFile.handler({
-        to: 'peer',
-        path: filePath,
-        text: '<message to="here">a</message>',
-      });
-
-      // Poll for the outbound row the handler writes before it starts
-      // awaiting the delivery ack.
-      let out = getUndeliveredMessages();
-      for (let i = 0; i < 100 && out.length === 0; i++) {
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        out = getUndeliveredMessages();
-      }
-      expect(out).toHaveLength(1);
-      expect(JSON.parse(out[0].content)).toMatchObject({ text: 'a', files: ['report.txt'] });
-
-      getInboundDb()
-        .prepare("INSERT INTO delivered (message_out_id, status, delivered_at) VALUES (?, 'delivered', ?)")
-        .run(out[0].id, new Date().toISOString());
-
-      const result = await handlerPromise;
-      expect(result.isError).toBeUndefined();
-      expect(result.content[0].text).toContain('delivered to peer');
-    } finally {
-      mkdirSpy.mockRestore();
-      writeFileSpy.mockRestore();
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
+    expect(result.content[0].text).toContain('obsolete');
   });
 });
 
@@ -529,6 +448,7 @@ describe('send_file allowlist (Group G — workgroup shared tree)', () => {
 describe('outcome reporting send_message contract', () => {
   beforeEach(() => {
     process.env.NANOCLAW_OUTCOME_REPORTING = '1';
+    process.env.NANOCLAW_SESSION_ID = 'session-fixture';
     getInboundDb().exec(
       'CREATE TABLE IF NOT EXISTS session_routing (id INTEGER PRIMARY KEY,channel_type TEXT,platform_id TEXT,thread_id TEXT)',
     );
@@ -536,6 +456,73 @@ describe('outcome reporting send_message contract', () => {
   });
   afterEach(() => {
     delete process.env.NANOCLAW_OUTCOME_REPORTING;
+    delete process.env.NANOCLAW_SESSION_ID;
+  });
+
+  it('uses one harness request automatically and rejects ambiguous or forged selections', async () => {
+    const { setChatLimit } = await import('../modules/mailbox/index.js');
+    setChatLimit(0);
+    try {
+      publishRequestCandidates([{ sequence: 2, messageId: 'platform-message:agent' }]);
+      delete process.env.NANOCLAW_SESSION_ID;
+      const single = await sendMessage.handler({
+        purpose: 'outcome',
+        text: 'Fixed.',
+        outcome: { verified: 'Tests passed' },
+      });
+      expect(single.isError).toBe(true);
+      expect(single.content[0].text).not.toContain('requestId');
+      expect(single.content[0].text).not.toContain('Harness session identity is unavailable');
+
+      publishRequestCandidates([
+        { sequence: 2, messageId: 'platform-message:agent' },
+        { sequence: 4, messageId: 'another-message:agent' },
+      ]);
+      expect(
+        (
+          await sendMessage.handler({
+            purpose: 'outcome',
+            text: 'Fixed.',
+            outcome: { verified: 'Tests passed' },
+          })
+        ).content[0].text,
+      ).toContain('requestId is required');
+      expect(
+        (
+          await sendMessage.handler({
+            purpose: 'outcome',
+            text: 'Fixed.',
+            outcome: { requestId: 999, verified: 'Tests passed' },
+          })
+        ).content[0].text,
+      ).toContain('not an admissible original request');
+    } finally {
+      setChatLimit(null);
+    }
+  });
+
+  it('resolves the second recurring task occurrence by its displayed request id', async () => {
+    const description = sendMessage.tool.inputSchema.properties.outcome.properties.requestId.description;
+    expect(description).toContain('<message id="…">');
+    expect(description).toContain('<task id="…">');
+    const { setChatLimit } = await import('../modules/mailbox/index.js');
+    publishRequestCandidates([
+      { sequence: 41, messageId: 'series-fire-1' },
+      { sequence: 42, messageId: 'series-fire-2' },
+    ]);
+    setChatLimit(0);
+    try {
+      const result = await sendMessage.handler({
+        purpose: 'outcome',
+        text: 'Second occurrence complete.',
+        outcome: { requestId: 42, verified: 'Second occurrence checks passed.' },
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Chat sends are disabled');
+      expect(result.content[0].text).not.toContain('not an admissible original request');
+    } finally {
+      setChatLimit(null);
+    }
   });
 
   it('records progress durably, refuses unlabeled narration, preserves internal handoffs', async () => {
