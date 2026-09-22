@@ -6,15 +6,15 @@ This section is the current migration and is complete on its own. Everything und
 
 **What moves.** `DEFAULT_OPUS_MODEL` (`src/flag-parser.ts`) is now `claude-opus-5-5[1m]`, and the Opus family default effort (`defaultEffortForModel`, `container/agent-runner/src/providers/claude.ts`) is now `medium`, down from `high`. On deploy, every Claude path whose model is the Opus default or an `opus` alias runs Opus 5.5. That covers primary groups, declared `providerFallback`s, `-m opus`, and `opus` task, wiring and subagent pins. Every Opus path with no effort configured runs `medium`, and that includes an explicit `claude-opus-5[1m]` pin, because the family default keys on every `claude-opus-*` id. Codex and OpenCode defaults do not move.
 
-**Detect.** A Claude path resolves its model in this order: task pin (for a task fire), session sticky `-m`, channel wiring `default_model`, group `container.json` `model`, then the install default. Effort resolves the same way through the matching `effort` fields, then the family default. A path **moves to Opus 5.5** when that chain ends at the install default or at the word `opus`. A frozen id such as `claude-opus-5[1m]` keeps its model. A path **moves to `medium`** when it resolves to any `claude-opus-*` id and no layer sets an effort, and that includes frozen `claude-opus-5[1m]` pins. Check every layer:
+**Detect.** A Claude chat turn resolves its model in this order: session sticky `-m`, channel wiring `default_model`, group `container.json` `model`, then the install default. A pure scheduled-task fire resolves: task pin, group `container.json` `model`, then the install default. It ignores session stickies (`container/agent-runner/src/poll-loop.ts:4015`), and a task session has no channel wiring. Effort resolves the same way through the matching `effort` fields, then the family default. A path **moves to Opus 5.5** when that chain ends at the install default or at the word `opus`. A frozen id such as `claude-opus-5[1m]` keeps its model. A path **moves to `medium`** when it resolves to any `claude-opus-*` id and no layer sets an effort, and that includes frozen `claude-opus-5[1m]` pins. Check every layer:
 
 ```bash
 # 1. Groups and every declared providerFallback, answered by the spawn resolver itself:
 #    run the audit script in History §1 unchanged; "(none)" or a refusal = unpinned.
 # 2. Channel wirings, including effort-only ones:
 pnpm exec tsx scripts/q.ts data/v2.db "select mga.id, mg.name, ag.folder, mga.default_model, mga.default_effort from messaging_group_agents mga join messaging_groups mg on mg.id = mga.messaging_group_id join agent_groups ag on ag.id = mga.agent_group_id where coalesce(mga.default_model,'') <> '' or coalesce(mga.default_effort,'') <> ''"
-# 3. Scheduled-task pins:
-ncl tasks list --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const d=JSON.parse(s);for(const t of (Array.isArray(d)?d:d.data)) if(t.model_pin||t.effort_pin) console.log(t.agent_group_id, t.series_id, t.model_pin||"-", t.effort_pin||"-")})'
+# 3. Every live task series; "(group)" = no pin, so it follows its group's model/effort:
+ncl tasks list --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const d=JSON.parse(s);for(const t of (Array.isArray(d)?d:d.data)) console.log(t.agent_group_id, t.series_id, t.model_pin||"(group)", t.effort_pin||"(group)")})'
 # 4. Session stickies (every session's outbound.db, one process; unreadable DBs are reported):
 pnpm exec tsx -e "import Database from 'better-sqlite3'; import fs from 'fs'; for (const g of fs.readdirSync('data/v2-sessions')) { let ss = []; try { ss = fs.readdirSync('data/v2-sessions/' + g) } catch { continue } for (const s of ss) { const p = 'data/v2-sessions/' + g + '/' + s + '/outbound.db'; if (!fs.existsSync(p)) continue; try { const d = new Database(p, { readonly: true }); for (const r of d.prepare(\"select key, value from session_state where key in ('sticky_model','sticky_effort')\").all()) console.log(g, s, r.key, r.value); d.close() } catch (e) { if (!/no such table/.test(e.message)) console.error('UNREADABLE', p, e.message) } } }"
 ```
@@ -42,7 +42,7 @@ docker inspect <fresh claude container> --format '{{range .Config.Env}}{{println
 pnpm exec tsx scripts/q.ts data/v2.db "select model, effort, count(*) from turn_usage where ts > '<deploy time>' group by 1,2"
 ```
 
-Expect `ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5-5[1m]` in every Claude container, with `NANOCLAW_CLAUDE_MODEL` equal to the group's pin or to `claude-opus-5-5[1m]` when unpinned. New `turn_usage` rows for unpinned work should read `claude-opus-5-5[1m]` / `medium`. A container still showing `claude-opus-5[1m]` was spawned from the old build or image.
+Expect `ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5-5[1m]` in every Claude container, with `NANOCLAW_CLAUDE_MODEL` equal to the group's pin or to `claude-opus-5-5[1m]` when unpinned. New `turn_usage` rows for unpinned work should read `claude-opus-5-5[1m]` / `medium`. Only `ANTHROPIC_DEFAULT_OPUS_MODEL` proves the build: if it still reads `claude-opus-5[1m]`, the container was spawned from the old build or image. `NANOCLAW_CLAUDE_MODEL=claude-opus-5[1m]` on a fresh container is simply a path pinned by the Fix commands above.
 
 **Rollback.**
 - **One path**: apply the Fix commands above, then `ncl groups restart --id <group-id>`.
