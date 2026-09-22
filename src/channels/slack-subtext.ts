@@ -26,7 +26,7 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-/** The subtext belonging to the postMessage call currently on the stack. */
+/** The subtext belonging to the postMessage/editMessage call currently on the stack. */
 const pendingSubtext = new AsyncLocalStorage<string>();
 
 /** A Slack chat.postMessage argument object, as far as this module cares. */
@@ -88,7 +88,13 @@ export function installSlackSubtextBlocks(adapter: unknown): void {
   const target = adapter as {
     __subtextInstalled?: boolean;
     postMessage: (threadId: string, message: unknown) => Promise<unknown>;
-    _client?: { chat?: { postMessage: (args: SlackPostArgs) => Promise<unknown> } };
+    editMessage?: (threadId: string, messageId: string, message: unknown) => Promise<unknown>;
+    _client?: {
+      chat?: {
+        postMessage: (args: SlackPostArgs) => Promise<unknown>;
+        update?: (args: SlackPostArgs) => Promise<unknown>;
+      };
+    };
   };
   if (target.__subtextInstalled) return;
   const chat = target._client?.chat;
@@ -111,4 +117,22 @@ export function installSlackSubtextBlocks(adapter: unknown): void {
 
   const originalChatPost = chat.postMessage.bind(chat);
   chat.postMessage = (args: SlackPostArgs) => originalChatPost(applySlackSubtext(args, pendingSubtext.getStore()));
+
+  // Edits (#1016). An agent correcting its own reply goes through the adapter's
+  // editMessage, which builds the same `markdown_text` payload as a post
+  // (toSlackPayload) and sends it with chat.update, so the same rewrite
+  // applies. Wrapped separately so an adapter missing either seam still posts
+  // normally and only the edit loses its footer.
+  if (typeof target.editMessage === 'function' && typeof chat.update === 'function') {
+    const originalEdit = target.editMessage.bind(adapter);
+    target.editMessage = (threadId, messageId, message) => {
+      const subtext =
+        message && typeof message === 'object' && typeof (message as { subtext?: unknown }).subtext === 'string'
+          ? ((message as { subtext: string }).subtext as string)
+          : undefined;
+      return withSlackSubtext(subtext, () => originalEdit(threadId, messageId, message));
+    };
+    const originalChatUpdate = chat.update.bind(chat);
+    chat.update = (args: SlackPostArgs) => originalChatUpdate(applySlackSubtext(args, pendingSubtext.getStore()));
+  }
 }

@@ -1381,9 +1381,24 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // delivery, leaving stale "thinking-block tails" visible to the
         // user. Status is meta info and the bubble is deleted on chat
         // delivery anyway, so visual truncation here is acceptable.
-        const limit = config.maxTextLength;
+        // An agent correcting its own reply keeps the status line: the runner
+        // stamps edit_message rows the same way it stamps the reply they
+        // replace (#1016). Status-bubble edits carry no subtext, so they are
+        // unaffected. Budget the footer before truncating, as the post path
+        // does, so Discord's in-text rendering cannot push past the limit.
+        const editSubtext =
+          message.kind === 'chat' &&
+          typeof content.subtext === 'string' &&
+          content.subtext.trim() &&
+          config.renderSubtext
+            ? content.subtext.trim()
+            : null;
+        const limit = config.maxTextLength
+          ? Math.max(1, config.maxTextLength - (editSubtext ? editSubtext.length + SUBTEXT_BUDGET_OVERHEAD : 0))
+          : undefined;
         const fitted = limit && editText.length > limit ? splitForLimit(editText, limit)[0].trimEnd() + '…' : editText;
-        await adapter.editMessage(tid, content.messageId as string, wrapBody(fitted));
+        const editBody = editSubtext ? config.renderSubtext!(wrapBody(fitted), editSubtext) : wrapBody(fitted);
+        await adapter.editMessage(tid, content.messageId as string, editBody);
         return;
       }
 

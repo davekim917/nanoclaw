@@ -354,31 +354,33 @@ export const sendMessage: McpToolDefinition = {
     const id = generateId();
     const denial = internal ? null : chatSendDenial();
     if (denial) return err(denial);
-    const seq = await writeMessageOut(withStatusSubtext({
-      id,
-      in_reply_to: getCurrentInReplyTo(),
-      kind: internal ? 'work_log' : 'chat',
-      // Agent-composed reply text — eligible for the status subtext. With
-      // outcome reporting on (the fleet default) this is THE reply path, not
-      // an alternative to the `<message>` envelope.
-      agentReply: !internal,
-      platform_id: routing.platform_id,
-      channel_type: routing.channel_type,
-      thread_id: routing.thread_id,
-      content: JSON.stringify({
-        text,
-        ...(key.threadKey ? { threadKey: key.threadKey } : {}),
-        ...(policy
-          ? {
-              reporting: {
-                version: 1,
-                purpose,
-                ...(purpose === 'outcome' ? { outcome: reportedOutcome, summary: normalized.text } : {}),
-              },
-            }
-          : {}),
+    const seq = await writeMessageOut(
+      withStatusSubtext({
+        id,
+        in_reply_to: getCurrentInReplyTo(),
+        kind: internal ? 'work_log' : 'chat',
+        // Agent-composed reply text — eligible for the status subtext. With
+        // outcome reporting on (the fleet default) this is THE reply path, not
+        // an alternative to the `<message>` envelope.
+        agentReply: !internal,
+        platform_id: routing.platform_id,
+        channel_type: routing.channel_type,
+        thread_id: routing.thread_id,
+        content: JSON.stringify({
+          text,
+          ...(key.threadKey ? { threadKey: key.threadKey } : {}),
+          ...(policy
+            ? {
+                reporting: {
+                  version: 1,
+                  purpose,
+                  ...(purpose === 'outcome' ? { outcome: reportedOutcome, summary: normalized.text } : {}),
+                },
+              }
+            : {}),
+        }),
       }),
-    }));
+    );
 
     if (seq < 0)
       return err(
@@ -562,18 +564,23 @@ export const editMessage: McpToolDefinition = {
     }
 
     const id = generateId();
-    await writeMessageOut({
-      id,
-      kind: 'chat',
-      platform_id: routing.platform_id,
-      channel_type: routing.channel_type,
-      thread_id: routing.thread_id,
-      content: JSON.stringify(
-        key.threadKey
-          ? { operation: 'edit', messageId: platformId, text, threadKey: key.threadKey }
-          : { operation: 'edit', messageId: platformId, text },
-      ),
-    });
+    await writeMessageOut(
+      withStatusSubtext({
+        id,
+        kind: 'chat',
+        // The agent's own corrected text, stamped like the reply it replaces
+        // (#1016); the own-conversation gate still applies.
+        agentReply: true,
+        platform_id: routing.platform_id,
+        channel_type: routing.channel_type,
+        thread_id: routing.thread_id,
+        content: JSON.stringify(
+          key.threadKey
+            ? { operation: 'edit', messageId: platformId, text, threadKey: key.threadKey }
+            : { operation: 'edit', messageId: platformId, text },
+        ),
+      }),
+    );
 
     log(`edit_message: #${seq} → ${platformId}`);
     return ok(`Message edit queued for #${seq}`);
