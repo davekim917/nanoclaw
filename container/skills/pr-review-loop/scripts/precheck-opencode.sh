@@ -32,11 +32,20 @@ PR=""
 REPO=""
 MODEL="opencode/deepseek-v4.1-flash"
 
+# A trailing flag with no value used to hang forever: `shift 2` with `$#=1`
+# fails and shifts nothing, and `set -uo pipefail` above carries no `-e`, so the
+# loop spun on the same argument until killed. Demand the value before
+# consuming it.
 while [ $# -gt 0 ]; do
   case "$1" in
-    --pr) PR="${2:-}"; shift 2 ;;
-    --repo) REPO="${2:-}"; shift 2 ;;
-    --model) MODEL="${2:-}"; shift 2 ;;
+    --pr|--repo|--model)
+      [ $# -ge 2 ] || { echo "precheck-opencode.sh: $1 needs a value" >&2; exit 2; }
+      case "$1" in
+        --pr) PR="$2" ;;
+        --repo) REPO="$2" ;;
+        --model) MODEL="$2" ;;
+      esac
+      shift 2 ;;
     *) echo "precheck-opencode.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -112,11 +121,25 @@ if [ -z "$WORKDIR" ]; then
 fi
 
 # `< /dev/null` is load-bearing too: with an open stdin the CLI waits for more
-# prompt input and hangs silently until its timeout.
-timeout "${PRECHECK_TIMEOUT:-900}" opencode run --dir "$WORKDIR" -m "$MODEL" "$PROMPT" < /dev/null 2>&1
+# prompt input and hangs silently until its timeout. That is a different hang
+# from the argument-parsing one above; both are real.
+#
+# The output is CAPTURED rather than streamed so that empty output can be
+# refused. An `opencode run` that exits 0 having printed nothing is a failure
+# mode seen in practice, and streaming it produced a clean exit and a blank
+# terminal — indistinguishable from "no findings", which is exactly the false
+# confidence a pre-check must not manufacture right before a merge. The cost is
+# that nothing appears until the run ends; the alternative is a silent pass.
+out=$(timeout "${PRECHECK_TIMEOUT:-900}" opencode run --dir "$WORKDIR" -m "$MODEL" "$PROMPT" < /dev/null 2>&1)
 rc=$?
 [ -n "$CLEANUP_DIR" ] && rm -rf "$CLEANUP_DIR"
+printf '%s\n' "$out"
 if [ "$rc" -ne 0 ]; then
   echo "precheck-opencode.sh: opencode exited $rc (a rate limit or timeout is not a PASS — re-run or use another pool)" >&2
+  exit "$rc"
 fi
-exit "$rc"
+if [ -z "${out//[[:space:]]/}" ]; then
+  echo "precheck-opencode.sh: opencode exited 0 but produced NO output — this is not a pass; re-run or use another pool" >&2
+  exit 1
+fi
+exit 0
