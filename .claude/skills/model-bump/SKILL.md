@@ -10,7 +10,7 @@ A model release touches three layers. Only the first needs code.
 | Layer | Where | How it changes |
 |---|---|---|
 | **Install default + aliases** | `src/flag-parser.ts` (`DEFAULT_OPUS_MODEL`, `MODEL_ALIAS_MAP`, `MODEL_EFFORT_SUPPORT`, `CODEX_MODEL_ALIAS_MAP`); family default effort in `defaultEffortForModel` (`container/agent-runner/src/providers/claude.ts`); `DEFAULT_CODEX_MODEL`/`DEFAULT_CODEX_EFFORT` (`container/agent-runner/src/providers/codex.ts`) | PR → review → deploy → image rebuild |
-| **Runtime that must know the id** | `container/Dockerfile` `CLAUDE_CODE_VERSION` + `@anthropic-ai/claude-agent-sdk` in `container/agent-runner/package.json` (same trailing number); `CODEX_VERSION` for OpenAI | same PR |
+| **Runtime that must know the id** | `container/Dockerfile` `CLAUDE_CODE_VERSION` + `@anthropic-ai/claude-agent-sdk` in `container/agent-runner/package.json` (same trailing number); `CODEX_VERSION` for OpenAI — keep it equal to the host's `codex --version` so a wire shape verified on the host holds in the container | same PR |
 | **Fleet pins** | `groups/<g>/container.json`, channel wirings, scheduled-task pins, subagent frontmatter, session stickies | `ncl` / file edits, no deploy |
 
 **Pins that say `opus` / `sonnet` / `fable` follow the default automatically.** Frozen ids (`claude-opus-5[1m]`) do not. Whenever you set a pin because the user wants "the current Opus", write the family alias, not the id. That turns the next bump into a code-only change.
