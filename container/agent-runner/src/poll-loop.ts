@@ -1791,7 +1791,9 @@ export function retainCompleteRecallPairs(original: MessageInRow[], admitted: Me
  * - All other system rows are dropped.
  */
 export function selectInTurnFollowUps(allPending: MessageInRow[]): MessageInRow[] {
-  const completePending = retainCompleteRecallUnits(allPending);
+  // A --fresh-context fire must not join the running conversation: it stays
+  // pending, and the outer loop resets before prompting it once this query ends.
+  const completePending = retainCompleteRecallUnits(allPending.filter((m) => !isFreshContextTaskBatch([m])));
   const isChatRow = (m: MessageInRow): boolean => m.kind === 'chat' || m.kind === 'chat-sdk';
   const triggerIds = new Set(completePending.filter(isAdmissibleTrigger).map((m) => m.id));
   if (triggerIds.size === 0) return [];

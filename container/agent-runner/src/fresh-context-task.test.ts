@@ -12,7 +12,7 @@ import { getContinuation, setContinuation } from './db/session-state.js';
 import type { MessageInRow } from './db/messages-in.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, QueryInput } from './providers/types.js';
-import { runPollLoop } from './poll-loop.js';
+import { runPollLoop, selectInTurnFollowUps } from './poll-loop.js';
 import { isFreshContextTaskBatch } from './fresh-context-task.js';
 
 class RecordingProvider extends MockProvider {
@@ -109,5 +109,18 @@ describe('isFreshContextTaskBatch', () => {
     expect(isFreshContextTaskBatch([row('task', 'not json')])).toBe(false);
     expect(isFreshContextTaskBatch([row('system', { text: 'recall' })])).toBe(false);
     expect(isFreshContextTaskBatch([])).toBe(false);
+  });
+});
+
+describe('selectInTurnFollowUps', () => {
+  it('leaves a flagged task fire pending instead of pushing it into the running conversation', () => {
+    const task = (id: string, content: object): MessageInRow =>
+      ({ id, kind: 'task', trigger: 1, content: JSON.stringify(content) }) as MessageInRow;
+    const admitted = selectInTurnFollowUps([
+      task('fresh', { prompt: 'p', freshContext: true }),
+      task('plain', { prompt: 'p' }),
+    ]);
+    expect(admitted.map((m) => m.id)).toEqual(['plain']);
+    expect(selectInTurnFollowUps([task('fresh', { prompt: 'p', freshContext: true })])).toEqual([]);
   });
 });
