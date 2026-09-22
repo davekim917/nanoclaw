@@ -90,11 +90,12 @@
  *      one shim this can bite is `worker-max`, and only when it is spawned onto
  *      a 5.5-or-older model: that spawn now fails where it previously ran at
  *      the global default. Accepted. The fleet default is `DEFAULT_CODEX_MODEL`
- *      = `gpt-6-sol` (`container/agent-runner/src/providers/codex.ts:420`) —
- *      absent from the bundled catalog through 0.156.0, so its metadata is the
- *      fallback and the effort check below is skipped for it (server accepts
- *      `max`, measured 2026-09-22) — no Codex group pins an older model than
- *      5.6, and a refusal naming the unsupported
+ *      = `gpt-6-sol` (`container/agent-runner/src/providers/codex.ts:420`).
+ *      It is not in the bundled catalog, but under ChatGPT auth on codex-cli
+ *      >= 0.155.1 the server catalog (`~/.codex/models_cache.json`) supplies
+ *      it with low..ultra (`gpt-6-luna`: low..max), so the check applies
+ *      normally. No Codex group pins an older model than 5.6, and a refusal
+ *      naming the unsupported
  *      level beats a shim called `worker-max` silently running at `high`. The
  *      other four shims name `low`/`medium`/`high`/`xhigh`, which every model
  *      in the catalog supports. One more bound: validation is skipped outright
