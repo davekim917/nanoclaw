@@ -4661,6 +4661,39 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(endCalls.every((afterResult) => afterResult)).toBe(true);
   }, 15_000);
 
+  // Background work between turns is the same hazard: the open input keeps a
+  // background subagent alive, so a pending fresh fire must not end the stream
+  // until that work drains.
+  it('does not end the stream for a default (fresh) fire while background work is live', async () => {
+    insertMessage('occ-2', 'task', { prompt: 'second fire of the same series' });
+
+    let backgroundLive = true;
+    const endCalls: boolean[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'first fire done', isError: false };
+      // Idle, but a background worker is still running for 1.6s.
+      await Bun.sleep(1600);
+      backgroundLive = false;
+      await Bun.sleep(1600);
+    }
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {
+        endCalls.push(backgroundLive);
+      },
+      abort: () => {},
+      applySettings: async () => {},
+      hasBackgroundWork: () => backgroundLive,
+      events: events(),
+    };
+
+    await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, { ultracode: false });
+
+    expect(endCalls.length).toBeGreaterThan(0);
+    expect(endCalls.every((whileBackgroundLive) => !whileBackgroundLive)).toBe(true);
+  }, 15_000);
+
   // #617: with prompt ids, one result that answered two admitted fires (the
   // CLI folded the second into the running turn) records BOTH, instead of
   // leaving the later fire with no outcome.

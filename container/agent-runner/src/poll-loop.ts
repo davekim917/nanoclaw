@@ -2196,9 +2196,12 @@ export async function processQuery(
         // A due fresh-context task fire needs the outer loop's reset, and this
         // stream otherwise stays open after its result. end() is only safe
         // between turns with no background work (the immutable-settings gate
-        // below, #608/#610); until then the fire stays pending, since
-        // selectInTurnFollowUps never pushes it, and the next poll retries.
-        // Other rows are still admitted meanwhile.
+        // below, #608/#610): Claude's end() closes stdin once the first result
+        // is in (SDK 0.3.280 `Query.streamInput`), while Codex and OpenCode read
+        // `ended` only between turns (codex.ts:1321-1328, opencode.ts:1374-1382),
+        // so for them the gate only defers. Until then the fire stays pending,
+        // since selectInTurnFollowUps never pushes it, and the next poll
+        // retries. Other rows are still admitted meanwhile.
         if (
           allPending.some((m) => m.trigger === 1 && startsFreshFire([m])) &&
           turnIdle &&

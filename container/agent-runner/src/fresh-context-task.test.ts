@@ -159,6 +159,66 @@ describe('scheduled task fires', () => {
     expect(provider.continuations[0]).toBe('prior-session');
   });
 
+  it('a fire that comes due mid-turn is held, the turn is not ended, and the fire runs fresh once idle', async () => {
+    setContinuation('mock', 'prior-session');
+    insertRow('t1', 'task', { prompt: 'first fire' });
+    const continuations: Array<string | undefined> = [];
+    let resultSeen = false;
+    const endCalls: boolean[] = [];
+    let queries = 0;
+    const provider = {
+      supportsNativeSlashCommands: false,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      query: (input: QueryInput): AgentQuery => {
+        continuations.push(input.continuation);
+        const n = ++queries;
+        let endedResolve: () => void = () => {};
+        const ended = new Promise<void>((resolve) => (endedResolve = resolve));
+        async function* events() {
+          yield { type: 'init' as const, continuation: `session-${n}` };
+          if (n === 1) await new Promise((resolve) => setTimeout(resolve, 1500));
+          resultSeen = true;
+          yield { type: 'result' as const, text: `fire ${n} done` };
+          await ended;
+        }
+        return {
+          push: () => {},
+          end: () => {
+            if (n === 1) endCalls.push(resultSeen);
+            endedResolve();
+          },
+          abort: () => endedResolve(),
+          events: events(),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const loop = runPollLoop({
+      provider: provider as never,
+      providerName: 'mock',
+      cwd: '/tmp',
+      signal: controller.signal,
+    });
+    try {
+      const deadline = Date.now() + 10_000;
+      while (continuations.length < 1) await new Promise((resolve) => setTimeout(resolve, 20));
+      // Mid-turn: the first query has not produced its result yet.
+      insertRow('t2', 'task', { prompt: 'second fire' });
+      while (continuations.length < 2) {
+        if (Date.now() > deadline) throw new Error('second fire never ran');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      // The first fire reset; the held second fire started fresh too, not in session-1.
+      expect(continuations).toEqual([undefined, undefined]);
+      expect(endCalls.length).toBeGreaterThan(0);
+      expect(endCalls.every((afterResult) => afterResult)).toBe(true);
+    } finally {
+      controller.abort();
+      await loop.catch(() => {});
+    }
+  }, 15_000);
+
   it('a chat row batched with a fire keeps the conversation', async () => {
     setContinuation('mock', 'prior-session');
     insertRow('t1', 'task', { prompt: 'check the watch' });
