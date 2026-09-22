@@ -44,16 +44,29 @@ to the retained technical owner, verify its artifact receipt, and stop.
    `smoke-run-scaffold.sh` or `smoke-evidence-barrier.sh` call. For a scaffold
    writer, pass `SMOKE_GATE_OWNER=<coordinatorOwnerToken>` from
    `<run>/controller/wake.json` — **re-read that file on every wake, not once
-   at intake.** The controller refreshes it with each brief, because a recovery
-   `poll` re-mints the run's coordinator lease under a new token and the one
-   you started with is then retired (XZO #2046).
+   at intake.** `smoke-pr-gate.sh poll` mints a fresh owner token on every
+   same-SHA recovery (`smoke-pr-gate.sh:5312`, written to the lease at `:5341`,
+   the PR authority at `:5346` and the gate state at `:5389`), so the token you
+   started with is then retired. The controller refreshes `wake.json` with
+   every brief it writes (`smoke-campaign-controller.py:1256-1258`, in
+   `_owner_wake` at `:1207`), which is why the file is current and your own
+   copy of its value is not (XZO #2046).
    - A brief headed **YOUR OWNER TOKEN CHANGED** means exactly that happened
-     mid-step. Export the token now in `wake.json` and run
+     mid-step: the controller saw the step's `briefedToken` differ from the
+     token the gate holds and re-offered it
+     (`smoke-campaign-controller.py` `_reissue_owner_token`). Export the token
+     now in `wake.json` and run
      `smoke-run-scaffold.sh adopt <run> <sourceSha>` before any further
      artifact write. That is the whole recovery. Never take a token from gate
      state, from another agent's file, or by setting `SMOKE_GATE_CLAIMANT` —
-     the fence *is* the authorization, and passing it with a borrowed value is
+     the fence *is* the authorization
+     (`smoke-run-scaffold.sh:267-269`, and `adopt` adds no authority check of
+     its own, `:690-694`), and passing it with a borrowed value is
      impersonation, not adoption.
+   - Your ack does not carry over. Writing a brief removes
+     `<run>/controller/brief-<step>.ack`
+     (`smoke-campaign-controller.py:1245-1255`), so a re-offered step needs a
+     fresh ack as its first act, exactly like any other wake.
 4. On `lanes` and `synthesis`, read `<run>/controller/barrier-<step>.json`
    before you start and again before you stop. The controller rewrites it every
    fire from the real `smoke-evidence-barrier.sh` and deletes it once the phase

@@ -1230,13 +1230,40 @@ class EffectLayer:
         # with no legitimate way back. XZO #2046, run
         # xzo-pr-pr2055-dacf01328421-20260921T193111Z. It is refreshed on EVERY
         # step so the file the brief points at always names the live token.
+        # AN ACK NEVER OUTLIVES THE BRIEF IT ACKNOWLEDGED. The ack is the
+        # owner's first act on a wake and the controller only tests it for
+        # existence, re-offering a wake solely while it is ABSENT (owner_step,
+        # :2111-2121); the renewer reads it the same way
+        # (smoke-controller-renew.sh, "brief-<step>.ack absent: no owner turn
+        # holds this step"). So a brief rewritten under a NEW owner token would
+        # otherwise inherit the previous brief's ack and be treated as taken,
+        # and never re-offered -- the second half of XZO #2046. Removing it here
+        # makes that impossible by construction rather than by sequencing: this
+        # function runs only when the obligation is absent or `intent`
+        # (owner_step, :2090), never while a live brief is enqueued, so any ack
+        # it finds belongs to a brief this write supersedes.
+        try:
+            dfd = _open_dir_contained(root, [run_id, "controller"], True)
+        except ControllerError:
+            dfd = None
+        if dfd is not None:
+            try:
+                os.unlink("brief-{}.ack".format(step), dir_fd=dfd)
+            except OSError:
+                pass
+            finally:
+                os.close(dfd)
         if c.get("wake"):
             write_contained_atomic(root, [run_id, "controller", "wake.json"],
                                    json.dumps(c["wake"], sort_keys=True, indent=1) + "\n")
         notes = self._brief_notes(run_id, step, run, c)
         write_contained_atomic(root, [run_id, "controller", "brief-{}.md".format(step)],
                                head + notes + body + "\n")
-        return {"outcome": "brief_written", "brief": os.path.join(run, "controller", "brief-{}.md".format(step))}
+        # briefedToken is what makes the re-issue a re-derived invariant instead
+        # of an edge: journaled by owner_step only once the brief is actually on
+        # disk, so a crash before that leaves the step still owing a re-offer.
+        return {"outcome": "brief_written", "briefedToken": c.get("token"),
+                "brief": os.path.join(run, "controller", "brief-{}.md".format(step))}
 
     def _barrier_report(self, effect):
         """Publish the phase barrier's own answer into the run tree.
@@ -2069,7 +2096,14 @@ class Controller:
                         wakeAgent=True, effect=result["outcome"], afterReconcile=bool(ob))
             crash_point("after-effect", "owner", step)
             if result["outcome"] in ("shadow_refused", "brief_written"):
-                self.record(run_id, "owner", step, "enqueued", 1, {"brief": brief, "outcome": result["outcome"]})
+                enqueued = {"brief": brief, "outcome": result["outcome"]}
+                # Only once the brief is on disk (see _owner_wake's return):
+                # _reissue_owner_token reads this to decide whether the step
+                # still owes a re-offer, so recording it early would close the
+                # transition a crash had not actually completed.
+                if result.get("briefedToken"):
+                    enqueued["briefedToken"] = result["briefedToken"]
+                self.record(run_id, "owner", step, "enqueued", 1, enqueued)
                 self.owner_wakes.append({"runId": run_id, "step": step, "brief": result.get("brief") or brief,
                                          "key": key, "since": iso(self.now)})
                 return "enqueued"
@@ -2116,7 +2150,7 @@ class Controller:
                                       "recoveredFromGateState": True}
         return detail
 
-    def _reissue_owner_token(self, run_id, obs):
+    def _reissue_owner_token(self, run_id, token):
         """A recovery poll re-minted this run's lease under a fresh token while
         an owner step was IN FLIGHT. XZO #2046.
 
@@ -2127,30 +2161,64 @@ class Controller:
         controller dispatched holds the retired token and has no way to learn
         the new one, because `controller/wake.json` -- the only file that
         carries it, and the file the intake brief names -- was written once, at
-        intake, and the step's brief is re-offered only while its `.ack` is
-        ABSENT (owner_step, :2068-2078), which it is not. So the owner the
-        controller itself dispatched can never satisfy the fence, and stops --
-        which is the correct behaviour, and why run pr2055 banked 4 of 14
-        markers with the other 8 lanes' evidence complete on disk.
+        intake. So the owner the controller itself dispatched can never satisfy
+        the fence, and stops -- which is the correct behaviour, and why run
+        pr2055 banked 4 of 14 markers with the other 8 lanes' evidence complete
+        on disk.
 
-        The fix is to re-OFFER the step. Recording it back to `intent` makes
-        owner_step perform its wake again, which rewrites wake.json with the
-        live token (the only legitimate issue path -- copying the token out of
-        gate state is impersonation, not adoption) and writes a brief whose
-        _brief_notes preamble says to run `adopt` before anything else.
-        `abandoned`/`failed_terminal`/`done` steps are left alone: nothing is
-        in flight to re-offer."""
-        for ob in list(obs.values()):
-            if ob["runId"] != run_id or ob["kind"] != "owner" or ob["state"] != "enqueued":
+        THE INVARIANT, and why this is not the poll-reclaim edge it started as:
+
+            An in-flight owner step must have been briefed under the token the
+            gate holds now.
+
+        `briefedToken` is journaled with the step when its brief is actually
+        written (owner_step, from _owner_wake's result), so the condition is
+        re-derived every fire from durable state and never from "have I already
+        done this". An edge trigger on reconcile_claims' poll-reclaim branch
+        was not crash-safe: the claim record is fsynced first, so a death
+        between the two records left the journaled token matching the wake, the
+        branch skipped forever, and the owner enqueued on the old brief and a
+        stale wake.json -- the exact wedge this exists to recover from. Now a
+        crash anywhere in the sequence leaves the next fire able to finish it,
+        because the next fire asks the same question of the same durable state
+        and gets the same answer until the brief lands. Once `briefedToken`
+        equals the live token it is a no-op, so it is safe to run every fire.
+
+        The re-offer records the step back to `intent`, which makes owner_step
+        perform its wake again: that rewrites wake.json with the live token
+        (the only legitimate issue path -- copying the token out of gate state
+        is impersonation, not adoption), removes the stale `.ack`, and writes a
+        brief whose _brief_notes preamble says to run `adopt` before anything
+        else. `done`/`abandoned`/`failed_terminal` steps are left alone:
+        nothing is in flight to re-offer."""
+        if not token:
+            return
+        for ob in list(self.obligations().values()):
+            if ob["runId"] != run_id or ob["kind"] != "owner" or ob["state"] not in ("intent", "enqueued"):
                 continue
+            briefed = (ob.get("detail") or {}).get("briefedToken")
+            if briefed == token:
+                continue
+            if briefed is None:
+                # Journaled by a controller that did not track it (this file is
+                # a live bind mount, so a run can be mid-flight across the
+                # upgrade). Absence is not evidence of a re-mint, and re-offering
+                # on it would tell an owner its token changed when it did not.
+                # Backfill at the current state -- the next genuine re-mint is
+                # caught, because then `briefedToken` is present and stale.
+                self.record(run_id, "owner", ob["slot"], ob["state"], ob["attempt"] or 1, {"briefedToken": token})
+                continue
+            if ob["state"] == "intent" and (ob.get("detail") or {}).get("tokenReissued"):
+                continue  # already mid-transition; owner_step finishes it this fire
             self.ensure_alarm(run_id, "controller_owner_token_reissued",
-                              "token-reissued:{}".format(run_id[-40:]),
+                              "token-reissued:{}:{}".format(run_id[-24:], token[-8:]),
                               {"step": ob["slot"],
                                "reason": "a recovery poll re-minted this run's lease; the dispatched owner must "
                                          "re-read controller/wake.json and run scaffold `adopt` before writing"})
             self.record(run_id, "owner", ob["slot"], "intent", ob["attempt"] or 1, {"tokenReissued": True})
             self.decide(run_id, ob["slot"], "wake_owner", "coordination_model",
-                        "owner token reissued; step re-offered for adoption", step=ob["slot"])
+                        "owner token reissued; step re-offered for adoption", step=ob["slot"],
+                        briefedToken=bool(briefed))
 
     def _legacy_hold(self, run_id, why):
         """A legacy run surfaced to the controller (a poll wake after its
@@ -2225,7 +2293,14 @@ class Controller:
                     # new token, and only the wake may hand one over.
                     self.record(run, "run", "claim", "enqueued", 1, dict(self._claim_detail(wake, "poll-reclaim"),
                                                                          reclaimed=True))
-                    self._reissue_owner_token(run, obs)
+                    # THE WINDOW. This record is fsynced, and the gate latches
+                    # the wake, so a kill here used to be unrecoverable: the
+                    # journal's token already matched and nothing would ever
+                    # look again. The re-offer is no longer sequenced behind it
+                    # -- _reissue_owner_token re-derives what is owed from
+                    # `briefedToken` on every fire -- and this seam is what the
+                    # regression kills at.
+                    crash_point("after-reclaim-record", "run", "claim")
                 obs = self.obligations()
         for run, claim in sorted(claims.items()):
             if not RUN_ID_RE.match(run) or run.startswith(PSEUDO_PREFIX) or run in self.legacy:
@@ -2434,6 +2509,12 @@ class Controller:
             if ka and not ka.get("ok"):
                 self.decide(run_id, None, "log", "mechanical", "progress stamp failed", error=ka.get("error"))
 
+        # Checked EVERY fire, before any owner_step can run, against the token
+        # _authority has just proved is the gate's. Not on the poll-reclaim
+        # edge: see _reissue_owner_token.
+        if self.live:
+            self._reissue_owner_token(run_id, run_ob["detail"].get("ownerToken"))
+
         self._alarm_overdue(run_id, None)
 
         # -- phase derivation (derived, never stored) --
@@ -2540,9 +2621,33 @@ class Controller:
         if syn_err == "missing":
             if not syn_barrier.get("ready"):
                 self.publish_barrier(run_id, "synthesis", syn_barrier)
+                # THE OWNER IS WOKEN HERE, not only once the barrier passes.
+                # By this point every OTHER party's contribution the synthesis
+                # barrier checks has already been gated above: the lanes
+                # barrier is ready (:2592), coordinator/preliminary.md exists
+                # (:2595) and challenger/disposition.md exists (:2603). What
+                # the synthesis barrier can still report is therefore the
+                # retained owner's -- `invalid[]` content it authored
+                # (journeys/scope-dispositions.json, or
+                # contact-sheet/dispositions.json under
+                # SMOKE_VISUAL_DISPOSITIONS=1), or a `missing[]` disposition it
+                # owes -- and the owner is the only judgment party the
+                # controller can invoke. Returning without a wake left the
+                # phase with no exit at all: the wrapper wakes on `ownerWake`
+                # alone (smoke-controller-live.sh:168-175), so nobody was told;
+                # and _maybe_synthesis_overdue_blocked needs the very
+                # owner:synthesis obligation this branch declined to create
+                # (:2685-2687), so the terminal BLOCKED safety net could not
+                # fire either. This is the same blind spot as the lanes barrier
+                # (XZO #2047), on the sibling path.
+                timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)
+                if timed:
+                    return timed
+                self.owner_step(run_id, "synthesis", "synthesis", done=False)
                 if syn_barrier.get("invalid"):
                     self.decide(run_id, "synthesis", "escalate", "coordination_model",
-                                "synthesis barrier invalid", invalid=syn_barrier.get("invalid"))
+                                "synthesis barrier invalid", invalid=syn_barrier.get("invalid"),
+                                reasons=(syn_barrier.get("invalidReasons") or [])[:3])
                 else:
                     self.decide(run_id, "synthesis", "wait", "wait", "synthesis barrier not ready",
                                 missing=syn_barrier.get("missing"))

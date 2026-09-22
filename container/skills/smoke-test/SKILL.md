@@ -1651,20 +1651,50 @@ do its job without. Both used to stay in the controller's own journal.
   `journeys/scope-dispositions.json` invalid on the first lanes fire — the
   journal said so, the brief did not, and the owner found out by running the
   barrier by hand.
+
+  **A refusing barrier wakes the owner on BOTH phases.** By the time a run
+  reaches the synthesis branch the lanes barrier is ready and both
+  `coordinator/preliminary.md` and `challenger/disposition.md` exist, so
+  anything the synthesis barrier still reports — rejected content it authored,
+  or a visual-candidate disposition it owes under
+  `SMOKE_VISUAL_DISPOSITIONS=1` — is the retained owner's, and the owner is the
+  only judgment party the controller can invoke. That branch used to return
+  without a wake, which left the phase with no exit at all: the wrapper wakes
+  on `ownerWake` alone, so nobody was told, and the overdue-BLOCKED safety net
+  keys on the very `owner:synthesis` obligation the branch declined to create,
+  so it could not fire either.
 - **A re-minted owner token.** `poll` mints a fresh coordinator owner token on
   every same-SHA recovery (`smoke-pr-gate.sh:5312`), which is how a coordinator
   that died is recovered and is not negotiable; `adopt`'s fence adds no
   authority check of its own, which is what makes it safe and is also not
   negotiable. The gap was the owner in between: `controller/wake.json` is the
   only file that carries the token to it, and it was written once, at intake.
-  It is now refreshed with **every** brief, and a poll that re-mints while an
-  owner step is in flight re-offers that step with a brief headed **YOUR OWNER
-  TOKEN CHANGED**, telling the owner to re-read `wake.json` and run
-  `smoke-run-scaffold.sh adopt` before writing anything. That re-issue is the
-  only legitimate route: a token copied out of gate state passes the fence by
-  impersonating its holder, which is what the fence exists to prevent
-  (XZO #2046 — the owner on `xzo-pr-pr2055-…` was asked to do exactly that and
-  correctly refused, leaving eight completed lanes unbankable).
+  It is now refreshed with **every** brief, and a step whose recorded
+  `briefedToken` differs from the token the gate holds is re-offered with a
+  brief headed **YOUR OWNER TOKEN CHANGED**, telling the owner to re-read
+  `wake.json` and run `smoke-run-scaffold.sh adopt` before writing anything.
+  That re-issue is the only legitimate route: a token copied out of gate state
+  passes the fence by impersonating its holder, which is what the fence exists
+  to prevent (XZO #2046 — the owner on `xzo-pr-pr2055-…` was asked to do
+  exactly that and correctly refused, leaving eight completed lanes
+  unbankable).
+
+  Two properties make that recoverable rather than merely correct on the happy
+  path. **The condition is re-derived, never remembered**: `briefedToken` is
+  journaled with the step only once its brief is on disk, and every fire
+  compares it against the token `_authority` has just proved is the gate's, so
+  a crash anywhere between the claim record and the re-offer leaves the next
+  fire able to finish the transition. An edge trigger on the poll-reclaim
+  branch was not enough — the claim record is fsynced first, so a death between
+  the two records would have left the journal looking done and the owner
+  wedged. **And an ack never outlives the brief it acknowledged**: writing a
+  brief removes `<run>/controller/brief-<step>.ack`, so a re-offered step
+  cannot inherit the previous brief's acknowledgement and be read as already
+  taken. A step briefed under a token that is absent from the journal entirely
+  (a run in flight across an upgrade of this file, which is a live bind mount)
+  is backfilled silently rather than re-offered: absence is not evidence of a
+  re-mint, and the next genuine one is caught because the value is then present
+  and stale.
 
 #### The claim renewer (required alongside the live controller)
 
