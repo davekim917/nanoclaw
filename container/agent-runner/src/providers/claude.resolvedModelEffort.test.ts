@@ -97,11 +97,11 @@ describe('family-default effort follows the RESOLVED model, not the opus alias',
   });
 
   it('test_opus_default_group_gets_opus_family_default', () => {
-    // Opus stays at `high` — the fleet baseline is Opus at high, and becoming
-    // the unpinned default did not lower it (operator decision 2026-09-16).
+    // Opus defaults to `medium` — the fleet baseline (operator decision 2026-09-22;
+    // was `high` from 2026-09-16).
     const o = turn({}, { groupModel: 'claude-opus-5[1m]' });
     expect(o?.model).toBe('claude-opus-5[1m]');
-    expect(o?.effort).toBe('high');
+    expect(o?.effort).toBe('medium');
   });
 });
 
@@ -109,7 +109,7 @@ describe('every other precedence layer is untouched', () => {
   it('test_per_turn_model_still_wins', () => {
     const o = turn({}, { groupModel: 'claude-sonnet-5' }, { model: 'claude-opus-5[1m]' });
     expect(o?.model).toBe('claude-opus-5[1m]');
-    expect(o?.effort).toBe('high');
+    expect(o?.effort).toBe('medium');
   });
 
   it('test_providerConfig_model_still_beats_the_host_default', () => {
@@ -163,7 +163,7 @@ describe('every other precedence layer is untouched', () => {
     // A spawn that carries neither var (unit tests) keeps the last resort.
     const o = turn({}, {});
     expect(o?.model).toBe('opus');
-    expect(o?.effort).toBe('high');
+    expect(o?.effort).toBe('medium');
   });
 
   it('test_clamp_still_refuses_an_unsupported_pairing', () => {
@@ -200,14 +200,14 @@ describe('an unpinned scheduled task lands on the group default, not a literal',
     expect(o?.effort).toBe('xhigh');
   });
 
-  it('test_unpinned_task_on_an_unconfigured_group_is_opus_at_high', () => {
+  it('test_unpinned_task_on_an_unconfigured_group_is_opus_at_medium', () => {
     // The Claude groups with no `model` in container.json. This is the
     // repricing: those groups' unpinned scheduled tasks move here on deploy.
     // Asserted so the cost claim in the PR body is a measured behaviour and
     // not a prediction.
     const o = turn({}, { groupModel: 'claude-opus-5[1m]' }, { model: undefined, effort: undefined });
     expect(o?.model).toBe('claude-opus-5[1m]');
-    expect(o?.effort).toBe('high');
+    expect(o?.effort).toBe('medium');
   });
 
   it('test_a_task_pin_still_overrides_the_group_default', () => {

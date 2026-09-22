@@ -67,7 +67,7 @@ describe('END-TO-END after the deletion', () => {
     expect(r.env.NANOCLAW_CLAUDE_MODEL).toBe('claude-haiku-4-5-20251001');
     // ...and the group's model does NOT become what the word `opus` means:
     // a `model: opus` subagent in a haiku group still gets Opus.
-    expect(r.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5[1m]');
+    expect(r.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5-5[1m]');
     expect(r.env.NANOCLAW_EFFORT_OVERRIDE).toBeUndefined();
     expect(r.model).toBe('claude-haiku-4-5-20251001');
     expect(r.effort).toBeUndefined();
@@ -106,11 +106,11 @@ describe('END-TO-END after the deletion', () => {
     expect(r.effort).toBe('medium');
   });
 
-  it('the unconfigured fleet baseline resolves to Opus [1m] / high', () => {
+  it('the unconfigured fleet baseline resolves to Opus [1m] / medium', () => {
     const r = spawn({});
     console.log('  baseline      -> model=', r.model, ' effort=', r.effort);
-    expect(r.model).toBe('claude-opus-5[1m]');
-    expect(r.effort).toBe('high');
+    expect(r.model).toBe('claude-opus-5-5[1m]');
+    expect(r.effort).toBe('medium');
   });
 
   it('a `model: opus` group pin resolves to Opus even where the group runs Sonnet', () => {
@@ -121,7 +121,7 @@ describe('END-TO-END after the deletion', () => {
     // word meant Sonnet 5, and every `model: opus` subagent silently ran it.
     const r = spawn({ model: 'claude-sonnet-5' });
     expect(r.env.NANOCLAW_CLAUDE_MODEL).toBe('claude-sonnet-5');
-    expect(r.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5[1m]');
+    expect(r.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5-5[1m]');
     expect(r.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-sonnet-5');
     // ...and the group still runs the model it pinned.
     expect(r.model).toBe('claude-sonnet-5');
@@ -131,7 +131,7 @@ describe('END-TO-END after the deletion', () => {
   it('a carried codex model + ultra are still refused at the host', () => {
     const r = spawn({ model: 'gpt-6-astra', effort: 'ultra' });
     console.log('  codex residue -> model=', r.model, ' effort=', r.effort);
-    expect(r.model).toBe('claude-opus-5[1m]');
-    expect(r.effort).toBe('high');
+    expect(r.model).toBe('claude-opus-5-5[1m]');
+    expect(r.effort).toBe('medium');
   });
 });

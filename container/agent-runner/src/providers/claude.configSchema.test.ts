@@ -374,21 +374,21 @@ describe('per-model-family effort defaults', () => {
     }
   };
 
-  it('test_effort_default_opus5_high: flagless turn (opus alias default → Opus 5) gets high', () => {
+  it('test_effort_default_opus_medium: flagless turn (opus alias default) gets medium', () => {
     const opts = run({});
     expect(opts?.model).toBe('opus');
-    expect(opts?.effort).toBe('high');
+    expect(opts?.effort).toBe('medium');
   });
 
-  // The concrete id the `opus` alias now resolves to (claude-opus-5[1m]).
-  // Operator decision 2026-07-27, reaffirmed 2026-09-16: Opus 5 defaults to
-  // `high` for parity with the Codex Sol default, and becoming the unpinned
-  // fleet model did not lower it. The clamp path keeps xhigh available, so an
-  // explicit `-e xhigh` still survives (guarded by the next test).
-  it('test_effort_default_opus5_high_explicit_id: explicit claude-opus-5[1m] defaults to high', () => {
+  // Every concrete opus id shares the family default, not only the one the
+  // `opus` alias resolves to. Operator decision 2026-09-22 (was `high` since
+  // 2026-07-27): Opus defaults to `medium`. The clamp path keeps xhigh
+  // available, so an explicit `-e xhigh` still survives (guarded by the next
+  // test).
+  it('test_effort_default_opus5_medium_explicit_id: explicit claude-opus-5[1m] defaults to medium', () => {
     const opts = run({ model: 'claude-opus-5[1m]' });
     expect(opts?.model).toBe('claude-opus-5[1m]');
-    expect(opts?.effort).toBe('high');
+    expect(opts?.effort).toBe('medium');
   });
 
   it('test_effort_xhigh_on_opus5_not_clamped: an explicit -e xhigh survives on Opus 5', () => {
@@ -436,11 +436,11 @@ describe('per-model-family effort defaults', () => {
     expect(opts?.effort).toBe('xhigh');
   });
 
-  it('test_effort_all_opus_default_high: all opus models (5+, older) default to high', () => {
+  it('test_effort_all_opus_default_medium: all opus models (5+, older) default to medium', () => {
     const flagless = run({ model: 'claude-opus-4-6[1m]' });
-    expect(flagless?.effort).toBe('high');
+    expect(flagless?.effort).toBe('medium');
     const flagless5 = run({ model: 'claude-opus-5[1m]' });
-    expect(flagless5?.effort).toBe('high');
+    expect(flagless5?.effort).toBe('medium');
   });
 
   it('test_effort_xhigh_survives_on_all_opus: explicit -e xhigh passes through on any opus model', () => {
