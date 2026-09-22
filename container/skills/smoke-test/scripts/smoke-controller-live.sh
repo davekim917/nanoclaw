@@ -34,6 +34,9 @@
 #      alarm; entries the journal holds are then removed from the queue.
 #
 # Output: the LAST stdout line is always {"wakeAgent":<bool>,"data":{...}}.
+# With isolated owner routing enabled, failure-only events use durable keyed
+# admission too. An unproven admission exits nonzero for existing script
+# backoff; it never also wakes the shared parent.
 # It wakes the owner for exactly two reasons:
 #   - a due owner judgment step: data carries {step, runId, brief} (the brief
 #     is <run>/controller/brief-<step>.md) for the owner router prompt;
@@ -142,6 +145,15 @@ fail_json() { # <slug> <detail> -- a failure line built with NO tool but bash
     "$(jesc "${ALARM_TEXT//\{slug\}/$1}")"
 }
 
+emit_line() { # failed admission exits nonzero into the existing script backoff
+  if [ -n "${SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON:-}" ]; then
+    printf '%s\n' "$1" | timeout -k 1 6 python3 "$SCRIPT_DIR/smoke-controller-failure-dispatch.py" \
+      --cutover "$SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
 final() { # <data-json> -- the only write to the runner's stdout
   local data="${1:-}"
   if ! jq -e 'type == "object"' <<<"$data" >/dev/null 2>&1; then
@@ -159,22 +171,24 @@ final() { # <data-json> -- the only write to the runner's stdout
     else
       detail="the fire printed no usable summary; see the task stderr"
     fi
-    fail_json "$slug" "$detail" >&3
-    exit 0
+    emit_line "$(fail_json "$slug" "$detail")" >&3
+    exit $?
   fi
   # Two reasons to wake: a well-formed owner step (with {step, runId, brief} on
   # top), or ANY fire that failed closed -- `failure` is the wrapper's whole
   # reporting mechanism, so it must never be rendered as a quiet false.
-  jq -cn --argjson d "$data" '
+  local line
+  line=$(jq -cn --argjson d "$data" '
     ($d.ownerWake // null) as $w
     | if ($w | type) == "object" and ($w.step | type) == "string" and ($w.runId | type) == "string"
          and ($w.brief | type) == "string" and $d.stepped == true
       then {wakeAgent:true, data:({step:$w.step, runId:$w.runId, brief:$w.brief} + ($d | del(.ownerWake)))}
       elif ($d.failure | type) == "string" and ($d.failure | length) > 0
       then {wakeAgent:true, data:($d | del(.ownerWake))}
-      else {wakeAgent:false, data:$d} end' >&3 2>/dev/null ||
-    fail_json final-line-unrenderable "the fire summary could not be rendered (jq unavailable or refused)" >&3
-  exit 0
+      else {wakeAgent:false, data:$d} end' 2>/dev/null) ||
+    line=$(fail_json final-line-unrenderable "the fire summary could not be rendered (jq unavailable or refused)")
+  emit_line "$line" >&3
+  exit $?
 }
 
 BUDGET_MAX=110
