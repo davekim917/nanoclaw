@@ -200,23 +200,22 @@ env_value() { # <key> -- "=<value>" for the last accepted literal, else empty.
   sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$1=('([^']*)'|\"([^\"\$\`\\\\]*)\"|([^[:space:]'\"\$\`\\\\;&|<>()]*))[[:space:]]*(#.*)?\$/=\3\4\5/p" \
     "$ENV_FILE" 2>/dev/null | tail -n 1
 }
-ENV_NAMES_ALL="$(env_names)"
-case "
-$ENV_NAMES_ALL
-" in
-  *"
-SMOKE_GATE_CLAIMANT
-"*)
+ACTIVE_ENV=""
+if [ -f "$ENV_FILE" ]; then
+  ACTIVE_ENV="$(sed '/^[[:space:]]*#/d' "$ENV_FILE" 2>/dev/null)"
+fi
+if [[ "$ACTIVE_ENV" =~ (^|[^A-Za-z0-9_])SMOKE_GATE_CLAIMANT([^A-Za-z0-9_]|$) ]]; then
   # The gate wrapper sources this file for every caller, so a claimant in it
   # would override the one this tick passes per call -- and would stamp the
   # legacy coordinator's calls as the controller's. Same refusal as the live
   # worker (smoke-controller-live-worker.py, the SMOKE_GATE_CLAIMANT branch of
   # load_config and the end_fire it feeds).
-  # Read the assignment/unset names, not warning comments mentioning the key.
-  # Capture before matching: grep -q under pipefail can hide a producer SIGPIPE.
+  # The wrapper SOURCES this file, so shell forms beyond env_names() can
+  # override authority too (readonly, export with multiple names, unset -v).
+  # Ignore only full comment lines; stripping inline '#' would misread quotes.
+  # Conservative refusal of remaining mentions preserves the old guard.
   final misconfigured "the env file assigns SMOKE_GATE_CLAIMANT; nothing renewed"
-  ;;
-esac
+fi
 # CONFIG NEVER TOUCHES THIS SHELL'S OWN VARIABLES. It is collected into a map
 # that becomes the GATE CALL's environment and nothing else. `export
 # "$key=$value"` here would let the env file rename this script's internals --

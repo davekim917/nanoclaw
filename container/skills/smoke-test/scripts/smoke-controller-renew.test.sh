@@ -728,18 +728,23 @@ unset SMOKE_CONTROLLER_GATE_CMD GATE_LOG
 echo "== 10. claimant comments and timezone-independent step age =="
 new_case comment-and-dst
 use_stub_gate
-START="$(/usr/bin/date -u +%s)"
+# Always exercise summer, even when CI runs in winter.
+START="$(/usr/bin/date -u -d '2026-07-15T12:00:00Z' +%s)"
 claim_files "$START"
 in_flight_at "$START"
 printf '\n# Never assign SMOKE_GATE_CLAIMANT here.\n#SMOKE_GATE_CLAIMANT=controller\n' >>"$SMOKE_CONTROLLER_ENV_FILE"
-FAKE_CLOCK_OFFSET=300
+FAKE_CLOCK_OFFSET=$((START + 300 - $(/usr/bin/date -u +%s)))
 for ZONE in UTC America/New_York Europe/London Asia/Tokyo; do
   TZ="$ZONE" tick
   [ "$(field '.data.renewed | length')" = 1 ] || fail "comment or $ZONE prevented live-step renewal: $LAST"
   [ "$(field '.wakeAgent')" = false ] || fail "renewal woke a model in $ZONE"
   ok
 done
-for ASSIGNMENT in 'export SMOKE_GATE_CLAIMANT=controller' 'SMOKE_GATE_CLAIMANT="$OTHER"' 'unset SMOKE_GATE_CLAIMANT'; do
+for ASSIGNMENT in 'export SMOKE_GATE_CLAIMANT=controller' 'SMOKE_GATE_CLAIMANT="$OTHER"' \
+  'unset SMOKE_GATE_CLAIMANT' 'export OTHER=1 SMOKE_GATE_CLAIMANT=controller' \
+  'declare -x SMOKE_GATE_CLAIMANT=controller' 'typeset -x SMOKE_GATE_CLAIMANT=controller' \
+  'readonly SMOKE_GATE_CLAIMANT=controller' 'unset -v SMOKE_GATE_CLAIMANT' \
+  'OTHER="#"; SMOKE_GATE_CLAIMANT=controller'; do
   write_env live
   printf '\n%s\n' "$ASSIGNMENT" >>"$SMOKE_CONTROLLER_ENV_FILE"
   tick
@@ -747,6 +752,13 @@ for ASSIGNMENT in 'export SMOKE_GATE_CLAIMANT=controller' 'SMOKE_GATE_CLAIMANT="
   ok
 done
 unset SMOKE_CONTROLLER_GATE_CMD GATE_LOG
+
+new_case fifo-env
+rm "$SMOKE_CONTROLLER_ENV_FILE"
+mkfifo "$SMOKE_CONTROLLER_ENV_FILE"
+LAST="$(timeout 5 bash "$R" 2>>"$C/renew.err")" || fail 'nonregular env file blocked the renewer'
+[ "$(field '.wakeAgent')" = false ] || fail 'nonregular env file woke a model'
+ok
 
 [ "$FAILURES" = 0 ] || { echo "$FAILURES assertion group(s) FAILED" >&2; exit 1; }
 echo "PASS ($PASSES assertions)"
