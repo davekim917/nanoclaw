@@ -5074,6 +5074,7 @@ describe('outcome reporting — quiet work and expected replies', () => {
 
   it('emits one deterministic liveness row and ties turn-end cleanup to it', async () => {
     insertMessage('liveness-human', 'chat', { sender: 'Operator', senderId: 'U1', text: 'Run the check.' });
+    insertMessage('liveness-human-latest', 'chat', { sender: 'Operator', senderId: 'U1', text: 'Include the API.' });
     const provider = {
       supportsNativeSlashCommands: false,
       registerMemorySessionHook: () => {},
@@ -5082,6 +5083,8 @@ describe('outcome reporting — quiet work and expected replies', () => {
       query: () => {
         async function* events(): AsyncGenerator<ProviderEvent> {
           yield { type: 'init', continuation: 'liveness-session' };
+          yield { type: 'progress', message: '> 💭 Inspecting the request.' };
+          yield { type: 'progress', message: '> 🔧 Running the focused check.' };
           yield { type: 'result', text: '<internal>done</internal>' };
         }
         return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
@@ -5106,13 +5109,20 @@ describe('outcome reporting — quiet work and expected replies', () => {
         if (!turnEnd) await new Promise((resolve) => setTimeout(resolve, 10));
       }
       const statuses = getOutboundDb()
-        .prepare("SELECT id,content FROM messages_out WHERE kind = 'status' ORDER BY seq")
-        .all() as Array<{ id: string; content: string }>;
-      expect(statuses).toHaveLength(1);
+        .prepare("SELECT id,in_reply_to,content FROM messages_out WHERE kind = 'status' ORDER BY seq")
+        .all() as Array<{ id: string; in_reply_to: string | null; content: string }>;
+      expect(statuses).toHaveLength(3);
+      const statusAnchors = statuses.map((row) => row.in_reply_to);
+      expect(new Set(statusAnchors).size).toBe(1);
+      expect(['liveness-human', 'liveness-human-latest']).toContain(statusAnchors[0]);
       expect(JSON.parse(statuses[0]!.content)).toEqual({
         text: 'Accepted · working',
         reporting: { version: 1, purpose: 'liveness', state: 'working' },
       });
+      expect(statuses.slice(1).map((row) => JSON.parse(row.content))).toEqual([
+        { text: '> 💭 Inspecting the request.', reporting: { version: 1, purpose: 'progress' } },
+        { text: '> 🔧 Running the focused check.', reporting: { version: 1, purpose: 'progress' } },
+      ]);
       expect(JSON.parse(turnEnd.content)).toEqual({ action: 'turn_end', lifecycleStatusId: statuses[0]!.id });
     } finally {
       abort.abort();
