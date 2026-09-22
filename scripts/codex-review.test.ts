@@ -2424,6 +2424,12 @@ describe('codex-review risk-scoped review requests', () => {
     // ANYWHERE but the first word must still refuse — the documented receipt
     // format leads with the id, so this is not a legitimate reviewer string.
     ['an allowed id mentioned after a disallowed first token', 'claude-sonnet-5 (fallback from claude-fable-5-1)'],
+    // Near-misses on the OpenCode entry. The allowlisted id is
+    // `deepseek-v4.1-flash` — the `v` is not optional — and it is stored bare
+    // because `assertConcreteModelId` refuses `/`, so the `opencode/` prefix a
+    // reviewer types into `opencode run -m` is NOT the allowed id either.
+    ['a near-miss spelling of an allowed id', 'deepseek-4.1-flash (opencode run)'],
+    ['an allowed id carrying its provider prefix', 'opencode/deepseek-v4.1-flash (opencode run)'],
   ])('refuses a receipt whose --reviewer names %s, a non-allowlisted model, posting nothing', (_case, reviewer) => {
     const root = tempRoot();
     const bodyFile = path.join(root, 'review.md');
@@ -2443,6 +2449,31 @@ describe('codex-review risk-scoped review requests', () => {
     expect(result.status).toBe(2);
     expect(result.posted).toBeNull();
     expect(result.stderr).toContain('reviewer-models.txt');
+  });
+
+  // The generic case above iterates whatever reviewer-models.txt holds, so it
+  // stops covering an id the moment that id is dropped. This one names the
+  // OpenCode entry literally: adding it widened who may approve a merge, and
+  // that widening should fail loudly if it is ever half-reverted (id dropped
+  // from FRONTIER_MODELS, or the file regenerated without it).
+  it('accepts a receipt from the OpenCode frontier entry, deepseek-v4.1-flash', () => {
+    const root = tempRoot();
+    const bodyFile = path.join(root, 'review.md');
+    fs.writeFileSync(bodyFile, 'Scope: complete diff.\n');
+
+    const result = runHelper(root, [
+      'receipt',
+      '--head',
+      HEAD,
+      '--outcome',
+      'approve',
+      '--reviewer',
+      'deepseek-v4.1-flash (opencode run)',
+      '--body-file',
+      bodyFile,
+    ]);
+    expect(result.status, `refused: ${result.stderr}`).toBe(0);
+    expect(result.posted).toContain('- **Reviewer and runtime:** deepseek-v4.1-flash (opencode run)');
   });
 
   it('accepts a receipt whose --reviewer names every listed model id, including a [1m] form', () => {
