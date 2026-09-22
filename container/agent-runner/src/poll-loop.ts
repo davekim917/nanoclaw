@@ -21,17 +21,17 @@ import { touchHeartbeat } from './heartbeat.js';
 import { clearStaleProcessingAcks } from './db/container-state.js';
 import {
   clearContinuation,
-  clearCurrentLifecycleStatus,
   clearCurrentInReplyTo,
-  getCurrentLifecycleStatus,
   migrateLegacyContinuation,
-  rememberRequestCandidates,
-  setCurrentLifecycleStatus,
   setContinuation,
   setCurrentInReplyTo,
 } from './db/session-state.js';
 import {
   advanceMemoryContextEpoch,
+  clearCurrentLifecycleStatus,
+  getCurrentLifecycleStatus,
+  rememberRequestCandidates,
+  setCurrentLifecycleStatus,
   beginProviderBusyScope,
   classifyTrigger,
   hasChatOutboundAfter,
