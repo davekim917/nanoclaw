@@ -37,8 +37,18 @@ export const REVIEWER_MODELS_OUTPUT_PATH = path.join(REPO_ROOT, 'container/skill
 /**
  * The frontier model per provider — who reviews today. Changing a tier means
  * editing this list and running `pnpm run reviewer-models -- --write`.
+ *
+ * `deepseek-v4.1-flash` is reached through the locally installed OpenCode CLI
+ * (`opencode run -m opencode/deepseek-v4.1-flash`, or the `opencode-go/` provider),
+ * which is a third capacity pool: on 2026-09-22 every Anthropic and OpenAI
+ * reviewer hit a rate limit within the same hour and a one-line test fix on a
+ * green PR was nearly unmergeable, because the gate requires a reviewer from
+ * this list and there was none left. The id is stored bare, without the
+ * `opencode/` provider prefix, because `assertConcreteModelId` refuses `/` —
+ * and the gate matches the FIRST WHITESPACE-SEPARATED TOKEN of `--reviewer`,
+ * so a receipt names it as `deepseek-v4.1-flash <effort> (OpenCode …)`.
  */
-const FRONTIER_MODELS = ['claude-opus-5', 'gpt-5.6-sol'];
+const FRONTIER_MODELS = ['claude-opus-5', 'gpt-5.6-sol', 'deepseek-v4.1-flash'];
 
 // Receipt compatibility only: these models remain eligible so an unchanged
 // exact-head receipt does not expire when dispatch defaults change.
