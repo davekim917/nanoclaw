@@ -319,8 +319,8 @@ function statusSubtextEnabled(): boolean {
  * Stamp the status subtext onto an outbound chat payload, or return it
  * unchanged.
  *
- * THIS IS THE ONLY STAMPING SITE, and it sits at the shared outbound seam
- * (db/messages-out.ts) rather than at any one sender. There are two unrelated
+ * THIS IS THE ONLY STAMPING DECISION. It is called through `withStatusSubtext`
+ * at each reply call site (see there for why not inside `writeMessageOut`). There are two unrelated
  * ways an agent's reply reaches a conversation, and which one runs depends on
  * a config flag most installs never touch:
  *
@@ -375,4 +375,23 @@ export function stampStatusSubtext(msg: {
   if (Object.prototype.hasOwnProperty.call(payload, 'subtext')) return msg.content;
   payload.subtext = subtext;
   return JSON.stringify(payload);
+}
+
+/**
+ * Stamp a row at its call site, then strip the marker before the write.
+ *
+ * WHY AT THE CALL SITE and not inside `writeMessageOut`: `db/messages-out.ts`
+ * is a byte-identical upstream shim, guarded by src/mailbox/UPSTREAM-MANIFEST.json
+ * (the drift lane fails on any edit). It also builds the mailbox payload field
+ * by field, so a marker on the row could never reach a mailbox override. And a
+ * seam bought nothing here: every stampable row already needs an explicit
+ * `agentReply` at its call site, so the three sites that set it are exactly the
+ * three that call this — `sendToDestination`, `deliverErrorResult` (poll-loop)
+ * and `send_message` (mcp-tools/core.ts).
+ */
+export function withStatusSubtext<
+  T extends { kind: string; channel_type?: string | null; platform_id?: string | null; content: string },
+>(row: T & { agentReply?: boolean }): T {
+  const { agentReply, ...rest } = row;
+  return { ...(rest as unknown as T), content: stampStatusSubtext({ ...rest, agentReply }) };
 }
