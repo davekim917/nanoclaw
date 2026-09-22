@@ -36,6 +36,7 @@ import { conversationDisplayName } from './adapter.js';
 import type { ChannelConversation, ChannelDefaults, ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { extractSlackRawText } from './slack-raw-text.js';
+import { installSlackSubtextBlocks } from './slack-subtext.js';
 import { createSlackHopGovernor, type SlackHopGovernor } from './slack-hop-limit.js';
 import {
   fetchSlackBotIdentity,
@@ -719,6 +720,10 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
       // its own dedup keyspace. The name also keys `chat.webhooks[...]` so
       // the webhook-server lookup matches.
       (slackAdapter as unknown as { name: string }).name = ws.channelType;
+      // Status subtext → Block Kit context block. Installed here, beside the
+      // adapter, because it wraps the adapter's own Web client; see
+      // slack-subtext.ts for why the rewrite happens at that layer.
+      installSlackSubtextBlocks(slackAdapter);
       const client = new WebClient(ws.botToken);
 
       // Discover this bot's identity before building the bridge. Setup publishes
@@ -754,6 +759,10 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
         // markdownHeadingsToBold only touches line-anchored `#` prefixes,
         // so order is independent for correctness but consistent for
         // intent.
+        // Slack renders the subtext as a Block Kit context block. The body
+        // only has to carry it this far — installSlackSubtextBlocks above
+        // reads it off the body and rewrites the outgoing payload.
+        renderSubtext: (body, subtext) => ({ ...body, subtext }),
         transformOutboundMarkdown: (text) => {
           // A bot has no legitimate reason to emit a raw bot <@id> — it only
           // shows up when the model echoes the inbound mention wire form

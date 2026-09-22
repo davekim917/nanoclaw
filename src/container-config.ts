@@ -717,6 +717,21 @@ export type { ExcludedPlugins } from './plugin-exclusions.js';
 export interface ContainerConfig {
   /** Structured reporting override. Absent is the fleet default; false is rollback. */
   outcomeReporting?: boolean;
+  /**
+   * Stamp the model/effort/context subtext under this group's own replies.
+   *
+   * ON everywhere unless a group sets `false`, because the whole point is the
+   * operator not having to remember what a long-lived thread is running on.
+   * The opt-out is per group rather than fleet-wide: the groups that want it
+   * silenced are the ones whose conversations include people outside the
+   * fleet, for whom the line is noise and a small disclosure of how the fleet
+   * is configured.
+   *
+   * Read by the runner straight out of the bind-mounted container.json
+   * (`container/agent-runner/src/config.ts`); the host only needs to preserve
+   * it across a read-modify-write of this file.
+   */
+  statusSubtext?: boolean;
   /** Physical channel addresses whose routine outcomes belong to an existing external reporter. */
   outcomeReportingExternalChannels?: string[];
   /** Host-enrolled wiki actors fail closed if their private policy is absent. */
@@ -1323,6 +1338,13 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
   return {
     wikiMaintenance: raw.wikiMaintenance,
     outcomeReporting: raw.outcomeReporting,
+    // Only an explicit `false` opts out. A missing key, a null, or a
+    // non-boolean is the default ON — a malformed config must not silently
+    // strip a signal the operator relies on, and silence is the state that has
+    // to be asked for. `undefined` here keeps the key out of a rewritten
+    // container.json, so a group that never opted out does not accumulate a
+    // field it did not set.
+    statusSubtext: raw.statusSubtext === false ? false : undefined,
     outcomeReportingExternalChannels: Array.isArray(raw.outcomeReportingExternalChannels)
       ? raw.outcomeReportingExternalChannels.filter((value): value is string => typeof value === 'string')
       : [],
@@ -1371,6 +1393,18 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
     workgroup_id: raw.workgroup_id,
     slack_user_token: raw.slack_user_token,
   };
+}
+
+/**
+ * Fleet default without materializing it into operator-owned container.json.
+ *
+ * Mirrors effectiveOutcomeReporting: only an explicit `false` opts out, so a
+ * missing key reads as ON. Callers that show an operator what a group is set
+ * to must present BOTH this and the stored value — "unset" and "explicitly on"
+ * are the same behaviour but not the same operator intent.
+ */
+export function effectiveStatusSubtext(config: Pick<ContainerConfig, 'statusSubtext'>): boolean {
+  return config.statusSubtext !== false;
 }
 
 /** Fleet default without materializing it into operator-owned container.json. */

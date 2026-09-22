@@ -66,6 +66,9 @@ export class MockProvider implements AgentProvider {
       // Mocks must name a model too: a mock that silently reports nothing is
       // how a test can pass while the ledger records NULL in production.
       resolvedModel: input.model ?? MOCK_RESOLVED_MODEL,
+      // Same reasoning: a mock reporting nothing is how a test passes while
+      // the real thing shows a blank or stale effort.
+      resolvedEffort: input.effort ?? null,
       push(message: string) {
         pending.push(message);
         waiting?.();

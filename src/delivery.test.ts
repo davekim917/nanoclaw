@@ -3532,6 +3532,36 @@ describe('per-work-item outcome delivery', () => {
     insertOutboundKind(
       'ag-1',
       session.id,
+      'wrong-turn-progress',
+      'status',
+      'telegram',
+      'telegram:123',
+      { text: '> 💭 Belongs to another turn.', reporting: { version: 1, purpose: 'progress' } },
+      null,
+      'human-request-2',
+    );
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
+
+    _resetStatusTrackingForTest();
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'wrong-thread-progress',
+      'status',
+      'telegram',
+      'telegram:123',
+      { text: '> 💭 Belongs to another thread.', reporting: { version: 1, purpose: 'progress' } },
+      'other-thread',
+      'human-request-1',
+    );
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
+
+    _resetStatusTrackingForTest();
+    insertOutboundKind(
+      'ag-1',
+      session.id,
       'progress-1',
       'status',
       'telegram',

@@ -54,6 +54,7 @@ import { CodexTurnLiveness, isCodexTerminalTurnItem, normalizeCodexThreadStatus 
 import { CodexRateLimitTracker } from './codex-rate-limit-tracker.js';
 import type { CodexRateLimitPark } from './codex-rate-limits.js';
 import { attachTurnEffort } from './turn-effort.js';
+import { recordContextTokens } from '../turn-status.js';
 
 /**
  * Health watchdog for a single turn. Guards against codex-app-server wedging
@@ -1685,6 +1686,9 @@ export class CodexProvider implements AgentProvider {
       // names a model (`stickyConfig.model ?? CODEX_MODEL ?? DEFAULT_CODEX_MODEL`), so
       // there is no unknown case here.
       resolvedModel: effectiveModel,
+      // The effort the app-server was actually configured with, not the `-e`
+      // that asked for it — same value `turnEffort.effective` reports (:1239).
+      resolvedEffort: effectiveConfig.reasoning_effort ?? null,
       push: (message: string) => {
         // If a turn is in flight, steer it instead of queueing — the agent's
         // response can then reference the late-arriving content. Falls back
@@ -2280,6 +2284,25 @@ export async function* runOneTurn(
         const usageKey = usage && 'total' in usage ? JSON.stringify(usage) : null;
         const isRepeat = usageKey !== null && usageKey === turnAccum.lastUsageKey;
         turnAccum.lastUsageKey = usageKey;
+
+        // Context occupancy for the status subtext, taken from Codex's OWN
+        // definition: `TokenUsage::tokens_in_context_window()` returns
+        // `total_tokens` (codex-rs/protocol/src/protocol.rs). It is read off
+        // `last` — one request — never off the thread-scoped running counter,
+        // which survives respawns and measures the thread, not the window.
+        //
+        // Deliberately NOT `inputTokens + cachedInputTokens`: in this protocol
+        // `cached_input_tokens` is a SUBSET of `input_tokens` (the same source
+        // defines `non_cached_input() = input_tokens - cached_input()`), so
+        // summing them double-counts the cached prefix. The opposite of
+        // Anthropic's convention, where the three prompt counters are disjoint
+        // — which is why each provider reports a finished figure here instead
+        // of handing raw fields to a shared seam.
+        //
+        // Unlike the accumulator below, this is a LATEST-WINS reading, so it
+        // needs no duplicate guard: a re-emitted payload re-reports the same
+        // window and overwrites the value with itself.
+        if (last) recordContextTokens(last.totalTokens);
 
         if (last && !isRepeat) {
           turnAccum.seen = true;

@@ -4,6 +4,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 import { getAgentMailbox } from '../mailbox/index.js';
+import { stampStatusSubtext } from '../turn-status.js';
 import type { OutboundMessage } from '../mailbox/types.js';
 
 export interface MessageOutRow {
@@ -22,6 +23,22 @@ export interface MessageOutRow {
 
 export interface WriteMessageOut {
   id: string;
+  /**
+   * This row carries the agent's own reply text, and may be stamped with the
+   * status subtext.
+   *
+   * OPT-IN, and deliberately not inferable. `kind: 'chat'` is far broader than
+   * "a reply the agent composed": `send_file` writes captions and attachment
+   * metadata as chat (mcp-tools/core.ts:480), and the runner posts its own
+   * chat notices such as the `/clear` acknowledgement (poll-loop.ts:653).
+   * Stamping those would put a model/effort line under a file upload, and
+   * under infra text that no turn authored — with whatever model/effort the
+   * PREVIOUS turn happened to leave in the store.
+   *
+   * Never persisted: writeMessageOut builds the mailbox payload field by
+   * field, so this one is read and dropped.
+   */
+  agentReply?: boolean;
   in_reply_to?: string | null;
   deliver_after?: string | null;
   recurrence?: string | null;
@@ -101,7 +118,11 @@ export function writeMessageOut(msg: WriteMessageOut): Promise<number> {
     platformId: msg.platform_id,
     channelType: msg.channel_type,
     threadId: msg.thread_id,
-    content: decorateContent(msg),
+    // Status subtext rides here, at the ONE seam every outbound row crosses,
+    // because the agent's reply reaches a conversation by two unrelated paths
+    // (`<message>` envelopes and the `send_message` MCP tool) and which one
+    // runs depends on a config flag. See stampStatusSubtext for the full why.
+    content: stampStatusSubtext({ ...msg, content: decorateContent(msg) }),
   });
 }
 
