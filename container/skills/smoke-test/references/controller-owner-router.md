@@ -43,7 +43,17 @@ to the retained technical owner, verify its artifact receipt, and stop.
    `<run>/`. Source `/workspace/agent/smoke-gate-env.sh` before any direct
    `smoke-run-scaffold.sh` or `smoke-evidence-barrier.sh` call. For a scaffold
    writer, pass `SMOKE_GATE_OWNER=<coordinatorOwnerToken>` from
-   `<run>/controller/wake.json`.
+   `<run>/controller/wake.json` — **re-read that file on every wake, not once
+   at intake.** The controller refreshes it with each brief, because a recovery
+   `poll` re-mints the run's coordinator lease under a new token and the one
+   you started with is then retired (XZO #2046).
+   - A brief headed **YOUR OWNER TOKEN CHANGED** means exactly that happened
+     mid-step. Export the token now in `wake.json` and run
+     `smoke-run-scaffold.sh adopt <run> <sourceSha>` before any further
+     artifact write. That is the whole recovery. Never take a token from gate
+     state, from another agent's file, or by setting `SMOKE_GATE_CLAIMANT` —
+     the fence *is* the authorization, and passing it with a borrowed value is
+     impersonation, not adoption.
 4. On `lanes` and `synthesis`, read `<run>/controller/barrier-<step>.json`
    before you start and again before you stop. The controller rewrites it every
    fire from the real `smoke-evidence-barrier.sh` and deletes it once the phase

@@ -1638,8 +1638,8 @@ Two scope rules keep that from becoming a hole:
 
 #### What the controller must tell the owner
 
-The controller knows things per fire that the owner cannot see and cannot do
-its job without, and they used to stay in the controller's own journal.
+The controller knows two things per fire that the owner cannot see and cannot
+do its job without. Both used to stay in the controller's own journal.
 
 - **The barrier's answer.** On every `lanes` and `synthesis` fire the
   controller writes the real `smoke-evidence-barrier.sh` output to
@@ -1651,6 +1651,20 @@ its job without, and they used to stay in the controller's own journal.
   `journeys/scope-dispositions.json` invalid on the first lanes fire — the
   journal said so, the brief did not, and the owner found out by running the
   barrier by hand.
+- **A re-minted owner token.** `poll` mints a fresh coordinator owner token on
+  every same-SHA recovery (`smoke-pr-gate.sh:5312`), which is how a coordinator
+  that died is recovered and is not negotiable; `adopt`'s fence adds no
+  authority check of its own, which is what makes it safe and is also not
+  negotiable. The gap was the owner in between: `controller/wake.json` is the
+  only file that carries the token to it, and it was written once, at intake.
+  It is now refreshed with **every** brief, and a poll that re-mints while an
+  owner step is in flight re-offers that step with a brief headed **YOUR OWNER
+  TOKEN CHANGED**, telling the owner to re-read `wake.json` and run
+  `smoke-run-scaffold.sh adopt` before writing anything. That re-issue is the
+  only legitimate route: a token copied out of gate state passes the fence by
+  impersonating its holder, which is what the fence exists to prevent
+  (XZO #2046 — the owner on `xzo-pr-pr2055-…` was asked to do exactly that and
+  correctly refused, leaving eight completed lanes unbankable).
 
 #### The claim renewer (required alongside the live controller)
 

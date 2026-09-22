@@ -922,4 +922,74 @@ grep -q 'controller/barrier-lanes.json' "$R/controller/brief-lanes.md" \
 grep -q 'CHECK THE BARRIER, DO NOT ASSUME IT' "$R/controller/brief-lanes.md" \
   || fail "#2047: a barrier that is only waiting for markers must not shout like one refusing content"
 
+# --- XZO #2046: a re-minted owner token must be re-ISSUED to the owner --------
+# Same run. The controller's fires stopped for 40 minutes (19:51:19Z ->
+# 20:31:42Z, wrapper/fires.ndjson) while the gate's coordinator lease is 900 s
+# (smoke-pr-gate.sh:220), so the lease lapsed under a live owner and its eight
+# completed lanes were refused their markers. The next `poll` then did what it
+# is supposed to do on a stale run: it resumed the run id and minted a FRESH
+# owner token (smoke-pr-gate.sh:5312 -> :5347/:5349/:5389). The controller
+# picked the new token up for itself, and stopped there. controller/wake.json --
+# the only file that carries the token to the owner, and the file the intake
+# brief tells it to read -- still named the retired one, and the lanes brief is
+# re-offered only while its `.ack` is ABSENT, which it was not. So the owner the
+# controller itself dispatched could satisfy neither begin_active_run_fence nor
+# `adopt`, the verb that exists for exactly this transition. It correctly
+# refused to work around it and the campaign ended BLOCKED with 4 of 14 markers.
+#
+# Neither the re-mint nor adopt's fence is the defect: the missing step is the
+# controller re-issuing the token it just received to the owner it dispatched.
+new_case ctl-2046-owner-token-reissued
+campaign 2   # contract + critic in, the lanes step enqueued under $TOKEN
+# The simulated owner acks at the START of a tick, so the brief written by the
+# last fire is acked here -- the same state the real run was in at 20:31Z.
+for b in "$R"/controller/brief-*.md; do [ -e "${b%.md}.ack" ] || : >"${b%.md}.ack"; done
+jq -e --arg t "$TOKEN" '.coordinatorOwnerToken == $t' "$R/controller/wake.json" >/dev/null \
+  || fail "#2046: precondition -- the run tree should hold the original token"
+STEP_BEFORE="$(jq -sr '[.[] | select(.kind=="owner" and .state=="enqueued")] | last | .slot' "$C/out/journal.ndjson")"
+[ -n "$STEP_BEFORE" ] && [ "$STEP_BEFORE" != null ] || fail "#2046: precondition -- no owner step is in flight"
+[ -e "$R/controller/brief-$STEP_BEFORE.ack" ] || fail "#2046: precondition -- the owner never acked $STEP_BEFORE"
+
+REMINT=owner-ctl-remint-2222
+claim "" controller "$REMINT"
+jq -c --arg t "$REMINT" '.data.coordinatorOwnerToken = $t' "$C/wake.json" >"$C/wake-remint.json"
+inputs_from_fakes
+step_ok "$(tick_time 3)" --poll-json "$C/wake-remint.json"
+
+jq -e --arg t "$REMINT" '.coordinatorOwnerToken == $t' "$R/controller/wake.json" >/dev/null \
+  || fail "#2046: the re-minted token was never issued to the owner (wake.json still names the retired one)"
+grep -q 'YOUR OWNER TOKEN CHANGED' "$R/controller/brief-$STEP_BEFORE.md" \
+  || fail "#2046: the re-offered brief does not tell the owner its token changed"
+grep -q 'smoke-run-scaffold.sh adopt' "$R/controller/brief-$STEP_BEFORE.md" \
+  || fail "#2046: the re-offered brief does not name the one legitimate recovery, adopt"
+grep -q 'Do NOT copy a token out of gate state' "$R/controller/brief-$STEP_BEFORE.md" \
+  || fail "#2046: the brief does not rule out the impersonation route the run's own recovery record refused"
+jq -se --arg s "$STEP_BEFORE" '[.[] | select(.kind=="owner" and .slot==$s and .state=="intent"
+       and (.detail.tokenReissued == true))] | length == 1' "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2046: the in-flight owner step was not re-offered for adoption"
+jq -se '[.[] | select(.kind=="send" and (.slot | startswith("alarm:token-reissued:")))] | length > 0' \
+  "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2046: a mid-run owner-token re-mint is not alarmed"
+# The owner is woken again -- a brief nobody is told to re-read is not an issue.
+[ "$(jq -r '.ownerWake.step // ""' <<<"$STEP_OUT")" = "$STEP_BEFORE" ] \
+  || fail "#2046: the owner was not re-woken for the step it must adopt into: $STEP_OUT"
+
+# Re-running the same fire hands the token over exactly once.
+BEFORE_LINES="$(wc -l <"$C/out/journal.ndjson")"
+step_ok "$(tick_time 3)" --poll-json "$C/wake-remint.json"
+jq -se --arg s "$STEP_BEFORE" '[.[] | select(.kind=="owner" and .slot==$s and .state=="intent"
+       and (.detail.tokenReissued == true))] | length == 1' "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2046: the retry of the same fire re-offered the step a second time ($BEFORE_LINES lines before)"
+# A step that is over is never re-offered: nothing is in flight to adopt into.
+new_case ctl-2046-no-reissue-without-a-step-in-flight
+campaign 6
+REMINT=owner-ctl-remint-3333
+claim "" controller "$REMINT"
+jq -c --arg t "$REMINT" '.data.coordinatorOwnerToken = $t' "$C/wake.json" >"$C/wake-remint.json"
+inputs_from_fakes
+step_ok "$(tick_time 7)" --poll-json "$C/wake-remint.json"
+jq -se '[.[] | select(.kind=="owner" and .state=="intent" and (.detail.tokenReissued == true))] | length == 0' \
+  "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2046: a finished run re-offered an owner step it has no use for"
+
 echo "smoke campaign controller live tests passed"

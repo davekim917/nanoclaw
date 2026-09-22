@@ -1215,7 +1215,22 @@ class EffectLayer:
             step=step, run_id=run_id, pr=c["pr"], sha=c["sha"], run=run)
         body = OWNER_BRIEF.get(step, "Step {}: see the owner router.".format(step)).format(run=run)
         root = self.ctl.args.run_root
-        if step == "intake" and c.get("wake"):
+        # THE WAKE IS THE ONLY PLACE THE OWNER LEARNS ITS OWNER TOKEN -- the
+        # intake brief says so in as many words ("use its coordinatorOwnerToken
+        # as SMOKE_GATE_OWNER for every smoke-run-scaffold.sh writer"). But the
+        # gate mints a FRESH token on every same-run recovery poll
+        # (smoke-pr-gate.sh:5312, written to lease/authority/state at :5341,
+        # :5346, :5389), and reconcile_claims records the new one the wake
+        # carries. Writing wake.json only at intake left the run tree naming a
+        # RETIRED token while the brief still told the owner to use it: every
+        # scaffold write, and `adopt` -- the verb that exists for exactly this
+        # transition (smoke-run-scaffold.sh:679, and its own header says so) --
+        # then dies in begin_active_run_fence's owner check
+        # (smoke-run-scaffold.sh:267-269)
+        # with no legitimate way back. XZO #2046, run
+        # xzo-pr-pr2055-dacf01328421-20260921T193111Z. It is refreshed on EVERY
+        # step so the file the brief points at always names the live token.
+        if c.get("wake"):
             write_contained_atomic(root, [run_id, "controller", "wake.json"],
                                    json.dumps(c["wake"], sort_keys=True, indent=1) + "\n")
         notes = self._brief_notes(run_id, step, run, c)
@@ -1260,9 +1275,21 @@ class EffectLayer:
 
     def _brief_notes(self, run_id, step, run, claim):
         """Run-specific preamble the STATIC OWNER_BRIEF template cannot carry:
-        what this fire's barrier refused. The controller already knows it at
-        the moment it writes the brief, and used to keep it to its journal."""
+        what this fire's barrier refused, and whether the owner's token was
+        reissued under it. Both are things the controller already knows at the
+        moment it writes the brief and used to keep to its own journal."""
         out = []
+        ob = self.ctl.obligations().get(obligation_key(run_id, "owner", step)) or {}
+        if (ob.get("detail") or {}).get("tokenReissued"):
+            out.append(
+                "**YOUR OWNER TOKEN CHANGED (XZO #2046).** A recovery `poll` re-minted this run's coordinator "
+                "lease under a fresh token, so the one you have been using is retired and every "
+                "`smoke-run-scaffold.sh` write will be refused by its owner fence. Re-read "
+                "`{run}/controller/wake.json` (refreshed with this brief), export its `coordinatorOwnerToken` as "
+                "`SMOKE_GATE_OWNER`, and run `smoke-run-scaffold.sh adopt {run} {sha}` BEFORE any further "
+                "artifact write. Do NOT copy a token out of gate state or any other actor's file: the one in "
+                "wake.json is issued to you, which is what makes the adoption an adoption.".format(
+                    run=run, sha=claim.get("sha") or "<frozen source sha>"))
         if step in BARRIER_STEPS:
             report = os.path.join(run, "controller", "barrier-{}.json".format(step))
             # The loud lead is for CONTENT the barrier rejects -- the thing only
@@ -2089,6 +2116,42 @@ class Controller:
                                       "recoveredFromGateState": True}
         return detail
 
+    def _reissue_owner_token(self, run_id, obs):
+        """A recovery poll re-minted this run's lease under a fresh token while
+        an owner step was IN FLIGHT. XZO #2046.
+
+        The gate is right to re-mint (that is how a coordinator that died is
+        recovered) and `adopt`'s fence is right to refuse a stale owner
+        (smoke-run-scaffold.sh:267-269, and `adopt` adds no authority check of
+        its own, :690-694). What was missing is the third party: the owner THIS
+        controller dispatched holds the retired token and has no way to learn
+        the new one, because `controller/wake.json` -- the only file that
+        carries it, and the file the intake brief names -- was written once, at
+        intake, and the step's brief is re-offered only while its `.ack` is
+        ABSENT (owner_step, :2068-2078), which it is not. So the owner the
+        controller itself dispatched can never satisfy the fence, and stops --
+        which is the correct behaviour, and why run pr2055 banked 4 of 14
+        markers with the other 8 lanes' evidence complete on disk.
+
+        The fix is to re-OFFER the step. Recording it back to `intent` makes
+        owner_step perform its wake again, which rewrites wake.json with the
+        live token (the only legitimate issue path -- copying the token out of
+        gate state is impersonation, not adoption) and writes a brief whose
+        _brief_notes preamble says to run `adopt` before anything else.
+        `abandoned`/`failed_terminal`/`done` steps are left alone: nothing is
+        in flight to re-offer."""
+        for ob in list(obs.values()):
+            if ob["runId"] != run_id or ob["kind"] != "owner" or ob["state"] != "enqueued":
+                continue
+            self.ensure_alarm(run_id, "controller_owner_token_reissued",
+                              "token-reissued:{}".format(run_id[-40:]),
+                              {"step": ob["slot"],
+                               "reason": "a recovery poll re-minted this run's lease; the dispatched owner must "
+                                         "re-read controller/wake.json and run scaffold `adopt` before writing"})
+            self.record(run_id, "owner", ob["slot"], "intent", ob["attempt"] or 1, {"tokenReissued": True})
+            self.decide(run_id, ob["slot"], "wake_owner", "coordination_model",
+                        "owner token reissued; step re-offered for adoption", step=ob["slot"])
+
     def _legacy_hold(self, run_id, why):
         """A legacy run surfaced to the controller (a poll wake after its
         coordinator went quiet). It is never adopted: journaled under the
@@ -2162,6 +2225,7 @@ class Controller:
                     # new token, and only the wake may hand one over.
                     self.record(run, "run", "claim", "enqueued", 1, dict(self._claim_detail(wake, "poll-reclaim"),
                                                                          reclaimed=True))
+                    self._reissue_owner_token(run, obs)
                 obs = self.obligations()
         for run, claim in sorted(claims.items()):
             if not RUN_ID_RE.match(run) or run.startswith(PSEUDO_PREFIX) or run in self.legacy:
