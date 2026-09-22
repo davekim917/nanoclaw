@@ -59,8 +59,9 @@ ncl groups config update --id <ag-id> --model opus --effort medium            # 
 ```
 
 - **Subagent defs** live in `groups/<g>/.claude/agents/*.md` (frontmatter `model:`/`effort:`) and `.codex/agents/*.toml` (`model`/`model_reasoning_effort`). Edit only the frontmatter lines. Another session may have uncommitted edits in the same file, so check `git -C groups status` first. Keep model names out of descriptions and prose, because config is the only place a model is named.
-- **Stickies** (`sticky_model` in a session's `outbound.db`) override the group and channel for that session only. They come from someone typing `-m` and are not moved by a bump. Report them. Clear one only when asked.
+- **Stickies** (`sticky_model` in a session's `outbound.db`) override the group and channel for that session only. They come from someone typing `-m` and are not moved by a bump. Report them. Clear one only when asked. There is no `ncl` verb. The container owns `outbound.db`, so write to it only while that session's container is stopped: check `sessions.container_status` and the `nanoclaw-session` label in `docker ps`. Then delete the `sticky_model`/`sticky_effort` rows from `session_state`, or upsert new values. `src/session-close-expiry.ts` already writes `session_state` from the host under the same condition.
 - A group model governs chat and scheduled work alike. There is no "Opus for chat, cheaper for tasks" knob. Use task pins for that.
+- **A task pin covers the task's own fires only.** A human reply in the thread of a task's post routes to that channel's thread session, never back to the task session (the router has no task-thread routing). That session resolves in this order: sticky → channel wiring → group `container.json` → install default. For follow-ups to keep the task's model, set it on the destination channel's wiring, which also covers every other thread in that channel.
 
 Wiring and group changes apply at the next container spawn. Task pins apply at the next fire.
 
