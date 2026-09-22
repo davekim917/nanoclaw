@@ -27,7 +27,7 @@ pnpm exec tsx -e "import Database from 'better-sqlite3'; import fs from 'fs'; fo
 
 A session sticky moves only when someone in that thread sends `-m sol` (or `-m ''` to clear it back to the group's model). There is no `ncl` verb for it. The container owns `outbound.db`, so an operator writes to it only while that session's container is stopped: delete the `sticky_model` row from `session_state`.
 
-**Why.** GPT-6 Sol and Luna are the GPT-6 successors to the 5.6 tiers, announced by OpenAI on 2026-09-22 at lower API prices. Neither id is in Codex's bundled model catalog (0.155.1 or 0.156.0); both are served on 0.155.1 and 0.156.0, so Codex runs them on fallback metadata and warns about it. The server gates them by client version, as measured above.
+**Why.** GPT-6 Sol and Luna are the GPT-6 successors to the 5.6 tiers, announced by OpenAI on 2026-09-22 at lower API prices. Neither id is in Codex's bundled model catalog. Under ChatGPT-account auth, codex-cli 0.155.1 and later get them from the server catalog (`~/.codex/models_cache.json`): `gpt-6-sol` supports `low` through `ultra`, and `gpt-6-luna` supports `low` through `max`. 0.154.0 has no metadata for them and falls back, and the server then refuses the request. `setup/lib/codex-model-min-cli.test.ts` fails if the default or the `sol`/`luna` aliases name a GPT-6 model while `versions.json` pins an older CLI.
 
 **Fix: keep 5.6 on a path, before deploying.** Pins are data and need no deploy:
 
