@@ -9,7 +9,12 @@
  * processing-ack sync. See docs/specs/upstream-mailbox-seam/plan.md §4.2.
  */
 import type Database from 'better-sqlite3';
-import { dispatchTaskEvent, type TaskDispatchInput, type TaskDispatchResult } from './ops/task-dispatch.js';
+import {
+  dispatchTaskEvent,
+  hasTaskDispatchEvents,
+  type TaskDispatchInput,
+  type TaskDispatchResult,
+} from './ops/task-dispatch.js';
 import { readTaskSettlement, type TaskSettlement } from './ops/task-settlement.js';
 export { dispatchSeriesId, dispatchEventId, validateDispatchKey } from './ops/task-dispatch.js';
 
@@ -487,6 +492,7 @@ export interface NanoclawMailboxSession extends MailboxSession {
   /** Fork insert: routing columns, and `trigger = 0` so the row lands inert. */
   insertTaskRow(row: TaskRowInsert): void;
   dispatchTaskEvent(input: TaskDispatchInput): TaskDispatchResult;
+  hasTaskDispatchEvents(): boolean;
   readTaskSettlement(eventId: string, threadId: string | null, observer?: boolean): TaskSettlement;
   /** Fork resume: also drops the stale recall pair and re-seqs the occurrence. */
   resumeTask(taskId: string): number;
@@ -1238,6 +1244,7 @@ function forkOps(
 
     insertTaskRow: (row) => insertTaskRow(inbound, row),
     dispatchTaskEvent: (input) => dispatchTaskEvent(inbound, input, outboundPresent ? readableOutbound() : null),
+    hasTaskDispatchEvents: () => hasTaskDispatchEvents(inbound),
     readTaskSettlement: (eventId, threadId, observer) =>
       readTaskSettlement(inbound, outboundPresent ? readableOutbound() : null, eventId, threadId, observer),
     resumeTask: (taskId) => resumeTask(inbound, taskId),

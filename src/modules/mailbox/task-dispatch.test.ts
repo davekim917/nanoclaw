@@ -155,6 +155,14 @@ describe('keyed task admission and settlement', () => {
       .prepare("INSERT INTO delivered(message_out_id,status,delivered_at) VALUES('wait','delivered',?)")
       .run(new Date().toISOString());
     expect(read().state).toBe('settled');
+    inbound.prepare("UPDATE delivered SET status='pending' WHERE message_out_id='wait'").run();
+    expect(read().state).toBe('busy');
+    inbound.prepare("UPDATE delivered SET status='failed' WHERE message_out_id='wait'").run();
+    expect(read().state).toBe('settled'); // resolved denial is terminal, not a future obligation
+    outbound
+      .prepare("UPDATE messages_out SET content=? WHERE id='outcome'")
+      .run(JSON.stringify({ auto: true, taskMessageIds: [rowId], isError: true }));
+    expect(read().state).toBe('unknown'); // terminal action never turns a failed provider outcome into success
   });
   it('fails closed on missing execution metadata, outcomes or outbound store', () => {
     const { rowId, seriesId } = dispatchTaskEvent(inbound, input);

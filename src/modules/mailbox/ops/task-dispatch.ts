@@ -8,6 +8,17 @@ import { taskThreadId } from '../../../db/sessions.js';
 const KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,199}$/;
 export const TASK_DISPATCH_MAX_RECOVERIES = 2;
 
+/** Terminal event rows remain replay receipts even after their container stops. */
+export function hasTaskDispatchEvents(db: Database.Database): boolean {
+  return !!db
+    .prepare(
+      `SELECT 1 FROM messages_in WHERE kind = 'task'
+    AND CASE WHEN json_valid(content) THEN json_type(content, '$.dispatch') IS NOT NULL ELSE 0 END
+    LIMIT 1`,
+    )
+    .get();
+}
+
 export function validateDispatchKey(value: unknown, name: string): asserts value is string {
   if (typeof value !== 'string' || !KEY_RE.test(value) || value.trim() !== value) {
     throw new Error(`${name} must be 1–200 ASCII letters, digits or . _ : / # -`);

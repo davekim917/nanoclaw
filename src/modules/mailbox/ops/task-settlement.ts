@@ -82,7 +82,7 @@ export function readTaskSettlement(
     // Include future outbound actions: a wait not yet delivered has not become an inbound obligation.
     const delivered = new Set(
       (
-        inbound.prepare("SELECT message_out_id FROM delivered WHERE status = 'delivered'").all() as Array<{
+        inbound.prepare("SELECT message_out_id FROM delivered WHERE status IN ('delivered', 'failed')").all() as Array<{
           message_out_id: string;
         }>
       ).map((r) => r.message_out_id),
