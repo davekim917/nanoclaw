@@ -199,7 +199,10 @@ case "${1:-}" in
     # not: a lane still in flight at the freeze started on an unfrozen pair
     # too. The one shape this cannot see is a late freeze while lanes run and
     # NO marker has landed yet -- nothing on disk records a dispatch -- which is
-    # why the controller's lanes brief puts `start` before any dispatch.
+    # why the controller's lanes brief puts `start` before any dispatch
+    # (smoke-campaign-controller.py:787-788, OWNER_BRIEF["lanes"], which opens
+    # "STEP 1, BEFORE ANY LANE IS DISPATCHED"). Editing that brief's ordering
+    # reopens the race this comment names.
     C="$RUN/completion-contract.json"
     LATE='{}'
     MARKED=""

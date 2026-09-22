@@ -636,7 +636,7 @@ elif [ "$PAIR_IDENTITY_MODE" = required ] && [ -z "${refreeze_error:-}" ]; then
         ;;
       damaged)
         # A further check appends after the damage and does not repair it;
-        # `finish` refuses the same file (smoke-pair-identity.sh:376-378).
+        # `finish` refuses the same file (smoke-pair-identity.sh:379-381).
         INVALID+=("$IDENTITY_CHECKS_REL")
         INVALID_REASONS+=("$IDENTITY_CHECKS_REL: $checks_reason — the check record is damaged and another check cannot repair it (it only appends); do not edit it by hand: conclude BLOCKED, or escalate if the pair evidence matters to this verdict")
         ;;
