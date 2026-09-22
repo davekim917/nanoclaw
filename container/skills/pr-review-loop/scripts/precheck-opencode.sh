@@ -19,9 +19,10 @@
 # category named `external_directory` precisely because reaching outside the
 # project root is a supported thing to permit — enumerated at
 # container/agent-runner/src/providers/opencode.ts:168 and set to `allow` at
-# :205 — and this host's ~/.config/opencode/opencode.jsonc declares no
-# `permission` block at all (verified: no `permission` key in the file). Bash
-# and absolute paths still run as the host user.
+# :205. On the host this was written for, ~/.config/opencode/opencode.jsonc
+# declared no `permission` block at all, so nothing narrowed that default;
+# check your own before assuming otherwise. Bash and absolute paths run as the
+# host user either way.
 #
 # So `--dir` removes the MECHANISM of the incident below — the agent no longer
 # has our checkout as its project root, so "edit the files I see" cannot reach
@@ -152,8 +153,21 @@ trap 'cleanup; exit 143' TERM
 # and the confinement is gone with NO error — the failure is silent, which is
 # the worst kind here. A wrong PRECHECK_DIR does the same. Fail closed: refuse
 # rather than run something that only looks isolated.
-if toplevel=$(git -C "$WORKDIR" rev-parse --show-toplevel 2>/dev/null); then
-  echo "precheck-opencode.sh: the agent's working directory $WORKDIR is inside a git repository ($toplevel) — refusing, because opencode would treat that repository as its project root and the isolation this script relies on would not exist. Set TMPDIR or PRECHECK_DIR to a path outside any checkout." >&2
+#
+# The predicate is `--git-dir`, NOT `--show-toplevel`. `--show-toplevel` does
+# not answer this question — it ERRORS ("fatal: this operation must be run in a
+# work tree") for the two shapes with no work tree, so the `if` was false and
+# the script sailed on. Measured here:
+#
+#   repo/               --show-toplevel: /…/repo        --git-dir: .git
+#   repo/.git/scratch   --show-toplevel: fatal: …       --git-dir: /…/repo/.git
+#   bare/               --show-toplevel: fatal: …       --git-dir: .
+#
+# Those are the worst two to fail open on: the agent gets a working directory
+# inside an object store, which no `checkout` undoes. `--git-dir` succeeds in
+# all three.
+if gitdir=$(git -C "$WORKDIR" rev-parse --git-dir 2>/dev/null); then
+  echo "precheck-opencode.sh: the agent's working directory $WORKDIR is inside a git repository (git dir: $gitdir) — refusing, because opencode would treat that repository as its project root and the isolation this script relies on would not exist. Set TMPDIR or PRECHECK_DIR to a path outside any checkout." >&2
   exit 2
 fi
 

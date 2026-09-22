@@ -146,10 +146,10 @@ describe('the confinement cannot evaporate silently', () => {
   // project root the whole guarantee, so a scratch directory that happens to
   // sit inside a repository — via TMPDIR, or a wrong PRECHECK_DIR — hands the
   // agent that repository and nothing says so. Refuse instead.
-  function repoDir() {
+  function repoDir(extraInitArgs: string[] = []) {
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'precheck-repo-'));
     roots.push(repo);
-    const init = spawnSync('git', ['init', '-q', repo], { encoding: 'utf8', timeout: 20_000 });
+    const init = spawnSync('git', ['init', '-q', ...extraInitArgs, repo], { encoding: 'utf8', timeout: 20_000 });
     expect(init.status, init.stderr).toBe(0);
     return repo;
   }
@@ -175,6 +175,28 @@ describe('the confinement cannot evaporate silently', () => {
     expect(result.opencodeArgs).toBeNull();
   });
 
+  // The two shapes with no work tree, which are the worst ones to fail open on:
+  // the agent would get a working directory inside an object store, and no
+  // `checkout` undoes that. `rev-parse --show-toplevel` detects neither — it
+  // ERRORS ("must be run in a work tree"), which reads as "not a repo" — so the
+  // predicate is `--git-dir`, which answers in all three shapes.
+  it('refuses a TMPDIR inside the .git directory itself', () => {
+    const repo = repoDir();
+    const insideGitDir = path.join(repo, '.git', 'scratch');
+    fs.mkdirSync(insideGitDir, { recursive: true });
+    const result = run("echo findings\nexit 0", ['--pr', '1'], { TMPDIR: insideGitDir });
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('inside a git repository');
+    expect(result.opencodeArgs, 'opencode must never be handed a path inside an object store').toBeNull();
+  });
+
+  it('refuses a TMPDIR inside a bare repository', () => {
+    const bare = repoDir(['--bare']);
+    const result = run("echo findings\nexit 0", ['--pr', '1'], { TMPDIR: bare });
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('inside a git repository');
+    expect(result.opencodeArgs).toBeNull();
+  });
 });
 
 describe('the scratch directory is always removed', () => {
