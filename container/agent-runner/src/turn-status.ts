@@ -503,9 +503,10 @@ export function stampStatusSubtext(msg: {
  * (the drift lane fails on any edit). It also builds the mailbox payload field
  * by field, so a marker on the row could never reach a mailbox override. And a
  * seam bought nothing here: every stampable row already needs an explicit
- * `agentReply` at its call site, so the three sites that set it are exactly the
- * three that call this — `sendToDestination`, `deliverErrorResult` (poll-loop)
- * and `send_message` (mcp-tools/core.ts).
+ * `agentReply` at its call site, so the sites that set it are exactly the
+ * sites that call this. `grep -rn withStatusSubtext container/agent-runner/src`
+ * lists them; they are deliberately not enumerated here, because a list in a
+ * comment goes stale the first time a writer is added.
  */
 export function withStatusSubtext<
   T extends { kind: string; channel_type?: string | null; platform_id?: string | null; content: string },
