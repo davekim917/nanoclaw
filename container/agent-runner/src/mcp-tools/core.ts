@@ -30,6 +30,7 @@ function chatSendDenial(): string | null {
   return null;
 }
 import { getCurrentInReplyTo } from '../db/session-state.js';
+import { withStatusSubtext } from '../turn-status.js';
 import { resolveRequestCandidate } from '../modules/mailbox/session-state.js';
 import { getSessionRouting, getTaskSeriesId } from '../db/session-routing.js';
 import { registerTools } from './server.js';
@@ -353,31 +354,33 @@ export const sendMessage: McpToolDefinition = {
     const id = generateId();
     const denial = internal ? null : chatSendDenial();
     if (denial) return err(denial);
-    const seq = await writeMessageOut({
-      id,
-      in_reply_to: getCurrentInReplyTo(),
-      kind: internal ? 'work_log' : 'chat',
-      // Agent-composed reply text — eligible for the status subtext. With
-      // outcome reporting on (the fleet default) this is THE reply path, not
-      // an alternative to the `<message>` envelope.
-      agentReply: !internal,
-      platform_id: routing.platform_id,
-      channel_type: routing.channel_type,
-      thread_id: routing.thread_id,
-      content: JSON.stringify({
-        text,
-        ...(key.threadKey ? { threadKey: key.threadKey } : {}),
-        ...(policy
-          ? {
-              reporting: {
-                version: 1,
-                purpose,
-                ...(purpose === 'outcome' ? { outcome: reportedOutcome, summary: normalized.text } : {}),
-              },
-            }
-          : {}),
+    const seq = await writeMessageOut(
+      withStatusSubtext({
+        id,
+        in_reply_to: getCurrentInReplyTo(),
+        kind: internal ? 'work_log' : 'chat',
+        // Agent-composed reply text — eligible for the status subtext. With
+        // outcome reporting on (the fleet default) this is THE reply path, not
+        // an alternative to the `<message>` envelope.
+        agentReply: !internal,
+        platform_id: routing.platform_id,
+        channel_type: routing.channel_type,
+        thread_id: routing.thread_id,
+        content: JSON.stringify({
+          text,
+          ...(key.threadKey ? { threadKey: key.threadKey } : {}),
+          ...(policy
+            ? {
+                reporting: {
+                  version: 1,
+                  purpose,
+                  ...(purpose === 'outcome' ? { outcome: reportedOutcome, summary: normalized.text } : {}),
+                },
+              }
+            : {}),
+        }),
       }),
-    });
+    );
 
     if (seq < 0)
       return err(
@@ -482,19 +485,26 @@ export const sendFile: McpToolDefinition = {
     fs.mkdirSync(outboxDir, { recursive: true });
     fs.writeFileSync(path.join(outboxDir, filename), fileContent);
 
-    await writeMessageOut({
-      id,
-      in_reply_to: getCurrentInReplyTo(),
-      kind: 'chat',
-      platform_id: routing.platform_id,
-      channel_type: routing.channel_type,
-      thread_id: routing.thread_id,
-      content: JSON.stringify(
-        key.threadKey
-          ? { text: caption, files: [filename], threadKey: key.threadKey }
-          : { text: caption, files: [filename] },
-      ),
-    });
+    await writeMessageOut(
+      withStatusSubtext({
+        id,
+        in_reply_to: getCurrentInReplyTo(),
+        kind: 'chat',
+        // A caption is agent-composed text: often the whole report, with the
+        // file attached to it. Stamped like any reply, own conversation only.
+        // A bare file with no caption gets no line, since there is no reply text
+        // to sit under.
+        agentReply: caption.trim() !== '',
+        platform_id: routing.platform_id,
+        channel_type: routing.channel_type,
+        thread_id: routing.thread_id,
+        content: JSON.stringify(
+          key.threadKey
+            ? { text: caption, files: [filename], threadKey: key.threadKey }
+            : { text: caption, files: [filename] },
+        ),
+      }),
+    );
 
     log(`send_file: ${id} → ${routing.resolvedName} (${filename}), awaiting host ack`);
 
@@ -561,18 +571,23 @@ export const editMessage: McpToolDefinition = {
     }
 
     const id = generateId();
-    await writeMessageOut({
-      id,
-      kind: 'chat',
-      platform_id: routing.platform_id,
-      channel_type: routing.channel_type,
-      thread_id: routing.thread_id,
-      content: JSON.stringify(
-        key.threadKey
-          ? { operation: 'edit', messageId: platformId, text, threadKey: key.threadKey }
-          : { operation: 'edit', messageId: platformId, text },
-      ),
-    });
+    await writeMessageOut(
+      withStatusSubtext({
+        id,
+        kind: 'chat',
+        // The agent's own corrected text, stamped like the reply it replaces
+        // (#1016); the own-conversation gate still applies.
+        agentReply: true,
+        platform_id: routing.platform_id,
+        channel_type: routing.channel_type,
+        thread_id: routing.thread_id,
+        content: JSON.stringify(
+          key.threadKey
+            ? { operation: 'edit', messageId: platformId, text, threadKey: key.threadKey }
+            : { operation: 'edit', messageId: platformId, text },
+        ),
+      }),
+    );
 
     log(`edit_message: #${seq} → ${platformId}`);
     return ok(`Message edit queued for #${seq}`);

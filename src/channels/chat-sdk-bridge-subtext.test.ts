@@ -19,17 +19,23 @@ interface Recorded {
   markdown?: string;
   raw?: string;
   subtext?: string;
+  files?: unknown[];
 }
 
 /** A bridge whose adapter records every body it is handed. */
 function subtextBridge(opts: { renderSubtext?: boolean; maxTextLength?: number }) {
   const posts: Recorded[] = [];
+  const edits: Recorded[] = [];
   const adapter = {
     name: 'stub',
     channelIdFromThreadId: (t: string) => t,
     postMessage: async (_threadId: string, body: Recorded) => {
       posts.push(body);
       return { id: `msg-${posts.length}`, threadId: _threadId, raw: {} };
+    },
+    editMessage: async (_threadId: string, _messageId: string, body: Recorded) => {
+      edits.push(body);
+      return { id: _messageId, threadId: _threadId, raw: {} };
     },
   } as unknown as Adapter;
 
@@ -46,7 +52,7 @@ function subtextBridge(opts: { renderSubtext?: boolean; maxTextLength?: number }
         }
       : {}),
   });
-  return { bridge, posts };
+  return { bridge, posts, edits };
 }
 
 describe('chat-sdk bridge status subtext', () => {
@@ -127,5 +133,58 @@ describe('chat-sdk bridge status subtext', () => {
     await bridge.deliver('thread-1', null, { kind: 'chat', content: { text: 'All set.', subtext: '   ' } });
 
     expect(posts[0].markdown).toBe('All set.');
+  });
+
+  // #1016: an agent correcting its own reply used to lose the line, because
+  // the edit branch returned before the subtext was ever looked at.
+  it('keeps the subtext when the agent edits its own reply', async () => {
+    const { bridge, edits } = subtextBridge({ renderSubtext: true });
+
+    await bridge.deliver('thread-1', null, {
+      kind: 'chat',
+      content: { operation: 'edit', messageId: 'm-1', text: 'Corrected.', subtext: 'opus-5 · high · 90k context' },
+    });
+
+    expect(edits).toHaveLength(1);
+    expect(edits[0].markdown).toBe('Corrected.\n-# opus-5 · high · 90k context');
+  });
+
+  it('leaves a status-bubble edit without a footer', async () => {
+    const { bridge, edits } = subtextBridge({ renderSubtext: true });
+
+    await bridge.deliver('thread-1', null, {
+      kind: 'status',
+      content: { operation: 'edit', messageId: 'm-1', text: 'thinking…', subtext: 'opus-5 · high' },
+    });
+
+    expect(edits[0].markdown).not.toContain('-#');
+  });
+
+  it('keeps an edited reply within the platform limit once the footer is appended', async () => {
+    const { bridge, edits } = subtextBridge({ renderSubtext: true, maxTextLength: 100 });
+
+    await bridge.deliver('thread-1', null, {
+      kind: 'chat',
+      content: { operation: 'edit', messageId: 'm-1', text: 'x'.repeat(300), subtext: 'opus-5 · high · 90k context' },
+    });
+
+    expect(edits[0].markdown!.length).toBeLessThanOrEqual(100);
+    expect(edits[0].markdown).toContain('-# opus-5 · high · 90k context');
+  });
+
+  // A send_file caption is stamped by the runner; the footer must land on the
+  // message that carries the files, not be dropped by the attachment path.
+  it('renders the subtext on a captioned file post, on the message carrying the file', async () => {
+    const { bridge, posts } = subtextBridge({ renderSubtext: true });
+
+    await bridge.deliver('thread-1', null, {
+      kind: 'chat',
+      content: { text: 'Blurb attached.', files: ['draft.md'], subtext: 'opus-5 · high · 452k context' },
+      files: [{ data: Buffer.from('# draft'), filename: 'draft.md' }],
+    } as never);
+
+    expect(posts).toHaveLength(1);
+    expect(posts[0].markdown).toBe('Blurb attached.\n-# opus-5 · high · 452k context');
+    expect(posts[0].files).toHaveLength(1);
   });
 });

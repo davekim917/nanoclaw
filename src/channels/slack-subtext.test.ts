@@ -58,6 +58,7 @@ describe('applySlackSubtext', () => {
 describe('installSlackSubtextBlocks', () => {
   function fakeAdapter() {
     const posted: Record<string, unknown>[] = [];
+    const updated: Record<string, unknown>[] = [];
     const adapter = {
       _client: {
         chat: {
@@ -65,7 +66,16 @@ describe('installSlackSubtextBlocks', () => {
             posted.push(args);
             return { ok: true, ts: '1.0' };
           },
+          update: async (args: Record<string, unknown>) => {
+            updated.push(args);
+            return { ok: true, ts: '1.0' };
+          },
         },
+      },
+      // Mirrors the real adapter's text edit: same payload builder, sent with chat.update.
+      editMessage: async (_threadId: string, messageId: string, message: unknown) => {
+        const markdown = (message as { markdown?: string }).markdown ?? '';
+        return adapter._client.chat.update({ channel: 'C1', ts: messageId, markdown_text: markdown });
       },
       // Stands in for the real adapter's render-then-send: whatever body it
       // was handed becomes a markdown_text payload.
@@ -74,7 +84,7 @@ describe('installSlackSubtextBlocks', () => {
         return adapter._client.chat.postMessage({ channel: 'C1', markdown_text: markdown });
       },
     };
-    return { adapter, posted };
+    return { adapter, posted, updated };
   }
 
   it('renders a context block for a body carrying subtext', async () => {
@@ -157,6 +167,31 @@ describe('installSlackSubtextBlocks', () => {
     expect((posted[0].blocks as unknown[]).length).toBe(2);
   });
 
+  // #1016
+  it('renders a context block on an edit that carries subtext', async () => {
+    const { adapter, updated } = fakeAdapter();
+    installSlackSubtextBlocks(adapter);
+
+    await adapter.editMessage('slack:C1', '1.0', { markdown: 'fixed', subtext: 'opus-5 · high · 90k context' });
+
+    expect(updated).toHaveLength(1);
+    expect(updated[0].blocks).toEqual([
+      { type: 'markdown', text: 'fixed' },
+      { type: 'context', elements: [{ type: 'mrkdwn', text: 'opus-5 · high · 90k context' }] },
+    ]);
+    expect(updated[0].ts).toBe('1.0');
+  });
+
+  it('leaves an edit with no subtext on the markdown_text path', async () => {
+    const { adapter, updated } = fakeAdapter();
+    installSlackSubtextBlocks(adapter);
+
+    await adapter.editMessage('slack:C1', '1.0', { markdown: 'fixed' });
+
+    expect(updated[0].markdown_text).toBe('fixed');
+    expect(updated[0].blocks).toBeUndefined();
+  });
+
   it('declines to install on an adapter missing either seam', () => {
     const noClient = { postMessage: vi.fn() };
     expect(() => installSlackSubtextBlocks(noClient)).not.toThrow();
@@ -172,9 +207,12 @@ describe('installSlackSubtextBlocks', () => {
     const { createSlackAdapter } = await import('@chat-adapter/slack');
     const adapter = createSlackAdapter({ botToken: 'xoxb-test', signingSecret: 'secret', mode: 'webhook' });
 
-    const client = (adapter as unknown as { _client?: { chat?: { postMessage?: unknown } } })._client;
+    const client = (adapter as unknown as { _client?: { chat?: { postMessage?: unknown; update?: unknown } } })._client;
     expect(typeof (adapter as unknown as { postMessage?: unknown }).postMessage).toBe('function');
     expect(typeof client?.chat?.postMessage).toBe('function');
+    // Edits (#1016): editMessage + chat.update, same toSlackPayload builder.
+    expect(typeof (adapter as unknown as { editMessage?: unknown }).editMessage).toBe('function');
+    expect(typeof client?.chat?.update).toBe('function');
 
     const converter = (adapter as unknown as { formatConverter: { toSlackPayload: (m: unknown) => unknown } })
       .formatConverter;

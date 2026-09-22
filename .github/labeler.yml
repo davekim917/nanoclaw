@@ -164,15 +164,18 @@ risk:high:
     - 'scripts/check-remote-boundary.ts'
     - '.public-boundary-allowlist.json'
     - 'container/skills/pr-review-loop/**'
+    # The QA release gate: its controller, gate, barrier and scaffold decide whether a
+    # client build is certified GO. No PR-lane CI runs its suites, and a defect
+    # publishes a verdict wrong on the merits (#2092: BLOCKED over a clean GO) or
+    # strands a campaign silently (#2024) -- #1001's three forced rounds found 8 P1s.
+    - 'container/skills/smoke-test/**'
     - 'docs/review-policy.md'
-    # The reviewer-eligibility tier rule the merge gate enforces. The generator
-    # now STATES its roster rather than deriving it, so a change there changes
-    # who may approve a merge directly. The other two no longer feed it and are
-    # kept for their own reasons: `container/agents/**` is empty today, and a
-    # def re-added there would reach every Claude group's subagent roster;
-    # `src/claude-agent-md.ts` is the Claude-to-Codex agent converter every
-    # group's `.codex/agents/` roster is generated through.
-    - 'scripts/reviewer-models*.ts'
+    # The reviewer-eligibility tier rule the merge gate enforces now lives in
+    # codex-review.sh itself (REVIEWER_DENIED_TIERS), covered by the skill glob
+    # above. These two are kept for their own reasons: `container/agents/**` is
+    # empty today, and a def re-added there would reach every Claude group's
+    # subagent roster; `src/claude-agent-md.ts` is the Claude-to-Codex agent
+    # converter every group's `.codex/agents/` roster is generated through.
     - 'container/agents/**'
     - 'src/claude-agent-md.ts'
     # Executable agent and tool config: a hook (.claude/settings.json), an
@@ -328,8 +331,8 @@ risk:gates:
     - 'scripts/check-remote-boundary.ts'
     - '.public-boundary-allowlist.json'
     - 'container/skills/pr-review-loop/**'
+    - 'container/skills/smoke-test/**'
     - 'docs/review-policy.md'
-    - 'scripts/reviewer-models*.ts'
     - 'container/agents/**'
     - 'src/claude-agent-md.ts'
     - '.claude/**'

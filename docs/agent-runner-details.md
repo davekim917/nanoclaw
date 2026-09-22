@@ -949,21 +949,22 @@ It is a LATEST-WINS reading of the most recent request, never a per-turn delta. 
 does **not** ride `TurnUsageInfo`: that seam's numbers go through `toTurnDelta`, and context
 occupancy is an absolute reading that must not be differenced.
 
-**Whose voice gets stamped.** The decision lives at the shared outbound seam
-(`db/messages-out.ts` → `stampStatusSubtext`), not in any one sender, because an agent's reply
-reaches a conversation by two unrelated paths and which one runs depends on a config flag:
-`<message to="…">` envelopes via `sendToDestination`, and the `send_message` MCP tool, which
-writes its own chat row. Outcome reporting is ON unless a group disables it, and it instructs the
-agent to reply through `send_message` — so on a default install that is *the* reply path.
-Stamping in either sender alone covers roughly half the fleet while looking complete.
+**Whose voice gets stamped.** One decision function, `stampStatusSubtext`
+(`container/agent-runner/src/turn-status.ts`), called through `withStatusSubtext` at each call site
+that writes agent-composed text: `sendToDestination` and `deliverErrorResult` (poll-loop), and
+`send_message`, `send_file` and `edit_message` (`mcp-tools/core.ts`). Not inside `writeMessageOut`:
+`db/messages-out.ts` is a byte-identical upstream shim, and a marker on the row could not reach the
+mailbox anyway. `send_message` is *the* reply path on a default install (outcome reporting is on
+unless a group disables it), and it runs in the MCP subprocess, so the turn's state rides a
+persisted session-state snapshot rather than module memory.
 
-Two gates, both of which must pass. The row must be marked `agentReply` — an explicit opt-in the
-two reply paths set, because `kind: 'chat'` is far broader than "a reply the agent composed"
-(`send_file` writes captions as chat, and the runner posts its own `/clear` notice the same way).
-And the destination must resolve to the session's own conversation, so a cross-destination send —
-a sibling agent's DM, another channel, or a message the operator asked the agent to relay on
-their behalf — goes out clean. `send_file` captions, `edit_message`, `add_reaction` and the
-runner's own infra notices are never stamped.
+Two gates, both of which must pass. The row must be marked `agentReply`, an explicit opt-in, because
+`kind: 'chat'` is broader than "text the agent composed": the runner posts its own `/clear` notice
+as chat, and no turn authored that. A `send_file` row is marked when it carries a caption, since
+the caption is agent text and is often the whole report with the file attached; a bare file is not.
+And the destination must resolve to the session's own conversation, so a cross-destination send (a
+sibling agent's DM, another channel, or a message the operator asked the agent to relay on their
+behalf) goes out clean. `add_reaction` and the runner's own infra notices are never stamped.
 
 *Known gap, accepted:* "post in THIS thread, as me" resolves to the origin and is stamped. No
 routing fact distinguishes it from a normal reply. A suppress flag on the sending tool was

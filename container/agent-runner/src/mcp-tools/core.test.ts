@@ -104,6 +104,152 @@ describe('send_message MCP tool — default replies in the current conversation'
     ).run();
   });
 
+  // Status subtext: send_message is THE reply path when outcome reporting is
+  // on (the fleet default), and it runs in the MCP subprocess, not poll-loop.
+  // Driving the real handler pins both halves: that core.ts routes its row
+  // through withStatusSubtext, and that the subprocess reads turn state from
+  // the session DB rather than its own (empty) memory.
+  it('stamps the status subtext on a reply to the session own conversation', async () => {
+    const ts = await import('../turn-status.js');
+    const { _setConfigForTest, _resetConfig } = await import('../config.js');
+    _resetConfig();
+    _setConfigForTest({});
+    ts.resetTurnStatus();
+    ts.setTurnSettings('claude-opus-5[1m]', 'high');
+    ts.setOwnConversation('slack', 'slack:CTEST00004');
+    ts.recordContextTokens(142_400);
+    ts._forgetOwnershipForTest(); // this process now sees what the subprocess sees
+
+    await sendMessage.handler({ text: 'answered' });
+    const toOperator = await sendMessage.handler({ to: 'operator', text: 'relayed' });
+    void toOperator;
+
+    const rows = getUndeliveredMessages();
+    const own = rows.find((r) => r.platform_id === 'slack:CTEST00004')!;
+    const other = rows.find((r) => r.platform_id === 'slack:DTEST00009')!;
+    expect(JSON.parse(own.content).subtext).toBe('opus-5 · high · 142k context');
+    expect(JSON.parse(other.content).subtext).toBeUndefined();
+    ts.resetTurnStatus();
+    _resetConfig();
+  });
+
+  // The roster is recorded by the provider inside poll-loop, but send_message
+  // stamps from the MCP subprocess — so it has to ride the persisted snapshot
+  // too, or delegating turns lose it on the default reply path (#1022's bug).
+  it('carries the subagent roster across the process boundary', async () => {
+    const ts = await import('../turn-status.js');
+    const { _setConfigForTest, _resetConfig } = await import('../config.js');
+    _resetConfig();
+    _setConfigForTest({});
+    ts.resetTurnStatus();
+    ts.setTurnSettings('claude-opus-5[1m]', 'xhigh');
+    ts.setOwnConversation('slack', 'slack:CTEST00004');
+    ts.recordContextTokens(142_400);
+    ts.recordSubagent('t1', { type: 'worker-high', model: 'claude-sonnet-5', effort: 'high' });
+    ts.recordSubagent('t2', { type: 'worker-high', model: 'claude-sonnet-5', effort: 'high' });
+    ts._forgetOwnershipForTest();
+
+    await sendMessage.handler({ text: 'delegated and done' });
+
+    const own = getUndeliveredMessages().find((r) => r.platform_id === 'slack:CTEST00004')!;
+    expect(JSON.parse(own.content).subtext).toBe('opus-5 · xhigh · 142k context · 2 subagents: 2x sonnet-5/high');
+    ts.resetTurnStatus();
+    _resetConfig();
+  });
+
+  // #1016: an agent correcting its own reply keeps the status line. The edit
+  // is stamped like the reply it replaces; an edit to a message in another
+  // conversation is not.
+  it('stamps an edit of the agent own reply, and not an edit elsewhere', async () => {
+    const ts = await import('../turn-status.js');
+    const { _setConfigForTest, _resetConfig } = await import('../config.js');
+    _resetConfig();
+    _setConfigForTest({});
+    ts.resetTurnStatus();
+    ts.setTurnSettings('claude-opus-5[1m]', 'high');
+    ts.setOwnConversation('slack', 'slack:CTEST00004');
+    ts.recordContextTokens(90_000);
+    ts._forgetOwnershipForTest();
+
+    await sendMessage.handler({ text: 'first draft' });
+    await sendMessage.handler({ to: 'operator', text: 'relayed' });
+    const [mine, relayed] = getUndeliveredMessages();
+
+    await editMessage.handler({ messageId: mine.seq, text: 'corrected' });
+    await editMessage.handler({ messageId: relayed.seq, text: 'relayed, corrected' });
+
+    const edits = getUndeliveredMessages()
+      .map((r) => JSON.parse(r.content))
+      .filter((c) => c.operation === 'edit');
+    expect(edits[0]).toMatchObject({ operation: 'edit', text: 'corrected', subtext: 'opus-5 · high · 90k context' });
+    expect(edits[1].subtext).toBeUndefined();
+    ts.resetTurnStatus();
+    _resetConfig();
+  });
+
+  // A send_file caption is agent-composed text, often the whole report with
+  // the file attached (a scheduled task's Discord post showed the line only on
+  // the follow-up message because captions were excluded). Stamp a captioned
+  // file in the own conversation; not a bare file, not a file sent elsewhere.
+  it('stamps a captioned send_file in the own conversation only', async () => {
+    const ts = await import('../turn-status.js');
+    const { _setConfigForTest, _resetConfig } = await import('../config.js');
+    _resetConfig();
+    _setConfigForTest({});
+    ts.resetTurnStatus();
+    ts.setTurnSettings('claude-opus-5[1m]', 'high');
+    ts.setOwnConversation('slack', 'slack:CTEST00004');
+    ts.recordContextTokens(452_000);
+    ts._forgetOwnershipForTest();
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-send-file-subtext-'));
+    const realMkdirSync = fs.mkdirSync.bind(fs);
+    const realWriteFileSync = fs.writeFileSync.bind(fs);
+    const mkdirSpy = spyOn(fs, 'mkdirSync').mockImplementation((target, opts) => {
+      if (typeof target === 'string' && target.startsWith('/workspace/outbox')) return undefined;
+      return realMkdirSync(target, opts as never);
+    });
+    const writeFileSpy = spyOn(fs, 'writeFileSync').mockImplementation((target, data, opts) => {
+      if (typeof target === 'string' && target.startsWith('/workspace/outbox')) return undefined;
+      return realWriteFileSync(target, data as never, opts as never);
+    });
+    // One send at a time: the handler waits for its row's delivery ack, and
+    // dedups by content hash per process, so each file gets distinct bytes.
+    const send = async (name: string, args: Record<string, unknown>) => {
+      const filePath = path.join(tmpDir, name);
+      realWriteFileSync(filePath, `${name} ${Date.now()} ${Math.random()}`);
+      const before = getUndeliveredMessages().length;
+      const pending = sendFile.handler({ path: filePath, ...args });
+      let out = getUndeliveredMessages();
+      for (let i = 0; i < 100 && out.length === before; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        out = getUndeliveredMessages();
+      }
+      const row = out[out.length - 1];
+      getInboundDb()
+        .prepare("INSERT INTO delivered (message_out_id, status, delivered_at) VALUES (?, 'delivered', ?)")
+        .run(row.id, new Date().toISOString());
+      await pending;
+      return { pid: row.platform_id, c: JSON.parse(row.content) };
+    };
+    try {
+      const captioned = await send('draft.md', { text: 'Here is the blurb, attached.' });
+      const bare = await send('bare.md', {});
+      const elsewhere = await send('dm.md', { to: 'operator', text: 'for your DM' });
+      expect(captioned.pid).toBe('slack:CTEST00004');
+      expect(captioned.c.subtext).toBe('opus-5 · high · 452k context');
+      expect(bare.c.subtext).toBeUndefined();
+      expect(elsewhere.pid).toBe('slack:DTEST00009');
+      expect(elsewhere.c.subtext).toBeUndefined();
+    } finally {
+      mkdirSpy.mockRestore();
+      writeFileSpy.mockRestore();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      ts.resetTurnStatus();
+      _resetConfig();
+    }
+  });
+
   it('omitting `to` posts in the session thread, not the owner DM', async () => {
     await sendMessage.handler({ text: 'team-auto: build stage done' });
 

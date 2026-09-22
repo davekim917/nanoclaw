@@ -23,7 +23,7 @@ import { recordRateLimitSamples, type AccountIdentity, type RateLimitSample } fr
 import { getCredentialSlot, setCredentialSlot } from '../modules/mailbox/session-state.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { appendActiveRuntimeContext } from '../runtime-context.js';
-import { recordContextTokens } from '../turn-status.js';
+import { recordContextTokens, recordSubagent } from '../turn-status.js';
 
 /**
  * Tokens occupying the context window, from one API response's `usage`.
@@ -3325,6 +3325,30 @@ export class ClaudeProvider implements AgentProvider {
             // tokens on a warm thread and render a full window as near-empty.
             // Top-level only: a subagent's usage measures ITS window, not ours.
             if (topLevel) recordContextTokens(claudeContextOccupancy(message.message?.usage));
+            else {
+              // A subagent frame — the exact set the context reading above
+              // skips, reused here for what it CAN answer: which worker this
+              // turn deployed and on which model.
+              //
+              // Both fields are OBSERVED. `subagent_type` is the agent type
+              // the Task call named, carried on the frame by the SDK, and
+              // `message.model` is the model that actually served the request
+              // — never the one that was asked for. Effort is not on this
+              // frame and is deliberately left null rather than inferred from
+              // the type name: `worker-xhigh` reads like an effort only
+              // because of one plugin's naming convention, and parsing it
+              // would be a guess wearing a measurement's clothes.
+              //
+              // Keyed by parent_tool_use_id — one Task call is one worker, so
+              // a worker that streams twenty frames is counted once.
+              const key = (message as { parent_tool_use_id?: string | null }).parent_tool_use_id;
+              if (key) {
+                recordSubagent(key, {
+                  type: (message as { subagent_type?: string }).subagent_type ?? null,
+                  model: message.message?.model ?? null,
+                });
+              }
+            }
             if (Array.isArray(blocks)) {
               let sawToolUse = false;
               for (const block of blocks) {

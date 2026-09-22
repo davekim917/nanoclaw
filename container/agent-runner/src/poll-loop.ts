@@ -15,7 +15,13 @@ import {
   type MessageInRow,
 } from './db/messages-in.js';
 import { getConfig } from './config.js';
-import { clearContextTokens, setOwnConversation, setTurnSettings } from './turn-status.js';
+import {
+  clearContextTokens,
+  clearSubagents,
+  setOwnConversation,
+  setTurnSettings,
+  withStatusSubtext,
+} from './turn-status.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { touchHeartbeat } from './heartbeat.js';
@@ -2888,6 +2894,10 @@ export async function processQuery(
         // produced no usable usage frame. Safe here specifically: every
         // dispatch for this result has already run above.
         clearContextTokens();
+        // The roster has the same per-turn lifetime as the context figure and
+        // must clear at the same boundary: one query serves many turns, so a
+        // roster left standing would name workers a LATER turn never deployed.
+        clearSubagents();
         // Handling is done deciding. If it pushed, the turn level is raised
         // again and the published bit stays 1; if it did not, this is where
         // the container becomes reapable.
@@ -3141,7 +3151,7 @@ export async function dispatchFileAttachment(
  */
 async function deliverErrorResult(text: string, routing: RoutingContext): Promise<void> {
   log('Error result with no <message> envelope — delivering to channel');
-  await writeMessageOut({
+  await writeMessageOut(withStatusSubtext({
     id: generateId(),
     in_reply_to: routing.inReplyTo,
     kind: 'chat',
@@ -3151,13 +3161,14 @@ async function deliverErrorResult(text: string, routing: RoutingContext): Promis
     // unmarked would make an error reply the one place the line silently
     // disappears — precisely when knowing the model and context is most
     // useful. Model and effort are accurate on an error turn; the context
-    // figure is this turn's, since it is cleared per result (:2872).
+    // figure is this turn's, since it is cleared per result (just before
+    // closeResultScope in processQuery).
     agentReply: true,
     platform_id: routing.platformId,
     channel_type: routing.channelType,
     thread_id: routing.threadId,
     content: JSON.stringify({ text }),
-  });
+  }));
 }
 
 /**
@@ -3270,6 +3281,8 @@ async function emitTurnEnd(): Promise<void> {
   // here: one query can serve many turns, so this fires too coarsely to be the
   // turn boundary. Kept as a backstop for a query that ends without a result.
   clearContextTokens();
+  // Backstop only, same as above — the real clear is per result.
+  clearSubagents();
   const lifecycleStatusId = getCurrentLifecycleStatus();
   await writeMessageOut({
     id: generateId(),
@@ -3623,24 +3636,23 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
   // including an explicit channel-root null, remains authoritative.
   const ownConversation = channelType === routing.channelType && platformId === routing.platformId;
   const threadId = destRouting ? destRouting.threadId : ownConversation ? routing.threadId : null;
-  // The status subtext is NOT stamped here. It rides the shared outbound seam
-  // (db/messages-out.ts -> stampStatusSubtext) so the `send_message` MCP path,
-  // which bypasses this function entirely and is the default reply path when
-  // outcome reporting is on, gets the same treatment.
-  await writeMessageOut({
+  // `send_message` (mcp-tools/core.ts) bypasses this function and is the
+  // default reply path when outcome reporting is on — it stamps itself through
+  // the same withStatusSubtext.
+  await writeMessageOut(withStatusSubtext({
     id: generateId(),
     // Batch anchor, not the channel's latest inbound row — see the poison
     // note in dispatchFileAttachment / getPendingMessages.
     in_reply_to: getBatchAnchor(channelType, platformId) ?? routing.inReplyTo,
     kind: 'chat',
     // Agent-composed reply text — eligible for the status subtext. The
-    // own-conversation gate still applies at the seam.
+    // own-conversation gate still applies inside stampStatusSubtext.
     agentReply: true,
     platform_id: platformId,
     channel_type: channelType,
     thread_id: threadId,
     content: JSON.stringify({ text: body }),
-  });
+  }));
 }
 
 /**

@@ -56,6 +56,18 @@ let ownChannelType: string | null = null;
 let ownPlatformId: string | null = null;
 
 /**
+ * Subagents this turn deployed, keyed by the provider's own handle for one
+ * deployment (Claude: the Task tool_use id; Codex: the child thread id) so a
+ * worker that emits many frames is counted once.
+ *
+ * `model` is OBSERVED where a provider reports what actually ran; `effort` is
+ * whatever that provider can say, which is not always the same kind of fact —
+ * see each provider's capture site. `null` on either means "this provider did
+ * not tell us", and the renderer omits it rather than guessing.
+ */
+const subagents = new Map<string, { type: string | null; model: string | null; effort: string | null }>();
+
+/**
  * Record the context occupancy observed on a provider request.
  *
  * Called per request, not per turn: a turn makes many round trips and the
@@ -85,11 +97,7 @@ export function recordContextTokens(tokens: number | null | undefined): void {
  * the group default became (the same reasoning as `modelInForce` in
  * poll-loop.ts, whose value this mirrors).
  */
-export function setTurnSettings(
-  nextModel?: string | null,
-  nextEffort?: string | null,
-  nextUltracode?: boolean,
-): void {
+export function setTurnSettings(nextModel?: string | null, nextEffort?: string | null, nextUltracode?: boolean): void {
   model = nextModel ?? null;
   effort = nextEffort ?? null;
   ultracode = nextUltracode === true;
@@ -174,6 +182,9 @@ interface Snapshot {
   contextTokens: number | null;
   ownChannelType: string | null;
   ownPlatformId: string | null;
+  // The roster crosses the same boundary for the same reason: the provider
+  // records it in poll-loop, but send_message stamps from the MCP subprocess.
+  subagents?: [string, { type: string | null; model: string | null; effort: string | null }][];
 }
 
 /**
@@ -187,7 +198,15 @@ let ownsStore = false;
 
 function persist(): void {
   ownsStore = true;
-  const snap: Snapshot = { model, effort, ultracode, contextTokens, ownChannelType, ownPlatformId };
+  const snap: Snapshot = {
+    model,
+    effort,
+    ultracode,
+    contextTokens,
+    ownChannelType,
+    ownPlatformId,
+    subagents: [...subagents.entries()],
+  };
   try {
     getAgentMailbox().operations.setState(SNAPSHOT_KEY, JSON.stringify(snap));
   } catch {
@@ -214,10 +233,51 @@ export function hydrateTurnStatus(): boolean {
     contextTokens = typeof snap.contextTokens === 'number' ? snap.contextTokens : null;
     ownChannelType = snap.ownChannelType ?? null;
     ownPlatformId = snap.ownPlatformId ?? null;
+    subagents.clear();
+    for (const [key, fields] of snap.subagents ?? []) subagents.set(key, fields);
     return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * Record (or refine) one subagent deployment.
+ *
+ * Idempotent per `key` and MERGING: providers learn the pieces at different
+ * moments — Claude sees the agent type on the Task call and the model on the
+ * worker's first frame; Codex sees the thread id on the activity item and the
+ * model/effort only after reading that thread. A later call fills gaps without
+ * erasing what is already known, so an out-of-order arrival cannot blank a
+ * field that was already answered.
+ */
+export function recordSubagent(
+  key: string,
+  fields: { type?: string | null; model?: string | null; effort?: string | null },
+): void {
+  if (!key) return;
+  const prior = subagents.get(key);
+  const next = {
+    type: fields.type ?? prior?.type ?? null,
+    model: fields.model ?? prior?.model ?? null,
+    effort: fields.effort ?? prior?.effort ?? null,
+  };
+  // Claude calls this once per worker frame, so a large fan-out would otherwise
+  // write thousands of identical snapshots. Persist only on a real change (#1028).
+  if (prior && prior.type === next.type && prior.model === next.model && prior.effort === next.effort) return;
+  subagents.set(key, next);
+  persist();
+}
+
+/**
+ * Forget the roster at a turn boundary — same reasoning as
+ * `clearContextTokens`: a roster describes ONE turn's delegation, and carrying
+ * it into the next would report workers that are no longer running.
+ */
+export function clearSubagents(): void {
+  if (subagents.size === 0) return;
+  subagents.clear();
+  persist();
 }
 
 /** Test seam — reset the store between cases. */
@@ -228,6 +288,7 @@ export function resetTurnStatus(): void {
   ultracode = false;
   ownChannelType = null;
   ownPlatformId = null;
+  subagents.clear();
   ownsStore = false;
   try {
     getAgentMailbox().operations.deleteState(SNAPSHOT_KEY);
@@ -245,6 +306,7 @@ export function _forgetOwnershipForTest(): void {
   ultracode = false;
   ownChannelType = null;
   ownPlatformId = null;
+  subagents.clear();
 }
 
 /**
@@ -284,6 +346,56 @@ export function formatTokens(tokens: number): string {
  * when every part is missing, so the delivery path can skip the subtext
  * entirely rather than post an empty one.
  */
+/** Longest roster rendered before the tail collapses into "+N more". */
+const MAX_RENDERED_SUBAGENT_GROUPS = 3;
+
+/**
+ * Render the roster as one clause: `3 subagents: 2x sonnet-5/high, haiku/low`.
+ *
+ * GROUPED BY (model, effort), not listed per worker. A coordinator can fan out
+ * a dozen workers across two tiers, and twelve near-identical entries would
+ * stop being subtext; what the operator is actually asking is "what tiers did
+ * this turn deploy, and how many of each". The count before the colon is the
+ * true total, so it stays honest even when the list is capped.
+ *
+ * A group whose model is unknown renders by whatever it does know — the
+ * provider's agent type, else nothing but the count. Null when the turn
+ * deployed nobody, which is the overwhelmingly common case and must add
+ * nothing to the line.
+ */
+export function formatSubagentRoster(): string | null {
+  if (subagents.size === 0) return null;
+
+  const groups = new Map<string, { label: string; count: number }>();
+  for (const entry of subagents.values()) {
+    // Identity of a GROUP is what it would render as, so two workers that
+    // display identically always collapse — including two that are equally
+    // unknown.
+    const model = entry.model ? shortModelName(entry.model) : null;
+    const label = [model ?? entry.type ?? null, entry.effort ?? null].filter(Boolean).join('/');
+    const key = label || 'unknown';
+    const group = groups.get(key);
+    if (group) group.count += 1;
+    else groups.set(key, { label, count: 1 });
+  }
+
+  // A group we know NOTHING about contributes to the total but has no label to
+  // print. Dropping it here rather than rendering a bare count keeps the line
+  // from saying "1 subagent: 1", which reads as a name.
+  const ordered = [...groups.values()]
+    .filter((g) => g.label !== '')
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  const shown = ordered.slice(0, MAX_RENDERED_SUBAGENT_GROUPS);
+  const hidden = ordered.length - shown.length;
+  const rendered = shown.map((g) => (g.count > 1 ? `${g.count}x ${g.label}` : g.label));
+  if (hidden > 0) rendered.push(`+${hidden} more`);
+
+  const total = subagents.size;
+  const noun = total === 1 ? 'subagent' : 'subagents';
+  const detail = rendered.filter(Boolean).join(', ');
+  return detail ? `${total} ${noun}: ${detail}` : `${total} ${noun}`;
+}
+
 export function formatStatusSubtext(): string | null {
   const parts: string[] = [];
   if (model) parts.push(shortModelName(model));
@@ -295,6 +407,11 @@ export function formatStatusSubtext(): string | null {
   if (ultracode) parts.push('ultracode');
   else if (effort) parts.push(effort);
   if (contextTokens !== null) parts.push(`${formatTokens(contextTokens)} context`);
+  // Last, and only when the turn actually delegated: it is the one clause that
+  // varies in length, so it belongs where it cannot push the facts that are
+  // always present off the end of a narrow display.
+  const roster = formatSubagentRoster();
+  if (roster) parts.push(roster);
   return parts.length > 0 ? parts.join(' · ') : null;
 }
 
@@ -319,8 +436,8 @@ function statusSubtextEnabled(): boolean {
  * Stamp the status subtext onto an outbound chat payload, or return it
  * unchanged.
  *
- * THIS IS THE ONLY STAMPING SITE, and it sits at the shared outbound seam
- * (db/messages-out.ts) rather than at any one sender. There are two unrelated
+ * THIS IS THE ONLY STAMPING DECISION. It is called through `withStatusSubtext`
+ * at each reply call site (see there for why not inside `writeMessageOut`). There are two unrelated
  * ways an agent's reply reaches a conversation, and which one runs depends on
  * a config flag most installs never touch:
  *
@@ -335,9 +452,10 @@ function statusSubtextEnabled(): boolean {
  * while looking complete in tests.
  *
  * Scope is deliberately narrow, and the first gate is OPT-IN: the row must be
- * marked `agentReply`, because `kind: 'chat'` alone is far broader than "a
- * reply the agent composed" — `send_file` captions and the runner's own
- * `/clear` notice are both routed chat rows. Then: the agent's own
+ * marked `agentReply`, because `kind: 'chat'` alone is broader than "text the
+ * agent composed" — the runner's own `/clear` notice is a routed chat row that
+ * no turn authored. (`send_file` IS marked when it carries a caption: the
+ * caption is agent text, often the whole report.) Then: the agent's own
  * conversation only (`isOwnConversation`), and an existing `subtext` key is
  * never overwritten.
  *
@@ -375,4 +493,24 @@ export function stampStatusSubtext(msg: {
   if (Object.prototype.hasOwnProperty.call(payload, 'subtext')) return msg.content;
   payload.subtext = subtext;
   return JSON.stringify(payload);
+}
+
+/**
+ * Stamp a row at its call site, then strip the marker before the write.
+ *
+ * WHY AT THE CALL SITE and not inside `writeMessageOut`: `db/messages-out.ts`
+ * is a byte-identical upstream shim, guarded by src/mailbox/UPSTREAM-MANIFEST.json
+ * (the drift lane fails on any edit). It also builds the mailbox payload field
+ * by field, so a marker on the row could never reach a mailbox override. And a
+ * seam bought nothing here: every stampable row already needs an explicit
+ * `agentReply` at its call site, so the sites that set it are exactly the
+ * sites that call this. `grep -rn withStatusSubtext container/agent-runner/src`
+ * lists them; they are deliberately not enumerated here, because a list in a
+ * comment goes stale the first time a writer is added.
+ */
+export function withStatusSubtext<
+  T extends { kind: string; channel_type?: string | null; platform_id?: string | null; content: string },
+>(row: T & { agentReply?: boolean }): T {
+  const { agentReply, ...rest } = row;
+  return { ...(rest as unknown as T), content: stampStatusSubtext({ ...rest, agentReply }) };
 }

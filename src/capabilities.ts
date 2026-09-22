@@ -1194,7 +1194,7 @@ const PROVIDER_SECRET = /^(anthropic|openai|opencode)(-|$)/i;
  * A URL is safe to print: `parseMcpServerConfig` refuses one carrying
  * credentials at intake (src/container-config.ts:477-501), and the agent reads
  * the same value in its own read-only container.json mount
- * (src/container-runner.ts:4878). `env` and `headers` are never rendered —
+ * (src/container-runner.ts:4879). `env` and `headers` are never rendered —
  * those DO carry placeholder credentials.
  */
 function genericMcpUseFor(name: string, server: McpServerConfig): string {
