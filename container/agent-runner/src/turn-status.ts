@@ -1,4 +1,5 @@
 import { getConfig } from './config.js';
+import { getAgentMailbox } from './mailbox/index.js';
 
 /**
  * The "what am I running on" line stamped under an agent's own replies.
@@ -70,7 +71,10 @@ let ownPlatformId: string | null = null;
  */
 export function recordContextTokens(tokens: number | null | undefined): void {
   if (typeof tokens !== 'number' || !Number.isFinite(tokens) || tokens <= 0) return;
-  contextTokens = Math.round(tokens);
+  const next = Math.round(tokens);
+  if (next === contextTokens) return;
+  contextTokens = next;
+  persist();
 }
 
 /**
@@ -89,6 +93,7 @@ export function setTurnSettings(
   model = nextModel ?? null;
   effort = nextEffort ?? null;
   ultracode = nextUltracode === true;
+  persist();
 }
 
 /**
@@ -113,7 +118,9 @@ export function setTurnSettings(
  * them.
  */
 export function clearContextTokens(): void {
+  if (contextTokens === null) return;
   contextTokens = null;
+  persist();
 }
 
 /**
@@ -125,6 +132,7 @@ export function clearContextTokens(): void {
 export function setOwnConversation(channelType?: string | null, platformId?: string | null): void {
   ownChannelType = channelType ?? null;
   ownPlatformId = platformId ?? null;
+  persist();
 }
 
 /**
@@ -140,8 +148,97 @@ export function isOwnConversation(channelType?: string | null, platformId?: stri
   return channelType === ownChannelType && platformId === ownPlatformId;
 }
 
+/**
+ * CROSS-PROCESS: the store lives in the session DB, not only in memory.
+ *
+ * The runner is two processes. poll-loop (and the provider inside it) sets the
+ * turn's model, effort, context and conversation — but the `send_message` MCP
+ * tool runs in a SEPARATE stdio subprocess (mcp-tools/server.ts:114) with its
+ * own, empty copy of this module. It writes its chat row there, so an
+ * in-memory-only store made `isOwnConversation` answer false for every reply
+ * sent through the tool. That is the default reply path whenever outcome
+ * reporting is on, and it shipped: in production 55 of 57 replies went out
+ * unstamped, while every test passed because tests run in ONE process.
+ *
+ * The snapshot rides session state — the same mailbox-backed channel that
+ * carries `in_reply_to` across the same boundary (db/session-state.ts).
+ * Writes happen only on change; `stampStatusSubtext` hydrates before deciding.
+ * Every access is guarded: a decoration must never be able to break a write.
+ */
+const SNAPSHOT_KEY = 'status_subtext_snapshot';
+
+interface Snapshot {
+  model: string | null;
+  effort: string | null;
+  ultracode: boolean;
+  contextTokens: number | null;
+  ownChannelType: string | null;
+  ownPlatformId: string | null;
+}
+
+/**
+ * True in the process that SETS turn state (poll-loop + provider). That
+ * process's memory is authoritative and is never overwritten from the DB —
+ * if a persist ever failed, hydrating would replace good state with stale.
+ * A process that never set state (the MCP subprocess) re-reads every time,
+ * because it is long-lived across turns and the snapshot keeps moving.
+ */
+let ownsStore = false;
+
+function persist(): void {
+  ownsStore = true;
+  const snap: Snapshot = { model, effort, ultracode, contextTokens, ownChannelType, ownPlatformId };
+  try {
+    getAgentMailbox().operations.setState(SNAPSHOT_KEY, JSON.stringify(snap));
+  } catch {
+    // No mailbox (unit tests) or a transient DB error: the in-memory store
+    // still serves this process, and a missed footer is the only cost.
+  }
+}
+
+/** Load the persisted snapshot into this process. Returns false if none. */
+export function hydrateTurnStatus(): boolean {
+  if (ownsStore) return false;
+  let raw: string | undefined;
+  try {
+    raw = getAgentMailbox().operations.getState(SNAPSHOT_KEY)?.value;
+  } catch {
+    return false;
+  }
+  if (!raw) return false;
+  try {
+    const snap = JSON.parse(raw) as Partial<Snapshot>;
+    model = snap.model ?? null;
+    effort = snap.effort ?? null;
+    ultracode = snap.ultracode === true;
+    contextTokens = typeof snap.contextTokens === 'number' ? snap.contextTokens : null;
+    ownChannelType = snap.ownChannelType ?? null;
+    ownPlatformId = snap.ownPlatformId ?? null;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Test seam — reset the store between cases. */
 export function resetTurnStatus(): void {
+  contextTokens = null;
+  model = null;
+  effort = null;
+  ultracode = false;
+  ownChannelType = null;
+  ownPlatformId = null;
+  ownsStore = false;
+  try {
+    getAgentMailbox().operations.deleteState(SNAPSHOT_KEY);
+  } catch {
+    // no mailbox in this test
+  }
+}
+
+/** Test seam — make this process behave as the MCP subprocess does. */
+export function _forgetOwnershipForTest(): void {
+  ownsStore = false;
   contextTokens = null;
   model = null;
   effort = null;
@@ -258,6 +355,9 @@ export function stampStatusSubtext(msg: {
   content: string;
 }): string {
   if (msg.agentReply !== true || msg.kind !== 'chat') return msg.content;
+  // Read the turn's state from the session DB, not this process's memory: the
+  // send_message tool runs in its own subprocess, where nothing set it.
+  hydrateTurnStatus();
   if (!isOwnConversation(msg.channel_type, msg.platform_id)) return msg.content;
   if (!statusSubtextEnabled()) return msg.content;
   const subtext = formatStatusSubtext();
