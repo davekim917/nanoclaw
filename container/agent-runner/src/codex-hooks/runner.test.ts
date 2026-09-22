@@ -92,18 +92,17 @@ describe('runPreToolUseChain — guardrails', () => {
     expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
   });
 
-  it('allows benign bash with only the stdin prefix added', async () => {
+  it('allows benign bash untouched — the rewrite hook has nothing to do', async () => {
     const out = (await runPreToolUseChain({
       tool_name: 'exec_command',
       tool_input: { command: 'ls -la' },
-    })) as {
-      continue?: boolean;
-      hookSpecificOutput?: { permissionDecision?: string; updatedInput?: { command?: string } };
-    };
-    // No credential prefix, no jest lock — only the stdin prefix the chain
-    // applies at its emit point.
-    expect(out.hookSpecificOutput?.permissionDecision).toBeUndefined();
-    expect(out.hookSpecificOutput?.updatedInput?.command).toBe('exec </dev/null\nls -la');
+    })) as
+      | { continue?: boolean }
+      | { hookSpecificOutput?: { hookEventName?: string; updatedInput?: { command?: string } } };
+    // `ls -la` is neither `codex exec` nor a jest run, and no credential prefix
+    // is prepended any more, so the chain returns a plain continue. The stdin
+    // prefix is Claude-only and must not appear here.
+    expect(out).toEqual({ continue: true });
   });
 
   it('allows /tmp-only git clone', async () => {
@@ -609,10 +608,10 @@ describe('runPreToolUseChain — one approval card per tool call (#833)', () => 
   });
 });
 
-// INVARIANT: the `exec </dev/null` stdin prefix is a transport detail that no
-// guard in this chain may see. runPreToolUseChain applies it exactly once, at
-// its emit point, after every guard including the destructive-action guard.
-describe('runPreToolUseChain — the stdin prefix is never visible to a guard', () => {
+// The `exec </dev/null` stdin prefix is CLAUDE-ONLY. This chain must never
+// emit it, and no guard here may ever see it — the email gate fails closed on
+// `<` and newlines, and the destructive guard would print it on an approval card.
+describe('runPreToolUseChain — no stdin prefix here, and no guard ever sees one', () => {
   const PREFIX = 'exec </dev/null\n';
   const saved: Record<string, string | undefined> = {};
   let sink = '';
@@ -658,33 +657,43 @@ describe('runPreToolUseChain — the stdin prefix is never visible to a guard', 
           .map((l) => JSON.parse(l) as string)
       : [];
 
-  it('(i) a --dry-run send passes the email gate with no approval request, then gets the prefix', async () => {
+  it('(i) a --dry-run send passes the email gate with no approval request, and gets no prefix', async () => {
     const cmd = 'gws gmail +send --to person8@fixture1.example.com --subject hi --body x --dry-run';
     const out = (await runPreToolUseChain({
       tool_name: 'exec_command',
       tool_input: { command: cmd },
       tool_use_id: 'exec-dry-run',
-    })) as { hookSpecificOutput?: { permissionDecision?: string; updatedInput?: { command?: string } } };
+    })) as {
+      continue?: boolean;
+      hookSpecificOutput?: { permissionDecision?: string; updatedInput?: { command?: string } };
+    };
     expect(out.hookSpecificOutput?.permissionDecision).toBeUndefined();
     expect(writeSpy).not.toHaveBeenCalled();
-    expect(out.hookSpecificOutput?.updatedInput?.command).toBe(`${PREFIX}${cmd}`);
+    // Nothing rewrote it, so the chain emits no updatedInput at all.
+    expect(out).toEqual({ continue: true });
   });
 
   it('(ii) the destructive guard is called with the un-prefixed command', async () => {
     const out = (await runPreToolUseChain({
       tool_name: 'exec_command',
       tool_input: { command: 'git status' },
-    })) as { hookSpecificOutput?: { updatedInput?: { command?: string } } };
+    })) as { continue?: boolean; hookSpecificOutput?: { updatedInput?: { command?: string } } };
     expect(guardCalls()).toEqual(['git status']);
-    // …and the prefix is still emitted, after it.
-    expect(out.hookSpecificOutput?.updatedInput?.command).toBe(`${PREFIX}git status`);
+    expect(out).toEqual({ continue: true });
   });
 
-  it('(ii) guards see the jest rewrite, but still not the prefix', async () => {
-    await runPreToolUseChain({ tool_name: 'exec_command', tool_input: { command: 'npx jest' } });
+  it('(ii) guards see the jest rewrite, and the emitted command carries no prefix', async () => {
+    const out = (await runPreToolUseChain({
+      tool_name: 'exec_command',
+      tool_input: { command: 'npx jest' },
+    })) as { hookSpecificOutput?: { updatedInput?: { command?: string } } };
     const [seen] = guardCalls();
     expect(seen).toContain('flock -n -E 126'); // the semantic rewrite IS visible
     expect(seen.startsWith(PREFIX)).toBe(false);
     expect(seen).not.toContain('</dev/null');
+    // The jest rewrite is still emitted — and still without a stdin prefix.
+    const emitted = out.hookSpecificOutput?.updatedInput?.command ?? '';
+    expect(emitted).toContain('flock -n -E 126');
+    expect(emitted.startsWith(PREFIX)).toBe(false);
   });
 });

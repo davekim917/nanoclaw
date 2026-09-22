@@ -22,7 +22,6 @@ import {
   createBlockSnowflakeConnectorHook,
   createBlockGitCloneHook,
   createEmailGateHook,
-  wrapDevNullStdin,
 } from '../providers/claude.js';
 import { createManagedGitMaintenanceHook } from '../managed-git-guard.js';
 
@@ -426,9 +425,9 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
     return first ?? { continue: true };
   }
 
-  // Bash-only chain. Order matters: the command rewrite (jest lock only — no
-  // stdin prefix, see the emit point below) first, so every guardrail after it
-  // evaluates the same command text.
+  // Bash-only chain. Order matters: the command rewrite (jest lock only — this
+  // chain applies no stdin prefix, see below) first, so every guardrail after
+  // it evaluates the same command text.
   const chain: HookCallback[] = [
     createBashCommandRewriteHook(),
     createManagedGitMaintenanceHook(),
@@ -497,18 +496,16 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
   const guardDeny = await runDestructiveGuard(guardCommand, toolUseId);
   if (guardDeny) return guardDeny;
 
-  // EMIT POINT for the stdin prefix. INVARIANT: `exec </dev/null` is a
-  // transport detail that no guard in this chain may see — not the email
-  // gate (whose bypass check fails closed on `<` and newlines), and not the
-  // destructive guard above (which would put the prefix on the approval card
-  // an admin reads). So it is applied exactly once, here, after every guard.
-  // See createBashCommandRewriteHook in providers/claude.ts.
-  if (guardCommand) {
-    mergedUpdatedInput = {
-      ...(mergedUpdatedInput ?? currentInput.tool_input),
-      command: wrapDevNullStdin(guardCommand),
-    };
-  }
+  // NO stdin prefix here, deliberately. `exec </dev/null` exists for the Claude
+  // Code Bash tool, whose fd 0 is a unix socket that is never written and never
+  // closed (the 2026-09-22 hang). Nothing shows a Codex path has that
+  // condition, and emitting `updatedInput` on every Bash call — rather than
+  // only for the jest rewrite — would put unverified surface on every Codex
+  // container for a hypothetical gain: whether codex honours the field, and
+  // under which key, is not established (docs/specs/claude-review-credential-rotation/run.md:11-12).
+  // So this chain emits exactly what it did before: the jest rewrite, or nothing.
+  // The Claude side applies the prefix at its own emit point — see
+  // createBashCommandRewriteHook's INVARIANT in providers/claude.ts.
 
   if (mergedUpdatedInput) {
     return {
