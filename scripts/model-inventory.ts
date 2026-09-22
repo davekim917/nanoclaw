@@ -7,6 +7,7 @@ import Database from 'better-sqlite3';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_OPUS_MODEL,
@@ -14,6 +15,8 @@ import {
   DEFAULT_HAIKU_MODEL,
   resolveEffectiveModel,
 } from '../src/flag-parser.js';
+import { isExcludedPluginPath, splitExcludedPlugins } from '../src/plugin-exclusions.js';
+import { loadPluginScopes, pluginAllowedForWorkgroup } from '../src/plugin-scopes.js';
 
 const ROOT = process.cwd(); // live data: data/, groups/
 // Code defaults are read from the same tree the imported constants come from.
@@ -36,6 +39,14 @@ const effortFor = (fam: string) =>
   grab(claudeTs, new RegExp(`m === '${fam}'[^\\n]*return '([a-z]+)'`)) !== '?'
     ? grab(claudeTs, new RegExp(`m === '${fam}'[^\\n]*return '([a-z]+)'`))
     : grab(claudeTs, new RegExp(`startsWith\\('claude-${fam}-'\\)\\) return '([a-z]+)'`));
+// Mirrors defaultEffortForModel in the container claude.ts: the family default
+// follows the RESOLVED model, and Haiku has no effort control at all.
+const claudeFamilyEffort = (model: string) => {
+  const m = model.toLowerCase();
+  if (m.startsWith('claude-haiku-')) return '(none — haiku)';
+  const fam = m.startsWith('claude-sonnet-') ? 'sonnet' : m.startsWith('claude-fable-') ? 'fable' : 'opus';
+  return `${effortFor(fam)} (family default)`;
+};
 const installDefaults = {
   claude: {
     unpinnedGroupModel: DEFAULT_OPUS_MODEL,
@@ -55,8 +66,8 @@ const installDefaults = {
 };
 
 // ── 2. Per group: container.json (authoritative) vs container_configs (projection)
-type Group = { id: string; name: string; folder: string };
-const groups = db.prepare('select id, name, folder from agent_groups order by folder').all() as Group[];
+type Group = { id: string; name: string; folder: string; workgroup_id: string | null };
+const groups = db.prepare('select id, name, folder, workgroup_id from agent_groups order by folder').all() as Group[];
 const dbCfg = new Map(
   (db.prepare('select agent_group_id, provider, model, effort from container_configs').all() as any[]).map((r) => [
     r.agent_group_id,
@@ -77,10 +88,11 @@ const groupRows = groups.map((g) => {
     : provider === 'claude'
       ? `${DEFAULT_OPUS_MODEL} (default)`
       : `${inst.model} (default)`;
-  const effEffort = effort || (provider === 'claude' ? `${effortFor('opus')} (family default)` : `${inst.effort} (default)`);
+  const effEffort =
+    effort || (provider === 'claude' ? claudeFamilyEffort(effModel) : `${inst.effort} (default)`);
   const drift =
-    (d.model ?? '') !== (cj.model ?? '') || (d.effort ?? '') !== (cj.effort ?? '')
-      ? `DB=${d.model || '-'}/${d.effort || '-'}`
+    (d.provider || 'claude') !== provider || (d.model ?? '') !== (cj.model ?? '') || (d.effort ?? '') !== (cj.effort ?? '')
+      ? `DB=${d.provider || 'claude'}:${d.model || '-'}/${d.effort || '-'}`
       : '';
   return { folder: g.folder, id: g.id, provider, model: effModel, effort: effEffort, drift };
 });
@@ -144,6 +156,59 @@ for (const g of groups) {
       });
     }
   }
+}
+
+// Plugin agent defs: every ~/plugins/<repo> is mounted into every group unless
+// that group excludes it (container.json excludePlugins, top-level or sub-path)
+// or the plugin is scoped to other workgroups — the same two predicates the
+// spawn path and the in-container walkers apply.
+const pluginsRoot = path.join(os.homedir(), 'plugins');
+const scopes = loadPluginScopes();
+const groupMeta = groups.map((g) => {
+  const cj = JSON.parse(read(path.join(ROOT, 'groups', g.folder, 'container.json')) || '{}');
+  return { folder: g.folder, wg: g.workgroup_id ?? g.folder, excluded: splitExcludedPlugins(cj.excludePlugins) };
+});
+const walk = (dir: string, rel: string, out: string[]) => {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    if (e.name === 'node_modules' || e.name.startsWith('.')) continue;
+    const r = rel ? `${rel}/${e.name}` : e.name;
+    if (e.isDirectory()) walk(path.join(dir, e.name), r, out);
+    else if (/\/agents\/[^/]+\.(md|toml)$/.test(`/${r}`)) out.push(r);
+  }
+};
+const reachLabel = (reached: string[]) => {
+  const missing = groupMeta.map((g) => g.folder).filter((f) => !reached.includes(f));
+  if (!missing.length) return 'all groups';
+  if (!reached.length) return 'no group';
+  return missing.length < reached.length ? `all except ${missing.join(',')}` : reached.join(',');
+};
+const pluginDefs: string[] = [];
+walk(pluginsRoot, '', pluginDefs);
+for (const rel of pluginDefs) {
+  const src = read(path.join(pluginsRoot, rel));
+  const isMd = rel.endsWith('.md');
+  const model = isMd ? fm(src, 'model') : toml(src, 'model');
+  const effort = isMd ? fm(src, 'effort') : toml(src, 'model_reasoning_effort');
+  if ((model === '?' || model === 'inherit') && (effort === '?' || /\/worker-[^/]+$/.test(rel))) continue;
+  const repo = rel.split('/')[0];
+  // Mirrors IN_TREE_SHADOWED_PLUGINS in src/container-runner.ts: never mounted.
+  if (repo === 'design-artifact-loop' || repo === 'gitnexus') continue;
+  const pluginDir = rel.replace(/\/agents\/[^/]+$/, '');
+  const reach = groupMeta.filter(
+    (g) => pluginAllowedForWorkgroup(repo, g.wg, scopes) && !isExcludedPluginPath(pluginDir, g.excluded),
+  );
+  subagents.push({
+    where: `plugin:${pluginDir} → ${reachLabel(reach.map((g) => g.folder))}`,
+    name: path.basename(rel),
+    model: model === '?' ? '(inherit)' : model,
+    effort: effort === '?' ? '(inherit)' : effort,
+  });
 }
 
 // ── 6. Session sticky pins (-m/-e sticky) on active sessions ────────────────
