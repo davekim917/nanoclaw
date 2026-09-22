@@ -132,3 +132,36 @@ describe('the roster inside the full subtext', () => {
     expect(formatStatusSubtext()).toBe('opus-5 · xhigh');
   });
 });
+
+describe('recordSubagent — persistence (#1028)', () => {
+  it('writes the snapshot only when a deployment actually changes', async () => {
+    const { closeSessionDb, initTestSessionDb } = await import('./modules/mailbox/testing.js');
+    const { getAgentMailbox } = await import('./mailbox/index.js');
+    const { recordSubagent, resetTurnStatus, setTurnSettings } = await import('./turn-status.js');
+    initTestSessionDb();
+    try {
+      resetTurnStatus();
+      setTurnSettings('claude-opus-5[1m]', 'xhigh');
+      const ops = getAgentMailbox().operations;
+      const original = ops.setState.bind(ops);
+      let writes = 0;
+      ops.setState = (key: string, value: string) => {
+        if (key === 'status_subtext_snapshot') writes++;
+        original(key, value);
+      };
+      try {
+        recordSubagent('t1', { type: 'worker-high', model: 'claude-sonnet-5' });
+        // Claude reports the same worker on every frame; none of these change anything.
+        for (let i = 0; i < 50; i++) recordSubagent('t1', { model: 'claude-sonnet-5' });
+        expect(writes).toBe(1);
+        recordSubagent('t1', { effort: 'high' });
+        expect(writes).toBe(2);
+      } finally {
+        ops.setState = original;
+      }
+    } finally {
+      resetTurnStatus();
+      closeSessionDb();
+    }
+  });
+});
