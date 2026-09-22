@@ -786,7 +786,7 @@ fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6 SMOKE_CONTROLLER_SEND_TO=campaign-ro
 # controller with this process's environment (smoke-campaign-controller.py:1393
 # -> run_read_only -> spawn :638-650, env=None) and fell back to
 # ${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases
-# (smoke-evidence-barrier.sh:556). No pin for the campaign lives there, so the
+# (smoke-evidence-barrier.sh:681). No pin for the campaign lives there, so the
 # journeys barrier took its "no gate pin owns it" path (smoke-journeys.py:997)
 # and the campaign stranded at the lanes barrier with no verdict.
 genv() { sed -n "s/^$1=//p" "$C/gate-env.txt" | tail -n 1; }

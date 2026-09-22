@@ -360,7 +360,7 @@ grep -q "exec 3>&1 1>&2" "$W" || fail "stdout must be moved to fd 3 before anyth
 # env file, so a key the install added -- SMOKE_GATE_LEASE_DIR -- was dropped
 # and the evidence barrier the controller step spawns with this environment
 # (smoke-campaign-controller.py:1393 -> spawn :638-650, env=None) fell back to
-# a lease dir holding no pin (smoke-evidence-barrier.sh:556). NOT_CONFIG is the
+# a lease dir holding no pin (smoke-evidence-barrier.sh:681). NOT_CONFIG is the
 # only thing withheld now, and it is ignored, exactly as an unlisted name was.
 new_case env-is-the-list
 claim; contract

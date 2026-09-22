@@ -46,7 +46,7 @@ INBOUND_DB = os.environ.get("SMOKE_CONTROLLER_LIVE_INBOUND_DB", "/workspace/inbo
 # process's environment (smoke-campaign-controller.py:1393 -> run_read_only ->
 # spawn, :638-650, env=None), and it read the fallback
 # ${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases
-# (smoke-evidence-barrier.sh:556). No pin for the campaign lives there, so
+# (smoke-evidence-barrier.sh:681). No pin for the campaign lives there, so
 # smoke-journeys.py's barrier took the "no gate pin owns it" path (:997) and
 # every campaign stranded at the lanes barrier.
 #
@@ -78,7 +78,7 @@ CONFIG_PREFIX = "SMOKE_"
 NOT_CONFIG = frozenset((
     # This wrapper's own seams, read from the process env above and documented
     # there as process-env-only. SMOKE_CONTROLLER_CRASH_AT is the controller's
-    # kill-injection seam (smoke-campaign-controller.py:212-213, os._exit) and
+    # kill-injection seam (smoke-campaign-controller.py:213-214, os._exit) and
     # reaches it through CHILD_ENV, so the file must not be able to set it.
     "SMOKE_CONTROLLER_ENV_FILE", "SMOKE_CONTROLLER_SCRIPT_DIR", "SMOKE_CONTROLLER_CRASH_AT",
     "SMOKE_CONTROLLER_LIVE_START", "SMOKE_CONTROLLER_LIVE_BUDGET", "SMOKE_CONTROLLER_LIVE_GH_CMD",

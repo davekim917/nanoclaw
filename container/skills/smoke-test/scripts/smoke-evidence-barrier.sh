@@ -437,6 +437,12 @@ lane_stale_after_refreeze() {
   return 1
 }
 
+# Lane-marker progress, counted by the loop below for PAIR IDENTITY (after
+# it): whether the lanes are still being worked decides whether an absent
+# identity record is progress not yet written or a finished phase without it.
+LANE_MARKERS_OUTSTANDING=0
+LANE_MARKERS_PRESENT=0
+
 while IFS= read -r marker; do
   case "$marker" in
     /*|../*|*/../*|*/..)
@@ -464,8 +470,10 @@ while IFS= read -r marker; do
   marker_path="$RUN_DIR/$marker"
   if [ ! -s "$marker_path" ]; then
     MISSING+=("$marker")
+    LANE_MARKERS_OUTSTANDING=$(( LANE_MARKERS_OUTSTANDING + 1 ))
     continue
   fi
+  LANE_MARKERS_PRESENT=$(( LANE_MARKERS_PRESENT + 1 ))
 
   expected_gen="$(expected_generation "$lane_id")"
 
@@ -507,6 +515,123 @@ while IFS= read -r marker; do
     fi
   fi
 done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
+
+# PAIR IDENTITY. A contract carrying `pairIdentity: "required"` owes a frozen
+# deployed pair and a clean check record before either phase passes. Before
+# this, the only enforcement point was the campaign controller's verdict
+# (validate_synthesis, GO branch only), reached after every lane had run: two
+# campaigns synthesised GO and published BLOCKED on "pair identity not ok
+# (last check: none)" alone (XZO #2092: pr2088 never ran `start`, pr2045 ran
+# `start` and never `check`), while this barrier reported ready with the file
+# absent. Here it is refused where the owner can still act on it, and through
+# the channel the controller already publishes and re-offers on
+# (controller/barrier-<phase>.json).
+#
+# OPT-IN BY THE RUN'S OWN CONTRACT. smoke-run-scaffold.sh `contract` writes the
+# field on every pr contract, so a run is held to it exactly when the contract
+# its owner wrote says so; a contract written before the field existed never
+# carries it and gets this barrier's previous answer byte for byte. Any other
+# value refuses rather than silently switching the check off.
+#
+# THE RULE, at identity.json's CURRENT freezeGeneration (a refreeze retires
+# older receipts, as `smoke-pair-identity.sh finish` does, :335-339):
+#   - no identity.json: MISSING while no lane marker exists yet (the owner is
+#     about to freeze, the normal first step), INVALID once any does — evidence
+#     is being gathered against a pair nobody froze.
+#   - no check at this generation: MISSING while any lane marker is still
+#     outstanding (lanes check at their end), INVALID once none is — the lanes
+#     finished and none of them recorded the pair.
+#   - any `drift` or `source-mismatch` at this generation: INVALID, and not
+#     cleared by a later `ok` check: a pair that changed under the run did
+#     change, and a later match does not un-change it. Genuine, so the remedy
+#     is the bounded `refreeze` (then redispatch) or a BLOCKED verdict.
+#   - the latest check at this generation not `ok` (an `unreadable` read):
+#     INVALID until a fresh check reads the pair.
+#   - a record line that is not JSON: INVALID, whatever its generation, as
+#     `finish` refuses it (:332-334) — a check only appends, so it cannot heal.
+# The MISSING -> INVALID transitions are deliberate: the controller re-offers
+# an acknowledged step when `invalid[]` changes and never on `missing[]`
+# (refusal_digest), so an owner is woken at the moment the lanes stop and not
+# on its own progress. Stronger than the verdict's own last-line test, which
+# is therefore implied by it for every run this applies to.
+PAIR_IDENTITY_MODE="$(jq -r 'if has("pairIdentity") then (.pairIdentity | tostring) else empty end' "$CONTRACT" 2>/dev/null ||
+  printf 'unreadable')"
+if [ -n "$PAIR_IDENTITY_MODE" ] && [ "$PAIR_IDENTITY_MODE" != required ]; then
+  INVALID+=("completion-contract.json")
+  INVALID_REASONS+=("completion-contract.json: pairIdentity is \"$PAIR_IDENTITY_MODE\" — the only value is \"required\"; this barrier will not guess whether the pair check applies")
+elif [ "$PAIR_IDENTITY_MODE" = required ] && [ -z "${refreeze_error:-}" ]; then
+  IDENTITY_CHECKS_REL="coordinator/identity-checks.ndjson"
+  PAIR_TOOL="$SCRIPT_DIR/smoke-pair-identity.sh"
+  printf -v PAIR_RUN_Q '%q' "$RUN_DIR"
+  if [ ! -s "$RUN_DIR/$IDENTITY_REL" ]; then
+    CONTRACT_PR="$(jq -r '.pr // "<pr>"' "$CONTRACT" 2>/dev/null || printf '<pr>')"
+    START_HOW="freeze it before any lane runs: SMOKE_GATE_FRONTEND_SERVICE=<frontendPreviewId> SMOKE_GATE_BACKEND_SERVICE=<backendPreviewId> bash $PAIR_TOOL start $PAIR_RUN_Q, with the two PR preview service ids \`smoke-pr-gate.sh check $CONTRACT_PR\` prints (never the develop pair the gate env names: start refuses a pair that does not serve this contract's sourceSha)"
+    if [ "$LANE_MARKERS_PRESENT" -gt 0 ]; then
+      INVALID+=("$IDENTITY_REL")
+      INVALID_REASONS+=("$IDENTITY_REL: lane markers exist but the deployed pair was never frozen — $START_HOW; then record a check (smoke-pair-identity.sh check) before this phase can pass")
+    else
+      MISSING+=("$IDENTITY_REL")
+    fi
+  else
+    FREEZE_GEN="$(jq -r '(.freezeGeneration // 1) | tostring' "$RUN_DIR/$IDENTITY_REL" 2>/dev/null || printf '1')"
+    printf '%s' "$FREEZE_GEN" | grep -Eq '^[0-9]+$' || FREEZE_GEN=1
+    FROZEN_FE="$(jq -r '.frontend.service // "<frontend service>"' "$RUN_DIR/$IDENTITY_REL" 2>/dev/null || printf '<frontend service>')"
+    FROZEN_BE="$(jq -r '.backend.service // "<backend service>"' "$RUN_DIR/$IDENTITY_REL" 2>/dev/null || printf '<backend service>')"
+    # The frozen ids ride on the command line on purpose: the gate env the
+    # owner sources names the DEVELOP pair, and `check` identifies the pair
+    # from its env (smoke-pair-identity.sh:61-62), so a check run with it
+    # compares the frozen preview against the wrong services and records a
+    # drift that is a real BLOCKED (:153-159).
+    CHECK_HOW="SMOKE_GATE_FRONTEND_SERVICE=$FROZEN_FE SMOKE_GATE_BACKEND_SERVICE=$FROZEN_BE bash $PAIR_TOOL check $PAIR_RUN_Q <label>"
+    if [ -e "$RUN_DIR/$IDENTITY_CHECKS_REL" ]; then
+      checks_result="$(jq -Rn --arg gen "$FREEZE_GEN" '
+        [inputs | select(test("\\S"))] as $raw
+        | [$raw | to_entries[] | {i: (.key + 1), rec: (.value | try fromjson catch null)}] as $rows
+        | ([$rows[] | select((.rec | type) != "object")] | first) as $bad
+        | if $bad != null then {status: "damaged", reason: ("line \($bad.i) is not a JSON object")}
+          else
+            [$rows[] | .rec | select(((.freezeGeneration // 1) | tostring) == $gen)] as $cur
+            | ([$cur[] | select(.verdict == "drift" or .verdict == "source-mismatch")] | first) as $gone
+            | if ($cur | length) == 0 then {status: "none"}
+              elif $gone != null then
+                {status: "genuine", reason: ("check \"\($gone.label // "?")\" recorded \($gone.verdict) at freeze generation " + $gen)}
+              elif ($cur[-1].verdict // "missing") != "ok" then
+                {status: "bad", reason: ("the latest check at freeze generation " + $gen + " (\"\($cur[-1].label // "?")\") is \($cur[-1].verdict // "missing"), not ok")}
+              else {status: "ok"} end
+          end' <"$RUN_DIR/$IDENTITY_CHECKS_REL" 2>/dev/null)" ||
+        checks_result='{"status":"damaged","reason":"the check record could not be read"}'
+    else
+      checks_result='{"status":"none"}'
+    fi
+    checks_status="$(jq -r '.status' <<<"$checks_result")"
+    checks_reason="$(jq -r '.reason // empty' <<<"$checks_result")"
+    case "$checks_status" in
+      ok) ;;
+      none)
+        if [ "$LANE_MARKERS_OUTSTANDING" -eq 0 ]; then
+          INVALID+=("$IDENTITY_CHECKS_REL")
+          INVALID_REASONS+=("$IDENTITY_CHECKS_REL: every lane marker is in but no pair-identity check was recorded at freeze generation $FREEZE_GEN — each lane checks at its start and end; record one now with $CHECK_HOW")
+        else
+          MISSING+=("$IDENTITY_CHECKS_REL")
+        fi
+        ;;
+      genuine)
+        INVALID+=("$IDENTITY_CHECKS_REL")
+        INVALID_REASONS+=("$IDENTITY_CHECKS_REL: $checks_reason — the deployed pair changed under this run or does not serve its sourceSha, and a later ok check does not clear that. Re-freeze once with smoke-pair-identity.sh refreeze $PAIR_RUN_Q \"<reason>\" (then redispatch every lane), or conclude BLOCKED; never re-run start")
+        ;;
+      damaged)
+        # A further check appends after the damage and does not repair it;
+        # `finish` refuses the same file (smoke-pair-identity.sh:332-334).
+        INVALID+=("$IDENTITY_CHECKS_REL")
+        INVALID_REASONS+=("$IDENTITY_CHECKS_REL: $checks_reason — the check record is damaged and another check cannot repair it (it only appends); do not edit it by hand: conclude BLOCKED, or escalate if the pair evidence matters to this verdict")
+        ;;
+      *)
+        INVALID+=("$IDENTITY_CHECKS_REL")
+        INVALID_REASONS+=("$IDENTITY_CHECKS_REL: $checks_reason — record a fresh check with $CHECK_HOW")
+        ;;
+    esac
+  fi
+fi
 
 # JOURNEY SELECTION. A run that pinned the gate's journey selection
 # (journeys/selection.json, written only by `smoke-journeys.py pin-run`) owes
@@ -557,7 +682,7 @@ JOURNEY_LEASE_DIR="${SMOKE_GATE_LEASE_DIR:-${SMOKE_GATE_SHARED_ROOT:-/workspace/
 # The run directory's OWN name is the run id; the contract's runId is checked
 # against it, so a borrowed runId borrows nothing. Derived exactly as the
 # scaffold derives it — the UNRESOLVED `basename "$RUN_DIR"` (its fence
-# smoke-run-scaffold.sh:199, the contract's runId :532, adopt :769) — never
+# smoke-run-scaffold.sh:199, the contract's runId :548, adopt :786) — never
 # through realpath: a run dir reached through a symlink (run-alias →
 # run-storage) is fenced, written and adopted as run-alias, and resolving it
 # here rejected that legitimate contract (#898 review 11). File checks keep

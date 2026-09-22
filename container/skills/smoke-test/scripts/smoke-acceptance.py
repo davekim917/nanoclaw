@@ -7,7 +7,7 @@ stable id, quoted from a FROZEN request source (an issue body, a Slack thread,
 the PR body's prose) so a `met` can be tied back to what was asked, not to
 what the author chose to promise. This script is read-only bookkeeping beside
 the lane -- it decides nothing about the verdict and the barrier never reads
-it (smoke-evidence-barrier.sh:622-631 turns every invalid entry into exit 1,
+it (smoke-evidence-barrier.sh:747-756 turns every invalid entry into exit 1,
 so a warning channel cannot live there; SKILL.md "Acceptance verifier").
 
   extract <run-dir> [--force]       intent/pr-body.md (and intent/pr-<n>-body.md

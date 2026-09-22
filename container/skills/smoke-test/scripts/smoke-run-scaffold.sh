@@ -526,6 +526,22 @@ contract)
   [ "$FENCED_STATE_KIND" != pr ] ||
     IDENTITY="$(jq -cn --argjson pr "$FENCED_PR" --arg slug "$FENCED_REPO_SLUG" '{pr:$pr, repoSlug:$slug}')"
 
+  # A pr contract owes a frozen deployed pair and a clean check record before
+  # either barrier phase passes (smoke-evidence-barrier.sh, PAIR IDENTITY):
+  # written here, after SMOKE_CONTRACT_EXTRA, so no deployment knob can drop
+  # it. A rewrite over a contract that predates the field keeps that
+  # contract's terms — `--regenerate` and a new-build rewrite continue a run
+  # that started without the requirement, and must not have it land mid-run
+  # unannounced (XZO #2092). `adopt` never rewrites it (`. + $identity`).
+  PAIR_IDENTITY='{}'
+  if [ "$FENCED_STATE_KIND" = pr ]; then
+    PAIR_IDENTITY='{"pairIdentity":"required"}'
+    if [ -e "$CONTRACT" ] &&
+       [ "$(jq -r 'type == "object" and (has("pairIdentity") | not)' "$CONTRACT" 2>/dev/null)" = true ]; then
+      PAIR_IDENTITY='{}'
+    fi
+  fi
+
   mkdir -p "$RUN_DIR/markers"
   tmp="$(mktemp "$RUN_DIR/.completion-contract.XXXXXX")"
   jq -n \
@@ -538,6 +554,7 @@ contract)
     --argjson markers "$MARKERS" \
     --argjson extra "$EXTRA" \
     --argjson identity "$IDENTITY" \
+    --argjson pairIdentity "$PAIR_IDENTITY" \
     '$extra + {
       schemaVersion: 2,
       runId: $runId,
@@ -549,7 +566,7 @@ contract)
       markerDir: "markers",
       terminalStatuses: ["pass","fail","blocked","void","completed"],
       createdAt: $now
-    } + $identity' > "$tmp"
+    } + $identity + $pairIdentity' > "$tmp"
   mv "$tmp" "$CONTRACT"
   jq -cn --arg path "$CONTRACT" --argjson lanes "$LANES" \
     '{ok:true,contract:$path,laneCount:($lanes|length)}'
