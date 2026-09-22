@@ -29,7 +29,8 @@ function chatSendDenial(): string | null {
   }
   return null;
 }
-import { getCurrentInReplyTo, resolveRequestCandidate } from '../db/session-state.js';
+import { getCurrentInReplyTo } from '../db/session-state.js';
+import { resolveRequestCandidate } from '../modules/mailbox/session-state.js';
 import { getSessionRouting, getTaskSeriesId } from '../db/session-routing.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
