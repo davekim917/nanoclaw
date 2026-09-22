@@ -84,7 +84,7 @@ const subagents = new Map<string, { type: string | null; model: string | null; e
 export function recordContextTokens(tokens: number | null | undefined): void {
   if (typeof tokens !== 'number' || !Number.isFinite(tokens) || tokens <= 0) return;
   const next = Math.round(tokens);
-  if (next === contextTokens) return;
+  if (next === contextTokens && !persistFailed) return;
   contextTokens = next;
   persist();
 }
@@ -126,7 +126,7 @@ export function setTurnSettings(nextModel?: string | null, nextEffort?: string |
  * them.
  */
 export function clearContextTokens(): void {
-  if (contextTokens === null) return;
+  if (contextTokens === null && !persistFailed) return;
   contextTokens = null;
   persist();
 }
@@ -209,11 +209,19 @@ function persist(): void {
   };
   try {
     getAgentMailbox().operations.setState(SNAPSHOT_KEY, JSON.stringify(snap));
+    persistFailed = false;
   } catch {
     // No mailbox (unit tests) or a transient DB error: the in-memory store
-    // still serves this process, and a missed footer is the only cost.
+    // still serves this process. Remember the failure, so the skip-if-unchanged
+    // checks in the setters don't strand the snapshot on a value that never
+    // reached the DB — the next setter call writes again even if nothing moved
+    // (#1023).
+    persistFailed = true;
   }
 }
+
+/** True when the last snapshot write failed and the DB copy is behind memory. */
+let persistFailed = false;
 
 /** Load the persisted snapshot into this process. Returns false if none. */
 export function hydrateTurnStatus(): boolean {
@@ -222,9 +230,13 @@ export function hydrateTurnStatus(): boolean {
   try {
     raw = getAgentMailbox().operations.getState(SNAPSHOT_KEY)?.value;
   } catch {
+    forgetForeignState();
     return false;
   }
-  if (!raw) return false;
+  if (!raw) {
+    forgetForeignState();
+    return false;
+  }
   try {
     const snap = JSON.parse(raw) as Partial<Snapshot>;
     model = snap.model ?? null;
@@ -237,8 +249,30 @@ export function hydrateTurnStatus(): boolean {
     for (const [key, fields] of snap.subagents ?? []) subagents.set(key, fields);
     return true;
   } catch {
+    forgetForeignState();
     return false;
   }
+}
+
+/**
+ * FAIL CLOSED in a process that does not own the store (#1023).
+ *
+ * The MCP subprocess is long-lived across turns. If a read of the snapshot
+ * fails (e.g. SQLITE_BUSY while poll-loop is writing) and it kept what the
+ * previous successful read loaded, `isOwnConversation` would answer for the
+ * PREVIOUS turn's conversation — and in an agent-shared session a send to that
+ * channel would be stamped, putting the fleet's model and context into a
+ * conversation that is not this turn's. An unreadable snapshot means "route
+ * unknown", which the gate answers with no stamp.
+ */
+function forgetForeignState(): void {
+  contextTokens = null;
+  model = null;
+  effort = null;
+  ultracode = false;
+  ownChannelType = null;
+  ownPlatformId = null;
+  subagents.clear();
 }
 
 /**
@@ -264,7 +298,8 @@ export function recordSubagent(
   };
   // Claude calls this once per worker frame, so a large fan-out would otherwise
   // write thousands of identical snapshots. Persist only on a real change (#1028).
-  if (prior && prior.type === next.type && prior.model === next.model && prior.effort === next.effort) return;
+  if (prior && prior.type === next.type && prior.model === next.model && prior.effort === next.effort && !persistFailed)
+    return;
   subagents.set(key, next);
   persist();
 }
@@ -275,7 +310,7 @@ export function recordSubagent(
  * it into the next would report workers that are no longer running.
  */
 export function clearSubagents(): void {
-  if (subagents.size === 0) return;
+  if (subagents.size === 0 && !persistFailed) return;
   subagents.clear();
   persist();
 }
@@ -290,6 +325,7 @@ export function resetTurnStatus(): void {
   ownPlatformId = null;
   subagents.clear();
   ownsStore = false;
+  persistFailed = false;
   try {
     getAgentMailbox().operations.deleteState(SNAPSHOT_KEY);
   } catch {
