@@ -3290,8 +3290,12 @@ scaffold_as "$ADOPT_T2" marker "$ADOPT_DIR" S1 completed 'by the recovery owner'
 # clean one so this still asserts only what adoption leaves behind.
 jq -e '.pairIdentity == "required"' "$ADOPT_DIR/completion-contract.json" >/dev/null
 mkdir -p "$ADOPT_DIR/coordinator"
-printf '{"ok":true,"freezeGeneration":1,"history":[],"frontend":{"service":"srv-seed00000001"},"backend":{"service":"srv-seed00000002"}}\n' \
-  > "$ADOPT_DIR/coordinator/identity.json"
+# Shaped exactly as `start` writes it on a PR contract: the barrier validates
+# the frozen record before reading any receipt.
+jq -c '.sourceSha as $s | {ok:true,freezeGeneration:1,history:[],expectedSourceSha:$s,
+    frontend:{service:"srv-seed00000001",deploy:"dep-seed00000001",commit:$s},
+    backend:{service:"srv-seed00000002",deploy:"dep-seed00000002",commit:$s}}' \
+  "$ADOPT_DIR/completion-contract.json" > "$ADOPT_DIR/coordinator/identity.json"
 printf '{"label":"seed","verdict":"ok","freezeGeneration":1}\n' > "$ADOPT_DIR/coordinator/identity-checks.ndjson"
 bash "$BARRIER" "$ADOPT_DIR" lanes | jq -e '.ready == true' >/dev/null
 [ "$(jq -r '.challengerDeadline' "$STATE_DIR/pr-126-state.json")" = "$ADOPT_DEADLINE" ]

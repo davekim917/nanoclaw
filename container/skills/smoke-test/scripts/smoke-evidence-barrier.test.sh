@@ -592,7 +592,8 @@ pi_marker() { # <lane> [generation]
 pi_freeze() { # [freezeGeneration]
   jq -n --argjson g "${1:-1}" --arg sha "$PI_SHA" \
     '{ok:true,freezeGeneration:$g,history:(if $g > 1 then [{reason:"backend replaced"}] else [] end),
-      frontend:{service:"srv-pife000000001"},backend:{service:"srv-pibe000000001"}}
+      frontend:{service:"srv-pife000000001",deploy:"dep-pife000000001",commit:$sha},
+      backend:{service:"srv-pibe000000001",deploy:"dep-pibe000000001",commit:$sha}}
      + (if $g > 1 then {refreezeLaneSnapshot:{contractPresent:true,sourceSha:$sha,
           lanes:[{id:"X",generation:1},{id:"Y",generation:1}]}} else {} end)' > "$PI/coordinator/identity.json"
 }
@@ -633,6 +634,39 @@ done
 pi_checks '{"label":"X-end","verdict":"ok","freezeGeneration":1}'
 pi_expect lanes '.ready == true' "an ok check must clear lanes"
 pi_expect synthesis '.ready == true' "an ok check must clear synthesis"
+# The frozen record is validated BEFORE any receipt is trusted (#1039 round 3):
+# `{}` plus a hand-written ok line used to read as ready, i.e. GO with no pair
+# ever recorded. Each malformed shape refuses; the clean one above still passes.
+cp "$PI/coordinator/identity.json" "$PI/id.good"
+for bad in '{}' \
+    "$(jq -c '.ok = false' "$PI/id.good")" \
+    "$(jq -c 'del(.backend)' "$PI/id.good")" \
+    "$(jq -c '.frontend.commit = ""' "$PI/id.good")" \
+    "$(jq -c 'del(.backend.deploy)' "$PI/id.good")" \
+    "$(jq -c '.freezeGeneration = 0' "$PI/id.good")" \
+    '[]'; do
+  printf '%s\n' "$bad" > "$PI/coordinator/identity.json"
+  pi_expect synthesis '.ready == false and .invalid == ["coordinator/identity.json"]' \
+    "a malformed identity.json ($bad) must refuse, not read as ready"
+done
+# ...and the round-3 shape is caught by THIS check, not by an unrelated rule.
+printf '{}\n' > "$PI/coordinator/identity.json"
+pi_expect synthesis '(.invalidReasons[0] | contains("not a frozen pair") and contains("ok is not true"))' \
+  "an empty identity.json must be refused as not a frozen pair"
+# A PR contract binds the freeze to its sourceSha: the record must name it and
+# both frozen commits must equal it. (This hand-made pr contract is incomplete
+# for the contract's own rules, so these assert only on identity.json.)
+jq '.ownershipKind = "pr" | .coordinatorOwnerToken = "tok-pi-fixture-0001" | .pr = 9001 | .runId = "pi run with spaces"' "$PI/completion-contract.json" > "$PI/c.tmp" && mv "$PI/c.tmp" "$PI/completion-contract.json"
+jq -c '. + {expectedSourceSha:"2222222222222222222222222222222222222222"}' "$PI/id.good" > "$PI/coordinator/identity.json"
+pi_expect synthesis '(.invalid | index("coordinator/identity.json")) != null and any(.invalidReasons[]; contains("expectedSourceSha does not name"))' \
+  "a PR freeze naming another sourceSha must refuse"
+jq -c --arg s "$PI_SHA" '. + {expectedSourceSha:$s} | .backend.commit = "3333333333333333333333333333333333333333"' "$PI/id.good" > "$PI/coordinator/identity.json"
+pi_expect synthesis '(.invalid | index("coordinator/identity.json")) != null and any(.invalidReasons[]; contains("frozen commits are not"))' \
+  "a PR freeze whose commits are not the sourceSha must refuse"
+jq -c --arg s "$PI_SHA" '. + {expectedSourceSha:$s}' "$PI/id.good" > "$PI/coordinator/identity.json"
+pi_expect synthesis '(.invalid | index("coordinator/identity.json")) == null' "a well-formed PR freeze must not be refused"
+pi_contract required
+cp "$PI/id.good" "$PI/coordinator/identity.json"
 # A genuine mismatch is NOT cleared by a later ok: the pair did change.
 for bad in drift source-mismatch; do
   pi_checks "{\"label\":\"X-start\",\"verdict\":\"$bad\",\"freezeGeneration\":1}" \

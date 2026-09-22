@@ -560,7 +560,8 @@ done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 #   - the latest check at this generation not `ok` (an `unreadable` read):
 #     INVALID until a fresh check reads the pair.
 #   - a record line that is not JSON: INVALID, whatever its generation, as
-#     `finish` refuses it (:376-378) — a check only appends, so it cannot heal.
+#     `finish` refuses it (smoke-pair-identity.sh:379-381) — a check only appends,
+#     so it cannot heal.
 # The MISSING -> INVALID transitions are deliberate: the controller re-offers
 # an acknowledged step when `invalid[]` changes and never on `missing[]`
 # (refusal_digest), so an owner is woken at the moment the lanes stop and not
@@ -587,6 +588,31 @@ elif [ "$PAIR_IDENTITY_MODE" = required ] && [ -z "${refreeze_error:-}" ]; then
     else
       MISSING+=("$IDENTITY_REL")
     fi
+  elif IDENTITY_SHAPE_ERR="$(jq -r --slurpfile c "$CONTRACT" '
+      def nonempty: type == "string" and length > 0;
+      ($c[0] // {}) as $k
+      | (if ($k.ownershipKind == "pr") then $k.sourceSha else null end) as $src
+      | [ (if .ok == true then empty else "ok is not true" end),
+          (.frontend, .backend | if type == "object" then empty else "a side of the pair is missing" end),
+          ([.frontend, .backend][] | objects | .service, .deploy, .commit
+             | if nonempty then empty else "a service, deploy or commit field is empty" end),
+          (if (has("freezeGeneration") | not) or ((.freezeGeneration | type) == "number"
+               and .freezeGeneration >= 1 and .freezeGeneration == (.freezeGeneration | floor))
+             then empty else "freezeGeneration is not a positive integer" end),
+          (if $src == null then empty
+           elif .expectedSourceSha != $src then "expectedSourceSha does not name this contract'"'"'s sourceSha"
+           elif (.frontend.commit? != $src) or (.backend.commit? != $src) then "the frozen commits are not this contract'"'"'s sourceSha"
+           else empty end) ]
+      | unique | join("; ")' "$RUN_DIR/$IDENTITY_REL" 2>/dev/null ||
+      printf 'not a readable JSON object')" && [ -n "$IDENTITY_SHAPE_ERR" ]; then
+    # FAIL CLOSED on the frozen record itself. Every receipt below is checked
+    # AGAINST this file, so a structurally empty one (`{}`) plus a hand-written
+    # `ok` line used to read as ready. Fields are what `start` writes
+    # (smoke-pair-identity.sh:232-235 payload; a PR contract's sourceSha must
+    # equal both commits, :139-143). Nothing repairs it in place: `refreeze`
+    # re-reads the live pair, but only over a record it can parse (:268-271).
+    INVALID+=("$IDENTITY_REL")
+    INVALID_REASONS+=("$IDENTITY_REL: not a frozen pair as smoke-pair-identity.sh start writes it ($IDENTITY_SHAPE_ERR), so no check can be verified against it; do not edit it by hand: conclude BLOCKED, or escalate if the pair evidence matters to this verdict")
   else
     FREEZE_GEN="$(jq -r '(.freezeGeneration // 1) | tostring' "$RUN_DIR/$IDENTITY_REL" 2>/dev/null || printf '1')"
     printf '%s' "$FREEZE_GEN" | grep -Eq '^[0-9]+$' || FREEZE_GEN=1

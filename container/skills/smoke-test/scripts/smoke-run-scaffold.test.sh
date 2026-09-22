@@ -49,8 +49,12 @@ seed_pair_identity() { # <run-dir>
   [ "$(jq -r '.pairIdentity // empty' "$1/completion-contract.json" 2>/dev/null)" = required ] || return 0
   [ -e "$1/coordinator/identity.json" ] && return 0
   mkdir -p "$1/coordinator"
-  printf '{"ok":true,"freezeGeneration":1,"history":[],"frontend":{"service":"srv-seed00000001"},"backend":{"service":"srv-seed00000002"}}\n' \
-    > "$1/coordinator/identity.json"
+  # Shaped as `start` writes it: the barrier validates the frozen record, and a
+  # PR contract's sourceSha must be both commits and expectedSourceSha.
+  jq -c '.sourceSha as $s | {ok:true,freezeGeneration:1,history:[],expectedSourceSha:$s,
+      frontend:{service:"srv-seed00000001",deploy:"dep-seed00000001",commit:$s},
+      backend:{service:"srv-seed00000002",deploy:"dep-seed00000002",commit:$s}}' \
+    "$1/completion-contract.json" > "$1/coordinator/identity.json"
   printf '{"label":"seed","verdict":"ok","freezeGeneration":1}\n' > "$1/coordinator/identity-checks.ndjson"
 }
 barrier() { seed_pair_identity "$1"; bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$@"; }
@@ -442,7 +446,9 @@ scaffold contract "$FIXTURE_DIR" "$OTHER_SHA" B1:browser S1:source >/dev/null
 # The barrier exits non-zero when not ready, so capture before asserting —
 # under `pipefail` a direct pipe would fail the test on the exit code alone.
 REFROZEN="$(barrier "$FIXTURE_DIR" lanes || true)"
-jq -e '.ready == false and (.invalid | sort == ["markers/B1.json","markers/S1.json"])' \
+# The pair frozen for the old build is bound to it too: its commits are the old
+# sourceSha, so the barrier refuses it until the new build's pair is re-frozen.
+jq -e '.ready == false and (.invalid | sort == ["coordinator/identity.json","markers/B1.json","markers/S1.json"])' \
   <<<"$REFROZEN" >/dev/null
 
 # F2. The barrier has always honoured `.generation`, but NOTHING could write
