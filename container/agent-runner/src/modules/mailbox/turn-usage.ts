@@ -146,12 +146,13 @@ type CumulativeMemo = { scope: string; usage: TurnUsageInfo };
 const lastCumulativeByCounter = new Map<string, CumulativeMemo>();
 
 /**
- * Providers whose `result.usage` is a running total rather than one turn's
- * own, AND whose counter resets when this process does. Both halves are
+ * Providers whose preferred usage source is a running total rather than one
+ * turn's own, AND whose counter resets when this process does. Both halves are
  * required — see the block above for why codex satisfies the first and fails
  * the second.
  *
- * Keyed per model because Claude's SDK reports `modelUsage`, a separate
+ * Explicit per-turn fallbacks bypass this set. Keyed per model because
+ * Claude's SDK reports `modelUsage`, a separate
  * running total per model: an Opus parent and a Sonnet subagent each need
  * their own baseline.
  */
