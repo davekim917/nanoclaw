@@ -1636,6 +1636,22 @@ Two scope rules keep that from becoming a hole:
   themselves; otherwise the file could rename their internals — the renewer's
   ceiling, its clock — and switch off a safety control by naming it.
 
+#### What the controller must tell the owner
+
+The controller knows things per fire that the owner cannot see and cannot do
+its job without, and they used to stay in the controller's own journal.
+
+- **The barrier's answer.** On every `lanes` and `synthesis` fire the
+  controller writes the real `smoke-evidence-barrier.sh` output to
+  `<run>/controller/barrier-<step>.json` and deletes it once the phase passes,
+  and every barrier-backed brief names that file. `invalid[]` is artifact
+  CONTENT the barrier rejects; only the owner can repair it, and no amount of
+  lane work clears it. Run `xzo-pr-pr2055-…` (XZO #2047) spent 67 minutes
+  running lanes while the barrier had already named
+  `journeys/scope-dispositions.json` invalid on the first lanes fire — the
+  journal said so, the brief did not, and the owner found out by running the
+  barrier by hand.
+
 #### The claim renewer (required alongside the live controller)
 
 A live controller needs a second, script-only series: `scripts/smoke-controller-renew.sh`.

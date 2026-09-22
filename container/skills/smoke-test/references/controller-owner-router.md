@@ -44,7 +44,13 @@ to the retained technical owner, verify its artifact receipt, and stop.
    `smoke-run-scaffold.sh` or `smoke-evidence-barrier.sh` call. For a scaffold
    writer, pass `SMOKE_GATE_OWNER=<coordinatorOwnerToken>` from
    `<run>/controller/wake.json`.
-4. Stop when the step's artifacts are written. The next controller fire picks
+4. On `lanes` and `synthesis`, read `<run>/controller/barrier-<step>.json`
+   before you start and again before you stop. The controller rewrites it every
+   fire from the real `smoke-evidence-barrier.sh` and deletes it once the phase
+   passes. `invalid[]` is artifact CONTENT the barrier rejects — yours to
+   repair, and no amount of lane work clears it; `missing[]` is what is not
+   written yet. A phase never passes while `invalid[]` is non-empty (XZO #2047).
+5. Stop when the step's artifacts are written. The next controller fire picks
    them up. If the step genuinely cannot finish in one turn (usually lanes),
    call `continue_work({ task })` before yielding and resume from durable
    state. This does not guarantee the child survives a turn/container boundary.

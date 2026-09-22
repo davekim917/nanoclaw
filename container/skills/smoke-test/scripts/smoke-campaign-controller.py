@@ -739,6 +739,10 @@ ONESHOT_TEXT = {
         "{run}/controller/dispatch-adjudicator.started first. Never post, finish or file."),
 }
 ONESHOT_ARTIFACTS = {"critic": "contact-sheet/critic.json", "adjudicator": "controller/adjudication.json"}
+# The owner steps a phase barrier gates. Their briefs carry a pointer to the
+# barrier's published answer (_brief_notes); the others have no barrier to cite.
+BARRIER_STEPS = ("lanes", "synthesis")
+
 OWNER_BRIEF = {
     "intake": (
         "Intake for this run, as the retained technical owner (pr-campaign skill flow, steps 1-2). The gate "
@@ -822,7 +826,7 @@ class EffectLayer:
             # socket, no file outside --out-dir is touched on this path.
             return {"outcome": "shadow_refused"}
         handler = {"send": self._send, "gh": self._gh, "gate": self._gate, "ncl_create": self._dispatch,
-                   "owner_wake": self._owner_wake}.get(effect.get("type"))
+                   "owner_wake": self._owner_wake, "barrier_report": self._barrier_report}.get(effect.get("type"))
         if handler is None:
             raise ControllerError("unknown effect type {!r}".format(effect.get("type")))
         try:
@@ -1214,8 +1218,76 @@ class EffectLayer:
         if step == "intake" and c.get("wake"):
             write_contained_atomic(root, [run_id, "controller", "wake.json"],
                                    json.dumps(c["wake"], sort_keys=True, indent=1) + "\n")
-        write_contained_atomic(root, [run_id, "controller", "brief-{}.md".format(step)], head + body + "\n")
+        notes = self._brief_notes(run_id, step, run, c)
+        write_contained_atomic(root, [run_id, "controller", "brief-{}.md".format(step)],
+                               head + notes + body + "\n")
         return {"outcome": "brief_written", "brief": os.path.join(run, "controller", "brief-{}.md".format(step))}
+
+    def _barrier_report(self, effect):
+        """Publish the phase barrier's own answer into the run tree.
+
+        The barrier tells the controller exactly which artifact it rejects and
+        why (smoke-evidence-barrier.sh -> invalid[]/invalidReasons[]). Before
+        this, the controller kept that to its own decisions journal -- truncated
+        to three reasons -- and woke the owner with a STATIC brief that said
+        nothing about it (XZO #2047, run
+        xzo-pr-pr2055-dacf01328421-20260921T193111Z: the lanes barrier named
+        journeys/scope-dispositions.json invalid on the 19:51:35Z fire and the
+        owner, the only party that could repair it, first learned of it at
+        20:58Z by running the barrier itself). The file is rewritten every fire
+        the phase is refused and removed the moment it passes, so it is never
+        stale advice."""
+        run_id, phase, doc = effect["runId"], effect["phase"], effect["barrier"]
+        root = self.ctl.args.run_root
+        name = "barrier-{}.json".format(phase)
+        if doc is None:
+            # Removed through the same containment the write uses, never by a
+            # joined path: an unlink is as much a write as the write is.
+            try:
+                dfd = _open_dir_contained(root, [run_id, "controller"], False)
+            except ControllerError:
+                return {"outcome": "published"}
+            try:
+                os.unlink(name, dir_fd=dfd)
+            except OSError:
+                pass
+            finally:
+                os.close(dfd)
+            return {"outcome": "published"}
+        write_contained_atomic(root, [run_id, "controller", name],
+                               json.dumps(doc, sort_keys=True, indent=1) + "\n")
+        return {"outcome": "published"}
+
+    def _brief_notes(self, run_id, step, run, claim):
+        """Run-specific preamble the STATIC OWNER_BRIEF template cannot carry:
+        what this fire's barrier refused. The controller already knows it at
+        the moment it writes the brief, and used to keep it to its journal."""
+        out = []
+        if step in BARRIER_STEPS:
+            report = os.path.join(run, "controller", "barrier-{}.json".format(step))
+            # The loud lead is for CONTENT the barrier rejects -- the thing only
+            # the owner can repair and the thing #2055 never heard about. A
+            # barrier that is merely waiting for markers the step is about to
+            # write is not news, and saying it in the same words would train the
+            # owner to skim past the one line that matters.
+            doc, _err = read_json_file(report)
+            refusing = bool(isinstance(doc, dict) and doc.get("invalid"))
+            # Stated on EVERY barrier-backed brief, not only when the file
+            # happens to exist as the brief is written: a brief is written once
+            # and a barrier is re-run every fire, so a refusal that starts
+            # later would otherwise still be invisible. The file itself is
+            # rewritten (and removed) every fire, so it is always this fire's
+            # answer.
+            out.append(
+                "{lead} The barrier's own answer for this run is `{report}`, rewritten every controller fire and "
+                "removed once the phase passes. `invalid[]` names artifacts whose CONTENT the barrier rejects — "
+                "they are yours to repair and no amount of lane work clears them — and `missing[]` names what is "
+                "not written yet. Read it before you start and again before you report this step done: the phase "
+                "cannot pass while `invalid[]` is non-empty, and the controller will not tell you twice.".format(
+                    report=report,
+                    lead=("**THE BARRIER IS ALREADY REFUSING THIS PHASE.**" if refusing
+                          else "**CHECK THE BARRIER, DO NOT ASSUME IT.**")))
+        return "".join(n + "\n\n" for n in out)
 
 
 def frozen_terminal_verb(detail):
@@ -1559,6 +1631,19 @@ class Controller:
 
     def obligations(self):
         return self.journal.obligations()
+
+    def publish_barrier(self, run_id, phase, barrier):
+        """Put this fire's barrier answer where the OWNER can read it, or take
+        a stale one away once the phase passes. Not an obligation: it carries
+        no promise, it is a mirror of a check that is re-run every fire. Shadow
+        refuses it like every other run-tree write."""
+        self.effects.perform({"type": "barrier_report", "runId": run_id, "phase": phase,
+                              "barrier": None if barrier is None else {
+                                  "at": iso(self.now), "phase": phase,
+                                  "ready": bool(barrier.get("ready")),
+                                  "missing": barrier.get("missing") or [],
+                                  "invalid": barrier.get("invalid") or [],
+                                  "invalidReasons": barrier.get("invalidReasons") or []}})
 
     def record(self, run_id, kind, slot, state, attempt=None, detail=None):
         rec = {"at": iso(self.now), "fire": self.fire, "runId": run_id, "kind": kind, "slot": slot,
@@ -2357,12 +2442,17 @@ class Controller:
             timed = self._maybe_challenger_timeout(run_id, claim, run)
             if timed:
                 return timed
+            # PUBLISHED BEFORE THE WAKE, not after: the brief is written by
+            # owner_step's effect, and _brief_notes can only cite a file that
+            # already exists.
+            self.publish_barrier(run_id, "lanes", lanes)
             self.owner_step(run_id, "lanes", "lanes", done=False)
             if lanes.get("invalid"):
                 self.decide(run_id, "lanes", "escalate", "coordination_model",
                             "lane evidence invalid (redispatch is a judgment call)",
                             invalid=lanes.get("invalid"), reasons=(lanes.get("invalidReasons") or [])[:3])
             return "lanes"
+        self.publish_barrier(run_id, "lanes", None)
         self.owner_step(run_id, "lanes", "lanes", done=True)
 
         if not run.has("coordinator/preliminary.md"):
@@ -2385,6 +2475,7 @@ class Controller:
         synthesis_doc, syn_err = run.synthesis()
         if syn_err == "missing":
             if not syn_barrier.get("ready"):
+                self.publish_barrier(run_id, "synthesis", syn_barrier)
                 if syn_barrier.get("invalid"):
                     self.decide(run_id, "synthesis", "escalate", "coordination_model",
                                 "synthesis barrier invalid", invalid=syn_barrier.get("invalid"))
@@ -2395,6 +2486,7 @@ class Controller:
             timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)
             if timed:
                 return timed
+            self.publish_barrier(run_id, "synthesis", None)
             self.owner_step(run_id, "synthesis", "synthesis", done=False)
             adj = self._adjudication(run_id, run)
             return adj or "synthesis"

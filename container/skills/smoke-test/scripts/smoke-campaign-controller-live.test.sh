@@ -872,4 +872,54 @@ for variant in budgeted spent; do
 done
 unset variant name t want
 
+
+# --- XZO #2047: a barrier refusal must reach the OWNER ------------------------
+# Run xzo-pr-pr2055-dacf01328421-20260921T193111Z: the lanes barrier answered
+# `invalid: ["journeys/scope-dispositions.json"]` on the 19:51:35Z fire -- the
+# FIRST lanes fire, before a single lane had run -- and every fire after it. The
+# controller journaled that as an `escalate` decision with the reasons truncated
+# to three, wrote the owner a brief from the STATIC OWNER_BRIEF template that
+# said nothing about it, and woke the owner to run 14 lanes. The owner, the only
+# party that could repair the artifact, discovered the refusal at 20:58Z by
+# running the barrier by hand -- 67 minutes and a collapsed lease later.
+#
+# The barrier's own content rules are smoke-journeys.test.sh's subject; what is
+# regressed here is the CONTROLLER's duty to carry whatever invalid[] it gets
+# back to the owner. The contract below is refused by the real
+# smoke-evidence-barrier.sh for its own content, from the first lanes fire, the
+# same shape as #2055's intake-authored artifact.
+new_case ctl-2047-barrier-refusal-reaches-owner
+contract
+mkdir -p "$R/contact-sheet"
+printf 'png\n' >"$R/contact-sheet/sheet.png"
+printf 'This build changes the checkout button; the checkout journey will be tested.\n' \
+  >"$R/controller/root-summary.md"
+jq -c '.requiredLaneMarkers = ["../elsewhere/markers/A1.json","markers/B1.json"]' \
+  "$R/completion-contract.json" >"$R/.contract.tmp"
+mv "$R/.contract.tmp" "$R/completion-contract.json"
+campaign 3
+
+jq -e '.invalid == ["../elsewhere/markers/A1.json"] and (.invalidReasons | length) == 1
+       and .ready == false and .phase == "lanes"' \
+  "$R/controller/barrier-lanes.json" >/dev/null \
+  || fail "#2047: the lanes barrier's answer is not published for the owner: $(cat "$R/controller/barrier-lanes.json" 2>&1)"
+grep -q 'controller/barrier-lanes.json' "$R/controller/brief-lanes.md" \
+  || fail "#2047: the lanes brief does not point the owner at the barrier's answer"
+grep -q 'THE BARRIER IS ALREADY REFUSING THIS PHASE' "$R/controller/brief-lanes.md" \
+  || fail "#2047: a brief written while the barrier already refuses does not say so"
+# The reasons are complete in the file even though the journal keeps three.
+jq -e '.invalidReasons[0] | test("path-traversal marker path")' "$R/controller/barrier-lanes.json" >/dev/null \
+  || fail "#2047: the published reason is not the barrier's own"
+
+# ...and it is removed the moment the phase passes, so it can never be read as
+# a live refusal that is over.
+new_case ctl-2047-barrier-report-cleared
+campaign 3
+[ ! -e "$R/controller/barrier-lanes.json" ] \
+  || fail "#2047: a passed lanes barrier left a refusal file behind"
+grep -q 'controller/barrier-lanes.json' "$R/controller/brief-lanes.md" \
+  || fail "#2047: a barrier-backed brief must name the barrier file even when nothing is refused yet"
+grep -q 'CHECK THE BARRIER, DO NOT ASSUME IT' "$R/controller/brief-lanes.md" \
+  || fail "#2047: a barrier that is only waiting for markers must not shout like one refusing content"
+
 echo "smoke campaign controller live tests passed"
