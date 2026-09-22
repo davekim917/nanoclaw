@@ -7,7 +7,7 @@
  * Shell scripts are tested the way `codex-review.test.ts` tests its helper:
  * spawn bash with a stub `bin/` ahead of PATH, so nothing reaches the network.
  */
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,7 +16,11 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
 
-allowSubprocess(['bash']);
+// `git` is spawned to build the fixture repositories the confinement tests
+// need, and the script itself shells out to the real `git` for its
+// inside-a-repository check — that check is the behaviour under test, so it is
+// deliberately not stubbed.
+allowSubprocess(['bash', 'git']);
 enforceHermeticity();
 
 const SCRIPT = path.resolve('container/skills/pr-review-loop/scripts/precheck-opencode.sh');
@@ -134,6 +138,88 @@ describe('the agent never runs in the caller directory', () => {
     expect(result.opencodeArgs).toContain(`--dir ${dir}`);
     expect(fs.existsSync(dir), 'a caller-supplied directory must not be deleted').toBe(true);
   });
+});
+
+describe('the confinement cannot evaporate silently', () => {
+  // `--dir` is advisory: it removes the mechanism (our checkout stops being the
+  // agent's project root), it does not confine the process. That makes the
+  // project root the whole guarantee, so a scratch directory that happens to
+  // sit inside a repository — via TMPDIR, or a wrong PRECHECK_DIR — hands the
+  // agent that repository and nothing says so. Refuse instead.
+  function repoDir() {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'precheck-repo-'));
+    roots.push(repo);
+    const init = spawnSync('git', ['init', '-q', repo], { encoding: 'utf8', timeout: 20_000 });
+    expect(init.status, init.stderr).toBe(0);
+    return repo;
+  }
+
+  it('refuses a TMPDIR that puts the scratch dir inside a repository, leaving nothing behind', () => {
+    const repo = repoDir();
+    const before = fs.readdirSync(repo);
+    const result = run("echo findings\nexit 0", ['--pr', '1'], { TMPDIR: repo });
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('inside a git repository');
+    expect(result.opencodeArgs, 'opencode must not have been started at all').toBeNull();
+    // The refusal happens after mktemp, so the refusal path must clean up too.
+    expect(fs.readdirSync(repo)).toEqual(before);
+  });
+
+  it('refuses a PRECHECK_DIR inside a repository', () => {
+    const repo = repoDir();
+    const inner = path.join(repo, 'nested');
+    fs.mkdirSync(inner);
+    const result = run("echo findings\nexit 0", ['--pr', '1'], { PRECHECK_DIR: inner });
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('inside a git repository');
+    expect(result.opencodeArgs).toBeNull();
+  });
+
+});
+
+describe('the scratch directory is always removed', () => {
+  it('removes it on the normal path', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'precheck-tmpdir-'));
+    roots.push(tmp);
+    const result = run("echo findings\nexit 0", ['--pr', '1'], { TMPDIR: tmp });
+    expect(result.status).toBe(0);
+    expect(fs.readdirSync(tmp)).toEqual([]);
+  });
+
+  // Without the trap, a signal during a run that can last 900s leaked the
+  // directory and whatever the agent had written into it. This has to signal
+  // the real process — a stub that kills its own parent does not reach the
+  // script (it runs inside a command substitution) and passes either way, which
+  // is how the first version of this test managed to pass against a script with
+  // the traps deleted.
+  it('removes it when the run is killed by a signal', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'precheck-tmpdir-'));
+    roots.push(tmp);
+    // The sentinel lives outside TMPDIR so its existence does not count against
+    // the emptiness assertion below.
+    const { root, bin, argsFile } = tempRoot(
+      `dir=$(printf '%s' "$*" | sed -n 's/.*--dir \\([^ ]*\\).*/\\1/p')\ntouch "$dir/agent-wrote-this"\ntouch "$SENTINEL"\nsleep 3\n`,
+    );
+    const sentinel = path.join(root, 'started');
+    const child = spawn('bash', [SCRIPT, '--pr', '1'], {
+      cwd: root,
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, OPENCODE_ARGS: argsFile, TMPDIR: tmp, SENTINEL: sentinel },
+    });
+    const exited = new Promise<number | null>((resolve) => child.on('exit', (code) => resolve(code)));
+    const deadline = Date.now() + 15_000;
+    while (!fs.existsSync(sentinel) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+    expect(fs.existsSync(sentinel), 'the stub never started').toBe(true);
+    expect(fs.readdirSync(tmp), 'the scratch dir should exist while the run is live').not.toEqual([]);
+
+    // Signal bash itself, mid-run. With a TERM trap set, bash defers it until
+    // the foreground command returns and then cleans up; with no trap, bash
+    // takes SIGTERM's default action and dies on the spot, leaving the
+    // directory and the agent's file behind — which is the difference this
+    // asserts.
+    child.kill('SIGTERM');
+    await exited;
+    expect(fs.readdirSync(tmp), 'the scratch dir and the agent output in it must be gone').toEqual([]);
+  }, 25_000);
 });
 
 describe('a truncated diff is announced even though output is now captured', () => {

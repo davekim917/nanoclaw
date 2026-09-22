@@ -9,10 +9,24 @@
 # the diff and answers whether the PR body's claims match the code. Catching a
 # wrong claim here means the paid round starts from a correct PR body.
 #
-# SAFETY. `opencode run` is an agent with write tools, so this script runs it
-# with `--dir` pointed at an empty scratch directory, never the caller's
-# checkout. See the comment on the invocation below for what happened when it
-# was not.
+# SAFETY, AND ITS LIMIT. `opencode run` is an agent with write tools, so this
+# script runs it with `--dir` pointed at an empty scratch directory, never the
+# caller's checkout. See the comment on the invocation below for what happened
+# when it was not.
+#
+# `--dir` IS ADVISORY, NOT ENFORCEMENT. `opencode run --help` calls it
+# "directory to run in"; nothing calls it a sandbox. OpenCode has a permission
+# category named `external_directory` precisely because reaching outside the
+# project root is a supported thing to permit — enumerated at
+# container/agent-runner/src/providers/opencode.ts:168 and set to `allow` at
+# :205 — and this host's ~/.config/opencode/opencode.jsonc declares no
+# `permission` block at all (verified: no `permission` key in the file). Bash
+# and absolute paths still run as the host user.
+#
+# So `--dir` removes the MECHANISM of the incident below — the agent no longer
+# has our checkout as its project root, so "edit the files I see" cannot reach
+# the worktree — but it does NOT confine the process. Do not read it as a
+# sandbox, and do not point this at a live repo on the strength of it.
 #
 # This is a PRE-CHECK, not a review. It writes no receipt and the merge gate
 # neither reads nor honours its output — `codex-review.sh receipt` is still the
@@ -52,6 +66,10 @@ done
 
 [ -n "$PR" ] || { echo "precheck-opencode.sh: --pr <n> is required" >&2; exit 2; }
 command -v opencode >/dev/null 2>&1 || { echo "precheck-opencode.sh: opencode is not on PATH" >&2; exit 2; }
+# git is not optional here: it is how the scratch-directory check below decides
+# whether the agent would land inside a repository. Without it that check would
+# silently answer "not a repo" for every path and fail open.
+command -v git >/dev/null 2>&1 || { echo "precheck-opencode.sh: git is not on PATH — it is required to verify the agent's working directory is not inside a repository" >&2; exit 2; }
 
 GH_ARGS=(pr view "$PR" --json title,body)
 DIFF_ARGS=(pr diff "$PR")
@@ -120,6 +138,25 @@ if [ -z "$WORKDIR" ]; then
   CLEANUP_DIR="$WORKDIR"
 fi
 
+# Remove only a directory this script created. A caller-supplied PRECHECK_DIR is
+# theirs; the trap covers Ctrl-C and SIGTERM during a run that can last 900s,
+# which previously leaked the scratch dir and whatever the agent wrote into it.
+cleanup() { [ -n "$CLEANUP_DIR" ] && rm -rf "$CLEANUP_DIR"; CLEANUP_DIR=""; }
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+# The whole point of `--dir` is that the agent's project root is not a checkout.
+# `mktemp -d` inherits TMPDIR, so a TMPDIR inside a repository puts the scratch
+# dir inside it, opencode's project detection walks up to the nearest `.git`,
+# and the confinement is gone with NO error — the failure is silent, which is
+# the worst kind here. A wrong PRECHECK_DIR does the same. Fail closed: refuse
+# rather than run something that only looks isolated.
+if toplevel=$(git -C "$WORKDIR" rev-parse --show-toplevel 2>/dev/null); then
+  echo "precheck-opencode.sh: the agent's working directory $WORKDIR is inside a git repository ($toplevel) — refusing, because opencode would treat that repository as its project root and the isolation this script relies on would not exist. Set TMPDIR or PRECHECK_DIR to a path outside any checkout." >&2
+  exit 2
+fi
+
 # `< /dev/null` is load-bearing too: with an open stdin the CLI waits for more
 # prompt input and hangs silently until its timeout. That is a different hang
 # from the argument-parsing one above; both are real.
@@ -132,7 +169,7 @@ fi
 # that nothing appears until the run ends; the alternative is a silent pass.
 out=$(timeout "${PRECHECK_TIMEOUT:-900}" opencode run --dir "$WORKDIR" -m "$MODEL" "$PROMPT" < /dev/null 2>&1)
 rc=$?
-[ -n "$CLEANUP_DIR" ] && rm -rf "$CLEANUP_DIR"
+cleanup
 printf '%s\n' "$out"
 if [ "$rc" -ne 0 ]; then
   echo "precheck-opencode.sh: opencode exited $rc (a rate limit or timeout is not a PASS — re-run or use another pool)" >&2
