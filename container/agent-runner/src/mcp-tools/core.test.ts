@@ -133,6 +133,40 @@ describe('send_message MCP tool — default replies in the current conversation'
     _resetConfig();
   });
 
+  // A scheduled task session has no conversation of its own (routing is a
+  // system:tasks:* thread with no platform), so the own-conversation gate
+  // alone left every scheduled post bare — seen live 2026-09-22, 23:19Z.
+  it('stamps a scheduled task session post to a platform, not an agent-to-agent row', async () => {
+    const ts = await import('../turn-status.js');
+    const { _setConfigForTest, _resetConfig } = await import('../config.js');
+    const db = getInboundDb();
+    db.prepare(
+      "UPDATE session_routing SET channel_type = NULL, platform_id = NULL, thread_id = 'system:tasks:series-1' WHERE id = 1",
+    ).run();
+    db.prepare(
+      `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+       VALUES ('sibling', 'Sibling', 'agent', NULL, NULL, 'ag-sibling')`,
+    ).run();
+    _resetConfig();
+    _setConfigForTest({});
+    ts.resetTurnStatus();
+    ts.setTurnSettings('claude-opus-5[1m]', 'high');
+    ts.setOwnConversation(null, null);
+    ts.recordContextTokens(88_000);
+    ts._forgetOwnershipForTest();
+
+    await sendMessage.handler({ to: 'operator', text: 'weekly report' });
+    await sendMessage.handler({ to: 'sibling', text: 'handoff' });
+
+    const rows = getUndeliveredMessages();
+    const post = rows.find((r) => r.platform_id === 'slack:DTEST00009')!;
+    const handoff = rows.find((r) => r.channel_type === 'agent')!;
+    expect(JSON.parse(post.content).subtext).toBe('opus-5 · high · 88k context');
+    expect(JSON.parse(handoff.content).subtext).toBeUndefined();
+    ts.resetTurnStatus();
+    _resetConfig();
+  });
+
   // The roster is recorded by the provider inside poll-loop, but send_message
   // stamps from the MCP subprocess — so it has to ride the persisted snapshot
   // too, or delegating turns lose it on the default reply path (#1022's bug).
