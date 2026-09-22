@@ -344,6 +344,20 @@ export function archiveMessage(msg: ArchiveMessage): boolean {
   return true;
 }
 
+/**
+ * Whether any archived message sits in `threadId` on this channel as one
+ * adapter type sees it (channel_type + platform_id — `idx_archive_channel`).
+ * Outbound rows from task sessions carry no messaging_group_id, so the channel
+ * is matched by its address rather than by messaging group id. Used by src/continue-thread.ts as evidence
+ * that a thread really exists on a destination.
+ */
+export function archiveHasThread(channelType: string, platformId: string, threadId: string): boolean {
+  const row = openDb()
+    .prepare('SELECT 1 FROM messages_archive WHERE channel_type = ? AND platform_id = ? AND thread_id = ? LIMIT 1')
+    .get(channelType, platformId, threadId);
+  return row !== undefined;
+}
+
 export interface ArchiveEvidenceRow {
   id: string;
   agentGroupId: string;

@@ -576,6 +576,7 @@ written by the host) resolves the name to routing fields.
     to?: string,     // destination name (e.g. "family", "worker-1").
                      // Optional when the agent has exactly one destination.
     thread_key?: string, // stable incident/topic id — see "Keyed threads" below
+    continue_thread?: string, // with thread_key: an existing thread the key adopts — see "Keyed threads"
   }
 }
 ```
@@ -607,6 +608,16 @@ messaging group — so the adapter instance counts — key):
 - Bookkeeping writes after a post has landed are logged on failure, never thrown, so a
   database hiccup can't make delivery re-post the message.
 
+`continue_thread` (content `continueThread`, runner-validated only together with `thread_key`)
+lets the **not found** case adopt an existing thread instead of opening a new root: the
+encoded id `search_threads` prints, a bare thread id, or a Discord/Slack link. The row is
+container-written, so the host (`src/continue-thread.ts`) resolves it against the
+destination's own `platform_id` and adopts it only when it has already seen that thread on
+the resolved messaging group — a session bound to (messaging group, thread), or an archived
+message on the same `channel_type` + `platform_id` in it. Adopted → post there and record the
+thread as the key's anchor, so later posts under the key follow it. Unconfirmed → a warn log
+and the ordinary root post. A live anchor always wins and the argument is ignored.
+
 A keyed post takes precedence over both unkeyed anchors — the rolling per-session day anchor
 for task sessions (`task_thread_anchors`, rotated by `anchorRotationKey` in
 `src/db/task-thread-anchors.ts`, opt-out `ncl tasks … --thread-anchor false`) and the
@@ -636,6 +647,7 @@ Send a file to a named destination (same destination model as `send_message`).
     text?: string,         // optional accompanying message
     filename?: string,     // display name (default: basename of path)
     thread_key?: string,   // as send_message
+    continue_thread?: string, // as send_message
   }
 }
 ```
@@ -645,7 +657,7 @@ Implementation:
 1. Resolve routing via `resolveRouting(to)` (as `send_message`)
 2. Generate a message ID and create `/workspace/outbox/{messageId}/`
 3. Copy the file into that outbox directory
-4. Write a `messages_out` row (`kind: 'chat'`) with content `{ text, files: [filename] }` (plus `threadKey` when given)
+4. Write a `messages_out` row (`kind: 'chat'`) with content `{ text, files: [filename] }` (plus `threadKey` and `continueThread` when given)
 
 #### send_card
 
