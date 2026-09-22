@@ -5,7 +5,9 @@
  * adapter, with the same fixtures as the keyed-anchor suite in delivery.test.ts.
  */
 import Database from 'better-sqlite3';
+import crypto from 'crypto';
 import fs from 'fs';
+import path from 'path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('./container-runner.js', async (importOriginal) => ({
@@ -23,8 +25,8 @@ vi.mock('./config.js', async () => {
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-continue-thread') }));
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
-import { getRawDb } from './db/connection.js';
+import { closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
+import { getDb, initDb } from './db/connection.js';
 import { resolveSession, resolveTaskSession } from './session-manager.js';
 import { outboundDbPath } from './mailbox/sqlite/paths.js';
 import { deliverSessionMessages, setDeliveryAdapter } from './delivery.js';
@@ -57,12 +59,13 @@ async function seed(): Promise<void> {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    getRawDb()
-      .prepare(
-        `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
-         VALUES ('ag-1', ?, 'channel', ?, ?)`,
-      )
-      .run(id, id, now());
+    await getDb().run(
+      `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
+       VALUES ('ag-1', ?, 'channel', ?, ?)`,
+      id,
+      id,
+      now(),
+    );
   }
 }
 
@@ -101,10 +104,8 @@ function archiveRow(channelType: string, platformId: string, threadId: string): 
   });
 }
 
-function keyRows(): Array<{ thread_key: string; thread_platform_id: string }> {
-  return getRawDb()
-    .prepare('SELECT thread_key, thread_platform_id FROM thread_key_anchors ORDER BY thread_key')
-    .all() as never;
+function keyRows(): Promise<Array<{ thread_key: string; thread_platform_id: string }>> {
+  return getDb().all('SELECT thread_key, thread_platform_id FROM thread_key_anchors ORDER BY thread_key');
 }
 
 function recordingAdapter(opts: { failThreaded?: boolean } = {}): Array<{ threadId: string | null }> {
@@ -122,8 +123,14 @@ function recordingAdapter(opts: { failThreaded?: boolean } = {}): Array<{ thread
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  await initTestDb();
-  runMigrations(getRawDb());
+  // Migrated through a throwaway handle so this file never names the raw
+  // central handle (src/db/raw-db-ratchet.test.ts), as in
+  // src/stop-intent-recovery.test.ts:299-305.
+  const dbPath = path.join(TEST_DIR, `central-${crypto.randomUUID()}.db`);
+  const migrated = new Database(dbPath);
+  runMigrations(migrated);
+  migrated.close();
+  await initDb(dbPath, { role: 'test' });
   await seed();
 });
 
@@ -191,7 +198,7 @@ describe('delivery — continueThread adopts an existing thread for a new key', 
     await deliverSessionMessages(session);
 
     expect(calls).toEqual([{ threadId: 'telegram:123:thr-live' }]);
-    expect(keyRows()).toEqual([{ thread_key: 'topic-a', thread_platform_id: 'thr-live' }]);
+    expect(await keyRows()).toEqual([{ thread_key: 'topic-a', thread_platform_id: 'thr-live' }]);
   });
 
   it('adopts a thread known only from the archive (the agent never engaged there)', async () => {
@@ -220,7 +227,7 @@ describe('delivery — continueThread adopts an existing thread for a new key', 
     await deliverSessionMessages(session);
 
     expect(calls).toEqual([{ threadId: 'telegram:123:thr-archived' }]);
-    expect(keyRows()).toEqual([{ thread_key: 'topic-a', thread_platform_id: 'thr-archived' }]);
+    expect(await keyRows()).toEqual([{ thread_key: 'topic-a', thread_platform_id: 'thr-archived' }]);
   });
 
   it('adopts a thread archived only by a sibling bot on the same conversation (pooled channel family)', async () => {
@@ -251,7 +258,7 @@ describe('delivery — continueThread adopts an existing thread for a new key', 
     await deliverSessionMessages(session);
 
     expect(calls).toEqual([{ threadId: 'telegram:123:thr-live' }, { threadId: 'telegram:123:thr-live' }]);
-    expect(keyRows()).toEqual([{ thread_key: 'topic-a', thread_platform_id: 'thr-live' }]);
+    expect(await keyRows()).toEqual([{ thread_key: 'topic-a', thread_platform_id: 'thr-live' }]);
   });
 
   it('rejects a thread from another messaging group: new root thread, a warn log', async () => {
@@ -266,7 +273,7 @@ describe('delivery — continueThread adopts an existing thread for a new key', 
     await deliverSessionMessages(session);
 
     expect(calls).toEqual([{ threadId: null }, { threadId: null }]);
-    expect(keyRows()).toEqual([
+    expect(await keyRows()).toEqual([
       { thread_key: 'topic-a', thread_platform_id: 'plat-1' },
       { thread_key: 'topic-b', thread_platform_id: 'plat-2' },
     ]);
@@ -284,18 +291,18 @@ describe('delivery — continueThread adopts an existing thread for a new key', 
     await deliverSessionMessages(session);
 
     expect(calls).toEqual([{ threadId: null }]);
-    expect(keyRows()).toEqual([{ thread_key: 'topic-a', thread_platform_id: 'plat-1' }]);
+    expect(await keyRows()).toEqual([{ thread_key: 'topic-a', thread_platform_id: 'plat-1' }]);
   });
 
   it('an existing live anchor wins over the argument', async () => {
     await threadSession('mg-1', 'telegram:123:thr-live');
-    getRawDb()
-      .prepare(
-        `INSERT INTO thread_key_anchors
-           (agent_group_id, messaging_group_id, thread_key, thread_platform_id, created_at, last_used_at)
-         VALUES ('ag-1', 'mg-1', 'topic-a', 'plat-root', ?, ?)`,
-      )
-      .run(now(), now());
+    await getDb().run(
+      `INSERT INTO thread_key_anchors
+         (agent_group_id, messaging_group_id, thread_key, thread_platform_id, created_at, last_used_at)
+       VALUES ('ag-1', 'mg-1', 'topic-a', 'plat-root', ?, ?)`,
+      now(),
+      now(),
+    );
     const session = await taskSession();
     insertChat(session.id, 'out-1', { text: 'x', threadKey: 'topic-a', continueThread: 'thr-live' });
     const calls = recordingAdapter();
@@ -303,7 +310,7 @@ describe('delivery — continueThread adopts an existing thread for a new key', 
     await deliverSessionMessages(session);
 
     expect(calls).toEqual([{ threadId: 'telegram:123:plat-root' }]);
-    expect(keyRows()).toEqual([{ thread_key: 'topic-a', thread_platform_id: 'plat-root' }]);
+    expect(await keyRows()).toEqual([{ thread_key: 'topic-a', thread_platform_id: 'plat-root' }]);
   });
 
   it('a failed post into the adopted thread falls back to root and records the root', async () => {
@@ -319,7 +326,7 @@ describe('delivery — continueThread adopts an existing thread for a new key', 
     await deliverSessionMessages(session);
 
     expect(calls).toEqual([{ threadId: 'telegram:123:thr-archived-on-platform' }, { threadId: null }]);
-    expect(keyRows()).toEqual([{ thread_key: 'topic-a', thread_platform_id: 'plat-2' }]);
+    expect(await keyRows()).toEqual([{ thread_key: 'topic-a', thread_platform_id: 'plat-2' }]);
   });
 
   it('is ignored without a thread key', async () => {
@@ -331,6 +338,6 @@ describe('delivery — continueThread adopts an existing thread for a new key', 
     await deliverSessionMessages(session);
 
     expect(calls).toEqual([{ threadId: null }]);
-    expect(keyRows()).toEqual([]);
+    expect(await keyRows()).toEqual([]);
   });
 });
