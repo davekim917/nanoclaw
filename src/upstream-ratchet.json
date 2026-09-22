@@ -230,7 +230,7 @@
 ".nvmrc":{"diff":0,"mode":"100644","sha256":"f14b4987904bcb5814e4459a057ed4d20f58a633152288a761214dcd28780b56"},
 ".prettierrc":{"diff":0,"mode":"100644","sha256":"c9396af8dd02064188ba41407fb182d2e8fdc3103a1f5f3ea4d1ec703e29bafd"},
 "AGENTS.md":{"diff":0,"mode":"120000","sha256":"6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7"},
-"CHANGELOG.md":{"diff":171,"mode":"100644","sha256":"cd4632f57a775898c78d767821a18df0018bb6e0ec4c9c5971eb14bfccce55b1"},
+"CHANGELOG.md":{"diff":171,"mode":"100644","sha256":"80b980f44e2b9c5510e4a2d134c9a457b7ea59d76598bd405c03d21fc0b24b0e"},
 "CLAUDE.md":{"diff":338,"mode":"100644","sha256":"1a520e73b596132676015dc6f2720ac1b17213ccfb7b32f97d9dab0290ea7211"},
 "CODE_OF_CONDUCT.md":{"diff":0,"mode":"100644","sha256":"ffb0652539c6d61f2cf0219f908f7221140764bb70cb1b78a9d15d3e5e1f5d36"},
 "CONTRIBUTING.md":{"diff":110,"mode":"100644","sha256":"2b1722afd70df3d79182f87f8e0d3ac7016ff4e79fb3f4ff0759f9f2fd8bf391"},
@@ -955,7 +955,7 @@
 "templates/README.md":{"diff":65,"mode":"100644","sha256":"33c5a73e548925974c8b09bce410422f1e1705307feaba1538cb7e870e987e01"},
 "tsconfig.json":{"diff":0,"mode":"100644","sha256":"25bb17e17ea109ef835738bc5481a8e79b3169dd003dd3c73c3f860724e653e8"},
 "uninstall.sh":{"diff":0,"mode":"100755","sha256":"5bc58587d37cc989c8a79f18d8fa731d1139c0387f531eb182b9303ccbe6d6ac"},
-"versions.json":{"diff":5,"mode":"100644","sha256":"2606211666be8c2ba935df8b34d2ad5b31cdd742ba4369c3b48c2bd665c91e4b"},
+"versions.json":{"diff":6,"mode":"100644","sha256":"6b74a1b66d6946f901cdc4fba7c7817964b5545564b7812875324203d33b85ef"},
 "vitest.config.ts":{"diff":181,"mode":"100644","sha256":"93d3fb590fb17bc2a9c858a794cd8555d2d8e578994ee9221fe1a3b244fcbc4b"},
 "vitest.skills.config.ts":{"diff":0,"mode":"100644","sha256":"0e88cbf778cdaf68e5580498220832a7ce574ae14850100b365dd1fbdd81f96f"}
 }}
