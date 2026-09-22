@@ -60,7 +60,12 @@ export function discoverClaudeSubagents(): DiscoveredSubagent[] {
   return [...seen.values()];
 }
 
-function walkPluginAgents(dir: string, seen: Map<string, DiscoveredSubagent>, depth = 0): void {
+/**
+ * The walk under one plugin root. Exported for read-only audits
+ * (scripts/model-inventory.ts) that must see scoped plugins too — the mirror
+ * consumers above deliberately skip those.
+ */
+export function walkPluginAgents(dir: string, seen: Map<string, DiscoveredSubagent>, depth = 0): void {
   if (depth > 3) return;
   let entries: fs.Dirent[];
   try {

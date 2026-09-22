@@ -15,7 +15,7 @@ import {
   DEFAULT_HAIKU_MODEL,
   resolveEffectiveModel,
 } from '../src/flag-parser.js';
-import { discoverClaudeSubagents } from '../src/claude-subagent-discovery.js';
+import { type DiscoveredSubagent, walkPluginAgents } from '../src/claude-subagent-discovery.js';
 import { isExcludedPluginPath, splitExcludedPlugins } from '../src/plugin-exclusions.js';
 import { loadPluginScopes, pluginAllowedForWorkgroup } from '../src/plugin-scopes.js';
 
@@ -117,12 +117,14 @@ const wirings = db
 // Tasks live in each group's system-session inbound.db; `ncl tasks list --json`
 // is the one reader that already knows where.
 let tasks: any[];
+let taskReadFailure: string | null = null;
 try {
   const raw = JSON.parse(execFileSync('ncl', ['tasks', 'list', '--json'], { encoding: 'utf8', maxBuffer: 64 << 20 }));
   tasks = Array.isArray(raw) ? raw : (raw.data ?? raw.tasks ?? []);
 } catch (e) {
   tasks = [];
-  console.error(`WARN: ncl tasks list failed — task pins NOT inventoried (${(e as Error).message.split('\n')[0]})`);
+  taskReadFailure = (e as Error).message.split('\n')[0];
+  console.error(`WARN: ncl tasks list failed — task pins NOT inventoried (${taskReadFailure})`);
 }
 const pinned = tasks
   .filter((t) => t.model_pin || t.effort_pin)
@@ -163,6 +165,26 @@ for (const g of groups) {
   }
 }
 
+// User-scope defs: data/v2-sessions/<group>/.claude-shared/agents is the
+// container's ~/.claude/agents, and operator-added files there persist
+// (syncWorkerAgentDefs prunes only MANAGED_WORKER_DEFS).
+for (const g of groups) {
+  const d = path.join(ROOT, 'data/v2-sessions', g.id, '.claude-shared/agents');
+  if (!fs.existsSync(d)) continue;
+  for (const f of fs.readdirSync(d).filter((f) => f.endsWith('.md'))) {
+    const src = read(path.join(d, f));
+    const model = fm(src, 'model');
+    const effort = fm(src, 'effort');
+    if ((model === '?' || model === 'inherit') && (effort === '?' || /^worker-/.test(f))) continue;
+    subagents.push({
+      where: `${g.folder} user scope (.claude-shared/agents)`,
+      name: f,
+      model: model === '?' ? '(inherit)' : model,
+      effort: effort === '?' ? '(inherit)' : effort,
+    });
+  }
+}
+
 // Plugin agent defs: every ~/plugins/<repo> is mounted into every group unless
 // that group excludes it (container.json excludePlugins, top-level or sub-path)
 // or the plugin is scoped to other workgroups — the same two predicates the
@@ -181,10 +203,20 @@ const reachLabel = (reached: string[]) => {
   if (!reached.length) return 'no group';
   return missing.length < reached.length ? `all except ${missing.join(',')}` : reached.join(',');
 };
-// The set comes from the runtime's own walk (discoverClaudeSubagents: depth
-// limit, deprecated/ and runtime-copy dirs skipped), not a second walker. It
-// omits workgroup-scoped plugins, which that walk never mirrors either.
-for (const def of discoverClaudeSubagents().filter((d) => d.source === 'plugin')) {
+// The set comes from the runtime's own per-plugin walk (walkPluginAgents:
+// depth limit, deprecated/ and runtime-copy dirs skipped), run over EVERY
+// plugin including workgroup-scoped ones — discoverClaudeSubagents skips
+// those because its consumers mirror fleet-wide, but eligible groups still
+// mount and run them. One map per plugin so a same-named def elsewhere
+// cannot hide this one.
+const pluginAgentDefs: DiscoveredSubagent[] = [];
+for (const plugin of fs.existsSync(pluginsRoot) ? fs.readdirSync(pluginsRoot) : []) {
+  if (plugin.startsWith('.')) continue;
+  const seen = new Map<string, DiscoveredSubagent>();
+  walkPluginAgents(path.join(pluginsRoot, plugin), seen);
+  pluginAgentDefs.push(...seen.values());
+}
+for (const def of pluginAgentDefs) {
   const rel = path.relative(pluginsRoot, def.path).split(path.sep).join('/');
   const src = read(def.path);
   const model = fm(src, 'model');
@@ -252,10 +284,11 @@ const observed = db
   )
   .all(since) as any[];
 
-const out = { stickyReadFailures, installDefaults, groups: groupRows, wirings, pinned, unpinnedCount, subagents, stickies, observed };
+const out = { taskReadFailure, stickyReadFailures, installDefaults, groups: groupRows, wirings, pinned, unpinnedCount, subagents, stickies, observed };
 if (asJson) {
   console.log(JSON.stringify(out, null, 2));
-  process.exit(0);
+  // Incomplete inventory is not a clean one: a caller must not read "no pins".
+  process.exit(taskReadFailure || stickyReadFailures.length ? 2 : 0);
 }
 
 const table = (title: string, rows: Record<string, unknown>[]) => {
@@ -284,3 +317,4 @@ table(
   `Observed last ${days}d (turn_usage)`,
   observed.map((r) => ({ group: byId.get(r.g) ?? r.g, trigger: r.trigger, model: r.model, effort: r.effort, turns: r.n })),
 );
+if (taskReadFailure || stickyReadFailures.length) process.exitCode = 2;
