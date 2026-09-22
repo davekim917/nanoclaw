@@ -45,6 +45,7 @@ import {
   steerCodexTurn,
   resolveCodexConfigDir,
   writeCodexMcpConfigToml,
+  readCodexSubagentThreads,
 } from './codex-app-server.js';
 // Hooks AND the `[hooks.state.*]` entries that make Codex actually dispatch
 // them: Codex >=0.154 refuses to run an untrusted hook, so writing hooks.json
@@ -54,7 +55,7 @@ import { CodexTurnLiveness, isCodexTerminalTurnItem, normalizeCodexThreadStatus 
 import { CodexRateLimitTracker } from './codex-rate-limit-tracker.js';
 import type { CodexRateLimitPark } from './codex-rate-limits.js';
 import { attachTurnEffort } from './turn-effort.js';
-import { recordContextTokens } from '../turn-status.js';
+import { recordContextTokens, recordSubagent } from '../turn-status.js';
 
 /**
  * Health watchdog for a single turn. Guards against codex-app-server wedging
@@ -1922,9 +1923,29 @@ export async function* runOneTurn(
     buffer.push({ type: 'file', path: filePath });
   };
 
+  // Child-thread ids this turn's subagents ran in, for the status subtext.
+  // `SubAgentActivityItem` carries the id and the agent path but NOT the
+  // model or effort — those live on the thread it points at, which is read
+  // once at the end of the turn rather than per item.
+  const subagentThreadIds = new Set<string>();
   const emitCollaborationProgress = (item: unknown): void => {
     const message = formatCodexCollaborationProgress(item, emittedCollaborationItemIds);
     if (message) buffer.push({ type: 'progress', message });
+    if (item && typeof item === 'object') {
+      const activity = item as { type?: unknown; agentThreadId?: unknown; agent_thread_id?: unknown; agentPath?: unknown };
+      if (activity.type === 'subAgentActivity') {
+        // camelCase on the generated TS schema, snake_case on the Rust wire
+        // type — which arrives depends on the app-server build, so read both.
+        const id = activity.agentThreadId ?? activity.agent_thread_id;
+        if (typeof id === 'string' && id) {
+          subagentThreadIds.add(id);
+          // Identity now, model/effort after the thread read below. Recording
+          // the path immediately means a turn whose thread list fails still
+          // reports that it delegated, and to what.
+          recordSubagent(id, { type: typeof activity.agentPath === 'string' ? activity.agentPath : null });
+        }
+      }
+    }
   };
 
   const liveness = new CodexTurnLiveness({
@@ -2494,6 +2515,19 @@ export async function* runOneTurn(
         ...(classification ? { classification } : {}),
       };
       return;
+    }
+
+    // Enrich the subagent roster with each child thread's configured model and
+    // effort. ONE `thread/list` for the whole turn, and only when the turn
+    // actually delegated — a turn that spawned nobody makes no extra call.
+    // Non-throwing by construction (see readCodexSubagentThreads): a roster is
+    // decoration and must not fail a turn that otherwise succeeded.
+    if (subagentThreadIds.size > 0 && threadId) {
+      for (const thread of await readCodexSubagentThreads(server, threadId, CODEX_HEALTH_PROBE_TIMEOUT_MS)) {
+        if (subagentThreadIds.has(thread.id)) {
+          recordSubagent(thread.id, { model: thread.model, effort: thread.effort });
+        }
+      }
     }
 
     yield {

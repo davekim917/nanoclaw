@@ -15,7 +15,13 @@ import {
   type MessageInRow,
 } from './db/messages-in.js';
 import { getConfig } from './config.js';
-import { clearContextTokens, setOwnConversation, setTurnSettings, withStatusSubtext } from './turn-status.js';
+import {
+  clearContextTokens,
+  clearSubagents,
+  setOwnConversation,
+  setTurnSettings,
+  withStatusSubtext,
+} from './turn-status.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { touchHeartbeat } from './heartbeat.js';
@@ -2888,6 +2894,10 @@ export async function processQuery(
         // produced no usable usage frame. Safe here specifically: every
         // dispatch for this result has already run above.
         clearContextTokens();
+        // The roster has the same per-turn lifetime as the context figure and
+        // must clear at the same boundary: one query serves many turns, so a
+        // roster left standing would name workers a LATER turn never deployed.
+        clearSubagents();
         // Handling is done deciding. If it pushed, the turn level is raised
         // again and the published bit stays 1; if it did not, this is where
         // the container becomes reapable.
@@ -3151,7 +3161,8 @@ async function deliverErrorResult(text: string, routing: RoutingContext): Promis
     // unmarked would make an error reply the one place the line silently
     // disappears — precisely when knowing the model and context is most
     // useful. Model and effort are accurate on an error turn; the context
-    // figure is this turn's, since it is cleared per result (:2872).
+    // figure is this turn's, since it is cleared per result (just before
+    // closeResultScope in processQuery).
     agentReply: true,
     platform_id: routing.platformId,
     channel_type: routing.channelType,
@@ -3270,6 +3281,8 @@ async function emitTurnEnd(): Promise<void> {
   // here: one query can serve many turns, so this fires too coarsely to be the
   // turn boundary. Kept as a backstop for a query that ends without a result.
   clearContextTokens();
+  // Backstop only, same as above — the real clear is per result.
+  clearSubagents();
   const lifecycleStatusId = getCurrentLifecycleStatus();
   await writeMessageOut({
     id: generateId(),

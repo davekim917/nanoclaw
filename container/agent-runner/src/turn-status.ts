@@ -56,6 +56,18 @@ let ownChannelType: string | null = null;
 let ownPlatformId: string | null = null;
 
 /**
+ * Subagents this turn deployed, keyed by the provider's own handle for one
+ * deployment (Claude: the Task tool_use id; Codex: the child thread id) so a
+ * worker that emits many frames is counted once.
+ *
+ * `model` is OBSERVED where a provider reports what actually ran; `effort` is
+ * whatever that provider can say, which is not always the same kind of fact —
+ * see each provider's capture site. `null` on either means "this provider did
+ * not tell us", and the renderer omits it rather than guessing.
+ */
+const subagents = new Map<string, { type: string | null; model: string | null; effort: string | null }>();
+
+/**
  * Record the context occupancy observed on a provider request.
  *
  * Called per request, not per turn: a turn makes many round trips and the
@@ -174,6 +186,9 @@ interface Snapshot {
   contextTokens: number | null;
   ownChannelType: string | null;
   ownPlatformId: string | null;
+  // The roster crosses the same boundary for the same reason: the provider
+  // records it in poll-loop, but send_message stamps from the MCP subprocess.
+  subagents?: [string, { type: string | null; model: string | null; effort: string | null }][];
 }
 
 /**
@@ -187,7 +202,15 @@ let ownsStore = false;
 
 function persist(): void {
   ownsStore = true;
-  const snap: Snapshot = { model, effort, ultracode, contextTokens, ownChannelType, ownPlatformId };
+  const snap: Snapshot = {
+    model,
+    effort,
+    ultracode,
+    contextTokens,
+    ownChannelType,
+    ownPlatformId,
+    subagents: [...subagents.entries()],
+  };
   try {
     getAgentMailbox().operations.setState(SNAPSHOT_KEY, JSON.stringify(snap));
   } catch {
@@ -214,10 +237,47 @@ export function hydrateTurnStatus(): boolean {
     contextTokens = typeof snap.contextTokens === 'number' ? snap.contextTokens : null;
     ownChannelType = snap.ownChannelType ?? null;
     ownPlatformId = snap.ownPlatformId ?? null;
+    subagents.clear();
+    for (const [key, fields] of snap.subagents ?? []) subagents.set(key, fields);
     return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * Record (or refine) one subagent deployment.
+ *
+ * Idempotent per `key` and MERGING: providers learn the pieces at different
+ * moments — Claude sees the agent type on the Task call and the model on the
+ * worker's first frame; Codex sees the thread id on the activity item and the
+ * model/effort only after reading that thread. A later call fills gaps without
+ * erasing what is already known, so an out-of-order arrival cannot blank a
+ * field that was already answered.
+ */
+export function recordSubagent(
+  key: string,
+  fields: { type?: string | null; model?: string | null; effort?: string | null },
+): void {
+  if (!key) return;
+  const prior = subagents.get(key) ?? { type: null, model: null, effort: null };
+  subagents.set(key, {
+    type: fields.type ?? prior.type,
+    model: fields.model ?? prior.model,
+    effort: fields.effort ?? prior.effort,
+  });
+  persist();
+}
+
+/**
+ * Forget the roster at a turn boundary — same reasoning as
+ * `clearContextTokens`: a roster describes ONE turn's delegation, and carrying
+ * it into the next would report workers that are no longer running.
+ */
+export function clearSubagents(): void {
+  if (subagents.size === 0) return;
+  subagents.clear();
+  persist();
 }
 
 /** Test seam — reset the store between cases. */
@@ -228,6 +288,7 @@ export function resetTurnStatus(): void {
   ultracode = false;
   ownChannelType = null;
   ownPlatformId = null;
+  subagents.clear();
   ownsStore = false;
   try {
     getAgentMailbox().operations.deleteState(SNAPSHOT_KEY);
@@ -245,6 +306,7 @@ export function _forgetOwnershipForTest(): void {
   ultracode = false;
   ownChannelType = null;
   ownPlatformId = null;
+  subagents.clear();
 }
 
 /**
@@ -284,6 +346,56 @@ export function formatTokens(tokens: number): string {
  * when every part is missing, so the delivery path can skip the subtext
  * entirely rather than post an empty one.
  */
+/** Longest roster rendered before the tail collapses into "+N more". */
+const MAX_RENDERED_SUBAGENT_GROUPS = 3;
+
+/**
+ * Render the roster as one clause: `3 subagents: 2x sonnet-5/high, haiku/low`.
+ *
+ * GROUPED BY (model, effort), not listed per worker. A coordinator can fan out
+ * a dozen workers across two tiers, and twelve near-identical entries would
+ * stop being subtext; what the operator is actually asking is "what tiers did
+ * this turn deploy, and how many of each". The count before the colon is the
+ * true total, so it stays honest even when the list is capped.
+ *
+ * A group whose model is unknown renders by whatever it does know — the
+ * provider's agent type, else nothing but the count. Null when the turn
+ * deployed nobody, which is the overwhelmingly common case and must add
+ * nothing to the line.
+ */
+export function formatSubagentRoster(): string | null {
+  if (subagents.size === 0) return null;
+
+  const groups = new Map<string, { label: string; count: number }>();
+  for (const entry of subagents.values()) {
+    // Identity of a GROUP is what it would render as, so two workers that
+    // display identically always collapse — including two that are equally
+    // unknown.
+    const model = entry.model ? shortModelName(entry.model) : null;
+    const label = [model ?? entry.type ?? null, entry.effort ?? null].filter(Boolean).join('/');
+    const key = label || 'unknown';
+    const group = groups.get(key);
+    if (group) group.count += 1;
+    else groups.set(key, { label, count: 1 });
+  }
+
+  // A group we know NOTHING about contributes to the total but has no label to
+  // print. Dropping it here rather than rendering a bare count keeps the line
+  // from saying "1 subagent: 1", which reads as a name.
+  const ordered = [...groups.values()]
+    .filter((g) => g.label !== '')
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  const shown = ordered.slice(0, MAX_RENDERED_SUBAGENT_GROUPS);
+  const hidden = ordered.length - shown.length;
+  const rendered = shown.map((g) => (g.count > 1 ? `${g.count}x ${g.label}` : g.label));
+  if (hidden > 0) rendered.push(`+${hidden} more`);
+
+  const total = subagents.size;
+  const noun = total === 1 ? 'subagent' : 'subagents';
+  const detail = rendered.filter(Boolean).join(', ');
+  return detail ? `${total} ${noun}: ${detail}` : `${total} ${noun}`;
+}
+
 export function formatStatusSubtext(): string | null {
   const parts: string[] = [];
   if (model) parts.push(shortModelName(model));
@@ -295,6 +407,11 @@ export function formatStatusSubtext(): string | null {
   if (ultracode) parts.push('ultracode');
   else if (effort) parts.push(effort);
   if (contextTokens !== null) parts.push(`${formatTokens(contextTokens)} context`);
+  // Last, and only when the turn actually delegated: it is the one clause that
+  // varies in length, so it belongs where it cannot push the facts that are
+  // always present off the end of a narrow display.
+  const roster = formatSubagentRoster();
+  if (roster) parts.push(roster);
   return parts.length > 0 ? parts.join(' · ') : null;
 }
 
