@@ -4,7 +4,7 @@
 
 **What moves.** `DEFAULT_CODEX_MODEL` (`container/agent-runner/src/providers/codex.ts`) is now `gpt-6-sol`, replacing `gpt-5.6-sol`. `DEFAULT_CODEX_EFFORT` stays `high`. The `sol` and `luna` aliases (`CODEX_MODEL_ALIAS_MAP`, `src/flag-parser.ts`) now name `gpt-6-sol` and `gpt-6-luna`. `terra` still names `gpt-5.6-terra`, because Terra has no GPT-6 release. `astra` is unchanged.
 
-**Requires codex-cli ≥ 0.155.1 in the agent image.** Measured on 2026-09-22 with ChatGPT-account auth, which is how the fleet's Codex runs. On 0.154.0, `gpt-6-sol` returns HTTP 400: "The 'gpt-6-sol' model is not supported when using Codex with a ChatGPT account". On 0.155.1, `gpt-6-sol` and `gpt-6-luna` are both served, and `max` effort is accepted. The image pin moves to 0.155.1 in the Opus 5.5 change (`container/Dockerfile` `CODEX_VERSION`, recorded in `versions.json` as `codex-cli`). Deploy this change with that one or after it, never on an image still at 0.154.0: every unpinned Codex path would fail.
+**Requires codex-cli ≥ 0.155.1 in the agent image.** Measured on 2026-09-22 with ChatGPT-account auth, which is how the fleet's Codex runs. On 0.154.0, `gpt-6-sol` returns HTTP 400: "The 'gpt-6-sol' model is not supported when using Codex with a ChatGPT account". On 0.155.1, `gpt-6-sol` and `gpt-6-luna` are both served, and `max` effort is accepted. The image pin moves to 0.156.0 in the Opus 5.5 change (`container/Dockerfile` `CODEX_VERSION`, recorded in `versions.json` as `codex-cli`). Deploy this change with that one or after it, never on an image still at 0.154.0: every unpinned Codex path would fail.
 
 On deploy, two kinds of Codex path move to GPT-6 Sol:
 - any Codex group whose `container.json` sets no model (`model`, `providerConfig.model`, or the legacy `defaultModel`);
@@ -27,7 +27,7 @@ pnpm exec tsx -e "import Database from 'better-sqlite3'; import fs from 'fs'; fo
 
 A session sticky moves only when someone in that thread sends `-m sol` (or `-m ''` to clear it back to the group's model). There is no `ncl` verb for it. The container owns `outbound.db`, so an operator writes to it only while that session's container is stopped: delete the `sticky_model` row from `session_state`.
 
-**Why.** GPT-6 Sol and Luna are the GPT-6 successors to the 5.6 tiers, announced by OpenAI on 2026-09-22 at lower API prices. Neither id is in Codex's bundled model catalog (0.155.1 or 0.156.0), so Codex runs them on fallback metadata and warns about it. The server gates them by client version, as measured above.
+**Why.** GPT-6 Sol and Luna are the GPT-6 successors to the 5.6 tiers, announced by OpenAI on 2026-09-22 at lower API prices. Neither id is in Codex's bundled model catalog (0.155.1 or 0.156.0); both are served on 0.155.1 and 0.156.0, so Codex runs them on fallback metadata and warns about it. The server gates them by client version, as measured above.
 
 **Fix: keep 5.6 on a path, before deploying.** Pins are data and need no deploy:
 
