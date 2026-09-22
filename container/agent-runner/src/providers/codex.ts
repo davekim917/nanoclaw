@@ -1943,6 +1943,12 @@ export async function* runOneTurn(
   const subagentThreadIds = new Set<string>();
   let rosterRead: Promise<void> | null = null;
   let rosterReadAgain = false;
+  // Set in this turn's `finally`. A read still in flight when the turn ends on
+  // an error path (the success path awaits it) must not write into the roster
+  // poll-loop has since cleared: that would stamp THIS turn's workers onto the
+  // NEXT turn's reply. Not awaited in `finally` instead, because against a dead
+  // server that would add a full request timeout to teardown.
+  let rosterTurnOver = false;
   const enrichRoster = (): void => {
     if (rosterRead) {
       rosterReadAgain = true;
@@ -1951,12 +1957,14 @@ export async function* runOneTurn(
     rosterRead = (async () => {
       do {
         rosterReadAgain = false;
-        for (const thread of await readCodexSubagentThreads(server, threadId, CODEX_HEALTH_PROBE_TIMEOUT_MS)) {
+        const threads = await readCodexSubagentThreads(server, threadId, CODEX_HEALTH_PROBE_TIMEOUT_MS);
+        if (rosterTurnOver) return;
+        for (const thread of threads) {
           if (subagentThreadIds.has(thread.id)) {
             recordSubagent(thread.id, { model: thread.model, effort: thread.effort });
           }
         }
-      } while (rosterReadAgain);
+      } while (rosterReadAgain && !rosterTurnOver);
     })().finally(() => {
       rosterRead = null;
     });
@@ -2591,6 +2599,7 @@ export async function* runOneTurn(
       steps: turnAccum.steps > 0 ? turnAccum.steps : null,
     };
   } finally {
+    rosterTurnOver = true;
     try {
       clearContainerToolInFlight();
     } catch (err) {

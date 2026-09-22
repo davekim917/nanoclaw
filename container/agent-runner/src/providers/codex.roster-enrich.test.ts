@@ -15,6 +15,7 @@ import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js
 import { _resetConfig, _setConfigForTest } from '../config.js';
 import {
   _forgetOwnershipForTest,
+  clearSubagents,
   formatStatusSubtext,
   hydrateTurnStatus,
   resetTurnStatus,
@@ -156,5 +157,57 @@ describe('Codex subagent roster enrichment (#1028)', () => {
     fixture.emit('turn/completed', { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [] } });
     await done;
     expect(events.at(-1)?.type).toBe('result');
+  });
+
+  // Review of #1034: a read still in flight when the turn dies on an error
+  // path must not write into the roster poll-loop has since cleared, or this
+  // turn's workers appear under the NEXT turn's reply.
+  it('drops a read that lands after the turn ended on an error', async () => {
+    const held: RecordedRequest[] = [];
+    const fixture = fakeServer((request) => {
+      if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };
+      if (request.method === 'thread/read') return { result: { thread: { status: { type: 'active' } } } };
+      if (request.method === 'thread/list') {
+        held.push(request);
+        return null; // answered by hand below, after the turn is over
+      }
+      return null;
+    });
+
+    const done = (async () => {
+      for await (const _event of runOneTurn(
+        fixture.server,
+        'thread-1',
+        'delegate',
+        'gpt-5.6-sol',
+        '/workspace',
+        () => true,
+        () => {},
+        { currentTurnId: null },
+        HEALTH,
+      ));
+    })();
+
+    await Bun.sleep(5);
+    fixture.emit('item/started', childActivity('a-1', 'child-1'));
+    await Bun.sleep(5);
+    expect(held.length).toBe(1);
+    fixture.emit('turn/completed', {
+      threadId: 'thread-1',
+      turn: { id: 'turn-1', status: 'failed', error: { message: 'boom' }, items: [] },
+    });
+    await done.catch(() => {});
+
+    // poll-loop clears the roster at the turn boundary...
+    clearSubagents();
+    // ...and only then does the orphaned read answer.
+    const pending = (fixture.server as unknown as { pending: Map<number, { resolve: (v: never) => void }> }).pending;
+    pending.get(held[0].id)?.resolve({
+      id: held[0].id,
+      result: { data: [{ id: 'child-1', model: 'gpt-5.6-sol', reasoning_effort: 'medium' }] },
+    } as never);
+    await Bun.sleep(5);
+
+    expect(formatStatusSubtext()).toBe('gpt-5.6-sol · high');
   });
 });
