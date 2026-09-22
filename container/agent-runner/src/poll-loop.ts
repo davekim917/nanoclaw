@@ -2183,6 +2183,15 @@ export async function processQuery(
           query.abort();
           return;
         }
+        // A due --fresh-context fire needs the outer loop's reset, and this
+        // stream otherwise stays open after its result. End (not abort) so a
+        // turn still running finishes first; selectInTurnFollowUps never pushes it.
+        if (allPending.some((m) => m.trigger === 1 && isFreshContextTaskBatch([m]))) {
+          log('Pending fresh-context task fire — ending active stream so outer loop can reset');
+          endedForCommand = true;
+          query.end();
+          return;
+        }
 
         // Flag-bearing messages (-m/-e/-f) are handled after admission, below:
         // stickies are persisted and live-capable settings are applied via

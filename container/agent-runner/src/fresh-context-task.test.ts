@@ -40,8 +40,8 @@ afterEach(() => {
 function insertRow(id: string, kind: 'task' | 'chat', content: object): void {
   getInboundDb()
     .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
-       VALUES (?, ?, ?, 'pending', 'chan-1', 'discord', NULL, ?)`,
+      `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content, trigger)
+       VALUES (?, ?, ?, 'pending', 'chan-1', 'discord', NULL, ?, 1)`,
     )
     .run(id, kind, new Date().toISOString(), JSON.stringify(content));
 }
@@ -81,6 +81,32 @@ describe('fresh-context task fires', () => {
     await runOneBatch(provider);
 
     expect(provider.continuations[0]).toBe('prior-session');
+  });
+
+  it('a flagged fire that comes due while the previous query is still open ends it and starts fresh', async () => {
+    setContinuation('mock', 'prior-session');
+    insertRow('t1', 'task', { prompt: 'first fire', freshContext: true });
+    const provider = new RecordingProvider();
+    const controller = new AbortController();
+    const loop = runPollLoop({ provider, providerName: 'mock', cwd: '/tmp', signal: controller.signal });
+    try {
+      const deadline = Date.now() + 4000;
+      while (provider.continuations.length === 0) {
+        if (Date.now() > deadline) throw new Error('first fire never queried');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      // The mock keeps its stream open after the result, as the real providers do.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      insertRow('t2', 'task', { prompt: 'second fire', freshContext: true });
+      while (provider.continuations.length < 2) {
+        if (Date.now() > deadline + 4000) throw new Error('second fire was never prompted');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(provider.continuations).toEqual([undefined, undefined]);
+    } finally {
+      controller.abort();
+      await loop.catch(() => {});
+    }
   });
 
   it('a chat row batched with a flagged fire keeps the conversation', async () => {
