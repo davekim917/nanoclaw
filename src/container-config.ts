@@ -1395,6 +1395,18 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
   };
 }
 
+/**
+ * Fleet default without materializing it into operator-owned container.json.
+ *
+ * Mirrors effectiveOutcomeReporting: only an explicit `false` opts out, so a
+ * missing key reads as ON. Callers that show an operator what a group is set
+ * to must present BOTH this and the stored value — "unset" and "explicitly on"
+ * are the same behaviour but not the same operator intent.
+ */
+export function effectiveStatusSubtext(config: Pick<ContainerConfig, 'statusSubtext'>): boolean {
+  return config.statusSubtext !== false;
+}
+
 /** Fleet default without materializing it into operator-owned container.json. */
 export function effectiveOutcomeReporting(config: Pick<ContainerConfig, 'outcomeReporting'>): boolean {
   return config.outcomeReporting !== false;

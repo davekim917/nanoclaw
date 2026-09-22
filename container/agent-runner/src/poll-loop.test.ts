@@ -5481,6 +5481,7 @@ describe('status subtext — round-two regressions', () => {
     await writeMessageOut({
       id: 'mcp-1',
       kind: 'chat',
+      agentReply: true,
       platform_id: 'chan-1',
       channel_type: 'discord',
       thread_id: null,
@@ -5489,6 +5490,48 @@ describe('status subtext — round-two regressions', () => {
 
     const row = getUndeliveredMessages().find((r: { id: string }) => r.id === 'mcp-1');
     expect(JSON.parse(row.content).subtext).toBe('opus-5 · xhigh · 142k context');
+  });
+
+  it('does not stamp a send_file caption row', async () => {
+    const { writeMessageOut, getUndeliveredMessages } = require('./db/messages-out.js');
+    setTurnSettings('claude-opus-5[1m]', 'xhigh');
+    setOwnConversation('discord', 'chan-1');
+    recordContextTokens(142_400);
+
+    // Exactly the shape mcp-tools/core.ts:480 writes: kind 'chat', own
+    // routing, no agentReply marker.
+    await writeMessageOut({
+      id: 'file-1',
+      kind: 'chat',
+      platform_id: 'chan-1',
+      channel_type: 'discord',
+      thread_id: null,
+      content: JSON.stringify({ text: 'here is the chart', files: ['chart.png'] }),
+    });
+
+    const row = getUndeliveredMessages().find((r: { id: string }) => r.id === 'file-1');
+    expect(JSON.parse(row.content).subtext).toBeUndefined();
+  });
+
+  it('does not stamp the runner own /clear notice with a stale turn setting', async () => {
+    const { writeMessageOut, getUndeliveredMessages } = require('./db/messages-out.js');
+    // A previous turn left settings in the store; the notice is authored by no
+    // turn at all and must not inherit them.
+    setTurnSettings('claude-opus-5[1m]', 'xhigh');
+    setOwnConversation('discord', 'chan-1');
+    recordContextTokens(142_400);
+
+    await writeMessageOut({
+      id: 'clear-1',
+      kind: 'chat',
+      platform_id: 'chan-1',
+      channel_type: 'discord',
+      thread_id: null,
+      content: JSON.stringify({ text: 'Session cleared.' }),
+    });
+
+    const row = getUndeliveredMessages().find((r: { id: string }) => r.id === 'clear-1');
+    expect(JSON.parse(row.content).subtext).toBeUndefined();
   });
 
   it('does not stamp a work_log row written through the same seam', async () => {

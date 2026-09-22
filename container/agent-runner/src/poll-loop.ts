@@ -3605,6 +3605,9 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
     // note in dispatchFileAttachment / getPendingMessages.
     in_reply_to: getBatchAnchor(channelType, platformId) ?? routing.inReplyTo,
     kind: 'chat',
+    // Agent-composed reply text — eligible for the status subtext. The
+    // own-conversation gate still applies at the seam.
+    agentReply: true,
     platform_id: platformId,
     channel_type: channelType,
     thread_id: threadId,

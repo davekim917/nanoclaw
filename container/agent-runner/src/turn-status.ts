@@ -237,10 +237,12 @@ function statusSubtextEnabled(): boolean {
  * Stamping in either sender alone therefore covers roughly half the fleet
  * while looking complete in tests.
  *
- * Scope is deliberately narrow: `kind: 'chat'` only, so work logs, cards,
- * system actions and file attachments pass through byte-identical; the
- * agent's own conversation only (`isOwnConversation`); and an existing
- * `subtext` key is never overwritten.
+ * Scope is deliberately narrow, and the first gate is OPT-IN: the row must be
+ * marked `agentReply`, because `kind: 'chat'` alone is far broader than "a
+ * reply the agent composed" — `send_file` captions and the runner's own
+ * `/clear` notice are both routed chat rows. Then: the agent's own
+ * conversation only (`isOwnConversation`), and an existing `subtext` key is
+ * never overwritten.
  *
  * Known gap, accepted: "post in THIS thread, as me" resolves to the origin and
  * is stamped. No routing fact distinguishes it from a normal reply; only the
@@ -250,11 +252,12 @@ function statusSubtextEnabled(): boolean {
  */
 export function stampStatusSubtext(msg: {
   kind: string;
+  agentReply?: boolean;
   channel_type?: string | null;
   platform_id?: string | null;
   content: string;
 }): string {
-  if (msg.kind !== 'chat') return msg.content;
+  if (msg.agentReply !== true || msg.kind !== 'chat') return msg.content;
   if (!isOwnConversation(msg.channel_type, msg.platform_id)) return msg.content;
   if (!statusSubtextEnabled()) return msg.content;
   const subtext = formatStatusSubtext();

@@ -154,6 +154,7 @@ describe('clearContextTokens — the turn boundary', () => {
 describe('stampStatusSubtext', () => {
   const chat = (over: Record<string, unknown> = {}) => ({
     kind: 'chat',
+    agentReply: true,
     channel_type: 'slack',
     platform_id: 'C-MAIN',
     content: JSON.stringify({ text: 'hi' }),
@@ -210,6 +211,25 @@ describe('stampStatusSubtext', () => {
   it('passes a JSON array through untouched', () => {
     const msg = chat({ content: '[1,2,3]' });
     expect(stampStatusSubtext(msg)).toBe('[1,2,3]');
+  });
+
+  // Round three: `kind === 'chat'` alone was too broad. A routed chat row is
+  // not necessarily a reply the agent composed.
+  it('leaves an unmarked chat row alone, as send_file captions are', () => {
+    const msg = chat({
+      agentReply: undefined,
+      content: JSON.stringify({ text: 'here is the chart', files: ['chart.png'] }),
+    });
+    expect(sub(stampStatusSubtext(msg))).toBeUndefined();
+  });
+
+  it('leaves a runner infra notice alone, as the /clear acknowledgement is', () => {
+    const msg = chat({ agentReply: undefined, content: JSON.stringify({ text: 'Session cleared.' }) });
+    expect(sub(stampStatusSubtext(msg))).toBeUndefined();
+  });
+
+  it('requires the marker to be exactly true, not merely truthy-adjacent', () => {
+    expect(sub(stampStatusSubtext(chat({ agentReply: false })))).toBeUndefined();
   });
 
   it('stamps nothing for a group that opted out', () => {

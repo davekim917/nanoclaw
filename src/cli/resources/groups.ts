@@ -5,6 +5,7 @@ import path from 'path';
 import { GROUPS_DIR } from '../../config.js';
 import {
   assertMcpServerNotPluginOwned,
+  effectiveStatusSubtext,
   parseMcpServerConfig,
   readContainerConfig,
   resolveContainerSecurity,
@@ -107,6 +108,12 @@ function presentConfig(row: ContainerConfigRow, folder?: string): Record<string,
     // must be visible here, not only in the spawn's docker args.
     security: fileConfig?.security ?? null,
     effective_security: fileConfig ? resolveContainerSecurity(fileConfig.security) : null,
+    // Stored AND effective, like resources/security above: the stored value is
+    // `false` only for a group that explicitly opted out, and null otherwise,
+    // so an operator auditing `--status-subtext off` can tell a deliberate
+    // opt-out from a group riding the default.
+    status_subtext: fileConfig?.statusSubtext ?? null,
+    effective_status_subtext: fileConfig ? effectiveStatusSubtext(fileConfig) : null,
     updated_at: row.updated_at,
   };
 }

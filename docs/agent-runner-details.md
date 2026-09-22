@@ -943,11 +943,21 @@ It is a LATEST-WINS reading of the most recent request, never a per-turn delta. 
 does **not** ride `TurnUsageInfo`: that seam's numbers go through `toTurnDelta`, and context
 occupancy is an absolute reading that must not be differenced.
 
-**Whose voice gets stamped.** `sendToDestination` (`poll-loop.ts`) is the single chokepoint every
-`<message to="…">` block passes through, and it stamps only when the destination resolves to the
-session's own conversation. A cross-destination send — a sibling agent's DM, another channel, or
-a message the operator asked the agent to relay on their behalf — goes out clean. `send_file`
-captions, `edit_message`, `add_reaction` and the runner's own infra notices are never stamped.
+**Whose voice gets stamped.** The decision lives at the shared outbound seam
+(`db/messages-out.ts` → `stampStatusSubtext`), not in any one sender, because an agent's reply
+reaches a conversation by two unrelated paths and which one runs depends on a config flag:
+`<message to="…">` envelopes via `sendToDestination`, and the `send_message` MCP tool, which
+writes its own chat row. Outcome reporting is ON unless a group disables it, and it instructs the
+agent to reply through `send_message` — so on a default install that is *the* reply path.
+Stamping in either sender alone covers roughly half the fleet while looking complete.
+
+Two gates, both of which must pass. The row must be marked `agentReply` — an explicit opt-in the
+two reply paths set, because `kind: 'chat'` is far broader than "a reply the agent composed"
+(`send_file` writes captions as chat, and the runner posts its own `/clear` notice the same way).
+And the destination must resolve to the session's own conversation, so a cross-destination send —
+a sibling agent's DM, another channel, or a message the operator asked the agent to relay on
+their behalf — goes out clean. `send_file` captions, `edit_message`, `add_reaction` and the
+runner's own infra notices are never stamped.
 
 *Known gap, accepted:* "post in THIS thread, as me" resolves to the origin and is stamped. No
 routing fact distinguishes it from a normal reply. A suppress flag on the sending tool was
