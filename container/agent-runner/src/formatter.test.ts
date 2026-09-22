@@ -284,6 +284,43 @@ describe('task timestamps', () => {
     expect(result).not.toContain(`time="${formatLocalTime(created, TIMEZONE)}"`);
   });
 
+  it('gives each recurring occurrence its own request id and preserves that id across retry backoff', () => {
+    const firstSlot = '2026-01-05T09:00:00.000Z';
+    const secondSlot = '2026-01-06T09:00:00.000Z';
+    const retryAt = '2026-01-06T09:05:00.000Z';
+    insertMessage(
+      'series-fire-1',
+      'task',
+      { prompt: 'prepare the daily brief' },
+      {
+        seq: 41,
+        processAfter: firstSlot,
+        scheduledFor: firstSlot,
+      },
+    );
+    insertMessage(
+      'series-fire-2',
+      'task',
+      { prompt: 'prepare the daily brief' },
+      {
+        seq: 42,
+        processAfter: secondSlot,
+        scheduledFor: secondSlot,
+      },
+    );
+
+    const initial = getPendingMessages();
+    expect(formatMessages([initial[0]!])).toContain('<task id="41"');
+    expect(formatMessages([initial[1]!])).toContain('<task id="42"');
+
+    getInboundDb().prepare('UPDATE messages_in SET process_after = ? WHERE id = ?').run(retryAt, 'series-fire-2');
+    const retried = getPendingMessages().find((row) => row.id === 'series-fire-2')!;
+    const prompt = formatMessages([retried]);
+    expect(prompt).toContain('<task id="42"');
+    expect(prompt).toContain(`time="${formatLocalTime(secondSlot, TIMEZONE)}"`);
+    expect(prompt).not.toContain(`time="${formatLocalTime(retryAt, TIMEZONE)}"`);
+  });
+
   it('renders the ORIGINAL slot for an occurrence sitting in retry backoff', () => {
     // deferMessageForFreshContextRetry puts a crashed provider turn behind a
     // retry deadline by rewriting process_after. That is a "don't touch me

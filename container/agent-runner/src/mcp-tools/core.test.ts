@@ -501,6 +501,27 @@ describe('outcome reporting send_message contract', () => {
     }
   });
 
+  it('resolves the second recurring task occurrence by its displayed request id', async () => {
+    const { setChatLimit } = await import('../modules/mailbox/index.js');
+    publishRequestCandidates([
+      { sequence: 41, messageId: 'series-fire-1' },
+      { sequence: 42, messageId: 'series-fire-2' },
+    ]);
+    setChatLimit(0);
+    try {
+      const result = await sendMessage.handler({
+        purpose: 'outcome',
+        text: 'Second occurrence complete.',
+        outcome: { requestId: 42, verified: 'Second occurrence checks passed.' },
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Chat sends are disabled');
+      expect(result.content[0].text).not.toContain('not an admissible original request');
+    } finally {
+      setChatLimit(null);
+    }
+  });
+
   it('records progress durably, refuses unlabeled narration, preserves internal handoffs', async () => {
     const progress = await sendMessage.handler({ text: 'Checking CI', purpose: 'progress' });
     expect(progress.content[0].text).toContain('Recorded internally');

@@ -2515,6 +2515,46 @@ describe('deliverSessionMessages — deferAck system actions', () => {
     expect(ids.has('out-after')).toBe(true);
     expect(outcome).toBe('pending');
   });
+
+  it('keeps lifecycle state for deferred and internal system actions', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    registerDeliveryAction(
+      'test_defer_without_public_delivery',
+      async () => ({ deferAck: true }) as const,
+      unguarded('test-only deferred internal action'),
+    );
+    registerDeliveryAction(
+      'test_internal_delivery_action',
+      async () => undefined,
+      unguarded('test-only completed internal action'),
+    );
+
+    const deletes: string[] = [];
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-working';
+      },
+      async deleteMessage(_channelType, _platformId, _threadId, messageId) {
+        deletes.push(messageId);
+      },
+    });
+    insertOutboundKind('ag-1', session.id, 'working', 'status', 'telegram', 'telegram:123', {
+      text: 'Accepted · working',
+      reporting: { version: 1, purpose: 'liveness', state: 'working' },
+    });
+    await deliverSessionMessages(session);
+
+    insertAt(session.id, 'deferred', '2026-09-01T00:00:02.000Z', 'system', {
+      action: 'test_defer_without_public_delivery',
+    });
+    insertAt(session.id, 'internal', '2026-09-01T00:00:03.000Z', 'system', {
+      action: 'test_internal_delivery_action',
+    });
+    await deliverSessionMessages(session);
+
+    expect(deletes).toEqual([]);
+  });
 });
 
 /**
@@ -2788,6 +2828,34 @@ describe('deliverSessionMessages — ask_question ids', () => {
 
     expect(calls).toHaveLength(1);
     expect(await getPendingQuestion('q-agent-1')).toMatchObject({ session_id: session.id, message_out_id: 'out-ask' });
+  });
+
+  it('clears lifecycle state only after an ask_question card is delivered', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const deletes: string[] = [];
+    let posts = 0;
+    setDeliveryAdapter({
+      async deliver() {
+        posts += 1;
+        return posts === 1 ? 'plat-working' : 'plat-question';
+      },
+      async deleteMessage(_channelType, _platformId, _threadId, messageId) {
+        deletes.push(messageId);
+      },
+    });
+    insertOutboundKind('ag-1', session.id, 'working', 'status', 'telegram', 'telegram:123', {
+      text: 'Accepted · working',
+      reporting: { version: 1, purpose: 'liveness', state: 'working' },
+    });
+    await deliverSessionMessages(session);
+    insertOutboundKind('ag-1', session.id, 'out-ask', 'chat-sdk', 'telegram', 'telegram:123', ask('q-agent-2'));
+
+    await deliverSessionMessages(session);
+
+    expect(posts).toBe(2);
+    expect(deletes).toEqual(['plat-working']);
+    expect(await getPendingQuestion('q-agent-2')).toMatchObject({ session_id: session.id, message_out_id: 'out-ask' });
   });
 });
 

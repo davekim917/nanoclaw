@@ -18,7 +18,11 @@ import { initTestDb, closeDb, runMigrations, getRawDb } from '../../db/index.js'
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { createSession, getPendingApprovalsByAction } from '../../db/sessions.js';
-import { setDeliveryAdapter, type ChannelDeliveryAdapter } from '../../delivery.js';
+import {
+  clearSessionStatusAfterPublicDelivery,
+  setDeliveryAdapter,
+  type ChannelDeliveryAdapter,
+} from '../../delivery.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { upsertUser } from '../permissions/db/users.js';
@@ -40,6 +44,11 @@ vi.mock('../../session-manager.js', async () => {
   const actual = await vi.importActual<typeof import('../../session-manager.js')>('../../session-manager.js');
   return { ...actual, writeSessionMessage: vi.fn() };
 });
+
+vi.mock('../../delivery.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../delivery.js')>()),
+  clearSessionStatusAfterPublicDelivery: vi.fn().mockResolvedValue(undefined),
+}));
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-approval-primitive') }));
 const DM_CHANNEL = 'slack';
@@ -133,6 +142,7 @@ describe('requestApproval delivery failure', () => {
     // No orphan: the row created before the delivery attempt is gone.
     expect(await getPendingApprovalsByAction('test_action')).toHaveLength(0);
     expect(lastNotifyText()).toMatch(/test_action failed: could not deliver/);
+    expect(vi.mocked(clearSessionStatusAfterPublicDelivery)).not.toHaveBeenCalled();
   });
 
   it('keeps the pending approval row when delivery succeeds', async () => {
@@ -154,5 +164,6 @@ describe('requestApproval delivery failure', () => {
 
     expect(await getPendingApprovalsByAction('test_action')).toHaveLength(1);
     expect(vi.mocked(writeSessionMessage)).not.toHaveBeenCalled();
+    expect(clearSessionStatusAfterPublicDelivery).toHaveBeenCalledWith(session.id);
   });
 });

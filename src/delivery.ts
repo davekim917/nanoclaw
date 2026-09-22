@@ -433,6 +433,12 @@ async function dropOrphanStatus(
   statusTracking.delete(sessionId);
 }
 
+/** Clear this session's lifecycle line after a confirmed public delivery. */
+export async function clearSessionStatusAfterPublicDelivery(sessionId: string): Promise<void> {
+  const isSpawnChild = await isSpawnChildSession(sessionId);
+  await dropOrphanStatus(sessionId, { skip: isSpawnChild, recoverLifecycle: true });
+}
+
 /** Discord refuses further edits after an old message reaches its edit cap. */
 function isDiscordStatusEditLimitError(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;
@@ -1955,13 +1961,7 @@ async function deliverMessage(
   // markDelivered for the chat reply itself — that would cause retry/
   // duplicate of the real answer.
   if (msg.kind === 'chat' || msg.kind === 'chat-sdk') {
-    // Skip orphan delete for spawn-task children — they were posted in
-    // append mode (durable work log), so there's no orphan to clean up.
-    // The statusTracking map is also untouched in append mode, but call
-    // `delete` anyway as a defensive no-op in case a regular chat row ever
-    // got tracked before the session was classified as a spawn child.
-    const isSpawnChild = await isSpawnChildSession(session.id);
-    await dropOrphanStatus(session.id, { skip: isSpawnChild, recoverLifecycle: true });
+    await clearSessionStatusAfterPublicDelivery(session.id);
   }
 
   if (msg.kind === 'chat') {

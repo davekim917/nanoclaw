@@ -29,7 +29,7 @@ import {
   getSession,
   updatePendingApprovalMessageId,
 } from '../../db/sessions.js';
-import { getDeliveryAdapter } from '../../delivery.js';
+import { clearSessionStatusAfterPublicDelivery, getDeliveryAdapter } from '../../delivery.js';
 import { requestWake } from '../../request-wake.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -506,6 +506,14 @@ export async function requestApprovalOutcome(opts: RequestApprovalOptions): Prom
     log.error('Failed to deliver approval card', { action, approvalId, target: destination.label, err });
     await notifyAgent(session, `${action} failed: could not deliver approval request to ${destination.label}.`);
     return 'failed';
+  }
+
+  try {
+    await clearSessionStatusAfterPublicDelivery(session.id);
+  } catch (err) {
+    // The card is already public. Cleanup must not relabel a successful post as
+    // a failed approval request or remove its durable pending row.
+    log.warn('Approval card posted but lifecycle cleanup failed', { action, approvalId, sessionId: session.id, err });
   }
 
   log.info('Approval requested', { action, approvalId, agentName, target: destination.label, deliveryTarget });
