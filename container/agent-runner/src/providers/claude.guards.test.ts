@@ -797,7 +797,7 @@ describe('createBashCommandRewriteHook: jest serialization', () => {
     }
   });
 
-  it('keeps the codex stdin wrap when codex is the one running jest', async () => {
+  it('the Claude hook still wraps stdin when the command itself is `codex exec` running jest', async () => {
     const out = await runHook('codex exec --yolo "npm test"');
     expect(out).toContain('</dev/null');
     expect(out).toContain('flock -n -E 126');
@@ -991,9 +991,10 @@ describe('createEmailGateHook — one approval card per tool call', () => {
   });
 });
 
-// ── Every Bash command gets /dev/null on stdin (2026-09-22 production incident) ──
+// ── Every CLAUDE Bash command gets /dev/null on stdin (2026-09-22 incident) ──
 //
-// The Bash tool's fd 0 is a socket that is never written and never closed.
+// The Claude Code Bash tool's fd 0 is a socket that is never written and never
+// closed; this prefix is scoped to that provider and the Codex chain gets none.
 // snowflake-cli 3.23.0 reads it when `--query` is empty (commands.py:175-176),
 // so `snow sql --query "$(cat missing.sql)"` hung a turn for 30 minutes. These
 // run the hook's REAL output under a real `bash`, with stdin held open and
@@ -1147,7 +1148,7 @@ describe('universal /dev/null stdin wrap', () => {
     expect(once.match(/exec <\/dev\/null/g)).toHaveLength(1);
   });
 
-  it('without closeStdin the hook never adds the prefix (the Codex chain emits it itself)', async () => {
+  it('without closeStdin the hook never adds the prefix (the Codex chain gets none at all)', async () => {
     const hook = createBashCommandRewriteHook();
     const run1 = async (command: string) =>
       (

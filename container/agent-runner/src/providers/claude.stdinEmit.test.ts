@@ -1,8 +1,9 @@
 /**
  * INVARIANT: the `exec </dev/null` stdin prefix is a transport detail that no
- * guard may ever see. On the Claude SDK path the Bash PreToolUse list IS the
- * chain (the CLI merges it), so its emit point is the rewrite hook registered
- * LAST with `closeStdin: true`.
+ * guard may ever see. It is applied on the CLAUDE path only — the Codex chain
+ * applies none (codex-hooks/runner.ts). On the Claude SDK path the Bash
+ * PreToolUse list IS the chain (the CLI merges it), so the single emit point
+ * is the rewrite hook registered LAST with `closeStdin: true`.
  *
  * We cannot read how the CLI merges several hooks' `updatedInput`. This test
  * therefore runs the provider's REAL registered Bash hook list under the

@@ -1,8 +1,9 @@
 /**
  * Records every command `evaluateBashCommand` is called with, so a test can
- * prove the in-tree Codex chain hands the destructive-action guard the command
- * WITHOUT the `exec </dev/null` stdin prefix — the prefix is a transport detail
- * and would otherwise land on the approval card an admin reads.
+ * prove the in-tree Codex chain hands the destructive-action guard raw command
+ * text. That chain applies no `exec </dev/null` stdin prefix at all (it is
+ * Claude-only), and this recorder is what pins that: a prefix reaching the
+ * guard would land on the approval card an admin reads.
  *
  * The recording goes to a FILE (appended, one JSON string per line), not a
  * module-level variable: the runner imports the core dynamically and bun
