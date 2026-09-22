@@ -409,7 +409,8 @@ export function materializeRawImageGeneration(
 /**
  * The unpinned Codex fleet default: gpt-6-sol at `high` reasoning (operator
  * decision 2026-09-22, replacing gpt-5.6-sol; gpt-5.6-terra at `xhigh` before
- * 2026-09-16). Keep it equal to the `sol` alias in src/flag-parser.ts.
+ * 2026-09-16). Keep it equal to the `sol` alias (`CODEX_MODEL_ALIAS_MAP`,
+ * src/flag-parser.ts:225).
  *
  * These are the ONLY fleet defaults for Codex. A group pins with
  * `providerConfig.model`/`reasoning_effort` in container.json, or
