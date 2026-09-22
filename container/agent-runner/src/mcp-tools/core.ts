@@ -357,6 +357,10 @@ export const sendMessage: McpToolDefinition = {
       id,
       in_reply_to: getCurrentInReplyTo(),
       kind: internal ? 'work_log' : 'chat',
+      // Agent-composed reply text — eligible for the status subtext. With
+      // outcome reporting on (the fleet default) this is THE reply path, not
+      // an alternative to the `<message>` envelope.
+      agentReply: !internal,
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
       thread_id: routing.thread_id,

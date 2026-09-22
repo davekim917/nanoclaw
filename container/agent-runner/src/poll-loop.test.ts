@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 
 import { evaluateAdmission, registerAdmissionGate } from './admission-gate.js';
-import { _resetConfig, loadConfig } from './config.js';
+import { _resetConfig, _setConfigForTest, loadConfig } from './config.js';
 import { clearStaleProcessingAcks, setContainerToolInFlight } from './db/container-state.js';
 import { setContinuation } from './db/session-state.js';
 import { getRequestCandidates, rememberRequestCandidates } from './modules/mailbox/session-state.js';
@@ -46,6 +46,13 @@ import {
   queueWorkContinuation,
 } from './modules/mailbox/index.js';
 import { MockProvider } from './providers/mock.js';
+import {
+  formatStatusSubtext,
+  recordContextTokens,
+  resetTurnStatus,
+  setOwnConversation,
+  setTurnSettings,
+} from './turn-status.js';
 import { postToolUseHook, preToolUseHook } from './providers/claude.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -5314,5 +5321,347 @@ describe('outcome reporting — quiet work and expected replies', () => {
     );
     expect(result.sent).toBe(0);
     expect(getUndeliveredMessages()[0].kind).toBe('work_log');
+  });
+});
+
+describe('dispatchResultText — status subtext', () => {
+  // The rule this pins: the model/effort/context line describes the machinery
+  // answering YOU, so it belongs under a reply in the conversation you are in
+  // and nowhere else. A cross-destination send carries someone else's words to
+  // someone else's room — including a message the operator asked the agent to
+  // relay on their behalf — and must go out clean.
+  function seedDestination(name: string, channelType: string, platformId: string): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES (?, ?, 'channel', ?, ?, NULL)`,
+      )
+      .run(name, name, channelType, platformId);
+  }
+
+  function routing(channelType: string | null, platformId: string | null) {
+    return { channelType, platformId, threadId: null, inReplyTo: null, quietStatus: false };
+  }
+
+  const subtextOf = (row: { content: string }): string | undefined =>
+    (JSON.parse(row.content) as { subtext?: string }).subtext;
+
+  beforeEach(() => {
+    _resetConfig();
+    _setConfigForTest({});
+    resetTurnStatus();
+    setTurnSettings('claude-opus-5[1m]', 'xhigh');
+    // Every case below runs with slack/C-MAIN as the session's own
+    // conversation; processQuery sets this per turn in production.
+    setOwnConversation('slack', 'C-MAIN');
+    recordContextTokens(142_400);
+  });
+
+  afterEach(() => {
+    resetTurnStatus();
+    _resetConfig();
+  });
+
+  it('stamps a reply addressed to the current conversation with to="here"', async () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+
+    await dispatchResultText('<message to="here">All set.</message>', routing('slack', 'C-MAIN'));
+
+    expect(subtextOf(getUndeliveredMessages()[0])).toBe('opus-5 · xhigh · 142k context');
+  });
+
+  it('stamps a reply that names the origin destination explicitly', async () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+
+    await dispatchResultText('<message to="slack-main">All set.</message>', routing('slack', 'C-MAIN'));
+
+    expect(subtextOf(getUndeliveredMessages()[0])).toBe('opus-5 · xhigh · 142k context');
+  });
+
+  it('stamps unwrapped text that falls back to the origin', async () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+
+    await dispatchResultText('I forgot to wrap this, but it is still my answer.', routing('slack', 'C-MAIN'));
+
+    expect(subtextOf(getUndeliveredMessages()[0])).toBe('opus-5 · xhigh · 142k context');
+  });
+
+  it('does NOT stamp a send to another channel — the relay-on-my-behalf case', async () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+    seedDestination('slack-other', 'slack', 'C-OTHER');
+
+    await dispatchResultText(
+      '<message to="slack-other">The operator asked me to pass this along.</message>',
+      routing('slack', 'C-MAIN'),
+    );
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].platform_id).toBe('C-OTHER');
+    expect(subtextOf(out[0])).toBeUndefined();
+  });
+
+  it('does NOT stamp a send to another platform', async () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+    seedDestination('discord-side', 'discord', 'chan-9');
+
+    await dispatchResultText('<message to="discord-side">over here</message>', routing('slack', 'C-MAIN'));
+
+    expect(subtextOf(getUndeliveredMessages()[0])).toBeUndefined();
+  });
+
+  it('stamps each destination independently when one turn addresses both', async () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+    seedDestination('slack-other', 'slack', 'C-OTHER');
+
+    await dispatchResultText(
+      '<message to="here">answering you</message><message to="slack-other">forwarding</message>',
+      routing('slack', 'C-MAIN'),
+    );
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(2);
+    const byChannel = Object.fromEntries(out.map((row) => [row.platform_id, subtextOf(row)]));
+    expect(byChannel['C-MAIN']).toBe('opus-5 · xhigh · 142k context');
+    expect(byChannel['C-OTHER']).toBeUndefined();
+  });
+
+  it('stamps nothing for a group that opted out', async () => {
+    _resetConfig();
+    _setConfigForTest({ statusSubtext: false });
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+
+    await dispatchResultText('<message to="here">All set.</message>', routing('slack', 'C-MAIN'));
+
+    expect(subtextOf(getUndeliveredMessages()[0])).toBeUndefined();
+  });
+
+  it('omits the field entirely when the turn resolved nothing to report', async () => {
+    resetTurnStatus();
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+
+    await dispatchResultText('<message to="here">All set.</message>', routing('slack', 'C-MAIN'));
+
+    const content = JSON.parse(getUndeliveredMessages()[0].content) as Record<string, unknown>;
+    expect(content).toEqual({ text: 'All set.' });
+  });
+});
+
+/**
+ * Round-two regressions, both of which shipped looking correct.
+ *
+ * 1. The stamp lived in `sendToDestination`, so the `send_message` MCP path —
+ *    THE reply path whenever outcome reporting is on, which is the fleet
+ *    default — produced unstamped replies. Every test passed, because every
+ *    test drove the envelope path.
+ * 2. The context figure was cleared at `emitTurnEnd`, which runs once per
+ *    QUERY. A query serves many turns, so a second turn with no usable usage
+ *    frame printed the first turn's figure as its own.
+ */
+describe('status subtext — round-two regressions', () => {
+  beforeEach(() => {
+    _resetConfig();
+    _setConfigForTest({});
+    resetTurnStatus();
+  });
+
+  afterEach(() => {
+    resetTurnStatus();
+    _resetConfig();
+  });
+
+  it('stamps a chat row written straight to the seam, as send_message writes it', async () => {
+    const { writeMessageOut, getUndeliveredMessages } = require('./db/messages-out.js');
+    setTurnSettings('claude-opus-5[1m]', 'xhigh');
+    setOwnConversation('discord', 'chan-1');
+    recordContextTokens(142_400);
+
+    // Exactly the shape mcp-tools/core.ts writes for a public reply: no
+    // dispatchResultText, no <message> envelope, no sendToDestination.
+    await writeMessageOut({
+      id: 'mcp-1',
+      kind: 'chat',
+      agentReply: true,
+      platform_id: 'chan-1',
+      channel_type: 'discord',
+      thread_id: null,
+      content: JSON.stringify({ text: 'answered through the tool' }),
+    });
+
+    const row = getUndeliveredMessages().find((r: { id: string }) => r.id === 'mcp-1');
+    expect(JSON.parse(row.content).subtext).toBe('opus-5 · xhigh · 142k context');
+  });
+
+  // Round four (Opus substitute review): effort was read from the REQUEST,
+  // while model was read from the provider's resolved value. Both of these
+  // are the "asserting a value the turn never ran at" failure the context
+  // clearing exists to prevent, one field over.
+  it('shows the provider resolved effort when the group configured it and no -e was typed', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('discord-eff', 'discord-eff', 'channel', 'discord', 'chan-1', NULL)`,
+      )
+      .run();
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-eff-config' };
+      recordContextTokens(142_400);
+      yield { type: 'result', text: '<message to="here">done</message>' };
+    }
+    // The group carries effort in container.json: the provider resolved
+    // 'xhigh', and querySettings carries NOTHING because no -e was typed.
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {},
+      events: events(),
+      abort: () => {},
+      resolvedModel: 'claude-opus-5[1m]',
+      resolvedEffort: 'xhigh',
+    } as unknown as AgentQuery;
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {
+      model: 'claude-opus-5[1m]',
+    });
+
+    const rows = getUndeliveredMessages().filter((r: { kind: string }) => r.kind === 'chat');
+    expect(JSON.parse(rows[0].content).subtext).toBe('opus-5 · xhigh · 142k context');
+  });
+
+  it('does not show a sticky effort the resolved model clamped away', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('discord-clamp', 'discord-clamp', 'channel', 'discord', 'chan-1', NULL)`,
+      )
+      .run();
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-eff-clamp' };
+      recordContextTokens(8_200);
+      yield { type: 'result', text: '<message to="here">done</message>' };
+    }
+    // Sticky -e xhigh from an earlier turn, then -m haiku. The provider
+    // clamps to the family default, which for haiku is nothing at all.
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {},
+      events: events(),
+      abort: () => {},
+      resolvedModel: 'claude-haiku-4-5',
+      resolvedEffort: null,
+    } as unknown as AgentQuery;
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {
+      model: 'claude-haiku-4-5',
+      effort: 'xhigh',
+    });
+
+    const rows = getUndeliveredMessages().filter((r: { kind: string }) => r.kind === 'chat');
+    // NOT 'haiku-4-5 · xhigh · 8.2k context' — the turn never ran at xhigh.
+    expect(JSON.parse(rows[0].content).subtext).toBe('haiku-4-5 · 8.2k context');
+  });
+
+  it('does not stamp a send_file caption row', async () => {
+    const { writeMessageOut, getUndeliveredMessages } = require('./db/messages-out.js');
+    setTurnSettings('claude-opus-5[1m]', 'xhigh');
+    setOwnConversation('discord', 'chan-1');
+    recordContextTokens(142_400);
+
+    // Exactly the shape mcp-tools/core.ts:480 writes: kind 'chat', own
+    // routing, no agentReply marker.
+    await writeMessageOut({
+      id: 'file-1',
+      kind: 'chat',
+      platform_id: 'chan-1',
+      channel_type: 'discord',
+      thread_id: null,
+      content: JSON.stringify({ text: 'here is the chart', files: ['chart.png'] }),
+    });
+
+    const row = getUndeliveredMessages().find((r: { id: string }) => r.id === 'file-1');
+    expect(JSON.parse(row.content).subtext).toBeUndefined();
+  });
+
+  it('does not stamp the runner own /clear notice with a stale turn setting', async () => {
+    const { writeMessageOut, getUndeliveredMessages } = require('./db/messages-out.js');
+    // A previous turn left settings in the store; the notice is authored by no
+    // turn at all and must not inherit them.
+    setTurnSettings('claude-opus-5[1m]', 'xhigh');
+    setOwnConversation('discord', 'chan-1');
+    recordContextTokens(142_400);
+
+    await writeMessageOut({
+      id: 'clear-1',
+      kind: 'chat',
+      platform_id: 'chan-1',
+      channel_type: 'discord',
+      thread_id: null,
+      content: JSON.stringify({ text: 'Session cleared.' }),
+    });
+
+    const row = getUndeliveredMessages().find((r: { id: string }) => r.id === 'clear-1');
+    expect(JSON.parse(row.content).subtext).toBeUndefined();
+  });
+
+  it('does not stamp a work_log row written through the same seam', async () => {
+    const { writeMessageOut, getUndeliveredMessages } = require('./db/messages-out.js');
+    setTurnSettings('claude-opus-5[1m]', 'xhigh');
+    setOwnConversation('discord', 'chan-1');
+    recordContextTokens(142_400);
+
+    await writeMessageOut({
+      id: 'mcp-log',
+      kind: 'work_log',
+      platform_id: 'chan-1',
+      channel_type: 'discord',
+      thread_id: null,
+      content: JSON.stringify({ text: 'internal progress' }),
+    });
+
+    const row = getUndeliveredMessages().find((r: { id: string }) => r.id === 'mcp-log');
+    expect(JSON.parse(row.content).subtext).toBeUndefined();
+  });
+
+  it('does not let a second turn in one query inherit the first turn context figure', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('discord-main', 'discord-main', 'channel', 'discord', 'chan-1', NULL)`,
+      )
+      .run();
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-two-turns' };
+      // Turn one measures its context and answers.
+      recordContextTokens(142_400);
+      yield { type: 'result', text: '<message to="here">first</message>' };
+      // Turn two answers WITHOUT a usable usage frame. The stream is still
+      // open — this is a second turn inside one processQuery, which is what
+      // made emitTurnEnd the wrong boundary.
+      yield { type: 'result', text: '<message to="here">second</message>' };
+    }
+    // The provider names its resolved effort, as a real one does — the
+    // display no longer reads the requested value.
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {},
+      events: events(),
+      abort: () => {},
+      resolvedModel: 'claude-opus-5[1m]',
+      resolvedEffort: 'xhigh',
+    } as unknown as AgentQuery;
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {
+      model: 'claude-opus-5[1m]',
+      effort: 'xhigh',
+    });
+
+    const rows = getUndeliveredMessages().filter((r: { kind: string }) => r.kind === 'chat');
+    const subtexts = rows.map((r: { content: string }) => JSON.parse(r.content).subtext);
+    // Model and effort survive both turns — they are standing configuration.
+    // The measurement belongs only to the turn that took it.
+    expect(subtexts[0]).toBe('opus-5 · xhigh · 142k context');
+    expect(subtexts[1]).toBe('opus-5 · xhigh');
   });
 });

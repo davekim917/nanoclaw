@@ -12,6 +12,33 @@ import { createOpencodeClient as createOpencodeQuestionClient } from '@opencode-
 
 import { memoryContextForSessionStart, type MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { appendActiveRuntimeContext } from '../runtime-context.js';
+import { recordContextTokens } from '../turn-status.js';
+
+/**
+ * Tokens occupying the context window, from one assistant message's `tokens`.
+ *
+ * OPENCODE FOLLOWS ANTHROPIC'S CONVENTION, NOT OPENAI'S — `input` and
+ * `cache.read` are DISJOINT, so occupancy is their sum plus any cache write.
+ * The measurement in `sumOpenCodeTurnUsage`'s header settles it rather than
+ * leaving it to inference: over one real session the per-message `input`
+ * summed to 325,382 while `cache.read` summed to 1,927,040, which is
+ * impossible if the cached figure were a subset of the input one.
+ *
+ * Contrast providers/codex.ts, where cached input IS a subset and this same
+ * sum would double-count the cached prefix.
+ *
+ * Returns 0 when there is nothing usable, which `recordContextTokens` ignores
+ * — a message with no token report leaves the previous reading standing
+ * rather than zeroing the display.
+ */
+export function openCodeContextOccupancy(
+  tokens: { input?: number; output?: number; cache?: { read?: number; write?: number } } | undefined,
+): number {
+  if (!tokens) return 0;
+  const count = (value: number | undefined): number =>
+    typeof value === 'number' && Number.isFinite(value) ? value : 0;
+  return count(tokens.input) + count(tokens.cache?.read) + count(tokens.cache?.write);
+}
 import { registerProvider } from './provider-registry.js';
 import type {
   AgentProvider,
@@ -1489,6 +1516,25 @@ export class OpenCodeProvider implements AgentProvider {
                     if (info.sessionID) sessionByMessageId.set(info.id, info.sessionID);
                     if (info.error) erroredMessageIds.add(info.id);
                     if (info.role === 'assistant') assistantUsageById.set(info.id, info);
+                    // Context occupancy for the status subtext. Unlike the
+                    // usage sum above this IS filtered to the turn's own
+                    // session: a subagent runs in its own session with its own
+                    // window, and its prompt size says nothing about ours.
+                    //
+                    // OpenCode follows Anthropic's convention, not OpenAI's —
+                    // `tokens.input` and `tokens.cache.read` are DISJOINT, so
+                    // occupancy is their sum. The measurement in
+                    // sumOpenCodeTurnUsage's header settles it: over one
+                    // session the per-message `input` summed to 325,382 while
+                    // `cache.read` summed to 1,927,040, which is impossible if
+                    // the cached figure were a subset of the input one.
+                    //
+                    // Latest-wins, and `message.updated` re-fires as a message
+                    // streams, so the value converges on that message's final
+                    // reading with no dedupe needed.
+                    if (info.role === 'assistant' && info.sessionID === turnSessionId) {
+                      recordContextTokens(openCodeContextOccupancy(info.tokens));
+                    }
                   }
                   break;
                 }
@@ -1707,6 +1753,10 @@ export class OpenCodeProvider implements AgentProvider {
       // — the ledger must be able to say "ran on opencode's own default" and
       // have that mean something different from "nobody recorded a model".
       resolvedModel: effectiveModel ?? OPENCODE_NATIVE_DEFAULT_MODEL,
+      // Post-clamp, matching `turnEffort.effective` (:1324). Null is real
+      // here: most thinking-capable models already run their highest by
+      // default, so OpenCode injects no reasoning_effort at all.
+      resolvedEffort: clampOpenCodeEffort(turn.effort ?? process.env.OPENCODE_EFFORT),
       push: (message: string, attachments?: PromptAttachment[]) => {
         pending.push({
           text: wrapPromptWithContext(message, systemInstructions),
