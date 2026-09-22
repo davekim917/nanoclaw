@@ -241,7 +241,8 @@ describe('repository mount poll and tool admission barrier', () => {
   }, 5_000);
 
   it('adds retry provenance after credential rotation while preserving the same unfinished task payload', async () => {
-    insertMessage('task-occurrence-retry', 'task', { prompt: 'Review the release queue once.' });
+    // Continuous: this case pins a retry that resumes the fire's stored session.
+    insertMessage('task-occurrence-retry', 'task', { continuous: true, prompt: 'Review the release queue once.' });
     setContinuation('claude', 'retry-provenance-session');
     const queryInputs: Array<{ prompt: string; continuation?: string }> = [];
     let queryCalls = 0;
@@ -306,7 +307,8 @@ describe('repository mount poll and tool admission barrier', () => {
   }, 5_000);
 
   it('points at the interrupted batch instead of re-sending it when the resumed transcript already holds it', async () => {
-    insertMessage('task-occurrence-dedup', 'task', { prompt: 'Review the release queue once.' });
+    // Continuous: this case pins a retry that resumes the fire's stored session.
+    insertMessage('task-occurrence-dedup', 'task', { continuous: true, prompt: 'Review the release queue once.' });
     setContinuation('claude', 'retry-dedup-session');
     const queryInputs: Array<{ prompt: string; continuation?: string }> = [];
     const asked: Array<{ continuation?: string; prompt: string }> = [];
@@ -4451,7 +4453,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
   it('admits a later occurrence into the RUNNING stream and gives it its own turn', async () => {
     // Pending before the query opens, but NOT in the initial batch — so the
     // only way it can be seen is the in-stream follow-up poll.
-    insertMessage('occ-2', 'task', { prompt: 'second fire of the same series' });
+    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire of the same series' });
 
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'c1' };
@@ -4492,7 +4494,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
   // CLI folded the second into the running turn) records BOTH, instead of
   // leaving the later fire with no outcome.
   it('records every fire one merged result answers', async () => {
-    insertMessage('occ-2', 'task', { prompt: 'second fire of the same series' });
+    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire of the same series' });
 
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'c1' };
@@ -4593,7 +4595,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     // Here the query is created at xhigh, a task fire moves it to medium live,
     // and a second batch wants xhigh again — equal to the creation snapshot,
     // different from the stream. It must be applied.
-    insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
 
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'c1' };
@@ -4604,7 +4606,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
       // Staged from inside the stream so it lands in a SECOND follow-up batch
       // rather than being merged into occ-2's. It wants xhigh again — equal to
       // the stale creation snapshot, different from the live stream.
-      insertMessage('occ-3', 'task', { prompt: 'third fire', flagIntent: { turnEffort: 'xhigh' } });
+      insertMessage('occ-3', 'task', { continuous: true, prompt: 'third fire', flagIntent: { turnEffort: 'xhigh' } });
       yield { type: 'result', text: 'second fire', isError: true };
       await Bun.sleep(1600);
       yield { type: 'result', text: 'third fire', isError: true };
@@ -4632,7 +4634,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
   }, 15_000);
 
   it('defers an immutable runtime-context restart until the active query is idle', async () => {
-    insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
     let firstResult = false;
 
     async function* events(): AsyncGenerator<ProviderEvent> {
@@ -4674,7 +4676,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
   }, 15_000);
 
   it('defers an immutable runtime-context restart while background work is live, and ends once it drains', async () => {
-    insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
     let live = 1;
     let drained = false;
 
@@ -4718,7 +4720,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
   }, 15_000);
 
   it('does not close immutable runtime context during asynchronous result handling', async () => {
-    insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
     let beginOutcome!: () => void;
     const outcomeStarted = new Promise<void>((resolve) => {
       beginOutcome = resolve;
@@ -4809,7 +4811,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     // that turn's settings, which is also the pre-existing behaviour.
     setStickyModel('claude-opus-5[1m]');
     setStickyEffort('xhigh');
-    insertMessage('occ-2', 'task', { prompt: 'a scheduled fire that came due mid-answer' });
+    insertMessage('occ-2', 'task', { continuous: true, prompt: 'a scheduled fire that came due mid-answer' });
 
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'c1' };
@@ -4850,6 +4852,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     // fallback now runs Claude, so feeding its gpt-* pin to applySettings
     // would make the fallback stream invalid rather than target-native.
     insertMessage('occ-fallback', 'task', {
+      continuous: true,
       prompt: 'a scheduled fire that came due during fallback',
       flagIntent: { turnModel: 'gpt-6-astra', turnEffort: 'medium' },
     });

@@ -1,8 +1,8 @@
 /**
- * `ncl tasks create|update --fresh-context` writes `freshContext` onto the
- * series' task content, and `get` reports it. The agent-runner side (a flagged
- * fire starts with no resumed continuation) is covered in
- * container/agent-runner/src/fresh-context-task.test.ts.
+ * `ncl tasks create|update --continuous` writes `continuous` onto the series'
+ * task content, `get` reports the effective mode, and a fresh fire leaves the
+ * task session row alone. The agent-runner side (which fires resume) is
+ * covered in container/agent-runner/src/fresh-context-task.test.ts.
  */
 import Database from 'better-sqlite3';
 import fs from 'fs';
@@ -24,10 +24,13 @@ vi.mock('../../container-runner.js', async (importOriginal) => ({
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-fresh-context') }));
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
+import { createMessagingGroup } from '../../db/messaging-groups.js';
+import { getSession } from '../../db/sessions.js';
+import { admitDueTaskContexts, resolveTaskSession, withExistingMailboxSession } from '../../session-manager.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { dispatch } from '../../cli/dispatch.js';
 import type { CallerContext } from '../../cli/frame.js';
-import { taskFreshContext } from './fresh-context.js';
+import { taskFiresFresh } from './fresh-context.js';
 import '../../cli/resources/tasks.js';
 
 const host: CallerContext = { caller: 'host' };
@@ -69,8 +72,8 @@ afterEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
-describe('--fresh-context', () => {
-  it('is absent by default, and round-trips through update without touching the other controls', async () => {
+describe('--continuous', () => {
+  it('defaults to fresh, and round-trips through update without touching the other controls', async () => {
     const created = await run('tasks-create', {
       group: 'ag-1',
       prompt: 'watch',
@@ -81,18 +84,22 @@ describe('--fresh-context', () => {
     });
     const sessionId = created.session_id as string;
     const before = taskContent(sessionId);
-    expect(before).not.toHaveProperty('freshContext');
+    expect(before).not.toHaveProperty('continuous');
+    expect(JSON.stringify(await run('tasks-get', { id: created.series_id, group: 'ag-1' }))).toContain(
+      '"context":"fresh"',
+    );
 
-    await run('tasks-update', { id: created.series_id, group: 'ag-1', fresh_context: true });
+    await run('tasks-update', { id: created.series_id, group: 'ag-1', continuous: true });
     const on = taskContent(sessionId);
-    expect(on.freshContext).toBe(true);
-    expect({ ...on, freshContext: undefined }).toEqual({ ...before, freshContext: undefined });
-    const shown = await run('tasks-get', { id: created.series_id, group: 'ag-1' });
-    expect(JSON.stringify(shown)).toContain('"fresh_context":1');
+    expect(on.continuous).toBe(true);
+    expect({ ...on, continuous: undefined }).toEqual({ ...before, continuous: undefined });
+    expect(JSON.stringify(await run('tasks-get', { id: created.series_id, group: 'ag-1' }))).toContain(
+      '"context":"continuous"',
+    );
 
-    await run('tasks-update', { id: created.series_id, group: 'ag-1', fresh_context: false });
-    expect(taskContent(sessionId).freshContext).toBe(false);
-    expect(taskFreshContext(JSON.stringify(taskContent(sessionId)))).toBe(false);
+    await run('tasks-update', { id: created.series_id, group: 'ag-1', continuous: false });
+    expect(taskContent(sessionId).continuous).toBe(false);
+    expect(taskFiresFresh(null, JSON.stringify(taskContent(sessionId)))).toBe(true);
   });
 
   it('can be set at create', async () => {
@@ -100,8 +107,57 @@ describe('--fresh-context', () => {
       group: 'ag-1',
       prompt: 'watch',
       process_after: '2999-01-01T00:00:00Z',
-      fresh_context: true,
+      continuous: true,
     });
-    expect(taskContent(created.session_id as string).freshContext).toBe(true);
+    expect(taskContent(created.session_id as string).continuous).toBe(true);
+  });
+
+  it('a thread-bound series is continuous with no flag', async () => {
+    await createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'slack',
+      platform_id: 'slack:C1',
+      name: 'general',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: new Date().toISOString(),
+    });
+    const created = await run('tasks-create', {
+      group: 'ag-1',
+      prompt: 'post in the thread',
+      process_after: '2999-01-01T00:00:00Z',
+      messaging_group: 'mg-1',
+      thread_id: 'slack:C1:1712345678.000100',
+    });
+    expect(JSON.stringify(await run('tasks-get', { id: created.series_id, group: 'ag-1' }))).toContain(
+      '"context":"continuous"',
+    );
+  });
+
+  it('a fresh fire keeps the same task session row, id and thread_id', async () => {
+    const created = await run('tasks-create', {
+      group: 'ag-1',
+      prompt: 'watch',
+      process_after: '2020-01-01T00:00:00Z',
+      recurrence: '0 9 * * *',
+    });
+    const sessionId = created.session_id as string;
+    const seriesId = created.series_id as string;
+    const before = await getSession(sessionId);
+    expect(before?.thread_id).toBe(`system:tasks:${seriesId}`);
+
+    const admitted = await withExistingMailboxSession('ag-1', sessionId, (mailbox) =>
+      admitDueTaskContexts(mailbox, 'ag-1', sessionId),
+    );
+    expect(admitted).toBe(1);
+
+    const again = await resolveTaskSession('ag-1', seriesId);
+    expect(again.created).toBe(false);
+    expect(again.session.id).toBe(sessionId);
+    expect(await getSession(sessionId)).toEqual(before);
+    const rows = getRawDb()
+      .prepare('SELECT id FROM sessions WHERE thread_id = ?')
+      .all(`system:tasks:${seriesId}`) as Array<{ id: string }>;
+    expect(rows.map((r) => r.id)).toEqual([sessionId]);
   });
 });

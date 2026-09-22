@@ -627,7 +627,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     }
   });
 
-  it('treats a --fresh-context task fire as a fresh provider context, and a plain fire as warm', async () => {
+  it('treats a default scheduled fire as a fresh provider context, and a --continuous fire as warm', async () => {
     const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
     fs.mkdirSync(path.join(memoryRoot, 'preferences'), { recursive: true });
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Canon\nJordan owns deployment.');
@@ -649,16 +649,16 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       outbound
         .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
         .run('continuation:claude', 'claude-context-before-fire', new Date().toISOString());
-      for (const [id, freshContext] of [
+      for (const [id, continuous] of [
         ['task-plain', false],
-        ['task-fresh', true],
+        ['task-kept', true],
       ] as const) {
         insertTaskRow(inbound, {
           id,
           seriesId: id,
           processAfter: '2020-01-01T00:00:00.000Z',
           recurrence: null,
-          content: JSON.stringify({ prompt: 'Who owns deployment?', ...(freshContext ? { freshContext } : {}) }),
+          content: JSON.stringify({ prompt: 'Who owns deployment?', ...(continuous ? { continuous } : {}) }),
         });
       }
       expect(await admitDueTaskContexts(AG, SESS)).toBe(2);
@@ -667,11 +667,11 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
         JSON.parse(
           (inbound.prepare('SELECT content FROM messages_in WHERE id = ?').get(id) as { content: string }).content,
         );
-      const plain = recall('recall-task-plain');
-      expect(plain).not.toHaveProperty('trustedCapabilities');
-      expect(plain.memoryEvidence.core).toEqual([]);
-      // The flagged fire is prompted into a reset provider, so it carries the full bootstrap again.
-      const fresh = recall('recall-task-fresh');
+      const kept = recall('recall-task-kept');
+      expect(kept).not.toHaveProperty('trustedCapabilities');
+      expect(kept.memoryEvidence.core).toEqual([]);
+      // A default fire is prompted into a reset provider, so it carries the full bootstrap again.
+      const fresh = recall('recall-task-plain');
       expect(fresh.trustedCapabilities).toMatchObject({ agentGroupId: AG });
       expect(fresh.memoryEvidence.core.map((row: { path: string }) => row.path)).toEqual(['index.md']);
     } finally {

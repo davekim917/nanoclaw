@@ -796,8 +796,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
-    // A --fresh-context series starts each fire with no resumed conversation —
-    // the /clear reset above, without its chat notice (fresh-context-task.ts).
+    // A scheduled fire starts with no resumed conversation unless its series is
+    // thread-bound or --continuous — the /clear reset above, without its chat
+    // notice (fresh-context-task.ts).
     if (continuation !== undefined && isFreshContextTaskBatch(keep)) {
       log('Fresh-context task fire: not resuming the stored session');
       continuation = undefined;
@@ -1791,7 +1792,7 @@ export function retainCompleteRecallPairs(original: MessageInRow[], admitted: Me
  * - All other system rows are dropped.
  */
 export function selectInTurnFollowUps(allPending: MessageInRow[]): MessageInRow[] {
-  // A --fresh-context fire must not join the running conversation: it stays
+  // A fresh-context task fire must not join the running conversation: it stays
   // pending, and the outer loop resets before prompting it once this query ends.
   const completePending = retainCompleteRecallUnits(allPending.filter((m) => !isFreshContextTaskBatch([m])));
   const isChatRow = (m: MessageInRow): boolean => m.kind === 'chat' || m.kind === 'chat-sdk';
@@ -2183,7 +2184,7 @@ export async function processQuery(
           query.abort();
           return;
         }
-        // A due --fresh-context fire needs the outer loop's reset, and this
+        // A due fresh-context task fire needs the outer loop's reset, and this
         // stream otherwise stays open after its result. End (not abort) so a
         // turn still running finishes first; selectInTurnFollowUps never pushes it.
         if (allPending.some((m) => m.trigger === 1 && isFreshContextTaskBatch([m]))) {

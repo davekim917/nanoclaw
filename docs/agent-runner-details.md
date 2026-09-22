@@ -779,6 +779,8 @@ ncl tasks cancel <series_id>
 
 Implementation: the host writes `messages_in` task rows into the agent group's system session (`thread_id = system:tasks`). The host sweep wakes that system-session container when a task is due. The task agent chooses its destination at fire time by emitting `<message to="name">...</message>` or using `send_message`.
 
+Each scheduled fire starts a fresh provider conversation (the `/clear` reset without its notice); only the continuation resets, never the session row or its `thread_id`. A fire resumes the stored conversation when its series is thread-bound (`--thread` / `--thread-id`), marked `--continuous`, a keyed `ncl tasks dispatch` event, or a retry of an interrupted fire (`tries > 0`), or when a non-task row shares its batch. `wait` wakes and `continue_work` resumes are not scheduled fires. Keep a series' state in files; mark it `--continuous` only if a fire relies on what earlier fires said. `container/agent-runner/src/fresh-context-task.ts`
+
 #### create_agent
 
 Create a long-lived companion sub-agent. The `name` becomes a destination the creating

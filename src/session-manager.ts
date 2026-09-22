@@ -54,7 +54,7 @@ import {
 import { log } from './log.js';
 import { buildPreTurnContext } from './modules/memory/pre-turn-context.js';
 import type { Session, SessionMode } from './types.js';
-import { taskFreshContext } from './modules/scheduling/fresh-context.js';
+import { taskFiresFresh } from './modules/scheduling/fresh-context.js';
 
 /** Root directory for all session data. */
 export function sessionsBaseDir(): string {
@@ -767,8 +767,8 @@ function buildRecallRow(
   central: RecallCentral,
 ): MessageInsert | null {
   if (!isAdmissiblePreTurnTrigger({ ...message, content: normalizedContent })) return null;
-  // A --fresh-context task fire resets the provider before it is prompted, like a queued /clear.
-  const resetPending = message.kind === 'task' && taskFreshContext(normalizedContent);
+  // A scheduled fire that starts fresh resets the provider before it is prompted, like a queued /clear.
+  const resetPending = message.kind === 'task' && taskFiresFresh(message.threadId, normalizedContent);
   const lifecycle = resolveRecallLifecycle(
     mailbox,
     agentGroupId,
