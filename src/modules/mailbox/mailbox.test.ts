@@ -122,6 +122,8 @@ describe('NanoclawAgentMailbox', () => {
           platform_id TEXT, channel_type TEXT, thread_id TEXT, content TEXT NOT NULL
         );
         CREATE TABLE delivered (message_out_id TEXT PRIMARY KEY, delivered_at TEXT NOT NULL);
+        INSERT INTO delivered (message_out_id, delivered_at)
+        VALUES ('legacy-existing', '2026-01-01T00:00:00.000Z');
       `);
     });
 
@@ -138,7 +140,16 @@ describe('NanoclawAgentMailbox', () => {
     );
     expect(columnsAfter).toContain('platform_message_id');
     expect(columnsAfter).toContain('status');
+    expect(columnsAfter).toContain('lifecycle_terminal_at');
     expect(deliveredIds.has('out-1')).toBe(true);
+    expect(deliveredIds.has('legacy-existing')).toBe(true);
+    expect(
+      raw(inbound, (db) =>
+        db
+          .prepare('SELECT message_out_id, delivered_at FROM delivered WHERE message_out_id = ?')
+          .get('legacy-existing'),
+      ),
+    ).toEqual({ message_out_id: 'legacy-existing', delivered_at: '2026-01-01T00:00:00.000Z' });
   });
 
   it('a legacy inbound DB missing delivered and session_routing regains them after prepare() and session()', async () => {
@@ -290,12 +301,24 @@ describe('NanoclawAgentMailbox', () => {
       m.markPending('out-42');
       m.markDeliveryFailed('out-42', 'boom');
       m.markDelivered('out-42', 'p1');
+      expect(m.markLifecycleTerminal('out-42')).toBe(true);
     });
 
     const row = raw(dbPath(key, 'inbound'), (db) =>
-      db.prepare('SELECT status, platform_message_id, error FROM delivered WHERE message_out_id = ?').get('out-42'),
-    ) as { status: string; platform_message_id: string | null; error: string | null };
-    expect(row).toEqual({ status: 'delivered', platform_message_id: 'p1', error: null });
+      db
+        .prepare(
+          'SELECT status, platform_message_id, error, lifecycle_terminal_at FROM delivered WHERE message_out_id = ?',
+        )
+        .get('out-42'),
+    ) as { status: string; platform_message_id: string | null; error: string | null; lifecycle_terminal_at: string };
+    expect(row).toMatchObject({ status: 'delivered', platform_message_id: 'p1', error: null });
+    expect(new Date(row.lifecycle_terminal_at).toISOString()).toBe(row.lifecycle_terminal_at);
+    // An old reader names only the columns it knows. The additive field is ignored.
+    expect(
+      raw(dbPath(key, 'inbound'), (db) =>
+        db.prepare('SELECT status, platform_message_id, error FROM delivered WHERE message_out_id = ?').get('out-42'),
+      ),
+    ).toEqual({ status: 'delivered', platform_message_id: 'p1', error: null });
   });
 
   /**

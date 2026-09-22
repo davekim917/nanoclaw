@@ -69,6 +69,7 @@ import {
   outboundStorageStat,
   markDelivered,
   markDeliveryFailed,
+  markLifecycleTerminal,
   markPending,
   type OutboundMessage as ForkOutboundMessage,
 } from './ops/delivery.js';
@@ -373,6 +374,8 @@ export interface NanoclawMailboxSession extends MailboxSession {
   markDelivered(messageOutId: string, platformMessageId: string | null): void;
   /** UPSERT that records the adapter's error message. */
   markDeliveryFailed(messageOutId: string, errorMessage?: string): void;
+  /** Preserve the delivery receipt while marking its activity line terminal. */
+  markLifecycleTerminal(messageOutId: string): boolean;
   /** Tiered column read: provider health and memory telemetry when present. */
   getContainerState(): NanoclawContainerState | null;
   /** Fork insert: allocates the even seq itself and accepts the fork's kinds. */
@@ -1098,6 +1101,7 @@ function forkOps(
     | 'countDueMessages'
     | 'markDelivered'
     | 'markDeliveryFailed'
+    | 'markLifecycleTerminal'
     | 'getContainerState'
     | 'insertMessage'
     | 'resumeTask'
@@ -1134,6 +1138,7 @@ function forkOps(
     countDueMessages: () => countDueMessages(inbound),
     markDelivered: (messageOutId, platformMessageId) => markDelivered(inbound, messageOutId, platformMessageId),
     markDeliveryFailed: (messageOutId, errorMessage) => markDeliveryFailed(inbound, messageOutId, errorMessage),
+    markLifecycleTerminal: (messageOutId) => markLifecycleTerminal(inbound, messageOutId),
     insertMessage: async (message) => {
       runInsertMessage(inbound, toMessageInsert(message), false);
     },

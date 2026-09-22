@@ -5032,6 +5032,32 @@ describe('outcome reporting — quiet work and expected replies', () => {
     expect(getRequestCandidates()).toEqual([{ sequence: 3, messageId: 'human-request' }]);
   });
 
+  it('retains each admitted recurring task occurrence as its own request candidate', () => {
+    rememberRequestCandidates([
+      {
+        id: 'recurring-task:first',
+        seq: 41,
+        kind: 'task',
+        trigger: 1,
+        channel_type: null,
+        content: JSON.stringify({ prompt: 'Run the audit.' }),
+      },
+      {
+        id: 'recurring-task:next',
+        seq: 42,
+        kind: 'task',
+        trigger: 1,
+        channel_type: null,
+        content: JSON.stringify({ prompt: 'Run the audit.' }),
+      },
+    ]);
+
+    expect(getRequestCandidates()).toEqual([
+      { sequence: 41, messageId: 'recurring-task:first' },
+      { sequence: 42, messageId: 'recurring-task:next' },
+    ]);
+  });
+
   it('emits one deterministic liveness row and ties turn-end cleanup to it', async () => {
     insertMessage('liveness-human', 'chat', { sender: 'Operator', senderId: 'U1', text: 'Run the check.' });
     const provider = {
@@ -5074,6 +5100,56 @@ describe('outcome reporting — quiet work and expected replies', () => {
         reporting: { version: 1, purpose: 'liveness', state: 'working' },
       });
       expect(JSON.parse(turnEnd.content)).toEqual({ action: 'turn_end', lifecycleStatusId: statuses[0]!.id });
+    } finally {
+      abort.abort();
+      await loop;
+    }
+  }, 5_000);
+
+  it('does not emit human liveness for an explicitly bot-authored platform trigger', async () => {
+    insertMessage(
+      'liveness-bot',
+      'chat-sdk',
+      { sender: 'Sibling bot', senderId: 'B1', author: { isBot: true }, text: 'Handoff.' },
+      { trigger: 1 },
+    );
+    const provider = {
+      supportsNativeSlashCommands: false,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      isRetryable: () => false,
+      query: () => {
+        async function* events(): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'bot-liveness-session' };
+          yield { type: 'result', text: '<internal>done</internal>' };
+        }
+        return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+      },
+    };
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+    try {
+      const deadline = Date.now() + 3_000;
+      let turnEnd: { content: string } | undefined;
+      while (!turnEnd) {
+        turnEnd = getOutboundDb()
+          .prepare("SELECT content FROM messages_out WHERE kind = 'system' ORDER BY seq DESC LIMIT 1")
+          .get() as { content: string } | undefined;
+        if (Date.now() >= deadline) throw new Error('timed out waiting for bot-authored turn completion');
+        if (!turnEnd) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(getOutboundDb().prepare("SELECT COUNT(*) AS count FROM messages_out WHERE kind = 'status'").get()).toEqual(
+        {
+          count: 0,
+        },
+      );
+      expect(JSON.parse(turnEnd.content)).toEqual({ action: 'turn_end' });
     } finally {
       abort.abort();
       await loop;

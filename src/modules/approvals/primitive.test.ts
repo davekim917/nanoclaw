@@ -19,8 +19,8 @@ import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { createSession, getPendingApprovalsByAction } from '../../db/sessions.js';
 import {
-  clearSessionStatusAfterPublicDelivery,
   setDeliveryAdapter,
+  settleSessionStatusAfterPublicDelivery,
   type ChannelDeliveryAdapter,
 } from '../../delivery.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -47,7 +47,7 @@ vi.mock('../../session-manager.js', async () => {
 
 vi.mock('../../delivery.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../delivery.js')>()),
-  clearSessionStatusAfterPublicDelivery: vi.fn().mockResolvedValue(undefined),
+  settleSessionStatusAfterPublicDelivery: vi.fn().mockResolvedValue(undefined),
 }));
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-approval-primitive') }));
@@ -142,7 +142,7 @@ describe('requestApproval delivery failure', () => {
     // No orphan: the row created before the delivery attempt is gone.
     expect(await getPendingApprovalsByAction('test_action')).toHaveLength(0);
     expect(lastNotifyText()).toMatch(/test_action failed: could not deliver/);
-    expect(vi.mocked(clearSessionStatusAfterPublicDelivery)).not.toHaveBeenCalled();
+    expect(vi.mocked(settleSessionStatusAfterPublicDelivery)).not.toHaveBeenCalled();
   });
 
   it('keeps the pending approval row when delivery succeeds', async () => {
@@ -164,6 +164,9 @@ describe('requestApproval delivery failure', () => {
 
     expect(await getPendingApprovalsByAction('test_action')).toHaveLength(1);
     expect(vi.mocked(writeSessionMessage)).not.toHaveBeenCalled();
-    expect(clearSessionStatusAfterPublicDelivery).toHaveBeenCalledWith(session.id);
+    expect(settleSessionStatusAfterPublicDelivery).toHaveBeenCalledWith(session.id, {
+      conversation: { channelType: DM_CHANNEL, platformId: DM_PLATFORM, threadId: null },
+      waitWhenElsewhere: true,
+    });
   });
 });

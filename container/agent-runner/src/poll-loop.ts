@@ -733,7 +733,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     markProcessing(keptIds);
     rememberRequestCandidates(keep);
     clearCurrentLifecycleStatus();
-    if (outcomeReportingEnabled() && !routing.taskRun && triggeringHumanInbound(keep) && !routing.quietStatus) {
+    if (outcomeReportingEnabled() && !routing.taskRun && triggeringHumanLivenessInbound(keep) && !routing.quietStatus) {
       const lifecycleStatusId = generateId();
       await writeMessageOut({
         id: lifecycleStatusId,
@@ -1684,6 +1684,20 @@ function hasRealInbound(messages: MessageInRow[]): boolean {
  */
 function triggeringHumanInbound(messages: MessageInRow[]): MessageInRow | undefined {
   return messages.find((m) => isAdmissibleTrigger(m) && m.channel_type !== 'agent' && hasRealInbound([m]));
+}
+
+/** Narrower human-only predicate for the new public accepted/working line. */
+function triggeringHumanLivenessInbound(messages: MessageInRow[]): MessageInRow | undefined {
+  return triggeringHumanInbound(
+    messages.filter((message) => {
+      try {
+        const content = JSON.parse(message.content) as { author?: { isBot?: unknown } };
+        return content.author?.isBot !== true;
+      } catch {
+        return true;
+      }
+    }),
+  );
 }
 
 function isContinuationRecoveryBatch(messages: MessageInRow[]): boolean {

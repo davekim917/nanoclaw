@@ -16,6 +16,7 @@ import {
   getSessionsActiveSince,
   createPendingQuestion,
   getPendingApproval,
+  getPendingApprovalsBySession,
   isTaskThread,
   taskSeriesId,
   TASKS_SYSTEM_THREAD_ID,
@@ -262,6 +263,7 @@ export type DrainOutcome = 'busy' | 'clean' | 'pending' | 'error';
  * is cleared.
  */
 interface StatusTrack {
+  outboundId: string;
   channelType: string;
   platformId: string;
   threadId: string | null;
@@ -394,6 +396,7 @@ async function recoverLifecycleStatus(sessionId: string, outboundId?: string): P
       ? origin
       : await getMessagingGroupByPlatform(recovered.channelType, recovered.platformId);
   return {
+    outboundId: recovered.outboundId,
     channelType: recovered.channelType,
     platformId: recovered.platformId,
     threadId: recovered.threadId,
@@ -407,9 +410,10 @@ async function recoverLifecycleStatus(sessionId: string, outboundId?: string): P
 async function dropOrphanStatus(
   sessionId: string,
   opts: { skip?: boolean; recoverLifecycle?: boolean } = {},
-): Promise<void> {
+): Promise<boolean> {
   let orphan = opts.skip ? undefined : statusTracking.get(sessionId);
   if (!orphan && opts.recoverLifecycle && !opts.skip) orphan = await recoverLifecycleStatus(sessionId);
+  let deleted = false;
   if (orphan && deliveryAdapter?.deleteMessage) {
     try {
       await deliveryAdapter.deleteMessage(
@@ -419,6 +423,7 @@ async function dropOrphanStatus(
         orphan.messageId,
         orphan.instance,
       );
+      deleted = true;
     } catch (err) {
       log.warn('Failed to delete orphan thinking-block status — leaving as-is', {
         sessionId,
@@ -431,12 +436,76 @@ async function dropOrphanStatus(
   }
   if (opts.recoverLifecycle && !opts.skip) lifecycleRecoveryMisses.add(sessionId);
   statusTracking.delete(sessionId);
+  return deleted;
 }
 
-/** Clear this session's lifecycle line after a confirmed public delivery. */
-export async function clearSessionStatusAfterPublicDelivery(sessionId: string): Promise<void> {
-  const isSpawnChild = await isSpawnChildSession(sessionId);
-  await dropOrphanStatus(sessionId, { skip: isSpawnChild, recoverLifecycle: true });
+export interface DeliveredConversation {
+  channelType: string;
+  platformId: string;
+  threadId: string | null;
+}
+
+function sameConversation(status: StatusTrack, delivered: DeliveredConversation): boolean {
+  return (
+    status.channelType === delivered.channelType &&
+    status.platformId === delivered.platformId &&
+    status.threadId === delivered.threadId
+  );
+}
+
+async function editSessionLifecycleStatus(status: StatusTrack, text: string): Promise<void> {
+  if (!status.lifecycle || !deliveryAdapter) return;
+  await deliveryAdapter.deliver(
+    status.channelType,
+    status.platformId,
+    status.threadId,
+    'status',
+    JSON.stringify({ operation: 'edit', messageId: status.messageId, text }),
+    undefined,
+    status.instance,
+  );
+}
+
+async function markSessionLifecycleWaiting(sessionId: string, status: StatusTrack): Promise<void> {
+  await editSessionLifecycleStatus(status, 'Waiting for approval.');
+  statusTracking.set(sessionId, status);
+}
+
+async function markSessionLifecycleTerminal(sessionId: string, status: StatusTrack): Promise<void> {
+  if (!status.lifecycle) return;
+  const session = await getSession(sessionId);
+  if (!session) throw new Error(`Cannot mark lifecycle terminal for missing session ${sessionId}`);
+  const marked = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+    mailbox.markLifecycleTerminal(status.outboundId),
+  );
+  if (!marked) throw new Error(`Cannot mark missing lifecycle delivery ${status.outboundId} terminal`);
+}
+
+/** Best-effort lifecycle settlement after the platform accepted a public message. */
+export async function settleSessionStatusAfterPublicDelivery(
+  sessionId: string,
+  options: { conversation?: DeliveredConversation; waitWhenElsewhere?: boolean } = {},
+): Promise<void> {
+  try {
+    const status = statusTracking.get(sessionId) ?? (await recoverLifecycleStatus(sessionId));
+    if (!status) return;
+    if (options.conversation) {
+      if (!sameConversation(status, options.conversation)) {
+        if (options.waitWhenElsewhere) await markSessionLifecycleWaiting(sessionId, status);
+        return;
+      }
+    }
+    statusTracking.set(sessionId, status);
+    await markSessionLifecycleTerminal(sessionId, status);
+    const isSpawnChild = await isSpawnChildSession(sessionId);
+    const deleted = await dropOrphanStatus(sessionId, { skip: isSpawnChild });
+    if (!deleted && status.lifecycle) await editSessionLifecycleStatus(status, 'Response delivered.');
+  } catch (err) {
+    log.warn('Public message delivered but lifecycle settlement failed', {
+      sessionId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 /** Discord refuses further edits after an old message reaches its edit cap. */
@@ -1545,6 +1614,7 @@ async function deliverMessage(
       // and using the wrong (channel, ts) pair on Slack's chat.delete could
       // delete an unrelated message if the timestamps happened to collide.
       statusTracking.set(session.id, {
+        outboundId: msg.id,
         channelType: msg.channel_type,
         platformId: msg.platform_id,
         threadId: msg.thread_id,
@@ -1961,7 +2031,7 @@ async function deliverMessage(
   // markDelivered for the chat reply itself — that would cause retry/
   // duplicate of the real answer.
   if (msg.kind === 'chat' || msg.kind === 'chat-sdk') {
-    await clearSessionStatusAfterPublicDelivery(session.id);
+    await settleSessionStatusAfterPublicDelivery(session.id);
   }
 
   if (msg.kind === 'chat') {
@@ -2148,9 +2218,20 @@ registerDeliveryAction(
   'turn_end',
   async (content, session) => {
     const lifecycleStatusId = typeof content.lifecycleStatusId === 'string' ? content.lifecycleStatusId : undefined;
-    if (lifecycleStatusId)
-      await stopSessionLifecycleStatus(session.id, 'Stopped before sending a reply.', lifecycleStatusId);
-    else await dropOrphanStatus(session.id);
+    if (!lifecycleStatusId) {
+      await dropOrphanStatus(session.id);
+      return undefined;
+    }
+
+    const pendingApprovals = await getPendingApprovalsBySession(session.id);
+    if (pendingApprovals.length > 0) {
+      const status = statusTracking.get(session.id) ?? (await recoverLifecycleStatus(session.id, lifecycleStatusId));
+      if (!status) return undefined;
+      await markSessionLifecycleWaiting(session.id, status);
+      return undefined;
+    }
+
+    await stopSessionLifecycleStatus(session.id, 'Stopped before sending a reply.', lifecycleStatusId);
     return undefined;
   },
   unguarded('turn boundary — updates or deletes only this session’s own status line, no privileged effect'),

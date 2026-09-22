@@ -29,7 +29,7 @@ import {
   getSession,
   updatePendingApprovalMessageId,
 } from '../../db/sessions.js';
-import { clearSessionStatusAfterPublicDelivery, getDeliveryAdapter } from '../../delivery.js';
+import { getDeliveryAdapter, settleSessionStatusAfterPublicDelivery } from '../../delivery.js';
 import { requestWake } from '../../request-wake.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -508,13 +508,14 @@ export async function requestApprovalOutcome(opts: RequestApprovalOptions): Prom
     return 'failed';
   }
 
-  try {
-    await clearSessionStatusAfterPublicDelivery(session.id);
-  } catch (err) {
-    // The card is already public. Cleanup must not relabel a successful post as
-    // a failed approval request or remove its durable pending row.
-    log.warn('Approval card posted but lifecycle cleanup failed', { action, approvalId, sessionId: session.id, err });
-  }
+  await settleSessionStatusAfterPublicDelivery(session.id, {
+    conversation: {
+      channelType: destination.channelType,
+      platformId: destination.platformId,
+      threadId: destination.threadId,
+    },
+    waitWhenElsewhere: true,
+  });
 
   log.info('Approval requested', { action, approvalId, agentName, target: destination.label, deliveryTarget });
   return 'posted';

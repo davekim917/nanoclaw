@@ -148,7 +148,8 @@ export function getRecoverableLifecycleStatus(
   outboundId?: string,
 ): RecoverableLifecycleStatus | null {
   const deliveredReceipt = inbound.prepare(
-    "SELECT platform_message_id FROM delivered WHERE message_out_id = ? AND status = 'delivered'",
+    `SELECT platform_message_id, lifecycle_terminal_at
+     FROM delivered WHERE message_out_id = ? AND status = 'delivered'`,
   );
   const isDelivered = inbound.prepare("SELECT 1 FROM delivered WHERE message_out_id = ? AND status = 'delivered'");
   const rows = outbound
@@ -177,8 +178,11 @@ export function getRecoverableLifecycleStatus(
     }
     if (content.reporting?.version !== 1 || content.reporting?.purpose !== 'liveness') continue;
     if (!row.channel_type || !row.platform_id) continue;
-    const deliveryReceipt = deliveredReceipt.get(row.id) as { platform_message_id: string | null } | undefined;
+    const deliveryReceipt = deliveredReceipt.get(row.id) as
+      | { platform_message_id: string | null; lifecycle_terminal_at: string | null }
+      | undefined;
     if (!deliveryReceipt?.platform_message_id) continue;
+    if (deliveryReceipt.lifecycle_terminal_at !== null) continue;
     const laterPublicIds = outbound
       .prepare("SELECT id FROM messages_out WHERE seq > ? AND kind IN ('chat','chat-sdk') ORDER BY seq DESC")
       .iterate(row.seq) as Iterable<{ id: string }>;

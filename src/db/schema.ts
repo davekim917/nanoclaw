@@ -231,6 +231,7 @@ CREATE TABLE IF NOT EXISTS delivered (
   platform_message_id TEXT,
   status              TEXT NOT NULL DEFAULT 'delivered',
   error               TEXT,
+  lifecycle_terminal_at TEXT,
   delivered_at        TEXT NOT NULL
 );
 

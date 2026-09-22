@@ -111,14 +111,16 @@ Host writes here after handing a `messages_out` row to the channel adapter. Cont
 
 ```sql
 CREATE TABLE delivered (
-  message_out_id      TEXT PRIMARY KEY,
-  platform_message_id TEXT,
-  status              TEXT NOT NULL DEFAULT 'delivered',  -- delivered|failed
-  delivered_at        TEXT NOT NULL
+  message_out_id        TEXT PRIMARY KEY,
+  platform_message_id   TEXT,
+  status                TEXT NOT NULL DEFAULT 'delivered',  -- pending|delivered|failed
+  error                 TEXT,
+  lifecycle_terminal_at TEXT,
+  delivered_at          TEXT NOT NULL
 );
 ```
 
-Writer: `markDelivered()` / `markDeliveryFailed()` in `src/db/session-db.ts`. Older session DBs are brought up to schema lazily by `migrateDeliveredTable()`.
+Writer: the mailbox delivery operations in `src/modules/mailbox/ops/delivery.ts`. `lifecycle_terminal_at` preserves the real delivery receipt while telling every status-recovery path that the activity line is no longer live. Older session DBs are brought up to schema lazily by `migrateDeliveredTable()`.
 
 ### 2.3 `destinations`
 
@@ -287,6 +289,6 @@ CREATE TABLE container_state (
 
 ## 5. Schema evolution
 
-Unlike the central DB, session DBs do **not** go through numbered migrations. Both `INBOUND_SCHEMA` and `OUTBOUND_SCHEMA` use `CREATE TABLE IF NOT EXISTS`, so a fresh session always gets the current shape. For session folders created under older builds, column-level gaps are patched lazily on open — e.g. `migrateDeliveredTable()` in `src/db/session-db.ts` adds `platform_message_id` and `status` to the `delivered` table if missing.
+Unlike the central DB, session DBs do **not** go through numbered migrations. Both `INBOUND_SCHEMA` and `OUTBOUND_SCHEMA` use `CREATE TABLE IF NOT EXISTS`, so a fresh session always gets the current shape. For session folders created under older builds, column-level gaps are patched lazily on open — e.g. `migrateDeliveredTable()` in `src/modules/mailbox/schema.ts` adds the receipt, status, error, and nullable lifecycle-terminal fields to `delivered` if missing. Existing data is preserved, and old readers that name their columns ignore the additive field.
 
 If you add a column to either schema, add a matching lazy migration for existing session folders, and prefer nullable columns or defaulted values so no data backfill is required.
