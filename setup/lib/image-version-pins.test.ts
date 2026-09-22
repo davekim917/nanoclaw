@@ -28,4 +28,11 @@ describe('container-image pins in versions.json match what the build installs', 
   it('claude-agent-sdk equals container/agent-runner/package.json', () => {
     expect(runnerPkg.dependencies['@anthropic-ai/claude-agent-sdk']).toBe(readVersionPin('claude-agent-sdk'));
   });
+
+  // claude-code 2.1.N ships with claude-agent-sdk 0.3.N; the CLI carries model
+  // support, the SDK is its protocol wrapper, and a mismatched pair is untested.
+  it('claude-code and claude-agent-sdk share a patch number', () => {
+    const patch = (v: string) => v.split('.')[2];
+    expect(patch(readVersionPin('claude-agent-sdk'))).toBe(patch(readVersionPin('claude-code')));
+  });
 });

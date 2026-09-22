@@ -1876,7 +1876,7 @@ registerResource({
           name: 'match_resolved',
           type: 'boolean',
           description:
-            'Also match pins that resolve to the same model (unifies the family alias "opus" with the frozen id "claude-opus-5[1m]"). Off by default: it converts a floating pin into a frozen one.',
+            'Also match pins that resolve to the same model (unifies the family alias "opus" with the frozen id it currently resolves to, e.g. "claude-opus-5-5[1m]"). Off by default: it converts a floating pin into a frozen one.',
         },
         {
           name: 'target_provider',
@@ -1906,7 +1906,7 @@ registerResource({
         },
       ],
       examples: [
-        `# See what a model bump would touch, fleet-wide, before touching anything:\nncl tasks repin --all --from-model claude-opus-5[1m] --to-model claude-opus-5-1[1m] --dry-run`,
+        `# See what a model bump would touch, fleet-wide, before touching anything:\nncl tasks repin --all --from-model claude-opus-5[1m] --to-model claude-opus-5-5[1m] --dry-run`,
         `# Fix an effort pin the target provider does not have (claude/codex xhigh -> opencode high):\nncl tasks repin --group ag-123 --target-provider opencode --from-effort xhigh --to-effort high`,
         `# Clear the way for a codex -> claude migration, then run the switch:\nncl tasks repin --group ag-123 --target-provider claude --from-model gpt-6-astra --to-model claude-sonnet-5`,
         `# Move ONE series off a pin several series share:\nncl tasks repin --group ag-123 --series-id task-abc --from-model sonnet --to-model opus --dry-run`,
