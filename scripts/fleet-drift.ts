@@ -8,9 +8,10 @@
  *
  * Flow:
  *   1. Collect today's metrics — disk usage/pct for data/, ERROR-line count in
- *      the last 24h from logs/nanoclaw.error.log(.1) (ANSI-stripped, local-time
- *      parsed — src/log.ts wraps the level tag in color codes and timestamps in
- *      local wall-clock, not UTC), and fleet-wide scheduled-task health (paused
+ *      the last 24h from logs/nanoclaw.error.log(.1) (ANSI-stripped; src/log.ts
+ *      wraps the level tag in color codes and stamps local wall-clock plus an
+ *      explicit UTC offset, which is what makes the instant recoverable here),
+ *      and fleet-wide scheduled-task health (paused
  *      series / oldest observed pause / worst live failure streak) via a
  *      per-session inbound.db fan-out. Fail-closed: any unreadable source
  *      throws, main() prints it and returns 1 — never silently treated as zero.
@@ -59,6 +60,7 @@ import Database from 'better-sqlite3';
 
 import { DATA_DIR, REPO_ROOT } from '../src/config.js';
 import { flattenClaudeMd } from '../src/agents-md-flatten.js';
+import { parseLogStamp } from '../src/log.js';
 
 // ─────────────────────────── pure logic (exported for tests) ──────────────
 
@@ -212,21 +214,28 @@ export function computeSeriesStats(rowsDescBySeq: TaskRow[]): Map<string, Series
  * `windowMs` of `nowMs`. src/log.ts wraps the level tag in ANSI color codes
  * (`\x1b[31mERROR\x1b[39m`) and the message in another color, so a plain
  * `] ERROR` prefix match misses every real line — strip ANSI escapes first.
- * The stamp itself is LOCAL wall-clock time (src/log.ts `ts()` uses local
- * Date getters, not UTC), so it's parsed as local — correct as long as this
- * script runs on the same host/TZ as the logger, which it does (both are
- * plain host processes, no TZ override).
+ * The stamp is LOCAL wall-clock (src/log.ts `ts()` uses local Date getters)
+ * followed by an explicit UTC offset, so `parseLogStamp` recovers the
+ * absolute instant without assuming anything about this script's own zone.
+ *
+ * That assumption used to be stated here as "both are plain host processes,
+ * no TZ override" — and it was false: the systemd unit sets
+ * `TZ=America/New_York` while `/etc/localtime` is `Etc/UTC`, so logger and
+ * reader sat 4h apart and the 24h window silently dropped its oldest 4h.
+ * Lines predating the offset (rotated logs, kept 30 days) still parse, as
+ * local and inexact — the same best-effort reading as before, no worse.
  */
 // eslint-disable-next-line no-control-regex -- deliberately matches the ANSI CSI escape byte to strip src/log.ts's color codes
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
-const ERROR_LINE_RE = /^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\] ERROR\b/;
+const ERROR_LINE_RE =
+  /^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})([+-]\d{2}:\d{2})?\] ERROR\b/;
 export function countRecentErrorLines(content: string, nowMs: number, windowMs = 24 * 60 * 60 * 1000): number {
   let count = 0;
   for (const rawLine of content.split('\n')) {
     const m = ERROR_LINE_RE.exec(rawLine.replace(ANSI_RE, ''));
     if (!m) continue;
-    const ts = Date.parse(m[1]);
-    if (Number.isFinite(ts) && nowMs - ts <= windowMs) count++;
+    const parsed = parseLogStamp(m[1], m[2]);
+    if (parsed && nowMs - parsed.ms <= windowMs) count++;
   }
   return count;
 }

@@ -30,6 +30,32 @@ function formatData(data: Record<string, unknown>): string {
   return parts.length ? ' ' + parts.join(' ') : '';
 }
 
+/**
+ * Numeric UTC offset for `d` as `+HH:MM` / `-HH:MM`.
+ *
+ * `getTimezoneOffset()` returns minutes the local zone is BEHIND UTC, so its
+ * sign is inverted relative to the ISO-8601 marker: EDT is +240 and renders
+ * as `-04:00`.
+ */
+function offsetMarker(d: Date): string {
+  const mins = -d.getTimezoneOffset();
+  const sign = mins < 0 ? '-' : '+';
+  const abs = Math.abs(mins);
+  return `${sign}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`;
+}
+
+/**
+ * Host log stamp: local wall-clock plus an explicit numeric UTC offset.
+ *
+ * The offset is load-bearing, not decoration. The stamp is built from local
+ * `Date` getters, so it renders in the host PROCESS's zone (`TZ` env, else
+ * `/etc/localtime`) — which is not necessarily the zone of whatever later
+ * reads the line. On this install the systemd unit sets
+ * `TZ=America/New_York` while `/etc/localtime` is `Etc/UTC`, so a script
+ * rebuilding the stamp with local getters lands 4h off and, because nothing
+ * throws, the error surfaces as a confident zero rather than a failure.
+ * Parse with `parseLogStamp` below rather than re-deriving the parts.
+ */
 function ts(): string {
   const d = new Date();
   const yyyy = d.getFullYear();
@@ -39,7 +65,62 @@ function ts(): string {
   const mm = String(d.getMinutes()).padStart(2, '0');
   const ss = String(d.getSeconds()).padStart(2, '0');
   const ms = String(d.getMilliseconds()).padStart(3, '0');
-  return `${yyyy}-${MM}-${dd} ${hh}:${mm}:${ss}.${ms}`;
+  return `${yyyy}-${MM}-${dd} ${hh}:${mm}:${ss}.${ms}${offsetMarker(d)}`;
+}
+
+/**
+ * Matches a host log line's leading `[<stamp>]`, with or without the offset.
+ *
+ * The offset group is OPTIONAL because rotated logs are kept 30 days and
+ * every line written before this change lacks it — a required group would
+ * silently stop matching all history.
+ */
+export const LOG_STAMP_RE = /^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})([+-]\d{2}:\d{2})?\]/;
+
+/**
+ * Absolute epoch ms for a stamp captured by `LOG_STAMP_RE`.
+ *
+ * With an offset the instant is unambiguous. WITHOUT one (pre-change lines)
+ * there is no recoverable answer: the only reading available is the READER's
+ * local zone, which is exactly the assumption that made these stamps
+ * misparse. `legacyIsLocal` therefore returns that best-effort value and
+ * callers that care can tell the two apart via the second return field.
+ */
+export function parseLogStamp(stamp: string, offset?: string): { ms: number; exact: boolean } | null {
+  if (offset) {
+    const ms = Date.parse(`${stamp.replace(' ', 'T')}${offset}`);
+    return Number.isFinite(ms) ? { ms, exact: true } : null;
+  }
+  const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\.(\d{3})$/.exec(stamp);
+  if (!m) return null;
+  const [y, mo, d, h, mi, sec, msec] = m.slice(1, 8).map(Number) as [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ];
+  const dt = new Date(y, mo - 1, d, h, mi, sec, msec);
+  // `new Date(2026, 12, 99, 99, ...)` does not throw — it NORMALISES, rolling
+  // overflow into a real instant. A corrupted line would then parse to a
+  // plausible-looking date, and in host-health.ts's backward walk a value
+  // below the cutoff ends the scan early, which is precisely the silent zero
+  // this change exists to remove. Reject anything that did not round-trip.
+  if (
+    dt.getFullYear() !== y ||
+    dt.getMonth() !== mo - 1 ||
+    dt.getDate() !== d ||
+    dt.getHours() !== h ||
+    dt.getMinutes() !== mi ||
+    dt.getSeconds() !== sec ||
+    dt.getMilliseconds() !== msec
+  ) {
+    return null;
+  }
+  const ms = dt.getTime();
+  return Number.isFinite(ms) ? { ms, exact: false } : null;
 }
 
 // Pluggable scrubber — the secret-scrubber module wires this on load to
