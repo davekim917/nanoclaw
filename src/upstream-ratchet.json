@@ -777,7 +777,7 @@
 "src/group-folder.test.ts":{"diff":81,"mode":"100644","sha256":"f1da5a6ee367826657c3569bebd5e818e6022a06eb6e51ebb815d9a1b4703202"},
 "src/group-folder.ts":{"diff":63,"mode":"100644","sha256":"8c1397821898889f3c44e189f857e2f7182fb777e9bd178bf20932d7f659f348"},
 "src/group-init.settings.test.ts":{"diff":117,"mode":"100644","sha256":"5425720799c0cc27ee092c2146d3a68353a1e1fb56e0ee609e5a8bc597295cc2"},
-"src/group-init.ts":{"diff":355,"mode":"100644","sha256":"f0bf984fdf6a8a2c16cb8b4e2613d48c43f8b76e0e524e418c96936f61e4d902"},
+"src/group-init.ts":{"diff":355,"mode":"100644","sha256":"b21a376906c5e6fb55412a58bff94f379188599cce2f87f3ad94f5ac3947bffa"},
 "src/group-persona.test.ts":{"diff":92,"mode":"100644","sha256":"aebddb3d89ce9233752c1890cc44dde704272d55ee5292cec868ba6feed839bc"},
 "src/group-persona.ts":{"diff":83,"mode":"100644","sha256":"35a8cc23c071cae6126a504450e3aefa656880772066fbe4737c2bd53bd06cff"},
 "src/group-skills.test.ts":{"diff":4,"mode":"100644","sha256":"16149cb05ee1d368146a48e1af383974b0167e56b3c2fdf30845a9cbe77b8f40"},
