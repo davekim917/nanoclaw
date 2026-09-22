@@ -164,6 +164,11 @@ risk:high:
     - 'scripts/check-remote-boundary.ts'
     - '.public-boundary-allowlist.json'
     - 'container/skills/pr-review-loop/**'
+    # The QA release gate: its controller, gate, barrier and scaffold decide whether a
+    # client build is certified GO. No PR-lane CI runs its suites, and a defect
+    # publishes a verdict wrong on the merits (#2092: BLOCKED over a clean GO) or
+    # strands a campaign silently (#2024) -- #1001's three forced rounds found 8 P1s.
+    - 'container/skills/smoke-test/**'
     - 'docs/review-policy.md'
     # The reviewer-eligibility tier rule the merge gate enforces. The generator
     # now STATES its roster rather than deriving it, so a change there changes
@@ -328,6 +333,7 @@ risk:gates:
     - 'scripts/check-remote-boundary.ts'
     - '.public-boundary-allowlist.json'
     - 'container/skills/pr-review-loop/**'
+    - 'container/skills/smoke-test/**'
     - 'docs/review-policy.md'
     - 'scripts/reviewer-models*.ts'
     - 'container/agents/**'
