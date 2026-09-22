@@ -46,7 +46,13 @@ import {
   queueWorkContinuation,
 } from './modules/mailbox/index.js';
 import { MockProvider } from './providers/mock.js';
-import { recordContextTokens, resetTurnStatus, setTurnSettings } from './turn-status.js';
+import {
+  formatStatusSubtext,
+  recordContextTokens,
+  resetTurnStatus,
+  setOwnConversation,
+  setTurnSettings,
+} from './turn-status.js';
 import { postToolUseHook, preToolUseHook } from './providers/claude.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -5345,6 +5351,9 @@ describe('dispatchResultText — status subtext', () => {
     _setConfigForTest({});
     resetTurnStatus();
     setTurnSettings('claude-opus-5[1m]', 'xhigh');
+    // Every case below runs with slack/C-MAIN as the session's own
+    // conversation; processQuery sets this per turn in production.
+    setOwnConversation('slack', 'C-MAIN');
     recordContextTokens(142_400);
   });
 
@@ -5435,5 +5444,102 @@ describe('dispatchResultText — status subtext', () => {
 
     const content = JSON.parse(getUndeliveredMessages()[0].content) as Record<string, unknown>;
     expect(content).toEqual({ text: 'All set.' });
+  });
+});
+
+/**
+ * Round-two regressions, both of which shipped looking correct.
+ *
+ * 1. The stamp lived in `sendToDestination`, so the `send_message` MCP path —
+ *    THE reply path whenever outcome reporting is on, which is the fleet
+ *    default — produced unstamped replies. Every test passed, because every
+ *    test drove the envelope path.
+ * 2. The context figure was cleared at `emitTurnEnd`, which runs once per
+ *    QUERY. A query serves many turns, so a second turn with no usable usage
+ *    frame printed the first turn's figure as its own.
+ */
+describe('status subtext — round-two regressions', () => {
+  beforeEach(() => {
+    _resetConfig();
+    _setConfigForTest({});
+    resetTurnStatus();
+  });
+
+  afterEach(() => {
+    resetTurnStatus();
+    _resetConfig();
+  });
+
+  it('stamps a chat row written straight to the seam, as send_message writes it', async () => {
+    const { writeMessageOut, getUndeliveredMessages } = require('./db/messages-out.js');
+    setTurnSettings('claude-opus-5[1m]', 'xhigh');
+    setOwnConversation('discord', 'chan-1');
+    recordContextTokens(142_400);
+
+    // Exactly the shape mcp-tools/core.ts writes for a public reply: no
+    // dispatchResultText, no <message> envelope, no sendToDestination.
+    await writeMessageOut({
+      id: 'mcp-1',
+      kind: 'chat',
+      platform_id: 'chan-1',
+      channel_type: 'discord',
+      thread_id: null,
+      content: JSON.stringify({ text: 'answered through the tool' }),
+    });
+
+    const row = getUndeliveredMessages().find((r: { id: string }) => r.id === 'mcp-1');
+    expect(JSON.parse(row.content).subtext).toBe('opus-5 · xhigh · 142k context');
+  });
+
+  it('does not stamp a work_log row written through the same seam', async () => {
+    const { writeMessageOut, getUndeliveredMessages } = require('./db/messages-out.js');
+    setTurnSettings('claude-opus-5[1m]', 'xhigh');
+    setOwnConversation('discord', 'chan-1');
+    recordContextTokens(142_400);
+
+    await writeMessageOut({
+      id: 'mcp-log',
+      kind: 'work_log',
+      platform_id: 'chan-1',
+      channel_type: 'discord',
+      thread_id: null,
+      content: JSON.stringify({ text: 'internal progress' }),
+    });
+
+    const row = getUndeliveredMessages().find((r: { id: string }) => r.id === 'mcp-log');
+    expect(JSON.parse(row.content).subtext).toBeUndefined();
+  });
+
+  it('does not let a second turn in one query inherit the first turn context figure', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('discord-main', 'discord-main', 'channel', 'discord', 'chan-1', NULL)`,
+      )
+      .run();
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-two-turns' };
+      // Turn one measures its context and answers.
+      recordContextTokens(142_400);
+      yield { type: 'result', text: '<message to="here">first</message>' };
+      // Turn two answers WITHOUT a usable usage frame. The stream is still
+      // open — this is a second turn inside one processQuery, which is what
+      // made emitTurnEnd the wrong boundary.
+      yield { type: 'result', text: '<message to="here">second</message>' };
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, events: events(), abort: () => {} };
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {
+      model: 'claude-opus-5[1m]',
+      effort: 'xhigh',
+    });
+
+    const rows = getUndeliveredMessages().filter((r: { kind: string }) => r.kind === 'chat');
+    const subtexts = rows.map((r: { content: string }) => JSON.parse(r.content).subtext);
+    // Model and effort survive both turns — they are standing configuration.
+    // The measurement belongs only to the turn that took it.
+    expect(subtexts[0]).toBe('opus-5 · xhigh · 142k context');
+    expect(subtexts[1]).toBe('opus-5 · xhigh');
   });
 });

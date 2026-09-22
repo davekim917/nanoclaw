@@ -15,7 +15,7 @@ import {
   type MessageInRow,
 } from './db/messages-in.js';
 import { getConfig } from './config.js';
-import { clearContextTokens, formatStatusSubtext, setTurnSettings } from './turn-status.js';
+import { clearContextTokens, setOwnConversation, setTurnSettings } from './turn-status.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { touchHeartbeat } from './heartbeat.js';
@@ -1947,6 +1947,8 @@ export async function processQuery(
   // comment above gives: what the turn REQUESTED can be nothing at all, and a
   // line that says "you are on the group default" answers nothing.
   setTurnSettings(modelInForce, querySettings.effort, querySettings.ultracode);
+  // Which conversation counts as "mine", for the subtext's own-voice gate.
+  setOwnConversation(routing.channelType, routing.platformId);
   /**
    * What the live stream is ACTUALLY set to. `querySettings` is the immutable
    * creation snapshot, so once a live settings change lands it stops
@@ -2859,6 +2861,15 @@ export async function processQuery(
           const stillOpen = openPromptIds();
           if (!provisional.promptIds.some((id) => stillOpen.includes(id))) provisional = undefined;
         }
+        // The context figure belongs to the turn that measured it, and THIS is
+        // the turn boundary — not emitTurnEnd. `processQuery` deliberately
+        // consumes many `result` events while the provider's generator stays
+        // open for follow-up pushes (see the note at the top of this branch),
+        // so emitTurnEnd runs once per QUERY, after the last of them. Clearing
+        // there would let turn N+1 inherit turn N's figure whenever N+1
+        // produced no usable usage frame. Safe here specifically: every
+        // dispatch for this result has already run above.
+        clearContextTokens();
         // Handling is done deciding. If it pushed, the turn level is raised
         // again and the published bit stays 1; if it did not, this is where
         // the container becomes reapable.
@@ -3229,11 +3240,9 @@ export async function dispatchInterimMessageBlocks(
  * assume inbound rows are already marked completed when this row lands.
  */
 async function emitTurnEnd(): Promise<void> {
-  // The context figure belongs to the turn that measured it. Dropping it here
-  // means the NEXT turn shows a figure only if it measures one of its own,
-  // rather than inheriting this turn's beside a possibly-different model.
-  // Safe at this point specifically: this runs after the turn's reply has been
-  // dispatched and stamped (dispatchResultText), never before.
+  // The context figure is cleared per RESULT (see closeResultScope above), not
+  // here: one query can serve many turns, so this fires too coarsely to be the
+  // turn boundary. Kept as a backstop for a query that ends without a result.
   clearContextTokens();
   const lifecycleStatusId = getCurrentLifecycleStatus();
   await writeMessageOut({
@@ -3573,23 +3582,6 @@ export async function autoAppendTaskLog(text: string, isError = false, model?: s
   log(`Task run log auto-appended from final text${isError ? ' (provider flagged the turn an error)' : ''}`);
 }
 
-/**
- * Is this group's status subtext turned on?
- *
- * Never throws. `getConfig()` throws when the config was never loaded, and a
- * footer is decoration — it must not be able to take a reply down with it. An
- * unreadable config answers NO rather than yes: the flag exists so a group can
- * ask for silence, and honouring that ask is the one outcome that matters if
- * we cannot tell which group this is.
- */
-function statusSubtextEnabled(): boolean {
-  try {
-    return getConfig().statusSubtext;
-  } catch {
-    return false;
-  }
-}
-
 async function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): Promise<void> {
   const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
@@ -3603,27 +3595,10 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
   // including an explicit channel-root null, remains authoritative.
   const ownConversation = channelType === routing.channelType && platformId === routing.platformId;
   const threadId = destRouting ? destRouting.threadId : ownConversation ? routing.threadId : null;
-  // Status subtext — the agent's own voice only.
-  //
-  // This is the one chokepoint every `<message to="…">` block passes through,
-  // including the `here` alias, the peer-as-destination recovery and the
-  // unwrapped-text origin fallback, so stamping here covers each of them
-  // without twelve write sites each growing their own copy.
-  //
-  // `ownConversation` is the whole gate, and it is deliberately narrow: the
-  // line describes the machinery answering YOU, so it belongs under a reply in
-  // the thread you are in and nowhere else. A cross-destination send — a
-  // sibling agent's DM, another channel, or a message the operator asked the
-  // agent to relay on their behalf — carries somebody else's words to somebody
-  // else's conversation, and stamping our model and context onto that would be
-  // both noise and a small leak of how the fleet is configured.
-  //
-  // Known gap, accepted: "post in THIS thread, as me" resolves to the origin
-  // and is stamped. No routing fact distinguishes it from a normal reply; only
-  // the agent's intent does. The alternative — a suppress flag on the sending
-  // tool — fails in the worse direction, because an agent that forgets to pass
-  // it stamps the operator's words rather than merely missing a line.
-  const subtext = ownConversation && statusSubtextEnabled() ? formatStatusSubtext() : null;
+  // The status subtext is NOT stamped here. It rides the shared outbound seam
+  // (db/messages-out.ts -> stampStatusSubtext) so the `send_message` MCP path,
+  // which bypasses this function entirely and is the default reply path when
+  // outcome reporting is on, gets the same treatment.
   await writeMessageOut({
     id: generateId(),
     // Batch anchor, not the channel's latest inbound row — see the poison
@@ -3633,7 +3608,7 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
     platform_id: platformId,
     channel_type: channelType,
     thread_id: threadId,
-    content: JSON.stringify(subtext ? { text: body, subtext } : { text: body }),
+    content: JSON.stringify({ text: body }),
   });
 }
 

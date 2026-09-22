@@ -4,6 +4,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 import { getAgentMailbox } from '../mailbox/index.js';
+import { stampStatusSubtext } from '../turn-status.js';
 import type { OutboundMessage } from '../mailbox/types.js';
 
 export interface MessageOutRow {
@@ -101,7 +102,11 @@ export function writeMessageOut(msg: WriteMessageOut): Promise<number> {
     platformId: msg.platform_id,
     channelType: msg.channel_type,
     threadId: msg.thread_id,
-    content: decorateContent(msg),
+    // Status subtext rides here, at the ONE seam every outbound row crosses,
+    // because the agent's reply reaches a conversation by two unrelated paths
+    // (`<message>` envelopes and the `send_message` MCP tool) and which one
+    // runs depends on a config flag. See stampStatusSubtext for the full why.
+    content: stampStatusSubtext({ ...msg, content: decorateContent(msg) }),
   });
 }
 

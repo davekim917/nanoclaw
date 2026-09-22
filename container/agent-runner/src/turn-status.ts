@@ -1,3 +1,5 @@
+import { getConfig } from './config.js';
+
 /**
  * The "what am I running on" line stamped under an agent's own replies.
  *
@@ -38,6 +40,19 @@ let contextTokens: number | null = null;
 let model: string | null = null;
 let effort: string | null = null;
 let ultracode = false;
+
+/**
+ * The conversation this session belongs to, as poll-loop resolved it.
+ *
+ * The subtext describes the machinery answering YOU, so it belongs under a
+ * reply in the thread you are in and nowhere else. A cross-destination send —
+ * a sibling agent's DM, another channel, or a message the operator asked the
+ * agent to relay on their behalf — carries somebody else's words to somebody
+ * else's conversation, and stamping our model and context onto that would be
+ * both noise and a small leak of how the fleet is configured.
+ */
+let ownChannelType: string | null = null;
+let ownPlatformId: string | null = null;
 
 /**
  * Record the context occupancy observed on a provider request.
@@ -86,9 +101,12 @@ export function setTurnSettings(
  * honest answer for missing telemetry is to omit the context part, which is
  * what an empty store renders.
  *
- * Called from `emitTurnEnd` (poll-loop.ts), which every turn exit runs and
- * which fires AFTER the turn's reply has been dispatched — so clearing here
- * never strips the figure from the reply that earned it.
+ * Called per RESULT, right before `closeResultScope` (poll-loop.ts), after
+ * every dispatch for that result has run — so clearing never strips the figure
+ * from the reply that earned it. NOT at `emitTurnEnd`: one query serves many
+ * turns (its generator stays open for follow-up pushes), so emitTurnEnd fires
+ * once per query and would let a later turn inherit an earlier turn's figure.
+ * It still calls this as a backstop for a query that ends without a result.
  *
  * Model and effort deliberately SURVIVE: they describe the session's standing
  * configuration, not a measurement, and remain true until something changes
@@ -98,12 +116,38 @@ export function clearContextTokens(): void {
   contextTokens = null;
 }
 
+/**
+ * Record which conversation is this session's own, for the own-voice gate.
+ *
+ * Set once per turn beside `setTurnSettings`, from the same `routing` the
+ * turn is being processed under.
+ */
+export function setOwnConversation(channelType?: string | null, platformId?: string | null): void {
+  ownChannelType = channelType ?? null;
+  ownPlatformId = platformId ?? null;
+}
+
+/**
+ * Is an outbound row addressed to this session's own conversation?
+ *
+ * FAILS CLOSED on an unknown route. A row with no platform, or one written
+ * before any turn established the session's routing, answers NO — an
+ * unstamped reply is a missing decoration, while a wrongly stamped one puts
+ * the fleet's configuration into somebody else's conversation.
+ */
+export function isOwnConversation(channelType?: string | null, platformId?: string | null): boolean {
+  if (!ownPlatformId || !platformId) return false;
+  return channelType === ownChannelType && platformId === ownPlatformId;
+}
+
 /** Test seam — reset the store between cases. */
 export function resetTurnStatus(): void {
   contextTokens = null;
   model = null;
   effort = null;
   ultracode = false;
+  ownChannelType = null;
+  ownPlatformId = null;
 }
 
 /**
@@ -155,4 +199,77 @@ export function formatStatusSubtext(): string | null {
   else if (effort) parts.push(effort);
   if (contextTokens !== null) parts.push(`${formatTokens(contextTokens)} context`);
   return parts.length > 0 ? parts.join(' · ') : null;
+}
+
+/**
+ * Is this group's status subtext turned on?
+ *
+ * Never throws. `getConfig()` throws when the config was never loaded, and a
+ * footer is decoration — it must not be able to take a reply down with it. An
+ * unreadable config answers NO rather than yes: the flag exists so a group can
+ * ask for silence, and honouring that ask is the one outcome that matters if
+ * we cannot tell which group this is.
+ */
+function statusSubtextEnabled(): boolean {
+  try {
+    return getConfig().statusSubtext;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stamp the status subtext onto an outbound chat payload, or return it
+ * unchanged.
+ *
+ * THIS IS THE ONLY STAMPING SITE, and it sits at the shared outbound seam
+ * (db/messages-out.ts) rather than at any one sender. There are two unrelated
+ * ways an agent's reply reaches a conversation, and which one runs depends on
+ * a config flag most installs never touch:
+ *
+ *   - `<message to="here">` envelopes, dispatched by sendToDestination.
+ *   - The `send_message` MCP tool, which writes its own chat row directly
+ *     (mcp-tools/core.ts:355). Outcome reporting — ON unless a group sets
+ *     `outcomeReporting: false` (src/container-config.ts:1399) — instructs the
+ *     agent to reply this way (destinations.ts:320), so on a default install
+ *     this is THE reply path, not an alternative one.
+ *
+ * Stamping in either sender alone therefore covers roughly half the fleet
+ * while looking complete in tests.
+ *
+ * Scope is deliberately narrow: `kind: 'chat'` only, so work logs, cards,
+ * system actions and file attachments pass through byte-identical; the
+ * agent's own conversation only (`isOwnConversation`); and an existing
+ * `subtext` key is never overwritten.
+ *
+ * Known gap, accepted: "post in THIS thread, as me" resolves to the origin and
+ * is stamped. No routing fact distinguishes it from a normal reply; only the
+ * agent's intent does. The alternative — a suppress flag on the sending tool —
+ * fails in the worse direction, because an agent that forgets to pass it
+ * stamps the operator's words rather than merely missing a line.
+ */
+export function stampStatusSubtext(msg: {
+  kind: string;
+  channel_type?: string | null;
+  platform_id?: string | null;
+  content: string;
+}): string {
+  if (msg.kind !== 'chat') return msg.content;
+  if (!isOwnConversation(msg.channel_type, msg.platform_id)) return msg.content;
+  if (!statusSubtextEnabled()) return msg.content;
+  const subtext = formatStatusSubtext();
+  if (!subtext) return msg.content;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(msg.content);
+  } catch {
+    return msg.content;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return msg.content;
+  const payload = parsed as Record<string, unknown>;
+  // Never overwrite a subtext the handler set itself.
+  if (Object.prototype.hasOwnProperty.call(payload, 'subtext')) return msg.content;
+  payload.subtext = subtext;
+  return JSON.stringify(payload);
 }

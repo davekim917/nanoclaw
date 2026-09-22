@@ -8,8 +8,12 @@
  */
 import { beforeEach, describe, expect, it } from 'bun:test';
 
+import { _resetConfig, _setConfigForTest } from './config.js';
 import {
   clearContextTokens,
+  isOwnConversation,
+  setOwnConversation,
+  stampStatusSubtext,
   formatStatusSubtext,
   formatTokens,
   recordContextTokens,
@@ -134,5 +138,113 @@ describe('clearContextTokens — the turn boundary', () => {
     clearContextTokens();
     recordContextTokens(12_800);
     expect(formatStatusSubtext()).toBe('opus-5 · high · 13k context');
+  });
+});
+
+/**
+ * The stamping seam.
+ *
+ * THIS is where round two found the feature was dead on a default install:
+ * stamping lived in `sendToDestination`, but with outcome reporting on — the
+ * fleet default — agents reply through the `send_message` MCP tool, which
+ * writes its chat row straight to `writeMessageOut` and never passes through
+ * that function. These cases pin the decision at the shared seam, where BOTH
+ * reply paths cross it.
+ */
+describe('stampStatusSubtext', () => {
+  const chat = (over: Record<string, unknown> = {}) => ({
+    kind: 'chat',
+    channel_type: 'slack',
+    platform_id: 'C-MAIN',
+    content: JSON.stringify({ text: 'hi' }),
+    ...over,
+  });
+  const sub = (out: string): string | undefined => (JSON.parse(out) as { subtext?: string }).subtext;
+
+  beforeEach(() => {
+    _resetConfig();
+    _setConfigForTest({});
+    resetTurnStatus();
+    setTurnSettings('claude-opus-5[1m]', 'xhigh');
+    setOwnConversation('slack', 'C-MAIN');
+    recordContextTokens(142_400);
+  });
+
+  it('stamps a chat row bound for the session own conversation', () => {
+    expect(sub(stampStatusSubtext(chat()))).toBe('opus-5 · xhigh · 142k context');
+  });
+
+  it('leaves a row for another channel alone', () => {
+    expect(sub(stampStatusSubtext(chat({ platform_id: 'C-OTHER' })))).toBeUndefined();
+  });
+
+  it('leaves a row for another platform alone', () => {
+    expect(sub(stampStatusSubtext(chat({ channel_type: 'discord', platform_id: 'chan-9' })))).toBeUndefined();
+  });
+
+  // Work logs, cards, system actions and file rows all share this seam.
+  it.each(['work_log', 'system', 'card', 'file'])('leaves kind=%s byte-identical', (kind) => {
+    const msg = chat({ kind });
+    expect(stampStatusSubtext(msg)).toBe(msg.content);
+  });
+
+  it('fails closed when no turn has established the session routing', () => {
+    setOwnConversation(null, null);
+    expect(sub(stampStatusSubtext(chat()))).toBeUndefined();
+  });
+
+  it('fails closed for a row carrying no platform', () => {
+    expect(sub(stampStatusSubtext(chat({ platform_id: null })))).toBeUndefined();
+  });
+
+  it('never overwrites a subtext the handler set itself', () => {
+    const msg = chat({ content: JSON.stringify({ text: 'hi', subtext: 'handler owns this' }) });
+    expect(sub(stampStatusSubtext(msg))).toBe('handler owns this');
+  });
+
+  it('passes non-JSON content through untouched', () => {
+    const msg = chat({ content: 'not json at all' });
+    expect(stampStatusSubtext(msg)).toBe('not json at all');
+  });
+
+  it('passes a JSON array through untouched', () => {
+    const msg = chat({ content: '[1,2,3]' });
+    expect(stampStatusSubtext(msg)).toBe('[1,2,3]');
+  });
+
+  it('stamps nothing for a group that opted out', () => {
+    _resetConfig();
+    _setConfigForTest({ statusSubtext: false });
+    expect(sub(stampStatusSubtext(chat()))).toBeUndefined();
+  });
+
+  it('stamps nothing when there is no line to show', () => {
+    resetTurnStatus();
+    setOwnConversation('slack', 'C-MAIN');
+    expect(sub(stampStatusSubtext(chat()))).toBeUndefined();
+  });
+
+  it('never throws when the config was never loaded', () => {
+    _resetConfig();
+    expect(() => stampStatusSubtext(chat())).not.toThrow();
+    expect(sub(stampStatusSubtext(chat()))).toBeUndefined();
+  });
+});
+
+describe('isOwnConversation', () => {
+  beforeEach(resetTurnStatus);
+
+  it('matches the routing the turn was set up with', () => {
+    setOwnConversation('slack', 'C-MAIN');
+    expect(isOwnConversation('slack', 'C-MAIN')).toBe(true);
+  });
+
+  it('is false before any turn has set the routing', () => {
+    expect(isOwnConversation('slack', 'C-MAIN')).toBe(false);
+  });
+
+  it('does not match a same-id channel on a different platform', () => {
+    setOwnConversation('slack', 'C-MAIN');
+    expect(isOwnConversation('discord', 'C-MAIN')).toBe(false);
   });
 });
