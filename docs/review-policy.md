@@ -102,9 +102,10 @@ are independent of each other:
   `docs/review-notes.md`). `src/provider-surfaces.test.ts` proves the host and
   container renders agree.
 
-Dropping an id from the reviewer roster costs that model receipt eligibility
-immediately, including on heads already receipted, unless it is one of the two
-compatibility ids. That is the reason the compatibility ids exist.
+Adding a word to `REVIEWER_DENIED_TIERS` costs every model it matches receipt
+eligibility immediately, including on heads already receipted, because
+merge-check re-reads the receipt against the current rule. Add a tier word only
+for a genuinely small tier.
 
 **Which reviewer is dispatched** is not a policy question — a reviewer is chosen
 for independence from the artifact's author, not for a worker tier.
