@@ -9,6 +9,9 @@
  * processing-ack sync. See docs/specs/upstream-mailbox-seam/plan.md §4.2.
  */
 import type Database from 'better-sqlite3';
+import { dispatchTaskEvent, type TaskDispatchInput, type TaskDispatchResult } from './ops/task-dispatch.js';
+import { readTaskSettlement, type TaskSettlement } from './ops/task-settlement.js';
+export { dispatchSeriesId, dispatchEventId, validateDispatchKey } from './ops/task-dispatch.js';
 
 import { sessionMailboxDir, sessionMailboxPath } from '../../mailbox/sqlite/paths.js';
 import { SqliteAgentMailbox, wrapSqliteInbound, wrapSqliteOutbound } from '../../mailbox/sqlite/index.js';
@@ -483,6 +486,8 @@ export interface NanoclawMailboxSession extends MailboxSession {
   // `countLiveTasks`, `findTaskBySeriesSlug`); only the ops below differ.
   /** Fork insert: routing columns, and `trigger = 0` so the row lands inert. */
   insertTaskRow(row: TaskRowInsert): void;
+  dispatchTaskEvent(input: TaskDispatchInput): TaskDispatchResult;
+  readTaskSettlement(eventId: string, threadId: string | null, observer?: boolean): TaskSettlement;
   /** Fork resume: also drops the stale recall pair and re-seqs the occurrence. */
   resumeTask(taskId: string): number;
   /** Fork update: script/threadAnchor/quietStatus/flagIntent/chatLimit + recall invalidation. */
@@ -1232,6 +1237,9 @@ function forkOps(
     listTurnUsageSince: (afterId) => readOutbound([], (outbound) => listTurnUsageSince(outbound, afterId)),
 
     insertTaskRow: (row) => insertTaskRow(inbound, row),
+    dispatchTaskEvent: (input) => dispatchTaskEvent(inbound, input, outboundPresent ? readableOutbound() : null),
+    readTaskSettlement: (eventId, threadId, observer) =>
+      readTaskSettlement(inbound, outboundPresent ? readableOutbound() : null, eventId, threadId, observer),
     resumeTask: (taskId) => resumeTask(inbound, taskId),
     updateTask: (taskId, update) => updateTask(inbound, taskId, update),
     getCompletedRecurringRows: () => getCompletedRecurring(inbound),

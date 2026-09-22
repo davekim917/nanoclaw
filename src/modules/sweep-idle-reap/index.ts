@@ -23,6 +23,8 @@ import {
 } from '../../host-sweep.js';
 
 const id = SWEEP_DUTY_INVENTORY;
+import { shouldReapIdleTaskContainer } from './task-idle.js';
+export { shouldReapIdleTaskContainer } from './task-idle.js';
 
 /**
  * Scheduled-task containers have no interactive follow-up window to preserve.
@@ -70,21 +72,6 @@ const id = SWEEP_DUTY_INVENTORY;
  * demoted it to the throttled 10-minute host recovery path. The chat path
  * has always guarded this; the task path now matches.
  */
-export function shouldReapIdleTaskContainer(
-  threadId: string | null,
-  dueMessageCount: number,
-  processingClaimCount: number,
-  providerExecuting: boolean,
-  hasActiveContinuation: boolean,
-): boolean {
-  return (
-    isTaskThread(threadId) &&
-    dueMessageCount === 0 &&
-    processingClaimCount === 0 &&
-    !providerExecuting &&
-    !hasActiveContinuation
-  );
-}
 
 /**
  * Chat/channel containers have an interactive follow-up window worth

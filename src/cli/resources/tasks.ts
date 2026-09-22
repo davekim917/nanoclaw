@@ -12,10 +12,12 @@ import {
   getSession,
   taskSeriesId,
   withQuietInvalidationSync,
+  setTaskRoutingPlatformId,
 } from '../../db/sessions.js';
 import { withCentralSync } from '../../db/central-lease.js';
 import { type TaskUpdate } from '../../modules/scheduling/db.js';
 import type { CliTaskRow, NanoclawMailboxSession } from '../../modules/mailbox/index.js';
+import { dispatchSeriesId, validateDispatchKey } from '../../modules/mailbox/index.js';
 import {
   enforceRecurrenceLimit,
   makeTaskId,
@@ -414,6 +416,65 @@ async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   return routingNote ? { ...output, routing_note: routingNote } : output;
 }
 
+async function dispatchTask(args: Record<string, unknown>, ctx: CallerContext) {
+  const group = groupArg(args, ctx);
+  if (!group) throw new Error('--group is required');
+  if (!(await getAgentGroup(group))) throw new Error('agent group not found');
+  const contextKey = args.context_key;
+  const eventKey = args.event_key;
+  validateDispatchKey(contextKey, '--context-key');
+  validateDispatchKey(eventKey, '--event-key');
+  const retryOf = args.retry_of;
+  if (retryOf !== undefined) validateDispatchKey(retryOf, '--retry-of');
+  const prompt = str(args.prompt);
+  if (!prompt?.trim() || prompt.length > 64_000) throw new Error('--prompt must contain 1–64000 characters');
+  const { routing, note } = await resolveTaskRouting(args, ctx);
+  // Resolve without re-stamping: a colliding replay must not mutate the existing route.
+  const { session } = await resolveTaskSession(group, dispatchSeriesId(contextKey));
+  const admitted = await withInbound(session, (mailbox) =>
+    withCentralSync(
+      () =>
+        withQuietInvalidationSync(session.id, () =>
+          mailbox.dispatchTaskEvent({
+            contextKey,
+            eventKey,
+            retryOf,
+            prompt,
+            originSessionId: ctx.caller === 'agent' ? ctx.sessionId : null,
+            ...routing,
+            muteChat: bool(args.mute_chat),
+            quietStatus: bool(args.quiet_status),
+          }),
+        ),
+      'ncl tasks dispatch',
+    ),
+  );
+  if (!admitted) throw new Error('task session mailbox unavailable');
+  if (routing.platformId !== null && session.task_routing_platform_id !== routing.platformId) {
+    await setTaskRoutingPlatformId(session.id, routing.platformId);
+  }
+  if (admitted.admission === 'inserted')
+    await writeAudit({
+      actor: actorFor(ctx),
+      action: 'create',
+      agentGroupId: group,
+      sessionId: session.id,
+      seriesId: admitted.seriesId,
+      after: prompt,
+      detail: { dispatch: { contextKey, eventKey, retryOf: retryOf ?? null, attempt: admitted.attempt } },
+    });
+  return {
+    admission: admitted.admission,
+    row_id: admitted.rowId,
+    series_id: admitted.seriesId,
+    session_id: session.id,
+    agent_group_id: group,
+    status: admitted.status,
+    attempt: admitted.attempt,
+    ...(note ? { routing_note: note } : {}),
+  };
+}
+
 /**
  * Append one host-timestamped line to a task's run log
  * (`<GROUPS_DIR>/<folder>/tasks/<series>.md`). This is NOT a delivery — it writes
@@ -514,6 +575,8 @@ async function listTasks(args: Record<string, unknown>, ctx: CallerContext) {
 async function getTask(args: Record<string, unknown>, ctx: CallerContext) {
   const id = taskId(args);
   for (const session of await selectedSessions(args, ctx)) {
+    const settlementRequested = bool(args.settlement) || bool(args.observer_settlement);
+    const settlementSession = settlementRequested ? await getSession(session.id) : undefined;
     const found = await withInbound(session, (mailbox) => {
       const row = mailbox.getCliTaskRow(id);
       if (!row) return undefined;
@@ -528,6 +591,15 @@ async function getTask(args: Record<string, unknown>, ctx: CallerContext) {
         completed_runs: stats.runs,
         failed_runs: stats.failed_runs,
         seriesKey,
+        ...(settlementRequested
+          ? {
+              settlement: mailbox.readTaskSettlement(
+                row.row_id,
+                settlementSession?.thread_id ?? null,
+                bool(args.observer_settlement),
+              ),
+            }
+          : {}),
       };
     });
     if (found) {
@@ -1486,8 +1558,56 @@ registerResource({
           description: 'Agent group id (host callers; auto-filled to your own group inside a container).',
         },
         { name: 'session', type: 'string', description: 'Limit to one task session id.' },
+        {
+          name: 'settlement',
+          type: 'boolean',
+          description: 'Include host-owned execution/outcome settlement facts; unknown must defer.',
+        },
+        {
+          name: 'observer_settlement',
+          type: 'boolean',
+          description:
+            'Legacy recurring observer cutover: exclude only its own future inert recurrence; all owned follow-ups still block.',
+        },
       ],
       handler: async (args, ctx) => getTask(args, ctx),
+    },
+    dispatch: {
+      access: 'open',
+      description:
+        'Admit an immediate event exactly once within an isolated context. Identical retries return the original admission; changed content or routing rejects. New context keys create fresh sessions. Admission is not successful work. Retain rows/sessions while keys can replay; manual deletion invalidates dedupe. Only failed or expired events may recover, at most twice, using --retry-of.',
+      args: [
+        {
+          name: 'context_key',
+          type: 'string',
+          required: true,
+          description: 'Stable bounded phase or observation key.',
+        },
+        { name: 'event_key', type: 'string', required: true, description: 'Stable event key within this context.' },
+        {
+          name: 'retry_of',
+          type: 'string',
+          description: 'Failed or expired predecessor event key; never use for a completed event.',
+        },
+        {
+          name: 'prompt',
+          type: 'string',
+          required: true,
+          description: 'Bounded current brief, up to 64000 characters.',
+        },
+        {
+          name: 'group',
+          type: 'string',
+          description: 'Host target group; agent callers are scoped to their own group.',
+        },
+        { name: 'thread', type: 'boolean', description: 'Bind the calling agent session thread.' },
+        { name: 'isolated', type: 'boolean', description: 'No implicit output destination.' },
+        { name: 'mute_chat', type: 'boolean', description: 'Disable chat sends for internal phases.' },
+        { name: 'quiet_status', type: 'boolean', description: 'Disable streaming status posts.' },
+        { name: 'messaging_group', type: 'string', description: 'Host-only output messaging group.' },
+        { name: 'thread_id', type: 'string', description: 'Host-only output thread, with --messaging-group.' },
+      ],
+      handler: async (args, ctx) => dispatchTask(args, ctx),
     },
     create: {
       access: 'open',

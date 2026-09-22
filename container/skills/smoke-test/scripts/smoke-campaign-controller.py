@@ -1215,7 +1215,34 @@ class EffectLayer:
             write_contained_atomic(root, [run_id, "controller", "wake.json"],
                                    json.dumps(c["wake"], sort_keys=True, indent=1) + "\n")
         write_contained_atomic(root, [run_id, "controller", "brief-{}.md".format(step)], head + body + "\n")
+        if effect.get("dispatchEvent"):
+            prompt = ("Run one bounded QA phase in this fresh coordinator context. Read /app/skills/smoke-test/SKILL.md "
+                      "and /app/skills/smoke-test/references/controller-phase-owner.md before work. "
+                      "Campaign records carry prior findings; never recreate an accepted phase. "
+                      "Keep one native qa-smoke-worker through this phase's build/test/repair. "
+                      "The controller alone publishes campaign status/verdicts. No chat or GitHub sends.\n\n" + head + body)
+            argv = self.ncl + ["tasks", "dispatch", "--context-key", "smoke/{}/{}".format(run_id, step),
+                               "--event-key", effect["dispatchEvent"], "--prompt", prompt,
+                               "--isolated", "--mute-chat", "--quiet-status", "--json"]
+            if effect.get("retryOf"):
+                argv += ["--retry-of", effect["retryOf"]]
+            rc, out, err = self._run(argv, 40)
+            doc = last_json_line(out) if rc is not None else None
+            data = doc.get("data") if isinstance(doc, dict) and doc.get("ok") is True else None
+            if isinstance(data, dict) and data.get("admission") in ("inserted", "replay") and \
+                    data.get("row_id") and data.get("session_id"):
+                return {"outcome": "admitted", "dispatch": dict(data, eventKey=effect["dispatchEvent"])}
+            return {"outcome": "unknown", "error": str((doc or {}).get("error") or err or "dispatch unavailable")[:300]}
         return {"outcome": "brief_written", "brief": os.path.join(run, "controller", "brief-{}.md".format(step))}
+
+    def owner_status(self, receipt):
+        """Only the host can read another task session's execution state."""
+        if self.mode != "live":
+            return None
+        rc, out, _ = self._run(self.ncl + ["tasks", "get", "--id", receipt["row_id"],
+                                         "--session", receipt["session_id"], "--settlement", "--json"], 20)
+        doc = last_json_line(out) if rc is not None else None
+        return doc.get("data") if isinstance(doc, dict) and doc.get("ok") is True else None
 
 
 def frozen_terminal_verb(detail):
@@ -1523,6 +1550,13 @@ class Controller:
         self.alarms = []
         self.step_errors = []  # steps whose outcome was not on the allowlist
         self.owner_wakes = []
+        self.owner_cutover = self._load_json_arg(getattr(args, "owner_dispatch_cutover_json", None), None)
+        if self.owner_cutover is not None:
+            if not isinstance(self.owner_cutover, dict) or not isinstance(self.owner_cutover.get("enabled"), bool) or \
+                    not isinstance(self.owner_cutover.get("legacyRuns"), list):
+                raise ControllerError("owner dispatch cutover must declare enabled and enumerate legacyRuns")
+            if not self.owner_cutover["enabled"]:
+                self.owner_cutover = None
         # Obligation keys whose intent THIS process journaled and has not yet
         # attempted. Never inferred from the journal: an intent that existed
         # when the process started may have been attempted by a fire that died
@@ -1934,11 +1968,80 @@ class Controller:
         self.record(run_id, "dispatch", slot, "intent", 1, {"outcome": "unknown", "error": result.get("error")})
         return "intent"
 
+    def _owner_route(self, run_id):
+        claim = self.obligations().get(obligation_key(run_id, "run", "claim"))
+        if not claim:
+            return "legacy"
+        route = claim["detail"].get("ownerRoute")
+        if route:
+            return route
+        if not self.live or self.owner_cutover is None:
+            return "legacy"
+        already_owned = any(o["runId"] == run_id and o["kind"] == "owner" for o in self.obligations().values())
+        route = "legacy" if run_id in self.owner_cutover["legacyRuns"] or already_owned else "phase-dispatch"
+        self.record(run_id, "run", "claim", claim["state"], detail={"ownerRoute": route})
+        return route
+
+    def _phase_owner_step(self, run_id, phase, step, done):
+        ob = self.obligations().get(obligation_key(run_id, "owner", step))
+        if ob and ob["state"] in ("done", "abandoned", "failed_terminal"):
+            return ob["state"]
+        if done and not ob:
+            return "done"  # no dispatched owner to settle; existing artifact barrier accepted this phase
+        # An accepted next phase never overlaps a retained worker from the previous one.
+        for prior in self.obligations().values():
+            if prior["runId"] != run_id or prior["kind"] != "owner" or prior["slot"] == step or prior["state"] != "enqueued":
+                continue
+            receipt = prior["detail"].get("dispatch")
+            status = self.effects.owner_status(receipt) if receipt else None
+            if not status or status.get("settlement", {}).get("state") != "settled":
+                self.decide(run_id, phase, "wait", "wait", "previous phase owner is not settled", step=prior["slot"])
+                return "intent"
+            self.record(run_id, "owner", prior["slot"], "done", detail={"checkpoint": status["settlement"]})
+        event, retry_of = "initial", None
+        if ob and ob["detail"].get("dispatch"):
+            receipt = ob["detail"]["dispatch"]
+            status = self.effects.owner_status(receipt)
+            settled = status.get("settlement", {}) if status else {}
+            if done and settled.get("state") == "settled":
+                accepted = {"intake": "completion-contract.json", "lanes": "lanes evidence barrier",
+                            "preliminary": "coordinator/preliminary.md", "synthesis": "synthesis.json",
+                            "adjudicated": "synthesis.json"}
+                self.record(run_id, "owner", step, "done", detail={"checkpoint": settled,
+                            "acceptedCheck": accepted.get(step, step)})
+                return "done"
+            failed = status and (status.get("status") in ("failed", "expired") or
+                                  (status.get("status") == "completed" and settled.get("outcome") == "error"))
+            if failed and settled.get("executionSettled") is True and receipt.get("attempt", 0) < 2:
+                retry_of = receipt["eventKey"]
+                event = "recovery-{}".format(receipt.get("attempt", 0) + 1)
+            else:
+                if settled.get("state") == "settled" and not done:
+                    self.ensure_alarm(run_id, "controller_owner_checkpoint_missing", "owner-checkpoint:{}".format(step),
+                                      {"step": step, "rowId": receipt["row_id"]})
+                started = parse_iso(ob["history"][0].get("at"))
+                if started and (self.now - started).total_seconds() > OWNER_STEP_SLA_SECONDS:
+                    self.ensure_alarm(run_id, "controller_obligation_overdue", "owner-dispatch:{}".format(step),
+                                      {"step": step, "rowId": receipt["row_id"], "status": status.get("status") if status else "unknown"})
+                self.decide(run_id, phase, "wait", "wait", "phase owner in flight or requires disposition", step=step)
+                return "intent"
+        if not ob:
+            self.record(run_id, "owner", step, "intent", 1)
+        result = self.effects.perform({"type": "owner_wake", "runId": run_id, "step": step,
+                                       "dispatchEvent": event, "retryOf": retry_of})
+        if result.get("outcome") == "admitted":
+            self.record(run_id, "owner", step, "enqueued", 1, {"outcome": "admitted", "dispatch": result["dispatch"]})
+        else:
+            self.decide(run_id, phase, "wait", "wait", "dispatch outcome unknown; replay same event", step=step)
+        return "enqueued" if result.get("outcome") == "admitted" else "intent"
+
     def owner_step(self, run_id, phase, step, done):
         """Judgment step for the retained owner. The wake is an effect: live
         writes <run>/controller/brief-<step>.md and the wrapper returns
         wakeAgent:true with {step, runId, brief}; shadow refuses it. A bare
         intent (a fire that died before the brief) is re-offered."""
+        if self._owner_route(run_id) == "phase-dispatch":
+            return self._phase_owner_step(run_id, phase, step, done)
         key = obligation_key(run_id, "owner", step)
         ob = self.obligations().get(key)
         brief = "controller/brief-{}.md".format(step)
@@ -2294,7 +2397,8 @@ class Controller:
                 self.decide(run_id, "intake", "escalate", "coordination_model",
                             "completion contract unreadable: {}".format(run.contract_error))
             return "intake"
-        self.owner_step(run_id, "intake", "intake", done=True)
+        if self.owner_step(run_id, "intake", "intake", done=True) != "done":
+            return "intake"
 
         if run.isdir("contact-sheet"):
             # The root post carries the critic's lines (PRP step 3), so it waits
@@ -2347,7 +2451,8 @@ class Controller:
         if not early_err and isinstance(early, dict) and early.get("verdict") in ("BLOCKED", "HUMAN_DECISION"):
             verdict, failed = validate_synthesis(run, claim.get("sha"), self.pr_heads.get(str(pr)),
                                                  {"ready": False}, run.last_identity_check())
-            self.owner_step(run_id, "synthesis", "synthesis", done=True)
+            if self.owner_step(run_id, "synthesis", "synthesis", done=True) != "done":
+                return "synthesis"
             return self.pre_finish(run_id, pr, verdict, failed, early)
 
         lanes = run.barrier("lanes")
@@ -2363,7 +2468,8 @@ class Controller:
                             "lane evidence invalid (redispatch is a judgment call)",
                             invalid=lanes.get("invalid"), reasons=(lanes.get("invalidReasons") or [])[:3])
             return "lanes"
-        self.owner_step(run_id, "lanes", "lanes", done=True)
+        if self.owner_step(run_id, "lanes", "lanes", done=True) != "done":
+            return "lanes"
 
         if not run.has("coordinator/preliminary.md"):
             timed = self._maybe_challenger_timeout(run_id, claim, run)
@@ -2371,7 +2477,8 @@ class Controller:
                 return timed
             self.owner_step(run_id, "preliminary", "preliminary", done=False)
             return "preliminary"
-        self.owner_step(run_id, "preliminary", "preliminary", done=True)
+        if self.owner_step(run_id, "preliminary", "preliminary", done=True) != "done":
+            return "preliminary"
 
         if not run.has("challenger/disposition.md"):
             timed = self._maybe_challenger_timeout(run_id, claim, run)
@@ -2398,7 +2505,8 @@ class Controller:
             self.owner_step(run_id, "synthesis", "synthesis", done=False)
             adj = self._adjudication(run_id, run)
             return adj or "synthesis"
-        self.owner_step(run_id, "synthesis", "synthesis", done=True)
+        if self.owner_step(run_id, "synthesis", "synthesis", done=True) != "done":
+            return "synthesis"
         self._adjudication(run_id, run)
 
         head = self.pr_heads.get(str(pr))
@@ -2733,6 +2841,8 @@ def main(argv=None):
         s.add_argument("--lock-timeout", type=float, default=30.0)
         # live only
         s.add_argument("--cutover-json")
+        s.add_argument("--owner-dispatch-cutover-json", default=env("SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON"),
+                       help="opt-in boundary {enabled:true,legacyRuns:[...]}; active campaigns retain their route")
         s.add_argument("--repo", default=env("SMOKE_GATE_REPO"))
         s.add_argument("--send-to", default=env("SMOKE_CONTROLLER_SEND_TO"))
         s.add_argument("--gate-cmd", default=env("SMOKE_CONTROLLER_GATE_CMD"))
