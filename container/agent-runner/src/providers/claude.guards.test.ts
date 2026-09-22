@@ -575,8 +575,8 @@ describe('E3 createEmailGateHook', () => {
       // Only the stdin wrap: no unset prefix, no credential.
       expect(rewritten).toBe(wrapDevNullStdin(emailCommand));
       expect(rewritten).not.toContain('ANTHROPIC_API_KEY');
-      // The gate evaluates the command as the agent typed it: the rewrite is
-      // registered LAST, so no guard ever sees the wrapper.
+      // The gate evaluates the command as the agent typed it: the CLI hands
+      // every hook the original input, so no guard ever sees the wrapper.
 
       // dry-run → bypass (allow, no staging)
       const dry = await runBashHook(createEmailGateHook(), emailCommand);

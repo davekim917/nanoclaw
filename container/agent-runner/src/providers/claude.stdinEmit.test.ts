@@ -8,16 +8,20 @@
  *
  * INVARIANT: the `exec </dev/null` stdin prefix is a transport detail that no
  * guard may ever see. It is applied on the CLAUDE path only — the Codex chain
- * applies none (codex-hooks/runner.ts). On the Claude SDK path the Bash
- * PreToolUse list IS the chain (the CLI merges it), so the single emit point
- * is the rewrite hook registered LAST with `closeStdin: true`.
+ * applies none (codex-hooks/runner.ts). On the Claude SDK path the single emit
+ * point is the rewrite hook with `closeStdin: true`, the only hook in the Bash
+ * PreToolUse list that returns `updatedInput`.
  *
- * We cannot read how the CLI merges several hooks' `updatedInput`. This test
- * therefore runs the provider's REAL registered Bash hook list under the
- * strictest reading — each hook receives the previous hook's `updatedInput` —
- * and asserts that every guard still saw the command exactly as the agent
- * typed it. Under the other reading (every hook sees the original input) the
- * guards see raw text trivially.
+ * How the CLI actually dispatches, read from its binary at SDK 0.3.280 (logic
+ * unchanged from 0.3.272): all of these hooks share one tier (only
+ * policySettings hooks run in an earlier one), whose hooks run CONCURRENTLY,
+ * every one on the same `hookInput`; the fold keeps the last `updatedInput` to
+ * complete. So in production no guard can see the prefix whatever the order.
+ * This test deliberately models something STRICTER — it threads each hook's
+ * `updatedInput` into the next, in list order — over the provider's REAL
+ * registered list, and asserts every guard still saw the command exactly as
+ * the agent typed it. Passing the stricter model implies the real one; that is
+ * why the rewrite stays registered last even though position orders nothing.
  */
 import { describe, it, expect, mock, spyOn, beforeEach, afterEach } from 'bun:test';
 import fs from 'node:fs';
@@ -82,7 +86,7 @@ async function runChained(hooks: HookCallback[], command: string) {
   return { seen, final: String(toolInput.command), denied };
 }
 
-describe('(iii) Claude registration: the stdin prefix is emitted last and never seen by a guard', () => {
+describe('(iii) Claude registration: one emitter, and no guard ever sees the stdin prefix', () => {
   const saved: Record<string, string | undefined> = {};
   let writeSpy: ReturnType<typeof spyOn> | undefined;
   beforeEach(() => {

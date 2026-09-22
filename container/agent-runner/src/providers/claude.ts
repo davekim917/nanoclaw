@@ -1174,10 +1174,16 @@ export function wrapJestSerialized(command: string): string {
  * The email gate's bypass check fails closed on `<` and newlines, so a guard
  * reading `exec </dev/null\n…` would turn a harmless `--dry-run` into an
  * hour-long approval wait. It is applied on the CLAUDE PATH ONLY, once:
- *   • Claude SDK: this hook with `closeStdin: true`, registered LAST in the
- *     Bash PreToolUse list — the one emit point. One hook emits both rewrites,
- *     because the CLI's merge of several `updatedInput`s is not something we
- *     can read; a second emitter could clobber the jest rewrite last-write-wins.
+ *   • Claude SDK: this hook with `closeStdin: true`, the ONLY hook in the Bash
+ *     PreToolUse list returning `updatedInput` — the one emit point. Read from
+ *     the CLI binary at SDK 0.3.280 (logic unchanged from 0.3.272): all of our
+ *     hooks share one tier (only policySettings hooks run in an earlier tier,
+ *     and may rewrite the input first), whose hooks run CONCURRENTLY (a
+ *     Promise.race merge), each on the same `hookInput`, never reassigned; the
+ *     fold keeps the last `updatedInput` to COMPLETE. So list position orders
+ *     neither execution nor merge: safety is one emitter plus unmodified input.
+ *     A second emitter would race this one. It sits last only for
+ *     claude.stdinEmit.test.ts, whose threaded model is stricter.
  *   • Codex (runPreToolUseChain): this hook WITHOUT `closeStdin`, first, so
  *     guards see the jest rewrite. That chain applies NO prefix anywhere (the
  *     fd-0 condition is the Claude Bash tool's, header above), so none reaches
@@ -2960,11 +2966,10 @@ export class ClaudeProvider implements AgentProvider {
           PreToolUse: [
             {
               matcher: 'Bash',
-              // Order matters: every guard runs on the command as the agent
-              // wrote it, and the rewrite (the only hook returning
-              // updatedInput, and the ONLY emit point for the stdin prefix in
-              // any chain) runs LAST — see createBashCommandRewriteHook's
-              // INVARIANT. The prefix must never be visible to a guard.
+              // List position does NOT order execution: the CLI runs these
+              // concurrently, each on the original input, so no guard sees the
+              // prefix. The rewrite must stay the ONLY hook returning
+              // updatedInput — see createBashCommandRewriteHook's INVARIANT.
               hooks: [
                 createManagedGitMaintenanceHook(),
                 createSelfApprovalBlockHook(),
