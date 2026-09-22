@@ -200,14 +200,23 @@ env_value() { # <key> -- "=<value>" for the last accepted literal, else empty.
   sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$1=('([^']*)'|\"([^\"\$\`\\\\]*)\"|([^[:space:]'\"\$\`\\\\;&|<>()]*))[[:space:]]*(#.*)?\$/=\3\4\5/p" \
     "$ENV_FILE" 2>/dev/null | tail -n 1
 }
-if [ -f "$ENV_FILE" ] && grep -Eq '\bSMOKE_GATE_CLAIMANT\b' "$ENV_FILE" 2>/dev/null; then
+ENV_NAMES_ALL="$(env_names)"
+case "
+$ENV_NAMES_ALL
+" in
+  *"
+SMOKE_GATE_CLAIMANT
+"*)
   # The gate wrapper sources this file for every caller, so a claimant in it
   # would override the one this tick passes per call -- and would stamp the
   # legacy coordinator's calls as the controller's. Same refusal as the live
   # worker (smoke-controller-live-worker.py, the SMOKE_GATE_CLAIMANT branch of
   # load_config and the end_fire it feeds).
-  final misconfigured "the env file names SMOKE_GATE_CLAIMANT; nothing renewed"
-fi
+  # Read the assignment/unset names, not warning comments mentioning the key.
+  # Capture before matching: grep -q under pipefail can hide a producer SIGPIPE.
+  final misconfigured "the env file assigns SMOKE_GATE_CLAIMANT; nothing renewed"
+  ;;
+esac
 # CONFIG NEVER TOUCHES THIS SHELL'S OWN VARIABLES. It is collected into a map
 # that becomes the GATE CALL's environment and nothing else. `export
 # "$key=$value"` here would let the env file rename this script's internals --
@@ -296,7 +305,9 @@ JOURNAL_TORN_TAIL=0
 JQ_ERR="$(mktemp "${TMPDIR:-/tmp}/smoke-renew-jq.XXXXXX" 2>/dev/null)" || JQ_ERR=/dev/null
 trap 'rm -f -- "$JQ_ERR" 2>/dev/null || true' EXIT
 
-CANDIDATES="$(jq -cRn --argjson now "$NOW_EPOCH" --argjson torn "$JOURNAL_TORN_TAIL" '
+# jq 1.6 date parsing is affected by DST in the process timezone. Journal
+# timestamps are UTC; localize the correction to this reader, not gate calls.
+CANDIDATES="$(TZ=UTC jq -cRn --argjson now "$NOW_EPOCH" --argjson torn "$JOURNAL_TORN_TAIL" '
   # The controller records exactly these states for the two kinds this tick
   # reads (smoke-campaign-controller.py record() call sites for kind "run" and
   # kind "owner"). Anything else is a journal this tick does not understand,
