@@ -1,4 +1,7 @@
 {
   "onecli-gateway": "1.36.0",
-  "onecli-cli": "2.2.5"
+  "onecli-cli": "2.2.5",
+  "claude-code": "2.1.280",
+  "claude-agent-sdk": "0.3.280",
+  "codex-cli": "0.155.1"
 }
