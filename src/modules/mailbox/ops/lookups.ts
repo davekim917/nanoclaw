@@ -138,6 +138,7 @@ export interface RecoverableLifecycleStatus {
   channelType: string;
   platformId: string;
   threadId: string | null;
+  inReplyTo: string | null;
   platformMessageId: string;
 }
 
@@ -154,7 +155,7 @@ export function getRecoverableLifecycleStatus(
   const isDelivered = inbound.prepare("SELECT 1 FROM delivered WHERE message_out_id = ? AND status = 'delivered'");
   const rows = outbound
     .prepare(
-      `SELECT id, seq, channel_type, platform_id, thread_id, content
+      `SELECT id, seq, channel_type, platform_id, thread_id, in_reply_to, content
        FROM messages_out
        WHERE kind = 'status'
          AND CASE WHEN json_valid(content) THEN json_extract(content, '$.reporting.purpose') END = 'liveness'
@@ -167,6 +168,7 @@ export function getRecoverableLifecycleStatus(
     channel_type: string | null;
     platform_id: string | null;
     thread_id: string | null;
+    in_reply_to: string | null;
     content: string;
   }>;
   for (const row of rows) {
@@ -192,6 +194,7 @@ export function getRecoverableLifecycleStatus(
       channelType: row.channel_type,
       platformId: row.platform_id,
       threadId: row.thread_id,
+      inReplyTo: row.in_reply_to,
       platformMessageId: deliveryReceipt.platform_message_id,
     };
   }

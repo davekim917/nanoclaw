@@ -449,6 +449,25 @@ export interface AgentQuery {
    * the entire point, and silence reads as the latter.
    */
   readonly resolvedModel: string;
+
+  /**
+   * The effort this query actually RUNS at, after the provider's own
+   * precedence chain and any safety clamp — never what the turn requested.
+   *
+   * REQUIRED for the same reason `resolvedModel` is, and the comment above
+   * applies verbatim: an optional field is a forgettable one. The status
+   * subtext read `querySettings.effort` (the `-e` flag) and was wrong twice
+   * over — a group carrying its effort in `container.json` requests nothing,
+   * so the line showed no effort at all, and a sticky effort the model does
+   * not support is clamped away, so the line showed a level the turn never
+   * ran at. Both are the "asserting a stale value as current" failure this
+   * feature exists to prevent.
+   *
+   * `null` is a legitimate answer meaning "this turn runs with no effort
+   * setting" (a model family with no effort notion, or a clamp to nothing) —
+   * it is a stated known-nothing, distinct from a field nobody wired up.
+   */
+  readonly resolvedEffort: string | null;
 }
 
 /**

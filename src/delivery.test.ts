@@ -29,6 +29,7 @@ const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-delivery'
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
 import { getDeliveredIds } from './modules/mailbox/ops/delivery.js';
+import { completeAnsweredPendingRows } from './modules/mailbox/ops/sweep.js';
 import { resolveSession, resolveTaskSession, withMailboxSession, writeSessionMessage } from './session-manager.js';
 import { openInboundDb as openInboundDbAt } from './modules/mailbox/openers.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
@@ -678,7 +679,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
         'status',
         channelType,
         'discord:guild-1:channel-1',
-        { text: 'first' },
+        { text: 'first', reporting: { version: 1, purpose: 'liveness', state: 'working' } },
         'thread-1',
         'turn-1',
       );
@@ -691,7 +692,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
         'status',
         channelType,
         'discord:guild-1:channel-1',
-        { text: 'second' },
+        { text: 'second', reporting: { version: 1, purpose: 'progress' } },
         'thread-1',
         'turn-1',
       );
@@ -699,7 +700,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
 
       expect(calls).toHaveLength(3);
       expect(calls[1]).toMatchObject({ operation: 'edit', messageId: 'status-1', text: 'second' });
-      expect(calls[2]).toEqual({ text: 'second' });
+      expect(calls[2]).toMatchObject({ text: 'second' });
       expect(deletes).toEqual(['status-1']);
 
       insertOutboundKind(
@@ -709,7 +710,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
         'status',
         channelType,
         'discord:guild-1:channel-1',
-        { text: 'third' },
+        { text: 'third', reporting: { version: 1, purpose: 'progress' } },
         'thread-1',
         'turn-1',
       );
@@ -721,6 +722,21 @@ describe('deliverSessionMessages — concurrent invocations', () => {
       inDb.close();
       expect(delivered.has('status-2')).toBe(true);
       expect(delivered.has('status-3')).toBe(true);
+
+      _resetStatusTrackingForTest();
+      insertOutboundKind(
+        'ag-1',
+        session.id,
+        'final-reply',
+        'chat',
+        channelType,
+        'discord:guild-1:channel-1',
+        { text: 'Done.' },
+        'thread-1',
+        'turn-1',
+      );
+      await deliverSessionMessages(session);
+      expect(deletes).toEqual(['status-1', 'status-2']);
     },
   );
 
@@ -916,6 +932,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     // session. For a spawn-child session, delivery should suppress it.
     insertOutboundKind('ag-1', session.id, 'thinking-1', 'status', 'telegram', 'telegram:123', {
       text: '> 💭 reading the brief...',
+      reporting: { version: 1, purpose: 'progress' },
     });
 
     const calls: Array<{ kind: string }> = [];
@@ -1427,12 +1444,13 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     sessionId: string,
     msgId: string,
     content: Record<string, unknown>,
+    inReplyTo: string | null = null,
   ): void {
     const db = new Database(outboundDbPath(agentGroupId, sessionId));
     db.prepare(
       `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, in_reply_to, content)
-       VALUES (?, ?, 'task_log', NULL, NULL, NULL, NULL, ?)`,
-    ).run(msgId, now(), JSON.stringify(content));
+       VALUES (?, ?, 'task_log', NULL, NULL, NULL, ?, ?)`,
+    ).run(msgId, now(), inReplyTo, JSON.stringify(content));
     db.close();
   }
 
@@ -1483,6 +1501,44 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     await deliverSessionMessages(session);
 
     expect((await outcomeRows()).map((r) => r.outcome)).toEqual(['ok']);
+  });
+  it('keeps correlated internal phase outcomes private and leaves unrelated inbound work pending', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveTaskSession('ag-1', 'phase-1');
+    const inbound = new Database(inboundDbPath('ag-1', session.id));
+    inbound
+      .prepare(
+        `INSERT INTO messages_in(id,seq,kind,timestamp,status,trigger,content) VALUES
+         ('human-unrelated',2,'chat',?,'pending',1,'{}'),
+         ('event-one',4,'task',?,'pending',1,'{}')`,
+      )
+      .run(now(), now());
+    insertTaskLog(
+      'ag-1',
+      session.id,
+      'phase-log',
+      { text: 'phase artifacts accepted', auto: true, taskMessageIds: ['event-one'] },
+      'event-one',
+    );
+    const deliver = vi.fn().mockResolvedValue('unexpected-public-post');
+    setDeliveryAdapter({ deliver });
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    const outbound = new Database(outboundDbPath('ag-1', session.id));
+    try {
+      // Exercise the consumer that uses in_reply_to to complete answered work,
+      // including a positive control proving this is not a no-op sweep.
+      expect(completeAnsweredPendingRows(inbound, outbound)).toEqual(['event-one']);
+      expect(completeAnsweredPendingRows(inbound, outbound)).toEqual([]);
+    } finally {
+      outbound.close();
+    }
+    expect(deliver).not.toHaveBeenCalled();
+    expect(await outcomeRows()).toHaveLength(1);
+    expect(inbound.prepare("SELECT status FROM messages_in WHERE id='human-unrelated'").get()).toEqual({
+      status: 'pending',
+    });
+    inbound.close();
   });
 
   it('ignores a mid-run append-log note — only the end-of-run summary is a fire', async () => {
@@ -3456,7 +3512,7 @@ describe('per-work-item outcome delivery', () => {
     });
   });
 
-  it('keeps old untyped status public, suppresses typed narration, and recovers typed liveness after host memory loss', async () => {
+  it('keeps old untyped status public, suppresses typed progress without a lifecycle line, and recovers typed liveness', async () => {
     const session = await prepare();
     const deliver = vi
       .fn()
@@ -3489,30 +3545,112 @@ describe('per-work-item outcome delivery', () => {
     });
   });
 
-  it('removes a durable typed liveness row when a reply lands after host memory loss', async () => {
+  it('edits one recovered lifecycle line for repeated progress and removes it when the permanent reply lands', async () => {
     const session = await prepare();
-    const deliver = vi.fn().mockResolvedValueOnce('lifecycle-status').mockResolvedValueOnce('public-reply');
+    const deliver = vi
+      .fn()
+      .mockResolvedValueOnce('lifecycle-status')
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce('public-reply');
     const deleteMessage = vi.fn().mockResolvedValue(undefined);
     setDeliveryAdapter({ deliver, deleteMessage });
-    insertOutboundKind('ag-1', session.id, 'lifecycle', 'status', 'telegram', 'telegram:123', {
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'lifecycle',
+      'status',
+      'telegram',
+      'telegram:123',
+      { text: 'Accepted · working', reporting: { version: 1, purpose: 'liveness', state: 'working' } },
+      null,
+      'human-request-1',
+    );
+    await deliverSessionMessages(session);
+
+    _resetStatusTrackingForTest();
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'wrong-turn-progress',
+      'status',
+      'telegram',
+      'telegram:123',
+      { text: '> 💭 Belongs to another turn.', reporting: { version: 1, purpose: 'progress' } },
+      null,
+      'human-request-2',
+    );
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
+
+    _resetStatusTrackingForTest();
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'wrong-thread-progress',
+      'status',
+      'telegram',
+      'telegram:123',
+      { text: '> 💭 Belongs to another thread.', reporting: { version: 1, purpose: 'progress' } },
+      'other-thread',
+      'human-request-1',
+    );
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
+
+    _resetStatusTrackingForTest();
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'progress-1',
+      'status',
+      'telegram',
+      'telegram:123',
+      { text: '> 💭 Inspecting the delivery path.', reporting: { version: 1, purpose: 'progress' } },
+      null,
+      'human-request-1',
+    );
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'progress-2',
+      'status',
+      'telegram',
+      'telegram:123',
+      { text: '> 🔧 Running focused checks.', reporting: { version: 1, purpose: 'progress' } },
+      null,
+      'human-request-1',
+    );
+    await deliverSessionMessages(session);
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'reply',
+      'chat',
+      'telegram',
+      'telegram:123',
+      { text: 'The requested answer.', reporting: { version: 1, purpose: 'reply' } },
+      null,
+      'human-request-1',
+    );
+    await deliverSessionMessages(session);
+
+    expect(deliver).toHaveBeenCalledTimes(4);
+    expect(JSON.parse(deliver.mock.calls[0]![4])).toEqual({
       text: 'Accepted · working',
       reporting: { version: 1, purpose: 'liveness', state: 'working' },
     });
-    await deliverSessionMessages(session);
-    for (let index = 0; index < 40; index++) {
-      insertOutboundKind('ag-1', session.id, `progress-${index}`, 'status', 'telegram', 'telegram:123', {
-        text: `Internal progress ${index}`,
-        reporting: { version: 1, purpose: 'progress' },
-      });
-    }
-    await deliverSessionMessages(session);
-    _resetStatusTrackingForTest();
-    insertOutboundKind('ag-1', session.id, 'reply', 'chat', 'telegram', 'telegram:123', {
-      text: 'The requested answer.',
-      reporting: { version: 1, purpose: 'reply' },
+    expect(JSON.parse(deliver.mock.calls[1]![4])).toEqual({
+      operation: 'edit',
+      messageId: 'lifecycle-status',
+      text: '> 💭 Inspecting the delivery path.',
     });
-    await deliverSessionMessages(session);
-    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(deliver.mock.calls[2]![4])).toEqual({
+      operation: 'edit',
+      messageId: 'lifecycle-status',
+      text: '> 🔧 Running focused checks.',
+    });
+    expect(JSON.parse(deliver.mock.calls[3]![4])).toMatchObject({ text: 'The requested answer.' });
     expect(deleteMessage).toHaveBeenCalledWith('telegram', 'telegram:123', null, 'lifecycle-status', 'telegram');
   });
 

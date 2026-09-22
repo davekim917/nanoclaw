@@ -679,8 +679,8 @@ PY
 # --- structure: only final() writes to the runner's stdout -------------------------
 [ "$(grep -c '>&3' "$W")" = "$(sed -n '/^final() {/,/^}/p' "$W" | grep -c '>&3')" ] \
   || fail "every fd-3 write must be inside final()"
-[ "$(sed -n '/^final() {/,/^}/p' "$W" | grep -c '>&3')" = 3 ] \
-  || fail "final() writes fd 3 in exactly three places: the jq render and its two fail_json fallbacks"
+# The number of branches is not a contract; every exercised path above asserts
+# exactly one final JSON line, and the opt-in dispatch-failure path below asserts none.
 grep -q "exec 3>&1 1>&2" "$W" || fail "stdout must be moved to fd 3 before anything runs"
 # Renderings of a true wake ({wakeAgent:true ...} in jq, "wakeAgent":true in
 # fail_json's printf), comments excluded: all of them live in final() or in
@@ -935,5 +935,40 @@ fire
 [ "$(d .failure)" = null ] || fail "an unset in the env file must not fail the fire: $OUTPUT"
 ! has_genv SMOKE_GATE_LEASE_DIR || fail "unset SMOKE_GATE_LEASE_DIR did not clear it"
 ! has_genv SMOKE_GATE_LABEL || fail "unset SMOKE_GATE_LABEL did not clear it"
+
+# Isolated failure routing uses the same real final-output path. Recording ncl
+# never starts a provider; a repeated cause/day admits one durable event.
+new_case isolated-failure
+echo 'export SMOKE_GATE_CLAIMANT=controller' >> "$C/env.sh"
+printf '{"enabled":true,"legacyRuns":[]}' > "$C/owner-cutover.json"
+cat > "$C/bin/ncl" <<'SH'
+#!/usr/bin/env python3
+import json, os, pathlib, sys
+p = pathlib.Path(os.environ['FAKE_STATE']) / 'failure-dispatch.json'
+args = sys.argv[1:]
+key = args[args.index('--context-key') + 1]
+prompt = args[args.index('--prompt') + 1]
+state = json.loads(p.read_text()) if p.exists() else {}
+replay = key in state
+if replay:
+    assert state[key] == prompt
+else:
+    state[key] = prompt
+p.write_text(json.dumps(state))
+print(json.dumps({'ok':True,'data':{'admission':'replay' if replay else 'inserted','row_id':'fake-event','status':'pending'}}))
+SH
+chmod +x "$C/bin/ncl"
+fire "PATH=$C/bin:$PATH" "SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON=$C/owner-cutover.json"
+[ "$WAKE" = false ] && [ "$(d .failureDispatch.admission)" = inserted ] || fail "failure was not admitted quietly: $OUTPUT"
+fire "PATH=$C/bin:$PATH" "SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON=$C/owner-cutover.json"
+[ "$WAKE" = false ] && [ "$(d .failureDispatch.admission)" = replay ] || fail "same failure must replay: $OUTPUT"
+[ "$(jq length "$C/fake/failure-dispatch.json")" = 1 ] || fail "repeated failure made another event"
+printf '#!/usr/bin/env bash\nexit 7\n' > "$C/bin/ncl"
+set +e
+env PATH="$C/bin:$PATH" SMOKE_CONTROLLER_ENV_FILE="$C/env.sh" \
+  SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON="$C/owner-cutover.json" bash "$W" > "$C/failed-output" 2> "$C/failed-error"
+failed_rc=$?
+set -e
+[ "$failed_rc" -ne 0 ] && [ ! -s "$C/failed-output" ] || fail "unproven admission must enter script backoff, never wake another parent"
 
 echo "smoke controller live wrapper tests passed"

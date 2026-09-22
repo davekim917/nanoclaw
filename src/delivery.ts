@@ -402,7 +402,7 @@ async function recoverLifecycleStatus(sessionId: string, outboundId?: string): P
     threadId: recovered.threadId,
     messageId: recovered.platformMessageId,
     instance: mg?.instance,
-    inReplyTo: null,
+    inReplyTo: recovered.inReplyTo,
     lifecycle: true,
   };
 }
@@ -1499,10 +1499,7 @@ async function deliverMessage(
   // spawn thread. Edit-in-place and the on-chat orphan delete are bypassed
   // so progress survives the final answer.
   if (msg.kind === 'status') {
-    // Suppress only rows whose emitting runner explicitly typed them as
-    // internal progress. A default-on host can coexist with preserved old
-    // runners: their untyped status rows keep the legacy public behavior.
-    if (content.reporting?.version === 1 && content.reporting?.purpose === 'progress') return { recordOnly: true };
+    const typedProgress = content.reporting?.version === 1 && content.reporting?.purpose === 'progress';
     if (!msg.channel_type || !msg.platform_id) {
       log.warn('Status message missing routing fields, dropping', { id: msg.id });
       return {};
@@ -1525,6 +1522,30 @@ async function deliverMessage(
         sessionId: session.id,
       });
       return {};
+    }
+    // Typed provider progress may update the deterministic activity line for
+    // this human turn, but it may never create a public narration stream of
+    // its own. The lifecycle row is written before the provider is invoked;
+    // durable recovery covers a host-memory reset between that post and the
+    // first progress event. Exact conversation + turn matching keeps task,
+    // sibling, and redirected traffic record-only.
+    if (typedProgress) {
+      let lifecycle = statusTracking.get(session.id);
+      if (!lifecycle) {
+        lifecycle = await recoverLifecycleStatus(session.id);
+        if (lifecycle) statusTracking.set(session.id, lifecycle);
+      }
+      if (
+        !lifecycle?.lifecycle ||
+        lifecycle.inReplyTo !== msg.in_reply_to ||
+        !sameConversation(lifecycle, {
+          channelType: msg.channel_type,
+          platformId: msg.platform_id,
+          threadId: msg.thread_id,
+        })
+      ) {
+        return { recordOnly: true };
+      }
     }
     // Turn-boundary reset. A status row carries its turn's batch anchor in
     // `in_reply_to`. If a tracked status belongs to a DIFFERENT turn than the
@@ -1613,16 +1634,37 @@ async function deliverMessage(
       // agent's send_message MCP tool can target a different channel/thread,
       // and using the wrong (channel, ts) pair on Slack's chat.delete could
       // delete an unrelated message if the timestamps happened to collide.
+      const lifecycleOwner = typedProgress && existing?.lifecycle ? existing : undefined;
       statusTracking.set(session.id, {
-        outboundId: msg.id,
+        outboundId: lifecycleOwner?.outboundId ?? msg.id,
         channelType: msg.channel_type,
         platformId: msg.platform_id,
         threadId: msg.thread_id,
         messageId: platformMsgId,
         instance: deliverInstance,
         inReplyTo: msg.in_reply_to,
-        lifecycle: content.reporting?.version === 1 && content.reporting?.purpose === 'liveness',
+        lifecycle:
+          lifecycleOwner?.lifecycle ?? (content.reporting?.version === 1 && content.reporting?.purpose === 'liveness'),
       });
+      // Discord can force an in-place activity line to be reposted after its
+      // edit cap. Keep the lifecycle receipt pointed at the replacement so a
+      // later host-memory recovery deletes the visible line, not its retired
+      // predecessor. This write is best-effort after platform success: a DB
+      // fault must not retry and duplicate the public post.
+      if (lifecycleOwner) {
+        try {
+          await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+            mailbox.markDelivered(lifecycleOwner.outboundId, platformMsgId),
+          );
+        } catch (err) {
+          log.warn('Activity repost succeeded but lifecycle receipt refresh failed', {
+            sessionId: session.id,
+            outboundId: lifecycleOwner.outboundId,
+            platformMsgId,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       if (content.reporting?.version === 1 && content.reporting?.purpose === 'liveness')
         lifecycleRecoveryMisses.delete(session.id);
     }

@@ -15,6 +15,7 @@ import {
   type MessageInRow,
 } from './db/messages-in.js';
 import { getConfig } from './config.js';
+import { clearContextTokens, setOwnConversation, setTurnSettings } from './turn-status.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { touchHeartbeat } from './heartbeat.js';
@@ -736,9 +737,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     clearCurrentLifecycleStatus();
     if (outcomeReportingEnabled() && !routing.taskRun && triggeringHumanLivenessInbound(keep) && !routing.quietStatus) {
       const lifecycleStatusId = generateId();
+      const lifecycleAnchor =
+        routing.channelType && routing.platformId
+          ? (getBatchAnchor(routing.channelType, routing.platformId) ?? routing.inReplyTo)
+          : routing.inReplyTo;
       await writeMessageOut({
         id: lifecycleStatusId,
-        in_reply_to: routing.inReplyTo,
+        in_reply_to: lifecycleAnchor,
         kind: 'status',
         platform_id: routing.platformId,
         channel_type: routing.channelType,
@@ -887,7 +892,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // would not either.
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          await autoAppendTaskLog(outcome.text, outcome.isError, outcome.model);
+          const taskMessageIds = key.split(',').filter((id) => getMessageIn(id)?.kind === 'task');
+          await autoAppendTaskLog(outcome.text, outcome.isError, outcome.model, taskMessageIds);
           return;
         } catch (logErr) {
           const reason = logErr instanceof Error ? logErr.message : String(logErr);
@@ -1942,6 +1948,22 @@ export async function processQuery(
   // resolved to. Recording the request wrote NULL to task_run_outcomes for
   // exactly the fires this change reroutes.
   let modelInForce = query.resolvedModel ?? querySettings.model;
+  // The status subtext reads the same resolved value, for the same reason the
+  // comment above gives: what the turn REQUESTED can be nothing at all, and a
+  // line that says "you are on the group default" answers nothing.
+  // Effort reads the PROVIDER's resolved value for the same reason the model
+  // does, and the asymmetry was a real bug: `querySettings.effort` is USER
+  // INTENT ONLY (the contract applyFlagBatch states at :3789), so a group
+  // carrying its effort in container.json requested nothing and the line
+  // showed no effort, while a sticky effort the model cannot support is
+  // clamped away and the line showed a level the turn never ran at.
+  // No `?? querySettings.effort` fallback: `resolvedEffort` is REQUIRED and
+  // `null` is a stated answer ("this turn runs with no effort setting"), not
+  // an absence to paper over. Falling back would resurrect the exact bug —
+  // a clamped-away sticky effort reappearing as though it had run.
+  setTurnSettings(modelInForce, query.resolvedEffort, querySettings.ultracode);
+  // Which conversation counts as "mine", for the subtext's own-voice gate.
+  setOwnConversation(routing.channelType, routing.platformId);
   /**
    * What the live stream is ACTUALLY set to. `querySettings` is the immutable
    * creation snapshot, so once a live settings change lands it stops
@@ -2300,6 +2322,13 @@ export async function processQuery(
             // Same read as at creation — one source, so a retarget and an open
             // cannot disagree about what ran.
             modelInForce = query.resolvedModel ?? fb.model;
+            // A mid-turn `-m`/`-e` retargets the live stream, so every message
+            // written after this point is genuinely on the new settings and the
+            // subtext has to move with them.
+            // Post-retarget the provider's getter is already updated
+            // (claude.ts:3559 reassigns activeEffort in applySettings), so it
+            // still beats the requested value here.
+            setTurnSettings(modelInForce, query.resolvedEffort, fb.ultracode);
             // The stream has moved; the comparison baseline moves with it, or
             // the next batch is measured against a snapshot that no longer
             // describes anything.
@@ -2850,6 +2879,15 @@ export async function processQuery(
           const stillOpen = openPromptIds();
           if (!provisional.promptIds.some((id) => stillOpen.includes(id))) provisional = undefined;
         }
+        // The context figure belongs to the turn that measured it, and THIS is
+        // the turn boundary — not emitTurnEnd. `processQuery` deliberately
+        // consumes many `result` events while the provider's generator stays
+        // open for follow-up pushes (see the note at the top of this branch),
+        // so emitTurnEnd runs once per QUERY, after the last of them. Clearing
+        // there would let turn N+1 inherit turn N's figure whenever N+1
+        // produced no usable usage frame. Safe here specifically: every
+        // dispatch for this result has already run above.
+        clearContextTokens();
         // Handling is done deciding. If it pushed, the turn level is raised
         // again and the published bit stays 1; if it did not, this is where
         // the container becomes reapable.
@@ -3107,6 +3145,14 @@ async function deliverErrorResult(text: string, routing: RoutingContext): Promis
     id: generateId(),
     in_reply_to: routing.inReplyTo,
     kind: 'chat',
+    // Marked, deliberately: this is the TURN'S OWN text going to the session's
+    // own conversation, which is exactly what the subtext describes. The same
+    // text routed through sendToDestination is stamped, and leaving this path
+    // unmarked would make an error reply the one place the line silently
+    // disappears — precisely when knowing the model and context is most
+    // useful. Model and effort are accurate on an error turn; the context
+    // figure is this turn's, since it is cleared per result (:2872).
+    agentReply: true,
     platform_id: routing.platformId,
     channel_type: routing.channelType,
     thread_id: routing.threadId,
@@ -3220,6 +3266,10 @@ export async function dispatchInterimMessageBlocks(
  * assume inbound rows are already marked completed when this row lands.
  */
 async function emitTurnEnd(): Promise<void> {
+  // The context figure is cleared per RESULT (see closeResultScope above), not
+  // here: one query can serve many turns, so this fires too coarsely to be the
+  // turn boundary. Kept as a backstop for a query that ends without a result.
+  clearContextTokens();
   const lifecycleStatusId = getCurrentLifecycleStatus();
   await writeMessageOut({
     id: generateId(),
@@ -3532,7 +3582,7 @@ export function resolveFireOutcome(input: {
  * An errored turn writes the row even when the text is empty. A failure that
  * leaves no line is precisely the silence this record exists to end.
  */
-export async function autoAppendTaskLog(text: string, isError = false, model?: string): Promise<void> {
+export async function autoAppendTaskLog(text: string, isError = false, model?: string, taskMessageIds: string[] = []): Promise<void> {
   // Run-log hygiene: an inert <message to> block never belongs in the log as
   // raw XML — replace each with its inner text, marked undelivered, so the
   // log stays readable prose.
@@ -3548,9 +3598,11 @@ export async function autoAppendTaskLog(text: string, isError = false, model?: s
   await writeMessageOut({
     id: generateId(),
     kind: 'task_log',
+    in_reply_to: taskMessageIds.length === 1 ? taskMessageIds[0] : null,
     content: JSON.stringify({
       text: line || (isError ? '(the provider reported an error and returned no text)' : '(run produced no output)'),
       auto: true,
+      ...(taskMessageIds.length ? { taskMessageIds } : {}),
       ...(isError ? { isError: true } : {}),
       ...(model ? { model } : {}),
     }),
@@ -3569,17 +3621,21 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
   // Dashboard messages can have no routing stamp in a freshly bound session.
   // Only that origin may inherit the resolved session route. A routed inbound,
   // including an explicit channel-root null, remains authoritative.
-  const threadId = destRouting
-    ? destRouting.threadId
-    : channelType === routing.channelType && platformId === routing.platformId
-      ? routing.threadId
-      : null;
+  const ownConversation = channelType === routing.channelType && platformId === routing.platformId;
+  const threadId = destRouting ? destRouting.threadId : ownConversation ? routing.threadId : null;
+  // The status subtext is NOT stamped here. It rides the shared outbound seam
+  // (db/messages-out.ts -> stampStatusSubtext) so the `send_message` MCP path,
+  // which bypasses this function entirely and is the default reply path when
+  // outcome reporting is on, gets the same treatment.
   await writeMessageOut({
     id: generateId(),
     // Batch anchor, not the channel's latest inbound row — see the poison
     // note in dispatchFileAttachment / getPendingMessages.
     in_reply_to: getBatchAnchor(channelType, platformId) ?? routing.inReplyTo,
     kind: 'chat',
+    // Agent-composed reply text — eligible for the status subtext. The
+    // own-conversation gate still applies at the seam.
+    agentReply: true,
     platform_id: platformId,
     channel_type: channelType,
     thread_id: threadId,

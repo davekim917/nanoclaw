@@ -101,7 +101,7 @@ export async function applyScheduleWake(
       threadId: routing?.thread_id ?? null,
       sourceSessionId: anchoredRouting?.source_session_id ?? null,
       content: JSON.stringify({
-        // Self-wake final text stays internal (container/agent-runner/src/poll-loop.ts:3402).
+        // Self-wake final text stays internal (container/agent-runner/src/poll-loop.ts:3452).
         // Refer to the mounted send_message schema rather than version-specific
         // policy fields (container/agent-runner/src/mcp-tools/core.ts:266–329).
         text: `[system] ${prompt}\n\n(Scheduled wake: bare final text is NOT delivered. Use the send_message tool for anything that should post, following its available schema and communication rules; if nothing needs posting, end with no message at all.)`,

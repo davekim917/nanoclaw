@@ -872,4 +872,397 @@ for variant in budgeted spent; do
 done
 unset variant name t want
 
+
+# --- XZO #2047: a barrier refusal must reach the OWNER ------------------------
+# Run xzo-pr-pr2055-dacf01328421-20260921T193111Z: the lanes barrier answered
+# `invalid: ["journeys/scope-dispositions.json"]` on the 19:51:35Z fire -- the
+# FIRST lanes fire, before a single lane had run -- and every fire after it. The
+# controller journaled that as an `escalate` decision with the reasons truncated
+# to three, wrote the owner a brief from the STATIC OWNER_BRIEF template that
+# said nothing about it, and woke the owner to run 14 lanes. The owner, the only
+# party that could repair the artifact, discovered the refusal at 20:58Z by
+# running the barrier by hand -- 67 minutes and a collapsed lease later.
+#
+# The barrier's own content rules are smoke-journeys.test.sh's subject; what is
+# regressed here is the CONTROLLER's duty to carry whatever invalid[] it gets
+# back to the owner. The contract below is refused by the real
+# smoke-evidence-barrier.sh for its own content, from the first lanes fire, the
+# same shape as #2055's intake-authored artifact.
+new_case ctl-2047-barrier-refusal-reaches-owner
+contract
+mkdir -p "$R/contact-sheet"
+printf 'png\n' >"$R/contact-sheet/sheet.png"
+printf 'This build changes the checkout button; the checkout journey will be tested.\n' \
+  >"$R/controller/root-summary.md"
+jq -c '.requiredLaneMarkers = ["../elsewhere/markers/A1.json","markers/B1.json"]' \
+  "$R/completion-contract.json" >"$R/.contract.tmp"
+mv "$R/.contract.tmp" "$R/completion-contract.json"
+campaign 3
+
+jq -e '.invalid == ["../elsewhere/markers/A1.json"] and (.invalidReasons | length) == 1
+       and .ready == false and .phase == "lanes"' \
+  "$R/controller/barrier-lanes.json" >/dev/null \
+  || fail "#2047: the lanes barrier's answer is not published for the owner: $(cat "$R/controller/barrier-lanes.json" 2>&1)"
+grep -q 'controller/barrier-lanes.json' "$R/controller/brief-lanes.md" \
+  || fail "#2047: the lanes brief does not point the owner at the barrier's answer"
+grep -q 'THE BARRIER IS ALREADY REFUSING THIS PHASE' "$R/controller/brief-lanes.md" \
+  || fail "#2047: a brief written while the barrier already refuses does not say so"
+# The reasons are complete in the file even though the journal keeps three.
+jq -e '.invalidReasons[0] | test("path-traversal marker path")' "$R/controller/barrier-lanes.json" >/dev/null \
+  || fail "#2047: the published reason is not the barrier's own"
+
+# ...and it is removed the moment the phase passes, so it can never be read as
+# a live refusal that is over.
+new_case ctl-2047-barrier-report-cleared
+campaign 3
+[ ! -e "$R/controller/barrier-lanes.json" ] \
+  || fail "#2047: a passed lanes barrier left a refusal file behind"
+grep -q 'controller/barrier-lanes.json' "$R/controller/brief-lanes.md" \
+  || fail "#2047: a barrier-backed brief must name the barrier file even when nothing is refused yet"
+grep -q 'CHECK THE BARRIER, DO NOT ASSUME IT' "$R/controller/brief-lanes.md" \
+  || fail "#2047: a barrier that is only waiting for markers must not shout like one refusing content"
+
+# --- XZO #2046: a re-minted owner token must be re-ISSUED to the owner --------
+# Same run. The controller's fires stopped for 40 minutes (19:51:19Z ->
+# 20:31:42Z, wrapper/fires.ndjson) while the gate's coordinator lease is 900 s
+# (smoke-pr-gate.sh:220), so the lease lapsed under a live owner and its eight
+# completed lanes were refused their markers. The next `poll` then did what it
+# is supposed to do on a stale run: it resumed the run id and minted a FRESH
+# owner token (smoke-pr-gate.sh:5312 -> :5347/:5349/:5389). The controller
+# picked the new token up for itself, and stopped there. controller/wake.json --
+# the only file that carries the token to the owner, and the file the intake
+# brief tells it to read -- still named the retired one, and the lanes brief is
+# re-offered only while its `.ack` is ABSENT, which it was not. So the owner the
+# controller itself dispatched could satisfy neither begin_active_run_fence nor
+# `adopt`, the verb that exists for exactly this transition. It correctly
+# refused to work around it and the campaign ended BLOCKED with 4 of 14 markers.
+#
+# Neither the re-mint nor adopt's fence is the defect: the missing step is the
+# controller re-issuing the token it just received to the owner it dispatched.
+new_case ctl-2046-owner-token-reissued
+campaign 2   # contract + critic in, the lanes step enqueued under $TOKEN
+# The simulated owner acks at the START of a tick, so the brief written by the
+# last fire is acked here -- the same state the real run was in at 20:31Z.
+for b in "$R"/controller/brief-*.md; do [ -e "${b%.md}.ack" ] || : >"${b%.md}.ack"; done
+jq -e --arg t "$TOKEN" '.coordinatorOwnerToken == $t' "$R/controller/wake.json" >/dev/null \
+  || fail "#2046: precondition -- the run tree should hold the original token"
+STEP_BEFORE="$(jq -sr '[.[] | select(.kind=="owner" and .state=="enqueued")] | last | .slot' "$C/out/journal.ndjson")"
+[ -n "$STEP_BEFORE" ] && [ "$STEP_BEFORE" != null ] || fail "#2046: precondition -- no owner step is in flight"
+[ -e "$R/controller/brief-$STEP_BEFORE.ack" ] || fail "#2046: precondition -- the owner never acked $STEP_BEFORE"
+
+REMINT=owner-ctl-remint-2222
+claim "" controller "$REMINT"
+jq -c --arg t "$REMINT" '.data.coordinatorOwnerToken = $t' "$C/wake.json" >"$C/wake-remint.json"
+inputs_from_fakes
+step_ok "$(tick_time 3)" --poll-json "$C/wake-remint.json"
+
+jq -e --arg t "$REMINT" '.coordinatorOwnerToken == $t' "$R/controller/wake.json" >/dev/null \
+  || fail "#2046: the re-minted token was never issued to the owner (wake.json still names the retired one)"
+grep -q 'YOUR OWNER TOKEN CHANGED' "$R/controller/brief-$STEP_BEFORE.md" \
+  || fail "#2046: the re-offered brief does not tell the owner its token changed"
+grep -q 'smoke-run-scaffold.sh adopt' "$R/controller/brief-$STEP_BEFORE.md" \
+  || fail "#2046: the re-offered brief does not name the one legitimate recovery, adopt"
+grep -q 'Do NOT copy a token out of gate state' "$R/controller/brief-$STEP_BEFORE.md" \
+  || fail "#2046: the brief does not rule out the impersonation route the run's own recovery record refused"
+jq -se --arg s "$STEP_BEFORE" '[.[] | select(.kind=="owner" and .slot==$s and .state=="intent"
+       and (.detail.tokenReissued == true))] | length == 1' "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2046: the in-flight owner step was not re-offered for adoption"
+jq -se '[.[] | select(.kind=="send" and (.slot | startswith("alarm:token-reissued:")))] | length > 0' \
+  "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2046: a mid-run owner-token re-mint is not alarmed"
+# The owner is woken again -- a brief nobody is told to re-read is not an issue.
+[ "$(jq -r '.ownerWake.step // ""' <<<"$STEP_OUT")" = "$STEP_BEFORE" ] \
+  || fail "#2046: the owner was not re-woken for the step it must adopt into: $STEP_OUT"
+
+# Re-running the same fire hands the token over exactly once.
+BEFORE_LINES="$(wc -l <"$C/out/journal.ndjson")"
+step_ok "$(tick_time 3)" --poll-json "$C/wake-remint.json"
+jq -se --arg s "$STEP_BEFORE" '[.[] | select(.kind=="owner" and .slot==$s and .state=="intent"
+       and (.detail.tokenReissued == true))] | length == 1' "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2046: the retry of the same fire re-offered the step a second time ($BEFORE_LINES lines before)"
+# A step that is over is never re-offered: nothing is in flight to adopt into.
+new_case ctl-2046-no-reissue-without-a-step-in-flight
+campaign 6
+REMINT=owner-ctl-remint-3333
+claim "" controller "$REMINT"
+jq -c --arg t "$REMINT" '.data.coordinatorOwnerToken = $t' "$C/wake.json" >"$C/wake-remint.json"
+inputs_from_fakes
+step_ok "$(tick_time 7)" --poll-json "$C/wake-remint.json"
+jq -se '[.[] | select(.kind=="owner" and .state=="intent" and (.detail.tokenReissued == true))] | length == 0' \
+  "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2046: a finished run re-offered an owner step it has no use for"
+
+
+# --- round 2, finding 3: the SYNTHESIS barrier's refusal wakes the owner too ---
+# The lanes fix (XZO #2047) left the identical blind spot on the sibling path:
+# when the synthesis barrier is not ready the branch published the report and
+# returned, and smoke-controller-live.sh wakes the owner only on `ownerWake`.
+# So the owner -- the only party that can repair what that barrier rejects --
+# was never invoked, and _maybe_synthesis_overdue_blocked keys on the very
+# owner:synthesis obligation the branch declined to create, so the terminal
+# BLOCKED net could not fire either. Driven through the real barrier: a
+# contact-sheet manifest it rejects for its own content, which is a
+# synthesis-phase-only check (smoke-evidence-barrier.sh gates the visual
+# candidate check on PHASE = synthesis) and so cannot be confused with a lanes
+# refusal.
+export SMOKE_VISUAL_DISPOSITIONS=1
+new_case ctl-2047b-synthesis-barrier-wakes-owner
+# Broken BEFORE the run first reaches synthesis, so what is under test is the
+# arrival at a refusing barrier, not a later fire finding an already-briefed
+# step. campaign 4 stops at await_challenger; world 5 lands the challenger's
+# disposition, which is the last gate before the synthesis branch.
+campaign 4
+printf 'shots\n' >"$R/contact-sheet/shots.json"
+printf 'not a manifest\n' >"$R/contact-sheet/manifest.json"
+world 5
+inputs_from_fakes
+step_ok "$(tick_time 5)"
+
+jq -e '.phase == "synthesis" and .ready == false
+       and (.invalid | index("contact-sheet/manifest.json") != null)' \
+  "$R/controller/barrier-synthesis.json" >/dev/null \
+  || fail "#2047(synthesis): the barrier's answer is not published: $(cat "$R/controller/barrier-synthesis.json" 2>&1)"
+[ -e "$R/controller/brief-synthesis.md" ] \
+  || fail "#2047(synthesis): a refusing synthesis barrier wrote no brief -- nobody is told and nobody is invoked"
+grep -q 'controller/barrier-synthesis.json' "$R/controller/brief-synthesis.md" \
+  || fail "#2047(synthesis): the brief does not point the owner at the barrier's answer"
+grep -q 'THE BARRIER IS ALREADY REFUSING THIS PHASE' "$R/controller/brief-synthesis.md" \
+  || fail "#2047(synthesis): the brief does not say the barrier is refusing content"
+jq -se '[.[] | select(.kind=="owner" and .slot=="synthesis" and .state=="enqueued"
+        and .detail.outcome=="brief_written")] | length == 1' "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2047(synthesis): no owner:synthesis obligation, so the overdue-BLOCKED net can never fire either"
+[ "$(jq -r '.ownerWake.step // ""' <<<"$STEP_OUT")" = synthesis ] \
+  || fail "#2047(synthesis): the owner was not woken for the step only it can repair: $STEP_OUT"
+unset SMOKE_VISUAL_DISPOSITIONS
+
+# --- round 2, finding 1: the re-issue survives a kill at the claim record -----
+# The claim record is fsynced BEFORE anything else and the gate latches the
+# wake, so an edge trigger on reconcile_claims' poll-reclaim branch was not
+# crash-safe: a death in between left the journalled token already matching,
+# the branch skipped forever, and the owner enqueued on the old brief and a
+# stale wake.json -- the exact wedge this PR recovers from. The kill is driven
+# at the real seam (crash_point "after-reclaim-record"), and the fire that
+# follows carries NO poll wake, which is what the gate actually gives once it
+# has latched one.
+new_case ctl-2046b-reissue-survives-a-crash-at-the-claim-record
+campaign 2
+for b in "$R"/controller/brief-*.md; do [ -e "${b%.md}.ack" ] || : >"${b%.md}.ack"; done
+REMINT=owner-ctl-remint-crash-4444
+claim "" controller "$REMINT"
+jq -c --arg t "$REMINT" '.data.coordinatorOwnerToken = $t' "$C/wake.json" >"$C/wake-remint.json"
+inputs_from_fakes
+SMOKE_CONTROLLER_CRASH_AT=after-reclaim-record:run:claim step "$(tick_time 3)" --poll-json "$C/wake-remint.json"
+[ "$STEP_RC" = 137 ] || fail "#2046(crash): the fire was not killed at the claim-record window (rc=$STEP_RC)"
+jq -se --arg t "$REMINT" '[.[] | select(.kind=="run" and .slot=="claim")] | last | .detail.ownerToken == $t' \
+  "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2046(crash): precondition -- the claim record did not land before the kill"
+jq -e --arg t "$REMINT" '.coordinatorOwnerToken != $t' "$R/controller/wake.json" >/dev/null \
+  || fail "#2046(crash): precondition -- the re-issue must not have completed before the kill"
+
+# The next fire has no wake at all. Recovery must come from durable state.
+inputs_from_fakes
+step_ok "$(tick_time 4)"
+jq -e --arg t "$REMINT" '.coordinatorOwnerToken == $t' "$R/controller/wake.json" >/dev/null \
+  || fail "#2046(crash): a kill at the claim record stranded the re-issue -- wake.json still names the retired token"
+grep -q 'YOUR OWNER TOKEN CHANGED' "$R/controller/brief-lanes.md" \
+  || fail "#2046(crash): the recovered fire did not re-offer the step for adoption"
+jq -se '[.[] | select(.kind=="owner" and .state=="intent" and (.detail.tokenReissued == true))] | length == 1' \
+  "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2046(crash): the re-offer was not journalled exactly once"
+# Idempotent: a further fire with nothing changed re-offers nothing.
+inputs_from_fakes
+step_ok "$(tick_time 5)"
+jq -se '[.[] | select(.kind=="owner" and .state=="intent" and (.detail.tokenReissued == true))] | length == 1' \
+  "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2046(crash): a later fire re-offered the step again after the transition completed"
+
+# --- round 2, finding 2: an ack never outlives the brief it acknowledged -----
+# owner_step re-offers a wake only while `brief-<step>.ack` is ABSENT, so a
+# brief rewritten under a new token inherited the previous brief's ack and was
+# read as already taken -- the second half of the same wedge.
+new_case ctl-2046c-ack-does-not-outlive-its-brief
+campaign 2
+for b in "$R"/controller/brief-*.md; do [ -e "${b%.md}.ack" ] || : >"${b%.md}.ack"; done
+[ -e "$R/controller/brief-lanes.ack" ] || fail "#2046(ack): precondition -- the owner never acked the lanes brief"
+REMINT=owner-ctl-remint-ack-5555
+claim "" controller "$REMINT"
+jq -c --arg t "$REMINT" '.data.coordinatorOwnerToken = $t' "$C/wake.json" >"$C/wake-remint.json"
+inputs_from_fakes
+step_ok "$(tick_time 3)" --poll-json "$C/wake-remint.json"
+[ ! -e "$R/controller/brief-lanes.ack" ] \
+  || fail "#2046(ack): the superseded brief's ack survived the re-offer, so the new brief reads as already taken"
+# ...and because it is gone, an owner that does not come back is re-offered
+# rather than assumed to hold the step.
+inputs_from_fakes
+step_ok "$(tick_time 4)"
+[ "$(jq -r '.ownerWake.step // ""' <<<"$STEP_OUT")" = lanes ] \
+  || fail "#2046(ack): an un-acked re-offered brief was not re-offered: $STEP_OUT"
+
+# --- round 2, finding 4: the router doc's file:line citations are real -------
+# CLAUDE.md requires file:line for a cross-module behavioural claim, and a line
+# number that drifts is worse than none: it reads as evidence. This fails the
+# moment one of the cited lines moves, which is the point.
+cite() { # <file> <line> <literal substring the cited line must contain>
+  local got
+  got="$(sed -n "${2}p" "$SCRIPT_DIR/$1" 2>/dev/null)"
+  grep -Fq -- "$3" <<<"$got" \
+    || fail "controller-owner-router.md cites $1:$2 for \"$3\", but that line is: ${got:-<absent>}"
+}
+ROUTER="$SCRIPT_DIR/../references/controller-owner-router.md"
+for c in 'smoke-pr-gate.sh:5312' 'smoke-campaign-controller.py:1291-1293' \
+         'smoke-run-scaffold.sh:267-269' 'smoke-campaign-controller.py:1280-1290'; do
+  grep -Fq "$c" "$ROUTER" || fail "router doc no longer cites $c"
+done
+cite smoke-pr-gate.sh 5312 'OWNER_TOKEN="$(new_owner_token'
+cite smoke-pr-gate.sh 5341 'lease_acquire "$RUN_ID" "$OWNER_TOKEN"'
+cite smoke-pr-gate.sh 5346 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
+cite smoke-pr-gate.sh 5389 '.activeLeaseOwner=$owner'
+cite smoke-run-scaffold.sh 268 '[ "$owner" = "$DEFAULT_OWNER" ]'
+cite smoke-run-scaffold.sh 690 'adds NO new authority check of its own'
+cite smoke-campaign-controller.py 1236 'def _owner_wake'
+cite smoke-campaign-controller.py 1286 'os.unlink("brief-{}.ack"'
+cite smoke-campaign-controller.py 1291 'if c.get("wake"):'
+
+
+# --- round 3, finding 1: a refusal that appears AFTER the ack re-offers ------
+# Round 1 covered first arrival -- already refusing when the brief was written.
+# The likelier order, and the one run pr2055 actually took, is the reverse: the
+# brief is issued while the barrier is merely waiting for markers, the owner
+# acks it, and THEN the owner writes evidence the barrier rejects. owner_step
+# re-offers only while the ack is absent, so the next fire published the new
+# refusal and returned ownerWake:null -- the diagnosis on disk and nobody told
+# to read it. Driven as the real sequence, not a synthetic state.
+new_case ctl-2047c-refusal-after-ack-reoffers
+# The brief is issued while the barrier is only WAITING for markers, and the
+# owner acks it. Nothing is refused yet.
+campaign 2
+for b in "$R"/controller/brief-*.md; do [ -e "${b%.md}.ack" ] || : >"${b%.md}.ack"; done
+[ -e "$R/controller/brief-lanes.ack" ] || fail "#2047(after-ack): precondition -- the lanes brief was never acked"
+jq -e '(.invalid | length) == 0 and (.missing | length) > 0' "$R/controller/barrier-lanes.json" >/dev/null \
+  || fail "#2047(after-ack): precondition -- the barrier was already refusing content before the ack: $(cat "$R/controller/barrier-lanes.json" 2>&1)"
+BRIEF_BEFORE="$(cat "$R/controller/brief-lanes.md")"
+
+# NOW the owner, mid-step, writes a marker the REAL barrier rejects.
+marker A1 1 pass
+jq -c '.evidence = ["evidence/does-not-exist.png"]' "$R/markers/A1.json" >"$R/markers/.A1.tmp"
+mv "$R/markers/.A1.tmp" "$R/markers/A1.json"
+inputs_from_fakes
+step_ok "$(tick_time 3)"
+
+jq -e '(.invalid | index("markers/A1.json") != null)' "$R/controller/barrier-lanes.json" >/dev/null \
+  || fail "#2047(after-ack): precondition -- the barrier does not reject the evidence: $(cat "$R/controller/barrier-lanes.json")"
+[ "$(jq -r '.ownerWake.step // ""' <<<"$STEP_OUT")" = lanes ] \
+  || fail "#2047(after-ack): a refusal that appeared after the ack woke nobody: $STEP_OUT"
+[ ! -e "$R/controller/brief-lanes.ack" ] \
+  || fail "#2047(after-ack): the re-offered brief kept the ack of the brief it superseded"
+grep -q 'THE BARRIER IS ALREADY REFUSING THIS PHASE' "$R/controller/brief-lanes.md" \
+  || fail "#2047(after-ack): the re-offered brief does not say the barrier is refusing content"
+[ "$BRIEF_BEFORE" != "$(cat "$R/controller/brief-lanes.md")" ] \
+  || fail "#2047(after-ack): the brief was not rewritten against the new refusal"
+jq -se '[.[] | select(.kind=="owner" and .slot=="lanes" and .state=="intent"
+        and (.detail.refusalChanged == true))] | length == 1' "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2047(after-ack): the re-offer was not journalled exactly once"
+
+# The trigger is the REFUSAL, not the published answer. An unchanged refusal
+# says nothing new...
+for b in "$R"/controller/brief-*.md; do [ -e "${b%.md}.ack" ] || : >"${b%.md}.ack"; done
+inputs_from_fakes
+step_ok "$(tick_time 4)"
+jq -se '[.[] | select(.kind=="owner" and .slot=="lanes" and .state=="intent"
+        and (.detail.refusalChanged == true))] | length == 1' "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2047(after-ack): an unchanged refusal re-offered the step again"
+
+# ...and a refusal that CLEARS says nothing either, even though missing[] moved
+# -- the owner banking its own markers must never wake it.
+marker A1 1 pass
+for b in "$R"/controller/brief-*.md; do [ -e "${b%.md}.ack" ] || : >"${b%.md}.ack"; done
+inputs_from_fakes
+step_ok "$(tick_time 5)"
+jq -e '(.invalid | length) == 0 and (.missing | length) > 0' "$R/controller/barrier-lanes.json" >/dev/null \
+  || fail "#2047(after-ack): precondition -- the repair did not clear the refusal"
+jq -se '[.[] | select(.kind=="owner" and .slot=="lanes" and .state=="intent"
+        and (.detail.refusalChanged == true))] | length == 1' "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2047(after-ack): a cleared refusal, or the owner's own progress, re-offered the step"
+
+# --- round 3, finding 2: the backfill reads the run tree, not the gate -------
+# A poll that re-minted BEFORE this file's upgrade leaves an obligation with no
+# `briefedToken` -- but `controller/wake.json` on disk still names the retired
+# token the owner is holding. Backfilling the gate's current token would make
+# every later fire see equality and skip the reissue permanently: the owner
+# fenced out with no path back, which is the wedge this PR exists to end.
+new_case ctl-2046d-backfill-reads-the-run-tree
+campaign 2
+for b in "$R"/controller/brief-*.md; do [ -e "${b%.md}.ack" ] || : >"${b%.md}.ack"; done
+# Exactly what a pre-upgrade journal looks like: the step in flight, no
+# briefedToken anywhere on it. wake.json keeps the token the owner was issued.
+jq -e '.coordinatorOwnerToken != null' "$R/controller/wake.json" >/dev/null \
+  || fail "#2046(backfill): precondition -- the run tree carries no issued token"
+
+# Exactly the state origin/main leaves behind: its poll-reclaim branch recorded
+# the NEW token on the claim and did nothing else, so the journal has moved on,
+# `controller/wake.json` still names the retired token the owner is holding,
+# and no owner obligation carries `briefedToken` at all. No poll wake either --
+# it was consumed before the upgrade and the gate does not re-emit a latched one.
+REMINT=owner-ctl-preupgrade-6666
+claim "" controller "$REMINT"
+python3 - "$C/out/journal.ndjson" "$REMINT" <<'PY'
+import json, sys
+p, remint = sys.argv[1], sys.argv[2]
+out = []
+for line in open(p):
+    if not line.strip():
+        continue
+    r = json.loads(line)
+    if r.get("kind") == "owner" and isinstance(r.get("detail"), dict):
+        r["detail"].pop("briefedToken", None)
+        r["detail"].pop("briefedRefusal", None)
+    if r.get("kind") == "run" and r.get("slot") == "claim" and isinstance(r.get("detail"), dict) \
+            and r["detail"].get("ownerToken"):
+        # Both fields, exactly as origin/main's _claim_detail sets them from a
+        # poll-reclaim wake. Only the RUN TREE is left behind.
+        r["detail"]["ownerToken"] = remint
+        if isinstance(r["detail"].get("wake"), dict):
+            r["detail"]["wake"]["coordinatorOwnerToken"] = remint
+    out.append(json.dumps(r, sort_keys=True, separators=(",", ":")))
+open(p, "w").write("\n".join(out) + "\n")
+PY
+inputs_from_fakes
+step_ok "$(tick_time 3)"
+
+jq -e --arg t "$REMINT" '.coordinatorOwnerToken == $t' "$R/controller/wake.json" >/dev/null \
+  || fail "#2046(backfill): the run tree's retired token was backfilled away instead of recognised as a re-mint"
+grep -q 'YOUR OWNER TOKEN CHANGED' "$R/controller/brief-lanes.md" \
+  || fail "#2046(backfill): the owner was not told its token changed"
+jq -se '[.[] | select(.type=="wake_owner" and .evidence=="run-tree")] | length >= 1' \
+  "$C/out/$RUN/decisions.ndjson" >/dev/null \
+  || fail "#2046(backfill): the re-offer does not record that the run tree was the evidence"
+
+# ...and a pre-upgrade step whose run tree AGREES with the gate is backfilled
+# silently: absence of a journal field is not, on its own, a re-mint.
+new_case ctl-2046e-backfill-agreeing-run-tree-is-silent
+campaign 2
+for b in "$R"/controller/brief-*.md; do [ -e "${b%.md}.ack" ] || : >"${b%.md}.ack"; done
+python3 - "$C/out/journal.ndjson" <<'PY'
+import json, sys
+p = sys.argv[1]
+out = []
+for line in open(p):
+    r = json.loads(line)
+    if r.get("kind") == "owner" and isinstance(r.get("detail"), dict):
+        r["detail"].pop("briefedToken", None)
+        r["detail"].pop("briefedRefusal", None)
+    out.append(json.dumps(r, sort_keys=True, separators=(",", ":")))
+open(p, "w").write("\n".join(out) + "\n")
+PY
+BRIEF_BEFORE="$(cat "$R/controller/brief-lanes.md")"
+inputs_from_fakes
+step_ok "$(tick_time 3)"
+grep -q 'YOUR OWNER TOKEN CHANGED' "$R/controller/brief-lanes.md" \
+  && fail "#2046(backfill): a run tree that agrees with the gate was reported as a re-mint"
+[ "$BRIEF_BEFORE" = "$(cat "$R/controller/brief-lanes.md")" ] \
+  || fail "#2046(backfill): an agreeing run tree rewrote the brief"
+jq -se '[.[] | select(.kind=="owner" and .slot=="lanes" and .detail.briefedToken != null)] | length >= 1' \
+  "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2046(backfill): an agreeing run tree was not backfilled, so it is re-read every fire"
+
 echo "smoke campaign controller live tests passed"

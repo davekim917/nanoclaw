@@ -158,6 +158,10 @@ export function registerSchedulingSweepDuties(): void {
     run: async (ctx) => {
       const { session, mailbox } = asSessionContext(ctx);
       if (isTaskThread(session.thread_id)) {
+        // Keyed dispatch receipts must remain addressable by the active-session
+        // lookup (src/session-manager.ts:428–470). Container idle reaping is
+        // independent; keeping this metadata does not keep its process alive.
+        if (mailbox!.hasTaskDispatchEvents()) return;
         const liveTasks = mailbox!.countLiveTasks();
         const hasPendingWait = mailbox!.hasPendingRecallPairedTrigger();
         const hasWorkContinuation = mailbox!.readContinuationPresence() !== null;
@@ -197,6 +201,7 @@ export function registerSchedulingSweepDuties(): void {
         // await may sit between these reads and the UPDATE: the SQLite reads
         // run synchronously, so the decision and close share one turn.
         const workArrived =
+          mailbox!.hasTaskDispatchEvents() ||
           mailbox!.countLiveTasks() > 0 ||
           mailbox!.hasPendingRecallPairedTrigger() ||
           mailbox!.readContinuationPresence() !== null;
