@@ -121,7 +121,7 @@ describe('schedule_wake delivery action', () => {
     // Delivery contract rides with every wake — see routing.selfWake in the runner.
     expect(content.text).toContain('bare final text is NOT delivered');
     expect(content.text).toContain('Use the send_message tool');
-    expect(content.text).not.toContain('<message>');
+    expect(content.text).not.toContain('<message');
     expect(content.text).toContain('if nothing needs posting, end with no message at all');
     const pair = allRows();
     expect(pair.map((row) => row.id)).toEqual([`recall-schedule-wake-${wakeId}`, `schedule-wake-${wakeId}`]);
