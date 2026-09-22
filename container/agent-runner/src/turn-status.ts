@@ -1,4 +1,5 @@
 import { getConfig } from './config.js';
+import { getTaskSeriesId } from './db/session-routing.js';
 import { getAgentMailbox } from './mailbox/index.js';
 
 /**
@@ -154,6 +155,29 @@ export function setOwnConversation(channelType?: string | null, platformId?: str
 export function isOwnConversation(channelType?: string | null, platformId?: string | null): boolean {
   if (!ownPlatformId || !platformId) return false;
   return channelType === ownChannelType && platformId === ownPlatformId;
+}
+
+/**
+ * Is an outbound row a scheduled task's post to a platform?
+ *
+ * An isolated task session has no conversation of its own: its routing is a
+ * `system:tasks:*` thread with no platform (db/session-routing.ts:28), and
+ * send_message refuses to guess a target there (mcp-tools/core.ts:222). Every
+ * chat row it writes is the task's output to a destination it named, so
+ * without this the own-conversation gate leaves every scheduled post bare.
+ * Agent-to-agent rows (`channel_type: 'agent'`) are not a platform post.
+ * Reads the routing from the inbound DB, so it answers the same in the MCP
+ * subprocess as in poll-loop.
+ */
+export function isTaskOutput(channelType?: string | null, platformId?: string | null): boolean {
+  if (!channelType || !platformId || channelType === 'agent') return false;
+  // FAILS CLOSED: a routing read that throws must cost a decoration, never
+  // the send it decorates.
+  try {
+    return getTaskSeriesId() !== null;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -512,7 +536,9 @@ export function stampStatusSubtext(msg: {
   // Read the turn's state from the session DB, not this process's memory: the
   // send_message tool runs in its own subprocess, where nothing set it.
   hydrateTurnStatus();
-  if (!isOwnConversation(msg.channel_type, msg.platform_id)) return msg.content;
+  if (!isOwnConversation(msg.channel_type, msg.platform_id) && !isTaskOutput(msg.channel_type, msg.platform_id)) {
+    return msg.content;
+  }
   if (!statusSubtextEnabled()) return msg.content;
   const subtext = formatStatusSubtext();
   if (!subtext) return msg.content;
