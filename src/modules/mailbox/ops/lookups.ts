@@ -110,6 +110,95 @@ export interface InboundRoutingAnchor {
   source_session_id: string | null;
 }
 
+export interface InboundRequestIdentity {
+  id: string;
+  seq: number;
+  kind: string;
+  trigger: number;
+  channel_type: string | null;
+  platform_id: string | null;
+  content: string;
+}
+
+/** Host-authoritative source row for a harness request id. */
+export function getInboundRequestIdentity(db: Database.Database, sequence: number): InboundRequestIdentity | null {
+  return (
+    (db
+      .prepare(
+        `SELECT id, seq, kind, trigger, channel_type, platform_id, content FROM messages_in
+         WHERE seq = ? AND trigger = 1 AND kind IN ('chat', 'chat-sdk', 'task')
+           AND COALESCE(channel_type, '') <> 'agent'`,
+      )
+      .get(sequence) as InboundRequestIdentity | undefined) ?? null
+  );
+}
+
+export interface RecoverableLifecycleStatus {
+  outboundId: string;
+  channelType: string;
+  platformId: string;
+  threadId: string | null;
+  platformMessageId: string;
+}
+
+/** Recover a delivered typed lifecycle row after the host's in-memory map was lost. */
+export function getRecoverableLifecycleStatus(
+  inbound: Database.Database,
+  outbound: Database.Database,
+  outboundId?: string,
+): RecoverableLifecycleStatus | null {
+  const rows = outbound
+    .prepare(
+      `SELECT id, seq, channel_type, platform_id, thread_id, content
+       FROM messages_out
+       WHERE kind = 'status'
+         AND CASE WHEN json_valid(content) THEN json_extract(content, '$.reporting.purpose') END = 'liveness'
+         ${outboundId ? 'AND id = ?' : ''}
+       ORDER BY seq DESC LIMIT 32`,
+    )
+    .all(...(outboundId ? [outboundId] : [])) as Array<{
+    id: string;
+    seq: number;
+    channel_type: string | null;
+    platform_id: string | null;
+    thread_id: string | null;
+    content: string;
+  }>;
+  for (const row of rows) {
+    let content: { reporting?: { version?: unknown; purpose?: unknown } };
+    try {
+      content = JSON.parse(row.content) as typeof content;
+    } catch {
+      continue;
+    }
+    if (content.reporting?.version !== 1 || content.reporting?.purpose !== 'liveness') continue;
+    if (!row.channel_type || !row.platform_id) continue;
+    const delivered = inbound
+      .prepare("SELECT platform_message_id FROM delivered WHERE message_out_id = ? AND status = 'delivered'")
+      .get(row.id) as { platform_message_id: string | null } | undefined;
+    if (!delivered?.platform_message_id) continue;
+    const laterPublicIds = outbound
+      .prepare("SELECT id FROM messages_out WHERE seq > ? AND kind IN ('chat','chat-sdk')")
+      .all(row.seq) as Array<{ id: string }>;
+    if (
+      laterPublicIds.some(
+        ({ id }) =>
+          inbound.prepare("SELECT 1 FROM delivered WHERE message_out_id = ? AND status = 'delivered'").get(id) !==
+          undefined,
+      )
+    )
+      return null;
+    return {
+      outboundId: row.id,
+      channelType: row.channel_type,
+      platformId: row.platform_id,
+      threadId: row.thread_id,
+      platformMessageId: delivered.platform_message_id,
+    };
+  }
+  return null;
+}
+
 /**
  * The routing of one inbound row in THIS session.
  *

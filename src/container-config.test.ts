@@ -13,6 +13,7 @@ import {
   readContainerConfigForSpawn,
   readContainerConfigStrict,
   effectiveTimezone,
+  effectiveOutcomeReporting,
   honouredTimezoneOverride,
   MIN_AUTO_COMPACT_WINDOW,
   resolveGroupTimezone,
@@ -929,8 +930,8 @@ describe('excludePlugins', () => {
   });
 });
 
-describe('outcome reporting opt-in', () => {
-  it('requires literal true and round-trips external routine-report channels', () => {
+describe('outcome reporting fleet default', () => {
+  it('keeps omission distinct from explicit rollback and does not pin it during writeback', async () => {
     writeGroupConfig('outcome-config', {
       outcomeReporting: true,
       outcomeReportingExternalChannels: ['slack:RELEASES'],
@@ -942,6 +943,16 @@ describe('outcome reporting opt-in', () => {
     writeContainerConfig('outcome-config', config);
     expect(readContainerConfig('outcome-config').model).toBe('unchanged-model');
     writeGroupConfig('outcome-not-opted', { outcomeReporting: 'true' });
-    expect(readContainerConfig('outcome-not-opted').outcomeReporting).toBe(false);
+    expect(readContainerConfig('outcome-not-opted').outcomeReporting).toBeUndefined();
+    expect(effectiveOutcomeReporting(readContainerConfig('outcome-not-opted'))).toBe(true);
+    writeGroupConfig('outcome-rollback', { outcomeReporting: false });
+    expect(effectiveOutcomeReporting(readContainerConfig('outcome-rollback'))).toBe(false);
+    writeGroupConfig('outcome-absent', { model: 'unchanged' });
+    await updateContainerConfig('outcome-absent', (current) => {
+      current.groupName = 'renamed';
+    });
+    expect(
+      JSON.parse(fs.readFileSync(path.join(GROUPS_DIR, 'outcome-absent', 'container.json'), 'utf8')),
+    ).not.toHaveProperty('outcomeReporting');
   });
 });

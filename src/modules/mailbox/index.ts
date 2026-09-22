@@ -75,13 +75,17 @@ import {
 import {
   getChannelDestination,
   getInboundRoutingAnchor,
+  getInboundRequestIdentity,
+  getRecoverableLifecycleStatus,
   getLatestRoutedTaskRow,
   getLatestTaskContent,
   getRecentInboundChatSenders,
   hasRestartNoteSince,
   type ChannelDestination,
   type InboundChatSenderRow,
+  type InboundRequestIdentity,
   type InboundRoutingAnchor,
+  type RecoverableLifecycleStatus,
   type RoutedTaskRow,
 } from './ops/lookups.js';
 import {
@@ -429,6 +433,8 @@ export interface NanoclawMailboxSession extends MailboxSession {
   getLatestTaskContent(seriesId: string): string | null;
   getLatestRoutedTaskRow(seriesId: string): RoutedTaskRow | null;
   getInboundRoutingAnchor(messageId: string): InboundRoutingAnchor | null;
+  getInboundRequestIdentity(sequence: number): InboundRequestIdentity | null;
+  getRecoverableLifecycleStatus(outboundId?: string): RecoverableLifecycleStatus | null;
 
   /**
    * Does this session have a `outbound.db` yet?
@@ -1205,6 +1211,9 @@ function forkOps(
     getLatestTaskContent: (seriesId) => getLatestTaskContent(inbound, seriesId),
     getLatestRoutedTaskRow: (seriesId) => getLatestRoutedTaskRow(inbound, seriesId),
     getInboundRoutingAnchor: (messageId) => getInboundRoutingAnchor(inbound, messageId),
+    getInboundRequestIdentity: (sequence) => getInboundRequestIdentity(inbound, sequence),
+    getRecoverableLifecycleStatus: (outboundId) =>
+      readOutbound(null, (outbound) => getRecoverableLifecycleStatus(inbound, outbound, outboundId)),
 
     getNextFutureProcessAfter: () => getNextFutureProcessAfter(inbound),
     expireStalePending: (maxAgeMs) => expireStalePending(inbound, maxAgeMs),

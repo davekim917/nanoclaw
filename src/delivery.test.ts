@@ -36,6 +36,7 @@ import { getTaskThreadAnchor, setTaskThreadAnchor } from './db/task-thread-ancho
 import { getRawDb } from './db/connection.js';
 import { createPendingApproval, getPendingApproval, getPendingQuestion } from './db/sessions.js';
 import {
+  _resetStatusTrackingForTest,
   _threadKeyLockWaitersForTest,
   clearSessionStatusOnKill,
   deliverSessionMessages,
@@ -46,6 +47,7 @@ import {
 import { unguarded } from './guard/index.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 import { isContainerRunning } from './container-runner.js';
+import { renderWorkOutcome } from './outcome-reporting-schema.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -2773,6 +2775,44 @@ describe('per-work-item outcome delivery', () => {
     };
   }
 
+  function opaqueOutcome(
+    agentGroupId: string,
+    sessionId: string,
+    sequence: number,
+    platformMessageId: string,
+    sourceRoute = { channelType: 'telegram', platformId: 'telegram:123' },
+  ): { text: string; reporting: object } {
+    const inbound = openInboundDbAt(inboundDbPath(agentGroupId, sessionId));
+    const rowId = `${platformMessageId}:${agentGroupId}`;
+    inbound
+      .prepare(
+        `INSERT INTO messages_in
+         (id,seq,kind,timestamp,status,trigger,platform_id,channel_type,content)
+         VALUES (?,?, 'chat', ?, 'completed', 1, ?, ?, ?)`,
+      )
+      .run(
+        rowId,
+        sequence,
+        now(),
+        sourceRoute.platformId,
+        sourceRoute.channelType,
+        JSON.stringify({ text: 'Do the work', platformMsgId: platformMessageId }),
+      );
+    inbound.close();
+    const summary = 'The requested work is complete.';
+    const data = { requestId: sequence, verified: 'Focused checks passed.' };
+    const trusted = {
+      sessionId,
+      messageId: rowId,
+      sequence,
+      origin: { ...sourceRoute, platformMessageId },
+    };
+    return {
+      text: renderWorkOutcome(summary, data, trusted).text,
+      reporting: { version: 1, purpose: 'outcome', summary, outcome: data },
+    };
+  }
+
   it('retains routine records without platform calls and preserves legacy human replies and native questions', async () => {
     const session = await prepare();
     const deliver = vi.fn().mockResolvedValue('question-or-reply');
@@ -2839,6 +2879,68 @@ describe('per-work-item outcome delivery', () => {
     });
     await deliverSessionMessages(second);
     expect(deliver).toHaveBeenCalledTimes(2);
+  });
+
+  it('dedupes one trusted platform request across sibling sessions without requiring an external URL', async () => {
+    const first = await prepare();
+    await createAgentGroup({
+      id: 'ag-2',
+      name: 'Sibling',
+      folder: 'sibling',
+      agent_provider: null,
+      workgroup_id: 'outcomes',
+      created_at: now(),
+    });
+    const second = (await resolveSession('ag-2', 'mg-1', null, 'shared')).session;
+    const deliver = vi.fn().mockResolvedValue('one-platform-outcome');
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind(
+      'ag-1',
+      first.id,
+      'opaque-a',
+      'chat',
+      'telegram',
+      'telegram:123',
+      opaqueOutcome('ag-1', first.id, 2, 'platform-request-1'),
+    );
+    insertOutboundKind(
+      'ag-2',
+      second.id,
+      'opaque-b',
+      'chat',
+      'telegram',
+      'telegram:123',
+      opaqueOutcome('ag-2', second.id, 8, 'platform-request-1'),
+    );
+    await Promise.all([deliverSessionMessages(first), deliverSessionMessages(second)]);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const receipt = getRawDb().prepare('SELECT work_item,state FROM work_outcome_receipts').get() as {
+      work_item: string;
+      state: string;
+    };
+    expect(receipt.work_item).toMatch(/^request:v1:[0-9a-f]{64}$/);
+    expect(receipt.state).toBe('delivered');
+  });
+
+  it('rejects an opaque outcome keyed to an agent-authored inbound row', async () => {
+    const session = await prepare();
+    const deliver = vi.fn().mockResolvedValue('must-not-deliver');
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'agent-keyed-outcome',
+      'chat',
+      'telegram',
+      'telegram:123',
+      opaqueOutcome('ag-1', session.id, 2, 'agent-handoff-1', {
+        channelType: 'agent',
+        platformId: 'agent:peer',
+      }),
+    );
+    await deliverSessionMessages(session);
+    expect(deliver).not.toHaveBeenCalled();
+    expect(getRawDb().prepare('SELECT COUNT(*) AS count FROM work_outcome_receipts').get()).toEqual({ count: 0 });
   });
 
   it('gives unrelated scheduled work outcomes independent roots instead of the daily task thread', async () => {
@@ -2912,6 +3014,66 @@ describe('per-work-item outcome delivery', () => {
       state: 'delivered',
       platform_message_id: null,
     });
+  });
+
+  it('keeps old untyped status public, suppresses typed narration, and recovers typed liveness after host memory loss', async () => {
+    const session = await prepare();
+    const deliver = vi
+      .fn()
+      .mockResolvedValueOnce('legacy-status')
+      .mockResolvedValueOnce('lifecycle-status')
+      .mockResolvedValue(undefined);
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind('ag-1', session.id, 'legacy', 'status', 'telegram', 'telegram:123', { text: 'Legacy status' });
+    insertOutboundKind('ag-1', session.id, 'narration', 'status', 'telegram', 'telegram:123', {
+      text: 'Model narration',
+      reporting: { version: 1, purpose: 'progress' },
+    });
+    insertOutboundKind('ag-1', session.id, 'lifecycle', 'status', 'telegram', 'telegram:123', {
+      text: 'Accepted · working',
+      reporting: { version: 1, purpose: 'liveness', state: 'working' },
+    });
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    _resetStatusTrackingForTest();
+    insertOutboundKind('ag-1', session.id, 'ended', 'system', null as never, null as never, {
+      action: 'turn_end',
+      lifecycleStatusId: 'lifecycle',
+    });
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(3);
+    expect(JSON.parse(deliver.mock.calls[2][4])).toMatchObject({
+      operation: 'edit',
+      messageId: 'lifecycle-status',
+      text: 'Stopped before sending a reply.',
+    });
+  });
+
+  it('removes a durable typed liveness row when a reply lands after host memory loss', async () => {
+    const session = await prepare();
+    const deliver = vi.fn().mockResolvedValueOnce('lifecycle-status').mockResolvedValueOnce('public-reply');
+    const deleteMessage = vi.fn().mockResolvedValue(undefined);
+    setDeliveryAdapter({ deliver, deleteMessage });
+    insertOutboundKind('ag-1', session.id, 'lifecycle', 'status', 'telegram', 'telegram:123', {
+      text: 'Accepted · working',
+      reporting: { version: 1, purpose: 'liveness', state: 'working' },
+    });
+    await deliverSessionMessages(session);
+    for (let index = 0; index < 40; index++) {
+      insertOutboundKind('ag-1', session.id, `progress-${index}`, 'status', 'telegram', 'telegram:123', {
+        text: `Internal progress ${index}`,
+        reporting: { version: 1, purpose: 'progress' },
+      });
+    }
+    await deliverSessionMessages(session);
+    _resetStatusTrackingForTest();
+    insertOutboundKind('ag-1', session.id, 'reply', 'chat', 'telegram', 'telegram:123', {
+      text: 'The requested answer.',
+      reporting: { version: 1, purpose: 'reply' },
+    });
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(deleteMessage).toHaveBeenCalledWith('telegram', 'telegram:123', null, 'lifecycle-status', 'telegram');
   });
 
   it('reconciles verified non-delivery and allows only the original queued row to retry', async () => {
@@ -2992,5 +3154,21 @@ describe('per-work-item outcome delivery', () => {
     });
     await deliverSessionMessages(session);
     expect(deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses an agent-group receipt scope when a legacy group has no workgroup membership', async () => {
+    await seedAgentAndChannel();
+    fs.mkdirSync(`${TEST_DIR}/groups/test-agent`, { recursive: true });
+    fs.writeFileSync(`${TEST_DIR}/groups/test-agent/container.json`, JSON.stringify({}));
+    const session = (await resolveSession('ag-1', 'mg-1', null, 'shared')).session;
+    const deliver = vi.fn().mockResolvedValue('legacy-group-outcome');
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind('ag-1', session.id, 'legacy-group', 'chat', 'telegram', 'telegram:123', await outcome());
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(getRawDb().prepare('SELECT workgroup_id,state FROM work_outcome_receipts').get()).toEqual({
+      workgroup_id: 'agent-group:ag-1',
+      state: 'delivered',
+    });
   });
 });

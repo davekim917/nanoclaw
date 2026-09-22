@@ -347,7 +347,7 @@ The sibling needs to be added to the relevant Slack channels FROM SLACK first â€
 
 The source bot keeps its own `messaging_group_agents` row in the existing `slack-<source>` channelType â€” untouched by this skill. Both bots share the channel physically; their NanoClaw routing is separate.
 
-Wire each desired physical Slack channel through the host `register` step, not by raw-inserting `messaging_group_agents`. The register path calls `createMessagingGroupAgent()`, which also creates the companion `agent_destinations` row the container needs for `<message to="...">` routing and origin-fallback.
+Wire each desired physical Slack channel through the host `register` step, not by raw-inserting `messaging_group_agents`. The register path calls `createMessagingGroupAgent()`, which also creates the companion `agent_destinations` row the container's structured delivery tools use for named-destination resolution and authorization.
 
 ```bash
 SLACK_CHANNEL_ID=CTEST00004                  # Slack channel id for #agents-example

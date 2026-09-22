@@ -8,7 +8,7 @@
  */
 import crypto from 'crypto';
 import { outcomeReportingEnabled } from '../outcome-reporting.js';
-import { OUTCOME_PURPOSES, renderWorkOutcome } from '../outcome-reporting-schema.js';
+import { OUTCOME_PURPOSES, renderWorkOutcome, type TrustedRequestIdentity } from '../outcome-reporting-schema.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -29,7 +29,7 @@ function chatSendDenial(): string | null {
   }
   return null;
 }
-import { getCurrentInReplyTo } from '../db/session-state.js';
+import { getCurrentInReplyTo, resolveRequestCandidate } from '../db/session-state.js';
 import { getSessionRouting, getTaskSeriesId } from '../db/session-routing.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
@@ -102,7 +102,7 @@ const ROUTING_MESSAGE_LEADING_OPENER_RE = /^\s*<message\s+to="[^"]*"\s*>/;
 const ROUTING_MESSAGE_CLOSER = '</message>';
 
 /**
- * Strip a leading `<message to="...">...</message>` envelope, terminating
+ * Recognize a leading `<message to="...">...</message>` envelope, terminating
  * at the FIRST closing tag — never the last, and never a nested one.
  *
  * This used to be a single regex whose inner group was a tempered token,
@@ -165,9 +165,11 @@ function normalizeToolMessageText(
     };
   }
 
-  // The envelope's `to` is deliberately ignored: the MCP tool's `to` (or its
-  // current-conversation default) is the only routing authority on this path.
-  return { text: envelope };
+  return {
+    error:
+      'text uses an obsolete `<message to="...">...</message>` delivery envelope. ' +
+      `Pass the body directly to ${callerTool}; its routing fields are authoritative.`,
+  };
 }
 
 // Mirrors the host's THREAD_KEY_PATTERN (src/db/thread-key-anchors.ts), which
@@ -262,7 +264,7 @@ export const sendMessage: McpToolDefinition = {
   tool: {
     name: 'send_message',
     description:
-      'Send a message. Omit `to` to post in the CURRENT conversation (the thread/channel you are working in) — this is the default and works regardless of how many destinations you have, so it is the right choice for progress updates and results of the work you were asked to do. Pass `to` ONLY to reach a different destination than the current conversation (a sibling agent, another channel, or a DM someone explicitly asked you to use). Do not redirect routine status/completion to a DM. A container file path means nothing to the user — attach it with send_file or excerpt its content here instead of naming the path.',
+      'Send a structured public message. Omit `to` for the CURRENT conversation; pass it only for a requested different destination. Use reply for requested interaction, outcome for one finished human work item, urgent/decision for material exceptions, handoff for actionable coordination, and progress only for an internal work record. The harness owns acknowledgment/liveness. A container file path is not user-accessible; attach it with send_file.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -286,14 +288,19 @@ export const sendMessage: McpToolDefinition = {
             workItem: {
               type: 'string',
               description:
-                'Original GitHub PR/issue or Slack human request permalink. Reuse through all phases/retries.',
+                'Legacy original GitHub PR/issue or Slack request URL. Omit when using the harness requestId.',
+            },
+            requestId: {
+              type: 'integer',
+              description:
+                'Harness-supplied id from the original inbound <message id="…">. Required when several requests are available.',
             },
             verified: { type: 'string' },
-            evidence: { type: 'string', description: 'Accessible HTTPS evidence link.' },
+            evidence: { type: 'string', description: 'Optional accessible HTTPS evidence link.' },
             remaining: { type: 'string' },
             needsYou: { type: 'string' },
           },
-          required: ['workItem', 'verified', 'evidence'],
+          required: ['verified'],
         },
         thread_key: { type: 'string', description: THREAD_KEY_DESCRIPTION },
       },
@@ -320,9 +327,19 @@ export const sendMessage: McpToolDefinition = {
       return err(
         'Choose an explicit purpose: progress stays internal; outcome, reply, urgent, decision or actionable handoff may reach the channel.',
       );
+    let reportedOutcome = args.outcome;
     if (policy && purpose === 'outcome') {
       try {
-        text = renderWorkOutcome(text, args.outcome).text;
+        const rawOutcome = args.outcome as Record<string, unknown> | undefined;
+        let trustedRequest: TrustedRequestIdentity | undefined;
+        if (rawOutcome?.workItem === undefined) {
+          const candidate = resolveRequestCandidate(rawOutcome?.requestId);
+          const sessionId = process.env.NANOCLAW_SESSION_ID;
+          if (!sessionId) throw new Error('Harness session identity is unavailable');
+          trustedRequest = { sessionId, messageId: candidate.messageId, sequence: candidate.sequence };
+          reportedOutcome = { ...rawOutcome, requestId: candidate.sequence };
+        }
+        text = renderWorkOutcome(text, reportedOutcome, trustedRequest).text;
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
       }
@@ -346,7 +363,7 @@ export const sendMessage: McpToolDefinition = {
               reporting: {
                 version: 1,
                 purpose,
-                ...(purpose === 'outcome' ? { outcome: args.outcome, summary: normalized.text } : {}),
+                ...(purpose === 'outcome' ? { outcome: reportedOutcome, summary: normalized.text } : {}),
               },
             }
           : {}),

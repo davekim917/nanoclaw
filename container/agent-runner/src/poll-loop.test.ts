@@ -6,7 +6,7 @@ import path from 'path';
 import { evaluateAdmission, registerAdmissionGate } from './admission-gate.js';
 import { _resetConfig, loadConfig } from './config.js';
 import { clearStaleProcessingAcks, setContainerToolInFlight } from './db/container-state.js';
-import { setContinuation } from './db/session-state.js';
+import { getRequestCandidates, rememberRequestCandidates, setContinuation } from './db/session-state.js';
 import { setStickyModel, setStickyEffort } from './modules/mailbox/session-state.js';
 import { getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getAgentMailbox } from './mailbox/index.js';
@@ -4825,6 +4825,84 @@ describe('outcome reporting — quiet work and expected replies', () => {
   afterEach(() => {
     delete process.env.NANOCLAW_OUTCOME_REPORTING;
   });
+
+  it('retains original human request ids and excludes host or agent-authored triggers', () => {
+    rememberRequestCandidates([
+      {
+        id: 'agent-handoff',
+        seq: 1,
+        kind: 'chat-sdk',
+        trigger: 1,
+        channel_type: 'agent',
+        content: JSON.stringify({ sender: 'Peer', text: 'handoff' }),
+      },
+      {
+        id: 'host-note',
+        seq: 2,
+        kind: 'chat',
+        trigger: 1,
+        channel_type: 'slack',
+        content: JSON.stringify({ origin: 'host', text: 'restart note' }),
+      },
+      {
+        id: 'human-request',
+        seq: 3,
+        kind: 'chat',
+        trigger: 1,
+        channel_type: 'slack',
+        content: JSON.stringify({ sender: 'Operator', senderId: 'U1', text: 'Do the work.' }),
+      },
+    ]);
+    expect(getRequestCandidates()).toEqual([{ sequence: 3, messageId: 'human-request' }]);
+  });
+
+  it('emits one deterministic liveness row and ties turn-end cleanup to it', async () => {
+    insertMessage('liveness-human', 'chat', { sender: 'Operator', senderId: 'U1', text: 'Run the check.' });
+    const provider = {
+      supportsNativeSlashCommands: false,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      isRetryable: () => false,
+      query: () => {
+        async function* events(): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'liveness-session' };
+          yield { type: 'result', text: '<internal>done</internal>' };
+        }
+        return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+      },
+    };
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+    try {
+      const deadline = Date.now() + 3_000;
+      let turnEnd: { content: string } | undefined;
+      while (!turnEnd) {
+        turnEnd = getOutboundDb()
+          .prepare("SELECT content FROM messages_out WHERE kind = 'system' ORDER BY seq DESC LIMIT 1")
+          .get() as { content: string } | undefined;
+        if (Date.now() >= deadline) throw new Error('timed out waiting for turn-end lifecycle cleanup');
+        if (!turnEnd) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const statuses = getOutboundDb()
+        .prepare("SELECT id,content FROM messages_out WHERE kind = 'status' ORDER BY seq")
+        .all() as Array<{ id: string; content: string }>;
+      expect(statuses).toHaveLength(1);
+      expect(JSON.parse(statuses[0]!.content)).toEqual({
+        text: 'Accepted · working',
+        reporting: { version: 1, purpose: 'liveness', state: 'working' },
+      });
+      expect(JSON.parse(turnEnd.content)).toEqual({ action: 'turn_end', lifecycleStatusId: statuses[0]!.id });
+    } finally {
+      abort.abort();
+      await loop;
+    }
+  }, 5_000);
 
   it.each(['claude', 'codex'])(
     'keeps internal output from clearing reply debt and nudges via the tool once (%s)',

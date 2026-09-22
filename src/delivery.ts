@@ -1,4 +1,4 @@
-import { renderWorkOutcome } from './outcome-reporting-schema.js';
+import { canonicalWorkItem, renderWorkOutcome } from './outcome-reporting-schema.js';
 import { claimWorkOutcome, settleWorkOutcome } from './db/work-outcome-receipts.js';
 /**
  * Outbound message delivery.
@@ -12,6 +12,7 @@ import { claimWorkOutcome, settleWorkOutcome } from './db/work-outcome-receipts.
 import {
   bumpLastOutbound,
   getRunningSessions,
+  getSession,
   getSessionsActiveSince,
   createPendingQuestion,
   getPendingApproval,
@@ -279,8 +280,15 @@ interface StatusTrack {
    *  the route until a replacement post succeeds, but never retry the doomed
    *  edit while the replacement is pending. */
   editExhausted?: boolean;
+  /** True only for the runner-authored deterministic lifecycle row. */
+  lifecycle?: boolean;
 }
 const statusTracking = new Map<string, StatusTrack>();
+
+/** Simulates host-process memory loss while leaving durable mailbox rows intact. */
+export function _resetStatusTrackingForTest(): void {
+  statusTracking.clear();
+}
 
 /**
  * Delete this session's tracked 💭 status and clear the tracking entry.
@@ -315,11 +323,83 @@ const statusTracking = new Map<string, StatusTrack>();
  * the host never depends on a dying process to clean up after itself.
  */
 export async function clearSessionStatusOnKill(sessionId: string): Promise<void> {
-  await dropOrphanStatus(sessionId);
+  await stopSessionLifecycleStatus(sessionId, 'Stopped.', undefined);
 }
 
-async function dropOrphanStatus(sessionId: string, opts: { skip?: boolean } = {}): Promise<void> {
-  const orphan = opts.skip ? undefined : statusTracking.get(sessionId);
+async function stopSessionLifecycleStatus(
+  sessionId: string,
+  text: string,
+  outboundId: string | undefined,
+): Promise<void> {
+  let status = statusTracking.get(sessionId);
+  if (status && !status.lifecycle) {
+    await dropOrphanStatus(sessionId);
+    return;
+  }
+  if (!status) status = await recoverLifecycleStatus(sessionId, outboundId);
+  if (!status || !deliveryAdapter) return;
+  try {
+    await deliveryAdapter.deliver(
+      status.channelType,
+      status.platformId,
+      status.threadId,
+      'status',
+      JSON.stringify({ operation: 'edit', messageId: status.messageId, text }),
+      undefined,
+      status.instance,
+    );
+  } catch (err) {
+    log.warn('Failed to mark lifecycle status stopped; deleting stale working line', {
+      sessionId,
+      messageId: status.messageId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    if (deliveryAdapter.deleteMessage) {
+      try {
+        await deliveryAdapter.deleteMessage(
+          status.channelType,
+          status.platformId,
+          status.threadId,
+          status.messageId,
+          status.instance,
+        );
+      } catch {
+        // Best effort: the adapter rejected both safe terminal operations.
+      }
+    }
+  }
+  statusTracking.delete(sessionId);
+}
+
+async function recoverLifecycleStatus(sessionId: string, outboundId?: string): Promise<StatusTrack | undefined> {
+  const session = await getSession(sessionId);
+  if (!session) return undefined;
+  const recovered = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+    mailbox.getRecoverableLifecycleStatus(outboundId),
+  );
+  if (!recovered) return undefined;
+  const origin = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
+  const mg =
+    origin && origin.channel_type === recovered.channelType && origin.platform_id === recovered.platformId
+      ? origin
+      : await getMessagingGroupByPlatform(recovered.channelType, recovered.platformId);
+  return {
+    channelType: recovered.channelType,
+    platformId: recovered.platformId,
+    threadId: recovered.threadId,
+    messageId: recovered.platformMessageId,
+    instance: mg?.instance,
+    inReplyTo: null,
+    lifecycle: true,
+  };
+}
+
+async function dropOrphanStatus(
+  sessionId: string,
+  opts: { skip?: boolean; recoverLifecycle?: boolean } = {},
+): Promise<void> {
+  let orphan = opts.skip ? undefined : statusTracking.get(sessionId);
+  if (!orphan && opts.recoverLifecycle && !opts.skip) orphan = await recoverLifecycleStatus(sessionId);
   if (orphan && deliveryAdapter?.deleteMessage) {
     try {
       await deliveryAdapter.deleteMessage(
@@ -1090,14 +1170,12 @@ async function deliverMessage(
 
   const content = JSON.parse(msg.content);
 
-  let quietOutcomes = false;
   let externalOutcomeChannels: string[] = [];
   const wikiGroup = await getAgentGroup(session.agent_group_id);
   if (wikiGroup) {
     const { readContainerConfig } = await import('./container-config.js');
     // Enrollment, not the model's tool list, constrains raw outbound rows too.
     const cfg = readContainerConfig(wikiGroup.folder);
-    quietOutcomes = cfg.outcomeReporting === true;
     externalOutcomeChannels = cfg.outcomeReportingExternalChannels ?? [];
     if (wikiEnrollment(wikiGroup.id, cfg.wikiMaintenance === true)) {
       if (!allowedWikiOutbound(msg.kind, content.action))
@@ -1335,7 +1413,10 @@ async function deliverMessage(
   // spawn thread. Edit-in-place and the on-chat orphan delete are bypassed
   // so progress survives the final answer.
   if (msg.kind === 'status') {
-    if (quietOutcomes && content.reporting?.version === 1) return { recordOnly: true };
+    // Suppress only rows whose emitting runner explicitly typed them as
+    // internal progress. A default-on host can coexist with preserved old
+    // runners: their untyped status rows keep the legacy public behavior.
+    if (content.reporting?.version === 1 && content.reporting?.purpose === 'progress') return { recordOnly: true };
     if (!msg.channel_type || !msg.platform_id) {
       log.warn('Status message missing routing fields, dropping', { id: msg.id });
       return {};
@@ -1453,6 +1534,7 @@ async function deliverMessage(
         messageId: platformMsgId,
         instance: deliverInstance,
         inReplyTo: msg.in_reply_to,
+        lifecycle: content.reporting?.version === 1 && content.reporting?.purpose === 'liveness',
       });
     }
     if (replacedStatus && platformMsgId) {
@@ -1554,10 +1636,13 @@ async function deliverMessage(
   if (isRoutineOutcome && session.messaging_group_id === null && isTaskThread(session.thread_id)) {
     // A recurring task's old conversation is not the new human work item's thread.
     baseThreadId = null;
-    const item = renderWorkOutcome(content.reporting.summary, content.reporting.outcome).key;
-    const slackRequest = /^slack:[^:]+:([^:]+):(\d{10})(\d{6})$/.exec(item);
-    if (slackRequest && msg.platform_id === `slack:${slackRequest[1]}`)
-      baseThreadId = `${msg.platform_id}:${slackRequest[2]}.${slackRequest[3]}`;
+    const legacyWorkItem = (content.reporting.outcome as Record<string, unknown> | undefined)?.workItem;
+    if (legacyWorkItem !== undefined) {
+      const item = canonicalWorkItem(legacyWorkItem);
+      const slackRequest = /^slack:[^:]+:([^:]+):(\d{10})(\d{6})$/.exec(item);
+      if (slackRequest && msg.platform_id === `slack:${slackRequest[1]}`)
+        baseThreadId = `${msg.platform_id}:${slackRequest[2]}.${slackRequest[3]}`;
+    }
   }
 
   // Rolling task-session thread anchor (fleet-hardening Phase 1.4). A task
@@ -1665,12 +1750,58 @@ async function deliverMessage(
       throw new Error(
         'This channel has an existing terminal reporter. Hand off the outcome through that route; do not post a competing report.',
       );
-    const rendered = renderWorkOutcome(content.reporting.summary, content.reporting.outcome);
+    const rawOutcome = content.reporting.outcome as Record<string, unknown> | undefined;
+    let trustedRequest: Parameters<typeof renderWorkOutcome>[2];
+    if (rawOutcome?.workItem === undefined) {
+      const sequence = rawOutcome?.requestId;
+      if (!Number.isSafeInteger(sequence) || (sequence as number) < 1)
+        throw new Error('Malformed harness request identity');
+      const source = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+        mailbox.getInboundRequestIdentity(sequence as number),
+      );
+      if (!source) throw new Error('Harness request identity does not belong to this source session');
+      let sourceContent: {
+        platformMsgId?: unknown;
+        sender?: unknown;
+        senderId?: unknown;
+        origin?: unknown;
+      };
+      try {
+        sourceContent = JSON.parse(source.content) as typeof sourceContent;
+      } catch (error) {
+        throw new Error('Malformed harness request source', { cause: error });
+      }
+      if (
+        source.kind !== 'task' &&
+        (sourceContent.sender === 'system' || sourceContent.senderId === 'system' || sourceContent.origin === 'host')
+      )
+        throw new Error('Harness request identity is not an original human request');
+      const platformMessageId =
+        typeof sourceContent.platformMsgId === 'string' && sourceContent.platformMsgId
+          ? sourceContent.platformMsgId
+          : undefined;
+      trustedRequest = {
+        sessionId: session.id,
+        messageId: source.id,
+        sequence: source.seq,
+        ...(platformMessageId && source.channel_type && source.platform_id
+          ? {
+              origin: {
+                channelType: source.channel_type,
+                platformId: source.platform_id,
+                platformMessageId,
+              },
+            }
+          : {}),
+      };
+    }
+    const rendered = renderWorkOutcome(content.reporting.summary, rawOutcome, trustedRequest);
     if (content.text !== rendered.text || content.operation || content.files)
       throw new Error('Malformed outcome envelope');
-    if (!wikiGroup?.workgroup_id) throw new Error('Outcome reporting requires actual workgroup membership');
+    if (!wikiGroup) throw new Error('Outcome reporting requires a source agent group');
+    const receiptScope = wikiGroup.workgroup_id ?? `agent-group:${wikiGroup.id}`;
     const claim = await claimWorkOutcome({
-      workgroup_id: wikiGroup.workgroup_id,
+      workgroup_id: receiptScope,
       work_item: rendered.key,
       message_id: msg.id,
       session_id: session.id,
@@ -1689,7 +1820,7 @@ async function deliverMessage(
       // Never re-send a claim whose platform acceptance is unknown, including after restart.
       return { deferAck: true };
     }
-    outcomeClaim = { workgroup: wikiGroup.workgroup_id, key: rendered.key };
+    outcomeClaim = { workgroup: receiptScope, key: rendered.key };
   }
   let platformMsgId: string | undefined;
   try {
@@ -1801,14 +1932,14 @@ async function deliverMessage(
   // message already gone) leaves the orphan visible but must NOT block
   // markDelivered for the chat reply itself — that would cause retry/
   // duplicate of the real answer.
-  if (msg.kind === 'chat') {
+  if (msg.kind === 'chat' || msg.kind === 'chat-sdk') {
     // Skip orphan delete for spawn-task children — they were posted in
     // append mode (durable work log), so there's no orphan to clean up.
     // The statusTracking map is also untouched in append mode, but call
     // `delete` anyway as a defensive no-op in case a regular chat row ever
     // got tracked before the session was classified as a spawn child.
     const isSpawnChild = await isSpawnChildSession(session.id);
-    await dropOrphanStatus(session.id, { skip: isSpawnChild });
+    await dropOrphanStatus(session.id, { skip: isSpawnChild, recoverLifecycle: true });
 
     // Mirror agent replies into the central archive (2.9). Scrubbed text
     // so any accidentally-included secret stays out of searchable history.
@@ -1991,9 +2122,12 @@ export function stopDeliveryPolls(): void {
  */
 registerDeliveryAction(
   'turn_end',
-  async (_content, session) => {
-    await dropOrphanStatus(session.id);
+  async (content, session) => {
+    const lifecycleStatusId = typeof content.lifecycleStatusId === 'string' ? content.lifecycleStatusId : undefined;
+    if (lifecycleStatusId)
+      await stopSessionLifecycleStatus(session.id, 'Stopped before sending a reply.', lifecycleStatusId);
+    else await dropOrphanStatus(session.id);
     return undefined;
   },
-  unguarded('turn boundary — deletes only this session’s own status line, no privileged effect'),
+  unguarded('turn boundary — updates or deletes only this session’s own status line, no privileged effect'),
 );

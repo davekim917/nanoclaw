@@ -20,8 +20,12 @@ import { touchHeartbeat } from './heartbeat.js';
 import { clearStaleProcessingAcks } from './db/container-state.js';
 import {
   clearContinuation,
+  clearCurrentLifecycleStatus,
   clearCurrentInReplyTo,
+  getCurrentLifecycleStatus,
   migrateLegacyContinuation,
+  rememberRequestCandidates,
+  setCurrentLifecycleStatus,
   setContinuation,
   setCurrentInReplyTo,
 } from './db/session-state.js';
@@ -526,6 +530,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           config.provider.resetRotationCycle?.();
           setCurrentInReplyTo(routing.inReplyTo);
           setCurrentBatchAnchors(sourceBatch);
+          rememberRequestCandidates(sourceBatch);
           let query: AgentQuery | undefined;
           const abortDirectQuery = () => query?.abort();
           try {
@@ -723,6 +728,24 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // (same prompt/continuation, so the cause hasn't changed).
     const trigger = classifyTrigger(keep);
     markProcessing(keptIds);
+    rememberRequestCandidates(keep);
+    clearCurrentLifecycleStatus();
+    if (outcomeReportingEnabled() && !routing.taskRun && triggeringHumanInbound(keep) && !routing.quietStatus) {
+      const lifecycleStatusId = generateId();
+      await writeMessageOut({
+        id: lifecycleStatusId,
+        in_reply_to: routing.inReplyTo,
+        kind: 'status',
+        platform_id: routing.platformId,
+        channel_type: routing.channelType,
+        thread_id: routing.threadId,
+        content: JSON.stringify({
+          text: 'Accepted · working',
+          reporting: { version: 1, purpose: 'liveness', state: 'working' },
+        }),
+      });
+      setCurrentLifecycleStatus(lifecycleStatusId);
+    }
     if (hasRealInbound(keep)) {
       resetWorkContinuationForRealInbound();
       // Real input means the thread is not finished after all — retract any
@@ -2208,6 +2231,7 @@ export async function processQuery(
         const followUpRouting = extractRouting(keep);
         setCurrentInReplyTo(followUpRouting.inReplyTo);
         setCurrentBatchAnchors(keep);
+        rememberRequestCandidates(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;
@@ -2238,9 +2262,12 @@ export async function processQuery(
         // and none was delivered.
         const midTurnNote =
           pushedHumanTrigger && !turnIdle
-            ? '\n\n<system>Reminder: unwrapped text you write between tool calls is NOT delivered. ' +
-              'To answer now, write a complete <message to="name">...</message> block or call the ' +
-              '`send_message` tool.</system>'
+            ? outcomeReportingEnabled()
+              ? '\n\n<system>Reminder: text written between tool calls is an internal work record. ' +
+                'To answer now, call send_message with purpose="reply".</system>'
+              : '\n\n<system>Reminder: unwrapped text you write between tool calls is NOT delivered. ' +
+                'To answer now, write a complete <message to="name">...</message> block or call the ' +
+                '`send_message` tool.</system>'
             : '';
         const pushedId = pushToQuery(prompt + midTurnNote, extractAttachments(keep));
         if (admittedTurn && pushedId) admittedTurn.promptIds = [pushedId];
@@ -2751,7 +2778,9 @@ export async function processQuery(
           const names = destinations.map((d) => d.name).join(', ');
           reminder +=
             ` Reminder: you have ${destinations.length} destinations (${names}). ` +
-            'Use <message to="name"> blocks to address them. Bare text goes to the scratchpad fallback only.';
+            (outcomeReportingEnabled()
+              ? 'Use send_message with an explicit purpose to address them; omit to for the current conversation.'
+              : 'Use <message to="name"> blocks to address them. Bare text goes to the scratchpad fallback only.');
         }
         pushToQuery(ensureFreshContextBootstrap(reminder));
       } else if (event.type === 'interim_text') {
@@ -3078,7 +3107,13 @@ export async function dispatchInterimMessageBlocks(
  * assume inbound rows are already marked completed when this row lands.
  */
 async function emitTurnEnd(): Promise<void> {
-  await writeMessageOut({ id: generateId(), kind: 'system', content: JSON.stringify({ action: 'turn_end' }) });
+  const lifecycleStatusId = getCurrentLifecycleStatus();
+  await writeMessageOut({
+    id: generateId(),
+    kind: 'system',
+    content: JSON.stringify({ action: 'turn_end', ...(lifecycleStatusId ? { lifecycleStatusId } : {}) }),
+  });
+  clearCurrentLifecycleStatus();
 }
 
 export async function dispatchResultText(

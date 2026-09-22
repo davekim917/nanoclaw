@@ -11,21 +11,32 @@
  */
 import { getAllDestinations } from './destinations.js';
 import { getTaskSeriesId } from './db/session-routing.js';
+import { outcomeReportingEnabled } from './outcome-reporting.js';
 // Module barrel — loads registration modules, including the singular mailbox slot.
 import './modules/index.js';
 import { getAgentMailbox, readMailboxContext } from './mailbox/index.js';
 
-export function buildCompactInstructions(names: string[], taskId: string | null): string {
+export function buildCompactInstructions(
+  names: string[],
+  taskId: string | null,
+  structuredReporting = outcomeReportingEnabled(),
+): string {
   const deliveryReminder = taskId
     ? [
         '   "This is an isolated task run. If you need to send the user a message, use send_message with an explicit to destination.',
         `   Final output is not delivered; it becomes the automatic summary in tasks/${taskId}.md.`,
         `   Available destinations: ${formatDestinationNames(names)}."`,
       ]
-    : [
-        '   "You MUST wrap all responses in <message to="name">...</message> blocks — use to="here" for the current conversation (the default).',
-        `   Available destinations: ${formatDestinationNames(names)}."`,
-      ];
+    : structuredReporting
+      ? [
+          '   "Public replies use send_message with an explicit purpose; omit to for the current conversation.',
+          '   Final text is an internal work record under this runtime capability.',
+          `   Available destinations: ${formatDestinationNames(names)}."`,
+        ]
+      : [
+          '   "You MUST wrap all responses in <message to="name">...</message> blocks — use to="here" for the current conversation (the default).',
+          `   Available destinations: ${formatDestinationNames(names)}."`,
+        ];
 
   return [
     'Preserve the following in the compaction summary:',
