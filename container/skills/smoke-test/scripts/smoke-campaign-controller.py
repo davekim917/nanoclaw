@@ -224,6 +224,35 @@ def crash_point(point, kind="", slot=""):
     os._exit(137)
 
 
+def refusal_digest(doc):
+    """A stable id for THE REFUSAL, from a published barrier report (or None).
+
+    `invalid[]` AND `invalidReasons[]`, in the barrier's own order and never
+    `missing[]`. Each half of that is deliberate:
+
+    - `missing[]` is the owner's own progress -- markers it is in the middle of
+      writing. Folding it in would wake the owner on every marker it banks,
+      which trains it to ignore the wake that matters.
+    - the reasons, not just the file names, because a repair commonly moves the
+      refusal without moving the file: run pr2055's scope-dispositions.json went
+      from `dispositions[3]/[30]/[31]` to `[3]/[30]/[32]` between fires, one
+      file throughout. Keying on `invalid[]` alone would call that unchanged and
+      leave the owner working against a stale diagnosis.
+    - the barrier's own order, not sorted: it is deterministic for a given tree
+      (requiredLaneMarkers in contract order, then the journeys and visual
+      checks in fixed sequence), so sorting would only hide a genuine change.
+
+    "" means nothing is refused -- which is never a reason to wake anyone."""
+    if not isinstance(doc, dict):
+        return ""
+    invalid = doc.get("invalid") or []
+    reasons = doc.get("invalidReasons") or []
+    if not invalid and not reasons:
+        return ""
+    return hashlib.sha256(json.dumps([invalid, reasons], sort_keys=False,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()[:32]
+
+
 def read_json_file(path):
     """(value, error). error is None only for a parsed document."""
     try:
@@ -739,6 +768,10 @@ ONESHOT_TEXT = {
         "{run}/controller/dispatch-adjudicator.started first. Never post, finish or file."),
 }
 ONESHOT_ARTIFACTS = {"critic": "contact-sheet/critic.json", "adjudicator": "controller/adjudication.json"}
+# The owner steps a phase barrier gates. Their briefs carry a pointer to the
+# barrier's published answer (_brief_notes); the others have no barrier to cite.
+BARRIER_STEPS = ("lanes", "synthesis")
+
 OWNER_BRIEF = {
     "intake": (
         "Intake for this run, as the retained technical owner (pr-campaign skill flow, steps 1-2). The gate "
@@ -822,7 +855,7 @@ class EffectLayer:
             # socket, no file outside --out-dir is touched on this path.
             return {"outcome": "shadow_refused"}
         handler = {"send": self._send, "gh": self._gh, "gate": self._gate, "ncl_create": self._dispatch,
-                   "owner_wake": self._owner_wake}.get(effect.get("type"))
+                   "owner_wake": self._owner_wake, "barrier_report": self._barrier_report}.get(effect.get("type"))
         if handler is None:
             raise ControllerError("unknown effect type {!r}".format(effect.get("type")))
         try:
@@ -1211,11 +1244,138 @@ class EffectLayer:
             step=step, run_id=run_id, pr=c["pr"], sha=c["sha"], run=run)
         body = OWNER_BRIEF.get(step, "Step {}: see the owner router.".format(step)).format(run=run)
         root = self.ctl.args.run_root
-        if step == "intake" and c.get("wake"):
+        # THE WAKE IS THE ONLY PLACE THE OWNER LEARNS ITS OWNER TOKEN -- the
+        # intake brief says so in as many words ("use its coordinatorOwnerToken
+        # as SMOKE_GATE_OWNER for every smoke-run-scaffold.sh writer"). But the
+        # gate mints a FRESH token on every same-run recovery poll
+        # (smoke-pr-gate.sh:5312, written to lease/authority/state at :5341,
+        # :5346, :5389), and reconcile_claims records the new one the wake
+        # carries. Writing wake.json only at intake left the run tree naming a
+        # RETIRED token while the brief still told the owner to use it: every
+        # scaffold write, and `adopt` -- the verb that exists for exactly this
+        # transition (smoke-run-scaffold.sh:679, and its own header says so) --
+        # then dies in begin_active_run_fence's owner check
+        # (smoke-run-scaffold.sh:267-269)
+        # with no legitimate way back. XZO #2046, run
+        # xzo-pr-pr2055-dacf01328421-20260921T193111Z. It is refreshed on EVERY
+        # step so the file the brief points at always names the live token.
+        # AN ACK NEVER OUTLIVES THE BRIEF IT ACKNOWLEDGED. The ack is the
+        # owner's first act on a wake and the controller only tests it for
+        # existence, re-offering a wake solely while it is ABSENT (owner_step,
+        # :2147-2157); the renewer reads it the same way
+        # (smoke-controller-renew.sh, "brief-<step>.ack absent: no owner turn
+        # holds this step"). So a brief rewritten under a NEW owner token would
+        # otherwise inherit the previous brief's ack and be treated as taken,
+        # and never re-offered -- the second half of XZO #2046. Removing it here
+        # makes that impossible by construction rather than by sequencing: this
+        # function runs only when the obligation is absent or `intent`
+        # (owner_step, :2124), never while a live brief is enqueued, so any ack
+        # it finds belongs to a brief this write supersedes.
+        try:
+            dfd = _open_dir_contained(root, [run_id, "controller"], True)
+        except ControllerError:
+            dfd = None
+        if dfd is not None:
+            try:
+                os.unlink("brief-{}.ack".format(step), dir_fd=dfd)
+            except OSError:
+                pass
+            finally:
+                os.close(dfd)
+        if c.get("wake"):
             write_contained_atomic(root, [run_id, "controller", "wake.json"],
                                    json.dumps(c["wake"], sort_keys=True, indent=1) + "\n")
-        write_contained_atomic(root, [run_id, "controller", "brief-{}.md".format(step)], head + body + "\n")
-        return {"outcome": "brief_written", "brief": os.path.join(run, "controller", "brief-{}.md".format(step))}
+        notes = self._brief_notes(run_id, step, run, c)
+        write_contained_atomic(root, [run_id, "controller", "brief-{}.md".format(step)],
+                               head + notes + body + "\n")
+        # briefedToken and briefedRefusal are what make the two re-offer rules
+        # re-derived invariants instead of edges: both are journaled by
+        # owner_step only once the brief is actually on disk, so a crash before
+        # that leaves the step still owing its re-offer. The refusal is read
+        # back from the published report rather than taken from the caller, so
+        # what is recorded is exactly what the owner can open and read.
+        return {"outcome": "brief_written", "briefedToken": c.get("token"),
+                "briefedRefusal": refusal_digest(
+                    read_json_file(os.path.join(run, "controller", "barrier-{}.json".format(step)))[0]),
+                "brief": os.path.join(run, "controller", "brief-{}.md".format(step))}
+
+    def _barrier_report(self, effect):
+        """Publish the phase barrier's own answer into the run tree.
+
+        The barrier tells the controller exactly which artifact it rejects and
+        why (smoke-evidence-barrier.sh -> invalid[]/invalidReasons[]). Before
+        this, the controller kept that to its own decisions journal -- truncated
+        to three reasons -- and woke the owner with a STATIC brief that said
+        nothing about it (XZO #2047, run
+        xzo-pr-pr2055-dacf01328421-20260921T193111Z: the lanes barrier named
+        journeys/scope-dispositions.json invalid on the 19:51:35Z fire and the
+        owner, the only party that could repair it, first learned of it at
+        20:58Z by running the barrier itself). The file is rewritten every fire
+        the phase is refused and removed the moment it passes, so it is never
+        stale advice."""
+        run_id, phase, doc = effect["runId"], effect["phase"], effect["barrier"]
+        root = self.ctl.args.run_root
+        name = "barrier-{}.json".format(phase)
+        if doc is None:
+            # Removed through the same containment the write uses, never by a
+            # joined path: an unlink is as much a write as the write is.
+            try:
+                dfd = _open_dir_contained(root, [run_id, "controller"], False)
+            except ControllerError:
+                return {"outcome": "published"}
+            try:
+                os.unlink(name, dir_fd=dfd)
+            except OSError:
+                pass
+            finally:
+                os.close(dfd)
+            return {"outcome": "published"}
+        write_contained_atomic(root, [run_id, "controller", name],
+                               json.dumps(doc, sort_keys=True, indent=1) + "\n")
+        return {"outcome": "published"}
+
+    def _brief_notes(self, run_id, step, run, claim):
+        """Run-specific preamble the STATIC OWNER_BRIEF template cannot carry:
+        what this fire's barrier refused, and whether the owner's token was
+        reissued under it. Both are things the controller already knows at the
+        moment it writes the brief and used to keep to its own journal."""
+        out = []
+        ob = self.ctl.obligations().get(obligation_key(run_id, "owner", step)) or {}
+        if (ob.get("detail") or {}).get("tokenReissued"):
+            out.append(
+                "**YOUR OWNER TOKEN CHANGED (XZO #2046).** A recovery `poll` re-minted this run's coordinator "
+                "lease under a fresh token, so the one you have been using is retired and every "
+                "`smoke-run-scaffold.sh` write will be refused by its owner fence. Re-read "
+                "`{run}/controller/wake.json` (refreshed with this brief), export its `coordinatorOwnerToken` as "
+                "`SMOKE_GATE_OWNER`, and run `smoke-run-scaffold.sh adopt {run} {sha}` BEFORE any further "
+                "artifact write. Do NOT copy a token out of gate state or any other actor's file: the one in "
+                "wake.json is issued to you, which is what makes the adoption an adoption.".format(
+                    run=run, sha=claim.get("sha") or "<frozen source sha>"))
+        if step in BARRIER_STEPS:
+            report = os.path.join(run, "controller", "barrier-{}.json".format(step))
+            # The loud lead is for CONTENT the barrier rejects -- the thing only
+            # the owner can repair and the thing #2055 never heard about. A
+            # barrier that is merely waiting for markers the step is about to
+            # write is not news, and saying it in the same words would train the
+            # owner to skim past the one line that matters.
+            doc, _err = read_json_file(report)
+            refusing = bool(isinstance(doc, dict) and doc.get("invalid"))
+            # Stated on EVERY barrier-backed brief, not only when the file
+            # happens to exist as the brief is written: a brief is written once
+            # and a barrier is re-run every fire, so a refusal that starts
+            # later would otherwise still be invisible. The file itself is
+            # rewritten (and removed) every fire, so it is always this fire's
+            # answer.
+            out.append(
+                "{lead} The barrier's own answer for this run is `{report}`, rewritten every controller fire and "
+                "removed once the phase passes. `invalid[]` names artifacts whose CONTENT the barrier rejects — "
+                "they are yours to repair and no amount of lane work clears them — and `missing[]` names what is "
+                "not written yet. Read it before you start and again before you report this step done: the phase "
+                "cannot pass while `invalid[]` is non-empty, and the controller will not tell you twice.".format(
+                    report=report,
+                    lead=("**THE BARRIER IS ALREADY REFUSING THIS PHASE.**" if refusing
+                          else "**CHECK THE BARRIER, DO NOT ASSUME IT.**")))
+        return "".join(n + "\n\n" for n in out)
 
 
 def frozen_terminal_verb(detail):
@@ -1559,6 +1719,19 @@ class Controller:
 
     def obligations(self):
         return self.journal.obligations()
+
+    def publish_barrier(self, run_id, phase, barrier):
+        """Put this fire's barrier answer where the OWNER can read it, or take
+        a stale one away once the phase passes. Not an obligation: it carries
+        no promise, it is a mirror of a check that is re-run every fire. Shadow
+        refuses it like every other run-tree write."""
+        self.effects.perform({"type": "barrier_report", "runId": run_id, "phase": phase,
+                              "barrier": None if barrier is None else {
+                                  "at": iso(self.now), "phase": phase,
+                                  "ready": bool(barrier.get("ready")),
+                                  "missing": barrier.get("missing") or [],
+                                  "invalid": barrier.get("invalid") or [],
+                                  "invalidReasons": barrier.get("invalidReasons") or []}})
 
     def record(self, run_id, kind, slot, state, attempt=None, detail=None):
         rec = {"at": iso(self.now), "fire": self.fire, "runId": run_id, "kind": kind, "slot": slot,
@@ -1957,7 +2130,16 @@ class Controller:
                         wakeAgent=True, effect=result["outcome"], afterReconcile=bool(ob))
             crash_point("after-effect", "owner", step)
             if result["outcome"] in ("shadow_refused", "brief_written"):
-                self.record(run_id, "owner", step, "enqueued", 1, {"brief": brief, "outcome": result["outcome"]})
+                enqueued = {"brief": brief, "outcome": result["outcome"]}
+                # Only once the brief is on disk (see _owner_wake's return):
+                # _reissue_owner_token reads this to decide whether the step
+                # still owes a re-offer, so recording it early would close the
+                # transition a crash had not actually completed.
+                if result.get("briefedToken"):
+                    enqueued["briefedToken"] = result["briefedToken"]
+                if "briefedRefusal" in result:
+                    enqueued["briefedRefusal"] = result["briefedRefusal"]
+                self.record(run_id, "owner", step, "enqueued", 1, enqueued)
                 self.owner_wakes.append({"runId": run_id, "step": step, "brief": result.get("brief") or brief,
                                          "key": key, "since": iso(self.now)})
                 return "enqueued"
@@ -2003,6 +2185,153 @@ class Controller:
                                       "sourceSha": claim["sha"], "coordinatorOwnerToken": token,
                                       "recoveredFromGateState": True}
         return detail
+
+    def _reissue_owner_token(self, run_id, token):
+        """A recovery poll re-minted this run's lease under a fresh token while
+        an owner step was IN FLIGHT. XZO #2046.
+
+        The gate is right to re-mint (that is how a coordinator that died is
+        recovered) and `adopt`'s fence is right to refuse a stale owner
+        (smoke-run-scaffold.sh:267-269, and `adopt` adds no authority check of
+        its own, :690-694). What was missing is the third party: the owner THIS
+        controller dispatched holds the retired token and has no way to learn
+        the new one, because `controller/wake.json` -- the only file that
+        carries it, and the file the intake brief names -- was written once, at
+        intake. So the owner the controller itself dispatched can never satisfy
+        the fence, and stops -- which is the correct behaviour, and why run
+        pr2055 banked 4 of 14 markers with the other 8 lanes' evidence complete
+        on disk.
+
+        THE INVARIANT, and why this is not the poll-reclaim edge it started as:
+
+            An in-flight owner step must have been briefed under the token the
+            gate holds now.
+
+        `briefedToken` is journaled with the step when its brief is actually
+        written (owner_step, from _owner_wake's result), so the condition is
+        re-derived every fire from durable state and never from "have I already
+        done this". An edge trigger on reconcile_claims' poll-reclaim branch
+        was not crash-safe: the claim record is fsynced first, so a death
+        between the two records left the journaled token matching the wake, the
+        branch skipped forever, and the owner enqueued on the old brief and a
+        stale wake.json -- the exact wedge this exists to recover from. Now a
+        crash anywhere in the sequence leaves the next fire able to finish it,
+        because the next fire asks the same question of the same durable state
+        and gets the same answer until the brief lands. Once `briefedToken`
+        equals the live token it is a no-op, so it is safe to run every fire.
+
+        The re-offer records the step back to `intent`, which makes owner_step
+        perform its wake again: that rewrites wake.json with the live token
+        (the only legitimate issue path -- copying the token out of gate state
+        is impersonation, not adoption), removes the stale `.ack`, and writes a
+        brief whose _brief_notes preamble says to run `adopt` before anything
+        else. `done`/`abandoned`/`failed_terminal` steps are left alone:
+        nothing is in flight to re-offer."""
+        if not token:
+            return
+        for ob in list(self.obligations().values()):
+            if ob["runId"] != run_id or ob["kind"] != "owner" or ob["state"] not in ("intent", "enqueued"):
+                continue
+            briefed = (ob.get("detail") or {}).get("briefedToken")
+            evidence = "journal"
+            if briefed == token:
+                continue
+            if briefed is None:
+                evidence = "run-tree"
+                # Journaled by a controller that did not track it: this file is
+                # a live bind mount, so a run can be mid-flight across the
+                # upgrade. The journal is silent -- the RUN TREE is not.
+                # `controller/wake.json` is the file the owner is told to read
+                # its token from (OWNER_BRIEF["intake"]) and the only file that
+                # carries one to it, so its `coordinatorOwnerToken` IS what the
+                # owner holds. Backfilling the gate's current token without
+                # looking would make every later fire see equality and skip the
+                # reissue forever -- on a run whose pre-upgrade poll had already
+                # re-minted, that is exactly the wedge this exists to end.
+                briefed = self._persisted_owner_token(run_id)
+                if briefed is None:
+                    evidence = "none"
+                if briefed == token:
+                    self.record(run_id, "owner", ob["slot"], ob["state"], ob["attempt"] or 1,
+                                {"briefedToken": token})
+                    continue
+                # Either the run tree names a DIFFERENT token (a re-mint the
+                # pre-upgrade controller never carried through -- genuine, fall
+                # through and re-offer), or there is no readable wake at all.
+                # No wake means no issued token, so the owner cannot satisfy
+                # begin_active_run_fence whatever it is holding, and the safe
+                # direction is to tell it: the re-offer writes wake.json with
+                # the live token and asks for an `adopt`, which is a no-op when
+                # the contract already names the caller (smoke-run-scaffold.sh
+                # adopt, the "exact retry" branch: no write, no history entry).
+                # So a spurious re-offer costs one owner turn and can corrupt
+                # nothing, while a silent backfill costs the campaign.
+            if ob["state"] == "intent" and (ob.get("detail") or {}).get("tokenReissued"):
+                continue  # already mid-transition; owner_step finishes it this fire
+            self.ensure_alarm(run_id, "controller_owner_token_reissued",
+                              "token-reissued:{}:{}".format(run_id[-24:], token[-8:]),
+                              {"step": ob["slot"],
+                               "reason": "a recovery poll re-minted this run's lease; the dispatched owner must "
+                                         "re-read controller/wake.json and run scaffold `adopt` before writing"})
+            self.record(run_id, "owner", ob["slot"], "intent", ob["attempt"] or 1, {"tokenReissued": True})
+            self.decide(run_id, ob["slot"], "wake_owner", "coordination_model",
+                        "owner token reissued; step re-offered for adoption", step=ob["slot"],
+                        evidence=evidence)
+
+    def _reoffer_on_new_refusal(self, run_id, step):
+        """Re-offer an ACKNOWLEDGED step whose barrier refusal has changed.
+
+        XZO #2047 again, by the likelier route. Round 1 covered first arrival:
+        the barrier was already refusing when the brief was written, so the
+        brief said so. The commoner order is the reverse -- the brief is issued
+        while the barrier is merely waiting for markers, the owner acks it,
+        then the owner writes evidence the barrier rejects. The next fire
+        publishes the new refusal and returns `ownerWake: null`, because
+        owner_step re-offers a wake only while the `.ack` is ABSENT
+        (:2147-2157). The diagnosis is on disk and nobody is told to read it --
+        the same dead end, reached the way run pr2055 actually reached it.
+
+        THE TRIGGER IS A CHANGE IN THE REFUSAL, NOT "INVALID". Narrower than
+        "the published answer changed", which would include `missing[]` and so
+        wake the owner on its own marker writes; wider than "became invalid",
+        which would leave an owner working against a refusal that has since
+        moved on to different files or different reasons. See refusal_digest.
+        A refusal that CLEARS re-offers nothing: there is nothing to say, and
+        the phase advances on its own.
+
+        Recorded against the step, so it is re-derived from durable state every
+        fire exactly like `briefedToken`: a crash between the publish and the
+        re-offer leaves the next fire owing the same re-offer. Re-offering does
+        not extend the step's SLA -- owner_step measures from `history[0]`
+        (:2158) -- so a run that keeps producing invalid evidence still ends at
+        the overdue path rather than being woken forever."""
+        ob = self.obligations().get(obligation_key(run_id, "owner", step))
+        if not ob or ob["state"] not in ("intent", "enqueued"):
+            return
+        current = refusal_digest(read_json_file(
+            os.path.join(self.args.run_root, run_id, "controller", "barrier-{}.json".format(step)))[0])
+        if not current or current == (ob.get("detail") or {}).get("briefedRefusal"):
+            return
+        if ob["state"] == "intent":
+            return  # a wake is already owed this fire; owner_step writes the current refusal into it
+        self.record(run_id, "owner", step, "intent", ob["attempt"] or 1, {"refusalChanged": True})
+        self.decide(run_id, step, "wake_owner", "coordination_model",
+                    "barrier refusal changed under an acknowledged step; re-offered", step=step)
+
+    def _persisted_owner_token(self, run_id):
+        """The token the RUN TREE says the owner was issued, or None.
+
+        `controller/wake.json` is written by _owner_wake with every brief and is
+        what OWNER_BRIEF["intake"] tells the owner to take `SMOKE_GATE_OWNER`
+        from, so it is the durable record of what the owner holds -- the
+        evidence the journal lacks for a step briefed before `briefedToken`
+        existed. Unreadable, absent, or carrying no token all answer None,
+        which the caller reads as "no issued token", not as agreement."""
+        doc, err = read_json_file(os.path.join(self.args.run_root, run_id, "controller", "wake.json"))
+        if err or not isinstance(doc, dict):
+            return None
+        tok = doc.get("coordinatorOwnerToken")
+        return tok if isinstance(tok, str) and tok else None
 
     def _legacy_hold(self, run_id, why):
         """A legacy run surfaced to the controller (a poll wake after its
@@ -2077,6 +2406,14 @@ class Controller:
                     # new token, and only the wake may hand one over.
                     self.record(run, "run", "claim", "enqueued", 1, dict(self._claim_detail(wake, "poll-reclaim"),
                                                                          reclaimed=True))
+                    # THE WINDOW. This record is fsynced, and the gate latches
+                    # the wake, so a kill here used to be unrecoverable: the
+                    # journal's token already matched and nothing would ever
+                    # look again. The re-offer is no longer sequenced behind it
+                    # -- _reissue_owner_token re-derives what is owed from
+                    # `briefedToken` on every fire -- and this seam is what the
+                    # regression kills at.
+                    crash_point("after-reclaim-record", "run", "claim")
                 obs = self.obligations()
         for run, claim in sorted(claims.items()):
             if not RUN_ID_RE.match(run) or run.startswith(PSEUDO_PREFIX) or run in self.legacy:
@@ -2285,6 +2622,12 @@ class Controller:
             if ka and not ka.get("ok"):
                 self.decide(run_id, None, "log", "mechanical", "progress stamp failed", error=ka.get("error"))
 
+        # Checked EVERY fire, before any owner_step can run, against the token
+        # _authority has just proved is the gate's. Not on the poll-reclaim
+        # edge: see _reissue_owner_token.
+        if self.live:
+            self._reissue_owner_token(run_id, run_ob["detail"].get("ownerToken"))
+
         self._alarm_overdue(run_id, None)
 
         # -- phase derivation (derived, never stored) --
@@ -2357,12 +2700,19 @@ class Controller:
             timed = self._maybe_challenger_timeout(run_id, claim, run)
             if timed:
                 return timed
+            # PUBLISHED BEFORE THE WAKE, not after: the brief is written by
+            # owner_step's effect, and _brief_notes can only cite a file that
+            # already exists.
+            self.publish_barrier(run_id, "lanes", lanes)
+            if self.live:
+                self._reoffer_on_new_refusal(run_id, "lanes")
             self.owner_step(run_id, "lanes", "lanes", done=False)
             if lanes.get("invalid"):
                 self.decide(run_id, "lanes", "escalate", "coordination_model",
                             "lane evidence invalid (redispatch is a judgment call)",
                             invalid=lanes.get("invalid"), reasons=(lanes.get("invalidReasons") or [])[:3])
             return "lanes"
+        self.publish_barrier(run_id, "lanes", None)
         self.owner_step(run_id, "lanes", "lanes", done=True)
 
         if not run.has("coordinator/preliminary.md"):
@@ -2385,9 +2735,36 @@ class Controller:
         synthesis_doc, syn_err = run.synthesis()
         if syn_err == "missing":
             if not syn_barrier.get("ready"):
+                self.publish_barrier(run_id, "synthesis", syn_barrier)
+                # THE OWNER IS WOKEN HERE, not only once the barrier passes.
+                # By this point every OTHER party's contribution the synthesis
+                # barrier checks has already been gated above: the lanes
+                # barrier is ready (:2715), coordinator/preliminary.md exists
+                # (:2718) and challenger/disposition.md exists (:2726). What
+                # the synthesis barrier can still report is therefore the
+                # retained owner's -- `invalid[]` content it authored
+                # (journeys/scope-dispositions.json, or
+                # contact-sheet/dispositions.json under
+                # SMOKE_VISUAL_DISPOSITIONS=1), or a `missing[]` disposition it
+                # owes -- and the owner is the only judgment party the
+                # controller can invoke. Returning without a wake left the
+                # phase with no exit at all: the wrapper wakes on `ownerWake`
+                # alone (smoke-controller-live.sh:168-175), so nobody was told;
+                # and _maybe_synthesis_overdue_blocked needs the very
+                # owner:synthesis obligation this branch declined to create
+                # (:2811-2813), so the terminal BLOCKED safety net could not
+                # fire either. This is the same blind spot as the lanes barrier
+                # (XZO #2047), on the sibling path.
+                timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)
+                if timed:
+                    return timed
+                if self.live:
+                    self._reoffer_on_new_refusal(run_id, "synthesis")
+                self.owner_step(run_id, "synthesis", "synthesis", done=False)
                 if syn_barrier.get("invalid"):
                     self.decide(run_id, "synthesis", "escalate", "coordination_model",
-                                "synthesis barrier invalid", invalid=syn_barrier.get("invalid"))
+                                "synthesis barrier invalid", invalid=syn_barrier.get("invalid"),
+                                reasons=(syn_barrier.get("invalidReasons") or [])[:3])
                 else:
                     self.decide(run_id, "synthesis", "wait", "wait", "synthesis barrier not ready",
                                 missing=syn_barrier.get("missing"))
@@ -2395,6 +2772,7 @@ class Controller:
             timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)
             if timed:
                 return timed
+            self.publish_barrier(run_id, "synthesis", None)
             self.owner_step(run_id, "synthesis", "synthesis", done=False)
             adj = self._adjudication(run_id, run)
             return adj or "synthesis"

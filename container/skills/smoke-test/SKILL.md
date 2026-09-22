@@ -1636,6 +1636,101 @@ Two scope rules keep that from becoming a hole:
   themselves; otherwise the file could rename their internals — the renewer's
   ceiling, its clock — and switch off a safety control by naming it.
 
+#### What the controller must tell the owner
+
+The controller knows two things per fire that the owner cannot see and cannot
+do its job without. Both used to stay in the controller's own journal.
+
+- **The barrier's answer.** On every `lanes` and `synthesis` fire the
+  controller writes the real `smoke-evidence-barrier.sh` output to
+  `<run>/controller/barrier-<step>.json` and deletes it once the phase passes
+  (`smoke-campaign-controller.py:1723` `publish_barrier`, whose effect writes at
+  `:1316-1318` and unlinks on `doc is None` at `:1319-1322`), and every
+  barrier-backed brief names that file (`:1353-1358`). `invalid[]` is artifact
+  CONTENT the barrier rejects; only the owner can repair it, and no amount of
+  lane work clears it. Run `xzo-pr-pr2055-…` (XZO #2047) spent 67 minutes
+  running lanes while the barrier had already named
+  `journeys/scope-dispositions.json` invalid on the first lanes fire — the
+  journal said so, the brief did not, and the owner found out by running the
+  barrier by hand.
+
+  **A refusal that appears AFTER the brief was acknowledged re-offers the
+  step.** The first fix covered first arrival — the barrier already refusing
+  when the brief was written. The commoner order, and the one run
+  `xzo-pr-pr2055-…` actually took, is the reverse: the brief is issued while
+  the barrier is merely waiting for markers, the owner acks it, and then the
+  owner writes evidence the barrier rejects. `owner_step` re-offers a wake only
+  while the `.ack` is absent (`smoke-campaign-controller.py:2147-2149`), so that
+  fire published the new refusal and woke nobody. The trigger is a change in **the refusal** — `invalid[]` *and*
+  `invalidReasons[]`, digested against what the brief was written under
+  (`refusal_digest`, `smoke-campaign-controller.py:227`; recorded as
+  `briefedRefusal` at `:1291-1298`, carried forward at `:2140-2141`, compared by
+  `_reoffer_on_new_refusal` at `:2281`) — and
+  deliberately neither of its neighbours: not "the published answer changed",
+  which includes `missing[]` and would wake the owner on every marker it banks;
+  and not "became invalid", which would leave an owner working against a
+  refusal that has since moved to different files or different reasons (pr2055's
+  `scope-dispositions.json` went from `dispositions[3]/[30]/[31]` to
+  `[3]/[30]/[32]` with the file name unchanged). A refusal that *clears*
+  re-offers nothing. Re-offering does not extend the step's SLA, which is
+  measured from the obligation's first record (`smoke-campaign-controller.py:2158`), so an owner that keeps producing
+  invalid evidence still ends at the overdue path.
+
+  **A refusing barrier wakes the owner on BOTH phases.** By the time a run
+  reaches the synthesis branch the lanes barrier is ready and both
+  `coordinator/preliminary.md` and `challenger/disposition.md` exist, so
+  anything the synthesis barrier still reports — rejected content it authored,
+  or a visual-candidate disposition it owes under
+  `SMOKE_VISUAL_DISPOSITIONS=1` — is the retained owner's, and the owner is the
+  only judgment party the controller can invoke. That branch used to return
+  without a wake (it now wakes at `smoke-campaign-controller.py:2758-2763`),
+  which left the phase with no exit at all: the wrapper wakes on `ownerWake`
+  alone (`smoke-controller-live.sh:168-175`), so nobody was told, and the
+  overdue-BLOCKED safety net keys on the very `owner:synthesis` obligation the
+  branch declined to create (`_maybe_synthesis_overdue_blocked`, `:2804`,
+  reading that obligation at `:2810-2811`), so it could not fire either.
+- **A re-minted owner token.** `poll` mints a fresh coordinator owner token on
+  every same-SHA recovery (`smoke-pr-gate.sh:5312`), which is how a coordinator
+  that died is recovered and is not negotiable; `adopt`'s fence adds no
+  authority check of its own, which is what makes it safe and is also not
+  negotiable. The gap was the owner in between: `controller/wake.json` is the
+  only file that carries the token to it, and it was written once, at intake.
+  It is now refreshed with **every** brief, and a step whose recorded
+  `briefedToken` differs from the token the gate holds is re-offered with a
+  brief headed **YOUR OWNER TOKEN CHANGED**, telling the owner to re-read
+  `wake.json` and run `smoke-run-scaffold.sh adopt` before writing anything.
+  That re-issue is the only legitimate route: a token copied out of gate state
+  passes the fence by impersonating its holder, which is what the fence exists
+  to prevent (XZO #2046 — the owner on `xzo-pr-pr2055-…` was asked to do
+  exactly that and correctly refused, leaving eight completed lanes
+  unbankable).
+
+  Two properties make that recoverable rather than merely correct on the happy
+  path. **The condition is re-derived, never remembered**: `briefedToken` is
+  journaled with the step only once its brief is on disk, and every fire
+  compares it against the token `_authority` has just proved is the gate's, so
+  a crash anywhere between the claim record and the re-offer leaves the next
+  fire able to finish the transition. An edge trigger on the poll-reclaim
+  branch was not enough — the claim record is fsynced first, so a death between
+  the two records would have left the journal looking done and the owner
+  wedged. **And an ack never outlives the brief it acknowledged**: writing a
+  brief removes `<run>/controller/brief-<step>.ack`, so a re-offered step
+  cannot inherit the previous brief's acknowledgement and be read as already
+  taken. A step briefed under a token that is absent from the journal
+  entirely — a run in flight across an upgrade of this file, which is a live
+  bind mount — is resolved against the RUN TREE, not the gate.
+  `controller/wake.json` is the file the owner is told to take
+  `SMOKE_GATE_OWNER` from and the only file that carries a token to it, so its
+  `coordinatorOwnerToken` is what the owner actually holds. Agreeing with the
+  gate, it is backfilled silently; naming a different token, it is a re-mint an
+  older controller never carried through and the step is re-offered. Backfilling
+  the gate's current token without looking would make every later fire see
+  equality and skip the reissue forever, which is the wedge itself. With no
+  readable wake at all there is no issued token, so the owner cannot satisfy the
+  fence whatever it holds and the re-offer is the safe direction: it writes
+  `wake.json` and asks for an `adopt`, which is a no-op when the contract
+  already names the caller.
+
 #### The claim renewer (required alongside the live controller)
 
 A live controller needs a second, script-only series: `scripts/smoke-controller-renew.sh`.
