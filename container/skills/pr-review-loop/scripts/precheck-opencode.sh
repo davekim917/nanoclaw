@@ -31,21 +31,23 @@
 #
 # This is a PRE-CHECK, not a review. It writes no receipt and the merge gate
 # neither reads nor honours its output — `codex-review.sh receipt` is still the
-# only thing that can satisfy the gate. Its model IS gate-eligible
-# (`deepseek-v4.1-flash` in reviewer-models.txt), so the same run can be
-# promoted to a receipt by passing its findings to `receipt --reviewer
-# "deepseek-v4.1-flash ..."` — but that is a deliberate act, never implied by
+# only thing that can satisfy the gate. Any frontier model is gate-eligible
+# (codex-review.sh refuses only the small tiers in REVIEWER_DENIED_TIERS), so a
+# run on one can be promoted to a receipt by passing its findings to `receipt
+# --reviewer "<model id> ..."` — but that is a deliberate act, never implied by
 # running this.
 #
 # Usage:
-#   precheck-opencode.sh --pr <n> [--repo <owner/name>] [--model <id>]
+#   precheck-opencode.sh --pr <n> [--repo <owner/name>] [--model <provider/id>]
 #
-# Defaults to the repo of the current directory and opencode/deepseek-v4.1-flash.
+# The model is --model, else $PRECHECK_MODEL, else opencode/deepseek-v4.1-flash.
+# The default is only a starting point, not an eligibility list: pass any model
+# `opencode models` lists and nothing else needs to change.
 set -uo pipefail
 
 PR=""
 REPO=""
-MODEL="opencode/deepseek-v4.1-flash"
+MODEL="${PRECHECK_MODEL:-opencode/deepseek-v4.1-flash}"
 
 # A trailing flag with no value used to hang forever: `shift 2` with `$#=1`
 # fails and shifts nothing, and `set -uo pipefail` above carries no `-e`, so the

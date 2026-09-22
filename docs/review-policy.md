@@ -36,36 +36,41 @@ does not relax required CI, holds, or merge authorization.
 
 The substitute, like every review (a delta check after a rebase or ratchet
 regeneration, adversarial verification, a gap analysis), runs on a frontier
-model: `claude-opus-5` on Claude, `gpt-5.6-sol` on Codex, both at `high`
-effort, and `deepseek-v4.1-flash` on OpenCode. Effort is a runtime setting — a
-native spawn's own field, or a scoped CLI invocation — never prompt wording;
-`opencode run` has no effort flag at all (effort is per-model `options` in the
-opencode config, `container/agent-runner/src/providers/opencode.ts:779-784`),
-so on that pool the model id is the whole tier. `flash` in that id is the
-vendor's latency brand, not a capability tier — DeepSeek v4.1-flash is
-frontier-class here, the same way Gemini 3.8-flash is, while
-`gemini-3.5-flash-lite` is not. The allowed ids are the roster in
-`scripts/reviewer-models.ts` plus explicit
-receipt compatibility for prior `claude-fable-5-1` and `gpt-6-astra` reviewers.
-Those IDs remain accepted so unchanged exact-head evidence survives this
-roster migration; they are not new dispatch defaults. The existing gate
-accepts these IDs for both receipt submission and receipt consumption:
-`container/skills/pr-review-loop/reviewer-models.txt`
-(`scripts/reviewer-models.ts --write`) — and `codex-review.sh receipt` /
-`merge-check` enforce it mechanically against `--reviewer`'s **first
-whitespace-delimited word** (a `[1m]` suffix on that word is tolerated): a
-`--reviewer` not starting with an allowed id is refused before it posts, and
-an approving receipt whose first word isn't allowed does not unlock a merge.
+model at `high` effort. There is no list of approved models, because vendors
+ship new frontier models faster than a list can be edited. Instead, the reviewer
+defaults to **the model the dispatching session is running on**: a Claude
+subagent inherits it, or takes the `opus`/`fable` alias, which resolves to the
+newest release; `codex exec` and `opencode run` use their configured model
+unless given `-m`. Effort is a runtime setting — a native spawn's own field, or
+a scoped CLI invocation — never prompt wording. `opencode run` has no effort
+flag at all (effort is per-model `options` in the opencode config,
+`container/agent-runner/src/providers/opencode.ts:779-784`), so on that pool
+the model id is the whole tier.
+
+Eligibility is enforced as a **denylist of small tiers**:
+`REVIEWER_DENIED_TIERS` in `container/skills/pr-review-loop/scripts/codex-review.sh`
+(`sonnet haiku luna terra mini nano lite small`). `codex-review.sh receipt` and
+`merge-check` read only `--reviewer`'s **first whitespace-delimited word**; they
+lowercase it and strip a trailing `[1m]` and any provider path (`opencode/`,
+`opencode-go/`). What is left must be a concrete versioned id, not an alias. It
+is refused if any whole `-`/`.`/`_` segment is a denied tier. Segments, not
+substrings: `gpt-5.4-mini` is refused, `gemini-3.8-flash` is not. `flash` is
+not denied — it is a latency brand that spans tiers (DeepSeek v4.1-flash and
+Gemini 3.8-flash are frontier-class; `gemini-3.5-flash-lite` is refused for
+`lite`). **The trade-off:** a denylist fails open, so a new small model whose
+name carries none of those words passes until it is added.
+
 The reviewer reports its **exact model id from its own runtime** — a Claude
 subagent from its system prompt, Codex from the `-m` it ran with or
-`codex exec`'s session metadata — as that first word, and the receipt's `--reviewer`
-copies it verbatim, e.g. `claude-opus-5 (opus)` or
-`gpt-5.6-sol high (codex exec)`. Only that first word is checked, so a receipt
-written under an older parenthetical — `claude-opus-5 (worker-frontier)` — is
-still honoured on the head it was posted against. Nobody has to be free for this: the author
-may start that reviewer as a fresh process
-(`codex exec -m gpt-5.6-sol -c model_reasoning_effort=high`, or
-`CLAUDE_CODE_EFFORT_LEVEL=high claude -p --model 'claude-opus-5[1m]' --effort high`) and hand it the inputs above.
+`codex exec`'s session metadata, OpenCode from `-m` — as that first word, and
+the receipt's `--reviewer` copies it verbatim, e.g. `claude-opus-5 (opus)`,
+`gpt-5.6-sol high (codex exec)` or `opencode/deepseek-v4.1-flash (opencode run)`.
+Everything after the first word is free text. Nobody has to be free for this:
+the author may start that reviewer as a fresh process
+(`codex exec -c model_reasoning_effort=high`,
+`CLAUDE_CODE_EFFORT_LEVEL=high claude -p --model opus --effort high`, or
+`opencode run -m <provider/model> '<prompt>' < /dev/null`) and hand it the
+inputs above.
 
 Record a durable review receipt tied to the exact final SHA: reviewer and
 runtime, complete-diff and relevant-file scope, outcome, and every finding with
@@ -76,16 +81,13 @@ its disposition. A local completion claim is not substitute-review coverage.
 There is no longer a worker-policy file, in this repo or in the bootstrap
 plugin. The plugin ships delegation as effort shims that inherit the caller's
 model, so nothing in a live config names a concrete frontier model any more,
-and nothing can be derived from one. Two places state a model or an effort, and
-they are independent of each other:
+and nothing can be derived from one. Two settings govern review, and they
+are independent of each other:
 
-- **Who may review.** The roster in `scripts/reviewer-models.ts`
-  (`FRONTIER_MODELS`, plus the fixed Fable/Astra receipt-compatibility ids).
-  Edit it, run `pnpm run reviewer-models -- --write`, commit the regenerated
-  `container/skills/pr-review-loop/reviewer-models.txt`.
-  `scripts/reviewer-models-freshness.test.ts` fails if you skip the regen, and
-  `assertConcreteModelId` refuses an alias, so the allowlist can never come to
-  mean "whatever the runtime defaults to today".
+- **Who may review.** Any frontier model; nothing to edit when a new one
+  ships. Only the small-tier denylist, `REVIEWER_DENIED_TIERS` in
+  `container/skills/pr-review-loop/scripts/codex-review.sh`, changes — add a
+  word when a vendor names a new small tier.
 - **What a Codex subagent runs at.** Codex's native default: the generated
   container config (written identically by `src/providers/codex.ts` and
   `container/agent-runner/src/codex-companion-setup.ts`) sets no
@@ -100,9 +102,10 @@ they are independent of each other:
   `docs/review-notes.md`). `src/provider-surfaces.test.ts` proves the host and
   container renders agree.
 
-Dropping an id from the reviewer roster costs that model receipt eligibility
-immediately, including on heads already receipted, unless it is one of the two
-compatibility ids. That is the reason the compatibility ids exist.
+Adding a word to `REVIEWER_DENIED_TIERS` costs every model it matches receipt
+eligibility immediately, including on heads already receipted, because
+merge-check re-reads the receipt against the current rule. Add a tier word only
+for a genuinely small tier.
 
 **Which reviewer is dispatched** is not a policy question — a reviewer is chosen
 for independence from the artifact's author, not for a worker tier.
