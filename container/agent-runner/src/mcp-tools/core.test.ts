@@ -187,6 +187,69 @@ describe('send_message MCP tool — default replies in the current conversation'
     _resetConfig();
   });
 
+  // A send_file caption is agent-composed text, often the whole report with
+  // the file attached (a scheduled task's Discord post showed the line only on
+  // the follow-up message because captions were excluded). Stamp a captioned
+  // file in the own conversation; not a bare file, not a file sent elsewhere.
+  it('stamps a captioned send_file in the own conversation only', async () => {
+    const ts = await import('../turn-status.js');
+    const { _setConfigForTest, _resetConfig } = await import('../config.js');
+    _resetConfig();
+    _setConfigForTest({});
+    ts.resetTurnStatus();
+    ts.setTurnSettings('claude-opus-5[1m]', 'high');
+    ts.setOwnConversation('slack', 'slack:CTEST00004');
+    ts.recordContextTokens(452_000);
+    ts._forgetOwnershipForTest();
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-send-file-subtext-'));
+    const realMkdirSync = fs.mkdirSync.bind(fs);
+    const realWriteFileSync = fs.writeFileSync.bind(fs);
+    const mkdirSpy = spyOn(fs, 'mkdirSync').mockImplementation((target, opts) => {
+      if (typeof target === 'string' && target.startsWith('/workspace/outbox')) return undefined;
+      return realMkdirSync(target, opts as never);
+    });
+    const writeFileSpy = spyOn(fs, 'writeFileSync').mockImplementation((target, data, opts) => {
+      if (typeof target === 'string' && target.startsWith('/workspace/outbox')) return undefined;
+      return realWriteFileSync(target, data as never, opts as never);
+    });
+    // One send at a time: the handler waits for its row's delivery ack, and
+    // dedups by content hash per process, so each file gets distinct bytes.
+    const send = async (name: string, args: Record<string, unknown>) => {
+      const filePath = path.join(tmpDir, name);
+      realWriteFileSync(filePath, `${name} ${Date.now()} ${Math.random()}`);
+      const before = getUndeliveredMessages().length;
+      const pending = sendFile.handler({ path: filePath, ...args });
+      let out = getUndeliveredMessages();
+      for (let i = 0; i < 100 && out.length === before; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        out = getUndeliveredMessages();
+      }
+      const row = out[out.length - 1];
+      getInboundDb()
+        .prepare("INSERT INTO delivered (message_out_id, status, delivered_at) VALUES (?, 'delivered', ?)")
+        .run(row.id, new Date().toISOString());
+      await pending;
+      return { pid: row.platform_id, c: JSON.parse(row.content) };
+    };
+    try {
+      const captioned = await send('draft.md', { text: 'Here is the blurb, attached.' });
+      const bare = await send('bare.md', {});
+      const elsewhere = await send('dm.md', { to: 'operator', text: 'for your DM' });
+      expect(captioned.pid).toBe('slack:CTEST00004');
+      expect(captioned.c.subtext).toBe('opus-5 · high · 452k context');
+      expect(bare.c.subtext).toBeUndefined();
+      expect(elsewhere.pid).toBe('slack:DTEST00009');
+      expect(elsewhere.c.subtext).toBeUndefined();
+    } finally {
+      mkdirSpy.mockRestore();
+      writeFileSpy.mockRestore();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      ts.resetTurnStatus();
+      _resetConfig();
+    }
+  });
+
   it('omitting `to` posts in the session thread, not the owner DM', async () => {
     await sendMessage.handler({ text: 'team-auto: build stage done' });
 

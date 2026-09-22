@@ -452,9 +452,10 @@ function statusSubtextEnabled(): boolean {
  * while looking complete in tests.
  *
  * Scope is deliberately narrow, and the first gate is OPT-IN: the row must be
- * marked `agentReply`, because `kind: 'chat'` alone is far broader than "a
- * reply the agent composed" — `send_file` captions and the runner's own
- * `/clear` notice are both routed chat rows. Then: the agent's own
+ * marked `agentReply`, because `kind: 'chat'` alone is broader than "text the
+ * agent composed" — the runner's own `/clear` notice is a routed chat row that
+ * no turn authored. (`send_file` IS marked when it carries a caption: the
+ * caption is agent text, often the whole report.) Then: the agent's own
  * conversation only (`isOwnConversation`), and an existing `subtext` key is
  * never overwritten.
  *
@@ -502,9 +503,10 @@ export function stampStatusSubtext(msg: {
  * (the drift lane fails on any edit). It also builds the mailbox payload field
  * by field, so a marker on the row could never reach a mailbox override. And a
  * seam bought nothing here: every stampable row already needs an explicit
- * `agentReply` at its call site, so the three sites that set it are exactly the
- * three that call this — `sendToDestination`, `deliverErrorResult` (poll-loop)
- * and `send_message` (mcp-tools/core.ts).
+ * `agentReply` at its call site, so the sites that set it are exactly the
+ * sites that call this. `grep -rn withStatusSubtext container/agent-runner/src`
+ * lists them; they are deliberately not enumerated here, because a list in a
+ * comment goes stale the first time a writer is added.
  */
 export function withStatusSubtext<
   T extends { kind: string; channel_type?: string | null; platform_id?: string | null; content: string },

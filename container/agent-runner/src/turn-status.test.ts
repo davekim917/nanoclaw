@@ -215,7 +215,7 @@ describe('stampStatusSubtext', () => {
 
   // Round three: `kind === 'chat'` alone was too broad. A routed chat row is
   // not necessarily a reply the agent composed.
-  it('leaves an unmarked chat row alone, as send_file captions are', () => {
+  it('leaves an unmarked chat row alone, as a caption-less file send is', () => {
     const msg = chat({
       agentReply: undefined,
       content: JSON.stringify({ text: 'here is the chart', files: ['chart.png'] }),
