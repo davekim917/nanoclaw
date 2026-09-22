@@ -104,6 +104,35 @@ describe('send_message MCP tool — default replies in the current conversation'
     ).run();
   });
 
+  // Status subtext: send_message is THE reply path when outcome reporting is
+  // on (the fleet default), and it runs in the MCP subprocess, not poll-loop.
+  // Driving the real handler pins both halves: that core.ts routes its row
+  // through withStatusSubtext, and that the subprocess reads turn state from
+  // the session DB rather than its own (empty) memory.
+  it('stamps the status subtext on a reply to the session own conversation', async () => {
+    const ts = await import('../turn-status.js');
+    const { _setConfigForTest, _resetConfig } = await import('../config.js');
+    _resetConfig();
+    _setConfigForTest({});
+    ts.resetTurnStatus();
+    ts.setTurnSettings('claude-opus-5[1m]', 'high');
+    ts.setOwnConversation('slack', 'slack:CTEST00004');
+    ts.recordContextTokens(142_400);
+    ts._forgetOwnershipForTest(); // this process now sees what the subprocess sees
+
+    await sendMessage.handler({ text: 'answered' });
+    const toOperator = await sendMessage.handler({ to: 'operator', text: 'relayed' });
+    void toOperator;
+
+    const rows = getUndeliveredMessages();
+    const own = rows.find((r) => r.platform_id === 'slack:CTEST00004')!;
+    const other = rows.find((r) => r.platform_id === 'slack:DTEST00009')!;
+    expect(JSON.parse(own.content).subtext).toBe('opus-5 · high · 142k context');
+    expect(JSON.parse(other.content).subtext).toBeUndefined();
+    ts.resetTurnStatus();
+    _resetConfig();
+  });
+
   it('omitting `to` posts in the session thread, not the owner DM', async () => {
     await sendMessage.handler({ text: 'team-auto: build stage done' });
 

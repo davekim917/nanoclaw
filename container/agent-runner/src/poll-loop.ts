@@ -15,7 +15,7 @@ import {
   type MessageInRow,
 } from './db/messages-in.js';
 import { getConfig } from './config.js';
-import { clearContextTokens, setOwnConversation, setTurnSettings } from './turn-status.js';
+import { clearContextTokens, setOwnConversation, setTurnSettings, withStatusSubtext } from './turn-status.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { touchHeartbeat } from './heartbeat.js';
@@ -3141,7 +3141,7 @@ export async function dispatchFileAttachment(
  */
 async function deliverErrorResult(text: string, routing: RoutingContext): Promise<void> {
   log('Error result with no <message> envelope — delivering to channel');
-  await writeMessageOut({
+  await writeMessageOut(withStatusSubtext({
     id: generateId(),
     in_reply_to: routing.inReplyTo,
     kind: 'chat',
@@ -3157,7 +3157,7 @@ async function deliverErrorResult(text: string, routing: RoutingContext): Promis
     channel_type: routing.channelType,
     thread_id: routing.threadId,
     content: JSON.stringify({ text }),
-  });
+  }));
 }
 
 /**
@@ -3623,24 +3623,23 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
   // including an explicit channel-root null, remains authoritative.
   const ownConversation = channelType === routing.channelType && platformId === routing.platformId;
   const threadId = destRouting ? destRouting.threadId : ownConversation ? routing.threadId : null;
-  // The status subtext is NOT stamped here. It rides the shared outbound seam
-  // (db/messages-out.ts -> stampStatusSubtext) so the `send_message` MCP path,
-  // which bypasses this function entirely and is the default reply path when
-  // outcome reporting is on, gets the same treatment.
-  await writeMessageOut({
+  // `send_message` (mcp-tools/core.ts) bypasses this function and is the
+  // default reply path when outcome reporting is on — it stamps itself through
+  // the same withStatusSubtext.
+  await writeMessageOut(withStatusSubtext({
     id: generateId(),
     // Batch anchor, not the channel's latest inbound row — see the poison
     // note in dispatchFileAttachment / getPendingMessages.
     in_reply_to: getBatchAnchor(channelType, platformId) ?? routing.inReplyTo,
     kind: 'chat',
     // Agent-composed reply text — eligible for the status subtext. The
-    // own-conversation gate still applies at the seam.
+    // own-conversation gate still applies inside stampStatusSubtext.
     agentReply: true,
     platform_id: platformId,
     channel_type: channelType,
     thread_id: threadId,
     content: JSON.stringify({ text: body }),
-  });
+  }));
 }
 
 /**

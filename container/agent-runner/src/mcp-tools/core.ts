@@ -30,6 +30,7 @@ function chatSendDenial(): string | null {
   return null;
 }
 import { getCurrentInReplyTo } from '../db/session-state.js';
+import { withStatusSubtext } from '../turn-status.js';
 import { resolveRequestCandidate } from '../modules/mailbox/session-state.js';
 import { getSessionRouting, getTaskSeriesId } from '../db/session-routing.js';
 import { registerTools } from './server.js';
@@ -353,7 +354,7 @@ export const sendMessage: McpToolDefinition = {
     const id = generateId();
     const denial = internal ? null : chatSendDenial();
     if (denial) return err(denial);
-    const seq = await writeMessageOut({
+    const seq = await writeMessageOut(withStatusSubtext({
       id,
       in_reply_to: getCurrentInReplyTo(),
       kind: internal ? 'work_log' : 'chat',
@@ -377,7 +378,7 @@ export const sendMessage: McpToolDefinition = {
             }
           : {}),
       }),
-    });
+    }));
 
     if (seq < 0)
       return err(
