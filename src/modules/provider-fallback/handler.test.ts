@@ -25,6 +25,7 @@ import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '
 import { getProviderHealth, isProviderUnavailable, markProviderUnavailable } from '../../db/provider-health.js';
 import type { Session } from '../../types.js';
 import { SYSTEM_ERROR_PARK_MAX_MS, handleProviderUnavailable, measuredResetAt } from './handler.js';
+import { handleProviderRetryPrimary } from './retry-primary.js';
 
 const GID = 'ag-pf';
 const FOLDER = 'pf-group';
@@ -189,5 +190,81 @@ describe('measuredResetAt', () => {
     expect(measuredResetAt(1789603200, now)).toBeNull();
     expect(measuredResetAt(undefined, now)).toBeNull();
     expect(measuredResetAt('', now)).toBeNull();
+  });
+});
+
+describe('provider_retry_primary handler', () => {
+  beforeEach(async () => {
+    killed.length = 0;
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    await initTestDb();
+    const db = getRawDb();
+    runMigrations(db);
+    await createAgentGroup({
+      id: GID,
+      name: FOLDER,
+      folder: FOLDER,
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+  });
+  afterEach(async () => {
+    await closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('clears the window and respawns, so the next spawn lands on the primary', async () => {
+    writeConfig({ provider: 'claude', providerFallback: { provider: 'codex' } });
+    await markProviderUnavailable(GID, 'claude', 'quota');
+    expect(await isProviderUnavailable(GID, 'claude')).toBe(true);
+
+    await handleProviderRetryPrimary({ action: 'provider_retry_primary', requestedModel: 'opus' }, session);
+
+    expect(await isProviderUnavailable(GID, 'claude')).toBe(false);
+    expect(killed).toHaveLength(1);
+    expect(killed[0].sessionId).toBe('sess-pf');
+  });
+
+  it('resets the failure streak too, so an operator-cleared outage reopens at 15m', async () => {
+    writeConfig({ provider: 'claude', providerFallback: { provider: 'codex' } });
+    // Three failures would put the NEXT window at 60m on the backoff ladder.
+    await markProviderUnavailable(GID, 'claude', 'quota');
+    await markProviderUnavailable(GID, 'claude', 'quota');
+    await markProviderUnavailable(GID, 'claude', 'quota');
+    expect((await getProviderHealth(GID, 'claude'))!.consecutive_failures).toBe(3);
+
+    await handleProviderRetryPrimary({ action: 'provider_retry_primary' }, session);
+
+    // The operator asserted the account works. If they are wrong, the next
+    // failing turn opens a fresh 15m window rather than resuming the ladder.
+    expect((await getProviderHealth(GID, 'claude'))!.consecutive_failures).toBe(0);
+    const reopened = await markProviderUnavailable(GID, 'claude', 'quota');
+    const windowMs = Date.parse(reopened) - Date.now();
+    expect(windowMs).toBeLessThanOrEqual(15 * 60_000);
+  });
+
+  it('does nothing when the session is already on its primary', async () => {
+    // No outage recorded: `resolveSpawnProvider` reports no fallback, so there
+    // is nothing to clear and no reason to burn a container restart. A stale
+    // request from a container respawned between the write and this read
+    // lands exactly here.
+    writeConfig({ provider: 'claude', providerFallback: { provider: 'codex' } });
+
+    await handleProviderRetryPrimary({ action: 'provider_retry_primary' }, session);
+
+    expect(killed).toHaveLength(0);
+  });
+
+  it('does nothing when the group declares no fallback', async () => {
+    writeConfig({ provider: 'claude' });
+    await markProviderUnavailable(GID, 'claude', 'quota');
+
+    await handleProviderRetryPrimary({ action: 'provider_retry_primary' }, session);
+
+    // Without a declared fallback the session was never routed away, so the
+    // window is the operator's own visible signal — not ours to clear.
+    expect(await isProviderUnavailable(GID, 'claude')).toBe(true);
+    expect(killed).toHaveLength(0);
   });
 });

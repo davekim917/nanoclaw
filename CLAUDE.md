@@ -180,6 +180,7 @@ Tracks latest stable, including majors; prerelease/beta/RC/dev/nightly/draft/yan
 | Remote MCP OAuth | `mcp-oauth-integrations.md` |
 | v1→v2 migration | `v1-to-v2-changes.md`, `migration-dev.md` |
 | Provider switching | `provider-migration.md` |
+| Provider fallback | `provider-fallback.md` |
 | Templates | `templates.md` |
 | Memory | `memory.md` |
 | Setup, customizing | `setup-wiring.md`, `customizing.md` |
