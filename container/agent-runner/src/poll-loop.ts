@@ -29,6 +29,7 @@ import { clearStaleProcessingAcks } from './db/container-state.js';
 import {
   clearContinuation,
   clearCurrentInReplyTo,
+  getContinuation,
   migrateLegacyContinuation,
   setContinuation,
   setCurrentInReplyTo,
@@ -101,7 +102,7 @@ import type {
 import { autoCommitDirtyWorktrees, type AutoSaveResult } from './worktree-autosave.js';
 import { buildSessionRecap, wrapRecap } from './session-recap.js';
 import { ensureFreshContextBootstrap } from './memory/bootstrap.js';
-import { isFreshContextTaskBatch } from './fresh-context-task.js';
+import { isFreshContextTaskBatch, sessionHasOpenWork, startsFreshFire } from './fresh-context-task.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -799,7 +800,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // A scheduled fire starts with no resumed conversation unless its series is
     // thread-bound or --continuous — the /clear reset above, without its chat
     // notice (fresh-context-task.ts).
-    if (continuation !== undefined && isFreshContextTaskBatch(keep)) {
+    const freshFire = continuation !== undefined && startsFreshFire(keep);
+    if (freshFire) {
       log('Fresh-context task fire: not resuming the stored session');
       continuation = undefined;
       resetProviderContext(config.providerName);
@@ -972,6 +974,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // minutes later). Idempotent — a provider whose abort() already ran
       // (e.g. via config.signal) treats a second call as a no-op.
       query.abort();
+      // A fresh fire's first attempt stored its new session at `init`
+      // (processQuery); every retry below resumes that one, not a blank one.
+      if (freshFire && continuation === undefined) continuation = getContinuation(config.providerName);
       const pausedWork = getWorkContinuation();
       if (pausedWork?.phase === 'queued') idleSuppressedContinuationIds.add(pausedWork.id);
 
@@ -1794,7 +1799,11 @@ export function retainCompleteRecallPairs(original: MessageInRow[], admitted: Me
 export function selectInTurnFollowUps(allPending: MessageInRow[]): MessageInRow[] {
   // A fresh-context task fire must not join the running conversation: it stays
   // pending, and the outer loop resets before prompting it once this query ends.
-  const completePending = retainCompleteRecallUnits(allPending.filter((m) => !isFreshContextTaskBatch([m])));
+  // With open work in the session it resumes instead, so it may join.
+  const holdFresh = allPending.some((m) => isFreshContextTaskBatch([m])) && !sessionHasOpenWork();
+  const completePending = retainCompleteRecallUnits(
+    holdFresh ? allPending.filter((m) => !isFreshContextTaskBatch([m])) : allPending,
+  );
   const isChatRow = (m: MessageInRow): boolean => m.kind === 'chat' || m.kind === 'chat-sdk';
   const triggerIds = new Set(completePending.filter(isAdmissibleTrigger).map((m) => m.id));
   if (triggerIds.size === 0) return [];
@@ -2185,10 +2194,19 @@ export async function processQuery(
           return;
         }
         // A due fresh-context task fire needs the outer loop's reset, and this
-        // stream otherwise stays open after its result. End (not abort) so a
-        // turn still running finishes first; selectInTurnFollowUps never pushes it.
-        if (allPending.some((m) => m.trigger === 1 && isFreshContextTaskBatch([m]))) {
-          log('Pending fresh-context task fire — ending active stream so outer loop can reset');
+        // stream otherwise stays open after its result. end() is only safe
+        // between turns with no background work (the immutable-settings gate
+        // below, #608/#610); until then the fire stays pending, since
+        // selectInTurnFollowUps never pushes it, and the next poll retries.
+        // Other rows are still admitted meanwhile.
+        if (
+          allPending.some((m) => m.trigger === 1 && startsFreshFire([m])) &&
+          turnIdle &&
+          !resultScopeOpen &&
+          !query.hasQueuedWork?.() &&
+          !query.hasBackgroundWork?.()
+        ) {
+          log('Pending fresh-context task fire — ending the idle stream so outer loop can reset');
           endedForCommand = true;
           query.end();
           return;

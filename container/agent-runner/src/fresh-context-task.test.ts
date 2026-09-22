@@ -15,6 +15,7 @@ import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, QueryInput } from './providers/types.js';
 import { runPollLoop, selectInTurnFollowUps } from './poll-loop.js';
 import { isFreshContextTaskBatch, taskRowFiresFresh } from './fresh-context-task.js';
+import { queueWorkContinuation } from './modules/mailbox/index.js';
 
 class RecordingProvider extends MockProvider {
   readonly continuations: Array<string | undefined> = [];
@@ -131,6 +132,33 @@ describe('scheduled task fires', () => {
     }
   });
 
+  it('a fire that comes due while a continue_work is queued resumes, so that work keeps its conversation', async () => {
+    setContinuation('mock', 'prior-session');
+    queueWorkContinuation('finish the report from the last fire');
+    insertRow('t1', 'task', { prompt: 'check the watch' });
+    const provider = new RecordingProvider();
+
+    await runOneBatch(provider);
+
+    expect(provider.continuations[0]).toBe('prior-session');
+  });
+
+  it('a fire that comes due while a wait wake is still pending resumes', async () => {
+    setContinuation('mock', 'prior-session');
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, process_after, content, trigger)
+         VALUES ('schedule-wake-w1', 'chat', ?, 'pending', ?, '{"text":"[system] check back"}', 1)`,
+      )
+      .run(new Date().toISOString(), new Date(Date.now() + 3_600_000).toISOString());
+    insertRow('t1', 'task', { prompt: 'check the watch' });
+    const provider = new RecordingProvider();
+
+    await runOneBatch(provider);
+
+    expect(provider.continuations[0]).toBe('prior-session');
+  });
+
   it('a chat row batched with a fire keeps the conversation', async () => {
     setContinuation('mock', 'prior-session');
     insertRow('t1', 'task', { prompt: 'check the watch' });
@@ -191,5 +219,11 @@ describe('selectInTurnFollowUps', () => {
     ]);
     expect(admitted.map((m) => m.id)).toEqual(['kept']);
     expect(selectInTurnFollowUps([task('fresh', { prompt: 'p' })])).toEqual([]);
+  });
+
+  it('admits a fire into the running conversation while the session holds open work', () => {
+    queueWorkContinuation('finish the report');
+    const task = { id: 'fresh', kind: 'task', trigger: 1, thread_id: null, content: '{"prompt":"p"}' } as MessageInRow;
+    expect(selectInTurnFollowUps([task]).map((m) => m.id)).toEqual(['fresh']);
   });
 });

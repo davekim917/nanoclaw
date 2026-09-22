@@ -306,6 +306,73 @@ describe('repository mount poll and tool admission barrier', () => {
     }
   }, 5_000);
 
+  it('a default (fresh) fire resets once, and its credential-rotation retry resumes the session attempt 1 started', async () => {
+    insertMessage('task-occurrence-retry', 'task', { prompt: 'Review the release queue once.' });
+    setContinuation('claude', 'previous-fire-session');
+    const queryInputs: Array<{ prompt: string; continuation?: string }> = [];
+    let queryCalls = 0;
+    const provider = {
+      supportsNativeSlashCommands: false,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      isRetryable: () => true,
+      rotateApiKey: () => ({ rotated: true }),
+      query: (input: { prompt: string; continuation?: string }) => {
+        queryInputs.push(input);
+        queryCalls += 1;
+        const attempt = queryCalls;
+        async function* events(): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'retry-provenance-session' };
+          if (attempt === 1) throw new Error('retryable upstream failure');
+          yield { type: 'result', text: 'Reviewed the release queue.' };
+        }
+        return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+      },
+    };
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+
+    try {
+      const deadline = Date.now() + 3_000;
+      while (
+        (
+          getOutboundDb()
+            .prepare('SELECT status FROM processing_ack WHERE message_id = ?')
+            .get('task-occurrence-retry') as { status: string } | undefined
+        )?.status !== 'completed'
+      ) {
+        if (Date.now() >= deadline) throw new Error('timed out waiting for credential-rotation retry completion');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      expect(queryInputs).toHaveLength(2);
+      expect(queryInputs[0].prompt).not.toContain('<runner-retry-provenance>');
+      // The fire resets: attempt 1 does not resume the previous fire's conversation...
+      expect(queryInputs[0].continuation).toBeUndefined();
+      // ...and the retry resumes the session attempt 1 stored at init, not a blank one.
+      expect(queryInputs[1].continuation).toBe('retry-provenance-session');
+      expect(queryInputs[1].prompt).toContain('<runner-retry-provenance>');
+      expect(queryInputs[1].prompt).toContain('Task occurrence ID: "task-occurrence-retry".');
+      expect(queryInputs[1].prompt).toContain('has not recorded a completed result');
+      expect(queryInputs[1].prompt).toContain('inspect durable effects already produced');
+      expect(queryInputs[1].prompt.endsWith(queryInputs[0].prompt)).toBe(true);
+      expect(
+        getOutboundDb().prepare("SELECT COUNT(*) AS count FROM messages_out WHERE kind = 'task_log'").get(),
+      ).toEqual({
+        count: 1,
+      });
+    } finally {
+      abort.abort();
+      await loop;
+    }
+  }, 5_000);
+
   it('points at the interrupted batch instead of re-sending it when the resumed transcript already holds it', async () => {
     // Continuous: this case pins a retry that resumes the fire's stored session.
     insertMessage('task-occurrence-dedup', 'task', { continuous: true, prompt: 'Review the release queue once.' });
@@ -359,6 +426,72 @@ describe('repository mount poll and tool admission barrier', () => {
       }
 
       expect(queryInputs).toHaveLength(2);
+      // The provider was asked about the exact prompt and continuation the retry resumes.
+      expect(asked).toEqual([{ continuation: 'retry-dedup-session', prompt: queryInputs[0].prompt }]);
+      expect(queryInputs[1].prompt).toContain('<runner-retry-provenance>');
+      expect(queryInputs[1].prompt).toContain('Task occurrence ID: "task-occurrence-dedup".');
+      expect(queryInputs[1].prompt).toContain('it is not repeated here');
+      expect(queryInputs[1].prompt).not.toContain(queryInputs[0].prompt);
+    } finally {
+      abort.abort();
+      await loop;
+    }
+  }, 5_000);
+
+  it('a default (fresh) fire retry points at the interrupted batch in the session attempt 1 started', async () => {
+    insertMessage('task-occurrence-dedup', 'task', { prompt: 'Review the release queue once.' });
+    setContinuation('claude', 'previous-fire-session');
+    const queryInputs: Array<{ prompt: string; continuation?: string }> = [];
+    const asked: Array<{ continuation?: string; prompt: string }> = [];
+    let queryCalls = 0;
+    const provider = {
+      supportsNativeSlashCommands: false,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      isRetryable: () => true,
+      rotateApiKey: () => ({ rotated: true }),
+      transcriptHasPrompt: (continuation: string | undefined, prompt: string, sinceMs: number) => {
+        asked.push({ continuation, prompt });
+        expect(sinceMs).toBeLessThanOrEqual(Date.now());
+        return true;
+      },
+      query: (input: { prompt: string; continuation?: string }) => {
+        queryInputs.push(input);
+        queryCalls += 1;
+        const attempt = queryCalls;
+        async function* events(): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'retry-dedup-session' };
+          if (attempt === 1) throw new Error('retryable upstream failure');
+          yield { type: 'result', text: 'Reviewed the release queue.' };
+        }
+        return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+      },
+    };
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+
+    try {
+      const deadline = Date.now() + 3_000;
+      while (
+        (
+          getOutboundDb()
+            .prepare('SELECT status FROM processing_ack WHERE message_id = ?')
+            .get('task-occurrence-dedup') as { status: string } | undefined
+        )?.status !== 'completed'
+      ) {
+        if (Date.now() >= deadline) throw new Error('timed out waiting for credential-rotation retry completion');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      expect(queryInputs).toHaveLength(2);
+      expect(queryInputs[0].continuation).toBeUndefined();
+      expect(queryInputs[1].continuation).toBe('retry-dedup-session');
       // The provider was asked about the exact prompt and continuation the retry resumes.
       expect(asked).toEqual([{ continuation: 'retry-dedup-session', prompt: queryInputs[0].prompt }]);
       expect(queryInputs[1].prompt).toContain('<runner-retry-provenance>');
@@ -4488,6 +4621,44 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(result.taskTurns!.map((t) => t.key)).toEqual(['occ-1', 'occ-2']);
     expect(result.taskTurns![0]!.outcome?.text).toBe('first fire failed');
     expect(result.taskTurns![1]!.outcome?.text).toBe('second fire failed');
+  }, 15_000);
+
+  // The default (fresh) twin of the case above: the later occurrence must not
+  // join the running conversation, and the stream is ended for it only once the
+  // turn is idle — end() mid-turn closes the control channel (#608/#610).
+  it('holds a default (fresh) later occurrence out of the RUNNING stream and ends the stream only when idle', async () => {
+    insertMessage('occ-2', 'task', { prompt: 'second fire of the same series' });
+
+    let resultSeen = false;
+    const endCalls: boolean[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      // Mid-turn window: several follow-up polls run while this turn is busy.
+      await Bun.sleep(1600);
+      resultSeen = true;
+      yield { type: 'result', text: 'first fire done', isError: false };
+      // Idle window: the next poll may now end the stream.
+      await Bun.sleep(1600);
+    }
+    const pushed: string[] = [];
+    const query: AgentQuery = {
+      push: (m: string) => pushed.push(m),
+      end: () => {
+        endCalls.push(resultSeen);
+      },
+      abort: () => {},
+      applySettings: async () => {},
+      events: events(),
+    };
+
+    const result = await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      ultracode: false,
+    });
+
+    expect(pushed.join('\n')).not.toContain('second fire of the same series');
+    expect(result.taskTurns!.map((t) => t.key)).toEqual(['occ-1']);
+    expect(endCalls.length).toBeGreaterThan(0);
+    expect(endCalls.every((afterResult) => afterResult)).toBe(true);
   }, 15_000);
 
   // #617: with prompt ids, one result that answered two admitted fires (the

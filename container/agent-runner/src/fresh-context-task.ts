@@ -20,6 +20,8 @@
  * `resolveTaskSession`, src/session-manager.ts:428-444), never a chat session.
  */
 import type { MessageInRow } from './db/messages-in.js';
+import { openInboundDb } from './mailbox/sqlite/connection.js';
+import { getWorkContinuation } from './modules/mailbox/session-state.js';
 
 /** Whether this one task row's fire starts fresh. */
 export function taskRowFiresFresh(m: MessageInRow): boolean {
@@ -40,4 +42,36 @@ export function taskRowFiresFresh(m: MessageInRow): boolean {
 export function isFreshContextTaskBatch(messages: MessageInRow[]): boolean {
   const substantive = messages.filter((m) => m.kind !== 'system');
   return substantive.length > 0 && substantive.every(taskRowFiresFresh);
+}
+
+/**
+ * Earlier work in this session that still needs its conversation: a queued or
+ * running `continue_work` record, or a `wait` wake that is not yet due (host
+ * row `schedule-wake-<id>`, src/modules/scheduled-wake/index.ts:96). A fire
+ * that comes due meanwhile resumes instead of resetting under that work, so
+ * the wake or continuation later lands in the conversation that set it.
+ */
+export function sessionHasOpenWork(): boolean {
+  if (getWorkContinuation() !== undefined) return true;
+  const db = openInboundDb();
+  // bun:sqlite answers a missing row with null, not undefined.
+  try {
+    return (
+      db
+        .prepare(
+          `SELECT 1 FROM messages_in
+            WHERE id LIKE 'schedule-wake-%' AND status = 'pending'
+              AND process_after IS NOT NULL AND datetime(process_after) > datetime('now')
+            LIMIT 1`,
+        )
+        .get() != null
+    );
+  } finally {
+    db.close();
+  }
+}
+
+/** Whether this batch is a scheduled fire that resets the conversation now. */
+export function startsFreshFire(messages: MessageInRow[]): boolean {
+  return isFreshContextTaskBatch(messages) && !sessionHasOpenWork();
 }
