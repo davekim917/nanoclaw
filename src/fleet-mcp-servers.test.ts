@@ -135,7 +135,7 @@ describe('entry validation', () => {
   it('refuses every wrong field shape, not just the transport', () => {
     // A string `args` clears `args.length > 0` and then throws on `.map` while
     // Codex writes its TOML
-    // (container/agent-runner/src/providers/codex-app-server.ts:749-750) — in
+    // (container/agent-runner/src/providers/codex-app-server.ts:806-807) — in
     // every group, since a fleet entry is inherited fleet-wide.
     write({ srv: { command: 'bun', args: '--serve' } });
     expect(() => readFleetMcpServers()).toThrow(/args must be an array of strings/);
@@ -222,7 +222,7 @@ describe('the file:line citations in this PR\u2019s comments', () => {
     },
     {
       file: 'container/agent-runner/src/providers/codex-app-server.ts',
-      line: 749,
+      line: 806,
       contains: 'config.args && config.args.length > 0',
       citedBy: 'validateFleetEntry — what a string `args` breaks',
     },
