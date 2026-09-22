@@ -9,6 +9,7 @@
  * on file and resumes cleanly if the user flips back.
  */
 import { getAgentMailbox } from '../mailbox/index.js';
+import { isAdmissibleOutcomeRequestSource } from '../outcome-reporting-schema.js';
 
 const LEGACY_KEY = 'sdk_session_id';
 
@@ -137,8 +138,7 @@ export function rememberRequestCandidates(
     let eligible = message.kind === 'task';
     if ((message.kind === 'chat' || message.kind === 'chat-sdk') && message.channel_type !== 'agent') {
       try {
-        const content = JSON.parse(message.content) as { sender?: unknown; senderId?: unknown; origin?: unknown };
-        eligible = content.sender !== 'system' && content.senderId !== 'system' && content.origin !== 'host';
+        eligible = isAdmissibleOutcomeRequestSource(message.kind, JSON.parse(message.content));
       } catch {
         eligible = false;
       }

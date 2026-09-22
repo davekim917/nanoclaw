@@ -93,8 +93,8 @@ export function markLifecycleTerminal(db: Database.Database, messageOutId: strin
   const result = db
     .prepare(
       `UPDATE delivered
-       SET lifecycle_terminal_at = ?
-       WHERE message_out_id = ? AND status = 'delivered' AND lifecycle_terminal_at IS NULL`,
+       SET lifecycle_terminal_at = COALESCE(lifecycle_terminal_at, ?)
+       WHERE message_out_id = ? AND status = 'delivered'`,
     )
     .run(new Date().toISOString(), messageOutId);
   return result.changes > 0;

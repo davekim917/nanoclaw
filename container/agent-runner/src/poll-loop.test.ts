@@ -5021,15 +5021,28 @@ describe('outcome reporting — quiet work and expected replies', () => {
         content: JSON.stringify({ origin: 'host', text: 'restart note' }),
       },
       {
-        id: 'human-request',
+        id: 'platform-bot',
         seq: 3,
+        kind: 'chat-sdk',
+        trigger: 1,
+        channel_type: 'slack',
+        content: JSON.stringify({
+          sender: 'Operator',
+          senderId: 'U1',
+          author: { isBot: true },
+          text: 'I look human in the flat fields.',
+        }),
+      },
+      {
+        id: 'human-request',
+        seq: 4,
         kind: 'chat',
         trigger: 1,
         channel_type: 'slack',
         content: JSON.stringify({ sender: 'Operator', senderId: 'U1', text: 'Do the work.' }),
       },
     ]);
-    expect(getRequestCandidates()).toEqual([{ sequence: 3, messageId: 'human-request' }]);
+    expect(getRequestCandidates()).toEqual([{ sequence: 4, messageId: 'human-request' }]);
   });
 
   it('retains each admitted recurring task occurrence as its own request candidate', () => {

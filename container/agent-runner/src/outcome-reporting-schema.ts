@@ -19,6 +19,25 @@ export interface TrustedRequestIdentity {
   origin?: { channelType: string; platformId: string; platformMessageId: string };
 }
 
+/** True only for a task occurrence or an external human-authored request. */
+export function isAdmissibleOutcomeRequestSource(kind: string, content: unknown): boolean {
+  if (kind === 'task') return true;
+  if ((kind !== 'chat' && kind !== 'chat-sdk') || !content || typeof content !== 'object' || Array.isArray(content))
+    return false;
+  const source = content as {
+    sender?: unknown;
+    senderId?: unknown;
+    origin?: unknown;
+    author?: { isBot?: unknown };
+  };
+  return (
+    source.sender !== 'system' &&
+    source.senderId !== 'system' &&
+    source.origin !== 'host' &&
+    source.author?.isBot !== true
+  );
+}
+
 /** Opaque receipt key derived from host-owned session + inbound-row identity. */
 export function requestWorkItem(identity: TrustedRequestIdentity): string {
   if (!identity.sessionId || !identity.messageId || !Number.isSafeInteger(identity.sequence) || identity.sequence < 1)

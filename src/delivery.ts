@@ -1,4 +1,4 @@
-import { canonicalWorkItem, renderWorkOutcome } from './outcome-reporting-schema.js';
+import { canonicalWorkItem, isAdmissibleOutcomeRequestSource, renderWorkOutcome } from './outcome-reporting-schema.js';
 import { claimWorkOutcome, settleWorkOutcome } from './db/work-outcome-receipts.js';
 /**
  * Outbound message delivery.
@@ -1854,16 +1854,14 @@ async function deliverMessage(
         sender?: unknown;
         senderId?: unknown;
         origin?: unknown;
+        author?: { isBot?: unknown };
       };
       try {
         sourceContent = JSON.parse(source.content) as typeof sourceContent;
       } catch (error) {
         throw new Error('Malformed harness request source', { cause: error });
       }
-      if (
-        source.kind !== 'task' &&
-        (sourceContent.sender === 'system' || sourceContent.senderId === 'system' || sourceContent.origin === 'host')
-      )
+      if (!isAdmissibleOutcomeRequestSource(source.kind, sourceContent))
         throw new Error('Harness request identity is not an original human request');
       const platformMessageId =
         typeof sourceContent.platformMsgId === 'string' && sourceContent.platformMsgId

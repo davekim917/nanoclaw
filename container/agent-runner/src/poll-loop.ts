@@ -1,4 +1,5 @@
 import { outcomeReportingEnabled, OUTCOME_REPLY_NUDGE } from './outcome-reporting.js';
+import { isAdmissibleOutcomeRequestSource } from './outcome-reporting-schema.js';
 import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'node:crypto';
@@ -1691,8 +1692,7 @@ function triggeringHumanLivenessInbound(messages: MessageInRow[]): MessageInRow 
   return triggeringHumanInbound(
     messages.filter((message) => {
       try {
-        const content = JSON.parse(message.content) as { author?: { isBot?: unknown } };
-        return content.author?.isBot !== true;
+        return isAdmissibleOutcomeRequestSource(message.kind, JSON.parse(message.content));
       } catch {
         return true;
       }

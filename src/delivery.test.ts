@@ -3091,6 +3091,7 @@ describe('per-work-item outcome delivery', () => {
     platformMessageId: string,
     sourceRoute = { channelType: 'telegram', platformId: 'telegram:123' },
     summary = 'The requested work is complete.',
+    sourceContent: Record<string, unknown> = {},
   ): { text: string; reporting: object } {
     const inbound = openInboundDbAt(inboundDbPath(agentGroupId, sessionId));
     const rowId = `${platformMessageId}:${agentGroupId}`;
@@ -3106,7 +3107,7 @@ describe('per-work-item outcome delivery', () => {
         now(),
         sourceRoute.platformId,
         sourceRoute.channelType,
-        JSON.stringify({ text: 'Do the work', platformMsgId: platformMessageId }),
+        JSON.stringify({ text: 'Do the work', platformMsgId: platformMessageId, ...sourceContent }),
       );
     inbound.close();
     const data = { requestId: sequence, verified: 'Focused checks passed.' };
@@ -3287,6 +3288,44 @@ describe('per-work-item outcome delivery', () => {
     await deliverSessionMessages(session);
     expect(deliver).not.toHaveBeenCalled();
     expect(getRawDb().prepare('SELECT COUNT(*) AS count FROM work_outcome_receipts').get()).toEqual({ count: 0 });
+  });
+
+  it('rejects an opaque outcome from a trusted bot author even when flat sender fields look human', async () => {
+    const session = await prepare();
+    const deliver = vi.fn().mockResolvedValue('must-not-deliver');
+    setDeliveryAdapter({ deliver });
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'bot-keyed-outcome',
+      'chat',
+      'telegram',
+      'telegram:123',
+      opaqueOutcome(
+        'ag-1',
+        session.id,
+        2,
+        'platform-bot-1',
+        { channelType: 'telegram', platformId: 'telegram:123' },
+        'The automated request is complete.',
+        { sender: 'Operator', senderId: 'U1', author: { isBot: true } },
+      ),
+    );
+
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+
+    expect(deliver).not.toHaveBeenCalled();
+    expect(getRawDb().prepare('SELECT COUNT(*) AS count FROM work_outcome_receipts').get()).toEqual({ count: 0 });
+    const inbound = openInboundDb('ag-1', session.id);
+    expect(
+      inbound.prepare('SELECT status,error FROM delivered WHERE message_out_id = ?').get('bot-keyed-outcome'),
+    ).toMatchObject({
+      status: 'failed',
+      error: expect.stringContaining('not an original human request'),
+    });
+    inbound.close();
   });
 
   it('gives unrelated scheduled work outcomes independent roots instead of the daily task thread', async () => {

@@ -304,6 +304,13 @@ describe('NanoclawAgentMailbox', () => {
       expect(m.markLifecycleTerminal('out-42')).toBe(true);
     });
 
+    const firstTerminalAt = raw(dbPath(key, 'inbound'), (db) =>
+      db.prepare('SELECT lifecycle_terminal_at FROM delivered WHERE message_out_id = ?').pluck().get('out-42'),
+    ) as string;
+    await mailbox.session(key, async (mailboxSession) => {
+      expect(fork(mailboxSession).markLifecycleTerminal('out-42')).toBe(true);
+    });
+
     const row = raw(dbPath(key, 'inbound'), (db) =>
       db
         .prepare(
@@ -313,6 +320,7 @@ describe('NanoclawAgentMailbox', () => {
     ) as { status: string; platform_message_id: string | null; error: string | null; lifecycle_terminal_at: string };
     expect(row).toMatchObject({ status: 'delivered', platform_message_id: 'p1', error: null });
     expect(new Date(row.lifecycle_terminal_at).toISOString()).toBe(row.lifecycle_terminal_at);
+    expect(row.lifecycle_terminal_at).toBe(firstTerminalAt);
     // An old reader names only the columns it knows. The additive field is ignored.
     expect(
       raw(dbPath(key, 'inbound'), (db) =>

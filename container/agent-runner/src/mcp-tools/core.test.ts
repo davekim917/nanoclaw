@@ -502,6 +502,9 @@ describe('outcome reporting send_message contract', () => {
   });
 
   it('resolves the second recurring task occurrence by its displayed request id', async () => {
+    const description = sendMessage.tool.inputSchema.properties.outcome.properties.requestId.description;
+    expect(description).toContain('<message id="…">');
+    expect(description).toContain('<task id="…">');
     const { setChatLimit } = await import('../modules/mailbox/index.js');
     publishRequestCandidates([
       { sequence: 41, messageId: 'series-fire-1' },

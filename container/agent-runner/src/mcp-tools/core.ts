@@ -293,7 +293,7 @@ export const sendMessage: McpToolDefinition = {
             requestId: {
               type: 'integer',
               description:
-                'Harness-supplied id from the original inbound <message id="…">. Required when several requests are available.',
+                'Harness-supplied id from the original inbound <message id="…"> or <task id="…">. Required when several requests are available.',
             },
             verified: { type: 'string' },
             evidence: { type: 'string', description: 'Optional accessible HTTPS evidence link.' },
