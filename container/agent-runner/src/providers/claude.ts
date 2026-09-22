@@ -3064,14 +3064,14 @@ export class ClaudeProvider implements AgentProvider {
                 createBashCommandRewriteHook({ closeStdin: true }),
               ],
             },
-            // NO MATCHER, deliberately, and LAST. `preToolUseHook` records
+            // NO MATCHER, deliberately. `preToolUseHook` records
             // `container_state` for EVERY tool (that is what lets the host
             // widen its ceiling past ABSOLUTE_CEILING_MS for a long-declared
             // Bash) and enforces SDK_DISALLOWED_TOOLS as defense-in-depth,
-            // which no Bash matcher would ever reach. Last so that for a Bash
-            // call the block hooks above get their say first; a tool they deny
-            // never reaches PostToolUse, and `toolsInFlight`'s own comment
-            // covers what that leaves behind.
+            // which no Bash matcher would ever reach. Its position orders
+            // nothing: the CLI runs it concurrently with the Bash hooks above,
+            // so it records a call they go on to deny; `toolsInFlight`'s own
+            // comment covers the entry that leaves behind.
             //
             // DO NOT DROP THIS ENTRY IN A MERGE RESOLUTION. It has been lost
             // six times; claude.preToolUse-registration.test.ts asserts it is
