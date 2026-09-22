@@ -81,8 +81,8 @@ its disposition. A local completion claim is not substitute-review coverage.
 There is no longer a worker-policy file, in this repo or in the bootstrap
 plugin. The plugin ships delegation as effort shims that inherit the caller's
 model, so nothing in a live config names a concrete frontier model any more,
-and nothing can be derived from one. Two places state a model or an effort, and
-they are independent of each other:
+and nothing can be derived from one. Two settings govern review, and they
+are independent of each other:
 
 - **Who may review.** Any frontier model; nothing to edit when a new one
   ships. Only the small-tier denylist, `REVIEWER_DENIED_TIERS` in

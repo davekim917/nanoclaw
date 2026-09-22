@@ -647,11 +647,14 @@ REVIEWER_DENIED_TIERS=(sonnet haiku luna terra mini nano lite small)
 # which names the route, not the model. What remains must be a concrete versioned
 # id: id characters only, starting with a letter or digit, containing a digit. A
 # bare alias ("opus", "inherit") names whatever the runtime defaults to, not the
-# model that ran, so a receipt must record the id the runtime reported. Every
-# comparison is pure bash, so no token is ever handed to an external command as
-# an argument (no "-V"/"--help" smuggling).
+# model that ran, so a receipt must record the id the runtime reported. A tier
+# word also matches when a version is fused onto it (`claude-sonnet5`,
+# `mistral-small3.1`). The function runs under LC_ALL=C: in a UTF-8 locale
+# bash's `[a-z]` also matches lookalikes such as a fullwidth `ｓ`, which would
+# let `claude-ｓonnet-5` through. Every comparison is pure bash, so no token is
+# ever handed to an external command as an argument (no "-V"/"--help" smuggling).
 reviewer_model_refusal() {
-  local text="${1:-}" first id seg denied
+  local LC_ALL=C text="${1:-}" first id seg denied
   local -a segs=()
   first="${text%%[[:space:]]*}"
   id=$(printf '%s' "$first" | tr '[:upper:]' '[:lower:]')
@@ -664,7 +667,7 @@ reviewer_model_refusal() {
   IFS='-._' read -r -a segs <<< "$id"
   for seg in "${segs[@]}"; do
     for denied in "${REVIEWER_DENIED_TIERS[@]}"; do
-      if [ "$seg" = "$denied" ]; then
+      if [[ "$seg" =~ ^${denied}[0-9]*$ ]]; then
         printf '"%s" is a %s-tier model; reviewers must be frontier-tier (denied tiers: %s)' "$first" "$denied" "${REVIEWER_DENIED_TIERS[*]}"
         return 0
       fi
@@ -672,8 +675,12 @@ reviewer_model_refusal() {
   done
 }
 
+# Fails closed: a refusal function that dies without printing is a refusal,
+# not an empty (allowed) answer.
 reviewer_model_allowed() {
-  [ -z "$(reviewer_model_refusal "${1:-}")" ]
+  local refusal
+  refusal=$(reviewer_model_refusal "${1:-}") || return 1
+  [ -z "$refusal" ]
 }
 
 # Sets SCOPE_MODE to `risk-scoped` or `legacy`, and LABELER_YML to the file it

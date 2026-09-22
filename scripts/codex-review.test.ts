@@ -2433,6 +2433,12 @@ describe('codex-review risk-scoped review requests', () => {
     ['a small model behind a two-level provider path', 'nvidia/mistralai/mistral-small-4-119b-2603'],
     ['a sonnet model behind a provider prefix', 'opencode/claude-sonnet-5 (opencode run)'],
     ['a bare alias with no version', 'opus (subagent)'],
+    // A version fused onto the tier word is still that tier.
+    ['a sonnet model with its version fused on', 'claude-sonnet5'],
+    ['a small model with its version fused on', 'mistral-small3.1'],
+    // A fullwidth `ｓ` passes bash's `[a-z]` in a UTF-8 locale; the rule runs
+    // under LC_ALL=C so the lookalike is not an id character at all.
+    ['a sonnet model spelled with a fullwidth lookalike', 'claude-ｓonnet-5'],
   ])('refuses a receipt whose --reviewer names %s, posting nothing', (_case, reviewer) => {
     const root = tempRoot();
     const bodyFile = path.join(root, 'review.md');
@@ -2473,6 +2479,8 @@ describe('codex-review risk-scoped review requests', () => {
     'gemini-3.1-pro',
     'gpt-7',
     'claude-opus-6 (opus)',
+    // Case is not part of the id: a mixed-case spelling is the same model.
+    'Claude-Opus-5 (opus)',
   ])('accepts a receipt from frontier model %s with no list to edit', (reviewer) => {
     const root = tempRoot();
     const bodyFile = path.join(root, 'review.md');
