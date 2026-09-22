@@ -97,11 +97,7 @@ export function recordContextTokens(tokens: number | null | undefined): void {
  * the group default became (the same reasoning as `modelInForce` in
  * poll-loop.ts, whose value this mirrors).
  */
-export function setTurnSettings(
-  nextModel?: string | null,
-  nextEffort?: string | null,
-  nextUltracode?: boolean,
-): void {
+export function setTurnSettings(nextModel?: string | null, nextEffort?: string | null, nextUltracode?: boolean): void {
   model = nextModel ?? null;
   effort = nextEffort ?? null;
   ultracode = nextUltracode === true;
@@ -260,12 +256,16 @@ export function recordSubagent(
   fields: { type?: string | null; model?: string | null; effort?: string | null },
 ): void {
   if (!key) return;
-  const prior = subagents.get(key) ?? { type: null, model: null, effort: null };
-  subagents.set(key, {
-    type: fields.type ?? prior.type,
-    model: fields.model ?? prior.model,
-    effort: fields.effort ?? prior.effort,
-  });
+  const prior = subagents.get(key);
+  const next = {
+    type: fields.type ?? prior?.type ?? null,
+    model: fields.model ?? prior?.model ?? null,
+    effort: fields.effort ?? prior?.effort ?? null,
+  };
+  // Claude calls this once per worker frame, so a large fan-out would otherwise
+  // write thousands of identical snapshots. Persist only on a real change (#1028).
+  if (prior && prior.type === next.type && prior.model === next.model && prior.effort === next.effort) return;
+  subagents.set(key, next);
   persist();
 }
 
