@@ -9,6 +9,7 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 
 import {
+  clearContextTokens,
   formatStatusSubtext,
   formatTokens,
   recordContextTokens,
@@ -100,5 +101,38 @@ describe('formatStatusSubtext', () => {
     setTurnSettings('claude-opus-5[1m]', 'xhigh', true);
     setTurnSettings('claude-opus-5[1m]', 'medium');
     expect(formatStatusSubtext()).toBe('opus-5 · medium');
+  });
+});
+
+describe('clearContextTokens — the turn boundary', () => {
+  it('drops the figure but keeps model and effort', () => {
+    // Model and effort describe standing configuration and stay true across a
+    // turn boundary; the context number is a measurement of ONE turn.
+    setTurnSettings('claude-opus-5[1m]', 'xhigh');
+    recordContextTokens(142_400);
+    clearContextTokens();
+    expect(formatStatusSubtext()).toBe('opus-5 · xhigh');
+  });
+
+  it('stops a turn with no usage frame from inheriting the previous turn`s figure', () => {
+    // The reported bug: recordContextTokens ignores an absent reading, so
+    // without a boundary the next turn prints a stale measurement beside a
+    // newly selected model, as though it belonged to that reply.
+    setTurnSettings('claude-opus-5[1m]', 'xhigh');
+    recordContextTokens(142_400);
+
+    clearContextTokens();
+    setTurnSettings('claude-haiku-4-5-20251001', 'low');
+    recordContextTokens(undefined); // a turn whose frames carried no usage
+
+    expect(formatStatusSubtext()).toBe('haiku-4-5-20251001 · low');
+  });
+
+  it('a fresh measurement after the boundary renders normally', () => {
+    setTurnSettings('claude-opus-5[1m]', 'high');
+    recordContextTokens(142_400);
+    clearContextTokens();
+    recordContextTokens(12_800);
+    expect(formatStatusSubtext()).toBe('opus-5 · high · 13k context');
   });
 });

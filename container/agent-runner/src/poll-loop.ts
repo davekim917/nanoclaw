@@ -15,7 +15,7 @@ import {
   type MessageInRow,
 } from './db/messages-in.js';
 import { getConfig } from './config.js';
-import { formatStatusSubtext, setTurnSettings } from './turn-status.js';
+import { clearContextTokens, formatStatusSubtext, setTurnSettings } from './turn-status.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { touchHeartbeat } from './heartbeat.js';
@@ -3229,6 +3229,12 @@ export async function dispatchInterimMessageBlocks(
  * assume inbound rows are already marked completed when this row lands.
  */
 async function emitTurnEnd(): Promise<void> {
+  // The context figure belongs to the turn that measured it. Dropping it here
+  // means the NEXT turn shows a figure only if it measures one of its own,
+  // rather than inheriting this turn's beside a possibly-different model.
+  // Safe at this point specifically: this runs after the turn's reply has been
+  // dispatched and stamped (dispatchResultText), never before.
+  clearContextTokens();
   const lifecycleStatusId = getCurrentLifecycleStatus();
   await writeMessageOut({
     id: generateId(),

@@ -76,6 +76,28 @@ export function setTurnSettings(
   ultracode = nextUltracode === true;
 }
 
+/**
+ * Forget the context reading at a turn boundary.
+ *
+ * `recordContextTokens` deliberately ignores an absent reading, so without
+ * this a turn that produces a reply WITHOUT a usable usage frame would inherit
+ * the previous turn's figure — and print it beside whatever model is now in
+ * force, asserting a stale measurement as belonging to the current reply. The
+ * honest answer for missing telemetry is to omit the context part, which is
+ * what an empty store renders.
+ *
+ * Called from `emitTurnEnd` (poll-loop.ts), which every turn exit runs and
+ * which fires AFTER the turn's reply has been dispatched — so clearing here
+ * never strips the figure from the reply that earned it.
+ *
+ * Model and effort deliberately SURVIVE: they describe the session's standing
+ * configuration, not a measurement, and remain true until something changes
+ * them.
+ */
+export function clearContextTokens(): void {
+  contextTokens = null;
+}
+
 /** Test seam — reset the store between cases. */
 export function resetTurnStatus(): void {
   contextTokens = null;
