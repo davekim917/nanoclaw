@@ -101,11 +101,10 @@ export async function applyScheduleWake(
       threadId: routing?.thread_id ?? null,
       sourceSessionId: anchoredRouting?.source_session_id ?? null,
       content: JSON.stringify({
-        // Delivery contract stated at fire time: on a self-wake, bare final
-        // text is logged, never posted (see Routing.selfWake in the runner) —
-        // without this line agents narrated "nothing moved, no post" and the
-        // origin-fallback posted exactly that to the channel, every wake.
-        text: `[system] ${prompt}\n\n(Scheduled wake: bare final text is NOT delivered. Wrap anything that should post in a <message> block; if nothing needs posting, end with no message at all.)`,
+        // Self-wake final text stays internal (container/agent-runner/src/poll-loop.ts:3452).
+        // Refer to the mounted send_message schema rather than version-specific
+        // policy fields (container/agent-runner/src/mcp-tools/core.ts:266–329).
+        text: `[system] ${prompt}\n\n(Scheduled wake: bare final text is NOT delivered. Use the send_message tool for anything that should post, following its available schema and communication rules; if nothing needs posting, end with no message at all.)`,
         sender: 'system',
         senderId: 'system',
         _system: { kind: 'agent_scheduled_wake' },

@@ -3445,8 +3445,8 @@ export async function dispatchResultText(
   // Self-wake turns are excluded: their unwrapped output is almost always
   // self-narration of the "nothing changed, no post" decision, and the
   // fallback turned that into channel spam (one no-op status line per wake).
-  // A wake that HAS news posts it via an explicit <message> block — the wake
-  // prompt states this contract.
+  // A wake that HAS news posts it via the send_message tool — the scheduled
+  // wake prompt states this contract.
   if (opts.blocksOnly) return { sent, hasUnwrapped: false, taskBlocks };
 
   if (!routing.taskRun && !routing.selfWake && sent === 0 && scratchpad) {
