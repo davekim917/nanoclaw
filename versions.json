@@ -3,5 +3,5 @@
   "onecli-cli": "2.2.5",
   "claude-code": "2.1.280",
   "claude-agent-sdk": "0.3.280",
-  "codex-cli": "0.155.1"
+  "codex-cli": "0.156.0"
 }

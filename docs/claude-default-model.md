@@ -6,11 +6,13 @@ This section is the current migration and is complete on its own. Everything und
 
 **What moves.** `DEFAULT_OPUS_MODEL` (`src/flag-parser.ts`) is now `claude-opus-5-5[1m]`, and the Opus family default effort (`defaultEffortForModel`, `container/agent-runner/src/providers/claude.ts`) is now `medium`, down from `high`. On deploy, every Claude path whose model is the Opus default or an `opus` alias runs Opus 5.5. That covers primary groups, declared `providerFallback`s, `-m opus`, and `opus` task, wiring and subagent pins. Every Opus path with no effort configured runs `medium`, and that includes an explicit `claude-opus-5[1m]` pin, because the family default keys on every `claude-opus-*` id. Codex and OpenCode defaults do not move.
 
-**Detect.** A Claude chat turn resolves its model in this order: session sticky `-m`, channel wiring `default_model`, group `container.json` `model`, then the install default. A pure scheduled-task fire resolves: task pin, group `container.json` `model`, then the install default. It ignores session stickies (`container/agent-runner/src/poll-loop.ts:4015`), and a task session has no channel wiring. Effort resolves the same way through the matching `effort` fields, then the family default. A path **moves to Opus 5.5** when that chain ends at the install default or at the word `opus`. A frozen id such as `claude-opus-5[1m]` keeps its model. A path **moves to `medium`** when it resolves to any `claude-opus-*` id and no layer sets an effort, and that includes frozen `claude-opus-5[1m]` pins. Check every layer:
+**Detect.** A Claude chat turn resolves its model in this order: `-m` (the turn's flag or the session sticky), then `container.json` `providerConfig.model`, then channel wiring `default_model`, then `container.json` `model`, then the install default. That is `input.model ?? stickyConfig.model ?? NANOCLAW_CLAUDE_MODEL` at `container/agent-runner/src/providers/claude.ts:2770`; the host folds wiring and group `model` into that env var. A pure scheduled-task fire resolves: task pin, `providerConfig.model`, group `model`, then the install default. It ignores session stickies (`container/agent-runner/src/poll-loop.ts:4015`), and a task session has no channel wiring. Effort resolves the same way through the matching `effort` fields, then the family default. A path **moves to Opus 5.5** when that chain ends at the install default or at the word `opus`. A frozen id such as `claude-opus-5[1m]` keeps its model. A path **moves to `medium`** when it resolves to any `claude-opus-*` id and no layer sets an effort, and that includes frozen `claude-opus-5[1m]` pins. Check every layer:
 
 ```bash
 # 1. Groups and every declared providerFallback, answered by the spawn resolver itself:
 #    run the audit script in History §1 unchanged; "(none)" or a refusal = unpinned.
+# 1b. providerConfig pins (they outrank every wiring; change them here, not on a wiring):
+node -e 'const fs=require("fs");for(const g of fs.readdirSync("groups")){let c;try{c=JSON.parse(fs.readFileSync(`groups/${g}/container.json`,"utf8"))}catch{continue}const p=c.providerConfig||{};if(p.model||p.effort)console.log(g,p.model||"-",p.effort||"-")}'
 # 2. Channel wirings, including effort-only ones:
 pnpm exec tsx scripts/q.ts data/v2.db "select mga.id, mg.name, ag.folder, mga.default_model, mga.default_effort from messaging_group_agents mga join messaging_groups mg on mg.id = mga.messaging_group_id join agent_groups ag on ag.id = mga.agent_group_id where coalesce(mga.default_model,'') <> '' or coalesce(mga.default_effort,'') <> ''"
 # 3. Every live task series; "(group)" = no pin, so it follows its group's model/effort:
@@ -21,17 +23,17 @@ pnpm exec tsx -e "import Database from 'better-sqlite3'; import fs from 'fs'; fo
 
 A wiring with only `default_effort` keeps that effort and takes its model from the group. A sticky or pin reading `opus` moves to 5.5, and a frozen id does not.
 
-**Why.** Opus 5.5 costs $4/$20 per MTok, against Opus 5's $5/$25, and `medium` is its API default. The container's claude-code CLI must be at least 2.1.280 to know the id, and this change pins exactly that version (with agent SDK 0.3.280 and codex-cli 0.155.1, recorded in `versions.json`).
+**Why.** Opus 5.5 costs $4/$20 per MTok, against Opus 5's $5/$25, and `medium` is its API default. The container's claude-code CLI must be at least 2.1.280 to know the id, and this change pins exactly that version (with agent SDK 0.3.280 and codex-cli 0.156.0, recorded in `versions.json`).
 
 **Fix: keep Opus 5/`high` on a path, before deploying.** Pins are data, so they take effect without a deploy:
 
 ```bash
 ncl groups config update --id <group-id> --model claude-opus-5[1m] --effort high      # a whole group
-ncl wirings update <wiring-id> --default-model claude-opus-5[1m] --default-effort high # one channel
+ncl wirings update <wiring-id> --default-model claude-opus-5[1m] --default-effort high # one channel (no effect where providerConfig sets a value)
 ncl tasks update --id <series> --group <group-id> --model claude-opus-5[1m] --effort high
 ```
 
-A declared `providerFallback` keeps Opus 5 only if its own `model`/`effort` in `container.json` say so.
+A group whose `container.json` has `providerConfig.model`/`.effort` is governed by those values ahead of any wiring. Edit them in the file to hold or move that group. A declared `providerFallback` keeps Opus 5 only if its own `model`/`effort` in `container.json` say so.
 
 **Deploy.** Run `scripts/deploy.sh`. It pulls, builds the host, and rebuilds the agent image, because `container/` changed. Then it restarts. The image rebuild is required: the SDK bump changes the runner's deps hash, and `src/agent-runner-image-check.ts` refuses every spawn until the image matches.
 
