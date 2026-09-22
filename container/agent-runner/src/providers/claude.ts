@@ -1165,18 +1165,26 @@ export function wrapJestSerialized(command: string): string {
 
 /**
  * Rewrites a Bash command before it runs: the jest serialization lock
- * (wrapJestSerialized), then `/dev/null` stdin around everything
+ * (wrapJestSerialized) — a SEMANTIC rewrite that guards may legitimately see —
+ * and, only when `closeStdin` is set, the `/dev/null` stdin prefix
  * (wrapDevNullStdin). No `unset <secrets>` prefix any more — see
  * secret-env.ts's header.
  *
- * Registered LAST in the Bash PreToolUse list. It is the only hook that
- * returns `updatedInput`, and every other Bash hook is a guard written against
- * the command as the agent typed it (the email gate's bypass check, for
- * example, fails closed on `<` and newlines). Whether the CLI hands a
- * later hook an earlier hook's `updatedInput` or runs them all on the original
- * input, last means no guard ever sees the wrapper.
+ * INVARIANT: the stdin prefix is a transport detail and no guard, in any
+ * chain, may ever see it. The email gate's bypass check fails closed on `<`
+ * and newlines, so a guard reading `exec </dev/null\n…` would turn a harmless
+ * `--dry-run` into an hour-long approval wait. Every chain therefore applies
+ * the prefix exactly ONCE, at the point it emits its final `updatedInput`:
+ *   • Claude SDK: this hook with `closeStdin: true`, registered LAST in the
+ *     Bash PreToolUse list. One hook emits both rewrites, because the CLI's
+ *     merge of several `updatedInput`s is not something we can read; a second
+ *     emitting hook could clobber the jest rewrite under last-write-wins.
+ *   • Codex (codex-hooks/runner.ts runPreToolUseChain): this hook WITHOUT
+ *     `closeStdin` stays first, so its guards see the jest rewrite, and the
+ *     chain applies wrapDevNullStdin itself after every guard, including the
+ *     destructive-action guard, just before it returns.
  */
-export function createBashCommandRewriteHook(): HookCallback {
+export function createBashCommandRewriteHook(opts: { closeStdin?: boolean } = {}): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;
@@ -1186,8 +1194,9 @@ export function createBashCommandRewriteHook(): HookCallback {
     if (JEST_RE.test(command) && !ALREADY_FLOCKED_RE.test(command)) {
       rewritten = wrapJestSerialized(rewritten);
     }
-    // Prefix goes outermost, so jest's inner `bash -c` inherits /dev/null too.
-    rewritten = wrapDevNullStdin(rewritten);
+    // Emit point for the Claude chain (see the INVARIANT above). The prefix goes
+    // outermost, so jest's inner `bash -c` inherits /dev/null too.
+    if (opts.closeStdin) rewritten = wrapDevNullStdin(rewritten);
     if (rewritten === command) return {};
 
     return {
@@ -2953,7 +2962,9 @@ export class ClaudeProvider implements AgentProvider {
               matcher: 'Bash',
               // Order matters: every guard runs on the command as the agent
               // wrote it, and the rewrite (the only hook returning
-              // updatedInput) runs LAST — see createBashCommandRewriteHook.
+              // updatedInput, and this chain's emit point for the stdin
+              // prefix) runs LAST — see createBashCommandRewriteHook's
+              // INVARIANT. The prefix must never be visible to a guard.
               hooks: [
                 createManagedGitMaintenanceHook(),
                 createSelfApprovalBlockHook(),
@@ -2961,7 +2972,7 @@ export class ClaudeProvider implements AgentProvider {
                 createBlockGitCloneHook(),
                 createBlockCodexCompanionHook(),
                 ...(pluginOwnsBashEmailGate ? [] : [createEmailGateHook()]),
-                createBashCommandRewriteHook(),
+                createBashCommandRewriteHook({ closeStdin: true }),
               ],
             },
           ],

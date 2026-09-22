@@ -54,7 +54,11 @@ async function runBashHook(
 /** Drive createBashCommandRewriteHook and return the command it produced. */
 async function runRewriteHook(command: string): Promise<string> {
   const input = { tool_name: 'Bash', tool_input: { command } } as unknown as PreToolUseHookInput;
-  const out = await createBashCommandRewriteHook()(input as Parameters<HookCallback>[0], EMPTY_CTX, EMPTY_OPTS);
+  const out = await createBashCommandRewriteHook({ closeStdin: true })(
+    input as Parameters<HookCallback>[0],
+    EMPTY_CTX,
+    EMPTY_OPTS,
+  );
   const hso = (out as { hookSpecificOutput?: { updatedInput?: { command?: string } } })?.hookSpecificOutput;
   return hso?.updatedInput?.command ?? command;
 }
@@ -766,7 +770,7 @@ describe('wrapJestSerialized', () => {
 
 describe('createBashCommandRewriteHook: jest serialization', () => {
   const runHook = async (command: string): Promise<string> => {
-    const hook = createBashCommandRewriteHook();
+    const hook = createBashCommandRewriteHook({ closeStdin: true });
     const res = (await hook(
       { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command } } as never,
       undefined as never,
@@ -1141,6 +1145,22 @@ describe('universal /dev/null stdin wrap', () => {
     expect(await runRewriteHook(once)).toBe(once);
     expect(wrapDevNullStdin(once)).toBe(once);
     expect(once.match(/exec <\/dev\/null/g)).toHaveLength(1);
+  });
+
+  it('without closeStdin the hook never adds the prefix (the Codex chain emits it itself)', async () => {
+    const hook = createBashCommandRewriteHook();
+    const run1 = async (command: string) =>
+      (
+        (await hook(
+          { tool_name: 'Bash', tool_input: { command } } as unknown as Parameters<HookCallback>[0],
+          EMPTY_CTX,
+          EMPTY_OPTS,
+        )) as { hookSpecificOutput?: { updatedInput?: { command?: string } } }
+      )?.hookSpecificOutput?.updatedInput?.command;
+    expect(await run1('ls -la')).toBeUndefined(); // nothing to rewrite
+    const jest = await run1('npx jest');
+    expect(jest).toBe(wrapJestSerialized('npx jest'));
+    expect(jest).not.toContain('exec </dev/null');
   });
 
   it('(f) quoted text containing `snow sql --query ""` is not denied and runs', async () => {
