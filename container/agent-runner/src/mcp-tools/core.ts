@@ -485,19 +485,26 @@ export const sendFile: McpToolDefinition = {
     fs.mkdirSync(outboxDir, { recursive: true });
     fs.writeFileSync(path.join(outboxDir, filename), fileContent);
 
-    await writeMessageOut({
-      id,
-      in_reply_to: getCurrentInReplyTo(),
-      kind: 'chat',
-      platform_id: routing.platform_id,
-      channel_type: routing.channel_type,
-      thread_id: routing.thread_id,
-      content: JSON.stringify(
-        key.threadKey
-          ? { text: caption, files: [filename], threadKey: key.threadKey }
-          : { text: caption, files: [filename] },
-      ),
-    });
+    await writeMessageOut(
+      withStatusSubtext({
+        id,
+        in_reply_to: getCurrentInReplyTo(),
+        kind: 'chat',
+        // A caption is agent-composed text: often the whole report, with the
+        // file attached to it. Stamped like any reply, own conversation only.
+        // A bare file with no caption gets no line, since there is no reply text
+        // to sit under.
+        agentReply: caption.trim() !== '',
+        platform_id: routing.platform_id,
+        channel_type: routing.channel_type,
+        thread_id: routing.thread_id,
+        content: JSON.stringify(
+          key.threadKey
+            ? { text: caption, files: [filename], threadKey: key.threadKey }
+            : { text: caption, files: [filename] },
+        ),
+      }),
+    );
 
     log(`send_file: ${id} → ${routing.resolvedName} (${filename}), awaiting host ack`);
 

@@ -19,6 +19,7 @@ interface Recorded {
   markdown?: string;
   raw?: string;
   subtext?: string;
+  files?: unknown[];
 }
 
 /** A bridge whose adapter records every body it is handed. */
@@ -169,5 +170,21 @@ describe('chat-sdk bridge status subtext', () => {
 
     expect(edits[0].markdown!.length).toBeLessThanOrEqual(100);
     expect(edits[0].markdown).toContain('-# opus-5 · high · 90k context');
+  });
+
+  // A send_file caption is stamped by the runner; the footer must land on the
+  // message that carries the files, not be dropped by the attachment path.
+  it('renders the subtext on a captioned file post, on the message carrying the file', async () => {
+    const { bridge, posts } = subtextBridge({ renderSubtext: true });
+
+    await bridge.deliver('thread-1', null, {
+      kind: 'chat',
+      content: { text: 'Blurb attached.', files: ['draft.md'], subtext: 'opus-5 · high · 452k context' },
+      files: [{ data: Buffer.from('# draft'), filename: 'draft.md' }],
+    } as never);
+
+    expect(posts).toHaveLength(1);
+    expect(posts[0].markdown).toBe('Blurb attached.\n-# opus-5 · high · 452k context');
+    expect(posts[0].files).toHaveLength(1);
   });
 });
