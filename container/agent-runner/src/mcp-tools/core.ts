@@ -265,7 +265,7 @@ export const sendMessage: McpToolDefinition = {
   tool: {
     name: 'send_message',
     description:
-      'Send a structured public message. Omit `to` for the CURRENT conversation; pass it only for a requested different destination. Use reply for requested interaction, outcome for one finished human work item, urgent/decision for material exceptions, handoff for actionable coordination, and progress only for an internal work record. The harness owns acknowledgment/liveness. A container file path is not user-accessible; attach it with send_file.',
+      'Send a structured public message. Omit `to` for the CURRENT conversation; pass it only for a requested different destination. Use reply for requested interaction, outcome for one finished human work item, urgent/decision for material exceptions, handoff for actionable coordination, and progress only for an internal work record. The harness owns acknowledgment/liveness. A container file path is not user-accessible: attach it with send_file, or excerpt its content here instead of naming the path.',
     inputSchema: {
       type: 'object' as const,
       properties: {
