@@ -470,6 +470,8 @@ export interface AgentQuery {
  * books the whole pre-restart history as one turn.
  */
 export interface TurnUsageInfo {
+  /** Counter lifetime supplied by the provider; a resumed session can open a new query counter. */
+  accounting?: { kind: 'cumulative'; scope: string } | { kind: 'per-turn' };
   model?: string | null;
   inputTokens?: number | null;
   outputTokens?: number | null;
