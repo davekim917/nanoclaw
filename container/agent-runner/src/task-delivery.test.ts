@@ -234,6 +234,20 @@ describe('automatic task run summary', () => {
     expect(content.auto).toBe(true);
     expect(content.isError).toBeUndefined();
   });
+  it('correlates a single automatic task outcome without changing its summary count', async () => {
+    await autoAppendTaskLog('Phase checkpoint saved.', false, 'test-model', ['event-one']);
+    const rows = getOutboundDb().prepare("SELECT in_reply_to, content FROM messages_out WHERE kind = 'task_log'").all() as {in_reply_to: string | null; content: string}[];
+    expect(rows).toHaveLength(1);
+    expect(rows[0].in_reply_to).toBe('event-one');
+    expect(JSON.parse(rows[0].content).taskMessageIds).toEqual(['event-one']);
+  });
+  it('records a batched outcome once without inventing a scalar reply anchor', async () => {
+    await autoAppendTaskLog('Batch answered.', true, 'test-model', ['event-one', 'event-two']);
+    const rows = getOutboundDb().prepare("SELECT in_reply_to, content FROM messages_out WHERE kind = 'task_log'").all() as {in_reply_to: string | null; content: string}[];
+    expect(rows).toHaveLength(1);
+    expect(rows[0].in_reply_to).toBeNull();
+    expect(JSON.parse(rows[0].content).taskMessageIds).toEqual(['event-one', 'event-two']);
+  });
 
   it("carries the provider's error verdict and the model that ran", async () => {
     await autoAppendTaskLog(

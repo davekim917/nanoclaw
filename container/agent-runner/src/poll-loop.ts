@@ -892,7 +892,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // would not either.
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          await autoAppendTaskLog(outcome.text, outcome.isError, outcome.model);
+          const taskMessageIds = key.split(',').filter((id) => getMessageIn(id)?.kind === 'task');
+          await autoAppendTaskLog(outcome.text, outcome.isError, outcome.model, taskMessageIds);
           return;
         } catch (logErr) {
           const reason = logErr instanceof Error ? logErr.message : String(logErr);
@@ -3581,7 +3582,7 @@ export function resolveFireOutcome(input: {
  * An errored turn writes the row even when the text is empty. A failure that
  * leaves no line is precisely the silence this record exists to end.
  */
-export async function autoAppendTaskLog(text: string, isError = false, model?: string): Promise<void> {
+export async function autoAppendTaskLog(text: string, isError = false, model?: string, taskMessageIds: string[] = []): Promise<void> {
   // Run-log hygiene: an inert <message to> block never belongs in the log as
   // raw XML — replace each with its inner text, marked undelivered, so the
   // log stays readable prose.
@@ -3597,9 +3598,11 @@ export async function autoAppendTaskLog(text: string, isError = false, model?: s
   await writeMessageOut({
     id: generateId(),
     kind: 'task_log',
+    in_reply_to: taskMessageIds.length === 1 ? taskMessageIds[0] : null,
     content: JSON.stringify({
       text: line || (isError ? '(the provider reported an error and returned no text)' : '(run produced no output)'),
       auto: true,
+      ...(taskMessageIds.length ? { taskMessageIds } : {}),
       ...(isError ? { isError: true } : {}),
       ...(model ? { model } : {}),
     }),

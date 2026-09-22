@@ -29,6 +29,7 @@ const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-delivery'
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
 import { getDeliveredIds } from './modules/mailbox/ops/delivery.js';
+import { completeAnsweredPendingRows } from './modules/mailbox/ops/sweep.js';
 import { resolveSession, resolveTaskSession, withMailboxSession, writeSessionMessage } from './session-manager.js';
 import { openInboundDb as openInboundDbAt } from './modules/mailbox/openers.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
@@ -1443,12 +1444,13 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     sessionId: string,
     msgId: string,
     content: Record<string, unknown>,
+    inReplyTo: string | null = null,
   ): void {
     const db = new Database(outboundDbPath(agentGroupId, sessionId));
     db.prepare(
       `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, in_reply_to, content)
-       VALUES (?, ?, 'task_log', NULL, NULL, NULL, NULL, ?)`,
-    ).run(msgId, now(), JSON.stringify(content));
+       VALUES (?, ?, 'task_log', NULL, NULL, NULL, ?, ?)`,
+    ).run(msgId, now(), inReplyTo, JSON.stringify(content));
     db.close();
   }
 
@@ -1499,6 +1501,44 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     await deliverSessionMessages(session);
 
     expect((await outcomeRows()).map((r) => r.outcome)).toEqual(['ok']);
+  });
+  it('keeps correlated internal phase outcomes private and leaves unrelated inbound work pending', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveTaskSession('ag-1', 'phase-1');
+    const inbound = new Database(inboundDbPath('ag-1', session.id));
+    inbound
+      .prepare(
+        `INSERT INTO messages_in(id,seq,kind,timestamp,status,trigger,content) VALUES
+         ('human-unrelated',2,'chat',?,'pending',1,'{}'),
+         ('event-one',4,'task',?,'pending',1,'{}')`,
+      )
+      .run(now(), now());
+    insertTaskLog(
+      'ag-1',
+      session.id,
+      'phase-log',
+      { text: 'phase artifacts accepted', auto: true, taskMessageIds: ['event-one'] },
+      'event-one',
+    );
+    const deliver = vi.fn().mockResolvedValue('unexpected-public-post');
+    setDeliveryAdapter({ deliver });
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    const outbound = new Database(outboundDbPath('ag-1', session.id));
+    try {
+      // Exercise the consumer that uses in_reply_to to complete answered work,
+      // including a positive control proving this is not a no-op sweep.
+      expect(completeAnsweredPendingRows(inbound, outbound)).toEqual(['event-one']);
+      expect(completeAnsweredPendingRows(inbound, outbound)).toEqual([]);
+    } finally {
+      outbound.close();
+    }
+    expect(deliver).not.toHaveBeenCalled();
+    expect(await outcomeRows()).toHaveLength(1);
+    expect(inbound.prepare("SELECT status FROM messages_in WHERE id='human-unrelated'").get()).toEqual({
+      status: 'pending',
+    });
+    inbound.close();
   });
 
   it('ignores a mid-run append-log note — only the end-of-run summary is a fire', async () => {

@@ -33,8 +33,11 @@
 #   7. runs one controller `step` in live mode, which journals every queued
 #      alarm; entries the journal holds are then removed from the queue.
 #
-# Output: the LAST stdout line is always {"wakeAgent":<bool>,"data":{...}}.
-# It wakes the owner for exactly two reasons:
+# Output on exit 0: the LAST stdout line is {"wakeAgent":<bool>,"data":{...}}.
+# With isolated owner routing enabled, failure-only events use durable keyed
+# admission too. An unproven admission exits nonzero for existing script
+# backoff; it never also wakes the shared parent.
+# Without isolated routing, it wakes the shared owner for exactly two reasons:
 #   - a due owner judgment step: data carries {step, runId, brief} (the brief
 #     is <run>/controller/brief-<step>.md) for the owner router prompt;
 #   - a fire that failed closed: data carries {failure, detail, fire}, and the
@@ -42,8 +45,8 @@
 #     (references/controller-owner-router.md). This is the wrapper's only
 #     reporting mechanism -- it posts nothing itself, because a fire that
 #     cannot complete cannot be trusted to run a send either.
-# Only the two named non-failure ends -- the completed step and the kill
-# switch being off -- are wakeAgent:false.
+# The completed step and the kill switch being off are wakeAgent:false.
+# Proven isolated admission or replay also returns wakeAgent:false.
 #
 # What that does NOT cover, and is accepted: a fire whose whole task script is
 # killed prints no line at all, so it reports nothing -- the host discards the
@@ -53,7 +56,7 @@
 # and notifies the owner (src/modules/scheduling/recurrence.ts:128-147): a
 # REPORTED failure is a wakeAgent:true occurrence, which the container resolves
 # completed, so it never counts toward that streak and never backs off. A
-# persistent reported fault therefore wakes the owner every fire, by design;
+# persistent reported fault on the legacy route wakes the owner every fire;
 # the owner's per-cause daily send id is what keeps it to one post a day
 # (container/agent-runner/src/cli/enqueue-send.ts:24-28, a replay).
 #
@@ -64,7 +67,9 @@
 #     default 100, so the hard kill lands by 112 s, under the runner's 120 s
 #     (agent-runner scheduling/task-script.ts). The worker cuts every child's
 #     timeout to its own deadline and passes the controller a deadline epoch.
-#   - exit status 0 whatever happens.
+#   - exit status 0 except when isolated owner routing is enabled and keyed
+#     admission is unproven: exit nonzero with no final stdout line, entering
+#     the existing script backoff / auto-pause reporting path described above.
 #   - the wrapper's own writes stay under the out-dir (contained, O_NOFOLLOW).
 #     Live effects leave it by design: the gate's state and lease files (poll,
 #     progress, finish), GitHub, chat rows in this session's outbound.db, task
@@ -142,6 +147,15 @@ fail_json() { # <slug> <detail> -- a failure line built with NO tool but bash
     "$(jesc "${ALARM_TEXT//\{slug\}/$1}")"
 }
 
+emit_line() { # failed admission exits nonzero into the existing script backoff
+  if [ -n "${SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON:-}" ]; then
+    printf '%s\n' "$1" | timeout -k 1 6 python3 "$SCRIPT_DIR/smoke-controller-failure-dispatch.py" \
+      --cutover "$SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
 final() { # <data-json> -- the only write to the runner's stdout
   local data="${1:-}"
   if ! jq -e 'type == "object"' <<<"$data" >/dev/null 2>&1; then
@@ -159,22 +173,24 @@ final() { # <data-json> -- the only write to the runner's stdout
     else
       detail="the fire printed no usable summary; see the task stderr"
     fi
-    fail_json "$slug" "$detail" >&3
-    exit 0
+    emit_line "$(fail_json "$slug" "$detail")" >&3
+    exit $?
   fi
   # Two reasons to wake: a well-formed owner step (with {step, runId, brief} on
   # top), or ANY fire that failed closed -- `failure` is the wrapper's whole
   # reporting mechanism, so it must never be rendered as a quiet false.
-  jq -cn --argjson d "$data" '
+  local line
+  line=$(jq -cn --argjson d "$data" '
     ($d.ownerWake // null) as $w
     | if ($w | type) == "object" and ($w.step | type) == "string" and ($w.runId | type) == "string"
          and ($w.brief | type) == "string" and $d.stepped == true
       then {wakeAgent:true, data:({step:$w.step, runId:$w.runId, brief:$w.brief} + ($d | del(.ownerWake)))}
       elif ($d.failure | type) == "string" and ($d.failure | length) > 0
       then {wakeAgent:true, data:($d | del(.ownerWake))}
-      else {wakeAgent:false, data:$d} end' >&3 2>/dev/null ||
-    fail_json final-line-unrenderable "the fire summary could not be rendered (jq unavailable or refused)" >&3
-  exit 0
+      else {wakeAgent:false, data:$d} end' 2>/dev/null) ||
+    line=$(fail_json final-line-unrenderable "the fire summary could not be rendered (jq unavailable or refused)")
+  emit_line "$line" >&3
+  exit $?
 }
 
 BUDGET_MAX=110

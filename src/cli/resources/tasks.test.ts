@@ -144,6 +144,118 @@ describe('tasks CLI resource', () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
+  it('concurrent keyed admissions adopt one session and preserve durable replay through quiet cache invalidation', async () => {
+    const args = {
+      group: 'ag-1',
+      context_key: 'qa/42/intake',
+      event_key: 'offer',
+      prompt: 'Current intake brief',
+      mute_chat: true,
+      quiet_status: true,
+    };
+    const invoke = (request = args) =>
+      dispatch({ id: 'keyed', command: 'tasks-dispatch', args: request }, { caller: 'host' });
+    const results = await Promise.all([invoke(), invoke()]);
+    expect(results.every((r) => r.ok)).toBe(true);
+    const rows = results.map((r) =>
+      r.ok ? (r.data as { session_id: string; row_id: string; admission: string }) : null,
+    );
+    expect(new Set(rows.map((r) => r?.session_id)).size).toBe(1);
+    expect(rows.map((r) => r?.admission).sort()).toEqual(['inserted', 'replay']);
+    const db = new Database(inboundDbPath('ag-1', rows[0]!.session_id));
+    expect(db.prepare("SELECT COUNT(*) AS n FROM messages_in WHERE kind='task'").get()).toEqual({ n: 1 });
+    db.close();
+    getRawDb()
+      .prepare("UPDATE sessions SET sweep_quiet_until='2099-01-01T00:00:00.000Z' WHERE id=?")
+      .run(rows[0]!.session_id);
+    const replay = await invoke();
+    expect(replay.ok).toBe(true);
+    if (replay.ok) expect(replay.data).toMatchObject({ row_id: rows[0]!.row_id, admission: 'replay' });
+    expect(getRawDb().prepare('SELECT sweep_quiet_until FROM sessions WHERE id=?').get(rows[0]!.session_id)).toEqual({
+      sweep_quiet_until: null,
+    });
+    const { applyScheduleWake } = await import('../../modules/scheduled-wake/index.js');
+    const { getSession } = await import('../../db/sessions.js');
+    const originalSession = await getSession(rows[0]!.session_id);
+    await applyScheduleWake(
+      {
+        action: 'schedule_wake',
+        prompt: 'Continue the same intake phase',
+        dedupe_key: 'owned-followup',
+        process_after: new Date(Date.now() + 60_000).toISOString(),
+      },
+      originalSession!,
+    );
+    const next = await invoke({ ...args, context_key: 'qa/42/lanes' });
+    expect(next.ok).toBe(true);
+    if (next.ok) {
+      const nextId = (next.data as { session_id: string }).session_id;
+      expect(nextId).not.toBe(rows[0]!.session_id);
+      for (const [id, expected] of [
+        [rows[0]!.session_id, 1],
+        [nextId, 0],
+      ] as const) {
+        const mailbox = new Database(inboundDbPath('ag-1', id));
+        expect(mailbox.prepare("SELECT COUNT(*) AS n FROM messages_in WHERE id LIKE 'schedule-wake-%'").get()).toEqual({
+          n: expected,
+        });
+        mailbox.close();
+      }
+    }
+    const status = await dispatch(
+      { id: 'settlement', command: 'tasks-get', args: { id: rows[0]!.row_id, group: 'ag-1', settlement: true } },
+      { caller: 'host' },
+    );
+    expect(status.ok).toBe(true);
+    if (status.ok) expect(status.data).toMatchObject({ settlement: { state: 'unknown' } });
+  });
+
+  it('rejects cross-group dispatch routing and changed keyed payloads', async () => {
+    const denied = await dispatch(
+      {
+        id: 'cross',
+        command: 'tasks-dispatch',
+        args: { group: 'ag-2', context_key: 'qa/42', event_key: 'offer', prompt: 'x', isolated: true },
+      },
+      agentCtx(),
+    );
+    expect(denied.ok).toBe(false);
+    const args = { group: 'ag-1', context_key: 'qa/42', event_key: 'offer', prompt: 'original' };
+    const first = await dispatch({ id: 'first', command: 'tasks-dispatch', args }, { caller: 'host' });
+    expect(first.ok).toBe(true);
+    const changed = await dispatch(
+      { id: 'changed', command: 'tasks-dispatch', args: { ...args, prompt: 'changed' } },
+      { caller: 'host' },
+    );
+    expect(changed.ok).toBe(false);
+  });
+  it('keyed dispatch writes nothing when quiet invalidation fails', async () => {
+    const sessions = await import('../../db/sessions.js');
+    const spy = vi.spyOn(sessions, 'withQuietInvalidationSync').mockImplementation((id: string) => {
+      throw new sessions.QuietInvalidationError(id, new Error('invalidation refused'));
+    });
+    const result = await dispatch(
+      {
+        id: 'quiet-failure',
+        command: 'tasks-dispatch',
+        args: {
+          group: 'ag-1',
+          context_key: 'quiet-failure',
+          event_key: 'one',
+          prompt: 'bounded brief',
+        },
+      },
+      { caller: 'host' },
+    );
+    spy.mockRestore();
+    expect(result.ok).toBe(false);
+    const rows = (await getSessionsByAgentGroup('ag-1')).filter((s) => s.thread_id?.startsWith('system:tasks'));
+    expect(rows).toHaveLength(1);
+    const db = new Database(inboundDbPath('ag-1', rows[0].id));
+    expect(db.prepare("SELECT COUNT(*) AS n FROM messages_in WHERE kind='task'").get()).toEqual({ n: 0 });
+    db.close();
+  });
+
   it('rejects a move from an agent caller before it can inspect task state', async () => {
     const result = await dispatch(
       {

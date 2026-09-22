@@ -313,6 +313,9 @@ describe('the run-outcome ledger records the model that actually ran', () => {
     expect(taskLogs.length).toBeGreaterThan(0);
     // Pre-fix: undefined — the key is absent from the row.
     expect(taskLogs[0]!.model).toBe(GROUP_DEFAULT);
+    const correlated = getUndeliveredMessages().find((m) => m.kind === 'task_log');
+    expect(correlated?.in_reply_to).toBe('t-ledger');
+    expect(JSON.parse(correlated!.content).taskMessageIds).toEqual(['t-ledger']);
   });
 
   it('a task pin is still what gets recorded when there is one', async () => {

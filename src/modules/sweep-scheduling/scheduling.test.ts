@@ -24,6 +24,8 @@ import type Database from 'better-sqlite3';
 import type { NanoclawMailboxSession } from '../mailbox/index.js';
 import type { Session } from '../../types.js';
 import type { SweepDuty, SweepSessionContext } from '../../host-sweep.js';
+import { dispatchSeriesId } from '../mailbox/ops/task-dispatch.js';
+import { findSystemSession, taskThreadId } from '../../db/sessions.js';
 
 // ─── Hermeticity tripwire (brief-common.md HARD RULE) ────────────────────────
 const spawns = vi.hoisted(() => [] as string[]);
@@ -830,6 +832,64 @@ describe('S2-PR11 scheduling + thread-close', () => {
     expect(getRawDb().prepare("SELECT status FROM sessions WHERE id = 'sess-wait-future'").get()).toEqual({
       status: 'active',
     });
+  });
+
+  it.each(['completed', 'failed', 'expired', 'cancelled'])(
+    'retains %s keyed receipts through S19 and replays without another task',
+    async (status) => {
+      const db = freshInbound();
+      const mailbox = sessionFor(db);
+      const input = {
+        contextKey: 'phase/run/step',
+        eventKey: 'start',
+        prompt: 'bounded phase',
+        originSessionId: null,
+        platformId: null,
+        channelType: null,
+        threadId: null,
+        muteChat: true,
+        quietStatus: true,
+      };
+      const admitted = mailbox.dispatchTaskEvent(input);
+      db.prepare('UPDATE messages_in SET status = ? WHERE id = ?').run(status, admitted.rowId);
+      const session = fakeSession({ id: 'sess-keyed', thread_id: taskThreadId(admitted.seriesId) });
+
+      await duty(SWEEP_DUTY_INVENTORY.S19).run(makeCtx({ session, mailbox }));
+
+      expect(mailbox.countLiveTasks()).toBe(0);
+      expect(calls.updates).toEqual([]);
+      expect((await findSystemSession('ag-test', session.thread_id!))?.id).toBe(session.id);
+      expect(mailbox.dispatchTaskEvent(input)).toMatchObject({ rowId: admitted.rowId, admission: 'replay', status });
+      expect(db.prepare('SELECT count(*) AS n FROM messages_in').get()).toEqual({ n: 1 });
+    },
+  );
+
+  it('rechecks keyed receipts after the S19 intent await even if the admitted task is already terminal', async () => {
+    const db = freshInbound();
+    const mailbox = sessionFor(db);
+    const contextKey = 'phase/raced';
+    const session = fakeSession({ id: 'sess-keyed-raced', thread_id: taskThreadId(dispatchSeriesId(contextKey)) });
+    calls.intentHook = () => {
+      const admitted = mailbox.dispatchTaskEvent({
+        contextKey,
+        eventKey: 'start',
+        prompt: 'bounded phase',
+        originSessionId: null,
+        platformId: null,
+        channelType: null,
+        threadId: null,
+        muteChat: true,
+        quietStatus: true,
+      });
+      db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = ?").run(admitted.rowId);
+    };
+
+    await duty(SWEEP_DUTY_INVENTORY.S19).run(makeCtx({ session, mailbox }));
+
+    expect(mailbox.countLiveTasks()).toBe(0);
+    expect(mailbox.hasTaskDispatchEvents()).toBe(true);
+    expect(calls.updates).toEqual([]);
+    expect((await findSystemSession('ag-test', session.thread_id!))?.id).toBe(session.id);
   });
 
   it('admits a due deferred wait, keeps its task session active, and wakes that same session', async () => {
