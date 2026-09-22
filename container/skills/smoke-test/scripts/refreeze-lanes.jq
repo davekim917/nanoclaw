@@ -55,9 +55,14 @@ def rl_lane_snapshot:
 
 # Input: identity.json. True once `refreeze` has run: it appends to history[]
 # and bumps freezeGeneration, so either one set means a re-freeze happened.
+# Also true for a LATE freeze: `start` that found lane evidence already on
+# disk records `lateFreeze` and snapshots the lanes exactly as `refreeze`
+# does, because evidence gathered before any freeze is bound to no pair at all
+# (smoke-pair-identity.sh, LATE FREEZE; XZO #2092).
 def rl_refrozen:
   ((.history // []) | if type == "array" then length > 0 else true end)
-  or ((.freezeGeneration // 1) != 1);
+  or ((.freezeGeneration // 1) != 1)
+  or has("lateFreeze");
 
 # Input: identity.json. $contract: the parsed contract, null when the run has
 # none, or any non-object when it could not be parsed.

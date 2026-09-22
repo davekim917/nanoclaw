@@ -365,6 +365,51 @@ expect_rc "$(run finish "$RUN15")" 2 bypass-restored-refuses-for-the-real-reason
 out | grep -Fq 'not redispatched since the pair re-freeze: A, B;' || \
   fail "bypass-restored-refuses-for-the-real-reason: expected the ordinary un-redispatched refusal after restoring the real snapshot"
 
+# --- 5i. A LATE freeze does not launder evidence gathered before it (XZO #2092)
+# The laundering sequence: lanes run and write markers with no pair frozen;
+# `start` then freezes whatever is live NOW and one ok `check` follows. Before,
+# that cleared finish and the barrier, so markers bound to no build supported a
+# verdict. A start that finds lane evidence on disk records itself as late and
+# snapshots the lanes like a re-freeze; nothing counts until each lane is
+# redispatched and re-run. A start with no marker yet is an ordinary freeze.
+[ "$(jq -r 'has("lateFreeze")' "$RUN5/coordinator/identity.json")" = false ] ||
+  fail "late-freeze: a start with no lane evidence on disk (run5) was recorded as late"
+RUNL="$T/run-late"; mkdir -p "$RUNL"
+gate_develop "$RUNL"
+scaffold contract "$RUNL" "$SRC_SHA" A B
+scaffold marker "$RUNL" A completed "A ran before any freeze"
+scaffold marker "$RUNL" B completed "B ran before any freeze"
+mk dep-fe000000001 live "$A" > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"
+mk dep-be000000001 live "$B" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+expect_rc "$(run start "$RUNL")" 0 late-start
+err | grep -q 'LATE FREEZE' || fail "late-start: start did not say the freeze was late"
+jq -e --arg sha "$SRC_SHA" '.lateFreeze.markersOnDisk == ["markers/A.json","markers/B.json"]
+    and .refreezeLaneSnapshot == {contractPresent: true, sourceSha: $sha, lanes: [{id: "A", generation: 1}, {id: "B", generation: 1}]}
+    and .freezeGeneration == 1 and .history == []' "$RUNL/coordinator/identity.json" >/dev/null ||
+  fail "late-start: identity.json does not record the late freeze and its lane snapshot"
+expect_rc "$(run check "$RUNL" coordinator-after-late-start)" 0 late-check-ok
+# The laundering step: an ok check on the late freeze must NOT clear the lanes.
+expect_rc "$(run finish "$RUNL")" 2 late-finish-refuses
+out | grep -Fq 'not redispatched since the pair was frozen late: A, B;' ||
+  fail "late-finish-refuses: finish did not name both lanes as run before the freeze"
+conclusions "$RUNL"
+BOUT="$(bash "$BARRIER" "$RUNL" synthesis || true)"
+jq -e '.ready == false and (.invalid | sort) == ["markers/A.json","markers/B.json"]
+       and all(.invalidReasons[]; contains("frozen LATE") and contains("redispatch"))' <<<"$BOUT" >/dev/null ||
+  { echo "$BOUT" > "$T/out"; fail "late-barrier-refuses"; }
+# Recovery is possible: redispatch, re-run with checks, and the same run passes.
+scaffold redispatch "$RUNL" A
+scaffold redispatch "$RUNL" B
+for l in A B; do
+  expect_rc "$(run check "$RUNL" "lane-$l-start")" 0 "late-recovery-check-$l"
+  scaffold marker "$RUNL" "$l" completed "$l re-run on the frozen pair"
+done
+expect_rc "$(run finish "$RUNL")" 0 late-finish-after-redispatch
+bash "$BARRIER" "$RUNL" synthesis | jq -e '.ready == true' >/dev/null || fail "late-barrier-ready-after-redispatch"
+# The one bounded refreeze is still available after a late freeze.
+mk dep-be000000009 live "$C" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+expect_rc "$(run refreeze "$RUNL" "backend replaced after the late freeze")" 0 late-then-refreeze-allowed
+
 # --- 6. Success without evidence: an actual truncated write is refused -----
 # Needs mount privilege (a full 64k tmpfs forces a real short write); skip
 # quietly otherwise — the read-back-before-install code path this exercises

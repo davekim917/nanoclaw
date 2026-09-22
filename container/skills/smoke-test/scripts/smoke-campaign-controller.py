@@ -785,17 +785,19 @@ OWNER_BRIEF = {
         "completion-contract.json LAST, with the scaffold `contract` command: it is the signal that intake is "
         "done, and the controller posts the root as soon as it exists."),
     "lanes": (
-        "Lanes: the same retained qa-smoke-worker executes this side's declared lanes and writes markers only "
-        "after evidence is durable; it does not spawn lane workers. The outer coordinator awaits that owner. "
-        "If the work cannot finish in one turn, checkpoint and call continue_work before yielding; this does "
-        "not prove same-child continuity after replacement. Recheck sourceSha against the PR head before "
-        "each lane; if it moved, stop and write the lane markers as void (BLOCKED_BUILD_IDENTITY). "
-        "PAIR IDENTITY (the pair-identity note above gives this run's exact commands): freeze the deployed PR "
-        "preview pair with `smoke-pair-identity.sh start` BEFORE the first lane, and `check` it at every lane's "
+        "Lanes. STEP 1, BEFORE ANY LANE IS DISPATCHED: freeze the deployed PR preview pair with "
+        "`smoke-pair-identity.sh start` (the pair-identity note above gives this run's exact command). This is "
+        "not one item among several: a freeze made after any lane marker exists is recorded as LATE, and every "
+        "lane already run must then be redispatched and run again before it counts. STEP 2, the lanes: the "
+        "same retained qa-smoke-worker executes this side's declared lanes and writes markers only after "
+        "evidence is durable; it does not spawn lane workers. Every lane records a pair-identity `check` at its "
         "start and end: the controller cannot publish GO without a clean record in "
-        "{run}/coordinator/identity-checks.ndjson. A check "
-        "that reports drift or source-mismatch is genuine: re-freeze once with `refreeze` and redispatch, or "
-        "conclude BLOCKED -- never run `start` again."),
+        "{run}/coordinator/identity-checks.ndjson. A check that reports drift or source-mismatch is genuine: "
+        "re-freeze once with `refreeze` and redispatch, or conclude BLOCKED -- never run `start` again. The "
+        "outer coordinator awaits that owner. If the work cannot finish in one turn, checkpoint and call "
+        "continue_work before yielding; this does not prove same-child continuity after replacement. Recheck "
+        "sourceSha against the PR head before each lane; if it moved, stop and write the lane markers as void "
+        "(BLOCKED_BUILD_IDENTITY)."),
     "preliminary": (
         "Preliminary: write {run}/coordinator/preliminary.md from the lane evidence, before reading anything under "
         "{run}/challenger/."),
@@ -1277,14 +1279,14 @@ class EffectLayer:
         # AN ACK NEVER OUTLIVES THE BRIEF IT ACKNOWLEDGED. The ack is the
         # owner's first act on a wake and the controller only tests it for
         # existence, re-offering a wake solely while it is ABSENT (owner_step,
-        # :2329-2339); the renewer reads it the same way
+        # :2334-2344); the renewer reads it the same way
         # (smoke-controller-renew.sh, "brief-<step>.ack absent: no owner turn
         # holds this step"). So a brief rewritten under a NEW owner token would
         # otherwise inherit the previous brief's ack and be treated as taken,
         # and never re-offered -- the second half of XZO #2046. Removing it here
         # makes that impossible by construction rather than by sequencing: this
         # function runs only when the obligation is absent or `intent`
-        # (owner_step, :2306), never while a live brief is enqueued, so any ack
+        # (owner_step, :2311), never while a live brief is enqueued, so any ack
         # it finds belongs to a brief this write supersedes.
         try:
             dfd = _open_dir_contained(root, [run_id, "controller"], True)
@@ -1433,8 +1435,10 @@ class EffectLayer:
         prints frontendPreviewId/backendPreviewId, smoke-pr-gate.sh:3066-3072,
         from evaluate_pr :2816-2820), and once frozen they are in
         identity.json. They go on the command line because the gate env the
-        owner sources names the DEVELOP pair (controller-phase-owner.md tells
-        it to source that env first) and `check` identifies the pair from its
+        owner sources names the DEVELOP pair -- the base services the gate
+        finds each preview under (smoke-pr-gate.sh:1672, :1708, :1589;
+        smoke-pair-identity.sh:16-19), and controller-phase-owner.md tells the
+        owner to source that env first -- and `check` identifies the pair from its
         env (smoke-pair-identity.sh:61-62): run with that env, it compares the
         frozen preview against the wrong services and records a drift that is
         a real BLOCKED (:153-159)."""
@@ -1455,7 +1459,8 @@ class EffectLayer:
                 fe=fe, be=be, tool=PAIR_IDENTITY, run=shlex.quote(run), tail=tail)
         pr = contract.get("pr") or claim.get("pr") or "<pr>"
         gate = self.cfg.get("gate_cmd") or "smoke-pr-gate.sh"
-        return ("**PAIR IDENTITY: NOT FROZEN.** Before the first lane runs, take `frontendPreviewId` and "
+        return ("**PAIR IDENTITY: NOT FROZEN -- do this before dispatching any lane.** A freeze made after a lane "
+                "marker exists is recorded as late, and every lane already run is then redone. Take `frontendPreviewId` and "
                 "`backendPreviewId` from `bash {gate} check {pr}` (the PR preview pair -- never the develop ids the "
                 "gate env names) and run `SMOKE_GATE_FRONTEND_SERVICE=<frontendPreviewId> "
                 "SMOKE_GATE_BACKEND_SERVICE=<backendPreviewId> bash {tool} start {run}`. If it refuses because the "
@@ -2470,7 +2475,7 @@ class Controller:
         then the owner writes evidence the barrier rejects. The next fire
         publishes the new refusal and returns `ownerWake: null`, because
         owner_step re-offers a wake only while the `.ack` is ABSENT
-        (:2329-2339). The diagnosis is on disk and nobody is told to read it --
+        (:2334-2344). The diagnosis is on disk and nobody is told to read it --
         the same dead end, reached the way run pr2055 actually reached it.
 
         THE TRIGGER IS A CHANGE IN THE REFUSAL, NOT "INVALID". Narrower than
@@ -2485,7 +2490,7 @@ class Controller:
         fire exactly like `briefedToken`: a crash between the publish and the
         re-offer leaves the next fire owing the same re-offer. Re-offering does
         not extend the step's SLA -- owner_step measures from `history[0]`
-        (:2340) -- so a run that keeps producing invalid evidence still ends at
+        (:2345) -- so a run that keeps producing invalid evidence still ends at
         the overdue path rather than being woken forever."""
         ob = self.obligations().get(obligation_key(run_id, "owner", step))
         if not ob or ob["state"] not in ("intent", "enqueued"):
@@ -2925,8 +2930,8 @@ class Controller:
                 # THE OWNER IS WOKEN HERE, not only once the barrier passes.
                 # By this point every OTHER party's contribution the synthesis
                 # barrier checks has already been gated above: the lanes
-                # barrier is ready (:2881), coordinator/preliminary.md exists
-                # (:2903) and challenger/disposition.md exists (:2912). What
+                # barrier is ready (:2886), coordinator/preliminary.md exists
+                # (:2908) and challenger/disposition.md exists (:2917). What
                 # the synthesis barrier can still report is therefore the
                 # retained owner's -- `invalid[]` content it authored
                 # (journeys/scope-dispositions.json, or
@@ -2938,7 +2943,7 @@ class Controller:
                 # alone (smoke-controller-live.sh:168-175), so nobody was told;
                 # and _maybe_synthesis_overdue_blocked needs the very
                 # owner:synthesis obligation this branch declined to create
-                # (:2997-2999), so the terminal BLOCKED safety net could not
+                # (:3002-3004), so the terminal BLOCKED safety net could not
                 # fire either. This is the same blind spot as the lanes barrier
                 # (XZO #2047), on the sibling path.
                 timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)

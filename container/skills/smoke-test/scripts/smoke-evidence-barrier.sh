@@ -411,6 +411,14 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IDENTITY_REL="coordinator/identity.json"
 REFREEZE_STALE=()
+# A LATE freeze (`start` after lane evidence existed, smoke-pair-identity.sh
+# LATE FREEZE) is read by the same rule; only the words differ, because there
+# was no earlier pair -- the retired evidence was bound to none.
+REFREEZE_WHY="since the pair re-freeze (contract generation %s is not above the refreeze snapshot) — its evidence predates the current pair"
+if [ -e "$RUN_DIR/$IDENTITY_REL" ] &&
+   [ "$(jq -r '((.history // []) | length) == 0 and has("lateFreeze")' "$RUN_DIR/$IDENTITY_REL" 2>/dev/null)" = true ]; then
+  REFREEZE_WHY="since the pair was frozen LATE (contract generation %s is not above the snapshot taken at the freeze) — this lane ran before any pair was frozen, so its evidence is bound to no build and cannot count"
+fi
 if [ -e "$RUN_DIR/$IDENTITY_REL" ]; then
   refreeze_result="$(jq -cs -L "$SCRIPT_DIR" --slurpfile c "$CONTRACT" '
     include "refreeze-lanes";
@@ -463,7 +471,9 @@ while IFS= read -r marker; do
   if lane_stale_after_refreeze "$lane_id"; then
     INVALID+=("$marker")
     printf -v redispatch_command '%q redispatch %q %q' "$SCRIPT_DIR/smoke-run-scaffold.sh" "$RUN_DIR" "$lane_id"
-    INVALID_REASONS+=("$marker: not redispatched since the pair re-freeze (contract generation $(expected_generation "$lane_id") is not above the refreeze snapshot) — its evidence predates the current pair; run $redispatch_command, then re-run the lane")
+    # shellcheck disable=SC2059 # REFREEZE_WHY is one of two fixed templates above
+    printf -v refreeze_why "$REFREEZE_WHY" "$(expected_generation "$lane_id")"
+    INVALID_REASONS+=("$marker: not redispatched $refreeze_why; run $redispatch_command, then re-run the lane")
     continue
   fi
 
@@ -534,10 +544,12 @@ done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 # value refuses rather than silently switching the check off.
 #
 # THE RULE, at identity.json's CURRENT freezeGeneration (a refreeze retires
-# older receipts, as `smoke-pair-identity.sh finish` does, :335-339):
+# older receipts, as `smoke-pair-identity.sh finish` does, :379-383):
 #   - no identity.json: MISSING while no lane marker exists yet (the owner is
 #     about to freeze, the normal first step), INVALID once any does — evidence
-#     is being gathered against a pair nobody froze.
+#     is being gathered against a pair nobody froze. Freezing then does not
+#     rescue it: `start` records a LATE freeze and the PAIR RE-FREEZE rule above
+#     refuses every lane until it is redispatched and re-run.
 #   - no check at this generation: MISSING while any lane marker is still
 #     outstanding (lanes check at their end), INVALID once none is — the lanes
 #     finished and none of them recorded the pair.
@@ -548,7 +560,7 @@ done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 #   - the latest check at this generation not `ok` (an `unreadable` read):
 #     INVALID until a fresh check reads the pair.
 #   - a record line that is not JSON: INVALID, whatever its generation, as
-#     `finish` refuses it (:332-334) — a check only appends, so it cannot heal.
+#     `finish` refuses it (:376-378) — a check only appends, so it cannot heal.
 # The MISSING -> INVALID transitions are deliberate: the controller re-offers
 # an acknowledged step when `invalid[]` changes and never on `missing[]`
 # (refusal_digest), so an owner is woken at the moment the lanes stop and not
@@ -565,10 +577,13 @@ elif [ "$PAIR_IDENTITY_MODE" = required ] && [ -z "${refreeze_error:-}" ]; then
   printf -v PAIR_RUN_Q '%q' "$RUN_DIR"
   if [ ! -s "$RUN_DIR/$IDENTITY_REL" ]; then
     CONTRACT_PR="$(jq -r '.pr // "<pr>"' "$CONTRACT" 2>/dev/null || printf '<pr>')"
-    START_HOW="freeze it before any lane runs: SMOKE_GATE_FRONTEND_SERVICE=<frontendPreviewId> SMOKE_GATE_BACKEND_SERVICE=<backendPreviewId> bash $PAIR_TOOL start $PAIR_RUN_Q, with the two PR preview service ids \`smoke-pr-gate.sh check $CONTRACT_PR\` prints (never the develop pair the gate env names: start refuses a pair that does not serve this contract's sourceSha)"
+    START_CMD="SMOKE_GATE_FRONTEND_SERVICE=<frontendPreviewId> SMOKE_GATE_BACKEND_SERVICE=<backendPreviewId> bash $PAIR_TOOL start $PAIR_RUN_Q, with the two PR preview service ids \`smoke-pr-gate.sh check $CONTRACT_PR\` prints (never the develop pair the gate env names: start refuses a pair that does not serve this contract's sourceSha)"
     if [ "$LANE_MARKERS_PRESENT" -gt 0 ]; then
+      # A late freeze cannot bind evidence already gathered, so the path to GO
+      # is freeze, then redo every lane (smoke-pair-identity.sh LATE FREEZE).
+      printf -v REDISPATCH_ANY '%q redispatch %q <lane-id>' "$SCRIPT_DIR/smoke-run-scaffold.sh" "$RUN_DIR"
       INVALID+=("$IDENTITY_REL")
-      INVALID_REASONS+=("$IDENTITY_REL: lane markers exist but the deployed pair was never frozen — $START_HOW; then record a check (smoke-pair-identity.sh check) before this phase can pass")
+      INVALID_REASONS+=("$IDENTITY_REL: lane markers exist but the deployed pair was never frozen, so that evidence is bound to no build and cannot count. To reach a verdict: (1) freeze now: $START_CMD — it records the freeze as LATE; (2) redispatch EVERY lane: $REDISPATCH_ANY for each; (3) re-run each lane, recording a pair-identity check at its start and end; this barrier then names any lane not yet redone")
     else
       MISSING+=("$IDENTITY_REL")
     fi
@@ -621,7 +636,7 @@ elif [ "$PAIR_IDENTITY_MODE" = required ] && [ -z "${refreeze_error:-}" ]; then
         ;;
       damaged)
         # A further check appends after the damage and does not repair it;
-        # `finish` refuses the same file (smoke-pair-identity.sh:332-334).
+        # `finish` refuses the same file (smoke-pair-identity.sh:376-378).
         INVALID+=("$IDENTITY_CHECKS_REL")
         INVALID_REASONS+=("$IDENTITY_CHECKS_REL: $checks_reason — the check record is damaged and another check cannot repair it (it only appends); do not edit it by hand: conclude BLOCKED, or escalate if the pair evidence matters to this verdict")
         ;;
