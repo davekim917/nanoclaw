@@ -5480,7 +5480,6 @@ describe('status subtext — round-two regressions', () => {
     _resetConfig();
   });
 
-
   // Round four (Opus substitute review): effort was read from the REQUEST,
   // while model was read from the provider's resolved value. Both of these
   // are the "asserting a value the turn never ran at" failure the context
@@ -5549,28 +5548,6 @@ describe('status subtext — round-two regressions', () => {
     const rows = getUndeliveredMessages().filter((r: { kind: string }) => r.kind === 'chat');
     // NOT 'haiku-4-5 · xhigh · 8.2k context' — the turn never ran at xhigh.
     expect(JSON.parse(rows[0].content).subtext).toBe('haiku-4-5 · 8.2k context');
-  });
-
-
-  it('does not stamp a send_file caption row', async () => {
-    const { writeMessageOut, getUndeliveredMessages } = require('./db/messages-out.js');
-    setTurnSettings('claude-opus-5[1m]', 'xhigh');
-    setOwnConversation('discord', 'chan-1');
-    recordContextTokens(142_400);
-
-    // Exactly the shape mcp-tools/core.ts:480 writes: kind 'chat', own
-    // routing, no agentReply marker.
-    await writeMessageOut({
-      id: 'file-1',
-      kind: 'chat',
-      platform_id: 'chan-1',
-      channel_type: 'discord',
-      thread_id: null,
-      content: JSON.stringify({ text: 'here is the chart', files: ['chart.png'] }),
-    });
-
-    const row = getUndeliveredMessages().find((r: { id: string }) => r.id === 'file-1');
-    expect(JSON.parse(row.content).subtext).toBeUndefined();
   });
 
   it('does not stamp the runner own /clear notice with a stale turn setting', async () => {

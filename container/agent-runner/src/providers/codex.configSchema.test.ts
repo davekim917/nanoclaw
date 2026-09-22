@@ -153,14 +153,14 @@ describe('CodexProvider sticky config + override propagation', () => {
 
   it('test_unpinned_codex_group_resolves_to_sol_at_high', () => {
     // The fleet default as one fact: an unpinned native Codex group — no
-    // providerConfig, no CODEX_MODEL — runs gpt-5.6-sol at high reasoning
+    // providerConfig, no CODEX_MODEL — runs gpt-6-sol at high reasoning
     // (operator decision 2026-09-16, was gpt-5.6-terra at xhigh). Asserted as
     // literals AND against the constants, so neither can move alone.
     const p = new CodexProvider();
     const cfg = (p as unknown as { stickyConfig: { reasoning_effort?: string } }).stickyConfig;
-    expect((p as unknown as { model: string }).model).toBe('gpt-5.6-sol');
+    expect((p as unknown as { model: string }).model).toBe('gpt-6-sol');
     expect(cfg.reasoning_effort).toBe('high');
-    expect(DEFAULT_CODEX_MODEL).toBe('gpt-5.6-sol');
+    expect(DEFAULT_CODEX_MODEL).toBe('gpt-6-sol');
     expect((p as unknown as { model: string }).model).toBe(DEFAULT_CODEX_MODEL);
   });
 

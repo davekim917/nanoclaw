@@ -513,9 +513,10 @@ export interface CodexSubagentThread {
  *
  * Codex models a subagent as its own THREAD — `SubAgentActivityItem` carries
  * only `{id, kind, agent_thread_id, agent_path}`, and the model/effort live on
- * the thread record it points at. `thread/list` with `ancestorThreadId` is the
- * same non-mutating call the liveness probe already makes; this one keeps the
- * fields that probe discards.
+ * the thread record it points at. `thread/list` with `ancestorThreadId` is a
+ * SECOND call with the same parameters the liveness probe sends
+ * (probeCodexThreadHealth) — not a reuse of its response. It keeps the fields
+ * that probe discards.
  *
  * HONEST LABEL: `model` and `reasoning_effort` are the thread's CONFIGURED
  * values. Codex's own protocol comment calls them "current configured … when

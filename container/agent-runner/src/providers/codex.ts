@@ -407,17 +407,17 @@ export function materializeRawImageGeneration(
 // the query/session. Per-turn overrides for these fields are not currently
 // exposed by Codex's `thread/start` shape.
 /**
- * The unpinned Codex fleet default: gpt-5.6-sol at `high` reasoning (operator
- * decision 2026-09-16, replacing gpt-5.6-terra at `xhigh`). It matches the
- * Claude side's Opus-at-high baseline, so a group's provider decides what runs
- * it, not what tier it runs at.
+ * The unpinned Codex fleet default: gpt-6-sol at `high` reasoning (operator
+ * decision 2026-09-22, replacing gpt-5.6-sol; gpt-5.6-terra at `xhigh` before
+ * 2026-09-16). Keep it equal to the `sol` alias (`CODEX_MODEL_ALIAS_MAP`,
+ * src/flag-parser.ts:225).
  *
  * These are the ONLY fleet defaults for Codex. A group pins with
  * `providerConfig.model`/`reasoning_effort` in container.json, or
  * `ncl groups config update --model/--effort`, and a pin always wins — nothing
  * here rewrites one.
  */
-export const DEFAULT_CODEX_MODEL = 'gpt-5.6-sol';
+export const DEFAULT_CODEX_MODEL = 'gpt-6-sol';
 export const DEFAULT_CODEX_EFFORT = 'high' as const;
 
 export const codexConfigSchema = z.strictObject({
@@ -1925,24 +1925,73 @@ export async function* runOneTurn(
 
   // Child-thread ids this turn's subagents ran in, for the status subtext.
   // `SubAgentActivityItem` carries the id and the agent path but NOT the
-  // model or effort — those live on the thread it points at, which is read
-  // once at the end of the turn rather than per item.
+  // model or effort — those live on the thread it points at.
+  //
+  // READ AS SOON AS A CHILD APPEARS, not only at turn end (#1028). With
+  // outcome reporting on (the default) the agent replies through
+  // send_message mid-turn, and that row is stamped from the persisted
+  // snapshot at the moment it is written. A roster enriched only after the
+  // turn completes arrives after the reply already went out, so a default
+  // Codex install showed `2x /root/researcher` with no model or effort. A
+  // child's model and effort are fixed when it is spawned, and a worker runs
+  // long before the parent can report its results, so a read started on the
+  // first activity item finishes well before the reply.
+  //
+  // Reads coalesce: one in flight at a time, and a spawn that lands during a
+  // read requests exactly one follow-up. Non-throwing (readCodexSubagentThreads
+  // returns [] on any failure), and never awaited on the stream path.
   const subagentThreadIds = new Set<string>();
+  let rosterRead: Promise<void> | null = null;
+  let rosterReadAgain = false;
+  // Set in this turn's `finally`. A read still in flight when the turn ends on
+  // an error path (the success path awaits it) must not write into the roster
+  // poll-loop has since cleared: that would stamp THIS turn's workers onto the
+  // NEXT turn's reply. Not awaited in `finally` instead, because against a dead
+  // server that would add a full request timeout to teardown.
+  let rosterTurnOver = false;
+  const enrichRoster = (): void => {
+    if (rosterRead) {
+      rosterReadAgain = true;
+      return;
+    }
+    rosterRead = (async () => {
+      do {
+        rosterReadAgain = false;
+        const threads = await readCodexSubagentThreads(server, threadId, CODEX_HEALTH_PROBE_TIMEOUT_MS);
+        if (rosterTurnOver) return;
+        for (const thread of threads) {
+          if (subagentThreadIds.has(thread.id)) {
+            recordSubagent(thread.id, { model: thread.model, effort: thread.effort });
+          }
+        }
+      } while (rosterReadAgain && !rosterTurnOver);
+    })().finally(() => {
+      rosterRead = null;
+    });
+  };
   const emitCollaborationProgress = (item: unknown): void => {
     const message = formatCodexCollaborationProgress(item, emittedCollaborationItemIds);
     if (message) buffer.push({ type: 'progress', message });
     if (item && typeof item === 'object') {
-      const activity = item as { type?: unknown; agentThreadId?: unknown; agent_thread_id?: unknown; agentPath?: unknown };
+      const activity = item as {
+        type?: unknown;
+        agentThreadId?: unknown;
+        agent_thread_id?: unknown;
+        agentPath?: unknown;
+      };
       if (activity.type === 'subAgentActivity') {
         // camelCase on the generated TS schema, snake_case on the Rust wire
         // type — which arrives depends on the app-server build, so read both.
         const id = activity.agentThreadId ?? activity.agent_thread_id;
         if (typeof id === 'string' && id) {
+          const firstSighting = !subagentThreadIds.has(id);
           subagentThreadIds.add(id);
           // Identity now, model/effort after the thread read below. Recording
           // the path immediately means a turn whose thread list fails still
           // reports that it delegated, and to what.
           recordSubagent(id, { type: typeof activity.agentPath === 'string' ? activity.agentPath : null });
+          // One read per child, not per activity item: a worker emits many.
+          if (firstSighting) enrichRoster();
         }
       }
     }
@@ -2517,11 +2566,13 @@ export async function* runOneTurn(
       return;
     }
 
-    // Enrich the subagent roster with each child thread's configured model and
-    // effort. ONE `thread/list` for the whole turn, and only when the turn
-    // actually delegated — a turn that spawned nobody makes no extra call.
-    // Non-throwing by construction (see readCodexSubagentThreads): a roster is
+    // Backstop for the early reads above: let any in-flight read land, then
+    // read once more so a child whose thread was not yet listable when it was
+    // spawned is still enriched for the envelope path, which dispatches after
+    // `result`. Only when the turn actually delegated — a turn that spawned
+    // nobody makes no call. Non-throwing by construction: a roster is
     // decoration and must not fail a turn that otherwise succeeded.
+    if (rosterRead) await rosterRead;
     if (subagentThreadIds.size > 0 && threadId) {
       for (const thread of await readCodexSubagentThreads(server, threadId, CODEX_HEALTH_PROBE_TIMEOUT_MS)) {
         if (subagentThreadIds.has(thread.id)) {
@@ -2548,6 +2599,7 @@ export async function* runOneTurn(
       steps: turnAccum.steps > 0 ? turnAccum.steps : null,
     };
   } finally {
+    rosterTurnOver = true;
     try {
       clearContainerToolInFlight();
     } catch (err) {

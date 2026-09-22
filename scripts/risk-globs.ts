@@ -59,11 +59,14 @@ const KNOWN_NON_CODE_GLOBS: ReadonlySet<string> = new Set([
   '.husky/**',
   '.public-boundary-allowlist.json',
   'container/skills/pr-review-loop/**',
+  // The QA release gate (#1032). Bash and Python only -- no .ts/.js in the tree --
+  // run by its own *.test.sh suites, which neither lane's coverage tool instruments.
+  'container/skills/smoke-test/**',
   'docs/review-policy.md',
-  // Trunk's worker agent definitions. The directory is EMPTY today: the
-  // reviewer allowlist no longer derives Claude ids from it
-  // (scripts/reviewer-models.ts states its roster), and delegation ships in the
-  // bootstrap orchestrate plugin instead. The glob stays because re-adding a
+  // Trunk's worker agent definitions. The directory is EMPTY today: reviewer
+  // eligibility is a small-tier denylist in codex-review.sh, not a list of ids
+  // derived from here, and delegation ships in the bootstrap orchestrate plugin
+  // instead. The glob stays because re-adding a
   // def here would put a subagent definition into every Claude group, which is
   // a risk:high change on its own — .md frontmatter/prose, not source either
   // lane's test suite instruments.
