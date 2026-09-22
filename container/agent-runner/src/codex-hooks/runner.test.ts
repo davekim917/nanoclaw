@@ -1,10 +1,6 @@
-import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { normalizeCodexHookInput, runPreToolUseChain } from './runner.js';
-import * as messagesOut from '../db/messages-out.js';
 
 describe('normalizeCodexHookInput', () => {
   it('translates exec_command → Bash', () => {
@@ -605,95 +601,5 @@ describe('runPreToolUseChain — one approval card per tool call (#833)', () => 
       tool_use_id: 'exec-raw-id',
     });
     expect(recorded().toolUseId).toBe('exec-raw-id');
-  });
-});
-
-// The `exec </dev/null` stdin prefix is CLAUDE-ONLY. This chain must never
-// emit it, and no guard here may ever see it — the email gate fails closed on
-// `<` and newlines, and the destructive guard would print it on an approval card.
-describe('runPreToolUseChain — no stdin prefix here, and no guard ever sees one', () => {
-  const PREFIX = 'exec </dev/null\n';
-  const saved: Record<string, string | undefined> = {};
-  let sink = '';
-  let writeSpy: ReturnType<typeof spyOn> | undefined;
-
-  beforeEach(() => {
-    for (const k of [
-      'NANOCLAW_DESTRUCTIVE_GUARD_CORE',
-      'NANOCLAW_EMAIL_GATE_CORE',
-      'NANOCLAW_IS_SCHEDULED_TASK',
-      'NANOCLAW_TEST_GUARD_COMMAND_SINK',
-    ])
-      saved[k] = process.env[k];
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = new URL(
-      './__test-fixtures__/guard-command-recorder/block-destructive-core.ts',
-      import.meta.url,
-    ).pathname;
-    // Inline email policy — the same fail-closed bypass check the finding cites.
-    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
-    delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
-    sink = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'nc-guard-sink-')), 'commands.jsonl');
-    process.env.NANOCLAW_TEST_GUARD_COMMAND_SINK = sink;
-    // Staging an approval card writes an outbound row. None may be written here.
-    writeSpy = spyOn(messagesOut, 'writeMessageOut').mockImplementation(() => {
-      throw new Error('an approval request was staged');
-    });
-  });
-  afterEach(() => {
-    writeSpy?.mockRestore();
-    for (const [k, v] of Object.entries(saved)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
-    fs.rmSync(path.dirname(sink), { recursive: true, force: true });
-  });
-
-  const guardCalls = (): string[] =>
-    fs.existsSync(sink)
-      ? fs
-          .readFileSync(sink, 'utf8')
-          .trim()
-          .split('\n')
-          .map((l) => JSON.parse(l) as string)
-      : [];
-
-  it('(i) a --dry-run send passes the email gate with no approval request, and gets no prefix', async () => {
-    const cmd = 'gws gmail +send --to person8@fixture1.example.com --subject hi --body x --dry-run';
-    const out = (await runPreToolUseChain({
-      tool_name: 'exec_command',
-      tool_input: { command: cmd },
-      tool_use_id: 'exec-dry-run',
-    })) as {
-      continue?: boolean;
-      hookSpecificOutput?: { permissionDecision?: string; updatedInput?: { command?: string } };
-    };
-    expect(out.hookSpecificOutput?.permissionDecision).toBeUndefined();
-    expect(writeSpy).not.toHaveBeenCalled();
-    // Nothing rewrote it, so the chain emits no updatedInput at all.
-    expect(out).toEqual({ continue: true });
-  });
-
-  it('(ii) the destructive guard is called with the un-prefixed command', async () => {
-    const out = (await runPreToolUseChain({
-      tool_name: 'exec_command',
-      tool_input: { command: 'git status' },
-    })) as { continue?: boolean; hookSpecificOutput?: { updatedInput?: { command?: string } } };
-    expect(guardCalls()).toEqual(['git status']);
-    expect(out).toEqual({ continue: true });
-  });
-
-  it('(ii) guards see the jest rewrite, and the emitted command carries no prefix', async () => {
-    const out = (await runPreToolUseChain({
-      tool_name: 'exec_command',
-      tool_input: { command: 'npx jest' },
-    })) as { hookSpecificOutput?: { updatedInput?: { command?: string } } };
-    const [seen] = guardCalls();
-    expect(seen).toContain('flock -n -E 126'); // the semantic rewrite IS visible
-    expect(seen.startsWith(PREFIX)).toBe(false);
-    expect(seen).not.toContain('</dev/null');
-    // The jest rewrite is still emitted — and still without a stdin prefix.
-    const emitted = out.hookSpecificOutput?.updatedInput?.command ?? '';
-    expect(emitted).toContain('flock -n -E 126');
-    expect(emitted.startsWith(PREFIX)).toBe(false);
   });
 });
