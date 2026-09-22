@@ -33,11 +33,11 @@
 #   7. runs one controller `step` in live mode, which journals every queued
 #      alarm; entries the journal holds are then removed from the queue.
 #
-# Output: the LAST stdout line is always {"wakeAgent":<bool>,"data":{...}}.
+# Output on exit 0: the LAST stdout line is {"wakeAgent":<bool>,"data":{...}}.
 # With isolated owner routing enabled, failure-only events use durable keyed
 # admission too. An unproven admission exits nonzero for existing script
 # backoff; it never also wakes the shared parent.
-# It wakes the owner for exactly two reasons:
+# Without isolated routing, it wakes the shared owner for exactly two reasons:
 #   - a due owner judgment step: data carries {step, runId, brief} (the brief
 #     is <run>/controller/brief-<step>.md) for the owner router prompt;
 #   - a fire that failed closed: data carries {failure, detail, fire}, and the
@@ -45,8 +45,8 @@
 #     (references/controller-owner-router.md). This is the wrapper's only
 #     reporting mechanism -- it posts nothing itself, because a fire that
 #     cannot complete cannot be trusted to run a send either.
-# Only the two named non-failure ends -- the completed step and the kill
-# switch being off -- are wakeAgent:false.
+# The completed step and the kill switch being off are wakeAgent:false.
+# Proven isolated admission or replay also returns wakeAgent:false.
 #
 # What that does NOT cover, and is accepted: a fire whose whole task script is
 # killed prints no line at all, so it reports nothing -- the host discards the
@@ -56,7 +56,7 @@
 # and notifies the owner (src/modules/scheduling/recurrence.ts:128-147): a
 # REPORTED failure is a wakeAgent:true occurrence, which the container resolves
 # completed, so it never counts toward that streak and never backs off. A
-# persistent reported fault therefore wakes the owner every fire, by design;
+# persistent reported fault on the legacy route wakes the owner every fire;
 # the owner's per-cause daily send id is what keeps it to one post a day
 # (container/agent-runner/src/cli/enqueue-send.ts:24-28, a replay).
 #
@@ -67,7 +67,9 @@
 #     default 100, so the hard kill lands by 112 s, under the runner's 120 s
 #     (agent-runner scheduling/task-script.ts). The worker cuts every child's
 #     timeout to its own deadline and passes the controller a deadline epoch.
-#   - exit status 0 whatever happens.
+#   - exit status 0 except when isolated owner routing is enabled and keyed
+#     admission is unproven: exit nonzero with no final stdout line, entering
+#     the existing script backoff / auto-pause reporting path described above.
 #   - the wrapper's own writes stay under the out-dir (contained, O_NOFOLLOW).
 #     Live effects leave it by design: the gate's state and lease files (poll,
 #     progress, finish), GitHub, chat rows in this session's outbound.db, task

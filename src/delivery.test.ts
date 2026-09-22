@@ -29,6 +29,7 @@ const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-delivery'
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
 import { getDeliveredIds } from './modules/mailbox/ops/delivery.js';
+import { completeAnsweredPendingRows } from './modules/mailbox/ops/sweep.js';
 import { resolveSession, resolveTaskSession, withMailboxSession, writeSessionMessage } from './session-manager.js';
 import { openInboundDb as openInboundDbAt } from './modules/mailbox/openers.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
@@ -1507,9 +1508,11 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     const inbound = new Database(inboundDbPath('ag-1', session.id));
     inbound
       .prepare(
-        "INSERT INTO messages_in(id,seq,kind,timestamp,status,content) VALUES('human-unrelated',2,'chat',?,'pending','{}')",
+        `INSERT INTO messages_in(id,seq,kind,timestamp,status,trigger,content) VALUES
+         ('human-unrelated',2,'chat',?,'pending',1,'{}'),
+         ('event-one',4,'task',?,'pending',1,'{}')`,
       )
-      .run(now());
+      .run(now(), now());
     insertTaskLog(
       'ag-1',
       session.id,
@@ -1521,6 +1524,15 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     setDeliveryAdapter({ deliver });
     await deliverSessionMessages(session);
     await deliverSessionMessages(session);
+    const outbound = new Database(outboundDbPath('ag-1', session.id));
+    try {
+      // Exercise the consumer that uses in_reply_to to complete answered work,
+      // including a positive control proving this is not a no-op sweep.
+      expect(completeAnsweredPendingRows(inbound, outbound)).toEqual(['event-one']);
+      expect(completeAnsweredPendingRows(inbound, outbound)).toEqual([]);
+    } finally {
+      outbound.close();
+    }
     expect(deliver).not.toHaveBeenCalled();
     expect(await outcomeRows()).toHaveLength(1);
     expect(inbound.prepare("SELECT status FROM messages_in WHERE id='human-unrelated'").get()).toEqual({
