@@ -10,6 +10,16 @@ Two things changed together, and only one of them is a default anyone chose.
 
 Pins are data (no deploy); the defaults are code (needs one). **A group you want held where it is must be pinned BEFORE you deploy**, or it runs the new default from the first spawn after the restart.
 
+## Opus 5.5 at `medium` (2026-09-22)
+
+A second move through the same seam. `DEFAULT_OPUS_MODEL` (`src/flag-parser.ts`) is now `claude-opus-5-5[1m]`, and the Opus family default effort (`defaultEffortForModel` in `container/agent-runner/src/providers/claude.ts`) is now `medium`, down from `high`. The sections below still describe the mechanics. For this move:
+
+- **Detect**: run the audit in [§1](#1-detect) unchanged. Every row whose effective model is the Opus default moves to `claude-opus-5-5[1m]`. Every Opus row whose effort column reads `(family default)` moves from `high` to `medium`, including explicit `claude-opus-5[1m]` pins, because the family default keys on every `claude-opus-*` id. Task pins are data: `ncl tasks list --json`, then read `model_pin` / `effort_pin`.
+- **Why**: Opus 5.5 is cheaper per token than Opus 5 ($4/$20 vs $5/$25 per MTok), and `medium` is its API default. The container CLI must be ≥ 2.1.280 to know the id; this change pins that version.
+- **Fix, to keep the old behaviour before deploying**: `ncl groups config update --id <group-id> --model claude-opus-5[1m] --effort high`. For a single channel: `ncl wirings update <wiring-id> --default-model claude-opus-5[1m] --default-effort high`. For one task: `ncl tasks update --id <series> --group <group-id> --model claude-opus-5[1m] --effort high`.
+- **Verify**: after deploy, a fresh Claude container's env carries `ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5-5[1m]` (see [§4](#4-verify)), and new `turn_usage` rows for unpinned groups read `model = 'claude-opus-5-5[1m]'` with `effort = 'medium'`.
+- **Rollback**: set `DEFAULT_OPUS_MODEL` back to `claude-opus-5[1m]` and the `claude-opus-*` branch of `defaultEffortForModel` back to `'high'`, then rebuild and restart. The CLI/SDK bump can stay: 2.1.280 still serves Opus 5.
+
 ## 1. Detect
 
 Which groups move — and it is **not** just the Claude ones. A declared `providerFallback` resolves through these same defaults, so a Codex group that falls back to Claude moves on the Claude default, and a Claude group that falls back to Codex moves on the Codex one. Measured on this install: 14 fallback paths resolve through a default that moves, and a primary-provider-only check lists none of them.
