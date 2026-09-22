@@ -1410,11 +1410,16 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // (`model: effectiveModel`), so a model-scoped window rejects every
       // slot in the ring and looks exactly like a dead account. Dropping the
       // pin re-queries on the group's configured model, because `undefined`
-      // means "no per-turn override" and each provider then resolves its own
-      // default (claude: NANOCLAW_CLAUDE_MODEL; codex and opencode: their own
-      // config surfaces). That is why this is NOT gated on providerName — a
-      // codex group pinned to a limited `gpt-*` model reaches it the same way
-      // before falling back to claude.
+      // means "no per-turn override" and every provider resolves its own
+      // default from it — verified, not assumed: claude falls through to
+      // `process.env.NANOCLAW_CLAUDE_MODEL` (providers/claude.ts:2739-2741),
+      // codex returns the group's configured model from
+      // `resolveQueryModel(undefined, this.model)` on its first line
+      // (providers/codex.ts:451, called at :1220), and opencode falls through
+      // to OPENCODE_MODEL then OPENCODE_NATIVE_DEFAULT_MODEL
+      // (providers/opencode.ts:1286, :1302). That is why this is NOT gated on
+      // providerName — a codex group pinned to a limited `gpt-*` model reaches
+      // it the same way before falling back to claude.
       //
       // Deliberately ONE attempt on ONE credential, not a second ring pass:
       // if the group's own default model is also rejected here, the account
