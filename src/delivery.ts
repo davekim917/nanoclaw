@@ -370,7 +370,6 @@ async function stopSessionLifecycleStatus(
       }
     }
   }
-  lifecycleRecoveryMisses.add(sessionId);
   statusTracking.delete(sessionId);
 }
 

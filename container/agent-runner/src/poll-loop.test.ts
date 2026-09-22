@@ -20,6 +20,7 @@ import {
   dispatchResultText,
   applyChatBudget,
   applyFlagBatch,
+  buildTaskBlockNudge,
   buildProviderUnavailableReport,
   buildWorkContinuationPrompt,
   handleEvent,
@@ -4992,6 +4993,13 @@ describe('outcome reporting — quiet work and expected replies', () => {
   });
   afterEach(() => {
     delete process.env.NANOCLAW_OUTCOME_REPORTING;
+  });
+
+  it('describes both supported task outcome identities and keeps evidence optional', () => {
+    const nudge = buildTaskBlockNudge([{ to: 'operator', body: 'Completed the requested audit.' }], 'operator');
+    expect(nudge).toContain('supported workItem URL or harness request id');
+    expect(nudge).toContain('evidence is optional');
+    expect(nudge).not.toContain('canonical item and evidence');
   });
 
   it('retains original human request ids and excludes host or agent-authored triggers', () => {

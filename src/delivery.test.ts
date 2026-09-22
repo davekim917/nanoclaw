@@ -333,6 +333,45 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     expect(deletes).toEqual(['plat-status-1']);
   });
 
+  it('removes a stopped lifecycle row when a queued reply lands after the container was killed', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    const deliveries: Array<{ kind: string; content: Record<string, unknown> }> = [];
+    const deletes: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, kind, content) {
+        deliveries.push({ kind, content: JSON.parse(content) as Record<string, unknown> });
+        if (deliveries.length === 1) return 'plat-lifecycle-1';
+        if (kind === 'chat') return 'plat-reply-1';
+        return undefined;
+      },
+      async deleteMessage(_channelType, _platformId, _threadId, messageId) {
+        deletes.push(messageId);
+      },
+    });
+
+    insertOutboundKind('ag-1', session.id, 'lifecycle-1', 'status', 'telegram', 'telegram:123', {
+      text: 'Accepted · working',
+      reporting: { version: 1, purpose: 'liveness', state: 'working' },
+    });
+    await deliverSessionMessages(session);
+    insertOutboundKind('ag-1', session.id, 'queued-reply', 'chat', 'telegram', 'telegram:123', {
+      text: 'The queued work completed.',
+      reporting: { version: 1, purpose: 'reply' },
+    });
+
+    await clearSessionStatusOnKill(session.id);
+    expect(deliveries[1]).toMatchObject({
+      kind: 'status',
+      content: { operation: 'edit', messageId: 'plat-lifecycle-1', text: 'Stopped.' },
+    });
+
+    await deliverSessionMessages(session);
+    expect(deliveries.at(-1)).toMatchObject({ kind: 'chat', content: { text: 'The queued work completed.' } });
+    expect(deletes).toEqual(['plat-lifecycle-1']);
+  });
+
   it('resets the status line on a new turn when the prior turn posted no chat-final', async () => {
     // Bug: a turn that ends WITHOUT a user-facing <message> block (agent
     // thought/used tools but chose not to reply) never writes a kind='chat'

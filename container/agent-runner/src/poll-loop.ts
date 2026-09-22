@@ -3439,7 +3439,7 @@ export function buildTaskBlockNudge(taskBlocks: TaskMessageBlock[], destinationN
     'If and only if any of it still needs to be sent, call send_message with an explicit to destination. ' +
     'If it was already sent or no notification is required, do not send it again. ' +
     (outcomeReportingEnabled()
-      ? 'Use purpose="reply" for a requested answer or purpose="outcome" with its canonical item and evidence only when the original work item finishes. Routine progress stays internal; preserve required approval routes. '
+      ? 'Use purpose="reply" for a requested answer or purpose="outcome" with the original supported workItem URL or harness request id only when the original work item finishes; evidence is optional. Routine progress stays internal; preserve required approval routes. '
       : '') +
     `Your destinations: ${escapePromptXml(destinationNames)}. ` +
     'The original task result is already recorded in the run log; do not repeat it.</system>'
