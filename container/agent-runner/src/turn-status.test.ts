@@ -6,10 +6,11 @@
  * missing, so "renders whatever it has" is the contract, not "renders when
  * complete".
  */
-import { beforeEach, describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
 import { _resetConfig, _setConfigForTest } from './config.js';
 import {
+  _forgetOwnershipForTest,
   clearContextTokens,
   isOwnConversation,
   setOwnConversation,
@@ -215,7 +216,7 @@ describe('stampStatusSubtext', () => {
 
   // Round three: `kind === 'chat'` alone was too broad. A routed chat row is
   // not necessarily a reply the agent composed.
-  it('leaves an unmarked chat row alone, as send_file captions are', () => {
+  it('leaves an unmarked chat row alone, as a caption-less file send is', () => {
     const msg = chat({
       agentReply: undefined,
       content: JSON.stringify({ text: 'here is the chart', files: ['chart.png'] }),
@@ -266,5 +267,85 @@ describe('isOwnConversation', () => {
   it('does not match a same-id channel on a different platform', () => {
     setOwnConversation('slack', 'C-MAIN');
     expect(isOwnConversation('discord', 'C-MAIN')).toBe(false);
+  });
+});
+
+/**
+ * #1023: the MCP subprocess must fail CLOSED when it can't read the snapshot,
+ * and a failed snapshot write must not be stranded by a skip-if-unchanged check.
+ */
+describe('cross-process snapshot failure handling (#1023)', () => {
+  const chat = (platform_id: string) => ({
+    kind: 'chat',
+    agentReply: true,
+    channel_type: 'discord',
+    platform_id,
+    content: JSON.stringify({ text: 'hi' }),
+  });
+  const sub = (out: string): string | undefined => (JSON.parse(out) as { subtext?: string }).subtext;
+
+  let ops: { getState: (k: string) => unknown; setState: (k: string, v: string) => void };
+  let realGet: typeof ops.getState;
+  let realSet: typeof ops.setState;
+
+  beforeEach(async () => {
+    const { initTestSessionDb } = await import('./modules/mailbox/testing.js');
+    const { getAgentMailbox } = await import('./mailbox/index.js');
+    initTestSessionDb();
+    _resetConfig();
+    _setConfigForTest({});
+    resetTurnStatus();
+    ops = getAgentMailbox().operations as unknown as typeof ops;
+    realGet = ops.getState.bind(ops);
+    realSet = ops.setState.bind(ops);
+  });
+
+  afterEach(async () => {
+    ops.getState = realGet;
+    ops.setState = realSet;
+    resetTurnStatus();
+    _resetConfig();
+    const { closeSessionDb } = await import('./modules/mailbox/testing.js');
+    closeSessionDb();
+  });
+
+  it('does not stamp from a previous turn when the snapshot read fails', () => {
+    // Turn N, for chan-A: poll-loop persists, the subprocess reads it.
+    setTurnSettings('claude-opus-5[1m]', 'high');
+    setOwnConversation('discord', 'chan-A');
+    recordContextTokens(142_400);
+    _forgetOwnershipForTest();
+    expect(sub(stampStatusSubtext(chat('chan-A')))).toBe('opus-5 · high · 142k context');
+
+    // Turn N+1: the read throws. A cross-destination send to chan-A must NOT
+    // be stamped from the stale chan-A state still held in memory.
+    ops.getState = () => {
+      throw new Error('SQLITE_BUSY');
+    };
+    expect(sub(stampStatusSubtext(chat('chan-A')))).toBeUndefined();
+  });
+
+  it('does not stamp from a previous turn when the snapshot has vanished', () => {
+    setTurnSettings('claude-opus-5[1m]', 'high');
+    setOwnConversation('discord', 'chan-A');
+    _forgetOwnershipForTest();
+    expect(sub(stampStatusSubtext(chat('chan-A')))).toBe('opus-5 · high');
+
+    ops.getState = () => undefined;
+    expect(sub(stampStatusSubtext(chat('chan-A')))).toBeUndefined();
+  });
+
+  it('retries a failed snapshot write even when the value has not changed', () => {
+    setTurnSettings('claude-opus-5[1m]', 'high');
+    setOwnConversation('discord', 'chan-A');
+    ops.setState = () => {
+      throw new Error('SQLITE_BUSY');
+    };
+    recordContextTokens(90_000); // write fails
+    ops.setState = realSet;
+    recordContextTokens(90_000); // same value: must still write
+
+    _forgetOwnershipForTest();
+    expect(sub(stampStatusSubtext(chat('chan-A')))).toBe('opus-5 · high · 90k context');
   });
 });

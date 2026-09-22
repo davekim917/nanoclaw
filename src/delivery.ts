@@ -52,6 +52,7 @@ import { log } from './log.js';
 import { scrubSecrets } from './secret-scrubber.js';
 import { humanizeOutboundContent } from './verdict-tokens.js';
 import { archiveMessage } from './message-archive.js';
+import { resolveContinueThread } from './continue-thread.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
 import { sessionOutboundStorageStat, type NanoclawMailboxSession } from './modules/mailbox/index.js';
@@ -585,6 +586,7 @@ function readThreadKey(content: { threadKey?: unknown }, msgId: string, sessionI
  * platform by the time this runs. So a failed write here is logged, never thrown:
  * a throw would fail the row and re-post a message the channel already shows.
  *   - threaded under the anchor → bump last_used_at
+ *   - threaded into a thread adopted via continueThread → record that thread
  *   - root post with an id (new key, expired key, or a threaded failure that
  *     fell back) → upsert the record, then prune stale keys
  *   - fell back to root but got no id → drop the dead record, so the next post
@@ -592,11 +594,19 @@ function readThreadKey(content: { threadKey?: unknown }, msgId: string, sessionI
  */
 async function settleThreadKeyAnchor(
   addr: ThreadKeyAddress,
-  outcome: { threaded: boolean; fellBack: boolean; platformMsgId: string | undefined; msgId: string },
+  outcome: {
+    threaded: boolean;
+    fellBack: boolean;
+    platformMsgId: string | undefined;
+    msgId: string;
+    adoptedThreadPlatformId?: string;
+  },
 ): Promise<void> {
   try {
     const nowIso = new Date().toISOString();
-    if (outcome.threaded) await touchThreadKeyAnchor(addr, nowIso);
+    if (outcome.threaded && outcome.adoptedThreadPlatformId)
+      await recordThreadKeyAnchor(addr, outcome.adoptedThreadPlatformId, nowIso);
+    else if (outcome.threaded) await touchThreadKeyAnchor(addr, nowIso);
     else if (outcome.platformMsgId) await recordThreadKeyAnchor(addr, outcome.platformMsgId, nowIso);
     else if (outcome.fellBack) await deleteThreadKeyAnchor(addr);
   } catch (err) {
@@ -1831,11 +1841,25 @@ async function deliverMessage(
 
   let effectiveThreadId = baseThreadId;
   let usedAnchor = false;
+  let adoptedThreadPlatformId: string | undefined;
   if (keyAddr) {
     const anchor = await getThreadKeyAnchor(keyAddr, new Date().toISOString());
     if (anchor && !(isInPlaceOp && content.messageId === anchor.threadPlatformId)) {
       effectiveThreadId = `${msg.platform_id}:${anchor.threadPlatformId}`;
       usedAnchor = true;
+    } else if (!anchor && !isInPlaceOp && content.continueThread !== undefined) {
+      // No live anchor: the key may adopt an existing thread the host confirms is on
+      // this messaging group (src/continue-thread.ts); unconfirmed posts at root as before.
+      const adopted = await resolveContinueThread(
+        content.continueThread,
+        { messagingGroupId: keyAddr.messagingGroupId, channelType: msg.channel_type, platformId: msg.platform_id },
+        { id: msg.id, sessionId: session.id, threadKey },
+      );
+      if (adopted) {
+        effectiveThreadId = adopted.threadId;
+        adoptedThreadPlatformId = adopted.threadPlatformId;
+        usedAnchor = true;
+      }
     }
   } else if (taskAnchorEligible) {
     const anchor = await getTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id);
@@ -2037,6 +2061,7 @@ async function deliverMessage(
       fellBack: usedAnchor && effectiveThreadId === null,
       platformMsgId,
       msgId: msg.id,
+      adoptedThreadPlatformId,
     });
   } else if (effectiveThreadId === null && platformMsgId && !isInPlaceOp) {
     if (taskAnchorEligible) {

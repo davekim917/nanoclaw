@@ -593,7 +593,11 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
         session: { id: 'sess-gc', agent_group_id: 'src-ag', thread_id: thread },
         agentGroupId: 'src-ag',
         // The source has neither resumable mailbox work nor an armed wait.
+        // No keyed dispatch receipts either: `true` would return at
+        // src/modules/sweep-scheduling/index.ts:164 before the move check, and
+        // this case would pass without the GC ever declining for the move.
         mailbox: {
+          hasTaskDispatchEvents: () => false,
           countLiveTasks: () => 0,
           hasPendingRecallPairedTrigger: () => false,
           readContinuationPresence: () => null,

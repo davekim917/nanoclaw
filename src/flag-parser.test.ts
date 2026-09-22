@@ -6,6 +6,7 @@ import {
   ensureOpus1mSuffix,
   resolveModelAlias,
   isOpenCodeModelSlug,
+  DEFAULT_OPUS_MODEL,
 } from './flag-parser.js';
 
 // Exported for the spawn path (container-runner buildContainerArgs): a channel
@@ -17,7 +18,7 @@ describe('formatFlagConfirmation model rendering', () => {
   it('resolves a bare family alias to the fully-qualified id', () => {
     const r = parseMessageFlags('-m opus hi');
     const ack = formatFlagConfirmation(r.intent ?? {}, r.warnings, r.errors);
-    expect(ack).toContain('claude-opus-5[1m]');
+    expect(ack).toContain(DEFAULT_OPUS_MODEL);
     expect(ack).not.toBe('⚙️ model → opus');
     expect(ack).toContain('via opus');
   });
@@ -36,7 +37,7 @@ describe('formatFlagConfirmation model rendering', () => {
 
   it('applies the same resolution to a per-turn -m1 flag', () => {
     const r = parseMessageFlags('-m1 opus hi');
-    expect(formatFlagConfirmation(r.intent ?? {}, r.warnings, r.errors)).toContain('claude-opus-5[1m]');
+    expect(formatFlagConfirmation(r.intent ?? {}, r.warnings, r.errors)).toContain(DEFAULT_OPUS_MODEL);
   });
 });
 
@@ -143,6 +144,13 @@ describe('parseMessageFlags', () => {
     it('auto-appends [1m] to bare claude-opus-4-8 id', () => {
       const r = parseMessageFlags('-m claude-opus-4-8 hi');
       expect(r.intent).toEqual({ stickyModel: 'claude-opus-4-8[1m]' });
+    });
+
+    it('resolves opus55 / opus5-5 / opus-5-5 aliases to claude-opus-5-5[1m]', () => {
+      for (const a of ['opus55', 'opus5-5', 'opus-5-5']) {
+        expect(parseMessageFlags(`-m ${a} hi`).intent).toEqual({ stickyModel: 'claude-opus-5-5[1m]' });
+      }
+      expect(ensureOpus1mSuffix('claude-opus-5-5')).toBe('claude-opus-5-5[1m]');
     });
 
     it('resolves opus5 / opus-5 aliases to claude-opus-5[1m]', () => {
@@ -345,7 +353,7 @@ describe('formatFlagConfirmation', () => {
 
   it('combines model + effort on one line', () => {
     const out = formatFlagConfirmation({ stickyModel: 'opus', stickyEffort: 'high' }, [], []);
-    expect(out).toBe('⚙️ model → claude-opus-5[1m] (via opus), effort → high');
+    expect(out).toBe(`⚙️ model → ${DEFAULT_OPUS_MODEL} (via opus), effort → high`);
   });
 
   it('appends warnings on their own line', () => {

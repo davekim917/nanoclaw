@@ -44,7 +44,6 @@ const DRIFT_TESTS = [
   'src/mailbox-seam-upstream.test.ts',
   'src/upstream-ratchet.test.ts',
   'src/design-artifact-loop-vendor.test.ts',
-  'scripts/reviewer-models-freshness.test.ts',
 ] as const;
 
 const lane = process.env.VITEST_LANE;

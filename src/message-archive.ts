@@ -344,6 +344,31 @@ export function archiveMessage(msg: ArchiveMessage): boolean {
   return true;
 }
 
+/**
+ * Whether any archived message sits in `threadId` on this channel
+ * (channel_type + platform_id — `idx_archive_channel`). Outbound rows from task
+ * sessions carry no messaging_group_id, so the channel is matched by its address
+ * rather than by messaging group id. Sibling bots on one conversation archive it
+ * under their own channel_type (`discord`, `discord-codex`, ...) with the base
+ * prefix on platform_id; those copies pool by channel family, the same rule as
+ * `search_threads` (container/agent-runner/src/mcp-tools/thread-search.ts:54-61),
+ * while a native adapter's unprefixed id keeps exact channel_type matching. Used by
+ * src/continue-thread.ts as evidence that a thread really exists on a destination.
+ */
+export function archiveHasThread(channelType: string, platformId: string, threadId: string): boolean {
+  const dash = channelType.indexOf('-');
+  const family = dash > 0 ? channelType.slice(0, dash) : channelType;
+  const pooled = platformId.startsWith(`${family}:`);
+  const row = openDb()
+    .prepare(
+      `SELECT 1 FROM messages_archive
+        WHERE (channel_type = ? OR channel_type = ? OR channel_type LIKE ?) AND platform_id = ? AND thread_id = ?
+        LIMIT 1`,
+    )
+    .get(channelType, pooled ? family : channelType, pooled ? `${family}-%` : null, platformId, threadId);
+  return row !== undefined;
+}
+
 export interface ArchiveEvidenceRow {
   id: string;
   agentGroupId: string;

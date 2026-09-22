@@ -35,6 +35,7 @@ import { resolveRequestCandidate } from '../modules/mailbox/session-state.js';
 import { getSessionRouting, getTaskSeriesId } from '../db/session-routing.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
+import { CONTINUE_THREAD_DESCRIPTION, parseContinueThread } from './continue-thread.js';
 
 // send_file safety constants — mirror v1's ipc-mcp-stdio.ts behavior.
 const SEND_FILE_MAX_BYTES = 50 * 1024 * 1024; // Slack's own cap is 1GB but most adapters fail long before
@@ -305,6 +306,7 @@ export const sendMessage: McpToolDefinition = {
           required: ['verified'],
         },
         thread_key: { type: 'string', description: THREAD_KEY_DESCRIPTION },
+        continue_thread: { type: 'string', description: CONTINUE_THREAD_DESCRIPTION },
       },
       required: ['text'],
     },
@@ -319,6 +321,8 @@ export const sendMessage: McpToolDefinition = {
 
     const key = parseThreadKey(args.thread_key);
     if ('error' in key) return err(key.error);
+    const cont = parseContinueThread(args.continue_thread, key.threadKey);
+    if ('error' in cont) return err(cont.error);
 
     const routing = resolveRouting(args.to as string | undefined);
     if ('error' in routing) return err(routing.error);
@@ -369,6 +373,7 @@ export const sendMessage: McpToolDefinition = {
         content: JSON.stringify({
           text,
           ...(key.threadKey ? { threadKey: key.threadKey } : {}),
+          ...(cont.continueThread ? { continueThread: cont.continueThread } : {}),
           ...(policy
             ? {
                 reporting: {
@@ -416,6 +421,7 @@ export const sendFile: McpToolDefinition = {
         text: { type: 'string', description: 'Optional accompanying message' },
         filename: { type: 'string', description: 'Display name (default: basename of path)' },
         thread_key: { type: 'string', description: THREAD_KEY_DESCRIPTION },
+        continue_thread: { type: 'string', description: CONTINUE_THREAD_DESCRIPTION },
       },
       required: ['path'],
     },
@@ -436,6 +442,8 @@ export const sendFile: McpToolDefinition = {
 
     const key = parseThreadKey(args.thread_key);
     if ('error' in key) return err(key.error);
+    const cont = parseContinueThread(args.continue_thread, key.threadKey);
+    if ('error' in cont) return err(cont.error);
 
     const denial = chatSendDenial();
     if (denial) return err(denial);
@@ -485,19 +493,31 @@ export const sendFile: McpToolDefinition = {
     fs.mkdirSync(outboxDir, { recursive: true });
     fs.writeFileSync(path.join(outboxDir, filename), fileContent);
 
-    await writeMessageOut({
-      id,
-      in_reply_to: getCurrentInReplyTo(),
-      kind: 'chat',
-      platform_id: routing.platform_id,
-      channel_type: routing.channel_type,
-      thread_id: routing.thread_id,
-      content: JSON.stringify(
-        key.threadKey
-          ? { text: caption, files: [filename], threadKey: key.threadKey }
-          : { text: caption, files: [filename] },
-      ),
-    });
+    await writeMessageOut(
+      withStatusSubtext({
+        id,
+        in_reply_to: getCurrentInReplyTo(),
+        kind: 'chat',
+        // A caption is agent-composed text: often the whole report, with the
+        // file attached to it. Stamped like any reply, own conversation only.
+        // A bare file with no caption gets no line, since there is no reply text
+        // to sit under.
+        agentReply: caption.trim() !== '',
+        platform_id: routing.platform_id,
+        channel_type: routing.channel_type,
+        thread_id: routing.thread_id,
+        content: JSON.stringify(
+          key.threadKey
+            ? {
+                text: caption,
+                files: [filename],
+                threadKey: key.threadKey,
+                ...(cont.continueThread ? { continueThread: cont.continueThread } : {}),
+              }
+            : { text: caption, files: [filename] },
+        ),
+      }),
+    );
 
     log(`send_file: ${id} → ${routing.resolvedName} (${filename}), awaiting host ack`);
 

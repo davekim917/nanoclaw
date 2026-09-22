@@ -2424,13 +2424,22 @@ describe('codex-review risk-scoped review requests', () => {
     // ANYWHERE but the first word must still refuse — the documented receipt
     // format leads with the id, so this is not a legitimate reviewer string.
     ['an allowed id mentioned after a disallowed first token', 'claude-sonnet-5 (fallback from claude-fable-5-1)'],
-    // Near-misses on the OpenCode entry. The allowlisted id is
-    // `deepseek-v4.1-flash` — the `v` is not optional — and it is stored bare
-    // because `assertConcreteModelId` refuses `/`, so the `opencode/` prefix a
-    // reviewer types into `opencode run -m` is NOT the allowed id either.
-    ['a near-miss spelling of an allowed id', 'deepseek-4.1-flash (opencode run)'],
-    ['an allowed id carrying its provider prefix', 'opencode/deepseek-v4.1-flash (opencode run)'],
-  ])('refuses a receipt whose --reviewer names %s, a non-allowlisted model, posting nothing', (_case, reviewer) => {
+    // Every denied tier, including ones reached through a provider path — the
+    // path names the route, so stripping it must not launder a small model.
+    ['a mini model', 'gpt-5.4-mini'],
+    ['a mini model whose tier is not the last segment', 'gpt-5.1-codex-mini (codex exec)'],
+    ['a nano model', 'gpt-5-nano'],
+    ['a lite model behind a provider prefix', 'opencode/gemini-3.5-flash-lite (opencode run)'],
+    ['a small model behind a two-level provider path', 'nvidia/mistralai/mistral-small-4-119b-2603'],
+    ['a sonnet model behind a provider prefix', 'opencode/claude-sonnet-5 (opencode run)'],
+    ['a bare alias with no version', 'opus (subagent)'],
+    // A version fused onto the tier word is still that tier.
+    ['a sonnet model with its version fused on', 'claude-sonnet5'],
+    ['a small model with its version fused on', 'mistral-small3.1'],
+    // A fullwidth `ｓ` passes bash's `[a-z]` in a UTF-8 locale; the rule runs
+    // under LC_ALL=C so the lookalike is not an id character at all.
+    ['a sonnet model spelled with a fullwidth lookalike', 'claude-ｓonnet-5'],
+  ])('refuses a receipt whose --reviewer names %s, posting nothing', (_case, reviewer) => {
     const root = tempRoot();
     const bodyFile = path.join(root, 'review.md');
     fs.writeFileSync(bodyFile, 'Scope: complete diff.\n');
@@ -2448,15 +2457,31 @@ describe('codex-review risk-scoped review requests', () => {
     ]);
     expect(result.status).toBe(2);
     expect(result.posted).toBeNull();
-    expect(result.stderr).toContain('reviewer-models.txt');
+    expect(result.stderr).toContain('receipt: --reviewer refused');
   });
 
-  // The generic case above iterates whatever reviewer-models.txt holds, so it
-  // stops covering an id the moment that id is dropped. This one names the
-  // OpenCode entry literally: adding it widened who may approve a merge, and
-  // that widening should fail loudly if it is ever half-reverted (id dropped
-  // from FRONTIER_MODELS, or the file regenerated without it).
-  it('accepts a receipt from the OpenCode frontier entry, deepseek-v4.1-flash', () => {
+  // There is no list of approved models: any concrete id outside the denied
+  // tiers may write a receipt, so a newly released frontier model works with no
+  // edit. `gpt-7` and `claude-opus-6` stand in for models that do not exist yet —
+  // they must pass, or the gate has quietly become an allowlist again.
+  // `gemini-3.8-flash` is the substring guard: it contains "mini" and must still
+  // pass, because tiers match whole id segments, never substrings.
+  it.each([
+    'claude-opus-5 (opus)',
+    'claude-opus-5[1m] (worker-frontier)',
+    'claude-fable-5-1',
+    'claude-opus-5-5[1m] (opus)',
+    'gpt-6-astra via codex exec',
+    'gpt-5.6-sol',
+    'deepseek-v4.1-flash (opencode run)',
+    'opencode/deepseek-v4.1-flash (opencode run)',
+    'opencode-go/gemini-3.8-flash',
+    'gemini-3.1-pro',
+    'gpt-7',
+    'claude-opus-6 (opus)',
+    // Case is not part of the id: a mixed-case spelling is the same model.
+    'Claude-Opus-5 (opus)',
+  ])('accepts a receipt from frontier model %s with no list to edit', (reviewer) => {
     const root = tempRoot();
     const bodyFile = path.join(root, 'review.md');
     fs.writeFileSync(bodyFile, 'Scope: complete diff.\n');
@@ -2468,53 +2493,12 @@ describe('codex-review risk-scoped review requests', () => {
       '--outcome',
       'approve',
       '--reviewer',
-      'deepseek-v4.1-flash (opencode run)',
+      reviewer,
       '--body-file',
       bodyFile,
     ]);
-    expect(result.status, `refused: ${result.stderr}`).toBe(0);
-    expect(result.posted).toContain('- **Reviewer and runtime:** deepseek-v4.1-flash (opencode run)');
-  });
-
-  it('accepts a receipt whose --reviewer names every listed model id, including a [1m] form', () => {
-    const modelsFile = path.resolve('container/skills/pr-review-loop/reviewer-models.txt');
-    const ids = fs
-      .readFileSync(modelsFile, 'utf8')
-      .split('\n')
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0 && !line.startsWith('#'));
-    expect(ids.length).toBeGreaterThan(0);
-
-    // Every plain listed id, plus one with the [1m] context-window suffix
-    // appended. Both label spellings are exercised: `(opus)` is what a receipt
-    // written today carries, `(worker-frontier)` is what receipts written
-    // before the delegation rework carry, and the gate must accept both because
-    // it reads only the first word.
-    const reviewers = [
-      ...ids.map((id) => `${id} (opus)`),
-      ...ids.map((id) => `${id} (worker-frontier)`),
-      `${ids[0]}[1m] (opus)`,
-      `${ids[0]}[1m] (worker-frontier)`,
-    ];
-    for (const reviewer of reviewers) {
-      const root = tempRoot();
-      const bodyFile = path.join(root, 'review.md');
-      fs.writeFileSync(bodyFile, 'Scope: complete diff.\n');
-
-      const result = runHelper(root, [
-        'receipt',
-        '--head',
-        HEAD,
-        '--outcome',
-        'approve',
-        '--reviewer',
-        reviewer,
-        '--body-file',
-        bodyFile,
-      ]);
-      expect(result.status, `reviewer "${reviewer}" was refused: ${result.stderr}`).toBe(0);
-      expect(result.posted).toContain(`- **Reviewer and runtime:** ${reviewer}`);
-    }
+    expect(result.status, `reviewer "${reviewer}" was refused: ${result.stderr}`).toBe(0);
+    expect(result.posted).toContain(`- **Reviewer and runtime:** ${reviewer}`);
   });
 
   it('refuses a review-verdict head whose approving receipt names a disallowed reviewer model', () => {
@@ -2527,7 +2511,7 @@ describe('codex-review risk-scoped review requests', () => {
     const result = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(result.status).toBe(24);
     expect(result.stderr).toContain('disallowed reviewer');
-    expect(result.stderr).toContain('reviewer-models.txt');
+    expect(result.stderr).toContain('sonnet-tier');
   });
 
   it.each([
@@ -4223,10 +4207,6 @@ describe('codex-review merge, the only merge path for a risk-scoped repo', () =>
     fs.mkdirSync(path.join(skill, 'scripts'), { recursive: true });
     for (const name of fs.readdirSync(path.dirname(HELPER)))
       fs.copyFileSync(path.join(path.dirname(HELPER), name), path.join(skill, 'scripts', name));
-    fs.copyFileSync(
-      path.join(path.dirname(HELPER), '..', 'reviewer-models.txt'),
-      path.join(skill, 'reviewer-models.txt'),
-    );
     const script = path.join(skill, 'scripts', 'codex-review.sh');
     fs.writeFileSync(
       path.join(root, 'evil.sh'),
@@ -5181,10 +5161,6 @@ describe('codex-review exact verdicts: a wrong pr-body.jq never passes a check o
     fs.mkdirSync(path.join(skill, 'scripts'), { recursive: true });
     for (const name of fs.readdirSync(path.dirname(HELPER)))
       fs.copyFileSync(path.join(path.dirname(HELPER), name), path.join(skill, 'scripts', name));
-    fs.copyFileSync(
-      path.join(path.dirname(HELPER), '..', 'reviewer-models.txt'),
-      path.join(skill, 'reviewer-models.txt'),
-    );
     const module = path.join(skill, 'scripts', 'pr-body.jq');
     fs.writeFileSync(module, edit(fs.readFileSync(module, 'utf8')));
     return path.join(skill, 'scripts', 'codex-review.sh');
