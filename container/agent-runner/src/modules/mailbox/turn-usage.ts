@@ -95,7 +95,7 @@ const NO_TURN_META: TurnMeta = {
 
 /**
  * Cumulative-usage bug fix (2026-08-24): the Claude Agent SDK's
- * `result.usage`/`modelUsage` is a RUNNING TOTAL FOR THE WHOLE SDK STREAM,
+ * `modelUsage` is a RUNNING TOTAL FOR THE WHOLE SDK STREAM,
  * not a per-turn amount — and one stream serves MANY turns (poll-loop.ts
  * keeps the generator open across follow-up pushes; see the comment at its
  * `event.type === 'result'` handling). Recording it as-is on every `result`
@@ -129,13 +129,17 @@ const NO_TURN_META: TurnMeta = {
  * not cumulative (see opencode.ts's result construction), so it is likewise
  * summed at the provider.
  *
+ * The SDK's separate `result.usage` field is per-turn main-loop-only usage,
+ * not this counter. ClaudeProvider marks that fallback as per-turn and leaves
+ * cost unknown; it prefers modelUsage even when only one model is present.
+ *
  * Scope key (2026-08-25): the memo used to be keyed by model alone, so a
  * brand-new stream whose first report happened to land ABOVE the previous
  * stream's stored total was silently subtracted against an unrelated series.
  * Entries now carry the scope they were observed in and a scope change
- * forces a raw (unsubtracted) row. The scope is the provider's CONTINUATION
- * (Claude's SDK session id), not the stream object, so a same-session
- * restart-at-zero shows up as a decrease and is caught by the reset check.
+ * forces a raw (unsubtracted) row. ClaudeProvider now supplies a query-scoped
+ * identity: a resumed native session starts a new counter, even when its first
+ * total exceeds the previous query's. Continuation is only a legacy fallback.
  */
 type CumulativeMemo = { scope: string; usage: TurnUsageInfo };
 /** One entry per live counter — keyed by model, see CUMULATIVE_PROVIDERS. */
@@ -278,8 +282,10 @@ export function recordTurnUsage(
   meta: TurnMeta = NO_TURN_META,
   scope = '',
 ): void {
-  const counterKey = CUMULATIVE_PROVIDERS.has(provider) ? (usage.model ?? '') : null;
-  const effectiveUsage = counterKey === null ? usage : toTurnDelta(usage, scope, counterKey);
+  const counterKey =
+    usage.accounting?.kind !== 'per-turn' && CUMULATIVE_PROVIDERS.has(provider) ? (usage.model ?? '') : null;
+  const counterScope = usage.accounting?.kind === 'cumulative' ? usage.accounting.scope : scope;
+  const effectiveUsage = counterKey === null ? usage : toTurnDelta(usage, counterScope, counterKey);
   // See isUnusedModelEntry: a cumulative provider lists every model of the
   // continuation on every turn, and the ones it didn't use come through with
   // a zero delta. Booking those as turns makes a model's usage mostly phantom.
@@ -321,7 +327,7 @@ export function recordTurnUsage(
     console.error(`[turn-usage] Failed to record turn usage: ${err instanceof Error ? err.message : String(err)}`);
     return; // baseline stays put — the next successful turn absorbs this one's tokens
   }
-  if (counterKey !== null) lastCumulativeByCounter.set(counterKey, { scope, usage });
+  if (counterKey !== null) lastCumulativeByCounter.set(counterKey, { scope: counterScope, usage });
 }
 
 /** For tests/diagnostics — reads back all rows in insertion order. */

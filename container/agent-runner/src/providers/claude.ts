@@ -2908,6 +2908,9 @@ export class ClaudeProvider implements AgentProvider {
     });
 
     let aborted = false;
+    // SDKResultMessage.modelUsage resets for each query(), even when resuming
+    // the same session (SDK sdk.d.ts, SDKResultSuccess.modelUsage contract).
+    const usageCounterScope = randomUUID();
 
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       // Fleet Hardening Phase 0.1 (see TurnUsageInfo). Both SDKResultSuccess
@@ -2933,12 +2936,12 @@ export class ClaudeProvider implements AgentProvider {
       }): TurnUsageInfo | TurnUsageInfo[] {
         const modelEntries = m.modelUsage ? Object.entries(m.modelUsage) : [];
         // modelUsage is keyed by model and carries its own per-model
-        // tokens/cost — a turn spanning multiple models (Opus parent +
-        // Sonnet subagents) gets one attributed row per model instead of
-        // being collapsed under a NULL model (Fleet Hardening Phase 0.1
-        // follow-up: this used to hide $718/$393 of daily spend).
-        if (modelEntries.length > 1) {
+        // tokens/cost, including children on the SAME model as their parent.
+        // result.usage has a different denominator (per-turn main loop), so
+        // model count must never switch the accounting source.
+        if (modelEntries.length > 0) {
           return modelEntries.map(([model, u]) => ({
+            accounting: { kind: 'cumulative' as const, scope: usageCounterScope },
             model,
             inputTokens: u.inputTokens ?? null,
             outputTokens: u.outputTokens ?? null,
@@ -2948,12 +2951,16 @@ export class ClaudeProvider implements AgentProvider {
           }));
         }
         return {
-          model: modelEntries.length === 1 ? modelEntries[0][0] : null,
+          // SDKResultSuccess.usage is per-turn MAIN LOOP only; unlike
+          // modelUsage it excludes child/auxiliary calls. Never combine it
+          // with cumulative total_cost_usd or subtract another turn from it.
+          accounting: { kind: 'per-turn' },
+          model: null,
           inputTokens: m.usage?.input_tokens ?? null,
           outputTokens: m.usage?.output_tokens ?? null,
           cacheReadTokens: m.usage?.cache_read_input_tokens ?? null,
           cacheWriteTokens: m.usage?.cache_creation_input_tokens ?? null,
-          costUsd: typeof m.total_cost_usd === 'number' ? m.total_cost_usd : null,
+          costUsd: null,
         };
       }
       let messageCount = 0;

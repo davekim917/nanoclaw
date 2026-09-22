@@ -34,9 +34,8 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
 const { ClaudeProvider } = await import('./claude.js');
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
 const { initTestSessionDb } = await import('../modules/mailbox/testing.js');
-const { getTurnUsageRows, recordTurnUsage, _resetCumulativeTrackingForTesting } = await import(
-  '../modules/mailbox/turn-usage.js'
-);
+const { getTurnUsageRows, recordTurnUsage, _resetCumulativeTrackingForTesting } =
+  await import('../modules/mailbox/turn-usage.js');
 import type { TurnUsageInfo } from './types.js';
 
 let tmp: string;
@@ -99,13 +98,86 @@ function resultWithModels(models: string[]): unknown {
     modelUsage: Object.fromEntries(
       models.map((m, i) => [
         m,
-        { inputTokens: 100 * (i + 1), outputTokens: 10, cacheReadInputTokens: 5, cacheCreationInputTokens: 1, costUSD: 0.5 },
+        {
+          inputTokens: 100 * (i + 1),
+          outputTokens: 10,
+          cacheReadInputTokens: 5,
+          cacheCreationInputTokens: 1,
+          costUSD: 0.5,
+        },
       ]),
     ),
   };
 }
 
 describe('claude turn effort -> turn_usage row', () => {
+  it('uses same-model parent and child cumulative totals, not per-turn main-loop usage', async () => {
+    sdkMessages.length = 0;
+    const result = (input: number, cost: number, mainInput: number) => ({
+      type: 'result',
+      subtype: 'success',
+      result: '',
+      total_cost_usd: cost,
+      usage: { input_tokens: mainInput, output_tokens: 1, cache_read_input_tokens: 2 },
+      modelUsage: {
+        'claude-fable-5-1': {
+          inputTokens: input,
+          outputTokens: input,
+          cacheReadInputTokens: input,
+          cacheCreationInputTokens: input,
+          costUSD: cost,
+        },
+      },
+    });
+    sdkMessages.push(result(100, 10, 20), result(150, 12, 3));
+    await runTurnAndRecord();
+    expect(getTurnUsageRows().map((r) => [r.input_tokens, r.cache_read_tokens, r.cost_usd])).toEqual([
+      [100, 100, 10],
+      [50, 50, 2],
+    ]);
+  });
+
+  it('retains the same counter basis when a second model first appears', async () => {
+    sdkMessages.length = 0;
+    const first = resultWithModels(['claude-opus-5']) as Record<string, unknown>;
+    const second = resultWithModels(['claude-opus-5', 'claude-haiku-4-5-20251001']) as Record<string, unknown>;
+    sdkMessages.push(first, second);
+    await runTurnAndRecord();
+    expect(getTurnUsageRows().map((r) => [r.model, r.input_tokens, r.cost_usd])).toEqual([
+      ['claude-opus-5', 100, 0.5],
+      ['claude-haiku-4-5-20251001', 200, 0.5],
+    ]);
+  });
+
+  it('starts a new counter for a new query even when the continuation id is unchanged', async () => {
+    sdkMessages.length = 0;
+    sdkMessages.push(resultWithModels(['claude-opus-5']));
+    await runTurnAndRecord();
+    await runTurnAndRecord();
+    expect(getTurnUsageRows().map((r) => [r.input_tokens, r.cost_usd])).toEqual([
+      [100, 0.5],
+      [100, 0.5],
+    ]);
+  });
+
+  it('records fallback main-loop usage per turn and leaves cumulative cost unknown', async () => {
+    sdkMessages.length = 0;
+    sdkMessages.push(
+      ...[10, 30].map((input) => ({
+        type: 'result',
+        subtype: 'success',
+        result: '',
+        total_cost_usd: input,
+        usage: { input_tokens: input, output_tokens: input, cache_read_input_tokens: input },
+      })),
+    );
+    await runTurnAndRecord();
+    expect(getTurnUsageRows().map((r) => [r.input_tokens, r.cost_usd])).toEqual([
+      [10, null],
+      [30, null],
+    ]);
+  });
+
   it('attributes an UNPINNED SCHEDULED TASK turn that spawned a subagent', async () => {
     // The shape poll-loop.ts produces for a pure task wake with no stored
     // -m/-e: it passes the BARE ALIAS `sonnet` at xhigh. The SDK expands that
