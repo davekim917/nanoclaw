@@ -452,9 +452,10 @@ function statusSubtextEnabled(): boolean {
  * while looking complete in tests.
  *
  * Scope is deliberately narrow, and the first gate is OPT-IN: the row must be
- * marked `agentReply`, because `kind: 'chat'` alone is far broader than "a
- * reply the agent composed" — `send_file` captions and the runner's own
- * `/clear` notice are both routed chat rows. Then: the agent's own
+ * marked `agentReply`, because `kind: 'chat'` alone is broader than "text the
+ * agent composed" — the runner's own `/clear` notice is a routed chat row that
+ * no turn authored. (`send_file` IS marked when it carries a caption: the
+ * caption is agent text, often the whole report.) Then: the agent's own
  * conversation only (`isOwnConversation`), and an existing `subtext` key is
  * never overwritten.
  *
