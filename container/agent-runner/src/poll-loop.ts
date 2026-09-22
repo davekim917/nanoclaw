@@ -1946,7 +1946,17 @@ export async function processQuery(
   // The status subtext reads the same resolved value, for the same reason the
   // comment above gives: what the turn REQUESTED can be nothing at all, and a
   // line that says "you are on the group default" answers nothing.
-  setTurnSettings(modelInForce, querySettings.effort, querySettings.ultracode);
+  // Effort reads the PROVIDER's resolved value for the same reason the model
+  // does, and the asymmetry was a real bug: `querySettings.effort` is USER
+  // INTENT ONLY (the contract applyFlagBatch states at :3789), so a group
+  // carrying its effort in container.json requested nothing and the line
+  // showed no effort, while a sticky effort the model cannot support is
+  // clamped away and the line showed a level the turn never ran at.
+  // No `?? querySettings.effort` fallback: `resolvedEffort` is REQUIRED and
+  // `null` is a stated answer ("this turn runs with no effort setting"), not
+  // an absence to paper over. Falling back would resurrect the exact bug —
+  // a clamped-away sticky effort reappearing as though it had run.
+  setTurnSettings(modelInForce, query.resolvedEffort, querySettings.ultracode);
   // Which conversation counts as "mine", for the subtext's own-voice gate.
   setOwnConversation(routing.channelType, routing.platformId);
   /**
@@ -2310,7 +2320,10 @@ export async function processQuery(
             // A mid-turn `-m`/`-e` retargets the live stream, so every message
             // written after this point is genuinely on the new settings and the
             // subtext has to move with them.
-            setTurnSettings(modelInForce, fb.effort, fb.ultracode);
+            // Post-retarget the provider's getter is already updated
+            // (claude.ts:3559 reassigns activeEffort in applySettings), so it
+            // still beats the requested value here.
+            setTurnSettings(modelInForce, query.resolvedEffort, fb.ultracode);
             // The stream has moved; the comparison baseline moves with it, or
             // the next batch is measured against a snapshot that no longer
             // describes anything.
@@ -3127,6 +3140,14 @@ async function deliverErrorResult(text: string, routing: RoutingContext): Promis
     id: generateId(),
     in_reply_to: routing.inReplyTo,
     kind: 'chat',
+    // Marked, deliberately: this is the TURN'S OWN text going to the session's
+    // own conversation, which is exactly what the subtext describes. The same
+    // text routed through sendToDestination is stamped, and leaving this path
+    // unmarked would make an error reply the one place the line silently
+    // disappears — precisely when knowing the model and context is most
+    // useful. Model and effort are accurate on an error turn; the context
+    // figure is this turn's, since it is cleared per result (:2872).
+    agentReply: true,
     platform_id: routing.platformId,
     channel_type: routing.channelType,
     thread_id: routing.threadId,

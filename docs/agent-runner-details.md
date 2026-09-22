@@ -925,9 +925,15 @@ opus-5 · xhigh · 142k context
 ```
 
 **What it is made of.** `container/agent-runner/src/turn-status.ts` holds three facts and renders
-them; missing parts are simply omitted. Model and effort come from `modelInForce` in
-`poll-loop.ts` — the provider's RESOLVED model, not what was requested, since an unpinned turn
-requests nothing. `ultracode` displaces the effort level it forces, because printing `xhigh`
+them; missing parts are simply omitted. Model and effort both come from the provider's RESOLVED
+values — `modelInForce` and `AgentQuery.resolvedEffort` — never from what the turn requested. For
+model that is because an unpinned turn requests nothing. For effort the stakes are higher:
+`querySettings.effort` is user intent only (`applyFlagBatch`'s stated contract), so a group
+carrying its effort in `container.json` requests nothing and the line would show no effort at
+all, and an effort the resolved model cannot support is clamped away by the provider, so the line
+would name a level the turn never ran at. `resolvedEffort` is a REQUIRED field on `AgentQuery`
+for the same reason `resolvedModel` is — an optional one is a forgettable one — and `null` is a
+real answer meaning "this turn runs with no effort setting". `ultracode` displaces the effort level it forces, because printing `xhigh`
 would hide the orchestration half of that setting.
 
 **Where the context figure comes from.** Each provider reports a finished number rather than raw

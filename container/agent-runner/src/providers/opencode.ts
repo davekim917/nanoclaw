@@ -1753,6 +1753,10 @@ export class OpenCodeProvider implements AgentProvider {
       // — the ledger must be able to say "ran on opencode's own default" and
       // have that mean something different from "nobody recorded a model".
       resolvedModel: effectiveModel ?? OPENCODE_NATIVE_DEFAULT_MODEL,
+      // Post-clamp, matching `turnEffort.effective` (:1324). Null is real
+      // here: most thinking-capable models already run their highest by
+      // default, so OpenCode injects no reasoning_effort at all.
+      resolvedEffort: clampOpenCodeEffort(turn.effort ?? process.env.OPENCODE_EFFORT),
       push: (message: string, attachments?: PromptAttachment[]) => {
         pending.push({
           text: wrapPromptWithContext(message, systemInstructions),

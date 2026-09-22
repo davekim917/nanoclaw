@@ -5492,6 +5492,76 @@ describe('status subtext — round-two regressions', () => {
     expect(JSON.parse(row.content).subtext).toBe('opus-5 · xhigh · 142k context');
   });
 
+  // Round four (Opus substitute review): effort was read from the REQUEST,
+  // while model was read from the provider's resolved value. Both of these
+  // are the "asserting a value the turn never ran at" failure the context
+  // clearing exists to prevent, one field over.
+  it('shows the provider resolved effort when the group configured it and no -e was typed', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('discord-eff', 'discord-eff', 'channel', 'discord', 'chan-1', NULL)`,
+      )
+      .run();
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-eff-config' };
+      recordContextTokens(142_400);
+      yield { type: 'result', text: '<message to="here">done</message>' };
+    }
+    // The group carries effort in container.json: the provider resolved
+    // 'xhigh', and querySettings carries NOTHING because no -e was typed.
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {},
+      events: events(),
+      abort: () => {},
+      resolvedModel: 'claude-opus-5[1m]',
+      resolvedEffort: 'xhigh',
+    } as unknown as AgentQuery;
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {
+      model: 'claude-opus-5[1m]',
+    });
+
+    const rows = getUndeliveredMessages().filter((r: { kind: string }) => r.kind === 'chat');
+    expect(JSON.parse(rows[0].content).subtext).toBe('opus-5 · xhigh · 142k context');
+  });
+
+  it('does not show a sticky effort the resolved model clamped away', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('discord-clamp', 'discord-clamp', 'channel', 'discord', 'chan-1', NULL)`,
+      )
+      .run();
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-eff-clamp' };
+      recordContextTokens(8_200);
+      yield { type: 'result', text: '<message to="here">done</message>' };
+    }
+    // Sticky -e xhigh from an earlier turn, then -m haiku. The provider
+    // clamps to the family default, which for haiku is nothing at all.
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {},
+      events: events(),
+      abort: () => {},
+      resolvedModel: 'claude-haiku-4-5',
+      resolvedEffort: null,
+    } as unknown as AgentQuery;
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {
+      model: 'claude-haiku-4-5',
+      effort: 'xhigh',
+    });
+
+    const rows = getUndeliveredMessages().filter((r: { kind: string }) => r.kind === 'chat');
+    // NOT 'haiku-4-5 · xhigh · 8.2k context' — the turn never ran at xhigh.
+    expect(JSON.parse(rows[0].content).subtext).toBe('haiku-4-5 · 8.2k context');
+  });
+
   it('does not stamp a send_file caption row', async () => {
     const { writeMessageOut, getUndeliveredMessages } = require('./db/messages-out.js');
     setTurnSettings('claude-opus-5[1m]', 'xhigh');
@@ -5571,7 +5641,16 @@ describe('status subtext — round-two regressions', () => {
       // made emitTurnEnd the wrong boundary.
       yield { type: 'result', text: '<message to="here">second</message>' };
     }
-    const query: AgentQuery = { push: () => {}, end: () => {}, events: events(), abort: () => {} };
+    // The provider names its resolved effort, as a real one does — the
+    // display no longer reads the requested value.
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {},
+      events: events(),
+      abort: () => {},
+      resolvedModel: 'claude-opus-5[1m]',
+      resolvedEffort: 'xhigh',
+    } as unknown as AgentQuery;
 
     await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {
       model: 'claude-opus-5[1m]',

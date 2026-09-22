@@ -3496,6 +3496,19 @@ export class ClaudeProvider implements AgentProvider {
       get resolvedModel() {
         return activeModel;
       },
+      // Live view of `activeEffort` — the effort that actually RAN, after the
+      // precedence chain (`-e` → group config → env override → family default,
+      // :2784) and the `clampEffortForModel` safety drop (:2788). A getter for
+      // the same reason as resolvedModel: applySettings reassigns it on a
+      // mid-stream retarget (:3559).
+      //
+      // The status subtext needs this, not the request: `querySettings.effort`
+      // holds USER INTENT only (the contract applyFlagBatch states at
+      // poll-loop.ts:3789), so a group carrying its effort in container.json
+      // requests nothing and a clamped turn requests something it never ran at.
+      get resolvedEffort() {
+        return activeEffort ?? null;
+      },
       abort: () => {
         aborted = true;
         stream.end();

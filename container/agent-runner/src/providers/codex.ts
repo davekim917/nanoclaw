@@ -1686,6 +1686,9 @@ export class CodexProvider implements AgentProvider {
       // names a model (`stickyConfig.model ?? CODEX_MODEL ?? DEFAULT_CODEX_MODEL`), so
       // there is no unknown case here.
       resolvedModel: effectiveModel,
+      // The effort the app-server was actually configured with, not the `-e`
+      // that asked for it — same value `turnEffort.effective` reports (:1239).
+      resolvedEffort: effectiveConfig.reasoning_effort ?? null,
       push: (message: string) => {
         // If a turn is in flight, steer it instead of queueing — the agent's
         // response can then reference the late-arriving content. Falls back
