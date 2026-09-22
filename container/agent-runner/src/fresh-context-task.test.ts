@@ -41,9 +41,9 @@ function insertRow(id: string, kind: 'task' | 'chat', content: object): void {
   getInboundDb()
     .prepare(
       `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
-       VALUES (?, ?, datetime('now'), 'pending', 'chan-1', 'discord', NULL, ?)`,
+       VALUES (?, ?, ?, 'pending', 'chan-1', 'discord', NULL, ?)`,
     )
-    .run(id, kind, JSON.stringify(content));
+    .run(id, kind, new Date().toISOString(), JSON.stringify(content));
 }
 
 async function runOneBatch(provider: RecordingProvider): Promise<void> {

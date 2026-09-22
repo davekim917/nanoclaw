@@ -4,7 +4,7 @@
  * starts with no resumed conversation, through the same reset `/clear` uses.
  *
  * Only a batch made entirely of flagged task rows qualifies, the same
- * conservative rule `quietStatus` follows (formatter.ts, `extractRouting`): any
+ * conservative rule `quietStatus` follows (formatter.ts:287-308): any
  * non-task row in the batch (a chat message, a wake, a recovery notice) is
  * input to the existing conversation, and resetting under it would drop the
  * memory that row was sent to. System rows (recall context) are ignored, as

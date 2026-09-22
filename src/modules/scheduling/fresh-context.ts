@@ -5,7 +5,8 @@
  * A series keeps ONE task session for its whole life
  * (`resolveTaskSession`, src/session-manager.ts:428-444), and the agent-runner
  * resumes that session's stored continuation on every batch
- * (container/agent-runner/src/poll-loop.ts, `migrateLegacyContinuation`). For a
+ * (container/agent-runner/src/poll-loop.ts:456, `migrateLegacyContinuation`;
+ * the only resets are rotation, :463-471, and /clear, :656-660). For a
  * watcher that keeps its state in files, the resumed conversation only grows
  * the context each fire pays for. The runner reads the flag
  * (container/agent-runner/src/fresh-context-task.ts); this side only
