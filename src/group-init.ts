@@ -114,11 +114,11 @@ const REQUIRED_SETTINGS: Record<string, unknown> = {
   // group's model now travels as NANOCLAW_CLAUDE_MODEL
   // (src/claude-spawn-defaults.ts).
   model: 'opus',
-  // Container agents deliver into chat threads, not a terminal — the default
-  // style's preamble/recap padding is pure noise there. Claude-only knob
-  // (Codex/OpenCode have no output-style concept); tone for those providers
-  // still comes from the CLAUDE.md voice slot.
-  outputStyle: 'Concise',
+  // Built-in "Proactive" style (act, don't ask; operator 2026-09-22, was
+  // "Concise"): container agents work unattended in chat threads. Claude-only
+  // knob (Codex/OpenCode have no output-style concept); tone for those
+  // providers still comes from the CLAUDE.md voice slot.
+  outputStyle: 'Proactive',
   // Every model call re-reads the skill listing (~6.8k tokens across ~100
   // skills, measured 2026-09-18). Zero-use bundled skills are hidden from the
   // agent but stay callable as `/name` (`user-invocable-only`); rarely used
