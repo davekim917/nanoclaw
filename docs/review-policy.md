@@ -37,8 +37,14 @@ does not relax required CI, holds, or merge authorization.
 The substitute, like every review (a delta check after a rebase or ratchet
 regeneration, adversarial verification, a gap analysis), runs on a frontier
 model: `claude-opus-5` on Claude, `gpt-5.6-sol` on Codex, both at `high`
-effort. Effort is a runtime setting — a native spawn's own field, or a scoped
-CLI invocation — never prompt wording. The allowed ids are the roster in
+effort, and `deepseek-v4.1-flash` on OpenCode. Effort is a runtime setting — a
+native spawn's own field, or a scoped CLI invocation — never prompt wording;
+`opencode run` has no effort flag at all (effort is per-model `options` in the
+opencode config, `container/agent-runner/src/providers/opencode.ts:779-784`),
+so on that pool the model id is the whole tier. `flash` in that id is the
+vendor's latency brand, not a capability tier — DeepSeek v4.1-flash is
+frontier-class here, the same way Gemini 3.8-flash is, while
+`gemini-3.5-flash-lite` is not. The allowed ids are the roster in
 `scripts/reviewer-models.ts` plus explicit
 receipt compatibility for prior `claude-fable-5-1` and `gpt-6-astra` reviewers.
 Those IDs remain accepted so unchanged exact-head evidence survives this

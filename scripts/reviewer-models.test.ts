@@ -15,12 +15,26 @@ import { assertConcreteModelId, computeReviewerModelIds, main, renderReviewerMod
 describe('computeReviewerModelIds', () => {
   it('lists the frontier models plus prior receipt compatibility, deduplicated and sorted', () => {
     const ids = computeReviewerModelIds();
-    expect(ids).toEqual(['claude-fable-5-1', 'claude-opus-5', 'gpt-5.6-sol', 'gpt-6-astra']);
+    expect(ids).toEqual([
+      'claude-fable-5-1',
+      'claude-opus-5',
+      'deepseek-v4.1-flash',
+      'gpt-5.6-sol',
+      'gpt-6-astra',
+    ]);
     expect(new Set(ids).size).toBe(ids.length);
     // Sanity: every id is non-empty and none is a cheap/fast/small tier's model.
+    //
+    // `flash` USED TO BE in this alternation and is deliberately not any more.
+    // It is a vendor's latency brand, not a capability tier: DeepSeek v4.1-flash
+    // and Gemini 3.8-flash are frontier-class, comparable to Opus and Sol, while
+    // `gemini-3.5-flash-lite` is not — and `lite` still catches that one. A
+    // substring of a marketing name is a poor proxy for capability, so the
+    // markers kept here are the ones that still name a genuinely smaller tier in
+    // this fleet's vocabulary (operator correction, 2026-09-22).
     for (const id of ids) {
       expect(id.length).toBeGreaterThan(0);
-      expect(id).not.toMatch(/sonnet|haiku|luna|terra|mini|nano|lite|flash/i);
+      expect(id).not.toMatch(/sonnet|haiku|luna|terra|mini|nano|lite/i);
     }
   });
 

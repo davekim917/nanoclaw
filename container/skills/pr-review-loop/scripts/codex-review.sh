@@ -2811,7 +2811,9 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
     # Reviewer eligibility is a tier rule, not prose: --reviewer's FIRST
     # whitespace-delimited token must name one of the models in
     # REVIEWER_MODELS_FILE (the frontier model for each vendor) —
-    # never a Sonnet/Haiku tier, Codex luna/terra, or a flash/mini model. Only
+    # never a Sonnet/Haiku tier, Codex luna/terra, or a mini/lite model. (Not
+    # "flash": that is a vendor latency brand, not a tier — OpenCode's
+    # frontier entry is `deepseek-v4.1-flash`. See docs/review-policy.md.) Only
     # that first token is read, so whatever follows it is free text and an
     # older receipt's parenthetical still passes. See docs/review-policy.md and
     # reviewer_model_allowed above.
