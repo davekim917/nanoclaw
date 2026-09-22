@@ -17,10 +17,16 @@ import { vocabFor } from '../../src/flag-parser.js';
 import { readVersionPin } from './version-pins.js';
 
 // Minimum codex-cli per model id, measured with `codex exec -m <id>` under
-// ChatGPT-account auth. Add a row when a default or alias moves to a new id.
+// ChatGPT-account auth. EVERY id the default or an alias can name needs a
+// row: a missing row fails the suite rather than skipping the check. For an
+// id whose true floor was never measured, the row is the oldest pin it is
+// known to run on (the fleet ran gpt-5.6-terra and gpt-6-astra on 0.154.0,
+// turn_usage 2026-09-22).
 const MIN_CODEX_CLI: Record<string, string> = {
   'gpt-6-sol': '0.155.1',
   'gpt-6-luna': '0.155.1',
+  'gpt-6-astra': '0.154.0',
+  'gpt-5.6-terra': '0.154.0',
 };
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -49,7 +55,8 @@ describe('the pinned codex-cli serves every Codex model the fleet defaults to', 
     ['alias astra', () => vocabFor('codex').resolveModel('astra')],
   ])('%s is served by the pinned codex-cli', (_label, id) => {
     const need = MIN_CODEX_CLI[id()];
-    if (need) expect(atLeast(pinned, need), `${id()} needs codex-cli >= ${need}, pinned ${pinned}`).toBe(true);
+    expect(need, `no MIN_CODEX_CLI row for ${id()}: measure it and add one`).toBeDefined();
+    expect(atLeast(pinned, need!), `${id()} needs codex-cli >= ${need}, pinned ${pinned}`).toBe(true);
   });
 
   it('refuses a pin below a model minimum (mutation guard)', () => {
