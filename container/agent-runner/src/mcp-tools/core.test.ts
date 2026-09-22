@@ -157,6 +157,36 @@ describe('send_message MCP tool — default replies in the current conversation'
     _resetConfig();
   });
 
+  // #1016: an agent correcting its own reply keeps the status line. The edit
+  // is stamped like the reply it replaces; an edit to a message in another
+  // conversation is not.
+  it('stamps an edit of the agent own reply, and not an edit elsewhere', async () => {
+    const ts = await import('../turn-status.js');
+    const { _setConfigForTest, _resetConfig } = await import('../config.js');
+    _resetConfig();
+    _setConfigForTest({});
+    ts.resetTurnStatus();
+    ts.setTurnSettings('claude-opus-5[1m]', 'high');
+    ts.setOwnConversation('slack', 'slack:CTEST00004');
+    ts.recordContextTokens(90_000);
+    ts._forgetOwnershipForTest();
+
+    await sendMessage.handler({ text: 'first draft' });
+    await sendMessage.handler({ to: 'operator', text: 'relayed' });
+    const [mine, relayed] = getUndeliveredMessages();
+
+    await editMessage.handler({ messageId: mine.seq, text: 'corrected' });
+    await editMessage.handler({ messageId: relayed.seq, text: 'relayed, corrected' });
+
+    const edits = getUndeliveredMessages()
+      .map((r) => JSON.parse(r.content))
+      .filter((c) => c.operation === 'edit');
+    expect(edits[0]).toMatchObject({ operation: 'edit', text: 'corrected', subtext: 'opus-5 · high · 90k context' });
+    expect(edits[1].subtext).toBeUndefined();
+    ts.resetTurnStatus();
+    _resetConfig();
+  });
+
   it('omitting `to` posts in the session thread, not the owner DM', async () => {
     await sendMessage.handler({ text: 'team-auto: build stage done' });
 
