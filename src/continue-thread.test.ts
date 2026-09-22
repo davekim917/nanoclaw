@@ -28,7 +28,7 @@ import { getRawDb } from './db/connection.js';
 import { resolveSession, resolveTaskSession } from './session-manager.js';
 import { outboundDbPath } from './mailbox/sqlite/paths.js';
 import { deliverSessionMessages, setDeliveryAdapter } from './delivery.js';
-import { archiveMessage } from './message-archive.js';
+import { archiveHasThread, archiveMessage } from './message-archive.js';
 import { continueThreadCandidate } from './continue-thread.js';
 import { log } from './log.js';
 
@@ -82,6 +82,23 @@ function insertChat(sessionId: string, msgId: string, content: Record<string, un
      VALUES (?, ?, 'chat', 'telegram:123', 'telegram', NULL, ?, ?)`,
   ).run(msgId, ts, `fire-${msgId}`, JSON.stringify(content));
   db.close();
+}
+
+function archiveRow(channelType: string, platformId: string, threadId: string): void {
+  archiveMessage({
+    id: `arch-${channelType}-${threadId}`,
+    agentGroupId: 'ag-1',
+    messagingGroupId: null,
+    channelType,
+    channelName: null,
+    platformId,
+    threadId,
+    role: 'user',
+    senderId: null,
+    senderName: 'operator',
+    text: 'the work in flight',
+    sentAt: now(),
+  });
 }
 
 function keyRows(): Array<{ thread_key: string; thread_platform_id: string }> {
@@ -204,6 +221,23 @@ describe('delivery — continueThread adopts an existing thread for a new key', 
 
     expect(calls).toEqual([{ threadId: 'telegram:123:thr-archived' }]);
     expect(keyRows()).toEqual([{ thread_key: 'topic-a', thread_platform_id: 'thr-archived' }]);
+  });
+
+  it('adopts a thread archived only by a sibling bot on the same conversation (pooled channel family)', async () => {
+    archiveRow('telegram-codex', 'telegram:123', 'telegram:123:thr-sibling');
+    const session = await taskSession();
+    insertChat(session.id, 'out-1', { text: 'topic', threadKey: 'topic-a', continueThread: 'thr-sibling' });
+    const calls = recordingAdapter();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: 'telegram:123:thr-sibling' }]);
+  });
+
+  it('archiveHasThread keeps exact channel_type matching for an unprefixed native id', () => {
+    archiveRow('native-cloud', '5550001', '5550001:thr-x');
+    expect(archiveHasThread('native-cloud', '5550001', '5550001:thr-x')).toBe(true);
+    expect(archiveHasThread('native', '5550001', '5550001:thr-x')).toBe(false);
   });
 
   it('a second post under the key threads into the adopted thread', async () => {
