@@ -101,6 +101,7 @@ import type {
 import { autoCommitDirtyWorktrees, type AutoSaveResult } from './worktree-autosave.js';
 import { buildSessionRecap, wrapRecap } from './session-recap.js';
 import { ensureFreshContextBootstrap } from './memory/bootstrap.js';
+import { isFreshContextTaskBatch } from './fresh-context-task.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -795,6 +796,14 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
+    // A --fresh-context series starts each fire with no resumed conversation —
+    // the /clear reset above, without its chat notice (fresh-context-task.ts).
+    if (continuation !== undefined && isFreshContextTaskBatch(keep)) {
+      log('Fresh-context task fire: not resuming the stored session');
+      continuation = undefined;
+      resetProviderContext(config.providerName);
+      freshContextBootstrapRequired = true;
+    }
     const formattedPrompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
     const prompt = freshContextBootstrapRequired ? ensureFreshContextBootstrap(formattedPrompt) : formattedPrompt;
     freshContextBootstrapRequired = false;

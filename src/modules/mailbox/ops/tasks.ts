@@ -109,6 +109,8 @@ export interface TaskUpdate {
   /** false = never glue this series' channel posts into a rolling day-thread (one-thread-per-item series). */
   threadAnchor?: boolean;
   quietStatus?: boolean;
+  /** true = each scheduled fire starts with no resumed conversation (modules/scheduling/fresh-context.ts). */
+  freshContext?: boolean;
   recurrence?: string | null;
   processAfter?: string;
   /**
@@ -177,6 +179,7 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
     update.scriptHost !== undefined ||
     update.threadAnchor !== undefined ||
     update.quietStatus !== undefined ||
+    update.freshContext !== undefined ||
     update.flagIntent !== undefined ||
     update.chatLimit !== undefined;
 
@@ -215,6 +218,7 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
         if (invalidatesScriptOutput) delete parsed.scriptOutput;
         if (update.threadAnchor !== undefined) parsed.threadAnchor = update.threadAnchor;
         if (update.quietStatus !== undefined) parsed.quietStatus = update.quietStatus;
+        if (update.freshContext !== undefined) parsed.freshContext = update.freshContext;
         if (update.flagIntent !== undefined) {
           // Merge, don't replace: a model-only change keeps an existing effort
           // pin (and vice versa). A `null` axis is the exception — it DELETES
