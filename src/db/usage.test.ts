@@ -9,6 +9,12 @@ import {
   pruneOldTurnUsage,
   summarizeTurnUsage,
 } from './usage.js';
+import {
+  CLAUDE_USAGE_TRUSTED_FROM,
+  isUntrustedTurnUsage,
+  UNTRUSTED_USAGE_NOTE,
+  untrustedTurnUsageSql,
+} from './usage-trust.js';
 import { listTurnUsageSince } from '../modules/mailbox/ops/reads.js';
 
 /**
@@ -70,12 +76,15 @@ function insertTurn(
   // `??` would treat an explicit `null` (the NULL-column test case) the same
   // as "not provided" and silently fall back to the default — check `undefined`
   // specifically so a deliberate null in the fixture reaches the INSERT as NULL.
+  // The default date sits after the #1061 cutoff (./usage-trust.ts): these
+  // cases test rollup arithmetic, and a Claude row inside the untrusted
+  // window reads back as the note, not a figure — that has its own describe.
   const withDefault = <T>(v: T | null | undefined, fallback: T): T | null => (v === undefined ? fallback : v);
   db.prepare(
     `INSERT INTO turn_usage (ts, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
      VALUES (@ts, @provider, @model, @input_tokens, @output_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd)`,
   ).run({
-    ts: withDefault(row.ts, '2026-08-10T12:00:00.000Z'),
+    ts: withDefault(row.ts, '2026-10-10T12:00:00.000Z'),
     provider: withDefault(row.provider, 'claude'),
     model: withDefault(row.model, 'opus'),
     input_tokens: withDefault(row.input_tokens, 100),
@@ -103,9 +112,9 @@ describe('rollupSessionUsage', () => {
 
   it('aggregates turn_usage rows into usage_daily, additive by (date, group, provider, model)', async () => {
     const outDb = makeOutboundDb();
-    insertTurn(outDb, { ts: '2026-08-10T01:00:00.000Z' });
-    insertTurn(outDb, { ts: '2026-08-10T23:00:00.000Z' });
-    insertTurn(outDb, { ts: '2026-08-11T01:00:00.000Z', provider: 'codex', model: 'gpt-5' });
+    insertTurn(outDb, { ts: '2026-10-10T01:00:00.000Z' });
+    insertTurn(outDb, { ts: '2026-10-10T23:00:00.000Z' });
+    insertTurn(outDb, { ts: '2026-10-11T01:00:00.000Z', provider: 'codex', model: 'gpt-5' });
 
     const rolled = await rollup(outDb);
     expect(rolled).toBe(3);
@@ -113,7 +122,7 @@ describe('rollupSessionUsage', () => {
     const rows = await listUsageDaily({ agentGroupId: GID });
     expect(rows).toHaveLength(2);
 
-    const day1 = rows.find((r) => r.date === '2026-08-10' && r.provider === 'claude')!;
+    const day1 = rows.find((r) => r.date === '2026-10-10' && r.provider === 'claude')!;
     expect(day1.turns).toBe(2);
     expect(day1.input_tokens).toBe(200);
     expect(day1.output_tokens).toBe(100);
@@ -123,7 +132,7 @@ describe('rollupSessionUsage', () => {
     expect(day1.model).toBe('opus');
     expect(day1.cost_applicable).toBe(true);
 
-    const day2 = rows.find((r) => r.date === '2026-08-11' && r.provider === 'codex')!;
+    const day2 = rows.find((r) => r.date === '2026-10-11' && r.provider === 'codex')!;
     expect(day2.turns).toBe(1);
     expect(day2.model).toBe('gpt-5');
     // Codex's app-server has no per-token cost field (ChatGPT-plan/subscription
@@ -442,7 +451,11 @@ describe('summarizeTurnUsage', () => {
   });
   afterEach(() => closeDb());
 
-  /** Insert one central turn_usage row. `turnId` null models a pre-migration-061 container. */
+  /**
+   * Insert one central turn_usage row. `turnId` null models a pre-migration-061
+   * container. The default date is after the #1061 cutoff so aggregation cases
+   * sum; the untrusted window is covered in its own describe below.
+   */
   function central(row: {
     ts?: string;
     group?: string;
@@ -463,7 +476,7 @@ describe('summarizeTurnUsage', () => {
          VALUES (@ts, @session, @group, @provider, @model, @turn_id, @effort, @input, @output, @cache_read, @cache_write, @cost)`,
       )
       .run({
-        ts: row.ts ?? '2026-08-24T12:00:00.000Z',
+        ts: row.ts ?? '2026-10-01T12:00:00.000Z',
         session: row.session ?? 'sess-1',
         group: row.group ?? 'ag-a',
         provider: row.provider ?? 'claude',
@@ -577,5 +590,93 @@ describe('summarizeTurnUsage', () => {
     const rows = await summarizeTurnUsage({ days: 7 });
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ group: 'TOTAL', turns: 0, cache_read_tokens: 0, cache_read_per_turn: 0 });
+  });
+});
+
+/**
+ * #1061: every Claude row before the cutoff in ./usage-trust.ts carries wrong
+ * cost AND wrong tokens. Readers must say so instead of showing a figure — a
+ * zero or a stored sum there is exactly the number nobody may quote.
+ */
+describe('untrusted Claude usage window (#1061)', () => {
+  beforeEach(async () => {
+    await initTestDb();
+    runMigrations(getRawDb());
+    await createAgentGroup({
+      id: GID,
+      name: 'usage',
+      folder: 'usage',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+  });
+  afterEach(() => closeDb());
+
+  it('ncl usage list: a Claude day inside the window shows the note, never a figure', async () => {
+    const outDb = makeOutboundDb();
+    // The live shape: a running total booked as one turn's cost.
+    insertTurn(outDb, { ts: '2026-09-22T11:08:22.000Z', cost_usd: 125.38 });
+    insertTurn(outDb, { ts: '2026-09-23T01:00:00.000Z', cost_usd: 0.14 });
+    insertTurn(outDb, { ts: '2026-09-01T01:00:00.000Z', provider: 'codex', model: 'gpt-5', cost_usd: null });
+    await rollup(outDb);
+
+    const byDay = new Map((await listUsageDaily({ agentGroupId: GID })).map((r) => [`${r.date}/${r.provider}`, r]));
+    expect(byDay.get('2026-09-22/claude')).toMatchObject({
+      turns: 1,
+      input_tokens: null,
+      output_tokens: null,
+      cache_read_tokens: null,
+      cache_write_tokens: null,
+      cost_usd: null,
+      untrusted: UNTRUSTED_USAGE_NOTE,
+    });
+    expect(byDay.get('2026-09-23/claude')).toMatchObject({ cost_usd: 0.14, input_tokens: 100, untrusted: null });
+    // Codex never went through the defective path: its figures stand.
+    expect(byDay.get('2026-09-01/codex')).toMatchObject({ input_tokens: 100, untrusted: null });
+  });
+
+  it('ncl usage summary: untrusted rows are counted, never summed, and an all-untrusted bucket has no figure', async () => {
+    const central = (ts: string, session: string, turnId: string, cost: number, provider = 'claude'): void => {
+      getRawDb()
+        .prepare(
+          `INSERT INTO turn_usage (ts, session_id, agent_group_id, provider, model, turn_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+           VALUES (?, ?, 'ag-a', ?, 'claude-opus-5', ?, 2, 200, 243000, 700, ?)`,
+        )
+        .run(ts, session, provider, turnId, cost);
+    };
+    central('2026-09-22T11:08:22.000Z', 'sess-old', 't-old', 125.38);
+    central('2026-09-22T19:00:00.000Z', 'sess-new', 't-new', 0.14);
+    central('2026-09-01T00:00:00.000Z', 'sess-cx', 't-cx', 0, 'codex');
+
+    const rows = await summarizeTurnUsage({ dimensions: ['session'] });
+    const total = rows.at(-1)!;
+    expect(total).toMatchObject({ session: 'TOTAL', turns: 3, trusted_turns: 2, untrusted_rows: 1 });
+    expect(total.cost_usd).toBe(0.14); // 125.52 if the running total leaked in
+    expect(total.cache_read_tokens).toBe(486_000);
+    expect(total.cache_read_per_turn).toBe(243_000);
+    expect(String(total.untrusted)).toContain(UNTRUSTED_USAGE_NOTE);
+
+    const old = rows.find((r) => r.session === 'sess-old')!;
+    expect(old).toMatchObject({ turns: 1, trusted_turns: 0, untrusted_rows: 1 });
+    for (const key of ['cost_usd', 'input_tokens', 'cache_read_tokens', 'cache_read_per_turn']) {
+      expect(old[key]).toBeNull();
+    }
+    expect(rows.find((r) => r.session === 'sess-new')).toMatchObject({ cost_usd: 0.14, untrusted: null });
+  });
+
+  it('the JS and SQL predicates agree at the cutoff instant', () => {
+    const justBefore = new Date(Date.parse(CLAUDE_USAGE_TRUSTED_FROM) - 1).toISOString();
+    expect(isUntrustedTurnUsage('claude', justBefore)).toBe(true);
+    expect(isUntrustedTurnUsage('claude', CLAUDE_USAGE_TRUSTED_FROM)).toBe(false);
+    expect(isUntrustedTurnUsage('codex', justBefore)).toBe(false);
+    const sql = (ts: string, provider = 'claude'): number =>
+      (
+        getRawDb()
+          .prepare(`SELECT ${untrustedTurnUsageSql()} AS u FROM (SELECT ? AS provider, ? AS ts)`)
+          .get(provider, ts) as { u: number }
+      ).u;
+    expect(sql(justBefore)).toBe(1);
+    expect(sql(CLAUDE_USAGE_TRUSTED_FROM)).toBe(0);
+    expect(sql(justBefore, 'codex')).toBe(0);
   });
 });

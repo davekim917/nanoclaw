@@ -375,6 +375,35 @@ describe('workgroupUsageHandler', () => {
     expect(body.usage.map((r) => r.agent_group_id).sort()).toEqual(['ag-1', 'ag-2']);
     expect(body.usage.every((r) => r.turns !== 99 && r.turns !== 42)).toBe(true);
   });
+
+  it('a Claude day inside the #1061 window reaches the dashboard as the note, never a figure', async () => {
+    // Pinned clock: the handler's default window counts back from now, and
+    // these dates must stay inside it however late the suite runs.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-24T12:00:00.000Z'));
+    try {
+      addUsage({ date: '2026-09-22', agent_group_id: 'ag-1', cost_usd: 125.38, cache_read_tokens: 243_000 });
+      addUsage({ date: '2026-09-23', agent_group_id: 'ag-1', cost_usd: 0.14, cache_read_tokens: 243_000 });
+
+      const res = (await workgroupUsageHandler(
+        makeReq('http://localhost/dashboard/api/workgroup/wg-1/usage'),
+        { id: 'wg-1' },
+        makeCtx({ no_filter: true }),
+      ))!;
+      const body = (await res.json()) as {
+        usage: { date: string; cost_usd: number | null; cache_read_tokens: number | null; untrusted: string | null }[];
+      };
+      const byDate = new Map(body.usage.map((r) => [r.date, r]));
+      expect(byDate.get('2026-09-22')).toMatchObject({
+        cost_usd: null,
+        cache_read_tokens: null,
+        untrusted: 'untrusted, see #1061',
+      });
+      expect(byDate.get('2026-09-23')).toMatchObject({ cost_usd: 0.14, cache_read_tokens: 243_000, untrusted: null });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('workgroupClaimsHandler', () => {

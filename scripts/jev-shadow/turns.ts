@@ -24,6 +24,8 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
+import { CLAUDE_USAGE_TRUSTED_FROM, isUntrustedTurnUsage, UNTRUSTED_USAGE_NOTE } from '../../src/db/usage-trust.js';
+
 export const ROOT = process.env.NANOCLAW_ROOT ?? '/home/ubuntu/nanoclaw-v2';
 
 /**
@@ -124,7 +126,7 @@ export function loadTurns(opts: {
   folders?: Set<string>;
   maxChars?: number;
   raw?: boolean;
-}): { turns: TurnRecord[]; skippedOutOfFocus: number; missingSession: number } {
+}): { turns: TurnRecord[]; skippedOutOfFocus: number; missingSession: number; untrustedCost: number } {
   const maxChars = opts.maxChars ?? 3000;
   const central = new Database(path.join(ROOT, 'data', 'v2.db'), { readonly: true, fileMustExist: true });
   const rows = central
@@ -143,6 +145,7 @@ export function loadTurns(opts: {
   const turns: TurnRecord[] = [];
   let skippedOutOfFocus = 0;
   let missingSession = 0;
+  let untrustedCost = 0;
   let prevSession = '';
   let prevStartMs = 0;
 
@@ -160,6 +163,14 @@ export function loadTurns(opts: {
     const windowHi = iso(startMs + START_SLACK_MS);
     prevStartMs = startMs;
 
+    // After the window bookkeeping above, like the other skips, so the next
+    // turn's attribution window still starts where this one did. Every report
+    // here sums cost_usd, and inside the #1061 window that column is not a
+    // figure — the turn is dropped, not zeroed, and counted below.
+    if (isUntrustedTurnUsage(String(r.provider), ts)) {
+      untrustedCost += 1;
+      continue;
+    }
     if (opts.folders && !opts.folders.has(folder)) continue;
     if (opts.scope === 'focus' && !FOCUS_WORKGROUPS.has(String(r.workgroup ?? ''))) {
       skippedOutOfFocus += 1;
@@ -208,5 +219,10 @@ export function loadTurns(opts: {
       logs: written.filter((w) => w.kind === 'task_log').map((w) => text(w.content).slice(0, maxChars)),
     });
   }
-  return { turns, skippedOutOfFocus, missingSession };
+  if (untrustedCost > 0) {
+    console.error(
+      `jev-shadow: ${untrustedCost} Claude turn(s) before ${CLAUDE_USAGE_TRUSTED_FROM} left out — cost_usd there is ${UNTRUSTED_USAGE_NOTE}`,
+    );
+  }
+  return { turns, skippedOutOfFocus, missingSession, untrustedCost };
 }

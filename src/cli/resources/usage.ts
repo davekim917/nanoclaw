@@ -44,6 +44,16 @@ registerResource({
         '(e.g. Codex — ChatGPT-plan/subscription billing, no per-token cost field). When false, cost_usd is ' +
         'always 0 and carries no cost signal; use input_tokens/output_tokens as the spend proxy instead.',
     },
+    {
+      name: 'untrusted',
+      type: 'string',
+      generated: true,
+      description:
+        'Computed, not stored: set for a Claude row dated on/before the #1061 cutoff (src/db/usage-trust.ts), ' +
+        'whose token and cost columns are then null. Those stored sums are wrong in both directions — ' +
+        'cumulative cost booked as one turn, and tokens missing subagents — so no figure is given. For spend ' +
+        'in that window, price the session transcripts.',
+    },
   ],
   operations: {},
   customOperations: {
@@ -74,6 +84,9 @@ registerResource({
         'The last row is TOTAL. It is queried WITHOUT the grouping, not summed from the rows above it:\n' +
         'with `--by model` (or any dimension one turn can straddle) a turn appears in several buckets, so\n' +
         'the buckets deliberately add up to more than the total.\n\n' +
+        'Claude rows before the #1061 cutoff are counted in `turns` and `untrusted_rows` but never summed:\n' +
+        'their stored cost and tokens are wrong. Token/cost/per-turn columns cover `trusted_turns` only, and\n' +
+        'a bucket with no trusted rows shows null there, with the note in `untrusted`.\n\n' +
         'The ledger is pruned at 30 days, so `--since`/`--days` beyond that return only what survives.',
       args: [
         {
