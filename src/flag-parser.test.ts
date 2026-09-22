@@ -400,10 +400,13 @@ describe('provider-aware vocabulary (codex)', () => {
   });
 
   it.each([
-    ['luna', 'gpt-5.6-luna'],
+    ['luna', 'gpt-6-luna'],
     ['terra', 'gpt-5.6-terra'],
-    ['sol', 'gpt-5.6-sol'],
+    ['sol', 'gpt-6-sol'],
     ['astra', 'gpt-6-astra'],
+    ['gpt6-sol', 'gpt-6-sol'],
+    ['gpt6-luna', 'gpt-6-luna'],
+    ['gpt5.6-sol', 'gpt-5.6-sol'],
     ['gpt6-astra', 'gpt-6-astra'],
     ['gpt-6-astra', 'gpt-6-astra'],
   ])('resolves Codex model %s for sticky and turn overrides', (alias, model) => {

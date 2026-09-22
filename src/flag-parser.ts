@@ -214,12 +214,17 @@ const CODEX_MODEL_ALIAS_MAP: Record<string, string> = {
   'gpt5.6-terra': 'gpt-5.6-terra',
   'gpt5.6-luna': 'gpt-5.6-luna',
   'gpt6-astra': 'gpt-6-astra',
-  // Friendly family names used by the channel-config MCP tool. Store the
-  // fully-qualified id so the Codex provider's gpt-* guard remains the final
-  // authority at app-server startup.
-  sol: 'gpt-5.6-sol',
+  'gpt6-sol': 'gpt-6-sol',
+  'gpt6-luna': 'gpt-6-luna',
+  // Friendly family names used by the channel-config MCP tool: each names the
+  // NEWEST model of that family (GPT-6 Sol/Luna GA 2026-09-22; Terra has no
+  // GPT-6 release). They resolve when the value is written, so a pin stores
+  // the fully-qualified id and the Codex provider's gpt-* guard remains the
+  // final authority at app-server startup — a stored pin does not follow a
+  // later bump of the alias.
+  sol: 'gpt-6-sol',
   terra: 'gpt-5.6-terra',
-  luna: 'gpt-5.6-luna',
+  luna: 'gpt-6-luna',
   astra: 'gpt-6-astra',
 };
 
@@ -262,7 +267,7 @@ const CLAUDE_VOCAB: ProviderFlagVocab = {
 const CODEX_VOCAB: ProviderFlagVocab = {
   resolveModel: (raw) => CODEX_MODEL_ALIAS_MAP[raw.toLowerCase()] ?? raw.toLowerCase(),
   isValidModel: (resolved) => CODEX_VALID_MODEL_RE.test(resolved),
-  modelHint: ' (codex models look like gpt-6-astra, gpt-5.5; aliases: luna|terra|sol|astra)',
+  modelHint: ' (codex models look like gpt-6-sol, gpt-5.5; aliases: luna|terra|sol|astra)',
   validEfforts: CODEX_VALID_EFFORT,
   effortHint: 'low|medium|high|xhigh|max|ultra',
   allowsUltracode: false,

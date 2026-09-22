@@ -58,7 +58,7 @@ export const setChannelModelTool: McpToolDefinition = {
   tool: {
     name: 'set_channel_model',
     description:
-      'Set the default model for a specific channel (messaging group) wired to this agent. When an authorized user directly asks to change this channel default, call this tool immediately; do NOT preflight with `list_models`, `list_access`, or `change_model`. The host validates the requested value for this agent provider and replies with the authoritative outcome. Applies to every future turn on that channel unless the user passes `-m <model>` explicitly. Mutates messaging_group_agents.default_model. Claude models accept family aliases such as `opus`, `sonnet`, `haiku`, and `fable`; Codex models accept `luna`, `terra`, `sol`, or full `gpt-*` ids (for example `gpt-5.6-luna`); OpenCode Zen models use slugs such as `opencode/deepseek-v4-flash-free`. Pass model=null to clear the per-channel override and fall back to the agent / host defaults. Admin-only.',
+      'Set the default model for a specific channel (messaging group) wired to this agent. When an authorized user directly asks to change this channel default, call this tool immediately; do NOT preflight with `list_models`, `list_access`, or `change_model`. The host validates the requested value for this agent provider and replies with the authoritative outcome. Applies to every future turn on that channel unless the user passes `-m <model>` explicitly. Mutates messaging_group_agents.default_model. Claude models accept family aliases such as `opus`, `sonnet`, `haiku`, and `fable`; Codex models accept `luna`, `terra`, `sol`, or full `gpt-*` ids (for example `gpt-6-luna`); OpenCode Zen models use slugs such as `opencode/deepseek-v4-flash-free`. Pass model=null to clear the per-channel override and fall back to the agent / host defaults. Admin-only.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -69,7 +69,7 @@ export const setChannelModelTool: McpToolDefinition = {
         model: {
           type: ['string', 'null'],
           description:
-            'Model to pin. Use a provider-valid id or alias (`luna` / `gpt-5.6-luna` for Codex, `opencode/deepseek-v4-flash-free` for OpenCode Zen). Pass null to clear the per-channel override.',
+            'Model to pin. Use a provider-valid id or alias (`luna` / `gpt-6-luna` for Codex, `opencode/deepseek-v4-flash-free` for OpenCode Zen). Pass null to clear the per-channel override.',
         },
       },
       required: ['model'],

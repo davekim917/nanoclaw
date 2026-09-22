@@ -407,17 +407,16 @@ export function materializeRawImageGeneration(
 // the query/session. Per-turn overrides for these fields are not currently
 // exposed by Codex's `thread/start` shape.
 /**
- * The unpinned Codex fleet default: gpt-5.6-sol at `high` reasoning (operator
- * decision 2026-09-16, replacing gpt-5.6-terra at `xhigh`). It matches the
- * Claude side's Opus-at-high baseline, so a group's provider decides what runs
- * it, not what tier it runs at.
+ * The unpinned Codex fleet default: gpt-6-sol at `high` reasoning (operator
+ * decision 2026-09-22, replacing gpt-5.6-sol; gpt-5.6-terra at `xhigh` before
+ * 2026-09-16). Keep it equal to the `sol` alias in src/flag-parser.ts.
  *
  * These are the ONLY fleet defaults for Codex. A group pins with
  * `providerConfig.model`/`reasoning_effort` in container.json, or
  * `ncl groups config update --model/--effort`, and a pin always wins — nothing
  * here rewrites one.
  */
-export const DEFAULT_CODEX_MODEL = 'gpt-5.6-sol';
+export const DEFAULT_CODEX_MODEL = 'gpt-6-sol';
 export const DEFAULT_CODEX_EFFORT = 'high' as const;
 
 export const codexConfigSchema = z.strictObject({
