@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { log } from './log.js';
+import { log, LOG_STAMP_RE, parseLogStamp } from './log.js';
 
 // ts() itself isn't exported — the log line prefix is the observable contract,
 // so we capture it the way a real reader (host-health.ts, clidash) would: off
@@ -36,11 +36,58 @@ describe('log line timestamp prefix', () => {
     log.info('hello');
 
     expect(calls).toHaveLength(1);
-    const match = calls[0]!.match(/^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\]/);
+    const match = calls[0]!.match(LOG_STAMP_RE);
     expect(match).not.toBeNull();
     expect(match![1]).toBe('2026-01-15 14:09:07.042');
     // The naive UTC hour (19) must not leak in — this is what would happen
     // if ts() regressed to getUTCHours()/toISOString() style formatting.
     expect(match![1]).not.toContain('19:09:07');
+  });
+
+  it('carries the numeric UTC offset, so the instant survives a foreign reader', () => {
+    log.info('hello');
+
+    const match = calls[0]!.match(LOG_STAMP_RE);
+    expect(match![2]).toBe('-05:00');
+    // The whole point: recovered WITHOUT reference to the reader's own zone.
+    const parsed = parseLogStamp(match![1], match![2]);
+    expect(parsed).toEqual({ ms: Date.parse('2026-01-15T19:09:07.042Z'), exact: true });
+  });
+});
+
+describe('parseLogStamp', () => {
+  it('resolves an offset stamp to one instant regardless of reader TZ', () => {
+    const expected = Date.parse('2026-01-15T19:09:07.042Z');
+    const originalTz = process.env.TZ;
+    try {
+      for (const tz of ['UTC', 'America/New_York', 'Asia/Tokyo', 'Asia/Kolkata']) {
+        process.env.TZ = tz;
+        expect(parseLogStamp('2026-01-15 14:09:07.042', '-05:00')).toEqual({
+          ms: expected,
+          exact: true,
+        });
+      }
+    } finally {
+      if (originalTz === undefined) delete process.env.TZ;
+      else process.env.TZ = originalTz;
+    }
+  });
+
+  it('flags an offset-less (pre-change) stamp as inexact rather than guessing', () => {
+    const parsed = parseLogStamp('2026-01-15 14:09:07.042');
+    expect(parsed?.exact).toBe(false);
+    // Best-effort local reading — the same value the pre-change code produced,
+    // which is all that is recoverable once the offset was never written.
+    expect(parsed?.ms).toBe(new Date(2026, 0, 15, 14, 9, 7, 42).getTime());
+  });
+
+  it('returns null for a malformed stamp instead of NaN', () => {
+    expect(parseLogStamp('not-a-stamp')).toBeNull();
+    expect(parseLogStamp('2026-13-99 99:99:99.999')).toBeNull();
+  });
+
+  it('matches both shapes, so 30 days of rotated logs keep parsing', () => {
+    expect('[2026-01-15 14:09:07.042] INFO x'.match(LOG_STAMP_RE)?.[2]).toBeUndefined();
+    expect('[2026-01-15 14:09:07.042-05:00] INFO x'.match(LOG_STAMP_RE)?.[2]).toBe('-05:00');
   });
 });

@@ -804,7 +804,7 @@
 "src/install-slug.ts":{"diff":15,"mode":"100644","sha256":"5b3ae522722aaceaf03d90f6e804ea487ac90612ad96bd4dcbb70c696a4abc58"},
 "src/liveness.test.ts":{"diff":25,"mode":"100644","sha256":null,"deleted":true},
 "src/liveness.ts":{"diff":38,"mode":"100644","sha256":null,"deleted":true},
-"src/log.ts":{"diff":48,"mode":"100644","sha256":"7a08977a67003726d2d3820f0a90c7b9836367358b46d9b5e89cde701aa63d57"},
+"src/log.ts":{"diff":133,"mode":"100644","sha256":"9dafbc1109de09327a439bb83203336c5f57a7983fa8a127e8f407078c50cf9d"},
 "src/mailbox/compose.ts":{"diff":4,"mode":"100644","sha256":"5f52cbb63a4777c3d063ba7700affbf4017e53c5b4256528f9f621fbb5675ae5"},
 "src/mailbox/index.ts":{"diff":0,"mode":"100644","sha256":"17ae8da9c7b266144485f09c7e0095520901afc435717c986840ccfb8840c9a3"},
 "src/mailbox/model.test.ts":{"diff":0,"mode":"100644","sha256":"ea459e8e5ea26ba0a009b53d315fcabfd2e314af393b3ed323232942799785ab"},
