@@ -17,15 +17,28 @@ import { recordContextTokens } from '../turn-status.js';
 /**
  * Tokens occupying the context window, from one assistant message's `tokens`.
  *
- * OPENCODE FOLLOWS ANTHROPIC'S CONVENTION, NOT OPENAI'S — `input` and
- * `cache.read` are DISJOINT, so occupancy is their sum plus any cache write.
- * The measurement in `sumOpenCodeTurnUsage`'s header settles it rather than
- * leaving it to inference: over one real session the per-message `input`
- * summed to 325,382 while `cache.read` summed to 1,927,040, which is
- * impossible if the cached figure were a subset of the input one.
+ * `input`, `cache.read` and `cache.write` are DISJOINT FOR EVERY UPSTREAM, so
+ * occupancy is their sum — including when OpenCode fronts an OpenAI model,
+ * whose raw usage reports cached tokens as a SUBSET of input.
  *
- * Contrast providers/codex.ts, where cached input IS a subset and this same
- * sum would double-count the cached prefix.
+ * The reason is OpenCode's own normalization, not the upstream's convention.
+ * OpenCode 1.18.31 (the pin, container/Dockerfile `ARG OPENCODE_VERSION`)
+ * builds `tokens` in `Session.getUsage`
+ * (packages/opencode/src/session/session.ts, tag v1.18.31): AI SDK v6 reports
+ * `inputTokens` INCLUDING cached tokens for every provider, and getUsage sets
+ * `input = inputTokens - cacheRead - cacheWrite` unconditionally. Those
+ * normalized tokens are what the assistant message carries
+ * (`ctx.assistantMessage.tokens = usage.tokens`, session/processor.ts), and
+ * that message is what `message.updated` delivers here. So the sum
+ * reconstitutes the full prompt on any upstream.
+ *
+ * #1015 suspected a double count on GPT-backed models and was closed on this
+ * evidence. The one-session measurement in `sumOpenCodeTurnUsage`'s header
+ * agrees but only covers an Anthropic upstream; the source above is what
+ * covers the rest. Re-read getUsage on any OPENCODE_VERSION bump — a release
+ * that stopped subtracting would make this sum double-count the cached prefix,
+ * as it would against raw OpenAI usage (contrast providers/codex.ts, which
+ * reads the app-server's raw counters and must not add them).
  *
  * Returns 0 when there is nothing usable, which `recordContextTokens` ignores
  * — a message with no token report leaves the previous reading standing
