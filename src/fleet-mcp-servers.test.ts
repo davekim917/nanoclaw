@@ -252,7 +252,7 @@ describe('the file:line citations in this PR\u2019s comments', () => {
     },
     {
       file: 'src/container-runner.ts',
-      line: 4878,
+      line: 4879,
       contains: "containerPath: '/workspace/agent/container.json'",
       citedBy: 'genericMcpUseFor — the agent already reads this file',
     },
