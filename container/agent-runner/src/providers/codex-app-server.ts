@@ -500,6 +500,62 @@ export async function probeCodexThreadHealth(
   };
 }
 
+/** One subagent thread, as the status subtext needs it. */
+export interface CodexSubagentThread {
+  id: string;
+  model: string | null;
+  effort: string | null;
+}
+
+/**
+ * List the child threads a turn's subagents ran in, with the model and effort
+ * each was configured with.
+ *
+ * Codex models a subagent as its own THREAD — `SubAgentActivityItem` carries
+ * only `{id, kind, agent_thread_id, agent_path}`, and the model/effort live on
+ * the thread record it points at. `thread/list` with `ancestorThreadId` is the
+ * same non-mutating call the liveness probe already makes; this one keeps the
+ * fields that probe discards.
+ *
+ * HONEST LABEL: `model` and `reasoning_effort` are the thread's CONFIGURED
+ * values. Codex's own protocol comment calls them "current configured … when
+ * loaded, otherwise the latest persisted", and says explicitly: "This is not
+ * per-turn execution telemetry." So this answers "what was this worker set to
+ * run at" — what the Codex desktop app shows when you click a subagent — and
+ * not "what did each of its requests observably use". Claude's side of this
+ * feature reads an observed model; the difference is real and is why the two
+ * capture sites do not share a helper.
+ *
+ * Returns [] rather than throwing: a roster is decoration, and a failed list
+ * must never take down the turn that was about to report its own success.
+ */
+export async function readCodexSubagentThreads(
+  server: AppServer,
+  threadId: string,
+  timeoutMs: number,
+): Promise<CodexSubagentThread[]> {
+  try {
+    const response = await sendCodexRequest(server, 'thread/list', { ancestorThreadId: threadId, limit: 100 }, timeoutMs);
+    if (response.error) return [];
+    const result = response.result as
+      | { data?: Array<Record<string, unknown>>; threads?: Array<Record<string, unknown>> }
+      | undefined;
+    const threads = result?.data ?? result?.threads ?? [];
+    const text = (value: unknown): string | null => (typeof value === 'string' && value.trim() ? value : null);
+    return threads
+      .map((thread) => ({
+        id: text(thread.id) ?? '',
+        model: text(thread.model),
+        // snake_case on the wire; the generated TS schema camelCases it, and
+        // which one arrives depends on the app-server build, so read both.
+        effort: text(thread.reasoning_effort) ?? text(thread.reasoningEffort),
+      }))
+      .filter((thread) => thread.id !== '');
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Pull the account's rate-limit snapshot — the Codex counterpart of Claude's
  * `/usage` control request (providers/claude.ts `planUsagePuller`).

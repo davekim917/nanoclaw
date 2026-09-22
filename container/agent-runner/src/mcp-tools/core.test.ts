@@ -133,6 +133,30 @@ describe('send_message MCP tool — default replies in the current conversation'
     _resetConfig();
   });
 
+  // The roster is recorded by the provider inside poll-loop, but send_message
+  // stamps from the MCP subprocess — so it has to ride the persisted snapshot
+  // too, or delegating turns lose it on the default reply path (#1022's bug).
+  it('carries the subagent roster across the process boundary', async () => {
+    const ts = await import('../turn-status.js');
+    const { _setConfigForTest, _resetConfig } = await import('../config.js');
+    _resetConfig();
+    _setConfigForTest({});
+    ts.resetTurnStatus();
+    ts.setTurnSettings('claude-opus-5[1m]', 'xhigh');
+    ts.setOwnConversation('slack', 'slack:CTEST00004');
+    ts.recordContextTokens(142_400);
+    ts.recordSubagent('t1', { type: 'worker-high', model: 'claude-sonnet-5', effort: 'high' });
+    ts.recordSubagent('t2', { type: 'worker-high', model: 'claude-sonnet-5', effort: 'high' });
+    ts._forgetOwnershipForTest();
+
+    await sendMessage.handler({ text: 'delegated and done' });
+
+    const own = getUndeliveredMessages().find((r) => r.platform_id === 'slack:CTEST00004')!;
+    expect(JSON.parse(own.content).subtext).toBe('opus-5 · xhigh · 142k context · 2 subagents: 2x sonnet-5/high');
+    ts.resetTurnStatus();
+    _resetConfig();
+  });
+
   it('omitting `to` posts in the session thread, not the owner DM', async () => {
     await sendMessage.handler({ text: 'team-auto: build stage done' });
 
