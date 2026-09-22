@@ -154,8 +154,16 @@ describe('container/CLAUDE.md "Working with Repos" prose migrated into the repo 
 describe('container/CLAUDE.md "container path is never openable" prose migrated into send_file/send_message (L3)', () => {
   it('send_message description tells the agent to attach or excerpt instead of naming a path', () => {
     const description = sendMessage.tool.description;
-    expect(description).toMatch(/means nothing to the user/);
+    // The prose this replaced ("A container path is never openable by a user —
+    // attach the file or excerpt it", container/CLAUDE.md before 8eaea5b06) has
+    // two halves, and BOTH must survive a rewording: the path is useless to the
+    // user, and the two sanctioned remedies. The first half is asserted by
+    // meaning rather than by one idiom — 152bcba88 reworded it to "is not
+    // user-accessible", which carries it — while the remedies stay pinned,
+    // because that same rewording silently dropped the excerpt half.
+    expect(description).toMatch(/means nothing to the user|not user-accessible/);
     expect(description).toMatch(/send_file/);
+    expect(description).toMatch(/excerpt/);
   });
 
   it('send_file description states it is how the user actually receives a container file', () => {
