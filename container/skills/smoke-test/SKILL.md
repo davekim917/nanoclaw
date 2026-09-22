@@ -1652,6 +1652,25 @@ do its job without. Both used to stay in the controller's own journal.
   journal said so, the brief did not, and the owner found out by running the
   barrier by hand.
 
+  **A refusal that appears AFTER the brief was acknowledged re-offers the
+  step.** The first fix covered first arrival — the barrier already refusing
+  when the brief was written. The commoner order, and the one run
+  `xzo-pr-pr2055-…` actually took, is the reverse: the brief is issued while
+  the barrier is merely waiting for markers, the owner acks it, and then the
+  owner writes evidence the barrier rejects. `owner_step` re-offers a wake only
+  while the `.ack` is absent, so that fire published the new refusal and woke
+  nobody. The trigger is a change in **the refusal** — `invalid[]` *and*
+  `invalidReasons[]`, digested against what the brief was written under — and
+  deliberately neither of its neighbours: not "the published answer changed",
+  which includes `missing[]` and would wake the owner on every marker it banks;
+  and not "became invalid", which would leave an owner working against a
+  refusal that has since moved to different files or different reasons (pr2055's
+  `scope-dispositions.json` went from `dispositions[3]/[30]/[31]` to
+  `[3]/[30]/[32]` with the file name unchanged). A refusal that *clears*
+  re-offers nothing. Re-offering does not extend the step's SLA, which is
+  measured from the obligation's first record, so an owner that keeps producing
+  invalid evidence still ends at the overdue path.
+
   **A refusing barrier wakes the owner on BOTH phases.** By the time a run
   reaches the synthesis branch the lanes barrier is ready and both
   `coordinator/preliminary.md` and `challenger/disposition.md` exist, so
@@ -1690,11 +1709,20 @@ do its job without. Both used to stay in the controller's own journal.
   wedged. **And an ack never outlives the brief it acknowledged**: writing a
   brief removes `<run>/controller/brief-<step>.ack`, so a re-offered step
   cannot inherit the previous brief's acknowledgement and be read as already
-  taken. A step briefed under a token that is absent from the journal entirely
-  (a run in flight across an upgrade of this file, which is a live bind mount)
-  is backfilled silently rather than re-offered: absence is not evidence of a
-  re-mint, and the next genuine one is caught because the value is then present
-  and stale.
+  taken. A step briefed under a token that is absent from the journal
+  entirely — a run in flight across an upgrade of this file, which is a live
+  bind mount — is resolved against the RUN TREE, not the gate.
+  `controller/wake.json` is the file the owner is told to take
+  `SMOKE_GATE_OWNER` from and the only file that carries a token to it, so its
+  `coordinatorOwnerToken` is what the owner actually holds. Agreeing with the
+  gate, it is backfilled silently; naming a different token, it is a re-mint an
+  older controller never carried through and the step is re-offered. Backfilling
+  the gate's current token without looking would make every later fire see
+  equality and skip the reissue forever, which is the wedge itself. With no
+  readable wake at all there is no issued token, so the owner cannot satisfy the
+  fence whatever it holds and the re-offer is the safe direction: it writes
+  `wake.json` and asks for an `adopt`, which is a no-op when the contract
+  already names the caller.
 
 #### The claim renewer (required alongside the live controller)
 

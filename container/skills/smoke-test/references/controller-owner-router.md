@@ -48,8 +48,8 @@ to the retained technical owner, verify its artifact receipt, and stop.
    same-SHA recovery (`smoke-pr-gate.sh:5312`, written to the lease at `:5341`,
    the PR authority at `:5346` and the gate state at `:5389`), so the token you
    started with is then retired. The controller refreshes `wake.json` with
-   every brief it writes (`smoke-campaign-controller.py:1256-1258`, in
-   `_owner_wake` at `:1207`), which is why the file is current and your own
+   every brief it writes (`smoke-campaign-controller.py:1285-1287`, in
+   `_owner_wake` at `:1236`), which is why the file is current and your own
    copy of its value is not (XZO #2046).
    - A brief headed **YOUR OWNER TOKEN CHANGED** means exactly that happened
      mid-step: the controller saw the step's `briefedToken` differ from the
@@ -65,7 +65,7 @@ to the retained technical owner, verify its artifact receipt, and stop.
      impersonation, not adoption.
    - Your ack does not carry over. Writing a brief removes
      `<run>/controller/brief-<step>.ack`
-     (`smoke-campaign-controller.py:1245-1255`), so a re-offered step needs a
+     (`smoke-campaign-controller.py:1274-1284`), so a re-offered step needs a
      fresh ack as its first act, exactly like any other wake.
 4. On `lanes` and `synthesis`, read `<run>/controller/barrier-<step>.json`
    before you start and again before you stop. The controller rewrites it every
@@ -73,6 +73,14 @@ to the retained technical owner, verify its artifact receipt, and stop.
    passes. `invalid[]` is artifact CONTENT the barrier rejects — yours to
    repair, and no amount of lane work clears it; `missing[]` is what is not
    written yet. A phase never passes while `invalid[]` is non-empty (XZO #2047).
+   - **You will be woken again if that refusal changes while you hold the
+     step**, including after you have acked the brief: the controller compares
+     the current `invalid[]`+`invalidReasons[]` against the ones your brief was
+     written under (`smoke-campaign-controller.py` `_reoffer_on_new_refusal`)
+     and re-offers the step when they differ. That wake is not a new step — it
+     is the same one, with a diagnosis you have not seen. Ack it and read the
+     barrier file again. You are NOT woken for `missing[]` moving, which is
+     just your own markers landing.
 5. Stop when the step's artifacts are written. The next controller fire picks
    them up. If the step genuinely cannot finish in one turn (usually lanes),
    call `continue_work({ task })` before yielding and resume from durable
