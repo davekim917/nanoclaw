@@ -23,6 +23,7 @@ import Database from 'better-sqlite3';
 import { execSync } from 'child_process';
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
+import { LOG_STAMP_RE, parseLogStamp } from '../src/log.js';
 
 const CENTRAL_DB = join(process.cwd(), 'data', 'v2.db');
 const LOG_INFO = join(process.cwd(), 'logs', 'nanoclaw.log');
@@ -86,40 +87,63 @@ function hostUptimeSec(bootMs: number | null): number | null {
  * Assumes the log is the server-local TZ — both this script and the host
  * log writer pull time-of-day from the same Node process TZ.
  */
-function walkLinesBackToCutoff(logPath: string, cutoffMs: number, onLine: (line: string, ts: number) => void): void {
-  if (!existsSync(logPath)) return;
+function walkLinesBackToCutoff(
+  logPath: string,
+  cutoffMs: number,
+  onLine: (line: string, ts: number) => void,
+): { sawInexact: boolean } {
+  if (!existsSync(logPath)) return { sawInexact: false };
   const lines = readFileSync(logPath, 'utf-8').split('\n');
-  const tsRe = /^\[(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\.(\d+)\]/;
+  let sawInexact = false;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
-    const m = line.match(tsRe);
+    const m = line.match(LOG_STAMP_RE);
     if (!m) {
       // continuation line, or a pre-upgrade line without a date prefix —
       // attribute to most-recently-seen timestamp (not counted toward cutoff)
       continue;
     }
-    const lineMs = new Date(
-      Number(m[1]),
-      Number(m[2]) - 1,
-      Number(m[3]),
-      Number(m[4]),
-      Number(m[5]),
-      Number(m[6]),
-      Number(m[7].padEnd(3, '0').slice(0, 3)),
-    ).getTime();
-    if (lineMs < cutoffMs) return;
-    onLine(line, lineMs);
+    // `cutoffMs` comes from systemd's UTC boot stamp, so the line's instant
+    // has to be absolute too. Rebuilding it from local getters (what this did
+    // before) is off by the host process's UTC offset whenever the logger's
+    // zone differs from this script's — `TZ=America/New_York` in the unit vs
+    // a UTC `/etc/localtime` here — which pushed every line below the cutoff
+    // and ended the walk on its first iteration. The counters then read 0 for
+    // events that had in fact occurred (5 ceiling kills, 101 expired-pending
+    // on 2026-09-22), and a zero is indistinguishable from a healthy host.
+    const parsed = parseLogStamp(m[1], m[2]);
+    if (!parsed) continue;
+    if (!parsed.exact) sawInexact = true;
+    if (parsed.ms < cutoffMs) return { sawInexact };
+    onLine(line, parsed.ms);
   }
+  return { sawInexact };
 }
 
-function countSinceBoot(logPath: string, pattern: RegExp, bootMs: number | null): number {
-  if (bootMs === null) return -1;
-  if (!existsSync(logPath)) return -1;
+/**
+ * Count matching lines since boot.
+ *
+ * `inexact` is not cosmetic. Lines written before src/log.ts started stamping
+ * a UTC offset carry only local wall-clock, so their instant is reconstructed
+ * in THIS process's zone. When the logger ran in a different one — the unit
+ * sets `TZ=America/New_York` against a UTC `/etc/localtime` — every line lands
+ * hours early, drops below `bootMs`, and ends the backward walk on its first
+ * iteration. The count then reads 0 for events that did occur (on 2026-09-22:
+ * 5 ceiling kills and 101 expired-pending reported as 0/0). A zero that cannot
+ * be trusted must not be printed as a clean zero, so callers render the caveat.
+ */
+function countSinceBoot(
+  logPath: string,
+  pattern: RegExp,
+  bootMs: number | null,
+): { n: number; inexact: boolean } {
+  if (bootMs === null) return { n: -1, inexact: false };
+  if (!existsSync(logPath)) return { n: -1, inexact: false };
   let n = 0;
-  walkLinesBackToCutoff(logPath, bootMs, (line) => {
+  const { sawInexact } = walkLinesBackToCutoff(logPath, bootMs, (line) => {
     if (pattern.test(line)) n++;
   });
-  return n;
+  return { n, inexact: sawInexact };
 }
 
 /**
@@ -183,9 +207,25 @@ if (oldest && dbCount > 0) {
 }
 console.log('');
 console.log('Since last restart:');
-console.log('  wake-deferred warnings:                     ', fmtCount(waitDeferred), waitDeferred === 0 ? '✓' : '⚠');
-console.log('  absolute-ceiling kills:                     ', fmtCount(ceilingKills), ceilingKills === 0 ? '✓' : '⚠');
-console.log('  expired-pending events:                     ', fmtCount(expiredEvents));
+/** A clean tick is only earned by a zero the stamps can actually support. */
+function fmtSinceBoot(c: { n: number; inexact: boolean }, tickOnZero = true): string {
+  const body = fmtCount(c.n);
+  if (c.inexact) return `${body} (unverified — pre-offset stamps)`;
+  if (!tickOnZero) return body;
+  return `${body} ${c.n === 0 ? '✓' : '⚠'}`;
+}
+
+console.log('  wake-deferred warnings:                     ', fmtSinceBoot(waitDeferred));
+console.log('  absolute-ceiling kills:                     ', fmtSinceBoot(ceilingKills));
+console.log('  expired-pending events:                     ', fmtSinceBoot(expiredEvents, false));
+if (waitDeferred.inexact || ceilingKills.inexact || expiredEvents.inexact) {
+  console.log(
+    '\n  ⚠ Some log lines in this window predate the UTC-offset stamp, so their\n' +
+      '    instant was reconstructed in this process\'s zone and the counts above\n' +
+      '    may be low (possibly 0 when events did occur). Resolved for lines\n' +
+      '    written after the next host restart.',
+  );
+}
 console.log('');
 console.log(`Stuck-claim hotspots (same message_id ≥3 times in error log):`);
 if (stuck.length === 0) {

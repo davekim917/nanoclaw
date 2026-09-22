@@ -5572,6 +5572,36 @@ describe('status subtext — round-two regressions', () => {
     expect(JSON.parse(rows[0].content).subtext).toBe('haiku-4-5 · 8.2k context');
   });
 
+  // PRODUCTION REGRESSION (2026-09-22): 55 of 57 live replies went out
+  // unstamped. send_message runs in a separate stdio MCP subprocess
+  // (mcp-tools/server.ts:114) whose copy of turn-status was never set, so
+  // isOwnConversation answered false. Every earlier test ran both halves in
+  // one process and could not see it. This one drops the process-local state
+  // before writing, exactly as the subprocess sees the world.
+  it('stamps a send_message reply written from a process that never set turn state', async () => {
+    const { writeMessageOut, getUndeliveredMessages } = require('./db/messages-out.js');
+    const { _forgetOwnershipForTest } = require('./turn-status.js');
+    // poll-loop's side: set the turn up, as processQuery does.
+    setTurnSettings('claude-opus-5[1m]', 'high');
+    setOwnConversation('discord', 'chan-1');
+    recordContextTokens(142_400);
+    // The MCP subprocess's side: none of that is in its memory.
+    _forgetOwnershipForTest();
+
+    await writeMessageOut({
+      id: 'mcp-xproc',
+      kind: 'chat',
+      agentReply: true,
+      platform_id: 'chan-1',
+      channel_type: 'discord',
+      thread_id: null,
+      content: JSON.stringify({ text: 'answered through the tool, from the other process' }),
+    });
+
+    const row = getUndeliveredMessages().find((r: { id: string }) => r.id === 'mcp-xproc');
+    expect(JSON.parse(row.content).subtext).toBe('opus-5 · high · 142k context');
+  });
+
   it('does not stamp a send_file caption row', async () => {
     const { writeMessageOut, getUndeliveredMessages } = require('./db/messages-out.js');
     setTurnSettings('claude-opus-5[1m]', 'xhigh');

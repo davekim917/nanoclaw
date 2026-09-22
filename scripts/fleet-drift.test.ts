@@ -188,10 +188,60 @@ describe('computeSeriesStats', () => {
   });
 });
 
+/**
+ * A stamp for instant `d` rendered in a zone `offsetMinutes` from UTC, with
+ * the explicit marker src/log.ts now writes. Deliberately NOT the runner's
+ * zone: the regression is a logger and a reader in different zones, which a
+ * stamp built from local getters can never express.
+ */
+function offsetStamp(d: Date, offsetMinutes: number): string {
+  const p2 = (n: number) => String(n).padStart(2, '0');
+  const p3 = (n: number) => String(n).padStart(3, '0');
+  const shifted = new Date(d.getTime() + offsetMinutes * 60_000);
+  const sign = offsetMinutes < 0 ? '-' : '+';
+  const abs = Math.abs(offsetMinutes);
+  const marker = `${sign}${p2(Math.floor(abs / 60))}:${p2(abs % 60)}`;
+  return (
+    `${shifted.getUTCFullYear()}-${p2(shifted.getUTCMonth() + 1)}-${p2(shifted.getUTCDate())} ` +
+    `${p2(shifted.getUTCHours())}:${p2(shifted.getUTCMinutes())}:${p2(shifted.getUTCSeconds())}.` +
+    `${p3(shifted.getUTCMilliseconds())}${marker}`
+  );
+}
+
+describe('countRecentErrorLines — logger and reader in different zones', () => {
+  const now = Date.now();
+  // A one-minute window makes the oracle sharp: any misreading of the zone
+  // moves the line hours away and drops it.
+  const WINDOW = 60_000;
+
+  for (const [label, offMin] of [
+    ['UTC+09:00', 540],
+    ['UTC-04:00 (this install)', -240],
+    ['UTC+05:30 (half-hour zone)', 330],
+  ] as const) {
+    it(`counts a 30s-old line stamped in ${label}`, () => {
+      const line = `[${offsetStamp(new Date(now - 30_000), offMin)}] \x1b[31mERROR\x1b[39m boom`;
+      expect(countRecentErrorLines(line, now, WINDOW)).toBe(1);
+    });
+  }
+
+  it('still excludes a line genuinely outside the window', () => {
+    const line = `[${offsetStamp(new Date(now - 10 * 60_000), 540)}] \x1b[31mERROR\x1b[39m old`;
+    expect(countRecentErrorLines(line, now, WINDOW)).toBe(0);
+  });
+
+  it('keeps parsing pre-change lines that carry no offset', () => {
+    const line = `[${localStamp(new Date(now - 30_000))}] \x1b[31mERROR\x1b[39m legacy`;
+    expect(countRecentErrorLines(line, now, WINDOW)).toBe(1);
+  });
+});
+
 describe('countRecentErrorLines', () => {
   // Built from real local Date objects (not hardcoded UTC 'Z' strings), so
-  // these assertions hold under any runner TZ — matching the fix: the logger
-  // writes local wall-clock time, and this parses it as local too.
+  // these assertions hold under any runner TZ. NOTE: an offset-less stamp is
+  // read in the READER's zone, so these cases only pass because the helper
+  // and the parser share one zone — they cannot detect a logger/reader split.
+  // The `offset` block below is the case that can; see `offsetStamp`.
   const nowDate = new Date();
   const now = nowDate.getTime();
 
