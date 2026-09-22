@@ -12,12 +12,14 @@ import { describe, it, expect, beforeEach, mock } from 'bun:test';
 
 type Recorded = { tool: string; declaredTimeoutMs: number | null } | null;
 let current: Recorded = null;
+let setCalls = 0;
 
 const realContainerState = await import('../db/container-state.js');
 mock.module('../db/container-state.js', () => ({
   ...realContainerState,
   setContainerToolInFlight: (tool: string, declaredTimeoutMs: number | null) => {
     current = { tool, declaredTimeoutMs };
+    setCalls++;
   },
   clearContainerToolInFlight: () => {
     current = null;
@@ -100,5 +102,17 @@ describe('tool in-flight tracking', () => {
     expect(current).not.toBeNull();
     resetToolInFlightTracking();
     expect(current).toBeNull();
+  });
+
+  it('does NOT re-write the row (and so re-stamp tool_started_at) while the described call is unchanged', async () => {
+    // The writer stamps tool_started_at = now on every set; the host reads that
+    // stamp as "tool already running before this claim". A parallel Read
+    // starting or finishing inside a long Bash must not move it forward.
+    await pre('bash-1', 'Bash', 1_800_000);
+    const afterBash = setCalls;
+    await pre('read-1', 'Read');
+    await post('read-1');
+    expect(setCalls).toBe(afterBash);
+    expect(current).toEqual({ tool: 'Bash', declaredTimeoutMs: 1_800_000 });
   });
 });

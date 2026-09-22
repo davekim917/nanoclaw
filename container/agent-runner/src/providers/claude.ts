@@ -685,16 +685,35 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
  */
 const toolsInFlight = new Map<string, { tool: string; declaredTimeoutMs: number | null }>();
 
+/**
+ * `tool_use_id` of the call the row currently describes: null = row cleared,
+ * undefined = unknown (never written, or the last write failed).
+ */
+let publishedToolUseId: string | null | undefined;
+
 /** Write `container_state` from the widest-declared call still in flight. */
 function publishToolInFlight(): void {
+  let widestId: string | null = null;
   let widest: { tool: string; declaredTimeoutMs: number | null } | null = null;
-  for (const entry of toolsInFlight.values()) {
-    if (widest === null || (entry.declaredTimeoutMs ?? 0) > (widest.declaredTimeoutMs ?? 0)) widest = entry;
+  for (const [id, entry] of toolsInFlight) {
+    if (widest === null || (entry.declaredTimeoutMs ?? 0) > (widest.declaredTimeoutMs ?? 0)) {
+      widest = entry;
+      widestId = id;
+    }
   }
+  // Write only when the DESCRIBED CALL changes. The writer stamps
+  // `tool_started_at = now` on every call (container/agent-runner/src/mailbox/
+  // sqlite/connection.ts:145-156), and the host's claim-stuck rule reads that
+  // stamp as "this tool was already running before the claim". Re-publishing
+  // the same long Bash because a parallel Read started or finished would move
+  // its start time forward and withdraw that forgiveness mid-operation.
+  if (widestId === publishedToolUseId) return;
   try {
     if (widest === null) clearContainerToolInFlight();
     else setContainerToolInFlight(widest.tool, widest.declaredTimeoutMs);
+    publishedToolUseId = widestId;
   } catch (err) {
+    publishedToolUseId = undefined;
     log(`Tool in-flight: failed to write container_state: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
