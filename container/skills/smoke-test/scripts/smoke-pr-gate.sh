@@ -1305,12 +1305,12 @@ CHALLENGER_RUN_ROOT="${SMOKE_GATE_RUN_ROOT:-}"
 challenger_disposition_file() { printf '%s/%s/challenger/disposition.md' "$CHALLENGER_RUN_ROOT" "$1"; }
 # Would a successor have to `adopt` this run's completion contract? The ONE
 # predicate, shared by the resumed `pr_build_settled` wake and `pr_run_stalled`.
-# `contract` stamps coordinatorOwnerToken once (smoke-run-scaffold.sh:545) and
+# `contract` stamps coordinatorOwnerToken once (smoke-run-scaffold.sh:562) and
 # every reclaim mints a new token, so the scaffold's require_contract_owner
 # (smoke-run-scaffold.sh:366-371) refuses a successor's marker/redispatch until
 # it runs `adopt`. Keyed on the token alone, so a schemaVersion 1 contract and
 # a schemaVersion 2 one (campaign identity beside the token) answer the same;
-# `adopt` backfills that identity itself (smoke-run-scaffold.sh:771-786).
+# `adopt` backfills that identity itself (smoke-run-scaffold.sh:788-803).
 # Read-only, and `null` — not false — when the run root is unwired: absence is
 # only evidence when presence was possible.
 contract_adoption_required() {  # <runId> -> true | false | null

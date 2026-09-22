@@ -162,7 +162,7 @@ TEST_HANG = os.environ.get("SMOKE_CONTROLLER_SHADOW_TEST_HANG", "")  # test-only
 # hardcoded allowlist here dropped SMOKE_GATE_LEASE_DIR and the evidence
 # barrier this wrapper's controller step spawns
 # (smoke-campaign-controller.py:1393 -> spawn, :638-650, env=None) fell back to
-# a lease dir holding no pin, smoke-evidence-barrier.sh:556). NOT_CONFIG is the
+# a lease dir holding no pin, smoke-evidence-barrier.sh:739). NOT_CONFIG is the
 # inverse: names that say how this process and its children RUN rather than
 # what the campaign IS. A name here is IGNORED, exactly as every name outside
 # the old allowlist was, so nothing that worked stops working.

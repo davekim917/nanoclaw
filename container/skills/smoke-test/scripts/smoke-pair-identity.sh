@@ -185,9 +185,53 @@ case "${1:-}" in
       echo "REFUSED: live pair does not serve PR contract sourceSha $EXPECTED_SOURCE_SHA — nothing frozen (exit 2): $P" >&2
       exit 2
     fi
-    PAYLOAD="$(printf '%s' "$P" | jq -c --arg expected "$EXPECTED_SOURCE_SHA" '
+    # LATE FREEZE (XZO #2092). A freeze binds evidence gathered AFTER it; it
+    # proves nothing about a lane that already ran, which gathered its evidence
+    # against a pair nobody froze and possibly a different deploy. Without this,
+    # `start` after the lanes plus one ok `check` cleared every gate and those
+    # unbound markers supported GO. So a `start` that finds lane evidence on
+    # disk records itself as late and snapshots the contract's lane generations
+    # exactly as `refreeze` does (rl_lane_snapshot); rl_refrozen then treats
+    # the run as re-frozen, and `finish` and smoke-evidence-barrier.sh refuse
+    # every lane until it is redispatched above that snapshot. INVARIANT: a
+    # counted marker comes from a dispatch made after the pair it is checked
+    # against was frozen. The snapshot covers every required lane, marker or
+    # not: a lane still in flight at the freeze started on an unfrozen pair
+    # too. The one shape this cannot see is a late freeze while lanes run and
+    # NO marker has landed yet -- nothing on disk records a dispatch -- which is
+    # why the controller's lanes brief puts `start` before any dispatch
+    # (smoke-campaign-controller.py:787-788, OWNER_BRIEF["lanes"], which opens
+    # "STEP 1, BEFORE ANY LANE IS DISPATCHED"). Editing that brief's ordering
+    # reopens the race this comment names.
+    C="$RUN/completion-contract.json"
+    LATE='{}'
+    MARKED=""
+    for m in "$RUN"/markers/*.json; do [ -s "$m" ] && MARKED="$MARKED ${m#"$RUN"/}"; done
+    CJSON=null
+    if [ -e "$C" ]; then
+      CJSON="$(jq -cs 'if length == 1 then .[0] else "unparsable" end' "$C" 2>/dev/null)" || CJSON='"unparsable"'
+      while IFS= read -r m; do
+        case "$m" in ''|/*|*..*) continue ;; esac
+        [ -s "$RUN/$m" ] && case " $MARKED " in *" $m "*) ;; *) MARKED="$MARKED $m" ;; esac
+      done < <(jq -r 'if type == "object" then (.requiredLaneMarkers // [])[]? | strings else empty end' <<<"$CJSON" 2>/dev/null)
+    fi
+    MARKED="${MARKED# }"
+    if [ -n "$MARKED" ]; then
+      [ "$CJSON" != null ] || {
+        echo "REFUSED: lane markers exist under $RUN but there is no completion contract — cannot tell which lanes must be redispatched after this late freeze; nothing frozen (exit 2)" >&2; exit 2; }
+      SNAP="$(jq -cn -L "$HERE" --argjson c "$CJSON" 'include "refreeze-lanes"; $c | rl_lane_snapshot')" || {
+        echo "REFUSED: could not snapshot the contract's lane generations for a late freeze — nothing frozen (exit 2)" >&2; exit 2; }
+      SNAP_ERR="$(jq -r '.error // empty' <<<"$SNAP")"
+      [ -z "$SNAP_ERR" ] || { echo "REFUSED: $SNAP_ERR — cannot snapshot lane generations for a late freeze; nothing frozen (exit 2)" >&2; exit 2; }
+      LATE="$(jq -cn --argjson snap "$SNAP" --arg at "$(date -u +%FT%TZ)" --arg marked "$MARKED" \
+        '{lateFreeze: {frozenAt: $at, markersOnDisk: ($marked | split(" ") | map(select(length > 0)))},
+          refreezeLaneSnapshot: $snap}')" || {
+        echo "REFUSED: could not record the late freeze (exit 2)" >&2; exit 2; }
+      echo "LATE FREEZE: lane evidence already exists ($MARKED); every required lane must be redispatched (smoke-run-scaffold.sh redispatch $RUN <lane-id>) and re-run before it counts" >&2
+    fi
+    PAYLOAD="$(printf '%s' "$P" | jq -c --arg expected "$EXPECTED_SOURCE_SHA" --argjson late "$LATE" '
       . + {freezeGeneration: 1, history: []} +
-      (if $expected == "" then {} else {expectedSourceSha: $expected} end)
+      (if $expected == "" then {} else {expectedSourceSha: $expected} end) + $late
     ')" || {
       echo "REFUSED: could not attach freeze bookkeeping to the live pair (exit 2)" >&2; exit 2; }
     python3 - "$RUN/coordinator" "$PAYLOAD" <<'PY'
@@ -263,11 +307,15 @@ PY
     NOW_ISO="$(date -u +%FT%TZ)"
     PAYLOAD="$(jq -c \
       --argjson old "$OLD" --arg reason "$REASON" --arg at "$NOW_ISO" --argjson gen "$NEW_GEN" \
-      --argjson snap "$SNAP" \
+      --argjson snap "$SNAP" --arg expected "$EXPECTED_SOURCE_SHA" \
       '. + {freezeGeneration: $gen, refreezeLaneSnapshot: $snap,
             history: (($old.history // []) + [{
               frontend: $old.frontend, backend: $old.backend, readAt: $old.readAt,
-              reason: $reason, refrozenAt: $at}])}' <<<"$P")" || {
+              reason: $reason, refrozenAt: $at}])}
+       # The re-frozen record is a frozen pair like any other: it keeps the
+       # source binding `start` wrote, or the barrier refuses it as not a
+       # frozen pair (smoke-evidence-barrier.sh, shape check) on every fire.
+       + (if $expected == "" then {} else {expectedSourceSha: $expected} end)' <<<"$P")" || {
       echo "REFUSED: could not build the re-frozen payload (exit 2)" >&2; exit 2; }
     python3 - "$RUN/coordinator" "$PAYLOAD" <<'PY'
 import json, os, sys, tempfile
@@ -316,8 +364,11 @@ PY
           ERR="$(jq -r '.error // empty' <<<"$RES")"
           [ -z "$ERR" ] || { echo "finish: unreadable — $ERR (exit 2)"; exit 2; }
           STALE="$(jq -r '.stale | join(", ")' <<<"$RES")"
+          SINCE="since the pair re-freeze: $STALE; their evidence predates the current pair"
+          [ "$(jq -r '((.history // []) | length) == 0 and has("lateFreeze")' "$F" 2>/dev/null)" = true ] &&
+            SINCE="since the pair was frozen late: $STALE; they ran before any pair was frozen, so their evidence is bound to no build"
           [ -z "$STALE" ] || {
-            echo "finish: refused — required lanes not redispatched since the pair re-freeze: $STALE; their evidence predates the current pair. Run smoke-run-scaffold.sh redispatch <run-dir> <lane-id> for each, re-run it, then finish again (exit 2)"
+            echo "finish: refused — required lanes not redispatched $SINCE. Run smoke-run-scaffold.sh redispatch <run-dir> <lane-id> for each, re-run it, then finish again (exit 2)"
             exit 2; }
           ;;
         *) echo "finish: unreadable — identity.json is not valid JSON (exit 2)"; exit 2 ;;

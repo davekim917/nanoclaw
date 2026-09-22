@@ -80,6 +80,7 @@ contract() {
     ownershipKind:"pr", coordinatorOwnerToken:"owner-test",
     requiredLaneMarkers:["markers/A1.json","markers/B1.json"],
     lanes:[{id:"A1",kind:"lane",generation:1},{id:"B1",kind:"lane",generation:2}]}' \
+    | jq -c "if \"${PAIR_REQUIRED:-}\" == \"\" then . else .pairIdentity = \"required\" end" \
     >"$R/completion-contract.json"
 }
 
@@ -97,7 +98,8 @@ parent_conclusions() { # [challenger-disposition]
   printf 'disposition\n' >"$R/challenger/disposition.md"
   jq -cn --arg d "${1:-CLEAR}" '{schemaVersion:1,lane:"challenger",status:"completed",disposition:$d}' \
     >"$R/challenger/challenge.complete.json"
-  printf '{"label":"end","verdict":"ok"}\n' >"$R/coordinator/identity-checks.ndjson"
+  # NO_IDENTITY: an owner that never runs smoke-pair-identity.sh (XZO #2092).
+  [ -n "${NO_IDENTITY:-}" ] || printf '{"label":"end","verdict":"ok"}\n' >"$R/coordinator/identity-checks.ndjson"
 }
 
 synthesis() { # verdict [jq-merge]
@@ -1109,8 +1111,8 @@ cite() { # <file> <line> <literal substring the cited line must contain>
     || fail "controller-owner-router.md cites $1:$2 for \"$3\", but that line is: ${got:-<absent>}"
 }
 ROUTER="$SCRIPT_DIR/../references/controller-owner-router.md"
-for c in 'smoke-pr-gate.sh:5312' 'smoke-campaign-controller.py:1291-1293' \
-         'smoke-run-scaffold.sh:267-269' 'smoke-campaign-controller.py:1280-1290'; do
+for c in 'smoke-pr-gate.sh:5312' 'smoke-campaign-controller.py:1302-1304' \
+         'smoke-run-scaffold.sh:267-269' 'smoke-campaign-controller.py:1291-1301'; do
   grep -Fq "$c" "$ROUTER" || fail "router doc no longer cites $c"
 done
 cite smoke-pr-gate.sh 5312 'OWNER_TOKEN="$(new_owner_token'
@@ -1118,10 +1120,10 @@ cite smoke-pr-gate.sh 5341 'lease_acquire "$RUN_ID" "$OWNER_TOKEN"'
 cite smoke-pr-gate.sh 5346 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
 cite smoke-pr-gate.sh 5389 '.activeLeaseOwner=$owner'
 cite smoke-run-scaffold.sh 268 '[ "$owner" = "$DEFAULT_OWNER" ]'
-cite smoke-run-scaffold.sh 690 'adds NO new authority check of its own'
-cite smoke-campaign-controller.py 1236 'def _owner_wake'
-cite smoke-campaign-controller.py 1286 'os.unlink("brief-{}.ack"'
-cite smoke-campaign-controller.py 1291 'if c.get("wake"):'
+cite smoke-run-scaffold.sh 707 'adds NO new authority check of its own'
+cite smoke-campaign-controller.py 1247 'def _owner_wake'
+cite smoke-campaign-controller.py 1297 'os.unlink("brief-{}.ack"'
+cite smoke-campaign-controller.py 1302 'if c.get("wake"):'
 
 
 # --- round 3, finding 1: a refusal that appears AFTER the ack re-offers ------
@@ -1264,5 +1266,79 @@ grep -q 'YOUR OWNER TOKEN CHANGED' "$R/controller/brief-lanes.md" \
 jq -se '[.[] | select(.kind=="owner" and .slot=="lanes" and .detail.briefedToken != null)] | length >= 1' \
   "$C/out/journal.ndjson" >/dev/null \
   || fail "#2046(backfill): an agreeing run tree was not backfilled, so it is re-read every fire"
+
+# --- XZO #2092: a clean GO synthesis with no pair identity is caught at lanes --
+# Run pr2088's real shape: the owner never runs smoke-pair-identity.sh (neither
+# identity.json nor identity-checks.ndjson), every lane passes, the challenger
+# clears and the owner synthesises GO. The controller's only enforcement point
+# was validate_synthesis's GO branch, so the campaign was spent and published
+# BLOCKED on "pair identity not ok (last check: none)" alone, over a clean GO.
+# Driven through the real barrier, with the owner acking every brief exactly as
+# the router does -- so the only way it hears about this is a re-offer.
+new_case ctl-2092-go-without-pair-identity
+PAIR_REQUIRED=1 NO_IDENTITY=1 campaign 8
+[ -e "$R/synthesis.json" ] && jq -e '.verdict == "GO"' "$R/synthesis.json" >/dev/null \
+  || fail "#2092: precondition -- the owner never reached a GO synthesis"
+[ ! -e "$R/coordinator/identity.json" ] && [ ! -e "$R/coordinator/identity-checks.ndjson" ] \
+  || fail "#2092: precondition -- this owner was supposed never to run pair identity"
+# Not spent: no terminal gate verb, no verdict post, no PR comment.
+[ "$(jq -s '[.[] | select(.tool=="gate" and (.op=="finish" or .op=="challenger-timeout"))] | length' "$FAKE_LOG")" = 0 ] \
+  || fail "#2092: the campaign was finished with no pair identity: $(finish_verdict) $(jr '[.[] | select(.kind=="verdict")] | last')"
+jr '[.[] | select(.kind=="send" and .slot=="verdict")] | length == 0' | grep -qx true \
+  || fail "#2092: a verdict was posted for a run with no pair identity"
+# Held at lanes, with the refusal published where the owner reads it.
+jq -e '.invalid == ["coordinator/identity.json"]
+    and (.invalidReasons[0] | contains("never frozen") and contains("smoke-pair-identity.sh start"))' \
+  "$R/controller/barrier-lanes.json" >/dev/null \
+  || fail "#2092: the lanes barrier report does not name the unfrozen pair: $(cat "$R/controller/barrier-lanes.json" 2>&1)"
+# Told, and told again the moment the lanes finished without it: every brief
+# was acked, so only a re-offer on the changed refusal could reach the owner.
+jq -se '[.[] | select(.kind=="owner" and .slot=="lanes" and .state=="intent" and .detail.refusalChanged == true)]
+        | length >= 1' "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2092: the finished-without-identity refusal never re-offered the acknowledged lanes step"
+grep -q 'THE BARRIER IS ALREADY REFUSING THIS PHASE' "$R/controller/brief-lanes.md" \
+  || fail "#2092: the re-offered lanes brief does not lead with the refusal"
+grep -Fq "PAIR IDENTITY: NOT FROZEN" "$R/controller/brief-lanes.md" \
+  && grep -Fq "$C/bin/gate.sh check $PR" "$R/controller/brief-lanes.md" \
+  || fail "#2092: the lanes brief does not give this run's start command and where the preview ids come from"
+# A LATE freeze must not launder that evidence (#1039 review). The owner, told
+# at last, runs the REAL `start` now -- after both lanes wrote markers -- and
+# one ok `check`. On the first cut of this fix that cleared the barrier and the
+# SAME markers certified GO, yet they ran before any pair was frozen and are
+# bound to no build. They count only once each lane is redispatched and re-run.
+PAIRFX="$C/pair-fx"; mkdir -p "$PAIRFX"
+printf '[{"deploy":{"id":"dep-prfe00000001","status":"live","commit":{"id":"%s"}}}]' "$SHA" >"$PAIRFX/fe.json"
+printf '[{"deploy":{"id":"dep-prbe00000001","status":"live","commit":{"id":"%s"}}}]' "$SHA" >"$PAIRFX/be.json"
+pair() { SMOKE_PAIR_FIXTURE_DIR="$PAIRFX" SMOKE_GATE_FRONTEND_SERVICE=srv-prfe00000001 \
+  SMOKE_GATE_BACKEND_SERVICE=srv-prbe00000001 bash "$SCRIPT_DIR/smoke-pair-identity.sh" "$@"; }
+pair start "$R" >/dev/null 2>"$C/pair.err" || fail "#2092(late): the late start was refused: $(cat "$C/pair.err")"
+pair check "$R" lanes-after-late-start >/dev/null 2>&1 \
+  || fail "#2092(late): precondition -- the check after the late start was not ok"
+for n in 9 10 11 12; do
+  world "$n"; inputs_from_fakes; step_ok "$(tick_time "$n")"
+done
+[ "$(jq -s '[.[] | select(.tool=="gate" and (.op=="finish" or .op=="challenger-timeout"))] | length' "$FAKE_LOG")" = 0 ] \
+  || fail "#2092(late): a late freeze plus one ok check laundered the pre-freeze lanes into a verdict: $(finish_verdict)"
+jq -e '(.invalid | sort) == ["markers/A1.json","markers/B1.json"]
+    and all(.invalidReasons[]; contains("frozen LATE") and contains("redispatch"))' \
+  "$R/controller/barrier-lanes.json" >/dev/null \
+  || fail "#2092(late): the lanes refusal does not name both pre-freeze lanes for redispatch: $(cat "$R/controller/barrier-lanes.json" 2>&1)"
+jq -se '[.[] | select(.kind=="owner" and .slot=="lanes" and .state=="intent" and .detail.refusalChanged == true)]
+        | length >= 2' "$C/out/journal.ndjson" >/dev/null \
+  || fail "#2092(late): the changed refusal (redo the lanes) was not re-offered to the owner"
+# Recovery is real: redispatch both lanes, re-run them with checks, re-synthesise
+# against the new generations -- and the SAME campaign certifies GO.
+jq -c '.lanes |= map(.generation += 1)' "$R/completion-contract.json" >"$R/.contract.tmp"
+mv "$R/.contract.tmp" "$R/completion-contract.json"
+marker A1 2 pass; marker B1 3 pass
+pair check "$R" lanes-rerun-end >/dev/null 2>&1 || fail "#2092(late): precondition -- the re-run check was not ok"
+synthesis GO '.laneGenerations = {A1:2, B1:3}'
+for n in 13 14 15 16; do
+  world "$n"; inputs_from_fakes; step_ok "$(tick_time "$n")"
+done
+[ "$(finish_verdict)" = '"GO"' ] \
+  || fail "#2092(late): redispatched lanes on the frozen pair did not let the GO through: $(finish_verdict) $STEP_OUT"
+[ ! -e "$R/controller/barrier-lanes.json" ] \
+  || fail "#2092: the lanes refusal was left published after the phase passed"
 
 echo "smoke campaign controller live tests passed"

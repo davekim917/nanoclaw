@@ -456,6 +456,22 @@ by calling `start` again. Reachability checks (`smoke-build-identity.sh`'s
 bundle/host and `/healthz`) stay separate from identity — they answer "is
 something serving", not "is it the pair this run claimed."
 
+A PR contract the scaffold writes carries `pairIdentity: "required"`, and
+`smoke-evidence-barrier.sh` then enforces this cadence at `lanes` and
+`synthesis` rather than leaving it to the verdict: no `identity.json` once any
+lane marker exists, no check at the current freeze generation once every
+marker is in, or any `drift`/`source-mismatch` at that generation (a later
+`ok` does not clear it) is `invalid[]`, with the exact command to run. Pass
+the frozen service ids on each `check`'s own command line: the gate env names
+the develop pair (`scripts/smoke-pair-identity.sh:16-19`), and a check against
+it records drift.
+
+**`start` is the first act, before any lane is dispatched.** A `start` that
+finds lane evidence already on disk records the freeze as **late** and
+snapshots the lanes like a `refreeze`: evidence gathered before any freeze is
+bound to no build, so `finish` and the barrier refuse every lane until it is
+redispatched (`smoke-run-scaffold.sh redispatch`) and run again.
+
 **On drift, the coordinator may re-freeze exactly once per run** with
 `refreeze <run-dir> <reason>`, instead of finishing the whole run BLOCKED for
 what may be one unrelated redeploy:
@@ -1644,9 +1660,9 @@ do its job without. Both used to stay in the controller's own journal.
 - **The barrier's answer.** On every `lanes` and `synthesis` fire the
   controller writes the real `smoke-evidence-barrier.sh` output to
   `<run>/controller/barrier-<step>.json` and deletes it once the phase passes
-  (`smoke-campaign-controller.py:1770` `publish_barrier`, whose effect writes at
-  `:1364-1365` and unlinks on `doc is None` at `:1350-1358`), and every
-  barrier-backed brief names that file (`:1385-1408`). `invalid[]` is artifact
+  (`smoke-campaign-controller.py:1830` `publish_barrier`, whose effect writes at
+  `:1375-1376` and unlinks on `doc is None` at `:1361-1369`), and every
+  barrier-backed brief names that file (`:1396-1419`). `invalid[]` is artifact
   CONTENT the barrier rejects; only the owner can repair it, and no amount of
   lane work clears it. Run `xzo-pr-pr2055-…` (XZO #2047) spent 67 minutes
   running lanes while the barrier had already named
@@ -1660,12 +1676,12 @@ do its job without. Both used to stay in the controller's own journal.
   `xzo-pr-pr2055-…` actually took, is the reverse: the brief is issued while
   the barrier is merely waiting for markers, the owner acks it, and then the
   owner writes evidence the barrier rejects. `owner_step` re-offers a wake only
-  while the `.ack` is absent (`smoke-campaign-controller.py:2274-2276`), so that
+  while the `.ack` is absent (`smoke-campaign-controller.py:2334-2336`), so that
   fire published the new refusal and woke nobody. The trigger is a change in **the refusal** — `invalid[]` *and*
   `invalidReasons[]`, digested against what the brief was written under
-  (`refusal_digest`, `smoke-campaign-controller.py:227`; recorded as
-  `briefedRefusal` at `:1303-1304`, carried forward at `:2267-2268`, compared by
-  `_reoffer_on_new_refusal` at `:2408`) — and
+  (`refusal_digest`, `smoke-campaign-controller.py:228`; recorded as
+  `briefedRefusal` at `:1314-1315`, carried forward at `:2327-2328`, compared by
+  `_reoffer_on_new_refusal` at `:2468`) — and
   deliberately neither of its neighbours: not "the published answer changed",
   which includes `missing[]` and would wake the owner on every marker it banks;
   and not "became invalid", which would leave an owner working against a
@@ -1673,7 +1689,7 @@ do its job without. Both used to stay in the controller's own journal.
   `scope-dispositions.json` went from `dispositions[3]/[30]/[31]` to
   `[3]/[30]/[32]` with the file name unchanged). A refusal that *clears*
   re-offers nothing. Re-offering does not extend the step's SLA, which is
-  measured from the obligation's first record (`smoke-campaign-controller.py:2285`), so an owner that keeps producing
+  measured from the obligation's first record (`smoke-campaign-controller.py:2345`), so an owner that keeps producing
   invalid evidence still ends at the overdue path.
 
   **A refusing barrier wakes the owner on BOTH phases.** By the time a run
@@ -1683,7 +1699,7 @@ do its job without. Both used to stay in the controller's own journal.
   or a visual-candidate disposition it owes under
   `SMOKE_VISUAL_DISPOSITIONS=1` — is the retained owner's, and the owner is the
   only judgment party the controller can invoke. That branch used to return
-  without a wake (it now wakes at `smoke-campaign-controller.py:2892-2894`),
+  without a wake (it now wakes at `smoke-campaign-controller.py:2952-2954`),
   which left the phase with no exit at all: the wrapper wakes on `ownerWake`
   alone (`smoke-controller-live.sh:168-175`), so nobody was told, and the
   overdue-BLOCKED safety net keys on the very `owner:synthesis` obligation the

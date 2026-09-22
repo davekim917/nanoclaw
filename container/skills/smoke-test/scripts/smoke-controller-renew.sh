@@ -96,7 +96,7 @@
 # and the reason is recorded in the tick's own line rather than swallowed.
 #
 # THE CEILING is OWNER_STEP_SLA_SECONDS (3600 s,
-# smoke-campaign-controller.py:131), measured from the obligation's FIRST
+# smoke-campaign-controller.py:132), measured from the obligation's FIRST
 # journal record -- the same clock the controller uses to call a step overdue
 # and escalate (owner_step:1975-1987). Past it this tick stops renewing, the
 # lease lapses within its remaining TTL, and the existing overdue/escalation

@@ -41,7 +41,23 @@ gate_owns() {
 }
 gate_owns "$(basename "$FIXTURE_DIR")"
 scaffold() { bash "$SCRIPT_DIR/smoke-run-scaffold.sh" "$@"; }
-barrier() { bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$@"; }
+# Every pr contract the scaffold writes owes a pair-identity record before a
+# barrier phase passes (XZO #2092; the rule is smoke-evidence-barrier.test.sh's
+# to cover). Seed a clean one where the contract asks for it and none exists,
+# so every barrier assertion below keeps testing what it tests.
+seed_pair_identity() { # <run-dir>
+  [ "$(jq -r '.pairIdentity // empty' "$1/completion-contract.json" 2>/dev/null)" = required ] || return 0
+  [ -e "$1/coordinator/identity.json" ] && return 0
+  mkdir -p "$1/coordinator"
+  # Shaped as `start` writes it: the barrier validates the frozen record, and a
+  # PR contract's sourceSha must be both commits and expectedSourceSha.
+  jq -c '.sourceSha as $s | {ok:true,freezeGeneration:1,history:[],expectedSourceSha:$s,
+      frontend:{service:"srv-seed00000001",deploy:"dep-seed00000001",commit:$s},
+      backend:{service:"srv-seed00000002",deploy:"dep-seed00000002",commit:$s}}' \
+    "$1/completion-contract.json" > "$1/coordinator/identity.json"
+  printf '{"label":"seed","verdict":"ok","freezeGeneration":1}\n' > "$1/coordinator/identity-checks.ndjson"
+}
+barrier() { seed_pair_identity "$1"; bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$@"; }
 
 # A short SHA is the shape a freehand contract would happily accept.
 if scaffold contract "$FIXTURE_DIR" deadbeef B1 >/dev/null 2>&1; then
@@ -79,6 +95,28 @@ SMOKE_CONTRACT_EXTRA="{\"sourceSha\":\"$OTHER_SHA\",\"requiredLaneMarkers\":[],\
 jq -e --arg sha "$SHA" '.sourceSha == $sha and (.requiredLaneMarkers | length == 2) and
   .schemaVersion == 2 and .pr == 5 and .repoSlug == "org__repo"' \
   "$FIXTURE_DIR/completion-contract.json" >/dev/null
+
+# XZO #2092: a pr contract declares that it owes pair identity, and no
+# deployment extra can take that back -- the fenced field is written after it.
+jq -e '.pairIdentity == "required"' "$FIXTURE_DIR/completion-contract.json" >/dev/null || {
+  echo "expected a pr contract to declare pairIdentity required" >&2; exit 1; }
+SMOKE_CONTRACT_EXTRA='{"pairIdentity":null}' \
+  scaffold contract "$FIXTURE_DIR" "$SHA" B1:browser S1:source --regenerate >/dev/null
+jq -e '.pairIdentity == "required"' "$FIXTURE_DIR/completion-contract.json" >/dev/null || {
+  echo "expected SMOKE_CONTRACT_EXTRA not to be able to drop pairIdentity" >&2; exit 1; }
+# A contract that predates the field keeps its terms through a rewrite: the
+# run started without the requirement and must not have it land mid-run.
+jq 'del(.pairIdentity)' "$FIXTURE_DIR/completion-contract.json" > "$FIXTURE_DIR/.pre-2092" &&
+  mv "$FIXTURE_DIR/.pre-2092" "$FIXTURE_DIR/completion-contract.json"
+scaffold contract "$FIXTURE_DIR" "$SHA" B1:browser S1:source --regenerate >/dev/null
+jq -e 'has("pairIdentity") | not' "$FIXTURE_DIR/completion-contract.json" >/dev/null || {
+  echo "expected --regenerate over a pre-requirement contract to keep it without pairIdentity" >&2; exit 1; }
+# ...and one that carries it keeps it.
+jq '.pairIdentity = "required"' "$FIXTURE_DIR/completion-contract.json" > "$FIXTURE_DIR/.post-2092" &&
+  mv "$FIXTURE_DIR/.post-2092" "$FIXTURE_DIR/completion-contract.json"
+scaffold contract "$FIXTURE_DIR" "$SHA" B1:browser S1:source --regenerate >/dev/null
+jq -e '.pairIdentity == "required"' "$FIXTURE_DIR/completion-contract.json" >/dev/null || {
+  echo "expected --regenerate to keep a contract's pairIdentity requirement" >&2; exit 1; }
 
 # Valid JSON with an invalid UTC timestamp is not a usable shared lease.
 jq '.expiresAt="not-a-timestamp"' "$SMOKE_GATE_LEASE_DIR/lease-$(basename "$FIXTURE_DIR").json" \
@@ -259,6 +297,9 @@ SMOKE_GATE_OWNER=owner-b scaffold adopt "$ADOPT" "$SHA" |
 # Only the owner binding moved. Lanes, generations, marker list, createdAt,
 # sourceSha and runId are untouched; no marker file was rewritten.
 [ "$(jq -c '[.lanes, .requiredLaneMarkers, .createdAt, .sourceSha, .runId]' "$ADOPT/completion-contract.json")" = "$ADOPT_LANES" ]
+# ...and so did not the run's pair-identity terms (XZO #2092).
+jq -e '.pairIdentity == "required"' "$ADOPT/completion-contract.json" >/dev/null || {
+  echo "expected adoption to keep the contract's pairIdentity requirement" >&2; exit 1; }
 [ "$(sha256sum "$ADOPT/markers/B1.json" | cut -d' ' -f1)" = "$ADOPT_B1_HASH" ]
 [ "$(sha256sum "$ADOPT/markers/S1.json" | cut -d' ' -f1)" = "$ADOPT_S1_HASH" ]
 # History records THAT ownership changed hands and when — nothing derived from
@@ -405,7 +446,9 @@ scaffold contract "$FIXTURE_DIR" "$OTHER_SHA" B1:browser S1:source >/dev/null
 # The barrier exits non-zero when not ready, so capture before asserting —
 # under `pipefail` a direct pipe would fail the test on the exit code alone.
 REFROZEN="$(barrier "$FIXTURE_DIR" lanes || true)"
-jq -e '.ready == false and (.invalid | sort == ["markers/B1.json","markers/S1.json"])' \
+# The pair frozen for the old build is bound to it too: its commits are the old
+# sourceSha, so the barrier refuses it until the new build's pair is re-frozen.
+jq -e '.ready == false and (.invalid | sort == ["coordinator/identity.json","markers/B1.json","markers/S1.json"])' \
   <<<"$REFROZEN" >/dev/null
 
 # F2. The barrier has always honoured `.generation`, but NOTHING could write
@@ -656,6 +699,9 @@ jq -e '.ok == false and (.error | test("does not hold the gate")) and (.error | 
 gate task-claim "$TASK_RUN_ID" "$SHA" | jq -e '.ok == true' >/dev/null
 scaffold contract "$TASK_RUN" "$SHA" B1:browser:'certification lane' \
   | jq -e '.ok == true and .laneCount == 1' >/dev/null
+# Only a pr contract owes pair identity (XZO #2092); a task run is unchanged.
+jq -e 'has("pairIdentity") | not' "$TASK_RUN/completion-contract.json" >/dev/null || {
+  echo "expected a task-scoped contract not to declare pairIdentity" >&2; exit 1; }
 printf 'ok\n' >"$TASK_RUN/evidence/ok.txt"
 scaffold marker "$TASK_RUN" B1 pass 'certified' 'evidence/ok.txt' | jq -e '.ok == true' >/dev/null
 barrier "$TASK_RUN" lanes | jq -e '.ready == true' >/dev/null || {

@@ -365,6 +365,51 @@ expect_rc "$(run finish "$RUN15")" 2 bypass-restored-refuses-for-the-real-reason
 out | grep -Fq 'not redispatched since the pair re-freeze: A, B;' || \
   fail "bypass-restored-refuses-for-the-real-reason: expected the ordinary un-redispatched refusal after restoring the real snapshot"
 
+# --- 5i. A LATE freeze does not launder evidence gathered before it (XZO #2092)
+# The laundering sequence: lanes run and write markers with no pair frozen;
+# `start` then freezes whatever is live NOW and one ok `check` follows. Before,
+# that cleared finish and the barrier, so markers bound to no build supported a
+# verdict. A start that finds lane evidence on disk records itself as late and
+# snapshots the lanes like a re-freeze; nothing counts until each lane is
+# redispatched and re-run. A start with no marker yet is an ordinary freeze.
+[ "$(jq -r 'has("lateFreeze")' "$RUN5/coordinator/identity.json")" = false ] ||
+  fail "late-freeze: a start with no lane evidence on disk (run5) was recorded as late"
+RUNL="$T/run-late"; mkdir -p "$RUNL"
+gate_develop "$RUNL"
+scaffold contract "$RUNL" "$SRC_SHA" A B
+scaffold marker "$RUNL" A completed "A ran before any freeze"
+scaffold marker "$RUNL" B completed "B ran before any freeze"
+mk dep-fe000000001 live "$A" > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"
+mk dep-be000000001 live "$B" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+expect_rc "$(run start "$RUNL")" 0 late-start
+err | grep -q 'LATE FREEZE' || fail "late-start: start did not say the freeze was late"
+jq -e --arg sha "$SRC_SHA" '.lateFreeze.markersOnDisk == ["markers/A.json","markers/B.json"]
+    and .refreezeLaneSnapshot == {contractPresent: true, sourceSha: $sha, lanes: [{id: "A", generation: 1}, {id: "B", generation: 1}]}
+    and .freezeGeneration == 1 and .history == []' "$RUNL/coordinator/identity.json" >/dev/null ||
+  fail "late-start: identity.json does not record the late freeze and its lane snapshot"
+expect_rc "$(run check "$RUNL" coordinator-after-late-start)" 0 late-check-ok
+# The laundering step: an ok check on the late freeze must NOT clear the lanes.
+expect_rc "$(run finish "$RUNL")" 2 late-finish-refuses
+out | grep -Fq 'not redispatched since the pair was frozen late: A, B;' ||
+  fail "late-finish-refuses: finish did not name both lanes as run before the freeze"
+conclusions "$RUNL"
+BOUT="$(bash "$BARRIER" "$RUNL" synthesis || true)"
+jq -e '.ready == false and (.invalid | sort) == ["markers/A.json","markers/B.json"]
+       and all(.invalidReasons[]; contains("frozen LATE") and contains("redispatch"))' <<<"$BOUT" >/dev/null ||
+  { echo "$BOUT" > "$T/out"; fail "late-barrier-refuses"; }
+# Recovery is possible: redispatch, re-run with checks, and the same run passes.
+scaffold redispatch "$RUNL" A
+scaffold redispatch "$RUNL" B
+for l in A B; do
+  expect_rc "$(run check "$RUNL" "lane-$l-start")" 0 "late-recovery-check-$l"
+  scaffold marker "$RUNL" "$l" completed "$l re-run on the frozen pair"
+done
+expect_rc "$(run finish "$RUNL")" 0 late-finish-after-redispatch
+bash "$BARRIER" "$RUNL" synthesis | jq -e '.ready == true' >/dev/null || fail "late-barrier-ready-after-redispatch"
+# The one bounded refreeze is still available after a late freeze.
+mk dep-be000000009 live "$C" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+expect_rc "$(run refreeze "$RUNL" "backend replaced after the late freeze")" 0 late-then-refreeze-allowed
+
 # --- 6. Success without evidence: an actual truncated write is refused -----
 # Needs mount privilege (a full 64k tmpfs forces a real short write); skip
 # quietly otherwise — the read-back-before-install code path this exercises
@@ -417,5 +462,86 @@ tail -1 "$RUN16/coordinator/identity-checks.ndjson" | jq -e --arg sha "$SRC_SHA"
 expect_rc "$(run finish "$RUN16")" 3 pr-finish-blocks-source-mismatch
 out | grep -Fq "finish: source mismatch" ||
   fail "pr-finish-blocks-source-mismatch: finish did not preserve BLOCKED semantics"
+
+# --- 8. The barrier accepts every record either writer produces, in either --
+#        contract order, and refuses a pair frozen for another build
+# There are exactly two writers of identity.json, `start` and `refreeze`, and
+# each writes expectedSourceSha only when a PR contract already exists. Two
+# closing reviews of #1039 found the barrier's frozen-record check refusing a
+# legitimate record from one writer path (refreeze, then start-before-contract),
+# so this drives every writer x contract-order combination through the real
+# verbs. Each contract names a required lane: with none, the barrier exits in
+# its prelude and never reaches the identity block, and an assertion that
+# identity.json was not refused passes vacuously -- so every accept below also
+# requires `has("phase")` (only a full barrier pass emits it) and the record on
+# disk.
+PR_OWNER_TOKEN="tok-pi-test-0001"
+pr_contract() { # <run> <sha> [ownershipKind]
+  jq -n --arg s "$2" --arg k "${3:-pr}" --arg r "$(basename "$1")" --arg t "$PR_OWNER_TOKEN" \
+    '{schemaVersion:2,sourceSha:$s,ownershipKind:$k,pairIdentity:"required",
+      requiredLaneMarkers:["markers/X.json"],lanes:[{id:"X",kind:"lane",generation:1}]}
+     + (if $k == "pr" then {coordinatorOwnerToken:$t,pr:9001,runId:$r,repoSlug:"acme/app"} else {} end)' \
+    > "$1/completion-contract.json"
+}
+serve_pair() { # <n> <frontend commit> <backend commit>
+  mk "$(printf 'dep-fe%09d' "$1")" live "$2" > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"
+  mk "$(printf 'dep-be%09d' "$1")" live "$3" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+}
+identity_verdict() { # <run> -> accept | refuse:<reason> | vacuous:<why>
+  local o
+  [ -s "$1/coordinator/identity.json" ] || { echo "vacuous:nothing frozen"; return; }
+  o="$(bash "$BARRIER" "$1" lanes 2>/dev/null || true)"
+  jq -e 'has("phase")' <<<"$o" >/dev/null 2>&1 || { echo "vacuous:barrier exited before the identity block: $o"; return; }
+  jq -r 'if (.invalid | index("coordinator/identity.json")) != null
+         then "refuse:" + ([.invalidReasons[] | select(startswith("coordinator/identity.json"))][0])
+         elif (.missing | index("coordinator/identity.json")) != null then "vacuous:identity.json listed missing"
+         else "accept" end' <<<"$o"
+}
+expect_accept() { local got; got="$(identity_verdict "$1")"; [ "$got" = accept ] || fail "$2: expected the barrier to accept the frozen record, got $got"; }
+expect_refuse() { # <run> <reason substring> <label>
+  local got; got="$(identity_verdict "$1")"
+  case "$got" in refuse:*"$2"*) ;; *) fail "$3: expected a refusal naming '$2', got $got" ;; esac
+}
+n8=0; run8() { n8=$((n8 + 1)); R8="$T/run8-$n8"; mkdir -p "$R8"; }
+
+# 8a. contract -> start: the ordinary order.
+run8; serve_pair 81 "$SRC_SHA" "$SRC_SHA"; pr_contract "$R8" "$SRC_SHA"
+expect_rc "$(run start "$R8")" 0 m8a-start; expect_accept "$R8" m8a
+# 8b. start BEFORE the contract (supported: SKILL.md "Every run, from the
+#     coordinator freezing before dispatch"): no expectedSourceSha is written,
+#     and its absence must not refuse -- the commits bind the pair.
+run8; serve_pair 82 "$SRC_SHA" "$SRC_SHA"; expect_rc "$(run start "$R8")" 0 m8b-start
+jq -e 'has("expectedSourceSha") | not' "$R8/coordinator/identity.json" >/dev/null || fail "m8b: fixture premise: start wrote expectedSourceSha with no contract"
+pr_contract "$R8" "$SRC_SHA"; expect_accept "$R8" m8b
+# 8c. start -> refreeze, both before the contract -> contract.
+run8; serve_pair 83 "$SRC_SHA" "$SRC_SHA"; expect_rc "$(run start "$R8")" 0 m8c-start
+serve_pair 84 "$SRC_SHA" "$SRC_SHA"; expect_rc "$(run refreeze "$R8" "redeployed before dispatch")" 0 m8c-refreeze
+pr_contract "$R8" "$SRC_SHA"; expect_accept "$R8" m8c
+# 8d. contract -> start -> redeploy -> drift -> refreeze: refreeze keeps the
+#     binding start wrote (#1039 closing review 1).
+run8; serve_pair 85 "$SRC_SHA" "$SRC_SHA"; pr_contract "$R8" "$SRC_SHA"
+expect_rc "$(run start "$R8")" 0 m8d-start; expect_rc "$(run check "$R8" before)" 0 m8d-check
+serve_pair 86 "$SRC_SHA" "$SRC_SHA"; expect_rc "$(run check "$R8" after-redeploy)" 3 m8d-drift
+expect_rc "$(run refreeze "$R8" "backend redeployed at the same source")" 0 m8d-refreeze
+jq -e --arg s "$SRC_SHA" '.freezeGeneration == 2 and .expectedSourceSha == $s' "$R8/coordinator/identity.json" >/dev/null ||
+  fail "m8d: the re-frozen record dropped the PR source binding: $(cat "$R8/coordinator/identity.json")"
+expect_accept "$R8" m8d
+# 8e. start -> contract -> refreeze.
+run8; serve_pair 87 "$SRC_SHA" "$SRC_SHA"; expect_rc "$(run start "$R8")" 0 m8e-start; pr_contract "$R8" "$SRC_SHA"
+serve_pair 88 "$SRC_SHA" "$SRC_SHA"; expect_rc "$(run refreeze "$R8" "redeployed")" 0 m8e-refreeze; expect_accept "$R8" m8e
+# 8f. The develop pair frozen before the PR contract existed is bound to
+#     another build: refused, naming refreeze as the repair -- which works.
+run8; serve_pair 89 "$A" "$B"; expect_rc "$(run start "$R8")" 0 m8f-start; pr_contract "$R8" "$SRC_SHA"
+expect_refuse "$R8" "bound to a different build" m8f; expect_refuse "$R8" "refreeze" m8f-names-repair
+serve_pair 90 "$SRC_SHA" "$SRC_SHA"; expect_rc "$(run refreeze "$R8" "froze the develop pair before the contract")" 0 m8f-refreeze
+expect_accept "$R8" m8f-repaired
+# 8g. The contract regenerated onto a new build after the freeze: the recorded
+#     expectedSourceSha names the old one. Refused; refreeze on the new pair repairs it.
+run8; serve_pair 91 "$SRC_SHA" "$SRC_SHA"; pr_contract "$R8" "$SRC_SHA"; expect_rc "$(run start "$R8")" 0 m8g-start
+pr_contract "$R8" "$SRC_SHA2"; expect_refuse "$R8" "names a different build" m8g
+serve_pair 92 "$SRC_SHA2" "$SRC_SHA2"; expect_rc "$(run refreeze "$R8" "new build")" 0 m8g-refreeze; expect_accept "$R8" m8g-repaired
+# 8h. A develop contract binds no source: a split pair is accepted in either order.
+run8; serve_pair 93 "$A" "$B"; pr_contract "$R8" "$SRC_SHA" develop; expect_rc "$(run start "$R8")" 0 m8h-start; expect_accept "$R8" m8h
+run8; serve_pair 94 "$A" "$B"; expect_rc "$(run start "$R8")" 0 m8h2-start; pr_contract "$R8" "$SRC_SHA" develop; expect_accept "$R8" m8h2
 
 echo "smoke pair identity tests passed"

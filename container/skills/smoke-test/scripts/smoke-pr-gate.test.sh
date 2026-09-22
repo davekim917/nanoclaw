@@ -2106,7 +2106,7 @@ STALL_OWNER="$(jq -r '.data.coordinatorOwnerToken' <<<"$STALL_OPEN")"
 mkdir -p "$SMOKE_GATE_RUN_ROOT/$STALL_RUN/challenger"
 echo "disposition: no blocking findings" > "$SMOKE_GATE_RUN_ROOT/$STALL_RUN/challenger/disposition.md"
 # The contract as the scaffold writes it today (schemaVersion 2, campaign
-# identity beside the token, smoke-run-scaffold.sh:541-552); a legacy v1 one
+# identity beside the token, smoke-run-scaffold.sh:558-569); a legacy v1 one
 # is exercised on PR 64 below.
 jq -cn --arg o "$STALL_OWNER" --arg run "$STALL_RUN" --arg sha "$STALL_SHA" \
   '{schemaVersion:2,runId:$run,sourceSha:$sha,coordinatorOwnerToken:$o,ownershipKind:"pr",pr:61,repoSlug:"org/repo"}' \
@@ -3285,6 +3285,18 @@ jq -e '.ownerAdoptions == [.ownerAdoptions[0]] and (.ownerAdoptions[0] | keys ==
 # same bytes at the same generation and still satisfies the barrier.
 scaffold_as "$ADOPT_T2" marker "$ADOPT_DIR" S1 completed 'by the recovery owner' | jq -e '.ok == true and .generation == 1' >/dev/null
 [ "$(sha256sum "$ADOPT_DIR/markers/B1.json" | cut -d' ' -f1)" = "$ADOPT_B1_HASH" ]
+# The scaffold's pr contract also owes a pair-identity record before a barrier
+# phase passes (XZO #2092, covered by smoke-evidence-barrier.test.sh); seed a
+# clean one so this still asserts only what adoption leaves behind.
+jq -e '.pairIdentity == "required"' "$ADOPT_DIR/completion-contract.json" >/dev/null
+mkdir -p "$ADOPT_DIR/coordinator"
+# Shaped exactly as `start` writes it on a PR contract: the barrier validates
+# the frozen record before reading any receipt.
+jq -c '.sourceSha as $s | {ok:true,freezeGeneration:1,history:[],expectedSourceSha:$s,
+    frontend:{service:"srv-seed00000001",deploy:"dep-seed00000001",commit:$s},
+    backend:{service:"srv-seed00000002",deploy:"dep-seed00000002",commit:$s}}' \
+  "$ADOPT_DIR/completion-contract.json" > "$ADOPT_DIR/coordinator/identity.json"
+printf '{"label":"seed","verdict":"ok","freezeGeneration":1}\n' > "$ADOPT_DIR/coordinator/identity-checks.ndjson"
 bash "$BARRIER" "$ADOPT_DIR" lanes | jq -e '.ready == true' >/dev/null
 [ "$(jq -r '.challengerDeadline' "$STATE_DIR/pr-126-state.json")" = "$ADOPT_DEADLINE" ]
 OUT="$(bash "$GATE" finish "$POLL_FAIL_SHA" "$ADOPT_RUN" NO_GO "$ADOPT_T2" || true)"

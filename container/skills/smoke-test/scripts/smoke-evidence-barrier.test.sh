@@ -567,4 +567,145 @@ echo "$RESULT" | jq -e '
 ' >/dev/null || {
   echo "expected a lane the snapshot never named, above its highest generation, not to be flagged as un-redispatched" >&2; echo "$RESULT" >&2; exit 1; }
 
+# --- pair identity, when the contract requires it (XZO #2092) ---------------
+# Two campaigns synthesised GO and published BLOCKED on "pair identity not ok
+# (last check: none)" alone, because the only enforcement point was the
+# controller's verdict and this barrier reported ready with no identity record
+# at all. A contract carrying pairIdentity:"required" now owes it here. The
+# MISSING -> INVALID transitions are asserted exactly: the controller re-offers
+# an acknowledged step on a change in invalid[] and never on missing[], so which
+# list an absence lands in decides whether the owner is ever told.
+PI="$FIXTURE_DIR/pi run with spaces"
+PI_SHA="1111111111111111111111111111111111111111"
+mkdir -p "$PI/markers" "$PI/coordinator" "$PI/challenger"
+pi_contract() { # [pairIdentity value, or "" to omit] [generation]
+  jq -n --arg sha "$PI_SHA" --arg mode "${1-required}" --argjson g "${2:-1}" \
+    '{schemaVersion:1,sourceSha:$sha,ownershipKind:"develop",
+      requiredLaneMarkers:["markers/X.json","markers/Y.json"],
+      lanes:[{id:"X",kind:"lane",generation:$g},{id:"Y",kind:"lane",generation:$g}]}
+     + (if $mode == "" then {} else {pairIdentity:$mode} end)' > "$PI/completion-contract.json"
+}
+pi_marker() { # <lane> [generation]
+  jq -n --arg sha "$PI_SHA" --arg l "$1" --argjson g "${2:-1}" \
+    '{lane:$l,sourceSha:$sha,generation:$g,status:"completed",completedAt:"2026-09-22T10:00:00Z"}' > "$PI/markers/$1.json"
+}
+pi_freeze() { # [freezeGeneration]
+  jq -n --argjson g "${1:-1}" --arg sha "$PI_SHA" \
+    '{ok:true,freezeGeneration:$g,history:(if $g > 1 then [{reason:"backend replaced"}] else [] end),
+      frontend:{service:"srv-pife000000001",deploy:"dep-pife000000001",commit:$sha},
+      backend:{service:"srv-pibe000000001",deploy:"dep-pibe000000001",commit:$sha}}
+     + (if $g > 1 then {refreezeLaneSnapshot:{contractPresent:true,sourceSha:$sha,
+          lanes:[{id:"X",generation:1},{id:"Y",generation:1}]}} else {} end)' > "$PI/coordinator/identity.json"
+}
+pi_checks() { printf '%s\n' "$@" > "$PI/coordinator/identity-checks.ndjson"; }
+pi_barrier() { bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$PI" "$1" || true; }
+pi_expect() { # <phase> <jq predicate> <message>
+  local out; out="$(pi_barrier "$1")"
+  echo "$out" | jq -e "$2" >/dev/null || { echo "pair identity: $3" >&2; echo "$out" >&2; exit 1; }
+}
+pi_contract required
+
+# The #2088 shape from the start: nothing frozen, no lane run yet. Normal first
+# step, so it is progress (missing), not a refusal the owner is woken for.
+pi_expect lanes '.ready == false and (.missing | index("coordinator/identity.json") != null) and .invalid == []' \
+  "an unfrozen run with no lane evidence yet must list identity.json as missing, not refuse"
+# A lane has written evidence against a pair nobody froze: a refusal, naming
+# the PR-preview start command rather than the develop pair.
+pi_marker X
+pi_expect lanes '.invalid == ["coordinator/identity.json"]
+    and (.invalidReasons[0] | contains("never frozen") and contains("smoke-pair-identity.sh start")
+         and contains("never the develop pair"))' \
+  "lane evidence with no frozen pair must be refused with the start command"
+# #2045's shape: frozen, never checked. Lanes still running -> missing.
+pi_freeze
+pi_expect lanes '.invalid == [] and (.missing | index("coordinator/identity-checks.ndjson") != null)' \
+  "a frozen run with lanes still outstanding must list the check record as missing"
+# ...and the moment the last marker lands, a refusal carrying the exact check
+# command with the FROZEN ids (never the gate env's develop pair).
+pi_marker Y
+for phase in lanes synthesis; do
+  printf '# p\n' > "$PI/coordinator/preliminary.md"; printf '# d\n' > "$PI/challenger/disposition.md"
+  pi_expect "$phase" '.ready == false and .invalid == ["coordinator/identity-checks.ndjson"]
+      and (.invalidReasons[0] | contains("every lane marker is in")
+           and contains("SMOKE_GATE_FRONTEND_SERVICE=srv-pife000000001 SMOKE_GATE_BACKEND_SERVICE=srv-pibe000000001"))' \
+    "$phase: finished lanes with no check must be refused with the frozen-id check command"
+done
+# A clean record clears both phases.
+pi_checks '{"label":"X-end","verdict":"ok","freezeGeneration":1}'
+pi_expect lanes '.ready == true' "an ok check must clear lanes"
+pi_expect synthesis '.ready == true' "an ok check must clear synthesis"
+# The frozen record is validated BEFORE any receipt is trusted (#1039 round 3):
+# `{}` plus a hand-written ok line used to read as ready, i.e. GO with no pair
+# ever recorded. Each malformed shape refuses; the clean one above still passes.
+cp "$PI/coordinator/identity.json" "$PI/id.good"
+for bad in '{}' \
+    "$(jq -c '.ok = false' "$PI/id.good")" \
+    "$(jq -c 'del(.backend)' "$PI/id.good")" \
+    "$(jq -c '.frontend.commit = ""' "$PI/id.good")" \
+    "$(jq -c 'del(.backend.deploy)' "$PI/id.good")" \
+    "$(jq -c '.freezeGeneration = 0' "$PI/id.good")" \
+    '[]'; do
+  printf '%s\n' "$bad" > "$PI/coordinator/identity.json"
+  pi_expect synthesis '.ready == false and .invalid == ["coordinator/identity.json"]' \
+    "a malformed identity.json ($bad) must refuse, not read as ready"
+done
+# ...and the round-3 shape is caught by THIS check, not by an unrelated rule.
+printf '{}\n' > "$PI/coordinator/identity.json"
+pi_expect synthesis '(.invalidReasons[0] | contains("not a frozen pair") and contains("ok is not true"))' \
+  "an empty identity.json must be refused as not a frozen pair"
+# A PR contract binds the freeze to its sourceSha: the record must name it and
+# both frozen commits must equal it. (This hand-made pr contract is incomplete
+# for the contract's own rules, so these assert only on identity.json.)
+jq '.ownershipKind = "pr" | .coordinatorOwnerToken = "tok-pi-fixture-0001" | .pr = 9001 | .runId = "pi run with spaces"' "$PI/completion-contract.json" > "$PI/c.tmp" && mv "$PI/c.tmp" "$PI/completion-contract.json"
+jq -c '. + {expectedSourceSha:"2222222222222222222222222222222222222222"}' "$PI/id.good" > "$PI/coordinator/identity.json"
+pi_expect synthesis '(.invalid | index("coordinator/identity.json")) != null and any(.invalidReasons[]; contains("names a different build"))' \
+  "a PR freeze naming another sourceSha must refuse"
+jq -c --arg s "$PI_SHA" '. + {expectedSourceSha:$s} | .backend.commit = "3333333333333333333333333333333333333333"' "$PI/id.good" > "$PI/coordinator/identity.json"
+pi_expect synthesis '(.invalid | index("coordinator/identity.json")) != null and any(.invalidReasons[]; contains("the frozen commits are not"))' \
+  "a PR freeze whose commits are not the sourceSha must refuse"
+jq -c --arg s "$PI_SHA" '. + {expectedSourceSha:$s}' "$PI/id.good" > "$PI/coordinator/identity.json"
+pi_expect synthesis '(.invalid | index("coordinator/identity.json")) == null' "a well-formed PR freeze must not be refused"
+pi_contract required
+cp "$PI/id.good" "$PI/coordinator/identity.json"
+# A genuine mismatch is NOT cleared by a later ok: the pair did change.
+for bad in drift source-mismatch; do
+  pi_checks "{\"label\":\"X-start\",\"verdict\":\"$bad\",\"freezeGeneration\":1}" \
+            '{"label":"X-end","verdict":"ok","freezeGeneration":1}'
+  pi_expect synthesis ".ready == false and .invalid == [\"coordinator/identity-checks.ndjson\"]
+      and (.invalidReasons[0] | contains(\"recorded $bad\") and contains(\"refreeze\") and contains(\"never re-run start\"))" \
+    "a $bad followed by an ok check must stay refused"
+done
+# A transient unreadable read is cleared by the next good read, but not before.
+pi_checks '{"label":"a","verdict":"ok"}' '{"label":"b","verdict":"unreadable"}'
+pi_expect lanes '.invalid == ["coordinator/identity-checks.ndjson"] and (.invalidReasons[0] | contains("is unreadable, not ok"))' \
+  "a latest unreadable check must be refused"
+pi_checks '{"label":"a","verdict":"ok"}' '{"label":"b","verdict":"unreadable"}' '{"label":"c","verdict":"ok"}'
+pi_expect lanes '.ready == true' "an unreadable read followed by an ok read must clear"
+# A damaged record cannot be healed by appending, so it says so.
+pi_checks '{"label":"a","verdict":"ok"}' 'not json'
+pi_expect lanes '.invalid == ["coordinator/identity-checks.ndjson"]
+    and (.invalidReasons[0] | contains("line 2 is not a JSON object") and contains("cannot repair it"))' \
+  "a damaged check record must be refused as unrepairable by another check"
+# A refreeze retires the old generation's receipts: a drift at generation 1
+# does not block a clean generation-2 record once every lane is redispatched.
+pi_contract required 2; pi_marker X 2; pi_marker Y 2; pi_freeze 2
+pi_checks '{"label":"X-mid","verdict":"drift","freezeGeneration":1}' '{"label":"X-end","verdict":"ok","freezeGeneration":2}'
+pi_expect synthesis '.ready == true' "a drift at a retired freeze generation must not block the current one"
+# ...and generation-1 receipts alone do not satisfy generation 2.
+pi_checks '{"label":"X-end","verdict":"ok","freezeGeneration":1}'
+pi_expect synthesis '.invalid == ["coordinator/identity-checks.ndjson"] and (.invalidReasons[0] | contains("generation 2"))' \
+  "receipts from a retired generation alone must not satisfy the current one"
+# An unknown mode refuses instead of switching the check off.
+pi_contract yes 2
+pi_expect lanes '.invalid == ["completion-contract.json"] and (.invalidReasons[0] | contains("the only value is \"required\""))' \
+  "an unknown pairIdentity value must refuse"
+# No field: the barrier's previous answer, exactly -- identity files or not.
+pi_contract "" 2
+mv "$PI/coordinator/identity.json" "$PI/coordinator/identity.json.off"
+mv "$PI/coordinator/identity-checks.ndjson" "$PI/coordinator/identity-checks.ndjson.off"
+pi_expect synthesis '.ready == true' "a contract without pairIdentity must be unaffected by the missing identity record"
+# The challenger's disposition gate never waits on pair identity.
+pi_contract required
+pi_expect disposition '.ready == true' "the disposition gate must ignore pair identity"
+
 echo "smoke evidence barrier tests passed"
