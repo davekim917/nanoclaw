@@ -4,7 +4,7 @@
  * returned in their on-disk shape so the callers' mapping code — and its
  * tolerance for partially populated rows — is unchanged.
  */
-import { getInboundDb, getOutboundDb } from '../../mailbox/sqlite/connection.js';
+import { getInboundDb, getOutboundDb, openInboundDb } from '../../mailbox/sqlite/connection.js';
 
 export interface DestinationRow {
   name: string;
@@ -141,5 +141,29 @@ export function hasChatOutboundAfter(
     );
   } catch {
     return true;
+  }
+}
+
+/**
+ * Whether a `wait` wake is still pending and not yet due (host row
+ * `schedule-wake-<id>`, src/modules/scheduled-wake/index.ts:96). Read through a
+ * fresh handle: the host writes messages_in continuously. bun:sqlite answers a
+ * missing row with null, not undefined.
+ */
+export function hasFutureSelfWake(): boolean {
+  const db = openInboundDb();
+  try {
+    return (
+      db
+        .prepare(
+          `SELECT 1 FROM messages_in
+            WHERE id LIKE 'schedule-wake-%' AND status = 'pending'
+              AND process_after IS NOT NULL AND datetime(process_after) > datetime('now')
+            LIMIT 1`,
+        )
+        .get() != null
+    );
+  } finally {
+    db.close();
   }
 }
