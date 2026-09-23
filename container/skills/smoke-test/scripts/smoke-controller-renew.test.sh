@@ -508,6 +508,30 @@ write_env live "export SMOKE_GATE_CLAIMANT='controller'"
 tick
 [ "$(field '.data.status')" = misconfigured ] || fail "SMOKE_GATE_CLAIMANT in the env file was not refused: $LAST"
 ok
+# Every other shell form that names the claimant is refused too: the wrapper
+# SOURCES the file, so assignment, a non-literal value, unset, readonly and a
+# multi-name export all reach the gate call's authority (time-box
+# smoke-renewer-repoint-re-8b5e step 3).
+for form in "SMOKE_GATE_CLAIMANT=controller" \
+  'SMOKE_GATE_CLAIMANT="$USER"' \
+  "unset SMOKE_GATE_CLAIMANT" \
+  "unset -v SMOKE_GATE_CLAIMANT" \
+  "readonly SMOKE_GATE_CLAIMANT=controller" \
+  "export SMOKE_GATE_FOO=1 SMOKE_GATE_CLAIMANT=controller" \
+  "declare -x SMOKE_GATE_CLAIMANT=controller" \
+  "  SMOKE_GATE_CLAIMANT=controller" \
+  "true; SMOKE_GATE_CLAIMANT=controller"; do
+  write_env live "$form"
+  tick
+  [ "$(field '.data.status')" = misconfigured ] || fail "claimant form was not refused: $form -> $LAST"
+done
+ok
+# A commented-out mention is not an assignment; refusing it would stop renewal
+# over a note. (Negative control for the loop above.)
+write_env live "# SMOKE_GATE_CLAIMANT=controller -- never set this here"
+tick
+[ "$(field '.data.status')" != misconfigured ] || fail "a commented-out claimant was refused: $LAST"
+ok
 write_env live
 sed -i "s|export SMOKE_CONTROLLER_OUT_DIR=.*|export SMOKE_CONTROLLER_OUT_DIR=\"\$HOME/out\"|" "$C/env.sh"
 tick
