@@ -11,6 +11,7 @@ import {
   isDependencyPath,
   isUsableCacheEntry,
   listInputFiles,
+  listProgramExternalFiles,
   pruneCache,
   restoreFromCache,
   storeInCache,
@@ -37,10 +38,27 @@ function makeRepo(root: string): void {
   fs.writeFileSync(path.join(root, 'dashboard', 'package.json'), '{"name":"spa"}');
   fs.writeFileSync(path.join(root, 'dashboard', 'pnpm-lock.yaml'), 'lockfileVersion: 9');
   fs.writeFileSync(path.join(root, 'dashboard', 'vite.config.ts'), 'export default {}');
-  fs.writeFileSync(path.join(root, 'dashboard', 'tsconfig.json'), '{}');
+  fs.writeFileSync(
+    path.join(root, 'dashboard', 'tsconfig.json'),
+    JSON.stringify({
+      compilerOptions: { module: 'ESNext', moduleResolution: 'bundler', jsx: 'react-jsx', noEmit: true },
+      include: ['src/**/*', 'vite.config.ts'],
+    }),
+  );
   fs.writeFileSync(path.join(root, 'dashboard', 'src', 'main.tsx'), 'export const a = 1;');
   fs.writeFileSync(path.join(root, 'dashboard', 'src', 'main.test.tsx'), 'it("x", () => {});');
   fs.writeFileSync(path.join(root, 'dashboard', 'src', 'test-setup.ts'), 'export {};');
+  // The real SPA imports host types by relative path (src/dashboard/observatory-v2/types.ts).
+  fs.writeFileSync(
+    path.join(root, 'dashboard', 'src', 'api.ts'),
+    "import type { Claim } from '../../src/dashboard/types.js';\nexport type C = Claim;\n",
+  );
+  fs.mkdirSync(path.join(root, 'src', 'dashboard'), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, 'src', 'dashboard', 'types.ts'),
+    "export type { State } from './state.js';\nexport interface Claim { state: 'open' | 'done' }\n",
+  );
+  fs.writeFileSync(path.join(root, 'src', 'dashboard', 'state.ts'), "export type State = 'a';\n");
   fs.mkdirSync(path.join(root, 'dashboard', 'node_modules', 'react'), { recursive: true });
   fs.writeFileSync(path.join(root, 'dashboard', 'node_modules', 'react', 'index.js'), 'x');
 
@@ -100,6 +118,11 @@ describe('scripts/build-dashboard-spa.ts', () => {
       expect(files).toContain('dashboard/pnpm-lock.yaml');
       expect(files).toContain('dashboard/vite.config.ts');
       expect(files.some((f) => f.includes('node_modules'))).toBe(false);
+    });
+
+    it('adds host files the dashboard program compiles, and nothing else outside dashboard/', () => {
+      fs.writeFileSync(path.join(root, 'src', 'index.ts'), 'export const host = 1;');
+      expect(listProgramExternalFiles(root)).toEqual(['src/dashboard/state.ts', 'src/dashboard/types.ts']);
     });
 
     it('counts test files, because the SPA build is what typechecks them', () => {
@@ -171,6 +194,23 @@ describe('scripts/build-dashboard-spa.ts', () => {
     it('does not treat an unreadable Vite dotenv input as absent', () => {
       fs.mkdirSync(path.join(root, 'dashboard', '.env.production'));
       expect(() => computeInputHash(root, {})).toThrow();
+    });
+
+    it('changes when a host file the dashboard imports changes (#1078)', () => {
+      // A breaking change here must force a rebuild (and so a dashboard tsc),
+      // not restore the old bundle until an unrelated dashboard/ edit.
+      const before = computeInputHash(root);
+      fs.writeFileSync(
+        path.join(root, 'src', 'dashboard', 'types.ts'),
+        "export type { State } from './state.js';\nexport interface Claim { state: 'open' | 'done' | 'paused' }\n",
+      );
+      expect(computeInputHash(root)).not.toBe(before);
+    });
+
+    it('follows re-exports transitively out of the imported host file', () => {
+      const before = computeInputHash(root);
+      fs.writeFileSync(path.join(root, 'src', 'dashboard', 'state.ts'), "export type State = 'b';\n");
+      expect(computeInputHash(root)).not.toBe(before);
     });
 
     it('ignores host source changes outside dashboard/', () => {

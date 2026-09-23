@@ -38,11 +38,13 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
+import ts from 'typescript';
+
 /**
  * Bump when the set of hashed inputs or the cache layout changes, so old
  * entries can never be mistaken for a match under new rules.
  */
-export const CACHE_FORMAT_VERSION = 2;
+export const CACHE_FORMAT_VERSION = 3;
 
 /** Keep the last N distinct bundles. Each is ~750KB. */
 export const CACHE_KEEP = 3;
@@ -89,6 +91,54 @@ export function listInputFiles(repoRoot: string): string[] {
     if (!p) continue;
     if (isDependencyPath(p)) continue;
     seen.add(p);
+  }
+  return [...seen].sort();
+}
+
+/**
+ * Repo files OUTSIDE `dashboard/` that the dashboard's TypeScript program
+ * compiles — today `src/dashboard/observatory-v2/types.ts`, which eleven
+ * dashboard modules import by relative path. `dashboard/tsconfig.json`'s build
+ * typechecks them, so they are inputs: without them a breaking change there
+ * kept restoring the old bundle (skipping `tsc`) until an unrelated
+ * `dashboard/` edit surfaced it in a later deploy (#1078).
+ *
+ * Derived from the program itself rather than a list, so a new import, a
+ * re-export chain or a `paths` alias is covered the moment it exists. This
+ * builds the program (parse + module resolution) but does not typecheck it,
+ * ~1s. It uses the host's `typescript`, not `dashboard/`'s, because the
+ * decision is made before the dashboard's deps are installed; with those deps
+ * absent, a bare-specifier import simply fails to resolve, which cannot hide a
+ * repo file — only relative/aliased paths can reach one.
+ *
+ * Kept: files under `repoRoot`, outside `dashboard/`, not in any
+ * `node_modules` (lib `.d.ts` and package types are covered by the lockfiles).
+ */
+export function listProgramExternalFiles(repoRoot: string): string[] {
+  const configPath = path.join(repoRoot, 'dashboard', 'tsconfig.json');
+  const fail = (d: ts.Diagnostic): never => {
+    throw new Error(
+      `dashboard SPA: cannot read ${configPath}: ${ts.flattenDiagnosticMessageText(d.messageText, '\n')}`,
+    );
+  };
+  const parsed = ts.getParsedCommandLineOfConfigFile(
+    configPath,
+    {},
+    { ...ts.sys, onUnRecoverableConfigFileDiagnostic: fail },
+  );
+  if (!parsed) throw new Error(`dashboard SPA: cannot read ${configPath}`);
+  const program = ts.createProgram({
+    rootNames: parsed.fileNames,
+    options: parsed.options,
+    ...(parsed.projectReferences ? { projectReferences: parsed.projectReferences } : {}),
+  });
+  const seen = new Set<string>();
+  for (const sf of program.getSourceFiles()) {
+    const rel = path.relative(repoRoot, sf.fileName).split(path.sep).join('/');
+    if (rel.startsWith('../') || path.isAbsolute(rel)) continue;
+    if (rel === 'dashboard' || rel.startsWith('dashboard/')) continue;
+    if (isDependencyPath(rel)) continue;
+    seen.add(rel);
   }
   return [...seen].sort();
 }
@@ -141,7 +191,8 @@ export function hashInputs(repoRoot: string, files: string[], env: Environment =
 }
 
 export function computeInputHash(repoRoot: string, env: Environment = process.env): string {
-  return hashInputs(repoRoot, listInputFiles(repoRoot), env);
+  const files = new Set([...listInputFiles(repoRoot), ...listProgramExternalFiles(repoRoot)]);
+  return hashInputs(repoRoot, [...files].sort(), env);
 }
 
 export type BuildDecision =
