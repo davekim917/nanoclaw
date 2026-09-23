@@ -167,7 +167,7 @@ registerResource({
       name: 'default_model',
       type: 'string',
       description:
-        'Default model for this channel\'s sessions (ignored under session_mode=agent-shared, whose one session has no channel: src/container-runner.ts:1857). Stored verbatim and NOT validated here: a Claude family alias (`opus`/`sonnet`/`haiku`) is resolved at spawn and follows the install default, but a Codex alias (`sol`/`luna`/…) is passed through unresolved, so give Codex groups a full `gpt-*` id. An in-chat `-m` does NOT write this column: it sets a sticky on that one session only. Set at `ncl wirings create`; after that only this command and the agent\'s admin-only set_channel_model tool change it. NULL inherits the group/install default; `--default-model ""` clears it.',
+        'Default model for this channel\'s sessions (ignored under session_mode=agent-shared: that one session has no messaging_group_id, and the spawn path reads channel defaults only `if (session.messaging_group_id)`). Stored verbatim and NOT validated here: a Claude family alias (`opus`/`sonnet`/`haiku`) is resolved at spawn and follows the install default, but a Codex alias (`sol`/`luna`/…) is passed through unresolved, so give Codex groups a full `gpt-*` id. An in-chat `-m` does NOT write this column: it sets a sticky on that one session only. Set at `ncl wirings create`; after that only this command and the agent\'s admin-only set_channel_model tool change it. NULL inherits the group/install default; `--default-model ""` clears it.',
       updatable: true,
       nullable: true,
     },
@@ -175,7 +175,7 @@ registerResource({
       name: 'default_effort',
       type: 'string',
       description:
-        'Default reasoning effort for this channel\'s sessions (ignored under session_mode=agent-shared, like --default-model) — same vocabulary as the `-e` chat flag, and provider-specific in what it accepts. An in-chat `-e` does NOT write this column: it sets a sticky on that one session only. Set at `ncl wirings create`; after that only this command and the agent\'s admin-only set_channel_effort tool change it. NULL inherits the group/install default; `--default-effort ""` clears it.',
+        "Default reasoning effort for this channel's sessions (ignored under session_mode=agent-shared, like --default-model) — same vocabulary as the `-e` chat flag, and provider-specific in what it accepts. It is NOT validated here: on a Codex group, anything outside low|medium|high|xhigh|max|ultra fails the container's codexConfigSchema at boot and the session cannot start. An in-chat `-e` does NOT write this column: it sets a sticky on that one session only. Set at `ncl wirings create`; after that only this command and the agent's admin-only set_channel_effort tool change it. NULL inherits the group/install default; `--default-effort \"\"` clears it.",
       updatable: true,
       nullable: true,
     },
