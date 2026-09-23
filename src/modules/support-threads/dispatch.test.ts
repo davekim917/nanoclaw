@@ -174,7 +174,7 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
     expect(wakeContainer).toHaveBeenCalledTimes(1);
   });
 
-  it('inherits isolated poller routing and turn flags as sticky support-session defaults', async () => {
+  it('inherits isolated poller routing, and passes its turn flags as one-turn flags — never session stickies', async () => {
     await seed();
     const seriesId = 'task-support-poller';
     const { session: poller } = await resolveTaskSession('ag-1', seriesId);
@@ -199,12 +199,12 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
     await handleDispatchSupportIssue(dispatchContent('gthread-task', 'customer replied'), poller);
     pollerDb.close();
     const [seedMessage, followupMessage] = inboundOf(row!.session_id!);
-    expect(JSON.parse(seedMessage.content)).toMatchObject({
-      flagIntent: { stickyModel: 'gpt-5.6-terra', stickyEffort: 'xhigh' },
-    });
-    expect(JSON.parse(followupMessage.content)).toMatchObject({
-      flagIntent: { stickyModel: 'gpt-5.6-terra', stickyEffort: 'xhigh' },
-    });
+    // One-turn flags, never sticky: the poller's dispatched work runs on its
+    // pin, but a human reply in the thread must not inherit it.
+    for (const message of [seedMessage, followupMessage]) {
+      const { flagIntent } = JSON.parse(message.content) as { flagIntent: Record<string, unknown> };
+      expect(flagIntent).toEqual({ turnModel: 'gpt-5.6-terra', turnEffort: 'xhigh' });
+    }
   });
 
   it('with a known ticket (legacy dispatcher), seeds the comment-not-duplicate protocol', async () => {
