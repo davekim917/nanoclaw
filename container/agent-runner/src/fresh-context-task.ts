@@ -20,7 +20,7 @@
  * `resolveTaskSession`, src/session-manager.ts:428-444), never a chat session.
  */
 import type { MessageInRow } from './db/messages-in.js';
-import { openInboundDb } from './mailbox/sqlite/connection.js';
+import { hasFutureSelfWake } from './modules/mailbox/reads.js';
 import { getWorkContinuation } from './modules/mailbox/session-state.js';
 
 /** Whether this one task row's fire starts fresh. */
@@ -52,23 +52,7 @@ export function isFreshContextTaskBatch(messages: MessageInRow[]): boolean {
  * the wake or continuation later lands in the conversation that set it.
  */
 export function sessionHasOpenWork(): boolean {
-  if (getWorkContinuation() !== undefined) return true;
-  const db = openInboundDb();
-  // bun:sqlite answers a missing row with null, not undefined.
-  try {
-    return (
-      db
-        .prepare(
-          `SELECT 1 FROM messages_in
-            WHERE id LIKE 'schedule-wake-%' AND status = 'pending'
-              AND process_after IS NOT NULL AND datetime(process_after) > datetime('now')
-            LIMIT 1`,
-        )
-        .get() != null
-    );
-  } finally {
-    db.close();
-  }
+  return getWorkContinuation() !== undefined || hasFutureSelfWake();
 }
 
 /** Whether this batch is a scheduled fire that resets the conversation now. */
