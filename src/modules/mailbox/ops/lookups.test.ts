@@ -11,6 +11,17 @@ import { getRecoverableLifecycleStatus } from './lookups.js';
  * hold if the two parsers ever disagree: one bad row must not throw out of
  * delivery recovery or hide a recoverable row behind it. Stub handles are the
  * only way to present that row, so this drives the op with them directly.
+ *
+ * The stub routes on the op's literal SQL, so a query edit there must update
+ * it deliberately:
+ *   - inbound `.get` answers the receipt lookup, recognised by its
+ *     `platform_message_id` column (lookups.ts:151-154); the `SELECT 1`
+ *     delivered probe (lookups.ts:155) gets `undefined`, i.e. "no later
+ *     public message was delivered";
+ *   - outbound `.all` answers the candidate scan, recognised by its
+ *     `kind = 'status'` filter (lookups.ts:156-165); every other outbound
+ *     statement is the later-public-ids `.iterate` (lookups.ts:188-190),
+ *     answered empty.
  */
 function handles(
   rows: Array<{ id: string; seq: number; content: string; in_reply_to?: string | null }>,
