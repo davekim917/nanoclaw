@@ -13,7 +13,7 @@
            bars as Markdown (--md) and JSON (--json).
 
 Per-campaign scoring is the replay's own `summarize`
-(smoke-campaign-replay.py:480-557), imported, so a live number and a replay
+(smoke-campaign-replay.py:484-561), imported, so a live number and a replay
 number mean the same thing: missed obligations (pr-comment, freeze-close,
 root post, verdict post, finish, issues), controller-caused duplicates (two
 intents or two effect decisions for one key+attempt), false GO, escalations
@@ -366,7 +366,7 @@ def bar(ok, unknown=False):
 def window_duplicates(shadow_dir, journal, since, until):
     """Controller-caused duplicates over EVERY shadow record in the window,
     not just finished campaigns: a stuck or still-active campaign counts too.
-    Same two rules as the replay (smoke-campaign-replay.py:494-509): a second
+    Same two rules as the replay (smoke-campaign-replay.py:498-513): a second
     plain intent for one key+attempt, or a second effect decision for one
     type+key+attempt that was not a post-reconcile marker search. A repeat
     counts when the repeating record falls inside the window."""

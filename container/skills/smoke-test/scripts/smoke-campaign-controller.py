@@ -1279,14 +1279,14 @@ class EffectLayer:
         # AN ACK NEVER OUTLIVES THE BRIEF IT ACKNOWLEDGED. The ack is the
         # owner's first act on a wake and the controller only tests it for
         # existence, re-offering a wake solely while it is ABSENT (owner_step,
-        # :2334-2344); the renewer reads it the same way
+        # :2337-2347); the renewer reads it the same way
         # (smoke-controller-renew.sh, "brief-<step>.ack absent: no owner turn
         # holds this step"). So a brief rewritten under a NEW owner token would
         # otherwise inherit the previous brief's ack and be treated as taken,
         # and never re-offered -- the second half of XZO #2046. Removing it here
         # makes that impossible by construction rather than by sequencing: this
         # function runs only when the obligation is absent or `intent`
-        # (owner_step, :2311), never while a live brief is enqueued, so any ack
+        # (owner_step, :2314), never while a live brief is enqueued, so any ack
         # it finds belongs to a brief this write supersedes.
         try:
             dfd = _open_dir_contained(root, [run_id, "controller"], True)
@@ -2113,10 +2113,13 @@ class Controller:
             self.record(run_id, "gate", verb, "intent", 1, {"args": argv_tail, "verdict": verdict})
             crash_point("after-intent", "gate", verb)
         # Both terminal verbs are crash-safe on retry: `finish` holds a
-        # finishIntent and writes verdict.json once (smoke-pr-gate.sh:4108-4135),
-        # and `challenger-timeout` refuses once the slot is gone or a
-        # disposition exists (smoke-pr-gate.sh:4575-4625) -- so an intent with
-        # no recorded outcome is simply re-offered.
+        # finishIntent and writes verdict.json once (smoke-pr-gate.sh:4147-4160),
+        # and `challenger-timeout` answers "not the active run" once the slot
+        # is gone (:4596-4613), which _gate reads as unknown -- so an intent
+        # with no recorded outcome is simply re-offered. Its refusal once a
+        # disposition exists (:4652-4657) is a definitive refusal, recorded
+        # failed_terminal below; pre_finish never re-sends it (see the verb
+        # choice there).
         result = self.effects.perform({"type": "gate", "runId": run_id, "verb": effect_verb or verb,
                                        "args": argv_tail})
         self.decide(run_id, phase, "gate", "mechanical", "obligation due", verb=verb, args=argv_tail,
@@ -2941,8 +2944,8 @@ class Controller:
                 # THE OWNER IS WOKEN HERE, not only once the barrier passes.
                 # By this point every OTHER party's contribution the synthesis
                 # barrier checks has already been gated above: the lanes
-                # barrier is ready (:2908), coordinator/preliminary.md exists
-                # (:2925) and challenger/disposition.md exists (:2931). What
+                # barrier is ready (:2911), coordinator/preliminary.md exists
+                # (:2928) and challenger/disposition.md exists (:2934). What
                 # the synthesis barrier can still report is therefore the
                 # retained owner's -- `invalid[]` content it authored
                 # (journeys/scope-dispositions.json, or
@@ -2954,7 +2957,7 @@ class Controller:
                 # alone (smoke-controller-live.sh:168-175), so nobody was told;
                 # and _maybe_synthesis_overdue_blocked needs the very
                 # owner:synthesis obligation this branch declined to create
-                # (:3013-3015), so the terminal BLOCKED safety net could not
+                # (:3016-3018), so the terminal BLOCKED safety net could not
                 # fire either. This is the same blind spot as the lanes barrier
                 # (XZO #2047), on the sibling path.
                 timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)
@@ -3159,6 +3162,23 @@ class Controller:
             self.decide(run_id, phase, "wait", "wait", "pre-finish obligations pending", pending=pending)
             return "verdict"
         claim_sha = (self.gate.active_claims().get(run_id) or {}).get("sha")
+        # A REPLAYED FROZEN VERDICT IS PUBLISHED THROUGH A VERB WHOSE
+        # PRECONDITIONS STILL HOLD NOW. The verb is frozen with the verdict, but
+        # `challenger-timeout` is refused by the real gate once a non-empty
+        # challenger/disposition.md exists (smoke-pr-gate.sh:4652-4657), and a
+        # disposition can land after the timeout froze its BLOCKED -- between
+        # the fire that validates it and the one that finishes, since the
+        # verdict post must be receipted first. gate_verb records that refusal
+        # failed_terminal, and every later replay re-sent the same refused verb,
+        # so the run held its slot for good (a wedge since live mode, #945;
+        # the fake gate did not model the refusal, so no test saw it). `finish`
+        # BLOCKED has no disposition precondition (:3976-4127) and publishes the
+        # same verdict; that the challenger was late is still what the frozen
+        # failed checks say. Re-derived every fire, so a disposition that lands
+        # between this read and the gate's own is refused once and finished
+        # through `finish` on the next fire, under its own obligation slot.
+        if terminal_verb == "challenger-timeout" and run.has("challenger/disposition.md"):
+            terminal_verb = "finish"
         if verdict == "GO" and failed:
             # Unreachable by construction; asserted so a future edit cannot
             # turn a failed check into a GO finish.

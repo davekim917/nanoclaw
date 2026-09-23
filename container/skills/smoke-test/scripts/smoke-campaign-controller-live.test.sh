@@ -46,6 +46,10 @@ new_case() { # name [mode]
   mkdir -p "$C/state" "$C/runs" "$C/out" "$C/fake" "$C/bin"
   R="$C/runs/$RUN"
   export FAKE_STATE="$C/fake" FAKE_LOG="$C/fake/calls.ndjson" FAKE_GATE_STATE="$C/state"
+  # The run root the gate itself reads (smoke-pr-gate.sh:1304): the fake gate
+  # refuses `challenger-timeout` without it, and once a disposition is under
+  # it, exactly as the real one does. The controller gets --run-root below.
+  export SMOKE_GATE_RUN_ROOT="$C/runs"
   : >"$FAKE_LOG"
   printf '#!/usr/bin/env bash\nexec python3 %q gate "$@"\n' "$FAKES" >"$C/bin/gate.sh"
   printf '{"%s":"%s"}\n' "$PR" "$SHA" >"$C/heads.json"
@@ -248,6 +252,26 @@ writes() { jq -s '[.[] | select(.op=="enqueued" or .op=="commented" or .op=="cre
 jr() { jq -cs "$1" "$C/out/journal.ndjson"; }
 dq() { jq -cs "$1" "$C/out/$RUN/decisions.ndjson"; }
 finish_verdict() { jr '[.[] | select(.kind=="gate" and .state=="done") | .detail.verdict] | last'; }
+# A frozen challenger-timeout BLOCKED whose disposition landed before it could
+# finish: it must finish through `finish`, the verb the REAL gate still accepts
+# (challenger-timeout is refused once a disposition exists,
+# smoke-pr-gate.sh:4652-4657; the fake gate models that refusal), with the
+# frozen verdict and failed checks unchanged. The disposition is asserted first,
+# so a pass is never a run the late disposition never reached.
+late_disposition_finished() { # label deadline finish-at
+  [ -s "$R/challenger/disposition.md" ] || fail "$1: precondition -- the late disposition is on disk"
+  jr '[.[] | select(.kind=="verdict" and .slot=="validated") | .detail.terminalVerb] == ["challenger-timeout"]' \
+    | grep -qx true || fail "$1: precondition -- the verdict was frozen as a challenger-timeout: $(jr '[.[]|select(.kind=="verdict")]')"
+  [ "$(finish_verdict)" = '"BLOCKED"' ] || fail "$1: the frozen BLOCKED never finished -- the run holds its slot: $(finish_verdict)"
+  jr '[.[] | select(.kind=="gate" and .state=="done") | .slot] == ["finish"]' | grep -qx true \
+    || fail "$1: the frozen BLOCKED finishes through finish, exactly once: $(jr '[.[] | select(.kind=="gate")]')"
+  dq '[.[] | select(.type=="finish")] | last | .failedChecks == ["challenger-timeout: no disposition by '"$2"'"]' \
+    | grep -qx true || fail "$1: the published verdict still names the missed deadline: $(dq '[.[]|select(.type=="finish")]|last')"
+  jr '[.[] | select(.kind=="gate" and .state=="done") | .at] | first == "'"$3"'"' | grep -qx true \
+    || fail "$1: finish lands on $3, the fire after the receipt: $(jr '[.[] | select(.kind=="gate" and .state=="done") | .at]')"
+  [ "$(jq -r '.completedVerdict' "$C/state/pr-$PR-state.json")" = BLOCKED ] \
+    || fail "$1: the gate released the slot BLOCKED"
+}
 WAKES=()
 
 # Drive the campaign: ticks 0..last, each fire run twice on the SAME inputs
@@ -478,14 +502,16 @@ unset STALL
 # --- 5c. a frozen verdict settles even after the phase files move under it -------
 # The challenger deadline passes with lanes pending: challenger-timeout BLOCKED
 # is validated and its post enqueued. The disposition then lands before the
-# post's receipt; the next fire must still settle and finish, not park in lanes.
+# post's receipt; the next fire must still settle and finish, not park in lanes
+# -- and must finish through `finish`: this case used to assert the frozen verb
+# (challenger-timeout) was kept, which only the fake gate accepted; the real
+# one refuses it once a disposition exists and the run then held its slot for
+# good (PR #1066 round 1).
 new_case late-disposition
 STALL=30 LATE_DISPOSITION=4 DEADLINE=2026-09-18T10:25:00Z campaign 8
-[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "late disposition: the frozen BLOCKED still finishes: $(finish_verdict)"
-jr '[.[] | select(.kind=="gate" and .slot=="challenger-timeout" and .state=="done")] | length == 1' | grep -qx true \
-  || fail "late disposition: the frozen verdict keeps its terminal verb"
-fin_at="$(jr '[.[] | select(.kind=="gate" and .state=="done") | .at] | first')"
-[ "$fin_at" = '"2026-09-18T10:40:00Z"' ] || fail "late disposition: finish lands the fire after the receipt, got $fin_at"
+late_disposition_finished "late disposition" 2026-09-18T10:25:00Z 2026-09-18T10:40:00Z
+[ "$(jq -s '[.[] | select(.tool=="gate" and .op=="challenger-timeout")] | length' "$FAKE_LOG")" = 0 ] \
+  || fail "late disposition: a timeout the disposition had already answered was sent to the gate"
 unset STALL LATE_DISPOSITION DEADLINE
 
 # --- 6. live and shadow apply the same rules ------------------------------------
@@ -1416,14 +1442,52 @@ jr '[.[] | select(.kind=="send") | .slot] | unique' | grep -qx '\["verdict"\]' \
 
 # b) the challenger files between the two fires: the timeout condition is then
 #    false, and the frozen BLOCKED must still settle rather than fall back into
-#    an intake it can never leave (the ladder's pr1896 replay, from intake).
+#    an intake it can never leave (the ladder's pr1896 replay, from intake) --
+#    through `finish`, since the real gate refuses the frozen verb now.
 new_case t2093-late-disposition
 NO_CONTRACT=1 LATE_DISPOSITION=4 DEADLINE="$DL" campaign 6
-timed_out "#2093(late disposition)"
-[ -e "$R/challenger/disposition.md" ] \
-  || fail "#2093(late): precondition -- the disposition landed, so the finishing fire could not have re-timed-out"
-jr '[.[] | select(.kind=="gate" and .state=="done") | .at] | first == "2026-09-18T10:40:00Z"' | grep -qx true \
-  || fail "#2093(late): the finish is on the fire the disposition landed on"
+late_disposition_finished "#2093(late disposition)" "$DL" 2026-09-18T10:40:00Z
+[ ! -e "$R/completion-contract.json" ] || fail "#2093(late): precondition -- the run never left intake"
+[ "$(jq -r '.prs["7"].state' "$C/fake/gh.json")" = CLOSED ] || fail "#2093(late): the freeze PR is closed after the finish"
+assert_once "#2093(late disposition)"
+
+# b2) the same race one step later: the disposition lands between the
+#     controller's read of the run tree and the gate's own. The gate refuses the
+#     timeout (definitively -- failed_terminal), and the next fire must finish
+#     BLOCKED through `finish` rather than re-send the refused verb forever.
+#     FAULTY: the fault changes the run tree mid-fire, so the retry of that
+#     fire is entitled to act on it; exactly-once is asserted after.
+new_case t2093-disposition-race
+jq -cn '{"gate:challenger-timeout":["disposition-lands"]}' >"$C/fake/faults.json"
+FAULTY=1 NO_CONTRACT=1 DEADLINE="$DL" campaign 6
+[ "$(jq -s '[.[] | select(.tool=="gate" and .op=="disposition-filed")] | length' "$FAKE_LOG")" = 1 ] \
+  || fail "#2093(race): precondition -- the gate refused exactly one timeout because the disposition had landed: $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
+jr '[.[] | select(.kind=="gate" and .slot=="challenger-timeout") | .state] | last == "failed_terminal"' | grep -qx true \
+  || fail "#2093(race): precondition -- the refusal was recorded as the definitive one it is"
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "#2093(race): the run holds its slot after the refused timeout: $(finish_verdict)"
+jr '[.[] | select(.kind=="gate" and .state=="done") | .slot] == ["finish"]' | grep -qx true \
+  || fail "#2093(race): the frozen BLOCKED finishes through finish, once: $(jr '[.[] | select(.kind=="gate")]')"
+[ "$(jq -s '[.[] | select(.tool=="gate" and .op=="challenger-timeout")] | length' "$FAKE_LOG")" = 0 ] \
+  || fail "#2093(race): the refused timeout was re-sent"
+assert_once "#2093(disposition race)"
+
+# b3) an EMPTY disposition.md is no disposition, to the gate (`[ -s ]`,
+#     smoke-pr-gate.sh:4653) and so to the controller: the timeout is still
+#     published through challenger-timeout, which records no-disposition.
+new_case t2093-empty-disposition
+claim "$DL"; wake_json
+mkdir -p "$R/challenger"; : >"$R/challenger/disposition.md"
+for n in 0 3 4 5; do
+  inputs_from_fakes
+  if [ "$n" = 0 ]; then step_ok "$(tick_time 0)" --poll-json "$C/wake.json"; else step_ok "$(tick_time "$n")"; fi
+done
+[ -e "$R/challenger/disposition.md" ] && [ ! -s "$R/challenger/disposition.md" ] \
+  || fail "#2093(empty): precondition -- the disposition file exists and is empty"
+[ "$(jq -s '[.[] | select(.tool=="gate" and .op=="challenger-timeout")] | length' "$FAKE_LOG")" = 1 ] \
+  || fail "#2093(empty): an empty disposition must not divert the timeout off challenger-timeout: $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
+[ "$(jq -r '.challengerDisposition' "$C/state/pr-$PR-state.json")" = no-disposition ] \
+  || fail "#2093(empty): the gate recorded no-disposition"
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "#2093(empty): BLOCKED: $(finish_verdict)"
 
 # c) a kill anywhere in the timeout's own sequence is recovered on re-entry,
 #    each effect exactly once (campaign re-runs every fire and asserts it).
