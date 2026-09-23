@@ -306,6 +306,25 @@ export function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
 }
 
 /**
+ * Test-only override for the SDK `query` that `ClaudeProvider.query` calls.
+ * The real one spawns the Claude Code CLI (`pathToClaudeCodeExecutable`
+ * below), which inside an agent container exists and reaches the Anthropic
+ * API through the credential proxy (#1072). Null in production, so the call
+ * site resolves `sdkQuery` at call time exactly as before (the live import
+ * binding, which the existing `mock.module` suites also rely on).
+ */
+let sdkQueryOverride: typeof sdkQuery | null = null;
+
+/**
+ * Test-only: replace the SDK `query` so a unit test drives the provider
+ * without spawning the CLI. Call with no argument to restore the real one.
+ * A seam rather than `mock.module`, which Bun cannot undo across files.
+ */
+export function _setSdkQueryForTesting(impl?: typeof sdkQuery): void {
+  sdkQueryOverride = impl ?? null;
+}
+
+/**
  * Test-only: clear the pull throttle between cases. `timeoutMs` shortens the
  * deadline so the hang path is testable without a 10s wait.
  */
@@ -2870,7 +2889,7 @@ export class ClaudeProvider implements AgentProvider {
     // consumer, which the SDK's own cleanup does not reliably observe.
     const queryAbortController = new AbortController();
 
-    const sdkResult = sdkQuery({
+    const sdkResult = (sdkQueryOverride ?? sdkQuery)({
       prompt: stream,
       options: {
         cwd: input.cwd,
