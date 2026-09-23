@@ -241,7 +241,8 @@ describe('repository mount poll and tool admission barrier', () => {
   }, 5_000);
 
   it('adds retry provenance after credential rotation while preserving the same unfinished task payload', async () => {
-    insertMessage('task-occurrence-retry', 'task', { prompt: 'Review the release queue once.' });
+    // Continuous: this case pins a retry that resumes the fire's stored session.
+    insertMessage('task-occurrence-retry', 'task', { continuous: true, prompt: 'Review the release queue once.' });
     setContinuation('claude', 'retry-provenance-session');
     const queryInputs: Array<{ prompt: string; continuation?: string }> = [];
     let queryCalls = 0;
@@ -305,8 +306,76 @@ describe('repository mount poll and tool admission barrier', () => {
     }
   }, 5_000);
 
+  it('a default (fresh) fire resets once, and its credential-rotation retry resumes the session attempt 1 started', async () => {
+    insertMessage('task-occurrence-retry', 'task', { prompt: 'Review the release queue once.' });
+    setContinuation('claude', 'previous-fire-session');
+    const queryInputs: Array<{ prompt: string; continuation?: string }> = [];
+    let queryCalls = 0;
+    const provider = {
+      supportsNativeSlashCommands: false,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      isRetryable: () => true,
+      rotateApiKey: () => ({ rotated: true }),
+      query: (input: { prompt: string; continuation?: string }) => {
+        queryInputs.push(input);
+        queryCalls += 1;
+        const attempt = queryCalls;
+        async function* events(): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'retry-provenance-session' };
+          if (attempt === 1) throw new Error('retryable upstream failure');
+          yield { type: 'result', text: 'Reviewed the release queue.' };
+        }
+        return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+      },
+    };
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+
+    try {
+      const deadline = Date.now() + 3_000;
+      while (
+        (
+          getOutboundDb()
+            .prepare('SELECT status FROM processing_ack WHERE message_id = ?')
+            .get('task-occurrence-retry') as { status: string } | undefined
+        )?.status !== 'completed'
+      ) {
+        if (Date.now() >= deadline) throw new Error('timed out waiting for credential-rotation retry completion');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      expect(queryInputs).toHaveLength(2);
+      expect(queryInputs[0].prompt).not.toContain('<runner-retry-provenance>');
+      // The fire resets: attempt 1 does not resume the previous fire's conversation...
+      expect(queryInputs[0].continuation).toBeUndefined();
+      // ...and the retry resumes the session attempt 1 stored at init, not a blank one.
+      expect(queryInputs[1].continuation).toBe('retry-provenance-session');
+      expect(queryInputs[1].prompt).toContain('<runner-retry-provenance>');
+      expect(queryInputs[1].prompt).toContain('Task occurrence ID: "task-occurrence-retry".');
+      expect(queryInputs[1].prompt).toContain('has not recorded a completed result');
+      expect(queryInputs[1].prompt).toContain('inspect durable effects already produced');
+      expect(queryInputs[1].prompt.endsWith(queryInputs[0].prompt)).toBe(true);
+      expect(
+        getOutboundDb().prepare("SELECT COUNT(*) AS count FROM messages_out WHERE kind = 'task_log'").get(),
+      ).toEqual({
+        count: 1,
+      });
+    } finally {
+      abort.abort();
+      await loop;
+    }
+  }, 5_000);
+
   it('points at the interrupted batch instead of re-sending it when the resumed transcript already holds it', async () => {
-    insertMessage('task-occurrence-dedup', 'task', { prompt: 'Review the release queue once.' });
+    // Continuous: this case pins a retry that resumes the fire's stored session.
+    insertMessage('task-occurrence-dedup', 'task', { continuous: true, prompt: 'Review the release queue once.' });
     setContinuation('claude', 'retry-dedup-session');
     const queryInputs: Array<{ prompt: string; continuation?: string }> = [];
     const asked: Array<{ continuation?: string; prompt: string }> = [];
@@ -357,6 +426,72 @@ describe('repository mount poll and tool admission barrier', () => {
       }
 
       expect(queryInputs).toHaveLength(2);
+      // The provider was asked about the exact prompt and continuation the retry resumes.
+      expect(asked).toEqual([{ continuation: 'retry-dedup-session', prompt: queryInputs[0].prompt }]);
+      expect(queryInputs[1].prompt).toContain('<runner-retry-provenance>');
+      expect(queryInputs[1].prompt).toContain('Task occurrence ID: "task-occurrence-dedup".');
+      expect(queryInputs[1].prompt).toContain('it is not repeated here');
+      expect(queryInputs[1].prompt).not.toContain(queryInputs[0].prompt);
+    } finally {
+      abort.abort();
+      await loop;
+    }
+  }, 5_000);
+
+  it('a default (fresh) fire retry points at the interrupted batch in the session attempt 1 started', async () => {
+    insertMessage('task-occurrence-dedup', 'task', { prompt: 'Review the release queue once.' });
+    setContinuation('claude', 'previous-fire-session');
+    const queryInputs: Array<{ prompt: string; continuation?: string }> = [];
+    const asked: Array<{ continuation?: string; prompt: string }> = [];
+    let queryCalls = 0;
+    const provider = {
+      supportsNativeSlashCommands: false,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      isRetryable: () => true,
+      rotateApiKey: () => ({ rotated: true }),
+      transcriptHasPrompt: (continuation: string | undefined, prompt: string, sinceMs: number) => {
+        asked.push({ continuation, prompt });
+        expect(sinceMs).toBeLessThanOrEqual(Date.now());
+        return true;
+      },
+      query: (input: { prompt: string; continuation?: string }) => {
+        queryInputs.push(input);
+        queryCalls += 1;
+        const attempt = queryCalls;
+        async function* events(): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'retry-dedup-session' };
+          if (attempt === 1) throw new Error('retryable upstream failure');
+          yield { type: 'result', text: 'Reviewed the release queue.' };
+        }
+        return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+      },
+    };
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+
+    try {
+      const deadline = Date.now() + 3_000;
+      while (
+        (
+          getOutboundDb()
+            .prepare('SELECT status FROM processing_ack WHERE message_id = ?')
+            .get('task-occurrence-dedup') as { status: string } | undefined
+        )?.status !== 'completed'
+      ) {
+        if (Date.now() >= deadline) throw new Error('timed out waiting for credential-rotation retry completion');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      expect(queryInputs).toHaveLength(2);
+      expect(queryInputs[0].continuation).toBeUndefined();
+      expect(queryInputs[1].continuation).toBe('retry-dedup-session');
       // The provider was asked about the exact prompt and continuation the retry resumes.
       expect(asked).toEqual([{ continuation: 'retry-dedup-session', prompt: queryInputs[0].prompt }]);
       expect(queryInputs[1].prompt).toContain('<runner-retry-provenance>');
@@ -4451,7 +4586,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
   it('admits a later occurrence into the RUNNING stream and gives it its own turn', async () => {
     // Pending before the query opens, but NOT in the initial batch — so the
     // only way it can be seen is the in-stream follow-up poll.
-    insertMessage('occ-2', 'task', { prompt: 'second fire of the same series' });
+    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire of the same series' });
 
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'c1' };
@@ -4488,11 +4623,82 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(result.taskTurns![1]!.outcome?.text).toBe('second fire failed');
   }, 15_000);
 
+  // The default (fresh) twin of the case above: the later occurrence must not
+  // join the running conversation, and the stream is ended for it only once the
+  // turn is idle — end() mid-turn closes the control channel (#608/#610).
+  it('holds a default (fresh) later occurrence out of the RUNNING stream and ends the stream only when idle', async () => {
+    insertMessage('occ-2', 'task', { prompt: 'second fire of the same series' });
+
+    let resultSeen = false;
+    const endCalls: boolean[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      // Mid-turn window: several follow-up polls run while this turn is busy.
+      await Bun.sleep(1600);
+      resultSeen = true;
+      yield { type: 'result', text: 'first fire done', isError: false };
+      // Idle window: the next poll may now end the stream.
+      await Bun.sleep(1600);
+    }
+    const pushed: string[] = [];
+    const query: AgentQuery = {
+      push: (m: string) => pushed.push(m),
+      end: () => {
+        endCalls.push(resultSeen);
+      },
+      abort: () => {},
+      applySettings: async () => {},
+      events: events(),
+    };
+
+    const result = await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      ultracode: false,
+    });
+
+    expect(pushed.join('\n')).not.toContain('second fire of the same series');
+    expect(result.taskTurns!.map((t) => t.key)).toEqual(['occ-1']);
+    expect(endCalls.length).toBeGreaterThan(0);
+    expect(endCalls.every((afterResult) => afterResult)).toBe(true);
+  }, 15_000);
+
+  // Background work between turns is the same hazard: the open input keeps a
+  // background subagent alive, so a pending fresh fire must not end the stream
+  // until that work drains.
+  it('does not end the stream for a default (fresh) fire while background work is live', async () => {
+    insertMessage('occ-2', 'task', { prompt: 'second fire of the same series' });
+
+    let backgroundLive = true;
+    const endCalls: boolean[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'first fire done', isError: false };
+      // Idle, but a background worker is still running for 1.6s.
+      await Bun.sleep(1600);
+      backgroundLive = false;
+      await Bun.sleep(1600);
+    }
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {
+        endCalls.push(backgroundLive);
+      },
+      abort: () => {},
+      applySettings: async () => {},
+      hasBackgroundWork: () => backgroundLive,
+      events: events(),
+    };
+
+    await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, { ultracode: false });
+
+    expect(endCalls.length).toBeGreaterThan(0);
+    expect(endCalls.every((whileBackgroundLive) => !whileBackgroundLive)).toBe(true);
+  }, 15_000);
+
   // #617: with prompt ids, one result that answered two admitted fires (the
   // CLI folded the second into the running turn) records BOTH, instead of
   // leaving the later fire with no outcome.
   it('records every fire one merged result answers', async () => {
-    insertMessage('occ-2', 'task', { prompt: 'second fire of the same series' });
+    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire of the same series' });
 
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'c1' };
@@ -4593,7 +4799,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     // Here the query is created at xhigh, a task fire moves it to medium live,
     // and a second batch wants xhigh again — equal to the creation snapshot,
     // different from the stream. It must be applied.
-    insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
 
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'c1' };
@@ -4604,7 +4810,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
       // Staged from inside the stream so it lands in a SECOND follow-up batch
       // rather than being merged into occ-2's. It wants xhigh again — equal to
       // the stale creation snapshot, different from the live stream.
-      insertMessage('occ-3', 'task', { prompt: 'third fire', flagIntent: { turnEffort: 'xhigh' } });
+      insertMessage('occ-3', 'task', { continuous: true, prompt: 'third fire', flagIntent: { turnEffort: 'xhigh' } });
       yield { type: 'result', text: 'second fire', isError: true };
       await Bun.sleep(1600);
       yield { type: 'result', text: 'third fire', isError: true };
@@ -4632,7 +4838,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
   }, 15_000);
 
   it('defers an immutable runtime-context restart until the active query is idle', async () => {
-    insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
     let firstResult = false;
 
     async function* events(): AsyncGenerator<ProviderEvent> {
@@ -4674,7 +4880,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
   }, 15_000);
 
   it('defers an immutable runtime-context restart while background work is live, and ends once it drains', async () => {
-    insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
     let live = 1;
     let drained = false;
 
@@ -4718,7 +4924,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
   }, 15_000);
 
   it('does not close immutable runtime context during asynchronous result handling', async () => {
-    insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+    insertMessage('occ-2', 'task', { continuous: true, prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
     let beginOutcome!: () => void;
     const outcomeStarted = new Promise<void>((resolve) => {
       beginOutcome = resolve;
@@ -4809,7 +5015,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     // that turn's settings, which is also the pre-existing behaviour.
     setStickyModel('claude-opus-5[1m]');
     setStickyEffort('xhigh');
-    insertMessage('occ-2', 'task', { prompt: 'a scheduled fire that came due mid-answer' });
+    insertMessage('occ-2', 'task', { continuous: true, prompt: 'a scheduled fire that came due mid-answer' });
 
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'c1' };
@@ -4850,6 +5056,7 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     // fallback now runs Claude, so feeding its gpt-* pin to applySettings
     // would make the fallback stream invalid rather than target-native.
     insertMessage('occ-fallback', 'task', {
+      continuous: true,
       prompt: 'a scheduled fire that came due during fallback',
       flagIntent: { turnModel: 'gpt-6-astra', turnEffort: 'medium' },
     });

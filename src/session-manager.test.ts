@@ -627,6 +627,59 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     }
   });
 
+  it('treats a default scheduled fire as a fresh provider context, and a --continuous fire as warm', async () => {
+    const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
+    fs.mkdirSync(path.join(memoryRoot, 'preferences'), { recursive: true });
+    fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Canon\nJordan owns deployment.');
+    fs.writeFileSync(path.join(memoryRoot, 'preferences', 'operator.md'), '# Operator\nJordan owns deployment.');
+    await writeSessionMessage(AG, SESS, {
+      id: 'fresh-task-first',
+      kind: 'chat-sdk',
+      timestamp: '2026-07-25T00:00:00.000Z',
+      content: JSON.stringify({ text: 'Who owns deployment?', sender: 'Operator' }),
+    });
+    const inbound = new Database(inboundDbPath(AG, SESS));
+    const outbound = new Database(outboundDbPath(AG, SESS));
+    try {
+      inbound
+        .prepare(
+          `UPDATE messages_in SET status = 'completed' WHERE id IN ('recall-fresh-task-first', 'fresh-task-first')`,
+        )
+        .run();
+      outbound
+        .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run('continuation:claude', 'claude-context-before-fire', new Date().toISOString());
+      for (const [id, continuous] of [
+        ['task-plain', false],
+        ['task-kept', true],
+      ] as const) {
+        insertTaskRow(inbound, {
+          id,
+          seriesId: id,
+          processAfter: '2020-01-01T00:00:00.000Z',
+          recurrence: null,
+          content: JSON.stringify({ prompt: 'Who owns deployment?', ...(continuous ? { continuous } : {}) }),
+        });
+      }
+      expect(await admitDueTaskContexts(AG, SESS)).toBe(2);
+
+      const recall = (id: string) =>
+        JSON.parse(
+          (inbound.prepare('SELECT content FROM messages_in WHERE id = ?').get(id) as { content: string }).content,
+        );
+      const kept = recall('recall-task-kept');
+      expect(kept).not.toHaveProperty('trustedCapabilities');
+      expect(kept.memoryEvidence.core).toEqual([]);
+      // A default fire is prompted into a reset provider, so it carries the full bootstrap again.
+      const fresh = recall('recall-task-plain');
+      expect(fresh.trustedCapabilities).toMatchObject({ agentGroupId: AG });
+      expect(fresh.memoryEvidence.core.map((row: { path: string }) => row.path)).toEqual(['index.md']);
+    } finally {
+      outbound.close();
+      inbound.close();
+    }
+  });
+
   it('does not repeat the bootstrap after more than 256 recall rows in one provider epoch', async () => {
     const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
     fs.mkdirSync(memoryRoot, { recursive: true });

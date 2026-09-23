@@ -54,6 +54,7 @@ import {
 import { log } from './log.js';
 import { buildPreTurnContext } from './modules/memory/pre-turn-context.js';
 import type { Session, SessionMode } from './types.js';
+import { taskFiresFresh } from './modules/scheduling/fresh-context.js';
 
 /** Root directory for all session data. */
 export function sessionsBaseDir(): string {
@@ -766,7 +767,16 @@ function buildRecallRow(
   central: RecallCentral,
 ): MessageInsert | null {
   if (!isAdmissiblePreTurnTrigger({ ...message, content: normalizedContent })) return null;
-  const lifecycle = resolveRecallLifecycle(mailbox, agentGroupId, sessionId, central.provider, `recall-${message.id}`);
+  // A scheduled fire that starts fresh resets the provider before it is prompted, like a queued /clear.
+  const resetPending = message.kind === 'task' && taskFiresFresh(message.threadId, normalizedContent);
+  const lifecycle = resolveRecallLifecycle(
+    mailbox,
+    agentGroupId,
+    sessionId,
+    central.provider,
+    `recall-${message.id}`,
+    resetPending,
+  );
   return {
     id: `recall-${message.id}`,
     kind: 'system',
@@ -849,6 +859,7 @@ function resolveRecallLifecycle(
   sessionId: string,
   provider: string,
   excludeRecallId?: string,
+  resetPending = false,
 ): RecallLifecycle {
   let contextEpoch = 0;
   let hasContinuation = false;
@@ -872,9 +883,11 @@ function resolveRecallLifecycle(
   // host cannot observe that future epoch yet; treat the pending boundary as
   // fresh now so same-batch follow-ups carry full canon and unsuppressed
   // relevant evidence into the reset context.
-  const pendingClear = mailbox
-    .listOpenChatContents()
-    .some((row) => latestUserText(row.content).toLocaleLowerCase('en-US').startsWith('/clear'));
+  const pendingClear =
+    resetPending ||
+    mailbox
+      .listOpenChatContents()
+      .some((row) => latestUserText(row.content).toLocaleLowerCase('en-US').startsWith('/clear'));
   if (pendingClear) hasContinuation = false;
 
   const rows = mailbox.listRecentRecallRows(256);

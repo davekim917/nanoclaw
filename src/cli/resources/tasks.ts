@@ -27,6 +27,7 @@ import {
 } from '../../modules/scheduling/create.js';
 import { resolveTaskFlagIntent, validateTaskPin } from '../../modules/scheduling/task-flags.js';
 import { parseTaskContent, parseTaskPin } from '../../modules/scheduling/task-content.js';
+import { taskFiresFresh } from '../../modules/scheduling/fresh-context.js';
 import { writeAudit } from '../../dashboard/api/scheduled-shared.js';
 import { moveTaskAsHost } from '../../dashboard/api/scheduled-move.js';
 import { resolveTaskSession, withExistingMailboxSession } from '../../session-manager.js';
@@ -249,6 +250,8 @@ function toOutput(session: ScopedSession, row: TaskRow) {
     has_script: content.script ? 1 : 0,
     script_host: content.scriptHost ? 1 : 0,
     thread_anchor: content.threadAnchor ? 1 : 0,
+    // Each fire starts fresh unless thread-bound, --continuous or a dispatch event (modules/scheduling/fresh-context.ts).
+    context: taskFiresFresh(row.thread_id, row.content) ? 'fresh' : 'continuous',
     origin_session_id: content.originSessionId, // which session created the task (null for CLI-created)
     // The per-fire pin, EXACTLY as stored. Until this landed, `ncl tasks` had
     // no way to show an operator what a series was pinned to — which is half
@@ -391,6 +394,8 @@ async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
               // Streaming status is useful interactively but noisy for scheduled
               // orchestrators that publish one consolidated channel message.
               ...(bool(args.quiet_status) ? { quietStatus: true } : {}),
+              // Fires resume one conversation instead of starting fresh (modules/scheduling/fresh-context.ts).
+              ...(bool(args.continuous) ? { continuous: true } : {}),
               // Per-turn chat send budget (e.g. 1 for a standup whose contract is
               // one digest post — trailing work-log messages get dropped).
               ...(chatLimitArg(args) !== undefined ? { chatLimit: chatLimitArg(args) } : {}),
@@ -673,6 +678,7 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
   }
   if (chatLimitArg(args) !== undefined) update.chatLimit = chatLimitArg(args);
   if (args.quiet_status !== undefined) update.quietStatus = bool(args.quiet_status);
+  if (args.continuous !== undefined) update.continuous = bool(args.continuous);
   const recurrence = normalizeNullableString(args.recurrence);
   const script = normalizeNullableString(args.script);
 
@@ -1708,6 +1714,12 @@ registerResource({
             'Suppress streaming status/thinking posts while preserving final chat sends. Use with --chat-limit for one-message scheduled orchestrators.',
         },
         {
+          name: 'continuous',
+          type: 'boolean',
+          description:
+            'Resume one conversation across fires. Default: each scheduled fire starts fresh, except a thread-bound series (--thread / --thread-id), which always continues. Use only when a fire relies on what earlier fires said, not on files or task state.',
+        },
+        {
           name: 'messaging_group',
           type: 'string',
           description: 'Host-only: stamp routing to this messaging group id (rejected from an agent caller).',
@@ -1803,6 +1815,12 @@ registerResource({
           name: 'quiet_status',
           type: 'boolean',
           description: 'Enable or disable streaming status suppression without muting final chat sends.',
+        },
+        {
+          name: 'continuous',
+          type: 'boolean',
+          description:
+            'true = fires resume one conversation; false = each scheduled fire starts fresh (the default). A thread-bound series always continues.',
         },
         { name: 'recurrence', type: 'string', description: 'New cron expression; "null"/"none" clears it (one-shot).' },
         {
