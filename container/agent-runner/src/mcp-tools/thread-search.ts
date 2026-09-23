@@ -39,6 +39,17 @@ function getDb(): Database | null {
 }
 
 /**
+ * Test seam: hand the tools an archive handle instead of opening ARCHIVE_PATH;
+ * `null` drops it so the next call opens the path again. Tests must use this
+ * rather than `mock.module('bun:sqlite')`: bun module mocks are process-global
+ * and `mock.restore()` does not undo them, so every later test file's session
+ * DBs would be built from the mock class (issue #1076).
+ */
+export function _setArchiveDbForTest(db: Database | null): void {
+  _db = db;
+}
+
+/**
  * When sibling copies of one conversation pool into one.
  *
  * In a workgroup each sibling bot archives the same conversation under its
