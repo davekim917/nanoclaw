@@ -126,6 +126,21 @@ BUDGET_PER_FINGERPRINT = 2
 STEP_OUTCOMES = frozenset((None, "released", "held", "intake", "lanes", "preliminary",
                            "await_challenger", "synthesis", "verdict", "finished"))
 TERMINAL_VERBS = ("finish", "challenger-timeout")
+# What each machine-readable `challenger-timeout` refusal code means
+# (smoke-pr-gate.sh, the code table above the verb). A code absent from this
+# table -- including none at all -- is treated as permanent and escalated,
+# never guessed toward a publish.
+#   premise-false  the challenger filed: publish the frozen BLOCKED via finish
+#   blind          the gate cannot look: retry the timeout, alarm a human
+#   wait           the gate's clock has not reached the deadline: retry
+#   permanent      this run cannot be timed out: escalate, publish nothing
+TIMEOUT_REFUSALS = {
+    "disposition-filed": "premise-false",
+    "run-root-unset": "blind",
+    "run-root-unreadable": "blind",
+    "deadline-not-passed": "wait",
+    "no-deadline": "permanent",
+}
 POST_FINISH_SLOTS = ("freeze-close",)
 # Journal kinds whose obligations must all be receipted before a GO finish.
 PRE_FINISH_KINDS = ("send", "gh", "dispatch")
@@ -742,6 +757,7 @@ ALARM_WORDS = {
     "controller_verdict_superseded": "a GO no longer holds, so the run finishes BLOCKED",
     "controller_gh_failed": "a GitHub write failed",
     "controller_gate_refused": "the gate refused a terminal verb",
+    "controller_gate_blind": "the gate cannot read the run root, so it cannot time this run out; fix the mount",
     "controller_no_authority": "this run's claim token is not held by the controller",
     "controller_dispatch_failed": "a judgment task could not be created",
     "controller_foreign_finish": "someone other than the controller finished this run",
@@ -1210,7 +1226,11 @@ class EffectLayer:
             # Transient, or the slot moved: the next fire's derivation sees the
             # verdict / release and settles it.
             return {"outcome": "unknown", "error": error[:300]}
-        return {"outcome": "refused", "error": error[:300]}
+        # The machine-readable refusal code, when the verb gives one
+        # (challenger-timeout's preconditions, smoke-pr-gate.sh:4589-4597).
+        # Never parsed out of the prose.
+        refusal = doc.get("refusal") if isinstance(doc.get("refusal"), str) else None
+        return {"outcome": "refused", "error": error[:300], "refusal": refusal}
 
     # -- ncl one-shots ------------------------------------------------------------
 
@@ -1265,8 +1285,8 @@ class EffectLayer:
         # intake brief says so in as many words ("use its coordinatorOwnerToken
         # as SMOKE_GATE_OWNER for every smoke-run-scaffold.sh writer"). But the
         # gate mints a FRESH token on every same-run recovery poll
-        # (smoke-pr-gate.sh:5312, written to lease/authority/state at :5341,
-        # :5346, :5389), and reconcile_claims records the new one the wake
+        # (smoke-pr-gate.sh:5322, written to lease/authority/state at :5351,
+        # :5356, :5399), and reconcile_claims records the new one the wake
         # carries. Writing wake.json only at intake left the run tree naming a
         # RETIRED token while the brief still told the owner to use it: every
         # scaffold write, and `adopt` -- the verb that exists for exactly this
@@ -1279,14 +1299,14 @@ class EffectLayer:
         # AN ACK NEVER OUTLIVES THE BRIEF IT ACKNOWLEDGED. The ack is the
         # owner's first act on a wake and the controller only tests it for
         # existence, re-offering a wake solely while it is ABSENT (owner_step,
-        # :2337-2347); the renewer reads it the same way
+        # :2395-2405); the renewer reads it the same way
         # (smoke-controller-renew.sh, "brief-<step>.ack absent: no owner turn
         # holds this step"). So a brief rewritten under a NEW owner token would
         # otherwise inherit the previous brief's ack and be treated as taken,
         # and never re-offered -- the second half of XZO #2046. Removing it here
         # makes that impossible by construction rather than by sequencing: this
         # function runs only when the obligation is absent or `intent`
-        # (owner_step, :2314), never while a live brief is enqueued, so any ack
+        # (owner_step, :2372), never while a live brief is enqueued, so any ack
         # it finds belongs to a brief this write supersedes.
         try:
             dfd = _open_dir_contained(root, [run_id, "controller"], True)
@@ -1528,7 +1548,7 @@ class GateView:
             run = st.get("activeRunId")
             if run:
                 # activeLeaseOwner is the claim's owner token (poll writes it
-                # with the slot, smoke-pr-gate.sh:5362-5366); live reads it
+                # with the slot, smoke-pr-gate.sh:5372-5376); live reads it
                 # only to recover a claim whose wake was lost.
                 out[run] = {"pr": pr, "sha": st.get("activeSha"), "deadline": st.get("challengerDeadline"),
                             "disposition": st.get("challengerDisposition"), "owner": st.get("activeLeaseOwner"),
@@ -2115,11 +2135,10 @@ class Controller:
         # Both terminal verbs are crash-safe on retry: `finish` holds a
         # finishIntent and writes verdict.json once (smoke-pr-gate.sh:4147-4160),
         # and `challenger-timeout` answers "not the active run" once the slot
-        # is gone (:4596-4613), which _gate reads as unknown -- so an intent
-        # with no recorded outcome is simply re-offered. Its refusal once a
-        # disposition exists (:4652-4657) is a definitive refusal, recorded
-        # failed_terminal below, and _publish_verb never selects the verb again
-        # once it is (the refusal is the gate's own answer).
+        # is gone (:4606-4623), which _gate reads as unknown -- so an intent
+        # with no recorded outcome is simply re-offered. How a REFUSAL of
+        # `challenger-timeout` is recorded depends on its code: see
+        # TIMEOUT_REFUSALS and the refused branch below.
         result = self.effects.perform({"type": "gate", "runId": run_id, "verb": effect_verb or verb,
                                        "args": argv_tail})
         self.decide(run_id, phase, "gate", "mechanical", "obligation due", verb=verb, args=argv_tail,
@@ -2134,12 +2153,51 @@ class Controller:
             self.record(run_id, "gate", verb, "done", 1, detail)
             return "done"
         if result["outcome"] == "refused":
-            # The gate said no (owner mismatch, GO after no-disposition, ...):
-            # never retried into the same refusal; a human owns it.
+            code = result.get("refusal")
+            meaning = TIMEOUT_REFUSALS.get(code) if verb == "challenger-timeout" else None
+            if meaning in ("blind", "wait"):
+                # NOT a refusal to act on: the gate could not look, or its clock
+                # has not reached the deadline yet. The verb stays open (intent)
+                # and is re-offered next fire; recording it failed_terminal would
+                # make it un-reselectable, and falling back to `finish` would
+                # publish a verdict nobody proved -- a run-root fault is an
+                # install fault, never evidence that nothing was filed
+                # (smoke-pr-gate.sh:4646-4649). A blind gate is a human's to fix:
+                # one alarm, deduped on the run and verb. There is deliberately
+                # no retry ceiling: the only things a ceiling could do are
+                # publish an unproven BLOCKED or abandon the slot, and the run
+                # is not silent meanwhile -- this alarm, plus the gate's own
+                # overrun alarm, which re-arms on an interval for a run that
+                # keeps holding its slot (smoke-pr-gate.sh:5043-5058).
+                if meaning == "blind":
+                    self.ensure_alarm(run_id, "controller_gate_blind", "gate-blind:{}".format(key[:12]),
+                                      {"verb": verb, "refusal": code, "error": result.get("error")})
+                self.record(run_id, "gate", verb, "intent", 1, {"outcome": "refused-transient", "refusal": code,
+                                                               "error": result.get("error")})
+                self.decide(run_id, phase, "wait", "wait", "gate could not act on the timeout yet; retried",
+                            verb=verb, refusal=code)
+                return "intent"
+            if meaning == "premise-false":
+                # The challenger DID file, as far as the gate can see: the
+                # timeout is moot, the refusal is permanent, and _publish_verb
+                # publishes the frozen BLOCKED through `finish` instead. Expected
+                # rather than a fault, so no operator alarm.
+                self.record(run_id, "gate", verb, "failed_terminal", 1,
+                            {"error": result.get("error"), "verdict": verdict, "refusal": code})
+                self.decide(run_id, phase, "log", "mechanical", "challenger-timeout moot: the gate sees a disposition",
+                            verb=verb, refusal=code)
+                return "failed_terminal"
+            # Everything else -- owner mismatch, GO after no-disposition,
+            # `no-deadline`, and any refusal code this controller does not know
+            # -- is permanent and escalated, and NOTHING is guessed from it:
+            # _publish_verb falls back only on `disposition-filed`, so an
+            # unknown code fails closed (the run is not published).
             self.ensure_alarm(run_id, "controller_gate_refused", "gate-refused:{}".format(key[:12]),
-                              {"verb": verb, "verdict": verdict, "error": result.get("error")})
-            self.record(run_id, "gate", verb, "failed_terminal", 1, {"error": result.get("error"), "verdict": verdict})
-            self.decide(run_id, phase, "escalate", "coordination_model", "controller_gate_refused", verb=verb)
+                              {"verb": verb, "verdict": verdict, "error": result.get("error"), "refusal": code})
+            self.record(run_id, "gate", verb, "failed_terminal", 1,
+                        {"error": result.get("error"), "verdict": verdict, "refusal": code})
+            self.decide(run_id, phase, "escalate", "coordination_model", "controller_gate_refused", verb=verb,
+                        refusal=code)
             return "failed_terminal"
         self.record(run_id, "gate", verb, "intent", 1, {"outcome": result["outcome"], "error": result.get("error")})
         return "intent"
@@ -2356,7 +2414,7 @@ class Controller:
                 # There is no timeout verdict for a silent owner (the spec's
                 # only timeout is the challenger's); resume vs abandon is the
                 # same human call the gate's pr_run_stalled asks for
-                # (smoke-pr-gate.sh:4775-4795), so it is counted as one.
+                # (smoke-pr-gate.sh:4785-4805), so it is counted as one.
                 self.decide(run_id, phase, "escalate", "coordination_model", "owner step overdue", step=step)
         self.decide(run_id, phase, "wait", "wait", "owner step in progress", step=step)
         return "intent"
@@ -2693,7 +2751,7 @@ class Controller:
         controller's progress stamps keep the gate's stale-run detection
         quiet. Never a resend: the obligation keeps its message id. (The
         gate's pr_run_overrun fires on claim AGE whatever the stamps say,
-        smoke-pr-gate.sh:5025-5048: the run-level backstop.)"""
+        smoke-pr-gate.sh:5035-5058: the run-level backstop.)"""
         obs = self.obligations()
         for ob in list(obs.values()):
             if ob["runId"] != run_id or ob["kind"] not in PRE_FINISH_KINDS or ob["slot"] in POST_FINISH_SLOTS:
@@ -2944,8 +3002,8 @@ class Controller:
                 # THE OWNER IS WOKEN HERE, not only once the barrier passes.
                 # By this point every OTHER party's contribution the synthesis
                 # barrier checks has already been gated above: the lanes
-                # barrier is ready (:2911), coordinator/preliminary.md exists
-                # (:2928) and challenger/disposition.md exists (:2934). What
+                # barrier is ready (:2969), coordinator/preliminary.md exists
+                # (:2986) and challenger/disposition.md exists (:2992). What
                 # the synthesis barrier can still report is therefore the
                 # retained owner's -- `invalid[]` content it authored
                 # (journeys/scope-dispositions.json, or
@@ -2957,7 +3015,7 @@ class Controller:
                 # alone (smoke-controller-live.sh:168-175), so nobody was told;
                 # and _maybe_synthesis_overdue_blocked needs the very
                 # owner:synthesis obligation this branch declined to create
-                # (:3016-3018), so the terminal BLOCKED safety net could not
+                # (:3074-3076), so the terminal BLOCKED safety net could not
                 # fire either. This is the same blind spot as the lanes barrier
                 # (XZO #2047), on the sibling path.
                 timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)
@@ -3075,7 +3133,7 @@ class Controller:
         if not deadline or self.now < deadline or run.has("challenger/disposition.md"):
             return None
         # `challenger-timeout` IS the terminal verb: it records no-disposition
-        # and runs `finish ... BLOCKED` itself (smoke-pr-gate.sh:4660-4666), so
+        # and runs `finish ... BLOCKED` itself (smoke-pr-gate.sh:4670-4676), so
         # the controller must not call `finish` after it.
         return self.pre_finish(run_id, claim.get("pr"), "BLOCKED", ["challenger-timeout: no disposition by {}".format(
             claim.get("deadline"))], {}, terminal_verb="challenger-timeout")
@@ -3171,12 +3229,16 @@ class Controller:
                     verdict=verdict, failedChecks=failed, verb=terminal_verb)
         state = self._terminal_call(run_id, phase, terminal_verb, claim_sha, verdict)
         if state == "failed_terminal" and terminal_verb == "challenger-timeout":
-            # The gate refused the timeout this fire: publish through `finish`
-            # now rather than a fire later (_publish_verb reads the same record).
-            terminal_verb = self._publish_verb(run_id, run, terminal_verb)
-            self.decide(run_id, phase, "finish", "mechanical", "challenger-timeout refused by the gate",
-                        verdict=verdict, failedChecks=failed, verb=terminal_verb)
-            state = self._terminal_call(run_id, phase, terminal_verb, claim_sha, verdict)
+            # A refusal that proves the premise false changes the verb in the
+            # fire that received it, not a fire later (_publish_verb reads the
+            # same record). Any other refusal leaves the verb as it is, so the
+            # run stays escalated and unpublished.
+            fallback = self._publish_verb(run_id, run, terminal_verb)
+            if fallback != terminal_verb:
+                terminal_verb = fallback
+                self.decide(run_id, phase, "finish", "mechanical", "challenger-timeout moot: publishing through finish",
+                            verdict=verdict, failedChecks=failed, verb=terminal_verb)
+                state = self._terminal_call(run_id, phase, terminal_verb, claim_sha, verdict)
         if state in TERMINAL_OK:
             # PRP step 7: the freeze-PR close follows finish in the same turn.
             return self.post_finish(run_id, pr, verdict, external=False)
@@ -3189,29 +3251,37 @@ class Controller:
     def _publish_verb(self, run_id, run, verb):
         """The terminal verb a (possibly replayed) verdict is published through.
 
-        INVARIANT: a refused verb is never re-selected, and the GATE's answer,
-        not the controller's reading of the run tree, is what decides. The
-        verb is frozen with the verdict, but `challenger-timeout` is refused by
-        the real gate once it sees a disposition (smoke-pr-gate.sh:4652-4657),
-        and a disposition can land after the timeout froze its BLOCKED. gate_verb
-        records that refusal failed_terminal and afterwards returns it without
-        calling the gate (this file, :2110-2111), so re-selecting the verb wedged the run
-        for good -- a wedge since live mode (#945), found three ways in PR #1066:
-        a fake gate that never refused, a frozen verb replayed after a late
-        disposition, and a controller read of the disposition (nonempty_file,
-        which rejects symlinks) that disagreed with the gate's `[ -s ]`.
+        INVARIANT, keyed on the gate's machine-readable refusal code
+        (TIMEOUT_REFUSALS), never on its prose or the controller's guess:
+          - a verb refused for a PERMANENT reason is never re-selected;
+          - a verb refused because the gate COULD NOT SEE (run root unset or
+            unreadable) or has not reached the deadline is retried -- it is
+            never recorded failed_terminal (gate_verb);
+          - ONLY a refusal that proves the premise false (`disposition-filed`)
+            changes the verb, to `finish`.
+        The verb is frozen with the verdict, but `challenger-timeout` is
+        refused by the real gate once it sees a disposition, and a disposition
+        can land after the timeout froze its BLOCKED. gate_verb records a
+        permanent refusal failed_terminal and afterwards returns it without
+        calling the gate (this file, :2130-2131), so re-selecting the verb
+        wedged the run for good -- a wedge since live mode (#945), found three
+        ways in PR #1066: a fake gate that never refused, a frozen verb replayed
+        after a late disposition, and a controller read of the disposition
+        (nonempty_file, which rejects symlinks) that disagreed with the gate's
+        `[ -s ]`. Round 3 of the same review found that falling back on ANY
+        refusal was fail-open: a gate that cannot read the run root would have
+        had a possibly healthy campaign published BLOCKED over a mount fault.
 
-        1. Once the gate has refused `challenger-timeout` for this run, the
-           verdict goes out through `finish`, whatever the controller would
-           predict. That record is the gate's own ground truth, so no future
-           divergence -- a symlink, permissions, a race, a partial write --
-           can send the refused verb again. Any refusal qualifies: the
-           verdict is BLOCKED either way, which asserts nothing about the
-           build; `finish` BLOCKED has none of the timeout's own preconditions
-           -- deadline, run root, disposition (smoke-pr-gate.sh:3976-4127) --
-           and a refusal the two verbs share (an owner or claimant mismatch)
-           is refused by `finish` too and escalated by gate_verb's alarm, as
-           before.
+        1. Once the gate has refused `challenger-timeout` for this run with
+           `disposition-filed`, the verdict goes out through `finish`, whatever
+           the controller would predict: that record is the gate's own ground
+           truth, so no divergence in how the two read the run tree -- a
+           symlink, permissions, a race -- can send the moot verb again.
+           `finish` BLOCKED has no disposition precondition
+           (smoke-pr-gate.sh:3976-4127) and publishes the same verdict. Every
+           other permanent refusal, including `no-deadline` and any code not in
+           TIMEOUT_REFUSALS, leaves the verb as it is: escalated by gate_verb's
+           alarm and NOT published -- an unknown code fails closed.
         2. Before any refusal, the controller predicts with the gate's own test
            -- `[ -s ]`: stat through symlinks, any file type, size > 0 -- only
            to avoid spending a fire on a refusal it can see coming. This is
@@ -3226,7 +3296,9 @@ class Controller:
             return verb
         ob = self.obligations().get(obligation_key(run_id, "gate", "challenger-timeout"))
         if ob and ob["state"] == "failed_terminal":
-            return "finish"
+            if TIMEOUT_REFUSALS.get(ob["detail"].get("refusal")) == "premise-false":
+                return "finish"
+            return verb  # permanent and escalated; gate_verb answers failed_terminal without a call
         try:
             if os.stat(run.path("challenger/disposition.md")).st_size > 0:
                 return "finish"

@@ -33,7 +33,7 @@ The fakes mirror the real contracts the controller depends on:
            and records completedRunId/completedVerdictDigest; a repeated
            finish with the same facts resumes from verdict.json
            (smoke-pr-gate.sh:4001-4050). `challenger-timeout` checks the real
-           verb's preconditions in its order (:4621-4657): a stamped deadline,
+           verb's preconditions in its order (:4631-4667): a stamped deadline,
            passed by the WALL clock, a readable SMOKE_GATE_RUN_ROOT (the same
            variable the real gate reads, :1304), and no non-empty
            challenger/disposition.md under it.
@@ -308,6 +308,12 @@ def gate(argv):
             return "fail", out({"ok": False, "error": "lock busy", "retryable": True})
         if f == "refuse":
             return "refused", out({"ok": False, "error": "injected refusal"})
+        if f and f.startswith("refuse-code:"):
+            # A scripted refusal carrying the given machine-readable code: a
+            # gate that answers with a code the controller cannot see coming,
+            # or one it does not know at all.
+            code = f.split(":", 1)[1]
+            return code, out({"ok": False, "refusal": code, "error": "injected refusal: " + code})
         resumed = None
         vfile = os.path.join(gs, "runs", run, "verdict.json")
         if verb != "progress" and os.path.exists(vfile):
@@ -317,7 +323,7 @@ def gate(argv):
                 return "verdict-conflict", out({"ok": False, "error": "a different verdict is already recorded"}, 2)
             # Only `finish` answers a completed run idempotently
             # (smoke-pr-gate.sh:4017-4025); `challenger-timeout` looks for the
-            # active slot first and has no such shortcut (:4596-4613), so a
+            # active slot first and has no such shortcut (:4606-4623), so a
             # completed run falls through to not-active below.
             for _, other in states():
                 if verb == "finish" and other.get("completedRunId") == run and other.get("activeRunId") != run:
@@ -338,27 +344,32 @@ def gate(argv):
             return "progress", out({"ok": True, "runId": run})
         if verb == "challenger-timeout":
             # The real verb's own preconditions, in its order
-            # (smoke-pr-gate.sh:4621-4657), each with its refusal text. Before
-            # these were modelled, a controller that sent `challenger-timeout`
-            # after a disposition had landed was answered ok here and REFUSED by
-            # the real gate (:4652-4657) -- the wedge PR #1066 round 1 found,
-            # which the late-disposition cases could not see.
+            # (smoke-pr-gate.sh:4631-4667), each with the SAME machine-readable
+            # `refusal` code the real gate emits (its code table, :4589-4597;
+            # smoke-pr-gate.test.sh §7d asserts the real gate emits each one, so
+            # the two cannot drift apart silently). Before these were modelled,
+            # a controller that sent `challenger-timeout` after a disposition
+            # had landed was answered ok here and REFUSED by the real gate
+            # (:4662-4667) -- the wedge PR #1066 round 1 found.
             deadline = st.get("challengerDeadline") or ""
             if not deadline:
-                return "no-deadline", out({"ok": False, "error": "this run has no challengerDeadline -- it was "
-                                           "claimed before deadlines were stamped, so there is nothing to time out."}, 2)
-            # Wall clock, as the real verb uses `date -u +%s` (:4628), not the
+                return "no-deadline", out({"ok": False, "refusal": "no-deadline",
+                                           "error": "this run has no challengerDeadline -- it was claimed before "
+                                                    "deadlines were stamped, so there is nothing to time out."}, 2)
+            # Wall clock, as the real verb uses `date -u +%s` (:4638), not the
             # controller's --now.
             dl = datetime.datetime.strptime(deadline, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
             if dl > datetime.datetime.now(datetime.timezone.utc):
-                return "deadline-not-passed", out({"ok": False, "error": "the challenger deadline has not passed -- keep waiting"})
+                return "deadline-not-passed", out({"ok": False, "refusal": "deadline-not-passed",
+                                                   "error": "the challenger deadline has not passed -- keep waiting"})
             root = os.environ.get("SMOKE_GATE_RUN_ROOT", "")
             if not root:
-                return "no-run-root", out({"ok": False, "error": "SMOKE_GATE_RUN_ROOT is not set, so the gate cannot "
-                                           "look for challenger/disposition.md"}, 2)
+                return "run-root-unset", out({"ok": False, "refusal": "run-root-unset",
+                                              "error": "SMOKE_GATE_RUN_ROOT is not set, so the gate cannot look for "
+                                                       "challenger/disposition.md"}, 2)
             if not os.path.isdir(root):
-                return "run-root-unreadable", out({"ok": False, "error": "SMOKE_GATE_RUN_ROOT " + root +
-                                                   " is not readable"}, 2)
+                return "run-root-unreadable", out({"ok": False, "refusal": "run-root-unreadable", "runRoot": root,
+                                                   "error": "SMOKE_GATE_RUN_ROOT " + root + " is not readable"}, 2)
             disp = os.path.join(root, run, "challenger", "disposition.md")
             if f == "disposition-lands":
                 # Scripted race: the challenger files between the controller's
@@ -366,13 +377,14 @@ def gate(argv):
                 os.makedirs(os.path.dirname(disp), exist_ok=True)
                 with open(disp, "w") as fh:
                     fh.write("filed during the gate call\n")
-            try:  # `[ -s ]` (:4653): stat THROUGH symlinks, any file type, size > 0
+            try:  # `[ -s ]` (:4663): stat THROUGH symlinks, any file type, size > 0
                 filed = os.stat(disp).st_size > 0
             except OSError:
                 filed = False
             if filed:
-                return "disposition-filed", out({"ok": False, "error": "the challenger DID file a disposition -- "
-                                                 "nothing timed out. Synthesize and finish normally."})
+                return "disposition-filed", out({"ok": False, "refusal": "disposition-filed", "dispositionFile": disp,
+                                                 "error": "the challenger DID file a disposition -- nothing timed "
+                                                          "out. Synthesize and finish normally."})
         verdict = argv[3] if verb == "finish" else "BLOCKED"
         if verb == "finish" and argv[1] != st.get("activeSha"):
             return "sha", out({"ok": False, "error": "finish sha does not match the sha this run claimed"}, 2)

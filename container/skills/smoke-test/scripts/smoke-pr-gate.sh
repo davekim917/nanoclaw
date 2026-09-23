@@ -4585,6 +4585,16 @@ fi
 # written and nothing had a deadline. The ONLY outcome this verb can produce is
 # BLOCKED, and it produces it through the ordinary `finish` — a timeout that
 # unblocks a coordinator toward GO is worse than the stall it ends.
+#
+# Each precondition refusal carries a machine-readable `refusal` code beside
+# its prose, because they mean opposite things to a caller:
+#   no-deadline          structural: this run cannot be timed out
+#   deadline-not-passed  wait: the caller's clock ran ahead of this one
+#   run-root-unset       the gate CANNOT LOOK -- never "nothing was filed"
+#   run-root-unreadable  the gate CANNOT LOOK (a mount or permission fault)
+#   disposition-filed    the premise is false: the challenger did file
+# The campaign controller keys on these codes, never on the prose
+# (smoke-campaign-controller.py, gate_verb and _publish_verb).
 if [ "$COMMAND" = "challenger-timeout" ]; then
   RUN_ID="${2:-}"
   OWNER="${3:-$DEFAULT_OWNER}"
@@ -4621,7 +4631,7 @@ if [ "$COMMAND" = "challenger-timeout" ]; then
   DEADLINE="$(jq -r '.challengerDeadline // empty' <<<"$STATE")"
   if [ -z "$DEADLINE" ]; then
     jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
-      '{ok:false,error:"this run has no challengerDeadline — it was claimed before deadlines were stamped, so there is nothing to time out. Release it or finish it explicitly.",
+      '{ok:false,refusal:"no-deadline",error:"this run has no challengerDeadline — it was claimed before deadlines were stamped, so there is nothing to time out. Release it or finish it explicitly.",
         pr:$pr,runId:$run}'
     exit 2
   fi
@@ -4629,7 +4639,7 @@ if [ "$COMMAND" = "challenger-timeout" ]; then
   if [ "$REMAINING" -gt 0 ]; then
     jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg deadline "$DEADLINE" \
       --argjson remaining "$REMAINING" \
-      '{ok:false,error:"the challenger deadline has not passed — keep waiting",
+      '{ok:false,refusal:"deadline-not-passed",error:"the challenger deadline has not passed — keep waiting",
         pr:$pr,runId:$run,challengerDeadline:$deadline,remainingSeconds:$remaining}'
     exit 0
   fi
@@ -4639,20 +4649,20 @@ if [ "$COMMAND" = "challenger-timeout" ]; then
   # on every deployment that has not wired this.
   if [ -z "$CHALLENGER_RUN_ROOT" ]; then
     jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
-      '{ok:false,error:"SMOKE_GATE_RUN_ROOT is not set, so the gate cannot look for challenger/disposition.md — refusing to declare a disposition missing that it never checked for. Wire SMOKE_GATE_RUN_ROOT to the run root, or finish this run explicitly.",
+      '{ok:false,refusal:"run-root-unset",error:"SMOKE_GATE_RUN_ROOT is not set, so the gate cannot look for challenger/disposition.md — refusing to declare a disposition missing that it never checked for. Wire SMOKE_GATE_RUN_ROOT to the run root, or finish this run explicitly.",
         pr:$pr,runId:$run}'
     exit 2
   fi
   if [ ! -d "$CHALLENGER_RUN_ROOT" ]; then
     jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg root "$CHALLENGER_RUN_ROOT" \
-      '{ok:false,error:("SMOKE_GATE_RUN_ROOT " + $root + " is not readable — the lookup failed, which is not the same as a missing disposition. Fix the mount and retry."),
+      '{ok:false,refusal:"run-root-unreadable",error:("SMOKE_GATE_RUN_ROOT " + $root + " is not readable — the lookup failed, which is not the same as a missing disposition. Fix the mount and retry."),
         pr:$pr,runId:$run,runRoot:$root}'
     exit 2
   fi
   DISPOSITION_FILE="$(challenger_disposition_file "$RUN_ID")"
   if [ -s "$DISPOSITION_FILE" ]; then
     jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg path "$DISPOSITION_FILE" \
-      '{ok:false,error:"the challenger DID file a disposition — nothing timed out. Synthesize and finish normally.",
+      '{ok:false,refusal:"disposition-filed",error:"the challenger DID file a disposition — nothing timed out. Synthesize and finish normally.",
         pr:$pr,runId:$run,dispositionFile:$path}'
     exit 0
   fi

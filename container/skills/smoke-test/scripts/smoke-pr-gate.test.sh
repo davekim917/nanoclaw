@@ -2282,10 +2282,35 @@ bash "$GATE" claim run-intake-dead 68 "$STALL_SHA" owner-intake | jq -e '.ok == 
 [ ! -e "$SMOKE_GATE_RUN_ROOT/run-intake-dead" ] || { echo "7d: precondition - no run directory" >&2; exit 1; }
 # Before the deadline the verb refuses, so what follows is the deadline's doing.
 bash "$GATE" challenger-timeout run-intake-dead owner-intake | jq -e '
-  .ok == false and (.error | test("has not passed"))' >/dev/null \
+  .ok == false and .refusal == "deadline-not-passed" and (.error | test("has not passed"))' >/dev/null \
   || { echo "7d: challenger-timeout ended a run before its deadline" >&2; exit 1; }
-jq -c '.challengerDeadline="2000-01-01T00:00:00Z"' "$STATE_DIR/pr-68-state.json" > "$STATE_DIR/pr-68-state.tmp"
-mv "$STATE_DIR/pr-68-state.tmp" "$STATE_DIR/pr-68-state.json"
+# Every precondition refusal carries its machine-readable code (the gate's code
+# table above the verb). The campaign controller keys on these codes, and the
+# controller tests' fake gate emits the same ones: asserted here against the
+# REAL verb so the two cannot drift apart unnoticed (PR #1066 rounds 1 and 3).
+set_pr68_deadline() {
+  jq -c --arg d "$1" '.challengerDeadline=$d' "$STATE_DIR/pr-68-state.json" > "$STATE_DIR/pr-68-state.tmp"
+  mv "$STATE_DIR/pr-68-state.tmp" "$STATE_DIR/pr-68-state.json"
+}
+timeout_refusal() { # <expected-code>: the verb refuses with exactly that code, slot untouched
+  local out
+  # Three of these refusals exit 2 (smoke-pr-gate.sh:4636,:4654,:4660): the
+  # code, not the exit status, is what is asserted.
+  out="$(bash "$GATE" challenger-timeout run-intake-dead owner-intake)" || true
+  jq -e --arg c "$1" '.ok == false and .refusal == $c' <<<"$out" >/dev/null \
+    || { echo "7d: expected refusal code $1, got: $out" >&2; exit 1; }
+  jq -e '.activeRunId == "run-intake-dead"' "$STATE_DIR/pr-68-state.json" >/dev/null \
+    || { echo "7d: a $1 refusal released the slot" >&2; exit 1; }
+}
+set_pr68_deadline ""
+timeout_refusal no-deadline
+set_pr68_deadline "2000-01-01T00:00:00Z"
+( unset SMOKE_GATE_RUN_ROOT; timeout_refusal run-root-unset )
+( export SMOKE_GATE_RUN_ROOT="$STATE_DIR/no-such-mount"; timeout_refusal run-root-unreadable )
+mkdir -p "$SMOKE_GATE_RUN_ROOT/run-intake-dead/challenger"
+echo "filed" > "$SMOKE_GATE_RUN_ROOT/run-intake-dead/challenger/disposition.md"
+timeout_refusal disposition-filed
+rm -rf "$SMOKE_GATE_RUN_ROOT/run-intake-dead"
 bash "$GATE" challenger-timeout run-intake-dead owner-intake | jq -e '
   .ok == true and .verdict == "BLOCKED" and .challengerDisposition == "no-disposition"' >/dev/null \
   || { echo "7d: challenger-timeout refused a contract-less run past its deadline" >&2; exit 1; }

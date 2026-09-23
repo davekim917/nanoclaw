@@ -62,8 +62,8 @@
 #
 # FRESHNESS. The ack is written ONCE and never again: the router creates it
 # (controller-owner-router.md:31), the controller only ever tests it for
-# existence (smoke-campaign-controller.py:1966) and re-offers the wake only
-# while it is ABSENT (:1961-1972), and a step that needs more than one turn
+# existence (smoke-campaign-controller.py:1986) and re-offers the wake only
+# while it is ABSENT (:1981-1992), and a step that needs more than one turn
 # continues through `continue_work` (router :43), which resumes in-session and
 # does not re-run the router's first act. Nothing in this repo refreshes or
 # removes it. So its mtime is the time of the FIRST wake, and treating that as
@@ -96,7 +96,7 @@
 # and the reason is recorded in the tick's own line rather than swallowed.
 #
 # THE CEILING is OWNER_STEP_SLA_SECONDS (3600 s,
-# smoke-campaign-controller.py:132), measured from the obligation's FIRST
+# smoke-campaign-controller.py:147), measured from the obligation's FIRST
 # journal record -- the same clock the controller uses to call a step overdue
 # and escalate (owner_step:1975-1987). Past it this tick stops renewing, the
 # lease lapses within its remaining TTL, and the existing overdue/escalation

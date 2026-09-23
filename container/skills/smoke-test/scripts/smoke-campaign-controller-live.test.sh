@@ -255,7 +255,7 @@ finish_verdict() { jr '[.[] | select(.kind=="gate" and .state=="done") | .detail
 # A frozen challenger-timeout BLOCKED whose disposition landed before it could
 # finish: it must finish through `finish`, the verb the REAL gate still accepts
 # (challenger-timeout is refused once a disposition exists,
-# smoke-pr-gate.sh:4652-4657; the fake gate models that refusal), with the
+# smoke-pr-gate.sh:4662-4667; the fake gate models that refusal), with the
 # frozen verdict and failed checks unchanged. The disposition is asserted first,
 # so a pass is never a run the late disposition never reached.
 late_disposition_finished() { # label deadline finish-at
@@ -983,7 +983,7 @@ grep -q 'CHECK THE BARRIER, DO NOT ASSUME IT' "$R/controller/brief-lanes.md" \
 # (smoke-pr-gate.sh:220), so the lease lapsed under a live owner and its eight
 # completed lanes were refused their markers. The next `poll` then did what it
 # is supposed to do on a stale run: it resumed the run id and minted a FRESH
-# owner token (smoke-pr-gate.sh:5312 -> :5347/:5349/:5389). The controller
+# owner token (smoke-pr-gate.sh:5322 -> :5357/:5349/:5389). The controller
 # picked the new token up for itself, and stopped there. controller/wake.json --
 # the only file that carries the token to the owner, and the file the intake
 # brief tells it to read -- still named the retired one, and the lanes brief is
@@ -1164,19 +1164,19 @@ cite() { # <file> <line> <literal substring the cited line must contain>
     || fail "controller-owner-router.md cites $1:$2 for \"$3\", but that line is: ${got:-<absent>}"
 }
 ROUTER="$SCRIPT_DIR/../references/controller-owner-router.md"
-for c in 'smoke-pr-gate.sh:5312' 'smoke-campaign-controller.py:1302-1304' \
-         'smoke-run-scaffold.sh:267-269' 'smoke-campaign-controller.py:1291-1301'; do
+for c in 'smoke-pr-gate.sh:5322' 'smoke-campaign-controller.py:1322-1324' \
+         'smoke-run-scaffold.sh:267-269' 'smoke-campaign-controller.py:1311-1321'; do
   grep -Fq "$c" "$ROUTER" || fail "router doc no longer cites $c"
 done
-cite smoke-pr-gate.sh 5312 'OWNER_TOKEN="$(new_owner_token'
-cite smoke-pr-gate.sh 5341 'lease_acquire "$RUN_ID" "$OWNER_TOKEN"'
-cite smoke-pr-gate.sh 5346 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
-cite smoke-pr-gate.sh 5389 '.activeLeaseOwner=$owner'
+cite smoke-pr-gate.sh 5322 'OWNER_TOKEN="$(new_owner_token'
+cite smoke-pr-gate.sh 5351 'lease_acquire "$RUN_ID" "$OWNER_TOKEN"'
+cite smoke-pr-gate.sh 5356 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
+cite smoke-pr-gate.sh 5399 '.activeLeaseOwner=$owner'
 cite smoke-run-scaffold.sh 268 '[ "$owner" = "$DEFAULT_OWNER" ]'
 cite smoke-run-scaffold.sh 707 'adds NO new authority check of its own'
-cite smoke-campaign-controller.py 1247 'def _owner_wake'
-cite smoke-campaign-controller.py 1297 'os.unlink("brief-{}.ack"'
-cite smoke-campaign-controller.py 1302 'if c.get("wake"):'
+cite smoke-campaign-controller.py 1267 'def _owner_wake'
+cite smoke-campaign-controller.py 1317 'os.unlink("brief-{}.ack"'
+cite smoke-campaign-controller.py 1322 'if c.get("wake"):'
 
 
 # --- round 3, finding 1: a refusal that appears AFTER the ack re-offers ------
@@ -1471,7 +1471,7 @@ jr '[.[] | select(.kind=="gate" and .state=="done") | .slot] == ["finish"]' | gr
 assert_once "#2093(disposition race)"
 
 # b3) an EMPTY disposition.md is no disposition, to the gate (`[ -s ]`,
-#     smoke-pr-gate.sh:4653) and so to the controller: the timeout is still
+#     smoke-pr-gate.sh:4663) and so to the controller: the timeout is still
 #     published through challenger-timeout, which records no-disposition.
 new_case t2093-empty-disposition
 claim "$DL"; wake_json
@@ -1511,21 +1511,105 @@ jr '[.[] | select(.kind=="gate" and .state=="done") | [.slot, .at]] == [["finish
 [ "$(finish_verdict)" = '"BLOCKED"' ] || fail "#2093(symlink): BLOCKED: $(finish_verdict)"
 assert_once "#2093(symlinked disposition)"
 
-# b5) a refusal the controller cannot predict at all (the fake's scripted
-#     `refuse`: the gate says no for a reason outside the run tree). The
-#     refusal record is the ground truth: the BLOCKED goes out through
-#     `finish` in the SAME fire and challenger-timeout is never sent again.
-new_case t2093-unpredicted-refusal
-jq -cn '{"gate:challenger-timeout":["refuse"]}' >"$C/fake/faults.json"
+# b5) the gate refuses with `disposition-filed` although the controller sees
+#     no disposition at all (scripted: the two read the run tree differently --
+#     a permission, a mount, a race the controller cannot observe). That code
+#     proves the timeout's premise false, and the refusal RECORD is the ground
+#     truth: the BLOCKED goes out through `finish` in the SAME fire and
+#     challenger-timeout is never sent again.
+new_case t2093-unpredicted-disposition
+jq -cn '{"gate:challenger-timeout":["refuse-code:disposition-filed"]}' >"$C/fake/faults.json"
 NO_CONTRACT=1 DEADLINE="$DL" campaign 6
+[ ! -e "$R/challenger/disposition.md" ] \
+  || fail "#2093(unpredicted): precondition -- the controller has no disposition to see; only the gate's answer says so"
 [ "$(jq -s '[.[] | select(.tool=="gate" and .argv[0]=="challenger-timeout")] | length' "$FAKE_LOG")" = 1 ] \
-  || fail "#2093(refused): challenger-timeout is sent exactly once and never after its refusal: $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
-jr '[.[] | select(.kind=="gate" and .slot=="challenger-timeout") | .state] | last == "failed_terminal"' | grep -qx true \
-  || fail "#2093(refused): precondition -- the refusal was recorded as definitive"
+  || fail "#2093(unpredicted): challenger-timeout is sent exactly once and never after its refusal: $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
+jr '[.[] | select(.kind=="gate" and .slot=="challenger-timeout")] | last | [.state, .detail.refusal]
+    == ["failed_terminal","disposition-filed"]' | grep -qx true \
+  || fail "#2093(unpredicted): precondition -- the refusal was recorded as definitive, with its code"
 jr '[.[] | select(.kind=="gate" and .state=="done") | [.slot, .at]] == [["finish","2026-09-18T10:40:00Z"]]' | grep -qx true \
-  || fail "#2093(refused): finish lands on the fire of the refusal: $(jr '[.[]|select(.kind=="gate")]')"
-[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "#2093(refused): the run holds its slot after the refusal: $(finish_verdict)"
-assert_once "#2093(unpredicted refusal)"
+  || fail "#2093(unpredicted): finish lands on the fire of the refusal: $(jr '[.[]|select(.kind=="gate")]')"
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "#2093(unpredicted): the run holds its slot after the refusal: $(finish_verdict)"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-refused:")))] | length == 0' | grep -qx true \
+  || fail "#2093(unpredicted): a moot timeout is expected, not an operator fault -- no gate-refused alarm"
+assert_once "#2093(unpredicted disposition)"
+
+# b6) the gate CANNOT SEE: SMOKE_GATE_RUN_ROOT is unreadable at the timeout
+#     (a mount fault). That is never evidence that nothing was filed: no
+#     `finish`, the timeout is NOT recorded failed_terminal, ONE operator alarm
+#     however many fires it lasts, and the timeout is retried -- so when the
+#     mount recovers, the next fire times out through challenger-timeout.
+new_case t2093-gate-blind
+claim "$DL"; wake_json
+blind_fire() { # tick
+  inputs_from_fakes
+  step_ok "$(tick_time "$1")"
+}
+inputs_from_fakes; step_ok "$(tick_time 0)" --poll-json "$C/wake.json"
+blind_fire 3                                        # 10:30 BLOCKED validated, its post enqueued
+export SMOKE_GATE_RUN_ROOT="$C/no-such-mount"       # the gate's mount goes away
+blind_fire 4; blind_fire 5; blind_fire 6            # three fires with a blind gate
+[ "$(jq -s '[.[] | select(.tool=="gate" and .op=="run-root-unreadable")] | length' "$FAKE_LOG")" = 3 ] \
+  || fail "#2093(blind): precondition -- the timeout reached the blind gate on each of the three fires (retried, not given up): $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
+[ "$(jq -s '[.[] | select(.tool=="gate" and .argv[0]=="finish")] | length' "$FAKE_LOG")" = 0 ] \
+  || fail "#2093(blind): a gate that cannot look must never be answered with finish BLOCKED"
+jr '[.[] | select(.kind=="gate" and .slot=="challenger-timeout")] | last | [.state, .detail.refusal]
+    == ["intent","run-root-unreadable"]' | grep -qx true \
+  || fail "#2093(blind): the blind refusal leaves the timeout open (intent), never failed_terminal: $(jr '[.[]|select(.kind=="gate")]|last')"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-blind:"))) | .slot] | unique | length == 1' \
+  | grep -qx true || fail "#2093(blind): exactly one deduped operator alarm for the blind gate"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-refused:")))] | length == 0' | grep -qx true \
+  || fail "#2093(blind): a blind gate is not escalated as a permanent refusal"
+[ "$(finish_verdict)" = null ] || fail "#2093(blind): nothing finished while the gate was blind: $(finish_verdict)"
+export SMOKE_GATE_RUN_ROOT="$C/runs"                # the mount recovers
+blind_fire 7; blind_fire 8
+jr '[.[] | select(.kind=="gate" and .state=="done") | [.slot, .at]] == [["challenger-timeout","2026-09-18T11:10:00Z"]]' \
+  | grep -qx true || fail "#2093(blind): the first fire after recovery times out through challenger-timeout: $(jr '[.[]|select(.kind=="gate")]')"
+[ "$(jq -r '.challengerDisposition' "$C/state/pr-$PR-state.json")" = no-disposition ] \
+  || fail "#2093(blind): the recovered gate recorded no-disposition itself"
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "#2093(blind): BLOCKED after recovery: $(finish_verdict)"
+assert_once "#2093(gate blind)"
+
+# b7) a PERMANENT refusal that does not prove the premise false -- a code this
+#     controller does not know, and `no-deadline` -- fails closed: the gate
+#     records no verdict, the slot stays held, the refusal is escalated, and
+#     nothing is guessed toward `finish`. (The verdict chat post and PR comment
+#     precede every terminal call by design; what is withheld is the gate's
+#     verdict, which is what ends a run.)
+for code in some-future-refusal no-deadline; do
+  new_case "t2093-permanent-$code"
+  jq -cn --arg c "refuse-code:$code" '{"gate:challenger-timeout":[$c]}' >"$C/fake/faults.json"
+  NO_CONTRACT=1 DEADLINE="$DL" campaign 6
+  [ "$(jq -s --arg c "$code" '[.[] | select(.tool=="gate" and .op==$c)] | length' "$FAKE_LOG")" = 1 ] \
+    || fail "#2093($code): precondition -- the timeout reached the gate and was refused with $code, once: $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
+  [ "$(jq -s '[.[] | select(.tool=="gate" and (.argv[0]=="finish" or .argv[0]=="challenger-timeout"))] | length' "$FAKE_LOG")" = 1 ] \
+    || fail "#2093($code): after a permanent refusal nothing is sent again -- no finish, no second timeout"
+  jr '[.[] | select(.kind=="gate" and .slot=="challenger-timeout")] | last | [.state, .detail.refusal]
+      == ["failed_terminal","'"$code"'"]' | grep -qx true \
+    || fail "#2093($code): the refusal is recorded permanent, with its code"
+  [ "$(finish_verdict)" = null ] || fail "#2093($code): an unproven verdict was published: $(finish_verdict)"
+  [ "$(jq -r '.activeRunId' "$C/state/pr-$PR-state.json")" = "$RUN" ] \
+    || fail "#2093($code): the slot is still held -- the gate recorded no verdict"
+  jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-refused:")))] | length >= 1' | grep -qx true \
+    || fail "#2093($code): the refusal is escalated to an operator"
+done
+
+# b8) `deadline-not-passed`: the gate's clock has not reached the deadline the
+#     controller's clock has. A wait, not a refusal: retried, never
+#     failed_terminal, never alarmed; the next attempt times out normally.
+new_case t2093-gate-clock-behind
+jq -cn '{"gate:challenger-timeout":["refuse-code:deadline-not-passed"]}' >"$C/fake/faults.json"
+FAULTY=1 NO_CONTRACT=1 DEADLINE="$DL" campaign 6
+[ "$(jq -s '[.[] | select(.tool=="gate" and .op=="deadline-not-passed")] | length' "$FAKE_LOG")" = 1 ] \
+  || fail "#2093(clock): precondition -- the gate answered deadline-not-passed once"
+jr '[.[] | select(.kind=="gate" and .state=="done") | .slot] == ["challenger-timeout"]' | grep -qx true \
+  || fail "#2093(clock): the retried timeout went through challenger-timeout: $(jr '[.[]|select(.kind=="gate")]')"
+jr '[.[] | select(.kind=="gate" and .slot=="challenger-timeout" and .state=="failed_terminal")] | length == 0' \
+  | grep -qx true || fail "#2093(clock): a wait is never recorded failed_terminal"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-")))] | length == 0' | grep -qx true \
+  || fail "#2093(clock): a wait raises no alarm"
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "#2093(clock): BLOCKED: $(finish_verdict)"
+assert_once "#2093(gate clock behind)"
 
 # c) a kill anywhere in the timeout's own sequence is recovered on re-entry,
 #    each effect exactly once (campaign re-runs every fire and asserts it).

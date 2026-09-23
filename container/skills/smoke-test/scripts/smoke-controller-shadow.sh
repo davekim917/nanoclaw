@@ -11,26 +11,26 @@
 #      (unset = `shadow`), because shadow is provably inert; `off` = do
 #      nothing; anything else is refused;
 #   2. `init`s the controller journal ONCE per out-dir. The controller keeps one
-#      journal for every run (smoke-campaign-controller.py:264-353) and `init`
-#      refuses an existing one (:325-330). A sentinel records that init
+#      journal for every run (smoke-campaign-controller.py:279-368) and `init`
+#      refuses an existing one (:340-345). A sentinel records that init
 #      happened, so a journal lost later is never re-created as empty -- the
-#      controller's `step` hard-errors on it instead (:302-303);
+#      controller's `step` hard-errors on it instead (:317-318);
 #   3. reads the gate's state files directly. `poll` is NOT side-effect-free:
 #      it claims the slot and writes pr-<n>-state.json before it wakes anyone
-#      (smoke-pr-gate.sh:5351-5361 via write_pr_state, :1380-1388). The state
+#      (smoke-pr-gate.sh:5361-5371 via write_pr_state, :1380-1388). The state
 #      files are replaced by tmp+rename (:1382-1384), so a read never sees a
 #      half-written file;
 #   4. fetches the current head of every PR the controller has in play with
 #      `gh pr view` (read-only), and `ncl tasks list --json` ONLY when the
 #      journal holds a bare, non-ambiguous dispatch intent -- the one path
-#      that reads tasks (smoke-campaign-controller.py:856-862);
+#      that reads tasks (smoke-campaign-controller.py:872-878);
 #   5. runs `step --shadow` once. That one step covers every active run
-#      (fire_once, smoke-campaign-controller.py:1235-1245).
+#      (fire_once, smoke-campaign-controller.py:1255-1265).
 #
 # Receipts are passed as `{}` on purpose. They are chat DELIVERY receipts keyed
-# key#attempt (smoke-campaign-controller.py:731-742), consulted only for an
+# key#attempt (smoke-campaign-controller.py:746-757), consulted only for an
 # `enqueued` send, and shadow never enqueues: a refused send is journaled
-# `done` at once (:774-778). There is no GitHub receipt input.
+# `done` at once (:790-794). There is no GitHub receipt input.
 #
 # Counterfactual hold (the replay's model, smoke-campaign-replay.py:425-428):
 # once the legacy coordinator finishes a run the shadow is tracking, the
@@ -83,7 +83,7 @@
 #     when absent), and every wrapper write is opened relative to a directory
 #     fd with O_NOFOLLOW at each component, then checked with the controller's
 #     own helpers (open_contained / _contained,
-#     smoke-campaign-controller.py:202-257) to resolve under OUT and to be a
+#     smoke-campaign-controller.py:217-272) to resolve under OUT and to be a
 #     regular file with exactly one link. A symlinked OUT, wrapper/, tmp/ or
 #     fires.ndjson is refused; a symlinked *.tmp or gate-view entry is
 #     unlinked and replaced, never followed. The controller's journal, lock
@@ -161,7 +161,7 @@ TEST_HANG = os.environ.get("SMOKE_CONTROLLER_SHADOW_TEST_HANG", "")  # test-only
 # (smoke-controller-live-worker.py, same rule, same reason: XZO #2047, where a
 # hardcoded allowlist here dropped SMOKE_GATE_LEASE_DIR and the evidence
 # barrier this wrapper's controller step spawns
-# (smoke-campaign-controller.py:1393 -> spawn, :638-650, env=None) fell back to
+# (smoke-campaign-controller.py:1413 -> spawn, :653-665, env=None) fell back to
 # a lease dir holding no pin, smoke-evidence-barrier.sh:739). NOT_CONFIG is the
 # inverse: names that say how this process and its children RUN rather than
 # what the campaign IS. A name here is IGNORED, exactly as every name outside
@@ -244,7 +244,7 @@ class Refused(Exception):
 
 def check_fd(fd, what):
     """The controller's resolve-under-root check, plus its regular-file and
-    single-link checks (smoke-campaign-controller.py:241-252)."""
+    single-link checks (smoke-campaign-controller.py:256-267)."""
     ctl._contained(fd, OUT)
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
