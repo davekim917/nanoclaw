@@ -703,10 +703,16 @@ function publishToolInFlight(): void {
   }
   // Write only when the DESCRIBED CALL changes. The writer stamps
   // `tool_started_at = now` on every call (container/agent-runner/src/mailbox/
-  // sqlite/connection.ts:145-156), and the host's claim-stuck rule reads that
-  // stamp as "this tool was already running before the claim". Re-publishing
-  // the same long Bash because a parallel Read started or finished would move
-  // its start time forward and withdraw that forgiveness mid-operation.
+  // sqlite/connection.ts:145-156), and the host reads that stamp as the start
+  // of the tool it describes: `decideCeilingFollowUp` ages it against the
+  // ceiling that fired to decide a wedged-tool wake
+  // (src/modules/sweep-continuation/decide.ts:42-57), the wake's dedupe key is
+  // built from it (sweep-continuation/index.ts:336), host-restart-warn feeds it
+  // to the same decision and keys its note on it (src/host-restart-warn.ts:249,
+  // :287), and the dashboard marks a thread stalled by its age
+  // (src/dashboard/api/threads.ts:251-253). Re-publishing the same long Bash
+  // because a parallel Read started or finished would move that start forward:
+  // it would re-key the recovery and make a wedged tool look fresh.
   if (widestId === publishedToolUseId) return;
   try {
     if (widest === null) clearContainerToolInFlight();
@@ -723,6 +729,37 @@ export function resetToolInFlightTracking(): void {
   if (toolsInFlight.size === 0) return;
   toolsInFlight.clear();
   publishToolInFlight();
+}
+
+/**
+ * Claude Code's Bash ceiling when `BASH_MAX_TIMEOUT_MS` is unset: the Bash
+ * tool's input schema documents `timeout` as "max 600000"
+ * (@anthropic-ai/claude-agent-sdk sdk-tools.d.ts:794, SDK 0.3.280).
+ */
+const CLAUDE_CODE_DEFAULT_BASH_MAX_TIMEOUT_MS = 600_000;
+
+/**
+ * The declared Bash timeout the host may trust, or null.
+ *
+ * The model's `tool_input.timeout` is whatever number it typed, and the host
+ * uses the published value unbounded — `Math.max(ABSOLUTE_CEILING_MS, declared)`
+ * for the ceiling and `Math.max(CLAIM_STUCK_MS, declared)` for the claim
+ * tolerance (src/modules/sweep-container-health/index.ts:585, :611). The CLI
+ * never runs a Bash call longer than `BASH_MAX_TIMEOUT_MS`, which the host pins
+ * to 3600000 in the container env (src/group-init.ts:30, and the spawn's
+ * `-e` at src/container-runner.ts:6488). So a declared `86400000` (or `1e12`) plus a
+ * wedged CLI or a leaked denied call would hold off both kills for a day (or
+ * forever) while the Bash itself was long dead. Clamping to the enforced cap
+ * bounds that at what the CLI would allow anyway.
+ *
+ * Non-numbers, NaN, ±Infinity and non-positive values are not a declaration:
+ * null, so the host falls back to its own defaults.
+ */
+export function clampDeclaredBashTimeoutMs(declared: unknown): number | null {
+  if (typeof declared !== 'number' || !Number.isFinite(declared) || declared <= 0) return null;
+  const envCap = Number(process.env.BASH_MAX_TIMEOUT_MS);
+  const cap = Number.isFinite(envCap) && envCap > 0 ? envCap : CLAUDE_CODE_DEFAULT_BASH_MAX_TIMEOUT_MS;
+  return Math.min(declared, cap);
 }
 
 /**
@@ -750,10 +787,9 @@ export const preToolUseHook: HookCallback = async (input) => {
       stopReason: `Tool '${toolName}' is not available in this environment — use the nanoclaw equivalent.`,
     } as unknown as ReturnType<HookCallback>;
   }
-  // Bash exposes its timeout via the tool_input.timeout field (ms). Any other
-  // tool: no declared timeout.
-  const declaredTimeoutMs =
-    toolName === 'Bash' && typeof i.tool_input?.timeout === 'number' ? (i.tool_input.timeout as number) : null;
+  // Bash exposes its timeout via the tool_input.timeout field (ms), clamped to
+  // what the CLI will actually enforce. Any other tool: no declared timeout.
+  const declaredTimeoutMs = toolName === 'Bash' ? clampDeclaredBashTimeoutMs(i.tool_input?.timeout) : null;
   toolsInFlight.set(i.tool_use_id ?? '', { tool: toolName, declaredTimeoutMs });
   publishToolInFlight();
   return { continue: true };
