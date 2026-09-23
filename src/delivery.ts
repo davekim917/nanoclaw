@@ -285,6 +285,10 @@ interface StatusTrack {
   editExhausted?: boolean;
   /** True only for the runner-authored deterministic lifecycle row. */
   lifecycle?: boolean;
+  /** The lifecycle row is tracked but was never posted: the human sees no
+   *  "working" line until the first typed progress posts one. `messageId` is
+   *  empty while this is set, so nothing may edit or delete it. */
+  unposted?: boolean;
 }
 const statusTracking = new Map<string, StatusTrack>();
 const lifecycleRecoveryMisses = new Set<string>();
@@ -342,6 +346,10 @@ async function stopSessionLifecycleStatus(
     return;
   }
   if (!status) status = await recoverLifecycleStatus(sessionId, outboundId);
+  if (status?.unposted) {
+    statusTracking.delete(sessionId);
+    return;
+  }
   if (!status || !deliveryAdapter) return;
   try {
     await deliveryAdapter.deliver(
@@ -415,7 +423,7 @@ async function dropOrphanStatus(
   let orphan = opts.skip ? undefined : statusTracking.get(sessionId);
   if (!orphan && opts.recoverLifecycle && !opts.skip) orphan = await recoverLifecycleStatus(sessionId);
   let deleted = false;
-  if (orphan && deliveryAdapter?.deleteMessage) {
+  if (orphan && !orphan.unposted && deliveryAdapter?.deleteMessage) {
     try {
       await deliveryAdapter.deleteMessage(
         orphan.channelType,
@@ -455,7 +463,7 @@ function sameConversation(status: StatusTrack, delivered: DeliveredConversation)
 }
 
 async function editSessionLifecycleStatus(status: StatusTrack, text: string): Promise<void> {
-  if (!status.lifecycle || !deliveryAdapter) return;
+  if (!status.lifecycle || status.unposted || !deliveryAdapter) return;
   await deliveryAdapter.deliver(
     status.channelType,
     status.platformId,
@@ -1535,9 +1543,9 @@ async function deliverMessage(
     }
     // Typed provider progress may update the deterministic activity line for
     // this human turn, but it may never create a public narration stream of
-    // its own. The lifecycle row is written before the provider is invoked;
-    // durable recovery covers a host-memory reset between that post and the
-    // first progress event. Exact conversation + turn matching keeps task,
+    // its own. The lifecycle row is written before the provider is invoked
+    // and tracked unposted; a host-memory reset before the first progress
+    // post leaves nothing to recover, so that turn's progress stays internal. Exact conversation + turn matching keeps task,
     // sibling, and redirected traffic record-only.
     if (typedProgress) {
       let lifecycle = statusTracking.get(session.id);
@@ -1568,7 +1576,7 @@ async function deliverMessage(
     // turn posts a fresh status line below the user's message instead.
     const stale = statusTracking.get(session.id);
     if (stale && stale.inReplyTo !== msg.in_reply_to) {
-      if (deliveryAdapter.deleteMessage) {
+      if (!stale.unposted && deliveryAdapter.deleteMessage) {
         try {
           await deliveryAdapter.deleteMessage(
             stale.channelType,
@@ -1588,7 +1596,27 @@ async function deliverMessage(
       statusTracking.delete(session.id);
     }
 
-    const existing = statusTracking.get(session.id);
+    // The deterministic liveness row stays unposted: the typing indicator
+    // already says the agent is working. It is tracked so the turn's first
+    // typed progress may post the activity line and own its lifecycle.
+    if (content.reporting?.version === 1 && content.reporting?.purpose === 'liveness') {
+      statusTracking.set(session.id, {
+        outboundId: msg.id,
+        channelType: msg.channel_type,
+        platformId: msg.platform_id,
+        threadId: msg.thread_id,
+        messageId: '',
+        instance: deliverInstance,
+        inReplyTo: msg.in_reply_to,
+        lifecycle: true,
+        unposted: true,
+      });
+      return { recordOnly: true };
+    }
+
+    const tracked = statusTracking.get(session.id);
+    const lifecycleOwner = tracked?.lifecycle && (typedProgress || tracked.unposted) ? tracked : undefined;
+    const existing = tracked?.unposted ? undefined : tracked;
     const freshOutbound = humanizeOutboundContent(scrubSecrets(msg.content));
     const replacingExhaustedStatus = existing?.editExhausted === true;
     let outbound = freshOutbound;
@@ -1644,7 +1672,6 @@ async function deliverMessage(
       // agent's send_message MCP tool can target a different channel/thread,
       // and using the wrong (channel, ts) pair on Slack's chat.delete could
       // delete an unrelated message if the timestamps happened to collide.
-      const lifecycleOwner = typedProgress && existing?.lifecycle ? existing : undefined;
       statusTracking.set(session.id, {
         outboundId: lifecycleOwner?.outboundId ?? msg.id,
         channelType: msg.channel_type,
@@ -1653,11 +1680,11 @@ async function deliverMessage(
         messageId: platformMsgId,
         instance: deliverInstance,
         inReplyTo: msg.in_reply_to,
-        lifecycle:
-          lifecycleOwner?.lifecycle ?? (content.reporting?.version === 1 && content.reporting?.purpose === 'liveness'),
+        lifecycle: lifecycleOwner !== undefined,
       });
-      // Discord can force an in-place activity line to be reposted after its
-      // edit cap. Keep the lifecycle receipt pointed at the replacement so a
+      // The first progress post (the liveness row itself is never posted), or
+      // a Discord repost after its edit cap. Keep the lifecycle receipt
+      // pointed at the visible line so a
       // later host-memory recovery deletes the visible line, not its retired
       // predecessor. This write is best-effort after platform success: a DB
       // fault must not retry and duplicate the public post.
@@ -1675,8 +1702,7 @@ async function deliverMessage(
           });
         }
       }
-      if (content.reporting?.version === 1 && content.reporting?.purpose === 'liveness')
-        lifecycleRecoveryMisses.delete(session.id);
+      if (lifecycleOwner) lifecycleRecoveryMisses.delete(session.id);
     }
     if (replacedStatus && platformMsgId) {
       if (deliveryAdapter.deleteMessage) {

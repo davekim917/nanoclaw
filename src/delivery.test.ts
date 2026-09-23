@@ -102,6 +102,26 @@ function insertOutboundKind(
   db.close();
 }
 
+/** The liveness row is never posted; the turn's first typed progress posts the visible line. */
+function insertFirstProgress(
+  sessionId: string,
+  msgId: string,
+  threadId: string | null = null,
+  inReplyTo: string | null = null,
+): void {
+  insertOutboundKind(
+    'ag-1',
+    sessionId,
+    msgId,
+    'status',
+    'telegram',
+    'telegram:123',
+    { text: '> 💭 Working.', reporting: { version: 1, purpose: 'progress' } },
+    threadId,
+    inReplyTo,
+  );
+}
+
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
@@ -357,6 +377,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
       text: 'Accepted · working',
       reporting: { version: 1, purpose: 'liveness', state: 'working' },
     });
+    insertFirstProgress(session.id, 'progress-1');
     await deliverSessionMessages(session);
     insertOutboundKind('ag-1', session.id, 'queued-reply', 'chat', 'telegram', 'telegram:123', {
       text: 'The queued work completed.',
@@ -409,6 +430,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
         text: 'Accepted · working',
         reporting: { version: 1, purpose: 'liveness', state: 'working' },
       });
+      insertFirstProgress(session.id, 'progress-approval');
       await deliverSessionMessages(session);
       await createPendingApproval({
         approval_id: `approval-${deleteMode}`,
@@ -476,6 +498,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
       },
       'thread-a',
     );
+    insertFirstProgress(session.id, 'progress-off-route', 'thread-a');
     await deliverSessionMessages(session);
     await createPendingApproval({
       approval_id: 'approval-off-route',
@@ -679,7 +702,18 @@ describe('deliverSessionMessages — concurrent invocations', () => {
         'status',
         channelType,
         'discord:guild-1:channel-1',
-        { text: 'first', reporting: { version: 1, purpose: 'liveness', state: 'working' } },
+        { text: 'Accepted · working', reporting: { version: 1, purpose: 'liveness', state: 'working' } },
+        'thread-1',
+        'turn-1',
+      );
+      insertOutboundKind(
+        'ag-1',
+        session.id,
+        'status-1-progress',
+        'status',
+        channelType,
+        'discord:guild-1:channel-1',
+        { text: 'first', reporting: { version: 1, purpose: 'progress' } },
         'thread-1',
         'turn-1',
       );
@@ -3075,6 +3109,7 @@ describe('deliverSessionMessages — ask_question ids', () => {
       text: 'Accepted · working',
       reporting: { version: 1, purpose: 'liveness', state: 'working' },
     });
+    insertFirstProgress(session.id, 'working-progress');
     await deliverSessionMessages(session);
     insertOutboundKind('ag-1', session.id, 'out-ask', 'chat-sdk', 'telegram', 'telegram:123', ask('q-agent-2'));
 
@@ -3103,6 +3138,7 @@ describe('deliverSessionMessages — ask_question ids', () => {
       text: 'Accepted · working',
       reporting: { version: 1, purpose: 'liveness', state: 'working' },
     });
+    insertFirstProgress(session.id, 'working-progress');
     await deliverSessionMessages(session);
     insertOutboundKind('ag-1', session.id, 'out-ask', 'chat-sdk', 'telegram', 'telegram:123', ask('q-agent-3'));
 
@@ -3530,6 +3566,10 @@ describe('per-work-item outcome delivery', () => {
       reporting: { version: 1, purpose: 'liveness', state: 'working' },
     });
     await deliverSessionMessages(session);
+    // The liveness row itself is never posted.
+    expect(deliver).toHaveBeenCalledTimes(1);
+    insertFirstProgress(session.id, 'first-progress');
+    await deliverSessionMessages(session);
     expect(deliver).toHaveBeenCalledTimes(2);
     _resetStatusTrackingForTest();
     insertOutboundKind('ag-1', session.id, 'ended', 'system', null as never, null as never, {
@@ -3543,6 +3583,24 @@ describe('per-work-item outcome delivery', () => {
       messageId: 'lifecycle-status',
       text: 'Stopped before sending a reply.',
     });
+  });
+
+  it('posts nothing for a turn that ends without progress or a reply', async () => {
+    const session = await prepare();
+    const deliver = vi.fn().mockResolvedValue('unexpected');
+    const deleteMessage = vi.fn().mockResolvedValue(undefined);
+    setDeliveryAdapter({ deliver, deleteMessage });
+    insertOutboundKind('ag-1', session.id, 'silent', 'status', 'telegram', 'telegram:123', {
+      text: 'Accepted · working',
+      reporting: { version: 1, purpose: 'liveness', state: 'working' },
+    });
+    insertOutboundKind('ag-1', session.id, 'silent-end', 'system', null as never, null as never, {
+      action: 'turn_end',
+      lifecycleStatusId: 'silent',
+    });
+    await deliverSessionMessages(session);
+    expect(deliver).not.toHaveBeenCalled();
+    expect(deleteMessage).not.toHaveBeenCalled();
   });
 
   it('edits one recovered lifecycle line for repeated progress and removes it when the permanent reply lands', async () => {
@@ -3566,6 +3624,7 @@ describe('per-work-item outcome delivery', () => {
       null,
       'human-request-1',
     );
+    insertFirstProgress(session.id, 'progress-0', null, 'human-request-1');
     await deliverSessionMessages(session);
 
     _resetStatusTrackingForTest();
@@ -3636,10 +3695,7 @@ describe('per-work-item outcome delivery', () => {
     await deliverSessionMessages(session);
 
     expect(deliver).toHaveBeenCalledTimes(4);
-    expect(JSON.parse(deliver.mock.calls[0]![4])).toEqual({
-      text: 'Accepted · working',
-      reporting: { version: 1, purpose: 'liveness', state: 'working' },
-    });
+    expect(JSON.parse(deliver.mock.calls[0]![4])).toMatchObject({ text: '> 💭 Working.' });
     expect(JSON.parse(deliver.mock.calls[1]![4])).toEqual({
       operation: 'edit',
       messageId: 'lifecycle-status',
