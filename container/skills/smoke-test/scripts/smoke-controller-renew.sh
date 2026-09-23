@@ -493,6 +493,9 @@ while IFS= read -r candidate; do
     continue
   fi
   if [ "$RENEWALS" -ge "$MAX_RENEWALS" ]; then
+    # An eligible step this tick will not renew is a failed renewal like any
+    # other: the worker must not claim more work while claims go unrenewed.
+    GATE_FAILURES=$((GATE_FAILURES + 1))
     note "$RUN_ID" "$STEP" "tick renewal cap ($MAX_RENEWALS) reached"
     continue
   fi

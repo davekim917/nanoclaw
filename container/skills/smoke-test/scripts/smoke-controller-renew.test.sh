@@ -915,5 +915,32 @@ failed_tick "rf6 a symlinked prior heartbeat is not believed" 2
 unset SMOKE_CONTROLLER_GATE_CMD GATE_LOG
 ok
 
+# More eligible steps than one tick may renew (MAX_RENEWALS, 16): the ones
+# past the cap go unrenewed, so the tick is not healthy (Codex, PR #1089).
+new_case heartbeat-renewal-cap
+use_stub_gate
+NOWE="$(/usr/bin/date -u +%s)"
+for i in $(seq 1 17); do
+  R_I="demo-pr-pr$((100 + i))-aaaaaaaaaaaa-20260920T000000Z"
+  mkdir -p "$C/runs/$R_I/controller" "$C/runs/$R_I/evidence"
+  : >"$C/runs/$R_I/controller/brief-lanes.ack"
+  : >"$C/runs/$R_I/evidence/progress.txt"
+  for rec in "run claim enqueued {\"ownerToken\":\"$TOKEN\"}" "owner lanes enqueued {}"; do
+    set -- $rec
+    jq -cn --arg run "$R_I" --arg kind "$1" --arg slot "$2" --arg state "$3" --arg at "$(iso "$NOWE")" \
+      --argjson detail "$4" \
+      '{at:$at,fire:$at,runId:$run,kind:$kind,slot:$slot,key:("k-" + $run + "-" + $kind + "-" + $slot),
+        state:$state,mode:"live",attempt:1,v:1,detail:$detail}' >>"$JOURNAL"
+  done
+done
+tick
+[ "$(field '.data.renewed | length')" = 16 ] || fail "cap: precondition -- 16 renewed: $LAST"
+[ "$(field '[.data.skipped[] | select(.reason | test("renewal cap"))] | length')" = 1 ] \
+  || fail "cap: precondition -- the 17th hit the cap: $LAST"
+[ "$(field '.data.status')" = renew-failed ] && [ "$(hb .status)" = renew-failed ] && [ "$(hb .failedTicks)" = 1 ] \
+  || fail "cap: a step left unrenewed by the cap is a failed tick: $LAST / $(cat "$(HB)" 2>&1)"
+unset SMOKE_CONTROLLER_GATE_CMD GATE_LOG
+ok
+
 [ "$FAILURES" = 0 ] || { echo "$FAILURES assertion group(s) FAILED" >&2; exit 1; }
 echo "PASS ($PASSES assertions)"
