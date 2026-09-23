@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -10,9 +10,50 @@ import { getPendingMessages, markCompleted, markProcessing, type MessageInRow } 
 import { formatMessages } from './formatter.js';
 import { selectInTurnFollowUps } from './poll-loop.js';
 import './providers/index.js';
+import { _setSdkQueryForTesting } from './providers/claude.js';
 import { createProvider } from './providers/factory.js';
 import type { AgentProvider, AgentQuery, QueryInput } from './providers/types.js';
 import { MEMORY_SESSION_HOOK } from './memory/session-hook.js';
+import type { Query, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+
+type SdkQuery = NonNullable<Parameters<typeof _setSdkQueryForTesting>[0]>;
+
+/**
+ * What the Claude provider handed the SDK, per `query` call. The real SDK
+ * spawns the Claude Code CLI, which inside an agent container can reach the
+ * Anthropic API (#1072), so the SDK entry point is swapped for this fake.
+ * It drains the prompt stream the way the CLI would read stdin, and its
+ * message iterator ends when the provider aborts.
+ */
+const sdkCalls: Array<{ resume?: string; prompts: string[] }> = [];
+const fakeSdkQuery: SdkQuery = (params) => {
+  const call = { resume: params.options?.resume, prompts: [] as string[] };
+  sdkCalls.push(call);
+  if (typeof params.prompt !== 'string') {
+    const prompt = params.prompt as AsyncIterable<SDKUserMessage>;
+    void (async () => {
+      for await (const message of prompt) {
+        const content = message.message.content;
+        call.prompts.push(typeof content === 'string' ? content : JSON.stringify(content));
+      }
+    })();
+  }
+  const signal = params.options?.abortController?.signal;
+  return {
+    async *[Symbol.asyncIterator]() {
+      if (signal && !signal.aborted) {
+        await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+      }
+    },
+    interrupt: async () => {},
+  } as unknown as Query;
+};
+
+beforeAll(() => _setSdkQueryForTesting(fakeSdkQuery));
+afterAll(() => _setSdkQueryForTesting());
+
+/** Let the fake SDK's prompt drain run. */
+const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
 const PROVIDERS = ['claude', 'codex', 'opencode'] as const;
 let nextSeq = 1;
@@ -22,6 +63,7 @@ const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
 beforeEach(() => {
   initTestSessionDb();
   nextSeq = 1;
+  sdkCalls.length = 0;
   testClaudeConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-provider-memory-'));
   process.env.CLAUDE_CONFIG_DIR = testClaudeConfigDir;
 });
@@ -70,7 +112,7 @@ function assertPairExactlyOnce(prompt: string, id: string, expectCapabilities: b
 }
 
 describe('provider memory lifecycle conformance', () => {
-  it('test_provider_lifecycle_parity_receives_pair_on_cold_warm_and_rotation', () => {
+  it('test_provider_lifecycle_parity_receives_pair_on_cold_warm_and_rotation', async () => {
     const expectedConstructors = {
       claude: 'ClaudeProvider',
       codex: 'CodexProvider',
@@ -124,6 +166,17 @@ describe('provider memory lifecycle conformance', () => {
       });
       assertPairExactlyOnce(records[2].prompt, `${providerName}-replacement`, true);
       expect(records.map((record) => record.phase)).toEqual(['query', 'push', 'query']);
+
+      if (providerName === 'claude') {
+        // The pair reached the SDK's input, not just the provider wrapper.
+        await flush();
+        expect(sdkCalls.map((call) => call.resume)).toEqual([undefined, 'claude-rotated-session']);
+        expect(sdkCalls[0].prompts).toHaveLength(2);
+        assertPairExactlyOnce(sdkCalls[0].prompts[0], 'claude-cold', true);
+        assertPairExactlyOnce(sdkCalls[0].prompts[1], 'claude-warm', false);
+        expect(sdkCalls[1].prompts).toHaveLength(1);
+        assertPairExactlyOnce(sdkCalls[1].prompts[0], 'claude-replacement', true);
+      }
       query.abort();
       replacementQuery.abort();
       markCompleted(replacement.map((row) => row.id));
