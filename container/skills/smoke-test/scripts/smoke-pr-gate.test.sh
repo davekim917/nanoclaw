@@ -2270,6 +2270,29 @@ bash "$GATE" release run-stall-done owner-done >/dev/null
 stall_clear
 unset SMOKE_GATE_RUN_ROOT
 
+# --- 7d. challenger-timeout ends a run that never left intake (XZO #2093) ------
+# The controller now times a run out while it is still in intake -- no
+# completion contract, possibly no run directory at all (run pr2075). That
+# rests on the verb needing neither: it reads the claim, the deadline and the
+# ABSENCE of challenger/disposition.md under a readable run root, then runs the
+# ordinary finish BLOCKED. Asserted here against the real verb, not the fake.
+STALL_SHA="$(sha 3)"
+stalled_fixture 68 "$STALL_SHA"
+bash "$GATE" claim run-intake-dead 68 "$STALL_SHA" owner-intake | jq -e '.ok == true' >/dev/null
+[ ! -e "$SMOKE_GATE_RUN_ROOT/run-intake-dead" ] || { echo "7d: precondition - no run directory" >&2; exit 1; }
+# Before the deadline the verb refuses, so what follows is the deadline's doing.
+bash "$GATE" challenger-timeout run-intake-dead owner-intake | jq -e '
+  .ok == false and (.error | test("has not passed"))' >/dev/null \
+  || { echo "7d: challenger-timeout ended a run before its deadline" >&2; exit 1; }
+jq -c '.challengerDeadline="2000-01-01T00:00:00Z"' "$STATE_DIR/pr-68-state.json" > "$STATE_DIR/pr-68-state.tmp"
+mv "$STATE_DIR/pr-68-state.tmp" "$STATE_DIR/pr-68-state.json"
+bash "$GATE" challenger-timeout run-intake-dead owner-intake | jq -e '
+  .ok == true and .verdict == "BLOCKED" and .challengerDisposition == "no-disposition"' >/dev/null \
+  || { echo "7d: challenger-timeout refused a contract-less run past its deadline" >&2; exit 1; }
+jq -e '.activeRunId == null and .completedRunId == "run-intake-dead" and .completedVerdict == "BLOCKED"' \
+  "$STATE_DIR/pr-68-state.json" >/dev/null || { echo "7d: the slot was not released BLOCKED" >&2; exit 1; }
+unset SMOKE_GATE_RUN_ROOT
+
 # --- 8. finish suspends the backend preview ---------------------------------
 fresh_state
 FINISH_SHA="$(sha 3)"

@@ -118,6 +118,22 @@ world() { # tick
   for b in "$R"/controller/brief-*.md; do
     [ -e "$b" ] && [ ! -e "${b%.md}.ack" ] && : >"${b%.md}.ack"
   done
+  # SETTLE="intake lanes ...": on the phase-dispatch route, each named owner
+  # step's session settles once the artifact it owes is on disk -- a tick
+  # after the owner writes it, as a real session ends after its last write.
+  # A step it does not name never settles.
+  if [ -n "${SETTLE:-}" ]; then
+    local st="{}" s
+    for s in $SETTLE; do
+      case "$s" in
+        intake) [ -e "$R/completion-contract.json" ] ;;
+        lanes) [ -e "$R/markers/B1.json" ] ;;
+        preliminary) [ -e "$R/coordinator/preliminary.md" ] ;;
+        *) false ;;
+      esac && st="$(jq -c --arg s "$s" '.[$s]="settled"' <<<"$st")"
+    done
+    printf '%s\n' "$st" >"$C/fake/settle.json"
+  fi
   # LATE_DISPOSITION=k: the challenger's disposition lands at tick k, whatever
   # the owner has done.
   if [ -n "${LATE_DISPOSITION:-}" ] && [ "$n" -ge "$LATE_DISPOSITION" ]; then
@@ -128,6 +144,9 @@ world() { # tick
     n=$((n - STALL)); [ "$n" -ge 2 ] || n=2
   fi
   [ "$n" -ge 1 ] || return 0
+  # NO_CONTRACT: an owner that never writes a completion contract -- a
+  # provider park, a declination (XZO #2093, run pr2075).
+  [ -z "${NO_CONTRACT:-}" ] || return 0
   if [ ! -e "$R/completion-contract.json" ]; then
     contract
     mkdir -p "$R/contact-sheet"
@@ -151,6 +170,8 @@ world() { # tick
   [ "$n" -ge 4 ] || return 0
   [ -e "$R/coordinator/preliminary.md" ] || printf 'prelim\n' >"$R/coordinator/preliminary.md"
   [ "$n" -ge 5 ] || return 0
+  # NO_CHALLENGER: the challenger never files a disposition.
+  [ -z "${NO_CHALLENGER:-}" ] || return 0
   [ -e "$R/challenger/challenge.complete.json" ] || parent_conclusions
   [ "$n" -ge 6 ] || return 0
   if [ ! -e "$R/synthesis.json" ]; then
@@ -198,6 +219,12 @@ live_args() {
     --cutover-json "$C/cutover.json" --repo acme/app --send-to campaign-room --gate-cmd "$C/bin/gate.sh" \
     --gh-cmd "python3 $FAKES gh" --ncl-cmd "python3 $FAKES ncl" --enqueue-cmd "python3 $FAKES enqueue" \
     --lock-timeout 1
+  # OWNER_DISPATCH: the phase-dispatch owner route (_phase_owner_step), whose
+  # steps settle only when fake/settle.json says so.
+  if [ -n "${OWNER_DISPATCH:-}" ]; then
+    jq -cn '{enabled:true,legacyRuns:[]}' >"$C/owner-cutover.json"
+    printf '%s\n' --owner-dispatch-cutover-json "$C/owner-cutover.json"
+  fi
 }
 step() { # now [extra args...]
   local now="$1"; shift
@@ -1340,5 +1367,115 @@ done
   || fail "#2092(late): redispatched lanes on the frozen pair did not let the GO through: $(finish_verdict) $STEP_OUT"
 [ ! -e "$R/controller/barrier-lanes.json" ] \
   || fail "#2092: the lanes refusal was left published after the phase passed"
+
+# --- XZO #2093: the challenger deadline ends a run from EVERY phase ------------
+# Every negative below is paired with a positive that only happens if the code
+# under test ran: a wake or a wait decision BEFORE the deadline proves the run
+# really sat in that phase, and the gate's own terminal call proves the fire
+# after the deadline reached the check.
+DL=2026-09-18T10:25:00Z
+timed_out() { # label
+  [ "$(finish_verdict)" = '"BLOCKED"' ] || fail "$1: no BLOCKED finish -- the run holds its slot: $(finish_verdict) $STEP_OUT"
+  jr '[.[] | select(.kind=="gate" and .state=="done") | .slot] == ["challenger-timeout"]' | grep -qx true \
+    || fail "$1: the terminal verb is challenger-timeout, exactly once: $(jr '[.[] | select(.kind=="gate")]')"
+  dq '[.[] | select(.type=="finish")] | last | .failedChecks
+      == ["challenger-timeout: no disposition by '"$DL"'"]' | grep -qx true \
+    || fail "$1: the verdict names the missed deadline and nothing else: $(dq '[.[]|select(.type=="finish")]|last')"
+  [ "$(jq -r '.prs["7"].state' "$C/fake/gh.json")" = CLOSED ] || fail "$1: the freeze PR is closed after the timeout"
+  assert_once "$1"
+}
+phase_waited() { # label step at: on fire <at> -- before the deadline, with the step's
+  # artifact already on disk -- the run was parked on that owner's settlement,
+  # i.e. on the done=True return under test, not on the artifact still missing.
+  [[ "$3" < "$DL" ]] || fail "$1: test bug -- $3 is not before the deadline $DL"
+  jq -cs --arg s "$2" --arg at "$3" '[.[] | select(.type=="wait" and .step==$s and .at == $at
+      and (.reason | test("phase owner in flight")))] | length > 0' "$C/out/$RUN/decisions.ndjson" | grep -qx true \
+    || fail "$1: precondition -- the run was not waiting on an unsettled $2 owner at $3, so this proves nothing: $(
+      jq -cs '[.[] | select(.type=="wait") | [.at,.step,.reason]] | unique' "$C/out/$RUN/decisions.ndjson")"
+}
+
+# a) run pr2075's shape: the owner never writes a contract. Intake is offered
+#    before the deadline; the first fire past it validates BLOCKED, the next
+#    one (its verdict post receipted) finishes -- two fires, as the issue's
+#    correction observed -- and nothing is posted or woken for a dead run.
+new_case t2093-no-contract
+NO_CONTRACT=1 DEADLINE="$DL" campaign 6
+timed_out "#2093(no contract)"
+[ "${WAKES[0]:-}" = intake ] && [[ "${WAKE_TIMES[0]}" < "$DL" ]] \
+  || fail "#2093: precondition -- intake was offered before the deadline: ${WAKES[*]} ${WAKE_TIMES[*]}"
+for i in "${!WAKES[@]}"; do
+  [[ "${WAKE_TIMES[$i]}" < "$DL" ]] || fail "#2093: owner woken for ${WAKES[$i]} at ${WAKE_TIMES[$i]}, past the deadline"
+done
+[ ! -e "$R/completion-contract.json" ] || fail "#2093: precondition -- the owner wrote no contract"
+jr '[.[] | select(.kind=="verdict" and .slot=="validated") | .at] | first == "2026-09-18T10:30:00Z"' | grep -qx true \
+  || fail "#2093: BLOCKED is validated on the FIRST fire past the deadline, not before and not later: $(jr '[.[]|select(.kind=="verdict")]')"
+jr '[.[] | select(.kind=="gate" and .state=="done") | .at] | first == "2026-09-18T10:40:00Z"' | grep -qx true \
+  || fail "#2093: finish lands the fire after the verdict post is receipted"
+jr '[.[] | select(.kind=="send") | .slot] | unique' | grep -qx '\["verdict"\]' \
+  || fail "#2093: the verdict is posted and the root post never is (no campaign ever started): $(jr '[.[]|select(.kind=="send")|.slot]|unique')"
+
+# b) the challenger files between the two fires: the timeout condition is then
+#    false, and the frozen BLOCKED must still settle rather than fall back into
+#    an intake it can never leave (the ladder's pr1896 replay, from intake).
+new_case t2093-late-disposition
+NO_CONTRACT=1 LATE_DISPOSITION=4 DEADLINE="$DL" campaign 6
+timed_out "#2093(late disposition)"
+[ -e "$R/challenger/disposition.md" ] \
+  || fail "#2093(late): precondition -- the disposition landed, so the finishing fire could not have re-timed-out"
+jr '[.[] | select(.kind=="gate" and .state=="done") | .at] | first == "2026-09-18T10:40:00Z"' | grep -qx true \
+  || fail "#2093(late): the finish is on the fire the disposition landed on"
+
+# c) a kill anywhere in the timeout's own sequence is recovered on re-entry,
+#    each effect exactly once (campaign re-runs every fire and asserts it).
+for point in after-intent:send:verdict after-intent:gate:challenger-timeout after-effect:gate:challenger-timeout; do
+  new_case "t2093-crash-${point//:/-}"
+  NO_CONTRACT=1 CRASH="$point" DEADLINE="$DL" campaign 7
+  timed_out "#2093(crash $point)"
+done
+
+# d) an owner's own HUMAN_DECISION is never pre-empted. Contract and synthesis
+#    land together, after the deadline, before the run has posted its root:
+#    the new pre-root check is the first thing that fire reaches, and it must
+#    defer to the verdict the owner wrote. (A guard, not a regression: main
+#    reaches this verdict too, because there the timeout sat below it.)
+new_case t2093-owner-verdict-wins
+claim "$DL"; wake_json
+step_ok 2026-09-18T10:00:00Z --poll-json "$C/wake.json"
+contract
+synthesis HUMAN_DECISION
+for now in 2026-09-18T10:30:00Z 2026-09-18T10:40:00Z; do inputs_from_fakes; step_ok "$now"; done
+[ ! -e "$R/challenger/disposition.md" ] || fail "#2093(d): precondition -- no disposition, so the timeout condition held"
+jr '[.[] | select(.kind=="verdict" and .slot=="validated") | .at] | first == "2026-09-18T10:30:00Z"' | grep -qx true \
+  || fail "#2093(d): precondition -- the verdict was taken on a fire past the deadline"
+[ "$(finish_verdict)" = '"HUMAN_DECISION"' ] \
+  || fail "#2093(d): the owner's HUMAN_DECISION was pre-empted by the deadline: $(finish_verdict)"
+jr '[.[] | select(.kind=="gate") | .slot] | unique == ["finish"]' | grep -qx true \
+  || fail "#2093(d): no challenger-timeout call at all: $(jr '[.[]|select(.kind=="gate")]')"
+
+# e) phase-dispatch route: the contract is written but the intake owner never
+#    settles, so intake returns on the done=True gate (_phase_owner_step).
+new_case t2093-intake-unsettled
+OWNER_DISPATCH=1 DEADLINE="$DL" campaign 6
+phase_waited "#2093(intake unsettled)" intake 2026-09-18T10:10:00Z
+timed_out "#2093(intake unsettled)"
+[ -e "$R/completion-contract.json" ] || fail "#2093(e): precondition -- the contract exists; the owner step is what never settles"
+
+# f) phase-dispatch: lanes evidence is complete but the lanes owner never
+#    settles. The old sites were all inside phases this return sits above.
+#    STALL=1 lands the markers a tick after the lanes owner is dispatched.
+DL=2026-09-18T10:45:00Z
+new_case t2093-lanes-unsettled
+OWNER_DISPATCH=1 SETTLE=intake NO_CHALLENGER=1 STALL=1 DEADLINE="$DL" campaign 7
+phase_waited "#2093(lanes unsettled)" lanes 2026-09-18T10:40:00Z
+timed_out "#2093(lanes unsettled)"
+[ -e "$R/markers/B1.json" ] || fail "#2093(f): precondition -- the lanes evidence is complete"
+
+# g) phase-dispatch: the preliminary is written but its owner never settles.
+new_case t2093-preliminary-unsettled
+OWNER_DISPATCH=1 SETTLE="intake lanes" NO_CHALLENGER=1 DEADLINE="$DL" campaign 7
+phase_waited "#2093(preliminary unsettled)" preliminary 2026-09-18T10:40:00Z
+timed_out "#2093(preliminary unsettled)"
+[ -e "$R/coordinator/preliminary.md" ] || fail "#2093(g): precondition -- the preliminary exists"
+unset STALL
 
 echo "smoke campaign controller live tests passed"

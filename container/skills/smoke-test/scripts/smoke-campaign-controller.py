@@ -2818,6 +2818,23 @@ class Controller:
         self._alarm_overdue(run_id, None)
 
         # -- phase derivation (derived, never stored) --
+        # THE CHALLENGER DEADLINE IS EVALUATED BEFORE INTAKE CAN RETURN (XZO
+        # #2093). Intake returns on every fire until a readable contract exists
+        # and the intake step settles, and before this the deadline was only
+        # evaluated further down, so a run whose owner never wrote a contract
+        # (a provider park, a declination) held its PR slot with no terminal
+        # path at all: run xzo-pr-pr2075-0f94c66c2d32-20260922T002109Z blew
+        # its deadline at 01:51:10Z and sat fifteen hours. It runs here only
+        # while the run has never posted its root (or its contract is
+        # unreadable, where intake returns before the root post on every fire
+        # anyway), because the root post is driven to its receipt only on the
+        # fires that reach it below: past that point the check lives with the
+        # lanes phase, after the root post, as it always has.
+        if not run.exists or run.contract_error or \
+                obligation_key(run_id, "send", "root") not in self.obligations():
+            ended = self._terminal_before_root(run_id, claim, run, pr)
+            if ended:
+                return ended
         if not run.exists or run.contract_error:
             self.owner_step(run_id, "intake", "intake", done=False)
             if run.exists and run.contract_error not in ("missing",):
@@ -2858,15 +2875,7 @@ class Controller:
         # replayed as is; a frozen GO is re-validated and can only fall.
         vob = self.obligations().get(obligation_key(run_id, "verdict", "validated"))
         if vob and vob["state"] == "done":
-            frozen = vob["detail"].get("verdict")
-            syn_doc, syn_err = run.synthesis()
-            if frozen == "GO":
-                verdict, failed = validate_synthesis(run, claim.get("sha"), self.pr_heads.get(str(pr)),
-                                                     run.barrier("synthesis"), run.last_identity_check())
-            else:
-                verdict, failed = frozen, vob["detail"].get("failedChecks") or []
-            return self.pre_finish(run_id, pr, verdict, failed, syn_doc if not syn_err else {},
-                                   terminal_verb=frozen_terminal_verb(vob["detail"]))
+            return self._replay_frozen_verdict(run_id, pr, claim, run, vob)
 
         # An owner may conclude BLOCKED or HUMAN_DECISION before the barriers
         # are ready (lanes that cannot be repaired). Neither verdict can clear
@@ -2882,13 +2891,21 @@ class Controller:
                 return "synthesis"
             return self.pre_finish(run_id, pr, verdict, failed, early)
 
+        # ONE evaluation for every phase from lanes to await_challenger, before
+        # any of them can judge or wait. Timeout BEFORE judgment: a run the
+        # challenger deadline ends this fire must not wake its owner for a step
+        # it will never use. It used to sit inside three of those phases (lanes
+        # not ready, no preliminary, no disposition), which left the two that
+        # wait on a settling owner -- lanes ready and preliminary written, on
+        # the phase-dispatch route (_phase_owner_step) -- returning below it on
+        # every fire. Nothing between here and the disposition check can end a
+        # run with no disposition any other way, so evaluating it once, first,
+        # reaches the same verdict those sites did on the same fire.
+        timed = self._maybe_challenger_timeout(run_id, claim, run)
+        if timed:
+            return timed
         lanes = run.barrier("lanes")
         if not lanes.get("ready"):
-            # Timeout BEFORE judgment: a run the challenger deadline ends this
-            # fire must not wake its owner for a step it will never use.
-            timed = self._maybe_challenger_timeout(run_id, claim, run)
-            if timed:
-                return timed
             # PUBLISHED BEFORE THE WAKE, not after: the brief is written by
             # owner_step's effect, and _brief_notes can only cite a file that
             # already exists.
@@ -2906,18 +2923,12 @@ class Controller:
             return "lanes"
 
         if not run.has("coordinator/preliminary.md"):
-            timed = self._maybe_challenger_timeout(run_id, claim, run)
-            if timed:
-                return timed
             self.owner_step(run_id, "preliminary", "preliminary", done=False)
             return "preliminary"
         if self.owner_step(run_id, "preliminary", "preliminary", done=True) != "done":
             return "preliminary"
 
         if not run.has("challenger/disposition.md"):
-            timed = self._maybe_challenger_timeout(run_id, claim, run)
-            if timed:
-                return timed
             self.decide(run_id, "await_challenger", "wait", "wait", "challenger disposition pending",
                         deadline=claim.get("deadline"))
             return "await_challenger"
@@ -2930,8 +2941,8 @@ class Controller:
                 # THE OWNER IS WOKEN HERE, not only once the barrier passes.
                 # By this point every OTHER party's contribution the synthesis
                 # barrier checks has already been gated above: the lanes
-                # barrier is ready (:2886), coordinator/preliminary.md exists
-                # (:2908) and challenger/disposition.md exists (:2917). What
+                # barrier is ready (:2908), coordinator/preliminary.md exists
+                # (:2925) and challenger/disposition.md exists (:2931). What
                 # the synthesis barrier can still report is therefore the
                 # retained owner's -- `invalid[]` content it authored
                 # (journeys/scope-dispositions.json, or
@@ -2943,7 +2954,7 @@ class Controller:
                 # alone (smoke-controller-live.sh:168-175), so nobody was told;
                 # and _maybe_synthesis_overdue_blocked needs the very
                 # owner:synthesis obligation this branch declined to create
-                # (:3002-3004), so the terminal BLOCKED safety net could not
+                # (:3013-3015), so the terminal BLOCKED safety net could not
                 # fire either. This is the same blind spot as the lanes barrier
                 # (XZO #2047), on the sibling path.
                 timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)
@@ -3012,6 +3023,49 @@ class Controller:
                     "synthesis overdue after challenger BLOCKED; finishing BLOCKED model-free")
         return self.pre_finish(run_id, pr, "BLOCKED", [
             "synthesis overdue ({}s) and challenger disposition BLOCKED".format(OWNER_STEP_SLA_SECONDS)], {})
+
+    def _replay_frozen_verdict(self, run_id, pr, claim, run, vob):
+        """Settle a verdict validated on an earlier fire (see step_run). A
+        frozen non-GO is replayed as is; a frozen GO is re-validated and can
+        only fall."""
+        frozen = vob["detail"].get("verdict")
+        syn_doc, syn_err = run.synthesis()
+        if frozen == "GO":
+            verdict, failed = validate_synthesis(run, claim.get("sha"), self.pr_heads.get(str(pr)),
+                                                 run.barrier("synthesis"), run.last_identity_check())
+        else:
+            verdict, failed = frozen, vob["detail"].get("failedChecks") or []
+        return self.pre_finish(run_id, pr, verdict, failed, syn_doc if not syn_err else {},
+                               terminal_verb=frozen_terminal_verb(vob["detail"]))
+
+    def _terminal_before_root(self, run_id, claim, run, pr):
+        """The terminal paths a run that has not left intake can still take,
+        in the precedence the ladder below gives them (XZO #2093):
+
+        1. A non-GO verdict frozen on an earlier fire settles, whatever the
+           phase files say now. The challenger-timeout this function raises
+           takes two fires -- its verdict post is receipted on the second
+           (issue comment, run pr2075) -- and a disposition landing between
+           them makes the timeout condition false; without this the second
+           fire would fall back into intake and the frozen verdict would never
+           finish, which is the pr1896 stall the ladder's own replay exists to
+           end. A frozen GO is left to the ladder: it needs a disposition, so
+           the deadline cannot be what ended it, and its re-validation waits
+           on the root post the ladder drives.
+        2. An owner's own BLOCKED/HUMAN_DECISION synthesis is taken by the
+           ladder ("An owner may conclude ..." below) and is never pre-empted
+           by a timeout -- but only where the ladder can reach it, which needs
+           a readable contract: validate_synthesis binds its sourceSha to the
+           contract's (:1700-1707), so without one it could only be BLOCKED.
+        3. The challenger deadline itself."""
+        vob = self.obligations().get(obligation_key(run_id, "verdict", "validated"))
+        if vob and vob["state"] == "done" and vob["detail"].get("verdict") != "GO":
+            return self._replay_frozen_verdict(run_id, pr, claim, run, vob)
+        if run.exists and not run.contract_error:
+            early, early_err = run.synthesis()
+            if not early_err and isinstance(early, dict) and early.get("verdict") in ("BLOCKED", "HUMAN_DECISION"):
+                return None
+        return self._maybe_challenger_timeout(run_id, claim, run)
 
     def _maybe_challenger_timeout(self, run_id, claim, run):
         deadline = parse_iso(claim.get("deadline"))

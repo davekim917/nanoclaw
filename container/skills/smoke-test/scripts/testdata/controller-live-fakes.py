@@ -244,6 +244,28 @@ def ncl(argv):
     if argv[:2] == ["tasks", "list"]:
         return "list", out({"ok": True, "data": [{"series_id": t["series_id"], "status": t["status"]}
                                                  for t in db["tasks"]]})
+    # The phase-dispatch owner route (the controller's _dispatch_owner_intent
+    # and owner_status). Admission is keyed on context + event, as the host's
+    # is; a step's settlement is whatever settle.json names for it, and a step
+    # it does not name is still running -- an owner that never settles.
+    if argv[:2] == ["tasks", "dispatch"]:
+        ctx, event = opt(argv, "--context-key"), opt(argv, "--event-key")
+        rows = load("dispatch.json", {"rows": {}})
+        rid = "row-" + hashlib.sha256("{}#{}".format(ctx, event).encode()).hexdigest()[:10]
+        admission = "replay" if rid in rows["rows"] else "inserted"
+        rows["rows"][rid] = {"context": ctx, "event": event,
+                             "session": "sess-" + hashlib.sha256(ctx.encode()).hexdigest()[:10]}
+        save("dispatch.json", rows)
+        return "dispatched", out({"ok": True, "data": {"admission": admission, "row_id": rid,
+                                                       "session_id": rows["rows"][rid]["session"]}})
+    if argv[:2] == ["tasks", "get"]:
+        row = load("dispatch.json", {"rows": {}})["rows"].get(opt(argv, "--id"))
+        if row is None:
+            return "unknown-row", out({"ok": False, "error": {"message": "no such row"}}, 1)
+        state = load("settle.json", {}).get(row["context"].rsplit("/", 1)[-1], "busy")
+        return "get", out({"ok": True, "data": {"status": "completed" if state == "settled" else "running",
+                                                "settlement": {"state": state, "outcome": "success",
+                                                               "executionSettled": state == "settled"}}})
     return "unknown", out({"ok": False, "error": {"message": "fake ncl: unsupported"}}, 2)
 
 

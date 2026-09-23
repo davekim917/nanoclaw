@@ -1699,7 +1699,7 @@ do its job without. Both used to stay in the controller's own journal.
   or a visual-candidate disposition it owes under
   `SMOKE_VISUAL_DISPOSITIONS=1` — is the retained owner's, and the owner is the
   only judgment party the controller can invoke. That branch used to return
-  without a wake (it now wakes at `smoke-campaign-controller.py:2952-2954`),
+  without a wake (it now wakes at `smoke-campaign-controller.py:2963-2965`),
   which left the phase with no exit at all: the wrapper wakes on `ownerWake`
   alone (`smoke-controller-live.sh:168-175`), so nobody was told, and the
   overdue-BLOCKED safety net keys on the very `owner:synthesis` obligation the
