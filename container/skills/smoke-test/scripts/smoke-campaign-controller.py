@@ -2118,8 +2118,8 @@ class Controller:
         # is gone (:4596-4613), which _gate reads as unknown -- so an intent
         # with no recorded outcome is simply re-offered. Its refusal once a
         # disposition exists (:4652-4657) is a definitive refusal, recorded
-        # failed_terminal below; pre_finish never re-sends it (see the verb
-        # choice there).
+        # failed_terminal below, and _publish_verb never selects the verb again
+        # once it is (the refusal is the gate's own answer).
         result = self.effects.perform({"type": "gate", "runId": run_id, "verb": effect_verb or verb,
                                        "args": argv_tail})
         self.decide(run_id, phase, "gate", "mechanical", "obligation due", verb=verb, args=argv_tail,
@@ -3162,34 +3162,77 @@ class Controller:
             self.decide(run_id, phase, "wait", "wait", "pre-finish obligations pending", pending=pending)
             return "verdict"
         claim_sha = (self.gate.active_claims().get(run_id) or {}).get("sha")
-        # A REPLAYED FROZEN VERDICT IS PUBLISHED THROUGH A VERB WHOSE
-        # PRECONDITIONS STILL HOLD NOW. The verb is frozen with the verdict, but
-        # `challenger-timeout` is refused by the real gate once a non-empty
-        # challenger/disposition.md exists (smoke-pr-gate.sh:4652-4657), and a
-        # disposition can land after the timeout froze its BLOCKED -- between
-        # the fire that validates it and the one that finishes, since the
-        # verdict post must be receipted first. gate_verb records that refusal
-        # failed_terminal, and every later replay re-sent the same refused verb,
-        # so the run held its slot for good (a wedge since live mode, #945;
-        # the fake gate did not model the refusal, so no test saw it). `finish`
-        # BLOCKED has no disposition precondition (:3976-4127) and publishes the
-        # same verdict; that the challenger was late is still what the frozen
-        # failed checks say. Re-derived every fire, so a disposition that lands
-        # between this read and the gate's own is refused once and finished
-        # through `finish` on the next fire, under its own obligation slot.
-        if terminal_verb == "challenger-timeout" and run.has("challenger/disposition.md"):
-            terminal_verb = "finish"
         if verdict == "GO" and failed:
             # Unreachable by construction; asserted so a future edit cannot
             # turn a failed check into a GO finish.
             raise ControllerError("refusing finish GO with failed checks: {}".format(failed))
+        terminal_verb = self._publish_verb(run_id, run, terminal_verb)
         self.decide(run_id, phase, "finish", "mechanical", "all pre-finish obligations settled",
                     verdict=verdict, failedChecks=failed, verb=terminal_verb)
-        args = [run_id] if terminal_verb == "challenger-timeout" else [claim_sha, run_id, verdict]
-        if self.gate_verb(run_id, phase, terminal_verb, args, verdict) in TERMINAL_OK:
+        state = self._terminal_call(run_id, phase, terminal_verb, claim_sha, verdict)
+        if state == "failed_terminal" and terminal_verb == "challenger-timeout":
+            # The gate refused the timeout this fire: publish through `finish`
+            # now rather than a fire later (_publish_verb reads the same record).
+            terminal_verb = self._publish_verb(run_id, run, terminal_verb)
+            self.decide(run_id, phase, "finish", "mechanical", "challenger-timeout refused by the gate",
+                        verdict=verdict, failedChecks=failed, verb=terminal_verb)
+            state = self._terminal_call(run_id, phase, terminal_verb, claim_sha, verdict)
+        if state in TERMINAL_OK:
             # PRP step 7: the freeze-PR close follows finish in the same turn.
             return self.post_finish(run_id, pr, verdict, external=False)
         return "verdict"
+
+    def _terminal_call(self, run_id, phase, verb, claim_sha, verdict):
+        args = [run_id] if verb == "challenger-timeout" else [claim_sha, run_id, verdict]
+        return self.gate_verb(run_id, phase, verb, args, verdict)
+
+    def _publish_verb(self, run_id, run, verb):
+        """The terminal verb a (possibly replayed) verdict is published through.
+
+        INVARIANT: a refused verb is never re-selected, and the GATE's answer,
+        not the controller's reading of the run tree, is what decides. The
+        verb is frozen with the verdict, but `challenger-timeout` is refused by
+        the real gate once it sees a disposition (smoke-pr-gate.sh:4652-4657),
+        and a disposition can land after the timeout froze its BLOCKED. gate_verb
+        records that refusal failed_terminal and afterwards returns it without
+        calling the gate (this file, :2110-2111), so re-selecting the verb wedged the run
+        for good -- a wedge since live mode (#945), found three ways in PR #1066:
+        a fake gate that never refused, a frozen verb replayed after a late
+        disposition, and a controller read of the disposition (nonempty_file,
+        which rejects symlinks) that disagreed with the gate's `[ -s ]`.
+
+        1. Once the gate has refused `challenger-timeout` for this run, the
+           verdict goes out through `finish`, whatever the controller would
+           predict. That record is the gate's own ground truth, so no future
+           divergence -- a symlink, permissions, a race, a partial write --
+           can send the refused verb again. Any refusal qualifies: the
+           verdict is BLOCKED either way, which asserts nothing about the
+           build; `finish` BLOCKED has none of the timeout's own preconditions
+           -- deadline, run root, disposition (smoke-pr-gate.sh:3976-4127) --
+           and a refusal the two verbs share (an owner or claimant mismatch)
+           is refused by `finish` too and escalated by gate_verb's alarm, as
+           before.
+        2. Before any refusal, the controller predicts with the gate's own test
+           -- `[ -s ]`: stat through symlinks, any file type, size > 0 -- only
+           to avoid spending a fire on a refusal it can see coming. This is
+           deliberately NOT RunView.has: nonempty_file rejects a symlink so a
+           link cannot make evidence out of content outside the run tree, and
+           that containment stays in force everywhere evidence is judged
+           (including _maybe_challenger_timeout, which decides whether the
+           challenger filed). Here only a size is read, never content, and the
+           only thing it can change is WHICH verb publishes a BLOCKED that is
+           already decided, so following the link grants nothing."""
+        if verb != "challenger-timeout":
+            return verb
+        ob = self.obligations().get(obligation_key(run_id, "gate", "challenger-timeout"))
+        if ob and ob["state"] == "failed_terminal":
+            return "finish"
+        try:
+            if os.stat(run.path("challenger/disposition.md")).st_size > 0:
+                return "finish"
+        except OSError:
+            pass
+        return verb
 
     def _post_finish_pending(self, run_id):
         for ob in self.obligations().values():

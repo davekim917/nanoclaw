@@ -1454,12 +1454,11 @@ assert_once "#2093(late disposition)"
 # b2) the same race one step later: the disposition lands between the
 #     controller's read of the run tree and the gate's own. The gate refuses the
 #     timeout (definitively -- failed_terminal), and the next fire must finish
-#     BLOCKED through `finish` rather than re-send the refused verb forever.
-#     FAULTY: the fault changes the run tree mid-fire, so the retry of that
-#     fire is entitled to act on it; exactly-once is asserted after.
+#     BLOCKED through `finish` rather than re-send the refused verb forever --
+#     in the SAME fire, so the retry of that fire performs nothing.
 new_case t2093-disposition-race
 jq -cn '{"gate:challenger-timeout":["disposition-lands"]}' >"$C/fake/faults.json"
-FAULTY=1 NO_CONTRACT=1 DEADLINE="$DL" campaign 6
+NO_CONTRACT=1 DEADLINE="$DL" campaign 6
 [ "$(jq -s '[.[] | select(.tool=="gate" and .op=="disposition-filed")] | length' "$FAKE_LOG")" = 1 ] \
   || fail "#2093(race): precondition -- the gate refused exactly one timeout because the disposition had landed: $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
 jr '[.[] | select(.kind=="gate" and .slot=="challenger-timeout") | .state] | last == "failed_terminal"' | grep -qx true \
@@ -1488,6 +1487,45 @@ done
 [ "$(jq -r '.challengerDisposition' "$C/state/pr-$PR-state.json")" = no-disposition ] \
   || fail "#2093(empty): the gate recorded no-disposition"
 [ "$(finish_verdict)" = '"BLOCKED"' ] || fail "#2093(empty): BLOCKED: $(finish_verdict)"
+
+# b4) a non-empty SYMLINKED disposition (PR #1066 round 2). The controller's
+#     evidence read refuses symlinks (nonempty_file), so the challenger has not
+#     filed as far as the ladder is concerned and the run times out; the gate's
+#     `[ -s ]` follows the link and would refuse challenger-timeout. The verb
+#     choice predicts with the gate's own test, so the BLOCKED goes out
+#     through `finish` with no refused call at all.
+new_case t2093-symlinked-disposition
+mkdir -p "$C/elsewhere" "$R/challenger"
+printf 'filed, but through a link\n' >"$C/elsewhere/disposition.md"
+ln -s "$C/elsewhere/disposition.md" "$R/challenger/disposition.md"
+NO_CONTRACT=1 DEADLINE="$DL" campaign 6
+[ -L "$R/challenger/disposition.md" ] && [ -s "$R/challenger/disposition.md" ] \
+  || fail "#2093(symlink): precondition -- a non-empty symlinked disposition"
+jr '[.[] | select(.kind=="verdict" and .slot=="validated") | .detail | [.terminalVerb, .failedChecks]]
+    == [["challenger-timeout", ["challenger-timeout: no disposition by '"$DL"'"]]]' | grep -qx true \
+  || fail "#2093(symlink): precondition -- the ladder did not take the link as a disposition; it timed out: $(jr '[.[]|select(.kind=="verdict")]')"
+[ "$(jq -s '[.[] | select(.tool=="gate" and .argv[0]=="challenger-timeout")] | length' "$FAKE_LOG")" = 0 ] \
+  || fail "#2093(symlink): challenger-timeout was sent although the gate sees the linked disposition: $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
+jr '[.[] | select(.kind=="gate" and .state=="done") | [.slot, .at]] == [["finish","2026-09-18T10:40:00Z"]]' | grep -qx true \
+  || fail "#2093(symlink): the BLOCKED finishes through finish on the fire after its post is receipted: $(jr '[.[]|select(.kind=="gate")]')"
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "#2093(symlink): BLOCKED: $(finish_verdict)"
+assert_once "#2093(symlinked disposition)"
+
+# b5) a refusal the controller cannot predict at all (the fake's scripted
+#     `refuse`: the gate says no for a reason outside the run tree). The
+#     refusal record is the ground truth: the BLOCKED goes out through
+#     `finish` in the SAME fire and challenger-timeout is never sent again.
+new_case t2093-unpredicted-refusal
+jq -cn '{"gate:challenger-timeout":["refuse"]}' >"$C/fake/faults.json"
+NO_CONTRACT=1 DEADLINE="$DL" campaign 6
+[ "$(jq -s '[.[] | select(.tool=="gate" and .argv[0]=="challenger-timeout")] | length' "$FAKE_LOG")" = 1 ] \
+  || fail "#2093(refused): challenger-timeout is sent exactly once and never after its refusal: $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
+jr '[.[] | select(.kind=="gate" and .slot=="challenger-timeout") | .state] | last == "failed_terminal"' | grep -qx true \
+  || fail "#2093(refused): precondition -- the refusal was recorded as definitive"
+jr '[.[] | select(.kind=="gate" and .state=="done") | [.slot, .at]] == [["finish","2026-09-18T10:40:00Z"]]' | grep -qx true \
+  || fail "#2093(refused): finish lands on the fire of the refusal: $(jr '[.[]|select(.kind=="gate")]')"
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "#2093(refused): the run holds its slot after the refusal: $(finish_verdict)"
+assert_once "#2093(unpredicted refusal)"
 
 # c) a kill anywhere in the timeout's own sequence is recovered on re-entry,
 #    each effect exactly once (campaign re-runs every fire and asserts it).

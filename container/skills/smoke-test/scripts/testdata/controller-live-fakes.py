@@ -366,7 +366,11 @@ def gate(argv):
                 os.makedirs(os.path.dirname(disp), exist_ok=True)
                 with open(disp, "w") as fh:
                     fh.write("filed during the gate call\n")
-            if os.path.isfile(disp) and os.path.getsize(disp) > 0:  # `[ -s ]`, :4653
+            try:  # `[ -s ]` (:4653): stat THROUGH symlinks, any file type, size > 0
+                filed = os.stat(disp).st_size > 0
+            except OSError:
+                filed = False
+            if filed:
                 return "disposition-filed", out({"ok": False, "error": "the challenger DID file a disposition -- "
                                                  "nothing timed out. Synthesize and finish normally."})
         verdict = argv[3] if verb == "finish" else "BLOCKED"
