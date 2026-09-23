@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import useSWR from 'swr';
-import type { SignalAgent, SignalDecision, SignalOverview } from '../../../../src/dashboard/observatory-v2/types.js';
+import type { SignalAgent, SignalClaimDetail, SignalDecision, SignalOverview } from '../../../../src/dashboard/observatory-v2/types.js';
 import { getThreadDetail, listThreads, postThreadMessage, type AuthMe, type ApiError } from '../../lib/api.js';
 import { subscribe } from '../../lib/sse.ts';
 import { getSignalThreadContext } from '../../lib/signal-api.js';
@@ -82,7 +82,9 @@ function ClaimedWork({ agent }: { agent: SignalAgent }) {
   const [query, setQuery] = useState('');
   const [limit, setLimit] = useState(5);
   const [focused, setFocused] = useState<string | null>(null);
-  const order = { live: 0, expiring: 1, stale: 2, parked: 3 };
+  // Keyed by the full state union, so a state added to SignalClaimDetail fails
+  // here, at the map, instead of as an index error at the lookup below.
+  const order: Record<SignalClaimDetail['state'], number> = { live: 0, expiring: 1, stale: 2, paused: 3, parked: 4 };
   const claims = [...(agent.claims ?? [])].sort(
     (a, b) =>
       order[agent.claim_details?.find((d) => d.slug === a)?.state ?? 'parked'] -
