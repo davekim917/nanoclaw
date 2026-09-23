@@ -349,3 +349,23 @@ describe('cross-process snapshot failure handling (#1023)', () => {
     expect(sub(stampStatusSubtext(chat('chan-A')))).toBe('opus-5 · high · 90k context');
   });
 });
+
+describe('served model', () => {
+  beforeEach(() => resetTurnStatus());
+
+  it('prints the served id over the requested alias, and falls back once the turn ends', async () => {
+    const ts = await import('./turn-status.js');
+    ts.setTurnSettings('opus', 'low');
+    expect(ts.formatStatusSubtext()).toBe('opus · low');
+    ts.recordServedModel('claude-opus-5-5');
+    expect(ts.formatStatusSubtext()).toBe('opus-5-5 · low');
+    // Placeholder and empty ids are not measurements.
+    ts.recordServedModel('<synthetic>');
+    ts.recordServedModel('  ');
+    ts.recordServedModel(null);
+    expect(ts.formatStatusSubtext()).toBe('opus-5-5 · low');
+    // Per-result boundary: the next turn must not inherit this turn's reading.
+    ts.clearContextTokens();
+    expect(ts.formatStatusSubtext()).toBe('opus · low');
+  });
+});

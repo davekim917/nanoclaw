@@ -27,7 +27,8 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
 const { ClaudeProvider } = await import('./claude.js');
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
 const { initTestSessionDb } = await import('../modules/mailbox/testing.js');
-const { formatStatusSubtext, formatSubagentRoster, resetTurnStatus, setTurnSettings } = await import('../turn-status.js');
+const { formatStatusSubtext, formatSubagentRoster, resetTurnStatus, setTurnSettings } =
+  await import('../turn-status.js');
 
 let tmp: string;
 let prevHome: string | undefined;
@@ -47,11 +48,16 @@ afterEach(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-function assistant(usage: Record<string, number>, opts: { parentToolUseId?: string } = {}) {
+function assistant(usage: Record<string, number>, opts: { parentToolUseId?: string; model?: string } = {}) {
   return {
     type: 'assistant',
     ...(opts.parentToolUseId ? { parent_tool_use_id: opts.parentToolUseId } : {}),
-    message: { role: 'assistant', content: [{ type: 'text', text: 'working' }], usage },
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text: 'working' }],
+      usage,
+      ...(opts.model ? { model: opts.model } : {}),
+    },
   };
 }
 
@@ -65,6 +71,30 @@ async function runTurn(): Promise<void> {
 }
 
 describe('claude context reading is wired into the message loop', () => {
+  // Seen live 2026-09-23: the support-poller task is pinned `-m opus`, so the
+  // requested model is the bare alias and the footer read `opus · low`. The
+  // API reported claude-opus-5-5 on every frame; the footer now prints that.
+  it('shows the model that SERVED the turn, not the alias that was requested', async () => {
+    setTurnSettings('opus', 'low');
+    sdkMessages.length = 0;
+    sdkMessages.push(
+      { type: 'system', subtype: 'init', session_id: 'sess-1' },
+      assistant({ input_tokens: 1_000, cache_read_input_tokens: 50_000 }, { model: 'claude-opus-5-5' }),
+      // A subagent served by another model says nothing about ours.
+      assistant(
+        { input_tokens: 10, cache_read_input_tokens: 10 },
+        { parentToolUseId: 'toolu_1', model: 'claude-haiku-4-5' },
+      ),
+      // The CLI's own placeholder frames name no model.
+      assistant({ input_tokens: 1_000, cache_read_input_tokens: 50_000 }, { model: '<synthetic>' }),
+      { type: 'result', subtype: 'success', result: '<message to="here">done</message>' },
+    );
+
+    await runTurn();
+
+    expect(formatStatusSubtext()).toStartWith('opus-5-5 · low · 51k context');
+  });
+
   it('records occupancy off a real assistant frame', async () => {
     setTurnSettings('claude-opus-5[1m]', 'xhigh');
     sdkMessages.length = 0;

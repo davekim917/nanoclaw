@@ -23,7 +23,7 @@ import { recordRateLimitSamples, type AccountIdentity, type RateLimitSample } fr
 import { getCredentialSlot, setCredentialSlot } from '../modules/mailbox/session-state.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { appendActiveRuntimeContext } from '../runtime-context.js';
-import { recordContextTokens, recordSubagent } from '../turn-status.js';
+import { recordContextTokens, recordServedModel, recordSubagent } from '../turn-status.js';
 
 /**
  * Tokens occupying the context window, from one API response's `usage`.
@@ -3394,8 +3394,12 @@ export class ClaudeProvider implements AgentProvider {
             // the sum. Reading `input_tokens` alone would show a few hundred
             // tokens on a warm thread and render a full window as near-empty.
             // Top-level only: a subagent's usage measures ITS window, not ours.
-            if (topLevel) recordContextTokens(claudeContextOccupancy(message.message?.usage));
-            else {
+            if (topLevel) {
+              recordContextTokens(claudeContextOccupancy(message.message?.usage));
+              // What actually answered, not what was asked for: a `-m opus`
+              // request is the alias `opus` until the API serves it.
+              recordServedModel(message.message?.model);
+            } else {
               // A subagent frame — the exact set the context reading above
               // skips, reused here for what it CAN answer: which worker this
               // turn deployed and on which model.

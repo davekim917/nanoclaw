@@ -44,6 +44,18 @@ let effort: string | null = null;
 let ultracode = false;
 
 /**
+ * The model id the provider reports actually SERVED this turn's requests.
+ *
+ * `model` above is what was asked for, and a request may be a family alias:
+ * a task pinned `-m opus` resolves to the literal string `opus`, which the
+ * API then serves as `claude-opus-5-5`. Printing the request put `opus`
+ * under replies (seen live 2026-09-23 on the support-poller task). When a
+ * provider observes the served id, the footer prints that instead. Like the
+ * context figure it is a measurement of one turn, so it clears per result.
+ */
+let servedModel: string | null = null;
+
+/**
  * The conversation this session belongs to, as poll-loop resolved it.
  *
  * The subtext describes the machinery answering YOU, so it belongs under a
@@ -91,6 +103,22 @@ export function recordContextTokens(tokens: number | null | undefined): void {
 }
 
 /**
+ * Record the model id a provider observed serving a request.
+ *
+ * Rejects the SDK's placeholder ids (`<synthetic>`, on frames the CLI makes up
+ * itself) along with empty values: those name no model, and printing one
+ * would be worse than falling back to the configured model.
+ */
+export function recordServedModel(id: string | null | undefined): void {
+  if (typeof id !== 'string') return;
+  const next = id.trim();
+  if (!next || next.startsWith('<')) return;
+  if (next === servedModel && !persistFailed) return;
+  servedModel = next;
+  persist();
+}
+
+/**
  * Set the model/effort the turn in flight is running at.
  *
  * `nextModel` should be the provider's RESOLVED model, not what was requested:
@@ -127,8 +155,12 @@ export function setTurnSettings(nextModel?: string | null, nextEffort?: string |
  * them.
  */
 export function clearContextTokens(): void {
-  if (contextTokens === null && !persistFailed) return;
+  if (contextTokens === null && servedModel === null && !persistFailed) return;
   contextTokens = null;
+  // The served model is the same kind of fact — one turn's measurement — and
+  // goes with it, so a turn that observes none falls back to the configured
+  // model rather than inheriting the previous turn's.
+  servedModel = null;
   persist();
 }
 
@@ -204,6 +236,7 @@ interface Snapshot {
   effort: string | null;
   ultracode: boolean;
   contextTokens: number | null;
+  servedModel?: string | null;
   ownChannelType: string | null;
   ownPlatformId: string | null;
   // The roster crosses the same boundary for the same reason: the provider
@@ -227,6 +260,7 @@ function persist(): void {
     effort,
     ultracode,
     contextTokens,
+    servedModel,
     ownChannelType,
     ownPlatformId,
     subagents: [...subagents.entries()],
@@ -267,6 +301,7 @@ export function hydrateTurnStatus(): boolean {
     effort = snap.effort ?? null;
     ultracode = snap.ultracode === true;
     contextTokens = typeof snap.contextTokens === 'number' ? snap.contextTokens : null;
+    servedModel = typeof snap.servedModel === 'string' ? snap.servedModel : null;
     ownChannelType = snap.ownChannelType ?? null;
     ownPlatformId = snap.ownPlatformId ?? null;
     subagents.clear();
@@ -291,6 +326,7 @@ export function hydrateTurnStatus(): boolean {
  */
 function forgetForeignState(): void {
   contextTokens = null;
+  servedModel = null;
   model = null;
   effort = null;
   ultracode = false;
@@ -342,6 +378,7 @@ export function clearSubagents(): void {
 /** Test seam — reset the store between cases. */
 export function resetTurnStatus(): void {
   contextTokens = null;
+  servedModel = null;
   model = null;
   effort = null;
   ultracode = false;
@@ -361,6 +398,7 @@ export function resetTurnStatus(): void {
 export function _forgetOwnershipForTest(): void {
   ownsStore = false;
   contextTokens = null;
+  servedModel = null;
   model = null;
   effort = null;
   ultracode = false;
@@ -458,7 +496,8 @@ export function formatSubagentRoster(): string | null {
 
 export function formatStatusSubtext(): string | null {
   const parts: string[] = [];
-  if (model) parts.push(shortModelName(model));
+  const shown = servedModel ?? model;
+  if (shown) parts.push(shortModelName(shown));
   // `ultracode` is not an effort level — it is a separate setting that forces
   // xhigh AND turns on standing workflow orchestration (see the ULTRACODE note
   // in the host's flag-parser.ts). Printing `xhigh` for it would hide the half
