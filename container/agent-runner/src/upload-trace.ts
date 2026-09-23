@@ -33,7 +33,7 @@ export function isUploadTraceCommand(msg: MessageInRow): boolean {
 
 /** Newest Claude Code transcript jsonl (the current session). */
 function newestTranscript(): string | null {
-  const projects = path.join(os.homedir(), '.claude', 'projects');
+  const projects = path.join(seams.homedir(), '.claude', 'projects');
   let best: { p: string; m: number } | null = null;
   let dirs: string[];
   try {
@@ -58,9 +58,27 @@ function newestTranscript(): string | null {
   return best?.p ?? null;
 }
 
-function curl(args: string[], input?: string): { ok: boolean; out: string } {
+type Curl = (args: string[], input?: string) => { ok: boolean; out: string };
+
+const realCurl: Curl = (args, input) => {
   const r = spawnSync('curl', args, { input, encoding: 'utf-8' });
   return { ok: r.status === 0, out: (r.stdout ?? '') + (r.stderr ?? '') };
+};
+
+const defaultSeams = { curl: realCurl, homedir: (): string => os.homedir() };
+let seams = defaultSeams;
+
+/**
+ * Test seam, like config.ts `_setConfigForTest`: swap the curl call and the
+ * home directory the transcript is found under, so a test never reads a real
+ * transcript or reaches Hugging Face. `null` restores the real ones.
+ */
+export function _setUploadTraceSeamsForTest(override: Partial<typeof defaultSeams> | null): void {
+  seams = override ? { ...defaultSeams, ...override } : defaultSeams;
+}
+
+function curl(args: string[], input?: string): { ok: boolean; out: string } {
+  return seams.curl(args, input);
 }
 
 /**

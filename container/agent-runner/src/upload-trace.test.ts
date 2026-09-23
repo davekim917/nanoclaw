@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import { getInboundDb } from './mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
@@ -7,14 +10,75 @@ import { getPendingMessages } from './db/messages-in.js';
 import type { MessageInRow } from './db/messages-in.js';
 import { MockProvider } from './providers/mock.js';
 import { runPollLoop } from './poll-loop.js';
-import { isUploadTraceCommand } from './upload-trace.js';
+import { _setUploadTraceSeamsForTest, isUploadTraceCommand, uploadTrace } from './upload-trace.js';
+import { clearHermeticityAttempts, hermeticityAttempts } from './test-hermeticity.js';
+
+// Every test here runs against a temp HOME holding one fixture transcript and a
+// fake curl: nothing may read the operator's real transcripts or reach Hugging
+// Face (#1070). The fake records each call so the tests can assert the URLs.
+const FIXTURE = '{"type":"user","message":"fixture transcript"}\n';
+let home = '';
+let calls: Array<{ args: string[]; input?: string }> = [];
+let responses: Array<{ ok: boolean; out: string }> = [];
 
 beforeEach(() => {
   initTestSessionDb();
+  home = fs.mkdtempSync(path.join(os.tmpdir(), 'upload-trace-home-'));
+  fs.mkdirSync(path.join(home, '.claude', 'projects', 'proj'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.claude', 'projects', 'proj', 'fixture-session.jsonl'), FIXTURE);
+  calls = [];
+  responses = [];
+  _setUploadTraceSeamsForTest({
+    homedir: () => home,
+    curl: (args, input) => {
+      calls.push({ args, input });
+      return responses.shift() ?? { ok: false, out: '\n000' };
+    },
+  });
+  clearHermeticityAttempts();
 });
 
 afterEach(() => {
+  _setUploadTraceSeamsForTest(null);
   closeSessionDb();
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+const urls = (): string[] => calls.map((c) => c.args.find((a) => a.startsWith('https://')) ?? '');
+
+describe('uploadTrace (hermetic)', () => {
+  it('stops at whoami when not signed in, and never reads past it', () => {
+    responses = [{ ok: true, out: '{"error":"Invalid credentials"}\n401' }];
+    const text = uploadTrace();
+    expect(urls()).toEqual(['https://huggingface.co/api/whoami-v2']);
+    expect(text).not.toContain('Uploaded');
+    expect(hermeticityAttempts()).toEqual([]);
+  });
+
+  it('when signed in, creates the private dataset and commits the fixture transcript', () => {
+    responses = [
+      { ok: true, out: '{"name":"test-user"}\n200' },
+      { ok: true, out: '' },
+      { ok: true, out: '' },
+    ];
+    const text = uploadTrace();
+    expect(urls()).toEqual([
+      'https://huggingface.co/api/whoami-v2',
+      'https://huggingface.co/api/repos/create',
+      'https://huggingface.co/api/datasets/test-user/nanoclaw-traces/commit/main',
+    ]);
+    expect(calls[2]!.input).toContain(Buffer.from(FIXTURE).toString('base64'));
+    expect(text).toBe(
+      'Uploaded → https://huggingface.co/datasets/test-user/nanoclaw-traces/blob/main/sessions/fixture-session.jsonl',
+    );
+    expect(hermeticityAttempts()).toEqual([]);
+  });
+
+  it('reports no transcript under an empty home, without calling curl', () => {
+    fs.rmSync(path.join(home, '.claude'), { recursive: true, force: true });
+    expect(uploadTrace()).toBe('No transcript to upload for this session yet.');
+    expect(calls).toEqual([]);
+  });
 });
 
 describe('isUploadTraceCommand', () => {
@@ -36,6 +100,7 @@ describe('isUploadTraceCommand', () => {
 
 describe('poll loop — /upload-trace command', () => {
   it('handles the command in the runner, writes a status, skips query', async () => {
+    responses = [{ ok: true, out: '{"error":"Invalid credentials"}\n401' }];
     getInboundDb()
       .prepare(
         `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, content)
@@ -64,6 +129,9 @@ describe('poll loop — /upload-trace command', () => {
 
     // Command message was completed (not left pending).
     expect(getPendingMessages()).toHaveLength(0);
+    // It went through the fake curl, not the network.
+    expect(urls()).toEqual(['https://huggingface.co/api/whoami-v2']);
+    expect(hermeticityAttempts()).toEqual([]);
 
     await loopPromise.catch(() => {});
   });
