@@ -9,11 +9,11 @@ A model release touches three layers. Only the first two need a PR.
 
 | Layer | Where | How it changes |
 |---|---|---|
-| **Install default + aliases** | `src/flag-parser.ts` (`DEFAULT_OPUS_MODEL`, `MODEL_ALIAS_MAP`, `MODEL_EFFORT_SUPPORT`, `CODEX_MODEL_ALIAS_MAP`); Claude family default effort in `defaultEffortForModel` (`container/agent-runner/src/providers/claude.ts`); `DEFAULT_CODEX_MODEL` / `DEFAULT_CODEX_EFFORT` (`container/agent-runner/src/providers/codex.ts`) | PR → deploy → image rebuild |
+| **Install default + aliases** | `src/flag-parser.ts` (`DEFAULT_OPUS_MODEL` / `_SONNET_` / `_HAIKU_`, `MODEL_ALIAS_MAP` incl. `fable`, `MODEL_EFFORT_SUPPORT`, `CODEX_MODEL_ALIAS_MAP`); Claude family default effort in `defaultEffortForModel` (`container/agent-runner/src/providers/claude.ts`); `DEFAULT_CODEX_MODEL` / `DEFAULT_CODEX_EFFORT` (`container/agent-runner/src/providers/codex.ts`) | PR → deploy → image rebuild |
 | **Runtime that must know the id** | `container/Dockerfile` `CLAUDE_CODE_VERSION` + `@anthropic-ai/claude-agent-sdk` in `container/agent-runner/package.json` (same patch number); `CODEX_VERSION` | same PR |
 | **Fleet pins** | `groups/<g>/container.json`, channel wirings, task pins, subagent frontmatter, session stickies | `ncl` / file edits, no deploy |
 
-**Pins that say `opus` / `sonnet` / `fable` follow the Claude default automatically; frozen ids (`claude-opus-5[1m]`) do not.** Bare family aliases are deliberately kept out of `MODEL_ALIAS_MAP` and resolve at use, not at storage (`src/flag-parser.ts:101-105`). That holds for task pins, wirings, and stickies alike: `ncl tasks list --json` shows a task pinned with `--model opus` as `opus`. When the user wants "the current Opus", write the family alias. Codex aliases (`sol`, `luna`, `terra`) are different: the Codex vocabulary maps them to a concrete id when the pin is written (`src/flag-parser.ts:274`), so they freeze. `ncl groups config update --model` stores its argument verbatim, so pass a full `gpt-*` id there.
+**Pins that say `opus` / `sonnet` / `haiku` follow their family default automatically; frozen ids (`claude-opus-5[1m]`) do not.** Those three are `FAMILY_DEFAULTS`, deliberately kept out of `MODEL_ALIAS_MAP`, and resolve at use, not at storage (`src/flag-parser.ts:101-110`). That holds for task pins, wirings, and stickies alike: `ncl tasks list --json` shows a task pinned with `--model opus` as `opus`. When the user wants "the current Opus", write the family alias. **`fable` is not one of them**: it lives in `MODEL_ALIAS_MAP` (`src/flag-parser.ts:68`) and is stored as its concrete id, so a Fable bump means repointing that entry *and* repinning the existing `claude-fable-*` pins. Codex aliases (`sol`, `luna`, `terra`) also freeze: the Codex vocabulary maps them to a concrete id when the pin is written (`src/flag-parser.ts:274`). `ncl groups config update --model` stores its argument verbatim, so pass a full `gpt-*` id there.
 
 ## 1. Inventory: what runs where
 
@@ -46,8 +46,8 @@ Use **this install's** image. Each install has its own image name (`container/bu
   IMG=$(pnpm exec tsx -e "import('./src/config.ts').then(m => console.log(m.CONTAINER_IMAGE))" | tail -1)
   docker run --rm --entrypoint sh "$IMG" -c 'p=$(find / -path /proc -prune -o -type d -path "*@anthropic-ai/claude-code" -print 2>/dev/null | head -1); grep -rlao "<new-id>" "$p" | wc -l'
   ```
-  If the count is 0, move to the first `latest` release that has it, and move the CLI and SDK to the same patch number.
-- **Codex**: the server gates new models **by client version**, and the binary's catalog doesn't list them either way. Grepping proves nothing. Probe each candidate version with a real call under the fleet's auth (ChatGPT account): `codex exec -m <new-id> -c model_reasoning_effort=<effort> "reply ok"`. On 2026-09-22 `gpt-6-sol` returned HTTP 400 on 0.154.0 and worked on 0.155.1. Keep the container's `CODEX_VERSION` equal to the host's `codex --version`.
+  If the count is 0, the id needs a newer CLI. Take the audited latest (step 3), which must contain the id; if it doesn't, the model can't be adopted yet.
+- **Codex**: the server gates new models **by client version**, and the binary's catalog doesn't list them either way. Grepping proves nothing. Probe each candidate version with a real call under the fleet's auth (ChatGPT account): `codex exec -m <new-id> -c model_reasoning_effort=<effort> "reply ok"`. On 2026-09-22 `gpt-6-sol` returned HTTP 400 on 0.154.0 and worked on 0.155.1. Move the container's CLI with the audited `docker:codex` item (step 3), and keep it equal to the host's `codex --version`.
 
 ## 3. The PR: everything in the first push
 
@@ -55,9 +55,14 @@ Work in a scratch worktree off `origin/main`, never the live checkout. **One PR 
 
 Code:
 - New Claude id: add pinned aliases to `MODEL_ALIAS_MAP` (e.g. `opus55`, `opus5-5`, `opus-5-5` → `claude-opus-5-5[1m]`; Opus and Fable always carry `[1m]`), and add a `MODEL_EFFORT_SUPPORT` row.
-- Default: change `DEFAULT_OPUS_MODEL` / `DEFAULT_CODEX_MODEL`. For Codex, repoint the family alias in `CODEX_MODEL_ALIAS_MAP`.
+- Default: change the constant for the family that shipped: `DEFAULT_OPUS_MODEL`, `DEFAULT_SONNET_MODEL`, or `DEFAULT_HAIKU_MODEL` (`src/flag-parser.ts:97-99`; bare `opus`/`sonnet`/`haiku` resolve through these), the `fable` entry in `MODEL_ALIAS_MAP`, or `DEFAULT_CODEX_MODEL`. For Codex, also repoint the family alias in `CODEX_MODEL_ALIAS_MAP`. Update that family's resolution tests in `src/flag-parser.test.ts`.
 - Default effort: `defaultEffortForModel` is the only place a Claude family default lives (`src/claude-spawn-defaults.ts` derives none). For Codex it is `DEFAULT_CODEX_EFFORT`.
-- CLI/SDK pins: bump `container/Dockerfile`, `container/agent-runner/package.json` (then `bun install` there and commit `bun.lock`), **and `versions.json`**. `setup/lib/image-version-pins.test.ts` fails if these drift, or if claude-code and the SDK differ in patch number. The SDK bump changes the deps hash, and spawns refuse until the image is rebuilt (`src/agent-runner-image-check.ts`), so the package edit and the rebuild ship together.
+- CLI/SDK pins: never hand-edit the manifests. Go through the audited flow (`docs/dependency-updates.md`), which rejects prerelease and yanked releases and regenerates the lock deterministically:
+  ```bash
+  bun scripts/container-updates.ts audit --format json        # item ids: docker:claude-code, bun:@anthropic-ai/claude-agent-sdk, docker:codex
+  bun scripts/container-updates.ts apply --repo <worktree> --items docker:claude-code,bun:@anthropic-ai/claude-agent-sdk
+  ```
+  Then record the new pins in **`versions.json`**. `setup/lib/image-version-pins.test.ts` fails if `versions.json` drifts from the Dockerfile or `package.json`, or if claude-code and the SDK differ in patch number. If the audited latest versions of the two differ in patch number, stop and ask; don't hand-pick a pair. The SDK bump changes the deps hash, and spawns refuse until the image is rebuilt (`src/agent-runner-image-check.ts`), so the package edit and the rebuild ship together.
 - New Codex id: add its `MIN_CODEX_CLI` row in `setup/lib/codex-model-min-cli.test.ts` with the minimum version the step-2 probe proved. The test fails when the default or an alias target has no row.
 
 Contract (CONTRIBUTING.md "Breaking Changes"). A moved default is breaking:
