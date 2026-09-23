@@ -697,8 +697,8 @@ adopt)
   # CONTRACT ADOPTION — the fenced ownership transition for a recovered run.
   #
   # `smoke-pr-gate.sh poll` mints a fresh owner token on EVERY wake, same-run
-  # recovery included (smoke-pr-gate.sh:4790), and writes it to the lease
-  # (:4819), the PR authority (:4824) and the state (:4862-4869) — no line of
+  # recovery included (smoke-pr-gate.sh:4803), and writes it to the lease
+  # (:4832), the PR authority (:4837) and the state (:4875-4882) — no line of
   # that block touches the contract. The recovery owner
   # therefore passes begin_active_run_fence and then dies in
   # require_contract_owner, with `contract --regenerate` (which retires every
@@ -715,7 +715,7 @@ adopt)
   # Deliberately NOT changed: lanes, generations, requiredLaneMarkers, markers,
   # `createdAt`, and the gate's challengerDeadline (this script cannot write
   # gate state at all; the gate's own same-SHA recovery keeps the original,
-  # smoke-pr-gate.sh:4864-4868) — so valid prior evidence keeps validating and recovery
+  # smoke-pr-gate.sh:4877-4881) — so valid prior evidence keeps validating and recovery
   # buys no fresh time budget. The successor is recorded as an ADOPTER in
   # `ownerAdoptions[]`, never as the author.
   require_coordinator_role "a completion-contract ownership adoption"
@@ -834,7 +834,7 @@ adopt)
        [{index:(((.ownerAdoptions // []) | length) + 1), adoptedAt:$now}])' \
     "$CONTRACT" > "$tmp"
   # Deterministic regression seam for a crash between validation and commit,
-  # same guard as smoke-pr-gate.sh:4841. Production wrappers never set it.
+  # same guard as smoke-pr-gate.sh:4854. Production wrappers never set it.
   if [ -n "${SMOKE_GATE_SHARED_ROOT+x}" ] && [ "$SMOKE_GATE_SHARED_ROOT" != /workspace/workgroup ] &&
      [ "${SMOKE_SCAFFOLD_TEST_CRASH_BEFORE_ADOPT_COMMIT:-}" = 1 ]; then
     kill -KILL "$$"

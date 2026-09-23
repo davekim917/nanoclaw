@@ -462,8 +462,12 @@ def replay_one(ctl, entry, mode, work, effects="shadow"):
     live_argv = []
     if live:
         os.makedirs(fake)
+        # SMOKE_GATE_RUN_ROOT: the run root the gate reads for a disposition
+        # (smoke-pr-gate.sh:1304), which the fake gate now checks as the real
+        # `challenger-timeout` does. A live install sets it to the same
+        # directory as the controller's --run-root, whose default it is.
         os.environ.update({"SMOKE_CONTROLLER_MODE": "live", "FAKE_STATE": fake, "FAKE_LOG": flog,
-                           "FAKE_GATE_STATE": state})
+                           "FAKE_GATE_STATE": state, "SMOKE_GATE_RUN_ROOT": root})
         with open(os.path.join(fake, "gh.json"), "w") as fh:
             json.dump({"comments": {}, "issues": [], "prs": {str(pr): {"state": "OPEN"}}}, fh)
         gate_sh = os.path.join(base, "gate.sh")

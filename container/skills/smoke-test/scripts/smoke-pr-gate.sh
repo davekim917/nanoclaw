@@ -311,7 +311,7 @@ lease_dir_prepare() {
 
 emit_lease_dir_error() {  # <runId> <command>
   jq -cn --arg run "$1" --arg cmd "$2" --arg dir "$LEASE_DIR" --arg detail "$LEASE_DIR_ERROR" \
-    '{ok:false,error:("shared coordinator lease unavailable - " + $detail + "; refusing to continue unleased"),
+    '{ok:false,refusal:"lease-unavailable",error:("shared coordinator lease unavailable - " + $detail + "; refusing to continue unleased"),
       runId:$run,command:$cmd,leaseDir:$dir}'
 }
 
@@ -378,7 +378,7 @@ lease_lifecycle_begin() { # <pr> <runId> <command>
   if ! lease_dir_prepare; then emit_lease_dir_error "$run" "$command"; return 1; fi
   if ! exec 5>"$(lease_lifecycle_lock_file "$pr")"; then
     jq -cn --argjson pr "$pr" --arg run "$run" --arg dir "$LEASE_DIR" --arg cmd "$command" \
-      '{ok:false,error:("could not open shared lifecycle lock under " + $dir + " - refusing to continue unleased"),pr:$pr,runId:$run,command:$cmd,leaseDir:$dir}'
+      '{ok:false,refusal:"lease-unavailable",error:("could not open shared lifecycle lock under " + $dir + " - refusing to continue unleased"),pr:$pr,runId:$run,command:$cmd,leaseDir:$dir}'
     return 1
   fi
   if ! flock -w "$LOCK_WAIT" 5; then
@@ -568,7 +568,7 @@ lease_fence_begin() {  # <pr> <runId> <owner> <command>
   if [ "$LIFECYCLE_FENCE_HELD" != true ] && ! lease_lifecycle_begin "$pr" "$run" "$command"; then return 1; fi
   if ! exec 6>"$(lease_lock_file "$run")"; then
     jq -cn --argjson pr "$pr" --arg run "$run" --arg dir "$LEASE_DIR" --arg cmd "$command" \
-      '{ok:false,error:("could not open shared run lease lock under " + $dir + " - refusing to continue unleased"),pr:$pr,runId:$run,command:$cmd,leaseDir:$dir}'
+      '{ok:false,refusal:"lease-unavailable",error:("could not open shared run lease lock under " + $dir + " - refusing to continue unleased"),pr:$pr,runId:$run,command:$cmd,leaseDir:$dir}'
     lease_lifecycle_end
     return 1
   fi
@@ -581,7 +581,7 @@ lease_fence_begin() {  # <pr> <runId> <owner> <command>
   lease="$(read_lease "$run")"
   if [ "$(lease_is_malformed "$lease")" = true ]; then
     jq -cn --argjson pr "$pr" --arg run "$run" --arg cmd "$command" --arg path "$(lease_file "$run")" \
-      '{ok:false,error:("shared coordinator lease is malformed at " + $path + " - refusing lifecycle authority"),pr:$pr,runId:$run,command:$cmd,leaseFile:$path}'
+      '{ok:false,refusal:"lease-unavailable",error:("shared coordinator lease is malformed at " + $path + " - refusing lifecycle authority"),pr:$pr,runId:$run,command:$cmd,leaseFile:$path}'
     flock -u 6; exec 6>&-; lease_lifecycle_end
     return 1
   fi
@@ -4585,6 +4585,19 @@ fi
 # written and nothing had a deadline. The ONLY outcome this verb can produce is
 # BLOCKED, and it produces it through the ordinary `finish` — a timeout that
 # unblocks a coordinator toward GO is worse than the stall it ends.
+#
+# Each precondition refusal carries a machine-readable `refusal` code beside
+# its prose, because they mean opposite things to a caller:
+#   no-deadline          structural: this run cannot be timed out
+#   deadline-not-passed  wait: the caller's clock ran ahead of this one
+#   run-root-unset       the gate CANNOT LOOK -- never "nothing was filed"
+#   run-root-unreadable  the gate CANNOT LOOK (a mount or permission fault)
+#   disposition-filed    the premise is false: the challenger did file
+# and, from the shared lease fence this verb and `finish` both take:
+#   lease-unavailable    the gate CANNOT LOOK at the lease (dir or lock will
+#                        not open, or the lease is malformed) -- retry, alarm
+# The campaign controller keys on these codes, never on the prose
+# (smoke-campaign-controller.py, gate_verb and _publish_verb).
 if [ "$COMMAND" = "challenger-timeout" ]; then
   RUN_ID="${2:-}"
   OWNER="${3:-$DEFAULT_OWNER}"
@@ -4621,7 +4634,7 @@ if [ "$COMMAND" = "challenger-timeout" ]; then
   DEADLINE="$(jq -r '.challengerDeadline // empty' <<<"$STATE")"
   if [ -z "$DEADLINE" ]; then
     jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
-      '{ok:false,error:"this run has no challengerDeadline — it was claimed before deadlines were stamped, so there is nothing to time out. Release it or finish it explicitly.",
+      '{ok:false,refusal:"no-deadline",error:"this run has no challengerDeadline — it was claimed before deadlines were stamped, so there is nothing to time out. Release it or finish it explicitly.",
         pr:$pr,runId:$run}'
     exit 2
   fi
@@ -4629,7 +4642,7 @@ if [ "$COMMAND" = "challenger-timeout" ]; then
   if [ "$REMAINING" -gt 0 ]; then
     jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg deadline "$DEADLINE" \
       --argjson remaining "$REMAINING" \
-      '{ok:false,error:"the challenger deadline has not passed — keep waiting",
+      '{ok:false,refusal:"deadline-not-passed",error:"the challenger deadline has not passed — keep waiting",
         pr:$pr,runId:$run,challengerDeadline:$deadline,remainingSeconds:$remaining}'
     exit 0
   fi
@@ -4639,20 +4652,20 @@ if [ "$COMMAND" = "challenger-timeout" ]; then
   # on every deployment that has not wired this.
   if [ -z "$CHALLENGER_RUN_ROOT" ]; then
     jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
-      '{ok:false,error:"SMOKE_GATE_RUN_ROOT is not set, so the gate cannot look for challenger/disposition.md — refusing to declare a disposition missing that it never checked for. Wire SMOKE_GATE_RUN_ROOT to the run root, or finish this run explicitly.",
+      '{ok:false,refusal:"run-root-unset",error:"SMOKE_GATE_RUN_ROOT is not set, so the gate cannot look for challenger/disposition.md — refusing to declare a disposition missing that it never checked for. Wire SMOKE_GATE_RUN_ROOT to the run root, or finish this run explicitly.",
         pr:$pr,runId:$run}'
     exit 2
   fi
   if [ ! -d "$CHALLENGER_RUN_ROOT" ]; then
     jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg root "$CHALLENGER_RUN_ROOT" \
-      '{ok:false,error:("SMOKE_GATE_RUN_ROOT " + $root + " is not readable — the lookup failed, which is not the same as a missing disposition. Fix the mount and retry."),
+      '{ok:false,refusal:"run-root-unreadable",error:("SMOKE_GATE_RUN_ROOT " + $root + " is not readable — the lookup failed, which is not the same as a missing disposition. Fix the mount and retry."),
         pr:$pr,runId:$run,runRoot:$root}'
     exit 2
   fi
   DISPOSITION_FILE="$(challenger_disposition_file "$RUN_ID")"
   if [ -s "$DISPOSITION_FILE" ]; then
     jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg path "$DISPOSITION_FILE" \
-      '{ok:false,error:"the challenger DID file a disposition — nothing timed out. Synthesize and finish normally.",
+      '{ok:false,refusal:"disposition-filed",error:"the challenger DID file a disposition — nothing timed out. Synthesize and finish normally.",
         pr:$pr,runId:$run,dispositionFile:$path}'
     exit 0
   fi

@@ -298,8 +298,8 @@ fire
 [ "$(d .stepped)" = false ] && [ -e "$OUT/wrapper/alarms/broken.json" ] || fail "an unreadable queued alarm is kept: $OUTPUT"
 
 # --- EVERY gate latch is recovered, not just four (review round 2, #1) -------------
-# stalledAlertRunId (smoke-pr-gate.sh:4783, checked :4762) and the control-file
-# wakes (:1463, :4858, :4908, :5245). The gate wrote the latch; the worker died
+# stalledAlertRunId (smoke-pr-gate.sh:4796, checked :4775) and the control-file
+# wakes (:1463, :4871, :4921, :5258). The gate wrote the latch; the worker died
 # before queueing: the next fire recovers it and posts it exactly once.
 posted() { jq --arg p "$1" '[.messages // {} | .[] | select(.fingerprint | startswith($p))] | length' "$C/fake/enqueue.json" 2>/dev/null || echo 0; }
 new_case latch-stalled
@@ -783,8 +783,8 @@ fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6 SMOKE_CONTROLLER_SEND_TO=campaign-ro
 # file defined 17, so eleven names -- SMOKE_GATE_LEASE_DIR among them -- were
 # dropped silently. The deployed gate WRAPPER sources that file itself, so the
 # gate's own lease dir stayed right; but the evidence barrier is spawned by the
-# controller with this process's environment (smoke-campaign-controller.py:1393
-# -> run_read_only -> spawn :638-650, env=None) and fell back to
+# controller with this process's environment (smoke-campaign-controller.py:1419
+# -> run_read_only -> spawn :653-665, env=None) and fell back to
 # ${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases
 # (smoke-evidence-barrier.sh:739). No pin for the campaign lives there, so the
 # journeys barrier took its "no gate pin owns it" path (smoke-journeys.py:997)

@@ -46,6 +46,10 @@ new_case() { # name [mode]
   mkdir -p "$C/state" "$C/runs" "$C/out" "$C/fake" "$C/bin"
   R="$C/runs/$RUN"
   export FAKE_STATE="$C/fake" FAKE_LOG="$C/fake/calls.ndjson" FAKE_GATE_STATE="$C/state"
+  # The run root the gate itself reads (smoke-pr-gate.sh:1304): the fake gate
+  # refuses `challenger-timeout` without it, and once a disposition is under
+  # it, exactly as the real one does. The controller gets --run-root below.
+  export SMOKE_GATE_RUN_ROOT="$C/runs"
   : >"$FAKE_LOG"
   printf '#!/usr/bin/env bash\nexec python3 %q gate "$@"\n' "$FAKES" >"$C/bin/gate.sh"
   printf '{"%s":"%s"}\n' "$PR" "$SHA" >"$C/heads.json"
@@ -118,6 +122,22 @@ world() { # tick
   for b in "$R"/controller/brief-*.md; do
     [ -e "$b" ] && [ ! -e "${b%.md}.ack" ] && : >"${b%.md}.ack"
   done
+  # SETTLE="intake lanes ...": on the phase-dispatch route, each named owner
+  # step's session settles once the artifact it owes is on disk -- a tick
+  # after the owner writes it, as a real session ends after its last write.
+  # A step it does not name never settles.
+  if [ -n "${SETTLE:-}" ]; then
+    local st="{}" s
+    for s in $SETTLE; do
+      case "$s" in
+        intake) [ -e "$R/completion-contract.json" ] ;;
+        lanes) [ -e "$R/markers/B1.json" ] ;;
+        preliminary) [ -e "$R/coordinator/preliminary.md" ] ;;
+        *) false ;;
+      esac && st="$(jq -c --arg s "$s" '.[$s]="settled"' <<<"$st")"
+    done
+    printf '%s\n' "$st" >"$C/fake/settle.json"
+  fi
   # LATE_DISPOSITION=k: the challenger's disposition lands at tick k, whatever
   # the owner has done.
   if [ -n "${LATE_DISPOSITION:-}" ] && [ "$n" -ge "$LATE_DISPOSITION" ]; then
@@ -128,6 +148,9 @@ world() { # tick
     n=$((n - STALL)); [ "$n" -ge 2 ] || n=2
   fi
   [ "$n" -ge 1 ] || return 0
+  # NO_CONTRACT: an owner that never writes a completion contract -- a
+  # provider park, a declination (XZO #2093, run pr2075).
+  [ -z "${NO_CONTRACT:-}" ] || return 0
   if [ ! -e "$R/completion-contract.json" ]; then
     contract
     mkdir -p "$R/contact-sheet"
@@ -151,6 +174,8 @@ world() { # tick
   [ "$n" -ge 4 ] || return 0
   [ -e "$R/coordinator/preliminary.md" ] || printf 'prelim\n' >"$R/coordinator/preliminary.md"
   [ "$n" -ge 5 ] || return 0
+  # NO_CHALLENGER: the challenger never files a disposition.
+  [ -z "${NO_CHALLENGER:-}" ] || return 0
   [ -e "$R/challenger/challenge.complete.json" ] || parent_conclusions
   [ "$n" -ge 6 ] || return 0
   if [ ! -e "$R/synthesis.json" ]; then
@@ -198,6 +223,12 @@ live_args() {
     --cutover-json "$C/cutover.json" --repo acme/app --send-to campaign-room --gate-cmd "$C/bin/gate.sh" \
     --gh-cmd "python3 $FAKES gh" --ncl-cmd "python3 $FAKES ncl" --enqueue-cmd "python3 $FAKES enqueue" \
     --lock-timeout 1
+  # OWNER_DISPATCH: the phase-dispatch owner route (_phase_owner_step), whose
+  # steps settle only when fake/settle.json says so.
+  if [ -n "${OWNER_DISPATCH:-}" ]; then
+    jq -cn '{enabled:true,legacyRuns:[]}' >"$C/owner-cutover.json"
+    printf '%s\n' --owner-dispatch-cutover-json "$C/owner-cutover.json"
+  fi
 }
 step() { # now [extra args...]
   local now="$1"; shift
@@ -221,6 +252,26 @@ writes() { jq -s '[.[] | select(.op=="enqueued" or .op=="commented" or .op=="cre
 jr() { jq -cs "$1" "$C/out/journal.ndjson"; }
 dq() { jq -cs "$1" "$C/out/$RUN/decisions.ndjson"; }
 finish_verdict() { jr '[.[] | select(.kind=="gate" and .state=="done") | .detail.verdict] | last'; }
+# A frozen challenger-timeout BLOCKED whose disposition landed before it could
+# finish: it must finish through `finish`, the verb the REAL gate still accepts
+# (challenger-timeout is refused once a disposition exists,
+# smoke-pr-gate.sh:4665-4670; the fake gate models that refusal), with the
+# frozen verdict and failed checks unchanged. The disposition is asserted first,
+# so a pass is never a run the late disposition never reached.
+late_disposition_finished() { # label deadline finish-at
+  [ -s "$R/challenger/disposition.md" ] || fail "$1: precondition -- the late disposition is on disk"
+  jr '[.[] | select(.kind=="verdict" and .slot=="validated") | .detail.terminalVerb] == ["challenger-timeout"]' \
+    | grep -qx true || fail "$1: precondition -- the verdict was frozen as a challenger-timeout: $(jr '[.[]|select(.kind=="verdict")]')"
+  [ "$(finish_verdict)" = '"BLOCKED"' ] || fail "$1: the frozen BLOCKED never finished -- the run holds its slot: $(finish_verdict)"
+  jr '[.[] | select(.kind=="gate" and .state=="done") | .slot] == ["finish"]' | grep -qx true \
+    || fail "$1: the frozen BLOCKED finishes through finish, exactly once: $(jr '[.[] | select(.kind=="gate")]')"
+  dq '[.[] | select(.type=="finish")] | last | .failedChecks == ["challenger-timeout: no disposition by '"$2"'"]' \
+    | grep -qx true || fail "$1: the published verdict still names the missed deadline: $(dq '[.[]|select(.type=="finish")]|last')"
+  jr '[.[] | select(.kind=="gate" and .state=="done") | .at] | first == "'"$3"'"' | grep -qx true \
+    || fail "$1: finish lands on $3, the fire after the receipt: $(jr '[.[] | select(.kind=="gate" and .state=="done") | .at]')"
+  [ "$(jq -r '.completedVerdict' "$C/state/pr-$PR-state.json")" = BLOCKED ] \
+    || fail "$1: the gate released the slot BLOCKED"
+}
 WAKES=()
 
 # Drive the campaign: ticks 0..last, each fire run twice on the SAME inputs
@@ -451,14 +502,16 @@ unset STALL
 # --- 5c. a frozen verdict settles even after the phase files move under it -------
 # The challenger deadline passes with lanes pending: challenger-timeout BLOCKED
 # is validated and its post enqueued. The disposition then lands before the
-# post's receipt; the next fire must still settle and finish, not park in lanes.
+# post's receipt; the next fire must still settle and finish, not park in lanes
+# -- and must finish through `finish`: this case used to assert the frozen verb
+# (challenger-timeout) was kept, which only the fake gate accepted; the real
+# one refuses it once a disposition exists and the run then held its slot for
+# good (PR #1066 round 1).
 new_case late-disposition
 STALL=30 LATE_DISPOSITION=4 DEADLINE=2026-09-18T10:25:00Z campaign 8
-[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "late disposition: the frozen BLOCKED still finishes: $(finish_verdict)"
-jr '[.[] | select(.kind=="gate" and .slot=="challenger-timeout" and .state=="done")] | length == 1' | grep -qx true \
-  || fail "late disposition: the frozen verdict keeps its terminal verb"
-fin_at="$(jr '[.[] | select(.kind=="gate" and .state=="done") | .at] | first')"
-[ "$fin_at" = '"2026-09-18T10:40:00Z"' ] || fail "late disposition: finish lands the fire after the receipt, got $fin_at"
+late_disposition_finished "late disposition" 2026-09-18T10:25:00Z 2026-09-18T10:40:00Z
+[ "$(jq -s '[.[] | select(.tool=="gate" and .op=="challenger-timeout")] | length' "$FAKE_LOG")" = 0 ] \
+  || fail "late disposition: a timeout the disposition had already answered was sent to the gate"
 unset STALL LATE_DISPOSITION DEADLINE
 
 # --- 6. live and shadow apply the same rules ------------------------------------
@@ -930,7 +983,7 @@ grep -q 'CHECK THE BARRIER, DO NOT ASSUME IT' "$R/controller/brief-lanes.md" \
 # (smoke-pr-gate.sh:220), so the lease lapsed under a live owner and its eight
 # completed lanes were refused their markers. The next `poll` then did what it
 # is supposed to do on a stale run: it resumed the run id and minted a FRESH
-# owner token (smoke-pr-gate.sh:5312 -> :5347/:5349/:5389). The controller
+# owner token (smoke-pr-gate.sh:5325 -> :5360/:5349/:5389). The controller
 # picked the new token up for itself, and stopped there. controller/wake.json --
 # the only file that carries the token to the owner, and the file the intake
 # brief tells it to read -- still named the retired one, and the lanes brief is
@@ -1111,19 +1164,19 @@ cite() { # <file> <line> <literal substring the cited line must contain>
     || fail "controller-owner-router.md cites $1:$2 for \"$3\", but that line is: ${got:-<absent>}"
 }
 ROUTER="$SCRIPT_DIR/../references/controller-owner-router.md"
-for c in 'smoke-pr-gate.sh:5312' 'smoke-campaign-controller.py:1302-1304' \
-         'smoke-run-scaffold.sh:267-269' 'smoke-campaign-controller.py:1291-1301'; do
+for c in 'smoke-pr-gate.sh:5325' 'smoke-campaign-controller.py:1328-1330' \
+         'smoke-run-scaffold.sh:267-269' 'smoke-campaign-controller.py:1317-1327'; do
   grep -Fq "$c" "$ROUTER" || fail "router doc no longer cites $c"
 done
-cite smoke-pr-gate.sh 5312 'OWNER_TOKEN="$(new_owner_token'
-cite smoke-pr-gate.sh 5341 'lease_acquire "$RUN_ID" "$OWNER_TOKEN"'
-cite smoke-pr-gate.sh 5346 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
-cite smoke-pr-gate.sh 5389 '.activeLeaseOwner=$owner'
+cite smoke-pr-gate.sh 5325 'OWNER_TOKEN="$(new_owner_token'
+cite smoke-pr-gate.sh 5354 'lease_acquire "$RUN_ID" "$OWNER_TOKEN"'
+cite smoke-pr-gate.sh 5359 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
+cite smoke-pr-gate.sh 5402 '.activeLeaseOwner=$owner'
 cite smoke-run-scaffold.sh 268 '[ "$owner" = "$DEFAULT_OWNER" ]'
 cite smoke-run-scaffold.sh 707 'adds NO new authority check of its own'
-cite smoke-campaign-controller.py 1247 'def _owner_wake'
-cite smoke-campaign-controller.py 1297 'os.unlink("brief-{}.ack"'
-cite smoke-campaign-controller.py 1302 'if c.get("wake"):'
+cite smoke-campaign-controller.py 1273 'def _owner_wake'
+cite smoke-campaign-controller.py 1323 'os.unlink("brief-{}.ack"'
+cite smoke-campaign-controller.py 1328 'if c.get("wake"):'
 
 
 # --- round 3, finding 1: a refusal that appears AFTER the ack re-offers ------
@@ -1340,5 +1393,452 @@ done
   || fail "#2092(late): redispatched lanes on the frozen pair did not let the GO through: $(finish_verdict) $STEP_OUT"
 [ ! -e "$R/controller/barrier-lanes.json" ] \
   || fail "#2092: the lanes refusal was left published after the phase passed"
+
+# --- XZO #2093: the challenger deadline ends a run from EVERY phase ------------
+# Every negative below is paired with a positive that only happens if the code
+# under test ran: a wake or a wait decision BEFORE the deadline proves the run
+# really sat in that phase, and the gate's own terminal call proves the fire
+# after the deadline reached the check.
+DL=2026-09-18T10:25:00Z
+timed_out() { # label
+  [ "$(finish_verdict)" = '"BLOCKED"' ] || fail "$1: no BLOCKED finish -- the run holds its slot: $(finish_verdict) $STEP_OUT"
+  jr '[.[] | select(.kind=="gate" and .state=="done") | .slot] == ["challenger-timeout"]' | grep -qx true \
+    || fail "$1: the terminal verb is challenger-timeout, exactly once: $(jr '[.[] | select(.kind=="gate")]')"
+  dq '[.[] | select(.type=="finish")] | last | .failedChecks
+      == ["challenger-timeout: no disposition by '"$DL"'"]' | grep -qx true \
+    || fail "$1: the verdict names the missed deadline and nothing else: $(dq '[.[]|select(.type=="finish")]|last')"
+  [ "$(jq -r '.prs["7"].state' "$C/fake/gh.json")" = CLOSED ] || fail "$1: the freeze PR is closed after the timeout"
+  assert_once "$1"
+}
+phase_waited() { # label step at: on fire <at> -- before the deadline, with the step's
+  # artifact already on disk -- the run was parked on that owner's settlement,
+  # i.e. on the done=True return under test, not on the artifact still missing.
+  [[ "$3" < "$DL" ]] || fail "$1: test bug -- $3 is not before the deadline $DL"
+  jq -cs --arg s "$2" --arg at "$3" '[.[] | select(.type=="wait" and .step==$s and .at == $at
+      and (.reason | test("phase owner in flight")))] | length > 0' "$C/out/$RUN/decisions.ndjson" | grep -qx true \
+    || fail "$1: precondition -- the run was not waiting on an unsettled $2 owner at $3, so this proves nothing: $(
+      jq -cs '[.[] | select(.type=="wait") | [.at,.step,.reason]] | unique' "$C/out/$RUN/decisions.ndjson")"
+}
+
+# a) run pr2075's shape: the owner never writes a contract. Intake is offered
+#    before the deadline; the first fire past it validates BLOCKED, the next
+#    one (its verdict post receipted) finishes -- two fires, as the issue's
+#    correction observed -- and nothing is posted or woken for a dead run.
+new_case t2093-no-contract
+NO_CONTRACT=1 DEADLINE="$DL" campaign 6
+timed_out "#2093(no contract)"
+[ "${WAKES[0]:-}" = intake ] && [[ "${WAKE_TIMES[0]}" < "$DL" ]] \
+  || fail "#2093: precondition -- intake was offered before the deadline: ${WAKES[*]} ${WAKE_TIMES[*]}"
+for i in "${!WAKES[@]}"; do
+  [[ "${WAKE_TIMES[$i]}" < "$DL" ]] || fail "#2093: owner woken for ${WAKES[$i]} at ${WAKE_TIMES[$i]}, past the deadline"
+done
+[ ! -e "$R/completion-contract.json" ] || fail "#2093: precondition -- the owner wrote no contract"
+jr '[.[] | select(.kind=="verdict" and .slot=="validated") | .at] | first == "2026-09-18T10:30:00Z"' | grep -qx true \
+  || fail "#2093: BLOCKED is validated on the FIRST fire past the deadline, not before and not later: $(jr '[.[]|select(.kind=="verdict")]')"
+jr '[.[] | select(.kind=="gate" and .state=="done") | .at] | first == "2026-09-18T10:40:00Z"' | grep -qx true \
+  || fail "#2093: finish lands the fire after the verdict post is receipted"
+jr '[.[] | select(.kind=="send") | .slot] | unique' | grep -qx '\["verdict"\]' \
+  || fail "#2093: the verdict is posted and the root post never is (no campaign ever started): $(jr '[.[]|select(.kind=="send")|.slot]|unique')"
+
+# b) the challenger files between the two fires: the timeout condition is then
+#    false, and the frozen BLOCKED must still settle rather than fall back into
+#    an intake it can never leave (the ladder's pr1896 replay, from intake) --
+#    through `finish`, since the real gate refuses the frozen verb now.
+new_case t2093-late-disposition
+NO_CONTRACT=1 LATE_DISPOSITION=4 DEADLINE="$DL" campaign 6
+late_disposition_finished "#2093(late disposition)" "$DL" 2026-09-18T10:40:00Z
+[ ! -e "$R/completion-contract.json" ] || fail "#2093(late): precondition -- the run never left intake"
+[ "$(jq -r '.prs["7"].state' "$C/fake/gh.json")" = CLOSED ] || fail "#2093(late): the freeze PR is closed after the finish"
+assert_once "#2093(late disposition)"
+
+# b2) the same race one step later: the disposition lands between the
+#     controller's read of the run tree and the gate's own. The gate refuses the
+#     timeout (definitively -- failed_terminal), and the next fire must finish
+#     BLOCKED through `finish` rather than re-send the refused verb forever --
+#     in the SAME fire, so the retry of that fire performs nothing.
+new_case t2093-disposition-race
+jq -cn '{"gate:challenger-timeout":["disposition-lands"]}' >"$C/fake/faults.json"
+NO_CONTRACT=1 DEADLINE="$DL" campaign 6
+[ "$(jq -s '[.[] | select(.tool=="gate" and .op=="disposition-filed")] | length' "$FAKE_LOG")" = 1 ] \
+  || fail "#2093(race): precondition -- the gate refused exactly one timeout because the disposition had landed: $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
+jr '[.[] | select(.kind=="gate" and .slot=="challenger-timeout") | .state] | last == "failed_terminal"' | grep -qx true \
+  || fail "#2093(race): precondition -- the refusal was recorded as the definitive one it is"
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "#2093(race): the run holds its slot after the refused timeout: $(finish_verdict)"
+jr '[.[] | select(.kind=="gate" and .state=="done") | .slot] == ["finish"]' | grep -qx true \
+  || fail "#2093(race): the frozen BLOCKED finishes through finish, once: $(jr '[.[] | select(.kind=="gate")]')"
+[ "$(jq -s '[.[] | select(.tool=="gate" and .op=="challenger-timeout")] | length' "$FAKE_LOG")" = 0 ] \
+  || fail "#2093(race): the refused timeout was re-sent"
+assert_once "#2093(disposition race)"
+
+# b3) an EMPTY disposition.md is no disposition, to the gate (`[ -s ]`,
+#     smoke-pr-gate.sh:4666) and so to the controller: the timeout is still
+#     published through challenger-timeout, which records no-disposition.
+new_case t2093-empty-disposition
+claim "$DL"; wake_json
+mkdir -p "$R/challenger"; : >"$R/challenger/disposition.md"
+for n in 0 3 4 5; do
+  inputs_from_fakes
+  if [ "$n" = 0 ]; then step_ok "$(tick_time 0)" --poll-json "$C/wake.json"; else step_ok "$(tick_time "$n")"; fi
+done
+[ -e "$R/challenger/disposition.md" ] && [ ! -s "$R/challenger/disposition.md" ] \
+  || fail "#2093(empty): precondition -- the disposition file exists and is empty"
+[ "$(jq -s '[.[] | select(.tool=="gate" and .op=="challenger-timeout")] | length' "$FAKE_LOG")" = 1 ] \
+  || fail "#2093(empty): an empty disposition must not divert the timeout off challenger-timeout: $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
+[ "$(jq -r '.challengerDisposition' "$C/state/pr-$PR-state.json")" = no-disposition ] \
+  || fail "#2093(empty): the gate recorded no-disposition"
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "#2093(empty): BLOCKED: $(finish_verdict)"
+
+# b4) a non-empty SYMLINKED disposition (PR #1066 round 2). The controller's
+#     evidence read refuses symlinks (nonempty_file), so the challenger has not
+#     filed as far as the ladder is concerned and the run times out; the gate's
+#     `[ -s ]` follows the link and would refuse challenger-timeout. The verb
+#     choice predicts with the gate's own test, so the BLOCKED goes out
+#     through `finish` with no refused call at all.
+new_case t2093-symlinked-disposition
+mkdir -p "$C/elsewhere" "$R/challenger"
+printf 'filed, but through a link\n' >"$C/elsewhere/disposition.md"
+ln -s "$C/elsewhere/disposition.md" "$R/challenger/disposition.md"
+NO_CONTRACT=1 DEADLINE="$DL" campaign 6
+[ -L "$R/challenger/disposition.md" ] && [ -s "$R/challenger/disposition.md" ] \
+  || fail "#2093(symlink): precondition -- a non-empty symlinked disposition"
+jr '[.[] | select(.kind=="verdict" and .slot=="validated") | .detail | [.terminalVerb, .failedChecks]]
+    == [["challenger-timeout", ["challenger-timeout: no disposition by '"$DL"'"]]]' | grep -qx true \
+  || fail "#2093(symlink): precondition -- the ladder did not take the link as a disposition; it timed out: $(jr '[.[]|select(.kind=="verdict")]')"
+[ "$(jq -s '[.[] | select(.tool=="gate" and .argv[0]=="challenger-timeout")] | length' "$FAKE_LOG")" = 0 ] \
+  || fail "#2093(symlink): challenger-timeout was sent although the gate sees the linked disposition: $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
+jr '[.[] | select(.kind=="gate" and .state=="done") | [.slot, .at]] == [["finish","2026-09-18T10:40:00Z"]]' | grep -qx true \
+  || fail "#2093(symlink): the BLOCKED finishes through finish on the fire after its post is receipted: $(jr '[.[]|select(.kind=="gate")]')"
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "#2093(symlink): BLOCKED: $(finish_verdict)"
+assert_once "#2093(symlinked disposition)"
+
+# b5) the gate refuses with `disposition-filed` although the controller sees
+#     no disposition at all (scripted: the two read the run tree differently --
+#     a permission, a mount, a race the controller cannot observe). That code
+#     proves the timeout's premise false, and the refusal RECORD is the ground
+#     truth: the BLOCKED goes out through `finish` in the SAME fire and
+#     challenger-timeout is never sent again.
+new_case t2093-unpredicted-disposition
+jq -cn '{"gate:challenger-timeout":["refuse-code:disposition-filed"]}' >"$C/fake/faults.json"
+NO_CONTRACT=1 DEADLINE="$DL" campaign 6
+[ ! -e "$R/challenger/disposition.md" ] \
+  || fail "#2093(unpredicted): precondition -- the controller has no disposition to see; only the gate's answer says so"
+[ "$(jq -s '[.[] | select(.tool=="gate" and .argv[0]=="challenger-timeout")] | length' "$FAKE_LOG")" = 1 ] \
+  || fail "#2093(unpredicted): challenger-timeout is sent exactly once and never after its refusal: $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
+jr '[.[] | select(.kind=="gate" and .slot=="challenger-timeout")] | last | [.state, .detail.refusal]
+    == ["failed_terminal","disposition-filed"]' | grep -qx true \
+  || fail "#2093(unpredicted): precondition -- the refusal was recorded as definitive, with its code"
+jr '[.[] | select(.kind=="gate" and .state=="done") | [.slot, .at]] == [["finish","2026-09-18T10:40:00Z"]]' | grep -qx true \
+  || fail "#2093(unpredicted): finish lands on the fire of the refusal: $(jr '[.[]|select(.kind=="gate")]')"
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "#2093(unpredicted): the run holds its slot after the refusal: $(finish_verdict)"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-refused:")))] | length == 0' | grep -qx true \
+  || fail "#2093(unpredicted): a moot timeout is expected, not an operator fault -- no gate-refused alarm"
+assert_once "#2093(unpredicted disposition)"
+
+# b6) the gate CANNOT SEE: SMOKE_GATE_RUN_ROOT is unreadable at the timeout
+#     (a mount fault). That is never evidence that nothing was filed: no
+#     `finish`, the timeout is NOT recorded failed_terminal, ONE operator alarm
+#     however many fires it lasts, and the timeout is retried -- so when the
+#     mount recovers, the next fire times out through challenger-timeout.
+new_case t2093-gate-blind
+claim "$DL"; wake_json
+blind_fire() { # tick
+  inputs_from_fakes
+  step_ok "$(tick_time "$1")"
+}
+inputs_from_fakes; step_ok "$(tick_time 0)" --poll-json "$C/wake.json"
+blind_fire 3                                        # 10:30 BLOCKED validated, its post enqueued
+export SMOKE_GATE_RUN_ROOT="$C/no-such-mount"       # the gate's mount goes away
+blind_fire 4; blind_fire 5; blind_fire 6            # three fires with a blind gate
+[ "$(jq -s '[.[] | select(.tool=="gate" and .op=="run-root-unreadable")] | length' "$FAKE_LOG")" = 3 ] \
+  || fail "#2093(blind): precondition -- the timeout reached the blind gate on each of the three fires (retried, not given up): $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
+[ "$(jq -s '[.[] | select(.tool=="gate" and .argv[0]=="finish")] | length' "$FAKE_LOG")" = 0 ] \
+  || fail "#2093(blind): a gate that cannot look must never be answered with finish BLOCKED"
+jr '[.[] | select(.kind=="gate" and .slot=="challenger-timeout")] | last | [.state, .detail.refusal]
+    == ["intent","run-root-unreadable"]' | grep -qx true \
+  || fail "#2093(blind): the blind refusal leaves the timeout open (intent), never failed_terminal: $(jr '[.[]|select(.kind=="gate")]|last')"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-blind:"))) | .slot] | unique | length == 1' \
+  | grep -qx true || fail "#2093(blind): exactly one deduped operator alarm for the blind gate"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-refused:")))] | length == 0' | grep -qx true \
+  || fail "#2093(blind): a blind gate is not escalated as a permanent refusal"
+[ "$(finish_verdict)" = null ] || fail "#2093(blind): nothing finished while the gate was blind: $(finish_verdict)"
+export SMOKE_GATE_RUN_ROOT="$C/runs"                # the mount recovers
+blind_fire 7; blind_fire 8
+jr '[.[] | select(.kind=="gate" and .state=="done") | [.slot, .at]] == [["challenger-timeout","2026-09-18T11:10:00Z"]]' \
+  | grep -qx true || fail "#2093(blind): the first fire after recovery times out through challenger-timeout: $(jr '[.[]|select(.kind=="gate")]')"
+[ "$(jq -r '.challengerDisposition' "$C/state/pr-$PR-state.json")" = no-disposition ] \
+  || fail "#2093(blind): the recovered gate recorded no-disposition itself"
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "#2093(blind): BLOCKED after recovery: $(finish_verdict)"
+assert_once "#2093(gate blind)"
+
+# b7) a PERMANENT refusal that does not prove the premise false -- a code this
+#     controller does not know, and `no-deadline` -- fails closed: the gate
+#     records no verdict, the slot stays held, the refusal is escalated, and
+#     nothing is guessed toward `finish`. (The verdict chat post and PR comment
+#     precede every terminal call by design; what is withheld is the gate's
+#     verdict, which is what ends a run.)
+for code in some-future-refusal no-deadline; do
+  new_case "t2093-permanent-$code"
+  jq -cn --arg c "refuse-code:$code" '{"gate:challenger-timeout":[$c]}' >"$C/fake/faults.json"
+  NO_CONTRACT=1 DEADLINE="$DL" campaign 6
+  [ "$(jq -s --arg c "$code" '[.[] | select(.tool=="gate" and .op==$c)] | length' "$FAKE_LOG")" = 1 ] \
+    || fail "#2093($code): precondition -- the timeout reached the gate and was refused with $code, once: $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
+  [ "$(jq -s '[.[] | select(.tool=="gate" and (.argv[0]=="finish" or .argv[0]=="challenger-timeout"))] | length' "$FAKE_LOG")" = 1 ] \
+    || fail "#2093($code): after a permanent refusal nothing is sent again -- no finish, no second timeout"
+  jr '[.[] | select(.kind=="gate" and .slot=="challenger-timeout")] | last | [.state, .detail.refusal]
+      == ["failed_terminal","'"$code"'"]' | grep -qx true \
+    || fail "#2093($code): the refusal is recorded permanent, with its code"
+  [ "$(finish_verdict)" = null ] || fail "#2093($code): an unproven verdict was published: $(finish_verdict)"
+  [ "$(jq -r '.activeRunId' "$C/state/pr-$PR-state.json")" = "$RUN" ] \
+    || fail "#2093($code): the slot is still held -- the gate recorded no verdict"
+  jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-refused:")))] | length >= 1' | grep -qx true \
+    || fail "#2093($code): the refusal is escalated to an operator"
+done
+
+# b8) `deadline-not-passed`: the gate's clock has not reached the deadline the
+#     controller's clock has. A wait, not a refusal: retried, never
+#     failed_terminal, never alarmed; the next attempt times out normally.
+new_case t2093-gate-clock-behind
+jq -cn '{"gate:challenger-timeout":["refuse-code:deadline-not-passed"]}' >"$C/fake/faults.json"
+FAULTY=1 NO_CONTRACT=1 DEADLINE="$DL" campaign 6
+[ "$(jq -s '[.[] | select(.tool=="gate" and .op=="deadline-not-passed")] | length' "$FAKE_LOG")" = 1 ] \
+  || fail "#2093(clock): precondition -- the gate answered deadline-not-passed once"
+jr '[.[] | select(.kind=="gate" and .state=="done") | .slot] == ["challenger-timeout"]' | grep -qx true \
+  || fail "#2093(clock): the retried timeout went through challenger-timeout: $(jr '[.[]|select(.kind=="gate")]')"
+jr '[.[] | select(.kind=="gate" and .slot=="challenger-timeout" and .state=="failed_terminal")] | length == 0' \
+  | grep -qx true || fail "#2093(clock): a wait is never recorded failed_terminal"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-")))] | length == 0' | grep -qx true \
+  || fail "#2093(clock): a wait raises no alarm"
+[ "$(finish_verdict)" = '"BLOCKED"' ] || fail "#2093(clock): BLOCKED: $(finish_verdict)"
+assert_once "#2093(gate clock behind)"
+
+# c) a kill anywhere in the timeout's own sequence is recovered on re-entry,
+#    each effect exactly once (campaign re-runs every fire and asserts it).
+for point in after-intent:send:verdict after-intent:gate:challenger-timeout after-effect:gate:challenger-timeout; do
+  new_case "t2093-crash-${point//:/-}"
+  NO_CONTRACT=1 CRASH="$point" DEADLINE="$DL" campaign 7
+  timed_out "#2093(crash $point)"
+done
+
+# d) an owner's own HUMAN_DECISION is never pre-empted. Contract and synthesis
+#    land together, after the deadline, before the run has posted its root:
+#    the new pre-root check is the first thing that fire reaches, and it must
+#    defer to the verdict the owner wrote. (A guard, not a regression: main
+#    reaches this verdict too, because there the timeout sat below it.)
+new_case t2093-owner-verdict-wins
+claim "$DL"; wake_json
+step_ok 2026-09-18T10:00:00Z --poll-json "$C/wake.json"
+contract
+synthesis HUMAN_DECISION
+for now in 2026-09-18T10:30:00Z 2026-09-18T10:40:00Z; do inputs_from_fakes; step_ok "$now"; done
+[ ! -e "$R/challenger/disposition.md" ] || fail "#2093(d): precondition -- no disposition, so the timeout condition held"
+jr '[.[] | select(.kind=="verdict" and .slot=="validated") | .at] | first == "2026-09-18T10:30:00Z"' | grep -qx true \
+  || fail "#2093(d): precondition -- the verdict was taken on a fire past the deadline"
+[ "$(finish_verdict)" = '"HUMAN_DECISION"' ] \
+  || fail "#2093(d): the owner's HUMAN_DECISION was pre-empted by the deadline: $(finish_verdict)"
+jr '[.[] | select(.kind=="gate") | .slot] | unique == ["finish"]' | grep -qx true \
+  || fail "#2093(d): no challenger-timeout call at all: $(jr '[.[]|select(.kind=="gate")]')"
+
+# e) phase-dispatch route: the contract is written but the intake owner never
+#    settles, so intake returns on the done=True gate (_phase_owner_step).
+new_case t2093-intake-unsettled
+OWNER_DISPATCH=1 DEADLINE="$DL" campaign 6
+phase_waited "#2093(intake unsettled)" intake 2026-09-18T10:10:00Z
+timed_out "#2093(intake unsettled)"
+[ -e "$R/completion-contract.json" ] || fail "#2093(e): precondition -- the contract exists; the owner step is what never settles"
+
+# f) phase-dispatch: lanes evidence is complete but the lanes owner never
+#    settles. The old sites were all inside phases this return sits above.
+#    STALL=1 lands the markers a tick after the lanes owner is dispatched.
+DL=2026-09-18T10:45:00Z
+new_case t2093-lanes-unsettled
+OWNER_DISPATCH=1 SETTLE=intake NO_CHALLENGER=1 STALL=1 DEADLINE="$DL" campaign 7
+phase_waited "#2093(lanes unsettled)" lanes 2026-09-18T10:40:00Z
+timed_out "#2093(lanes unsettled)"
+[ -e "$R/markers/B1.json" ] || fail "#2093(f): precondition -- the lanes evidence is complete"
+
+# g) phase-dispatch: the preliminary is written but its owner never settles.
+new_case t2093-preliminary-unsettled
+OWNER_DISPATCH=1 SETTLE="intake lanes" NO_CHALLENGER=1 DEADLINE="$DL" campaign 7
+phase_waited "#2093(preliminary unsettled)" preliminary 2026-09-18T10:40:00Z
+timed_out "#2093(preliminary unsettled)"
+[ -e "$R/coordinator/preliminary.md" ] || fail "#2093(g): precondition -- the preliminary exists"
+unset STALL
+
+# --- PR #1066 closing review: "could not look" never concludes a run ----------
+# One fire where the controller cannot see what is on disk must never become a
+# verdict. Every case proves the run was briefed and really sat where it says
+# (the run tree is the controller's own), and that the fire in question
+# returned `blind` -- an outcome only the code under test produces -- before
+# asserting what did NOT happen.
+fire_at() { inputs_from_fakes; step_ok "$(tick_time "$1")" "${@:2}"; }
+ticks() { # from to: the world, then a fire, per tick
+  local n
+  for n in $(seq "$1" "$2"); do
+    world "$n"
+    if [ "$n" = 0 ]; then fire_at 0 --poll-json "$C/wake.json"; else fire_at "$n"; fi
+  done
+}
+run_phase() { jq -r --arg r "$RUN" '[.runs[] | select(.runId==$r) | .phase] | first' <<<"$STEP_OUT"; }
+briefed() { # label: the controller has written into the run dir -- its own proof it exists
+  jr '[.[] | select(.kind=="owner" and .slot=="intake") | .detail.briefedToken] | map(select(.)) | length > 0' \
+    | grep -qx true || fail "$1: precondition -- the intake brief is on disk (briefedToken journaled)"
+}
+held_blind() { # label at where: that fire returned blind, alarmed once, judged nothing
+  [ "$(run_phase)" = blind ] || fail "$1: the fire at $2 returned $(run_phase), not blind: $STEP_OUT"
+  dq '[.[] | select(.type=="wait" and .at=="'"$2"'" and .where=="'"$3"'")] | length == 1' | grep -qx true \
+    || fail "$1: one journaled wait at $2 naming $3: $(dq '[.[] | select(.at=="'"$2"'") | [.type,.reason,.where]]')"
+  jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:run-blind:"))) | .slot] | unique | length == 1' \
+    | grep -qx true || fail "$1: exactly one run-blind operator alarm"
+  jr '[.[] | select(.kind=="verdict")] | length == 0' | grep -qx true \
+    || fail "$1: a verdict was frozen from a fire that could not see: $(jr '[.[]|select(.kind=="verdict")]')"
+  jr '[.[] | select(.kind=="send" and .slot=="verdict")] | length == 0' | grep -qx true \
+    || fail "$1: a verdict was posted from a fire that could not see"
+  [ "$(jq -s '[.[] | select(.tool=="gate" and (.argv[0]=="finish" or .argv[0]=="challenger-timeout"))] | length' "$FAKE_LOG")" = 0 ] \
+    || fail "$1: a terminal gate verb was sent from a fire that could not see"
+}
+certified_go() { # label: the run, once visible again, certifies GO through finish
+  [ "$(finish_verdict)" = '"GO"' ] || fail "$1: the run did not certify GO once it could see: $(finish_verdict)"
+  jr '[.[] | select(.kind=="gate" and .state=="done") | .slot] == ["finish"]' | grep -qx true \
+    || fail "$1: GO goes through finish, once: $(jr '[.[]|select(.kind=="gate")]')"
+  [ "$(jq -r '.completedVerdict' "$C/state/pr-$PR-state.json")" = GO ] || fail "$1: the gate released the slot GO"
+  assert_once "$1"
+}
+
+# b9) the reviewer's probe: the challenger files at 10:50, the deadline is
+#     10:55, and the run directory is invisible to the controller for the one
+#     fire at 11:00. The run was briefed and its root posted, so a directory
+#     the controller wrote into and cannot find is blindness, never "not filed".
+#     main certifies GO; dcfbb93f published BLOCKED "no disposition by 10:55".
+DL=2026-09-18T10:55:00Z
+new_case blind-blip-after-deadline
+claim "$DL"; wake_json
+ticks 0 5
+[ -s "$R/challenger/disposition.md" ] || fail "b9: precondition -- the challenger filed at 10:50"
+briefed b9
+jr '[.[] | select(.kind=="send" and .slot=="root")] | length > 0' | grep -qx true \
+  || fail "b9: precondition -- the root was posted before the blip (the run is past intake)"
+[[ "$DL" < 2026-09-18T11:00:00Z ]] || fail "b9: test bug -- the blip fire must be past the deadline"
+world 6
+mv "$R" "$C/away"                                        # the mount blips for one fire
+fire_at 6
+mv "$C/away" "$R"
+held_blind b9 2026-09-18T11:00:00Z run-dir
+ticks 7 9
+certified_go b9
+
+# b10) the same blip BEFORE the deadline, mid-campaign: nothing to conclude, so
+#      only the run-dir guard in step_run can be what holds it -- without it the
+#      fire reads an unscaffolded run and routes it back to intake, silently.
+new_case blind-blip-mid-campaign
+claim; wake_json
+ticks 0 3
+briefed b10
+jr '[.[] | select(.kind=="send" and .slot=="root")] | length > 0' | grep -qx true \
+  || fail "b10: precondition -- the run is past its root post, so intake is behind it"
+world 4
+mv "$R" "$C/away"
+fire_at 4
+mv "$C/away" "$R"
+held_blind b10 2026-09-18T10:40:00Z run-dir
+dq '[.[] | select(.at=="2026-09-18T10:40:00Z" and (.phase=="intake" or .type=="wake_owner"))] | length == 0' | grep -qx true \
+  || fail "b10: the blind fire routed the run back to intake or woke an owner: $(dq '[.[]|select(.at=="2026-09-18T10:40:00Z")]')"
+ticks 5 8
+certified_go b10
+
+# b11) PARTIAL blindness at the verdict: the run directory is visible but one
+#      file the verdict reads cannot be opened (EACCES on the identity record,
+#      which GO requires, validate_synthesis). The ladder never reads it before
+#      the verdict, so only pre_finish's whole-tree sight can hold this fire;
+#      without it the unreadable record is "pair identity not ok" and GO is
+#      published BLOCKED.
+if [ "$(id -u)" = 0 ]; then
+  echo "b11/b14 SKIPPED: running as root, which ignores file modes -- EACCES cannot be simulated" >&2
+else
+  new_case blind-file-at-verdict
+  claim; wake_json
+  ticks 0 5
+  briefed b11
+  world 6
+  [ -s "$R/synthesis.json" ] && [ -s "$R/coordinator/identity-checks.ndjson" ] \
+    || fail "b11: precondition -- a GO synthesis and an ok identity record are on disk"
+  chmod 000 "$R/coordinator/identity-checks.ndjson"
+  fire_at 6
+  chmod 644 "$R/coordinator/identity-checks.ndjson"
+  held_blind b11 2026-09-18T11:00:00Z verdict
+  ticks 7 9
+  certified_go b11
+
+  # b14) a crashed critic dispatch whose start file exists but cannot be looked
+  #      at. Ambiguity is sticky and permits only BLOCKED, and it is concluded in
+  #      dispatch(), outside pre_finish -- so an unreadable start file must hold
+  #      the fire, never mark the one-shot ambiguous.
+  new_case blind-dispatch-started
+  claim; wake_json
+  world 0; fire_at 0 --poll-json "$C/wake.json"
+  world 1
+  inputs_from_fakes
+  SMOKE_CONTROLLER_CRASH_AT=after-intent:dispatch:critic step "$(tick_time 1)"
+  [ "$STEP_RC" = 137 ] || fail "b14: precondition -- the fire died between the dispatch intent and the create: rc=$STEP_RC $STEP_OUT"
+  fire_at 1
+  jr '[.[] | select(.kind=="dispatch" and .slot=="critic")] | last | .state == "intent"' | grep -qx true \
+    || fail "b14: precondition -- the critic dispatch is a bare intent (the crash window)"
+  briefed b14
+  world 2
+  printf 'started\n' >"$R/controller/dispatch-critic.started"   # the one-shot did start
+  chmod 000 "$R/controller"
+  fire_at 2
+  chmod 755 "$R/controller"
+  [ "$(run_phase)" = intake ] || fail "b14: the critic wait keeps the run in intake: $(run_phase)"
+  dq '[.[] | select(.type=="wait" and .at=="2026-09-18T10:20:00Z" and .where=="dispatch-started")] | length == 1' \
+    | grep -qx true || fail "b14: the unreadable start file was held as blind: $(dq '[.[] | select(.at=="2026-09-18T10:20:00Z") | [.type,.reason,.where]]')"
+  jr '[.[] | select(.kind=="dispatch" and .slot=="critic") | .detail.ambiguous] | map(select(.)) | length == 0' \
+    | grep -qx true || fail "b14: an unreadable start file marked the dispatch ambiguous"
+  jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:dispatch-ambiguous:")))] | length == 0' \
+    | grep -qx true || fail "b14: an unreadable start file raised dispatch-ambiguous"
+  jq -cn '{screens:[{screen:"checkout-390",grade:"OK",reason:"layout holds"}],notes:[]}' >"$R/contact-sheet/critic.json"
+  ticks 3 9
+  jr '[.[] | select(.kind=="dispatch" and .slot=="critic")] | last | .state == "done"' | grep -qx true \
+    || fail "b14: the critic dispatch settled from its evidence once visible"
+  [ "$(finish_verdict)" = '"GO"' ] || fail "b14: the run certifies GO: $(finish_verdict)"
+fi
+
+# b12) the other side of the line: a run the controller has NEVER written into
+#      and cannot find is absent, not blind -- its deadline had already passed
+#      at the first fire, so it times out as before. Reading every missing
+#      directory as blindness would hold this run forever.
+DL=2026-09-18T10:25:00Z
+new_case absent-never-briefed
+claim "$DL"; wake_json
+fire_at 3 --poll-json "$C/wake.json"
+fire_at 4; fire_at 5
+[ ! -e "$R" ] || fail "b12: precondition -- the controller never wrote into the run directory"
+timed_out "b12(never briefed)"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:run-blind:")))] | length == 0' | grep -qx true \
+  || fail "b12: a run with no directory the controller ever wrote is not a blind one"
+
+# b13) `lease-unavailable` (PR #1066 closing review, P3): the gate's lease
+#      fence cannot read the lease. A blind gate, for `finish` as much as for
+#      the timeout: retried, never failed_terminal, one gate-blind alarm, and the
+#      next fire finishes normally.
+new_case lease-unavailable-finish
+jq -cn '{"gate:finish":["refuse-code:lease-unavailable"]}' >"$C/fake/faults.json"
+FAULTY=1 campaign 9
+[ "$(jq -s '[.[] | select(.tool=="gate" and .op=="lease-unavailable")] | length' "$FAKE_LOG")" = 1 ] \
+  || fail "b13: precondition -- finish reached the gate and was refused lease-unavailable once: $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
+jr '[.[] | select(.kind=="gate" and .slot=="finish" and .state=="failed_terminal")] | length == 0' | grep -qx true \
+  || fail "b13: a lease the gate cannot read made finish un-reselectable (failed_terminal)"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-blind:"))) | .slot] | unique | length == 1' \
+  | grep -qx true || fail "b13: exactly one gate-blind operator alarm"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-refused:")))] | length == 0' | grep -qx true \
+  || fail "b13: a blind lease is not escalated as a permanent refusal"
+certified_go b13
+
+# The fake gate parses a deadline as the real one does (epoch_or_zero,
+# smoke-pr-gate.sh:166-173): unparsable has PASSED. smoke-pr-gate.test.sh §7d
+# asserts the real verb does the same.
+new_case fake-deadline-unparsable
+claim not-a-date
+SMOKE_GATE_CLAIMANT=controller python3 "$FAKES" gate challenger-timeout "$RUN" "$TOKEN" \
+  | jq -e '.ok == true' >/dev/null || fail "fake gate: an unparsable deadline is treated as passed, as the real gate treats it"
 
 echo "smoke campaign controller live tests passed"

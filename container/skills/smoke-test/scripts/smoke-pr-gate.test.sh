@@ -2270,6 +2270,69 @@ bash "$GATE" release run-stall-done owner-done >/dev/null
 stall_clear
 unset SMOKE_GATE_RUN_ROOT
 
+# --- 7d. challenger-timeout ends a run that never left intake (XZO #2093) ------
+# The controller now times a run out while it is still in intake -- no
+# completion contract, possibly no run directory at all (run pr2075). That
+# rests on the verb needing neither: it reads the claim, the deadline and the
+# ABSENCE of challenger/disposition.md under a readable run root, then runs the
+# ordinary finish BLOCKED. Asserted here against the real verb, not the fake.
+STALL_SHA="$(sha 3)"
+stalled_fixture 68 "$STALL_SHA"
+bash "$GATE" claim run-intake-dead 68 "$STALL_SHA" owner-intake | jq -e '.ok == true' >/dev/null
+[ ! -e "$SMOKE_GATE_RUN_ROOT/run-intake-dead" ] || { echo "7d: precondition - no run directory" >&2; exit 1; }
+# Before the deadline the verb refuses, so what follows is the deadline's doing.
+bash "$GATE" challenger-timeout run-intake-dead owner-intake | jq -e '
+  .ok == false and .refusal == "deadline-not-passed" and (.error | test("has not passed"))' >/dev/null \
+  || { echo "7d: challenger-timeout ended a run before its deadline" >&2; exit 1; }
+# Every precondition refusal carries its machine-readable code (the gate's code
+# table above the verb). The campaign controller keys on these codes, and the
+# controller tests' fake gate emits the same ones: asserted here against the
+# REAL verb so the two cannot drift apart unnoticed (PR #1066 rounds 1 and 3).
+set_pr68_deadline() {
+  jq -c --arg d "$1" '.challengerDeadline=$d' "$STATE_DIR/pr-68-state.json" > "$STATE_DIR/pr-68-state.tmp"
+  mv "$STATE_DIR/pr-68-state.tmp" "$STATE_DIR/pr-68-state.json"
+}
+timeout_refusal() { # <expected-code>: the verb refuses with exactly that code, slot untouched
+  local out
+  # Three of these refusals exit 2 (smoke-pr-gate.sh:4639,:4657,:4663): the
+  # code, not the exit status, is what is asserted.
+  out="$(bash "$GATE" challenger-timeout run-intake-dead owner-intake)" || true
+  jq -e --arg c "$1" '.ok == false and .refusal == $c' <<<"$out" >/dev/null \
+    || { echo "7d: expected refusal code $1, got: $out" >&2; exit 1; }
+  jq -e '.activeRunId == "run-intake-dead"' "$STATE_DIR/pr-68-state.json" >/dev/null \
+    || { echo "7d: a $1 refusal released the slot" >&2; exit 1; }
+}
+set_pr68_deadline ""
+timeout_refusal no-deadline
+set_pr68_deadline "2000-01-01T00:00:00Z"
+( unset SMOKE_GATE_RUN_ROOT; timeout_refusal run-root-unset )
+( export SMOKE_GATE_RUN_ROOT="$STATE_DIR/no-such-mount"; timeout_refusal run-root-unreadable )
+mkdir -p "$SMOKE_GATE_RUN_ROOT/run-intake-dead/challenger"
+echo "filed" > "$SMOKE_GATE_RUN_ROOT/run-intake-dead/challenger/disposition.md"
+timeout_refusal disposition-filed
+rm -rf "$SMOKE_GATE_RUN_ROOT/run-intake-dead"
+# An UNPARSABLE deadline has passed: epoch_or_zero reads a failed `date -d` as
+# epoch 0 (smoke-pr-gate.sh:166-173). The fake gate models exactly that (PR
+# #1066 closing review); a refusal from the run-root check, which comes after
+# the deadline check, proves the deadline did not stop it.
+set_pr68_deadline "not-a-date"
+( export SMOKE_GATE_RUN_ROOT="$STATE_DIR/no-such-mount"; timeout_refusal run-root-unreadable )
+set_pr68_deadline "2000-01-01T00:00:00Z"
+# `lease-unavailable`: the shared lease fence, which this verb and `finish`
+# both take, cannot read the lease (here: malformed). A "cannot look" the
+# controller retries and alarms on (GATE_REFUSALS), never a permanent refusal.
+LEASE68="$SMOKE_GATE_LEASE_DIR/lease-run-intake-dead.json"
+cp "$LEASE68" "$LEASE68.keep"
+printf '{' > "$LEASE68"
+timeout_refusal lease-unavailable
+mv "$LEASE68.keep" "$LEASE68"
+bash "$GATE" challenger-timeout run-intake-dead owner-intake | jq -e '
+  .ok == true and .verdict == "BLOCKED" and .challengerDisposition == "no-disposition"' >/dev/null \
+  || { echo "7d: challenger-timeout refused a contract-less run past its deadline" >&2; exit 1; }
+jq -e '.activeRunId == null and .completedRunId == "run-intake-dead" and .completedVerdict == "BLOCKED"' \
+  "$STATE_DIR/pr-68-state.json" >/dev/null || { echo "7d: the slot was not released BLOCKED" >&2; exit 1; }
+unset SMOKE_GATE_RUN_ROOT
+
 # --- 8. finish suspends the backend preview ---------------------------------
 fresh_state
 FINISH_SHA="$(sha 3)"
