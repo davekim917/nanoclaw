@@ -1661,8 +1661,8 @@ do its job without. Both used to stay in the controller's own journal.
   controller writes the real `smoke-evidence-barrier.sh` output to
   `<run>/controller/barrier-<step>.json` and deletes it once the phase passes
   (`smoke-campaign-controller.py:1977` `publish_barrier`, whose effect writes at
-  `:1401-1402` and unlinks on `doc is None` at `:1387-1395`), and every
-  barrier-backed brief names that file (`:1422-1445`). `invalid[]` is artifact
+  `:1436-1437` and unlinks on `doc is None` at `:1422-1430`), and every
+  barrier-backed brief names that file (`:1457-1480`). `invalid[]` is artifact
   CONTENT the barrier rejects; only the owner can repair it, and no amount of
   lane work clears it. Run `xzo-pr-pr2055-…` (XZO #2047) spent 67 minutes
   running lanes while the barrier had already named
@@ -1680,8 +1680,8 @@ do its job without. Both used to stay in the controller's own journal.
   fire published the new refusal and woke nobody. The trigger is a change in **the refusal** — `invalid[]` *and*
   `invalidReasons[]`, digested against what the brief was written under
   (`refusal_digest`, `smoke-campaign-controller.py:252`; recorded as
-  `briefedRefusal` at `:1340-1341`, carried forward at `:2493-2494`, compared by
-  `_reoffer_on_new_refusal` at `:2634`) — and
+  `briefedRefusal` at `:1375-1376`, carried forward at `:2540-2541`, compared by
+  `_reoffer_on_new_refusal` at `:2681`) — and
   deliberately neither of its neighbours: not "the published answer changed",
   which includes `missing[]` and would wake the owner on every marker it banks;
   and not "became invalid", which would leave an owner working against a

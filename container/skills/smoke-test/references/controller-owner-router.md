@@ -49,7 +49,7 @@ to the retained technical owner, verify its artifact receipt, and stop.
    the PR authority at `:5359` and the gate state at `:5402`), so the token you
    started with is then retired. The controller refreshes `wake.json` with
    every brief it writes (`smoke-campaign-controller.py:1363-1365`, in
-   `_owner_wake` at `:1273`), which is why the file is current and your own
+   `_owner_wake` at `:1308`), which is why the file is current and your own
    copy of its value is not (XZO #2046).
    - A brief headed **YOUR OWNER TOKEN CHANGED** means exactly that happened
      mid-step: the controller saw the step's `briefedToken` differ from the

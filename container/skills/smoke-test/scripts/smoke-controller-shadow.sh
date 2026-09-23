@@ -12,9 +12,9 @@
 #      nothing; anything else is refused;
 #   2. `init`s the controller journal ONCE per out-dir. The controller keeps one
 #      journal for every run (smoke-campaign-controller.py:288-377) and `init`
-#      refuses an existing one (:343-348). A sentinel records that init
+#      refuses an existing one (:349-354). A sentinel records that init
 #      happened, so a journal lost later is never re-created as empty -- the
-#      controller's `step` hard-errors on it instead (:320-321);
+#      controller's `step` hard-errors on it instead (:326-327);
 #   3. reads the gate's state files directly. `poll` is NOT side-effect-free:
 #      it claims the slot and writes pr-<n>-state.json before it wakes anyone
 #      (smoke-pr-gate.sh:5364-5374 via write_pr_state, :1380-1388). The state
@@ -30,7 +30,7 @@
 # Receipts are passed as `{}` on purpose. They are chat DELIVERY receipts keyed
 # key#attempt (smoke-campaign-controller.py:781-795), consulted only for an
 # `enqueued` send, and shadow never enqueues: a refused send is journaled
-# `done` at once (:796-800). There is no GitHub receipt input.
+# `done` at once (:831-835). There is no GitHub receipt input.
 #
 # Counterfactual hold (the replay's model, smoke-campaign-replay.py:425-428):
 # once the legacy coordinator finishes a run the shadow is tracking, the
@@ -96,10 +96,10 @@
 #     mailbox/sqlite/operations.ts:62). The reply is written with trigger=0,
 #     which never wakes the agent (src/cli/delivery-action.ts:78). In shadow
 #     the controller journals a dispatch intent (smoke-campaign-controller.py
-#     :870) and records the refused create as `enqueued` in the same fire
-#     (:878-885), so a bare intent survives only a step killed between those
+#     :905) and records the refused create as `enqueued` in the same fire
+#     (:913-920), so a bare intent survives only a step killed between those
 #     lines. The next fire's ncl read then finds no task (shadow creates
-#     none), the controller marks the intent ambiguous (:863-866), and ncl
+#     none), the controller marks the intent ambiguous (:898-901), and ncl
 #     never runs for it again: at most one ncl call per such crash.
 set -uo pipefail
 exec 3>&1 1>&2
@@ -161,7 +161,7 @@ TEST_HANG = os.environ.get("SMOKE_CONTROLLER_SHADOW_TEST_HANG", "")  # test-only
 # (smoke-controller-live-worker.py, same rule, same reason: XZO #2047, where a
 # hardcoded allowlist here dropped SMOKE_GATE_LEASE_DIR and the evidence
 # barrier this wrapper's controller step spawns
-# (smoke-campaign-controller.py:1454 -> spawn, :653-665, env=None) fell back to
+# (smoke-campaign-controller.py:1800 -> spawn, :692-704, env=None) fell back to
 # a lease dir holding no pin, smoke-evidence-barrier.sh:739). NOT_CONFIG is the
 # inverse: names that say how this process and its children RUN rather than
 # what the campaign IS. A name here is IGNORED, exactly as every name outside
