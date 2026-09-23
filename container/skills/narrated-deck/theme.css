@@ -1,0 +1,126 @@
+/*
+ * Slide theme for narrated decks. Every slide is a 1920x1080 page; the agent
+ * writes only the fragment inside <main class="slide">. Sizes are large on
+ * purpose: the slide is read on a phone while the voice carries the detail.
+ */
+:root {
+  --bg: #0e1116;
+  --panel: #171b23;
+  --line: #262c38;
+  --text: #f2f4f8;
+  --muted: #9aa3b5;
+  --accent: #7ea6ff;
+  --up: #3ecf8e;
+  --down: #ff6b6b;
+  --flat: #c9ced8;
+  --warn: #ffc15e;
+}
+body.theme-light {
+  --bg: #fbfbfc;
+  --panel: #f0f2f5;
+  --line: #dde1e8;
+  --text: #121620;
+  --muted: #5b6475;
+  --accent: #2f5fe0;
+  --up: #0f9d63;
+  --down: #d93636;
+  --flat: #4a5263;
+  --warn: #b7791f;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: 1920px; height: 1080px; overflow: hidden; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Inter", "Liberation Sans", "DejaVu Sans", Arial, sans-serif;
+  font-size: 40px;
+  line-height: 1.25;
+  -webkit-font-smoothing: antialiased;
+}
+
+.slide {
+  position: absolute;
+  inset: 0 0 72px 0;
+  padding: 88px 112px 40px;
+  display: flex;
+  flex-direction: column;
+  justify-content: safe center;
+  gap: 44px;
+  overflow: hidden;
+}
+footer {
+  position: absolute;
+  left: 112px; right: 112px; bottom: 0;
+  height: 72px;
+  display: flex; justify-content: space-between; align-items: center;
+  color: var(--muted);
+  font-size: 24px;
+  border-top: 2px solid var(--line);
+}
+
+/* Type */
+.kicker { font-size: 28px; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); font-weight: 700; }
+h1 { font-size: 72px; line-height: 1.08; font-weight: 800; letter-spacing: -.02em; }
+h2 { font-size: 52px; line-height: 1.12; font-weight: 750; }
+.lede { font-size: 44px; color: var(--muted); max-width: 1500px; }
+.muted { color: var(--muted); }
+.up { color: var(--up); }
+.down { color: var(--down); }
+.flat { color: var(--flat); }
+.warn { color: var(--warn); }
+.accent { color: var(--accent); }
+
+/* One huge statement: <div class="big"><div class="v">$4.2M</div><div class="l">gross revenue</div></div> */
+.big { display: flex; flex-direction: column; gap: 16px; }
+.big .v { font-size: 200px; font-weight: 800; line-height: 1; letter-spacing: -.03em; }
+.big .l { font-size: 48px; color: var(--muted); }
+
+/* KPI tiles: <div class="kpis"><div class="kpi"><div class="l">Gross</div><div class="v">$4.2M</div><div class="d down">-$0.1M vs forecast</div></div>…</div> */
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 32px; }
+.kpi { background: var(--panel); border: 2px solid var(--line); border-radius: 28px; padding: 40px 44px; display: flex; flex-direction: column; gap: 12px; }
+.kpi .l { font-size: 30px; color: var(--muted); font-weight: 600; }
+.kpi .v { font-size: 96px; font-weight: 800; line-height: 1; letter-spacing: -.02em; }
+.kpi .d { font-size: 32px; font-weight: 700; }
+
+/* Scannable table: <table class="scan"><thead><tr><th>Vertical</th><th class="n">vs plan</th></tr></thead><tbody>…</tbody></table> */
+table.scan { width: 100%; border-collapse: collapse; font-size: 40px; }
+table.scan th { text-align: left; font-size: 26px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); padding: 0 24px 20px; border-bottom: 3px solid var(--line); }
+table.scan td { padding: 26px 24px; border-bottom: 2px solid var(--line); }
+table.scan tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--panel) 60%, transparent); }
+table.scan .n { text-align: right; font-variant-numeric: tabular-nums; font-weight: 700; }
+table.scan tbody tr.hl td { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+
+/* Horizontal bars: <div class="bars"><div class="bar"><span class="l">Direct</span><span class="track"><i style="--w:72%"></i></span><span class="v up">+$130K</span></div>…</div> */
+.bars { display: flex; flex-direction: column; gap: 30px; }
+.bar { display: grid; grid-template-columns: 360px 1fr 260px; align-items: center; gap: 32px; }
+.bar .l { font-size: 38px; font-weight: 650; }
+.bar .track { height: 56px; background: var(--panel); border-radius: 14px; overflow: hidden; }
+.bar .track i { display: block; height: 100%; width: var(--w, 50%); background: var(--accent); border-radius: 14px; }
+.bar.up .track i { background: var(--up); }
+.bar.down .track i { background: var(--down); }
+.bar .v { font-size: 40px; font-weight: 800; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Callout box */
+.callout { background: var(--panel); border-left: 12px solid var(--accent); border-radius: 20px; padding: 40px 48px; font-size: 48px; font-weight: 650; line-height: 1.2; }
+.callout.down { border-left-color: var(--down); }
+.callout.up { border-left-color: var(--up); }
+.callout.warn { border-left-color: var(--warn); }
+
+/* Short list — three items at most */
+ul.points { list-style: none; display: flex; flex-direction: column; gap: 28px; }
+ul.points li { font-size: 46px; font-weight: 600; padding-left: 56px; position: relative; }
+ul.points li::before { content: ""; position: absolute; left: 0; top: .42em; width: 24px; height: 24px; border-radius: 50%; background: var(--accent); }
+
+/* Layout helpers */
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 56px; align-items: start; }
+.cols.wide-left { grid-template-columns: 3fr 2fr; }
+.row { display: flex; gap: 32px; align-items: center; flex-wrap: wrap; }
+.grow { flex: 1; }
+.tag { display: inline-block; font-size: 28px; font-weight: 700; padding: 10px 22px; border-radius: 999px; background: var(--panel); border: 2px solid var(--line); }
+.tag.up { color: var(--up); border-color: color-mix(in srgb, var(--up) 45%, transparent); }
+.tag.down { color: var(--down); border-color: color-mix(in srgb, var(--down) 45%, transparent); }
+svg { display: block; }
+
+/* Status modifiers on a component tint its accent only, never all its text. */
+.bar.up, .bar.down, .callout.up, .callout.down, .callout.warn, .kpi.up, .kpi.down { color: var(--text); }

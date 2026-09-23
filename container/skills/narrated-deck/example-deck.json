@@ -1,0 +1,27 @@
+{
+  "title": "Weekly business review — example",
+  "subtitle": "Illustrative numbers only",
+  "theme": "dark",
+  "slides": [
+    {
+      "label": "The headline",
+      "narration": "Here's the week in one line. Revenue came in at four point two million dollars, a little behind the forecast but ahead of plan. The miss is almost entirely one channel, and I'll show you which.",
+      "html": "<div class=\"kicker\">Week ending Sep 26</div><div class=\"big\"><div class=\"v\">$4.2M</div><div class=\"l\">gross revenue</div></div><div class=\"row\"><span class=\"tag down\">−$0.1M vs forecast</span><span class=\"tag up\">+$0.2M vs plan</span></div>"
+    },
+    {
+      "label": "By channel",
+      "narration": "Across the four channels, three are ahead. Direct leads at plus one hundred thirty thousand. Wholesale is the problem: down three hundred thousand, which is more than the whole company's miss.",
+      "html": "<div class=\"kicker\">By channel · vs forecast</div><h2>Three of four channels ahead</h2><div class=\"bars\"><div class=\"bar up\"><span class=\"l\">Direct</span><span class=\"track\"><i style=\"--w:43%\"></i></span><span class=\"v up\">+$130K</span></div><div class=\"bar up\"><span class=\"l\">Marketplace</span><span class=\"track\"><i style=\"--w:27%\"></i></span><span class=\"v up\">+$80K</span></div><div class=\"bar up\"><span class=\"l\">Retail</span><span class=\"track\"><i style=\"--w:10%\"></i></span><span class=\"v up\">+$30K</span></div><div class=\"bar down\"><span class=\"l\">Wholesale</span><span class=\"track\"><i style=\"--w:100%\"></i></span><span class=\"v down\">−$300K</span></div></div>"
+    },
+    {
+      "label": "The scorecard",
+      "narration": "Here's the scorecard. Read it by the right-hand column: green is ahead of forecast, red is behind. Wholesale is the only red row, and it's also our second-biggest channel, so it moves the total.",
+      "html": "<div class=\"kicker\">Scorecard</div><table class=\"scan\"><thead><tr><th>Channel</th><th class=\"n\">Revenue</th><th class=\"n\">vs forecast</th></tr></thead><tbody><tr><td>Direct</td><td class=\"n\">$1.9M</td><td class=\"n up\">+$130K</td></tr><tr><td>Marketplace</td><td class=\"n\">$0.8M</td><td class=\"n up\">+$80K</td></tr><tr><td>Retail</td><td class=\"n\">$0.3M</td><td class=\"n up\">+$30K</td></tr><tr class=\"hl\"><td>Wholesale</td><td class=\"n\">$1.2M</td><td class=\"n down\">−$300K</td></tr></tbody></table>"
+    },
+    {
+      "label": "What to decide",
+      "narration": "One decision for you this week. Wholesale's miss is a timing slip on one retail partner's order. The team wants to hold the forecast rather than cut it. If that order doesn't land by mid-October, we revisit.",
+      "html": "<div class=\"kicker\">Decision needed</div><div class=\"callout warn\">Hold the Wholesale forecast — the miss is one partner's order slipping, not lost demand.</div><ul class=\"points\"><li>Revisit if the order hasn't landed by Oct 15</li></ul>"
+    }
+  ]
+}

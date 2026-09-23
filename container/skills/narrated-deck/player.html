@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>__TITLE__</title>
+<style>
+  :root {
+    --bg: #07090c; --panel: #12161d; --line: #232a35; --text: #eef1f6; --muted: #8e97a8;
+    --accent: #7ea6ff; --accent-ink: #0b1020;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    min-height: 100vh; min-height: 100dvh;
+    display: flex; flex-direction: column; align-items: center;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    -webkit-tap-highlight-color: transparent;
+  }
+  .wrap { width: 100%; max-width: 1200px; padding: 12px 16px 24px; display: flex; flex-direction: column; gap: 12px; }
+  header h1 { font-size: 17px; margin: 4px 0 0; font-weight: 700; letter-spacing: -.01em; }
+  header p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+
+  .stage { position: relative; width: min(100%, calc((100dvh - 230px) * 16 / 9)); align-self: center; aspect-ratio: 16 / 9; background: #000; border-radius: 12px; overflow: hidden; cursor: pointer; }
+  .stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  .overlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(0,0,0,.35); transition: opacity .2s; }
+  .overlay.hidden { opacity: 0; pointer-events: none; }
+  .overlay span { width: 76px; height: 76px; border-radius: 50%; background: var(--accent); display: grid; place-items: center; box-shadow: 0 8px 30px rgba(0,0,0,.4); }
+  .overlay svg { width: 34px; height: 34px; fill: var(--accent-ink); margin-left: 4px; }
+
+  .timeline { display: flex; gap: 3px; height: 22px; align-items: center; cursor: pointer; touch-action: none; }
+  .seg { position: relative; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; flex-basis: 0; }
+  .seg i { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--accent); }
+  .seg.cur { height: 10px; }
+
+  .controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; min-height: 44px; min-width: 44px; padding: 0 12px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; cursor: pointer; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button svg { width: 22px; height: 22px; fill: currentColor; }
+  button.play { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); min-width: 56px; }
+  .time { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 13px; margin-left: 4px; }
+  .spacer { flex: 1; }
+  .speeds { display: flex; gap: 4px; }
+  .speeds button { min-width: 48px; padding: 0 8px; font-size: 14px; font-weight: 650; }
+  .speeds button[aria-pressed="true"] { background: var(--text); color: var(--bg); border-color: var(--text); }
+
+  .transcript { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .transcript .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 6px; }
+  .transcript p { margin: 0; font-size: 16px; line-height: 1.55; }
+  details.chapters { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+  details.chapters summary { cursor: pointer; padding: 12px 16px; color: var(--muted); font-size: 14px; }
+  details.chapters ol { margin: 0; padding: 0 8px 8px; list-style: none; }
+  details.chapters li button { width: 100%; justify-content: flex-start; background: transparent; border-color: transparent; text-align: left; min-height: 40px; }
+  details.chapters li button.cur { background: var(--bg); border-color: var(--line); }
+  details.chapters .n { color: var(--muted); width: 2.2em; flex: none; font-variant-numeric: tabular-nums; }
+  details.chapters .d { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  @media (max-width: 520px) {
+    .wrap { padding: 8px 12px 20px; }
+    .time { order: 5; width: 100%; margin: 0; }
+    .spacer { display: none; }
+    .speeds { width: 100%; }
+    .speeds button { flex: 1; }
+  }
+  @media (orientation: landscape) and (max-height: 520px) {
+    header, .transcript, details.chapters { display: none; }
+    .wrap { max-width: none; padding: 4px 12px; gap: 6px; }
+    .stage { width: 100%; aspect-ratio: auto; height: calc(100dvh - 96px); border-radius: 6px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1 id="title"></h1>
+    <p id="subtitle"></p>
+  </header>
+
+  <div class="stage" id="stage" role="button" aria-label="Play or pause">
+    <img id="slide" alt="">
+    <div class="overlay" id="overlay"><span><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></span></div>
+  </div>
+
+  <div class="timeline" id="timeline" aria-label="Seek"></div>
+
+  <div class="controls">
+    <button id="prev" aria-label="Previous slide"><svg viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/></svg></button>
+    <button id="play" class="play" aria-label="Play"><svg viewBox="0 0 24 24" id="playIcon"><path d="M8 5v14l11-7z"/></svg></button>
+    <button id="next" aria-label="Next slide"><svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg></button>
+    <span class="time" id="time">0:00 / 0:00</span>
+    <span class="spacer"></span>
+    <div class="speeds" id="speeds" role="group" aria-label="Playback speed"></div>
+  </div>
+
+  <section class="transcript" aria-live="polite">
+    <div class="label" id="slideLabel"></div>
+    <p id="narration"></p>
+  </section>
+
+  <details class="chapters">
+    <summary>All slides</summary>
+    <ol id="chapters"></ol>
+  </details>
+</div>
+
+<audio id="audio" preload="auto"></audio>
+
+<script id="deck-data" type="application/json">__DECK_JSON__</script>
+<script>
+(function () {
+  var deck = JSON.parse(document.getElementById('deck-data').textContent);
+  var SPEEDS = [1, 1.25, 1.5, 1.75, 2];
+  var PLAY = '<path d="M8 5v14l11-7z"/>';
+  var PAUSE = '<path d="M6 5h4v14H6zm8 0h4v14h-4z"/>';
+  var $ = function (id) { return document.getElementById(id); };
+  var audio = $('audio');
+  var slides = deck.slides;
+  var total = deck.duration;
+  var cur = -1;
+
+  function store(key, value) {
+    try { if (value === undefined) return localStorage.getItem(key); localStorage.setItem(key, value); } catch (e) { return null; }
+  }
+  function fmt(t) {
+    t = Math.max(0, Math.round(t));
+    return Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0');
+  }
+  function indexAt(t) {
+    for (var i = slides.length - 1; i >= 0; i--) if (t >= slides[i].start - 0.01) return i;
+    return 0;
+  }
+
+  $('title').textContent = deck.title;
+  document.title = deck.title;
+  if (deck.subtitle) $('subtitle').textContent = deck.subtitle; else $('subtitle').remove();
+  audio.src = deck.audio;
+  audio.preservesPitch = true;
+  audio.webkitPreservesPitch = true;
+
+  var segs = slides.map(function (s, i) {
+    var seg = document.createElement('div');
+    seg.className = 'seg';
+    seg.style.flexGrow = String(Math.max(0.5, s.end - s.start));
+    seg.appendChild(document.createElement('i'));
+    $('timeline').appendChild(seg);
+    return seg;
+  });
+
+  var chapterButtons = slides.map(function (s, i) {
+    var li = document.createElement('li');
+    var b = document.createElement('button');
+    b.innerHTML = '<span class="n"></span><span class="t"></span><span class="d"></span>';
+    b.querySelector('.n').textContent = (i + 1) + '.';
+    b.querySelector('.t').textContent = s.label;
+    b.querySelector('.d').textContent = fmt(s.start);
+    b.addEventListener('click', function () { seek(s.start + 0.02, true); });
+    li.appendChild(b);
+    $('chapters').appendChild(li);
+    return b;
+  });
+
+  function setSpeed(rate) {
+    audio.playbackRate = rate;
+    audio.defaultPlaybackRate = rate;
+    store('narrated-deck-speed', String(rate));
+    Array.prototype.forEach.call($('speeds').children, function (b) {
+      b.setAttribute('aria-pressed', String(Number(b.dataset.rate) === rate));
+    });
+  }
+  SPEEDS.forEach(function (rate) {
+    var b = document.createElement('button');
+    b.dataset.rate = String(rate);
+    b.textContent = rate + '×';
+    b.setAttribute('aria-label', 'Speed ' + rate + 'x');
+    b.addEventListener('click', function () { setSpeed(rate); });
+    $('speeds').appendChild(b);
+  });
+  var saved = Number(store('narrated-deck-speed'));
+  setSpeed(SPEEDS.indexOf(saved) >= 0 ? saved : 1);
+
+  function show(i) {
+    if (i === cur) return;
+    cur = i;
+    var s = slides[i];
+    $('slide').src = s.image;
+    $('slide').alt = s.label;
+    $('slideLabel').textContent = 'Slide ' + (i + 1) + ' of ' + slides.length;
+    $('narration').textContent = s.narration;
+    segs.forEach(function (seg, j) { seg.classList.toggle('cur', j === i); });
+    chapterButtons.forEach(function (b, j) { b.classList.toggle('cur', j === i); });
+    if ('mediaSession' in navigator && window.MediaMetadata) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: s.label, artist: deck.title,
+        artwork: [{ src: s.image, sizes: '1920x1080', type: s.image.slice(5, s.image.indexOf(';')) }]
+      });
+    }
+  }
+  function paint() {
+    var t = audio.currentTime;
+    var i = indexAt(t);
+    show(i);
+    segs.forEach(function (seg, j) {
+      var s = slides[j];
+      var p = t >= s.end ? 1 : t <= s.start ? 0 : (t - s.start) / (s.end - s.start);
+      seg.firstChild.style.width = (p * 100).toFixed(2) + '%';
+    });
+    $('time').textContent = fmt(t) + ' / ' + fmt(total) + (audio.playbackRate !== 1 ? '  ·  ' + fmt((total - t) / audio.playbackRate) + ' left' : '');
+  }
+  function seek(t, autoplay) {
+    audio.currentTime = Math.min(Math.max(0, t), total - 0.05);
+    paint();
+    if (autoplay && audio.paused) toggle();
+  }
+  function toggle() {
+    if (audio.paused) { var p = audio.play(); if (p && p.catch) p.catch(function () {}); }
+    else audio.pause();
+  }
+  function step(d) {
+    var i = indexAt(audio.currentTime);
+    // "Previous" restarts the current slide unless we are at its very start.
+    if (d < 0 && audio.currentTime - slides[i].start > 2) return seek(slides[i].start + 0.02);
+    var j = Math.min(slides.length - 1, Math.max(0, i + d));
+    seek(slides[j].start + 0.02);
+  }
+  function syncPlayState() {
+    var playing = !audio.paused;
+    $('playIcon').innerHTML = playing ? PAUSE : PLAY;
+    $('play').setAttribute('aria-label', playing ? 'Pause' : 'Play');
+    $('overlay').classList.toggle('hidden', playing);
+  }
+
+  audio.addEventListener('timeupdate', paint);
+  audio.addEventListener('seeked', paint);
+  audio.addEventListener('play', syncPlayState);
+  audio.addEventListener('pause', syncPlayState);
+  audio.addEventListener('ended', syncPlayState);
+  audio.addEventListener('ratechange', paint);
+  $('stage').addEventListener('click', toggle);
+  $('play').addEventListener('click', toggle);
+  $('prev').addEventListener('click', function () { step(-1); });
+  $('next').addEventListener('click', function () { step(1); });
+
+  function seekFromPointer(e) {
+    // Map through the segment widths so a tap lands where the eye expects.
+    for (var i = 0; i < segs.length; i++) {
+      var sr = segs[i].getBoundingClientRect();
+      if (e.clientX <= sr.right + 1.5 || i === segs.length - 1) {
+        var frac = Math.min(1, Math.max(0, (e.clientX - sr.left) / sr.width));
+        return seek(slides[i].start + frac * (slides[i].end - slides[i].start));
+      }
+    }
+  }
+  var dragging = false;
+  $('timeline').addEventListener('pointerdown', function (e) { dragging = true; $('timeline').setPointerCapture(e.pointerId); seekFromPointer(e); });
+  $('timeline').addEventListener('pointermove', function (e) { if (dragging) seekFromPointer(e); });
+  $('timeline').addEventListener('pointerup', function () { dragging = false; });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.target.tagName === 'INPUT') return;
+    if (e.key === ' ' || e.key === 'k') { e.preventDefault(); toggle(); }
+    else if (e.key === 'ArrowRight') step(1);
+    else if (e.key === 'ArrowLeft') step(-1);
+    else if (e.key === ']' || e.key === '>') setSpeed(SPEEDS[Math.min(SPEEDS.length - 1, SPEEDS.indexOf(audio.playbackRate) + 1)] || 1);
+    else if (e.key === '[' || e.key === '<') setSpeed(SPEEDS[Math.max(0, SPEEDS.indexOf(audio.playbackRate) - 1)] || 1);
+  });
+
+  if ('mediaSession' in navigator) {
+    var ms = navigator.mediaSession;
+    try {
+      ms.setActionHandler('play', function () { audio.play(); });
+      ms.setActionHandler('pause', function () { audio.pause(); });
+      ms.setActionHandler('previoustrack', function () { step(-1); });
+      ms.setActionHandler('nexttrack', function () { step(1); });
+      ms.setActionHandler('seekbackward', function () { seek(audio.currentTime - 10); });
+      ms.setActionHandler('seekforward', function () { seek(audio.currentTime + 10); });
+    } catch (e) {}
+  }
+
+  show(0);
+  paint();
+})();
+</script>
+</body>
+</html>
