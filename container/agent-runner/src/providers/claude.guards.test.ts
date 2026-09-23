@@ -19,6 +19,7 @@ import {
 import * as messagesOut from '../db/messages-out.js';
 import * as sessionRouting from '../db/session-routing.js';
 import * as deliveryAcks from '../db/delivery-acks.js';
+import { allowSubprocess, resetHermeticityAllowances } from '../test-hermeticity.js';
 
 // Fixture core paths — claude.ts resolves these via NANOCLAW_DESTRUCTIVE_GUARD_CORE
 // (block-destructive) and NANOCLAW_EMAIL_GATE_CORE (email).
@@ -1002,6 +1003,12 @@ describe('createEmailGateHook — one approval card per tool call', () => {
 describe('universal /dev/null stdin wrap', () => {
   let dir = '';
   const HANG_MS = 2_000;
+
+  // These tests exist to run the hook's output under a REAL bash, so they opt
+  // in. Bun's allowances are run-wide (test-hermeticity.ts:13-16), so grant per
+  // test and reset after, as review-churn-gate.test.ts does.
+  beforeEach(() => allowSubprocess(['bash']));
+  afterEach(() => resetHermeticityAllowances());
 
   beforeAll(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-stdin-wrap-'));
