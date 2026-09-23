@@ -33,7 +33,7 @@ The fakes mirror the real contracts the controller depends on:
            and records completedRunId/completedVerdictDigest; a repeated
            finish with the same facts resumes from verdict.json
            (smoke-pr-gate.sh:4001-4050). `challenger-timeout` checks the real
-           verb's preconditions in its order (:4631-4667): a stamped deadline,
+           verb's preconditions in its order (:4634-4670): a stamped deadline,
            passed by the WALL clock, a readable SMOKE_GATE_RUN_ROOT (the same
            variable the real gate reads, :1304), and no non-empty
            challenger/disposition.md under it.
@@ -41,11 +41,11 @@ The fakes mirror the real contracts the controller depends on:
            lists them one JSON object per line.
   ncl      `tasks create` returns {ok, data:{series_id}}; `tasks list` lists them.
 """
-import datetime
 import fcntl
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -278,6 +278,18 @@ def ncl(argv):
 
 
 # -- gate -----------------------------------------------------------------------
+def epoch_or_zero(value):
+    """smoke-pr-gate.sh epoch_or_zero (:166-173), verbatim in behaviour:
+    `date -u -d "$value" +%s`, and 0 for an empty value or a failed parse."""
+    if not value or value == "null":
+        return 0
+    try:
+        r = subprocess.run(["date", "-u", "-d", value, "+%s"], capture_output=True, text=True, timeout=10)
+        return int(r.stdout.strip()) if r.returncode == 0 else 0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+
+
 def gate(argv):
     gs = os.environ["FAKE_GATE_STATE"]
     verb = argv[0]
@@ -323,7 +335,7 @@ def gate(argv):
                 return "verdict-conflict", out({"ok": False, "error": "a different verdict is already recorded"}, 2)
             # Only `finish` answers a completed run idempotently
             # (smoke-pr-gate.sh:4017-4025); `challenger-timeout` looks for the
-            # active slot first and has no such shortcut (:4606-4623), so a
+            # active slot first and has no such shortcut (:4609-4626), so a
             # completed run falls through to not-active below.
             for _, other in states():
                 if verb == "finish" and other.get("completedRunId") == run and other.get("activeRunId") != run:
@@ -344,22 +356,24 @@ def gate(argv):
             return "progress", out({"ok": True, "runId": run})
         if verb == "challenger-timeout":
             # The real verb's own preconditions, in its order
-            # (smoke-pr-gate.sh:4631-4667), each with the SAME machine-readable
-            # `refusal` code the real gate emits (its code table, :4589-4597;
+            # (smoke-pr-gate.sh:4634-4670), each with the SAME machine-readable
+            # `refusal` code the real gate emits (its code table, :4589-4600;
             # smoke-pr-gate.test.sh §7d asserts the real gate emits each one, so
             # the two cannot drift apart silently). Before these were modelled,
             # a controller that sent `challenger-timeout` after a disposition
             # had landed was answered ok here and REFUSED by the real gate
-            # (:4662-4667) -- the wedge PR #1066 round 1 found.
+            # (:4665-4670) -- the wedge PR #1066 round 1 found.
             deadline = st.get("challengerDeadline") or ""
             if not deadline:
                 return "no-deadline", out({"ok": False, "refusal": "no-deadline",
                                            "error": "this run has no challengerDeadline -- it was claimed before "
                                                     "deadlines were stamped, so there is nothing to time out."}, 2)
-            # Wall clock, as the real verb uses `date -u +%s` (:4638), not the
-            # controller's --now.
-            dl = datetime.datetime.strptime(deadline, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-            if dl > datetime.datetime.now(datetime.timezone.utc):
+            # Wall clock, as the real verb uses `date -u +%s` (:4641), not the
+            # controller's --now; and the deadline parsed exactly as the real
+            # verb parses it, with epoch_or_zero (:166-173) -- `date -u -d`,
+            # whose failure reads as epoch 0, so an unparsable deadline has
+            # PASSED. A strict parse here would raise where the gate times out.
+            if epoch_or_zero(deadline) - int(time.time()) > 0:
                 return "deadline-not-passed", out({"ok": False, "refusal": "deadline-not-passed",
                                                    "error": "the challenger deadline has not passed -- keep waiting"})
             root = os.environ.get("SMOKE_GATE_RUN_ROOT", "")
@@ -377,7 +391,7 @@ def gate(argv):
                 os.makedirs(os.path.dirname(disp), exist_ok=True)
                 with open(disp, "w") as fh:
                     fh.write("filed during the gate call\n")
-            try:  # `[ -s ]` (:4663): stat THROUGH symlinks, any file type, size > 0
+            try:  # `[ -s ]` (:4666): stat THROUGH symlinks, any file type, size > 0
                 filed = os.stat(disp).st_size > 0
             except OSError:
                 filed = False

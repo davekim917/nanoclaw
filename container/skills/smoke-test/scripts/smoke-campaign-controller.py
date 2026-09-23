@@ -123,21 +123,24 @@ BUDGET_PER_FINGERPRINT = 2
 # "unknown", a malformed gate artifact, an unforeseen exception -- is a silent
 # failure, and the boundary below alarms on it. A new phase is added HERE; a
 # path that forgets to alarm is caught rather than lost.
-STEP_OUTCOMES = frozenset((None, "released", "held", "intake", "lanes", "preliminary",
+STEP_OUTCOMES = frozenset((None, "released", "held", "blind", "intake", "lanes", "preliminary",
                            "await_challenger", "synthesis", "verdict", "finished"))
 TERMINAL_VERBS = ("finish", "challenger-timeout")
-# What each machine-readable `challenger-timeout` refusal code means
-# (smoke-pr-gate.sh, the code table above the verb). A code absent from this
-# table -- including none at all -- is treated as permanent and escalated,
-# never guessed toward a publish.
+# What each machine-readable gate refusal code means (smoke-pr-gate.sh: the
+# `challenger-timeout` code table above that verb, and `lease-unavailable`,
+# which the shared lease fence emits for every lifecycle verb). A code absent
+# from this table -- including none at all -- is treated as permanent and
+# escalated, never guessed toward a publish; only `blind` applies to a verb
+# other than `challenger-timeout` (gate_verb).
 #   premise-false  the challenger filed: publish the frozen BLOCKED via finish
-#   blind          the gate cannot look: retry the timeout, alarm a human
+#   blind          the gate cannot look: retry the verb, alarm a human
 #   wait           the gate's clock has not reached the deadline: retry
 #   permanent      this run cannot be timed out: escalate, publish nothing
-TIMEOUT_REFUSALS = {
+GATE_REFUSALS = {
     "disposition-filed": "premise-false",
     "run-root-unset": "blind",
     "run-root-unreadable": "blind",
+    "lease-unavailable": "blind",
     "deadline-not-passed": "wait",
     "no-deadline": "permanent",
 }
@@ -757,7 +760,10 @@ ALARM_WORDS = {
     "controller_verdict_superseded": "a GO no longer holds, so the run finishes BLOCKED",
     "controller_gh_failed": "a GitHub write failed",
     "controller_gate_refused": "the gate refused a terminal verb",
-    "controller_gate_blind": "the gate cannot read the run root, so it cannot time this run out; fix the mount",
+    "controller_gate_blind": ("the gate cannot read its run root or its lease directory, so it cannot act on "
+                              "this run; fix the mount"),
+    "controller_run_blind": ("the controller cannot see this run's directory, so it judges nothing until it can; "
+                             "check the mount and --run-root"),
     "controller_no_authority": "this run's claim token is not held by the controller",
     "controller_dispatch_failed": "a judgment task could not be created",
     "controller_foreign_finish": "someone other than the controller finished this run",
@@ -1227,7 +1233,7 @@ class EffectLayer:
             # verdict / release and settles it.
             return {"outcome": "unknown", "error": error[:300]}
         # The machine-readable refusal code, when the verb gives one
-        # (challenger-timeout's preconditions, smoke-pr-gate.sh:4589-4597).
+        # (challenger-timeout's preconditions, smoke-pr-gate.sh:4589-4600).
         # Never parsed out of the prose.
         refusal = doc.get("refusal") if isinstance(doc.get("refusal"), str) else None
         return {"outcome": "refused", "error": error[:300], "refusal": refusal}
@@ -1285,8 +1291,8 @@ class EffectLayer:
         # intake brief says so in as many words ("use its coordinatorOwnerToken
         # as SMOKE_GATE_OWNER for every smoke-run-scaffold.sh writer"). But the
         # gate mints a FRESH token on every same-run recovery poll
-        # (smoke-pr-gate.sh:5322, written to lease/authority/state at :5351,
-        # :5356, :5399), and reconcile_claims records the new one the wake
+        # (smoke-pr-gate.sh:5325, written to lease/authority/state at :5354,
+        # :5359, :5402), and reconcile_claims records the new one the wake
         # carries. Writing wake.json only at intake left the run tree naming a
         # RETIRED token while the brief still told the owner to use it: every
         # scaffold write, and `adopt` -- the verb that exists for exactly this
@@ -1299,14 +1305,14 @@ class EffectLayer:
         # AN ACK NEVER OUTLIVES THE BRIEF IT ACKNOWLEDGED. The ack is the
         # owner's first act on a wake and the controller only tests it for
         # existence, re-offering a wake solely while it is ABSENT (owner_step,
-        # :2395-2405); the renewer reads it the same way
+        # :2500-2510); the renewer reads it the same way
         # (smoke-controller-renew.sh, "brief-<step>.ack absent: no owner turn
         # holds this step"). So a brief rewritten under a NEW owner token would
         # otherwise inherit the previous brief's ack and be treated as taken,
         # and never re-offered -- the second half of XZO #2046. Removing it here
         # makes that impossible by construction rather than by sequencing: this
         # function runs only when the obligation is absent or `intent`
-        # (owner_step, :2372), never while a live brief is enqueued, so any ack
+        # (owner_step, :2477), never while a live brief is enqueued, so any ack
         # it finds belongs to a brief this write supersedes.
         try:
             dfd = _open_dir_contained(root, [run_id, "controller"], True)
@@ -1548,7 +1554,7 @@ class GateView:
             run = st.get("activeRunId")
             if run:
                 # activeLeaseOwner is the claim's owner token (poll writes it
-                # with the slot, smoke-pr-gate.sh:5372-5376); live reads it
+                # with the slot, smoke-pr-gate.sh:5375-5379); live reads it
                 # only to recover a claim whose wake was lost.
                 out[run] = {"pr": pr, "sha": st.get("activeSha"), "deadline": st.get("challengerDeadline"),
                             "disposition": st.get("challengerDisposition"), "owner": st.get("activeLeaseOwner"),
@@ -1624,6 +1630,92 @@ class RunView:
 
     def has(self, rel):
         return self.exists and nonempty_file(self.path(rel))
+
+    # THREE-VALUED READS (XZO #2093, PR #1066's closing review). `exists`,
+    # has() and nonempty_file answer False both for "not there" and for "could
+    # not look", and nothing may be CONCLUDED from the second: one fire where
+    # the run dir was invisible (a mount blip, EACCES, a mis-pointed
+    # --run-root) timed a run out BLOCKED "no disposition" over a disposition
+    # that was on disk. The two-valued reads stay for everything that only
+    # WAITS on a False (a later fire looks again); what can conclude is gated
+    # by these -- see Controller._hold_blind for where each one is enforced.
+
+    def visibility(self, expected):
+        """present | absent | blind for the run directory itself.
+
+        `expected` is the controller's own proof that the directory exists: it
+        wrote a brief into it (Controller._run_dir_expected). ENOENT under a
+        readable run root is `absent` only without that proof; every other
+        failure to look -- the root unreadable, EACCES, not a directory -- and
+        ENOENT for a directory the controller itself wrote into are `blind`."""
+        if not self.dir:
+            return "absent"
+        try:
+            st = os.stat(self.dir)
+        except FileNotFoundError:
+            root = os.path.dirname(self.dir)
+            if not (os.path.isdir(root) and os.access(root, os.R_OK | os.X_OK)):
+                return "blind"
+            return "blind" if expected else "absent"
+        except OSError:
+            return "blind"
+        if not stat.S_ISDIR(st.st_mode) or not os.access(self.dir, os.R_OK | os.X_OK):
+            return "blind"
+        return "present"
+
+    def file_state(self, rel):
+        """present | absent | blind for one file in a run directory already
+        known visible. `present` has exactly has()'s meaning (a regular,
+        non-symlinked, non-empty file -- a link is never evidence,
+        nonempty_file); `absent` is a POSITIVE observation that there is none;
+        any other failure to look (EACCES on a parent, EIO) is `blind`."""
+        try:
+            st = os.lstat(self.path(rel))
+        except FileNotFoundError:
+            return "absent"
+        except OSError:
+            return "blind"
+        return "present" if stat.S_ISREG(st.st_mode) and st.st_size > 0 else "absent"
+
+    def sight(self, expected):
+        """(present | absent | blind, detail) for the WHOLE run tree: the one
+        answer every verdict is gated on (Controller.pre_finish). A verdict
+        reads the contract, synthesis.json, the identity record, the lane
+        markers, the disposition and whatever the barrier walks, and each of
+        those reads turns "could not look" into a failed check or a missing
+        disposition; gating every one of them at its own site is the pattern
+        that produced this bug four times. Instead a run is `present` only when
+        its directory is visible and every directory in it can be listed and
+        every regular file in it opened. Symlinks are not followed (never
+        evidence). An entry that vanishes mid-walk is an atomic replace, not
+        blindness. Live PR runs are a few hundred files (the largest recent
+        one, pr2045, 674 files in 45 directories), so the walk is cheap."""
+        seen = self.visibility(expected)
+        if seen != "present":
+            return seen, {"path": self.dir}
+        stack = [self.dir]
+        while stack:
+            d = stack.pop()
+            try:
+                entries = list(os.scandir(d))
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                return "blind", {"path": d, "error": str(exc)[:200]}
+            for ent in entries:
+                try:
+                    if ent.is_dir(follow_symlinks=False):
+                        stack.append(ent.path)
+                        continue
+                    if not ent.is_file(follow_symlinks=False):
+                        continue
+                    fd = os.open(ent.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    os.close(fd)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    return "blind", {"path": ent.path, "error": str(exc)[:200]}
+        return "present", {}
 
     def isdir(self, rel):
         return self.exists and os.path.isdir(self.path(rel))
@@ -2135,10 +2227,10 @@ class Controller:
         # Both terminal verbs are crash-safe on retry: `finish` holds a
         # finishIntent and writes verdict.json once (smoke-pr-gate.sh:4147-4160),
         # and `challenger-timeout` answers "not the active run" once the slot
-        # is gone (:4606-4623), which _gate reads as unknown -- so an intent
-        # with no recorded outcome is simply re-offered. How a REFUSAL of
-        # `challenger-timeout` is recorded depends on its code: see
-        # TIMEOUT_REFUSALS and the refused branch below.
+        # is gone (:4609-4626), which _gate reads as unknown -- so an intent
+        # with no recorded outcome is simply re-offered. How a REFUSAL is
+        # recorded depends on its code: see GATE_REFUSALS and the refused
+        # branch below.
         result = self.effects.perform({"type": "gate", "runId": run_id, "verb": effect_verb or verb,
                                        "args": argv_tail})
         self.decide(run_id, phase, "gate", "mechanical", "obligation due", verb=verb, args=argv_tail,
@@ -2154,7 +2246,12 @@ class Controller:
             return "done"
         if result["outcome"] == "refused":
             code = result.get("refusal")
-            meaning = TIMEOUT_REFUSALS.get(code) if verb == "challenger-timeout" else None
+            meaning = GATE_REFUSALS.get(code)
+            if verb != "challenger-timeout" and meaning != "blind":
+                # Only the lease fence's code applies to every lifecycle verb;
+                # the rest are challenger-timeout's own preconditions, and one
+                # on any other verb is a gate this controller does not know.
+                meaning = None
             if meaning in ("blind", "wait"):
                 # NOT a refusal to act on: the gate could not look, or its clock
                 # has not reached the deadline yet. The verb stays open (intent)
@@ -2162,19 +2259,20 @@ class Controller:
                 # make it un-reselectable, and falling back to `finish` would
                 # publish a verdict nobody proved -- a run-root fault is an
                 # install fault, never evidence that nothing was filed
-                # (smoke-pr-gate.sh:4646-4649). A blind gate is a human's to fix:
+                # (smoke-pr-gate.sh:4649-4652), and neither is a lease directory
+                # or lock the gate cannot open. A blind gate is a human's to fix:
                 # one alarm, deduped on the run and verb. There is deliberately
                 # no retry ceiling: the only things a ceiling could do are
                 # publish an unproven BLOCKED or abandon the slot, and the run
                 # is not silent meanwhile -- this alarm, plus the gate's own
                 # overrun alarm, which re-arms on an interval for a run that
-                # keeps holding its slot (smoke-pr-gate.sh:5043-5058).
+                # keeps holding its slot (smoke-pr-gate.sh:5046-5061).
                 if meaning == "blind":
                     self.ensure_alarm(run_id, "controller_gate_blind", "gate-blind:{}".format(key[:12]),
                                       {"verb": verb, "refusal": code, "error": result.get("error")})
                 self.record(run_id, "gate", verb, "intent", 1, {"outcome": "refused-transient", "refusal": code,
                                                                "error": result.get("error")})
-                self.decide(run_id, phase, "wait", "wait", "gate could not act on the timeout yet; retried",
+                self.decide(run_id, phase, "wait", "wait", "gate could not act on this verb yet; retried",
                             verb=verb, refusal=code)
                 return "intent"
             if meaning == "premise-false":
@@ -2225,7 +2323,14 @@ class Controller:
             # A bare intent means the fire died between journaling it and
             # recording the create's outcome (see the enqueued record below).
             live = [t for t in self.tasks if isinstance(t, dict) and (t.get("name") or "").startswith(slug)]
-            if live or run.has(started_rel):
+            started = run.file_state(started_rel) if run.exists else "absent"
+            if not live and started == "blind":
+                # Ambiguity is sticky and permits only BLOCKED (pre_finish), and
+                # it is concluded here, outside pre_finish's sight check: a start
+                # file the controller cannot look at is never evidence that the
+                # one-shot did not start.
+                return self._hold_blind(run_id, phase, "dispatch-started", {"path": run.path(started_rel)})
+            if live or started == "present":
                 self.record(run_id, "dispatch", slot, "enqueued", 1, {
                     "taskId": live[0].get("id") if live else None, "reconciled": True,
                     "via": "task" if live else started_rel})
@@ -2414,7 +2519,7 @@ class Controller:
                 # There is no timeout verdict for a silent owner (the spec's
                 # only timeout is the challenger's); resume vs abandon is the
                 # same human call the gate's pr_run_stalled asks for
-                # (smoke-pr-gate.sh:4785-4805), so it is counted as one.
+                # (smoke-pr-gate.sh:4788-4808), so it is counted as one.
                 self.decide(run_id, phase, "escalate", "coordination_model", "owner step overdue", step=step)
         self.decide(run_id, phase, "wait", "wait", "owner step in progress", step=step)
         return "intent"
@@ -2536,7 +2641,7 @@ class Controller:
         then the owner writes evidence the barrier rejects. The next fire
         publishes the new refusal and returns `ownerWake: null`, because
         owner_step re-offers a wake only while the `.ack` is ABSENT
-        (:2334-2344). The diagnosis is on disk and nobody is told to read it --
+        (:2500-2510). The diagnosis is on disk and nobody is told to read it --
         the same dead end, reached the way run pr2055 actually reached it.
 
         THE TRIGGER IS A CHANGE IN THE REFUSAL, NOT "INVALID". Narrower than
@@ -2551,7 +2656,7 @@ class Controller:
         fire exactly like `briefedToken`: a crash between the publish and the
         re-offer leaves the next fire owing the same re-offer. Re-offering does
         not extend the step's SLA -- owner_step measures from `history[0]`
-        (:2345) -- so a run that keeps producing invalid evidence still ends at
+        (:2511) -- so a run that keeps producing invalid evidence still ends at
         the overdue path rather than being woken forever."""
         ob = self.obligations().get(obligation_key(run_id, "owner", step))
         if not ob or ob["state"] not in ("intent", "enqueued"):
@@ -2751,7 +2856,7 @@ class Controller:
         controller's progress stamps keep the gate's stale-run detection
         quiet. Never a resend: the obligation keeps its message id. (The
         gate's pr_run_overrun fires on claim AGE whatever the stamps say,
-        smoke-pr-gate.sh:5035-5058: the run-level backstop.)"""
+        smoke-pr-gate.sh:5038-5061: the run-level backstop.)"""
         obs = self.obligations()
         for ob in list(obs.values()):
             if ob["runId"] != run_id or ob["kind"] not in PRE_FINISH_KINDS or ob["slot"] in POST_FINISH_SLOTS:
@@ -2802,6 +2907,54 @@ class Controller:
         self.ensure_alarm(run_id, "controller_step_failed",
                           "{}:{}".format(cause, run_id[-24:]), detail)
         return phase
+
+    def _run_dir_expected(self, run_id):
+        """The controller's own proof that <run> exists, so that not finding it
+        means the controller cannot see it rather than that nobody wrote it.
+
+        An owner step records `brief_written`/`admitted`/`briefedToken`/
+        `dispatchIntent` only once <run>/controller/brief-<step>.md is on disk
+        (_owner_wake writes the brief before either route records anything,
+        :1332 and :1351; owner_step journals it after the effect returns,
+        :2485-2495) -- a bare `intent` is deliberately NOT proof, since a fire
+        can die before the brief lands. A `send:root` obligation is proof too:
+        the root is posted only from a readable completion contract (step_run's
+        ladder). Shadow owner steps (`shadow_refused`) write nothing and are
+        not proof."""
+        for ob in self.obligations().values():
+            if ob["runId"] != run_id:
+                continue
+            if ob["kind"] == "send" and ob["slot"] == "root":
+                return True
+            d = ob.get("detail") or {}
+            if ob["kind"] == "owner" and (d.get("outcome") in ("brief_written", "admitted") or
+                                          d.get("briefedToken") or d.get("dispatchIntent")):
+                return True
+        return False
+
+    def _hold_blind(self, run_id, phase, where, detail):
+        """The ONE way a run the controller cannot see is handled: one alarm
+        (deduped on the run), a journaled wait, and nothing concluded, frozen,
+        posted or sent to the gate. A later fire that can see decides from
+        what is actually there.
+
+        Where it is enforced, and why each is needed:
+          - step_run, every fire (`run-dir`): the run directory itself. Before
+            this the ladder read an invisible directory as a run that had never
+            been scaffolded, and routed a run in any phase back through the
+            pre-root timeout (the PR #1066 closing-review P1).
+          - pre_finish (`verdict`): the whole run tree (RunView.sight), because
+            every verdict -- the timeout, an owner's early BLOCKED, the
+            validated synthesis, a frozen verdict's replay, the overdue
+            safety net -- is concluded there and nowhere else.
+          - dispatch (`dispatch-started`): a crashed dispatch intent is judged
+            ambiguous (sticky, and it permits only BLOCKED) from its start file
+            being absent, outside the pre_finish funnel."""
+        self.ensure_alarm(run_id, "controller_run_blind", "run-blind:{}".format(run_id[-40:]),
+                          dict(detail, where=where))
+        self.decide(run_id, phase, "wait", "wait", "run directory not fully visible: nothing is judged until it is",
+                    where=where, **{k: v for k, v in detail.items() if k in ("path", "error")})
+        return "blind"
 
     def step_run(self, run_id):
         obs = self.obligations()
@@ -2870,6 +3023,23 @@ class Controller:
             if ka and not ka.get("ok"):
                 self.decide(run_id, None, "log", "mechanical", "progress stamp failed", error=ka.get("error"))
 
+        # A directory the controller has written into but cannot see now is a
+        # fault, never an unscaffolded run: held before anything below can read
+        # it, write into it (the token re-issue writes briefs) or route it
+        # (_hold_blind). The claim was kept alive above, so the run keeps its
+        # slot while a human fixes the mount.
+        expected = self._run_dir_expected(run_id)
+        seen = run.visibility(expected)
+        if seen != "blind" and (seen == "present") != run.exists:
+            # The directory changed between the view's construction and this
+            # look (an owner scaffolding it mid-fire, or a blip ending): the
+            # cached view is stale in a direction nothing may judge from, so
+            # it is read again rather than alarmed on.
+            run = RunView(self.args.run_root, run_id)
+            seen = run.visibility(expected)
+        if seen == "blind":
+            return self._hold_blind(run_id, None, "run-dir", {"path": run.dir})
+
         # Checked EVERY fire, before any owner_step can run, against the token
         # _authority has just proved is the gate's. Not on the poll-reclaim
         # edge: see _reissue_owner_token.
@@ -2890,15 +3060,18 @@ class Controller:
         # unreadable, where intake returns before the root post on every fire
         # anyway), because the root post is driven to its receipt only on the
         # fires that reach it below: past that point the check lives with the
-        # lanes phase, after the root post, as it always has.
-        if not run.exists or run.contract_error or \
+        # lanes phase, after the root post, as it always has. `seen` is never
+        # `blind` here (held above), so a run with no directory is one the
+        # controller has never written into -- never briefed -- and not one
+        # it merely cannot see this fire.
+        if seen != "present" or run.contract_error or \
                 obligation_key(run_id, "send", "root") not in self.obligations():
             ended = self._terminal_before_root(run_id, claim, run, pr)
             if ended:
                 return ended
-        if not run.exists or run.contract_error:
+        if seen != "present" or run.contract_error:
             self.owner_step(run_id, "intake", "intake", done=False)
-            if run.exists and run.contract_error not in ("missing",):
+            if seen == "present" and run.contract_error not in ("missing",):
                 self.decide(run_id, "intake", "escalate", "coordination_model",
                             "completion contract unreadable: {}".format(run.contract_error))
             return "intake"
@@ -3002,8 +3175,8 @@ class Controller:
                 # THE OWNER IS WOKEN HERE, not only once the barrier passes.
                 # By this point every OTHER party's contribution the synthesis
                 # barrier checks has already been gated above: the lanes
-                # barrier is ready (:2969), coordinator/preliminary.md exists
-                # (:2986) and challenger/disposition.md exists (:2992). What
+                # barrier is ready (:3142), coordinator/preliminary.md exists
+                # (:3159) and challenger/disposition.md exists (:3165). What
                 # the synthesis barrier can still report is therefore the
                 # retained owner's -- `invalid[]` content it authored
                 # (journeys/scope-dispositions.json, or
@@ -3015,7 +3188,7 @@ class Controller:
                 # alone (smoke-controller-live.sh:168-175), so nobody was told;
                 # and _maybe_synthesis_overdue_blocked needs the very
                 # owner:synthesis obligation this branch declined to create
-                # (:3074-3076), so the terminal BLOCKED safety net could not
+                # (:3247-3249), so the terminal BLOCKED safety net could not
                 # fire either. This is the same blind spot as the lanes barrier
                 # (XZO #2047), on the sibling path.
                 timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)
@@ -3117,7 +3290,7 @@ class Controller:
            ladder ("An owner may conclude ..." below) and is never pre-empted
            by a timeout -- but only where the ladder can reach it, which needs
            a readable contract: validate_synthesis binds its sourceSha to the
-           contract's (:1700-1707), so without one it could only be BLOCKED.
+           contract's (:1812-1819), so without one it could only be BLOCKED.
         3. The challenger deadline itself."""
         vob = self.obligations().get(obligation_key(run_id, "verdict", "validated"))
         if vob and vob["state"] == "done" and vob["detail"].get("verdict") != "GO":
@@ -3130,16 +3303,31 @@ class Controller:
 
     def _maybe_challenger_timeout(self, run_id, claim, run):
         deadline = parse_iso(claim.get("deadline"))
+        # has() is False for "could not look" too; that is safe ONLY because
+        # the timeout concludes through pre_finish, which holds any run whose
+        # tree it cannot fully read before freezing or posting anything.
         if not deadline or self.now < deadline or run.has("challenger/disposition.md"):
             return None
         # `challenger-timeout` IS the terminal verb: it records no-disposition
-        # and runs `finish ... BLOCKED` itself (smoke-pr-gate.sh:4670-4676), so
+        # and runs `finish ... BLOCKED` itself (smoke-pr-gate.sh:4673-4679), so
         # the controller must not call `finish` after it.
         return self.pre_finish(run_id, claim.get("pr"), "BLOCKED", ["challenger-timeout: no disposition by {}".format(
             claim.get("deadline"))], {}, terminal_verb="challenger-timeout")
 
     def pre_finish(self, run_id, pr, verdict, failed, synthesis_doc, terminal_verb="finish"):
         phase = "verdict"
+        # EVERY verdict is concluded here and nowhere else, so this is where
+        # "could not look" is kept from becoming one: nothing is frozen,
+        # posted, filed or sent to the gate while any part of the run tree
+        # cannot be read (RunView.sight, _hold_blind). `absent` passes -- a
+        # run the controller never wrote into and cannot find (a run timed
+        # out before it was ever briefed) has nothing to be blind to, and the
+        # gate still reads the disposition through its own root before it
+        # accepts a timeout.
+        run = RunView(self.args.run_root, run_id)
+        sight, why = run.sight(self._run_dir_expected(run_id))
+        if sight == "blind":
+            return self._hold_blind(run_id, phase, "verdict", why)
         # The verdict is frozen the first time it validates, because the
         # verdict post is rendered from it. Later fires only re-check a frozen
         # GO: if it no longer validates (the PR head moved, evidence changed),
@@ -3166,7 +3354,6 @@ class Controller:
         for f in (synthesis_doc or {}).get("findings") or []:
             if isinstance(f, dict) and f.get("confirmed") and isinstance(f.get("id"), str):
                 findings.append(f["id"])
-        run = RunView(self.args.run_root, run_id)
         for m in run.markers().values():
             for fid in (m["doc"] or {}).get("confirmedFindings") or []:
                 if isinstance(fid, str) and fid not in findings:
@@ -3252,7 +3439,7 @@ class Controller:
         """The terminal verb a (possibly replayed) verdict is published through.
 
         INVARIANT, keyed on the gate's machine-readable refusal code
-        (TIMEOUT_REFUSALS), never on its prose or the controller's guess:
+        (GATE_REFUSALS), never on its prose or the controller's guess:
           - a verb refused for a PERMANENT reason is never re-selected;
           - a verb refused because the gate COULD NOT SEE (run root unset or
             unreadable) or has not reached the deadline is retried -- it is
@@ -3263,7 +3450,7 @@ class Controller:
         refused by the real gate once it sees a disposition, and a disposition
         can land after the timeout froze its BLOCKED. gate_verb records a
         permanent refusal failed_terminal and afterwards returns it without
-        calling the gate (this file, :2130-2131), so re-selecting the verb
+        calling the gate (this file, :2222-2223), so re-selecting the verb
         wedged the run for good -- a wedge since live mode (#945), found three
         ways in PR #1066: a fake gate that never refused, a frozen verb replayed
         after a late disposition, and a controller read of the disposition
@@ -3280,7 +3467,7 @@ class Controller:
            `finish` BLOCKED has no disposition precondition
            (smoke-pr-gate.sh:3976-4127) and publishes the same verdict. Every
            other permanent refusal, including `no-deadline` and any code not in
-           TIMEOUT_REFUSALS, leaves the verb as it is: escalated by gate_verb's
+           GATE_REFUSALS, leaves the verb as it is: escalated by gate_verb's
            alarm and NOT published -- an unknown code fails closed.
         2. Before any refusal, the controller predicts with the gate's own test
            -- `[ -s ]`: stat through symlinks, any file type, size > 0 -- only
@@ -3296,7 +3483,7 @@ class Controller:
             return verb
         ob = self.obligations().get(obligation_key(run_id, "gate", "challenger-timeout"))
         if ob and ob["state"] == "failed_terminal":
-            if TIMEOUT_REFUSALS.get(ob["detail"].get("refusal")) == "premise-false":
+            if GATE_REFUSALS.get(ob["detail"].get("refusal")) == "premise-false":
                 return "finish"
             return verb  # permanent and escalated; gate_verb answers failed_terminal without a call
         try:

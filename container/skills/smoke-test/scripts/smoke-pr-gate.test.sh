@@ -2294,7 +2294,7 @@ set_pr68_deadline() {
 }
 timeout_refusal() { # <expected-code>: the verb refuses with exactly that code, slot untouched
   local out
-  # Three of these refusals exit 2 (smoke-pr-gate.sh:4636,:4654,:4660): the
+  # Three of these refusals exit 2 (smoke-pr-gate.sh:4639,:4657,:4663): the
   # code, not the exit status, is what is asserted.
   out="$(bash "$GATE" challenger-timeout run-intake-dead owner-intake)" || true
   jq -e --arg c "$1" '.ok == false and .refusal == $c' <<<"$out" >/dev/null \
@@ -2311,6 +2311,21 @@ mkdir -p "$SMOKE_GATE_RUN_ROOT/run-intake-dead/challenger"
 echo "filed" > "$SMOKE_GATE_RUN_ROOT/run-intake-dead/challenger/disposition.md"
 timeout_refusal disposition-filed
 rm -rf "$SMOKE_GATE_RUN_ROOT/run-intake-dead"
+# An UNPARSABLE deadline has passed: epoch_or_zero reads a failed `date -d` as
+# epoch 0 (smoke-pr-gate.sh:166-173). The fake gate models exactly that (PR
+# #1066 closing review); a refusal from the run-root check, which comes after
+# the deadline check, proves the deadline did not stop it.
+set_pr68_deadline "not-a-date"
+( export SMOKE_GATE_RUN_ROOT="$STATE_DIR/no-such-mount"; timeout_refusal run-root-unreadable )
+set_pr68_deadline "2000-01-01T00:00:00Z"
+# `lease-unavailable`: the shared lease fence, which this verb and `finish`
+# both take, cannot read the lease (here: malformed). A "cannot look" the
+# controller retries and alarms on (GATE_REFUSALS), never a permanent refusal.
+LEASE68="$SMOKE_GATE_LEASE_DIR/lease-run-intake-dead.json"
+cp "$LEASE68" "$LEASE68.keep"
+printf '{' > "$LEASE68"
+timeout_refusal lease-unavailable
+mv "$LEASE68.keep" "$LEASE68"
 bash "$GATE" challenger-timeout run-intake-dead owner-intake | jq -e '
   .ok == true and .verdict == "BLOCKED" and .challengerDisposition == "no-disposition"' >/dev/null \
   || { echo "7d: challenger-timeout refused a contract-less run past its deadline" >&2; exit 1; }

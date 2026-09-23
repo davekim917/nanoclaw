@@ -311,7 +311,7 @@ lease_dir_prepare() {
 
 emit_lease_dir_error() {  # <runId> <command>
   jq -cn --arg run "$1" --arg cmd "$2" --arg dir "$LEASE_DIR" --arg detail "$LEASE_DIR_ERROR" \
-    '{ok:false,error:("shared coordinator lease unavailable - " + $detail + "; refusing to continue unleased"),
+    '{ok:false,refusal:"lease-unavailable",error:("shared coordinator lease unavailable - " + $detail + "; refusing to continue unleased"),
       runId:$run,command:$cmd,leaseDir:$dir}'
 }
 
@@ -378,7 +378,7 @@ lease_lifecycle_begin() { # <pr> <runId> <command>
   if ! lease_dir_prepare; then emit_lease_dir_error "$run" "$command"; return 1; fi
   if ! exec 5>"$(lease_lifecycle_lock_file "$pr")"; then
     jq -cn --argjson pr "$pr" --arg run "$run" --arg dir "$LEASE_DIR" --arg cmd "$command" \
-      '{ok:false,error:("could not open shared lifecycle lock under " + $dir + " - refusing to continue unleased"),pr:$pr,runId:$run,command:$cmd,leaseDir:$dir}'
+      '{ok:false,refusal:"lease-unavailable",error:("could not open shared lifecycle lock under " + $dir + " - refusing to continue unleased"),pr:$pr,runId:$run,command:$cmd,leaseDir:$dir}'
     return 1
   fi
   if ! flock -w "$LOCK_WAIT" 5; then
@@ -568,7 +568,7 @@ lease_fence_begin() {  # <pr> <runId> <owner> <command>
   if [ "$LIFECYCLE_FENCE_HELD" != true ] && ! lease_lifecycle_begin "$pr" "$run" "$command"; then return 1; fi
   if ! exec 6>"$(lease_lock_file "$run")"; then
     jq -cn --argjson pr "$pr" --arg run "$run" --arg dir "$LEASE_DIR" --arg cmd "$command" \
-      '{ok:false,error:("could not open shared run lease lock under " + $dir + " - refusing to continue unleased"),pr:$pr,runId:$run,command:$cmd,leaseDir:$dir}'
+      '{ok:false,refusal:"lease-unavailable",error:("could not open shared run lease lock under " + $dir + " - refusing to continue unleased"),pr:$pr,runId:$run,command:$cmd,leaseDir:$dir}'
     lease_lifecycle_end
     return 1
   fi
@@ -581,7 +581,7 @@ lease_fence_begin() {  # <pr> <runId> <owner> <command>
   lease="$(read_lease "$run")"
   if [ "$(lease_is_malformed "$lease")" = true ]; then
     jq -cn --argjson pr "$pr" --arg run "$run" --arg cmd "$command" --arg path "$(lease_file "$run")" \
-      '{ok:false,error:("shared coordinator lease is malformed at " + $path + " - refusing lifecycle authority"),pr:$pr,runId:$run,command:$cmd,leaseFile:$path}'
+      '{ok:false,refusal:"lease-unavailable",error:("shared coordinator lease is malformed at " + $path + " - refusing lifecycle authority"),pr:$pr,runId:$run,command:$cmd,leaseFile:$path}'
     flock -u 6; exec 6>&-; lease_lifecycle_end
     return 1
   fi
@@ -4593,6 +4593,9 @@ fi
 #   run-root-unset       the gate CANNOT LOOK -- never "nothing was filed"
 #   run-root-unreadable  the gate CANNOT LOOK (a mount or permission fault)
 #   disposition-filed    the premise is false: the challenger did file
+# and, from the shared lease fence this verb and `finish` both take:
+#   lease-unavailable    the gate CANNOT LOOK at the lease (dir or lock will
+#                        not open, or the lease is malformed) -- retry, alarm
 # The campaign controller keys on these codes, never on the prose
 # (smoke-campaign-controller.py, gate_verb and _publish_verb).
 if [ "$COMMAND" = "challenger-timeout" ]; then

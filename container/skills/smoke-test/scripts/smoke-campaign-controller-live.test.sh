@@ -255,7 +255,7 @@ finish_verdict() { jr '[.[] | select(.kind=="gate" and .state=="done") | .detail
 # A frozen challenger-timeout BLOCKED whose disposition landed before it could
 # finish: it must finish through `finish`, the verb the REAL gate still accepts
 # (challenger-timeout is refused once a disposition exists,
-# smoke-pr-gate.sh:4662-4667; the fake gate models that refusal), with the
+# smoke-pr-gate.sh:4665-4670; the fake gate models that refusal), with the
 # frozen verdict and failed checks unchanged. The disposition is asserted first,
 # so a pass is never a run the late disposition never reached.
 late_disposition_finished() { # label deadline finish-at
@@ -983,7 +983,7 @@ grep -q 'CHECK THE BARRIER, DO NOT ASSUME IT' "$R/controller/brief-lanes.md" \
 # (smoke-pr-gate.sh:220), so the lease lapsed under a live owner and its eight
 # completed lanes were refused their markers. The next `poll` then did what it
 # is supposed to do on a stale run: it resumed the run id and minted a FRESH
-# owner token (smoke-pr-gate.sh:5322 -> :5357/:5349/:5389). The controller
+# owner token (smoke-pr-gate.sh:5325 -> :5360/:5349/:5389). The controller
 # picked the new token up for itself, and stopped there. controller/wake.json --
 # the only file that carries the token to the owner, and the file the intake
 # brief tells it to read -- still named the retired one, and the lanes brief is
@@ -1164,19 +1164,19 @@ cite() { # <file> <line> <literal substring the cited line must contain>
     || fail "controller-owner-router.md cites $1:$2 for \"$3\", but that line is: ${got:-<absent>}"
 }
 ROUTER="$SCRIPT_DIR/../references/controller-owner-router.md"
-for c in 'smoke-pr-gate.sh:5322' 'smoke-campaign-controller.py:1322-1324' \
-         'smoke-run-scaffold.sh:267-269' 'smoke-campaign-controller.py:1311-1321'; do
+for c in 'smoke-pr-gate.sh:5325' 'smoke-campaign-controller.py:1328-1330' \
+         'smoke-run-scaffold.sh:267-269' 'smoke-campaign-controller.py:1317-1327'; do
   grep -Fq "$c" "$ROUTER" || fail "router doc no longer cites $c"
 done
-cite smoke-pr-gate.sh 5322 'OWNER_TOKEN="$(new_owner_token'
-cite smoke-pr-gate.sh 5351 'lease_acquire "$RUN_ID" "$OWNER_TOKEN"'
-cite smoke-pr-gate.sh 5356 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
-cite smoke-pr-gate.sh 5399 '.activeLeaseOwner=$owner'
+cite smoke-pr-gate.sh 5325 'OWNER_TOKEN="$(new_owner_token'
+cite smoke-pr-gate.sh 5354 'lease_acquire "$RUN_ID" "$OWNER_TOKEN"'
+cite smoke-pr-gate.sh 5359 'bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"'
+cite smoke-pr-gate.sh 5402 '.activeLeaseOwner=$owner'
 cite smoke-run-scaffold.sh 268 '[ "$owner" = "$DEFAULT_OWNER" ]'
 cite smoke-run-scaffold.sh 707 'adds NO new authority check of its own'
-cite smoke-campaign-controller.py 1267 'def _owner_wake'
-cite smoke-campaign-controller.py 1317 'os.unlink("brief-{}.ack"'
-cite smoke-campaign-controller.py 1322 'if c.get("wake"):'
+cite smoke-campaign-controller.py 1273 'def _owner_wake'
+cite smoke-campaign-controller.py 1323 'os.unlink("brief-{}.ack"'
+cite smoke-campaign-controller.py 1328 'if c.get("wake"):'
 
 
 # --- round 3, finding 1: a refusal that appears AFTER the ack re-offers ------
@@ -1471,7 +1471,7 @@ jr '[.[] | select(.kind=="gate" and .state=="done") | .slot] == ["finish"]' | gr
 assert_once "#2093(disposition race)"
 
 # b3) an EMPTY disposition.md is no disposition, to the gate (`[ -s ]`,
-#     smoke-pr-gate.sh:4663) and so to the controller: the timeout is still
+#     smoke-pr-gate.sh:4666) and so to the controller: the timeout is still
 #     published through challenger-timeout, which records no-disposition.
 new_case t2093-empty-disposition
 claim "$DL"; wake_json
@@ -1663,5 +1663,182 @@ phase_waited "#2093(preliminary unsettled)" preliminary 2026-09-18T10:40:00Z
 timed_out "#2093(preliminary unsettled)"
 [ -e "$R/coordinator/preliminary.md" ] || fail "#2093(g): precondition -- the preliminary exists"
 unset STALL
+
+# --- PR #1066 closing review: "could not look" never concludes a run ----------
+# One fire where the controller cannot see what is on disk must never become a
+# verdict. Every case proves the run was briefed and really sat where it says
+# (the run tree is the controller's own), and that the fire in question
+# returned `blind` -- an outcome only the code under test produces -- before
+# asserting what did NOT happen.
+fire_at() { inputs_from_fakes; step_ok "$(tick_time "$1")" "${@:2}"; }
+ticks() { # from to: the world, then a fire, per tick
+  local n
+  for n in $(seq "$1" "$2"); do
+    world "$n"
+    if [ "$n" = 0 ]; then fire_at 0 --poll-json "$C/wake.json"; else fire_at "$n"; fi
+  done
+}
+run_phase() { jq -r --arg r "$RUN" '[.runs[] | select(.runId==$r) | .phase] | first' <<<"$STEP_OUT"; }
+briefed() { # label: the controller has written into the run dir -- its own proof it exists
+  jr '[.[] | select(.kind=="owner" and .slot=="intake") | .detail.briefedToken] | map(select(.)) | length > 0' \
+    | grep -qx true || fail "$1: precondition -- the intake brief is on disk (briefedToken journaled)"
+}
+held_blind() { # label at where: that fire returned blind, alarmed once, judged nothing
+  [ "$(run_phase)" = blind ] || fail "$1: the fire at $2 returned $(run_phase), not blind: $STEP_OUT"
+  dq '[.[] | select(.type=="wait" and .at=="'"$2"'" and .where=="'"$3"'")] | length == 1' | grep -qx true \
+    || fail "$1: one journaled wait at $2 naming $3: $(dq '[.[] | select(.at=="'"$2"'") | [.type,.reason,.where]]')"
+  jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:run-blind:"))) | .slot] | unique | length == 1' \
+    | grep -qx true || fail "$1: exactly one run-blind operator alarm"
+  jr '[.[] | select(.kind=="verdict")] | length == 0' | grep -qx true \
+    || fail "$1: a verdict was frozen from a fire that could not see: $(jr '[.[]|select(.kind=="verdict")]')"
+  jr '[.[] | select(.kind=="send" and .slot=="verdict")] | length == 0' | grep -qx true \
+    || fail "$1: a verdict was posted from a fire that could not see"
+  [ "$(jq -s '[.[] | select(.tool=="gate" and (.argv[0]=="finish" or .argv[0]=="challenger-timeout"))] | length' "$FAKE_LOG")" = 0 ] \
+    || fail "$1: a terminal gate verb was sent from a fire that could not see"
+}
+certified_go() { # label: the run, once visible again, certifies GO through finish
+  [ "$(finish_verdict)" = '"GO"' ] || fail "$1: the run did not certify GO once it could see: $(finish_verdict)"
+  jr '[.[] | select(.kind=="gate" and .state=="done") | .slot] == ["finish"]' | grep -qx true \
+    || fail "$1: GO goes through finish, once: $(jr '[.[]|select(.kind=="gate")]')"
+  [ "$(jq -r '.completedVerdict' "$C/state/pr-$PR-state.json")" = GO ] || fail "$1: the gate released the slot GO"
+  assert_once "$1"
+}
+
+# b9) the reviewer's probe: the challenger files at 10:50, the deadline is
+#     10:55, and the run directory is invisible to the controller for the one
+#     fire at 11:00. The run was briefed and its root posted, so a directory
+#     the controller wrote into and cannot find is blindness, never "not filed".
+#     main certifies GO; dcfbb93f published BLOCKED "no disposition by 10:55".
+DL=2026-09-18T10:55:00Z
+new_case blind-blip-after-deadline
+claim "$DL"; wake_json
+ticks 0 5
+[ -s "$R/challenger/disposition.md" ] || fail "b9: precondition -- the challenger filed at 10:50"
+briefed b9
+jr '[.[] | select(.kind=="send" and .slot=="root")] | length > 0' | grep -qx true \
+  || fail "b9: precondition -- the root was posted before the blip (the run is past intake)"
+[[ "$DL" < 2026-09-18T11:00:00Z ]] || fail "b9: test bug -- the blip fire must be past the deadline"
+world 6
+mv "$R" "$C/away"                                        # the mount blips for one fire
+fire_at 6
+mv "$C/away" "$R"
+held_blind b9 2026-09-18T11:00:00Z run-dir
+ticks 7 9
+certified_go b9
+
+# b10) the same blip BEFORE the deadline, mid-campaign: nothing to conclude, so
+#      only the run-dir guard in step_run can be what holds it -- without it the
+#      fire reads an unscaffolded run and routes it back to intake, silently.
+new_case blind-blip-mid-campaign
+claim; wake_json
+ticks 0 3
+briefed b10
+jr '[.[] | select(.kind=="send" and .slot=="root")] | length > 0' | grep -qx true \
+  || fail "b10: precondition -- the run is past its root post, so intake is behind it"
+world 4
+mv "$R" "$C/away"
+fire_at 4
+mv "$C/away" "$R"
+held_blind b10 2026-09-18T10:40:00Z run-dir
+dq '[.[] | select(.at=="2026-09-18T10:40:00Z" and (.phase=="intake" or .type=="wake_owner"))] | length == 0' | grep -qx true \
+  || fail "b10: the blind fire routed the run back to intake or woke an owner: $(dq '[.[]|select(.at=="2026-09-18T10:40:00Z")]')"
+ticks 5 8
+certified_go b10
+
+# b11) PARTIAL blindness at the verdict: the run directory is visible but one
+#      file the verdict reads cannot be opened (EACCES on the identity record,
+#      which GO requires, validate_synthesis). The ladder never reads it before
+#      the verdict, so only pre_finish's whole-tree sight can hold this fire;
+#      without it the unreadable record is "pair identity not ok" and GO is
+#      published BLOCKED.
+if [ "$(id -u)" = 0 ]; then
+  echo "b11/b14 SKIPPED: running as root, which ignores file modes -- EACCES cannot be simulated" >&2
+else
+  new_case blind-file-at-verdict
+  claim; wake_json
+  ticks 0 5
+  briefed b11
+  world 6
+  [ -s "$R/synthesis.json" ] && [ -s "$R/coordinator/identity-checks.ndjson" ] \
+    || fail "b11: precondition -- a GO synthesis and an ok identity record are on disk"
+  chmod 000 "$R/coordinator/identity-checks.ndjson"
+  fire_at 6
+  chmod 644 "$R/coordinator/identity-checks.ndjson"
+  held_blind b11 2026-09-18T11:00:00Z verdict
+  ticks 7 9
+  certified_go b11
+
+  # b14) a crashed critic dispatch whose start file exists but cannot be looked
+  #      at. Ambiguity is sticky and permits only BLOCKED, and it is concluded in
+  #      dispatch(), outside pre_finish -- so an unreadable start file must hold
+  #      the fire, never mark the one-shot ambiguous.
+  new_case blind-dispatch-started
+  claim; wake_json
+  world 0; fire_at 0 --poll-json "$C/wake.json"
+  world 1
+  inputs_from_fakes
+  SMOKE_CONTROLLER_CRASH_AT=after-intent:dispatch:critic step "$(tick_time 1)"
+  [ "$STEP_RC" = 137 ] || fail "b14: precondition -- the fire died between the dispatch intent and the create: rc=$STEP_RC $STEP_OUT"
+  fire_at 1
+  jr '[.[] | select(.kind=="dispatch" and .slot=="critic")] | last | .state == "intent"' | grep -qx true \
+    || fail "b14: precondition -- the critic dispatch is a bare intent (the crash window)"
+  briefed b14
+  world 2
+  printf 'started\n' >"$R/controller/dispatch-critic.started"   # the one-shot did start
+  chmod 000 "$R/controller"
+  fire_at 2
+  chmod 755 "$R/controller"
+  [ "$(run_phase)" = intake ] || fail "b14: the critic wait keeps the run in intake: $(run_phase)"
+  dq '[.[] | select(.type=="wait" and .at=="2026-09-18T10:20:00Z" and .where=="dispatch-started")] | length == 1' \
+    | grep -qx true || fail "b14: the unreadable start file was held as blind: $(dq '[.[] | select(.at=="2026-09-18T10:20:00Z") | [.type,.reason,.where]]')"
+  jr '[.[] | select(.kind=="dispatch" and .slot=="critic") | .detail.ambiguous] | map(select(.)) | length == 0' \
+    | grep -qx true || fail "b14: an unreadable start file marked the dispatch ambiguous"
+  jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:dispatch-ambiguous:")))] | length == 0' \
+    | grep -qx true || fail "b14: an unreadable start file raised dispatch-ambiguous"
+  jq -cn '{screens:[{screen:"checkout-390",grade:"OK",reason:"layout holds"}],notes:[]}' >"$R/contact-sheet/critic.json"
+  ticks 3 9
+  jr '[.[] | select(.kind=="dispatch" and .slot=="critic")] | last | .state == "done"' | grep -qx true \
+    || fail "b14: the critic dispatch settled from its evidence once visible"
+  [ "$(finish_verdict)" = '"GO"' ] || fail "b14: the run certifies GO: $(finish_verdict)"
+fi
+
+# b12) the other side of the line: a run the controller has NEVER written into
+#      and cannot find is absent, not blind -- its deadline had already passed
+#      at the first fire, so it times out as before. Reading every missing
+#      directory as blindness would hold this run forever.
+DL=2026-09-18T10:25:00Z
+new_case absent-never-briefed
+claim "$DL"; wake_json
+fire_at 3 --poll-json "$C/wake.json"
+fire_at 4; fire_at 5
+[ ! -e "$R" ] || fail "b12: precondition -- the controller never wrote into the run directory"
+timed_out "b12(never briefed)"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:run-blind:")))] | length == 0' | grep -qx true \
+  || fail "b12: a run with no directory the controller ever wrote is not a blind one"
+
+# b13) `lease-unavailable` (PR #1066 closing review, P3): the gate's lease
+#      fence cannot read the lease. A blind gate, for `finish` as much as for
+#      the timeout: retried, never failed_terminal, one gate-blind alarm, and the
+#      next fire finishes normally.
+new_case lease-unavailable-finish
+jq -cn '{"gate:finish":["refuse-code:lease-unavailable"]}' >"$C/fake/faults.json"
+FAULTY=1 campaign 9
+[ "$(jq -s '[.[] | select(.tool=="gate" and .op=="lease-unavailable")] | length' "$FAKE_LOG")" = 1 ] \
+  || fail "b13: precondition -- finish reached the gate and was refused lease-unavailable once: $(jq -sc '[.[]|select(.tool=="gate")|.op]' "$FAKE_LOG")"
+jr '[.[] | select(.kind=="gate" and .slot=="finish" and .state=="failed_terminal")] | length == 0' | grep -qx true \
+  || fail "b13: a lease the gate cannot read made finish un-reselectable (failed_terminal)"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-blind:"))) | .slot] | unique | length == 1' \
+  | grep -qx true || fail "b13: exactly one gate-blind operator alarm"
+jr '[.[] | select(.kind=="send" and (.slot | startswith("alarm:gate-refused:")))] | length == 0' | grep -qx true \
+  || fail "b13: a blind lease is not escalated as a permanent refusal"
+certified_go b13
+
+# The fake gate parses a deadline as the real one does (epoch_or_zero,
+# smoke-pr-gate.sh:166-173): unparsable has PASSED. smoke-pr-gate.test.sh §7d
+# asserts the real verb does the same.
+new_case fake-deadline-unparsable
+claim not-a-date
+SMOKE_GATE_CLAIMANT=controller python3 "$FAKES" gate challenger-timeout "$RUN" "$TOKEN" \
+  | jq -e '.ok == true' >/dev/null || fail "fake gate: an unparsable deadline is treated as passed, as the real gate treats it"
 
 echo "smoke campaign controller live tests passed"

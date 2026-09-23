@@ -430,7 +430,7 @@ def verdict_agreement(rows):
     (that is its own hard bar). The controller's GO rule is deliberately
     stricter than today's coordinator, so an actual GO the controller holds
     at BLOCKED/NO_GO is expected -- but only with the failed check it named
-    (its finish decision's failedChecks, smoke-campaign-controller.py:584-639).
+    (its finish decision's failedChecks, smoke-campaign-controller.py:587-642).
     Unexplained: FAIL. Explained, or any other non-GO mismatch: a human reads
     it (NEEDS_REVIEW)."""
     unexplained, review = [], []
