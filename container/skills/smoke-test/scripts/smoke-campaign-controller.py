@@ -148,6 +148,12 @@ POST_FINISH_SLOTS = ("freeze-close",)
 # Journal kinds whose obligations must all be receipted before a GO finish.
 PRE_FINISH_KINDS = ("send", "gh", "dispatch")
 OWNER_STEP_SLA_SECONDS = 3600
+# A phase dispatch whose admission this controller still cannot confirm after
+# this long is alarmed (controller_dispatch_unconfirmed). Replaying the same
+# event is safe and stays the recovery, but it is silent: pr2121 replayed its
+# intake dispatch for hours because every `ncl` answer was misread, and
+# nothing said so. Three fires at the controller's ~10-minute cadence.
+DISPATCH_UNCONFIRMED_ALARM_SECONDS = 1800
 # A send awaiting its delivery receipt, or a GitHub write awaiting its marker
 # read-back, older than this raises controller_obligation_overdue (once). It
 # never resends: a missing receipt is ambiguous and keeps its message id.
@@ -711,7 +717,33 @@ def spawn(argv, timeout, allowed, env=None):
 
 
 def last_json_line(text):
-    for line in reversed((text or "").strip().splitlines()):
+    """The JSON object a child printed last, or None.
+
+    Two shapes reach here. The gate and this controller print ONE object per
+    line, after any number of progress lines. The in-container `ncl --json`
+    PRETTY-PRINTS its one response across many lines
+    (container/agent-runner/src/cli/ncl.ts:286, `JSON.stringify(resp, null,
+    2)`), and a line scan alone reads that as a bare `{` and answers None: every
+    phase-dispatch admission then looked unknown, and pr2121 replayed its
+    intake dispatch for hours with no alarm. So: the whole output first, then
+    the last top-level object -- an unindented `{` line through the end --
+    then the old last-line rule."""
+    text = (text or "").strip()
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        pass
+    else:
+        return doc if isinstance(doc, dict) else None
+    lines = text.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].rstrip() == "{":
+            try:
+                doc = json.loads("\n".join(lines[i:]))
+            except ValueError:
+                continue
+            return doc if isinstance(doc, dict) else None
+    for line in reversed(lines):
         line = line.strip()
         if line.startswith("{"):
             try:
@@ -756,6 +788,9 @@ ALARM_WORDS = {
     "controller_send_failed": "a chat post could not be delivered after its retries",
     "controller_send_budget": "the controller's chat budget for this run is spent",
     "controller_dispatch_ambiguous": "a judgment task may or may not have started; it is held for a human",
+    "controller_dispatch_unconfirmed": ("an owner phase dispatch could not be confirmed as admitted; the controller "
+                                        "keeps replaying the same event, so check `ncl tasks dispatch` from the "
+                                        "controller's container"),
     "controller_obligation_overdue": "a step is past its deadline",
     "controller_verdict_superseded": "a GO no longer holds, so the run finishes BLOCKED",
     "controller_gh_failed": "a GitHub write failed",
@@ -1305,7 +1340,7 @@ class EffectLayer:
         # AN ACK NEVER OUTLIVES THE BRIEF IT ACKNOWLEDGED. The ack is the
         # owner's first act on a wake and the controller only tests it for
         # existence, re-offering a wake solely while it is ABSENT (owner_step,
-        # :2500-2510); the renewer reads it the same way
+        # :2547-2557); the renewer reads it the same way
         # (smoke-controller-renew.sh, "brief-<step>.ack absent: no owner turn
         # holds this step"). So a brief rewritten under a NEW owner token would
         # otherwise inherit the previous brief's ack and be treated as taken,
@@ -2455,7 +2490,19 @@ class Controller:
                 "briefedToken": result.get("briefedToken"), "briefedRefusal": result.get("briefedRefusal", ""),
                 "tokenReissued": False, "refusalChanged": False})
         else:
-            self.decide(run_id, phase, "wait", "wait", "dispatch outcome unknown; replay same event", step=step)
+            error = str(result.get("error") or "")[:200]
+            self.decide(run_id, phase, "wait", "wait", "dispatch outcome unknown; replay same event", step=step,
+                        detail={"eventKey": event, "error": error})
+            # When the intent for THIS event was first journaled: the history
+            # record that carries it, else the obligation's first record.
+            ob = self.obligations().get(obligation_key(run_id, "owner", step)) or {}
+            since = next((parse_iso(h.get("at")) for h in ob.get("history") or []
+                          if ((h.get("detail") or {}).get("dispatchIntent") or {}).get("eventKey") == event), None)
+            since = since or parse_iso(((ob.get("history") or [{}])[0]).get("at"))
+            if since and (self.now - since).total_seconds() > DISPATCH_UNCONFIRMED_ALARM_SECONDS:
+                self.ensure_alarm(run_id, "controller_dispatch_unconfirmed",
+                                  "owner-dispatch-unconfirmed:{}:{}".format(step, event[:40]),
+                                  {"step": step, "eventKey": event, "since": iso(since), "error": error})
         return "enqueued" if result.get("outcome") == "admitted" else "intent"
 
     def owner_step(self, run_id, phase, step, done):
@@ -2641,7 +2688,7 @@ class Controller:
         then the owner writes evidence the barrier rejects. The next fire
         publishes the new refusal and returns `ownerWake: null`, because
         owner_step re-offers a wake only while the `.ack` is ABSENT
-        (:2500-2510). The diagnosis is on disk and nobody is told to read it --
+        (:2547-2557). The diagnosis is on disk and nobody is told to read it --
         the same dead end, reached the way run pr2055 actually reached it.
 
         THE TRIGGER IS A CHANGE IN THE REFUSAL, NOT "INVALID". Narrower than
@@ -2656,7 +2703,7 @@ class Controller:
         fire exactly like `briefedToken`: a crash between the publish and the
         re-offer leaves the next fire owing the same re-offer. Re-offering does
         not extend the step's SLA -- owner_step measures from `history[0]`
-        (:2511) -- so a run that keeps producing invalid evidence still ends at
+        (:2558) -- so a run that keeps producing invalid evidence still ends at
         the overdue path rather than being woken forever."""
         ob = self.obligations().get(obligation_key(run_id, "owner", step))
         if not ob or ob["state"] not in ("intent", "enqueued"):
@@ -2915,8 +2962,8 @@ class Controller:
         An owner step records `brief_written`/`admitted`/`briefedToken`/
         `dispatchIntent` only once <run>/controller/brief-<step>.md is on disk
         (_owner_wake writes the brief before either route records anything,
-        :1332 and :1351; owner_step journals it after the effect returns,
-        :2485-2495) -- a bare `intent` is deliberately NOT proof, since a fire
+        :1367 and :1386; owner_step journals it after the effect returns,
+        :2532-2542) -- a bare `intent` is deliberately NOT proof, since a fire
         can die before the brief lands. A `send:root` obligation is proof too:
         the root is posted only from a readable completion contract (step_run's
         ladder). Shadow owner steps (`shadow_refused`) write nothing and are
@@ -3175,7 +3222,7 @@ class Controller:
                 # THE OWNER IS WOKEN HERE, not only once the barrier passes.
                 # By this point every OTHER party's contribution the synthesis
                 # barrier checks has already been gated above: the lanes
-                # barrier is ready (:3142), coordinator/preliminary.md exists
+                # barrier is ready (:3189), coordinator/preliminary.md exists
                 # (:3159) and challenger/disposition.md exists (:3165). What
                 # the synthesis barrier can still report is therefore the
                 # retained owner's -- `invalid[]` content it authored
@@ -3290,7 +3337,7 @@ class Controller:
            ladder ("An owner may conclude ..." below) and is never pre-empted
            by a timeout -- but only where the ladder can reach it, which needs
            a readable contract: validate_synthesis binds its sourceSha to the
-           contract's (:1812-1819), so without one it could only be BLOCKED.
+           contract's (:1847-1854), so without one it could only be BLOCKED.
         3. The challenger deadline itself."""
         vob = self.obligations().get(obligation_key(run_id, "verdict", "validated"))
         if vob and vob["state"] == "done" and vob["detail"].get("verdict") != "GO":
@@ -3450,7 +3497,7 @@ class Controller:
         refused by the real gate once it sees a disposition, and a disposition
         can land after the timeout froze its BLOCKED. gate_verb records a
         permanent refusal failed_terminal and afterwards returns it without
-        calling the gate (this file, :2222-2223), so re-selecting the verb
+        calling the gate (this file, :2257-2258), so re-selecting the verb
         wedged the run for good -- a wedge since live mode (#945), found three
         ways in PR #1066: a fake gate that never refused, a frozen verb replayed
         after a late disposition, and a controller read of the disposition
