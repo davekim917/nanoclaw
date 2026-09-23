@@ -50,19 +50,22 @@ mock.module('../db/container-state.js', () => ({
 }));
 
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
-const { ClaudeProvider, wrapDevNullStdin } = await import('./claude.js');
+const { ClaudeProvider, wrapDevNullStdin, preToolUseHook, resetToolInFlightTracking } = await import('./claude.js');
 const messagesOut = await import('../db/messages-out.js');
 const { runPreToolUseChain } = await import('../codex-hooks/runner.js');
 
 type HookEntry = { matcher?: string; hooks: HookCallback[] };
 
-function registeredBashHooks(): HookCallback[] {
+function registeredPreToolUse(): HookEntry[] {
   captured = null;
   const provider = new ClaudeProvider({ providerConfig: {} });
   provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
   provider.query({ prompt: 'x', cwd: '/tmp' });
-  const pre = (captured?.hooks as Record<string, HookEntry[]> | undefined)?.PreToolUse ?? [];
-  return pre.find((e) => e.matcher === 'Bash')?.hooks ?? [];
+  return (captured?.hooks as Record<string, HookEntry[]> | undefined)?.PreToolUse ?? [];
+}
+
+function registeredBashHooks(): HookCallback[] {
+  return registeredPreToolUse().find((e) => e.matcher === 'Bash')?.hooks ?? [];
 }
 
 /** Run the list threading `updatedInput` forward; record what each hook was given. */
@@ -119,6 +122,42 @@ describe('(iii) Claude registration: one emitter, and no guard ever sees the std
     expect(writeSpy).not.toHaveBeenCalled();
     expect(r.seen).toEqual(Array(hooks.length).fill(cmd)); // every hook, email gate included, saw raw text
     expect(r.final).toBe(wrapDevNullStdin(cmd));
+  });
+
+  it('across EVERY hook a Bash call reaches — unmatched entries included — only the rewrite returns updatedInput', async () => {
+    // The list above is not all the CLI runs for Bash: an entry with no matcher
+    // (preToolUseHook's) runs in the same concurrent tier. A second emitter
+    // anywhere in that tier would race the rewrite's prefix, so the one-emitter
+    // rule is checked over the whole tier, the way the CLI dispatches it:
+    // concurrently, every hook on the same input.
+    // One capture: the guard factories mint new instances on every query().
+    const entries = registeredPreToolUse();
+    const hooks = entries.filter((e) => e.matcher === undefined || e.matcher === 'Bash').flatMap((e) => e.hooks);
+    expect(hooks).toContain(preToolUseHook);
+    const rewrite = entries.find((e) => e.matcher === 'Bash')!.hooks.at(-1)!;
+    const cmd = 'echo hi';
+    const outs = await Promise.all(
+      hooks.map((hook) =>
+        hook(
+          {
+            hook_event_name: 'PreToolUse',
+            tool_name: 'Bash',
+            tool_input: { command: cmd },
+            tool_use_id: 'toolu_tier',
+          } as never,
+          {} as never,
+          {} as never,
+        ),
+      ),
+    );
+    resetToolInFlightTracking();
+    const emitters = hooks.filter(
+      (_, i) => (outs[i] as { hookSpecificOutput?: { updatedInput?: unknown } })?.hookSpecificOutput?.updatedInput,
+    );
+    expect(emitters).toEqual([rewrite]);
+    const emitted = (outs[hooks.indexOf(rewrite)] as { hookSpecificOutput: { updatedInput: { command: string } } })
+      .hookSpecificOutput.updatedInput.command;
+    expect(emitted).toBe(wrapDevNullStdin(cmd));
   });
 });
 
