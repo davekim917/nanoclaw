@@ -1358,7 +1358,7 @@ class EffectLayer:
         # AN ACK NEVER OUTLIVES THE BRIEF IT ACKNOWLEDGED. The ack is the
         # owner's first act on a wake and the controller only tests it for
         # existence, re-offering a wake solely while it is ABSENT (owner_step,
-        # :2518-2528); the renewer reads it the same way
+        # :2565-2575); the renewer reads it the same way
         # (smoke-controller-renew.sh, "brief-<step>.ack absent: no owner turn
         # holds this step"). So a brief rewritten under a NEW owner token would
         # otherwise inherit the previous brief's ack and be treated as taken,
