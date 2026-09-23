@@ -17,11 +17,14 @@ import './usage.js';
 const GID = 'ag-usage-cli';
 const HOST: CallerContext = { caller: 'host', sessionId: '', agentGroupId: '' } as CallerContext;
 
+// Dated after the #1061 cutoff (src/db/usage-trust.ts): a Claude row inside
+// the untrusted window is counted but never summed, and this file tests the
+// CLI seam, not that rule (src/db/usage.test.ts covers it).
 function insertCentralTurn(turnId: string, model: string, cacheRead: number): void {
   getRawDb()
     .prepare(
       `INSERT INTO turn_usage (ts, session_id, agent_group_id, provider, model, turn_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
-       VALUES ('2026-08-24T12:00:00.000Z', 'sess-1', ?, 'claude', ?, ?, 10, 5, ?, 1, 0.25)`,
+       VALUES ('2026-10-01T12:00:00.000Z', 'sess-1', ?, 'claude', ?, ?, 10, 5, ?, 1, 0.25)`,
     )
     .run(GID, model, turnId, cacheRead);
 }
