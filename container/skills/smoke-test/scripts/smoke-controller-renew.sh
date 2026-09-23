@@ -13,7 +13,7 @@
 # A claimed run's liveness used to depend on the controller firing. The gate's
 # shared coordinator lease is 900 s (smoke-pr-gate.sh:220,
 # LEASE_TTL_SECONDS) and its only stamp is `progress`, which the live wrapper
-# issues once per fire (smoke-controller-live-worker.py:601-610). But:
+# issues once per fire (smoke-controller-live-worker.py:792-800). But:
 #
 #   * the controller cannot fire while an owner turn is running. A series
 #     arms its next occurrence only when the current one is resolved
@@ -45,7 +45,9 @@
 # followed the same run at 07:15Z. It never claims, never finishes, never
 # posts, never writes the journal, never writes a run artifact, never writes
 # `activeRunId`/`activeLeaseOwner`/`activeClaimant`. It reads the controller's
-# journal and the briefs' ack files; the gate owns every write.
+# journal and the briefs' ack files; the gate owns every write. Its one file
+# of its own is <out>/renewer/heartbeat.json, its liveness record (THE
+# HEARTBEAT, below final's definition).
 #
 # WHEN IT RENEWS -- all five must hold, per run:
 #   1. the journal's newest record for an `owner` obligation is `enqueued`
@@ -62,8 +64,8 @@
 #
 # FRESHNESS. The ack is written ONCE and never again: the router creates it
 # (controller-owner-router.md:31), the controller only ever tests it for
-# existence (smoke-campaign-controller.py:2549) and re-offers the wake only
-# while it is ABSENT (:2547-2557), and a step that needs more than one turn
+# existence (smoke-campaign-controller.py:2567) and re-offers the wake only
+# while it is ABSENT (:2565-2575), and a step that needs more than one turn
 # continues through `continue_work` (router :43), which resumes in-session and
 # does not re-run the router's first act. Nothing in this repo refreshes or
 # removes it. So its mtime is the time of the FIRST wake, and treating that as
@@ -141,9 +143,58 @@ MAX_RENEWALS=16           # a tick is bounded even if the journal is huge
 
 RESULT_RENEWED='[]'
 RESULT_SKIPPED='[]'
+GATE_FAILURES=0
+
+# THE HEARTBEAT (#1031). This tick's only other output is task stdout, which
+# nothing keeps, so nothing could tell "the renewer ran and had nothing to do"
+# from "the renewer's series was never created, or was paused" -- which is how
+# campaign pr2055 lost its lease mid-step (XZO #2024): the renewer merged on
+# 09-20 and its series was not created until 09-22, and nothing noticed. So
+# every tick that knows the controller's out-dir records that it ran, and how
+# it ended, in ONE file of its own: <out>/renewer/heartbeat.json. The live
+# worker reads it before every poll and refuses to claim new work while it is
+# absent, stale, failing or unreadable (smoke-controller-live-worker.py,
+# renewer_health). It is written LAST, from final(), so a heartbeat means a
+# tick that ran to its end; it is best-effort and never changes the tick's
+# outcome or its stdout line. A tick that ends before the out-dir is known
+# (no jq, a refused env file, not live, no run root) writes none, and the
+# worker reads that as the renewer being absent or stale -- the right answer,
+# since such a renewer renews nothing either.
+HEARTBEAT_DIR=""
+# Consecutive ticks, this one included, in which a gate `progress` call for an
+# eligible step came back as anything but a renewal (or a positive "that run is
+# no longer active"). 0 on every other tick. The worker stops claiming on the
+# first and alarms from the second (smoke-controller-live-worker.py,
+# RENEWER_FAILED_TICKS_LIMIT): one failed tick is usually a busy lock or a race;
+# two in a row is a renewer that cannot renew.
+FAILED_TICKS=0
+heartbeat() { # <status>
+  [ -n "$HEARTBEAT_DIR" ] || return 0
+  # The out-dir is the worker's; this tick never creates it (the worker makes
+  # it on its first live fire). Its own subdirectory must be a real directory,
+  # never a symlink it would write through.
+  [ -d "$(dirname "$HEARTBEAT_DIR")" ] || return 0
+  [ -L "$HEARTBEAT_DIR" ] && return 0
+  mkdir -p -- "$HEARTBEAT_DIR" 2>/dev/null || return 0
+  [ -d "$HEARTBEAT_DIR" ] && [ ! -L "$HEARTBEAT_DIR" ] || return 0
+  local tmp
+  tmp="$(mktemp "$HEARTBEAT_DIR/.heartbeat.XXXXXX" 2>/dev/null)" || return 0
+  # No jq here: a tick that ends `no-jq`-adjacent must still be recordable. The
+  # status is always one of final()'s fixed slugs.
+  if printf '{"schemaVersion":1,"tick":"%s","tickEpoch":%s,"status":"%s","failedTicks":%s}\n' \
+      "$NOW" "${NOW_EPOCH:-0}" "$1" "$FAILED_TICKS" >"$tmp" 2>/dev/null && chmod 0644 -- "$tmp" 2>/dev/null; then
+    # rename(2) replaces whatever sits at the name, a symlink included,
+    # rather than writing through it.
+    mv -f -T -- "$tmp" "$HEARTBEAT_DIR/heartbeat.json" 2>/dev/null || rm -f -- "$tmp" 2>/dev/null
+  else
+    rm -f -- "$tmp" 2>/dev/null
+  fi
+  return 0
+}
 
 final() { # <status> <detail-or-empty>
   local status="$1" detail="${2:-}"
+  heartbeat "$status"
   if ! jq -cn --arg tick "$NOW" --arg status "$status" --arg detail "$detail" \
       --argjson renewed "$RESULT_RENEWED" --argjson skipped "$RESULT_SKIPPED" \
       '{wakeAgent:false,data:({tick:$tick,status:$status,renewed:$renewed,skipped:$skipped}
@@ -264,10 +315,13 @@ MODE="$(cfg SMOKE_CONTROLLER_MODE)"; MODE="${MODE:-shadow}"
 
 RUN_ROOT="$(cfg SMOKE_GATE_RUN_ROOT)"
 [ -n "$RUN_ROOT" ] || final misconfigured "SMOKE_GATE_RUN_ROOT is unset"
+# Same derivation as the live worker (smoke-controller-live-worker.py:383-384).
+# Derived before anything else can fail, so every later failure is recorded
+# in the heartbeat as a failing tick rather than as silence.
+OUT="$(cfg SMOKE_CONTROLLER_OUT_DIR)"; OUT="${OUT:-$(dirname "${RUN_ROOT%/}")/controller}"
+HEARTBEAT_DIR="$OUT/renewer"
 GATE_CMD="$(cfg SMOKE_CONTROLLER_GATE_CMD)"; GATE_CMD="${GATE_CMD:-/workspace/agent/smoke-pr-gate.sh}"
 [ -f "$GATE_CMD" ] || final misconfigured "gate wrapper $GATE_CMD is not a file"
-# Same derivation as the live worker (smoke-controller-live-worker.py:329-330).
-OUT="$(cfg SMOKE_CONTROLLER_OUT_DIR)"; OUT="${OUT:-$(dirname "${RUN_ROOT%/}")/controller}"
 JOURNAL="$OUT/journal.ndjson"
 [ -f "$JOURNAL" ] || final no-journal "no controller journal at $JOURNAL"
 
@@ -439,6 +493,9 @@ while IFS= read -r candidate; do
     continue
   fi
   if [ "$RENEWALS" -ge "$MAX_RENEWALS" ]; then
+    # An eligible step this tick will not renew is a failed renewal like any
+    # other: the worker must not claim more work while claims go unrenewed.
+    GATE_FAILURES=$((GATE_FAILURES + 1))
     note "$RUN_ID" "$STEP" "tick renewal cap ($MAX_RENEWALS) reached"
     continue
   fi
@@ -452,19 +509,48 @@ while IFS= read -r candidate; do
     timeout -k 2 "$GATE_CALL_TIMEOUT" bash "$GATE_CMD" progress "$RUN_ID" "$TOKEN" 2>/dev/null | tail -n 1)"
   # `.ok // true` would be wrong twice over: jq's `//` treats a literal false
   # as empty, and a missing `ok` is not a success.
-  if [ "$(jq -r 'if type == "object" and .ok == true then "yes" else "no" end' \
-      <<<"${GATE_OUT:-{}}" 2>/dev/null)" = yes ]; then
+  # "gone" is the gate POSITIVELY seeing another run (or none) in the PR's
+  # slot: the run was finished, reclaimed or displaced, and there is no lease
+  # left for this tick to keep. Only the progress verb's own "not the active
+  # run" answers carry activeRunId alongside a PR (smoke-pr-gate.sh, the
+  # progress verb and emit_not_active). pr:null is the gate NOT finding the
+  # run -- which a wrong state dir produces too -- so it is a failure.
+  GATE_ANSWER="$(jq -r '
+      if type != "object" then "failed"
+      elif .ok == true then "renewed"
+      elif .ok == false and has("activeRunId") and .pr != null and .activeRunId != .runId then "gone"
+      else "failed" end' <<<"${GATE_OUT:-{}}" 2>/dev/null)"
+  if [ "$GATE_ANSWER" = renewed ]; then
     RENEWALS=$((RENEWALS + 1))
     RESULT_RENEWED="$(jq -c --arg r "$RUN_ID" --arg s "$STEP" --argjson age "$AGE" \
       '. + [{runId:$r,step:$s,ageSeconds:$age}]' <<<"$RESULT_RENEWED")"
   else
     # A refusal is the gate holding its own line (the run was reclaimed or
     # finished, the token retired, the lock busy). Recorded, never retried in
-    # a loop, never worked around.
+    # a loop, never worked around -- but anything short of "gone" is a step
+    # that needed a renewal and did not get one, and the heartbeat says so.
+    [ "$GATE_ANSWER" = gone ] || GATE_FAILURES=$((GATE_FAILURES + 1))
     note "$RUN_ID" "$STEP" \
       "gate refused progress: $(jq -r 'if type == "object" then (.error // "no result") else "no result" end' \
         <<<"${GATE_OUT:-{}}" 2>/dev/null | cut -c1-160)"
   fi
 done <<<"$CANDIDATES"
 
+if [ "$GATE_FAILURES" -gt 0 ]; then
+  # Carried from this renewer's own last heartbeat. One it cannot read counts
+  # as a failed tick: an unreadable record is not evidence the last tick was
+  # healthy, and erring high only stops claiming a tick sooner.
+  PREV=0
+  if [ -L "$HEARTBEAT_DIR/heartbeat.json" ]; then
+    PREV=1
+  elif [ -e "$HEARTBEAT_DIR/heartbeat.json" ]; then
+    PREV="$(jq -r 'if type != "object" then 1
+        elif .status != "renew-failed" then 0
+        elif (.failedTicks | type) == "number" and .failedTicks >= 1 and .failedTicks == (.failedTicks | floor)
+          then .failedTicks else 1 end' "$HEARTBEAT_DIR/heartbeat.json" 2>/dev/null)"
+    [[ "$PREV" =~ ^[0-9]{1,6}$ ]] || PREV=1
+  fi
+  FAILED_TICKS=$((PREV + 1))
+  final renew-failed "$GATE_FAILURES gate progress call(s) did not renew; failed ticks in a row: $FAILED_TICKS"
+fi
 final ok ""

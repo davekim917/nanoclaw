@@ -23,14 +23,14 @@
 #   4. fetches the current head of every PR the controller has in play with
 #      `gh pr view` (read-only), and `ncl tasks list --json` ONLY when the
 #      journal holds a bare, non-ambiguous dispatch intent -- the one path
-#      that reads tasks (smoke-campaign-controller.py:913-919);
+#      that reads tasks (smoke-campaign-controller.py:931-937);
 #   5. runs `step --shadow` once. That one step covers every active run
-#      (fire_once, smoke-campaign-controller.py:1296-1306).
+#      (fire_once, smoke-campaign-controller.py:1314-1324).
 #
 # Receipts are passed as `{}` on purpose. They are chat DELIVERY receipts keyed
-# key#attempt (smoke-campaign-controller.py:781-795), consulted only for an
+# key#attempt (smoke-campaign-controller.py:781-813), consulted only for an
 # `enqueued` send, and shadow never enqueues: a refused send is journaled
-# `done` at once (:831-835). There is no GitHub receipt input.
+# `done` at once (:849-853). There is no GitHub receipt input.
 #
 # Counterfactual hold (the replay's model, smoke-campaign-replay.py:425-428):
 # once the legacy coordinator finishes a run the shadow is tracking, the
@@ -161,7 +161,7 @@ TEST_HANG = os.environ.get("SMOKE_CONTROLLER_SHADOW_TEST_HANG", "")  # test-only
 # (smoke-controller-live-worker.py, same rule, same reason: XZO #2047, where a
 # hardcoded allowlist here dropped SMOKE_GATE_LEASE_DIR and the evidence
 # barrier this wrapper's controller step spawns
-# (smoke-campaign-controller.py:1800 -> spawn, :692-704, env=None) fell back to
+# (smoke-campaign-controller.py:1818 -> spawn, :692-704, env=None) fell back to
 # a lease dir holding no pin, smoke-evidence-barrier.sh:739). NOT_CONFIG is the
 # inverse: names that say how this process and its children RUN rather than
 # what the campaign IS. A name here is IGNORED, exactly as every name outside

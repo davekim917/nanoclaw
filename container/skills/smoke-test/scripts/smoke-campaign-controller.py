@@ -783,6 +783,24 @@ GATE_ALARM_TEXT = {
                        "that is a human call."),
     "pr_preflight_failed": "PR #{pr}'s preflight check failed ({reason}); no campaign.",
     "coordinator_lease_unavailable": "The PR smoke watcher could not take the coordinator lease.",
+    # The claim renewer's liveness (#1031; smoke-controller-live-worker.py,
+    # renewer_gate). One per case, because each needs a different fix. All four
+    # stop NEW campaigns from being claimed and leave claimed ones running.
+    "controller_renewer_absent": (
+        "The smoke claim renewer has never run here ({reason}). Its series (`smoke-controller-renew`) is missing, was "
+        "never created, runs a pinned copy older than the heartbeat (anything but /app/skills/smoke-test/scripts/), "
+        "or every tick fails before it can record itself. Check `ncl tasks list`. No new campaign is claimed till it ticks."),
+    "controller_renewer_stale": (
+        "The smoke claim renewer stopped ticking: {reason}. Its series (`smoke-controller-renew`) was paused or "
+        "removed, or its ticks die before they finish. Check `ncl tasks list`. No new smoke campaign is claimed "
+        "until it ticks again."),
+    "controller_renewer_failing": (
+        "The smoke claim renewer is ticking but renewing nothing: {reason}. Its series exists; its configuration "
+        "or the controller journal it reads is the fault. No new smoke campaign is claimed until a tick succeeds."),
+    "controller_renewer_unreadable": (
+        "The smoke controller cannot read the claim renewer's heartbeat ({reason}). That is a mount or permission "
+        "fault on the controller's out dir, NOT proof the renewer stopped. No new smoke campaign is claimed until "
+        "it can be read."),
 }
 ALARM_WORDS = {
     "controller_send_failed": "a chat post could not be delivered after its retries",
@@ -1340,14 +1358,14 @@ class EffectLayer:
         # AN ACK NEVER OUTLIVES THE BRIEF IT ACKNOWLEDGED. The ack is the
         # owner's first act on a wake and the controller only tests it for
         # existence, re-offering a wake solely while it is ABSENT (owner_step,
-        # :2547-2557); the renewer reads it the same way
+        # :2565-2575); the renewer reads it the same way
         # (smoke-controller-renew.sh, "brief-<step>.ack absent: no owner turn
         # holds this step"). So a brief rewritten under a NEW owner token would
         # otherwise inherit the previous brief's ack and be treated as taken,
         # and never re-offered -- the second half of XZO #2046. Removing it here
         # makes that impossible by construction rather than by sequencing: this
         # function runs only when the obligation is absent or `intent`
-        # (owner_step, :2477), never while a live brief is enqueued, so any ack
+        # (owner_step, :2495), never while a live brief is enqueued, so any ack
         # it finds belongs to a brief this write supersedes.
         try:
             dfd = _open_dir_contained(root, [run_id, "controller"], True)
@@ -2688,7 +2706,7 @@ class Controller:
         then the owner writes evidence the barrier rejects. The next fire
         publishes the new refusal and returns `ownerWake: null`, because
         owner_step re-offers a wake only while the `.ack` is ABSENT
-        (:2547-2557). The diagnosis is on disk and nobody is told to read it --
+        (:2565-2575). The diagnosis is on disk and nobody is told to read it --
         the same dead end, reached the way run pr2055 actually reached it.
 
         THE TRIGGER IS A CHANGE IN THE REFUSAL, NOT "INVALID". Narrower than
@@ -2703,7 +2721,7 @@ class Controller:
         fire exactly like `briefedToken`: a crash between the publish and the
         re-offer leaves the next fire owing the same re-offer. Re-offering does
         not extend the step's SLA -- owner_step measures from `history[0]`
-        (:2558) -- so a run that keeps producing invalid evidence still ends at
+        (:2576) -- so a run that keeps producing invalid evidence still ends at
         the overdue path rather than being woken forever."""
         ob = self.obligations().get(obligation_key(run_id, "owner", step))
         if not ob or ob["state"] not in ("intent", "enqueued"):
@@ -2962,8 +2980,8 @@ class Controller:
         An owner step records `brief_written`/`admitted`/`briefedToken`/
         `dispatchIntent` only once <run>/controller/brief-<step>.md is on disk
         (_owner_wake writes the brief before either route records anything,
-        :1367 and :1386; owner_step journals it after the effect returns,
-        :2532-2542) -- a bare `intent` is deliberately NOT proof, since a fire
+        :1385 and :1404; owner_step journals it after the effect returns,
+        :2550-2560) -- a bare `intent` is deliberately NOT proof, since a fire
         can die before the brief lands. A `send:root` obligation is proof too:
         the root is posted only from a readable completion contract (step_run's
         ladder). Shadow owner steps (`shadow_refused`) write nothing and are
@@ -3222,8 +3240,8 @@ class Controller:
                 # THE OWNER IS WOKEN HERE, not only once the barrier passes.
                 # By this point every OTHER party's contribution the synthesis
                 # barrier checks has already been gated above: the lanes
-                # barrier is ready (:3189), coordinator/preliminary.md exists
-                # (:3159) and challenger/disposition.md exists (:3165). What
+                # barrier is ready (:3207), coordinator/preliminary.md exists
+                # (:3224) and challenger/disposition.md exists (:3230). What
                 # the synthesis barrier can still report is therefore the
                 # retained owner's -- `invalid[]` content it authored
                 # (journeys/scope-dispositions.json, or
@@ -3235,7 +3253,7 @@ class Controller:
                 # alone (smoke-controller-live.sh:168-175), so nobody was told;
                 # and _maybe_synthesis_overdue_blocked needs the very
                 # owner:synthesis obligation this branch declined to create
-                # (:3247-3249), so the terminal BLOCKED safety net could not
+                # (:3265-3267), so the terminal BLOCKED safety net could not
                 # fire either. This is the same blind spot as the lanes barrier
                 # (XZO #2047), on the sibling path.
                 timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)
@@ -3337,7 +3355,7 @@ class Controller:
            ladder ("An owner may conclude ..." below) and is never pre-empted
            by a timeout -- but only where the ladder can reach it, which needs
            a readable contract: validate_synthesis binds its sourceSha to the
-           contract's (:1847-1854), so without one it could only be BLOCKED.
+           contract's (:1865-1872), so without one it could only be BLOCKED.
         3. The challenger deadline itself."""
         vob = self.obligations().get(obligation_key(run_id, "verdict", "validated"))
         if vob and vob["state"] == "done" and vob["detail"].get("verdict") != "GO":
@@ -3497,7 +3515,7 @@ class Controller:
         refused by the real gate once it sees a disposition, and a disposition
         can land after the timeout froze its BLOCKED. gate_verb records a
         permanent refusal failed_terminal and afterwards returns it without
-        calling the gate (this file, :2257-2258), so re-selecting the verb
+        calling the gate (this file, :2275-2276), so re-selecting the verb
         wedged the run for good -- a wedge since live mode (#945), found three
         ways in PR #1066: a fake gate that never refused, a frozen verb replayed
         after a late disposition, and a controller read of the disposition

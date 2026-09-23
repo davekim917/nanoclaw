@@ -12,6 +12,7 @@ itself -- the owner does, per references/controller-owner-router.md.
 See smoke-controller-live.sh for the fire's steps and guarantees.
 """
 import datetime as dt
+import errno
 import fcntl
 import importlib.util
 import json
@@ -43,7 +44,7 @@ INBOUND_DB = os.environ.get("SMOKE_CONTROLLER_LIVE_INBOUND_DB", "/workspace/inbo
 # install's deployment gate wrapper sources the file itself (`. <its
 # dir>/smoke-gate-env.sh`, then exec the skill's gate), so ITS lease dir stayed
 # right -- but the evidence barrier is spawned by the controller directly, with this
-# process's environment (smoke-campaign-controller.py:1800 -> run_read_only ->
+# process's environment (smoke-campaign-controller.py:1818 -> run_read_only ->
 # spawn, :692-704, env=None), and it read the fallback
 # ${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases
 # (smoke-evidence-barrier.sh:739). No pin for the campaign lives there, so
@@ -509,6 +510,11 @@ def latch_map(states, control):
 
 def alarm_fingerprint(wake, control):
     """One fingerprint for the poll path and the latch path alike."""
+    if str(wake.get("trigger") or "").startswith(RENEWER_TRIGGER_PREFIX):
+        # One alarm per renewer outage: the key names the outage and its
+        # onset (renewer_gate), never the fire that noticed it -- so a second
+        # outage the same day is a second alarm, not a duplicate of the first.
+        return "renewer:{}".format(wake.get("renewerKey") or "-")
     field = CONTROL_TRIGGERS.get(wake.get("trigger"))
     if field:
         return "control:{}@{}".format(field, control.get(field) or "-")
@@ -537,6 +543,179 @@ def alarm_queue():
     """The queued gate alarms, listed through the containment walk: a
     symlinked wrapper/alarms is refused, never silently read as empty."""
     return [n for n in ctl.listdir_contained(OUT, ["wrapper", "alarms"]) if n.endswith(".json")]
+
+
+# -- the claim renewer's liveness (#1031) -------------------------------------------
+# A claimed run survives an owner step longer than the gate's 900 s lease only
+# because smoke-controller-renew.sh, its own scheduled series, keeps stamping
+# `progress` for it. Nothing verified that series existed: it merged on 09-20
+# (#955), was not created until 09-22, and campaign pr2055 lost its lease
+# mid-step in between (XZO #2024). The renewer now records every tick in
+# <out>/renewer/heartbeat.json (smoke-controller-renew.sh, THE HEARTBEAT), and
+# this fire reads it before it may POLL -- the poll being what claims new
+# campaigns (pr_build_settled) and what re-mints a stale one.
+#
+# ANY state but `fresh` refuses the poll: that only delays a campaign, and a
+# campaign claimed with no renewer is the one that dies mid-step. It does NOT
+# touch a run already claimed -- the renewer being down is a risk to that run,
+# not a verdict on it: it keeps its keepalive stamps and its steps, and the
+# alarm names it. Each state means a different fix, so each has its own alarm:
+#   absent      no heartbeat has ever been written: the series was never
+#               created, or every tick fails before it knows the out-dir.
+#               Alarmed only after RENEWER_STALE_SECONDS of absence seen by
+#               this worker, so the window before a freshly deployed renewer's
+#               first tick is not a false alarm (the poll is still refused).
+#   stale       the last tick is older than RENEWER_STALE_SECONDS: the series
+#               was paused or removed, or its ticks die before their end.
+#   failing     the renewer ticks, but its last tick ended in a status that
+#               renews nothing (misconfigured, journal-unreadable, ...) -- or
+#               in `renew-failed`, gate `progress` calls that did not renew,
+#               for RENEWER_FAILED_TICKS_LIMIT ticks in a row. A renewer that
+#               cannot reach the lease while this worker can still claim is
+#               the failure this gate exists for.
+#   degraded    exactly one `renew-failed` tick: the poll is refused (a
+#               campaign claimed now could run a whole owner step before the
+#               next renewer tick, and this series cannot fire again until
+#               that occurrence ends), but not alarmed until a second.
+#   unreadable  the heartbeat could not be LOOKED at (EACCES, a symlink, a
+#               non-regular file, bytes that are not a heartbeat, a tick from
+#               the future): a fault on this side, NOT evidence the renewer
+#               stopped -- #1066's absent-vs-blind lesson.
+# The renewer ticks */5; two intervals plus a minute of spawn and sweep jitter.
+RENEWER_STALE_SECONDS = 660
+RENEWER_FUTURE_SLACK_SECONDS = 60
+RENEWER_HEALTHY_STATUSES = ("ok", "idle")
+RENEWER_FAILED_STATUS = "renew-failed"
+RENEWER_FAILED_TICKS_LIMIT = 2
+RENEWER_TRIGGER_PREFIX = "controller_renewer_"
+RENEWER_WATCH = ["wrapper", "renewer-watch.json"]
+
+
+def renewer_health():
+    """(state, detail): fresh | absent | stale | degraded | failing | unreadable.
+    Absent is claimed ONLY on ENOENT -- of <out>/renewer or of the file in it.
+    Every other failure to look is `unreadable`, never `absent`."""
+    try:
+        dfd = ctl._open_dir_contained(OUT, ["renewer"], False)
+    except ctl.ControllerError as exc:
+        # _open_dir_contained carries the errno so ENOENT can be told from
+        # EACCES/ELOOP/ENOTDIR (smoke-campaign-controller.py:416-422).
+        if getattr(exc, "errno", None) == errno.ENOENT:
+            return "absent", {}
+        return "unreadable", {"error": str(exc)[:200]}
+    except OSError as exc:
+        return "unreadable", {"error": str(exc)[:200]}
+    try:
+        try:
+            fd = os.open("heartbeat.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        except FileNotFoundError:
+            return "absent", {}
+        except OSError as exc:
+            return "unreadable", {"error": "heartbeat.json: {}".format(exc)[:200]}
+    finally:
+        os.close(dfd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return "unreadable", {"error": "heartbeat.json is not a regular file"}
+        raw = os.read(fd, 4096)
+    except OSError as exc:
+        return "unreadable", {"error": "heartbeat.json: {}".format(exc)[:200]}
+    finally:
+        os.close(fd)
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return "unreadable", {"error": "heartbeat.json is not JSON"}
+    tick = ctl.parse_iso(doc.get("tick")) if isinstance(doc, dict) else None
+    if tick is None:
+        return "unreadable", {"error": "heartbeat.json has no readable tick"}
+    age = int((now - tick).total_seconds())
+    detail = {"lastTick": doc["tick"], "ageSeconds": age, "status": doc.get("status")}
+    if age < -RENEWER_FUTURE_SLACK_SECONDS:
+        # A tick from the future would read as fresh for as long as it stays
+        # ahead, masking a dead renewer: it is not believed.
+        return "unreadable", dict(detail, error="heartbeat tick is in the future")
+    if age > RENEWER_STALE_SECONDS:
+        return "stale", detail
+    if doc.get("status") == RENEWER_FAILED_STATUS:
+        # smoke-controller-renew.sh counts these (FAILED_TICKS). A count that
+        # is missing or not a positive integer is not read as "only one".
+        failed = doc.get("failedTicks")
+        detail["failedTicks"] = failed
+        if (isinstance(failed, int) and not isinstance(failed, bool)
+                and 1 <= failed < RENEWER_FAILED_TICKS_LIMIT):
+            return "degraded", detail
+        return "failing", detail
+    if doc.get("status") not in RENEWER_HEALTHY_STATUSES:
+        return "failing", detail
+    return "fresh", detail
+
+
+def renewer_gate(states):
+    """True when this fire may poll. Otherwise records why in the summary and
+    queues ONE operator alarm per outage (absent: only past its grace)."""
+    state, detail = renewer_health()
+    summary["renewer"] = dict(detail, state=state)
+    if state == "fresh":
+        try:
+            ctl.unlink_contained(OUT, RENEWER_WATCH)
+        except (OSError, ctl.ControllerError):
+            pass
+        return True
+    # THE OUTAGE: every fire from the first that saw the renewer unhealthy to
+    # the next that sees it fresh. Its onset is kept in renewer-watch.json and
+    # named in the alarm key, so each outage alarms once and a later one alarms
+    # again. absentSince is the absent grace's own clock, reset whenever the
+    # renewer is anything but absent.
+    watch, _ = read_json(os.path.join(WRAP, *RENEWER_WATCH[1:]))
+    watch = watch if isinstance(watch, dict) else {}
+    onset = ctl.parse_iso(watch.get("outageSince"))
+    since = ctl.parse_iso(watch.get("absentSince")) if state == "absent" else None
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    want = {"outageSince": (onset or now).strftime(fmt)}
+    if state == "absent":
+        want["absentSince"] = (since or now).strftime(fmt)
+    kept = True
+    if want != watch:
+        try:
+            write(RENEWER_WATCH, json.dumps(want, sort_keys=True) + "\n")
+        except (OSError, ctl.ControllerError):
+            # Unrecorded, the onset is this fire's and would change every fire:
+            # the keys below drop it rather than alarm on every fire.
+            kept = False
+    outage = "@" + want["outageSince"] if kept else ""
+    summary["renewer"]["outageSince"] = want["outageSince"]
+    claimed = sorted(st["activeRunId"] for st in states.values()
+                     if isinstance(st.get("activeRunId"), str) and st.get("activeClaimant") == "controller")
+    if state == "absent":
+        since = since or now
+        waited = int((now - since).total_seconds())
+        summary["renewer"]["absentSince"] = want["absentSince"]
+        summary["pollSkipped"] = "claim renewer heartbeat absent for {}s: not claiming".format(waited)
+        if waited <= RENEWER_STALE_SECONDS:
+            return False
+        reason = "no heartbeat since this controller first looked at {}".format(want["absentSince"])
+        key = "absent" + outage
+    elif state == "degraded":
+        summary["pollSkipped"] = ("claim renewer's last tick did not renew ({} failed tick): "
+                                  "not claiming").format(detail.get("failedTicks"))
+        return False
+    elif state == "stale":
+        reason = "its last tick was {} ({} min ago, status {})".format(
+            detail["lastTick"], detail["ageSeconds"] // 60, detail.get("status"))
+        key = "stale@" + detail["lastTick"]
+    elif state == "failing":
+        reason = "its last tick at {} ended `{}`".format(detail["lastTick"], detail.get("status"))
+        key = "failing@{}{}".format(detail.get("status"), outage)
+    else:
+        reason = detail.get("error") or "unreadable"
+        key = "unreadable" + outage
+    if claimed:
+        reason += "; claimed run(s) at risk of losing their lease on a long owner step: " + ", ".join(claimed)
+    summary.setdefault("pollSkipped", "claim renewer {}: not claiming".format(state))
+    queue_alarm({"schemaVersion": 1, "trigger": RENEWER_TRIGGER_PREFIX + state, "reason": reason,
+                 "renewerKey": key, "renewer": dict(detail, state=state), "claimedRuns": claimed}, {})
+    return False
 
 
 def journal_fail_closed(reason, detail):
@@ -663,8 +842,13 @@ def main():
                 log("progress stamp for {} failed: {}".format(run_id, (err or out or "").strip()[:120]))
     poll = None
     poll_path = None
+    # After the keepalive stamps above, so a claimed run is kept live whatever
+    # the renewer's state; before the poll, which is the only thing it gates.
+    renewer_ok = renewer_gate(states)
     pending_alarms = alarm_queue()
-    if pending_alarms:
+    if not renewer_ok:
+        pass  # renewer_gate recorded pollSkipped
+    elif pending_alarms:
         # Queued alarms are drained into the journal BEFORE the next poll: a
         # queue that never drains must not let polls keep claiming runs.
         summary["pollSkipped"] = "{} queued gate alarm(s) to drain first".format(len(pending_alarms))

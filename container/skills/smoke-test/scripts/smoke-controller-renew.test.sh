@@ -760,5 +760,187 @@ LAST="$(timeout 5 bash "$R" 2>>"$C/renew.err")" || fail 'nonregular env file blo
 [ "$(field '.wakeAgent')" = false ] || fail 'nonregular env file woke a model'
 ok
 
+# ═════════════════════════════════════════════════════════════════════════════
+# THE HEARTBEAT (#1031) — every tick that knows the out-dir records that it
+# ran and how it ended, in <out>/renewer/heartbeat.json, which the live worker
+# reads before it may claim. Every "no heartbeat" assertion first proves the
+# tick ran to final() (its own stdout status), so an absent file is the code
+# under test deciding, not a tick that never ran.
+# ═════════════════════════════════════════════════════════════════════════════
+echo "== heartbeat =="
+HB() { printf '%s' "$C/out/renewer/heartbeat.json"; }
+hb() { jq -r "$1" "$(HB)" 2>/dev/null; }
+new_case heartbeat-idle
+tick
+[ "$(field '.data.status')" = idle ] || fail "heartbeat: precondition -- an empty journal is an idle tick: $LAST"
+[ "$(hb .status)" = idle ] && [ "$(hb .tick)" = "$(field '.data.tick')" ] \
+  || fail "heartbeat: an idle tick records itself, with the tick it reported: $(cat "$(HB)" 2>&1)"
+[ "$(hb .schemaVersion)" = 1 ] && [ "$(hb .tickEpoch)" -gt 0 ] || fail "heartbeat: schema and epoch"
+[ "$(stat -c %a "$(HB)")" = 644 ] || fail "heartbeat: readable by the worker's container (0644): $(stat -c %a "$(HB)")"
+[ "$(printf '%s\n' "$LAST" | wc -l)" = 1 ] && [ "$(field '.wakeAgent')" = false ] \
+  || fail "heartbeat: the tick's stdout contract is unchanged: $LAST"
+ok
+
+new_case heartbeat-renewed
+use_stub_gate
+claim_files
+in_flight_at "$(/usr/bin/date -u +%s)"
+tick
+[ "$(field '.data.renewed | length')" = 1 ] || fail "heartbeat: precondition -- this tick renewed a step: $LAST"
+[ "$(hb .status)" = ok ] || fail "heartbeat: a renewing tick records ok: $(cat "$(HB)" 2>&1)"
+unset SMOKE_CONTROLLER_GATE_CMD GATE_LOG
+ok
+
+new_case heartbeat-failing
+export SMOKE_CONTROLLER_GATE_CMD="$C/no-such-gate.sh"
+tick
+[ "$(field '.data.status')" = misconfigured ] || fail "heartbeat: precondition -- a missing gate wrapper: $LAST"
+[ "$(hb .status)" = misconfigured ] \
+  || fail "heartbeat: a failing tick records WHY, so the worker can say 'ticking but renewing nothing'"
+unset SMOKE_CONTROLLER_GATE_CMD
+ok
+
+new_case heartbeat-not-live
+write_env shadow
+tick
+[ "$(field '.data.status')" = not-live ] || fail "heartbeat: precondition -- the kill switch is off: $LAST"
+[ ! -e "$C/out/renewer" ] || fail "heartbeat: a tick that is not live writes nothing at all"
+ok
+
+new_case heartbeat-no-out-dir
+rm -rf "$C/out"
+tick
+[ "$(field '.data.status')" = no-journal ] || fail "heartbeat: precondition -- the tick ran to its end: $LAST"
+[ ! -e "$C/out" ] || fail "heartbeat: the renewer never creates the worker's out-dir"
+ok
+
+new_case heartbeat-symlinked-dir
+mkdir -p "$C/elsewhere"
+ln -s "$C/elsewhere" "$C/out/renewer"
+tick
+[ "$(field '.data.status')" = idle ] || fail "heartbeat: precondition -- the tick ran to its end: $LAST"
+[ -z "$(ls -A "$C/elsewhere")" ] || fail "heartbeat: written THROUGH a symlinked renewer dir: $(ls -A "$C/elsewhere")"
+ok
+
+new_case heartbeat-symlinked-file
+mkdir -p "$C/out/renewer" "$C/elsewhere"
+printf 'untouched\n' >"$C/elsewhere/target"
+ln -s "$C/elsewhere/target" "$C/out/renewer/heartbeat.json"
+tick
+[ "$(field '.data.status')" = idle ] || fail "heartbeat: precondition -- the tick ran to its end: $LAST"
+[ "$(cat "$C/elsewhere/target")" = untouched ] || fail "heartbeat: written through a symlinked heartbeat file"
+[ ! -L "$(HB)" ] && [ "$(hb .status)" = idle ] \
+  || fail "heartbeat: the link is REPLACED by the real heartbeat (rename, never follow)"
+ok
+
+# A tick that REACHED the gate and did not renew is not a healthy tick
+# (Codex, PR #1089): a renewer that cannot renew while the worker can still
+# claim is the failure the heartbeat exists to surface. `renew-failed` carries
+# how many ticks in a row; the worker stops claiming at 2.
+reply_gate() { # <one JSON line the gate answers progress with, or "" for none>
+  cat >"$STUB" <<SH
+#!/usr/bin/env bash
+printf '%s claimant=%s\n' "\$*" "\${SMOKE_GATE_CLAIMANT:-}" >>"\$GATE_LOG"
+printf '%s\n' '$1'
+SH
+  chmod +x "$STUB"
+  export SMOKE_CONTROLLER_GATE_CMD="$STUB" GATE_LOG="$C/gate.log"
+  : >"$GATE_LOG"
+}
+failed_tick() { # <label> <expected failedTicks>
+  tick
+  grep -q "^progress $RUN " "$GATE_LOG" || fail "$1: precondition -- the tick reached the gate: $LAST"
+  [ "$(field '.data.status')" = renew-failed ] && [ "$(field '.data.renewed | length')" = 0 ] \
+    || fail "$1: a refused renewal is not an ok tick: $LAST"
+  [ "$(hb .status)" = renew-failed ] && [ "$(hb .failedTicks)" = "$2" ] \
+    || fail "$1: heartbeat records renew-failed x$2: $(cat "$(HB)" 2>&1)"
+  : >"$GATE_LOG"
+}
+
+new_case heartbeat-renew-failed
+claim_files
+in_flight_at "$(/usr/bin/date -u +%s)"
+# The gate did not find the run (pr:null): a wrong state dir answers this too.
+reply_gate '{"ok":false,"error":"not the active run (reclaimed or finished) — stop this campaign","runId":"x","pr":null,"activeRunId":null}'
+failed_tick "rf1 not-found" 1
+failed_tick "rf1 again" 2
+failed_tick "rf1 a third" 3
+use_stub_gate
+tick
+[ "$(field '.data.status')" = ok ] && [ "$(hb .status)" = ok ] && [ "$(hb .failedTicks)" = 0 ] \
+  || fail "rf1: one renewal resets the count: $(cat "$(HB)" 2>&1)"
+ok
+reply_gate '{"ok":false,"retryable":true,"error":"gate_lock_busy: ...","pr":7}'
+failed_tick "rf2 lock busy" 1
+reply_gate '{"ok":false,"error":"caller owner does not match the owner recorded by claim - STOP this campaign","pr":7,"runId":"x","requestedBy":"a","claimedBy":"b"}'
+failed_tick "rf3 owner mismatch (a PR but no activeRunId)" 2
+reply_gate ''
+failed_tick "rf4 no answer (the call timed out)" 3
+reply_gate 'not json'
+failed_tick "rf5 not JSON" 4
+ok
+
+# The gate POSITIVELY saw the run leave its slot: nothing is left to renew,
+# and the renewer is not failing for it.
+new_case heartbeat-run-gone
+claim_files
+in_flight_at "$(/usr/bin/date -u +%s)"
+reply_gate "{\"ok\":false,\"error\":\"not the active run (reclaimed or finished) — stop this campaign\",\"pr\":7,\"runId\":\"$RUN\",\"activeRunId\":null}"
+tick
+grep -q "^progress $RUN " "$GATE_LOG" || fail "gone: precondition -- the tick reached the gate: $LAST"
+[ "$(field '.data.status')" = ok ] && [ "$(hb .status)" = ok ] && [ "$(hb .failedTicks)" = 0 ] \
+  || fail "gone: a run the gate saw finish is not a failed renewal: $LAST / $(cat "$(HB)" 2>&1)"
+[ "$(field '.data.skipped | length')" = 1 ] || fail "gone: still recorded as skipped: $LAST"
+reply_gate "{\"ok\":false,\"error\":\"STOP THIS CAMPAIGN. displaced\",\"pr\":7,\"runId\":\"$RUN\",\"activeRunId\":\"other-run\",\"displacedAt\":\"2026-09-23T00:00:00Z\"}"
+tick
+[ "$(hb .status)" = ok ] || fail "gone: a displaced run is not a failed renewal: $(cat "$(HB)" 2>&1)"
+ok
+
+# The count is carried from the renewer's own last heartbeat; one it cannot
+# read is not evidence the last tick was healthy.
+new_case heartbeat-renew-failed-unreadable-prior
+claim_files
+in_flight_at "$(/usr/bin/date -u +%s)"
+mkdir -p "$C/out/renewer"
+printf 'torn{' >"$(HB)"
+reply_gate '{"ok":false,"error":"x","pr":null,"activeRunId":null,"runId":"x"}'
+failed_tick "rf6 torn prior heartbeat" 2
+printf '{"status":"renew-failed","failedTicks":"many"}\n' >"$(HB)"
+failed_tick "rf6 non-numeric prior count" 2
+printf '{"status":"idle","failedTicks":9}\n' >"$(HB)"
+failed_tick "rf6 a healthy prior tick restarts the count" 1
+printf '{"status":"ok","failedTicks":0}\n' >"$C/prior-elsewhere.json"
+rm -f "$(HB)"; ln -s "$C/prior-elsewhere.json" "$(HB)"
+failed_tick "rf6 a symlinked prior heartbeat is not believed" 2
+unset SMOKE_CONTROLLER_GATE_CMD GATE_LOG
+ok
+
+# More eligible steps than one tick may renew (MAX_RENEWALS, 16): the ones
+# past the cap go unrenewed, so the tick is not healthy (Codex, PR #1089).
+new_case heartbeat-renewal-cap
+use_stub_gate
+NOWE="$(/usr/bin/date -u +%s)"
+for i in $(seq 1 17); do
+  R_I="demo-pr-pr$((100 + i))-aaaaaaaaaaaa-20260920T000000Z"
+  mkdir -p "$C/runs/$R_I/controller" "$C/runs/$R_I/evidence"
+  : >"$C/runs/$R_I/controller/brief-lanes.ack"
+  : >"$C/runs/$R_I/evidence/progress.txt"
+  for rec in "run claim enqueued {\"ownerToken\":\"$TOKEN\"}" "owner lanes enqueued {}"; do
+    set -- $rec
+    jq -cn --arg run "$R_I" --arg kind "$1" --arg slot "$2" --arg state "$3" --arg at "$(iso "$NOWE")" \
+      --argjson detail "$4" \
+      '{at:$at,fire:$at,runId:$run,kind:$kind,slot:$slot,key:("k-" + $run + "-" + $kind + "-" + $slot),
+        state:$state,mode:"live",attempt:1,v:1,detail:$detail}' >>"$JOURNAL"
+  done
+done
+tick
+[ "$(field '.data.renewed | length')" = 16 ] || fail "cap: precondition -- 16 renewed: $LAST"
+[ "$(field '[.data.skipped[] | select(.reason | test("renewal cap"))] | length')" = 1 ] \
+  || fail "cap: precondition -- the 17th hit the cap: $LAST"
+[ "$(field '.data.status')" = renew-failed ] && [ "$(hb .status)" = renew-failed ] && [ "$(hb .failedTicks)" = 1 ] \
+  || fail "cap: a step left unrenewed by the cap is a failed tick: $LAST / $(cat "$(HB)" 2>&1)"
+unset SMOKE_CONTROLLER_GATE_CMD GATE_LOG
+ok
+
 [ "$FAILURES" = 0 ] || { echo "$FAILURES assertion group(s) FAILED" >&2; exit 1; }
 echo "PASS ($PASSES assertions)"

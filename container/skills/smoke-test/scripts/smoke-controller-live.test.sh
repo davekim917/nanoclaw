@@ -93,8 +93,19 @@ OUTPUT=""
 DATA=""
 WAKE=""
 ELAPSED=0
+# The claim renewer's heartbeat (#1031): the worker refuses to POLL unless it
+# is fresh, so every fire gets a fresh `ok` one by default, as a healthy
+# renewer ticking every 5 minutes leaves. NO_HEARTBEAT=1 leaves the file alone
+# -- for the cases that must not create the out-dir, and the renewer cases,
+# which shape it themselves.
+renewer_ticked() { # [status] [tick] [extra JSON members, e.g. ,"failedTicks":2]
+  mkdir -p "$OUT/renewer"
+  printf '{"schemaVersion":1,"tick":"%s","status":"%s"%s}\n' \
+    "${2:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" "${1:-ok}" "${3:-}" >"$OUT/renewer/heartbeat.json"
+}
 fire() { # [env assignments...]
   local s rc
+  [ -n "${NO_HEARTBEAT:-}" ] || renewer_ticked
   s="$(date +%s)"
   set +e
   OUTPUT="$(env SMOKE_CONTROLLER_ENV_FILE="$C/env.sh" \
@@ -138,14 +149,14 @@ alarm_selfcontained() {
 for m in "" shadow off; do
   new_case "not-live-${m:-unset}"
   write_env "$m"
-  fire
+  NO_HEARTBEAT=1 fire
   [ "$WAKE" = false ] && d .skipped | grep -q "not live" || fail "mode '${m:-unset}' must do nothing: $OUTPUT"
   [ ! -s "$FAKE_LOG" ] || fail "mode '${m:-unset}' must call nothing: $(cat "$FAKE_LOG")"
   [ ! -e "$OUT" ] || fail "mode '${m:-unset}' must not create the out-dir"
 done
 new_case misconfigured
 write_env live skip-send-to
-fire
+NO_HEARTBEAT=1 fire
 [ "$WAKE" = true ] && [ "$(d .failure)" = misconfigured ] && [ "$(d '.misconfigured[0]')" = SMOKE_CONTROLLER_SEND_TO ] \
   || fail "live without a destination: $OUTPUT"
 [ -n "$(d .detail)" ] && [ "$(d .detail)" != null ] && [ "$(d .fire)" != null ] \
@@ -155,7 +166,7 @@ fire
 # the ledger silently. It is now the same wake as any other.
 new_case early-fault
 rm -f "$C/bin/gate.sh"
-fire
+NO_HEARTBEAT=1 fire
 [ "$WAKE" = true ] && [ "$(d .failure)" = misconfigured ] && [ ! -e "$OUT" ] \
   || fail "a fault before the out-dir resolves still reports: $OUTPUT"
 
@@ -783,7 +794,7 @@ fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6 SMOKE_CONTROLLER_SEND_TO=campaign-ro
 # file defined 17, so eleven names -- SMOKE_GATE_LEASE_DIR among them -- were
 # dropped silently. The deployed gate WRAPPER sources that file itself, so the
 # gate's own lease dir stayed right; but the evidence barrier is spawned by the
-# controller with this process's environment (smoke-campaign-controller.py:1800
+# controller with this process's environment (smoke-campaign-controller.py:1818
 # -> run_read_only -> spawn :692-704, env=None) and fell back to
 # ${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases
 # (smoke-evidence-barrier.sh:739). No pin for the campaign lives there, so the
@@ -971,5 +982,204 @@ env PATH="$C/bin:$PATH" SMOKE_CONTROLLER_ENV_FILE="$C/env.sh" \
 failed_rc=$?
 set -e
 [ "$failed_rc" -ne 0 ] && [ ! -s "$C/failed-output" ] || fail "unproven admission must enter script backoff, never wake another parent"
+
+# --- #1031: the claim renewer's liveness gates the POLL, and alarms per case ------
+# Every case sets up a PR the next poll would claim (next_poll_claims), so "no
+# poll" is only ever read against a fixture the positive control shows DOES
+# poll and claim with a fresh heartbeat. The alarm is asserted as the post the
+# operator actually receives (the enqueued text), not as a queue file.
+ago() { date -u -d "-$1 seconds" +%Y-%m-%dT%H:%M:%SZ; }
+polls() { calls '[.[] | select(.tool=="gate" and .op=="poll")] | length'; }
+renewer_posts() { # the renewer alarm posts enqueued so far
+  jq -c '[.messages // {} | .[] | select(.text | test("claim renewer")) | .text]' "$C/fake/enqueue.json" 2>/dev/null \
+    || echo '[]'
+}
+claimed_by_controller() { jq -r '.activeClaimant // ""' "$C/agent/state/pr-$PR-state.json" 2>/dev/null; }
+refused_to_claim() { # label state
+  [ "$(d .failure)" = null ] && [ "$(d .stepped)" = true ] \
+    || fail "$1: a renewer outage is not a failed fire -- it still steps: $OUTPUT"
+  [ "$(d .renewer.state)" = "$2" ] || fail "$1: the fire read the heartbeat as $2: $OUTPUT"
+  [ "$(polls)" = 0 ] || fail "$1: the gate was polled, so a campaign could be claimed: $(cat "$FAKE_LOG")"
+  [ -z "$(claimed_by_controller)" ] || fail "$1: a campaign was claimed with the renewer $2"
+  d .pollSkipped | grep -q "renewer" || fail "$1: the fire says why it did not poll: $OUTPUT"
+}
+
+# r0) POSITIVE CONTROL: the same fixture, a fresh heartbeat -> polled, claimed.
+new_case renewer-fresh
+next_poll_claims
+fire
+[ "$(d .renewer.state)" = fresh ] && [ "$(polls)" = 1 ] && [ "$(claimed_by_controller)" = controller ] \
+  || fail "r0: a fresh renewer lets the fire poll and claim: $OUTPUT"
+[ "$(renewer_posts)" = '[]' ] || fail "r0: a fresh renewer raises no alarm"
+
+# r1) STALE -- the series was paused or removed: its last tick is 12 min old.
+#     Refused, and one alarm naming the case; a second fire in the same outage
+#     posts nothing new.
+new_case renewer-stale
+next_poll_claims
+renewer_ticked ok "$(ago 720)"
+NO_HEARTBEAT=1 fire
+refused_to_claim r1 stale
+renewer_posts | jq -e 'length == 1 and (.[0] | test("stopped ticking") and test("ncl tasks list"))' >/dev/null \
+  || fail "r1: one post says the renewer stopped ticking: $(renewer_posts)"
+# A LATER fire: the worker's clock is second-resolution (FIRE), and two fires in
+# the same second cannot tell a per-outage alarm key from a per-fire one.
+sleep 1
+NO_HEARTBEAT=1 fire
+refused_to_claim "r1(second fire)" stale
+[ "$(renewer_posts | jq length)" = 1 ] || fail "r1: the same outage is posted once, not per fire: $(renewer_posts)"
+# ...and the renewer ticking again lifts it on the very next fire.
+next_poll_claims
+fire
+[ "$(d .renewer.state)" = fresh ] && [ "$(polls)" = 1 ] && [ "$(claimed_by_controller)" = controller ] \
+  || fail "r1: a renewer that ticks again lets the next fire claim: $OUTPUT"
+
+# r1b) one missed tick is NOT stale: 9 min old is inside two intervals.
+new_case renewer-one-missed-tick
+next_poll_claims
+renewer_ticked ok "$(ago 540)"
+NO_HEARTBEAT=1 fire
+[ "$(d .renewer.state)" = fresh ] && [ "$(polls)" = 1 ] || fail "r1b: one missed tick still polls: $OUTPUT"
+
+# r2) ABSENT -- the series was never created. The first fire refuses to claim
+#     but does NOT alarm (a freshly deployed renewer has not ticked yet); once
+#     the absence has lasted past the window, it alarms.
+new_case renewer-absent
+next_poll_claims
+fire_absent() { NO_HEARTBEAT=1 fire; }
+rm -rf "$OUT/renewer"
+fire_absent
+refused_to_claim "r2(grace)" absent
+[ "$(renewer_posts)" = '[]' ] || fail "r2: the deploy window before the first tick is not alarmed: $(renewer_posts)"
+[ -n "$(d .renewer.absentSince)" ] && [ "$(d .renewer.absentSince)" != null ] \
+  || fail "r2: the fire records when it first saw the renewer absent: $OUTPUT"
+jq -c --arg t "$(ago 720)" '.absentSince = $t' "$OUT/wrapper/renewer-watch.json" >"$C/w.tmp"
+mv "$C/w.tmp" "$OUT/wrapper/renewer-watch.json"   # 12 minutes of absence later
+fire_absent
+refused_to_claim "r2(past the window)" absent
+renewer_posts | jq -e 'length == 1 and (.[0] | test("never run here") and test("never created") and test("pinned copy"))' >/dev/null \
+  || fail "r2: one post says the renewer has never run: $(renewer_posts)"
+
+# r3) FAILING -- the renewer ticks, but every tick ends misconfigured.
+new_case renewer-failing
+next_poll_claims
+renewer_ticked misconfigured
+NO_HEARTBEAT=1 fire
+refused_to_claim r3 failing
+renewer_posts | jq -e 'length == 1 and (.[0] | test("ticking but renewing nothing") and test("misconfigured"))' \
+  >/dev/null || fail "r3: one post says the renewer ticks but renews nothing: $(renewer_posts)"
+
+# r3b) RENEW-FAILED -- the renewer reaches the gate but its progress calls do
+#      not renew (Codex, PR #1089). Even one such tick refuses the claim: a
+#      campaign claimed now could run a whole owner step before the next
+#      renewer tick could say more. It is alarmed only from the second in a
+#      row (one is a busy lock or a race), or on a count that is not a
+#      positive integer.
+new_case renewer-renew-failed-once
+next_poll_claims
+renewer_ticked renew-failed "" ',"failedTicks":1'
+NO_HEARTBEAT=1 fire
+refused_to_claim r3b degraded
+[ "$(d .renewer.failedTicks)" = 1 ] || fail "r3b: the fire records the failed-tick count: $OUTPUT"
+[ "$(renewer_posts)" = '[]' ] || fail "r3b: one failed tick is not alarmed: $(renewer_posts)"
+for COUNT in 2 5 '"2"' 0 -1 1.5 true null; do
+  new_case "renewer-renew-failed-$COUNT"
+  next_poll_claims
+  renewer_ticked renew-failed "" ",\"failedTicks\":$COUNT"
+  NO_HEARTBEAT=1 fire
+  refused_to_claim "r3b($COUNT)" failing
+done
+new_case renewer-renew-failed-no-count
+next_poll_claims
+renewer_ticked renew-failed
+NO_HEARTBEAT=1 fire
+refused_to_claim "r3b(no count)" failing
+renewer_posts | jq -e 'length == 1 and (.[0] | test("ticking but renewing nothing") and test("renew-failed"))' \
+  >/dev/null || fail "r3b: one post says the renewer ticks but renews nothing: $(renewer_posts)"
+
+# r3c) ONE ALARM PER OUTAGE, not per day (Codex, PR #1089): the same outage
+#      over several fires posts once; the renewer recovering and failing the
+#      same way again later is a second outage, and posts again.
+new_case renewer-second-outage
+next_poll_claims
+mkdir -p "$OUT/wrapper"
+ONSET="$(ago 900)"                                  # noticed 15 min ago
+printf '{"outageSince":"%s"}\n' "$ONSET" >"$OUT/wrapper/renewer-watch.json"
+renewer_ticked misconfigured
+NO_HEARTBEAT=1 fire
+[ "$(d .renewer.state)" = failing ] && [ "$(d .renewer.outageSince)" = "$ONSET" ] \
+  || fail "r3c: the outage keeps the onset it was first seen at: $OUTPUT"
+NO_HEARTBEAT=1 fire
+[ "$(renewer_posts | jq length)" = 1 ] || fail "r3c: one outage over two fires posts once: $(renewer_posts)"
+renewer_ticked ok
+NO_HEARTBEAT=1 fire
+[ "$(d .renewer.state)" = fresh ] && [ ! -e "$OUT/wrapper/renewer-watch.json" ] \
+  || fail "r3c: a fresh renewer ends the outage: $OUTPUT"
+renewer_ticked misconfigured
+NO_HEARTBEAT=1 fire
+[ "$(d .renewer.state)" = failing ] && [ "$(d .renewer.outageSince)" != "$ONSET" ] \
+  || fail "r3c: the second outage has its own onset: $OUTPUT"
+[ "$(renewer_posts | jq length)" = 2 ] || fail "r3c: a second outage the same day posts again: $(renewer_posts)"
+
+# r4) UNREADABLE -- the controller cannot look at the heartbeat (here a
+#     symlink, refused by O_NOFOLLOW). Never read as "the renewer stopped".
+new_case renewer-unreadable
+next_poll_claims
+mkdir -p "$OUT/renewer" "$C/elsewhere"
+printf '{"schemaVersion":1,"tick":"%s","status":"ok"}\n' "$(ago 0)" >"$C/elsewhere/hb.json"
+ln -s "$C/elsewhere/hb.json" "$OUT/renewer/heartbeat.json"
+NO_HEARTBEAT=1 fire
+refused_to_claim r4 unreadable
+renewer_posts | jq -e 'length == 1 and (.[0] | test("cannot read") and test("NOT proof the renewer stopped"))' \
+  >/dev/null || fail "r4: one post names a fault on this side, not a dead renewer: $(renewer_posts)"
+renewer_posts | jq -e '.[0] | test("stopped ticking|never run here") | not' >/dev/null \
+  || fail "r4: an unreadable heartbeat is not reported as a stopped or missing renewer"
+
+# r4b) a tick from the FUTURE is not believed: it would read as fresh for as
+#      long as it stayed ahead, masking a dead renewer.
+new_case renewer-future-tick
+next_poll_claims
+renewer_ticked ok "$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)"
+NO_HEARTBEAT=1 fire
+refused_to_claim r4b unreadable
+d .renewer.error | grep -q "future" || fail "r4b: the fire says the tick is in the future: $OUTPUT"
+
+# r6) END TO END: the heartbeat the REAL renewer writes is the one the worker
+#     reads as fresh -- same path, same fields -- so neither side's fixture
+#     can drift from the other's.
+new_case renewer-end-to-end
+fire                                   # the worker creates the out-dir and journal
+rm -rf "$OUT/renewer"
+SMOKE_CONTROLLER_ENV_FILE="$C/env.sh" bash "$SCRIPT_DIR/smoke-controller-renew.sh" >"$C/renew.out" 2>/dev/null
+jq -e '.data.status == "idle" or .data.status == "ok"' "$C/renew.out" >/dev/null \
+  || fail "r6: precondition -- the real renewer ticked healthily: $(cat "$C/renew.out")"
+[ -f "$OUT/renewer/heartbeat.json" ] || fail "r6: the real renewer wrote its heartbeat where the worker looks"
+next_poll_claims
+: >"$FAKE_LOG"
+NO_HEARTBEAT=1 fire
+[ "$(d .renewer.state)" = fresh ] && [ "$(polls)" = 1 ] \
+  || fail "r6: the worker reads the real renewer's heartbeat as fresh and polls: $OUTPUT"
+
+# r5) A run ALREADY CLAIMED when the renewer goes stale is not failed,
+#     released or frozen: it keeps its keepalive stamp and its step, and the
+#     alarm names it as at risk.
+new_case renewer-stale-claimed-run
+next_poll_claims
+fire
+[ "$(claimed_by_controller)" = controller ] || fail "r5: precondition -- the first fire claimed the run"
+: >"$FAKE_LOG"
+renewer_ticked ok "$(ago 720)"
+NO_HEARTBEAT=1 fire
+[ "$(d .failure)" = null ] && [ "$(d .renewer.state)" = stale ] && [ "$(polls)" = 0 ] \
+  && d .pollSkipped | grep -q renewer || fail "r5: the stale renewer stopped the poll: $OUTPUT"
+calls '[.[] | select(.tool=="gate" and .op=="progress")] | length >= 1' | grep -qx true \
+  || fail "r5: the claimed run still got its keepalive stamp: $(cat "$FAKE_LOG")"
+[ "$(d .stepped)" = true ] || fail "r5: the claimed run was still stepped: $OUTPUT"
+[ "$(jq -r '.activeRunId' "$C/agent/state/pr-$PR-state.json")" = "$RUN" ] \
+  || fail "r5: the claimed run still holds its slot"
+calls '[.[] | select(.tool=="gate" and (.op=="finish" or .op=="challenger-timeout" or .op=="release"))] | length == 0' \
+  | grep -qx true || fail "r5: the renewer being down finished or released nothing"
+renewer_posts | jq -e --arg r "$RUN" 'length == 1 and (.[0] | contains($r))' >/dev/null \
+  || fail "r5: the alarm names the claimed run at risk: $(renewer_posts)"
 
 echo "smoke controller live wrapper tests passed"
