@@ -62,12 +62,29 @@ jobs:
           # last moved in April; the image went to 1.3.14 in May, so CI spent two
           # months testing agent-runner code against a Bun we never ship.
           bun-version: 1.3.14
-      - run: pnpm install --frozen-lockfile
+      - name: Install host deps
+        id: install
+        run: pnpm install --frozen-lockfile
       - name: Install agent-runner deps (Bun)
+        id: bun_install
         working-directory: container/agent-runner
         run: bun install --frozen-lockfile
 
+      # REPORT THE WHOLE RED LIST, NOT THE FIRST ITEM (#1067). Without an
+      # `if:`, a step runs only when every step before it passed, so one early
+      # failure hid every later check — on 2026-09-22 seven main breaks surfaced
+      # one CI run at a time, and #1010's Container tests never ran across six
+      # runs because Host tests failed first. Each independent check below
+      # therefore carries
+      #   if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+      # `!cancelled()`, not `always()`: a cancelled run (concurrency, a manual
+      # stop) still stops here rather than burning quota. The install
+      # condition, not a bare `!cancelled()`: when deps failed to install,
+      # every check would fail for that one reason and bury it under a dozen
+      # identical reds. Container-side checks also require `bun_install`.
+      # The coverage ratchet is NOT independent — see its own comment.
       - name: Format check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm run format:check
 
       # Seam 3 — neither pre-push locally (bypassed with --no-verify, or a
@@ -78,15 +95,19 @@ jobs:
       # any of the pre-existing rules) could merge clean and only surface at
       # the next deploy build.
       - name: Lint
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm run lint
 
       - name: Typecheck host
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm exec tsc --noEmit
 
       - name: Typecheck scripts
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm exec tsc -p tsconfig.scripts.json --noEmit
 
       - name: Typecheck container
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && steps.bun_install.outcome == 'success' }}
         run: pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 
       # Everything except the three drift tests, which belong to `bookkeeping`.
@@ -115,11 +136,15 @@ jobs:
       #
       # Feeds scripts/check-risk-coverage.ts below.
       - name: Host tests
+        id: host_tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm exec vitest run --coverage
         env:
           VITEST_LANE: correctness
 
       - name: Container tests
+        id: container_tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && steps.bun_install.outcome == 'success' }}
         working-directory: container/agent-runner
         # No concurrency flag here on purpose. `bun test` runs test FILES
         # sequentially in a single process — `--max-concurrency` only caps
@@ -168,6 +193,7 @@ jobs:
       # failed here, though not locally, where a personal git identity
       # happened to hide it).
       - name: git-safety.sh selfcheck
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm run check:git-safety-selfcheck
         env:
           GIT_AUTHOR_NAME: selfcheck
@@ -176,6 +202,7 @@ jobs:
           GIT_COMMITTER_EMAIL: selfcheck@example.invalid
 
       - name: wiki-pre-push-hook.sh selfcheck
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm run check:wiki-pre-push-hook-selfcheck
         env:
           GIT_AUTHOR_NAME: selfcheck
@@ -192,6 +219,7 @@ jobs:
       # GIT_CONFIG_NOSYSTEM=1 keeps it hermetic against this runner's own git
       # config; ~7s, bash/git/jq are all preinstalled on ubuntu-latest.
       - name: health-sentinel.sh selfcheck
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: |
           export HOME="$(mktemp -d)"
           export GIT_CONFIG_NOSYSTEM=1
@@ -210,8 +238,27 @@ jobs:
       # repo root against both reports produced above, in the same job so no
       # artifact hand-off is needed for the gate itself (the steps below are
       # only for regenerating the baseline from a real CI run).
+      #
+      # NOT independent (#1067): it reads the coverage Host tests and Container
+      # tests wrote, and a suite that failed partway leaves a partial report
+      # that would read as spurious regressions. So it runs only when both
+      # suites passed, and when it cannot run, the step after it FAILS BY NAME
+      # rather than leaving the ratchet silently absent from the red list — a
+      # missing check reads as a pass.
       - name: Risk-path coverage ratchet
+        if: ${{ !cancelled() && steps.host_tests.outcome == 'success' && steps.container_tests.outcome == 'success' }}
         run: pnpm exec tsx scripts/check-risk-coverage.ts
+
+      - name: Risk-path coverage ratchet NOT RUN
+        if: ${{ !cancelled() && (steps.host_tests.outcome != 'success' || steps.container_tests.outcome != 'success') }}
+        env:
+          HOST_TESTS: ${{ steps.host_tests.outcome }}
+          CONTAINER_TESTS: ${{ steps.container_tests.outcome }}
+        run: |
+          msg="coverage ratchet NOT RUN: it needs complete coverage from both suites (Host tests: $HOST_TESTS, Container tests: $CONTAINER_TESTS). Fix those, then rerun — coverage on risk:high paths is unchecked until then."
+          echo "::error title=Risk-path coverage ratchet NOT RUN::$msg"
+          printf '### Risk-path coverage ratchet: NOT RUN\n\n%s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
       # A SEPARATE, unconditional (`if: always()`) computation from the same
       # two reports: writes a FRESH baseline candidate to a throwaway path,
@@ -260,9 +307,14 @@ jobs:
       # installing it would let a bun.lock or Bun-pin change red the
       # BOOKKEEPING job for a reason that has nothing to do with bookkeeping.
       # Keeping each job's red meaningful is the whole point of the split.
-      - run: pnpm install --frozen-lockfile
+      - name: Install host deps
+        id: install
+        run: pnpm install --frozen-lockfile
 
+      # Independent checks: each reports even when another failed (#1067; see
+      # the note above `Format check` in `correctness`).
       - name: Public repository boundary
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm run check:public-boundary -- --portable
 
       # The host suite can only prove src/upstream-ratchet.json is CURRENT — it
@@ -275,6 +327,7 @@ jobs:
       # Exit 1 = a diff grew or became newly divergent. Exit 2 = the fetch did
       # not land, which is an infrastructure failure, not a ratchet failure.
       - name: Upstream divergence ratchet
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: |
           git fetch --depth=1 https://github.com/nanocoai/nanoclaw.git \
             "$(node -p "require('./src/upstream-ratchet.json').upstream")"
@@ -284,6 +337,7 @@ jobs:
       # commit an artifact", never "the code is broken". See DRIFT_TESTS in
       # vitest.config.ts.
       - name: Drift tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm exec vitest run
         env:
           VITEST_LANE: drift
