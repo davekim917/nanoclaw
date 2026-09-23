@@ -6,49 +6,21 @@
  * is in the (host-projected) archive DB, not just self-group rows.
  *
  * Setup: build a synthetic projection DB in :memory: matching the ARCHIVE_SCHEMA_SQL
- * from src/db/per-agent-projections.ts, then inject it into the module via
- * mock.module on 'bun:sqlite'.
+ * from src/db/per-agent-projections.ts, and hand it to the module through
+ * _setArchiveDbForTest.
+ *
+ * Never mock.module('bun:sqlite') here (issue #1076). bun module mocks are
+ * process-global and mock.restore() does not undo them, so every later test
+ * file's session DBs were built from the mock class. It did not forward
+ * `inTransaction`, so controller-send's catch (modules/mailbox/controller-send.ts:216)
+ * skipped its ROLLBACK and the next BEGIN IMMEDIATE threw.
  */
-import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from 'bun:test';
 import { Database } from 'bun:sqlite';
 
-// ---- Capture real Database class BEFORE any mock.module calls ----
-// We use the real class to build synthetic projection DBs in memory.
-const RealDatabase = Database;
-
-// ---- Module-level state for injected test DB ----
-// The thread-search module keeps a private _db singleton. We intercept by
-// mocking 'bun:sqlite' so that new Database(ARCHIVE_PATH, {readonly:true})
-// returns our test-controlled in-memory DB instead of opening the missing file.
-let _injectedDb: Database | null = null;
-
-mock.module('bun:sqlite', () => ({
-  Database: class MockDatabase {
-    private _real: Database;
-    constructor(path: string | Buffer, options?: { readonly?: boolean }) {
-      if (_injectedDb && path === '/workspace/archive.db') {
-        // Intercept archive.db open — return injected test DB
-        this._real = _injectedDb;
-      } else {
-        // Any other DB (e.g. :memory: in the mailbox connection) — open normally
-        this._real = new RealDatabase(path as string, options);
-      }
-    }
-    prepare(sql: string) { return this._real.prepare(sql); }
-    exec(sql: string) { return this._real.exec(sql); }
-    close() { /* keep singleton alive across calls in same test */ }
-    run(sql: string, ...params: unknown[]) { return this._real.run(sql, ...params as Parameters<Database['run']>); }
-    query(sql: string) { return this._real.query(sql); }
-    // bun's mock.module is process-global: later test files' mailbox connection
-    // singletons are built from THIS class. Forward transaction so code like
-    // markScriptSkipped (db.transaction(...)()) keeps working cross-file.
-    transaction(fn: (...args: unknown[]) => unknown) { return this._real.transaction(fn); }
-    get(sql: string, ...params: unknown[]) { return (this._real as unknown as Record<string, (...a: unknown[]) => unknown>)['get']?.(sql, ...params); }
-  },
-}));
-
-const { initTestSessionDb, closeSessionDb } = await import("../modules/mailbox/testing.js");
-const { getInboundDb } = await import("../mailbox/sqlite/connection.js");
+import { initTestSessionDb, closeSessionDb } from '../modules/mailbox/testing.js';
+import { getInboundDb } from '../mailbox/sqlite/connection.js';
+import { searchThreadsTool, resolveThreadLinkTool, readThreadTool, _setArchiveDbForTest } from './thread-search.js';
 
 function seedSessionRouting(): void {
   const db = getInboundDb();
@@ -57,14 +29,6 @@ function seedSessionRouting(): void {
     "INSERT INTO session_routing (id, channel_type, platform_id, thread_id, spawn_task_id, session_id) VALUES (1, ?, ?, NULL, NULL, ?)",
   ).run("slack", "slack:C001", "sess-test");
 }
-
-// ---- Mock server.js registerTools (side-effect on import) ----
-mock.module('./server.js', () => ({
-  registerTools: (_tools: unknown) => {},
-}));
-
-// Import tools AFTER mocks are wired up.
-const { searchThreadsTool, resolveThreadLinkTool, readThreadTool } = await import('./thread-search.js');
 
 // ---- ARCHIVE_SCHEMA_SQL (copied from src/db/per-agent-projections.ts) ----
 const ARCHIVE_SCHEMA_SQL = `
@@ -106,7 +70,7 @@ const ARCHIVE_SCHEMA_SQL = `
 `;
 
 function buildProjectionDb(): Database {
-  const db = new RealDatabase(':memory:');
+  const db = new Database(':memory:');
   db.exec(ARCHIVE_SCHEMA_SQL);
   return db;
 }
@@ -147,31 +111,13 @@ function insertMsg(
   );
 }
 
-// Helper to reset the module's _db singleton between tests.
-// We do this by replacing _injectedDb with a fresh DB and clearing the
-// thread-search module's internal cache by reassigning _injectedDb before
-// the first call (module cache keeps _db set, so we need a different approach).
-//
-// Solution: set _injectedDb BEFORE calling getDb() in the module. The module
-// lazily initialises _db on first call. We force a re-init by re-importing
-// with a fresh mock — but that's complex. Instead: each test just makes sure
-// _injectedDb is set fresh; the getDb() singleton is already initialised by
-// the first test. We work around this by reading via a stable singleton but
-// swapping row content per test.
-//
-// Practical approach: use one shared DB per describe block, insert/delete rows
-// per test. Since the module-level _db is initialised on first call and we
-// can't reset it between tests without re-importing, we share one DB instance
-// across all tests (the one set in _injectedDb before first import). Each test
-// clears the table and re-populates.
-
-let sharedDb: Database;
-
-// One-time setup: build the shared DB and wire it as the injected DB.
-// The mock.module for bun:sqlite intercepts new Database('/workspace/archive.db')
-// and returns this when _injectedDb is set.
-sharedDb = buildProjectionDb();
-_injectedDb = sharedDb;
+// One archive DB for the file, cleared and re-populated per test.
+const sharedDb: Database = buildProjectionDb();
+_setArchiveDbForTest(sharedDb);
+afterAll(() => {
+  _setArchiveDbForTest(null);
+  sharedDb.close();
+});
 
 function clearDb(db: Database): void {
   // FTS triggers handle fts cleanup automatically via AD trigger.
