@@ -163,10 +163,10 @@ GATE_FAILURES=0
 HEARTBEAT_DIR=""
 # Consecutive ticks, this one included, in which a gate `progress` call for an
 # eligible step came back as anything but a renewal (or a positive "that run is
-# no longer active"). 0 on every other tick. The worker stops claiming at 2
-# (smoke-controller-live-worker.py, RENEWER_FAILED_TICKS_LIMIT): one failed
-# tick is a busy lock or a race and the 900 s lease outlasts it; two in a row
-# is a renewer that cannot renew.
+# no longer active"). 0 on every other tick. The worker stops claiming on the
+# first and alarms from the second (smoke-controller-live-worker.py,
+# RENEWER_FAILED_TICKS_LIMIT): one failed tick is usually a busy lock or a race;
+# two in a row is a renewer that cannot renew.
 FAILED_TICKS=0
 heartbeat() { # <status>
   [ -n "$HEARTBEAT_DIR" ] || return 0

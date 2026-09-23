@@ -511,8 +511,9 @@ def latch_map(states, control):
 def alarm_fingerprint(wake, control):
     """One fingerprint for the poll path and the latch path alike."""
     if str(wake.get("trigger") or "").startswith(RENEWER_TRIGGER_PREFIX):
-        # One alarm per renewer outage per day: the key names the outage
-        # (renewer_gate), never the fire that noticed it.
+        # One alarm per renewer outage: the key names the outage and its
+        # onset (renewer_gate), never the fire that noticed it -- so a second
+        # outage the same day is a second alarm, not a duplicate of the first.
         return "renewer:{}".format(wake.get("renewerKey") or "-")
     field = CONTROL_TRIGGERS.get(wake.get("trigger"))
     if field:
@@ -571,8 +572,11 @@ def alarm_queue():
 #               in `renew-failed`, gate `progress` calls that did not renew,
 #               for RENEWER_FAILED_TICKS_LIMIT ticks in a row. A renewer that
 #               cannot reach the lease while this worker can still claim is
-#               the failure this gate exists for; one such tick is a busy lock
-#               or a race, which the 900 s lease outlasts.
+#               the failure this gate exists for.
+#   degraded    exactly one `renew-failed` tick: the poll is refused (a
+#               campaign claimed now could run a whole owner step before the
+#               next renewer tick, and this series cannot fire again until
+#               that occurrence ends), but not alarmed until a second.
 #   unreadable  the heartbeat could not be LOOKED at (EACCES, a symlink, a
 #               non-regular file, bytes that are not a heartbeat, a tick from
 #               the future): a fault on this side, NOT evidence the renewer
@@ -588,7 +592,7 @@ RENEWER_WATCH = ["wrapper", "renewer-watch.json"]
 
 
 def renewer_health():
-    """(state, detail): fresh | absent | stale | failing | unreadable.
+    """(state, detail): fresh | absent | stale | degraded | failing | unreadable.
     Absent is claimed ONLY on ENOENT -- of <out>/renewer or of the file in it.
     Every other failure to look is `unreadable`, never `absent`."""
     try:
@@ -640,7 +644,7 @@ def renewer_health():
         detail["failedTicks"] = failed
         if (isinstance(failed, int) and not isinstance(failed, bool)
                 and 1 <= failed < RENEWER_FAILED_TICKS_LIMIT):
-            return "fresh", detail
+            return "degraded", detail
         return "failing", detail
     if doc.get("status") not in RENEWER_HEALTHY_STATUSES:
         return "failing", detail
@@ -648,42 +652,64 @@ def renewer_health():
 
 
 def renewer_gate(states):
-    """True when this fire may poll. Otherwise records why in the summary and,
-    past the absent grace, queues ONE operator alarm for this outage."""
+    """True when this fire may poll. Otherwise records why in the summary and
+    queues ONE operator alarm per outage (absent: only past its grace)."""
     state, detail = renewer_health()
     summary["renewer"] = dict(detail, state=state)
-    if state != "absent":
+    if state == "fresh":
         try:
             ctl.unlink_contained(OUT, RENEWER_WATCH)
         except (OSError, ctl.ControllerError):
             pass
-    if state == "fresh":
         return True
+    # THE OUTAGE: every fire from the first that saw the renewer unhealthy to
+    # the next that sees it fresh. Its onset is kept in renewer-watch.json and
+    # named in the alarm key, so each outage alarms once and a later one alarms
+    # again. absentSince is the absent grace's own clock, reset whenever the
+    # renewer is anything but absent.
+    watch, _ = read_json(os.path.join(WRAP, *RENEWER_WATCH[1:]))
+    watch = watch if isinstance(watch, dict) else {}
+    onset = ctl.parse_iso(watch.get("outageSince"))
+    since = ctl.parse_iso(watch.get("absentSince")) if state == "absent" else None
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    want = {"outageSince": (onset or now).strftime(fmt)}
+    if state == "absent":
+        want["absentSince"] = (since or now).strftime(fmt)
+    kept = True
+    if want != watch:
+        try:
+            write(RENEWER_WATCH, json.dumps(want, sort_keys=True) + "\n")
+        except (OSError, ctl.ControllerError):
+            # Unrecorded, the onset is this fire's and would change every fire:
+            # the keys below drop it rather than alarm on every fire.
+            kept = False
+    outage = "@" + want["outageSince"] if kept else ""
+    summary["renewer"]["outageSince"] = want["outageSince"]
     claimed = sorted(st["activeRunId"] for st in states.values()
                      if isinstance(st.get("activeRunId"), str) and st.get("activeClaimant") == "controller")
     if state == "absent":
-        watch, _ = read_json(os.path.join(WRAP, *RENEWER_WATCH[1:]))
-        since = ctl.parse_iso((watch or {}).get("absentSince")) if isinstance(watch, dict) else None
-        if since is None:
-            since = now
-            write(RENEWER_WATCH, json.dumps({"absentSince": FIRE}, sort_keys=True) + "\n")
+        since = since or now
         waited = int((now - since).total_seconds())
-        summary["renewer"]["absentSince"] = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+        summary["renewer"]["absentSince"] = want["absentSince"]
         summary["pollSkipped"] = "claim renewer heartbeat absent for {}s: not claiming".format(waited)
         if waited <= RENEWER_STALE_SECONDS:
             return False
-        reason = "no heartbeat since this controller first looked at {}".format(summary["renewer"]["absentSince"])
-        key = "absent"
+        reason = "no heartbeat since this controller first looked at {}".format(want["absentSince"])
+        key = "absent" + outage
+    elif state == "degraded":
+        summary["pollSkipped"] = ("claim renewer's last tick did not renew ({} failed tick): "
+                                  "not claiming").format(detail.get("failedTicks"))
+        return False
     elif state == "stale":
         reason = "its last tick was {} ({} min ago, status {})".format(
             detail["lastTick"], detail["ageSeconds"] // 60, detail.get("status"))
         key = "stale@" + detail["lastTick"]
     elif state == "failing":
         reason = "its last tick at {} ended `{}`".format(detail["lastTick"], detail.get("status"))
-        key = "failing@{}".format(detail.get("status"))
+        key = "failing@{}{}".format(detail.get("status"), outage)
     else:
         reason = detail.get("error") or "unreadable"
-        key = "unreadable"
+        key = "unreadable" + outage
     if claimed:
         reason += "; claimed run(s) at risk of losing their lease on a long owner step: " + ", ".join(claimed)
     summary.setdefault("pollSkipped", "claim renewer {}: not claiming".format(state))

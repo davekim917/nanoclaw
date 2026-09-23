@@ -1769,9 +1769,10 @@ cost a 13-lane step four lane markers and finished the run `BLOCKED`
 **The live controller will not claim a new campaign without it.** Every tick
 writes `<out-dir>/renewer/heartbeat.json`. Before each poll, the live
 controller reads it and skips the poll unless the last tick is under 11 minutes
-old and ended `ok` or `idle`, or ended `renew-failed` for the first tick in a
-row (gate `progress` calls that did not renew; one such tick is a busy lock or
-a race, and the 900 s lease outlasts it). It posts one alarm per outage per day, with
+old and ended `ok` or `idle`. A tick ending `renew-failed` (gate `progress`
+calls that did not renew) stops claiming at once, but is alarmed only from the
+second in a row, since one is usually a busy lock or a race. It posts one alarm per outage (a
+later outage the same day alarms again), with
 different wording for each case, because each has a different fix:
 
 | Alarm says | What it means | Fix |

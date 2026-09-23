@@ -1069,15 +1069,17 @@ renewer_posts | jq -e 'length == 1 and (.[0] | test("ticking but renewing nothin
   >/dev/null || fail "r3: one post says the renewer ticks but renews nothing: $(renewer_posts)"
 
 # r3b) RENEW-FAILED -- the renewer reaches the gate but its progress calls do
-#      not renew (Codex, PR #1089). One such tick is a busy lock or a race and
-#      still claims; two in a row, or a count that is not a positive integer,
-#      is a renewer that cannot renew.
+#      not renew (Codex, PR #1089). Even one such tick refuses the claim: a
+#      campaign claimed now could run a whole owner step before the next
+#      renewer tick could say more. It is alarmed only from the second in a
+#      row (one is a busy lock or a race), or on a count that is not a
+#      positive integer.
 new_case renewer-renew-failed-once
 next_poll_claims
 renewer_ticked renew-failed "" ',"failedTicks":1'
 NO_HEARTBEAT=1 fire
-[ "$(d .renewer.state)" = fresh ] && [ "$(d .renewer.failedTicks)" = 1 ] && [ "$(polls)" = 1 ] \
-  && [ "$(claimed_by_controller)" = controller ] || fail "r3b: one failed tick still claims: $OUTPUT"
+refused_to_claim r3b degraded
+[ "$(d .renewer.failedTicks)" = 1 ] || fail "r3b: the fire records the failed-tick count: $OUTPUT"
 [ "$(renewer_posts)" = '[]' ] || fail "r3b: one failed tick is not alarmed: $(renewer_posts)"
 for COUNT in 2 5 '"2"' 0 -1 1.5 true null; do
   new_case "renewer-renew-failed-$COUNT"
@@ -1093,6 +1095,30 @@ NO_HEARTBEAT=1 fire
 refused_to_claim "r3b(no count)" failing
 renewer_posts | jq -e 'length == 1 and (.[0] | test("ticking but renewing nothing") and test("renew-failed"))' \
   >/dev/null || fail "r3b: one post says the renewer ticks but renews nothing: $(renewer_posts)"
+
+# r3c) ONE ALARM PER OUTAGE, not per day (Codex, PR #1089): the same outage
+#      over several fires posts once; the renewer recovering and failing the
+#      same way again later is a second outage, and posts again.
+new_case renewer-second-outage
+next_poll_claims
+mkdir -p "$OUT/wrapper"
+ONSET="$(ago 900)"                                  # noticed 15 min ago
+printf '{"outageSince":"%s"}\n' "$ONSET" >"$OUT/wrapper/renewer-watch.json"
+renewer_ticked misconfigured
+NO_HEARTBEAT=1 fire
+[ "$(d .renewer.state)" = failing ] && [ "$(d .renewer.outageSince)" = "$ONSET" ] \
+  || fail "r3c: the outage keeps the onset it was first seen at: $OUTPUT"
+NO_HEARTBEAT=1 fire
+[ "$(renewer_posts | jq length)" = 1 ] || fail "r3c: one outage over two fires posts once: $(renewer_posts)"
+renewer_ticked ok
+NO_HEARTBEAT=1 fire
+[ "$(d .renewer.state)" = fresh ] && [ ! -e "$OUT/wrapper/renewer-watch.json" ] \
+  || fail "r3c: a fresh renewer ends the outage: $OUTPUT"
+renewer_ticked misconfigured
+NO_HEARTBEAT=1 fire
+[ "$(d .renewer.state)" = failing ] && [ "$(d .renewer.outageSince)" != "$ONSET" ] \
+  || fail "r3c: the second outage has its own onset: $OUTPUT"
+[ "$(renewer_posts | jq length)" = 2 ] || fail "r3c: a second outage the same day posts again: $(renewer_posts)"
 
 # r4) UNREADABLE -- the controller cannot look at the heartbeat (here a
 #     symlink, refused by O_NOFOLLOW). Never read as "the renewer stopped".
