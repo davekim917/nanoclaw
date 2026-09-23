@@ -28,6 +28,7 @@ pnpm exec tsx scripts/q.ts data/v2.db "select mga.id, mg.name, mga.agent_group_i
 ncl tasks list --json   # rows with model_pin / effort_pin
 # Subagent defs: group-local, then plugin agents
 grep -rHE '^(model|effort):' groups/*/.claude/agents
+grep -rHE '^(model|effort):' ~/plugins/*/plugins/*/agents   # plugin agents (delegation roles live here, not in trunk)
 # What actually ran
 pnpm exec tsx scripts/q.ts data/v2.db "select agent_group_id, trigger, model, effort, count(*) from turn_usage where ts > '<ISO since>' group by 1,2,3,4 order by 1"
 ```
@@ -60,7 +61,8 @@ Code:
 - CLI/SDK pins: never hand-edit the manifests. Go through the audited flow (`docs/dependency-updates.md`), which rejects prerelease and yanked releases and regenerates the lock deterministically:
   ```bash
   bun scripts/container-updates.ts audit --format json        # item ids: docker:claude-code, bun:@anthropic-ai/claude-agent-sdk, docker:codex
-  bun scripts/container-updates.ts apply --repo <worktree> --items docker:claude-code,bun:@anthropic-ai/claude-agent-sdk
+  bun scripts/container-updates.ts apply --repo <worktree> --items docker:claude-code,bun:@anthropic-ai/claude-agent-sdk   # Claude bump
+  bun scripts/container-updates.ts apply --repo <worktree> --items docker:codex                                             # Codex bump
   ```
   Then record the new pins in **`versions.json`**. `setup/lib/image-version-pins.test.ts` fails if `versions.json` drifts from the Dockerfile or `package.json`, or if claude-code and the SDK differ in patch number. If the audited latest versions of the two differ in patch number, stop and ask; don't hand-pick a pair. The SDK bump changes the deps hash, and spawns refuse until the image is rebuilt (`src/agent-runner-image-check.ts`), so the package edit and the rebuild ship together.
 - New Codex id: add its `MIN_CODEX_CLI` row in `setup/lib/codex-model-min-cli.test.ts` with the minimum version the step-2 probe proved. The test fails when the default or an alias target has no row.
@@ -87,6 +89,7 @@ Then follow the repo's merge gate. Deploy is the deployer's job, and the restart
 ```bash
 ncl tasks update --id <series> --group <ag-id> --model opus --effort low       # "" clears
 ncl tasks repin --all --from-model <old> --to-model <new> --dry-run             # bulk; literal match, see `ncl tasks help repin`
+ncl tasks repin --all --from-model <old> --to-model <new>                       # then apply, after reviewing the dry-run report
 ncl wirings update <mga-id> --default-model opus --default-effort low          # "" clears
 ncl groups config update --id <ag-id> --model <full-id> --effort medium        # writes DB + container.json; applies at restart
 ```
@@ -101,6 +104,6 @@ ncl groups config update --id <ag-id> --model <full-id> --effort medium        #
 
 ## 5. Verify after deploy
 
-- A fresh container's env shows the new default: `ANTHROPIC_DEFAULT_OPUS_MODEL=<new-id>`. `docker exec <c> codex --version` shows the new CLI.
+- A fresh container's env shows the new default for the family that moved: `ANTHROPIC_DEFAULT_OPUS_MODEL`, `_SONNET_MODEL`, or `_HAIKU_MODEL` (`src/claude-spawn-defaults.ts:240-249`). Unpinned groups run Opus, so a Sonnet, Haiku, or Fable bump shows in `turn_usage` only on a turn pinned to that family. For Codex, `docker exec <c> codex --version` shows the new CLI.
 - `turn_usage` shows the new id for unpinned work. A config write proves only that the config was written.
 - Rollover: use plain `docker ps --format '{{.Names}} {{.Image}} {{.Label "nanoclaw-session"}}'`. `--filter ancestor=<old id>` misses containers whose image is now untagged. An old-image container is not a reason to kill in-flight work. Report it, and let it roll over or be recycled at a quiet moment.
