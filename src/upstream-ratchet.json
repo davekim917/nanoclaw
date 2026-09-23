@@ -674,7 +674,7 @@
 "src/cli/resources/user-dms.ts":{"diff":0,"mode":"100644","sha256":"fcc176650dd7425b053d31301f14d5e856dc4cef76507223f29175c3cd2d781e"},
 "src/cli/resources/users.ts":{"diff":0,"mode":"100644","sha256":"0e6ab94787f4f6fc840346a837915b260f5e6e9b4b16f0e82b3f9cb5e87f8e38"},
 "src/cli/resources/wirings.test.ts":{"diff":324,"mode":"100644","sha256":"9938285ffc44f3609903a68ac191bcb17559b8f3ac9ac32144ddec11d3b83b4b"},
-"src/cli/resources/wirings.ts":{"diff":101,"mode":"100644","sha256":"577a3884c237d7d29b21a9559104c60c405e25838e3e472d120fffe8b2cfdb5d"},
+"src/cli/resources/wirings.ts":{"diff":101,"mode":"100644","sha256":"e838d431588f4869eed9e7e30e496eefc982af737c2893a2750f10cf1c17e48c"},
 "src/cli/socket-client.ts":{"diff":0,"mode":"100644","sha256":"dc7857cf9b1ba00f974614c3a64bf01a345de384fd4dbdfa8c8f3a0e9e75692b"},
 "src/cli/socket-server.test.ts":{"diff":319,"mode":"100644","sha256":"c01983081c4a50a53147c240b1b5f8570ed6bc67e989ae75667ed13c95988a3a"},
 "src/cli/socket-server.ts":{"diff":267,"mode":"100644","sha256":"3e433b8f2925dbc57f5f57764b1433715fb6e6edf0a4ea9e6ecace8eeeedf37f"},
