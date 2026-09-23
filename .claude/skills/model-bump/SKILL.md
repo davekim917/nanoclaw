@@ -1,0 +1,98 @@
+---
+name: model-bump
+description: "Adopt a newly released Anthropic or OpenAI model across the fleet: move the install default and family alias, bump the pinned CLI/SDK that must know the new id, ship the breaking-change contract (CHANGELOG, migration doc, versions.json) in the first push, then repin whatever should follow (groups, channel wirings, scheduled tasks, subagent defs, session stickies). Also answers 'what model/effort runs where'. Triggers: 'Opus X is out', 'new GPT model', 'bump the default model', 'make -m opus resolve to', 'move <agent/task> to <model>', 'model inventory'. Host session only."
+---
+
+# Model bump
+
+A model release touches three layers. Only the first two need a PR.
+
+| Layer | Where | How it changes |
+|---|---|---|
+| **Install default + aliases** | `src/flag-parser.ts` (`DEFAULT_OPUS_MODEL`, `MODEL_ALIAS_MAP`, `MODEL_EFFORT_SUPPORT`, `CODEX_MODEL_ALIAS_MAP`); Claude family default effort in `defaultEffortForModel` (`container/agent-runner/src/providers/claude.ts`); `DEFAULT_CODEX_MODEL` / `DEFAULT_CODEX_EFFORT` (`container/agent-runner/src/providers/codex.ts`) | PR → deploy → image rebuild |
+| **Runtime that must know the id** | `container/Dockerfile` `CLAUDE_CODE_VERSION` + `@anthropic-ai/claude-agent-sdk` in `container/agent-runner/package.json` (same patch number); `CODEX_VERSION` | same PR |
+| **Fleet pins** | `groups/<g>/container.json`, channel wirings, task pins, subagent frontmatter, session stickies | `ncl` / file edits, no deploy |
+
+**Pins that say `opus` / `sonnet` / `fable` follow the Claude default automatically; frozen ids (`claude-opus-5[1m]`) do not.** When the user wants "the current Opus", write the family alias. Codex aliases (`sol`, `luna`, `terra`) are different: they resolve when the pin is written and freeze. `ncl groups config update --model` stores its argument verbatim, so pass a full `gpt-*` id there.
+
+## 1. Inventory: what runs where
+
+Check a user's claim ("X is on Sonnet") against what actually ran before changing anything. It is often a stale session sticky, not a pin.
+
+```bash
+# Group config (authoritative). Indented provider/model lines are providerFallback.
+grep -HE '"(provider|model|effort)":' groups/*/container.json
+# Channel wiring overrides
+pnpm exec tsx scripts/q.ts data/v2.db "select mga.id, mg.name, mga.agent_group_id, mga.default_model, mga.default_effort from messaging_group_agents mga join messaging_groups mg on mg.id = mga.messaging_group_id where coalesce(mga.default_model,'') <> '' or coalesce(mga.default_effort,'') <> ''"
+# Scheduled-task pins
+ncl tasks list --json   # rows with model_pin / effort_pin
+# Subagent defs: group-local, then plugin agents
+grep -rHE '^(model|effort):' groups/*/.claude/agents
+# What actually ran
+pnpm exec tsx scripts/q.ts data/v2.db "select agent_group_id, trigger, model, effort, count(*) from turn_usage where ts > '<ISO since>' group by 1,2,3,4 order by 1"
+```
+
+Session stickies: use the `outbound.db` sweep in the **Detect** block of `docs/codex-default-model.md` (change the `like` pattern to the id you are looking for).
+
+## 2. Does the image's CLI serve the id?
+
+Test against the **container's** pinned CLI, never the host's.
+
+- **Claude**: an id the CLI binary doesn't contain silently loses its family behaviour (1M window, effort ladder). Grep the image, with the current default as a control:
+  ```bash
+  IMG=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -m1 'nanoclaw-agent-v2-.*:latest')
+  docker run --rm --entrypoint sh "$IMG" -c 'p=$(find / -path /proc -prune -o -type d -path "*@anthropic-ai/claude-code" -print 2>/dev/null | head -1); grep -rlao "<new-id>" "$p" | wc -l'
+  ```
+  If the count is 0, move to the first `latest` release that has it, and move the CLI and SDK to the same patch number.
+- **Codex**: the server gates new models **by client version**, and the binary's catalog doesn't list them either way. Grepping proves nothing. Probe each candidate version with a real call under the fleet's auth (ChatGPT account): `codex exec -m <new-id> -c model_reasoning_effort=<effort> "reply ok"`. On 2026-09-22 `gpt-6-sol` returned HTTP 400 on 0.154.0 and worked on 0.155.1. Keep the container's `CODEX_VERSION` equal to the host's `codex --version`.
+
+## 3. The PR: everything in the first push
+
+Work in a scratch worktree off `origin/main`, never the live checkout. **One PR = the runtime change only.** Tooling, inventory scripts, and review-policy changes go in their own PRs.
+
+Code:
+- New Claude id: add pinned aliases to `MODEL_ALIAS_MAP` (e.g. `opus55`, `opus5-5`, `opus-5-5` → `claude-opus-5-5[1m]`; Opus and Fable always carry `[1m]`), and add a `MODEL_EFFORT_SUPPORT` row.
+- Default: change `DEFAULT_OPUS_MODEL` / `DEFAULT_CODEX_MODEL`. For Codex, repoint the family alias in `CODEX_MODEL_ALIAS_MAP`.
+- Default effort: `defaultEffortForModel` is the only place a Claude family default lives (`src/claude-spawn-defaults.ts` derives none). For Codex it is `DEFAULT_CODEX_EFFORT`.
+- CLI/SDK pins: bump `container/Dockerfile`, `container/agent-runner/package.json` (then `bun install` there and commit `bun.lock`), **and `versions.json`**. `setup/lib/image-version-pins.test.ts` fails if these drift, or if claude-code and the SDK differ in patch number. The SDK bump changes the deps hash, and spawns refuse until the image is rebuilt (`src/agent-runner-image-check.ts`), so the package edit and the rebuild ship together.
+- New Codex id: add its `MIN_CODEX_CLI` row in `setup/lib/codex-model-min-cli.test.ts` with the minimum version the step-2 probe proved. The test fails when the default or an alias target has no row.
+
+Contract (CONTRIBUTING.md "Breaking Changes"). A moved default is breaking:
+- A `[BREAKING]` CHANGELOG entry saying what moves, what's required (CLI minimum, image rebuild), and a link to the migration doc.
+- A migration section in `docs/claude-default-model.md` or `docs/codex-default-model.md` with **detect / why / fix / verify / rollback**. Mark the old section as history. Facts the first draft got wrong last time:
+  - a pure task fire ignores session stickies (`effectiveTurnSettings`, `container/agent-runner/src/poll-loop.ts:4029`);
+  - a group's `providerConfig.model` outranks the wiring (`container/agent-runner/src/providers/claude.ts:2770`: `input.model ?? stickyConfig.model ?? NANOCLAW_CLAUDE_MODEL ?? ANTHROPIC_DEFAULT_OPUS_MODEL`);
+  - a host restart **adopts** running containers, which keep their spawn-time runner and CLI. Tell operators to recycle with `ncl groups restart`.
+
+Tests:
+- Resolution tests reference `DEFAULT_OPUS_MODEL`. The one deliberate literal is `claude_spawn_env_matches_the_live_fleet_baseline` (`src/claude-spawn-defaults.test.ts`); change it on purpose.
+- A family-effort change also moves the container tests in `container/agent-runner/src/providers/`: `claude.configSchema`, `claude.resolvedModelEffort`, `claude.spawnEndToEnd`, `claude.fallbackConfig`, `claude.turn-usage-effort`.
+- Run them throttled, per CLAUDE.md "Development": the host files you touched plus `setup/lib/image-version-pins.test.ts` and `setup/lib/codex-model-min-cli.test.ts`; in the container, `bun test src/providers/` and `bun run typecheck`.
+- Regenerate the ratchet: `pnpm run ratchet:report -- --write`.
+
+Then follow the repo's merge gate. Deploy is the deployer's job, and the restart needs operator approval.
+
+## 4. Fleet pins (no deploy)
+
+**Never pin a live task or wiring to an id the running image can't serve.** Wait until the deploy that carries the CLI is live.
+
+```bash
+ncl tasks update --id <series> --group <ag-id> --model opus --effort low       # "" clears
+ncl tasks repin --all --from-model <old> --to-model <new> --dry-run             # bulk; literal match, see `ncl tasks help repin`
+ncl wirings update <mga-id> --default-model opus --default-effort low          # "" clears
+ncl groups config update --id <ag-id> --model <full-id> --effort medium        # writes DB + container.json; applies at restart
+```
+
+- **Subagent defs**: edit the canonical source.
+  - Group-local: `groups/<g>/.claude/agents/*.md`. Check `git -C groups status` first; another session may have uncommitted edits.
+  - Plugin agents: the plugin's own repo.
+  - `.codex/agents/*.toml` carrying `# managed by nanoclaw codex-sync` are generated mirrors (`src/codex-sync.ts`); never edit one.
+  - Keep model names out of descriptions and prose. Frontmatter is the only place a model is named.
+- **Session stickies** come from a chat `-m`/`-e`, which writes `sticky_model`/`sticky_effort` to that session's `outbound.db` `session_state` (`container/agent-runner/src/poll-loop.ts:3790`). They override the wiring and the group for that session only, and a bump doesn't move them. Report them; clear or set one only when asked. There is no `ncl` verb. The container owns `outbound.db`, so write only while that session's container is stopped: check `sessions.container_status` and the `nanoclaw-session` label in `docker ps`.
+- **A task pin covers the task's own fires only.** A human reply in a task post's thread routes to that channel's thread session. That session resolves: sticky → wiring → group `container.json` → install default. To make follow-ups match the task, set the channel's wiring, or `-e <level>` in the thread.
+
+## 5. Verify after deploy
+
+- A fresh container's env shows the new default: `ANTHROPIC_DEFAULT_OPUS_MODEL=<new-id>`. `docker exec <c> codex --version` shows the new CLI.
+- `turn_usage` shows the new id for unpinned work. A config write proves only that the config was written.
+- Rollover: use plain `docker ps --format '{{.Names}} {{.Image}} {{.Label "nanoclaw-session"}}'`. `--filter ancestor=<old id>` misses containers whose image is now untagged. An old-image container is not a reason to kill in-flight work. Report it, and let it roll over or be recycled at a quiet moment.
