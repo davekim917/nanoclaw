@@ -81,6 +81,20 @@ afterEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
+// The runner's copy of this rule (container/agent-runner/src/fresh-context-task.ts)
+// runs the same table, so the two cannot drift.
+const sharedCases = JSON.parse(
+  fs.readFileSync(path.join(process.cwd(), 'container/agent-runner/src/fresh-context-cases.json'), 'utf8'),
+) as { cases: Array<{ name: string; thread_id: string | null; content: string; host: boolean | null }> };
+
+describe('shared fresh-fire cases (container/agent-runner/src/fresh-context-cases.json)', () => {
+  for (const c of sharedCases.cases.filter((x) => x.host !== null)) {
+    it(c.name, () => {
+      expect(taskFiresFresh(c.thread_id, c.content)).toBe(c.host);
+    });
+  }
+});
+
 describe('--continuous', () => {
   it('defaults to fresh, and round-trips through update without touching the other controls', async () => {
     const created = await run('tasks-create', {

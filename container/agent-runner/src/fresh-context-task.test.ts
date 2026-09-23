@@ -6,6 +6,7 @@
  * continuation each query was handed.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { readFileSync } from 'fs';
 
 import { getInboundDb } from './mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
@@ -267,6 +268,26 @@ describe('isFreshContextTaskBatch', () => {
     expect(taskRowFiresFresh(row('task', 'not json'))).toBe(false);
     expect(taskRowFiresFresh(row('chat', { text: 'hi' }))).toBe(false);
   });
+});
+
+const sharedCases = JSON.parse(readFileSync(new URL('./fresh-context-cases.json', import.meta.url), 'utf8')) as {
+  cases: Array<{
+    name: string;
+    kind: string;
+    thread_id: string | null;
+    tries: number;
+    content: string;
+    runner: boolean;
+  }>;
+};
+
+describe('shared fresh-fire cases (fresh-context-cases.json, also run by the host suite)', () => {
+  for (const c of sharedCases.cases) {
+    it(c.name, () => {
+      const row = { id: 'x', kind: c.kind, thread_id: c.thread_id, tries: c.tries, content: c.content } as MessageInRow;
+      expect(taskRowFiresFresh(row)).toBe(c.runner);
+    });
+  }
 });
 
 describe('selectInTurnFollowUps', () => {

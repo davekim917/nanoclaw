@@ -1,0 +1,104 @@
+{
+  "_comment": "Shared cases for the two copies of the fresh-fire rule: the runner's taskRowFiresFresh (container/agent-runner/src/fresh-context-task.ts) and the host's taskFiresFresh (src/modules/scheduling/fresh-context.ts). Both test suites run this table, so the copies cannot drift. `host` is null where the host is never asked (it only sees task rows, and it does not see retries).",
+  "cases": [
+    {
+      "name": "plain parent-channel fire",
+      "kind": "task",
+      "thread_id": null,
+      "tries": 0,
+      "content": "{\"prompt\":\"p\"}",
+      "runner": true,
+      "host": true
+    },
+    {
+      "name": "thread-bound fire",
+      "kind": "task",
+      "thread_id": "slack:C1:1712345678.000100",
+      "tries": 0,
+      "content": "{\"prompt\":\"p\"}",
+      "runner": false,
+      "host": false
+    },
+    {
+      "name": "continuous: true",
+      "kind": "task",
+      "thread_id": null,
+      "tries": 0,
+      "content": "{\"prompt\":\"p\",\"continuous\":true}",
+      "runner": false,
+      "host": false
+    },
+    {
+      "name": "continuous: false",
+      "kind": "task",
+      "thread_id": null,
+      "tries": 0,
+      "content": "{\"prompt\":\"p\",\"continuous\":false}",
+      "runner": true,
+      "host": true
+    },
+    {
+      "name": "continuous as a string is not the flag",
+      "kind": "task",
+      "thread_id": null,
+      "tries": 0,
+      "content": "{\"prompt\":\"p\",\"continuous\":\"true\"}",
+      "runner": true,
+      "host": true
+    },
+    {
+      "name": "keyed dispatch event",
+      "kind": "task",
+      "thread_id": null,
+      "tries": 0,
+      "content": "{\"prompt\":\"p\",\"dispatch\":{\"contextKey\":\"k\",\"eventKey\":\"e\"}}",
+      "runner": false,
+      "host": false
+    },
+    {
+      "name": "unreadable content stays continuous",
+      "kind": "task",
+      "thread_id": null,
+      "tries": 0,
+      "content": "not json",
+      "runner": false,
+      "host": false
+    },
+    {
+      "name": "JSON null content",
+      "kind": "task",
+      "thread_id": null,
+      "tries": 0,
+      "content": "null",
+      "runner": true,
+      "host": true
+    },
+    {
+      "name": "empty thread id is not thread-bound",
+      "kind": "task",
+      "thread_id": "",
+      "tries": 0,
+      "content": "{\"prompt\":\"p\"}",
+      "runner": true,
+      "host": true
+    },
+    {
+      "name": "retry of an interrupted fire (runner only)",
+      "kind": "task",
+      "thread_id": null,
+      "tries": 1,
+      "content": "{\"prompt\":\"p\"}",
+      "runner": false,
+      "host": null
+    },
+    {
+      "name": "chat row (runner only)",
+      "kind": "chat",
+      "thread_id": null,
+      "tries": 0,
+      "content": "{\"text\":\"hi\"}",
+      "runner": false,
+      "host": null
+    }
+  ]
+}

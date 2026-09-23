@@ -4694,6 +4694,89 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(endCalls.every((whileBackgroundLive) => !whileBackgroundLive)).toBe(true);
   }, 15_000);
 
+  // The two remaining terms of the #608 gate for a pending fresh fire: the
+  // stream stays open while result handling runs, and while the provider holds
+  // pushes it accepted but has not started.
+  it('does not end the stream for a default (fresh) fire while result handling is still running', async () => {
+    insertMessage('occ-2', 'task', { prompt: 'second fire of the same series' });
+    let releaseOutcome!: () => void;
+    const outcomeReleased = new Promise<void>((resolve) => {
+      releaseOutcome = resolve;
+    });
+    let outcomeHeld = false;
+    const endCalls: boolean[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'first fire done', answeredPrompts: ['p-initial'] };
+      await Bun.sleep(1600);
+    }
+    const query: AgentQuery = {
+      initialPromptId: 'p-initial',
+      push: () => 'p-push',
+      end: () => {
+        endCalls.push(outcomeHeld);
+      },
+      abort: () => {},
+      applySettings: async () => {},
+      events: events(),
+    };
+
+    const run = processQuery(
+      query,
+      TASK_ROUTING,
+      ['occ-1'],
+      'claude',
+      undefined,
+      'p',
+      undefined,
+      { ultracode: false },
+      undefined,
+      undefined,
+      undefined,
+      'unknown',
+      async () => {
+        // The task outcome write holds result handling open for 1.2s.
+        outcomeHeld = true;
+        await Promise.race([outcomeReleased, Bun.sleep(1200)]);
+        outcomeHeld = false;
+      },
+    );
+    await run;
+    releaseOutcome();
+
+    expect(endCalls.length).toBeGreaterThan(0);
+    expect(endCalls.every((duringResultHandling) => !duringResultHandling)).toBe(true);
+  }, 15_000);
+
+  it('does not end the stream for a default (fresh) fire while the provider holds queued work', async () => {
+    insertMessage('occ-2', 'task', { prompt: 'second fire of the same series' });
+    let queued = true;
+    const endCalls: boolean[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'first fire done', isError: false };
+      // Idle by turn level, but an accepted push is still queued for 1.6s.
+      await Bun.sleep(1600);
+      queued = false;
+      await Bun.sleep(1600);
+    }
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {
+        endCalls.push(queued);
+      },
+      abort: () => {},
+      applySettings: async () => {},
+      hasQueuedWork: () => queued,
+      events: events(),
+    };
+
+    await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, { ultracode: false });
+
+    expect(endCalls.length).toBeGreaterThan(0);
+    expect(endCalls.every((whileQueued) => !whileQueued)).toBe(true);
+  }, 15_000);
+
   // #617: with prompt ids, one result that answered two admitted fires (the
   // CLI folded the second into the running turn) records BOTH, instead of
   // leaving the later fire with no outcome.
