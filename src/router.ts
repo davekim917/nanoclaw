@@ -663,7 +663,10 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
         // leave NULL and let the group default in container.json answer.
         //
         // Tone ONLY: default_model / default_effort are sticky per-channel
-        // operational pins (set by `ncl wirings update` or the set_channel_* tools), and spreading one channel's
+        // operational pins — written after creation only by `ncl wirings update`
+        // (src/cli/resources/wirings.ts:199, `update: 'approval'` → genericUpdate) and the
+        // agent's set_channel_model / set_channel_effort tools
+        // (src/modules/channel-config/index.ts:176, :250) — and spreading one channel's
         // pin to every future channel is a worse bug than the one this fixes.
         const inheritedTone = await unanimousToneFor(inheritedAgent.id, mg.channel_type);
         const isGroup = event.message.isGroup ?? mg.is_group === 1;
