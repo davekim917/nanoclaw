@@ -58,9 +58,33 @@ function newestTranscript(): string | null {
   return best?.p ?? null;
 }
 
-function curl(args: string[], input?: string): { ok: boolean; out: string } {
+type CurlResult = { ok: boolean; out: string };
+type CurlImpl = (args: string[], input?: string) => CurlResult;
+
+function realCurl(args: string[], input?: string): CurlResult {
   const r = spawnSync('curl', args, { input, encoding: 'utf-8' });
   return { ok: r.status === 0, out: (r.stdout ?? '') + (r.stderr ?? '') };
+}
+
+let curlOverride: CurlImpl | null = null;
+
+/**
+ * Every HTTP call in this module goes through here. Unset (production), it is
+ * exactly `realCurl`. Inside an agent container the OneCLI proxy injects the
+ * user's HF token, so a test that reached `realCurl` would make a credentialed
+ * call to huggingface.co (#1086).
+ */
+function curl(args: string[], input?: string): CurlResult {
+  return (curlOverride ?? realCurl)(args, input);
+}
+
+/**
+ * Test-only: replace the curl call so `uploadTrace()` never reaches the
+ * network. Call with no argument to restore the real one. A seam rather than
+ * `mock.module`, which Bun cannot undo across files (#1076).
+ */
+export function _setCurlForTesting(impl?: CurlImpl): void {
+  curlOverride = impl ?? null;
 }
 
 /**

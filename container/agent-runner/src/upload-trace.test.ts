@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 
 import { getInboundDb } from './mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
@@ -7,7 +7,19 @@ import { getPendingMessages } from './db/messages-in.js';
 import type { MessageInRow } from './db/messages-in.js';
 import { MockProvider } from './providers/mock.js';
 import { runPollLoop } from './poll-loop.js';
-import { isUploadTraceCommand } from './upload-trace.js';
+import { _setCurlForTesting, isUploadTraceCommand } from './upload-trace.js';
+
+// uploadTrace() shells out to curl against huggingface.co, and inside an agent
+// container the OneCLI proxy makes that call credentialed (#1086). Answer every
+// call with the gateway's "not signed in" 401 instead, and record the URLs.
+const curlCalls: string[][] = [];
+beforeAll(() =>
+  _setCurlForTesting((args) => {
+    curlCalls.push(args);
+    return { ok: true, out: '{"error":"unauthorized"}\n401' };
+  }),
+);
+afterAll(() => _setCurlForTesting());
 
 beforeEach(() => {
   initTestSessionDb();
@@ -61,6 +73,15 @@ describe('poll loop — /upload-trace command', () => {
     const text = JSON.parse(out[0].content).text as string;
     expect(text.length).toBeGreaterThan(0);
     expect(text).not.toBe('should not run');
+    // Which status depends on whether this HOME holds a transcript; either way
+    // the only curl call was the faked whoami, and it stopped at the 401.
+    if (curlCalls.length > 0) {
+      expect(curlCalls).toHaveLength(1);
+      expect(curlCalls[0]).toContain('https://huggingface.co/api/whoami-v2');
+      expect(text).toStartWith("Can't upload");
+    } else {
+      expect(text).toBe('No transcript to upload for this session yet.');
+    }
 
     // Command message was completed (not left pending).
     expect(getPendingMessages()).toHaveLength(0);
