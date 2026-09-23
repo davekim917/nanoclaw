@@ -25,8 +25,10 @@ A Fable or Codex bump therefore means repointing the alias entry *and* repinning
 Check a user's claim ("X is on Sonnet") against what actually ran before changing anything. It is often a stale session sticky, not a pin.
 
 ```bash
-# Group config (authoritative). Indented provider/model lines are providerFallback.
-grep -HE '"(provider|model|effort|defaultModel|defaultEffort)":' groups/*/container.json   # defaultModel/defaultEffort = legacy keys, still honoured
+# Group config (authoritative). An indented line is inside providerConfig OR providerFallback: open the file to tell which.
+grep -HE '"(provider|model|effort|reasoning_effort|defaultModel|defaultEffort)":' groups/*/container.json   # defaultModel/defaultEffort = legacy keys, still honoured
+# Host-wide Codex default (below providerConfig.model, above DEFAULT_CODEX_MODEL); no output = unset
+tr '\0' '\n' < /proc/$(systemctl show -p MainPID --value nanoclaw-v2)/environ | grep -E '^CODEX_MODEL='
 # Channel wiring overrides
 pnpm exec tsx scripts/q.ts data/v2.db "select mga.id, mg.name, mga.agent_group_id, mga.default_model, mga.default_effort from messaging_group_agents mga join messaging_groups mg on mg.id = mga.messaging_group_id where coalesce(mga.default_model,'') <> '' or coalesce(mga.default_effort,'') <> ''"
 # Scheduled-task pins
@@ -94,12 +96,16 @@ Do this after the base `./container/build.sh` and before the host restart. A gro
 - **Claude SDK bump:** the group fails the deps-drift check and refuses to spawn.
 
 List them with `grep -lE '"imageTag"' groups/*/container.json`, then rebuild according to how each image was made:
-- A package image built by `install_packages` (tag `<image base>:<group-id>`, packages set in `container_configs`): `ncl groups restart --id <group-id> --rebuild` (`buildAgentGroupImage`, `src/container-runner.ts:7606`).
+- A package image built by `install_packages` (tag `<image base>:<group-id>`, packages set in `container_configs`): `ncl groups restart --id <group-id> --rebuild` (`buildAgentGroupImage`, `src/container-runner.ts:7606`). This also recycles the group's containers and kills in-flight work, so run it at a quiet moment.
 - Any other tag is an operator-supplied custom image. `--rebuild` would fail ("No packages to install", `src/container-runner.ts:7614-7615`) or build a different tag. Rebuild it with its own build process, on top of the new base.
 
 ## 4. Fleet pins (no deploy)
 
 **Never pin a live task or wiring to an id the running image can't serve.** Wait until the deploy that carries the CLI is live.
+
+**Deployed is not enough for task pins and stickies.** They apply per turn inside whatever container is already running (`container/agent-runner/src/poll-loop.ts:4029`, `container/agent-runner/src/providers/codex.ts:1222`). A host restart *adopts* running containers, and they keep their old CLI. So a repin right after deploy can send the new id to an old-CLI container; for Codex that's the HTTP 400. Before repinning a task or setting a sticky:
+1. Check that the session's container is gone or on the new image (`docker ps`, `nanoclaw-session` label).
+2. If it's still on the old image, recycle the group first with `ncl groups restart --id <group-id>`, at a quiet moment.
 
 ```bash
 ncl tasks update --id <series> --group <ag-id> --model opus --effort low       # "" clears
@@ -122,7 +128,7 @@ ncl groups config update --id <ag-id> --model <full-id> --effort medium        #
 - **Session stickies** come from a chat `-m`/`-e`, which writes `sticky_model`/`sticky_effort` to that session's `outbound.db` `session_state` (`container/agent-runner/src/poll-loop.ts:3790`). They override the wiring and the group for that session only, and a bump doesn't move them. Report them; clear or set one only when asked. There is no `ncl` verb. The container owns `outbound.db`, so write only while that session's container is stopped: check `sessions.container_status` and the `nanoclaw-session` label in `docker ps`.
 - **A task pin covers the task's own fires only.** A human reply in a task post's thread routes to that channel's thread session. That session's order depends on the provider:
   - **Claude**: sticky → `providerConfig.model` → wiring → `container.json` `model` → legacy `defaultModel` → install default. The host folds the last four into `NANOCLAW_CLAUDE_MODEL` (`src/claude-spawn-defaults.ts:146-163`), and the runner puts `providerConfig.model` above that env (`container/agent-runner/src/providers/claude.ts:2770`). **Setting the wiring does nothing for a Claude group whose `providerConfig` sets a model**; change that group's config instead.
-  - **Codex**: sticky (per turn, `container/agent-runner/src/providers/codex.ts:1222`) → wiring → `container.json` `model` → legacy `defaultModel` → `providerConfig.model` → install default. The host folds wiring, `model`, and `defaultModel` into `NANOCLAW_CODEX_MODEL_OVERRIDE` (`src/container-runner.ts:6553-6555`), and the runner takes that env ahead of `providerConfig.model` (`container/agent-runner/src/config.ts:131-137`). So a Codex group's `providerConfig.model` counts only when no wiring, `model`, or `defaultModel` is set. A repin that touches only `providerConfig` leaves such a group on the old model.
+  - **Codex**: sticky (per turn, `container/agent-runner/src/providers/codex.ts:1222`) → wiring → `container.json` `model` → legacy `defaultModel` → `providerConfig.model` → host `CODEX_MODEL` env → install default. The host folds wiring, `model`, and `defaultModel` into `NANOCLAW_CODEX_MODEL_OVERRIDE` (`src/container-runner.ts:6553-6555`), and the runner takes that env ahead of `providerConfig.model` (`container/agent-runner/src/config.ts:131-137`). The host's own `CODEX_MODEL` env is forwarded to the container (`src/providers/codex.ts:157-160`) and sits just above `DEFAULT_CODEX_MODEL` (`container/agent-runner/src/providers/codex.ts:1102`), so if it's set, it becomes the effective default, not the bump. So a Codex group's `providerConfig.model` counts only when no wiring, `model`, or `defaultModel` is set. A repin that touches only `providerConfig` leaves such a group on the old model.
 
   To make follow-ups match the task, set the channel's wiring (subject to the Claude exception above), or send `-e <level>` in the thread.
 
