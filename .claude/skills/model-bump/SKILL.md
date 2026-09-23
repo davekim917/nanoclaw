@@ -16,6 +16,7 @@ A model release touches three layers. Only the first two need a PR.
 **Pins that say `opus` / `sonnet` / `haiku` follow their family default automatically; frozen ids (`claude-opus-5[1m]`) do not.** Those three are `FAMILY_DEFAULTS`, deliberately kept out of `MODEL_ALIAS_MAP`, and resolve at use, not at storage (`src/flag-parser.ts:101-110`). `ncl tasks list --json` shows a task pinned with `--model opus` as `opus`. When the user wants "the current Opus", write the family alias. Whether any other alias freezes depends on the **write path**:
 - **Task pins and chat `-m` stickies** go through the flag vocabulary, which maps every `MODEL_ALIAS_MAP` / `CODEX_MODEL_ALIAS_MAP` entry to its concrete id at write. So `fable` (`src/flag-parser.ts:68`) and the Codex aliases `sol` / `luna` / `terra` / `astra` (`src/flag-parser.ts:274`) freeze there.
 - **`ncl wirings update --default-model` and `ncl groups config update --model`** store their argument literally. A literal **Claude** alias there resolves at use and floats. **A Codex alias does not resolve at all**: the spawn path forwards the stored value unchanged as `NANOCLAW_CODEX_MODEL_OVERRIDE` (`src/container-runner.ts:6553-6555`), and the runner doesn't expand it (`container/agent-runner/src/config.ts:106`). So for a Codex group, always pass a full `gpt-*` id on both paths.
+- **The agent's `set_channel_model` tool** writes the same wiring column, but it runs a Codex value through the flag parser first, so there a Codex alias freezes to its concrete id (`src/modules/channel-config/index.ts:105-111`, `:176`). A Claude value is stored literally.
 
 A Fable or Codex bump therefore means repointing the alias entry *and* repinning every concrete id the step-1 inventory finds: task pins, stickies, channel wirings (`messaging_group_agents.default_model`), and group `container.json` `model` / legacy `defaultModel` / `providerConfig.model` / `providerFallback.model`.
 
@@ -86,6 +87,16 @@ Tests:
 
 Then follow the repo's merge gate. Deploy is the deployer's job, and the restart needs operator approval.
 
+### Before the host restart: per-group images
+
+Do this after the base `./container/build.sh` and before the host restart. A group with `imageTag` in its `container.json` spawns from that image (`src/container-runner.ts:1688`), and a base rebuild doesn't rebuild it (`src/agent-runner-image-check.ts:275-281`). If it isn't rebuilt, the group breaks in one of two ways:
+- **Codex-only bump:** the deps hash doesn't change, so the group spawns the new default on its old baked CLI and gets the HTTP 400.
+- **Claude SDK bump:** the group fails the deps-drift check and refuses to spawn.
+
+List them with `grep -lE '"imageTag"' groups/*/container.json`, then rebuild according to how each image was made:
+- A package image built by `install_packages` (tag `<image base>:<group-id>`, packages set in `container_configs`): `ncl groups restart --id <group-id> --rebuild` (`buildAgentGroupImage`, `src/container-runner.ts:7606`).
+- Any other tag is an operator-supplied custom image. `--rebuild` would fail ("No packages to install", `src/container-runner.ts:7614-7615`) or build a different tag. Rebuild it with its own build process, on top of the new base.
+
 ## 4. Fleet pins (no deploy)
 
 **Never pin a live task or wiring to an id the running image can't serve.** Wait until the deploy that carries the CLI is live.
@@ -98,6 +109,11 @@ ncl wirings update <mga-id> --default-model opus --default-effort low          #
 ncl groups config update --id <ag-id> --model <full-id> --effort medium        # writes DB + container.json; applies at restart
 ```
 
+- **`providerConfig.model`, `providerFallback.model`, and legacy `defaultModel` have no `ncl` verb.** `groups config update --model` writes only `model` (`src/cli/resources/groups.ts:693`). Repin those three by editing `groups/<g>/container.json` directly:
+  - check `git -C groups status` first, since another session may have uncommitted edits;
+  - the edit applies at the group's next restart;
+  - the `container_configs` DB projection doesn't see it, so `ncl groups config get` won't show it. Read the file to confirm.
+
 - **Subagent defs**: edit the canonical source.
   - Group-local: `groups/<g>/.claude/agents/*.md`. Check `git -C groups status` first; another session may have uncommitted edits.
   - Plugin agents: the plugin's own repo.
@@ -105,8 +121,8 @@ ncl groups config update --id <ag-id> --model <full-id> --effort medium        #
   - Keep model names out of descriptions and prose. Frontmatter is the only place a model is named.
 - **Session stickies** come from a chat `-m`/`-e`, which writes `sticky_model`/`sticky_effort` to that session's `outbound.db` `session_state` (`container/agent-runner/src/poll-loop.ts:3790`). They override the wiring and the group for that session only, and a bump doesn't move them. Report them; clear or set one only when asked. There is no `ncl` verb. The container owns `outbound.db`, so write only while that session's container is stopped: check `sessions.container_status` and the `nanoclaw-session` label in `docker ps`.
 - **A task pin covers the task's own fires only.** A human reply in a task post's thread routes to that channel's thread session. That session's order depends on the provider:
-  - **Claude**: sticky → group `providerConfig.model` → wiring → group `container.json` model → install default (`container/agent-runner/src/providers/claude.ts:2770`). **Setting the wiring does nothing for a Claude group whose `providerConfig` sets a model**; change that group's config instead.
-  - **Codex**: sticky (per turn, `container/agent-runner/src/providers/codex.ts:1222`) → wiring → group `providerConfig.model` → group `container.json` model → install default (`container/agent-runner/src/config.ts:131-137`). Here the wiring does override `providerConfig`.
+  - **Claude**: sticky → `providerConfig.model` → wiring → `container.json` `model` → legacy `defaultModel` → install default. The host folds the last four into `NANOCLAW_CLAUDE_MODEL` (`src/claude-spawn-defaults.ts:146-163`), and the runner puts `providerConfig.model` above that env (`container/agent-runner/src/providers/claude.ts:2770`). **Setting the wiring does nothing for a Claude group whose `providerConfig` sets a model**; change that group's config instead.
+  - **Codex**: sticky (per turn, `container/agent-runner/src/providers/codex.ts:1222`) → wiring → `container.json` `model` → legacy `defaultModel` → `providerConfig.model` → install default. The host folds wiring, `model`, and `defaultModel` into `NANOCLAW_CODEX_MODEL_OVERRIDE` (`src/container-runner.ts:6553-6555`), and the runner takes that env ahead of `providerConfig.model` (`container/agent-runner/src/config.ts:131-137`). So a Codex group's `providerConfig.model` counts only when no wiring, `model`, or `defaultModel` is set. A repin that touches only `providerConfig` leaves such a group on the old model.
 
   To make follow-ups match the task, set the channel's wiring (subject to the Claude exception above), or send `-e <level>` in the thread.
 
@@ -114,7 +130,5 @@ ncl groups config update --id <ag-id> --model <full-id> --effort medium        #
 
 - A fresh container's env shows the new default for the family that moved: `ANTHROPIC_DEFAULT_OPUS_MODEL`, `_SONNET_MODEL`, or `_HAIKU_MODEL` (`src/claude-spawn-defaults.ts:240-249`). Unpinned groups run Opus, so a Sonnet, Haiku, or Fable bump shows in `turn_usage` only on a turn pinned to that family. For Codex, `docker exec <c> codex --version` shows the new CLI.
 - `turn_usage` shows the new id for unpinned work. A config write proves only that the config was written.
-- Per-group images: a group with `imageTag` in its `container.json` spawns from that image (`src/container-runner.ts:1688`), and a base rebuild doesn't rebuild it (`src/agent-runner-image-check.ts:275-281`). After a CLI bump, such a group would run the old CLI under the new default; for Codex that's the HTTP 400. List them with `grep -lE '"imageTag"' groups/*/container.json`, then rebuild according to how each image was made:
-  - A package image built by `install_packages` (tag `<image base>:<group-id>`, packages set in `container_configs`): `ncl groups restart --id <group-id> --rebuild` (`buildAgentGroupImage`, `src/container-runner.ts:7606`).
-  - Any other tag is an operator-supplied custom image. `--rebuild` would fail ("No packages to install", `src/container-runner.ts:7614-7615`) or build a different tag. Rebuild it with its own build process, on top of the new base.
+- Every `imageTag` group's running container is on its rebuilt image (see "Before the host restart").
 - Rollover: use plain `docker ps --format '{{.Names}} {{.Image}} {{.Label "nanoclaw-session"}}'`. `--filter ancestor=<old id>` misses containers whose image is now untagged. An old-image container is not a reason to kill in-flight work. Report it, and let it roll over or be recycled at a quiet moment.
