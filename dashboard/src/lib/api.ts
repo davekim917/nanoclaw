@@ -400,11 +400,14 @@ export interface WorkgroupUsageRow {
   provider: string;
   model: string;
   turns: number;
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_tokens: number;
-  cache_write_tokens: number;
-  cost_usd: number;
+  /** Token and cost columns are null inside the untrusted Claude window; `untrusted` then says why (#1061). */
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_write_tokens: number | null;
+  cost_usd: number | null;
+  cost_applicable: boolean;
+  untrusted: string | null;
 }
 
 export interface WorkgroupUsageResponse {

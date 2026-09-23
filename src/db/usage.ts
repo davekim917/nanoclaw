@@ -19,9 +19,11 @@
  * the cumulative-usage fix (container/agent-runner/src/db/turn-usage.ts)
  * landed have INFLATED Claude token/cost totals — the SDK's running-total-
  * for-the-whole-stream value was recorded on every turn instead of that
- * turn's own delta, measured at 1.3-5.2x inflation. Nothing here corrects
- * that retroactively; treat usage_daily/turn_usage rows from before that fix
- * as directional only, not exact.
+ * turn's own delta, measured at 1.3-5.2x inflation. That fix left a second
+ * defect in place until #1007 (2026-09-22), so EVERY Claude row before
+ * ./usage-trust.ts's cutoff is untrusted: the readers below return the
+ * #1061 note instead of a figure for it. The stored values are never
+ * rewritten.
  *
  * NOTE ON usage_daily.turns (turn-correlation fix, migration 061): a turn
  * spanning multiple models writes one turn_usage row per model, so
@@ -43,6 +45,7 @@
  */
 import { centralTransaction } from './central-lease.js';
 import { getDb } from './connection.js';
+import { isUntrustedUsageDay, UNTRUSTED_USAGE_NOTE, untrustedTurnUsageSql } from './usage-trust.js';
 import { log } from '../log.js';
 import type { NanoclawMailboxSession } from '../modules/mailbox/index.js';
 
@@ -51,7 +54,8 @@ import type { NanoclawMailboxSession } from '../modules/mailbox/index.js';
 // optional fields postdate the original table, so a row from an older
 // container arrives without those keys and every read below goes through `??`.
 
-export interface UsageDailyRow {
+/** A usage_daily row as stored. */
+export interface StoredUsageDailyRow {
   date: string;
   agent_group_id: string;
   provider: string;
@@ -62,6 +66,27 @@ export interface UsageDailyRow {
   cache_read_tokens: number;
   cache_write_tokens: number;
   cost_usd: number;
+}
+
+/**
+ * A usage_daily row as readers present it. The token and cost columns are
+ * NULL, and `untrusted` carries the #1061 note, for a bucket inside the
+ * untrusted Claude window (./usage-trust.ts) — a stored sum there is not a
+ * figure anyone may quote. `turns` stays: it counts rows, which the defect
+ * never touched.
+ */
+export interface UsageDailyRow {
+  date: string;
+  agent_group_id: string;
+  provider: string;
+  model: string;
+  turns: number;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_write_tokens: number | null;
+  cost_usd: number | null;
+  untrusted: string | null;
   /**
    * Whether cost_usd for this row is a real dollar figure vs a coerced-null
    * zero. `usage_daily.cost_usd` is `REAL NOT NULL DEFAULT 0` (an additive
@@ -91,6 +116,21 @@ const PROVIDERS_WITHOUT_COST = new Set(['codex']);
 /** Exported so callers doing their own raw usage_daily queries (e.g. the dashboard's multi-group IN-list, which listUsageDaily's single-agentGroupId filter doesn't support) can attach the same computed flag rather than re-deriving it. */
 export function isCostApplicable(provider: string): boolean {
   return !PROVIDERS_WITHOUT_COST.has(provider);
+}
+
+/** The one way a stored usage_daily row reaches a reader — every read surface goes through it. */
+export function presentUsageDailyRow(row: StoredUsageDailyRow): UsageDailyRow {
+  const base = { ...row, cost_applicable: isCostApplicable(row.provider) };
+  if (!isUntrustedUsageDay(row.provider, row.date)) return { ...base, untrusted: null };
+  return {
+    ...base,
+    input_tokens: null,
+    output_tokens: null,
+    cache_read_tokens: null,
+    cache_write_tokens: null,
+    cost_usd: null,
+    untrusted: UNTRUSTED_USAGE_NOTE,
+  };
 }
 
 /** The turn_usage rows one session read hands over, in the mailbox's own shape. */
@@ -249,11 +289,11 @@ export async function listUsageDaily(
     params.push(new Date(Date.now() - filters.days * 86_400_000).toISOString().slice(0, 10));
   }
   const clause = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : '';
-  const rows = await getDb().all<Omit<UsageDailyRow, 'cost_applicable'>>(
+  const rows = await getDb().all<StoredUsageDailyRow>(
     `SELECT * FROM usage_daily${clause} ORDER BY date DESC, agent_group_id, provider, model LIMIT 1000`,
     ...params,
   );
-  return rows.map((row) => ({ ...row, cost_applicable: isCostApplicable(row.provider) }));
+  return rows.map(presentUsageDailyRow);
 }
 
 // ---------------------------------------------------------------------------
@@ -280,8 +320,11 @@ export type UsageDimension = keyof typeof USAGE_DIMENSIONS;
 
 export const USAGE_DIMENSION_NAMES = Object.keys(USAGE_DIMENSIONS) as UsageDimension[];
 
-/** One bucket of the summary, plus the synthetic `TOTAL` row appended last. */
-export type TurnUsageSummaryRow = Record<string, string | number>;
+/**
+ * One bucket of the summary, plus the synthetic `TOTAL` row appended last.
+ * NULL is the untrusted-only bucket's "no figure" and `untrusted`'s "clean".
+ */
+export type TurnUsageSummaryRow = Record<string, string | number | null>;
 
 /**
  * Summarize the central turn_usage ledger — the accurate per-turn data that
@@ -332,13 +375,24 @@ export async function summarizeTurnUsage(
   // Every SUM is wrapped: over zero rows SQLite's SUM returns NULL, not 0, and
   // the un-grouped TOTAL query always produces a row — so an empty window
   // would otherwise report `null` tokens rather than `0`.
+  //
+  // Token and cost sums cover TRUSTED rows only (./usage-trust.ts, #1061);
+  // untrusted rows are counted, not summed, and `decorate` names them. `turns`
+  // still counts every turn — the defect never touched turn identity — while
+  // the per-turn averages divide by the trusted turns the sums came from.
+  const untrusted = untrustedTurnUsageSql();
+  const trusted = `NOT ${untrusted}`;
+  const trustedSum = (col: string): string => `COALESCE(SUM(CASE WHEN ${trusted} THEN ${col} END), 0) AS ${col}`;
   const metrics = `
     COUNT(DISTINCT turn_id) + COALESCE(SUM(turn_id IS NULL), 0) AS turns,
-    COALESCE(SUM(input_tokens), 0) AS input_tokens,
-    COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
-    COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
-    COALESCE(SUM(output_tokens), 0) AS output_tokens,
-    COALESCE(SUM(cost_usd), 0) AS cost_usd`;
+    COUNT(DISTINCT CASE WHEN ${trusted} THEN turn_id END)
+      + COALESCE(SUM(turn_id IS NULL AND ${trusted}), 0) AS trusted_turns,
+    COALESCE(SUM(${untrusted}), 0) AS untrusted_rows,
+    ${trustedSum('input_tokens')},
+    ${trustedSum('cache_read_tokens')},
+    ${trustedSum('cache_write_tokens')},
+    ${trustedSum('output_tokens')},
+    ${trustedSum('cost_usd')}`;
 
   const db = getDb();
   const selectDims = dims.map((d) => `${USAGE_DIMENSIONS[d]} AS "${d}"`).join(', ');
@@ -360,16 +414,38 @@ export async function summarizeTurnUsage(
     label: Record<string, string>,
   ): TurnUsageSummaryRow => {
     const turns = Number(row?.turns ?? 0);
-    const per = (n: unknown): number => (turns > 0 ? Math.round(Number(n ?? 0) / turns) : 0);
-    return {
+    const trustedTurns = Number(row?.trusted_turns ?? 0);
+    const untrustedRows = Number(row?.untrusted_rows ?? 0);
+    const per = (n: unknown): number => (trustedTurns > 0 ? Math.round(Number(n ?? 0) / trustedTurns) : 0);
+    const decorated: TurnUsageSummaryRow = {
       ...label,
       ...row,
       turns,
+      trusted_turns: trustedTurns,
+      untrusted_rows: untrustedRows,
       cost_usd: Math.round(Number(row?.cost_usd ?? 0) * 10_000) / 10_000,
       input_per_turn: per(row?.input_tokens),
       cache_read_per_turn: per(row?.cache_read_tokens),
       output_per_turn: per(row?.output_tokens),
+      untrusted: untrustedRows > 0 ? `${untrustedRows} row(s) not summed — ${UNTRUSTED_USAGE_NOTE}` : null,
     };
+    // A bucket made only of untrusted rows has no figure at all. Its zero sums
+    // would read as "spent nothing", so they become NULL beside the note.
+    if (untrustedRows > 0 && trustedTurns === 0) {
+      for (const key of [
+        'input_tokens',
+        'cache_read_tokens',
+        'cache_write_tokens',
+        'output_tokens',
+        'cost_usd',
+        'input_per_turn',
+        'cache_read_per_turn',
+        'output_per_turn',
+      ]) {
+        decorated[key] = null;
+      }
+    }
+    return decorated;
   };
 
   const rows = buckets.map((b) => decorate(b, {}));
