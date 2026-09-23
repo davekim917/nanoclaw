@@ -167,7 +167,7 @@ registerResource({
       name: 'default_model',
       type: 'string',
       description:
-        'Sticky model for this channel — same vocabulary as the `-m` chat flag (family alias like `opus`/`sonnet`, a pinned id, or a provider slug). An in-chat `-m` PERSISTS here, so a one-off experiment silently becomes the channel default. NULL inherits the group/install default; `--default-model ""` clears it.',
+        'Default model for every session on this channel. Stored verbatim and NOT validated here: a Claude family alias (`opus`/`sonnet`/`haiku`) is resolved at spawn and follows the install default, but a Codex alias (`sol`/`luna`/…) is passed through unresolved, so give Codex groups a full `gpt-*` id. An in-chat `-m` does NOT write this column: it sets a sticky on that one session only. After creation, only this command and the agent\'s admin-only set_channel_model tool change it. NULL inherits the group/install default; `--default-model ""` clears it.',
       updatable: true,
       nullable: true,
     },
@@ -175,7 +175,7 @@ registerResource({
       name: 'default_effort',
       type: 'string',
       description:
-        'Sticky reasoning effort for this channel — same vocabulary as the `-e` chat flag, and provider-specific in what it accepts. Persists from chat like --default-model. NULL inherits the group/install default; `--default-effort ""` clears it.',
+        'Default reasoning effort for every session on this channel — same vocabulary as the `-e` chat flag, and provider-specific in what it accepts. An in-chat `-e` does NOT write this column: it sets a sticky on that one session only. After creation, only this command and the agent\'s admin-only set_channel_effort tool change it. NULL inherits the group/install default; `--default-effort ""` clears it.',
       updatable: true,
       nullable: true,
     },
