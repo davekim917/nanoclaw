@@ -176,7 +176,7 @@ else, `html` slides are more capable: json-render has no tables or charts.
 
 ## Voice and cost
 
-- Default voice: **Matilda** (`XrExE9yKIg1WjnnlVkGX`, professional, American).
+- Default voice: **Brian** (`nPczCjzI2devNBz1zQrb`, deep, American male).
   Set `"voice"` in the spec to change it; list the account's voices with
   `curl -sS https://api.elevenlabs.io/v1/voices`. Keep one voice per deck.
   If the user names a preferred voice, save it to memory and reuse it.

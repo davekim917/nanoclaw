@@ -25,7 +25,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
-export const DEFAULT_VOICE = 'XrExE9yKIg1WjnnlVkGX'; // "Matilda" — premade, knowledgeable, professional
+export const DEFAULT_VOICE = 'nPczCjzI2devNBz1zQrb'; // "Brian" — premade, deep, resonant (operator picked a male voice)
 export const DEFAULT_MODEL = 'eleven_multilingual_v2';
 export const MAX_SLIDES = 40;
 const WIDTH = 1920;
