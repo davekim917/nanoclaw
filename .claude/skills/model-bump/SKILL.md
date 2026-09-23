@@ -13,7 +13,7 @@ A model release touches three layers. Only the first two need a PR.
 | **Runtime that must know the id** | `container/Dockerfile` `CLAUDE_CODE_VERSION` + `@anthropic-ai/claude-agent-sdk` in `container/agent-runner/package.json` (same patch number); `CODEX_VERSION` | same PR |
 | **Fleet pins** | `groups/<g>/container.json`, channel wirings, task pins, subagent frontmatter, session stickies | `ncl` / file edits, no deploy |
 
-**Pins that say `opus` / `sonnet` / `fable` follow the Claude default automatically; frozen ids (`claude-opus-5[1m]`) do not.** When the user wants "the current Opus", write the family alias. Codex aliases (`sol`, `luna`, `terra`) are different: they resolve when the pin is written and freeze. `ncl groups config update --model` stores its argument verbatim, so pass a full `gpt-*` id there.
+**Pins that say `opus` / `sonnet` / `fable` follow the Claude default automatically; frozen ids (`claude-opus-5[1m]`) do not.** Bare family aliases are deliberately kept out of `MODEL_ALIAS_MAP` and resolve at use, not at storage (`src/flag-parser.ts:101-105`). That holds for task pins, wirings, and stickies alike: `ncl tasks list --json` shows a task pinned with `--model opus` as `opus`. When the user wants "the current Opus", write the family alias. Codex aliases (`sol`, `luna`, `terra`) are different: the Codex vocabulary maps them to a concrete id when the pin is written (`src/flag-parser.ts:274`), so they freeze. `ncl groups config update --model` stores its argument verbatim, so pass a full `gpt-*` id there.
 
 ## 1. Inventory: what runs where
 
@@ -38,9 +38,12 @@ Session stickies: use the `outbound.db` sweep in the **Detect** block of `docs/c
 
 Test against the **container's** pinned CLI, never the host's.
 
+Use **this install's** image. Each install has its own image name (`container/build.sh:39-44`), and a group with `imageTag` in its `container.json` spawns from that image instead (`src/container-runner.ts:1687`). If you're probing for one group, use its running container's image.
+
 - **Claude**: an id the CLI binary doesn't contain silently loses its family behaviour (1M window, effort ladder). Grep the image, with the current default as a control:
   ```bash
-  IMG=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -m1 'nanoclaw-agent-v2-.*:latest')
+  # From the install root, not a worktree: the name is derived from the checkout path.
+  IMG=$(pnpm exec tsx -e "import('./src/config.ts').then(m => console.log(m.CONTAINER_IMAGE))" | tail -1)
   docker run --rm --entrypoint sh "$IMG" -c 'p=$(find / -path /proc -prune -o -type d -path "*@anthropic-ai/claude-code" -print 2>/dev/null | head -1); grep -rlao "<new-id>" "$p" | wc -l'
   ```
   If the count is 0, move to the first `latest` release that has it, and move the CLI and SDK to the same patch number.
