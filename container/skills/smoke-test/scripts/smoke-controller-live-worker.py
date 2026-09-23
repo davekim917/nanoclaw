@@ -44,8 +44,8 @@ INBOUND_DB = os.environ.get("SMOKE_CONTROLLER_LIVE_INBOUND_DB", "/workspace/inbo
 # install's deployment gate wrapper sources the file itself (`. <its
 # dir>/smoke-gate-env.sh`, then exec the skill's gate), so ITS lease dir stayed
 # right -- but the evidence barrier is spawned by the controller directly, with this
-# process's environment (smoke-campaign-controller.py:1437 -> run_read_only ->
-# spawn, :653-665, env=None), and it read the fallback
+# process's environment (smoke-campaign-controller.py:1818 -> run_read_only ->
+# spawn, :692-704, env=None), and it read the fallback
 # ${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases
 # (smoke-evidence-barrier.sh:739). No pin for the campaign lives there, so
 # smoke-journeys.py's barrier took the "no gate pin owns it" path (:997) and
@@ -79,7 +79,7 @@ CONFIG_PREFIX = "SMOKE_"
 NOT_CONFIG = frozenset((
     # This wrapper's own seams, read from the process env above and documented
     # there as process-env-only. SMOKE_CONTROLLER_CRASH_AT is the controller's
-    # kill-injection seam (smoke-campaign-controller.py:231-232, os._exit) and
+    # kill-injection seam (smoke-campaign-controller.py:237-238, os._exit) and
     # reaches it through CHILD_ENV, so the file must not be able to set it.
     "SMOKE_CONTROLLER_ENV_FILE", "SMOKE_CONTROLLER_SCRIPT_DIR", "SMOKE_CONTROLLER_CRASH_AT",
     "SMOKE_CONTROLLER_LIVE_START", "SMOKE_CONTROLLER_LIVE_BUDGET", "SMOKE_CONTROLLER_LIVE_GH_CMD",
@@ -599,7 +599,7 @@ def renewer_health():
         dfd = ctl._open_dir_contained(OUT, ["renewer"], False)
     except ctl.ControllerError as exc:
         # _open_dir_contained carries the errno so ENOENT can be told from
-        # EACCES/ELOOP/ENOTDIR (smoke-campaign-controller.py:410-416).
+        # EACCES/ELOOP/ENOTDIR (smoke-campaign-controller.py:416-422).
         if getattr(exc, "errno", None) == errno.ENOENT:
             return "absent", {}
         return "unreadable", {"error": str(exc)[:200]}

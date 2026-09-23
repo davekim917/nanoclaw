@@ -3,7 +3,10 @@
 import datetime as dt
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -12,6 +15,22 @@ spec = importlib.util.spec_from_file_location("controller", Path(__file__).with_
 ctl = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ctl)
 RUN = "xzo-pr-pr7-aaaaaaaaaaaa-20260918T100000Z"
+HERE = Path(__file__).resolve().parent
+NCL_TS = HERE.parents[3] / "container" / "agent-runner" / "src" / "cli" / "ncl.ts"
+
+
+def ncl_json(doc):
+    """Byte-for-byte what the real in-container `ncl --json` prints for one
+    response frame (ncl.ts:286). NclFormat below proves it against node."""
+    return json.dumps(dict({"id": "cli-test"}, **doc), indent=2, ensure_ascii=False) + "\n"
+
+
+def node_stringify(doc):
+    """The REAL formatter: node's JSON.stringify(doc, null, 2) + newline."""
+    node = shutil.which("node")
+    assert node, "node is required: it is the only authority on what ncl prints"
+    return subprocess.run([node, "-e", "process.stdout.write(JSON.stringify(JSON.parse(process.argv[1]), null, 2) + '\\n')",
+                           json.dumps(doc)], capture_output=True, text=True, check=True).stdout
 
 
 class Effects:
@@ -202,7 +221,7 @@ class PhaseDispatch(unittest.TestCase):
             def dispatch(argv, timeout):
                 commands.append(argv)
                 event = argv[argv.index("--event-key") + 1]
-                return 0, json.dumps({"ok": True, "data": {"admission": "inserted", "row_id": event,
+                return 0, ncl_json({"ok": True, "data": {"admission": "inserted", "row_id": event,
                     "session_id": "same-phase", "attempt": 0}}), ""
             effect._run = dispatch
             current = {"status": "completed", "settlement": {"state": "busy", "executionSettled": False}}
@@ -239,6 +258,126 @@ class PhaseDispatch(unittest.TestCase):
             self.assertEqual(len({c[c.index("--context-key") + 1] for c in commands}), 1)
             self.assertFalse(any("--retry-of" in c for c in commands))
             self.assertEqual(self.c.owner_wakes, [])
+
+    # pr2121 (2026-09-23): the host admitted the intake dispatch, but every
+    # answer was the pretty-printed frame the controller could not parse, so
+    # the obligation sat at `intent` replaying the same event, with no alarm.
+    PR2121_REPLAY = {"ok": True, "data": {"admission": "replay", "row_id": "event-0000aaaa1111",
+                     "series_id": "dispatch-0000bbbb2222", "session_id": "sess-0000000000000-test01",
+                     "agent_group_id": "ag-00000000", "status": "completed", "attempt": 0}}
+    SETTLED = {"ok": True, "data": {"status": "completed", "settlement": {
+        "state": "settled", "outcome": "success", "executionSettled": True}}}
+
+    def real_effects(self, answer):
+        effect = ctl.EffectLayer.__new__(ctl.EffectLayer)
+        effect.ctl, effect.ncl, effect.mode, effect.performed = self.c, ["fake-ncl"], "live", []
+        effect.commands = []
+        def run(argv, timeout):
+            effect.commands.append(argv)
+            return answer(argv)
+        effect._run = run
+        self.c.effects = effect
+        return effect
+
+    def stuck_intent(self):
+        """The journal pr2121 was left with: an intake intent carrying the
+        saved dispatch envelope, never recorded as enqueued. The route is
+        recorded on the claim first, as _owner_route does in production."""
+        self.assertEqual(self.c._owner_route(RUN), "phase-dispatch")
+        self.c.record(RUN, "owner", "intake", "intent", 1)
+        self.c.record(RUN, "owner", "intake", "intent", detail={"dispatchIntent": {
+            "eventKey": "initial", "retryOf": None, "prompt": "saved intake prompt",
+            "briefedToken": "tok", "briefedRefusal": "", "brief": "brief-intake.md"}})
+
+    def test_pr2121_stuck_intent_recovers_on_replay_without_a_second_event(self):
+        self.stuck_intent()
+        t0 = self.c.now
+        answers = {"dispatch": None, "get": ncl_json(self.SETTLED)}
+        def answer(argv):
+            if argv[1:3] == ["tasks", "dispatch"]:
+                return (None, "", "timeout") if answers["dispatch"] is None else (0, answers["dispatch"], "")
+            return 0, answers["get"], ""
+        effect = self.real_effects(answer)
+        unconfirmed = lambda: [a for a in self.c.alarms if a[1] == "controller_dispatch_unconfirmed"]
+        # Unconfirmed, but not yet for long: replayed, not alarmed.
+        self.c.now = t0 + dt.timedelta(minutes=10)
+        self.assertEqual(self.c.owner_step(RUN, "intake", "intake", True), "intent")
+        self.assertEqual(unconfirmed(), [])
+        # Past DISPATCH_UNCONFIRMED_ALARM_SECONDS: alarmed, under ONE fingerprint.
+        for minutes in (31, 41):
+            self.c.now = t0 + dt.timedelta(minutes=minutes)
+            self.assertEqual(self.c.owner_step(RUN, "intake", "intake", True), "intent")
+        self.assertEqual(len({a[2] for a in unconfirmed()}), 1, unconfirmed())
+        self.assertEqual(unconfirmed()[0][3]["eventKey"], "initial")
+        # The host's real answer, as the real ncl prints it: admitted as a replay.
+        answers["dispatch"] = ncl_json(self.PR2121_REPLAY)
+        self.c.now = t0 + dt.timedelta(minutes=51)
+        self.assertEqual(self.c.owner_step(RUN, "intake", "intake", True), "enqueued")
+        ob = self.c.obligations()[ctl.obligation_key(RUN, "owner", "intake")]
+        self.assertEqual(ob["state"], "enqueued")
+        self.assertEqual(ob["detail"]["dispatch"]["row_id"], "event-0000aaaa1111")
+        self.assertIsNone(ob["detail"]["dispatchIntent"])
+        # Next fire: the completed, settled owner row settles intake.
+        self.c.now = t0 + dt.timedelta(minutes=61)
+        self.assertEqual(self.c.owner_step(RUN, "intake", "intake", True), "done")
+        dispatches = [c for c in effect.commands if c[1:3] == ["tasks", "dispatch"]]
+        self.assertEqual(len(dispatches), 4)  # three unconfirmed replays, one admitted
+        self.assertEqual({c[c.index("--event-key") + 1] for c in dispatches}, {"initial"})
+        self.assertFalse(any("--retry-of" in c for c in dispatches))
+        self.assertEqual(sum(1 for c in effect.commands if c[1:3] == ["tasks", "get"]), 1)
+        self.c.now = t0 + dt.timedelta(minutes=71)
+        self.assertEqual(self.c.owner_step(RUN, "intake", "intake", True), "done")
+        self.assertEqual(len([c for c in effect.commands if c[1:3] == ["tasks", "dispatch"]]), 4)
+
+    def test_pretty_printed_admission_is_admitted_on_the_first_replay(self):
+        self.stuck_intent()
+        effect = self.real_effects(lambda argv: (0, node_stringify(dict({"id": "cli-1"}, **self.PR2121_REPLAY)), ""))
+        self.assertEqual(self.c.owner_step(RUN, "intake", "intake", False), "enqueued")
+        self.assertEqual(len(effect.commands), 1)
+        self.assertEqual(self.c.alarms, [])
+
+
+class NclFormat(unittest.TestCase):
+    """The fakes must print what the real `ncl --json` prints, and the parser
+    must read that. Every assertion here compares against node itself or
+    ncl.ts's own source, never against another Python rendering."""
+
+    def test_ncl_still_pretty_prints_its_frame(self):
+        # If this fails, ncl's output changed: update ncl_json, the shared fake
+        # (testdata/controller-live-fakes.py ncl_out), the inline fakes in
+        # smoke-controller-live.test.sh and smoke-controller-shadow.test.sh, and
+        # re-check last_json_line -- then this line.
+        self.assertIn("process.stdout.write(JSON.stringify(resp, null, 2) + '\\n');", NCL_TS.read_text())
+
+    def test_the_test_formatter_is_node_byte_for_byte(self):
+        for doc in (PhaseDispatch.PR2121_REPLAY, PhaseDispatch.SETTLED,
+                    {"ok": False, "error": {"message": "refusé \u2014 \"quoted\""}}, {"ok": True, "data": []}):
+            self.assertEqual(ncl_json(doc), node_stringify(dict({"id": "cli-test"}, **doc)))
+
+    def test_shared_fake_prints_what_ncl_prints(self):
+        fakes = HERE / "testdata" / "controller-live-fakes.py"
+        with tempfile.TemporaryDirectory() as state:
+            env = dict(os.environ, FAKE_STATE=state)
+            for argv in (["tasks", "create", "--name", "ctl-x", "--prompt", "p", "--json"],
+                         ["tasks", "list", "--json"],
+                         ["tasks", "dispatch", "--context-key", "smoke/r/intake", "--event-key", "initial",
+                          "--prompt", "p", "--json"],
+                         ["tasks", "get", "--id", "no-such-row", "--json"],
+                         ["tasks", "nonsense", "--json"]):
+                res = subprocess.run(["python3", str(fakes), "ncl"] + argv, env=env, capture_output=True, text=True)
+                self.assertEqual(res.returncode, 0, (argv, res.stderr))  # --json never sets an exit code
+                self.assertEqual(res.stdout, node_stringify(json.loads(res.stdout)), argv)
+
+    def test_parser_reads_what_ncl_prints(self):
+        frame = dict({"id": "cli-0000000000000-test01"}, **PhaseDispatch.PR2121_REPLAY)
+        printed = node_stringify(frame)
+        self.assertGreater(printed.count("\n"), 5)
+        self.assertEqual(ctl.last_json_line(printed), frame)
+        self.assertEqual(ctl.last_json_line("ncl: warning\n" + printed), frame)
+        # The one-object-per-line shape the gate prints is unchanged.
+        self.assertEqual(ctl.last_json_line('progress line\n{"ok": false}\n{"ok": true}\n'), {"ok": True})
+        self.assertIsNone(ctl.last_json_line('{"ok": true}\n{"ok": tr'))
+        self.assertIsNone(ctl.last_json_line(""))
 
 
 if __name__ == "__main__":
