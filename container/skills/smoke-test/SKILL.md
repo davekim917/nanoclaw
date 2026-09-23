@@ -1660,9 +1660,9 @@ do its job without. Both used to stay in the controller's own journal.
 - **The barrier's answer.** On every `lanes` and `synthesis` fire the
   controller writes the real `smoke-evidence-barrier.sh` output to
   `<run>/controller/barrier-<step>.json` and deletes it once the phase passes
-  (`smoke-campaign-controller.py:1942` `publish_barrier`, whose effect writes at
-  `:1401-1402` and unlinks on `doc is None` at `:1387-1395`), and every
-  barrier-backed brief names that file (`:1422-1445`). `invalid[]` is artifact
+  (`smoke-campaign-controller.py:1960` `publish_barrier`, whose effect writes at
+  `:1419-1420` and unlinks on `doc is None` at `:1405-1413`), and every
+  barrier-backed brief names that file (`:1440-1463`). `invalid[]` is artifact
   CONTENT the barrier rejects; only the owner can repair it, and no amount of
   lane work clears it. Run `xzo-pr-pr2055-…` (XZO #2047) spent 67 minutes
   running lanes while the barrier had already named
@@ -1676,12 +1676,12 @@ do its job without. Both used to stay in the controller's own journal.
   `xzo-pr-pr2055-…` actually took, is the reverse: the brief is issued while
   the barrier is merely waiting for markers, the owner acks it, and then the
   owner writes evidence the barrier rejects. `owner_step` re-offers a wake only
-  while the `.ack` is absent (`smoke-campaign-controller.py:2500-2502`), so that
+  while the `.ack` is absent (`smoke-campaign-controller.py:2518-2520`), so that
   fire published the new refusal and woke nobody. The trigger is a change in **the refusal** — `invalid[]` *and*
   `invalidReasons[]`, digested against what the brief was written under
   (`refusal_digest`, `smoke-campaign-controller.py:246`; recorded as
-  `briefedRefusal` at `:1340-1341`, carried forward at `:2493-2494`, compared by
-  `_reoffer_on_new_refusal` at `:2634`) — and
+  `briefedRefusal` at `:1358-1359`, carried forward at `:2511-2512`, compared by
+  `_reoffer_on_new_refusal` at `:2652`) — and
   deliberately neither of its neighbours: not "the published answer changed",
   which includes `missing[]` and would wake the owner on every marker it banks;
   and not "became invalid", which would leave an owner working against a
@@ -1689,7 +1689,7 @@ do its job without. Both used to stay in the controller's own journal.
   `scope-dispositions.json` went from `dispositions[3]/[30]/[31]` to
   `[3]/[30]/[32]` with the file name unchanged). A refusal that *clears*
   re-offers nothing. Re-offering does not extend the step's SLA, which is
-  measured from the obligation's first record (`smoke-campaign-controller.py:2511`), so an owner that keeps producing
+  measured from the obligation's first record (`smoke-campaign-controller.py:2529`), so an owner that keeps producing
   invalid evidence still ends at the overdue path.
 
   **A refusing barrier wakes the owner on BOTH phases.** By the time a run
@@ -1699,7 +1699,7 @@ do its job without. Both used to stay in the controller's own journal.
   or a visual-candidate disposition it owes under
   `SMOKE_VISUAL_DISPOSITIONS=1` — is the retained owner's, and the owner is the
   only judgment party the controller can invoke. That branch used to return
-  without a wake (it now wakes at `smoke-campaign-controller.py:3197-3199`),
+  without a wake (it now wakes at `smoke-campaign-controller.py:3215-3217`),
   which left the phase with no exit at all: the wrapper wakes on `ownerWake`
   alone (`smoke-controller-live.sh:168-175`), so nobody was told, and the
   overdue-BLOCKED safety net keys on the very `owner:synthesis` obligation the
@@ -1765,6 +1765,22 @@ the current one resolves, so it cannot fire while the owner's turn is running,
 and the owner is refused `progress` as a claimant mismatch. On PR #2022 that
 cost a 13-lane step four lane markers and finished the run `BLOCKED`
 (XZO #2024).
+
+**The live controller will not claim a new campaign without it.** Every tick
+writes `<out-dir>/renewer/heartbeat.json`. Before each poll, the live
+controller reads it and skips the poll unless the last tick is under 11 minutes
+old and ended `ok` or `idle`. It posts one alarm per outage per day, with
+different wording for each case, because each has a different fix:
+
+| Alarm says | What it means | Fix |
+|---|---|---|
+| "has never run here" | no heartbeat, for 11+ minutes | create the series above (`ncl tasks list` shows whether it exists), or point it back at `/app/skills/smoke-test/scripts/smoke-controller-renew.sh` if it runs a pinned copy older than the heartbeat |
+| "stopped ticking" | last tick older than 11 minutes | resume or recreate the series |
+| "ticking but renewing nothing" | ticks end in a failure status | its configuration, or the journal it reads |
+| "cannot read the heartbeat" | the file can't be looked at | a mount or permission fault on the out-dir; the renewer may be fine |
+
+A run already claimed keeps going: it is still stamped and stepped every fire,
+and the alarm names it as at risk.
 
 The renewer is its own series, so its own session and container: neither the
 owner's turn nor the controller's cadence can hold it up. Each tick reads the

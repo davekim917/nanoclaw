@@ -760,5 +760,78 @@ LAST="$(timeout 5 bash "$R" 2>>"$C/renew.err")" || fail 'nonregular env file blo
 [ "$(field '.wakeAgent')" = false ] || fail 'nonregular env file woke a model'
 ok
 
+# ═════════════════════════════════════════════════════════════════════════════
+# THE HEARTBEAT (#1031) — every tick that knows the out-dir records that it
+# ran and how it ended, in <out>/renewer/heartbeat.json, which the live worker
+# reads before it may claim. Every "no heartbeat" assertion first proves the
+# tick ran to final() (its own stdout status), so an absent file is the code
+# under test deciding, not a tick that never ran.
+# ═════════════════════════════════════════════════════════════════════════════
+echo "== heartbeat =="
+HB() { printf '%s' "$C/out/renewer/heartbeat.json"; }
+hb() { jq -r "$1" "$(HB)" 2>/dev/null; }
+new_case heartbeat-idle
+tick
+[ "$(field '.data.status')" = idle ] || fail "heartbeat: precondition -- an empty journal is an idle tick: $LAST"
+[ "$(hb .status)" = idle ] && [ "$(hb .tick)" = "$(field '.data.tick')" ] \
+  || fail "heartbeat: an idle tick records itself, with the tick it reported: $(cat "$(HB)" 2>&1)"
+[ "$(hb .schemaVersion)" = 1 ] && [ "$(hb .tickEpoch)" -gt 0 ] || fail "heartbeat: schema and epoch"
+[ "$(stat -c %a "$(HB)")" = 644 ] || fail "heartbeat: readable by the worker's container (0644): $(stat -c %a "$(HB)")"
+[ "$(printf '%s\n' "$LAST" | wc -l)" = 1 ] && [ "$(field '.wakeAgent')" = false ] \
+  || fail "heartbeat: the tick's stdout contract is unchanged: $LAST"
+ok
+
+new_case heartbeat-renewed
+use_stub_gate
+claim_files
+in_flight_at "$(/usr/bin/date -u +%s)"
+tick
+[ "$(field '.data.renewed | length')" = 1 ] || fail "heartbeat: precondition -- this tick renewed a step: $LAST"
+[ "$(hb .status)" = ok ] || fail "heartbeat: a renewing tick records ok: $(cat "$(HB)" 2>&1)"
+unset SMOKE_CONTROLLER_GATE_CMD GATE_LOG
+ok
+
+new_case heartbeat-failing
+export SMOKE_CONTROLLER_GATE_CMD="$C/no-such-gate.sh"
+tick
+[ "$(field '.data.status')" = misconfigured ] || fail "heartbeat: precondition -- a missing gate wrapper: $LAST"
+[ "$(hb .status)" = misconfigured ] \
+  || fail "heartbeat: a failing tick records WHY, so the worker can say 'ticking but renewing nothing'"
+unset SMOKE_CONTROLLER_GATE_CMD
+ok
+
+new_case heartbeat-not-live
+write_env shadow
+tick
+[ "$(field '.data.status')" = not-live ] || fail "heartbeat: precondition -- the kill switch is off: $LAST"
+[ ! -e "$C/out/renewer" ] || fail "heartbeat: a tick that is not live writes nothing at all"
+ok
+
+new_case heartbeat-no-out-dir
+rm -rf "$C/out"
+tick
+[ "$(field '.data.status')" = no-journal ] || fail "heartbeat: precondition -- the tick ran to its end: $LAST"
+[ ! -e "$C/out" ] || fail "heartbeat: the renewer never creates the worker's out-dir"
+ok
+
+new_case heartbeat-symlinked-dir
+mkdir -p "$C/elsewhere"
+ln -s "$C/elsewhere" "$C/out/renewer"
+tick
+[ "$(field '.data.status')" = idle ] || fail "heartbeat: precondition -- the tick ran to its end: $LAST"
+[ -z "$(ls -A "$C/elsewhere")" ] || fail "heartbeat: written THROUGH a symlinked renewer dir: $(ls -A "$C/elsewhere")"
+ok
+
+new_case heartbeat-symlinked-file
+mkdir -p "$C/out/renewer" "$C/elsewhere"
+printf 'untouched\n' >"$C/elsewhere/target"
+ln -s "$C/elsewhere/target" "$C/out/renewer/heartbeat.json"
+tick
+[ "$(field '.data.status')" = idle ] || fail "heartbeat: precondition -- the tick ran to its end: $LAST"
+[ "$(cat "$C/elsewhere/target")" = untouched ] || fail "heartbeat: written through a symlinked heartbeat file"
+[ ! -L "$(HB)" ] && [ "$(hb .status)" = idle ] \
+  || fail "heartbeat: the link is REPLACED by the real heartbeat (rename, never follow)"
+ok
+
 [ "$FAILURES" = 0 ] || { echo "$FAILURES assertion group(s) FAILED" >&2; exit 1; }
 echo "PASS ($PASSES assertions)"
