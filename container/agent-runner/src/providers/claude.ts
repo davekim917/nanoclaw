@@ -1073,18 +1073,47 @@ export function createSubagentQuotaHook(options: {
 
 // Credential model for container shells: secret-env.ts (SDK-free).
 
-// `codex exec` reads stdin IN ADDITION to the prompt arg — codex's own help:
-// "If stdin is piped and a prompt is also provided, stdin is appended as a
-// <stdin> block". The agent's Bash tool leaves stdin open (a pipe with no EOF),
-// so codex blocks forever on that read, gets killed at the turn timeout, and
-// its block-buffered output is lost — surfacing as "codex exec hangs, zero
-// output" (2026-06-27; my own earlier `docker exec` tests EOF'd stdin and
-// masked it). Wrapping the command group's stdin to /dev/null gives codex an
-// immediate EOF so it runs with just the prompt. An explicit `< file` on codex,
-// or a `… | codex` pipe, still wins (inner/pipe redirect binds closer), so
-// deliberate piped input is preserved; only the unused-open-stdin hang changes.
-const CODEX_EXEC_RE = /\bcodex\s+exec\b/;
-const ALREADY_DEVNULL_STDIN_RE = /<\s*\/dev\/null\b/;
+// ── Every CLAUDE Bash command gets /dev/null on stdin (this provider ONLY) ──
+//
+// The Claude Code Bash tool's fd 0 is a unix socket never written and never
+// closed, so a program reading stdin blocks forever. No Codex tool is known to
+// share it; runPreToolUseChain applies none. Two hangs, both on this path:
+//   • `codex exec` appends stdin to its prompt ("If stdin is piped and a prompt
+//     is also provided, stdin is appended as a <stdin> block"), so it blocked
+//     and died at the turn timeout (2026-06-27, a03dc6787: a CLAUDE agent).
+//   • snowflake-cli 3.23.0 treats an EMPTY `--query` as "no source given" and
+//     falls back to `sys.stdin.read()` (snowflake/cli/_plugins/sql/commands.py:175-176).
+//     On 2026-09-22 `snow sql -c mr --query "$(cat /tmp/why0.sql)"` with the
+//     file never written left a production thread silent for 30 minutes
+//     (argv's last element was '' per /proc/<pid>/cmdline; wchan =
+//     unix_stream_data_wait).
+//
+// Nothing legitimately reads that socket, so the fix is not to detect the
+// programs that do. An earlier version pattern-matched `snow` invocations and
+// every patch to that shell parser produced the next miss: `rows=$(snow …)`,
+// a piped snow exempting a later unpiped one, separators inside quotes. The
+// wrap is now unconditional and there is nothing to detect.
+//
+// `exec </dev/null` on its own line, before the command:
+//   • A PREFIX, with no closing token, so nothing the command ends with can
+//     collide with the wrap. A brace group (`{\n<cmd>\n} </dev/null`) turned
+//     two shapes bash accepts today into hard syntax errors: a heredoc with no
+//     terminator line and a trailing line-continuation `\` both swallowed the
+//     closing `}`.
+//   • Redirects on individual commands still override it, so `… | snow sql -i`,
+//     `cmd < file` and heredocs keep their own stdin.
+//   • Same shell, no subshell: `cd` and `export` persist. The harness runs
+//     `bash -c "… && eval '<cmd>' && pwd -P >| <cwdfile>"` with the command
+//     in argv, not on stdin, so closing fd 0 inside the eval cannot cut the
+//     harness off from its own input.
+//   • NOT a wall-clock timeout: a legitimately long query is waiting on the
+//     server, not on fd 0, and runs as long as it needs.
+const STDIN_PREFIX = 'exec </dev/null\n';
+
+/** Give a command /dev/null on stdin. Idempotent. Exported for tests. */
+export function wrapDevNullStdin(command: string): string {
+  return command.startsWith(STDIN_PREFIX) ? command : `${STDIN_PREFIX}${command}`;
+}
 
 // Two concurrent jest runs will OOM-kill this container no matter how each one
 // is configured. On 2026-08-09 one agent had two background suites going and
@@ -1135,24 +1164,45 @@ export function wrapJestSerialized(command: string): string {
 }
 
 /**
- * Rewrites a Bash command before it runs: `/dev/null` stdin for `codex exec`
- * (CODEX_EXEC_RE) and the jest serialization lock (wrapJestSerialized). No
- * `unset <secrets>` prefix any more — see secret-env.ts's header.
+ * Rewrites a Bash command before it runs: the jest serialization lock
+ * (wrapJestSerialized) — a SEMANTIC rewrite that guards may legitimately see —
+ * and, only when `closeStdin` is set, the `/dev/null` stdin prefix
+ * (wrapDevNullStdin). No `unset <secrets>` prefix any more — see
+ * secret-env.ts's header.
+ *
+ * INVARIANT: the stdin prefix is a transport detail no guard may ever see.
+ * The email gate's bypass check fails closed on `<` and newlines, so a guard
+ * reading `exec </dev/null\n…` would turn a harmless `--dry-run` into an
+ * hour-long approval wait. It is applied on the CLAUDE PATH ONLY, once:
+ *   • Claude SDK: this hook with `closeStdin: true`, the ONLY hook in the Bash
+ *     PreToolUse list returning `updatedInput` — the one emit point. Read from
+ *     the CLI binary at SDK 0.3.280 (logic unchanged from 0.3.272): all of our
+ *     hooks share one tier (only policySettings hooks run in an earlier tier,
+ *     and may rewrite the input first), whose hooks run CONCURRENTLY (a
+ *     Promise.race merge), each on the same `hookInput`, never reassigned; the
+ *     fold keeps the last `updatedInput` to COMPLETE. So list position orders
+ *     neither execution nor merge: safety is one emitter plus unmodified input.
+ *     A second emitter would race this one. It sits last only for
+ *     claude.stdinEmit.test.ts, whose threaded model is stricter.
+ *   • Codex (runPreToolUseChain): this hook WITHOUT `closeStdin`, first, so
+ *     guards see the jest rewrite. That chain applies NO prefix anywhere (the
+ *     fd-0 condition is the Claude Bash tool's, header above), so none reaches
+ *     a guard or an approval card. That asymmetry is the scope, not an
+ *     oversight: do not "fix" it by adding one.
  */
-export function createBashCommandRewriteHook(): HookCallback {
+export function createBashCommandRewriteHook(opts: { closeStdin?: boolean } = {}): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;
     if (!command) return {};
-    const wrapCodexStdin = CODEX_EXEC_RE.test(command) && !ALREADY_DEVNULL_STDIN_RE.test(command);
 
     let rewritten = command;
-    if (wrapCodexStdin) rewritten = `{ ${rewritten} ; } </dev/null`;
-    // After the codex wrap, so a `codex exec` that itself runs jest keeps its
-    // /dev/null stdin.
     if (JEST_RE.test(command) && !ALREADY_FLOCKED_RE.test(command)) {
       rewritten = wrapJestSerialized(rewritten);
     }
+    // Emit point for the Claude chain (see the INVARIANT above). The prefix goes
+    // outermost, so jest's inner `bash -c` inherits /dev/null too.
+    if (opts.closeStdin) rewritten = wrapDevNullStdin(rewritten);
     if (rewritten === command) return {};
 
     return {
@@ -2916,17 +2966,18 @@ export class ClaudeProvider implements AgentProvider {
           PreToolUse: [
             {
               matcher: 'Bash',
-              // Order matters: the command rewrite runs first so the later
-              // block hooks and the email gate all evaluate the same
-              // command text. Block hooks return deny if they match.
+              // List position does NOT order execution: the CLI runs these
+              // concurrently, each on the original input, so no guard sees the
+              // prefix. The rewrite must stay the ONLY hook returning
+              // updatedInput — see createBashCommandRewriteHook's INVARIANT.
               hooks: [
-                createBashCommandRewriteHook(),
                 createManagedGitMaintenanceHook(),
                 createSelfApprovalBlockHook(),
                 createBlockSnowflakeConnectorHook(),
                 createBlockGitCloneHook(),
                 createBlockCodexCompanionHook(),
                 ...(pluginOwnsBashEmailGate ? [] : [createEmailGateHook()]),
+                createBashCommandRewriteHook({ closeStdin: true }),
               ],
             },
           ],

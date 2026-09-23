@@ -1,11 +1,16 @@
-import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, spyOn } from 'bun:test';
 import type { HookCallback, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import {
   createBashCommandRewriteHook,
   wrapJestSerialized,
   createSelfApprovalBlockHook,
   createBlockSnowflakeConnectorHook,
+  wrapDevNullStdin,
   createBlockGitCloneHook,
   createBlockCodexCompanionHook,
   createEmailGateHook,
@@ -14,6 +19,7 @@ import {
 import * as messagesOut from '../db/messages-out.js';
 import * as sessionRouting from '../db/session-routing.js';
 import * as deliveryAcks from '../db/delivery-acks.js';
+import { allowSubprocess, resetHermeticityAllowances } from '../test-hermeticity.js';
 
 // Fixture core paths — claude.ts resolves these via NANOCLAW_DESTRUCTIVE_GUARD_CORE
 // (block-destructive) and NANOCLAW_EMAIL_GATE_CORE (email).
@@ -49,7 +55,11 @@ async function runBashHook(
 /** Drive createBashCommandRewriteHook and return the command it produced. */
 async function runRewriteHook(command: string): Promise<string> {
   const input = { tool_name: 'Bash', tool_input: { command } } as unknown as PreToolUseHookInput;
-  const out = await createBashCommandRewriteHook()(input as Parameters<HookCallback>[0], EMPTY_CTX, EMPTY_OPTS);
+  const out = await createBashCommandRewriteHook({ closeStdin: true })(
+    input as Parameters<HookCallback>[0],
+    EMPTY_CTX,
+    EMPTY_OPTS,
+  );
   const hso = (out as { hookSpecificOutput?: { updatedInput?: { command?: string } } })?.hookSpecificOutput;
   return hso?.updatedInput?.command ?? command;
 }
@@ -563,11 +573,14 @@ describe('E3 createEmailGateHook', () => {
 
       const emailCommand = 'gws gmail +send --to person8@fixture1.example.com --subject hi --body x --dry-run';
       const rewritten = await runRewriteHook(emailCommand);
-      expect(rewritten).toBe(emailCommand); // untouched: no unset, no wrap
+      // Only the stdin wrap: no unset prefix, no credential.
+      expect(rewritten).toBe(wrapDevNullStdin(emailCommand));
       expect(rewritten).not.toContain('ANTHROPIC_API_KEY');
+      // The gate evaluates the command as the agent typed it: the CLI hands
+      // every hook the original input, so no guard ever sees the wrapper.
 
       // dry-run → bypass (allow, no staging)
-      const dry = await runBashHook(createEmailGateHook(), rewritten);
+      const dry = await runBashHook(createEmailGateHook(), emailCommand);
       expect(dry.permissionDecision).toBeUndefined();
       expect(gateCard()).toBeUndefined();
       expect(ackedRequestId).toBeNull();
@@ -711,58 +724,21 @@ describe('createBashCommandRewriteHook credential passthrough', () => {
   // own container runs on, the way `codex exec` and `opencode run` already
   // could. MUTATION CHECK: restoring the `unset <vars> 2>/dev/null; ` prefix in
   // createBashCommandRewriteHook fails every assertion here.
-  it('leaves an ordinary command byte-identical — no unset prefix, no rewrite', async () => {
+  it('adds only the stdin wrap to an ordinary command — no unset prefix', async () => {
     for (const cmd of ['claude -p "review this"', 'printenv ANTHROPIC_API_KEY', 'ls -la /workspace']) {
       const out = await runRewriteHook(cmd);
-      expect(out).toBe(cmd);
+      expect(out).toBe(wrapDevNullStdin(cmd));
       expect(out).not.toContain('unset ');
     }
   });
 
   it('never names a credential slot in a rewritten command either', async () => {
-    // The two rewrites that DO fire (codex stdin, jest lock) must not reintroduce one.
+    // Neither rewrite (stdin wrap, jest lock) may reintroduce one.
     for (const cmd of ['codex exec --yolo "x"', 'npx jest']) {
       const out = await runRewriteHook(cmd);
       expect(out).not.toBe(cmd); // a rewrite really did happen
       for (const slot of SLOTS) expect(out).not.toContain(slot);
     }
-  });
-});
-
-// ── createBashCommandRewriteHook: codex exec stdin /dev/null wrap ──
-describe('createBashCommandRewriteHook codex exec stdin fix', () => {
-  async function sanitize(command: string): Promise<string | undefined> {
-    const input = { tool_name: 'Bash', tool_input: { command } } as unknown as PreToolUseHookInput;
-    const out = await createBashCommandRewriteHook()(input as Parameters<HookCallback>[0], EMPTY_CTX, EMPTY_OPTS);
-    const hso = (out as { hookSpecificOutput?: { updatedInput?: { command?: string } } })?.hookSpecificOutput;
-    return hso?.updatedInput?.command;
-  }
-
-  it('wraps a codex exec command so its stdin is /dev/null', async () => {
-    const out = await sanitize('codex exec --yolo "reply OK"');
-    expect(out).toContain('codex exec --yolo "reply OK"');
-    expect(out).toMatch(/^\{ .* ; \} <\/dev\/null$/);
-  });
-
-  it('wraps even with a cd prefix (last command is codex)', async () => {
-    const out = await sanitize('cd /workspace/agent && codex exec --yolo "x"');
-    expect(out).toMatch(/\} <\/dev\/null$/);
-    expect(out).toContain('cd /workspace/agent && codex exec');
-  });
-
-  it('does not double-redirect when stdin is already /dev/null', async () => {
-    const command = 'codex exec --yolo "x" </dev/null';
-    const out = await sanitize(command);
-    // Already has </dev/null → no group wrap added. With no credential prefix
-    // left to prepend either, the hook has nothing to rewrite and returns no
-    // updatedInput at all (claude.ts: `if (rewritten === command) return {}`).
-    expect(out).toBeUndefined();
-    expect(out ?? command).not.toMatch(/\} <\/dev\/null$/);
-  });
-
-  it('does not wrap non-codex commands', async () => {
-    const out = await sanitize('ls -la /workspace');
-    expect(out ?? 'ls -la /workspace').not.toContain('</dev/null');
   });
 });
 
@@ -795,7 +771,7 @@ describe('wrapJestSerialized', () => {
 
 describe('createBashCommandRewriteHook: jest serialization', () => {
   const runHook = async (command: string): Promise<string> => {
-    const hook = createBashCommandRewriteHook();
+    const hook = createBashCommandRewriteHook({ closeStdin: true });
     const res = (await hook(
       { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command } } as never,
       undefined as never,
@@ -822,7 +798,7 @@ describe('createBashCommandRewriteHook: jest serialization', () => {
     }
   });
 
-  it('keeps the codex stdin wrap when codex is the one running jest', async () => {
+  it('the Claude hook still wraps stdin when the command itself is `codex exec` running jest', async () => {
     const out = await runHook('codex exec --yolo "npm test"');
     expect(out).toContain('</dev/null');
     expect(out).toContain('flock -n -E 126');
@@ -1013,5 +989,208 @@ describe('createEmailGateHook — one approval card per tool call', () => {
     await expect(runWithToolUseId('exec-abc')).rejects.toThrow(/outbound.db unavailable/);
     expect(rec().abandoned).toEqual(['key:exec-abc|request_bash_gate']);
     expect(rec().published).toEqual([]);
+  });
+});
+
+// ── Every CLAUDE Bash command gets /dev/null on stdin (2026-09-22 incident) ──
+//
+// The Claude Code Bash tool's fd 0 is a socket that is never written and never
+// closed; this prefix is scoped to that provider and the Codex chain gets none.
+// snowflake-cli 3.23.0 reads it when `--query` is empty (commands.py:175-176),
+// so `snow sql --query "$(cat missing.sql)"` hung a turn for 30 minutes. These
+// run the hook's REAL output under a real `bash`, with stdin held open and
+// never written, against a `snow` stub that reproduces the CLI's fallback.
+describe('universal /dev/null stdin wrap', () => {
+  let dir = '';
+  const HANG_MS = 2_000;
+
+  // These tests exist to run the hook's output under a REAL bash, so they opt
+  // in. Bun's allowances are run-wide (test-hermeticity.ts:13-16), so grant per
+  // test and reset after, as review-churn-gate.test.ts does.
+  beforeEach(() => allowSubprocess(['bash']));
+  afterEach(() => resetHermeticityAllowances());
+
+  beforeAll(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-stdin-wrap-'));
+    // Mirrors commands.py:175-176: no (or empty) --query and stdin not a tty
+    // → read ALL of stdin.
+    fs.writeFileSync(
+      path.join(dir, 'snow'),
+      [
+        '#!/bin/bash',
+        'q=""; prev=""',
+        'for a in "$@"; do',
+        '  case "$prev" in --query|-q) q="$a" ;; esac',
+        '  case "$a" in --query=*) q="${a#--query=}" ;; esac',
+        '  prev="$a"',
+        'done',
+        'if [ -z "$q" ] && [ ! -t 0 ]; then data=$(cat); echo "STDIN:[$data]"; exit 1; fi',
+        'echo "QUERY:[$q]"',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+  });
+  afterAll(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  /** Run under bash with an open, never-written stdin. `hung` = killed at HANG_MS. */
+  function run(command: string): Promise<{ code: number | null; hung: boolean; out: string }> {
+    return new Promise((resolve) => {
+      const child = spawn('bash', ['-c', command], {
+        cwd: dir,
+        env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+        stdio: ['pipe', 'pipe', 'pipe'], // stdin: a pipe we never write and never close
+      });
+      let out = '';
+      child.stdout.on('data', (b) => (out += String(b)));
+      let hung = false;
+      const timer = setTimeout(() => {
+        hung = true;
+        child.kill('SIGKILL');
+      }, HANG_MS);
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        resolve({ code, hung, out });
+      });
+    });
+  }
+
+  it('(a) the incident command and a $(snow …) capture return immediately', async () => {
+    for (const cmd of [
+      'snow sql -c mr --query "$(cat missing.sql)"',
+      'rows=$(snow sql --query "$(cat missing.sql)"); echo "rc=$?"',
+    ]) {
+      const before = await run(cmd);
+      const after = await run(await runRewriteHook(cmd));
+      console.log(
+        `  ${cmd}\n    before: hung=${before.hung} code=${before.code}\n    after:  hung=${after.hung} code=${after.code}`,
+      );
+      expect(before.hung).toBe(true);
+      expect(after.hung).toBe(false);
+    }
+  }, 20_000);
+
+  it('(b) a piped snow keeps its pipe data AND a later unpiped snow no longer hangs', async () => {
+    const cmd = `printf 'select 1' | snow sql -i; snow sql --query "$(cat missing.sql)"`;
+    const before = await run(cmd);
+    const after = await run(await runRewriteHook(cmd));
+    console.log(
+      `  before: hung=${before.hung}\n  after:  hung=${after.hung} code=${after.code} out=${JSON.stringify(after.out)}`,
+    );
+    expect(before.hung).toBe(true);
+    expect(after.hung).toBe(false);
+    expect(after.out).toContain('STDIN:[select 1]'); // the inner pipe won
+    expect(after.out).toContain('STDIN:[]'); // the second read /dev/null
+  }, 20_000);
+
+  // Every shape must behave EXACTLY as it does unwrapped: same exit code, same
+  // stdout. The two marked ← regressed under the earlier brace-group wrap
+  // (`{\n<cmd>\n} </dev/null`), where they swallowed the closing `}` and
+  // became `syntax error: unexpected end of file` (rc 2).
+  const SHAPES: Array<[string, string]> = [
+    ['plain', 'echo plain'],
+    ['heredoc terminated', "cat <<'EOF'\nhello from heredoc\nEOF"],
+    ['heredoc unterminated ←', 'cat <<EOF\nno terminator line'],
+    ['trailing backslash ←', 'echo a \\'],
+    ['mid-command continuation', 'echo a \\\n  b'],
+    ['loop', 'for i in 1 2 3; do echo "n$i"; done'],
+    ['exit 3', 'echo before; exit 3'],
+    ['"}" in a string', 'echo "}"'],
+    ['trailing &', 'echo backgrounded &'],
+    ['trailing # comment', 'echo kept # trailing comment'],
+  ];
+
+  it('(c) every shell shape keeps its raw exit code and output under the prefix', async () => {
+    const rows: string[] = [];
+    for (const [name, cmd] of SHAPES) {
+      const wrapped = await runRewriteHook(cmd);
+      expect(wrapped).not.toBe(cmd); // really rewritten
+      const raw = await run(cmd);
+      const rew = await run(wrapped);
+      rows.push(`${name.padEnd(26)} raw rc=${raw.code} rewritten rc=${rew.code}`);
+      expect(raw.hung).toBe(false);
+      expect(rew.hung).toBe(false);
+      expect(rew.code).toBe(raw.code);
+      expect(rew.out).toBe(raw.out);
+    }
+    console.log(`  ${rows.join('\n  ')}`);
+  }, 60_000);
+
+  it('(d) same shell, no subshell: `cd` persists past the command', async () => {
+    const wrapped = await runRewriteHook('cd /tmp && pwd');
+    const r = await run(`${wrapped}\npwd`);
+    expect(r.out.trim().split('\n')).toEqual(['/tmp', '/tmp']);
+  });
+
+  it("(g) inside the harness's own `eval '<cmd>' && pwd -P >| <cwdfile>` the cwd capture still works", async () => {
+    // Claude Code runs a Bash call as bash -c "… && eval '<cmd>' && pwd -P >| <cwdfile>",
+    // the command in argv (observed on this host via /proc/$$/cmdline), so
+    // `exec </dev/null` inside the eval closes only the socket nobody writes.
+    const cwdFile = path.join(dir, 'cwd-capture');
+    const harness = (cmd: string) => `eval '${cmd.replace(/'/g, `'"'"'`)}' && pwd -P >| ${cwdFile}`;
+    const wrapped = await runRewriteHook(`cd /tmp && echo 'moved'; cat`); // `cat` would hang on the open stdin
+    const r = await run(harness(wrapped));
+    expect(r.hung).toBe(false);
+    expect(r.code).toBe(0);
+    expect(r.out).toBe('moved\n');
+    expect(fs.readFileSync(cwdFile, 'utf8').trim()).toBe('/tmp');
+  });
+
+  it('(h) the jest lock still works after the exec line (prefix outermost)', async () => {
+    // A harmless stand-in for the jest command: `cat` proves the lock's inner
+    // `bash -c` inherited /dev/null rather than the open socket.
+    const wrapped = wrapDevNullStdin(wrapJestSerialized('echo jest-ok; cat'));
+    expect(wrapped.startsWith('exec </dev/null\n')).toBe(true);
+    const r = await run(wrapped);
+    expect(r.hung).toBe(false);
+    expect(r.code).toBe(0);
+    expect(r.out).toBe('jest-ok\n');
+    // And the real hook produces exactly that order for a jest command.
+    expect(await runRewriteHook('npx jest')).toBe(wrapDevNullStdin(wrapJestSerialized('npx jest')));
+  });
+
+  it('(e) is not applied twice', async () => {
+    const once = await runRewriteHook('snow sql --query "select 1"');
+    expect(await runRewriteHook(once)).toBe(once);
+    expect(wrapDevNullStdin(once)).toBe(once);
+    expect(once.match(/exec <\/dev\/null/g)).toHaveLength(1);
+  });
+
+  it('without closeStdin the hook never adds the prefix (the Codex chain gets none at all)', async () => {
+    const hook = createBashCommandRewriteHook();
+    const run1 = async (command: string) =>
+      (
+        (await hook(
+          { tool_name: 'Bash', tool_input: { command } } as unknown as Parameters<HookCallback>[0],
+          EMPTY_CTX,
+          EMPTY_OPTS,
+        )) as { hookSpecificOutput?: { updatedInput?: { command?: string } } }
+      )?.hookSpecificOutput?.updatedInput?.command;
+    expect(await run1('ls -la')).toBeUndefined(); // nothing to rewrite
+    const jest = await run1('npx jest');
+    expect(jest).toBe(wrapJestSerialized('npx jest'));
+    expect(jest).not.toContain('exec </dev/null');
+  });
+
+  it('(f) quoted text containing `snow sql --query ""` is not denied and runs', async () => {
+    const cmd = `echo 'foo; snow sql --query ""'`;
+    // The empty-query deny hook is gone; no remaining Bash guard objects.
+    expect((await import('./claude.js')).createBlockSnowflakeEmptyQueryHook).toBeUndefined();
+    const savedGuard = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
+    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/guard-core.ts';
+    try {
+      for (const hook of [
+        createSelfApprovalBlockHook(),
+        createBlockSnowflakeConnectorHook(),
+        createBlockGitCloneHook(),
+        createBlockCodexCompanionHook(),
+      ]) {
+        expect((await runBashHook(hook, cmd)).permissionDecision).toBeUndefined();
+      }
+    } finally {
+      if (savedGuard === undefined) delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
+      else process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = savedGuard;
+    }
+    const r = await run(await runRewriteHook(cmd));
+    expect(r.out.trim()).toBe('foo; snow sql --query ""');
   });
 });

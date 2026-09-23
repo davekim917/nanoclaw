@@ -96,7 +96,8 @@ describe('runPreToolUseChain — guardrails', () => {
       | { continue?: boolean }
       | { hookSpecificOutput?: { hookEventName?: string; updatedInput?: { command?: string } } };
     // `ls -la` is neither `codex exec` nor a jest run, and no credential prefix
-    // is prepended any more, so the chain returns a plain continue.
+    // is prepended any more, so the chain returns a plain continue. The stdin
+    // prefix is Claude-only and must not appear here.
     expect(out).toEqual({ continue: true });
   });
 

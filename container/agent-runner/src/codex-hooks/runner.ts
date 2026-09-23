@@ -425,8 +425,9 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
     return first ?? { continue: true };
   }
 
-  // Bash-only chain. Order matters: the command rewrite first, so every
-  // guardrail after it evaluates the same command text.
+  // Bash-only chain. Order matters: the command rewrite (jest lock only — this
+  // chain applies no stdin prefix, see below) first, so every guardrail after
+  // it evaluates the same command text.
   const chain: HookCallback[] = [
     createBashCommandRewriteHook(),
     createManagedGitMaintenanceHook(),
@@ -494,6 +495,17 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
   const toolUseId = typeof normalized.tool_use_id === 'string' ? normalized.tool_use_id : undefined;
   const guardDeny = await runDestructiveGuard(guardCommand, toolUseId);
   if (guardDeny) return guardDeny;
+
+  // NO stdin prefix here, deliberately. `exec </dev/null` exists for the Claude
+  // Code Bash tool, whose fd 0 is a unix socket that is never written and never
+  // closed (the 2026-09-22 hang). Nothing shows a Codex path has that
+  // condition, and emitting `updatedInput` on every Bash call — rather than
+  // only for the jest rewrite — would put unverified surface on every Codex
+  // container for a hypothetical gain: whether codex honours the field, and
+  // under which key, is not established (docs/specs/claude-review-credential-rotation/run.md:11-12).
+  // So this chain emits exactly what it did before: the jest rewrite, or nothing.
+  // The Claude side applies the prefix at its own emit point — see
+  // createBashCommandRewriteHook's INVARIANT in providers/claude.ts.
 
   if (mergedUpdatedInput) {
     return {
