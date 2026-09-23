@@ -27,8 +27,11 @@ Check a user's claim ("X is on Sonnet") against what actually ran before changin
 ```bash
 # Group config (authoritative). An indented line is inside providerConfig OR providerFallback: open the file to tell which.
 grep -HE '"(provider|model|effort|reasoning_effort|defaultModel|defaultEffort)":' groups/*/container.json   # defaultModel/defaultEffort = legacy keys, still honoured
-# Host-wide Codex default (below providerConfig.model, above DEFAULT_CODEX_MODEL); no output = unset
+# Host-wide Codex default (below providerConfig.model, above DEFAULT_CODEX_MODEL). Check BOTH sources:
+# the host loads .env into process.env after exec, so the service environ alone misses it (src/main.ts:230-253, called at :618).
+# Either one set = the effective default. The environ wins over .env, because .env never overrides an existing key (src/main.ts:249).
 tr '\0' '\n' < /proc/$(systemctl show -p MainPID --value nanoclaw-v2)/environ | grep -E '^CODEX_MODEL='
+grep -E '^\s*CODEX_MODEL=' .env
 # Channel wiring overrides
 pnpm exec tsx scripts/q.ts data/v2.db "select mga.id, mg.name, mga.agent_group_id, mga.default_model, mga.default_effort from messaging_group_agents mga join messaging_groups mg on mg.id = mga.messaging_group_id where coalesce(mga.default_model,'') <> '' or coalesce(mga.default_effort,'') <> ''"
 # Scheduled-task pins
@@ -104,8 +107,9 @@ List them with `grep -lE '"imageTag"' groups/*/container.json`, then rebuild acc
 **Never pin a live task or wiring to an id the running image can't serve.** Wait until the deploy that carries the CLI is live.
 
 **Deployed is not enough for task pins and stickies.** They apply per turn inside whatever container is already running (`container/agent-runner/src/poll-loop.ts:4029`, `container/agent-runner/src/providers/codex.ts:1222`). A host restart *adopts* running containers, and they keep their old CLI. So a repin right after deploy can send the new id to an old-CLI container; for Codex that's the HTTP 400. Before repinning a task or setting a sticky:
-1. Check that the session's container is gone or on the new image (`docker ps`, `nanoclaw-session` label).
+1. Check that the session's container is gone or on the new image. Find it by its `nanoclaw-session` label in `docker ps`, then compare `docker inspect -f '{{.Image}}' <container>` with `docker image inspect -f '{{.Id}}' "$IMG"` (`$IMG` from step 2; for an `imageTag` group, that group's own tag). After the base rebuild, an old-image container also shows a bare hex id in `{{.Image}}` instead of the tag.
 2. If it's still on the old image, recycle the group first with `ncl groups restart --id <group-id>`, at a quiet moment.
+3. For `ncl tasks repin --all`, which repins every group at once: run the step-5 rollover listing first, and recycle every group that still has an old-image container.
 
 ```bash
 ncl tasks update --id <series> --group <ag-id> --model opus --effort low       # "" clears
