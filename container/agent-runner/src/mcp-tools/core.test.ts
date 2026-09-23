@@ -133,6 +133,26 @@ describe('send_message MCP tool — default replies in the current conversation'
     _resetConfig();
   });
 
+  it('carries the served model across the MCP process boundary', async () => {
+    const ts = await import('../turn-status.js');
+    const { _setConfigForTest, _resetConfig } = await import('../config.js');
+    _resetConfig();
+    _setConfigForTest({});
+    ts.resetTurnStatus();
+    ts.setTurnSettings('opus', 'low');
+    ts.setOwnConversation('slack', 'slack:CTEST00004');
+    ts.recordServedModel('claude-opus-5-5');
+    ts.recordContextTokens(51_000);
+    ts._forgetOwnershipForTest(); // this process now sees what the subprocess sees
+
+    await sendMessage.handler({ text: 'answered' });
+
+    const own = getUndeliveredMessages().find((r) => r.platform_id === 'slack:CTEST00004')!;
+    expect(JSON.parse(own.content).subtext).toBe('opus-5-5 · low · 51k context');
+    ts.resetTurnStatus();
+    _resetConfig();
+  });
+
   // A scheduled task session has no conversation of its own (routing is a
   // system:tasks:* thread with no platform), so the own-conversation gate
   // alone left every scheduled post bare — seen live 2026-09-22, 23:19Z.
