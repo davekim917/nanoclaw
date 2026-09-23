@@ -17,7 +17,7 @@ A model release touches three layers. Only the first two need a PR.
 - **Task pins and chat `-m` stickies** go through the flag vocabulary, which maps every `MODEL_ALIAS_MAP` / `CODEX_MODEL_ALIAS_MAP` entry to its concrete id at write. So `fable` (`src/flag-parser.ts:68`) and the Codex aliases `sol` / `luna` / `terra` / `astra` (`src/flag-parser.ts:274`) freeze there.
 - **`ncl wirings update --default-model` and `ncl groups config update --model`** store their argument literally. A literal **Claude** alias there resolves at use and floats. **A Codex alias does not resolve at all**: the spawn path forwards the stored value unchanged as `NANOCLAW_CODEX_MODEL_OVERRIDE` (`src/container-runner.ts:6553-6555`), and the runner doesn't expand it (`container/agent-runner/src/config.ts:106`). So for a Codex group, always pass a full `gpt-*` id on both paths.
 
-A Fable or Codex bump therefore means repointing the alias entry *and* repinning the concrete ids already stored in tasks and stickies.
+A Fable or Codex bump therefore means repointing the alias entry *and* repinning every concrete id the step-1 inventory finds: task pins, stickies, channel wirings (`messaging_group_agents.default_model`), and group `container.json` `model` / `providerConfig.model` / `providerFallback.model`.
 
 ## 1. Inventory: what runs where
 
@@ -104,7 +104,11 @@ ncl groups config update --id <ag-id> --model <full-id> --effort medium        #
   - `.codex/agents/*.toml` carrying `# managed by nanoclaw codex-sync` are generated mirrors (`src/codex-sync.ts`); never edit one.
   - Keep model names out of descriptions and prose. Frontmatter is the only place a model is named.
 - **Session stickies** come from a chat `-m`/`-e`, which writes `sticky_model`/`sticky_effort` to that session's `outbound.db` `session_state` (`container/agent-runner/src/poll-loop.ts:3790`). They override the wiring and the group for that session only, and a bump doesn't move them. Report them; clear or set one only when asked. There is no `ncl` verb. The container owns `outbound.db`, so write only while that session's container is stopped: check `sessions.container_status` and the `nanoclaw-session` label in `docker ps`.
-- **A task pin covers the task's own fires only.** A human reply in a task post's thread routes to that channel's thread session. That session resolves: sticky → group `providerConfig.model` → wiring → group `container.json` model → install default (`container/agent-runner/src/providers/claude.ts:2770`). To make follow-ups match the task, set the channel's wiring, or `-e <level>` in the thread. **Setting the wiring does nothing for a group whose `providerConfig` sets a model**: change that group's config instead.
+- **A task pin covers the task's own fires only.** A human reply in a task post's thread routes to that channel's thread session. That session's order depends on the provider:
+  - **Claude**: sticky → group `providerConfig.model` → wiring → group `container.json` model → install default (`container/agent-runner/src/providers/claude.ts:2770`). **Setting the wiring does nothing for a Claude group whose `providerConfig` sets a model**; change that group's config instead.
+  - **Codex**: sticky (per turn, `container/agent-runner/src/providers/codex.ts:1222`) → wiring → group `providerConfig.model` → group `container.json` model → install default (`container/agent-runner/src/config.ts:131-137`). Here the wiring does override `providerConfig`.
+
+  To make follow-ups match the task, set the channel's wiring (subject to the Claude exception above), or send `-e <level>` in the thread.
 
 ## 5. Verify after deploy
 
