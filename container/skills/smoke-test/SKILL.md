@@ -1769,14 +1769,16 @@ cost a 13-lane step four lane markers and finished the run `BLOCKED`
 **The live controller will not claim a new campaign without it.** Every tick
 writes `<out-dir>/renewer/heartbeat.json`. Before each poll, the live
 controller reads it and skips the poll unless the last tick is under 11 minutes
-old and ended `ok` or `idle`. It posts one alarm per outage per day, with
+old and ended `ok` or `idle`, or ended `renew-failed` for the first tick in a
+row (gate `progress` calls that did not renew; one such tick is a busy lock or
+a race, and the 900 s lease outlasts it). It posts one alarm per outage per day, with
 different wording for each case, because each has a different fix:
 
 | Alarm says | What it means | Fix |
 |---|---|---|
 | "has never run here" | no heartbeat, for 11+ minutes | create the series above (`ncl tasks list` shows whether it exists), or point it back at `/app/skills/smoke-test/scripts/smoke-controller-renew.sh` if it runs a pinned copy older than the heartbeat |
 | "stopped ticking" | last tick older than 11 minutes | resume or recreate the series |
-| "ticking but renewing nothing" | ticks end in a failure status | its configuration, or the journal it reads |
+| "ticking but renewing nothing" | ticks end in a failure status, or `renew-failed` two ticks in a row | its configuration, or the journal it reads; for `renew-failed`, the gate is refusing or not answering its `progress` calls: check the state and lease dirs its env file names |
 | "cannot read the heartbeat" | the file can't be looked at | a mount or permission fault on the out-dir; the renewer may be fine |
 
 A run already claimed keeps going: it is still stamped and stepped every fire,

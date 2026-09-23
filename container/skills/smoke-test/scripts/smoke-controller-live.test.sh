@@ -98,10 +98,10 @@ ELAPSED=0
 # renewer ticking every 5 minutes leaves. NO_HEARTBEAT=1 leaves the file alone
 # -- for the cases that must not create the out-dir, and the renewer cases,
 # which shape it themselves.
-renewer_ticked() { # [status] [tick]
+renewer_ticked() { # [status] [tick] [extra JSON members, e.g. ,"failedTicks":2]
   mkdir -p "$OUT/renewer"
-  printf '{"schemaVersion":1,"tick":"%s","status":"%s"}\n' \
-    "${2:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" "${1:-ok}" >"$OUT/renewer/heartbeat.json"
+  printf '{"schemaVersion":1,"tick":"%s","status":"%s"%s}\n' \
+    "${2:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" "${1:-ok}" "${3:-}" >"$OUT/renewer/heartbeat.json"
 }
 fire() { # [env assignments...]
   local s rc
@@ -1067,6 +1067,32 @@ NO_HEARTBEAT=1 fire
 refused_to_claim r3 failing
 renewer_posts | jq -e 'length == 1 and (.[0] | test("ticking but renewing nothing") and test("misconfigured"))' \
   >/dev/null || fail "r3: one post says the renewer ticks but renews nothing: $(renewer_posts)"
+
+# r3b) RENEW-FAILED -- the renewer reaches the gate but its progress calls do
+#      not renew (Codex, PR #1089). One such tick is a busy lock or a race and
+#      still claims; two in a row, or a count that is not a positive integer,
+#      is a renewer that cannot renew.
+new_case renewer-renew-failed-once
+next_poll_claims
+renewer_ticked renew-failed "" ',"failedTicks":1'
+NO_HEARTBEAT=1 fire
+[ "$(d .renewer.state)" = fresh ] && [ "$(d .renewer.failedTicks)" = 1 ] && [ "$(polls)" = 1 ] \
+  && [ "$(claimed_by_controller)" = controller ] || fail "r3b: one failed tick still claims: $OUTPUT"
+[ "$(renewer_posts)" = '[]' ] || fail "r3b: one failed tick is not alarmed: $(renewer_posts)"
+for COUNT in 2 5 '"2"' 0 -1 1.5 true null; do
+  new_case "renewer-renew-failed-$COUNT"
+  next_poll_claims
+  renewer_ticked renew-failed "" ",\"failedTicks\":$COUNT"
+  NO_HEARTBEAT=1 fire
+  refused_to_claim "r3b($COUNT)" failing
+done
+new_case renewer-renew-failed-no-count
+next_poll_claims
+renewer_ticked renew-failed
+NO_HEARTBEAT=1 fire
+refused_to_claim "r3b(no count)" failing
+renewer_posts | jq -e 'length == 1 and (.[0] | test("ticking but renewing nothing") and test("renew-failed"))' \
+  >/dev/null || fail "r3b: one post says the renewer ticks but renews nothing: $(renewer_posts)"
 
 # r4) UNREADABLE -- the controller cannot look at the heartbeat (here a
 #     symlink, refused by O_NOFOLLOW). Never read as "the renewer stopped".

@@ -567,7 +567,12 @@ def alarm_queue():
 #   stale       the last tick is older than RENEWER_STALE_SECONDS: the series
 #               was paused or removed, or its ticks die before their end.
 #   failing     the renewer ticks, but its last tick ended in a status that
-#               renews nothing (misconfigured, journal-unreadable, ...).
+#               renews nothing (misconfigured, journal-unreadable, ...) -- or
+#               in `renew-failed`, gate `progress` calls that did not renew,
+#               for RENEWER_FAILED_TICKS_LIMIT ticks in a row. A renewer that
+#               cannot reach the lease while this worker can still claim is
+#               the failure this gate exists for; one such tick is a busy lock
+#               or a race, which the 900 s lease outlasts.
 #   unreadable  the heartbeat could not be LOOKED at (EACCES, a symlink, a
 #               non-regular file, bytes that are not a heartbeat, a tick from
 #               the future): a fault on this side, NOT evidence the renewer
@@ -576,6 +581,8 @@ def alarm_queue():
 RENEWER_STALE_SECONDS = 660
 RENEWER_FUTURE_SLACK_SECONDS = 60
 RENEWER_HEALTHY_STATUSES = ("ok", "idle")
+RENEWER_FAILED_STATUS = "renew-failed"
+RENEWER_FAILED_TICKS_LIMIT = 2
 RENEWER_TRIGGER_PREFIX = "controller_renewer_"
 RENEWER_WATCH = ["wrapper", "renewer-watch.json"]
 
@@ -626,6 +633,15 @@ def renewer_health():
         return "unreadable", dict(detail, error="heartbeat tick is in the future")
     if age > RENEWER_STALE_SECONDS:
         return "stale", detail
+    if doc.get("status") == RENEWER_FAILED_STATUS:
+        # smoke-controller-renew.sh counts these (FAILED_TICKS). A count that
+        # is missing or not a positive integer is not read as "only one".
+        failed = doc.get("failedTicks")
+        detail["failedTicks"] = failed
+        if (isinstance(failed, int) and not isinstance(failed, bool)
+                and 1 <= failed < RENEWER_FAILED_TICKS_LIMIT):
+            return "fresh", detail
+        return "failing", detail
     if doc.get("status") not in RENEWER_HEALTHY_STATUSES:
         return "failing", detail
     return "fresh", detail

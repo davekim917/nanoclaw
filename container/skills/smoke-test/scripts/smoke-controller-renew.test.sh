@@ -833,5 +833,87 @@ tick
   || fail "heartbeat: the link is REPLACED by the real heartbeat (rename, never follow)"
 ok
 
+# A tick that REACHED the gate and did not renew is not a healthy tick
+# (Codex, PR #1089): a renewer that cannot renew while the worker can still
+# claim is the failure the heartbeat exists to surface. `renew-failed` carries
+# how many ticks in a row; the worker stops claiming at 2.
+reply_gate() { # <one JSON line the gate answers progress with, or "" for none>
+  cat >"$STUB" <<SH
+#!/usr/bin/env bash
+printf '%s claimant=%s\n' "\$*" "\${SMOKE_GATE_CLAIMANT:-}" >>"\$GATE_LOG"
+printf '%s\n' '$1'
+SH
+  chmod +x "$STUB"
+  export SMOKE_CONTROLLER_GATE_CMD="$STUB" GATE_LOG="$C/gate.log"
+  : >"$GATE_LOG"
+}
+failed_tick() { # <label> <expected failedTicks>
+  tick
+  grep -q "^progress $RUN " "$GATE_LOG" || fail "$1: precondition -- the tick reached the gate: $LAST"
+  [ "$(field '.data.status')" = renew-failed ] && [ "$(field '.data.renewed | length')" = 0 ] \
+    || fail "$1: a refused renewal is not an ok tick: $LAST"
+  [ "$(hb .status)" = renew-failed ] && [ "$(hb .failedTicks)" = "$2" ] \
+    || fail "$1: heartbeat records renew-failed x$2: $(cat "$(HB)" 2>&1)"
+  : >"$GATE_LOG"
+}
+
+new_case heartbeat-renew-failed
+claim_files
+in_flight_at "$(/usr/bin/date -u +%s)"
+# The gate did not find the run (pr:null): a wrong state dir answers this too.
+reply_gate '{"ok":false,"error":"not the active run (reclaimed or finished) — stop this campaign","runId":"x","pr":null,"activeRunId":null}'
+failed_tick "rf1 not-found" 1
+failed_tick "rf1 again" 2
+failed_tick "rf1 a third" 3
+use_stub_gate
+tick
+[ "$(field '.data.status')" = ok ] && [ "$(hb .status)" = ok ] && [ "$(hb .failedTicks)" = 0 ] \
+  || fail "rf1: one renewal resets the count: $(cat "$(HB)" 2>&1)"
+ok
+reply_gate '{"ok":false,"retryable":true,"error":"gate_lock_busy: ...","pr":7}'
+failed_tick "rf2 lock busy" 1
+reply_gate '{"ok":false,"error":"caller owner does not match the owner recorded by claim - STOP this campaign","pr":7,"runId":"x","requestedBy":"a","claimedBy":"b"}'
+failed_tick "rf3 owner mismatch (a PR but no activeRunId)" 2
+reply_gate ''
+failed_tick "rf4 no answer (the call timed out)" 3
+reply_gate 'not json'
+failed_tick "rf5 not JSON" 4
+ok
+
+# The gate POSITIVELY saw the run leave its slot: nothing is left to renew,
+# and the renewer is not failing for it.
+new_case heartbeat-run-gone
+claim_files
+in_flight_at "$(/usr/bin/date -u +%s)"
+reply_gate "{\"ok\":false,\"error\":\"not the active run (reclaimed or finished) — stop this campaign\",\"pr\":7,\"runId\":\"$RUN\",\"activeRunId\":null}"
+tick
+grep -q "^progress $RUN " "$GATE_LOG" || fail "gone: precondition -- the tick reached the gate: $LAST"
+[ "$(field '.data.status')" = ok ] && [ "$(hb .status)" = ok ] && [ "$(hb .failedTicks)" = 0 ] \
+  || fail "gone: a run the gate saw finish is not a failed renewal: $LAST / $(cat "$(HB)" 2>&1)"
+[ "$(field '.data.skipped | length')" = 1 ] || fail "gone: still recorded as skipped: $LAST"
+reply_gate "{\"ok\":false,\"error\":\"STOP THIS CAMPAIGN. displaced\",\"pr\":7,\"runId\":\"$RUN\",\"activeRunId\":\"other-run\",\"displacedAt\":\"2026-09-23T00:00:00Z\"}"
+tick
+[ "$(hb .status)" = ok ] || fail "gone: a displaced run is not a failed renewal: $(cat "$(HB)" 2>&1)"
+ok
+
+# The count is carried from the renewer's own last heartbeat; one it cannot
+# read is not evidence the last tick was healthy.
+new_case heartbeat-renew-failed-unreadable-prior
+claim_files
+in_flight_at "$(/usr/bin/date -u +%s)"
+mkdir -p "$C/out/renewer"
+printf 'torn{' >"$(HB)"
+reply_gate '{"ok":false,"error":"x","pr":null,"activeRunId":null,"runId":"x"}'
+failed_tick "rf6 torn prior heartbeat" 2
+printf '{"status":"renew-failed","failedTicks":"many"}\n' >"$(HB)"
+failed_tick "rf6 non-numeric prior count" 2
+printf '{"status":"idle","failedTicks":9}\n' >"$(HB)"
+failed_tick "rf6 a healthy prior tick restarts the count" 1
+printf '{"status":"ok","failedTicks":0}\n' >"$C/prior-elsewhere.json"
+rm -f "$(HB)"; ln -s "$C/prior-elsewhere.json" "$(HB)"
+failed_tick "rf6 a symlinked prior heartbeat is not believed" 2
+unset SMOKE_CONTROLLER_GATE_CMD GATE_LOG
+ok
+
 [ "$FAILURES" = 0 ] || { echo "$FAILURES assertion group(s) FAILED" >&2; exit 1; }
 echo "PASS ($PASSES assertions)"
