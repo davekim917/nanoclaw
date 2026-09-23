@@ -17,7 +17,7 @@ A model release touches three layers. Only the first two need a PR.
 - **Task pins and chat `-m` stickies** go through the flag vocabulary, which maps every `MODEL_ALIAS_MAP` / `CODEX_MODEL_ALIAS_MAP` entry to its concrete id at write. So `fable` (`src/flag-parser.ts:68`) and the Codex aliases `sol` / `luna` / `terra` / `astra` (`src/flag-parser.ts:274`) freeze there.
 - **`ncl wirings update --default-model` and `ncl groups config update --model`** store their argument literally. A literal **Claude** alias there resolves at use and floats. **A Codex alias does not resolve at all**: the spawn path forwards the stored value unchanged as `NANOCLAW_CODEX_MODEL_OVERRIDE` (`src/container-runner.ts:6553-6555`), and the runner doesn't expand it (`container/agent-runner/src/config.ts:106`). So for a Codex group, always pass a full `gpt-*` id on both paths.
 
-A Fable or Codex bump therefore means repointing the alias entry *and* repinning every concrete id the step-1 inventory finds: task pins, stickies, channel wirings (`messaging_group_agents.default_model`), and group `container.json` `model` / `providerConfig.model` / `providerFallback.model`.
+A Fable or Codex bump therefore means repointing the alias entry *and* repinning every concrete id the step-1 inventory finds: task pins, stickies, channel wirings (`messaging_group_agents.default_model`), and group `container.json` `model` / legacy `defaultModel` / `providerConfig.model` / `providerFallback.model`.
 
 ## 1. Inventory: what runs where
 
