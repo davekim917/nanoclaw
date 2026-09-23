@@ -919,7 +919,7 @@
 "src/response-registry.ts":{"diff":27,"mode":"100644","sha256":"eb57afb3b71ad3a5cde9812c272530956ac375e542257227d2bfdd3beb2c16b6"},
 "src/router-session-created.test.ts":{"diff":237,"mode":"100644","sha256":null,"deleted":true},
 "src/router-unknown-engage-mode.test.ts":{"diff":163,"mode":"100644","sha256":null,"deleted":true},
-"src/router.ts":{"diff":1334,"mode":"100644","sha256":"321bd749eccd3c1b4c35a2b95b97ac7fd9c90dbee1eeb88073800d1619584720"},
+"src/router.ts":{"diff":1334,"mode":"100644","sha256":"ba536d4efcaefb89a942deaa0958419aafddd0c06b28545f8500b4195a32318e"},
 "src/session-claim-fencing.test.ts":{"diff":329,"mode":"100644","sha256":null,"deleted":true},
 "src/session-manager.attachments.test.ts":{"diff":11,"mode":"100644","sha256":"6e67158f9257cff6d70d2287d8f4737c9f138bc8bfd7a88d81fdad5acbd9dc7b"},
 "src/session-manager.feeds.test.ts":{"diff":82,"mode":"100644","sha256":null,"deleted":true},
