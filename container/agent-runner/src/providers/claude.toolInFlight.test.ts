@@ -135,7 +135,7 @@ describe('tool in-flight tracking', () => {
     // host-restart-warn (src/host-restart-warn.ts:249, :287), the dashboard's
     // stall rule (src/dashboard/api/threads.ts:251-253) and decideStuckAction's
     // tool-in-flight claim forgiveness (src/modules/sweep-container-health/
-    // index.ts:552, :645). A parallel Read starting or finishing inside a long
+    // index.ts:552, :664). A parallel Read starting or finishing inside a long
     // Bash must not move it forward.
     await pre('bash-1', 'Bash', 1_800_000);
     const afterBash = setCalls;

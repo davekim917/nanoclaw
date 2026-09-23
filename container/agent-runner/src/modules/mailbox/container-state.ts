@@ -160,6 +160,47 @@ export function resetProviderExecuting(outbound: Database = getOutboundDb()): vo
   publishProviderExecuting(outbound);
 }
 
+/* ─── provider_query_event_at ──────────────────────────────────────────────── */
+
+/**
+ * When the CURRENT query's provider first emitted an event; NULL until it has,
+ * and NULL between queries. The host sweep reads it to tell a turn that is
+ * alive but quiet (a long think: the model is generating and, with no partial
+ * messages, emits nothing) from one hung at the gate (the query started and
+ * the provider never produced anything). Only the second may be killed for an
+ * aged claim; see `decideStuckAction` (src/modules/sweep-container-health/index.ts).
+ *
+ * Written at most twice per query — reset at the start, stamped on the first
+ * event — so it costs one DB write per query, not one per event. The heartbeat
+ * stays a file touch.
+ */
+let queryEventStamped = false;
+
+function writeProviderQueryEventAt(value: string | null, outbound: Database): void {
+  outbound
+    .prepare(
+      `INSERT INTO container_state (id, provider_query_event_at, updated_at)
+       VALUES (1, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         provider_query_event_at = excluded.provider_query_event_at,
+         updated_at = excluded.updated_at`,
+    )
+    .run(value, new Date().toISOString());
+}
+
+/** A query is starting, or has ended: it has emitted nothing (yet). */
+export function resetProviderQueryEvent(outbound: Database = getOutboundDb()): void {
+  queryEventStamped = false;
+  writeProviderQueryEventAt(null, outbound);
+}
+
+/** The current query's provider emitted an event. Writes only the first time per query. */
+export function markProviderQueryEvent(outbound: Database = getOutboundDb()): void {
+  if (queryEventStamped) return;
+  writeProviderQueryEventAt(new Date().toISOString(), outbound);
+  queryEventStamped = true;
+}
+
 /**
  * Clear stale processing state on container startup. If the previous
  * container crashed, processing acks and its host-visible in-flight operation
@@ -169,6 +210,10 @@ export function clearStaleProcessingAcks(): void {
   getOutboundDb().prepare("DELETE FROM processing_ack WHERE status = 'processing'").run();
   sqliteClearContainerToolInFlight();
   clearProviderHealthState();
+  // A query the previous container was running when it died cannot NULL its
+  // own stamp, and a leftover one would read as "this query is alive" to the
+  // host's claim rule.
+  resetProviderQueryEvent();
   // A container killed mid-work cannot run its own `finally`, so the flag can
   // survive in outbound.db. Clearing it here — the fresh container's startup,
   // before its first poll — means a leaked 1 can never make the NEXT container

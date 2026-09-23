@@ -69,6 +69,8 @@ import {
   setChatLimit,
   chatBudgetExhausted,
   setProviderTurnExecuting,
+  markProviderQueryEvent,
+  resetProviderQueryEvent,
   setStickyEffort,
   setStickyFast,
   setStickyModel,
@@ -129,6 +131,12 @@ const CORRUPTION_STREAK_EXIT = 10;
 // sleep). Full jitter is load-bearing: sibling containers hit the same overload
 // in lockstep, so a fixed schedule would have them all retry on the same beat.
 const TRANSIENT_OVERLOAD_MAX_TRIES = 30;
+/**
+ * How many times one container process releases the same mid-turn follow-up
+ * whose stream ended unconsumed; see the `finally` of `processQuery`.
+ */
+const FOLLOW_UP_MAX_RELEASES = 1;
+const followUpReleaseCounts = new Map<string, number>();
 const TRANSIENT_OVERLOAD_BASE_MS = 1500;
 const TRANSIENT_OVERLOAD_CAP_MS = 30_000;
 const TRANSIENT_OVERLOAD_HEARTBEAT_MS = 10_000;
@@ -2064,7 +2072,9 @@ export async function processQuery(
   ];
 
   /**
-   * Follow-up rows pushed into this query whose ack is not terminal yet.
+   * Follow-up rows pushed into this query whose ack is not terminal yet, with
+   * the prompt id the provider stamped on each push (undefined when the
+   * provider does not track prompt ids).
    *
    * A mid-turn push used to be `markCompleted` on the line after
    * `pushToQuery` — seconds after the message arrived, with no evidence the
@@ -2076,22 +2086,27 @@ export async function processQuery(
    * Observed live 2026-09-22: a person's messages during a 30-minute wedged
    * turn were acked and lost, and the thread stayed silent.
    *
-   * These ids are now drained at the same place the INITIAL batch is — the
-   * turn's `result`, which for the claude provider settles everything pushed
-   * into it so far (a push is merged into the running turn; claude.ts's
-   * generator only exits on end/abort). If the turn never produces a result,
-   * the rows keep their non-terminal `processing` claim, the next container's
-   * `clearStaleProcessingAcks` drops the orphan claim, and the still-`pending`
-   * inbound row is selected again. Redelivery, not loss — the designed recovery
-   * (host-sweep.ts's comment at the poll interval: "if something is truly
-   * stuck, the host will kill the container and messages get reset to pending").
+   * A push is completed only once the provider says a result CONSUMED it: its
+   * prompt id is in that result's `answeredPrompts`, or in a later `settled`
+   * (the provider went idle holding it, so its echo was dropped and it was
+   * consumed — see the `settled` branch). Any `result` is NOT enough: the CLI
+   * can answer a turn while a pushed prompt is still queued behind it
+   * (claude.ts's `outstanding`), and completing it there loses it if the
+   * container dies before the queued turn runs. Only a provider that reports
+   * no prompt ids at all (`answeredPrompts` undefined, or a push that returned
+   * no id) falls back to completing on any `result`.
+   *
+   * If the stream ends with a push still unconsumed, the `finally` below
+   * RELEASES its claim, so the still-`pending` row is selected again —
+   * redelivery, not loss.
    */
-  let pendingFollowUpIds: string[] = [];
-  const completePendingFollowUps = (): void => {
-    if (pendingFollowUpIds.length === 0) return;
-    const ids = pendingFollowUpIds;
-    pendingFollowUpIds = [];
-    markCompleted(ids);
+  type PendingFollowUp = { ids: string[]; promptId: string | undefined };
+  let pendingFollowUps: PendingFollowUp[] = [];
+  const completeConsumedFollowUps = (consumed: (f: PendingFollowUp) => boolean): void => {
+    const consumedNow = pendingFollowUps.filter(consumed);
+    if (consumedNow.length === 0) return;
+    pendingFollowUps = pendingFollowUps.filter((f) => !consumed(f));
+    markCompleted(consumedNow.flatMap((f) => f.ids));
   };
 
   const requeueLedgerHead = (suppress: boolean): void => {
@@ -2494,13 +2509,14 @@ export async function processQuery(
         if (admittedTurn && pushedId) admittedTurn.promptIds = [pushedId];
         archivePrompts.push({ prompt });
         admittedInbound = true;
-        // NOT markCompleted here — see `pendingFollowUpIds`. The claim stays
-        // `processing` until a `result` proves the model consumed the push.
-        pendingFollowUpIds.push(...keptIds);
+        // NOT markCompleted here — see `pendingFollowUps`. The claim stays
+        // `processing` until the provider reports this prompt consumed.
+        pendingFollowUps.push({ ids: keptIds, promptId: pushedId });
         // Deliberately no touchHeartbeat() here: that would restart the idle
         // ceiling on every inbound message. A claim held across a long silent
-        // tool is forgiven host-side instead — `decideStuckAction`'s
-        // tool-in-flight rule (src/modules/sweep-container-health/index.ts).
+        // tool, or a long think, is forgiven host-side instead —
+        // `decideStuckAction`'s tool-in-flight and live-query rules
+        // (src/modules/sweep-container-health/index.ts).
       } catch (err) {
         pollFailed = true;
         // Without this catch the rejection escapes the void IIFE and Node
@@ -2611,6 +2627,9 @@ export async function processQuery(
 
   // The initial prompt is a turn the same way a push is; `result` clears it.
   setProviderTurnExecuting(true);
+  // A new query has emitted nothing yet. Until its first event the host's claim
+  // rule treats it as possibly hung at the gate (`markProviderQueryEvent`).
+  resetProviderQueryEvent();
   try {
     for await (const event of query.events) {
       if (event.type === 'error') {
@@ -2640,6 +2659,11 @@ export async function processQuery(
 
       await handleEvent(event, routing);
       touchHeartbeat();
+      try {
+        markProviderQueryEvent();
+      } catch (err) {
+        log(`Failed to stamp provider_query_event_at: ${err instanceof Error ? err.message : String(err)}`);
+      }
 
       if (event.type === 'init') {
         queryContinuation = event.continuation;
@@ -2773,11 +2797,13 @@ export async function processQuery(
         // mid-turn, or the message may not need a response at all — either
         // way the per-turn work for these rows is finished.
         markCompleted(initialBatchIds);
-        // Same instant, same reason, for anything pushed into this turn
-        // mid-flight. A push is merged into the running turn, so this result
-        // settles it too — that is the one moment at which "the model consumed
-        // it" is actually true. See `pendingFollowUpIds`.
-        completePendingFollowUps();
+        // Pushes this result CONSUMED — not every push outstanding: one still
+        // queued behind the answered prompt stays claimed until its own
+        // result or a `settled`. See `pendingFollowUps`.
+        const answered = event.answeredPrompts;
+        completeConsumedFollowUps(
+          (f) => answered === undefined || f.promptId === undefined || answered.includes(f.promptId),
+        );
         if (event.text) {
           // AUP refusal fast-fail: when Anthropic's content policy filter
           // fires mid-task, the SDK returns a terminal chat response with
@@ -2991,6 +3017,8 @@ export async function processQuery(
         // their echo was dropped (sdk.d.ts lists the cases). The last result
         // that answered none of the runner's prompts is the one that consumed
         // them.
+        const settledIds = event.unansweredPrompts;
+        completeConsumedFollowUps((f) => f.promptId !== undefined && settledIds.includes(f.promptId));
         if (routing.taskRun && provisional) {
           const held = provisional;
           const covered = event.unansweredPrompts.filter((id) => held.promptIds.includes(id));
@@ -3058,23 +3086,53 @@ export async function processQuery(
     // Floor for the abort/throw paths, which never reach a `result`.
     closeResultScope();
     setProviderTurnExecuting(false);
-    // A push that never got its `result` (abort, throw, a stream ended for a
+    // This query has ended; the host must not read its first event as a live
+    // query's (see `markProviderQueryEvent`).
+    try {
+      resetProviderQueryEvent();
+    } catch (err) {
+      log(`Failed to reset provider_query_event_at: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    // A push that never got consumed (abort, throw, a stream ended for a
     // command) must NOT keep a claim the runner will then filter out of every
     // later selection: the container stays alive across queries, so nothing
     // would clear it until the container exits and the message would be
     // silently undeliverable in the meantime. Release the claim instead — the
     // inbound row is still `pending`, so the next query re-selects it. This is
-    // the same op the repository-fence deferral uses (poll-loop.ts:1536) and it
-    // is deliberately a RELEASE, never a `markCompleted`: completing is what
-    // lost the message in the first place.
-    if (pendingFollowUpIds.length > 0) {
-      const unconsumed = pendingFollowUpIds;
-      pendingFollowUpIds = [];
+    // the same op the repository-fence deferral uses (poll-loop.ts:1571)
+    // and it is deliberately a RELEASE the first time: completing is what lost
+    // the message in the first place.
+    //
+    // Bounded: ONE release per row per container process
+    // (`FOLLOW_UP_MAX_RELEASES`). A row whose stream ends unconsumed a second
+    // time is completed instead, so a poison follow-up that kills every turn it
+    // joins cannot be redelivered forever. That is the same terminal handling
+    // an initial batch gets when its turn ends without a result
+    // (poll-loop.ts:1686). The container cannot bump `messages_in.tries` —
+    // inbound.db is host-written — so the count lives here; a container death
+    // instead goes through the host's MAX_TRIES ladder
+    // (src/modules/sweep-session-core/index.ts:85).
+    if (pendingFollowUps.length > 0) {
+      const unconsumed = pendingFollowUps.flatMap((f) => f.ids);
+      pendingFollowUps = [];
+      const exhausted = unconsumed.filter((id) => (followUpReleaseCounts.get(id) ?? 0) >= FOLLOW_UP_MAX_RELEASES);
+      const release = unconsumed.filter((id) => !exhausted.includes(id));
       try {
-        releaseProcessingClaims(unconsumed);
-        log(`Released ${unconsumed.length} follow-up claim(s) the stream ended without consuming`);
+        if (release.length > 0) {
+          releaseProcessingClaims(release);
+          for (const id of release) followUpReleaseCounts.set(id, (followUpReleaseCounts.get(id) ?? 0) + 1);
+          log(`Released ${release.length} follow-up claim(s) the stream ended without consuming`);
+        }
+        if (exhausted.length > 0) {
+          markCompleted(exhausted);
+          for (const id of exhausted) followUpReleaseCounts.delete(id);
+          log(
+            `Completed ${exhausted.length} follow-up(s) left unconsumed twice (${exhausted.join(', ')}) — ` +
+              'not redelivering again',
+          );
+        }
       } catch (err) {
-        log(`Failed to release unconsumed follow-up claims: ${err instanceof Error ? err.message : String(err)}`);
+        log(`Failed to settle unconsumed follow-up claims: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   }

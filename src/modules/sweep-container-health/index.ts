@@ -555,6 +555,24 @@ function inFlightToolStartedAtMs(state: ContainerState | null): number | null {
   return Number.isFinite(startedAt) ? startedAt : null;
 }
 
+/**
+ * True while the container's provider is mid-turn in a query that has already
+ * produced at least one event: alive, and possibly quiet for a long stretch
+ * (a long think emits nothing — the claude provider runs without partial
+ * messages, so the heartbeat, touched once per provider event, stands still).
+ * False for a query that has emitted nothing since it started, which is the
+ * "hung at the gate" case the claim rule exists to catch, and false for any
+ * outbound.db whose runner does not write `provider_query_event_at` (an
+ * adopted container on an older runner snapshot): no forgiveness, old rule.
+ * Requires a heartbeat so the ceiling check above always applies to a claim
+ * this forgives.
+ */
+function providerQueryIsLive(state: ContainerState | null, heartbeatMtimeMs: number): boolean {
+  if (heartbeatMtimeMs === 0 || state?.provider_executing !== 1) return false;
+  const eventAt = state.provider_query_event_at;
+  return typeof eventAt === 'string' && eventAt !== '' && Number.isFinite(parseSqliteUtc(eventAt));
+}
+
 function activeOperationTimeoutMs(state: ContainerState | null): number | null {
   if (!state || (state.current_tool !== 'Bash' && state.current_tool !== 'CodexItem')) return null;
   return typeof state.tool_declared_timeout_ms === 'number' ? state.tool_declared_timeout_ms : null;
@@ -627,6 +645,7 @@ export function decideStuckAction(args: {
   // gets SPAWN_GRACE_MS to clean them on startup before we kill for them.
   const inGrace = spawnedAtMs > 0 && now - spawnedAtMs < SPAWN_GRACE_MS;
   const toolStartedAtMs = inFlightToolStartedAtMs(containerState);
+  const queryIsLive = providerQueryIsLive(containerState, heartbeatMtimeMs);
   for (const claim of claims) {
     const claimedAt = parseSqliteUtc(claim.status_changed);
     if (Number.isNaN(claimedAt)) continue;
@@ -636,13 +655,22 @@ export function decideStuckAction(args: {
     if (inGrace && claimedAt < spawnedAtMs) continue;
     // A tool that was ALREADY running when this message was claimed, and is
     // still in flight, explains why the claim has not been consumed: the runner
-    // holds a mid-turn follow-up's claim until the turn's `result`
-    // (container/agent-runner/src/poll-loop.ts, `pendingFollowUpIds`), and a
+    // holds a mid-turn follow-up's claim until the provider reports it consumed
+    // (container/agent-runner/src/poll-loop.ts, `pendingFollowUps`), and a
     // turn inside a long silent tool emits no event to touch the heartbeat. The
     // claim is not evidence of a wedge. This only forgives the CLAIM rule; the
     // ceiling above is untouched, so a wedged tool is still reaped when the
     // heartbeat ages past max(ABSOLUTE_CEILING_MS, declared timeout).
     if (toolStartedAtMs !== null && toolStartedAtMs < claimedAt) continue;
+    // The same held claim with NO tool in flight: a check-in that arrived while
+    // the model is thinking or writing a long tool input. The provider turn is
+    // executing and this query has produced events, so the container is not
+    // hung at the gate; it is quiet. Forgive the claim and leave the wedge
+    // question to the ceiling above: a provider that stops emitting is still
+    // reaped once the heartbeat ages past ABSOLUTE_CEILING_MS (or a clamped
+    // declared Bash timeout). A query that has emitted nothing since it
+    // started gets no forgiveness — that is the case this rule kills.
+    if (queryIsLive) continue;
     return { action: 'kill-claim', messageId: claim.message_id, claimAgeMs: claimAge, toleranceMs: tolerance };
   }
 

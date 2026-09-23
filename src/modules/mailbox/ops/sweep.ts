@@ -442,6 +442,14 @@ export interface ContainerState {
   /** memory.events:max — ceiling hits that forced reclaim (pre-kill signal). */
   memory_max_events?: number | null;
   memory_telemetry_at?: string | null;
+  /**
+   * When the container's CURRENT query first produced a provider event; null
+   * until it has, and between queries. Written by the runner
+   * (container/agent-runner/src/modules/mailbox/container-state.ts,
+   * `markProviderQueryEvent`); undefined on an outbound.db an older runner
+   * created, which the claim rule reads as "no forgiveness".
+   */
+  provider_query_event_at?: string | null;
 }
 
 /**
@@ -484,6 +492,10 @@ const CONTAINER_STATE_MEMORY_COLUMNS =
 // tier and the column the host just added reads back as undefined.
 const CONTAINER_STATE_EXECUTING_COLUMNS = `${CONTAINER_STATE_TOOL_COLUMNS}, provider_executing`;
 const CONTAINER_STATE_COLUMN_TIERS = [
+  // Newest first. A DB whose container has not yet run a runner that adds
+  // provider_query_event_at fails this SELECT with "no such column" and reads
+  // the tier below, exactly as it did before the column existed.
+  `${CONTAINER_STATE_MEMORY_COLUMNS}, memory_max_events, provider_query_event_at`,
   `${CONTAINER_STATE_MEMORY_COLUMNS}, memory_max_events`,
   CONTAINER_STATE_MEMORY_COLUMNS,
   CONTAINER_STATE_PROVIDER_COLUMNS,

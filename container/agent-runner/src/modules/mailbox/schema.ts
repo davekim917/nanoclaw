@@ -164,6 +164,7 @@ export function ensureNanoclawOutboundSchema(outbound: Database): void {
         memory_oom_kill_events   INTEGER,
         memory_max_events        INTEGER,
         memory_telemetry_at      TEXT,
+        provider_query_event_at  TEXT,
         updated_at               TEXT NOT NULL
       );
     `);
@@ -198,6 +199,12 @@ export function ensureNanoclawOutboundSchema(outbound: Database): void {
     ['memory_oom_kill_events', 'INTEGER'],
     ['memory_max_events', 'INTEGER'],
     ['memory_telemetry_at', 'TEXT'],
+    // When the current query first produced a provider event (container-state.ts,
+    // `markProviderQueryEvent`). The host's claim rule reads it through a
+    // column tier and treats a DB without it as "no forgiveness", so an
+    // outbound.db created by an older runner is safe before and after this
+    // backfill.
+    ['provider_query_event_at', 'TEXT'],
     // Added to CREATE TABLE without a backfill entry — any outbound.db older
     // than the column made every INSERT throw at boot, so the session
     // crash-looped on each sweep wake and never answered again (observed
