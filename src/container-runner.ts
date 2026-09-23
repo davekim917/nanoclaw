@@ -7492,6 +7492,11 @@ async function buildContainerArgs(
         DISABLE_TOOLS:
           resolveScopedEnv('DBT_MCP_DISABLE_TOOLS', credentialFolder) ?? 'trigger_job_run,cancel_job_run,retry_job_run',
       };
+      // Every Admin API tool (list_jobs, list_jobs_runs, get_job_run_error, …)
+      // needs DBT_ACCOUNT_ID; without it dbt-mcp fails them before any HTTP
+      // call with an empty error message. Discovery/Semantic Layer don't.
+      const accountId = resolveScopedEnv('DBT_CLOUD_ACCOUNT_ID', credentialFolder);
+      if (accountId) env.DBT_ACCOUNT_ID = accountId;
       const devEnvId = resolveScopedEnv('DBT_DEV_ENV_ID', credentialFolder);
       if (devEnvId) env.DBT_DEV_ENV_ID = devEnvId;
       const userId = resolveScopedEnv('DBT_USER_ID', credentialFolder);
