@@ -62,8 +62,8 @@ interface SupportTaskContext {
   channelType: string;
   platformId: string;
   flagIntent?: {
-    stickyModel?: string;
-    stickyEffort?: string;
+    turnModel?: string;
+    turnEffort?: string;
   };
 }
 
@@ -94,8 +94,13 @@ function ticketCreationStep(policy: string | null): string {
  * Isolated scheduled-task sessions have no central messaging_group_id. Their
  * host-authored task row carries the delivery route instead, and its per-fire
  * turn flags are the model policy that should follow work dispatched from that
- * fire. Convert those one-turn flags to sticky flags for the dedicated support
- * session so later engineer replies stay on the same model/effort.
+ * fire. They stay ONE-TURN flags on the dispatched message: the poller's own
+ * work in the support thread (seeding a new issue, relaying a customer reply)
+ * runs on the task's model/effort, while a human's reply in that thread
+ * resolves like any other thread (sticky → wiring → group → install default).
+ * Operator decision 2026-09-23: follow-ups should not inherit the poller's
+ * cheap per-fire pin. (Before this, the pin was converted to a session sticky,
+ * which silently put every engineer reply on it.)
  */
 async function getSupportTaskContext(session: Session): Promise<SupportTaskContext | null> {
   if (!session.thread_id?.startsWith(TASK_SESSION_PREFIX)) return null;
@@ -115,12 +120,12 @@ async function getSupportTaskContext(session: Session): Promise<SupportTaskConte
     const parsed = JSON.parse(row.content) as {
       flagIntent?: { turnModel?: unknown; turnEffort?: unknown };
     };
-    const stickyModel = str(parsed.flagIntent?.turnModel);
-    const stickyEffort = str(parsed.flagIntent?.turnEffort);
-    if (stickyModel || stickyEffort) {
+    const turnModel = str(parsed.flagIntent?.turnModel);
+    const turnEffort = str(parsed.flagIntent?.turnEffort);
+    if (turnModel || turnEffort) {
       flagIntent = {
-        ...(stickyModel ? { stickyModel } : {}),
-        ...(stickyEffort ? { stickyEffort } : {}),
+        ...(turnModel ? { turnModel } : {}),
+        ...(turnEffort ? { turnEffort } : {}),
       };
     }
   } catch (err) {
