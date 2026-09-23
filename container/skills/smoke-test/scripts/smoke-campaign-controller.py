@@ -148,6 +148,12 @@ POST_FINISH_SLOTS = ("freeze-close",)
 # Journal kinds whose obligations must all be receipted before a GO finish.
 PRE_FINISH_KINDS = ("send", "gh", "dispatch")
 OWNER_STEP_SLA_SECONDS = 3600
+# A phase dispatch whose admission this controller still cannot confirm after
+# this long is alarmed (controller_dispatch_unconfirmed). Replaying the same
+# event is safe and stays the recovery, but it is silent: pr2121 replayed its
+# intake dispatch for hours because every `ncl` answer was misread, and
+# nothing said so. Three fires at the controller's ~10-minute cadence.
+DISPATCH_UNCONFIRMED_ALARM_SECONDS = 1800
 # A send awaiting its delivery receipt, or a GitHub write awaiting its marker
 # read-back, older than this raises controller_obligation_overdue (once). It
 # never resends: a missing receipt is ambiguous and keeps its message id.
@@ -711,7 +717,33 @@ def spawn(argv, timeout, allowed, env=None):
 
 
 def last_json_line(text):
-    for line in reversed((text or "").strip().splitlines()):
+    """The JSON object a child printed last, or None.
+
+    Two shapes reach here. The gate and this controller print ONE object per
+    line, after any number of progress lines. The in-container `ncl --json`
+    PRETTY-PRINTS its one response across many lines
+    (container/agent-runner/src/cli/ncl.ts:286, `JSON.stringify(resp, null,
+    2)`), and a line scan alone reads that as a bare `{` and answers None: every
+    phase-dispatch admission then looked unknown, and pr2121 replayed its
+    intake dispatch for hours with no alarm. So: the whole output first, then
+    the last top-level object -- an unindented `{` line through the end --
+    then the old last-line rule."""
+    text = (text or "").strip()
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        pass
+    else:
+        return doc if isinstance(doc, dict) else None
+    lines = text.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].rstrip() == "{":
+            try:
+                doc = json.loads("\n".join(lines[i:]))
+            except ValueError:
+                continue
+            return doc if isinstance(doc, dict) else None
+    for line in reversed(lines):
         line = line.strip()
         if line.startswith("{"):
             try:
@@ -756,6 +788,9 @@ ALARM_WORDS = {
     "controller_send_failed": "a chat post could not be delivered after its retries",
     "controller_send_budget": "the controller's chat budget for this run is spent",
     "controller_dispatch_ambiguous": "a judgment task may or may not have started; it is held for a human",
+    "controller_dispatch_unconfirmed": ("an owner phase dispatch could not be confirmed as admitted; the controller "
+                                        "keeps replaying the same event, so check `ncl tasks dispatch` from the "
+                                        "controller's container"),
     "controller_obligation_overdue": "a step is past its deadline",
     "controller_verdict_superseded": "a GO no longer holds, so the run finishes BLOCKED",
     "controller_gh_failed": "a GitHub write failed",
@@ -2455,7 +2490,19 @@ class Controller:
                 "briefedToken": result.get("briefedToken"), "briefedRefusal": result.get("briefedRefusal", ""),
                 "tokenReissued": False, "refusalChanged": False})
         else:
-            self.decide(run_id, phase, "wait", "wait", "dispatch outcome unknown; replay same event", step=step)
+            error = str(result.get("error") or "")[:200]
+            self.decide(run_id, phase, "wait", "wait", "dispatch outcome unknown; replay same event", step=step,
+                        detail={"eventKey": event, "error": error})
+            # When the intent for THIS event was first journaled: the history
+            # record that carries it, else the obligation's first record.
+            ob = self.obligations().get(obligation_key(run_id, "owner", step)) or {}
+            since = next((parse_iso(h.get("at")) for h in ob.get("history") or []
+                          if ((h.get("detail") or {}).get("dispatchIntent") or {}).get("eventKey") == event), None)
+            since = since or parse_iso(((ob.get("history") or [{}])[0]).get("at"))
+            if since and (self.now - since).total_seconds() > DISPATCH_UNCONFIRMED_ALARM_SECONDS:
+                self.ensure_alarm(run_id, "controller_dispatch_unconfirmed",
+                                  "owner-dispatch-unconfirmed:{}:{}".format(step, event[:40]),
+                                  {"step": step, "eventKey": event, "since": iso(since), "error": error})
         return "enqueued" if result.get("outcome") == "admitted" else "intent"
 
     def owner_step(self, run_id, phase, step, done):

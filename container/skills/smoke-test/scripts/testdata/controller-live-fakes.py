@@ -107,6 +107,22 @@ def out(doc, rc=0):
     return rc
 
 
+NCL_FRAMES = [0]
+
+
+def ncl_out(doc, rc=0):
+    """What the REAL in-container `ncl --json` prints: the whole response frame,
+    PRETTY-PRINTED, `JSON.stringify(resp, null, 2) + '\\n'`
+    (container/agent-runner/src/cli/ncl.ts:286), and exit 0 whether or not the
+    host said ok (--json sets no exit code for a refusal). A one-line fake is
+    how the controller shipped a parser that never read a live dispatch
+    (pr2121). smoke-python-suites.test.sh pins this against node's own output."""
+    NCL_FRAMES[0] += 1
+    frame = dict({"id": "cli-fake-{}".format(NCL_FRAMES[0])}, **doc)
+    sys.stdout.write(json.dumps(frame, indent=2, ensure_ascii=False) + "\n")
+    return 0 if "--json" in sys.argv else rc
+
+
 # -- enqueue ------------------------------------------------------------------
 def enqueue(argv):
     db = load("enqueue.json", {"messages": {}, "fires": {}})
@@ -239,18 +255,18 @@ def ncl(argv):
         name = opt(argv, "--name")
         f = fault("ncl:create")
         if f == "fail-before":
-            return "fail", out({"ok": False, "error": {"message": "injected"}}, 1)
+            return "fail", ncl_out({"ok": False, "error": {"message": "injected"}}, 1)
         if f == "refuse":
-            return "refused", out({"ok": False, "error": {"message": "group has cli_scope disabled"}}, 1)
+            return "refused", ncl_out({"ok": False, "error": {"message": "group has cli_scope disabled"}}, 1)
         sid = "{}-{}".format(name, hashlib.sha256(name.encode()).hexdigest()[:6])
         db["tasks"].append({"series_id": sid, "name": name, "status": "pending", "prompt": opt(argv, "--prompt"),
                             "flags": [a for a in argv if a.startswith("--") and a not in ("--prompt",)]})
         save("ncl.json", db)
         if f == "fail-after":
             return "fail-after", 1  # no output: a timeout after the host created the task
-        return "created", out({"ok": True, "data": {"series_id": sid}})
+        return "created", ncl_out({"ok": True, "data": {"series_id": sid}})
     if argv[:2] == ["tasks", "list"]:
-        return "list", out({"ok": True, "data": [{"series_id": t["series_id"], "status": t["status"]}
+        return "list", ncl_out({"ok": True, "data": [{"series_id": t["series_id"], "status": t["status"]}
                                                  for t in db["tasks"]]})
     # The phase-dispatch owner route (the controller's _dispatch_owner_intent
     # and owner_status). Admission is keyed on context + event, as the host's
@@ -264,17 +280,17 @@ def ncl(argv):
         rows["rows"][rid] = {"context": ctx, "event": event,
                              "session": "sess-" + hashlib.sha256(ctx.encode()).hexdigest()[:10]}
         save("dispatch.json", rows)
-        return "dispatched", out({"ok": True, "data": {"admission": admission, "row_id": rid,
+        return "dispatched", ncl_out({"ok": True, "data": {"admission": admission, "row_id": rid,
                                                        "session_id": rows["rows"][rid]["session"]}})
     if argv[:2] == ["tasks", "get"]:
         row = load("dispatch.json", {"rows": {}})["rows"].get(opt(argv, "--id"))
         if row is None:
-            return "unknown-row", out({"ok": False, "error": {"message": "no such row"}}, 1)
+            return "unknown-row", ncl_out({"ok": False, "error": {"message": "no such row"}}, 1)
         state = load("settle.json", {}).get(row["context"].rsplit("/", 1)[-1], "busy")
-        return "get", out({"ok": True, "data": {"status": "completed" if state == "settled" else "running",
+        return "get", ncl_out({"ok": True, "data": {"status": "completed" if state == "settled" else "running",
                                                 "settlement": {"state": state, "outcome": "success",
                                                                "executionSettled": state == "settled"}}})
-    return "unknown", out({"ok": False, "error": {"message": "fake ncl: unsupported"}}, 2)
+    return "unknown", ncl_out({"ok": False, "error": {"message": "fake ncl: unsupported"}}, 2)
 
 
 # -- gate -----------------------------------------------------------------------

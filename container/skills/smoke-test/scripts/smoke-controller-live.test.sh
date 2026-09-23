@@ -783,7 +783,7 @@ fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6 SMOKE_CONTROLLER_SEND_TO=campaign-ro
 # file defined 17, so eleven names -- SMOKE_GATE_LEASE_DIR among them -- were
 # dropped silently. The deployed gate WRAPPER sources that file itself, so the
 # gate's own lease dir stayed right; but the evidence barrier is spawned by the
-# controller with this process's environment (smoke-campaign-controller.py:1419
+# controller with this process's environment (smoke-campaign-controller.py:1454
 # -> run_read_only -> spawn :653-665, env=None) and fell back to
 # ${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases
 # (smoke-evidence-barrier.sh:739). No pin for the campaign lives there, so the
@@ -955,7 +955,8 @@ if replay:
 else:
     state[key] = prompt
 p.write_text(json.dumps(state))
-print(json.dumps({'ok':True,'data':{'admission':'replay' if replay else 'inserted','row_id':'fake-event','status':'pending'}}))
+# Exactly what the real `ncl --json` prints (ncl.ts:286): the frame, pretty-printed.
+sys.stdout.write(json.dumps({'id':'cli-fake','ok':True,'data':{'admission':'replay' if replay else 'inserted','row_id':'fake-event','status':'pending'}}, indent=2) + '\n')
 SH
 chmod +x "$C/bin/ncl"
 fire "PATH=$C/bin:$PATH" "SMOKE_CONTROLLER_OWNER_DISPATCH_CUTOVER_JSON=$C/owner-cutover.json"
