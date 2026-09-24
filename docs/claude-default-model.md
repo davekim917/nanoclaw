@@ -1,10 +1,10 @@
 # Migration: the Claude default model
 
-## Current: Opus and Fable default effort `high` (2026-09-24)
+## Current: Opus default effort `high` (2026-09-24)
 
 This section is the current migration. The model does not move: `DEFAULT_OPUS_MODEL` stays `claude-opus-5-5[1m]` (see **History: 2026-09-22** below). Only the family default effort moves.
 
-**What moves.** `defaultEffortForModel` (`container/agent-runner/src/providers/claude.ts`) returns `high`, not `medium`, for every `claude-opus-*` id, the bare `opus` alias, a turn with no model, and every `claude-fable-*` id. Sonnet stays `xhigh`, and Haiku stays at no effort. A path moves only when **no layer sets an effort**, because the family default is the last step of the runner's chain: `input.effort ?? stickyConfig.effort ?? NANOCLAW_EFFORT_OVERRIDE ?? defaultEffortForModel(model)` (the "Effort precedence" block in the same file). Every explicit pin keeps its value.
+**What moves.** `defaultEffortForModel` (`container/agent-runner/src/providers/claude.ts`) returns `high`, not `medium`, for every `claude-opus-*` id, the bare `opus` alias, and a turn with no model. Fable stays `medium`, Sonnet stays `xhigh`, and Haiku stays at no effort. A path moves only when **no layer sets an effort**, because the family default is the last step of the runner's chain: `input.effort ?? stickyConfig.effort ?? NANOCLAW_EFFORT_OVERRIDE ?? defaultEffortForModel(model)` (the "Effort precedence" block in the same file). Every explicit pin keeps its value.
 
 **Detect.** These layers pin an effort. A Claude path with none of them set moves to `high`:
 - a session sticky `sticky_effort` (chat `-e`). A pure task fire ignores it (`effectiveTurnSettings`, `container/agent-runner/src/poll-loop.ts`);
@@ -59,7 +59,7 @@ pnpm exec tsx scripts/q.ts data/v2.db "select effort, count(*), round(avg(cost_u
 
 It worked if turns per human-touched thread fall back toward 5.0, with human turns per thread flat, and cost per turn stays well under the Opus 5 / `high` baseline. If turns per thread don't fall, `high` isn't buying less rework: roll back, or look at the model switch instead. The medium-era baseline covers only about two days, so treat it as a direction, not a precise number.
 
-**Rollback.** Change `defaultEffortForModel` back to `medium` for opus, no-model and fable, then redeploy (host restart). No pin was written, so there is nothing to unpin.
+**Rollback.** Change `defaultEffortForModel` back to `medium` for opus and no-model, then redeploy (host restart). No pin was written, so there is nothing to unpin.
 
 ## History: 2026-09-22 — Opus 5.5 at `medium`
 
