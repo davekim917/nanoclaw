@@ -40,7 +40,21 @@ ncl tasks update --id <series> --group <group-id> --effort medium
 pnpm exec tsx scripts/q.ts data/v2.db "select model, effort, count(*), round(avg(cost_usd),3) from turn_usage where provider='claude' and ts > '<restart time>' group by 1,2"
 ```
 
-Track average cost per turn and the rework rate against the numbers in **Why**.
+**Success check (one week after the restart).** The rework signal was never measured directly, so judge this change on two numbers from `turn_usage`, for the coordinator group whose rework prompted the change (main-model rows only; baselines below are from the install that made this decision). Compare a 7-day window after the restart against the baselines below:
+
+| Metric | Opus 5 / `high` (2026-09-15 → 09-22) | Opus 5.5 / `medium` (09-22 → 09-24) |
+|---|---|---|
+| Turns per thread that has a human turn (the rework proxy: extra agent-initiated turns per human ask) | 4.97 (79 threads; 4.72 human) | 5.66 (44 threads; 4.68 human) |
+| Average cost per turn | $5.04 (623 turns) | $2.13 (255 turns) |
+
+```bash
+# rework proxy: turns per human-touched thread, and how many of them were human
+pnpm exec tsx scripts/q.ts data/v2.db "with s as (select session_id, sum(trigger='human') h, count(*) n from turn_usage where agent_group_id='<group-id>' and model='claude-opus-5-5[1m]' and ts > '<restart>' group by 1 having h>0) select count(*), round(avg(n),2), round(avg(h),2) from s"
+# cost per turn
+pnpm exec tsx scripts/q.ts data/v2.db "select effort, count(*), round(avg(cost_usd),3) from turn_usage where agent_group_id='<group-id>' and model='claude-opus-5-5[1m]' and ts > '<restart>' group by 1"
+```
+
+It worked if turns per human-touched thread fall back toward 5.0, with human turns per thread flat, and cost per turn stays well under the Opus 5 / `high` baseline. If turns per thread don't fall, `high` isn't buying less rework: roll back, or look at the model switch instead. The medium-era baseline covers only about two days, so treat it as a direction, not a precise number.
 
 **Rollback.** Change `defaultEffortForModel` back to `medium` for opus, no-model and fable, then redeploy (host restart). No pin was written, so there is nothing to unpin.
 
