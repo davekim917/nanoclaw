@@ -192,4 +192,61 @@ describe('keyed task admission and settlement', () => {
     inbound.prepare("UPDATE messages_in SET kind='chat' WHERE id='poll'").run();
     expect(read().state).toBe('busy');
   });
+  it('future-inputs mode counts not-yet-due waits instead of blocking; everything else still blocks', () => {
+    const { rowId, seriesId } = dispatchTaskEvent(inbound, input);
+    complete(rowId);
+    const insert = inbound.prepare(
+      "INSERT INTO messages_in(id,seq,kind,timestamp,content,status,process_after) VALUES(?,?,?,?,'{}','pending',?)",
+    );
+    // A keyed deadline wake the observation turn armed for a different work item, plus its recall row.
+    insert.run('wake', 4, 'chat', new Date().toISOString(), '2099-01-01T00:00:00.000Z');
+    insert.run('recall-wake', 6, 'system', new Date().toISOString(), '2099-01-01T00:00:00.000Z');
+    const strict = () => readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId));
+    const read = () => readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId), false, true);
+    expect(strict()).toMatchObject({ state: 'busy', reason: 'execution-or-input-outstanding' });
+    expect(strict()).not.toHaveProperty('futureInputs');
+    expect(read()).toMatchObject({ state: 'settled', executionSettled: true, futureInputs: 2 });
+    // Due, undated, paused and processing inputs are current work, not future follow-ups.
+    for (const [status, processAfter] of [
+      ['pending', '2000-01-01T00:00:00.000Z'],
+      ['pending', null],
+      ['paused', '2099-01-01T00:00:00.000Z'],
+      ['processing', '2099-01-01T00:00:00.000Z'],
+    ] as const) {
+      inbound.prepare("UPDATE messages_in SET status=?, process_after=? WHERE id='wake'").run(status, processAfter);
+      expect(read().state, `${status} ${processAfter}`).toBe('busy');
+    }
+    inbound
+      .prepare("UPDATE messages_in SET status='pending', process_after='2099-01-01T00:00:00.000Z' WHERE id='wake'")
+      .run();
+    outbound.prepare('UPDATE container_state SET provider_executing=1').run();
+    expect(read().state).toBe('busy');
+    outbound.prepare('UPDATE container_state SET provider_executing=0').run();
+    outbound.prepare("INSERT INTO session_state VALUES('work_continuation','invalid',?)").run(new Date().toISOString());
+    expect(read().state).toBe('busy');
+    outbound.prepare("DELETE FROM session_state WHERE key='work_continuation'").run();
+    outbound
+      .prepare("UPDATE messages_out SET content=? WHERE id='outcome'")
+      .run(JSON.stringify({ auto: true, taskMessageIds: [rowId], isError: true }));
+    expect(read().state).toBe('unknown'); // setting future inputs aside never turns a failed outcome into success
+  });
+  it('legacy observer plus future-inputs settles the cutover shape: own inert poll and a later deadline wake', () => {
+    const { rowId, seriesId } = dispatchTaskEvent(inbound, input);
+    complete(rowId);
+    inbound.prepare("UPDATE messages_in SET recurrence='15,45 * * * *' WHERE id=?").run(rowId);
+    inbound
+      .prepare(
+        "INSERT INTO messages_in(id,seq,kind,timestamp,content,status,process_after,recurrence,series_id,trigger) VALUES('poll',4,'task',?,'{}','pending','2099-01-01T00:00:00.000Z','15,45 * * * *',?,0)",
+      )
+      .run(new Date().toISOString(), seriesId);
+    inbound
+      .prepare(
+        "INSERT INTO messages_in(id,seq,kind,timestamp,content,status,process_after) VALUES('wake',6,'chat',?,'{}','pending','2099-01-01T00:00:00.000Z')",
+      )
+      .run(new Date().toISOString());
+    const at = (observer: boolean, future: boolean) =>
+      readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId), observer, future);
+    expect(at(true, false)).toMatchObject({ state: 'busy', executionSettled: false });
+    expect(at(true, true)).toMatchObject({ state: 'settled', executionSettled: true, futureInputs: 2 });
+  });
 });

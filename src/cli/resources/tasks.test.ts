@@ -208,6 +208,17 @@ describe('tasks CLI resource', () => {
     );
     expect(status.ok).toBe(true);
     if (status.ok) expect(status.data).toMatchObject({ settlement: { state: 'unknown' } });
+    // The flag alone requests settlement and reports what it set aside: the future wake and its recall row.
+    const future = await dispatch(
+      {
+        id: 'future-settlement',
+        command: 'tasks-get',
+        args: { id: rows[0]!.row_id, group: 'ag-1', future_inputs_settled: true },
+      },
+      { caller: 'host' },
+    );
+    expect(future.ok).toBe(true);
+    if (future.ok) expect(future.data).toMatchObject({ settlement: { futureInputs: 2 } });
   });
 
   it('rejects cross-group dispatch routing and changed keyed payloads', async () => {
