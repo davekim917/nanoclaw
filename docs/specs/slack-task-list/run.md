@@ -42,3 +42,11 @@
   stops are tracked by container name so idle reaps keep their exclusion. A rate-limited FIRST post that an answer
   overtakes is retired (recorded delivered-unsent) instead of posting later below the answer. The round cap (3) is
   reached, so a final review of this head needs the operator's call.
+- **Substitute closing review** (Codex at its round cap; fresh-context claude-opus-5-5 subagent at high effort, head
+  b28d9611, same route as #1119): changes, with 1 P2 and 9 P3s. P2 fixed: a task list never becomes, or threads
+  under, the turn's channel-root anchor, so an answer no longer threads under the progress list in channel-level
+  sessions (Discord channels, shared-mode Slack). There the list also follows the answered message's thread, and
+  kill settlement accepts it. P3 fixed: a first post that failed for any reason is retired once an answer
+  overtakes it. P3s recorded, not fixed: idle-reap keeps ✱ (by design), reminder into fresh contexts, recovery
+  re-inject not wired, boot `stopUnadoptable` and adopted-container crash, `new_list` over an undelivered post,
+  adopted old-runner containers lose 💭 until respawn, Discord 1 h edit cap, `quietStatus` thread-bound fires.

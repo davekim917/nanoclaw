@@ -1176,8 +1176,12 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
         // retries, it can overwrite newer progress or appear after the final
         // answer. The next poll resumes from this oldest undelivered row.
         // Except a task-list row: progress must never hold an answer back,
-        // and a newer edit of the list supersedes this one (above).
-        if (msg.kind === 'task_list') continue;
+        // and a newer edit of the list supersedes this one (above). A first
+        // post an answer overtakes is retired, not posted below the answer.
+        if (msg.kind === 'task_list') {
+          noteHeldTaskListPost(heldListPosts, msg);
+          continue;
+        }
         break;
       }
     }
@@ -1954,8 +1958,14 @@ async function deliverMessage(
   // already target a thread (thread_id null) and the turn has an inbound
   // anchor (in_reply_to set). The first message of the turn posts at root
   // and is recorded below; later messages of the same turn reply under it.
+  // A task list is progress, not the turn's reply: it never becomes the root
+  // the answer threads under, and never threads under an earlier message.
   const turnAnchorEligible =
-    !isRoutineOutcome && !taskAnchorEligible && baseThreadId === null && msg.in_reply_to != null;
+    !isRoutineOutcome &&
+    !taskAnchorEligible &&
+    baseThreadId === null &&
+    msg.in_reply_to != null &&
+    msg.kind !== 'task_list';
 
   let effectiveThreadId = baseThreadId;
   let usedAnchor = false;

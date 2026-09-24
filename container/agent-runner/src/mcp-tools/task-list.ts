@@ -94,8 +94,19 @@ export const updateTaskList: McpToolDefinition = {
     if (!session.channel_type || !session.platform_id || session.channel_type === 'agent') {
       return err('this session has no conversation to show a task list in');
     }
-    const routing = { channelType: session.channel_type, platformId: session.platform_id, threadId: session.thread_id };
     const ops = getAgentMailbox().operations;
+    // A channel-level session (Discord channel, shared-mode Slack) has no
+    // thread of its own and answers in the thread of the message it is
+    // replying to; the list goes there too, so it sits above its answer.
+    let threadId = session.thread_id;
+    if (threadId === null) {
+      const inReplyTo = getCurrentInReplyTo();
+      const inbound = inReplyTo ? ops.getInboundRouteById(inReplyTo) : null;
+      if (inbound && inbound.channelType === session.channel_type && inbound.platformId === session.platform_id) {
+        threadId = inbound.threadId;
+      }
+    }
+    const routing = { channelType: session.channel_type, platformId: session.platform_id, threadId };
     const deps: TaskListDeps = {
       load: () => parseTaskListState(ops.getState(TASK_LIST_STATE_KEY)?.value),
       save: (state) => ops.setState(TASK_LIST_STATE_KEY, JSON.stringify(state)),

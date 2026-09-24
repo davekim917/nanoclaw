@@ -155,7 +155,7 @@ something the plan did not know.
   without a platform id as a failed post, so after the switch comes back on its next update posts afresh.
 - **Compaction: next prompt only, never mid-turn.** Upstream reverted a mid-turn post-compaction reminder
   (`a760da7fe`: it made the agent send an unintended message), and no provider emits `compacted` today. The list
-  comes back as a prompt prefix after a context reset that keeps the work going (rotation, recovery); `/clear`
+  comes back as a prompt prefix after a context reset that keeps the work going (rotation); `/clear`
   marks it stale instead. A compaction inside one long turn relies on the model's own summary. Known limit.
 - **One list mechanism per provider**: OpenCode's `todowrite` is denied while the switch is on. Codex's native
   `update_plan` has no config switch in 0.156 (checked the binary's feature keys), so a Codex agent has both;
@@ -199,4 +199,9 @@ something the plan did not know.
   not covered (no close handler on this host).
 - **Rate-limited first post**: if an answer overtakes it, the post is retired rather than shown below the answer;
   the next update posts afresh.
+- **Channel-level sessions** (Discord channels, shared-mode Slack): the list is never the turn's thread anchor (the
+  answer stays the root) and goes in the thread of the message being answered.
+- **Known limits (closing review P3s)**: an idle reap leaves an unfinished list as is; the recovery path does not
+  re-inject the list; containers adopted at deploy run the old runner (no list, 💭 hidden) until they respawn;
+  Discord's 1 h edit cap is not handled for lists; `new_list` over an undelivered post can leave two lists.
 - **Sibling rooms**: Slack inbound drops a bot post carrying the list footer, so a list never wakes another bot.

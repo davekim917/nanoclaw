@@ -61,6 +61,10 @@ export interface MailboxOperations {
   countConversationMessagesAfter(outboundSeq: number, inboundSeq: number): number;
   /** Highest inbound sequence number so far (0 when empty). */
   maxInboundSeq(): number;
+  /** Where one inbound message came from. */
+  getInboundRouteById(
+    id: string,
+  ): { channelType: string | null; platformId: string | null; threadId: string | null } | null;
   getUndeliveredMessages(): OutboundMessage[];
   getState(key: string): StateValue | undefined;
   setState(key: string, value: string): void;

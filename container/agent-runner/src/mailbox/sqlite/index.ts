@@ -176,6 +176,13 @@ export class SqliteAgentMailbox implements AgentMailbox {
     return inbound.n + outbound.n;
   }
 
+  getInboundRouteById(id: string) {
+    const row = getInboundDb()
+      .prepare('SELECT channel_type, platform_id, thread_id FROM messages_in WHERE id = ?')
+      .get(id) as { channel_type: string | null; platform_id: string | null; thread_id: string | null } | undefined;
+    return row ? { channelType: row.channel_type, platformId: row.platform_id, threadId: row.thread_id } : null;
+  }
+
   maxInboundSeq(): number {
     return (getInboundDb().prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_in').get() as { m: number }).m;
   }

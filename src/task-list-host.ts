@@ -107,7 +107,9 @@ export async function settleTaskListOnKill(sessionId: string, reason: string): P
         if (
           edit.channelType !== origin.channel_type ||
           edit.platformId !== origin.platform_id ||
-          edit.threadId !== session.thread_id
+          // A channel-level session (no thread of its own) holds its lists in
+          // the threads of the messages it answered, all in its own channel.
+          (session.thread_id !== null && edit.threadId !== session.thread_id)
         ) {
           log.warn('Task list is not in this session’s own conversation — not marking it interrupted', {
             sessionId,

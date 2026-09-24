@@ -597,6 +597,63 @@ describe('task list delivery (switch on)', () => {
     expect(sent).toEqual(['chat:Done: A.']);
   });
 
+  it('never makes the list the root the answer threads under (channel-level session)', async () => {
+    await seed();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    expect(session.thread_id).toBeNull();
+    const calls = captureAdapter();
+    const base = Date.now();
+    const db = outbound(session.id);
+    const add = db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, in_reply_to, content)
+       VALUES (?, ?, ?, ?, 'slack', NULL, 'in-1', ?)`,
+    );
+    add.run('list-1', new Date(base).toISOString(), 'task_list', PLATFORM, JSON.stringify({ text: 'T\n✱ A' }));
+    add.run('answer', new Date(base + 1).toISOString(), 'chat', PLATFORM, JSON.stringify({ text: 'Here it is' }));
+    add.run('follow-up', new Date(base + 2).toISOString(), 'chat', PLATFORM, JSON.stringify({ text: 'One more' }));
+    db.close();
+    await deliverSessionMessages(session);
+    // The answer is the turn's root; the follow-up threads under the ANSWER, not the list.
+    expect(calls.map((c) => [c.kind, c.threadId])).toEqual([
+      ['task_list', null],
+      ['chat', null],
+      ['chat', `${PLATFORM}:plat-2`],
+    ]);
+  });
+
+  it('retires a first post that failed for any reason once its answer overtakes it', async () => {
+    const sessionId = await seed();
+    const sent: string[] = [];
+    let fail = true;
+    setDeliveryAdapter({
+      async deliver(_c, _p, _t, kind, content) {
+        if (kind === 'task_list' && fail) {
+          fail = false;
+          throw new Error('slack internal_error');
+        }
+        sent.push(`${kind}:${(JSON.parse(content) as { text: string }).text}`);
+        return `plat-${sent.length}`;
+      },
+    });
+    const base = Date.now();
+    insertRow(sessionId, 'first-post', 'task_list', { text: 'T\n✱ A' }, { timestamp: new Date(base).toISOString() });
+    insertRow(sessionId, 'answer', 'chat', { text: 'Done: A.' }, { timestamp: new Date(base + 1).toISOString() });
+    const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    expect(sent).toEqual(['chat:Done: A.']);
+  });
+
+  it('marks interrupted a list a channel-level session posted in the thread it answered', async () => {
+    await seed();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    seedDeliveredList(session.id);
+    const calls = captureAdapter();
+    await settleTaskListOnKill(session.id, 'absolute-ceiling');
+    expect(calls).toHaveLength(1);
+    expect(calls[0].threadId).toBe(THREAD);
+  });
+
   it('sends only the newest of several queued edits to one list', async () => {
     const sessionId = await seed();
     const calls = captureAdapter();
