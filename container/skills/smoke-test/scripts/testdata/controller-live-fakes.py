@@ -38,7 +38,10 @@ The fakes mirror the real contracts the controller depends on:
            variable the real gate reads, :1304), and no non-empty
            challenger/disposition.md under it.
   gh       comments/issues carry whatever body was written; `api ... --jq .[]`
-           lists them one JSON object per line.
+           lists them one JSON object per line. With a `labels` list in
+           gh.json, `label list` returns it and `issue create` refuses a label
+           outside it, as GitHub does; without one, `label list` fails and
+           create takes any label (the behaviour before labels were checked).
   ncl      `tasks create` returns {ok, data:{series_id}}; `tasks list` lists them.
 """
 import fcntl
@@ -211,11 +214,21 @@ def gh(argv):
         print(json.dumps([{"number": i["number"], "title": i["title"], "url": i["html_url"]}
                           for i in db["issues"] if i["state"] == "open"]))
         return "list", 0
+    if argv[:2] == ["label", "list"]:
+        if fault("gh:label-list") == "fail-before":
+            return "fail", out_err("HTTP 502")
+        if "labels" not in db:
+            return "unknown", out_err("fake gh: no labels configured")
+        print(json.dumps([{"name": n} for n in db["labels"]]))
+        return "labels", 0
     if argv[:2] == ["issue", "create"]:
         body = open(opt(argv, "--body-file")).read()
         f = fault("gh:issue-create")
         if f == "fail-before":
             return "fail", out_err("HTTP 502")
+        missing = [x for x in opts(argv, "--label") if "labels" in db and x not in db["labels"]]
+        if missing:
+            return "refused", out_err("could not add label: '{}' not found".format(missing[0]))
         n = len(db["issues"]) + 100
         db["issues"].append({"number": n, "title": opt(argv, "--title"), "body": body, "state": "open",
                              "labels": opts(argv, "--label"), "html_url": "https://github.test/issues/{}".format(n)})

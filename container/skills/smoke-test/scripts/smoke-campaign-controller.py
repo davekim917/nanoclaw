@@ -886,7 +886,8 @@ OWNER_BRIEF = {
         "(the run record the controller posts as the PR comment: lane detail, design check, recovery history). Write "
         "{run}/controller/verdict-bullets.md: at most three plain-language bullets for the verdict post (what "
         "blocks or was proven; what was not challenged or not demonstrable; the next owner). For each confirmed "
-        "finding write {run}/controller/issues/<findingId>.json: {{\"title\":...,\"body\":...,\"labels\":[...]}}. "
+        "finding write {run}/controller/issues/<findingId>.json: {{\"title\":...,\"body\":...,\"labels\":[...]}}; "
+        "labels are the repo's own names, severity as `severity:p<n>` (never a bare `P<n>`). "
         "The controller files them, posts the verdict, comments on the PR and runs `finish`. To ask for a fresh "
         "adjudicator instead, write {run}/controller/adjudication-request.md (the disputed findings and their "
         "evidence), no synthesis.json, and stop: you are woken again as `adjudicated`."),
@@ -921,6 +922,7 @@ class EffectLayer:
         self.cfg = dict(cfg or {})
         self.performed = []
         self.ctl = None
+        self._repo_labels = {}  # repo -> label names, read once per fire
         if mode == "live":
             missing = [k for k in self.LIVE_REQUIRED if not self.cfg.get(k)]
             if missing:
@@ -1150,11 +1152,12 @@ class EffectLayer:
                 return {"outcome": "done", "via": "search", "state": state}
             if state is None:
                 return {"outcome": "unknown", "error": "gh pr view failed"}
-            self._run(self.gh + ["pr", "close", str(pr), "-R", repo], 30)
+            wrote = self._run(self.gh + ["pr", "close", str(pr), "-R", repo], 30)
             state = self._pr_state(pr)
             if state in ("CLOSED", "MERGED"):
                 return {"outcome": "done", "via": "write", "state": state}
-            return {"outcome": "unknown", "error": "pr still {} after close".format(state)}
+            return {"outcome": "unknown",
+                    "error": gh_write_error(wrote, "pr close") or "pr still {} after close".format(state)}
         if slot == "pr-comment":
             api = "repos/{}/issues/{}/comments?since={}&per_page=100".format(repo, pr, since)
             found, err = self._find_marker(api, marker)
@@ -1165,11 +1168,12 @@ class EffectLayer:
             body = self._run_record(run_id, c, effect.get("hint") or {})
             path, _ = write_contained_once(root, self._payload_dir(run_id) + [key[:16] + "-pr-comment.md"],
                                            "{}\n{}\n".format(marker, body))
-            self._run(self.gh + ["pr", "comment", str(pr), "-R", repo, "--body-file", path], 30)
+            wrote = self._run(self.gh + ["pr", "comment", str(pr), "-R", repo, "--body-file", path], 30)
             found, err = self._find_marker(api, marker)
             if found:
                 return {"outcome": "done", "via": "write", "url": found}
-            return {"outcome": "unknown", "error": err or "comment not found on read-back"}
+            return {"outcome": "unknown",
+                    "error": gh_write_error(wrote, "pr comment") or err or "comment not found on read-back"}
         if slot.startswith("issue:"):
             fid = slot[len("issue:"):]
             api = "repos/{}/issues?state=all&since={}&per_page=100".format(repo, since)
@@ -1192,16 +1196,22 @@ class EffectLayer:
             for issue in open_issues if isinstance(open_issues, list) else []:
                 if isinstance(issue, dict) and normalize_title(issue.get("title")) == norm:
                     return {"outcome": "done", "via": "dedup", "url": issue.get("url"), "duplicateOf": issue.get("number")}
+            labels, mapped, dropped = resolve_labels(labels, self._labels_of(repo))
+            if dropped:
+                body += "\n\nLabels not on {} and dropped: {}.".format(repo, ", ".join("`{}`".format(x) for x in dropped))
             path, _ = write_contained_once(root, self._payload_dir(run_id) + [key[:16] + "-issue.md"],
                                            "{}\n{}\n".format(body, marker))
             argv = self.gh + ["issue", "create", "-R", repo, "--title", title, "--body-file", path]
             for label in labels:
                 argv += ["--label", label]
-            self._run(argv, 30)
+            wrote = self._run(argv, 30)
             found, err = self._find_marker(api, marker)
+            relabel = {k: v for k, v in (("labelsMapped", mapped), ("labelsDropped", dropped)) if v}
             if found:
-                return {"outcome": "done", "via": "write", "url": found}
-            return {"outcome": "unknown", "error": err or "issue not found on read-back"}
+                return dict({"outcome": "done", "via": "write", "url": found}, **relabel)
+            return dict({"outcome": "unknown",
+                         "error": gh_write_error(wrote, "issue create") or err or "issue not found on read-back"},
+                        **relabel)
         return {"outcome": "failed", "error": "no GitHub handler for slot {!r}".format(slot)}
 
     def _run_record(self, run_id, claim, hint):
@@ -1227,6 +1237,21 @@ class EffectLayer:
                     lines.append("- Finding {}: {}".format(f.get("id"), f.get("disposition") or "no disposition"))
         lines += ["", "The owner wrote no prose record; lane evidence is in the run directory."]
         return "\n".join(lines)
+
+    def _labels_of(self, repo):
+        """The repo's label names, listed once per fire; None if the listing
+        failed (resolve_labels then sends the owner's labels unchanged)."""
+        if repo not in self._repo_labels:
+            rc, out, _ = self._run(self.gh + ["label", "list", "-R", repo, "--limit", "1000", "--json", "name"], 20)
+            names = None
+            if rc == 0:
+                try:
+                    doc = json.loads(out or "[]")
+                    names = [d["name"] for d in doc if isinstance(d, dict) and isinstance(d.get("name"), str)]
+                except (ValueError, TypeError):
+                    names = None
+            self._repo_labels[repo] = names
+        return self._repo_labels[repo]
 
     def _find_marker(self, api, marker):
         objs, err = self._gh_json_lines(api)
@@ -1358,14 +1383,14 @@ class EffectLayer:
         # AN ACK NEVER OUTLIVES THE BRIEF IT ACKNOWLEDGED. The ack is the
         # owner's first act on a wake and the controller only tests it for
         # existence, re-offering a wake solely while it is ABSENT (owner_step,
-        # :2565-2575); the renewer reads it the same way
+        # :2638-2648); the renewer reads it the same way
         # (smoke-controller-renew.sh, "brief-<step>.ack absent: no owner turn
         # holds this step"). So a brief rewritten under a NEW owner token would
         # otherwise inherit the previous brief's ack and be treated as taken,
         # and never re-offered -- the second half of XZO #2046. Removing it here
         # makes that impossible by construction rather than by sequencing: this
         # function runs only when the obligation is absent or `intent`
-        # (owner_step, :2495), never while a live brief is enqueued, so any ack
+        # (owner_step, :2568), never while a live brief is enqueued, so any ack
         # it finds belongs to a brief this write supersedes.
         try:
             dfd = _open_dir_contained(root, [run_id, "controller"], True)
@@ -1573,6 +1598,52 @@ def safe_component(name):
 
 def normalize_title(title):
     return " ".join(re.sub(r"[^a-z0-9]+", " ", str(title or "").lower()).split())
+
+
+def gh_write_error(result, what):
+    """The refusal text of a gh write, or None when it exited 0. A write's
+    outcome is settled by the marker read-back, never by its exit code (a
+    timed-out write may still have landed) -- but when the read-back finds
+    nothing, gh's own stderr is the only line that says why (`could not add
+    label: 'P3' not found`), so it is what the decision and alarm carry."""
+    rc, _, err = result
+    if rc == 0:
+        return None
+    text = " ".join(str(err or "").split())
+    return "{} {}: {}".format(what, "timed out" if rc is None else "rc={}".format(rc), text or "no stderr")[:300]
+
+
+def resolve_labels(wanted, repo_labels):
+    """(kept, mapped, dropped) for an issue's labels against the repo's own.
+
+    `gh issue create --label X` is refused outright when the repo has no X,
+    and a refused create is an issue obligation that never settles -- the
+    run cannot finish (XZO #2126: an owner wrote `P3`, the repo's convention
+    is `severity:p3`). So a label the repo lacks is dropped, never sent; a
+    bare severity shorthand `P<n>` maps to the repo's `severity:p<n>` when
+    that label exists. Matching is case-insensitive and sends the repo's own
+    spelling. `smoke-finding` is the controller's label (dedup keys on it)
+    and is always kept. repo_labels None = the listing failed: send the
+    labels unchanged, and a refusal surfaces through the create's stderr."""
+    if repo_labels is None:
+        return list(wanted), [], []
+    canon = {name.lower(): name for name in repo_labels}
+    kept, mapped, dropped = [], [], []
+    for label in wanted:
+        if label == "smoke-finding":
+            name = label
+        else:
+            name = canon.get(label.lower())
+            m = re.match(r"^[Pp]([0-9])$", label)
+            if name is None and m:
+                name = canon.get("severity:p" + m.group(1))
+                if name is not None:
+                    mapped.append("{}->{}".format(label, name))
+        if name is None:
+            dropped.append(label)
+        elif name not in kept:
+            kept.append(name)
+    return kept, mapped, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -2254,14 +2325,16 @@ class Controller:
                                        "marker": "<!-- smoke-ctl:{} -->".format(key),
                                        "writeOnlyIfMarkerAbsent": reconcile})
         self.decide(run_id, phase, "gh", "mechanical", "obligation due", slot=slot, key=key, effect=result["outcome"],
-                    afterReconcile=reconcile)
+                    afterReconcile=reconcile, **{k: result[k] for k in ("error", "labelsMapped", "labelsDropped")
+                                                 if result.get(k)})
         crash_point("after-effect", "gh", slot)
         if result["outcome"] == "shadow_refused":
             self.record(run_id, "gh", slot, "done", 1, {"outcome": result["outcome"], "shadowAssumed": True})
             return "done"
         if result["outcome"] == "done":
             self.record(run_id, "gh", slot, "done", 1, {k: result[k] for k in ("outcome", "via", "url", "state",
-                                                                                "duplicateOf") if k in result})
+                                                                                "duplicateOf", "labelsMapped",
+                                                                                "labelsDropped") if k in result})
             return "done"
         if result["outcome"] == "unknown":
             # Stays a bare intent: the next fire reconciles by marker search.
@@ -2706,7 +2779,7 @@ class Controller:
         then the owner writes evidence the barrier rejects. The next fire
         publishes the new refusal and returns `ownerWake: null`, because
         owner_step re-offers a wake only while the `.ack` is ABSENT
-        (:2565-2575). The diagnosis is on disk and nobody is told to read it --
+        (:2638-2648). The diagnosis is on disk and nobody is told to read it --
         the same dead end, reached the way run pr2055 actually reached it.
 
         THE TRIGGER IS A CHANGE IN THE REFUSAL, NOT "INVALID". Narrower than
@@ -2721,7 +2794,7 @@ class Controller:
         fire exactly like `briefedToken`: a crash between the publish and the
         re-offer leaves the next fire owing the same re-offer. Re-offering does
         not extend the step's SLA -- owner_step measures from `history[0]`
-        (:2576) -- so a run that keeps producing invalid evidence still ends at
+        (:2649) -- so a run that keeps producing invalid evidence still ends at
         the overdue path rather than being woken forever."""
         ob = self.obligations().get(obligation_key(run_id, "owner", step))
         if not ob or ob["state"] not in ("intent", "enqueued"):
@@ -2941,8 +3014,10 @@ class Controller:
                 continue
             fp = "overdue:{}".format(ob["key"][:12])
             label = "{}:{}".format(ob["kind"], ob["slot"])
-            if self.ensure_alarm(run_id, "controller_obligation_overdue", fp,
-                                 {"obligation": label, "state": ob["state"], "since": since}):
+            detail = {"obligation": label, "state": ob["state"], "since": since}
+            if ob["detail"].get("error"):
+                detail["error"] = ob["detail"]["error"]  # why it is stuck, e.g. gh's refusal
+            if self.ensure_alarm(run_id, "controller_obligation_overdue", fp, detail):
                 self.decide(run_id, phase, "escalate", "coordination_model", "obligation overdue", obligation=label)
 
     # -- one run ------------------------------------------------------------
@@ -2980,8 +3055,8 @@ class Controller:
         An owner step records `brief_written`/`admitted`/`briefedToken`/
         `dispatchIntent` only once <run>/controller/brief-<step>.md is on disk
         (_owner_wake writes the brief before either route records anything,
-        :1385 and :1404; owner_step journals it after the effect returns,
-        :2550-2560) -- a bare `intent` is deliberately NOT proof, since a fire
+        :1410 and :1429; owner_step journals it after the effect returns,
+        :2623-2633) -- a bare `intent` is deliberately NOT proof, since a fire
         can die before the brief lands. A `send:root` obligation is proof too:
         the root is posted only from a readable completion contract (step_run's
         ladder). Shadow owner steps (`shadow_refused`) write nothing and are
@@ -3240,8 +3315,8 @@ class Controller:
                 # THE OWNER IS WOKEN HERE, not only once the barrier passes.
                 # By this point every OTHER party's contribution the synthesis
                 # barrier checks has already been gated above: the lanes
-                # barrier is ready (:3207), coordinator/preliminary.md exists
-                # (:3224) and challenger/disposition.md exists (:3230). What
+                # barrier is ready (:3282), coordinator/preliminary.md exists
+                # (:3299) and challenger/disposition.md exists (:3305). What
                 # the synthesis barrier can still report is therefore the
                 # retained owner's -- `invalid[]` content it authored
                 # (journeys/scope-dispositions.json, or
@@ -3253,7 +3328,7 @@ class Controller:
                 # alone (smoke-controller-live.sh:168-175), so nobody was told;
                 # and _maybe_synthesis_overdue_blocked needs the very
                 # owner:synthesis obligation this branch declined to create
-                # (:3265-3267), so the terminal BLOCKED safety net could not
+                # (:3340-3342), so the terminal BLOCKED safety net could not
                 # fire either. This is the same blind spot as the lanes barrier
                 # (XZO #2047), on the sibling path.
                 timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)
@@ -3355,7 +3430,7 @@ class Controller:
            ladder ("An owner may conclude ..." below) and is never pre-empted
            by a timeout -- but only where the ladder can reach it, which needs
            a readable contract: validate_synthesis binds its sourceSha to the
-           contract's (:1865-1872), so without one it could only be BLOCKED.
+           contract's (:1936-1943), so without one it could only be BLOCKED.
         3. The challenger deadline itself."""
         vob = self.obligations().get(obligation_key(run_id, "verdict", "validated"))
         if vob and vob["state"] == "done" and vob["detail"].get("verdict") != "GO":
@@ -3515,7 +3590,7 @@ class Controller:
         refused by the real gate once it sees a disposition, and a disposition
         can land after the timeout froze its BLOCKED. gate_verb records a
         permanent refusal failed_terminal and afterwards returns it without
-        calling the gate (this file, :2275-2276), so re-selecting the verb
+        calling the gate (this file, :2348-2349), so re-selecting the verb
         wedged the run for good -- a wedge since live mode (#945), found three
         ways in PR #1066: a fake gate that never refused, a frozen verb replayed
         after a late disposition, and a controller read of the disposition

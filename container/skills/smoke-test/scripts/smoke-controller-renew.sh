@@ -64,7 +64,7 @@
 #
 # FRESHNESS. The ack is written ONCE and never again: the router creates it
 # (controller-owner-router.md:31), the controller only ever tests it for
-# existence (smoke-campaign-controller.py:2567) and re-offers the wake only
+# existence (smoke-campaign-controller.py:2640) and re-offers the wake only
 # while it is ABSENT (:2565-2575), and a step that needs more than one turn
 # continues through `continue_work` (router :43), which resumes in-session and
 # does not re-run the router's first act. Nothing in this repo refreshes or
