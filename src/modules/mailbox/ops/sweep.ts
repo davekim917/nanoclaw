@@ -228,7 +228,60 @@ export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Data
     })();
   }
 
-  return completeAnsweredPendingRows(inDb, outDb);
+  const answered = completeAnsweredPendingRows(inDb, outDb);
+  closeOrphanRecallRows(inDb);
+  return answered;
+}
+
+/**
+ * Close every pending `recall-<X>` row whose target `<X>` is already terminal:
+ * `completed`, `failed`, `expired`, or `cancelled` (an admitted task cancelled
+ * before the runner claimed it keeps its recall, `cancelTask`,
+ * src/mailbox/sqlite/tasks.ts:44-50; nothing revives a cancelled row).
+ *
+ * Admission writes the recall row beside its turn (`admitDueRow`,
+ * src/modules/mailbox/ops/admission.ts:155-175) and a normal turn claims and
+ * acks both. A turn that ends without claiming its recall leaves it pending: a
+ * script-gated or script-errored task fire, where the runner acks only the task
+ * (`completed` or `script-skip:error`,
+ * container/agent-runner/src/modules/mailbox/index.ts:279-292) and defers the
+ * unclaimed rest (container/agent-runner/src/poll-loop.ts:724-740), or a /clear
+ * completed inline. The runner already treats such a row as dead
+ * (container/agent-runner/src/modules/mailbox/selection.ts:341-357), nothing
+ * re-pairs it once its target is terminal (admission needs the target pending,
+ * `DUE_PREDICATE`, admission.ts:90-102), and `expireStalePending` above expires
+ * it 24 hours later anyway. This expires it on the same tick instead, so a
+ * watcher on a 5-minute cadence stops carrying a day of dead recall payloads
+ * through every poll's candidate windows.
+ *
+ * A row counts as a recall only by the runner's own test — `kind = 'system'`,
+ * the `recall-` id prefix AND `subtype: 'recall_context'` content
+ * (`recallTargetId`, container/agent-runner/src/modules/mailbox/selection.ts:95-103),
+ * which both writers stamp (`src/session-manager.ts:788`, the admitted recall;
+ * `src/modules/mailbox/ops/ingress.ts:134`, the deferred marker). A system row
+ * that merely shares the prefix is not ours to expire.
+ *
+ * `expired` is exactly the state `expireStalePending` would give it. The query
+ * also matches orphans left before this ran, so the first tick after deploy
+ * clears each visited session's backlog. Idempotent.
+ */
+export function closeOrphanRecallRows(inDb: Database.Database): number {
+  return inDb
+    .prepare(
+      `UPDATE messages_in
+          SET status = 'expired'
+        WHERE id >= 'recall-' AND id < 'recall.'
+          AND kind = 'system'
+          AND status = 'pending'
+          AND json_valid(content)
+          AND json_extract(content, '$.subtype') = 'recall_context'
+          AND EXISTS (
+            SELECT 1 FROM messages_in AS target
+             WHERE target.id = substr(messages_in.id, 8)
+               AND target.status IN ('completed', 'failed', 'expired', 'cancelled')
+          )`,
+    )
+    .run().changes;
 }
 
 /**
