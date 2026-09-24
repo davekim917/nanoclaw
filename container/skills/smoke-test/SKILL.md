@@ -1461,9 +1461,10 @@ choose. It is not a substitute for an agent choosing a reversible dev remedy or
 deferral.
 
 When a listed condition holds, the outer coordinator dispatches one fresh
-provider-native `qa-adjudicator`: Fable 5.1 or GPT-6 Astra, medium by default,
-independent of both owners' sessions. This is a fresh review, not a higher tier;
-there is no prerequisite parent-effort increase or model ladder. Give it the
+provider-native `qa-adjudicator` at its installed model/effort (the deployment's
+agent definition names them), independent of both owners' sessions. This is a
+fresh review, not a higher tier; there is no prerequisite parent-effort increase
+or model ladder. Give it the
 frozen run record, full finding evidence, source, tests, and both owners'
 arguments. The challenger requests this through the coordinator and never
 spawns it itself. Return the review to the retained coordinator-side owner for
