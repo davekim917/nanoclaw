@@ -493,7 +493,12 @@ export interface NanoclawMailboxSession extends MailboxSession {
   insertTaskRow(row: TaskRowInsert): void;
   dispatchTaskEvent(input: TaskDispatchInput): TaskDispatchResult;
   hasTaskDispatchEvents(): boolean;
-  readTaskSettlement(eventId: string, threadId: string | null, observer?: boolean): TaskSettlement;
+  readTaskSettlement(
+    eventId: string,
+    threadId: string | null,
+    observer?: boolean,
+    futureInputs?: boolean,
+  ): TaskSettlement;
   /** Fork resume: also drops the stale recall pair and re-seqs the occurrence. */
   resumeTask(taskId: string): number;
   /** Fork update: script/threadAnchor/quietStatus/flagIntent/chatLimit + recall invalidation. */
@@ -1245,8 +1250,15 @@ function forkOps(
     insertTaskRow: (row) => insertTaskRow(inbound, row),
     dispatchTaskEvent: (input) => dispatchTaskEvent(inbound, input, outboundPresent ? readableOutbound() : null),
     hasTaskDispatchEvents: () => hasTaskDispatchEvents(inbound),
-    readTaskSettlement: (eventId, threadId, observer) =>
-      readTaskSettlement(inbound, outboundPresent ? readableOutbound() : null, eventId, threadId, observer),
+    readTaskSettlement: (eventId, threadId, observer, futureInputs) =>
+      readTaskSettlement(
+        inbound,
+        outboundPresent ? readableOutbound() : null,
+        eventId,
+        threadId,
+        observer,
+        futureInputs,
+      ),
     resumeTask: (taskId) => resumeTask(inbound, taskId),
     updateTask: (taskId, update) => updateTask(inbound, taskId, update),
     getCompletedRecurringRows: () => getCompletedRecurring(inbound),

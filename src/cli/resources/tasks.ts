@@ -580,7 +580,8 @@ async function listTasks(args: Record<string, unknown>, ctx: CallerContext) {
 async function getTask(args: Record<string, unknown>, ctx: CallerContext) {
   const id = taskId(args);
   for (const session of await selectedSessions(args, ctx)) {
-    const settlementRequested = bool(args.settlement) || bool(args.observer_settlement);
+    const settlementRequested =
+      bool(args.settlement) || bool(args.observer_settlement) || bool(args.future_inputs_settled);
     const settlementSession = settlementRequested ? await getSession(session.id) : undefined;
     const found = await withInbound(session, (mailbox) => {
       const row = mailbox.getCliTaskRow(id);
@@ -602,6 +603,7 @@ async function getTask(args: Record<string, unknown>, ctx: CallerContext) {
                 row.row_id,
                 settlementSession?.thread_id ?? null,
                 bool(args.observer_settlement),
+                bool(args.future_inputs_settled),
               ),
             }
           : {}),
@@ -1574,6 +1576,12 @@ registerResource({
           type: 'boolean',
           description:
             'Legacy recurring observer cutover: exclude only its own future inert recurrence; all owned follow-ups still block.',
+        },
+        {
+          name: 'future_inputs_settled',
+          type: 'boolean',
+          description:
+            'Observer whose follow-ups are separate episodes: count not-yet-due pending inputs (future waits) instead of blocking on them; due, paused and processing inputs still block.',
         },
       ],
       handler: async (args, ctx) => getTask(args, ctx),
