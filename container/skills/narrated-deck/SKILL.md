@@ -57,6 +57,7 @@ there, not as failures.
   "subtitle": "optional — shown in the player header",
   "theme": "dark",
   "voice": "optional ElevenLabs voice_id",
+  "pauses": { "sentence": 0.6, "paragraph": 0.9 },
   "slides": [
     { "label": "The headline", "narration": "…", "html": "<div class=\"kicker\">…</div>…" },
     { "label": "Trend", "narration": "…", "image": "chart.png" },
@@ -70,6 +71,11 @@ there, not as failures.
   or `jsonRender` (a json-render spec — see below).
 - `label` is the slide's name in the player's chapter list. Keep it to 2–5 words.
 - `theme`: `dark` (default) or `light`.
+- `pauses` (optional): seconds of silence after each sentence and after each
+  paragraph (a blank line in the narration). Defaults `0.6` / `0.9`. The voice
+  on its own leaves ~0.25s, which sounds rushed; raise them if the user says
+  the pacing still feels hurried, `0` leaves that kind untouched. Changing
+  pauses re-uses the cached voice — it costs nothing to re-render.
 - A complete working spec: `/app/skills/narrated-deck/example-deck.json`.
   Copy it rather than starting from nothing.
 
@@ -92,6 +98,9 @@ there, not as failures.
 - **Lead with the answer.** First sentence of the deck = the headline result.
 - **Don't read the slide.** Say the *so what* the visual can't: why it moved,
   what it means, what happens next.
+- **Short sentences, one idea each.** A listener can't re-read. Break
+  anything over ~20 words; a run-on sentence gets no pause and sounds robotic.
+  Put a blank line between thoughts inside a slide for a longer beat.
 - **15–45 seconds per slide** (≈ 40–110 words). A deck should run 2–6 minutes.
 - **Spell out what a voice would mangle.** The TTS reads text literally:
 
@@ -201,7 +210,8 @@ else, `html` slides are more capable: json-render has no tables or charts.
 
 | Symptom | Cause / fix |
 |---|---|
-| `ElevenLabs TTS failed: HTTP 401` | This group isn't granted the `ElevenLabs` secret, or the key lacks text-to-speech permission. Report it to the operator; don't retry. (`GET /v1/user` returns 401 by design — the key has no `user_read`; it is not a useful credential test.) |
+| `… out of credits` | The ElevenLabs account's monthly quota is used up. Render `--silent`, deliver the visuals, and tell the operator the voice step was skipped for lack of credits. Don't retry. |
+| `ElevenLabs TTS failed: HTTP 401` (any other message) | This group isn't granted the `ElevenLabs` secret, or the key lacks text-to-speech permission. Report it to the operator; don't retry. (`GET /v1/user` returns 401 by design — the key has no `user_read`; it is not a useful credential test.) |
 | `content overflows the slide` warning | Too much on the slide. Cut rows or words; don't shrink the type. |
 | `… over the ~10 MB chat upload cap` warning | Deck too long for chat. Split it, or send the HTML only if it fits. |
 | `chromium exited …` | Usually malformed HTML in a fragment. Check the slide's `slides/NN.html`. |

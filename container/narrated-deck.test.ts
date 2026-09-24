@@ -18,8 +18,10 @@ import {
   buildPlayerHtml,
   concatList,
   parseArgs,
+  planPauses,
   slideLabel,
   slugify,
+  spliceSilence,
   timeline,
   ttsCacheKey,
   validateDeck,
@@ -49,6 +51,14 @@ describe('validateDeck', () => {
     expect(none.errors[0]).toMatch(/exactly one of html \| image \| jsonRender \(got none\)/);
     const two = validateDeck({ title: 't', slides: [slide({ image: 'a.png' })] });
     expect(two.errors[0]).toMatch(/got html, image/);
+  });
+
+  it('validates pause targets', () => {
+    const deck = (pauses: unknown) => ({ title: 't', slides: [slide()], pauses });
+    expect(validateDeck(deck({ sentence: 0.8 })).errors).toEqual([]);
+    expect(validateDeck(deck({ sentence: 5 })).errors[0]).toMatch(/pauses.sentence/);
+    expect(validateDeck(deck({ comma: 0.2 })).errors[0]).toMatch(/unknown key/);
+    expect(validateDeck(deck([1])).errors[0]).toMatch(/pauses: must be an object/);
   });
 
   it('warns, without failing, on a slide narration long enough to lose the listener', () => {
@@ -127,6 +137,79 @@ describe('buildPlayerHtml', () => {
     expect(match).not.toBeNull();
     expect(JSON.parse(match![1])).toEqual(data);
     expect(html).toContain('<title>Q3 &lt;review&gt;</title>');
+  });
+});
+
+/** Fake ElevenLabs alignment: every character 0.05 s long, with `gaps` (index → extra seconds before that char). */
+function align(text: string, gaps: Record<number, number> = {}) {
+  const characters = [...text];
+  const character_start_times_seconds: number[] = [];
+  const character_end_times_seconds: number[] = [];
+  let t = 0;
+  characters.forEach((_, i) => {
+    t += gaps[i] ?? 0;
+    character_start_times_seconds.push(t);
+    t += 0.05;
+    character_end_times_seconds.push(t);
+  });
+  return { characters, character_start_times_seconds, character_end_times_seconds };
+}
+
+describe('planPauses', () => {
+  it('lengthens sentence ends to the target, and paragraph ends to the longer one', () => {
+    const text = 'Up six percent. Amazon led!\n\nNext is wholesale.';
+    const plan = planPauses(align(text));
+    expect(plan.map((p) => p.kind)).toEqual(['sentence', 'paragraph']);
+    // The whitespace itself was voiced as 0.05 s per char: one space, then two newlines.
+    expect(plan[0].add).toBeCloseTo(0.6 - 0.05, 5);
+    expect(plan[1].add).toBeCloseTo(0.9 - 0.1, 5);
+  });
+
+  it('skips decimals, abbreviations, initials and the clip end', () => {
+    const text = 'It hit 4.2 million, vs. plan in the U.S. market. Done.';
+    const plan = planPauses(align(text));
+    expect(plan).toHaveLength(1);
+    expect(plan[0].from).toBeCloseTo(align(text).character_end_times_seconds[text.indexOf('market.') + 6], 5);
+  });
+
+  it('counts a closing quote as part of the sentence end', () => {
+    expect(planPauses(align('He said "no." Then left.'))).toHaveLength(1);
+  });
+
+  it('leaves a boundary alone when the voice already paused long enough', () => {
+    const text = 'One. Two.';
+    expect(planPauses(align(text, { [text.indexOf('T')]: 0.7 }))).toEqual([]);
+  });
+
+  it('a target of 0 turns that kind off; bad alignment yields no plan', () => {
+    expect(planPauses(align('A b. C d.\n\nE f.'), { sentence: 0, paragraph: 0.9 }).map((p) => p.kind)).toEqual([
+      'paragraph',
+    ]);
+    expect(planPauses(undefined)).toEqual([]);
+    expect(
+      planPauses({ characters: ['a'], character_start_times_seconds: [], character_end_times_seconds: [] }),
+    ).toEqual([]);
+  });
+});
+
+describe('spliceSilence', () => {
+  it('inserts silence at the quietest point in the gap and keeps every sample', () => {
+    const rate = 1000;
+    const pcm = new Int16Array(1000).fill(8000);
+    pcm.fill(0, 500, 520); // a 20 ms quiet spot the voice left at 0.50 s
+    const { pcm: out, added } = spliceSilence(pcm, rate, [{ from: 0.45, to: 0.6, add: 0.3, kind: 'sentence' }]);
+    expect(added).toBeCloseTo(0.3, 5);
+    expect(out.length).toBe(1300);
+    // The loud audio is untouched on both sides; the silence sits inside the quiet spot.
+    expect(out.filter((x) => x === 8000).length).toBe(980);
+    const firstZero = out.indexOf(0);
+    expect(firstZero).toBeGreaterThanOrEqual(500);
+    expect(out.subarray(firstZero, firstZero + 320).every((x) => x === 0)).toBe(true);
+  });
+
+  it('is a no-op without a plan', () => {
+    const pcm = new Int16Array([1, 2, 3]);
+    expect(spliceSilence(pcm, 1000, []).pcm).toBe(pcm);
   });
 });
 

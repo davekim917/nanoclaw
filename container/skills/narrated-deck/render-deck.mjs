@@ -9,8 +9,11 @@
  * Pipeline: each slide's visual becomes a 1920x1080 image (HTML fragment via
  * headless Chromium, a json-render spec via the json-render plugin, or an
  * existing image); each slide's narration becomes speech via ElevenLabs
- * through the OneCLI gateway (curl — the gateway injects the key). The clips
- * are padded and joined into ONE continuous track, so the player never has to
+ * through the OneCLI gateway (curl — the gateway injects the key). The voice
+ * leaves only ~0.25s between sentences, which sounds rushed, so each clip's
+ * sentence and paragraph breaks are lengthened to `pauses` using ElevenLabs'
+ * per-character timings (`planPauses`, `spliceSilence`). The clips are padded
+ * and joined into ONE continuous track, so the player never has to
  * start a second audio element mid-deck (mobile browsers block that).
  *
  * No npm dependencies: node, curl, ffmpeg/ffprobe and chromium are all in the
@@ -30,6 +33,9 @@ export const DEFAULT_MODEL = 'eleven_multilingual_v2';
 export const MAX_SLIDES = 40;
 const WIDTH = 1920;
 const HEIGHT = 1080;
+export const DEFAULT_PAUSES = { sentence: 0.6, paragraph: 0.9 };
+const MAX_PAUSE_S = 2;
+const SAMPLE_RATE = 44100;
 const LEAD_IN_S = 0.25;
 const TAIL_S = 0.6;
 const SILENT_WPM = 160;
@@ -82,6 +88,18 @@ export function validateDeck(deck) {
   }
   if (deck.voice !== undefined && (typeof deck.voice !== 'string' || !deck.voice.trim())) {
     errors.push('voice: must be an ElevenLabs voice_id string');
+  }
+  if (deck.pauses !== undefined) {
+    if (!deck.pauses || typeof deck.pauses !== 'object' || Array.isArray(deck.pauses)) {
+      errors.push('pauses: must be an object like { "sentence": 0.6, "paragraph": 0.9 }');
+    } else {
+      for (const [k, v] of Object.entries(deck.pauses)) {
+        if (!(k in DEFAULT_PAUSES)) errors.push(`pauses.${k}: unknown key (use sentence | paragraph)`);
+        else if (typeof v !== 'number' || !(v >= 0 && v <= MAX_PAUSE_S)) {
+          errors.push(`pauses.${k}: must be seconds between 0 and ${MAX_PAUSE_S}`);
+        }
+      }
+    }
   }
   if (!Array.isArray(deck.slides) || deck.slides.length === 0) {
     errors.push('slides: required, non-empty array');
@@ -152,6 +170,96 @@ export function buildPlayerHtml(template, data) {
 
 export function ttsCacheKey(request) {
   return createHash('sha256').update(JSON.stringify(request)).digest('hex').slice(0, 32);
+}
+
+// A period after these is not a sentence end ("vs. last year").
+const ABBREVIATION = /(?:^|[^A-Za-z])(?:vs|e\.g|i\.e|approx|mr|mrs|ms|dr|jr|sr)\.$/i;
+const INITIAL = /(?:^|[\s.])[A-Z]\.$/; // "U.S." or "J." — a letter, not a sentence end
+
+/**
+ * Where to lengthen the silence in one voiced clip. `alignment` is ElevenLabs'
+ * per-character timing for the text it was sent; a sentence end is `.?!`
+ * (plus any closing quote or bracket) followed by whitespace, and a blank
+ * line after it makes it a paragraph end. Returns [{ from, to, add, kind }]:
+ * the silence the voice left (`from`–`to`, seconds into the clip) and how much
+ * to add to reach the target. Boundaries already at or past the target are
+ * left alone, and a target of 0 turns that kind off.
+ */
+export function planPauses(alignment, pauses = DEFAULT_PAUSES) {
+  const chars = alignment?.characters;
+  const starts = alignment?.character_start_times_seconds;
+  const ends = alignment?.character_end_times_seconds;
+  if (!Array.isArray(chars) || !Array.isArray(starts) || !Array.isArray(ends)) return [];
+  if (starts.length !== chars.length || ends.length !== chars.length) return [];
+  const target = { ...DEFAULT_PAUSES, ...pauses };
+  const plan = [];
+  for (let i = 0; i < chars.length; i++) {
+    if (!/^[.!?]$/.test(chars[i])) continue;
+    let j = i + 1;
+    while (j < chars.length && /^["'”’)\]]$/.test(chars[j])) j++;
+    if (j >= chars.length || !/^\s$/.test(chars[j])) continue; // "4.2", or the end of the clip
+    let k = j;
+    let newlines = 0;
+    while (k < chars.length && /^\s$/.test(chars[k])) {
+      if (chars[k] === '\n') newlines++;
+      k++;
+    }
+    if (k >= chars.length) continue;
+    if (chars[i] === '.') {
+      const before = chars.slice(Math.max(0, i - 8), i + 1).join('');
+      if (ABBREVIATION.test(before) || INITIAL.test(before)) continue;
+    }
+    const kind = newlines >= 2 ? 'paragraph' : 'sentence';
+    const from = ends[j - 1];
+    const to = Math.max(from, starts[k]);
+    const add = target[kind] - (to - from);
+    if (target[kind] > 0 && add > 0.02) plan.push({ from, to, add, kind });
+    i = k - 1;
+  }
+  return plan;
+}
+
+/** Sample index of the quietest 10 ms in [lo, hi] seconds — where a cut is inaudible. */
+function quietestPoint(pcm, rate, lo, hi) {
+  const win = Math.max(1, Math.round(rate * 0.01));
+  const first = Math.max(0, Math.round(lo * rate));
+  const last = Math.min(pcm.length - win, Math.round(hi * rate));
+  if (last <= first) return Math.min(pcm.length, Math.max(0, Math.round(((lo + hi) / 2) * rate)));
+  let best = first;
+  let bestEnergy = Infinity;
+  for (let s = first; s <= last; s += Math.max(1, win >> 1)) {
+    let e = 0;
+    for (let x = s; x < s + win; x++) e += Math.abs(pcm[x]);
+    if (e < bestEnergy) {
+      bestEnergy = e;
+      best = s;
+    }
+  }
+  return best + (win >> 1);
+}
+
+/**
+ * Inserts digital silence into mono 16-bit PCM for each planned pause. The cut
+ * goes at the quietest point in the gap, widened by 40 ms each side because
+ * the character timings are approximate and mp3 decoding shifts audio by a
+ * few ms. Returns { pcm, added } (added = seconds of silence inserted).
+ */
+export function spliceSilence(pcm, rate, plan) {
+  if (!plan.length) return { pcm, added: 0 };
+  const cuts = plan
+    .map((p) => ({ at: quietestPoint(pcm, rate, p.from - 0.04, p.to + 0.04), n: Math.round(p.add * rate) }))
+    .sort((a, b) => a.at - b.at);
+  const total = cuts.reduce((a, c) => a + c.n, 0);
+  const out = new Int16Array(pcm.length + total); // zero-filled = silence
+  let src = 0;
+  let dst = 0;
+  for (const { at, n } of cuts) {
+    out.set(pcm.subarray(src, at), dst);
+    dst += at - src + n;
+    src = at;
+  }
+  out.set(pcm.subarray(src), dst);
+  return { pcm: out, added: total / rate };
 }
 
 /** Slide start/end times on the joined track, from per-slide clip durations. */
@@ -309,11 +417,15 @@ async function renderVisual(slide, i, ctx) {
 
 // ---------------------------------------------------------------------- audio
 
-async function synthesize(request, dst, attempt = 1) {
+/**
+ * Voices one request via the with-timestamps endpoint: writes the audio to
+ * `dst` (mp3) and ElevenLabs' character alignment to `alignFile` (JSON).
+ */
+async function synthesize(request, dst, alignFile, attempt = 1) {
   const body = path.join(path.dirname(dst), `.${path.basename(dst)}.body.json`);
   const tmp = `${dst}.part`;
   fs.writeFileSync(body, JSON.stringify(request.body));
-  const url = `${TTS_URL}/${encodeURIComponent(request.voice)}?output_format=mp3_44100_128`;
+  const url = `${TTS_URL}/${encodeURIComponent(request.voice)}/with-timestamps?output_format=mp3_44100_128`;
   const { stdout } = await run('curl', [
     '-sS',
     '--max-time',
@@ -324,7 +436,7 @@ async function synthesize(request, dst, attempt = 1) {
     '-H',
     'Content-Type: application/json',
     '-H',
-    'Accept: audio/mpeg',
+    'Accept: application/json',
     '--data-binary',
     `@${body}`,
     '-o',
@@ -335,7 +447,11 @@ async function synthesize(request, dst, attempt = 1) {
   fs.rmSync(body, { force: true });
   const status = Number(stdout.trim());
   if (status === 200) {
-    fs.renameSync(tmp, dst);
+    const res = JSON.parse(fs.readFileSync(tmp, 'utf8'));
+    fs.rmSync(tmp, { force: true });
+    if (typeof res.audio_base64 !== 'string' || !res.audio_base64) throw new Error('ElevenLabs returned no audio');
+    fs.writeFileSync(alignFile, JSON.stringify(res.alignment ?? null));
+    fs.writeFileSync(dst, Buffer.from(res.audio_base64, 'base64'));
     return;
   }
   const detail = fs.existsSync(tmp) ? fs.readFileSync(tmp, 'utf8').slice(0, 400) : '';
@@ -344,10 +460,12 @@ async function synthesize(request, dst, attempt = 1) {
     const wait = 2 ** attempt * 1000;
     log(`ElevenLabs ${status}, retrying in ${wait / 1000}s`);
     await new Promise((r) => setTimeout(r, wait));
-    return synthesize(request, dst, attempt + 1);
+    return synthesize(request, dst, alignFile, attempt + 1);
   }
-  const hint =
-    status === 401
+  // ElevenLabs answers an exhausted quota with 401 too; don't blame the key for it.
+  const hint = /quota_exceeded/.test(detail)
+    ? ' — the ElevenLabs account is out of credits; render with --silent and tell the operator'
+    : status === 401
       ? ' — this agent group is not granted the ElevenLabs secret (or the key lacks text_to_speech permission); report it to the operator'
       : '';
   throw new Error(`ElevenLabs TTS failed: HTTP ${status}${hint}. ${detail}`);
@@ -374,15 +492,29 @@ async function narrate(slide, i, ctx) {
       ...(ctx.voiceSettings ? { voice_settings: ctx.voiceSettings } : {}),
     },
   };
-  const cached = path.join(ctx.cacheDir, `${ttsCacheKey(request)}.mp3`);
-  if (fs.existsSync(cached)) {
+  const key = ttsCacheKey(request);
+  const cached = path.join(ctx.cacheDir, `${key}.mp3`);
+  const alignFile = path.join(ctx.cacheDir, `${key}.align.json`);
+  // The alignment is written first, so an mp3 without one predates timings.
+  if (fs.existsSync(cached) && fs.existsSync(alignFile)) {
     ctx.cacheHits++;
   } else {
     log(`voicing slide ${i + 1}/${slides.length}`);
-    await synthesize(request, cached);
+    await synthesize(request, cached, alignFile);
     ctx.charsBilled += request.body.text.length;
   }
-  await ffmpeg(['-i', cached, '-af', pad, '-ar', '44100', '-ac', '1', wav]);
+  // Decode, lengthen sentence breaks, then pad: the timings are relative to
+  // the raw clip, so the splice has to happen before the lead-in shifts it.
+  const raw = path.join(ctx.tmpDir, `${n}.pcm`);
+  await ffmpeg(['-i', cached, '-f', 's16le', '-ac', '1', '-ar', String(SAMPLE_RATE), raw]);
+  const buf = fs.readFileSync(raw);
+  const pcm = new Int16Array(buf.buffer, buf.byteOffset, buf.length >> 1);
+  const plan = planPauses(JSON.parse(fs.readFileSync(alignFile, 'utf8')), ctx.pauses);
+  const spliced = spliceSilence(pcm, SAMPLE_RATE, plan);
+  ctx.pausesLengthened += plan.length;
+  ctx.pauseSecondsAdded += spliced.added;
+  fs.writeFileSync(raw, Buffer.from(spliced.pcm.buffer, spliced.pcm.byteOffset, spliced.pcm.byteLength));
+  await ffmpeg(['-f', 's16le', '-ar', String(SAMPLE_RATE), '-ac', '1', '-i', raw, '-af', pad, wav]);
   return wav;
 }
 
@@ -498,6 +630,7 @@ export async function main(argv) {
     voice: deck.voice || process.env.NARRATED_DECK_VOICE || DEFAULT_VOICE,
     model: deck.model || DEFAULT_MODEL,
     voiceSettings: deck.voiceSettings,
+    pauses: { ...DEFAULT_PAUSES, ...deck.pauses },
     silent: opts.silent,
     slides: deck.slides,
     count: deck.slides.length,
@@ -510,6 +643,8 @@ export async function main(argv) {
     warnings: [...warnings],
     cacheHits: 0,
     charsBilled: 0,
+    pausesLengthened: 0,
+    pauseSecondsAdded: 0,
   };
   for (const d of [ctx.slidesDir, ctx.audioDir, ctx.cacheDir]) fs.mkdirSync(d, { recursive: true });
 
@@ -526,6 +661,8 @@ export async function main(argv) {
       voice: ctx.silent ? null : ctx.voice,
       ttsCharsBilled: ctx.charsBilled,
       ttsCacheHits: ctx.cacheHits,
+      pausesLengthened: ctx.pausesLengthened,
+      pauseSecondsAdded: Number(ctx.pauseSecondsAdded.toFixed(1)),
       slideImages: images,
       files: [],
       warnings: ctx.warnings,
