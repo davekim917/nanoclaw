@@ -709,10 +709,13 @@ function publishToolInFlight(): void {
   // (src/modules/sweep-continuation/decide.ts:42-57), the wake's dedupe key is
   // built from it (sweep-continuation/index.ts:336), host-restart-warn feeds it
   // to the same decision and keys its note on it (src/host-restart-warn.ts:249,
-  // :287), and the dashboard marks a thread stalled by its age
-  // (src/dashboard/api/threads.ts:251-253). Re-publishing the same long Bash
-  // because a parallel Read started or finished would move that start forward:
-  // it would re-key the recovery and make a wedged tool look fresh.
+  // :287), the dashboard marks a thread stalled by its age
+  // (src/dashboard/api/threads.ts:251-253), and `decideStuckAction` forgives a
+  // claim made after it while that tool is in flight
+  // (src/modules/sweep-container-health/index.ts:552, :664). Re-publishing the
+  // same long Bash because a parallel Read started or finished would move that
+  // start forward: it would re-key the recovery, make a wedged tool look fresh,
+  // and withdraw that claim forgiveness mid-operation.
   if (widestId === publishedToolUseId) return;
   try {
     if (widest === null) clearContainerToolInFlight();

@@ -1987,3 +1987,169 @@ describe('post-kill writes yield to a replacement container', () => {
     expect(f.state()).toBe('claims=0 notices=1');
   });
 });
+
+// A mid-turn follow-up's claim is held until the provider reports it consumed
+// (container/agent-runner/src/poll-loop.ts, `pendingFollowUps`). A turn inside
+// a long silent tool emits no event, so the heartbeat stays older than the
+// claim. The claim rule must not read that as a wedge while a tool that began
+// BEFORE the claim is still in flight — and the ceiling must not move.
+describe('decideStuckAction: a claim made while an earlier tool is still in flight', () => {
+  const MIN = 60 * 1000;
+  const claimedAt = BASE - 5 * MIN; // age 5 min > CLAIM_STUCK_MS
+  const claim = { message_id: 'm-followup', status_changed: new Date(claimedAt).toISOString() };
+  // A non-Bash tool, so no declared timeout widens the tolerance and the new
+  // rule is the only thing that can forgive the claim.
+  const readStartedAt = (ms: number) => ({
+    current_tool: 'Read',
+    tool_declared_timeout_ms: null,
+    tool_started_at: new Date(ms).toISOString(),
+  });
+  const heartbeatBeforeClaim = BASE - 12 * MIN; // older than the claim, inside the ceiling
+
+  it('(a) forgives the claim when the tool started before it', () => {
+    expect(CLAIM_STUCK_MS).toBeLessThan(BASE - claimedAt);
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: heartbeatBeforeClaim,
+      containerState: readStartedAt(BASE - 10 * MIN),
+      claims: [claim],
+    });
+    expect(res).toEqual({ action: 'ok' });
+  });
+
+  // Not "unchanged": the kill rule is the same, but the claims it sees are not.
+  // Before this PR a pushed follow-up held no claim at all; now it holds one
+  // until it is consumed. So a claim with no tool in flight is killed only when
+  // nothing else shows the turn is alive: no live query (below).
+  it('(b) kills the claim with no tool in flight when no live query forgives it', () => {
+    for (const containerState of [
+      null,
+      { current_tool: null, tool_declared_timeout_ms: null, tool_started_at: new Date(BASE - 10 * MIN).toISOString() },
+      // Executing, but this query has produced no event: hung at the gate.
+      {
+        current_tool: null,
+        tool_declared_timeout_ms: null,
+        tool_started_at: null,
+        provider_executing: 1,
+        provider_query_event_at: null,
+      },
+    ]) {
+      const res = decideStuckAction({
+        now: BASE,
+        heartbeatMtimeMs: heartbeatBeforeClaim,
+        containerState,
+        claims: [claim],
+      });
+      expect(res.action).toBe('kill-claim');
+    }
+  });
+
+  it('(c) still kills the claim when the tool started AFTER it', () => {
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: heartbeatBeforeClaim,
+      containerState: readStartedAt(BASE - 2 * MIN),
+      claims: [claim],
+    });
+    expect(res.action).toBe('kill-claim');
+  });
+
+  it('(d) the ceiling still fires while a tool is in flight', () => {
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: BASE - ABSOLUTE_CEILING_MS - MIN,
+      containerState: readStartedAt(BASE - 40 * MIN),
+      claims: [claim],
+    });
+    expect(res.action).toBe('kill-ceiling');
+    if (res.action !== 'kill-ceiling') return;
+    expect(res.ceilingMs).toBe(ABSOLUTE_CEILING_MS);
+  });
+
+  it('(e) an unparseable or missing tool_started_at gives no forgiveness', () => {
+    for (const tool_started_at of ['not-a-timestamp', '', null]) {
+      const res = decideStuckAction({
+        now: BASE,
+        heartbeatMtimeMs: heartbeatBeforeClaim,
+        containerState: { current_tool: 'Read', tool_declared_timeout_ms: null, tool_started_at },
+        claims: [claim],
+      });
+      expect(res.action).toBe('kill-claim');
+    }
+  });
+});
+
+// The #1014 review's P1. A follow-up pushed into a running turn now holds its
+// claim until consumed. With no tool in flight — the model thinking, or writing
+// a long tool input — the claude provider emits nothing (no partial messages),
+// so the heartbeat stays older than the claim and CLAIM_STUCK_MS (60 s) would
+// kill a healthy container mid-turn. A live query forgives the claim; a query
+// hung at the gate does not; and the ceiling still reaps a genuine wedge.
+describe('decideStuckAction: a claim held through a long think', () => {
+  const MIN = 60 * 1000;
+  const claim = { message_id: 'm-checkin', status_changed: new Date(BASE - 5 * MIN).toISOString() };
+  const heartbeatBeforeClaim = BASE - 8 * MIN;
+  const state = (over: Partial<ContainerState>): ContainerState => ({
+    current_tool: null,
+    tool_declared_timeout_ms: null,
+    tool_started_at: null,
+    provider_executing: 1,
+    provider_query_event_at: new Date(BASE - 20 * MIN).toISOString(),
+    ...over,
+  });
+
+  it('forgives the claim while the provider is executing a query that has produced events', () => {
+    expect(CLAIM_STUCK_MS).toBeLessThan(5 * MIN);
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: heartbeatBeforeClaim,
+      containerState: state({}),
+      claims: [claim],
+    });
+    expect(res).toEqual({ action: 'ok' });
+  });
+
+  it('kills the claim when the query has produced NO event since it started (hung at the gate)', () => {
+    for (const provider_query_event_at of [null, undefined, '', 'not-a-timestamp']) {
+      const res = decideStuckAction({
+        now: BASE,
+        heartbeatMtimeMs: heartbeatBeforeClaim,
+        containerState: state({ provider_query_event_at }),
+        claims: [claim],
+      });
+      expect(res.action).toBe('kill-claim');
+    }
+  });
+
+  it('kills the claim when no provider turn is executing', () => {
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: heartbeatBeforeClaim,
+      containerState: state({ provider_executing: 0 }),
+      claims: [claim],
+    });
+    expect(res.action).toBe('kill-claim');
+  });
+
+  it('gives no forgiveness without a heartbeat, where the ceiling cannot apply', () => {
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: 0,
+      containerState: state({}),
+      claims: [claim],
+    });
+    expect(res.action).toBe('kill-claim');
+  });
+
+  it('the ceiling still reaps a provider that went silent mid-think', () => {
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: BASE - ABSOLUTE_CEILING_MS - MIN,
+      containerState: state({}),
+      claims: [claim],
+    });
+    expect(res.action).toBe('kill-ceiling');
+    if (res.action !== 'kill-ceiling') return;
+    expect(res.ceilingMs).toBe(ABSOLUTE_CEILING_MS);
+  });
+});

@@ -132,9 +132,11 @@ describe('tool in-flight tracking', () => {
     // that stamp as the described tool's start: decideCeilingFollowUp's
     // freshness bound (src/modules/sweep-continuation/decide.ts:42-57), the
     // wedged-tool recovery key (sweep-continuation/index.ts:336),
-    // host-restart-warn (src/host-restart-warn.ts:249, :287) and the dashboard's
-    // stall rule (src/dashboard/api/threads.ts:251-253). A parallel Read
-    // starting or finishing inside a long Bash must not move it forward.
+    // host-restart-warn (src/host-restart-warn.ts:249, :287), the dashboard's
+    // stall rule (src/dashboard/api/threads.ts:251-253) and decideStuckAction's
+    // tool-in-flight claim forgiveness (src/modules/sweep-container-health/
+    // index.ts:552, :664). A parallel Read starting or finishing inside a long
+    // Bash must not move it forward.
     await pre('bash-1', 'Bash', 1_800_000);
     const afterBash = setCalls;
     await pre('read-1', 'Read');

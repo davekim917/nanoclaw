@@ -5922,3 +5922,191 @@ describe('status subtext — round-two regressions', () => {
     expect(subtexts[1]).toBe('opus-5 · xhigh');
   });
 });
+
+/**
+ * A mid-turn push used to be `markCompleted` on the line after `pushToQuery` —
+ * terminal seconds after arrival, with no evidence the model had consumed it.
+ * `completed` is what the host syncs onto `messages_in.status`
+ * (src/modules/mailbox/ops/sweep.ts:207) and nothing re-delivers a completed
+ * row, so a turn that died before reading the push took the message with it.
+ * 2026-09-22: a person's check-ins during a 30-minute wedged turn were acked
+ * and lost, and the thread stayed silent.
+ */
+describe('a follow-up pushed mid-turn is acked only once consumed', () => {
+  const ackStatus = (id: string): string | undefined =>
+    (
+      getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as
+        | { status: string }
+        | undefined
+    )?.status;
+  const inboundStatus = (id: string): string | undefined =>
+    (getInboundDb().prepare('SELECT status FROM messages_in WHERE id = ?').get(id) as { status: string } | undefined)
+      ?.status;
+
+  /** Runs a query whose turn stays open until the poll admits a row. */
+  function runWithMidTurnPush(afterPush: 'result' | 'die'): Promise<string | undefined> {
+    insertMessage('m-checkin', 'chat', { sender: 'Operator', senderId: 'U1', text: 'are you there' });
+    let sawPush!: () => void;
+    const pushed = new Promise<void>((resolve) => {
+      sawPush = resolve;
+    });
+    let ackWhileRunning: string | undefined;
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      await pushed; // the turn is still running when the poll admits the row
+      ackWhileRunning = ackStatus('m-checkin');
+      if (afterPush === 'result') yield { type: 'result', text: '<internal>read it</internal>' };
+      // 'die': the stream ends with the push never answered.
+    }
+    const query: AgentQuery = {
+      push: () => sawPush(),
+      end: () => {},
+      abort: () => {},
+      events: events(),
+    };
+    // Settings must match what the follow-up batch resolves to, or the poll
+    // ends the stream instead of pushing.
+    return processQuery(query, ERR_ROUTING, [], 'claude', undefined, 'initial', undefined, {
+      ultracode: false,
+      fast: false,
+    }).then(() => ackWhileRunning);
+  }
+
+  it('holds a non-terminal `processing` claim while the turn runs, then completes at `result`', async () => {
+    const ackWhileRunning = await runWithMidTurnPush('result');
+    // The regression: this used to already read 'completed'.
+    expect(ackWhileRunning).toBe('processing');
+    expect(ackStatus('m-checkin')).toBe('completed');
+  }, 30_000);
+
+  it('RELEASES the claim when the stream ends without a result, so the row is re-delivered', async () => {
+    const ackWhileRunning = await runWithMidTurnPush('die');
+    expect(ackWhileRunning).toBe('processing');
+    // Released, not completed: no ack row at all, inbound still pending.
+    expect(ackStatus('m-checkin')).toBeUndefined();
+    expect(inboundStatus('m-checkin')).toBe('pending');
+    expect(getPendingMessages().map((m) => m.id)).toContain('m-checkin');
+  }, 30_000);
+  /**
+   * Runs one query that pushes `id` mid-turn, then plays `after(pushResult)`:
+   * the events that follow the push. `push()` returns the id the provider
+   * stamped on it, as the claude provider does.
+   */
+  async function runPushed(
+    id: string,
+    after: () => AsyncGenerator<ProviderEvent>,
+    opts: { insert?: boolean; onPushed?: () => void } = {},
+  ): Promise<void> {
+    if (opts.insert !== false) insertMessage(id, 'chat', { sender: 'Operator', senderId: 'U1', text: 'are you there' });
+    let sawPush!: () => void;
+    const pushed = new Promise<void>((resolve) => {
+      sawPush = resolve;
+    });
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      await pushed;
+      opts.onPushed?.();
+      yield* after();
+    }
+    const query = {
+      push: () => {
+        sawPush();
+        return 'p-push';
+      },
+      end: () => {},
+      abort: () => {},
+      events: events(),
+      initialPromptId: 'p-initial',
+      hasQueuedWork: () => true,
+    } as AgentQuery;
+    await processQuery(query, ERR_ROUTING, [], 'claude', undefined, 'initial', undefined, {
+      ultracode: false,
+      fast: false,
+    });
+  }
+
+  // #1014 review P2: the CLI can answer the running turn while the pushed
+  // prompt is still queued behind it. That result must not ack the push.
+  it('a result that answered only the initial prompt does NOT complete a push still queued behind it', async () => {
+    let ackAfterFirstResult: string | undefined;
+    await runPushed('m-queued', async function* () {
+      yield { type: 'result', text: '<internal>t1</internal>', answeredPrompts: ['p-initial'] };
+      ackAfterFirstResult = ackStatus('m-queued');
+      // The container dies before the queued turn produces its result.
+    });
+    expect(ackAfterFirstResult).toBe('processing');
+    // Released at stream end, so the row is delivered again rather than lost.
+    expect(ackStatus('m-queued')).toBeUndefined();
+    expect(inboundStatus('m-queued')).toBe('pending');
+  }, 30_000);
+
+  it('completes the push at the result whose answeredPrompts names it', async () => {
+    let ackBetween: string | undefined;
+    await runPushed('m-answered', async function* () {
+      yield { type: 'result', text: '<internal>t1</internal>', answeredPrompts: ['p-initial'] };
+      ackBetween = ackStatus('m-answered');
+      yield { type: 'result', text: '<internal>t2</internal>', answeredPrompts: ['p-push'] };
+    });
+    expect(ackBetween).toBe('processing');
+    expect(ackStatus('m-answered')).toBe('completed');
+  }, 30_000);
+
+  it('completes the push when a later `settled` reports it consumed with its echo dropped', async () => {
+    await runPushed('m-settled', async function* () {
+      yield { type: 'result', text: '<internal>t1</internal>', answeredPrompts: [] };
+      yield { type: 'settled', unansweredPrompts: ['p-push'] };
+    });
+    expect(ackStatus('m-settled')).toBe('completed');
+  }, 30_000);
+
+  // #1014 review P3: an in-container release does not bump `tries` (inbound.db
+  // is host-written), so the runner bounds it itself: one release per row per
+  // container process, then the row is completed like an initial batch whose
+  // turn ended without a result.
+  it('releases a follow-up left unconsumed once, and completes it the second time', async () => {
+    const dies = async function* (): AsyncGenerator<ProviderEvent> {};
+    await runPushed('m-poison', dies);
+    expect(ackStatus('m-poison')).toBeUndefined();
+    expect(inboundStatus('m-poison')).toBe('pending');
+
+    await runPushed('m-poison', dies, { insert: false });
+    expect(ackStatus('m-poison')).toBe('completed');
+  }, 60_000);
+
+  // #1014 review P1: the host forgives a held claim during a long think only
+  // while THIS query has produced an event. The runner publishes that as
+  // container_state.provider_query_event_at: NULL at query start, stamped on
+  // the first event, NULL again once the query ends.
+  it('publishes provider_query_event_at for the life of the query only', async () => {
+    const queryEventAt = (): string | null | undefined =>
+      (
+        getOutboundDb().prepare('SELECT provider_query_event_at FROM container_state WHERE id = 1').get() as
+          | { provider_query_event_at: string | null }
+          | undefined
+      )?.provider_query_event_at;
+    let duringQuery: string | null | undefined;
+    await runPushed(
+      'm-live',
+      async function* () {
+        yield { type: 'result', text: '<internal>t1</internal>', answeredPrompts: ['p-initial', 'p-push'] };
+      },
+      { onPushed: () => (duringQuery = queryEventAt()) },
+    );
+    expect(typeof duringQuery).toBe('string');
+    expect(Number.isFinite(Date.parse(duringQuery as string))).toBe(true);
+    expect(queryEventAt()).toBeNull();
+  }, 30_000);
+
+  it('container startup clears a stamp a dead container left behind', () => {
+    getOutboundDb()
+      .prepare(
+        `INSERT INTO container_state (id, provider_query_event_at, updated_at) VALUES (1, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET provider_query_event_at = excluded.provider_query_event_at`,
+      )
+      .run('2026-09-23T00:00:00.000Z', '2026-09-23T00:00:00.000Z');
+    clearStaleProcessingAcks();
+    expect(getOutboundDb().prepare('SELECT provider_query_event_at FROM container_state WHERE id = 1').get()).toEqual({
+      provider_query_event_at: null,
+    });
+  });
+});

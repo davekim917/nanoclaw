@@ -118,4 +118,37 @@ describe('outbound DB initialization', () => {
     expect(columns.has('memory_telemetry_at')).toBe(true);
     db.close();
   });
+
+  // A container restarted onto an outbound.db an older runner created, with a
+  // row already in it: the backfill adds provider_query_event_at once, keeps the
+  // row, and a second boot is a no-op rather than a duplicate-column throw.
+  it('backfills provider_query_event_at onto an old-runner DB, idempotently', () => {
+    const db = new Database(':memory:');
+    db.exec(`
+      CREATE TABLE container_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        current_tool TEXT,
+        tool_declared_timeout_ms INTEGER,
+        tool_started_at TEXT,
+        provider_executing INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+      )
+    `);
+    db.prepare("INSERT INTO container_state (id, provider_executing, updated_at) VALUES (1, 1, 'old')").run();
+    const columnsOf = () =>
+      (db.prepare("PRAGMA table_info('container_state')").all() as Array<{ name: string }>).map((row) => row.name);
+    expect(columnsOf()).not.toContain('provider_query_event_at');
+
+    ensureNanoclawOutboundSchema(db);
+    expect(columnsOf()).toContain('provider_query_event_at');
+    expect(() => ensureNanoclawOutboundSchema(db)).not.toThrow();
+    expect(columnsOf().filter((name) => name === 'provider_query_event_at')).toHaveLength(1);
+
+    const row = db.prepare('SELECT provider_executing, provider_query_event_at FROM container_state').get() as {
+      provider_executing: number;
+      provider_query_event_at: string | null;
+    };
+    expect(row).toEqual({ provider_executing: 1, provider_query_event_at: null });
+    db.close();
+  });
 });

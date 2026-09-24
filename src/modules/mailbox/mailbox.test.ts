@@ -41,6 +41,7 @@ import {
 import { SessionDbMissingError } from './openers.js';
 import { withExistingMailboxSession, withMailboxSession } from '../../session-manager.js';
 import { shouldReapIdleTaskContainer } from '../sweep-idle-reap/index.js';
+import { decideStuckAction } from '../sweep-container-health/index.js';
 import { withExistingNanoclawOutbound } from './index.js';
 import { sessionOutboundStorageStat, type NanoclawMailboxSession } from './index.js';
 
@@ -1048,6 +1049,91 @@ describe('provider_executing across the container to host seam', () => {
     const busy = await mailbox.session(key, (m) => fork(m).getContainerState());
     expect(busy?.provider_executing).toBe(1);
     expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, busy?.provider_executing === 1, false)).toBe(false);
+  });
+});
+
+/**
+ * `provider_query_event_at` across the same seam, and across runner versions.
+ * The column is created by the CONTAINER (its ensureNanoclawOutboundSchema
+ * backfill, container/agent-runner/src/modules/mailbox/schema.ts), so after a
+ * deploy an adopted container on the old runner snapshot keeps an outbound.db
+ * without it. The host must read that DB without throwing and must NOT forgive
+ * a claim from it: the old claim rule applies until the container respawns
+ * onto the new runner.
+ */
+describe('provider_query_event_at across the container to host seam', () => {
+  // The booted shape an older runner leaves behind: every fork column up to
+  // memory_max_events, and not the new one.
+  const OLD_RUNNER_COLUMNS = [
+    'provider_status TEXT',
+    'provider_last_event_at TEXT',
+    'provider_last_probe_at TEXT',
+    'provider_probe_failures INTEGER',
+    'provider_recovery_attempts INTEGER',
+    'provider_failure_reason TEXT',
+    'memory_current_bytes INTEGER',
+    'memory_peak_bytes INTEGER',
+    'memory_max_bytes INTEGER',
+    'memory_oom_events INTEGER',
+    'memory_oom_kill_events INTEGER',
+    'memory_max_events INTEGER',
+    'memory_telemetry_at TEXT',
+  ];
+  const NOW = Date.parse('2026-09-23T12:00:00.000Z');
+  const MIN = 60_000;
+  // A mid-turn follow-up claimed 5 min ago; the last provider event (heartbeat)
+  // is older than the claim and well inside the ceiling: a long think.
+  const claims = [{ message_id: 'm-checkin', status_changed: new Date(NOW - 5 * MIN).toISOString() }];
+  const heartbeatMtimeMs = NOW - 8 * MIN;
+
+  function sessionWith(columns: string[], write: (db: Database.Database) => void): MailboxSessionKey {
+    const key = freshKey();
+    getAgentMailbox().prepare(key);
+    raw(dbPath(key, 'outbound'), (db) => {
+      for (const column of columns) db.exec(`ALTER TABLE container_state ADD COLUMN ${column}`);
+      write(db);
+    });
+    return key;
+  }
+
+  it('an old-runner DB without the column reads cleanly and gives no forgiveness', async () => {
+    const key = sessionWith(OLD_RUNNER_COLUMNS, (db) =>
+      db
+        .prepare('INSERT INTO container_state (id, provider_executing, updated_at) VALUES (1, 1, ?)')
+        .run(new Date(NOW).toISOString()),
+    );
+    const state = await getAgentMailbox().session(key, (m) => fork(m).getContainerState());
+    // Read through the next tier down, not an error and not null.
+    expect(state?.provider_executing).toBe(1);
+    expect(state?.memory_max_events).toBeNull();
+    expect(state?.provider_query_event_at).toBeUndefined();
+    expect(decideStuckAction({ now: NOW, heartbeatMtimeMs, containerState: state ?? null, claims }).action).toBe(
+      'kill-claim',
+    );
+  });
+
+  it('a new-runner DB with the column stamped forgives the claim; NULL (no event this query) does not', async () => {
+    const stamp = (value: string | null) =>
+      sessionWith([...OLD_RUNNER_COLUMNS, 'provider_query_event_at TEXT'], (db) =>
+        db
+          .prepare(
+            'INSERT INTO container_state (id, provider_executing, provider_query_event_at, updated_at) VALUES (1, 1, ?, ?)',
+          )
+          .run(value, new Date(NOW).toISOString()),
+      );
+    const live = await getAgentMailbox().session(stamp(new Date(NOW - 20 * MIN).toISOString()), (m) =>
+      fork(m).getContainerState(),
+    );
+    expect(live?.provider_query_event_at).toBe(new Date(NOW - 20 * MIN).toISOString());
+    expect(decideStuckAction({ now: NOW, heartbeatMtimeMs, containerState: live ?? null, claims })).toEqual({
+      action: 'ok',
+    });
+
+    const gate = await getAgentMailbox().session(stamp(null), (m) => fork(m).getContainerState());
+    expect(gate?.provider_query_event_at).toBeNull();
+    expect(decideStuckAction({ now: NOW, heartbeatMtimeMs, containerState: gate ?? null, claims }).action).toBe(
+      'kill-claim',
+    );
   });
 });
 
