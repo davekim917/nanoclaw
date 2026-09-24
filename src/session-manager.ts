@@ -768,7 +768,7 @@ function buildRecallRow(
 ): MessageInsert | null {
   if (!isAdmissiblePreTurnTrigger({ ...message, content: normalizedContent })) return null;
   // A scheduled fire that starts fresh resets the provider before it is prompted, like a queued /clear.
-  const resetPending = message.kind === 'task' && taskFiresFresh(message.threadId, normalizedContent);
+  const resetPending = message.kind === 'task' && taskFiresFresh(normalizedContent);
   const lifecycle = resolveRecallLifecycle(
     mailbox,
     agentGroupId,

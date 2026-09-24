@@ -1,6 +1,6 @@
 /**
  * Scheduled task fires start the provider with no resumed continuation by
- * default; a thread-bound, --continuous, dispatch or retried fire, or any batch
+ * default, thread-bound or not; a --continuous, dispatch or retried fire, or any batch
  * holding a non-task row, resumes exactly as before.
  * Drives the real `runPollLoop` against a provider that records the
  * continuation each query was handed.
@@ -83,14 +83,14 @@ describe('scheduled task fires', () => {
     expect(getContinuation('mock')).toStartWith('mock-session-');
   });
 
-  it('a thread-bound fire resumes the stored continuation', async () => {
+  it('a thread-bound fire starts fresh: the thread is where it posts, not a conversation', async () => {
     setContinuation('mock', 'prior-session');
     insertRow('t1', 'task', { prompt: 'post in the thread' }, 'thread-7');
     const provider = new RecordingProvider();
 
     await runOneBatch(provider);
 
-    expect(provider.continuations[0]).toBe('prior-session');
+    expect(provider.continuations[0]).toBeUndefined();
   });
 
   it('a --continuous fire resumes the stored continuation', async () => {
@@ -259,8 +259,9 @@ describe('isFreshContextTaskBatch', () => {
     expect(isFreshContextTaskBatch([])).toBe(false);
   });
 
-  it('keeps thread-bound, --continuous, dispatch and retried fires, and unreadable rows, continuous', () => {
-    expect(taskRowFiresFresh(row('task', { prompt: 'p' }, 'thread-7'))).toBe(false);
+  it('keeps --continuous, dispatch and retried fires, and unreadable rows, continuous; thread-bound starts fresh', () => {
+    expect(taskRowFiresFresh(row('task', { prompt: 'p' }, 'thread-7'))).toBe(true);
+    expect(taskRowFiresFresh(row('task', { prompt: 'p', continuous: true }, 'thread-7'))).toBe(false);
     expect(taskRowFiresFresh(row('task', { prompt: 'p', continuous: true }))).toBe(false);
     expect(taskRowFiresFresh(row('task', { prompt: 'p', continuous: false }))).toBe(true);
     expect(taskRowFiresFresh(row('task', { prompt: 'p', dispatch: { contextKey: 'k', eventKey: 'e' } }))).toBe(false);

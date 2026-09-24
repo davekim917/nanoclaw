@@ -11,13 +11,13 @@
       "host": true
     },
     {
-      "name": "thread-bound fire",
+      "name": "thread-bound fire starts fresh",
       "kind": "task",
       "thread_id": "slack:C1:1712345678.000100",
       "tries": 0,
       "content": "{\"prompt\":\"p\"}",
-      "runner": false,
-      "host": false
+      "runner": true,
+      "host": true
     },
     {
       "name": "continuous: true",
@@ -74,13 +74,13 @@
       "host": true
     },
     {
-      "name": "empty thread id is not thread-bound",
+      "name": "thread-bound --continuous fire",
       "kind": "task",
-      "thread_id": "",
+      "thread_id": "slack:C1:1712345678.000100",
       "tries": 0,
-      "content": "{\"prompt\":\"p\"}",
-      "runner": true,
-      "host": true
+      "content": "{\"prompt\":\"p\",\"continuous\":true}",
+      "runner": false,
+      "host": false
     },
     {
       "name": "retry of an interrupted fire (runner only)",

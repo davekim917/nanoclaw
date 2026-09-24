@@ -90,7 +90,7 @@ const sharedCases = JSON.parse(
 describe('shared fresh-fire cases (container/agent-runner/src/fresh-context-cases.json)', () => {
   for (const c of sharedCases.cases.filter((x) => x.host !== null)) {
     it(c.name, () => {
-      expect(taskFiresFresh(c.thread_id, c.content)).toBe(c.host);
+      expect(taskFiresFresh(c.content)).toBe(c.host);
     });
   }
 });
@@ -122,7 +122,7 @@ describe('--continuous', () => {
 
     await run('tasks-update', { id: created.series_id, group: 'ag-1', continuous: false });
     expect(taskContent(sessionId).continuous).toBe(false);
-    expect(taskFiresFresh(null, JSON.stringify(taskContent(sessionId)))).toBe(true);
+    expect(taskFiresFresh(JSON.stringify(taskContent(sessionId)))).toBe(true);
   });
 
   it('can be set at create', async () => {
@@ -135,7 +135,7 @@ describe('--continuous', () => {
     expect(taskContent(created.session_id as string).continuous).toBe(true);
   });
 
-  it('a thread-bound series is continuous with no flag', async () => {
+  it('a thread-bound series starts fresh with no flag', async () => {
     await createMessagingGroup({
       id: 'mg-1',
       channel_type: 'slack',
@@ -153,7 +153,7 @@ describe('--continuous', () => {
       thread_id: 'slack:C1:1712345678.000100',
     });
     expect(JSON.stringify(await run('tasks-get', { id: created.series_id, group: 'ag-1' }))).toContain(
-      '"context":"continuous"',
+      '"context":"fresh"',
     );
   });
 
