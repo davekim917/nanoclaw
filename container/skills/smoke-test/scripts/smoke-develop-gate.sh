@@ -1964,40 +1964,40 @@ if [ "$FREEZE_HANDOFF" = true ]; then
   # unadopted ten hours later. Same shape re-froze `8dfca446` as #1195 after
   # #1188 had already produced a verdict for it.
   #
-  # Only fires with NO handoff open (nothing to hijack) and only for the exact
-  # SHA this poll is about to freeze. This is the `already_completed` dedup
-  # below, sourced from the ledger instead of state — not a second authority.
-  # It cannot launder a verdict past the tamper shield above, which guards
-  # adoption INTO an open handoff: there is none here, adoption never touches
-  # the hold, and a forged GO line lands as completedVerdict=GO with a hold
-  # present, which the reconciler below reports as `unexpected` and alarms on.
+  # Only fires with NO handoff open (nothing to hijack). It cannot launder a
+  # verdict past the tamper shield above, which guards adoption INTO an open
+  # handoff: there is none here, adoption never touches the hold, and a forged
+  # GO line lands as completedVerdict=GO with a hold present, which the
+  # reconciler below reports as `unexpected` and alarms on.
   #
-  # A deliberate re-smoke of the SAME SHA is adopted too, when its line is a
-  # different run that finished LATER than the verdict state holds (#1108).
-  # Live: develop@6a0b65df froze as XZO #2121 (void, BLOCKED, adopted), then
-  # re-smoked as #2126 (HUMAN_DECISION, hold raised). Keyed only on SHA, state
-  # kept the void BLOCKED — which implies no hold, so the reconciler watched
-  # nothing and the live #2126 hold could be deleted unnoticed. Timestamps
-  # that do not parse never adopt (fail closed). The hold is still never
-  # touched: a forged newer line can only make the reconciler louder.
+  # WHICH line: the newest one, by finishedAt, that is a different run and
+  # finished LATER than the verdict state holds -- whatever its targetSha, and
+  # completedSha becomes that line's own target. Keyed on develop's current
+  # head instead (as it was through #1108), a freeze whose target develop had
+  # already moved past was never adopted: XZO #2176 froze fe92bc76, develop
+  # reached ef798620 mid-run, and state kept #2161 while the hold named #2176,
+  # so the reconciler woke gate_hold_tampered "mismatched" (#1134). The
+  # same-SHA re-smoke (#1108: #2121 void BLOCKED, then #2126) and the
+  # never-adopted #1211 line are both just "a newer line". Only-later means
+  # completedAt never moves backwards; a finishedAt that does not parse never
+  # adopts, and neither does a non-empty completedAt that does not (fail
+  # closed). A state with no completedAt yet adopts the newest line.
   if [ -z "$(jq -r '.handoffTargetSha // empty' <<<"$STATE")" ] &&
      [ -s "$HANDOFF_LEDGER" ]; then
-    OOB_ENTRY="$(jq -cR --arg t "$SOURCE_SHA" \
-      'fromjson? | select(type == "object") | select(.targetSha == $t)' \
-      "$HANDOFF_LEDGER" 2>/dev/null | tail -1)"
-    if [ -n "$OOB_ENTRY" ] && jq -e --arg sha "$SOURCE_SHA" --argjson s "$STATE" '
+    OOB_ENTRY="$(jq -cR 'fromjson? | select(type == "object")' "$HANDOFF_LEDGER" 2>/dev/null |
+      jq -cs --argjson s "$STATE" '
         def t: try fromdateiso8601 catch null;
-        ($s.completedSha // "") != $sha or
-        ((.runId | type == "string" and length > 0) and .runId != $s.completedRunId and
-         ((.finishedAt | t) as $new | (($s.completedAt // "") | t) as $old |
-          $new != null and $old != null and $new > $old))
-      ' <<<"$OOB_ENTRY" >/dev/null 2>&1; then
-      STATE="$(jq -c --arg sha "$SOURCE_SHA" \
-        --arg run "$(jq -r '.runId' <<<"$OOB_ENTRY")" \
-        --arg verdict "$(jq -r '.verdict' <<<"$OOB_ENTRY")" \
-        --arg now "$(jq -r '.finishedAt' <<<"$OOB_ENTRY")" \
-        '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict' \
-        <<<"$STATE")"
+        (($s.completedAt // "") as $c | if $c == "" then 0 else ($c | t) end) as $old |
+        if $old == null then empty else
+          [.[] | select((.runId | type == "string" and length > 0) and .runId != $s.completedRunId and
+                        (.targetSha | type == "string" and test("^[0-9a-f]{40}$")))
+               | ((.finishedAt | t) // null) as $f | select($f != null and $f > $old) | . + {_at: $f}]
+          | (max_by(._at) // empty) | del(._at)
+        end' 2>/dev/null)"
+    if [ -n "$OOB_ENTRY" ]; then
+      STATE="$(jq -c --argjson e "$OOB_ENTRY" \
+        '.completedSha=$e.targetSha | .completedAt=$e.finishedAt | .completedRunId=$e.runId |
+         .completedVerdict=$e.verdict' <<<"$STATE")"
     fi
   fi
 fi
