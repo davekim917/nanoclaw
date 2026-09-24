@@ -161,7 +161,14 @@ slide number is added for you.
 <div class="row"> … </div>         <!-- inline row; <span class="tag up">+$0.2M vs plan</span> -->
 ```
 
-Text utilities: `.up .down .flat .warn .accent .muted`. For a line or area
+Text utilities: `.up .down .flat .warn .accent .muted`.
+
+The theme is a starting point, not a constraint. When the user asks for a
+different look (brand colours, a light theme, another typeface), put a
+`<style>` block or inline styles in the fragments. Web fonts load at render
+time, e.g. `<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;800&display=block">`.
+Use `display=block` so the screenshot waits for the font. If the user wants
+the look kept, save it to memory and reuse it on their next deck. For a line or area
 chart, write inline `<svg>` in the fragment (size it to the slide), or render a
 PNG with any tool you have and use an `image` slide.
 
@@ -176,7 +183,7 @@ else, `html` slides are more capable: json-render has no tables or charts.
 
 ## Voice and cost
 
-- Default voice: **Brian** (`nPczCjzI2devNBz1zQrb`, deep, American male).
+- Default voice: **Will** (`bIHbv24MWmeRgasZH58o`, relaxed, American male).
   Set `"voice"` in the spec to change it; list the account's voices with
   `curl -sS https://api.elevenlabs.io/v1/voices`. Keep one voice per deck.
   If the user names a preferred voice, save it to memory and reuse it.
