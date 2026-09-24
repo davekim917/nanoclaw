@@ -205,6 +205,34 @@ class FindingIssue(unittest.TestCase):
         self.assertEqual(len(self.filed()), 1000)
         self.assertIn("1000-result cap", self.c.decisions[-1]["error"])
 
+    def noise(self, n):
+        return [{"number": 1000 + k, "title": "Other finding {}".format(k), "body": "", "state": "open",
+                 "labels": ["smoke-finding"], "html_url": "https://github.test/issues/{}".format(1000 + k)}
+                for k in range(n)]
+
+    def test_a_match_on_the_full_page_wins_even_when_search_cannot_see_it(self):
+        # Newest-first: a just-created duplicate is on the page but not yet in
+        # the search index. The page decides; search is never consulted.
+        fresh = {"number": 5, "title": "Upload preview missing", "body": "", "state": "open",
+                 "labels": ["smoke-finding"], "html_url": "https://github.test/issues/5"}
+        self.gh(labels=["smoke-finding", "severity:p3"], issues=[fresh] + self.noise(499), unindexed=[5])
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        self.assertEqual(self.c.decisions[-1]["duplicateOf"], 5)
+        with open(os.environ["FAKE_LOG"]) as fh:
+            self.assertFalse(any("--search" in line for line in fh))
+
+    def test_a_non_ascii_title_is_searched_as_written(self):
+        run = Path(self.c.args.run_root) / RUN / "controller" / "issues"
+        (run / "CF-1.json").write_text(json.dumps({"title": "Aperçu du téléversement absent", "labels": []}))
+        match = {"number": 5, "title": "Aperçu du téléversement absent", "body": "", "state": "open",
+                 "labels": ["smoke-finding"], "html_url": "https://github.test/issues/5"}
+        self.gh(labels=["smoke-finding", "severity:p3"], issues=self.noise(500) + [match])
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        self.assertEqual(self.c.decisions[-1]["duplicateOf"], 5)
+        with open(os.environ["FAKE_LOG"]) as fh:
+            [argv] = [json.loads(line)["argv"] for line in fh if "--search" in line]
+        self.assertIn('"Aperçu du téléversement absent" in:title', argv)
+
     def test_a_label_listing_that_is_not_a_list_or_is_at_its_cap_is_unknown(self):
         self.gh(labelListRaw='{"message": "Not Found"}')
         self.assertIsNone(self.fx._labels_of("org/xzo"))
