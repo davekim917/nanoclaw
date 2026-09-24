@@ -95,19 +95,23 @@ export function readTaskSettlement(
       state.provider_executing === 1,
       readContinuationPresence(outbound) !== null,
     );
-    const observerSeries =
-      observer && row.recurrence && row.series_id && threadId === taskThreadId(row.series_id) ? row.series_id : null;
+    // A completed fire row never keeps its recurrence: re-arming inserts the next
+    // occurrence and clears the original's recurrence in one transaction
+    // (`armNextTask`, src/modules/mailbox/ops/tasks.ts:344-356). So the
+    // observer's own series is identified by id and task thread, and only a
+    // recurring, inert, future row of that series is exempt.
+    const observerSeries = observer && row.series_id && threadId === taskThreadId(row.series_id) ? row.series_id : null;
     const obligations = (
       inbound
         .prepare(
           `SELECT COUNT(*) AS n FROM messages_in
       WHERE status IN ('pending', 'processing', 'paused') AND NOT COALESCE((
-        ? IS NOT NULL AND kind = 'task' AND series_id = ? AND recurrence = ?
+        ? IS NOT NULL AND kind = 'task' AND series_id = ? AND recurrence IS NOT NULL
         AND status = 'pending' AND trigger = 0 AND datetime(process_after) > datetime('now')), 0)
       AND NOT (? AND status = 'pending' AND process_after IS NOT NULL
         AND datetime(process_after) > datetime('now'))`,
         )
-        .get(observerSeries, observerSeries, row.recurrence, futureInputs ? 1 : 0) as { n: number }
+        .get(observerSeries, observerSeries, futureInputs ? 1 : 0) as { n: number }
     ).n;
     if (!idle || obligations > 0) return result('busy', 'execution-or-input-outstanding');
     // Include future outbound actions: a wait not yet delivered has not become an inbound obligation.
