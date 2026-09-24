@@ -26,3 +26,4 @@
   kill fence defeated by an identical update after respawn (`touchedAt` stamped on every save), cooldown bypassed by
   a newer revision or another session (cooldown keyed per platform), rate-limited interrupted edit lost (retried
   after the cooldown, re-fenced each attempt). Regression tests for each. Corrective budget: 3 of 3 used.
+- **Implementation review round 4** (verification, same transport, head f4a8b2ee): approve, no findings.
