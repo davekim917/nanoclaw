@@ -127,6 +127,44 @@ describe('SQLite runner mailbox canonical serialization', () => {
     ]);
   });
 
+  test('counts conversation traffic from separate inbound and outbound cursors', () => {
+    const { inbound, outbound } = initTestSessionDb();
+    const addIn = inbound.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, trigger, content)
+       VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z', 'pending', 0, 1, '{}')`,
+    );
+    const addOut = outbound.prepare(
+      `INSERT INTO messages_out (id, seq, kind, timestamp, content) VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z', '{}')`,
+    );
+    // Inbound numbering trails outbound: the host counts from inbound.db alone.
+    addIn.run('in-2', 2, 'chat');
+    addOut.run('list', 11, 'task_list');
+    addIn.run('in-4', 4, 'chat-sdk');
+    addIn.run('in-6', 6, 'system');
+    addOut.run('reply', 13, 'chat');
+    const mailbox = new SqliteAgentMailbox();
+    expect(mailbox.maxInboundSeq()).toBe(6);
+    // After the list (outbound 11, inbound 2): in-4 and the reply; not the system row.
+    expect(mailbox.countConversationMessagesAfter(11, 2)).toBe(2);
+  });
+
+  test('reads one inbound message route by id', () => {
+    const { inbound } = initTestSessionDb();
+    inbound
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, trigger, platform_id, channel_type, thread_id, content)
+         VALUES ('in-1', 2, 'chat', '2026-01-01T00:00:00.000Z', 'pending', 0, 1, 'slack:C1', 'slack', 'slack:C1:171.1', '{}')`,
+      )
+      .run();
+    const mailbox = new SqliteAgentMailbox();
+    expect(mailbox.getInboundRouteById('in-1')).toEqual({
+      channelType: 'slack',
+      platformId: 'slack:C1',
+      threadId: 'slack:C1:171.1',
+    });
+    expect(mailbox.getInboundRouteById('missing')).toBeNull();
+  });
+
   test('skips malformed pending inbound rows instead of crashing the runner', () => {
     const { inbound } = initTestSessionDb();
     inbound

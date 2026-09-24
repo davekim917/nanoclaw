@@ -152,6 +152,14 @@ const hooks = vi.hoisted(() => ({
   },
 }));
 
+// An exit the host did not ask for settles the session's task list (a crashed
+// runner must not leave a live-looking list); observed, not run.
+const { settleTaskListOnKill } = vi.hoisted(() => ({ settleTaskListOnKill: vi.fn(async () => undefined) }));
+vi.mock('./task-list-host.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./task-list-host.js')>()),
+  settleTaskListOnKill,
+}));
+
 vi.mock('child_process', async (importOriginal) => {
   const real = await importOriginal<typeof import('child_process')>();
   return {
@@ -802,6 +810,8 @@ describe('claim-first spawn', () => {
     );
     expect(isContainerRunning('sess-early-error')).toBe(false);
     expect(hooks.events).toContain('release:sess-early-error:1');
+    // Not a host stop: the task list is settled as interrupted.
+    await vi.waitFor(() => expect(settleTaskListOnKill).toHaveBeenCalledWith('sess-early-error', 'container-exit'));
   });
 
   it('a stale finish does not release a fresh claim', async () => {

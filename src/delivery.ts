@@ -58,6 +58,14 @@ import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './sess
 import { sessionOutboundStorageStat, type NanoclawMailboxSession } from './modules/mailbox/index.js';
 import type { OutboundMessage } from './modules/mailbox/ops/delivery.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
+import { TASK_LIST_ENABLED } from './config.js';
+import {
+  deferTaskListOnRateLimit,
+  noteHeldTaskListPost,
+  noteTaskListDelivered,
+  supersededTaskListEdits,
+  taskListCooldownMs,
+} from './task-list-host.js';
 import { flagNeedsInput, getTaskByChildSession } from './modules/orchestrator-dispatch/db/tasks.js';
 import { appendRunLog } from './modules/scheduling/run-log.js';
 import { emitDashboardEvent, emitSessionEvent } from './dashboard/api/events.js';
@@ -691,6 +699,32 @@ async function withThreadKeyLock<T>(
  */
 const inflightDeliveries = new Set<string>();
 
+/**
+ * Run `fn` holding this session's delivery slot, waiting (bounded) for a drain
+ * already in flight to finish rather than skipping. For work that must be
+ * ORDERED against the session's deliveries — the live task list's kill-time
+ * edit (src/task-list-host.ts) must land after anything the drain already
+ * sent. Never runs unowned: past the wait it returns `undefined` without
+ * calling `fn`.
+ */
+export async function withSessionDeliverySlot<T>(
+  sessionId: string,
+  fn: () => Promise<T>,
+  waitMs = 30_000,
+): Promise<T | undefined> {
+  const deadline = Date.now() + waitMs;
+  while (inflightDeliveries.has(sessionId)) {
+    if (Date.now() >= deadline) return undefined;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  inflightDeliveries.add(sessionId);
+  try {
+    return await fn();
+  } finally {
+    inflightDeliveries.delete(sessionId);
+  }
+}
+
 export interface ChannelDeliveryAdapter {
   deliver(
     channelType: string,
@@ -703,7 +737,13 @@ export interface ChannelDeliveryAdapter {
      *  Host-internal only — containers never see instance. */
     instance?: string,
   ): Promise<string | undefined>;
-  setTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
+  setTyping?(
+    channelType: string,
+    platformId: string,
+    threadId: string | null,
+    instance?: string,
+    status?: string,
+  ): Promise<void>;
   deleteMessage?(
     channelType: string,
     platformId: string,
@@ -933,8 +973,21 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
 
   if (outstanding.length === 0) return 'clean';
 
-  const undelivered = snapshot.due.filter((m) => !delivered.has(m.id));
-  if (undelivered.length === 0) return 'pending';
+  const due = snapshot.due.filter((m) => !delivered.has(m.id));
+  if (due.length === 0) return 'pending';
+  // A task-list edit that a later queued edit of the same message replaces is
+  // never sent: the list is whole in every edit, so only the newest matters,
+  // and skipping the rest keeps a busy list off the platform's rate limit.
+  const supersededEdits = supersededTaskListEdits(due);
+  const undelivered = due.filter((m) => !supersededEdits.has(m.id));
+  if (supersededEdits.size > 0) {
+    await ackDelivery(agentGroup.id, session.id, (mailbox) => {
+      for (const id of supersededEdits) mailbox.markDelivered(id, null);
+    });
+    if (undelivered.length === 0) {
+      return outstanding.every((id) => delivered.has(id) || supersededEdits.has(id)) ? 'clean' : 'pending';
+    }
+  }
 
   // Bump `tasks.last_progress_at` once per drain if this session is a
   // spawn-task child. Only `spawn_progress` MCP calls update that column
@@ -962,7 +1015,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
   }
 
   let sawError = false;
-  const deliveredNow = new Set<string>();
+  const deliveredNow = new Set<string>(supersededEdits);
 
   /**
    * Terminal drop for one message, reached either from this tick's own
@@ -1007,7 +1060,15 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
     }
   };
 
+  // Initial task-list posts stepped past for a rate limit; an answer that
+  // overtakes them retires them (noteHeldTaskListPost).
+  const heldListPosts = new Set<string>();
   for (const msg of undelivered) {
+    // A list row waits out its platform's rate-limit cooldown; it stays outstanding.
+    if (msg.kind === 'task_list' && taskListCooldownMs(msg.channel_type) > 0) {
+      noteHeldTaskListPost(heldListPosts, msg);
+      continue;
+    }
     // A stored count already at the cap is terminal on its own — the crash
     // window described on the helpers above leaves exactly that row behind.
     // Deciding from it BEFORE the adapter runs is what stops a successor host
@@ -1044,9 +1105,12 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
       // (on admin approval or timeout). Auto-acking here would race
       // ahead of the human and silently unblock a gated command.
       if (!result.deferAck) {
-        await ackDelivery(agentGroup.id, session.id, (mailbox) =>
-          mailbox.markDelivered(msg.id, result.platformMsgId ?? null),
-        );
+        await ackDelivery(agentGroup.id, session.id, (mailbox) => {
+          mailbox.markDelivered(msg.id, result.platformMsgId ?? null);
+          if (msg.kind === 'chat' && !result.recordOnly)
+            for (const id of heldListPosts) mailbox.markDelivered(id, null);
+        });
+        if (msg.kind === 'chat' && !result.recordOnly) heldListPosts.clear();
         deliveredNow.add(msg.id);
         // Mirror the outbound timestamp into the central sessions row so
         // the inbox board can compute attention-state without opening
@@ -1083,10 +1147,17 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
       // back. Skip the pause for internal traffic (system actions,
       // agent-to-agent routing) — the user doesn't see those and
       // shouldn't get a gap in their typing indicator for them.
-      if (!result.recordOnly && msg.kind !== 'system' && msg.channel_type !== 'agent') {
+      // A task-list post or edit is not a reply: the agent is still working.
+      if (!result.recordOnly && msg.kind !== 'system' && msg.kind !== 'task_list' && msg.channel_type !== 'agent') {
         pauseTypingRefreshAfterDelivery(session.id);
       }
     } catch (err) {
+      // A rate-limited list row is not failing, it is early: cool it down
+      // uncharged and let the answers behind it through.
+      if (msg.kind === 'task_list' && deferTaskListOnRateLimit(msg.channel_type, err)) {
+        noteHeldTaskListPost(heldListPosts, msg);
+        continue;
+      }
       sawError = true;
       const attempts = await recordAttemptRow(msg.id, session.id, err);
       if (attempts !== null && attempts >= MAX_DELIVERY_ATTEMPTS) {
@@ -1104,6 +1175,13 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
         // newer status/chat overtake this row; if the failed row later
         // retries, it can overwrite newer progress or appear after the final
         // answer. The next poll resumes from this oldest undelivered row.
+        // Except a task-list row: progress must never hold an answer back,
+        // and a newer edit of the list supersedes this one (above). A first
+        // post an answer overtakes is retired, not posted below the answer.
+        if (msg.kind === 'task_list') {
+          noteHeldTaskListPost(heldListPosts, msg);
+          continue;
+        }
         break;
       }
     }
@@ -1273,6 +1351,16 @@ async function deliverMessage(
   }
 
   const content = JSON.parse(msg.content);
+
+  // Live task list (docs/specs/slack-task-list/plan.md). The host switch is the
+  // gate that reaches adopted containers too: off, their list rows go nowhere
+  // and the 💭 status posts below come back. A row from a container the host
+  // already marked interrupted must not revive the list.
+  // A spawn-task child's thread is a work log the dashboard shows; its list
+  // stays internal like its 💭 did.
+  if (msg.kind === 'task_list' && (!TASK_LIST_ENABLED || (await isSpawnChildSession(session.id)))) {
+    return { recordOnly: true };
+  }
 
   let externalOutcomeChannels: string[] = [];
   const wikiGroup = await getAgentGroup(session.agent_group_id);
@@ -1517,6 +1605,14 @@ async function deliverMessage(
   // spawn thread. Edit-in-place and the on-chat orphan delete are bypassed
   // so progress survives the final answer.
   if (msg.kind === 'status') {
+    // The task list and the platform's status line replace the 💭 stream. The
+    // row stays in outbound.db (the dashboard's session view still reads it);
+    // it just never posts. An agent-shared session (no messaging group, not a
+    // task session — session-manager.ts:371) has no conversation of its own
+    // to show a list in, and the runner refuses the tool there, so it keeps
+    // its 💭 progress.
+    const agentShared = session.messaging_group_id === null && !isTaskThread(session.thread_id);
+    if (TASK_LIST_ENABLED && !agentShared) return { recordOnly: true };
     const typedProgress = content.reporting?.version === 1 && content.reporting?.purpose === 'progress';
     if (!msg.channel_type || !msg.platform_id) {
       log.warn('Status message missing routing fields, dropping', { id: msg.id });
@@ -1862,8 +1958,14 @@ async function deliverMessage(
   // already target a thread (thread_id null) and the turn has an inbound
   // anchor (in_reply_to set). The first message of the turn posts at root
   // and is recorded below; later messages of the same turn reply under it.
+  // A task list is progress, not the turn's reply: it never becomes the root
+  // the answer threads under, and never threads under an earlier message.
   const turnAnchorEligible =
-    !isRoutineOutcome && !taskAnchorEligible && baseThreadId === null && msg.in_reply_to != null;
+    !isRoutineOutcome &&
+    !taskAnchorEligible &&
+    baseThreadId === null &&
+    msg.in_reply_to != null &&
+    msg.kind !== 'task_list';
 
   let effectiveThreadId = baseThreadId;
   let usedAnchor = false;
@@ -2108,6 +2210,10 @@ async function deliverMessage(
     platformMsgId,
     fileCount: files?.length,
   });
+
+  // The list's current item becomes the platform's "is working…" status text.
+  if (msg.kind === 'task_list')
+    noteTaskListDelivered(session.id, JSON.parse(scrubbedContent) as Record<string, unknown>);
 
   // A real chat message supersedes any in-flight progress status. Delete
   // the orphan thinking-block message so it doesn't linger in the thread,

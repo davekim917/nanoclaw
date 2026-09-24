@@ -235,3 +235,104 @@ export function hasRestartNoteSince(db: Database.Database, since: string): boole
       .get(since) !== undefined
   );
 }
+
+/**
+ * What the host does with a live task list when its container is killed
+ * mid-work (src/task-list-host.ts). Only the list's WORDING comes from the
+ * container-written record (`session_state.task_list`); where to edit comes
+ * from host-owned evidence — the post row the host delivered and the platform
+ * id it recorded in `delivered` — so a forged record cannot point the host at
+ * a message or destination the list never had.
+ */
+export interface TaskListSettlement {
+  /**
+   * The dead container's undelivered task_list rows, written at or before the
+   * kill. Recorded delivered-unsent so none can land over the interrupted form
+   * (or, for a first post that never went out, show a list nobody will finish).
+   */
+  staleRowIds: string[];
+  /** The interrupted edit, when the list's post is on screen. */
+  edit: {
+    channelType: string;
+    platformId: string;
+    threadId: string | null;
+    platformMessageId: string;
+    interruptedText: string;
+    interruptedSubtext: string;
+  } | null;
+}
+
+/**
+ * Null when there is nothing to settle: no list, a finished or stale one (its
+ * queued rows carry its real final state — let them deliver), or one touched
+ * after the kill began, which belongs to a newer container.
+ */
+export function getTaskListSettlement(
+  inbound: Database.Database,
+  outbound: Database.Database,
+  killedAt: string,
+): TaskListSettlement | null {
+  let record: Record<string, unknown>;
+  try {
+    const row = outbound.prepare("SELECT value FROM session_state WHERE key = 'task_list'").get() as
+      | { value: string }
+      | undefined;
+    if (!row) return null;
+    record = JSON.parse(row.value) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (record.version !== 1 || record.finished === true || record.stale === true) return null;
+  // `touchedAt` is stamped on every save (an unchanged or still-pending
+  // update keeps `updatedAt`, the time on screen); a record from a runner
+  // snapshot older than that field falls back to `updatedAt`.
+  const touchedAt = typeof record.touchedAt === 'string' ? record.touchedAt : record.updatedAt;
+  if (typeof touchedAt !== 'string' || !(Date.parse(touchedAt) <= Date.parse(killedAt))) return null;
+  const delivered = new Set(
+    (inbound.prepare('SELECT message_out_id FROM delivered').all() as Array<{ message_out_id: string }>).map(
+      (r) => r.message_out_id,
+    ),
+  );
+  // julianday keeps the milliseconds datetime() would truncate: a row written
+  // in the kill's own second, after it, is a newer container's.
+  const staleRowIds = (
+    outbound
+      .prepare("SELECT id FROM messages_out WHERE kind = 'task_list' AND julianday(timestamp) <= julianday(?)")
+      .all(killedAt) as Array<{ id: string }>
+  )
+    .map((r) => r.id)
+    .filter((id) => !delivered.has(id));
+
+  // The list's own post when it is on screen; while a replacement post is
+  // still undelivered (and about to be dropped as stale above), the post it
+  // was replacing is the one on screen — it gets the interrupted form.
+  let edit: TaskListSettlement['edit'] = null;
+  const supersedes = record.supersedes as { outboundId?: unknown } | null | undefined;
+  const candidates = [record.postOutboundId, supersedes?.outboundId].filter(
+    (id): id is string => typeof id === 'string',
+  );
+  if (typeof record.interruptedText === 'string' && typeof record.interruptedSubtext === 'string') {
+    for (const outboundId of candidates) {
+      const post = outbound
+        .prepare("SELECT channel_type, platform_id, thread_id FROM messages_out WHERE id = ? AND kind = 'task_list'")
+        .get(outboundId) as
+        | { channel_type: string | null; platform_id: string | null; thread_id: string | null }
+        | undefined;
+      const receipt = inbound
+        .prepare("SELECT platform_message_id FROM delivered WHERE message_out_id = ? AND status = 'delivered'")
+        .get(outboundId) as { platform_message_id: string | null } | undefined;
+      if (post?.channel_type && post.platform_id && receipt?.platform_message_id) {
+        edit = {
+          channelType: post.channel_type,
+          platformId: post.platform_id,
+          threadId: post.thread_id,
+          platformMessageId: receipt.platform_message_id,
+          interruptedText: record.interruptedText,
+          interruptedSubtext: record.interruptedSubtext,
+        };
+        break;
+      }
+    }
+  }
+  return { staleRowIds, edit };
+}

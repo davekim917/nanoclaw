@@ -120,9 +120,10 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
       platformId: string,
       threadId: string | null,
       instance?: string,
+      status?: string,
     ): Promise<void> {
       const adapter = getChannelAdapterExact(instance ?? channelType);
-      await adapter?.setTyping?.(platformId, threadId);
+      await adapter?.setTyping?.(platformId, threadId, status);
     },
     // Support-thread + delivery-morph surfaces. Exact-keyed like deliver/typing
     // so a per-issue thread or a status-message deletion never lands on a

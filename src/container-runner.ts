@@ -34,6 +34,7 @@ import {
   MAX_CONCURRENT_CONTAINERS,
   ONECLI_API_KEY,
   ONECLI_URL,
+  TASK_LIST_ENABLED,
   TASK_SCRIPT_TIMEOUT_MS,
   WORKGROUP_SHARED_FS,
 } from './config.js';
@@ -2036,6 +2037,9 @@ async function spawnContainer(
 
       child.on('close', (code) => {
         finalizeContainer();
+        if (!hostStoppedContainers.delete(containerName) && code !== 0) {
+          void import('./task-list-host.js').then((m) => m.settleTaskListOnKill(session.id, 'container-exit'));
+        }
         // code null = killed by signal (normal shutdown path), not a boot failure.
         if (code === 137) {
           log.warn('Container exited 137 — likely OOM kill or forced SIGKILL', {
@@ -2243,7 +2247,10 @@ export function captureContainerStderr(
  */
 function clearStatusOnKill(sessionId: string, reason: string): void {
   void import('./delivery.js')
-    .then((m) => m.clearSessionStatusOnKill(sessionId))
+    .then(async (m) => {
+      const { settleTaskListOnKill } = await import('./task-list-host.js');
+      await Promise.all([m.clearSessionStatusOnKill(sessionId), settleTaskListOnKill(sessionId, reason)]);
+    })
     .catch((err) => {
       log.warn('Failed to clear status on container kill — leaving as-is', {
         sessionId,
@@ -2252,6 +2259,13 @@ function clearStatusOnKill(sessionId: string, reason: string): void {
       });
     });
 }
+
+/**
+ * Containers the host itself is stopping (every stop path runs
+ * clearStatusOnKill, which settles the task list). Any other non-zero exit —
+ * OOM, a runner crash — settles it from the close handler instead.
+ */
+const hostStoppedContainers = new Set<string>();
 
 /** Stop a RUNNING container, attaching every exit callback before the stop. */
 function stopRunningContainer(sessionId: string, reason: string, onExit: ContainerExitCallback[]): void {
@@ -2265,6 +2279,7 @@ function stopRunningContainer(sessionId: string, reason: string, onExit: Contain
     });
   }
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName, adopted: entry.adopted });
+  hostStoppedContainers.add(entry.containerName);
   clearStatusOnKill(sessionId, reason);
   try {
     stopContainer(entry.containerName);
@@ -2572,6 +2587,7 @@ function stopPendingSurvivor(sessionId: string, reason: string, onExit: Containe
     return;
   }
   log.info('Killing container', { sessionId, reason, containerName, pending: true });
+  hostStoppedContainers.add(containerName);
   clearStatusOnKill(sessionId, reason);
   try {
     stopContainer(containerName);
@@ -3703,6 +3719,7 @@ export async function stopAllContainers(gracePeriodMs: number = 10_000): Promise
       }
       channelOnClose(entry.channel, () => resolve());
     });
+    hostStoppedContainers.add(entry.containerName);
     try {
       stopContainer(entry.containerName);
     } catch (err) {
@@ -6596,6 +6613,9 @@ async function buildContainerArgs(
 
   // Spawn-only capability: old containers retain their existing explicit-human reply path.
   if (effectiveOutcomeReporting(containerConfig)) args.push('-e', 'NANOCLAW_OUTCOME_REPORTING=1');
+  // Spawn-only too: an adopted container keeps the tool list it started with; the
+  // host delivery gate (TASK_LIST_ENABLED) is what reaches it.
+  if (TASK_LIST_ENABLED) args.push('-e', 'NANOCLAW_TASK_LIST=1');
 
   // Per-channel default tone profile — ports v1's "always-on tone" feature.
   // Precedence: per-channel wiring (messaging_group_agents.default_tone) →

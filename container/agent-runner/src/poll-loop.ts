@@ -105,6 +105,7 @@ import { autoCommitDirtyWorktrees, type AutoSaveResult } from './worktree-autosa
 import { buildSessionRecap, wrapRecap } from './session-recap.js';
 import { ensureFreshContextBootstrap } from './memory/bootstrap.js';
 import { isFreshContextTaskBatch, sessionHasOpenWork, startsFreshFire } from './fresh-context-task.js';
+import { loadTaskListState, markTaskListStale, taskListEnabled, taskListReminder } from './task-list.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -667,6 +668,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         continuation = undefined;
         resetProviderContext(config.providerName);
         freshContextBootstrapRequired = true;
+        if (taskListEnabled()) markTaskListStale(getAgentMailbox().operations);
         await writeMessageOut({
           id: generateId(),
           kind: 'chat',
@@ -816,7 +818,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       freshContextBootstrapRequired = true;
     }
     const formattedPrompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
-    const prompt = freshContextBootstrapRequired ? ensureFreshContextBootstrap(formattedPrompt) : formattedPrompt;
+    // A context reset that is not /clear (rotation, recovery) keeps the work
+    // going, so the fresh context gets the unfinished task list back.
+    const listReminder =
+      freshContextBootstrapRequired && taskListEnabled()
+        ? taskListReminder(loadTaskListState(getAgentMailbox().operations))
+        : null;
+    const prompt = freshContextBootstrapRequired
+      ? ensureFreshContextBootstrap(listReminder ? `${listReminder}\n\n${formattedPrompt}` : formattedPrompt)
+      : formattedPrompt;
     freshContextBootstrapRequired = false;
 
     log(

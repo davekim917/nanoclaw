@@ -20,9 +20,12 @@ vi.mock('./container-runner.js', async (importOriginal) => ({
   buildAgentGroupImage: vi.fn().mockResolvedValue(undefined),
 }));
 
+// The 💭 status path below is the live task list's off-switch fallback
+// (NANOCLAW_TASK_LIST=0), so this file pins the switch off to keep covering it;
+// the task-list path has its own file, task-list-delivery.test.ts.
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
-  return { ...actual, DATA_DIR: TEST_DIR, GROUPS_DIR: `${TEST_DIR}/groups` };
+  return { ...actual, DATA_DIR: TEST_DIR, GROUPS_DIR: `${TEST_DIR}/groups`, TASK_LIST_ENABLED: false };
 });
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-delivery') }));

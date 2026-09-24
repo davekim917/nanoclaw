@@ -1,6 +1,7 @@
 import {
   closeSessionDb,
   getInboundDb,
+  getOutboundDb,
   sqliteClearContainerToolInFlight,
   sqliteClearStaleProcessingAcks,
   sqliteSetContainerToolInFlight,
@@ -163,6 +164,27 @@ export class SqliteAgentMailbox implements AgentMailbox {
         threadId: row.thread_id,
       })
     );
+  }
+
+  countConversationMessagesAfter(outboundSeq: number, inboundSeq: number): number {
+    const inbound = getInboundDb()
+      .prepare("SELECT COUNT(*) AS n FROM messages_in WHERE seq > ? AND kind IN ('chat', 'chat-sdk')")
+      .get(inboundSeq) as { n: number };
+    const outbound = getOutboundDb()
+      .prepare("SELECT COUNT(*) AS n FROM messages_out WHERE seq > ? AND kind = 'chat'")
+      .get(outboundSeq) as { n: number };
+    return inbound.n + outbound.n;
+  }
+
+  getInboundRouteById(id: string) {
+    const row = getInboundDb()
+      .prepare('SELECT channel_type, platform_id, thread_id FROM messages_in WHERE id = ?')
+      .get(id) as { channel_type: string | null; platform_id: string | null; thread_id: string | null } | undefined;
+    return row ? { channelType: row.channel_type, platformId: row.platform_id, threadId: row.thread_id } : null;
+  }
+
+  maxInboundSeq(): number {
+    return (getInboundDb().prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_in').get() as { m: number }).m;
   }
 
   getLatestInboundRoute(channelType: string, platformId: string) {

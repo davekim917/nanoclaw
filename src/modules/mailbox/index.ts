@@ -86,6 +86,8 @@ import {
   getInboundRoutingAnchor,
   getInboundRequestIdentity,
   getRecoverableLifecycleStatus,
+  getTaskListSettlement,
+  type TaskListSettlement,
   getLatestRoutedTaskRow,
   getLatestTaskContent,
   getRecentInboundChatSenders,
@@ -446,6 +448,7 @@ export interface NanoclawMailboxSession extends MailboxSession {
   getInboundRoutingAnchor(messageId: string): InboundRoutingAnchor | null;
   getInboundRequestIdentity(sequence: number): InboundRequestIdentity | null;
   getRecoverableLifecycleStatus(outboundId?: string): RecoverableLifecycleStatus | null;
+  getTaskListSettlement(killedAt: string): TaskListSettlement | null;
 
   /**
    * Does this session have a `outbound.db` yet?
@@ -1235,6 +1238,8 @@ function forkOps(
     getInboundRequestIdentity: (sequence) => getInboundRequestIdentity(inbound, sequence),
     getRecoverableLifecycleStatus: (outboundId) =>
       readOutbound(null, (outbound) => getRecoverableLifecycleStatus(inbound, outbound, outboundId)),
+    getTaskListSettlement: (killedAt) =>
+      readOutbound(null, (outbound) => getTaskListSettlement(inbound, outbound, killedAt)),
 
     getNextFutureProcessAfter: () => getNextFutureProcessAfter(inbound),
     expireStalePending: (maxAgeMs) => expireStalePending(inbound, maxAgeMs),

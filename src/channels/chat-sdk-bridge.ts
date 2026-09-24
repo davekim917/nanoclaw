@@ -737,9 +737,15 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   // so break the mention regexes (which require `@` immediately followed by
   // a word/letter char) with a zero-width space — invisible on delivery,
   // renders identically to the reader, but no rewriter matches it.
-  const neutralizeMentions = (t: string): string => t.replace(/@(?=[\w\p{L}])/gu, '@\u200b');
+  // Platform-native tokens get the same break: Slack's `<!here>`,
+  // `<!channel>`, `<!subteam^…>` and Discord's `<@&role>` notify without an
+  // `@` followed by a letter, and the markdown transform passes them through.
+  const neutralizeMentions = (t: string): string =>
+    t.replace(/@(?=[\w\p{L}])/gu, '@\u200b').replace(/<(?=[!@])/g, '<\u200b');
+  // Status and task-list text is progress, never a ping: an @ in it would
+  // notify on a message whose edits are otherwise silent.
   const transformStatusOrText = (t: string, kind: string): string =>
-    transformText(kind === 'status' ? neutralizeMentions(t) : t);
+    transformText(kind === 'status' || kind === 'task_list' ? neutralizeMentions(t) : t);
   // Native-syntax transforms (e.g. Telegram mrkdwn) round-trip as `raw` so
   // the adapter doesn't re-parse them as CommonMark and mangle links.
   // Markdown-preserving transforms keep `markdown` delivery so adapter
@@ -1387,7 +1393,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // unaffected. Budget the footer before truncating, as the post path
         // does, so Discord's in-text rendering cannot push past the limit.
         const editSubtext =
-          message.kind === 'chat' &&
+          (message.kind === 'chat' || message.kind === 'task_list') &&
           typeof content.subtext === 'string' &&
           content.subtext.trim() &&
           config.renderSubtext
@@ -1398,8 +1404,23 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           : undefined;
         const fitted = limit && editText.length > limit ? splitForLimit(editText, limit)[0].trimEnd() + '…' : editText;
         const editBody = editSubtext ? config.renderSubtext!(wrapBody(fitted), editSubtext) : wrapBody(fitted);
-        await adapter.editMessage(tid, content.messageId as string, editBody);
-        return;
+        // Edits get 429 handling like posts: a live task list edits one message
+        // repeatedly, and a dropped edit leaves it showing stale progress. A
+        // task-list edit does not wait here at all — it would hold the
+        // session's queue; the host cools the row down and lets answers
+        // through instead (task-list-host.ts).
+        const listEdit = message.kind === 'task_list';
+        for (let attempt = 1; ; attempt++) {
+          try {
+            await adapter.editMessage(tid, content.messageId as string, editBody);
+            return;
+          } catch (err) {
+            const retryAfterMs = parseRetryAfterMs(err);
+            if (retryAfterMs === null || listEdit || attempt > MAX_RATE_LIMIT_RETRIES) throw err;
+            log.info('chat-sdk-bridge: edit rate-limited, retrying', { attempt, retryAfterMs });
+            await sleep(retryAfterMs + RATE_LIMIT_BUFFER_MS);
+          }
+        }
       }
 
       if (content.operation === 'reaction' && content.messageId && content.emoji) {
@@ -1559,7 +1580,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // the host deletes when the real reply lands, so a footer on it is
         // noise that outlives nothing.
         const subtext =
-          message.kind === 'chat' &&
+          (message.kind === 'chat' || message.kind === 'task_list') &&
           typeof content.subtext === 'string' &&
           content.subtext.trim() &&
           config.renderSubtext
@@ -1576,7 +1597,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const textLimit = config.maxTextLength ? Math.max(1, config.maxTextLength - subtextBudget) : undefined;
         const chunks: string[] =
           textLimit && text.length > textLimit
-            ? message.kind === 'status'
+            ? message.kind === 'status' || message.kind === 'task_list'
               ? [splitForLimit(text, textLimit)[0].trimEnd() + '…']
               : splitForLimit(text, textLimit)
             : [text];
@@ -1609,7 +1630,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               // mid-stream — the user sees only the first chunk(s).
               const retryAfterMs = parseRetryAfterMs(err);
               attempt++;
-              if (retryAfterMs !== null && attempt <= MAX_RATE_LIMIT_RETRIES) {
+              // A task-list post never waits here: the host cools it down
+              // and lets the session's answers through (task-list-host.ts).
+              if (retryAfterMs !== null && attempt <= MAX_RATE_LIMIT_RETRIES && message.kind !== 'task_list') {
                 log.info('chat-sdk-bridge: chunk rate-limited, retrying', {
                   chunkIndex: i,
                   totalChunks: chunks.length,
@@ -1665,9 +1688,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
     },
 
-    async setTyping(platformId: string, threadId: string | null) {
+    async setTyping(platformId: string, threadId: string | null, status?: string) {
       const tid = threadId ?? platformId;
-      await adapter.startTyping(tid);
+      await adapter.startTyping(tid, status);
     },
 
     async deleteMessage(platformId: string, threadId: string | null, messageId: string) {

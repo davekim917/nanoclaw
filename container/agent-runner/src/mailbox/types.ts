@@ -53,6 +53,18 @@ export interface MailboxOperations {
   getMessageIdBySeq(sequence: number): string | null;
   getRoutingBySeq(sequence: number): SessionRouting | null;
   getLatestInboundRoute(channelType: string, platformId: string): { threadId: string | null; inReplyTo: string } | null;
+  /**
+   * Human or agent chat messages after a point in each mailbox (task-list
+   * repost check). Separate cursors: the host numbers inbound rows from
+   * inbound.db alone, so one sequence cannot order both directions.
+   */
+  countConversationMessagesAfter(outboundSeq: number, inboundSeq: number): number;
+  /** Highest inbound sequence number so far (0 when empty). */
+  maxInboundSeq(): number;
+  /** Where one inbound message came from. */
+  getInboundRouteById(
+    id: string,
+  ): { channelType: string | null; platformId: string | null; threadId: string | null } | null;
   getUndeliveredMessages(): OutboundMessage[];
   getState(key: string): StateValue | undefined;
   setState(key: string, value: string): void;

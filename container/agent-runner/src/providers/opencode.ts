@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { taskListEnabled } from '../task-list.js';
 import { spawn, type ChildProcess } from 'child_process';
 import { pathToFileURL } from 'url';
 
@@ -944,7 +945,9 @@ export function buildOpenCodeConfig(
     ...(model ? { model } : {}),
     ...(smallModel ? { small_model: smallModel } : {}),
     enabled_providers: enabledProviders,
-    permission: OPENCODE_PERMISSIONS,
+    // With the live task list on, `update_task_list` is the one checklist:
+    // OpenCode's own todowrite would be a second, invisible one.
+    permission: taskListEnabled() ? { ...OPENCODE_PERMISSIONS, todowrite: 'deny' } : OPENCODE_PERMISSIONS,
     autoupdate: false,
     snapshot: false,
     provider: providerOptions,

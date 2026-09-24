@@ -25,6 +25,7 @@ import { gateCommand, preFanoutGate, getInterceptHandler } from './command-gate.
 import type { InterceptContext } from './command-gate.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDeliveryAdapter } from './delivery.js';
+import { ackInboundReceipt, isHumanChatSdkContent } from './task-list-host.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
 import {
   channelNameProvenance,
@@ -1594,6 +1595,12 @@ async function deliverToAgent(
   // AFTER the backfill read above, which needs the pre-wake state, and after
   // the write, so a duplicate or a failed insert never claims engagement.
   if (wake) await markSessionEngaged(session.id);
+  // The 👀 receipt, only now that the message is durable (a failed or
+  // duplicate insert never acknowledges), and only for a live human message
+  // — a replayed history message was already seen.
+  if (wake && !event.recovered && isHumanChatSdkContent(event.message.kind, event.message.content)) {
+    ackInboundReceipt(event.channelType, event.platformId, effectiveThreadId, event.message.id, mg.instance);
+  }
 
   log.info('Message routed', {
     sessionId: session.id,
