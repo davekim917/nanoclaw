@@ -643,6 +643,50 @@ gate_finished_elsewhere "$RUN"
 step_ok 2026-09-18T10:30:00Z
 jr '[.[] | select(.slot | startswith("alarm:foreign-finish"))] | length > 0' | grep -qx true \
   || fail "regained: another actor finishing a run we hold is a foreign finish: $(jr '[.[] | .slot] | unique')"
+# g) every loss is said: lost, held again, lost again raises a second
+#    no-authority alarm, so the holder's quiet finish never follows a silent loss.
+new_case lost-twice
+claim; wake_json
+step_ok 2026-09-18T10:00:00Z --poll-json "$C/wake.json"
+for at in 10:10 10:30; do
+  jq -c '.activeLeaseOwner="owner-coordinator" | .activeClaimant=null' "$C/state/pr-$PR-state.json" >"$C/state/pr.tmp"
+  mv "$C/state/pr.tmp" "$C/state/pr-$PR-state.json"
+  step_ok "2026-09-18T$at:00Z"
+  claim
+  step_ok "2026-09-18T${at%0}5:00Z"
+done
+jq -c '.activeLeaseOwner="owner-coordinator" | .activeClaimant=null' "$C/state/pr-$PR-state.json" >"$C/state/pr.tmp"
+mv "$C/state/pr.tmp" "$C/state/pr-$PR-state.json"
+step_ok 2026-09-18T10:50:00Z
+step_ok 2026-09-18T10:55:00Z
+[ "$(jr '[.[] | select(.slot | startswith("alarm:no-authority")) | .slot] | unique | length')" = 3 ] \
+  || fail "lost-twice: each of three losses alarms once: $(jr '[.[] | .slot] | unique')"
+gate_finished_elsewhere "$RUN"
+step_ok 2026-09-18T11:00:00Z
+jr '[.[] | select(.slot | startswith("alarm:foreign-finish"))] | length == 0' | grep -qx true \
+  || fail "lost-twice: the holder's finish is quiet once the last loss was alarmed"
+# h) a post-finish write an earlier controller already journaled for such a
+#    run (XZO #2176 had a freeze-close planned) is abandoned with its reason,
+#    not left open -- open, it kept every later fire revisiting the run.
+for seeded in intent failed; do
+  new_case "inherited-close-$seeded"
+  claim 2026-09-18T11:30:00Z ""; wake_json
+  step_ok 2026-09-18T10:00:00Z --poll-json "$C/wake.json"
+  jq -cn --arg run "$RUN" --arg k "$(key "$RUN" gh freeze-close)" --arg st "$seeded" \
+    '{v:1,at:"2026-09-18T10:05:00Z",fire:"seed",runId:$run,kind:"gh",slot:"freeze-close",key:$k,state:$st,attempt:1,
+      mode:"live",detail:{planned:true}}' >>"$C/out/journal.ndjson"
+  gate_finished_elsewhere "$RUN"
+  step_ok 2026-09-18T10:10:00Z
+  jr '[.[] | select(.slot=="freeze-close")] | last | .state == "abandoned" and .detail.reason == "run finished by its holder"' \
+    | grep -qx true || fail "$seeded: the inherited freeze-close is abandoned: $(jr '[.[] | select(.slot=="freeze-close")]')"
+  [ "$(jq -s '[.[] | select(.tool=="gh" or .tool=="gate" or .tool=="ncl")] | length' "$FAKE_LOG")" = 0 ] \
+    || fail "$seeded: the inherited freeze-close is never run: $(cat "$FAKE_LOG")"
+  # The alarm lane still waits on its receipt; the run itself is not revisited.
+  RUNQ='[.[] | select(.phase != "alarm")] | length'
+  N="$(dq "$RUNQ")"
+  step_ok 2026-09-18T10:20:00Z
+  [ "$(dq "$RUNQ")" = "$N" ] || fail "$seeded: the next fire takes the done fast path: $(dq '.[-3:]')"
+done
 # c) the gate fake mirrors claimant_guard: a legacy caller cannot finish a
 #    controller run (the real gate is tested in smoke-pr-gate.test.sh).
 new_case legacy-caller

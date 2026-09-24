@@ -1315,7 +1315,7 @@ class EffectLayer:
         the title (via=dedup). In a repo without `smoke-finding` that match can
         be a human's issue, so the PR's run record says so rather than the
         journal alone. pre_finish steps every issue obligation before the
-        pr-comment in the same fire (:3590-3594); one still unsettled then is not
+        pr-comment in the same fire (:3597-3601); one still unsettled then is not
         listed here, and its match stays on its own `gh` decision row."""
         lines = []
         for ob in self.ctl.obligations().values():
@@ -3000,7 +3000,7 @@ class Controller:
     def _authority(self, run_id, run_ob, claim):
         """Live: may this controller act on the run? Its journaled token must
         be the one the gate holds. A token that changed without our own wake
-        means someone else holds the slot: never act, alarm once. The gate
+        means someone else holds the slot: never act, alarm once per loss. The gate
         must ALSO record the claim as the controller's (activeClaimant, set by
         a `poll` run with SMOKE_GATE_CLAIMANT=controller; smoke-pr-gate.sh
         claimant_guard): a legacy-claimed run is never ours even when its
@@ -3015,11 +3015,18 @@ class Controller:
                 # present, so post_finish does not treat our run as another's.
                 self.record(run_id, "run", "claim", run_ob["state"], 1, {"noAuthority": False})
             return True
-        self.ensure_alarm(run_id, "controller_no_authority", "no-authority:{}".format(run_id[-40:]),
+        # Each loss is its own alarm: a run held again and then lost again
+        # says so again, so post_finish's quiet close never follows a silent
+        # loss. The first loss keeps the pre-counter fingerprint.
+        seen = (run_ob or {}).get("detail", {})
+        losses = max(1, seen.get("authorityLosses", 0) + (0 if seen.get("noAuthority") else 1))
+        self.ensure_alarm(run_id, "controller_no_authority",
+                          "no-authority:{}".format(run_id[-40:]) + (":{}".format(losses) if losses > 1 else ""),
                           {"journaled": bool(token), "gateHolder": bool(holder),
                            "tokenMatch": bool(token and token == holder), "claimant": claim.get("claimant")})
-        if not (run_ob or {}).get("detail", {}).get("noAuthority"):
-            self.record(run_id, "run", "claim", run_ob["state"] if run_ob else "enqueued", 1, {"noAuthority": True})
+        if not seen.get("noAuthority"):
+            self.record(run_id, "run", "claim", run_ob["state"] if run_ob else "enqueued", 1,
+                        {"noAuthority": True, "authorityLosses": losses})
         self.decide(run_id, None, "escalate", "coordination_model", "controller_no_authority")
         return False
 
@@ -3402,8 +3409,8 @@ class Controller:
                 # THE OWNER IS WOKEN HERE, not only once the barrier passes.
                 # By this point every OTHER party's contribution the synthesis
                 # barrier checks has already been gated above: the lanes
-                # barrier is ready (:3369), coordinator/preliminary.md exists
-                # (:3386) and challenger/disposition.md exists (:3392). What
+                # barrier is ready (:3376), coordinator/preliminary.md exists
+                # (:3393) and challenger/disposition.md exists (:3399). What
                 # the synthesis barrier can still report is therefore the
                 # retained owner's -- `invalid[]` content it authored
                 # (journeys/scope-dispositions.json, or
@@ -3415,7 +3422,7 @@ class Controller:
                 # alone (smoke-controller-live.sh:168-175), so nobody was told;
                 # and _maybe_synthesis_overdue_blocked needs the very
                 # owner:synthesis obligation this branch declined to create
-                # (:3427-3429), so the terminal BLOCKED safety net could not
+                # (:3434-3436), so the terminal BLOCKED safety net could not
                 # fire either. This is the same blind spot as the lanes barrier
                 # (XZO #2047), on the sibling path.
                 timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)
@@ -3734,7 +3741,15 @@ class Controller:
             # Finished by the run's holder, which was never this controller
             # (_authority alarmed that once already): no foreign-finish alarm,
             # and none of the post-finish writes -- a freeze-close here would
-            # be this controller acting on a run it does not hold.
+            # be this controller acting on a run it does not hold. One an
+            # earlier controller already journaled (a planned or failed
+            # freeze-close) is abandoned with the reason on record: left open,
+            # _post_finish_pending would keep step_run off its done fast path.
+            for ob in obs.values():
+                if ob["runId"] == run_id and ob["slot"] in POST_FINISH_SLOTS \
+                        and ob["state"] not in ("done", "delivered", "abandoned", "failed_terminal"):
+                    self.record(run_id, ob["kind"], ob["slot"], "abandoned", ob["attempt"] or None,
+                                {"reason": "run finished by its holder"})
             if obs[run_key]["state"] not in ("done", "abandoned"):
                 self.record(run_id, "run", "claim", "done", 1, {"verdict": verdict, "finishedBy": "holder"})
             self.decide(run_id, "finished", "log", "mechanical", "run finished by its holder", verdict=verdict,

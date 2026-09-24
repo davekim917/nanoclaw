@@ -1699,12 +1699,12 @@ do its job without. Both used to stay in the controller's own journal.
   or a visual-candidate disposition it owes under
   `SMOKE_VISUAL_DISPOSITIONS=1` — is the retained owner's, and the owner is the
   only judgment party the controller can invoke. That branch used to return
-  without a wake (it now wakes at `smoke-campaign-controller.py:3424-3426`),
+  without a wake (it now wakes at `smoke-campaign-controller.py:3431-3433`),
   which left the phase with no exit at all: the wrapper wakes on `ownerWake`
   alone (`smoke-controller-live.sh:168-175`), so nobody was told, and the
   overdue-BLOCKED safety net keys on the very `owner:synthesis` obligation the
-  branch declined to create (`_maybe_synthesis_overdue_blocked`, `:3468`,
-  reading that obligation at `:3474-3475`), so it could not fire either.
+  branch declined to create (`_maybe_synthesis_overdue_blocked`, `:3475`,
+  reading that obligation at `:3481-3482`), so it could not fire either.
 - **A re-minted owner token.** `poll` mints a fresh coordinator owner token on
   every same-SHA recovery (`smoke-pr-gate.sh:5325`), which is how a coordinator
   that died is recovered and is not negotiable; `adopt`'s fence adds no
