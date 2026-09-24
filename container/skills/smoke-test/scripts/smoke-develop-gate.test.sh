@@ -1381,6 +1381,44 @@ bash "$GATE" poll | jq -e '.data.trigger == "gate_hold_tampered" and .data.holdI
 [ "$(sha256sum "$HOLD_FILE")" = "$HOLD_SUM" ] || rs_fail "a forged line touched the hold"
 unset SMOKE_GATE_HOLD_FILE
 
+# --- 39d. A freeze whose target develop has moved past is adopted (#1134) --
+# XZO #2176 froze fe92bc76; develop reached ef798620 mid-run. Keyed on the
+# current head, its NO_GO line was never adopted: state kept #2161 while the
+# hold named #2176, and the reconciler woke gate_hold_tampered "mismatched".
+# The newest later line is adopted whatever its target; completedAt never
+# moves backwards; the hold is never touched.
+fresh_state
+OLD_T="$(printf 'a%.0s' $(seq 40))"; FROZEN_T="$(printf 'b%.0s' $(seq 40))"; HEAD_T="$(printf 'c%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$HEAD_T"
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+HOLD_FILE="$STATE_DIR2/develop-hold.json"
+export SMOKE_GATE_HOLD_FILE="$HOLD_FILE"
+LEDGER="$STATE_DIR2/handoff-ledger.jsonl"
+mv_fail() { echo "39d: $1" >&2; exit 1; }
+mv_line() {  # <target> <run> <verdict> <finishedAt>
+  jq -cn --arg t "$1" --arg run "$2" --arg v "$3" --arg at "$4" \
+    '{schemaVersion:1,targetSha:$t,freezeSha:"f00d",freezePr:1,runId:$run,verdict:$v,finishedAt:$at}' >>"$LEDGER"
+}
+mv_state() { jq -c '[.completedSha[0:1], .completedRunId, .completedVerdict, .completedAt]' "$STATE_DIR2/develop-state.json"; }
+# #2161's round, adopted as the state's record (its hold stands).
+mv_line "$OLD_T" run-2161 NO_GO 2026-09-24T11:31:03Z
+jq -cn --arg sha "$OLD_T" '{schemaVersion:1,sha:$sha,runId:"run-2161",verdict:"NO_GO",raisedAt:"2026-09-24T11:31:03Z",reason:"no_go"}' >"$HOLD_FILE"
+bash "$GATE" poll >/dev/null; bash "$GATE" poll >/dev/null
+[ "$(mv_state)" = '["a","run-2161","NO_GO","2026-09-24T11:31:03Z"]' ] || mv_fail "first line not adopted: $(mv_state)"
+# #2176 freezes an older head, finishes NO_GO and replaces the hold; develop has moved on.
+jq -cn --arg sha "$FROZEN_T" '{schemaVersion:1,sha:$sha,runId:"run-2176",verdict:"NO_GO",raisedAt:"2026-09-24T17:52:05Z",reason:"no_go"}' >"$HOLD_FILE"
+HOLD_SUM="$(sha256sum "$HOLD_FILE")"
+mv_line "$FROZEN_T" run-2176 NO_GO 2026-09-24T17:52:05Z
+OUT="$(bash "$GATE" poll)"
+jq -e '.data.trigger != "gate_hold_tampered"' <<<"$OUT" >/dev/null || mv_fail "a moved-past freeze read as tamper: $OUT"
+[ "$(mv_state)" = '["b","run-2176","NO_GO","2026-09-24T17:52:05Z"]' ] || mv_fail "moved-past freeze not adopted: $(mv_state)"
+[ "$(sha256sum "$HOLD_FILE")" = "$HOLD_SUM" ] || mv_fail "adoption touched the hold"
+# Never backwards: an OLDER line for another target, appended later, is not adopted.
+mv_line "$OLD_T" run-late-append GO 2026-09-24T12:00:00Z
+bash "$GATE" poll >/dev/null
+[ "$(mv_state)" = '["b","run-2176","NO_GO","2026-09-24T17:52:05Z"]' ] || mv_fail "adopted an older line: $(mv_state)"
+unset SMOKE_GATE_HOLD_FILE
+
 # --- 40. `ack`: terminal disposition for an alarm wake ---------------------
 # Argument validation first. A typo'd trigger filed under a key nothing reads
 # would be an ack-shaped no-op, which is the exact failure class this verb
