@@ -44,6 +44,7 @@ import {
   getDueWakePriority,
   syncProcessingAcks,
 } from './ops/sweep.js';
+import { cancelTask } from '../../mailbox/sqlite/tasks.js';
 import { INBOUND_SCHEMA } from '../../db/schema.js';
 import { DATA_DIR } from '../../config.js';
 
@@ -1491,6 +1492,17 @@ describe('syncProcessingAcks — recall row of a finished turn', () => {
     expect(closeOrphanRecallRows(inDb)).toBe(0);
     expect(status(inDb, 'recall-other')).toBe('pending');
     expect(status(inDb, 'recall-unparsed')).toBe('pending');
+  });
+
+  it('an admitted task cancelled before the runner claimed it leaves no pending recall', () => {
+    const { inDb, outDb } = freshPair();
+    admittedPair(inDb, 't-cancel');
+    expect(cancelTask(inDb, 't-cancel')).toBe(1);
+
+    syncProcessingAcks(inDb, outDb);
+
+    expect(status(inDb, 't-cancel')).toBe('cancelled');
+    expect(status(inDb, 'recall-t-cancel')).toBe('expired');
   });
 
   it('closes a deferred recall marker once its target is terminal', () => {

@@ -234,7 +234,10 @@ export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Data
 }
 
 /**
- * Close every pending `recall-<X>` row whose target `<X>` is already terminal.
+ * Close every pending `recall-<X>` row whose target `<X>` is already terminal:
+ * `completed`, `failed`, `expired`, or `cancelled` (an admitted task cancelled
+ * before the runner claimed it keeps its recall, `cancelTask`,
+ * src/mailbox/sqlite/tasks.ts:44-50; nothing revives a cancelled row).
  *
  * Admission writes the recall row beside its turn (`admitDueRow`,
  * src/modules/mailbox/ops/admission.ts:155-175) and a normal turn claims and
@@ -275,7 +278,7 @@ export function closeOrphanRecallRows(inDb: Database.Database): number {
           AND EXISTS (
             SELECT 1 FROM messages_in AS target
              WHERE target.id = substr(messages_in.id, 8)
-               AND target.status IN ('completed', 'failed', 'expired')
+               AND target.status IN ('completed', 'failed', 'expired', 'cancelled')
           )`,
     )
     .run().changes;
