@@ -1590,8 +1590,12 @@ async function deliverMessage(
   if (msg.kind === 'status') {
     // The task list and the platform's status line replace the 💭 stream. The
     // row stays in outbound.db (the dashboard's session view still reads it);
-    // it just never posts.
-    if (TASK_LIST_ENABLED) return { recordOnly: true };
+    // it just never posts. An agent-shared session (no messaging group, not a
+    // task session — session-manager.ts:371) has no conversation of its own
+    // to show a list in, and the runner refuses the tool there, so it keeps
+    // its 💭 progress.
+    const agentShared = session.messaging_group_id === null && !isTaskThread(session.thread_id);
+    if (TASK_LIST_ENABLED && !agentShared) return { recordOnly: true };
     const typedProgress = content.reporting?.version === 1 && content.reporting?.purpose === 'progress';
     if (!msg.channel_type || !msg.platform_id) {
       log.warn('Status message missing routing fields, dropping', { id: msg.id });

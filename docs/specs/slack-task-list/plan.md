@@ -190,4 +190,8 @@ something the plan did not know.
   is operator-driven and rare, and the next real update repaints.
 - **Receipt and status line**: 👀 on a live human Slack message when it wakes an agent; the status line reads
   "is thinking…", or "is working: <current item>" once the list has one.
+- **Agent-shared sessions** have no conversation of their own, so the tool refuses there and they keep their 💭
+  progress.
+- **Replacing a list**: a repost's old copy (or the previous generation) is collapsed into a pointer only once the
+  new post has a platform id. Until then it stays the visible list, and a kill marks IT interrupted.
 - **Sibling rooms**: Slack inbound drops a bot post carrying the list footer, so a list never wakes another bot.

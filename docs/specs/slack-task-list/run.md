@@ -32,3 +32,8 @@
   `@names`; repost traffic counted from separate inbound/outbound cursors (the host numbers inbound from
   inbound.db alone, `src/modules/mailbox/ops/ingress.ts:42-45`); 👀 receipt moved after the durable inbound write.
   This loop runs under the merge gate (`pr-review-loop`, round cap 3), not team-auto's spent corrective budget.
+- **GitHub Codex review, round 2** (head effc1f67): 2 findings, both accepted and fixed with tests. An agent-shared
+  session (no messaging group, `session-manager.ts:371`) cannot show a list, so it keeps its 💭 progress instead
+  of losing all of it. A replaced list (busy-thread repost or previous generation) is collapsed only after its
+  replacement has a platform id, and until then it is also what the host marks interrupted on a kill
+  (`supersedes`).

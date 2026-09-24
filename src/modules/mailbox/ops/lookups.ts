@@ -303,29 +303,35 @@ export function getTaskListSettlement(
     .map((r) => r.id)
     .filter((id) => !delivered.has(id));
 
+  // The list's own post when it is on screen; while a replacement post is
+  // still undelivered (and about to be dropped as stale above), the post it
+  // was replacing is the one on screen — it gets the interrupted form.
   let edit: TaskListSettlement['edit'] = null;
-  if (
-    typeof record.postOutboundId === 'string' &&
-    typeof record.interruptedText === 'string' &&
-    typeof record.interruptedSubtext === 'string'
-  ) {
-    const post = outbound
-      .prepare("SELECT channel_type, platform_id, thread_id FROM messages_out WHERE id = ? AND kind = 'task_list'")
-      .get(record.postOutboundId) as
-      | { channel_type: string | null; platform_id: string | null; thread_id: string | null }
-      | undefined;
-    const receipt = inbound
-      .prepare("SELECT platform_message_id FROM delivered WHERE message_out_id = ? AND status = 'delivered'")
-      .get(record.postOutboundId) as { platform_message_id: string | null } | undefined;
-    if (post?.channel_type && post.platform_id && receipt?.platform_message_id) {
-      edit = {
-        channelType: post.channel_type,
-        platformId: post.platform_id,
-        threadId: post.thread_id,
-        platformMessageId: receipt.platform_message_id,
-        interruptedText: record.interruptedText,
-        interruptedSubtext: record.interruptedSubtext,
-      };
+  const supersedes = record.supersedes as { outboundId?: unknown } | null | undefined;
+  const candidates = [record.postOutboundId, supersedes?.outboundId].filter(
+    (id): id is string => typeof id === 'string',
+  );
+  if (typeof record.interruptedText === 'string' && typeof record.interruptedSubtext === 'string') {
+    for (const outboundId of candidates) {
+      const post = outbound
+        .prepare("SELECT channel_type, platform_id, thread_id FROM messages_out WHERE id = ? AND kind = 'task_list'")
+        .get(outboundId) as
+        | { channel_type: string | null; platform_id: string | null; thread_id: string | null }
+        | undefined;
+      const receipt = inbound
+        .prepare("SELECT platform_message_id FROM delivered WHERE message_out_id = ? AND status = 'delivered'")
+        .get(outboundId) as { platform_message_id: string | null } | undefined;
+      if (post?.channel_type && post.platform_id && receipt?.platform_message_id) {
+        edit = {
+          channelType: post.channel_type,
+          platformId: post.platform_id,
+          threadId: post.thread_id,
+          platformMessageId: receipt.platform_message_id,
+          interruptedText: record.interruptedText,
+          interruptedSubtext: record.interruptedSubtext,
+        };
+        break;
+      }
     }
   }
   return { staleRowIds, edit };

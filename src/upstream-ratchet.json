@@ -750,7 +750,7 @@
 "src/delivery-guard.ts":{"diff":40,"mode":"100644","sha256":"ec1b5d44e24409ba1c2299b834071ea78dac0dc9c76b2bc6d8bcd5230f756d2e"},
 "src/delivery-shadow.test.ts":{"diff":141,"mode":"100644","sha256":null,"deleted":true},
 "src/delivery.test.ts":{"diff":3932,"mode":"100644","sha256":"5472741721a2fd5c27f88aac72bb1a43a4dacefd8113e5fa45e7974dc103e995"},
-"src/delivery.ts":{"diff":2153,"mode":"100644","sha256":"8f4926b35226c5c25576665f791743dbfd490df1594148dd165dc73df00bde94"},
+"src/delivery.ts":{"diff":2157,"mode":"100644","sha256":"18c71a3de99f340c2c9ad0fb92d5d4c1335195094f53beb70ca13c9f42dca203"},
 "src/drivers/cli.test.ts":{"diff":33,"mode":"100644","sha256":null,"deleted":true},
 "src/drivers/cli.ts":{"diff":88,"mode":"100644","sha256":null,"deleted":true},
 "src/drivers/conformance.test.ts":{"diff":740,"mode":"100644","sha256":null,"deleted":true},

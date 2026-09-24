@@ -24,7 +24,14 @@ vi.mock('./config.js', async () => {
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-task-list-delivery') }));
 
-import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from './db/index.js';
+import {
+  closeDb,
+  createAgentGroup,
+  createMessagingGroup,
+  createMessagingGroupAgent,
+  initTestDb,
+  runMigrations,
+} from './db/index.js';
 import { getRawDb } from './db/connection.js';
 import { getDeliveredIds } from './modules/mailbox/ops/delivery.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
@@ -190,6 +197,32 @@ describe('task list delivery (switch on)', () => {
     await deliverSessionMessages(session);
     expect(calls).toHaveLength(0);
     expect(await delivered(sessionId)).toContain('status-1');
+  });
+
+  it('keeps 💭 progress for an agent-shared session, which has no conversation to show a list in', async () => {
+    await seed();
+    await createMessagingGroupAgent({
+      id: 'mga-shared',
+      messaging_group_id: 'mg-1',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'agent-shared',
+      priority: 0,
+      default_model: null,
+      default_effort: null,
+      default_tone: null,
+      instructions_profile: null,
+      created_at: now(),
+    });
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'agent-shared');
+    expect(session.messaging_group_id).toBeNull();
+    const calls = captureAdapter();
+    insertRow(session.id, 'status-1', 'status', { text: '> 💭 thinking' });
+    await deliverSessionMessages(session);
+    expect(calls.map((c) => c.kind)).toEqual(['status']);
   });
 
   it('posts a task list through the channel path with its footer', async () => {
@@ -384,6 +417,33 @@ describe('task list delivery (switch on)', () => {
     });
     await settleTaskListOnKill(sessionId, 'absolute-ceiling');
     expect(sent).toEqual(['limited']);
+  });
+
+  it('marks the replaced list interrupted while its replacement post is still undelivered', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    insertRow(
+      sessionId,
+      'list-2',
+      'task_list',
+      { text: 'Migrating\n✓ Ran it\n✱ Verify' },
+      { timestamp: new Date(Date.now() - 1_000).toISOString() },
+    );
+    writeListState(sessionId, {
+      postOutboundId: 'list-2',
+      platformMessageId: null,
+      supersedes: { outboundId: 'list-1', platformMessageId: '1786621600.000100' },
+    });
+    const calls = captureAdapter();
+    await settleTaskListOnKill(sessionId, 'absolute-ceiling');
+    expect(calls).toHaveLength(1);
+    expect(calls[0].content).toMatchObject({
+      operation: 'edit',
+      messageId: '1786621600.000100',
+      text: 'Migrating\n✓ Ran it\n◌ Verify (interrupted)',
+    });
+    // The replacement never shows.
+    expect(await delivered(sessionId)).toContain('list-2');
   });
 
   it('scrubs registered secrets from both interrupted fields', async () => {

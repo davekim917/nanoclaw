@@ -58,6 +58,13 @@ export interface TaskListState {
   postSeq: number | null;
   /** Highest inbound seq when the post was written — the repost check's inbound cursor. */
   postInboundSeq?: number | null;
+  /**
+   * The list still on screen that this post replaces (a busy-thread repost's
+   * old copy, or the previous generation). It is collapsed into a pointer only
+   * once this post has a platform id — until then it IS the visible list, so
+   * it is also what the host marks interrupted if the container dies first.
+   */
+  supersedes?: { outboundId: string; platformMessageId: string } | null;
   /** Platform id of the visible post, once the host has delivered it. */
   platformMessageId: string | null;
   postedAt: string | null;
@@ -274,6 +281,14 @@ export async function applyTaskListUpdate(
   const finished = input.items.every((item) => item.status === 'done');
   const text = renderBody(input.title, input.items);
   const subtext = renderSubtext(routing.channelType, now);
+  // Point a replaced list at the one now on screen.
+  const collapse = async (messageId: string, latest: string): Promise<void> => {
+    const link = latestListLink(routing.channelType, routing.platformId, routing.threadId, latest);
+    await deps.write(
+      { operation: 'edit', messageId, text: supersededText(link), taskList: { superseded: true } },
+      routing,
+    );
+  };
 
   // The list this update continues, if any, and the platform id of its
   // visible post. A post the host reported as failed is no post at all:
@@ -294,6 +309,11 @@ export async function applyTaskListUpdate(
       save({ ...current, title: input.title, items: input.items, revision: current.revision + 1 });
       return { ok: false, error: 'the task list post has not been delivered yet; call update_task_list again shortly' };
     }
+    if (current && target && current.supersedes) {
+      // The post is on screen now: the list it replaced can become a pointer.
+      await collapse(current.supersedes.platformMessageId, target);
+      current = { ...current, supersedes: null };
+    }
   }
 
   const next: TaskListState = {
@@ -308,6 +328,7 @@ export async function applyTaskListUpdate(
     postOutboundId: current?.postOutboundId ?? null,
     postSeq: current?.postSeq ?? null,
     postInboundSeq: current?.postInboundSeq ?? null,
+    supersedes: current?.supersedes ?? null,
     platformMessageId: target,
     postedAt: current?.postedAt ?? null,
     updatedAt: now,
@@ -346,31 +367,38 @@ export async function applyTaskListUpdate(
   }
 
   // Post a fresh list: a new generation, or a repost at the bottom of a busy thread.
+  // What it replaces on screen: on a repost this list's own copy; otherwise the
+  // previous generation's post, or — when that post never showed — whatever
+  // it was itself going to replace. Same conversation only: a list left in
+  // another thread stays as it was.
+  const replaced =
+    busy && current?.postOutboundId && target
+      ? { outboundId: current.postOutboundId, platformMessageId: target }
+      : prev && sameRoute(routing, prev)
+        ? prev.postOutboundId && prev.platformMessageId
+          ? { outboundId: prev.postOutboundId, platformMessageId: prev.platformMessageId }
+          : (prev.supersedes ?? null)
+        : null;
   const post = await deps.write({ text, subtext, taskList: meta }, routing);
   next.postOutboundId = post.id;
   next.postSeq = post.seq;
   next.postInboundSeq = deps.inboundSeq();
   next.postedAt = now;
   next.platformMessageId = null;
+  next.supersedes = replaced;
   save(next);
   const ack = await deps.awaitPlatformId(post.id, POST_ACK_TIMEOUT_MS);
   if (ack.platformId) {
     next.platformMessageId = ack.platformId;
+    // Collapse the replaced list only now that its replacement is on screen;
+    // a pending post collapses it on the next update, a failed one never
+    // does (the next fresh post inherits `supersedes`). Best effort: a
+    // missing pointer only leaves the old list showing its last state.
+    if (replaced) {
+      await collapse(replaced.platformMessageId, ack.platformId);
+      next.supersedes = null;
+    }
     save(next);
-  }
-
-  // Collapse what this post replaces — the previous generation's list, or
-  // on a repost this list's old copy — into a pointer. Same conversation
-  // only: a list left in another thread stays as it was. Best effort: the
-  // new list is already posted, and a missing pointer only leaves the old
-  // list showing its last state.
-  const replaced = busy ? target : prev && sameRoute(routing, prev) ? prev.platformMessageId : null;
-  if (replaced) {
-    const link = latestListLink(routing.channelType, routing.platformId, routing.threadId, next.platformMessageId);
-    await deps.write(
-      { operation: 'edit', messageId: replaced, text: supersededText(link), taskList: { superseded: true } },
-      routing,
-    );
   }
   return { ok: true, action: busy ? 'reposted' : 'posted', state: next };
 }

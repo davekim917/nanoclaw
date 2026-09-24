@@ -245,6 +245,44 @@ describe('applyTaskListUpdate', () => {
     expect(h.trafficQueries).toEqual([[h.writes[0].seq, 4]]);
   });
 
+  it('collapses the old copy only once the repost is on screen', async () => {
+    const h = harness({ messagesAfter: 3 });
+    await applyTaskListUpdate(input('T', items(['A', 'in_progress'], ['B', 'pending'])), SLACK, h.deps);
+    h.advance(TASK_LIST_REPOST_AFTER_MS);
+    h.setDeliver('pending');
+    await applyTaskListUpdate(input('T', items(['A', 'done'], ['B', 'in_progress'])), SLACK, h.deps);
+    // The repost has not shown: the old copy is still the visible list.
+    expect(h.writes).toHaveLength(2);
+    expect(h.state?.supersedes).toEqual({ outboundId: 'out-1', platformMessageId: '1786621600.001' });
+    h.setDeliver('ok');
+    await applyTaskListUpdate(input('T', items(['A', 'done'], ['B', 'done'])), SLACK, h.deps);
+    expect(h.writes[2].content).toMatchObject({
+      operation: 'edit',
+      messageId: '1786621600.001',
+      taskList: { superseded: true },
+    });
+    expect(h.writes[3].content).toMatchObject({ operation: 'edit', messageId: '1786621600.002' });
+    expect(h.state?.supersedes).toBeNull();
+  });
+
+  it('never collapses a list into a pointer at a replacement that failed', async () => {
+    const h = harness();
+    await applyTaskListUpdate(input('T', items(['A', 'done'])), SLACK, h.deps);
+    h.setDeliver('failed');
+    await applyTaskListUpdate(input('Next', items(['B', 'in_progress']), true), SLACK, h.deps);
+    expect(h.writes).toHaveLength(2);
+    expect(h.state?.supersedes).toEqual({ outboundId: 'out-1', platformMessageId: '1786621600.001' });
+    // The next fresh post inherits the replacement and collapses the original once it shows.
+    h.setDeliver('ok');
+    await applyTaskListUpdate(input('Next', items(['B', 'done'])), SLACK, h.deps);
+    expect(h.writes[3].content).toMatchObject({
+      operation: 'edit',
+      messageId: '1786621600.001',
+      taskList: { superseded: true },
+    });
+    expect(h.state?.supersedes).toBeNull();
+  });
+
   it('does not repost a quiet thread', async () => {
     const h = harness({ messagesAfter: 0 });
     await applyTaskListUpdate(input('T', items(['A', 'in_progress'], ['B', 'pending'])), SLACK, h.deps);
