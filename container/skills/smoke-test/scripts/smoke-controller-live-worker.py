@@ -44,7 +44,7 @@ INBOUND_DB = os.environ.get("SMOKE_CONTROLLER_LIVE_INBOUND_DB", "/workspace/inbo
 # install's deployment gate wrapper sources the file itself (`. <its
 # dir>/smoke-gate-env.sh`, then exec the skill's gate), so ITS lease dir stayed
 # right -- but the evidence barrier is spawned by the controller directly, with this
-# process's environment (smoke-campaign-controller.py:1940 -> run_read_only ->
+# process's environment (smoke-campaign-controller.py:1962 -> run_read_only ->
 # spawn, :692-704, env=None), and it read the fallback
 # ${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases
 # (smoke-evidence-barrier.sh:739). No pin for the campaign lives there, so
