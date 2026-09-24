@@ -1291,16 +1291,17 @@ ci_verdict() {
         | select((.name == $labeler and .event == "pull_request_target") | not)
         | if $asof != "" and ((.updated_at // "") as $u | $u == "" or $u > $asof)
           then .status = "updated after the merge" | .conclusion = null else . end ]
-      # The newest run per name, and where the head has pull_request runs of
-      # a workflow, the newest of THOSE: this gate judges a pull request, and
-      # a run of the same sha from another event (a push of it elsewhere)
-      # did not test the pull request merge ref, so it can neither pass nor
-      # mask it (a quick-tier run included). A workflow with no
-      # pull_request run on the head is judged by its newest run of any event.
+      # Per workflow name, BOTH its newest run of any event and its newest
+      # pull_request run are judged. The newest run keeps every blocking
+      # signal it always had (a newer failed or pending push of the same sha
+      # still blocks); the newest pull_request run must pass too, because this
+      # gate judges a pull request and a run from another event did not test
+      # its merge ref, so another event success can neither pass nor mask it
+      # (a quick-tier run included). Stricter than either rule alone.
       | group_by(.name) | map(
-          ( [ .[] | select(.event == "pull_request") ] ) as $pr
-          | (if ($pr | length) > 0 then $pr else . end)
-          | max_by([.run_started_at // .created_at // "", .id // 0])) ) as $runs
+          max_by([.run_started_at // .created_at // "", .id // 0]) as $newest
+          | ( [ .[] | select(.event == "pull_request") ] | if length > 0 then [ max_by([.run_started_at // .created_at // "", .id // 0]) ] else [] end ) as $pr
+          | [ $newest ] + [ $pr[] | select(.id != $newest.id) ] ) | add // [] ) as $runs
     | ( [ .[1][][]? | select(.context as $c | $excluded | index($c) | not)
           | select($asof == "" or (.created_at // "") <= $asof) ]
         | group_by(.context) | map(max_by([.created_at // "", .id // 0])) ) as $statuses
@@ -1310,7 +1311,7 @@ ci_verdict() {
     | ($hostState == "success") as $hostGreen
     | ( [ $runs[] | select(.status == "completed" and (.id | IN($unstarted[]))) ] ) as $never
     | ( [ $never[] | select(.name as $n | $required | index($n) != null) ] ) as $neverRequired
-    | ( if $hostGreen then [ $neverRequired[] | .name ] else [] end ) as $hosted
+    | ( if $hostGreen then [ $neverRequired[] | .name ] | unique else [] end ) as $hosted
     | ( [ $quick[] | .id ] ) as $quickIds
     | ( [ $runs[] | select(.status == "completed" and (.id | IN($quickIds[]))) ] ) as $quickRuns
     | ( [ $runs[] | select(.status == "completed" and (.id | IN($unstarted[]) | not) and (.id | IN($quickIds[]) | not))

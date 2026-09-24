@@ -1407,6 +1407,30 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     expect(result.stdout).toContain('ci_pending: CI=in_progress');
   });
 
+  it('a newer failed or pending run from another event still blocks a passing pull_request run (mutation: pull_request runs judged alone)', () => {
+    const failed = tempRoot();
+    writeJson(failed, 'pr.json', ciPr());
+    runs(failed, 'runs.json', [
+      workflowRun('CI', 'completed', 'success'),
+      { ...workflowRun('CI', 'completed', 'failure', '2026-09-05T00:05:00Z'), event: 'push' },
+    ]);
+    expect(ciWait(failed, ['--head', HEAD], [0, 0]).status).toBe(29);
+
+    const pending = tempRoot();
+    writeJson(pending, 'pr.json', ciPr());
+    runs(pending, 'runs-1.json', [
+      workflowRun('CI', 'completed', 'success'),
+      { ...workflowRun('CI', 'in_progress', null, '2026-09-05T00:05:00Z'), event: 'push' },
+    ]);
+    runs(pending, 'runs-2.json', [
+      workflowRun('CI', 'completed', 'success'),
+      { ...workflowRun('CI', 'completed', 'success', '2026-09-05T00:05:00Z'), event: 'push' },
+    ]);
+    const result = ciWait(pending, ['--head', HEAD], [0, 0, 0, 30]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('ci_pending: CI=in_progress');
+  });
+
   it('a workflow with no pull_request run on the head is judged by its newest run of any event, as before', () => {
     const root = tempRoot();
     writeJson(root, 'pr.json', ciPr());
