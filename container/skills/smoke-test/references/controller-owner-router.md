@@ -48,8 +48,8 @@ to the retained technical owner, verify its artifact receipt, and stop.
    same-SHA recovery (`smoke-pr-gate.sh:5325`, written to the lease at `:5354`,
    the PR authority at `:5359` and the gate state at `:5402`), so the token you
    started with is then retired. The controller refreshes `wake.json` with
-   every brief it writes (`smoke-campaign-controller.py:1381-1383`, in
-   `_owner_wake` at `:1326`), which is why the file is current and your own
+   every brief it writes (`smoke-campaign-controller.py:1419-1421`, in
+   `_owner_wake` at `:1364`), which is why the file is current and your own
    copy of its value is not (XZO #2046).
    - A brief headed **YOUR OWNER TOKEN CHANGED** means exactly that happened
      mid-step: the controller saw the step's `briefedToken` differ from the
@@ -65,7 +65,7 @@ to the retained technical owner, verify its artifact receipt, and stop.
      impersonation, not adoption.
    - Your ack does not carry over. Writing a brief removes
      `<run>/controller/brief-<step>.ack`
-     (`smoke-campaign-controller.py:1370-1380`), so a re-offered step needs a
+     (`smoke-campaign-controller.py:1408-1418`), so a re-offered step needs a
      fresh ack as its first act, exactly like any other wake.
 4. On `lanes` and `synthesis`, read `<run>/controller/barrier-<step>.json`
    before you start and again before you stop. The controller rewrites it every
@@ -158,7 +158,11 @@ suppress it.
   refusal is not a problem to work around.
 - File or comment on GitHub, or close a PR. Write
   `<run>/controller/issues/<findingId>.json` instead, and the controller files
-  it.
+  it. Its `labels` are the repo's own label names, with severity as
+  `severity:p<n>`, never a bare `P<n>`. The controller adds `smoke-finding`,
+  maps a bare `P<n>` to `severity:p<n>` when the repo has it, and drops any
+  label the repo lacks, `smoke-finding` included (noting it in the issue
+  body), because GitHub refuses the whole create over one unknown label.
 - Dispatch the design critic or the adjudicator. The controller runs both as
   fresh one-shots. To ask for adjudication, write
   `<run>/controller/adjudication-request.md` naming the disputed findings and
