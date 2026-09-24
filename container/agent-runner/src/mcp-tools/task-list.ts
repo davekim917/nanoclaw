@@ -53,6 +53,14 @@ export const updateTaskList: McpToolDefinition = {
   tool: {
     name: 'update_task_list',
     description: TASK_LIST_DESCRIPTION,
+    // Claude Code defers MCP tools behind tool search by default, leaving the
+    // model only the name until it loads the schema — enough friction that a
+    // live test saw Claude skip the list on 7 minutes of unprompted
+    // multi-step work while OpenCode (no deferral) used it. The CLI keeps a
+    // tool loaded when `_meta['anthropic/alwaysLoad'] === true` (claude-agent-
+    // sdk 0.3.281 sdk.d.ts: "Applied via `_meta['anthropic/alwaysLoad']` on
+    // each tool"). Other providers ignore _meta.
+    _meta: { 'anthropic/alwaysLoad': true },
     inputSchema: {
       type: 'object' as const,
       additionalProperties: false,
