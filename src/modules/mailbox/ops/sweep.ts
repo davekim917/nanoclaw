@@ -251,6 +251,13 @@ export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Data
  * watcher on a 5-minute cadence stops carrying a day of dead recall payloads
  * through every poll's candidate windows.
  *
+ * A row counts as a recall only by the runner's own test — `kind = 'system'`,
+ * the `recall-` id prefix AND `subtype: 'recall_context'` content
+ * (`recallTargetId`, container/agent-runner/src/modules/mailbox/selection.ts:95-103),
+ * which both writers stamp (`src/session-manager.ts:788`, the admitted recall;
+ * `src/modules/mailbox/ops/ingress.ts:134`, the deferred marker). A system row
+ * that merely shares the prefix is not ours to expire.
+ *
  * `expired` is exactly the state `expireStalePending` would give it. The query
  * also matches orphans left before this ran, so the first tick after deploy
  * clears each visited session's backlog. Idempotent.
@@ -263,6 +270,8 @@ export function closeOrphanRecallRows(inDb: Database.Database): number {
         WHERE id >= 'recall-' AND id < 'recall.'
           AND kind = 'system'
           AND status = 'pending'
+          AND json_valid(content)
+          AND json_extract(content, '$.subtype') = 'recall_context'
           AND EXISTS (
             SELECT 1 FROM messages_in AS target
              WHERE target.id = substr(messages_in.id, 8)

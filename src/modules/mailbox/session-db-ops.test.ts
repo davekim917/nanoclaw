@@ -1474,6 +1474,39 @@ describe('syncProcessingAcks — recall row of a finished turn', () => {
     expect(status(inDb, 'recall-done')).toBe('pending');
     expect(status(inDb, 'sys-note')).toBe('pending');
   });
+
+  it('never touches a recall-prefixed system row whose content is not a recall context', () => {
+    const { inDb } = freshPair();
+    row(inDb, 'other', 'task', 'completed');
+    row(inDb, 'unparsed', 'task', 'completed');
+    seq += 2;
+    const insert = inDb.prepare(
+      `INSERT INTO messages_in (id, seq, timestamp, status, tries, kind, content, series_id, trigger)
+       VALUES (?, ?, ?, 'pending', 0, 'system', ?, ?, 0)`,
+    );
+    insert.run('recall-other', seq, new Date().toISOString(), JSON.stringify({ subtype: 'integration_note' }), 'x');
+    seq += 2;
+    insert.run('recall-unparsed', seq, new Date().toISOString(), 'not json', 'y');
+
+    expect(closeOrphanRecallRows(inDb)).toBe(0);
+    expect(status(inDb, 'recall-other')).toBe('pending');
+    expect(status(inDb, 'recall-unparsed')).toBe('pending');
+  });
+
+  it('closes a deferred recall marker once its target is terminal', () => {
+    const { inDb } = freshPair();
+    row(inDb, 'deferred-done', 'chat', 'completed');
+    seq += 2;
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, timestamp, status, tries, kind, content, series_id, trigger)
+         VALUES ('recall-deferred-done', ?, ?, 'pending', 0, 'system', ?, 'recall-deferred-done', 0)`,
+      )
+      .run(seq, new Date().toISOString(), JSON.stringify({ subtype: 'recall_context', deferred: true }));
+
+    expect(closeOrphanRecallRows(inDb)).toBe(1);
+    expect(status(inDb, 'recall-deferred-done')).toBe('expired');
+  });
 });
 
 describe('hot journal recovery (readonly outbound opens)', () => {
