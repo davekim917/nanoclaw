@@ -36,8 +36,3 @@ def quick_only: [ .[].jobs[]? ] as $jobs
     and ([ $gate[0].steps[]? | select(.name != "Full CI has not run on this commit") | select((.conclusion // "") | IN("success", "skipped", "neutral") | not) ] | length) == 0
     and ($jobs | all(.[]; .name == "CI Quick" or ((.conclusion // "") | IN("success", "skipped", "neutral"))));
 
-# Whether a jobs listing (slurped) is attempt $a's. The plain /jobs route
-# answers for the run's LATEST attempt, which a re-run can advance past the
-# attempt the runs listing reported; a page from another attempt describes
-# other jobs. A job without run_attempt is taken as $a (GitHub always sends it).
-def jobs_of_attempt($a): all(.[].jobs[]?; (.run_attempt // $a) == $a);

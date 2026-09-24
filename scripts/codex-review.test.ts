@@ -140,18 +140,22 @@ if [ -n "$rest" ]; then
       exit 1
       ;;
     */actions/runs/*/attempts/*/jobs\\?*)
-      # jobs--<run id>--attempt-<n>.json is that EARLIER attempt's jobs page
-      # (the newest attempt is served by the plain /jobs route below). Absent =
-      # the read fails.
+      # jobs--<run id>--attempt-<n>.json is that attempt's jobs page. A run
+      # with no attempt pages at all is a single-attempt run, and its
+      # jobs--<run id>.json answers for attempt 1. Absent = the read fails.
       id="\${rest#*/actions/runs/}"
       attempt="\${id#*/attempts/}"; attempt="\${attempt%%/*}"
       id="\${id%%/*}"
-      if [ ! -f "$MOCK_DIR/jobs--$id--attempt-$attempt.json" ]; then
+      src="$MOCK_DIR/jobs--$id--attempt-$attempt.json"
+      if [ ! -f "$src" ] && [ "$attempt" = 1 ] && ! compgen -G "$MOCK_DIR/jobs--$id--attempt-*.json" >/dev/null; then
+        src="$MOCK_DIR/jobs--$id.json"
+      fi
+      if [ ! -f "$src" ]; then
         echo '{"message":"Not Found","status":"404"}'
         echo 'gh: Not Found (HTTP 404)' >&2
         exit 1
       fi
-      if printf '%s\\n' "$@" | grep -qx -- --slurp; then printf '['; cat "$MOCK_DIR/jobs--$id--attempt-$attempt.json"; printf ']'; else cat "$MOCK_DIR/jobs--$id--attempt-$attempt.json"; fi
+      if printf '%s\\n' "$@" | grep -qx -- --slurp; then printf '['; cat "$src"; printf ']'; else cat "$src"; fi
       exit 0
       ;;
     */actions/runs/*/jobs\\?*)
@@ -1219,7 +1223,7 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
   });
   function quickRun(root: string, jobs = quickJobs(), attempt = 1, name = 'CI', startedAt = '2026-09-05T00:01:00Z'): Page {
     const run = { ...workflowRun(name, 'completed', 'failure', startedAt), run_attempt: attempt };
-    writeJson(root, `jobs--${run.id as number}.json`, { total_count: jobs.length, jobs });
+    writeJson(root, `jobs--${run.id as number}--attempt-${attempt}.json`, { total_count: jobs.length, jobs });
     return run;
   }
   function runs(root: string, name: string, list: Page[]): void {
@@ -1236,6 +1240,7 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     runs(root, 'runs-1.json', [quickRun(root)]);
     runs(root, 'runs-2.json', [{ ...workflowRun('CI', 'in_progress', null), run_attempt: 2 }]);
     runs(root, 'runs-3.json', [{ ...workflowRun('CI', 'completed', 'success'), run_attempt: 2 }]);
+    runState(root, QUICK, 'completed', 1, 1);
     runState(root, QUICK, 'queued', 2);
 
     const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 0, 30, 30, 60]);
@@ -1251,6 +1256,7 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     runs(root, 'runs-1.json', [quickRun(root)]);
     runs(root, 'runs-2.json', [{ ...workflowRun('CI', 'in_progress', null), run_attempt: 2 }]);
     runs(root, 'runs-3.json', [{ ...workflowRun('CI', 'completed', 'success'), run_attempt: 2 }]);
+    runState(root, QUICK, 'completed', 1, 1);
     runState(root, QUICK, 'queued', 2);
 
     // The tick starts at 50; the reads and the POST take until 95.
@@ -1294,6 +1300,7 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     const root = tempRoot();
     writeJson(root, 'pr.json', ciPr());
     runs(root, 'runs.json', [quickRun(root)]);
+    runState(root, QUICK, 'completed', 1);
 
     const result = ciWait(root, ['--head', HEAD], [0, 0, 0], { MOCK_RERUN_STATUS: '1' });
     expect(result.status).toBe(1);
@@ -1332,7 +1339,10 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     runs(root, 'runs-1.json', [quickRun(root, quickJobs(), 1)]);
     runs(root, 'runs-2.json', [quickRun(root, quickJobs(), 2)]);
     runs(root, 'runs-3.json', [quickRun(root, quickJobs(), 3)]);
-    runState(root, QUICK, 'queued', 9);
+    runState(root, QUICK, 'completed', 1, 1);
+    runState(root, QUICK, 'in_progress', 2, 2);
+    runState(root, QUICK, 'completed', 2, 3);
+    runState(root, QUICK, 'in_progress', 3, 4);
 
     const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 0, 30, 30, 30, 60]);
     expect(result.status).toBe(1);
@@ -1346,7 +1356,10 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     const starts = ['2026-09-05T00:01:00Z', '2026-09-05T00:01:10Z', '2026-09-05T00:01:20Z'];
     const names = ['CI', 'CI2', 'CI3'];
     const quick = names.map((n, i) => quickRun(root, quickJobs(), 1, n, starts[i]));
-    for (const run of quick) runState(root, run.id as number, 'queued', 2);
+    for (const run of quick) {
+      runState(root, run.id as number, 'completed', 1, 1);
+      runState(root, run.id as number, 'queued', 2);
+    }
     runs(root, 'runs-1.json', quick);
     runs(root, 'runs-2.json', names.map((n, i) => ({ ...workflowRun(n, 'completed', 'success', starts[i]), run_attempt: 2 })));
 
@@ -1363,13 +1376,41 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     expect(result.stderr).toContain(`ci_quick: runs=${QUICK}:1: CI ran only its quick checks on this head`);
   });
 
-  it('a jobs page from a later attempt than the listing reports is a re-run under way: pending, not quick, not red', () => {
+  it('does not re-run a run someone already re-ran; the next tick judges the new attempt (mutation: stale verdict re-run)', () => {
     const root = tempRoot();
-    const jobs = quickJobs().map((j) => ({ ...j, run_attempt: 2 }));
-    scopeFixture(root, { labels: [], ci: [quickRun(root, jobs, 1)], statuses: [] });
-    const result = runHelper(root, ['merge-check', '--head', HEAD]);
-    expect(result.status).toBe(24);
-    expect(result.stderr).toContain('ci_pending: CI=re-running');
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs-1.json', [quickRun(root)]);
+    runs(root, 'runs-2.json', [{ ...workflowRun('CI', 'completed', 'success'), run_attempt: 2 }]);
+    runState(root, QUICK, 'in_progress', 2);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 30]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`run ${QUICK} has already moved past attempt 1; not re-running it`);
+    expect(reruns(result.calls)).toBe(0);
+  });
+
+  it('a refused re-run is not an error when the run started another attempt meanwhile (mutation: refusal always exits 1)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs-1.json', [quickRun(root)]);
+    runs(root, 'runs-2.json', [{ ...workflowRun('CI', 'completed', 'success'), run_attempt: 2 }]);
+    runState(root, QUICK, 'completed', 1, 1);
+    runState(root, QUICK, 'in_progress', 2);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 30], { MOCK_RERUN_STATUS: '1' });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`run ${QUICK} started another attempt while this asked`);
+  });
+
+  it('a repo without a CI Quick job reads an ordinary failure red, exactly as before (mutation: tier handling leaks to untiered repos)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs.json', [quickRun(root, [job('build', 'failure'), job('lint', 'success')], 2)]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(29);
+    expect(result.stderr).toContain(`ci=red head=${HEAD}: ci_red: CI=failure (required)`);
+    expect(reruns(result.calls)).toBe(0);
   });
 
   it('an earlier quick attempt does not disqualify a full re-run GitHub never started from CI (host) (mutation: quick counted as a genuine red)', () => {
@@ -1378,7 +1419,7 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     const run = { ...workflowRun('CI', 'completed', 'failure'), run_attempt: 2 };
     const jobs = quickJobs();
     writeJson(root, `jobs--${QUICK}--attempt-1.json`, { total_count: jobs.length, jobs });
-    writeJson(root, `jobs--${QUICK}.json`, { total_count: 1, jobs: [neverStarted(2)] });
+    writeJson(root, `jobs--${QUICK}--attempt-2.json`, { total_count: 1, jobs: [neverStarted(2)] });
     runs(root, 'runs.json', [run]);
     writeJson(root, `statuses--${HEAD}.json`, [commitStatus('CI (host)', 'success')]);
 
@@ -1394,7 +1435,7 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     const run = { ...workflowRun('CI', 'completed', 'failure'), run_attempt: 2 };
     const jobs = [job('plan', 'success'), job('spelling / en-US spelling', 'success'), gate('failure')];
     writeJson(root, `jobs--${QUICK}--attempt-1.json`, { total_count: jobs.length, jobs });
-    writeJson(root, `jobs--${QUICK}.json`, { total_count: 1, jobs: [neverStarted(2)] });
+    writeJson(root, `jobs--${QUICK}--attempt-2.json`, { total_count: 1, jobs: [neverStarted(2)] });
     runs(root, 'runs.json', [run]);
     writeJson(root, `statuses--${HEAD}.json`, [commitStatus('CI (host)', 'success')]);
 
@@ -1405,16 +1446,18 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
   it('a latest-attempt page that is not the attempt the listing reported never excuses anything (mutation: /jobs trusted as that attempt)', () => {
     const root = tempRoot();
     writeJson(root, 'pr.json', ciPr());
-    // Listing: attempt 2 (a genuine failure). /jobs has moved on to attempt 3.
+    // Listing: attempt 2, a genuine failure. The plain /jobs route has moved
+    // on to a never-started attempt 3 (with no run_attempt field to say so).
     const run = { ...workflowRun('CI', 'completed', 'failure'), run_attempt: 2 };
     const jobs = quickJobs();
     writeJson(root, `jobs--${QUICK}--attempt-1.json`, { total_count: jobs.length, jobs });
-    writeJson(root, `jobs--${QUICK}.json`, { total_count: 1, jobs: [neverStarted(3)] });
+    writeJson(root, `jobs--${QUICK}--attempt-2.json`, { total_count: 1, jobs: [job('build', 'failure')] });
+    writeJson(root, `jobs--${QUICK}.json`, { total_count: 1, jobs: [neverStarted()] });
     runs(root, 'runs.json', [run]);
     writeJson(root, `statuses--${HEAD}.json`, [commitStatus('CI (host)', 'success')]);
 
-    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 30], { CODEX_REVIEW_CI_WAIT_SECONDS: '30' });
-    expect(result.status).not.toBe(0);
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(29);
     expect(result.stdout).not.toContain('ci=host');
   });
 
@@ -1425,7 +1468,8 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     const lint = { ...workflowRun('Lint', 'completed', 'failure', '2026-09-05T00:03:00Z'), run_attempt: 2 };
     const lintId = lint.id as number;
     writeJson(root, `jobs--${lintId}--attempt-1.json`, { total_count: 1, jobs: [neverStarted(1)] });
-    writeJson(root, `jobs--${lintId}.json`, { total_count: 1, jobs: [neverStarted(3)] });
+    writeJson(root, `jobs--${lintId}--attempt-2.json`, { total_count: 1, jobs: [job('lint', 'failure')] });
+    writeJson(root, `jobs--${lintId}.json`, { total_count: 1, jobs: [neverStarted()] });
     runs(root, 'runs.json', [workflowRun('CI', 'completed', 'success'), lint]);
 
     const result = ciWait(root, ['--head', HEAD], [0, 0]);
@@ -5617,9 +5661,9 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
 
   // A failed run that has been re-run IN PLACE: one run id, `attempts.length`
   // attempts, `attempts[i]` saying whether attempt i+1 started. GitHub serves
-  // the newest attempt's jobs at the plain /jobs route and the earlier ones at
-  // /attempts/<n>/jobs; `undefined` writes no fixture for an attempt, so that
-  // read 404s. The run id lives in one place here — it has to agree with three
+  // every attempt's jobs at /attempts/<n>/jobs (the gate reads them there,
+  // pinned) and the newest one also at the plain /jobs route; `undefined`
+  // writes no fixture for an attempt, so that read 404s. The run id lives in one place here — it has to agree with three
   // file names, and the fixtures that spelled it out each time were the reason
   // this helper exists.
   function rerunRun(root: string, attempts: (boolean | undefined)[], name = 'CI'): Page {
@@ -5629,10 +5673,9 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
     attempts.forEach((started, i) => {
       if (started === undefined) return;
       const newest = i === attempts.length - 1;
-      writeJson(root, newest ? `jobs--${runId}.json` : `jobs--${runId}--attempt-${i + 1}.json`, {
-        total_count: 1,
-        jobs: [actionsJob(started, 'failure', runId)],
-      });
+      const page = { total_count: 1, jobs: [actionsJob(started, 'failure', runId)] };
+      writeJson(root, `jobs--${runId}--attempt-${i + 1}.json`, page);
+      if (newest) writeJson(root, `jobs--${runId}.json`, page);
     });
     return run;
   }

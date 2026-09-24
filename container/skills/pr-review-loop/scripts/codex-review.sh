@@ -1302,18 +1302,16 @@ ci_verdict() {
     | ( [ $runs[] | select(.status == "completed" and (.id | IN($unstarted[]))) ] ) as $never
     | ( [ $never[] | select(.name as $n | $required | index($n) != null) ] ) as $neverRequired
     | ( if $hostGreen then [ $neverRequired[] | .name ] else [] end ) as $hosted
-    | ( [ $quick[] | select(.state == "quick") | .id ] ) as $quickIds
-    | ( [ $quick[] | .id ] ) as $tieredIds
+    | ( [ $quick[] | .id ] ) as $quickIds
     | ( [ $runs[] | select(.status == "completed" and (.id | IN($quickIds[]))) ] ) as $quickRuns
-    | ( [ $runs[] | select(.status == "completed" and (.id | IN($tieredIds[])) and (.id | IN($quickIds[]) | not)) | "\(.name)=re-running" ] ) as $advancing
-    | ( [ $runs[] | select(.status == "completed" and (.id | IN($unstarted[]) | not) and (.id | IN($tieredIds[]) | not))
+    | ( [ $runs[] | select(.status == "completed" and (.id | IN($unstarted[]) | not) and (.id | IN($quickIds[]) | not))
           | (.name as $n | $required | index($n) != null) as $isRequired
           | select((.conclusion // "") as $c | if $isRequired then $c != "success" else ($c | IN("success", "neutral", "skipped") | not) end)
           | "\(.name)=\(.conclusion // "none")\(if $isRequired then " (required)" else "" end)" ]
         + ( if $hostGreen or $hostState == "pending" then [] else [ $neverRequired[] | "\(.name)=not started (required; GitHub never started its jobs and no \($hostContext) success from \(if ($posters | length) == 0 then "an allowed poster (none could be resolved: set CODEX_REVIEW_HOST_CI_POSTERS)" else ($posters | join("/")) end) is on this head — run run-host-ci.sh)" ] end )
         + [ $statuses[] | select(.state != "success" and .state != "pending") | "\(.context)=\(.state)" ] ) as $red
     | [ $required[] | . as $n | select(any($runs[]; .name == $n) | not) ] as $missing
-    | ( [ $runs[] | select(.status != "completed") | "\(.name)=\(.status)" ] + $advancing
+    | ( [ $runs[] | select(.status != "completed") | "\(.name)=\(.status)" ]
         + [ $statuses[] | select(.state == "pending") | "\(.context)=pending" ] ) as $pending
     | if ($runs | length) == 0 and ($statuses | length) == 0 then "ci_missing: no workflow run or commit status on this head — CI never ran"
       elif ($red | length) > 0 then "ci_red: " + ($red | join(", "))
@@ -1414,13 +1412,11 @@ never_started_runs() {
       [[ "$attempt" =~ ^[0-9]+$ ]] && [ "$attempt" -ge 1 ] || attempt=1
       # Newest attempt first, so the common single-attempt run costs one read.
       for (( a = attempt; a >= 1; a-- )); do
-        if [ "$a" -eq "$attempt" ]; then
-          endpoint="repos/$REPO/actions/runs/$id/jobs?per_page=100"
-        else
-          endpoint="repos/$REPO/actions/runs/$id/attempts/$a/jobs?per_page=100"
-        fi
+        # Pinned to the attempt by URL, newest included: the plain /jobs route
+        # answers for whatever attempt is latest NOW, which a re-run can have
+        # advanced past the one the runs listing reported.
+        endpoint="repos/$REPO/actions/runs/$id/attempts/$a/jobs?per_page=100"
         jobs=$(gh api --paginate --slurp "$endpoint" 2>/dev/null) || { clean=0; break; }
-        printf '%s\n' "$jobs" | jq -e -L "$HERE" --argjson a "$a" 'include "never-started"; jobs_of_attempt($a)' >/dev/null 2>&1 || { clean=0; break; }
         # A quick-tier attempt (quick_only) — of this run or of an earlier
         # run on the head, e.g. before a reopen — is the per-push check, not
         # a genuine failure of the head: it neither disqualifies the workflow
@@ -1445,11 +1441,9 @@ never_started_runs() {
   jq -cn --argjson c "$candidates" --argjson d "$disqualified" '[ $c[] | select(.name | IN($d[]) | not) | .id ]'
 }
 
-# Runs of a required workflow on HEAD whose newest attempt is the quick tier
-# (never-started.jq quick_only), as a JSON array of {id, attempt, state}:
-# state `quick`, or `advancing` when the latest-attempt jobs page already
-# belongs to a later attempt than the listing reported (a re-run is under
-# way; ci_verdict reads it as pending, never red). Only a
+# Runs of a required workflow on HEAD whose newest attempt, as the runs
+# listing reports it, is the quick tier (never-started.jq quick_only), as a
+# JSON array of {id, attempt}; the jobs read is pinned to that attempt. Only a
 # completed `failure` run of a required workflow can be one, and only those
 # cost a jobs read. Fail closed: a jobs read that fails, or anything that does
 # not prove quick_only, leaves the run out, so ci_verdict judges it as the red
@@ -1467,11 +1461,9 @@ quick_tier_runs() {
   while IFS=$'\t' read -r id attempt; do
     [[ "$id" =~ ^[0-9]+$ ]] || continue
     [[ "$attempt" =~ ^[0-9]+$ ]] && [ "$attempt" -ge 1 ] || attempt=1
-    jobs=$(gh api --paginate --slurp "repos/$REPO/actions/runs/$id/jobs?per_page=100" 2>/dev/null) || continue
-    if ! printf '%s\n' "$jobs" | jq -e -L "$HERE" --argjson a "$attempt" 'include "never-started"; jobs_of_attempt($a)' >/dev/null 2>&1; then
-      found=$(jq -cn --argjson f "$found" --argjson id "$id" --argjson a "$attempt" '$f + [{ id: $id, attempt: $a, state: "advancing" }]') || return 1
-    elif printf '%s\n' "$jobs" | jq -e -L "$HERE" 'include "never-started"; quick_only' >/dev/null 2>&1; then
-      found=$(jq -cn --argjson f "$found" --argjson id "$id" --argjson a "$attempt" '$f + [{ id: $id, attempt: $a, state: "quick" }]') || return 1
+    jobs=$(gh api --paginate --slurp "repos/$REPO/actions/runs/$id/attempts/$attempt/jobs?per_page=100" 2>/dev/null) || continue
+    if printf '%s\n' "$jobs" | jq -e -L "$HERE" 'include "never-started"; quick_only' >/dev/null 2>&1; then
+      found=$(jq -cn --argjson f "$found" --argjson id "$id" --argjson a "$attempt" '$f + [{ id: $id, attempt: $a }]') || return 1
     fi
   done <<< "$rows"
   printf '%s\n' "$found"
@@ -2028,6 +2020,16 @@ ci_wait_read_pr() {
 # is caught before either case: on a conflicting PR a `pull_request` run can
 # never register, so without that check ci-wait would wait out the whole
 # window for nothing.
+# Whether run <id> has visibly moved past attempt <n> (a "<id>:<n>" pair): it
+# is no longer `completed`, or its run_attempt is past n. A failed read is
+# "not moved" — never taken as a re-run that started.
+ci_wait_run_moved() {
+  local reg
+  reg=$(gh api "repos/$REPO/actions/runs/${1%%:*}" --jq '"\(.status)\t\(.run_attempt // 1)"' 2>/dev/null) || return 1
+  [ "${reg%%$'\t'*}" != completed ] && return 0
+  [[ "${reg#*$'\t'}" =~ ^[0-9]+$ ]] && [ "${reg#*$'\t'}" -gt "${1#*:}" ]
+}
+
 ci_wait_main() {
   local head="" timeout="${CODEX_REVIEW_CI_WAIT_SECONDS:-1800}"
   local poll="${CODEX_REVIEW_CI_POLL_SECONDS:-30}" register="${CODEX_REVIEW_CI_REGISTER_SECONDS:-180}"
@@ -2052,7 +2054,7 @@ ci_wait_main() {
   # The quick tier (ci_quick): the runs this call re-ran to request the full
   # suite, as " <id>:<attempt>" keys; those whose re-run has not visibly
   # started; and when it last asked.
-  local requested="" awaiting="" still reg request_at=0 pairs pair id
+  local requested="" awaiting="" still request_at=0 pairs pair id
   start=$(date +%s) || exit 1
   # The deadline covers the whole command, including the mergeability phase
   # below.
@@ -2172,7 +2174,21 @@ ci_wait_main() {
                 echo "ci=error head=$head: re-ran run $id twice and it came back quick again ($verdict); re-run all its jobs by hand, not --failed" >&2
                 exit 1
               fi
+              # The verdict can be stale: someone may already have re-run it.
+              # Then there is nothing to request — the next tick judges the
+              # new attempt — and the same holds when a POST is refused
+              # because a re-run began in between.
+              if ci_wait_run_moved "$pair"; then
+                echo "ci-wait: run $id has already moved past attempt ${pair#*:}; not re-running it"
+                requested="$requested $pair"
+                continue
+              fi
               if ! gh api -X POST "repos/$REPO/actions/runs/$id/rerun" >/dev/null; then
+                if ci_wait_run_moved "$pair"; then
+                  echo "ci-wait: run $id started another attempt while this asked; not re-running it"
+                  requested="$requested $pair"
+                  continue
+                fi
                 echo "ci=error head=$head: could not re-run run $id to request the full suite (this needs Actions write on $REPO); re-run all its jobs by hand, then ci-wait again" >&2
                 exit 1
               fi
@@ -2193,9 +2209,7 @@ ci_wait_main() {
         if [ -n "$awaiting" ]; then
           still=""
           for pair in $awaiting; do
-            reg=$(gh api "repos/$REPO/actions/runs/${pair%%:*}" --jq '"\(.status)\t\(.run_attempt // 1)"' 2>/dev/null) || { still="$still $pair"; continue; }
-            if [ "${reg%%$'\t'*}" != completed ] || [ "${reg#*$'\t'}" -gt "${pair#*:}" ] 2>/dev/null; then continue; fi
-            still="$still $pair"
+            ci_wait_run_moved "$pair" || still="$still $pair"
           done
           awaiting="$still"
           if [ -n "$awaiting" ] && [ $((now - request_at)) -ge "$register" ]; then
