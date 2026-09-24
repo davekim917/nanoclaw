@@ -250,8 +250,8 @@ function toOutput(session: ScopedSession, row: TaskRow) {
     has_script: content.script ? 1 : 0,
     script_host: content.scriptHost ? 1 : 0,
     thread_anchor: content.threadAnchor ? 1 : 0,
-    // Each fire starts fresh unless thread-bound, --continuous or a dispatch event (modules/scheduling/fresh-context.ts).
-    context: taskFiresFresh(row.thread_id, row.content) ? 'fresh' : 'continuous',
+    // Each fire starts fresh unless --continuous or a dispatch event (modules/scheduling/fresh-context.ts).
+    context: taskFiresFresh(row.content) ? 'fresh' : 'continuous',
     origin_session_id: content.originSessionId, // which session created the task (null for CLI-created)
     // The per-fire pin, EXACTLY as stored. Until this landed, `ncl tasks` had
     // no way to show an operator what a series was pinned to — which is half
@@ -1717,7 +1717,7 @@ registerResource({
           name: 'continuous',
           type: 'boolean',
           description:
-            'Resume one conversation across fires. Default: each scheduled fire starts fresh, except a thread-bound series (--thread / --thread-id), which always continues. Use only when a fire relies on what earlier fires said, not on files or task state.',
+            'Resume one conversation across fires. Default: each scheduled fire starts fresh, thread-bound or not. Use only when a fire relies on what earlier fires said, not on files or task state.',
         },
         {
           name: 'messaging_group',
@@ -1819,8 +1819,7 @@ registerResource({
         {
           name: 'continuous',
           type: 'boolean',
-          description:
-            'true = fires resume one conversation; false = each scheduled fire starts fresh (the default). A thread-bound series always continues.',
+          description: 'true = fires resume one conversation; false = each scheduled fire starts fresh (the default).',
         },
         { name: 'recurrence', type: 'string', description: 'New cron expression; "null"/"none" clears it (one-shot).' },
         {

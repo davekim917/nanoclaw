@@ -806,7 +806,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
     // A scheduled fire starts with no resumed conversation unless its series is
-    // thread-bound or --continuous — the /clear reset above, without its chat
+    // --continuous — the /clear reset above, without its chat
     // notice (fresh-context-task.ts).
     const freshFire = continuation !== undefined && startsFreshFire(keep);
     if (freshFire) {

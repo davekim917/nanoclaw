@@ -14,19 +14,20 @@
  * error recovery (context too long, a stale session). The reset clears only the provider continuation; the session row, its
  * id and `thread_id = system:tasks:<seriesId>` are untouched.
  *
- * A fire keeps the conversation when its row is thread-bound (`thread_id` set:
- * `ncl tasks create --thread` / `--thread-id`, src/cli/resources/tasks.ts:308-329,
- * carried by every re-arm, src/modules/mailbox/ops/tasks.ts:330), marked
- * `continuous: true`, or a keyed dispatch event (`content.dispatch`,
- * src/modules/mailbox/ops/task-dispatch.ts:152). This mirrors
+ * A fire keeps the conversation only when its row is marked `continuous: true`
+ * or is a keyed dispatch event (`content.dispatch`,
+ * src/modules/mailbox/ops/task-dispatch.ts:152). A thread-bound row (`thread_id`
+ * set by `--thread` / `--thread-id`) still starts fresh: the thread is where the
+ * fire posts, not a conversation it resumes — every task row lands in its
+ * series' own task session (`scheduleTask` → `resolveTaskSession`,
+ * src/db/scheduled-tasks.ts:293), never the thread's chat session. This mirrors
  * `taskRowFiresFresh` in the runner; keep the two in step. The runner alone
  * also resumes a retry of an interrupted fire (`tries > 0`); recall built here
  * for such a retry just repeats bootstrap context the resumed session has.
  */
 
-/** Whether a scheduled fire of a task row with this routing thread and content starts fresh. */
-export function taskFiresFresh(threadId: string | null | undefined, rawContent: string): boolean {
-  if (threadId) return false;
+/** Whether a scheduled fire of a task row with this content starts fresh. */
+export function taskFiresFresh(rawContent: string): boolean {
   try {
     const c = JSON.parse(rawContent) as { continuous?: unknown; dispatch?: unknown } | null;
     return c?.continuous !== true && c?.dispatch === undefined;
