@@ -839,6 +839,49 @@ export async function addDiscordThreadMembers(
   }
 }
 
+/**
+ * Open the thread the live Gateway path would have opened for a channel-root
+ * @mention that only channel recovery saw.
+ *
+ * On a root mention, @chat-adapter/discord creates a thread from the message
+ * before dispatch (`handleGatewayMessage` → `createDiscordThread`), so the
+ * mention routes to its own per-thread session. A mention that arrives while
+ * the Gateway is down (an event-loop stall long enough to drop it) is found
+ * later by REST history, which has no such step: it routed to the channel's
+ * thread-less session and the reply landed at channel root.
+ *
+ * A thread created from a message shares its snowflake, and 160004 means one
+ * already exists — both yield `<platformId>:<messageId>`. Any other failure
+ * returns null, matching the adapter, which also answers at root when it
+ * cannot create the thread.
+ */
+export async function openRecoveredMentionThread(
+  rest: Pick<DiscordThreadRestClient, 'post'>,
+  platformId: string,
+  message: { id: string; text?: string },
+): Promise<string | null> {
+  const [scheme, guildId, channelId, threadId] = platformId.split(':');
+  if (scheme !== 'discord' || !guildId || guildId === '@me' || !channelId || threadId) return null;
+  try {
+    await rest.post(Routes.threads(channelId, message.id), {
+      // Provisional: maybeRenameNewThread retitles it like any mention-opened thread.
+      body: { name: discordThreadNameFrom(message.text?.replace(/<@!?\d+>/g, '')), auto_archive_duration: 1440 },
+    });
+    log.info('Discord thread opened for recovered mention', { channelId, messageId: message.id });
+    // eslint-disable-next-line no-catch-all/no-catch-all -- every failure degrades to a root reply, as the adapter's does
+  } catch (err) {
+    if ((err as { code?: unknown }).code !== RESTJSONErrorCodes.ThreadAlreadyCreatedForMessage) {
+      log.warn('Discord thread create for recovered mention failed — answering at channel root', {
+        channelId,
+        messageId: message.id,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  }
+  return `${platformId}:${message.id}`;
+}
+
 function isDiscordUnknownChannelError(err: unknown): boolean {
   // @chat-adapter/discord@4.29.0 serialises HTTP failures into the message text, not a code field:
   // `Discord API error: ${response.status} ${errorText}` (dist/index.js:1661, discordFetch) and
@@ -1042,6 +1085,7 @@ for (const ws of workspaces) {
           const raw = message.raw as { mentions?: Array<{ id?: string }> } | undefined;
           return raw?.mentions?.some((mention) => mention.id === identity.userId) === true;
         },
+        threadRecoveredRootMention: (platformId, message) => openRecoveredMentionThread(rest, platformId, message),
         // Match the live Gateway patch: self echoes are removed by the bridge;
         // among remaining bots, only known NanoClaw siblings are admissible.
         allowRecoveredBotMessage: (message) => {
