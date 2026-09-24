@@ -17,14 +17,27 @@ def never_started: .status == "completed" and ((.steps // []) | length) == 0 and
 def run_never_started: [ .[].jobs[]? ] | length > 0 and all(.[]; never_started) and any(.[]; .conclusion == "failure");
 
 # A quick-tier attempt, given its jobs listing in the same slurped shape: the
-# repo's CI ran only its cheap per-push checks on this commit and failed its
-# `CI Quick` gate on purpose, because the full suite runs only when that run is
-# re-run (the repo's .github/workflows/ci.yml declares the two tiers). Its job named
-# `CI Quick` concluded failure and every other job succeeded or was skipped; any
-# other failure is a real red. It is not evidence about the head either way:
-# ci_verdict reads it as ci_quick (never green, never red), ci-wait answers it
-# by requesting the re-run, and never_started_runs skips an earlier quick
-# attempt instead of counting it as a genuine failure.
+# repo's CI ran only its cheap per-push checks on this commit and stopped on
+# purpose, because the full suite runs only when that run is re-run (the
+# repo's .github/workflows/ci.yml declares the two tiers). Evidence, not
+# names alone: exactly one job named `CI Quick`, concluded failure, in which
+# the step `Full CI has not run on this commit` is the one that failed and
+# every other step passed or was skipped (so the gate's own verdict passed
+# first), and every other job in the run passed or was skipped. Anything else
+# is a real red. It is not evidence about the head either way: ci_verdict
+# reads it as ci_quick (never green, never red), ci-wait answers it by
+# requesting the re-run, and never_started_runs neither counts it nor lets it
+# disqualify the workflow.
 def quick_only: [ .[].jobs[]? ] as $jobs
-  | ($jobs | any(.[]; .name == "CI Quick" and .conclusion == "failure"))
+  | [ $jobs[] | select(.name == "CI Quick") ] as $gate
+  | ($gate | length) == 1
+    and $gate[0].conclusion == "failure"
+    and ([ $gate[0].steps[]? | select(.name == "Full CI has not run on this commit" and .conclusion == "failure") ] | length) == 1
+    and ([ $gate[0].steps[]? | select(.name != "Full CI has not run on this commit") | select((.conclusion // "") | IN("success", "skipped", "neutral") | not) ] | length) == 0
     and ($jobs | all(.[]; .name == "CI Quick" or ((.conclusion // "") | IN("success", "skipped", "neutral"))));
+
+# Whether a jobs listing (slurped) is attempt $a's. The plain /jobs route
+# answers for the run's LATEST attempt, which a re-run can advance past the
+# attempt the runs listing reported; a page from another attempt describes
+# other jobs. A job without run_attempt is taken as $a (GitHub always sends it).
+def jobs_of_attempt($a): all(.[].jobs[]?; (.run_attempt // $a) == $a);
