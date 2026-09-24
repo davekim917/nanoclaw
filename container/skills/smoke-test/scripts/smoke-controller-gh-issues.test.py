@@ -201,6 +201,40 @@ class FindingIssue(unittest.TestCase):
         self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
         self.assertEqual(self.c.decisions[-1]["duplicateOf"], 5)
 
+    def issue_lists(self):
+        with open(os.environ["FAKE_LOG"]) as fh:
+            return sum(1 for line in fh if json.loads(line)["argv"][:2] == ["issue", "list"])
+
+    def spec(self, fid, title):
+        (Path(self.c.args.run_root) / RUN / "controller" / "issues" / "{}.json".format(fid)).write_text(
+            json.dumps({"title": title, "labels": ["P3"]}))
+
+    def test_the_dedup_listing_runs_once_per_fire(self):
+        self.gh(labels=["smoke-finding", "severity:p3"])
+        self.spec("CF-2", "Second finding")
+        self.c.github(RUN, "synthesis", "issue:CF-1")
+        self.c.github(RUN, "synthesis", "issue:CF-2")
+        self.assertEqual(self.issue_lists(), 1)
+        self.assertEqual(len(self.filed()), 2)
+
+    def test_the_cached_listing_learns_an_issue_this_fire_filed(self):
+        # Two findings with one title in one fire: the second must dedup
+        # against the first, exactly as a fresh listing would have let it.
+        self.gh(labels=["smoke-finding", "severity:p3"])
+        self.spec("CF-2", "Upload preview missing")
+        self.c.github(RUN, "synthesis", "issue:CF-1")
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-2"), "done")
+        [issue] = self.filed()
+        self.assertEqual(self.c.decisions[-1]["duplicateOf"], issue["number"])
+
+    def test_an_unconfirmed_create_makes_the_next_obligation_relist(self):
+        self.gh(labels=["smoke-finding", "severity:p3"])
+        (self.state / "faults.json").write_text(json.dumps({"gh:issue-create": ["fail-before"]}))
+        self.spec("CF-2", "Second finding")
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "intent")
+        self.c.github(RUN, "synthesis", "issue:CF-2")
+        self.assertEqual(self.issue_lists(), 2)
+
     def test_a_label_listing_that_is_not_a_list_or_is_at_its_cap_is_unknown(self):
         self.gh(labelListRaw='{"message": "Not Found"}')
         self.assertIsNone(self.fx._labels_of("org/xzo"))
