@@ -63,9 +63,10 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
   // Fable 5.1 (GA 2026-09-01): two-segment version scheme (claude-fable-5-1),
   // like opus-4-8. 1M-context-only in this fork, same policy as opus. NOTE:
   // $10/$50 per MTok — 2x Opus 4.8; opt-in via flag, never a default. Bare
-  // `fable` tracks the newest fable — currently 5.1. Fable 5 (claude-fable-5,
-  // single-digit version scheme) is still served and stays pinned below.
-  fable: 'claude-fable-5-1[1m]',
+  // `fable` is a FAMILY alias (FAMILY_DEFAULTS below), not an entry here, so
+  // a stored `fable` tracks DEFAULT_FABLE_MODEL across bumps. Fable 5
+  // (claude-fable-5, single-digit version scheme) is still served and stays
+  // pinned below.
   fable51: 'claude-fable-5-1[1m]',
   'fable5-1': 'claude-fable-5-1[1m]',
   'fable-5-1': 'claude-fable-5-1[1m]',
@@ -97,18 +98,39 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
 export const DEFAULT_OPUS_MODEL = 'claude-opus-5-5[1m]';
 export const DEFAULT_SONNET_MODEL = 'claude-sonnet-5';
 export const DEFAULT_HAIKU_MODEL = 'claude-haiku-4-5-20251001';
+export const DEFAULT_FABLE_MODEL = 'claude-fable-5-1[1m]';
 
 /**
  * Bare FAMILY aliases. Deliberately NOT in MODEL_ALIAS_MAP: storing `opus`
  * keeps a sticky choice tracking the family default across future bumps,
  * whereas `opus5` freezes to that version. Resolution happens at the point of
- * USE (spawn env, chat ack), not at the point of storage.
+ * USE (spawn env, chat ack), not at the point of storage. Inside the
+ * container the CLI resolves each bare family word through
+ * ANTHROPIC_DEFAULT_<FAMILY>_MODEL (claudeSpawnEnv), so a per-turn `fable`
+ * reaches the API as DEFAULT_FABLE_MODEL too.
  */
 const FAMILY_DEFAULTS: Record<string, string> = {
   opus: DEFAULT_OPUS_MODEL,
   sonnet: DEFAULT_SONNET_MODEL,
   haiku: DEFAULT_HAIKU_MODEL,
+  fable: DEFAULT_FABLE_MODEL,
 };
+
+/**
+ * Codex FAMILY aliases: each names the newest model of that family (GPT-6
+ * Sol/Luna/Astra GA 2026-09-22; Terra has no GPT-6 release). Like the Claude
+ * families they are stored as typed and resolved at USE, so a pin on `sol`
+ * follows the next Sol release with no repin. The Codex CLI has no alias
+ * mechanism of its own, so the host hands this map to every container as
+ * NANOCLAW_CODEX_MODEL_ALIASES and the Codex provider resolves through it
+ * (container/agent-runner/src/providers/model-vocabulary.ts).
+ */
+export const CODEX_FAMILY_DEFAULTS: Readonly<Record<string, string>> = Object.freeze({
+  sol: 'gpt-6-sol',
+  luna: 'gpt-6-luna',
+  astra: 'gpt-6-astra',
+  terra: 'gpt-5.6-terra',
+});
 
 /**
  * The concrete model a raw `-m` value / stored default actually runs as:
@@ -117,7 +139,13 @@ const FAMILY_DEFAULTS: Record<string, string> = {
  * no family key collides with them.
  */
 export function resolveEffectiveModel(raw: string): string {
-  return resolveModelAlias(FAMILY_DEFAULTS[raw.toLowerCase()] ?? raw);
+  const key = raw.toLowerCase();
+  const family = Object.hasOwn(FAMILY_DEFAULTS, key)
+    ? FAMILY_DEFAULTS[key]
+    : Object.hasOwn(CODEX_FAMILY_DEFAULTS, key)
+      ? CODEX_FAMILY_DEFAULTS[key]
+      : undefined;
+  return resolveModelAlias(family ?? raw);
 }
 
 const VALID_MODEL_RE =
@@ -127,7 +155,7 @@ const VALID_MODEL_RE =
   // constant — so `-m haiku`, which resolveEffectiveModel maps to that id,
   // failed validation and fell through to the opus default at the spawn seam,
   // silently running Opus for a group that asked for Haiku.
-  /^(?:opus|sonnet|haiku|default|claude-opus-\d+(?:-\d+)?(?:\[\dm\])?|claude-haiku-\d+-\d+(?:-\d+)?(?:\[\dm\])?|claude-sonnet-\d+(?:\[\dm\])?|claude-fable-\d+(?:-\d+)?(?:\[\dm\])?)$/;
+  /^(?:opus|sonnet|haiku|fable|default|claude-opus-\d+(?:-\d+)?(?:\[\dm\])?|claude-haiku-\d+-\d+(?:-\d+)?(?:\[\dm\])?|claude-sonnet-\d+(?:\[\dm\])?|claude-fable-\d+(?:-\d+)?(?:\[\dm\])?)$/;
 
 /**
  * Opus is only supported in its 1M-context form in this fork. Auto-append
@@ -192,6 +220,8 @@ const MODEL_EFFORT_SUPPORT: Record<string, ReadonlySet<EffortLevel>> = {
   'claude-opus-5[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
   // Opus 5.5: same full ladder. Bare `opus` resolves here (DEFAULT_OPUS_MODEL).
   'claude-opus-5-5[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
+  // Bare `fable` resolves to DEFAULT_FABLE_MODEL (Fable 5.1) — same surface.
+  fable: new Set(['low', 'medium', 'high', 'xhigh', 'max']),
   // Fable 5: full effort surface (docs/en/build-with-claude/effort, verified
   // 2026-06-09). Adaptive thinking is ALWAYS ON for fable — `disabled` is
   // rejected by the API — so effort is the only depth control.
@@ -222,16 +252,8 @@ const CODEX_MODEL_ALIAS_MAP: Record<string, string> = {
   'gpt6-astra': 'gpt-6-astra',
   'gpt6-sol': 'gpt-6-sol',
   'gpt6-luna': 'gpt-6-luna',
-  // Friendly family names used by the channel-config MCP tool: each names the
-  // NEWEST model of that family (GPT-6 Sol/Luna GA 2026-09-22; Terra has no
-  // GPT-6 release). They resolve when the value is written, so a pin stores
-  // the fully-qualified id and the Codex provider's gpt-* guard remains the
-  // final authority at app-server startup — a stored pin does not follow a
-  // later bump of the alias.
-  sol: 'gpt-6-sol',
-  terra: 'gpt-5.6-terra',
-  luna: 'gpt-6-luna',
-  astra: 'gpt-6-astra',
+  // The bare family names (sol, luna, astra, terra) are NOT here: they are
+  // stored as typed and resolved at use (CODEX_FAMILY_DEFAULTS above).
 };
 
 /**
@@ -272,8 +294,8 @@ const CLAUDE_VOCAB: ProviderFlagVocab = {
 
 const CODEX_VOCAB: ProviderFlagVocab = {
   resolveModel: (raw) => CODEX_MODEL_ALIAS_MAP[raw.toLowerCase()] ?? raw.toLowerCase(),
-  isValidModel: (resolved) => CODEX_VALID_MODEL_RE.test(resolved),
-  modelHint: ' (codex models look like gpt-6-sol, gpt-5.5; aliases: luna|terra|sol|astra)',
+  isValidModel: (resolved) => CODEX_VALID_MODEL_RE.test(resolved) || Object.hasOwn(CODEX_FAMILY_DEFAULTS, resolved),
+  modelHint: ' (codex models look like gpt-6-sol, gpt-5.5; family aliases that follow bumps: luna|terra|sol|astra)',
   validEfforts: CODEX_VALID_EFFORT,
   effortHint: 'low|medium|high|xhigh|max|ultra',
   allowsUltracode: false,

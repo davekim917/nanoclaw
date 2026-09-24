@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url';
 
 import { describe, expect, it } from 'vitest';
 
-import { vocabFor } from '../../src/flag-parser.js';
+import { CODEX_FAMILY_DEFAULTS } from '../../src/flag-parser.js';
 import { readVersionPin } from './version-pins.js';
 
 // Minimum codex-cli per model id, measured with `codex exec -m <id>` under
@@ -32,6 +32,14 @@ const MIN_CODEX_CLI: Record<string, string> = {
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const codexTs = fs.readFileSync(path.join(root, 'container', 'agent-runner', 'src', 'providers', 'codex.ts'), 'utf-8');
 const defaultModel = codexTs.match(/export const DEFAULT_CODEX_MODEL = '([^']+)'/)?.[1];
+const vocabTs = fs.readFileSync(
+  path.join(root, 'container', 'agent-runner', 'src', 'providers', 'model-vocabulary.ts'),
+  'utf-8',
+);
+const runnerFamilyNames = vocabTs
+  .match(/const CODEX_FAMILY_NAMES[^=]*= new Set\(\[([^\]]*)\]\)/)?.[1]
+  ?.match(/'([^']+)'/g)
+  ?.map((q) => q.slice(1, -1));
 
 const semver = (v: string) => v.split('.').map(Number);
 const atLeast = (have: string, need: string) => {
@@ -48,15 +56,23 @@ describe('the pinned codex-cli serves every Codex model the fleet defaults to', 
   });
 
   it.each([
-    ['DEFAULT_CODEX_MODEL', () => defaultModel!],
-    ['alias sol', () => vocabFor('codex').resolveModel('sol')],
-    ['alias luna', () => vocabFor('codex').resolveModel('luna')],
-    ['alias terra', () => vocabFor('codex').resolveModel('terra')],
-    ['alias astra', () => vocabFor('codex').resolveModel('astra')],
+    ['DEFAULT_CODEX_MODEL', () => defaultModel!] as const,
+    ...Object.entries(CODEX_FAMILY_DEFAULTS).map(([name, id]) => [`alias ${name}`, () => id] as const),
   ])('%s is served by the pinned codex-cli', (_label, id) => {
     const need = MIN_CODEX_CLI[id()];
     expect(need, `no MIN_CODEX_CLI row for ${id()}: measure it and add one`).toBeDefined();
     expect(atLeast(pinned, need!), `${id()} needs codex-cli >= ${need}, pinned ${pinned}`).toBe(true);
+  });
+
+  it('the unpinned default is the sol family target', () => {
+    // An unpinned group and a `sol` pin must run the same model.
+    expect(defaultModel).toBe(CODEX_FAMILY_DEFAULTS.sol);
+  });
+
+  it('the runner recognises exactly the host family names', () => {
+    // The runner resolves through the host-sent map but keeps its own list of
+    // names so an unresolved family word is never sent verbatim.
+    expect(runnerFamilyNames?.sort()).toEqual(Object.keys(CODEX_FAMILY_DEFAULTS).sort());
   });
 
   it('refuses a pin below a model minimum (mutation guard)', () => {

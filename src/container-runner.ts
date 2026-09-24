@@ -87,6 +87,7 @@ import { composeGroupClaudeMd } from './claude-md-compose.js';
 // Owns the claude branch's model/effort resolution AND the `-e` strings it
 // emits, so both are reachable from a unit test — buildContainerArgs is not.
 import { claudeSpawnEnv } from './claude-spawn-defaults.js';
+import { CODEX_FAMILY_DEFAULTS } from './flag-parser.js';
 import { readEnvFileMatching } from './env.js';
 import { resolveGitHubToken as resolveGitHubTokenForContainer } from './github-token.js';
 export { resolveGitHubToken } from './github-token.js';
@@ -6572,6 +6573,11 @@ async function buildContainerArgs(
   const activeChannelModel = providerFallbackApplied ? null : channelDefaults?.channelDefaultModel;
   const activeChannelEffort = providerFallbackApplied ? null : channelDefaults?.channelDefaultEffort;
 
+  // Codex family aliases (`sol`, `luna`, …) are stored as typed and resolved
+  // inside the container, because the Codex CLI has none of its own. Emitted
+  // for every spawn: a Claude-primary group can fall back to Codex, and its
+  // providerFallback.model may name a family.
+  args.push('-e', `NANOCLAW_CODEX_MODEL_ALIASES=${JSON.stringify(CODEX_FAMILY_DEFAULTS)}`);
   if (provider === 'codex') {
     // The Codex provider reads model/reasoning_effort from its strict
     // providerConfig schema. These spawn-scoped envs are overlaid into that

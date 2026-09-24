@@ -3144,20 +3144,28 @@ describe('ncl tasks repin', () => {
     expect(listed.human).toContain('claude-sonnet-5@xhigh');
   });
 
-  it('persists the RESOLVED model, not the alias the operator typed', async () => {
-    // `astra` is accepted only BECAUSE it resolves to `gpt-6-astra`. Storing
-    // the raw alias persists a value the validator never approved, and
-    // codex.ts::resolveQueryModel accepts only `gpt-*` — it would silently fall
-    // back to the configured model on every fire, forever, with no error.
+  it('persists a family alias as typed, so the pin follows the next release', async () => {
+    // `astra` is a Codex FAMILY alias (CODEX_FAMILY_DEFAULTS): stored as typed
+    // and resolved in the container (resolveCodexFamily), like `opus`. A
+    // pinned dot-form alias still resolves at write — see the case below.
     await makePinGroup('ag-cx', 'codex');
     const t = await makePinnedTask('ag-cx', 'alias', { model: 'gpt-5.6-sol' });
 
     const r = await repin({ group: 'ag-cx', from_model: 'gpt-5.6-sol', to_model: 'astra' });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(storedTaskPin('ag-cx', t.session_id, t.series_id)).toEqual({ turnModel: 'gpt-6-astra' });
-    // The dry-run/report view must show the stored value too, not the alias.
-    expect((r.data as { changes: Array<{ to: { model: string } }> }).changes[0].to.model).toBe('gpt-6-astra');
+    expect(storedTaskPin('ag-cx', t.session_id, t.series_id)).toEqual({ turnModel: 'astra' });
+    expect((r.data as { changes: Array<{ to: { model: string } }> }).changes[0].to.model).toBe('astra');
+  });
+
+  it('persists a pinned version alias RESOLVED', async () => {
+    await makePinGroup('ag-cx2', 'codex');
+    const t = await makePinnedTask('ag-cx2', 'alias', { model: 'gpt-5.6-sol' });
+
+    const r = await repin({ group: 'ag-cx2', from_model: 'gpt-5.6-sol', to_model: 'gpt6-astra' });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(storedTaskPin('ag-cx2', t.session_id, t.series_id)).toEqual({ turnModel: 'gpt-6-astra' });
   });
 
   it('validates the MERGED pin, not just the half being written', async () => {

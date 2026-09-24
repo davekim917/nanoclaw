@@ -97,8 +97,9 @@ type ParsedChannelValue = { value?: string | null; error?: string };
 
 /**
  * Channel defaults use the same provider-aware vocabulary as chat flags.
- * Codex's friendly `luna`/`terra`/`sol` names are normalized to gpt-* ids;
- * other providers retain their existing model strings for forward-compatible
+ * A Codex value goes through the flag vocabulary: dot forms (`gpt6-sol`)
+ * normalize to gpt-* ids, and the family names (`sol`/`luna`/`astra`/`terra`)
+ * are kept as typed so the wiring follows the next release; other providers retain their existing model strings for forward-compatible
  * SDK ids. Effort is validated for every provider so `max`/`ultra` cannot be
  * written to a Claude or OpenCode wiring by accident.
  */

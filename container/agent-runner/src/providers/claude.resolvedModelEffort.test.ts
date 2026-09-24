@@ -96,6 +96,15 @@ describe('family-default effort follows the RESOLVED model, not the opus alias',
     expect(o?.effort).toBe('medium');
   });
 
+  it('test_bare_fable_turn_pin_gets_fables_family_default', () => {
+    // A task pin or sticky stores bare `fable` (the CLI resolves it through
+    // ANTHROPIC_DEFAULT_FABLE_MODEL); it must default like a Fable id, not
+    // fall through to the catch-all `high`.
+    const o = turn({}, { groupModel: 'claude-opus-5-5[1m]' }, { model: 'fable' });
+    expect(o?.model).toBe('fable');
+    expect(o?.effort).toBe('medium');
+  });
+
   it('test_opus_default_group_gets_opus_family_default', () => {
     // Opus defaults to `high` — the fleet baseline (operator decision 2026-09-24;
     // was `medium` from 2026-09-22, `high` before that from 2026-09-16).
