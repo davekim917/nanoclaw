@@ -95,9 +95,11 @@ export function readTaskSettlement(
       state.provider_executing === 1,
       readContinuationPresence(outbound) !== null,
     );
-    // A completed fire row never keeps its recurrence (the next occurrence carries
-    // it), so the observer's own series is identified by id and task thread, and
-    // only a recurring, inert, future row of that series is exempt.
+    // A completed fire row never keeps its recurrence: re-arming inserts the next
+    // occurrence and clears the original's recurrence in one transaction
+    // (`armNextTask`, src/modules/mailbox/ops/tasks.ts:344-356). So the
+    // observer's own series is identified by id and task thread, and only a
+    // recurring, inert, future row of that series is exempt.
     const observerSeries = observer && row.series_id && threadId === taskThreadId(row.series_id) ? row.series_id : null;
     const obligations = (
       inbound
