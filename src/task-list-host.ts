@@ -6,10 +6,9 @@
  * `session_state.task_list`. The host does four small things, all here so the
  * upstream-owned delivery and typing modules carry only one-line hooks:
  *
- *   - the switch's delivery gate, plus the fence that stops a killed
- *     container's queued update from reviving a list marked interrupted
- *     (`taskListRowAdmissible`);
- *   - marking a list interrupted when its container is killed mid-work
+ *   - coalescing queued edits of one list (`supersededTaskListEdits`);
+ *   - marking a list interrupted when its container is killed mid-work,
+ *     fenced so the dead container's queued updates cannot revive it
  *     (`settleTaskListOnKill`);
  *   - the platform status line's text — "is working: <current item>"
  *     (`setTypingStatusText` / `typingStatusFor`);
@@ -18,7 +17,7 @@
  * delivery.ts is reached by dynamic import: it statically imports this module.
  */
 import { TASK_LIST_ENABLED } from './config.js';
-import { getMessagingGroup, getMessagingGroupByPlatform } from './db/messaging-groups.js';
+import { getMessagingGroup } from './db/messaging-groups.js';
 import { getSession } from './db/sessions.js';
 import { log } from './log.js';
 import { scrubSecrets } from './secret-scrubber.js';
@@ -32,68 +31,89 @@ import { withExistingMailboxSession } from './session-manager.js';
 const IDLE_EXIT_REASONS = new Set(['scheduled-task-idle', 'chat-idle-reap']);
 
 /**
- * Per session, the list revision the host marked interrupted. A queued update
- * from the dead container at or below it must not revive the ✱; a newer
- * container writes higher revisions (the counter lives in the session's
- * durable record) and passes, clearing the fence.
+ * Task-list edits in a delivery batch that a LATER edit of the same message
+ * in the same batch replaces. Every edit carries the whole list, so only the
+ * newest needs to reach the platform; the rest are recorded delivered unsent.
+ * `due` is in delivery order. Posts are never superseded — an edit can only
+ * target a post that already delivered.
  */
-const interruptedTaskLists = new Map<string, number>();
-
-/** Test hook: forget interrupted-list fences (host-memory reset). */
-export function _resetInterruptedTaskListsForTest(): void {
-  interruptedTaskLists.clear();
-}
-
-/** Should delivery send this task_list row? False = record it delivered, post nothing. */
-export function taskListRowAdmissible(sessionId: string, content: Record<string, unknown>): boolean {
-  if (!TASK_LIST_ENABLED) return false;
-  const revision = (content.taskList as { revision?: unknown } | undefined)?.revision;
-  const fence = interruptedTaskLists.get(sessionId);
-  if (fence === undefined || typeof revision !== 'number') return true;
-  if (revision <= fence) return false;
-  interruptedTaskLists.delete(sessionId);
-  return true;
+export function supersededTaskListEdits(
+  due: ReadonlyArray<{ id: string; kind: string; content: string }>,
+): Set<string> {
+  const latestByTarget = new Map<string, string>();
+  const superseded = new Set<string>();
+  for (const row of due) {
+    if (row.kind !== 'task_list') continue;
+    let target: unknown;
+    try {
+      const content = JSON.parse(row.content) as { operation?: unknown; messageId?: unknown };
+      target = content.operation === 'edit' ? content.messageId : undefined;
+    } catch {
+      continue;
+    }
+    if (typeof target !== 'string') continue;
+    const previous = latestByTarget.get(target);
+    if (previous) superseded.add(previous);
+    latestByTarget.set(target, row.id);
+  }
+  return superseded;
 }
 
 /**
  * Edit a session's unfinished task list to its "interrupted" form because its
  * container is being killed mid-work, so a dead agent never leaves a
- * live-looking list. The runner pre-renders that form on every update
- * (`interruptedText`), so the host renders nothing. Never throws.
+ * live-looking list. Never throws.
+ *
+ * Ordered and fenced through the session's delivery slot: it waits for any
+ * drain in flight, records the dead container's still-queued list rows
+ * delivered-unsent (durably, in inbound.db, so a host restart cannot replay
+ * them over the interrupted form), then edits. Where it edits comes from
+ * host-owned evidence (`getTaskListSettlement`) and must be the session's own
+ * conversation; only the wording — pre-rendered by the runner on every update
+ * — comes from the container's record.
  */
 export async function settleTaskListOnKill(sessionId: string, reason: string): Promise<void> {
   setTypingStatusText(sessionId, null);
   if (!TASK_LIST_ENABLED || IDLE_EXIT_REASONS.has(reason)) return;
+  const killedAt = new Date().toISOString();
   try {
-    const { getDeliveryAdapter } = await import('./delivery.js');
-    const adapter = getDeliveryAdapter();
     const session = await getSession(sessionId);
-    if (!adapter || !session) return;
-    const list = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-      mailbox.readTaskList(),
-    );
-    if (!list || list.finished || list.stale) return;
-    interruptedTaskLists.set(sessionId, list.revision);
-    const origin = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
-    const mg =
-      origin && origin.channel_type === list.channelType && origin.platform_id === list.platformId
-        ? origin
-        : await getMessagingGroupByPlatform(list.channelType, list.platformId);
-    await adapter.deliver(
-      list.channelType,
-      list.platformId,
-      list.threadId,
-      'task_list',
-      JSON.stringify({
-        operation: 'edit',
-        messageId: list.platformMessageId,
-        text: scrubSecrets(list.interruptedText),
-        subtext: list.interruptedSubtext,
-      }),
-      undefined,
-      mg?.instance,
-    );
-    log.info('Task list marked interrupted', { sessionId, reason, revision: list.revision });
+    const origin = session?.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
+    if (!session || !origin) return;
+    const { getDeliveryAdapter, withSessionDeliverySlot } = await import('./delivery.js');
+    await withSessionDeliverySlot(sessionId, async () => {
+      const adapter = getDeliveryAdapter();
+      if (!adapter) return;
+      const list = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+        const found = mailbox.getTaskListSettlement(killedAt);
+        if (found) for (const rowId of found.staleRowIds) mailbox.markDelivered(rowId, null);
+        return found;
+      });
+      if (!list) return;
+      if (
+        list.channelType !== origin.channel_type ||
+        list.platformId !== origin.platform_id ||
+        list.threadId !== session.thread_id
+      ) {
+        log.warn('Task list is not in this session’s own conversation — not marking it interrupted', { sessionId });
+        return;
+      }
+      await adapter.deliver(
+        list.channelType,
+        list.platformId,
+        list.threadId,
+        'task_list',
+        JSON.stringify({
+          operation: 'edit',
+          messageId: list.platformMessageId,
+          text: scrubSecrets(list.interruptedText),
+          subtext: list.interruptedSubtext,
+        }),
+        undefined,
+        origin.instance,
+      );
+      log.info('Task list marked interrupted', { sessionId, reason, skippedRows: list.staleRowIds.length });
+    });
   } catch (err) {
     log.warn('Failed to mark task list interrupted — leaving its last state', {
       sessionId,

@@ -30,7 +30,8 @@ import { getDeliveredIds } from './modules/mailbox/ops/delivery.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { resolveSession } from './session-manager.js';
 import { deliverSessionMessages, setDeliveryAdapter } from './delivery.js';
-import { _resetInterruptedTaskListsForTest, ackInboundReceipt, settleTaskListOnKill } from './task-list-host.js';
+import { _clearSecretsForTest, registerSecrets } from './secret-scrubber.js';
+import { ackInboundReceipt, settleTaskListOnKill, typingStatusFor } from './task-list-host.js';
 
 const PLATFORM = 'slack:C0AAA';
 const THREAD = 'slack:C0AAA:1786621514.008659';
@@ -58,13 +59,51 @@ function outbound(sessionId: string): Database.Database {
   return new Database(outboundDbPath('ag-1', sessionId));
 }
 
-function insertRow(sessionId: string, id: string, kind: string, content: object): void {
+function insertRow(
+  sessionId: string,
+  id: string,
+  kind: string,
+  content: object,
+  route: { platformId?: string; threadId?: string | null; timestamp?: string } = {},
+): void {
   const db = outbound(sessionId);
   db.prepare(
     `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content)
      VALUES (?, ?, ?, ?, 'slack', ?, ?)`,
-  ).run(id, now(), kind, PLATFORM, THREAD, JSON.stringify(content));
+  ).run(
+    id,
+    route.timestamp ?? now(),
+    kind,
+    route.platformId ?? PLATFORM,
+    route.threadId === undefined ? THREAD : route.threadId,
+    JSON.stringify(content),
+  );
   db.close();
+}
+
+/** Host-owned evidence: the host delivered `id` as platform message `platformMessageId`. */
+function recordDelivered(sessionId: string, id: string, platformMessageId: string): void {
+  const db = new Database(inboundDbPath('ag-1', sessionId));
+  db.prepare(
+    "INSERT INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES (?, ?, 'delivered', ?)",
+  ).run(id, platformMessageId, now());
+  db.close();
+}
+
+/** The list's visible post, delivered by the host, plus the runner's record pointing at it. */
+function seedDeliveredList(sessionId: string, route: { platformId?: string; threadId?: string | null } = {}): void {
+  insertRow(
+    sessionId,
+    'list-1',
+    'task_list',
+    { text: 'Migrating\n✱ Run it', taskList: { revision: 1 } },
+    {
+      ...route,
+      timestamp: new Date(Date.now() - 60_000).toISOString(),
+    },
+  );
+  recordDelivered(sessionId, 'list-1', '1786621600.000100');
+  writeListState(sessionId);
 }
 
 function writeListState(sessionId: string, overrides: Record<string, unknown> = {}): void {
@@ -128,7 +167,7 @@ beforeEach(async () => {
   fs.mkdirSync(TEST_DIR, { recursive: true });
   await initTestDb();
   runMigrations(getRawDb());
-  _resetInterruptedTaskListsForTest();
+  _clearSecretsForTest();
 });
 
 afterEach(async () => {
@@ -165,7 +204,7 @@ describe('task list delivery (switch on)', () => {
 
   it('marks an unfinished list interrupted when its container is killed mid-work', async () => {
     const sessionId = await seed();
-    writeListState(sessionId);
+    seedDeliveredList(sessionId);
     const calls = captureAdapter();
     await settleTaskListOnKill(sessionId, 'absolute-ceiling');
     expect(calls).toEqual([
@@ -182,9 +221,37 @@ describe('task list delivery (switch on)', () => {
     ]);
   });
 
-  it('leaves the list alone when an idle reaper ends a container that already finished working', async () => {
+  it('edits where the host delivered the list, not where the container record claims', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    // A forged record naming another channel and message changes nothing.
+    writeListState(sessionId, { platformId: 'slack:CVICTIM', platformMessageId: '1111111111.000001' });
+    const calls = captureAdapter();
+    await settleTaskListOnKill(sessionId, 'absolute-ceiling');
+    expect(calls).toHaveLength(1);
+    expect(calls[0].content.messageId).toBe('1786621600.000100');
+    expect(calls[0].threadId).toBe(THREAD);
+  });
+
+  it('refuses a list whose delivered post is outside the session’s own conversation', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId, { threadId: 'slack:C0AAA:1700000000.000001' });
+    const calls = captureAdapter();
+    await settleTaskListOnKill(sessionId, 'absolute-ceiling');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('does nothing without host evidence that the post was delivered', async () => {
     const sessionId = await seed();
     writeListState(sessionId);
+    const calls = captureAdapter();
+    await settleTaskListOnKill(sessionId, 'absolute-ceiling');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('leaves the list alone when an idle reaper ends a container that already finished working', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
     const calls = captureAdapter();
     await settleTaskListOnKill(sessionId, 'chat-idle-reap');
     await settleTaskListOnKill(sessionId, 'scheduled-task-idle');
@@ -193,39 +260,77 @@ describe('task list delivery (switch on)', () => {
 
   it('leaves a finished list alone', async () => {
     const sessionId = await seed();
+    seedDeliveredList(sessionId);
     writeListState(sessionId, { finished: true });
     const calls = captureAdapter();
     await settleTaskListOnKill(sessionId, 'absolute-ceiling');
     expect(calls).toHaveLength(0);
   });
 
-  it('never lets the dead container’s queued update revive the list; a newer container’s does', async () => {
+  it('never lets the dead container’s queued update revive the list, across a host restart; a later one does', async () => {
     const sessionId = await seed();
-    writeListState(sessionId, { revision: 4 });
+    seedDeliveredList(sessionId);
+    insertRow(
+      sessionId,
+      'late-edit',
+      'task_list',
+      { operation: 'edit', messageId: '1786621600.000100', text: 'Migrating\n✓ Ran it\n✱ Verify' },
+      { timestamp: new Date(Date.now() - 1_000).toISOString() },
+    );
     const calls = captureAdapter();
     await settleTaskListOnKill(sessionId, 'absolute-ceiling');
     expect(calls).toHaveLength(1);
-
-    const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
-    insertRow(sessionId, 'late-edit', 'task_list', {
-      operation: 'edit',
-      messageId: '1786621600.000100',
-      text: 'Migrating\n✓ Ran it\n✱ Verify',
-      taskList: { generation: 1, revision: 4, activeText: 'Verify' },
-    });
-    await deliverSessionMessages(session);
-    expect(calls).toHaveLength(1);
+    // Recorded delivered in inbound.db — durable, so no host restart replays it.
     expect(await delivered(sessionId)).toContain('late-edit');
 
-    insertRow(sessionId, 'resumed-edit', 'task_list', {
-      operation: 'edit',
-      messageId: '1786621600.000100',
-      text: 'Migrating\n✓ Ran it\n✓ Verified',
-      taskList: { generation: 1, revision: 5, activeText: null },
-    });
+    const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+    await deliverSessionMessages(session);
+    expect(calls).toHaveLength(1);
+
+    insertRow(
+      sessionId,
+      'resumed-edit',
+      'task_list',
+      { operation: 'edit', messageId: '1786621600.000100', text: 'Migrating\n✓ Ran it\n✓ Verified' },
+      { timestamp: new Date(Date.now() + 1_000).toISOString() },
+    );
     await deliverSessionMessages(session);
     expect(calls).toHaveLength(2);
     expect(calls[1].content.text).toBe('Migrating\n✓ Ran it\n✓ Verified');
+  });
+
+  it('sends only the newest of several queued edits to one list', async () => {
+    const sessionId = await seed();
+    const calls = captureAdapter();
+    const base = Date.now();
+    for (const [i, text] of ['one', 'two', 'three'].entries()) {
+      insertRow(
+        sessionId,
+        `edit-${i}`,
+        'task_list',
+        { operation: 'edit', messageId: '1786621600.000100', text },
+        { timestamp: new Date(base + i).toISOString() },
+      );
+    }
+    const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+    await deliverSessionMessages(session);
+    expect(calls.map((c) => c.content.text)).toEqual(['three']);
+    const done = await delivered(sessionId);
+    expect(['edit-0', 'edit-1', 'edit-2'].every((id) => done.has(id))).toBe(true);
+  });
+
+  it('shows the scrubbed item in the status line, never a registered secret', async () => {
+    const sessionId = await seed();
+    registerSecrets({ API_TOKEN: 'sk-live-abcdef123456' });
+    captureAdapter();
+    insertRow(sessionId, 'list-secret', 'task_list', {
+      text: 'T\n✱ Call the API with sk-live-abcdef123456',
+      taskList: { generation: 1, revision: 1, activeText: 'Call the API with sk-live-abcdef123456' },
+    });
+    const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+    await deliverSessionMessages(session);
+    expect(typingStatusFor(sessionId)).not.toContain('sk-live-abcdef123456');
+    expect(typingStatusFor(sessionId)).toMatch(/^is working: Call the API with /);
   });
 
   it('adds the 👀 receipt on Slack only', async () => {

@@ -10,3 +10,10 @@
   `node_modules` confound (the worktree links the live checkout's container `node_modules`, installed SDK
   0.3.272 vs #1126's pinned 0.3.281), not this change.
 - **Repair rounds**: 1 (test harness modelled delivery fate per row; typing module over-cut and restored).
+- **Implementation review round 1** (Codex gpt-6-astra high, read-only sandbox, vendored adversarial prompt +
+  schema): needs-attention, 8 findings. Accepted and fixed: kill-edit authority from host evidence (1), identical
+  retry after pending post dropped (3), memory-only / unordered interruption fence (4), unscrubbed status text (5),
+  list edits holding answers (6, bounded wait + coalescing), switch-off stranding (8, null platform id = failed).
+  Partly accepted: concurrency (2) — MCP-process serialization, no cross-DB transaction (duplicate post at worst);
+  progress parity (7) — spawn-child lists internal; sibling-triggered turns keep lists (explicit agent action, and
+  sibling bots drop list posts at inbound). Each fix has a regression test in task-list(-delivery).test.ts.

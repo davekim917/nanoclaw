@@ -150,7 +150,9 @@ something the plan did not know.
 - **Host pieces live in `src/task-list-host.ts`**; delivery, typing, router and container-runner carry one-line
   hooks (upstream-ratchet growth +105 lines).
 - **Switch**: one env var, `NANOCLAW_TASK_LIST` (default on, `0` off). Host start: delivery gate — `task_list` rows
-  dropped, 💭 status rows posted again. Spawn: `NANOCLAW_TASK_LIST=1` registers the tool.
+  recorded delivered without posting, 💭 status rows posted again. Spawn: `NANOCLAW_TASK_LIST=1` registers the tool.
+  No "task list paused" edit on existing lists: they stop updating. An adopted container reads a row recorded
+  without a platform id as a failed post, so after the switch comes back on its next update posts afresh.
 - **Compaction: next prompt only, never mid-turn.** Upstream reverted a mid-turn post-compaction reminder
   (`a760da7fe`: it made the agent send an unintended message), and no provider emits `compacted` today. The list
   comes back as a prompt prefix after a context reset that keeps the work going (rotation, recovery); `/clear`
@@ -162,8 +164,19 @@ something the plan did not know.
   conversations only.
 - **Repost rule**: the list's post is ≥15 min old and ≥2 conversation messages sit below it.
 - **Kill reasons**: the idle reapers (`chat-idle-reap`, `scheduled-task-idle`) end containers after their work
-  and leave the list as is; every other kill with an unfinished list marks it interrupted and fences older
-  revisions from reviving it.
+  and leave the list as is; every other kill with an unfinished list marks it interrupted.
+- **Kill-time edit (implementation review, Codex gpt-6-astra high)**: runs in the session's delivery slot (after any
+  drain in flight), records the dead container's queued list rows delivered-unsent in inbound.db (durable across a
+  host restart, so nothing replays over the interrupted form), and edits where the HOST delivered the list —
+  the delivered post's own row and `delivered` receipt — only in the session's own conversation. The container's
+  record supplies only the wording. Residual: a row the dying container writes during its SIGTERM grace, after
+  the kill began, can still land.
+- **Delivery**: queued edits of one list coalesce to the newest (the rest recorded delivered-unsent); a
+  rate-limited list edit waits at most once, ≤5 s, then fails into the host retry path, so an answer behind it is
+  not held long. Spawn-child sessions' lists stay internal, as their 💭 did. The status line takes its item from
+  the secret-scrubbed row.
+- **Runner concurrency**: `update_task_list` calls are serialized in the MCP process. Not done: one mailbox
+  transaction around state + outbound write — the crash window between them costs at most a duplicate list post.
 - **Receipt and status line**: 👀 on a live human Slack message when it wakes an agent; the status line reads
   "is thinking…", or "is working: <current item>" once the list has one.
 - **Sibling rooms**: Slack inbound drops a bot post carrying the list footer, so a list never wakes another bot.

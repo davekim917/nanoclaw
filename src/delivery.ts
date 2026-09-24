@@ -59,7 +59,7 @@ import { sessionOutboundStorageStat, type NanoclawMailboxSession } from './modul
 import type { OutboundMessage } from './modules/mailbox/ops/delivery.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import { TASK_LIST_ENABLED } from './config.js';
-import { noteTaskListDelivered, taskListRowAdmissible } from './task-list-host.js';
+import { noteTaskListDelivered, supersededTaskListEdits } from './task-list-host.js';
 import { flagNeedsInput, getTaskByChildSession } from './modules/orchestrator-dispatch/db/tasks.js';
 import { appendRunLog } from './modules/scheduling/run-log.js';
 import { emitDashboardEvent, emitSessionEvent } from './dashboard/api/events.js';
@@ -693,6 +693,27 @@ async function withThreadKeyLock<T>(
  */
 const inflightDeliveries = new Set<string>();
 
+/**
+ * Run `fn` holding this session's delivery slot, waiting (bounded) for a drain
+ * already in flight to finish rather than skipping. For work that must be
+ * ORDERED against the session's deliveries — the live task list's kill-time
+ * edit (src/task-list-host.ts) must land after anything the drain already sent.
+ * Past the wait it runs anyway: a stuck drain must not strand the cleanup.
+ */
+export async function withSessionDeliverySlot<T>(sessionId: string, fn: () => Promise<T>, waitMs = 30_000): Promise<T> {
+  const deadline = Date.now() + waitMs;
+  while (inflightDeliveries.has(sessionId) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const owned = !inflightDeliveries.has(sessionId);
+  if (owned) inflightDeliveries.add(sessionId);
+  try {
+    return await fn();
+  } finally {
+    if (owned) inflightDeliveries.delete(sessionId);
+  }
+}
+
 export interface ChannelDeliveryAdapter {
   deliver(
     channelType: string,
@@ -941,8 +962,21 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
 
   if (outstanding.length === 0) return 'clean';
 
-  const undelivered = snapshot.due.filter((m) => !delivered.has(m.id));
-  if (undelivered.length === 0) return 'pending';
+  const due = snapshot.due.filter((m) => !delivered.has(m.id));
+  if (due.length === 0) return 'pending';
+  // A task-list edit that a later queued edit of the same message replaces is
+  // never sent: the list is whole in every edit, so only the newest matters,
+  // and skipping the rest keeps a busy list off the platform's rate limit.
+  const supersededEdits = supersededTaskListEdits(due);
+  const undelivered = due.filter((m) => !supersededEdits.has(m.id));
+  if (supersededEdits.size > 0) {
+    await ackDelivery(agentGroup.id, session.id, (mailbox) => {
+      for (const id of supersededEdits) mailbox.markDelivered(id, null);
+    });
+    if (undelivered.length === 0) {
+      return outstanding.every((id) => delivered.has(id) || supersededEdits.has(id)) ? 'clean' : 'pending';
+    }
+  }
 
   // Bump `tasks.last_progress_at` once per drain if this session is a
   // spawn-task child. Only `spawn_progress` MCP calls update that column
@@ -970,7 +1004,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
   }
 
   let sawError = false;
-  const deliveredNow = new Set<string>();
+  const deliveredNow = new Set<string>(supersededEdits);
 
   /**
    * Terminal drop for one message, reached either from this tick's own
@@ -1287,7 +1321,11 @@ async function deliverMessage(
   // gate that reaches adopted containers too: off, their list rows go nowhere
   // and the 💭 status posts below come back. A row from a container the host
   // already marked interrupted must not revive the list.
-  if (msg.kind === 'task_list' && !taskListRowAdmissible(session.id, content)) return { recordOnly: true };
+  // A spawn-task child's thread is a work log the dashboard shows; its list
+  // stays internal like its 💭 did.
+  if (msg.kind === 'task_list' && (!TASK_LIST_ENABLED || (await isSpawnChildSession(session.id)))) {
+    return { recordOnly: true };
+  }
 
   let externalOutcomeChannels: string[] = [];
   const wikiGroup = await getAgentGroup(session.agent_group_id);
@@ -2129,7 +2167,8 @@ async function deliverMessage(
   });
 
   // The list's current item becomes the platform's "is working…" status text.
-  if (msg.kind === 'task_list') noteTaskListDelivered(session.id, content);
+  if (msg.kind === 'task_list')
+    noteTaskListDelivered(session.id, JSON.parse(scrubbedContent) as Record<string, unknown>);
 
   // A real chat message supersedes any in-flight progress status. Delete
   // the orphan thinking-block message so it doesn't linger in the thread,

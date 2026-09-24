@@ -226,17 +226,21 @@ describe('applyTaskListUpdate', () => {
     expect(out).toMatchObject({ action: 'edited' });
   });
 
-  it('refuses to stack a second list under an undelivered one, keeping the new items', async () => {
+  it('refuses to stack a second list under an undelivered one, and the identical retry still goes out', async () => {
     const h = harness({ deliver: 'pending' });
     await applyTaskListUpdate(input('T', items(['A', 'in_progress'])), SLACK, h.deps);
-    const out = await applyTaskListUpdate(input('T', items(['A', 'done'], ['B', 'in_progress'])), SLACK, h.deps);
+    const final = input('T', items(['A', 'done'], ['B', 'done']));
+    const out = await applyTaskListUpdate(final, SLACK, h.deps);
     expect(out.ok).toBe(false);
     expect(h.writes).toHaveLength(1);
     expect(h.state?.items).toHaveLength(2);
-    // Once delivered, the next call edits the original post.
+    // The post lands; retrying the SAME final update must reach the platform,
+    // not be mistaken for "nothing changed".
     h.setDeliver('ok');
-    const next = await applyTaskListUpdate(input('T', items(['A', 'done'], ['B', 'done'])), SLACK, h.deps);
-    expect(next).toMatchObject({ action: 'edited' });
+    const retry = await applyTaskListUpdate(final, SLACK, h.deps);
+    expect(retry).toMatchObject({ ok: true, action: 'edited' });
+    expect(h.writes[1].content).toMatchObject({ operation: 'edit', text: 'T\n✓ A\n✓ B' });
+    expect(h.state?.finished).toBe(true);
   });
 
   it('a post the host gave up on is replaced by a fresh post', async () => {

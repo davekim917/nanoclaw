@@ -560,6 +560,8 @@ const SUBTEXT_BUDGET_OVERHEAD = 8;
 
 const MAX_RATE_LIMIT_RETRIES = 3;
 const RATE_LIMIT_BUFFER_MS = 100;
+/** Longest a task-list edit waits on a rate limit before failing into the host retry path. */
+const TASK_LIST_EDIT_MAX_WAIT_MS = 5_000;
 const CARD_TITLE_MAX_CODE_POINTS = 150;
 const DISCORD_MESSAGE_MAX_CODE_UNITS = 2000;
 const DISCORD_BUTTON_LABEL_MAX_CODE_POINTS = 80;
@@ -1400,16 +1402,21 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           : undefined;
         const fitted = limit && editText.length > limit ? splitForLimit(editText, limit)[0].trimEnd() + '…' : editText;
         const editBody = editSubtext ? config.renderSubtext!(wrapBody(fitted), editSubtext) : wrapBody(fitted);
-        // Edits get the same 429 handling as posts: a live task list edits
-        // one message repeatedly, and a dropped edit leaves it showing stale
-        // progress.
+        // Edits get 429 handling like posts: a live task list edits one message
+        // repeatedly, and a dropped edit leaves it showing stale progress. A
+        // task-list edit waits at most once and briefly — it sits in the
+        // session's ordered queue, and an answer behind it must not wait on
+        // progress; past that it fails into the host's retry path, where a
+        // newer queued edit supersedes it (delivery.ts).
+        const listEdit = message.kind === 'task_list';
         for (let attempt = 1; ; attempt++) {
           try {
             await adapter.editMessage(tid, content.messageId as string, editBody);
             return;
           } catch (err) {
             const retryAfterMs = parseRetryAfterMs(err);
-            if (retryAfterMs === null || attempt > MAX_RATE_LIMIT_RETRIES) throw err;
+            if (retryAfterMs === null || attempt > (listEdit ? 1 : MAX_RATE_LIMIT_RETRIES)) throw err;
+            if (listEdit && retryAfterMs > TASK_LIST_EDIT_MAX_WAIT_MS) throw err;
             log.info('chat-sdk-bridge: edit rate-limited, retrying', { attempt, retryAfterMs });
             await sleep(retryAfterMs + RATE_LIMIT_BUFFER_MS);
           }

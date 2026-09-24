@@ -318,8 +318,11 @@ export async function applyTaskListUpdate(
     deps.messagesAfter(current.postSeq) >= TASK_LIST_REPOST_MIN_MESSAGES;
 
   if (current && target && !busy) {
-    if (current.title === input.title && sameItems(current.items, input.items)) {
-      // Nothing visible changed; skip the edit (rate limits).
+    if (current.text === text) {
+      // The platform already shows this render (only the footer time would
+      // change); skip the edit (rate limits). Compared against what was last
+      // WRITTEN, not the stored items: an update saved while the post was
+      // still undelivered is not on screen yet and must go out on the retry.
       deps.save({ ...next, text: current.text, subtext: current.subtext, updatedAt: current.updatedAt });
       return { ok: true, action: 'unchanged', state: next };
     }
@@ -355,10 +358,6 @@ export async function applyTaskListUpdate(
     );
   }
   return { ok: true, action: busy ? 'reposted' : 'posted', state: next };
-}
-
-function sameItems(a: TaskItem[], b: TaskItem[]): boolean {
-  return a.length === b.length && a.every((item, i) => item.text === b[i].text && item.status === b[i].status);
 }
 
 /** Short tool result: counts, not the whole list (the model just sent it). */

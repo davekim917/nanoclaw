@@ -35,6 +35,9 @@ function err(text: string) {
   return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true as const };
 }
 
+/** Serializes update_task_list calls within this MCP server process. */
+let updateChain: Promise<unknown> = Promise.resolve();
+
 export const TASK_LIST_DESCRIPTION =
   'Keep a live task list in this conversation: one checklist message, edited in place, that shows people what you are doing without them watching you work. ' +
   'Use it when the work has several steps or will take more than a couple of minutes. Skip it for a quick answer, a single step, or conversation. ' +
@@ -112,14 +115,21 @@ export const updateTaskList: McpToolDefinition = {
       async awaitPlatformId(outboundId, timeoutMs) {
         const ack = await awaitDeliveryAck(outboundId, timeoutMs);
         if (!ack) return { platformId: null, failed: false };
-        return ack.status === 'delivered'
-          ? { platformId: ack.platformMessageId ?? null, failed: false }
-          : { platformId: null, failed: true };
+        // Delivered with no platform id = the host recorded it without posting
+        // (its task-list switch is off): as good as failed — the next update
+        // posts afresh instead of waiting on a post that will never exist.
+        if (ack.status === 'delivered' && ack.platformMessageId)
+          return { platformId: ack.platformMessageId, failed: false };
+        return { platformId: null, failed: true };
       },
       messagesAfter: (seq) => ops.countConversationMessagesAfter(seq),
       now: () => new Date(),
     };
-    const outcome = await applyTaskListUpdate(input, routing, deps);
+    // One update at a time: each reads, writes and saves the one record, so a
+    // parallel pair must not interleave (duplicate posts, lost revisions).
+    const run = updateChain.then(() => applyTaskListUpdate(input, routing, deps));
+    updateChain = run.catch(() => undefined);
+    const outcome = await run;
     if (!outcome.ok) return err(outcome.error);
     return ok(describeOutcome(outcome));
   },
