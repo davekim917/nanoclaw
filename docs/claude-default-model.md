@@ -17,10 +17,12 @@ This section is the current migration. The model does not move: `DEFAULT_OPUS_MO
 grep -HE '"(effort|defaultEffort)":' groups/*/container.json
 pnpm exec tsx scripts/q.ts data/v2.db "select mga.id, mga.agent_group_id, mga.default_effort from messaging_group_agents mga where coalesce(mga.default_effort,'') <> ''"
 ncl tasks list --json   # rows with effort_pin
-grep -rHE '^effort:' groups/*/.claude/agents
+grep -rHE '^effort:' groups/*/.claude/agents                                    # project scope
+grep -rHE '^effort:' data/v2-sessions/*/.claude-shared/agents 2>/dev/null        # user scope (per group)
+find ~/plugins -type d -name agents -not -path '*/node_modules/*' -exec grep -rHE '^effort:' {} +   # plugin-mounted roles
+# Session stickies (every session's outbound.db; unreadable DBs are reported):
+pnpm exec tsx -e "import Database from 'better-sqlite3'; import fs from 'fs'; for (const g of fs.readdirSync('data/v2-sessions')) { let ss = []; try { ss = fs.readdirSync('data/v2-sessions/' + g) } catch { continue } for (const s of ss) { const p = 'data/v2-sessions/' + g + '/' + s + '/outbound.db'; if (!fs.existsSync(p)) continue; try { const d = new Database(p, { readonly: true }); for (const r of d.prepare(\"select value from session_state where key = 'sticky_effort'\").all()) console.log(g, s, r.value); d.close() } catch (e) { if (!/no such table/.test(e.message)) console.error('UNREADABLE', p, e.message) } } }"
 ```
-
-Session stickies: run the `outbound.db` sweep in `docs/codex-default-model.md` **Detect**, with `key = 'sticky_effort'`.
 
 **Why.** Operator observation, 2026-09-24: after the 2026-09-22 move to `medium`, work reviewed by a second agent needed rework noticeably more often. That is not measured, and it is confounded: the same deploy moved Opus 5 to Opus 5.5. The cost headroom is measured. Over `turn_usage` since 2026-09-15 (human, on_wake and scheduled turns), Opus 5.5 at `medium` averaged $1.88 per turn, against $5.74 for Opus 5 at `high`, so `high` on Opus 5.5 is expected to stay below the pre-09-22 cost.
 
