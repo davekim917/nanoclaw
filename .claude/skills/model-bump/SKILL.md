@@ -65,7 +65,7 @@ Work in a scratch worktree off `origin/main`, never the live checkout. **One PR 
 
 Code:
 - New Claude id: add pinned aliases to `MODEL_ALIAS_MAP` (e.g. `opus55`, `opus5-5`, `opus-5-5` → `claude-opus-5-5[1m]`; Opus and Fable always carry `[1m]`), and add a `MODEL_EFFORT_SUPPORT` row.
-- Default: change the constant for the family that shipped: `DEFAULT_OPUS_MODEL`, `DEFAULT_SONNET_MODEL`, or `DEFAULT_HAIKU_MODEL` (`src/flag-parser.ts:97-99`; bare `opus`/`sonnet`/`haiku` resolve through these), the `fable` entry in `MODEL_ALIAS_MAP`, or `DEFAULT_CODEX_MODEL`. For Codex, also repoint the family alias in `CODEX_MODEL_ALIAS_MAP`. Update that family's resolution tests in `src/flag-parser.test.ts`.
+- Default: change the constant for the family that shipped: `DEFAULT_OPUS_MODEL`, `DEFAULT_SONNET_MODEL`, `DEFAULT_HAIKU_MODEL`, or `DEFAULT_FABLE_MODEL` (`src/flag-parser.ts:98-101`; bare `opus`/`sonnet`/`haiku`/`fable` resolve through these), or, for Codex, that family's entry in `CODEX_FAMILY_DEFAULTS` (`src/flag-parser.ts:128`) and, for Sol, `DEFAULT_CODEX_MODEL` with it (`setup/lib/codex-model-min-cli.test.ts` fails when the two differ). Never add a bare family name to `MODEL_ALIAS_MAP` or `CODEX_MODEL_ALIAS_MAP`: those resolve at write and would freeze the pin. Update that family's resolution tests in `src/flag-parser.test.ts`.
 - Default effort: `defaultEffortForModel` is the only place a Claude family default lives (`src/claude-spawn-defaults.ts` derives none). For Codex it is `DEFAULT_CODEX_EFFORT`.
 - CLI/SDK pins: never hand-edit the manifests. Go through the audited flow (`docs/dependency-updates.md`), which rejects prerelease and yanked releases and regenerates the lock deterministically:
   ```bash
@@ -74,7 +74,7 @@ Code:
   bun scripts/container-updates.ts apply --repo <worktree> --items docker:codex                                             # Codex bump
   ```
   Then record the new pins in **`versions.json`**. `setup/lib/image-version-pins.test.ts` fails if `versions.json` drifts from the Dockerfile or `package.json`, or if claude-code and the SDK differ in patch number. If the audited latest versions of the two differ in patch number, stop and ask; don't hand-pick a pair. The SDK bump changes the deps hash, and spawns refuse until the image is rebuilt (`src/agent-runner-image-check.ts`), so the package edit and the rebuild ship together.
-- New Codex id: add its `MIN_CODEX_CLI` row in `setup/lib/codex-model-min-cli.test.ts` with the minimum version the step-2 probe proved. The test fails when `DEFAULT_CODEX_MODEL` or the `sol` / `luna` / `terra` / `astra` alias targets have no row. Those are hard-coded, so a new alias family needs its own case added to the test.
+- New Codex id: add its `MIN_CODEX_CLI` row in `setup/lib/codex-model-min-cli.test.ts` with the minimum version the step-2 probe proved. The test fails when `DEFAULT_CODEX_MODEL` or any `CODEX_FAMILY_DEFAULTS` target has no row; it reads the map, so a new family is covered automatically. A new family name also goes into the runner's `CODEX_FAMILY_NAMES` (`container/agent-runner/src/providers/model-vocabulary.ts`), which the same test checks against the host map.
 
 Contract (CONTRIBUTING.md "Breaking Changes"). A moved default is breaking:
 - A `[BREAKING]` CHANGELOG entry saying what moves, what's required (CLI minimum, image rebuild), and a link to the migration doc.
