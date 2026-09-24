@@ -2037,9 +2037,7 @@ async function spawnContainer(
 
       child.on('close', (code) => {
         finalizeContainer();
-        if (!hostStoppedContainers.delete(containerName) && code !== 0) {
-          void import('./task-list-host.js').then((m) => m.settleTaskListOnKill(session.id, 'container-exit'));
-        }
+        settleUnexpectedExit(session.id, containerName);
         // code null = killed by signal (normal shutdown path), not a boot failure.
         if (code === 137) {
           log.warn('Container exited 137 — likely OOM kill or forced SIGKILL', {
@@ -2266,6 +2264,17 @@ function clearStatusOnKill(sessionId: string, reason: string): void {
  * OOM, a runner crash — settles it from the close handler instead.
  */
 const hostStoppedContainers = new Set<string>();
+
+/**
+ * Settle the session's task list after an exit the host did not ask for (a
+ * crash, an OOM kill, a runner that quit). Exit codes are not consulted: an
+ * adopted container's `docker wait` exits 0 whatever the container did, and a
+ * list is stale once its container is gone either way.
+ */
+function settleUnexpectedExit(sessionId: string, containerName: string): void {
+  if (hostStoppedContainers.delete(containerName)) return;
+  void import('./task-list-host.js').then((m) => m.settleTaskListOnKill(sessionId, 'container-exit'));
+}
 
 /** Stop a RUNNING container, attaching every exit callback before the stop. */
 function stopRunningContainer(sessionId: string, reason: string, onExit: ContainerExitCallback[]): void {
@@ -2795,6 +2804,7 @@ function onWaiterClose(
   }
   log.info('Adopted container exited', { sessionId, containerName, code, stderrTail });
   finalizeSession(sessionId, channel, null, containerName);
+  settleUnexpectedExit(sessionId, containerName);
 }
 
 function scheduleWaiterRearm(sessionId: string, channel: AdoptedChannel, containerName: string): void {

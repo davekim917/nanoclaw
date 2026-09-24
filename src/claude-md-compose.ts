@@ -31,7 +31,7 @@ import { OUTCOME_REPORTING_INSTRUCTIONS } from './outcome-reporting-instructions
 import os from 'os';
 import path from 'path';
 
-import { GROUPS_DIR } from './config.js';
+import { GROUPS_DIR, TASK_LIST_ENABLED } from './config.js';
 import {
   effectiveOutcomeReporting,
   readContainerConfig,
@@ -393,6 +393,8 @@ export async function composeGroupClaudeMd(
       if (!match) continue;
       const moduleName = match[1];
       if (moduleName === 'cli' && cliDisabled) continue;
+      // The task-list tool is registered only while its switch is on.
+      if (moduleName === 'task-list' && !TASK_LIST_ENABLED) continue;
       desired.set(`module-${moduleName}.md`, flattenClaudeMd(path.join(mcpToolsHostDir, entry)));
     }
   }

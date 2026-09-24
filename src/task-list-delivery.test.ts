@@ -288,13 +288,13 @@ describe('task list delivery (switch on)', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('leaves the list alone when an idle reaper ends a container that already finished working', async () => {
+  it('marks an unfinished list stopped when an idle reaper ends its container, too', async () => {
     const sessionId = await seed();
     seedDeliveredList(sessionId);
     const calls = captureAdapter();
     await settleTaskListOnKill(sessionId, 'chat-idle-reap');
-    await settleTaskListOnKill(sessionId, 'scheduled-task-idle');
-    expect(calls).toHaveLength(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].content.subtext).toContain('stopped');
   });
 
   it('leaves a finished list alone', async () => {

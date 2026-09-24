@@ -9,6 +9,7 @@ import {
   renderBody,
   renderSubtext,
   TASK_LIST_RENDER_MAX,
+  TASK_LIST_DISCORD_REPOST_AFTER_MS,
   TASK_LIST_REPOST_AFTER_MS,
   TASK_LIST_STATE_KEY,
   taskListReminder,
@@ -281,6 +282,21 @@ describe('applyTaskListUpdate', () => {
       taskList: { superseded: true },
     });
     expect(h.state?.supersedes).toBeNull();
+  });
+
+  it('reposts a Discord list before its 1-hour edit cap, even in a quiet channel', async () => {
+    const DISCORD = { channelType: 'discord', platformId: 'discord:1:2', threadId: null };
+    const h = harness({ messagesAfter: 0 });
+    await applyTaskListUpdate(input('T', items(['A', 'in_progress'], ['B', 'pending'])), DISCORD, h.deps);
+    h.advance(TASK_LIST_DISCORD_REPOST_AFTER_MS);
+    const out = await applyTaskListUpdate(input('T', items(['A', 'done'], ['B', 'in_progress'])), DISCORD, h.deps);
+    expect(out).toMatchObject({ action: 'reposted' });
+    // The old copy, still under an hour old, becomes a pointer.
+    expect(h.writes[2].content).toMatchObject({
+      operation: 'edit',
+      messageId: '1786621600.001',
+      taskList: { superseded: true },
+    });
   });
 
   it('does not repost a quiet thread', async () => {

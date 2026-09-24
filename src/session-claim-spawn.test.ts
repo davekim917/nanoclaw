@@ -996,6 +996,8 @@ describe('claim-first spawn', () => {
     waiter.exitCode = 0;
     waiter.emit('close', 0);
     await waitForFinalize('sess-adopter');
+    // The host did not stop it: its task list is settled (docker wait exits 0 either way).
+    await vi.waitFor(() => expect(settleTaskListOnKill).toHaveBeenCalledWith('sess-adopter', 'container-exit'));
   });
 
   // LAST runtime case in the file, deliberately: `stopAllContainers()` latches
