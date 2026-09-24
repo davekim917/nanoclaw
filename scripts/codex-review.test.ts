@@ -1368,6 +1368,21 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     expect(reruns(result.calls)).toBe(3);
   });
 
+  it('a newer run of the workflow from another event does not stand for the PR\'s full suite (mutation: newest run of any event wins)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    const push = { ...workflowRun('CI', 'completed', 'success', '2026-09-05T00:05:00Z'), event: 'push' };
+    runs(root, 'runs-1.json', [quickRun(root), push]);
+    runs(root, 'runs-2.json', [{ ...workflowRun('CI', 'completed', 'success', '2026-09-05T00:09:00Z'), run_attempt: 2 }, push]);
+    runState(root, QUICK, 'completed', 1, 1);
+    runState(root, QUICK, 'queued', 2);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 0, 30]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`requested the full suite on ${HEAD} by re-running run ${QUICK}`);
+    expect(reruns(result.calls)).toBe(1);
+  });
+
   it('merge-check refuses a quick-tier head: the full suite never ran on it (mutation: ci_quick read as green)', () => {
     const root = tempRoot();
     scopeFixture(root, { labels: [], ci: [quickRun(root)], statuses: [] });

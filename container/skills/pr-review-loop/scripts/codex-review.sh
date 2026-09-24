@@ -1291,7 +1291,14 @@ ci_verdict() {
         | select((.name == $labeler and .event == "pull_request_target") | not)
         | if $asof != "" and ((.updated_at // "") as $u | $u == "" or $u > $asof)
           then .status = "updated after the merge" | .conclusion = null else . end ]
-      | group_by(.name) | map(max_by([.run_started_at // .created_at // "", .id // 0])) ) as $runs
+      # Newest run per name, except that a workflow whose newest
+      # pull_request run is a quick tier is judged by THAT run: a newer run
+      # of it from another event (a push of the same sha) is not the
+      # pull request full suite, which only a re-run of the quick run starts.
+      | group_by(.name) | map(
+          ( [ .[] | select(.event == "pull_request") ] | if length > 0 then max_by([.run_started_at // .created_at // "", .id // 0]) else null end ) as $pr
+          | if $pr != null and ($pr.id | IN($quick[] | .id)) then $pr
+            else max_by([.run_started_at // .created_at // "", .id // 0]) end) ) as $runs
     | ( [ .[1][][]? | select(.context as $c | $excluded | index($c) | not)
           | select($asof == "" or (.created_at // "") <= $asof) ]
         | group_by(.context) | map(max_by([.created_at // "", .id // 0])) ) as $statuses
