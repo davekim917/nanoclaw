@@ -37,7 +37,13 @@ import {
   sessionInboundHasMessage,
   upsertSessionRouting,
 } from './ops/ingress.js';
-import { expireClosedSessionPending, expireStalePending, getDueWakePriority, syncProcessingAcks } from './ops/sweep.js';
+import {
+  closeOrphanRecallRows,
+  expireClosedSessionPending,
+  expireStalePending,
+  getDueWakePriority,
+  syncProcessingAcks,
+} from './ops/sweep.js';
 import { INBOUND_SCHEMA } from '../../db/schema.js';
 import { DATA_DIR } from '../../config.js';
 
@@ -1334,6 +1340,139 @@ describe('syncProcessingAcks — script-skip counter', () => {
     syncProcessingAcks(inDb, outDb);
 
     expect(status(inDb, 't1')).toBe('completed');
+  });
+});
+
+describe('syncProcessingAcks — recall row of a finished turn', () => {
+  function freshPair() {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    ensureSchema(DB_PATH, 'inbound');
+    const outPath = path.join(TEST_DIR, 'outbound.db');
+    ensureSchema(outPath, 'outbound');
+    return { inDb: new Database(DB_PATH), outDb: new Database(outPath) };
+  }
+
+  let seq = 0;
+  function row(
+    inDb: InstanceType<typeof Database>,
+    id: string,
+    kind: 'task' | 'system' | 'chat',
+    status = 'pending',
+    trigger = 1,
+  ) {
+    seq += 2;
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, timestamp, status, tries, kind, content, series_id, trigger)
+         VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        seq,
+        new Date().toISOString(),
+        status,
+        kind,
+        JSON.stringify(kind === 'system' ? { subtype: 'recall_context' } : { prompt: 'p' }),
+        id,
+        trigger,
+      );
+  }
+
+  // An admitted pair, as admitDueRow leaves it: recall (trigger 0) + turn (trigger 1).
+  function admittedPair(inDb: InstanceType<typeof Database>, id: string, kind: 'task' | 'chat' = 'task') {
+    row(inDb, `recall-${id}`, 'system', 'pending', 0);
+    row(inDb, id, kind);
+  }
+
+  function ack(outDb: InstanceType<typeof Database>, id: string, status: string) {
+    outDb
+      .prepare('INSERT OR REPLACE INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
+      .run(id, status, new Date().toISOString());
+  }
+
+  const status = (inDb: InstanceType<typeof Database>, id: string) =>
+    (inDb.prepare('SELECT status FROM messages_in WHERE id = ?').get(id) as { status: string }).status;
+
+  it('a script-gated fire (task acked completed, recall never claimed) leaves no pending recall', () => {
+    const { inDb, outDb } = freshPair();
+    admittedPair(inDb, 't-gated');
+    ack(outDb, 't-gated', 'completed');
+
+    syncProcessingAcks(inDb, outDb);
+
+    expect(status(inDb, 't-gated')).toBe('completed');
+    expect(status(inDb, 'recall-t-gated')).toBe('expired');
+  });
+
+  it('a script-errored fire (script-skip:error) closes its recall too', () => {
+    const { inDb, outDb } = freshPair();
+    admittedPair(inDb, 't-err');
+    ack(outDb, 't-err', 'script-skip:error');
+
+    syncProcessingAcks(inDb, outDb);
+
+    expect(status(inDb, 't-err')).toBe('failed');
+    expect(status(inDb, 'recall-t-err')).toBe('expired');
+  });
+
+  it('leaves the recall of a still-pending turn alone (an admitted pair waiting to run)', () => {
+    const { inDb, outDb } = freshPair();
+    admittedPair(inDb, 't-live');
+
+    syncProcessingAcks(inDb, outDb);
+
+    expect(status(inDb, 't-live')).toBe('pending');
+    expect(status(inDb, 'recall-t-live')).toBe('pending');
+  });
+
+  it('a recall the runner claimed and acked keeps its completed status', () => {
+    const { inDb, outDb } = freshPair();
+    admittedPair(inDb, 'c-1', 'chat');
+    ack(outDb, 'c-1', 'completed');
+    ack(outDb, 'recall-c-1', 'completed');
+
+    syncProcessingAcks(inDb, outDb);
+
+    expect(status(inDb, 'recall-c-1')).toBe('completed');
+  });
+
+  it('a late runner ack on an already-closed recall still lands as completed', () => {
+    const { inDb, outDb } = freshPair();
+    admittedPair(inDb, 'c-2', 'chat');
+    ack(outDb, 'c-2', 'completed');
+    syncProcessingAcks(inDb, outDb);
+    expect(status(inDb, 'recall-c-2')).toBe('expired');
+
+    ack(outDb, 'recall-c-2', 'completed');
+    syncProcessingAcks(inDb, outDb);
+
+    expect(status(inDb, 'recall-c-2')).toBe('completed');
+  });
+
+  it('clears an existing backlog in one pass, including targets settled without an ack', () => {
+    const { inDb } = freshPair();
+    for (let i = 0; i < 5; i++) admittedPair(inDb, `old-${i}`);
+    inDb.prepare("UPDATE messages_in SET status = 'completed' WHERE id LIKE 'old-%'").run();
+    row(inDb, 'recall-gone', 'system', 'pending', 0); // target never existed: left to expireStalePending
+    admittedPair(inDb, 'still-due');
+
+    expect(closeOrphanRecallRows(inDb)).toBe(5);
+    expect(closeOrphanRecallRows(inDb)).toBe(0);
+    expect(status(inDb, 'recall-old-4')).toBe('expired');
+    expect(status(inDb, 'recall-gone')).toBe('pending');
+    expect(status(inDb, 'recall-still-due')).toBe('pending');
+  });
+
+  it('never touches a non-recall system row or a recall-prefixed row of another kind', () => {
+    const { inDb } = freshPair();
+    row(inDb, 'done', 'task', 'completed');
+    row(inDb, 'recall-done', 'chat', 'pending'); // not a system row
+    row(inDb, 'sys-note', 'system', 'pending', 0);
+
+    expect(closeOrphanRecallRows(inDb)).toBe(0);
+    expect(status(inDb, 'recall-done')).toBe('pending');
+    expect(status(inDb, 'sys-note')).toBe('pending');
   });
 });
 

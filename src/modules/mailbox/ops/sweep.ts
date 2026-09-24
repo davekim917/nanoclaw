@@ -228,7 +228,48 @@ export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Data
     })();
   }
 
-  return completeAnsweredPendingRows(inDb, outDb);
+  const answered = completeAnsweredPendingRows(inDb, outDb);
+  closeOrphanRecallRows(inDb);
+  return answered;
+}
+
+/**
+ * Close every pending `recall-<X>` row whose target `<X>` is already terminal.
+ *
+ * Admission writes the recall row beside its turn (`admitDueRow`,
+ * src/modules/mailbox/ops/admission.ts:155-175) and a normal turn claims and
+ * acks both. A turn that ends without claiming its recall leaves it pending: a
+ * script-gated or script-errored task fire, where the runner acks only the task
+ * (`completed` or `script-skip:error`,
+ * container/agent-runner/src/modules/mailbox/index.ts:279-292) and defers the
+ * unclaimed rest (container/agent-runner/src/poll-loop.ts:724-740), or a /clear
+ * completed inline. The runner already treats such a row as dead
+ * (container/agent-runner/src/modules/mailbox/selection.ts:341-357), nothing
+ * re-pairs it once its target is terminal (admission needs the target pending,
+ * `DUE_PREDICATE`, admission.ts:90-102), and `expireStalePending` above expires
+ * it 24 hours later anyway. This expires it on the same tick instead, so a
+ * watcher on a 5-minute cadence stops carrying a day of dead recall payloads
+ * through every poll's candidate windows.
+ *
+ * `expired` is exactly the state `expireStalePending` would give it. The query
+ * also matches orphans left before this ran, so the first tick after deploy
+ * clears each visited session's backlog. Idempotent.
+ */
+export function closeOrphanRecallRows(inDb: Database.Database): number {
+  return inDb
+    .prepare(
+      `UPDATE messages_in
+          SET status = 'expired'
+        WHERE id >= 'recall-' AND id < 'recall.'
+          AND kind = 'system'
+          AND status = 'pending'
+          AND EXISTS (
+            SELECT 1 FROM messages_in AS target
+             WHERE target.id = substr(messages_in.id, 8)
+               AND target.status IN ('completed', 'failed', 'expired')
+          )`,
+    )
+    .run().changes;
 }
 
 /**
