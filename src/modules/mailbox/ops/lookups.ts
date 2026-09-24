@@ -264,7 +264,7 @@ export interface TaskListSettlement {
 
 /**
  * Null when there is nothing to settle: no list, a finished or stale one (its
- * queued rows carry its real final state — let them deliver), or one updated
+ * queued rows carry its real final state — let them deliver), or one touched
  * after the kill began, which belongs to a newer container.
  */
 export function getTaskListSettlement(
@@ -283,7 +283,11 @@ export function getTaskListSettlement(
     return null;
   }
   if (record.version !== 1 || record.finished === true || record.stale === true) return null;
-  if (typeof record.updatedAt !== 'string' || !(Date.parse(record.updatedAt) <= Date.parse(killedAt))) return null;
+  // `touchedAt` is stamped on every save (an unchanged or still-pending
+  // update keeps `updatedAt`, the time on screen); a record from a runner
+  // snapshot older than that field falls back to `updatedAt`.
+  const touchedAt = typeof record.touchedAt === 'string' ? record.touchedAt : record.updatedAt;
+  if (typeof touchedAt !== 'string' || !(Date.parse(touchedAt) <= Date.parse(killedAt))) return null;
   const delivered = new Set(
     (inbound.prepare('SELECT message_out_id FROM delivered').all() as Array<{ message_out_id: string }>).map(
       (r) => r.message_out_id,

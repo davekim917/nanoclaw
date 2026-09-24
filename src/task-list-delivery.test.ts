@@ -31,7 +31,12 @@ import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { resolveSession } from './session-manager.js';
 import { deliverSessionMessages, setDeliveryAdapter, withSessionDeliverySlot } from './delivery.js';
 import { _clearSecretsForTest, registerSecrets } from './secret-scrubber.js';
-import { ackInboundReceipt, settleTaskListOnKill, typingStatusFor } from './task-list-host.js';
+import {
+  _clearTaskListCooldownsForTest,
+  ackInboundReceipt,
+  settleTaskListOnKill,
+  typingStatusFor,
+} from './task-list-host.js';
 
 const PLATFORM = 'slack:C0AAA';
 const THREAD = 'slack:C0AAA:1786621514.008659';
@@ -168,6 +173,7 @@ beforeEach(async () => {
   await initTestDb();
   runMigrations(getRawDb());
   _clearSecretsForTest();
+  _clearTaskListCooldownsForTest();
 });
 
 afterEach(async () => {
@@ -326,6 +332,60 @@ describe('task list delivery (switch on)', () => {
     expect(calls).toHaveLength(0);
   });
 
+  it('leaves a list a replacement container re-saved unchanged alone — touchedAt, not the on-screen time, fences it', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    // An identical update keeps updatedAt (the time on screen) but stamps touchedAt.
+    writeListState(sessionId, {
+      updatedAt: new Date(Date.now() - 60_000).toISOString(),
+      touchedAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const calls = captureAdapter();
+    await settleTaskListOnKill(sessionId, 'absolute-ceiling');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('retries a rate-limited interrupted edit after the cooldown instead of losing it', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    const sent: string[] = [];
+    let limited = true;
+    setDeliveryAdapter({
+      async deliver(_c, _p, _t, _kind, content) {
+        if (limited) {
+          limited = false;
+          throw new Error('slack rate_limited: Retry-After: 1');
+        }
+        sent.push((JSON.parse(content) as { text: string }).text);
+        return 'plat-1';
+      },
+    });
+    const started = Date.now();
+    await settleTaskListOnKill(sessionId, 'absolute-ceiling');
+    expect(sent).toEqual(['Migrating\n✓ Ran it\n◌ Verify (interrupted)']);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1_000);
+  });
+
+  it('drops a rate-limited interrupted edit once a replacement container takes the list over', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_c, _p, _t, _kind, content) {
+        if (sent.length === 0) {
+          sent.push('limited');
+          // The replacement container re-saves the list while the edit waits.
+          writeListState(sessionId, { touchedAt: new Date(Date.now() + 60_000).toISOString() });
+          throw new Error('slack rate_limited: Retry-After: 1');
+        }
+        sent.push((JSON.parse(content) as { text: string }).text);
+        return 'plat-1';
+      },
+    });
+    await settleTaskListOnKill(sessionId, 'absolute-ceiling');
+    expect(sent).toEqual(['limited']);
+  });
+
   it('scrubs registered secrets from both interrupted fields', async () => {
     const sessionId = await seed();
     registerSecrets({ API_TOKEN: 'sk-live-abcdef123456' });
@@ -395,6 +455,61 @@ describe('task list delivery (switch on)', () => {
     await new Promise((r) => setTimeout(r, 1_100));
     await deliverSessionMessages(session);
     expect(sent).toEqual(['chat:Done: A.', 'task_list:T\n✓ A']);
+  });
+
+  it('holds a newer revision and other sessions’ lists until the platform cooldown ends', async () => {
+    const sessionId = await seed();
+    const sent: string[] = [];
+    let limited = true;
+    setDeliveryAdapter({
+      async deliver(_c, _p, _t, kind, content) {
+        if (kind === 'task_list' && limited) {
+          limited = false;
+          throw new Error('slack rate_limited: Retry-After: 1');
+        }
+        sent.push(`${kind}:${(JSON.parse(content) as { text: string }).text}`);
+        return `plat-${sent.length}`;
+      },
+    });
+    const base = Date.now();
+    insertRow(
+      sessionId,
+      'rev-1',
+      'task_list',
+      { operation: 'edit', messageId: 'm-1', text: 'one' },
+      { timestamp: new Date(base).toISOString() },
+    );
+    const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+    await deliverSessionMessages(session);
+    expect(sent).toEqual([]);
+
+    // A newer revision supersedes the cooling row, but inherits its cooldown.
+    insertRow(
+      sessionId,
+      'rev-2',
+      'task_list',
+      { operation: 'edit', messageId: 'm-1', text: 'two' },
+      { timestamp: new Date(base + 1).toISOString() },
+    );
+    await deliverSessionMessages(session);
+    expect(sent).toEqual([]);
+
+    // Another session's list on the same platform waits too.
+    const other = await resolveSession('ag-1', 'mg-1', 'slack:C0AAA:1786621514.999999', 'per-thread');
+    insertRow(
+      other.session.id,
+      'other-1',
+      'task_list',
+      { text: 'other list' },
+      { threadId: 'slack:C0AAA:1786621514.999999' },
+    );
+    await deliverSessionMessages(other.session);
+    expect(sent).toEqual([]);
+
+    await new Promise((r) => setTimeout(r, 1_100));
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(other.session);
+    expect(sent).toEqual(['task_list:two', 'task_list:other list']);
   });
 
   it('sends only the newest of several queued edits to one list', async () => {

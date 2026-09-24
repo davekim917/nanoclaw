@@ -60,6 +60,13 @@ export interface TaskListState {
   platformMessageId: string | null;
   postedAt: string | null;
   updatedAt: string;
+  /**
+   * When this container last wrote the record — on EVERY save, unlike
+   * `updatedAt`, which an unchanged or still-pending update leaves alone
+   * because it is the time on screen. The host's kill fence reads it: a
+   * record touched after a kill began belongs to the replacement container.
+   */
+  touchedAt?: string;
   /** Every item done: the next update starts a new list. */
   finished: boolean;
   /** Left behind by a context reset (/clear, fresh task fire): the next update starts a new list. */
@@ -259,6 +266,7 @@ export async function applyTaskListUpdate(
   const prev = deps.load();
   const nowDate = deps.now();
   const now = nowDate.toISOString();
+  const save = (state: TaskListState): void => deps.save({ ...state, touchedAt: now });
   const finished = input.items.every((item) => item.status === 'done');
   const text = renderBody(input.title, input.items);
   const subtext = renderSubtext(routing.channelType, now);
@@ -279,7 +287,7 @@ export async function applyTaskListUpdate(
     if (current && !target) {
       // Delivery still pending. Keep the new items so the next call carries
       // them, and say so rather than stack a second list under this one.
-      deps.save({ ...current, title: input.title, items: input.items, revision: current.revision + 1 });
+      save({ ...current, title: input.title, items: input.items, revision: current.revision + 1 });
       return { ok: false, error: 'the task list post has not been delivered yet; call update_task_list again shortly' };
     }
   }
@@ -323,11 +331,11 @@ export async function applyTaskListUpdate(
       // change); skip the edit (rate limits). Compared against what was last
       // WRITTEN, not the stored items: an update saved while the post was
       // still undelivered is not on screen yet and must go out on the retry.
-      deps.save({ ...next, text: current.text, subtext: current.subtext, updatedAt: current.updatedAt });
+      save({ ...next, text: current.text, subtext: current.subtext, updatedAt: current.updatedAt });
       return { ok: true, action: 'unchanged', state: next };
     }
     await deps.write({ operation: 'edit', messageId: target, text, subtext, taskList: meta }, routing);
-    deps.save(next);
+    save(next);
     return { ok: true, action: 'edited', state: next };
   }
 
@@ -337,11 +345,11 @@ export async function applyTaskListUpdate(
   next.postSeq = post.seq;
   next.postedAt = now;
   next.platformMessageId = null;
-  deps.save(next);
+  save(next);
   const ack = await deps.awaitPlatformId(post.id, POST_ACK_TIMEOUT_MS);
   if (ack.platformId) {
     next.platformMessageId = ack.platformId;
-    deps.save(next);
+    save(next);
   }
 
   // Collapse what this post replaces — the previous generation's list, or

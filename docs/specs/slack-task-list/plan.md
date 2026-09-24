@@ -165,16 +165,20 @@ something the plan did not know.
 - **Repost rule**: the list's post is ≥15 min old and ≥2 conversation messages sit below it.
 - **Kill reasons**: the idle reapers (`chat-idle-reap`, `scheduled-task-idle`) end containers after their work
   and leave the list as is; every other kill with an unfinished list marks it interrupted.
-- **Kill-time edit (implementation review, Codex gpt-6-astra high, two rounds)**: runs only while holding the
+- **Kill-time edit (implementation review, Codex gpt-6-astra high, three rounds)**: runs only while holding the
   session's delivery slot (after any drain in flight; if a drain will not finish in 30 s it does nothing rather than
   race it). It records the dead container's queued list rows delivered-unsent in inbound.db — durable across a host
   restart; a first post that never went out is dropped the same way — and edits where the HOST delivered the list
   (the post's own row and `delivered` receipt), only in the session's own conversation. The container's record
-  supplies only the wording, scrubbed like any payload. A list updated after the kill began belongs to a newer
-  container and is left alone. Residual: a row the dying container writes during its SIGTERM grace can still land.
+  supplies only the wording, scrubbed like any payload. A list touched after the kill began belongs to a newer
+  container and is left alone — the fence reads `touchedAt`, stamped on every save, because an unchanged or
+  still-pending update keeps `updatedAt` (the time on screen). A rate-limited interrupted edit is not lost: it waits
+  out the platform cooldown outside the slot and re-decides from scratch, up to 4 attempts and 5 minutes per wait.
+  Residual: a row the dying container writes during its SIGTERM grace can still land.
 - **Delivery**: queued edits of one list coalesce to the newest (the rest recorded delivered-unsent). A rate-limited
-  list row never waits inline and never blocks: it cools down for Slack's Retry-After, uncharged, while the
-  session's answers go out, then sends. Any other list-row failure also steps aside instead of holding the queue.
+  list row never waits inline and never blocks: its platform cools down for Slack's Retry-After — every task-list
+  write on that platform waits, including a newer revision of the same list and other sessions' lists — uncharged,
+  while answers go out, then sends. The cooldown is in host memory; a host restart forgets it. Any other list-row failure also steps aside instead of holding the queue.
   Spawn-child sessions' lists stay internal, as their 💭 did. The status line takes its item from the
   secret-scrubbed row.
 - **Runner concurrency**: `update_task_list` calls are serialized in the MCP process. Not done: one mailbox

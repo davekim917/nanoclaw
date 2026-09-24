@@ -170,6 +170,17 @@ describe('applyTaskListUpdate', () => {
     const out = await applyTaskListUpdate(input('T', items(['A', 'in_progress'])), SLACK, h.deps);
     expect(out).toMatchObject({ ok: true, action: 'unchanged' });
     expect(h.writes).toHaveLength(1);
+    // The on-screen time stays; the touch the host's kill fence reads does not.
+    expect(h.state?.updatedAt).toBe('2026-09-24T15:00:00.000Z');
+    expect(h.state?.touchedAt).toBe('2026-09-24T15:01:00.000Z');
+  });
+
+  it('stamps touchedAt on a save while the post is still undelivered', async () => {
+    const h = harness({ deliver: 'pending' });
+    await applyTaskListUpdate(input('T', items(['A', 'in_progress'])), SLACK, h.deps);
+    h.advance(30_000);
+    await applyTaskListUpdate(input('T', items(['A', 'done'], ['B', 'in_progress'])), SLACK, h.deps);
+    expect(h.state?.touchedAt).toBe('2026-09-24T15:00:30.000Z');
   });
 
   it('starts a new list after a finished one and points the old one at it', async () => {

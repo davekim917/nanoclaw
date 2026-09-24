@@ -60,10 +60,16 @@ export function supersededTaskListEdits(
   return superseded;
 }
 
+/** Rate-limited interrupted edits are retried this many times in all. */
+const KILL_EDIT_MAX_ATTEMPTS = 4;
+/** A cooldown longer than this is not waited out: the list keeps its last state. */
+const KILL_EDIT_MAX_WAIT_MS = 5 * 60_000;
+const KILL_EDIT_WAIT_BUFFER_MS = 250;
+
 /**
  * Edit a session's unfinished task list to its "interrupted" form because its
  * container is being killed mid-work, so a dead agent never leaves a
- * live-looking list. Never throws.
+ * live-looking list. Never throws; its caller does not wait on it.
  *
  * Ordered and fenced through the session's delivery slot: it waits for any
  * drain in flight, records the dead container's still-queued list rows
@@ -72,6 +78,11 @@ export function supersededTaskListEdits(
  * host-owned evidence (`getTaskListSettlement`) and must be the session's own
  * conversation; only the wording — pre-rendered by the runner on every update
  * — comes from the container's record.
+ *
+ * A rate limit does not lose the edit: it waits out the platform's cooldown
+ * OUTSIDE the slot (answers keep flowing) and tries again, re-deciding from
+ * scratch each time, so a replacement container that took the list over in
+ * the meantime is left alone.
  */
 export async function settleTaskListOnKill(sessionId: string, reason: string): Promise<void> {
   setTypingStatusText(sessionId, null);
@@ -82,47 +93,65 @@ export async function settleTaskListOnKill(sessionId: string, reason: string): P
     const origin = session?.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
     if (!session || !origin) return;
     const { getDeliveryAdapter, withSessionDeliverySlot } = await import('./delivery.js');
-    const settled = await withSessionDeliverySlot(sessionId, async () => {
-      const adapter = getDeliveryAdapter();
-      if (!adapter) return true;
-      const settlement = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
-        const found = mailbox.getTaskListSettlement(killedAt);
-        if (found) for (const rowId of found.staleRowIds) mailbox.markDelivered(rowId, null);
-        return found;
+    for (let attempt = 1; ; attempt++) {
+      const waitMs = await withSessionDeliverySlot(sessionId, async (): Promise<number> => {
+        const adapter = getDeliveryAdapter();
+        if (!adapter) return 0;
+        const settlement = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+          const found = mailbox.getTaskListSettlement(killedAt);
+          if (found) for (const rowId of found.staleRowIds) mailbox.markDelivered(rowId, null);
+          return found;
+        });
+        const edit = settlement?.edit;
+        if (!edit) return 0;
+        if (
+          edit.channelType !== origin.channel_type ||
+          edit.platformId !== origin.platform_id ||
+          edit.threadId !== session.thread_id
+        ) {
+          log.warn('Task list is not in this session’s own conversation — not marking it interrupted', {
+            sessionId,
+          });
+          return 0;
+        }
+        const cooling = taskListCooldownMs(edit.channelType);
+        if (cooling > 0) return cooling;
+        try {
+          await adapter.deliver(
+            edit.channelType,
+            edit.platformId,
+            edit.threadId,
+            'task_list',
+            // Scrubbed whole, like every other outbound payload (delivery.ts):
+            // both fields are container-written.
+            scrubSecrets(
+              JSON.stringify({
+                operation: 'edit',
+                messageId: edit.platformMessageId,
+                text: edit.interruptedText,
+                subtext: edit.interruptedSubtext,
+              }),
+            ),
+            undefined,
+            origin.instance,
+          );
+        } catch (err) {
+          if (deferTaskListOnRateLimit(edit.channelType, err)) return taskListCooldownMs(edit.channelType) || 1;
+          throw err;
+        }
+        log.info('Task list marked interrupted', { sessionId, reason, skippedRows: settlement.staleRowIds.length });
+        return 0;
       });
-      const edit = settlement?.edit;
-      if (!edit) return true;
-      if (
-        edit.channelType !== origin.channel_type ||
-        edit.platformId !== origin.platform_id ||
-        edit.threadId !== session.thread_id
-      ) {
-        log.warn('Task list is not in this session’s own conversation — not marking it interrupted', { sessionId });
-        return true;
+      if (waitMs === undefined) {
+        log.warn('Task list left as is — a delivery for this session did not finish in time', { sessionId, reason });
+        return;
       }
-      await adapter.deliver(
-        edit.channelType,
-        edit.platformId,
-        edit.threadId,
-        'task_list',
-        // Scrubbed whole, like every other outbound payload (delivery.ts):
-        // both fields are container-written.
-        scrubSecrets(
-          JSON.stringify({
-            operation: 'edit',
-            messageId: edit.platformMessageId,
-            text: edit.interruptedText,
-            subtext: edit.interruptedSubtext,
-          }),
-        ),
-        undefined,
-        origin.instance,
-      );
-      log.info('Task list marked interrupted', { sessionId, reason, skippedRows: settlement.staleRowIds.length });
-      return true;
-    });
-    if (settled === undefined) {
-      log.warn('Task list left as is — a delivery for this session did not finish in time', { sessionId, reason });
+      if (waitMs === 0) return;
+      if (attempt >= KILL_EDIT_MAX_ATTEMPTS || waitMs > KILL_EDIT_MAX_WAIT_MS) {
+        log.warn('Task list left as is — still rate-limited', { sessionId, reason, attempt, waitMs });
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, waitMs + KILL_EDIT_WAIT_BUFFER_MS));
     }
   } catch (err) {
     log.warn('Failed to mark task list interrupted — leaving its last state', {
@@ -134,29 +163,41 @@ export async function settleTaskListOnKill(sessionId: string, reason: string): P
 }
 
 /**
- * Per task_list row, when the platform's rate-limit cooldown ends. A list row
- * waits out its cooldown on its own: the drain skips it (answers behind it go
- * out) and it is not charged a delivery attempt, so a long cooldown cannot
- * exhaust the final refresh. Memory-only: after a host restart a row simply
- * tries once more.
+ * Per platform (channel type), when its rate-limit cooldown ends. A task-list
+ * write that hits a rate limit pauses EVERY task-list write on that platform
+ * until Retry-After passes — a newer revision of the same list, another
+ * session's list, the kill-time interrupted edit — so a busy list cannot keep
+ * probing a limit it has already been told about. Platform-wide rather than
+ * per channel because Slack's update limits are per workspace, and a pause of
+ * a few seconds costs nothing: answers never consult it, and a paused row is
+ * not charged a delivery attempt, so a long cooldown cannot exhaust a final
+ * refresh. Memory-only: after a host restart the next write simply tries.
  */
 const taskListCooldowns = new Map<string, number>();
 
-/** Is this row still inside a rate-limit cooldown? */
-export function taskListRowCoolingDown(rowId: string): boolean {
-  const until = taskListCooldowns.get(rowId);
-  if (until === undefined) return false;
-  if (Date.now() < until) return true;
-  taskListCooldowns.delete(rowId);
-  return false;
+/** Milliseconds left in this platform's task-list cooldown; 0 when there is none. */
+export function taskListCooldownMs(channelType: string | null): number {
+  const key = channelType ?? '';
+  const until = taskListCooldowns.get(key);
+  if (until === undefined) return 0;
+  const left = until - Date.now();
+  if (left > 0) return left;
+  taskListCooldowns.delete(key);
+  return 0;
 }
 
-/** If `err` is a rate limit, start this row's cooldown and return true (not a delivery failure). */
-export function deferTaskListRowOnRateLimit(rowId: string, err: unknown): boolean {
+/** If `err` is a rate limit, start this platform's cooldown and return true (not a delivery failure). */
+export function deferTaskListOnRateLimit(channelType: string | null, err: unknown): boolean {
   const retryAfterMs = parseRetryAfterMs(err);
   if (retryAfterMs === null) return false;
-  taskListCooldowns.set(rowId, Date.now() + retryAfterMs);
+  const key = channelType ?? '';
+  taskListCooldowns.set(key, Math.max(taskListCooldowns.get(key) ?? 0, Date.now() + retryAfterMs));
   return true;
+}
+
+/** Test seam: forget every cooldown. */
+export function _clearTaskListCooldownsForTest(): void {
+  taskListCooldowns.clear();
 }
 
 /** Longest task-list item shown in a status line before it is clipped. */

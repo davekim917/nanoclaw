@@ -22,3 +22,7 @@
   timeout), rate limits (2: per-row cooldown, uncharged, never blocks answers; bridge never waits inline for list
   rows), interrupted footer unscrubbed (4). Rejected with reasons in As built: cross-DB transaction (3),
   identical-retry after a switch flip (5).
+- **Implementation review round 3** (same transport, head 7d23a7bd): needs-attention, 3 — all accepted and fixed:
+  kill fence defeated by an identical update after respawn (`touchedAt` stamped on every save), cooldown bypassed by
+  a newer revision or another session (cooldown keyed per platform), rate-limited interrupted edit lost (retried
+  after the cooldown, re-fenced each attempt). Regression tests for each. Corrective budget: 3 of 3 used.

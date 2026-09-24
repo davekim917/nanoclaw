@@ -60,10 +60,10 @@ import type { OutboundMessage } from './modules/mailbox/ops/delivery.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import { TASK_LIST_ENABLED } from './config.js';
 import {
-  deferTaskListRowOnRateLimit,
+  deferTaskListOnRateLimit,
   noteTaskListDelivered,
   supersededTaskListEdits,
-  taskListRowCoolingDown,
+  taskListCooldownMs,
 } from './task-list-host.js';
 import { flagNeedsInput, getTaskByChildSession } from './modules/orchestrator-dispatch/db/tasks.js';
 import { appendRunLog } from './modules/scheduling/run-log.js';
@@ -1060,8 +1060,8 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
   };
 
   for (const msg of undelivered) {
-    // A list row waiting out a rate limit steps aside; it stays outstanding.
-    if (msg.kind === 'task_list' && taskListRowCoolingDown(msg.id)) continue;
+    // A list row waits out its platform's rate-limit cooldown; it stays outstanding.
+    if (msg.kind === 'task_list' && taskListCooldownMs(msg.channel_type) > 0) continue;
     // A stored count already at the cap is terminal on its own — the crash
     // window described on the helpers above leaves exactly that row behind.
     // Deciding from it BEFORE the adapter runs is what stops a successor host
@@ -1144,7 +1144,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
     } catch (err) {
       // A rate-limited list row is not failing, it is early: cool it down
       // uncharged and let the answers behind it through.
-      if (msg.kind === 'task_list' && deferTaskListRowOnRateLimit(msg.id, err)) continue;
+      if (msg.kind === 'task_list' && deferTaskListOnRateLimit(msg.channel_type, err)) continue;
       sawError = true;
       const attempts = await recordAttemptRow(msg.id, session.id, err);
       if (attempts !== null && attempts >= MAX_DELIVERY_ATTEMPTS) {
