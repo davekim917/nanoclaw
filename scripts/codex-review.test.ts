@@ -1383,6 +1383,40 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     expect(reruns(result.calls)).toBe(1);
   });
 
+  it('an unreadable quick run is still judged over a newer push run: red, never green (mutation: other events win when evidence is missing)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    const push = { ...workflowRun('CI', 'completed', 'success', '2026-09-05T00:05:00Z'), event: 'push' };
+    // No jobs fixture for the PR run: its quick evidence cannot be read.
+    runs(root, 'runs.json', [workflowRun('CI', 'completed', 'failure'), push]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(29);
+    expect(reruns(result.calls)).toBe(0);
+  });
+
+  it('a pending pull_request run is not masked by a newer push success (mutation: newest run of any event wins)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    const push = { ...workflowRun('CI', 'completed', 'success', '2026-09-05T00:05:00Z'), event: 'push' };
+    runs(root, 'runs-1.json', [workflowRun('CI', 'in_progress', null), push]);
+    runs(root, 'runs-2.json', [workflowRun('CI', 'completed', 'success'), push]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 30]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('ci_pending: CI=in_progress');
+  });
+
+  it('a workflow with no pull_request run on the head is judged by its newest run of any event, as before', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs.json', [{ ...workflowRun('CI', 'completed', 'success'), event: 'push' }]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`ci=green head=${HEAD}`);
+  });
+
   it('merge-check refuses a quick-tier head: the full suite never ran on it (mutation: ci_quick read as green)', () => {
     const root = tempRoot();
     scopeFixture(root, { labels: [], ci: [quickRun(root)], statuses: [] });
