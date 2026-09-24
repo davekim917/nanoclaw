@@ -56,6 +56,8 @@ export interface TaskListState {
   /** messages_out id / seq of the visible post; null until it is written. */
   postOutboundId: string | null;
   postSeq: number | null;
+  /** Highest inbound seq when the post was written — the repost check's inbound cursor. */
+  postInboundSeq?: number | null;
   /** Platform id of the visible post, once the host has delivered it. */
   platformMessageId: string | null;
   postedAt: string | null;
@@ -233,8 +235,10 @@ export interface TaskListDeps {
    * `failed: false` means delivery is still pending.
    */
   awaitPlatformId(outboundId: string, timeoutMs: number): Promise<{ platformId: string | null; failed: boolean }>;
-  /** Conversation messages (human or agent chat) with a sequence after `seq`. */
-  messagesAfter(seq: number): number;
+  /** Highest inbound sequence number so far. */
+  inboundSeq(): number;
+  /** Conversation messages (human or agent chat) after these outbound / inbound cursors. */
+  messagesAfter(outboundSeq: number, inboundSeq: number): number;
   now(): Date;
 }
 
@@ -303,6 +307,7 @@ export async function applyTaskListUpdate(
     threadId: routing.threadId,
     postOutboundId: current?.postOutboundId ?? null,
     postSeq: current?.postSeq ?? null,
+    postInboundSeq: current?.postInboundSeq ?? null,
     platformMessageId: target,
     postedAt: current?.postedAt ?? null,
     updatedAt: now,
@@ -323,7 +328,8 @@ export async function applyTaskListUpdate(
     current.postedAt !== null &&
     current.postSeq !== null &&
     nowDate.getTime() - Date.parse(current.postedAt) >= TASK_LIST_REPOST_AFTER_MS &&
-    deps.messagesAfter(current.postSeq) >= TASK_LIST_REPOST_MIN_MESSAGES;
+    // A record from before the inbound cursor existed falls back to postSeq.
+    deps.messagesAfter(current.postSeq, current.postInboundSeq ?? current.postSeq) >= TASK_LIST_REPOST_MIN_MESSAGES;
 
   if (current && target && !busy) {
     if (current.text === text) {
@@ -343,6 +349,7 @@ export async function applyTaskListUpdate(
   const post = await deps.write({ text, subtext, taskList: meta }, routing);
   next.postOutboundId = post.id;
   next.postSeq = post.seq;
+  next.postInboundSeq = deps.inboundSeq();
   next.postedAt = now;
   next.platformMessageId = null;
   save(next);

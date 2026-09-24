@@ -58,6 +58,21 @@ describe('chat-sdk bridge — task list', () => {
     expect(edits[0].markdown).toBe('Migrating\n✓ Ran it\n-# todos as of 3:02 PM');
   });
 
+  it('never pings: platform-native broadcast and role tokens are broken like @names', async () => {
+    const { bridge, posts, edits } = bridgeWith();
+    const text = 'Relay\n✱ Tell <!here> and <!channel>, <!subteam^S123>, <@&42>, <@U0ABC> and @everyone';
+    await bridge.deliver('thread-1', null, { kind: 'task_list', content: { text } });
+    await bridge.deliver('thread-1', null, {
+      kind: 'task_list',
+      content: { operation: 'edit', messageId: 'msg-1', text },
+    });
+    for (const body of [posts[0].markdown!, edits[0].markdown!]) {
+      expect(body).not.toMatch(/<[!@]/);
+      expect(body).not.toMatch(/@[\w\p{L}]/u);
+      expect(body.replace(/\u200b/g, '')).toBe(text);
+    }
+  });
+
   it('stays a single message when it outgrows the platform limit', async () => {
     const { bridge, posts } = bridgeWith({ maxTextLength: 120 });
     await bridge.deliver('thread-1', null, {

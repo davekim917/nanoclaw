@@ -27,3 +27,8 @@
   a newer revision or another session (cooldown keyed per platform), rate-limited interrupted edit lost (retried
   after the cooldown, re-fenced each attempt). Regression tests for each. Corrective budget: 3 of 3 used.
 - **Implementation review round 4** (verification, same transport, head f4a8b2ee): approve, no findings.
+- **GitHub Codex review, round 1** (merge gate, head e7074f11): 3 findings, all accepted and fixed with regression
+  tests — native broadcast/role tokens in list text (`<!here>`, `<!channel>`, `<@&role>`) now neutralized like
+  `@names`; repost traffic counted from separate inbound/outbound cursors (the host numbers inbound from
+  inbound.db alone, `src/modules/mailbox/ops/ingress.ts:42-45`); 👀 receipt moved after the durable inbound write.
+  This loop runs under the merge gate (`pr-review-loop`, round cap 3), not team-auto's spent corrective budget.

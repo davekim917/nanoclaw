@@ -737,7 +737,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   // so break the mention regexes (which require `@` immediately followed by
   // a word/letter char) with a zero-width space — invisible on delivery,
   // renders identically to the reader, but no rewriter matches it.
-  const neutralizeMentions = (t: string): string => t.replace(/@(?=[\w\p{L}])/gu, '@\u200b');
+  // Platform-native tokens get the same break: Slack's `<!here>`,
+  // `<!channel>`, `<!subteam^…>` and Discord's `<@&role>` notify without an
+  // `@` followed by a letter, and the markdown transform passes them through.
+  const neutralizeMentions = (t: string): string =>
+    t.replace(/@(?=[\w\p{L}])/gu, '@\u200b').replace(/<(?=[!@])/g, '<\u200b');
   // Status and task-list text is progress, never a ping: an @ in it would
   // notify on a message whose edits are otherwise silent.
   const transformStatusOrText = (t: string, kind: string): string =>

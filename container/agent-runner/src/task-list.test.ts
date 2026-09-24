@@ -20,7 +20,7 @@ import {
 const SLACK = { channelType: 'slack', platformId: 'slack:C0AAA', threadId: 'slack:C0AAA:1786621514.008659' };
 
 /** In-memory store + outbound log standing in for the mailbox and the host. */
-function harness(opts: { deliver?: 'ok' | 'pending' | 'failed'; messagesAfter?: number } = {}) {
+function harness(opts: { deliver?: 'ok' | 'pending' | 'failed'; messagesAfter?: number; inboundSeq?: number } = {}) {
   let state: TaskListState | null = null;
   let clock = Date.parse('2026-09-24T15:00:00.000Z');
   let seq = 1;
@@ -29,6 +29,7 @@ function harness(opts: { deliver?: 'ok' | 'pending' | 'failed'; messagesAfter?: 
   // Each row's fate is fixed when it is written, as on the real host: a
   // failed row stays failed; a pending one delivers once the host catches up.
   const fates = new Map<string, 'ok' | 'pending' | 'failed'>();
+  const trafficQueries: Array<[number, number]> = [];
   const deps: TaskListDeps = {
     load: () => (state ? structuredClone(state) : null),
     save: (s) => {
@@ -48,12 +49,17 @@ function harness(opts: { deliver?: 'ok' | 'pending' | 'failed'; messagesAfter?: 
       if (mode === 'pending') return { platformId: null, failed: false };
       return { platformId: platformIds.get(outboundId) ?? null, failed: false };
     },
-    messagesAfter: () => opts.messagesAfter ?? 0,
+    inboundSeq: () => opts.inboundSeq ?? 0,
+    messagesAfter: (outboundSeq, inboundSeq) => {
+      trafficQueries.push([outboundSeq, inboundSeq]);
+      return opts.messagesAfter ?? 0;
+    },
     now: () => new Date(clock),
   };
   return {
     deps,
     writes,
+    trafficQueries,
     get state() {
       return state;
     },
@@ -227,6 +233,16 @@ describe('applyTaskListUpdate', () => {
     expect(h.state?.generation).toBe(1);
     expect(h.state?.postOutboundId).toBe('out-2');
     expect(h.writes[2].content).toMatchObject({ operation: 'edit', messageId: '1786621600.001' });
+  });
+
+  it('counts busy-thread traffic from each mailbox’s own cursor', async () => {
+    // The host numbers inbound rows from inbound.db alone, so inbound can sit
+    // well below the list's outbound seq: 4 while the post is 3+.
+    const h = harness({ inboundSeq: 4 });
+    await applyTaskListUpdate(input('T', items(['A', 'in_progress'], ['B', 'pending'])), SLACK, h.deps);
+    h.advance(TASK_LIST_REPOST_AFTER_MS);
+    await applyTaskListUpdate(input('T', items(['A', 'done'], ['B', 'in_progress'])), SLACK, h.deps);
+    expect(h.trafficQueries).toEqual([[h.writes[0].seq, 4]]);
   });
 
   it('does not repost a quiet thread', async () => {

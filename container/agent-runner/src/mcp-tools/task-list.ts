@@ -122,7 +122,8 @@ export const updateTaskList: McpToolDefinition = {
           return { platformId: ack.platformMessageId, failed: false };
         return { platformId: null, failed: true };
       },
-      messagesAfter: (seq) => ops.countConversationMessagesAfter(seq),
+      inboundSeq: () => ops.maxInboundSeq(),
+      messagesAfter: (outboundSeq, inboundSeq) => ops.countConversationMessagesAfter(outboundSeq, inboundSeq),
       now: () => new Date(),
     };
     // One update at a time: each reads, writes and saves the one record, so a

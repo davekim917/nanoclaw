@@ -166,14 +166,18 @@ export class SqliteAgentMailbox implements AgentMailbox {
     );
   }
 
-  countConversationMessagesAfter(sequence: number): number {
+  countConversationMessagesAfter(outboundSeq: number, inboundSeq: number): number {
     const inbound = getInboundDb()
       .prepare("SELECT COUNT(*) AS n FROM messages_in WHERE seq > ? AND kind IN ('chat', 'chat-sdk')")
-      .get(sequence) as { n: number };
+      .get(inboundSeq) as { n: number };
     const outbound = getOutboundDb()
       .prepare("SELECT COUNT(*) AS n FROM messages_out WHERE seq > ? AND kind = 'chat'")
-      .get(sequence) as { n: number };
+      .get(outboundSeq) as { n: number };
     return inbound.n + outbound.n;
+  }
+
+  maxInboundSeq(): number {
+    return (getInboundDb().prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_in').get() as { m: number }).m;
   }
 
   getLatestInboundRoute(channelType: string, platformId: string) {

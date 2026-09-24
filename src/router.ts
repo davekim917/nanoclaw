@@ -1532,11 +1532,6 @@ async function deliverToAgent(
   // Start typing indicator before writeSessionMessage so recall injection
   // latency doesn't delay visible feedback on chat/chat-sdk paths.
   if (wake && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
-    // A replayed history message was already seen; only a live human message
-    // gets the receipt reaction.
-    if (!event.recovered && isHumanChatSdkContent(event.message.kind, event.message.content)) {
-      ackInboundReceipt(event.channelType, event.platformId, effectiveThreadId, event.message.id, mg.instance);
-    }
     startTypingRefresh(
       session.id,
       session.agent_group_id,
@@ -1600,6 +1595,12 @@ async function deliverToAgent(
   // AFTER the backfill read above, which needs the pre-wake state, and after
   // the write, so a duplicate or a failed insert never claims engagement.
   if (wake) await markSessionEngaged(session.id);
+  // The 👀 receipt, only now that the message is durable (a failed or
+  // duplicate insert never acknowledges), and only for a live human message
+  // — a replayed history message was already seen.
+  if (wake && !event.recovered && isHumanChatSdkContent(event.message.kind, event.message.content)) {
+    ackInboundReceipt(event.channelType, event.platformId, effectiveThreadId, event.message.id, mg.instance);
+  }
 
   log.info('Message routed', {
     sessionId: session.id,
