@@ -831,7 +831,7 @@ ALARM_WORDS = {
 ONESHOT_TEXT = {
     "critic": (
         "Fresh design check for smoke run {runId} (PR #{pr}, build {sha12}). Dispatch a fresh provider-native "
-        "`qa-design-critic` (model and effort from its agent definition) in the foreground with the graded "
+        "`qa-design-critic` at its installed model/effort in the foreground with the graded "
         "viewport PNGs in {run}/contact-sheet/, the {run}/contact-sheet/design-system/ folder and, for each tile "
         "manifest.json marks `changed`, its *-base.png and *-diff.png, asking what the change broke. Never grade "
         "*-full.png; an `unsettled` tile is not BROKEN evidence on its own. Then write its lines to "
@@ -841,7 +841,7 @@ ONESHOT_TEXT = {
         "finish, file issues or touch any other run file."),
     "adjudicator": (
         "Fresh dispute adjudication for smoke run {runId} (PR #{pr}, build {sha12}). Dispatch a fresh "
-        "provider-native `qa-adjudicator` (model and effort from its agent definition) in the foreground on the "
+        "provider-native `qa-adjudicator` at its installed model/effort in the foreground on the "
         "disputed findings named in {run}/controller/adjudication-request.md, with only the evidence that file "
         "names. Write its ruling to {run}/controller/adjudication.json. Write "
         "{run}/controller/dispatch-adjudicator.started first. Never post, finish or file."),
