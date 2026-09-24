@@ -42,6 +42,7 @@ let tmp: string;
 let prevHome: string | undefined;
 let prevOpus: string | undefined;
 let prevSonnet: string | undefined;
+let prevFable: string | undefined;
 let prevOverride: string | undefined;
 
 beforeEach(() => {
@@ -49,6 +50,7 @@ beforeEach(() => {
   prevHome = process.env.HOME;
   prevOpus = process.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
   prevSonnet = process.env.ANTHROPIC_DEFAULT_SONNET_MODEL;
+  prevFable = process.env.ANTHROPIC_DEFAULT_FABLE_MODEL;
   prevOverride = process.env.NANOCLAW_EFFORT_OVERRIDE;
   process.env.HOME = tmp;
   delete process.env.NANOCLAW_EFFORT_OVERRIDE;
@@ -61,6 +63,7 @@ afterEach(() => {
     ['HOME', prevHome],
     ['ANTHROPIC_DEFAULT_OPUS_MODEL', prevOpus],
     ['ANTHROPIC_DEFAULT_SONNET_MODEL', prevSonnet],
+    ['ANTHROPIC_DEFAULT_FABLE_MODEL', prevFable],
     ['NANOCLAW_EFFORT_OVERRIDE', prevOverride],
   ] as const) {
     if (value === undefined) delete process.env[key];
@@ -198,6 +201,24 @@ describe('claude turn effort -> turn_usage row', () => {
     expect(rows.map((r) => [r.model, r.effort])).toEqual([
       ['claude-sonnet-5', 'xhigh'],
       // Still NULL, and for the RIGHT reason: we never set a subagent's effort.
+      ['claude-haiku-4-5-20251001', null],
+    ]);
+  });
+
+  it('attributes a bare `fable` pin to the concrete Fable id', async () => {
+    // A task pin or sticky stores bare `fable`; the SDK keys modelUsage by the
+    // id ANTHROPIC_DEFAULT_FABLE_MODEL names, so the alias must canonicalize.
+    process.env.ANTHROPIC_DEFAULT_FABLE_MODEL = 'claude-fable-5-1[1m]';
+    sdkMessages.length = 0;
+    sdkMessages.push(
+      { type: 'system', subtype: 'init', session_id: 'sess-1' },
+      resultWithModels(['claude-fable-5-1[1m]', 'claude-haiku-4-5-20251001']),
+    );
+
+    await runTurnAndRecord({ model: 'fable', effort: 'medium' });
+
+    expect(getTurnUsageRows().map((r) => [r.model, r.effort])).toEqual([
+      ['claude-fable-5-1[1m]', 'medium'],
       ['claude-haiku-4-5-20251001', null],
     ]);
   });
