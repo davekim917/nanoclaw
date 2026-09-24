@@ -211,8 +211,10 @@ def gh(argv):
         f = fault("gh:issue-list")
         if f == "fail-before":
             return "fail", out_err("HTTP 502")
+        want = opt(argv, "--label")
         print(json.dumps([{"number": i["number"], "title": i["title"], "url": i["html_url"]}
-                          for i in db["issues"] if i["state"] == "open"]))
+                          for i in db["issues"] if i["state"] == "open"
+                          and (want is None or want in i.get("labels", []))]))
         return "list", 0
     if argv[:2] == ["label", "list"]:
         if fault("gh:label-list") == "fail-before":

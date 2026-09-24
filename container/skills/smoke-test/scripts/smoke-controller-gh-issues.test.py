@@ -132,6 +132,24 @@ class FindingIssue(unittest.TestCase):
         self.assertEqual(issue["labels"], ["severity:p3"])
         self.assertIn("`smoke-finding`", issue["body"])
 
+    def test_a_repo_without_smoke_finding_dedups_across_runs_unlabelled(self):
+        # An earlier campaign filed this finding unlabelled; the marker cannot
+        # see it (its key carries that run's id), so title dedup must.
+        prior = {"number": 5, "title": "Upload preview missing", "body": "earlier run", "state": "open",
+                 "labels": [], "html_url": "https://github.test/issues/5"}
+        self.gh(labels=["severity:p3"], issues=[prior])
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        self.assertEqual(len(self.filed()), 1)
+        ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:CF-1")]
+        self.assertEqual((ob["detail"]["via"], ob["detail"]["duplicateOf"]), ("dedup", 5))
+
+    def test_a_repo_with_smoke_finding_keeps_dedup_scoped_to_it(self):
+        prior = {"number": 5, "title": "Upload preview missing", "body": "a human's issue", "state": "open",
+                 "labels": [], "html_url": "https://github.test/issues/5"}
+        self.gh(labels=["smoke-finding", "severity:p3"], issues=[prior])
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        self.assertEqual(len(self.filed()), 2)
+
     def test_a_recovered_listing_still_puts_the_dropped_note_in_the_filed_body(self):
         # Fire 1: the listing fails, the owner's labels go out unchanged, the
         # create is refused -- and its body payload is already on disk.
