@@ -1315,7 +1315,7 @@ class EffectLayer:
         the title (via=dedup). In a repo without `smoke-finding` that match can
         be a human's issue, so the PR's run record says so rather than the
         journal alone. pre_finish steps every issue obligation before the
-        pr-comment in the same fire (:3576-3580); one still unsettled then is not
+        pr-comment in the same fire (:3590-3594); one still unsettled then is not
         listed here, and its match stays on its own `gh` decision row."""
         lines = []
         for ob in self.ctl.obligations().values():
@@ -2982,6 +2982,16 @@ class Controller:
         for run, claim in sorted(claims.items()):
             if not RUN_ID_RE.match(run) or run.startswith(PSEUDO_PREFIX) or run in self.legacy:
                 continue
+            if self.live and claim.get("claimant") != "controller":
+                # Not an orphan of ours: the gate records another claimant --
+                # null is the legacy coordinator, e.g. a human-requested
+                # campaign it claims and finishes itself -- and refuses every
+                # cross-claimant verb ("Never both act on one run",
+                # smoke-pr-gate.sh:1336-1347). Journaling it made this
+                # controller alarm no-authority on it, then foreign-finish, and
+                # plan a freeze-close write on a run it never held (XZO #2176).
+                # Shadow still mirrors it: comparing those runs is its job.
+                continue
             if obligation_key(run, "run", "claim") not in obs:
                 self.record(run, "run", "claim", "enqueued", 1, self._claim_detail(None, "recovered", claim))
                 self.alarms.append({"trigger": "controller_orphan_claim", "runId": run, "pr": claim["pr"]})
@@ -3000,6 +3010,10 @@ class Controller:
         token = (run_ob or {}).get("detail", {}).get("ownerToken")
         holder = claim.get("owner")
         if token and holder and token == holder and claim.get("claimant") == "controller":
+            if (run_ob or {}).get("detail", {}).get("noAuthority"):
+                # Held again (our own poll reclaimed it): the flag describes the
+                # present, so post_finish does not treat our run as another's.
+                self.record(run_id, "run", "claim", run_ob["state"], 1, {"noAuthority": False})
             return True
         self.ensure_alarm(run_id, "controller_no_authority", "no-authority:{}".format(run_id[-40:]),
                           {"journaled": bool(token), "gateHolder": bool(holder),
@@ -3388,8 +3402,8 @@ class Controller:
                 # THE OWNER IS WOKEN HERE, not only once the barrier passes.
                 # By this point every OTHER party's contribution the synthesis
                 # barrier checks has already been gated above: the lanes
-                # barrier is ready (:3355), coordinator/preliminary.md exists
-                # (:3372) and challenger/disposition.md exists (:3378). What
+                # barrier is ready (:3369), coordinator/preliminary.md exists
+                # (:3386) and challenger/disposition.md exists (:3392). What
                 # the synthesis barrier can still report is therefore the
                 # retained owner's -- `invalid[]` content it authored
                 # (journeys/scope-dispositions.json, or
@@ -3401,7 +3415,7 @@ class Controller:
                 # alone (smoke-controller-live.sh:168-175), so nobody was told;
                 # and _maybe_synthesis_overdue_blocked needs the very
                 # owner:synthesis obligation this branch declined to create
-                # (:3413-3415), so the terminal BLOCKED safety net could not
+                # (:3427-3429), so the terminal BLOCKED safety net could not
                 # fire either. This is the same blind spot as the lanes barrier
                 # (XZO #2047), on the sibling path.
                 timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)
@@ -3716,6 +3730,16 @@ class Controller:
     def post_finish(self, run_id, pr, verdict, external):
         obs = self.obligations()
         run_key = obligation_key(run_id, "run", "claim")
+        if external and (obs.get(run_key) or {}).get("detail", {}).get("noAuthority"):
+            # Finished by the run's holder, which was never this controller
+            # (_authority alarmed that once already): no foreign-finish alarm,
+            # and none of the post-finish writes -- a freeze-close here would
+            # be this controller acting on a run it does not hold.
+            if obs[run_key]["state"] not in ("done", "abandoned"):
+                self.record(run_id, "run", "claim", "done", 1, {"verdict": verdict, "finishedBy": "holder"})
+            self.decide(run_id, "finished", "log", "mechanical", "run finished by its holder", verdict=verdict,
+                        finishedBy="holder")
+            return "finished"
         is_freeze = (obs.get(run_key) or {}).get("detail", {}).get("isFreezePr")
         pv = self.gate.pr_verdict(pr) if pr else None
         if isinstance(pv, dict) and pv.get("runId") == run_id and isinstance(pv.get("handoff"), dict):
@@ -3789,7 +3813,12 @@ class Controller:
         # can spend this fire on ordinary work.
         self._drain_alarms()
         self.reconcile_claims()
-        runs = set(self.journal.runs()) | set(self.gate.active_claims())
+        # A live controller steps the runs it journaled plus the gate's claims
+        # that are its own; another claimant's run (reconcile_claims) is never
+        # stepped, or _authority alarms no-authority on every coordinator run.
+        claims = self.gate.active_claims()
+        runs = set(self.journal.runs()) | {r for r, c in claims.items()
+                                           if not self.live or c.get("claimant") == "controller"}
         summary = []
         for run_id in sorted(runs):
             if not RUN_ID_RE.match(run_id) or run_id.startswith(PSEUDO_PREFIX) or run_id in self.legacy:

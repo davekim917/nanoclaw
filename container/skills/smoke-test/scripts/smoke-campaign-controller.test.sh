@@ -121,7 +121,7 @@ step() { # now [extra args...]
   set -e
 }
 # A step that could not take control.lock prints `skipped` and exits 0
-# (smoke-campaign-controller.py:3922-3924), having judged nothing. step_ok
+# (smoke-campaign-controller.py:3951-3953), having judged nothing. step_ok
 # refuses it, so a lock that is busy when it should not be names itself here
 # instead of surfacing later as a missing decision (#1120).
 step_ok() {
