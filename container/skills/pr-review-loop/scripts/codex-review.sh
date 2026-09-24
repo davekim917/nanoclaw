@@ -2020,12 +2020,13 @@ ci_wait_read_pr() {
 # is caught before either case: on a conflicting PR a `pull_request` run can
 # never register, so without that check ci-wait would wait out the whole
 # window for nothing.
-# Whether run <id> has visibly moved past attempt <n> (a "<id>:<n>" pair): it
-# is no longer `completed`, or its run_attempt is past n. A failed read is
-# "not moved" — never taken as a re-run that started.
+# Whether run <id> has visibly moved past attempt <n> (a "<id>:<n>" pair): 0
+# when it is no longer `completed` or its run_attempt is past n, 1 when it is
+# confirmed unchanged, 2 when the read failed. A failed read is never taken as
+# a re-run that started, nor as leave to request one.
 ci_wait_run_moved() {
   local reg
-  reg=$(gh api "repos/$REPO/actions/runs/${1%%:*}" --jq '"\(.status)\t\(.run_attempt // 1)"' 2>/dev/null) || return 1
+  reg=$(gh api "repos/$REPO/actions/runs/${1%%:*}" --jq '"\(.status)\t\(.run_attempt // 1)"' 2>/dev/null) || return 2
   [ "${reg%%$'\t'*}" != completed ] && return 0
   [[ "${reg#*$'\t'}" =~ ^[0-9]+$ ]] && [ "${reg#*$'\t'}" -gt "${1#*:}" ]
 }
@@ -2054,7 +2055,7 @@ ci_wait_main() {
   # The quick tier (ci_quick): the runs this call re-ran to request the full
   # suite, as " <id>:<attempt>" keys; those whose re-run has not visibly
   # started; and when it last asked.
-  local requested="" awaiting="" still request_at=0 pairs pair id
+  local requested="" awaiting="" still request_at=0 pairs pair id moved
   start=$(date +%s) || exit 1
   # The deadline covers the whole command, including the mergeability phase
   # below.
@@ -2178,9 +2179,14 @@ ci_wait_main() {
               # Then there is nothing to request — the next tick judges the
               # new attempt — and the same holds when a POST is refused
               # because a re-run began in between.
-              if ci_wait_run_moved "$pair"; then
+              moved=0
+              ci_wait_run_moved "$pair" || moved=$?
+              if [ "$moved" = 0 ]; then
                 echo "ci-wait: run $id has already moved past attempt ${pair#*:}; not re-running it"
                 requested="$requested $pair"
+                continue
+              elif [ "$moved" = 2 ]; then
+                echo "ci-wait: could not read run $id's current attempt; not re-running it this tick"
                 continue
               fi
               if ! gh api -X POST "repos/$REPO/actions/runs/$id/rerun" >/dev/null; then

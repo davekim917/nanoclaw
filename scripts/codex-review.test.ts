@@ -1389,6 +1389,19 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     expect(reruns(result.calls)).toBe(0);
   });
 
+  it('does not re-run when it cannot read the run first; it asks again next tick (mutation: a failed read taken as unchanged)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs-1.json', [quickRun(root)]);
+    runs(root, 'runs-2.json', [{ ...workflowRun('CI', 'completed', 'success'), run_attempt: 2 }]);
+    // No run fixture: every read of the run fails.
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 30]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`could not read run ${QUICK}'s current attempt; not re-running it this tick`);
+    expect(reruns(result.calls)).toBe(0);
+  });
+
   it('a refused re-run is not an error when the run started another attempt meanwhile (mutation: refusal always exits 1)', () => {
     const root = tempRoot();
     writeJson(root, 'pr.json', ciPr());
