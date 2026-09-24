@@ -501,13 +501,13 @@ A repo is **risk-scoped** when `.github/labeler.yml` on the PR's base branch nam
 
 ```bash
 OLD=<approved head> NEW=<new head> BASE=<the base commit merged in: NEW's second parent>
-out=$(git merge-tree --write-tree "$OLD" "$BASE"); rc=$?     # 0 clean, 1 conflicts (tree still written), >1 error
+out=$(git merge-tree --write-tree "$OLD" "$BASE"); rc=$?     # 0 clean; 1 conflicts (tree on line 1) or bad input (cat-file below catches that)
 [ "$rc" -le 1 ] && T=$(printf '%s\n' "$out" | head -1) && git cat-file -e "$T^{tree}" \
   && git diff --stat "$T" "$NEW" && git diff "$T" "$NEW" \
   || echo "NO REVIEW SURFACE: review the full diff"
 ```
 
-The reviewer reads that diff: every line, including deletions. A regenerated `src/upstream-ratchet.json` or the PR's own `docs/review-notes/` fragment is expected there. Anything else gets reviewed like any code change, and so does a deletion of another PR's fragment. The receipt body names `T` and the diffstat. The PR's `CI` workflow must be green on the new head, as it must for any merge. The gate requires only the workflows in `CODEX_REVIEW_REQUIRED_WORKFLOWS`, default `CI` (the `ci_status` comment in `scripts/codex-review.sh`). So don't re-run ci-full when the move added no code. Run it when the diff touches code, the same as for any code change.
+The reviewer reads that diff: every line, including deletions. A regenerated `src/upstream-ratchet.json` or the PR's own `docs/review-notes/` fragment is expected there. Anything else gets reviewed like any code change, and so does a deletion of another PR's fragment. The receipt body names `T` and the diffstat. The PR's `CI` workflow must be green on the new head, as it must for any merge. The gate requires only the workflows in `CODEX_REVIEW_REQUIRED_WORKFLOWS`, default `CI` (`ci_verdict` in `scripts/codex-review.sh`). So don't re-run ci-full when the move added no code. Run it when the added code warrants it, as for any change (CLAUDE.md, Development).
 
 **Read the review notes first, and add to your fragment.** Before writing or reviewing code, the author and the reviewer read `docs/review-notes.md` and every `docs/review-notes/<PR>.md` fragment (in a container: `/workspace/project/docs/review-notes.md` and `/workspace/project/docs/review-notes/`). Post every review verdict as a receipt, `changes` included. Once any receipt on the PR, on any head, says `changes`, the PR adds `docs/review-notes/<its PR number>.md` — one or more lesson lines, in the registry's format and classes — or its body carries `Review-notes: none (<reason>)`; `merge-check` refuses with `review_notes_missing` (24) otherwise. Do not append the historical `docs/review-notes.md` lessons. Deferring a finding to an issue, or reverting a PR, adds a fragment too. When the PR carries `risk:*` dimension labels, they scope the reviewer's brief.
 
