@@ -131,6 +131,27 @@ export const SLACK_DEFAULTS: ChannelDefaults = {
  *    counter rather than being ignored. Failing open on the RESET is the safe
  *    direction — the alternative silently mutes a channel forever.
  */
+/**
+ * Is this a bot's live task-list post? The runner renders every list with a
+ * context-block footer that starts "todos as of" (or "stopped · todos as of"
+ * once interrupted) — container/agent-runner/src/task-list.ts renderSubtext —
+ * and nothing else posts that footer. Bot-authored only, so a human quoting
+ * the phrase still reaches the agent.
+ */
+export function isSlackTaskListPost(message: { author?: { isBot?: boolean | 'unknown' }; raw?: unknown }): boolean {
+  if (message.author?.isBot !== true) return false;
+  const blocks = (message.raw as { blocks?: unknown } | undefined)?.blocks;
+  if (!Array.isArray(blocks)) return false;
+  return blocks.some(
+    (block) =>
+      (block as { type?: unknown }).type === 'context' &&
+      Array.isArray((block as { elements?: unknown }).elements) &&
+      (block as { elements: Array<{ text?: unknown }> }).elements.some(
+        (el) => typeof el.text === 'string' && /^(stopped · )?todos as of /.test(el.text),
+      ),
+  );
+}
+
 export function slackHopInboundFilter(
   governor: SlackHopGovernor,
   identity: SlackBotIdentity | null,
@@ -809,7 +830,15 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
         // sorted afterwards, so counting them would both mis-order the hop
         // state and re-judge history the live path already judged; recovery
         // is separately bounded by its window and allowRecoveredBotMessage.
-        inboundFilter: (message, ctx) => (ctx.recovered ? true : slackHopInboundFilter(hopGovernor, identity, message)),
+        // A sibling agent's live task list is its own progress, never a turn
+        // for this bot: drop it before routing so a list post can't wake an
+        // agent in a shared room.
+        inboundFilter: (message, ctx) =>
+          isSlackTaskListPost(message)
+            ? false
+            : ctx.recovered
+              ? true
+              : slackHopInboundFilter(hopGovernor, identity, message),
         detectRecoveredMention: (message) => {
           if (!identity) return false;
           const raw = message.raw as Record<string, unknown> | undefined;

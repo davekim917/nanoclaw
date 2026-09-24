@@ -29,6 +29,7 @@ import './memory-write.js';
 import './work-continuation.js';
 import './wait.js';
 import './escalate.js';
+import './task-list.js';
 import { startMcpServer, mountSpawnTools } from './server.js';
 
 function log(msg: string): void {

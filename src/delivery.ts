@@ -58,6 +58,8 @@ import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './sess
 import { sessionOutboundStorageStat, type NanoclawMailboxSession } from './modules/mailbox/index.js';
 import type { OutboundMessage } from './modules/mailbox/ops/delivery.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
+import { TASK_LIST_ENABLED } from './config.js';
+import { noteTaskListDelivered, taskListRowAdmissible } from './task-list-host.js';
 import { flagNeedsInput, getTaskByChildSession } from './modules/orchestrator-dispatch/db/tasks.js';
 import { appendRunLog } from './modules/scheduling/run-log.js';
 import { emitDashboardEvent, emitSessionEvent } from './dashboard/api/events.js';
@@ -703,7 +705,13 @@ export interface ChannelDeliveryAdapter {
      *  Host-internal only — containers never see instance. */
     instance?: string,
   ): Promise<string | undefined>;
-  setTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
+  setTyping?(
+    channelType: string,
+    platformId: string,
+    threadId: string | null,
+    instance?: string,
+    status?: string,
+  ): Promise<void>;
   deleteMessage?(
     channelType: string,
     platformId: string,
@@ -1083,7 +1091,8 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
       // back. Skip the pause for internal traffic (system actions,
       // agent-to-agent routing) — the user doesn't see those and
       // shouldn't get a gap in their typing indicator for them.
-      if (!result.recordOnly && msg.kind !== 'system' && msg.channel_type !== 'agent') {
+      // A task-list post or edit is not a reply: the agent is still working.
+      if (!result.recordOnly && msg.kind !== 'system' && msg.kind !== 'task_list' && msg.channel_type !== 'agent') {
         pauseTypingRefreshAfterDelivery(session.id);
       }
     } catch (err) {
@@ -1273,6 +1282,12 @@ async function deliverMessage(
   }
 
   const content = JSON.parse(msg.content);
+
+  // Live task list (docs/specs/slack-task-list/plan.md). The host switch is the
+  // gate that reaches adopted containers too: off, their list rows go nowhere
+  // and the 💭 status posts below come back. A row from a container the host
+  // already marked interrupted must not revive the list.
+  if (msg.kind === 'task_list' && !taskListRowAdmissible(session.id, content)) return { recordOnly: true };
 
   let externalOutcomeChannels: string[] = [];
   const wikiGroup = await getAgentGroup(session.agent_group_id);
@@ -1517,6 +1532,10 @@ async function deliverMessage(
   // spawn thread. Edit-in-place and the on-chat orphan delete are bypassed
   // so progress survives the final answer.
   if (msg.kind === 'status') {
+    // The task list and the platform's status line replace the 💭 stream. The
+    // row stays in outbound.db (the dashboard's session view still reads it);
+    // it just never posts.
+    if (TASK_LIST_ENABLED) return { recordOnly: true };
     const typedProgress = content.reporting?.version === 1 && content.reporting?.purpose === 'progress';
     if (!msg.channel_type || !msg.platform_id) {
       log.warn('Status message missing routing fields, dropping', { id: msg.id });
@@ -2108,6 +2127,9 @@ async function deliverMessage(
     platformMsgId,
     fileCount: files?.length,
   });
+
+  // The list's current item becomes the platform's "is working…" status text.
+  if (msg.kind === 'task_list') noteTaskListDelivered(session.id, content);
 
   // A real chat message supersedes any in-flight progress status. Delete
   // the orphan thinking-block message so it doesn't linger in the thread,

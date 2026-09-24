@@ -25,6 +25,7 @@ import { gateCommand, preFanoutGate, getInterceptHandler } from './command-gate.
 import type { InterceptContext } from './command-gate.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDeliveryAdapter } from './delivery.js';
+import { ackInboundReceipt, isHumanChatSdkContent } from './task-list-host.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
 import {
   channelNameProvenance,
@@ -1531,6 +1532,11 @@ async function deliverToAgent(
   // Start typing indicator before writeSessionMessage so recall injection
   // latency doesn't delay visible feedback on chat/chat-sdk paths.
   if (wake && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
+    // A replayed history message was already seen; only a live human message
+    // gets the receipt reaction.
+    if (!event.recovered && isHumanChatSdkContent(event.message.kind, event.message.content)) {
+      ackInboundReceipt(event.channelType, event.platformId, effectiveThreadId, event.message.id, mg.instance);
+    }
     startTypingRefresh(
       session.id,
       session.agent_group_id,

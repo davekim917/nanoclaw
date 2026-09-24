@@ -100,3 +100,49 @@ export function readDoneProposal(outbound: Database.Database): DoneProposal | nu
     return null;
   }
 }
+
+/**
+ * The live task list's record (`session_state.task_list`, written only by the
+ * runner's update_task_list). The host reads it for one job: when a container
+ * dies mid-list, edit the visible list to its pre-rendered "interrupted" form
+ * so a dead agent never leaves a live-looking ✱. Anything malformed reads as
+ * no list — the host never guesses at what to edit.
+ */
+export interface HostTaskList {
+  revision: number;
+  finished: boolean;
+  stale: boolean;
+  channelType: string;
+  platformId: string;
+  threadId: string | null;
+  platformMessageId: string;
+  interruptedText: string;
+  interruptedSubtext: string;
+}
+
+export function readTaskList(outbound: Database.Database): HostTaskList | null {
+  try {
+    const row = outbound.prepare("SELECT value FROM session_state WHERE key = 'task_list'").get() as
+      | { value: string }
+      | undefined;
+    if (!row) return null;
+    const p = JSON.parse(row.value) as Record<string, unknown>;
+    if (p.version !== 1 || typeof p.revision !== 'number') return null;
+    if (typeof p.channelType !== 'string' || typeof p.platformId !== 'string') return null;
+    if (typeof p.platformMessageId !== 'string' || !p.platformMessageId) return null;
+    if (typeof p.interruptedText !== 'string' || typeof p.interruptedSubtext !== 'string') return null;
+    return {
+      revision: p.revision,
+      finished: p.finished === true,
+      stale: p.stale === true,
+      channelType: p.channelType,
+      platformId: p.platformId,
+      threadId: typeof p.threadId === 'string' ? p.threadId : null,
+      platformMessageId: p.platformMessageId,
+      interruptedText: p.interruptedText,
+      interruptedSubtext: p.interruptedSubtext,
+    };
+  } catch {
+    return null;
+  }
+}

@@ -15,6 +15,7 @@ const envConfig = readEnvFile([
   'NANOCLAW_WORKGROUP_SHARED_FS',
   'NANOCLAW_SELF_HEAL',
   'NANOCLAW_SELF_HEAL_TAKEOVER',
+  'NANOCLAW_TASK_LIST',
   'CONTAINER_CPU_LIMIT',
   'CONTAINER_CPU_SHARES',
   'CONTAINER_MEMORY_LIMIT',
@@ -96,6 +97,13 @@ export const SELF_HEAL_ENABLED = (process.env.NANOCLAW_SELF_HEAL ?? envConfig.NA
 // prevent. Nudges prove themselves first. See modules/claims/self-heal.ts.
 export const SELF_HEAL_TAKEOVER_ENABLED =
   (process.env.NANOCLAW_SELF_HEAL_TAKEOVER ?? envConfig.NANOCLAW_SELF_HEAL_TAKEOVER) === '1';
+// Live task list (docs/specs/slack-task-list/plan.md). Default ON; `0` is the
+// fleet-wide off switch. The host reads it twice: here, at host start, to gate
+// delivery (task_list rows dropped, 💭 status posts back) — which reaches even
+// adopted containers — and at spawn, where it decides whether the container gets
+// the update_task_list tool (`NANOCLAW_TASK_LIST=1`). Same env-then-.env read as
+// SELF_HEAL_ENABLED, for the same import-time reason.
+export const TASK_LIST_ENABLED = (process.env.NANOCLAW_TASK_LIST ?? envConfig.NANOCLAW_TASK_LIST) !== '0';
 // Pre-task script timeout in ms, shared by the host path (host-script.ts) and
 // forwarded into containers for the container path (task-script.ts). Read via
 // env-then-.env for the same import-order reason as the flags above.

@@ -324,7 +324,9 @@ export interface ChannelAdapter {
   deliver(platformId: string, threadId: string | null, message: OutboundMessage): Promise<string | undefined>;
 
   // Optional
-  setTyping?(platformId: string, threadId: string | null): Promise<void>;
+  /** `status` is the platform's status-line text where it has one (Slack's
+   *  "<bot> is thinking…"); adapters without one ignore it. */
+  setTyping?(platformId: string, threadId: string | null, status?: string): Promise<void>;
   /**
    * Delete a previously-posted message via the platform's API. Optional —
    * adapters whose platform doesn't allow bot-message deletion (or which

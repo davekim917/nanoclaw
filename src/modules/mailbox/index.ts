@@ -160,8 +160,10 @@ import {
   clearWorkContinuation,
   readContinuationPresence,
   readDoneProposal,
+  readTaskList,
   type ContinuationPresence,
   type DoneProposal,
+  type HostTaskList,
 } from './ops/session-state.js';
 import {
   countDueMessages,
@@ -261,8 +263,10 @@ export {
   clearWorkContinuation,
   readContinuationPresence,
   readDoneProposal,
+  readTaskList,
   type ContinuationPresence,
   type DoneProposal,
+  type HostTaskList,
 } from './ops/session-state.js';
 
 /**
@@ -606,6 +610,7 @@ export interface NanoclawMailboxSession extends MailboxSession {
   /** Opens outbound.db read-write. The only host write to a container-owned key. */
   clearWorkContinuation(): ContinuationPresence | null;
   readDoneProposal(): DoneProposal | null;
+  readTaskList(): HostTaskList | null;
   hasRestartNoteSince(since: string): boolean;
 
   // --- fork-only repository fence ----------------------------------------
@@ -670,6 +675,7 @@ export type NanoclawOutboundRead = Pick<
   | 'getProcessingClaimRows'
   | 'readRepositoryMountBarrierAck'
   | 'readDoneProposal'
+  | 'readTaskList'
   | 'readContinuationPresence'
 >;
 
@@ -949,6 +955,7 @@ export function composeOutboundOps(
     // The empty values are the same answers a present-but-empty outbound.db
     // gives: no proposal, no continuation record, and nothing cleared.
     readDoneProposal: () => readOutbound(null, readDoneProposal),
+    readTaskList: () => readOutbound(null, readTaskList),
     readContinuationPresence: () => readOutbound(null, readContinuationPresence),
     clearWorkContinuation: () => (outboundPresent ? clearWorkContinuation(writableOutbound()) : null),
     // Rebinds upstream's op (`wrapSqliteOutbound` provides one too, and this

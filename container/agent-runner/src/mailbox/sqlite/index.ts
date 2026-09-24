@@ -1,6 +1,7 @@
 import {
   closeSessionDb,
   getInboundDb,
+  getOutboundDb,
   sqliteClearContainerToolInFlight,
   sqliteClearStaleProcessingAcks,
   sqliteSetContainerToolInFlight,
@@ -163,6 +164,16 @@ export class SqliteAgentMailbox implements AgentMailbox {
         threadId: row.thread_id,
       })
     );
+  }
+
+  countConversationMessagesAfter(sequence: number): number {
+    const inbound = getInboundDb()
+      .prepare("SELECT COUNT(*) AS n FROM messages_in WHERE seq > ? AND kind IN ('chat', 'chat-sdk')")
+      .get(sequence) as { n: number };
+    const outbound = getOutboundDb()
+      .prepare("SELECT COUNT(*) AS n FROM messages_out WHERE seq > ? AND kind = 'chat'")
+      .get(sequence) as { n: number };
+    return inbound.n + outbound.n;
   }
 
   getLatestInboundRoute(channelType: string, platformId: string) {

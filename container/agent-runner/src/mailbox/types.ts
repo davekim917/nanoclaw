@@ -53,6 +53,8 @@ export interface MailboxOperations {
   getMessageIdBySeq(sequence: number): string | null;
   getRoutingBySeq(sequence: number): SessionRouting | null;
   getLatestInboundRoute(channelType: string, platformId: string): { threadId: string | null; inReplyTo: string } | null;
+  /** Human or agent chat messages with a sequence number after `sequence` (task-list repost check). */
+  countConversationMessagesAfter(sequence: number): number;
   getUndeliveredMessages(): OutboundMessage[];
   getState(key: string): StateValue | undefined;
   setState(key: string, value: string): void;
