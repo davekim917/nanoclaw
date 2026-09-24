@@ -71,6 +71,14 @@ claim() { # [deadline] [claimant] [owner]
       activeLeaseOwner:$owner,activeClaimant:(if $cl == "" then null else $cl end)}' >"$C/state/pr-$PR-state.json"
 }
 
+gate_finished_elsewhere() { # completedRunId
+  mkdir -p "$C/state/runs/$RUN"
+  jq -cn --arg run "$RUN" --arg sha "$SHA" '{schemaVersion:1,runId:$run,sha:$sha,verdict:"BLOCKED"}' \
+    >"$C/state/runs/$RUN/verdict.json"
+  jq -c --arg done "$1" '.activeRunId=null | .activeLeaseOwner=null | .activeClaimant=null
+    | .completedRunId=$done | .completedVerdict="BLOCKED"' "$C/state/pr-$PR-state.json" >"$C/state/pr.tmp"
+  mv "$C/state/pr.tmp" "$C/state/pr-$PR-state.json"
+}
 wake_json() {
   jq -cn --arg run "$RUN" --arg sha "$SHA" --argjson pr "$PR" --arg tok "$TOKEN" \
     '{wakeAgent:true,data:{trigger:"pr_build_settled",runId:$run,pr:$pr,sourceSha:$sha,isFreezePr:true,
@@ -569,6 +577,115 @@ for variant in claimant token; do
     || fail "$variant: no gate/GitHub/task effect on a run we do not hold: $(cat "$FAKE_LOG")"
   jr '[.[] | select(.detail.noAuthority)] | length == 1' | grep -qx true || fail "$variant: no-authority recorded once"
   [ ! -e "$R/controller/brief-intake.md" ] || fail "$variant: no owner brief for a run we do not hold"
+  # Its holder finishes it: no foreign-finish alarm (no-authority already said
+  # so) and no post-finish write -- the wake marked it a freeze PR, so before
+  # XZO #2176 this planned and ran a freeze-close on a run we never held.
+  gate_finished_elsewhere "$RUN"
+  step_ok 2026-09-18T12:10:00Z
+  [ "$(jq -s '[.[] | select(.tool=="gate" or .tool=="gh" or .tool=="ncl")] | length' "$FAKE_LOG")" = 0 ] \
+    || fail "$variant: no post-finish effect on a run its holder finished: $(cat "$FAKE_LOG")"
+  jr '[.[] | select(.slot | startswith("alarm:foreign-finish"))] | length == 0' | grep -qx true \
+    || fail "$variant: its holder finishing it is not a foreign finish"
+  jr '[.[] | select(.kind=="run" and .state=="done" and .detail.finishedBy=="holder")] | length == 1' | grep -qx true \
+    || fail "$variant: the run is closed out as finished by its holder"
+done
+# d) a run the legacy coordinator claimed and finishes itself -- a
+#    human-requested campaign (XZO #2176) -- is not an orphan of ours: never
+#    journaled, never alarmed, never acted on, from claim to finish.
+new_case coordinator-run
+claim 2026-09-18T11:30:00Z "" owner-coordinator
+step_ok 2026-09-18T10:00:00Z
+jq -e '[.alarms[]? | select(.trigger=="controller_orphan_claim")] | length == 0' <<<"$STEP_OUT" >/dev/null \
+  || fail "a coordinator claim is not a controller orphan: $STEP_OUT"
+gate_finished_elsewhere "$RUN"
+step_ok 2026-09-18T10:10:00Z
+jr "[.[] | select(.runId==\"$RUN\")] | length == 0" | grep -qx true \
+  || fail "a coordinator-claimed run is never journaled: $(jr '[.[] | {slot, state}]')"
+[ ! -s "$FAKE_LOG" ] || fail "no gate/GitHub/task/chat effect for a coordinator run: $(cat "$FAKE_LOG")"
+# e) a run the controller HELD, whose claim then passes to another actor, is
+#    never silent end to end: no-authority fires once when the claim passes,
+#    and only then may the holder's finish stay quiet (no foreign-finish, no
+#    freeze-close) -- quiet at the finish is safe because the loss was said.
+new_case handed-off
+claim; wake_json
+step_ok 2026-09-18T10:00:00Z --poll-json "$C/wake.json"
+jr '[.[] | select(.slot | startswith("alarm:no-authority"))] | length == 0' | grep -qx true \
+  || fail "handed-off: no alarm while the controller holds the run"
+EFFECTS='[.[] | select(.tool=="gate" or .tool=="gh" or .tool=="ncl")] | length'
+BEFORE="$(jq -s "$EFFECTS" "$FAKE_LOG")"
+jq -c '.activeLeaseOwner="owner-coordinator" | .activeClaimant=null' "$C/state/pr-$PR-state.json" >"$C/state/pr.tmp"
+mv "$C/state/pr.tmp" "$C/state/pr-$PR-state.json"
+step_ok 2026-09-18T10:10:00Z
+step_ok 2026-09-18T10:20:00Z
+[ "$(jr '[.[] | select(.slot | startswith("alarm:no-authority")) | .slot] | unique | length')" = 1 ] \
+  || fail "handed-off: losing the claim raises exactly one no-authority alarm: $(jr '[.[] | .slot] | unique')"
+jr '[.[] | select(.detail.noAuthority == true)] | length == 1' | grep -qx true || fail "handed-off: loss recorded once"
+gate_finished_elsewhere "$RUN"
+step_ok 2026-09-18T10:30:00Z
+[ "$(jq -s "$EFFECTS" "$FAKE_LOG")" = "$BEFORE" ] \
+  || fail "handed-off: no gate/GitHub/task effect (no freeze-close) once the claim passed: $(cat "$FAKE_LOG")"
+jr '[.[] | select(.slot | startswith("alarm:foreign-finish"))] | length == 0' | grep -qx true \
+  || fail "handed-off: the holder's finish is quiet once the loss was alarmed"
+jr '[.[] | select(.kind=="run" and .state=="done" and .detail.finishedBy=="holder")] | length == 1' | grep -qx true \
+  || fail "handed-off: closed out as finished by its holder"
+# f) the loss is the present, not history: a run lost and then held again is
+#    ours, so another actor finishing it IS a foreign finish, alarmed.
+new_case regained
+claim; wake_json
+step_ok 2026-09-18T10:00:00Z --poll-json "$C/wake.json"
+jq -c '.activeLeaseOwner="owner-coordinator" | .activeClaimant=null' "$C/state/pr-$PR-state.json" >"$C/state/pr.tmp"
+mv "$C/state/pr.tmp" "$C/state/pr-$PR-state.json"
+step_ok 2026-09-18T10:10:00Z
+claim
+step_ok 2026-09-18T10:20:00Z
+jr '[.[] | select(.detail.noAuthority == false)] | length == 1' | grep -qx true || fail "regained: held again clears the loss"
+gate_finished_elsewhere "$RUN"
+step_ok 2026-09-18T10:30:00Z
+jr '[.[] | select(.slot | startswith("alarm:foreign-finish"))] | length > 0' | grep -qx true \
+  || fail "regained: another actor finishing a run we hold is a foreign finish: $(jr '[.[] | .slot] | unique')"
+# g) every loss is said: lost, held again, lost again raises a second
+#    no-authority alarm, so the holder's quiet finish never follows a silent loss.
+new_case lost-twice
+claim; wake_json
+step_ok 2026-09-18T10:00:00Z --poll-json "$C/wake.json"
+for at in 10:10 10:30; do
+  jq -c '.activeLeaseOwner="owner-coordinator" | .activeClaimant=null' "$C/state/pr-$PR-state.json" >"$C/state/pr.tmp"
+  mv "$C/state/pr.tmp" "$C/state/pr-$PR-state.json"
+  step_ok "2026-09-18T$at:00Z"
+  claim
+  step_ok "2026-09-18T${at%0}5:00Z"
+done
+jq -c '.activeLeaseOwner="owner-coordinator" | .activeClaimant=null' "$C/state/pr-$PR-state.json" >"$C/state/pr.tmp"
+mv "$C/state/pr.tmp" "$C/state/pr-$PR-state.json"
+step_ok 2026-09-18T10:50:00Z
+step_ok 2026-09-18T10:55:00Z
+[ "$(jr '[.[] | select(.slot | startswith("alarm:no-authority")) | .slot] | unique | length')" = 3 ] \
+  || fail "lost-twice: each of three losses alarms once: $(jr '[.[] | .slot] | unique')"
+gate_finished_elsewhere "$RUN"
+step_ok 2026-09-18T11:00:00Z
+jr '[.[] | select(.slot | startswith("alarm:foreign-finish"))] | length == 0' | grep -qx true \
+  || fail "lost-twice: the holder's finish is quiet once the last loss was alarmed"
+# h) a post-finish write an earlier controller already journaled for such a
+#    run (XZO #2176 had a freeze-close planned) is abandoned with its reason,
+#    not left open -- open, it kept every later fire revisiting the run.
+for seeded in intent failed; do
+  new_case "inherited-close-$seeded"
+  claim 2026-09-18T11:30:00Z ""; wake_json
+  step_ok 2026-09-18T10:00:00Z --poll-json "$C/wake.json"
+  jq -cn --arg run "$RUN" --arg k "$(key "$RUN" gh freeze-close)" --arg st "$seeded" \
+    '{v:1,at:"2026-09-18T10:05:00Z",fire:"seed",runId:$run,kind:"gh",slot:"freeze-close",key:$k,state:$st,attempt:1,
+      mode:"live",detail:{planned:true}}' >>"$C/out/journal.ndjson"
+  gate_finished_elsewhere "$RUN"
+  step_ok 2026-09-18T10:10:00Z
+  jr '[.[] | select(.slot=="freeze-close")] | last | .state == "abandoned" and .detail.reason == "run finished by its holder"' \
+    | grep -qx true || fail "$seeded: the inherited freeze-close is abandoned: $(jr '[.[] | select(.slot=="freeze-close")]')"
+  [ "$(jq -s '[.[] | select(.tool=="gh" or .tool=="gate" or .tool=="ncl")] | length' "$FAKE_LOG")" = 0 ] \
+    || fail "$seeded: the inherited freeze-close is never run: $(cat "$FAKE_LOG")"
+  # The alarm lane still waits on its receipt; the run itself is not revisited.
+  RUNQ='[.[] | select(.phase != "alarm")] | length'
+  N="$(dq "$RUNQ")"
+  step_ok 2026-09-18T10:20:00Z
+  [ "$(dq "$RUNQ")" = "$N" ] || fail "$seeded: the next fire takes the done fast path: $(dq '.[-3:]')"
 done
 # c) the gate fake mirrors claimant_guard: a legacy caller cannot finish a
 #    controller run (the real gate is tested in smoke-pr-gate.test.sh).
@@ -708,14 +825,6 @@ one_alarm() { # label alarm-slot [run]
 }
 # verdict.json on file, the slot gone, and a completed state that names another
 # run (or this one): the gate's finish cannot be confirmed / was someone else's.
-gate_finished_elsewhere() { # completedRunId
-  mkdir -p "$C/state/runs/$RUN"
-  jq -cn --arg run "$RUN" --arg sha "$SHA" '{schemaVersion:1,runId:$run,sha:$sha,verdict:"BLOCKED"}' \
-    >"$C/state/runs/$RUN/verdict.json"
-  jq -c --arg done "$1" '.activeRunId=null | .activeLeaseOwner=null | .activeClaimant=null
-    | .completedRunId=$done | .completedVerdict="BLOCKED"' "$C/state/pr-$PR-state.json" >"$C/state/pr.tmp"
-  mv "$C/state/pr.tmp" "$C/state/pr-$PR-state.json"
-}
 recovery_fires() { # crash-spec first-tick: kill the first fire there, then keep firing
   local n now extra
   for n in $(seq "$2" $(($2 + 4))); do
@@ -853,8 +962,10 @@ transition() { # name
                           "$C/state/pr-$PR-state.json" >"$C/state/pr.tmp"
                         mv "$C/state/pr.tmp" "$C/state/pr-$PR-state.json"
                         inputs_from_fakes; step_ok "$(tick_time 1)" ;;
+    # Our wake journaled the run, then the gate names another holder. (An
+    # unjournaled claim of another claimant is not ours at all -- 7d.)
     no-authority)       claim "" ""; wake_json
-                        inputs_from_fakes; step_ok "$(tick_time 0)" ;;
+                        inputs_from_fakes; step_ok "$(tick_time 0)" --poll-json "$C/wake.json" ;;
     foreign-finish)     claim; wake_json; inputs_from_fakes; step_ok "$(tick_time 0)" --poll-json "$C/wake.json"
                         gate_finished_elsewhere "$RUN"
                         inputs_from_fakes; step_ok "$(tick_time 1)" ;;
