@@ -121,6 +121,20 @@ class FindingIssue(unittest.TestCase):
         self.assertEqual(trigger, "controller_obligation_overdue")
         self.assertEqual(detail["error"], err)
 
+    def test_a_recovered_listing_still_puts_the_dropped_note_in_the_filed_body(self):
+        # Fire 1: the listing fails, the owner's labels go out unchanged, the
+        # create is refused -- and its body payload is already on disk.
+        self.gh(labels=["smoke-finding", "severity:p3"])
+        (self.state / "faults.json").write_text(json.dumps({"gh:label-list": ["fail-before"]}))
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "intent")
+        # Fire 2 (a fresh EffectLayer, as every fire is its own process): the
+        # listing recovers, `nope` is dropped, and the note reaches the issue.
+        self.fx._repo_labels = {}
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        [issue] = self.filed()
+        self.assertEqual(issue["labels"], ["smoke-finding", "severity:p3"])
+        self.assertIn("dropped: `nope`", issue["body"])
+
     def test_a_write_that_exits_zero_but_is_not_found_keeps_the_read_back_error(self):
         self.assertIsNone(ctl.gh_write_error((0, "", "noise"), "issue create"))
         self.assertEqual(ctl.gh_write_error((None, "", "timed out after 30s"), "pr comment"),

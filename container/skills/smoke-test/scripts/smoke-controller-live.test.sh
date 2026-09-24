@@ -794,7 +794,7 @@ fire SMOKE_CONTROLLER_LIVE_BUDGET_SECONDS=6 SMOKE_CONTROLLER_SEND_TO=campaign-ro
 # file defined 17, so eleven names -- SMOKE_GATE_LEASE_DIR among them -- were
 # dropped silently. The deployed gate WRAPPER sources that file itself, so the
 # gate's own lease dir stayed right; but the evidence barrier is spawned by the
-# controller with this process's environment (smoke-campaign-controller.py:1889
+# controller with this process's environment (smoke-campaign-controller.py:1896
 # -> run_read_only -> spawn :692-704, env=None) and fell back to
 # ${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}/qa-coordinator/leases
 # (smoke-evidence-barrier.sh:739). No pin for the campaign lives there, so the

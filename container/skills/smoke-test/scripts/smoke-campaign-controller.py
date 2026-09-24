@@ -1197,10 +1197,17 @@ class EffectLayer:
                 if isinstance(issue, dict) and normalize_title(issue.get("title")) == norm:
                     return {"outcome": "done", "via": "dedup", "url": issue.get("url"), "duplicateOf": issue.get("number")}
             labels, mapped, dropped = resolve_labels(labels, self._labels_of(repo))
+            name = key[:16] + "-issue.md"
             if dropped:
-                body += "\n\nLabels not on {} and dropped: {}.".format(repo, ", ".join("`{}`".format(x) for x in dropped))
-            path, _ = write_contained_once(root, self._payload_dir(run_id) + [key[:16] + "-issue.md"],
-                                           "{}\n{}\n".format(body, marker))
+                note = "Labels not on {} and dropped: {}.".format(repo, ", ".join("`{}`".format(x) for x in dropped))
+                body += "\n\n" + note
+                # The payload is written once per name and a replay keeps it
+                # (write_contained_once), so a body that gains this note after
+                # an earlier attempt -- a listing that failed, then recovered --
+                # needs its own name, or the note never reaches the issue. The
+                # marker search above still makes the create land at most once.
+                name = "{}-{}-issue.md".format(key[:16], hashlib.sha256(note.encode()).hexdigest()[:8])
+            path, _ = write_contained_once(root, self._payload_dir(run_id) + [name], "{}\n{}\n".format(body, marker))
             argv = self.gh + ["issue", "create", "-R", repo, "--title", title, "--body-file", path]
             for label in labels:
                 argv += ["--label", label]
@@ -1383,14 +1390,14 @@ class EffectLayer:
         # AN ACK NEVER OUTLIVES THE BRIEF IT ACKNOWLEDGED. The ack is the
         # owner's first act on a wake and the controller only tests it for
         # existence, re-offering a wake solely while it is ABSENT (owner_step,
-        # :2638-2648); the renewer reads it the same way
+        # :2645-2655); the renewer reads it the same way
         # (smoke-controller-renew.sh, "brief-<step>.ack absent: no owner turn
         # holds this step"). So a brief rewritten under a NEW owner token would
         # otherwise inherit the previous brief's ack and be treated as taken,
         # and never re-offered -- the second half of XZO #2046. Removing it here
         # makes that impossible by construction rather than by sequencing: this
         # function runs only when the obligation is absent or `intent`
-        # (owner_step, :2568), never while a live brief is enqueued, so any ack
+        # (owner_step, :2575), never while a live brief is enqueued, so any ack
         # it finds belongs to a brief this write supersedes.
         try:
             dfd = _open_dir_contained(root, [run_id, "controller"], True)
@@ -2779,7 +2786,7 @@ class Controller:
         then the owner writes evidence the barrier rejects. The next fire
         publishes the new refusal and returns `ownerWake: null`, because
         owner_step re-offers a wake only while the `.ack` is ABSENT
-        (:2638-2648). The diagnosis is on disk and nobody is told to read it --
+        (:2645-2655). The diagnosis is on disk and nobody is told to read it --
         the same dead end, reached the way run pr2055 actually reached it.
 
         THE TRIGGER IS A CHANGE IN THE REFUSAL, NOT "INVALID". Narrower than
@@ -2794,7 +2801,7 @@ class Controller:
         fire exactly like `briefedToken`: a crash between the publish and the
         re-offer leaves the next fire owing the same re-offer. Re-offering does
         not extend the step's SLA -- owner_step measures from `history[0]`
-        (:2649) -- so a run that keeps producing invalid evidence still ends at
+        (:2656) -- so a run that keeps producing invalid evidence still ends at
         the overdue path rather than being woken forever."""
         ob = self.obligations().get(obligation_key(run_id, "owner", step))
         if not ob or ob["state"] not in ("intent", "enqueued"):
@@ -3055,8 +3062,8 @@ class Controller:
         An owner step records `brief_written`/`admitted`/`briefedToken`/
         `dispatchIntent` only once <run>/controller/brief-<step>.md is on disk
         (_owner_wake writes the brief before either route records anything,
-        :1410 and :1429; owner_step journals it after the effect returns,
-        :2623-2633) -- a bare `intent` is deliberately NOT proof, since a fire
+        :1417 and :1436; owner_step journals it after the effect returns,
+        :2630-2640) -- a bare `intent` is deliberately NOT proof, since a fire
         can die before the brief lands. A `send:root` obligation is proof too:
         the root is posted only from a readable completion contract (step_run's
         ladder). Shadow owner steps (`shadow_refused`) write nothing and are
@@ -3315,8 +3322,8 @@ class Controller:
                 # THE OWNER IS WOKEN HERE, not only once the barrier passes.
                 # By this point every OTHER party's contribution the synthesis
                 # barrier checks has already been gated above: the lanes
-                # barrier is ready (:3282), coordinator/preliminary.md exists
-                # (:3299) and challenger/disposition.md exists (:3305). What
+                # barrier is ready (:3289), coordinator/preliminary.md exists
+                # (:3306) and challenger/disposition.md exists (:3312). What
                 # the synthesis barrier can still report is therefore the
                 # retained owner's -- `invalid[]` content it authored
                 # (journeys/scope-dispositions.json, or
@@ -3328,7 +3335,7 @@ class Controller:
                 # alone (smoke-controller-live.sh:168-175), so nobody was told;
                 # and _maybe_synthesis_overdue_blocked needs the very
                 # owner:synthesis obligation this branch declined to create
-                # (:3340-3342), so the terminal BLOCKED safety net could not
+                # (:3347-3349), so the terminal BLOCKED safety net could not
                 # fire either. This is the same blind spot as the lanes barrier
                 # (XZO #2047), on the sibling path.
                 timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)
@@ -3430,7 +3437,7 @@ class Controller:
            ladder ("An owner may conclude ..." below) and is never pre-empted
            by a timeout -- but only where the ladder can reach it, which needs
            a readable contract: validate_synthesis binds its sourceSha to the
-           contract's (:1936-1943), so without one it could only be BLOCKED.
+           contract's (:1943-1950), so without one it could only be BLOCKED.
         3. The challenger deadline itself."""
         vob = self.obligations().get(obligation_key(run_id, "verdict", "validated"))
         if vob and vob["state"] == "done" and vob["detail"].get("verdict") != "GO":
@@ -3590,7 +3597,7 @@ class Controller:
         refused by the real gate once it sees a disposition, and a disposition
         can land after the timeout froze its BLOCKED. gate_verb records a
         permanent refusal failed_terminal and afterwards returns it without
-        calling the gate (this file, :2348-2349), so re-selecting the verb
+        calling the gate (this file, :2355-2356), so re-selecting the verb
         wedged the run for good -- a wedge since live mode (#945), found three
         ways in PR #1066: a fake gate that never refused, a frozen verb replayed
         after a late disposition, and a controller read of the disposition
