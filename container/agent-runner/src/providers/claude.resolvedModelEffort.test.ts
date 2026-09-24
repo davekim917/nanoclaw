@@ -93,7 +93,7 @@ describe('family-default effort follows the RESOLVED model, not the opus alias',
   it('test_fable_pinned_group_gets_fables_family_default', () => {
     const o = turn({}, { groupModel: 'claude-fable-5-1[1m]' });
     expect(o?.model).toBe('claude-fable-5-1[1m]');
-    expect(o?.effort).toBe('high');
+    expect(o?.effort).toBe('medium');
   });
 
   it('test_opus_default_group_gets_opus_family_default', () => {
@@ -116,7 +116,7 @@ describe('every other precedence layer is untouched', () => {
     const o = turn({ providerConfig: { model: 'claude-fable-5-1[1m]' } }, { groupModel: 'claude-sonnet-5' });
     expect(o?.model).toBe('claude-fable-5-1[1m]');
     // ...and now the family default follows THAT model, which is the whole point.
-    expect(o?.effort).toBe('high');
+    expect(o?.effort).toBe('medium');
   });
 
   it('test_operator_effort_override_still_beats_the_family_default', () => {
