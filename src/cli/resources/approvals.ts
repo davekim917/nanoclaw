@@ -1,3 +1,4 @@
+import { PENDING_APPROVAL_STATUSES } from '../../types.js';
 import { registerResource } from '../crud.js';
 import { resolveApprovalFromHost } from '../../modules/approvals/response-handler.js';
 
@@ -44,8 +45,9 @@ registerResource({
     {
       name: 'status',
       type: 'string',
-      description: 'Current status.',
-      enum: ['pending', 'approved', 'rejected', 'expired'],
+      description:
+        'Current status. awaiting_reason means the admin chose "Reject with reason…" and the reply is still pending.',
+      enum: [...PENDING_APPROVAL_STATUSES],
     },
     { name: 'title', type: 'string', description: 'Card title shown to the admin.' },
     { name: 'options_json', type: 'json', description: 'Card button options as JSON array.' },

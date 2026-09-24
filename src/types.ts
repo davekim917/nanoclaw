@@ -223,6 +223,10 @@ export interface PendingQuestion {
 
 // ── Pending approvals (central DB) ──
 
+/** Every status a pending_approvals row can hold. */
+export const PENDING_APPROVAL_STATUSES = ['pending', 'approved', 'rejected', 'expired', 'awaiting_reason'] as const;
+export type PendingApprovalStatus = (typeof PENDING_APPROVAL_STATUSES)[number];
+
 export interface PendingApproval {
   approval_id: string;
   session_id: string | null;
@@ -241,7 +245,7 @@ export interface PendingApproval {
    * host sweep finalizes a plain reject (set by markApprovalAwaitingReason).
    */
   expires_at: string | null;
-  status: 'pending' | 'approved' | 'rejected' | 'expired' | 'awaiting_reason';
+  status: PendingApprovalStatus;
   title: string;
   question: string;
   options_json: string;
