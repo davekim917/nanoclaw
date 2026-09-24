@@ -195,6 +195,21 @@ export function deferTaskListOnRateLimit(channelType: string | null, err: unknow
   return true;
 }
 
+/**
+ * Note an initial task-list POST the drain stepped past for a rate limit. If
+ * an answer delivers after it in the same drain, the post is retired
+ * (recorded delivered-unsent) rather than sent later BELOW the answer; the
+ * runner reads that as a failed post and its next update posts afresh. Edits
+ * can safely land late — they change a message already in place.
+ */
+export function noteHeldTaskListPost(held: Set<string>, msg: { id: string; content: string }): void {
+  try {
+    if ((JSON.parse(msg.content) as { operation?: unknown }).operation !== 'edit') held.add(msg.id);
+  } catch {
+    // Unparseable: the delivery path records its own failure for it.
+  }
+}
+
 /** Test seam: forget every cooldown. */
 export function _clearTaskListCooldownsForTest(): void {
   taskListCooldowns.clear();

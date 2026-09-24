@@ -37,3 +37,8 @@
   of losing all of it. A replaced list (busy-thread repost or previous generation) is collapsed only after its
   replacement has a platform id, and until then it is also what the host marks interrupted on a kill
   (`supersedes`).
+- **GitHub Codex review, round 3** (head 5c60d6f3, the loop's last round): 2 findings, both accepted and fixed with
+  mutation-checked tests. A container exit the host did not ask for (OOM, runner crash) now settles its list; host
+  stops are tracked by container name so idle reaps keep their exclusion. A rate-limited FIRST post that an answer
+  overtakes is retired (recorded delivered-unsent) instead of posting later below the answer. The round cap (3) is
+  reached, so a final review of this head needs the operator's call.

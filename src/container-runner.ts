@@ -2037,6 +2037,9 @@ async function spawnContainer(
 
       child.on('close', (code) => {
         finalizeContainer();
+        if (!hostStoppedContainers.delete(containerName) && code !== 0) {
+          void import('./task-list-host.js').then((m) => m.settleTaskListOnKill(session.id, 'container-exit'));
+        }
         // code null = killed by signal (normal shutdown path), not a boot failure.
         if (code === 137) {
           log.warn('Container exited 137 — likely OOM kill or forced SIGKILL', {
@@ -2257,6 +2260,13 @@ function clearStatusOnKill(sessionId: string, reason: string): void {
     });
 }
 
+/**
+ * Containers the host itself is stopping (every stop path runs
+ * clearStatusOnKill, which settles the task list). Any other non-zero exit —
+ * OOM, a runner crash — settles it from the close handler instead.
+ */
+const hostStoppedContainers = new Set<string>();
+
 /** Stop a RUNNING container, attaching every exit callback before the stop. */
 function stopRunningContainer(sessionId: string, reason: string, onExit: ContainerExitCallback[]): void {
   const entry = activeContainers.get(sessionId);
@@ -2269,6 +2279,7 @@ function stopRunningContainer(sessionId: string, reason: string, onExit: Contain
     });
   }
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName, adopted: entry.adopted });
+  hostStoppedContainers.add(entry.containerName);
   clearStatusOnKill(sessionId, reason);
   try {
     stopContainer(entry.containerName);
@@ -2576,6 +2587,7 @@ function stopPendingSurvivor(sessionId: string, reason: string, onExit: Containe
     return;
   }
   log.info('Killing container', { sessionId, reason, containerName, pending: true });
+  hostStoppedContainers.add(containerName);
   clearStatusOnKill(sessionId, reason);
   try {
     stopContainer(containerName);
@@ -3707,6 +3719,7 @@ export async function stopAllContainers(gracePeriodMs: number = 10_000): Promise
       }
       channelOnClose(entry.channel, () => resolve());
     });
+    hostStoppedContainers.add(entry.containerName);
     try {
       stopContainer(entry.containerName);
     } catch (err) {

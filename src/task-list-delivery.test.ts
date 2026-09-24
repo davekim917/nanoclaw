@@ -572,6 +572,31 @@ describe('task list delivery (switch on)', () => {
     expect(sent).toEqual(['task_list:two', 'task_list:other list']);
   });
 
+  it('retires a rate-limited first post that its answer overtook, instead of posting it below the answer', async () => {
+    const sessionId = await seed();
+    const sent: string[] = [];
+    let limited = true;
+    setDeliveryAdapter({
+      async deliver(_c, _p, _t, kind, content) {
+        if (kind === 'task_list' && limited) throw new Error('slack rate_limited: Retry-After: 1');
+        sent.push(`${kind}:${(JSON.parse(content) as { text: string }).text}`);
+        return `plat-${sent.length}`;
+      },
+    });
+    const base = Date.now();
+    insertRow(sessionId, 'first-post', 'task_list', { text: 'T\n✱ A' }, { timestamp: new Date(base).toISOString() });
+    insertRow(sessionId, 'answer', 'chat', { text: 'Done: A.' }, { timestamp: new Date(base + 1).toISOString() });
+    const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+    await deliverSessionMessages(session);
+    expect(sent).toEqual(['chat:Done: A.']);
+    // Recorded delivered with no platform id: the runner reads it as a failed post.
+    expect(await delivered(sessionId)).toContain('first-post');
+    limited = false;
+    await new Promise((r) => setTimeout(r, 1_100));
+    await deliverSessionMessages(session);
+    expect(sent).toEqual(['chat:Done: A.']);
+  });
+
   it('sends only the newest of several queued edits to one list', async () => {
     const sessionId = await seed();
     const calls = captureAdapter();

@@ -194,4 +194,9 @@ something the plan did not know.
   progress.
 - **Replacing a list**: a repost's old copy (or the previous generation) is collapsed into a pointer only once the
   new post has a platform id. Until then it stays the visible list, and a kill marks IT interrupted.
+- **Crashes**: a container exit the host did not ask for (OOM, runner crash) settles its list like a kill; the
+  host tracks its own stops by container name, so idle reaps keep their exclusion. An adopted container's crash is
+  not covered (no close handler on this host).
+- **Rate-limited first post**: if an answer overtakes it, the post is retired rather than shown below the answer;
+  the next update posts afresh.
 - **Sibling rooms**: Slack inbound drops a bot post carrying the list footer, so a list never wakes another bot.

@@ -61,6 +61,7 @@ import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typ
 import { TASK_LIST_ENABLED } from './config.js';
 import {
   deferTaskListOnRateLimit,
+  noteHeldTaskListPost,
   noteTaskListDelivered,
   supersededTaskListEdits,
   taskListCooldownMs,
@@ -1059,9 +1060,15 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
     }
   };
 
+  // Initial task-list posts stepped past for a rate limit; an answer that
+  // overtakes them retires them (noteHeldTaskListPost).
+  const heldListPosts = new Set<string>();
   for (const msg of undelivered) {
     // A list row waits out its platform's rate-limit cooldown; it stays outstanding.
-    if (msg.kind === 'task_list' && taskListCooldownMs(msg.channel_type) > 0) continue;
+    if (msg.kind === 'task_list' && taskListCooldownMs(msg.channel_type) > 0) {
+      noteHeldTaskListPost(heldListPosts, msg);
+      continue;
+    }
     // A stored count already at the cap is terminal on its own — the crash
     // window described on the helpers above leaves exactly that row behind.
     // Deciding from it BEFORE the adapter runs is what stops a successor host
@@ -1098,9 +1105,12 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
       // (on admin approval or timeout). Auto-acking here would race
       // ahead of the human and silently unblock a gated command.
       if (!result.deferAck) {
-        await ackDelivery(agentGroup.id, session.id, (mailbox) =>
-          mailbox.markDelivered(msg.id, result.platformMsgId ?? null),
-        );
+        await ackDelivery(agentGroup.id, session.id, (mailbox) => {
+          mailbox.markDelivered(msg.id, result.platformMsgId ?? null);
+          if (msg.kind === 'chat' && !result.recordOnly)
+            for (const id of heldListPosts) mailbox.markDelivered(id, null);
+        });
+        if (msg.kind === 'chat' && !result.recordOnly) heldListPosts.clear();
         deliveredNow.add(msg.id);
         // Mirror the outbound timestamp into the central sessions row so
         // the inbox board can compute attention-state without opening
@@ -1144,7 +1154,10 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
     } catch (err) {
       // A rate-limited list row is not failing, it is early: cool it down
       // uncharged and let the answers behind it through.
-      if (msg.kind === 'task_list' && deferTaskListOnRateLimit(msg.channel_type, err)) continue;
+      if (msg.kind === 'task_list' && deferTaskListOnRateLimit(msg.channel_type, err)) {
+        noteHeldTaskListPost(heldListPosts, msg);
+        continue;
+      }
       sawError = true;
       const attempts = await recordAttemptRow(msg.id, session.id, err);
       if (attempts !== null && attempts >= MAX_DELIVERY_ATTEMPTS) {
