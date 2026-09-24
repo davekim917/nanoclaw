@@ -140,18 +140,22 @@ if [ -n "$rest" ]; then
       exit 1
       ;;
     */actions/runs/*/attempts/*/jobs\\?*)
-      # jobs--<run id>--attempt-<n>.json is that EARLIER attempt's jobs page
-      # (the newest attempt is served by the plain /jobs route below). Absent =
-      # the read fails.
+      # jobs--<run id>--attempt-<n>.json is that attempt's jobs page. A run
+      # with no attempt pages at all is a single-attempt run, and its
+      # jobs--<run id>.json answers for attempt 1. Absent = the read fails.
       id="\${rest#*/actions/runs/}"
       attempt="\${id#*/attempts/}"; attempt="\${attempt%%/*}"
       id="\${id%%/*}"
-      if [ ! -f "$MOCK_DIR/jobs--$id--attempt-$attempt.json" ]; then
+      src="$MOCK_DIR/jobs--$id--attempt-$attempt.json"
+      if [ ! -f "$src" ] && [ "$attempt" = 1 ] && ! compgen -G "$MOCK_DIR/jobs--$id--attempt-*.json" >/dev/null; then
+        src="$MOCK_DIR/jobs--$id.json"
+      fi
+      if [ ! -f "$src" ]; then
         echo '{"message":"Not Found","status":"404"}'
         echo 'gh: Not Found (HTTP 404)' >&2
         exit 1
       fi
-      if printf '%s\\n' "$@" | grep -qx -- --slurp; then printf '['; cat "$MOCK_DIR/jobs--$id--attempt-$attempt.json"; printf ']'; else cat "$MOCK_DIR/jobs--$id--attempt-$attempt.json"; fi
+      if printf '%s\\n' "$@" | grep -qx -- --slurp; then printf '['; cat "$src"; printf ']'; else cat "$src"; fi
       exit 0
       ;;
     */actions/runs/*/jobs\\?*)
@@ -175,6 +179,27 @@ if [ -n "$rest" ]; then
         exit 1
       fi
       cat "$MOCK_DIR/job--$id.json"
+      exit 0
+      ;;
+    */actions/runs/*/rerun)
+      # POST re-run of a whole run: recorded; MOCK_RERUN_STATUS makes it fail.
+      [[ " $* " == *" -X POST "* ]] || { echo 'mock: a re-run must be a POST' >&2; exit 9; }
+      id="\${rest#*/actions/runs/}"
+      id="\${id%%/*}"
+      printf 'rerun %s\\n' "$id" >> "$MOCK_CALLS"
+      if [ "\${MOCK_RERUN_STATUS:-0}" != 0 ]; then echo 'gh: Resource not accessible by personal access token (HTTP 403)' >&2; exit "$MOCK_RERUN_STATUS"; fi
+      exit 0
+      ;;
+    */actions/runs/[0-9]*)
+      # One run, as the script's --jq prints it (status<TAB>run_attempt):
+      # run--<id>-<n>.tsv answers the nth read of it, run--<id>.tsv otherwise.
+      # Absent = the read fails.
+      id="\${rest##*/}"
+      n=$(grep -c "^rest repos/[^ ]*/actions/runs/$id$" "$MOCK_CALLS")
+      src="$MOCK_DIR/run--$id.tsv"
+      if [ -f "$MOCK_DIR/run--$id-$n.tsv" ]; then src="$MOCK_DIR/run--$id-$n.tsv"; fi
+      if [ ! -f "$src" ]; then echo '{"message":"Not Found","status":"404"}'; echo 'gh: Not Found (HTTP 404)' >&2; exit 1; fi
+      cat "$src"
       exit 0
       ;;
     */actions/runs\\?*)
@@ -1150,6 +1175,407 @@ describe('codex-review ci-wait, the only way to wait on CI', () => {
     const result = ciWait(root, args, [0]);
     expect(result.status).toBe(2);
     expect(result.calls).toBe('');
+  });
+});
+
+describe('codex-review ci-wait: a quick-tier head requests the full suite', () => {
+  // A tiered repo's ci.yml runs a pull request's first attempt on a commit as
+  // the quick tier: plan + spelling, then a `CI Quick` gate whose verdict step
+  // passes and whose `Full CI has not run on this commit` step fails on
+  // purpose. A re-run of that run is the full suite, which reports CI Gate.
+  const QUICK = Date.parse('2026-09-05T00:01:00Z') / 1000;
+  const VERDICT_STEP = 'Every selected job passed and every other one was skipped';
+  const QUICK_STEP = 'Full CI has not run on this commit';
+  function job(name: string, conclusion: string, steps?: Page[]): Page {
+    const ran = conclusion !== 'skipped';
+    return {
+      id: 7000 + name.length,
+      name,
+      status: 'completed',
+      conclusion,
+      runner_id: ran ? 1000006727 : 0,
+      runner_name: ran ? 'GitHub Actions 1000006727' : '',
+      steps: steps ?? (ran ? [{ name: 'step', status: 'completed', conclusion }] : []),
+    };
+  }
+  // The gate as it really ends: its verdict step failing skips the quick step.
+  function gate(verdict: 'success' | 'failure'): Page {
+    return job('CI Quick', 'failure', [
+      { name: 'Set up job', status: 'completed', conclusion: 'success' },
+      { name: VERDICT_STEP, status: 'completed', conclusion: verdict },
+      { name: QUICK_STEP, status: 'completed', conclusion: verdict === 'success' ? 'failure' : 'skipped' },
+    ]);
+  }
+  const quickJobs = (spelling = 'success') => [
+    job('plan', 'success'),
+    job('spelling / en-US spelling', spelling),
+    job('backend-ci', 'skipped'),
+    gate(spelling === 'success' ? 'success' : 'failure'),
+  ];
+  const neverStarted = (attempt?: number) => ({
+    id: 1,
+    status: 'completed',
+    conclusion: 'failure',
+    runner_id: 0,
+    runner_name: '',
+    steps: [],
+    ...(attempt === undefined ? {} : { run_attempt: attempt }),
+  });
+  function quickRun(root: string, jobs = quickJobs(), attempt = 1, name = 'CI', startedAt = '2026-09-05T00:01:00Z'): Page {
+    const run: Page = { ...workflowRun(name, 'completed', 'failure', startedAt), run_attempt: attempt };
+    writeJson(root, `jobs--${run.id as number}--attempt-${attempt}.json`, { total_count: jobs.length, jobs });
+    return run;
+  }
+  function runs(root: string, name: string, list: Page[]): void {
+    writeJson(root, name, { total_count: list.length + 1, workflow_runs: [labelRun('completed', 'success'), ...list] });
+  }
+  function runState(root: string, id: number, status: string, attempt: number, nth?: number): void {
+    fs.writeFileSync(path.join(root, nth === undefined ? `run--${id}.tsv` : `run--${id}-${nth}.tsv`), `${status}\t${attempt}\n`);
+  }
+  const reruns = (calls: string) => calls.split('\n').filter((l) => l.startsWith('rerun ')).length;
+
+  it('re-runs the quick run once, then waits for the full suite and reads it green (mutation: quick read as red, or as green)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs-1.json', [quickRun(root)]);
+    runs(root, 'runs-2.json', [{ ...workflowRun('CI', 'in_progress', null), run_attempt: 2 }]);
+    runs(root, 'runs-3.json', [{ ...workflowRun('CI', 'completed', 'success'), run_attempt: 2 }]);
+    runState(root, QUICK, 'completed', 1, 1);
+    runState(root, QUICK, 'queued', 2);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 0, 30, 30, 60]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`requested the full suite on ${HEAD} by re-running run ${QUICK}`);
+    expect(result.stdout).toContain(`ci=green head=${HEAD}`);
+    expect(reruns(result.calls)).toBe(1);
+  });
+
+  it('gives the full suite the whole --timeout from after the request, not from the tick (mutation: request_at taken before the reads)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs-1.json', [quickRun(root)]);
+    runs(root, 'runs-2.json', [{ ...workflowRun('CI', 'in_progress', null), run_attempt: 2 }]);
+    runs(root, 'runs-3.json', [{ ...workflowRun('CI', 'completed', 'success'), run_attempt: 2 }]);
+    runState(root, QUICK, 'completed', 1, 1);
+    runState(root, QUICK, 'queued', 2);
+
+    // The tick starts at 50; the reads and the POST take until 95.
+    const result = ciWait(root, ['--head', HEAD, '--timeout', '60'], [0, 50, 95, 95, 125, 125, 155]);
+    expect(result.status).toBe(0);
+    expect(result.sleep).toBe('30\n30\n');
+  });
+
+  it('does not re-run a quick run whose own checks failed: that is red (mutation: any CI Quick run re-run)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs.json', [quickRun(root, quickJobs('failure'))]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(29);
+    expect(result.stderr).toContain(`ci=red head=${HEAD}: ci_red: CI=failure (required)`);
+    expect(reruns(result.calls)).toBe(0);
+  });
+
+  it('a gate whose own verdict failed is red even when every job looks right (mutation: quick_only by names alone)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs.json', [quickRun(root, [job('plan', 'success'), job('spelling / en-US spelling', 'success'), gate('failure')])]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(29);
+    expect(reruns(result.calls)).toBe(0);
+  });
+
+  it('fails closed to red when the jobs read fails (mutation: an unreadable run assumed quick)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs.json', [workflowRun('CI', 'completed', 'failure')]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(29);
+    expect(reruns(result.calls)).toBe(0);
+  });
+
+  it('exits 1 and says to re-run by hand when the re-run is refused (mutation: a failed POST read as requested)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs.json', [quickRun(root)]);
+    runState(root, QUICK, 'completed', 1);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0], { MOCK_RERUN_STATUS: '1' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`could not re-run run ${QUICK} to request the full suite`);
+  });
+
+  it('exits 30 when the requested re-run never starts, and asks only once (mutation: re-requests every tick)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs.json', [quickRun(root)]);
+    runState(root, QUICK, 'completed', 1);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 0, 30, 30, 60], { CODEX_REVIEW_CI_REGISTER_SECONDS: '60' });
+    expect(result.status).toBe(30);
+    expect(result.stderr).toContain(`ci=none head=${HEAD}: the full-suite re-run of ${QUICK}:1 requested`);
+    expect(reruns(result.calls)).toBe(1);
+  });
+
+  it('another workflow still pending does not hide a re-run that never started (mutation: registration checked only while quick)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs-1.json', [quickRun(root)]);
+    runs(root, 'runs.json', [quickRun(root), workflowRun('Lint', 'in_progress', null, '2026-09-05T00:02:00Z')]);
+    runState(root, QUICK, 'completed', 1);
+
+    const result = ciWait(root, ['--head', HEAD, '--timeout', '120'], [0, 0, 0, 0, 30, 30, 60], {
+      CODEX_REVIEW_CI_REGISTER_SECONDS: '60',
+    });
+    expect(result.status).toBe(30);
+    expect(reruns(result.calls)).toBe(1);
+  });
+
+  it('asks again for a new quick attempt of a run, but at most twice per run (mutation: no cap)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs-1.json', [quickRun(root, quickJobs(), 1)]);
+    runs(root, 'runs-2.json', [quickRun(root, quickJobs(), 2)]);
+    runs(root, 'runs-3.json', [quickRun(root, quickJobs(), 3)]);
+    runState(root, QUICK, 'completed', 1, 1);
+    runState(root, QUICK, 'in_progress', 2, 2);
+    runState(root, QUICK, 'completed', 2, 3);
+    runState(root, QUICK, 'in_progress', 3, 4);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 0, 30, 30, 30, 60]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`re-ran run ${QUICK} twice and it came back quick again`);
+    expect(reruns(result.calls)).toBe(2);
+  });
+
+  it('requests every required quick workflow, however many there are (mutation: one cap across all runs)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    const starts = ['2026-09-05T00:01:00Z', '2026-09-05T00:01:10Z', '2026-09-05T00:01:20Z'];
+    const names = ['CI', 'CI2', 'CI3'];
+    const quick = names.map((n, i) => quickRun(root, quickJobs(), 1, n, starts[i]));
+    for (const run of quick) {
+      runState(root, run.id as number, 'completed', 1, 1);
+      runState(root, run.id as number, 'queued', 2);
+    }
+    runs(root, 'runs-1.json', quick);
+    runs(root, 'runs-2.json', names.map((n, i) => ({ ...workflowRun(n, 'completed', 'success', starts[i]), run_attempt: 2 })));
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 0, 0, 0, 30], { CODEX_REVIEW_REQUIRED_WORKFLOWS: 'CI,CI2,CI3' });
+    expect(result.status).toBe(0);
+    expect(reruns(result.calls)).toBe(3);
+  });
+
+  it('a newer run of the workflow from another event does not stand for the PR\'s full suite (mutation: newest run of any event wins)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    const push = { ...workflowRun('CI', 'completed', 'success', '2026-09-05T00:05:00Z'), event: 'push' };
+    runs(root, 'runs-1.json', [quickRun(root), push]);
+    runs(root, 'runs-2.json', [{ ...workflowRun('CI', 'completed', 'success', '2026-09-05T00:09:00Z'), run_attempt: 2 }, push]);
+    runState(root, QUICK, 'completed', 1, 1);
+    runState(root, QUICK, 'queued', 2);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 0, 30]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`requested the full suite on ${HEAD} by re-running run ${QUICK}`);
+    expect(reruns(result.calls)).toBe(1);
+  });
+
+  it('an unreadable quick run is still judged over a newer push run: red, never green (mutation: other events win when evidence is missing)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    const push = { ...workflowRun('CI', 'completed', 'success', '2026-09-05T00:05:00Z'), event: 'push' };
+    // No jobs fixture for the PR run: its quick evidence cannot be read.
+    runs(root, 'runs.json', [workflowRun('CI', 'completed', 'failure'), push]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(29);
+    expect(reruns(result.calls)).toBe(0);
+  });
+
+  it('a pending pull_request run is not masked by a newer push success (mutation: newest run of any event wins)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    const push = { ...workflowRun('CI', 'completed', 'success', '2026-09-05T00:05:00Z'), event: 'push' };
+    runs(root, 'runs-1.json', [workflowRun('CI', 'in_progress', null), push]);
+    runs(root, 'runs-2.json', [workflowRun('CI', 'completed', 'success'), push]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 30]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('ci_pending: CI=in_progress');
+  });
+
+  it('a newer failed or pending run from another event still blocks a passing pull_request run (mutation: pull_request runs judged alone)', () => {
+    const failed = tempRoot();
+    writeJson(failed, 'pr.json', ciPr());
+    runs(failed, 'runs.json', [
+      workflowRun('CI', 'completed', 'success'),
+      { ...workflowRun('CI', 'completed', 'failure', '2026-09-05T00:05:00Z'), event: 'push' },
+    ]);
+    expect(ciWait(failed, ['--head', HEAD], [0, 0]).status).toBe(29);
+
+    const pending = tempRoot();
+    writeJson(pending, 'pr.json', ciPr());
+    runs(pending, 'runs-1.json', [
+      workflowRun('CI', 'completed', 'success'),
+      { ...workflowRun('CI', 'in_progress', null, '2026-09-05T00:05:00Z'), event: 'push' },
+    ]);
+    runs(pending, 'runs-2.json', [
+      workflowRun('CI', 'completed', 'success'),
+      { ...workflowRun('CI', 'completed', 'success', '2026-09-05T00:05:00Z'), event: 'push' },
+    ]);
+    const result = ciWait(pending, ['--head', HEAD], [0, 0, 0, 30]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('ci_pending: CI=in_progress');
+  });
+
+  it('a workflow with no pull_request run on the head is judged by its newest run of any event, as before', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs.json', [{ ...workflowRun('CI', 'completed', 'success'), event: 'push' }]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`ci=green head=${HEAD}`);
+  });
+
+  it('merge-check refuses a quick-tier head: the full suite never ran on it (mutation: ci_quick read as green)', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [], ci: [quickRun(root)], statuses: [] });
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain(`ci_quick: runs=${QUICK}:1: CI ran only its quick checks on this head`);
+  });
+
+  it('does not re-run a run someone already re-ran; the next tick judges the new attempt (mutation: stale verdict re-run)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs-1.json', [quickRun(root)]);
+    runs(root, 'runs-2.json', [{ ...workflowRun('CI', 'completed', 'success'), run_attempt: 2 }]);
+    runState(root, QUICK, 'in_progress', 2);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 30]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`run ${QUICK} has already moved past attempt 1; not re-running it`);
+    expect(reruns(result.calls)).toBe(0);
+  });
+
+  it('does not re-run when it cannot read the run first; it asks again next tick (mutation: a failed read taken as unchanged)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs-1.json', [quickRun(root)]);
+    runs(root, 'runs-2.json', [{ ...workflowRun('CI', 'completed', 'success'), run_attempt: 2 }]);
+    // No run fixture: every read of the run fails.
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 30]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`could not read run ${QUICK}'s current attempt; not re-running it this tick`);
+    expect(reruns(result.calls)).toBe(0);
+  });
+
+  it('a refused re-run is not an error when the run started another attempt meanwhile (mutation: refusal always exits 1)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs-1.json', [quickRun(root)]);
+    runs(root, 'runs-2.json', [{ ...workflowRun('CI', 'completed', 'success'), run_attempt: 2 }]);
+    runState(root, QUICK, 'completed', 1, 1);
+    runState(root, QUICK, 'in_progress', 2);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 30], { MOCK_RERUN_STATUS: '1' });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`run ${QUICK} started another attempt while this asked`);
+  });
+
+  it('a repo without a CI Quick job reads an ordinary failure red, exactly as before (mutation: tier handling leaks to untiered repos)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    runs(root, 'runs.json', [quickRun(root, [job('build', 'failure'), job('lint', 'success')], 2)]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(29);
+    expect(result.stderr).toContain(`ci=red head=${HEAD}: ci_red: CI=failure (required)`);
+    expect(reruns(result.calls)).toBe(0);
+  });
+
+  it('an earlier quick attempt does not disqualify a full re-run GitHub never started from CI (host) (mutation: quick counted as a genuine red)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    const run = { ...workflowRun('CI', 'completed', 'failure'), run_attempt: 2 };
+    const jobs = quickJobs();
+    writeJson(root, `jobs--${QUICK}--attempt-1.json`, { total_count: jobs.length, jobs });
+    writeJson(root, `jobs--${QUICK}--attempt-2.json`, { total_count: 1, jobs: [neverStarted(2)] });
+    runs(root, 'runs.json', [run]);
+    writeJson(root, `statuses--${HEAD}.json`, [commitStatus('CI (host)', 'success')]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`ci=host head=${HEAD}: ci_host:`);
+    expect(reruns(result.calls)).toBe(0);
+  });
+
+  it('an earlier attempt whose gate verdict really failed still disqualifies CI (host) (mutation: quick_only by names alone)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    const run = { ...workflowRun('CI', 'completed', 'failure'), run_attempt: 2 };
+    const jobs = [job('plan', 'success'), job('spelling / en-US spelling', 'success'), gate('failure')];
+    writeJson(root, `jobs--${QUICK}--attempt-1.json`, { total_count: jobs.length, jobs });
+    writeJson(root, `jobs--${QUICK}--attempt-2.json`, { total_count: 1, jobs: [neverStarted(2)] });
+    runs(root, 'runs.json', [run]);
+    writeJson(root, `statuses--${HEAD}.json`, [commitStatus('CI (host)', 'success')]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(29);
+  });
+
+  it('a latest-attempt page that is not the attempt the listing reported never excuses anything (mutation: /jobs trusted as that attempt)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    // Listing: attempt 2, a genuine failure. The plain /jobs route has moved
+    // on to a never-started attempt 3 (with no run_attempt field to say so).
+    const run = { ...workflowRun('CI', 'completed', 'failure'), run_attempt: 2 };
+    const jobs = quickJobs();
+    writeJson(root, `jobs--${QUICK}--attempt-1.json`, { total_count: jobs.length, jobs });
+    writeJson(root, `jobs--${QUICK}--attempt-2.json`, { total_count: 1, jobs: [job('build', 'failure')] });
+    writeJson(root, `jobs--${QUICK}.json`, { total_count: 1, jobs: [neverStarted()] });
+    runs(root, 'runs.json', [run]);
+    writeJson(root, `statuses--${HEAD}.json`, [commitStatus('CI (host)', 'success')]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(29);
+    expect(result.stdout).not.toContain('ci=host');
+  });
+
+  it('a never-started page from a later attempt does not excuse a failed workflow run (mutation: never_started_runs trusts /jobs as the listed attempt)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    // Lint (not required) failed on attempt 2 per the listing; /jobs has moved on to attempt 3.
+    const lint: Page = { ...workflowRun('Lint', 'completed', 'failure', '2026-09-05T00:03:00Z'), run_attempt: 2 };
+    const lintId = lint.id as number;
+    writeJson(root, `jobs--${lintId}--attempt-1.json`, { total_count: 1, jobs: [neverStarted(1)] });
+    writeJson(root, `jobs--${lintId}--attempt-2.json`, { total_count: 1, jobs: [job('lint', 'failure')] });
+    writeJson(root, `jobs--${lintId}.json`, { total_count: 1, jobs: [neverStarted()] });
+    runs(root, 'runs.json', [workflowRun('CI', 'completed', 'success'), lint]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(29);
+    expect(result.stderr).toContain('Lint=failure');
+  });
+
+  it('an earlier quick RUN (e.g. before a reopen) does not disqualify a newer run GitHub never started (mutation: only same-run attempts skipped)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    const quick = quickRun(root);
+    const later = workflowRun('CI', 'completed', 'failure', '2026-09-05T00:09:00Z');
+    writeJson(root, `jobs--${later.id as number}.json`, { total_count: 1, jobs: [neverStarted()] });
+    runs(root, 'runs.json', [quick, later]);
+    writeJson(root, `statuses--${HEAD}.json`, [commitStatus('CI (host)', 'success')]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`ci=host head=${HEAD}: ci_host:`);
+    expect(reruns(result.calls)).toBe(0);
   });
 });
 
@@ -5321,9 +5747,9 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
 
   // A failed run that has been re-run IN PLACE: one run id, `attempts.length`
   // attempts, `attempts[i]` saying whether attempt i+1 started. GitHub serves
-  // the newest attempt's jobs at the plain /jobs route and the earlier ones at
-  // /attempts/<n>/jobs; `undefined` writes no fixture for an attempt, so that
-  // read 404s. The run id lives in one place here — it has to agree with three
+  // every attempt's jobs at /attempts/<n>/jobs (the gate reads them there,
+  // pinned) and the newest one also at the plain /jobs route; `undefined`
+  // writes no fixture for an attempt, so that read 404s. The run id lives in one place here — it has to agree with three
   // file names, and the fixtures that spelled it out each time were the reason
   // this helper exists.
   function rerunRun(root: string, attempts: (boolean | undefined)[], name = 'CI'): Page {
@@ -5333,10 +5759,9 @@ describe('codex-review host CI: a CI (host) success stands in only for a workflo
     attempts.forEach((started, i) => {
       if (started === undefined) return;
       const newest = i === attempts.length - 1;
-      writeJson(root, newest ? `jobs--${runId}.json` : `jobs--${runId}--attempt-${i + 1}.json`, {
-        total_count: 1,
-        jobs: [actionsJob(started, 'failure', runId)],
-      });
+      const page = { total_count: 1, jobs: [actionsJob(started, 'failure', runId)] };
+      writeJson(root, `jobs--${runId}--attempt-${i + 1}.json`, page);
+      if (newest) writeJson(root, `jobs--${runId}.json`, page);
     });
     return run;
   }
