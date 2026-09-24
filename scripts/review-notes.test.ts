@@ -218,8 +218,8 @@ function citationExistenceProblems(fix: string, root: string): string[] {
   for (const { file, span, endLine, pinnedSha } of fileLineCitations(fix)) {
     if (pinnedSha) {
       if (!gitCommitResolvable(root, pinnedSha)) {
-        // A shallow CI checkout (.github/workflows/ci-full.yml uses actions/checkout@v4
-        // with no fetch-depth override, so depth 1) cannot resolve most historical
+        // A shallow checkout (actions/checkout@v4's default depth 1 — ci.yml and ci-full.yml
+        // override it with fetch-depth: 0, and run-host-ci.sh fetches full history) cannot resolve most historical
         // shas at all — the *only* case an unresolvable sha is expected, not a
         // mistake. Skipping unconditionally here (#730 P3 regression) let a
         // typo'd `at <sha>` silently exempt a wrong line, or a citation to a
