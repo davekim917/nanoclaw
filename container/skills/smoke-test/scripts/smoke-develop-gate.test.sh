@@ -1325,6 +1325,62 @@ jq -cn --arg target "$OOB2_SHA" --arg freeze "zzz" --argjson pr 99 \
 bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_ledger_tampered"' >/dev/null
 jq -e '.completedRunId != "rival-run"' "$STATE_DIR2/develop-state.json" >/dev/null
 
+# --- 39c. A deliberate re-smoke of the SAME SHA is adopted (#1108) -------
+# Live: develop@6a0b65df froze as XZO #2121 (void, BLOCKED, adopted), then was
+# re-smoked as #2126 (HUMAN_DECISION, hold raised). Adoption keyed on SHA only,
+# so state kept the void BLOCKED -- which implies no hold, so the reconciler
+# watched nothing and the live hold could be deleted unnoticed. A newer line
+# for the same SHA (different run, later finishedAt) is adopted; an older,
+# same-run or unparsable one is not; and the hold is never touched.
+fresh_state
+RS_SHA="$(printf '7%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$RS_SHA"
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+HOLD_FILE="$STATE_DIR2/develop-hold.json"
+export SMOKE_GATE_HOLD_FILE="$HOLD_FILE"
+LEDGER="$STATE_DIR2/handoff-ledger.jsonl"
+ledger_line() {  # <run> <verdict> <finishedAt> <freezePr>
+  jq -cn --arg target "$RS_SHA" --arg run "$1" --arg verdict "$2" --arg at "$3" --argjson pr "$4" \
+    '{schemaVersion:1,targetSha:$target,freezeSha:"f00d",freezePr:$pr,runId:$run,verdict:$verdict,finishedAt:$at}' >>"$LEDGER"
+}
+rs_fail() { echo "39c: $1" >&2; exit 1; }
+completed() { jq -c '[.completedRunId, .completedVerdict, .completedAt]' "$STATE_DIR2/develop-state.json"; }
+ledger_line run-void BLOCKED 2026-09-23T11:31:24Z 2121
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "already_completed"' >/dev/null
+[ "$(completed)" = '["run-void","BLOCKED","2026-09-23T11:31:24Z"]' ] || rs_fail "first line not adopted: $(completed)"
+# The re-smoke raises its hold, then its line lands: adopted, hold byte-identical,
+# and the reconciler now expects that hold and finds it (no tamper wake).
+hold_up run-resmoke "$RS_SHA"
+HOLD_SUM="$(sha256sum "$HOLD_FILE")"
+ledger_line run-resmoke HUMAN_DECISION 2026-09-23T16:50:56Z 2126
+bash "$GATE" poll | jq -e '.data.trigger == "already_completed"' >/dev/null \
+  || rs_fail "re-smoke adoption must not alarm"
+[ "$(completed)" = '["run-resmoke","HUMAN_DECISION","2026-09-23T16:50:56Z"]' ] \
+  || rs_fail "same-SHA re-smoke not adopted: $(completed)"
+[ "$(sha256sum "$HOLD_FILE")" = "$HOLD_SUM" ] || rs_fail "adoption touched the hold"
+# Tamper detection is live again: deleting the re-smoke's hold now alarms.
+mv "$HOLD_FILE" "$HOLD_FILE.aside"
+bash "$GATE" poll | jq -e '.data.trigger == "gate_hold_tampered" and .data.holdIntegrity == "missing" and
+  .data.ledgerRunId == "run-resmoke"' >/dev/null || rs_fail "deleted re-smoke hold not detected"
+mv "$HOLD_FILE.aside" "$HOLD_FILE"
+bash "$GATE" poll >/dev/null
+# Not adopted: an OLDER line, the SAME run again, or an unparsable timestamp.
+for spec in 'run-older GO 2026-09-23T12:00:00Z' 'run-resmoke GO 2026-09-24T09:00:00Z' 'run-garbled GO yesterday'; do
+  read -r rs_run rs_verdict rs_at <<<"$spec"
+  ledger_line "$rs_run" "$rs_verdict" "$rs_at" 1
+  bash "$GATE" poll >/dev/null
+  [ "$(completed)" = '["run-resmoke","HUMAN_DECISION","2026-09-23T16:50:56Z"]' ] \
+    || rs_fail "adopted a line it must not ($spec): $(completed)"
+done
+# A forged NEWER GO line is adopted -- and only makes the reconciler louder:
+# GO with the hold still present is `unexpected`, and the hold is untouched.
+ledger_line run-forged GO 2026-09-24T10:00:00Z 3
+bash "$GATE" poll | jq -e '.data.trigger == "gate_hold_tampered" and .data.holdIntegrity == "unexpected"' >/dev/null \
+  || rs_fail "forged newer GO with a hold present must alarm unexpected"
+[ "$(sha256sum "$HOLD_FILE")" = "$HOLD_SUM" ] || rs_fail "a forged line touched the hold"
+unset SMOKE_GATE_HOLD_FILE
+
 # --- 40. `ack`: terminal disposition for an alarm wake ---------------------
 # Argument validation first. A typo'd trigger filed under a key nothing reads
 # would be an ack-shaped no-op, which is the exact failure class this verb
