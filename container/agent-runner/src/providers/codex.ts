@@ -23,7 +23,7 @@ import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/cont
 import { appendActiveRuntimeContext } from '../runtime-context.js';
 import { setProviderHealthState, type ProviderHealthState } from '../modules/mailbox/index.js';
 import { formatCredentialRotationNotice } from '../credential-rotation-notice.js';
-import { CODEX_MODEL_RE } from './model-vocabulary.js';
+import { CODEX_MODEL_RE, isCodexFamilyName, resolveCodexFamily } from './model-vocabulary.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import {
@@ -409,8 +409,9 @@ export function materializeRawImageGeneration(
 /**
  * The unpinned Codex fleet default: gpt-6-sol at `high` reasoning (operator
  * decision 2026-09-22, replacing gpt-5.6-sol; gpt-5.6-terra at `xhigh` before
- * 2026-09-16). Keep it equal to the `sol` alias (`CODEX_MODEL_ALIAS_MAP`,
- * src/flag-parser.ts:225).
+ * 2026-09-16). Keep it equal to the `sol` family target
+ * (`CODEX_FAMILY_DEFAULTS`, src/flag-parser.ts:128; setup/lib/codex-model-min-cli.test.ts
+ * fails when they differ).
  *
  * These are the ONLY fleet defaults for Codex. A group pins with
  * `providerConfig.model`/`reasoning_effort` in container.json, or
@@ -451,6 +452,7 @@ type CodexStickyConfig = z.infer<typeof codexConfigSchema>;
 /** Flag-requested model if it's codex-shaped, else the configured fallback. */
 export function resolveQueryModel(requested: string | undefined, fallback: string): string {
   if (!requested) return fallback;
+  requested = resolveCodexFamily(requested);
   if (CODEX_MODEL_RE.test(requested)) return requested;
   console.error(`[codex-provider] Ignoring non-codex model override "${requested}" — staying on ${fallback}`);
   return fallback;
@@ -1082,8 +1084,21 @@ export class CodexProvider implements AgentProvider {
     // out-of-vocabulary value (a claude model id from a mis-declared
     // `providerFallback`) would throw at boot instead of degrading.
     const rawSticky: Record<string, unknown> = { ...(options.providerConfig ?? {}) };
+    // A family alias (`sol`) anywhere in the chain resolves here, before the
+    // strict schema and the `gpt-*` guard see it.
+    if (typeof rawSticky.model === 'string') {
+      rawSticky.model = resolveCodexFamily(rawSticky.model);
+      // Unresolved only when the host sent no alias map (a host predating
+      // src/container-runner.ts:6486/:6588, i.e. an adopted container).
+      // Never hand the app-server a bare family word.
+      if (isCodexFamilyName(rawSticky.model as string)) {
+        console.error(`[codex-provider] Ignoring unresolved Codex family alias "${rawSticky.model}"`);
+        delete rawSticky.model;
+      }
+    }
     if (rawSticky.model === undefined && options.model !== undefined) {
-      if (CODEX_MODEL_RE.test(options.model)) rawSticky.model = options.model;
+      const model = resolveCodexFamily(options.model);
+      if (CODEX_MODEL_RE.test(model)) rawSticky.model = model;
       else console.error(`[codex-provider] Ignoring non-codex config model "${options.model}"`);
     }
     if (rawSticky.reasoning_effort === undefined && options.effort !== undefined) {
@@ -1099,7 +1114,12 @@ export class CodexProvider implements AgentProvider {
     // (host default) > built-in default.
     // Unpinned native Codex groups and unpinned provider fallbacks share this
     // final default. A fallback's primary config is intentionally absent here.
-    this.model = this.stickyConfig.model ?? (options.env?.CODEX_MODEL as string | undefined) ?? DEFAULT_CODEX_MODEL;
+    const envDefault = options.env?.CODEX_MODEL as string | undefined;
+    const hostDefault = envDefault ? resolveCodexFamily(envDefault) : undefined;
+    this.model =
+      this.stickyConfig.model ??
+      (hostDefault && !isCodexFamilyName(hostDefault) ? hostDefault : undefined) ??
+      DEFAULT_CODEX_MODEL;
 
     // Fallback OAuth identities. Empty when CODEX_FALLBACK_HOMES is unset
     // (the host didn't mount any fallbacks). Read from process.env rather

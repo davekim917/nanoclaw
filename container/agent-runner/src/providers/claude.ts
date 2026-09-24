@@ -44,19 +44,22 @@ import { recordContextTokens, recordServedModel, recordSubagent } from '../turn-
  * so a response with no usage leaves the previous reading standing rather
  * than zeroing the display.
  */
-export function claudeContextOccupancy(usage: {
-  input_tokens?: number | null;
-  cache_read_input_tokens?: number | null;
-  cache_creation_input_tokens?: number | null;
-} | null | undefined): number {
+export function claudeContextOccupancy(
+  usage:
+    | {
+        input_tokens?: number | null;
+        cache_read_input_tokens?: number | null;
+        cache_creation_input_tokens?: number | null;
+      }
+    | null
+    | undefined,
+): number {
   if (!usage) return 0;
   // Nullable in the SDK's own types, and a null must read as "nothing cached",
   // never as a missing term that quietly shrinks the total.
   const count = (value: number | null | undefined): number =>
     typeof value === 'number' && Number.isFinite(value) ? value : 0;
-  return (
-    count(usage.input_tokens) + count(usage.cache_read_input_tokens) + count(usage.cache_creation_input_tokens)
-  );
+  return count(usage.input_tokens) + count(usage.cache_read_input_tokens) + count(usage.cache_creation_input_tokens);
 }
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { shimCwd } from './cwd-shim.js';
@@ -2366,6 +2369,7 @@ const FAMILY_ALIAS_ENV: Record<string, string> = {
   opus: 'ANTHROPIC_DEFAULT_OPUS_MODEL',
   sonnet: 'ANTHROPIC_DEFAULT_SONNET_MODEL',
   haiku: 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  fable: 'ANTHROPIC_DEFAULT_FABLE_MODEL',
 };
 
 /**
@@ -2430,7 +2434,11 @@ function defaultEffortForModel(model: string | undefined): string | undefined {
   if (m === 'opus' || m.startsWith('claude-opus-')) return 'high';
   // Sonnet 5 (the bare `sonnet` alias resolves to it) defaults to xhigh.
   if (m === 'sonnet' || m.startsWith('claude-sonnet-')) return 'xhigh';
-  if (m.startsWith('claude-fable-')) return 'medium';
+  // Bare `fable` is a family alias (the CLI resolves it through
+  // ANTHROPIC_DEFAULT_FABLE_MODEL, set at src/claude-spawn-defaults.ts:254);
+  // before 2026-09-24 it never reached here
+  // bare and fell through to `high`.
+  if (m === 'fable' || m.startsWith('claude-fable-')) return 'medium';
   if (m === 'haiku' || m.startsWith('claude-haiku-')) return undefined;
   return 'high';
 }

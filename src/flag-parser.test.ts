@@ -7,6 +7,9 @@ import {
   resolveModelAlias,
   isOpenCodeModelSlug,
   DEFAULT_OPUS_MODEL,
+  DEFAULT_FABLE_MODEL,
+  CODEX_FAMILY_DEFAULTS,
+  resolveEffectiveModel,
 } from './flag-parser.js';
 
 // Exported for the spawn path (container-runner buildContainerArgs): a channel
@@ -180,8 +183,14 @@ describe('parseMessageFlags', () => {
       expect(r.warnings).toEqual([]);
     });
 
-    it('resolves bare fable / fable51 / fable5-1 / fable-5-1 aliases to claude-fable-5-1[1m]', () => {
-      expect(parseMessageFlags('-m fable hi').intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]' });
+    it('stores bare fable as the family alias, so it follows DEFAULT_FABLE_MODEL', () => {
+      expect(parseMessageFlags('-m fable hi').intent).toEqual({ stickyModel: 'fable' });
+      expect(parseMessageFlags('-m1 fable hi').intent).toEqual({ turnModel: 'fable' });
+      expect(resolveEffectiveModel('fable')).toBe(DEFAULT_FABLE_MODEL);
+      expect(formatFlagConfirmation({ stickyModel: 'fable' }, [], [])).toContain(`${DEFAULT_FABLE_MODEL} (via fable)`);
+    });
+
+    it('resolves fable51 / fable5-1 / fable-5-1 aliases to claude-fable-5-1[1m]', () => {
       expect(parseMessageFlags('-m fable51 hi').intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]' });
       expect(parseMessageFlags('-m fable5-1 hi').intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]' });
       expect(parseMessageFlags('-m fable-5-1 hi').intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]' });
@@ -204,9 +213,9 @@ describe('parseMessageFlags', () => {
 
     it('accepts the full effort surface on fable 5.1 (incl. xhigh and max)', () => {
       const xhigh = parseMessageFlags('-m fable -e xhigh hi');
-      expect(xhigh.intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]', stickyEffort: 'xhigh' });
+      expect(xhigh.intent).toEqual({ stickyModel: 'fable', stickyEffort: 'xhigh' });
       expect(xhigh.warnings).toEqual([]);
-      const max = parseMessageFlags('-m fable -e max hi');
+      const max = parseMessageFlags('-m fable51 -e max hi');
       expect(max.intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]', stickyEffort: 'max' });
       expect(max.warnings).toEqual([]);
     });
@@ -407,11 +416,16 @@ describe('provider-aware vocabulary (codex)', () => {
     expect(r.intent).toEqual({ stickyModel: 'gpt-5.5' });
   });
 
+  it.each(['luna', 'terra', 'sol', 'astra'])('stores Codex family %s as typed, resolving at use', (family) => {
+    for (const value of [family, family.toUpperCase()]) {
+      expect(parseMessageFlags(`-m ${value} hi`, 'codex').intent).toEqual({ stickyModel: family });
+      expect(parseMessageFlags(`-m1 ${value} hi`, 'codex').intent).toEqual({ turnModel: family });
+    }
+    expect(resolveEffectiveModel(family)).toBe(CODEX_FAMILY_DEFAULTS[family]);
+    expect(resolveEffectiveModel(family)).toMatch(/^gpt-/);
+  });
+
   it.each([
-    ['luna', 'gpt-6-luna'],
-    ['terra', 'gpt-5.6-terra'],
-    ['sol', 'gpt-6-sol'],
-    ['astra', 'gpt-6-astra'],
     ['gpt6-sol', 'gpt-6-sol'],
     ['gpt6-luna', 'gpt-6-luna'],
     ['gpt5.6-sol', 'gpt-5.6-sol'],
@@ -509,8 +523,9 @@ describe('provider-aware vocabulary (codex)', () => {
 
   it('defaults to the claude vocabulary when no provider is passed (back-compat)', () => {
     const r = parseMessageFlags('-m fable hi');
-    expect(r.intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]' });
+    expect(r.intent).toEqual({ stickyModel: 'fable' });
     expect(parseMessageFlags('-m gpt-5.5 hi').errors[0]).toMatch(/unknown model/);
+    expect(parseMessageFlags('-m sol hi').errors[0]).toMatch(/unknown model/);
   });
 });
 

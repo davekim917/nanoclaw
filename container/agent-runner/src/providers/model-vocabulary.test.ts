@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { modelBelongsToProvider } from './model-vocabulary.js';
+import { isCodexFamilyName, modelBelongsToProvider, resolveCodexFamily } from './model-vocabulary.js';
 
 describe('modelBelongsToProvider', () => {
   // One table, three providers: the partition must be exhaustive and
@@ -11,6 +11,9 @@ describe('modelBelongsToProvider', () => {
     ['claude-opus-5[1m]', true, false, false],
     ['claude-fable-5-1', true, false, false],
     ['opus', true, false, false],
+    ['fable', true, false, false],
+    ['sol', false, true, false],
+    ['astra', false, true, false],
     ['opencode-go/kimi-k2.7-code', false, false, true],
     ['nvidia/meta/llama-3.3-70b-instruct', false, false, true],
   ];
@@ -26,5 +29,27 @@ describe('modelBelongsToProvider', () => {
     // src/flag-parser.ts `vocabFor`: unknown providers fall back to the Claude vocabulary.
     expect(modelBelongsToProvider('opus', 'mock')).toBe(true);
     expect(modelBelongsToProvider('gpt-6-astra', 'mock')).toBe(false);
+  });
+});
+
+describe('resolveCodexFamily', () => {
+  const env = { NANOCLAW_CODEX_MODEL_ALIASES: JSON.stringify({ sol: 'gpt-6-sol', astra: 'gpt-6-astra' }) };
+
+  it('resolves a family name through the host-sent map, case-insensitively', () => {
+    expect(resolveCodexFamily('sol', env)).toBe('gpt-6-sol');
+    expect(resolveCodexFamily('ASTRA', env)).toBe('gpt-6-astra');
+  });
+
+  it('leaves concrete ids and non-family words alone', () => {
+    expect(resolveCodexFamily('gpt-5.6-sol', env)).toBe('gpt-5.6-sol');
+    expect(resolveCodexFamily('opus', env)).toBe('opus');
+  });
+
+  it('leaves a family name unresolved when the map is missing, malformed, or maps to a non-gpt value', () => {
+    expect(resolveCodexFamily('sol', {})).toBe('sol');
+    expect(resolveCodexFamily('sol', { NANOCLAW_CODEX_MODEL_ALIASES: '{not json' })).toBe('sol');
+    expect(resolveCodexFamily('sol', { NANOCLAW_CODEX_MODEL_ALIASES: '{"sol":"opus"}' })).toBe('sol');
+    expect(isCodexFamilyName('sol')).toBe(true);
+    expect(isCodexFamilyName('constructor')).toBe(false);
   });
 });

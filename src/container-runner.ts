@@ -87,6 +87,7 @@ import { composeGroupClaudeMd } from './claude-md-compose.js';
 // Owns the claude branch's model/effort resolution AND the `-e` strings it
 // emits, so both are reachable from a unit test — buildContainerArgs is not.
 import { claudeSpawnEnv } from './claude-spawn-defaults.js';
+import { CODEX_FAMILY_DEFAULTS } from './flag-parser.js';
 import { readEnvFileMatching } from './env.js';
 import { resolveGitHubToken as resolveGitHubTokenForContainer } from './github-token.js';
 export { resolveGitHubToken } from './github-token.js';
@@ -270,6 +271,17 @@ export function gitIdentityEnv(identity?: GitIdentity): Record<string, string> {
 // IDENTICAL across both majors (only the path moved), so a surface or type check
 // cannot see it. Verify any future bump by CALLING a running gateway.
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY, timeout: 30_000 });
+
+/**
+ * Codex family aliases (`sol`, `luna`, …) are stored as typed and resolved
+ * inside the container, because the Codex CLI has none of its own. Emitted by
+ * BOTH spawn branches (the restricted wiki one returns early) and for every
+ * provider: a Claude-primary group can fall back to Codex, and its
+ * providerFallback.model may name a family.
+ */
+function codexFamilyAliasEnv(): string[] {
+  return ['-e', `NANOCLAW_CODEX_MODEL_ALIASES=${JSON.stringify(CODEX_FAMILY_DEFAULTS)}`];
+}
 
 // Default model constants moved to flag-parser.ts (DEFAULT_OPUS_MODEL etc.) —
 // the chat ack has to resolve family aliases the same way this spawn path
@@ -6471,6 +6483,7 @@ async function buildContainerArgs(
     ];
     for (const [key, value] of Object.entries(env)) args.push('-e', `${key}=${value}`);
     if (provider === 'claude') args.push(...claudeSpawnEnv(containerConfig));
+    args.push(...codexFamilyAliasEnv());
     for (const mount of mounts) {
       if (fs.realpathSync(mount.hostPath) !== mount.hostPath) throw new Error('Wiki runtime mount changed');
       args.push('-v', `${mount.hostPath}:${mount.containerPath}${mount.readonly ? ':ro' : ''}`);
@@ -6572,6 +6585,7 @@ async function buildContainerArgs(
   const activeChannelModel = providerFallbackApplied ? null : channelDefaults?.channelDefaultModel;
   const activeChannelEffort = providerFallbackApplied ? null : channelDefaults?.channelDefaultEffort;
 
+  args.push(...codexFamilyAliasEnv());
   if (provider === 'codex') {
     // The Codex provider reads model/reasoning_effort from its strict
     // providerConfig schema. These spawn-scoped envs are overlaid into that

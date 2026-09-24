@@ -9,7 +9,7 @@ import {
   claudeSpawnEnv,
   resolveClaudeSpawnDefaults,
 } from './claude-spawn-defaults.js';
-import { DEFAULT_OPUS_MODEL, DEFAULT_SONNET_MODEL } from './flag-parser.js';
+import { DEFAULT_FABLE_MODEL, DEFAULT_OPUS_MODEL, DEFAULT_SONNET_MODEL } from './flag-parser.js';
 import type { ContainerConfig } from './container-config.js';
 
 type Cfg = Pick<
@@ -180,6 +180,8 @@ describe('claudeSpawnEnv', () => {
       '-e',
       'ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5-20251001',
       '-e',
+      `ANTHROPIC_DEFAULT_FABLE_MODEL=${DEFAULT_FABLE_MODEL}`,
+      '-e',
       'NANOCLAW_EFFORT_OVERRIDE=medium',
       '-e',
       'CLAUDE_CODE_AUTO_COMPACT_WINDOW=600000',
@@ -204,12 +206,13 @@ describe('claudeSpawnEnv', () => {
       ANTHROPIC_DEFAULT_OPUS_MODEL: DEFAULT_OPUS_MODEL,
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5-20251001',
+      ANTHROPIC_DEFAULT_FABLE_MODEL: DEFAULT_FABLE_MODEL,
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: '600000',
       CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: '2',
       CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: '5',
       CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: '1',
     });
-    expect(env).toHaveLength(16);
+    expect(env).toHaveLength(18);
   });
 
   it('claude_spawn_env_matches_the_live_fleet_baseline', () => {
@@ -275,19 +278,25 @@ describe('claudeSpawnEnv — the family aliases are install constants, never the
     expect(opusAlias(cfg({ model: 'claude-fable-5-1[1m]' }), { model: 'sonnet' })).toBe(DEFAULT_OPUS_MODEL);
   });
 
-  it('the sonnet and haiku aliases are constants too', () => {
+  it('the sonnet, haiku and fable aliases are constants too', () => {
     const env = pairs(claudeSpawnEnv(cfg({ model: 'claude-opus-5[1m]' })));
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(DEFAULT_SONNET_MODEL);
     expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-haiku-4-5-20251001');
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe(DEFAULT_FABLE_MODEL);
+  });
+
+  it('a group pinned to bare fable follows DEFAULT_FABLE_MODEL', () => {
+    expect(pairs(claudeSpawnEnv(cfg({ model: 'fable' }))).NANOCLAW_CLAUDE_MODEL).toBe(DEFAULT_FABLE_MODEL);
   });
 
   it('the group model travels in its own variable, never in an alias', () => {
     // The structural form: for a group pinned to something that is not Opus,
     // no ANTHROPIC_DEFAULT_* var may hold that pin.
-    const env = pairs(claudeSpawnEnv(cfg({ model: 'claude-fable-5-1[1m]' })));
-    expect(env.NANOCLAW_CLAUDE_MODEL).toBe('claude-fable-5-1[1m]');
+    // Fable 5 — a still-served version no family alias points at.
+    const env = pairs(claudeSpawnEnv(cfg({ model: 'claude-fable-5[1m]' })));
+    expect(env.NANOCLAW_CLAUDE_MODEL).toBe('claude-fable-5[1m]');
     for (const [k, v] of Object.entries(env)) {
-      if (k.startsWith('ANTHROPIC_DEFAULT_')) expect(v).not.toBe('claude-fable-5-1[1m]');
+      if (k.startsWith('ANTHROPIC_DEFAULT_')) expect(v).not.toBe('claude-fable-5[1m]');
     }
   });
 });

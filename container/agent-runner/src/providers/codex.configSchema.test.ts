@@ -274,3 +274,44 @@ describe('CodexProvider provider-fallback model/effort', () => {
     expect(sticky(p).reasoning_effort).toBe(DEFAULT_CODEX_EFFORT);
   });
 });
+
+describe('Codex family aliases resolve at use', () => {
+  const ALIASES = JSON.stringify({
+    sol: 'gpt-6-sol',
+    luna: 'gpt-6-luna',
+    astra: 'gpt-6-astra',
+    terra: 'gpt-5.6-terra',
+  });
+  const withAliases = (fn: () => void, value: string | null = ALIASES) => {
+    const prev = process.env.NANOCLAW_CODEX_MODEL_ALIASES;
+    if (value === null) delete process.env.NANOCLAW_CODEX_MODEL_ALIASES;
+    else process.env.NANOCLAW_CODEX_MODEL_ALIASES = value;
+    try {
+      fn();
+    } finally {
+      if (prev === undefined) delete process.env.NANOCLAW_CODEX_MODEL_ALIASES;
+      else process.env.NANOCLAW_CODEX_MODEL_ALIASES = prev;
+    }
+  };
+  const modelOf = (p: CodexProvider) => (p as unknown as { model: string }).model;
+
+  it('a providerConfig family pin resolves to the current id', () => {
+    withAliases(() => expect(modelOf(new CodexProvider({ providerConfig: { model: 'astra' } }))).toBe('gpt-6-astra'));
+  });
+
+  it('a providerFallback family pin (options.model) resolves to the current id', () => {
+    withAliases(() => expect(modelOf(new CodexProvider({ model: 'luna' }))).toBe('gpt-6-luna'));
+  });
+
+  it('a per-turn family pin resolves before the gpt-* guard', () => {
+    withAliases(() => expect(resolveQueryModel('sol', 'gpt-6-astra')).toBe('gpt-6-sol'));
+  });
+
+  it('without the host map a family word is never sent verbatim', () => {
+    withAliases(() => {
+      expect(modelOf(new CodexProvider({ providerConfig: { model: 'astra' } }))).toBe(DEFAULT_CODEX_MODEL);
+      expect(modelOf(new CodexProvider({ model: 'luna' }))).toBe(DEFAULT_CODEX_MODEL);
+      expect(resolveQueryModel('sol', 'gpt-6-astra')).toBe('gpt-6-astra');
+    }, null);
+  });
+});

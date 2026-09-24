@@ -1,4 +1,5 @@
 import {
+  DEFAULT_FABLE_MODEL,
   DEFAULT_HAIKU_MODEL,
   DEFAULT_OPUS_MODEL,
   DEFAULT_SONNET_MODEL,
@@ -210,14 +211,17 @@ export function resolveClaudeSpawnDefaults(
  * pin every group in the fleet to one model-blind effort.
  * `claude_spawn_env_omits_effort_when_nothing_configured` guards it.
  *
- * ## The three alias vars carry ALIASES, never the group's model
+ * ## The four alias vars carry ALIASES, never the group's model
  *
  * `ANTHROPIC_DEFAULT_<FAMILY>_MODEL` is the SDK's alias short-circuit: the
  * string in it is what the CLI sends when anything — the agent, a subagent's
  * `model:` frontmatter, the `"model": "opus"` pin group-init writes into every
  * group's settings.json — uses that bare family word. All three are therefore
  * install-wide constants emitted verbatim, so `opus` means Opus in every
- * group and `sonnet` means Sonnet in every group.
+ * group and `sonnet` means Sonnet in every group. Fable joined them on
+ * 2026-09-24: without ANTHROPIC_DEFAULT_FABLE_MODEL a bare `fable` (a task
+ * pin, a `model: fable` subagent) ran whatever the CLI build defaults to,
+ * not DEFAULT_FABLE_MODEL.
  *
  * The opus one used to carry `resolved.model` instead, which made the word
  * "opus" mean "whatever this group runs". Paired with the unpinned default
@@ -246,6 +250,8 @@ export function claudeSpawnEnv(
     `ANTHROPIC_DEFAULT_SONNET_MODEL=${DEFAULT_SONNET_MODEL}`,
     '-e',
     `ANTHROPIC_DEFAULT_HAIKU_MODEL=${DEFAULT_HAIKU_MODEL}`,
+    '-e',
+    `ANTHROPIC_DEFAULT_FABLE_MODEL=${DEFAULT_FABLE_MODEL}`,
   ];
   if (resolved.effort) env.push('-e', `NANOCLAW_EFFORT_OVERRIDE=${resolved.effort}`);
   // Quota caps ride the same primitive so the wiki spawn branch, which builds

@@ -10,7 +10,7 @@ On deploy, two kinds of Codex path move to GPT-6 Sol:
 - any Codex group whose `container.json` sets no model (`model`, `providerConfig.model`, or the legacy `defaultModel`);
 - any Claude group whose `providerFallback` is `{"provider": "codex"}` with no `model`.
 
-**Aliases resolve when the value is written, but only on some paths.** A chat `-m sol` (a session sticky) and the channel-config tool store the concrete id, so an existing `gpt-5.6-sol` or `gpt-5.6-luna` pin written that way stays on 5.6 until it is rewritten. The same will hold after the next bump for a pin written today. `ncl groups config update --model` stores its argument **verbatim** in `container.json` (`src/cli/resources/groups.ts:556` takes the raw argument and `:693` writes it), so pass a full `gpt-*` id there, never an alias.
+**Pins written before 2026-09-24 hold full ids.** Until then a chat `-m sol`, a task pin and the channel-config tool stored the concrete id, so an existing `gpt-5.6-sol` or `gpt-5.6-luna` pin written that way stays on 5.6 until it is rewritten. Since 2026-09-24 the family names `sol` / `luna` / `astra` / `terra` are stored as typed on every path and resolved in the container (`CODEX_FAMILY_DEFAULTS`, `src/flag-parser.ts:128`), so a pin written as `sol` follows the next bump by itself.
 
 **Detect.** From the install root:
 

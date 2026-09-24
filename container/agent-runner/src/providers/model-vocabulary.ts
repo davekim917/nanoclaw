@@ -23,8 +23,48 @@
 export const CODEX_MODEL_RE = /^gpt-[a-z0-9][a-z0-9.-]*$/;
 export const OPENCODE_MODEL_SLUG_RE = /^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._/-]*$/i;
 
+/**
+ * Codex FAMILY aliases (`sol`, `luna`, `astra`, `terra`). The host stores a
+ * family name as typed so a pin follows the next release of that family, and
+ * hands the current name → id map to every container as
+ * NANOCLAW_CODEX_MODEL_ALIASES (`CODEX_FAMILY_DEFAULTS`, src/flag-parser.ts:128),
+ * emitted by `codexFamilyAliasEnv` (src/container-runner.ts:282) from both
+ * spawn branches (src/container-runner.ts:6486 wiki, :6588 ordinary).
+ * The Codex CLI has no alias mechanism, so the provider resolves through this
+ * before anything reaches the app-server. The names are listed here too so a
+ * family pin is still recognised as Codex when the env is missing (a container
+ * spawned by an older host); it then fails the `gpt-*` guard and is ignored
+ * with a log line, never sent verbatim.
+ */
+const CODEX_FAMILY_NAMES: ReadonlySet<string> = new Set(['sol', 'luna', 'astra', 'terra']);
+
+function codexFamilyMap(env: Record<string, string | undefined>): Record<string, string> {
+  const raw = env.NANOCLAW_CODEX_MODEL_ALIASES;
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return {};
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(parsed)) if (typeof v === 'string' && CODEX_MODEL_RE.test(v)) out[k] = v;
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function isCodexFamilyName(model: string): boolean {
+  return CODEX_FAMILY_NAMES.has(model.toLowerCase());
+}
+
+/** A Codex family alias → its current id; anything else unchanged. */
+export function resolveCodexFamily(model: string, env: Record<string, string | undefined> = process.env): string {
+  const key = model.toLowerCase();
+  if (!CODEX_FAMILY_NAMES.has(key)) return model;
+  return codexFamilyMap(env)[key] ?? model;
+}
+
 export function modelBelongsToProvider(model: string, providerName: string): boolean {
-  const codex = CODEX_MODEL_RE.test(model);
+  const codex = CODEX_MODEL_RE.test(model) || CODEX_FAMILY_NAMES.has(model.toLowerCase());
   const opencode = OPENCODE_MODEL_SLUG_RE.test(model);
   if (providerName === 'codex') return codex;
   if (providerName === 'opencode') return opencode;
