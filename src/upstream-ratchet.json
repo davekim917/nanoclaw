@@ -255,10 +255,10 @@
 "config-examples/mount-allowlist.json":{"diff":0,"mode":"100644","sha256":"49e12b387f81a97671633bd8ec67a013bb3660911363623a34e92a6361765c66"},
 "container/.dockerignore":{"diff":0,"mode":"100644","sha256":"ac417039131d1222d33cbd69df27933f2c307e519eb441c473793c2de37fbdd0"},
 "container/CLAUDE.md":{"diff":49,"mode":"100644","sha256":"92c3dde82e6f27a36c95536f94a363a0f5def49016659f470c8546da19cd1ee6"},
-"container/Dockerfile":{"diff":488,"mode":"100644","sha256":"8c606fff2d3ad9083a0a04ac04b5c248657c94570b40d694ff7380f8cc88be02"},
-"container/agent-runner/bun.lock":{"diff":46,"mode":"100644","sha256":"0646383b94f380acbcd5d0f039a34e8e06618799681048d64b05480e056c4c4b"},
+"container/Dockerfile":{"diff":488,"mode":"100644","sha256":"1f7547b60901cc72f14c0d58a8ee3735c47eb64882a0eb670f50b06705561232"},
+"container/agent-runner/bun.lock":{"diff":46,"mode":"100644","sha256":"8bb591564959b3a4288a007628b509b889916d0d745c51f3504367dddbb1947f"},
 "container/agent-runner/bunfig.toml":{"diff":0,"mode":"100644","sha256":"3c35bbe6522d71981d126ea0ad6a1cfea291c0223f11f7deaf5b58a44bd13b43"},
-"container/agent-runner/package.json":{"diff":14,"mode":"100644","sha256":"7d7192c36b76cac719b7a187b0047840f075bd32eb144b52066cb76b66902b1e"},
+"container/agent-runner/package.json":{"diff":14,"mode":"100644","sha256":"4c14ba91e3b72269f479afe21b09e40abf3f490f7ad8f9b06dd7b837443d297f"},
 "container/agent-runner/scripts/sdk-capture/.gitignore":{"diff":5,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/scripts/sdk-capture/analyze.ts":{"diff":110,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/scripts/sdk-capture/doh-proxy.ts":{"diff":66,"mode":"100644","sha256":null,"deleted":true},
@@ -955,7 +955,7 @@
 "templates/README.md":{"diff":65,"mode":"100644","sha256":"33c5a73e548925974c8b09bce410422f1e1705307feaba1538cb7e870e987e01"},
 "tsconfig.json":{"diff":0,"mode":"100644","sha256":"25bb17e17ea109ef835738bc5481a8e79b3169dd003dd3c73c3f860724e653e8"},
 "uninstall.sh":{"diff":0,"mode":"100755","sha256":"5bc58587d37cc989c8a79f18d8fa731d1139c0387f531eb182b9303ccbe6d6ac"},
-"versions.json":{"diff":6,"mode":"100644","sha256":"f992957c1b9fc3dc9a31ff2486496f834d51b0b6d5c5336bbd69e36c2abdfa76"},
+"versions.json":{"diff":6,"mode":"100644","sha256":"e69e3968501a69984852d970bc395a2a7dde5d9b19ecad664187c684ac43fb3b"},
 "vitest.config.ts":{"diff":180,"mode":"100644","sha256":"0576ccc2cdf809b152f5aa6bd1cab6632373e34069b6d72f76dba91aff271a09"},
 "vitest.skills.config.ts":{"diff":0,"mode":"100644","sha256":"0e88cbf778cdaf68e5580498220832a7ce574ae14850100b365dd1fbdd81f96f"}
 }}
