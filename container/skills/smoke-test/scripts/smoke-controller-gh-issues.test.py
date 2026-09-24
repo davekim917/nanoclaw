@@ -194,6 +194,17 @@ class FindingIssue(unittest.TestCase):
             searched = [json.loads(line)["argv"] for line in fh if "--search" in line]
         self.assertEqual(len(searched), 1)  # the near miss really came back from the search
 
+    def test_a_title_search_at_its_cap_never_files(self):
+        # 1000 open issues all match the search phrase, none the exact title:
+        # a full search is not proof of absence, so nothing is created.
+        crowd = [{"number": 2000 + k, "title": "Upload preview missing variant {}".format(k), "body": "",
+                  "state": "open", "labels": ["smoke-finding"], "html_url": "https://github.test/issues/{}".format(2000 + k)}
+                 for k in range(1000)]
+        self.gh(labels=["smoke-finding", "severity:p3"], issues=crowd)
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "intent")
+        self.assertEqual(len(self.filed()), 1000)
+        self.assertIn("1000-result cap", self.c.decisions[-1]["error"])
+
     def test_a_label_listing_that_is_not_a_list_or_is_at_its_cap_is_unknown(self):
         self.gh(labelListRaw='{"message": "Not Found"}')
         self.assertIsNone(self.fx._labels_of("org/xzo"))
