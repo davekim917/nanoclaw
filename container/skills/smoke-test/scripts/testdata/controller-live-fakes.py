@@ -211,17 +211,22 @@ def gh(argv):
         f = fault("gh:issue-list")
         if f == "fail-before":
             return "fail", out_err("HTTP 502")
-        want = opt(argv, "--label")
-        print(json.dumps([{"number": i["number"], "title": i["title"], "url": i["html_url"]}
-                          for i in db["issues"] if i["state"] == "open"
-                          and (want is None or want in i.get("labels", []))]))
+        want, search = opt(argv, "--label"), opt(argv, "--search")
+        phrase = json.loads(search.rsplit(" in:title", 1)[0]).lower() if search else None
+        hits = [{"number": i["number"], "title": i["title"], "url": i["html_url"]}
+                for i in db["issues"] if i["state"] == "open" and (want is None or want in i.get("labels", []))
+                and (phrase is None or phrase in i["title"].lower())]
+        print(json.dumps(hits[:int(opt(argv, "--limit") or 30)]))
         return "list", 0
     if argv[:2] == ["label", "list"]:
         if fault("gh:label-list") == "fail-before":
             return "fail", out_err("HTTP 502")
+        if "labelListRaw" in db:
+            print(db["labelListRaw"])
+            return "labels", 0
         if "labels" not in db:
             return "unknown", out_err("fake gh: no labels configured")
-        print(json.dumps([{"name": n} for n in db["labels"]]))
+        print(json.dumps([{"name": n} for n in db["labels"]][:int(opt(argv, "--limit") or 30)]))
         return "labels", 0
     if argv[:2] == ["issue", "create"]:
         body = open(opt(argv, "--body-file")).read()

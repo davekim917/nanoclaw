@@ -150,6 +150,60 @@ class FindingIssue(unittest.TestCase):
         self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
         self.assertEqual(len(self.filed()), 2)
 
+    def test_a_title_match_is_named_in_the_decision_and_the_pr_run_record(self):
+        prior = {"number": 5, "title": "Upload preview missing", "body": "a human's issue", "state": "open",
+                 "labels": [], "html_url": "https://github.test/issues/5"}
+        self.gh(labels=["severity:p3"], issues=[prior])
+        self.c.github(RUN, "synthesis", "issue:CF-1")
+        self.assertEqual(self.c.decisions[-1]["duplicateOf"], 5)
+        self.assertEqual(self.c.github(RUN, "synthesis", "pr-comment", hint={"verdict": "GO"}), "done")
+        [comment] = json.loads((self.state / "gh.json").read_text())["comments"]["7"]
+        self.assertIn("Finding CF-1: matched open issue #5 by title, not filed again", comment["body"])
+
+    def test_no_match_leaves_the_run_record_as_it_was(self):
+        self.gh(labels=["smoke-finding", "severity:p3"])
+        self.c.github(RUN, "synthesis", "issue:CF-1")
+        self.c.github(RUN, "synthesis", "pr-comment", hint={"verdict": "GO"})
+        [comment] = json.loads((self.state / "gh.json").read_text())["comments"]["7"]
+        self.assertNotIn("matched open issue", comment["body"])
+
+    def test_a_match_past_the_listing_cap_is_found_by_title_search(self):
+        noise = [{"number": 1000 + k, "title": "Other finding {}".format(k), "body": "", "state": "open",
+                  "labels": ["smoke-finding"], "html_url": "https://github.test/issues/{}".format(1000 + k)}
+                 for k in range(500)]
+        match = {"number": 5, "title": "Upload preview missing", "body": "", "state": "open",
+                 "labels": ["smoke-finding"], "html_url": "https://github.test/issues/5"}
+        self.gh(labels=["smoke-finding", "severity:p3"], issues=noise + [match])
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        self.assertEqual(self.c.decisions[-1]["duplicateOf"], 5)
+        self.assertEqual(len(self.filed()), 501)
+
+    def test_a_near_miss_from_title_search_is_not_a_match(self):
+        # `in:title` search is tokenized and fuzzy: it only narrows candidates,
+        # and normalized-title equality still decides the match.
+        noise = [{"number": 1000 + k, "title": "Other finding {}".format(k), "body": "", "state": "open",
+                  "labels": ["smoke-finding"], "html_url": "https://github.test/issues/{}".format(1000 + k)}
+                 for k in range(500)]
+        near = {"number": 6, "title": "Upload preview missing on mobile", "body": "", "state": "open",
+                "labels": ["smoke-finding"], "html_url": "https://github.test/issues/6"}
+        self.gh(labels=["smoke-finding", "severity:p3"], issues=noise + [near])
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        self.assertNotIn("duplicateOf", self.c.decisions[-1])
+        self.assertEqual(self.filed()[-1]["title"], "Upload preview missing")
+        with open(os.environ["FAKE_LOG"]) as fh:
+            searched = [json.loads(line)["argv"] for line in fh if "--search" in line]
+        self.assertEqual(len(searched), 1)  # the near miss really came back from the search
+
+    def test_a_label_listing_that_is_not_a_list_or_is_at_its_cap_is_unknown(self):
+        self.gh(labelListRaw='{"message": "Not Found"}')
+        self.assertIsNone(self.fx._labels_of("org/xzo"))
+        self.fx._repo_labels = {}
+        self.gh(labels=["label-{}".format(k) for k in range(1000)])
+        self.assertIsNone(self.fx._labels_of("org/xzo"))
+        self.fx._repo_labels = {}
+        self.gh(labels=["label-{}".format(k) for k in range(999)])
+        self.assertEqual(len(self.fx._labels_of("org/xzo")), 999)
+
     def test_a_recovered_listing_still_puts_the_dropped_note_in_the_filed_body(self):
         # Fire 1: the listing fails, the owner's labels go out unchanged, the
         # create is refused -- and its body payload is already on disk.
