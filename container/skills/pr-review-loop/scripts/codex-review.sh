@@ -60,8 +60,9 @@
 #   29  ci-wait: CI finished red on the head (`ci_red`) — merge-check would refuse this
 #       head with 24
 #   30  ci-wait: no run registered — nothing at all, or no run of a required workflow, was
-#       on the head within the registration window (`ci_missing`); waiting longer can't
-#       help, so this is never a timeout
+#       on the head within the registration window (`ci_missing`), or the full-suite
+#       re-run ci-wait requested for a quick-tier head (`ci_quick`) never started; waiting
+#       longer can't help, so this is never a timeout
 #   31  ci-wait: the PR conflicts with its base — GitHub runs no `pull_request` workflow
 #       on a conflicting PR, so it fails fast rather than waiting out the window
 #   `merge` passes merge-check's 1, 24, 25 (after one re-check) and 26 through unchanged,
@@ -1228,8 +1229,11 @@ review_notes_state() {
     )'
 }
 
-# Empty when CI on exactly HEAD is green; otherwise `ci_missing`, `ci_red` or
-# `ci_pending` and what caused it. Workflow runs come from `actions/runs`, not
+# Empty when CI on exactly HEAD is green; otherwise `ci_missing`, `ci_red`,
+# `ci_pending` or `ci_quick` and what caused it. `ci_quick` is a required
+# workflow whose newest attempt on the head was a quick tier (quick_tier_runs):
+# the full suite has not run, so it is never green (merge-check refuses it,
+# audit flags it) and never red (ci-wait answers it by re-running the run). Workflow runs come from `actions/runs`, not
 # `commits/<sha>/check-runs`: that 403s ("Resource not accessible by personal
 # access token") under the narrower-scoped tokens container agents may hold,
 # which fail-closed 13 PRs for the sibling release-policy.py on 2026-09-06.
@@ -1271,14 +1275,15 @@ review_notes_state() {
 # status is the one judged. One from anyone else stands in for nothing (it is
 # still an ordinary status, so it is red when it is red).
 ci_verdict() {
-  local runs statuses unstarted posters='[]' required="${CODEX_REVIEW_REQUIRED_WORKFLOWS:-CI}"
+  local runs statuses unstarted quick posters='[]' required="${CODEX_REVIEW_REQUIRED_WORKFLOWS:-CI}"
   runs=$(gh api --paginate --slurp "repos/$REPO/actions/runs?head_sha=$1&per_page=100") || return 1
   statuses=$(gh api --paginate --slurp "repos/$REPO/commits/$1/statuses?per_page=100") || return 1
   unstarted=$(never_started_runs "$1" "$runs" "$required") || return 1
+  quick=$(quick_tier_runs "$1" "$runs" "$required") || return 1
   # Only asked when something could be excused, so a healthy head never pays
   # for (or fails on) the identity read.
   if [ "$unstarted" != '[]' ]; then posters=$(host_ci_posters); fi
-  printf '%s\n%s\n' "$runs" "$statuses" | jq -rs --arg head "$1" --arg labeler "$RISK_LABEL_WORKFLOW" --arg requiredList "$required" --argjson excluded "$CI_EXCLUDED_CONTEXTS" --arg asof "$GATE_AS_OF" --argjson unstarted "$unstarted" --arg hostContext "$HOST_CI_CONTEXT" --argjson posters "$posters" '
+  printf '%s\n%s\n' "$runs" "$statuses" | jq -rs --arg head "$1" --arg labeler "$RISK_LABEL_WORKFLOW" --arg requiredList "$required" --argjson excluded "$CI_EXCLUDED_CONTEXTS" --arg asof "$GATE_AS_OF" --argjson unstarted "$unstarted" --argjson quick "$quick" --arg hostContext "$HOST_CI_CONTEXT" --argjson posters "$posters" '
     ( $requiredList | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) ) as $required
     | ( [ .[0][].workflow_runs[]?
         | select(.head_sha == $head)
@@ -1297,7 +1302,9 @@ ci_verdict() {
     | ( [ $runs[] | select(.status == "completed" and (.id | IN($unstarted[]))) ] ) as $never
     | ( [ $never[] | select(.name as $n | $required | index($n) != null) ] ) as $neverRequired
     | ( if $hostGreen then [ $neverRequired[] | .name ] else [] end ) as $hosted
-    | ( [ $runs[] | select(.status == "completed" and (.id | IN($unstarted[]) | not))
+    | ( [ $quick[] | .id ] ) as $quickIds
+    | ( [ $runs[] | select(.status == "completed" and (.id | IN($quickIds[]))) ] ) as $quickRuns
+    | ( [ $runs[] | select(.status == "completed" and (.id | IN($unstarted[]) | not) and (.id | IN($quickIds[]) | not))
           | (.name as $n | $required | index($n) != null) as $isRequired
           | select((.conclusion // "") as $c | if $isRequired then $c != "success" else ($c | IN("success", "neutral", "skipped") | not) end)
           | "\(.name)=\(.conclusion // "none")\(if $isRequired then " (required)" else "" end)" ]
@@ -1310,6 +1317,7 @@ ci_verdict() {
       elif ($red | length) > 0 then "ci_red: " + ($red | join(", "))
       elif ($missing | length) > 0 then "ci_missing: " + ($missing | join(", ")) + " — required, but no run on this head"
       elif ($pending | length) > 0 then "ci_pending: " + ($pending | join(", "))
+      elif ($quickRuns | length) > 0 then "ci_quick: runs=" + ([ $quickRuns[] | .id as $i | "\($i):\([ $quick[] | select(.id == $i) | .attempt ][0])" ] | join(",")) + ": " + ([ $quickRuns[] | .name ] | unique | join(", ")) + " ran only its quick checks on this head; the full suite has not run (ci-wait requests it by re-running the run)"
       elif ($hosted | length) > 0 then "ci_host: " + ($hosted | join(", ")) + " never started on Actions; the \($hostContext) success on this head stands in"
       else empty end'
 }
@@ -1410,6 +1418,11 @@ never_started_runs() {
           endpoint="repos/$REPO/actions/runs/$id/attempts/$a/jobs?per_page=100"
         fi
         jobs=$(gh api --paginate --slurp "$endpoint" 2>/dev/null) || { clean=0; break; }
+        # An earlier quick-tier attempt (quick_only) is the per-push check the
+        # full re-run replaced, not a genuine failure of the head.
+        if [ "$a" -lt "$attempt" ] && printf '%s\n' "$jobs" | jq -e -L "$HERE" 'include "never-started"; quick_only' >/dev/null 2>&1; then
+          continue
+        fi
         printf '%s\n' "$jobs" | jq -e -L "$HERE" 'include "never-started"; run_never_started' >/dev/null 2>&1 || { clean=0; break; }
       done
     else
@@ -1422,6 +1435,33 @@ never_started_runs() {
     fi
   done <<< "$rows"
   jq -cn --argjson c "$candidates" --argjson d "$disqualified" '[ $c[] | select(.name | IN($d[]) | not) | .id ]'
+}
+
+# Runs of a required workflow on HEAD whose newest attempt is the quick tier
+# (never-started.jq quick_only), as a JSON array of {id, attempt}. Only a
+# completed `failure` run of a required workflow can be one, and only those
+# cost a jobs read. Fail closed: a jobs read that fails, or anything that does
+# not prove quick_only, leaves the run out, so ci_verdict judges it as the red
+# run it otherwise is. Under `audit`, runs created after GATE_AS_OF are not
+# asked about (ci_verdict drops them anyway).
+quick_tier_runs() {
+  local rows id attempt jobs found='[]'
+  rows=$(printf '%s\n' "$2" | jq -r --arg head "$1" --arg asof "$GATE_AS_OF" --arg requiredList "${3-}" '
+    ( $requiredList | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) ) as $required
+    | [ .[].workflow_runs[]? | select(.head_sha == $head and .status == "completed" and .conclusion == "failure")
+      | select($asof == "" or (.created_at // "") <= $asof)
+      | select((.name // "") | IN($required[]))
+      | { id: .id, attempt: (.run_attempt // 1) } ]
+    | unique_by(.id) | .[] | "\(.id)\t\(.attempt)"') || return 1
+  while IFS=$'\t' read -r id attempt; do
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+    [[ "$attempt" =~ ^[0-9]+$ ]] && [ "$attempt" -ge 1 ] || attempt=1
+    jobs=$(gh api --paginate --slurp "repos/$REPO/actions/runs/$id/jobs?per_page=100" 2>/dev/null) || continue
+    if printf '%s\n' "$jobs" | jq -e -L "$HERE" 'include "never-started"; quick_only' >/dev/null 2>&1; then
+      found=$(jq -cn --argjson f "$found" --argjson id "$id" --argjson a "$attempt" '$f + [{ id: $id, attempt: $a }]') || return 1
+    fi
+  done <<< "$rows"
+  printf '%s\n' "$found"
 }
 
 # The newest independent-review-receipt:v1 for exactly HEAD, from the authors
@@ -1996,6 +2036,9 @@ ci_wait_main() {
 
   local start deadline now elapsed tick=0 state verdict last_verdict=""
   local pr_fails=0 ci_fails=0 unk_reads=0
+  # The quick tier (ci_quick): the runs this call re-ran to request the full
+  # suite, as " <id>:<attempt>" keys, and when it last asked.
+  local requested="" requests=0 request_at=0 pairs pair
   start=$(date +%s) || exit 1
   # The deadline covers the whole command, including the mergeability phase
   # below.
@@ -2099,6 +2142,36 @@ ci_wait_main() {
             ;;
           ci_pending:*)
             echo "ci-wait tick=$tick elapsed=${elapsed}s/${timeout}s mergeable=$state $verdict"
+            ;;
+          ci_quick:*)
+            # The repo ran only its quick per-push checks on this head, and its
+            # full suite runs when that run is re-run (never-started.jq
+            # quick_only). Being asked to wait on CI is the request: re-run it,
+            # all jobs, once per attempt seen and at most twice per call, and
+            # give the full suite the whole --timeout from the request.
+            pairs="${verdict#ci_quick: runs=}"
+            pairs="${pairs%%: *}"
+            for pair in ${pairs//,/ }; do
+              case "$requested " in *" $pair "*) continue ;; esac
+              if [ "$requests" -ge 2 ]; then
+                echo "ci=error head=$head: re-ran the quick run twice and it came back quick again ($verdict); re-run all its jobs by hand, not --failed" >&2
+                exit 1
+              fi
+              if ! gh api -X POST "repos/$REPO/actions/runs/${pair%%:*}/rerun" >/dev/null; then
+                echo "ci=error head=$head: could not re-run run ${pair%%:*} to request the full suite (this needs Actions write on $REPO); re-run all its jobs by hand, then ci-wait again" >&2
+                exit 1
+              fi
+              requested="$requested $pair"
+              requests=$((requests + 1))
+              request_at="$now"
+              deadline=$((request_at + timeout))
+              echo "ci-wait: requested the full suite on $head by re-running run ${pair%%:*} (attempt ${pair#*:} was quick checks only); waiting up to ${timeout}s from now"
+            done
+            if [ -n "$requested" ] && [ $((now - request_at)) -ge "$register" ]; then
+              echo "ci=none head=$head: the full-suite re-run requested ${register}s+ ago has not started; $verdict" >&2
+              exit 30
+            fi
+            echo "ci-wait tick=$tick elapsed=${elapsed}s/${timeout}s mergeable=$state full suite requested; waiting for its re-run to start"
             ;;
         esac
       else
