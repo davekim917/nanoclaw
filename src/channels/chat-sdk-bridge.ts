@@ -365,6 +365,14 @@ export interface ChatSdkBridgeConfig {
   inboundFilter?: (message: ChatMessage, ctx: InboundFilterContext) => boolean;
   /** Recover mention semantics from REST-fetched history (SDK fetches may omit isMention). */
   detectRecoveredMention?: (message: ChatMessage) => boolean;
+  /**
+   * Thread a recovered channel-root @mention the way live dispatch would have.
+   * Discord's live Gateway path opens a thread on a root mention before
+   * dispatch; REST history has no such step, so without this a mention seen
+   * only by recovery routes to the channel-level session and is answered at
+   * channel root. Return the thread id, or null to keep the root address.
+   */
+  threadRecoveredRootMention?: (platformId: string, message: ChatMessage) => Promise<string | null>;
   /** Allow selected bot-authored history rows (default recovery policy drops bots). */
   allowRecoveredBotMessage?: (message: ChatMessage) => boolean;
   /** Platform override for history pagination when adapter.fetchMessages lacks channel-root support. */
@@ -1996,11 +2004,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             // Some adapters model a channel-root post as the root of a native
             // reply thread (Slack: slack:<channel>:<message-ts>). Preserve that
             // address; Discord root messages use message.threadId===platformId
-            // and correctly remain null.
+            // and remain null unless threadRecoveredRootMention threads them.
             threadId = message.threadId;
           }
           const isMention =
             target.isDM || message.isMention === true || config.detectRecoveredMention?.(message) === true;
+          if (threadId === null && isMention && !target.isDM && config.threadRecoveredRootMention) {
+            threadId = await config.threadRecoveredRootMention(target.platformId, message);
+          }
           try {
             await forwardInbound(
               target.platformId,

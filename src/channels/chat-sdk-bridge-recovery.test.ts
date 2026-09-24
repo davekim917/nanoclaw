@@ -222,6 +222,64 @@ describe('Chat SDK bridge missed-message recovery', () => {
     expect(result).toEqual({ scannedTargets: 1, recoveredMessages: 2, failedTargets: 0 });
   });
 
+  it('threads a recovered channel-root mention through threadRecoveredRootMention; plain root posts stay root', async () => {
+    // Discord shape: a root post's threadId is the channel id itself.
+    const fetched = [
+      message({ id: 'plain', timestamp: '2026-07-21T18:17:00Z', text: 'chatter', threadId: 'stub:C' }),
+      message({
+        id: 'ask',
+        timestamp: '2026-07-21T18:18:00Z',
+        text: '@bot help',
+        threadId: 'stub:C',
+        raw: { mention: true },
+      }),
+      message({
+        id: 'refused',
+        timestamp: '2026-07-21T18:19:00Z',
+        text: '@bot again',
+        threadId: 'stub:C',
+        raw: { mention: true },
+      }),
+    ];
+    const adapter = {
+      name: 'stub',
+      initialize: async () => {},
+      channelIdFromThreadId: () => 'stub:C',
+      fetchMessages: vi.fn(async () => ({ messages: fetched })),
+    } as unknown as Adapter;
+    const threadRecoveredRootMention = vi.fn(async (platformId: string, msg: ChatMessage) =>
+      msg.id === 'refused' ? null : `${platformId}:${msg.id}`,
+    );
+    const bridge = createChatSdkBridge({
+      adapter,
+      supportsThreads: true,
+      detectRecoveredMention: (msg) => (msg.raw as { mention?: boolean }).mention === true,
+      threadRecoveredRootMention,
+    });
+    const inbound: Array<{ id: string; threadId: string | null }> = [];
+    await bridge.setup({
+      onInbound: async (_platformId, threadId, msg) => {
+        inbound.push({ id: msg.id, threadId });
+      },
+      onInboundEvent: async () => {},
+      onMetadata: () => {},
+      onAction: () => {},
+    } as ChannelSetup);
+
+    await bridge.recoverMissedMessages!({
+      since: '2026-07-21T18:16:00Z',
+      reason: 'event-loop-stall',
+      targets: [{ platformId: 'stub:C', threadId: null, isDM: false }],
+    });
+
+    expect(inbound).toEqual([
+      { id: 'plain', threadId: null },
+      { id: 'ask', threadId: 'stub:C:ask' },
+      { id: 'refused', threadId: null },
+    ]);
+    expect(threadRecoveredRootMention.mock.calls.map(([, msg]) => msg.id)).toEqual(['ask', 'refused']);
+  });
+
   it('normalizes stale sibling sender names before recovered messages reach the router', async () => {
     const fetched = [
       message({

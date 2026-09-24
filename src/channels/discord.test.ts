@@ -14,6 +14,7 @@ import {
   discordCreateThread,
   discordThreadNameFrom,
   installMessageThreadAutoCreate,
+  openRecoveredMentionThread,
   type DiscordThreadRestClient,
   discoverDiscordRecoveryTargets,
   extractDiscordChannelId,
@@ -911,6 +912,43 @@ function forwardPayload(snapshotMessage: Record<string, any> | null, overrides: 
     ...overrides,
   };
 }
+
+describe('openRecoveredMentionThread', () => {
+  const platformId = 'discord:g1:c1';
+
+  it('opens a thread on the mention and returns its per-thread address', async () => {
+    const post = vi.fn(async () => ({ id: 'm1' }));
+    await expect(
+      openRecoveredMentionThread({ post }, platformId, { id: 'm1', text: '<@42> what does Chris need?' }),
+    ).resolves.toBe('discord:g1:c1:m1');
+    expect(post).toHaveBeenCalledWith('/channels/c1/messages/m1/threads', {
+      body: { name: 'what does Chris need?', auto_archive_duration: 1440 },
+    });
+  });
+
+  it('reuses a thread that already exists (160004)', async () => {
+    const raced = Object.assign(new Error('A thread has already been created for this message'), { code: 160004 });
+    const post = vi.fn(async () => {
+      throw raced;
+    });
+    await expect(openRecoveredMentionThread({ post }, platformId, { id: 'm1', text: 'hi' })).resolves.toBe(
+      'discord:g1:c1:m1',
+    );
+  });
+
+  it('answers at channel root when the thread cannot be created', async () => {
+    const post = vi.fn(async () => {
+      throw Object.assign(new Error('Missing Permissions'), { code: 50013 });
+    });
+    await expect(openRecoveredMentionThread({ post }, platformId, { id: 'm1', text: 'hi' })).resolves.toBeNull();
+  });
+
+  it.each(['discord:@me:dm1', 'discord:g1:c1:t1', 'slack:C1'])('never threads %s', async (id) => {
+    const post = vi.fn();
+    await expect(openRecoveredMentionThread({ post }, id, { id: 'm1', text: 'hi' })).resolves.toBeNull();
+    expect(post).not.toHaveBeenCalled();
+  });
+});
 
 describe('unwrapForwardedSnapshot', () => {
   it('unwraps forwarded text into content with a label', () => {
