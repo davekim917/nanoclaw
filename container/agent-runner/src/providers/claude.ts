@@ -2404,15 +2404,15 @@ function canonicalUsageModel(model: string | undefined, env: Record<string, stri
  * Per-model-family default effort, applied only when nothing upstream chose
  * one (-e flag, group provider config, operator NANOCLAW_EFFORT_OVERRIDE).
  *
- *   opus → medium — operator decision 2026-09-22 with the Opus 5.5 bump
- *           (was `high` from 2026-07-27). Opus is the model an UNPINNED group
- *           runs (DEFAULT_OPUS_MODEL in src/flag-parser.ts), so this is the
+ *   opus → high — operator decision 2026-09-24 (was `high` from 2026-07-27, then
+ *           `medium` from 2026-09-22, which coincided with rework). An UNPINNED group
+ *           runs Opus (DEFAULT_OPUS_MODEL in src/flag-parser.ts), so this is the
  *           fleet baseline. Applies to the bare `opus` alias and every
  *           concrete claude-opus-* id; this install only runs Opus 5+.
  *           Operators dial down or up per group, per channel, per task or
  *           per turn via -e / NANOCLAW_EFFORT_OVERRIDE.
- *   fable → medium — keep Fable's default at medium; operators can dial up
- *           via -e or NANOCLAW_EFFORT_OVERRIDE when a task warrants it.
+ *   fable → high — moved with opus on 2026-09-24 (was medium); operators
+ *           dial down via -e or NANOCLAW_EFFORT_OVERRIDE.
  *   sonnet → xhigh — Sonnet 5 (the bare `sonnet` alias) defaults to xhigh, the
  *           recommended setting for coding/agentic work; fleet decision.
  *           (This fork only runs Sonnet 5.)
@@ -2422,15 +2422,15 @@ function canonicalUsageModel(model: string | undefined, env: Record<string, stri
  * clampEffortForModel below.
  */
 function defaultEffortForModel(model: string | undefined): string | undefined {
-  if (!model) return 'medium';
+  if (!model) return 'high';
   const m = model.toLowerCase();
   // Opus 5+ only — every opus id (and the bare alias, which resolves to
   // DEFAULT_OPUS_MODEL via ANTHROPIC_DEFAULT_OPUS_MODEL) defaults to
-  // `medium`, which every opus generation supports.
-  if (m === 'opus' || m.startsWith('claude-opus-')) return 'medium';
+  // `high`, which every opus generation supports (history in the doc above).
+  if (m === 'opus' || m.startsWith('claude-opus-')) return 'high';
   // Sonnet 5 (the bare `sonnet` alias resolves to it) defaults to xhigh.
   if (m === 'sonnet' || m.startsWith('claude-sonnet-')) return 'xhigh';
-  if (m.startsWith('claude-fable-')) return 'medium';
+  if (m.startsWith('claude-fable-')) return 'high';
   if (m === 'haiku' || m.startsWith('claude-haiku-')) return undefined;
   return 'high';
 }
@@ -3758,7 +3758,7 @@ export class ClaudeProvider implements AgentProvider {
       // requests mirror interactive Claude Code's /model. Re-runs the same
       // effort resolution chain as query() so a model switch without an
       // explicit -e lands on the new model's family default (e.g. -m fable
-      // mid-turn → fable@medium, not fable@inherited-xhigh).
+      // mid-turn → fable@high, not fable@inherited-xhigh).
       applySettings: async (s) => {
         // `s.model === undefined` means LEAVE THE LIVE MODEL UNCHANGED, and
         // that is not an inconsistency with query creation — it is what every

@@ -214,7 +214,7 @@ describe('claudeSpawnEnv', () => {
 
   it('claude_spawn_env_matches_the_live_fleet_baseline', () => {
     // This is the unpinned Claude baseline: Opus [1m], and no effort — the
-    // container applies Opus's family default (medium), which is the value no
+    // container applies Opus's family default (high), which is the value no
     // host-side env could express without also pinning every other group.
     // The one deliberate literal: a model bump must change it on purpose.
     expect(pairs(claudeSpawnEnv(cfg())).NANOCLAW_CLAUDE_MODEL).toBe('claude-opus-5-5[1m]');

@@ -108,9 +108,9 @@ describe('a claude provider fallback reaches the provider without a container-si
   });
 
   it('test_fallback_family_effort_follows_the_declared_model', () => {
-    expect(fallbackSpawn({ model: 'fable' }).effort).toBe('medium');
+    expect(fallbackSpawn({ model: 'fable' }).effort).toBe('high');
     expect(fallbackSpawn({ model: 'sonnet5' }).effort).toBe('xhigh');
-    expect(fallbackSpawn({ model: 'claude-opus-5[1m]' }).effort).toBe('medium');
+    expect(fallbackSpawn({ model: 'claude-opus-5[1m]' }).effort).toBe('high');
   });
 
   it('test_fallback_haiku_declaration_gets_no_effort_at_all', () => {
@@ -129,13 +129,13 @@ describe('a claude provider fallback reaches the provider without a container-si
     // boot-time crash loop is impossible because nothing is parsed there.
     const r = fallbackSpawn({ model: 'gpt-5.6-sol', effort: 'ultra' });
     expect(r.model).toBe('claude-opus-5-5[1m]');
-    expect(r.effort).toBe('medium');
+    expect(r.effort).toBe('high');
   });
 
   it('test_a_fallback_with_no_declaration_runs_the_install_default', () => {
     const r = fallbackSpawn({});
     expect(r.model).toBe('claude-opus-5-5[1m]');
-    expect(r.effort).toBe('medium');
+    expect(r.effort).toBe('high');
   });
 });
 

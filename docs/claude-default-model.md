@@ -1,8 +1,71 @@
 # Migration: the Claude default model
 
-## Current: Opus 5.5 at `medium` (2026-09-22)
+## Current: Opus and Fable default effort `high` (2026-09-24)
 
-This section is the current migration and is complete on its own. Everything under **History** below describes the 2026-09-16 change and its values. Only that section's §1 audit script is reused here, as a tool.
+This section is the current migration. The model does not move: `DEFAULT_OPUS_MODEL` stays `claude-opus-5-5[1m]` (see **History: 2026-09-22** below). Only the family default effort moves.
+
+**What moves.** `defaultEffortForModel` (`container/agent-runner/src/providers/claude.ts`) returns `high`, not `medium`, for every `claude-opus-*` id, the bare `opus` alias, a turn with no model, and every `claude-fable-*` id. Sonnet stays `xhigh`, and Haiku stays at no effort. A path moves only when **no layer sets an effort**, because the family default is the last step of the runner's chain: `input.effort ?? stickyConfig.effort ?? NANOCLAW_EFFORT_OVERRIDE ?? defaultEffortForModel(model)` (the "Effort precedence" block in the same file). Every explicit pin keeps its value.
+
+**Detect.** These layers pin an effort. A Claude path with none of them set moves to `high`:
+- a session sticky `sticky_effort` (chat `-e`). A pure task fire ignores it (`effectiveTurnSettings`, `container/agent-runner/src/poll-loop.ts`);
+- `container.json` `providerConfig.effort`;
+- on a Codex-primary group, a Claude `providerFallback.effort`, which is used when that group falls back to Claude (`activeFallback?.effort`, `container/agent-runner/src/config.ts`);
+- channel wiring `default_effort`, then `container.json` `effort`, then legacy `defaultEffort`. The host folds these three into `NANOCLAW_EFFORT_OVERRIDE`, in that order (`effortLayers`, `src/claude-spawn-defaults.ts`);
+- a task `effort_pin`;
+- a subagent's frontmatter `effort:`.
+
+```bash
+for f in groups/*/container.json; do jq -r '(if ((.provider // "claude") | ascii_downcase) == "claude" then [["effort", .effort], ["defaultEffort", .defaultEffort], ["providerConfig.effort", (.providerConfig // {}).effort]] else [] end) + (if (((.providerFallback // {}).provider // "") | ascii_downcase) == "claude" then [["providerFallback.effort (claude fallback)", .providerFallback.effort]] else [] end) | map(select(.[1] != null)) | .[] | "\(input_filename)\t\(.[0])=\(.[1])"' "$f"; done   # Claude-applicable only; a Codex group's own effort and a Codex fallback's effort are not listed
+pnpm exec tsx scripts/q.ts data/v2.db "select mga.id, mga.agent_group_id, mga.default_effort from messaging_group_agents mga where coalesce(mga.default_effort,'') <> ''"
+ncl tasks list --json   # rows with effort_pin
+grep -rHE '^effort:' groups/*/.claude/agents                                    # project scope
+grep -rHE '^effort:' data/v2-sessions/*/.claude-shared/agents 2>/dev/null        # user scope (per group)
+find ~/plugins -type d -name agents -not -path '*/node_modules/*' -exec grep -rHE '^effort:' {} +   # plugin-mounted roles
+# Session stickies (every session's outbound.db; unreadable DBs are reported):
+pnpm exec tsx -e "import Database from 'better-sqlite3'; import fs from 'fs'; for (const g of fs.readdirSync('data/v2-sessions')) { let ss = []; try { ss = fs.readdirSync('data/v2-sessions/' + g) } catch { continue } for (const s of ss) { const p = 'data/v2-sessions/' + g + '/' + s + '/outbound.db'; if (!fs.existsSync(p)) continue; try { const d = new Database(p, { readonly: true }); for (const r of d.prepare(\"select value from session_state where key = 'sticky_effort'\").all()) console.log(g, s, r.value); d.close() } catch (e) { if (!/no such table/.test(e.message)) console.error('UNREADABLE', p, e.message) } } }"
+```
+
+**Why.** Operator observation, 2026-09-24: after the 2026-09-22 move to `medium`, work reviewed by a second agent needed rework noticeably more often. That is not measured, and it is confounded: the same deploy moved Opus 5 to Opus 5.5. The cost headroom is measured. Over `turn_usage` since 2026-09-15 (human, on_wake and scheduled turns), Opus 5.5 at `medium` averaged $1.88 per turn, against $5.74 for Opus 5 at `high`, so `high` on Opus 5.5 is expected to stay below the pre-09-22 cost.
+
+**Fix: keep `medium` on a path.** Set it explicitly before deploying:
+
+```bash
+ncl groups config update --id <group-id> --effort medium        # group
+ncl wirings update <wiring-id> --default-effort medium          # one channel
+ncl tasks update --id <series> --group <group-id> --effort medium
+```
+
+**Deploy.** The change is agent-runner source only. It adds no dependencies, so the image needs no rebuild. The runner source is a boot snapshot taken at host start (`src/agent-runner-source.ts`), so a **host restart** is what makes it live. Running containers are adopted across the restart and keep the snapshot they spawned with. They move as they respawn; recycle one sooner with `ncl groups restart --id <group-id>`.
+
+**Verify.** A turn from a container spawned after the restart, for a path with no effort pin, writes `turn_usage` with `effort = 'high'` (and `effort_requested = 'high'`) on `claude-opus-5-5[1m]`:
+
+```bash
+pnpm exec tsx scripts/q.ts data/v2.db "select model, effort, count(*), round(avg(cost_usd),3) from turn_usage where provider='claude' and ts > '<restart time>' group by 1,2"
+```
+
+**Success check (one week after the restart).** The rework signal was never measured directly, so judge this change on two numbers from `turn_usage`, for the coordinator group whose rework prompted the change (main-model rows only; baselines below are from the install that made this decision). Compare a 7-day window after the restart against the baselines below. The rework query counts only `high` turns, because adopted containers keep running `medium` until they respawn:
+
+| Metric | Opus 5 / `high` (2026-09-15 → 09-22) | Opus 5.5 / `medium` (09-22 → 09-24) |
+|---|---|---|
+| Turns per thread that has a human turn (the rework proxy: extra agent-initiated turns per human ask) | 4.97 (79 threads; 4.72 human) | 5.66 (44 threads; 4.68 human) |
+| Average cost per turn | $5.04 (623 turns) | $2.13 (255 turns) |
+
+```bash
+# rework proxy: turns per human-touched thread, and how many of them were human
+pnpm exec tsx scripts/q.ts data/v2.db "with s as (select session_id, sum(trigger='human') h, count(*) n from turn_usage where agent_group_id='<group-id>' and model='claude-opus-5-5[1m]' and effort='high' and ts > '<restart>' group by 1 having h>0) select count(*), round(avg(n),2), round(avg(h),2) from s"
+# cost per turn
+pnpm exec tsx scripts/q.ts data/v2.db "select effort, count(*), round(avg(cost_usd),3) from turn_usage where agent_group_id='<group-id>' and model='claude-opus-5-5[1m]' and ts > '<restart>' group by 1"
+```
+
+It worked if turns per human-touched thread fall back toward 5.0, with human turns per thread flat, and cost per turn stays well under the Opus 5 / `high` baseline. If turns per thread don't fall, `high` isn't buying less rework: roll back, or look at the model switch instead. The medium-era baseline covers only about two days, so treat it as a direction, not a precise number.
+
+**Rollback.** Change `defaultEffortForModel` back to `medium` for opus, no-model and fable, then redeploy (host restart). No pin was written, so there is nothing to unpin.
+
+## History: 2026-09-22 — Opus 5.5 at `medium`
+
+_Historical. The effort half of this section (`medium`) is superseded by the section above; the model half (`claude-opus-5-5[1m]`) is current._
+
+Everything under the older **History** further below describes the 2026-09-16 change and its values. Only that section's §1 audit script is reused here, as a tool.
 
 **What moves.** `DEFAULT_OPUS_MODEL` (`src/flag-parser.ts`) is now `claude-opus-5-5[1m]`, and the Opus family default effort (`defaultEffortForModel`, `container/agent-runner/src/providers/claude.ts`) is now `medium`, down from `high`. On deploy, every Claude path whose model is the Opus default or an `opus` alias runs Opus 5.5. That covers primary groups, declared `providerFallback`s, `-m opus`, and `opus` task, wiring and subagent pins. Every Opus path with no effort configured runs `medium`, and that includes an explicit `claude-opus-5[1m]` pin, because the family default keys on every `claude-opus-*` id. Codex and OpenCode defaults do not move.
 
