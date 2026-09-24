@@ -374,21 +374,21 @@ describe('per-model-family effort defaults', () => {
     }
   };
 
-  it('test_effort_default_opus_medium: flagless turn (opus alias default) gets medium', () => {
+  it('test_effort_default_opus_high: flagless turn (opus alias default) gets high', () => {
     const opts = run({});
     expect(opts?.model).toBe('opus');
-    expect(opts?.effort).toBe('medium');
+    expect(opts?.effort).toBe('high');
   });
 
   // Every concrete opus id shares the family default, not only the one the
   // `opus` alias resolves to. Operator decision 2026-09-22 (was `high` since
-  // 2026-07-27): Opus defaults to `medium`. The clamp path keeps xhigh
+  // 2026-07-27): Opus defaults to `high` (operator decision 2026-09-24). The clamp path keeps xhigh
   // available, so an explicit `-e xhigh` still survives (guarded by the next
   // test).
-  it('test_effort_default_opus5_medium_explicit_id: explicit claude-opus-5[1m] defaults to medium', () => {
+  it('test_effort_default_opus5_high_explicit_id: explicit claude-opus-5[1m] defaults to high', () => {
     const opts = run({ model: 'claude-opus-5[1m]' });
     expect(opts?.model).toBe('claude-opus-5[1m]');
-    expect(opts?.effort).toBe('medium');
+    expect(opts?.effort).toBe('high');
   });
 
   it('test_effort_xhigh_on_opus5_not_clamped: an explicit -e xhigh survives on Opus 5', () => {
@@ -396,9 +396,9 @@ describe('per-model-family effort defaults', () => {
     expect(opts?.effort).toBe('xhigh');
   });
 
-  it('test_effort_default_fable_medium: -m fable without -e defaults to medium', () => {
+  it('test_effort_default_fable_high: -m fable without -e defaults to high', () => {
     const opts = run({ model: 'claude-fable-5[1m]' });
-    expect(opts?.effort).toBe('medium');
+    expect(opts?.effort).toBe('high');
   });
 
   it('test_effort_flag_wins_on_fable: -e xhigh on fable overrides the family default', () => {
@@ -436,11 +436,11 @@ describe('per-model-family effort defaults', () => {
     expect(opts?.effort).toBe('xhigh');
   });
 
-  it('test_effort_all_opus_default_medium: all opus models (5+, older) default to medium', () => {
+  it('test_effort_all_opus_default_high: all opus models (5+, older) default to high', () => {
     const flagless = run({ model: 'claude-opus-4-6[1m]' });
-    expect(flagless?.effort).toBe('medium');
+    expect(flagless?.effort).toBe('high');
     const flagless5 = run({ model: 'claude-opus-5[1m]' });
-    expect(flagless5?.effort).toBe('medium');
+    expect(flagless5?.effort).toBe('high');
   });
 
   it('test_effort_xhigh_survives_on_all_opus: explicit -e xhigh passes through on any opus model', () => {
@@ -499,7 +499,7 @@ describe('live applySettings (-m/-e on an active query — same conversation, no
     expect(q.requiresRestartForRuntimeContext).toBe(true);
     await q.applySettings!({ model: 'claude-fable-5[1m]' });
     expect(capturedSetModel).toEqual(['claude-fable-5[1m]']);
-    expect(capturedFlagSettings).toEqual([{ effortLevel: 'medium' }]);
+    expect(capturedFlagSettings).toEqual([{ effortLevel: 'high' }]);
   });
 
   it('test_applySettings_effort_only: -e medium mid-turn → no setModel, effortLevel applied', async () => {

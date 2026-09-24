@@ -93,15 +93,15 @@ describe('family-default effort follows the RESOLVED model, not the opus alias',
   it('test_fable_pinned_group_gets_fables_family_default', () => {
     const o = turn({}, { groupModel: 'claude-fable-5-1[1m]' });
     expect(o?.model).toBe('claude-fable-5-1[1m]');
-    expect(o?.effort).toBe('medium');
+    expect(o?.effort).toBe('high');
   });
 
   it('test_opus_default_group_gets_opus_family_default', () => {
-    // Opus defaults to `medium` — the fleet baseline (operator decision 2026-09-22;
-    // was `high` from 2026-09-16).
+    // Opus defaults to `high` — the fleet baseline (operator decision 2026-09-24;
+    // was `medium` from 2026-09-22, `high` before that from 2026-09-16).
     const o = turn({}, { groupModel: 'claude-opus-5[1m]' });
     expect(o?.model).toBe('claude-opus-5[1m]');
-    expect(o?.effort).toBe('medium');
+    expect(o?.effort).toBe('high');
   });
 });
 
@@ -109,14 +109,14 @@ describe('every other precedence layer is untouched', () => {
   it('test_per_turn_model_still_wins', () => {
     const o = turn({}, { groupModel: 'claude-sonnet-5' }, { model: 'claude-opus-5[1m]' });
     expect(o?.model).toBe('claude-opus-5[1m]');
-    expect(o?.effort).toBe('medium');
+    expect(o?.effort).toBe('high');
   });
 
   it('test_providerConfig_model_still_beats_the_host_default', () => {
     const o = turn({ providerConfig: { model: 'claude-fable-5-1[1m]' } }, { groupModel: 'claude-sonnet-5' });
     expect(o?.model).toBe('claude-fable-5-1[1m]');
     // ...and now the family default follows THAT model, which is the whole point.
-    expect(o?.effort).toBe('medium');
+    expect(o?.effort).toBe('high');
   });
 
   it('test_operator_effort_override_still_beats_the_family_default', () => {
@@ -163,7 +163,7 @@ describe('every other precedence layer is untouched', () => {
     // A spawn that carries neither var (unit tests) keeps the last resort.
     const o = turn({}, {});
     expect(o?.model).toBe('opus');
-    expect(o?.effort).toBe('medium');
+    expect(o?.effort).toBe('high');
   });
 
   it('test_clamp_still_refuses_an_unsupported_pairing', () => {
@@ -200,14 +200,14 @@ describe('an unpinned scheduled task lands on the group default, not a literal',
     expect(o?.effort).toBe('xhigh');
   });
 
-  it('test_unpinned_task_on_an_unconfigured_group_is_opus_at_medium', () => {
+  it('test_unpinned_task_on_an_unconfigured_group_is_opus_at_high', () => {
     // The Claude groups with no `model` in container.json. This is the
     // repricing: those groups' unpinned scheduled tasks move here on deploy.
     // Asserted so the cost claim in the PR body is a measured behaviour and
     // not a prediction.
     const o = turn({}, { groupModel: 'claude-opus-5[1m]' }, { model: undefined, effort: undefined });
     expect(o?.model).toBe('claude-opus-5[1m]');
-    expect(o?.effort).toBe('medium');
+    expect(o?.effort).toBe('high');
   });
 
   it('test_a_task_pin_still_overrides_the_group_default', () => {
