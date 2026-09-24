@@ -17,3 +17,8 @@
   Partly accepted: concurrency (2) — MCP-process serialization, no cross-DB transaction (duplicate post at worst);
   progress parity (7) — spawn-child lists internal; sibling-triggered turns keep lists (explicit agent action, and
   sibling bots drop list posts at inbound). Each fix has a regression test in task-list(-delivery).test.ts.
+- **Implementation review round 2** (same transport, head f1bfbfac): needs-attention, 5. Accepted and fixed:
+  kill-fence gaps (1: undelivered first post now dropped, newer-container record left alone, no unowned run on slot
+  timeout), rate limits (2: per-row cooldown, uncharged, never blocks answers; bridge never waits inline for list
+  rows), interrupted footer unscrubbed (4). Rejected with reasons in As built: cross-DB transaction (3),
+  identical-retry after a switch flip (5).

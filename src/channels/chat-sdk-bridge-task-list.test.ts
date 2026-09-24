@@ -68,13 +68,25 @@ describe('chat-sdk bridge — task list', () => {
     expect(posts[0].markdown!.length).toBeLessThanOrEqual(120);
   });
 
-  it('retries a rate-limited edit instead of dropping it', async () => {
+  it('never waits on a rate limit for a list edit or post — the host cools the row down instead', async () => {
+    const limited = new Error('slack rate_limited: Retry-After: 30');
+    const { bridge, edits } = bridgeWith({ editFailures: [limited] });
+    await expect(
+      bridge.deliver('thread-1', null, {
+        kind: 'task_list',
+        content: { operation: 'edit', messageId: 'msg-1', text: 'T\n✓ A', subtext: 'todos as of 3:00 PM' },
+      }),
+    ).rejects.toThrow('Retry-After');
+    expect(edits).toHaveLength(0);
+  });
+
+  it('still retries a rate-limited edit of an ordinary reply', async () => {
     vi.useFakeTimers();
     try {
       const { bridge, edits } = bridgeWith({ editFailures: [new Error('slack rate_limited: Retry-After: 1')] });
       const done = bridge.deliver('thread-1', null, {
-        kind: 'task_list',
-        content: { operation: 'edit', messageId: 'msg-1', text: 'T\n✓ A', subtext: 'todos as of 3:00 PM' },
+        kind: 'chat',
+        content: { operation: 'edit', messageId: 'msg-1', text: 'Corrected.' },
       });
       await vi.advanceTimersByTimeAsync(5_000);
       await done;

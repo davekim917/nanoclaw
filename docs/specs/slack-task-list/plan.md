@@ -165,18 +165,25 @@ something the plan did not know.
 - **Repost rule**: the list's post is ≥15 min old and ≥2 conversation messages sit below it.
 - **Kill reasons**: the idle reapers (`chat-idle-reap`, `scheduled-task-idle`) end containers after their work
   and leave the list as is; every other kill with an unfinished list marks it interrupted.
-- **Kill-time edit (implementation review, Codex gpt-6-astra high)**: runs in the session's delivery slot (after any
-  drain in flight), records the dead container's queued list rows delivered-unsent in inbound.db (durable across a
-  host restart, so nothing replays over the interrupted form), and edits where the HOST delivered the list —
-  the delivered post's own row and `delivered` receipt — only in the session's own conversation. The container's
-  record supplies only the wording. Residual: a row the dying container writes during its SIGTERM grace, after
-  the kill began, can still land.
-- **Delivery**: queued edits of one list coalesce to the newest (the rest recorded delivered-unsent); a
-  rate-limited list edit waits at most once, ≤5 s, then fails into the host retry path, so an answer behind it is
-  not held long. Spawn-child sessions' lists stay internal, as their 💭 did. The status line takes its item from
-  the secret-scrubbed row.
+- **Kill-time edit (implementation review, Codex gpt-6-astra high, two rounds)**: runs only while holding the
+  session's delivery slot (after any drain in flight; if a drain will not finish in 30 s it does nothing rather than
+  race it). It records the dead container's queued list rows delivered-unsent in inbound.db — durable across a host
+  restart; a first post that never went out is dropped the same way — and edits where the HOST delivered the list
+  (the post's own row and `delivered` receipt), only in the session's own conversation. The container's record
+  supplies only the wording, scrubbed like any payload. A list updated after the kill began belongs to a newer
+  container and is left alone. Residual: a row the dying container writes during its SIGTERM grace can still land.
+- **Delivery**: queued edits of one list coalesce to the newest (the rest recorded delivered-unsent). A rate-limited
+  list row never waits inline and never blocks: it cools down for Slack's Retry-After, uncharged, while the
+  session's answers go out, then sends. Any other list-row failure also steps aside instead of holding the queue.
+  Spawn-child sessions' lists stay internal, as their 💭 did. The status line takes its item from the
+  secret-scrubbed row.
 - **Runner concurrency**: `update_task_list` calls are serialized in the MCP process. Not done: one mailbox
-  transaction around state + outbound write — the crash window between them costs at most a duplicate list post.
+  transaction around state + outbound write. The window is a process kill between two consecutive SQLite writes in
+  one tool call; its worst case is one list left showing an older state (or marked interrupted from it) until the
+  next update.
+- **Switch flip with an identical retry**: an edit written while the host gate was off is recorded delivered-unsent;
+  after it comes back on, only a CHANGED update repaints (an identical retry reads as unchanged). Accepted: the flip
+  is operator-driven and rare, and the next real update repaints.
 - **Receipt and status line**: 👀 on a live human Slack message when it wakes an agent; the status line reads
   "is thinking…", or "is working: <current item>" once the list has one.
 - **Sibling rooms**: Slack inbound drops a bot post carrying the list footer, so a list never wakes another bot.

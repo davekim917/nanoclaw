@@ -237,26 +237,36 @@ export function hasRestartNoteSince(db: Database.Database, since: string): boole
 }
 
 /**
- * What the host needs to mark a live task list interrupted when its container
- * is killed mid-work (src/task-list-host.ts). Only the list's WORDING comes
- * from the container-written record (`session_state.task_list`); where to edit
- * comes from host-owned evidence — the outbound row the host itself delivered
- * and the platform id it recorded in `delivered` — so a forged record cannot
- * point the host at a message or a destination the list never had.
+ * What the host does with a live task list when its container is killed
+ * mid-work (src/task-list-host.ts). Only the list's WORDING comes from the
+ * container-written record (`session_state.task_list`); where to edit comes
+ * from host-owned evidence — the post row the host delivered and the platform
+ * id it recorded in `delivered` — so a forged record cannot point the host at
+ * a message or destination the list never had.
  */
 export interface TaskListSettlement {
-  /** Destination of the visible post, as the host delivered it. */
-  channelType: string;
-  platformId: string;
-  threadId: string | null;
-  /** Platform id the host recorded when it delivered that post. */
-  platformMessageId: string;
-  interruptedText: string;
-  interruptedSubtext: string;
-  /** Undelivered task_list rows written at or before the kill: the dead container's last words. */
+  /**
+   * The dead container's undelivered task_list rows, written at or before the
+   * kill. Recorded delivered-unsent so none can land over the interrupted form
+   * (or, for a first post that never went out, show a list nobody will finish).
+   */
   staleRowIds: string[];
+  /** The interrupted edit, when the list's post is on screen. */
+  edit: {
+    channelType: string;
+    platformId: string;
+    threadId: string | null;
+    platformMessageId: string;
+    interruptedText: string;
+    interruptedSubtext: string;
+  } | null;
 }
 
+/**
+ * Null when there is nothing to settle: no list, a finished or stale one (its
+ * queued rows carry its real final state — let them deliver), or one updated
+ * after the kill began, which belongs to a newer container.
+ */
 export function getTaskListSettlement(
   inbound: Database.Database,
   outbound: Database.Database,
@@ -273,36 +283,46 @@ export function getTaskListSettlement(
     return null;
   }
   if (record.version !== 1 || record.finished === true || record.stale === true) return null;
-  if (typeof record.postOutboundId !== 'string') return null;
-  if (typeof record.interruptedText !== 'string' || typeof record.interruptedSubtext !== 'string') return null;
-  const post = outbound
-    .prepare("SELECT channel_type, platform_id, thread_id FROM messages_out WHERE id = ? AND kind = 'task_list'")
-    .get(record.postOutboundId) as
-    | { channel_type: string | null; platform_id: string | null; thread_id: string | null }
-    | undefined;
-  const receipt = inbound
-    .prepare("SELECT platform_message_id FROM delivered WHERE message_out_id = ? AND status = 'delivered'")
-    .get(record.postOutboundId) as { platform_message_id: string | null } | undefined;
-  if (!post?.channel_type || !post.platform_id || !receipt?.platform_message_id) return null;
+  if (typeof record.updatedAt !== 'string' || !(Date.parse(record.updatedAt) <= Date.parse(killedAt))) return null;
   const delivered = new Set(
     (inbound.prepare('SELECT message_out_id FROM delivered').all() as Array<{ message_out_id: string }>).map(
       (r) => r.message_out_id,
     ),
   );
+  // julianday keeps the milliseconds datetime() would truncate: a row written
+  // in the kill's own second, after it, is a newer container's.
   const staleRowIds = (
     outbound
-      .prepare("SELECT id FROM messages_out WHERE kind = 'task_list' AND datetime(timestamp) <= datetime(?)")
+      .prepare("SELECT id FROM messages_out WHERE kind = 'task_list' AND julianday(timestamp) <= julianday(?)")
       .all(killedAt) as Array<{ id: string }>
   )
     .map((r) => r.id)
     .filter((id) => !delivered.has(id));
-  return {
-    channelType: post.channel_type,
-    platformId: post.platform_id,
-    threadId: post.thread_id,
-    platformMessageId: receipt.platform_message_id,
-    interruptedText: record.interruptedText,
-    interruptedSubtext: record.interruptedSubtext,
-    staleRowIds,
-  };
+
+  let edit: TaskListSettlement['edit'] = null;
+  if (
+    typeof record.postOutboundId === 'string' &&
+    typeof record.interruptedText === 'string' &&
+    typeof record.interruptedSubtext === 'string'
+  ) {
+    const post = outbound
+      .prepare("SELECT channel_type, platform_id, thread_id FROM messages_out WHERE id = ? AND kind = 'task_list'")
+      .get(record.postOutboundId) as
+      | { channel_type: string | null; platform_id: string | null; thread_id: string | null }
+      | undefined;
+    const receipt = inbound
+      .prepare("SELECT platform_message_id FROM delivered WHERE message_out_id = ? AND status = 'delivered'")
+      .get(record.postOutboundId) as { platform_message_id: string | null } | undefined;
+    if (post?.channel_type && post.platform_id && receipt?.platform_message_id) {
+      edit = {
+        channelType: post.channel_type,
+        platformId: post.platform_id,
+        threadId: post.thread_id,
+        platformMessageId: receipt.platform_message_id,
+        interruptedText: record.interruptedText,
+        interruptedSubtext: record.interruptedSubtext,
+      };
+    }
+  }
+  return { staleRowIds, edit };
 }

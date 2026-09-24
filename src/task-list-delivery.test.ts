@@ -29,7 +29,7 @@ import { getRawDb } from './db/connection.js';
 import { getDeliveredIds } from './modules/mailbox/ops/delivery.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { resolveSession } from './session-manager.js';
-import { deliverSessionMessages, setDeliveryAdapter } from './delivery.js';
+import { deliverSessionMessages, setDeliveryAdapter, withSessionDeliverySlot } from './delivery.js';
 import { _clearSecretsForTest, registerSecrets } from './secret-scrubber.js';
 import { ackInboundReceipt, settleTaskListOnKill, typingStatusFor } from './task-list-host.js';
 
@@ -297,6 +297,104 @@ describe('task list delivery (switch on)', () => {
     await deliverSessionMessages(session);
     expect(calls).toHaveLength(2);
     expect(calls[1].content.text).toBe('Migrating\n✓ Ran it\n✓ Verified');
+  });
+
+  it('drops an undelivered first post instead of letting it show a list nobody will finish', async () => {
+    const sessionId = await seed();
+    insertRow(
+      sessionId,
+      'list-1',
+      'task_list',
+      { text: 'Migrating\n✱ Run it' },
+      {
+        timestamp: new Date(Date.now() - 1_000).toISOString(),
+      },
+    );
+    writeListState(sessionId);
+    const calls = captureAdapter();
+    await settleTaskListOnKill(sessionId, 'absolute-ceiling');
+    expect(calls).toHaveLength(0);
+    expect(await delivered(sessionId)).toContain('list-1');
+  });
+
+  it('leaves a list updated after the kill began alone — it belongs to a newer container', async () => {
+    const sessionId = await seed();
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, { updatedAt: new Date(Date.now() + 60_000).toISOString() });
+    const calls = captureAdapter();
+    await settleTaskListOnKill(sessionId, 'absolute-ceiling');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('scrubs registered secrets from both interrupted fields', async () => {
+    const sessionId = await seed();
+    registerSecrets({ API_TOKEN: 'sk-live-abcdef123456' });
+    seedDeliveredList(sessionId);
+    writeListState(sessionId, {
+      interruptedText: 'T\n◌ call sk-live-abcdef123456 (interrupted)',
+      interruptedSubtext: 'stopped · sk-live-abcdef123456',
+    });
+    const calls = captureAdapter();
+    await settleTaskListOnKill(sessionId, 'absolute-ceiling');
+    expect(calls).toHaveLength(1);
+    expect(JSON.stringify(calls[0].content)).not.toContain('sk-live-abcdef123456');
+  });
+
+  it('never edits unowned: a drain that will not finish leaves the list as is', async () => {
+    const sessionId = await seed();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    setDeliveryAdapter({
+      async deliver() {
+        await held;
+        return 'plat-held';
+      },
+    });
+    insertRow(sessionId, 'slow-reply', 'chat', { text: 'hello' });
+    const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+    const drain = deliverSessionMessages(session);
+    await vi.waitFor(async () =>
+      expect(await withSessionDeliverySlot(sessionId, async () => 'ran', 50)).toBeUndefined(),
+    );
+    release();
+    await drain;
+    expect(await withSessionDeliverySlot(sessionId, async () => 'ran', 50)).toBe('ran');
+  });
+
+  it('lets an answer through while a list row waits out a rate limit, uncharged, then sends the row', async () => {
+    const sessionId = await seed();
+    const sent: string[] = [];
+    let limited = true;
+    setDeliveryAdapter({
+      async deliver(_c, _p, _t, kind, content) {
+        if (kind === 'task_list' && limited) throw new Error('slack rate_limited: Retry-After: 1');
+        sent.push(`${kind}:${(JSON.parse(content) as { text: string }).text}`);
+        return `plat-${sent.length}`;
+      },
+    });
+    const base = Date.now();
+    insertRow(
+      sessionId,
+      'list-edit',
+      'task_list',
+      { operation: 'edit', messageId: 'm-1', text: 'T\n✓ A' },
+      {
+        timestamp: new Date(base).toISOString(),
+      },
+    );
+    insertRow(sessionId, 'answer', 'chat', { text: 'Done: A.' }, { timestamp: new Date(base + 1).toISOString() });
+    const { session } = await resolveSession('ag-1', 'mg-1', THREAD, 'per-thread');
+    await deliverSessionMessages(session);
+    expect(sent).toEqual(['chat:Done: A.']);
+    expect(await delivered(sessionId)).not.toContain('list-edit');
+
+    // Inside the cooldown the row is not retried; after it, it goes out.
+    limited = false;
+    await deliverSessionMessages(session);
+    expect(sent).toEqual(['chat:Done: A.']);
+    await new Promise((r) => setTimeout(r, 1_100));
+    await deliverSessionMessages(session);
+    expect(sent).toEqual(['chat:Done: A.', 'task_list:T\n✓ A']);
   });
 
   it('sends only the newest of several queued edits to one list', async () => {

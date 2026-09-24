@@ -59,7 +59,12 @@ import { sessionOutboundStorageStat, type NanoclawMailboxSession } from './modul
 import type { OutboundMessage } from './modules/mailbox/ops/delivery.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import { TASK_LIST_ENABLED } from './config.js';
-import { noteTaskListDelivered, supersededTaskListEdits } from './task-list-host.js';
+import {
+  deferTaskListRowOnRateLimit,
+  noteTaskListDelivered,
+  supersededTaskListEdits,
+  taskListRowCoolingDown,
+} from './task-list-host.js';
 import { flagNeedsInput, getTaskByChildSession } from './modules/orchestrator-dispatch/db/tasks.js';
 import { appendRunLog } from './modules/scheduling/run-log.js';
 import { emitDashboardEvent, emitSessionEvent } from './dashboard/api/events.js';
@@ -697,20 +702,25 @@ const inflightDeliveries = new Set<string>();
  * Run `fn` holding this session's delivery slot, waiting (bounded) for a drain
  * already in flight to finish rather than skipping. For work that must be
  * ORDERED against the session's deliveries — the live task list's kill-time
- * edit (src/task-list-host.ts) must land after anything the drain already sent.
- * Past the wait it runs anyway: a stuck drain must not strand the cleanup.
+ * edit (src/task-list-host.ts) must land after anything the drain already
+ * sent. Never runs unowned: past the wait it returns `undefined` without
+ * calling `fn`.
  */
-export async function withSessionDeliverySlot<T>(sessionId: string, fn: () => Promise<T>, waitMs = 30_000): Promise<T> {
+export async function withSessionDeliverySlot<T>(
+  sessionId: string,
+  fn: () => Promise<T>,
+  waitMs = 30_000,
+): Promise<T | undefined> {
   const deadline = Date.now() + waitMs;
-  while (inflightDeliveries.has(sessionId) && Date.now() < deadline) {
+  while (inflightDeliveries.has(sessionId)) {
+    if (Date.now() >= deadline) return undefined;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  const owned = !inflightDeliveries.has(sessionId);
-  if (owned) inflightDeliveries.add(sessionId);
+  inflightDeliveries.add(sessionId);
   try {
     return await fn();
   } finally {
-    if (owned) inflightDeliveries.delete(sessionId);
+    inflightDeliveries.delete(sessionId);
   }
 }
 
@@ -1050,6 +1060,8 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
   };
 
   for (const msg of undelivered) {
+    // A list row waiting out a rate limit steps aside; it stays outstanding.
+    if (msg.kind === 'task_list' && taskListRowCoolingDown(msg.id)) continue;
     // A stored count already at the cap is terminal on its own — the crash
     // window described on the helpers above leaves exactly that row behind.
     // Deciding from it BEFORE the adapter runs is what stops a successor host
@@ -1130,6 +1142,9 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
         pauseTypingRefreshAfterDelivery(session.id);
       }
     } catch (err) {
+      // A rate-limited list row is not failing, it is early: cool it down
+      // uncharged and let the answers behind it through.
+      if (msg.kind === 'task_list' && deferTaskListRowOnRateLimit(msg.id, err)) continue;
       sawError = true;
       const attempts = await recordAttemptRow(msg.id, session.id, err);
       if (attempts !== null && attempts >= MAX_DELIVERY_ATTEMPTS) {
@@ -1147,6 +1162,9 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
         // newer status/chat overtake this row; if the failed row later
         // retries, it can overwrite newer progress or appear after the final
         // answer. The next poll resumes from this oldest undelivered row.
+        // Except a task-list row: progress must never hold an answer back,
+        // and a newer edit of the list supersedes this one (above).
+        if (msg.kind === 'task_list') continue;
         break;
       }
     }
