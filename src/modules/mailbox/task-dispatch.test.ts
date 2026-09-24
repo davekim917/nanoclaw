@@ -174,7 +174,7 @@ describe('keyed task admission and settlement', () => {
   it('legacy observer cutover excludes only its own future inert recurrence, never owned follow-ups', () => {
     const { rowId, seriesId } = dispatchTaskEvent(inbound, input);
     complete(rowId);
-    inbound.prepare("UPDATE messages_in SET recurrence='15,45 * * * *' WHERE id=?").run(rowId);
+    // Production shape: the completed fire row has recurrence NULL; the next occurrence carries it.
     inbound
       .prepare(
         "INSERT INTO messages_in(id,seq,kind,timestamp,content,status,process_after,recurrence,series_id,trigger) VALUES('poll',4,'task',?,'{}','pending','2099-01-01T00:00:00.000Z','15,45 * * * *',?,0)",
@@ -183,11 +183,16 @@ describe('keyed task admission and settlement', () => {
     const read = () => readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId), true);
     expect(readTaskSettlement(inbound, outbound, rowId, taskThreadId(seriesId)).state).toBe('busy');
     expect(read().state).toBe('settled');
+    inbound.prepare("UPDATE messages_in SET series_id='another-series' WHERE id='poll'").run();
+    expect(read().state).toBe('busy'); // another series' recurrence is not this observer's own poll
+    inbound.prepare("UPDATE messages_in SET series_id=? WHERE id='poll'").run(seriesId);
     inbound.prepare("UPDATE messages_in SET trigger=1 WHERE id='poll'").run();
     expect(read().state).toBe('busy');
     inbound.prepare("UPDATE messages_in SET trigger=0,status='paused' WHERE id='poll'").run();
     expect(read().state).toBe('busy');
-    inbound.prepare("UPDATE messages_in SET status='pending',recurrence=NULL,series_id=NULL WHERE id='poll'").run();
+    inbound.prepare("UPDATE messages_in SET status='pending',recurrence=NULL WHERE id='poll'").run();
+    expect(read().state).toBe('busy'); // a same-series one-shot is owned follow-up work, not the next poll
+    inbound.prepare("UPDATE messages_in SET series_id=NULL WHERE id='poll'").run();
     expect(read().state).toBe('busy');
     inbound.prepare("UPDATE messages_in SET kind='chat' WHERE id='poll'").run();
     expect(read().state).toBe('busy');
@@ -233,7 +238,7 @@ describe('keyed task admission and settlement', () => {
   it('legacy observer plus future-inputs settles the cutover shape: own inert poll and a later deadline wake', () => {
     const { rowId, seriesId } = dispatchTaskEvent(inbound, input);
     complete(rowId);
-    inbound.prepare("UPDATE messages_in SET recurrence='15,45 * * * *' WHERE id=?").run(rowId);
+    // Production shape: the completed fire row has recurrence NULL; the next occurrence carries it.
     inbound
       .prepare(
         "INSERT INTO messages_in(id,seq,kind,timestamp,content,status,process_after,recurrence,series_id,trigger) VALUES('poll',4,'task',?,'{}','pending','2099-01-01T00:00:00.000Z','15,45 * * * *',?,0)",
