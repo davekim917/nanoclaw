@@ -163,8 +163,9 @@ something the plan did not know.
 - **Scheduled-task sessions** refuse the tool (they report through `send_message`); the list lives in
   conversations only.
 - **Repost rule**: the list's post is ≥15 min old and ≥2 conversation messages sit below it.
-- **Kill reasons**: the idle reapers (`chat-idle-reap`, `scheduled-task-idle`) end containers after their work
-  and leave the list as is; every other kill with an unfinished list marks it interrupted.
+- **Kill reasons**: every stop marks an unfinished list stopped, idle reaps included (PR 2: once the container is
+  gone a ✱ is stale whatever the reason). An exit the host did not ask for — crash, OOM, a runner that quit, an
+  adopted container's exit — settles the same way.
 - **Kill-time edit (implementation review, Codex gpt-6-astra high, three rounds)**: runs only while holding the
   session's delivery slot (after any drain in flight; if a drain will not finish in 30 s it does nothing rather than
   race it). It records the dead container's queued list rows delivered-unsent in inbound.db — durable across a host
@@ -194,14 +195,20 @@ something the plan did not know.
   progress.
 - **Replacing a list**: a repost's old copy (or the previous generation) is collapsed into a pointer only once the
   new post has a platform id. Until then it stays the visible list, and a kill marks IT interrupted.
-- **Crashes**: a container exit the host did not ask for (OOM, runner crash) settles its list like a kill; the
-  host tracks its own stops by container name, so idle reaps keep their exclusion. An adopted container's crash is
-  not covered (no close handler on this host).
+- **Crashes**: a container exit the host did not ask for (OOM, runner crash, adopted or spawned) settles its list
+  like a kill; the host tracks its own stops by container name so a stop settles once. Exit codes are not read: an
+  adopted container's `docker wait` exits 0 whatever the container did.
 - **Rate-limited first post**: if an answer overtakes it, the post is retired rather than shown below the answer;
   the next update posts afresh.
 - **Channel-level sessions** (Discord channels, shared-mode Slack): the list is never the turn's thread anchor (the
   answer stays the root) and goes in the thread of the message being answered.
-- **Known limits (closing review P3s)**: an idle reap leaves an unfinished list as is; the recovery path does not
-  re-inject the list; containers adopted at deploy run the old runner (no list, 💭 hidden) until they respawn;
-  Discord's 1 h edit cap is not handled for lists; `new_list` over an undelivered post can leave two lists.
+- **Discord**: a list is reposted once its post is 50 min old (Discord caps edits to messages older than 1 h,
+  API error 30046), while the old copy can still be edited into a pointer.
+- **When a list is used** (PR 2): the model decides. A live test showed the tool description alone did not get
+  lists used unprompted (0 of 3 providers on a real multi-step audit), so the rule also ships always-on as
+  `mcp-tools/task-list.instructions.md` — composed into every provider's CLAUDE.md/AGENTS.md, omitted when the
+  switch is off — and the description says "proactively, nobody will ask": 3+ distinct steps or several tool calls.
+- **Known limits (closing review P3s)**: the recovery path does not re-inject the list; containers adopted at a
+  deploy that first enables the switch run the old runner (no list, 💭 hidden) until they respawn; `new_list` over
+  an undelivered post can leave two lists.
 - **Sibling rooms**: Slack inbound drops a bot post carrying the list footer, so a list never wakes another bot.

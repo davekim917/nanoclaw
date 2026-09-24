@@ -4,7 +4,10 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { TEST_ROOT } = vi.hoisted(() => ({ TEST_ROOT: uniqueTmpRoot('claude-md-compose-test') }));
+const { TEST_ROOT, switches } = vi.hoisted(() => ({
+  TEST_ROOT: uniqueTmpRoot('claude-md-compose-test'),
+  switches: { taskList: true },
+}));
 const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 
 vi.mock('./config.js', async (importOriginal) => ({
@@ -12,6 +15,9 @@ vi.mock('./config.js', async (importOriginal) => ({
   GROUPS_DIR: `${TEST_ROOT}/groups`,
   // Hermetic: the plugin scope policy (src/plugin-scopes.ts) must never be read from the host.
   DATA_DIR: `${TEST_ROOT}/data`,
+  get TASK_LIST_ENABLED() {
+    return switches.taskList;
+  },
 }));
 
 // NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
@@ -68,6 +74,7 @@ function importsOf(folder: string): string[] {
 // rather than merely referenced.
 const SHARED_BASE_SENTINEL = 'SENTINEL_SHARED_BASE_9f2c';
 const MODULE_CLI_SENTINEL = 'SENTINEL_MODULE_CLI_4a71';
+const MODULE_TASK_LIST_SENTINEL = 'SENTINEL_MODULE_TASK_LIST_7c20';
 
 function seedInstructionSources(): void {
   const sharedBase = path.join(TEST_ROOT, 'container', 'CLAUDE.md');
@@ -77,12 +84,14 @@ function seedInstructionSources(): void {
   const mcpTools = path.join(TEST_ROOT, 'container', 'agent-runner', 'src', 'mcp-tools');
   fs.mkdirSync(mcpTools, { recursive: true });
   fs.writeFileSync(path.join(mcpTools, 'cli.instructions.md'), `# ncl\n\n${MODULE_CLI_SENTINEL}\n`);
+  fs.writeFileSync(path.join(mcpTools, 'task-list.instructions.md'), `# Task list\n\n${MODULE_TASK_LIST_SENTINEL}\n`);
 }
 
 beforeEach(async () => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
   seedInstructionSources();
+  switches.taskList = true;
   await initTestDb();
   runMigrations(getRawDb());
 });
@@ -263,6 +272,26 @@ describe('composeGroupClaudeMd scheduling instructions through ncl tasks', () =>
     await composeGroupClaudeMd(ag, 'claude');
 
     expect(docOf(ag.folder)).not.toContain(MODULE_CLI_SENTINEL);
+  });
+});
+
+describe('task-list guidance follows its switch', () => {
+  it('composes the task-list fragment while the tool is on, for every provider', async () => {
+    const ag = group('ag-task-list-on', 'task-list-on');
+    await seed(ag);
+    await composeGroupClaudeMd(ag, 'codex');
+    expect(docOf(ag.folder)).toContain(MODULE_TASK_LIST_SENTINEL);
+    expect(fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'AGENTS.md'), 'utf-8')).toContain(
+      MODULE_TASK_LIST_SENTINEL,
+    );
+  });
+
+  it('leaves it out when the switch is off (the tool is not registered)', async () => {
+    switches.taskList = false;
+    const ag = group('ag-task-list-off', 'task-list-off');
+    await seed(ag);
+    await composeGroupClaudeMd(ag, 'claude');
+    expect(docOf(ag.folder)).not.toContain(MODULE_TASK_LIST_SENTINEL);
   });
 });
 

@@ -36,6 +36,12 @@ export const TASK_LIST_RENDER_MAX = 2000;
 export const TASK_LIST_REPOST_AFTER_MS = 15 * 60 * 1000;
 /** How much conversation below the list counts as "busy". */
 export const TASK_LIST_REPOST_MIN_MESSAGES = 2;
+/**
+ * Discord caps edits to a message older than 1 hour (API error 30046), so a
+ * Discord list is reposted before then — while its old copy can still be
+ * edited into a pointer.
+ */
+export const TASK_LIST_DISCORD_REPOST_AFTER_MS = 50 * 60 * 1000;
 
 export type TaskItemStatus = 'pending' | 'in_progress' | 'done';
 
@@ -344,13 +350,16 @@ export async function applyTaskListUpdate(
     activeText: finished ? null : activeText(input.items),
   };
 
+  const postAge = current?.postedAt ? nowDate.getTime() - Date.parse(current.postedAt) : 0;
   const busy =
     current !== null &&
     current.postedAt !== null &&
     current.postSeq !== null &&
-    nowDate.getTime() - Date.parse(current.postedAt) >= TASK_LIST_REPOST_AFTER_MS &&
-    // A record from before the inbound cursor existed falls back to postSeq.
-    deps.messagesAfter(current.postSeq, current.postInboundSeq ?? current.postSeq) >= TASK_LIST_REPOST_MIN_MESSAGES;
+    ((postAge >= TASK_LIST_REPOST_AFTER_MS &&
+      // A record from before the inbound cursor existed falls back to postSeq.
+      deps.messagesAfter(current.postSeq, current.postInboundSeq ?? current.postSeq) >=
+        TASK_LIST_REPOST_MIN_MESSAGES) ||
+      (routing.channelType.startsWith('discord') && postAge >= TASK_LIST_DISCORD_REPOST_AFTER_MS));
 
   if (current && target && !busy) {
     if (current.text === text) {

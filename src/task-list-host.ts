@@ -25,13 +25,6 @@ import { scrubSecrets } from './secret-scrubber.js';
 import { withExistingMailboxSession } from './session-manager.js';
 
 /**
- * Kill reasons that end a container AFTER its work, not during it. The idle
- * reapers fire only once the agent has stopped, so a list still showing ✱
- * there is the agent's own bookkeeping, not an interruption — leave it.
- */
-const IDLE_EXIT_REASONS = new Set(['scheduled-task-idle', 'chat-idle-reap']);
-
-/**
  * Task-list edits in a delivery batch that a LATER edit of the same message
  * in the same batch replaces. Every edit carries the whole list, so only the
  * newest needs to reach the platform; the rest are recorded delivered unsent.
@@ -86,7 +79,10 @@ const KILL_EDIT_WAIT_BUFFER_MS = 250;
  */
 export async function settleTaskListOnKill(sessionId: string, reason: string): Promise<void> {
   setTypingStatusText(sessionId, null);
-  if (!TASK_LIST_ENABLED || IDLE_EXIT_REASONS.has(reason)) return;
+  // Every stop settles, idle reaps included: once the container is gone a
+  // list still showing ✱ is stale whatever the reason (a finished list is
+  // left alone by getTaskListSettlement).
+  if (!TASK_LIST_ENABLED) return;
   const killedAt = new Date().toISOString();
   try {
     const session = await getSession(sessionId);
