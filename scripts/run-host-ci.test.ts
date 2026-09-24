@@ -184,7 +184,9 @@ describe('run-host-ci.sh', () => {
     expect(result.comment).toContain(path.join(ctx.shared, 'host-ci-logs', logs[0]));
     expect(fs.readFileSync(path.join(ctx.shared, 'host-ci-logs', logs[0]), 'utf8')).toContain('declared-output-line');
     expect(result.calls).toContain(`git -C ${ctx.scratch}/`);
-    expect(result.calls).toContain(`fetch -q --depth=1 --no-tags https://github.com/example/repository.git ${HEAD}`);
+    // Full history: a shallow clone makes review-notes.test.ts skip pinned citations.
+    expect(result.calls).toContain(`fetch -q --no-tags https://github.com/example/repository.git ${HEAD}`);
+    expect(result.calls).not.toContain('--depth');
     expect(result.scratchLeft).toEqual([]);
   });
 

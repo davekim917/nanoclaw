@@ -36,10 +36,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      # Full history, as ci-full.yml's `correctness` job does and for the same
-      # reason: scripts/review-notes.test.ts (below) resolves every pinned
-      # `at <sha>` citation and, in a shallow clone, skips one it cannot
-      # resolve with only a warning. Costs a few seconds.
+      # Full history, as ci-full.yml's `correctness` job does
+      # (.github/workflows/ci-full.yml:51-53) and for the same reason:
+      # scripts/review-notes.test.ts (below) resolves every pinned `at <sha>`
+      # citation (scripts/review-notes.test.ts:218-220) and, only when
+      # `git rev-parse --is-shallow-repository` says true
+      # (scripts/review-notes.test.ts:183-185), skips one it cannot resolve
+      # with only a warning (scripts/review-notes.test.ts:232-237). Costs a
+      # few seconds. run-host-ci.sh fetches full history for the same reason
+      # (container/skills/pr-review-loop/scripts/run-host-ci.sh:165-175).
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -86,10 +91,11 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm exec vitest run scripts/review-notes.test.ts --maxWorkers=1
       # src/upstream-ratchet.json must be regenerated whenever an upstream-owned
-      # file changes (CLAUDE.md); a stale hash (#1103) otherwise first shows at
-      # ci-full's drift tests. fs + crypto only, ~seconds. The GROWTH
-      # arithmetic (ratchet:report) still needs upstream objects and stays in
-      # ci-full.yml's `bookkeeping` job.
+      # file changes (CLAUDE.md:105); a stale hash (#1103) otherwise first
+      # shows at ci-full's drift tests. The suite is fs + crypto only, no git
+      # (src/upstream-ratchet.test.ts:4-16), ~seconds. The GROWTH arithmetic
+      # (ratchet:report) needs the pinned upstream commit and stays in
+      # ci-full.yml's `bookkeeping` job (.github/workflows/ci-full.yml:320-334).
       - name: Upstream ratchet is current
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm exec vitest run src/upstream-ratchet.test.ts --maxWorkers=1
