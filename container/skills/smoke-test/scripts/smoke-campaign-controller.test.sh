@@ -120,7 +120,17 @@ step() { # now [extra args...]
   STEP_RC=$?
   set -e
 }
-step_ok() { step "$@"; [ "$STEP_RC" = 0 ] || fail "step $1 exited $STEP_RC: $STEP_OUT $(cat "$C/stderr")"; }
+# A step that could not take control.lock prints `skipped` and exits 0
+# (smoke-campaign-controller.py:3922-3924), having judged nothing. step_ok
+# refuses it, so a lock that is busy when it should not be names itself here
+# instead of surfacing later as a missing decision (#1120).
+step_ok() {
+  step "$@"
+  [ "$STEP_RC" = 0 ] || fail "step $1 exited $STEP_RC: $STEP_OUT $(cat "$C/stderr")"
+  if jq -e 'has("skipped")' <<<"$STEP_OUT" >/dev/null 2>&1; then
+    fail "step $1 was skipped, not run: $STEP_OUT"
+  fi
+}
 
 jr() { jq -cs "$1" "$C/out/journal.ndjson"; }            # query the journal
 dq() { jq -cs "$1" "$C/out/$RUN/decisions.ndjson"; }     # query the decisions
@@ -201,7 +211,8 @@ claim
 flock "$C/out/control.lock" sleep 4 &
 LOCK_PID=$!
 sleep 0.5
-step_ok 2026-09-18T10:00:00Z
+step 2026-09-18T10:00:00Z   # not step_ok: skipping is the expected outcome here
+[ "$STEP_RC" = 0 ] || fail "a busy lock must exit 0: rc=$STEP_RC $STEP_OUT"
 echo "$STEP_OUT" | jq -e '.skipped == "control.lock busy"' >/dev/null || fail "busy lock must skip: $STEP_OUT"
 [ "$(wc -c <"$C/out/journal.ndjson")" = 0 ] || fail "a skipped fire must not write the journal"
 kill "$LOCK_PID" 2>/dev/null || true
@@ -516,7 +527,7 @@ dq '[.[] | select(.type=="send")] | length == 0' | grep -qx true || fail "the ro
 printf '{"screens":[]}\n' >"$R/contact-sheet/critic.json"
 step_ok 2026-09-18T10:10:00Z
 dq '[.[] | select(.type=="send") | .slot]' | grep -qx '\["root","root-sheet"\]' \
-  || fail "root then sheet once the critic landed: $(dq '[.[] | select(.type=="send")]')"
+  || fail "root then sheet once the critic landed: $(dq '[.[] | select(.type=="send")]') (last step: $STEP_OUT)"
 
 new_case criticlate
 claim; contract

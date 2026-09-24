@@ -163,6 +163,9 @@ CRITIC_WAIT_SECONDS = 1200
 # {screens:[{screen, grade, reason}]}). Today its lines live only in
 # run-record.md prose and the workgroup design-critic-log.ndjson.
 CRITIC_ARTIFACT = "contact-sheet/critic.json"
+# Open issues listed for title dedup; a listing that reaches it is incomplete
+# and files nothing (EffectLayer._gh).
+ISSUE_DEDUP_LIMIT = 5000
 POST_FINISH_SLA_SECONDS = 3600
 CLOSED_DISPOSITION = re.compile(r"^(fixed-verified|not-blocking:.+|refuted:.+)$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -923,6 +926,7 @@ class EffectLayer:
         self.performed = []
         self.ctl = None
         self._repo_labels = {}  # repo -> label names, read once per fire
+        self._open_issue_lists = {}  # repo -> open issues for title dedup, listed once per fire
         if mode == "live":
             missing = [k for k in self.LIVE_REQUIRED if not self.cfg.get(k)]
             if missing:
@@ -1165,7 +1169,7 @@ class EffectLayer:
                 return {"outcome": "unknown", "error": err}
             if found:
                 return {"outcome": "done", "via": "search", "url": found}
-            body = self._run_record(run_id, c, effect.get("hint") or {})
+            body = self._run_record(run_id, c, effect.get("hint") or {}) + self._dedup_note(run_id)
             path, _ = write_contained_once(root, self._payload_dir(run_id) + [key[:16] + "-pr-comment.md"],
                                            "{}\n{}\n".format(marker, body))
             wrote = self._run(self.gh + ["pr", "comment", str(pr), "-R", repo, "--body-file", path], 30)
@@ -1184,24 +1188,33 @@ class EffectLayer:
                 return {"outcome": "done", "via": "search", "url": found}
             title, body, labels = self._issue_content(run_id, fid, c)
             repo_labels = self._labels_of(repo)
-            # SI: dedup against open smoke-finding issues by normalized title. A
-            # repo without that label files unlabelled (resolve_labels), so it is
-            # searched unlabelled too: the marker only dedups ONE run's retries
-            # (obligation_key carries the runId), not the next campaign's.
-            scope = [] if repo_labels is not None and "smoke-finding" not in {n.lower() for n in repo_labels} \
-                else ["--label", "smoke-finding"]
-            rc, out, errtext = self._run(self.gh + ["issue", "list", "-R", repo] + scope + [
-                "--state", "open", "--limit", "500", "--json", "number,title,url"], 25)
-            if rc != 0:
-                return {"outcome": "unknown", "error": (errtext or "issue list rc={}".format(rc))[:200]}
-            try:
-                open_issues = json.loads(out or "[]")
-            except ValueError:
-                return {"outcome": "unknown", "error": "unparsable gh issue list output"}
+            # SI: dedup against open smoke-finding issues by normalized title,
+            # over the COMPLETE open set. No `--label` and no `--search`: either
+            # sends gh through the search API (pkg/cmd/issue/list/list.go:235-244
+            # at gh v2.101.0), which is index-backed, capped at 1000 (http.go:188)
+            # and query-length-limited. Unfiltered, gh pages the GraphQL listing
+            # (http.go:33) to --limit, so the scope is applied here from each
+            # issue's labels. A repo without `smoke-finding` files unlabelled
+            # (resolve_labels), so its open issues are matched unscoped: the
+            # marker dedups only ONE run's retries (obligation_key carries the
+            # runId), not the next campaign's. Listed once per fire (_open_issues).
+            open_issues, err = self._open_issues(repo)
+            if err:
+                return {"outcome": "unknown", "error": err}
+            if len(open_issues) >= ISSUE_DEDUP_LIMIT:
+                # A full listing is not proof of absence: unknown, never a
+                # create. The obligation's overdue alarm carries this text.
+                return {"outcome": "unknown",
+                        "error": "open-issue listing hit its {} cap; not filing".format(ISSUE_DEDUP_LIMIT)}
+            scoped = repo_labels is None or "smoke-finding" in {n.lower() for n in repo_labels}
             norm = normalize_title(title)
-            for issue in open_issues if isinstance(open_issues, list) else []:
-                if isinstance(issue, dict) and normalize_title(issue.get("title")) == norm:
-                    return {"outcome": "done", "via": "dedup", "url": issue.get("url"), "duplicateOf": issue.get("number")}
+            for issue in open_issues:
+                if not isinstance(issue, dict) or normalize_title(issue.get("title")) != norm:
+                    continue
+                names = {str(x.get("name")).lower() for x in issue.get("labels") or [] if isinstance(x, dict)}
+                if not scoped or "smoke-finding" in names:
+                    return {"outcome": "done", "via": "dedup", "url": issue.get("url"),
+                            "duplicateOf": issue.get("number")}
             labels, mapped, dropped = resolve_labels(labels, repo_labels)
             name = key[:16] + "-issue.md"
             if dropped:
@@ -1221,7 +1234,15 @@ class EffectLayer:
             found, err = self._find_marker(api, marker)
             relabel = {k: v for k, v in (("labelsMapped", mapped), ("labelsDropped", dropped)) if v}
             if found:
+                # The fire's cached listing learns what it just filed, as a
+                # fresh listing would, so a same-title finding later in this
+                # fire dedups against it instead of filing twice.
+                number = re.search(r"/issues/(\d+)", str(found))
+                open_issues.append({"number": int(number.group(1)) if number else None, "title": title,
+                                    "url": found, "labels": [{"name": x} for x in labels]})
                 return dict({"outcome": "done", "via": "write", "url": found}, **relabel)
+            # The create may have landed unseen: the next obligation relists.
+            self._open_issue_lists.pop(repo, None)
             return dict({"outcome": "unknown",
                          "error": gh_write_error(wrote, "issue create") or err or "issue not found on read-back"},
                         **relabel)
@@ -1251,6 +1272,26 @@ class EffectLayer:
         lines += ["", "The owner wrote no prose record; lane evidence is in the run directory."]
         return "\n".join(lines)
 
+    def _open_issues(self, repo):
+        """(open issues, None) or (None, error): the repo's open issues with
+        their labels, listed once per fire -- unfiltered, so gh pages the
+        GraphQL listing rather than the search API (see _gh). Behaviour was
+        verified on gh 2.89 and the v2.101.0 source; the container's gh is
+        apt `stable`, unpinned (container/Dockerfile:102-105)."""
+        if repo not in self._open_issue_lists:
+            rc, out, errtext = self._run(self.gh + ["issue", "list", "-R", repo, "--state", "open", "--limit",
+                                                    str(ISSUE_DEDUP_LIMIT), "--json", "number,title,url,labels"], 60)
+            if rc != 0:
+                return None, (errtext or "issue list rc={}".format(rc))[:200]
+            try:
+                doc = json.loads(out or "[]")
+            except ValueError:
+                return None, "unparsable gh issue list output"
+            if not isinstance(doc, list):
+                return None, "gh issue list returned no list"
+            self._open_issue_lists[repo] = doc
+        return self._open_issue_lists[repo], None
+
     def _labels_of(self, repo):
         """The repo's label names, listed once per fire; None if the listing
         failed (resolve_labels then sends the owner's labels unchanged)."""
@@ -1260,11 +1301,30 @@ class EffectLayer:
             if rc == 0:
                 try:
                     doc = json.loads(out or "[]")
+                except ValueError:
+                    doc = None
+                # Anything but a list, or a list at the cap (labels may lie past
+                # it), is an unknown label set, never an empty or partial one.
+                if isinstance(doc, list) and len(doc) < 1000:
                     names = [d["name"] for d in doc if isinstance(d, dict) and isinstance(d.get("name"), str)]
-                except (ValueError, TypeError):
-                    names = None
             self._repo_labels[repo] = names
         return self._repo_labels[repo]
+
+    def _dedup_note(self, run_id):
+        """Findings this run did NOT file because an open issue already had
+        the title (via=dedup). In a repo without `smoke-finding` that match can
+        be a human's issue, so the PR's run record says so rather than the
+        journal alone. pre_finish steps every issue obligation before the
+        pr-comment in the same fire (:3576-3580); one still unsettled then is not
+        listed here, and its match stays on its own `gh` decision row."""
+        lines = []
+        for ob in self.ctl.obligations().values():
+            d = ob.get("detail") or {}
+            if ob["runId"] == run_id and ob["kind"] == "gh" and ob["slot"].startswith("issue:") \
+                    and ob["state"] == "done" and d.get("via") == "dedup":
+                lines.append("- Finding {}: matched open issue #{} by title, not filed again{}".format(
+                    ob["slot"][len("issue:"):], d.get("duplicateOf"), " ({})".format(d["url"]) if d.get("url") else ""))
+        return "\n\n" + "\n".join(sorted(lines)) if lines else ""
 
     def _find_marker(self, api, marker):
         objs, err = self._gh_json_lines(api)
@@ -1396,14 +1456,14 @@ class EffectLayer:
         # AN ACK NEVER OUTLIVES THE BRIEF IT ACKNOWLEDGED. The ack is the
         # owner's first act on a wake and the controller only tests it for
         # existence, re-offering a wake solely while it is ABSENT (owner_step,
-        # :2651-2661); the renewer reads it the same way
+        # :2711-2721); the renewer reads it the same way
         # (smoke-controller-renew.sh, "brief-<step>.ack absent: no owner turn
         # holds this step"). So a brief rewritten under a NEW owner token would
         # otherwise inherit the previous brief's ack and be treated as taken,
         # and never re-offered -- the second half of XZO #2046. Removing it here
         # makes that impossible by construction rather than by sequencing: this
         # function runs only when the obligation is absent or `intent`
-        # (owner_step, :2581), never while a live brief is enqueued, so any ack
+        # (owner_step, :2641), never while a live brief is enqueued, so any ack
         # it finds belongs to a brief this write supersedes.
         try:
             dfd = _open_dir_contained(root, [run_id, "controller"], True)
@@ -2338,8 +2398,8 @@ class Controller:
                                        "marker": "<!-- smoke-ctl:{} -->".format(key),
                                        "writeOnlyIfMarkerAbsent": reconcile})
         self.decide(run_id, phase, "gh", "mechanical", "obligation due", slot=slot, key=key, effect=result["outcome"],
-                    afterReconcile=reconcile, **{k: result[k] for k in ("error", "labelsMapped", "labelsDropped")
-                                                 if result.get(k)})
+                    afterReconcile=reconcile, **{k: result[k] for k in ("error", "labelsMapped", "labelsDropped",
+                                                                   "duplicateOf") if result.get(k)})
         crash_point("after-effect", "gh", slot)
         if result["outcome"] == "shadow_refused":
             self.record(run_id, "gh", slot, "done", 1, {"outcome": result["outcome"], "shadowAssumed": True})
@@ -2792,7 +2852,7 @@ class Controller:
         then the owner writes evidence the barrier rejects. The next fire
         publishes the new refusal and returns `ownerWake: null`, because
         owner_step re-offers a wake only while the `.ack` is ABSENT
-        (:2651-2661). The diagnosis is on disk and nobody is told to read it --
+        (:2711-2721). The diagnosis is on disk and nobody is told to read it --
         the same dead end, reached the way run pr2055 actually reached it.
 
         THE TRIGGER IS A CHANGE IN THE REFUSAL, NOT "INVALID". Narrower than
@@ -2807,7 +2867,7 @@ class Controller:
         fire exactly like `briefedToken`: a crash between the publish and the
         re-offer leaves the next fire owing the same re-offer. Re-offering does
         not extend the step's SLA -- owner_step measures from `history[0]`
-        (:2662) -- so a run that keeps producing invalid evidence still ends at
+        (:2722) -- so a run that keeps producing invalid evidence still ends at
         the overdue path rather than being woken forever."""
         ob = self.obligations().get(obligation_key(run_id, "owner", step))
         if not ob or ob["state"] not in ("intent", "enqueued"):
@@ -3068,8 +3128,8 @@ class Controller:
         An owner step records `brief_written`/`admitted`/`briefedToken`/
         `dispatchIntent` only once <run>/controller/brief-<step>.md is on disk
         (_owner_wake writes the brief before either route records anything,
-        :1423 and :1442; owner_step journals it after the effect returns,
-        :2636-2646) -- a bare `intent` is deliberately NOT proof, since a fire
+        :1483 and :1502; owner_step journals it after the effect returns,
+        :2696-2706) -- a bare `intent` is deliberately NOT proof, since a fire
         can die before the brief lands. A `send:root` obligation is proof too:
         the root is posted only from a readable completion contract (step_run's
         ladder). Shadow owner steps (`shadow_refused`) write nothing and are
@@ -3328,8 +3388,8 @@ class Controller:
                 # THE OWNER IS WOKEN HERE, not only once the barrier passes.
                 # By this point every OTHER party's contribution the synthesis
                 # barrier checks has already been gated above: the lanes
-                # barrier is ready (:3295), coordinator/preliminary.md exists
-                # (:3312) and challenger/disposition.md exists (:3318). What
+                # barrier is ready (:3355), coordinator/preliminary.md exists
+                # (:3372) and challenger/disposition.md exists (:3378). What
                 # the synthesis barrier can still report is therefore the
                 # retained owner's -- `invalid[]` content it authored
                 # (journeys/scope-dispositions.json, or
@@ -3341,7 +3401,7 @@ class Controller:
                 # alone (smoke-controller-live.sh:168-175), so nobody was told;
                 # and _maybe_synthesis_overdue_blocked needs the very
                 # owner:synthesis obligation this branch declined to create
-                # (:3353-3355), so the terminal BLOCKED safety net could not
+                # (:3413-3415), so the terminal BLOCKED safety net could not
                 # fire either. This is the same blind spot as the lanes barrier
                 # (XZO #2047), on the sibling path.
                 timed = self._maybe_synthesis_overdue_blocked(run_id, pr, run)
@@ -3443,7 +3503,7 @@ class Controller:
            ladder ("An owner may conclude ..." below) and is never pre-empted
            by a timeout -- but only where the ladder can reach it, which needs
            a readable contract: validate_synthesis binds its sourceSha to the
-           contract's (:1949-1956), so without one it could only be BLOCKED.
+           contract's (:2009-2016), so without one it could only be BLOCKED.
         3. The challenger deadline itself."""
         vob = self.obligations().get(obligation_key(run_id, "verdict", "validated"))
         if vob and vob["state"] == "done" and vob["detail"].get("verdict") != "GO":
@@ -3603,7 +3663,7 @@ class Controller:
         refused by the real gate once it sees a disposition, and a disposition
         can land after the timeout froze its BLOCKED. gate_verb records a
         permanent refusal failed_terminal and afterwards returns it without
-        calling the gate (this file, :2361-2362), so re-selecting the verb
+        calling the gate (this file, :2421-2422), so re-selecting the verb
         wedged the run for good -- a wedge since live mode (#945), found three
         ways in PR #1066: a fake gate that never refused, a frozen verb replayed
         after a late disposition, and a controller read of the disposition

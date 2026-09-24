@@ -211,17 +211,25 @@ def gh(argv):
         f = fault("gh:issue-list")
         if f == "fail-before":
             return "fail", out_err("HTTP 502")
-        want = opt(argv, "--label")
-        print(json.dumps([{"number": i["number"], "title": i["title"], "url": i["html_url"]}
-                          for i in db["issues"] if i["state"] == "open"
-                          and (want is None or want in i.get("labels", []))]))
+        # --label and --search would send real gh through the search API
+        # (list.go:235-244, gh v2.101.0); the controller passes neither, and
+        # this fake refuses them so a regression is loud.
+        if opt(argv, "--label") or opt(argv, "--search"):
+            return "refused", out_err("fake gh: issue list --label/--search goes through search; not supported")
+        hits = [{"number": i["number"], "title": i["title"], "url": i["html_url"],
+                 "labels": [{"name": n} for n in i.get("labels", [])]}
+                for i in db["issues"] if i["state"] == "open"]
+        print(json.dumps(hits[:int(opt(argv, "--limit") or 30)]))
         return "list", 0
     if argv[:2] == ["label", "list"]:
         if fault("gh:label-list") == "fail-before":
             return "fail", out_err("HTTP 502")
+        if "labelListRaw" in db:
+            print(db["labelListRaw"])
+            return "labels", 0
         if "labels" not in db:
             return "unknown", out_err("fake gh: no labels configured")
-        print(json.dumps([{"name": n} for n in db["labels"]]))
+        print(json.dumps([{"name": n} for n in db["labels"]][:int(opt(argv, "--limit") or 30)]))
         return "labels", 0
     if argv[:2] == ["issue", "create"]:
         body = open(opt(argv, "--body-file")).read()

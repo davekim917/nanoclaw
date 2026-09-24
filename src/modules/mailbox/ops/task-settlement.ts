@@ -10,6 +10,8 @@ export interface TaskSettlement {
   outcome: 'success' | 'error' | null;
   observedAt: string;
   reason: string;
+  /** Present only when not-yet-due inputs were set aside (`futureInputs` mode). */
+  futureInputs?: number;
 }
 
 /** Exact automatic single-event outcome. Legacy and batched outcomes cannot settle one event. */
@@ -36,26 +38,53 @@ export function readTaskOutcome(outbound: Database.Database, eventId: string): '
   return null;
 }
 
-/** Host-owned facts only: no prompt, transcript, or artifact interpretation. */
+/**
+ * Host-owned facts only: no prompt, transcript, or artifact interpretation.
+ *
+ * `futureInputs` is for an observer whose later follow-ups are separate
+ * episodes (a watcher's deadline wake for one PR is not the observation that
+ * armed it): pending inputs not yet due are counted and reported, not treated
+ * as outstanding execution. Due, processing and paused inputs, claims,
+ * provider execution, continuation and undelivered actions still block.
+ */
 export function readTaskSettlement(
   inbound: Database.Database,
   outbound: Database.Database | null,
   eventId: string,
   threadId: string | null,
   observer = false,
+  futureInputs = false,
 ): TaskSettlement {
+  let deferred: number | undefined;
   const result = (
     state: TaskSettlement['state'],
     reason: string,
     outcome: TaskSettlement['outcome'] = null,
     executionSettled = false,
-  ): TaskSettlement => ({ state, reason, outcome, executionSettled, observedAt: new Date().toISOString() });
+  ): TaskSettlement => ({
+    state,
+    reason,
+    outcome,
+    executionSettled,
+    observedAt: new Date().toISOString(),
+    ...(deferred === undefined ? {} : { futureInputs: deferred }),
+  });
   if (!outbound) return result('unknown', 'outbound-unavailable');
   try {
     const row = inbound
       .prepare("SELECT status, series_id, recurrence FROM messages_in WHERE id = ? AND kind = 'task'")
       .get(eventId) as { status: string; series_id: string | null; recurrence: string | null } | undefined;
     if (!row) return result('unknown', 'event-unavailable');
+    if (futureInputs) {
+      deferred = (
+        inbound
+          .prepare(
+            `SELECT COUNT(*) AS n FROM messages_in WHERE status = 'pending' AND process_after IS NOT NULL
+        AND datetime(process_after) > datetime('now')`,
+          )
+          .get() as { n: number }
+      ).n;
+    }
     const state = getContainerState(outbound);
     if (!state || (state.provider_executing !== 0 && state.provider_executing !== 1))
       return result('unknown', 'execution-state-unavailable');
@@ -74,9 +103,11 @@ export function readTaskSettlement(
           `SELECT COUNT(*) AS n FROM messages_in
       WHERE status IN ('pending', 'processing', 'paused') AND NOT COALESCE((
         ? IS NOT NULL AND kind = 'task' AND series_id = ? AND recurrence = ?
-        AND status = 'pending' AND trigger = 0 AND datetime(process_after) > datetime('now')), 0)`,
+        AND status = 'pending' AND trigger = 0 AND datetime(process_after) > datetime('now')), 0)
+      AND NOT (? AND status = 'pending' AND process_after IS NOT NULL
+        AND datetime(process_after) > datetime('now'))`,
         )
-        .get(observerSeries, observerSeries, row.recurrence) as { n: number }
+        .get(observerSeries, observerSeries, row.recurrence, futureInputs ? 1 : 0) as { n: number }
     ).n;
     if (!idle || obligations > 0) return result('busy', 'execution-or-input-outstanding');
     // Include future outbound actions: a wait not yet delivered has not become an inbound obligation.
