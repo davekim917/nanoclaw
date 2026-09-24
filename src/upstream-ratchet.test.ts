@@ -94,8 +94,15 @@ describe('upstream-ownership ratchet', () => {
       onDisk,
       `${MANIFEST_REL} is not in canonical form — do not hand-edit or reformat it, regenerate: ${REGENERATE_HINT}`,
     ).toBe(serializeManifest(manifest));
+    // One line per entry, a blank line between neighbours: git merges two
+    // hunks only when an unchanged base line separates them, so without the
+    // blank two PRs touching sort-adjacent paths conflict (#1099).
     const bodyLines = onDisk.trimEnd().split('\n').slice(1, -1);
-    expect(bodyLines.length, 'one line per file entry').toBe(entries.length);
+    expect(bodyLines.length, 'one line per file entry, a blank line between entries').toBe(2 * entries.length - 1);
+    expect(
+      bodyLines.filter((_, i) => i % 2 === 1).every((line) => line === ''),
+      'every other body line is the blank separator',
+    ).toBe(true);
   });
 
   it('every upstream-owned file matches the manifest — a divergence change without a regenerated manifest fails', () => {

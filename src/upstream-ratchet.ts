@@ -239,14 +239,21 @@ export function sealManifest(manifest: UpstreamRatchetManifest): UpstreamRatchet
 }
 
 /**
- * The manifest's ON-DISK form: ONE LINE PER FILE ENTRY, sorted by path.
+ * The manifest's ON-DISK form: ONE LINE PER FILE ENTRY, sorted by path, with
+ * a BLANK LINE between consecutive entries.
  *
  * `JSON.stringify(…, null, 2)` would spread every entry over four to six lines
  * and indent them, which makes this file a merge minefield: two PRs that each
  * regenerate it after touching unrelated upstream-owned files would collide on
- * the indented braces between their entries. One line per path means git's
- * line-level merge resolves them cleanly — two regenerations conflict only on
- * the paths they BOTH touched, which is exactly the case a human should look at.
+ * the indented braces between their entries. One line per path fixes that for
+ * paths far apart in sort order, but NOT for neighbours: git's three-way merge
+ * treats two hunks that ABUT in the base as one conflict, even when each side
+ * changed a different line. `poll-loop.ts` and `poll-loop.test.ts` sit on
+ * consecutive lines, so two PRs touching one each still conflicted (#1099). The
+ * blank separator is an unchanged base line between every pair of entries, so
+ * two regenerations conflict only on the paths they BOTH touched — which is
+ * exactly the case a human should look at, since the merged file's bytes are
+ * then something neither side hashed.
  *
  * The file carries `upstream`, `paths` and `files` and nothing else. No totals,
  * no counts, no timestamps: an aggregate would change on every regeneration
@@ -279,8 +286,10 @@ export function serializeManifest(manifest: UpstreamRatchetManifest): string {
     if (entry.deleted === true) fields.push('"deleted":true');
     if (entry.ignored === true) fields.push('"ignored":true');
     if (entry.binary === true) fields.push('"binary":true');
-    const comma = index === paths.length - 1 ? '' : ',';
-    lines.push(`${JSON.stringify(relPath)}:{${fields.join(',')}}${comma}`);
+    const last = index === paths.length - 1;
+    lines.push(`${JSON.stringify(relPath)}:{${fields.join(',')}}${last ? '' : ','}`);
+    // The separator that keeps neighbouring entries from abutting — see above.
+    if (!last) lines.push('');
   });
   lines.push('}}');
   return lines.join('\n') + '\n';

@@ -12,18 +12,31 @@ back toward upstream freely, and may only move further away as a named, justifie
 
 ```
 {"upstream":"b76fcb3db0236b36a4d50bed02e89eff472d0e67","paths":"04812c26…","files":{
-"assets/logo.png":{"diff":1,"mode":"100644","sha256":"…","binary":true},
 ".claude/scheduled_tasks.lock":{"diff":1,"mode":"100644","sha256":null,"deleted":true,"ignored":true},
+
+"assets/logo.png":{"diff":1,"mode":"100644","sha256":"…","binary":true},
+
 "docs/gone.md":{"diff":40,"mode":"100644","sha256":null,"deleted":true},
+
 "src/host-sweep.ts":{"diff":1504,"mode":"100644","sha256":"…"}
 }}
 ```
 
-**One line per file entry, sorted by path, and nothing but `upstream`, `paths` and `files`.** That layout is the
-point, not a quirk: pretty-printed JSON spreads each entry over four to six indented lines, so two PRs that
-each regenerate the manifest after touching unrelated upstream-owned files collide on the braces between
-their entries. One line per path lets git merge them, and two regenerations conflict only on the paths they
-**both** touched. The three top-level fields are `upstream` (the pinned commit), `paths` (the coverage
+**One line per file entry, sorted by path, a blank line between entries, and nothing but `upstream`, `paths`
+and `files`.** That layout is the point, not a quirk: pretty-printed JSON spreads each entry over four to six
+indented lines, so two PRs that each regenerate the manifest after touching unrelated upstream-owned files
+collide on the braces between their entries. One line per path fixes that only for paths far apart in sort
+order. Git's three-way merge treats two hunks that **abut** in the base as one conflict even when each side
+changed a different line, so `poll-loop.ts` and `poll-loop.test.ts`, which were consecutive lines, still
+conflicted (#1099). The blank separator is an unchanged base line between every pair of neighbours, so two
+regenerations conflict only on the paths they **both** touched.
+
+That remaining conflict is correct, not a leftover. When two PRs both edit the same upstream-owned file, the
+merged file's bytes are something neither side hashed, so a line-level auto-merge would leave a stale
+`sha256` on main that the host suite then fails on. Resolve it by merging the code and re-running `--write`
+on the merged tree. Taking either side's line without regenerating leaves the entry stale.
+
+The three top-level fields are `upstream` (the pinned commit), `paths` (the coverage
 seal) and `files`. No totals, no counts, no timestamps — an aggregate would change on every regeneration
 whatever moved, so every PR would conflict on it, and the report derives those numbers from the entries
 anyway. The seal is not an aggregate in that sense: it covers the key SET, not the entries' contents, so it
