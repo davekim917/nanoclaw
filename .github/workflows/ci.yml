@@ -17,7 +17,7 @@ permissions:
 # ~25 PRs a day, which burned ~1,750 min/day in mid-September 2026 — parallelism
 # and dropping `--coverage` were both measured and did not help (PR #873,
 # vitest.config.ts). So this workflow, the pull_request lane, is typechecks
-# plus one seconds-long drift test (~1.5 min): correctness before merge is the author's job — run the
+# plus three seconds-long tests (~1.5 min): correctness before merge is the author's job — run the
 # tests for what you touched locally (CLAUDE.md, Development). The full suite
 # lives in ci-full.yml (nightly + on demand) under its own workflow name; see
 # that file for why the name matters to the merge gate.
@@ -36,7 +36,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # Full history, as ci-full.yml's `correctness` job does and for the same
+      # reason: scripts/review-notes.test.ts (below) resolves every pinned
+      # `at <sha>` citation and, in a shallow clone, skips one it cannot
+      # resolve with only a warning. Costs a few seconds.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -66,9 +72,24 @@ jobs:
       - name: Typecheck container
         if: ${{ !cancelled() && steps.install.outcome == 'success' && steps.bun_install.outcome == 'success' }}
         run: pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
-      # The one test this lane runs (~seconds): .github/host-ci.sh must stay
+      # The tests this lane runs, each seconds-long and service-free.
+      # .github/host-ci.sh must stay
       # exactly this job's steps, and a drift found only by the nightly would
       # already have let a host-CI stand-in run less than CI does.
       - name: Host CI declaration mirrors this workflow
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm exec vitest run scripts/host-ci-declaration.test.ts --maxWorkers=1
+      # docs/review-notes fragments are usually added in a PR's last commit;
+      # with this check nightly-only, main went red twice on 2026-09-23 (#1089's
+      # fragment, then a stale citation). ~60 tests, ~8s, git-only.
+      - name: Review notes
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm exec vitest run scripts/review-notes.test.ts --maxWorkers=1
+      # src/upstream-ratchet.json must be regenerated whenever an upstream-owned
+      # file changes (CLAUDE.md); a stale hash (#1103) otherwise first shows at
+      # ci-full's drift tests. fs + crypto only, ~seconds. The GROWTH
+      # arithmetic (ratchet:report) still needs upstream objects and stays in
+      # ci-full.yml's `bookkeeping` job.
+      - name: Upstream ratchet is current
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm exec vitest run src/upstream-ratchet.test.ts --maxWorkers=1
