@@ -150,6 +150,67 @@ class FindingIssue(unittest.TestCase):
         self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
         self.assertEqual(len(self.filed()), 2)
 
+    def test_a_title_match_is_named_in_the_decision_and_the_pr_run_record(self):
+        prior = {"number": 5, "title": "Upload preview missing", "body": "a human's issue", "state": "open",
+                 "labels": [], "html_url": "https://github.test/issues/5"}
+        self.gh(labels=["severity:p3"], issues=[prior])
+        self.c.github(RUN, "synthesis", "issue:CF-1")
+        self.assertEqual(self.c.decisions[-1]["duplicateOf"], 5)
+        self.assertEqual(self.c.github(RUN, "synthesis", "pr-comment", hint={"verdict": "GO"}), "done")
+        [comment] = json.loads((self.state / "gh.json").read_text())["comments"]["7"]
+        self.assertIn("Finding CF-1: matched open issue #5 by title, not filed again", comment["body"])
+
+    def test_no_match_leaves_the_run_record_as_it_was(self):
+        self.gh(labels=["smoke-finding", "severity:p3"])
+        self.c.github(RUN, "synthesis", "issue:CF-1")
+        self.c.github(RUN, "synthesis", "pr-comment", hint={"verdict": "GO"})
+        [comment] = json.loads((self.state / "gh.json").read_text())["comments"]["7"]
+        self.assertNotIn("matched open issue", comment["body"])
+
+    def noise(self, n):
+        return [{"number": 1000 + k, "title": "Other finding {}".format(k), "body": "", "state": "open",
+                 "labels": ["smoke-finding"], "html_url": "https://github.test/issues/{}".format(1000 + k)}
+                for k in range(n)]
+
+    def test_dedup_lists_every_open_issue_without_search(self):
+        # A match far past any page size is found: one complete listing, no
+        # --label, no --search (both route gh through the search index).
+        match = {"number": 5, "title": "Upload preview missing", "body": "", "state": "open",
+                 "labels": ["smoke-finding"], "html_url": "https://github.test/issues/5"}
+        self.gh(labels=["smoke-finding", "severity:p3"], issues=self.noise(1500) + [match])
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        self.assertEqual(self.c.decisions[-1]["duplicateOf"], 5)
+        with open(os.environ["FAKE_LOG"]) as fh:
+            [argv] = [json.loads(line)["argv"] for line in fh if '"issue", "list"' in line]
+        self.assertNotIn("--label", argv)
+        self.assertNotIn("--search", argv)
+        self.assertEqual(argv[argv.index("--limit") + 1], str(ctl.ISSUE_DEDUP_LIMIT))
+
+    def test_a_listing_at_its_cap_never_files(self):
+        self.gh(labels=["smoke-finding", "severity:p3"], issues=self.noise(ctl.ISSUE_DEDUP_LIMIT))
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "intent")
+        self.assertEqual(len(self.filed()), ctl.ISSUE_DEDUP_LIMIT)
+        self.assertIn("cap; not filing", self.c.decisions[-1]["error"])
+
+    def test_a_non_ascii_title_dedups_by_normalized_equality(self):
+        run = Path(self.c.args.run_root) / RUN / "controller" / "issues"
+        (run / "CF-1.json").write_text(json.dumps({"title": "Aperçu du téléversement absent", "labels": []}))
+        match = {"number": 5, "title": "Aperçu du téléversement absent", "body": "", "state": "open",
+                 "labels": ["smoke-finding"], "html_url": "https://github.test/issues/5"}
+        self.gh(labels=["smoke-finding", "severity:p3"], issues=[match])
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        self.assertEqual(self.c.decisions[-1]["duplicateOf"], 5)
+
+    def test_a_label_listing_that_is_not_a_list_or_is_at_its_cap_is_unknown(self):
+        self.gh(labelListRaw='{"message": "Not Found"}')
+        self.assertIsNone(self.fx._labels_of("org/xzo"))
+        self.fx._repo_labels = {}
+        self.gh(labels=["label-{}".format(k) for k in range(1000)])
+        self.assertIsNone(self.fx._labels_of("org/xzo"))
+        self.fx._repo_labels = {}
+        self.gh(labels=["label-{}".format(k) for k in range(999)])
+        self.assertEqual(len(self.fx._labels_of("org/xzo")), 999)
+
     def test_a_recovered_listing_still_puts_the_dropped_note_in_the_filed_body(self):
         # Fire 1: the listing fails, the owner's labels go out unchanged, the
         # create is refused -- and its body payload is already on disk.

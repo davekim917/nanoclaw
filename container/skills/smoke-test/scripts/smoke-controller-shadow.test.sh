@@ -212,7 +212,7 @@ jq -e '.[0].name == "ctl-deadbeef-0a1b" and .[0].id == "ctl-deadbeef-0a1b"' "$OU
   || fail "series ids are passed as task names: $(cat "$OUT/wrapper/inputs/tasks.json")"
 fire FAKE_NCL=fail
 [ "$(d .skipped)" = "input fetch failed" ] || fail "ncl failure is decision-less: $DATA"
-# Once the controller has marked the intent ambiguous (smoke-campaign-controller.py:940-943)
+# Once the controller has marked the intent ambiguous (smoke-campaign-controller.py:943-946)
 # it never reconciles from tasks again, so ncl (and its transport writes) stop.
 jq -cn --arg run "$RUN" --arg k "$k" '{v:1,at:"2026-09-18T10:06:00Z",fire:"f",runId:$run,kind:"dispatch",slot:"critic",
   key:$k,state:"intent",attempt:1,mode:"shadow",detail:{ambiguous:true}}' >>"$OUT/journal.ndjson"
@@ -366,7 +366,7 @@ grep -q "exec 3>&1 1>&2" "$W" || fail "stdout must be moved to fd 3 before anyth
 # This wrapper used to keep its own allowlist of names owned by the INSTALL's
 # env file, so a key the install added -- SMOKE_GATE_LEASE_DIR -- was dropped
 # and the evidence barrier the controller step spawns with this environment
-# (smoke-campaign-controller.py:1902 -> spawn :692-704, env=None) fell back to
+# (smoke-campaign-controller.py:1940 -> spawn :692-704, env=None) fell back to
 # a lease dir holding no pin (smoke-evidence-barrier.sh:739). NOT_CONFIG is the
 # only thing withheld now, and it is ignored, exactly as an unlisted name was.
 new_case env-is-the-list
