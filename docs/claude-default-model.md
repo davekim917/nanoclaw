@@ -9,12 +9,13 @@ This section is the current migration. The model does not move: `DEFAULT_OPUS_MO
 **Detect.** These layers pin an effort. A Claude path with none of them set moves to `high`:
 - a session sticky `sticky_effort` (chat `-e`). A pure task fire ignores it (`effectiveTurnSettings`, `container/agent-runner/src/poll-loop.ts`);
 - `container.json` `providerConfig.effort`;
+- on a Codex-primary group, a Claude `providerFallback.effort`, which is used when that group falls back to Claude (`activeFallback?.effort`, `container/agent-runner/src/config.ts`);
 - channel wiring `default_effort`, then `container.json` `effort`, then legacy `defaultEffort`. The host folds these three into `NANOCLAW_EFFORT_OVERRIDE`, in that order (`effortLayers`, `src/claude-spawn-defaults.ts`);
 - a task `effort_pin`;
 - a subagent's frontmatter `effort:`.
 
 ```bash
-grep -HE '"(effort|defaultEffort)":' groups/*/container.json
+for f in groups/*/container.json; do jq -r '(if ((.provider // "claude") | ascii_downcase) == "claude" then [["effort", .effort], ["defaultEffort", .defaultEffort], ["providerConfig.effort", (.providerConfig // {}).effort]] else [] end) + (if (((.providerFallback // {}).provider // "") | ascii_downcase) == "claude" then [["providerFallback.effort (claude fallback)", .providerFallback.effort]] else [] end) | map(select(.[1] != null)) | .[] | "\(input_filename)\t\(.[0])=\(.[1])"' "$f"; done   # Claude-applicable only; a Codex group's own effort and a Codex fallback's effort are not listed
 pnpm exec tsx scripts/q.ts data/v2.db "select mga.id, mga.agent_group_id, mga.default_effort from messaging_group_agents mga where coalesce(mga.default_effort,'') <> ''"
 ncl tasks list --json   # rows with effort_pin
 grep -rHE '^effort:' groups/*/.claude/agents                                    # project scope
@@ -42,7 +43,7 @@ ncl tasks update --id <series> --group <group-id> --effort medium
 pnpm exec tsx scripts/q.ts data/v2.db "select model, effort, count(*), round(avg(cost_usd),3) from turn_usage where provider='claude' and ts > '<restart time>' group by 1,2"
 ```
 
-**Success check (one week after the restart).** The rework signal was never measured directly, so judge this change on two numbers from `turn_usage`, for the coordinator group whose rework prompted the change (main-model rows only; baselines below are from the install that made this decision). Compare a 7-day window after the restart against the baselines below:
+**Success check (one week after the restart).** The rework signal was never measured directly, so judge this change on two numbers from `turn_usage`, for the coordinator group whose rework prompted the change (main-model rows only; baselines below are from the install that made this decision). Compare a 7-day window after the restart against the baselines below. The rework query counts only `high` turns, because adopted containers keep running `medium` until they respawn:
 
 | Metric | Opus 5 / `high` (2026-09-15 → 09-22) | Opus 5.5 / `medium` (09-22 → 09-24) |
 |---|---|---|
@@ -51,7 +52,7 @@ pnpm exec tsx scripts/q.ts data/v2.db "select model, effort, count(*), round(avg
 
 ```bash
 # rework proxy: turns per human-touched thread, and how many of them were human
-pnpm exec tsx scripts/q.ts data/v2.db "with s as (select session_id, sum(trigger='human') h, count(*) n from turn_usage where agent_group_id='<group-id>' and model='claude-opus-5-5[1m]' and ts > '<restart>' group by 1 having h>0) select count(*), round(avg(n),2), round(avg(h),2) from s"
+pnpm exec tsx scripts/q.ts data/v2.db "with s as (select session_id, sum(trigger='human') h, count(*) n from turn_usage where agent_group_id='<group-id>' and model='claude-opus-5-5[1m]' and effort='high' and ts > '<restart>' group by 1 having h>0) select count(*), round(avg(n),2), round(avg(h),2) from s"
 # cost per turn
 pnpm exec tsx scripts/q.ts data/v2.db "select effort, count(*), round(avg(cost_usd),3) from turn_usage where agent_group_id='<group-id>' and model='claude-opus-5-5[1m]' and ts > '<restart>' group by 1"
 ```

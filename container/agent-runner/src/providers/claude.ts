@@ -3758,7 +3758,7 @@ export class ClaudeProvider implements AgentProvider {
       // requests mirror interactive Claude Code's /model. Re-runs the same
       // effort resolution chain as query() so a model switch without an
       // explicit -e lands on the new model's family default (e.g. -m fable
-      // mid-turn → fable@medium, not fable@inherited-xhigh).
+      // mid-turn → fable@high, not fable@inherited-xhigh).
       applySettings: async (s) => {
         // `s.model === undefined` means LEAVE THE LIVE MODEL UNCHANGED, and
         // that is not an inconsistency with query creation — it is what every
