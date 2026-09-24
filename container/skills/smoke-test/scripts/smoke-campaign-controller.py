@@ -1629,23 +1629,23 @@ def resolve_labels(wanted, repo_labels):
     is `severity:p3`). So a label the repo lacks is dropped, never sent; a
     bare severity shorthand `P<n>` maps to the repo's `severity:p<n>` when
     that label exists. Matching is case-insensitive and sends the repo's own
-    spelling. `smoke-finding` is the controller's label (dedup keys on it)
-    and is always kept. repo_labels None = the listing failed: send the
-    labels unchanged, and a refusal surfaces through the create's stderr."""
+    spelling. `smoke-finding` gets no exemption: a repo without it wedges the
+    create the same way, and the title dedup that lists by it then finds
+    nothing (`gh issue list --label <absent>` is `[]`, rc 0) while the marker
+    search still bounds the create. repo_labels None = the listing failed:
+    send the labels unchanged, and a refusal surfaces through the create's
+    stderr."""
     if repo_labels is None:
         return list(wanted), [], []
     canon = {name.lower(): name for name in repo_labels}
     kept, mapped, dropped = [], [], []
     for label in wanted:
-        if label == "smoke-finding":
-            name = label
-        else:
-            name = canon.get(label.lower())
-            m = re.match(r"^[Pp]([0-9])$", label)
-            if name is None and m:
-                name = canon.get("severity:p" + m.group(1))
-                if name is not None:
-                    mapped.append("{}->{}".format(label, name))
+        name = canon.get(label.lower())
+        m = re.match(r"^[Pp]([0-9])$", label)
+        if name is None and m:
+            name = canon.get("severity:p" + m.group(1))
+            if name is not None:
+                mapped.append("{}->{}".format(label, name))
         if name is None:
             dropped.append(label)
         elif name not in kept:

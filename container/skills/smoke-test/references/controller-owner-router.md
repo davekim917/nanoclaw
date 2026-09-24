@@ -159,10 +159,10 @@ suppress it.
 - File or comment on GitHub, or close a PR. Write
   `<run>/controller/issues/<findingId>.json` instead, and the controller files
   it. Its `labels` are the repo's own label names, with severity as
-  `severity:p<n>`, never a bare `P<n>`. The controller always adds
-  `smoke-finding`, maps a bare `P<n>` to `severity:p<n>` when the repo has it,
-  and drops any label the repo lacks (noting it in the issue body), because
-  GitHub refuses the whole create over one unknown label.
+  `severity:p<n>`, never a bare `P<n>`. The controller adds `smoke-finding`,
+  maps a bare `P<n>` to `severity:p<n>` when the repo has it, and drops any
+  label the repo lacks, `smoke-finding` included (noting it in the issue
+  body), because GitHub refuses the whole create over one unknown label.
 - Dispatch the design critic or the adjudicator. The controller runs both as
   fresh one-shots. To ask for adjudication, write
   `<run>/controller/adjudication-request.md` naming the disputed findings and

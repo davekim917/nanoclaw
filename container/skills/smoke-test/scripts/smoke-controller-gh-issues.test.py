@@ -27,7 +27,7 @@ FAKES = HERE / "testdata" / "controller-live-fakes.py"
 class ResolveLabels(unittest.TestCase):
     def test_maps_severity_shorthand_drops_unknown_keeps_repo_spelling(self):
         kept, mapped, dropped = ctl.resolve_labels(["smoke-finding", "P3", "UI", "nope", "ui"],
-                                                   ["severity:p3", "ui", "bug"])
+                                                   ["smoke-finding", "severity:p3", "ui", "bug"])
         self.assertEqual(kept, ["smoke-finding", "severity:p3", "ui"])
         self.assertEqual(mapped, ["P3->severity:p3"])
         self.assertEqual(dropped, ["nope"])
@@ -35,6 +35,10 @@ class ResolveLabels(unittest.TestCase):
     def test_shorthand_without_a_severity_label_is_dropped_and_an_exact_p_label_is_kept(self):
         self.assertEqual(ctl.resolve_labels(["P1"], ["bug"]), ([], [], ["P1"]))
         self.assertEqual(ctl.resolve_labels(["P1"], ["P1", "severity:p1"]), (["P1"], [], []))
+
+    def test_smoke_finding_is_dropped_like_any_label_the_repo_lacks(self):
+        self.assertEqual(ctl.resolve_labels(["smoke-finding", "P3"], ["severity:p3"]),
+                         (["severity:p3"], ["P3->severity:p3"], ["smoke-finding"]))
 
     def test_listing_failed_sends_labels_unchanged(self):
         self.assertEqual(ctl.resolve_labels(["smoke-finding", "P3"], None), (["smoke-finding", "P3"], [], []))
@@ -120,6 +124,13 @@ class FindingIssue(unittest.TestCase):
         [(trigger, detail)] = self.c.alarms
         self.assertEqual(trigger, "controller_obligation_overdue")
         self.assertEqual(detail["error"], err)
+
+    def test_a_repo_without_smoke_finding_still_gets_its_issue(self):
+        self.gh(labels=["severity:p3"])
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        [issue] = self.filed()
+        self.assertEqual(issue["labels"], ["severity:p3"])
+        self.assertIn("`smoke-finding`", issue["body"])
 
     def test_a_recovered_listing_still_puts_the_dropped_note_in_the_filed_body(self):
         # Fire 1: the listing fails, the owner's labels go out unchanged, the
