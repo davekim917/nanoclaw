@@ -1222,7 +1222,7 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     ...(attempt === undefined ? {} : { run_attempt: attempt }),
   });
   function quickRun(root: string, jobs = quickJobs(), attempt = 1, name = 'CI', startedAt = '2026-09-05T00:01:00Z'): Page {
-    const run = { ...workflowRun(name, 'completed', 'failure', startedAt), run_attempt: attempt };
+    const run: Page = { ...workflowRun(name, 'completed', 'failure', startedAt), run_attempt: attempt };
     writeJson(root, `jobs--${run.id as number}--attempt-${attempt}.json`, { total_count: jobs.length, jobs });
     return run;
   }
@@ -1551,7 +1551,7 @@ describe('codex-review ci-wait: a quick-tier head requests the full suite', () =
     const root = tempRoot();
     writeJson(root, 'pr.json', ciPr());
     // Lint (not required) failed on attempt 2 per the listing; /jobs has moved on to attempt 3.
-    const lint = { ...workflowRun('Lint', 'completed', 'failure', '2026-09-05T00:03:00Z'), run_attempt: 2 };
+    const lint: Page = { ...workflowRun('Lint', 'completed', 'failure', '2026-09-05T00:03:00Z'), run_attempt: 2 };
     const lintId = lint.id as number;
     writeJson(root, `jobs--${lintId}--attempt-1.json`, { total_count: 1, jobs: [neverStarted(1)] });
     writeJson(root, `jobs--${lintId}--attempt-2.json`, { total_count: 1, jobs: [job('lint', 'failure')] });
