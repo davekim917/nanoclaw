@@ -27,7 +27,9 @@ export const OPENCODE_MODEL_SLUG_RE = /^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._/
  * Codex FAMILY aliases (`sol`, `luna`, `astra`, `terra`). The host stores a
  * family name as typed so a pin follows the next release of that family, and
  * hands the current name → id map to every container as
- * NANOCLAW_CODEX_MODEL_ALIASES (`CODEX_FAMILY_DEFAULTS`, src/flag-parser.ts).
+ * NANOCLAW_CODEX_MODEL_ALIASES (`CODEX_FAMILY_DEFAULTS`, src/flag-parser.ts:128),
+ * emitted by `codexFamilyAliasEnv` (src/container-runner.ts:282) from both
+ * spawn branches (src/container-runner.ts:6486 wiki, :6588 ordinary).
  * The Codex CLI has no alias mechanism, so the provider resolves through this
  * before anything reaches the app-server. The names are listed here too so a
  * family pin is still recognised as Codex when the env is missing (a container

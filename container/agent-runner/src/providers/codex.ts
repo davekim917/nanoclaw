@@ -410,7 +410,7 @@ export function materializeRawImageGeneration(
  * The unpinned Codex fleet default: gpt-6-sol at `high` reasoning (operator
  * decision 2026-09-22, replacing gpt-5.6-sol; gpt-5.6-terra at `xhigh` before
  * 2026-09-16). Keep it equal to the `sol` family target
- * (`CODEX_FAMILY_DEFAULTS`, src/flag-parser.ts; setup/lib/codex-model-min-cli.test.ts
+ * (`CODEX_FAMILY_DEFAULTS`, src/flag-parser.ts:128; setup/lib/codex-model-min-cli.test.ts
  * fails when they differ).
  *
  * These are the ONLY fleet defaults for Codex. A group pins with
@@ -1088,7 +1088,8 @@ export class CodexProvider implements AgentProvider {
     // strict schema and the `gpt-*` guard see it.
     if (typeof rawSticky.model === 'string') {
       rawSticky.model = resolveCodexFamily(rawSticky.model);
-      // Unresolved only when the host sent no alias map (an older host).
+      // Unresolved only when the host sent no alias map (a host predating
+      // src/container-runner.ts:6486/:6588, i.e. an adopted container).
       // Never hand the app-server a bare family word.
       if (isCodexFamilyName(rawSticky.model as string)) {
         console.error(`[codex-provider] Ignoring unresolved Codex family alias "${rawSticky.model}"`);

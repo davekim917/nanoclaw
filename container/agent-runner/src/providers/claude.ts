@@ -2435,7 +2435,8 @@ function defaultEffortForModel(model: string | undefined): string | undefined {
   // Sonnet 5 (the bare `sonnet` alias resolves to it) defaults to xhigh.
   if (m === 'sonnet' || m.startsWith('claude-sonnet-')) return 'xhigh';
   // Bare `fable` is a family alias (the CLI resolves it through
-  // ANTHROPIC_DEFAULT_FABLE_MODEL); before 2026-09-24 it never reached here
+  // ANTHROPIC_DEFAULT_FABLE_MODEL, set at src/claude-spawn-defaults.ts:254);
+  // before 2026-09-24 it never reached here
   // bare and fell through to `high`.
   if (m === 'fable' || m.startsWith('claude-fable-')) return 'medium';
   if (m === 'haiku' || m.startsWith('claude-haiku-')) return undefined;
