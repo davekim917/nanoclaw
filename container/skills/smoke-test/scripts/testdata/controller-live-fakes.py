@@ -211,15 +211,14 @@ def gh(argv):
         f = fault("gh:issue-list")
         if f == "fail-before":
             return "fail", out_err("HTTP 502")
-        want, search = opt(argv, "--label"), opt(argv, "--search")
-        # Search matches the phrase literally (a JSON-escaped query finds
-        # nothing) and cannot see issues listed in `unindexed`, as GitHub's
-        # search index lags a fresh create.
-        phrase = search.rsplit(" in:title", 1)[0].strip().strip('"').lower() if search else None
-        hits = [{"number": i["number"], "title": i["title"], "url": i["html_url"]}
-                for i in db["issues"] if i["state"] == "open" and (want is None or want in i.get("labels", []))
-                and (phrase is None or (phrase in i["title"].lower()
-                                        and i["number"] not in db.get("unindexed", [])))]
+        # --label and --search would send real gh through the search API
+        # (list.go:235-244, gh v2.101.0); the controller passes neither, and
+        # this fake refuses them so a regression is loud.
+        if opt(argv, "--label") or opt(argv, "--search"):
+            return "refused", out_err("fake gh: issue list --label/--search goes through search; not supported")
+        hits = [{"number": i["number"], "title": i["title"], "url": i["html_url"],
+                 "labels": [{"name": n} for n in i.get("labels", [])]}
+                for i in db["issues"] if i["state"] == "open"]
         print(json.dumps(hits[:int(opt(argv, "--limit") or 30)]))
         return "list", 0
     if argv[:2] == ["label", "list"]:

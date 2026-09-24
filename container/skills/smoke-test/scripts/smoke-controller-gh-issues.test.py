@@ -167,71 +167,39 @@ class FindingIssue(unittest.TestCase):
         [comment] = json.loads((self.state / "gh.json").read_text())["comments"]["7"]
         self.assertNotIn("matched open issue", comment["body"])
 
-    def test_a_match_past_the_listing_cap_is_found_by_title_search(self):
-        noise = [{"number": 1000 + k, "title": "Other finding {}".format(k), "body": "", "state": "open",
-                  "labels": ["smoke-finding"], "html_url": "https://github.test/issues/{}".format(1000 + k)}
-                 for k in range(500)]
-        match = {"number": 5, "title": "Upload preview missing", "body": "", "state": "open",
-                 "labels": ["smoke-finding"], "html_url": "https://github.test/issues/5"}
-        self.gh(labels=["smoke-finding", "severity:p3"], issues=noise + [match])
-        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
-        self.assertEqual(self.c.decisions[-1]["duplicateOf"], 5)
-        self.assertEqual(len(self.filed()), 501)
-
-    def test_a_near_miss_from_title_search_is_not_a_match(self):
-        # `in:title` search is tokenized and fuzzy: it only narrows candidates,
-        # and normalized-title equality still decides the match.
-        noise = [{"number": 1000 + k, "title": "Other finding {}".format(k), "body": "", "state": "open",
-                  "labels": ["smoke-finding"], "html_url": "https://github.test/issues/{}".format(1000 + k)}
-                 for k in range(500)]
-        near = {"number": 6, "title": "Upload preview missing on mobile", "body": "", "state": "open",
-                "labels": ["smoke-finding"], "html_url": "https://github.test/issues/6"}
-        self.gh(labels=["smoke-finding", "severity:p3"], issues=noise + [near])
-        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
-        self.assertNotIn("duplicateOf", self.c.decisions[-1])
-        self.assertEqual(self.filed()[-1]["title"], "Upload preview missing")
-        with open(os.environ["FAKE_LOG"]) as fh:
-            searched = [json.loads(line)["argv"] for line in fh if "--search" in line]
-        self.assertEqual(len(searched), 1)  # the near miss really came back from the search
-
-    def test_a_title_search_at_its_cap_never_files(self):
-        # 1000 open issues all match the search phrase, none the exact title:
-        # a full search is not proof of absence, so nothing is created.
-        crowd = [{"number": 2000 + k, "title": "Upload preview missing variant {}".format(k), "body": "",
-                  "state": "open", "labels": ["smoke-finding"], "html_url": "https://github.test/issues/{}".format(2000 + k)}
-                 for k in range(1000)]
-        self.gh(labels=["smoke-finding", "severity:p3"], issues=crowd)
-        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "intent")
-        self.assertEqual(len(self.filed()), 1000)
-        self.assertIn("1000-result cap", self.c.decisions[-1]["error"])
-
     def noise(self, n):
         return [{"number": 1000 + k, "title": "Other finding {}".format(k), "body": "", "state": "open",
                  "labels": ["smoke-finding"], "html_url": "https://github.test/issues/{}".format(1000 + k)}
                 for k in range(n)]
 
-    def test_a_match_on_the_full_page_wins_even_when_search_cannot_see_it(self):
-        # Newest-first: a just-created duplicate is on the page but not yet in
-        # the search index. The page decides; search is never consulted.
-        fresh = {"number": 5, "title": "Upload preview missing", "body": "", "state": "open",
+    def test_dedup_lists_every_open_issue_without_search(self):
+        # A match far past any page size is found: one complete listing, no
+        # --label, no --search (both route gh through the search index).
+        match = {"number": 5, "title": "Upload preview missing", "body": "", "state": "open",
                  "labels": ["smoke-finding"], "html_url": "https://github.test/issues/5"}
-        self.gh(labels=["smoke-finding", "severity:p3"], issues=[fresh] + self.noise(499), unindexed=[5])
+        self.gh(labels=["smoke-finding", "severity:p3"], issues=self.noise(1500) + [match])
         self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
         self.assertEqual(self.c.decisions[-1]["duplicateOf"], 5)
         with open(os.environ["FAKE_LOG"]) as fh:
-            self.assertFalse(any("--search" in line for line in fh))
+            [argv] = [json.loads(line)["argv"] for line in fh if '"issue", "list"' in line]
+        self.assertNotIn("--label", argv)
+        self.assertNotIn("--search", argv)
+        self.assertEqual(argv[argv.index("--limit") + 1], str(ctl.ISSUE_DEDUP_LIMIT))
 
-    def test_a_non_ascii_title_is_searched_as_written(self):
+    def test_a_listing_at_its_cap_never_files(self):
+        self.gh(labels=["smoke-finding", "severity:p3"], issues=self.noise(ctl.ISSUE_DEDUP_LIMIT))
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "intent")
+        self.assertEqual(len(self.filed()), ctl.ISSUE_DEDUP_LIMIT)
+        self.assertIn("cap; not filing", self.c.decisions[-1]["error"])
+
+    def test_a_non_ascii_title_dedups_by_normalized_equality(self):
         run = Path(self.c.args.run_root) / RUN / "controller" / "issues"
         (run / "CF-1.json").write_text(json.dumps({"title": "Aperçu du téléversement absent", "labels": []}))
         match = {"number": 5, "title": "Aperçu du téléversement absent", "body": "", "state": "open",
                  "labels": ["smoke-finding"], "html_url": "https://github.test/issues/5"}
-        self.gh(labels=["smoke-finding", "severity:p3"], issues=self.noise(500) + [match])
+        self.gh(labels=["smoke-finding", "severity:p3"], issues=[match])
         self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
         self.assertEqual(self.c.decisions[-1]["duplicateOf"], 5)
-        with open(os.environ["FAKE_LOG"]) as fh:
-            [argv] = [json.loads(line)["argv"] for line in fh if "--search" in line]
-        self.assertIn('"Aperçu du téléversement absent" in:title', argv)
 
     def test_a_label_listing_that_is_not_a_list_or_is_at_its_cap_is_unknown(self):
         self.gh(labelListRaw='{"message": "Not Found"}')
