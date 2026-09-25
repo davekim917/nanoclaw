@@ -13,6 +13,10 @@
 import Database from 'better-sqlite3';
 
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from '../../db/schema.js';
+import {
+  migrateDeliveredTable as migrateUpstreamDeliveredColumns,
+  migrateMessagesInTable as migrateUpstreamMessagesInColumns,
+} from '../../mailbox/sqlite/session-db.js';
 
 /** Apply the inbound or outbound schema to a DB file. Idempotent. */
 export function ensureSchema(dbPath: string, schema: 'inbound' | 'outbound'): void {
@@ -64,15 +68,10 @@ export function migrateSessionRoutingTable(db: Database.Database): void {
 
 /** Ensure the delivered table has columns added after initial schema. */
 export function migrateDeliveredTable(db: Database.Database): void {
+  migrateUpstreamDeliveredColumns(db);
   const cols = new Set(
     (db.prepare("PRAGMA table_info('delivered')").all() as Array<{ name: string }>).map((c) => c.name),
   );
-  if (!cols.has('platform_message_id')) {
-    db.prepare('ALTER TABLE delivered ADD COLUMN platform_message_id TEXT').run();
-  }
-  if (!cols.has('status')) {
-    db.prepare("ALTER TABLE delivered ADD COLUMN status TEXT NOT NULL DEFAULT 'delivered'").run();
-  }
   if (!cols.has('error')) {
     db.prepare('ALTER TABLE delivered ADD COLUMN error TEXT').run();
   }
@@ -146,29 +145,10 @@ function installRepoIngressFenceGuards(db: Database.Database): void {
 // DBs). No-op on fresh installs where the columns are in the baseline schema.
 // Backfills existing rows so invariants hold (series_id = id).
 export function migrateMessagesInTable(db: Database.Database): void {
+  migrateUpstreamMessagesInColumns(db);
   const cols = new Set(
     (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((c) => c.name),
   );
-  if (!cols.has('series_id')) {
-    db.prepare('ALTER TABLE messages_in ADD COLUMN series_id TEXT').run();
-    db.prepare('UPDATE messages_in SET series_id = id WHERE series_id IS NULL').run();
-    db.prepare('CREATE INDEX IF NOT EXISTS idx_messages_in_series ON messages_in(series_id)').run();
-  }
-  if (!cols.has('trigger')) {
-    // All pre-existing rows got written with the old "every inbound wakes
-    // the agent" semantics, so backfill 1 and default 1 for new inserts.
-    db.prepare('ALTER TABLE messages_in ADD COLUMN trigger INTEGER NOT NULL DEFAULT 1').run();
-  }
-  if (!cols.has('source_session_id')) {
-    // For agent-to-agent return-path routing. NULL on existing rows is fine —
-    // their replies fall back to the legacy "newest active session" lookup.
-    db.prepare('ALTER TABLE messages_in ADD COLUMN source_session_id TEXT').run();
-  }
-  if (!cols.has('on_wake')) {
-    // 1 = only deliver on the container's first poll (fresh start).
-    // All existing rows are normal messages, so default 0.
-    db.prepare('ALTER TABLE messages_in ADD COLUMN on_wake INTEGER NOT NULL DEFAULT 0').run();
-  }
   if (!cols.has('scheduled_for')) {
     // ALTER and backfill in ONE transaction. SQLite makes DDL transactional,
     // and better-sqlite3 nests via SAVEPOINT, so this is safe wherever the
