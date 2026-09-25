@@ -1,7 +1,7 @@
 /**
  * Raw-access ratchet for the mailbox seam.
  *
- * scripts/mailbox-seam-ratchet-scan.ts finds every non-test .ts file, outside
+ * `computeOffenders` finds every non-test .ts file, outside
  * the mailbox driver and the fork's mailbox module, that still touches raw
  * session-DB internals or receives a passed session handle. That set must
  * shrink monotonically as the mailbox-seam PR series (docs/specs/upstream-mailbox-seam/plan.md)

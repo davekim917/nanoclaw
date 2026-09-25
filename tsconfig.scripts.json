@@ -8,17 +8,5 @@
     "sourceMap": false
   },
   "include": ["scripts/**/*.ts", "setup/**/*.ts", "src/test-setup.ts"],
-  "exclude": [
-    "node_modules",
-    "dist",
-    // TODO(#335): these are pre-v2-launch manual E2E scripts that have
-    // drifted from current APIs (ChannelSetup, PollLoopConfig,
-    // MessagingGroupAgent) and/or reach into container/agent-runner (a
-    // separate Bun tree whose bun:sqlite / Bun globals don't resolve under
-    // this Node tsconfig). Fixing them is a rewrite, not a typecheck fix —
-    // see PR body for the itemized list.
-    "scripts/test-v2-agent.ts",
-    "scripts/test-v2-channel-e2e.ts",
-    "scripts/test-v2-host.ts"
-  ]
+  "exclude": ["node_modules", "dist"]
 }
