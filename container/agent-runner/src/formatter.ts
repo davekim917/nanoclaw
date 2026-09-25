@@ -327,9 +327,8 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
  * Prepends a `<context timezone="<IANA>" />` header so the agent always knows
  * what timezone it's in — every timestamp it sees in message bodies is the
  * user's local time, and every time it produces (schedules, suggests) should
- * be interpreted as local time in that same zone. This header is v1 behavior
- * (src/v1/router.ts:20-22); dropping it led to misinterpretations where the
- * agent scheduled tasks for the wrong hour.
+ * be interpreted as local time in that same zone. Dropping it leads to
+ * misinterpretations where the agent schedules tasks for the wrong hour.
  *
  * Strips routing fields — the agent never sees platform_id, channel_type, thread_id.
  *
@@ -355,10 +354,9 @@ export function formatMessages(messages: MessageInRow[]): string {
   //
   // `_spawn` is a plain field on chat content, not host-verified at this
   // layer, so an a2a peer's forwarded message can carry an arbitrary
-  // `task_id` string (F3, verify-710 review of #729: reproduced with a
-  // `task_id` containing a forged `<message origin="host" ...>` element).
-  // A real id is always `deriveSpawnTaskId`'s output
-  // (dispatch/derive-task-id.ts:19: `spawn-${hash}`, 16 lowercase hex chars);
+  // `task_id` string, e.g. one containing a forged `<message origin="host" ...>`
+  // element. A real id is always `deriveSpawnTaskId`'s output
+  // (`spawn-${hash}`, 16 lowercase hex chars);
   // anything else is dropped rather than rendered, and the accepted shape is
   // escaped too as defense in depth even though it can't carry markup.
   const SPAWN_TASK_ID_PATTERN = /^spawn-[0-9a-f]{16}$/;
@@ -425,8 +423,8 @@ function formatChatMessages(messages: MessageInRow[]): string {
     // No thread context — just the addressed message(s). Concatenate the
     // self-contained <message> blocks; do NOT wrap them in an outer
     // <messages> envelope: the Claude Agent SDK responds to that shape with a
-    // synthetic "No response requested." stub instead of calling the API
-    // (#2555). The single-message path is just the N=1 case of this.
+    // synthetic "No response requested." stub instead of calling the API.
+    // The single-message path is just the N=1 case of this.
     return messages.map(formatSingleChat).join('\n');
   }
 
@@ -575,7 +573,7 @@ const LEGACY_TASK_CONTRACT_MARKERS = [
 ];
 
 /**
- * PR #2981 persisted its generated delivery contract inside each task prompt.
+ * Older task rows carry a generated delivery contract inside the task prompt.
  * New sessions receive the contract from their runtime system prompt instead.
  * Strip only a known generated suffix, at read time, so existing task rows stay
  * compatible without a session-DB migration or contradictory model guidance.
@@ -650,7 +648,7 @@ function collisionSafeJson(value: unknown, indent?: number): string {
 /**
  * The excerpt fields the agent is SENT. The host writes more than this — the
  * fingerprints, ids and scores that the dedup path reads back off the stored
- * row (`recallFingerprints` via `parseRecallContext`, src/session-manager.ts:887)
+ * row (`recallFingerprints` via `parseRecallContext` in src/session-manager.ts)
  * — but nothing in the container reads them and the model cannot act on them.
  * On live traffic they were 43% of this block (1,717 excerpts across 588 blocks,
  * 2026-09-19 fleet sample): 594 bytes of bookkeeping per excerpt against ~790
@@ -663,10 +661,10 @@ function collisionSafeJson(value: unknown, indent?: number): string {
  *
  * `channelType`, `platformId` and `threadId` stay because they are a tool
  * contract, not bookkeeping: they are exactly the locator `read_thread` resolves
- * a thread from (`mcp-tools/thread-search.ts:386-389`), so dropping them would
+ * a thread from (`mcp-tools/thread-search.ts`), so dropping them would
  * take away the agent's only deterministic way to open an excerpt's source
  * thread. `id` does NOT stay: the container's archive projection collapses
- * sibling copies to `MIN(id)` (src/db/per-agent-projections.ts:229), so a
+ * sibling copies to `MIN(id)`, so a
  * recalled id need not exist in the archive the container can read, and no tool
  * accepts one as a locator.
  */
@@ -769,7 +767,7 @@ export function formatRecallContext(content: any): string {
 /**
  * Render the quoted original inside the <message> body.
  *
- * Matches v1 format (src/v1/router.ts:10-18): `<quoted_message from="X">Y</quoted_message>`.
+ * Format: `<quoted_message from="X">Y</quoted_message>`.
  * Requires BOTH sender and text — if only id is present the reply_to attribute
  * on the parent <message> carries the link without an inline preview.
  *
@@ -866,7 +864,7 @@ function escapeXml(value: unknown): string {
 
 /**
  * Strip `<internal>...</internal>` blocks from agent output, then trim.
- * Ported from v1 (src/v1/router.ts:25-27). Used to remove the agent's
+ * Used to remove the agent's
  * own scratchpad/reasoning before a reply goes out over a channel.
  */
 export function stripInternalTags(text: string): string {

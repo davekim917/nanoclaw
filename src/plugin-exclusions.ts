@@ -13,13 +13,12 @@
  * Bun package tree with no shared module resolution; a byte-identical file with
  * no imports is the only form that can be checked for parity mechanically.
  *
- * WHY THE CONTAINER, not the host. #826 tried to honour a sub-plugin entry
- * host-side, by binding an empty directory over the excluded path before the
- * container started. Three review rounds returned the same class of P1: the
- * host was predicting what three independent in-container walkers would
- * resolve, and the two namespaces disagree (a container-absolute symlink is
- * absent to the host's `statSync`, a nested pair emits a mountpoint under a
- * read-only bind, …). The mechanism came out. Each walker now answers the
+ * WHY THE CONTAINER, not the host. Honouring a sub-plugin entry host-side, by
+ * binding an empty directory over the excluded path before the container
+ * starts, means the host predicting what three independent in-container
+ * walkers would resolve, and the two namespaces disagree (a container-absolute
+ * symlink is absent to the host's `statSync`, a nested pair emits a mountpoint
+ * under a read-only bind, …). Each walker instead answers the
  * question in the namespace where the paths actually resolve, against a path it
  * built itself — never a `realpath` of host state.
  */
@@ -40,12 +39,9 @@
  * `readContainerConfig` throws on every read — which is a fail-closed guard
  * refusing a legitimate state rather than a bad input.
  *
- * Earlier revisions of #826 also refused a backslash, a control character and a
- * colon in a sub-path entry, because a sub-path was interpolated into a mask
- * mount's container path and thence into `-v <host>:<container>:ro`. That mask
- * mechanism is gone, and this PR does not bring it back: a sub-path entry is
- * still never interpolated into a mount argument. It is compared as a string
- * against a path each walker assembled from `readdirSync` names
+ * A backslash, a control character and a colon are not refused either: a
+ * sub-path entry is never interpolated into a mount argument. It is compared
+ * as a string against a path each walker assembled from `readdirSync` names
  * (`isExcludedPluginPath`), and joined onto a host path whose result is then
  * `realpath`-contained (`src/claude-md-compose.ts`). Backslash, newline and DEL
  * are all legal bytes in a Linux directory name, so refusing them would be the
@@ -208,7 +204,7 @@ export function splitExcludedPlugins(entries: readonly string[] | undefined): Ex
  * namespace doing the walking. Never pass a `realpath`, an absolute path, or a
  * path resolved in a different mount namespace: the covering relation is string
  * containment on segments, and resolving the string first is exactly the
- * host-side prediction #826 removed.
+ * cross-namespace prediction described above.
  *
  * Ancestor coverage runs from the repo root down to and including `relPath`
  * itself, so excluding `bootstrap/plugins` withholds `bootstrap/plugins/x` and

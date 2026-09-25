@@ -4,16 +4,16 @@
  * conversation only when it is (host src/modules/scheduling/fresh-context.ts):
  *   - marked `continuous: true` (`ncl tasks create|update --continuous`);
  *   - a keyed `ncl tasks dispatch` event (`content.dispatch`), whose context key
- *     exists so events of one phase share a session (docs/keyed-task-dispatch.md:3); or
+ *     exists so events of one phase share a session; or
  *   - a retry of an interrupted fire (`tries > 0`).
  *
  * Only a batch made entirely of such fresh task rows resets, the same
- * conservative rule `quietStatus` follows (formatter.ts:287-308): any non-task
+ * conservative rule `quietStatus` follows (formatter.ts): any non-task
  * row in the batch (a chat message, a `wait` wake, a recovery notice) is input
  * to the existing conversation, and resetting under it would drop the memory
  * that row was sent to. System rows (recall context) are ignored, as there.
  * Task rows only ever land in their series' own task session (host
- * `resolveTaskSession`, src/session-manager.ts:429-445), never a chat session —
+ * `resolveTaskSession`), never a chat session —
  * so a thread-bound row (`thread_id` set by `--thread` / `--thread-id`) starts
  * fresh too: the thread is where it posts, not a conversation it resumes.
  */
@@ -44,7 +44,7 @@ export function isFreshContextTaskBatch(messages: MessageInRow[]): boolean {
 /**
  * Earlier work in this session that still needs its conversation: a queued or
  * running `continue_work` record, or a `wait` wake that is not yet due (host
- * row `schedule-wake-<id>`, src/modules/scheduled-wake/index.ts:96). A fire
+ * row `schedule-wake-<id>`). A fire
  * that comes due meanwhile resumes instead of resetting under that work, so
  * the wake or continuation later lands in the conversation that set it.
  */

@@ -1,14 +1,12 @@
 /**
  * Shared wording for telling a replayed turn that its credential was
  * rotated out from under it. Single-sourced because two providers hit this:
- * `claude.ts` rotates via `ClaudeProvider.rotateApiKey`
- * (providers/claude.ts:2308), and `poll-loop.ts`'s in-turn retry builds the
- * replay prompt with this notice in `formatCredentialRetryPrompt`
- * (poll-loop.ts:135). `codex.ts` rotates CODEX_HOME identities inline inside
- * its own `query()` generator — the rotation call is
- * `self.rotateCodexHome()` (providers/codex.ts:1455) — and appends this
- * notice itself to whatever prompt `resolveCodexRestartTransition` produces
- * for the resumed/restarted thread (providers/codex.ts:1537).
+ * `claude.ts` rotates via `ClaudeProvider.rotateApiKey`, and `poll-loop.ts`'s
+ * in-turn retry builds the replay prompt with this notice in
+ * `formatCredentialRetryPrompt`. `codex.ts` rotates CODEX_HOME identities
+ * inline inside its own `query()` generator — the rotation call is
+ * `self.rotateCodexHome()` — and appends this notice itself to whatever prompt
+ * `resolveCodexRestartTransition` produces for the resumed/restarted thread.
  *
  * Why this exists at all: a rotation replays the SAME conversation history
  * on a healthy credential, but the agent's own prior turn is still sitting
@@ -20,10 +18,9 @@
  * continuing on the credential that is now serving it fine.
  *
  * The wording is deliberately NOT "you hit a usage limit": poll-loop rotates
- * on every error `ClaudeProvider.isRetryable` accepts (providers/claude.ts:2264-2272
- * — 429/rate limit, overloaded, upstream_error, quota) except the ones
- * `isTransientOverload` recognises first (poll-loop.ts:836, poll-loop.ts:1008-1011),
- * so the failure that triggered the swap may have been an upstream error
+ * on every error `ClaudeProvider.isRetryable` accepts (429/rate limit,
+ * overloaded, upstream_error, quota) except the ones `isTransientOverload`
+ * recognises first, so the failure that triggered the swap may have been an upstream error
  * rather than a limit. The notice therefore names the failure class
  * generically and only asserts what is true on every path: the previous
  * credential failed, this attempt runs on a different one, and any limit text
@@ -31,9 +28,8 @@
  *
  * Same rule for the subagent sentence. Subagents die with the provider
  * process on both paths — Claude's abort tears the CLI down via
- * `queryAbortController` (created and passed at providers/claude.ts:2517-2526,
- * fired by the query's `abort()` at providers/claude.ts:2999-3007) and Codex kills the
- * app-server (`killCodexAppServer`, providers/codex-app-server.ts:257-263) —
+ * `queryAbortController` (fired by the query's `abort()`) and Codex kills the
+ * app-server (`killCodexAppServer`) —
  * but neither path signals a process group or verifies descendants, so a
  * backgrounded shell command may outlive the attempt. The notice therefore
  * does NOT claim those were terminated; it tells the agent to check before

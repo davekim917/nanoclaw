@@ -8,7 +8,7 @@
  * message into the session a reply in the card's thread would reach.
  *
  * A kind='system' row never touches the chat budget (admitChatWrite returns
- * early for anything but kind 'chat', modules/mailbox/index.ts:117-118), so a
+ * early for anything but kind 'chat'), so a
  * muted task can still post a card — the same lane escalate_to_owner uses.
  */
 import { writeMessageOut } from '../db/messages-out.js';

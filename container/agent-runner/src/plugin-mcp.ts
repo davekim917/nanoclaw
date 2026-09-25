@@ -32,7 +32,7 @@ export function resolvePluginServer(config: McpServerConfig): McpServerConfig {
   // guards host-side mutations (`assertMcpServerNotPluginOwned` reads
   // container.json) and must never reach a provider's server map. Stripped
   // only when present, so an unmarked server is still returned by identity
-  // and every narrowing below is untouched (#500).
+  // and every narrowing below is untouched.
   if ((config as { plugin?: string }).plugin !== undefined) {
     const { plugin: _owner, ...unmarked } = config as McpServerConfig & { plugin?: string };
     return resolvePluginServer(unmarked as McpServerConfig);

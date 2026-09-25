@@ -8,8 +8,8 @@
  *     --text-file <path> --thread-key <runId> --run-id <runId> --fire <fire> \
  *     [--fingerprint <fp>] [--file <abs path>]... [--outbox-root <dir>]
  *
- * in the task's own session, the same transport `ncl` uses (cli/ncl.ts:
- * 272-273): the task-script process starts the session mailbox itself. The
+ * in the task's own session, the same transport `ncl` uses: the task-script
+ * process starts the session mailbox itself. The
  * runner source is a boot snapshot (src/agent-runner-source.ts), so a change
  * here reaches containers only after a host restart.
  *
@@ -17,18 +17,16 @@
  * destination, stage attachments at <outbox>/<id>/<name>, write one
  * messages_out row the host drains with no agent turn. Four differences:
  *
- *  - `to` is required (task sessions must name it, core.ts:214-216) and the
+ *  - `to` is required (task sessions must name it) and the
  *    thread key (the run id) is required, so every post of a run threads
  *    across fires (src/db/thread-key-anchors.ts).
- *  - The id is the caller's `<obligation key>#<attempt>`, not a random one
- *    (core.ts:291), and the row is written with INSERT ... ON CONFLICT(id) DO
+ *  - The id is the caller's `<obligation key>#<attempt>`, not a random one,
+ *    and the row is written with INSERT ... ON CONFLICT(id) DO
  *    NOTHING, then read back. An identical existing row is `replay` (exit 0);
  *    a different payload under the same id is an error and is never
- *    overwritten. A plain INSERT would throw on replay
- *    (mailbox/sqlite/operations.ts:148-166).
+ *    overwritten. A plain INSERT would throw on replay.
  *  - It does not go through the fork's per-turn chat budget
- *    (NanoclawAgentMailbox.writeMessageOut -> admitChatWrite,
- *    modules/mailbox/index.ts:303-306), which is the MODEL's budget and
+ *    (NanoclawAgentMailbox.writeMessageOut -> admitChatWrite), which is the MODEL's budget and
  *    silently returns -1 when refused. The controller has its own, enforced
  *    here in the same transaction as the insert: per run per fire, per run,
  *    per alarm fingerprint. A replay never consumes budget.
@@ -65,7 +63,7 @@ export const CONTROLLER_SEND_BUDGET = { perFire: 4, perRun: 15, perFingerprint: 
 const ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}#[1-9][0-9]{0,2}$/;
 const RUN_ID_PATTERN = /^[A-Za-z0-9._-]{1,200}$/;
 const FINGERPRINT_PATTERN = /^[A-Za-z0-9._:-]{1,160}$/;
-const MAX_FILE_BYTES = 50 * 1024 * 1024; // send_file's cap (core.ts:36)
+const MAX_FILE_BYTES = 50 * 1024 * 1024; // send_file's cap
 const DEFAULT_OUTBOX_ROOT = '/workspace/outbox';
 
 export interface EnqueueSendInput {
@@ -100,7 +98,7 @@ interface Routing {
 }
 
 /**
- * The named-destination branch of core.ts resolveRouting (core.ts:242-256):
+ * The named-destination branch of core.ts resolveRouting:
  * a channel keeps the session's thread only when it is the session's own
  * chat; an agent destination never carries a thread. The parity test in
  * enqueue-send.test.ts holds this to send_message's actual row.
@@ -136,7 +134,7 @@ function readAttachment(filePath: string): StagedFile {
   } catch {
     throw new EnqueueSendError('invalid', `attachment not found: ${filePath}`);
   }
-  // Same allowlist as send_file (core.ts:62-67), checked on the real path so
+  // Same allowlist as send_file, checked on the real path so
   // a symlink under /workspace cannot carry a host file out.
   if (!isAllowedFilePath(real)) throw new EnqueueSendError('invalid', `attachment path not allowed: ${filePath}`);
   const stat = fs.statSync(real);

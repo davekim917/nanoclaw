@@ -26,24 +26,24 @@
  * insertDeferredMessageWithContextIfNew, writeSessionMessage,
  * writeSessionMessageIfNew, and the two raw-SQL task inserters):
  *
- *   - 'chat'     — src/router.ts:1419 (event.message.kind, InboundEvent.message.kind
+ *   - 'chat'     — src/router.ts (event.message.kind, InboundEvent.message.kind
  *                  typed 'chat' | 'chat-sdk' in src/channels/adapter.ts) and ~20 more
  *                  writeSessionMessage call sites across host-sweep.ts, delivery,
  *                  orchestrator-dispatch, self-mod, approvals, repository-workspaces,
  *                  scheduled-wake, agent-to-agent, support-threads, host-restart-warn,
  *                  cli/resources/groups.ts, dashboard/steer.ts, container-restart.ts,
  *                  modules/scheduling/recurrence.ts.
- *   - 'chat-sdk' — src/router.ts:1419 (same InboundEvent path, Chat SDK adapters).
- *   - 'system'   — src/modules/interactive/index.ts:38, src/modules/orchestrator-dispatch/
- *                  cancellation.ts:65, src/cli/delivery-action.ts:44,
- *                  src/modules/repository-workspaces/index.ts:482, and the recall-context
- *                  marker rows built in src/session-manager.ts:560 and
- *                  src/db/session-db.ts:598-613 (id prefix `recall-`, not a distinct kind).
- *   - 'task'     — src/modules/scheduling/db.ts:44 and src/db/scheduled-tasks.ts:289
+ *   - 'chat-sdk' — src/router.ts (same InboundEvent path, Chat SDK adapters).
+ *   - 'system'   — src/modules/interactive/index.ts, src/modules/orchestrator-dispatch/
+ *                  cancellation.ts, src/cli/delivery-action.ts,
+ *                  src/modules/repository-workspaces/index.ts, and the recall-context
+ *                  marker rows built in src/session-manager.ts and
+ *                  src/db/session-db.ts (id prefix `recall-`, not a distinct kind).
+ *   - 'task'     — src/modules/scheduling/db.ts and src/db/scheduled-tasks.ts
  *                  (both raw `INSERT INTO messages_in (...) VALUES (..., 'task', ...)`,
  *                  not through the named insert functions above).
  *   - 'webhook'  — no live writer found on this install, but it is the fork's own
- *                  declared closed set too: src/types.ts:284
+ *                  declared closed set too: src/types.ts
  *                  `export type MessageInKind = 'chat' | 'chat-sdk' | 'task' | 'webhook' | 'system';`
  *                  Kept in the set on that authority, not the (currently zero) measurement.
  *

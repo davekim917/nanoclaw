@@ -7,14 +7,14 @@
  * slack-user-token` on every spawn: the exact notice that once led an agent to
  * conclude Slack was down when `curl https://slack.com/api/*` worked. Slack
  * access is the proxy-injected token, withheld per session by the host
- * (src/container-runner.ts:6941; docs/slack-user-token.md), so dropping the
+ * (docs/slack-user-token.md), so dropping the
  * name here removes no capability.
  */
 export const RETIRED_MCP_SERVER_NAMES: ReadonlySet<string> = new Set(['slack-user-token']);
 
 /**
  * Remove every retired name from the merged server map, in place, logging each
- * one. Applied once (container/agent-runner/src/index.ts:257), after
+ * one. Applied once (container/agent-runner/src/index.ts), after
  * `container.json` and `NANOCLAW_MCP_SERVERS` are merged, so no source of MCP
  * config can bring a retired server back.
  */

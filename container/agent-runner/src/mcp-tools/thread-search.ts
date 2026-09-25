@@ -43,7 +43,7 @@ function getDb(): Database | null {
  * `null` drops it so the next call opens the path again. Tests must use this
  * rather than `mock.module('bun:sqlite')`: bun module mocks are process-global
  * and `mock.restore()` does not undo them, so every later test file's session
- * DBs would be built from the mock class (issue #1076).
+ * DBs would be built from the mock class.
  */
 export function _setArchiveDbForTest(db: Database | null): void {
   _db = db;
