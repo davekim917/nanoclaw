@@ -108,11 +108,39 @@ describe("adder", () => {
     ['a matcher', 'expect(add(2, 2)).toEqual(4);', 'expect(add(2, 2)).toBeDefined();'],
     ['a matcher argument', 'expect(add(2, 2)).toEqual(4);', 'expect(add(2, 2)).toEqual(expect.any(Number));'],
     ['a removed assertion', 'expect(add(2, 2)).toEqual(4);', ''],
-    ['a case-local expected value', 'const expected = 3;', 'const expected = add(1, 2);'],
   ])('flags %s as a changed assertion', async (_name, from, to) => {
     const result = await judge({ 'src/a.test.ts': SUITE }, { 'src/a.test.ts': SUITE.replace(from, to) });
     expect(result.findings).toEqual([expect.objectContaining({ case: 'adder › adds', kind: 'assertion-changed' })]);
     expect(result.summary).toContain('src/a.test.ts › adder › adds: 1 assertion removed or changed');
+  });
+
+  it('flags a changed case-local expected value as changed setup', async () => {
+    const result = await judge(
+      { 'src/a.test.ts': SUITE },
+      { 'src/a.test.ts': SUITE.replace('const expected = 3;', 'const expected = add(1, 2);') },
+    );
+    expect(result.findings).toEqual([expect.objectContaining({ case: 'adder › adds', kind: 'setup-changed' })]);
+  });
+
+  it('flags the value under test replaced by a constant, with its assertion untouched', async () => {
+    const before = `it('computes', () => {\n  const actual = subject();\n  expect(actual).toBe(1);\n});\n`;
+    const result = await judge({ 'src/c.test.ts': before }, { 'src/c.test.ts': before.replace('subject()', '1') });
+    expect(result.findings).toEqual([expect.objectContaining({ case: 'computes', kind: 'setup-changed' })]);
+  });
+
+  it('flags a changed in-case mock with its assertion untouched, and ignores an added setup line', async () => {
+    const before = `it('reads', () => {\n  vi.mocked(load).mockReturnValue(null);\n  expect(read()).toBeNull();\n});\n`;
+    const changed = before.replace('mockReturnValue(null)', 'mockReturnValue(undefined)');
+    const grown = before.replace('  expect(', '  const unused = 1;\n  expect(');
+    const flagged = await judge({ 'src/r.test.ts': before }, { 'src/r.test.ts': changed });
+    expect(flagged.findings).toEqual([
+      expect.objectContaining({
+        case: 'reads',
+        kind: 'setup-changed',
+        change: '1 setup statement changed or removed, e.g. vi.mocked(load).mockReturnValue(null);',
+      }),
+    ]);
+    expect((await judge({ 'src/r.test.ts': before }, { 'src/r.test.ts': grown })).verdict).toBe('clean');
   });
 
   it('flags a changed multiline matcher argument', async () => {

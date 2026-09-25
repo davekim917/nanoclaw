@@ -4,9 +4,10 @@
  *
  * Compares the tests a PR already had (at the merge base) with the same tests
  * at its head, syntax-aware, so formatting and moved-but-unchanged code never
- * count. It says `review` for a removed or changed assertion, a removed case or
- * `.each` row, an added `.skip`/`.todo`/`.fails`/`.skipIf`/`.runIf`, a changed
- * or removed fixture, helper or test-config statement, and for anything it
+ * count. It says `review` for a removed or changed assertion, a changed or
+ * removed setup statement inside a case, a removed case or `.each` row, an
+ * added `.skip`/`.todo`/`.fails`/`.skipIf`/`.runIf`, a changed or removed
+ * fixture, helper or test-config statement, and for anything it
  * cannot analyse (an unsupported language, a parse error, a failed read). It
  * says `refuse` for any `.only` in a test file the PR touches. It is a review
  * trigger, never a verdict on whether the change is legitimate.
@@ -82,11 +83,12 @@ function parse(ts, file, text) {
   return sf;
 }
 
-/** A formatting-free rendering of a node: comments, whitespace, quotes and parentheses do not show. */
-function canon(ts, node) {
+/** A formatting-free rendering of a node: comments, whitespace, quotes and parentheses do not show. Nodes in `hidden` render as a placeholder. */
+function canon(ts, node, hidden = null) {
   const K = ts.SyntaxKind;
   const out = [];
   const visit = (n) => {
+    if (hidden?.has(n)) return out.push('<assertion>');
     if (ts.isParenthesizedExpression(n)) return visit(n.expression);
     switch (n.kind) {
       case K.StringLiteral:
@@ -185,8 +187,8 @@ function chainRoot(ts, node) {
   return ts.isIdentifier(n) ? n.text : null;
 }
 
-/** Every assertion in `body`, as {canon, text}: an expect/assert chain up to its last call, plus the case-local declarations its matcher arguments name. */
-function assertions(ts, body) {
+/** The outermost expect/assert chain of every assertion in `body`, each up to its last call. */
+function assertionNodes(ts, body) {
   const tops = new Set();
   const visit = (n) => {
     if (ts.isCallExpression(n) && ASSERT_ROOTS.has(chainRoot(ts, n.expression) ?? '')) {
@@ -209,45 +211,22 @@ function assertions(ts, body) {
     for (let p = top.parent; p && p !== body; p = p.parent) if (tops.has(p)) return true;
     return false;
   };
-  return [...tops]
-    .filter((top) => !nested(top))
-    .map((top) => {
-      const names = new Set();
-      const collect = (n) => {
-        if (ts.isIdentifier(n)) names.add(n.text);
-        ts.forEachChild(n, collect);
-      };
-      for (
-        let c = top;
-        ts.isCallExpression(c) || ts.isPropertyAccessExpression(c) || ts.isNonNullExpression(c);
-        c = c.expression
-      )
-        if (ts.isCallExpression(c) && !ASSERT_ROOTS.has(ts.isIdentifier(c.expression) ? c.expression.text : ''))
-          c.arguments.forEach(collect);
-      const locals = [];
-      for (const name of [...names].sort()) {
-        const decl = localDeclaration(ts, top, name, body);
-        if (decl) locals.push(`${name}=${canon(ts, decl)}`);
-      }
-      return { canon: [canon(ts, top), ...locals].join(' | '), text: oneLine(top.getText()) };
-    });
+  return new Set([...tops].filter((top) => !nested(top)));
 }
 
-function localDeclaration(ts, from, name, stop) {
-  for (let n = from.parent; n; n = n.parent) {
-    if (ts.isBlock(n))
-      for (const st of n.statements) {
-        if (!ts.isVariableStatement(st)) continue;
-        for (const d of st.declarationList.declarations) if (bindsName(ts, d.name, name)) return d;
-      }
-    if (n === stop) return null;
+/** A case's assertions, and the rest of its body statement by statement with each assertion as a placeholder. */
+function caseBody(ts, fn) {
+  const tops = assertionNodes(ts, fn);
+  const asserts = [...tops].map((top) => ({ canon: canon(ts, top), text: oneLine(top.getText()) }));
+  const statements = ts.isBlock(fn.body) ? fn.body.statements : [fn.body];
+  const setup = [];
+  for (const st of statements) {
+    let e = ts.isExpressionStatement(st) ? st.expression : st;
+    if (ts.isAwaitExpression(e)) e = e.expression;
+    if (tops.has(e)) continue;
+    setup.push({ canon: canon(ts, st, tops), text: oneLine(st.getText()) });
   }
-  return null;
-}
-
-function bindsName(ts, binding, name) {
-  if (ts.isIdentifier(binding)) return binding.text === name;
-  return binding.elements.some((e) => !ts.isOmittedExpression(e) && bindsName(ts, e.name, name));
+  return { asserts, setup };
 }
 
 function containsTestCall(ts, node) {
@@ -323,7 +302,7 @@ function testFile(ts, file, sf) {
           rows: t.rows,
           full: canon(ts, n),
           body: t.fn ? canon(ts, t.fn) : null,
-          asserts: t.kind === 'case' && t.fn ? assertions(ts, t.fn) : [],
+          ...(t.kind === 'case' && t.fn ? caseBody(ts, t.fn) : { asserts: [], setup: [] }),
         };
         units.push(unit);
         if (t.fn) {
@@ -395,6 +374,13 @@ function compareCases(baseUnits, headUnits, headPathOf, findings) {
           ...where,
           kind: 'assertion-changed',
           change: `${plural(gone.length, 'assertion')} removed or changed, e.g. ${gone[0].text}`,
+        });
+      const changed = missing(b.setup, h.setup);
+      if (changed.length)
+        findings.push({
+          ...where,
+          kind: 'setup-changed',
+          change: `${plural(changed.length, 'setup statement')} changed or removed, e.g. ${changed[0].text}`,
         });
     }
     if (b.rows) {
