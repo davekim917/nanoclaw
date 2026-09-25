@@ -20,6 +20,7 @@ describe('the hygiene checks cannot be weakened without review', () => {
     'knip.json',
     'container/agent-runner/knip.json',
     '.jscpd.json',
+    'src/design-artifact-loop-vendor.ts',
     '.github/workflows/ci.yml',
     '.github/workflows/ci-full.yml',
     '.github/host-ci.sh',

@@ -183,6 +183,7 @@
     "src/delivery-guard.ts": 100,
     "src/delivery.ts": 76.88,
     "src/deploy-crash-guard.ts": 90.12,
+    "src/design-artifact-loop-vendor.ts": 32,
     "src/group-init.ts": 86.42,
     "src/guard/guard-actions.ts": 100,
     "src/guard/guard.ts": 100,
