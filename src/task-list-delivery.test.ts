@@ -29,10 +29,8 @@ import {
   createAgentGroup,
   createMessagingGroup,
   createMessagingGroupAgent,
-  initTestDb,
-  runMigrations,
+  initMigratedTestDb,
 } from './db/index.js';
-import { getRawDb } from './db/connection.js';
 import { getDeliveredIds } from './modules/mailbox/ops/delivery.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { resolveSession } from './session-manager.js';
@@ -177,8 +175,7 @@ async function delivered(sessionId: string): Promise<Set<string>> {
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
   _clearSecretsForTest();
   _clearTaskListCooldownsForTest();
 });
