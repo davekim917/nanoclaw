@@ -15,10 +15,10 @@
  * and every optional field tolerates `null` because the schema marks them
  * nullable.
  *
- * Why this mirrors the Claude `usage_pull` path (providers/claude.ts): Codex
- * turns had zero rate-limit visibility — 561 turns in a week with every
- * `turn_usage.rate_limit_*` NULL, the only signal a post-hoc `systemError`
- * once the wall was already hit. The protocol exposes the data; this asks.
+ * Why this exists: Codex turns had zero rate-limit visibility — 561 turns in a
+ * week with every `turn_usage.rate_limit_*` NULL, the only signal a post-hoc
+ * `systemError` once the wall was already hit. The protocol exposes the data;
+ * this asks.
  */
 import type { AccountIdentity, RateLimitSample, RateLimitSampleSource } from '../modules/mailbox/index.js';
 
@@ -191,7 +191,7 @@ export function mergeCodexRateLimitSnapshot(
 
 /**
  * Translate a snapshot into `rate_limit_samples` rows, one per window, in the
- * exact shape the Claude provider writes (`usageResponseToSamples`,
+ * same shape as the Claude provider's per-window rows (`unifiedWindowsToSamples`,
  * providers/claude.ts) so one query reads both providers:
  * `utilization` is the 0-1 fraction, `limit_type` is `five_hour`/`seven_day`.
  * A snapshot with no window still records that the pull happened

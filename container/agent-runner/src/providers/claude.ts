@@ -64,7 +64,6 @@ export function claudeContextOccupancy(
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { CLAUDE_FAMILY_ALIAS_ENV } from './model-vocabulary.js';
 import { shimCwd } from './cwd-shim.js';
-import { parseSlotUsageSurvey, surveyEntryToUsageResponse, SLOT_USAGE_SURVEY_ENV } from './claude-slot-usage.js';
 import { attachTurnEffort } from './turn-effort.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import { MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
@@ -117,6 +116,12 @@ export interface SdkRateLimitInfo {
   utilization?: number;
   errorCode?: string;
   overageDisabledReason?: string;
+  /**
+   * Per-window readings from the response headers. Internal to the SDK (absent
+   * from its public types), so `unknown`: read only through
+   * `unifiedWindowsToSamples`, which feature-detects the shape.
+   */
+  unifiedWindows?: unknown;
 }
 
 /**
@@ -149,29 +154,89 @@ export function classifyRateLimitEvent(
 }
 
 /**
- * Structured `/usage` response — the plan-utilization PULL.
+ * Plan utilization per window, from the response headers — no request of our
+ * own.
  *
- * `rate_limit_event` above is EVENT-GATED: the SDK emits it only when there
- * is something to warn about, so utilization readings existed only for
- * accounts already past ~84%. Measured live 2026-08-25: one agent group had
- * 29 readings (0.84 -> 0.96) and every other group, including the heaviest,
- * had zero. No baseline, no trajectory. This control request answers for
- * every window on every account regardless of utilization.
+ * `rate_limit_info.unifiedWindows` is `{ five_hour, seven_day,
+ * seven_day_overage_included }`, each `{ utilization, resetsAt }`, parsed by
+ * the CLI from the `anthropic-ratelimit-unified-*` headers of inference calls
+ * it already makes. The CLI emits an event whenever a window's rounded
+ * percentage or reset moves, so this covers accounts nowhere near a limit; the
+ * top-level `utilization` is set only past a warning threshold.
  *
- * Typed structurally rather than imported from the SDK: the method is
- * explicitly experimental and the shape is documented as unstable, and a
- * removed type export would break `bun run typecheck` on an otherwise fine
- * SDK bump. Only the fields read below are declared.
+ * Do not reintroduce a `/api/oauth/usage` pull (the SDK `get_usage` request):
+ * ring slots are `claude setup-token` credentials scoped `user:inference`
+ * only, and that endpoint needs `user:profile`. It answers 403, and the 403s
+ * drain its per-token limiter into a 429 with a retry-after near an hour.
+ *
+ * The field is internal to the SDK and can change without notice, so it is
+ * parsed defensively: anything that is not an object of entries with a finite
+ * numeric `utilization` yields no row, never a throw. Window names pass
+ * through as sent. `utilization` is a 0-1 fraction that can exceed 1 (usage
+ * past a window's cap) and is stored as sent; `resetsAt` is epoch seconds.
  */
-interface SdkUsageWindow {
-  /** Percentage 0-100 (NOT the 0-1 fraction rate_limit_event reports). */
-  utilization?: number | null;
-  resets_at?: string | null;
+export function unifiedWindowsToSamples(windows: unknown, who: AccountIdentity): RateLimitSample[] {
+  if (typeof windows !== 'object' || windows === null || Array.isArray(windows)) return [];
+  const rows: RateLimitSample[] = [];
+  for (const [limitType, window] of Object.entries(windows as Record<string, unknown>)) {
+    if (typeof window !== 'object' || window === null) continue;
+    const { utilization, resetsAt } = window as { utilization?: unknown; resetsAt?: unknown };
+    if (typeof utilization !== 'number' || !Number.isFinite(utilization)) continue;
+    rows.push({
+      source: 'rate_limit_headers',
+      ...who,
+      subscriptionType: null,
+      available: true,
+      limitType,
+      utilization,
+      resetsAt: typeof resetsAt === 'number' ? resetsAtIso(resetsAt) : null,
+      status: null,
+    });
+  }
+  return rows;
 }
-interface SdkUsageResponse {
-  subscription_type?: string | null;
-  rate_limits_available?: boolean;
-  rate_limits?: Record<string, SdkUsageWindow | null | undefined> | null;
+
+/** Log once per container when an OAuth session's events stop carrying windows. */
+let warnedNoUnifiedWindows = false;
+
+/** Test-only: re-arm the one-shot "no unifiedWindows" log. */
+export function _resetUnifiedWindowsWarningForTesting(): void {
+  warnedNoUnifiedWindows = false;
+}
+
+/**
+ * Rows for one `rate_limit_event`: the top-level row (it carries the SDK
+ * `status`, which no per-window row has), plus one `rate_limit_headers` row
+ * per window when `unifiedWindows` is present. Never throws — a shape change
+ * must not fail the turn.
+ */
+export function rateLimitEventToSamples(info: SdkRateLimitInfo | undefined, who: AccountIdentity): RateLimitSample[] {
+  const rows: RateLimitSample[] = [
+    {
+      source: 'rate_limit_event',
+      ...who,
+      subscriptionType: null,
+      available: true,
+      limitType: info?.rateLimitType ?? null,
+      utilization: info?.utilization ?? null,
+      resetsAt: resetsAtIso(info?.resetsAt),
+      status: info?.status ?? null,
+    },
+  ];
+  let windows: RateLimitSample[] = [];
+  try {
+    windows = unifiedWindowsToSamples(info?.unifiedWindows, who);
+  } catch (err) {
+    log(`unifiedWindows unreadable (top-level row only): ${err instanceof Error ? err.message : String(err)}`);
+  }
+  // Only an OAuth session is expected to carry windows (the SDK documents the
+  // field as always absent for API-key, Bedrock and Vertex). Logged once, so a
+  // CLI that stops sending it is visible without flooding the log.
+  if (windows.length === 0 && who.account !== null && !warnedNoUnifiedWindows) {
+    warnedNoUnifiedWindows = true;
+    log('rate_limit_event carried no usable unifiedWindows — recording the top-level reading only');
+  }
+  return rows.concat(windows);
 }
 
 /**
@@ -196,119 +261,6 @@ export function laneForSlot(declaration: string | undefined, slotName: string | 
   return null;
 }
 
-const USAGE_CONTROL_METHOD = 'usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET';
-
-/**
- * Feature-detect the experimental usage control request, bound to its query.
- *
- * NEVER call this method by name without the check. The SDK's own doc comment
- * says the name WILL change when the API stabilizes, and
- * `container/agent-runner` is a read-only bind mount that deploys on the next
- * container respawn with NO build step — so a rename does not fail at build
- * time, it throws inside every live container on the fleet. Absent method =>
- * null => capture silently degrades to the `rate_limit_event` path, which is
- * exactly today's behavior.
- */
-export function planUsagePuller(q: unknown): (() => Promise<SdkUsageResponse>) | null {
-  const fn = (q as Record<string, unknown> | null | undefined)?.[USAGE_CONTROL_METHOD];
-  return typeof fn === 'function' ? () => (fn as () => Promise<SdkUsageResponse>).call(q) : null;
-}
-
-/**
- * Translate one `/usage` response into sample rows.
- *
- * `rate_limits_available: false` (API key, Bedrock, Vertex, or a missing
- * profile scope) is a NORMAL answer, not an error — it yields one row with
- * `available: false` so "plan limits do not apply here" is recorded as a
- * fact. Never sampling at all yields no row. Collapsing those two states is
- * the absent-vs-empty bug class; keep them apart.
- *
- * A window the plan omits or reports as null is skipped rather than written
- * as a null reading. If that leaves nothing, one `available: true` row with
- * no window still records that the pull happened.
- *
- * Every pull row whose `utilization` is NULL says WHY in `status` — the
- * column that already exists to explain a row. Without it the three states
- * are indistinguishable to anyone reading the table who does not already
- * know what `available` means: they all look like a missing number.
- */
-export function usageResponseToSamples(res: SdkUsageResponse, who: AccountIdentity): RateLimitSample[] {
-  const base = {
-    source: 'usage_pull' as const,
-    ...who,
-    subscriptionType: res.subscription_type ?? null,
-    status: null,
-  };
-  if (res.rate_limits_available !== true || !res.rate_limits) {
-    return [
-      { ...base, available: false, limitType: null, utilization: null, resetsAt: null, status: 'not_applicable' },
-    ];
-  }
-  const rows: RateLimitSample[] = [];
-  for (const [limitType, w] of Object.entries(res.rate_limits)) {
-    if (!w || typeof w.utilization !== 'number') continue;
-    rows.push({
-      ...base,
-      available: true,
-      limitType,
-      // 0-100 here, 0-1 in storage (matching turn_usage.rate_limit_utilization
-      // and rate_limit_event). Normalize at the seam, once.
-      utilization: w.utilization / 100,
-      resetsAt: w.resets_at ?? null,
-    });
-  }
-  if (rows.length === 0) {
-    return [{ ...base, available: true, limitType: null, utilization: null, resetsAt: null, status: 'no_window' }];
-  }
-  return rows;
-}
-
-/**
- * One pull per session per interval. The call is a network round-trip to the
- * claude.ai usage endpoint, so doing it every turn would put telemetry on the
- * hot path; utilization does not move meaningfully faster than this anyway.
- * Module scope IS per-session scope — one container serves exactly one session.
- */
-const USAGE_PULL_MIN_INTERVAL_MS = 5 * 60_000;
-
-/**
- * Deadline for one pull. The throttle above bounds how OFTEN we call; it says
- * nothing about how LONG a call takes, and those are different failure modes —
- * the one that bites is a call that neither resolves nor rejects.
- *
- * The SDK imposes no deadline of its own. Verified in sdk.mjs: `Query.request`
- * stores the resolver in `pendingControlResponses` keyed by request id and
- * settles ONLY when a matching control response arrives, or when the transport
- * closes and sweeps every pending entry. There is no timer anywhere on that
- * path. So an unanswered `get_usage` leaks a pending promise and a map entry
- * for the container's whole life.
- *
- * 10s is generous for a telemetry round-trip and far below the 5-minute
- * throttle, so a permanently hung endpoint can never accumulate more than one
- * in-flight pull.
- */
-const USAGE_PULL_TIMEOUT_MS = 10_000;
-
-let lastUsagePullAt = 0;
-let warnedNoUsagePuller = false;
-let usagePullTimeoutMs = USAGE_PULL_TIMEOUT_MS;
-
-/**
- * Reject `p` if it has not settled within `ms`. A timed-out pull is NOT
- * SAMPLED — no row is written, exactly as for a transport error, and still
- * distinct from the `available: false` row that means "plan limits do not
- * apply here". Three states: sampled, not applicable, not sampled.
- */
-export function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout>;
-  return Promise.race([
-    p,
-    new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`usage pull exceeded ${ms}ms`)), ms);
-    }),
-  ]).finally(() => clearTimeout(timer));
-}
-
 /**
  * Test-only override for the SDK `query` that `ClaudeProvider.query` calls.
  * The real one spawns the Claude Code CLI (`pathToClaudeCodeExecutable`
@@ -326,40 +278,6 @@ let sdkQueryOverride: typeof sdkQuery | null = null;
  */
 export function _setSdkQueryForTesting(impl?: typeof sdkQuery): void {
   sdkQueryOverride = impl ?? null;
-}
-
-/**
- * Test-only: clear the pull throttle between cases. `timeoutMs` shortens the
- * deadline so the hang path is testable without a 10s wait.
- */
-export function _resetUsagePullThrottleForTesting(timeoutMs: number = USAGE_PULL_TIMEOUT_MS): void {
-  lastUsagePullAt = 0;
-  warnedNoUsagePuller = false;
-  usagePullTimeoutMs = timeoutMs;
-}
-
-/**
- * Sample plan utilization, throttled. Fire-and-forget on purpose: a slow or
- * failed usage call must never delay or fail the turn it was sampled from —
- * this is telemetry, not correctness.
- */
-function samplePlanUsage(q: unknown, who: AccountIdentity, now = Date.now()): void {
-  if (now - lastUsagePullAt < USAGE_PULL_MIN_INTERVAL_MS) return;
-  const pull = planUsagePuller(q);
-  if (!pull) {
-    // Log once, or an SDK rename silently reverts the fleet to event-only
-    // capture and nobody notices for weeks.
-    if (!warnedNoUsagePuller) {
-      warnedNoUsagePuller = true;
-      log(`SDK exposes no ${USAGE_CONTROL_METHOD}() — rate-limit capture falls back to rate_limit_event only`);
-    }
-    return;
-  }
-  // Advance BEFORE awaiting so a slow pull can't let a second one stack up.
-  lastUsagePullAt = now;
-  void withDeadline(pull(), usagePullTimeoutMs)
-    .then((res) => recordRateLimitSamples(usageResponseToSamples(res, who)))
-    .catch((err) => log(`rate-limit usage pull failed (telemetry only): ${err instanceof Error ? err.message : err}`));
 }
 
 /** Max chars per thinking label. Bumped from 500 — thinking prose is usually
@@ -2621,8 +2539,8 @@ export class ClaudeProvider implements AgentProvider {
    * position hint it can re-derive by rotating.
    *
    * This is the only thing that moves the ring at boot. Plan utilization never
-   * does (`recordSlotUsageSurvey` only records it): slot order is the
-   * operator's numbered priority, operator decision 2026-09-16.
+   * does: slot order is the operator's numbered priority, operator decision
+   * 2026-09-16.
    */
   restorePersistedCredentialSlot(): void {
     let persisted: string | undefined;
@@ -2661,47 +2579,6 @@ export class ClaudeProvider implements AgentProvider {
     // written) — ignore and stay on the primary. Log once so a stale slot
     // never rotting silently is at least visible.
     log(`Persisted credential slot "${persisted}" is not in the current pool — ignoring, staying on primary`);
-  }
-
-  /**
-   * Record the host's plan-utilization survey (`NANOCLAW_SLOT_USAGE_SURVEY`,
-   * `src/slot-usage-survey.ts`) as one `usage_pull` sample row per ring slot
-   * per window, so idle slots stay visible in `rate_limit_samples`.
-   *
-   * Telemetry ONLY: it never moves the ring. Slots are used in numbered order
-   * (`CLAUDE_CODE_OAUTH_TOKEN`, `_2`, `_3`, …) and advance only on a wall via
-   * `rotateApiKey` — the operator's priority, decided 2026-09-16, reversing
-   * quota-burn 0.6's most-used-first pick.
-   *
-   * Makes no network call; a missing, unparseable or stale survey records
-   * nothing. Never throws — this must not stop a container from booting.
-   */
-  recordSlotUsageSurvey(deps: { now?: number; maxAgeMs?: number } = {}): void {
-    const usingOauth = !this.env.ANTHROPIC_API_KEY && this.oauthRing.length > 0;
-    if (!usingOauth) return;
-    const credentialSet = process.env.NANOCLAW_OAUTH_CREDENTIAL_SET ?? null;
-    try {
-      const survey = parseSlotUsageSurvey(process.env[SLOT_USAGE_SURVEY_ENV], {
-        now: deps.now ?? Date.now(),
-        maxAgeMs: deps.maxAgeMs,
-      });
-      if (survey.problem) log(`Slot usage survey unusable (nothing recorded): ${survey.problem}`);
-      if (survey.staleSlots.length > 0) {
-        log(`Slot usage survey too old to use for: ${survey.staleSlots.join(', ')}`);
-      }
-      for (const slot of this.oauthRing) {
-        const entry = survey.fresh[slot.name];
-        if (!entry) continue;
-        const who: AccountIdentity = {
-          account: slot.name,
-          credentialSet,
-          lane: laneForSlot(process.env.CLAUDE_CODE_OAUTH_LANES, slot.name),
-        };
-        recordRateLimitSamples(usageResponseToSamples(surveyEntryToUsageResponse(entry), who));
-      }
-    } catch (err) {
-      log(`Slot usage survey recording aborted: ${err instanceof Error ? err.message : String(err)}`);
-    }
   }
 
   /** Best-effort persist; never throws — a respawn just re-derives via rotation. */
@@ -3374,30 +3251,12 @@ export class ClaudeProvider implements AgentProvider {
                 : null,
             };
             lastRateLimitInfo = undefined; // scoped to the turn that just closed
-            // Throttled, fire-and-forget: samples plan utilization for THIS
-            // account whether or not the SDK had anything to warn about.
-            samplePlanUsage(sdkResult, who);
           } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
             yield { type: 'error', message: 'API retry', retryable: true };
           } else if (message.type === 'rate_limit_event') {
             const info = (message as { rate_limit_info?: SdkRateLimitInfo }).rate_limit_info;
             lastRateLimitInfo = info; // held for the `result` that closes this turn
-            // Kept alongside the pull, not replaced by it: the event carries a
-            // `status` (allowed_warning / rejected) the pull has no field for,
-            // and it is the fallback when the experimental pull is unavailable.
-            // `source` on the row says which path produced it.
-            recordRateLimitSamples([
-              {
-                source: 'rate_limit_event',
-                ...who,
-                subscriptionType: null,
-                available: true,
-                limitType: info?.rateLimitType ?? null,
-                utilization: info?.utilization ?? null,
-                resetsAt: resetsAtIso(info?.resetsAt),
-                status: info?.status ?? null,
-              },
-            ]);
+            recordRateLimitSamples(rateLimitEventToSamples(info, who));
             const blocked = classifyRateLimitEvent(info);
             if (!blocked) {
               if (info?.status === 'allowed_warning') {

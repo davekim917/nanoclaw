@@ -536,7 +536,12 @@ export async function readCodexSubagentThreads(
   timeoutMs: number,
 ): Promise<CodexSubagentThread[]> {
   try {
-    const response = await sendCodexRequest(server, 'thread/list', { ancestorThreadId: threadId, limit: 100 }, timeoutMs);
+    const response = await sendCodexRequest(
+      server,
+      'thread/list',
+      { ancestorThreadId: threadId, limit: 100 },
+      timeoutMs,
+    );
     if (response.error) return [];
     const result = response.result as
       | { data?: Array<Record<string, unknown>>; threads?: Array<Record<string, unknown>> }
@@ -558,8 +563,9 @@ export async function readCodexSubagentThreads(
 }
 
 /**
- * Pull the account's rate-limit snapshot — the Codex counterpart of Claude's
- * `/usage` control request (providers/claude.ts `planUsagePuller`).
+ * Pull the account's rate-limit snapshot. (Claude has no counterpart pull: it
+ * reads the per-window headers off `rate_limit_event`, providers/claude.ts
+ * `unifiedWindowsToSamples`.)
  *
  * **Sent with NO `params` at all**, and that stays true across pin moves. The
  * shape originally shipped as `{ excludeResetCreditDetails: true }`, written

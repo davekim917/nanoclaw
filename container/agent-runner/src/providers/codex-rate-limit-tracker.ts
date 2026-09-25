@@ -9,11 +9,10 @@
  * lifecycle runs against a fake app-server in tests with no network and no
  * `codex` binary — the hermeticity test depends on that.
  *
- * Failure policy mirrors claude.ts's `samplePlanUsage`: a read that errors or
- * exceeds its deadline is NOT SAMPLED (no row, no park) and logged; it never
- * fails or delays the turn beyond the deadline. The systemError park in the
- * poll-loop / host remains the fallback for a session whose read never
- * answers.
+ * Failure policy: a read that errors or exceeds its deadline is NOT SAMPLED
+ * (no row, no park) and logged; it never fails or delays the turn beyond the
+ * deadline. The systemError park in the poll-loop / host remains the fallback
+ * for a session whose read never answers.
  */
 import fs from 'fs';
 import path from 'path';
@@ -36,13 +35,12 @@ import {
 } from './codex-rate-limits.js';
 
 /**
- * Re-read cadence when no push has refreshed the snapshot — same interval as
- * Claude's `USAGE_PULL_MIN_INTERVAL_MS`. Checked before each turn; the read
- * is awaited (bounded below) because the park decision needs it BEFORE the
- * turn starts to be worth anything.
+ * Re-read cadence when no push has refreshed the snapshot. Checked before each
+ * turn; the read is awaited (bounded below) because the park decision needs it
+ * BEFORE the turn starts to be worth anything.
  */
 export const CODEX_RATE_LIMITS_REFRESH_MS = 5 * 60_000;
-/** Deadline for one read. Same reasoning as claude.ts's `USAGE_PULL_TIMEOUT_MS`. */
+/** Deadline for one read, so a read that never answers cannot hold the turn. */
 export const CODEX_RATE_LIMITS_READ_TIMEOUT_MS = 10_000;
 
 export interface CodexRateLimitTrackerDeps {

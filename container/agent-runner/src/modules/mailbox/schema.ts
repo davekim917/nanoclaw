@@ -74,9 +74,11 @@ export const RATE_LIMIT_SAMPLES_DDL = `
   CREATE TABLE IF NOT EXISTS rate_limit_samples (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     ts                TEXT NOT NULL,
-    -- 'usage_pull' (the /usage control request — fires regardless of
-    -- utilization) or 'rate_limit_event' (SDK telemetry — only fires once
-    -- the account is already in warning/blocked territory).
+    -- 'rate_limit_event' (the event's top-level reading — utilization only
+    -- once the account is in warning/blocked territory), 'rate_limit_headers'
+    -- (Claude: one row per window from the event's unifiedWindows, read from
+    -- the response headers, every utilization level) or 'usage_pull' (Codex's
+    -- account/rateLimits/read; Claude rows of this source predate its removal).
     source            TEXT NOT NULL,
     -- OAuth ring slot name (CLAUDE_CODE_OAUTH_TOKEN, _2, ...). NULL for
     -- API-key sessions. Without it, samples from four rotating accounts mix
@@ -91,21 +93,22 @@ export const RATE_LIMIT_SAMPLES_DDL = `
     lane              TEXT,
     subscription_type TEXT,
     available         INTEGER NOT NULL,
-    -- Window: five_hour | seven_day | seven_day_oauth_apps | seven_day_opus.
+    -- Window: five_hour | seven_day | seven_day_overage_included | seven_day_opus | …
     -- NULL when available = 0, or when the plan reported no windows — read
     -- 'status' for which.
     limit_type        TEXT,
-    -- 0-1 FRACTION, matching turn_usage.rate_limit_utilization. The pull
-    -- reports 0-100 and is divided at the capture seam; rate_limit_event
-    -- already reports a fraction.
+    -- 0-1 FRACTION, matching turn_usage.rate_limit_utilization. The Codex
+    -- pull reports 0-100 and is divided at the capture seam; rate_limit_event
+    -- and rate_limit_headers already report a fraction. A header reading can
+    -- exceed 1 when usage legitimately runs past a window's cap.
     utilization       REAL,
     resets_at         TEXT,
     -- Why this row looks the way it does. For rate_limit_event: the SDK's own
-    -- status (allowed_warning / rejected). For usage_pull: NULL when the row
+    -- status (allowed_warning / rejected). For rate_limit_headers: always
+    -- NULL (the row carries a reading). For usage_pull: NULL when the row
     -- carries a real reading, else the reason it does not —
     --   'not_applicable' = plan limits do not apply to this session at all
-    --                      (API key / Bedrock / Vertex, or the CLI was not
-    --                      told the token carries 'user:profile'),
+    --                      (API key / Bedrock / Vertex),
     --   'no_window'      = the pull answered but named no usable window.
     -- A NULL utilization with NO row at all is the third state: not sampled.
     -- Without this column all three read as "the number is missing".

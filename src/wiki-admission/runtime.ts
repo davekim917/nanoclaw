@@ -73,7 +73,9 @@ export function wikiRuntimeEnvironment(
     NANOCLAW_WIKI_MAINTENANCE: '1',
     NANOCLAW_WORKGROUP_ID: workgroup,
     CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
-    CLAUDE_CODE_OAUTH_SCOPES: 'user:inference user:profile',
+    // Only what a `claude setup-token` credential holds — see the scope
+    // declaration in container-runner.ts for why `user:profile` is not claimed.
+    CLAUDE_CODE_OAUTH_SCOPES: 'user:inference',
   };
   if (provider === 'codex') {
     if (model) env.NANOCLAW_CODEX_MODEL_OVERRIDE = model;
