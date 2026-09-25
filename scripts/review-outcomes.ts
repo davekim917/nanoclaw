@@ -114,6 +114,7 @@ import { execFileSync } from 'node:child_process';
 import nodePath from 'node:path';
 
 import { parse } from 'yaml';
+import { walkArgs } from './lib/cli-args.js';
 
 // ─────────────────────────── types ─────────────────────────────────────────
 
@@ -2400,28 +2401,17 @@ function parseArgs(argv: readonly string[]): Options {
     followupDays: 14,
     json: false,
   };
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
-    const next = (): string => {
-      const value = argv[i + 1];
-      if (value === undefined) fail(`${arg} needs a value`);
-      i += 1;
-      return value;
-    };
-    const eq = arg.indexOf('=');
-    const name = eq === -1 ? arg : arg.slice(0, eq);
-    const inline = eq === -1 ? null : arg.slice(eq + 1);
-
-    if (name === '--repo') options.repo = inline ?? next();
-    else if (name === '--switch') options.switchIso = inline ?? next();
-    else if (name === '--days') options.days = Number(inline ?? next());
-    else if (name === '--followup-days') options.followupDays = Number(inline ?? next());
+  walkArgs(argv, fail, (name, arg, value) => {
+    if (name === '--repo') options.repo = value();
+    else if (name === '--switch') options.switchIso = value();
+    else if (name === '--days') options.days = Number(value());
+    else if (name === '--followup-days') options.followupDays = Number(value());
     else if (name === '--json') options.json = true;
     else if (name === '--weekly') options.weekly = true;
-    else if (name === '--weekly-days') options.weeklyDays = Number(inline ?? next());
+    else if (name === '--weekly-days') options.weeklyDays = Number(value());
     else if (name === '--help' || name === '-h') usage();
     else if (arg !== '--') fail(`unknown argument: ${arg}`);
-  }
+  });
   if (!Number.isFinite(options.days) || options.days <= 0) fail('--days must be a positive number');
   if (!Number.isFinite(options.followupDays) || options.followupDays <= 0)
     fail('--followup-days must be a positive number');

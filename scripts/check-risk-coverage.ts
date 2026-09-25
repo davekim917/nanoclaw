@@ -74,9 +74,8 @@
  *     measured coverage but still no floor recorded for it (`'new'`) — a risk file
  *     that ships with no coverage floor at all is exactly the gap `--write` exists to
  *     close, so ordinary runs fail it rather than silently accepting whatever the file
- *     happens to measure today (review receipt on #714, round 1, P2-1: this shipped
- *     unfloored once before and was fixed only after a reviewer noticed in a probe —
- *     see docs/review-notes.md's `risk coverage`/repeat-class entries).
+ *     happens to measure today (see docs/review-notes.md's `risk coverage`/repeat-class
+ *     entries).
  * A baseline entry of `'untested'` never fails on its own — it is accepted debt, not a
  * live threshold. `--write` folds the current state into the baseline either way, and
  * `--write`/`--bootstrap` (either flag) suspend the `'new'` failure specifically:
@@ -135,6 +134,7 @@ import { parse as parseYaml } from 'yaml';
 
 import { globsForRiskHigh } from './review-outcomes.js';
 import { splitRiskGlobs } from './risk-globs.js';
+import { walkArgs } from './lib/cli-args.js';
 
 // ─────────────────────────── types ─────────────────────────────────────────
 
@@ -397,7 +397,7 @@ export interface EvaluateOptions {
    * the opposite of what a one-time bootstrap run is for). Default false: an
    * ordinary run — the one CI's "Risk-path coverage ratchet" step runs — fails a
    * `'new'` file exactly like `'new-untested'`, so a risk file can no longer ship
-   * with no floor at all and stay green (review receipt on #714 round 1, P2-1).
+   * with no floor at all and stay green.
    */
   allowNew?: boolean;
 }
@@ -407,8 +407,7 @@ export interface EvaluateOptions {
  * `EvaluateOptions.allowNew` takes. Factored out of `main()`'s inline arithmetic into
  * a pure, directly testable function: with `allowNew` computed inline, flipping it to
  * unconditionally `true` in normal mode left every one of this script's existing
- * tests green, because none of them exercised `main()` itself (review receipt on
- * #714, round 2, P2-B).
+ * tests green, because none of them exercised `main()` itself.
  *
  * True in exactly two cases:
  *   - `write` is set — a `--write` run is ABOUT to record a floor for every current
@@ -421,7 +420,7 @@ export interface EvaluateOptions {
  * `bootstrap` paired with an ALREADY-EXISTING baseline is deliberately false:
  * `--bootstrap` is documented as a one-time initial-baseline flag, not a standing way
  * to silence the check, so passing it again against a baseline that is already
- * committed must not suppress `'new'` (review receipt on #714, round 2, P3-1).
+ * committed must not suppress `'new'`.
  */
 export function allowNewFor(opts: { write: boolean; bootstrap: boolean; baselineExists: boolean }): boolean {
   return opts.write || (opts.bootstrap && !opts.baselineExists);
@@ -512,8 +511,7 @@ function round2(n: number): number {
 /**
  * Rounds DOWN to one decimal place — this repo's floor convention for a SUGGESTED
  * coverage baseline entry (a floor must never be stricter than what was actually
- * measured, so it only ever rounds down, never to the nearest or up — review receipt
- * on #714, round 2, P3-3). Operates on an already `round2()`-ed value rather than the
+ * measured, so it only ever rounds down, never to the nearest or up). Operates on an already `round2()`-ed value rather than the
  * raw float, so a floating-point artifact one decimal place further out (e.g.
  * 92.30000000000001) can't floor to the wrong decile.
  */
@@ -547,8 +545,7 @@ function fmtDelta(delta: number | null): string {
  * what was actually measured. The line itself carries no trailing comma:
  * `coverage-risk-baseline.json` is one JSON object, a comma after its LAST entry
  * breaks it, and this script has no way to know whether the entry being pasted in
- * will land last — so the message says so explicitly instead of guessing (review
- * receipt on #714, round 2, P3-3).
+ * will land last — so the message says so explicitly instead of guessing.
  *
  * `row.current` is always a `number` for a `'new'` row: `classifyFile` only ever
  * produces status `'new'` (never `'new-untested'`/`'n/a'`) from a `{ kind:
@@ -626,30 +623,19 @@ function parseArgs(argv: readonly string[]): Options {
     threshold: DEFAULT_THRESHOLD,
     json: false,
   };
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
-    const next = (): string => {
-      const value = argv[i + 1];
-      if (value === undefined) fail(`${arg} needs a value`);
-      i += 1;
-      return value;
-    };
-    const eq = arg.indexOf('=');
-    const name = eq === -1 ? arg : arg.slice(0, eq);
-    const inline = eq === -1 ? null : arg.slice(eq + 1);
-
+  walkArgs(argv, fail, (name, arg, value) => {
     if (name === '--write') options.write = true;
     else if (name === '--bootstrap') options.bootstrap = true;
     else if (name === '--allow-partial-report') options.allowPartialReport = true;
     else if (name === '--allow-missing-container-report') options.allowMissingContainerReport = true;
-    else if (name === '--host-summary') options.hostSummary = inline ?? next();
-    else if (name === '--container-lcov') options.containerLcov = inline ?? next();
-    else if (name === '--baseline') options.baseline = inline ?? next();
-    else if (name === '--threshold') options.threshold = Number(inline ?? next());
+    else if (name === '--host-summary') options.hostSummary = value();
+    else if (name === '--container-lcov') options.containerLcov = value();
+    else if (name === '--baseline') options.baseline = value();
+    else if (name === '--threshold') options.threshold = Number(value());
     else if (name === '--json') options.json = true;
     else if (name === '--help' || name === '-h') usage();
     else if (arg !== '--') fail(`unknown argument: ${arg}`);
-  }
+  });
   if (!Number.isFinite(options.threshold) || options.threshold < 0) fail('--threshold must be a non-negative number');
   return options;
 }
@@ -771,8 +757,7 @@ function main(): void {
   // `baselineExists` means "did a baseline already exist when this run started", not
   // "does the fresh one --write is about to produce exist" — a --write run replaces
   // the file regardless of whether one was already there, and `write: true` alone
-  // already forces `allowNewFor` true either way (review receipt on #714, round 2,
-  // P2-B/P3-1).
+  // already forces `allowNewFor` true either way.
   const baselineExists = fs.existsSync(baselinePath);
   const allowNew = allowNewFor({ write: options.write, bootstrap: options.bootstrap, baselineExists });
 
@@ -800,8 +785,7 @@ function main(): void {
   // allowNewFor suspends `new` only when bootstrap is paired with NO existing
   // baseline (the one-time initial-baseline case, whose empty baseline would
   // otherwise fail on every risk file that exists) — `--bootstrap` against an
-  // ALREADY-committed baseline no longer silently suppresses the check (review
-  // receipt on #714, round 2, P3-1).
+  // ALREADY-committed baseline does not silently suppress the check.
   const result = evaluate(riskFiles, classifications, resolution.baseline, options.threshold, { allowNew });
   printReport(result, options, false);
   process.exit(result.passed ? 0 : 1);

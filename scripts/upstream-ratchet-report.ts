@@ -97,6 +97,7 @@ import {
   type TreeReader,
   type UpstreamRatchetManifest,
 } from '../src/upstream-ratchet.js';
+import { walkArgs } from './lib/cli-args.js';
 
 const SCRIPT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -121,33 +122,18 @@ function parseArgs(argv: readonly string[]): Options {
     json: false,
     check: null,
   };
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
-    const next = (): string => {
-      const value = argv[i + 1];
-      // A path may legitimately begin with a dash, so `--accept -- -weird.md`
-      // has to stay possible; only a missing value is an error.
-      if (value === undefined) fail(`${arg} needs a value`);
-      i += 1;
-      return value;
-    };
-    // `--flag=value` as well as `--flag value`: a path starting with a dash is
-    // unambiguous in the first form, and shells and CI configs prefer it.
-    const eq = arg.indexOf('=');
-    const name = eq === -1 ? arg : arg.slice(0, eq);
-    const inline = eq === -1 ? null : arg.slice(eq + 1);
-
-    if (name === '--root') options.root = path.resolve(inline ?? next());
+  walkArgs(argv, fail, (name, arg, value) => {
+    if (name === '--root') options.root = path.resolve(value());
     else if (name === '--write') options.write = true;
-    else if (name === '--accept') options.accept.add(normalizeRel(inline ?? next()));
+    else if (name === '--accept') options.accept.add(normalizeRel(value()));
     else if (name === '--accept-all') options.acceptAll = true;
-    else if (name === '--upstream') options.upstream = inline ?? next();
+    else if (name === '--upstream') options.upstream = value();
     else if (name === '--json') options.json = true;
-    else if (name === '--check') options.check = inline ?? next();
+    else if (name === '--check') options.check = value();
     else if (name === '--help' || name === '-h') usage();
     // `pnpm run ratchet:report -- --write` can forward a bare `--`.
     else if (arg !== '--') fail(`unknown argument: ${arg}`);
-  }
+  });
   if (options.upstream !== null) {
     // Re-pinning moves the base under every path at once. There is no honest
     // per-path arbitration to do, so it writes and accepts everything, with the
