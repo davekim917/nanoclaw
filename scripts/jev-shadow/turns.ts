@@ -26,7 +26,7 @@ import Database from 'better-sqlite3';
 
 import { CLAUDE_USAGE_TRUSTED_FROM, isUntrustedTurnUsage, UNTRUSTED_USAGE_NOTE } from '../../src/db/usage-trust.js';
 
-export const ROOT = process.env.NANOCLAW_ROOT ?? '/home/ubuntu/nanoclaw-v2';
+const ROOT = process.env.NANOCLAW_ROOT ?? '/home/ubuntu/nanoclaw-v2';
 
 /**
  * Workgroups the Jev work is focused on for now — a SCOPE choice, not a
@@ -38,7 +38,7 @@ export const ROOT = process.env.NANOCLAW_ROOT ?? '/home/ubuntu/nanoclaw-v2';
  * name, so a new sibling group lands in its workgroup's focus automatically.
  * `scope: 'all'` reads every group.
  */
-export const FOCUS_WORKGROUPS = new Set(
+const FOCUS_WORKGROUPS = new Set(
   (process.env.JEV_SHADOW_FOCUS ?? 'main')
     .split(',')
     .map((s) => s.trim())
@@ -48,7 +48,7 @@ export const FOCUS_WORKGROUPS = new Set(
 /** Poll jitter: a row due just after a turn's recorded start can still be read by it. */
 const START_SLACK_MS = 60_000;
 
-export interface TurnInput {
+interface TurnInput {
   kind: string;
   seriesId: string | null;
   text: string;
@@ -165,8 +165,8 @@ export function loadTurns(opts: {
 
     // After the window bookkeeping above, like the other skips, so the next
     // turn's attribution window still starts where this one did. Every report
-    // here sums cost_usd, and inside the #1061 window that column is not a
-    // figure — the turn is dropped, not zeroed, and counted below.
+    // here sums cost_usd, and inside the untrusted-usage window that column is
+    // not a figure — the turn is dropped, not zeroed, and counted below.
     if (isUntrustedTurnUsage(String(r.provider), ts)) {
       untrustedCost += 1;
       continue;

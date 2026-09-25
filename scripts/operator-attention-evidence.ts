@@ -5,21 +5,21 @@
  *
  * - `messages_out`/`delivered` are separate tables; delivery evidence is a non-null
  *   platform message id at the host-stamped `delivered_at` event time
- *   (`src/mailbox/sqlite/schema.ts:23-28`, `src/mailbox/sqlite/session-db.ts:258-262`).
+ *   (`src/mailbox/sqlite/schema.ts`, `src/mailbox/sqlite/session-db.ts`).
  *   The delivery loop also acknowledges valid adapter no-ops with a null id, so a
  *   null marker is explicitly *not* counted as platform delivery here
- *   (`src/delivery.ts:748-758`, `src/channels/cli.ts:139-145`).
+ *   (`src/delivery.ts`, `src/channels/cli.ts`).
  * - An assistant archive row is reported only as archive observation, at its own
  *   `sent_at` event time. It is not platform-delivery evidence: the archive write
  *   follows any normally returned adapter result, including the CLI no-terminal
- *   no-op above (`src/delivery.ts:1488-1496,1579-1600`). The canonical host archive is
- *   `path.join(DATA_DIR, 'archive.db')` (`src/message-archive.ts:30`), but this
+ *   no-op above (`src/delivery.ts`). The canonical host archive is
+ *   `path.join(DATA_DIR, 'archive.db')` (`src/message-archive.ts`), but this
  *   script accepts an explicit archive DB and never claims it covers every
  *   session beneath an independently supplied sessions root. Archive contents
  *   are never selected or emitted.
  * - `quietStatus` stops status rows before they are written
- *   (`container/agent-runner/src/poll-loop.ts:2558-2562`) and `chatLimit` can
- *   drop chat rows before their insert (`container/agent-runner/src/modules/mailbox/index.ts:116-131`).
+ *   (`container/agent-runner/src/poll-loop.ts`) and `chatLimit` can
+ *   drop chat rows before their insert (`container/agent-runner/src/modules/mailbox/index.ts`).
  *   Configuration is reported separately; missing rows are never invented as
  *   suppressed delivery events.
  *
@@ -49,18 +49,18 @@ const REVIEW_OUTCOME_BASE_BRANCH = 'main' as const;
  * Known agent-group metadata directories, not session directories.
  *
  * Keep this explicit: session ids are normally minted as `sess-*`
- * (`src/session-manager.ts:328-330`), but an unfamiliar directory must still
+ * (`src/session-manager.ts`), but an unfamiliar directory must still
  * fail closed as a possible session rather than disappear from coverage.
- * `.claude-shared` is created per group (`src/group-init.ts:283-288`) and
+ * `.claude-shared` is created per group (`src/group-init.ts`) and
  * `.context` is the sibling store written by `sessionContextPathFor`
- * (`src/session-manager.ts:73-103`). `.claude-memory` is retained for stale
+ * (`src/session-manager.ts`). `.claude-memory` is retained for stale
  * installs: `groupClaudeMemoryDir` created it at
- * `ac8582847:src/session-manager.ts:90-92` before `3198aef43` moved that state
+ * `ac8582847:src/session-manager.ts` before `3198aef43` moved that state
  * beneath `.claude-shared`.
  */
 const AGENT_GROUP_METADATA_DIR_NAMES = new Set(['.claude-shared', '.claude-memory', '.context']);
 
-export interface CandidateSample {
+interface CandidateSample {
   source: 'inbound' | 'choice_receipts';
   session: string;
   eventId: string;
@@ -72,15 +72,15 @@ export interface CandidateSample {
     | 'resolved_choice_receipt';
 }
 
-export interface CoverageError {
+interface CoverageError {
   source: 'archive' | 'central' | 'inbound' | 'outbound';
   session?: string;
   code: 'missing_file' | 'missing_required_table' | 'missing_required_column' | 'unreadable';
 }
 
-export type ArchiveScope = 'explicit_db_scope_unverified_against_sessions_root';
+type ArchiveScope = 'explicit_db_scope_unverified_against_sessions_root';
 
-export interface AttentionCounters {
+interface AttentionCounters {
   /** Current pending central-DB cards, never a historical card total. */
   platformBackedPendingApprovalCardsSnapshot: number;
   /** Durable host-written receipts; no clicker id, label, or value is emitted. */
@@ -104,7 +104,7 @@ export interface AttentionCounters {
   mutedChatTaskRowsConfigured: number;
 }
 
-export interface ReviewOutcomeRow {
+interface ReviewOutcomeRow {
   kind: 'explicit_pr_revert' | 'fixes_pr_proxy' | 'same_file_overlap_proxy';
   targetPr: number;
   evidencePr: number;
@@ -338,7 +338,7 @@ function parseTaskControls(content: string): ParsedTaskControls | null {
 }
 
 /** A deliberately small prose-only candidate detector; never an outcome fact. */
-export function isStatusChaseCandidate(text: string): boolean {
+function isStatusChaseCandidate(text: string): boolean {
   return /\b(?:status|update|progress|eta|any news|where (?:are|is)|still (?:working|running)|how(?:'s| is) it going)\b/i.test(
     text,
   );
@@ -371,7 +371,7 @@ function listSessionDirectories(root: string): Array<{ session: string; dir: str
   return result;
 }
 
-/** Uses the canonical host-owned-first, legacy-fallback resolver at src/modules/mailbox/host-inbound.ts:237-240. */
+/** Uses the canonical host-owned-first, legacy-fallback resolver at src/modules/mailbox/host-inbound.ts. */
 function inboundPathForSession(sessionDir: string): string | null {
   const resolved = resolveInboundDbPath(sessionDir);
   return fs.existsSync(resolved) ? resolved : null;
@@ -617,7 +617,7 @@ function scanSession(input: {
       .all() as OutboundRow[];
     // Delivery acknowledgements belong to the *inbound* database by design;
     // `messages_out` is container-owned and never has this table
-    // (`src/mailbox/sqlite/schema.ts:23-60`). Do not ATTACH: each source DB
+    // (`src/mailbox/sqlite/schema.ts`). Do not ATTACH: each source DB
     // remains independently read-only, including when its WAL is live.
     const deliveredRows = inbound
       .prepare('SELECT message_out_id, status, platform_message_id, delivered_at FROM delivered')
@@ -698,7 +698,7 @@ export function extractReviewOutcomeEvidence(
   // In particular, a PR fetched past `until` cannot mature or supply evidence
   // for an earlier target in this frozen report.
   // Match `computeWeeklyReport`'s population exactly: it begins by retaining
-  // only PRs whose base is `main` (`scripts/review-outcomes.ts:1310-1317`).
+  // only PRs whose base is `main` (`scripts/review-outcomes.ts`).
   // Apply that scope before selecting targets OR relationship candidates so a
   // PR on another base cannot borrow a main PR's week maturity or link into a
   // main target's evidence.
@@ -710,7 +710,7 @@ export function extractReviewOutcomeEvidence(
   );
 
   // `computeWeeklyReport` owns the established 14-day end-of-week maturity
-  // definition (`scripts/review-outcomes.ts:1266-1295`); this only reuses it.
+  // definition (`scripts/review-outcomes.ts`); this only reuses it.
   const maturityByWeek = new Map(
     computeWeeklyReport([...eligiblePrs], [], followupDays, until).rows.map((row) => [row.isoWeek, row.immature]),
   );

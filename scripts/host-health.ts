@@ -3,8 +3,8 @@
  * scripts/host-health.ts — quick observability snapshot for the running host.
  *
  * Run after a host restart (or any time) to spot the four ghost-cycle
- * signals that the host-sweep age-out + spawn-grace fixes (PRs #86 / #87)
- * are designed to keep at zero:
+ * signals that the host-sweep age-out and spawn-grace logic is designed to
+ * keep at zero:
  *
  *   1. docker container count vs DB-claimed-running count    (should match)
  *   2. wake deferrals since last restart                      (should be 0)

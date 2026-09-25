@@ -62,7 +62,7 @@ const KNOWN_NON_CODE_GLOBS: ReadonlySet<string> = new Set([
   // Hygiene-check policy (knip and jscpd configuration); the checker itself is scripts/hygiene/**.
   'knip.json',
   '.jscpd.json',
-  // The QA release gate (#1032). Bash and Python only -- no .ts/.js in the tree --
+  // The QA release gate. Bash and Python only -- no .ts/.js in the tree --
   // run by its own *.test.sh suites, which neither lane's coverage tool instruments.
   'container/skills/smoke-test/**',
   'docs/review-policy.md',
@@ -74,7 +74,7 @@ const KNOWN_NON_CODE_GLOBS: ReadonlySet<string> = new Set([
   // a risk:high change on its own — .md frontmatter/prose, not source either
   // lane's test suite instruments.
   'container/agents/**',
-  // Executable agent/tool config added to risk:high by #660 — a hook, an
+  // Executable agent/tool config — a hook, an
   // auto-trusted MCP server, Claude Code's own trust state, a ripgrep config, and a
   // submodule URL (see .github/labeler.yml's own comment on this block). None of
   // these is source this repo's own test suites instrument; they are config other

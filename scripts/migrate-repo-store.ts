@@ -148,7 +148,7 @@ function parseArgs(argv: string[]): Args {
  * host-only byte-hash cache, never a rescue, origin pin, manifest, or a
  * published canonical. A subsequent offline run revalidates every entry.
  */
-export function repositoryMigrationPrestageCachePath(dataDir: string = DATA_DIR): string {
+function repositoryMigrationPrestageCachePath(dataDir: string = DATA_DIR): string {
   return path.join(dataDir, 'repository-migration-prestage', 'file-hashes-v1.json');
 }
 

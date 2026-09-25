@@ -20,11 +20,10 @@
  * Container logs then vanish with the container (`--rm`).
  *
  * So a dead read path leaves no error anywhere a human will meet by accident,
- * and the push path keeps the table looking alive. That is exactly what
- * happened on 2026-09-15: the container's codex-cli (0.153.4,
- * `container/Dockerfile:41`) rejected the params map #812 built against the
- * host's 0.154.0 schema, and for two hours the fleet wrote 408 push rows and
- * zero pull rows with nothing surfacing it (#817).
+ * and the push path keeps the table looking alive: a container codex-cli
+ * (pinned in `container/Dockerfile`) older than the schema the pull params were
+ * built against rejects every pull, and the fleet writes push rows and zero
+ * pull rows with nothing surfacing it.
  *
  * THE SIGNAL is that asymmetry, scoped to the unit the credentials belong to:
  * an (agent group, `credential_set`) pair that is PUSHING inside the window
@@ -42,7 +41,7 @@
  *     indistinguishable from here, and none of them is a symptom.
  *   - It does not judge the CONTENT of a pull row. A pull that lands but comes
  *     back `unsampled`/`not_applicable` (its `status` column) counts as the read
- *     path working; the #811 HTTP-429 shape is a different defect with a
+ *     path working; an HTTP-429 pull is a different defect with a
  *     different remedy, and rows exist for it to be queried directly.
  *   - It does not read the central DB, `container.json`, or any provider
  *     config, and it never restarts, kills or reconfigures anything.
@@ -60,7 +59,7 @@
  *
  * Opens are `readonly` + `PRAGMA query_only=ON`. A read-only open never
  * replays a rollback journal, so this cannot alter a session DB the way a
- * read-write open could (the class in `docs/review-notes.md`, #735/#761).
+ * read-write open could (the class in `docs/review-notes.md`).
  */
 /* eslint-disable no-catch-all/no-catch-all -- an unreadable or malformed session DB must become an explicit counted error, never a silent zero; that is the defect this script exists to catch */
 import fs from 'node:fs';
@@ -82,7 +81,7 @@ const EXIT_USAGE = 2;
 /** Cap on findings embedded in `--gate` data, which is injected into a prompt. */
 const GATE_FINDING_LIMIT = 20;
 
-export type PairVerdict =
+type PairVerdict =
   /** Push rows in the window, and no pull row has EVER landed for this pair. */
   | 'never'
   /** Push rows in the window, none pulled in it, but pulls landed before it. */
@@ -90,7 +89,7 @@ export type PairVerdict =
   /** Both paths landed rows in the window. */
   | 'ok';
 
-export interface TelemetryPair {
+interface TelemetryPair {
   /** Sessions-root subdirectory — the agent group id, per `sessionDir()`. */
   agentGroup: string;
   /** `credential_set` as stored; null when the host did not say. */
@@ -108,7 +107,7 @@ export interface TelemetryPair {
   pushingSessions: number;
 }
 
-export type ScanErrorCode =
+type ScanErrorCode =
   /** A group directory could not be listed — every session under it is invisible. */
   | 'group_unlistable'
   /** An `outbound.db` path could not be stat'd for a reason other than ENOENT. */
@@ -120,7 +119,7 @@ export type ScanErrorCode =
   /** Rows whose `ts` SQLite cannot parse, dropped from both counts. */
   | 'unparsable_timestamps';
 
-export interface TelemetryScanError {
+interface TelemetryScanError {
   /** `<agent group>` or `<agent group>/<session>`, relative to the sessions root. */
   path: string;
   code: ScanErrorCode;
@@ -154,7 +153,7 @@ export interface TelemetryHealthReport {
 }
 
 /** Injected in tests so an open failure can be provoked deterministically. */
-export type OpenSessionDb = (file: string) => Database.Database;
+type OpenSessionDb = (file: string) => Database.Database;
 
 const openReadOnly: OpenSessionDb = (file) => {
   const db = new Database(file, { readonly: true, fileMustExist: true });
@@ -302,7 +301,7 @@ const VERDICT_ORDER: Record<PairVerdict, number> = { never: 0, stale: 1, ok: 2 }
 
 /**
  * Walk `<sessionsRoot>/<agent group>/<session>/outbound.db`, exactly the two
- * levels `sessionDir()` writes (`src/session-manager.ts:64-66`).
+ * levels `sessionDir()` writes (`src/session-manager.ts`).
  */
 export function scanRateLimitTelemetry(options: ScanOptions): TelemetryHealthReport {
   const { sessionsRoot, sinceIso, windowHours, minPushes } = options;
@@ -456,7 +455,7 @@ export function windowStart(hours: number, now: Date = new Date()): string {
 
 /**
  * The host-gated task-script contract: the LAST stdout line is
- * `{wakeAgent, data}` (`src/modules/scheduling/host-script.ts:392-404`).
+ * `{wakeAgent, data}` (`src/modules/scheduling/host-script.ts`).
  *
  * A failed scan wakes too. A telemetry checker that goes quiet when it breaks
  * would reproduce, one level up, the exact failure it was built to catch.
@@ -623,7 +622,7 @@ export function main(argv: string[]): number {
   } catch (err) {
     // In gate mode a broken checker must still wake someone, and must still
     // exit 0 — a non-zero exit makes the host discard the fire entirely
-    // (host-script.ts:386-389), which is silence again.
+    // (host-script.ts), which is silence again.
     if (parsed.format === 'gate') {
       console.log(
         JSON.stringify({

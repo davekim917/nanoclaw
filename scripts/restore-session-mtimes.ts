@@ -40,7 +40,7 @@ import { tryRunWithStorageCleanupClaim } from '../src/storage-activity.js';
 import { sessionHasOpenWork } from '../src/storage-manager.js';
 
 /** The observed burst: 2,102 files at 20:21Z and 2,925 at 20:22Z, install TZ UTC. */
-export const DEFAULT_BURST_WINDOW = { centerIso: '2026-08-15T20:21:00.000Z', radiusMinutes: 10 };
+const DEFAULT_BURST_WINDOW = { centerIso: '2026-08-15T20:21:00.000Z', radiusMinutes: 10 };
 
 /** Signals the migration pass never wrote, newest-first preference is by mtime. */
 const SIGNAL_FILES = ['outbound.db', 'archive.db', 'central.db', '.heartbeat'] as const;
@@ -52,7 +52,7 @@ export interface BurstWindow {
   endMs: number;
 }
 
-export interface RestoreEntry {
+interface RestoreEntry {
   sessionId: string;
   agentGroupId: string;
   inboundPath: string;
@@ -63,7 +63,7 @@ export interface RestoreEntry {
   provenance: string;
 }
 
-export type SkipReason =
+type SkipReason =
   | 'outside-burst-window'
   | 'central-row-missing'
   | 'central-activity-after-burst'
@@ -80,7 +80,7 @@ export interface RestoreManifest {
   skipped: Array<{ sessionId: string; reason: SkipReason }>;
 }
 
-export interface PreimageManifest {
+interface PreimageManifest {
   appliedAt: string;
   sourceManifest: string;
   entries: Array<{ sessionId: string; inboundPath: string; inode: number; mtimeMs: number }>;
@@ -248,7 +248,7 @@ const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
  * root, then require it to still be that path after realpath. A manifest is an
  * editable JSON file on disk; its `inboundPath` string is a hint, not authority.
  */
-export function resolveEntryPath(dataDir: string, entry: RestoreEntry): string | null {
+function resolveEntryPath(dataDir: string, entry: RestoreEntry): string | null {
   if (!SAFE_ID.test(entry.agentGroupId) || !SAFE_ID.test(entry.sessionId)) return null;
   const sessPath = path.join(dataDir, 'v2-sessions', entry.agentGroupId, entry.sessionId);
   const inboundPath = path.join(sessPath, 'inbound.db');
@@ -442,7 +442,7 @@ function usage(): never {
   process.exit(2);
 }
 
-export function runCli(argv = process.argv.slice(2)): void {
+function runCli(argv = process.argv.slice(2)): void {
   const flag = (name: string): string | undefined => {
     const index = argv.indexOf(`--${name}`);
     return index >= 0 ? argv[index + 1] : undefined;

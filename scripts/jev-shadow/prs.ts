@@ -7,8 +7,7 @@
  * Label: did Codex's review of the PR raise a P1? Only PRs with a review from
  * the Codex connector carry a label. That undercounts review: a PR reviewed by
  * a substitute reviewer (a receipt, not a connector review) lands in the
- * "not reviewed" bucket — #874 and #870 did on 2026-09-18 although both were
- * risk:high and reviewed. Treat "unreviewed but flagged" as a lead to check
+ * "not reviewed" bucket even when it was risk:high and reviewed. Treat "unreviewed but flagged" as a lead to check
  * against the PR's risk labels and receipts, never as a review-scope gap.
  *
  * Result on 2026-09-18 (232 PRs, 53 labelled): worst-critical-check AUC 0.547.

@@ -22,7 +22,7 @@ type Question =
   | { type: 'choice'; instructions: string; criteria: Record<string, string | null> }
   | { type: 'score'; instructions: string; criteria: string[] };
 
-export interface Answer {
+interface Answer {
   type: 'noul' | 'choice' | 'score';
   noul?: number;
   choice?: string;

@@ -101,7 +101,7 @@ export function listInputFiles(repoRoot: string): string[] {
  * dashboard modules import by relative path. `dashboard/tsconfig.json`'s build
  * typechecks them, so they are inputs: without them a breaking change there
  * kept restoring the old bundle (skipping `tsc`) until an unrelated
- * `dashboard/` edit surfaced it in a later deploy (#1078).
+ * `dashboard/` edit surfaced it in a later deploy.
  *
  * Derived from the program itself rather than a list, so a new import, a
  * re-export chain or a `paths` alias is covered the moment it exists. This

@@ -217,7 +217,7 @@ async function run(opts: Options): Promise<void> {
   outer: for (const groupDir of groupDirs) {
     const groupPath = path.join(sessionsRoot, groupDir);
     if (!fs.statSync(groupPath).isDirectory()) continue;
-    // The directory name IS the agent group id (storage-activity.ts:319). A
+    // The directory name IS the agent group id. A
     // group with a timezone override runs its whole series on that grid, so both
     // the cron interpretation and the rendered fire time report it — every line
     // already names the zone it is in, so nothing here reads ambiguously.

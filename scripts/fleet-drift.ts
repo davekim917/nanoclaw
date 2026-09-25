@@ -98,7 +98,7 @@ export function checkBand(value: number, priorValues: number[], flatZeroGuardAbs
   return { breach: value > threshold, median: med, madScaled, threshold };
 }
 
-/** A paused series is an absorbing state (see recurrence.ts:34-47) — flag it once it's been sitting unresumed for a few days. */
+/** A paused series is an absorbing state (see src/modules/scheduling/recurrence.ts) — flag it once it's been sitting unresumed for a few days. */
 export function pausedSeriesBreach(pausedSeries: number, oldestPausedDays: number): boolean {
   return pausedSeries > 0 && oldestPausedDays >= 3;
 }
@@ -185,7 +185,7 @@ interface SeriesStat {
  *     seen per series, since input is already seq-DESC).
  *   - failedStreak: leading run of 'failed' rows within the subsequence
  *     filtered to status IN ('completed','failed') — mirrors trailingFailedRuns'
- *     predicate in src/modules/scheduling/db.ts:258 exactly, so intervening
+ *     predicate in src/modules/scheduling/db.ts exactly, so intervening
  *     pending/paused/cancelled/expired rows don't break or pad the streak.
  */
 export function computeSeriesStats(rowsDescBySeq: TaskRow[]): Map<string, SeriesStat> {
@@ -640,7 +640,7 @@ function unscannableBreaches(
 // Defensive translation only — compose (`src/claude-md-compose.ts`) no longer
 // writes any `.claude-shared.md`/`.claude-fragments/` symlink pointing at
 // these container paths (every section is read from its host path and
-// inlined directly as of the fragment-retirement follow-up to issue #233),
+// inlined directly),
 // so a freshly composed CLAUDE.md never contains an `@`-import that resolves
 // through this map. It stays here for two reasons: a group whose CLAUDE.md
 // predates that change still carries the old `@`-import text until its next
@@ -946,7 +946,7 @@ function logAndFileBreaches(breaches: Breach[], dryRun: boolean): void {
 
 // ──────────────────────────────────── main ─────────────────────────────────
 
-export function main(): number {
+function main(): number {
   try {
     const dryRun = process.env.FLEET_DRIFT_DRY_RUN === '1';
     const now = new Date();

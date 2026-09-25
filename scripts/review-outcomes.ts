@@ -26,7 +26,7 @@
  *
  * Follow-up and revert matching:
  * - `Fixes-PR:` link — same regex `codex-review.sh` uses at merge time
- *   (`FIXES_PR_LINE_RE`, `container/skills/pr-review-loop/scripts/codex-review.sh:486`),
+ *   (`FIXES_PR_LINE_RE`, `container/skills/pr-review-loop/scripts/codex-review.sh`),
  *   read case-insensitively, same as that script's `jq test($lineRe; "i")` call.
  * - fix-title overlap (`FIX_TITLE_RE`, same file:485) — the fallback ONLY when no PR
  *   links to the candidate, per plan.md's Measurement status: "same-subsystem
@@ -35,14 +35,14 @@
  *   Generated files (the ratchet manifest, lockfiles) don't count as shared: see
  *   `GENERATED_FILES`. Overlap still over-counts in a busy repo, so read it as an upper
  *   bound; the link rate is the real signal once `Fixes-PR:` lines accumulate.
- * - revert — this repo's real revert PRs (e.g. #610, "revert(runner): back out ending
- *   a task stream after its result (#608)") do not follow GitHub's auto-revert
+ * - revert — this repo's real revert PRs (e.g. "revert(runner): back out ending a
+ *   task stream after its result (#N)") do not follow GitHub's auto-revert
  *   template (`Revert "<title>"` / "This reverts pull request #N."); they use the same
  *   conventional-commit prefix as `FIX_TITLE_RE` does for fixes. So the title rule
  *   here is generalized from "starts with `Revert \"`" to "starts with the word
  *   revert" (covers both forms), and the body rule is one regex spanning both
  *   `Reverts #N` and `This reverts ... #N` (a bounded gap between the word and the
- *   number, verified against #610's actual body: "This reverts #608 (merge `...`)").
+ *   number, e.g. "This reverts #N (merge `...`)").
  *
  * Shadow-review counting — the direct measurement `docs/specs/risk-based-review/plan.md`'s
  * rollback section names as primary, over the file-overlap upper bound above:
@@ -91,9 +91,8 @@
  *   pnpm exec tsx scripts/review-outcomes.ts [--repo owner/repo] [--switch <ISO>]
  *     [--days <n>] [--followup-days <n>] [--json]
  *
- * Defaults: --repo davekim917/nanoclaw, --switch 2026-09-10T16:43:16Z (`GATE_GO_LIVE_ISO`
- * — PR #605's mergedAt, the exact instant the merge gate went live here, not a rounded
- * midnight), --days 30, --followup-days 14.
+ * Defaults: --repo davekim917/nanoclaw, --switch `GATE_GO_LIVE_ISO` (the exact instant the
+ * merge gate went live here, not a rounded midnight), --days 30, --followup-days 14.
  *
  * **Shadow coverage** (separate from the before/after bucket above): the before/after
  * bucket's low-risk population is a REPLAY of `.github/labeler.yml`'s file globs, kept
@@ -103,10 +102,10 @@
  * labels (`risk:high` / `review:requested`), not a glob replay. `computeShadowCoverage`
  * answers a narrower, more literal question — "of the PRs the workflow should be picking
  * up since it went live, how many did it actually review?" — using `report`'s own
- * selection rule (`shadow-review.yml:350-356`): base ref `main` (`baseRefName`,
+ * selection rule (`shadow-review.yml`): base ref `main` (`baseRefName`,
  * `SHADOW_REVIEW_BASE_REF`) and CURRENT labels excluding `risk:high`/`review:requested`
- * (`isEligibleForShadowReview`), scoped to PRs merged at or after PR #660's merge time
- * (`SHADOW_REVIEW_GO_LIVE_ISO`, when shadow review went live). Its one caveat: label
+ * (`isEligibleForShadowReview`), scoped to PRs merged at or after
+ * `SHADOW_REVIEW_GO_LIVE_ISO`, when shadow review went live. Its one caveat: label
  * eligibility is judged against a PR's CURRENT labels, which can drift from what
  * they were at merge time (a PR later relabeled `risk:high`, or `review:requested`
  * cleared after the fact) — see `LABEL_DRIFT_CAVEAT`.
@@ -155,7 +154,7 @@ export interface PullRequestData {
   /**
    * Set instead of `atMergeContext` when the merge commit's diff hit `fileDiffAtMergeLocal`'s
    * `'over-cap'` case (>=300 changed files) — the gate answers `review` deterministically
-   * there (`codex-review.sh:764`), with no file/label evaluation needed at all, so there is
+   * there (`codex-review.sh`), with no file/label evaluation needed at all, so there is
    * no real `AtMergeContext` to build. `buildWeeklyRow` reads this BEFORE
    * `classifyAtMergeVerdict`, treating the PR as resolved with this forced verdict.
    */
@@ -165,18 +164,18 @@ export interface PullRequestData {
 /**
  * What the merge gate actually saw for one PR AT THE MOMENT it merged — the file-glob
  * and label half of codex-review.sh `audit`'s own reconstruction (`SCOPE_PIN_BASE`,
- * `GATE_LABELS`; codex-review.sh:663-701,1660-1695), replayed here from the same public
+ * `GATE_LABELS`; codex-review.sh), replayed here from the same public
  * facts audit itself reads (the merge commit's first parent, the PR's labeled/unlabeled
  * event history, and — LOCALLY, not GitHub's compare API — the merge commit's own diff
  * against that base), not from whatever's true today. A `risk:high`
  * glob list grows over time — 22 at go-live to 62 as of this file's last edit — and a
  * label can be added or removed after merge; either drift silently rewrites history if
  * the replay uses CURRENT state instead of AT-MERGE state (see the file header's
- * "Pre-gate vs. post-gate" note for the concrete case, PR #620, this fixes).
+ * "Pre-gate vs. post-gate" note).
  */
 export interface AtMergeContext {
   /** The merge commit's diff against its base, filenames ∪ renamed files' PREVIOUS
-   *  filenames (codex-review.sh:760) — moving a file OFF a risky path still changes
+   *  filenames (codex-review.sh) — moving a file OFF a risky path still changes
    *  that path. */
   files: string[];
   /** Labels as of `mergedAt`, replayed from the PR's LabeledEvent/UnlabeledEvent
@@ -293,7 +292,7 @@ const FIX_TITLE_RE = /^\s*fix(\([^)]*\))?!?:/i;
 /**
  * Strips CommonMark fenced code blocks and HTML comments from `body`, mirroring
  * codex-review.sh's `fix_link_state`'s `unfenced` + `gsub("<!--...-->")` EXACTLY
- * (`codex-review.sh:520-545`): a `Fixes-PR:` line inside either is an example or a
+ * (`codex-review.sh`): a `Fixes-PR:` line inside either is an example or a
  * template being quoted, not a real link, and must not be read as one — the same reason
  * `fix_link_state` strips both before testing `FIXES_PR_LINE_RE` at merge time. Fence
  * rule: up to 3 leading spaces, then 3+ backticks or 3+ tildes opens one; only a BARE
@@ -338,7 +337,7 @@ export function isFixTitle(title: string): boolean {
 // so it can tell a real same-repo reference from a cross-repo one and from `none`.
 const FIXES_PR_LINE_VALUE_RE = /^[ \t]*Fixes-PR:[ \t]*(.*)$/gim;
 // `owner/repo#N` (GitHub's cross-repo shorthand — a different repository's numbering,
-// e.g. `nanocoai/nanoclaw#605` is upstream's #605, never this repo's) and any
+// e.g. `nanocoai/nanoclaw#N` is upstream's PR N, never this repo's) and any
 // parenthetical remark that names "upstream" at all (e.g. `(upstream already covers
 // this)`) — both are stripped from a value before its `#N`s are read as OUR PR numbers.
 const CROSS_REPO_OR_UPSTREAM_RE = /\([^)]*\bupstream\b[^)]*\)|[\w.-]+\/[\w.-]+#\d+/gi;
@@ -347,12 +346,11 @@ const NONE_TOKEN_RE = /\bnone\b/i;
 /**
  * Every same-repo PR number a `Fixes-PR:` line names — link(s) only, `none` credits
  * nothing. Handles more than one `Fixes-PR:` line, and more than one `#N` on one line
- * (`Fixes-PR: #605, #620`). Fenced/commented occurrences are never read (see
+ * (`Fixes-PR: #N, #M`). Fenced/commented occurrences are never read (see
  * `stripFencedAndCommented`); a cross-repo `owner/repo#N` or an "(upstream ...)"
  * parenthetical is stripped before numbers are read, so neither is credited as this
  * repo's own PR. **`none` anywhere alongside a real number anywhere else — same line or
- * a separate one — credits NOTHING at all**, per the coordinator's "`none` followed by
- * `#2` must credit nothing": an internally contradictory declaration cannot be trusted
+ * a separate one — credits NOTHING at all**: an internally contradictory declaration cannot be trusted
  * for either signal, so the whole extraction returns `[]` rather than picking a side.
  */
 export function extractFixesPrNumbers(body: string): number[] {
@@ -437,25 +435,20 @@ export function filesOverlap(a: string[], b: string[]): boolean {
 
 /**
  * `Revert "..."` (GitHub's auto-revert template) generalized to "starts with the word
- * revert" so it also matches this repo's real convention, `revert(scope): ...` (#610) —
- * see file header.
+ * revert" so it also matches this repo's real convention, `revert(scope): ...` — see
+ * file header.
  */
 const REVERT_TITLE_RE = /^\s*revert\b/i;
 
 /**
  * `Reverts #N` / `This reverts ... #N`, ANCHORED TO A LINE'S START (`^`, multiline) —
- * not a bare search anywhere in the body. `#653`'s own body is the concrete case this
- * fixes: its prose explains this repo's revert convention by QUOTING #610's title —
- * `` `revert(runner): back out ending a task stream after its result (#608)` `` — and
- * separately says "revert matching including the real #610 shape" and "the one real
- * revert in the window (#610 reverting #608)". The unanchored version matched all three
- * as if #653 itself named a revert target; #653 never reverted anything, and its title
- * isn't revert-shaped either. Every one of those three matches sits mid-sentence (a
- * quoted title inside backticks, a `-`-bulleted list item's prose, an ordinary
- * sentence) — none starts its own line with `revert(s)`, so anchoring excludes all
- * three while keeping every real case this suite already covers: `Reverts #608 because
- * it broke prod.`, `This reverts #608 (merge ...)`, and GitHub's own `This reverts pull
- * request #608.` template — every one of those genuinely opens its line with the word.
+ * not a bare search anywhere in the body. A PR body that merely DISCUSSES a revert —
+ * quoting a revert PR's title inside backticks, or mentioning it in a bulleted item or
+ * an ordinary sentence — must not read as naming a revert target. Such mentions sit
+ * mid-sentence; none starts its own line with `revert(s)`, so anchoring excludes them
+ * while keeping every real form: `Reverts #N because it broke prod.`,
+ * `This reverts #N (merge ...)`, and GitHub's own `This reverts pull request #N.`
+ * template — every one of those genuinely opens its line with the word.
  * Gap after the word capped at 60 chars, same line, same as before.
  */
 const REVERT_BODY_LINE_RE = /^[ \t]*(?:this\s+)?reverts?\b[^\n#]{0,60}?#(?<num>\d+)\b/gim;
@@ -545,7 +538,7 @@ const SHADOW_REVIEW_TITLE_RE = /^shadow review:\s*#(\d+)\b/i;
 // The workflow's "File findings" step (shadow-review.yml) renders every finding as its
 // own bullet starting "- **P1** — " or "- **P2** — ". Anchored to that bullet start
 // (multiline `^`), not a bare `\bP1\b`, so a P2 finding whose free-text description
-// happens to mention "P1" — e.g. "similar to the P1 in #642" — isn't counted as one.
+// happens to mention "P1" — e.g. "similar to the P1 in #N" — isn't counted as one.
 // Case-insensitive so a casing drift in the rendering doesn't silently undercount.
 const P1_LINE_RE = /^- \*\*P1\*\*/im;
 
@@ -612,7 +605,7 @@ const REVIEW_REQUESTED_LABEL = 'review:requested';
 
 /**
  * Mirrors the LABEL half of `shadow-review.yml`'s own selection rule (`report`'s
- * job-level `if:`, shadow-review.yml:350-356): eligible for shadow review when CURRENT
+ * job-level `if:`, shadow-review.yml): eligible for shadow review when CURRENT
  * labels include neither `risk:high` nor `review:requested`. The base-ref half of that
  * same `if:` (`github.event.pull_request.base.ref == 'main'`) is checked separately in
  * `computeShadowCoverage` via `baseRefName`, since it isn't a label. Used by
@@ -626,7 +619,7 @@ export function isEligibleForShadowReview(labels: string[]): boolean {
 
 /**
  * Composes `isLowRisk` (the file-glob half of `codex-review.sh`'s `scope_eval`
- * skip-verdict rule, `codex-review.sh:750`,`:765-767`) with `isEligibleForShadowReview`
+ * skip-verdict rule, `codex-review.sh`) with `isEligibleForShadowReview`
  * (the identical label check `shadow-review.yml`'s own selection rule uses) against
  * `riskHighGlobs`/`pr.labels` AS GIVEN — CURRENT state, whatever the caller passes.
  *
@@ -635,9 +628,9 @@ export function isEligibleForShadowReview(labels: string[]): boolean {
  * PR's CURRENT labels, which can drift from what they were at its merge (see
  * `computeShadowCoverage`'s own `LABEL_DRIFT_CAVEAT`). Calling this with CURRENT globs
  * against an OLD PR silently answers "would this merge on skip TODAY", not "did it merge
- * on skip AT ITS OWN MERGE" — the exact bug PR #620 exposed (skipped correctly under the
- * 22 globs live at its merge; flips to "reviewed" under the 62 live now, and #620 is
- * itself a linked bug-introducer, so the flip hides a real miss). The weekly report's
+ * on skip AT ITS OWN MERGE" — a PR skipped correctly under the globs live at its merge
+ * can flip to "reviewed" under today's, and if it is a linked bug-introducer the flip
+ * hides a real miss. The weekly report's
  * post-gate reviewed/skipped lane split uses `classifyAtMergeVerdict` below instead,
  * which replays `.github/labeler.yml` and labels AS THEY STOOD at each PR's own merge.
  * This function stays exported for ad-hoc "under today's rules" questions, where CURRENT
@@ -663,19 +656,14 @@ export function classifyAtMergeVerdict(ctx: AtMergeContext | null | undefined): 
 const SHADOW_REVIEW_BASE_REF = 'main';
 
 /**
- * When the risk-scoped merge gate effectively went live: PR #609's `mergedAt`
- * (`gh pr view 609 --json mergedAt` against davekim917/nanoclaw —
- * `2026-09-10T16:43:32Z`, 16 seconds after #605). #609, not #605, is the commit that
- * actually SHIPS `.github/labeler.yml` (title: "ci: label PRs that touch high-risk
- * paths (observe-only)") — before it, `repo_mode` reads no labeler.yml at all and
- * `scope_eval` answers `auto`/legacy (`codex-review.sh:~622-634`), the same as no gate
- * existing yet. #605 itself (the merge-check code) merged 16 seconds EARLIER and is
- * therefore pre-gate under this constant — it belongs there: #605 is a linked
- * bug-introducer (fixed by #642), and reading it as post-gate-but-unresolved would make
- * it vanish from the report instead of landing in the pre-gate class where it's honest.
+ * When the risk-scoped merge gate effectively went live: the `mergedAt` of the PR that
+ * SHIPS `.github/labeler.yml` — before it, `repo_mode` reads no labeler.yml at all and
+ * `scope_eval` (`codex-review.sh`) answers `auto`/legacy, the same as no gate existing
+ * yet. The merge-check code itself merged seconds earlier and is therefore pre-gate
+ * under this constant, which is where it belongs.
  *
- * Compared with STRICT `>`, not `>=`: #609 is the commit that ships the file, so a PR
- * merged in the SAME instant as #609 (i.e. #609 itself) was not yet governed by it.
+ * Compared with STRICT `>`, not `>=`: the PR merged at this instant is the one that
+ * ships the file, so it was not yet governed by it.
  * Every PR merged before or AT this instant is auto-reviewed — there was no skip
  * verdict to have merged on — so the weekly report classifies it by a plain
  * low-risk/high-risk file class (`isLowRisk` against the CURRENT glob list, same as the
@@ -689,9 +677,8 @@ const SHADOW_REVIEW_BASE_REF = 'main';
 export const GATE_GO_LIVE_ISO = '2026-09-10T16:43:32Z';
 
 /**
- * When the `Fixes-PR:` convention started: PR #642's `mergedAt` (verified via
- * `gh pr view 642 --json mergedAt`; #642 introduced the gate-integrity change that
- * requires the trailer on `fix`-titled PRs — plan.md, Tier 1 status). Pinned as a
+ * When the `Fixes-PR:` convention started: the `mergedAt` of the gate-integrity change
+ * that requires the trailer on `fix`-titled PRs (plan.md, Tier 1 status). Pinned as a
  * constant, NOT recomputed via `findConventionStartIso` over each run's own fetch
  * window: a window that doesn't reach back far enough would compute a LATER date than
  * the truth, silently misclassifying weeks that are actually link-complete as
@@ -703,7 +690,7 @@ export const FIXES_PR_CONVENTION_START_ISO = '2026-09-11T12:44:10Z';
 // ─────────────────────────── at-merge replay (pure) ────────────────────────
 //
 // The pure half of reconstructing a PR's `AtMergeContext` — codex-review.sh `audit`'s
-// own two mechanisms (`codex-review.sh:663-701` for the base, `:1660-1695` for labels),
+// own two mechanisms (both in `codex-review.sh`),
 // factored so each is independently testable without a real merge commit or GraphQL
 // response. The I/O half (fetching the merge commit's shape, its label-event timeline,
 // the compare listing, and `.github/labeler.yml` AT that base) lives in the "gh I/O"
@@ -719,7 +706,7 @@ export interface RawLabelEvent {
 /**
  * Replays a PR's label history up to (and including) `mergedAtIso`, mirroring
  * `codex-review.sh`'s `audit` case's own `reduce` over `labelEvents` sorted by
- * `createdAt` (`codex-review.sh:1688-1691`): a `LabeledEvent` adds the name, an
+ * `createdAt` (`codex-review.sh`): a `LabeledEvent` adds the name, an
  * `UnlabeledEvent` removes it, applied strictly in time order, and anything after the
  * merge is not read at all — labels the PR grew or lost afterward say nothing about
  * what the gate saw when it merged.
@@ -767,8 +754,7 @@ export function resolveAtMergeBaseSha(shape: MergeCommitShape): string | null {
 }
 
 /**
- * When shadow review went live: PR #660's merge time (`gh pr view 660 --json mergedAt`
- * against davekim917/nanoclaw). PRs merged before this were never candidates for shadow
+ * When shadow review went live (the merge time of the PR that enabled it). PRs merged before this were never candidates for shadow
  * review at all, so `computeShadowCoverage` excludes them from its denominator.
  */
 export const SHADOW_REVIEW_GO_LIVE_ISO = '2026-09-11T15:59:15Z';
@@ -1059,7 +1045,7 @@ export function computeReport(
 // matching method, so a number here is not directly comparable to Cosmos's, only to an
 // earlier run of this same query.
 //
-// **Pre-gate vs. post-gate.** `GATE_GO_LIVE_ISO` (PR #605) is when the skip verdict
+// **Pre-gate vs. post-gate.** `GATE_GO_LIVE_ISO` is when the skip verdict
 // itself started existing. A PR merged before it was auto-reviewed unconditionally —
 // there was no gate to have merged on skip — so counting it as "reviewed" or "skipped"
 // answers a question that didn't apply yet. Such a PR gets a purely DESCRIPTIVE
@@ -1067,11 +1053,9 @@ export function computeReport(
 // same as the before/after bucket already does), reported under `preGate*` fields, never
 // folded into `reviewed`/`skipped`. A PR merged at or after go-live gets the real verdict,
 // replayed AT ITS OWN MERGE via `classifyAtMergeVerdict`/`AtMergeContext` — never a
-// CURRENT-state replay: the `risk:high` glob list has grown from 22 at go-live to 62 as
-// of this file's last edit, and PR #620 is the concrete case that growth mis-scores under
-// a naive CURRENT-state replay (skipped correctly under the 22 globs live at its merge;
-// flips to "reviewed" under the 62 live now — and #620 is itself a linked
-// bug-introducer, so the flip would have hidden a real miss instead of exposing it). A
+// CURRENT-state replay: the `risk:high` glob list grows, so a PR skipped correctly under
+// the globs live at its merge can flip to "reviewed" under today's — and if it is a
+// linked bug-introducer, the flip hides a real miss instead of exposing it. A
 // week whose PRs straddle go-live (`isMixedGateWeek`) reports BOTH the pre-gate
 // descriptive counts and the post-gate verdict counts, clearly separated, so the table
 // can't be misread as one uniform "reviewed vs skipped" split.
@@ -1080,8 +1064,8 @@ export function computeReport(
 // count — the only one this file treats as ground truth, never the overlap heuristic)
 // when EITHER a later PR names it via `Fixes-PR:` OR a later PR reverts it
 // (`findRevert`), both within `followupDays` — a revert is exactly as strong evidence
-// that a PR introduced a bug as a linked fix is, and #608 (reverted by #610, never
-// itself `Fixes-PR:`-linked) would otherwise silently not count as one.
+// that a PR introduced a bug as a linked fix is, and a reverted PR that no later PR
+// names in `Fixes-PR:` would otherwise silently not count as one.
 
 /** One lane's (overall / reviewed / skipped) follow-up counts for one week. `linked` is
  *  the GROUND-TRUTH count — a `Fixes-PR:` link OR a revert found within the window (see
@@ -1229,8 +1213,8 @@ function buildWeeklyRow(
   const goLiveMs = new Date(GATE_GO_LIVE_ISO).getTime();
   const conventionStartMs = new Date(FIXES_PR_CONVENTION_START_ISO).getTime();
 
-  // Strict `>`/`<=`: GATE_GO_LIVE_ISO is #609's OWN mergedAt (the commit that ships
-  // labeler.yml), so #609 itself is pre-gate — see that constant's own doc comment.
+  // Strict `>`/`<=`: GATE_GO_LIVE_ISO is the OWN mergedAt of the PR that ships
+  // labeler.yml, so that PR itself is pre-gate — see that constant's own doc comment.
   // `preGateOverride` is belt-and-braces: a PR that is post-gate BY DATE but whose own
   // base commit had no labeler.yml yet (resolveAtMergeContexts) is still reclassified
   // pre-gate, never left to vanish as merely "unresolved".
@@ -1641,8 +1625,8 @@ function fetchMergedPrsForSlice(repo: string, slice: MergedPrSearchSlice): PullR
 }
 
 /** How long `verifyMergedPrTotalCount` waits before its one retry — long enough for
- *  GitHub's search index to catch up on a just-completed merge, per the round-4 review
- *  receipt on #706 ("the search index can lag a very recent merge"). */
+ *  GitHub's search index to catch up on a just-completed merge (the search index can lag
+ *  a very recent merge). */
 const SEARCH_TOTAL_COUNT_RETRY_WAIT_MS = 3000;
 
 /** Blocks the calling thread for `ms` milliseconds, synchronously. This whole file is
@@ -1748,7 +1732,7 @@ export const UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS = 2 * 60 * 1000;
  * whatever ref happens to be checked out when the script happens to run.
  *
  * This replaces a captured wall-clock `new Date().toISOString()` as the search window's
- * `until` bound (the #706 P2, review round 2 on #717). With wall-clock `now`, a PR that
+ * `until` bound. With wall-clock `now`, a PR that
  * merged into `main` in the gap between `review-metrics.yml`'s `actions/checkout` and
  * this script's live `gh pr list --search` call minutes later — after `pnpm install` —
  * was IN the window (its `mergedAt` <= wall-clock now) even though its merge commit was
@@ -1756,10 +1740,9 @@ export const UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS = 2 * 60 * 1000;
  * with a `git fetch --no-tags origin <sha>` retry on a local miss, but that retry cannot
  * authenticate in `review-metrics.yml`: the repo is private and the workflow checks out
  * with `persist-credentials: false`, so an unauthenticated fetch gets a 401 in Actions —
- * confirmed against workflow run 34675405074's log, which shows checkout removing its
- * auth header. The fallback only ever worked on a host with its own git credential
- * helper (`gh auth git-credential`), which the CI runner is not, so a PR merging mid-job
- * (#695's case) was still reported unresolved in Actions specifically.
+ * checkout removes its auth header. The fallback only ever worked on a host with its own
+ * git credential helper (`gh auth git-credential`), which the CI runner is not, so a PR
+ * merging mid-job was still reported unresolved in Actions specifically.
  *
  * Deriving `untilIso` from the checkout's OWN `origin/main` tip instead makes the
  * window's end deterministic and reproducible from that one commit: every merged PR the
@@ -1806,8 +1789,7 @@ export function resolveMainTipUntilIso(marginMs: number = UNTIL_ISO_SEARCH_INDEX
  *  into `resolveMainTipUntilIso` so that function's return type and tested error
  *  messages stay untouched. Threaded into the weekly report's window line so a human
  *  reading the posted comment (or the plain-console form) can see the exact commit
- *  `untilIso` was derived from, not just the derived timestamp — the #717 round-2 P3:
- *  with only `untilIso` in `--json`'s `until` field, a hand run against a stale
+ *  `untilIso` was derived from, not just the derived timestamp: with only `untilIso` in `--json`'s `until` field, a hand run against a stale
  *  `origin/main` (fetched days ago) silently cut the current week short with nothing in
  *  the posted comment saying so.
  */
@@ -1959,15 +1941,13 @@ function git(args: readonly string[]): string {
  *  local miss, to cover a PR merging into `main` in the gap between
  *  `review-metrics.yml`'s `actions/checkout` (which runs once, at job start) and this
  *  script's live `gh pr list --search`/`search/issues` calls minutes later, after `pnpm
- *  install` (#706 round 1; reproduced live against davekim917/nanoclaw on 2026-09-12,
- *  workflow run 34675405074: PR #695 merged 24s into that run, and its merge commit was
- *  absent from the checkout). That fallback cannot authenticate in `review-metrics.yml`
+ *  install` (a PR merged seconds into a run is absent from that run's checkout). That
+ *  fallback cannot authenticate in `review-metrics.yml`
  *  though: the repo is private, and the workflow checks out with
- *  `persist-credentials: false` — confirmed against that same run's log, which shows
- *  checkout removing its auth header — so an unauthenticated `git fetch` gets a 401 in
+ *  `persist-credentials: false`, and checkout removes its auth header — so an unauthenticated `git fetch` gets a 401 in
  *  Actions specifically. The fallback only ever worked on a host with its own git
  *  credential helper (`gh auth git-credential`), which the CI runner is not, so a PR
- *  merging mid-job was STILL reported unresolved there (#717 review round 1 P2).
+ *  merging mid-job was STILL reported unresolved there.
  *
  *  Fixed properly instead by capping the search window's end at `origin/main`'s own tip
  *  (`resolveMainTipUntilIso`, used to build `untilIso` in `main()`): every merged PR this
@@ -2116,7 +2096,7 @@ export function parseGitNameStatus(raw: string): GitDiffEntry[] {
 /**
  * The merge commit's diff against `baseSha`, from LOCAL git (`git diff --name-status -M
  * -z` — see `GitDiffEntry`'s own doc comment for why `-z`) — mirroring `codex-review.sh
- * scope_eval`'s own completeness rule (`codex-review.sh:756-767`) even though a local
+ * scope_eval`'s own completeness rule (`codex-review.sh`) even though a local
  * diff has no true 300-file cap of its own: if the listed count doesn't match GitHub's
  * own `changedFiles` for this PR, the listing is treated as incomplete/suspect the same
  * way the gate's own REST-capped comparison would be — `null` (fail closed), never a
@@ -2125,9 +2105,9 @@ export function parseGitNameStatus(raw: string): GitDiffEntry[] {
  * `'over-cap'` is a DIFFERENT answer from `null`, for a count that reaches 300: GitHub's
  * own `compare` endpoint the gate reads truncates at exactly 300 files
  * (docs.github.com/en/rest/commits/commits#compare-two-commits), so `scope_eval`'s own
- * `$listed >= 300` check (`codex-review.sh:764`) ALWAYS trips for a real >=300-file PR —
+ * `$listed >= 300` check (`codex-review.sh`) ALWAYS trips for a real >=300-file PR —
  * the gate's own verdict there is a deterministic `review` (the caught error becomes a
- * non-empty reason list, which takes the `review` branch, `codex-review.sh:777-779`),
+ * non-empty reason list, which takes the `review` branch, `codex-review.sh`),
  * never a "maybe-incomplete listing" the way an actual count MISMATCH below 300 is.
  * `resolveAtMergeFileContextLocal` surfaces `'over-cap'` as its own `'review'` kind so
  * the replay matches the gate exactly there, instead of folding it into the
@@ -2149,7 +2129,7 @@ export function fileDiffAtMergeLocal(
     return null;
   }
   const entries = parseGitNameStatus(raw);
-  if (entries.length >= 300) return 'over-cap'; // codex-review.sh:764 — the gate's own fail-closed-to-`review` cap
+  if (entries.length >= 300) return 'over-cap'; // codex-review.sh — the gate's own fail-closed-to-`review` cap
   if (entries.length !== changedFiles) return null; // count mismatch — incomplete or wrong listing
   const names = new Set<string>();
   for (const e of entries) {
@@ -2163,7 +2143,7 @@ export type LocalAtMergeFileContext =
   | { kind: 'resolved'; files: string[]; riskHighGlobs: string[] }
   | { kind: 'pre-gate' }
   /** >=300 changed files (`fileDiffAtMergeLocal`'s `'over-cap'`): the gate itself
-   *  deterministically answers `review` for this case (`codex-review.sh:764`), so the
+   *  deterministically answers `review` for this case (`codex-review.sh`), so the
    *  replay must too — never left `unresolved`, which would undercount `reviewed`. */
   | { kind: 'review' }
   | { kind: 'unresolved' };
@@ -2309,7 +2289,7 @@ export function resolveAtMergeContexts(
         continue;
       }
       // >=300 changed files: the gate answers `review` deterministically regardless of
-      // labels (codex-review.sh:764,777-779 — the caught cap error alone makes the
+      // labels (codex-review.sh — the caught cap error alone makes the
       // reason list non-empty), so no label-history lookup is needed for this PR at all.
       if (fileContext.kind === 'review') {
         result.set(pr.number, { atMergeContext: null, preGateOverride: false, atMergeForcedVerdict: 'review' });
@@ -2413,10 +2393,8 @@ export function fetchShadowReviewedPRs(repo: string): number[] {
 function parseArgs(argv: readonly string[]): Options {
   const options: Options = {
     repo: 'davekim917/nanoclaw',
-    // The gate's actual go-live instant (GATE_GO_LIVE_ISO, PR #605's mergedAt) — not a
-    // rounded midnight. Before this correction the default read 2026-09-10T00:00:00Z,
-    // over 16 hours earlier than the real switch, which misclassified every PR merged
-    // in that gap as "after" when the gate hadn't gone live yet.
+    // The gate's actual go-live instant — not a rounded midnight, which would
+    // misclassify every PR merged between midnight and the real switch as "after".
     switchIso: GATE_GO_LIVE_ISO,
     days: 30,
     followupDays: 14,

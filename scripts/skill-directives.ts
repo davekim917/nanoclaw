@@ -23,7 +23,7 @@
 //        dest still copies fresh, but a PRESENT dest is compared to the
 //        branch and REFUSED (bounced to an agent, not overwritten) if it
 //        diverged — protects e.g. a customized Slack/Discord adapter from a
-//        stale registry-branch replay (#250). ApplyOptions.force overrides
+//        stale registry-branch replay. ApplyOptions.force overrides
 //        the refusal.
 //   append to:<file> [at:<marker>]  body: line(s) to add             skip if present
 //   dep [manager:pnpm]      body: `pkg@<exact-semver>` line(s)        reinstall no-op
@@ -177,7 +177,7 @@ export function promptVar(d: Directive): string | undefined {
  * `['dm_channel']` (stdout form); `capture:platform_id=PLATFORM_ID,owner=ACCOUNT`
  * → `['platform_id','owner']` (effect:step field form).
  */
-export function captureVars(spec: string): string[] {
+function captureVars(spec: string): string[] {
   if (!spec.includes('=')) return [spec];
   return spec
     .split(',')

@@ -63,7 +63,7 @@ export interface SnapshotEntry {
   snapshotPath?: string;
 }
 
-export interface WorkgroupMigration {
+interface WorkgroupMigration {
   workgroupId: string;
   status: 'inventoried' | 'cutover-started' | 'applied' | 'blocked' | 'rolled-back';
   canonicalPath: string;

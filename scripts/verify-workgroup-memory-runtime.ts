@@ -31,14 +31,14 @@ const MAX_SESSION_ROWS = 100_000;
 const MAX_NATIVE_PROJECT_DIRS = 512;
 const REQUIRED_RECALL_KEYS = ['memoryEvidence', 'conversationEvidence', 'notices'] as const;
 
-export interface VerificationIssue {
+interface VerificationIssue {
   code: string;
   severity: Severity;
   subject?: string;
   detail?: string;
 }
 
-export interface RuntimeMemberVerification {
+interface RuntimeMemberVerification {
   id: string;
   folder: string;
   provider: string | null;
@@ -56,7 +56,7 @@ export interface RuntimeMemberVerification {
   }>;
 }
 
-export interface RuntimeSessionVerification {
+interface RuntimeSessionVerification {
   id: string;
   agentGroupId: string;
   messagingGroupId: string | null;
@@ -69,7 +69,7 @@ export interface RuntimeSessionVerification {
   issues: VerificationIssue[];
 }
 
-export interface RuntimeWorkgroupVerification {
+interface RuntimeWorkgroupVerification {
   id: string;
   status: VerificationStatus;
   canonical: {

@@ -427,7 +427,7 @@ export function installProviderMemoryPayload(
   }
 }
 
-export function gitRefReader(projectRoot: string, ref: string): PayloadReader {
+function gitRefReader(projectRoot: string, ref: string): PayloadReader {
   return (relativePath) => {
     try {
       return execFileSync('git', ['show', `${ref}:${relativePath}`], {
@@ -442,7 +442,7 @@ export function gitRefReader(projectRoot: string, ref: string): PayloadReader {
   };
 }
 
-export function treeReader(projectRoot: string): PayloadReader {
+function treeReader(projectRoot: string): PayloadReader {
   return (relativePath) => {
     try {
       return fs.readFileSync(path.join(projectRoot, relativePath), 'utf8');
