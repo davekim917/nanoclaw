@@ -12,7 +12,7 @@
  * policy module (scripts/skill-policy.ts): the natural-barrier gate confirm,
  * the URL offer, the prose-derived validation message.
  */
-import { execSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
@@ -92,7 +92,9 @@ export interface PrompterContext {
  * against the prompt's declared `validate:`/`flags:` (the engine's
  * validate-at-bind is the programmatic backstop, not the UX).
  */
-export function clackResolveInput(ctx: PrompterContext = {}): (name: string, meta: InputMeta) => Promise<string | undefined> {
+export function clackResolveInput(
+  ctx: PrompterContext = {},
+): (name: string, meta: InputMeta) => Promise<string | undefined> {
   // The `?` help-escape is only meaningful at a real terminal: it hands the
   // operator off to an interactive Claude session (stdio inherited). In a
   // headless / non-TTY run nobody can type `?` into a clack prompt anyway, and
@@ -234,7 +236,8 @@ async function reuseFromEnv(
     // stale credential that no longer matches the declared shape is never
     // offered — prompting fresh beats a loud validate-at-bind dead-end.
     const shape = promptShape.get(v);
-    if (shape?.validate && !new RegExp(shape.validate, shape.flags).test(normalizeValue(existing, shape.normalize))) continue;
+    if (shape?.validate && !new RegExp(shape.validate, shape.flags).test(normalizeValue(existing, shape.normalize)))
+      continue;
     if (await confirm(`Found an existing ${key} (${maskValue(existing)}). Use it?`)) reuse[v] = existing;
   }
   return reuse;
@@ -274,14 +277,22 @@ export function hostExec(projectRoot: string, rawLog?: string): (cmd: string) =>
       });
       let out = '';
       let err = '';
-      child.stdout.on('data', (c: Buffer) => { out += c.toString('utf8'); });
-      child.stderr.on('data', (c: Buffer) => { err += c.toString('utf8'); });
+      child.stdout.on('data', (c: Buffer) => {
+        out += c.toString('utf8');
+      });
+      child.stderr.on('data', (c: Buffer) => {
+        err += c.toString('utf8');
+      });
       child.on('error', reject);
       child.on('close', (code) => {
         tee(cmd, out, err);
         if (code === 0) return resolve(out);
         const stderr = err.trim();
-        const head = stderr.split('\n').map((l) => l.trim()).find(Boolean) ?? 'command failed';
+        const head =
+          stderr
+            .split('\n')
+            .map((l) => l.trim())
+            .find(Boolean) ?? 'command failed';
         reject(new Error(`exit ${code ?? '?'}: ${head}${stderr ? `\n${stderr}` : ''}`));
       });
     });
@@ -325,8 +336,15 @@ export function hostExecStream(projectRoot: string): (cmd: string) => Promise<St
         while ((idx = buf.indexOf('\n')) !== -1) {
           const line = buf.slice(0, idx);
           buf = buf.slice(idx + 1);
-          if (/^=== NANOCLAW SETUP: \S+ ===/.test(line)) { current = { fields: {} }; continue; }
-          if (line.startsWith('=== END ===')) { if (current) blocks.push(current); current = null; continue; }
+          if (/^=== NANOCLAW SETUP: \S+ ===/.test(line)) {
+            current = { fields: {} };
+            continue;
+          }
+          if (line.startsWith('=== END ===')) {
+            if (current) blocks.push(current);
+            current = null;
+            continue;
+          }
           if (current) {
             const c = line.indexOf(':');
             if (c > 0) current.fields[line.slice(0, c).trim()] = line.slice(c + 1).trim();
@@ -426,16 +444,6 @@ function defaultOnEvent(
   };
 }
 
-/** Fork-aware registry-branch remote shared by structured channel installs. */
-function channelsRemote(projectRoot: string): () => string {
-  return () =>
-    execSync('source setup/lib/channels-remote.sh; resolve_channels_remote', {
-      cwd: projectRoot,
-      shell: '/bin/bash',
-      encoding: 'utf8',
-    }).trim();
-}
-
 export interface RunSkillOptions {
   projectRoot?: string;
   /** Pre-supplied prompt answers — pass them all for a fully programmatic run. */
@@ -450,7 +458,7 @@ export interface RunSkillOptions {
   exec?: (cmd: string) => string | void | Promise<string | void>;
   /** Defaults to `hostExecStream`. Streaming exec for `nc:run effect:step`. */
   execStream?: (cmd: string) => Promise<StepOutcome>;
-  /** Defaults to the fork-aware channels-branch resolver. */
+  /** Defaults to the engine's `resolveRegistryRemote`. */
   resolveRemote?: (branch: string) => string;
   /** Run effects the caller owns (e.g. `['restart']` when it restarts once). */
   skipEffects?: string[];
@@ -531,7 +539,7 @@ export async function runSkill(skillDir: string, opts: RunSkillOptions = {}): Pr
     onEvent: opts.onEvent ?? defaultOnEvent(md, confirm, open),
     exec: opts.exec ?? hostExec(projectRoot, rawLog),
     execStream: opts.execStream ?? hostExecStream(projectRoot),
-    resolveRemote: opts.resolveRemote ?? channelsRemote(projectRoot),
+    resolveRemote: opts.resolveRemote,
     skipEffects: opts.skipEffects,
     force: opts.force,
   });

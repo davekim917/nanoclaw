@@ -1,7 +1,7 @@
-import type Database from 'better-sqlite3';
+import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 
-import { getRecoverableLifecycleStatus } from './lookups.js';
+import { getRecoverableLifecycleStatus, getTaskListSettlement } from './lookups.js';
 
 /**
  * getRecoverableLifecycleStatus's SQL admits only rows SQLite calls
@@ -79,5 +79,42 @@ describe('getRecoverableLifecycleStatus', () => {
       bad: { platform_message_id: 'pm-bad', lifecycle_terminal_at: null },
     });
     expect(getRecoverableLifecycleStatus(inbound, outbound)).toBeNull();
+  });
+});
+
+describe('getTaskListSettlement', () => {
+  const killedAt = '2026-09-25T12:00:00.000Z';
+
+  function dbs(taskListValue: string | null): { inbound: Database.Database; outbound: Database.Database } {
+    const inbound = new Database(':memory:');
+    inbound.exec('CREATE TABLE delivered (message_out_id TEXT, platform_message_id TEXT, status TEXT)');
+    const outbound = new Database(':memory:');
+    outbound.exec(`
+      CREATE TABLE session_state (key TEXT PRIMARY KEY, value TEXT);
+      CREATE TABLE messages_out (id TEXT, kind TEXT, timestamp TEXT, channel_type TEXT, platform_id TEXT, thread_id TEXT);
+      INSERT INTO messages_out VALUES ('tl-1', 'task_list', '2026-09-25T11:59:00.000Z', 'slack', 'C1', 'T1');
+    `);
+    if (taskListValue !== null) {
+      outbound.prepare("INSERT INTO session_state (key, value) VALUES ('task_list', ?)").run(taskListValue);
+    }
+    return { inbound, outbound };
+  }
+
+  const liveList = JSON.stringify({ version: 1, touchedAt: '2026-09-25T11:59:30.000Z' });
+
+  it('settles a live list touched before the kill: its undelivered rows go stale', () => {
+    const { inbound, outbound } = dbs(liveList);
+    expect(getTaskListSettlement(inbound, outbound, killedAt)).toEqual({ staleRowIds: ['tl-1'], edit: null });
+  });
+
+  it('treats an unparseable task_list record as nothing to settle instead of throwing', () => {
+    const { inbound, outbound } = dbs('{"version": 1, "touchedAt"');
+    expect(getTaskListSettlement(inbound, outbound, killedAt)).toBeNull();
+  });
+
+  it('treats an outbound DB with no session_state table as nothing to settle instead of throwing', () => {
+    const { inbound, outbound } = dbs(liveList);
+    outbound.exec('DROP TABLE session_state');
+    expect(getTaskListSettlement(inbound, outbound, killedAt)).toBeNull();
   });
 });

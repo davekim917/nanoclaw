@@ -55,13 +55,11 @@ Run:
 If output is non-empty:
 - Tell the user to commit or stash first, then stop.
 
-Check remotes:
-- `git remote -v`
+Resolve the registry remote, the one skill installs fetch from (the `nanocoai/nanoclaw` remote; it adds `upstream` when no remote matches). On a fork this is usually not `origin`:
+- `bash -c 'source setup/lib/channels-remote.sh; resolve_channels_remote'`
 
-If `origin` does not point at a NanoClaw upstream (or you want to verify it has the skill branches), confirm with the user before continuing. The default upstream is `https://github.com/nanocoai/nanoclaw.git`.
-
-Fetch the branches that carry skill code:
-- `git fetch origin channels providers --prune`
+Use that name as `<remote>` below, and fetch the branches that carry skill code:
+- `git fetch <remote> channels providers --prune`
 
 # Step 1: Detect installed skills
 
@@ -94,7 +92,7 @@ owned by its copy directives or shell `git show` commands. For each path:
 1. Confirm the path exists on the candidate branch. A candidate missing a file
    required by the current installer or registration tests is `BLOCK`.
 2. Compare the candidate bytes with the live file without overwriting it:
-   `cmp -s <(git show origin/<branch>:<path>) <path>`.
+   `cmp -s <(git show <remote>/<branch>:<path>) <path>`.
 3. For every difference, inspect the complete candidate-to-live diff and the
    live file's relevant non-merge history. Classify live-only changes as:
    - required local customization or newer trunk integration;
@@ -134,7 +132,7 @@ For each selected skill (process one at a time):
 
 1. Tell the user which compatibility-cleared skill is being re-applied.
 2. Invoke the corresponding `/add-<name>` skill using the Skill tool.
-   - Its apply runs its own pre-flight, fetches the latest files from upstream (`git fetch origin <branch>` + `git show origin/<branch>:path > path`), overwrites the copied-in code, and installs any pinned dependency.
+   - Its apply runs its own pre-flight, fetches the latest files from upstream (`git fetch <remote> <branch>` + `git show <remote>/<branch>:path > path`), overwrites the copied-in code, and installs any pinned dependency.
    - Re-applying is additive: it refreshes only that skill's own files. The barrel import line is left in place if already present, and `.env` credentials and DB wiring are untouched.
 3. If a skill's apply reports a problem (a missing upstream file, a failing dependency install), record it and continue with the remaining skills.
 
