@@ -96,9 +96,9 @@ export interface AgentProvider {
    * `CLAUDE_CODE_OAUTH_TOKEN_2`), `position` its 1-based place in the ring
    * (primary is 1), and `ringSize` the ring's total length. Poll-loop passes
    * these through to the replayed turn so the agent knows it is running on a
-   * different credential than the one that just failed — the rotation catch
-   * calls this at poll-loop.ts:1010 and poll-loop.ts:1059 and hands the result
-   * to `formatCredentialRetryPrompt` at poll-loop.ts:1017. Omitted (along
+   * different credential than the one that just failed — the rotation catch in
+   * poll-loop.ts calls this and hands the result to
+   * `formatCredentialRetryPrompt`. Omitted (along
    * with `rotated: false`) when no rotation happened.
    */
   rotateApiKey?(): { rotated: boolean; slot?: string; position?: number; ringSize?: number };
@@ -127,8 +127,8 @@ export interface AgentProvider {
    * Restore the credential slot persisted by a previous instance of this
    * session's container (circular OAuth ring only — see
    * `ClaudeProvider.restorePersistedCredentialSlot`). Reads session state, so
-   * the runner entrypoint calls it once after the mailbox has started
-   * (`index.ts:97`) and the provider is built (`index.ts:308`); providers
+   * the runner entrypoint (`index.ts`) calls it once after the mailbox has
+   * started and the provider is built; providers
    * must not call it from their constructor or from `query()`.
    */
   restorePersistedCredentialSlot?(): void;
@@ -433,8 +433,7 @@ export interface AgentQuery {
    * sets it, `applySettings` updates it, and a NEW path cannot forget to
    * report because there is nothing to report — the caller reads. Recording
    * absence instead is what put a NULL model on unpinned fires in
-   * `task_run_outcomes`, the "can't tell what actually ran" hole #549 and
-   * #561 exist to close.
+   * `task_run_outcomes`, the "can't tell what actually ran" hole.
    *
    * REQUIRED, deliberately. It was optional for one release and the two
    * providers that did not implement it were simply forgotten — three review
@@ -622,6 +621,6 @@ export type ProviderEvent =
    * The poll-loop reacts by injecting a destination reminder back into
    * the live query so the agent doesn't drop `<message to="…">` wrapping
    * after compaction. Distinct from `result` so it doesn't mark the turn
-   * completed or get dispatched as a chat message. See qwibitai/nanoclaw#2325.
+   * completed or get dispatched as a chat message.
    */
   | { type: 'compacted'; text: string };

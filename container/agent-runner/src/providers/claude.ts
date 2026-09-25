@@ -312,7 +312,7 @@ export function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
  * Test-only override for the SDK `query` that `ClaudeProvider.query` calls.
  * The real one spawns the Claude Code CLI (`pathToClaudeCodeExecutable`
  * below), which inside an agent container exists and reaches the Anthropic
- * API through the credential proxy (#1072). Null in production, so the call
+ * API through the credential proxy. Null in production, so the call
  * site resolves `sdkQuery` at call time exactly as before (the live import
  * binding, which the existing `mock.module` suites also rely on).
  */
@@ -435,7 +435,7 @@ export const SUBAGENT_TOOL_NAMES = ['Agent', 'Task'] as const;
  * `TaskOutput` / `TaskStop` / `TaskCreate` the way an unanchored `Task` regex
  * would. The CLI's own config help states the same contract: "The matcher is
  * a string: a tool name ("Bash"), pipe-separated list ("Edit|Write"), or empty
- * to match all." (`HookCallbackMatcher.matcher?: string`, sdk.d.ts:867.)
+ * to match all." (`HookCallbackMatcher.matcher?: string` in sdk.d.ts.)
  */
 export const SUBAGENT_TOOL_MATCHER = SUBAGENT_TOOL_NAMES.join('|');
 
@@ -508,8 +508,7 @@ export const SDK_DISALLOWED_TOOLS = [
 // to append it here, the tool's user-visible command prompt would
 // surface despite bypassPermissions — inconsistent UX. Omitting the
 // enumeration keeps the surface open-by-default and relies on
-// `disallowedTools` above for explicit blocks. v1 reached the same
-// conclusion (src/agent-runner/index.ts:1056-1077 comment).
+// `disallowedTools` above for explicit blocks.
 
 interface SDKUserMessage {
   type: 'user';
@@ -661,14 +660,14 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
 
 /**
  * Tool calls this query currently has in flight, keyed by the SDK's
- * `tool_use_id` (sdk.d.ts:2589 PreToolUse, :2508 PostToolUse, :2489
- * PostToolUseFailure — every one of the three carries it).
+ * `tool_use_id` (the PreToolUse, PostToolUse and PostToolUseFailure inputs
+ * all carry it).
  *
  * WHY A KEYED MAP AND NOT A MATCHER. `postToolUseHook` is registered without a
  * matcher and used to clear `container_state` unconditionally, so with tools
  * running in PARALLEL the first one to finish erased the state belonging to a
  * still-running Bash — and `activeOperationTimeoutMs`
- * (src/modules/sweep-container-health/index.ts:545-548) then returns null, which
+ * (src/modules/sweep-container-health/index.ts) then returns null, which
  * collapses the host's ceiling back to ABSOLUTE_CEILING_MS and its claim
  * tolerance back to CLAIM_STUCK_MS. A matcher cannot fix that: `matcher: 'Bash'`
  * still cannot tell TWO parallel Bash calls apart, and it would additionally
@@ -706,16 +705,16 @@ function publishToolInFlight(): void {
   }
   // Write only when the DESCRIBED CALL changes. The writer stamps
   // `tool_started_at = now` on every call (container/agent-runner/src/mailbox/
-  // sqlite/connection.ts:145-156), and the host reads that stamp as the start
+  // sqlite/connection.ts), and the host reads that stamp as the start
   // of the tool it describes: `decideCeilingFollowUp` ages it against the
   // ceiling that fired to decide a wedged-tool wake
-  // (src/modules/sweep-continuation/decide.ts:42-57), the wake's dedupe key is
-  // built from it (sweep-continuation/index.ts:336), host-restart-warn feeds it
-  // to the same decision and keys its note on it (src/host-restart-warn.ts:249,
-  // :287), the dashboard marks a thread stalled by its age
-  // (src/dashboard/api/threads.ts:251-253), and `decideStuckAction` forgives a
+  // (src/modules/sweep-continuation/decide.ts), the wake's dedupe key is
+  // built from it (sweep-continuation/index.ts), host-restart-warn feeds it
+  // to the same decision and keys its note on it (src/host-restart-warn.ts),
+  // the dashboard marks a thread stalled by its age
+  // (src/dashboard/api/threads.ts), and `decideStuckAction` forgives a
   // claim made after it while that tool is in flight
-  // (src/modules/sweep-container-health/index.ts:552, :664). Re-publishing the
+  // (src/modules/sweep-container-health/index.ts). Re-publishing the
   // same long Bash because a parallel Read started or finished would move that
   // start forward: it would re-key the recovery, make a wedged tool look fresh,
   // and withdraw that claim forgiveness mid-operation.
@@ -740,7 +739,7 @@ export function resetToolInFlightTracking(): void {
 /**
  * Claude Code's Bash ceiling when `BASH_MAX_TIMEOUT_MS` is unset: the Bash
  * tool's input schema documents `timeout` as "max 600000"
- * (@anthropic-ai/claude-agent-sdk sdk-tools.d.ts:794, SDK 0.3.280).
+ * (@anthropic-ai/claude-agent-sdk sdk-tools.d.ts, SDK 0.3.280).
  */
 const CLAUDE_CODE_DEFAULT_BASH_MAX_TIMEOUT_MS = 600_000;
 
@@ -750,10 +749,10 @@ const CLAUDE_CODE_DEFAULT_BASH_MAX_TIMEOUT_MS = 600_000;
  * The model's `tool_input.timeout` is whatever number it typed, and the host
  * uses the published value unbounded — `Math.max(ABSOLUTE_CEILING_MS, declared)`
  * for the ceiling and `Math.max(CLAIM_STUCK_MS, declared)` for the claim
- * tolerance (src/modules/sweep-container-health/index.ts:585, :611). The CLI
+ * tolerance (src/modules/sweep-container-health/index.ts). The CLI
  * never runs a Bash call longer than `BASH_MAX_TIMEOUT_MS`, which the host pins
- * to 3600000 in the container env (src/group-init.ts:30, and the spawn's
- * `-e` at src/container-runner.ts:6488). So a declared `86400000` (or `1e12`) plus a
+ * to 3600000 in the container env (src/group-init.ts, and the spawn's
+ * `-e` in src/container-runner.ts). So a declared `86400000` (or `1e12`) plus a
  * wedged CLI or a leaked denied call would hold off both kills for a day (or
  * forever) while the Bash itself was long dead. Clamping to the enforced cap
  * bounds that at what the CLI would allow anyway.
@@ -905,8 +904,7 @@ const ANTHROPIC_FALLBACK_RE = /^ANTHROPIC_API_KEY_(\d+)$/;
 // OAuth (no ANTHROPIC_API_KEY), retryable errors advance through these.
 const OAUTH_FALLBACK_RE = /^CLAUDE_CODE_OAUTH_TOKEN_(\d+)$/;
 
-// Retryable upstream errors. v1's list — see
-// container/agent-runner/src/index.ts:470-478.
+// Retryable upstream errors.
 // `subscription_quota_exhausted` is our own marker (see QUOTA_RESULT_RE
 // below) — when the SDK returns the Claude Max quota message as a
 // normal result text instead of throwing, we re-throw with this prefix
@@ -1204,7 +1202,7 @@ export function createSubagentQuotaHook(options: {
 //     is also provided, stdin is appended as a <stdin> block"), so it blocked
 //     and died at the turn timeout (2026-06-27, a03dc6787: a CLAUDE agent).
 //   • snowflake-cli 3.23.0 treats an EMPTY `--query` as "no source given" and
-//     falls back to `sys.stdin.read()` (snowflake/cli/_plugins/sql/commands.py:175-176).
+//     falls back to `sys.stdin.read()` (snowflake/cli/_plugins/sql/commands.py).
 //     On 2026-09-22 `snow sql -c mr --query "$(cat /tmp/why0.sql)"` with the
 //     file never written left a production thread silent for 30 minutes
 //     (argv's last element was '' per /proc/<pid>/cmdline; wchan =
@@ -1240,7 +1238,7 @@ export function wrapDevNullStdin(command: string): string {
 // Two concurrent jest runs will OOM-kill this container no matter how each one
 // is configured. On 2026-08-09 one agent had two background suites going and
 // its container was OOM-killed 109 times in a single session; two siblings hit
-// 46 and 36. Worker sizing (XZO PR #691) bounds ONE run to fit the cgroup, but
+// 46 and 36. Worker sizing bounds ONE run to fit the cgroup, but
 // a run cannot see a sibling process, so the multiplication survives it.
 //
 // The invariant is "one jest at a time in this container", and the mechanical
@@ -1559,14 +1557,13 @@ export function createBlockCodexCompanionHook(): HookCallback {
 export const GWS_EMAIL_SEND_RE =
   /\bgws\s+gmail\s+(?:\+(?:send|reply|reply-all|forward)|users\s+(?:messages|drafts)\s+send)\b/;
 /** Inline mirror of email-gate-core.ts (this is the fail-closed FALLBACK, so it
- *  can't import the core). Keep in sync with the SoT. QA codex-#2/#3/#4. */
+ *  can't import the core). Keep in sync with the SoT. */
 const EMAIL_BYPASS_FLAGS = new Set(['--dry-run', '--draft', '--help', '-h']);
 // Includes `#` (comment: `… --body x # --dry-run` drops the flag at runtime) and
 // the NEWLINE separator `\n\r` — the bypass check runs on the WHOLE command, so a
 // `--dry-run\n<real send>` decoy must fail closed here (else `\s+` token-splitting
 // treats the newline as whitespace and the decoy's --dry-run reads as real argv
 // while bash runs the second line). Mirrors the SoT SHELL_METACHAR_RE.
-// QA codex re-pass #4 (comment) + #5 (newline decoy).
 const EMAIL_SHELL_METACHAR_RE = /[<>|;&$`(){}#\n\r]/;
 
 /** A bypass flag (--dry-run/--draft/--help/-h) is honored only as a real argv
@@ -1578,19 +1575,17 @@ const EMAIL_SHELL_METACHAR_RE = /[<>|;&$`(){}#\n\r]/;
  *  expansions / grouping / comments / newlines can divert the token from gws's
  *  argv while the mail still sends), then split on bash IFS (space/tab/newline,
  *  not JS \s) and match a whole flag token. After these rejections the tokens
- *  EXACTLY equal bash's argv words. Mirrors the SoT bypassFlagIsRealArgvToken.
- *  QA codex re-pass #1 (subshell) + #3 (redirection) + #4 (comment, ANSI-C)
- *  + #5 (newline) + #6 (backslash / non-IFS whitespace). */
+ *  EXACTLY equal bash's argv words. Mirrors the SoT bypassFlagIsRealArgvToken. */
 // Non-IFS, non-flag, non-metachar placeholder for a stripped quoted span. Using
 // a sentinel (not a space) keeps bash word-concatenation: `--body 'x'--dry-run`
 // joins to one word `x--dry-run` (no real flag), so the replacement must keep it
-// one token — a space would manufacture a bogus --dry-run (codex #7). Mirrors SoT.
+// one token — a space would manufacture a bogus --dry-run. Mirrors SoT.
 const EMAIL_QUOTED_SPAN_SENTINEL = '\x00';
 const EMAIL_LEADING_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 /** Mirrors SoT bypassFlagIsRealArgvToken: quote→sentinel, reject quote/backslash/
  *  metachar, then bind to a DIRECT gws invocation (skip VAR=value, require first
- *  word `gws` so a wrapper like `exec -a --dry-run gws …` can't swallow the flag —
- *  codex #8) and honor a bypass flag only in OPTION position (not as a prior bare
+ *  word `gws` so a wrapper like `exec -a --dry-run gws …` can't swallow the flag)
+ *  and honor a bypass flag only in OPTION position (not as a prior bare
  *  option's value). Fail-closed: every step only makes bypass LESS likely. */
 function emailBypassIsRealArgvToken(gwsSegment: string): boolean {
   // Strip NON-expanding quotes first (single + ANSI-C $'…' — no expansion), then
@@ -1600,7 +1595,7 @@ function emailBypassIsRealArgvToken(gwsSegment: string): boolean {
   // NUL-strip would otherwise hide it from the metachar check. Inspect the span
   // CONTENT (capture group) so the locale `$` prefix isn't counted. Only command
   // substitution executes — bare `$VAR`/`$5` is parameter expansion, so a legit
-  // `--body "cost is $5"` must still bypass. Mirrors SoT. (codex #126 P1)
+  // `--body "cost is $5"` must still bypass. Mirrors SoT.
   const safeStripped = gwsSegment
     .replace(/\$'(?:[^'\\]|\\.)*'/g, EMAIL_QUOTED_SPAN_SENTINEL)
     .replace(/'[^']*'/g, EMAIL_QUOTED_SPAN_SENTINEL);
@@ -1612,12 +1607,12 @@ function emailBypassIsRealArgvToken(gwsSegment: string): boolean {
     .replace(/\$"(?:[^"\\]|\\.)*"/g, EMAIL_QUOTED_SPAN_SENTINEL)
     .replace(/"(?:[^"\\]|\\.)*"/g, EMAIL_QUOTED_SPAN_SENTINEL);
   if (unquoted.includes("'") || unquoted.includes('"')) return false;
-  if (unquoted.includes('\\')) return false; // unquoted backslash escape → don't bypass (codex #6)
+  if (unquoted.includes('\\')) return false; // unquoted backslash escape → don't bypass
   if (EMAIL_SHELL_METACHAR_RE.test(unquoted)) return false;
   const tokens = unquoted.split(/[ \t\n]+/).filter((t) => t.length > 0); // bash IFS, not JS \s
   let i = 0;
   while (i < tokens.length && EMAIL_LEADING_ASSIGNMENT_RE.test(tokens[i])) i++; // skip VAR=value
-  if (tokens[i] !== 'gws') return false; // direct gws invocation only, no wrapper (codex #8)
+  if (tokens[i] !== 'gws') return false; // direct gws invocation only, no wrapper
   for (let j = i + 1; j < tokens.length; j++) {
     if (!EMAIL_BYPASS_FLAGS.has(tokens[j])) continue;
     const prev = tokens[j - 1];
@@ -1821,8 +1816,8 @@ export function createEmailGateHook(opts?: {
     const command = (pre.tool_input as { command?: string })?.command;
     if (!command) return {};
 
-    // The rewrite hook no longer prepends an `unset …;` prefix (codex #126 F1
-    // is moot), so the gate evaluates exactly what the agent wrote.
+    // The rewrite hook prepends no `unset …;` prefix, so the gate evaluates
+    // exactly what the agent wrote.
     const evalCommand = command;
 
     // Verdict (allow vs gate + pre-built card) comes from the shared core's
@@ -1839,8 +1834,7 @@ export function createEmailGateHook(opts?: {
         // unknown action). Anything that isn't a well-formed allow|gate is
         // untrusted → fall back to the inline fail-CLOSED evaluator. Without this,
         // `{action:'bogus'}` / `{}` would hit the non-'gate' branch below and ALLOW
-        // a real send unapproved. (codex #126 F2 — mirrors the codex-runner
-        // verdict-shape guard.)
+        // a real send unapproved. Mirrors the codex-runner verdict-shape guard.
         verdict = isWellFormedEmailVerdict(v) ? v : evaluateEmailSendInline(evalCommand, { isScheduledTask });
       } catch {
         verdict = evaluateEmailSendInline(evalCommand, { isScheduledTask });
@@ -2063,7 +2057,7 @@ export function createBlockGitCloneHook(): HookCallback {
 // passed as MCP server headers at registration time, not as Bash-visible env.
 // Forwarding them into the SDK's child-process env defeats that isolation.
 // Single source shared with the OpenCode provider (secret-env.ts) so the two
-// providers' env-hygiene can't drift apart. (codex #126)
+// providers' env-hygiene can't drift apart.
 const SDK_ENV_DENYLIST: ReadonlySet<string> = new Set(MCP_HEADER_ONLY_SECRET_VARS);
 
 function filterSdkEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
@@ -2167,7 +2161,7 @@ export function discoverPlugins(
       }
       // `<repo>/deprecated/` (no manifest of its own) holds retired plugins kept
       // for reference; the host skill discovery skips them too
-      // (src/plugin-skill-discovery.ts:518).
+      // (src/plugin-skill-discovery.ts).
       if (sub === 'deprecated') continue;
       let sub2s: string[] = [];
       try {
@@ -2461,7 +2455,7 @@ function defaultEffortForModel(model: string | undefined): string | undefined {
   // Sonnet 5 (the bare `sonnet` alias resolves to it) defaults to xhigh.
   if (m === 'sonnet' || m.startsWith('claude-sonnet-')) return 'xhigh';
   // Bare `fable` is a family alias (the CLI resolves it through
-  // ANTHROPIC_DEFAULT_FABLE_MODEL, set at src/claude-spawn-defaults.ts:254);
+  // ANTHROPIC_DEFAULT_FABLE_MODEL, set in src/claude-spawn-defaults.ts);
   // before 2026-09-24 it never reached here
   // bare and fell through to `high`.
   if (m === 'fable' || m.startsWith('claude-fable-')) return 'medium';
@@ -2627,12 +2621,12 @@ export class ClaudeProvider implements AgentProvider {
    *
    * NOT called from the constructor, and not from `query()` either: it reads
    * session state, and `getCredentialSlot` opens the outbound session DB
-   * directly (`mailbox/sqlite/connection.ts:76-89` — it does not go through
+   * directly (`getOutboundDb` in mailbox/sqlite/connection.ts — it does not go through
    * the mailbox registry, so "no mailbox registered" is not a guard). A
    * constructor that touched the DB would make every unit test that builds
    * a provider create a session DB at the production path. The runner
-   * entrypoint calls this exactly once, after the mailbox has started
-   * (`index.ts:97`) and the provider is built (`index.ts:308`); tests call it
+   * entrypoint (`index.ts`) calls this exactly once, after the mailbox has
+   * started and the provider is built; tests call it
    * explicitly when they want the restore.
    *
    * OAuth ring ONLY — see the comment below where the `ANTHROPIC_API_KEY_N`
@@ -2697,7 +2691,7 @@ export class ClaudeProvider implements AgentProvider {
    * Telemetry ONLY: it never moves the ring. Slots are used in numbered order
    * (`CLAUDE_CODE_OAUTH_TOKEN`, `_2`, `_3`, …) and advance only on a wall via
    * `rotateApiKey` — the operator's priority, decided 2026-09-16, reversing
-   * quota-burn 0.6's most-used-first pick (#811/#821).
+   * quota-burn 0.6's most-used-first pick.
    *
    * Makes no network call; a missing, unparseable or stale survey records
    * nothing. Never throws — this must not stop a container from booting.
@@ -3048,7 +3042,7 @@ export class ClaudeProvider implements AgentProvider {
     // family word. It made the fix above true only at the docker boundary: a
     // group pinned to a non-current opus (say `opus48`) had `opus` rewritten
     // back to claude-opus-4-8[1m] here, so its `model: opus` subagents ran the
-    // group's pin rather than the install's Opus (PR #839 review r1 P2). The
+    // group's pin rather than the install's Opus. The
     // family words are install constants in every layer now; the model in
     // force travels as the SDK's own `model` option, which is set from
     // `model` directly and needs no alias.
@@ -3773,8 +3767,8 @@ export class ClaudeProvider implements AgentProvider {
       // mid-stream retarget (:3559).
       //
       // The status subtext needs this, not the request: `querySettings.effort`
-      // holds USER INTENT only (the contract applyFlagBatch states at
-      // poll-loop.ts:3789), so a group carrying its effort in container.json
+      // holds USER INTENT only (the contract `applyFlagBatch` states in
+      // poll-loop.ts), so a group carrying its effort in container.json
       // requests nothing and a clamped turn requests something it never ran at.
       get resolvedEffort() {
         return activeEffort ?? null;
@@ -3785,7 +3779,7 @@ export class ClaudeProvider implements AgentProvider {
         // Idempotent: AbortController#abort() on an already-aborted
         // controller is a documented no-op, so a caller that ends up
         // calling abort() more than once for the same query (e.g. both the
-        // poll-loop's error-path abort at poll-loop.ts:808 and a config.signal listener firing)
+        // poll-loop's error-path abort and a config.signal listener firing)
         // never double-tears-down.
         queryAbortController.abort();
       },
