@@ -113,7 +113,7 @@
 ".claude/skills/add-ollama-tool/ollama-registration.test.ts":{"diff":66,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/add-ollama-tool/ollama-wiring.test.ts":{"diff":60,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/add-opencode/REMOVE.md":{"diff":70,"mode":"100644","sha256":"83f761cab3ee15dd5205ca2ffc9a4089a86f0d3f731990abf3df30e8adeb17e7"},
-".claude/skills/add-opencode/SKILL.md":{"diff":284,"mode":"100644","sha256":"8b01684a34f7ae3775672a7dba4f7dad3ca637deb26da3114278901ec194398e"},
+".claude/skills/add-opencode/SKILL.md":{"diff":291,"mode":"100644","sha256":"5ad40ad714411c79f1af19815d6d268acba5f1d30115ced1a63e1a903b6cc7e3"},
 ".claude/skills/add-opencode/opencode-cli-tools.test.ts":{"diff":34,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/add-resend/REMOVE.md":{"diff":6,"mode":"100644","sha256":"5941a1c2d34c7a227e7c3b4430cebd1922b7db6bdd02a3e1215d29decd4ec52d"},
 ".claude/skills/add-resend/SKILL.md":{"diff":4,"mode":"100644","sha256":"2e9322a0089e2ea10145d3936e4004252092d9fde43f6ce22232b8f09c8ffc25"},
