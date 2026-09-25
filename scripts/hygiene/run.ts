@@ -178,6 +178,12 @@ function main(): void {
     console.error('usage: pnpm exec tsx scripts/hygiene/run.ts [--report]');
     process.exit(2);
   }
+  for (const workspace of KNIP_WORKSPACES) {
+    if (fs.existsSync(path.join(REPO_ROOT, workspace, 'node_modules'))) continue;
+    // Without installed packages knip cannot see peer dependencies and reports them as unused.
+    console.error(`hygiene: install ${path.posix.join(workspace, 'node_modules')} first; knip's results depend on it`);
+    process.exit(2);
+  }
   const files = sourceFiles(REPO_ROOT);
   const findings = [
     ...KNIP_WORKSPACES.flatMap((workspace) => knipFindings(REPO_ROOT, workspace)),
