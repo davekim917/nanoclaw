@@ -916,7 +916,7 @@
 "src/repo-hygiene.test.ts":{"diff":22,"mode":"100644","sha256":null,"deleted":true},
 "src/request-wake.test.ts":{"diff":62,"mode":"100644","sha256":"8ff9b88b1c709a1a85e47e79c8abe53e03e85c47d8ec913eb4953271cb36f117"},
 "src/request-wake.ts":{"diff":49,"mode":"100644","sha256":"7f7ef5532c9f63de6945ce6fdc5fb46d05d53b4fb2cc03155b551c713005ac89"},
-"src/response-registry.ts":{"diff":23,"mode":"100644","sha256":"ea0684e1d436f2c6f1826775c16c225f6cf9041395919d5a02b9e5278106d225"},
+"src/response-registry.ts":{"diff":13,"mode":"100644","sha256":"01c71c50b412a5954c54b714119fddcd24ab27275fd73598f4d6847219a73bcd"},
 "src/router-session-created.test.ts":{"diff":237,"mode":"100644","sha256":null,"deleted":true},
 "src/router-unknown-engage-mode.test.ts":{"diff":163,"mode":"100644","sha256":null,"deleted":true},
 "src/router.ts":{"diff":1333,"mode":"100644","sha256":"6f273e9401d66c50dd3e353c76c6d9438f71a66611d03f947fda8a9914f6e3b0"},

@@ -35,18 +35,16 @@ describe('L-3: startHostModules fires after the delivery adapter and before the 
     expect(pollingStart).toBeGreaterThan(modulesStart);
   });
 
-  it('shutdown() aborts and stops host modules before the shutdown-callback loop and before stopDeliveryPolls', () => {
+  it('shutdown() aborts and stops host modules before stopDeliveryPolls', () => {
     const source = fs.readFileSync(path.resolve('src/main.ts'), 'utf8');
     const shutdownSignalReceived = source.indexOf("log.info('Shutdown signal received'");
     const abort = source.indexOf('hostAbortController.abort()');
     const modulesStop = source.indexOf('await stopHostModules()');
-    const callbackLoop = source.indexOf('for (const cb of getShutdownCallbacks())');
     const pollsStop = source.indexOf('stopDeliveryPolls()');
 
     expect(shutdownSignalReceived).toBeGreaterThan(-1);
     expect(abort).toBeGreaterThan(shutdownSignalReceived);
     expect(modulesStop).toBeGreaterThan(abort);
-    expect(callbackLoop).toBeGreaterThan(modulesStop);
     expect(pollsStop).toBeGreaterThan(modulesStop);
   });
 
