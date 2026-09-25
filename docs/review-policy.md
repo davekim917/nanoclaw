@@ -160,6 +160,12 @@ Every `fix` PR carries `Fixes-PR: #<n>`, naming the PR it fixes, or
 `Fixes-PR: none` in its body; `codex-review.sh merge-check` enforces it. A
 line inside a code fence or an HTML comment doesn't count.
 
+In a repo whose base branch sets `"requireReplacesLine": true` in
+`.github/pr-review-loop.json`, every PR body also carries `Replaces:` followed
+by what the change supersedes, or `Replaces: nothing`. merge-check reads it
+from the body at merge time, the same way, and the reviewer verifies the
+claim: the replaced code is gone in the same PR.
+
 ## The test is blocking, not correctness
 
 Most findings should not stop a merge, including real ones. Review exists to
