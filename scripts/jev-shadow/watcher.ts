@@ -69,7 +69,7 @@ const asList = (v: unknown): string[] =>
     : [];
 
 /** Human-readable change list between two consecutive snapshots. Deterministic. */
-export function diff(prev: Snap | null, cur: Snap): string[] {
+function diff(prev: Snap | null, cur: Snap): string[] {
   if (!prev) return ['first fire in the window: no previous snapshot to compare'];
   const out: string[] = [];
   for (const k of LIST_SIGNALS) {

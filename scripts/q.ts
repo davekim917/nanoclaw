@@ -10,10 +10,10 @@
  * so existing skill text reads identically. Mutations run via
  * stmt.run() (single statement) or db.exec() (compound).
  *
- * Why this exists: setup/verify.ts:5 codifies that NanoClaw avoids
+ * Why this exists: setup/verify.ts codifies that NanoClaw avoids
  * depending on the sqlite3 CLI binary; setup never installs or probes
  * for it. Skills that shell out to `sqlite3` therefore fail on hosts
- * where it isn't preinstalled (common on fresh Ubuntu — see #2191).
+ * where it isn't preinstalled (common on fresh Ubuntu).
  * This wrapper preserves the skill-text shape (path then SQL string)
  * while routing through the better-sqlite3 dep that setup already
  * installs and verifies.

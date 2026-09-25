@@ -97,7 +97,7 @@ function hasRoutingColumn(db: Database.Database): boolean {
   );
 }
 
-export function runBackfill(apply: boolean, dataDir: string = DATA_DIR): void {
+function runBackfill(apply: boolean, dataDir: string = DATA_DIR): void {
   const dbPath = path.join(dataDir, 'v2.db');
   const centralDb = new Database(dbPath, { readonly: !apply, fileMustExist: true });
 

@@ -456,7 +456,7 @@ function resolveCodexRegistration(dir: string, name: string, dryRun: boolean): C
  * This runs in a SEPARATE PROCESS from the host, which is why the primitive it
  * calls has to be cross-process. Its own read-modify-write used to race the
  * host's spawn-time identity write, and the field it lost — `excludePlugins` —
- * is the one that withholds a plugin from a group on purpose (#840).
+ * is the one that withholds a plugin from a group on purpose.
  *
  * The dry-run branch reads and reports without taking the lock: it writes
  * nothing, so there is nothing to serialize, and its answer is a snapshot
@@ -515,8 +515,7 @@ async function main(): Promise<void> {
   // The MIRROR's population, not a walk of this script's own: what this reports
   // is what `syncOpenCodePluginSkills` below will publish, and a walk denying
   // less would credit this plugin with a name a scoped plugin claims ahead of it
-  // (or omit one it loses to a scoped plugin), which is #836's class in the
-  // operator's report rather than in a group's skills.
+  // (or omit one it loses to a scoped plugin) in the operator's report.
   const portableSkills = openCodeMirrorSkills(PLUGINS_ROOT)
     .filter((s) => s.plugin === name)
     .map((s) => s.name);

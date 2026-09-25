@@ -65,7 +65,7 @@ export interface StepOutcome {
   fields: Record<string, string>;
 }
 
-export type StepStatus = 'skip' | 'apply' | 'needs-input' | 'agent';
+type StepStatus = 'skip' | 'apply' | 'needs-input' | 'agent';
 export interface PlanStep {
   n: number;
   kind: string;
@@ -122,7 +122,7 @@ function selfStatus(d: Directive, root: string, force = false): { status: StepSt
       if (missing.length === 0) {
         // force overrides an owned-by-fork refusal, but only applyOne can
         // tell whether any present dest actually diverged — a blanket 'skip'
-        // here (the pre-#250-fix rule: nothing missing ⇒ nothing to do) would
+        // here (nothing missing ⇒ nothing to do) would
         // make `force` a documented no-op the moment the run stabilizes
         // (every dest present, which is the common steady state). Run
         // applyOne so it can re-check and force-overwrite where needed.
@@ -220,12 +220,12 @@ export type JournalEntry =
   | { op: 'json-merge'; path: string; key: string; value: unknown }
   | { op: 'ran'; cmd: string; undo?: string };
 
-export interface AgentTask {
+interface AgentTask {
   kind: string;
   line: number;
   reason: string;
   prose: string; // the surrounding prose the agent reads to apply the step
-  // True only for a `copy owned-by-fork` refusal (#250): the engine already
+  // True only for a `copy owned-by-fork` refusal: the engine already
   // did the safe, complete thing (installed what it safely could, left a
   // diverged file alone) — nothing is broken and no follow-up is required
   // unless the operator deliberately wants `force`. Undefined/false for
@@ -297,7 +297,7 @@ export interface ApplyOptions {
   // true, a fork-owned destination that has diverged from the registry branch
   // IS overwritten with the branch version instead of being refused. The
   // engine's only opinion of what "force" means — mirrors a driver's --force
-  // flag (#250). Absent/false ⇒ the protective default: refuse and bounce.
+  // flag. Absent/false ⇒ the protective default: refuse and bounce.
   force?: boolean;
 }
 
@@ -313,7 +313,7 @@ export function fullyApplied(res: ApplyResult): boolean {
 /**
  * True when `res` has a genuine blocking issue — deferred input, or a
  * non-`protective` agentTask — that a human/agent must resolve before a
- * caller can safely treat the skill as done (#250). `fullyApplied` stays
+ * caller can safely treat the skill as done. `fullyApplied` stays
  * strict (a protective refusal still isn't "nothing left to report"; the CLI
  * should still print it), but a consumer deciding whether to ABORT a flow
  * (e.g. the setup driver, mid credential collection) should gate on this
@@ -326,7 +326,7 @@ export function hasBlockingFailure(res: ApplyResult): boolean {
 
 /**
  * The failure diagnosis for the FIRST BLOCKING directive that bounced to an
- * agent, in document order — a purely `protective` refusal (#250) is skipped
+ * agent, in document order — a purely `protective` refusal is skipped
  * so it never becomes the reported headline for a real failure elsewhere in
  * the same run: a concise headline (the nearest section heading) plus the
  * bounced step's own prose as the hint. The setup driver surfaces this when a
@@ -607,7 +607,7 @@ async function applyOne(
           // This fork has customized these destinations beyond the registry
           // branch (Slack/Discord's multi-workspace suffix tokens, mention
           // resolution, missed-message recovery, on top of the channels
-          // branch's stale snapshot — #250): the branch is a REFERENCE for a
+          // branch's stale snapshot): the branch is a REFERENCE for a
           // file never installed here, not a source of truth to replay over
           // a live one. Content is captured via `exec` and written with
           // writeFileSync — never a shell redirect — so a branch path that
@@ -810,7 +810,7 @@ export async function applySkill(skillDir: string, root: string, opts: ApplyOpti
   // finishes it from the prose once the upstream failure is fixed. A DEFERRED
   // prompt (headless rebuild, no answer) is not a failure — it never bounces, so
   // `blocked` stays false and a later restart remains runnable. A PROTECTIVE
-  // bounce (`copy owned-by-fork` refusing a diverged file — #250) also leaves
+  // bounce (`copy owned-by-fork` refusing a diverged file) also leaves
   // `blocked` false: the engine already did the safe, complete thing, the run
   // is NOT in a known-bad state, and a later restart/wire still needs to fire
   // normally (e.g. so a channel install still restarts and loads the new
@@ -944,7 +944,7 @@ export async function applySkill(skillDir: string, root: string, opts: ApplyOpti
         // A protective refusal, not an engine failure — bounce with the
         // specific reason verbatim (never the generic "could not apply"
         // wrapper) so the agent (or operator) reads exactly what diverged
-        // and what force does, per #250. protective:true keeps it out of
+        // and what force does. protective:true keeps it out of
         // `hasBlockingFailure` and off the run-health gate (`blocked` stays
         // false) — the engine already did the safe, complete thing.
         bounce(d, msg.slice('FORK_OWNED_DIVERGED: '.length), { protective: true });

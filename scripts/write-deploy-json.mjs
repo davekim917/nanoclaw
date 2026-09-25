@@ -15,9 +15,9 @@
  * Neither failure is visible where it happens:
  *
  *  - the manifest: the write succeeds, the restart hands off, and on the next
- *    boot `readJson` (src/deploy-crash-guard.ts:111-117) catches the parse
- *    error and answers null, `evaluateBoot` (:134) reads null as `no-op`, and
- *    `runDeployCrashGuard` (:273) returns — so a crashing deployment silently
+ *    boot `readJson` (src/deploy-crash-guard.ts) catches the parse
+ *    error and answers null, `evaluateBoot` reads null as `no-op`, and
+ *    `runDeployCrashGuard` returns — so a crashing deployment silently
  *    loses automatic rollback for the host AND every sibling service;
  *  - the status: it is the operator-facing artifact, read by the announcer and
  *    by the health alert, so a malformed one turns a reported failure into
