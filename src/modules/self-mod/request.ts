@@ -8,9 +8,10 @@
  * hold builders create the approval card when the guard holds. On approve,
  * the continuation re-enters the wrapped action and ./apply.ts runs.
  *
- * Host-side sanitization for install_packages is defense-in-depth — the MCP
- * tool validates first. Both layers matter: the DB row carries the payload
- * verbatim through to shell exec on apply.
+ * The container is untrusted and its MCP tools do not validate: the checks
+ * here are the only ones, and a hand-written outbound row reaches them as
+ * easily as a tool call. For install_packages that matters most — the DB row
+ * carries the payload verbatim through to shell exec on apply.
  *
  * `parseMcpServerConfig` below is where a bad remote-MCP config fails
  * closed: it calls `isKnownRawSecret` (../../container-config.js) on every
@@ -131,6 +132,34 @@ export function escapeInvisibles(s: string): string {
   });
 }
 
+/**
+ * Fields `parseMcpServerConfig` accepts from an admin or a plugin stamp but
+ * not from an agent. The approval card is the admin's only view of what gets
+ * persisted, so this path refuses a field it cannot honour or cannot show,
+ * rather than persist it unseen.
+ *
+ * - `cwd`: an absolute path fails `parseCwd`, and `validateMcpServers` strips
+ *   the ./ and ${PLUGIN_ROOT}/${PLUGIN_DATA} forms from a server with no
+ *   `pluginRoot` — which an agent-added server never has.
+ * - `displayName`, `description`: persisted and shown to agents in the
+ *   capability list, so they belong with an admin, who sets them with
+ *   `ncl groups config add-mcp-server`.
+ */
+const AGENT_REFUSED_MCP_FIELDS: ReadonlyArray<readonly [field: string, reason: string]> = [
+  [
+    'cwd',
+    'cwd is not supported on an agent request — it resolves only against a plugin root, which an agent-added server does not have',
+  ],
+  [
+    'displayName',
+    'displayName is not accepted from an agent — an admin sets it with `ncl groups config add-mcp-server --display-name`',
+  ],
+  [
+    'description',
+    'description is not accepted from an agent — an admin sets it with `ncl groups config add-mcp-server --description`',
+  ],
+];
+
 export async function validateAddMcpServer(content: Record<string, unknown>, session: Session): Promise<boolean> {
   const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
@@ -140,6 +169,11 @@ export async function validateAddMcpServer(content: Record<string, unknown>, ses
   const serverName = typeof content.name === 'string' ? content.name : '';
   if (!serverName) {
     await notifyAgent(session, 'add_mcp_server failed: name is required.');
+    return false;
+  }
+  const refused = AGENT_REFUSED_MCP_FIELDS.find(([field]) => content[field] !== undefined);
+  if (refused) {
+    await notifyAgent(session, `add_mcp_server failed: ${refused[1]}.`);
     return false;
   }
   let serverConfig: ParsedMcpServerConfig;
