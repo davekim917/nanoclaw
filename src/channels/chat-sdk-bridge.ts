@@ -287,7 +287,7 @@ export interface ChatSdkBridgeConfig {
    * adapter; if both are set, `transformOutboundText` wins (preserves the
    * pre-existing raw-delivery contract).
    */
-  transformOutboundMarkdown?: (markdown: string) => string;
+  transformOutboundMarkdown?: (markdown: string, destination?: { platformId: string }) => string;
   /**
    * How this platform renders the status subtext — the small, de-emphasized
    * line under an agent's own reply naming the model, effort and context it
@@ -729,9 +729,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         `non-empty, only letters, digits, '.', '_' or '-'`,
     );
   }
-  const transformText = (t: string): string => {
+  const transformText = (t: string, platformId?: string): string => {
     if (config.transformOutboundText) return config.transformOutboundText(t);
-    if (config.transformOutboundMarkdown) return config.transformOutboundMarkdown(t);
+    if (config.transformOutboundMarkdown)
+      return config.transformOutboundMarkdown(t, platformId ? { platformId } : undefined);
     return t;
   };
   // Status (kind='status') messages are narration/thought-balloon text, not
@@ -752,8 +753,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     t.replace(/@(?=[\w\p{L}])/gu, '@\u200b').replace(/<(?=[!@])/g, '<\u200b');
   // Status and task-list text is progress, never a ping: an @ in it would
   // notify on a message whose edits are otherwise silent.
-  const transformStatusOrText = (t: string, kind: string): string =>
-    transformText(kind === 'status' || kind === 'task_list' ? neutralizeMentions(t) : t);
+  const transformStatusOrText = (t: string, kind: string, platformId?: string): string =>
+    transformText(kind === 'status' || kind === 'task_list' ? neutralizeMentions(t) : t, platformId);
   // Native-syntax transforms (e.g. Telegram mrkdwn) round-trip as `raw` so
   // the adapter doesn't re-parse them as CommonMark and mangle links.
   // Markdown-preserving transforms keep `markdown` delivery so adapter
@@ -1384,6 +1385,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const editText = transformStatusOrText(
           (content.text as string) || (content.markdown as string) || '',
           message.kind,
+          platformId,
         );
         // Edit path is status post-then-edit only — chat replies post fresh
         // (commit 897a5d0), so the morph-into-long-final-answer case the
@@ -1550,7 +1552,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
       // Normal message
       const rawText = (content.markdown as string) || (content.text as string);
-      const text = rawText ? transformStatusOrText(rawText, message.kind) : rawText;
+      const text = rawText ? transformStatusOrText(rawText, message.kind, platformId) : rawText;
       if (text) {
         // Host notifications use this opt-in to make an incomplete multi-chunk
         // report fail instead of looking delivered. Ordinary chat keeps the

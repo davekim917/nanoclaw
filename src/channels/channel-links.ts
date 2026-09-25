@@ -103,11 +103,21 @@ export function linkSlackChannelNames(
   });
 }
 
-/** Discord: guild channels, as the native `<#id>` mention. */
-export function linkDiscordChannelNames(text: string, channels: KnownChannel[] = knownChannels()): string {
+/**
+ * Discord: channels in the destination's guild, as the native `<#id>`
+ * mention. A mention only resolves inside its own guild, so without a guild
+ * destination (a DM, or no destination given) nothing is linked.
+ */
+export function linkDiscordChannelNames(
+  text: string,
+  destinationPlatformId: string | undefined,
+  channels: KnownChannel[] = knownChannels(),
+): string {
   if (!text.includes('#')) return text;
+  const guild = /^discord:(\d+):\d+$/.exec(destinationPlatformId ?? '')?.[1];
+  if (!guild) return text;
   const guildChannels = channels.filter(
-    (c) => c.channelType.startsWith('discord') && /^discord:\d+:\d+$/.test(c.platformId),
+    (c) => c.channelType.startsWith('discord') && c.platformId.startsWith(`discord:${guild}:`),
   );
   return linkChannelNames(text, (name) => {
     const platformId = uniquePlatformId(guildChannels, name);
