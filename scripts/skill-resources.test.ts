@@ -4,20 +4,27 @@
  * so a host change that deletes or renames an export one of them imports goes
  * unnoticed until someone runs the skill.
  *
- * Install locations come from the skill itself: `nc:copy` directives (local
- * copies only — `from-branch:` sources live on another branch), and the copy
- * steps in its SKILL.md code blocks (`cp SRC DST`, `SRC → DST`). Each named
+ * Install locations come from the skill itself: `nc:copy` directives and the
+ * copy steps in its SKILL.md code blocks (`cp SRC DST`, `SRC → DST`). Each named
  * relative import in an installed host-side file is resolved against its
  * install location and checked, by TypeScript parse, against what the target
  * module exports.
+ *
+ * A `from-branch:` copy is read from the remote an install would fetch it
+ * from (`detectRegistryRemote`, the engine's own resolver), as
+ * `git show <remote>/<branch>:<path>`. When that ref is not fetched locally
+ * the copy is skipped, and the skip says what to fetch.
  */
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
+import { detectRegistryRemote } from './skill-apply.js';
 import { parseDirectives } from './skill-directives.js';
+import type { ChannelContextDefaults, ConversationInfo } from '../src/channels/adapter.js';
 import { getAllUsers } from '../src/modules/permissions/db/users.js';
 
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -31,6 +38,15 @@ const CODE_FILE = /\.(?:[cm]?[jt]s|tsx)$/;
  * deletes them.
  */
 const SKILL_ONLY_EXPORTS: Record<string, unknown> = { getAllUsers };
+
+/** The same, for host types whose only importers are `from-branch:` copies. */
+interface SkillOnlyTypes {
+  ChannelContextDefaults: ChannelContextDefaults;
+  ConversationInfo: ConversationInfo;
+}
+const SKILL_ONLY_TYPES = ['ChannelContextDefaults', 'ConversationInfo'] as const satisfies ReadonlyArray<
+  keyof SkillOnlyTypes
+>;
 
 /** Skill code files no copy step installs, and why. */
 const NOT_INSTALLED: ReadonlyArray<{ prefix: string; reason: string }> = [
@@ -58,8 +74,49 @@ const NOT_INSTALLED: ReadonlyArray<{ prefix: string; reason: string }> = [
 
 interface Install {
   skill: string;
+  /** A tree path, or `git:<ref>:<path>` for a file read from a branch. */
   src: string;
   dst: string;
+}
+
+/**
+ * Git with every inherited `GIT_*` variable removed. A test run launched from
+ * a hook or another git process can inherit `GIT_DIR`/`GIT_WORK_TREE`/
+ * `GIT_INDEX_FILE`, which would point these reads at some other repository.
+ * Read-only: `null` when the command fails.
+ */
+function git(args: string[]): string | null {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+  try {
+    return execFileSync('git', args, {
+      cwd: REPO_ROOT,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch {
+    return null;
+  }
+}
+
+const registryRemote = detectRegistryRemote(REPO_ROOT);
+
+/** The local ref an install of `branch` reads, or why there is none. */
+function registryRefOf(branch: string): { ref: string } | { reason: string } {
+  if (!registryRemote) return { reason: 'no remote resolves as the registry (setup/lib/channels-remote.sh)' };
+  const ref = `refs/remotes/${registryRemote}/${branch}`;
+  if (git(['rev-parse', '--verify', '--quiet', ref]) === null) {
+    return { reason: `${registryRemote}/${branch} is not fetched locally; fetch it to check these copies` };
+  }
+  return { ref };
+}
+
+function read(src: string): string {
+  if (!src.startsWith('git:')) return fs.readFileSync(path.join(REPO_ROOT, src), 'utf8');
+  const out = git(['show', src.slice('git:'.length)]);
+  if (out === null) throw new Error(`cannot read ${src}`);
+  return out;
 }
 
 function listFiles(rel: string): string[] {
@@ -93,6 +150,35 @@ function plainCodeBlocks(markdown: string): string[][] {
     current?.push(line.trim());
   }
   return blocks;
+}
+
+interface BranchCopy {
+  skill: string;
+  branch: string;
+  src: string;
+  dst: string;
+}
+
+function branchCopiesOf(skill: string): BranchCopy[] {
+  const markdown = fs.readFileSync(path.join(REPO_ROOT, SKILLS_DIR, skill, 'SKILL.md'), 'utf8');
+  return parseDirectives(markdown).flatMap((d) => {
+    const branch = d.attrs['from-branch'];
+    if (d.kind !== 'copy' || typeof branch !== 'string') return [];
+    return d.body.map((line) => {
+      const [src, dst = src] = line.split('->').map((part) => part.trim());
+      return { skill, branch, src, dst };
+    });
+  });
+}
+
+/** A branch copy's files as read from `ref`; a path the ref lacks yields none. */
+function installsFromRef(copy: BranchCopy, ref: string): Install[] {
+  const files = (git(['ls-tree', '-r', '--name-only', ref, '--', copy.src]) ?? '').split('\n').filter(Boolean);
+  return files.map((file) => ({
+    skill: copy.skill,
+    src: `git:${ref}:${file}`,
+    dst: path.posix.join(copy.dst, path.posix.relative(copy.src, file)),
+  }));
 }
 
 function installsOf(skill: string): Install[] {
@@ -147,18 +233,22 @@ const parsed = new Map<string, ts.SourceFile>();
 function parse(rel: string): ts.SourceFile {
   let file = parsed.get(rel);
   if (!file) {
-    file = ts.createSourceFile(rel, fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8'), ts.ScriptTarget.Latest, true);
+    file = ts.createSourceFile(rel, read(rel), ts.ScriptTarget.Latest, true);
     parsed.set(rel, file);
   }
   return file;
 }
 
 /** Where a relative specifier lands, as the file to read: an installed resource's source, or a tree file. */
-function resolve(fromDst: string, specifier: string): { dst: string; read: string } | null {
+function resolve(
+  fromDst: string,
+  specifier: string,
+  lookup: ReadonlyMap<string, Install> = installedAt,
+): { dst: string; read: string } | null {
   const base = path.posix.join(path.posix.dirname(fromDst), specifier);
   const stem = base.replace(/\.[cm]?js$/, '');
   for (const dst of [base, `${stem}.ts`, `${stem}.tsx`, `${stem}.js`, `${stem}.mjs`, `${base}/index.ts`]) {
-    const install = installedAt.get(dst);
+    const install = lookup.get(dst);
     if (install) return { dst, read: install.src };
     const abs = path.join(REPO_ROOT, dst);
     if (fs.existsSync(abs) && fs.statSync(abs).isFile()) return { dst, read: dst };
@@ -175,7 +265,11 @@ function bindingNames(name: ts.BindingName): string[] {
   return name.elements.flatMap((e) => (ts.isOmittedExpression(e) ? [] : bindingNames(e.name)));
 }
 
-function exportsOf(target: { dst: string; read: string }, seen = new Set<string>()): Set<string> {
+function exportsOf(
+  target: { dst: string; read: string },
+  lookup: ReadonlyMap<string, Install> = installedAt,
+  seen = new Set<string>(),
+): Set<string> {
   const names = new Set<string>();
   if (seen.has(target.dst)) return names;
   seen.add(target.dst);
@@ -187,8 +281,8 @@ function exportsOf(target: { dst: string; read: string }, seen = new Set<string>
       } else if (stmt.exportClause && ts.isNamespaceExport(stmt.exportClause)) {
         names.add(stmt.exportClause.name.text);
       } else if (stmt.moduleSpecifier && ts.isStringLiteral(stmt.moduleSpecifier)) {
-        const next = resolve(target.dst, stmt.moduleSpecifier.text);
-        if (next) for (const n of exportsOf(next, seen)) if (n !== 'default') names.add(n);
+        const next = resolve(target.dst, stmt.moduleSpecifier.text, lookup);
+        if (next) for (const n of exportsOf(next, lookup, seen)) if (n !== 'default') names.add(n);
       }
       continue;
     }
@@ -264,7 +358,47 @@ function namedImportsOf(file: ts.SourceFile): NamedImport[] {
   return out.filter((i) => i.specifier.startsWith('.'));
 }
 
-const hostInstalls = installs.filter((i) => CODE_FILE.test(i.dst) && !i.dst.startsWith('container/'));
+const isHostCode = (i: Install) => CODE_FILE.test(i.dst) && !i.dst.startsWith('container/');
+const hostInstalls = installs.filter(isHostCode);
+
+/** Per registry branch: the host code its copies install, and the lookup their imports resolve through. */
+const branchChecks: Array<{ ref: string; lookup: ReadonlyMap<string, Install>; installs: Install[] }> = [];
+/** Branch copies that could not be read, with the reason. */
+const uncheckedBranchCopies: Array<{ skill: string; branch: string; reason: string }> = [];
+{
+  const copies = skills.flatMap(branchCopiesOf);
+  for (const branch of [...new Set(copies.map((c) => c.branch))].sort()) {
+    const onBranch = copies.filter((c) => c.branch === branch);
+    const found = registryRefOf(branch);
+    if ('reason' in found) {
+      for (const skill of [...new Set(onBranch.map((c) => c.skill))]) {
+        uncheckedBranchCopies.push({ skill, branch, reason: found.reason });
+      }
+      continue;
+    }
+    const fromRef = onBranch.flatMap((copy) => installsFromRef(copy, found.ref));
+    const lookup = new Map([...installedAt, ...fromRef.map((i): [string, Install] => [i.dst, i])]);
+    branchChecks.push({ ref: found.ref, lookup, installs: fromRef.filter(isHostCode) });
+  }
+}
+
+function importProblems(install: Install, lookup: ReadonlyMap<string, Install> = installedAt): string[] {
+  const problems: string[] = [];
+  for (const { specifier, names } of namedImportsOf(parse(install.src))) {
+    const target = resolve(install.dst, specifier, lookup);
+    if (!target) {
+      problems.push(`imports '${specifier}', which does not exist relative to ${install.dst}`);
+      continue;
+    }
+    const exported = exportsOf(target, lookup);
+    for (const name of names) {
+      if (!exported.has(name)) {
+        problems.push(`imports { ${name} } from '${specifier}', but ${target.dst} does not export it`);
+      }
+    }
+  }
+  return problems;
+}
 
 describe('installable skill resources', () => {
   it('finds the host-side installs the skills declare', () => {
@@ -287,22 +421,23 @@ describe('installable skill resources', () => {
 
   for (const install of hostInstalls) {
     it(`${install.skill}: ${install.src} resolves every named import at ${install.dst}`, () => {
-      const problems: string[] = [];
-      for (const { specifier, names } of namedImportsOf(parse(install.src))) {
-        const target = resolve(install.dst, specifier);
-        if (!target) {
-          problems.push(`imports '${specifier}', which does not exist relative to ${install.dst}`);
-          continue;
-        }
-        const exported = exportsOf(target);
-        for (const name of names) {
-          if (!exported.has(name)) {
-            problems.push(`imports { ${name} } from '${specifier}', but ${target.dst} does not export it`);
-          }
-        }
-      }
-      expect(problems, `${install.skill}: ${install.src} (installed at ${install.dst})`).toEqual([]);
+      expect(importProblems(install), `${install.skill}: ${install.src} (installed at ${install.dst})`).toEqual([]);
     });
+  }
+
+  for (const { lookup, installs: fromRef } of branchChecks) {
+    for (const install of fromRef) {
+      it(`${install.skill}: ${install.src} resolves every named import at ${install.dst}`, () => {
+        expect(
+          importProblems(install, lookup),
+          `${install.skill}: ${install.src} (installed at ${install.dst})`,
+        ).toEqual([]);
+      });
+    }
+  }
+
+  for (const { skill, branch, reason } of uncheckedBranchCopies) {
+    it.skip(`${skill}: from-branch:${branch} copies not checked — ${reason}`);
   }
 
   it('SKILL_ONLY_EXPORTS names only exports a skill resource still imports', () => {
@@ -311,4 +446,20 @@ describe('installable skill resources', () => {
     );
     expect(Object.keys(SKILL_ONLY_EXPORTS).filter((name) => !imported.has(name))).toEqual([]);
   });
+
+  it.skipIf(branchChecks.length === 0 || uncheckedBranchCopies.length > 0)(
+    'SKILL_ONLY_TYPES names only types a from-branch copy still imports (skipped while any registry branch is unread)',
+    () => {
+      const imported = new Set(
+        branchChecks.flatMap((check) =>
+          check.installs.flatMap((install) => namedImportsOf(parse(install.src)).flatMap((i) => i.names)),
+        ),
+      );
+      const refs = branchChecks.map((check) => check.ref).join(', ');
+      expect(
+        SKILL_ONLY_TYPES.filter((name) => !imported.has(name)),
+        `no from-branch copy in ${refs} imports these`,
+      ).toEqual([]);
+    },
+  );
 });

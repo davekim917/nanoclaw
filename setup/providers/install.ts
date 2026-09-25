@@ -53,10 +53,7 @@ export interface ProviderInstallResult {
   blockers: string[];
 }
 
-export async function applyProviderSkill(
-  skillDir: string,
-  projectRoot: string,
-): Promise<ProviderInstallResult> {
+export async function applyProviderSkill(skillDir: string, projectRoot: string): Promise<ProviderInstallResult> {
   // A provider SKILL.md has no prompt directives (vault-only auth runs
   // separately). No resolveInput is passed: absent ⇒ any prompt defers, which
   // is exactly the old defer-all stub's semantics with no stub to maintain.
@@ -65,14 +62,6 @@ export async function applyProviderSkill(
       if (isFlowOwnedCommand(cmd)) return; // build/test/auth are the flow's job
       execSync(cmd, { cwd: projectRoot, stdio: 'pipe' });
     },
-    // Fork-aware: reuse the existing resolver (handles upstream/fork remotes and
-    // the auto-add-upstream fallback) instead of assuming `origin`.
-    resolveRemote: () =>
-      execSync('source setup/lib/channels-remote.sh; resolve_channels_remote', {
-        cwd: projectRoot,
-        shell: '/bin/bash',
-        encoding: 'utf8',
-      }).trim(),
   });
 
   const blockers = [...result.agentTasks.map((t) => t.reason), ...result.deferred];

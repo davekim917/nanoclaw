@@ -13,8 +13,13 @@
 # explicit upstream configured working on the first try.
 #
 # Explicit override: set NANOCLAW_CHANNELS_REMOTE=<name> to skip detection.
+#
+# This is the only implementation of the lookup: scripts/skill-apply.ts
+# (`resolveRegistryRemote`, the engine default the setup driver also uses)
+# sources this file rather than keeping a copy.
 
-resolve_channels_remote() {
+# Side-effect free: echoes the override or the matching remote, or returns 1.
+detect_channels_remote() {
   if [ -n "${NANOCLAW_CHANNELS_REMOTE:-}" ]; then
     printf '%s' "$NANOCLAW_CHANNELS_REMOTE"
     return 0
@@ -33,6 +38,11 @@ resolve_channels_remote() {
         ;;
     esac
   done < <(git remote -v 2>/dev/null | awk '$3 == "(fetch)" { print $1"\t"$2 }')
+  return 1
+}
+
+resolve_channels_remote() {
+  detect_channels_remote && return 0
 
   # No matching remote — add `upstream` and use it. Silent on failure so
   # callers see the eventual `git fetch` error rather than a cryptic
