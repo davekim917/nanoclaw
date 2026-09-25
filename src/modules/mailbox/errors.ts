@@ -1,7 +1,7 @@
 /**
  * The two session-DB failure classes, in a module that imports nothing.
  *
- * They lived in `openers.ts` until #761's fix round. `host-inbound.ts` has to
+ * They cannot live in `openers.ts`: `host-inbound.ts` has to
  * raise `SessionDbMissingError` when a session is deleted out from under its
  * migration, and `openers.ts` already imports `sessionDirForInboundDbPath`
  * FROM `host-inbound.ts` — so importing the class back out of `openers.ts`

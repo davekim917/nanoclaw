@@ -2,9 +2,7 @@
  * Session-DB open funnels for the fork's mailbox implementation.
  *
  * Internal to `src/modules/mailbox/` — the module is the only code that opens
- * a session DB. `src/db/session-db.ts` re-exports these while the caller
- * migration (docs/specs/upstream-mailbox-seam/plan.md PRs 3-6) is in flight;
- * PR 7 deletes that façade.
+ * a session DB.
  *
  * These are NOT the central app DB — they're the cross-mount SQLite files
  * shared between host and container. See session-manager.ts header for the
@@ -19,7 +17,7 @@ import { SessionDbMissingError, SessionDbUnopenableError } from './errors.js';
 import { sessionDirForInboundDbPath } from './host-inbound.js';
 
 /**
- * The two failure classes moved to `errors.ts` in #761's fix round, and are
+ * The two failure classes live in `errors.ts` and are
  * re-exported here so every existing `from './openers.js'` import site is
  * unchanged. A re-export is the same class object, so `instanceof` still
  * works. See `errors.ts` for why they had to leave this file: `host-inbound.ts`
@@ -139,10 +137,10 @@ export function openInboundDb(dbPath: string): Database.Database {
   // `sessionDbPathIsGone`, not existsSync: an unreadable parent directory is a
   // present session, and must reach the open and fail there on its real error.
   if (sessionDbPathIsGone(dbPath)) throw new SessionDbMissingError(dbPath);
-  // The SESSION root, not `path.dirname(dbPath)`: since #749 the host-owned
+  // The SESSION root, not `path.dirname(dbPath)`: the host-owned
   // inbound.db lives at `<session>/.host/inbound.db`, and the reclaim only ever
-  // reads markers on the session root itself (`resourceRoots`,
-  // src/storage-activity.ts:493-496). Planting one level deeper would leave a
+  // reads markers on the session root itself (`resourceRoots` in
+  // src/storage-activity.ts). Planting one level deeper would leave a
   // marker nothing looks at — the guard would still appear to work while
   // protecting nothing. See sessionDirForInboundDbPath.
   const release = plantStorageActivityMarker(sessionDirForInboundDbPath(dbPath), 'inbound-open');
@@ -286,6 +284,3 @@ export function openOutboundDbWritable(dbPath: string): Database.Database {
   assertQueryable(db, dbPath);
   return db;
 }
-
-// Alias for the upstream name; both reach the same writable open path.
-export const openOutboundDbRw = openOutboundDbWritable;

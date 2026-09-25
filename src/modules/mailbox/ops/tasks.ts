@@ -21,15 +21,6 @@ import { migrateMessagesInTable } from '../schema.js';
 import { sqliteUtcToIso } from '../sqlite-utc.js';
 import { nextEvenSeq } from './ingress.js';
 
-// Byte-identical to the fork's own copies; upstream owns the implementation.
-export {
-  cancelAllTasks,
-  cancelTask,
-  clearRecurrence,
-  deleteTask,
-  trailingFailedRuns,
-} from '../../../mailbox/sqlite/tasks.js';
-
 /**
  * Insert one pending task occurrence. `seriesId` is the series join key — equal
  * to `id` for a brand-new series, or the existing series for a recurrence clone
@@ -133,7 +124,7 @@ export interface TaskUpdate {
    * `null` on an axis CLEARS that axis — the one thing a merge cannot express
    * by value, because every storable pin is a non-empty string and `undefined`
    * already means "leave this axis alone". Writing `''` instead would be a
-   * different bug: `parseTaskPin` (task-content.ts:56) reads `''` back as an
+   * different bug: `parseTaskPin` reads `''` back as an
    * absent pin, so the series would DISPLAY unpinned while the key survives in
    * the envelope for the next merge to resurrect.
    */
@@ -232,7 +223,7 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
           }
           // Drop the envelope key once both axes are gone, rather than leaving
           // `flagIntent: {}` behind. Readers tolerate either (parseTaskPin
-          // answers null for a missing key, task-content.ts:56), but a
+          // answers null for a missing key), but a
           // byte-level diff of the content is how an operator confirms a pin is
           // actually gone, and `{}` reads as "something is still pinned here".
           if (Object.keys(merged).length === 0) delete parsed.flagIntent;

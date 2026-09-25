@@ -71,7 +71,7 @@ export function activateRepoIngressFence(db: Database.Database, epoch: string): 
   })();
 }
 
-export function admitTaggedRows(db: Database.Database, epoch: string, messageId?: string): RepoIngressAdmissionResult {
+function admitTaggedRows(db: Database.Database, epoch: string, messageId?: string): RepoIngressAdmissionResult {
   const idFilter = messageId === undefined ? '' : " AND (id = @messageId OR id = 'recall-' || @messageId)";
   const wakeRequired =
     (db

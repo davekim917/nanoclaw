@@ -2,7 +2,7 @@
  * Where the host keeps a session's `inbound.db`, and how a session gets moved
  * there.
  *
- * THE DEFECT THIS CLOSES (#749, the same class as #735's `writable-sidecar`).
+ * THE DEFECT THIS CLOSES (the same class as the archive projection's writable sidecar).
  * `inbound.db` is host-authoritative and container-read-only: the host writes
  * the `delivered` rows that gate admin approvals, the email gate and the
  * send_file ack, and `messages_in` drives due-message wake, recurrence and
@@ -15,11 +15,11 @@
  * checksums are seeded by a nonce in the journal's OWN header), so a journal
  * hand-built by a container is replayed verbatim as a HOT journal by the
  * host's next read-write open, writing attacker-chosen pages into the
- * host-owned database. A forged `delivered` row was landed this way in the
- * proof of concept on #735.
+ * host-owned database. A forged `delivered` row was landed this way in a
+ * proof of concept.
  *
- * WHY #735'S FIX CANNOT BE COPIED. The archive projection is derived state
- * with a freshness stamp, so #735 could simply DELETE any sidecar before every
+ * WHY THE ARCHIVE PROJECTION'S FIX CANNOT BE COPIED. The projection is derived state
+ * with a freshness stamp, so it can simply DELETE any sidecar before every
  * read-write open and rebuild from source. `inbound.db` is authoritative and
  * has no rebuild path: a genuine journal left by a host crash mid-write MUST
  * still be replayed, or the file is left torn. "Delete every journal" and
@@ -43,7 +43,7 @@
  *    than concluding the session was never provisioned and creating an empty
  *    one over it (which would lose messages and re-deliver).
  *  - The container's read path is unchanged. The runner still opens
- *    `/workspace/inbound.db` (`container/agent-runner/src/mailbox/sqlite/connection.ts:22`)
+ *    `/workspace/inbound.db` (`container/agent-runner/src/mailbox/sqlite/connection.ts`)
  *    through the existing read-only file overlay, so this needs no runner
  *    change, no image rebuild, and no restart of running containers. A hard
  *    link is the SAME inode, so the container sees every host write, and
@@ -86,11 +86,11 @@ import { HostInboundProvenanceError, SessionDbMissingError } from './errors.js';
  * Safe against every directory walker in the tree, which is why the host-owned
  * directory is INSIDE the session directory rather than a sibling of it: the
  * reclaim's regenerable sweep only ever takes the four names in
- * `REGENERABLE_SWEEP_DIR_NAMES` (`src/storage-manager.ts:190`), the session
- * reclaim requires a `sess-` prefix (`src/storage-manager.ts:1737`), and a
+ * `REGENERABLE_SWEEP_DIR_NAMES` (`src/storage-manager.ts`), the session
+ * reclaim requires a `sess-` prefix, and a
  * session directory's contents are already arbitrary. A sibling directory at
  * the agent-group level would instead have been enumerated as a SESSION by
- * `resourceRoots` (`src/storage-activity.ts:493-496`), which has no dot-prefix
+ * `resourceRoots` (`src/storage-activity.ts`), which has no dot-prefix
  * skip, and would have had to be taught to five separate walkers.
  */
 export const HOST_INBOUND_DIR_NAME = '.host';
@@ -107,7 +107,7 @@ export function hostInboundDbPathFor(sessionPath: string): string {
   return path.join(hostInboundDirFor(sessionPath), 'inbound.db');
 }
 
-/** The pre-#749 location, kept as a hard link to the same inode. */
+/** The legacy location, kept as a hard link to the same inode. */
 export function legacyInboundDbPathFor(sessionPath: string): string {
   return path.join(sessionPath, 'inbound.db');
 }
@@ -117,11 +117,11 @@ export function legacyInboundDbPathFor(sessionPath: string): string {
  *
  * The inverse of `hostInboundDbPathFor`, and it has to exist: the
  * storage-activity marker that keeps a reclaim off a session being written is
- * planted on the session ROOT (`openInboundDb`, `src/modules/mailbox/openers.ts:182`),
+ * planted on the session ROOT (`openInboundDb`),
  * and `path.dirname` of a host-owned inbound path is now `.host`, not the
  * session. Planting there would put the marker somewhere the reclaim never
  * looks — `resourceRoots` enumerates `v2-sessions/<group>/<session>` and
- * nothing below it (`src/storage-activity.ts:493-496`) — so the guard would
+ * nothing below it — so the guard would
  * still appear to work while protecting nothing.
  *
  * A path that is not host-owned answers with its own directory, so a caller
@@ -136,12 +136,12 @@ export function sessionDirForInboundDbPath(dbPath: string): string {
  * Sidecars sitting at the LEGACY path, which are foreign by construction.
  *
  * Once a session is migrated the host never journals beside the legacy name
- * again, so anything found there was created by a container. This is #735's
- * delete-before-open rule applied at the one place it is provably safe — and
+ * again, so anything found there was created by a container. This is the archive
+ * projection's delete-before-open rule applied at the one place it is provably safe — and
  * deleting matters beyond tidiness: a planted `inbound.db-journal` makes every
  * READ-ONLY open of the legacy name fail (a read-only handle cannot perform
  * the rollback a hot journal owes), which is `dbHasRows`
- * (`src/storage-manager.ts:867`) reporting a session unreadable and the
+ * reporting a session unreadable and the
  * reclaim then failing closed on it forever.
  */
 export function removeForeignInboundSidecars(sessionPath: string): string[] {
@@ -169,9 +169,9 @@ export function removeForeignInboundSidecars(sessionPath: string): string[] {
  *    only ever creates `-journal`/`-wal`/`-shm` in the database's own
  *    directory, so overlaying the directory leaves no sibling path outside the
  *    protection. The container cannot create, modify or delete the host's
- *    journal, which is what #749 turned into forged `delivered` rows.
+ *    journal, which a writable journal would turn into forged `delivered` rows.
  *  - `/workspace/inbound.db` READ-ONLY, the legacy hard link, so the runner's
- *    unchanged read path (`container/agent-runner/src/mailbox/sqlite/connection.ts:22`)
+ *    unchanged read path (`container/agent-runner/src/mailbox/sqlite/connection.ts`)
  *    still resolves. This is the control that has always refused a direct
  *    write through that name, and it is unchanged.
  *
@@ -193,7 +193,7 @@ export function hostInboundMounts(
  * Remove the host-owned directory outright, for a session being destroyed.
  *
  * Upstream's `destroy` only knows the legacy name and its sidecars
- * (`src/mailbox/sqlite/index.ts:441-444`); the host-owned copy and its journal
+ * (`src/mailbox/sqlite/index.ts`); the host-owned copy and its journal
  * sit one level down and would otherwise outlive the session that owned them.
  * Lives here rather than at the caller so the layout has one definition.
  */
@@ -210,7 +210,7 @@ export function removeHostInboundDir(sessionPath: string): void {
  * a journal, so the one moment the fallback must never be the running state is
  * the moment a container is about to be handed the session. Fail closed — the
  * spawn retries, rather than coming up with the database sitting in a
- * directory the container can write (#749).
+ * directory the container can write.
  */
 export function assertHostOwnedInboundDb(sessionPath: string, sessionId: string): void {
   if (inboundDbIsHostOwned(sessionPath)) return;
@@ -255,7 +255,7 @@ export interface HostInboundSessionKey {
   sessionId: string;
 }
 
-export type InboundMigrationOutcome =
+type InboundMigrationOutcome =
   /** No session directory — nothing to do. */
   | 'no-session'
   /** Neither path holds a database yet; the caller provisions at the host path. */
@@ -290,9 +290,9 @@ export interface InboundMigrationResult {
  *
  * `existsSync` answered a moment ago, and the answer can be stale by the time
  * the `stat`/`link` runs: the session reclaim deletes whole session directories
- * from a worker thread (`src/storage-manager.ts:1543`), concurrently with host
+ * from a worker thread, concurrently with host
  * work on the same session. That is the very race `openInboundDb` is built
- * around (`openers.ts:172-205`), and leaving it unguarded costs more than an
+ * around, and leaving it unguarded costs more than an
  * ugly stack — a raw `ENOENT … link` is not the class callers branch on.
  * `container-restart`, `delivery` and the sweep all key their
  * skip-the-vanished-session path on `SessionDbMissingError`, so an unmapped
@@ -303,7 +303,7 @@ export interface InboundMigrationResult {
  * reclaimed session throws the same raw errno one line earlier.
  *
  * Only ENOENT/ENOTDIR are mapped, matching `sessionDbPathIsGone`'s rule
- * (`openers.ts:84-92`): every other errno means the filesystem declined to
+ * in `openers.ts`: every other errno means the filesystem declined to
  * answer, and no session may be declared vanished on an unanswered question.
  */
 function asVanished<T>(dbPath: string, work: () => T): T {
@@ -476,7 +476,7 @@ function databaseIsIntact(dbPath: string): boolean {
 /**
  * Let SQLite roll a genuine crash journal back, by touching the database.
  *
- * The same mechanism as `recoverHotJournal` (`src/modules/mailbox/openers.ts:248`),
+ * The same mechanism as `recoverHotJournal` in `openers.ts`,
  * inlined rather than imported: `openers.ts` imports the session-directory
  * helper from this module for its activity marker, and a static cycle between
  * the two is exactly the shape the host's ESM rules warn about.

@@ -319,31 +319,6 @@ export function getInboundSourceSessionId(db: Database.Database, messageId: stri
   return row?.source_session_id ?? null;
 }
 
-/**
- * Find the source_session_id of the most recent a2a inbound row from a
- * specific peer (by agent group id). Used as a peer-affinity fallback in
- * a2a routing when an outbound reply has no `in_reply_to` (e.g. the
- * container's send_message MCP tool path didn't thread the batch's
- * in_reply_to through).
- *
- * Heuristic: "the last time this peer talked to me, which session was it?"
- * Returns null when no prior a2a inbound from that peer carries a
- * non-null source_session_id (typical for pre-migration installs).
- */
-export function getMostRecentPeerSourceSessionId(db: Database.Database, peerAgentGroupId: string): string | null {
-  const row = db
-    .prepare(
-      `SELECT source_session_id FROM messages_in
-        WHERE channel_type = 'agent'
-          AND platform_id = ?
-          AND source_session_id IS NOT NULL
-        ORDER BY seq DESC
-        LIMIT 1`,
-    )
-    .get(peerAgentGroupId) as { source_session_id: string | null } | undefined;
-  return row?.source_session_id ?? null;
-}
-
 /** Does this session's inbound.db already carry `messageId`? */
 export function inboundHasMessage(db: Database.Database, messageId: string): boolean {
   return db.prepare('SELECT 1 FROM messages_in WHERE id = ? LIMIT 1').get(messageId) !== undefined;
@@ -358,7 +333,7 @@ export function inboundHasMessage(db: Database.Database, messageId: string): boo
  * Returns false if the DB file does not exist (session not yet initialised).
  */
 export function sessionInboundHasMessage(agentGroupId: string, sessionId: string, messageId: string): boolean {
-  // Resolved, never reconstructed: since #749 the host-owned inbound.db lives
+  // Resolved, never reconstructed: the host-owned inbound.db lives
   // in `<session>/.host/`, and the journal this function recovers below must be
   // the one in THAT directory — the only one a container cannot have written.
   const dbPath = resolveInboundDbPath(path.join(DATA_DIR, 'v2-sessions', agentGroupId, sessionId));
