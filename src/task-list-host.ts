@@ -213,8 +213,23 @@ export function _clearTaskListCooldownsForTest(): void {
   taskListCooldowns.clear();
 }
 
-/** Longest task-list item shown in a status line before it is clipped. */
-const STATUS_ITEM_MAX = 60;
+/**
+ * Longest status line, prefix included. Slack's `assistant.threads.setStatus`
+ * rejects a `loading_messages` entry of 51+ characters ("must be less than 51
+ * characters"), and the adapter sends the status text as that entry
+ * (`@chat-adapter/slack` startTyping). Every status line comes from
+ * typingStatusFor — the typing module passes it on each of its setTyping calls
+ * (modules/typing/index.ts triggerTyping callers) — so the clip lives there.
+ */
+const STATUS_TEXT_MAX = 50;
+
+function clipStatusText(text: string): string {
+  if (text.length <= STATUS_TEXT_MAX) return text;
+  let cut = text.slice(0, STATUS_TEXT_MAX - 1);
+  // Never leave half of a surrogate pair (an emoji cut in two).
+  if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+  return `${cut.trimEnd()}…`;
+}
 
 /**
  * Per session, the task list's current item (set when a task_list row
@@ -234,7 +249,7 @@ export function typingStatusFor(sessionId: string): string | undefined {
   if (!TASK_LIST_ENABLED) return undefined;
   const item = statusTexts.get(sessionId);
   if (!item) return 'is thinking…';
-  return `is working: ${item.length > STATUS_ITEM_MAX ? `${item.slice(0, STATUS_ITEM_MAX - 1)}…` : item}`;
+  return clipStatusText(`is working: ${item}`);
 }
 
 /**

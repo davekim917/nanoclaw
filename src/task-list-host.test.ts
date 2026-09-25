@@ -47,9 +47,30 @@ describe('status-line text', () => {
     setTypingStatusText('sess-1', 'x'.repeat(100));
     startTypingRefresh('sess-1', 'ag-1', 'slack', 'slack:C1', 'T1');
     await vi.advanceTimersByTimeAsync(0);
-    expect(statuses[0]).toBe(`is working: ${'x'.repeat(59)}…`);
+    expect(statuses[0]).toBe(`is working: ${'x'.repeat(37)}…`);
     stopTypingRefresh('sess-1');
     expect(typingStatusFor('sess-1')).toBe('is thinking…');
+  });
+
+  // Slack's assistant.threads.setStatus rejects a loading message of 51+
+  // characters, and the prefix counts toward it.
+  it('keeps the whole status line within 50 characters for a 60-character item', () => {
+    const item = 'Reconcile the orders backfill against the warehouse snapshot';
+    expect(item).toHaveLength(60);
+    setTypingStatusText('sess-1', item);
+    const status = typingStatusFor('sess-1')!;
+    expect(status.length).toBeLessThanOrEqual(50);
+    expect(status).toBe('is working: Reconcile the orders backfill against…');
+  });
+
+  it('leaves an item that fits exactly untouched, and never splits an emoji', () => {
+    setTypingStatusText('sess-1', 'y'.repeat(38));
+    expect(typingStatusFor('sess-1')).toBe(`is working: ${'y'.repeat(38)}`);
+    expect(typingStatusFor('sess-1')).toHaveLength(50);
+    setTypingStatusText('sess-1', `${'z'.repeat(36)}🚀 and more`);
+    const status = typingStatusFor('sess-1')!;
+    expect(status.length).toBeLessThanOrEqual(50);
+    expect(status).toBe(`is working: ${'z'.repeat(36)}…`);
   });
 });
 
