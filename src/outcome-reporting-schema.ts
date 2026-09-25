@@ -1,8 +1,6 @@
 /** Pure wire contract. Mirrored into the separately packaged agent runner. */
 import { createHash } from 'node:crypto';
 
-const OUTCOME_PURPOSES = ['progress', 'outcome', 'reply', 'urgent', 'decision', 'handoff'] as const;
-
 export interface TrustedRequestIdentity {
   sessionId: string;
   messageId: string;

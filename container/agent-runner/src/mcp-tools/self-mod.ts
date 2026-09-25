@@ -142,7 +142,7 @@ export function unavailableModelInventory(provider: string) {
   );
 }
 
-const listModels: McpToolDefinition = {
+export const listModels: McpToolDefinition = {
   tool: {
     name: 'list_models',
     description:
@@ -234,7 +234,7 @@ const listModels: McpToolDefinition = {
   },
 };
 
-const changeModel: McpToolDefinition = {
+export const changeModel: McpToolDefinition = {
   tool: {
     name: 'change_model',
     description:
