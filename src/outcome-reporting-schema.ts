@@ -2,15 +2,6 @@
 import { createHash } from 'node:crypto';
 
 export const OUTCOME_PURPOSES = ['progress', 'outcome', 'reply', 'urgent', 'decision', 'handoff'] as const;
-export type OutcomePurpose = (typeof OUTCOME_PURPOSES)[number];
-export interface WorkOutcome {
-  workItem?: string;
-  requestId?: number;
-  verified: string;
-  evidence?: string;
-  remaining?: string;
-  needsYou?: string;
-}
 
 export interface TrustedRequestIdentity {
   sessionId: string;

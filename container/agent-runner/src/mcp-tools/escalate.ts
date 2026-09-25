@@ -24,7 +24,7 @@ function err(text: string) {
   return { content: [{ type: 'text' as const, text }], isError: true };
 }
 
-export const escalateToOwner: McpToolDefinition = {
+const escalateToOwner: McpToolDefinition = {
   tool: {
     name: 'escalate_to_owner',
     description:

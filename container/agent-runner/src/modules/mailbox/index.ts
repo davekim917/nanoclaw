@@ -64,8 +64,7 @@ export * from './session-state.js';
 export * from './turn-usage.js';
 export * from './rate-limit-samples.js';
 export * from './wiki-lint.js';
-export { isMailboxTestMode, setMailboxTestMode } from './test-mode.js';
-export { INBOUND_KINDS, type InboundKind } from './inbound-kinds.js';
+export { setMailboxTestMode } from './test-mode.js';
 
 /* ─── Admission ────────────────────────────────────────────────────────────── */
 

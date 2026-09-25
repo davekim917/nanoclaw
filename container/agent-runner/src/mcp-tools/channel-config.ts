@@ -54,7 +54,7 @@ function ok(text: string) {
   return { content: [{ type: 'text' as const, text }] };
 }
 
-export const setChannelModelTool: McpToolDefinition = {
+const setChannelModelTool: McpToolDefinition = {
   tool: {
     name: 'set_channel_model',
     description:
@@ -89,7 +89,7 @@ export const setChannelModelTool: McpToolDefinition = {
   },
 };
 
-export const setChannelEffortTool: McpToolDefinition = {
+const setChannelEffortTool: McpToolDefinition = {
   tool: {
     name: 'set_channel_effort',
     description:
@@ -130,6 +130,6 @@ export const setChannelEffortTool: McpToolDefinition = {
   },
 };
 
-export const channelConfigTools: McpToolDefinition[] = [setChannelModelTool, setChannelEffortTool];
+const channelConfigTools: McpToolDefinition[] = [setChannelModelTool, setChannelEffortTool];
 
 registerTools(channelConfigTools);

@@ -62,12 +62,12 @@ export function _setArchiveDbForTest(db: Database | null): void {
  * are distinct platforms, not base and variant (`isChannelVariant`,
  * src/types.ts) — those rows keep matching on their exact channel_type.
  */
-export function channelFamily(channelType: string): string {
+function channelFamily(channelType: string): string {
   const dash = channelType.indexOf('-');
   return dash > 0 ? channelType.slice(0, dash) : channelType;
 }
 
-export function isPooled(channelType: string, platformId: string): boolean {
+function isPooled(channelType: string, platformId: string): boolean {
   return platformId.startsWith(`${channelFamily(channelType)}:`);
 }
 
@@ -470,7 +470,7 @@ export const readThreadTool: McpToolDefinition = {
   },
 };
 
-export const readThreadByKeyTool: McpToolDefinition = {
+const readThreadByKeyTool: McpToolDefinition = {
   tool: {
     name: 'read_thread_by_key',
     description:
@@ -491,7 +491,7 @@ export const readThreadByKeyTool: McpToolDefinition = {
   },
 };
 
-export const readCurrentThreadTool: McpToolDefinition = {
+const readCurrentThreadTool: McpToolDefinition = {
   tool: {
     name: 'read_current_thread',
     description:
@@ -527,7 +527,7 @@ export const readCurrentThreadTool: McpToolDefinition = {
   },
 };
 
-export const threadSearchTools: McpToolDefinition[] = [
+const threadSearchTools: McpToolDefinition[] = [
   searchThreadsTool,
   resolveThreadLinkTool,
   readThreadTool,

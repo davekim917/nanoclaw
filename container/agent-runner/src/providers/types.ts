@@ -260,7 +260,7 @@ export interface QueryInput {
 
 export type McpServerConfig = StdioMcpServerConfig | HttpMcpServerConfig | SseMcpServerConfig;
 
-export interface StdioMcpServerConfig {
+interface StdioMcpServerConfig {
   /** Omitted `type` defaults to stdio for backward compat with the older config shape. */
   type?: 'stdio';
   command: string;
@@ -286,13 +286,13 @@ export interface StdioMcpServerConfig {
  * host's OneCLI gateway injects credentials via HTTPS_PROXY — the container
  * never sees the token. See `granola` wiring in the host container-runner.
  */
-export interface HttpMcpServerConfig {
+interface HttpMcpServerConfig {
   type: 'http';
   url: string;
   headers?: Record<string, string>;
 }
 
-export interface SseMcpServerConfig {
+interface SseMcpServerConfig {
   type: 'sse';
   url: string;
   headers?: Record<string, string>;

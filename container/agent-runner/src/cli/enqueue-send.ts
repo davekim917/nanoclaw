@@ -103,7 +103,7 @@ interface Routing {
  * chat; an agent destination never carries a thread. The parity test in
  * enqueue-send.test.ts holds this to send_message's actual row.
  */
-export function resolveNamedRouting(to: string): Routing {
+function resolveNamedRouting(to: string): Routing {
   const dest = findByName(to);
   if (!dest) throw new EnqueueSendError('invalid', `unknown destination "${to}"`);
   if (dest.type === 'channel') {
@@ -176,7 +176,7 @@ function sameDigests(stored: FileDigests | null, wanted: FileDigests): boolean {
   return stored.every((d, i) => d.name === wanted[i].name && d.sha256 === wanted[i].sha256);
 }
 
-export function budgetRefusal(state: BudgetState, fire: string, fingerprint: string | null | undefined): string | null {
+function budgetRefusal(state: BudgetState, fire: string, fingerprint: string | null | undefined): string | null {
   const fireCount = state.fire === fire ? state.fireCount : 0;
   if (fireCount >= CONTROLLER_SEND_BUDGET.perFire) return `per-fire budget ${CONTROLLER_SEND_BUDGET.perFire} reached`;
   if (state.total >= CONTROLLER_SEND_BUDGET.perRun) return `per-run budget ${CONTROLLER_SEND_BUDGET.perRun} reached`;

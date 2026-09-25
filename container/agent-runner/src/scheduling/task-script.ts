@@ -78,7 +78,7 @@ const FALLBACK_BLOCK: RegExp[] = [
 ];
 
 /** Refuse a pre-task script the interactive Bash gate would block or gate. */
-export async function classifyScript(script: string): Promise<{ safe: boolean; reason?: string }> {
+async function classifyScript(script: string): Promise<{ safe: boolean; reason?: string }> {
   // Managed canonical metadata is shared by every topic worktree in a
   // workgroup. Enforce its host-only maintenance boundary before consulting
   // the Bootstrap evaluator so unattended scripts cannot reach a command the
@@ -188,7 +188,7 @@ export async function runScript(
  * a destructive script the classifier refused to run. 'blocked' acks like
  * 'error' (backoff) so a misconfigured/hostile series throttles itself.
  */
-export type ScriptSkipReason = 'gated' | 'error' | 'blocked';
+type ScriptSkipReason = 'gated' | 'error' | 'blocked';
 
 export interface TaskScriptOutcome {
   keep: MessageInRow[];

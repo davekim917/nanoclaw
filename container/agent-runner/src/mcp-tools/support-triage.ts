@@ -22,7 +22,7 @@
  */
 import fs from 'fs';
 
-export const TRIAGE_MODEL = 'jev-1.13.0'; // pinned: thresholds mean nothing across an alias move
+const TRIAGE_MODEL = 'jev-1.13.0'; // pinned: thresholds mean nothing across an alias move
 const ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
 const TAXONOMY_PATH = '/workspace/agent/support-taxonomy.json';
 const DEFAULT_TIMEOUT_MS = 4_000;
@@ -199,7 +199,7 @@ function chosen(answer: JevAnswer | undefined, type: string, options: Record<str
  * number out of range discards the whole triage (fail-open), rather than
  * passing a partial or repaired hint downstream.
  */
-export function parseTriage(
+function parseTriage(
   answers: Record<string, JevAnswer>,
   product: string | null,
   taxonomy: SupportTaxonomy,

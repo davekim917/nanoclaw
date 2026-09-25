@@ -32,7 +32,7 @@ const RUNNER_SCHEMA = path.resolve(import.meta.dirname, '../container/agent-runn
  */
 function productionDdl(): string {
   const source = fs.readFileSync(RUNNER_SCHEMA, 'utf8');
-  const match = /export const RATE_LIMIT_SAMPLES_DDL = `([\s\S]*?)`;/.exec(source);
+  const match = /(?:export )?const RATE_LIMIT_SAMPLES_DDL = `([\s\S]*?)`;/.exec(source);
   if (!match) throw new Error(`RATE_LIMIT_SAMPLES_DDL not found in ${RUNNER_SCHEMA}`);
   return match[1];
 }

@@ -7,7 +7,7 @@ import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryIn
  * Supports push() — queued messages produce additional results.
  */
 /** What MockProvider reports when a turn pins no model. */
-export const MOCK_RESOLVED_MODEL = 'mock:group-default';
+const MOCK_RESOLVED_MODEL = 'mock:group-default';
 
 export class MockProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;

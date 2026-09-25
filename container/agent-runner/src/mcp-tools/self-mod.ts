@@ -16,18 +16,13 @@ import { getCentralDb } from '../central-db.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { setStickyModel, setStickyEffort } from '../modules/mailbox/index.js';
 import { getConfig } from '../config.js';
-import { resolveFamilyModel } from '../providers/model-vocabulary.js';
+import { OPENCODE_MODEL_SLUG_RE, resolveFamilyModel } from '../providers/model-vocabulary.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
 }
-
-// Mirror of the host flag-parser's OPENCODE_VALID_MODEL_RE (src/flag-parser.ts):
-// a well-formed provider-prefixed opencode slug `<provider>/<id…>`. Kept in sync
-// by hand — the container can't import the host module (separate tree).
-const OPENCODE_MODEL_SLUG_RE = /^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._/-]*$/i;
 
 function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -398,7 +393,7 @@ export function unavailableModelInventory(provider: string) {
   );
 }
 
-export const listModels: McpToolDefinition = {
+const listModels: McpToolDefinition = {
   tool: {
     name: 'list_models',
     description:
@@ -490,7 +485,7 @@ export const listModels: McpToolDefinition = {
   },
 };
 
-export const changeModel: McpToolDefinition = {
+const changeModel: McpToolDefinition = {
   tool: {
     name: 'change_model',
     description:

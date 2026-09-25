@@ -2,7 +2,7 @@ import { cwdWrappedArgv } from './cwd-shim.js';
 import type { McpServerConfig } from './types.js';
 
 /** OpenCode `mcp` entry shape (local stdio server). */
-export type OpenCodeMcpLocal = {
+type OpenCodeMcpLocal = {
   type: 'local';
   command: string[];
   environment?: Record<string, string>;
@@ -10,7 +10,7 @@ export type OpenCodeMcpLocal = {
 };
 
 /** OpenCode `mcp` entry shape (remote Streamable HTTP server). */
-export type OpenCodeMcpRemote = {
+type OpenCodeMcpRemote = {
   type: 'remote';
   url: string;
   headers?: Record<string, string>;

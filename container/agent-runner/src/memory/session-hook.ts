@@ -2,7 +2,7 @@ import { renderMemorySection } from './context.js';
 
 const MEMORY_CONTEXT_SOURCES = ['startup', 'clear', 'compact'] as const;
 
-export type MemorySessionHookSource = (typeof MEMORY_CONTEXT_SOURCES)[number];
+type MemorySessionHookSource = (typeof MEMORY_CONTEXT_SOURCES)[number];
 export type MemorySessionStartSource = MemorySessionHookSource | 'resume';
 
 export interface MemorySessionHookRegistration {

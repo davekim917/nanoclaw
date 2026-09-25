@@ -11,7 +11,7 @@ import type { Database } from 'bun:sqlite';
 
 import { getOutboundDb, sqliteClearContainerToolInFlight } from '../../mailbox/sqlite/connection.js';
 
-export type ProviderHealthStatus = 'active' | 'healthy' | 'suspect' | 'recovering' | 'failed' | 'idle';
+type ProviderHealthStatus = 'active' | 'healthy' | 'suspect' | 'recovering' | 'failed' | 'idle';
 
 export interface ProviderHealthState {
   status: ProviderHealthStatus;

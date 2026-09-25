@@ -33,7 +33,7 @@ function ok(text: string) {
   return { content: [{ type: 'text' as const, text }] };
 }
 
-export const startRemoteControlTool: McpToolDefinition = {
+const startRemoteControlTool: McpToolDefinition = {
   tool: {
     name: 'start_remote_control',
     description:
@@ -54,7 +54,7 @@ export const startRemoteControlTool: McpToolDefinition = {
   },
 };
 
-export const stopRemoteControlTool: McpToolDefinition = {
+const stopRemoteControlTool: McpToolDefinition = {
   tool: {
     name: 'stop_remote_control',
     description: 'Stop the currently-running Claude Code Remote Control session on the host.',
@@ -66,7 +66,7 @@ export const stopRemoteControlTool: McpToolDefinition = {
   },
 };
 
-export const getRemoteControlStatusTool: McpToolDefinition = {
+const getRemoteControlStatusTool: McpToolDefinition = {
   tool: {
     name: 'get_remote_control_status',
     description: 'Check whether a Remote Control session is active on the host, and if so, return its URL.',
@@ -78,7 +78,7 @@ export const getRemoteControlStatusTool: McpToolDefinition = {
   },
 };
 
-export const remoteControlTools: McpToolDefinition[] = [
+const remoteControlTools: McpToolDefinition[] = [
   startRemoteControlTool,
   stopRemoteControlTool,
   getRemoteControlStatusTool,

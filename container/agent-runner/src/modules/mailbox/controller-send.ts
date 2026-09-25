@@ -14,7 +14,7 @@
 import { createOutboundRecord } from '../../mailbox/model.generated.js';
 import { getInboundDb, getOutboundDb } from '../../mailbox/sqlite/connection.js';
 
-export interface ControllerSendRowPayload {
+interface ControllerSendRowPayload {
   kind: string;
   platform_id: string | null;
   channel_type: string | null;
@@ -24,25 +24,25 @@ export interface ControllerSendRowPayload {
   content: string;
 }
 
-export type ControllerSendDigests = Array<{ name: string; sha256: string }>;
+type ControllerSendDigests = Array<{ name: string; sha256: string }>;
 
-export interface ControllerSendBudgetState {
+interface ControllerSendBudgetState {
   total: number;
   fire: string;
   fireCount: number;
   fingerprints: Record<string, number>;
 }
 
-export function controllerSendDigestKey(id: string): string {
+function controllerSendDigestKey(id: string): string {
   return `controller_send_files:${id}`;
 }
 
-export function controllerSendBudgetKey(runId: string): string {
+function controllerSendBudgetKey(runId: string): string {
   return `controller_send_budget:${runId}`;
 }
 
 /** The digests recorded with an existing row; null when absent or unreadable. */
-export function readControllerSendDigests(id: string): ControllerSendDigests | null {
+function readControllerSendDigests(id: string): ControllerSendDigests | null {
   const row = getOutboundDb().prepare('SELECT value FROM session_state WHERE key = ?').get(controllerSendDigestKey(id)) as
     | { value: string }
     | undefined;
@@ -67,7 +67,7 @@ export function readControllerSendDigests(id: string): ControllerSendDigests | n
  * The per-run budget counters. Throws through `onUnreadable` rather than
  * returning zeroes: an unreadable counter must not read as "nothing sent".
  */
-export function readControllerSendBudget(runId: string, onUnreadable: (runId: string) => Error): ControllerSendBudgetState {
+function readControllerSendBudget(runId: string, onUnreadable: (runId: string) => Error): ControllerSendBudgetState {
   const row = getOutboundDb()
     .prepare('SELECT value FROM session_state WHERE key = ?')
     .get(controllerSendBudgetKey(runId)) as { value: string } | undefined;
