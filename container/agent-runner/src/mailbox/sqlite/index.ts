@@ -171,13 +171,14 @@ export class SqliteAgentMailbox implements AgentMailbox {
     inboundSeq: number,
     route: { platformId: string; threadId: string | null },
   ): number {
-    // Only what shows in that conversation: platform messages (`chat-sdk` —
-    // an inbound `chat` row is a host/system note, never on screen) and the
-    // agent's own chat posted there. Counting session-wide made a thread look
-    // busy over system notes and messages to other destinations.
+    // Only what shows in that conversation: rows routed to its platform and
+    // thread. The route is the provenance filter — a host/system note is keyed
+    // to the agent group, never to a channel — so a native `chat` ingress
+    // (e.g. the CLI adapter) still counts. Counting session-wide made a thread
+    // look busy over system notes and messages to other destinations.
     const inbound = getInboundDb()
       .prepare(
-        "SELECT COUNT(*) AS n FROM messages_in WHERE seq > ? AND kind = 'chat-sdk' AND platform_id = ? AND thread_id IS ?",
+        "SELECT COUNT(*) AS n FROM messages_in WHERE seq > ? AND kind IN ('chat', 'chat-sdk') AND platform_id = ? AND thread_id IS ?",
       )
       .get(inboundSeq, route.platformId, route.threadId) as { n: number };
     const outbound = getOutboundDb()

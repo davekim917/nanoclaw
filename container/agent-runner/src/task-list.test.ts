@@ -214,6 +214,17 @@ describe('applyTaskListUpdate', () => {
     expect(h.writes[1].content.operation).toBeUndefined();
   });
 
+  it('does not reuse a post whose record predates the inbound cursor', async () => {
+    const h = harness({ messagesAfter: 0 });
+    await applyTaskListUpdate(input('First', items(['A', 'done'])), SLACK, h.deps);
+    const legacy = { ...h.state! } as Partial<TaskListState>;
+    delete legacy.postInboundSeq;
+    h.deps.save(legacy as TaskListState);
+    const out = await applyTaskListUpdate(input('Second', items(['B', 'in_progress'])), SLACK, h.deps);
+    expect(out).toMatchObject({ ok: true, action: 'posted' });
+    expect(h.writes[1].content.operation).toBeUndefined();
+  });
+
   it('takes over a finished list’s post when nothing sits below it', async () => {
     const h = harness({ messagesAfter: 0 });
     await applyTaskListUpdate(input('First', items(['A', 'done'])), SLACK, h.deps);

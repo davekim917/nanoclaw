@@ -336,7 +336,9 @@ export async function applyTaskListUpdate(
     sameRoute(routing, prev) &&
     prev.platformMessageId &&
     prev.postSeq !== null &&
-    deps.messagesAfter(prev.postSeq, prev.postInboundSeq ?? prev.postSeq) === 0
+    // Without its own inbound cursor nothing proves the thread is quiet.
+    prev.postInboundSeq != null &&
+    deps.messagesAfter(prev.postSeq, prev.postInboundSeq) === 0
   ) {
     current = prev;
     target = prev.platformMessageId;

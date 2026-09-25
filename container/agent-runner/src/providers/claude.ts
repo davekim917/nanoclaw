@@ -1348,9 +1348,8 @@ export const TASK_LIST_TOOL_NAME = 'mcp__nanoclaw__update_task_list';
  * rewrote its parent's on-screen list with its own steps — seen live
  * 2026-09-25, where the worker's finished list forced the parent
  * to post a new one under a pointless "Latest task list" link. The SDK marks a
- * hook call made inside a subagent with `agent_id` (claude-agent-sdk sdk.d.ts:183:
- * "Present only when the hook fires from within a subagent"); the main thread
- * never carries it, even under `--agent`.
+ * hook call made inside a subagent with `agent_id`; the main thread never
+ * carries it, even under `--agent`.
  */
 export function createSubagentTaskListDenyHook(): HookCallback {
   return async (input) => {

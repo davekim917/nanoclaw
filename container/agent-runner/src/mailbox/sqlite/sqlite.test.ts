@@ -147,14 +147,17 @@ describe('SQLite runner mailbox canonical serialization', () => {
     // traffic in another thread never show below the list.
     addIn.run('in-8', 8, 'chat', 'ag-1', null);
     addIn.run('in-10', 10, 'chat-sdk', 'slack:C1', 'slack:C1:999.9');
+    // A native `chat` ingress routed to the conversation (the CLI adapter's kind) does count.
+    addIn.run('in-12', 12, 'chat', 'cli:local', null);
     addOut.run('elsewhere', 15, 'chat', 'slack:C2', null);
     addOut.run('reply', 13, 'chat', 'slack:C1', T);
     const mailbox = new SqliteAgentMailbox();
-    expect(mailbox.maxInboundSeq()).toBe(10);
+    expect(mailbox.maxInboundSeq()).toBe(12);
     // After the list (outbound 11, inbound 2): in-4 and the reply only.
     expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'slack:C1', threadId: T })).toBe(2);
     // A channel-level conversation (null thread) matches null exactly.
     expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'slack:C2', threadId: null })).toBe(1);
+    expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'cli:local', threadId: null })).toBe(1);
   });
 
   test('reads one inbound message route by id', () => {
