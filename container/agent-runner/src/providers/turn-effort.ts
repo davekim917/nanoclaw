@@ -8,7 +8,7 @@
  * confirm it. Without this, "did `ncl groups config update --effort` actually
  * reach the container" was only answerable by reading code — which is how a
  * class of silent config no-ops survived unnoticed across nine Claude groups
- * for months (fixed 2026-09-07, PRs #532/#540/#535). The model half of every
+ * for months (fixed 2026-09-07). The model half of every
  * one of those claims was measured; the effort half was inferred.
  *
  * EFFECTIVE, NOT REQUESTED — and both, because they diverge. `effort` is the

@@ -569,11 +569,11 @@ export async function readCodexSubagentThreads(
  * deserializes its params as unit, so that map was refused at the JSON-RPC
  * boundary before any account lookup:
  *   `Invalid request: invalid type: map, expected unit`
- * — which is what production logged for every bind-time read (#817). Omitting
+ * — which is what production logged for every bind-time read. Omitting
  * `params` is valid on both: unit on 0.153.4, absent-and-optional on 0.154.0
  * (verified by issuing the real RPC against both binaries).
  *
- * The container's `ARG CODEX_VERSION` (`container/Dockerfile:41`) is now
+ * The container's `ARG CODEX_VERSION` (`container/Dockerfile`) is now
  * **0.154.0** too, so the params map would be accepted again — and it is still
  * deliberately NOT sent. `excludeResetCreditDetails: true` only skipped a
  * second reset-credit lookup we never read, so re-adding it would buy nothing
@@ -585,9 +585,9 @@ export async function readCodexSubagentThreads(
  * as NOT SAMPLED (no row, no park) and logs it — telemetry must never fail a
  * turn. That is why this failed silently for a full deploy:
  * `CodexRateLimitTracker.read()` writes its `usage_pull` sample inside the same
- * `try` (`codex-rate-limit-tracker.ts:232`, caught at `:235`), so a throw here
+ * `try` (`codex-rate-limit-tracker.ts`), so a throw here
  * costs every pull row while the push path (`account/rateLimits/updated`,
- * `onNotification` at `:261`) keeps writing and the sample table looks alive.
+ * `onNotification`) keeps writing and the sample table looks alive.
  */
 export async function readCodexAccountRateLimits(
   server: AppServer,
@@ -608,7 +608,7 @@ export async function readCodexAccountRateLimits(
  * optional because this is a foreign wire shape and a pin move may drop or
  * rename a field. The three the trust check reads — `key`, `enabled`,
  * `trustStatus` — are exactly the three codex's own dispatch predicate reads
- * (`hooks/src/engine/discovery.rs:713-718`: `enabled && (bypass_hook_trust ||
+ * (`hooks/src/engine/discovery.rs`: `enabled && (bypass_hook_trust ||
  * trust_status is Managed | Trusted)`).
  */
 export interface CodexHookListEntry {
@@ -825,7 +825,6 @@ export function renderCodexMcpConfigToml(existing: string, servers: Record<strin
  * Honors CODEX_HOME so a rotated home (OAuth fallback) gets its own regenerated
  * config — otherwise the rotated app-server reads stale config from the wrong
  * dir. CODEX_HOME == $HOME/.codex on initial spawn, so this is a no-op there.
- * (codex #126)
  */
 export function resolveCodexConfigDir(): string {
   return process.env.CODEX_HOME || path.join(process.env.HOME || '/home/node', '.codex');
@@ -918,7 +917,7 @@ export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number; codex
   // guard wiring, so a rotated fallback home MUST get the regenerated hooks or the
   // guard silently stops firing after an OAuth rotation. An explicit codexHome
   // lets peer-mode `codex exec` receive the same in-tree hook before CODEX_HOME
-  // is switched to its synthesized runtime directory. (codex #126)
+  // is switched to its synthesized runtime directory.
   //
   // Through the SAME resolver as the config writer, deliberately. This used to
   // read `process.env.CODEX_HOME ?? …` while the config writer read

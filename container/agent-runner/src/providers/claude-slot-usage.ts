@@ -10,7 +10,7 @@
  * Telemetry ONLY — the readings never choose a credential. Slot order is the
  * operator's priority: the ring is `CLAUDE_CODE_OAUTH_TOKEN`, then `_2`, `_3`,
  * … in numeric order, and it advances only when a slot hits a rate-limit or
- * quota wall (`ClaudeProvider.rotateApiKey`). Quota-burn 0.6 (#811/#821) moved
+ * quota wall (`ClaudeProvider.rotateApiKey`). Quota-burn 0.6 moved
  * each session onto the most-used slot with headroom; the operator reversed
  * that on 2026-09-16 in favour of numbered order.
  *
@@ -119,7 +119,7 @@ export function parseSlotUsageSurvey(
 /**
  * One survey entry as the `/usage` response shape `usageResponseToSamples`
  * already consumes, so the 0-100 -> 0-1 normalization stays at its single
- * seam and the rows written are byte-for-byte what #811 wrote.
+ * seam.
  */
 export function surveyEntryToUsageResponse(entry: SlotUsageSurveyEntry): OauthUsageResponse {
   return { subscription_type: null, rate_limits_available: true, rate_limits: entry.rateLimits };

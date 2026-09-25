@@ -10,7 +10,7 @@ const TRANSCRIPT_PROMPT_TAIL_BYTES = 8 * 1024 * 1024;
  * True only when `text` is provably in what a resume of the transcript at
  * `transcriptPath` will load. A credential-rotation retry asks this to decide
  * whether it can point at the batch instead of sending it again
- * (poll-loop.ts:1128 → `formatCredentialRetryPrompt`, poll-loop.ts:142).
+ * (poll-loop.ts → `formatCredentialRetryPrompt`).
  *
  * The resumed context is the parent chain ending at the newest `user`/
  * `assistant` entry, so that is what this walks: from that entry back through
@@ -85,13 +85,13 @@ export function transcriptContainsUserText(transcriptPath: string, text: string,
     // Duplicate detection runs BEFORE sidechains are dropped: a sidechain entry
     // that reuses a main-conversation uuid shadows it on resume — verified
     // against SDK 0.3.278 / CLI 2.1.278, where the captured request carried the
-    // sidechain's text and not the batch (PR #948 review round 2).
+    // sidechain's text and not the batch.
     if (seenUuids.has(entry.uuid)) return false;
     seenUuids.add(entry.uuid);
     // Only a boolean is a claim about sidechain-ness. `"true"` or `1` are not
     // `=== true`, so they would have been treated as main conversation while the
-    // SDK excluded them — a batch this walk reached that the resume omits
-    // (PR #948 review round 3). No writer is known to emit those, which is
+    // SDK excluded them — a batch this walk reached that the resume omits.
+    // No writer is known to emit those, which is
     // exactly why the file, not the guess, decides.
     if ('isSidechain' in entry && typeof entry.isSidechain !== 'boolean') return false;
     if (entry.isSidechain === true) continue; // subagent turns are not resumed here

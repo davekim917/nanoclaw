@@ -189,7 +189,7 @@ export class CodexRateLimitTracker {
     const server = this.server;
     // Advance BEFORE awaiting so a slow read cannot stack a second one.
     this.lastReadAt = this.deps.now();
-    // Check-then-act across the await, per FIELD (review round 2 on #812): a
+    // Check-then-act across the await, per FIELD: a
     // whole-snapshot seq made the read discard EVERY field when ANY one had
     // an intervening push, e.g. a sparse primary-only push would blank out
     // the read's own fresh secondary reading and leave it unchecked for a

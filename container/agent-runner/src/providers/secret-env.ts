@@ -23,7 +23,7 @@
  *     GITHUB_TOKEN were never stripped here either);
  *   - OneCLI's per-request injection at the proxy boundary, where the
  *     container-side value is frequently only the `placeholder` sentinel
- *     (src/container-runner.ts:3974).
+ *     (src/container-runner.ts).
  *
  * Unsetting the Anthropic vars per Bash command was a v1 port whose premise —
  * "a Bash subprocess must not be able to `printenv` a live secret" — this file
@@ -34,7 +34,7 @@
  *
  * GMAIL_OAUTH_PATH / GMAIL_CREDENTIALS_PATH went with them, for a different
  * reason: nothing in `src/` or `container/` sets either one in the container
- * env. `.claude/skills/add-gmail-tool/SKILL.md:177` sets both — on the gmail MCP
+ * env. `.claude/skills/add-gmail-tool/SKILL.md` sets both — on the gmail MCP
  * server's OWN env, not the container's — so the old unset never matched them,
  * and their values are file paths, not secrets. Two names that could never
  * match.
@@ -61,7 +61,7 @@ export const OAUTH_KEY_RE = /^CLAUDE_CODE_OAUTH_TOKEN(_\d+)?$/;
  * nor data-tool secrets that bash tools legitimately consume from env
  * (SNOWFLAKE_PASSWORD, DBT_* tokens, OPENAI_API_KEY, …) — stripping those would
  * break `snow`/`dbt`/etc. on BOTH providers. Single source of truth; do not fork
- * this list into an adapter. (codex #126)
+ * this list into an adapter.
  */
 export const MCP_HEADER_ONLY_SECRET_VARS: readonly string[] = [
   'GRANOLA_ACCESS_TOKEN',

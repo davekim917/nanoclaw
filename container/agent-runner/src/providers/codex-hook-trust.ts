@@ -6,14 +6,13 @@
  * matching `[hooks.state."<key>"] trusted_hash` entry in `config.toml`, and
  * the handler is simply never dispatched — the discovery loop only pushes a
  * handler when `trust_status` is `Managed | Trusted`
- * (codex-rs `hooks/src/engine/discovery.rs:664-716`). There is no RPC to grant
+ * (codex-rs `hooks/src/engine/discovery.rs`). There is no RPC to grant
  * trust, and a `-c hooks.state...` override does not take.
  *
  * A bypass DOES exist, and two earlier revisions of this comment were wrong
  * about it in opposite directions — first that there was none, then that it
  * was inert everywhere. What is true on 0.154.0, measured against the binary
- * with a positive and a negative control on every row (#847; full arm table
- * and codex-rs citations on #838):
+ * with a positive and a negative control on every row:
  *
  * | path                                              | untrusted hooks fired |
  * |---------------------------------------------------|----------------------|
@@ -36,8 +35,8 @@
  * than for want of an alternative. They name exactly the generated handlers
  * plus the plugins `planCodexPluginRegistration` admits; the override runs
  * EVERY enabled hook in the home, including anything that arrives there later.
- * The entries' own weakness — they can silently mis-hash, which is the whole
- * #830 class — is what #832's spawn-time `hooks/list` check exists to catch.
+ * The entries' own weakness — they can silently mis-hash — is what the
+ * spawn-time `hooks/list` check exists to catch.
  *
  * Two traps, recorded because each yields a false pass: the app-server
  * silently accepts unknown params, so an override being "accepted" on
@@ -58,8 +57,8 @@
  * to an interactive trust prompt no container can answer.
  *
  * The hash is a fingerprint of the NORMALIZED hook identity, not of the file
- * bytes (codex-rs `hooks/src/engine/discovery.rs:742-791` → `hook_hash`,
- * `config/src/fingerprint.rs:53-84` → `version_for_toml`):
+ * bytes (codex-rs `hooks/src/engine/discovery.rs` → `hook_hash`,
+ * `config/src/fingerprint.rs` → `version_for_toml`):
  *
  *   sha256(compact, recursively key-sorted JSON of
  *     { event_name, matcher?, hooks: [ <normalized handler> ] })
@@ -128,7 +127,7 @@ export function codexHookEventKey(event: CodexHookEvent): string {
 /**
  * The events whose `matcher` survives into the hashed identity — codex's
  * `HOOK_EVENT_NAMES_WITH_MATCHERS` (`hooks/src/lib.rs`), applied by
- * `matcher_pattern_for_event` (`hooks/src/events/common.rs:112-128`) BEFORE
+ * `matcher_pattern_for_event` (`hooks/src/events/common.rs`) BEFORE
  * `hook_hash` sees the group.
  *
  * For `UserPromptSubmit`, `Stop` and `Interrupt` codex replaces the declared
@@ -156,7 +155,7 @@ const SESSION_END_DEFAULT_TIMEOUT_SEC = 1;
 const SESSION_END_MAX_TIMEOUT_SEC = 3;
 /**
  * `additionalContextLimit` equal to the default is normalized away before
- * hashing (`discovery.rs:556-557`), so an explicit 2500 and an absent value
+ * hashing (`discovery.rs`), so an explicit 2500 and an absent value
  * hash identically.
  */
 const DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT = 2500;
@@ -251,7 +250,7 @@ export interface CodexCommandHookHandler {
 
 /**
  * A `"type": "mcp_tool"` handler (`HookHandlerConfig::McpTool`,
- * codex-rs `config/src/hook_config.rs:186-196`).
+ * codex-rs `config/src/hook_config.rs`).
  *
  * `input` carries `#[serde(default)]` and NO `skip_serializing_if`, so unlike
  * the `Option` fields it is present in the hashed document even when empty.
@@ -318,7 +317,7 @@ function normalizeTimeout(event: CodexHookEvent, timeout: number | BoxedNumber |
  *
  * - `command` is the RAW string, before `${PLUGIN_ROOT}` expansion: the Rust
  *   side clones `command` into the hashed config and only then folds the env
- *   substitutions into a separate copy (`discovery.rs:562-577`).
+ *   substitutions into a separate copy (`discovery.rs`).
  * - `command_windows` is resolved into `command` on non-Windows and then set
  *   to `None`, so it never appears.
  * - `timeout` is always present (`Some(timeout_sec)`), normalized.
@@ -450,7 +449,7 @@ function encodeMcpToolInputValue(value: unknown): unknown | null {
  * `input` hashes as an empty table, not as an absent field.
  *
  * `async` and `additionalContextLimit` never appear: the McpTool variant has
- * neither field (`config/src/hook_config.rs:186-196`).
+ * neither field (`config/src/hook_config.rs`).
  */
 function normalizeMcpToolHandler(
   event: CodexHookEvent,
@@ -481,7 +480,7 @@ function normalizeMcpToolHandler(
  *
  * A skipped handler still CONSUMES its index: codex enumerates the whole group
  * and `continue`s, so the key of every later handler depends on it
- * (`append_matcher_groups`, `discovery.rs:502-655`).
+ * (`append_matcher_groups`, `discovery.rs`).
  */
 function normalizeHandler(event: CodexHookEvent, handler: CodexHookHandler): Record<string, unknown> | null {
   if (handler.type === 'command') {
@@ -496,7 +495,7 @@ function normalizeHandler(event: CodexHookEvent, handler: CodexHookHandler): Rec
   return null;
 }
 
-/** Recursively sort object keys — `canonical_json` in `fingerprint.rs:67-84`. */
+/** Recursively sort object keys — `canonical_json` in `fingerprint.rs`. */
 function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (value && typeof value === 'object') {
@@ -542,7 +541,7 @@ export function codexHookTrustHash(
  *
  * `keySource` is the prefix Codex builds the state key from: the ABSOLUTE
  * hooks.json path for a file hook, or `<plugin>@<marketplace>:<relative path>`
- * for a plugin hook (`hook_key`, `hooks/src/lib.rs:113-123`). The suffix is
+ * for a plugin hook (`hook_key`, `hooks/src/lib.rs`). The suffix is
  * `:<event_key>:<groupIndex>:<handlerIndex>`.
  *
  * INDICES ARE POSITIONS IN THE FILE AS WRITTEN, including handlers codex
@@ -688,10 +687,10 @@ export function mergeCodexHookTrustIntoToml(toml: string, entries: readonly Code
 
 /**
  * Codex dispatches a handler only when `enabled && trust_status ∈ {Managed,
- * Trusted}` (`hooks/src/engine/discovery.rs:713-718`; `bypass_hook_trust` is
+ * Trusted}` (`hooks/src/engine/discovery.rs`; `bypass_hook_trust` is
  * the third disjunct and is inert on this path — see this file's header). Both
  * halves matter: a `[hooks.state."<key>"] enabled = false` row leaves a handler
- * `trusted` and still undispatched (`hook_enabled`, `discovery.rs:813-815`).
+ * `trusted` and still undispatched (`hook_enabled`, `discovery.rs`).
  */
 export function isCodexHookDispatchable(entry: CodexHookListEntry): boolean {
   const status = (entry.trustStatus ?? '').toLowerCase();
@@ -880,7 +879,7 @@ const DEFAULT_PLUGIN_HOOKS_FILE = 'hooks/hooks.json';
 /**
  * Resolve one declared `hooks` path the way codex's manifest loader does, or
  * `null` when codex would DISCARD it (`resolve_manifest_path`,
- * `core-plugins/src/manifest.rs:597-649`).
+ * `core-plugins/src/manifest.rs`).
  *
  * Four refusals, all of them silent warnings on the codex side:
  *   - empty;
@@ -895,7 +894,7 @@ const DEFAULT_PLUGIN_HOOKS_FILE = 'hooks/hooks.json';
  * Returns the two forms separately, because codex uses two. The FILE it opens
  * keeps the declaration literally (POSIX: a `\\` is an ordinary filename byte);
  * the KEY it records replaces `\\` with `/` (`append_plugin_hook_file`,
- * `core-plugins/src/loader.rs:1280-1285`). Measured: a plugin declaring
+ * `core-plugins/src/loader.rs`). Measured: a plugin declaring
  * `./hooks\\d.json`, with BOTH a file literally named `hooks\\d.json` and a real
  * `hooks/d.json`, loaded the backslash-named one and keyed it `hooks/d.json`.
  */
@@ -920,7 +919,7 @@ export interface CodexPluginHookBlock {
   /**
    * The `source_relative_path` half of the state key: a relative file path, or
    * `plugin.json#hooks[<index>]` for a hooks block declared INLINE in the
-   * manifest (`load_plugin_hooks`, `core-plugins/src/loader.rs:1191-1243`).
+   * manifest (`load_plugin_hooks`, `core-plugins/src/loader.rs`).
    */
   keySuffix: string;
   /** The `hooks` object itself — from the file, or from the manifest inline. */
@@ -930,8 +929,8 @@ export interface CodexPluginHookBlock {
 /**
  * Every hooks block codex 0.154.0 will load for this plugin, in its own order.
  *
- * Reproduces `resolve_manifest_hooks` (`core-plugins/src/manifest.rs:413-444`)
- * feeding `load_plugin_hooks` (`core-plugins/src/loader.rs:1191-1243`). The
+ * Reproduces `resolve_manifest_hooks` (`core-plugins/src/manifest.rs`)
+ * feeding `load_plugin_hooks` (`core-plugins/src/loader.rs`). The
  * manifest `hooks` field accepts FOUR shapes, and this module previously handled
  * two:
  *

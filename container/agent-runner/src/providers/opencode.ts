@@ -33,7 +33,7 @@ import { recordContextTokens } from '../turn-status.js';
  * that message is what `message.updated` delivers here. So the sum
  * reconstitutes the full prompt on any upstream.
  *
- * #1015 suspected a double count on GPT-backed models and was closed on this
+ * A double count on GPT-backed models was suspected and ruled out on this
  * evidence. The one-session measurement in `sumOpenCodeTurnUsage`'s header
  * agrees but only covers an Anthropic upstream; the source above is what
  * covers the rest. Re-read getUsage on any OPENCODE_VERSION bump — a release
@@ -506,10 +506,10 @@ const STALE_SESSION_RE = new RegExp(
  * stdio children can't printenv Exa/Braintrust/Granola. That is the
  * cross-provider env-hygiene parity bar (Claude strips the same set via
  * filterSdkEnv). Data-tool secrets (SNOWFLAKE_PASSWORD, DBT_*, OPENAI_API_KEY,
- * …) are deliberately KEPT, matching Claude. (codex #126)
+ * …) are deliberately KEPT, matching Claude.
  *
- * ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN used to be stripped here too
- * (codex #126 F3). They no longer are: a container's shell inherits the
+ * ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN are deliberately NOT stripped:
+ * a container's shell inherits the
  * credential the container runs on, so an agent in an OpenCode session can run
  * `claude -p` headless the way it can already run `opencode run` and
  * `codex exec` — see secret-env.ts's header for the model.
@@ -1145,8 +1145,7 @@ async function ensureSharedRuntime(
     // ownership. If init throws AFTER spawnOpencodeServer returns a LIVE proc but
     // BEFORE the sharedRuntime assignment (e.g. client.event.subscribe() rejects),
     // destroySharedRuntime() can't see this proc — so the finally kills it here.
-    // Without this, every retry leaks another orphaned server process. (codex #126
-    // F5 follow-up)
+    // Without this, every retry leaks another orphaned server process.
     let orphanProc: ChildProcess | undefined;
     try {
       if (sharedRuntime) {
@@ -1193,7 +1192,7 @@ async function ensureSharedRuntime(
       // mounted yet, or before OPENCODE_ALLOW_UNGUARDED is set) clearing lets a
       // later turn RE-RUN init instead of replaying the cached rejection forever.
       // The poll loop survives per-turn errors, so without this the container is
-      // stuck unguarded-broken for its whole life. (codex #126 F5)
+      // stuck unguarded-broken for its whole life.
       sharedInit = null;
     }
   })();

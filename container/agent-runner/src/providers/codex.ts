@@ -410,7 +410,7 @@ export function materializeRawImageGeneration(
  * The unpinned Codex fleet default: gpt-6-sol at `high` reasoning (operator
  * decision 2026-09-22, replacing gpt-5.6-sol; gpt-5.6-terra at `xhigh` before
  * 2026-09-16). Keep it equal to the `sol` family target
- * (`CODEX_FAMILY_DEFAULTS`, src/flag-parser.ts:128; setup/lib/codex-model-min-cli.test.ts
+ * (`CODEX_FAMILY_DEFAULTS`, src/flag-parser.ts; setup/lib/codex-model-min-cli.test.ts
  * fails when they differ).
  *
  * These are the ONLY fleet defaults for Codex. A group pins with
@@ -877,7 +877,7 @@ export function copyRolloutToFallback(srcRollout: string, srcCodexHome: string, 
  * fallback home is RW and Codex reads roles from `$CODEX_HOME/agents/`. The
  * destination is an exact snapshot: retired roles must not survive a later
  * mirror, and removing the primary tree clears a stale fallback tree. No-op
- * only when src==dst or neither tree exists. (codex #126)
+ * only when src==dst or neither tree exists.
  */
 export function mirrorCodexAgentsToHome(primaryCodexHome: string, targetCodexHome: string): boolean {
   if (primaryCodexHome === targetCodexHome) return false;
@@ -1089,7 +1089,7 @@ export class CodexProvider implements AgentProvider {
     if (typeof rawSticky.model === 'string') {
       rawSticky.model = resolveCodexFamily(rawSticky.model);
       // Unresolved only when the host sent no alias map (a host predating
-      // src/container-runner.ts:6486/:6588, i.e. an adopted container).
+      // `codexFamilyAliasEnv`, i.e. an adopted container).
       // Never hand the app-server a bare family word.
       if (isCodexFamilyName(rawSticky.model as string)) {
         console.error(`[codex-provider] Ignoring unresolved Codex family alias "${rawSticky.model}"`);
@@ -1610,8 +1610,8 @@ export class CodexProvider implements AgentProvider {
                   // (just switched above), so regenerating config + the guard hooks
                   // lands them in the fallback home — without this the rotated
                   // app-server runs UNGUARDED. agents/ is bind-mounted only at the
-                  // primary, so mirror the role definitions across explicitly
-                  // (codex #126); the mirror is a no-op when the ring wraps back
+                  // primary, so mirror the role definitions across explicitly;
+                  // the mirror is a no-op when the ring wraps back
                   // to the primary (`mirrorCodexAgentsToHome` returns on src == dst).
                   writeCodexMcpConfigToml(self.mcpServers);
                   writeCodexHooksAndTrust();
@@ -1947,7 +1947,7 @@ export async function* runOneTurn(
   // `SubAgentActivityItem` carries the id and the agent path but NOT the
   // model or effort — those live on the thread it points at.
   //
-  // READ AS SOON AS A CHILD APPEARS, not only at turn end (#1028). With
+  // READ AS SOON AS A CHILD APPEARS, not only at turn end. With
   // outcome reporting on (the default) the agent replies through
   // send_message mid-turn, and that row is stamped from the persisted
   // snapshot at the moment it is written. A roster enriched only after the
@@ -2472,7 +2472,7 @@ export async function* runOneTurn(
         // delivers as edit-in-place) ends up overwriting the 💭 thinking
         // labels emitted from `item/reasoning/…` with "status: active". The
         // Claude provider hit the analogous problem with tool_use labels
-        // overwriting thinking and resolved it the same way (claude.ts:54).
+        // overwriting thinking and resolved it the same way.
         // Anything more semantic that codex might emit (compacting,
         // loading skills, etc.) still gets forwarded.
         const raw = params.status;
