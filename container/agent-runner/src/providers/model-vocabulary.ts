@@ -70,3 +70,35 @@ export function modelBelongsToProvider(model: string, providerName: string): boo
   if (providerName === 'opencode') return opencode;
   return !codex && !opencode;
 }
+
+/**
+ * The env var the CLI expands each bare Claude family alias through. It is
+ * read only in the alias → concrete id direction (`canonicalUsageModel` in the
+ * Claude provider, `resolveFamilyModel` below); the send path pins nothing into `perQueryEnv` any more, because a family word
+ * means the same model in every group.
+ *
+ * The host resolves every alias once at spawn and injects the answers here
+ * (`claudeSpawnEnv` in src/claude-spawn-defaults.ts, forwarded by
+ * src/group-init.ts), so reading these is reading the host's own resolution
+ * rather than mirroring its vocabulary. That matters: src/flag-parser.ts owns
+ * the alias table and is NOT importable from this Bun package, so a second
+ * copy here would be free to drift.
+ */
+export const CLAUDE_FAMILY_ALIAS_ENV: Readonly<Record<string, string>> = {
+  opus: 'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  sonnet: 'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  haiku: 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  fable: 'ANTHROPIC_DEFAULT_FABLE_MODEL',
+};
+
+/**
+ * A family word of either provider → the concrete id it runs as in this
+ * container; anything else unchanged. For comparing against stored ids (the
+ * operator deny list), not for sending: the providers resolve on their own.
+ */
+export function resolveFamilyModel(model: string, env: Record<string, string | undefined> = process.env): string {
+  const key = model.toLowerCase();
+  if (CODEX_FAMILY_NAMES.has(key)) return resolveCodexFamily(key, env);
+  if (Object.hasOwn(CLAUDE_FAMILY_ALIAS_ENV, key)) return env[CLAUDE_FAMILY_ALIAS_ENV[key]] || model;
+  return model;
+}

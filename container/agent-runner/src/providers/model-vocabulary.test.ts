@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'bun:test';
 
-import { isCodexFamilyName, modelBelongsToProvider, resolveCodexFamily } from './model-vocabulary.js';
+import {
+  isCodexFamilyName,
+  modelBelongsToProvider,
+  resolveCodexFamily,
+  resolveFamilyModel,
+} from './model-vocabulary.js';
 
 describe('modelBelongsToProvider', () => {
   // One table, three providers: the partition must be exhaustive and
@@ -51,5 +56,23 @@ describe('resolveCodexFamily', () => {
     expect(resolveCodexFamily('sol', { NANOCLAW_CODEX_MODEL_ALIASES: '{"sol":"opus"}' })).toBe('sol');
     expect(isCodexFamilyName('sol')).toBe(true);
     expect(isCodexFamilyName('constructor')).toBe(false);
+  });
+});
+
+describe('resolveFamilyModel', () => {
+  const env = {
+    NANOCLAW_CODEX_MODEL_ALIASES: JSON.stringify({ sol: 'gpt-6-sol' }),
+    ANTHROPIC_DEFAULT_FABLE_MODEL: 'claude-fable-5-1[1m]',
+  };
+
+  it('resolves a family word of either provider, case-insensitively', () => {
+    expect(resolveFamilyModel('SOL', env)).toBe('gpt-6-sol');
+    expect(resolveFamilyModel('Fable', env)).toBe('claude-fable-5-1[1m]');
+  });
+
+  it('leaves concrete ids, unknown words and prototype keys alone', () => {
+    expect(resolveFamilyModel('gpt-6-astra', env)).toBe('gpt-6-astra');
+    expect(resolveFamilyModel('constructor', env)).toBe('constructor');
+    expect(resolveFamilyModel('opus', env)).toBe('opus'); // no env answer: unchanged
   });
 });

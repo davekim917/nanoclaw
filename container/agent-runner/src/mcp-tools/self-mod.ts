@@ -16,6 +16,7 @@ import { getCentralDb } from '../central-db.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { setStickyModel, setStickyEffort } from '../modules/mailbox/index.js';
 import { getConfig } from '../config.js';
+import { resolveFamilyModel } from '../providers/model-vocabulary.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -536,12 +537,17 @@ export const changeModel: McpToolDefinition = {
     }
 
     // Operator deny list (central.db projection) — block wrong-subscription models.
+    // Match the slug as typed, lowercased, and resolved: a family word (`sol`,
+    // `ASTRA`) runs its current concrete id, so a denial of either must hold.
     const central = getCentralDb();
     if (central) {
       try {
-        const denied = central
-          .prepare('SELECT reason FROM denied_models WHERE provider = ? AND slug = ?')
-          .get(provider, slug) as { reason?: string } | undefined;
+        const lookup = central.prepare('SELECT reason FROM denied_models WHERE provider = ? AND slug = ?');
+        let denied: { reason?: string } | undefined;
+        for (const candidate of new Set([slug, slug.toLowerCase(), resolveFamilyModel(slug)])) {
+          denied = lookup.get(provider, candidate) as { reason?: string } | undefined;
+          if (denied) break;
+        }
         if (denied) {
           return err(
             `"${slug}" is on the operator deny list${denied.reason ? ` (${denied.reason})` : ''} — cannot switch to it.`,

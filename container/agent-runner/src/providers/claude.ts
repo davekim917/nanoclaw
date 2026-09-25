@@ -62,6 +62,7 @@ export function claudeContextOccupancy(
   return count(usage.input_tokens) + count(usage.cache_read_input_tokens) + count(usage.cache_creation_input_tokens);
 }
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
+import { CLAUDE_FAMILY_ALIAS_ENV } from './model-vocabulary.js';
 import { shimCwd } from './cwd-shim.js';
 import { parseSlotUsageSurvey, surveyEntryToUsageResponse, SLOT_USAGE_SURVEY_ENV } from './claude-slot-usage.js';
 import { attachTurnEffort } from './turn-effort.js';
@@ -2373,26 +2374,6 @@ function ensureOpus1mSuffix(model: string): string {
 }
 
 /**
- * The env var the CLI expands each bare family alias through. It is read
- * here only in the alias → concrete id direction (`canonicalUsageModel`); the
- * send path pins nothing into `perQueryEnv` any more, because a family word
- * means the same model in every group.
- *
- * The host resolves every alias once at spawn and injects the answers here
- * (`claudeSpawnEnv` in src/claude-spawn-defaults.ts, forwarded by
- * src/group-init.ts), so reading these is reading the host's own resolution
- * rather than mirroring its vocabulary. That matters: src/flag-parser.ts owns
- * the alias table and is NOT importable from this Bun package, so a second
- * copy here would be free to drift.
- */
-const FAMILY_ALIAS_ENV: Record<string, string> = {
-  opus: 'ANTHROPIC_DEFAULT_OPUS_MODEL',
-  sonnet: 'ANTHROPIC_DEFAULT_SONNET_MODEL',
-  haiku: 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  fable: 'ANTHROPIC_DEFAULT_FABLE_MODEL',
-};
-
-/**
  * The concrete model id a bare alias will actually run as — what `modelUsage`
  * will be keyed by, and therefore the only form that can be compared against
  * it.
@@ -2418,7 +2399,7 @@ const FAMILY_ALIAS_ENV: Record<string, string> = {
  */
 function canonicalUsageModel(model: string | undefined, env: Record<string, string | undefined>): string | undefined {
   if (!model) return model;
-  const key = FAMILY_ALIAS_ENV[model.toLowerCase()];
+  const key = CLAUDE_FAMILY_ALIAS_ENV[model.toLowerCase()];
   if (!key) return model; // already a concrete id
   const resolved = env[key];
   return resolved ? ensureOpus1mSuffix(resolved) : model;
