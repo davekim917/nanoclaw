@@ -115,7 +115,7 @@ Beyond correctness, a reviewer checks:
 - **A new helper where one already exists** — name the existing one.
 - **Code that belongs in a shared component** — logic re-implemented or copied across modules instead of centralised.
 
-Dead code, copy-paste clones, `file:line` citations and PR-number history in comments are flagged in CI by `scripts/hygiene/run.ts`; exemptions live only in `knip.json`, `container/agent-runner/knip.json` and `.jscpd.json`, which are `risk:high`.
+Dead code, copy-paste clones, `file:line` citations and PR-number history in comments are flagged in CI by `scripts/hygiene/run.ts`; exemptions live only in `knip.json`, `container/agent-runner/knip.json` and `.jscpd.json`, which are `risk:high`, apart from two derived sets it skips: files still byte-identical to upstream (`src/upstream-ratchet.json`) and the vendored design-review engine.
 
 ## Development
 

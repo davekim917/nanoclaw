@@ -169,6 +169,7 @@ risk:high:
     - 'knip.json'
     - 'container/agent-runner/knip.json'
     - '.jscpd.json'
+    - 'src/design-artifact-loop-vendor.ts'
     # The QA release gate: its controller, gate, barrier and scaffold decide whether a
     # client build is certified GO. No PR-lane CI runs its suites, and a defect
     # publishes a verdict wrong on the merits (#2092: BLOCKED over a clean GO) or
@@ -340,6 +341,7 @@ risk:gates:
     - 'knip.json'
     - 'container/agent-runner/knip.json'
     - '.jscpd.json'
+    - 'src/design-artifact-loop-vendor.ts'
     - 'container/skills/smoke-test/**'
     - 'docs/review-policy.md'
     - 'container/agents/**'

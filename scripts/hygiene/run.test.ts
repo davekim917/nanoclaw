@@ -5,7 +5,9 @@ import { describe, expect, it } from 'vitest';
 
 import { allowSubprocess, enforceHermeticity } from '../../src/test-hermeticity.js';
 import { scaledTimeout } from '../../src/test-timeout-scale.js';
-import { commentFindings, jscpdFindings, knipFindings, sourceFiles } from './run.js';
+import { createHash } from 'node:crypto';
+
+import { commentFindings, exemptFiles, hygieneFindings, jscpdFindings, knipFindings, sourceFiles } from './run.js';
 
 enforceHermeticity();
 allowSubprocess(['knip', 'jscpd']);
@@ -175,6 +177,26 @@ describe('jscpd', () => {
   );
 
   it(
+    'drops a clone between two exempt files and reports one with a single exempt side at the other side',
+    () => {
+      const root = jscpdProject([], {
+        'src/a-upstream.ts': block,
+        'src/b-ours.ts': `const pad = 1;\n${block}`,
+        'src/c-upstream.ts': otherBlock,
+        'src/d-vendored.ts': otherBlock,
+      });
+      const exempt = {
+        upstream: new Set(['src/a-upstream.ts', 'src/c-upstream.ts']),
+        vendored: new Set(['src/d-vendored.ts']),
+      };
+      expect(summary(jscpdFindings(root, sourceFiles(root), exempt))).toEqual([
+        'clone src/b-ours.ts:2 13 lines also at src/a-upstream.ts:1',
+      ]);
+    },
+    TOOL_TIMEOUT,
+  );
+
+  it(
     'reports a mirror entry that no longer matches any clone',
     () => {
       const root = jscpdProject([{ files: ['src/a.ts', 'src/gone.ts'], reason: 'fixture' }], {
@@ -185,5 +207,67 @@ describe('jscpd', () => {
       ]);
     },
     TOOL_TIMEOUT,
+  );
+});
+
+describe('exempt files', () => {
+  const sha = (text: string) => createHash('sha256').update(text).digest('hex');
+  const ENGINE = 'container/agent-runner/src/mcp-tools/design-review';
+
+  it('exempts upstream files whose bytes still match a diff-0 entry, and the vendored engine but its wrapper', () => {
+    const root = project('exempt', {
+      'src/same.ts': 'export const same = 1;\n',
+      'src/edited.ts': 'export const edited = 2;\n',
+      'src/diverged.ts': 'export const diverged = 3;\n',
+      [`${ENGINE}/index.ts`]: 'export {};\n',
+      [`${ENGINE}/state.ts`]: 'export {};\n',
+      'src/upstream-ratchet.json': JSON.stringify({
+        upstream: 'a'.repeat(40),
+        paths: 'b'.repeat(64),
+        files: {
+          'src/same.ts': { diff: 0, mode: '100644', sha256: sha('export const same = 1;\n') },
+          'src/edited.ts': { diff: 0, mode: '100644', sha256: sha('export const edited = 1;\n') },
+          'src/diverged.ts': { diff: 4, mode: '100644', sha256: sha('export const diverged = 3;\n') },
+          'src/gone.ts': { diff: 7, mode: '100644', sha256: null, deleted: true },
+        },
+      }),
+    });
+    const exempt = exemptFiles(root);
+    expect([...exempt.upstream]).toEqual(['src/same.ts']);
+    expect([...exempt.vendored]).toEqual([`${ENGINE}/state.ts`]);
+  });
+
+  it(
+    'reports no knip or comment finding in an exempt file, and still reports the same finding elsewhere',
+    () => {
+      const workspace = (dir: string) => ({
+        [`${dir}package.json`]: JSON.stringify({ name: 'fixture', private: true, type: 'module', dependencies: {} }),
+        [`${dir}knip.json`]: JSON.stringify({ entry: ['src/index.ts'], project: ['src/**/*.ts'] }),
+        [`${dir}src/index.ts`]:
+          "import { used } from './lib.js';\nimport { kept } from './upstream.js';\nused();\nkept();\n",
+        [`${dir}src/lib.ts`]: 'export function used() {}\n// See #123.\nexport function unused() {}\n',
+        [`${dir}src/upstream.ts`]: 'export function kept() {}\n// See #123.\nexport function unusedUpstream() {}\n',
+      });
+      const root = project('exempt-findings', {
+        '.jscpd.json': JSON.stringify({ minLines: 10, minTokens: 80 }),
+        ...workspace(''),
+        ...workspace('container/agent-runner/'),
+      });
+      const exempt = {
+        upstream: new Set(['src/upstream.ts']),
+        vendored: new Set(['container/agent-runner/src/upstream.ts']),
+      };
+      const locations = hygieneFindings(root, exempt).map((finding) => `${finding.check} ${finding.location}`);
+      expect(locations.filter((location) => location.includes('upstream.ts'))).toEqual([]);
+      expect(locations).toEqual(
+        expect.arrayContaining([
+          'knip src/lib.ts:3',
+          'comments src/lib.ts:2',
+          'knip container/agent-runner/src/lib.ts:3',
+          'comments container/agent-runner/src/lib.ts:2',
+        ]),
+      );
+    },
+    TOOL_TIMEOUT * 2,
   );
 });

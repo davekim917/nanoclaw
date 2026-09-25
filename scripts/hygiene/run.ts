@@ -1,9 +1,11 @@
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { vendoredEngineFiles } from '../../src/design-artifact-loop-vendor.js';
 import { scanComments } from './comments.js';
 
 export interface Finding {
@@ -40,6 +42,39 @@ const SOURCE_ROOTS = ['src', 'setup', 'scripts', 'container/agent-runner/src', '
 const SOURCE_FILE = /\.(?:[cm]?[jt]s|tsx)$/;
 const NOT_SOURCE =
   /(?:^|\/)(?:node_modules|__fixtures__|__test-fixtures__|test-fixtures|transaction-fixtures)\/|\.test\.[cm]?[jt]s$/;
+
+/**
+ * Files whose findings are fixed somewhere other than this tree, so no check reports them.
+ * `upstream`: upstream-owned files still byte-identical to the pinned upstream commit, per
+ * src/upstream-ratchet.json and the bytes on disk now; editing one would grow the divergence
+ * the ratchet tracks. `vendored`: the design-review engine, fixed in the plugin repo and
+ * re-vendored.
+ */
+export interface Exempt {
+  upstream: Set<string>;
+  vendored: Set<string>;
+}
+
+/** Read and hashed here rather than through src/upstream-ratchet.ts, so what this exempts is decided in reviewed code. */
+function regularFileSha256(file: string): string | null {
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  return stat?.isFile() ? createHash('sha256').update(fs.readFileSync(file)).digest('hex') : null;
+}
+
+export function exemptFiles(root: string): Exempt {
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'src', 'upstream-ratchet.json'), 'utf8')) as {
+    files: Record<string, { diff: number; sha256: string | null }>;
+  };
+  const upstream = new Set<string>();
+  for (const [file, entry] of Object.entries(manifest.files)) {
+    if (entry.diff === 0 && entry.sha256 !== null && regularFileSha256(path.join(root, file)) === entry.sha256) {
+      upstream.add(file);
+    }
+  }
+  return { upstream, vendored: new Set(vendoredEngineFiles(root)) };
+}
+
+const isExempt = (exempt: Exempt, file: string) => exempt.upstream.has(file) || exempt.vendored.has(file);
 
 function toolOptions(cwd: string) {
   return { cwd, encoding: 'utf8' as const, env: { ...process.env, PATH: TOOL_PATH }, maxBuffer: 256 * 1024 * 1024 };
@@ -96,8 +131,15 @@ export function knipFindings(root: string, workspace: string): Finding[] {
   return findings;
 }
 
-/** Clones among `files`, except those between two files that `.jscpd.json` lists as one mirror. */
-export function jscpdFindings(root: string, files: string[]): Finding[] {
+/**
+ * Clones among `files`, except those between two files that `.jscpd.json` lists as one mirror
+ * and those between two exempt files. A clone with one exempt side is reported at the other.
+ */
+export function jscpdFindings(
+  root: string,
+  files: string[],
+  exempt: Exempt = { upstream: new Set(), vendored: new Set() },
+): Finding[] {
   const { mirrors = [], ...options } = JSON.parse(
     fs.readFileSync(path.join(root, '.jscpd.json'), 'utf8'),
   ) as JscpdPolicy;
@@ -128,11 +170,15 @@ export function jscpdFindings(root: string, files: string[]): Finding[] {
         usedMirrors.add(mirror);
         continue;
       }
+      if (isExempt(exempt, first) && isExempt(exempt, second)) continue;
+      const [ours, theirs] = isExempt(exempt, first)
+        ? [`${second}:${clone.secondFile.start}`, `${first}:${clone.firstFile.start}`]
+        : [`${first}:${clone.firstFile.start}`, `${second}:${clone.secondFile.start}`];
       findings.push({
         check: 'jscpd',
         kind: 'clone',
-        location: `${first}:${clone.firstFile.start}`,
-        message: `${clone.lines} lines also at ${second}:${clone.secondFile.start}`,
+        location: ours,
+        message: `${clone.lines} lines also at ${theirs}`,
       });
     }
     mirrors.forEach((mirror, index) => {
@@ -161,6 +207,22 @@ export function commentFindings(root: string, files: string[]): Finding[] {
   );
 }
 
+/** Every finding the tree owns: exempt files are still analysed, so knip and jscpd see their references. */
+export function hygieneFindings(root: string, exempt: Exempt): Finding[] {
+  const files = sourceFiles(root);
+  const knip = KNIP_WORKSPACES.flatMap((workspace) => knipFindings(root, workspace)).filter(
+    (finding) => !isExempt(exempt, finding.location.replace(/:\d+$/, '')),
+  );
+  return [
+    ...knip,
+    ...jscpdFindings(root, files, exempt),
+    ...commentFindings(
+      root,
+      files.filter((file) => !isExempt(exempt, file)),
+    ),
+  ];
+}
+
 function print(findings: Finding[]): void {
   for (const check of ['knip', 'jscpd', 'comments'] as const) {
     const group = findings.filter((finding) => finding.check === check);
@@ -184,13 +246,12 @@ function main(): void {
     console.error(`hygiene: install ${path.posix.join(workspace, 'node_modules')} first; knip's results depend on it`);
     process.exit(2);
   }
-  const files = sourceFiles(REPO_ROOT);
-  const findings = [
-    ...KNIP_WORKSPACES.flatMap((workspace) => knipFindings(REPO_ROOT, workspace)),
-    ...jscpdFindings(REPO_ROOT, files),
-    ...commentFindings(REPO_ROOT, files),
-  ];
+  const exempt = exemptFiles(REPO_ROOT);
+  const findings = hygieneFindings(REPO_ROOT, exempt);
   print(findings);
+  console.log(
+    `\nexempt: ${exempt.upstream.size} file(s) byte-identical to upstream, ${exempt.vendored.size} vendored design-review file(s)`,
+  );
   const report = args.includes('--report');
   console.log(`\nhygiene: ${findings.length} finding(s)${report ? ' (report mode, not failing)' : ''}`);
   process.exitCode = findings.length > 0 && !report ? 1 : 0;
