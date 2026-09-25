@@ -190,6 +190,12 @@ describe('parseMessageFlags', () => {
       expect(formatFlagConfirmation({ stickyModel: 'fable' }, [], [])).toContain(`${DEFAULT_FABLE_MODEL} (via fable)`);
     });
 
+    it('stores an uppercase family name lowercase, like the Codex vocabulary', () => {
+      expect(parseMessageFlags('-m FABLE hi').intent).toEqual({ stickyModel: 'fable' });
+      expect(parseMessageFlags('-m1 Opus hi').intent).toEqual({ turnModel: 'opus' });
+      expect(parseMessageFlags('-m FABLE hi').errors).toEqual([]);
+    });
+
     it('resolves fable51 / fable5-1 / fable-5-1 aliases to claude-fable-5-1[1m]', () => {
       expect(parseMessageFlags('-m fable51 hi').intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]' });
       expect(parseMessageFlags('-m fable5-1 hi').intent).toEqual({ stickyModel: 'claude-fable-5-1[1m]' });

@@ -34,7 +34,7 @@ import {
   updateContainerConfigJson,
   updateContainerConfigScalars,
 } from '../../db/container-configs.js';
-import { getDeniedModel } from '../../db/denied-models.js';
+import { getDenialFor } from '../../db/denied-models.js';
 import { getSession } from '../../db/sessions.js';
 import { isOpenCodeModelSlug } from '../../flag-parser.js';
 import {
@@ -302,7 +302,7 @@ export async function performModelChange(
     return;
   }
 
-  const denied = await getDeniedModel(config.provider, slug);
+  const denied = await getDenialFor(config.provider, slug);
   if (denied) {
     await notify(
       `change_model failed: "${slug}" is in the ${config.provider} deny list${

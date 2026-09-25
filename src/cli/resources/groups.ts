@@ -33,7 +33,7 @@ import {
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
-import { getDeniedModel } from '../../db/denied-models.js';
+import { getDenialFor } from '../../db/denied-models.js';
 import { auditTaskPins, formatStrandedPins, formatLateStrandedPins } from '../../modules/scheduling/pin-audit.js';
 import { assertValidGroupFolder, groupFolderExistsOnDisk } from '../../group-folder.js';
 import { log } from '../../log.js';
@@ -611,12 +611,13 @@ registerResource({
           if (!effectiveProvider) {
             throw new Error('Cannot validate --model without a provider set on the group');
           }
-          const denied = await getDeniedModel(effectiveProvider, updates.model);
+          const denied = await getDenialFor(effectiveProvider, updates.model);
           if (denied) {
             throw new Error(
-              `Model "${updates.model}" is denied for provider "${effectiveProvider}".` +
+              `Model "${updates.model}" is denied for provider "${effectiveProvider}"` +
+                (denied.slug !== updates.model ? ` (matches denied "${denied.slug}").` : '.') +
                 (denied.reason ? ` Reason: ${denied.reason}` : '') +
-                `\n\nOperator can remove via: ncl denied-models remove --provider ${effectiveProvider} --slug ${updates.model}`,
+                `\n\nOperator can remove via: ncl denied-models remove --provider ${effectiveProvider} --slug ${denied.slug}`,
             );
           }
         }

@@ -106,7 +106,7 @@ export const DEFAULT_FABLE_MODEL = 'claude-fable-5-1[1m]';
  * whereas `opus5` freezes to that version. Resolution happens at the point of
  * USE (spawn env, chat ack), not at the point of storage. Inside the
  * container the CLI resolves each bare family word through
- * ANTHROPIC_DEFAULT_<FAMILY>_MODEL (src/claude-spawn-defaults.ts:254), so a per-turn `fable`
+ * ANTHROPIC_DEFAULT_<FAMILY>_MODEL (set by `claudeSpawnEnv`), so a per-turn `fable`
  * reaches the API as DEFAULT_FABLE_MODEL too.
  */
 const FAMILY_DEFAULTS: Record<string, string> = {
@@ -123,7 +123,7 @@ const FAMILY_DEFAULTS: Record<string, string> = {
  * follows the next Sol release with no repin. The Codex CLI has no alias
  * mechanism of its own, so the host hands this map to every container as
  * NANOCLAW_CODEX_MODEL_ALIASES and the Codex provider resolves through it
- * (`resolveCodexFamily`, container/agent-runner/src/providers/model-vocabulary.ts:60).
+ * (`resolveCodexFamily` in the runner's model-vocabulary module).
  */
 export const CODEX_FAMILY_DEFAULTS: Readonly<Record<string, string>> = Object.freeze({
   sol: 'gpt-6-sol',
@@ -134,9 +134,10 @@ export const CODEX_FAMILY_DEFAULTS: Readonly<Record<string, string>> = Object.fr
 
 /**
  * The concrete model a raw `-m` value / stored default actually runs as:
- * family alias → install default, pinned alias → its id, bare opus id → [1m].
- * Non-Claude values (codex `gpt-*`, opencode slugs) pass through untouched —
- * no family key collides with them.
+ * family alias of either provider (`opus`, `fable`, `sol`, …) → install
+ * default, pinned alias → its id, bare opus id → [1m]. Other non-Claude values
+ * (codex `gpt-*`, opencode slugs) pass through untouched — no family key
+ * collides with them.
  */
 export function resolveEffectiveModel(raw: string): string {
   const key = raw.toLowerCase();
@@ -282,7 +283,12 @@ export interface ProviderFlagVocab {
 }
 
 const CLAUDE_VOCAB: ProviderFlagVocab = {
-  resolveModel: (raw) => resolveModelAlias(raw),
+  // A family name is stored lowercase (`-m FABLE` → `fable`), as the Codex
+  // vocabulary already does; everything else resolves through the alias map.
+  resolveModel: (raw) => {
+    const key = raw.toLowerCase();
+    return Object.hasOwn(FAMILY_DEFAULTS, key) ? key : resolveModelAlias(raw);
+  },
   isValidModel: (resolved) => VALID_MODEL_RE.test(resolved),
   modelHint: '',
   validEfforts: VALID_EFFORT,
