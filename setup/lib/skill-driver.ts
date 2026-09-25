@@ -459,7 +459,7 @@ export interface RunSkillOptions {
   /**
    * Overrides a `copy owned-by-fork` refusal: replaces a fork-owned file that
    * has diverged from its registry branch with the branch version instead of
-   * refusing to touch it (#250). Mirrors the CLI's `--force`. Defaults to
+   * refusing to touch it. Mirrors the CLI's `--force`. Defaults to
    * false — the protective behavior.
    */
   force?: boolean;
@@ -538,7 +538,7 @@ export async function runSkill(skillDir: string, opts: RunSkillOptions = {}): Pr
 }
 
 // CLI: pnpm exec tsx setup/lib/skill-driver.ts <skillDir> [--force]   — apply a
-// skill interactively. --force overrides an owned-by-fork refusal (#250) —
+// skill interactively. --force overrides an owned-by-fork refusal —
 // use it only after confirming with the operator that replacing a customized
 // file with the registry-branch version is actually wanted.
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {

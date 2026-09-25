@@ -32,7 +32,7 @@ import { log } from '../src/log.js';
 
 const UNHEALTHY_RUNS_THRESHOLD = 10;
 
-export interface PeerStatus {
+interface PeerStatus {
   label: string;
   configPath: string;
   state: string;

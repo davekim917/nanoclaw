@@ -15,7 +15,6 @@
  * bar characters. Just the bits the NanoClaw setup menus actually use.
  */
 import { SelectPrompt } from '@clack/core';
-import { isCancel } from '@clack/prompts';
 import { styleText } from 'node:util';
 
 import { brandBody } from './theme.js';
@@ -54,7 +53,7 @@ function headerIcon(state: PromptState): string {
   }
 }
 
-export interface BrightSelectOption<T> {
+interface BrightSelectOption<T> {
   value: T;
   label?: string;
   hint?: string;
@@ -73,7 +72,7 @@ export interface BrightSelectOptions<T> {
  * stray `↓`+`Enter` silently picks option 2). Raw-mode reads only see kernel
  * tty data via the event loop, so the drain needs a real (short) window.
  */
-export function flushStdin(windowMs = 50): Promise<void> {
+function flushStdin(windowMs = 50): Promise<void> {
   return new Promise((resolve) => {
     const stdin = process.stdin;
     if (!stdin.isTTY) return resolve();
@@ -145,4 +144,3 @@ export async function brightSelect<T>(
   }).prompt() as Promise<T | symbol>;
 }
 
-export { isCancel };

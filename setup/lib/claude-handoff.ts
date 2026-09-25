@@ -32,18 +32,11 @@
  */
 import { execSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
-import path from 'path';
 
 import * as p from '@clack/prompts';
 import k from 'kleur';
 
-import {
-  type AssistContext,
-  BIG_PICTURE_FILES,
-  ensureClaudeReady,
-  offerClaudeAssist,
-  STEP_FILES,
-} from './claude-assist.js';
+import { type AssistContext, ensureClaudeReady, failureReferences, offerClaudeAssist } from './claude-assist.js';
 import { ensureAnswer } from './runner.js';
 import { brandBody, note } from './theme.js';
 
@@ -141,15 +134,10 @@ function spawnInteractiveClaude(prompt: string): Promise<boolean> {
 }
 
 /**
- * Sentinel returned by `validateWithHelpEscape` when the user types `?`.
- * The caller compares against this to decide whether to trigger a handoff.
- */
-export const HELP_ESCAPE_SENTINEL = '__NANOCLAW_HELP_ESCAPE__';
-
-/**
  * Wrap a clack `validate` callback so typing `?` short-circuits validation
- * and returns the HELP_ESCAPE_SENTINEL. Caller should check for the sentinel
- * after awaiting the prompt and trigger offerClaudeHandoff if matched.
+ * and is accepted as the answer. Caller should check the answer with
+ * `isHelpEscape` after awaiting the prompt and trigger offerClaudeHandoff if
+ * matched.
  *
  * Usage:
  *   const answer = await p.text({
@@ -159,7 +147,7 @@ export const HELP_ESCAPE_SENTINEL = '__NANOCLAW_HELP_ESCAPE__';
  *       return undefined;
  *     }),
  *   });
- *   if (answer === HELP_ESCAPE_SENTINEL) { await offerClaudeHandoff(ctx); ... }
+ *   if (isHelpEscape(answer)) { await offerClaudeHandoff(ctx); ... }
  */
 export function validateWithHelpEscape(
   inner?: (value: string | undefined) => string | Error | undefined,
@@ -174,11 +162,7 @@ export function validateWithHelpEscape(
   };
 }
 
-/**
- * True if the value returned by a text/password prompt should trigger a
- * handoff. Abstracts the sentinel check so callers don't have to import it
- * directly at every site.
- */
+/** True if the value returned by a text/password prompt should trigger a handoff. */
 export function isHelpEscape(value: unknown): boolean {
   return typeof value === 'string' && value.trim() === '?';
 }
@@ -286,15 +270,7 @@ async function offerFailureHandoff(
 }
 
 function buildFailurePrompt(ctx: AssistContext, projectRoot: string): string {
-  const stepRefs = STEP_FILES[ctx.stepName] ?? [];
-  const references = [
-    ...BIG_PICTURE_FILES,
-    ...stepRefs,
-    'logs/setup.log',
-    ctx.rawLogPath
-      ? path.relative(projectRoot, ctx.rawLogPath)
-      : 'logs/setup-steps/',
-  ].filter((v, i, a) => a.indexOf(v) === i);
+  const references = failureReferences(ctx, projectRoot);
 
   const lines: string[] = [
     "I'm running NanoClaw's interactive setup flow and hit a failure.",

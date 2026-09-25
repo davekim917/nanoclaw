@@ -36,7 +36,7 @@ export interface PathItem {
   path: string;
 }
 
-export interface ServiceInventory {
+interface ServiceInventory {
   launchdPlist?: string;
   systemdUserUnit?: string;
   systemdSystemUnit?: string;
@@ -46,7 +46,7 @@ export interface ServiceInventory {
   nclSymlink?: string;
 }
 
-export interface OnecliInventory {
+interface OnecliInventory {
   mine: VaultAgent[];
   orphans: VaultAgent[];
   /** False when agent_groups couldn't be read — orphan labels are then unreliable. */

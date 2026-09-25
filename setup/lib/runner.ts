@@ -22,7 +22,7 @@ import { offerClaudeOnFailure } from './claude-handoff.js';
 import { emit as phEmit } from './diagnostics.js';
 import { brandBody, fitToWidth, fmtDuration } from './theme.js';
 
-export type Fields = Record<string, string>;
+type Fields = Record<string, string>;
 export type Block = { type: string; fields: Fields };
 
 export type StepResult = {
@@ -55,7 +55,7 @@ export type SpinnerLabels = {
  * code card as soon as pair-telegram emits it, rather than after the step
  * has finished).
  */
-export class StatusStream {
+class StatusStream {
   private lineBuf = '';
   private current: Block | null = null;
   readonly blocks: Block[] = [];
@@ -288,7 +288,7 @@ export function writeStepEntry(
 }
 
 /** Strip STATUS + LOG (redundant) and any oversize values from the terminal block's fields. */
-export function summariseTerminalFields(block: Block | null): Record<string, string> {
+function summariseTerminalFields(block: Block | null): Record<string, string> {
   if (!block) return {};
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(block.fields)) {

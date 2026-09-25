@@ -21,12 +21,6 @@ const TRUECOLOR =
   USE_ANSI &&
   (process.env.COLORTERM === 'truecolor' || process.env.COLORTERM === '24bit');
 
-export function brand(s: string): string {
-  if (!USE_ANSI) return s;
-  if (TRUECOLOR) return `\x1b[38;2;43;183;206m${s}\x1b[0m`;
-  return k.cyan(s);
-}
-
 export function brandBold(s: string): string {
   if (!USE_ANSI) return s;
   if (TRUECOLOR) return `\x1b[1;38;2;43;183;206m${s}\x1b[0m`;
