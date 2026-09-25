@@ -235,6 +235,59 @@ class FindingIssue(unittest.TestCase):
         self.c.github(RUN, "synthesis", "issue:CF-2")
         self.assertEqual(self.issue_lists(), 2)
 
+    def calls(self, prefix):
+        with open(os.environ["FAKE_LOG"]) as fh:
+            return [c for c in (json.loads(line) for line in fh) if c["argv"][:len(prefix)] == prefix]
+
+    def test_a_create_the_listings_lag_is_confirmed_by_its_own_url_in_the_same_fire(self):
+        # Every listing lacks the fresh creates, so only the direct read of the
+        # URL create printed can settle them in this fire.
+        self.gh(labels=["smoke-finding", "severity:p3"], listLag=True)
+        self.spec("CF-2", "Second finding")
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-2"), "done")
+        self.assertEqual(len(self.filed()), 2)
+        self.assertEqual(self.issue_lists(), 1)
+        first = self.filed()[0]
+        ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:CF-1")]
+        self.assertEqual((ob["detail"]["via"], ob["detail"]["url"]), ("write", first["html_url"]))
+        self.assertIn(["api", "repos/org/xzo/issues/{}".format(first["number"])],
+                      [c["argv"][:2] for c in self.calls(["api"])])
+
+    def test_no_printed_url_falls_back_to_the_listing_and_never_reads_as_not_created(self):
+        # Create lands but prints nothing, and the listing lags: unknown, not
+        # "not created" -- and the next fire finds it by its marker, no refile.
+        self.gh(labels=["smoke-finding", "severity:p3"], listLag=True)
+        (self.state / "faults.json").write_text(json.dumps({"gh:issue-create": ["silent"]}))
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "intent")
+        self.assertEqual(self.c.decisions[-1]["error"], "issue not found on read-back")
+        db = json.loads((self.state / "gh.json").read_text())
+        db["issues"][0].pop("unlisted")
+        (self.state / "gh.json").write_text(json.dumps(db))
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        self.assertEqual(len(self.filed()), 1)
+        ob = self.c.obligations()[ctl.obligation_key(RUN, "gh", "issue:CF-1")]
+        self.assertEqual(ob["detail"]["via"], "search")
+
+    def test_a_failed_get_falls_back_to_the_listing_scan(self):
+        # The pre-create marker scan passes; the GET of the printed URL fails;
+        # the listing scan (no lag here) still confirms the create.
+        self.gh(labels=["smoke-finding", "severity:p3"])
+        (self.state / "faults.json").write_text(json.dumps({"gh:api": ["pass", "fail-before"]}))
+        self.assertEqual(self.c.github(RUN, "synthesis", "issue:CF-1"), "done")
+        self.assertEqual(len(self.filed()), 1)
+        self.assertEqual(len(self.calls(["api"])), 3)
+
+    def test_a_printed_url_whose_issue_lacks_our_marker_is_not_ours(self):
+        other = {"number": 100, "title": "someone else's", "body": "no marker", "state": "open",
+                 "labels": [], "html_url": "https://github.test/issues/100"}
+        self.gh(labels=["smoke-finding", "severity:p3"])
+        wrote = (0, "https://github.test/issues/100\n", "")
+        (self.state / "gh.json").write_text(json.dumps({"comments": {}, "issues": [other], "prs": {}}))
+        self.assertIsNone(self.fx._created_issue("org/xzo", wrote, "<!-- smoke-ctl:abc -->"))
+        self.assertIsNone(self.fx._created_issue("org/xzo", (0, "created\n", ""), "<!-- smoke-ctl:abc -->"))
+        self.assertIsNone(self.fx._created_issue("org/xzo", (None, "", "timed out"), "<!-- smoke-ctl:abc -->"))
+
     def test_a_label_listing_that_is_not_a_list_or_is_at_its_cap_is_unknown(self):
         self.gh(labelListRaw='{"message": "Not Found"}')
         self.assertIsNone(self.fx._labels_of("org/xzo"))
