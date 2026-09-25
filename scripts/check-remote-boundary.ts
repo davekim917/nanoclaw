@@ -39,7 +39,7 @@
  * is 300 branches and one whole-tree `--index` scan measures 27.8s on this
  * host, so scanning every head naively is ~2.3 hours per run. Closing it needs
  * a scanned-tip cursor, per-commit message scanning and changed-path scanning
- * — a design, not a patch. Tracked in issue #592.
+ * — a design, not a patch.
  *
  * A backstop that overstates its own coverage is worse than one with a hole
  * someone can see, so keep this paragraph honest if the scope changes.
@@ -78,7 +78,7 @@ import { notifyOwner } from '../src/notify-owner.js';
  * not scan one install and alert another because of where it was invoked from.
  * It is also what makes `data/v2.db` resolvable, since the checker reaches the
  * registry through the snapshot's common checkout (`findMainCheckoutRoot` in
- * `scripts/check-public-boundary.ts:442`).
+ * `scripts/check-public-boundary.ts`).
  */
 const INSTALL_ROOT = path.resolve(fileURLToPath(import.meta.url), '..', '..');
 
@@ -207,7 +207,7 @@ function git(args: string[], cwd = INSTALL_ROOT): string {
  * (`INSTALL_ROOT/.public-boundary-allowlist.json`, the old source of this
  * argument) is NOT a safe substitute: it lags `origin/main` between a merge
  * and the next deploy, and it can hold an uncommitted edit — the same class of
- * hole `.husky/pre-push` closed for pushed refs (#651).
+ * hole `.husky/pre-push` closed for pushed refs.
  *
  * Three cases, told apart by `lstat` (not `stat`, which follows a symlink and
  * would silently exempt whatever the link points at — the hook's own read,
@@ -268,7 +268,7 @@ export interface CheckerInvocation {
 }
 
 /** The checker's raw process result, ahead of `scanSnapshot`'s `BoundaryScan` mapping. */
-export interface CheckerResult {
+interface CheckerResult {
   status: number | null;
   stderr: string;
   error?: Error;
@@ -318,7 +318,7 @@ export function scanSnapshot(
   }
 }
 
-export interface SnapshotRun<T> {
+interface SnapshotRun<T> {
   value: T;
   /** Why cleanup did not fully succeed, or `null`. Never thrown away — see `reportCleanup`. */
   cleanupError: string | null;
@@ -414,9 +414,9 @@ function withSnapshot<T>(commit: string, body: (snapshot: string) => T): Snapsho
   // that shim RESOLVES here, where it previously did not.
   //
   // Defensive today, not load-bearing: the shim exits before doing anything
-  // unless a matching hook file exists — `.husky/_/h:6` is
+  // unless a matching hook file exists — `.husky/_/h` runs
   // `[ ! -f "$s" ] && exit 0` against `s=$(dirname "$(dirname "$0")")/$n`
-  // (`.husky/_/h:4`) — and `.husky/` carries only `commit-msg`, `pre-commit`
+  // — and `.husky/` carries only `commit-msg`, `pre-commit`
   // and `pre-push`. So no `post-checkout` runs against a scratch tree today.
   // It becomes load-bearing the day someone adds `.husky/post-checkout`, which
   // is exactly when nobody would think to look here.
