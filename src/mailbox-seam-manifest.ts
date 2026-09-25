@@ -57,10 +57,10 @@ export const UPSTREAM_FILES: readonly string[] = [
   'container/agent-runner/src/mailbox/model.generated.ts',
   'container/agent-runner/src/mailbox/registry.test.ts',
   // 'container/agent-runner/src/mailbox/sqlite/connection.ts' — FORK DIVERGED, see FORK_DIVERGED_UPSTREAM_FILES.
-  'container/agent-runner/src/mailbox/sqlite/index.ts',
+  // 'container/agent-runner/src/mailbox/sqlite/index.ts' — FORK DIVERGED, see FORK_DIVERGED_UPSTREAM_FILES.
   'container/agent-runner/src/mailbox/sqlite/operations.ts',
-  'container/agent-runner/src/mailbox/sqlite/sqlite.test.ts',
-  'container/agent-runner/src/mailbox/types.ts',
+  // 'container/agent-runner/src/mailbox/sqlite/sqlite.test.ts' — FORK DIVERGED, see FORK_DIVERGED_UPSTREAM_FILES.
+  // 'container/agent-runner/src/mailbox/types.ts' — FORK DIVERGED, see FORK_DIVERGED_UPSTREAM_FILES.
   'container/agent-runner/src/modules/index.ts',
   'container/agent-runner/src/heartbeat.ts',
   'container/agent-runner/src/db/container-state.ts',
@@ -134,10 +134,19 @@ export const UNPORTABLE_UPSTREAM_FILES: ReadonlyArray<{
  * (#588) to add refuseProductionSessionDbUnderTest() and its call from
  * getOutboundDb, so a test that skipped initTestSessionDb() can no longer
  * silently create the production-path session DB.
+ *
+ * container/agent-runner/src/mailbox/sqlite/index.ts, .../sqlite/sqlite.test.ts
+ * and container/agent-runner/src/mailbox/types.ts: diverged in 83697a84c
+ * ("live task list replaces 💭 thinking messages") and its review rounds to add
+ * the fork-only task-list reads — countConversationMessagesAfter,
+ * getInboundRouteById and maxInboundSeq — to the runner's mailbox session.
  */
 export const FORK_DIVERGED_UPSTREAM_FILES: readonly string[] = [
   'container/agent-runner/src/db/messages-in.ts',
   'container/agent-runner/src/mailbox/sqlite/connection.ts',
+  'container/agent-runner/src/mailbox/sqlite/index.ts',
+  'container/agent-runner/src/mailbox/sqlite/sqlite.test.ts',
+  'container/agent-runner/src/mailbox/types.ts',
 ] as const;
 
 export interface MailboxSeamManifest {

@@ -13,7 +13,7 @@
     },
     {
       "files": ["src/mailbox/sqlite/index.ts", "container/agent-runner/src/mailbox/sqlite/index.ts"],
-      "reason": "Upstream mailbox-seam ports, kept byte-identical to upstream and pinned by src/mailbox/UPSTREAM-MANIFEST.json; neither side can be edited to share code."
+      "reason": "Upstream mailbox-seam ports: the host side is byte-identical to upstream and pinned by src/mailbox/UPSTREAM-MANIFEST.json; the runner side is upstream's port plus fork-only task-list reads (FORK_DIVERGED_UPSTREAM_FILES in src/mailbox-seam-manifest.ts). The two package trees share no modules, so neither side can import the other."
     },
     {
       "files": ["src/plugin-exclusions.ts", "container/agent-runner/src/plugin-exclusions.ts"],
