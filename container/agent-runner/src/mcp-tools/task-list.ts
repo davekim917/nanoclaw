@@ -38,7 +38,7 @@ function err(text: string) {
 /** Serializes update_task_list calls within this MCP server process. */
 let updateChain: Promise<unknown> = Promise.resolve();
 
-export const TASK_LIST_DESCRIPTION =
+const TASK_LIST_DESCRIPTION =
   'Keep a live task list in this conversation: one checklist message, edited in place, that shows people what you are doing without them watching you work. ' +
   'Use it proactively — nobody will ask for it — whenever a request takes 3 or more distinct steps or several tool calls; start it before the first step. Skip it for a quick answer, a single step, or conversation. ' +
   'Send the WHOLE list every call (it replaces the last one): a short title naming the work (e.g. "Migrating the orders table"), and every item with its status. ' +

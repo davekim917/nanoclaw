@@ -157,7 +157,7 @@ export function transientOverloadDelayMs(n: number, rand: number = Math.random()
  * `provider.transcriptHasPrompt`) — then a one-line pointer replaces it, so the
  * batch is not in context twice for the rest of the session.
  *
- * `rotation` is the result of the `rotateApiKey()` call (providers/claude.ts:2308)
+ * `rotation` is the result of the `rotateApiKey()` call
  * that triggered this retry. When it reports `rotated: true` with a position/ringSize, a second
  * block tells the agent explicitly that its credential was swapped and any
  * "rate limited" narrative still sitting in its resumed transcript is stale
@@ -922,8 +922,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       if (writtenFireKeys.has(key)) return;
       writtenFireKeys.add(key);
       // A write that throws committed nothing: the outbound insert is its own
-      // transaction, rolled back on failure (mailbox/sqlite/operations.ts:131,
-      // :169). So the same outcome is retried in place, briefly. What three
+      // transaction, rolled back on failure. So the same outcome is retried in place, briefly. What three
       // short attempts do not heal (a full disk, a closed db), a later one
       // would not either.
       for (let attempt = 1; attempt <= 3; attempt++) {
@@ -983,7 +982,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       log(`Query error: ${errMsg}`);
       // The failed query's CLI child may still be running (an in-body throw
       // unwinds the generator without necessarily tearing the subprocess
-      // down — see queryAbortController at providers/claude.ts:2517-2526). Every recovery branch
+      // down — see queryAbortController in providers/claude.ts). Every recovery branch
       // below starts a FRESH query on the same or a rotated credential, so
       // abort the old one first: left alone, it can keep running on an
       // exhausted/wedged credential and burn another failure minutes after
@@ -1013,6 +1012,67 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // required for the backoff branches that may sleep while a fence lands.
       repositoryRecoveryAllowed();
 
+      // Sleep with the heartbeat touched throughout, so the host sweep does not
+      // reap the container as stale while a recovery branch backs off.
+      const backOff = async (sleepMs: number): Promise<void> => {
+        const beat = setInterval(touchHeartbeat, TRANSIENT_OVERLOAD_HEARTBEAT_MS);
+        try {
+          await new Promise((resolve) => setTimeout(resolve, sleepMs));
+        } finally {
+          clearInterval(beat);
+        }
+        touchHeartbeat();
+      };
+
+      // One in-turn recovery attempt on the same batch and settings, resuming
+      // `from` on `model` (undefined drops the per-turn pin). Its query is aborted before any error propagates: an abandoned
+      // retry query leaks its CLI child the same way the original did (see the
+      // abort() at the top of this catch).
+      const retryInTurn = async (
+        retryPrompt: string,
+        from: string | undefined,
+        model: string | undefined,
+      ): Promise<void> => {
+        let retryQuery: AgentQuery | undefined;
+        try {
+          retryQuery = config.provider.query({
+            prompt: retryPrompt,
+            attachments: batchAttachments,
+            continuation: from,
+            cwd: config.cwd,
+            systemContext: config.systemContext,
+            model,
+            effort: effectiveEffort,
+            ultracode: effectiveUltracode,
+            fast: effectiveFast,
+          });
+          const retryResult = await processQuery(
+            retryQuery,
+            routing,
+            processingIds,
+            config.providerName,
+            config.provider.onExchangeComplete?.bind(config.provider),
+            prompt,
+            from,
+            { model, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
+            runnerId,
+            undefined,
+            suppressContinuationUntilRealInbound,
+            trigger,
+            reportTaskOutcome,
+            processQueryFallbackOptions,
+          );
+          mergeTaskTurns(retryResult.taskTurns);
+          if (retryResult.continuation && retryResult.continuation !== from) {
+            continuation = retryResult.continuation;
+            setContinuation(config.providerName, continuation);
+          }
+        } catch (retryErr) {
+          retryQuery?.abort();
+          throw retryErr;
+        }
+      };
+
       // Transient server-overload recovery: the provider's runtime hit a
       // 429/529 ("temporarily limiting requests · not your usage limit"),
       // exhausted its own internal retries, and surfaced the failure as result
@@ -1030,48 +1090,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             `Transient server overload — retry ${attempt + 1}/${TRANSIENT_OVERLOAD_MAX_TRIES} ` +
               `in ${sleepMs}ms (same prompt, no rotation)`,
           );
-          const beat = setInterval(touchHeartbeat, TRANSIENT_OVERLOAD_HEARTBEAT_MS);
-          try {
-            await new Promise((resolve) => setTimeout(resolve, sleepMs));
-          } finally {
-            clearInterval(beat);
-          }
-          touchHeartbeat();
+          await backOff(sleepMs);
           if (!repositoryRecoveryAllowed()) break;
-          let retryQuery: AgentQuery | undefined;
           try {
-            retryQuery = config.provider.query({
-              prompt,
-              attachments: batchAttachments,
-              continuation,
-              cwd: config.cwd,
-              systemContext: config.systemContext,
-              model: effectiveModel,
-              effort: effectiveEffort,
-              ultracode: effectiveUltracode,
-              fast: effectiveFast,
-            });
-            const retryResult = await processQuery(
-              retryQuery,
-              routing,
-              processingIds,
-              config.providerName,
-              config.provider.onExchangeComplete?.bind(config.provider),
-              prompt,
-              continuation,
-              { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
-              runnerId,
-              undefined,
-              suppressContinuationUntilRealInbound,
-              trigger,
-              reportTaskOutcome,
-              processQueryFallbackOptions,
-            );
-            mergeTaskTurns(retryResult.taskTurns);
-            if (retryResult.continuation && retryResult.continuation !== continuation) {
-              continuation = retryResult.continuation;
-              setContinuation(config.providerName, continuation);
-            }
+            await retryInTurn(prompt, continuation, effectiveModel);
             recovered = true;
           } catch (retryErr) {
             // Still overloaded → back off and try again. A *different* error
@@ -1082,13 +1104,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             // rotate this turn — but the next user message starts a fresh turn
             // that hits the normal rotation path, so it self-heals; not worth
             // threading retryErr through every downstream recovery branch.
-            //
-            // Either way this retryQuery's CLI child needs tearing down before
-            // the next attempt (or before falling through to another recovery
-            // branch) fires a new one — see the abort() call at the top of
-            // this catch block for why an abandoned query can't be trusted to
-            // clean up its own subprocess.
-            retryQuery?.abort();
             if (config.provider.isTransientOverload?.(retryErr)) continue;
             log(
               `Retry during transient overload hit a non-transient error: ` +
@@ -1115,54 +1130,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         for (let attempt = 0; attempt < CODEX_IDLE_RETRY_MAX && !recovered; attempt++) {
           const sleepMs = CODEX_IDLE_RETRY_BASE_MS * (attempt + 1);
           log(`Codex idle-timeout — retry ${attempt + 1}/${CODEX_IDLE_RETRY_MAX} in ${sleepMs}ms`);
-          const beat = setInterval(touchHeartbeat, TRANSIENT_OVERLOAD_HEARTBEAT_MS);
-          try {
-            await new Promise((resolve) => setTimeout(resolve, sleepMs));
-          } finally {
-            clearInterval(beat);
-          }
-          touchHeartbeat();
+          await backOff(sleepMs);
           if (!repositoryRecoveryAllowed()) break;
-          let retryQuery: AgentQuery | undefined;
           try {
-            retryQuery = config.provider.query({
-              prompt,
-              attachments: batchAttachments,
-              continuation,
-              cwd: config.cwd,
-              systemContext: config.systemContext,
-              model: effectiveModel,
-              effort: effectiveEffort,
-              ultracode: effectiveUltracode,
-              fast: effectiveFast,
-            });
-            const retryResult = await processQuery(
-              retryQuery,
-              routing,
-              processingIds,
-              config.providerName,
-              config.provider.onExchangeComplete?.bind(config.provider),
-              prompt,
-              continuation,
-              { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
-              runnerId,
-              undefined,
-              suppressContinuationUntilRealInbound,
-              trigger,
-              reportTaskOutcome,
-              processQueryFallbackOptions,
-            );
-            mergeTaskTurns(retryResult.taskTurns);
-            if (retryResult.continuation && retryResult.continuation !== continuation) {
-              continuation = retryResult.continuation;
-              setContinuation(config.providerName, continuation);
-            }
+            await retryInTurn(prompt, continuation, effectiveModel);
             recovered = true;
           } catch (retryErr) {
-            // Tear this attempt's CLI child down before falling through — an
-            // abandoned retry query leaks its subprocess the same way the original
-            // did (see the abort() at the top of the outer catch).
-            retryQuery?.abort();
             // Still stalled → back off and try again. Any other error → stop
             // and let the original idle error fall through to the clean message.
             if (retryErr instanceof ProviderEventError && retryErr.classification === 'idle_timeout') {
@@ -1205,7 +1178,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       while (rotation?.rotated && !recovered) {
         log(`Upstream transient error — rotated credential, retrying same batch in-turn with provenance`);
         if (!repositoryRecoveryAllowed()) break;
-        let retryQuery: AgentQuery | undefined;
         try {
           const retryPrompt = formatCredentialRetryPrompt(
             prompt,
@@ -1213,46 +1185,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             rotation,
             config.provider.transcriptHasPrompt?.(continuation, prompt, batchStartedAt) ?? false,
           );
-          retryQuery = config.provider.query({
-            prompt: retryPrompt,
-            attachments: batchAttachments,
-            continuation,
-            cwd: config.cwd,
-            systemContext: config.systemContext,
-            model: effectiveModel,
-            effort: effectiveEffort,
-            ultracode: effectiveUltracode,
-            fast: effectiveFast,
-          });
-          const retryResult = await processQuery(
-            retryQuery,
-            routing,
-            processingIds,
-            config.providerName,
-            config.provider.onExchangeComplete?.bind(config.provider),
-            prompt,
-            continuation,
-            { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
-            runnerId,
-            undefined,
-            suppressContinuationUntilRealInbound,
-            trigger,
-            reportTaskOutcome,
-            processQueryFallbackOptions,
-          );
-          mergeTaskTurns(retryResult.taskTurns);
-          if (retryResult.continuation && retryResult.continuation !== continuation) {
-            continuation = retryResult.continuation;
-            setContinuation(config.providerName, continuation);
-          }
+          await retryInTurn(retryPrompt, continuation, effectiveModel);
           recovered = true;
         } catch (retryErr) {
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           log(`Retry after credential rotation also failed: ${retryMsg}`);
-          // Tear this attempt's CLI child down before the next rotated
-          // attempt (or the fall-through past this loop) starts a new one —
-          // same reasoning as the abort() at the top of the outer catch.
-          retryQuery?.abort();
           // Still retryable? Advance to the next credential in the ring and
           // retry again; rotateApiKey returns rotated:false when the cycle is
           // spent, ending the loop.
@@ -1262,9 +1199,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
       // Context-window recovery: session grew past the model's limit.
       // Clear the continuation AND retry the same prompt once with a
-      // fresh session, mirroring v1's silent prompt_too_long auto-
-      // recovery (src/index.ts:2132-2199 — v1 also retried exactly once;
-      // a second failure surfaced to the user same as we do here).
+      // fresh session. Exactly one retry; a second failure surfaces to the
+      // user.
       //
       // Gated on `continuation` because a freshly-started session can't
       // be "too long" — if a user's first message is already over the
@@ -1282,7 +1218,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         continuation = undefined;
         resetProviderContext(config.providerName);
         freshContextBootstrapRequired = true;
-        let retryQuery: AgentQuery | undefined;
         try {
           const recap = buildSessionRecap();
           const retryPrompt = ensureFreshContextBootstrap(
@@ -1292,44 +1227,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               prompt,
           );
           freshContextBootstrapRequired = false;
-          retryQuery = config.provider.query({
-            prompt: retryPrompt,
-            attachments: batchAttachments,
-            continuation: undefined,
-            cwd: config.cwd,
-            systemContext: config.systemContext,
-            model: effectiveModel,
-            effort: effectiveEffort,
-            ultracode: effectiveUltracode,
-            fast: effectiveFast,
-          });
-          const retryResult = await processQuery(
-            retryQuery,
-            routing,
-            processingIds,
-            config.providerName,
-            config.provider.onExchangeComplete?.bind(config.provider),
-            prompt,
-            undefined,
-            { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
-            runnerId,
-            undefined,
-            suppressContinuationUntilRealInbound,
-            trigger,
-            reportTaskOutcome,
-            processQueryFallbackOptions,
-          );
-          mergeTaskTurns(retryResult.taskTurns);
-          if (retryResult.continuation) {
-            continuation = retryResult.continuation;
-            setContinuation(config.providerName, continuation);
-          }
+          await retryInTurn(retryPrompt, undefined, effectiveModel);
           recovered = true;
         } catch (retryErr) {
-          // Tear this attempt's CLI child down before falling through — an
-          // abandoned retry query leaks its subprocess the same way the original
-          // did (see the abort() at the top of the outer catch).
-          retryQuery?.abort();
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           log(`Retry after context-too-long also failed: ${retryMsg}`);
           // The failed retry's `init` event may have re-persisted a
@@ -1348,7 +1248,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         continuation = undefined;
         resetProviderContext(config.providerName);
         freshContextBootstrapRequired = true;
-        let retryQuery: AgentQuery | undefined;
         try {
           const recap = buildSessionRecap();
           const retryPrompt = ensureFreshContextBootstrap(
@@ -1358,44 +1257,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               prompt,
           );
           freshContextBootstrapRequired = false;
-          retryQuery = config.provider.query({
-            prompt: retryPrompt,
-            attachments: batchAttachments,
-            continuation: undefined,
-            cwd: config.cwd,
-            systemContext: config.systemContext,
-            model: effectiveModel,
-            effort: effectiveEffort,
-            ultracode: effectiveUltracode,
-            fast: effectiveFast,
-          });
-          const retryResult = await processQuery(
-            retryQuery,
-            routing,
-            processingIds,
-            config.providerName,
-            config.provider.onExchangeComplete?.bind(config.provider),
-            prompt,
-            undefined,
-            { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
-            runnerId,
-            undefined,
-            suppressContinuationUntilRealInbound,
-            trigger,
-            reportTaskOutcome,
-            processQueryFallbackOptions,
-          );
-          mergeTaskTurns(retryResult.taskTurns);
-          if (retryResult.continuation) {
-            continuation = retryResult.continuation;
-            setContinuation(config.providerName, continuation);
-          }
+          await retryInTurn(retryPrompt, undefined, effectiveModel);
           recovered = true;
         } catch (retryErr) {
-          // Tear this attempt's CLI child down before falling through — an
-          // abandoned retry query leaks its subprocess the same way the original
-          // did (see the abort() at the top of the outer catch).
-          retryQuery?.abort();
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           log(`Retry after stale-session recovery also failed: ${retryMsg}`);
           // The failed retry's `init` event may have re-persisted a
@@ -1417,7 +1281,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         continuation = undefined;
         resetProviderContext(config.providerName);
         freshContextBootstrapRequired = true;
-        let retryQuery: AgentQuery | undefined;
         try {
           const recap = buildSessionRecap();
           const retryPrompt = ensureFreshContextBootstrap(
@@ -1427,44 +1290,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               prompt,
           );
           freshContextBootstrapRequired = false;
-          retryQuery = config.provider.query({
-            prompt: retryPrompt,
-            attachments: batchAttachments,
-            continuation: undefined,
-            cwd: config.cwd,
-            systemContext: config.systemContext,
-            model: effectiveModel,
-            effort: effectiveEffort,
-            ultracode: effectiveUltracode,
-            fast: effectiveFast,
-          });
-          const retryResult = await processQuery(
-            retryQuery,
-            routing,
-            processingIds,
-            config.providerName,
-            config.provider.onExchangeComplete?.bind(config.provider),
-            prompt,
-            undefined,
-            { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
-            runnerId,
-            undefined,
-            suppressContinuationUntilRealInbound,
-            trigger,
-            reportTaskOutcome,
-            processQueryFallbackOptions,
-          );
-          mergeTaskTurns(retryResult.taskTurns);
-          if (retryResult.continuation) {
-            continuation = retryResult.continuation;
-            setContinuation(config.providerName, continuation);
-          }
+          await retryInTurn(retryPrompt, undefined, effectiveModel);
           recovered = true;
         } catch (retryErr) {
-          // Tear this attempt's CLI child down before falling through — an
-          // abandoned retry query leaks its subprocess the same way the original
-          // did (see the abort() at the top of the outer catch).
-          retryQuery?.abort();
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           log(`Retry after provider system_error also failed: ${retryMsg}`);
           continuation = undefined;
@@ -1490,12 +1318,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // pin re-queries on the group's configured model, because `undefined`
       // means "no per-turn override" and every provider resolves its own
       // default from it — verified, not assumed: claude falls through to
-      // `process.env.NANOCLAW_CLAUDE_MODEL` (providers/claude.ts:2739-2741),
-      // codex returns the group's configured model from
-      // `resolveQueryModel(undefined, this.model)` on its first line
-      // (providers/codex.ts:451, called at :1220), and opencode falls through
-      // to OPENCODE_MODEL then OPENCODE_NATIVE_DEFAULT_MODEL
-      // (providers/opencode.ts:1286, :1302). That is why this is NOT gated on
+      // `process.env.NANOCLAW_CLAUDE_MODEL`, codex returns the group's
+      // configured model from `resolveQueryModel(undefined, this.model)`, and
+      // opencode falls through to OPENCODE_MODEL then
+      // OPENCODE_NATIVE_DEFAULT_MODEL. That is why this is NOT gated on
       // providerName — a codex group pinned to a limited `gpt-*` model reaches
       // it the same way before falling back to claude.
       //
@@ -1506,40 +1332,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       const quotaExhausted = config.provider.isQuotaExhausted?.(err) ?? isProviderQuotaExhausted(err);
       if (!recovered && repositoryRecoveryAllowed() && quotaExhausted && effectiveModel !== undefined) {
         log(`Quota rejection while pinned to ${effectiveModel} — retrying once on the group's default model`);
-        let retryQuery: AgentQuery | undefined;
         try {
-          retryQuery = config.provider.query({
-            prompt,
-            attachments: batchAttachments,
-            continuation,
-            cwd: config.cwd,
-            systemContext: config.systemContext,
-            model: undefined,
-            effort: effectiveEffort,
-            ultracode: effectiveUltracode,
-            fast: effectiveFast,
-          });
-          const retryResult = await processQuery(
-            retryQuery,
-            routing,
-            processingIds,
-            config.providerName,
-            config.provider.onExchangeComplete?.bind(config.provider),
-            prompt,
-            continuation,
-            { model: undefined, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
-            runnerId,
-            undefined,
-            suppressContinuationUntilRealInbound,
-            trigger,
-            reportTaskOutcome,
-            processQueryFallbackOptions,
-          );
-          mergeTaskTurns(retryResult.taskTurns);
-          if (retryResult.continuation && retryResult.continuation !== continuation) {
-            continuation = retryResult.continuation;
-            setContinuation(config.providerName, continuation);
-          }
+          await retryInTurn(prompt, continuation, undefined);
           recovered = true;
           // Clear the pin only when it was STICKY. A one-off `-m` on this
           // message has nothing to clear, and clearing then would silently
@@ -1551,7 +1345,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           if (stickyWasPinned) clearStickyModel();
           await noteModelQuotaFallback(effectiveModel, stickyWasPinned, err, routing);
         } catch (retryErr) {
-          retryQuery?.abort();
           log(
             `Retry on the group's default model also failed: ` +
               `${retryErr instanceof Error ? retryErr.message : String(retryErr)}`,
@@ -1866,7 +1659,7 @@ export function formatMessagesWithCommands(messages: MessageInRow[], nativeSlash
       const cmdInfo = categorizeMessage(msg);
       if (cmdInfo.category === 'passthrough' || cmdInfo.category === 'admin') {
         // The host inserts recall_context immediately BEFORE its wake trigger
-        // (src/modules/mailbox/ops/ingress.ts:94-110). Native slash dispatch
+        // (host src/modules/mailbox/ops/ingress.ts). Native slash dispatch
         // is only recognized when the command starts the SDK prompt, so never
         // flush preceding recall/context rows before it. They are preserved
         // below, after the command, along with any router-provided transcript.
@@ -1959,7 +1752,7 @@ export async function processQuery(
   // The channel is the PERSON'S row's, not the batch anchor's: extractRouting
   // anchors a mixed batch on its task row (formatter.ts, "task row" anchor),
   // which is the task's destination, not where the person is. "Has its own
-  // routing" is extractRouting's test — a platform_id (formatter.ts:307-311).
+  // routing" is extractRouting's test — a platform_id.
   const replyDebt = (rows: MessageInRow[], from: RoutingContext): ReplyDebt | null => {
     const human = routing.taskRun ? undefined : triggeringHumanInbound(rows);
     if (!human) return null;
@@ -2089,7 +1882,7 @@ export async function processQuery(
    * A mid-turn push used to be `markCompleted` on the line after
    * `pushToQuery` — seconds after the message arrived, with no evidence the
    * model had consumed it. `completed` is the terminal ack the host syncs onto
-   * `messages_in.status` (`syncProcessingAcks`, src/modules/mailbox/ops/sweep.ts:207),
+   * `messages_in.status` (host `syncProcessingAcks`),
    * and once a row is `completed` nothing re-delivers it: the wake duty stops
    * counting it due and `completeAnsweredPendingRows` never looks at it. So a
    * turn that died before it ever read the push took the message with it.
@@ -2252,9 +2045,9 @@ export async function processQuery(
         // A due fresh-context task fire needs the outer loop's reset, and this
         // stream otherwise stays open after its result. end() is only safe
         // between turns with no background work (the immutable-settings gate
-        // below, #608/#610): Claude's end() closes stdin once the first result
+        // below): Claude's end() closes stdin once the first result
         // is in (SDK 0.3.280 `Query.streamInput`), while Codex and OpenCode read
-        // `ended` only between turns (codex.ts:1321-1328, opencode.ts:1374-1382),
+        // `ended` only between turns,
         // so for them the gate only defers. Until then the fire stays pending,
         // since selectInTurnFollowUps never pushes it, and the next poll
         // retries. Other rows are still admitted meanwhile.
@@ -2392,7 +2185,7 @@ export async function processQuery(
             // Claude's system prompt is fixed when the SDK query starts. It
             // cannot honestly accept a new model/effort until the next query,
             // but end() is only safe between turns: closing streaming input
-            // while a turn runs also closes its control channel (#608/#610).
+            // while a turn runs also closes its control channel.
             // Leave these rows pending and retry on the next idle poll.
             // Live background work is the same hazard between turns: the
             // open input is what keeps a background subagent alive, so
@@ -2430,7 +2223,7 @@ export async function processQuery(
             // written after this point is genuinely on the new settings and the
             // subtext has to move with them.
             // Post-retarget the provider's getter is already updated
-            // (claude.ts:3559 reassigns activeEffort in applySettings), so it
+            // (claude.ts `applySettings` reassigns activeEffort), so it
             // still beats the requested value here.
             setTurnSettings(modelInForce, query.resolvedEffort, fb.ultracode);
             // The stream has moved; the comparison baseline moves with it, or
@@ -2722,7 +2515,7 @@ export async function processQuery(
         // task fire: the CLI's synthetic "Continue from where you left off."
         // turn on resuming an interrupted session, or a turn a background-task
         // notification started. Recorded, it would take the fire's one outcome
-        // slot and drop the real turn's result (#606). A provider that tracks
+        // slot and drop the real turn's result. A provider that tracks
         // prompt ids says which prompts each result answered
         // (`answeredPrompts`, empty for none); one that does not leaves every
         // result eligible.
@@ -2791,7 +2584,7 @@ export async function processQuery(
         }
         // A `result` event signals the assistant's turn is complete, but the
         // provider's events generator stays open for follow-up `push()` calls
-        // (see container/agent-runner/src/providers/claude.ts:1080 — the
+        // (see the query generator in providers/claude.ts — the
         // generator only exits on `stream.end()`/abort). We must NOT flip
         // the `done` flag here; the polling interval depends on `done` to
         // gate follow-up admission, and stopping it after the first result
@@ -3114,7 +2907,7 @@ export async function processQuery(
     // would clear it until the container exits and the message would be
     // silently undeliverable in the meantime. Release the claim instead — the
     // inbound row is still `pending`, so the next query re-selects it. This is
-    // the same op the repository-fence deferral uses (poll-loop.ts:1571)
+    // the same op the repository-fence deferral uses
     // and it is deliberately a RELEASE the first time: completing is what lost
     // the message in the first place.
     //
@@ -3122,11 +2915,9 @@ export async function processQuery(
     // (`FOLLOW_UP_MAX_RELEASES`). A row whose stream ends unconsumed a second
     // time is completed instead, so a poison follow-up that kills every turn it
     // joins cannot be redelivered forever. That is the same terminal handling
-    // an initial batch gets when its turn ends without a result
-    // (poll-loop.ts:1686). The container cannot bump `messages_in.tries` —
+    // an initial batch gets when its turn ends without a result. The container cannot bump `messages_in.tries` —
     // inbound.db is host-written — so the count lives here; a container death
-    // instead goes through the host's MAX_TRIES ladder
-    // (src/modules/sweep-session-core/index.ts:85).
+    // instead goes through the host's MAX_TRIES ladder.
     if (pendingFollowUps.length > 0) {
       const unconsumed = pendingFollowUps.flatMap((f) => f.ids);
       pendingFollowUps = [];
@@ -4076,7 +3867,7 @@ async function requestPrimaryProviderRetry(requestedModel: string): Promise<bool
  * because it belongs to another provider (`applyFlagBatch`). The pin itself
  * stays in session_state. What happens next depends on WHY the provider
  * differs: under a spawn-time fallback (`fallbackActive`, the host's
- * NANOCLAW_PROVIDER_FALLBACK_APPLIED marker — config.ts:85) the primary comes
+ * NANOCLAW_PROVIDER_FALLBACK_APPLIED marker, read in config.ts) the primary comes
  * back on its own and the pin applies again; after a deliberate provider
  * migration the new provider IS the primary, nothing reverts, and the user
  * has to re-pin or clear it.
