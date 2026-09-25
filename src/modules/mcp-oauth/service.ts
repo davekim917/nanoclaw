@@ -60,14 +60,19 @@ import {
   registerClient,
   type TokenResponse,
 } from './oauth-client.js';
-import { deleteOnecliSecret, findOnecliSecretByName, putOnecliBearerSecret } from './onecli-secret-writer.js';
+import {
+  deleteOnecliSecret,
+  findOnecliSecretByName,
+  putOnecliBearerSecret,
+  type OnecliSecretRef,
+} from './onecli-secret-writer.js';
 import { pollDeviceToken, requestDeviceAuthorization } from './device.js';
 import { startLoopbackListener, sshTunnelCommand } from './loopback.js';
 import { createPkcePair, createState } from './pkce.js';
 import { deleteMcpOAuthBundle, readMcpOAuthBundle, writeMcpOAuthBundle, type McpOAuthBundle } from './store.js';
 
 /** Re-mint this far ahead of the stated expiry — same margin as the GitHub App
- *  installation token (`src/github-app-token.ts:24`), for the same reason: a
+ *  installation token (`src/github-app-token.ts`), for the same reason: a
  *  container that picks the value up at the edge of the window must still get
  *  a token that outlives its first few calls. */
 export const REFRESH_MARGIN_MS = 10 * 60 * 1000;
@@ -88,9 +93,9 @@ export const UNKNOWN_EXPIRY_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
  * one port while the listener sits on another would look like it worked and
  * never capture anything.
  */
-export const DEFAULT_LOOPBACK_PORT = 8765;
+const DEFAULT_LOOPBACK_PORT = 8765;
 
-export function defaultRedirectUri(port: number = DEFAULT_LOOPBACK_PORT): string {
+function defaultRedirectUri(port: number = DEFAULT_LOOPBACK_PORT): string {
   return `http://127.0.0.1:${port}/callback`;
 }
 
@@ -101,7 +106,7 @@ const DEFAULT_CLIENT_NAME = 'NanoClaw';
  * argument everywhere else, so they are constrained once, here, rather than
  * escaped at each use.
  */
-export function assertIntegrationName(name: string): void {
+function assertIntegrationName(name: string): void {
   if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(name)) {
     throw new Error(
       `Invalid integration name "${name}" — use lowercase letters, digits and hyphens, starting with a letter or digit (max 63).`,
@@ -115,7 +120,7 @@ export function assertIntegrationName(name: string): void {
  * exists (one a human made before this command did) gets adopted in place
  * instead of orphaned beside a new one.
  */
-export function defaultBearerSecretName(integrationName: string, groupFolder: string): string {
+function defaultBearerSecretName(integrationName: string, groupFolder: string): string {
   const titled = (s: string) =>
     s
       .split(/[-_\s]+/)
@@ -183,13 +188,13 @@ export interface LoginResult {
 }
 
 /** How long an opt-in loopback listener stays up by default. */
-export const DEFAULT_LISTEN_TIMEOUT_SECONDS = 600;
+const DEFAULT_LISTEN_TIMEOUT_SECONDS = 600;
 
 /**
  * Lock key for a (group, MCP URL) pair, held ONLY by `startLogin` and only
  * inside the name lock.
  *
- * #905 review P2: the name lock does not serialize two logins that use
+ * The name lock does not serialize two logins that use
  * different NAMES for the same target, so both could pass the duplicate check
  * below, both dynamically register a client, and only the second fail at the
  * unique index — leaving exactly the stray registration the check exists to
@@ -233,7 +238,7 @@ async function startLoginLocked(input: LoginInput, fetchImpl: FetchLike): Promis
   // An integration's group is IMMUTABLE. Silently moving `agent_group_id` would
   // point `complete` at the new group's `container.json` while leaving the old
   // group's declaration in place, and a declared secret is granted on every
-  // spawn (`src/onecli-secrets.ts:517`) — so the old group would keep a live
+  // spawn (`applyOnecliSecrets`) — so the old group would keep a live
   // bearer, and on a shared `--secret` would keep receiving refreshed ones. The
   // two-step path is explicit about what it leaves behind, which a silent move
   // is not.
@@ -594,16 +599,7 @@ async function finalizeToken(
 
   let secret;
   try {
-    secret = await putOnecliBearerSecret(
-      {
-        name: row.bearer_secret_name,
-        hostPattern: row.host_pattern,
-        pathPattern: row.path_pattern,
-        headerName: 'Authorization',
-        valueFormat: `${token.tokenType || 'Bearer'} {value}`,
-      },
-      token.accessToken,
-    );
+    secret = await putIntegrationBearer(row, token.tokenType || 'Bearer', token.accessToken);
   } catch (err) {
     // The credentials are safe on disk; only the bearer failed to land. `error`
     // is due on the NEXT tick regardless of the expiry written here
@@ -734,8 +730,7 @@ async function completeLoginLocked(
 /**
  * Add the bearer secret to the group's `container.json` `onecliSecrets`, which
  * is what actually grants it: `applyOnecliSecrets` reconciles the group's OneCLI
- * agent to EXACTLY that declared set on every spawn
- * (`src/onecli-secrets.ts:517`), so a secret missing from the file is a secret
+ * agent to EXACTLY that declared set on every spawn, so a secret missing from the file is a secret
  * the agent is not granted, however fresh its value is. That is half of today's
  * MCP failure class: the bearer secret exists in the vault, is fresh, and is
  * simply not named in that group's `container.json` — so the agent is never
@@ -748,7 +743,7 @@ async function ensureSecretDeclared(agentGroupId: string, secretName: string): P
   if (!group) return false;
   // Read-only fast path. The refresh path calls this on every successful
   // refresh, and `updateContainerConfig` rewrites the file unconditionally
-  // (`src/container-config.ts:1547`, in place — `:1427`), so without this an
+  // (in place), so without this an
   // already-declared secret would cost a locked rewrite of container.json per
   // refresh. The locked read-modify-write below still decides the real answer.
   if ((readContainerConfig(group.folder).onecliSecrets ?? []).includes(secretName)) return false;
@@ -766,15 +761,14 @@ async function ensureSecretDeclared(agentGroupId: string, secretName: string): P
  * The inverse of `ensureSecretDeclared`: drop these spellings of the bearer
  * from the group's `container.json` `onecliSecrets`, leaving every other
  * declaration exactly as it was. Only `remove --delete-secret` calls it, and
- * only just before deleting the secret they name (#929).
+ * only just before deleting the secret they name.
  *
  * `spellings` is the secret NAME and, when the vault ref resolved, its UUID:
- * `onecliSecrets` accepts either (`resolveSecretUuids`,
- * `src/onecli-secrets.ts:449`), `ensureSecretDeclared` only ever writes the
+ * `onecliSecrets` accepts either (`resolveSecretUuids` in
+ * `src/onecli-secrets.ts`), `ensureSecretDeclared` only ever writes the
  * name, but an operator may have declared the UUID by hand — and once the
  * secret is deleted, a leftover declaration in EITHER spelling aborts the
- * spawn. Matching is exact, as `matchDeclarations` compares
- * (`src/onecli-secrets.ts:473`).
+ * spawn. Matching is exact, as `matchDeclarations` compares.
  *
  * Returns true when at least one declaration was removed.
  */
@@ -856,12 +850,12 @@ export function decideRefresh(row: McpOAuthIntegration, nowMs: number): RefreshD
  * three. The refresh continuation then re-writes the bundle and recreates the
  * vault secret, while its own UPDATE silently matches zero rows — and because
  * `remove` deliberately leaves the group's `container.json` declaration alone,
- * `applyOnecliSecrets` grants that resurrected secret again on the next spawn
- * (`src/onecli-secrets.ts:517`). A credential that `ncl integrations list` says
+ * `applyOnecliSecrets` grants that resurrected secret again on the next spawn.
+ * A credential that `ncl integrations list` says
  * is gone would be live.
  *
  * In-process is sufficient and is the established shape: the host is one Node
- * process and `src/onecli-secrets.ts:168` serializes its own read-modify-write
+ * process and `src/onecli-secrets.ts` serializes its own read-modify-write
  * against the same vault the same way.
  */
 const integrationLocks = new Map<string, Promise<unknown>>();
@@ -959,7 +953,7 @@ function pendingWriteStatusDetail(name: string, err: unknown): string {
  * gap.
  *
  * A token with no stated `expires_in` has no expiry to judge, and treating that
- * as "never spent" parked it forever (#905 review round 2): an outage longer
+ * as "never spent" would park it forever: an outage longer
  * than its real lifetime would end with a dead bearer written to the vault and
  * no fresh grant ever attempted. It is bounded by the same interval the
  * refresher already uses for an unknown expiry — past that, a refresh was due
@@ -972,6 +966,24 @@ function parkedTokenIsSpent(parked: ParkedSecretWrite, nowMs: number): boolean {
   return expiresMs - nowMs <= REFRESH_MARGIN_MS;
 }
 
+/** Write `accessToken` into the integration's OneCLI bearer secret. */
+function putIntegrationBearer(
+  row: McpOAuthIntegration,
+  tokenType: string,
+  accessToken: string,
+): Promise<OnecliSecretRef> {
+  return putOnecliBearerSecret(
+    {
+      name: row.bearer_secret_name,
+      hostPattern: row.host_pattern,
+      pathPattern: row.path_pattern,
+      headerName: 'Authorization',
+      valueFormat: `${tokenType} {value}`,
+    },
+    accessToken,
+  );
+}
+
 /** Retry ONLY the vault write, with the token that was already minted. */
 async function retryPendingSecretWrite(
   row: McpOAuthIntegration,
@@ -979,16 +991,7 @@ async function retryPendingSecretWrite(
   outcome: RefreshOutcome,
 ): Promise<void> {
   try {
-    const secret = await putOnecliBearerSecret(
-      {
-        name: row.bearer_secret_name,
-        hostPattern: row.host_pattern,
-        pathPattern: row.path_pattern,
-        headerName: 'Authorization',
-        valueFormat: `${parked.tokenType} {value}`,
-      },
-      parked.accessToken,
-    );
+    const secret = await putIntegrationBearer(row, parked.tokenType, parked.accessToken);
     pendingSecretWrites.delete(row.name);
     await markMcpOAuthIntegration(row.name, {
       status: 'active',
@@ -1159,16 +1162,7 @@ async function refreshOne(name: string, outcome: RefreshOutcome, fetchImpl: Fetc
 
     let secret;
     try {
-      secret = await putOnecliBearerSecret(
-        {
-          name: row.bearer_secret_name,
-          hostPattern: row.host_pattern,
-          pathPattern: row.path_pattern,
-          headerName: 'Authorization',
-          valueFormat: `${token.tokenType || 'Bearer'} {value}`,
-        },
-        token.accessToken,
-      );
+      secret = await putIntegrationBearer(row, token.tokenType || 'Bearer', token.accessToken);
     } catch (err) {
       // Park the minted token and let the backoff own the retry, rather than
       // falling into the generic handler below, which would leave the row due
@@ -1200,8 +1194,8 @@ async function refreshOne(name: string, outcome: RefreshOutcome, fetchImpl: Fetc
       bearer_secret_id: secret.id,
       last_refresh_at: new Date().toISOString(),
     });
-    // The same tail `finalizeToken` and `retryPendingSecretWrite` run (#911
-    // item 3). `finalizeToken` marks the row `active` BEFORE it declares the
+    // The same tail `finalizeToken` and `retryPendingSecretWrite` run.
+    // `finalizeToken` marks the row `active` BEFORE it declares the
     // secret, so a declaration that failed there (container.json locked or
     // unwritable) left an active integration whose bearer the group is never
     // granted — and nothing after it ever declared it again. Its failure is
@@ -1286,7 +1280,7 @@ export interface RemoveResult {
  * other things may match on it, and an accidental delete is not recoverable
  * from here — the vault has no read-back.
  *
- * `deleteSecret` is SUBTRACTIVE-OR-NOTHING (#929). It refuses unless the
+ * `deleteSecret` is SUBTRACTIVE-OR-NOTHING. It refuses unless the
  * owning group's own `container.json` is the only thing that still depends on
  * the bearer, and then drops it there before deleting the vault secret.
  * `findForeignSecretDeclarations` is the scan and lists what counts.
@@ -1295,11 +1289,10 @@ export interface RemoveResult {
  * place, and the spawn takes their UNION: the workgroup's
  * `workgroups.onecli_secrets` and the group's own `container.json`
  * `onecliSecrets` (`mergeWorkgroupAndGroupSecrets`,
- * `src/onecli-secrets.ts:566` — "neither list can subtract from the other";
- * merged at `src/container-runner.ts:7077`). So an edit to one group's file
+ * `src/onecli-secrets.ts` — "neither list can subtract from the other"). So an edit to one group's file
  * cannot take back a workgroup declaration, and it cannot touch a sibling's
  * file at all. Deleting a secret any of those still names makes
- * `resolveSecretUuids` throw (`src/onecli-secrets.ts:464`) and aborts EVERY
+ * `resolveSecretUuids` throw and aborts EVERY
  * spawn that inherits it — for a workgroup-level declaration that is every
  * group in the workgroup, not just this one. Refusing keeps the property the
  * whole path is built on: either the declaration and the secret both go, or
@@ -1307,11 +1300,11 @@ export interface RemoveResult {
  *
  * Why the removal does the group-level undeclare at all, rather than leaving
  * it to the operator as it used to: `refreshOne` re-declares the bearer on
- * every successful refresh (`service.ts:1210`), so a refresh between a hand
+ * every successful refresh, so a refresh between a hand
  * edit and this call re-declared the name this call was about to delete —
  * producing exactly the spawn-abort above. Both run under the same per-name
  * lock (`withIntegrationLock`, taken by `removeIntegration` and by
- * `refreshExpiringMcpOAuthIntegrations` at `service.ts:1066`), so doing it
+ * `refreshExpiringMcpOAuthIntegrations`), so doing it
  * here closes that window rather than narrowing it.
  *
  * Plain `remove` still leaves the declaration alone everywhere: an
@@ -1353,17 +1346,16 @@ interface SecretDeclarationSite {
  *      expiry margin, so "eventually" can be hours of 401s.
  *
  * Both spellings are matched for 1 and 2 because `onecliSecrets` accepts
- * either a name or a vault UUID (`resolveSecretUuids`,
- * `src/onecli-secrets.ts:449`), compared exactly (`matchDeclarations`,
- * `:473`) — and once the secret is gone, a leftover declaration in either one
+ * either a name or a vault UUID (`resolveSecretUuids`), compared exactly
+ * (`matchDeclarations`) — and once the secret is gone, a leftover declaration in either one
  * aborts the spawn. Source 3 matches on `bearer_secret_name`, which is what a
  * row stores.
  *
  * The group files are read with `readContainerConfig` deliberately, not a
  * stricter reader: it answers `emptyConfig()` for both an absent file
- * (`src/container-config.ts:1283`) and one it cannot parse (`:1290`), and the
+ * and one it cannot parse, and the
  * spawn path asks the same question through the same function
- * (`readContainerConfigForSpawn`, `:1310`, non-strict unless an operator
+ * (`readContainerConfigForSpawn`, non-strict unless an operator
  * spawn fence is up). A scan that disagreed with the thing it is protecting
  * would refuse on declarations the spawn never sees.
  *

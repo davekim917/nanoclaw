@@ -30,13 +30,13 @@ export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 
 const DISCOVERY_TIMEOUT_MS = 10_000;
 
-export interface ProtectedResourceMetadata {
+interface ProtectedResourceMetadata {
   resource?: string;
   authorization_servers?: string[];
   scopes_supported?: string[];
 }
 
-export interface AuthorizationServerMetadata {
+interface AuthorizationServerMetadata {
   issuer?: string;
   authorization_endpoint?: string;
   token_endpoint?: string;
@@ -250,7 +250,7 @@ async function getJson<T>(fetchImpl: FetchLike, url: string): Promise<T> {
  * A non-401 answer is not an error here — it means the endpoint did not
  * challenge us, and the caller falls back to the well-known paths.
  */
-export async function probeResourceMetadataUrl(fetchImpl: FetchLike, mcpUrl: string): Promise<string | undefined> {
+async function probeResourceMetadataUrl(fetchImpl: FetchLike, mcpUrl: string): Promise<string | undefined> {
   const res = await fetchImpl(mcpUrl, {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
@@ -260,13 +260,13 @@ export async function probeResourceMetadataUrl(fetchImpl: FetchLike, mcpUrl: str
   return parseWwwAuthenticate(res.headers.get('www-authenticate'));
 }
 
-export async function discoverProtectedResource(
+async function discoverProtectedResource(
   fetchImpl: FetchLike,
   mcpUrl: string,
 ): Promise<{ url: string; metadata: ProtectedResourceMetadata }> {
   // The MCP URL is where the bearer token will be sent on every request, and
   // the well-known candidates below are derived from it — so a cleartext
-  // `--url` is refused outright, before anything is probed (#876 P2-3).
+  // `--url` is refused outright, before anything is probed.
   assertHttpsEndpoint('--url', mcpUrl);
   const candidates: string[] = [];
   try {
@@ -308,7 +308,7 @@ export async function discoverProtectedResource(
   );
 }
 
-export async function discoverAuthorizationServer(
+async function discoverAuthorizationServer(
   fetchImpl: FetchLike,
   issuer: string,
 ): Promise<{ url: string; metadata: AuthorizationServerMetadata }> {
@@ -318,7 +318,7 @@ export async function discoverAuthorizationServer(
       const metadata = await getJson<AuthorizationServerMetadata>(fetchImpl, url);
       if (metadata.authorization_endpoint && metadata.token_endpoint) {
         // RFC 8414 §3.3 is an ACCEPTANCE test for a candidate, not a verdict on
-        // the whole probe (#905 review round 2). The probe list deliberately
+        // the whole probe. The probe list deliberately
         // includes the ROOT well-known path as a fallback for a path-carrying
         // issuer, and on a multi-tenant host that document is complete and
         // belongs to somebody else. Checking it after the loop let that

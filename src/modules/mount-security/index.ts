@@ -23,7 +23,7 @@ export interface MountAllowlist {
   blockedPatterns: string[];
 }
 
-export interface AllowedRoot {
+interface AllowedRoot {
   path: string;
   allowReadWrite: boolean;
   description?: string;
@@ -208,8 +208,7 @@ function getRealPath(p: string): string | null {
 /**
  * True when `realPath` touches the host-managed git-hooks tree
  * (data/managed-git-hooks/ — src/managed-git-hooks.ts) in either direction
- * (#666 review B9: "equals or contains data/managed-git-hooks (DATA_DIR or
- * any ancestor)"):
+ * (equals or contains data/managed-git-hooks, DATA_DIR or any ancestor):
  *   - realPath EQUALS the tree root, or is a DESCENDANT of it (mounting
  *     into scan/ or refuse/ directly — a container could overwrite the
  *     hook or pattern lib);
@@ -217,7 +216,7 @@ function getRealPath(p: string): string | null {
  *     anything above it — because a read-write mount of a broader
  *     directory reaches the managed tree through the parent just as surely
  *     as mounting it directly.
- * Compares REALPATHS both ways (#666 review B11), not the raw strings, so a
+ * Compares REALPATHS both ways, not the raw strings, so a
  * symlink that only resolves into (or over) the tree is caught the same as
  * a direct path. Returns false (never blocks) if the tree doesn't exist yet
  * on this host — nothing to protect before the first boot that creates it,
@@ -246,7 +245,7 @@ type ProtectedTreeHit = 'touches' | 'unverifiable' | null;
  * Shared containment check for a directory directly under DATA_DIR, in three
  * passes: lexical (works before the leaf exists), under DATA_DIR's realpath
  * (catches a symlinked alias of DATA_DIR), and the LEAF's own realpath
- * (#905 review round 3, #909) — resolving only DATA_DIR and appending the
+ * — resolving only DATA_DIR and appending the
  * literal leaf component misses a leaf that is ITSELF a symlink to a
  * directory elsewhere. Writes and reads through `path.join(DATA_DIR, leaf,
  * …)` follow that symlink, so its target is where the files really are.
@@ -270,13 +269,13 @@ function touchesDataDirLeaf(leaf: string, realPath: string): ProtectedTreeHit {
 }
 
 function touchesManagedGitHooksRoot(realPath: string): ProtectedTreeHit {
-  // Lexical comparison first (#666 review P3-6/"nudge" follow-up): this
+  // Lexical comparison first: this
   // never requires data/managed-git-hooks/ to exist on disk at all, so it
   // still refuses a mount aimed there even before the very first host
   // restart that creates the directory. Then realpath, rooted at DATA_DIR's
-  // OWN realpath (#666 review P3-6: "DATA_DIR always exists, even when the
-  // leaf doesn't") to catch a symlinked alias of DATA_DIR, and finally the
-  // leaf's own realpath (#909): a `data/managed-git-hooks` that is itself a
+  // OWN realpath (DATA_DIR always exists, even when the leaf doesn't) to
+  // catch a symlinked alias of DATA_DIR, and finally the
+  // leaf's own realpath: a `data/managed-git-hooks` that is itself a
   // symlink would otherwise let a read-write mount of its target through.
   return touchesDataDirLeaf('managed-git-hooks', realPath);
 }
@@ -285,8 +284,8 @@ function touchesManagedGitHooksRoot(realPath: string): ProtectedTreeHit {
  * True when `realPath` touches the MCP OAuth bundle directory
  * (`data/mcp-oauth/` — `src/modules/mcp-oauth/store.ts`) in either direction.
  *
- * The blocked PATTERN is not enough on its own, and #905 review P1 is the
- * reason: `matchesBlockedPattern` only inspects the selected path itself
+ * The blocked PATTERN is not enough on its own:
+ * `matchesBlockedPattern` only inspects the selected path itself
  * (`matchesBlockedPattern` below scans `realPath`'s own components and its own
  * string), never its descendants. So `mcp-oauth` in the list refuses a mount
  * AIMED at the bundle directory and does nothing about a mount of `data/`, or
@@ -436,7 +435,7 @@ export function validateMount(mount: AdditionalMount): MountValidationResult {
   }
 
   // Refuse a read-write mount into the host-managed git-hooks tree
-  // unconditionally (#666 review B9) — a container that could write there
+  // unconditionally — a container that could write there
   // could overwrite the boot-snapshotted hook or pattern lib every
   // scan-policy repo's push depends on, regardless of what the allowlist
   // otherwise permits. Read-only mounts of the same tree are unaffected —
@@ -464,7 +463,7 @@ export function validateMount(mount: AdditionalMount): MountValidationResult {
   }
 
   // DATA_DIR itself cannot be resolved, so neither protected tree's realpath
-  // check could run (#911 item 4). Still fail closed — a symlinked alias could
+  // check could run. Still fail closed — a symlinked alias could
   // reach either tree and nothing here can tell — but say why, rather than
   // claiming an unrelated mount reaches the bundles. The OAuth check runs for
   // every mount, and both checks share `touchesDataDirLeaf`, so this one
@@ -560,37 +559,4 @@ export function validateAdditionalMounts(
   }
 
   return validatedMounts;
-}
-
-/**
- * Generate a template allowlist file for users to customize
- */
-export function generateAllowlistTemplate(): string {
-  const template: MountAllowlist = {
-    allowedRoots: [
-      {
-        path: '~/projects',
-        allowReadWrite: true,
-        description: 'Development projects',
-      },
-      {
-        path: '~/repos',
-        allowReadWrite: true,
-        description: 'Git repositories',
-      },
-      {
-        path: '~/Documents/work',
-        allowReadWrite: false,
-        description: 'Work documents (read-only)',
-      },
-    ],
-    blockedPatterns: [
-      // Additional patterns beyond defaults
-      'password',
-      'secret',
-      'token',
-    ],
-  };
-
-  return JSON.stringify(template, null, 2);
 }

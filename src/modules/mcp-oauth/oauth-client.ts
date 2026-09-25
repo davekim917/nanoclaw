@@ -5,9 +5,9 @@
  *
  * Every function takes an injected fetch so the whole flow is testable without
  * a network. Plain `fetch` is what the host uses for outbound HTTPS elsewhere
- * (`src/github-app-token.ts:228`); it does NOT traverse the OneCLI gateway
- * proxy, because `NODE_USE_ENV_PROXY` was stripped from the daemon env after it
- * broke every spawn on 2026-09-02 (`src/onecli-secrets.ts:95`). That matters
+ * (`src/github-app-token.ts`); it does NOT traverse the OneCLI gateway
+ * proxy, because `NODE_USE_ENV_PROXY` is stripped from the daemon env (see
+ * `src/onecli-secrets.ts`). That matters
  * here: a token request routed through the gateway would have the dead bearer
  * injected over its own Authorization header.
  */

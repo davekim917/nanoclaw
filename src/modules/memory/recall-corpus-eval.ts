@@ -25,7 +25,7 @@ export interface RecallCorpus {
   }>;
 }
 
-export interface RecallCorpusMetrics {
+interface RecallCorpusMetrics {
   exact: number;
   correction: number;
   link: number;

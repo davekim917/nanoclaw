@@ -22,7 +22,7 @@
 import http from 'http';
 import os from 'os';
 
-export interface LoopbackCapture {
+interface LoopbackCapture {
   code?: string;
   state?: string;
   error?: string;
