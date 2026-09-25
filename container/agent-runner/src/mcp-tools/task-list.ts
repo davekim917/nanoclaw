@@ -44,6 +44,7 @@ export const TASK_LIST_DESCRIPTION =
   'Send the WHOLE list every call (it replaces the last one): a short title naming the work (e.g. "Migrating the orders table"), and every item with its status. ' +
   'Call it when you start, when an item starts or finishes, and when you add work; keep one item in_progress while you work. ' +
   'Write items as actions ("Run the migration"). When one finishes, rewrite it as its outcome ("Migration ran: 14 tables, no errors"), so the finished list reads as a summary. ' +
+  'Format items like chat: backtick identifiers (`orders_v2`, `pnpm test`), link PRs and issues as [repo#123](url), and name channels as #name. ' +
   'A follow-up that arrives while you work: react to acknowledge it and add it as an item, rather than starting another list. ' +
   'The list is progress, not the deliverable: post results, findings and answers as their own messages. ' +
   'Updating the list notifies no one, so a blocker, a question, an approval you need, or the final result goes in a new message, and you @-mention someone only when they must act. ' +

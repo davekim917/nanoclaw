@@ -3344,6 +3344,49 @@ describe('processQuery provider_executing', () => {
   });
 });
 
+it('hands an unfinished task list back after provider compaction', async () => {
+  const prev = process.env.NANOCLAW_TASK_LIST;
+  process.env.NANOCLAW_TASK_LIST = '1';
+  getAgentMailbox().operations.setState(
+    'task_list',
+    JSON.stringify({
+      version: 1,
+      generation: 1,
+      revision: 2,
+      title: 'Backfilling the orders table',
+      items: [
+        { text: 'Schema checked', status: 'done' },
+        { text: 'Run the backfill', status: 'in_progress' },
+      ],
+      channelType: 'slack',
+      platformId: 'slack:C1',
+      threadId: null,
+      finished: false,
+    }),
+  );
+  const pushes: string[] = [];
+  async function* events(): AsyncGenerator<ProviderEvent> {
+    yield { type: 'init', continuation: 'sess-list-compaction' };
+    yield { type: 'compacted', text: 'Context compacted.' };
+    yield { type: 'result', text: '<message to="discord-test">continued</message>' };
+  }
+  const query: AgentQuery = {
+    push: (message) => pushes.push(message),
+    end: () => {},
+    events: events(),
+    abort: () => {},
+  };
+  try {
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', 'sess-list-compaction', {});
+  } finally {
+    if (prev === undefined) delete process.env.NANOCLAW_TASK_LIST;
+    else process.env.NANOCLAW_TASK_LIST = prev;
+  }
+  const compaction = pushes.find((message) => message.includes('Context was just compacted'));
+  expect(compaction).toContain('Your live task list');
+  expect(compaction).toContain('Run the backfill');
+});
+
 it('re-bootstraps bounded canon and capabilities immediately after provider compaction', async () => {
   const pushes: string[] = [];
   async function* events(): AsyncGenerator<ProviderEvent> {

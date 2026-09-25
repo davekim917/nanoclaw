@@ -3065,6 +3065,11 @@ export async function processQuery(
               ? 'Use send_message with an explicit purpose to address them; omit to for the current conversation.'
               : 'Use <message to="name"> blocks to address them. Bare text goes to the scratchpad fallback only.');
         }
+        // Compaction can summarize the live task list away mid-run; hand it back.
+        const listReminder = taskListEnabled()
+          ? taskListReminder(loadTaskListState(getAgentMailbox().operations))
+          : null;
+        if (listReminder) reminder += `\n\n${listReminder}`;
         pushToQuery(ensureFreshContextBootstrap(reminder));
       } else if (event.type === 'interim_text') {
         for (const block of await dispatchInterimMessageBlocks(event.text, routing, (blocks) =>
@@ -3322,24 +3327,26 @@ export async function dispatchFileAttachment(
  */
 async function deliverErrorResult(text: string, routing: RoutingContext): Promise<void> {
   log('Error result with no <message> envelope — delivering to channel');
-  await writeMessageOut(withStatusSubtext({
-    id: generateId(),
-    in_reply_to: routing.inReplyTo,
-    kind: 'chat',
-    // Marked, deliberately: this is the TURN'S OWN text going to the session's
-    // own conversation, which is exactly what the subtext describes. The same
-    // text routed through sendToDestination is stamped, and leaving this path
-    // unmarked would make an error reply the one place the line silently
-    // disappears — precisely when knowing the model and context is most
-    // useful. Model and effort are accurate on an error turn; the context
-    // figure is this turn's, since it is cleared per result (just before
-    // closeResultScope in processQuery).
-    agentReply: true,
-    platform_id: routing.platformId,
-    channel_type: routing.channelType,
-    thread_id: routing.threadId,
-    content: JSON.stringify({ text }),
-  }));
+  await writeMessageOut(
+    withStatusSubtext({
+      id: generateId(),
+      in_reply_to: routing.inReplyTo,
+      kind: 'chat',
+      // Marked, deliberately: this is the TURN'S OWN text going to the session's
+      // own conversation, which is exactly what the subtext describes. The same
+      // text routed through sendToDestination is stamped, and leaving this path
+      // unmarked would make an error reply the one place the line silently
+      // disappears — precisely when knowing the model and context is most
+      // useful. Model and effort are accurate on an error turn; the context
+      // figure is this turn's, since it is cleared per result (just before
+      // closeResultScope in processQuery).
+      agentReply: true,
+      platform_id: routing.platformId,
+      channel_type: routing.channelType,
+      thread_id: routing.threadId,
+      content: JSON.stringify({ text }),
+    }),
+  );
 }
 
 /**
@@ -3766,7 +3773,12 @@ export function resolveFireOutcome(input: {
  * An errored turn writes the row even when the text is empty. A failure that
  * leaves no line is precisely the silence this record exists to end.
  */
-export async function autoAppendTaskLog(text: string, isError = false, model?: string, taskMessageIds: string[] = []): Promise<void> {
+export async function autoAppendTaskLog(
+  text: string,
+  isError = false,
+  model?: string,
+  taskMessageIds: string[] = [],
+): Promise<void> {
   // Run-log hygiene: an inert <message to> block never belongs in the log as
   // raw XML — replace each with its inner text, marked undelivered, so the
   // log stays readable prose.
@@ -3810,20 +3822,22 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
   // `send_message` (mcp-tools/core.ts) bypasses this function and is the
   // default reply path when outcome reporting is on — it stamps itself through
   // the same withStatusSubtext.
-  await writeMessageOut(withStatusSubtext({
-    id: generateId(),
-    // Batch anchor, not the channel's latest inbound row — see the poison
-    // note in dispatchFileAttachment / getPendingMessages.
-    in_reply_to: getBatchAnchor(channelType, platformId) ?? routing.inReplyTo,
-    kind: 'chat',
-    // Agent-composed reply text — eligible for the status subtext. The
-    // own-conversation gate still applies inside stampStatusSubtext.
-    agentReply: true,
-    platform_id: platformId,
-    channel_type: channelType,
-    thread_id: threadId,
-    content: JSON.stringify({ text: body }),
-  }));
+  await writeMessageOut(
+    withStatusSubtext({
+      id: generateId(),
+      // Batch anchor, not the channel's latest inbound row — see the poison
+      // note in dispatchFileAttachment / getPendingMessages.
+      in_reply_to: getBatchAnchor(channelType, platformId) ?? routing.inReplyTo,
+      kind: 'chat',
+      // Agent-composed reply text — eligible for the status subtext. The
+      // own-conversation gate still applies inside stampStatusSubtext.
+      agentReply: true,
+      platform_id: platformId,
+      channel_type: channelType,
+      thread_id: threadId,
+      content: JSON.stringify({ text: body }),
+    }),
+  );
 }
 
 /**

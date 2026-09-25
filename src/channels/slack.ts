@@ -37,6 +37,7 @@ import type { ChannelConversation, ChannelDefaults, ChannelRecoveryRequest, Chan
 import { registerChannelAdapter } from './channel-registry.js';
 import { extractSlackRawText } from './slack-raw-text.js';
 import { installSlackSubtextBlocks } from './slack-subtext.js';
+import { linkSlackChannelNames } from './channel-links.js';
 import { createSlackHopGovernor, type SlackHopGovernor } from './slack-hop-limit.js';
 import {
   fetchSlackBotIdentity,
@@ -804,7 +805,10 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
             }
           }
           const structured = normalizeSlackOrderedListContinuations(named);
-          return markdownHeadingsToBold(resolveSlackMentions(structured, ws.channelType));
+          return linkSlackChannelNames(
+            markdownHeadingsToBold(resolveSlackMentions(structured, ws.channelType)),
+            ws.channelType,
+          );
         },
         // Inbound wire text carries mentions as raw <@U…>; resolving them to
         // @name here is what stops agents from ever LEARNING the raw form —
