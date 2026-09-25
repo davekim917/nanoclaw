@@ -17,7 +17,7 @@ import type { Migration } from './index.js';
  *                        signal from a single column.
  *
  * `sessions.last_active` already tracks the inbound side (host-writes-in path
- * in session-manager.ts:427). Keeping outbound separate means we can render
+ * in session-manager.ts). Keeping outbound separate means we can render
  * "agent asked at 14:02, you replied at 14:05" without an additional join.
  *
  * Both columns are nullable: every existing session predates the column,

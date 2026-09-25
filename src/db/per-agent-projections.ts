@@ -89,8 +89,8 @@ const ARCHIVE_SCHEMA_SQL = `
  * before the host opens the file read-write. Returns the suffixes it deleted.
  *
  * WHY THIS EXISTS. The session directory is bind-mounted READ-WRITE into every
- * container at `/workspace` (`src/container-runner.ts:4439`); only `archive.db`
- * itself is re-overlaid read-only on top (`:4812`). So a container can freely
+ * container at `/workspace`; only `archive.db`
+ * itself is re-overlaid read-only on top. So a container can freely
  * create `archive.db-journal` / `-wal` / `-shm` in that directory even though
  * it cannot alter `archive.db`'s own bytes. SQLite treats a well-formed
  * rollback journal found beside an EXISTING, non-empty database as a HOT
@@ -101,7 +101,7 @@ const ARCHIVE_SCHEMA_SQL = `
  * own header — so a journal hand-built by a container (which can read the
  * read-only `archive.db` to match its page size and layout) is replayed
  * verbatim into the host-owned projection. Verified against better-sqlite3
- * 11.10.0. #668's seeding (`seedArchiveProjectionFrom`) would then copy the
+ * 11.10.0. Seeding (`seedArchiveProjectionFrom`) would then copy the
  * poisoned projection into the same agent's other sessions.
  *
  * WHY DELETING IS SAFE. The host is the SOLE legitimate writer of a projection
@@ -293,7 +293,7 @@ export function buildArchiveProjection(
  * output changes for identical inputs — the schema, the dedup grouping, the
  * column list. A stamp from an older builder never satisfies a newer one.
  * Version 2 replaced v1's stat signature over the whole archive file with this
- * scope-keyed watermark (#360).
+ * scope-keyed watermark.
  */
 export const ARCHIVE_PROJECTION_STAMP_VERSION = 2;
 
@@ -322,7 +322,7 @@ type ArchiveProjectionIdentity = Pick<ArchiveProjectionStamp, 'version' | 'agent
  *
  * The ONE identity check, shared by `decideArchiveProjectionMode` (may this
  * local stamp be trusted for reuse/append?) and `findArchiveSeedCandidate`
- * (#667/#668: may this sibling's stamp be trusted as a seed?), so the two
+ * (may this sibling's stamp be trusted as a seed?), so the two
  * cannot drift apart — a sibling seed and a local append must agree on
  * exactly what counts as "the same projection."
  */
@@ -456,7 +456,7 @@ function readArchiveScopeSignatureOnce(
  * was a stat signature over `data/archive.db`, so a message archived for any
  * agent group anywhere invalidated every session's projection: on the live host
  * that was 435 full rebuilds against 65 reuses in one day, median 19 s each,
- * against projections of 230-240 MB (#360).
+ * against projections of 230-240 MB.
  *
  * `messages_archive` is NOT append-only, which is why the v1 stamp took the
  * coarse route: `ARCHIVE_UPSERT_SQL` in `src/message-archive.ts` carries
@@ -540,7 +540,7 @@ export function readArchiveProjectionStamp(dstPath: string): ArchiveProjectionSt
   }
 }
 
-/** What a seed candidate needs for #667: where its file is and what it claims to hold. */
+/** What a seed candidate needs: where its file is and what it claims to hold. */
 interface ArchiveSeedCandidate {
   dstPath: string;
   stamp: ArchiveProjectionStamp;
@@ -549,7 +549,7 @@ interface ArchiveSeedCandidate {
 /**
  * Look for an existing projection from THIS SAME agent group, at the same
  * scope, that a brand-new session of theirs can be seeded from instead of
- * paying a full rebuild (#667).
+ * paying a full rebuild.
  *
  * Restricted to the calling agent's OWN prior sessions — not any workgroup
  * sibling — via `sameProjectionIdentity`, the identical check
@@ -586,7 +586,7 @@ interface ArchiveSeedCandidate {
  *
  * Scans every stamp under `DATA_DIR/projection-stamps`: cheap (one small JSON
  * read per existing session projection) and only reached when THIS session has
- * no local projection file (fresh, or reclaimed — #693).
+ * no local projection file (fresh, or reclaimed).
  */
 function findArchiveSeedCandidate(stamp: ArchiveProjectionStamp, excludeDstPath: string): ArchiveSeedCandidate | null {
   let entries: string[];
@@ -612,7 +612,7 @@ function findArchiveSeedCandidate(stamp: ArchiveProjectionStamp, excludeDstPath:
     try {
       // `lstat`, not `stat`: reports the path itself, never a target it may
       // point at, so `isFile()` is already false for a symlink — this is the
-      // ONLY barrier against a symlinked candidate (#668 F7), not a
+      // ONLY barrier against a symlinked candidate, not a
       // redundant check alongside some other one. A stamp can legitimately
       // describe a real, same-scope file that a later write replaced with a
       // link to a DIFFERENT (wider-scope) projection of the same agent;
@@ -660,7 +660,7 @@ function findArchiveSeedCandidate(stamp: ArchiveProjectionStamp, excludeDstPath:
  * only see the one column every row carries. The member-set half is instead
  * a claim the stamp makes about those contents, trusted because only the
  * host ever writes a session's `archive.db` or its stamp: containers mount
- * their own copy read-only (`container-runner.ts:4709`) over the read-write
+ * their own copy read-only over the read-write
  * session directory the host itself created, no other mount source in this
  * tree covers `DATA_DIR/v2-sessions/` or `DATA_DIR/projection-stamps/`
  * (`container-runner.ts`'s `mounts.push` call sites), and the storage
@@ -754,8 +754,8 @@ export function removeArchiveProjectionStamp(dstPath: string): void {
 }
 
 /**
- * 'seeded' (#667): a session with no local projection file (fresh, or
- * reclaimed — #693) had its projection copied from a same-scope sibling
+ * 'seeded': a session with no local projection file (fresh, or
+ * reclaimed) had its projection copied from a same-scope sibling
  * instead of built from the source archive, then (per
  * `sinceRowid`/`rows`) reused as-is or brought current with the normal
  * append path. Distinct from 'reused'/'appended' so production logs can tell
@@ -1027,7 +1027,7 @@ function nullSafeFold(fn: 'MIN' | 'MAX', column: string): string {
  * decision needs `COUNT(*)`/`MAX(rowid)` over the source, and a boot with ~800
  * sessions would run that query 800 times on the main thread.
  *
- * Stamp discipline is unchanged from #315 — the stamp is removed BEFORE any
+ * Stamp discipline: the stamp is removed BEFORE any
  * write and rewritten only after the write succeeds, so a crash in between
  * leaves no stamp and the next spawn rebuilds. The stamp is read from the
  * source before the rows are, which can only make it describe LESS than the
@@ -1045,11 +1045,10 @@ export function materializeArchiveProjection(
   let previous = readArchiveProjectionStamp(dstPath);
   let seededFrom: string | null = null;
 
-  // #667/#693: any session with NO LOCAL FILE is eligible for seeding —
-  // whether it never had one (a genuinely fresh session, #667) or had one
+  // Any session with NO LOCAL FILE is eligible for seeding —
+  // whether it never had one (a genuinely fresh session) or had one
   // that is gone now (the storage reclaimer deletes a quiet session's
-  // `archive.db`, `src/storage-manager.ts:1864-1884`, but never its stamp —
-  // `removeArchiveProjectionStamp` appears nowhere in that file, so a
+  // `archive.db` but never its stamp, so a
   // reclaimed session is left with an ORPHAN stamp and no file). The FILE
   // decides freshness here, not the stamp: a stamp with no file describes
   // nothing a few lines further down either — `decideArchiveProjectionMode`
@@ -1063,10 +1062,10 @@ export function materializeArchiveProjection(
   // rests on the candidate matching `sameProjectionIdentity` against the
   // freshly computed `stamp` below, plus `seedArchiveProjectionFrom`'s
   // post-copy row-label check. Discarding an orphan local stamp touches
-  // neither, so this cannot weaken the isolation boundary #668 established.
+  // neither, so this cannot weaken the seeding isolation boundary.
   if (!fs.existsSync(dstPath)) {
     // Defensive, not load-bearing: nothing downstream can currently observe
-    // whether this drop runs (#727 F1). A seed success overwrites `previous`
+    // whether this drop runs. A seed success overwrites `previous`
     // with `candidate.stamp` a few lines below; a seed failure's catch nulls
     // it too; and with no candidate at all, the orphan stamp is never reused
     // as `previous` either — `decideArchiveProjectionMode`'s own
@@ -1202,7 +1201,7 @@ export function buildCentralProjection(srcPath: string, dstPath: string, agentGr
   }
   // Same rule as both archive-projection opens, so the sidecar discipline is
   // uniform across every projection rather than resting on a reader noticing
-  // that the unlink below happens to make this one safe already (#735 P3).
+  // that the unlink below happens to make this one safe already.
   removeStaleProjectionSidecars(dstPath);
   if (fs.existsSync(dstPath)) fs.unlinkSync(dstPath);
   const dst = new Database(dstPath);

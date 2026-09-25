@@ -31,7 +31,6 @@ const REPO_ROOT = path.resolve(__dirname, '..', '..');
 export const BARE_RAW_HANDLE_FILES: ReadonlyMap<string, string> = new Map([
   ['src/db/connection.ts', 'defines getRawDb'],
   ['src/db/central-lease.ts', 'withRawDb is the sanctioned wrapper around it'],
-  ['src/db/migrations/019-mnemon-ingest-db.ts', 'sqliteOnly migration; runs inside the synchronous runner at boot'],
   ['src/host-lifecycle-seam-manifest.ts', 'names the identifier in the upstream-owned manifest'],
   ['src/main.ts', 'the boot-time migration runner call and the reconcilers it hands the same handle'],
   [

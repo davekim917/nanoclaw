@@ -1,33 +1,7 @@
 import Database from 'better-sqlite3';
-import fs from 'fs';
-import path from 'path';
-import { DATA_DIR } from '../../config.js';
 import { runMnemonRecallFeedbackMigration } from './021-mnemon-recall-feedback.js';
 import { runMnemonDaemonStateMigration } from './022-mnemon-daemon-state.js';
 import { runMnemonRecallFactContentMigration } from './023-mnemon-recall-fact-content.js';
-
-export const MNEMON_INGEST_DB_PATH = path.join(DATA_DIR, 'mnemon-ingest.db');
-
-export function openMnemonIngestDb(dbPath?: string): Database.Database {
-  // Under vitest a no-arg open resolves to the REAL data/mnemon-ingest.db.
-  // A test that triggers a lazy getRawDb() without injecting its seam
-  // (setDeadLettersDb / setMnemonStoreIngestDb / setIngestDb) then writes
-  // dead_letters and watermarks into PRODUCTION — 1,170 vitest-signature
-  // dead_letter rows (EnvironmentTeardownError) were found on 2026-07-03,
-  // some poisoning real chat pairs out of memory ingestion. Fail loud so the
-  // leaking suite is identified at the call site instead.
-  if (!dbPath && process.env.VITEST) {
-    throw new Error(
-      'openMnemonIngestDb(): refusing to open the production ingest DB under vitest — inject an in-memory DB via the module test seam or pass an explicit temp path',
-    );
-  }
-  const resolved = dbPath ?? MNEMON_INGEST_DB_PATH;
-  fs.mkdirSync(path.dirname(resolved), { recursive: true });
-  const db = new Database(resolved);
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-  return db;
-}
 
 export function runMnemonIngestMigrations(db: Database.Database): void {
   db.exec(`
@@ -108,7 +82,7 @@ export function runMnemonIngestMigrations(db: Database.Database): void {
   if (!applied.has('mnemon-ingest-counters-v2')) {
     db.transaction(() => {
       // Per-pair / per-source instrumentation columns. The chat-pair filter
-      // (classifier.ts:364) and source-ingest filter (source-ingest.ts) both
+      // (classifier.ts) and source-ingest filter (source-ingest.ts) both
       // gate at importance >= MIN_FACT_IMPORTANCE; without these counters the
       // operator can't see the drop rate by group/path. Codex F1 follow-up:
       // emitted = total facts the classifier produced (pre any filter);

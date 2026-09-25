@@ -31,7 +31,7 @@
  * lease itself. No wait cycle exists, and the re-entrancy guard below turns the
  * one shape that could produce one into an immediate throw.
  *
- * Production callers since seam 3 PR 6: the wake/write/agent-route guards and
+ * Production callers: the wake/write/agent-route guards and
  * the `guard()` consult sites, `withQuietInvalidationSync` and its callers,
  * `write-destinations.ts`, and every central transaction in the fork.
  *
@@ -350,7 +350,7 @@ export interface RawStatements {
  * load-bearing one — a statement nested inside a returned object passes this
  * type and is still inert.
  */
-export type NoLiveSqlite<T> = T extends
+type NoLiveSqlite<T> = T extends
   | Database.Database
   | Database.Statement
   | Database.Transaction
@@ -361,7 +361,7 @@ export type NoLiveSqlite<T> = T extends
   : [];
 
 /**
- * The `withRawDb` callback contract, both halves at once (#408): it may not be
+ * The `withRawDb` callback contract, both halves at once: it may not be
  * async — a promise-returning callback passes `NoLiveSqlite` (a promise is not
  * a live object) and leaves the lease released with raw work still pending —
  * and it may not hand back anything live. Checked in that order so the more
@@ -497,7 +497,7 @@ function settleStrayTransaction(
  *
  * Two throws, for two different failures. Outside a block there is no lease and
  * the statement could land inside an open driver transaction, so it is refused —
- * that makes PR 6's migration of the allowlisted sites structural rather than
+ * that makes the lease structural rather than
  * conventional. Inside a block an open transaction is unreachable by
  * construction (the lease is exclusive), so the `inTransaction` check is a belt:
  * a non-zero count in the post-restart gate means a bypass, not a race.
@@ -532,7 +532,7 @@ export function withRawDb<T>(
   try {
     result = fn(new BlockScopedRawDb(raw, blockEpoch));
     if (isThenable(result)) {
-      // An `async` callback (#408): its first statement may already have run,
+      // An `async` callback: its first statement may already have run,
       // but everything after its first await would land outside the lease.
       // The facades refuse that work at runtime; this refuses the shape.
       disownThenable(result, 'The withRawDb callback');

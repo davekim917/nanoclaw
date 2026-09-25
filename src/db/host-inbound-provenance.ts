@@ -4,8 +4,8 @@
  *
  * The table lives in the central DB (`data/v2.db`), which is host-only and
  * never mounted into a container. That is the entire point: a container can
- * create a convincing `.host/inbound.db` on the filesystem — round 2 of #761's
- * review proved it can, under the pre-deploy mount set — but it cannot write a
+ * create a convincing `.host/inbound.db` on the filesystem — review proved it
+ * can, under the pre-deploy mount set — but it cannot write a
  * row here, so "the host made this" stays unforgeable. See migration 079 for
  * why no content-based or filesystem-based test can answer that question.
  *
@@ -97,25 +97,6 @@ export async function readHostInboundProvenance(
     'readHostInboundProvenance',
   );
   return row ?? null;
-}
-
-/**
- * Does the file at `filePath` carry provenance recorded by this host?
- *
- * Fails closed on every unanswerable case: no row, or a file that cannot be
- * identified. A row whose identity does NOT match the file on disk is the
- * strongest negative of all — something replaced the file this host created.
- */
-export async function hostInboundProvenanceMatches(
-  agentGroupId: string,
-  sessionId: string,
-  filePath: string,
-): Promise<boolean> {
-  const row = await readHostInboundProvenance(agentGroupId, sessionId);
-  if (!row) return false;
-  const identity = fileIdentityOf(filePath);
-  if (!identity) return false;
-  return row.device === identity.device && row.inode === identity.inode;
 }
 
 /** Forget a session's provenance, for a session being destroyed. */

@@ -9,7 +9,7 @@ import type { Migration } from './index.js';
  * backoff cap. That mark lived only in a process-local `Map`, so every host
  * restart threw the whole cache away and the first tick after a boot swept
  * every active session — ~850 of them, a ~450 s tick, nine times in the 22
- * hours of log that #320 was filed against. This column is where the mark now
+ * hours of log examined. This column is where the mark now
  * survives the restart; `startHostSweep` warms the map from it.
  *
  * ISO-8601 UTC, the same shape as `last_active` and `last_outbound_at`, so the

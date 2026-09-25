@@ -34,8 +34,8 @@ import type { Migration } from './index.js';
  * Scoped to the LIVE statuses, `pending` AND `approved`, which together are
  * exactly the window in which a card can still take an answer. This is not
  * cosmetic: `resolveChoice` flips the row pending→approved BEFORE it awaits
- * delivery (src/modules/approvals/choices.ts:115), and puts it back to
- * `pending` when delivery throws (:138) or finds no live session (:149) —
+ * delivery, and puts it back to
+ * `pending` when delivery throws or finds no live session —
  * the card stays open and clickable the whole time.
  *
  * Covering only `pending` would drop the reservation for the entire delivery
@@ -47,8 +47,8 @@ import type { Migration } from './index.js';
  * reproduced by the reviewer).
  *
  * `expired` is deliberately NOT covered: `retireChoice` moves a row there and
- * deletes it in the same breath (choices.ts:173-176), and a resolved row is
- * deleted outright (:160), so a choiceId whose card is gone is free to be
+ * deletes it in the same breath, and a resolved row is
+ * deleted outright, so a choiceId whose card is gone is free to be
  * used again — the same rule the application-level pre-check applies.
  *
  * FAILS SOFT, NEVER CLOSED, on pre-existing duplicates. `runMigrations` runs

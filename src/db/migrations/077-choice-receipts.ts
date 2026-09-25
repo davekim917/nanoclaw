@@ -23,8 +23,7 @@ import type { Migration } from './index.js';
  * it is host-minted per approval (`appr-<ms>-<6 base36>`,
  * src/modules/approvals/primitive.ts:~410) and unique by construction.
  * `request_id` — the card's own `choice-…` id, the container's `choiceId`
- * threaded through as `pending_approvals.request_id` (see
- * src/modules/interactive/choice.ts:174) — is kept as an indexed, NOT unique
+ * threaded through as `pending_approvals.request_id` — is kept as an indexed, NOT unique
  * column: it is agent-chosen, so a compromised agent can reuse one across
  * two different cards. Keying the receipt on `request_id` let a reused
  * choiceId silently collapse two resolved approvals into one receipt (a
@@ -49,8 +48,7 @@ import type { Migration } from './index.js';
  * ONE path does delete rows, and it is not on that lifecycle: full
  * agent-group teardown. `scripts/delete-cli-agent.ts` sweeps every table
  * carrying an `agent_group_id` column, discovered generically from
- * `pragma_table_info` rather than named one by one
- * (scripts/delete-cli-agent.ts:50-59), so this table's rows for that group go
+ * `pragma_table_info` rather than named one by one, so this table's rows for that group go
  * with the group — by design: once the agent group is gone the receipts
  * attest to cards nobody can resolve back to an agent. A consumer that must
  * outlive teardown has to copy the receipt out before then.

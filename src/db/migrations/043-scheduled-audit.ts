@@ -26,7 +26,7 @@ import type { Migration } from './index.js';
  *   series_id            correlation_id so each side's audit tail is complete
  *                        without a cross-scope read.
  *   before_hash/        — sha256 of the prompt body before/after an edit
- *   after_hash           (createHash precedent, steer.ts:17). Scripts are
+ *   after_hash           (createHash precedent, steer.ts). Scripts are
  *                        hash-only — never stored verbatim.
  *   before_preview/     — first 512 chars of the prompt body before/after.
  *   after_preview        Scripts are NOT previewed (hash-only).

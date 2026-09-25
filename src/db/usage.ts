@@ -20,9 +20,9 @@
  * landed have INFLATED Claude token/cost totals — the SDK's running-total-
  * for-the-whole-stream value was recorded on every turn instead of that
  * turn's own delta, measured at 1.3-5.2x inflation. That fix left a second
- * defect in place until #1007 (2026-09-22), so EVERY Claude row before
+ * defect in place until 2026-09-22, so EVERY Claude row before
  * ./usage-trust.ts's cutoff is untrusted: the readers below return the
- * #1061 note instead of a figure for it. The stored values are never
+ * untrusted note instead of a figure for it. The stored values are never
  * rewritten.
  *
  * NOTE ON usage_daily.turns (turn-correlation fix, migration 061): a turn
@@ -70,7 +70,7 @@ export interface StoredUsageDailyRow {
 
 /**
  * A usage_daily row as readers present it. The token and cost columns are
- * NULL, and `untrusted` carries the #1061 note, for a bucket inside the
+ * NULL, and `untrusted` carries the untrusted note, for a bucket inside the
  * untrusted Claude window (./usage-trust.ts) — a stored sum there is not a
  * figure anyone may quote. `turns` stays: it counts rows, which the defect
  * never touched.
@@ -114,7 +114,7 @@ export interface UsageDailyRow {
 const PROVIDERS_WITHOUT_COST = new Set(['codex']);
 
 /** Exported so callers doing their own raw usage_daily queries (e.g. the dashboard's multi-group IN-list, which listUsageDaily's single-agentGroupId filter doesn't support) can attach the same computed flag rather than re-deriving it. */
-export function isCostApplicable(provider: string): boolean {
+function isCostApplicable(provider: string): boolean {
   return !PROVIDERS_WITHOUT_COST.has(provider);
 }
 
@@ -376,7 +376,7 @@ export async function summarizeTurnUsage(
   // the un-grouped TOTAL query always produces a row — so an empty window
   // would otherwise report `null` tokens rather than `0`.
   //
-  // Token and cost sums cover TRUSTED rows only (./usage-trust.ts, #1061);
+  // Token and cost sums cover TRUSTED rows only (./usage-trust.ts);
   // untrusted rows are counted, not summed, and `decorate` names them. `turns`
   // still counts every turn — the defect never touched turn identity — while
   // the per-turn averages divide by the trusted turns the sums came from.

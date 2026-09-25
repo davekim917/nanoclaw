@@ -13,8 +13,7 @@
  * never "abort the request" but "adopt the row the winner just wrote and
  * carry on".
  *
- * Codex found seven separate sites with that shape across three review rounds
- * on PR 411. Fixing them one at a time is how the eighth lands: the invariant
+ * Seven separate sites had that shape. Fixing them one at a time is how the eighth lands: the invariant
  * lives in a primitive, and a tripwire test (`insert-or-adopt.test.ts`) fails
  * if a new bare `createSession(` / `createMessagingGroup(` / `createAgentGroup(`
  * call appears outside one. See
@@ -32,10 +31,6 @@
  *   untouched, and a unique violation whose winner cannot be re-read rethrows
  *   the ORIGINAL error — that combination means the constraint that fired was
  *   not the one the caller's `reload` looks up, which is a bug worth seeing.
- *
- * PR 6 may move this onto the driver itself (alongside `centralTransaction`
- * in `src/db/central-lease.ts`), at which point the call sites keep this exact
- * signature.
  */
 
 /**
@@ -47,8 +42,7 @@
  * only raises `_UNIQUE` for a separate `UNIQUE` constraint/index, and the
  * PRIMARY KEY itself is exactly such an index by another name. Missing this
  * meant `insertOrAdopt` rethrew instead of adopting for any PRIMARY KEY
- * natural key (github Codex review, PR #437, src/cli/crud.ts:294 — `users`
- * declares `naturalKey: ['id']`).
+ * natural key (`users` in `cli/crud.ts` declares `naturalKey: ['id']`).
  */
 export function isUniqueViolation(err: unknown): boolean {
   if (typeof err !== 'object' || err === null) return false;

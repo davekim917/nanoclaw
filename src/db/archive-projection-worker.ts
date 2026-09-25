@@ -6,12 +6,12 @@
  * which it did (`materializeArchiveProjection`). The host thread reads nothing
  * from the 400 MB source.
  *
- * Before #315, `buildArchiveProjection` ran synchronously on the main thread on
+ * `buildArchiveProjection` used to run synchronously on the main thread on
  * every container spawn: a `GROUP BY` over an unindexed 135 MB `text` column
  * against a 414 MB source, then a row-by-row rewrite of a projection as large
- * as 238 MB. That was the dominant cause of #315 — 327 stalls in one day, p50
+ * as 238 MB. That was the dominant cause of event-loop stalls — 327 in one day, p50
  * 18.3 s, max 59.7 s, with 86% of them ending inside a container spawn. Moving
- * it off-thread removed the stall but not the work: #360 measured 435 full
+ * it off-thread removed the stall but not the work: a later measurement found 435 full
  * rebuilds against 65 reuses in a day, median 19 s and p90 28 s each, because
  * the v1 freshness stamp keyed on the whole archive file and a message for any
  * agent group invalidated every session's projection. Five of those serialized
@@ -195,7 +195,7 @@ export async function ensureArchiveProjection(
 
   const scope = workgroupMemberIds?.length ?? null;
   if (result.mode === 'seeded') {
-    // Distinct log mode (#667): production can grep this apart from ordinary
+    // Distinct log mode: production can grep this apart from ordinary
     // 'reused'/'appended' traffic to confirm a fresh session avoided the
     // full-build path.
     log.info('Archive projection seeded', {
@@ -265,6 +265,3 @@ onHostShutdown(async function archiveProjectionHostShutdown() {
 export function __setArchiveProjectionWorkerFactoryForTest(factory: ArchiveProjectionWorkerFactory | null): void {
   sharedWorker = factory ? new ArchiveProjectionWorker(factory) : new ArchiveProjectionWorker();
 }
-
-/** Exported for tests that need to distinguish an infrastructure fault from a build failure. */
-export const __test = { WorkerUnavailableError };

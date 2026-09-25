@@ -7,7 +7,7 @@
 import { getDb } from './connection.js';
 
 /** A key unused for this long is treated as absent, and pruned on the next record. */
-export const THREAD_KEY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const THREAD_KEY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
  * The accepted `threadKey` shape. The runner's `send_message`/`send_file`
@@ -90,7 +90,7 @@ export async function touchThreadKeyAnchor(addr: ThreadKeyAddress, nowIso: strin
   );
 }
 
-export async function pruneThreadKeyAnchors(nowIso: string): Promise<void> {
+async function pruneThreadKeyAnchors(nowIso: string): Promise<void> {
   await getDb().run(
     'DELETE FROM thread_key_anchors WHERE datetime(last_used_at) < datetime(?)',
     retentionCutoff(nowIso),

@@ -84,7 +84,7 @@ export function getShipLog(agentGroupId: string, limit = 50): Promise<ShipLogEnt
 
 /**
  * COUNT and page as two sequential awaits, deliberately NOT a
- * `centralTransaction`. Under PR 6 the pair sat in one synchronous lease
+ * `centralTransaction`. The pair once sat in one synchronous lease
  * block, so a concurrent insert could not land between them; now it can, and
  * `total` may exceed what `data` shows by one row for one render. That skew is
  * cosmetic, no writer reads either value back, and neither paginated helper has

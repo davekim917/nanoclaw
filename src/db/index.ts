@@ -1,5 +1,4 @@
-export { initDb, initTestDb, getDb, getRawDb, closeDb, hasTable, hasTableRaw } from './connection.js';
-export type { DbConfig, DbDriver, DbInitOptions, RunResult } from './driver.js';
+export { initDb, initTestDb, getDb, getRawDb, closeDb } from './connection.js';
 export { runMigrations } from './migrations/index.js';
 export {
   createAgentGroup,
@@ -13,14 +12,11 @@ export {
   createMessagingGroup,
   getMessagingGroup,
   getMessagingGroupByPlatform,
-  getAllMessagingGroups,
-  getMessagingGroupsByChannel,
   updateMessagingGroup,
   deleteMessagingGroup,
   createMessagingGroupAgent,
   getMessagingGroupAgents,
   getMessagingGroupAgent,
-  getMessagingGroupAgentByPair,
   updateMessagingGroupAgent,
   deleteMessagingGroupAgent,
 } from './messaging-groups.js';
@@ -28,7 +24,6 @@ export {
   createSession,
   getSession,
   findSession,
-  findSessionByAgentGroup,
   getSessionsByAgentGroup,
   getActiveSessions,
   getRunningSessions,
@@ -38,55 +33,8 @@ export {
   createPendingQuestion,
   getPendingQuestion,
   deletePendingQuestion,
-  createPendingApproval,
-  getPendingApproval,
-  updatePendingApprovalStatus,
-  deletePendingApproval,
-  getPendingApprovalsByAction,
 } from './sessions.js';
-export {
-  addShipLogEntry,
-  getShipLog,
-  getShipLogPaginated,
-  getShipLogSince,
-  getBacklogItemById,
-  addBacklogItem,
-  updateBacklogItem,
-  deleteBacklogItem,
-  getBacklog,
-  getBacklogPaginated,
-  getBacklogResolvedSince,
-  getCommitDigestState,
-  upsertCommitDigestState,
-  type ShipLogEntry,
-  type BacklogItem,
-  type CommitDigestState,
-} from './backlog.js';
-export {
-  getContainerConfig,
-  getAllContainerConfigs,
-  createContainerConfig,
-  ensureContainerConfig,
-  updateContainerConfigScalars,
-  updateContainerConfigJson,
-  deleteContainerConfig,
-} from './container-configs.js';
-export {
-  recordChoiceReceipt,
-  getChoiceReceipt,
-  getChoiceReceiptsByRequestId,
-  type ChoiceReceipt,
-  type ChoiceReceiptRow,
-} from './choice-receipts.js';
-export {
-  listDeniedModels,
-  getDeniedModel,
-  isDeniedModel,
-  addDeniedModel,
-  removeDeniedModel,
-  type DeniedModel,
-} from './denied-models.js';
-
+export { getContainerConfig, ensureContainerConfig } from './container-configs.js';
 import { getRawDb as rawHandleForMigrations, initTestDb as openTestDb } from './connection.js';
 import { runMigrations as applyAllMigrations } from './migrations/index.js';
 

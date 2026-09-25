@@ -21,14 +21,14 @@ export function getDb(): DbDriver {
  * `sqliteRaw` is upstream's own escape hatch (`drivers/sqlite.ts`, used by its
  * migration runner for `sqliteOnly` migrations), so this is upstream-sanctioned
  * rather than a bypass. It exists because the fork's call sites are all
- * synchronous today and convert leaf-by-leaf across seam 3 (PRs 3-5); it is
- * DELETED in PR 6 once the last one is async.
+ * synchronous and convert leaf-by-leaf; it is
+ * deleted once the last one is async.
  *
  * The set of files importing it is pinned by `src/db/raw-db-ratchet.test.ts`:
  * entries may be removed, never added. A raw statement bypasses the driver's
  * `activeTransaction` gate, so it is only safe while the fork opens ZERO driver
  * transactions — which is why every fork transaction stays a raw synchronous
- * `db.transaction(() => …)()` closure until PR 6 lands the central lease
+ * `db.transaction(() => …)()` closure
  * (docs/specs/upstream-async-central-db-seam/plan.md §4.1).
  */
 export function getRawDb(): Database.Database {
@@ -75,8 +75,8 @@ export async function initDb(
  * `foreign_keys = ON`): `compose.ts` additionally sets `journal_mode = WAL`,
  * which SQLite ignores for an in-memory database. Upstream's
  * `prepareTestSchema` branch is omitted — `SqliteDriver` does not implement that
- * hook, so it is dead code here, and the fork's `runMigrations` is still
- * synchronous until PR 2.
+ * hook, so it is dead code here, and the fork's `runMigrations` is
+ * synchronous.
  */
 export async function initTestDb(): Promise<DbDriver> {
   return initDb(':memory:', { role: 'test' });
@@ -97,23 +97,4 @@ export async function closeDb(): Promise<void> {
  */
 export async function hasTable(db: DbDriver, name: string): Promise<boolean> {
   return db.hasTable(name);
-}
-
-/**
- * TRANSITIONAL synchronous `hasTable` — the fork's pre-seam body, renamed.
- *
- * The async `hasTable` above cannot be dropped into the fork's call sites: they
- * are all `if (!hasTable(...))` truthiness guards, and `!promise` is always
- * `false`, so every module-degradation guard would invert silently. The sites
- * convert with their owning leaf in PR 4; this function goes with the last one.
- *
- * Cheap: a single indexed lookup on sqlite_master. Results are not cached — a
- * module install adds the table at runtime (next service start), and callers may
- * run before or after that boundary.
- */
-export function hasTableRaw(db: Database.Database, name: string): boolean {
-  const row = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1`).get(name) as
-    | { '1': number }
-    | undefined;
-  return row !== undefined;
 }

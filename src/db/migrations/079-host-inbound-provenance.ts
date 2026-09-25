@@ -4,10 +4,10 @@ import type { Migration } from './index.js';
 /**
  * Migration 079 — `host_inbound_provenance`
  *
- * WHY. #749 moved the host's `inbound.db` into `<session>/.host/` and overlaid
- * that DIRECTORY read-only, which closes the planted-journal class for every
+ * WHY. Moving the host's `inbound.db` into `<session>/.host/` and overlaying
+ * that DIRECTORY read-only closes the planted-journal class for every
  * container spawned under the new mount set. It does not answer the reverse
- * question, and round 2 of the review proved the gap: under the PRE-deploy
+ * question, and review proved the gap: under the PRE-deploy
  * mount set `/workspace` is read-write and `.host` does not exist, so nothing
  * is overlaid over it, and a container can simply `mkdir /workspace/.host` and
  * write its own `inbound.db` there. At that session's next spawn the migration

@@ -13,7 +13,7 @@
  * dedupe, so a second steer resolves to the first thread and posts into it.
  *
  * Keyed by (workgroup_id, item_id), not item_id alone: board item ids are
- * repo-scoped strings the release watcher publishes ("XZO#869"), and two
+ * repo-scoped strings the release watcher publishes ("<REPO>#<number>"), and two
  * workgroups working the same repo would otherwise share one row and post into
  * each other's threads.
  *
