@@ -91,8 +91,8 @@ Note: auto-created agents default to `all` secret mode — every vault secret wh
 **v1:** native adapters (e.g. `discord.js` used directly) imported in `src/channels/`. Installing a channel meant editing code, adding a dependency, and setting env vars.
 
 **v2:** channel adapters live on a sibling `channels` branch. Each `/add-<channel>` skill:
-1. `git fetch origin channels`
-2. `git show channels:src/channels/<name>.ts > src/channels/<name>.ts`
+1. `git fetch <remote> channels`, where `<remote>` is what `setup/lib/channels-remote.sh` resolves
+2. `git show <remote>/channels:src/channels/<name>.ts > src/channels/<name>.ts`
 3. Appends `import './<name>.js';` to `src/channels/index.ts`
 4. `pnpm install @chat-adapter/<name>@<pinned>`
 5. `pnpm run build`

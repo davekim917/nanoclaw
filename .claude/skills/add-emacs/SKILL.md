@@ -33,18 +33,25 @@ Otherwise continue. Every step below is safe to re-run.
 
 ### 1. Fetch the channels branch
 
+The branch comes from the registry remote `setup/lib/channels-remote.sh`
+resolves, not necessarily `origin`:
+
 ```bash
-git fetch origin channels
+source setup/lib/channels-remote.sh
+remote=$(resolve_channels_remote)
+git fetch "$remote" channels
 ```
 
 ### 2. Copy the adapter and Lisp client
 
 ```bash
+source setup/lib/channels-remote.sh
+remote=$(resolve_channels_remote)
 mkdir -p emacs
-git show origin/channels:src/channels/emacs.ts                    > src/channels/emacs.ts
-git show origin/channels:src/channels/emacs.test.ts              > src/channels/emacs.test.ts
-git show origin/channels:src/channels/emacs-registration.test.ts > src/channels/emacs-registration.test.ts
-git show origin/channels:emacs/nanoclaw.el                        > emacs/nanoclaw.el
+git show "$remote/channels:src/channels/emacs.ts"                    > src/channels/emacs.ts
+git show "$remote/channels:src/channels/emacs.test.ts"              > src/channels/emacs.test.ts
+git show "$remote/channels:src/channels/emacs-registration.test.ts" > src/channels/emacs-registration.test.ts
+git show "$remote/channels:emacs/nanoclaw.el"                        > emacs/nanoclaw.el
 ```
 
 ### 3. Append the self-registration import

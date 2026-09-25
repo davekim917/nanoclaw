@@ -68,7 +68,7 @@ Rule of thumb: aim for skills that are almost all "adds." Not 100%; some reach-i
 
 The files a skill adds live in the skill's own folder, and the skill copies them into the project when it runs. The skill is self-contained.
 
-The exception is skills that plug into a registry: channels and providers. Their code is larger, multi-file, and has to stay in sync with the core as it changes over time. That code lives on a long-lived **registry branch** (`channels`, `providers`) that we forward-merge against main, and the skill fetches it from there (`git show origin/channels:path > path`). A frozen copy in a skill folder would go stale.
+The exception is skills that plug into a registry: channels and providers. Their code is larger, multi-file, and has to stay in sync with the core as it changes over time. That code lives on a long-lived **registry branch** (`channels`, `providers`) that we forward-merge against main, and the skill fetches it from there (`git show <remote>/channels:path > path`, where `<remote>` is what `setup/lib/channels-remote.sh` resolves). A frozen copy in a skill folder would go stale.
 
 This fetch is **additive, never a merge**. The skill copies in the files it needs; it does *not* `git merge` the branch. Merging a registry branch into a customized install is exactly the conflict fight this model exists to avoid. A skill's **tests live on the branch alongside its code** and are fetched the same way; a channel's adapter travels with its registration test. A provider is the multi-point case: its code spans the host *and* container trees plus a Dockerfile edit, so it fetches files into both trees and ships a registration test per tree. See the provider archetype in [skill-guidelines.md](skill-guidelines.md).
 

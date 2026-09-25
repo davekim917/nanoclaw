@@ -48,7 +48,7 @@ Add a messaging channel or an agent provider. The SKILL.md contains the install 
 
 **How they work:**
 1. User runs `/add-telegram`
-2. Claude follows the SKILL.md: `git fetch origin channels`, then copies each file in with `git show origin/channels:<path> > <path>`. Install is an additive fetch, never a `git merge`.
+2. Claude follows the SKILL.md: fetches `channels` from the registry remote `setup/lib/channels-remote.sh` resolves (the `nanocoai/nanoclaw` remote, usually `upstream` on a fork), then copies each file in with `git show <remote>/channels:<path> > <path>`. Install is an additive fetch, never a `git merge`.
 3. The adapter's registration test is fetched the same way and run as verification
 4. Claude walks through interactive setup (tokens, bot creation, etc.)
 
