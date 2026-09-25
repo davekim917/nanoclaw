@@ -4,6 +4,8 @@ import path from 'node:path';
 import { parse } from 'yaml';
 import { describe, expect, it } from 'vitest';
 
+import { matchesAnyGlob } from './review-outcomes.js';
+
 /**
  * Drift guard for .github/labeler.yml: `risk:high` is documented as the union of
  * every dimension label's globs (risk:guard, risk:message-path, ...), and the
@@ -78,6 +80,15 @@ describe('labeler.yml dimension labels stay in sync with risk:high', () => {
     expect(highGlobs.has('coverage-risk-baseline.json')).toBe(true);
     expect(globsFor(config, 'risk:gates')).toContain('coverage-risk-baseline.json');
   });
+
+  // A PR that loosens the test-weakening trigger, or turns it off, is itself reviewed.
+  it.each(['container/skills/pr-review-loop/scripts/test-weakening.mjs', '.github/pr-review-loop.json'])(
+    'protects the test-weakening trigger and its opt-in: %s',
+    (file) => {
+      expect(matchesAnyGlob(file, [...highGlobs])).toBe(true);
+      expect(matchesAnyGlob(file, globsFor(config, 'risk:gates'))).toBe(true);
+    },
+  );
 });
 
 describe('globsFor', () => {

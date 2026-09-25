@@ -166,6 +166,17 @@ by what the change supersedes, or `Replaces: nothing`. merge-check reads it
 from the body at merge time, the same way, and the reviewer verifies the
 claim: the replaced code is gone in the same PR.
 
+A repo whose base branch sets `"testWeakening"` in the same file to `enforce`
+has merge-check compare the tests a PR already had, at its merge base, with
+the same tests at its head (`test-weakening.mjs`, syntax-aware for TypeScript
+and JavaScript; formatting and unchanged moves do not count). A removed or
+changed assertion, a removed case or `.each` row, an added `.skip`, `.todo`,
+`.fails`, `.skipIf` or `.runIf`, a changed fixture, helper or test config, and
+any test it cannot analyse make the head a review, test-only PRs included;
+a `.only` refuses the merge. The PR body then states, per change, the evidence
+that the test still catches what it did. `report` prints the same answer on
+stderr and changes nothing; absent or `off` does nothing.
+
 ## The test is blocking, not correctness
 
 Most findings should not stop a merge, including real ones. Review exists to

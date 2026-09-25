@@ -657,6 +657,75 @@ replaces_refusal() {
     "$REVIEW_LOOP_CONFIG" "${SCOPE_BASE_REF:-the base branch}"
 }
 
+# The test-weakening trigger (test-weakening.mjs): `off` unless the base
+# commit scope_eval resolved sets testWeakening in REVIEW_LOOP_CONFIG to
+# `report` (print what it finds, change nothing) or `enforce` (a finding makes
+# the verdict review; a `.only` refuses the merge). Non-zero when the config
+# cannot be read or holds another value.
+TEST_WEAKENING_JS="$HERE/test-weakening.mjs"
+TEST_WEAKENING_HOWTO="Get the review for this head (request one, or an approving substitute receipt), and state in the PR body, for each change named here, the evidence that the test still catches what it caught before"
+test_weakening_mode() {
+  local config status=0
+  config=$(base_file "$SCOPE_BASE" "$REVIEW_LOOP_CONFIG") || status=$?
+  case "$status" in
+    0)
+      printf '%s' "$config" | jq -er '
+        if type != "object" then error("not a JSON object")
+        elif has("testWeakening") | not then "off"
+        elif .testWeakening | IN("off", "report", "enforce") then .testWeakening
+        else error("testWeakening is not off, report or enforce") end'
+      ;;
+    3) echo off ;;
+    *) return 1 ;;
+  esac
+}
+
+# Runs the trigger on comparison $1 once scope_eval has a verdict. In enforce
+# mode a finding, or no answer from the detector, makes the verdict review and
+# says why in SCOPE_REASON; a `.only` also sets SCOPE_TEST_REFUSAL, which
+# merge-check and audit refuse on whatever else holds. Report mode prints the
+# same answer on stderr and leaves the verdict alone.
+SCOPE_TEST_REFUSAL=""
+test_weakening_eval() {
+  local mode node_bin result="" verdict summary
+  mode=$(test_weakening_mode) || {
+    add_review_reason "fail closed: could not read testWeakening from $REVIEW_LOOP_CONFIG at $SCOPE_BASE as off, report or enforce"
+    return 0
+  }
+  [ "$mode" != off ] || return 0
+  if node_bin=$(runtime); then
+    result=$(printf '%s' "$1" | "$node_bin" "$TEST_WEAKENING_JS" "$REPO" "$SCOPE_HEAD") || result=""
+  fi
+  verdict=$(printf '%s' "$result" | jq -er '.verdict | select(IN("clean", "review", "refuse"))' 2>/dev/null) || verdict=""
+  summary=$(printf '%s' "$result" | jq -er '.summary | strings' 2>/dev/null) || summary=""
+  if [ "$mode" = report ]; then
+    case "$verdict" in
+      clean) echo "test-weakening (report only): no weakening found" >&2 ;;
+      review) echo "test-weakening (report only, not enforced): would require review: $summary" >&2 ;;
+      refuse) echo "test-weakening (report only, not enforced): would refuse: $summary" >&2 ;;
+      *) echo "test-weakening (report only): the detector gave no verdict" >&2 ;;
+    esac
+    return 0
+  fi
+  case "$verdict" in
+    clean) return 0 ;;
+    review | refuse) summary="test changes need review: $summary. $TEST_WEAKENING_HOWTO" ;;
+    *) summary="fail closed: the test-weakening check gave no verdict" ;;
+  esac
+  [ "$verdict" != refuse ] || SCOPE_TEST_REFUSAL=$(printf '%s' "$result" | jq -r .summary)
+  add_review_reason "$summary"
+}
+
+# A skip verdict's reason is replaced, a review's extended.
+add_review_reason() {
+  if [ "$SCOPE_VERDICT" = skip ]; then SCOPE_REASON="$1"; else SCOPE_REASON="$SCOPE_REASON; $1"; fi
+  SCOPE_VERDICT=review
+}
+
+test_only_refusal() {
+  printf "a test file this PR touches marks a case .only, which runs it alone and silently skips the rest: %s. Remove the .only and push again" "$SCOPE_TEST_REFUSAL"
+}
+
 # Reviewer eligibility is a tier rule stated as a DENYLIST: any model may write
 # or unlock a receipt unless its id names a small tier. There is deliberately no
 # list of approved models — vendors ship new frontier models constantly, and an
@@ -831,6 +900,7 @@ base_tip() {
 scope_eval() {
   local pr_json base files after decision
   SCOPE_FILES=null
+  SCOPE_TEST_REFUSAL=""
   pr_json=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,baseRefName,labels) || return 1
   pr_json=$(labels_as_of "$pr_json") || return 1
   SCOPE_HEAD=$(printf '%s' "$pr_json" | jq -er .headRefOid) || return 1
@@ -920,6 +990,7 @@ scope_eval() {
   SCOPE_VERDICT=$(printf '%s' "$decision" | jq -er .verdict) || return 1
   SCOPE_REASON=$(printf '%s' "$decision" | jq -er .reason) || return 1
   SCOPE_FILES=$(printf '%s' "$decision" | jq -c .files) || return 1
+  test_weakening_eval "$files"
 }
 
 # merge-check's last read before it allows a merge. `gh pr merge
@@ -1975,6 +2046,10 @@ merge_check_main() {
       exit 1
       ;;
   esac
+  if [ -n "$SCOPE_TEST_REFUSAL" ]; then
+    echo "merge=refused head=$SCOPE_HEAD: $(test_only_refusal)" >&2
+    exit 24
+  fi
   # No branch protection holds this line, so merge-check does, whatever the
   # verdict: every check run on exactly this head, completed green.
   ci=$(ci_verdict "$SCOPE_HEAD") || exit 1
@@ -2905,6 +2980,10 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
         exit 1
         ;;
     esac
+    if [ -n "$SCOPE_TEST_REFUSAL" ]; then
+      echo "audit=violation $where: it merged with a .only in a test file it touched: $SCOPE_TEST_REFUSAL"
+      exit 28
+    fi
     ci=$(ci_verdict "$audit_head") || { echo "audit=error $where: could not read CI on the head" >&2; exit 1; }
     case "$ci" in
       '') ;;

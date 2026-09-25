@@ -152,6 +152,22 @@ if [ -n "$rest" ]; then
       echo 'gh: Not Found (HTTP 404)' >&2
       exit 1
       ;;
+    */contents/*\\?ref=*)
+      # content--<ref>--<path, each / as __> is that file at that ref; a .error marker fails the read.
+      ref="\${rest##*ref=}"
+      file="\${rest#*/contents/}"
+      file="\${file%%\\?*}"
+      file="$MOCK_DIR/content--$ref--\${file//\\//__}"
+      if [ -f "$file.error" ]; then
+        echo '{"message":"Server Error","status":"500"}'
+        echo 'gh: Server Error (HTTP 500)' >&2
+        exit 1
+      fi
+      if [ -f "$file" ]; then cat "$file"; exit 0; fi
+      echo '{"message":"Not Found","status":"404"}'
+      echo 'gh: Not Found (HTTP 404)' >&2
+      exit 1
+      ;;
     */actions/runs/*/attempts/*/jobs\\?*)
       # jobs--<run id>--attempt-<n>.json is that attempt's jobs page. A run
       # with no attempt pages at all is a single-attempt run, and its
@@ -703,6 +719,10 @@ function runHelper(root: string, args: string[], env: Record<string, string> = {
   fs.writeFileSync(
     path.join(bin, 'node'),
     `#!/usr/bin/env bash
+if [[ "\${1:-}" == */test-weakening.mjs ]]; then
+  printf 'node %s\\n' "$*" >> "$MOCK_CALLS"
+  exec "$MOCK_REAL_NODE" "$@"
+fi
 cat >/dev/null
 printf 'node %s\\n' "$*" >> "$MOCK_CALLS"
 echo '{"status":"pass"}'
@@ -737,6 +757,7 @@ exit 64
       REVIEW_ROUND_CAP: '',
       CODEX_REVIEW_REQUIRED_WORKFLOWS: '',
       CODEX_REVIEW_HOST_CI_POSTERS: 'fleet-bot',
+      MOCK_REAL_NODE: process.execPath,
       ...env,
     },
   });
@@ -2707,6 +2728,150 @@ describe('codex-review risk-scoped review requests', () => {
       expect(result.stdout).not.toContain('merge=allowed');
     });
   });
+
+  describe('the test-weakening trigger, applied only where the base branch opts in', () => {
+    const MERGE_BASE = '6666666666666666666666666666666666666666';
+    const TEST_FILE = 'src/adder.test.ts';
+    const BEFORE = "describe('adder', () => {\n  it('adds', () => {\n    expect(add(1, 2)).toBe(3);\n  });\n});\n";
+    const WEAKENED = BEFORE.replace('.toBe(3)', '.toBeDefined()');
+    const REFORMATTED = 'describe("adder", () => {\n  it("adds", () => { expect(add(1, 2)).toBe(3) });\n});\n';
+    const FOCUSED = BEFORE.replace("it('adds'", "it.only('adds'");
+    const FINDING = `${TEST_FILE} › adder › adds: 1 assertion removed or changed, e.g. expect(add(1, 2)).toBe(3)`;
+    const HOWTO =
+      'Get the review for this head (request one, or an approving substitute receipt), and state in the PR body';
+
+    // A PR changing TEST_FILE alone, from BEFORE at the merge base to `after` at HEAD.
+    function weakeningFixture(
+      root: string,
+      opts: { reviewLoop?: string; after?: string; comments?: Page[]; unreadable?: boolean },
+    ): void {
+      scopeFixture(root, {
+        labels: [],
+        files: [changedFile(TEST_FILE)],
+        reviewLoop: opts.reviewLoop,
+        comments: opts.comments,
+      });
+      for (const base of [BASE_OID, 'main', STALE_BASE])
+        writeJson(root, `compare--${base}...${HEAD}.json`, {
+          status: 'ahead',
+          merge_base_commit: { sha: MERGE_BASE },
+          files: [changedFile(TEST_FILE)],
+        });
+      const name = TEST_FILE.replaceAll('/', '__');
+      fs.writeFileSync(path.join(root, `content--${MERGE_BASE}--${name}`), BEFORE);
+      fs.writeFileSync(path.join(root, `content--${HEAD}--${name}`), opts.after ?? WEAKENED);
+      if (opts.unreadable) fs.writeFileSync(path.join(root, `content--${HEAD}--${name}.error`), '');
+    }
+
+    it.each([
+      ['has no .github/pr-review-loop.json', undefined],
+      ['does not set testWeakening', '{ "requireReplacesLine": false }\n'],
+      ['sets testWeakening to off', '{ "testWeakening": "off" }\n'],
+    ])('merges a weakened test on green CI exactly as before when the base %s', (_case, reviewLoop) => {
+      const root = tempRoot();
+      weakeningFixture(root, { reviewLoop });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`merge=allowed head=${HEAD} mode=risk-scoped verdict=skip ci=green`);
+      expect(result.stderr).not.toContain('test-weakening');
+      expect(result.calls).not.toContain('test-weakening.mjs');
+      expect(result.calls).not.toContain(`/contents/src/`);
+    });
+
+    it('makes a weakened test a review, naming the file, the case and the change, and how to proceed', () => {
+      const root = tempRoot();
+      weakeningFixture(root, { reviewLoop: '{ "testWeakening": "enforce" }\n' });
+
+      const scope = runHelper(root, ['scope']);
+      expect(scope.status).toBe(0);
+      expect(JSON.parse(scope.stdout)).toMatchObject({ verdict: 'review' });
+      expect(JSON.parse(scope.stdout).reason).toBe(
+        `test changes need review: ${FINDING}. ${HOWTO}, for each change named here, the evidence that the test still catches what it caught before`,
+      );
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain(
+        `merge=refused head=${HEAD} verdict=review: no review of this head was requested`,
+      );
+      expect(result.stderr).toContain(FINDING);
+      expect(result.stderr).toContain(HOWTO);
+      expect(result.calls).toContain(`rest repos/example/repository/contents/${TEST_FILE}?ref=${MERGE_BASE}\n`);
+      expect(result.calls).toContain(`rest repos/example/repository/contents/${TEST_FILE}?ref=${HEAD}\n`);
+    });
+
+    it('merges a weakened test once a substitute receipt for the head approves it', () => {
+      const root = tempRoot();
+      weakeningFixture(root, {
+        reviewLoop: '{ "testWeakening": "enforce" }\n',
+        comments: [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z')],
+      });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`merge=allowed head=${HEAD} mode=risk-scoped verdict=review`);
+    });
+
+    it('merges a test change that is formatting only on green CI', () => {
+      const root = tempRoot();
+      weakeningFixture(root, { reviewLoop: '{ "testWeakening": "enforce" }\n', after: REFORMATTED });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`merge=allowed head=${HEAD} mode=risk-scoped verdict=skip ci=green`);
+    });
+
+    it('refuses a .only outright, even with an approving receipt', () => {
+      const root = tempRoot();
+      weakeningFixture(root, {
+        reviewLoop: '{ "testWeakening": "enforce" }\n',
+        after: FOCUSED,
+        comments: [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z')],
+      });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain(
+        `merge=refused head=${HEAD}: a test file this PR touches marks a case .only, which runs it alone and silently skips the rest: ${TEST_FILE} › adder › adds: .only runs this case alone and skips the rest. Remove the .only and push again`,
+      );
+    });
+
+    it('only reports in report mode, leaving the verdict and the merge as they were', () => {
+      const root = tempRoot();
+      weakeningFixture(root, { reviewLoop: '{ "testWeakening": "report" }\n', after: FOCUSED });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`merge=allowed head=${HEAD} mode=risk-scoped verdict=skip ci=green`);
+      expect(result.stderr).toContain('test-weakening (report only, not enforced): would refuse: ');
+    });
+
+    it('requires review, never a pass, when a test file cannot be read', () => {
+      const root = tempRoot();
+      weakeningFixture(root, { reviewLoop: '{ "testWeakening": "enforce" }\n', unreadable: true });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain(
+        `${TEST_FILE} › (whole file): not analysed (could not read ${TEST_FILE} at ${HEAD})`,
+      );
+    });
+
+    it.each([
+      ['an unknown mode', '{ "testWeakening": "on" }\n'],
+      ['a boolean', '{ "testWeakening": true }\n'],
+    ])('fails closed to review when testWeakening is %s', (_case, reviewLoop) => {
+      const root = tempRoot();
+      weakeningFixture(root, { reviewLoop, after: REFORMATTED });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain('fail closed: could not read testWeakening from .github/pr-review-loop.json');
+      expect(result.calls).not.toContain('test-weakening.mjs');
+    });
+  });
+
 
   it.each([
     [
@@ -4851,6 +5016,28 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
     );
     expect(result.calls).toContain(
       `rest repos/example/repository/contents/.github/pr-review-loop.json?ref=${MERGE_PARENT}\n`,
+    );
+  });
+
+  it('flags a merge that carried a .only into a test file, where the commit it merged onto enforced the trigger', () => {
+    const root = tempRoot();
+    const file = 'src/adder.test.ts';
+    auditFixture(root, { labels: [], files: [changedFile(file)] });
+    writeJson(root, `compare--${MERGE_PARENT}...${HEAD}.json`, {
+      status: 'ahead',
+      merge_base_commit: { sha: MERGE_PARENT },
+      files: [changedFile(file)],
+    });
+    fs.writeFileSync(path.join(root, `review-loop--${MERGE_PARENT}.json`), '{ "testWeakening": "enforce" }\n');
+    const suite = (it: string) =>
+      `describe('adder', () => {\n  ${it}('adds', () => {\n    expect(add(1, 2)).toBe(3);\n  });\n});\n`;
+    fs.writeFileSync(path.join(root, `content--${MERGE_PARENT}--src__adder.test.ts`), suite('it'));
+    fs.writeFileSync(path.join(root, `content--${HEAD}--src__adder.test.ts`), suite('it.only'));
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain(
+      `audit=violation pr=1 head=${HEAD} base=${MERGE_PARENT} merged=${MERGED_AT} verdict=review: it merged with a .only in a test file it touched: ${file} › adder › adds`,
     );
   });
 
