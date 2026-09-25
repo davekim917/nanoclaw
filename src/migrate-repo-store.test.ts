@@ -41,9 +41,15 @@ const TSX_BIN = (() => {
     return 'npx';
   }
 })();
-// npx (last-resort fallback) needs the package name as its first arg; a
-// direct tsx binary does not.
-function tsxArgs(args: string[]): string[] {
+/**
+ * Arguments that make tsx evaluate `source` as an ES module. `tsx -e` defaults
+ * to CommonJS, which cannot load an ESM-only package such as `chat` (its
+ * `exports` offer only an `import` condition); the scripts these children
+ * import run as ESM in production (`"type": "module"`). npx, the last-resort
+ * fallback, needs the package name as its first argument.
+ */
+function tsxEvalArgs(source: string): string[] {
+  const args = ['--input-type=module', '-e', source];
   return TSX_BIN.endsWith('npx') ? ['tsx', ...args] : args;
 }
 
@@ -1093,7 +1099,7 @@ describe('lossless server-wide repository migration', () => {
     ].join('\n');
     let crashStatus: number | undefined;
     try {
-      execFileSync(TSX_BIN, tsxArgs(['-e', crashChild]), {
+      execFileSync(TSX_BIN, tsxEvalArgs(crashChild), {
         cwd: process.cwd(),
         env: {
           ...process.env,
@@ -1146,7 +1152,7 @@ describe('lossless server-wide repository migration', () => {
       'fs.writeFileSync(process.env.DESCRIPTOR_FILE!, `${JSON.stringify(descriptor, null, 2)}\\n`, { mode: 0o600 });',
       'loadMigrationDescriptor(process.env.DESCRIPTOR_FILE!, process.env.MIGRATION_DATA_DIR!);',
     ].join('\n');
-    execFileSync(TSX_BIN, tsxArgs(['-e', descriptorChild]), {
+    execFileSync(TSX_BIN, tsxEvalArgs(descriptorChild), {
       cwd: process.cwd(),
       env: {
         ...process.env,
@@ -1480,7 +1486,7 @@ describe('lossless server-wide repository migration', () => {
       ].join('\n');
       let status: number | undefined;
       try {
-        execFileSync(TSX_BIN, tsxArgs(['-e', child]), {
+        execFileSync(TSX_BIN, tsxEvalArgs(child), {
           cwd: process.cwd(),
           env: {
             ...process.env,
