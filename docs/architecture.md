@@ -678,7 +678,7 @@ The DB layer is split by entity rather than kept in one monolithic file:
 ```
 src/db/
   connection.ts              ← singleton, init, WAL mode
-  schema.ts                  ← CREATE TABLE statements (current state, for reference)
+  schema.ts                  ← session DB schemas (INBOUND_SCHEMA / OUTBOUND_SCHEMA)
   migrations/
     index.ts                 ← runner: checks version, applies pending
     001-initial.ts           ← initial schema

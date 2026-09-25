@@ -2,7 +2,7 @@
 
 Complete reference for `data/v2.db`, the host-owned admin-plane database. Start with [db.md](db.md) for the three-DB overview, the map, and the cross-mount rules.
 
-Access layer: `src/db/`. `src/db/schema.ts`'s `SCHEMA` constant is a _reference copy_ of the core tables for orientation — it is not exhaustive: several tables (`agent_destinations`, `pending_approvals`, `container_configs`, `agent_message_policies`, `pending_channel_approvals`, and others) exist only in their migration files under `src/db/migrations/`, which remain the actual source of truth for what's created at runtime.
+Access layer: `src/db/`. The schema's source of truth is the numbered migration files under `src/db/migrations/`: each table is created, and later altered, by the migration that introduced it.
 
 ---
 
