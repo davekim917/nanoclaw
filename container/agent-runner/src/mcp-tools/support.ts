@@ -14,6 +14,7 @@
 import { writeMessageOut } from '../db/messages-out.js';
 import type { WriteMessageOut } from '../db/messages-out.js';
 import { registerTools } from './server.js';
+import { err, log, ok } from './tool-helpers.js';
 import { describeTriage, triageSupportEmail } from './support-triage.js';
 import type { SupportTriage } from './support-triage.js';
 import type { McpToolDefinition } from './types.js';
@@ -24,18 +25,6 @@ type SupportActionWriteDependencies = {
   write?: (message: WriteMessageOut) => number | Promise<number>;
   sleep?: (ms: number) => Promise<void>;
 };
-
-function log(msg: string): void {
-  console.error(`[mcp-tools] ${msg}`);
-}
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
-
-function err(text: string) {
-  return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true };
-}
 
 function isTransientSqliteLock(error: unknown): boolean {
   if (!(error instanceof Error)) return false;

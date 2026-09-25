@@ -754,12 +754,13 @@ describe('writeCodexHooksAndTrust', () => {
   });
 
   it('is what the codex provider calls at every hooks.json write', () => {
-    // Four call sites: the pre-spawn write and three OAuth-rotation rewrites.
-    // A bare `writeCodexHooksJson()` at any of them writes the guard chain into
-    // a home with no trust entries, where it loads and never fires.
+    // Two call sites: the pre-spawn write and `restartAppServer`, which every
+    // recovery and OAuth-rotation branch goes through. A bare
+    // `writeCodexHooksJson()` at either writes the guard chain into a home with
+    // no trust entries, where it loads and never fires.
     const source = fs.readFileSync(new URL('./providers/codex.ts', import.meta.url), 'utf8');
     expect(source).not.toMatch(/\bwriteCodexHooksJson\s*\(/);
-    expect(source.match(/\bwriteCodexHooksAndTrust\s*\(/g)).toHaveLength(4);
+    expect(source.match(/\bwriteCodexHooksAndTrust\s*\(/g)).toHaveLength(2);
   });
 
   it('trusts the hooks a mounted plugin declares, keyed <plugin>@<marketplace>', () => {

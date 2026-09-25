@@ -19,11 +19,8 @@ import {
   WRITING_RULES_FILE,
 } from '../tone-profiles.js';
 import { registerTools } from './server.js';
+import { ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
 
 const getToneProfileTool: McpToolDefinition = {
   tool: {

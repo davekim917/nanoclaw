@@ -63,7 +63,7 @@ export const STALE_THREAD_RE = /thread\s+not\s+found|unknown\s+thread|thread[_\s
  * drops EVERY MCP server for that group, not just the offending one.
  * (upstream 05860324c)
  */
-export function tomlBasicString(value: string): string {
+function tomlBasicString(value: string): string {
   if (value.includes('\n') || value.includes('\r')) {
     throw new Error(
       `MCP config value contains newline (not supported in config.toml): ${JSON.stringify(value.slice(0, 40))}${value.length > 40 ? '…' : ''}`,
@@ -116,7 +116,7 @@ export function escapeTomlBasicStringBody(value: string): string {
  * table carrying a command the approval card never showed. Bare and quoted
  * forms name the same table. (upstream 2e97ab046)
  */
-export function tomlKey(name: string): string {
+function tomlKey(name: string): string {
   return /^[A-Za-z0-9_-]+$/.test(name) ? name : tomlBasicString(name);
 }
 
@@ -793,36 +793,41 @@ export function renderCodexMcpConfigToml(existing: string, servers: Record<strin
   const base = stripExistingMcpServers(existing);
   const lines: string[] = base ? [base, '', MCP_MARKER, ''] : [];
   for (const [name, config] of Object.entries(servers)) {
-    const tomlName = tomlKey(name);
-    lines.push(`[mcp_servers.${tomlName}]`);
-    if (config.type === 'http') {
-      lines.push(`url = ${tomlBasicString(config.url)}`);
-      if (config.headers && Object.keys(config.headers).length > 0) {
-        lines.push(`http_headers = ${tomlInlineStringMap(config.headers)}`);
-      }
-    } else {
-      lines.push('type = "stdio"');
-      lines.push(`command = ${tomlBasicString(config.command)}`);
-      // Codex launches the stdio server here natively. Must stay ABOVE the
-      // `[mcp_servers.*.env]` sub-table header or TOML re-parents it into the
-      // env table. (upstream 5e15069da)
-      if (config.cwd) {
-        lines.push(`cwd = ${tomlBasicString(config.cwd)}`);
-      }
-      if (config.args && config.args.length > 0) {
-        const argsStr = config.args.map(tomlBasicString).join(', ');
-        lines.push(`args = [${argsStr}]`);
-      }
-      if (config.env && Object.keys(config.env).length > 0) {
-        lines.push(`[mcp_servers.${tomlName}.env]`);
-        for (const [key, value] of Object.entries(config.env)) {
-          lines.push(`${tomlKey(key)} = ${tomlBasicString(value)}`);
-        }
-      }
-    }
-    lines.push('');
+    lines.push(...renderCodexMcpServer(name, config), '');
   }
   return lines.join('\n');
+}
+
+/** One `[mcp_servers.<name>]` table, with its env sub-table when it has one. */
+export function renderCodexMcpServer(name: string, config: CodexMcpServer): string[] {
+  const tomlName = tomlKey(name);
+  const lines = [`[mcp_servers.${tomlName}]`];
+  if (config.type === 'http') {
+    lines.push(`url = ${tomlBasicString(config.url)}`);
+    if (config.headers && Object.keys(config.headers).length > 0) {
+      lines.push(`http_headers = ${tomlInlineStringMap(config.headers)}`);
+    }
+    return lines;
+  }
+  lines.push('type = "stdio"');
+  lines.push(`command = ${tomlBasicString(config.command)}`);
+  // Codex launches the stdio server here natively. Must stay ABOVE the
+  // `[mcp_servers.*.env]` sub-table header or TOML re-parents it into the
+  // env table. (upstream 5e15069da)
+  if (config.cwd) {
+    lines.push(`cwd = ${tomlBasicString(config.cwd)}`);
+  }
+  if (config.args && config.args.length > 0) {
+    const argsStr = config.args.map(tomlBasicString).join(', ');
+    lines.push(`args = [${argsStr}]`);
+  }
+  if (config.env && Object.keys(config.env).length > 0) {
+    lines.push(`[mcp_servers.${tomlName}.env]`);
+    for (const [key, value] of Object.entries(config.env)) {
+      lines.push(`${tomlKey(key)} = ${tomlBasicString(value)}`);
+    }
+  }
+  return lines;
 }
 
 /**

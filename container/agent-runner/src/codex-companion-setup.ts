@@ -53,8 +53,7 @@ import {
   buildCodexHooksJson,
   listCodexHooks,
   parseTomlTableHeader,
-  tomlBasicString,
-  tomlKey,
+  renderCodexMcpServer,
   writeCodexHooksJson,
 } from './providers/codex-app-server.js';
 import {
@@ -161,12 +160,6 @@ function log(msg: string): void {
   console.error(`[codex-companion-setup] ${msg}`);
 }
 
-function tomlInlineStringMap(map: Record<string, string>): string {
-  return `{ ${Object.entries(map)
-    .map(([key, value]) => `${tomlBasicString(key)} = ${tomlBasicString(value)}`)
-    .join(', ')} }`;
-}
-
 export function renderMcpServerForTest(name: string, config: McpServerConfig): string[] {
   return renderMcpServer(name, config);
 }
@@ -180,42 +173,12 @@ export function stripPluginsAndMarketplacesForTest(toml: string): string {
 }
 
 function renderMcpServer(name: string, config: McpServerConfig): string[] {
-  const lines: string[] = [];
-  // Same quoting and cwd rules as writeCodexMcpConfigToml — this is the second
-  // Codex config.toml writer in the tree and shares its blast radius: one
-  // malformed entry makes codex reject the file and drops every MCP server.
-  const tomlName = tomlKey(name);
-  lines.push(`[mcp_servers.${tomlName}]`);
-
+  // The same renderer as writeCodexMcpConfigToml: one malformed entry makes
+  // codex reject the file and drops every MCP server.
   if (config.type === 'sse') {
     throw new Error(`MCP server "${name}" uses deprecated SSE transport. Use type: "http" instead.`);
   }
-
-  if (config.type === 'http') {
-    lines.push(`url = ${tomlBasicString(config.url)}`);
-    if (config.headers && Object.keys(config.headers).length > 0) {
-      lines.push(`http_headers = ${tomlInlineStringMap(config.headers)}`);
-    }
-    return lines;
-  }
-
-  lines.push('type = "stdio"');
-  lines.push(`command = ${tomlBasicString(config.command)}`);
-  // Above the env sub-table header, or TOML re-parents it. (upstream 5e15069da)
-  if (config.cwd) {
-    lines.push(`cwd = ${tomlBasicString(config.cwd)}`);
-  }
-  if (config.args && config.args.length > 0) {
-    const argsStr = config.args.map(tomlBasicString).join(', ');
-    lines.push(`args = [${argsStr}]`);
-  }
-  if (config.env && Object.keys(config.env).length > 0) {
-    lines.push(`[mcp_servers.${tomlName}.env]`);
-    for (const [key, value] of Object.entries(config.env)) {
-      lines.push(`${tomlKey(key)} = ${tomlBasicString(value)}`);
-    }
-  }
-  return lines;
+  return renderCodexMcpServer(name, config);
 }
 
 function parseTomlString(raw: string): string {

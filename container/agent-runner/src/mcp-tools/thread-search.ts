@@ -10,20 +10,13 @@ import { Database } from 'bun:sqlite';
 import { findByName } from '../destinations.js';
 import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
+import { err, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
 
 const ARCHIVE_PATH = '/workspace/archive.db';
 
 function log(msg: string): void {
   console.error(`[thread-search] ${msg}`);
-}
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
-
-function err(text: string) {
-  return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true };
 }
 
 let _db: Database | null = null;

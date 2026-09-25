@@ -20,23 +20,8 @@ import { writeMessageOut } from '../db/messages-out.js';
 import '../providers/index.js';
 import { listProviderNames, validateProviderConfig } from '../providers/provider-registry.js';
 import { registerTools } from './server.js';
+import { err, generateId, log, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
-
-function log(msg: string): void {
-  console.error(`[mcp-tools] ${msg}`);
-}
-
-function generateId(): string {
-  return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
-
-function err(text: string) {
-  return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true };
-}
 
 export const createAgent: McpToolDefinition = {
   tool: {

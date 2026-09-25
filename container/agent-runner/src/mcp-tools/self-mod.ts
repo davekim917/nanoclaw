@@ -18,23 +18,8 @@ import { setStickyModel, setStickyEffort } from '../modules/mailbox/index.js';
 import { getConfig } from '../config.js';
 import { OPENCODE_MODEL_SLUG_RE, resolveFamilyModel } from '../providers/model-vocabulary.js';
 import { registerTools } from './server.js';
+import { err, generateId, log, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
-
-function log(msg: string): void {
-  console.error(`[mcp-tools] ${msg}`);
-}
-
-function generateId(): string {
-  return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
-
-function err(text: string) {
-  return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true };
-}
 
 const APT_RE = /^[a-z0-9][a-z0-9._+-]*$/;
 const NPM_RE = /^(@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;

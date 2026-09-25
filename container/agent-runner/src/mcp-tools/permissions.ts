@@ -22,30 +22,9 @@
  * gates what admin can do). Owner is intentionally not grantable via
  * tool; set via `/init-first-agent` or direct DB edit.
  */
-import { writeMessageOut } from '../db/messages-out.js';
-import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
+import { emitSystemAction, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
-
-function genId(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-async function emit(action: string, extra: Record<string, unknown> = {}): Promise<void> {
-  const r = getSessionRouting();
-  await writeMessageOut({
-    id: genId('perm'),
-    kind: 'system',
-    platform_id: r.platform_id,
-    channel_type: r.channel_type,
-    thread_id: r.thread_id,
-    content: JSON.stringify({ action, ...extra }),
-  });
-}
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
 
 const grantAccessTool: McpToolDefinition = {
   tool: {
@@ -78,7 +57,7 @@ const grantAccessTool: McpToolDefinition = {
     if (!user) return ok('Error: `user` is required.');
     const role = typeof args.role === 'string' ? args.role.trim().toLowerCase() : 'member';
     const agentGroupId = typeof args.agentGroupId === 'string' ? args.agentGroupId.trim() : undefined;
-    await emit('grant_access', { user, role, agentGroupId });
+    await emitSystemAction('perm', 'grant_access', { user, role, agentGroupId });
     return ok(
       `grant_access requested (user=${user}, role=${role}${agentGroupId ? `, agentGroup=${agentGroupId}` : ''}). Host will reply with the outcome.`,
     );
@@ -109,7 +88,7 @@ const revokeAccessTool: McpToolDefinition = {
     const user = typeof args.user === 'string' ? args.user.trim() : '';
     if (!user) return ok('Error: `user` is required.');
     const agentGroupId = typeof args.agentGroupId === 'string' ? args.agentGroupId.trim() : undefined;
-    await emit('revoke_access', { user, agentGroupId });
+    await emitSystemAction('perm', 'revoke_access', { user, agentGroupId });
     return ok(
       `revoke_access requested (user=${user}${agentGroupId ? `, agentGroup=${agentGroupId}` : ''}). Host will reply with the outcome.`,
     );
@@ -134,7 +113,7 @@ const listAccessTool: McpToolDefinition = {
   },
   handler: async (args: Record<string, unknown>) => {
     const agentGroupId = typeof args.agentGroupId === 'string' ? args.agentGroupId.trim() : undefined;
-    await emit('list_access', { agentGroupId });
+    await emitSystemAction('perm', 'list_access', { agentGroupId });
     return ok(
       `list_access requested${agentGroupId ? ` (agentGroup=${agentGroupId})` : ''}. Host will reply with the roster.`,
     );

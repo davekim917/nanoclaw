@@ -20,23 +20,11 @@ import { getCentralDb } from '../central-db.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
+import { err, generateId, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
-
 
 function log(msg: string): void {
   console.error(`[backlog] ${msg}`);
-}
-
-function generateId(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
-
-function err(text: string) {
-  return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true };
 }
 
 function routing() {

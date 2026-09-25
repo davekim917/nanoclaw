@@ -12,13 +12,10 @@ import { randomUUID } from 'node:crypto';
 
 import { writeMessageOut } from '../db/messages-out.js';
 import { registerTools } from './server.js';
+import { ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
 
 const MAX_QUESTION_CHARS = 1500;
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
 
 function err(text: string) {
   return { content: [{ type: 'text' as const, text }], isError: true };

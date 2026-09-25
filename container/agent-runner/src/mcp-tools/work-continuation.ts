@@ -8,15 +8,8 @@ import {
   WORK_CONTINUATION_TASK_MAX_CHARS,
 } from '../modules/mailbox/index.js';
 import { registerTools } from './server.js';
+import { err, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
-
-function err(text: string) {
-  return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true as const };
-}
 
 export const continueWork: McpToolDefinition = {
   tool: {
