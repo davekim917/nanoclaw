@@ -95,7 +95,7 @@ export { ASSIGN_DEDUPE_MS };
  * a stranger to see absence, while a member of the group is someone the surface
  * may honestly tell "not you".
  */
-export function canAssign(userId: string, agentGroupId: string): Promise<{ ok: boolean; reason?: string }> {
+function canAssign(userId: string, agentGroupId: string): Promise<{ ok: boolean; reason?: string }> {
   // The role predicates are lease-only (§4.5 I-1); one block for the whole decision.
   return withCentralSync((): { ok: boolean; reason?: string } => {
     if (isOwner(userId) || isGlobalAdmin(userId) || isAdminOfAgentGroup(userId, agentGroupId)) {

@@ -52,11 +52,29 @@ async function requireConfiguredGroup(id: string): Promise<AgentGroup> {
   return group;
 }
 
-function packageArgs(args: Record<string, unknown>): { apt: string | undefined; npm: string | undefined } {
+// Dual-write packages: file (canonical, survives backfill at host
+// restart) + DB (cache, read by buildAgentGroupImage at rebuild time).
+async function editPackages(
+  args: Record<string, unknown>,
+  edit: (list: string[], pkg: string) => string[],
+): Promise<{ apt: string | null; npm: string | null }> {
+  const id = args.id as string;
+  if (!id) throw new Error('--id is required');
+
+  const group = await requireConfiguredGroup(id);
+
   const apt = args.apt as string | undefined;
   const npm = args.npm as string | undefined;
   if (!apt && !npm) throw new Error('Provide --apt <pkg> or --npm <pkg>');
-  return { apt, npm };
+
+  const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
+    if (!cfg.packages) cfg.packages = { apt: [], npm: [] };
+    if (apt) cfg.packages.apt = edit(cfg.packages.apt, apt);
+    if (npm) cfg.packages.npm = edit(cfg.packages.npm, npm);
+  });
+  if (apt) await updateContainerConfigJson(id, 'packages_apt', fileConfig.packages.apt);
+  if (npm) await updateContainerConfigJson(id, 'packages_npm', fileConfig.packages.npm);
+  return { apt: apt || null, npm: npm || null };
 }
 
 function mountPathArgs(args: Record<string, unknown>): { hostPath: string; containerPath: string } {
@@ -887,28 +905,12 @@ registerResource({
       description:
         'Add a package to a group. Requires `ncl groups restart --rebuild` to take effect. Use --id <group-id> and --apt <pkg> or --npm <pkg>.',
       handler: async (args) => {
-        const id = args.id as string;
-        if (!id) throw new Error('--id is required');
-
-        const group = await requireConfiguredGroup(id);
-
-        const { apt, npm } = packageArgs(args);
-
-        // Dual-write packages: file (canonical, survives backfill at host
-        // restart) + DB (cache, read by buildAgentGroupImage at rebuild time).
-        // Build path happens to read from DB too, so package-add WAS working
-        // pre-fix — but file would have drifted, leaving operators with stale
-        // container.json and a DB that gets clobbered by next backfill.
-        const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
-          if (!cfg.packages) cfg.packages = { apt: [], npm: [] };
-          if (apt && !cfg.packages.apt.includes(apt)) cfg.packages.apt.push(apt);
-          if (npm && !cfg.packages.npm.includes(npm)) cfg.packages.npm.push(npm);
+        const { apt, npm } = await editPackages(args, (list, pkg) => {
+          if (!list.includes(pkg)) list.push(pkg);
+          return list;
         });
-        if (apt) await updateContainerConfigJson(id, 'packages_apt', fileConfig.packages.apt);
-        if (npm) await updateContainerConfigJson(id, 'packages_npm', fileConfig.packages.npm);
-
         return {
-          added: { apt: apt || null, npm: npm || null },
+          added: { apt, npm },
           note: 'Image rebuild required for packages to take effect. Use install_packages from the agent or rebuild manually.',
         };
       },
@@ -918,23 +920,9 @@ registerResource({
       description:
         'Remove a package from a group. Requires `ncl groups restart --rebuild` to take effect. Use --id <group-id> and --apt <pkg> or --npm <pkg>.',
       handler: async (args) => {
-        const id = args.id as string;
-        if (!id) throw new Error('--id is required');
-
-        const group = await requireConfiguredGroup(id);
-
-        const { apt, npm } = packageArgs(args);
-
-        const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
-          if (!cfg.packages) cfg.packages = { apt: [], npm: [] };
-          if (apt) cfg.packages.apt = cfg.packages.apt.filter((p) => p !== apt);
-          if (npm) cfg.packages.npm = cfg.packages.npm.filter((p) => p !== npm);
-        });
-        if (apt) await updateContainerConfigJson(id, 'packages_apt', fileConfig.packages.apt);
-        if (npm) await updateContainerConfigJson(id, 'packages_npm', fileConfig.packages.npm);
-
+        const { apt, npm } = await editPackages(args, (list, pkg) => list.filter((p) => p !== pkg));
         return {
-          removed: { apt: apt || null, npm: npm || null },
+          removed: { apt, npm },
           note: 'Image rebuild required for package changes to take effect.',
         };
       },
