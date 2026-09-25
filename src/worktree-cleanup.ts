@@ -30,7 +30,7 @@ import { withCentralSync, withRawDb } from './db/central-lease.js';
 // statement (invariant I-2), and it asks an outbound-keyed existence question,
 // which is the right one for a probe that reads only outbound state.
 //
-// This file is NOT on the raw-access allowlist; PR 7 took it off. The two
+// This file is NOT on the raw-access allowlist. The two
 // inbound touches that remain are `fs.existsSync` on a path, not opens.
 import { readSessionOutbound, sessionMailboxPath } from './modules/mailbox/index.js';
 import { onHostShutdown, onHostStart } from './host-lifecycle.js';
@@ -64,7 +64,7 @@ const MINIMUM_IDLE_DAYS = 7;
 const STALE_WARNING_DAYS = 30;
 const DEFAULT_TOPIC_IDLE_RECLAIM_DAYS = 14;
 /**
- * #190, owner-approved: a scratch clone is only a candidate after two weeks
+ * Owner-approved: a scratch clone is only a candidate after two weeks
  * untouched — twice the topic floor, because nothing upstream ever closes a
  * clone the way a session close retires a topic, so idleness is the only
  * signal that the agent which made it has moved on.
@@ -178,7 +178,7 @@ function checkoutGitEnv(dir: string): NodeJS.ProcessEnv {
  * Every filter the repository at `dir` defines in its effective config (local,
  * includes, worktree), so safeGitArgs can neutralize each one by name; `null`
  * when that config cannot be read. A clone's `.git` is container-writable
- * (worktrees/ is mounted read-write, container-runner.ts:4386), and `status`
+ * (worktrees/ is mounted read-write), and `status`
  * runs a clean filter whenever it rehashes a file.
  */
 function repositoryFilterNames(dir: string, env: NodeJS.ProcessEnv): string[] | null {
@@ -215,10 +215,9 @@ function safeDirectories(directory: string): string[] | null {
 }
 
 /**
- * A topic's checkouts through the one lister (plan §5.1), or `null` when its
+ * A topic's checkouts through the one lister, or `null` when its
  * worktrees root could not be read. `listTopicCheckouts` returns [] only for
- * ENOENT and throws on every other read failure
- * (repository-workspaces.ts:607-613), so an unreadable root is counted and
+ * ENOENT and throws on every other read failure, so an unreadable root is counted and
  * preserved here, never mistaken for an empty one.
  */
 function readTopicCheckouts(worktreeRoot: string): TopicCheckout[] | null {
@@ -243,7 +242,7 @@ function statMtimeMs(filePath: string): number | null {
  * (seam 3 §4.5). This module runs ON THE HOST — `main.ts` side-effect-imports
  * it and its `onHostStart` hook schedules `runWorktreeCleanupOnce` on a timer
  * — so a bare raw SELECT here could execute while a `centralTransaction` is
- * suspended and silently join it (#460 round 4). Every reader either takes
+ * suspended and silently join it. Every reader either takes
  * the lease for the read alone (`readSessionInventory`, the async entry
  * points) or holds it across a recheck-then-trash span that must stay one
  * synchronous turn (`finalizeIdleCollection`'s fence, the GC recheck).
@@ -346,10 +345,9 @@ function discover(dataDir: string, rows: SessionRow[] | null): DiscoveryResult {
     // The worktrees root is not a pure checkout namespace: the storage
     // activity lease (`.nanoclaw-storage-active`) and a shared pnpm cache
     // (`.pnpm-store`) live here too. The lister returns only names that parse
-    // as `<repo>` or `<repo>@<slug>` (repository-workspaces.ts:590-598), so
-    // none of them becomes a target;
-    // before a name filter existed, one such directory made canonicalRepoDir()
-    // throw and aborted the entire cleanup pass at discovery, fleet-wide.
+    // as `<repo>` or `<repo>@<slug>`, so none of them becomes a target;
+    // without that filter, one such directory would make canonicalRepoDir()
+    // throw and abort the entire cleanup pass at discovery, fleet-wide.
     //
     // The parse is deliberately NOT widened to admit them. `SAFE_SEGMENT` is a
     // path-traversal boundary, and a checkout it rejects is preserved, never
@@ -384,7 +382,7 @@ function participantHasPersistedWork(participant: TopicParticipant, dataDir: str
   // Two-signal reclaim check, mirroring writeSessionMessageLocked exactly
   // (sessionWasReclaimed && the session's inbound.db is absent).
   // Neither signal alone is proof. The journal line is written BEFORE the
-  // archiving->closed CAS (storage-manager.ts:1259 vs :1266-1269); on CAS loss
+  // archiving->closed CAS in storage-manager; on CAS loss
   // the directory is deliberately kept, so journaled-but-CAS-lost is still
   // live. And the session ROOT can be recreated by a late inbound write that
   // loses the reclaim race — it acquires the storage lease (which mkdirs the
@@ -518,13 +516,13 @@ function isLinkedToCanonical(target: TopicWorktreeTarget): boolean {
 }
 
 /**
- * Does Git resolve `gitDir`'s common dir to `canonical`'s own `.git`? (#669)
+ * Does Git resolve `gitDir`'s common dir to `canonical`'s own `.git`?
  *
  * Asked before a host Git call that runs against a canonical (as cwd or `-C`)
  * or one of its linked admin dirs (`--git-dir`): Git follows a `commondir`
  * file in either to whatever repository it names. The canonical's own file is
- * the sentinel spawn mounts read-only (container-runner.ts:1542), but the
- * canonical `.git` is mounted read-write (container-runner.ts:4536), so the
+ * the sentinel spawn mounts read-only, but the
+ * canonical `.git` is mounted read-write, so the
  * admin dirs under `.git/worktrees/` stay container-writable. This is
  * therefore check-then-use: it narrows the window, it does not close it. A
  * mismatch, or a common dir Git cannot report, refuses the item and logs it.
@@ -796,8 +794,8 @@ function gcMode(): 'dry-run' | 'apply' {
 }
 
 /**
- * A `git worktree lock` marker on this checkout's admin dir. Codex review
- * (PR #182, round 6, verified against Git 2.43): `worktree prune` exits 0 but
+ * A `git worktree lock` marker on this checkout's admin dir. Verified against
+ * Git 2.43: `worktree prune` exits 0 but
  * leaves a locked entry's registration in place even once its path is gone —
  * recreating it afterward fails with "missing but locked worktree". A lock is
  * an agent explicitly saying "don't touch this", so it makes the checkout
@@ -867,8 +865,8 @@ function provenDisposable(
   // Scope 'all': every local ref's commits must be on origin. `--all` names
   // HEAD, every branch, tag, note and replace ref, the stash and every other
   // remote's refs. A commit reachable only from a tag, a detached HEAD or a
-  // note is on no branch, and the former `--branches HEAD` read a tag-only
-  // commit as pushed (PR #657 review, round 2). HEAD stays named explicitly:
+  // note is on no branch, and `--branches HEAD` would read a tag-only
+  // commit as pushed. HEAD stays named explicitly:
   // `--all` alone exits 0 with no output on an unborn HEAD (measured, git
   // 2.43), while `log HEAD` fails there, so such a repository reads as
   // unprovable, never as clean. Only origin's remote-tracking refs are
@@ -876,11 +874,10 @@ function provenDisposable(
   // can hold commits no real remote has. Scope 'head' is a linked worktree's
   // proof, unchanged: its HEAD against every remote-tracking ref.
   //
-  // One exception for a clone (#672): a tag the host recorded when it built
+  // One exception for a clone: a tag the host recorded when it built
   // the clone, still held at the same object, is the canonical's, not the
   // clone's own work. A clone copies every canonical tag (repository_checkout
-  // removes only heads and remote-tracking refs,
-  // modules/repository-workspaces/index.ts:889-904), and a release tag off
+  // removes only heads and remote-tracking refs), and a release tag off
   // every origin branch would otherwise keep every clone of that repository
   // forever. The record is host-only (checkoutInheritedTagsPath). The
   // canonical's refs are container-writable and are never read here, so no
@@ -919,10 +916,8 @@ function provenDisposable(
   // checkouts share; trashing it destroys their history, and nothing above
   // would notice because every check so far looks only at THIS tree.
   //
-  // Codex review of #190: collectClones already asks cloneHasBoundWorktrees,
-  // but only once, during the scan. That was survivable while any live
-  // container in the group refused every clone under it; with that gate gone
-  // a clone in a busy group is an ordinary candidate, and an agent running
+  // collectClones already asks cloneHasBoundWorktrees, but only once, during
+  // the scan. A clone in a busy group is an ordinary candidate, and an agent running
   // `git worktree add` against it between the scan and the trash would not be
   // caught. Ask git's own registry instead of the filesystem sweep: every
   // linked worktree of a repo has an entry under <gitdir>/worktrees, so this
@@ -951,7 +946,7 @@ function provenDisposable(
  * in it, so it is proved with scope `all`; a linked worktree owns only its
  * HEAD, as it always has; a checkout whose shape the lister could not decide
  * is refused outright. `inheritedTagsRecord` names the host-only record of the
- * tags a topic clone inherited when the host built it (#672); only a topic
+ * tags a topic clone inherited when the host built it; only a topic
  * checkout has one, and a clone without a record counts every tag.
  */
 export function proveCheckoutDisposable(
@@ -996,8 +991,7 @@ function isPrivateClone(dir: string): boolean {
  * — in practice `gitdir: /workspace/...`, a path that only resolves inside the
  * container that made it.
  *
- * #190 constraint 3: roughly 42 of these exist and they are permanently
- * unprovable from the host, so they must never be removed. They already are
+ * These are permanently unprovable from the host, so they must never be removed. They already are
  * never removed, because isPrivateClone demands a real `.git` DIRECTORY — but
  * they were also silently invisible, which in the middle of a storage squeeze
  * reads as "nothing here" rather than "mass no host-side pass can ever
@@ -1167,11 +1161,10 @@ function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<stri
         continue;
       }
       const worktreeRoot = path.join(topicDir, 'worktrees');
-      // #203: topicDir's own mtime is not a signal of activity — any bulk
+      // topicDir's own mtime is not a signal of activity — any bulk
       // metadata touch on the parent (data/v2-topics/<workgroup>) bumps every
-      // topic dir at once regardless of what's inside. Production evidence:
-      // 360 topic dirs shared one 2-second mtime window from an unidentified
-      // bulk op, which silently disabled this gate fleet-wide for 7 days.
+      // topic dir at once regardless of what's inside, which would silently
+      // disable this gate fleet-wide.
       // `worktrees/` is the deeper, real-activity signal — branchMayBeRemoved
       // above already keys off this same depth rather than the topic dir.
       // Read idleDays from worktrees/ exclusively rather than
@@ -1263,9 +1256,9 @@ function collectClones(
     const skip = (reason: string): void =>
       record(report, { category: 'clone', path: candidate.dir, collect: false, reason, bytes: 0 });
 
-    // #190: agent-group and workgroup liveness were the gates that made clone
-    // reclaim unreachable. `groups/<folder>` is bind-mounted into every
-    // container of that group, so a group with any running container refused
+    // Agent-group and workgroup liveness are not gates here: they would make
+    // clone reclaim unreachable. `groups/<folder>` is bind-mounted into every
+    // container of that group, so a group with any running container would refuse
     // EVERY clone under it — and a QA group with a continuous cadence never
     // has a quiet moment. Neither gate says anything about THIS directory.
     // Apply mode decides that per path instead: mount relation plus a process
@@ -1279,7 +1272,7 @@ function collectClones(
       continue;
     }
     // isPrivateClone found a real `.git` directory, which is the lister's own
-    // definition of a clone (repository-workspaces.ts:632).
+    // definition of a clone.
     const decision = disposability.proveCheckoutDisposable({ path: candidate.dir, shape: 'clone' });
     if (!decision.ok) {
       skip(decision.reason);
@@ -1333,8 +1326,8 @@ function trashPath(target: string): void {
  *
  * Where it does not hold — DATA_DIR or GROUPS_DIR on their own volume, a
  * common enough cloud layout — a translated path comes out relative to that
- * volume's root and simply fails to match any candidate. Codex review of #190
- * flagged this: the consequence is a MISS, not a spurious match, so the /proc
+ * volume's root and simply fails to match any candidate. The consequence is a
+ * MISS, not a spurious match, so the /proc
  * check quietly degrades to nothing rather than misfiring. It is defence in
  * depth either way — the git re-proof on the moved copy is what actually
  * stands between this and deleting live work — but a reader should not
@@ -1381,15 +1374,15 @@ function hostPathForProcessCwd(pid: string, cwd: string, procRoot: string): stri
 /**
  * Host paths that some currently running process is rooted in.
  *
- * #190 constraint 2: a git lock is not a liveness signal for these directories
+ * A git lock is not a liveness signal for these directories
  * (measured: 3 live sessions, 0 locks), so ask the process table directly.
  *
  * Boundary, stated because absence of a signal must never be read as absence
  * of a process: 282 of 390 pids on this host have an unreadable cwd — they are
  * root- and system-owned processes, which never hold an agent scratch clone as
  * their working directory. Every process that CAN hold one (container agents,
- * host shells running as the install user) is readable, and was observed to be
- * during the #190 audit. An unreadable pid contributes nothing rather than
+ * host shells running as the install user) is readable. An unreadable pid
+ * contributes nothing rather than
  * failing the pass; a pid we can see but cannot place fails it.
  */
 function liveProcessCwds(procRoot = '/proc'): string[] | null {
@@ -1444,7 +1437,7 @@ function processRootedIn(target: string, cwds: string[]): boolean {
  *   source. `groups/<folder>` is itself mounted into every container of that
  *   group, so EVERY scratch clone in an active group is permanently in this
  *   state; treating it as equivalent to the case above is what made clone
- *   reclaim unreachable in practice (#190). A container could touch such a
+ *   reclaim unreachable in practice. A container could touch such a
  *   path, but the idle + git proof is the evidence that it has not, and the
  *   quarantine rename plus post-move recheck is what closes the race.
  * - 'clear' — no overlap at all.
@@ -1484,7 +1477,7 @@ function overlapsAny(target: string, mounts: string[]): boolean {
 }
 
 /**
- * Codex review finding on PR #182: a message can land, or a container spawn
+ * A message can land, or a container spawn
  * can land its bind mount, in the window between stillDisposable's pre-move
  * recheck and the topic being fully trashed. Closed-path topics can't be
  * re-routed to (the router only ever opens a NEW session for a new thread
@@ -1492,7 +1485,7 @@ function overlapsAny(target: string, mounts: string[]): boolean {
  * ACTIVE session still receives inbound.
  *
  * inbound admission bumps last_active BEFORE any spawn ever mounts anything
- * (session-manager.ts:911), so admission-before-the-move is always caught by
+ * (session-manager), so admission-before-the-move is always caught by
  * the recheck below, and admission-after-the-move finds the directory gone
  * and re-materializes a fresh checkout for the new message — nothing lost
  * either way. The move (renaming the directory out of its live path) is the
@@ -1600,8 +1593,8 @@ function restoreQuarantinedEntry(
  * attempt left behind: what occupies the original path decides, never what
  * the quarantine still holds. While nothing does, the whole topic goes back in
  * one rename. Once something does — the spawn path does
- * `mkdirSync(<topic>/worktrees, {recursive:true})` (container-runner.ts:1746)
- * on its own, so a live container can recreate the destination at any moment,
+ * `mkdirSync(<topic>/worktrees, {recursive:true})` on its own, so a live
+ * container can recreate the destination at any moment,
  * and a bare rename onto it fails — each entry goes back on its own: every
  * entry of the quarantined `worktrees/` (a `<repo>` or `<repo>@<slug>`
  * checkout, or a name the lister does not parse) and every other entry of the
@@ -1732,7 +1725,7 @@ function laterThan(a: number | null, b: number | null): boolean {
 }
 
 /** Durable record of exact linked-worktree removals a trash is (or was) about to require.
- *  See #185: a crash between a successful trash and the deregistration loop that
+ *  A crash between a successful trash and the deregistration loop that
  *  follows it would otherwise leave a dangling `.git/worktrees/<name>`
  *  registration with nothing to find it. */
 const PENDING_PRUNE_FILE = '.gc-pending-prunes.json';
@@ -2075,7 +2068,7 @@ function completeLegacyPendingRemoval(entry: PendingWorktreeRemoval, dataDir: st
 
 /**
  * Finish any exact deregistration left pending by a crash between a successful
- * trash and the deregistration loop that follows it (#185). Run once at the
+ * trash and the deregistration loop that follows it. Run once at the
  * start of every apply pass, same shape as recoverOrphanedQuarantine. A repeat
  * failure stays journaled for the next pass; no operator command is required.
  */
@@ -2110,7 +2103,7 @@ function runPendingPrunes(dataDir: string): void {
  * A clone's recovery marker lives BESIDE its quarantine entry, not inside it.
  *
  * Topics put the marker in the directory so it travels in the same atomic
- * rename (#184). A clone cannot: the post-move check is a git re-proof, and an
+ * rename. A clone cannot: the post-move check is a git re-proof, and an
  * untracked marker file inside the tree would read as a dirty worktree and
  * abort every single collection. Deleting the marker after the rename instead
  * would strand any entry whose process died in the gap — a markerless entry is
@@ -2156,9 +2149,8 @@ function restoreQuarantinedClone(originalPath: string, quarantinePath: string): 
 /**
  * Quarantine-then-verify removal for a scratch clone.
  *
- * Clones previously went straight to `trashPath` while topics got the
- * quarantine treatment (#190 constraint 7). That gap matters more now, not
- * less: dropping the coarse agent-group-live gate means a clone can be
+ * Clones get the same quarantine treatment as topics: without the coarse
+ * agent-group-live gate a clone can be
  * collected while its group has a live container, so the window between
  * deciding and deleting has to be closed by evidence rather than by refusing
  * the whole class.
@@ -2209,10 +2201,10 @@ function finalizeCloneCollection(
     return { ok: false, reason };
   };
 
-  // A scratch clone under an active group is always inside a mount source
-  // (#190), so only the strong relation refuses one. A topic checkout lives
+  // A scratch clone under an active group is always inside a mount source,
+  // so only the strong relation refuses one. A topic checkout lives
   // under `<topic>/worktrees`, which is mounted only into its own work unit's
-  // containers (container-runner.ts:4379-4385): inside any mount source means
+  // containers: inside any mount source means
   // a running container can reach it, so it refuses on anything but 'clear',
   // as finalizeIdleCollection does for a whole topic.
   const freshMounts = runningContainerMounts();
@@ -2258,7 +2250,7 @@ async function finalizeIdleCollection(
   const quarantinePath = path.join(quarantineRoot, `${path.basename(candidate.path)}-${Date.now()}`);
   fs.mkdirSync(quarantineRoot, { recursive: true });
 
-  // #184: write the recovery marker INTO the topic dir BEFORE the rename that
+  // Write the recovery marker INTO the topic dir BEFORE the rename that
   // creates the quarantine entry, so the marker travels with the directory in
   // the SAME renameSync — one atomic move, not two separate writes with a
   // crash window between them. A markerless quarantine entry is now
@@ -2305,7 +2297,7 @@ async function finalizeIdleCollection(
       worktreePath: path.join(candidate.path, 'worktrees', checkout.name),
     }));
 
-  // #183: the durable-write fence runs LAST, immediately before the
+  // The durable-write fence runs LAST, immediately before the
   // irreversible trash — not before freshMounts/repoListing above, which
   // themselves cost real wall-clock time (a docker inspect, a readdir). A
   // fence checked earlier leaves that whole span unguarded; checked here it
@@ -2329,9 +2321,9 @@ async function finalizeIdleCollection(
     const owner = participantsByTopic(dataDir, rows).get(candidate.path);
     const activityAdvanced = (owner?.participants ?? []).some((p) => {
       const prior = before.get(p.sessionId);
-      // Codex P1 (round 4): status/idleSince lag the real admission event —
+      // status/idleSince lag the real admission event —
       // writeSessionMessageLocked inserts into inbound.db and closes it BEFORE
-      // it updates last_active (session-manager.ts:892-911), two separate
+      // it updates last_active, two separate
       // writes. Fence on the durable write itself instead of its lagging
       // index: inbound.db's mtime moves at the insert, not after. A file that
       // appeared, or whose mtime moved forward, or that stopped being statable
@@ -2346,7 +2338,7 @@ async function finalizeIdleCollection(
       return { ok: false, reason: 'aborted-late-activity' };
     }
 
-    // #185: journal the exact deregistrations this trash is about to require BEFORE trashing,
+    // Journal the exact deregistrations this trash is about to require BEFORE trashing,
     // so a crash between the trash succeeding and the loop below finishing
     // leaves a durable record instead of a silently dangling registration.
     // runPendingPrunes sweeps this at the start of the next apply pass.
@@ -2426,7 +2418,7 @@ function stillDisposable(
 ): { ok: boolean; reason: string } {
   if (candidate.category === 'clone') {
     // A clone under an active group is ALWAYS inside a mount source, so only
-    // the strong relation can refuse here (#190). What stands in for the
+    // the strong relation can refuse here. What stands in for the
     // coarse gate: no process is actually rooted in this directory, and the
     // git proof from the scan is re-run below after the quarantine rename.
     if (relationToMounts(candidate.path, mounts) === 'is-mount-source') {

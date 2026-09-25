@@ -1,5 +1,5 @@
 /** Host-side Git execution policy for container-influenced repositories. */
-import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from 'child_process';
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -79,25 +79,7 @@ export function safeGitFilterNames(gitDir: string, workTree?: string): string[] 
     '--get-regexp',
     '^filter\\..*\\.(clean|smudge|process|required)$',
   ];
-  let output: string;
-  try {
-    output = execFileSync('git', args, {
-      encoding: 'utf8',
-      env: safeGitEnv(),
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 10_000,
-    });
-  } catch (error) {
-    const status = (error as NodeJS.ErrnoException & { status?: number }).status;
-    if (status === 1) return [];
-    throw error;
-  }
-  const names = new Set<string>();
-  for (const key of output.split('\n')) {
-    const match = /^filter\.(.+)\.(?:clean|smudge|process|required)$/.exec(key.trim());
-    if (match) names.add(match[1]);
-  }
-  return [...names].sort();
+  return filterNamesFrom(args);
 }
 
 function localFilterNames(configPath: string): string[] {
@@ -109,26 +91,26 @@ function localFilterNames(configPath: string): string[] {
     throw error;
   }
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`unsafe Git config path: ${configPath}`);
+  return filterNamesFrom([
+    'config',
+    '--file',
+    configPath,
+    '--includes',
+    '--name-only',
+    '--get-regexp',
+    '^filter\\..*\\.(clean|smudge|process|required)$',
+  ]);
+}
+
+function filterNamesFrom(args: string[]): string[] {
   let output: string;
   try {
-    output = execFileSync(
-      'git',
-      [
-        'config',
-        '--file',
-        configPath,
-        '--includes',
-        '--name-only',
-        '--get-regexp',
-        '^filter\\..*\\.(clean|smudge|process|required)$',
-      ],
-      {
-        encoding: 'utf8',
-        env: safeGitEnv(),
-        stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: 10_000,
-      },
-    );
+    output = execFileSync('git', args, {
+      encoding: 'utf8',
+      env: safeGitEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 10_000,
+    });
   } catch (error) {
     const status = (error as NodeJS.ErrnoException & { status?: number }).status;
     if (status === 1) return [];
@@ -175,12 +157,6 @@ export function safeGitConfigSet(configPath: string, key: string, value: string)
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 10_000,
   });
-}
-
-export function safeGitOptions(
-  options: Omit<ExecFileSyncOptionsWithStringEncoding, 'encoding' | 'env'> & { env?: NodeJS.ProcessEnv } = {},
-): ExecFileSyncOptionsWithStringEncoding {
-  return { ...options, encoding: 'utf8', env: safeGitEnv(options.env) };
 }
 
 export function repositoryConfigPath(gitDir: string): string {

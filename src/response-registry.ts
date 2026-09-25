@@ -1,9 +1,8 @@
 /**
- * Response handler + shutdown callback registries.
+ * Response handler registry.
  *
  * Extracted from index.ts so that modules calling `registerResponseHandler()`
- * or `onShutdown()` at import time don't hit a TDZ error on the const-array
- * declarations. index.ts imports src/modules/index.js for its side effects,
+ * at import time don't hit a TDZ error on the const-array declaration. index.ts imports src/modules/index.js for its side effects,
  * which triggers module registrations that would otherwise happen before
  * index.ts's own const initializers have run.
  *
@@ -37,15 +36,4 @@ export function registerResponseHandler(handler: ResponseHandler): void {
 
 export function getResponseHandlers(): readonly ResponseHandler[] {
   return responseHandlers;
-}
-
-type ShutdownCallback = () => void | Promise<void>;
-const shutdownCallbacks: ShutdownCallback[] = [];
-
-export function onShutdown(cb: ShutdownCallback): void {
-  shutdownCallbacks.push(cb);
-}
-
-export function getShutdownCallbacks(): readonly ShutdownCallback[] {
-  return shutdownCallbacks;
 }

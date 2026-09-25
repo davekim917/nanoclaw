@@ -78,7 +78,7 @@ export function resolveWorkgroupWiki(
 /**
  * An agent in a session that predates the wiki can leave a file or symlink at
  * `/workspace/wiki`. The mountpoint-stub loop keeps whatever already exists
- * there (`if (fs.existsSync(stubPath)) continue`, src/container-runner.ts:6749),
+ * there (`if (fs.existsSync(stubPath)) continue` in container-runner),
  * and Docker then fails a directory bind onto a file on every spawn of that
  * session. Skipping the optional wiki keeps the spawn alive.
  */

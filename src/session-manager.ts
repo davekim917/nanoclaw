@@ -233,7 +233,7 @@ export function heartbeatPath(agentGroupId: string, sessionId: string): string {
 
 /**
  * Claude Code's project-dir name hash for the container cwd. v2's cwd is
- * `/workspace/agent` (set in container/agent-runner/src/index.ts:42 as `CWD`
+ * `/workspace/agent` (set in the agent-runner's index.ts as `CWD`
  * and passed to the SDK via poll-loop), which hashes to `-workspace-agent`.
  * v1 used `/workspace/group` → `-workspace-group`; do not copy-paste that
  * constant without verifying the current cwd. If the cwd ever changes,
@@ -277,8 +277,7 @@ export function groupClaudeMemoryDir(agentGroupId: string): string {
  * Pre-create the per-session `projects/<hash>/` dir on the host with uid 1001
  * ownership BEFORE docker mounts it.
  *
- * This is load-bearing — v1 learned it the hard way (comment at v1
- * container-runner.ts:1675-1681). The parent `/home/node/.claude` is a bind
+ * This is load-bearing. The parent `/home/node/.claude` is a bind
  * mount; if the inner `projects/<hash>/` path doesn't already exist on the host
  * when docker starts the container, the daemon creates the missing
  * intermediates AS ROOT. The container runs as uid 1001 and can't write inside
@@ -1124,11 +1123,11 @@ async function writeSessionMessageLocked(
   // a line. A session id is never reused, so the answer only ever goes
   // false -> true, once. See `sessionWasReclaimed`.
   //
-  // The line records the reclaim's INTENT, not its completion: it is written
-  // at storage-manager.ts:1207, before the archiving->closed CAS at :1215,
-  // and that CAS can fail — in which case :1221 logs and deliberately keeps
-  // the directory ("removing it is not our call"). A crash before the rmSync
-  // at :1230 leaves the same shape. So the line alone would brick a session
+  // The line records the reclaim's INTENT, not its completion: storage-manager
+  // writes it before the archiving->closed CAS, and that CAS can fail — in
+  // which case the reclaim logs and deliberately keeps the directory
+  // ("removing it is not our call"). A crash before the rmSync leaves the
+  // same shape. So the line alone would brick a session
   // that is still live. inbound.db answers the second half — the reclaim
   // removes the whole directory, and nothing in the lease recreates that file
   // (the lease mkdirs only the session ROOT, which is why the root's
@@ -1141,7 +1140,7 @@ async function writeSessionMessageLocked(
   // inside the window — is closed rather than papered over: the recreate it
   // needed was the old guard letting that second writer through to
   // `initSessionFolder` below. The only other in-process creator,
-  // `initStubSessionFolder` (db/scheduled-tasks.ts:98), runs on a freshly
+  // `initStubSessionFolder` (db/scheduled-tasks), runs on a freshly
   // generated id. Remove the leak and the interleave has no producer.
   //
   // One composition is deliberate: a CAS-lost session that an operator THEN
@@ -1814,7 +1813,7 @@ function extractAttachmentFiles(
   // Resolved lazily on the first attachment that actually carries bytes, so a
   // message whose attachments have no inline `data` never creates an inbox dir.
   // ensureContainedInboxDir refuses a pre-placed symlink at the inbox root or
-  // the per-message subdir before any write lands outside the sandbox (#2828).
+  // the per-message subdir before any write lands outside the sandbox.
   let inboxDir: string | null = null;
   let inboxResolved = false;
 

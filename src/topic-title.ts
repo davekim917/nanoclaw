@@ -62,7 +62,7 @@ export async function generateTopicTitle(messageText: string): Promise<string | 
     const title = raw.replace(/\*+/g, '').trim().slice(0, MAX_TITLE_LENGTH);
     return title || undefined;
   } catch (err) {
-    // callHaiku attaches the subprocess stderr to err.stderr (see llm.ts:30),
+    // callHaiku attaches the subprocess stderr to err.stderr (see llm.ts),
     // but the default JSON serializer of Error doesn't pick up custom props,
     // so surface it explicitly. Without this, every "Topic title generation
     // failed" warn looks like "Command failed: claude -p ..." with no clue

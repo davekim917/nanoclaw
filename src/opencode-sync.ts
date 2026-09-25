@@ -245,7 +245,7 @@ export interface OpenCodeSkillSyncResult {
  *     for /team-* is "every SKILL.md becomes a command automatically" via
  *     `packages/opencode/src/command/index.ts` (verified in source).
  *   - OpenCode auto-scans `~/.config/opencode/{skill,skills}/` (OPENCODE_SKILL_PATTERN
- *     in `packages/opencode/src/skill/index.ts:24`). We write there + every
+ *     in `packages/opencode/src/skill/index.ts`). We write there + every
  *     `~/.local/share/opencode-<folder>/skill/` for the per-sibling sets.
  *
  * Discovery uses `runtime: 'opencode'` — its denylist excludes the Claude
@@ -265,10 +265,10 @@ export interface OpenCodeSkillSyncResult {
  * deny different plugins are two different populations, and discovery keeps only
  * the FIRST plugin to claim a skill name — so a reader deriving its own deny set
  * can name a different owner for a name than the writer published under it. The
- * drop set walked with the default denials only and did exactly that, which was
- * #836; every reader now takes its population from `openCodeMirrorSkills`.
+ * drop set walked with the default denials only and did exactly that; every
+ * reader now takes its population from `openCodeMirrorSkills`.
  */
-export function openCodeMirrorDenyPlugins(): Set<string> {
+function openCodeMirrorDenyPlugins(): Set<string> {
   // A workgroup-scoped plugin's skills are never mirrored. Every target here is
   // either the global dir, which any OpenCode group without its own falls back
   // to, or a per-sibling dir not keyed by workgroup (src/plugin-scopes.ts). They
@@ -285,9 +285,7 @@ export function openCodeMirrorDenyPlugins(): Set<string> {
  * Discovery keeps only the FIRST plugin to claim a skill name (alphabetically),
  * so two walks that deny different plugins can name different owners for one
  * name — and then a reader's answer is about a directory the mirror does not
- * hold. That divergence has now cost this file three findings: the drop set's
- * own walk (#836, closed here), the attribution walk's deny set, and the
- * support-dir population.
+ * hold.
  */
 export function openCodeMirrorSkills(pluginsRoot: string): DiscoveredSkill[] {
   return discoverPortableSkills(pluginsRoot, { runtime: 'opencode', denyPlugins: openCodeMirrorDenyPlugins() });
@@ -412,7 +410,7 @@ export function collectSiblingSupportDirs(
  * mirror dir — the writer's record and the reader's fallback have to agree or
  * the fallback refuses content the record would have allowed.
  */
-export function supportDirRoot(dir: string, pluginRoots: readonly string[]): string | undefined {
+function supportDirRoot(dir: string, pluginRoots: readonly string[]): string | undefined {
   const resolved = resolveRealPath(dir);
   if (resolved === null) return undefined;
   return pluginRoots.find((root) => isWithinResolvedRoot(resolved, root));

@@ -13,12 +13,12 @@ import { getDb } from './db/connection.js';
 import type { VolumeMount } from './providers/provider-container-registry.js';
 
 export const WORKGROUP_READ_ACCESS_POLICY_PATH = path.join(DATA_DIR, 'workgroup-read-access.json');
-export const WORKGROUP_READ_ACCESS_CONTAINER_ROOT = '/workspace/extra/work';
+const WORKGROUP_READ_ACCESS_CONTAINER_ROOT = '/workspace/extra/work';
 const WORKGROUP_READ_ACCESS_RELATIVE_ROOT = 'work';
 
-export type WorkgroupReadAccessMode = 'all' | 'archives';
+type WorkgroupReadAccessMode = 'all' | 'archives';
 
-export interface WorkgroupReadAccessGrant {
+interface WorkgroupReadAccessGrant {
   mode: WorkgroupReadAccessMode;
   sources: '*' | string[];
 }
@@ -28,7 +28,7 @@ interface WorkgroupReadAccessPolicy {
   recipients: Record<string, WorkgroupReadAccessGrant>;
 }
 
-export interface WorkgroupReadAccessRequest {
+interface WorkgroupReadAccessRequest {
   hostPath: string;
   containerPath: string;
   readonly: true;

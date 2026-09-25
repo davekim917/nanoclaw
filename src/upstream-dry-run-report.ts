@@ -40,7 +40,7 @@ export interface NewMigration {
   name: string | null;
 }
 
-export interface MigrationCollision {
+interface MigrationCollision {
   file: string;
   ordinal: number;
   name: string | null;
@@ -60,7 +60,7 @@ export interface ForkOrdinalMigrationFile {
  * registered under a different ordinal, e.g. `module-*.ts` files). Not a
  * collision: the migration is already present, nothing to renumber.
  */
-export interface AlreadyPortedMigration {
+interface AlreadyPortedMigration {
   file: string;
   ordinal: number | null;
   name: string;

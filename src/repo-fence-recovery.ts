@@ -73,9 +73,8 @@ async function yieldEventLoop(index: number): Promise<void> {
  *
  * - publish  → `withRepositoryLifecycleClaims([requesterWorkUnit], …)` wraps the
  *   whole of `applyRepositoryPublishAction`'s quiesce → publish → release,
- *   which fences only the requester's work unit (#655). The workgroup mount
- *   claim is still what `ncl repositories` activation holds
- *   (cli/resources/repositories.ts:78).
+ *   which fences only the requester's work unit. The workgroup mount
+ *   claim is still what `ncl repositories` activation holds.
  * - transfer → `withRepositoryLifecycleClaims([source, destination], …)` inside
  *   `transferRepositoryWorktree` wraps `beforeMoveWhileClaimed` (which
  *   quiesces the destination work unit) through the release.
@@ -175,10 +174,8 @@ export async function releaseOrphanedRepoIngressFences(
       // across `wakeRepositoryMountSessions` (invariant I-3).
       // The two central reads the in-flight check needs, taken BEFORE the
       // session opens so the action below stays synchronous from its fence
-      // read to its release (the messaging group joined the agent group here
-      // in seam 3 PR 6, when `getMessagingGroup` went async). A throw here is
-      // "identity unresolvable" and is counted as unreadable by the catch,
-      // exactly as the read inside used to.
+      // read to its release. A throw here is "identity unresolvable" and is
+      // counted as unreadable by the catch.
       const group = await getAgentGroup(session.agent_group_id);
       const messagingGroup = session.messaging_group_id
         ? ((await getMessagingGroup(session.messaging_group_id)) ?? null)

@@ -14,7 +14,7 @@ const createdRoots: string[] = [];
  * share fixture state: whichever run lost the race failed as `disk I/O error`
  * or a missing directory somewhere unrelated to the change under test, never as
  * an assertion. `fileParallelism: false` only ever covered the single-process
- * case. See issue #274.
+ * case.
  *
  * The directory is NOT created — suites that assert on an absent root, or that
  * exercise code whose job is to create it, keep that behavior. Every root

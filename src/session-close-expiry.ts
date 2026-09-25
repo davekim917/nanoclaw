@@ -1,5 +1,5 @@
 /**
- * Releasing everything a CLOSED session can never consume (#520).
+ * Releasing everything a CLOSED session can never consume.
  *
  * ## The leak
  *
@@ -19,7 +19,7 @@
  * ## All THREE things sessionHasOpenWork counts
  *
  * The predicate is a chain, and clearing only its first link leaves the
- * session pinned exactly as before (Codex round 1 on #583, finding 2):
+ * session pinned exactly as before:
  *
  *   1. inbound `messages_in` in ('processing','pending')  → expireClosedSessionPending
  *   2. outbound `processing_ack` status = 'processing'    → deleteOrphanProcessingClaims
@@ -64,7 +64,7 @@ import type { Session } from './types.js';
  * unbounded case this exists to prevent. Progress across boots is guaranteed by
  * the cursor instead.
  */
-export const CLOSED_SESSION_BACKLOG_DRAIN_LIMIT = 250;
+const CLOSED_SESSION_BACKLOG_DRAIN_LIMIT = 250;
 
 export interface ClosedSessionRelease {
   /** Inbound rows moved to 'expired'. */
@@ -175,7 +175,7 @@ async function writeOutboundOnlyWhenStopped<T>(
  * pinned by its missing file, not by its rows. Fixing that is a separate
  * question about the `null` fail-closed and is deliberately not attempted here.
  */
-export async function releaseOutboundOnlyClosedSession(
+async function releaseOutboundOnlyClosedSession(
   agentGroupId: string,
   session: Session,
   reason: 'spent-task-session-gc' | 'closed-session-backlog',
@@ -296,18 +296,17 @@ export interface ClosedSessionDrainResult {
  * Drain the sessions that were closed BEFORE this landed.
  *
  * Deliberately not a sweep duty and not a migration: a per-tick pass over every
- * closed session is the per-session cost #516 is about, and a migration would
+ * closed session is the per-session cost this avoids, and a migration would
  * rewrite 1,229 session files in one shot.
  *
  * ## Why a cursor, not "reclaim will take care of it"
  *
- * The first version of this leaned on reclaim removing a drained session's
- * directory so the next boot would skip it. That is true EVENTUALLY and false
- * within an evening: reclaim is asynchronous and bounded per tick, so a host
+ * Leaning on reclaim removing a drained session's directory so the next boot
+ * would skip it is true EVENTUALLY and false within an evening: reclaim is
+ * asynchronous and bounded per tick, so a host
  * that restarts three times in a night re-walks the same unordered prefix and
- * the tail past the cap never gets opened at all (Codex round 1 on #583,
- * finding 1). With 287 retained directories against a cap of 250, the last 37
- * would starve indefinitely — and those rows clearing is the entire point.
+ * the tail past the cap never gets opened at all, and those rows clearing is
+ * the entire point.
  *
  * So progress is guaranteed rather than incidental: the query is ordered by
  * `id`, the run records the last session it OPENED, and the next run resumes

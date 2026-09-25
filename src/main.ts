@@ -85,12 +85,11 @@ import { enforceUpgradeTripwire } from './upgrade-state.js';
 import { reconcilePendingUpgradeContexts } from './session-manager.js';
 import { releaseOrphanedRepoIngressFencesAtStartup } from './repo-fence-recovery.js';
 
-// Response + shutdown registries live in response-registry.ts to break the
-// circular import cycle: src/index.ts imports src/modules/index.js for side
-// effects, and the modules call registerResponseHandler/onShutdown at top
-// level — which would hit a TDZ error if the arrays lived here. Re-exported
-// here so existing callers see the same surface.
-import { getResponseHandlers, getShutdownCallbacks, type ResponsePayload } from './response-registry.js';
+// The response registry lives in response-registry.ts to break the circular
+// import cycle: src/index.ts imports src/modules/index.js for side effects, and
+// the modules call registerResponseHandler at top level — which would hit a
+// TDZ error if the array lived here.
+import { getResponseHandlers, type ResponsePayload } from './response-registry.js';
 
 // Upstream host-lifecycle seam (docs/specs/upstream-host-sweep-seam/plan.md §4.1).
 // Aborted as the first shutdown action so `HostStartContext.signal` carries real
@@ -1073,13 +1072,6 @@ async function shutdown(signal: string): Promise<void> {
   // (docs/specs/upstream-host-sweep-seam/plan.md §4.1).
   hostAbortController.abort();
   await stopHostModules();
-  for (const cb of getShutdownCallbacks()) {
-    try {
-      await cb();
-    } catch (err) {
-      log.error('Shutdown callback threw', { err });
-    }
-  }
   stopDeliveryPolls();
   stopHostSweep();
   stopChannelRecoveryMonitor();

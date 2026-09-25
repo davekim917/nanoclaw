@@ -18,7 +18,7 @@
 /** No second kill notice inside this window, however fast the counter climbs. */
 export const OOM_NOTICE_MIN_INTERVAL_MS = 10 * 60 * 1000;
 /** A second notice needs the cumulative count to have grown by this factor. */
-export const OOM_NOTICE_GROWTH_FACTOR = 10;
+const OOM_NOTICE_GROWTH_FACTOR = 10;
 /** Reclaim events in one lifetime before the (quieter) pressure notice fires. */
 export const MEMORY_PRESSURE_NOTICE_THRESHOLD = 500;
 

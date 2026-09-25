@@ -7,9 +7,9 @@ import {
   repositoryOriginContainsCredentials,
 } from './repository-migration-identity.js';
 
-export type MissingAdminRecoveryAction = 'restore-visible-state' | 'archive-visible-state';
+type MissingAdminRecoveryAction = 'restore-visible-state' | 'archive-visible-state';
 
-export type ReviewedCheckoutSelection = 'synthesized-visible-state' | 'exact-git-admin';
+type ReviewedCheckoutSelection = 'synthesized-visible-state' | 'exact-git-admin';
 
 export interface ReviewedCheckoutRecoveryDecision {
   checkoutPath: string;
@@ -34,9 +34,6 @@ export interface ReviewedCheckoutRecoveryDecision {
   gitPointerSha256?: string;
   visibleStateSha256: string;
 }
-
-/** @deprecated Use ReviewedCheckoutRecoveryDecision. */
-export type ReviewedMissingAdminRecoveryDecision = ReviewedCheckoutRecoveryDecision;
 
 export interface ReviewedOriginSelection {
   workgroupId: string;

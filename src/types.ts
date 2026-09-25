@@ -34,7 +34,7 @@ export interface ContainerConfigRow {
   updated_at: string;
 }
 
-export type UnknownSenderPolicy = 'strict' | 'request_approval' | 'decline_notify' | 'public';
+type UnknownSenderPolicy = 'strict' | 'request_approval' | 'decline_notify' | 'public';
 
 export interface MessagingGroup {
   id: string;
@@ -121,8 +121,8 @@ export interface UserDm {
   resolved_at: string;
 }
 
-export type EngageMode = 'pattern' | 'mention' | 'mention-pattern' | 'mention-sticky';
-export type SenderScope = 'all' | 'known';
+type EngageMode = 'pattern' | 'mention' | 'mention-pattern' | 'mention-sticky';
+type SenderScope = 'all' | 'known';
 export type IgnoredMessagePolicy = 'drop' | 'accumulate';
 
 // Session-mode enum shared across router.ts, session-manager.ts, channel-auto-wire,
@@ -130,12 +130,6 @@ export type IgnoredMessagePolicy = 'drop' | 'accumulate';
 // channel-auto-wire/index.ts is re-exported from here so there's one source of truth.
 export type SessionMode = 'shared' | 'per-thread' | 'agent-shared';
 export const SESSION_MODES: readonly SessionMode[] = ['shared', 'per-thread', 'agent-shared'] as const;
-
-// Provider enum. Values are the agent-runner runtime identifier used by
-// registerProviderContainerConfig and the container_configs.provider column.
-// 'mock' is the in-container test provider (container/agent-runner/src/providers/mock.ts).
-export type Provider = 'claude' | 'codex' | 'opencode' | 'mock';
-export const PROVIDERS: readonly Provider[] = ['claude', 'codex', 'opencode', 'mock'] as const;
 
 // Channel-type enum. Covers external adapters (slack, discord, telegram, ...),
 // hybrid variants (whatsapp-cloud), and the internal synthetic channels
@@ -158,24 +152,6 @@ export type ChannelType =
   | 'signal'
   | 'agent'
   | 'cli';
-export const CHANNEL_TYPES: readonly ChannelType[] = [
-  'slack',
-  'discord',
-  'telegram',
-  'whatsapp',
-  'whatsapp-cloud',
-  'teams',
-  'linear',
-  'github',
-  'imessage',
-  'webex',
-  'matrix',
-  'google-chat',
-  'resend',
-  'signal',
-  'agent',
-  'cli',
-] as const;
 
 /**
  * Match a channel_type against a base adapter name. Channel variants are
@@ -305,40 +281,6 @@ export interface Session {
    */
   sweep_quiet_until?: string | null;
   created_at: string;
-}
-
-// ── Session DB entities ──
-
-export type MessageInKind = 'chat' | 'chat-sdk' | 'task' | 'webhook' | 'system';
-export type MessageInStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';
-
-export interface MessageIn {
-  id: string;
-  kind: MessageInKind;
-  timestamp: string;
-  status: MessageInStatus;
-  status_changed: string | null;
-  process_after: string | null;
-  recurrence: string | null;
-  tries: number;
-  platform_id: string | null;
-  channel_type: string | null;
-  thread_id: string | null;
-  content: string; // JSON blob
-}
-
-export interface MessageOut {
-  id: string;
-  in_reply_to: string | null;
-  timestamp: string;
-  delivered: number; // 0 | 1
-  deliver_after: string | null;
-  recurrence: string | null;
-  kind: string;
-  platform_id: string | null;
-  channel_type: string | null;
-  thread_id: string | null;
-  content: string; // JSON blob
 }
 
 // ── Pending questions (central DB) ──

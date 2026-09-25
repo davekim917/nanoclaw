@@ -12,7 +12,7 @@ export type PrestagedFileType = 'file' | 'symlink';
 
 // The live inventory is expected to include roughly one million paths. These
 // limits cap parser/memory exposure while leaving headroom for that fleet.
-export const MAX_CACHE_ENTRIES = 1_250_000;
+const MAX_CACHE_ENTRIES = 1_250_000;
 export const MAX_CACHE_DOCUMENT_BYTES = 768 * 1024 * 1024;
 export const MAX_CACHE_PATH_BYTES = 4096;
 export const MAX_SYMLINK_TARGET_BYTES = 4096;

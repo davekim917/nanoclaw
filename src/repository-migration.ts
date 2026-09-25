@@ -26,6 +26,7 @@ import {
   normalizedGithubRepositoryIdentity,
 } from './repository-migration-identity.js';
 import type { RepositoryMigrationPrestageCache } from './repository-migration-prestage.js';
+import { sha256File } from './repository-protected-archives.js';
 
 export interface LegacyCheckoutCandidate {
   workgroupId: string;
@@ -62,7 +63,7 @@ export function mergeLegacyCheckoutProvenance(
   };
 }
 
-export interface FileInventoryEntry {
+interface FileInventoryEntry {
   path: string;
   type: 'file' | 'symlink';
   mode: number;
@@ -185,7 +186,7 @@ export type MigrationPhase =
   | 'worktrees-restored'
   | 'audited';
 
-export interface MigrationJournal {
+interface MigrationJournal {
   version: 1;
   runId: string;
   workgroupId: string;
@@ -291,22 +292,6 @@ function gitRaw(args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv
 
 function sha256(value: Buffer | string): string {
   return createHash('sha256').update(value).digest('hex');
-}
-
-function sha256File(file: string): string {
-  const hash = createHash('sha256');
-  const fd = fs.openSync(file, fs.constants.O_RDONLY);
-  const buffer = Buffer.allocUnsafe(8 * 1024 * 1024);
-  try {
-    for (;;) {
-      const read = fs.readSync(fd, buffer, 0, buffer.length, null);
-      if (read === 0) break;
-      hash.update(buffer.subarray(0, read));
-    }
-  } finally {
-    fs.closeSync(fd);
-  }
-  return hash.digest('hex');
 }
 
 function atomicJson(file: string, value: unknown): void {
@@ -582,7 +567,7 @@ export function readLegacyGitDirOrigin(gitDir: string, context?: LegacyGitResolu
   return origin;
 }
 
-export function resolveLegacyGitAdmin(
+function resolveLegacyGitAdmin(
   candidate: LegacyCheckoutCandidate,
   context?: LegacyGitResolutionContext,
 ): { gitDir: string; commonGitDir: string } {
@@ -1257,7 +1242,7 @@ function captureGitPointer(checkoutPath: string): CheckoutCapture['gitPointer'] 
   };
 }
 
-export function reviewedCheckoutStateSha256(capture: CheckoutCapture): string {
+function reviewedCheckoutStateSha256(capture: CheckoutCapture): string {
   return sha256(
     canonicalJson({
       checkoutPath: capture.checkoutPath,
@@ -1808,6 +1793,26 @@ export function createRepositoryMigrationManifest(input: {
   const recoveryByPath = new Map(
     (input.recoveryDecisions ?? []).map((decision) => [path.resolve(decision.checkoutPath), decision]),
   );
+  const recoveryProposalLine = (capture: CheckoutCapture): string => {
+    const existingDecision = recoveryByPath.get(path.resolve(capture.checkoutPath));
+    const proposal: ReviewedCheckoutRecoveryDecision = existingDecision
+      ? { ...existingDecision, action: 'archive-visible-state' }
+      : {
+          checkoutPath: capture.checkoutPath,
+          workgroupId: capture.workgroupId,
+          repo: capture.repo,
+          action: 'archive-visible-state',
+          selection: 'exact-git-admin',
+          selectedGitDir: capture.gitDir,
+          selectedCommonGitDir: capture.commonGitDir,
+          selectedHead: capture.head,
+          selectedBranch: capture.branch,
+          selectedIndexSha256: capture.indexSha256,
+          ...(capture.gitPointer ? { gitPointerSha256: capture.gitPointer.sha256 } : {}),
+          visibleStateSha256: reviewedCheckoutStateSha256(capture),
+        };
+    return `- ${capture.checkoutPath}\nreviewed recovery proposal (action requires operator review): ${JSON.stringify(proposal)}`;
+  };
   if (recoveryByPath.size !== (input.recoveryDecisions ?? []).length) {
     throw new Error(`duplicate reviewed checkout recovery decision for ${input.workgroupId}/${input.repo}`);
   }
@@ -1937,28 +1942,7 @@ export function createRepositoryMigrationManifest(input: {
           'they use a synthetic non-live work unit and can only proceed when explicitly archived by a reviewed preservation decision:\n'
         : 'legacy checkout(s) contain dirty, unborn, local-only, or unpushed state but have no real topic/session; ' +
           'supply exact reviewed mappings or explicitly archive their preserved state before migration:\n') +
-        unmappedWithUniqueState
-          .map((capture) => {
-            const existingDecision = recoveryByPath.get(path.resolve(capture.checkoutPath));
-            const proposal: ReviewedCheckoutRecoveryDecision = existingDecision
-              ? { ...existingDecision, action: 'archive-visible-state' }
-              : {
-                  checkoutPath: capture.checkoutPath,
-                  workgroupId: capture.workgroupId,
-                  repo: capture.repo,
-                  action: 'archive-visible-state',
-                  selection: 'exact-git-admin',
-                  selectedGitDir: capture.gitDir,
-                  selectedCommonGitDir: capture.commonGitDir,
-                  selectedHead: capture.head,
-                  selectedBranch: capture.branch,
-                  selectedIndexSha256: capture.indexSha256,
-                  ...(capture.gitPointer ? { gitPointerSha256: capture.gitPointer.sha256 } : {}),
-                  visibleStateSha256: reviewedCheckoutStateSha256(capture),
-                };
-            return `- ${capture.checkoutPath}\nreviewed recovery proposal (action requires operator review): ${JSON.stringify(proposal)}`;
-          })
-          .join('\n'),
+        unmappedWithUniqueState.map(recoveryProposalLine).join('\n'),
     );
   }
   const objectStores = [
@@ -2002,28 +1986,7 @@ export function createRepositoryMigrationManifest(input: {
       divergentUnitErrors.push(
         `same work unit has divergent physical checkout state and cannot share one linked worktree; ` +
           `the repository-named checkout is the only unambiguous active candidate, but every alternate requires ` +
-          `an explicit reviewed archive decision:\n${alternates
-            .map((capture) => {
-              const existingDecision = recoveryByPath.get(path.resolve(capture.checkoutPath));
-              const proposal: ReviewedCheckoutRecoveryDecision = existingDecision
-                ? { ...existingDecision, action: 'archive-visible-state' }
-                : {
-                    checkoutPath: capture.checkoutPath,
-                    workgroupId: capture.workgroupId,
-                    repo: capture.repo,
-                    action: 'archive-visible-state',
-                    selection: 'exact-git-admin',
-                    selectedGitDir: capture.gitDir,
-                    selectedCommonGitDir: capture.commonGitDir,
-                    selectedHead: capture.head,
-                    selectedBranch: capture.branch,
-                    selectedIndexSha256: capture.indexSha256,
-                    ...(capture.gitPointer ? { gitPointerSha256: capture.gitPointer.sha256 } : {}),
-                    visibleStateSha256: reviewedCheckoutStateSha256(capture),
-                  };
-              return `- ${capture.checkoutPath}\nreviewed recovery proposal (action requires operator review): ${JSON.stringify(proposal)}`;
-            })
-            .join('\n')}`,
+          `an explicit reviewed archive decision:\n${alternates.map(recoveryProposalLine).join('\n')}`,
       );
       continue;
     }
@@ -2031,26 +1994,7 @@ export function createRepositoryMigrationManifest(input: {
       `same work unit has divergent physical checkout state and cannot share one linked worktree; ` +
         `there is no unambiguous active primary, so every divergent state requires an explicit reviewed archive ` +
         `decision and the real topic will start from a fresh canonical checkout:\n${unitCaptures
-          .map((capture) => {
-            const existingDecision = recoveryByPath.get(path.resolve(capture.checkoutPath));
-            const proposal: ReviewedCheckoutRecoveryDecision = existingDecision
-              ? { ...existingDecision, action: 'archive-visible-state' }
-              : {
-                  checkoutPath: capture.checkoutPath,
-                  workgroupId: capture.workgroupId,
-                  repo: capture.repo,
-                  action: 'archive-visible-state',
-                  selection: 'exact-git-admin',
-                  selectedGitDir: capture.gitDir,
-                  selectedCommonGitDir: capture.commonGitDir,
-                  selectedHead: capture.head,
-                  selectedBranch: capture.branch,
-                  selectedIndexSha256: capture.indexSha256,
-                  ...(capture.gitPointer ? { gitPointerSha256: capture.gitPointer.sha256 } : {}),
-                  visibleStateSha256: reviewedCheckoutStateSha256(capture),
-                };
-            return `- ${capture.checkoutPath}\nreviewed recovery proposal (action requires operator review): ${JSON.stringify(proposal)}`;
-          })
+          .map(recoveryProposalLine)
           .join('\n')}`,
     );
   }
