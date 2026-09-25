@@ -50,12 +50,11 @@ type TaskInsert = Omit<Task, 'created_at' | 'needs_input' | 'steer_question' | '
   Partial<Pick<Task, 'needs_input' | 'steer_question' | 'archived_at'>>;
 
 /**
- * Seam 3 PR 6 put the three exports `applySpawnTask`'s admission transaction
- * calls — `insertTaskAtomic`, `getTaskByParentAndIdempotency`,
- * `countActiveByParent` — on the async driver, because a `centralTransaction`
- * closure may await driver statements and nothing else (plan §4.4). PR 5d
- * finishes the leaf: every remaining export drops its transitional lease belt
- * and runs on the driver too.
+ * The three exports `applySpawnTask`'s admission transaction calls —
+ * `insertTaskAtomic`, `getTaskByParentAndIdempotency`, `countActiveByParent` —
+ * run on the async driver, because a `centralTransaction` closure may await
+ * driver statements and nothing else. Every other export runs on the driver
+ * too.
  *
  * None of them needs `centralTransaction`. Each is ONE statement, and each
  * mutation is already compare-and-set in SQL — `WHERE status = 'pending'`,
@@ -269,65 +268,6 @@ export async function flagNeedsInput(taskId: string, question: string | null): P
     question,
   );
   return result.changes > 0;
-}
-
-/**
- * Clear the needs_input flag and the optional steer_question text. Invoked
- * by the steer write path so the operator's reply transparently unblocks
- * the worker. Guarded `WHERE needs_input = 1` so the partial index drives
- * the lookup and rows that weren't waiting on steer don't trigger writes.
- */
-export async function clearNeedsInput(taskId: string): Promise<void> {
-  await getDb().run(
-    `UPDATE tasks
-          SET needs_input = 0,
-              steer_question = NULL
-        WHERE task_id = ?
-          AND needs_input = 1`,
-    taskId,
-  );
-}
-
-/**
- * Soft-delete a task from the dashboard's default view. Returns true when
- * the row actually flipped (was not already archived) — callers gate SSE
- * emits on this so a no-op archive doesn't trigger refetches.
- */
-export async function archiveTaskById(taskId: string, archivedAt: string = new Date().toISOString()): Promise<boolean> {
-  const result = await getDb().run(
-    `UPDATE tasks SET archived_at = ? WHERE task_id = ? AND archived_at IS NULL`,
-    archivedAt,
-    taskId,
-  );
-  return result.changes > 0;
-}
-
-export async function unarchiveTaskById(taskId: string): Promise<void> {
-  await getDb().run(`UPDATE tasks SET archived_at = NULL WHERE task_id = ?`, taskId);
-}
-
-/**
- * Bulk archive: every non-archived task in `groupId` with the given
- * terminal status. Returns the row count. Callers (dashboard bulk endpoint,
- * scope-checked by the handler) are responsible for verifying the caller
- * is admin-of `groupId` before invoking.
- */
-export async function bulkArchiveByGroupAndStatus(
-  groupId: string,
-  status: TerminalTaskStatus,
-  archivedAt: string = new Date().toISOString(),
-): Promise<number> {
-  const result = await getDb().run(
-    `UPDATE tasks
-          SET archived_at = ?
-        WHERE parent_agent_group_id = ?
-          AND status = ?
-          AND archived_at IS NULL`,
-    archivedAt,
-    groupId,
-    status,
-  );
-  return result.changes;
 }
 
 /**

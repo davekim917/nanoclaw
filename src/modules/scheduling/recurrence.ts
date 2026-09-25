@@ -117,8 +117,7 @@ export async function handleRecurrence(mailbox: NanoclawMailboxSession, session:
 
   for (const msg of recurring) {
     try {
-      // Interpret the cron expression in the user's timezone. v1 did this
-      // (src/v1/task-scheduler.ts:20-49); without it, a task written "0 9 * * *"
+      // Interpret the cron expression in the user's timezone. Without it, a task written "0 9 * * *"
       // by an agent running in a user's local TZ fires at 09:00 UTC instead of
       // 09:00 user-local.
       const interval = CronExpressionParser.parse(msg.recurrence, { tz });

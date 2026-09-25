@@ -43,8 +43,8 @@ export async function revokeCapability(
   agentGroupId: string,
   role: 'orchestrator',
 ): Promise<{ success: boolean; reason?: string }> {
-  // The in-flight test and the delete are ONE statement (seam-3 read-then-write
-  // class, #443). Read first and delete after, and a task admitted in the
+  // The in-flight test and the delete are ONE statement (the read-then-write
+  // race class). Read first and delete after, and a task admitted in the
   // window between them loses its orchestrator capability mid-flight — the
   // exact condition the guard exists to prevent. The NOT EXISTS makes SQLite
   // evaluate both at the same instant, and `changes === 0` means a task was

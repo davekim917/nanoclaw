@@ -21,7 +21,6 @@
 export {
   // Byte-identical to upstream's; the module re-exports upstream's own copies.
   cancelTask,
-  deleteTask,
   pauseTask,
   // Fork-only semantics (routing columns, inert inserts, recall invalidation).
   cancelSeriesWithStrandClear,

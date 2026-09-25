@@ -7,7 +7,7 @@
  * target's inbound DB; if the source message had `files` (from `send_file`),
  * the actual bytes are copied from the source's outbox into the target's
  * `inbox/<a2a-msg-id>/` directory and surfaced to the target agent as
- * `attachments` (existing formatter convention — see formatter.ts:230).
+ * `attachments` (the runner formatter's existing convention).
  * The target agent can then forward the file onward via its own `send_file`
  * call using the absolute `/workspace/inbox/<a2a-msg-id>/<filename>` path.
  *
@@ -114,7 +114,7 @@ export function forwardAttachedFiles(
   // compromised target agent can write inside its own session dir, so it could
   // pre-place `inbox` (or `inbox/<future-msgId>`) as a symlink pointing
   // anywhere host-writable; ensureContainedInboxDir refuses the symlink before
-  // any copy lands outside the sandbox (#2828, CWE-59).
+  // any copy lands outside the sandbox (CWE-59).
   const inboxRoot = path.join(sessionDir(target.agentGroupId, target.sessionId), 'inbox');
   const targetInboxDir = ensureContainedInboxDir(inboxRoot, target.messageId, {
     targetGroup: target.agentGroupId,
@@ -315,7 +315,7 @@ async function resolveTargetSession(
       // only resolves rows in the *caller's* inbound. So a candidate
       // here means: this caller and that target session previously
       // communicated. The candidate's mg may differ from the caller's
-      // effective mg (e.g. test #2332: PA.paSlackSession sends to
+      // effective mg (e.g. PA.paSlackSession sends to
       // researcher; researcher's reply must land back in paSlackSession
       // even though researcher itself is in agent-shared mode and
       // fallback.mgId is null). The originating-session semantic wins;
@@ -611,7 +611,7 @@ async function performAgentRoute(
 
   // PROOF ONE, before the copy — and the copy itself, in the SAME leased block.
   //
-  // Proving under the lease and copying after it is not enough (#481). The
+  // Proving under the lease and copying after it is not enough. The
   // lease is released when `withCentralSync` resolves, and a revocation queued
   // behind it commits in that gap, so the bytes land in the target's mounted
   // inbox on a grant that no longer exists. The later writer-side proof does
@@ -816,7 +816,7 @@ async function addThreadContext(
 /**
  * Parse source content, copy any referenced `files` from source outbox to
  * target inbox, and return a JSON string with an `attachments` array added
- * (formatter.ts:223 already knows how to render this shape).
+ * (the runner formatter already renders this shape).
  *
  * If the source content isn't JSON or has no files, returns the original
  * content string unchanged — this is safe to call on every route.

@@ -14,7 +14,7 @@
  * 3. Prune member compat links whose shared target is gone
  *    (`pruneDanglingWorkgroupCompatLinks`).
  * Idempotent — re-running on already-reconciled state is a no-op. Only step 1
- * and the workgroups enumeration throw on failure (the caller, src/main.ts:682,
+ * and the workgroups enumeration throw on failure (the caller in src/main.ts
  * logs and exits process.exit(1)); steps 2 and 3 warn and skip per workgroup
  * and per member, so one lost race cannot stop the host booting.
  */
@@ -72,13 +72,12 @@ export function reconcileWorkgroupFsState(db: Database.Database): void {
   // this order only so a boot's shared-tree writes precede its reads.
   //
   // Step 3 is NOT the boot's last writer to the shared tree:
-  // this whole function runs at src/main.ts:682, and runBootMountQuiescence at
-  // :692 then calls reconcileWorkgroupSharedDirs (:514) and the memory gate
-  // (:520), both of which add names after this prune has read its listing.
+  // after this whole function runs at boot, runBootMountQuiescence
+  // calls reconcileWorkgroupSharedDirs and the memory gate, both of which add names after this prune has read its listing.
   // That is safe for two separate reasons, not one — `memory` and `artifacts`
   // are held by RESERVED_SHARED_DIR_NAMES and never considered here, and
-  // migrateWorkgroup writes a name's shared entry before its compat link
-  // (shared-dirs.ts:723/:731 precede :742), so a link this prune could see can
+  // migrateWorkgroup writes a name's shared entry before its compat link,
+  // so a link this prune could see can
   // never be newer than its target. Contained the same way as step 2 — a
   // workgroup whose shared tree cannot be listed prunes nothing.
   pruneDanglingWorkgroupCompatLinks(db);

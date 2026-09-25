@@ -32,7 +32,8 @@ import { AGENT_MESSAGE_POLICY_BY_PAIR_SQL } from './db/agent-message-policies.js
  */
 export const A2A_MESSAGE_GATE_ACTION = 'a2a_message_gate';
 
-export const agentsCreate = defineGuardedAction({
+// A catalog entry only: nothing consults it, but defining it registers `agents.create`.
+defineGuardedAction({
   action: 'agents.create',
   grantActionName: 'create_agent',
   // Bind a create_agent grant to the name that was approved.

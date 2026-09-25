@@ -74,7 +74,7 @@ export async function applyScheduleWake(
   // container-owned outbound.db read-write to apply its schema, and this
   // request was read out of that very mailbox, so it exists. A session that
   // has vanished has nothing left to wake.
-  // src/modules/mailbox/ops/ingress.ts:102–111 checks the trigger ID regardless of status before
+  // Ingress (src/modules/mailbox/ops/ingress.ts) checks the trigger ID regardless of status before
   // atomically inserting its pair. The key stays consumed while that row is retained.
   const effectiveWakeId = hasDedupeKey
     ? `keyed-${createHash('sha256').update(`${session.id}\0${dedupeKey}`).digest('hex')}`
@@ -101,9 +101,9 @@ export async function applyScheduleWake(
       threadId: routing?.thread_id ?? null,
       sourceSessionId: anchoredRouting?.source_session_id ?? null,
       content: JSON.stringify({
-        // Self-wake final text stays internal (container/agent-runner/src/poll-loop.ts:3452).
+        // Self-wake final text stays internal (the runner's poll loop).
         // Refer to the mounted send_message schema rather than version-specific
-        // policy fields (container/agent-runner/src/mcp-tools/core.ts:266–329).
+        // policy fields (the runner's core MCP tools).
         text: `[system] ${prompt}\n\n(Scheduled wake: bare final text is NOT delivered. Use the send_message tool for anything that should post, following its available schema and communication rules; if nothing needs posting, end with no message at all.)`,
         sender: 'system',
         senderId: 'system',

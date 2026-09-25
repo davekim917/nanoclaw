@@ -152,7 +152,7 @@ export function prepareScheduledTask(input: {
 /**
  * Persist a prepared task through NanoClaw's single task/session representation.
  *
- * Asynchronous since mailbox seam PR 7: the write goes through the seam, whose
+ * Asynchronous: the write goes through the seam, whose
  * `session()` is a promise. `resolveTaskSession` above provisions the mailbox,
  * so this uses the existing-only funnel and treats `undefined` as the same
  * hard error the pre-seam existsSync guard raised (invariant I-10 — a task
