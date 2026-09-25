@@ -16,7 +16,7 @@
  * is NOT used: the value would sit in this host's process table for the life of
  * the call. The gateway API takes it on stdin instead.
  *
- * `curl` rather than `fetch`, for the same reason `src/onecli-secrets.ts:95`
+ * `curl` rather than `fetch`, for the same reason `src/onecli-secrets.ts`
  * gives: host `fetch` must never traverse the gateway proxy.
  *
  * NOTHING HERE READS A VALUE BACK — the API has no such route (see the note in

@@ -1,14 +1,14 @@
 /**
  * Detached execution for the repository delivery actions.
  *
- * `pollActive`/`pollSweep` drain sessions serially (delivery.ts:443-463), and a
+ * `pollActive`/`pollSweep` drain sessions serially (delivery.ts), and a
  * `repository_publish` handled inline held that loop for the whole of
  * `quiesceSessionsForRepositoryMounts` — every sibling container in the
  * workgroup finishing its current tool call. Observed 2026-09-01:
  * `Active delivery poll timing cycleMs=172606 polled=2`, i.e. no session on the
  * host got an outbound message for nearly three minutes. Nothing about the
  * action needs the loop: the container fire-and-forgets the row
- * (git-worktrees.ts:428-442) and reads the outcome later from an `onWake` chat
+ * (the runner's git-worktrees tool) and reads the outcome later from an `onWake` chat
  * row, so the only thing the inline call bought was the ack.
  *
  * So: return `deferAck` and run the apply on a detached chain.
@@ -18,7 +18,7 @@
  *     (modules/mailbox/ops/delivery.ts) cannot tell 'pending' from 'delivered', so one
  *     would silently lose the action across a host restart. A host that dies
  *     mid-publish leaves the row untouched: the startup orphan-fence pass
- *     releases the dead process's fences (repo-fence-recovery.ts:218) and the
+ *     releases the dead process's fences (repo-fence-recovery.ts) and the
  *     first poll re-dispatches the action, which both applies absorb
  *     idempotently (canonical-exists branch / transfer tombstone recovery).
  *   - `inFlight` is the dedup: the row stays undelivered while the job runs, so
@@ -28,9 +28,8 @@
  *     parallel.
  *       - `repository_publish`, `repository_refresh` and `repository_transfer`
  *         share the one `'global'` lane. Publish and transfer both take
- *         `withRepositoryLifecycleClaims` on the work units they drain (#655
- *         narrowed publish to the requester's), which THROWS rather than queues
- *         (repository-workspaces.ts:233-235), so two of them on one work unit
+ *         `withRepositoryLifecycleClaims` on the work units they drain (publish
+ *         drains only the requester's), which THROWS rather than queues, so two of them on one work unit
  *         would fail each other. The serial drain is what kept those apart, and
  *         the global lane reproduces exactly that property.
  *       - `repository_checkout` runs on a lane per (workgroup, work unit)
@@ -59,7 +58,7 @@ import type { Session } from '../../types.js';
 export const REPOSITORY_REQUEST_ID_PATTERN = /^repo-[0-9]{10,17}-[a-f0-9]{16}$/;
 
 /** The lane publish, refresh and transfer share. */
-export const GLOBAL_REPOSITORY_LANE = 'global';
+const GLOBAL_REPOSITORY_LANE = 'global';
 
 export type RepositoryActionApply = (content: Record<string, unknown>, session: Session) => Promise<void>;
 
@@ -71,7 +70,7 @@ const chains = new Map<string, Promise<void>>();
  * Actions whose apply drains sessions (quiesceSessionsForRepositoryMounts). A
  * host restart in the middle of one leaves its `messages_out` row undelivered,
  * so the next host start replays it from scratch and drains every session a
- * second time (#718). While one runs, a marker file tells scripts/deploy.sh to
+ * second time. While one runs, a marker file tells scripts/deploy.sh to
  * hold the restart until the drain settles.
  */
 const DRAINING_ACTIONS = new Set(['repository_publish', 'repository_transfer']);

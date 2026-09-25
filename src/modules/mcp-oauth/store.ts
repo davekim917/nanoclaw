@@ -19,11 +19,11 @@
  * SO IT LIVES HERE, and the precedent is exact: the GitHub App PRIVATE KEY
  * already sits on this host's filesystem at `GITHUB_APP_PRIVATE_KEY_PATH`, read
  * by the host to mint short-lived installation tokens
- * (`src/github-app-token.ts:227`). This store is that same shape — a long-lived
+ * (`src/github-app-token.ts`). This store is that same shape — a long-lived
  * minting credential the HOST holds, producing a short-lived credential the
  * container gets. The invariant that matters is unchanged: no container ever
  * sees either file. `DATA_DIR` itself is never bind-mounted; only named
- * subpaths under it are (`src/container-runner.ts:4443,4456,4485,4875,4972`),
+ * subpaths under it are (see the mount builders in `src/container-runner.ts`),
  * and `mcp-oauth/` is not one of them.
  *
  * WHAT IS NOT HERE: the ACCESS token. The exception this file represents is
@@ -64,7 +64,7 @@ export interface McpOAuthBundle {
   updatedAt: string;
 }
 
-export function mcpOAuthStoreDir(dataDir: string = DATA_DIR): string {
+function mcpOAuthStoreDir(dataDir: string = DATA_DIR): string {
   return path.join(dataDir, 'mcp-oauth');
 }
 

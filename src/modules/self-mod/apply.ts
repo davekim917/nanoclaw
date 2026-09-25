@@ -186,14 +186,14 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
   // without the server the admin just approved.
   // Same refusal as the CLI door: an approved add_mcp_server naming a
   // plugin-owned server must not overwrite the plugin's entry or drop its
-  // provenance marker (Codex on #486). Checked before either store is touched.
+  // provenance marker. Checked before either store is touched.
   try {
     assertMcpServerNotPluginOwned(readContainerConfig(agentGroup.folder).mcpServers?.[name], name, agentGroup.folder);
     // eslint-disable-next-line no-catch-all/no-catch-all -- the refusal is the outcome; the notification is best-effort
   } catch (err) {
     // Best-effort like the invalid-payload branch above: a rejected notify must
     // not throw out of the approval handler, or the refused approval stays
-    // pending and re-clickable (Codex on #486).
+    // pending and re-clickable.
     await notifyAgent(session, `add_mcp_server refused: ${err instanceof Error ? err.message : String(err)}`).catch(
       (notifyErr) =>
         log.warn('Failed to notify agent about refused add_mcp_server approval', {

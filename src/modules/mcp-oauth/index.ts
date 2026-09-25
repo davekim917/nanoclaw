@@ -16,7 +16,7 @@
 import { registerSweepDuty, registerSweepDutySource, SWEEP_DUTY_INVENTORY } from '../../host-sweep.js';
 import { log } from '../../log.js';
 
-export function registerMcpOAuthSweepDuties(): void {
+function registerMcpOAuthSweepDuties(): void {
   registerSweepDuty({
     name: SWEEP_DUTY_INVENTORY.FORK4,
     phase: 'tick:housekeeping',

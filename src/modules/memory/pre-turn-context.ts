@@ -244,11 +244,11 @@ export interface PreTurnContext {
   notices: ContextNotice[];
 }
 
-export const CORE_PATHS = ['index.md'] as const;
-export const PREFERENCES_DIR = 'preferences/';
+const CORE_PATHS = ['index.md'] as const;
+const PREFERENCES_DIR = 'preferences/';
 
 /** Canonical filename key for a person: "Pat Doe" -> "pat-doe". */
-export function preferenceSlug(name: string): string {
+function preferenceSlug(name: string): string {
   return name
     .toLocaleLowerCase('en-US')
     .normalize('NFKD')
@@ -314,8 +314,8 @@ function extractSenderName(normalizedContent: string): string | null {
 
 /**
  * Extracts the triggering message's sender id from normalized content — same
- * shapes `container/agent-runner/src/formatter.ts:161` (extractSenderId) and
- * `src/modules/permissions/index.ts:84-96` (extractAndUpsertUser) already
+ * shapes the runner formatter's `extractSenderId` and the permissions
+ * module's `extractAndUpsertUser` already
  * parse: top-level `senderId` string, else nested `author.userId` string.
  * Absence or a parse failure returns null, same permissiveness as
  * extractSenderName above. Unlike those two call sites this id is used
@@ -363,12 +363,11 @@ function lookupChannelType(db: RawStatements, messagingGroupId: string | null): 
  * CURRENT conversation's channel_type — and only when `id` actually starts
  * with it; otherwise `id` is returned completely unchanged.
  *
- * This replaces the old "strip everything before the LAST colon" rule
- * (rawIdSuffix, removed — PR #221 round 4). That rule was unsound: a raw
+ * Do not "strip everything before the LAST colon" instead. That rule is unsound: a raw
  * platform handle can itself contain a colon (Matrix: `@alice:matrix.org`),
- * and `extractAndUpsertUser` (src/modules/permissions/index.ts:96-99) stores
+ * and `extractAndUpsertUser` stores
  * such a handle UN-prefixed (no leading `channelType:`) because it already
- * "looks namespaced". Suffixing at the last colon then collapsed two
+ * "looks namespaced". Suffixing at the last colon would collapse two
  * DIFFERENT people on different homeservers — `@alice:matrix.org` and
  * `@bob:matrix.org` — to the same "matrix.org" suffix, letting a bare
  * `ids: [matrix.org]` entry match a whole homeserver and letting an
@@ -386,7 +385,7 @@ function stripVerifiedPrefix(id: string, channelType: string | null): string {
 
 /**
  * Namespaces the trigger-fallback sender id the same way `extractAndUpsertUser`
- * (src/modules/permissions/index.ts:99) namespaces an archived one: an id
+ * namespaces an archived one: an id
  * that already contains a colon is left as-is, otherwise it is prefixed with
  * the CURRENT messaging group's channel_type (`${channelType}:${rawId}`).
  * `channelType` is the value `lookupChannelType` already resolved once in
@@ -1131,7 +1130,7 @@ function extractQueryText(normalizedContent: string): string {
   return normalizedContent;
 }
 
-export function headingsOf(content: string): string[] {
+function headingsOf(content: string): string[] {
   return content
     .split(/\r?\n/)
     .map((line) => line.match(/^#{1,6}\s+(.+?)\s*#*\s*$/)?.[1]?.trim())
@@ -1145,7 +1144,7 @@ function isContainedPath(root: string, candidate: string): boolean {
   return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
-export function readBoundedFile(
+function readBoundedFile(
   filePath: string,
   canonicalRoot: string,
   maxBytes: number = PRE_TURN_BOUNDS.markdownFileBytes,
@@ -1222,7 +1221,7 @@ function listDirectMarkdownStems(root: string, dir: string, notices: ContextNoti
   return stems;
 }
 
-export interface InvolvedSenderGroup {
+interface InvolvedSenderGroup {
   /** Archive's stable sender_id for this person, or null for the trigger-sender fallback group. */
   senderId: string | null;
   /** Per-message display name and, when resolved and different, the canonical users.display_name. */
@@ -1268,7 +1267,7 @@ export function _resetPreferenceIdCacheForTest(): void {
   PREFERENCE_ID_CACHE.clear();
 }
 
-export function readMemoryEvidence(
+function readMemoryEvidence(
   root: string,
   workgroupId: string,
   notices: ContextNotice[],
@@ -1491,7 +1490,7 @@ export function readMemoryEvidence(
       // whose own colon isn't a namespace separator, or a sibling bot's
       // differently-namespaced sender_id) is left whole and must NOT reach
       // the raw map — that would resurrect the last-colon-suffix bug this id
-      // tier exists to avoid (PR #221 round 4).
+      // tier exists to avoid.
       let idRelative: string | undefined;
       if (group.senderId !== null) {
         idRelative = exactIdToRelative.get(group.senderId);
