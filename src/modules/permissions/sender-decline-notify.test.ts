@@ -819,3 +819,37 @@ describe('unknown-sender decline_notify flow', () => {
     expect(stamp.sender_identity).toBe('conversation');
   });
 });
+
+describe('unknown-sender decline_notify with no FYI recipient', () => {
+  it('still declines, in the generic voice, when nobody is owner or admin', async () => {
+    (await db()).prepare("DELETE FROM user_roles WHERE user_id = 'telegram:owner'").run();
+
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(strangerDm('hello'));
+    await waitForDeliveries(1);
+    await settle();
+
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    const [channel, platformId, , , content] = deliverMock.mock.calls[0];
+    expect([channel, platformId]).toEqual(['telegram', 'dm-stranger']);
+    expect(JSON.parse(content as string).text).toBe("I'm my owner's personal agent — I can't help you directly.");
+  });
+
+  it('names the owner in the decline but skips the FYI when no owner DM is reachable on the origin platform', async () => {
+    // The owner exists and is named, but has no Telegram DM to deliver to.
+    (await db()).prepare("DELETE FROM user_dms WHERE user_id = 'telegram:owner'").run();
+
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(strangerDm('hello'));
+    await waitForDeliveries(1);
+    await settle();
+
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    const [, platformId, , , content] = deliverMock.mock.calls[0];
+    expect(platformId).toBe('dm-stranger');
+    expect(JSON.parse(content as string).text).toBe("I'm Owner's personal agent — I can't help you directly.");
+    // The stamp is still written, so the next message is deduped rather than re-declined.
+    const stamps = (await db()).prepare("SELECT id FROM pending_sender_approvals WHERE id LIKE 'decline:%'").all();
+    expect(stamps).toHaveLength(1);
+  });
+});

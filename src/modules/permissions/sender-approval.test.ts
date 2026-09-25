@@ -544,3 +544,98 @@ describe('unknown-sender request_approval flow', () => {
     expect(member).toBeDefined();
   });
 });
+
+describe('unknown-sender request_approval when no card can reach anyone', () => {
+  async function pendingRows(): Promise<number> {
+    const { getRawDb } = await import('../../db/connection.js');
+    return (getRawDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number }).c;
+  }
+
+  it('sends no card and keeps no row when nobody is owner or admin', async () => {
+    getRawDb().prepare("DELETE FROM user_roles WHERE user_id = 'telegram:owner'").run();
+
+    const { requestSenderApproval } = await import('./sender-approval.js');
+    const queued = await requestSenderApproval({
+      messagingGroupId: 'mg-chat',
+      agentGroupId: 'ag-1',
+      senderIdentity: 'tg:stranger',
+      senderName: 'Stranger',
+      event: stranger('hi'),
+    });
+
+    // false: nothing is retained for replay, so the caller does not defer the message.
+    expect(queued).toBe(false);
+    expect(deliverMock).not.toHaveBeenCalled();
+    expect(await pendingRows()).toBe(0);
+  });
+
+  it('does not fall back to an approver on another platform, and leaves the next message free to try again', async () => {
+    // The only owner is on Slack; the stranger wrote on Telegram. The card
+    // carries this workspace's sender identity and text, so it must not cross.
+    getRawDb().prepare("DELETE FROM user_roles WHERE user_id = 'telegram:owner'").run();
+    await upsertUser({ id: 'slack:boss', kind: 'slack', display_name: 'Boss', created_at: now() });
+    await grantRole({
+      user_id: 'slack:boss',
+      role: 'owner',
+      agent_group_id: null,
+      granted_by: null,
+      granted_at: now(),
+    });
+    await createMessagingGroup({
+      id: 'mg-dm-boss',
+      channel_type: 'slack',
+      platform_id: 'dm-boss',
+      name: 'Boss DM',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    getRawDb()
+      .prepare('INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES (?, ?, ?, ?)')
+      .run('slack:boss', 'slack', 'mg-dm-boss', now());
+
+    const { requestSenderApproval } = await import('./sender-approval.js');
+    const input = {
+      messagingGroupId: 'mg-chat',
+      agentGroupId: 'ag-1',
+      senderIdentity: 'tg:stranger',
+      senderName: 'Stranger',
+      event: stranger('hi'),
+    };
+    expect(await requestSenderApproval(input)).toBe(false);
+    expect(await requestSenderApproval({ ...input, event: stranger('hello?') })).toBe(false);
+
+    expect(deliverMock).not.toHaveBeenCalled();
+    expect(await pendingRows()).toBe(0);
+  });
+
+  it('keeps the row after a failed card delivery, so the dedup gate still holds', async () => {
+    deliverMock.mockRejectedValueOnce(new Error('telegram 502'));
+
+    const { requestSenderApproval } = await import('./sender-approval.js');
+    const first = stranger('hi');
+    const queued = await requestSenderApproval({
+      messagingGroupId: 'mg-chat',
+      agentGroupId: 'ag-1',
+      senderIdentity: 'tg:stranger',
+      senderName: 'Stranger',
+      event: first,
+    });
+
+    // The event is retained for replay behind the undelivered card.
+    expect(queued).toBe(true);
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    expect(await pendingRows()).toBe(1);
+
+    const again = await requestSenderApproval({
+      messagingGroupId: 'mg-chat',
+      agentGroupId: 'ag-1',
+      senderIdentity: 'tg:stranger',
+      senderName: 'Stranger',
+      event: stranger('still there?'),
+    });
+    expect(again).toBe(false);
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    expect(await pendingRows()).toBe(1);
+  });
+});
