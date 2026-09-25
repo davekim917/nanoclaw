@@ -47,6 +47,30 @@ const states: Array<{ name: string; remotes: Record<string, string>; expected: s
   { name: 'no registry remote', remotes: { origin: FORK, discord: SIBLING }, expected: 'upstream' },
 ];
 
+const REPO_ROOT = path.resolve(__dirname, '..');
+const INSTALLER_ROOTS = ['.claude/skills', 'container/skills', 'setup', 'scripts'];
+const INSTALLER_FILE = /\.(?:md|sh|[cm]?[jt]s)$/;
+const TEST_FILE = /\.test\.[cm]?[jt]s$/;
+const HARD_CODED_REGISTRY = [
+  /\b(?:origin|upstream)\/(?:channels|providers):/,
+  /\bgit fetch (?:origin|upstream) (?:channels|providers)\b/,
+];
+
+/** Installer text under `rel`: skills, setup and scripts, without tests and without the resolver itself. */
+function installerFiles(rel: string): string[] {
+  const abs = path.join(REPO_ROOT, rel);
+  const stat = fs.lstatSync(abs, { throwIfNoEntry: false });
+  if (!stat || stat.isSymbolicLink()) return [];
+  if (stat.isDirectory()) {
+    return fs
+      .readdirSync(abs)
+      .filter((name) => name !== 'node_modules')
+      .flatMap((name) => installerFiles(path.posix.join(rel, name)));
+  }
+  if (!INSTALLER_FILE.test(rel) || TEST_FILE.test(rel) || rel === 'setup/lib/channels-remote.sh') return [];
+  return [rel];
+}
+
 afterEach(() => {
   process.env = { ...savedEnv };
 });
@@ -79,6 +103,18 @@ describe('registry remote resolution', () => {
     const resolved = repo({ origin: FORK });
     expect(resolveRegistryRemote(resolved)).toBe('upstream');
     expect(git(resolved, ['remote', 'get-url', 'upstream'])).toBe(REGISTRY);
+  });
+
+  it('no installer hard-codes the remote a registry branch comes from', () => {
+    const offenders = INSTALLER_ROOTS.flatMap(installerFiles).flatMap((rel) =>
+      fs
+        .readFileSync(path.join(REPO_ROOT, rel), 'utf8')
+        .split('\n')
+        .flatMap((line, i) =>
+          HARD_CODED_REGISTRY.some((re) => re.test(line)) ? [`${rel}:${i + 1}: ${line.trim()}`] : [],
+        ),
+    );
+    expect(offenders, 'resolve the remote with setup/lib/channels-remote.sh (resolve_channels_remote)').toEqual([]);
   });
 
   it('ignores an inherited GIT_DIR and acts on the repository it runs in', () => {
