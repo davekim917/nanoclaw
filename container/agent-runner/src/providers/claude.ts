@@ -2659,9 +2659,13 @@ export class ClaudeProvider implements AgentProvider {
     return transcriptPath !== null && transcriptContainsUserText(transcriptPath, prompt, sinceMs);
   }
 
+  /** The CLI authenticates with the OAuth ring only when no API key is set; a set key wins. */
+  private usingOauth(): boolean {
+    return !this.env.ANTHROPIC_API_KEY && Boolean(this.env.CLAUDE_CODE_OAUTH_TOKEN);
+  }
+
   rotateApiKey(): { rotated: boolean; slot?: string; position?: number; ringSize?: number } {
-    const usingOauth = !this.env.ANTHROPIC_API_KEY && Boolean(this.env.CLAUDE_CODE_OAUTH_TOKEN);
-    if (usingOauth) {
+    if (this.usingOauth()) {
       // Circular: advance around the ring (wrapping past the last fallback
       // back to the primary). Give up only once we've visited every OTHER
       // credential this cycle — so a transient failure on the current token
@@ -2911,13 +2915,16 @@ export class ClaudeProvider implements AgentProvider {
     // meaningless line. Captured here, not read at sample time: the CLI
     // subprocess is started with this query's env, so the slot is fixed for
     // the life of the query even if the ring advances afterwards.
-    const oauthSlot = this.oauthRing[this.oauthRingPos]?.name ?? null;
+    // A container can hold the ring AND an API key; the key is then what the
+    // CLI uses, so its samples belong to no slot.
+    const usingOauth = this.usingOauth();
+    const oauthSlot = usingOauth ? (this.oauthRing[this.oauthRingPos]?.name ?? null) : null;
     // The slot name alone is ambiguous: scoped per-group tokens are forwarded
     // under the same `_N` names as the global pool, so identity is the PAIR
     // (credentialSet, account). `lane` is operator-declared install policy.
     const who: AccountIdentity = {
       account: oauthSlot,
-      credentialSet: process.env.NANOCLAW_OAUTH_CREDENTIAL_SET ?? null,
+      credentialSet: usingOauth ? (process.env.NANOCLAW_OAUTH_CREDENTIAL_SET ?? null) : null,
       lane: laneForSlot(process.env.CLAUDE_CODE_OAUTH_LANES, oauthSlot),
     };
 

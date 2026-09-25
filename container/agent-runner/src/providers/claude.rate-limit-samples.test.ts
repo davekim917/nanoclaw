@@ -306,6 +306,17 @@ describe('capture through the provider', () => {
     });
   });
 
+  it('stamps no slot or credential set when an API key is the active auth, even with the ring present', async () => {
+    sdkMessages.push(INIT_MSG, { type: 'rate_limit_event', rate_limit_info: { status: 'allowed' } }, RESULT_MSG);
+    process.env.NANOCLAW_OAUTH_CREDENTIAL_SET = 'global';
+
+    await runTurn({ ANTHROPIC_API_KEY: 'sk-test', CLAUDE_CODE_OAUTH_TOKEN: 'tok-primary' });
+
+    expect(getRateLimitSampleRows()).toEqual([
+      expect.objectContaining({ source: 'rate_limit_event', account: null, credential_set: null, lane: null }),
+    ]);
+  });
+
   it('does not crash on a reshaped unifiedWindows', async () => {
     sdkMessages.push(
       INIT_MSG,
