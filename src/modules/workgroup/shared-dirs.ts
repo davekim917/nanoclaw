@@ -663,7 +663,6 @@ interface SiblingSharedLink {
   state: 'current' | 'real' | 'repoint';
 }
 
-/** Every existing sibling's entry for each moved shared dir, classified. */
 function* siblingSharedLinks(
   groupsDir: string,
   siblingFolders: string[],
