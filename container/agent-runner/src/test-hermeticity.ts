@@ -33,6 +33,39 @@ export interface HermeticityAttempt {
   callSite: string;
 }
 
+/**
+ * Inherited `GIT_*` variables point every fixture git command at a real
+ * repository: on 2026-09-25 a `GIT_DIR` exported by `git bisect run` let a host
+ * test write `core.bare=true` into the shared checkout. The whole prefix is
+ * dropped before any test file loads; a test that needs one sets it on the
+ * child it spawns. Host counterpart: `src/test-git-env.ts`.
+ *
+ * Deleting from `process.env` is not enough under Bun (1.3.12): a child spawned
+ * without an explicit `env` gets the environment the process started with, not
+ * the edited `process.env`. `guardBunSubprocess` below fills that gap.
+ */
+const strippedGitEnv = Object.keys(process.env).filter((key) => key.startsWith('GIT_'));
+for (const key of strippedGitEnv) delete process.env[key];
+
+/**
+ * Give a `Bun.spawn`/`Bun.spawnSync` call that names no `env` the current
+ * `process.env`, so the stripped variables stay stripped in the child. Only
+ * applied when something was stripped; `child_process` reaches this layer
+ * with `env: undefined`.
+ */
+function withCurrentEnv(args: unknown[]): unknown[] {
+  if (strippedGitEnv.length === 0) return args;
+  const [first, second] = args;
+  if (Array.isArray(first)) {
+    const options = (second ?? {}) as { env?: unknown };
+    return options.env == null ? [first, { ...options, env: { ...process.env } }, ...args.slice(2)] : args;
+  }
+  if (first && typeof first === 'object' && (first as { env?: unknown }).env == null) {
+    return [{ ...(first as object), env: { ...process.env } }, ...args.slice(1)];
+  }
+  return args;
+}
+
 function readMode(): HermeticityMode {
   const raw = (process.env.NANOCLAW_TEST_HERMETICITY ?? '').trim().toLowerCase();
   if (raw === 'warn' || raw === 'off' || raw === 'enforce') return raw;
@@ -247,7 +280,7 @@ function guardBunSubprocess(): void {
           ? (first as { cmd: unknown[] }).cmd
           : [];
       if (!insideGuardedSubprocess) checkSubprocess(`Bun.${api}`, [String(argv[0] ?? first)]);
-      return original(...args);
+      return original(...withCurrentEnv(args));
     };
   }
 }
