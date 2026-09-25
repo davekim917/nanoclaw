@@ -129,23 +129,32 @@ describe('SQLite runner mailbox canonical serialization', () => {
 
   test('counts conversation traffic from separate inbound and outbound cursors', () => {
     const { inbound, outbound } = initTestSessionDb();
+    const T = 'slack:C1:171.1';
     const addIn = inbound.prepare(
-      `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, trigger, content)
-       VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z', 'pending', 0, 1, '{}')`,
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, trigger, platform_id, thread_id, content)
+       VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z', 'pending', 0, 1, ?, ?, '{}')`,
     );
     const addOut = outbound.prepare(
-      `INSERT INTO messages_out (id, seq, kind, timestamp, content) VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z', '{}')`,
+      `INSERT INTO messages_out (id, seq, kind, timestamp, platform_id, thread_id, content)
+       VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z', ?, ?, '{}')`,
     );
     // Inbound numbering trails outbound: the host counts from inbound.db alone.
-    addIn.run('in-2', 2, 'chat');
-    addOut.run('list', 11, 'task_list');
-    addIn.run('in-4', 4, 'chat-sdk');
-    addIn.run('in-6', 6, 'system');
-    addOut.run('reply', 13, 'chat');
+    addIn.run('in-2', 2, 'chat-sdk', 'slack:C1', T);
+    addOut.run('list', 11, 'task_list', 'slack:C1', T);
+    addIn.run('in-4', 4, 'chat-sdk', 'slack:C1', T);
+    addIn.run('in-6', 6, 'system', 'slack:C1', T);
+    // A host/system note (inbound `chat`, the group as its platform) and
+    // traffic in another thread never show below the list.
+    addIn.run('in-8', 8, 'chat', 'ag-1', null);
+    addIn.run('in-10', 10, 'chat-sdk', 'slack:C1', 'slack:C1:999.9');
+    addOut.run('elsewhere', 15, 'chat', 'slack:C2', null);
+    addOut.run('reply', 13, 'chat', 'slack:C1', T);
     const mailbox = new SqliteAgentMailbox();
-    expect(mailbox.maxInboundSeq()).toBe(6);
-    // After the list (outbound 11, inbound 2): in-4 and the reply; not the system row.
-    expect(mailbox.countConversationMessagesAfter(11, 2)).toBe(2);
+    expect(mailbox.maxInboundSeq()).toBe(10);
+    // After the list (outbound 11, inbound 2): in-4 and the reply only.
+    expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'slack:C1', threadId: T })).toBe(2);
+    // A channel-level conversation (null thread) matches null exactly.
+    expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'slack:C2', threadId: null })).toBe(1);
   });
 
   test('reads one inbound message route by id', () => {

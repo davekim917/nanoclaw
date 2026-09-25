@@ -45,7 +45,8 @@ mock.module('../db/container-state.js', () => ({
 }));
 
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
-const { ClaudeProvider, preToolUseHook, postToolUseHook } = await import('./claude.js');
+const { ClaudeProvider, preToolUseHook, postToolUseHook, TASK_LIST_TOOL_NAME, createSubagentTaskListDenyHook } =
+  await import('./claude.js');
 
 type HookEntry = { matcher?: string; hooks: HookCallback[] };
 
@@ -79,5 +80,37 @@ describe('claude provider hook registration', () => {
     // ceiling open for the life of the query.
     expect(hookTable('PostToolUse').flatMap((e) => e.hooks)).toContain(postToolUseHook);
     expect(hookTable('PostToolUseFailure').flatMap((e) => e.hooks)).toContain(postToolUseHook);
+  });
+});
+
+describe('the live task list is the main agent’s alone', () => {
+  it('registers the subagent deny hook on the task-list tool', () => {
+    const entry = hookTable('PreToolUse').find((e) => e.matcher === TASK_LIST_TOOL_NAME);
+    expect(entry).toBeDefined();
+    expect(entry?.hooks).toHaveLength(1);
+  });
+
+  it('names the tool the way the CLI names the nanoclaw MCP server’s tools', () => {
+    expect(TASK_LIST_TOOL_NAME).toBe('mcp__nanoclaw__update_task_list');
+  });
+
+  const call = (extra: Record<string, unknown>) =>
+    createSubagentTaskListDenyHook()(
+      { hook_event_name: 'PreToolUse', tool_name: TASK_LIST_TOOL_NAME, tool_input: {}, ...extra } as never,
+      undefined,
+      { signal: new AbortController().signal },
+    );
+
+  it('denies a call made inside a subagent', async () => {
+    const out = (await call({ agent_id: 'a75fb5f7ad8cf91c1', agent_type: 'worker' })) as {
+      hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string };
+    };
+    expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out.hookSpecificOutput?.permissionDecisionReason).toContain('main agent');
+  });
+
+  it('lets the main thread through, including an --agent session (agent_type without agent_id)', async () => {
+    expect(await call({})).toEqual({ continue: true });
+    expect(await call({ agent_type: 'main-role' })).toEqual({ continue: true });
   });
 });

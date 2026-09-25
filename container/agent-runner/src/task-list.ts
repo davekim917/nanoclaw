@@ -322,9 +322,34 @@ export async function applyTaskListUpdate(
     }
   }
 
+  // A new list whose finished predecessor is still the last thing in this
+  // conversation takes over that post instead of stacking under it: a fresh
+  // post there leaves a "Latest task list" link pointing at the message right
+  // below it (seen live 2026-09-25). Only a finished list — an unfinished one
+  // replaced by `new_list` stays visible as it was.
+  let reused = false;
+  if (
+    !current &&
+    prev &&
+    prev.finished &&
+    prev.stale !== true &&
+    sameRoute(routing, prev) &&
+    prev.platformMessageId &&
+    prev.postSeq !== null &&
+    deps.messagesAfter(prev.postSeq, prev.postInboundSeq ?? prev.postSeq) === 0
+  ) {
+    current = prev;
+    target = prev.platformMessageId;
+    reused = true;
+    if (prev.supersedes) {
+      await collapse(prev.supersedes.platformMessageId, target);
+      current = { ...prev, supersedes: null };
+    }
+  }
+
   const next: TaskListState = {
     version: 1,
-    generation: current ? current.generation : (prev?.generation ?? 0) + 1,
+    generation: current && !reused ? current.generation : (prev?.generation ?? 0) + 1,
     revision: (prev?.revision ?? 0) + 1,
     title: input.title,
     items: input.items,

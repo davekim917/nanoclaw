@@ -166,13 +166,25 @@ export class SqliteAgentMailbox implements AgentMailbox {
     );
   }
 
-  countConversationMessagesAfter(outboundSeq: number, inboundSeq: number): number {
+  countConversationMessagesAfter(
+    outboundSeq: number,
+    inboundSeq: number,
+    route: { platformId: string; threadId: string | null },
+  ): number {
+    // Only what shows in that conversation: platform messages (`chat-sdk` —
+    // an inbound `chat` row is a host/system note, never on screen) and the
+    // agent's own chat posted there. Counting session-wide made a thread look
+    // busy over system notes and messages to other destinations.
     const inbound = getInboundDb()
-      .prepare("SELECT COUNT(*) AS n FROM messages_in WHERE seq > ? AND kind IN ('chat', 'chat-sdk')")
-      .get(inboundSeq) as { n: number };
+      .prepare(
+        "SELECT COUNT(*) AS n FROM messages_in WHERE seq > ? AND kind = 'chat-sdk' AND platform_id = ? AND thread_id IS ?",
+      )
+      .get(inboundSeq, route.platformId, route.threadId) as { n: number };
     const outbound = getOutboundDb()
-      .prepare("SELECT COUNT(*) AS n FROM messages_out WHERE seq > ? AND kind = 'chat'")
-      .get(outboundSeq) as { n: number };
+      .prepare(
+        "SELECT COUNT(*) AS n FROM messages_out WHERE seq > ? AND kind = 'chat' AND platform_id = ? AND thread_id IS ?",
+      )
+      .get(outboundSeq, route.platformId, route.threadId) as { n: number };
     return inbound.n + outbound.n;
   }
 

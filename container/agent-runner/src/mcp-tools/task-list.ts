@@ -47,7 +47,8 @@ export const TASK_LIST_DESCRIPTION =
   'A follow-up that arrives while you work: react to acknowledge it and add it as an item, rather than starting another list. ' +
   'The list is progress, not the deliverable: post results, findings and answers as their own messages. ' +
   'Updating the list notifies no one, so a blocker, a question, an approval you need, or the final result goes in a new message, and you @-mention someone only when they must act. ' +
-  'Set new_list true only to start unrelated work while an older list is unfinished; a finished list is replaced automatically.';
+  'Set new_list true only to start unrelated work while an older list is unfinished; a finished list is replaced automatically. ' +
+  'Only the main agent keeps the list: a delegated subagent or worker never calls this tool, and reports its progress in its result instead.';
 
 export const updateTaskList: McpToolDefinition = {
   tool: {
@@ -142,7 +143,11 @@ export const updateTaskList: McpToolDefinition = {
         return { platformId: null, failed: true };
       },
       inboundSeq: () => ops.maxInboundSeq(),
-      messagesAfter: (outboundSeq, inboundSeq) => ops.countConversationMessagesAfter(outboundSeq, inboundSeq),
+      messagesAfter: (outboundSeq, inboundSeq) =>
+        ops.countConversationMessagesAfter(outboundSeq, inboundSeq, {
+          platformId: routing.platformId,
+          threadId: routing.threadId,
+        }),
       now: () => new Date(),
     };
     // One update at a time: each reads, writes and saves the one record, so a

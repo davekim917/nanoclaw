@@ -54,11 +54,16 @@ export interface MailboxOperations {
   getRoutingBySeq(sequence: number): SessionRouting | null;
   getLatestInboundRoute(channelType: string, platformId: string): { threadId: string | null; inReplyTo: string } | null;
   /**
-   * Human or agent chat messages after a point in each mailbox (task-list
-   * repost check). Separate cursors: the host numbers inbound rows from
+   * Platform messages and the agent's own chat in ONE conversation (platform
+   * + thread) after a point in each mailbox — the task list's "is anything
+   * below it" check. Separate cursors: the host numbers inbound rows from
    * inbound.db alone, so one sequence cannot order both directions.
    */
-  countConversationMessagesAfter(outboundSeq: number, inboundSeq: number): number;
+  countConversationMessagesAfter(
+    outboundSeq: number,
+    inboundSeq: number,
+    route: { platformId: string; threadId: string | null },
+  ): number;
   /** Highest inbound sequence number so far (0 when empty). */
   maxInboundSeq(): number;
   /** Where one inbound message came from. */

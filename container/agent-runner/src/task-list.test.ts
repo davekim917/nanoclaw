@@ -191,7 +191,8 @@ describe('applyTaskListUpdate', () => {
   });
 
   it('starts a new list after a finished one and points the old one at it', async () => {
-    const h = harness();
+    // Conversation below the finished list: the new one goes at the bottom.
+    const h = harness({ messagesAfter: 1 });
     await applyTaskListUpdate(input('First', items(['A', 'done'])), SLACK, h.deps);
     expect(h.state?.finished).toBe(true);
     const out = await applyTaskListUpdate(input('Second', items(['B', 'in_progress'])), SLACK, h.deps);
@@ -209,6 +210,21 @@ describe('applyTaskListUpdate', () => {
     await applyTaskListUpdate(input('First', items(['A', 'in_progress'])), SLACK, h.deps);
     await applyTaskListUpdate(input('Other', items(['B', 'pending']), true), SLACK, h.deps);
     expect(h.state?.generation).toBe(2);
+    // Nothing below it, but the unfinished list must stay on screen: a new post.
+    expect(h.writes[1].content.operation).toBeUndefined();
+  });
+
+  it('takes over a finished list’s post when nothing sits below it', async () => {
+    const h = harness({ messagesAfter: 0 });
+    await applyTaskListUpdate(input('First', items(['A', 'done'])), SLACK, h.deps);
+    const out = await applyTaskListUpdate(input('Second', items(['B', 'in_progress'])), SLACK, h.deps);
+    expect(out).toMatchObject({ ok: true, action: 'edited' });
+    expect(h.state?.generation).toBe(2);
+    expect(h.state?.finished).toBe(false);
+    // One post, edited in place — no second list and no "Latest task list" pointer.
+    expect(h.writes).toHaveLength(2);
+    expect(h.writes[1].content).toMatchObject({ operation: 'edit', messageId: '1786621600.001' });
+    expect(String(h.writes[1].content.text)).toContain('Second');
   });
 
   it('a list left behind by /clear is replaced, not edited', async () => {
@@ -267,7 +283,7 @@ describe('applyTaskListUpdate', () => {
   });
 
   it('never collapses a list into a pointer at a replacement that failed', async () => {
-    const h = harness();
+    const h = harness({ messagesAfter: 1 });
     await applyTaskListUpdate(input('T', items(['A', 'done'])), SLACK, h.deps);
     h.setDeliver('failed');
     await applyTaskListUpdate(input('Next', items(['B', 'in_progress']), true), SLACK, h.deps);
