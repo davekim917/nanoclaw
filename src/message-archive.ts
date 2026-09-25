@@ -216,7 +216,7 @@ function initSchema(db: Database.Database): void {
  * Create `archive_row_marks` and its triggers, and say so ONCE.
  *
  * The archive projection's freshness stamp fails closed while these are
- * absent — every spawn rebuilds, which is the pre-#360 behavior — so an
+ * absent — every spawn rebuilds — so an
  * operator upgrading a live install needs to see the moment they appear. The
  * existence check reads `sqlite_master` rather than trusting the silence of
  * `IF NOT EXISTS`, which cannot tell "created" from "already there", and it
@@ -248,7 +248,7 @@ function ensureArchiveRowMarks(db: Database.Database): void {
  * reads it.
  *
  * `initSchema` is otherwise reached only through the lazy `openDb()`, which
- * runs on the first archive WRITE. On a host upgrading into #360 that means
+ * runs on the first archive WRITE. On an upgraded host that means
  * `archive_row_marks` would not exist until some unrelated chat traffic
  * happened to arrive — and until it does, every archive projection stamp
  * reports an unknown mutation count and fails closed, so every spawn keeps
@@ -351,7 +351,7 @@ export function archiveMessage(msg: ArchiveMessage): boolean {
  * rather than by messaging group id. Sibling bots on one conversation archive it
  * under their own channel_type (`discord`, `discord-codex`, ...) with the base
  * prefix on platform_id; those copies pool by channel family, the same rule as
- * `search_threads` (container/agent-runner/src/mcp-tools/thread-search.ts:54-61),
+ * `search_threads` (container/agent-runner/src/mcp-tools/thread-search.ts),
  * while a native adapter's unprefixed id keeps exact channel_type matching. Used by
  * src/continue-thread.ts as evidence that a thread really exists on a destination.
  */

@@ -153,5 +153,3 @@ function yamlScalar(value: string): string {
   if (!needsQuoting) return value;
   return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
-
-export { MANAGED_MARKER };

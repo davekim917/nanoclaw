@@ -30,7 +30,7 @@
  * mount time — it reads whatever value sanitizeCanonicalConfig/the
  * migration pass already wrote into the repo's own .git/config, and that
  * value is always the ONE exported MANAGED_GIT_HOOKS_SCAN_DIR constant
- * (never re-derived per writer — #666 review B12: any writer producing a
+ * (never re-derived per writer — any writer producing a
  * different string silently drops the repo out of hook coverage, since
  * nothing mounts at a `core.hooksPath` value that doesn't match exactly).
  */
@@ -45,7 +45,7 @@ import { repositoryConfigPath, safeGitConfigGet, safeGitConfigSet } from './safe
 import { discoverCanonicalRepositories, repositoriesRoot } from './repository-workspaces.js';
 
 const MANAGED_GIT_HOOKS_ROOT = path.join(DATA_DIR, 'managed-git-hooks');
-/** The ONE value every writer (sanitize template, migration pass, migration temp canonical) must use for core.hooksPath, and the ONE value every mount check compares against (#666 review B12). */
+/** The ONE value every writer (sanitize template, migration pass, migration temp canonical) must use for core.hooksPath, and the ONE value every mount check compares against. */
 export const MANAGED_GIT_HOOKS_SCAN_DIR = path.join(MANAGED_GIT_HOOKS_ROOT, 'scan');
 export const MANAGED_GIT_HOOKS_REFUSE_DIR = path.join(MANAGED_GIT_HOOKS_ROOT, 'refuse');
 export const MANAGED_HOOK_FILENAME = 'pre-push';
@@ -55,7 +55,7 @@ export const MANAGED_PATTERNS_FILENAME = 'nanoclaw-secret-patterns.sh';
 // transitively by repository-workspaces/index.ts, which a lot of unrelated
 // tests pull in through a PARTIAL `./config.js` mock that has no reason to
 // know about REPO_ROOT. A module-scope `path.join(REPO_ROOT, ...)` crashed
-// every one of those at import time (#666 review, CI round) even though
+// every one of those at import time even though
 // none of them ever call refreshManagedGitHooks. Only evaluate REPO_ROOT
 // inside the function that actually reads it.
 function hookSourcePath(): string {
@@ -71,17 +71,17 @@ function patternsSourcePath(): string {
  * SECRET_BLOCK_RE has real false-positive vectors in code (PEM/AWS-example
  * fixtures, test tokens) that the wiki content shape doesn't. Widen this
  * list only after that false-positive rate is measured for code repos the
- * way #666 measured it for wiki (see scripts/wiki-pre-push-hook.sh's header
+ * way it was measured for wiki (see scripts/wiki-pre-push-hook.sh's header
  * for the historical wiki numbers).
  *
  * The ONE list this predicate reads. The runner keeps its own copy of this
- * predicate (container/agent-runner/src/mcp-tools/git-worktrees.ts:109-111,
+ * predicate (container/agent-runner/src/mcp-tools/git-worktrees.ts,
  * `isScanPolicyRepositoryName`, needed because it cannot import host src/ —
  * see that file's comment) sourced from
  * container/agent-runner/src/mcp-tools/scan-policy-repos.json, the same
  * array duplicated here rather than re-derived. src/managed-git-hooks.test.ts's
  * "runner/host scan-policy lists" test reads both and asserts they
- * deep-equal, so the two can never silently drift apart (#680 follow-up).
+ * deep-equal, so the two can never silently drift apart.
  */
 export const SCAN_POLICY_REPOSITORY_NAMES: readonly string[] = ['wiki'];
 
@@ -129,7 +129,7 @@ function atomicWriteInDir(dir: string, filename: string, content: Buffer, mode: 
 
 /**
  * Validate every component of a managed-hooks directory path, not just the
- * leaf (#666 review B11): `<root>/managed-git-hooks/scan` (or `refuse`) is
+ * leaf: `<root>/managed-git-hooks/scan` (or `refuse`) is
  * walked component by component via resolveContainedRealDirectory
  * (src/fs-safety.ts — the same helper host reconciliation uses to refuse a
  * container-planted symlink), which throws on any symlink or non-directory
@@ -154,7 +154,7 @@ function isHostOwned(dir: string): boolean {
  * Create `path.join(parent, name)` if missing and confirm it is a real,
  * non-symlink directory — `parent` itself must already be a validated real
  * directory (the caller's job; see ensureManagedDirChain below). Uses a
- * NON-recursive mkdirSync deliberately (#666 review P3-1): a recursive
+ * NON-recursive mkdirSync deliberately: a recursive
  * mkdir creates every missing intermediate component in one call, so if
  * `parent` turned out to be a symlink, the write would already have
  * happened INSIDE the symlink's target by the time any validation ran
@@ -208,8 +208,8 @@ function ensureManagedDirChain(dir: string): void {
  * Writes the lib before the hook so nothing ever observes a hook without
  * its sourced dependency.
  *
- * Records the resulting hashes in this process's own memory (#666 review
- * B4) — checkScanHooksIntegrity below compares the installed files against
+ * Records the resulting hashes in this process's own memory —
+ * checkScanHooksIntegrity below compares the installed files against
  * THESE recorded values, never against a live re-read of REPO_ROOT. Without
  * this, any deploy that touched scripts/wiki-pre-push-hook.sh or
  * secret-scan.sh between boots would make every spawn's integrity check see
@@ -265,7 +265,7 @@ function checkScanHooksIntegrity(scanDir: string): boolean {
 
 /**
  * The refuse hook's ENTIRE content: a compiled string constant, never a
- * file read from REPO_ROOT (#666 review B6) — a live source read here would
+ * file read from REPO_ROOT — a live source read here would
  * bring the exact "deploy changed the file mid-uptime" failure mode this
  * fallback exists to survive back into the fallback itself. `/bin/sh`, one
  * message, unconditional `exit 1`; depends on neither bash nor the pattern
@@ -288,7 +288,7 @@ const REFUSE_HOOK_CONTENT = Buffer.from(
 
 /**
  * Write (or overwrite) the refuse hook at `refuseDir`, atomically, mode
- * 0755 explicitly (#666 review B6: git silently skips a 0644 hook and
+ * 0755 explicitly (git silently skips a 0644 hook and
  * exits 0, so an accidental non-executable write would be worse than no
  * write at all). Independent of refreshManagedGitHooks — has its own
  * try/catch at the boot call site, and is also called lazily from
@@ -302,8 +302,7 @@ export function ensureRefuseHook(refuseDir: string = MANAGED_GIT_HOOKS_REFUSE_DI
 
 /**
  * Non-throwing integrity check for the refuse/ directory — validated as
- * strictly as the scan/ directory (#666 review, "validate the refuse hook
- * as strictly as the managed one"): real non-symlink directory chain,
+ * strictly as the scan/ directory: real non-symlink directory chain,
  * host-owned, the hook file a real executable regular file whose content is
  * byte-identical to REFUSE_HOOK_CONTENT.
  */
@@ -323,8 +322,8 @@ function checkRefuseHookIntegrity(refuseDir: string): boolean {
 export type HooksMountStrategy = 'scan' | 'refuse' | 'withhold';
 
 /**
- * The fallback order every scan-policy spawn decision goes through (#666
- * review, ordering-analysis message): git itself runs NO hook and exits 0
+ * The fallback order every scan-policy spawn decision goes through: git
+ * itself runs NO hook and exits 0
  * when `core.hooksPath` points at a missing or non-executable path
  * (verified on git 2.43), so a degrade path that merely "mounts nothing"
  * would silently let pushes through unscanned — worse than doing nothing at
@@ -384,8 +383,8 @@ export interface CanonicalHooksPathMigrationResult {
  * and reported in `alerts`, never silently skipped or overwritten. Returns
  * counts only — never repo names, so this is safe to log/report verbatim.
  *
- * Each repository's migration attempt gets its OWN try/catch (#666 review
- * P2-2: safeGitConfigGet/Set used to throw outside any per-repo guard — a
+ * Each repository's migration attempt gets its OWN try/catch
+ * (safeGitConfigGet/Set used to throw outside any per-repo guard — a
  * stale config.lock on one repo took the whole pass, and therefore boot,
  * down). A failure here counts toward `alerts` the same as a non-default
  * hooksPath does; the two are distinguished only in the log line, never in
@@ -456,7 +455,7 @@ export function migrateExistingCanonicalHooksPath(dataDir: string = DATA_DIR): C
  * anything that can spawn a container — see initializeManagedGitHooks's own
  * call site in src/main.ts for the exact placement and why.
  *
- * Three independent steps, each with its own try/catch (#666 review B3):
+ * Three independent steps, each with its own try/catch:
  * boot must never abort because this module failed, in whole or in part.
  * decideHooksMountStrategy's own fallback order (scan -> refuse -> withhold)
  * is what actually protects a real push from going unscanned if any of

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// callHaiku now resolves credentials through the same structuredCredentials()
-// path callClaudeStructured uses, which merges in `.env`-file values via
+// callHaiku resolves credentials through structuredCredentials(), which
+// merges in `.env`-file values via
 // readEnvFileMatching() whenever passed process.env directly. Stub it out so
 // tests never touch the real on-disk `.env` (which, on a live install, holds
 // real OAuth tokens) — credential slots for these tests come exclusively

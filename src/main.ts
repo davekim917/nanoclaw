@@ -198,8 +198,7 @@ async function checkBuildDrift(buildInfo: ReturnType<typeof readBuildInfo>): Pro
     if (result.code === 0) {
       // Only a verified delivery is recorded. Stamping the marker before the
       // send would remember a FAILED alert as sent and never retry it — the
-      // same false-receipt defect that muted host alerting for three days
-      // (fork #538, PR #556).
+      // same false-receipt defect that muted host alerting for three days.
       writeBuildDriftAlertState({ buildSha, headSha: head });
     } else {
       log.warn('build-drift: could not DM the owner', { code: result.code, message: result.message });
@@ -458,7 +457,7 @@ export async function runBootMountQuiescence(
   // skip the survivors — their containers are not interrupted, and the note
   // says they were. That skip set exists only once the door has listed and
   // partitioned, and the note still has to precede the stop pass, which can
-  // outlast the heartbeat freshness window (#441). A door that dies half way
+  // outlast the heartbeat freshness window. A door that dies half way
   // through its stops leaves the note already written for every must-stop
   // session; a door whose listing fails writes none, and the boot fails there.
   // The door calls it a second time only when its post-stop re-evaluation
@@ -653,7 +652,7 @@ export async function main(): Promise<void> {
   // `archive_row_marks` and its triggers are created by the archive's lazy
   // open, which fires on the first archive WRITE. Until they exist every
   // projection freshness stamp reports an unknown mutation count and fails
-  // closed, so every spawn does the full 19 s rebuild #360 exists to remove.
+  // closed, so every spawn does the full 19 s rebuild the stamps exist to remove.
   //
   // Ahead of the dashboard for the same reason the OneCLI preflight below is:
   // `startDashboard()` exposes endpoints that reach `wakeContainer` — a
@@ -668,7 +667,7 @@ export async function main(): Promise<void> {
   // that depends only on DATA_DIR, so this is the earliest honest position.
   ensureArchiveSchema();
 
-  // Snapshot the agent-runner source for this boot (mailbox seam PR 0) —
+  // Snapshot the agent-runner source for this boot —
   // must happen before anything can spawn a container, so every spawn this
   // process makes mounts the same tree, not the live checkout mid-`git pull`.
   activateAgentRunnerSource();
@@ -846,7 +845,7 @@ export async function main(): Promise<void> {
   }
 
   // 2-ter. Drain the pending rows left in sessions closed before S19 learned
-  // to expire them (#520). Bounded and self-draining — a session whose rows
+  // to expire them. Bounded and self-draining — a session whose rows
   // are expired stops pinning `sessionHasOpenWork`, reclaim removes its
   // directory, and the next boot skips it on a statSync. Non-fatal.
   try {
@@ -907,8 +906,8 @@ export async function main(): Promise<void> {
   // E also leaves a `// F2 hook` marker at the END of `adoptRunningSessions`,
   // and this call deliberately does NOT move there: it can spawn, and adoption
   // must stay a pure inventory pass with no wake inside it. §7.F says `main()`.
-  // The recovery wake goes through the seam like every other wake (T0 PR 3
-  // gate): the module-internal default exists for the unit tests, main()
+  // The recovery wake goes through the seam like every other wake: the
+  // module-internal default exists for the unit tests, main()
   // injects requestWake so a recovered restart records the same wake signal a
   // live one does.
   await honorPendingStopIntents((session) => requestWake(session, 'container-restart'));
@@ -951,7 +950,7 @@ export async function main(): Promise<void> {
         const incoming = { platform: adapter.channelType, source: 'adapter' as const };
         const updates = resolveChannelMetadataUpdates(mg, name, isGroup, incoming);
         if (Object.keys(updates).length === 0) return;
-        // The provenance check runs again INSIDE the write (#416 site 5): the
+        // The provenance check runs again INSIDE the write: the
         // read above and this write are separated by an await, and the
         // router's classified name may land between them.
         await applyChannelMetadataUpdates(mg.id, updates, incoming);
@@ -1013,13 +1012,13 @@ export async function main(): Promise<void> {
   // behalf — archive init, FS reconciliation, the OneCLI preflight,
   // container-config backfill, channel adapters, and the delivery bridge
   // just above — has to be up first, or an `ncl` call racing them could read
-  // or write into state that is still mid-setup (PR #453 review, round 2).
+  // or write into state that is still mid-setup.
   markCliServerReady();
 
   // 4b. Host module lifecycle (upstream seam) — modules register onHostStart/
   // onHostShutdown callbacks at import time; this is where registered start
   // work actually begins (docs/specs/upstream-host-sweep-seam/plan.md §4.1).
-  // PR 0 registers nothing, so this is inert by construction.
+  // Inert when no module registers anything.
   await startHostModules({ db: getDb(), signal: hostAbortController.signal });
 
   // Start recovery only after permissions and delivery are fully wired. A

@@ -69,7 +69,7 @@ export const QUIET_SESSION_BACKOFF_MS = 30 * 60_000;
  * expires somewhere in [floor, 1) x the backoff above, never past it.
  *
  * Without a jitter every session marked in the same tick expires in the same
- * tick. Live (#320): the whole quiet population — ~840 sessions — came back on
+ * tick. Live: the whole quiet population — ~840 sessions — came back on
  * one exact 30-minute grid 48 times a day, and each of those was a ~30 s tick
  * that swept every active session at once. This spreads that cohort across the
  * 15 minutes below the cap. It only ever SHORTENS a skip, so plan.md §4.4's
@@ -126,7 +126,7 @@ export function _resetQuietSessionCacheForTesting(): void {
  *
  * The map is process-local, so before this every restart threw the whole cache
  * away and the first tick swept every active session — ~850 of them, a 457 s
- * tick, nine times in the 22 hours of log #320 was filed against. One query,
+ * tick, nine times in 22 hours of log. One query,
  * no session-DB opens.
  *
  * Safe by construction rather than by re-derivation, on three counts:
@@ -180,7 +180,7 @@ export const CLAIM_STUCK_MS = 60 * 1000;
 export const SPAWN_GRACE_MS = 60 * 1000;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Sweep duty registry (convergence seam 2, PR 2)
+// Sweep duty registry
 //
 // The tick used to be a prose list of statements. It is now a driver over this
 // registry: a duty declares WHICH window it runs in (`phase`) and WHERE in that
@@ -190,7 +190,7 @@ export const SPAWN_GRACE_MS = 60 * 1000;
 // window — expressed as data instead of as the order of statements in one
 // function. docs/specs/upstream-host-sweep-seam/plan.md §4.3-§4.5.
 //
-// PR 2 is behavior-preserving: the same duty bodies run in the same windows
+// The registry is behavior-preserving: the same duty bodies run in the same windows
 // with the same guards, the same cadences and the same two error strings. What
 // is new is structure — both error lines now carry `duty` and `window`, and a
 // family PR can move a body into `src/modules/sweep-<family>/` by moving its
@@ -273,8 +273,8 @@ export interface ContainerObservation {
   lastInboundAtMs: number | null;
   /**
    * WHICH container the state above is about, read in the same turn so a duty
-   * can tell it apart from a replacement registered while the duty awaited
-   * (#505). Null when nothing is registered.
+   * can tell it apart from a replacement registered while the duty awaited.
+   * Null when nothing is registered.
    */
   containerIdentity: ContainerIdentity | null;
 }
@@ -322,7 +322,7 @@ export interface SweepSessionContext extends SweepTickContext {
    */
   reportWoke(woke: boolean): void;
   /**
-   * Wake instrumentation (#359). A duty that starts a container wake says so,
+   * Wake instrumentation. A duty that starts a container wake says so,
    * and says whether the per-session loop waited for it and for how long.
    *
    * `sessionsMs` alone mixed "walked N sessions" with "waited on M container
@@ -598,7 +598,7 @@ export function dutyFailureFields(err: unknown): { duty?: string; window?: Sweep
 }
 
 async function runDutyBody<T>(duty: string, window: SweepWindow, body: () => T | Promise<T>): Promise<T> {
-  const entry = { duty, window, startedAtMs: Date.now() }; // what a stalled tick names (#637)
+  const entry = { duty, window, startedAtMs: Date.now() }; // what a stalled tick names
   activeDuties.push(entry);
   try {
     return await body();
@@ -612,7 +612,7 @@ async function runDutyBody<T>(duty: string, window: SweepWindow, body: () => T |
 
 async function runTickPhase(ctx: SweepTickContext, phase: SweepPhase, generation: number): Promise<void> {
   for (const duty of dutiesForPhase(phase)) {
-    if (generation !== tickGeneration) return; // abandoned (#637): never run beside its replacement
+    if (generation !== tickGeneration) return; // abandoned: never run beside its replacement
     if (tickDutiesRunning.has(duty.name)) {
       log.warn('Host sweep duty still running under an abandoned tick — skipped', { duty: duty.name, window: phase });
       continue;
@@ -632,7 +632,7 @@ async function runTickPhase(ctx: SweepTickContext, phase: SweepPhase, generation
   }
 }
 
-/** A session whose sweeping tick was abandoned starts no further duty (#637). */
+/** A session whose sweeping tick was abandoned starts no further duty. */
 function sessionTickAbandoned(ctx: SweepSessionContext): boolean {
   const owner = sessionsRunning.get(ctx.session.id);
   return owner !== undefined && owner !== tickGeneration;
@@ -754,7 +754,7 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   // so the registration drift guard in host-sweep-registry.test.ts stays an
   // exact accounting of every registered duty.
   FORK1: 'github-token-file-refresh',
-  // Fork addition (seam 4 series A', issue #430): the coordination tables of
+  // Fork addition: the coordination tables of
   // migration 071 gained writers, and a write that lands after session teardown
   // leaves a row behind that no foreign key removes. Body in
   // `src/modules/sweep-central/coordination-orphans.ts`.
@@ -803,7 +803,7 @@ export type StuckDecision =
   | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number };
 
 /**
- * The ceiling-kill accountability family (S2-PR13) lives in
+ * The ceiling-kill accountability family lives in
  * `src/modules/sweep-continuation/`. `src/host-restart-warn.ts` imports
  * `decideCeilingFollowUp` and `WORK_CONTINUATION_RESUME_MAX_ATTEMPTS` from
  * here and is outside that PR's ownership, so both keep resolving from this
@@ -911,13 +911,13 @@ export function writeSystemWake(
 
 // Failed-provider self-heal (S11), running-container SLA (S14) and the OOM /
 // memory-pressure notice (S16) moved to
-// `src/modules/sweep-container-health/index.ts` (convergence seam 2, PR 10).
+// `src/modules/sweep-container-health/index.ts`.
 //
 // `providerFailedTicks` itself stays here, exported, rather than moving with
 // the rest of S11's body: the driver's own `!alive` cleanup below must stay
 // SYNCHRONOUS (a dynamic import there proved to add an await suspension
 // point the pre-seam code never had, letting a concurrent wake observe a
-// stale `alive=false` across the gap — Codex review, S2-PR10). The map's
+// stale `alive=false` across the gap). The map's
 // SEMANTICS — the two-tick debounce, read and written only by
 // `observeProviderStatus`/`decideProviderHeal` — belong entirely to S11 in
 // `sweep-container-health`; that module imports this export directly
@@ -941,13 +941,13 @@ export type SessionRunner = <T>(action: (mailbox: NanoclawMailboxSession) => T |
 
 let running = false;
 
-/** A tick past this is stuck on an await that may never settle; it is abandoned (#637). 2× the worst live tick (7m30s, #516). */
+/** A tick past this is stuck on an await that may never settle; it is abandoned. 2× the worst live tick (7m30s). */
 export const SWEEP_TICK_STALL_MS = 15 * 60_000;
 /** Bumped at each tick start and on abandonment; a tick compares it at its checkpoints. */
 let tickGeneration = 0;
 /** Duty bodies in flight, innermost last: what a stalled tick is stuck in. */
 const activeDuties: Array<{ duty: string; window: SweepWindow; startedAtMs: number }> = [];
-/** Tick duties and sessions still running, possibly under an abandoned tick: never re-entered (#637). */
+/** Tick duties and sessions still running, possibly under an abandoned tick: never re-entered. */
 const tickDutiesRunning = new Set<string>();
 const sessionsRunning = new Map<string, number>(); // session → the generation sweeping it
 
@@ -995,7 +995,7 @@ async function sweep(): Promise<void> {
       return 'done' as const;
     })();
     // A throw is caught below; a tick that never settles held the reschedule
-    // forever (#637: dead ~7h on 2026-09-11, every vital green). Race it
+    // forever (dead ~7h on 2026-09-11, every vital green). Race it
     // against the stall bound; a loser that resumes stops at its checkpoints.
     const stalled = new Promise<'stalled'>((resolve) => {
       stallTimer = setTimeout(() => resolve('stalled'), SWEEP_TICK_STALL_MS);
@@ -1038,7 +1038,7 @@ const lastTickStats = {
 };
 
 /**
- * This tick's wake instrumentation (#359), reset at the top of every tick and
+ * This tick's wake instrumentation, reset at the top of every tick and
  * copied into `lastTickStats` at the end. Module-level rather than a field on
  * `SweepTickContext` because the per-session contexts are built one at a time
  * and every one of them has to add into the same tick total.
@@ -1095,7 +1095,7 @@ async function sweepOnce(generation: number): Promise<void> {
     log.error('Host sweep: failed to load active sessions', { err });
     sessions = [];
   }
-  if (generation !== tickGeneration) return; // abandoned (#637): reset nothing the live tick has recorded
+  if (generation !== tickGeneration) return; // abandoned: reset nothing the live tick has recorded
 
   // Isolate failures per-session — a throw from one stuck session's
   // cleanup must not skip every later session for the rest of the tick.
@@ -1118,8 +1118,8 @@ async function sweepOnce(generation: number): Promise<void> {
   // never reaches the write.
   const newQuietMarks: QuietSessionMark[] = [];
   for (const session of sessions) {
-    if (generation !== tickGeneration) return; // abandoned (#637): sweep no further
-    if (sessionsRunning.has(session.id)) continue; // still inside an abandoned tick (#637)
+    if (generation !== tickGeneration) return; // abandoned: sweep no further
+    if (sessionsRunning.has(session.id)) continue; // still inside an abandoned tick
     const mark = quietSessions.get(session.id);
     if (mark && Date.now() < mark.skipUntilMs && mark.lastActive === session.last_active) {
       skippedQuiet++;
@@ -1129,7 +1129,7 @@ async function sweepOnce(generation: number): Promise<void> {
     sessionsRunning.set(session.id, generation);
     try {
       const quietUntil = await sweepSession(session, tick);
-      if (generation !== tickGeneration) return; // abandoned (#637): a verdict from phases it skipped
+      if (generation !== tickGeneration) return; // abandoned: a verdict from phases it skipped
       if (quietUntil !== null) {
         quietSessions.set(session.id, { skipUntilMs: quietUntil, lastActive: session.last_active });
         // Carry the basis: the flush happens after the whole fan-out, and
@@ -1165,7 +1165,7 @@ async function sweepOnce(generation: number): Promise<void> {
     // overhead is microseconds against that cost.
     await sweepYield();
   }
-  if (generation !== tickGeneration) return; // abandoned (#637): persist nothing against reset state
+  if (generation !== tickGeneration) return; // abandoned: persist nothing against reset state
   // Bound the cache to sessions that still exist (closed sessions drop out
   // of getActiveSessions and would otherwise accumulate forever).
   if (quietSessions.size > sessions.length + 500) {
@@ -1207,7 +1207,7 @@ async function sweepOnce(generation: number): Promise<void> {
 
   await runTickPhase(tick, 'tick:post-session', generation);
   await runTickPhase(tick, 'tick:housekeeping', generation);
-  if (generation !== tickGeneration) return; // abandoned (#637): the stats belong to the live tick
+  if (generation !== tickGeneration) return; // abandoned: the stats belong to the live tick
 
   lastTickStats.ticks++;
   lastTickStats.sweptSessions = sweptSessions;
@@ -1219,7 +1219,7 @@ async function sweepOnce(generation: number): Promise<void> {
   const sweepMs = Date.now() - sweepStartedAtMs;
   if (sweepMs >= 1_000) {
     // `wakesStarted`/`spawnsAwaited`/`spawnWaitMs` are what make `sessionsMs`
-    // readable (#359): with spawnsAwaited 0 and spawnWaitMs near zero,
+    // readable: with spawnsAwaited 0 and spawnWaitMs near zero,
     // sessionsMs is the cost of walking the sessions and nothing else.
     log.info('Host sweep tick timing', {
       sweepMs,
@@ -1504,16 +1504,15 @@ export async function _sweepSessionForTesting(session: Session): Promise<number 
   return sweepSession(session, tick);
 }
 
-// G64 (S2-PR6): the pruneIdleSessionArtifacts/pruneIdleThreadArtifacts
+// G64: the pruneIdleSessionArtifacts/pruneIdleThreadArtifacts
 // back-compat shims that used to live here are gone — callers use
 // storage-manager.ts's own exports (which already default `isContainerRunning`
 // and the sessions/threads roots) directly.
 
 // Running-container SLA (S14) and the OOM / memory-pressure notice (S16)
-// moved to src/modules/sweep-container-health/index.ts (convergence seam 2,
-// PR 10).
+// moved to src/modules/sweep-container-health/index.ts.
 
-// sweepTaskWatchdog moved with the orchestrator family (S2-PR5) into
+// sweepTaskWatchdog moved with the orchestrator family into
 // src/modules/sweep-orchestrator/task-watchdog.ts — a sibling of that
 // family's index.ts, not index.ts itself, so this re-export doesn't create a
 // static cycle back through index.ts's own import of this file (registerSweepDuty

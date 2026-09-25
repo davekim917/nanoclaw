@@ -62,7 +62,7 @@ export function groupFolderExistsOnDisk(folder: string): boolean {
   ensureWithinBase(GROUPS_DIR, groupPath);
   // A base-directory alias (`.`, `x/..`, `./`) resolves to GROUPS_DIR itself,
   // which always exists — reporting it as occupied residue would tell the
-  // operator to move or remove every group's workspace (Codex on #486).
+  // operator to move or remove every group's workspace.
   if (path.relative(GROUPS_DIR, groupPath) === '') {
     throw new Error(`Invalid group folder "${folder}": names the groups directory itself`);
   }

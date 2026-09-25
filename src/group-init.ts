@@ -9,14 +9,6 @@ import { providerProvidesAgentSurfaces } from './providers/provider-container-re
 import { prepareWorkgroupMemoryMember } from './modules/workgroup/shared-dirs.js';
 import type { AgentGroup } from './types.js';
 
-// Symlink name inside the group's dir. Claude Code's @-import only
-// follows paths inside cwd, so we can't reference /workspace/global
-// directly — we symlink into the group dir and import the symlink. The
-// symlink resolves to /workspace/global/CLAUDE.md inside the container;
-// dangling on the host is fine, host tools don't follow it.
-export const GLOBAL_MEMORY_LINK_NAME = '.claude-global.md';
-export const GLOBAL_CLAUDE_IMPORT = `@./${GLOBAL_MEMORY_LINK_NAME}`;
-
 // Nanoclaw-managed env vars. Reconciled to trunk on every container spawn:
 // values here always win over what's on disk, keys in DEPRECATED_ENV get
 // deleted, anything outside both lists is user-owned and left alone.

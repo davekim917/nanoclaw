@@ -7,7 +7,7 @@
  * ("OneCLI gateway not applied — refusing to spawn container without
  * credentials", `src/container-runner.ts`) and costs a ~60s sweep cycle of
  * latency. On the live host that happened on **26% of spawns** under Node 20
- * and still happens on ~2% under Node 22 (issue #239). Until now the log said
+ * and still happens on ~2% under Node 22. Until now the log said
  * only that it happened — never why — because the SDK throws the reason away
  * twice over:
  *
@@ -26,7 +26,7 @@
  *
  * ## Why exactly one retry, and only here
  *
- * The 48h forensics on issue #239 pinned the failure class precisely:
+ * 48h of forensics pinned the failure class precisely:
  *
  *   - **Not a timeout.** Refusals had a p50 of 39ms and a max of 21s against a
  *     30s ceiling; 174 of 274 finished under 50ms. Refusals were *faster* than
@@ -62,10 +62,10 @@ import { httpStatusOf, isRetryableStatus } from './onecli-preflight.js';
  * busy gateway that needs time to recover — the forensics measured a 39ms p50
  * failure, so a long backoff would only add latency to the thing it fixes.
  */
-export const APPLY_RETRY_DELAY_MS = 250;
+const APPLY_RETRY_DELAY_MS = 250;
 
 /** Bound on the diagnostic probe, which must never itself stall a spawn. */
-export const DIAGNOSE_TIMEOUT_MS = 5_000;
+const DIAGNOSE_TIMEOUT_MS = 5_000;
 
 /**
  * How slow a first attempt may be and still be worth retrying.

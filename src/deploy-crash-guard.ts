@@ -53,11 +53,11 @@ interface RollbackManifest {
    * (`long_running_repo_units` in scripts/deploy.sh; nanoclaw-v2 is never in
    * here — it is the service this guard is running inside). Rolling the
    * checkout back without restarting them leaves each one resident on the code
-   * the reset just removed, which is the defect #822 fixed in the pre-handoff
-   * shell trap, reproduced in the path that runs after that shell is dead.
+   * the reset just removed — the same defect as in the pre-handoff shell
+   * trap, reproduced in the path that runs after that shell is dead.
    *
    * ABSENT and `[]` are different answers and are reported differently:
-   * absent means a deploy.sh that predates #822 wrote this manifest and
+   * absent means a deploy.sh that predates sibling restarts wrote this manifest and
    * restarted nothing, `[]` means this deploy looked and found no siblings.
    */
   restartedUnits?: unknown;
@@ -221,7 +221,7 @@ export function performRollback(
       restored.push(`${siblings.units.length} sibling service(s) left running (commit reset skipped)`);
     }
   } else if (siblings.kind === 'absent') {
-    // Said, not inferred from silence: a pre-#822 manifest restarted nothing,
+    // Said, not inferred from silence: an older manifest restarted nothing,
     // so there is nothing to undo — which is a different fact from `[]`.
     console.error('deploy-crash-guard: manifest predates sibling restarts — no services to put back');
   } else {

@@ -48,8 +48,8 @@ import { log } from './log.js';
  * tries two seconds apart covers that without turning a genuinely broken
  * control API into a slow boot.
  */
-export const PREFLIGHT_ATTEMPTS = 3;
-export const PREFLIGHT_RETRY_DELAY_MS = 2_000;
+const PREFLIGHT_ATTEMPTS = 3;
+const PREFLIGHT_RETRY_DELAY_MS = 2_000;
 
 /**
  * Shorter than the spawn path's 30s. That timeout exists because spawns run
@@ -57,7 +57,7 @@ export const PREFLIGHT_RETRY_DELAY_MS = 2_000;
  * probe competes with nothing, and a control API that needs more than ten
  * seconds to answer one GET is not healthy.
  */
-export const PREFLIGHT_TIMEOUT_MS = 10_000;
+const PREFLIGHT_TIMEOUT_MS = 10_000;
 
 export type PreflightResult =
   | { status: 'ok'; agent: string | null; latencyMs: number; attempts: number }
@@ -139,7 +139,7 @@ export function httpStatusOf(err: unknown): number | undefined {
  * carries only `url` and `statusCode`, and reading the header would mean
  * bypassing `getContainerConfig` — the very call this probe exists to make.
  */
-export const RETRYABLE_4XX: ReadonlySet<number> = new Set([408, 425, 429]);
+const RETRYABLE_4XX: ReadonlySet<number> = new Set([408, 425, 429]);
 
 /**
  * Shared with the spawn path (`src/onecli-apply.ts`) — see `httpStatusOf`.

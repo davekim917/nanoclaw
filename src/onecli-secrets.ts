@@ -92,7 +92,7 @@ function isUuid(s: string): boolean {
 /**
  * Promise-wrapped `execFile('curl', …)`.
  *
- * The whole point of this module's #315 fix: every gateway round trip yields
+ * The whole point: every gateway round trip yields
  * to the event loop instead of parking it. `curl -f` still turns a non-2xx
  * response into a rejection, so callers keep their fail-closed behavior
  * unchanged — only the blocking changes, not the outcomes.
@@ -138,7 +138,7 @@ function curl(args: string[], label: string): Promise<string> {
  * Cached vault secrets listing.
  *
  * `/api/secrets?limit=10000` used to run on EVERY spawn (the largest single
- * contributor to the #315 stalls).
+ * contributor to host event-loop stalls).
  *
  * The guarantee is one-directional, and the direction matters:
  *
@@ -231,8 +231,8 @@ async function withIdentityLock<T>(identity: string, fn: () => Promise<T>): Prom
  *
  * Runs asynchronously (promise-wrapped `execFile`). It used to be
  * `execFileSync`, purely so the resolve/apply call chain could stay sync; that
- * blocked the host event loop for the full round trip on EVERY container spawn
- * (issue #315). `curl` is retained rather than `fetch` because host `fetch`
+ * blocked the host event loop for the full round trip on EVERY container spawn.
+ * `curl` is retained rather than `fetch` because host `fetch`
  * must never traverse the gateway proxy.
  */
 async function listViaApi(resource: 'agents' | 'secrets'): Promise<unknown[]> {
@@ -400,7 +400,7 @@ async function resolveAgentUuid(identifier: string): Promise<string> {
  * list confirms the agent. Every other response fails closed so the caller
  * cannot continue into an unscoped container configuration.
  *
- * Async since #315 — the spawn path awaits it rather than blocking the host
+ * Async — the spawn path awaits it rather than blocking the host
  * event loop for the gateway round trip. Serialized per identity so two
  * concurrent spawns of the same group cannot both take the create branch.
  */
@@ -502,7 +502,7 @@ function matchDeclarations(
 
 /**
  * Apply a group's per-spawn OneCLI secret scoping. Does nothing when
- * `declarations` is empty or undefined. Async since #315; callers in the spawn
+ * `declarations` is empty or undefined. Async; callers in the spawn
  * path MUST await it (see the tripwire in `onecli-secrets.test.ts`).
  *
  * Steps when declarations are present:
@@ -592,7 +592,7 @@ export function mergeWorkgroupAndGroupSecrets(
  * withholds exactly these from a session's OneCLI agent when the session is
  * not owner-safe, so teammates in a shared channel can't extract the owner's
  * Slack through the agent. See `isOwnerSafeSlackSession`
- * (src/modules/permissions/slack-user-token-gate.ts:108) and the two-tier identity (src/container-runner.ts:6941).
+ * (src/modules/permissions/slack-user-token-gate.ts) and the two-tier identity (src/container-runner.ts).
  *
  * Resolution:
  *   - If `explicitNames` is provided (from `slack_user_token.onecli_secret_names`),
@@ -662,12 +662,12 @@ const TYPESAFE_HOST = 'api.typesafe.ai';
  * Placeholder `TYPESAFE_API_KEY` for a Claude container whose grants already
  * route `api.typesafe.ai` through the gateway. fast-jev-compaction (a
  * `~/plugins` function-hook plugin) refuses to run with no key
- * (`~/plugins/fast-jev-compaction/hooks/fast-jev.ts:170`), but the real key is
+ * (`~/plugins/fast-jev-compaction/hooks/fast-jev.ts`), but the real key is
  * injected at the proxy, so the container only needs a non-empty stand-in.
  *
  * Gated on the grant, not set fleet-wide: the grant is the clearance to send
  * that group's text to TypeSafe. Without it the plugin throws before any
- * request and falls back to the built-in summary (`fast-jev.ts:283-288`).
+ * request and falls back to the built-in summary.
  * Reads the cache `applyOnecliSecrets` has just warmed; a cold cache yields no
  * key, which is the same safe fallback.
  */
