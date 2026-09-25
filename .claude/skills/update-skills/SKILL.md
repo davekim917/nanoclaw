@@ -55,11 +55,8 @@ Run:
 If output is non-empty:
 - Tell the user to commit or stash first, then stop.
 
-Resolve the registry remote, the one skill installs fetch from (the `nanocoai/nanoclaw` remote; it adds `upstream` when no remote matches). On a fork this is usually not `origin`:
-- `bash -c 'source setup/lib/channels-remote.sh; resolve_channels_remote'`
-
-Use that name as `<remote>` below, and fetch the branches that carry skill code:
-- `git fetch <remote> channels providers --prune`
+Resolve the registry remote, the one skill installs fetch from (the `nanocoai/nanoclaw` remote; it adds `upstream` when no remote matches). On a fork this is usually not `origin`. Fetch the branches that carry skill code from it, and use that remote as `<remote>` below:
+- `source setup/lib/channels-remote.sh; remote=$(resolve_channels_remote); git fetch "$remote" channels providers --prune`
 
 # Step 1: Detect installed skills
 

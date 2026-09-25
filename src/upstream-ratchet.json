@@ -204,7 +204,7 @@
 ".claude/skills/slack-agent-flow/src/modules/slack-agent-flow/slack-deps.ts":{"diff":70,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/slack-agent-flow/src/modules/slack-agent-flow/types.ts":{"diff":109,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/update-nanoclaw/SKILL.md":{"diff":666,"mode":"100644","sha256":"37ff0e88b282046f70dbb3ee9278e0d5bf3770fc4f6d6a918c5b04cf1ba545df"},
-".claude/skills/update-skills/SKILL.md":{"diff":200,"mode":"100644","sha256":"2d214bf419c259b9f7f1fe17cc3c4426dbd207afd0427c9585aaebd190d3da06"},
+".claude/skills/update-skills/SKILL.md":{"diff":197,"mode":"100644","sha256":"92f5508a5e1e128966af83a5cc0251f0888196d3a54e487a813936eecd773597"},
 ".env.example":{"diff":2,"mode":"100644","sha256":"028a07aa9235380b77cf2b75deadcb06a176a71c701a66df45067ba3ba87c70f"},
 ".github/CODEOWNERS":{"diff":12,"mode":"100644","sha256":"060c67453c4fc08447966abbee1a7380177ba35915e95540de3cb9806921487f"},
 ".github/ISSUE_TEMPLATE/bug-report.yml":{"diff":167,"mode":"100644","sha256":null,"deleted":true},
