@@ -26,16 +26,16 @@
  *      a future refactor that adds a new import re-triggers this review
  *      instead of silently drifting into reachability.
  *
- * Two of the eight (`init-cli-agent.ts`, `init-first-agent.ts`) and
- * `refresh-backlog-canvas.ts` have NO relative-import path (even
- * over-approximated) into `session-manager.ts`, `container-runner.ts`,
- * `delivery.ts`, or `mailbox/index.ts` at all — verified below by walking
- * their import graphs directly rather than asserting an absence by hand.
+ * Two of the eight (`init-cli-agent.ts`, `init-first-agent.ts`) have NO
+ * relative-import path (even over-approximated) into `session-manager.ts`,
+ * `container-runner.ts`, `delivery.ts`, or `mailbox/index.ts` at all —
+ * verified below by walking their import graphs directly rather than
+ * asserting an absence by hand.
  *
  * `migrate-repo-store.ts` and `verify-workgroup-memory-runtime.ts` import
  * `session-manager.ts` for non-seam helpers only.
- * `reclaim-idle-thread-worktrees.ts` and `restore-session-mtimes.ts` reach it
- * only through `storage-manager.ts` / `storage-activity.ts`, which contain NO
+ * `restore-session-mtimes.ts` reaches it only through `storage-manager.ts` /
+ * `storage-activity.ts`, which contain NO
  * seam call themselves (asserted below) and only re-export the same
  * non-seam `session-manager.js` helpers. `storage-gc.ts` reaches it only
  * through `worktree-cleanup.ts`, which likewise contains no seam call and
@@ -56,15 +56,8 @@ import { randomBytes } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import ts from 'typescript';
 
-import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
-import {
-  isAdmissiblePreTurnTrigger,
-  readThreadDirOwner,
-  sessionContextPathFor,
-  sessionsBaseDir,
-  threadsBaseDir,
-  threadWorktreeDir,
-} from './session-manager.js';
+import { inboundDbPath } from './mailbox/sqlite/paths.js';
+import { isAdmissiblePreTurnTrigger, readThreadDirOwner, threadWorktreeDir } from './session-manager.js';
 import { isContainerRunning, isContainerSpawning } from './container-runner.js';
 import { tryRunWithStorageCleanupClaim } from './storage-activity.js';
 import { sessionHasOpenWork } from './storage-manager.js';
@@ -773,20 +766,6 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
   });
 });
 
-describe('scripts/reclaim-idle-thread-worktrees.ts — only imports getStorageReport from storage-manager.ts', () => {
-  it("storage-manager.ts's session-manager.js re-imports never reach the mailbox seam", async () => {
-    await withNoMailboxRegistered(() => {
-      const dir = tmpDir('reclaim');
-      callNeverReachingSeam(() => inboundDbPath('ag1', 's1'));
-      callNeverReachingSeam(() => outboundDbPath('ag1', 's1'));
-      callNeverReachingSeam(() => sessionContextPathFor(dir));
-      callNeverReachingSeam(() => sessionsBaseDir());
-      callNeverReachingSeam(() => threadsBaseDir());
-      callNeverReachingSeam(() => threadWorktreeDir('cli', 'thread-1', 'wg-1'));
-    });
-  });
-});
-
 describe('scripts/restore-session-mtimes.ts — imports tryRunWithStorageCleanupClaim (storage-activity.ts) and sessionHasOpenWork (storage-manager.ts)', () => {
   it('tryRunWithStorageCleanupClaim never reaches the mailbox seam', async () => {
     await withNoMailboxRegistered(() => {
@@ -882,9 +861,9 @@ describe('scripts/storage-gc.ts — only imports runStorageGcOnce from worktree-
   });
 });
 
-describe('scripts/init-cli-agent.ts, scripts/init-first-agent.ts, scripts/refresh-backlog-canvas.ts have no relative-import path to the seam', () => {
+describe('scripts/init-cli-agent.ts, scripts/init-first-agent.ts have no relative-import path to the seam', () => {
   const STANDALONE_ROOTS = ['scripts'];
-  const TARGETS = ['scripts/init-cli-agent.ts', 'scripts/init-first-agent.ts', 'scripts/refresh-backlog-canvas.ts'];
+  const TARGETS = ['scripts/init-cli-agent.ts', 'scripts/init-first-agent.ts'];
   const SEAM_ADJACENT_FILES = [
     'src/session-manager.ts',
     'src/container-runner.ts',

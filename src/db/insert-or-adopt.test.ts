@@ -183,14 +183,6 @@ const ALLOWLIST: Array<{ path: string; reason: string }> = [
     reason: 'Single-process dev seed script; no concurrent peer exists to race with.',
   },
   {
-    path: 'scripts/test-v2-host.ts',
-    reason: 'Single-process manual harness; a unique violation is the signal the harness wants to see.',
-  },
-  {
-    path: 'scripts/test-v2-channel-e2e.ts',
-    reason: 'Single-process manual harness; a unique violation is the signal the harness wants to see.',
-  },
-  {
     path: 'setup/register.ts',
     reason: 'Interactive single-process setup flow; the host is not running yet, so nothing can race it.',
   },

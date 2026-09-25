@@ -48,11 +48,9 @@ export const LEGACY_INBOUND_PATH_ALLOWLIST: ReadonlyMap<string, string> = new Ma
   ['scripts/list-scheduled-tasks.ts', 'existsSync, then a { readonly: true } open'],
   ['scripts/verify-workgroup-memory-runtime.ts', '{ readonly: true, fileMustExist: true } open'],
   ['scripts/jev-shadow/turns.ts', '{ readonly: true, fileMustExist: true } open'],
-  ['scripts/inventory-tasks-by-provider.ts', '{ readonly: true } open'],
   ['scripts/lookback.ts', '{ readonly: true } opens'],
   ['scripts/fleet-drift.ts', '{ readonly: true } open'],
   ['scripts/restore-session-mtimes.ts', 'statSync and realpath containment only — never opened'],
-  ['scripts/_audit_scan_tasks.ts', '{ readonly: true, fileMustExist: true } open'],
   [
     'scripts/backfill-task-routing-platform-id.ts',
     '{ readonly: true, fileMustExist: true } open; its read-write open is the CENTRAL db',

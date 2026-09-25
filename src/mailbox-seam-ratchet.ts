@@ -13,9 +13,7 @@
  * false negatives are not, so keep the patterns broad.
  *
  * Lives under src/ (not scripts/) so src/mailbox-seam-ratchet.test.ts can import
- * it — the host tsconfig's rootDir is src/. scripts/mailbox-seam-ratchet-scan.ts
- * is a thin CLI shim over this module (same split as
- * src/design-artifact-loop-vendor.ts + scripts/vendor-design-artifact-loop.ts).
+ * it — the host tsconfig's rootDir is src/.
  */
 import fs from 'node:fs';
 import path from 'node:path';
