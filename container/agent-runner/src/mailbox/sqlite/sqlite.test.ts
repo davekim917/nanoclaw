@@ -151,10 +151,12 @@ describe('SQLite runner mailbox canonical serialization', () => {
     addIn.run('in-12', 12, 'chat', 'cli:local', null);
     addOut.run('elsewhere', 15, 'chat', 'slack:C2', null);
     addOut.run('reply', 13, 'chat', 'slack:C1', T);
+    // An ask_user_question / send_card post is outbound `chat-sdk`: visible, so it counts.
+    addOut.run('card', 17, 'chat-sdk', 'slack:C1', T);
     const mailbox = new SqliteAgentMailbox();
     expect(mailbox.maxInboundSeq()).toBe(12);
-    // After the list (outbound 11, inbound 2): in-4 and the reply only.
-    expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'slack:C1', threadId: T })).toBe(2);
+    // After the list (outbound 11, inbound 2): in-4, the reply and the card.
+    expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'slack:C1', threadId: T })).toBe(3);
     // A channel-level conversation (null thread) matches null exactly.
     expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'slack:C2', threadId: null })).toBe(1);
     expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'cli:local', threadId: null })).toBe(1);

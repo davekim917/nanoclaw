@@ -1345,11 +1345,9 @@ export const TASK_LIST_TOOL_NAME = 'mcp__nanoclaw__update_task_list';
 /**
  * PreToolUse: the live task list belongs to the conversation's main agent.
  * A delegated subagent shares the nanoclaw MCP server, so without this a worker
- * rewrote its parent's on-screen list with its own steps — seen live
- * 2026-09-25, where the worker's finished list forced the parent
- * to post a new one under a pointless "Latest task list" link. The SDK marks a
- * hook call made inside a subagent with `agent_id`; the main thread never
- * carries it, even under `--agent`.
+ * can rewrite (and finish) its parent's on-screen list. The SDK marks a hook
+ * call made inside a subagent with `agent_id`; the main thread never carries
+ * it, even under `--agent`.
  */
 export function createSubagentTaskListDenyHook(): HookCallback {
   return async (input) => {

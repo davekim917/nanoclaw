@@ -323,10 +323,10 @@ export async function applyTaskListUpdate(
   }
 
   // A new list whose finished predecessor is still the last thing in this
-  // conversation takes over that post instead of stacking under it: a fresh
-  // post there leaves a "Latest task list" link pointing at the message right
-  // below it (seen live 2026-09-25). Only a finished list — an unfinished one
-  // replaced by `new_list` stays visible as it was.
+  // conversation takes over that post instead of stacking under it, which
+  // would leave a "Latest task list" pointer aimed at the message right below.
+  // Only a finished list — an unfinished one replaced by `new_list` stays
+  // visible as it was.
   let reused = false;
   if (
     !current &&
