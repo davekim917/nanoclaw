@@ -42,7 +42,9 @@
 #   24  merge-check: merging this head is not allowed — CI is not green on it, it has
 #       neither a clean Codex review nor an approving substitute receipt, the
 #       approving receipt's reviewer is not a frontier model id, it is a
-#       fix PR whose body has no Fixes-PR line, or a substitute receipt on the PR
+#       fix PR whose body has no Fixes-PR line, the base branch's
+#       .github/pr-review-loop.json requires a Replaces line and the body has none,
+#       or a substitute receipt on the PR
 #       asked for changes and it neither adds docs/review-notes/<this PR>.md nor
 #       carries a `Review-notes: none (<reason>)` line (`review_notes_missing`)
 #   25  merge-check: the base branch moved while the check ran, or could not be
@@ -555,17 +557,20 @@ RECEIPT_REVIEWER_LINE_RE='\*\*Reviewer and runtime:\*\* (?<reviewer>[^\n]+)'
 # docs/specs/risk-based-review/plan.md links a fix to its PR through this line.
 FIX_TITLE_RE='^\s*fix(\([^)]*\))?!?:'
 FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
+# The body line naming what a PR supersedes, or `nothing`. Required only in a
+# repo whose base branch sets `"requireReplacesLine": true` in
+# REVIEW_LOOP_CONFIG, so every other repo merges exactly as before
+# (replaces_state). Its value must show a character (has_visible_text,
+# visible-text.jq): a zero-width space or word joiner alone is not one.
+REPLACES_LINE_RE='(^|\n)Replaces:(?<value>[^\n]*)'
+REVIEW_LOOP_CONFIG='.github/pr-review-loop.json'
 # The review-notes rule (docs/review-policy.md, "Review notes and fix links"):
 # a PR any substitute receipt asked for changes on adds a current-PR fragment
 # under REVIEW_NOTES_DIR, or its body carries this line, read the way the Fixes-PR
 # line is (review_notes_state). The reason is ONE parenthesised phrase, with no
 # parenthesis inside it and nothing after it on the line, so `none ()x)` and
-# `none ( ) )` never pass for one; review_notes_state strips every \p{Cf}
-# (format) character from the reason first — a soft hyphen or an emoji ZWJ
-# sequence must not sink an otherwise-visible reason — then requires at least
-# one character that is not whitespace, a control character, a combining mark
-# with no base of its own, or one of the specific blank-looking codepoints
-# U+2800/U+3164/U+115F/U+1160/U+FFA0 (real_reason, #707 P3-b).
+# `none ( ) )` never pass for one, and the reason must show a character
+# (has_visible_text, visible-text.jq, #707 P3-b).
 REVIEW_NOTES_FILE='docs/review-notes.md'
 REVIEW_NOTES_DIR='docs/review-notes'
 REVIEW_NOTES_NONE_LINE_RE='(^|\n)Review-notes:[ \t]*none[ \t]*\((?<reason>[^()\n]*)\)[ \t]*\r?(?=\n|\z)'
@@ -614,6 +619,42 @@ fix_link_state() {
       pr_body_text as $body
       | if (.title | test($titleRe; "i")) and ($body | test($lineRe; "i") | not) then "missing" else "ok" end
     )'
+}
+
+# `missing` when the base commit scope_eval resolved requires a `Replaces:`
+# line and the {body} JSON object $1 has none, else `ok`; read like the
+# Fixes-PR line. A base with no REVIEW_LOOP_CONFIG requires nothing. A config
+# that cannot be read, or is not an object whose requireReplacesLine is a
+# boolean, returns non-zero: no verdict, never a pass.
+replaces_state() {
+  local config status=0 required
+  config=$(base_file "$SCOPE_BASE" "$REVIEW_LOOP_CONFIG") || status=$?
+  case "$status" in
+    0)
+      required=$(printf '%s' "$config" | jq -r '
+        if type != "object" then error("not a JSON object")
+        elif has("requireReplacesLine") | not then "optional"
+        elif .requireReplacesLine | type != "boolean" then error("requireReplacesLine is not a boolean")
+        elif .requireReplacesLine then "required"
+        else "optional" end') || return 1
+      ;;
+    3) required=optional ;;
+    *) return 1 ;;
+  esac
+  case "$required" in
+    optional) echo ok; return 0 ;;
+    required) ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$1" | jq -r -L "$HERE" --arg lineRe "$REPLACES_LINE_RE" '
+    include "pr-body";
+    include "visible-text";
+    pr_body_text | if [ capture($lineRe; "gi") ] | any(.value | has_visible_text) then "ok" else "missing" end'
+}
+
+replaces_refusal() {
+  printf "the PR body has no 'Replaces:' line, which %s on %s requires. Add one line naming what this change supersedes, e.g. 'Replaces: the hand-rolled retry loop in the sync worker', or 'Replaces: nothing' when it supersedes nothing. It must start its own line, outside any code fence or HTML comment. Edit the body and re-run merge-check; no new commit is needed" \
+    "$REVIEW_LOOP_CONFIG" "${SCOPE_BASE_REF:-the base branch}"
 }
 
 # Reviewer eligibility is a tier rule stated as a DENYLIST: any model may write
@@ -684,15 +725,30 @@ reviewer_model_allowed() {
   [ -z "$refusal" ]
 }
 
+# Prints file $2 as it is at base commit $1. Read through the API, never the
+# checkout, since a PR can edit its own copy, and only at a commit scope_eval
+# resolved, never by branch name. Returns 3 when that commit has no such file,
+# which is GitHub's plain path-not-found 404 alone. A ref GitHub cannot find is
+# a 404 too ("No commit found for the ref ..."), and that, like any other
+# failure, returns 1 for the caller to fail closed on. gh prints the error body
+# on stdout.
+base_file() {
+  local raw status=0
+  [[ "$1" =~ ^[0-9a-f]{40}$ ]] || return 1
+  raw=$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$REPO/contents/$2?ref=$1" 2>/dev/null) || status=$?
+  if [ "$status" -eq 0 ]; then
+    printf '%s' "$raw"
+    return 0
+  fi
+  if printf '%s' "$raw" | jq -e '.status == "404" and .message == "Not Found"' >/dev/null 2>&1; then
+    return 3
+  fi
+  return 1
+}
+
 # Sets SCOPE_MODE to `risk-scoped` or `legacy`, and LABELER_YML to the file it
-# read, so the globs come from the same read as the mode. Read from BASE
-# through the API, never the checkout, since a PR can edit its own copy, and
-# only at the commit scope_eval resolved the base branch to, never by name.
-# The file is absent (legacy) only on GitHub's plain path-not-found 404, which
-# on a commit just resolved means that commit has no labeler.yml. A ref GitHub
-# cannot find is a 404 too ("No commit found for the ref ..."), and that, like
-# any other failure, returns non-zero for the caller to fail closed on. gh
-# prints the error body on stdout.
+# read, so the globs come from the same read as the mode. A base commit with
+# no labeler.yml is legacy (base_file).
 #
 # Detection is deliberately loose and parsing (risk-scope.jq) deliberately
 # strict. Any doubt is risk-scoped: `risk:high` anywhere in the file, or any
@@ -703,17 +759,19 @@ reviewer_model_allowed() {
 LABELER_YML=""
 repo_mode() {
   local raw status=0
-  [[ "$1" =~ ^[0-9a-f]{40}$ ]] || return 1
-  raw=$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$REPO/contents/.github/labeler.yml?ref=$1" 2>/dev/null) || status=$?
-  if [ "$status" -ne 0 ]; then
-    if printf '%s' "$raw" | jq -e '.status == "404" and .message == "Not Found"' >/dev/null 2>&1; then
+  raw=$(base_file "$1" .github/labeler.yml) || status=$?
+  case "$status" in
+    0) ;;
+    3)
       SCOPE_MODE=legacy
       LABELER_YML=""
       return 0
-    fi
-    echo "could not read .github/labeler.yml at $1 in $REPO" >&2
-    return 1
-  fi
+      ;;
+    *)
+      echo "could not read .github/labeler.yml at $1 in $REPO" >&2
+      return 1
+      ;;
+  esac
   LABELER_YML="$raw"
   if printf '%s\n' "$raw" | grep -qF -e 'risk:high' -e '\'; then
     SCOPE_MODE=risk-scoped
@@ -1159,15 +1217,7 @@ review_notes_state() {
     --arg notes "$REVIEW_NOTES_FILE" --arg fragment "$REVIEW_NOTES_DIR/$PR.md" \
     --argjson files "$SCOPE_FILES" '
     include "pr-body";
-    # Strip every format character first, then require at least one visible
-    # one left: a soft hyphen or an emoji ZWJ sequence must not sink an
-    # otherwise-visible reason. A handful of codepoints look blank but are
-    # not \p{Cf}, so they are named explicitly; a combining mark is excluded
-    # outright, since a real base character elsewhere already satisfies this
-    # test on its own, and a combining mark with no base must not (#707 P3-b).
-    def real_reason:
-      gsub("\\p{Cf}"; "") as $stripped
-      | ($stripped | test("[^\\s\\p{Z}\\p{Cc}\\p{M}\\x{2800}\\x{3164}\\x{115F}\\x{1160}\\x{FFA0}]"));
+    include "visible-text";
     # pr_body_text checks its own shape inside pr-body.jq, but a replacement
     # module can drop that check along with the rest of the module (#707
     # P3-a) — assert the shape up front, whenever pr_body_text yields exactly
@@ -1183,7 +1233,7 @@ review_notes_state() {
     (
     ($state | split("\t")) as [$kind, $why]
       | pr_body_text as $body
-      | if [ $body | capture($lineRe; "gi") ] | any(.reason | real_reason) then "ok"
+      | if [ $body | capture($lineRe; "gi") ] | any(.reason | has_visible_text) then "ok"
       elif ($files | type) == "array" and any($files[]; . == $fragment) then "ok"
       else
         ( if $kind == "changes" then $why
@@ -1210,7 +1260,7 @@ review_notes_state() {
                 else
                   ($split[0].reason) as $reasonContent
                   | ($split[0].trailing | gsub("^[ \t]+"; "") | gsub("[ \t\r]+$"; "")) as $trailing
-                  | if ($reasonContent | real_reason | not) then
+                  | if ($reasonContent | has_visible_text | not) then
                       "the body carries a `Review-notes: none ()` line, but its reason is empty or has no visible character. Give it a visible reason, or add the lesson in \($fragment)"
                     elif ($trailing | length) > 0 then
                       "the body carries a `Review-notes: none (<reason>)` line, but it has text after the closing parenthesis (\"\($trailing)\"), which the check reads as not ending the line\(if $trailing == "." then " (a trailing period counts as text after the parenthesis; drop it)" else "" end). Remove it, or add the lesson in \($fragment)"
@@ -1843,7 +1893,7 @@ admin_readiness() {
 # never read a defer as a pass. Its base is re-read first, since a base that
 # moved may have opted in since.
 merge_check_main() {
-  local want="" pr_text fix_link ci ci_word receipt_raw receipt receipt_reviewer notes markers since observation claim_now_iso claims
+  local want="" pr_text fix_link replaces ci ci_word receipt_raw receipt receipt_reviewer notes markers since observation claim_now_iso claims
   while [ $# -gt 0 ]; do
     case "$1" in
       --head)
@@ -1901,6 +1951,27 @@ merge_check_main() {
       ;;
     *)
       echo "merge=error head=$SCOPE_HEAD: the Fixes-PR check gave no verdict (got \"$fix_link\")" >&2
+      exit 1
+      ;;
+  esac
+  # A base that did not resolve to a commit has no config to read. scope_eval
+  # has already failed that head closed to review, and refuse_if_base_moved
+  # refuses it before every allow below, so it is refused as it was before.
+  replaces=ok
+  if [ -n "$SCOPE_BASE" ]; then
+    replaces=$(replaces_state "$pr_text") || {
+      echo "merge=error head=$SCOPE_HEAD: the Replaces check gave no verdict; could not read $REVIEW_LOOP_CONFIG at $SCOPE_BASE as an object with a boolean requireReplacesLine" >&2
+      exit 1
+    }
+  fi
+  case "$replaces" in
+    ok) ;;
+    missing)
+      echo "merge=refused head=$SCOPE_HEAD: $(replaces_refusal)" >&2
+      exit 24
+      ;;
+    *)
+      echo "merge=error head=$SCOPE_HEAD: the Replaces check gave no verdict (got \"$replaces\")" >&2
       exit 1
       ;;
   esac
@@ -2819,6 +2890,18 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
         ;;
       *)
         echo "audit=error $where: the Fixes-PR check gave no verdict (got \"$fix_link\")" >&2
+        exit 1
+        ;;
+    esac
+    replaces=$(replaces_state "$at_merge") || { echo "audit=error $where: the Replaces check gave no verdict; could not read $REVIEW_LOOP_CONFIG at the commit it merged onto" >&2; exit 1; }
+    case "$replaces" in
+      ok) ;;
+      missing)
+        echo "audit=violation $where: it merged with no 'Replaces:' line in its body, which $REVIEW_LOOP_CONFIG on the commit it merged onto requires"
+        exit 28
+        ;;
+      *)
+        echo "audit=error $where: the Replaces check gave no verdict (got \"$replaces\")" >&2
         exit 1
         ;;
     esac

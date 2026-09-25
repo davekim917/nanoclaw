@@ -139,6 +139,19 @@ if [ -n "$rest" ]; then
       echo 'gh: Not Found (HTTP 404)' >&2
       exit 1
       ;;
+    */contents/.github/pr-review-loop.json\\?ref=*)
+      # review-loop--<ref>.json is the file at that ref; a .error marker fails the read.
+      ref="\${rest##*ref=}"
+      if [ -f "$MOCK_DIR/review-loop--$ref.error" ]; then
+        echo '{"message":"Server Error","status":"500"}'
+        echo 'gh: Server Error (HTTP 500)' >&2
+        exit 1
+      fi
+      if [ -f "$MOCK_DIR/review-loop--$ref.json" ]; then cat "$MOCK_DIR/review-loop--$ref.json"; exit 0; fi
+      echo '{"message":"Not Found","status":"404"}'
+      echo 'gh: Not Found (HTTP 404)' >&2
+      exit 1
+      ;;
     */actions/runs/*/attempts/*/jobs\\?*)
       # jobs--<run id>--attempt-<n>.json is that attempt's jobs page. A run
       # with no attempt pages at all is a single-attempt run, and its
@@ -400,6 +413,8 @@ const MERGE_PARENT = '8888888888888888888888888888888888888888';
 const MERGED_AT = '2026-09-05T01:00:00Z';
 const RISK_CONFIG =
   "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/router.ts'\n    - '.github/**'\n";
+// A base branch's .github/pr-review-loop.json that requires the Replaces line.
+const REPLACES_OPT_IN = '{ "requireReplacesLine": true }\n';
 
 function writeJson(root: string, name: string, value: unknown): void {
   fs.writeFileSync(path.join(root, name), JSON.stringify(value));
@@ -631,6 +646,8 @@ function scopeFixture(
     rollup?: Page[] | null;
     title?: string;
     body?: string;
+    // The base's .github/pr-review-loop.json, as raw text; absent when undefined.
+    reviewLoop?: string;
   } = {},
 ): void {
   // The files HEAD changes, as the comparison from BASE_OID lists them; null =
@@ -659,6 +676,9 @@ function scopeFixture(
     const labeler = path.join(root, `labeler--${ref}.yml`);
     if (opts.baseConfig === null) fs.rmSync(labeler, { force: true });
     else fs.writeFileSync(labeler, opts.baseConfig ?? RISK_CONFIG);
+    const reviewLoop = path.join(root, `review-loop--${ref}.json`);
+    if (opts.reviewLoop === undefined) fs.rmSync(reviewLoop, { force: true });
+    else fs.writeFileSync(reviewLoop, opts.reviewLoop);
   }
   // One Actions listing, as the API returns it: the Risk label run, which
   // merge-check leaves out of CI, and the CI runs it requires green.
@@ -2569,6 +2589,123 @@ describe('codex-review risk-scoped review requests', () => {
     const result = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain(`merge=allowed head=${HEAD} mode=risk-scoped verdict=skip ci=green`);
+  });
+
+  describe('the Replaces line, required only where the base branch opts in', () => {
+    const REFUSED = `merge=refused head=${HEAD}: the PR body has no 'Replaces:' line, which .github/pr-review-loop.json on main requires.`;
+
+    it.each([
+      ['no line at all', 'Summary.'],
+      ['an empty value', 'Summary.\n\nReplaces:'],
+      ['a blank value', 'Summary.\n\nReplaces:   \r\nMore.'],
+      ['its value on the next line', 'Replaces:\nthe old loader'],
+      ['the key mid-line', 'See Replaces: nothing above.'],
+      ['the line only in a fenced example', 'Write it like this:\n\n```\nReplaces: nothing\n```'],
+      ['the line only in a template comment', '<!-- Replaces: nothing -->'],
+      ['a value that is only a comment', 'Replaces: <!-- what this supersedes -->'],
+      ['a value that is only a zero-width space', 'Summary.\n\nReplaces: \u200b'],
+      ['a value that is only a word joiner', 'Summary.\n\nReplaces:\u2060\n'],
+      ['a value that is only a byte-order mark', 'Summary.\n\nReplaces: \ufeff \r\nMore.'],
+    ])('refuses a body with %s, and says what line to add', (_case, body) => {
+      const root = tempRoot();
+      scopeFixture(root, { labels: [], body, reviewLoop: REPLACES_OPT_IN });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain(REFUSED);
+      expect(result.stderr).toContain("e.g. 'Replaces: the hand-rolled retry loop in the sync worker'");
+      expect(result.stderr).toContain("or 'Replaces: nothing' when it supersedes nothing");
+      expect(result.stderr).toContain('outside any code fence or HTML comment');
+    });
+
+    it.each([
+      ['nothing', 'Summary.\n\nReplaces: nothing'],
+      ['a description', 'Summary.\n\nReplaces: the hand-written loader in src/config.ts\n'],
+      ['CRLF endings and no space', 'Summary.\r\n\r\nReplaces:nothing\r\n'],
+      ['a lowercase key', 'replaces: nothing'],
+      ['a real line after a fenced example', '```\nReplaces: x\n```\nReplaces: nothing'],
+      ['a description with a zero-width space inside it', 'Replaces: the old\u200b loader'],
+    ])('allows a body whose Replaces line is %s', (_case, body) => {
+      const root = tempRoot();
+      scopeFixture(root, { labels: [], body, reviewLoop: REPLACES_OPT_IN });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`merge=allowed head=${HEAD} mode=risk-scoped verdict=skip ci=green`);
+    });
+
+    it('refuses once the line is edited out of the body after CI went green, on the same head', () => {
+      const root = tempRoot();
+      scopeFixture(root, { labels: [], body: 'Summary.\n\nReplaces: nothing', reviewLoop: REPLACES_OPT_IN });
+
+      const before = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(before.status).toBe(0);
+
+      writeJson(root, 'pr.json', prState([], HEAD, 'feat: route a new message kind', 'Summary.'));
+      const after = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(after.status).toBe(24);
+      expect(after.stderr).toContain(REFUSED);
+    });
+
+    it.each([
+      ['has no .github/pr-review-loop.json', undefined],
+      ['sets requireReplacesLine to false', '{ "requireReplacesLine": false }\n'],
+      ['does not set requireReplacesLine', '{}\n'],
+    ])('merges a body with no Replaces line as before when the base %s', (_case, reviewLoop) => {
+      const root = tempRoot();
+      scopeFixture(root, { labels: [], body: 'Summary.', reviewLoop });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`merge=allowed head=${HEAD} mode=risk-scoped verdict=skip ci=green`);
+      expect(result.calls).toContain(
+        `rest repos/example/repository/contents/.github/pr-review-loop.json?ref=${BASE_OID}\n`,
+      );
+    });
+
+    it('never reads the opt-in in a legacy repo, whose merge-check still defers', () => {
+      const root = tempRoot();
+      scopeFixture(root, { baseConfig: null, labels: [], body: 'Summary.', reviewLoop: REPLACES_OPT_IN });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(26);
+      expect(result.stdout).toContain('merge=defer mode=legacy');
+      expect(result.calls).not.toContain('pr-review-loop.json');
+    });
+
+    it('reads the opt-in at the base commit alone, so a PR cannot opt itself out', () => {
+      const root = tempRoot();
+      scopeFixture(root, { labels: [], body: 'Summary.', reviewLoop: REPLACES_OPT_IN });
+      for (const ref of ['main', 'feat', STALE_BASE])
+        fs.writeFileSync(path.join(root, `review-loop--${ref}.json`), '{ "requireReplacesLine": false }\n');
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain(REFUSED);
+      expect(result.calls).toContain(
+        `rest repos/example/repository/contents/.github/pr-review-loop.json?ref=${BASE_OID}\n`,
+      );
+      expect(result.calls).not.toMatch(/pr-review-loop\.json\?ref=(?!f{40}\n)/);
+    });
+
+    it.each([
+      ['cannot be read', `review-loop--${BASE_OID}.error`, ''],
+      ['is not JSON', `review-loop--${BASE_OID}.json`, 'requireReplacesLine: true\n'],
+      ['is not an object', `review-loop--${BASE_OID}.json`, '[true]\n'],
+      ['sets requireReplacesLine to a string', `review-loop--${BASE_OID}.json`, '{ "requireReplacesLine": "yes" }\n'],
+      ['sets requireReplacesLine to null', `review-loop--${BASE_OID}.json`, '{ "requireReplacesLine": null }\n'],
+      ['sets requireReplacesLine to a number', `review-loop--${BASE_OID}.json`, '{ "requireReplacesLine": 1 }\n'],
+      ['is empty', `review-loop--${BASE_OID}.json`, ''],
+    ])('gives no verdict, and never a pass, when the base opt-in %s', (_case, name, content) => {
+      const root = tempRoot();
+      scopeFixture(root, { labels: [], body: 'Summary.\n\nReplaces: nothing' });
+      fs.writeFileSync(path.join(root, name), content);
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('the Replaces check gave no verdict');
+      expect(result.stdout).not.toContain('merge=allowed');
+    });
   });
 
   it.each([
@@ -4575,6 +4712,7 @@ describe('codex-review merge, the only merge path for a risk-scoped repo', () =>
     ['a fix PR names no Fixes-PR', { title: 'fix: close the gate' }, 24],
     ['a review-verdict head has no review', { labels: ['risk:high'] }, 24],
     ['a receipt asked for changes', { comments: [receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z')] }, 24],
+    ['the base requires a Replaces line and the body has none', { reviewLoop: REPLACES_OPT_IN }, 24],
     ['the repo is legacy', { baseConfig: null }, 26],
   ])('never merges, and passes the code through, when merge-check refuses because %s', (_case, fixture, code) => {
     const root = tempRoot();
@@ -4701,6 +4839,30 @@ describe('codex-review merge, the only merge path for a risk-scoped repo', () =>
 });
 
 describe('codex-review audit, the gate re-judged as of a merge', () => {
+  it('flags a merge whose body had no Replaces line when the commit it merged onto required one', () => {
+    const root = tempRoot();
+    auditFixture(root, { labels: [], body: 'Summary.' });
+    fs.writeFileSync(path.join(root, `review-loop--${MERGE_PARENT}.json`), REPLACES_OPT_IN);
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain(
+      `audit=violation pr=1 head=${HEAD} base=${MERGE_PARENT} merged=${MERGED_AT} verdict=skip: it merged with no 'Replaces:' line in its body`,
+    );
+    expect(result.calls).toContain(
+      `rest repos/example/repository/contents/.github/pr-review-loop.json?ref=${MERGE_PARENT}\n`,
+    );
+  });
+
+  it('passes a merge onto a commit that did not yet require the Replaces line, though main requires it now', () => {
+    const root = tempRoot();
+    auditFixture(root, { labels: [], body: 'Summary.', reviewLoop: REPLACES_OPT_IN });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`audit=pass pr=1 head=${HEAD} base=${MERGE_PARENT}`);
+  });
+
   it('passes a merge the gate would have allowed, judged from the commit it merged onto', () => {
     const root = tempRoot();
     auditFixture(root, { labels: [] });
@@ -5355,7 +5517,7 @@ describe('codex-review review-notes rule: a PR a reviewer said no to records its
     ['a zero-width space for a reason', 'Review-notes: none (\u200b)'],
     ['a no-break space for a reason', 'Review-notes: none (\u00a0)'],
     // #707 P3-b: these look blank but are not \p{Cf}, so stripping alone
-    // never removes them: real_reason must name them not-visible directly.
+    // never removes them: has_visible_text must name them not-visible directly.
     ['a braille blank (U+2800) for a reason', 'Review-notes: none (\u2800)'],
     ['a Hangul filler (U+3164) for a reason', 'Review-notes: none (\u3164)'],
     ['a lone combining mark for a reason', 'Review-notes: none (\u0301)'],
