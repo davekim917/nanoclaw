@@ -6,7 +6,7 @@
  * post under the key lands there too.
  *
  * The outbound row is container-written and never trusted (the same reason the
- * host re-checks `threadKey`, src/db/thread-key-anchors.ts:13-17). So the value
+ * host re-checks `threadKey`, src/db/thread-key-anchors.ts). So the value
  * is only a pointer: it is resolved against the destination's own address, and
  * adopted only when the host has already seen that thread on that messaging
  * group — a session bound to it, or an archived message in it. Anything else
@@ -17,7 +17,7 @@ import { log } from './log.js';
 import { archiveHasThread } from './message-archive.js';
 
 /** Longest value considered at all; the runner caps what it writes at the same length. */
-export const CONTINUE_THREAD_MAX_LENGTH = 512;
+const CONTINUE_THREAD_MAX_LENGTH = 512;
 
 /** One thread segment of an encoded thread id — no `:`, so it cannot re-address the channel part. */
 const THREAD_SEGMENT = /^[A-Za-z0-9._-]{1,128}$/;

@@ -131,9 +131,9 @@ export function agentImageFingerprint(image: string = CONTAINER_IMAGE): string |
  * unchanged. A stale verdict can only keep a tree private, never delete it.
  *
  * Module memory, not a file: the sweep runs in ONE persistent storage worker
- * that serves every pass (storage-maintenance-worker.ts:69 "Owns one
- * persistent worker", reused by `ensureWorker` at :136, one module-level
- * instance at :171), so this map outlives passes. A host restart or worker
+ * that serves every pass (storage-maintenance-worker.ts owns one persistent
+ * worker, reused by `ensureWorker`, one module-level instance), so this map
+ * outlives passes. A host restart or worker
  * crash forgets it, which costs one capped re-read per tree.
  */
 interface ConvertMismatchVerdict {
@@ -253,7 +253,7 @@ export function dependencyKey(pkgDir: string, fingerprint: string): { key: strin
 
 // ── Tree walk and inventory ─────────────────────────────────────────────────
 
-export type InventoryItem = [relativePath: string, type: 'f' | 'l', size: number];
+type InventoryItem = [relativePath: string, type: 'f' | 'l', size: number];
 
 export interface Inventory {
   items: InventoryItem[];
@@ -413,9 +413,9 @@ function isContainedPackageKey(key: string): boolean {
 }
 
 /**
- * npm's os/cpu list match, as npm-install-checks 7.1.2 `checkList` decides it
- * (lib/index.js:59-83): a `!value` naming the platform refuses; otherwise the
- * list must name it, hold only negations, or be exactly `any`.
+ * npm's os/cpu list match, as npm-install-checks 7.1.2 `checkList` decides it:
+ * a `!value` naming the platform refuses; otherwise the list must name it,
+ * hold only negations, or be exactly `any`.
  */
 function platformListAccepts(value: string, list: unknown): boolean {
   const entries = typeof list === 'string' ? [list] : list;
@@ -471,7 +471,7 @@ function foreignPlatform(entry: JsonObject, platform: InstallPlatform): string |
  * tree installed for another CPU passes (1)-(3), and the first report pass on
  * the host found arm64 trees under x64 keys. Only installed packages are
  * checked, and without --force npm never installs one whose os/cpu excludes the
- * platform it installs for (npm-install-checks lib/index.js:34-35), so a
+ * platform it installs for (npm-install-checks), so a
  * genuine install is never refused. libc is not checked: real trees hold the
  * -gnu and -musl builds of a native package side by side.
  */
@@ -532,7 +532,7 @@ export function checkCompleteness(pkgDir: string, platform: InstallPlatform = IN
 
 // ── Seal and verify (§5.7.4, §5.7.6) ────────────────────────────────────────
 
-export interface SealedRecord {
+interface SealedRecord {
   version: 1;
   key: string;
   keyInputs: KeyInputs;
@@ -548,14 +548,14 @@ export interface SealedRecord {
 }
 
 /** What convert compares a private tree against. */
-export interface EntryIdentity {
+interface EntryIdentity {
   inventory: InventoryItem[];
   inventorySha256: string;
   contentSha256: string;
 }
 
 /** What a report pass would have sealed, so later same-key trees report their convert. */
-export interface WouldSealEntry extends EntryIdentity {
+interface WouldSealEntry extends EntryIdentity {
   source: string;
 }
 
@@ -616,7 +616,7 @@ export function verifyEntry(entryDir: string): VerifyResult {
 
 // ── Pass ────────────────────────────────────────────────────────────────────
 
-export interface DependencyCacheCounters {
+interface DependencyCacheCounters {
   recovered: number;
   adopted: number;
   converted: number;
@@ -633,7 +633,7 @@ export interface DependencyCacheCounters {
   privateInMountedTopicsBytes: number;
 }
 
-export interface DependencyCacheDecision {
+interface DependencyCacheDecision {
   mode: 'report' | 'apply';
   op: string;
   path: string;
@@ -916,7 +916,7 @@ function withPackageDirTimesPreserved<T>(pkgDir: string, fn: () => T): T {
  * hardlink every regular file, recreate every symlink as a symlink (never
  * followed), and skip private root dot entries. The root hidden lockfile is
  * COPIED instead (owner-writable, mtime preserved): npm rewrites it on every
- * run (@npmcli/arborist lib/arborist/reify.js:254 → lib/shrinkwrap.js:1164),
+ * run (@npmcli/arborist reify → shrinkwrap),
  * so a shared read-only inode would be unlinked by the next run and a shared
  * writable one would carry one workspace's edit into every other. `dst` must
  * not exist. On any failure the partial `dst` — links, that copy and our own
@@ -1047,7 +1047,7 @@ export type LinkOutcome =
  * verified 2026-09-11 in nanoclaw-agent-v2-2a38bd3e:latest with `ldd --version`
  * and `process.report` (glibcVersionRuntime 2.36, arch x64), with no musl loader
  * present. npm names that family `glibc` (npm-install-checks 7.1.2
- * lib/current-env.js:24-25,38-39).
+ * `current-env`).
  */
 export interface LinkPlatform extends InstallPlatform {
   readonly libc: string;
@@ -1117,9 +1117,8 @@ function platformExcludes(entry: JsonObject, platform: LinkPlatform): boolean {
  *
  * An absent package-lock entry is excused when:
  *   (a) its lockfile `os`/`cpu` exclude this platform, or it declares a `libc`
- *       that excludes it. That is npm's own test (npm-install-checks 7.1.2
- *       lib/index.js:34-39; lists matched by `checkList`, :59-83, which
- *       `platformListAccepts` mirrors).
+ *       that excludes it. That is npm's own test (npm-install-checks 7.1.2;
+ *       lists matched by `checkList`, which `platformListAccepts` mirrors).
  *   (b) it declares `os` or `cpu`, declares no `libc`, and is named as a musl
  *       build, while this platform is glibc. Lockfiles written before npm
  *       recorded `libc` omit it, and npm skips these builds after reading the

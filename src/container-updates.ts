@@ -9,15 +9,15 @@ const execFileAsync = promisify(execFile);
 /** Where ~/plugins is mounted inside agent containers (see container-runner.ts). */
 export const CONTAINER_PLUGINS_ROOT = '/workspace/plugins';
 
-export type UpdateKind =
+type UpdateKind =
   | 'host-dependency'
   | 'bun-dependency'
   | 'remotion-dependency'
   | 'dockerfile-pin'
   | 'codex-sync'
   | 'plugin-version';
-export type UpdateSurface = 'host' | 'container' | 'bootstrap' | 'plugins';
-export type AuditStatus = 'current' | 'outdated' | 'unknown' | 'blocked';
+type UpdateSurface = 'host' | 'container' | 'bootstrap' | 'plugins';
+type AuditStatus = 'current' | 'outdated' | 'unknown' | 'blocked';
 
 export interface AuditItem {
   id: string;
@@ -52,7 +52,7 @@ export interface AuditItem {
  * Dependencies that are one half of a client/server pair with a locally-running
  * component. Keyed by package name; the value names what must move with it.
  *
- * Exists because #135 bumped @onecli-sh/sdk ^0.5.0 -> ^2.8.0 and took the whole
+ * Exists because a bump of @onecli-sh/sdk ^0.5.0 -> ^2.8.0 took the whole
  * fleet down for ~1h. Both majors export the same methods, only the HTTP path
  * moved (/api -> /v1), so the build and the full test suite passed on the broken
  * version — nothing but a live call could have caught it.
@@ -88,7 +88,7 @@ function parseDependencyPins(manifestText: string | null): Record<string, string
  *
  * `keptOurs` is the load-bearing signal: at the merge commit M, the dependency
  * resolved to OUR side (M matches M^1) while upstream's side (M^2) differed.
- * That is a deliberate hold. #135 bumped @onecli-sh/sdk five hours after merge
+ * That is a deliberate hold. The breaking @onecli-sh/sdk bump landed five hours after merge
  * ceb3fcd1 had kept ^0.5.0 over upstream's 2.2.1, and nothing connected the two.
  */
 export function deriveUpstreamPolicy(texts: {
@@ -292,14 +292,14 @@ export async function describeUpstreamPolicy(
   return { source: 'unavailable', generatedAt: null };
 }
 
-export interface ReleaseResolved {
+interface ReleaseResolved {
   status: 'resolved';
   version: string;
   tag?: string;
   commitish?: string;
 }
 
-export interface ReleaseBlocked {
+interface ReleaseBlocked {
   status: 'blocked';
   reason: string;
 }
@@ -353,7 +353,7 @@ export type CommandRunner = (command: string[], cwd: string) => Promise<void>;
 const PRERELEASE = /(?:^|[._+-])(alpha|beta|rc|pre|preview|dev|nightly|canary|snapshot)\d*(?:$|[._+-])/i;
 const COMPACT_PRERELEASE = /\d(?:a|b|rc|dev)\d*$/i;
 
-export function isStableVersion(value: string): boolean {
+function isStableVersion(value: string): boolean {
   const normalized = value.trim().replace(/^v(?=\d)/i, '');
   return (
     /^\d+(?:\.\d+)*(?:\.post\d+)?$/i.test(normalized) &&
@@ -771,7 +771,7 @@ export function renderAuditMarkdown(items: AuditItem[]): string {
   lines.push('', `${actionable.length} outdated; ${blocked.length} blocked or unknown.`);
   for (const item of blocked) lines.push(`- ${item.id}: ${item.detail ?? item.status}`);
 
-  // Constraints that must be READ, not inferred. These exist because #135 passed
+  // Constraints that must be READ, not inferred. These exist because an SDK bump passed
   // every gate — build green, tests green, identical method names — and still
   // took the fleet down. Surface them next to the versions so an approval can't
   // be given without seeing them.

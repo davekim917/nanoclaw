@@ -46,7 +46,7 @@ export type ClaudeSpawnConfig = Pick<
  * does. Depth 1 previously PREVENTED a worker from delegating further; depth 2
  * allows it, which is the intent — nothing forbids re-delegation now, and the
  * installed orchestrate worker definitions never did
- * (`~/plugins/bootstrap/plugins/orchestrate/agents/worker-high.md:8` just says
+ * (`~/plugins/bootstrap/plugins/orchestrate/agents/worker-high.md` just says
  * to execute the prompt).
  *
  * Concurrency is NOT per-parent, so depth 2 does not square it: the pinned CLI
@@ -256,7 +256,7 @@ export function claudeSpawnEnv(
   if (resolved.effort) env.push('-e', `NANOCLAW_EFFORT_OVERRIDE=${resolved.effort}`);
   // Quota caps ride the same primitive so the wiki spawn branch, which builds
   // its own argv and returns before the ordinary branch's env block, cannot
-  // fall behind it (PR #810 review F1).
+  // fall behind it.
   env.push(
     '-e',
     `CLAUDE_CODE_AUTO_COMPACT_WINDOW=${containerConfig.autoCompactWindow ?? DEFAULT_CLAUDE_AUTO_COMPACT_WINDOW}`,

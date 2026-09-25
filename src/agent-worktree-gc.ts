@@ -70,9 +70,9 @@ import path from 'path';
  * `worktree add`, the commit-message scan and the final `worktree remove` all
  * use `git -C "$worktree_root"` or an absolute path, and the boundary check
  * passes `--root` while running with cwd `$repo_root`
- * (`.husky/pre-push:172,174`). So a snapshot ALWAYS looks idle while its push
+ * (`.husky/pre-push`). So a snapshot ALWAYS looks idle while its push
  * is very much in flight — which is exactly what produced the false "safe to
- * reclaim" on the first real run (#570).
+ * reclaim" on the first real run.
  *
  * It used to be worse than that rather than simply absent: the hook's lint and
  * typecheck phases did `cd "$snapshot_root"`, so the probe was right
@@ -91,7 +91,7 @@ import path from 'path';
  *
  * Matched on the directory NAME rather than a `/tmp` prefix: the hook creates
  * it with `mktemp -d "${TMPDIR:-/tmp}/nanoclaw-pre-push.XXXXXX"`
- * (`.husky/pre-push:107,158`), so a push run with TMPDIR set puts it under
+ * (`.husky/pre-push`), so a push run with TMPDIR set puts it under
  * `/var/tmp` or a private runtime dir and a `/tmp`-anchored pattern would miss
  * it entirely. The literal dot is load-bearing — it is what keeps a lookalike
  * like `nanoclaw-prepush-notahook` out.
@@ -131,7 +131,7 @@ export interface Assessment {
 }
 
 /** A git invocation that failed. Caught in exactly one place, in `assess`. */
-export class ProbeError extends Error {
+class ProbeError extends Error {
   constructor(readonly args: string[]) {
     super(`git ${args.join(' ')} failed`);
     this.name = 'ProbeError';
@@ -452,7 +452,7 @@ const PR_LIST_LIMIT = 1000;
  * it. A partial list read as complete would delete a worktree whose review is
  * still in flight.
  */
-export function openPrBranches(repoRoot: string): Set<string> | null {
+function openPrBranches(repoRoot: string): Set<string> | null {
   try {
     const out = execFileSync(
       'gh',
@@ -468,7 +468,7 @@ export function openPrBranches(repoRoot: string): Set<string> | null {
 }
 
 /** Null when the inventory could not be taken — NOT an empty inventory. */
-export function listWorktrees(repoRoot: string): WorktreeRow[] | null {
+function listWorktrees(repoRoot: string): WorktreeRow[] | null {
   const porcelain = gitTolerant(repoRoot, ['worktree', 'list', '--porcelain']);
   if (porcelain === null) return null;
   return parseWorktreeList(porcelain).map((row) => ({ ...row, missing: !fs.existsSync(row.path) }));

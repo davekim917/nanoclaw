@@ -41,8 +41,8 @@ const FIRST_SCAN_COMMIT_CAP = 100;
 const DESCRIPTION_COMMIT_CAP = 20;
 
 let timer: NodeJS.Timeout | null = null;
-// Guards against overlapping scans now that git calls are async (#648
-// follow-up): the old execFileSync-based scan could never overlap its own
+// Guards against overlapping scans now that git calls are async: the old
+// execFileSync-based scan could never overlap its own
 // re-armed timer, because every await inside it settled as a same-tick
 // microtask before the event loop could reach a timer callback. Now each git
 // call actually yields, so a scan slower than SCAN_INTERVAL_MS (e.g. every
@@ -145,8 +145,7 @@ function errorMessage(error: unknown): string {
 async function readGit(repoDir: string, args: string[], operation: string, timeout = 5000): Promise<string | null> {
   try {
     // execFile has no `stdio` option — @types/node's ExecFileOptions
-    // (node_modules/@types/node/child_process.d.ts:1053) extends only
-    // CommonOptions + Abortable, unlike CommonSpawnOptions (:658), so it
+    // extends only CommonOptions + Abortable, unlike CommonSpawnOptions, so it
     // can't reject a fetch's credential prompt the way execFileSync's
     // `stdio: ['ignore', 'pipe', 'pipe']` did. util.promisify's custom
     // execFile implementation attaches the live ChildProcess as `.child`

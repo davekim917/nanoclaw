@@ -213,9 +213,9 @@ export const DATAFOLD_MCP_SERVER = {
 /**
  * Host-only fields on a stored MCP entry: they exist for the capability
  * snapshot and never for the provider. The container parses this JSON straight
- * into its server map (`container/agent-runner/src/index.ts:245`) and hands
+ * into its server map (`container/agent-runner/src/index.ts`) and hands
  * each entry to a provider's translator; its own `McpServerConfig`
- * (`container/agent-runner/src/providers/types.ts:269-307`) declares neither
+ * (`container/agent-runner/src/providers/types.ts`) declares neither
  * field, so they are dropped here rather than ridden along to three providers.
  *
  * `instructions` is deliberately NOT in this list. It is not part of that type
@@ -262,7 +262,7 @@ export function gitIdentityEnv(identity?: GitIdentity): Record<string, string> {
 // 200. v1.42.0 serves BOTH prefixes, which is why `src/onecli-secrets.ts`'s raw
 // `/api/<resource>` call still works; don't assume that holds forever.
 //
-// History worth not repeating: a blind `^0.5.0` -> `^2.8.0` bump in #135 took
+// History worth not repeating: a blind `^0.5.0` -> `^2.8.0` bump took
 // the whole fleet down for ~1h against the then-current v1.18.6 gateway, which
 // served only `/api`. ensureAgent 404'd, every spawn aborted, and the sweep
 // retried at WARN forever with no escalation. Nothing caught it — build and
@@ -431,7 +431,7 @@ export function _respawnIntentTokenForTesting(sessionId: string): number | undef
  * lease") replaced it with the lease id. The fork takes the end state directly,
  * so the claimant vocabulary never has to be migrated.
  *
- * The lease start in `main()` is fail-open by design (`shadowWrite`, #421), so
+ * The lease start in `main()` is fail-open by design (`shadowWrite`), so
  * a host whose registration failed at boot reaches here with no id. One late
  * start is attempted from the spawn path — the DB may well be healthy again by
  * then — and it is also `shadowWrite`-wrapped, because a failed retry must
@@ -530,8 +530,8 @@ async function selfLeaseIsLive(instanceId: string): Promise<boolean> {
  * as "absent". The adopter holds the survivor by definition and skips it. A
  * runtime call, so it sits OUTSIDE the transaction below.
  *
- * P1 — the peer half, and the incarnation CAS, as ONE atomic step (#439, item
- * 1). The holder's liveness verdict and the conditional UPDATE were two
+ * P1 — the peer half, and the incarnation CAS, as ONE atomic step. The
+ * holder's liveness verdict and the conditional UPDATE were two
  * statements, and a peer whose lease had expired but renewed in between was
  * overwritten while its container kept running. `centralTransaction` opens
  * `BEGIN IMMEDIATE` under the fork's central lease, so the peer's renewal
@@ -1422,7 +1422,7 @@ async function spawnReservedContainer(caller: Session, guard?: WakeGuard): Promi
   // process and incorrectly reject another wake at the cap.
   const inFlightWakes = [...spawningSessions].filter((sessionId) => !activeContainers.has(sessionId)).length;
   // A pending survivor is a container this host did not admit but which is
-  // running all the same (seam 4 E/D2, #462 item 7): it occupies a slot.
+  // running all the same: it occupies a slot.
   const pendingSurvivors = pendingAdoptions.size;
   if (MAX_CONCURRENT_CONTAINERS > 0 && activeCount + inFlightWakes + pendingSurvivors >= MAX_CONCURRENT_CONTAINERS) {
     log.warn('Container wake deferred — concurrency cap reached', {
@@ -1521,7 +1521,7 @@ export async function resolveSessionRepositoryWorkUnit(
 
 export function canonicalGitControlMounts(gitDir: string, stateDir: string): VolumeMount[] {
   // Checked before anything below writes into this .git. A `commondir` file
-  // sends Git to another repository's refs and objects (#669), so the canonical
+  // sends Git to another repository's refs and objects, so the canonical
   // carries a self-referential sentinel, bind-mounted read-only over its own
   // path like the object-alternates placeholders below. An existing canonical
   // gets it at its next spawn. Anything else found there is never overwritten:
@@ -1596,8 +1596,7 @@ function alertScanPolicyHooksOnce(repository: { gitDir: string }, outcome: 'refu
   log.error('managed-git-hooks: scan-policy repository degraded below the real hook', {
     outcome,
     // gitDir DOES contain the workgroup id and repo name as path segments
-    // (#666 review P3-5: an earlier comment here incorrectly claimed
-    // otherwise) — this is a host log line, not the count-only report
+    // — this is a host log line, not the count-only report
     // migrateExistingCanonicalHooksPath returns to callers, so it is fine
     // for it to be more specific.
     gitDir: repository.gitDir,
@@ -1764,7 +1763,7 @@ async function spawnContainer(
   // session whose inbound.db has been reclaimed. That fails closed on purpose —
   // a container with no mailbox to poll could otherwise recreate the host-owned
   // database under the writable parent mount. The direct open this replaced
-  // threw for exactly this state. Since #749 `buildMounts` refuses such a spawn
+  // threw for exactly this state. `buildMounts` refuses such a spawn
   // outright rather than omitting the overlay, so this is now the first of two
   // fail-closed checks rather than the only one.
   const repositoryFenceRead = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => ({
@@ -2022,7 +2021,7 @@ async function spawnContainer(
       everSeenRunningSessions.add(session.id);
 
       // Every child listener is attached HERE, in the same synchronous turn as
-      // `spawn()`, before the block returns (#460 round 2). A runtime that
+      // `spawn()`, before the block returns. A runtime that
       // cannot launch (ENOENT, EACCES) emits `error` from a `process.nextTick`
       // queued inside `spawn()`; whether the continuation of the `await`
       // around this block runs before that tick is a scheduler detail
@@ -2101,7 +2100,7 @@ async function spawnContainer(
  * Synchronous by requirement: it runs from `close`/`error` handlers. The
  * durable writes are one detached tail (`finishSessionBookkeeping`), fenced on
  * the session claim so a peer host that took the session at N+1 is never
- * overwritten by this host's stale finish (#439, item 2).
+ * overwritten by this host's stale finish.
  */
 export function finalizeSession(
   sessionId: string,
@@ -2153,8 +2152,8 @@ export function finalizeSession(
  * Both are fenced on the claim row. The release always was — it matches
  * `claimed_by` AND `incarnation`, so a stale release is a no-op — but the
  * status write was not: after a peer host took the session at N+1, this host's
- * still-live child could report the peer's live container stopped (#439, item
- * 2). The fence read and the conditional status write are ONE atomic step
+ * still-live child could report the peer's live container stopped. The fence
+ * read and the conditional status write are ONE atomic step
  * (`centralTransaction`, `BEGIN IMMEDIATE` under the central lease): a
  * replacement wake's claim CAS runs in its own transaction and so waits behind
  * this one, which closes the interleaving where the replacement claimed N+1
@@ -2346,7 +2345,7 @@ export function killContainer(
     if (pendingAdoptions.has(sessionId)) {
       // A survivor this host could not yet adopt: running, owned, untracked.
       // Stopped by name and proven gone before its hold is released and the
-      // exit work runs (seam 4 E/D2, #462 item 2).
+      // exit work runs.
       recordStopIntent(sessionId, intent);
       stopPendingSurvivor(sessionId, reason, onExit ? [onExit] : []);
       return;
@@ -2403,7 +2402,7 @@ interface PendingHold {
   reservedMb: number | null;
   /** False when the survivor would be refused as a spawn: its reservation is saturating and adoption stops it under its claim. */
   fits: boolean | null;
-  /** The `docker wait` exit observer, armed when the name is known (#462 item 1). */
+  /** The `docker wait` exit observer, armed when the name is known. */
   waiter: ChildProcess | null;
   /**
    * Exit work handed to `killContainer` by a stop that could not be proven:
@@ -2416,7 +2415,7 @@ interface PendingHold {
 const pendingHolds = new Map<string, PendingHold>();
 
 /**
- * Observe a pending survivor's exit (#462 item 1). Without this a survivor
+ * Observe a pending survivor's exit. Without this a survivor
  * that exits with no further message keeps its holds until the next boot and
  * can starve unrelated queued sessions. Same discipline as the adopted
  * channel: a waiter close is a hint, checked against the runtime; gone →
@@ -2531,7 +2530,7 @@ async function holdAsPending(
       if (memory.requestMb !== undefined) {
         // The survivor is using this memory whether or not it fits: count it,
         // saturating, so admission blocks fresh spawns until it is adopted or
-        // proven gone (#462 item 5) rather than spawning on top of it.
+        // proven gone rather than spawning on top of it.
         getMemoryAdmission().reserveSaturating(session.id, memory.requestMb);
         hold.reservedMb = memory.requestMb;
       }
@@ -2590,7 +2589,7 @@ function transferPendingHold(sessionId: string): void {
 }
 
 /**
- * Stop a pending survivor by name (#462 item 2): `docker stop`, then a hard
+ * Stop a pending survivor by name: `docker stop`, then a hard
  * kill if the stop did not take, and the hold is released — and the exit work
  * run — only once the runtime proves the container gone. A survivor that
  * cannot be stopped stays pending (owned, leased, counted) and the caller
@@ -2626,7 +2625,7 @@ function stopPendingSurvivor(sessionId: string, reason: string, onExit: Containe
     }
   }
   // The exit work rides the hold either way: released now if the container is
-  // proven gone, or by the observer when it eventually exits (#479 round 2).
+  // proven gone, or by the observer when it eventually exits.
   hold.parkedExits.push(...onExit);
   if (!containerProvenGone(containerName)) {
     log.warn('A pending survivor could not be stopped — keeping it pending with its exit work parked', {
@@ -2641,7 +2640,7 @@ function stopPendingSurvivor(sessionId: string, reason: string, onExit: Containe
 }
 
 /**
- * Make an unlisted pending survivor stoppable (#479 round 2): a hold seeded on
+ * Make an unlisted pending survivor stoppable: a hold seeded on
  * an inventory failure carries no container name, so nothing can stop it by
  * name. Re-list from the runtime: found → the name is recorded and the exit
  * observer armed, `'running'`; not listed → the survivor is gone and its hold
@@ -2677,7 +2676,7 @@ export async function resolvePendingSurvivor(sessionId: string): Promise<'runnin
  * survivor is adopted), and different for every spawn (the name carries the
  * spawn instant), so a caller that must tell "the same container" from "a
  * replacement" across an await compares this, not `getContainerSpawnedAt`,
- * which flips from 0 to the adoption instant on adoption (#479 round 2).
+ * which flips from 0 to the adoption instant on adoption.
  */
 export function getContainerIdentity(sessionId: string): string | null {
   return activeContainers.get(sessionId)?.containerName ?? pendingHolds.get(sessionId)?.containerName ?? null;
@@ -3056,7 +3055,7 @@ function stopUnadoptable(containerName: string, why: string, sessionId: string |
  * absence; a duplicate this host cannot remove fails the boot — when the owned
  * container exits, finalization would release the claim, reservation and
  * leases while the duplicate keeps writing the outbound DB, so there is no
- * safe state to continue from (#462 item 6).
+ * safe state to continue from.
  */
 function removeDuplicateContainer(
   container: { name: string; sessionId: string | null },
@@ -3438,7 +3437,7 @@ export async function reconcileSurvivorWakeRows(session: Session): Promise<{ con
  * exit that recorded it, by the boot door, or by the wake that later gave the
  * session a container again, which never touches the row — so every plain
  * row this pass reads is cleared after the respawn promises are handled
- * (#474). Left alone, the rows accumulate one per session and the table stops
+ * Left alone, the rows accumulate one per session and the table stops
  * being evidence of anything. A session still awaiting claim-fenced adoption
  * keeps its row: its container is alive and not yet re-fenced.
  *
@@ -3503,8 +3502,8 @@ export async function honorPendingStopIntents(
 }
 
 /**
- * Clear the plain `'stop'` rows the boot pass read, in one conditional write
- * (#474). Each row is matched on the value AND the `updated_at` that was read,
+ * Clear the plain `'stop'` rows the boot pass read, in one conditional write.
+ * Each row is matched on the value AND the `updated_at` that was read,
  * so only the row version the pass saw is cleared: a kill that re-armed the
  * row to `respawn_after_stop` since, or recorded a fresh `'stop'` for the same
  * session (a thread close landing while an earlier respawn was awaited), wrote
@@ -3541,7 +3540,7 @@ async function clearHonouredStopIntents(
     // touched, which is a strict subset of `honoured`: a row rewritten since
     // the read carries a newer stamp and is skipped. The per-session lines
     // below are driven by that subset, so a line never claims a clear that did
-    // not happen (#501). Row count and `changes` are the same number here, so
+    // not happen. Row count and `changes` are the same number here, so
     // the aggregate `cleared` count is unchanged.
     let clearedIds: string[];
     /* eslint-disable no-catch-all/no-catch-all -- a failed clear must not block startup; it is reported and retried next boot */
@@ -3976,7 +3975,7 @@ export function resolveCodexAuthFallbacks(
 /**
  * True for a credential-staging failure caused by HOST STATE rather than by a
  * bug here: a SYSCALL error, or one of the `Unsafe …` refusals the staging
- * guards raise (`src/fs-safety.ts:44`, plus `stageCodexAuth` and
+ * guards raise (`src/fs-safety.ts`, plus `stageCodexAuth` and
  * `materializeCodexFallbackRuntime` below).
  *
  * A PEER credential — Codex in a non-codex container, OpenCode in any of them —
@@ -3989,13 +3988,13 @@ export function resolveCodexAuthFallbacks(
  * codes too (`ERR_INVALID_ARG_TYPE`), and those are exactly the bugs this
  * predicate exists to let through. The underscore is what separates them.
  *
- * `Invalid group folder` (`src/group-folder.ts:21`, reached through
+ * `Invalid group folder` (`src/group-folder.ts`, reached through
  * `stageOpenCodeAuth`'s defense-in-depth check on the scoped path) counts as
  * host state too: a live `agent_groups.folder` CAN fail the grammar, because
  * not every creation path checks it. `toFolder` in
- * `src/modules/permissions/channel-approval.ts:119` has no length cap, so a
+ * `src/modules/permissions/channel-approval.ts` has no length cap, so a
  * channel name of 65+ characters mints a folder the 64-char pattern refuses,
- * and `setup/migrate-v2/groups.ts:78` carries v1 folder names over verbatim.
+ * and `setup/migrate-v2/groups.ts` carries v1 folder names over verbatim.
  * The spawn path itself never checks the grammar, so such a group spawned fine
  * before this PR; making the peer credential the one thing that renders it
  * unspawnable would be a regression. Withholding also means the scoped path is
@@ -4497,7 +4496,7 @@ export function channelInstructionsMounts(
  * One line per synchronous stage of a spawn, so the next stall can be
  * attributed without another sampling session.
  *
- * #315 cost a day of investigation because the whole window between waking a
+ * An earlier stall cost a day of investigation because the whole window between waking a
  * container and loading the mount allowlist emitted no logs at all — roughly
  * 1,450 lines of prologue, ending at the first OneCLI line, which is why the
  * OneCLI path was blamed for a block that had already finished by then.
@@ -4642,14 +4641,13 @@ export async function buildMounts(
   // signaling that rides on inbound.db.
   //
   // A FILE-level read-only overlay is NOT sufficient, and believing it was is
-  // what #749 exploited. The overlay covers the file; SQLite's rollback
+  // what an exploit used. The overlay covers the file; SQLite's rollback
   // journal is a SIBLING PATH, and this parent mount is read-write, so a
   // container could create `/workspace/inbound.db-journal` beside it. A
   // journal carries no binding to its database's identity, so the host
   // replayed the container's hand-built journal as a HOT journal on its next
   // read-write open and wrote attacker-chosen pages into the host-owned
-  // database — a forged `delivered` row, proven by the proof of concept on
-  // #735.
+  // database — a forged `delivered` row, proven by a proof of concept.
   //
   // So the host keeps inbound.db in `<session>/.host/` and that DIRECTORY is
   // overlaid read-only below. SQLite only ever creates `-journal`/`-wal`/
@@ -4673,7 +4671,7 @@ export async function buildMounts(
   // where the transitional legacy-path fallback in `resolveInboundDbPath` must
   // stop: no container ever runs against a session whose database still sits
   // in the directory it can write. Fail closed — a spawn that cannot migrate
-  // retries rather than coming up unprotected (#749).
+  // retries rather than coming up unprotected.
   await migrateInboundDbToHostDir(sessDir, { agentGroupId: agentGroup.id, sessionId: session.id });
   assertHostOwnedInboundDb(sessDir, session.id);
   mounts.push(...hostInboundMounts(sessDir));
@@ -4704,7 +4702,7 @@ export async function buildMounts(
   // whole spawn on the first unusable canonical — and a foreign `commondir`
   // naming a missing directory makes its Git probe exit 128 — so a single
   // tampered or half-migrated `.git` used to stop every container in the
-  // workgroup instead of withholding one repository (#669 review).
+  // workgroup instead of withholding one repository.
   const canonicals = classifyCanonicalRepositories(wgKey);
   for (const broken of canonicals.unusable) {
     log.error(
@@ -4763,7 +4761,7 @@ export async function buildMounts(
     }
     mounts.push({ hostPath: repository.gitDir, containerPath: repository.gitDir, readonly: false });
     mounts.push(...controlMounts);
-    // Deduped by container path (#666 review B8): two scan-policy
+    // Deduped by container path: two scan-policy
     // repositories in one workgroup would otherwise both resolve to the
     // SAME containerPath (MANAGED_GIT_HOOKS_SCAN_DIR — one host-managed
     // directory for the whole install, not per-repo), and Docker rejects a
@@ -5064,7 +5062,7 @@ export async function buildMounts(
   // Awaited: the projection is rebuilt on a worker thread when its inputs have
   // moved, and skipped entirely when they have not. It used to run
   // synchronously here on every spawn, which parked the host event loop for
-  // seconds at a time — the dominant cause of #315. Fail-closed is unchanged:
+  // seconds at a time — the dominant cause of event-loop stalls. Fail-closed is unchanged:
   // a build that runs and throws aborts the spawn.
   const archiveProjectionStartedAt = Date.now();
   await ensureArchiveProjection(archiveSrc, archiveDst, agentGroup.id, workgroupMemberIds);
@@ -5085,7 +5083,7 @@ export async function buildMounts(
   mounts.push({ hostPath: centralDst, containerPath: '/workspace/central.db', readonly: true });
 
   // Shared agent-runner source — read-only, same code for all groups. This
-  // is the boot-time snapshot activated in main.ts (mailbox seam PR 0), not
+  // is the boot-time snapshot activated in main.ts, not
   // the live checkout — see src/agent-runner-source.ts.
   const agentRunnerSrc = agentRunnerSourcePath();
   mounts.push({ hostPath: agentRunnerSrc, containerPath: '/app/src', readonly: true });
@@ -5218,7 +5216,7 @@ export async function buildMounts(
     // (`src/container-config.ts`), and drops a sub-path an excluded ancestor
     // already covers — so a redundant pair like `["mono", "mono/plugins/alpha"]`
     // is ONE entry to the mount denial a few lines above and was TWO here. Two
-    // readers of one field normalizing differently is the class #826 r3 recorded
+    // readers of one field normalizing differently is the class once recorded
     // for the composer's fragment keys, and it is a defect even where today's
     // outcomes happen to agree.
     //
@@ -5297,9 +5295,9 @@ export async function buildMounts(
       // provider Codex is a PEER capability, and failing a whole container over
       // it would be exactly the "peer codex degraded → every container
       // crash-loops" trade the runner refuses
-      // (container/agent-runner/src/codex-companion-setup.ts:352-369). So a peer
+      // (container/agent-runner/src/codex-companion-setup.ts). So a peer
       // stage that throws is logged and WITHHELD: the container boots, finds no
-      // `auth.json`, and skips CODEX_HOME setup (`codex-companion-setup.ts:582`).
+      // `auth.json`, and skips CODEX_HOME setup.
       // Narrowed by `isHostStateFailure` so a bug here still surfaces.
       const stageOrWithhold = (what: string, stage: () => VolumeMount[]): VolumeMount[] => {
         try {
@@ -5318,7 +5316,7 @@ export async function buildMounts(
       // provider=codex brings its own session-local /home/node/.codex (see
       // src/providers/codex.ts's container-config registry contribution) plus
       // the RO host home below, which `refreshCodexAuthFromHost`
-      // (container/agent-runner/src/providers/codex.ts:897) re-reads auth.json
+      // (container/agent-runner/src/providers/codex.ts) re-reads auth.json
       // from when the host rotates a token mid-session. That mount is the ONE
       // place a container still sees a whole host Codex home, read-only —
       // narrowing it to a file bind would defeat the refresh, which exists to
@@ -5341,7 +5339,7 @@ export async function buildMounts(
         // that the next host-side `codex` run would execute. The runner reads
         // exactly one file from this mount (`HOST_CODEX_DIR/auth.json`, which
         // it symlinks into its own CODEX_HOME:
-        // container/agent-runner/src/codex-companion-setup.ts:581-604).
+        // container/agent-runner/src/codex-companion-setup.ts).
         //
         // Source keyed on `agentGroup.folder`, NOT `credentialFolder`: a codex
         // sibling usually wants its own ChatGPT identity, while credentialFolder
@@ -5369,7 +5367,7 @@ export async function buildMounts(
       // session and the transcript must follow it: provider=codex. A peer's
       // fallback is a credential and nothing else — `CODEX_FALLBACK_HOMES` is
       // read only by the Codex provider and by `setupCodexPrimaryRuntime`
-      // (container/agent-runner/src/codex-companion-setup.ts:704), neither of
+      // (container/agent-runner/src/codex-companion-setup.ts), neither of
       // which a Claude or OpenCode container runs — so mounting that account's
       // host transcripts RW into one would be exposure with no function.
       const resolvedFallbacks = resolveCodexAuthFallbacks(containerConfig.codexAuthFallbacks, primaryHostPath);
@@ -6054,7 +6052,7 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
     } else if (!entry.isSymbolicLink()) {
       // A real entry here is either a template overlay (intentional; see
       // src/group-skills.ts) or a stale pre-refactor skill copy that shadows
-      // the shared skill (#3001). No marker distinguishes them yet, so
+      // the shared skill. No marker distinguishes them yet, so
       // surface the skip instead of staying silent.
       log.warn(
         'Shared skill not symlinked: real entry occupies the path (template overlay or stale pre-refactor copy)',
@@ -6101,7 +6099,7 @@ const MANAGED_WORKER_DEFS = [
 // `.claude-shared/agents/` — the container's user scope — while the shim is
 // registered from the plugin mount; on the HOST a plugin agent carries the
 // qualified `<plugin>:<agent>` name, but IN A CONTAINER it is exposed bare
-// (this fork's own #814 finding, recorded in docs/specs/quota-burn/plan.md).
+// (recorded in docs/specs/quota-burn/plan.md).
 // So a stale user-scope `worker-high.md` left from the retired roster sits
 // under the same bare name as the live shim.
 //
@@ -6196,7 +6194,7 @@ async function ensureRuntimeFields(
     // commented "race-safe": the re-read narrowed the window in which a
     // concurrent writer's change could be overwritten, but two separate
     // syscalls cannot close it, and what fell through was a silently discarded
-    // `excludePlugins` (#840). The read/merge/write shape is unchanged — any
+    // `excludePlugins`. The read/merge/write shape is unchanged — any
     // operator-owned field written after the spawn began is still preserved —
     // it is now exclusive as well.
     const fresh = await updateContainerConfig(agentGroup.folder, (config) => {
@@ -6704,13 +6702,13 @@ async function buildContainerArgs(
   // Read directly from the DB rather than from `agentGroup` because the
   // typed `AgentGroup` interface doesn't surface workgroup_id (column was
   // added in migration 036; the row carries it but the type predates it).
-  // Mirrors the existing W3 fail-closed lookup at container-runner.ts:1068.
+  // Mirrors the existing W3 fail-closed lookup in this file.
   //
   // Try/catch fail-soft: pre-migration-036 installs don't have the
   // workgroup_id column at all. `SELECT workgroup_id FROM ...` throws
-  // `no such column` on those schemas. Codex P1 on PR #113 caught this
-  // turning a best-effort prompt addendum into a hard spawn failure.
-  // The W3 path at line 1066 uses PRAGMA table_info to guard the same
+  // `no such column` on those schemas, which would turn a best-effort
+  // prompt addendum into a hard spawn failure.
+  // The W3 path uses PRAGMA table_info to guard the same
   // case; here we use try/catch because the workgroup line is purely
   // additive — silent fall-through is the right semantic.
   try {
@@ -6809,7 +6807,7 @@ async function buildContainerArgs(
     }
   }
 
-  // v1 settings.json env block (src/container-runner.ts:1703-1709): SDK
+  // v1 settings.json env block: SDK
   // capabilities that need explicit opt-in. Porting as plain env since
   // v2's container reads env, not a settings.json mount point.
   args.push('-e', 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1');
@@ -7155,7 +7153,7 @@ async function buildContainerArgs(
       }
 
       // Awaited: these hit the OneCLI control API. They were synchronous
-      // (execFileSync curl) until #315, which parked the host event loop for
+      // (execFileSync curl) once, which parked the host event loop for
       // the full round trip on every spawn. Ordering with the mount/env
       // assembly below is unchanged — the whole block is sequential inside
       // this one async function, and `args` is local to this call.

@@ -1,10 +1,10 @@
 /**
- * The self-referential `commondir` sentinel every workgroup canonical `.git` carries (#669).
+ * The self-referential `commondir` sentinel every workgroup canonical `.git` carries.
  *
  * Git honours a `commondir` file in any git dir, not only in a linked
  * worktree's admin dir, and then reads refs, objects and config from the
  * directory it names. A canonical's `.git` is mounted read-write into every
- * topic container at its exact host path (container-runner.ts:4536), so a
+ * topic container at its exact host path (container-runner.ts), so a
  * container could otherwise create one and point host Git at another
  * workgroup's repository.
  *
@@ -17,7 +17,7 @@
  * is why the content is ".", never "".
  *
  * The host creates the sentinel and bind-mounts it read-only over its own
- * path (container-runner.ts:1542), so a container can neither rewrite nor
+ * path (container-runner.ts), so a container can neither rewrite nor
  * replace it.
  */
 import { execFileSync } from 'child_process';
@@ -28,7 +28,7 @@ import path from 'path';
 import { safeGitArgs, safeGitEnv } from './safe-git.js';
 
 /** The exact bytes of the sentinel. Anything else in a canonical `commondir` is foreign. */
-export const CANONICAL_COMMONDIR_SENTINEL = '.\n';
+const CANONICAL_COMMONDIR_SENTINEL = '.\n';
 
 export type CanonicalCommondirState = 'absent' | 'sentinel' | 'foreign';
 
@@ -45,7 +45,7 @@ export function canonicalCommondirPath(gitDir: string): string {
  *
  * The sentinel must be the file's only name (nlink 1). The read-only overlay
  * protects the name `commondir`, not the inode: another name for it inside the
- * read-write `.git` mount (container-runner.ts:4536) would stay writable, and a
+ * read-write `.git` mount would stay writable, and a
  * write through it changes what Git reads at `commondir`. A container spawned
  * with the overlay cannot make one (link(2) across mount points fails with
  * EXDEV), but a container spawned before the sentinel existed can, and so can
@@ -110,7 +110,7 @@ export function readCanonicalCommondir(gitDir: string): CanonicalCommondirState 
  * The temporary name is unlinked before the final read, so a sentinel this
  * call created ends with nlink 1. Between the link and that unlink it has two
  * names. No other host spawn can look in that gap: this runs synchronously
- * inside canonicalGitControlMounts (container-runner.ts:1478), on the host's
+ * inside canonicalGitControlMounts (container-runner.ts), on the host's
  * one event loop. A container that links the temporary name in that gap
  * leaves nlink 2, which the final read refuses. So does a host crash inside
  * the gap; an operator then removes the stray `commondir.tmp-*`.
@@ -156,7 +156,7 @@ export function ensureCanonicalCommondirSentinel(gitDir: string): CanonicalCommo
  * Does Git itself resolve `gitDir`'s common dir to `expectedCommonDir`?
  *
  * Asked with `--git-dir`, so no discovery walk is involved, and through
- * safeGitEnv, which builds the environment from scratch (safe-git.ts:29-43),
+ * safeGitEnv, which builds the environment from scratch (safe-git.ts),
  * so an inherited GIT_DIR or GIT_COMMON_DIR cannot answer for the repository.
  * Both sides are real-pathed. Any failure answers false.
  */

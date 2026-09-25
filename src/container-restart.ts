@@ -85,7 +85,7 @@ export class RepositoryMountQuiescenceError extends Error {
  * lets `quiesceSessionsForRepositoryMounts` hand it back through the recovery
  * shape that already exists for exactly this (`barriersReleased: false`).
  */
-export class RepositoryMountBarrierRollbackError extends Error {
+class RepositoryMountBarrierRollbackError extends Error {
   readonly epoch: string;
   readonly strandedSessions: Session[];
   readonly barrierGenerations: Record<string, string>;
@@ -108,7 +108,7 @@ function uniqueSessions(sessions: Session[]): Session[] {
  * ingress path to fence: messages_in only exists inside that file, and the only
  * writer that could create it is a spawn, which is already rejected at the
  * workgroup mount claim or the drained work unit's lifecycle claim
- * (container-runner.ts:1685-1690) for the whole quiescence window. Opening it instead throws inside
+ * (container-runner.ts) for the whole quiescence window. Opening it instead throws inside
  * better-sqlite3 ("directory does not exist") and fails the entire publication.
  */
 function sessionInboundPath(session: Session): string {
@@ -148,8 +148,8 @@ function sessionVanishIsSkippable(session: Session): boolean {
 
 /**
  * Is a container running for this session as far as the host can tell —
- * tracked, still spawning, or a pending survivor adoption could not yet claim
- * (seam 4 E/D2, #462)? The barrier predicates ask this rather than the
+ * tracked, still spawning, or a pending survivor adoption could not yet claim?
+ * The barrier predicates ask this rather than the
  * registry alone: a pending survivor is live, holds the mounts, and must
  * acknowledge the fence and drain its work before it is stopped.
  */
@@ -394,7 +394,7 @@ export async function quiesceSessionsForRepositoryMounts(
   // own a live RW mount and must not escape quiescence — so the stop set is
   // derived before the fenceable filter, never from it. A pending adoption is
   // a survivor this host has not claimed but which is running and holds the
-  // mounts all the same (seam 4 E/D2, #462 item 3): it is stopped here like
+  // mounts all the same: it is stopped here like
   // any running container, through `killContainer`, which routes it.
   const affected = known.filter(
     (session) => isContainerRunning(session.id) || isContainerSpawning(session.id) || hasPendingAdoption(session.id),
@@ -409,7 +409,7 @@ export async function quiesceSessionsForRepositoryMounts(
       `running session(s) have no inbound database to fence: ${unfenceable.map((session) => session.id).join(', ')}`,
     );
   }
-  // #223 returns `fenced` — the subset this pass actually fenced, after
+  // The fence returns `fenced` — the subset this pass actually fenced, after
   // skipping sessions whose inbound DB vanished — so barrierSessions,
   // barrierAcks and barrierGenerations stay one consistent set.
   let fenced: Session[];
@@ -594,7 +594,7 @@ export interface BootQuiescenceOptions {
    * PRE-stop partition: the boot block writes the host-restart accountability
    * note here for every session marked running by the previous host EXCEPT
    * the survivors, whose containers are not being interrupted — before the
-   * stop pass, which can outlast the heartbeat freshness window (#441). Pass 2
+   * stop pass, which can outlast the heartbeat freshness window. Pass 2
    * runs only when the post-stop re-evaluation moved sessions INTO must-stop
    * (a flipped workgroup, a newcomer): `mustStopSessionIds` is then exactly
    * those newly reclassified sessions, which the first note skipped and which
@@ -754,7 +754,7 @@ export async function quiesceWorkgroupsForBootMountChange(
   // must-stop one that is still here (a stop that did not take, a newcomer in
   // a changed workgroup) is stopped in the second pass. An inventory taken
   // BEFORE that await would hold no record of a newcomer that arrived during
-  // it, and the mounts would be reconciled under a live container (#493).
+  // it, and the mounts would be reconciled under a live container.
   const afterFirstPass = partitionInstallContainers(list(), finalChanged, known, knownSessions);
   if (afterFirstPass.mustStop.length > 0) {
     log.info('Boot quiescence second pass', {
@@ -841,9 +841,9 @@ export async function restartAgentGroupContainers(
   wakeMessage?: string,
   options: { respawnAll?: boolean } = {},
 ): Promise<number> {
-  // A pending survivor (adoption could not yet claim it, seam 4 E/D2) is
+  // A pending survivor (adoption could not yet claim it) is
   // running the OLD image and configuration too; it is selected like a tracked
-  // container and stopped through `killContainer`, which routes it (#462).
+  // container and stopped through `killContainer`, which routes it.
   const sessions = (await getSessionsByAgentGroup(agentGroupId)).filter(
     (s) => s.status === 'active' && (isContainerRunning(s.id) || hasPendingAdoption(s.id)),
   );
@@ -855,7 +855,7 @@ export async function restartAgentGroupContainers(
     // container name yet, and nothing can stop a container it cannot name.
     // Resolve it from the runtime BEFORE the wake row is written: gone means
     // there is nothing to restart (and no row to leave behind); unknown means
-    // this restart cannot be performed or reported (#479 round 2).
+    // this restart cannot be performed or reported.
     if (hasPendingAdoption(session.id)) {
       const resolved = await resolvePendingSurvivor(session.id);
       if (resolved === 'gone') continue;
@@ -953,7 +953,7 @@ export async function restartAgentGroupContainers(
     // later recovery pass. The container NAME identifies the process: every
     // spawn mints a new one, and a pending survivor adopted during the await
     // keeps its own — `getContainerSpawnedAt` would flip from 0 to the adoption
-    // instant there and misread adoption as replacement (#479 round 2).
+    // instant there and misread adoption as replacement.
     const identity = getContainerIdentity(session.id);
 
     // Always respawn after the kill when there is anything to process: an
