@@ -32,6 +32,22 @@ export const TREE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url
  */
 const SERVER_ONLY = new Set(['index.ts', 'bundle.test.ts']); // plugin-only: stdio entry (tree has its own wrapper) + dist-bundle freshness test (tree vendors no dist/)
 const TREE_ENGINE_DIR = 'container/agent-runner/src/mcp-tools/design-review';
+const TREE_ONLY_ENGINE_FILES = new Set(['index.ts']);
+
+/**
+ * Tree-relative paths of the vendored engine modules, read from the tree alone so it
+ * holds without the plugin repo: every `.ts` in the engine dir but the tree-only
+ * wrapper, which is exactly what the sync's prune leaves there.
+ */
+export function vendoredEngineFiles(treeRoot: string = TREE_ROOT): string[] {
+  const dir = path.join(treeRoot, TREE_ENGINE_DIR);
+  if (!fs.existsSync(dir)) return [];
+  return fs
+    .readdirSync(dir)
+    .filter((f) => f.endsWith('.ts') && !TREE_ONLY_ENGINE_FILES.has(f))
+    .sort()
+    .map((f) => `${TREE_ENGINE_DIR}/${f}`);
+}
 
 function buildVendoredMap(): Array<{ from: string; to: string; dir?: boolean }> {
   const entries: Array<{ from: string; to: string; dir?: boolean }> = [];
@@ -99,9 +115,9 @@ export function vendorDesignArtifactLoop(): string[] {
     if (syncOne(from, to, dir ?? false)) changed.push(to);
   }
   // Prune tree engine files no longer in the map (a module deleted/renamed in the
-  // plugin must not linger in the tree). index.ts is the tree-only wrapper.
+  // plugin must not linger in the tree).
   const engineDir = path.join(TREE_ROOT, TREE_ENGINE_DIR);
-  const expected = new Set([...VENDORED.map((e) => path.basename(e.to)), 'index.ts']);
+  const expected = new Set([...VENDORED.map((e) => path.basename(e.to)), ...TREE_ONLY_ENGINE_FILES]);
   for (const f of fs.readdirSync(engineDir)) {
     if (f.endsWith('.ts') && !expected.has(f)) {
       fs.rmSync(path.join(engineDir, f));
