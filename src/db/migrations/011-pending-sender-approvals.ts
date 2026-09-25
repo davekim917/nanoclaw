@@ -12,7 +12,7 @@
  * implicit migration transaction. The default-flip was cosmetic anyway —
  * every `createMessagingGroup` callsite passes `unknown_sender_policy`
  * explicitly, and the router's auto-create path was updated to hardcode
- * `'request_approval'` directly (see src/router.ts:123).
+ * `'request_approval'` directly.
  */
 import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';

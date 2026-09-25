@@ -14,13 +14,13 @@ import type { Migration } from './index.js';
  * key's first post landed.
  *
  * SHAPE. Keyed by agent group, not session, so a recreated task session keeps
- * threading its open incidents: S19 closes a spent task session
- * (`src/modules/sweep-scheduling/index.ts:200`), `findSystemSession` matches
- * active rows only (`src/db/sessions.ts:128`), so the series' next scheduling
- * mints a new session id (`src/session-manager.ts:446`).
+ * threading its open incidents: S19 closes a spent task session,
+ * `findSystemSession` matches
+ * active rows only, so the series' next scheduling
+ * mints a new session id.
  * And per messaging group, not (channel type, platform id): delivery sends
  * through the resolved messaging group's adapter instance
- * (`deliverInstance = mg.instance`, `src/delivery.ts:1316`), and two instances
+ * (`deliverInstance = mg.instance`), and two instances
  * wired to one conversation are two messaging_groups rows (migration 016) with
  * separate bot identities, so each keeps its own parent.
  *

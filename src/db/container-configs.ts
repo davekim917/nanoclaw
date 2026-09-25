@@ -53,10 +53,6 @@ export async function getContainerConfig(agentGroupId: string): Promise<Containe
   return getDb().get<ContainerConfigRow>(CONTAINER_CONFIG_BY_GROUP_SQL, agentGroupId);
 }
 
-export async function getAllContainerConfigs(): Promise<ContainerConfigRow[]> {
-  return getDb().all<ContainerConfigRow>(CONTAINER_CONFIGS_ALL_SQL);
-}
-
 /** Insert a new config row. Caller must supply all JSON fields (use defaults for empty). */
 export async function createContainerConfig(config: ContainerConfigRow): Promise<void> {
   await getDb().run(
@@ -155,8 +151,4 @@ export async function updateContainerConfigJson(
     now,
     agentGroupId,
   );
-}
-
-export async function deleteContainerConfig(agentGroupId: string): Promise<void> {
-  await getDb().run('DELETE FROM container_configs WHERE agent_group_id = ?', agentGroupId);
 }

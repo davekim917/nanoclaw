@@ -12,7 +12,7 @@
 import { getDb } from './connection.js';
 
 /** How long a run outcome is retained before the sweep's prune drops it. */
-export const TASK_RUN_OUTCOME_RETENTION_DAYS = 30;
+const TASK_RUN_OUTCOME_RETENTION_DAYS = 30;
 
 export interface TaskRunOutcomeInsert {
   agentGroupId: string;

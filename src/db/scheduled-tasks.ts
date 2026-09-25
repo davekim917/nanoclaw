@@ -156,7 +156,7 @@ function initStubSessionFolder(agentGroupId: string, sessionId: string): void {
 /**
  * Resolve (or create) the channel-root session for an (agent_group_id,
  * messaging_group_id) pair. Channel-root means `thread_id IS NULL`; this is
- * the canonical home for scheduled-task rows (`src/db/sessions.ts:74-83`).
+ * the canonical home for scheduled-task rows.
  *
  * Concurrency: the lookup-then-insert is racy without protection — two
  * simultaneous callers can both miss the existing row and both try to
@@ -205,7 +205,7 @@ export async function resolveActiveSession(agentGroupId: string, messagingGroupI
  * `destination` is required by `TaskDef`'s type — TypeScript prevents
  * callers from omitting it; no runtime guard needed.
  *
- * SYNCHRONOUS and lease-only (seam 3 §4.5 I-1, #460 round 2): the reads go
+ * SYNCHRONOUS and lease-only: the reads go
  * through `withRawDb`, so this runs only inside a `withCentralSync` block,
  * where no driver transaction can be open and nothing can interleave — a
  * parallel INSERT into messaging_group_agents (itself a `centralTransaction`)
@@ -308,8 +308,7 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
   // funnel's `prepare()` runs `ensureSchema(..., 'outbound')`: a read-write
   // open and DDL on the CONTAINER-owned outbound.db, across the mount, from
   // the host. Pre-seam this path opened inbound.db and nothing else. Same
-  // rule, and the same reasoning, as the ingress write in `session-manager.ts`
-  // (mailbox seam PR 4, review round 1).
+  // rule, and the same reasoning, as the ingress write in `session-manager.ts`.
   //
   // Either funnel carries what the hand-rolled open used to: the same two
   // pragmas AND the storage-activity marker that keeps a concurrent reclaim
@@ -343,7 +342,7 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
       // The task row persists the route, and `delivery.ts` permits a
       // non-origin send when `agent_destinations` has no entry, so a stale
       // authorization here becomes a real one at fire time. Re-running it in
-      // its OWN transaction ahead of the block was not enough (#460 round 2):
+      // its OWN transaction ahead of the block was not enough:
       // a revocation queued behind that transaction commits the moment it
       // ends, before the block's lease is taken. Sharing the block closes it.
       //
@@ -392,7 +391,7 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
       // below is about the central-DB side of a row that has already been
       // written.
       //
-      // #416 site 3, re-audited under the lease (seam 3 PR 6): the stamp below
+      // Under the lease, the stamp below
       // is a driver `run`, and under the lease a driver statement can now park
       // behind an open central transaction, so a second `scheduleTask` for the
       // same series CAN land its own upsert between this write and the stamp.
@@ -405,7 +404,7 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
       // write failure) whose worst case is one lost re-schedule that the
       // caller of the failed attempt already sees as an error; making the
       // restore conditional on the row still matching this attempt needs a
-      // mailbox-side compare-and-restore and is left on #416.
+      // mailbox-side compare-and-restore and is left open.
       const upserted = await withCentralSync(() => {
         validateDestinationUnderLease(def);
         return withQuietInvalidationSync(sessionId, () =>
@@ -469,7 +468,7 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
   // cannot see it. The invalidation is a central-DB write that nulls
   // `sweep_quiet_until` and advances `last_active` in one statement, so the
   // session is swept on the next tick rather than sleeping through its first
-  // fire — and, since S2-PR15 persists that mark, across a restart too.
+  // fire — and, since that mark is persisted, across a restart too.
   //
   // Invalidation lives INSIDE `stamp`, around the upsert itself — see
   // `withQuietInvalidationSync`. It used to bracket this await from the

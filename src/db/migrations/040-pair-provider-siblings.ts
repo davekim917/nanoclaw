@@ -5,7 +5,7 @@ import type { Migration } from './index.js';
  * Migration 040 — pair-provider-siblings
  *
  * Repairs workgroup membership for provider-sibling agent groups that migration
- * 036 could not pair. 036 (`036-workgroup-id.ts:76`) only strips the `-codex`
+ * 036 could not pair. 036 only strips the `-codex`
  * suffix, so a sibling created by `/clone-as-opencode` (or any future
  * `/clone-as-<provider>`) before the clone skill learned to set `workgroup_id`
  * at INSERT fell through `reconcileWorkgroupAtSpawn`'s last-resort default to a
@@ -27,7 +27,7 @@ import type { Migration } from './index.js';
  * suffix set purely as a defensive net; 036 already paired those, so they are
  * skipped here.
  */
-export const SIBLING_SUFFIXES = ['-codex', '-opencode'] as const;
+const SIBLING_SUFFIXES = ['-codex', '-opencode'] as const;
 
 export const migration040: Migration = {
   version: 40,

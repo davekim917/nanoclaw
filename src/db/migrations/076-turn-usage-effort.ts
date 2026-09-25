@@ -16,7 +16,7 @@ import type { Migration } from './index.js';
  * could confirm it — and a class of silent config no-ops, where
  * `ncl groups config update --model/--effort` never reached a Claude
  * container, survived unnoticed across nine agent groups for months
- * (2026-09-07, PRs #532/#540/#535). The model half of each of those findings
+ * (found 2026-09-07). The model half of each of those findings
  * was measurable from this table; the effort half rested entirely on code
  * reading. These columns close that gap.
  *

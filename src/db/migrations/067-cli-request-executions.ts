@@ -14,7 +14,7 @@ import type { Migration } from './index.js';
  * row on the next poll, running the command a second and third time
  * (`MAX_DELIVERY_ATTEMPTS` is 3). For `ncl tasks create`, whose series id
  * comes from `randomUUID()` per invocation, that is three scheduled series
- * where the agent asked for one (issue #273).
+ * where the agent asked for one.
  *
  * The row is claimed BEFORE dispatch and completed with the response frame
  * after, so a retry replays the stored frame instead of re-running the

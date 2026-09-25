@@ -5,11 +5,11 @@
  * unindexed `text` column against a multi-hundred-megabyte `archive.db`, then
  * writes the result row by row through `better-sqlite3`. All of that is
  * synchronous, and it used to run on the host's main thread on every container
- * spawn — the dominant cause of the chronic event-loop stalls in #315
+ * spawn — the dominant cause of the chronic event-loop stalls
  * (p50 18 s, ~20/hour). The work itself is unchanged; only the thread it runs
  * on is.
  *
- * Since #360 the DECISION runs here too, not just the build: one request means
+ * The DECISION runs here too, not just the build: one request means
  * "make this projection current", and the reply says whether that took a reuse,
  * an append or a full rebuild. The decision needs `COUNT(*)`/`MAX(rowid)` over
  * the source, and a boot with ~800 sessions cannot afford to run that on the
@@ -41,7 +41,7 @@ export interface ArchiveProjectionResponse {
   bytes?: number;
   ms?: number;
   sinceRowid?: number | null;
-  /** 'seeded' only (#667): the sibling projection this session was copied from. */
+  /** 'seeded' only: the sibling projection this session was copied from. */
   seededFrom?: string | null;
   error?: string;
 }

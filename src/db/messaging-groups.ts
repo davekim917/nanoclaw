@@ -16,6 +16,7 @@ import {
 } from '../modules/agent-to-agent/db/agent-destinations.js';
 import { centralTransaction } from './central-lease.js';
 import { getDb, hasTable } from './connection.js';
+import { updateColumnsById } from './update-columns.js';
 
 // ── Messaging Groups ──
 
@@ -157,7 +158,7 @@ export function channelNameProvenance(platform: string, source: ChannelNameSourc
  * token is unparseable, is read as an adapter-sourced name on the row's own
  * platform — the pre-069 behavior, where a raw fetch always overwrote.
  */
-export function parseChannelNameProvenance(
+function parseChannelNameProvenance(
   raw: string | null | undefined,
   fallbackPlatform: string,
 ): { platform: string; source: ChannelNameSource } {
@@ -206,18 +207,7 @@ export type MessagingGroupUpdates = Partial<Pick<MessagingGroup, 'is_group' | 'u
   ({ name: string; name_source: string } | { name?: never; name_source?: never });
 
 export async function updateMessagingGroup(id: string, updates: MessagingGroupUpdates): Promise<void> {
-  const fields: string[] = [];
-  const values: Record<string, unknown> = { id };
-
-  for (const [key, value] of Object.entries(updates)) {
-    if (value !== undefined) {
-      fields.push(`${key} = @${key}`);
-      values[key] = value;
-    }
-  }
-  if (fields.length === 0) return;
-
-  await getDb().run(`UPDATE messaging_groups SET ${fields.join(', ')} WHERE id = @id`, values);
+  await updateColumnsById('messaging_groups', id, updates);
 }
 
 /**
@@ -226,7 +216,7 @@ export async function updateMessagingGroup(id: string, updates: MessagingGroupUp
  * `resolveChannelMetadataUpdates` (main.ts) decides from a row it READ, and
  * the adapter callback then awaits before writing; the router's classified
  * name can land in that window, and an unconditioned `updateMessagingGroup`
- * would overwrite the better-informed name with the adapter's (#416 site 5).
+ * would overwrite the better-informed name with the adapter's.
  * So the name/name_source pair is written through one UPDATE whose CASE
  * re-evaluates `channelNameProvenanceAccepts` against the STORED row at the
  * instant of the write — the SQL below is that predicate, clause for clause:
@@ -365,8 +355,8 @@ export async function createMessagingGroupAgent(mga: MessagingGroupAgent): Promi
   // insert are atomic against a concurrent wiring from another process (codex
   // phase-A review P2). DB-only closure (plan §4.4).
   //
-  // The companion destination is allocated INSIDE the same transaction
-  // (#460 round 2): its lookup, suffix allocation and insert are serialized
+  // The companion destination is allocated INSIDE the same transaction:
+  // its lookup, suffix allocation and insert are serialized
   // with the wiring row. Written after commit, two concurrent wirings with
   // the same normalized name both observed the base `local_name` unused, and
   // the second insert died on the (agent_group_id, local_name) primary key
@@ -388,7 +378,7 @@ export async function createMessagingGroupAgent(mga: MessagingGroupAgent): Promi
  * DB-only, like `ensureAgentDestinationForWiring`: driver statements awaited in
  * sequence, nothing else (plan §4.4). Callers: `createMessagingGroupAgent`
  * above, and the router's workspace-trust auto-wire, which proves workspace
- * uniqueness in the same transaction (#482).
+ * uniqueness in the same transaction.
  */
 export async function createMessagingGroupAgentInTransaction(mga: MessagingGroupAgent): Promise<void> {
   await assertSameWorkgroupWiring(mga.messaging_group_id, mga.agent_group_id);
@@ -478,7 +468,7 @@ export async function getMessagingGroupAgents(messagingGroupId: string): Promise
   // actually wires new MGs. The schema defaults (`drop`, `shared`) are stale
   // relative to runtime behavior:
   //
-  //   - ignored_message_policy='accumulate' — matches router.ts:370 (auto-create
+  //   - ignored_message_policy='accumulate' — matches the router (auto-create
   //     uses 'accumulate'). Drop = silently discard non-engaging messages,
   //     which loses thread context the agent needs when it later engages.
   //   - session_mode='per-thread' — matches every channel's operational config
@@ -623,18 +613,7 @@ export async function updateMessagingGroupAgent(
     >
   >,
 ): Promise<void> {
-  const fields: string[] = [];
-  const values: Record<string, unknown> = { id };
-
-  for (const [key, value] of Object.entries(updates)) {
-    if (value !== undefined) {
-      fields.push(`${key} = @${key}`);
-      values[key] = value;
-    }
-  }
-  if (fields.length === 0) return;
-
-  await getDb().run(`UPDATE messaging_group_agents SET ${fields.join(', ')} WHERE id = @id`, values);
+  await updateColumnsById('messaging_group_agents', id, updates);
 }
 
 export async function deleteMessagingGroupAgent(id: string): Promise<void> {
@@ -649,24 +628,4 @@ export async function getMessagingGroupsByAgentGroup(agentGroupId: string): Prom
        WHERE mga.agent_group_id = ?`,
     agentGroupId,
   );
-}
-
-/**
- * Pick the "primary" messaging group for an agent group — the one a background
- * task (for example, a daily source audit) should post its findings to. Ranks by
- * messaging_group_agents.priority DESC, with messaging_groups.created_at ASC
- * as a stable tiebreaker (older wiring wins). Returns null when the agent
- * group has no wired channels yet (e.g. brand-new agents from create_agent
- * before any wiring); callers must handle that case.
- */
-export async function getPrimaryMessagingGroupByAgentGroup(agentGroupId: string): Promise<MessagingGroup | null> {
-  const row = await getDb().get<MessagingGroup>(
-    `SELECT mg.* FROM messaging_groups mg
-       JOIN messaging_group_agents mga ON mga.messaging_group_id = mg.id
-       WHERE mga.agent_group_id = ?
-       ORDER BY mga.priority DESC, mg.created_at ASC
-       LIMIT 1`,
-    agentGroupId,
-  );
-  return row ?? null;
 }

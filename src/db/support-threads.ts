@@ -165,11 +165,3 @@ export async function rebindSupportThreadSession(
     { gmailThreadId, sessionId, agentGroupId },
   );
 }
-
-export async function closeSupportThread(gmailThreadId: string, now: string): Promise<void> {
-  await getDb().run(
-    "UPDATE support_threads SET status = 'closed', last_activity_at = ? WHERE gmail_thread_id = ?",
-    now,
-    gmailThreadId,
-  );
-}

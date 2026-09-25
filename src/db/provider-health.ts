@@ -174,7 +174,7 @@ export async function markProviderUnavailable(
  * while the row still looks the way the read saw it (`updated_at` is the
  * version stamp — every writer bumps it). A `markProviderUnavailable` that
  * commits between the read and this write therefore stands: its newer cooldown
- * is not clobbered by a success that predates it (Codex P2 on #460). Returns
+ * is not clobbered by a success that predates it. Returns
  * whether the clear applied.
  */
 export async function markProviderAvailable(

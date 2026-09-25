@@ -1,5 +1,6 @@
 import type { AgentGroup } from '../types.js';
 import { getDb } from './connection.js';
+import { updateColumnsById } from './update-columns.js';
 
 /**
  * The `getAgentGroup` read, as a constant, so a synchronous guard-path caller
@@ -54,18 +55,7 @@ export async function updateAgentGroup(
   id: string,
   updates: Partial<Pick<AgentGroup, 'name' | 'agent_provider'>>,
 ): Promise<void> {
-  const fields: string[] = [];
-  const values: Record<string, unknown> = { id };
-
-  for (const [key, value] of Object.entries(updates)) {
-    if (value !== undefined) {
-      fields.push(`${key} = @${key}`);
-      values[key] = value;
-    }
-  }
-  if (fields.length === 0) return;
-
-  await getDb().run(`UPDATE agent_groups SET ${fields.join(', ')} WHERE id = @id`, values);
+  await updateColumnsById('agent_groups', id, updates);
 }
 
 export async function deleteAgentGroup(id: string): Promise<void> {
@@ -111,11 +101,10 @@ export async function getWorkgroupOnecliSecretsById(workgroupId: string): Promis
  * remove --delete-secret`, which must refuse instead of deleting a vault
  * secret some other declaration site still names. The merge is union-only —
  * "per-group secrets are appended additively. Neither list can subtract from
- * the other" (`mergeWorkgroupAndGroupSecrets`, `src/onecli-secrets.ts:566`) —
+ * the other" (`mergeWorkgroupAndGroupSecrets` in `onecli-secrets.ts`) —
  * so a group's own `container.json` can never take back a workgroup
  * declaration, and deleting a secret a workgroup still names aborts every
- * spawn of every group in it (`src/onecli-secrets.ts:464`, reached from
- * `src/container-runner.ts:7077`).
+ * spawn of every group in it.
  *
  * Installs have tens of workgroups, not thousands, and this runs once per
  * `--delete-secret`, so it reads them all rather than pushing a LIKE match

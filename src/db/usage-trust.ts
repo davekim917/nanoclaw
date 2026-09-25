@@ -1,12 +1,10 @@
 /**
- * The Claude usage window no reader may present as a figure (#1061).
+ * The Claude usage window no reader may present as a figure.
  *
- * Until #1007, a Claude turn that touched ONE model recorded the SDK's
+ * Until the 2026-09-22 runner fix, a Claude turn that touched ONE model recorded the SDK's
  * per-turn main-loop `result.usage` beside the query-cumulative
- * `total_cost_usd` (container/agent-runner/src/providers/claude.ts:2940-2956 at
- * ee1e48f8c^). `toTurnDelta` resets a whole row when any field falls
- * (container/agent-runner/src/modules/mailbox/turn-usage.ts:200-201), and
- * per-turn token counts fall constantly — so those rows booked the running
+ * `total_cost_usd`. The runner's `toTurnDelta` resets a whole row when any field falls,
+ * and per-turn token counts fall constantly — so those rows booked the running
  * cost total raw (measured: $125.38, $125.51, $125.64 … on ~$0.13 turns),
  * while the rows that did subtract got an honest cost delta and meaningless
  * "this turn minus last turn" tokens that also omit same-model subagents.
@@ -24,7 +22,7 @@
 export const UNTRUSTED_USAGE_NOTE = 'untrusted, see #1061';
 
 /**
- * First instant every live Claude container ran the #1007 writer. The host
+ * First instant every live Claude container ran the fixed writer. The host
  * restart at 2026-09-22T17:06Z shipped it, but a container adopted across a
  * restart keeps its spawn-time runner until it exits (CLAUDE.md, Container
  * Restart): the last pre-fix container (spawned 12:13Z, adopted across that
@@ -36,7 +34,7 @@ export const UNTRUSTED_USAGE_NOTE = 'untrusted, see #1061';
 export const CLAUDE_USAGE_TRUSTED_FROM = '2026-09-22T18:35:09.000Z';
 
 /** usage_daily buckets by UTC day, so the day the cutoff falls in is untrusted whole. */
-export const CLAUDE_USAGE_LAST_UNTRUSTED_DAY = CLAUDE_USAGE_TRUSTED_FROM.slice(0, 10);
+const CLAUDE_USAGE_LAST_UNTRUSTED_DAY = CLAUDE_USAGE_TRUSTED_FROM.slice(0, 10);
 
 /** For a per-turn row (`turn_usage`), keyed on its ISO-8601 UTC `ts`. */
 export function isUntrustedTurnUsage(provider: string, ts: string): boolean {

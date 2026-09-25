@@ -10,7 +10,7 @@ import type { Migration } from './index.js';
  *
  *   1. A live install carries an orphan row whose parent messaging group is
  *      gone, so every `disableForeignKeys` migration re-logs
- *      "Pre-existing FK violations carried through migration" at boot (#487).
+ *      "Pre-existing FK violations carried through migration" at boot.
  *   2. With `foreign_keys = ON` (`src/db/compose.ts`), deleting a messaging
  *      group that still holds a pending registration card fails outright.
  *
