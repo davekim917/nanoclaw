@@ -15,6 +15,12 @@ import { resolveInboundDbPath } from '../host-inbound.js';
 import { recoverHotJournal } from '../openers.js';
 import { migrateMessagesInTable, migrateSessionRoutingTable } from '../schema.js';
 
+export {
+  getInboundSourceSessionId,
+  replaceDestinations,
+  type DestinationRow,
+} from '../../../mailbox/sqlite/session-db.js';
+
 export interface MessageInsert {
   id: string;
   kind: string;
@@ -283,40 +289,6 @@ export function readSessionRouting(db: Database.Database): SessionRouting | null
   if (!row) return null;
   if (!row.channel_type || !row.platform_id) return null;
   return row;
-}
-
-export interface DestinationRow {
-  name: string;
-  display_name: string | null;
-  type: 'channel' | 'agent';
-  channel_type: string | null;
-  platform_id: string | null;
-  agent_group_id: string | null;
-}
-
-export function replaceDestinations(db: Database.Database, entries: DestinationRow[]): void {
-  const tx = db.transaction((rows: DestinationRow[]) => {
-    db.prepare('DELETE FROM destinations').run();
-    const stmt = db.prepare(
-      `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
-       VALUES (@name, @display_name, @type, @channel_type, @platform_id, @agent_group_id)`,
-    );
-    for (const row of rows) stmt.run(row);
-  });
-  tx(entries);
-}
-
-/**
- * Look up an inbound row's source_session_id by its message id. Returns null
- * if the row doesn't exist or the column is NULL (channel inbound or
- * pre-migration a2a inbound). Used by a2a routing to route replies back to
- * the originating session.
- */
-export function getInboundSourceSessionId(db: Database.Database, messageId: string): string | null {
-  const row = db.prepare('SELECT source_session_id FROM messages_in WHERE id = ?').get(messageId) as
-    | { source_session_id: string | null }
-    | undefined;
-  return row?.source_session_id ?? null;
 }
 
 /** Does this session's inbound.db already carry `messageId`? */

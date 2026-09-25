@@ -5,7 +5,14 @@
  */
 import type Database from 'better-sqlite3';
 
+import { getProcessingClaims } from '../../../mailbox/sqlite/session-db.js';
 import { migrateMessagesInTable } from '../schema.js';
+
+export {
+  deleteOrphanProcessingClaims,
+  getProcessingClaims,
+  type ProcessingClaim,
+} from '../../../mailbox/sqlite/session-db.js';
 
 /**
  * Earliest FUTURE process_after among pending rows, or null. Used by the host
@@ -407,11 +414,6 @@ export function listOverdueRecurringRows(
   return outDb ? rows.filter((row) => !hasProcessingAck(outDb, row.id)) : rows;
 }
 
-export interface ProcessingClaim {
-  message_id: string;
-  status_changed: string;
-}
-
 /**
  * Has a container acknowledged this inbound message at all?
  *
@@ -429,26 +431,6 @@ export interface ProcessingClaim {
  */
 export function hasProcessingAck(outDb: Database.Database, messageId: string): boolean {
   return outDb.prepare('SELECT 1 FROM processing_ack WHERE message_id = ? LIMIT 1').get(messageId) !== undefined;
-}
-
-/** Return processing_ack rows still in 'processing' with their claim timestamps. */
-export function getProcessingClaims(outDb: Database.Database): ProcessingClaim[] {
-  return outDb
-    .prepare("SELECT message_id, status_changed FROM processing_ack WHERE status = 'processing'")
-    .all() as ProcessingClaim[];
-}
-
-/**
- * Delete orphan 'processing' rows. Called by the host after killing a
- * container so the leftover claim doesn't trip claim-stuck on the next sweep
- * tick (which would kill the freshly respawned container before its
- * agent-runner can run its own startup cleanup).
- *
- * Safe because the host only writes to outbound.db when no container is
- * running (we just killed it). Returns the number of rows deleted.
- */
-export function deleteOrphanProcessingClaims(outDb: Database.Database): number {
-  return outDb.prepare("DELETE FROM processing_ack WHERE status = 'processing'").run().changes;
 }
 
 export interface ContainerState {
