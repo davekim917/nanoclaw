@@ -5,8 +5,10 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+  atomicJson,
   canonicalRepoDir,
   defaultTopicBranch,
+  fsyncDirectories,
   originPinPath,
   readOriginPin,
   topicWorktreesDir,
@@ -292,44 +294,6 @@ function gitRaw(args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv
 
 function sha256(value: Buffer | string): string {
   return createHash('sha256').update(value).digest('hex');
-}
-
-function atomicJson(file: string, value: unknown): void {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temp = `${file}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`;
-  try {
-    fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-    const fd = fs.openSync(temp, fs.constants.O_RDONLY);
-    try {
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    fs.renameSync(temp, file);
-    const parentFd = fs.openSync(path.dirname(file), fs.constants.O_RDONLY);
-    try {
-      fs.fsyncSync(parentFd);
-    } finally {
-      fs.closeSync(parentFd);
-    }
-  } finally {
-    try {
-      fs.unlinkSync(temp);
-    } catch {
-      // Published or never created.
-    }
-  }
-}
-
-function fsyncDirectories(...directories: string[]): void {
-  for (const directory of new Set(directories.map((entry) => path.resolve(entry)))) {
-    const fd = fs.openSync(directory, fs.constants.O_RDONLY);
-    try {
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-  }
 }
 
 function fsyncDirectoryTree(directory: string): void {

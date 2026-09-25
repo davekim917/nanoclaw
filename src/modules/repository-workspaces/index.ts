@@ -31,6 +31,7 @@ import { REPOSITORY_REQUEST_ID_PATTERN, runRepositoryActionDetached } from './jo
 import {
   assertRepositoryName,
   canonicalRepoDir,
+  fsyncDirectories,
   checkoutDirName,
   checkoutStagingRoot,
   cloneIdentity,
@@ -222,17 +223,6 @@ function fsyncParent(file: string): void {
     fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);
-  }
-}
-
-function fsyncDirectories(...directories: string[]): void {
-  for (const directory of new Set(directories.map((entry) => path.resolve(entry)))) {
-    const fd = fs.openSync(directory, fs.constants.O_RDONLY);
-    try {
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
   }
 }
 

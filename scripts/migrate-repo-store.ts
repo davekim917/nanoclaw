@@ -36,6 +36,7 @@ import {
 } from '../src/repository-migration.js';
 import { loadRepositoryMigrationPrestageCache } from '../src/repository-migration-prestage.js';
 import {
+  atomicJson,
   canonicalRepoDir,
   readOriginPin,
   repositoriesRoot,
@@ -81,7 +82,7 @@ import {
   pidsWithOpenFilesBelow,
   type ProtectedInodeInventory,
 } from '../src/repository-migration-quiescence.js';
-import { completedRepositoryQuiescencePaths } from '../src/repository-migration-quiescence-paths.js';
+import { completedRepositoryQuiescencePaths, minimalRoots } from '../src/repository-migration-quiescence-paths.js';
 
 interface Args {
   execute: boolean;
@@ -150,33 +151,6 @@ function parseArgs(argv: string[]): Args {
  */
 function repositoryMigrationPrestageCachePath(dataDir: string = DATA_DIR): string {
   return path.join(dataDir, 'repository-migration-prestage', 'file-hashes-v1.json');
-}
-
-function atomicJson(file: string, value: unknown): void {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temp = `${file}.tmp-${process.pid}-${createHash('sha256').update(String(Math.random())).digest('hex').slice(0, 12)}`;
-  try {
-    fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-    const fd = fs.openSync(temp, fs.constants.O_RDONLY);
-    try {
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    fs.renameSync(temp, file);
-    const parentFd = fs.openSync(path.dirname(file), fs.constants.O_RDONLY);
-    try {
-      fs.fsyncSync(parentFd);
-    } finally {
-      fs.closeSync(parentFd);
-    }
-  } finally {
-    try {
-      fs.unlinkSync(temp);
-    } catch {
-      // Published or never created.
-    }
-  }
 }
 
 function sha(value: string): string {
@@ -1035,17 +1009,6 @@ function assertFleetQuiescent(paths: string[], refreshInodes = false): void {
   }
 }
 
-function minimalQuiescenceRoots(paths: readonly string[]): string[] {
-  const selected: string[] = [];
-  for (const candidate of [...new Set(paths.map((entry) => path.resolve(entry)))].sort(
-    (left, right) => left.length - right.length || left.localeCompare(right),
-  )) {
-    if (selected.some((root) => contained(candidate, root))) continue;
-    selected.push(candidate);
-  }
-  return selected.sort();
-}
-
 function preManifestQuiescencePaths(
   groups: AgentGroupRow[],
   grouped: Map<string, LegacyCheckoutCandidate[]>,
@@ -1075,7 +1038,7 @@ function preManifestQuiescencePaths(
     paths.add(path.resolve(DATA_DIR, 'repositories', group.workgroup_id));
   }
   paths.add(path.resolve(DATA_DIR, 'v2-threads'));
-  return minimalQuiescenceRoots([...paths]);
+  return minimalRoots([...paths]);
 }
 
 function prestageRepositoryMigrationFileHashes(
@@ -1666,7 +1629,7 @@ function migrationQuiescencePaths(
   manifests: RepositoryMigrationManifest[],
   protectedArchives: ProtectedArchiveEvidence[],
 ): string[] {
-  return minimalQuiescenceRoots([
+  return minimalRoots([
     ...new Set([
       ...manifests.flatMap((manifest) => [
         ...manifest.captures.map((capture) => capture.checkoutPath),
