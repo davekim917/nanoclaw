@@ -11,8 +11,24 @@ export interface CommentFinding {
 // Checked before the directive exemption: knip honours these tags even inside an eslint-disable comment.
 const SUPPRESSION = /jscpd:ignore-|@(?:public|internal|beta|alias|lintignore)(?![A-Za-z0-9_])/;
 const DIRECTIVE = /^(?:eslint-disable|eslint-enable|@ts-expect-error|@ts-ignore|@ts-nocheck|prettier-ignore|c8 ignore)/;
-const CITATION = /[\w-]\.(?:[cm]?[jt]sx?|json|sh|py|md|ya?ml|toml|sql):\d/;
 const PR_HISTORY = /(?<!&)#\d+\b|\bPR\s?\d+\b/;
+
+// `<name>:<digits>`, excluding a version such as `image:1.3.14`.
+const LOCATION = /(?<![\w./@-])([\w./@-]*\w):\d+(?!\d|\.\d)/g;
+const SOURCE_EXTENSION =
+  /\.(?:[cm]?[jt]sx?|json|sh|bash|py|md|ya?ml|toml|sql|rs|go|c|h|cpp|hpp|java|kt|rb|swift|css|html|txt)$/;
+const EXTENSIONLESS_FILE =
+  /^(?:Dockerfile|Containerfile|Makefile|GNUmakefile|Justfile|Procfile|Gemfile|Rakefile|Jenkinsfile)(?:\.[\w-]+)?$|^\.[A-Za-z][\w.-]*$/;
+
+/** Host:port (with or without a URL scheme), times and ids carry neither a path nor a file-like name. */
+function citesFileLine(line: string): boolean {
+  return [...line.matchAll(LOCATION)].some(([, name]) => {
+    if (name.startsWith('//')) return false;
+    const base = name.slice(name.lastIndexOf('/') + 1);
+    const pathQualified = name.includes('/') && /[A-Za-z]/.test(base);
+    return pathQualified || SOURCE_EXTENSION.test(base) || EXTENSIONLESS_FILE.test(base);
+  });
+}
 
 function isJSDocNode(node: ts.Node): boolean {
   return node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode;
@@ -55,7 +71,7 @@ export function scanComments(fileName: string, text: string): CommentFinding[] {
         findings.push({ rule, line: firstLine + offset, excerpt: lineText.trim().slice(0, 160) });
       if (SUPPRESSION.test(lineText)) report('inline-suppression');
       if (isDirective) return;
-      if (CITATION.test(lineText)) report('file-line-citation');
+      if (citesFileLine(lineText)) report('file-line-citation');
       if (PR_HISTORY.test(lineText)) report('pr-history');
     });
   }
