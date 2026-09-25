@@ -8,7 +8,7 @@ function contained(candidate: string, root: string): boolean {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-function minimalRoots(paths: readonly string[]): string[] {
+export function minimalRoots(paths: readonly string[]): string[] {
   const selected: string[] = [];
   for (const candidate of [...new Set(paths.map((entry) => path.resolve(entry)))].sort(
     (left, right) => left.length - right.length || left.localeCompare(right),

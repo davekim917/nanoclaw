@@ -293,11 +293,15 @@ export function writeTransferTombstone(
   ) {
     throw new Error('repository transfer tombstone identity mismatch');
   }
-  const file = transferTombstonePath(source, repo, dataDir);
+  atomicJson(transferTombstonePath(source, repo, dataDir), tombstone);
+}
+
+/** Durable JSON write: temp file, fsync, rename, fsync of the parent directory. */
+export function atomicJson(file: string, value: unknown): void {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temp = `${file}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`;
   try {
-    fs.writeFileSync(temp, `${JSON.stringify(tombstone, null, 2)}\n`, { mode: 0o600 });
+    fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
     const fd = fs.openSync(temp, fs.constants.O_RDONLY);
     try {
       fs.fsyncSync(fd);
@@ -316,6 +320,17 @@ export function writeTransferTombstone(
       fs.unlinkSync(temp);
     } catch {
       // Published or never created.
+    }
+  }
+}
+
+export function fsyncDirectories(...directories: string[]): void {
+  for (const directory of new Set(directories.map((entry) => path.resolve(entry)))) {
+    const fd = fs.openSync(directory, fs.constants.O_RDONLY);
+    try {
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
     }
   }
 }

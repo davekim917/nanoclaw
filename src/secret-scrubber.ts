@@ -139,12 +139,6 @@ export const TOKEN_SHAPE_PATTERNS: ReadonlyArray<[RegExp, string]> = [
  * touch disk), runtime-fetched OAuth, bearer tokens appearing in response
  * bodies that an agent echoes back, literal secrets inlined into SQL/URL
  * strings.
- *
- * Mirrored in container/agent-runner/src/providers/bash-label.ts
- * (the container is Bun and can't import host code). When updating one
- * list, update the other — the two form the label-vs-outbound defense
- * pair: bash-label sanitizes at the source, scrubSecrets backstops at
- * delivery.
  */
 const SECRET_SHAPE_PATTERNS: ReadonlyArray<[RegExp, string]> = [...CONTEXTUAL_SECRET_PATTERNS, ...TOKEN_SHAPE_PATTERNS];
 
@@ -154,7 +148,7 @@ const SECRET_SHAPE_PATTERNS: ReadonlyArray<[RegExp, string]> = [...CONTEXTUAL_SE
  * tables, content-addressed digests, trace IDs). Scrubbing is
  * structural: prefixes + contextual patterns + .env values. Novel-vendor
  * tokens are an accepted residual risk; the fix is a one-line prefix
- * addition, not a heuristic. See bash-label.ts for the mirrored rationale.
+ * addition, not a heuristic.
  */
 function scrubSecretShapes(text: string): string {
   let out = text;

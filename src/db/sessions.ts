@@ -499,10 +499,10 @@ export async function resetPhantomContainerStatus(): Promise<number> {
 
 /**
  * Soft-dismiss a session from the inbox's default view. Returns true when
- * the row flipped from visible→archived (mirrors `archiveTaskById`'s
- * change-only contract so callers can gate SSE emits without doing a
- * second read). Archived sessions still process inbound traffic and run
- * their containers; archiving is purely an operator-side display flag.
+ * the row flipped from visible→archived, so callers can gate SSE emits
+ * without doing a second read. Archived sessions still process inbound
+ * traffic and run their containers; archiving is purely an operator-side
+ * display flag.
  */
 export async function archiveSessionById(id: string, archivedAt: string = new Date().toISOString()): Promise<boolean> {
   const result = await getDb().run(
