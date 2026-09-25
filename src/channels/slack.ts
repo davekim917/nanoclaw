@@ -37,7 +37,7 @@ import type { ChannelConversation, ChannelDefaults, ChannelRecoveryRequest, Chan
 import { registerChannelAdapter } from './channel-registry.js';
 import { extractSlackRawText } from './slack-raw-text.js';
 import { installSlackSubtextBlocks } from './slack-subtext.js';
-import { linkSlackChannelNames } from './channel-links.js';
+import { linkSlackChannelNames, warmChannelDirectory } from './channel-links.js';
 import { createSlackHopGovernor, type SlackHopGovernor } from './slack-hop-limit.js';
 import {
   fetchSlackBotIdentity,
@@ -893,6 +893,7 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
         // identity first so its inbound filter observes sibling bots correctly.
         const previousIdentity = getKnownSlackBots().get(ws.channelType);
         registerSlackBot(ws.channelType, identity);
+        warmChannelDirectory();
         try {
           await setupBridge(setup);
         } catch (err) {

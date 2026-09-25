@@ -1,6 +1,17 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { linkDiscordChannelNames, linkSlackChannelNames, type KnownChannel } from './channel-links.js';
+vi.mock('../db/messaging-groups.js', () => ({
+  getAllMessagingGroups: vi.fn(async () => [
+    { id: 'mg-1', channel_type: 'slack-a', platform_id: 'slack:CTESTBUILD', name: '#build-room' },
+  ]),
+}));
+
+import {
+  linkDiscordChannelNames,
+  linkSlackChannelNames,
+  warmChannelDirectory,
+  type KnownChannel,
+} from './channel-links.js';
 import { registerSlackBot, unregisterSlackBot, type SlackBotIdentity } from './slack-mentions.js';
 
 const BOT_A: SlackBotIdentity = {
@@ -62,6 +73,15 @@ describe('linkSlackChannelNames', () => {
       '<#CTESTBUILD>',
     ].join('\n');
     expect(link(text)).toBe(text);
+  });
+
+  it('links the first message after start-up once the adapter has warmed the directory', async () => {
+    warmChannelDirectory();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // No channel list passed: this is the live, cached directory.
+    expect(linkSlackChannelNames('see #build-room', 'slack-a')).toBe(
+      'see [#build-room](https://example.slack.com/archives/CTESTBUILD)',
+    );
   });
 
   it('does nothing for a bot this host does not know', () => {
