@@ -1339,6 +1339,32 @@ export function createBashCommandRewriteHook(opts: { closeStdin?: boolean } = {}
   };
 }
 
+/** The live task list's tool, as the Claude CLI names the nanoclaw MCP server's tools. */
+export const TASK_LIST_TOOL_NAME = 'mcp__nanoclaw__update_task_list';
+
+/**
+ * PreToolUse: the live task list belongs to the conversation's main agent.
+ * A delegated subagent shares the nanoclaw MCP server, so without this a worker
+ * can rewrite (and finish) its parent's on-screen list. The SDK marks a hook
+ * call made inside a subagent with `agent_id`; the main thread never carries
+ * it, even under `--agent`.
+ */
+export function createSubagentTaskListDenyHook(): HookCallback {
+  return async (input) => {
+    const agentId = (input as { agent_id?: unknown }).agent_id;
+    if (typeof agentId !== 'string' || agentId.length === 0) return { continue: true };
+    const reason =
+      'The live task list belongs to the main agent. Do not call update_task_list from a subagent; report your progress and results in your final response instead.';
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse' as const,
+        permissionDecision: 'deny' as const,
+        permissionDecisionReason: reason,
+      },
+    };
+  };
+}
+
 function denyBash(reason: string) {
   return {
     systemMessage: reason,
@@ -3124,6 +3150,7 @@ export class ClaudeProvider implements AgentProvider {
             // six times; claude.preToolUse-registration.test.ts asserts it is
             // here.
             { hooks: [preToolUseHook] },
+            { matcher: TASK_LIST_TOOL_NAME, hooks: [createSubagentTaskListDenyHook()] },
           ],
           PostToolUse: [
             { hooks: [postToolUseHook] },

@@ -129,23 +129,51 @@ describe('SQLite runner mailbox canonical serialization', () => {
 
   test('counts conversation traffic from separate inbound and outbound cursors', () => {
     const { inbound, outbound } = initTestSessionDb();
+    const T = 'slack:C1:171.1';
     const addIn = inbound.prepare(
-      `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, trigger, content)
-       VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z', 'pending', 0, 1, '{}')`,
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, trigger, platform_id, thread_id, content)
+       VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z', 'pending', 0, 1, ?, ?, '{}')`,
     );
     const addOut = outbound.prepare(
-      `INSERT INTO messages_out (id, seq, kind, timestamp, content) VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z', '{}')`,
+      `INSERT INTO messages_out (id, seq, kind, timestamp, platform_id, thread_id, content)
+       VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z', ?, ?, '{}')`,
     );
     // Inbound numbering trails outbound: the host counts from inbound.db alone.
-    addIn.run('in-2', 2, 'chat');
-    addOut.run('list', 11, 'task_list');
-    addIn.run('in-4', 4, 'chat-sdk');
-    addIn.run('in-6', 6, 'system');
-    addOut.run('reply', 13, 'chat');
+    addIn.run('in-2', 2, 'chat-sdk', 'slack:C1', T);
+    addOut.run('list', 11, 'task_list', 'slack:C1', T);
+    addIn.run('in-4', 4, 'chat-sdk', 'slack:C1', T);
+    addIn.run('in-6', 6, 'system', 'slack:C1', T);
+    // A host/system note (inbound `chat`, the group as its platform) and
+    // traffic in another thread never show below the list.
+    addIn.run('in-8', 8, 'chat', 'ag-1', null);
+    addIn.run('in-10', 10, 'chat-sdk', 'slack:C1', 'slack:C1:999.9');
+    // A native `chat` ingress routed to the conversation (the CLI adapter's kind) does count.
+    addIn.run('in-12', 12, 'chat', 'cli:local', null);
+    addOut.run('elsewhere', 15, 'chat', 'slack:C2', null);
+    addOut.run('reply', 13, 'chat', 'slack:C1', T);
+    // An ask_user_question / send_card post is outbound `chat-sdk`: visible, so it counts.
+    addOut.run('card', 17, 'chat-sdk', 'slack:C1', T);
+    // A request_choice card for this conversation (route-less system row) counts;
+    // one sent `to` another channel destination does not.
+    const addSys = outbound.prepare(
+      `INSERT INTO messages_out (id, seq, kind, timestamp, content) VALUES (?, ?, 'system', '2026-01-01T00:00:00.000Z', ?)`,
+    );
+    addSys.run('choice-here', 19, JSON.stringify({ action: 'request_choice', choiceId: 'c1' }));
+    addSys.run(
+      'choice-there',
+      21,
+      JSON.stringify({ action: 'request_choice', choiceId: 'c2', platformId: 'slack:C9' }),
+    );
+    addSys.run('other-system', 23, JSON.stringify({ action: 'schedule_wake' }));
     const mailbox = new SqliteAgentMailbox();
-    expect(mailbox.maxInboundSeq()).toBe(6);
-    // After the list (outbound 11, inbound 2): in-4 and the reply; not the system row.
-    expect(mailbox.countConversationMessagesAfter(11, 2)).toBe(2);
+    expect(mailbox.maxInboundSeq()).toBe(12);
+    // After the list (outbound 11, inbound 2): in-4, the reply, the card and the own-conversation choice.
+    expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'slack:C1', threadId: T })).toBe(4);
+    // A channel-level conversation (null thread) matches null exactly.
+    expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'slack:C2', threadId: null })).toBe(2);
+    expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'cli:local', threadId: null })).toBe(2);
+    // Nothing after the choice: zero.
+    expect(mailbox.countConversationMessagesAfter(23, 12, { platformId: 'slack:C1', threadId: T })).toBe(0);
   });
 
   test('reads one inbound message route by id', () => {

@@ -166,14 +166,35 @@ export class SqliteAgentMailbox implements AgentMailbox {
     );
   }
 
-  countConversationMessagesAfter(outboundSeq: number, inboundSeq: number): number {
+  countConversationMessagesAfter(
+    outboundSeq: number,
+    inboundSeq: number,
+    route: { platformId: string; threadId: string | null },
+  ): number {
+    // Only what shows in that conversation: rows routed to its platform and
+    // thread. The route is the provenance filter — a host/system note is keyed
+    // to the agent group, never to a channel — so a native `chat` ingress
+    // (e.g. the CLI adapter) still counts, and the agent's own questions and
+    // cards (`chat-sdk`) count like its chat.
     const inbound = getInboundDb()
-      .prepare("SELECT COUNT(*) AS n FROM messages_in WHERE seq > ? AND kind IN ('chat', 'chat-sdk')")
-      .get(inboundSeq) as { n: number };
+      .prepare(
+        "SELECT COUNT(*) AS n FROM messages_in WHERE seq > ? AND kind IN ('chat', 'chat-sdk') AND platform_id = ? AND thread_id IS ?",
+      )
+      .get(inboundSeq, route.platformId, route.threadId) as { n: number };
     const outbound = getOutboundDb()
-      .prepare("SELECT COUNT(*) AS n FROM messages_out WHERE seq > ? AND kind = 'chat'")
+      .prepare(
+        "SELECT COUNT(*) AS n FROM messages_out WHERE seq > ? AND kind IN ('chat', 'chat-sdk') AND platform_id = ? AND thread_id IS ?",
+      )
+      .get(outboundSeq, route.platformId, route.threadId) as { n: number };
+    // A request_choice card for this session's own conversation is a route-less
+    // `system` row the host posts in-thread. Counted conservatively: a false
+    // positive only means a new list goes below instead of reusing the old post.
+    const cards = getOutboundDb()
+      .prepare(
+        "SELECT COUNT(*) AS n FROM messages_out WHERE seq > ? AND kind = 'system' AND json_extract(content, '$.action') = 'request_choice' AND json_extract(content, '$.platformId') IS NULL",
+      )
       .get(outboundSeq) as { n: number };
-    return inbound.n + outbound.n;
+    return inbound.n + outbound.n + cards.n;
   }
 
   getInboundRouteById(id: string) {
