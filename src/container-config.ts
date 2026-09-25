@@ -67,8 +67,8 @@ interface StdioMcpServerConfig {
    * (codex) or via a launch shim (cwd-shim.ts). Without a pluginRoot there is
    * nothing to resolve against, so `validateMcpServers` strips it — the only
    * layer that does; the runtime passes provenance-less servers through
-   * untouched. No CLI flag or self-mod tool param exposes it; raw payloads
-   * carrying one are rejected at intake (`parseMcpServerConfig`).
+   * untouched. No CLI flag or self-mod tool param exposes it, and the
+   * self-mod intake (`validateAddMcpServer`) refuses a request carrying one.
    */
   cwd?: string;
   /**

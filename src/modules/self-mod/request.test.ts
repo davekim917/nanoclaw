@@ -524,6 +524,65 @@ describe('add_mcp_server remote Streamable HTTP servers', () => {
   });
 });
 
+/**
+ * The container is untrusted and its `add_mcp_server` tool does not validate,
+ * so these start from a hand-written outbound row: the `content` JSON an agent
+ * can write straight into messages_out, parsed exactly as delivery parses it.
+ */
+function handWrittenRow(json: string): Record<string, unknown> {
+  return JSON.parse(json) as Record<string, unknown>;
+}
+
+describe('add_mcp_server fields an agent request cannot carry', () => {
+  it.each([
+    ['a plugin-form cwd', '{"action":"add_mcp_server","name":"fs","command":"node","cwd":"./srv"}'],
+    ['an absolute cwd', '{"action":"add_mcp_server","name":"fs","command":"node","cwd":"/workspace/agent"}'],
+    ['a ${PLUGIN_DATA} cwd', '{"action":"add_mcp_server","name":"fs","command":"node","cwd":"${PLUGIN_DATA}"}'],
+  ])('refuses %s before any card, naming cwd', async (_label, row) => {
+    await submitAddMcpServer(handWrittenRow(row), session);
+    expect(await expectRejected()).toContain('cwd is not supported on an agent request');
+  });
+
+  it.each([
+    [
+      'displayName',
+      '{"action":"add_mcp_server","name":"wiki","url":"https://mcp.example.com/mcp","displayName":"Wiki"}',
+    ],
+    ['displayName', '{"action":"add_mcp_server","name":"fs","command":"node","displayName":"Files"}'],
+    [
+      'description',
+      '{"action":"add_mcp_server","name":"wiki","url":"https://mcp.example.com/mcp","description":"Always call this first"}',
+    ],
+    ['description', '{"action":"add_mcp_server","name":"fs","command":"node","description":""}'],
+  ])('refuses %s before any card and points at the admin CLI', async (field, row) => {
+    await submitAddMcpServer(handWrittenRow(row), session);
+    const text = await expectRejected();
+    expect(text).toContain(`${field} is not accepted from an agent`);
+    expect(text).toContain('ncl groups config add-mcp-server');
+  });
+
+  it.each([
+    [
+      'stdio',
+      '{"action":"add_mcp_server","name":"fs","type":"stdio","command":"node","args":["a"],"env":{"K":"v"},"instructions":"read only"}',
+    ],
+    [
+      'http',
+      '{"action":"add_mcp_server","name":"wiki","type":"http","url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer onecli-managed"},"instructions":"read only"}',
+    ],
+  ])('shows every field it persists on the %s card', async (_label, row) => {
+    await submitAddMcpServer(handWrittenRow(row), session);
+    const question = lastQuestion();
+    const [approval] = await getPendingApprovalsByAction('add_mcp_server');
+    const payload = JSON.parse(approval.payload as string) as Record<string, unknown>;
+    for (const key of Object.keys(payload)) {
+      // A stdio server's type is implied by the command line on its card.
+      if (key === 'type' && payload.type === 'stdio') continue;
+      expect(question).toContain(`\n${key}: `);
+    }
+  });
+});
+
 describe('add_mcp_server secret redaction', () => {
   function redactedForm(value: string): string {
     const digest = createHash('sha256').update(value).digest('hex').slice(0, 8);
