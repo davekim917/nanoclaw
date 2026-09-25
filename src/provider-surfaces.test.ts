@@ -338,25 +338,17 @@ describe('container instruction contracts', async () => {
     ).toEqual(settings(buildContainerCodexConfig()));
   });
 
-  it('keeps IN_TREE_SHADOWED_PLUGINS identical on both sides of the host/container boundary', async () => {
-    // The host copy is a function-local const in buildMounts, so both sides are
-    // read as text.
-    const shadowed = (rel: string) => {
-      const m = readRepoFile(rel).match(/IN_TREE_SHADOWED_PLUGINS = (?:new Set\()?\[([^\]]*)\]/);
-      expect(
-        m,
-        `Could not find IN_TREE_SHADOWED_PLUGINS in ${rel}. If it was reshaped, update this test — ` +
-          `it is the only thing keeping the host and container copies in sync. ${PARALLEL_IMPL_NOTE}`,
-      ).not.toBeNull();
-      return [...m![1].matchAll(/'([^']*)'/g)].map((q) => q[1]);
-    };
-
+  it('keeps the in-tree-shadowed plugins out of the container plugin mount', async () => {
+    // The container no longer re-checks this list: the host mount exclusion is
+    // the only thing keeping a vendored plugin from being delivered twice. The
+    // host copy is a function-local const in buildMounts, so it is read as text.
+    const m = readRepoFile(CONTAINER_RUNNER).match(/IN_TREE_SHADOWED_PLUGINS = \[([^\]]*)\]/);
     expect(
-      shadowed(CODEX_COMPANION_SETUP),
-      `IN_TREE_SHADOWED_PLUGINS DRIFT between ${CONTAINER_RUNNER} (host mount exclusion) and ` +
-        `${CODEX_COMPANION_SETUP} (container plugin registration). ${PARALLEL_IMPL_NOTE} ` +
-        `A plugin dropped from one side either gets double-delivered or silently un-shadowed.`,
-    ).toEqual(shadowed(CONTAINER_RUNNER));
+      m,
+      `Could not find IN_TREE_SHADOWED_PLUGINS in ${CONTAINER_RUNNER}; update this test if it moved.`,
+    ).not.toBeNull();
+    const shadowed = [...m![1].matchAll(/'([^']*)'/g)].map((q) => q[1]);
+    expect(shadowed).toEqual(expect.arrayContaining(['design-artifact-loop', 'gitnexus']));
   });
 });
 
