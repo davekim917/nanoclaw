@@ -18,7 +18,7 @@ import path from 'path';
 // files each.
 export const MAX_PLUGIN_FILES = 2000;
 export const MAX_PLUGIN_TOTAL_BYTES = 50 * 1024 * 1024;
-export const MAX_PLUGIN_DEPTH = 16;
+const MAX_PLUGIN_DEPTH = 16;
 
 export interface PluginFile {
   /** Path relative to the plugin root, '/'-separated. */
@@ -43,7 +43,7 @@ export function walkPluginDir(root: string): { files: PluginFile[]; dirs: string
   // Directories are recorded as well as walked: `copyPluginDir` recreates only
   // the parents of files, so an intentionally EMPTY shipped directory — the
   // `./work` a server declares as its `cwd` — vanished from the stamp and the
-  // server's `cd` failed at first launch (Codex on #500 round 8).
+  // server's `cd` failed at first launch.
   const dirs: string[] = [];
   // Directories count toward the entry cap too — a breadth bomb of empty
   // dirs must trip the same abuse bound as a file bomb.

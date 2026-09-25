@@ -20,8 +20,6 @@ import { walkPluginDir } from './plugin-dir.js';
 import { readPluginSkills } from './skills.js';
 import type { TemplateTask } from './tasks.js';
 
-export type { TemplateTask } from './tasks.js';
-
 /** A parsed plugin directory. */
 export interface Template {
   /** The manifest's machine name — also the folder the plugin is stamped under. */

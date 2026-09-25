@@ -137,7 +137,7 @@ const SESSIONS_ROOT = path.resolve(process.cwd(), 'data/v2-sessions');
 const SESSION_DATABASE_FILES = new Set(['inbound.db', 'outbound.db']);
 // One definition of the layout, imported rather than restated: the watcher has
 // to look exactly where the host writes, and a second copy of '.host' here
-// would be free to drift away from the writer (#749).
+// would be free to drift away from the writer.
 import { HOST_INBOUND_DIR_NAME } from '../../modules/mailbox/index.js';
 
 type SessionWatchStats = Pick<Stats, 'isDirectory' | 'isSymbolicLink'>;
@@ -156,7 +156,7 @@ export function shouldIgnoreSessionWatchPath(filePath: string, stats?: SessionWa
     // after stat. Admit the path-only pass, then require a real directory.
     return stats !== undefined && (stats.isSymbolicLink() || !stats.isDirectory());
   }
-  // Since #749 the host writes `<session>/.host/inbound.db`, so the watch has
+  // The host writes `<session>/.host/inbound.db`, so the watch has
   // to reach one level deeper for that one path — otherwise every host inbound
   // write stops raising an SSE event and the board silently goes stale. The
   // `.host` DIRECTORY is admitted too, or chokidar never descends into it.
@@ -242,7 +242,7 @@ export function startSSEFeed(): void {
         const [agentGroupId, sessionId] = parts;
         if (!agentGroupId || !sessionId) return;
         // `<ag>/<sess>/{inbound,outbound}.db`, or the host-owned
-        // `<ag>/<sess>/.host/inbound.db` the host has written since #749.
+        // `<ag>/<sess>/.host/inbound.db` the host writes.
         const filename = parts[parts.length - 1];
         const hostOwned = parts.length === 4 && parts[2] === HOST_INBOUND_DIR_NAME && filename === 'inbound.db';
         if (!hostOwned && (parts.length !== 3 || !filename || !SESSION_DATABASE_FILES.has(filename))) return;

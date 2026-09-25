@@ -10,7 +10,7 @@
  * command that already succeeded — and a failed handler is re-dispatched by
  * the delivery loop up to `MAX_DELIVERY_ATTEMPTS` times. Without the ledger
  * that retry re-runs the command, so one `ncl tasks create` mints three
- * scheduled series (issue #273). The retry itself is kept: what it retries is
+ * scheduled series. The retry itself is kept: what it retries is
  * the write.
  */
 import { registerDeliveryAction } from '../delivery.js';

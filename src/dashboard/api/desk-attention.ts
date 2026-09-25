@@ -134,7 +134,7 @@ const GENERATED_HEADER_LINES = 10;
 /** `## <bucket> (<n>)` — the count is the generator's, and is not read. */
 const BUCKET_HEADING = /^##\s+(\S[^(]*?)\s*(?:\(\d+\))?\s*$/;
 
-/** `- **[#571](<url>)** · p1 · filed 2026-08-08 · <title>` */
+/** `- **[#<n>](<url>)** · p1 · filed 2026-08-08 · <title>` */
 const DEFECT_LINE = /^-\s+\*\*\[#(\d+)\]\((\S+?)\)\*\*\s*·\s*(p\d+)\s*·\s*filed\s+(\d{4}-\d{2}-\d{2})\s*·\s*(.+?)\s*$/;
 
 /** `https://<host>/<owner>/<repo>/issues/<n>` → `<owner>/<repo>`, else null. */

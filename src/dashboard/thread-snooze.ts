@@ -39,7 +39,7 @@ import type { AuthHandler, AuthedRequestContext } from './router.js';
 const json = (status: number, body: unknown): Response =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 
-export interface ThreadSnoozeRow {
+interface ThreadSnoozeRow {
   thread_id: string;
   snoozed_at_activity: string | null;
 }

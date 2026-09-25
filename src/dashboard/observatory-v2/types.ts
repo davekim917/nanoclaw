@@ -34,7 +34,7 @@ export interface SignalWorkItem {
   source_url: string | null;
   as_of: string | null;
 }
-export interface SignalDecisionEvent {
+interface SignalDecisionEvent {
   at: string;
   actor: SignalPerson;
   action: 'claim' | 'release' | 'answer';
@@ -71,7 +71,7 @@ export interface SignalDecision {
   capabilities: { claim: boolean; answer: boolean; dispatch: boolean; release?: boolean };
   history: SignalDecisionEvent[];
 }
-export interface SignalClaimDetail {
+interface SignalClaimDetail {
   slug: string;
   owner: string;
   /** Source-provided note headline, not a generated task title or verified outcome. */
@@ -83,7 +83,7 @@ export interface SignalClaimDetail {
   thread_id: string | null;
   source_url: string | null;
 }
-export interface SignalAgent {
+interface SignalAgent {
   id: string;
   workgroup_id: string;
   name: string;
@@ -97,7 +97,7 @@ export interface SignalAgent {
   claim_details?: SignalClaimDetail[];
   next_task?: { title: string; at: string } | null;
 }
-export interface SignalActivity {
+interface SignalActivity {
   id: string;
   workgroup_id: string;
   at: string;

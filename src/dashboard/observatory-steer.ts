@@ -44,9 +44,8 @@ import { dispatch } from '../cli/dispatch.js';
 import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
 import { claimsBaseDir } from '../modules/claims/escalation.js';
-import { canAssign } from './assign.js';
+import { refuseUnassignableInWorkgroup } from './assign.js';
 import { readReleaseState, threadPermalink, threadPlatformId } from './api/observatory.js';
-import type { AgentGroup } from '../types.js';
 import type { AuthHandler } from './router.js';
 
 const json = (status: number, body: unknown): Response =>
@@ -273,15 +272,8 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
   if (!text) return json(400, { error: 'empty_text' });
   if (text.length > MAX_TEXT) return json(400, { error: 'text_too_long', maxLength: MAX_TEXT });
 
-  const role = await canAssign(ctx.user.id, agentGroupId);
-  if (!role.ok) return json(role.reason === 'not_found' ? 404 : 403, { error: role.reason });
-
-  const agent = await getDb().get<AgentGroup>(
-    `SELECT * FROM agent_groups WHERE id = ? AND workgroup_id = ?`,
-    agentGroupId,
-    workgroupId,
-  );
-  if (!agent) return json(404, { error: 'agent_group_not_in_workgroup' });
+  const refusal = await refuseUnassignableInWorkgroup(ctx.user.id, agentGroupId, workgroupId);
+  if (refusal) return refusal;
 
   const targetId = claimSlug ?? itemId!;
   const dedupeKey = `${workgroupId}:${targetId}:${createHash('sha256').update(text).digest('hex')}`;

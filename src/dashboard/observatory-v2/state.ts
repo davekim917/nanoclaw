@@ -64,7 +64,7 @@ export interface ReviewRow {
   record: string;
   updated_at: string;
 }
-export function emptyRecord(): ReviewRecord {
+function emptyRecord(): ReviewRecord {
   return { owner: null, answer: null, answered_by: null, answered_at: null, history: [], requests: [], dispatch: null };
 }
 export function readRecord(row: ReviewRow | undefined): ReviewRecord {

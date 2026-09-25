@@ -76,7 +76,7 @@ export function requiredConfirmations(agentProposed: boolean): 1 | 2 {
   return agentProposed ? 1 : 2;
 }
 
-export interface ThreadClosePayload extends Record<string, unknown> {
+interface ThreadClosePayload extends Record<string, unknown> {
   /** Every agent group with a session in the close's frozen fan-out. */
   agentGroupIds: string[];
   /** An agent on this thread has a standing `propose_done` record. */

@@ -33,7 +33,7 @@ function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
-export type ObservatoryClaim = BoardClaim & {
+type ObservatoryClaim = BoardClaim & {
   /** Resolved permalink to the thread the work was claimed in — every row on the
    *  board links back to where it actually happened. Null when unresolvable. */
   threadUrl: string | null;
@@ -46,7 +46,7 @@ export type ObservatoryClaim = BoardClaim & {
   sessionId: string | null;
 };
 
-export interface ObservatoryRoom {
+interface ObservatoryRoom {
   key: string;
   name: string;
   platform: string;
@@ -55,7 +55,7 @@ export interface ObservatoryRoom {
   permalink: string | null;
 }
 
-export interface ObservatoryAgent {
+interface ObservatoryAgent {
   id: string;
   /** Channel-facing persona name (resolveAssistantName) — what claim owners are written as. */
   name: string;
@@ -161,7 +161,7 @@ export interface ReleaseStateItem {
   steeredThread?: SteeredThread | null;
 }
 
-export interface SteeredThread {
+interface SteeredThread {
   threadId: string;
   threadUrl: string | null;
   at: string;
@@ -582,7 +582,7 @@ const LOCATION_WINDOW_MS = 8 * 60 * 60 * 1000;
  * never claim someone is working in a room the host is about to reap them out
  * of.
  */
-export const WORKING_WINDOW_MS = 10 * 60 * 1000;
+const WORKING_WINDOW_MS = 10 * 60 * 1000;
 
 /** Case-insensitive match of a claim owner against an agent's channel-facing name OR folder. */
 export function ownerMatchesAgent(owner: string, agent: { name: string; folder: string }): boolean {
@@ -613,7 +613,7 @@ interface WiringRow {
  * Slack hide dormant wiring on another platform without un-wiring it. Absent =
  * every platform shows.
  */
-export async function observatoryHiddenRooms(workgroupId: string): Promise<string[]> {
+async function observatoryHiddenRooms(workgroupId: string): Promise<string[]> {
   const members = await getDb().all<{ folder: string }>(
     'SELECT folder FROM agent_groups WHERE workgroup_id = ?',
     workgroupId,
@@ -629,7 +629,7 @@ export async function observatoryHiddenRooms(workgroupId: string): Promise<strin
   return [];
 }
 
-export async function observatoryPlatforms(workgroupId: string): Promise<string[] | null> {
+async function observatoryPlatforms(workgroupId: string): Promise<string[] | null> {
   const members = await getDb().all<{ folder: string }>(
     'SELECT folder FROM agent_groups WHERE workgroup_id = ?',
     workgroupId,

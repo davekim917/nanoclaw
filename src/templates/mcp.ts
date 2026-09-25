@@ -4,7 +4,7 @@
  * Failure boundaries follow the spec: a missing file is fine; a malformed
  * file (bad JSON, wrong $schema, extra top-level fields) invalidates only the
  * MCP component; an invalid server entry skips only that server. The one
- * deliberate fatal case is a smuggled credential (threat #5): a value
+ * deliberate fatal case is a smuggled credential: a value
  * matching a high-confidence secret pattern rejects the whole plugin so a
  * real key never lands in a registry install.
  *
@@ -46,7 +46,7 @@ import { SECRET_ENV_KEY_RE, SECRET_VALUE_RE } from '../modules/self-mod/request.
 import { MCP_SCHEMA_URL } from './manifest.js';
 
 /** The Agent Plugins literal the stamp-time secret lint always accepts. */
-export const PLACEHOLDER_VALUE = 'placeholder';
+const PLACEHOLDER_VALUE = 'placeholder';
 
 /**
  * Values the lint never questions: the Agent Plugins literal, and this fork's
@@ -94,7 +94,7 @@ export function readPluginMcp(pluginDir: string): { servers: Record<string, Pars
   }
   if (!fs.existsSync(file)) return { servers: {}, report };
 
-  // CLASS INVARIANT (#500 rounds 2-4): no plugin whose `mcp.json` cannot be
+  // CLASS INVARIANT: no plugin whose `mcp.json` cannot be
   // PROVEN free of credentials may be stamped. `createAgentFromTemplate` copies
   // the whole plugin directory into the agent-readable
   // `groups/<folder>/plugins/<name>` mount, so every skip below ships the file
@@ -125,8 +125,8 @@ export function readPluginMcp(pluginDir: string): { servers: Record<string, Pars
   // still ships: `createAgentFromTemplate` copies the whole plugin directory
   // into the agent-readable `groups/<folder>/plugins/<name>` tree, so a
   // credential sitting in a well-formed entry under a wrong `$schema` or an
-  // unknown top-level key would have reached the agent unlinted (Codex on
-  // #500). The severity belongs to the credential, whatever else is malformed.
+  // unknown top-level key would have reached the agent unlinted. The severity
+  // belongs to the credential, whatever else is malformed.
   lintDocumentCredentials(raw, report);
 
   if (raw.$schema !== MCP_SCHEMA_URL) {
@@ -169,7 +169,7 @@ export function readPluginMcp(pluginDir: string): { servers: Record<string, Pars
  * just outside it that still shipped: a credential in `args`, a header scheme
  * off the list, a bare string entry (`"crm": "sk-live-…"`). The file is copied
  * verbatim into the agent-readable `groups/<folder>/plugins/<name>` mount, so
- * the unit that must be proven credential-free is the file (#500 rounds 2-7).
+ * the unit that must be proven credential-free is the file.
  */
 function lintDocumentCredentials(raw: Record<string, unknown>, report: string[]): void {
   if (isPlainObject(raw.mcpServers)) {
@@ -181,7 +181,7 @@ function lintDocumentCredentials(raw: Record<string, unknown>, report: string[])
   }
   // `raw`, not `raw.mcpServers`: the FILE is what ships, so a credential parked
   // in a sibling key (`metadata: { token: "sk-live-…" }`, or a secret-shaped
-  // `$schema`) reaches the agent just the same (Codex on #500 round 8).
+  // `$schema`) reaches the agent just the same.
   for (const [where, value] of entryStrings(raw)) {
     lintSecrets(where.split('.')[1] ?? 'mcp.json', where, value, report);
   }
@@ -222,7 +222,7 @@ function assertLintableValues(server: string, kind: 'env' | 'headers', raw: unkn
 /**
  * Validate one server entry. Returns the parsed config, or a skip reason.
  * Never throws: `lintDocumentCredentials` has already rejected the whole plugin
- * for a smuggled secret before any entry reaches here (#500 rounds 2-3).
+ * for a smuggled secret before any entry reaches here.
  */
 function readServerEntry(name: string, entry: unknown): ParsedMcpServerConfig | string {
   // Shared intake gate: names reach provider config writers with structural
@@ -284,7 +284,7 @@ function readServerEntry(name: string, entry: unknown): ParsedMcpServerConfig | 
 }
 
 /**
- * Stamp-time secret lint (threat #5). High-confidence known-format matches
+ * Stamp-time secret lint. High-confidence known-format matches
  * reject the whole plugin; a secret-looking KEY with an unrecognized value
  * only warns, so ordinary config values never block a legitimate setup.
  */
@@ -293,7 +293,7 @@ function lintSecrets(server: string, where: string, value: string, report: strin
   // SECRET_VALUE_RE is ^-anchored, so strip a leading auth scheme first. The
   // surrounding parser accepts ANY single-token scheme, so match that rather
   // than a fixed list — "Key sk-…" hid its credential from a Bearer/Token/Basic
-  // list while the parser happily accepted the header (Codex on #500 round 6).
+  // list while the parser happily accepted the header.
   const bare = value.replace(/^[A-Za-z][A-Za-z0-9-]*\s+/, '');
   if (SECRET_VALUE_RE.test(value) || SECRET_VALUE_RE.test(bare)) {
     throw new Error(

@@ -56,6 +56,7 @@
  * answer "denied".
  */
 import { getAgentGroup } from '../db/agent-groups.js';
+import { getDb } from '../db/connection.js';
 import { getMessagingGroup } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import { ATTENTION_ITEM_PREFIX, type AttentionSourceEnv } from '../attention-sources.js';
@@ -68,6 +69,7 @@ import { personaName, roomPermalink } from './api/observatory.js';
 import { selectScopedAttentionItems, wiredAgentsByChannel } from './api/threads.js';
 import { ASSIGN_DEDUPE_MS, releaseItemAssignment, reserveItemAssignment } from './db/item-assignments.js';
 import { observatoryAssign, type ObservatoryAssignPayload } from './observatory-assign-guard.js';
+import type { AgentGroup } from '../types.js';
 import type { AuthHandler, AuthedRequestContext } from './router.js';
 
 const json = (status: number, body: unknown): Response =>
@@ -102,6 +104,23 @@ export function canAssign(userId: string, agentGroupId: string): Promise<{ ok: b
     if (isMember(userId, agentGroupId)) return { ok: false, reason: 'member_role_cannot_assign' };
     return { ok: false, reason: 'not_found' };
   }, 'canAssign');
+}
+
+export async function refuseUnassignableInWorkgroup(
+  userId: string,
+  agentGroupId: string,
+  workgroupId: string,
+): Promise<Response | null> {
+  const role = await canAssign(userId, agentGroupId);
+  if (!role.ok) return json(role.reason === 'not_found' ? 404 : 403, { error: role.reason });
+
+  const agent = await getDb().get<AgentGroup>(
+    `SELECT * FROM agent_groups WHERE id = ? AND workgroup_id = ?`,
+    agentGroupId,
+    workgroupId,
+  );
+  if (!agent) return json(404, { error: 'agent_group_not_in_workgroup' });
+  return null;
 }
 
 /**

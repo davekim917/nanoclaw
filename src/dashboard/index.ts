@@ -7,7 +7,7 @@
  */
 import { register, requireAuth, registerCookieVerifier } from './router.js';
 import { ensureServerStarted } from '../webhook-server.js';
-import { startSSEFeed, stopSSEFeed, eventsHandler } from './api/events.js';
+import { startSSEFeed, eventsHandler } from './api/events.js';
 import { indexHtmlHandler, staticHandler } from './static.js';
 
 /** 301 preserving the query string — the token link rides `?token=`. */
@@ -116,10 +116,10 @@ export function startDashboard(): void {
 
   // Scheduled Tasks Board — 10 routes (design §3b + prompt/title search). The
   // `scheduled` namespace is distinct from `tasks` (the spawn board owns that).
-  // All auth-gated. Route matching is by exact segment count (router.ts:104), so
+  // All auth-gated. Route matching is by exact segment count (router.ts), so
   // `/move` (4 segs) and `/move/preview` (5 segs) are unambiguous regardless of
   // order. BUT `/search` and `/:key` share a segment count, and `:key` captures
-  // any segment — dispatch is first-match (router.ts:205), so `/search` MUST be
+  // any segment — dispatch is first-match, so `/search` MUST be
   // registered before `/:key` or it'd be swallowed as a key. Static `*tail` splat
   // stays LAST.
   register('GET', '/dashboard/api/scheduled', requireAuth(scheduledListHandler));
@@ -147,8 +147,4 @@ export function startDashboard(): void {
   register('GET', '/dashboard/static/*tail', staticHandler);
 
   ensureServerStarted();
-}
-
-export function stopDashboard(): void {
-  stopSSEFeed();
 }

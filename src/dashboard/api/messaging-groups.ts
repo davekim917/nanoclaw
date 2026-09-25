@@ -9,8 +9,8 @@
  * listMessagingGroups) is this list's ONLY consumer (grep-confirmed across
  * dashboard/ and every server-side route) and move preview/execute are
  * already gated to `canManageScheduled` — owner/global-admin only
- * (scheduled-shared.ts:39-41) — and 404 for anyone else
- * (scheduled-move.ts:249). Without the same gate here, a workgroup-scoped
+ * (scheduled-shared.ts) — and 404 for anyone else
+ * (scheduled-move.ts). Without the same gate here, a workgroup-scoped
  * member or admin who can never move a task could still read every OTHER
  * workgroup's channel names and platform ids off this endpoint. Gating the
  * whole list on that tier closes the read without inventing a second,

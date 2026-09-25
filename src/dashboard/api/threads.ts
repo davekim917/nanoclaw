@@ -156,7 +156,7 @@ export function threadChannelKey(threadId: string | null | undefined, known?: Re
 export type ThreadState = 'unassigned' | 'needs_you' | 'stalled' | 'running' | 'parked' | 'idle';
 
 /** §5: a tool that started this long ago with nothing newer out is stuck. */
-export const STALL_AFTER_MS = 30 * 60_000;
+const STALL_AFTER_MS = 30 * 60_000;
 
 export interface ThreadStateInput {
   /** How many sessions back this work item. Zero = an unowned item with no thread yet. */
@@ -268,7 +268,7 @@ export function deriveThreadState(input: ThreadStateInput): ThreadState {
 
 /* ─── Wire shapes ──────────────────────────────────────────────────────────── */
 
-export interface ThreadParticipant {
+interface ThreadParticipant {
   agent_group_id: string;
   name: string;
   /**
@@ -298,7 +298,7 @@ export interface ThreadParticipant {
 }
 
 /** An agent the thread can be handed to — see {@link ThreadSummary.assignable_agents}. */
-export interface ThreadAgentOption {
+interface ThreadAgentOption {
   agent_group_id: string;
   name: string;
 }
@@ -441,7 +441,7 @@ export interface ThreadSummary {
 }
 
 /** {@link ThreadSummary.attention_source}. */
-export interface ThreadAttentionSource {
+interface ThreadAttentionSource {
   /** The declared source kind — `release-board`, etc. */
   kind: string;
   /**
@@ -521,7 +521,7 @@ export interface ThreadAttentionSource {
 }
 
 /** {@link ThreadAttentionSource.assigned}. */
-export interface ThreadItemAssignment {
+interface ThreadItemAssignment {
   agent_group_id: string;
   /** The name the item's own room knows this agent by, resolved like a participant's. */
   agent_name: string;
@@ -549,7 +549,7 @@ export interface ThreadDoneProposal {
  * `EXTRA_SEGMENT_PLATFORMS` fallback — this is NOT a second, competing rule).
  *
  * Delegates rather than restating the rule. It used to be a verbatim copy of
- * `isTaskThread` (`src/db/sessions.ts:157`), which is the shape that
+ * `isTaskThread` (`src/db/sessions.ts`), which is the shape that
  * drifts: two copies agree until one is edited. Kept as a named export because
  * the pill, the filter and their tests read better for it, but there is now
  * exactly one definition.
@@ -962,7 +962,7 @@ function liveContainerState(
 
 /* ─── Agent identity (§10.2) ───────────────────────────────────────────────── */
 
-export interface AgentIdentity {
+interface AgentIdentity {
   agent_group_id: string;
   name: string;
   canonicalName: string;
@@ -1107,7 +1107,7 @@ export async function readClaimsByThread(
 /* ─── Task-thread anchors (DEFECT 1, continued 2026-08-21) ─────────────────── */
 
 /** One session's most-recently-created `task_thread_anchors` row. */
-export interface TaskAnchor {
+interface TaskAnchor {
   platformId: string;
   atMs: number;
 }
@@ -1611,6 +1611,21 @@ export async function buildThreadList(
     ],
     avatarLookup,
   );
+  const assignableOn = (channelKey: string, include: (agentGroupId: string) => boolean): ThreadAgentOption[] =>
+    (wiredByChannel.get(channelKey) ?? [])
+      .filter((a) => include(a.agent_group_id))
+      .map((a) => ({
+        agent_group_id: a.agent_group_id,
+        name:
+          identities.get(
+            identityKey({
+              agentGroupId: a.agent_group_id,
+              messagingGroupId: a.messaging_group_id,
+              sessionProvider: null,
+            }),
+          )?.name ?? a.name,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
   // One query for the whole page's snoozes, never one per row. Per-user by
   // construction — see thread-snooze.ts on why this is not archive.
   //
@@ -1732,20 +1747,7 @@ export async function buildThreadList(
     const displayChannelKey = dmDedupeKey.get(channelKey) ?? channelKey;
 
     const onThread = new Set(participants.map((p) => p.agent_group_id));
-    const assignableAgents: ThreadAgentOption[] = (wiredByChannel.get(channelKey) ?? [])
-      .filter((a) => !onThread.has(a.agent_group_id) && inScope(a.agent_group_id))
-      .map((a) => ({
-        agent_group_id: a.agent_group_id,
-        name:
-          identities.get(
-            identityKey({
-              agentGroupId: a.agent_group_id,
-              messagingGroupId: a.messaging_group_id,
-              sessionProvider: null,
-            }),
-          )?.name ?? a.name,
-      }))
-      .sort((a, b) => a.name.localeCompare(b.name));
+    const assignableAgents = assignableOn(channelKey, (id) => !onThread.has(id) && inScope(id));
 
     const state = deriveThreadState({
       sessionCount: ordered.length,
@@ -1856,20 +1858,7 @@ export async function buildThreadList(
     // declared channel can be handed the work, and choosing one creates the
     // session the item does not have yet ("Assign is the verb that creates the
     // thread" — §2).
-    const assignableAgents: ThreadAgentOption[] = (wiredByChannel.get(item.channel_key) ?? [])
-      .filter((a) => inScope(a.agent_group_id))
-      .map((a) => ({
-        agent_group_id: a.agent_group_id,
-        name:
-          identities.get(
-            identityKey({
-              agentGroupId: a.agent_group_id,
-              messagingGroupId: a.messaging_group_id,
-              sessionProvider: null,
-            }),
-          )?.name ?? a.name,
-      }))
-      .sort((a, b) => a.name.localeCompare(b.name));
+    const assignableAgents = assignableOn(item.channel_key, inScope);
 
     // NOT set directly — §5: one function decides what state a row is in, and
     // a producing surface that sets `state` itself invents its own lane

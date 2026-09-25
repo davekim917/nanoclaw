@@ -178,7 +178,7 @@ export const workgroupUsageHandler: AuthHandler = async (req, params, ctx) => {
         sinceDate,
       );
       // The same presentation `ncl usage list` gets: cost_applicable from the
-      // provider, and the #1061 note in place of any figure inside the
+      // provider, and the untrusted note in place of any figure inside the
       // untrusted Claude window (src/db/usage-trust.ts).
       usage = rawRows.map(presentUsageDailyRow);
     }
@@ -200,7 +200,7 @@ interface RawClaim {
   escalated_at?: unknown;
 }
 
-export interface ClaimEntry {
+interface ClaimEntry {
   slug: string;
   owner: string | null;
   claimed_at: string | null;
@@ -254,7 +254,7 @@ function readClaims(dataDir: string, workgroupId: string, now: number): ClaimEnt
   return out;
 }
 
-export interface WorkgroupSeriesRow {
+interface WorkgroupSeriesRow {
   series_id: string;
   agent_group_id: string;
   agent_group_name: string;

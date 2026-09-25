@@ -88,7 +88,7 @@ const json = (status: number, body: unknown): Response =>
 export const CLOSE_CONFIRM_WINDOW_MS = 10 * 60 * 1000;
 
 /** Reason cap, mirroring the container's own `DONE_PROPOSAL_REASON_MAX_CHARS`. */
-export { CLOSE_REASON_MAX_CHARS, readDoneProposal, type DoneProposal } from '../modules/mailbox/index.js';
+export { readDoneProposal, type DoneProposal } from '../modules/mailbox/index.js';
 
 const CLOSE_WAKE_ID_PREFIX = 'thread-close-';
 
@@ -110,8 +110,7 @@ const CLOSE_WAKE_ID_PREFIX = 'thread-close-';
  *
  * Returns the proposal it was given, so the sweep's call site stays one line.
  */
-// On the async driver since seam 3 PR 6 (the "5c" family, converted with its
-// one sweep-continuation caller): a best-effort mirror, so the read→write pair
+// On the async driver: a best-effort mirror, so the read→write pair
 // needs no transaction — a stale mirror is refreshed by the next tick, and the
 // close path never trusts this copy.
 export async function syncDoneProposalMirror(
@@ -356,7 +355,7 @@ async function writeCloseWrapUp(
 
 /* ─── Phase 1: request ─────────────────────────────────────────────────────── */
 
-export interface ThreadClosureRow {
+interface ThreadClosureRow {
   thread_id: string;
   requested_by: string;
   requested_at: string;
@@ -376,7 +375,7 @@ export interface ThreadCloseBody {
 const NOT_FOUND = { status: 404 as const, body: { error: 'thread_not_found' } };
 
 /** The single decision every reservation input and reported field comes from. */
-export interface ClosureDecision {
+interface ClosureDecision {
   /**
    * `live-task-series` is its own outcome, not folded into `refused`: unlike
    * every other refusal on this path, it is safe to disclose to a caller who
@@ -430,7 +429,7 @@ export interface ClosureDecision {
  *   function may not have. Under-counting proposals can only raise the
  *   confirmation bar, never lower it.
  */
-export function decideClosure(
+function decideClosure(
   freshVisible: CloseSession[],
   proposalsBySession: ReadonlyMap<string, boolean>,
   confirmations: number,
@@ -802,7 +801,7 @@ async function forceClearWorkContinuation(session: CloseSession, threadId: strin
   // `ensureContinuationCleared` counts that as not-cleared.
   const cleared = await withExistingNanoclawOutbound(session.agent_group_id, session.id, (outbound) => {
     // Re-checked INSIDE the session, immediately before the write, with no
-    // await in between — the guard shape PR 5 established for every host write
+    // await in between — the guard shape for every host write
     // to the container-owned outbound.db. Opening the session is a yield, and a
     // wake can start a container in it; `outbound.db` has exactly one writer,
     // so the host may only write while none is claimed. Not cleared, so the

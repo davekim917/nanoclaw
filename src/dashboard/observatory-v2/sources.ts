@@ -25,7 +25,7 @@ export interface SourceDecision extends SignalDecision {
   repository?: string | null;
   exact_context?: boolean;
 }
-export interface ProjectRow {
+interface ProjectRow {
   id: string;
   workgroup_id: string;
   name: string;
@@ -109,7 +109,7 @@ export async function visibleWorkgroups(ctx: AuthedRequestContext) {
     ...ctx.scopes.allowed_group_ids,
   );
 }
-export function safeUrl(value: unknown): string | null {
+function safeUrl(value: unknown): string | null {
   if (typeof value !== 'string') return null;
   try {
     const u = new URL(value);
@@ -177,7 +177,7 @@ function validReleaseItem(value: unknown): value is ReleaseStateItem {
 }
 
 /** Only structured repository metadata or an exact GitHub URL can name a repo. */
-export function repositoryOf(item: ReleaseStateItem): string | null {
+function repositoryOf(item: ReleaseStateItem): string | null {
   const meta = (item as ReleaseStateItem & { meta?: { repo?: unknown } }).meta;
   if (typeof meta?.repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(meta.repo)) return meta.repo.toLowerCase();
   const url = safeUrl(item.url);
@@ -225,7 +225,7 @@ function materialMeta(meta: unknown): unknown {
       .map((k) => [k, record[k]]),
   );
 }
-export function readPendingQuestion(
+function readPendingQuestion(
   agentGroupId: string,
   sessionId: string,
 ): { seq: number; text: string; timestamp: string } | null {

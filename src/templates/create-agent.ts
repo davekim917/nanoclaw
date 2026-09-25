@@ -35,7 +35,7 @@ export interface CreateAgentResult {
 }
 
 /** Group-private skills overlay — where plugin skills are discovered and executed from. */
-export function groupSkillsOverlayDir(agentGroupId: string): string {
+function groupSkillsOverlayDir(agentGroupId: string): string {
   return path.join(DATA_DIR, 'v2-sessions', agentGroupId, '.claude-shared', 'skills');
 }
 
@@ -68,12 +68,12 @@ export function markPluginServers(
  * Add the `plugin` ownership marker — to BOTH stores.
  *
  * The fork is file-first: container.json IS what the spawn reads, and all
- * three mutation guards read the FILE, not the row (`groups.ts:657,687` and
- * `modules/self-mod/apply.ts:191` all call `assertMcpServerNotPluginOwned`
+ * three mutation guards read the FILE, not the row (two in `groups.ts` and
+ * one in `modules/self-mod/apply.ts` call `assertMcpServerNotPluginOwned`
  * with an entry from `readContainerConfig`). A marker written only to the DB
  * projection therefore guards nothing: an `ncl groups config add-mcp-server`
- * or an approved `add_mcp_server` would silently overwrite a plugin's server
- * (Codex on #500). The marker rides the file alongside `pluginRoot`, which is
+ * or an approved `add_mcp_server` would silently overwrite a plugin's server.
+ * The marker rides the file alongside `pluginRoot`, which is
  * already a host bookkeeping field there; the runner strips both in
  * `resolvePluginServer` before any provider sees the config.
  */
@@ -115,7 +115,7 @@ export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOpt
   // config row below, BEFORE tasks are created, so a template task's first
   // run and its later re-arms agree on the same zone.
   const timezone = (opts?.timezone && canonicalizeIanaTimezone(opts.timezone)) || undefined;
-  // TODO(T5 PR 5): route through `prepareTemplateTasks` (src/templates/tasks.ts)
+  // TODO: route through `prepareTemplateTasks` (src/templates/tasks.ts)
   // once the scheduling theme lands `taskNameSlug` — restamp needs the id-slug
   // collision gate to match a live series.
   const tasks = tpl.tasks.map((task) => {

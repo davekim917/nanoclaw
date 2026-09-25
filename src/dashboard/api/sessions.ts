@@ -58,10 +58,10 @@ import { heartbeatPath } from '../../session-manager.js';
 import { log } from '../../log.js';
 import type { AuthHandler } from '../router.js';
 
-export type AttentionState = 'needs_me' | 'active' | 'idle' | 'stale';
+type AttentionState = 'needs_me' | 'active' | 'idle' | 'stale';
 export type ContainerStatus = 'running' | 'idle' | 'stale' | 'unknown';
 
-export interface SessionSummary {
+interface SessionSummary {
   agent_group_id: string;
   session_id: string;
   messaging_group_id: string | null;
@@ -148,6 +148,40 @@ interface SessionJoinRow {
   attached_task_id: string | null;
   attached_task_status: string | null;
   attached_task_needs_input: number | null;
+}
+
+function summarizeSession(row: SessionJoinRow): SessionSummary {
+  const containerStatus = deriveContainerStatus(row.agent_group_id, row.id);
+  // Only probe inbound.db for would-be-stale rows. Stale boundary uses
+  // last_inbound (fallback created_at for never-inbounded sessions) so a
+  // brand-new session-shared session doesn't trip the recurrence probe
+  // on every refresh.
+  const lastInboundMs = row.last_active ? Date.parse(row.last_active) : 0;
+  const baselineMs = lastInboundMs || Date.parse(row.created_at);
+  const couldBeStale =
+    containerStatus !== 'running' &&
+    row.attached_task_status !== 'running' &&
+    row.attached_task_status !== 'pending' &&
+    (!baselineMs || Date.now() - baselineMs >= ONE_DAY_MS);
+  const hasRecurrence = couldBeStale ? hasPendingRecurrence(row.agent_group_id, row.id, DATA_DIR) : false;
+  const attentionState = deriveAttentionState(row, containerStatus, hasRecurrence);
+  return {
+    agent_group_id: row.agent_group_id,
+    session_id: row.id,
+    messaging_group_id: row.messaging_group_id,
+    thread_id: row.thread_id,
+    title: row.title,
+    last_inbound_at: row.last_active,
+    last_outbound_at: row.last_outbound_at,
+    last_outbound_kind: row.last_outbound_kind,
+    archived_at: row.archived_at,
+    container_status: containerStatus,
+    has_pending_recurrence: hasRecurrence,
+    attached_task_id: row.attached_task_id,
+    attached_task_status: row.attached_task_status,
+    attached_task_needs_input: row.attached_task_needs_input === null ? null : row.attached_task_needs_input === 1,
+    attention_state: attentionState,
+  };
 }
 
 function deriveAttentionState(
@@ -287,39 +321,7 @@ export const sessionsHandler: AuthHandler = async (req, _params, ctx) => {
     });
   }
 
-  const sessions: SessionSummary[] = rows.map((row) => {
-    const containerStatus = deriveContainerStatus(row.agent_group_id, row.id);
-    // Only probe inbound.db for would-be-stale rows. Stale boundary uses
-    // last_inbound (fallback created_at for never-inbounded sessions) so a
-    // brand-new session-shared session doesn't trip the recurrence probe
-    // on every refresh.
-    const lastInboundMs = row.last_active ? Date.parse(row.last_active) : 0;
-    const baselineMs = lastInboundMs || Date.parse(row.created_at);
-    const couldBeStale =
-      containerStatus !== 'running' &&
-      row.attached_task_status !== 'running' &&
-      row.attached_task_status !== 'pending' &&
-      (!baselineMs || Date.now() - baselineMs >= ONE_DAY_MS);
-    const hasRecurrence = couldBeStale ? hasPendingRecurrence(row.agent_group_id, row.id, DATA_DIR) : false;
-    const attentionState = deriveAttentionState(row, containerStatus, hasRecurrence);
-    return {
-      agent_group_id: row.agent_group_id,
-      session_id: row.id,
-      messaging_group_id: row.messaging_group_id,
-      thread_id: row.thread_id,
-      title: row.title,
-      last_inbound_at: row.last_active,
-      last_outbound_at: row.last_outbound_at,
-      last_outbound_kind: row.last_outbound_kind,
-      archived_at: row.archived_at,
-      container_status: containerStatus,
-      has_pending_recurrence: hasRecurrence,
-      attached_task_id: row.attached_task_id,
-      attached_task_status: row.attached_task_status,
-      attached_task_needs_input: row.attached_task_needs_input === null ? null : row.attached_task_needs_input === 1,
-      attention_state: attentionState,
-    };
-  });
+  const sessions: SessionSummary[] = rows.map(summarizeSession);
 
   return new Response(JSON.stringify({ sessions }), {
     status: 200,
@@ -534,34 +536,7 @@ export const sessionsDetailHandler: AuthHandler = async (_req, params, ctx) => {
     });
   }
 
-  const containerStatus = deriveContainerStatus(row.agent_group_id, row.id);
-  const lastInboundMs = row.last_active ? Date.parse(row.last_active) : 0;
-  const baselineMs = lastInboundMs || Date.parse(row.created_at);
-  const couldBeStale =
-    containerStatus !== 'running' &&
-    row.attached_task_status !== 'running' &&
-    row.attached_task_status !== 'pending' &&
-    (!baselineMs || Date.now() - baselineMs >= ONE_DAY_MS);
-  const hasRecurrence = couldBeStale ? hasPendingRecurrence(row.agent_group_id, row.id, DATA_DIR) : false;
-  const attentionState = deriveAttentionState(row, containerStatus, hasRecurrence);
-
-  const session: SessionSummary = {
-    agent_group_id: row.agent_group_id,
-    session_id: row.id,
-    messaging_group_id: row.messaging_group_id,
-    thread_id: row.thread_id,
-    title: row.title,
-    last_inbound_at: row.last_active,
-    last_outbound_at: row.last_outbound_at,
-    last_outbound_kind: row.last_outbound_kind,
-    archived_at: row.archived_at,
-    container_status: containerStatus,
-    has_pending_recurrence: hasRecurrence,
-    attached_task_id: row.attached_task_id,
-    attached_task_status: row.attached_task_status,
-    attached_task_needs_input: row.attached_task_needs_input === null ? null : row.attached_task_needs_input === 1,
-    attention_state: attentionState,
-  };
+  const session = summarizeSession(row);
 
   const transcript = readSessionTranscript(row.agent_group_id, row.id);
 
