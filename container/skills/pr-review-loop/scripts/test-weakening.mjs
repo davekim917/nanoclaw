@@ -88,7 +88,7 @@ function canon(ts, node, hidden = null) {
   const K = ts.SyntaxKind;
   const out = [];
   const visit = (n) => {
-    if (hidden?.has(n)) return out.push('<assertion>');
+    if (hidden?.has(n)) return out.push('<hidden>');
     if (ts.isParenthesizedExpression(n)) return visit(n.expression);
     switch (n.kind) {
       case K.StringLiteral:
@@ -229,11 +229,11 @@ function caseBody(ts, fn) {
   return { asserts, setup };
 }
 
-function containsTestCall(ts, node) {
-  let found = false;
+/** The outermost test calls under `node`. */
+function testCalls(ts, node) {
+  const found = new Set();
   const visit = (n) => {
-    if (found) return;
-    if (ts.isCallExpression(n) && testCall(ts, n)) found = true;
+    if (ts.isCallExpression(n) && testCall(ts, n)) found.add(n);
     else ts.forEachChild(n, visit);
   };
   visit(node);
@@ -252,37 +252,83 @@ function statementName(ts, st) {
   return oneLine(st.getText(), 60);
 }
 
-/** `const {…} = await import('…')` or `require('…')`: an import by another spelling. */
-function isModuleLoad(ts, st) {
-  if (!ts.isVariableStatement(st)) return false;
-  return st.declarationList.declarations.every((d) => {
-    let init = d.initializer;
-    if (init && ts.isAwaitExpression(init)) init = init.expression;
-    if (!init || !ts.isCallExpression(init)) return false;
-    return (
-      init.expression.kind === ts.SyntaxKind.ImportKeyword ||
-      (ts.isIdentifier(init.expression) && init.expression.text === 'require')
-    );
-  });
+/** The module `init` loads by `await import('…')` or `require('…')`, or null. */
+function loadedModule(ts, init) {
+  if (init && ts.isAwaitExpression(init)) init = init.expression;
+  if (!init || !ts.isCallExpression(init)) return null;
+  const loader =
+    init.expression.kind === ts.SyntaxKind.ImportKeyword ||
+    (ts.isIdentifier(init.expression) && init.expression.text === 'require');
+  if (!loader) return null;
+  const arg = init.arguments[0];
+  return arg && ts.isStringLiteralLike(arg) ? arg.text : arg ? canon(ts, arg) : '';
 }
 
-/** Non-test statements of one scope: helpers, fixtures, hooks and mocks. Imports and types are left out. */
-function supportStatements(ts, statements, file, scope) {
+function isModuleLoad(ts, st) {
+  return (
+    ts.isVariableStatement(st) && st.declarationList.declarations.every((d) => loadedModule(ts, d.initializer) !== null)
+  );
+}
+
+/** Records what each local name of an import or module load is bound to, and each side-effect-only import. */
+function recordImports(ts, st, imports) {
+  const bind = (name, target) => imports.bindings.set(name, target);
+  if (ts.isImportDeclaration(st)) {
+    const from = st.moduleSpecifier.text;
+    const clause = st.importClause;
+    if (!clause) return imports.effects.push({ canon: from, text: from });
+    if (clause.isTypeOnly) return;
+    if (clause.name) bind(clause.name.text, `${from}#default`);
+    const named = clause.namedBindings;
+    if (named && ts.isNamespaceImport(named)) bind(named.name.text, `${from}#*`);
+    if (named && ts.isNamedImports(named))
+      for (const e of named.elements)
+        if (!e.isTypeOnly) bind(e.name.text, `${from}#${(e.propertyName ?? e.name).text}`);
+    return;
+  }
+  if (ts.isImportEqualsDeclaration(st)) {
+    const ref = st.moduleReference;
+    const from = ts.isExternalModuleReference(ref) ? canon(ts, ref.expression) : canon(ts, ref);
+    return bind(st.name.text, `${from}#*`);
+  }
+  for (const d of st.declarationList.declarations) {
+    const from = loadedModule(ts, d.initializer);
+    if (ts.isIdentifier(d.name)) bind(d.name.text, `${from}#*`);
+    else if (ts.isObjectBindingPattern(d.name))
+      for (const e of d.name.elements)
+        if (ts.isIdentifier(e.name))
+          bind(e.name.text, `${from}#${e.propertyName ? canon(ts, e.propertyName) : e.name.text}`);
+  }
+}
+
+/**
+ * Non-test statements of one scope: helpers, fixtures, hooks, mocks, and any
+ * wrapper around a test (an `if`, a loop), with the tests inside it as
+ * placeholders. Imports and module loads go to `imports`; types are left out.
+ */
+function supportStatements(ts, statements, file, scope, imports) {
   const out = [];
   for (const st of statements) {
-    if (ts.isImportDeclaration(st) || ts.isImportEqualsDeclaration(st) || isModuleLoad(ts, st)) continue;
+    if (ts.isImportDeclaration(st) || ts.isImportEqualsDeclaration(st) || isModuleLoad(ts, st)) {
+      recordImports(ts, st, imports);
+      continue;
+    }
     if (ts.isTypeAliasDeclaration(st) || ts.isInterfaceDeclaration(st)) continue;
     if (ts.isExportDeclaration(st) && !st.moduleSpecifier && st.exportClause) continue;
-    if (containsTestCall(ts, st)) continue;
-    out.push({ file, scope, name: statementName(ts, st), canon: canon(ts, st), text: oneLine(st.getText()) });
+    const tests = testCalls(ts, st);
+    if (ts.isExpressionStatement(st) && tests.has(st.expression)) continue;
+    out.push({ file, scope, name: statementName(ts, st), canon: canon(ts, st, tests), text: oneLine(st.getText()) });
   }
   return out;
 }
 
+const noImports = () => ({ bindings: new Map(), effects: [] });
+
 /** The units (cases and groups) and support statements of one parsed test file. */
 function testFile(ts, file, sf) {
   const units = [];
-  const support = supportStatements(ts, sf.statements, file, '');
+  const imports = noImports();
+  const support = supportStatements(ts, sf.statements, file, '', imports);
   const seen = new Map();
   const visit = (n, scope, inherited) => {
     if (ts.isCallExpression(n)) {
@@ -307,7 +353,7 @@ function testFile(ts, file, sf) {
         units.push(unit);
         if (t.fn) {
           if (t.kind === 'group' && ts.isBlock(t.fn.body))
-            support.push(...supportStatements(ts, t.fn.body.statements, file, base));
+            support.push(...supportStatements(ts, t.fn.body.statements, file, base, imports));
           ts.forEachChild(t.fn, (c) => visit(c, t.kind === 'group' ? trail : scope, unit.effective));
         }
         return;
@@ -316,20 +362,23 @@ function testFile(ts, file, sf) {
     ts.forEachChild(n, (c) => visit(c, scope, inherited));
   };
   visit(sf, [], new Set());
-  return { units, support };
+  return { units, support, imports };
 }
 
-function missing(before, after) {
+/** `before` items with no equal in `after`, and `after` items left over, matched one to one. */
+function match(before, after) {
   const left = new Map();
-  for (const x of after) left.set(x.canon, (left.get(x.canon) ?? 0) + 1);
+  for (const x of after) left.set(x.canon, [...(left.get(x.canon) ?? []), x]);
   const gone = [];
   for (const x of before) {
-    const n = left.get(x.canon) ?? 0;
-    if (n > 0) left.set(x.canon, n - 1);
+    const same = left.get(x.canon);
+    if (same?.length) same.pop();
     else gone.push(x);
   }
-  return gone;
+  return { gone, extra: [...left.values()].flat() };
 }
+
+const missing = (before, after) => match(before, after).gone;
 
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
@@ -408,20 +457,58 @@ function compareSupport(baseSupport, headSupport, headPathOf, findings) {
     return m;
   };
   const headScoped = scoped(headSupport);
-  const anywhere = new Set(headSupport.map((s) => s.canon));
+  const paired = new Set();
+  const gone = [];
+  const elsewhere = [];
   for (const [k, list] of scoped(baseSupport)) {
     const [file, scope] = k.split('\0');
     const headPath = headPathOf(file);
-    const gone = missing(list, headPath ? (headScoped.get(`${headPath}\0${scope}`) ?? []) : []);
-    for (const s of gone) {
-      if (anywhere.has(s.canon)) continue;
+    const headKey = headPath ? `${headPath}\0${scope}` : null;
+    if (headKey) paired.add(headKey);
+    const m = match(list, (headKey && headScoped.get(headKey)) || []);
+    gone.push(...m.gone.map((s) => ({ s, file, scope, headPath })));
+    elsewhere.push(...m.extra);
+  }
+  for (const [k, list] of headScoped) if (!paired.has(k)) elsewhere.push(...list);
+  const unmoved = new Set(
+    missing(
+      gone.map((g) => g.s),
+      elsewhere,
+    ),
+  );
+  for (const { s, file, scope, headPath } of gone) {
+    if (!unmoved.has(s)) continue;
+    findings.push({
+      file,
+      case: scope ? `${scope} › ${s.name}` : s.name,
+      kind: 'support-changed',
+      change: headPath ? 'fixture/helper statement changed or removed' : 'file removed',
+    });
+  }
+}
+
+/** An import whose local name now binds something else, or a side-effect import that is gone. */
+function compareImports(baseImports, headImports, headPathOf, findings) {
+  for (const [file, before] of baseImports) {
+    const after = headImports.get(headPathOf(file));
+    if (!after) continue;
+    for (const [name, target] of before.bindings) {
+      const now = after.bindings.get(name);
+      if (now !== undefined && now !== target)
+        findings.push({
+          file,
+          case: `import ${name}`,
+          kind: 'support-changed',
+          change: `now ${now.replace('#', ' › ')}, was ${target.replace('#', ' › ')}`,
+        });
+    }
+    for (const effect of missing(before.effects, after.effects))
       findings.push({
         file,
-        case: scope ? `${scope} › ${s.name}` : s.name,
+        case: `import '${effect.text}'`,
         kind: 'support-changed',
-        change: headPath ? 'fixture/helper statement changed or removed' : 'file removed',
+        change: 'side-effect import removed',
       });
-    }
   }
 }
 
@@ -488,8 +575,8 @@ export async function analyze({ files, read, ts }) {
   });
   const text = (side, file) => (file ? texts.get(`${side}\0${file}`) : null);
 
-  const base = { units: [], support: [] };
-  const head = { units: [], support: [] };
+  const base = { units: [], support: [], imports: new Map() };
+  const head = { units: [], support: [], imports: new Map() };
   const read2 = (side, file) => {
     const t = text(side, file);
     if (t instanceof Error) throw t;
@@ -498,9 +585,9 @@ export async function analyze({ files, read, ts }) {
   const extract = (file, cls, t) => {
     if (!ts) throw new Error('the typescript package is not installed where this runs');
     const sf = parse(ts, file, t);
-    return cls === 'ast-test'
-      ? testFile(ts, file, sf)
-      : { units: [], support: supportStatements(ts, sf.statements, file, '') };
+    if (cls === 'ast-test') return testFile(ts, file, sf);
+    const imports = noImports();
+    return { units: [], support: supportStatements(ts, sf.statements, file, '', imports), imports };
   };
 
   for (const job of jobs) {
@@ -528,13 +615,14 @@ export async function analyze({ files, read, ts }) {
       if (job.after && headClass && h === null) throw new Error('missing at the head');
       const before = job.before ? extract(job.before, job.beforeClass, b) : null;
       const after = job.after && headClass ? extract(job.after, headClass, h) : null;
-      for (const [into, got] of [
-        [base, before],
-        [head, after],
+      for (const [into, got, at] of [
+        [base, before, job.before],
+        [head, after, job.after],
       ])
         if (got) {
           into.units.push(...got.units);
           into.support.push(...got.support);
+          into.imports.set(at, got.imports);
         }
     } catch (err) {
       incomplete(file, err.message);
@@ -551,6 +639,7 @@ export async function analyze({ files, read, ts }) {
       });
   compareCases(base.units, head.units, headPathOf, findings);
   compareSupport(base.support, head.support, headPathOf, findings);
+  compareImports(base.imports, head.imports, headPathOf, findings);
 
   const verdict = refusals.length ? 'refuse' : findings.length ? 'review' : 'clean';
   return { verdict, summary: summarize(refusals.length ? refusals : findings), findings, refusals };

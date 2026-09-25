@@ -214,6 +214,35 @@ describe("adder", () => {
     expect((await judge({ 'src/a.test.ts': withHelpers }, { 'src/a.test.ts': grown })).verdict).toBe('clean');
   });
 
+  it('flags a changed wrapper around a test, with the test inside it unchanged', async () => {
+    const wrapped = (cond: string) => `if (${cond}) {\n  it('runs', () => { expect(run()).toBe(1); });\n}\n`;
+    const result = await judge({ 'src/w.test.ts': wrapped('RUN_IN_CI') }, { 'src/w.test.ts': wrapped('false') });
+    expect(result.findings).toEqual([expect.objectContaining({ kind: 'support-changed' })]);
+  });
+
+  it('flags an import whose name now binds another module or export, and a removed side-effect import', async () => {
+    const before = `import './setup';\nimport { subject } from './real.js';\nit('works', () => { expect(subject()).toBe(1); });\n`;
+    const result = await judge(
+      { 'src/i.test.ts': before },
+      { 'src/i.test.ts': before.replace("import './setup';\n", '').replace('./real.js', './stub.js') },
+    );
+    expect(result.findings).toEqual([
+      expect.objectContaining({ case: 'import subject', change: 'now ./stub.js › subject, was ./real.js › subject' }),
+      expect.objectContaining({ case: "import './setup'", change: 'side-effect import removed' }),
+    ]);
+  });
+
+  it('flags a hook removed from one suite though an identical hook stays in another', async () => {
+    const suite = (name: string, hook: string) =>
+      `describe('${name}', () => {\n  ${hook}\n  it('x', () => { expect(x()).toBe(1); });\n});\n`;
+    const hook = 'beforeEach(() => reset());';
+    const result = await judge(
+      { 'src/d.test.ts': suite('a', hook) + suite('b', hook) },
+      { 'src/d.test.ts': suite('a', hook) + suite('b', '') },
+    );
+    expect(result.findings).toEqual([expect.objectContaining({ case: 'b › beforeEach', kind: 'support-changed' })]);
+  });
+
   it('flags a changed statement in a shared helper file, and a changed fixture line', async () => {
     const helper = "export const WAIT_MS = 500;\nexport function makeDb() { return open(':memory:'); }\n";
     const result = await judge(
