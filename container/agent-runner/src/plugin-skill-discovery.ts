@@ -52,7 +52,7 @@ export interface DiscoveredSkill {
 }
 
 /** `fs.realpathSync`, or null when the path does not resolve. Null means refuse. */
-export function resolveRealPath(target: string): string | null {
+function resolveRealPath(target: string): string | null {
   try {
     return fs.realpathSync(target);
   } catch {
@@ -64,7 +64,7 @@ export function resolveRealPath(target: string): string | null {
  * Is an already-resolved path inside an already-resolved root? Separator
  * boundary, so a sibling named `<root>-evil` cannot prefix-match.
  */
-export function isWithinResolvedRoot(resolved: string, resolvedRoot: string): boolean {
+function isWithinResolvedRoot(resolved: string, resolvedRoot: string): boolean {
   return resolved === resolvedRoot || resolved.startsWith(resolvedRoot + path.sep);
 }
 
@@ -73,7 +73,7 @@ export function isWithinResolvedRoot(resolved: string, resolvedRoot: string): bo
  * into — one per plugin directory, each resolved so a symlinked plugin checkout
  * keeps working.
  */
-export function resolvePluginRoots(pluginsRoot: string): string[] {
+function resolvePluginRoots(pluginsRoot: string): string[] {
   let entries: string[];
   try {
     entries = fs.readdirSync(pluginsRoot);
@@ -97,7 +97,7 @@ export function resolvePluginRoots(pluginsRoot: string): string[] {
  * Plugins to skip entirely. These wrap Claude-only runtime functionality
  * (Skill tool, Agent tool, slash-command machinery).
  */
-export const DEFAULT_DENY_PLUGINS = new Set<string>([
+const DEFAULT_DENY_PLUGINS = new Set<string>([
   // bootstrap: many sub-plugins inside; we walk it with a finer-grained denylist
   //            via DENY_SUB_PLUGIN_SKILL_DIRS, not at the top level.
   // codex: skills here are Codex-plugin internal, already loaded via the codex
@@ -633,7 +633,7 @@ export function syncSkillSymlinks(
  * `MIRROR_SOURCE_ROOT_FILE`, which the support-dir mirror writes too and which
  * `isManagedMirror` must not key on.
  */
-export const MIRROR_MARKER = '.nanoclaw-managed';
+const MIRROR_MARKER = '.nanoclaw-managed';
 
 /**
  * Provenance file: the plugin repository a mirror dir was published from.
@@ -656,7 +656,7 @@ export const MIRROR_MARKER = '.nanoclaw-managed';
 const MIRROR_SOURCE_ROOT_FILE = '.nanoclaw-source-root';
 
 /** Names this mirror owns in its own dirs. A plugin child using one is never mirrored. */
-export const MIRROR_OWNED_CHILDREN: ReadonlySet<string> = new Set([MIRROR_MARKER, MIRROR_SOURCE_ROOT_FILE]);
+const MIRROR_OWNED_CHILDREN: ReadonlySet<string> = new Set([MIRROR_MARKER, MIRROR_SOURCE_ROOT_FILE]);
 
 /**
  * The provenance file's contents for a mirror dir published from `resolvedRoot`.
@@ -677,7 +677,7 @@ function formatMirrorSourceRoot(resolvedRoot: string): string {
  * and writing through that link would both trust a plugin-authored record and
  * write into the plugin's repository. Returns whether anything changed.
  */
-export function writeMirrorSourceRoot(mirrorDir: string, resolvedRoot: string): boolean {
+function writeMirrorSourceRoot(mirrorDir: string, resolvedRoot: string): boolean {
   const file = path.join(mirrorDir, MIRROR_SOURCE_ROOT_FILE);
   const content = formatMirrorSourceRoot(resolvedRoot);
   let stat: fs.Stats | undefined;
@@ -716,7 +716,7 @@ export function writeMirrorSourceRoot(mirrorDir: string, resolvedRoot: string): 
  * `lstat`-gated to a regular file, so a symlink standing where the record
  * belongs is not followed and read as a record.
  */
-export function readMirrorSourceRoot(mirrorDir: string): string | null {
+function readMirrorSourceRoot(mirrorDir: string): string | null {
   const file = path.join(mirrorDir, MIRROR_SOURCE_ROOT_FILE);
   let stat: fs.Stats | undefined;
   try {
