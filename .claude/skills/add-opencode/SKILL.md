@@ -25,6 +25,7 @@ Use the following as an installed-state inventory:
 - `import './opencode.js';` line in `container/agent-runner/src/providers/index.ts`
 - `@opencode-ai/sdk` in `container/agent-runner/package.json`
 - `opencode-ai@${OPENCODE_VERSION}` in the pnpm global-install block in `container/Dockerfile`
+- `src/opencode-dockerfile.test.ts`
 
 Whether every item is present or some are missing, continue through the fetched
 candidate and composed-tree gates below. An installed provider must not skip
@@ -116,6 +117,13 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 ```
 
 > The container `.npmrc` allowlist is **separate** from the host's `pnpm-workspace.yaml` `onlyBuiltDependencies`. The host allowlist is human-gated per CLAUDE.md; this container-side allowlist follows the same posture (only add packages the operator explicitly wants — opencode-ai's postinstall pattern matches the existing entries).
+
+**(d)** Copy the Dockerfile guard into the host test tree and run it. The OpenCode CLI is a globally installed binary, not an importable package, so this structural test is what goes red if the `OPENCODE_VERSION` pin or the `opencode-ai@${OPENCODE_VERSION}` install line is dropped or drifts:
+
+```bash
+cp .claude/skills/add-opencode/tests/opencode-dockerfile.test.ts src/opencode-dockerfile.test.ts
+pnpm exec vitest run src/opencode-dockerfile.test.ts
+```
 
 ### 5. Add the agent-runner dependency
 
@@ -281,6 +289,7 @@ grep -q "./opencode.js" src/providers/index.ts && echo "host barrel: OK"
 grep -q "@opencode-ai/sdk" container/agent-runner/package.json && echo "agent-runner dep: OK"
 grep -q "opencode-ai@" container/Dockerfile && echo "Dockerfile install: OK"
 pnpm exec vitest run src/providers/opencode-registration.test.ts
+pnpm exec vitest run src/opencode-dockerfile.test.ts
 cd container/agent-runner && bun run test src/providers/ && cd -
 pnpm exec tsx scripts/provider-memory-contract.ts --provider opencode --require-payload
 ```
