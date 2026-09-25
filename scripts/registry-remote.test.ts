@@ -53,8 +53,9 @@ const INSTALLER_FILE = /\.(?:md|sh|[cm]?[jt]s)$/;
 const TEST_FILE = /\.test\.[cm]?[jt]s$/;
 const HARD_CODED_REGISTRY = [
   /\b(?:origin|upstream)\/(?:channels|providers):/,
-  // `git [-C <dir>] fetch [<options>] <remote> [<refspec>...]`: options may precede the remote.
-  /\bgit\b.*\bfetch\b(?:\s+-\S+)*\s+(?:origin|upstream)\s+(?:\S+\s+)*?(?:channels|providers)\b/,
+  // Any `git … fetch` naming the remote as a token and a registry branch after it: options (with or
+  // without separate values) may come anywhere before the remote.
+  /\bgit\b.*\bfetch\b.*\s['"]?(?:origin|upstream)['"]?\s(?:.*\s)?['"]?(?:channels|providers)\b/,
 ];
 const hardCodes = (line: string) => HARD_CODED_REGISTRY.some((re) => re.test(line));
 
@@ -112,6 +113,8 @@ describe('registry remote resolution', () => {
       'git fetch origin channels',
       'git fetch --prune origin channels',
       'git -C "$root" fetch --depth=1 upstream main providers',
+      'git fetch --depth 1 origin channels',
+      'git fetch --upload-pack /tmp/git-upload-pack upstream providers',
       'git show origin/channels:src/channels/github.ts > src/channels/github.ts',
       'git show upstream/providers:src/providers/codex.ts',
     ]) {
