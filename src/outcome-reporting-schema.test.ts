@@ -46,8 +46,11 @@ describe('outcome wire contract', () => {
     expect(() => renderWorkOutcome('Done.', { requestId: 4, verified: 'Checked' }, a)).toThrow();
   });
   it('keeps host and separately packaged runner validation identical', () => {
-    expect(fs.readFileSync('container/agent-runner/src/outcome-reporting-schema.ts', 'utf8')).toBe(
-      fs.readFileSync('src/outcome-reporting-schema.ts', 'utf8'),
+    // Each tree exports only what its own callers use, so `export` may differ;
+    // every other byte must match.
+    const body = (file: string) => fs.readFileSync(file, 'utf8').replace(/^export /gm, '');
+    expect(body('container/agent-runner/src/outcome-reporting-schema.ts')).toBe(
+      body('src/outcome-reporting-schema.ts'),
     );
   });
 });

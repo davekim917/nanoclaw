@@ -30,7 +30,7 @@ export function isAdmissibleOutcomeRequestSource(kind: string, content: unknown)
 }
 
 /** Opaque receipt key derived from host-owned session + inbound-row identity. */
-export function requestWorkItem(identity: TrustedRequestIdentity): string {
+function requestWorkItem(identity: TrustedRequestIdentity): string {
   if (!identity.sessionId || !identity.messageId || !Number.isSafeInteger(identity.sequence) || identity.sequence < 1)
     throw new Error('Invalid trusted request identity');
   const hash = createHash('sha256');
@@ -49,7 +49,7 @@ export function requestWorkItem(identity: TrustedRequestIdentity): string {
 }
 
 /** Durable originating identity, never an agent-invented milestone or label. */
-export function canonicalWorkItem(value: unknown): string {
+function canonicalWorkItem(value: unknown): string {
   if (typeof value !== 'string') throw new Error('workItem must be a GitHub PR/issue or original Slack request URL');
   let url: URL;
   try {

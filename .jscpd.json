@@ -25,7 +25,7 @@
     },
     {
       "files": ["src/outcome-reporting-schema.ts", "container/agent-runner/src/outcome-reporting-schema.ts"],
-      "reason": "Wire contract between host and runner, mirrored into the runner package; src/outcome-reporting-schema.test.ts asserts the copies are identical."
+      "reason": "Wire contract between host and runner, mirrored into the runner package; src/outcome-reporting-schema.test.ts asserts the copies are identical apart from `export`."
     },
     {
       "files": ["src/cli/stdin-json.ts", "container/agent-runner/src/cli/stdin-json.ts"],
