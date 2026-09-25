@@ -23,22 +23,18 @@ import { err, generateId, log, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
 
 /**
- * Fields the host's `parseMcpServerConfig` accepts. The container is untrusted,
- * so it does not validate them: the host's precheck does, before any approval
- * card, and reports a rejection to the agent as a message.
+ * Fields forwarded to the host. The container is untrusted, so it does not
+ * validate them: the host's precheck does, before any approval card, and
+ * reports a rejection to the agent as a message.
+ *
+ * Deliberately a subset of what `parseMcpServerConfig` accepts. `cwd` has no
+ * self-mod form that survives: an absolute path fails `parseCwd`
+ * (src/container-config.ts:547) and the plugin forms are stripped without a
+ * `pluginRoot` (src/container-config.ts:576). `displayName` and `description`
+ * are persisted and shown to agents, but `requestAddMcpServerHold`
+ * (src/modules/self-mod/request.ts) does not put them on the approval card.
  */
-const MCP_SERVER_FIELDS = [
-  'type',
-  'command',
-  'args',
-  'env',
-  'cwd',
-  'url',
-  'headers',
-  'instructions',
-  'displayName',
-  'description',
-] as const;
+const MCP_SERVER_FIELDS = ['type', 'command', 'args', 'env', 'url', 'headers', 'instructions'] as const;
 
 export const installPackages: McpToolDefinition = {
   tool: {
@@ -91,7 +87,7 @@ export const addMcpServer: McpToolDefinition = {
   tool: {
     name: 'add_mcp_server',
     description:
-      'Wire an EXISTING third-party MCP server into YOUR per-agent runtime config. Provide EITHER the local `command` + optional `args`/`env`/`cwd` (e.g. `npx @modelcontextprotocol/server-github`; browse options at https://mcp.so), OR the remote Streamable HTTP `url` of a hosted server (HTTPS; plain HTTP only for localhost / host.docker.internal) with optional `headers`. Requires admin approval; fire-and-forget. The host validates the request before any approval card (server name, transport fields, no credentials in the url, headers limited to known configuration headers or the OneCLI placeholder); a rejection arrives later as a message, as does the approval decision. Never ask the user for credentials or fabricate credential-setup instructions — OneCLI handles them: use `"onecli-managed"` as the placeholder value for any credential env var, header, or config field the server needs (e.g. `headers: { "Authorization": "Bearer onecli-managed" }`). After the server is installed and the container restarts, load the `onecli-gateway` skill for the full credential-handling flow (connect URLs, stubs, error recovery).',
+      'Wire an EXISTING third-party MCP server into YOUR per-agent runtime config. Provide EITHER the local `command` + optional `args`/`env` (e.g. `npx @modelcontextprotocol/server-github`; browse options at https://mcp.so), OR the remote Streamable HTTP `url` of a hosted server (HTTPS; plain HTTP only for localhost / host.docker.internal) with optional `headers`. Requires admin approval; fire-and-forget. The host validates the request before any approval card (server name, transport fields, no credentials in the url, headers limited to known configuration headers or the OneCLI placeholder); a rejection arrives later as a message, as does the approval decision. Never ask the user for credentials or fabricate credential-setup instructions — OneCLI handles them: use `"onecli-managed"` as the placeholder value for any credential env var, header, or config field the server needs (e.g. `headers: { "Authorization": "Bearer onecli-managed" }`). After the server is installed and the container restarts, load the `onecli-gateway` skill for the full credential-handling flow (connect URLs, stubs, error recovery).',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -103,7 +99,6 @@ export const addMcpServer: McpToolDefinition = {
         command: { type: 'string', description: 'Command to run a local stdio MCP server' },
         args: { type: 'array', items: { type: 'string' }, description: 'Command arguments (command only)' },
         env: { type: 'object', description: 'Environment variables for the server (command only)' },
-        cwd: { type: 'string', description: 'Absolute working directory for the server process (command only)' },
         url: {
           type: 'string',
           description:
@@ -115,8 +110,6 @@ export const addMcpServer: McpToolDefinition = {
             'HTTP headers for a remote server (url only). Credential headers must use the "onecli-managed" placeholder — the gateway substitutes the real secret at the proxy boundary.',
         },
         instructions: { type: 'string', description: 'Optional usage notes for agents that use this server' },
-        displayName: { type: 'string', description: 'Optional human-readable name for the capability list' },
-        description: { type: 'string', description: 'Optional one-line description for the capability list' },
       },
       required: ['name'],
     },

@@ -74,7 +74,7 @@ describe('add_mcp_server forwards the request for the host to validate', () => {
     });
   });
 
-  it('forwards every field the host accepts, including the ones it used to drop', async () => {
+  it('forwards the fields an approval card can show, and drops the rest', async () => {
     const { payload } = await submit({
       name: 'fs',
       type: 'stdio',
@@ -94,10 +94,7 @@ describe('add_mcp_server forwards the request for the host to validate', () => {
       command: 'mcp-fs',
       args: ['/data'],
       env: { ROOT: '/data' },
-      cwd: '/workspace/agent',
       instructions: 'Use for file reads.',
-      displayName: 'Files',
-      description: 'Local file server',
     });
     expect(
       (
