@@ -966,7 +966,6 @@ function parkedTokenIsSpent(parked: ParkedSecretWrite, nowMs: number): boolean {
   return expiresMs - nowMs <= REFRESH_MARGIN_MS;
 }
 
-/** Write `accessToken` into the integration's OneCLI bearer secret. */
 function putIntegrationBearer(
   row: McpOAuthIntegration,
   tokenType: string,
