@@ -49,6 +49,15 @@ function refreshChannelDirectory(): Promise<void> {
   return loading;
 }
 
+/**
+ * Load the directory as an adapter comes up, so the first outbound message
+ * after a restart is linked too — the transforms are synchronous and only
+ * trigger a refresh, they never wait for one.
+ */
+export function warmChannelDirectory(): void {
+  void refreshChannelDirectory();
+}
+
 function knownChannels(): KnownChannel[] {
   if (Date.now() - loadedAt > DIRECTORY_TTL_MS) void refreshChannelDirectory();
   return directory;

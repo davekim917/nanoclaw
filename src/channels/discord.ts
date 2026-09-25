@@ -28,7 +28,7 @@ import { getOwners } from '../modules/permissions/db/user-roles.js';
 import { transformOutsideProtectedRegions } from '../text-styles.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
-import { linkDiscordChannelNames } from './channel-links.js';
+import { linkDiscordChannelNames, warmChannelDirectory } from './channel-links.js';
 import type { ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
 
 interface DiscordRecoveryThread {
@@ -1014,6 +1014,7 @@ for (const ws of workspaces) {
       const identity = await fetchDiscordBotIdentity(ws.botToken);
       if (identity) {
         knownDiscordBots.set(ws.channelType, identity);
+        warmChannelDirectory();
         publishSiblingId(identity.userId);
       } else {
         log.warn('Discord bot identity unavailable — outbound @-mentions for this bot will not resolve', {
