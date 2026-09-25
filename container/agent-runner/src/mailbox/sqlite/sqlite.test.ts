@@ -153,13 +153,27 @@ describe('SQLite runner mailbox canonical serialization', () => {
     addOut.run('reply', 13, 'chat', 'slack:C1', T);
     // An ask_user_question / send_card post is outbound `chat-sdk`: visible, so it counts.
     addOut.run('card', 17, 'chat-sdk', 'slack:C1', T);
+    // A request_choice card for this conversation (route-less system row) counts;
+    // one sent `to` another channel destination does not.
+    const addSys = outbound.prepare(
+      `INSERT INTO messages_out (id, seq, kind, timestamp, content) VALUES (?, ?, 'system', '2026-01-01T00:00:00.000Z', ?)`,
+    );
+    addSys.run('choice-here', 19, JSON.stringify({ action: 'request_choice', choiceId: 'c1' }));
+    addSys.run(
+      'choice-there',
+      21,
+      JSON.stringify({ action: 'request_choice', choiceId: 'c2', platformId: 'slack:C9' }),
+    );
+    addSys.run('other-system', 23, JSON.stringify({ action: 'schedule_wake' }));
     const mailbox = new SqliteAgentMailbox();
     expect(mailbox.maxInboundSeq()).toBe(12);
-    // After the list (outbound 11, inbound 2): in-4, the reply and the card.
-    expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'slack:C1', threadId: T })).toBe(3);
+    // After the list (outbound 11, inbound 2): in-4, the reply, the card and the own-conversation choice.
+    expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'slack:C1', threadId: T })).toBe(4);
     // A channel-level conversation (null thread) matches null exactly.
-    expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'slack:C2', threadId: null })).toBe(1);
-    expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'cli:local', threadId: null })).toBe(1);
+    expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'slack:C2', threadId: null })).toBe(2);
+    expect(mailbox.countConversationMessagesAfter(11, 2, { platformId: 'cli:local', threadId: null })).toBe(2);
+    // Nothing after the choice: zero.
+    expect(mailbox.countConversationMessagesAfter(23, 12, { platformId: 'slack:C1', threadId: T })).toBe(0);
   });
 
   test('reads one inbound message route by id', () => {

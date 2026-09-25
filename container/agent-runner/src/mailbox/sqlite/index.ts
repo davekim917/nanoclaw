@@ -186,7 +186,15 @@ export class SqliteAgentMailbox implements AgentMailbox {
         "SELECT COUNT(*) AS n FROM messages_out WHERE seq > ? AND kind IN ('chat', 'chat-sdk') AND platform_id = ? AND thread_id IS ?",
       )
       .get(outboundSeq, route.platformId, route.threadId) as { n: number };
-    return inbound.n + outbound.n;
+    // A request_choice card for this session's own conversation is a route-less
+    // `system` row the host posts in-thread. Counted conservatively: a false
+    // positive only means a new list goes below instead of reusing the old post.
+    const cards = getOutboundDb()
+      .prepare(
+        "SELECT COUNT(*) AS n FROM messages_out WHERE seq > ? AND kind = 'system' AND json_extract(content, '$.action') = 'request_choice' AND json_extract(content, '$.platformId') IS NULL",
+      )
+      .get(outboundSeq) as { n: number };
+    return inbound.n + outbound.n + cards.n;
   }
 
   getInboundRouteById(id: string) {
