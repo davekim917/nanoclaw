@@ -42,7 +42,6 @@ import '../src/channels/index.js';
 import { resolveUnknownSenderPolicy, resolveWiringDefaults } from '../src/channels/channel-defaults.js';
 import { hasDeclaredChannelDefaults } from '../src/channels/channel-registry.js';
 import { DATA_DIR, GROUPS_DIR } from '../src/config.js';
-import { createAgentGroup, getAgentGroupByFolder } from '../src/db/agent-groups.js';
 import { initDb, getRawDb } from '../src/db/connection.js';
 import {
   createMessagingGroup,
@@ -59,6 +58,8 @@ import { upsertUser } from '../src/modules/permissions/db/users.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../src/db/container-configs.js';
 import { namespacedPlatformId } from '../src/platform-id.js';
 import type { AgentGroup, MessagingGroup } from '../src/types.js';
+
+import { findOrCreateAgentGroup, generateId } from './lib/bootstrap-agent-group.js';
 
 type Role = 'owner' | 'admin' | 'member';
 
@@ -151,10 +152,6 @@ function namespacedUserId(channel: string, raw: string): string {
   return raw.includes(':') ? raw : `${channel}:${raw}`;
 }
 
-function generateId(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
 async function wireIfMissing(
   mg: MessagingGroup,
   ag: AgentGroup,
@@ -229,21 +226,7 @@ async function main(): Promise<void> {
   // 2. Agent group + filesystem.
   const folder = `dm-with-${normalizeName(args.displayName)}`;
   const pickedProvider = process.env.NANOCLAW_PICKED_PROVIDER?.trim().toLowerCase();
-  let ag: AgentGroup | undefined = await getAgentGroupByFolder(folder);
-  if (!ag) {
-    const agId = generateId('ag');
-    await createAgentGroup({
-      id: agId,
-      name: args.agentName,
-      folder,
-      agent_provider: null,
-      created_at: now,
-    });
-    ag = (await getAgentGroupByFolder(folder))!;
-    console.log(`Created agent group: ${ag.id} (${folder})`);
-  } else {
-    console.log(`Reusing agent group: ${ag.id} (${folder})`);
-  }
+  const ag = await findOrCreateAgentGroup(folder, args.agentName, now);
   // Seed the config row, stamped with the effective provider: the operator's
   // setup pick (NANOCLAW_PICKED_PROVIDER) when this runs inside a setup run,
   // otherwise the persisted instance default. Workspace scaffolding is deferred

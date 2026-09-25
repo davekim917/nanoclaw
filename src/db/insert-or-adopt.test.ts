@@ -179,6 +179,11 @@ const ALLOWLIST: Array<{ path: string; reason: string }> = [
     reason: 'Single-process bootstrap script; no concurrent peer exists to race with.',
   },
   {
+    path: 'scripts/lib/bootstrap-agent-group.ts',
+    reason:
+      'Find-or-create shared by the two single-process bootstrap scripts above; no concurrent peer exists to race with.',
+  },
+  {
     path: 'scripts/seed-discord.ts',
     reason: 'Single-process dev seed script; no concurrent peer exists to race with.',
   },

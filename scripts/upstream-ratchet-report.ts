@@ -589,6 +589,24 @@ function renderRow(row: Row): string {
   return `  ${row.verdict.padEnd(9)} ${row.path.padEnd(58)} ${n(row.before)} → ${n(row.after)} (${sign})${note}`;
 }
 
+function printVerdictGroups(rows: Row[]): void {
+  for (const verdict of ORDER) {
+    const group = rows.filter((r) => r.verdict === verdict);
+    if (group.length === 0) continue;
+    console.log(`${verdict} (${n(group.length)})`);
+    for (const row of group) console.log(renderRow(row));
+    console.log('');
+  }
+}
+
+function printTotals(after: ReturnType<typeof counts>, sha: string): void {
+  console.log(
+    `${n(after.total)} upstream-owned files at ${sha.slice(0, 8)}: ` +
+      `${n(after.modified)} modified, ${n(after.deleted)} deleted in fork, ` +
+      `${n(after.identical)} byte-identical, ${n(after.binary)} binary`,
+  );
+}
+
 function counts(manifest: UpstreamRatchetManifest): {
   total: number;
   divergent: number;
@@ -861,23 +879,13 @@ function runCheck(options: Options): never {
         `Commit-source measurement: ignored-path detection and untracked-shadow checking do not apply to a ` +
         `bare ref and are skipped.\n`,
     );
-    for (const verdict of ORDER) {
-      const group = rows.filter((r) => r.verdict === verdict);
-      if (group.length === 0) continue;
-      console.log(`${verdict} (${n(group.length)})`);
-      for (const row of group) console.log(renderRow(row));
-      console.log('');
-    }
+    printVerdictGroups(rows);
     if (currencyFindings.length > 0) {
       console.log(`STALE-MANIFEST (${n(currencyFindings.length)})`);
       for (const f of currencyFindings) console.log(renderCurrencyFinding(f));
       console.log('');
     }
-    console.log(
-      `${n(after.total)} upstream-owned files at ${sha.slice(0, 8)}: ` +
-        `${n(after.modified)} modified, ${n(after.deleted)} deleted in fork, ` +
-        `${n(after.identical)} byte-identical, ${n(after.binary)} binary`,
-    );
+    printTotals(after, sha);
     console.log(`UNCHANGED ${n(rows.filter((r) => r.verdict === 'UNCHANGED').length)}   (measured in ${elapsedMs} ms)`);
     console.log(summary);
 
@@ -1030,18 +1038,8 @@ function main(): void {
           `. Every number below moves for upstream's reasons, not the fork's.\n`,
       );
     }
-    for (const verdict of ORDER) {
-      const group = rows.filter((r) => r.verdict === verdict);
-      if (group.length === 0) continue;
-      console.log(`${verdict} (${n(group.length)})`);
-      for (const row of group) console.log(renderRow(row));
-      console.log('');
-    }
-    console.log(
-      `${n(after.total)} upstream-owned files at ${sha.slice(0, 8)}: ` +
-        `${n(after.modified)} modified, ${n(after.deleted)} deleted in fork, ` +
-        `${n(after.identical)} byte-identical, ${n(after.binary)} binary`,
-    );
+    printVerdictGroups(rows);
+    printTotals(after, sha);
     console.log(`UNCHANGED ${n(rows.filter((r) => r.verdict === 'UNCHANGED').length)}   (measured in ${elapsedMs} ms)`);
     console.log(summary);
   }
