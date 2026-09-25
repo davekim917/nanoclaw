@@ -8,7 +8,7 @@
  *
  * WHY `flock(2)` AND NOT AN `O_EXCL` LOCK FILE. Node has no synchronous
  * `flock`, so an in-process lock file (`fs.openSync(p, 'wx')` plus a PID
- * staleness check, as `codex-sync-watcher.ts:161` does for its singleton guard)
+ * staleness check, as `codex-sync-watcher.ts` does for its singleton guard)
  * is the tempting alternative and is wrong for data integrity:
  *
  *   - It LEAKS on `kill -9`. The kernel releases an flock when the holding fd
@@ -21,7 +21,7 @@
  *
  * The cost is a `flock` child process per acquisition (~5ms). `flock` is
  * already a hard host prerequisite: `ncl`'s single-host ownership claim shells
- * out to it (`src/cli/socket-server.ts:74`, which fails setup with an install
+ * out to it (`src/cli/socket-server.ts`, which fails setup with an install
  * hint when it is missing) and `container/build.sh` serializes rebuilds with
  * it. This adds no dependency.
  */
@@ -35,7 +35,7 @@ import path from 'path';
  * a lock whose path can be redirected is not a lock, and locking a FIFO blocks
  * forever rather than failing.
  */
-export function openStableRegularFile(file: string): { fd: number; created: boolean } {
+function openStableRegularFile(file: string): { fd: number; created: boolean } {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   let fd: number;
   let created = true;

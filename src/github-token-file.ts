@@ -81,7 +81,7 @@ export function githubTokenDeliveredAsEnv(env: NodeJS.ProcessEnv = process.env, 
   return githubTokenInEnv(env) || !containerRunsAsHostUser(uid);
 }
 
-export function groupTokenDir(agentGroupId: string, dataDir: string = DATA_DIR): string {
+function groupTokenDir(agentGroupId: string, dataDir: string = DATA_DIR): string {
   // The id becomes a path segment. Ids are host-generated (`ag-<ms>-<rand>`),
   // but a traversal here would let one group's spawn write over another's token
   // file, so refuse anything that is not a single plain segment.

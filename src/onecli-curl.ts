@@ -19,7 +19,7 @@
  * put in an error message here.
  *
  * `curl` rather than `fetch` is not negotiable on this path: host `fetch` must
- * never traverse the gateway proxy (`src/onecli-secrets.ts:97`).
+ * never traverse the gateway proxy (`src/onecli-secrets.ts`).
  */
 import { ONECLI_API_KEY } from './config.js';
 

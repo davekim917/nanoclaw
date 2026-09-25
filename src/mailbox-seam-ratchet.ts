@@ -24,7 +24,7 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 export const RATCHET_SCAN_ROOTS: readonly string[] = ['src', 'container/agent-runner/src'];
 
 /** Directories exempt from the scan — the mailbox driver and its fork module. */
-export const RATCHET_EXCLUDED_DIRS: readonly string[] = [
+const RATCHET_EXCLUDED_DIRS: readonly string[] = [
   'src/mailbox/sqlite',
   'src/modules/mailbox',
   'container/agent-runner/src/mailbox/sqlite',
@@ -48,8 +48,7 @@ export const RATCHET_EXCLUDED_DIRS: readonly string[] = [
  *    .claude/skills/add-dashboard/resources/dashboard-pusher.ts here
  *    verbatim. That resource does raw session-DB reads for the dashboard's
  *    own message-volume charts; migrating it onto NanoclawAgentMailbox isn't
- *    buildable in this PR — the seam doesn't exist yet (host: PR 2, runner:
- *    R1). Tracked as a real, deliberate exclusion, not an oversight: this
+ *    buildable here. Tracked as a real, deliberate exclusion, not an oversight: this
  *    ratchet covers the mailbox-seam migration's own surface, not every
  *    skill-installed resource with its own install lifecycle and test file
  *    (dashboard-pusher.test.ts, alongside it in the skill resources dir).
@@ -70,7 +69,7 @@ const RAW_OPENER_NAMES = [
   'outboundDbPath',
   'getInboundDb',
   'getOutboundDb',
-  // The mailbox module's two transitional handle accessors. PR 7 deleted them,
+  // The mailbox module's two transitional handle accessors, now deleted;
   // and these entries stay as the tripwire: a caller that moves onto
   // withMailboxSession but then hands the open handle to a helper has not
   // finished migrating, and reintroducing an accessor under either name would
@@ -136,8 +135,8 @@ function blankComments(src: string): string {
 
 function matchesPatternA(src: string): boolean {
   // (a) the literal 'session-db' appears anywhere in the file (comments already
-  // stripped). Broadened from "an import from a path ending in session-db.js"
-  // (PR #249 review round 5): a static-import-shaped regex misses a dynamic
+  // stripped). Broadened from "an import from a path ending in session-db.js":
+  // a static-import-shaped regex misses a dynamic
   // `await import('.../session-db.js')`, a destructured re-export, or an alias
   // — a whole-file substring check covers all of those in one rule, so there is
   // no import-shape evasion of this class left to find.
@@ -147,7 +146,7 @@ function matchesPatternA(src: string): boolean {
 function matchesPatternB(src: string): boolean {
   // (b) any raw opener/path-helper name appears anywhere in the file as a whole
   // word (comments already stripped). Broadened from "an import of any raw
-  // opener/path helper name" (PR #249 review round 5, same reasoning as (a)):
+  // opener/path helper name" (same reasoning as (a)):
   // covers static imports, dynamic import() with destructuring, and re-export
   // aliases in one rule.
   const re = new RegExp(`\\b(?:${RAW_OPENER_NAMES.join('|')})\\b`);

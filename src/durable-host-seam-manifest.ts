@@ -16,18 +16,18 @@
  * src/host-lifecycle-seam-manifest.ts and src/mailbox-seam-manifest.ts.
  * See docs/specs/upstream-restart-survival-seam/plan.md §7.A.
  */
-import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { hashFilesAtGitSha } from './seam-manifest-git.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const MANIFEST_PATH = path.join(REPO_ROOT, 'src/durable-host-seam/UPSTREAM-MANIFEST.json');
 
 /**
  * The two coordination files taken verbatim. Both compile against the fork
- * unchanged because seam 3 PR 1 landed upstream's async `DbDriver` byte-identical
+ * unchanged because upstream's async `DbDriver` landed byte-identical
  * (plan §3.5, divergence 6) — the fork adds nothing to either file, so
  * byte-equality is the right invariant rather than a divergence measurement.
  *
@@ -41,50 +41,12 @@ export interface DurableHostSeamManifest {
   files: Record<string, string>;
 }
 
-function sha256(content: Buffer | string): string {
-  return createHash('sha256').update(content).digest('hex');
-}
-
-/** Hashes the working tree's current copy of every UPSTREAM_FILES entry. */
-export function computeManifest(upstream: string): DurableHostSeamManifest {
-  const files: Record<string, string> = {};
-  for (const relPath of UPSTREAM_FILES) {
-    const abs = path.join(REPO_ROOT, relPath);
-    if (!fs.existsSync(abs)) {
-      throw new Error(`durable-host-seam-manifest: UPSTREAM_FILES entry missing from the working tree: ${relPath}`);
-    }
-    files[relPath] = sha256(fs.readFileSync(abs));
-  }
-  return { upstream, files: sortKeys(files) };
-}
-
 /** Hashes upstream's copy of every UPSTREAM_FILES entry at the given sha, via `git show`. */
 export function computeManifestFromGit(upstreamSha: string): DurableHostSeamManifest {
-  const files: Record<string, string> = {};
-  for (const relPath of UPSTREAM_FILES) {
-    let content: Buffer;
-    try {
-      content = execFileSync('git', ['show', `${upstreamSha}:${relPath}`], {
-        cwd: REPO_ROOT,
-        maxBuffer: 64 * 1024 * 1024,
-      });
-    } catch (err) {
-      throw new Error(
-        `durable-host-seam-manifest: ${relPath} not found at upstream ${upstreamSha} (git show failed): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-        { cause: err },
-      );
-    }
-    files[relPath] = sha256(content);
-  }
-  return { upstream: upstreamSha, files: sortKeys(files) };
-}
-
-function sortKeys(files: Record<string, string>): Record<string, string> {
-  const sorted: Record<string, string> = {};
-  for (const key of Object.keys(files).sort()) sorted[key] = files[key];
-  return sorted;
+  return {
+    upstream: upstreamSha,
+    files: hashFilesAtGitSha('durable-host-seam-manifest', REPO_ROOT, upstreamSha, UPSTREAM_FILES),
+  };
 }
 
 export function readManifest(): DurableHostSeamManifest {

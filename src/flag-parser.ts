@@ -20,7 +20,7 @@
  */
 
 /** Normalized effort values accepted by the SDK's Options.effort. */
-export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 const VALID_EFFORT: ReadonlySet<string> = new Set<EffortLevel>(['low', 'medium', 'high', 'xhigh', 'max']);
 
 /**

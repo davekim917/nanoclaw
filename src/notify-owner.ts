@@ -16,7 +16,7 @@
  * agent path is undeliverable in exactly the case those watchdogs exist to
  * report. Worse, `sock.sendall()` returns success unconditionally — there is
  * no ack frame on this path — so a script had no way to tell "delivered" from
- * "queued into a hole" (fork #538, #556's review).
+ * "queued into a hole".
  *
  * This module posts directly to Slack's Web API and only reports success on
  * a verified `ok: true` response. It has no dependency on nanoclaw-v2 being
@@ -53,8 +53,8 @@ import { formatLocalStamp, isValidTimezone } from './timezone.js';
 
 /**
  * This install's root, derived from THIS FILE's location — deliberately not
- * the cwd-derived paths in `src/config.ts` (`PROJECT_ROOT = process.cwd()`,
- * config.ts:60). Every caller happens to `cd` first, but an alerting
+ * the cwd-derived paths in `src/config.ts` (`PROJECT_ROOT = process.cwd()`).
+ * Every caller happens to `cd` first, but an alerting
  * primitive must not read a different install's central DB or `.env`
  * because someone invoked it from elsewhere: the failure mode is a silent
  * exit 2 ("no owner DM") at the exact moment an alert matters.
@@ -66,7 +66,7 @@ import { formatLocalStamp, isValidTimezone } from './timezone.js';
 export const INSTALL_ROOT = path.resolve(fileURLToPath(import.meta.url), '..', '..');
 export const OWNER_DB_PATH = path.join(INSTALL_ROOT, 'data', 'v2.db');
 
-export interface OwnerDm {
+interface OwnerDm {
   platformId: string;
   channelType: string;
 }
@@ -79,7 +79,7 @@ export interface OwnerDm {
  * silences the alert even though a perfectly good DM sits behind it.
  * Read-only; never creates or migrates the DB.
  */
-export function resolveOwnerDms(dbPath: string): OwnerDm[] {
+function resolveOwnerDms(dbPath: string): OwnerDm[] {
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
   try {
     return db
@@ -101,11 +101,11 @@ export function resolveOwnerDms(dbPath: string): OwnerDm[] {
  * The install timezone, resolved from THIS install's `.env` rather than
  * `src/config.ts`'s `TIMEZONE`, which is a module-level constant built from
  * `process.cwd()` at import time. Same precedence and the same exported
- * validator as `resolveConfigTimezone` (config.ts:228) — only the `.env` it
+ * validator as `resolveConfigTimezone` (config.ts) — only the `.env` it
  * reads differs. config.ts is upstream-owned, so parameterizing it there
  * would grow the divergence ratchet for a two-caller helper.
  */
-export function resolveInstallTimezone(rootDir: string): string {
+function resolveInstallTimezone(rootDir: string): string {
   const candidates = [process.env.TZ, readEnvValue(rootDir, 'TZ'), Intl.DateTimeFormat().resolvedOptions().timeZone];
   for (const tz of candidates) if (tz && isValidTimezone(tz)) return tz;
   return 'UTC';

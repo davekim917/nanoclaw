@@ -11,7 +11,7 @@
  */
 
 /** Content fields only a host note may carry: the origin marker and its purpose tag. */
-export const HOST_ONLY_FIELDS = ['origin', 'event'] as const;
+const HOST_ONLY_FIELDS = ['origin', 'event'] as const;
 
 /**
  * Content field carrying the platform-native id of the specific inbound
@@ -34,16 +34,15 @@ export const HOST_ONLY_FIELDS = ['origin', 'event'] as const;
  * chat write — an agent's own tool call, an agent-to-agent delivery — can set
  * this field on itself and have it survive.
  */
-export const PLATFORM_MSG_ID_FIELD = 'platformMsgId';
+const PLATFORM_MSG_ID_FIELD = 'platformMsgId';
 
 /**
  * The message kinds the runner marks. formatSingleChat renders the fields above,
- * and it formats only the chat and chat-sdk batch (formatter.ts:322, passed to
+ * and it formats only the chat and chat-sdk batch (formatter.ts, passed to
  * formatChatMessages). Other kinds keep same-named fields that mean something
- * else, e.g. a webhook row's `event`, which formatWebhookMessage renders
- * (formatter.ts:534-537).
+ * else, e.g. a webhook row's `event`, which formatWebhookMessage renders.
  */
-export const HOST_MARKED_KINDS: readonly string[] = ['chat', 'chat-sdk'];
+const HOST_MARKED_KINDS: readonly string[] = ['chat', 'chat-sdk'];
 
 /**
  * Drop the host-only fields (HOST_ONLY_FIELDS) from JSON-object content of a

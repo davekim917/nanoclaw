@@ -16,11 +16,11 @@
  * — the logic lives here (under src/, so src/*.test.ts can import it: the host
  * tsconfig's rootDir is src/), scripts/mailbox-seam-manifest.ts is a thin CLI shim.
  */
-import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { hashFilesAtGitSha } from './seam-manifest-git.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const MANIFEST_PATH = path.join(REPO_ROOT, 'src/mailbox/UPSTREAM-MANIFEST.json');
@@ -131,7 +131,7 @@ export const UNPORTABLE_UPSTREAM_FILES: ReadonlyArray<{
  * occurrence's original slot. See docs/specs/upstream-mailbox-seam/plan.md.
  *
  * container/agent-runner/src/mailbox/sqlite/connection.ts: diverged in e4cefa3c8
- * (#588) to add refuseProductionSessionDbUnderTest() and its call from
+ * to add refuseProductionSessionDbUnderTest() and its call from
  * getOutboundDb, so a test that skipped initTestSessionDb() can no longer
  * silently create the production-path session DB.
  */
@@ -145,50 +145,12 @@ export interface MailboxSeamManifest {
   files: Record<string, string>;
 }
 
-function sha256(content: Buffer | string): string {
-  return createHash('sha256').update(content).digest('hex');
-}
-
-/** Hashes the working tree's current copy of every UPSTREAM_FILES entry. */
-export function computeManifest(upstream: string): MailboxSeamManifest {
-  const files: Record<string, string> = {};
-  for (const relPath of UPSTREAM_FILES) {
-    const abs = path.join(REPO_ROOT, relPath);
-    if (!fs.existsSync(abs)) {
-      throw new Error(`mailbox-seam-manifest: UPSTREAM_FILES entry missing from the working tree: ${relPath}`);
-    }
-    files[relPath] = sha256(fs.readFileSync(abs));
-  }
-  return { upstream, files: sortKeys(files) };
-}
-
 /** Hashes upstream's copy of every UPSTREAM_FILES entry at the given sha, via `git show`. */
 export function computeManifestFromGit(upstreamSha: string): MailboxSeamManifest {
-  const files: Record<string, string> = {};
-  for (const relPath of UPSTREAM_FILES) {
-    let content: Buffer;
-    try {
-      content = execFileSync('git', ['show', `${upstreamSha}:${relPath}`], {
-        cwd: REPO_ROOT,
-        maxBuffer: 64 * 1024 * 1024,
-      });
-    } catch (err) {
-      throw new Error(
-        `mailbox-seam-manifest: ${relPath} not found at upstream ${upstreamSha} (git show failed): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-        { cause: err },
-      );
-    }
-    files[relPath] = sha256(content);
-  }
-  return { upstream: upstreamSha, files: sortKeys(files) };
-}
-
-function sortKeys(files: Record<string, string>): Record<string, string> {
-  const sorted: Record<string, string> = {};
-  for (const key of Object.keys(files).sort()) sorted[key] = files[key];
-  return sorted;
+  return {
+    upstream: upstreamSha,
+    files: hashFilesAtGitSha('mailbox-seam-manifest', REPO_ROOT, upstreamSha, UPSTREAM_FILES),
+  };
 }
 
 export function readManifest(): MailboxSeamManifest {

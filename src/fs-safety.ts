@@ -5,7 +5,7 @@ import path from 'path';
  * Fail closed when any existing component below `parent` is a symlink or is
  * not a directory. Missing descendants are safe for a later mkdir operation.
  */
-export function isNonSymlinkDirectoryChain(parent: string, ...components: string[]): boolean {
+function isNonSymlinkDirectoryChain(parent: string, ...components: string[]): boolean {
   let parentStat: fs.Stats;
   try {
     parentStat = fs.lstatSync(parent);
