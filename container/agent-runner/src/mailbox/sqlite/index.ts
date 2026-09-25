@@ -45,7 +45,7 @@ import type {
   ProcessingStatus,
 } from '../types.js';
 
-function inboundMessage(row: MessageInRow): InboundMessage {
+export function inboundMessage(row: MessageInRow): InboundMessage {
   return parseInboundRecord({
     id: row.id,
     sequence: row.seq,

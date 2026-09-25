@@ -8,26 +8,7 @@ import type {
   StateRecord,
 } from './model.generated.js';
 
-export type {
-  ContainerRecord,
-  DeliveryRecord,
-  DestinationRecord,
-  DirectOutboundWrite,
-  InboundRecord,
-  InboundStatus,
-  InboundWrite,
-  IsoTimestamp,
-  OutboundDelivery,
-  OutboundRecord,
-  OutboundWrite,
-  ProcessingAckRecord,
-  ProcessingStatus,
-  SessionRoutingRecord,
-  StateRecord,
-  TaskRecord,
-  TaskStatus,
-  TaskWrite,
-} from './model.generated.js';
+export type { OutboundWrite, ProcessingStatus } from './model.generated.js';
 
 export interface MailboxSessionKey {
   agentGroupId: string;
