@@ -2328,24 +2328,23 @@ describe('CLAUDE_CODE_OAUTH_LANES reaches the container', () => {
 // ── OAuth scope declaration ──────────────────────────────────────────────────
 // Same source-level guard, same reason it is needed, different silence.
 //
-// When the CLI authenticates from CLAUDE_CODE_OAUTH_TOKEN it has no stored
-// credential to read scopes from, so it synthesises one and defaults its
-// scopes to ["user:inference"]. Plan utilization is gated behind
-// `user:profile`: with the default the CLI answers `rate_limits_available:
-// false` and never attempts the lookup, so every usage_pull sample lands with
-// a NULL utilization and nothing anywhere reports an error. Verified against
-// the shipped CLI binary and reproduced end to end — same token, same proxy,
-// scopes undeclared -> no windows, declared -> five_hour + seven_day.
+// Every ring slot is a `claude setup-token` credential scoped `user:inference`
+// only. When the CLI authenticates from CLAUDE_CODE_OAUTH_TOKEN it takes the
+// token's scopes from CLAUDE_CODE_OAUTH_SCOPES, so declaring `user:profile`
+// makes it call profile-scoped endpoints (/api/oauth/usage among them) that
+// answer 403 for these tokens and then 429 once the 403s exhaust the per-token
+// limiter. Plan utilization comes from the response headers instead
+// (`rate_limit_event.unifiedWindows`), which need only `user:inference`.
 describe('CLAUDE_CODE_OAUTH_SCOPES reaches the container', () => {
   const source = fs
     .readFileSync(path.join(import.meta.dirname, 'container-runner.ts'), 'utf8')
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/(^|[^:])\/\/.*$/gm, '$1');
 
-  it('declares user:profile alongside user:inference on the forwarded token', () => {
-    // Both scopes matter: `user:inference` gates ii(), `user:profile` gates
-    // the utilization read. Dropping either puts the pull back to silent.
-    expect(source).toMatch(/args\.push\(\s*'-e',\s*'CLAUDE_CODE_OAUTH_SCOPES=user:inference user:profile'/);
+  it('declares user:inference alone on the forwarded token', () => {
+    expect(source).toMatch(/args\.push\(\s*'-e',\s*'CLAUDE_CODE_OAUTH_SCOPES=user:inference'\s*\)/);
+    // No code path may claim a scope these tokens do not hold.
+    expect(source).not.toContain('user:profile');
   });
 
   it('declares them only where a host OAuth token is forwarded', () => {
@@ -2356,43 +2355,11 @@ describe('CLAUDE_CODE_OAUTH_SCOPES reaches the container', () => {
     expect(oauthBlock.indexOf('CLAUDE_CODE_OAUTH_SCOPES')).toBeLessThan(oauthBlock.indexOf('const ghToken'));
   });
 
-  // The host's plan-utilization survey rides the same block as the ring it
-  // describes. Volume and correctness are pinned in slot-usage-survey.test.ts;
-  // what can only be checked here is that the push is not stranded on some
-  // other branch — #810's lesson, where a pin emitted from one of two spawn
-  // branches regressed the other one silently.
-  it('pushes NANOCLAW_SLOT_USAGE_SURVEY from the same block that forwards the ring', () => {
-    const oauthBlock = source.slice(source.indexOf('if (hostOauth) {'), source.indexOf('const ghToken'));
-    expect(oauthBlock).toMatch(
-      /args\.push\(\s*'-e',\s*`NANOCLAW_SLOT_USAGE_SURVEY=\$\{encodeSlotUsageSurvey\(survey\)\}`/,
-    );
-    expect(oauthBlock).toContain('ringSlotsForSurvey(hostOauth, auth.oauthFallbacks)');
-  });
-
-  it('pushes it unconditionally, so an absent variable is a wiring bug and an empty one is cold start', () => {
-    const oauthBlock = source.slice(source.indexOf('if (hostOauth) {'), source.indexOf('const ghToken'));
-    const push = oauthBlock.slice(oauthBlock.indexOf('NANOCLAW_SLOT_USAGE_SURVEY'));
-    // No `if (`/ternary between the survey read and its push.
-    const between = oauthBlock.slice(
-      oauthBlock.indexOf('slotUsageSurveyForSpawn'),
-      oauthBlock.indexOf('NANOCLAW_SLOT_USAGE_SURVEY'),
-    );
-    expect(between).not.toMatch(/\bif\s*\(/);
-    expect(push).toBeTruthy();
-  });
-
-  it('derives the credential set ONCE, so the survey cache and the sample rows cannot be filed under different sets', () => {
-    const oauthBlock = source.slice(source.indexOf('if (hostOauth) {'), source.indexOf('const ghToken'));
-    const occurrences = oauthBlock.match(/auth\.oauthScoped \? `group:\$\{credentialFolder\}` : 'global'/g) ?? [];
-    expect(occurrences).toHaveLength(1);
-    expect(oauthBlock).toContain('NANOCLAW_OAUTH_CREDENTIAL_SET=${oauthCredentialSet}');
-    expect(oauthBlock).toContain('slotUsageSurveyForSpawn(oauthCredentialSet, surveySlots)');
-  });
-
-  it('never awaits the survey refresh on the spawn path — a usage pull cannot delay or fail a spawn', () => {
-    const oauthBlock = source.slice(source.indexOf('if (hostOauth) {'), source.indexOf('const ghToken'));
-    expect(oauthBlock).toContain('void refreshed;');
-    expect(oauthBlock).not.toContain('await refreshed');
+  it('no longer surveys /api/oauth/usage or forwards a survey to the container', () => {
+    // The host survey could never succeed with these tokens (403, then 429).
+    expect(source).not.toContain('NANOCLAW_SLOT_USAGE_SURVEY');
+    expect(source).not.toContain('slot-usage-survey');
+    expect(source).not.toContain('/api/oauth/usage');
   });
 });
 

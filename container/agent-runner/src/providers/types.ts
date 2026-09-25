@@ -134,14 +134,6 @@ export interface AgentProvider {
   restorePersistedCredentialSlot?(): void;
 
   /**
-   * Record the host's per-slot plan-utilization survey as sample rows
-   * (`ClaudeProvider.recordSlotUsageSurvey`). Telemetry only — it never
-   * changes which credential is active. The runner entrypoint calls it once,
-   * right after the restore.
-   */
-  recordSlotUsageSurvey?(): void;
-
-  /**
    * Optional pre-resume maintenance. Given the stored continuation token,
    * decide whether its backing transcript has grown too large or too old to
    * resume cheaply. Return a non-null reason string to tell the caller to drop

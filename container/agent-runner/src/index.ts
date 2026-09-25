@@ -306,9 +306,6 @@ async function main(): Promise<void> {
   // may now read the credential slot a previous container of this session
   // rotated onto.
   provider.restorePersistedCredentialSlot?.();
-  // Record every slot's plan utilization from the host survey. Telemetry
-  // only — slots are used in numbered order, never chosen by usage.
-  provider.recordSlotUsageSurvey?.();
 
   const stopResourceTelemetry = startResourceTelemetry(log);
   try {

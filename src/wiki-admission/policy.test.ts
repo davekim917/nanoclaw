@@ -165,6 +165,9 @@ describe('maintenance authority', () => {
     );
     expect(env.NANOCLAW_WIKI_MAINTENANCE).toBe('1');
     expect(env.GH_TOKEN).toBeUndefined();
+    // setup-token credentials carry user:inference only; claiming user:profile
+    // makes the CLI call endpoints that 403 and then 429 for these tokens.
+    expect(env.CLAUDE_CODE_OAUTH_SCOPES).toBe('user:inference');
   });
   it('private runtime mounts no mutable group source, repository or shared memory', () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'wiki-runtime-'));

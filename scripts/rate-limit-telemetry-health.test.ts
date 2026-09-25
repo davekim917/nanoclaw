@@ -23,10 +23,7 @@ import {
   type TelemetryHealthReport,
 } from './rate-limit-telemetry-health.js';
 
-const RUNNER_SCHEMA = path.resolve(
-  import.meta.dirname,
-  '../container/agent-runner/src/modules/mailbox/schema.ts',
-);
+const RUNNER_SCHEMA = path.resolve(import.meta.dirname, '../container/agent-runner/src/modules/mailbox/schema.ts');
 
 /**
  * Extract the production DDL. A failure here is loud on purpose: silently
@@ -62,7 +59,8 @@ function makeRoot(): string {
 
 interface SampleRow {
   ts: string;
-  source: 'usage_pull' | 'rate_limit_event';
+  source: 'usage_pull' | 'rate_limit_event' | 'rate_limit_headers';
+  account?: string | null;
   credentialSet?: string | null;
   limitType?: string | null;
   status?: string | null;
@@ -87,7 +85,7 @@ function writeSessionDb(root: string, group: string, session: string, rows: Samp
     stmt.run(
       r.ts,
       r.source,
-      'CLAUDE_CODE_OAUTH_TOKEN',
+      r.account === undefined ? 'CLAUDE_CODE_OAUTH_TOKEN' : r.account,
       r.credentialSet === undefined ? 'codex:.codex' : r.credentialSet,
       null,
       null,
@@ -110,7 +108,10 @@ function writeTablelessSessionDb(root: string, group: string, session: string): 
   return file;
 }
 
-function scan(root: string, overrides: Partial<Parameters<typeof scanRateLimitTelemetry>[0]> = {}): TelemetryHealthReport {
+function scan(
+  root: string,
+  overrides: Partial<Parameters<typeof scanRateLimitTelemetry>[0]> = {},
+): TelemetryHealthReport {
   return scanRateLimitTelemetry({
     sessionsRoot: root,
     sinceIso: SINCE,
@@ -159,6 +160,54 @@ describe('scanRateLimitTelemetry — the asymmetry', () => {
 
     expect(report.findings).toEqual([]);
     expect(pairFor(report, 'group-healthy')?.verdict).toBe('ok');
+  });
+
+  // Claude's reading since the /api/oauth/usage pull was retired: per-window
+  // rows parsed from the same event's unifiedWindows. A Claude pair with no
+  // usage_pull row at all must read as healthy, not NEVER.
+  it('counts rate_limit_headers rows as the Claude read path working', () => {
+    const root = makeRoot();
+    writeSessionDb(root, 'group-claude', 'sess-1', [
+      { ts: '2026-09-15T01:40:00.000Z', source: 'rate_limit_event', credentialSet: 'global' },
+      { ts: '2026-09-15T01:40:00.000Z', source: 'rate_limit_headers', credentialSet: 'global', limitType: 'five_hour' },
+      { ts: '2026-09-15T01:40:00.000Z', source: 'rate_limit_headers', credentialSet: 'global', limitType: 'seven_day' },
+    ]);
+
+    const report = scan(root);
+
+    expect(report.findings).toEqual([]);
+    expect(pairFor(report, 'group-claude')).toMatchObject({ verdict: 'ok', pushRows: 1, pullRows: 2 });
+  });
+
+  it('fires when events keep landing but their windows stop — a CLI that dropped unifiedWindows', () => {
+    const root = makeRoot();
+    writeSessionDb(root, 'group-claude-dropped', 'sess-1', [
+      { ts: '2026-09-12T09:00:00.000Z', source: 'rate_limit_headers', credentialSet: 'global' },
+      { ts: '2026-09-15T01:40:00.000Z', source: 'rate_limit_event', credentialSet: 'global' },
+    ]);
+
+    expect(pairFor(scan(root), 'group-claude-dropped')).toMatchObject({
+      verdict: 'stale',
+      lastPullEver: '2026-09-12T09:00:00.000Z',
+    });
+  });
+
+  // A Claude API-key / Bedrock / Vertex session has no slot and no credential
+  // set, and its events never carry windows: nothing is missing, so nothing fires.
+  it('does not judge pushes from a session with no OAuth identity', () => {
+    const root = makeRoot();
+    writeSessionDb(root, 'group-api-key', 'sess-1', [
+      { ts: '2026-09-15T01:40:00.000Z', source: 'rate_limit_event', account: null, credentialSet: null },
+    ]);
+    // A Codex row with an unknown account still has its credential set, and stays judged.
+    writeSessionDb(root, 'group-codex-no-account', 'sess-1', [
+      { ts: '2026-09-15T01:40:00.000Z', source: 'rate_limit_event', account: null },
+    ]);
+
+    const report = scan(root);
+
+    expect(pairFor(report, 'group-api-key')).toBeUndefined();
+    expect(pairFor(report, 'group-codex-no-account')?.verdict).toBe('never');
   });
 
   it('counts a pull that came back unsampled as the read path working', () => {
@@ -526,9 +575,7 @@ describe('source hygiene', () => {
     // it silently matched nothing. This file shipped two during development
     // (the pair-key separator); `KEY_SEP` is an escape sequence for that
     // reason, and this pins it.
-    const source = fs.readFileSync(
-      path.resolve(import.meta.dirname, 'rate-limit-telemetry-health.ts'),
-    );
+    const source = fs.readFileSync(path.resolve(import.meta.dirname, 'rate-limit-telemetry-health.ts'));
     expect(source.includes(0)).toBe(false);
   });
 });

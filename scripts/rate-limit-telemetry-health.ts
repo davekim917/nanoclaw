@@ -1,19 +1,22 @@
 /**
  * Read-path health for rate-limit telemetry (`rate_limit_samples`).
  *
- * WHY THIS EXISTS. `rate_limit_samples` is written by two independent paths
- * (`container/agent-runner/src/modules/mailbox/rate-limit-samples.ts:20`):
+ * WHY THIS EXISTS. `rate_limit_samples` is written by a push path and a
+ * per-window READING path (`RateLimitSampleSource`,
+ * `container/agent-runner/src/modules/mailbox/rate-limit-samples.ts`):
  *
- *   - `rate_limit_event` — a PUSH. The provider volunteers it mid-turn.
- *   - `usage_pull`       — a PULL. The runner asks, at bind and on a throttle.
+ *   - `rate_limit_event`   — the PUSH. The provider volunteers it mid-turn.
+ *   - `usage_pull`         — Codex's reading: the runner asks, at bind and on
+ *                            a throttle.
+ *   - `rate_limit_headers` — Claude's reading: one row per plan window from the
+ *                            same event's `unifiedWindows`
+ *                            (`rateLimitEventToSamples`, providers/claude.ts).
+ *                            A Claude pair has no new `usage_pull` rows.
  *
- * Both are deliberately fail-open telemetry: a failed pull logs and writes
- * NOTHING. Claude's `samplePlanUsage` only `.catch(log)`s
- * (`container/agent-runner/src/providers/claude.ts:300-301`), its per-slot pick
- * returns `samples: null` on a throw
- * (`container/agent-runner/src/providers/claude.ts:2352-2354`), and Codex's
- * tracker never reaches its `record` call when the read rejects
- * (`container/agent-runner/src/providers/codex-rate-limit-tracker.ts:232`).
+ * Both readings are deliberately fail-open telemetry. Codex's tracker never
+ * reaches its `record` call when the read rejects, and Claude's parser writes
+ * no window row when the CLI stops sending `unifiedWindows` or changes its
+ * shape — while the push row keeps landing.
  * Container logs then vanish with the container (`--rm`).
  *
  * So a dead read path leaves no error anywhere a human will meet by accident,
@@ -25,10 +28,12 @@
  *
  * THE SIGNAL is that asymmetry, scoped to the unit the credentials belong to:
  * an (agent group, `credential_set`) pair that is PUSHING inside the window
- * but has landed NO pull row in it. `credential_set` is the discriminator the
- * rows already carry — `codex:<home>` for Codex, `global` / `group:<folder>`
- * for Claude (schema.ts:85-88) — so one rule covers both providers without
- * this script knowing anything about provider configuration.
+ * but has landed NO reading row (`usage_pull` or `rate_limit_headers`) in it;
+ * "pull" below means either reading source. `credential_set` is the
+ * discriminator the rows already carry — `codex:<home>` for Codex, `global` /
+ * `group:<folder>` for Claude (the `rate_limit_samples` DDL notes) — so one
+ * rule covers both providers without this script knowing anything about
+ * provider configuration.
  *
  * WHAT IT DELIBERATELY DOES NOT DO.
  *   - It does not fire on silence. A pair with no push rows in the window is
@@ -36,7 +41,7 @@
  *     writes neither kind of row), and a fleet that is merely quiet are
  *     indistinguishable from here, and none of them is a symptom.
  *   - It does not judge the CONTENT of a pull row. A pull that lands but comes
- *     back `unsampled`/`not_applicable` (schema.ts:103-112) counts as the read
+ *     back `unsampled`/`not_applicable` (its `status` column) counts as the read
  *     path working; the #811 HTTP-429 shape is a different defect with a
  *     different remedy, and rows exist for it to be queried directly.
  *   - It does not read the central DB, `container.json`, or any provider
@@ -93,9 +98,9 @@ export interface TelemetryPair {
   verdict: PairVerdict;
   /** `rate_limit_event` rows in the window. */
   pushRows: number;
-  /** `usage_pull` rows in the window. */
+  /** Reading rows (`READING_SOURCES`) in the window. */
   pullRows: number;
-  /** Most recent `usage_pull` row of any age, or null if none exists. */
+  /** Most recent reading row of any age, or null if none exists. */
   lastPullEver: string | null;
   /** Most recent `rate_limit_event` row in the window. */
   lastPushInWindow: string | null;
@@ -185,6 +190,22 @@ interface PerSessionRow {
 }
 
 /**
+ * The reading sources — either one landing counts as the read path working.
+ * Codex writes `usage_pull`; Claude writes `rate_limit_headers` (its older
+ * `usage_pull` rows still count toward `last_pull_ever`).
+ */
+const READING_SOURCES = ['usage_pull', 'rate_limit_headers'] as const;
+const READING_SOURCES_SQL = READING_SOURCES.map((s) => `'${s}'`).join(', ');
+
+/**
+ * A push that can be judged. A Claude API-key, Bedrock or Vertex session has
+ * no OAuth slot and no credential set, and never carries header windows, so
+ * its pushes have no reading to be missing. A Codex row always has a
+ * credential set, even when its account is unknown.
+ */
+const JUDGED_PUSH_SQL = `source = 'rate_limit_event' AND NOT (account IS NULL AND credential_set IS NULL)`;
+
+/**
  * Both sides of the comparison go through `datetime()` per the house rule
  * (CLAUDE.md, Timestamps). That rule has one sharp edge: `datetime()` answers
  * NULL for a value it cannot parse, and `NULL >= x` is false, so a malformed
@@ -193,10 +214,10 @@ interface PerSessionRow {
  */
 const PER_SESSION_SQL = `
   SELECT credential_set,
-         SUM(CASE WHEN source = 'rate_limit_event' AND datetime(ts) >= datetime(?) THEN 1 ELSE 0 END) AS push_rows,
-         SUM(CASE WHEN source = 'usage_pull'       AND datetime(ts) >= datetime(?) THEN 1 ELSE 0 END) AS pull_rows,
-         MAX(CASE WHEN source = 'usage_pull'       THEN ts END)                                       AS last_pull_ever,
-         MAX(CASE WHEN source = 'rate_limit_event' AND datetime(ts) >= datetime(?) THEN ts END)       AS last_push_in_window
+         SUM(CASE WHEN ${JUDGED_PUSH_SQL} AND datetime(ts) >= datetime(?) THEN 1 ELSE 0 END)                    AS push_rows,
+         SUM(CASE WHEN source IN (${READING_SOURCES_SQL}) AND datetime(ts) >= datetime(?) THEN 1 ELSE 0 END) AS pull_rows,
+         MAX(CASE WHEN source IN (${READING_SOURCES_SQL}) THEN ts END)                                         AS last_pull_ever,
+         MAX(CASE WHEN ${JUDGED_PUSH_SQL} AND datetime(ts) >= datetime(?) THEN ts END)                          AS last_push_in_window
     FROM rate_limit_samples
    GROUP BY credential_set
 `;
@@ -495,9 +516,11 @@ export function formatHumanReport(report: TelemetryHealthReport, timezone: strin
 
   if (report.findings.length > 0) {
     out.push('');
-    out.push(`${report.findings.length} finding(s): the pull path landed no sample while the push path kept writing.`);
-    out.push('  NEVER = no usage_pull row has ever existed for that pair (the #817 shape).');
-    out.push('  STALE = pulls landed before the window but none inside it.');
+    out.push(
+      `${report.findings.length} finding(s): the reading path landed no sample while the push path kept writing.`,
+    );
+    out.push('  NEVER = no usage_pull / rate_limit_headers row has ever existed for that pair (the #817 shape).');
+    out.push('  STALE = readings landed before the window but none inside it.');
   }
 
   if (report.errors.length > 0) {

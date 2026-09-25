@@ -1,12 +1,12 @@
 /**
  * Account-level rate-limit utilization samples (outbound.db, container-owned).
  *
- * Why this exists: the SDK's `rate_limit_event` is emitted ONLY when there is
- * something to warn about, so utilization readings existed only for accounts
- * already past ~84%. Live, exactly one agent group had any readings at all and
- * the heaviest group had none — no baseline, no trajectory. The `/usage`
- * control request (see providers/claude.ts) is a PULL and reports every
- * window for every account regardless.
+ * Why this exists: the top-level `rate_limit_event` utilization is set ONLY
+ * once there is something to warn about, so it gave readings only for
+ * accounts already past ~84% — no baseline, no trajectory. Claude now records
+ * every window from the same event's `unifiedWindows` (parsed by the CLI from
+ * the response headers; `rateLimitEventToSamples` in providers/claude.ts), and
+ * Codex reads `account/rateLimits/read` (providers/codex-rate-limit-tracker.ts).
  *
  * Shape rationale, `available` semantics, and the 0-1 utilization convention
  * are documented on RATE_LIMIT_SAMPLES_DDL in schema.ts.
@@ -16,8 +16,20 @@
  */
 import { getOutboundDb } from '../../mailbox/sqlite/connection.js';
 
-/** Which capture path produced the row. Both are kept; the pull is primary. */
-export type RateLimitSampleSource = 'usage_pull' | 'rate_limit_event';
+/**
+ * Which capture path produced the row.
+ *
+ *   - `rate_limit_event`   — the event's top-level reading (Claude and Codex);
+ *                            carries the SDK `status`.
+ *   - `rate_limit_headers` — Claude only: one row per plan window from the
+ *                            same event's `unifiedWindows`, which the CLI reads
+ *                            from the `anthropic-ratelimit-unified-*` response
+ *                            headers. No request of its own.
+ *   - `usage_pull`         — Codex's `account/rateLimits/read`. Claude rows
+ *                            with this source are old: its `/api/oauth/usage`
+ *                            pull needs a scope its tokens do not hold.
+ */
+export type RateLimitSampleSource = 'usage_pull' | 'rate_limit_event' | 'rate_limit_headers';
 
 /**
  * Who a sample is about. `account` alone is NOT an identity — the host
