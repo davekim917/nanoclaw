@@ -58,5 +58,3 @@
  * still rejects anything outside it.
  */
 export const INBOUND_KINDS = ['chat', 'chat-sdk', 'system', 'task', 'webhook'] as const;
-
-export type InboundKind = (typeof INBOUND_KINDS)[number];

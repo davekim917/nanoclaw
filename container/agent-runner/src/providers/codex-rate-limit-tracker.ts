@@ -39,9 +39,9 @@ import {
  * turn; the read is awaited (bounded below) because the park decision needs it
  * BEFORE the turn starts to be worth anything.
  */
-export const CODEX_RATE_LIMITS_REFRESH_MS = 5 * 60_000;
+const CODEX_RATE_LIMITS_REFRESH_MS = 5 * 60_000;
 /** Deadline for one read, so a read that never answers cannot hold the turn. */
-export const CODEX_RATE_LIMITS_READ_TIMEOUT_MS = 10_000;
+const CODEX_RATE_LIMITS_READ_TIMEOUT_MS = 10_000;
 
 export interface CodexRateLimitTrackerDeps {
   read: (server: AppServer, timeoutMs: number) => Promise<CodexRateLimitsReadResponse>;

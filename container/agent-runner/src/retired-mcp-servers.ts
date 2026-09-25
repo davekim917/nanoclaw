@@ -10,7 +10,7 @@
  * (docs/slack-user-token.md), so dropping the
  * name here removes no capability.
  */
-export const RETIRED_MCP_SERVER_NAMES: ReadonlySet<string> = new Set(['slack-user-token']);
+const RETIRED_MCP_SERVER_NAMES: ReadonlySet<string> = new Set(['slack-user-token']);
 
 /**
  * Remove every retired name from the merged server map, in place, logging each

@@ -38,7 +38,7 @@ export const CHURN_GATE_SCRIPT_PATHS = [
 export const CHURN_GATE_SCRIPT_ENV = 'NANOCLAW_REVIEW_CHURN_GATE_SCRIPT';
 
 /** Exit status the skill's gate uses for REFRAME REQUIRED. */
-export const REFRAME_REQUIRED_EXIT = 3;
+const REFRAME_REQUIRED_EXIT = 3;
 
 /**
  * The gate is asked about the identity the caller has pinned, never about the
@@ -126,7 +126,7 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-export function refusalMessage(
+function refusalMessage(
   gateText: string,
   script: string,
   identity: { branch: string; head: string; force?: boolean; lease?: string },

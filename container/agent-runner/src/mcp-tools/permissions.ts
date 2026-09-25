@@ -47,7 +47,7 @@ function ok(text: string) {
   return { content: [{ type: 'text' as const, text }] };
 }
 
-export const grantAccessTool: McpToolDefinition = {
+const grantAccessTool: McpToolDefinition = {
   tool: {
     name: 'grant_access',
     description:
@@ -85,7 +85,7 @@ export const grantAccessTool: McpToolDefinition = {
   },
 };
 
-export const revokeAccessTool: McpToolDefinition = {
+const revokeAccessTool: McpToolDefinition = {
   tool: {
     name: 'revoke_access',
     description:
@@ -116,7 +116,7 @@ export const revokeAccessTool: McpToolDefinition = {
   },
 };
 
-export const listAccessTool: McpToolDefinition = {
+const listAccessTool: McpToolDefinition = {
   tool: {
     name: 'list_access',
     description:
@@ -141,6 +141,6 @@ export const listAccessTool: McpToolDefinition = {
   },
 };
 
-export const permissionTools: McpToolDefinition[] = [grantAccessTool, revokeAccessTool, listAccessTool];
+const permissionTools: McpToolDefinition[] = [grantAccessTool, revokeAccessTool, listAccessTool];
 
 registerTools(permissionTools);

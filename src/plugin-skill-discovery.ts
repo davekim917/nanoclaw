@@ -716,7 +716,7 @@ export const MIRROR_MARKER = '.nanoclaw-managed';
  * and the cleanup pass deletes a managed dir whose name is not a desired skill,
  * which every support dir's is not.
  */
-export const MIRROR_SOURCE_ROOT_FILE = '.nanoclaw-source-root';
+const MIRROR_SOURCE_ROOT_FILE = '.nanoclaw-source-root';
 
 /** Names this mirror owns in its own dirs. A plugin child using one is never mirrored. */
 export const MIRROR_OWNED_CHILDREN: ReadonlySet<string> = new Set([MIRROR_MARKER, MIRROR_SOURCE_ROOT_FILE]);
@@ -728,7 +728,7 @@ export const MIRROR_OWNED_CHILDREN: ReadonlySet<string> = new Set([MIRROR_MARKER
  * truncate the record — a real Linux basename may contain one
  * (`docs/review-notes/826.md`, the segment-rule rounds).
  */
-export function formatMirrorSourceRoot(resolvedRoot: string): string {
+function formatMirrorSourceRoot(resolvedRoot: string): string {
   return `${JSON.stringify(resolvedRoot)}\n`;
 }
 

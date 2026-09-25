@@ -91,7 +91,7 @@ const PRIORITY_ORDER = `CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 EL
 
 // ---- Tool definitions ----
 
-export const addShipLog: McpToolDefinition = {
+const addShipLog: McpToolDefinition = {
   tool: {
     name: 'add_ship_log',
     description:
@@ -128,7 +128,7 @@ export const addShipLog: McpToolDefinition = {
   },
 };
 
-export const addBacklogItem: McpToolDefinition = {
+const addBacklogItem: McpToolDefinition = {
   tool: {
     name: 'add_backlog_item',
     description: 'Add an item to the backlog.',
@@ -171,7 +171,7 @@ export const addBacklogItem: McpToolDefinition = {
   },
 };
 
-export const updateBacklogItem: McpToolDefinition = {
+const updateBacklogItem: McpToolDefinition = {
   tool: {
     name: 'update_backlog_item',
     description: 'Update a backlog item. Pass the itemId from list_backlog.',
@@ -215,7 +215,7 @@ export const updateBacklogItem: McpToolDefinition = {
   },
 };
 
-export const deleteBacklogItem: McpToolDefinition = {
+const deleteBacklogItem: McpToolDefinition = {
   tool: {
     name: 'delete_backlog_item',
     description: 'Delete a backlog item.',
@@ -237,7 +237,7 @@ export const deleteBacklogItem: McpToolDefinition = {
   },
 };
 
-export const listBacklog: McpToolDefinition = {
+const listBacklog: McpToolDefinition = {
   tool: {
     name: 'list_backlog',
     description: 'List backlog items for the current agent group. Optionally filter by status.',
@@ -296,7 +296,7 @@ export const listBacklog: McpToolDefinition = {
   },
 };
 
-export const getActivitySummary: McpToolDefinition = {
+const getActivitySummary: McpToolDefinition = {
   tool: {
     name: 'get_activity_summary',
     description:

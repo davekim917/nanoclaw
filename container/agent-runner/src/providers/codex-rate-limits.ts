@@ -22,7 +22,7 @@
  */
 import type { AccountIdentity, RateLimitSample, RateLimitSampleSource } from '../modules/mailbox/index.js';
 
-export interface CodexRateLimitWindow {
+interface CodexRateLimitWindow {
   /** Integer 0-100 (required by the schema). */
   usedPercent: number;
   /** Epoch seconds (int64). Nullable. */
@@ -36,7 +36,7 @@ export interface CodexRateLimitWindow {
  * newer app-server adds still parks (any non-null value is "reached") and is
  * recorded verbatim rather than dropped.
  */
-export type CodexRateLimitReachedType =
+type CodexRateLimitReachedType =
   | 'rate_limit_reached'
   | 'workspace_owner_credits_depleted'
   | 'workspace_member_credits_depleted'

@@ -238,7 +238,7 @@ export function parseHooksJsonPreservingNumbers(text: string): unknown {
 }
 
 /** A `"type": "command"` handler as it appears in a hooks.json group. */
-export interface CodexCommandHookHandler {
+interface CodexCommandHookHandler {
   type: 'command';
   command: string;
   commandWindows?: string | null;
@@ -255,7 +255,7 @@ export interface CodexCommandHookHandler {
  * `input` carries `#[serde(default)]` and NO `skip_serializing_if`, so unlike
  * the `Option` fields it is present in the hashed document even when empty.
  */
-export interface CodexMcpToolHookHandler {
+interface CodexMcpToolHookHandler {
   type: 'mcp_tool';
   server: string;
   tool: string;
@@ -266,7 +266,7 @@ export interface CodexMcpToolHookHandler {
 
 export type CodexHookHandler = CodexCommandHookHandler | CodexMcpToolHookHandler;
 
-export interface CodexHookGroup {
+interface CodexHookGroup {
   matcher?: string | null;
   hooks?: unknown[];
 }

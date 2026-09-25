@@ -34,7 +34,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export const askUserQuestion: McpToolDefinition = {
+const askUserQuestion: McpToolDefinition = {
   tool: {
     name: 'ask_user_question',
     description:
@@ -129,7 +129,7 @@ export const askUserQuestion: McpToolDefinition = {
   },
 };
 
-export const sendCard: McpToolDefinition = {
+const sendCard: McpToolDefinition = {
   tool: {
     name: 'send_card',
     description:

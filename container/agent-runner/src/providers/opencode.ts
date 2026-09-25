@@ -1200,7 +1200,7 @@ async function ensureSharedRuntime(
   return sharedInit;
 }
 
-export function destroySharedRuntime(): void {
+function destroySharedRuntime(): void {
   if (sharedRuntime) {
     try {
       sharedRuntime.streamRelease();

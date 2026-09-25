@@ -35,7 +35,7 @@ export const TASK_LIST_RENDER_MAX = 2000;
 /** A list older than this, with conversation below it, is reposted at the bottom. */
 export const TASK_LIST_REPOST_AFTER_MS = 15 * 60 * 1000;
 /** How much conversation below the list counts as "busy". */
-export const TASK_LIST_REPOST_MIN_MESSAGES = 2;
+const TASK_LIST_REPOST_MIN_MESSAGES = 2;
 /**
  * Discord caps edits to a message older than 1 hour (API error 30046), so a
  * Discord list is reposted before then — while its old copy can still be
@@ -43,7 +43,7 @@ export const TASK_LIST_REPOST_MIN_MESSAGES = 2;
  */
 export const TASK_LIST_DISCORD_REPOST_AFTER_MS = 50 * 60 * 1000;
 
-export type TaskItemStatus = 'pending' | 'in_progress' | 'done';
+type TaskItemStatus = 'pending' | 'in_progress' | 'done';
 
 export interface TaskItem {
   text: string;
@@ -142,7 +142,7 @@ export function parseTaskListInput(args: Record<string, unknown>): TaskListInput
  * both the clock time AND "(25 minutes ago)" client-side, so the footer ages
  * without an edit; anything else gets a fixed local time.
  */
-export function renderTime(channelType: string, iso: string, timezone = TIMEZONE): string {
+function renderTime(channelType: string, iso: string, timezone = TIMEZONE): string {
   const unix = Math.floor(Date.parse(iso) / 1000);
   const local = new Date(iso).toLocaleTimeString('en-US', {
     timeZone: timezone,
@@ -191,7 +191,7 @@ export function renderSubtext(channelType: string, updatedAt: string, interrupte
 }
 
 /** The item the agent is on right now, for the platform's "is working…" status line. */
-export function activeText(items: TaskItem[]): string | null {
+function activeText(items: TaskItem[]): string | null {
   const active = items.find((item) => item.status === 'in_progress');
   return active ? active.text : null;
 }
@@ -216,7 +216,7 @@ export function latestListLink(
   return `https://slack.com/archives/${channel}/p${platformMessageId.replace('.', '')}${query}`;
 }
 
-export function supersededText(link: string | null): string {
+function supersededText(link: string | null): string {
   return link ? `[Latest task list →](${link})` : 'Latest task list ↓';
 }
 

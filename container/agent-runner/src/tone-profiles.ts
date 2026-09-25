@@ -19,8 +19,8 @@
 import fs from 'fs';
 import path from 'path';
 
-export const GROUP_TONE_DIR = '/workspace/tone-profiles-group';
-export const SHARED_TONE_DIR = '/workspace/tone-profiles';
+const GROUP_TONE_DIR = '/workspace/tone-profiles-group';
+const SHARED_TONE_DIR = '/workspace/tone-profiles';
 
 export const WRITING_RULES_FILE = 'writing-rules.md';
 export const SELECTION_GUIDE_FILE = 'selection-guide.md';
@@ -38,7 +38,7 @@ export function isSafeProfileName(name: string): boolean {
 }
 
 /** Absolute path of `<name>.md`, or null when no mount has it. */
-export function resolveToneProfilePath(name: string, dirs: string[] = SEARCH_DIRS): string | null {
+function resolveToneProfilePath(name: string, dirs: string[] = SEARCH_DIRS): string | null {
   if (!isSafeProfileName(name)) return null;
   for (const dir of dirs) {
     const candidate = path.join(dir, `${name}.md`);

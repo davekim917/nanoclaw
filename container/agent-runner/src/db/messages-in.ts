@@ -119,8 +119,3 @@ export function findQuestionResponse(questionId: string): MessageInRow | undefin
   const message = getAgentMailbox().operations.findQuestionResponse(questionId);
   return message && messageRow(message);
 }
-
-export function findCliResponse(requestId: string): MessageInRow | undefined {
-  const message = getAgentMailbox().operations.findCliResponse(requestId);
-  return message && messageRow(message);
-}

@@ -70,7 +70,7 @@ export const OUTBOUND_DB_PATH = '/workspace/outbound.db';
  *    deliberate resilience — restricting it turns a soft delay into a hard
  *    stall until the window resets.
  */
-export const RATE_LIMIT_SAMPLES_DDL = `
+const RATE_LIMIT_SAMPLES_DDL = `
   CREATE TABLE IF NOT EXISTS rate_limit_samples (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     ts                TEXT NOT NULL,

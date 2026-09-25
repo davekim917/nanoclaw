@@ -92,7 +92,7 @@ export function findCapabilityService(
   return { missing: true };
 }
 
-export const getCapabilitiesTool: McpToolDefinition = {
+const getCapabilitiesTool: McpToolDefinition = {
   tool: {
     name: 'get_capabilities',
     description:
@@ -164,6 +164,6 @@ export function readCapabilities(args: Record<string, unknown>, snapshotPath: st
   return ok(JSON.stringify(payload, null, 2));
 }
 
-export const capabilitiesTools: McpToolDefinition[] = [getCapabilitiesTool];
+const capabilitiesTools: McpToolDefinition[] = [getCapabilitiesTool];
 
 registerTools(capabilitiesTools);

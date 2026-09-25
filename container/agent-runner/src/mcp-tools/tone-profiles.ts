@@ -25,7 +25,7 @@ function ok(text: string) {
   return { content: [{ type: 'text' as const, text }] };
 }
 
-export const getToneProfileTool: McpToolDefinition = {
+const getToneProfileTool: McpToolDefinition = {
   tool: {
     name: 'get_tone_profile',
     description:
@@ -57,7 +57,7 @@ export const getToneProfileTool: McpToolDefinition = {
   },
 };
 
-export const listToneProfilesTool: McpToolDefinition = {
+const listToneProfilesTool: McpToolDefinition = {
   tool: {
     name: 'list_tone_profiles',
     description:
@@ -80,6 +80,6 @@ export const listToneProfilesTool: McpToolDefinition = {
   },
 };
 
-export const toneProfileTools: McpToolDefinition[] = [getToneProfileTool, listToneProfilesTool];
+const toneProfileTools: McpToolDefinition[] = [getToneProfileTool, listToneProfilesTool];
 
 registerTools(toneProfileTools);

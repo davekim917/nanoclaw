@@ -14,7 +14,6 @@
 import type { HookCallback } from '@anthropic-ai/claude-agent-sdk';
 
 import {
-  SDK_DISALLOWED_TOOLS,
   preToolUseHook,
   postToolUseHook,
   createBashCommandRewriteHook,
@@ -521,7 +520,7 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
 /**
  * Run the PostToolUse hook chain. Always clears the in-flight tracker.
  */
-export async function runPostToolUseChain(input: CodexHookInput): Promise<unknown> {
+async function runPostToolUseChain(input: CodexHookInput): Promise<unknown> {
   const normalized = normalizeCodexHookInput(input);
 
   await postToolUseHook(
@@ -548,6 +547,3 @@ export async function runHookForCodex(eventName: HookEvent, input: CodexHookInpu
       return { continue: true };
   }
 }
-
-/** Re-export for tests. */
-export { SDK_DISALLOWED_TOOLS };

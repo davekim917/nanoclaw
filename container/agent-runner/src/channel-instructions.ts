@@ -24,7 +24,7 @@
 import fs from 'fs';
 import path from 'path';
 
-export const CHANNEL_INSTRUCTIONS_DIR = '/workspace/channel-instructions';
+const CHANNEL_INSTRUCTIONS_DIR = '/workspace/channel-instructions';
 
 /**
  * The name indexes a filename, and it arrives from the host as an env string,

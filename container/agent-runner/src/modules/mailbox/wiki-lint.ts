@@ -11,9 +11,8 @@
 import { Database } from 'bun:sqlite';
 
 import { getOutboundDb, openInboundDb } from '../../mailbox/sqlite/connection.js';
+import { OUTBOUND_DB_PATH } from './schema.js';
 import { isMailboxTestMode } from './test-mode.js';
-
-const OUTBOUND_DB_PATH = '/workspace/outbound.db';
 
 interface TaskIdRow {
   id: string;

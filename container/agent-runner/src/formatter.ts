@@ -11,7 +11,7 @@ import { TIMEZONE, formatLocalTime, formatLocalDateTimeFull } from './timezone.j
  * - passthrough: pass raw to the agent (no XML wrapping)
  * - none: not a command — format normally
  */
-export type CommandCategory = 'admin' | 'filtered' | 'passthrough' | 'none';
+type CommandCategory = 'admin' | 'filtered' | 'passthrough' | 'none';
 
 const ADMIN_COMMANDS = new Set([
   '/remote-control',

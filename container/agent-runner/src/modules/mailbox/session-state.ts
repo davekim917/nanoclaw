@@ -391,7 +391,7 @@ const PRIMARY_RETRY_REQUEST_KEY = 'primary_retry_requested_at';
  * one honest attempt, then the ordinary cooldown does its job. A user who
  * genuinely waits and asks again gets a second attempt.
  */
-export const PRIMARY_RETRY_REQUEST_COOLDOWN_MS = 30 * 60 * 1000;
+const PRIMARY_RETRY_REQUEST_COOLDOWN_MS = 30 * 60 * 1000;
 
 /**
  * Claim the right to ask the host for the primary provider back, at most once

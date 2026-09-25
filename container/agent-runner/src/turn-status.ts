@@ -201,7 +201,7 @@ export function isOwnConversation(channelType?: string | null, platformId?: stri
  * Reads the routing from the inbound DB, so it answers the same in the MCP
  * subprocess as in poll-loop.
  */
-export function isTaskOutput(channelType?: string | null, platformId?: string | null): boolean {
+function isTaskOutput(channelType?: string | null, platformId?: string | null): boolean {
   if (!channelType || !platformId || channelType === 'agent') return false;
   // FAILS CLOSED: a routing read that throws must cost a decoration, never
   // the send it decorates.

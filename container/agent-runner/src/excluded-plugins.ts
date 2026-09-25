@@ -24,7 +24,7 @@ import fs from 'fs';
 
 import { splitExcludedPlugins, validateExcludePlugins, type ExcludedPlugins } from './plugin-exclusions.js';
 
-export const CONTAINER_CONFIG_PATH = '/workspace/agent/container.json';
+const CONTAINER_CONFIG_PATH = '/workspace/agent/container.json';
 
 function log(msg: string): void {
   console.error(`[excluded-plugins] ${msg}`);
