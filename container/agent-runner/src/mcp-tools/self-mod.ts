@@ -28,11 +28,10 @@ import type { McpToolDefinition } from './types.js';
  * reports a rejection to the agent as a message.
  *
  * Deliberately a subset of what `parseMcpServerConfig` accepts. `cwd` has no
- * self-mod form that survives: an absolute path fails `parseCwd`
- * (src/container-config.ts:547) and the plugin forms are stripped without a
- * `pluginRoot` (src/container-config.ts:576). `displayName` and `description`
- * are persisted and shown to agents, but `requestAddMcpServerHold`
- * (src/modules/self-mod/request.ts) does not put them on the approval card.
+ * self-mod form that survives: the host's `parseCwd` rejects an absolute path
+ * and its `validateMcpServers` strips the plugin forms without a `pluginRoot`.
+ * `displayName` and `description` are persisted and shown to agents, but the
+ * host's `requestAddMcpServerHold` does not put them on the approval card.
  */
 const MCP_SERVER_FIELDS = ['type', 'command', 'args', 'env', 'url', 'headers', 'instructions'] as const;
 
