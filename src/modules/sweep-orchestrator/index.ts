@@ -1,5 +1,5 @@
 /**
- * Sweep family: orchestrator, dormant (seam 2, S2-PR5).
+ * Sweep family: orchestrator, dormant.
  *
  * T6 orchestrator-reconciler (tick:post-session, order 10), T18 task-watchdog
  * (tick:post-session, order 25) and T14 completed-task-auto-archive
@@ -17,7 +17,7 @@
  * T18's and T14's own bodies live in sibling files (task-watchdog.ts,
  * auto-archive.ts) rather than here, so the acceptance-case suite can import
  * them directly without pulling in this file's dependency on host-sweep.ts —
- * the same split S2-PR4 used for steer-idempotency.ts.
+ * the same split as steer-idempotency.ts.
  *
  * Registers at import — this module has no other consumer. It is imported by
  * src/modules/index.ts (production boot) and, for hermetic coverage, by
@@ -33,7 +33,7 @@ import { runReconcilerSweep } from '../orchestrator-dispatch/reconciler.js';
 import { autoArchiveOldCompleted } from './auto-archive.js';
 import { sweepTaskWatchdog } from './task-watchdog.js';
 
-export function registerOrchestratorSweepDuties(): void {
+function registerOrchestratorSweepDuties(): void {
   const id = SWEEP_DUTY_INVENTORY;
 
   // ── tick:post-session — container state is now current ─────────────────────

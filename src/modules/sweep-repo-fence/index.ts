@@ -1,5 +1,5 @@
 /**
- * Repo-fence + approvals-scan sweep family (seam 2, PR 8 — G08).
+ * Repo-fence + approvals-scan sweep family.
  *
  * Registers two `tick`-phase duties at import:
  *   - T5  `approvals-reason-sweep`      (tick:housekeeping, order 10)
@@ -7,21 +7,18 @@
  *
  * Both were already thin wrappers around a body that lives outside
  * `host-sweep.ts` in its own module (`../../repo-fence-recovery.js`,
- * `../approvals/index.js`), so only the registration wrapper moves here —
- * plan.md §4.7 step 2's "the wrapper moves too" case. Neither underlying
- * module moves: `repo-fence-recovery.ts` is also imported directly by
- * `src/main.ts` (startup pass) and `src/delivery.ts` /
+ * `../approvals/index.js`), so only the registration wrapper lives here.
+ * `repo-fence-recovery.ts` is also imported directly by `src/main.ts`
+ * (startup pass) and `src/delivery.ts` /
  * `src/modules/repository-workspaces/job-runner.ts` (dropped-message
- * recovery), both outside this family PR's ownership boundary.
+ * recovery).
  *
  * Registered via `registerSweepDutySource('sweep-repo-fence', ...)` rather
- * than a bare import-time `registerSweepDuty` call: PR 2's registry replays
+ * than a bare import-time `registerSweepDuty` call: the registry replays
  * every recorded source's registrar on `_resetSweepRegistryForTesting()`'s
  * default reset, so this family's two duties survive a test-file reset
- * instead of being silently dropped (found while building this PR — see
- * `src/host-sweep-registry.test.ts`'s "duty registration sources" case).
- * `registerSweepRepoFenceDuties` stays exported for that test file to
- * reference directly if ever needed.
+ * instead of being silently dropped (see `src/host-sweep-registry.test.ts`'s
+ * "duty registration sources" case).
  */
 import { log } from '../../log.js';
 import { SWEEP_DUTY_INVENTORY, registerSweepDuty, registerSweepDutySource } from '../../host-sweep.js';
@@ -30,7 +27,7 @@ import type { Session } from '../../types.js';
 
 const id = SWEEP_DUTY_INVENTORY;
 
-export function registerSweepRepoFenceDuties(): void {
+function registerSweepRepoFenceDuties(): void {
   registerSweepDuty({
     name: id.T22,
     phase: 'tick:post-session',

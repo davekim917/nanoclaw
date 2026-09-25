@@ -1,5 +1,5 @@
 /**
- * Per-session core — S2-PR9 (docs/specs/upstream-host-sweep-seam/plan.md).
+ * Per-session core.
  *
  * The four duties every swept session runs regardless of what else is true of
  * it: the processing_ack sync (S2) and stale-pending expiry (S3) that open the
@@ -121,7 +121,7 @@ function resetStuckProcessingRows(mailbox: NanoclawMailboxSession, session: Sess
 // follow-up list (one name, two surfaces).
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function registerSessionCoreSweepDuties(): void {
+function registerSessionCoreSweepDuties(): void {
   const id = SWEEP_DUTY_INVENTORY;
 
   registerSweepDuty({
@@ -175,7 +175,7 @@ export function registerSessionCoreSweepDuties(): void {
     run: (ctx) => {
       const { session, mailbox } = asSessionContext(ctx);
       // Ownership, not just liveness: a container still SPAWNING is about to
-      // own outbound.db, and this reset writes it (mailbox seam PR 5, 7199be48).
+      // own outbound.db, and this reset writes it.
       // Ownership short-circuits BEFORE the claim read: a live container clears
       // its own claims, and this duty does nothing at all for one — the case
       // below pins that no mailbox op is even reached. The guard on the write
@@ -199,12 +199,12 @@ export function registerSessionCoreSweepDuties(): void {
       const { session, mailbox, alive, hasOutbound } = asSessionContext(ctx);
       // `alive` is sampled in W1, BEFORE this tail window opened, so it cannot
       // authorize a write to outbound.db ON ITS OWN — re-checked here,
-      // immediately before the reset, with no await in between (7199be48).
+      // immediately before the reset, with no await in between.
       // Both conditions, not just the fresh one: `alive` stays the phase
       // decision this duty has always made (a live container clears its own
-      // claims), and the ownership check is the added TOCTOU close. PR 5
-      // replaced `alive` outright because there it was a local; here it is part
-      // of the session-context contract other duties read.
+      // claims), and the ownership check is the added TOCTOU close. `alive`
+      // stays because it is part of the session-context contract other duties
+      // read.
       if (!alive && hasOutbound) {
         writeOutboundWhenStopped(session, mailbox!, () =>
           resetStuckProcessingRows(mailbox!, session, 'container not running'),

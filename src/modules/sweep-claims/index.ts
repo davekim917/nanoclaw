@@ -1,6 +1,5 @@
 /**
- * Sweep family: claims (seam 2, S2-PR6 — plan.md §5 "S2-PR6 claims + storage +
- * egress (G48/G45/G64)", §8 "S2-PR6 — claims, storage, egress"). Registers
+ * Sweep family: claims. Registers
  * T20 (claims-reconcile, order 100) and T21 (claims-self-heal, order 110) on
  * `tick:housekeeping` — both housekeeping duties, but the order between them
  * is load-bearing (plan.md §4.3 constraint 3): a claim whose pull request has
@@ -29,7 +28,7 @@ import { log } from '../../log.js';
 import { reconcileMergedClaims } from '../claims/reconcile.js';
 import { sweepClaimsSelfHeal } from '../claims/self-heal.js';
 
-export function registerClaimsSweepDuties(): void {
+function registerClaimsSweepDuties(): void {
   const id = SWEEP_DUTY_INVENTORY;
 
   registerSweepDuty({

@@ -1,6 +1,5 @@
 /**
- * T14 completed-task-auto-archive duty body (seam 2, S2-PR5) — moved out of
- * src/host-sweep.ts unchanged. Kept in its own file, sibling to index.ts, so
+ * T14 completed-task-auto-archive duty body. Kept in its own file, sibling to index.ts, so
  * the acceptance-case suite (orchestrator.test.ts) can import it directly
  * without pulling in host-sweep.ts's whole registry import graph.
  *

@@ -1,10 +1,10 @@
 /**
- * Container health — S2-PR10 (docs/specs/upstream-host-sweep-seam/plan.md).
+ * Container health.
  *
  * Owns the `session:health` chain's first and last branches (S11 provider
  * self-heal, S14 running-container SLA) plus the SLA observation hook that
  * rides inside S14's own observe session (S16 OOM / memory-pressure notice).
- * S12/S13 (the two idle reaps, S2-PR3's family) stay registered in
+ * S12/S13 (the two idle reaps, the sweep-idle-reap family) stay registered in
  * `host-sweep.ts` at orders 20/30 in between — the exclusive chain's order
  * is heal (10) → idle-task-reap (20) → idle-chat-reap (30) → SLA (40,
  * fallthrough), and this module owns only the two ends of it.
@@ -85,7 +85,7 @@ const oomKillObserver = new OomKillObserver();
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Consecutive `failed` observations required before acting. */
-export const PROVIDER_HEAL_CONSECUTIVE_TICKS = 2;
+const PROVIDER_HEAL_CONSECUTIVE_TICKS = 2;
 export const PROVIDER_HEAL_MAX_ATTEMPTS = 2;
 export const PROVIDER_HEAL_COOLDOWN_MS = 10 * 60 * 1000;
 const PROVIDER_HEAL_ID_PREFIX = 'provider-heal-';
@@ -129,7 +129,7 @@ export function countProviderHealAttemptsSinceRealInbound(mailbox: NanoclawMailb
 }
 
 /** Age of the newest provider-heal marker row, or null when there is none. */
-export function providerHealLastAttemptAgeMs(mailbox: NanoclawMailboxSession, now: number): number | null {
+function providerHealLastAttemptAgeMs(mailbox: NanoclawMailboxSession, now: number): number | null {
   const ts = mailbox.latestRecoveryMarkerTimestamp(PROVIDER_HEAL_ID_PREFIX);
   if (!ts) return null;
   const at = parseSqliteUtc(ts);
@@ -182,7 +182,7 @@ async function applyProviderHeal(
   // against the container `target` names, and provider resolution, the health
   // write and this mailbox open have all yielded since. If the original exited
   // and a wake registered a replacement in that window, the marker below would
-  // be charged to a healthy container and the kill would take it down (#478).
+  // be charged to a healthy container and the kill would take it down.
   // Refuse instead: no marker, no kill, full attempt budget kept for a failure
   // that is still real.
   const registered = containerIdentityFor(session.id);
@@ -234,7 +234,7 @@ async function applyProviderHeal(
  * mailbox close between the marker and this call is one more yield, and
  * `killContainer` kills whichever container is registered — so without the
  * fence a replacement spawned in that window is killed and its work reported
- * lost (#478). Same fence `finalizeSession` applies to a late terminal event.
+ * lost. Same fence `finalizeSession` applies to a late terminal event.
  */
 function killForProviderHeal(session: Session, target: ContainerIdentity | null): void {
   const registered = containerIdentityFor(session.id);
@@ -303,8 +303,7 @@ export function notifyProviderHealParked(
 }
 
 /**
- * Why this session must not be healed right now, or `null` when it may be
- * (fork issue #343).
+ * Why this session must not be healed right now, or `null` when it may be.
  *
  * Every input to the decision above is stale by the time it is acted on.
  * `containerState` comes from the driver's observe read (W3), the `alive`
@@ -330,7 +329,7 @@ export function notifyProviderHealParked(
  * Did the registry move to a DIFFERENT container?
  *
  * Absence is not change. A null on either side means "this host has no identity
- * for the session", which is the state every pre-#478 check already handled on
+ * for the session", which the target-availability checks already handle on
  * its own — `providerHealTargetUnavailableReason` for a container that is gone,
  * and `killContainer` itself, which is a no-op when nothing is registered. A
  * fence that refused on null would instead disable the whole self-heal wherever
@@ -402,7 +401,7 @@ async function sweepProviderHeal(
     return false;
   }
 
-  // #343: nothing below may act on a target that is already gone. Skipping
+  // Nothing below may act on a target that is already gone. Skipping
   // costs nothing — a container that exited on its own needs no kill, and the
   // session keeps its full attempt budget for a failure that is still real.
   //
@@ -420,7 +419,7 @@ async function sweepProviderHeal(
   // The guard's own identity snapshot is taken in the SAME synchronous block:
   // it names the container every decision below was proven against, so a
   // replacement registered across any later await is refused rather than
-  // charged and killed (#478).
+  // charged and killed.
   const { unavailable, registered } = await withCentralSync(
     () => ({
       unavailable: providerHealTargetUnavailableReason(session.id),
@@ -436,8 +435,8 @@ async function sweepProviderHeal(
     return true;
   }
 
-  // The DECISION is only valid for the container it was made about (#505 round
-  // 2). `decision` rests on the `failed` state W3 read, and the budget open
+  // The DECISION is only valid for the container it was made about.
+  // `decision` rests on the `failed` state W3 read, and the budget open
   // above has yielded since: if that container exited and a wake registered a
   // replacement, the registry now names a HEALTHY container, and a fence that
   // re-read it here would compare that replacement against itself and pass. So
@@ -472,9 +471,9 @@ async function sweepProviderHeal(
         // Same yield boundary as the kill-ceiling notice: the park kill is
         // above, this session opened after it, and a respawn in that gap owns
         // outbound.db. The notice is one-per-episode and idempotent, so
-        // skipping it costs nothing a later tick cannot redo. Mailbox seam
-        // PR 5b (#332) made `writeOutboundWhenStopped` the single guarded
-        // body for every host-side outbound write; it travels with this one.
+        // skipping it costs nothing a later tick cannot redo.
+        // `writeOutboundWhenStopped` is the single guarded body for every
+        // host-side outbound write.
         writeOutboundWhenStopped(session, mailbox, () =>
           notifyProviderHealParked(
             mailbox,
@@ -547,7 +546,7 @@ function heartbeatMtimeMs(agentGroupId: string, sessionId: string): number {
  * its start cannot be read. Null means "no forgiveness" — a missing or
  * malformed `tool_started_at` fails toward the pre-existing claim rule.
  * The runner writes this column as ISO-8601 on every set
- * (container/agent-runner/src/mailbox/sqlite/connection.ts:145-156).
+ * (container/agent-runner/src/mailbox/sqlite/connection.ts).
  */
 function inFlightToolStartedAtMs(state: ContainerState | null): number | null {
   if (!state?.current_tool || typeof state.tool_started_at !== 'string' || state.tool_started_at === '') return null;
@@ -943,8 +942,7 @@ export { reportContainerOomTelemetry as _reportContainerOomTelemetryForTesting }
  * Test-only entry point for the running-container SLA, including both post-kill
  * write paths. Builds the minimum session context the duty reads: the SLA and
  * its follow-ups touch `session`, `agentGroupId`, `agentGroupFolder` and the
- * two window openers, nothing else. Moved here with `enforceRunningContainerSla`
- * itself (S2-PR10) — it was host-sweep.ts's while the body still lived there.
+ * two window openers, nothing else.
  */
 export function _enforceRunningContainerSlaForTesting(
   run: SessionRunner,
@@ -985,7 +983,7 @@ export function _enforceRunningContainerSlaForTesting(
 // Registrations — S11, S14, and S16's SLA-observation hook.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function registerContainerHealthSweepDuties(): void {
+function registerContainerHealthSweepDuties(): void {
   const id = SWEEP_DUTY_INVENTORY;
 
   registerSweepDuty({

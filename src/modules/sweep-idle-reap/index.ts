@@ -1,16 +1,12 @@
 /**
- * Sweep family: idle reaps (seam 2, S2-PR3 — plan.md §5 "S2-PR3 idle reaps
- * (G28)", §8 "S2-PR3 — idle reaps"). Registers S12 (idle-task-reap) and S13
+ * Sweep family: idle reaps. Registers S12 (idle-task-reap) and S13
  * (idle-chat-reap) on the `session:health` exclusive chain at order 20/30 —
- * heal (S11, order 10, stays in host-sweep.ts until PR 10) runs first, then
+ * heal (S11, order 10, sweep-container-health) runs first, then
  * this module's two reaps, then the running-container SLA (S14, order 40,
- * the fallthrough — also stays until PR 10).
+ * the fallthrough, also sweep-container-health).
  *
- * Moved from src/host-sweep.ts UNCHANGED (cut/paste, same statements, same
- * log strings, same thresholds): both predicates and their `run()` bodies are
- * byte-identical to the pre-move source. Behavior-preserving move only — fork
- * issue #259 (the scheduled-task idle reaper killing a task-script container
- * mid-run) is OPEN and intentionally NOT fixed here.
+ * Known hazard, not fixed here: the scheduled-task idle reaper can kill a
+ * task-script container mid-run.
  */
 import { isTaskThread } from '../../db/sessions.js';
 import { killContainer } from '../../container-runner.js';
@@ -45,15 +41,15 @@ const id = SWEEP_DUTY_INVENTORY;
  * reap above: message quiet is not idleness. A parent turn that launched a
  * background agent ends with a `result` and then emits nothing until the
  * agent finishes; the runner holds the turn level up across that stretch
- * (`lowerTurnLevelUnlessQueued`, container/agent-runner/src/poll-loop.ts:2265,
+ * (`lowerTurnLevelUnlessQueued` in container/agent-runner/src/poll-loop.ts
  * returns early while `query.hasBackgroundWork()`), and it is the only signal
  * that does — no due row, no claim, no continuation, no outbound. Observed
  * live 2026-09-16/17: a chat session's builder subagent ran past the floor
  * twice and was killed mid-build each time, 15 min after the parent's last
  * status, with the heartbeat fresh and the flag raised. A container that
  * wedges with the flag up is still bounded: a wedged provider stops touching
- * the heartbeat, and the ceiling (`decideStuckAction`,
- * src/modules/sweep-container-health/index.ts:555) keys on that alone.
+ * the heartbeat, and the ceiling (`decideStuckAction` in
+ * sweep-container-health) keys on that alone.
  */
 export const CHAT_IDLE_REAP_MS = 15 * 60 * 1000;
 
@@ -92,7 +88,7 @@ export function shouldReapIdleChatContainer(
  * `_resetSweepRegistryForTesting()` in src/host-sweep-registry.test.ts instead
  * of only host-sweep.ts's own in-file builtins coming back.
  */
-export function registerIdleReapSweepDuties(): void {
+function registerIdleReapSweepDuties(): void {
   registerSweepDuty({
     name: id.S12,
     phase: 'session:health',

@@ -1,6 +1,5 @@
 /**
- * Pure ceiling-follow-up decision — S2-PR13's one leaf
- * (docs/specs/upstream-host-sweep-seam/plan.md §4.7).
+ * Pure ceiling-follow-up decision.
  *
  * Deliberately split out of `index.ts`: `src/host-restart-warn.ts` imports
  * `decideCeilingFollowUp` from `src/host-sweep.js` and that import path is
@@ -44,7 +43,7 @@ export function decideCeilingFollowUp(args: {
   // Bound against the ceiling that actually fired, plus one sweep interval of
   // detection lag. Bounding against ABSOLUTE_CEILING_MS made this branch
   // unreachable: starting a tool emits a provider event, which touches the
-  // heartbeat (poll-loop.ts:1712), so at kill time the tool's age is always at
+  // heartbeat, so at kill time the tool's age is always at
   // least the heartbeat age that just exceeded the ceiling. Every genuinely
   // wedged tool was killed and then went dark with no accountability wake.
   const maxToolAgeMs =

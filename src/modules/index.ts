@@ -32,7 +32,7 @@ import './channel-auto-wire/index.js';
 import './bash-gate/index.js';
 // Orchestrator dispatch — task dispatch pipeline + reconciler.
 import './orchestrator-dispatch/index.js';
-// Sweep family: orchestrator, dormant (seam 2, S2-PR5) — T6 reconciler,
+// Sweep family: orchestrator, dormant — T6 reconciler,
 // T14 auto-archive, T18 task watchdog. Registers at import.
 import './sweep-orchestrator/index.js';
 // Backlog + ship-log delivery action handlers (add_ship_log, add/update/delete_backlog_item).
@@ -60,46 +60,44 @@ import './sweep-storage/index.js';
 
 import './escalation/index.js';
 
-// Sweep duty families (convergence seam 2) — each self-registers its duties
+// Sweep duty families — each self-registers its duties
 // on the host-sweep.ts registry at import time, same pattern as above.
-// sweep-idle-reap: S12 idle-task-reap, S13 idle-chat-reap (S2-PR3).
+// sweep-idle-reap: S12 idle-task-reap, S13 idle-chat-reap.
 import './sweep-idle-reap/index.js';
-// Sweep family: central housekeeping (seam 2, S2-PR4) — github-app-token-refresh,
+// Sweep family: central housekeeping — github-app-token-refresh,
 // steer-idempotency-prune, channel-ingress-receipt-prune, session-title-sweep,
 // thread-title-retry, dashboard-token-prune (all tick:housekeeping).
 import './sweep-central/index.js';
-// Sweep-repo-fence (seam 2, PR 8 — G08): T5 approvals-reason-sweep,
+// Sweep-repo-fence: T5 approvals-reason-sweep,
 // T22 orphaned-repo-fence-release.
 import './sweep-repo-fence/index.js';
-// Sweep family: scheduled-move recovery (seam 2, S2-PR7) — T11
+// Sweep family: scheduled-move recovery — T11
 // scheduled-move-recovery, T12 audit-body-prune on tick:housekeeping.
 import './sweep-scheduled-move/index.js';
 import './wiki-admission/index.js';
 // Sweep container health — S11 provider self-heal, S14 running-container SLA,
-// S16 OOM / memory-pressure notice (convergence seam 2, PR 10).
+// S16 OOM / memory-pressure notice.
 import './sweep-container-health/index.js';
-// sweep-egress: T2 egress-network-reheal (S2-PR6).
+// sweep-egress: T2 egress-network-reheal.
 import './sweep-egress/index.js';
-// sweep-claims: T20 claims-reconcile, T21 claims-self-heal (S2-PR6).
+// sweep-claims: T20 claims-reconcile, T21 claims-self-heal.
 import './sweep-claims/index.js';
-// S2-PR6's own barrel line for sweep-storage is deliberately absent: this
-// lineage already imports that module above (S2-PR1 owns it for the
-// onHostShutdown half), and its T13 registration rides that same import.
-// Sweep family: usage-rollup (T19, host-sweep seam S2-PR12).
+// No second barrel line for sweep-storage: it is imported above for its
+// onHostShutdown half, and its T13 registration rides that same import.
+// Sweep family: usage-rollup (T19).
 import './sweep-usage/index.js';
 // Sweep per-session core — S2 processing_ack sync, S3 stale-pending expiry,
-// S4 pre-wake orphan-claim reset, S17 orphan-claim retry (convergence seam 2,
-// PR 9).
+// S4 pre-wake orphan-claim reset, S17 orphan-claim retry.
 import './sweep-session-core/index.js';
 
-// Continuation and ceiling accountability (S2-PR13, G09) — S6 done-proposal-mirror,
+// Continuation and ceiling accountability — S6 done-proposal-mirror,
 // S7 continuation-read, S8 continuation-recovery-parking, S9a
 // continuation-wake-eligibility, S9b container-wake, S15 kill-ceiling-notice,
 // S10 ceiling-kill-accountability.
 import './sweep-continuation/index.js';
 import './sweep-promise-watch/index.js';
 
-// Sweep duty family: scheduling + thread-close (S2-PR11) — thread-close-advance,
+// Sweep duty family: scheduling + thread-close — thread-close-advance,
 // due-wake-admission, recurrence-fanout, spent-task-session-gc.
 import './sweep-scheduling/index.js';
 

@@ -1,14 +1,9 @@
 /**
- * Sweep family: scheduled-move recovery (seam 2, S2-PR7 — plan.md §5 "S2-PR7
- * scheduled-move recovery (G30)", §8 "S2-PR7 — scheduled-move recovery").
- * Registers T11 (scheduled-move-recovery) and T12 (audit-body-prune) on
- * `tick:housekeeping` at order 50/60 — order-free housekeeping work, run
+ * Sweep family: scheduled-move recovery. Registers T11
+ * (scheduled-move-recovery) and T12 (audit-body-prune) on `tick:housekeeping` at order 50/60 — order-free housekeeping work, run
  * every tick with no session fan-out.
  *
- * Moved from src/host-sweep.ts UNCHANGED (cut/paste, same statements, same
- * log strings, same thresholds). PR 2 registered both duties in-file as a
- * SHARED try/catch; this module keeps that behavior-preserving split into two
- * independently guarded registrations while KEEPING the identical
+ * The two duties are independently guarded registrations that KEEP the identical
  * `scheduled-move-recovery: sweep hook failed` warn string on both, so a log
  * search for that string still finds every failure it used to.
  */
@@ -25,8 +20,7 @@ import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
 // host caller. The raw-opener exemption this module used to carry existed for
 // an INJECTED sessions root, but no production caller ever injects one — the
 // sweep's only call site passes `{}` — so it protected test scaffolding rather
-// than behaviour, and it is gone (mailbox seam PR 7 made the same change in
-// host-sweep.ts).
+// than behaviour, and it is gone.
 import { withExistingMailboxSession } from '../../session-manager.js';
 import { readSessionInbound } from '../mailbox/index.js';
 import { type TaskRowSnapshot } from '../scheduling/db.js';
@@ -387,8 +381,8 @@ export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<
             // after the quiet-mark flush. The fan-out saw a source with no live
             // task (that is the crash state this recovery exists for) and may have
             // just marked it quiet, so the row about to be restored is a DUE task
-            // hiding behind a mark taken seconds ago, and S2-PR15 would carry that
-            // mark across a restart. The central-DB invalidation clears it.
+            // hiding behind a mark taken seconds ago, and the persisted mark
+            // would survive a restart. The central-DB invalidation clears it.
             //
             // Invalidate BEFORE the restore, in the same synchronous turn (Codex
             // pre-pass Part C, round 3 H1): inbound.db and the central DB are two

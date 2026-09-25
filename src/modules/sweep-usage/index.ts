@@ -1,12 +1,9 @@
 /**
- * Sweep family: usage rollup (seam 2, S2-PR12 — plan.md §5 "S2-PR12 usage
- * rollup (G22)", §8 "S2-PR12 — usage rollup"). Registers T19 (usage-rollup)
+ * Sweep family: usage rollup. Registers T19 (usage-rollup)
  * on `tick:post-session` at order 40 — reuses the tick's own `ctx.sessions`
  * (constraint 4), no extra `getActiveSessions()` call.
  *
- * Moved from src/host-sweep.ts UNCHANGED (cut/paste, same statements, same
- * log strings, same thresholds, same helper calls), taking mailbox PR 6's
- * shape for both halves of the read: `rollupSessionUsage` asks for only the
+ * Both halves of the read are narrow: `rollupSessionUsage` asks for only the
  * `Pick<NanoclawMailboxSession, 'listTurnUsageSince'>` op it uses, and the
  * handle that supplies it comes from `readSessionOutbound`, the read-only
  * funnel, NOT a raw `openOutboundDb`.
@@ -69,7 +66,7 @@ export async function sweepUsageRollup(sessions: readonly Session[]): Promise<vo
       // fleet-fan-out default and never advances its watermark, so its
       // turn_usage rows never reach the central ledger.
       //
-      // Three steps, in this order (seam 3 PR 6): the central watermark is
+      // Three steps, in this order: the central watermark is
       // read first, the outbound read hands back the rows above it while the
       // session file is open, and the central transaction folds them in after
       // the file is closed — `readSessionOutbound` closes the handle the moment
@@ -113,7 +110,7 @@ export async function sweepUsageRollup(sessions: readonly Session[]): Promise<vo
  * `_resetSweepRegistryForTesting()` in src/host-sweep-registry.test.ts instead
  * of only host-sweep.ts's own in-file builtins coming back.
  */
-export function registerUsageSweepDuties(): void {
+function registerUsageSweepDuties(): void {
   registerSweepDuty({
     name: id.T19,
     phase: 'tick:post-session',

@@ -1,9 +1,8 @@
 /**
- * T18 task-watchdog duty body (seam 2, S2-PR5) — moved out of
- * src/host-sweep.ts unchanged. Kept in its own file, sibling to index.ts, so
+ * T18 task-watchdog duty body. Kept in its own file, sibling to index.ts, so
  * the acceptance-case suite (orchestrator.test.ts) can import it directly
  * without pulling in host-sweep.ts's whole registry import graph — the same
- * split S2-PR4 used for steer-idempotency.ts.
+ * split as steer-idempotency.ts.
  *
  * DORMANT: no agent group holds the `orchestrator` capability (parked
  * 2026-08-11 — src/modules/orchestrator-dispatch/index.ts), so `await getActiveTasks()`
