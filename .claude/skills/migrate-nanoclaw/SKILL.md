@@ -144,16 +144,16 @@ Then spawn sub-agents to analyze all non-skill changes. For Tier 2, one or two a
 
 - **Config + build files** — one sub-agent
 - **Source files** (`src/*.ts`) — one sub-agent
-- **Skills the user flagged as modified** (or all of them for Tier 3) — one sub-agent per skill, comparing the user's current skill-owned files against the pristine version the skill fetches. For a file the skill writes from `origin/<branch>`, diff the working copy against that source:
+- **Skills the user flagged as modified** (or all of them for Tier 3) — one sub-agent per skill, comparing the user's current skill-owned files against the pristine version the skill fetches. For a file the skill writes from a registry branch, diff the working copy against that source, where `<remote>` is the remote `setup/lib/channels-remote.sh` resolves (`resolve_channels_remote`):
   ```
-  diff <(git show origin/<branch>:<path>) <path>
+  diff <(git show <remote>/<branch>:<path>) <path>
   ```
 - **Container files** — one sub-agent (if changes exist)
 
 Each sub-agent task:
 
 > Read these diffs and the current file contents. For each change:
-> 1. `git diff $BASE..HEAD -- <file>` (or `diff <(git show origin/<branch>:<file>) <file>` for skill-owned files)
+> 1. `git diff $BASE..HEAD -- <file>` (or `diff <(git show <remote>/<branch>:<file>) <file>` for skill-owned files)
 > 2. Read the full current file for context
 > 3. Summarize: what changed, what the likely intent is
 > 4. Assess detail level: could a fresh Claude session reproduce this from intent alone, or does it need specific code snippets, API details, import paths?
@@ -368,12 +368,12 @@ Store `$PROJECT_ROOT` and `$WORKTREE` as absolute paths. Use `$WORKTREE` in all 
 
 ## 2.4 Reapply skills in worktree
 
-The clean upstream base already carries every skill's `SKILL.md` under `.claude/skills/`. Reapply each installed skill by re-running its own apply against the worktree — each `/add-<name>` skill fetches its files additively (`git fetch origin <branch>` + `git show origin/<branch>:path > path`), pins its own dependencies, and is safe to re-run, so this reproduces the install on the new base without merging branches.
+The clean upstream base already carries every skill's `SKILL.md` under `.claude/skills/`. Reapply each installed skill by re-running its own apply against the worktree — each `/add-<name>` skill fetches its files additively from the registry remote (`git fetch <remote> <branch>` + `git show <remote>/<branch>:path > path`, where `<remote>` is what `setup/lib/channels-remote.sh` resolves), pins its own dependencies, and is safe to re-run, so this reproduces the install on the new base without merging branches.
 
 For each skill listed in the migration guide's "Applied Skills" section:
 
 1. Confirm the skill exists on the new base: check `$WORKTREE/.claude/skills/<name>/SKILL.md`.
-2. If present, follow that `SKILL.md`'s apply steps with the worktree as the working tree — run its `git fetch origin <branch>`, write its files with `git show origin/<branch>:path > $WORKTREE/path`, append its import lines, and run its pinned `pnpm install`/`bun install` inside the worktree.
+2. If present, follow that `SKILL.md`'s apply steps with the worktree as the working tree — run its `git fetch <remote> <branch>` (the remote its apply resolves), write its files with `git show <remote>/<branch>:path > $WORKTREE/path`, append its import lines, and run its pinned `pnpm install`/`bun install` inside the worktree.
 3. If the skill is missing from the new base, warn the user (it may have been removed or renamed upstream).
 4. If reapplying a skill fails (a fetched path no longer exists, or its apply errors), stop and tell the user — the skill needs updating for the new upstream.
 

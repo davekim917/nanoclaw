@@ -22,16 +22,29 @@ const RESOLVER = 'setup/lib/channels-remote.sh';
 const RUNS_GIT = /(?:^|[\s`'"(;|&{])git\s+\S/;
 /** `channels`/`providers` as a branch argument or a ref's branch part, not as a path directory or part of a word. */
 const REGISTRY_BRANCH = /(?<![\w.-])(?:channels|providers)(?=$|[\s:'"`),;])/g;
-/** What must directly precede a branch mention: the variable or resolver call, then `/` or whitespace (other branch names may sit between). */
+/**
+ * Registry placeholders in the two shapes a registry install takes: any `<…>` as a ref's branch
+ * read for a file (`origin/<branch>:<path>`), and `<branch>` as a fetch argument (other fetch
+ * placeholders such as `<sha>` or `<bundle>` are not branches).
+ */
+const PLACEHOLDER_REF = /(?<=\/)<[\w-]+>(?=:)/g;
+const PLACEHOLDER_FETCHED = /(?<=\s)<branch>(?=$|[\s'"`),;])/g;
+/**
+ * What must directly precede a branch mention: a variable, the resolver call, or the `<remote>`
+ * placeholder a skill binds to the resolver's answer, then `/` or whitespace (other branch names may
+ * sit between).
+ */
 const REMOTE_FROM_VARIABLE =
-  /(?:\$\{?\w+\}?|\$\(resolve_channels_remote\))["']?(?:\/|(?:\s+(?:channels|providers))*\s+)["']?$/;
+  /(?:\$\{?\w+\}?|\$\(resolve_channels_remote\)|<remote>)["']?(?:\/|(?:\s+(?:channels|providers|<[\w-]+>))*\s+)["']?$/;
 
 function hardCodesRegistryRemote(line: string): boolean {
   if (!RUNS_GIT.test(line)) return false;
-  for (const match of line.matchAll(REGISTRY_BRANCH)) {
-    if (!REMOTE_FROM_VARIABLE.test(line.slice(0, match.index))) return true;
-  }
-  return false;
+  const mentions = [
+    ...line.matchAll(REGISTRY_BRANCH),
+    ...line.matchAll(PLACEHOLDER_REF),
+    ...(/\bfetch\b/.test(line) ? line.matchAll(PLACEHOLDER_FETCHED) : []),
+  ];
+  return mentions.some((match) => match[0] !== '<remote>' && !REMOTE_FROM_VARIABLE.test(line.slice(0, match.index)));
 }
 
 function installerFiles(rel: string): string[] {
@@ -67,6 +80,9 @@ describe('installers take the registry remote from the resolver', () => {
       'git checkout -B channels origin/channels',
       "execSync('git fetch origin channels')",
       '`git show origin/channels:<path> > <path>`',
+      'run its `git fetch origin <branch>`, write its files with `git show origin/<branch>:path > $WORKTREE/path`',
+      'diff <(git show origin/<branch>:<path>) <path>',
+      'git fetch upstream <branch>',
     ]) {
       expect(hardCodesRegistryRemote(line), line).toBe(true);
     }
@@ -86,6 +102,12 @@ describe('installers take the registry remote from the resolver', () => {
       'git add src/channels/index.ts src/providers/index.ts',
       'git diff -- src/channels/',
       'git fetch origin main',
+      'cmp -s <(git show <remote>/<branch>:<path>) <path>',
+      'git fetch "$remote" <branch>',
+      'git merge upstream/<branch>',
+      'git checkout upstream/<branch> -- .claude/skills/migrate-nanoclaw/',
+      'git show upstream/main:package.json',
+      'git diff $BASE..HEAD -- <file>',
       'Fetch the `channels` branch from the resolved remote.',
     ]) {
       expect(hardCodesRegistryRemote(line), line).toBe(false);
