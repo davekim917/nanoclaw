@@ -42,12 +42,18 @@ The fakes mirror the real contracts the controller depends on:
            gh.json, `label list` returns it and `issue create` refuses a label
            outside it, as GitHub does; without one, `label list` fails and
            create takes any label (the behaviour before labels were checked).
+           `api repos/<r>/issues/<n>` GETs one issue (404 when absent). With
+           `listLag: true` in gh.json, a created issue stays out of every
+           listing (`api` scans and `issue list`) until it is cleared -- the
+           lag GitHub's listings show a fresh create; the GET still finds it.
+           Fault `silent` on gh:issue-create files the issue but prints no URL.
   ncl      `tasks create` returns {ok, data:{series_id}}; `tasks list` lists them.
 """
 import fcntl
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -184,12 +190,19 @@ def gh(argv):
         f = fault("gh:api")
         if f == "fail-before":
             return "fail", out_err("HTTP 502")
+        single = re.match(r"repos/[^/]+/[^/]+/issues/(\d+)$", path)
+        if single:
+            hit = [i for i in db["issues"] if str(i["number"]) == single.group(1)]
+            if not hit:
+                return "missing", out_err("HTTP 404: Not Found")
+            print(json.dumps(hit[0]))
+            return "get", 0
         objs = []
         if "/comments" in path:
             pr = path.split("/issues/")[1].split("/")[0]
             objs = db["comments"].get(pr, [])
         else:
-            objs = db["issues"]
+            objs = [i for i in db["issues"] if not i.get("unlisted")]
         for o in objs:
             print(json.dumps(o))
         return "list", 0
@@ -218,7 +231,7 @@ def gh(argv):
             return "refused", out_err("fake gh: issue list --label/--search goes through search; not supported")
         hits = [{"number": i["number"], "title": i["title"], "url": i["html_url"],
                  "labels": [{"name": n} for n in i.get("labels", [])]}
-                for i in db["issues"] if i["state"] == "open"]
+                for i in db["issues"] if i["state"] == "open" and not i.get("unlisted")]
         print(json.dumps(hits[:int(opt(argv, "--limit") or 30)]))
         return "list", 0
     if argv[:2] == ["label", "list"]:
@@ -242,9 +255,13 @@ def gh(argv):
         n = len(db["issues"]) + 100
         db["issues"].append({"number": n, "title": opt(argv, "--title"), "body": body, "state": "open",
                              "labels": opts(argv, "--label"), "html_url": "https://github.test/issues/{}".format(n)})
+        if db.get("listLag"):
+            db["issues"][-1]["unlisted"] = True
         save("gh.json", db)
         if f == "fail-after":
             return "fail-after", out_err("HTTP 502 after write")
+        if f == "silent":
+            return "created-silent", 0
         print("https://github.test/issues/{}".format(n))
         return "created", 0
     if argv[:2] == ["pr", "view"]:
