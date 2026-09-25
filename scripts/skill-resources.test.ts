@@ -85,15 +85,16 @@ interface Install {
  * `GIT_INDEX_FILE`, which would point these reads at some other repository.
  * Read-only: `null` when the command fails.
  */
-function git(args: string[]): string | null {
+function git(args: string[], timeout?: number): string | null {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
   try {
     return execFileSync('git', args, {
       cwd: REPO_ROOT,
-      env,
+      env: { ...env, GIT_TERMINAL_PROMPT: '0' },
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       maxBuffer: 64 * 1024 * 1024,
+      timeout,
     });
   } catch {
     return null;
@@ -102,13 +103,20 @@ function git(args: string[]): string | null {
 
 const registryRemote = detectRegistryRemote(REPO_ROOT);
 
-/** The local ref an install of `branch` reads, or why there is none. */
+/**
+ * The local ref an install of `branch` reads, or why there is none. An install
+ * fetches first, so a local ref behind the remote would check an old payload:
+ * it counts only when `git ls-remote` (read-only) shows it current.
+ */
 function registryRefOf(branch: string): { ref: string } | { reason: string } {
   if (!registryRemote) return { reason: 'no remote resolves as the registry (setup/lib/channels-remote.sh)' };
   const ref = `refs/remotes/${registryRemote}/${branch}`;
-  if (git(['rev-parse', '--verify', '--quiet', ref]) === null) {
-    return { reason: `${registryRemote}/${branch} is not fetched locally; fetch it to check these copies` };
-  }
+  const fetchIt = `run \`git fetch ${registryRemote} ${branch}\` to check these copies`;
+  const local = git(['rev-parse', '--verify', '--quiet', ref])?.trim();
+  if (!local) return { reason: `${registryRemote}/${branch} is not fetched locally; ${fetchIt}` };
+  const remote = git(['ls-remote', '--heads', registryRemote, branch], 30_000)?.split(/\s/)[0];
+  if (!remote) return { reason: `cannot reach ${registryRemote} to confirm ${registryRemote}/${branch} is current` };
+  if (remote !== local) return { reason: `${registryRemote}/${branch} is behind the remote; ${fetchIt}` };
   return { ref };
 }
 
