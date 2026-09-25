@@ -26,10 +26,12 @@ if ! $needs_install; then
 fi
 
 echo "STEP: fetch-channels-branch"
-git fetch origin channels
+source setup/lib/channels-remote.sh
+remote="$(resolve_channels_remote)"
+git fetch "$remote" channels
 
 echo "STEP: copy-files"
-git show origin/channels:src/channels/github.ts > src/channels/github.ts
+git show "$remote/channels:src/channels/github.ts" > src/channels/github.ts
 
 echo "STEP: register-import"
 if ! grep -q "import './github.js';" src/channels/index.ts; then
