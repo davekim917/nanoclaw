@@ -60,6 +60,7 @@ function makeRoot(): string {
 interface SampleRow {
   ts: string;
   source: 'usage_pull' | 'rate_limit_event' | 'rate_limit_headers';
+  account?: string | null;
   credentialSet?: string | null;
   limitType?: string | null;
   status?: string | null;
@@ -84,7 +85,7 @@ function writeSessionDb(root: string, group: string, session: string, rows: Samp
     stmt.run(
       r.ts,
       r.source,
-      'CLAUDE_CODE_OAUTH_TOKEN',
+      r.account === undefined ? 'CLAUDE_CODE_OAUTH_TOKEN' : r.account,
       r.credentialSet === undefined ? 'codex:.codex' : r.credentialSet,
       null,
       null,
@@ -189,6 +190,24 @@ describe('scanRateLimitTelemetry — the asymmetry', () => {
       verdict: 'stale',
       lastPullEver: '2026-09-12T09:00:00.000Z',
     });
+  });
+
+  // A Claude API-key / Bedrock / Vertex session has no slot and no credential
+  // set, and its events never carry windows: nothing is missing, so nothing fires.
+  it('does not judge pushes from a session with no OAuth identity', () => {
+    const root = makeRoot();
+    writeSessionDb(root, 'group-api-key', 'sess-1', [
+      { ts: '2026-09-15T01:40:00.000Z', source: 'rate_limit_event', account: null, credentialSet: null },
+    ]);
+    // A Codex row with an unknown account still has its credential set, and stays judged.
+    writeSessionDb(root, 'group-codex-no-account', 'sess-1', [
+      { ts: '2026-09-15T01:40:00.000Z', source: 'rate_limit_event', account: null },
+    ]);
+
+    const report = scan(root);
+
+    expect(pairFor(report, 'group-api-key')).toBeUndefined();
+    expect(pairFor(report, 'group-codex-no-account')?.verdict).toBe('never');
   });
 
   it('counts a pull that came back unsampled as the read path working', () => {

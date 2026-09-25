@@ -198,6 +198,14 @@ const READING_SOURCES = ['usage_pull', 'rate_limit_headers'] as const;
 const READING_SOURCES_SQL = READING_SOURCES.map((s) => `'${s}'`).join(', ');
 
 /**
+ * A push that can be judged. A Claude API-key, Bedrock or Vertex session has
+ * no OAuth slot and no credential set, and never carries header windows, so
+ * its pushes have no reading to be missing. A Codex row always has a
+ * credential set, even when its account is unknown.
+ */
+const JUDGED_PUSH_SQL = `source = 'rate_limit_event' AND NOT (account IS NULL AND credential_set IS NULL)`;
+
+/**
  * Both sides of the comparison go through `datetime()` per the house rule
  * (CLAUDE.md, Timestamps). That rule has one sharp edge: `datetime()` answers
  * NULL for a value it cannot parse, and `NULL >= x` is false, so a malformed
@@ -206,10 +214,10 @@ const READING_SOURCES_SQL = READING_SOURCES.map((s) => `'${s}'`).join(', ');
  */
 const PER_SESSION_SQL = `
   SELECT credential_set,
-         SUM(CASE WHEN source = 'rate_limit_event' AND datetime(ts) >= datetime(?) THEN 1 ELSE 0 END)             AS push_rows,
+         SUM(CASE WHEN ${JUDGED_PUSH_SQL} AND datetime(ts) >= datetime(?) THEN 1 ELSE 0 END)                    AS push_rows,
          SUM(CASE WHEN source IN (${READING_SOURCES_SQL}) AND datetime(ts) >= datetime(?) THEN 1 ELSE 0 END) AS pull_rows,
          MAX(CASE WHEN source IN (${READING_SOURCES_SQL}) THEN ts END)                                         AS last_pull_ever,
-         MAX(CASE WHEN source = 'rate_limit_event' AND datetime(ts) >= datetime(?) THEN ts END)                   AS last_push_in_window
+         MAX(CASE WHEN ${JUDGED_PUSH_SQL} AND datetime(ts) >= datetime(?) THEN ts END)                          AS last_push_in_window
     FROM rate_limit_samples
    GROUP BY credential_set
 `;
