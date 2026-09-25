@@ -55,8 +55,7 @@ export interface ChoiceHandlerContext {
  * Deliver the answer. Resolve to the session that received it, or null when no
  * live session can take it. Throw only when the answer was NOT recorded: once
  * the row is written, a failed wake is not a failed delivery, because the sweep
- * wakes a session with due rows (sweep-scheduling/index.ts:76,
- * sweep-continuation/index.ts:674).
+ * wakes a session with due rows (sweep-scheduling, sweep-continuation).
  */
 export type ChoiceHandler = (ctx: ChoiceHandlerContext) => Promise<Session | null>;
 
@@ -79,8 +78,7 @@ export function getChoiceHandler(action: string): ChoiceHandler | undefined {
  * `approvers` (payload) names none, and the response handler's owner/admin
  * check is the whole rule. Narrowing only: that check still applies to a
  * listed user. A listed Slack id matches the clicker's same-workspace sibling
- * ids, the equivalence role checks use (equivalentSlackUserIds,
- * slack-user-identity.ts:26-45; user-roles.ts:27-30).
+ * ids, the equivalence role checks use (equivalentSlackUserIds).
  */
 export function choiceClickAllowed(approval: PendingApproval, userId: string): boolean {
   const approvers = payloadApprovers(approval);
@@ -93,7 +91,7 @@ export function choiceClickAllowed(approval: PendingApproval, userId: string): b
  * Resolve an authorized click on a choice card. Any stored option is a
  * legitimate answer — there is no approve/reject vocabulary here — and the
  * first click wins: the pending→approved compare-and-swap
- * (transitionPendingApprovalStatus, src/db/sessions.ts:726-737) lets exactly
+ * (transitionPendingApprovalStatus) lets exactly
  * one racing click through, and the row is deleted once the answer is
  * delivered, so a later click finds nothing.
  */
@@ -182,7 +180,7 @@ export async function retireChoice(approval: PendingApproval, line: string): Pro
   return true;
 }
 
-/** Same predicate as unwakeableReason (src/container-runner.ts:691-696). */
+/** Same predicate as unwakeableReason in src/container-runner.ts. */
 async function liveSession(sessionId: string | null): Promise<Session | undefined> {
   const session = sessionId ? await getSession(sessionId) : undefined;
   return session && session.status === 'active' && session.archived_at == null ? session : undefined;
@@ -246,7 +244,7 @@ function receiptReleaseScopeJson(approval: PendingApproval): string | null {
 
 /**
  * Edit a choice card's message to `text`. The editCardResolution pattern
- * (onecli-approvals.ts:513-538): dispatch through `instance ?? channel_type`,
+ * in onecli-approvals.ts: dispatch through `instance ?? channel_type`,
  * because dispatch is exact-key, and fail loudly — the row is gone by now, so
  * a swallowed failure leaves live-looking buttons that do nothing.
  */

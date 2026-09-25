@@ -160,7 +160,7 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
 
   // The authority snapshot above is UX — the fast denial before the target is
   // resolved. The decision that matters is re-taken INSIDE the block that
-  // writes (#460 round 2): the target resolution awaits, and a caller revoked
+  // writes: the target resolution awaits, and a caller revoked
   // in that window must not complete a privileged write on stale authority.
   // Caller re-check, target check and the write are one synchronous lease
   // block; the write runs the leaf's exported constant through `withRawDb`.
@@ -283,14 +283,14 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
 
   // ONE synchronous lease block: the caller's authority is RE-CHECKED here,
   // the target's standing is read, and the removal runs — nothing awaits
-  // between them (#460 round 2). The snapshot taken before `resolveTargetUserId`
+  // between them. The snapshot taken before `resolveTargetUserId`
   // is only the fast denial; another owner/admin can revoke this caller during
   // that await, and the write must see the caller as they are NOW. The writes
   // execute the leaves' exported constants through `withRawDb` (one constant,
   // two executors), so the block holds no driver statement.
   //
   // `callerIsGlobal` is the load-bearing half of the admin-role branch, not a
-  // shortcut for the refusal above it (issue #443, Codex round 2): a scoped
+  // shortcut for the refusal above it: a scoped
   // admin may take membership, never a role, and with the checks and the
   // writes in one block a role granted concurrently is either seen (refused)
   // or lands after this block, untouched.
@@ -351,7 +351,7 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
     return;
   }
   log.info('revoke_access: revoked', { callerId, targetUserId, targetAgentGroupId });
-  // Best-effort: removeMember/revokeRole above already committed. Same
+  // Best-effort: the removal above already committed. Same
   // reasoning as the grant paths — an awaited rejection here would cause a
   // full-handler retry that re-attempts an already-completed revoke.
   void Promise.resolve(notifyAgent(session, `Revoked access: \`${targetUserId}\` ← \`${targetAgentGroupId}\`.`)).catch(

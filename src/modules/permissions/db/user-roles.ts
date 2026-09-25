@@ -58,7 +58,7 @@ const SCOPED_ROLE_SQL = 'SELECT 1 FROM user_roles WHERE user_id = ? AND role = ?
  * The role writes as SQL constants: executed on the driver by
  * `grantRole`/`revokeRole`, and through `withRawDb` by `grant.ts`, whose
  * grant/revoke apply the write in the same synchronous lease block as the
- * caller's authority re-check (#460 round 2). One constant, two executors.
+ * caller's authority re-check. One constant, two executors.
  */
 export const GRANT_ROLE_SQL = `INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at)
        VALUES (@user_id, @role, @agent_group_id, @granted_by, @granted_at)`;

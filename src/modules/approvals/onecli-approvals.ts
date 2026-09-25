@@ -190,7 +190,7 @@ export async function resolveOneCLIApproval(
   if (state) {
     pending.delete(approvalId);
     clearTimeout(state.timer);
-    // The bridge edits no approval card on click (chat-sdk-bridge.ts:1176),
+    // The bridge edits no approval card on click,
     // so the resolution edit happens here — addressed to the card this ROW
     // names, not to whatever message the click was made on.
     await editCardResolution(row, await approvalResolutionLine(row, selectedOption, userId));

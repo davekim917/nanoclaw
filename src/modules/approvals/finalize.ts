@@ -17,6 +17,19 @@ import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { editApprovalCardResolution, notifyApprovalResolved } from './primitive.js';
 
+/** Write a system note into the requesting agent's session. */
+export async function writeApprovalNote(session: Session, text: string): Promise<void> {
+  await writeSessionMessage(session.agent_group_id, session.id, {
+    id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    kind: 'chat',
+    timestamp: new Date().toISOString(),
+    platformId: session.agent_group_id,
+    channelType: 'agent',
+    threadId: null,
+    content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
+  });
+}
+
 /**
  * Notify the requesting agent that its action was rejected, drop the pending
  * row, fire approval-resolved callbacks, and wake the container.
@@ -36,15 +49,7 @@ export async function finalizeReject(
     ? `Your ${approval.action} request was rejected by admin: "${reason}"`
     : `Your ${approval.action} request was rejected by admin.`;
 
-  await writeSessionMessage(session.agent_group_id, session.id, {
-    id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    kind: 'chat',
-    timestamp: new Date().toISOString(),
-    platformId: session.agent_group_id,
-    channelType: 'agent',
-    threadId: null,
-    content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
-  });
+  await writeApprovalNote(session, text);
 
   log.info('Approval rejected', {
     approvalId: approval.approval_id,

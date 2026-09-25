@@ -19,8 +19,8 @@
  * reject-with-reason holds (re-exported here, which also loads reason-capture
  * so its interceptor registers).
  *
- * Self-mod flows (install_packages, add_mcp_server) moved out to
- * `src/modules/self-mod/` in PR #7 — they now register delivery actions
+ * Self-mod flows (install_packages, add_mcp_server) live in
+ * `src/modules/self-mod/` and register delivery actions
  * + approval handlers via this module's public API.
  */
 import { onDeliveryAdapterReady } from '../../delivery.js';

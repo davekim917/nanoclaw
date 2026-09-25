@@ -7,13 +7,13 @@
  * 'thread':
  *
  *   - no `to`: into the session's own conversation and thread — the routing
- *     the container sees (session-manager.ts:600-617);
+ *     the container sees (from the session manager);
  *   - `to`: top-level in the named destination (the card IS the ask), after the
  *     host re-authorizes the container's routing (authorizedDestination).
  *
  * The card outlives the container. The pending_approvals row is central, and a
  * module approval row carries no expiry: the only writer of `expires_at` on one
- * is the reject-with-reason hold (src/db/sessions.ts:748-751), which a choice
+ * is the reject-with-reason hold, which a choice
  * card never enters. `approvers` narrows who may answer; `key` retires the agent
  * group's open card under the same key once the new one has posted ("replace,
  * never stack").
@@ -46,16 +46,16 @@ import { hasAdminPrivilege } from '../permissions/db/user-roles.js';
 import { getUser } from '../permissions/db/users.js';
 
 export const REQUEST_CHOICE_ACTION = 'request_choice';
-export const MAX_CHOICE_OPTIONS = 10;
-export const MAX_CHOICE_APPROVERS = 20;
+const MAX_CHOICE_OPTIONS = 10;
+const MAX_CHOICE_APPROVERS = 20;
 export const SUPERSEDED_LINE = '↩️ Superseded by a newer ask';
 /** The host-only event tag on a relayed answer (notifyAgent); the agent acts on nothing else. */
-export const CHOICE_RESPONSE_EVENT = 'choice_response';
+const CHOICE_RESPONSE_EVENT = 'choice_response';
 const ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const USER_ID_RE = /^[^:\s]+:\S+$/;
 const OPTION_STYLES = new Set<unknown>(['primary', 'danger', 'default']);
 
-export interface ChoiceRequest {
+interface ChoiceRequest {
   choiceId: string;
   title: string;
   question: string;
@@ -74,7 +74,7 @@ export interface ChoiceRequest {
  * Validate the container's payload. The MCP tool validates first; this is the
  * host's own check, since the outbound row is container-written.
  */
-export function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequest | { error: string } {
+function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequest | { error: string } {
   const { choiceId, title, question, options, key, approvers, to, channelType, platformId, approvalScope } = content;
   if (typeof choiceId !== 'string' || !ID_RE.test(choiceId)) return { error: 'choiceId is missing or malformed' };
   const scope = approvalScope === undefined ? undefined : parseReleaseShipScope(approvalScope);
@@ -266,7 +266,7 @@ function duplicateChoiceRefusal(choiceId: string): string {
 /**
  * The messaging group a container-resolved destination names, if this agent
  * group may post there — the check an ordinary outbound message gets
- * (delivery.ts:1127-1156): resolve the group origin-first, then allow the
+ * in delivery.ts: resolve the group origin-first, then allow the
  * session's own chat, and require an agent_destinations channel row for any
  * other (skipped, as there, when the agent-to-agent module's table is absent).
  */
@@ -295,8 +295,8 @@ async function authorizedDestination(
  * Replace, never stack: retire every open request_choice card this agent
  * group posted under `key` BEFORE `newest` (createdBefore), so the newest card
  * always survives. Two same-key asks from different sessions of one group can
- * be handled at the same time — the active poll (delivery.ts:521-524) and the
- * sweep (delivery.ts:896-905) are separate loops — and "everything but my own
+ * be handled at the same time — delivery's active poll and its
+ * sweep are separate loops — and "everything but my own
  * row" let each retire the other, leaving no card open.
  *
  * The key lives in the row's payload JSON, not a column of its own: open
@@ -333,8 +333,8 @@ function payloadKey(row: PendingApproval): string | undefined {
 
 /**
  * The session a typed reply in the card's thread would reach, resolved as the
- * router resolves one — thread policy (router.ts:955-983), per-thread
- * promotion (router.ts:1248-1251), then resolveSession (router.ts:1331-1336),
+ * router resolves one — thread policy, per-thread
+ * promotion, then resolveSession,
  * which creates the session when absent. So a click behaves like a reply in
  * the ask's thread and lands where that conversation already lives.
  * Undefined when the card's channel is not wired to the agent group (a
@@ -372,15 +372,14 @@ async function cardConversationSession(
 /**
  * Thread id of a reply in the thread under message `messageId` on `mg`'s
  * channel. Slack only: the adapter encodes a thread as `slack:<channel>:<ts>`
- * (@chat-adapter/slack 4.29.0, dist/index.js:3767-3769) and the messaging
- * group stores the channel-root id `slack:<channel>` (chat-sdk-bridge.ts:1010-1016),
- * the composition router.ts:494-495 already uses for root DMs. A card's
- * platform_message_id is its Slack ts: the bridge returns postMessage's id
- * (chat-sdk-bridge.ts:1385-1389), which is chat.postMessage's `ts`
- * (dist/index.js:2844-2848). Elsewhere: null, where a channel-root reply lands.
+ * (@chat-adapter/slack) and the messaging
+ * group stores the channel-root id `slack:<channel>` (chat-sdk-bridge.ts),
+ * the composition the router already uses for root DMs. A card's
+ * platform_message_id is its Slack ts: the bridge returns postMessage's id,
+ * which is chat.postMessage's `ts`. Elsewhere: null, where a channel-root reply lands.
  */
 function replyThreadId(mg: MessagingGroup, messageId: string | null): string | null {
-  // Same predicate as isSlackChannelType (router.ts:444-448); router.ts imports module code, so not imported here.
+  // Same predicate as isSlackChannelType in router.ts; router.ts imports module code, so not imported here.
   const slack = mg.channel_type === 'slack' || isChannelVariant(mg.channel_type, 'slack');
   if (!messageId || !slack || !mg.platform_id.startsWith('slack:')) return null;
   return `${mg.platform_id}:${messageId}`;
@@ -396,7 +395,7 @@ const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF
  *
  * Fixed key order, every value percent-encoded with encodeURIComponent, so it
  * stays one line whatever a label or name contains, and it reaches the model
- * unchanged: the runner XML-escapes chat text (& < > ", formatter.ts:716-718
+ * unchanged: the runner XML-escapes chat text (& < > ", in the formatter
  * in container/agent-runner/src), and encodeURIComponent output contains none
  * of those. Lone surrogates, which encodeURIComponent throws on, become U+FFFD.
  * Anyone can type this line, and a host note can echo text it was sent, so the
@@ -450,9 +449,9 @@ async function relayChoice(ctx: ChoiceHandlerContext): Promise<Session | null> {
   const target = (await cardConversationSession(ctx.approval, ctx.requester)) ?? ctx.requester;
   if (!target) return null;
   // The click reaches the host without the platform's display name
-  // (ResponsePayload, src/response-registry.ts:15-28), so the name comes from
+  // (ResponsePayload in src/response-registry.ts), so the name comes from
   // the clicker's users row — an authorized clicker holds a user_roles row,
-  // which references users(id) (src/db/schema.ts:88-89).
+  // which references users(id).
   const user = await getUser(ctx.userId);
   const id = `choice-answer-${ctx.approval.approval_id}`;
   try {
@@ -472,8 +471,8 @@ async function relayChoice(ctx: ChoiceHandlerContext): Promise<Session | null> {
   } catch (err) {
     // notifyAgent inserts the row, then reads the session back and wakes it
     // (primitive.ts). A failure after the insert still leaves a due row, and
-    // the sweep wakes a session with due rows (sweep-scheduling/index.ts:76,
-    // sweep-continuation/index.ts:674) — so a recorded answer is delivered.
+    // the sweep wakes a session with due rows (sweep-scheduling,
+    // sweep-continuation) — so a recorded answer is delivered.
     // Only an unrecorded one may reopen the card (ChoiceHandler contract).
     if (await sessionMessageExists(target.agent_group_id, target.id, id)) {
       log.warn('Choice answer recorded but the wake failed — the sweep will wake the session', {
