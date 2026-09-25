@@ -16,5 +16,9 @@
   "project": ["src/**/*.ts", "scripts/**/*.ts"],
   "ignoreFiles": ["src/codex-hooks/__test-fixtures__/**"],
   "ignoreBinaries": ["codex", "gcloud", "opencode"],
-  "includeEntryExports": true
+  "includeEntryExports": true,
+  "ignoreIssues": {
+    "src/db/messages-in.ts": ["exports"],
+    "src/mailbox/types.ts": ["types"]
+  }
 }

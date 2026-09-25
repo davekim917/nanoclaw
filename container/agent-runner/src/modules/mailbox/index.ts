@@ -12,14 +12,13 @@ import type { Database } from 'bun:sqlite';
 import { registerAdmissionGate } from '../../admission-gate.js';
 import { getConfig } from '../../config.js';
 import { getOutboundDb } from '../../mailbox/sqlite/connection.js';
-import { SqliteAgentMailbox } from '../../mailbox/sqlite/index.js';
+import { inboundMessage as upstreamInboundMessage, SqliteAgentMailbox } from '../../mailbox/sqlite/index.js';
 import {
   sqliteMarkCompleted,
   sqliteMarkFailed,
   sqliteMarkProcessing,
   sqliteTimestamp,
 } from '../../mailbox/sqlite/operations.js';
-import { parseInboundRecord } from '../../mailbox/model.generated.js';
 import type { InboundMessage, MailboxOperations, MailboxSessionKey, ProcessingStatus } from '../../mailbox/types.js';
 import type { MessageInRow } from '../../db/messages-in.js';
 import { ensureNanoclawOutboundSchema, prepareOutboundFile } from './schema.js';
@@ -132,11 +131,10 @@ function admitChatWrite(id: string, kind: string, content: string): boolean {
 
 /* ─── Inbound record mapping ───────────────────────────────────────────────── */
 
-// Mirrors upstream's private inboundMessage()/parseInboundMessage() in
-// mailbox/sqlite/index.ts — the fork's selection returns rows, so the same
+// The fork's selection returns rows, so it maps them with upstream's
 // row→record mapping (and the same skip-and-log on a row that fails the
-// canonical parse) has to run here. M-1 (inbound-kinds.ts) proved the fork
-// writes only upstream's five kinds, so upstream's parser is sufficient.
+// canonical parse). The fork writes only upstream's five kinds
+// (inbound-kinds.ts), so upstream's parser is sufficient.
 /**
  * Upstream's inbound record plus the fork-only columns it does not model.
  *
@@ -151,26 +149,8 @@ export interface NanoclawInboundMessage extends InboundMessage {
 }
 
 function inboundMessage(row: MessageInRow): NanoclawInboundMessage {
-  const record = parseInboundRecord({
-    id: row.id,
-    sequence: row.seq,
-    kind: row.kind,
-    timestamp: sqliteTimestamp(row.timestamp),
-    status: row.status,
-    processAfter: row.process_after === null ? null : sqliteTimestamp(row.process_after),
-    recurrence: row.recurrence,
-    seriesId: row.series_id ?? null,
-    tries: row.tries,
-    trigger: row.trigger === 1,
-    platformId: row.platform_id,
-    channelType: row.channel_type,
-    threadId: row.thread_id,
-    content: row.content,
-    sourceSessionId: row.source_session_id ?? null,
-    onWake: row.on_wake === 1,
-  });
   return {
-    ...record,
+    ...upstreamInboundMessage(row),
     // Through sqliteTimestamp for the same reason `process_after` is: the
     // host's one-time backfill copies `process_after` verbatim, so a row
     // migrated on an install whose older writers used SQLite's naive
