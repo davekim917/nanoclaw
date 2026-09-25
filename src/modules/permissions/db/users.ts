@@ -30,3 +30,7 @@ export const USER_BY_ID_SQL = 'SELECT * FROM users WHERE id = ?';
 export async function getUser(id: string): Promise<User | undefined> {
   return getDb().get<User>(USER_BY_ID_SQL, id);
 }
+
+export async function getAllUsers(): Promise<User[]> {
+  return getDb().all<User>('SELECT * FROM users ORDER BY created_at');
+}
