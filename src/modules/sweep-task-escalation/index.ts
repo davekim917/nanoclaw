@@ -150,8 +150,8 @@ async function escalateSeries(
   });
 
   // The episode is stamped only on a delivery that actually reached someone.
-  // Stamping on a failed send is the false receipt that made the health
-  // sentinel go quiet for three days (#538) — an unreachable operator must
+  // Stamping on a failed send is a false receipt that can silence the health
+  // sentinel for days — an unreachable operator must
   // leave the alert armed so the next tick tries again, not mark it spoken for.
   if (await notifyOperators(text, { source: 'task-failure-escalation', seriesId, agentGroupId })) {
     await markEscalated(newest.id);
@@ -180,7 +180,7 @@ export async function runTaskFailureEscalation(): Promise<void> {
   }
 }
 
-export function registerTaskEscalationSweepDuties(): void {
+function registerTaskEscalationSweepDuties(): void {
   registerSweepDuty({
     name: SWEEP_DUTY_INVENTORY.T24,
     phase: 'tick:housekeeping',

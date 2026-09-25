@@ -62,11 +62,11 @@ import type { Session } from '../../types.js';
 
 export const QUIET_MS = 24 * 60 * 60_000;
 export const MAX_AGE_MS = 72 * 60 * 60_000;
-export const SCAN_INTERVAL_MS = 30 * 60_000;
-export const PROMISE_THRESHOLD = 0.85;
+const SCAN_INTERVAL_MS = 30 * 60_000;
+const PROMISE_THRESHOLD = 0.85;
 export const NUDGE_DAILY_CAP = 10;
 const MAX_MESSAGE_CHARS = 6_000;
-export const NUDGE_ID_PREFIX = 'promise-nudge-';
+const NUDGE_ID_PREFIX = 'promise-nudge-';
 
 export type PromiseWatchMode = 'off' | 'shadow' | 'nudge';
 
@@ -145,7 +145,7 @@ export function admissible(
 }
 
 /** The promise question from the backtest (V2), plus scheduled-time wording it missed. */
-export const PROMISE_QUESTION: JevQuestion = {
+const PROMISE_QUESTION: JevQuestion = {
   type: 'noul',
   instructions:
     'The agent commits itself to doing further work after this message on its own initiative — for example ' +
@@ -168,7 +168,7 @@ export function redact(text: string): string {
     .slice(0, MAX_MESSAGE_CHARS);
 }
 
-export function nudgeText(promisedAt: string, excerpt: string): string {
+function nudgeText(promisedAt: string, excerpt: string): string {
   return (
     `[system] Promise check. Your last message in this conversation (${promisedAt}) committed to further work, ` +
     `and nothing has happened here since — no continue_work, no wait, no later message. The message began: ` +
@@ -339,7 +339,7 @@ function readSnapshot(mailbox: NanoclawMailboxSession): SessionSnapshot {
 const CAP_FILE = path.join(DATA_DIR, 'promise-watch-nudges.json');
 
 /** A real UTC calendar day in YYYY-MM-DD form (rejects 2026-99-99 and 2026-02-31). */
-export function isCalendarDay(day: string): boolean {
+function isCalendarDay(day: string): boolean {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return false;
   const t = Date.parse(`${day}T00:00:00Z`);
   return Number.isFinite(t) && new Date(t).toISOString().slice(0, 10) === day;
@@ -437,7 +437,7 @@ function productionDeps(mode: PromiseWatchMode): ScanDeps {
 let lastScanAt = 0;
 let scanning = false;
 
-export function registerPromiseWatchSweepDuties(): void {
+function registerPromiseWatchSweepDuties(): void {
   registerSweepDuty({
     name: SWEEP_DUTY_INVENTORY.FORK5,
     phase: 'tick:housekeeping',

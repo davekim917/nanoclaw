@@ -859,7 +859,7 @@
 "src/modules/cross-session-context/index.ts":{"diff":43,"mode":"100644","sha256":null,"deleted":true},
 "src/modules/cross-session-context/prune.test.ts":{"diff":83,"mode":"100644","sha256":null,"deleted":true},
 "src/modules/cross-session-context/prune.ts":{"diff":23,"mode":"100644","sha256":null,"deleted":true},
-"src/modules/index.ts":{"diff":87,"mode":"100644","sha256":"214e6af74414a5aa969b0660f41c908aa68dc4d7d0d4b59b9f2aab349845ba9f"},
+"src/modules/index.ts":{"diff":85,"mode":"100644","sha256":"7edc1bf258571a404391adae11408a0067f4229c6050c05951e2c04e7ad715a5"},
 "src/modules/interactive/agent.md":{"diff":0,"mode":"100644","sha256":"6ebb9d5923a3a5317d8b37172adc58a04c1171586656a17ffac09df5a61116d4"},
 "src/modules/interactive/index.ts":{"diff":16,"mode":"100644","sha256":"ae8779247d28d45845b2f2d5e239608cb3451893bac1a6ebb105825713aef5f9"},
 "src/modules/interactive/project.md":{"diff":0,"mode":"100644","sha256":"8fd804cc57f372d7b2c61297c0e5a11380185c19071741382a0ec60b2056bcfc"},

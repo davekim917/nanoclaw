@@ -1,11 +1,11 @@
 /**
- * Sweep family: central housekeeping (seam 2, S2-PR4).
+ * Sweep family: central housekeeping.
  *
  * Order-free `tick:housekeeping` work moved out of src/host-sweep.ts unchanged
  * (plan.md §4.3/§4.7): T7 github-app-token-refresh (20), T9 steer-idempotency
  * prune (30), T10 channel-ingress-receipt prune (40), T15 session-title sweep
  * (80), T16 thread-title retry (90), T17 dashboard-token prune (120). Phase
- * and order are unchanged from the PR 5 baseline — those coordinates encode
+ * and order are fixed — those coordinates encode
  * ordering constraints (plan.md §4.3 table) and must never move.
  *
  * github-token-file-refresh (25) is NOT part of that seam-2 port — it is a
@@ -19,13 +19,12 @@
  * host-sweep-registry.test.ts stays an exact accounting of every registered
  * duty, ported or fork-only.
  *
- * FORK2 coordination-orphans (130) is likewise a fork addition, from seam 4
- * series A' (issue #430): the coordination tables gained writers, and a write
+ * FORK2 coordination-orphans (130) is likewise a fork addition: the coordination tables gained writers, and a write
  * that lands after session teardown leaves a row no foreign key removes. Last
  * in the phase because the rows are inert and nothing else here reads them.
  *
- * T23 cli-request-execution-prune (42) was added later (issue #273's
- * at-most-once ncl ledger): slotted right after T10 since both are
+ * T23 cli-request-execution-prune (42), the at-most-once ncl ledger prune, is
+ * slotted right after T10 since both are
  * order-free receipt/ledger prunes with no dependency on one another (42, not
  * 45 — host-sweep-registry.test.ts's F-4.4 probe reserves order 45 in this
  * phase to prove tick-level duty isolation past T10's throw).
@@ -111,7 +110,7 @@ function registerCentralSweepDuties(): void {
     name: id.T23,
     phase: 'tick:housekeeping',
     order: 42,
-    // Prune the agent `ncl` at-most-once execution ledger (issue #273). Its
+    // Prune the agent `ncl` at-most-once execution ledger. Its
     // rows only have to outlive the delivery loop's retry of one outbound row.
     run: async () => {
       await pruneCliRequestExecutions();
@@ -167,7 +166,7 @@ function registerCentralSweepDuties(): void {
     name: id.FORK2,
     phase: 'tick:housekeeping',
     order: 130,
-    // Drop coordination rows whose session no longer exists (issue #430). A
+    // Drop coordination rows whose session no longer exists. A
     // delete that lands while a delivery is mid-flight, or while the spawn path
     // holds a claim, loses the race and leaves an inert row behind; migration
     // 071 declares no foreign key. Order-free and last in the phase: the rows

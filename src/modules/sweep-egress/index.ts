@@ -1,6 +1,5 @@
 /**
- * Sweep family: egress (seam 2, S2-PR6 — plan.md §5 "S2-PR6 claims + storage +
- * egress (G48/G45/G64)", §8 "S2-PR6 — claims, storage, egress"). Registers T2
+ * Sweep family: egress. Registers T2
  * (egress-network-reheal) on `tick:pre-session` at order 10 — the earliest
  * tick duty, before the per-session fan-out (constraint 4 in plan.md §4.3
  * lists T6/T10 as relying on the outer wrapper; T2 itself has no ordering
@@ -17,7 +16,7 @@ import { ensureEgressNetwork } from '../../egress-lockdown.js';
 import { log } from '../../log.js';
 import { registerSweepDuty, registerSweepDutySource, SWEEP_DUTY_INVENTORY } from '../../host-sweep.js';
 
-export function registerEgressSweepDuties(): void {
+function registerEgressSweepDuties(): void {
   registerSweepDuty({
     name: SWEEP_DUTY_INVENTORY.T2,
     phase: 'tick:pre-session',

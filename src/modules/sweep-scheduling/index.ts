@@ -1,5 +1,5 @@
 /**
- * Scheduling + thread-close — S2-PR11 (docs/specs/upstream-host-sweep-seam/plan.md).
+ * Scheduling + thread-close.
  *
  * Four duties, three of them the scheduled-task lifecycle and one the
  * operator-confirmed thread close:
@@ -15,7 +15,7 @@
  * inside the window the driver already opened and holds no second session on
  * the same key (constraint 18, invariant I-3):
  * `runHostGatedTaskScripts` and `handleRecurrence` take the sweep's OWN
- * session as their first parameter (mailbox seam PR 4) rather than opening
+ * session as their first parameter rather than opening
  * one of their own.
  */
 import { isContainerRunning } from '../../container-runner.js';
@@ -89,7 +89,7 @@ export async function _prepareDueWakeForTesting(
   return prepareDueWake(mailbox, agentGroupId, sessionId);
 }
 
-export function registerSchedulingSweepDuties(): void {
+function registerSchedulingSweepDuties(): void {
   const id = SWEEP_DUTY_INVENTORY;
 
   registerSweepDuty({
@@ -122,7 +122,7 @@ export function registerSchedulingSweepDuties(): void {
     order: 20,
     // 8. Recurrence fanout for completed recurring tasks.
     // MODULE-HOOK:scheduling-recurrence:start
-    // Takes this session (mailbox seam PR 4). Same rule as
+    // Takes this session. Same rule as
     // `runHostGatedTaskScripts` in prepareDueWake: a sweep callee with no other
     // production caller receives the sweep's session, never a raw handle and
     // never its own nested open on the same key.
@@ -159,7 +159,7 @@ export function registerSchedulingSweepDuties(): void {
       const { session, mailbox } = asSessionContext(ctx);
       if (isTaskThread(session.thread_id)) {
         // Keyed dispatch receipts must remain addressable by the active-session
-        // lookup (src/session-manager.ts:428–470). Container idle reaping is
+        // lookup in src/session-manager.ts. Container idle reaping is
         // independent; keeping this metadata does not keep its process alive.
         if (mailbox!.hasTaskDispatchEvents()) return;
         const liveTasks = mailbox!.countLiveTasks();
@@ -214,7 +214,7 @@ export function registerSchedulingSweepDuties(): void {
         }
         await updateSession(session.id, { status: 'closed' });
         // The ONLY active->closed transition on the host, and therefore the
-        // whole of #520's leak: `expireStalePending` runs as duty S3 inside a
+        // one place pending work can leak: `expireStalePending` runs as duty S3 inside a
         // loop over ACTIVE sessions, so anything still `pending` here is out
         // of its reach the moment the row above flips, and pins the session
         // directory against reclaim forever via `sessionHasOpenWork`.
@@ -245,8 +245,8 @@ export function registerSchedulingSweepDuties(): void {
     // state is current. Nothing here can START a close; only an operator can.
     run: async () => {
       try {
-        // Awaited (mailbox seam PR 4): the close path became asynchronous when
-        // its proposal reads moved behind the funnel, and an unawaited call
+        // Awaited: the close path is asynchronous because
+        // its proposal reads go through the funnel, and an unawaited call
         // would let the tick finish while the close is still mid-flight —
         // rejections escaping this catch, and the duty reporting success it
         // has not had.

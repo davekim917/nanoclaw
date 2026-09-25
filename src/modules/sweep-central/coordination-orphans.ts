@@ -4,10 +4,10 @@ import { log } from '../../log.js';
 /** The coordination tables keyed by `session_id`, in delete order. */
 const COORDINATION_TABLES = ['delivery_attempts', 'session_claims', 'wake_signals'] as const;
 
-export type CoordinationOrphanCounts = Record<(typeof COORDINATION_TABLES)[number], number>;
+type CoordinationOrphanCounts = Record<(typeof COORDINATION_TABLES)[number], number>;
 
 /**
- * Drop coordination rows whose session no longer exists (issue #430).
+ * Drop coordination rows whose session no longer exists.
  *
  * Teardown removes a session's coordination rows, but a write that lands after
  * the delete wins the race: a delivery still awaiting an adapter when its group

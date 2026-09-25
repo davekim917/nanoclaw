@@ -4,9 +4,6 @@ import { log } from '../../log.js';
 /**
  * Prune steer_idempotency rows: applied rows older than 60s, pending rows
  * older than 5min.
- *
- * Moved unchanged from src/host-sweep.ts (seam 2, S2-PR4 — central
- * housekeeping). Same statements, same log strings, same thresholds.
  */
 export async function pruneSteerIdempotency(): Promise<void> {
   try {

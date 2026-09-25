@@ -9,14 +9,9 @@
  * asymmetry is why both halves live in one module instead of splitting
  * across host-sweep.ts (start) and main.ts (stop), as they did before.
  *
- * The shutdown half is S2-PR1's, taken verbatim: `onHostShutdown` from
- * `host-lifecycle.ts` (S2-PR0) is the ONE stop path — `stopHostModules()`
- * runs before `stopHostSweep()` by design and S2-PR1 removed main.ts's own
- * direct stop call. S2-PR6's branch base carried neither file, so its own
- * copy of this module registered nothing (its earlier `response-registry`
- * substitute was withdrawn after Codex's PR6 review F1); on this integrated
- * lineage the file keeps PR 1's version and gains only PR 6's T13
- * registration below. Do not add a second stop path here.
+ * The shutdown half: `onHostShutdown` from `host-lifecycle.ts` is the ONE
+ * stop path — `stopHostModules()` runs before `stopHostSweep()` by design,
+ * and main.ts has no direct stop call. Do not add a second stop path here.
  */
 import { onHostShutdown } from '../../host-lifecycle.js';
 import { getStorageProtectedSessionIds } from '../../container-runner.js';
@@ -26,8 +21,7 @@ import { runStorageMaintenanceInBackground, stopStorageMaintenanceWorker } from 
 import { handleStoragePressureAlert } from '../../storage-pressure-alert.js';
 
 /**
- * Same fire-and-forget semantics as the former host-sweep.ts:1206 call site,
- * including its existing `.catch` — reclaim disk from idle caches and Docker
+ * Fire-and-forget, with a `.catch` — reclaim disk from idle caches and Docker
  * artifacts after per-session sweep work has had a chance to notice and wake
  * due messages, without blocking the host event loop.
  */
@@ -48,13 +42,9 @@ onHostShutdown(async function storageMaintenanceHostShutdown() {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// S2-PR6: T13 (storage-maintenance) sweep duty registration.
-//
-// Moved from src/host-sweep.ts UNCHANGED (plan.md §4.3 constraint 2:
-// "storage maintenance after the session loop" — tick:post-session, order
-// 30). The pre-move body duplicated exactly the fire-and-forget chain
-// `startStorageMaintenanceOnce` above already implements, so the registered
-// duty calls this module's own export instead of re-stating it.
+// T13 (storage-maintenance) sweep duty registration. Storage maintenance runs
+// after the session loop (tick:post-session, order 30), and the duty calls
+// `startStorageMaintenanceOnce` above rather than re-stating its chain.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function registerStorageSweepDuties(): void {
@@ -69,7 +59,7 @@ export function registerStorageSweepDuties(): void {
     // loop stays available for channel heartbeats and inbound events.
     run: (ctx) => {
       // Active containers PLUS the pending survivors adoption could not yet
-      // claim (seam 4 E/D2, #462 item 4): a survivor whose storage lease could
+      // claim: a survivor whose storage lease could
       // not be taken is otherwise unprotected from the worker's cleanup.
       startStorageMaintenanceOnce([...new Set([...ctx.activeContainerSessionIds, ...getStorageProtectedSessionIds()])]);
     },

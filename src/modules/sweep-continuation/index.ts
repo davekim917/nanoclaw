@@ -1,6 +1,5 @@
 /**
- * Continuation and ceiling accountability — S2-PR13, the G09 family
- * (docs/specs/upstream-host-sweep-seam/plan.md §4.3, §8).
+ * Continuation and ceiling accountability.
  *
  * Seven registrations, all of them about work the host promised on an agent's
  * behalf and must still answer for after a crash or a ceiling kill:
@@ -170,9 +169,9 @@ async function incrementStoppedContinuationAttempt(
  * TOCTOU site: the container-state check must happen INSIDE the session, after
  * the open and immediately before the mutation.
  *
- * Lives here rather than in host-sweep.ts because S2-PR13 moved
- * `incrementStoppedContinuationAttempt` into this family; the shim travels with
- * its body, exactly as S2-PR10's SLA entry point did. Its signature and the
+ * Lives here rather than in host-sweep.ts because
+ * `incrementStoppedContinuationAttempt` belongs to this family; the shim lives
+ * with its body, as the SLA entry point does. Its signature and the
  * cases that call it are unchanged.
  */
 export function _incrementStoppedContinuationAttemptForTesting(
@@ -369,7 +368,7 @@ export function _applyCeilingFollowUpForTesting(
  * never opens outbound.db for writing at all, and the earlier
  * `writableOutDb` test seam is gone with it.
  */
-export function notifyKillCeiling(
+function notifyKillCeiling(
   mailbox: NanoclawMailboxSession,
   session: Session,
   heartbeatAgeMs: number,
@@ -461,7 +460,7 @@ export function _notifyKillCeilingForTesting(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Wakes S9b has started and not yet settled (#359).
+ * Wakes S9b has started and not yet settled.
  *
  * The wake is detached, so its follow-up work outlives the tick that started
  * it. Two things need that fact to be observable:
@@ -507,7 +506,7 @@ export function _resetDetachedWakesForTesting(): void {
   detachedWakes.clear();
 }
 
-/** Test-only: how many detached follow-ups are in flight (#359 dedupe). */
+/** Test-only: how many detached follow-ups are in flight (the dedupe set). */
 export function _detachedWakeCountForTesting(): number {
   return detachedWakes.size;
 }
@@ -517,7 +516,7 @@ export function _settleDetachedWakesForTesting(): Promise<void> {
   return Promise.all([...detachedWakes.values()]).then(() => undefined);
 }
 
-export function registerContinuationSweepDuties(): void {
+function registerContinuationSweepDuties(): void {
   const id = SWEEP_DUTY_INVENTORY;
 
   registerSweepDuty({
@@ -531,8 +530,7 @@ export function registerContinuationSweepDuties(): void {
     // copy the close path trusts (see thread-close.ts). Isolated: a mirror
     // failure must never cost this session its sweep.
     //
-    // `syncDoneProposalMirror` now takes the PARSED proposal (mailbox seam
-    // PR 4), so the read is the module's own op and no handle leaves the
+    // `syncDoneProposalMirror` takes the PARSED proposal, so the read is the module's own op and no handle leaves the
     // session. The `hasOutbound` guard is kept for what it costs: a
     // never-woken session has no proposal to mirror and no outbound file to
     // open looking for one.
@@ -613,7 +611,7 @@ export function registerContinuationSweepDuties(): void {
     run: async (ctx) => {
       const c = asSessionContext(ctx);
       const { session, plan } = c;
-      // A spawn for this session is already in flight (#359). `wakeContainer`
+      // A spawn for this session is already in flight. `wakeContainer`
       // dedupes by session, so calling it again returns the SAME promise —
       // and wrapping that promise in a fresh `.then()` every tick is what made
       // the follow-ups accumulate: one closure per tick, each retaining this
@@ -634,7 +632,7 @@ export function registerContinuationSweepDuties(): void {
       // `session.archived_at` gates admission alongside the checks above, and
       // BEFORE the continuation-attempt increment below — not folded into the
       // `if` a few lines down. `unwakeableReason` already refuses an archived
-      // session with "session is archived" (`container-runner.ts:694`) — but
+      // session with "session is archived" — but
       // that refusal comes back as the same `false` a transient spawn failure
       // returns, which by design leaves the due row pending for the next tick
       // (see the comment on `wakeContainer never throws` below). An archived
@@ -694,7 +692,7 @@ export function registerContinuationSweepDuties(): void {
         // by-id caller already re-reads (`router.ts`, `agent-route.ts`,
         // `container-restart.ts`); this one did not.
         //
-        // DETACHED (#359). The per-session loop is serial, and a spawn can take
+        // DETACHED. The per-session loop is serial, and a spawn can take
         // 20-47 s because `ensureArchiveProjection` awaits ONE worker thread
         // that serialises builds — so awaiting here made the tick's cost track
         // the number of containers that happened to be due, not the number of
@@ -820,7 +818,7 @@ export function registerContinuationSweepDuties(): void {
       // replacement never consumes it, and it instead greets the NEXT fresh
       // container with a stale "your previous container was killed" notice —
       // while counting against that class's recovery-attempt cap. Skipping is
-      // correct, not merely safe (#332's reasoning, kept verbatim).
+      // correct, not merely safe.
       writeOutboundWhenStopped(ctx.session, mailbox, () => {
         try {
           applyCeilingFollowUp(
