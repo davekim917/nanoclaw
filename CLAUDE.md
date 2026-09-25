@@ -106,6 +106,17 @@ Before a PR, a skill, or any contribution, you MUST read [CONTRIBUTING.md](CONTR
 
 Any change to an upstream-owned file must regenerate `src/upstream-ratchet.json` (`pnpm run ratchet:report -- --write`); growth needs `--accept` and a reason in the PR body.
 
+## Review guidelines
+
+Beyond correctness, a reviewer checks:
+
+- **`Replaces:`** — the PR body names what the change supersedes, or `nothing`. Verify the claim, and that the replaced code is actually deleted in the same PR rather than left behind.
+- **Hard-coded values** that belong in config.
+- **A new helper where one already exists** — name the existing one.
+- **Code that belongs in a shared component** — logic re-implemented or copied across modules instead of centralised.
+
+Dead code, copy-paste clones, `file:line` citations and PR-number history in comments are flagged in CI by `scripts/hygiene/run.ts`; exemptions live only in `knip.json`, `container/agent-runner/knip.json` and `.jscpd.json`, which are `risk:high`.
+
 ## Development
 
 Run commands directly — don't tell the user to run them.

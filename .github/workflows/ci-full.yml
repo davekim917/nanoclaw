@@ -110,6 +110,12 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' && steps.bun_install.outcome == 'success' }}
         run: pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 
+      # The same whole-tree hygiene run as ci.yml, against main, so a finding
+      # that two separately green PRs create together shows up within a day.
+      - name: Hygiene checks
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && steps.bun_install.outcome == 'success' }}
+        run: pnpm exec tsx scripts/hygiene/run.ts --report
+
       # Everything except the three drift tests, which belong to `bookkeeping`.
       # See DRIFT_TESTS in vitest.config.ts. ONE step, not a plain run followed
       # by a second `--coverage` run: this repo's Actions-minutes budget is

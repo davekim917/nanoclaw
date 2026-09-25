@@ -1,0 +1,62 @@
+{
+  "minLines": 10,
+  "minTokens": 80,
+  "format": ["typescript", "javascript"],
+  "mirrors": [
+    {
+      "files": ["src/mailbox/model.ts", "container/agent-runner/src/mailbox/model.generated.ts"],
+      "reason": "Generated copy for the runner tree: `pnpm run mailbox-model:generate` writes it and `mailbox-model:check` compares the two byte for byte."
+    },
+    {
+      "files": ["src/mailbox/index.ts", "container/agent-runner/src/mailbox/index.ts"],
+      "reason": "Upstream mailbox-seam ports, kept byte-identical to upstream and pinned by src/mailbox/UPSTREAM-MANIFEST.json; neither side can be edited to share code."
+    },
+    {
+      "files": ["src/mailbox/sqlite/index.ts", "container/agent-runner/src/mailbox/sqlite/index.ts"],
+      "reason": "Upstream mailbox-seam ports, kept byte-identical to upstream and pinned by src/mailbox/UPSTREAM-MANIFEST.json; neither side can be edited to share code."
+    },
+    {
+      "files": ["src/plugin-exclusions.ts", "container/agent-runner/src/plugin-exclusions.ts"],
+      "reason": "Host and runner must agree on what an exclusion entry means; the two package trees share no modules, so the file is duplicated verbatim and src/plugin-exclusions-parity.test.ts fails on drift."
+    },
+    {
+      "files": ["src/plugin-skill-discovery.ts", "container/agent-runner/src/plugin-skill-discovery.ts"],
+      "reason": "Host and container discover plugin skills by the same rules; src/plugin-skill-discovery.test.ts asserts the runner copy stays logically identical."
+    },
+    {
+      "files": ["src/outcome-reporting-schema.ts", "container/agent-runner/src/outcome-reporting-schema.ts"],
+      "reason": "Wire contract between host and runner, mirrored into the runner package; src/outcome-reporting-schema.test.ts asserts the copies are identical."
+    },
+    {
+      "files": ["src/cli/stdin-json.ts", "container/agent-runner/src/cli/stdin-json.ts"],
+      "reason": "Both the host ncl and the in-container ncl parse --stdin-json the same way; the copies are byte-identical because the two package trees share no modules."
+    },
+    {
+      "files": ["src/test-hermeticity.ts", "container/agent-runner/src/test-hermeticity.ts"],
+      "reason": "Hermeticity guard for each test runner (vitest on the host, bun:test in the runner); the runner copy names the host file as its counterpart."
+    },
+    {
+      "files": ["src/timezone.ts", "container/agent-runner/src/timezone.ts"],
+      "reason": "Timezone rules the host and the container must apply identically; the runner copy is declared a mirror of the host file."
+    },
+    {
+      "files": ["src/managed-git-command-guard.ts", "container/agent-runner/src/managed-git-guard.ts"],
+      "reason": "The managed-git command parser is duplicated rather than imported across the package boundary, as the host file states."
+    },
+    {
+      "files": ["src/repository-workspaces.ts", "container/agent-runner/src/mcp-tools/checkout-layout.ts"],
+      "reason": "Checkout-layout primitive duplicated on purpose in the runner, as both files state; checkout-layout.fixtures.json is shared by both test suites."
+    },
+    {
+      "files": [
+        "src/modules/orchestrator-dispatch/derive-task-id.ts",
+        "container/agent-runner/src/dispatch/derive-task-id.ts"
+      ],
+      "reason": "Host and runner must derive the same dispatch task id; the runner copy states it is the identical algorithm."
+    },
+    {
+      "files": ["src/command-gate.ts", "container/agent-runner/src/formatter.ts"],
+      "reason": "The runner mirrors the host's user-message extraction and mention stripping, as formatter.ts states, so both sides classify the same commands."
+    }
+  ]
+}
