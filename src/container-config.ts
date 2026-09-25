@@ -170,7 +170,7 @@ const SECRET_QUERY_SUFFIX_RE = new RegExp(`(${CREDENTIAL_NOUNS})$`, 'i');
 const CAMEL_SPLIT_RE = /([a-z0-9])([A-Z])/g;
 
 /** Whether a query parameter NAME signals a credential. */
-export function isCredentialQueryKey(key: string): boolean {
+function isCredentialQueryKey(key: string): boolean {
   const normalized = key.replace(CAMEL_SPLIT_RE, '$1_$2');
   return SECRET_QUERY_WORD_RE.test(normalized) || SECRET_QUERY_SUFFIX_RE.test(normalized);
 }
