@@ -71,7 +71,7 @@ export interface SignalDecision {
   capabilities: { claim: boolean; answer: boolean; dispatch: boolean; release?: boolean };
   history: SignalDecisionEvent[];
 }
-interface SignalClaimDetail {
+export interface SignalClaimDetail {
   slug: string;
   owner: string;
   /** Source-provided note headline, not a generated task title or verified outcome. */
@@ -83,7 +83,7 @@ interface SignalClaimDetail {
   thread_id: string | null;
   source_url: string | null;
 }
-interface SignalAgent {
+export interface SignalAgent {
   id: string;
   workgroup_id: string;
   name: string;
