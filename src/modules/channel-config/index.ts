@@ -271,6 +271,3 @@ const CHANNEL_CONFIG_ACTION = unguarded(
 );
 registerDeliveryAction('set_channel_model', handleSetChannelModel, CHANNEL_CONFIG_ACTION);
 registerDeliveryAction('set_channel_effort', handleSetChannelEffort, CHANNEL_CONFIG_ACTION);
-
-// Export for testing.
-export { deriveCallerId as _deriveCallerId, resolveChannelMessagingGroupId as _resolveChannelMessagingGroupId };

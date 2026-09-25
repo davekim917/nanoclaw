@@ -8,8 +8,8 @@ import type { RawStatements } from '../../db/central-lease.js';
  * The token reads from the OWNER's Slack lens, so the host decides per spawn
  * whether it is injected at all: a session that is not owner-safe spawns under
  * the `<group>-noslack` OneCLI identity whose secret set excludes it (the
- * two-tier identity at `src/container-runner.ts:6938`, which runs
- * only when `slackUserTokenSecrets` finds a secret, `:6941`). There is no second layer: a Slack MCP used to
+ * two-tier identity in `src/container-runner.ts`, which runs
+ * only when `slackUserTokenSecrets` finds a secret). There is no second layer: a Slack MCP used to
  * be registered behind this same predicate and was retired, so this function
  * is the whole authorization decision.
  *
@@ -119,8 +119,7 @@ export function isOwnerSafeSlackSession(
   //   1. session's messaging_group is a 1:1 DM (is_group = 0) and is wired
   //      to THIS spawning agent (mga_session.agent_group_id = agentGroupId);
   //      filtering by the active agent prevents a multi-wired DM from
-  //      authorizing via a different agent's workgroup. Codex P2 #3 on
-  //      PR #110.
+  //      authorizing via a different agent's workgroup.
   //   2. the spawning agent has a non-null workgroup_id (post-migration-036;
   //      standalone agents are workgroup-of-1)
   //   3. some global owner (role='owner', agent_group_id IS NULL) has a
@@ -131,7 +130,7 @@ export function isOwnerSafeSlackSession(
   //      (channel_type segment before first '-' — `slack`, `discord`,
   //      `telegram`, etc.). Platform-prefix equality on top of handle
   //      equality prevents cross-platform handle collision from authorizing
-  //      (Codex P1 on PR #110: `telegram:123` owner ≠ `slack-retail:123` session
+  //      (`telegram:123` owner ≠ `slack-retail:123` session
   //      user even if handles collide). Workgroup equality on top of
   //      handle equality prevents cross-workspace collision (different
   //      Slack workspaces have different workgroups). All three must hold.

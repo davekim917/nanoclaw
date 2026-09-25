@@ -42,8 +42,7 @@ export async function createPendingChannelApproval(row: PendingChannelApproval):
 }
 
 /** The row the `channels.register` guard reads. */
-export const PENDING_CHANNEL_APPROVAL_BY_GROUP_SQL =
-  'SELECT * FROM pending_channel_approvals WHERE messaging_group_id = ?';
+const PENDING_CHANNEL_APPROVAL_BY_GROUP_SQL = 'SELECT * FROM pending_channel_approvals WHERE messaging_group_id = ?';
 
 /**
  * Synchronous and lease-only (seam-3 plan §4.5, I-1): the `channels.register`

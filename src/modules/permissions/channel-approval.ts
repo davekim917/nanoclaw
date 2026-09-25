@@ -97,7 +97,7 @@ export const AGENT_ACCESS_SCOPE_WARNING =
 // Interceptor errors fall back to the card — a broken module must never make
 // escalations silently vanish.
 
-export type ChannelCardDecision = 'card' | 'handled';
+type ChannelCardDecision = 'card' | 'handled';
 export type ChannelCardInterceptor = (mg: MessagingGroup, event: InboundEvent) => Promise<ChannelCardDecision>;
 
 const channelCardInterceptors = new Map<string, ChannelCardInterceptor>();
@@ -237,7 +237,7 @@ export interface RequestChannelApprovalInput {
   event: InboundEvent;
 }
 
-function isSameInboundEvent(raw: string, event: InboundEvent): boolean {
+export function isSameInboundEvent(raw: string, event: InboundEvent): boolean {
   try {
     const stored = JSON.parse(raw) as InboundEvent;
     return (

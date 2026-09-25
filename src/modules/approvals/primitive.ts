@@ -10,8 +10,7 @@
  *     the response handler dispatches into the registered callback. Optional
  *     modules (self-mod, future module gates) register here.
  *
- * Approver picking lives here too — it used to sit in src/access.ts and got
- * folded in with the PR #7 re-tier. The picks functions walk user_roles
+ * Approver picking lives here too. The picks functions walk user_roles
  * (owner, global admin, scoped admin) and resolve to a reachable DM via the
  * permissions module's user-dm helper.
  *
@@ -19,7 +18,7 @@
  * it here is technically a tier inversion — but the host bundles both with
  * main, and the alternative (a third "permissions-primitive" default module
  * exposing just user-roles/user-dms) is more churn than it's worth. Revisit
- * if either module becomes genuinely optional (see REFACTOR_PLAN open q #3).
+ * if either module becomes genuinely optional.
  */
 import { normalizeOptions, type NormalizedOption, type RawOption } from '../../channels/ask-question.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
@@ -159,6 +158,16 @@ export async function pickApprover(agentGroupId: string | null): Promise<string[
   for (const r of await getOwners()) add(r.user_id);
 
   return approvers;
+}
+
+/** Owners → global admins → admins @ that group: the reverse of pickApprover. */
+export async function pickOwnersFirst(agentGroupId: string | null): Promise<string[]> {
+  const roles = [
+    ...(await getOwners()),
+    ...(await getGlobalAdmins()),
+    ...(agentGroupId ? await getAdminsOfAgentGroup(agentGroupId) : []),
+  ];
+  return [...new Set(roles.map((r) => r.user_id))];
 }
 
 /**
@@ -600,7 +609,7 @@ export async function approvalResolutionLine(
 /**
  * Edit an approval card to show how a click resolved it.
  *
- * The bridge edits no approval card on click (chat-sdk-bridge.ts:1176, :2079):
+ * The bridge edits no approval card on click:
  * it sees only the id the button carried, so it cannot know the clicked
  * message was this approval's own card, nor that the clicker may decide it.
  * The resolution edit happens here instead — addressed to the card the ROW

@@ -41,8 +41,8 @@ import { centralTransaction } from '../../db/central-lease.js';
 import { completeDeferredInbound } from '../../router.js';
 import { log } from '../../log.js';
 import type { InboundEvent } from '../../channels/adapter.js';
-import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
-import { AGENT_ACCESS_SCOPE_WARNING } from './channel-approval.js';
+import { pickApprovalDelivery, pickApprover, pickOwnersFirst } from '../approvals/primitive.js';
+import { AGENT_ACCESS_SCOPE_WARNING, isSameInboundEvent } from './channel-approval.js';
 import {
   claimDeclineStamp,
   clearDeclineStamp,
@@ -50,7 +50,7 @@ import {
   getInFlightSenderApproval,
   isDeclineStampId,
 } from './db/pending-sender-approvals.js';
-import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from './db/user-roles.js';
+import { getOwners } from './db/user-roles.js';
 import { getUser } from './db/users.js';
 
 const APPROVAL_OPTIONS: RawOption[] = [
@@ -68,20 +68,6 @@ export interface RequestSenderApprovalInput {
   senderIdentity: string; // namespaced user id (channel_type:handle)
   senderName: string | null;
   event: InboundEvent;
-}
-
-function isSameInboundEvent(raw: string, event: InboundEvent): boolean {
-  try {
-    const stored = JSON.parse(raw) as InboundEvent;
-    return (
-      stored.channelType === event.channelType &&
-      (stored.instance ?? stored.channelType) === (event.instance ?? event.channelType) &&
-      stored.platformId === event.platformId &&
-      stored.message.id === event.message.id
-    );
-  } catch {
-    return false;
-  }
 }
 
 /** True only when this exact event is the one retained for later replay. */
@@ -212,17 +198,10 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
   return true;
 }
 
-/**
- * Option value the admin clicked that means "allow" — shared with the
- * response handler so the two sides can't drift.
- */
-export const APPROVE_VALUE = 'approve';
-export const REJECT_VALUE = 'reject';
-
 // ── Decline-and-notify (unknown_sender_policy = 'decline_notify') ──
 
 /** At most one decline + one FYI per (sender, messaging group) per this window. */
-export const DECLINE_NOTIFY_DEDUPE_MS = 24 * 60 * 60 * 1000;
+const DECLINE_NOTIFY_DEDUPE_MS = 24 * 60 * 60 * 1000;
 
 /** Stamp key for a sender the resolver couldn't identify — the messaging
  *  group (a 1:1 DM) still keys the pair, so dedupe holds. */
@@ -240,21 +219,8 @@ const UNKNOWN_SENDER_KEY = 'unknown';
  * a teammate's DM while the owner saw nothing. Admins stay on as
  * reachability fallback.
  */
-async function fyiRecipients(agentGroupId: string | null): Promise<string[]> {
-  const ordered: string[] = [];
-  const seen = new Set<string>();
-  const add = (id: string): void => {
-    if (!seen.has(id)) {
-      seen.add(id);
-      ordered.push(id);
-    }
-  };
-  for (const r of await getOwners()) add(r.user_id);
-  for (const r of await getGlobalAdmins()) add(r.user_id);
-  if (agentGroupId) {
-    for (const r of await getAdminsOfAgentGroup(agentGroupId)) add(r.user_id);
-  }
-  return ordered;
+function fyiRecipients(agentGroupId: string | null): Promise<string[]> {
+  return pickOwnersFirst(agentGroupId);
 }
 
 /** A usable display name, or null — an empty string is not a name. */
@@ -341,11 +307,11 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
     // only if we go on to win — a stamp being refreshed has no receipt of its
     // own, and its body is the sentinel, not an event.
     //
-    // The dedupe decision and the stamp are ONE statement (issue #443, Codex
-    // round 1): `claimDeclineStamp` folds the freshness test into the upsert's
+    // The dedupe decision and the stamp are ONE statement:
+    // `claimDeclineStamp` folds the freshness test into the upsert's
     // conflict clause, so exactly one caller comes back true and only that
     // caller sends. The pre-claim READ and that claim are one central
-    // transaction (fork issue #452, site 3): read outside it, the read can
+    // transaction: read outside it, the read can
     // find no row, yield, and the claim then overwrites a card inserted in
     // the gap — whose deferred receipt is never completed. Under BEGIN
     // IMMEDIATE the card is either already there (read, then closed below) or

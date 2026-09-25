@@ -19,7 +19,7 @@ import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
-import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from '../permissions/db/user-roles.js';
+import { pickOwnersFirst } from '../approvals/primitive.js';
 
 /**
  * OWNERS-FIRST candidate order — the reverse of pickApprover. An escalation's
@@ -28,19 +28,8 @@ import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from '../permission
  * answer it (observed live: the card landed in a teammate's DM while the
  * owner saw nothing). Admins remain as reachability fallback only.
  */
-async function escalationApprovers(agentGroupId: string): Promise<string[]> {
-  const ordered: string[] = [];
-  const seen = new Set<string>();
-  const add = (id: string): void => {
-    if (!seen.has(id)) {
-      seen.add(id);
-      ordered.push(id);
-    }
-  };
-  for (const r of await getOwners()) add(r.user_id);
-  for (const r of await getGlobalAdmins()) add(r.user_id);
-  for (const r of await getAdminsOfAgentGroup(agentGroupId)) add(r.user_id);
-  return ordered;
+function escalationApprovers(agentGroupId: string): Promise<string[]> {
+  return pickOwnersFirst(agentGroupId);
 }
 
 const MAX_QUESTION_CHARS = 1500;
@@ -52,10 +41,7 @@ const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
 const RATE_LIMIT_MAX = 3;
 const recentBySession = new Map<string, number[]>();
 
-export async function applyOwnerEscalation(
-  content: Record<string, unknown>,
-  session: Session,
-): Promise<DeliveryActionResult> {
+async function applyOwnerEscalation(content: Record<string, unknown>, session: Session): Promise<DeliveryActionResult> {
   const question = typeof content.question === 'string' ? content.question.trim() : '';
   const unknownKeys = Object.keys(content).filter((key) => !ALLOWED_KEYS.has(key));
   if (unknownKeys.length > 0 || question === '' || question.length > MAX_QUESTION_CHARS) {

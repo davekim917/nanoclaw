@@ -211,12 +211,11 @@ async function handleUnknownSender(
   if (decision.effect === 'deny' && isDeclineNotify) {
     // The decline copy assumes a 1:1 DM surface, so this needs POSITIVE
     // evidence of one — `mg.is_group !== 1` is not that. The router's
-    // auto-create default (router.ts:599,608) only resolves an adapter
+    // auto-create default only resolves an adapter
     // that reports NEITHER isDM nor isGroup to is_group = 1
     // (group/mention-safe); is_group also defaults to 0 with NO adapter
     // evidence at all on other paths that create a row — the CLI's
-    // `is_group` field (src/cli/resources/messaging-groups.ts:102-106) and
-    // the column itself (src/db/schema.ts:37) both default to 0. So
+    // `is_group` field and the column itself both default to 0. So
     // `mg.is_group` alone is never proof either way, and this event's own
     // live signal is required — the same reason the user_dms cache
     // requires `event.isDM === true` (src/router.ts, the 2a branch).
@@ -394,7 +393,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
   const currentMg = await getMessagingGroup(row.messaging_group_id);
   const voidedByPolicyFlip = currentMg?.unknown_sender_policy === 'decline_notify';
 
-  // ── Claim the card before acting on it (issue #443, Codex round 1) ──
+  // ── Claim the card before acting on it ──
   //
   // `getPendingSenderApproval` above is awaited, so it yields. Two callbacks
   // for the SAME card — an adapter retry, a double-click — can therefore both
@@ -444,8 +443,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     // The claim above already removed the row, and that row held the ONLY copy
     // of the retained inbound (`original_message`). If the member write fails
     // here, a plain rethrow would leave the sender approved-but-not-admitted
-    // with nothing left to replay and no card to click again (issue #443,
-    // Codex round 2).
+    // with nothing left to replay and no card to click again.
     //
     // So the claim is made recoverable by putting the row back, rather than by
     // adding a `claimed_at` column — a column means a migration, and the row
@@ -572,8 +570,8 @@ async function wireApprovedChannel(
 
   // Everything from here to the member write runs with the card already
   // claimed (deleted) and the retained inbound still deferred. A failure in
-  // this stretch used to lose the retry path: no card, no wiring, a receipt
-  // nothing would ever complete (fork issue #452, site 2). The claim stays a
+  // this stretch must not lose the retry path: no card, no wiring, a receipt
+  // nothing would ever complete. The claim stays a
   // DELETE — it is the arbiter between duplicate callbacks — so the recovery
   // is to put the full row BACK on failure: the next click (or the retained
   // inbound's own retry) finds the card exactly as it was.

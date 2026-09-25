@@ -24,11 +24,10 @@ import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { deletePendingApproval, getPendingApproval, getSession } from '../../db/sessions.js';
 import type { ResponsePayload } from '../../response-registry.js';
 import { log } from '../../log.js';
-import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { hasAdminPrivilege, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
 import { choiceClickAllowed, getChoiceHandler, resolveChoice } from './choices.js';
-import { finalizeReject } from './finalize.js';
+import { finalizeReject, writeApprovalNote } from './finalize.js';
 import { ONECLI_ACTION, resolveOneCLIApproval } from './onecli-approvals.js';
 import {
   editApprovalCardResolution,
@@ -56,10 +55,10 @@ async function isThreadDelivery(approval: PendingApproval, session: Session): Pr
 /**
  * Whether a click was made on this approval's own card: the clicked message
  * must be the one the host posted, whose id is stored from deliver's return
- * (primitive.ts:463-465, onecli-approvals.ts:424). Without a stored id there
+ * (see primitive.ts and onecli-approvals.ts). Without a stored id there
  * is nothing to match. A choice card then refuses, because its id is
  * backfilled just after delivery; any other kind resolves as it did before,
- * for a row stored without one (primitive.ts:463 skips a deliver that
+ * for a row stored without one (the primitive skips storing when deliver
  * returned no id).
  */
 function isClickOnApprovalCard(approval: PendingApproval, payload: ResponsePayload): boolean {
@@ -75,7 +74,7 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
   // from its own card. The button names just the approval id, and an agent
   // that writes a raw ask_question row can post a card of its own carrying
   // that id, and a click on it decodes through the approval's own options
-  // (src/db/sessions.ts:819-824), so it reads as a real answer. Claimed, so
+  // (src/db/sessions.ts), so it reads as a real answer. Claimed, so
   // no later handler takes the id either.
   if (!isClickOnApprovalCard(approval, payload)) {
     log.warn('Ignoring a click that was not made on the approval card', {
@@ -200,17 +199,7 @@ async function handleRegisteredApproval(
   }
 
   // Approved — dispatch to the module that registered for this action.
-  const notify = async (text: string): Promise<void> => {
-    await writeSessionMessage(session.agent_group_id, session.id, {
-      id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      kind: 'chat',
-      timestamp: new Date().toISOString(),
-      platformId: session.agent_group_id,
-      channelType: 'agent',
-      threadId: null,
-      content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
-    });
-  };
+  const notify = (text: string): Promise<void> => writeApprovalNote(session, text);
 
   const handler = getApprovalHandler(approval.action);
   if (!handler) {
