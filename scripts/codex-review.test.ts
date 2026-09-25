@@ -2603,6 +2603,9 @@ describe('codex-review risk-scoped review requests', () => {
       ['the line only in a fenced example', 'Write it like this:\n\n```\nReplaces: nothing\n```'],
       ['the line only in a template comment', '<!-- Replaces: nothing -->'],
       ['a value that is only a comment', 'Replaces: <!-- what this supersedes -->'],
+      ['a value that is only a zero-width space', 'Summary.\n\nReplaces: \u200b'],
+      ['a value that is only a word joiner', 'Summary.\n\nReplaces:\u2060\n'],
+      ['a value that is only a byte-order mark', 'Summary.\n\nReplaces: \ufeff \r\nMore.'],
     ])('refuses a body with %s, and says what line to add', (_case, body) => {
       const root = tempRoot();
       scopeFixture(root, { labels: [], body, reviewLoop: REPLACES_OPT_IN });
@@ -2621,6 +2624,7 @@ describe('codex-review risk-scoped review requests', () => {
       ['CRLF endings and no space', 'Summary.\r\n\r\nReplaces:nothing\r\n'],
       ['a lowercase key', 'replaces: nothing'],
       ['a real line after a fenced example', '```\nReplaces: x\n```\nReplaces: nothing'],
+      ['a description with a zero-width space inside it', 'Replaces: the old\u200b loader'],
     ])('allows a body whose Replaces line is %s', (_case, body) => {
       const root = tempRoot();
       scopeFixture(root, { labels: [], body, reviewLoop: REPLACES_OPT_IN });
@@ -5513,7 +5517,7 @@ describe('codex-review review-notes rule: a PR a reviewer said no to records its
     ['a zero-width space for a reason', 'Review-notes: none (\u200b)'],
     ['a no-break space for a reason', 'Review-notes: none (\u00a0)'],
     // #707 P3-b: these look blank but are not \p{Cf}, so stripping alone
-    // never removes them: real_reason must name them not-visible directly.
+    // never removes them: has_visible_text must name them not-visible directly.
     ['a braille blank (U+2800) for a reason', 'Review-notes: none (\u2800)'],
     ['a Hangul filler (U+3164) for a reason', 'Review-notes: none (\u3164)'],
     ['a lone combining mark for a reason', 'Review-notes: none (\u0301)'],

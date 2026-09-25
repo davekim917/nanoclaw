@@ -560,20 +560,17 @@ FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
 # The body line naming what a PR supersedes, or `nothing`. Required only in a
 # repo whose base branch sets `"requireReplacesLine": true` in
 # REVIEW_LOOP_CONFIG, so every other repo merges exactly as before
-# (replaces_state).
-REPLACES_LINE_RE='(^|\n)Replaces:[ \t]*\S'
+# (replaces_state). Its value must show a character (has_visible_text,
+# visible-text.jq): a zero-width space or word joiner alone is not one.
+REPLACES_LINE_RE='(^|\n)Replaces:(?<value>[^\n]*)'
 REVIEW_LOOP_CONFIG='.github/pr-review-loop.json'
 # The review-notes rule (docs/review-policy.md, "Review notes and fix links"):
 # a PR any substitute receipt asked for changes on adds a current-PR fragment
 # under REVIEW_NOTES_DIR, or its body carries this line, read the way the Fixes-PR
 # line is (review_notes_state). The reason is ONE parenthesised phrase, with no
 # parenthesis inside it and nothing after it on the line, so `none ()x)` and
-# `none ( ) )` never pass for one; review_notes_state strips every \p{Cf}
-# (format) character from the reason first — a soft hyphen or an emoji ZWJ
-# sequence must not sink an otherwise-visible reason — then requires at least
-# one character that is not whitespace, a control character, a combining mark
-# with no base of its own, or one of the specific blank-looking codepoints
-# U+2800/U+3164/U+115F/U+1160/U+FFA0 (real_reason, #707 P3-b).
+# `none ( ) )` never pass for one, and the reason must show a character
+# (has_visible_text, visible-text.jq, #707 P3-b).
 REVIEW_NOTES_FILE='docs/review-notes.md'
 REVIEW_NOTES_DIR='docs/review-notes'
 REVIEW_NOTES_NONE_LINE_RE='(^|\n)Review-notes:[ \t]*none[ \t]*\((?<reason>[^()\n]*)\)[ \t]*\r?(?=\n|\z)'
@@ -651,7 +648,8 @@ replaces_state() {
   esac
   printf '%s' "$1" | jq -r -L "$HERE" --arg lineRe "$REPLACES_LINE_RE" '
     include "pr-body";
-    pr_body_text | if test($lineRe; "i") then "ok" else "missing" end'
+    include "visible-text";
+    pr_body_text | if [ capture($lineRe; "gi") ] | any(.value | has_visible_text) then "ok" else "missing" end'
 }
 
 replaces_refusal() {
@@ -1219,15 +1217,7 @@ review_notes_state() {
     --arg notes "$REVIEW_NOTES_FILE" --arg fragment "$REVIEW_NOTES_DIR/$PR.md" \
     --argjson files "$SCOPE_FILES" '
     include "pr-body";
-    # Strip every format character first, then require at least one visible
-    # one left: a soft hyphen or an emoji ZWJ sequence must not sink an
-    # otherwise-visible reason. A handful of codepoints look blank but are
-    # not \p{Cf}, so they are named explicitly; a combining mark is excluded
-    # outright, since a real base character elsewhere already satisfies this
-    # test on its own, and a combining mark with no base must not (#707 P3-b).
-    def real_reason:
-      gsub("\\p{Cf}"; "") as $stripped
-      | ($stripped | test("[^\\s\\p{Z}\\p{Cc}\\p{M}\\x{2800}\\x{3164}\\x{115F}\\x{1160}\\x{FFA0}]"));
+    include "visible-text";
     # pr_body_text checks its own shape inside pr-body.jq, but a replacement
     # module can drop that check along with the rest of the module (#707
     # P3-a) — assert the shape up front, whenever pr_body_text yields exactly
@@ -1243,7 +1233,7 @@ review_notes_state() {
     (
     ($state | split("\t")) as [$kind, $why]
       | pr_body_text as $body
-      | if [ $body | capture($lineRe; "gi") ] | any(.reason | real_reason) then "ok"
+      | if [ $body | capture($lineRe; "gi") ] | any(.reason | has_visible_text) then "ok"
       elif ($files | type) == "array" and any($files[]; . == $fragment) then "ok"
       else
         ( if $kind == "changes" then $why
@@ -1270,7 +1260,7 @@ review_notes_state() {
                 else
                   ($split[0].reason) as $reasonContent
                   | ($split[0].trailing | gsub("^[ \t]+"; "") | gsub("[ \t\r]+$"; "")) as $trailing
-                  | if ($reasonContent | real_reason | not) then
+                  | if ($reasonContent | has_visible_text | not) then
                       "the body carries a `Review-notes: none ()` line, but its reason is empty or has no visible character. Give it a visible reason, or add the lesson in \($fragment)"
                     elif ($trailing | length) > 0 then
                       "the body carries a `Review-notes: none (<reason>)` line, but it has text after the closing parenthesis (\"\($trailing)\"), which the check reads as not ending the line\(if $trailing == "." then " (a trailing period counts as text after the parenthesis; drop it)" else "" end). Remove it, or add the lesson in \($fragment)"
