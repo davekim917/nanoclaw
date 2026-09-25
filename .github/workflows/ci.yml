@@ -101,13 +101,12 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm exec vitest run src/upstream-ratchet.test.ts --maxWorkers=1
       # Dead code (knip, host and runner), duplication (jscpd) and prohibited
-      # comment forms over the whole tree. `--report` prints the findings and
-      # exits 0; enforcement drops the flag here, in host-ci.sh and in
-      # ci-full.yml once main reports zero. A check that cannot run fails the
-      # step in either mode.
+      # comment forms over the whole tree. Any finding fails the step, as does
+      # a check that cannot run. Keep this line identical in host-ci.sh and
+      # ci-full.yml.
       - name: Hygiene checks
         if: ${{ !cancelled() && steps.install.outcome == 'success' && steps.bun_install.outcome == 'success' }}
-        run: pnpm exec tsx scripts/hygiene/run.ts --report
+        run: pnpm exec tsx scripts/hygiene/run.ts
       - name: Hygiene check fixtures
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm exec vitest run scripts/hygiene --maxWorkers=1

@@ -114,7 +114,7 @@ jobs:
       # that two separately green PRs create together shows up within a day.
       - name: Hygiene checks
         if: ${{ !cancelled() && steps.install.outcome == 'success' && steps.bun_install.outcome == 'success' }}
-        run: pnpm exec tsx scripts/hygiene/run.ts --report
+        run: pnpm exec tsx scripts/hygiene/run.ts
 
       # Everything except the three drift tests, which belong to `bookkeeping`.
       # See DRIFT_TESTS in vitest.config.ts. ONE step, not a plain run followed
