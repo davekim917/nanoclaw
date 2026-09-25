@@ -16,15 +16,15 @@ import { isOwner, isGlobalAdmin } from '../../modules/permissions/db/user-roles.
 import type { ScheduledTaskRow } from '../../modules/mailbox/index.js';
 
 /**
- * Host sweep cadence. MIRRORS the private `SWEEP_INTERVAL_MS = 60_000` at
- * src/host-sweep.ts:90 — defined here as the board feature's single host-side
+ * Host sweep cadence. MIRRORS the private `SWEEP_INTERVAL_MS = 60_000` in
+ * src/host-sweep.ts — defined here as the board feature's single host-side
  * home for the constant so the verb×state matrix's `guard_grace` derivation
  * (scheduled-board-matrix.ts) and the health-grace math (scheduled-assembly.ts)
  * can import it without reaching across group ownership into host-sweep.ts.
  *
  * The board's health-grace and guard-grace math MUST use the same interval the
  * sweep actually runs at, so the two values are coupled: if anyone ever changes
- * the sweep cadence, BOTH src/host-sweep.ts:90 and this const must move together.
+ * the sweep cadence, BOTH src/host-sweep.ts and this const must move together.
  */
 export const SWEEP_INTERVAL_MS = 60_000;
 
@@ -108,8 +108,7 @@ function buildDetailJson(e: AuditEntry): string | null {
  * Write one audit row. Prompt bodies are hashed + previewed (≤512 chars);
  * scripts are hash-only; secret names never persist; `move_intent` rows carry
  * the verbatim snapshot in detail_json until purged on resolve. Central DB,
- * on the async driver (seam 3 PR 6, the "5c" family: this body and every
- * caller converted together).
+ * on the async driver.
  */
 export async function writeAudit(e: AuditEntry): Promise<void> {
   const beforeHash = e.before !== undefined ? sha256(e.before) : null;

@@ -34,7 +34,7 @@ export interface SignalWorkItem {
   source_url: string | null;
   as_of: string | null;
 }
-export interface SignalDecisionEvent {
+interface SignalDecisionEvent {
   at: string;
   actor: SignalPerson;
   action: 'claim' | 'release' | 'answer';
@@ -97,7 +97,7 @@ export interface SignalAgent {
   claim_details?: SignalClaimDetail[];
   next_task?: { title: string; at: string } | null;
 }
-export interface SignalActivity {
+interface SignalActivity {
   id: string;
   workgroup_id: string;
   at: string;

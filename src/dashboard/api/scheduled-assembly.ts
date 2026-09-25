@@ -9,7 +9,7 @@
  * that lands mid-assembly forces a re-run (read-your-own-write, §3a).
  *
  * All board DB opens are { readonly: true } + busy_timeout 1000 (the
- * hasPendingRecurrence precedent, sessions.ts:121-122) — never the write
+ * hasPendingRecurrence precedent in sessions.ts) — never the write
  * path's 5000ms. A per-session read failure never fails the fleet snapshot:
  * the session contributes an `unreadable` count and the rest still return
  * (§3a degraded contract, S12).
@@ -114,8 +114,8 @@ export interface ScheduledAssemblyOptions {
 /**
  * Parse a SQLite timestamp/ISO string to epoch ms. SQLite TIMESTAMP columns
  * store UTC without a zone marker; Date.parse treats those as local time, so
- * append Z when no zone marker is present (parseSqliteUtc precedent,
- * host-sweep.ts:86).
+ * append Z when no zone marker is present (parseSqliteUtc precedent in
+ * host-sweep.ts).
  */
 function parseUtcMs(s: string | null): number | null {
   if (!s) return null;
@@ -166,7 +166,7 @@ const TWENTY_FOUR_H_MS = 24 * 60 * 60 * 1000;
 
 /**
  * The cron interval (ms) for the occurrence this row is ARMED on — parsed
- * identically to the firing path (recurrence.ts:31). Returns null on parse
+ * identically to the firing path (recurrence.ts). Returns null on parse
  * failure or for one-offs (no cron).
  *
  * `anchorMs` is the armed occurrence (`process_after`), not the wall clock.
@@ -210,7 +210,7 @@ export function deriveHealth(ctx: HealthCtx): HealthState {
 
   // Residual-strand: the latest row of the series is TERMINAL yet still carries
   // a recurrence (no live successor was minted — the swallowed-cron-parse-error
-  // signature, recurrence.ts:46-52). A stateless persistence clock excludes the
+  // signature in recurrence.ts). A stateless persistence clock excludes the
   // legitimate transient between completion-sync and successor-insert: flag
   // strand only once aged past 2×SWEEP_INTERVAL via now − max(timestamp,
   // process_after) (§4.1).

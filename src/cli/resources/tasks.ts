@@ -67,7 +67,7 @@ function str(value: unknown): string | undefined {
  * `str()` collapses "absent" and "supplied but empty" into `undefined`. That
  * is the right answer when reading an optional value and the wrong one for the
  * scope guards below, which branch on presence: `--session "$SESS"` with an
- * unset variable arrives as `session: ''` (parse-argv.ts:29 keeps it), and a
+ * unset variable arrives as `session: ''` (parse-argv.ts keeps it), and a
  * presence test built on `str()` reads that as absent and skips — failing open
  * on exactly the input that makes the mistake likely, and doing it to a script
  * silently, every run. That is this file's own class one level down: the guard
@@ -76,7 +76,7 @@ function str(value: unknown): string | undefined {
  * The empty string is the shape that gets here, because `''` is a valid string
  * and passes argument validation. The value-less `--session` shape does not:
  * it parses to `true` and `validateArgs` already rejects it with "--session
- * requires a value" (crud.ts:523). The non-string branch below is therefore
+ * requires a value". The non-string branch below is therefore
  * defence in depth for callers that bypass validation, not a live hole.
  *
  * No flag guarded here has an empty string as a meaningful value, so refusing
@@ -211,7 +211,7 @@ function withInbound<T>(session: ScopedSession, fn: (mailbox: NanoclawMailboxSes
  * in the same synchronous turn (see that helper — there is no second call and
  * none is owed). A swallowed central-DB failure would leave the row hidden
  * behind a mark nothing clears until `QUIET_SESSION_BACKOFF_MS` expires, past a
- * warmed restart, since S2-PR15 persists the mark.
+ * warmed restart, since the mark is persisted.
  *
  * The call goes INSIDE the mailbox action, after the action's own read, not
  * around `withInbound`. These commands fan out across every session the caller
@@ -224,7 +224,7 @@ function withInbound<T>(session: ScopedSession, fn: (mailbox: NanoclawMailboxSes
  * strict SUPERSET of what they can touch: it matches
  * `(id = ? OR series_id = ?) AND kind = 'task'` at any status, while
  * pause/resume/cancel/update/delete all add a status filter to that same
- * predicate (src/mailbox/sqlite/tasks.ts:44-101). A miss therefore proves the
+ * predicate (src/mailbox/sqlite/tasks.ts). A miss therefore proves the
  * write would match nothing. Cancel-all probes with `listCliTaskSeries()`,
  * whose pending/paused set is exactly what `cancelAllTasks` updates.
  *
@@ -498,7 +498,7 @@ async function appendTaskLog(
   let group = groupArg(args, ctx);
   if (!series && ctx.caller === 'agent' && ctx.sessionId) {
     const sess = await getSession(ctx.sessionId);
-    // `taskSeriesId` (`src/db/sessions.ts:182`) returns null for the bare
+    // `taskSeriesId` returns null for the bare
     // `system:tasks` an upgraded install may still hold; the old slice returned
     // `''` there, which fell through to the `--id is required` error below only
     // by accident of being falsy. Being explicit keeps that behaviour when the
@@ -765,7 +765,7 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
   }
   if (args.thread_anchor !== undefined) update.threadAnchor = bool(args.thread_anchor);
   // `--model ""` CLEARS the per-fire pin, the same spelling `groups config
-  // update` uses for a group pin (groups.ts:521), plus this verb's own
+  // update` uses for a group pin, plus this verb's own
   // `"null"`/`"none"` clear words (`--script`, `--recurrence`). `str()` is
   // wrong here for the reason `suppliedFlag` exists one way up: it collapses
   // "absent" and "supplied empty" into `undefined`, and on THIS flag the empty
@@ -778,8 +778,7 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
     // `--group` is required for a CLEAR too, not only for a set. A set needs it
     // to resolve the provider vocabulary; a clear needs it for SCOPE, which is
     // the separate reason and the one that bites harder. Series ids are unique
-    // within an agent group, not fleet-wide
-    // (`src/modules/scheduling/create.ts:67`, `src/session-manager.ts:428`),
+    // within an agent group, not fleet-wide,
     // and an unscoped `tasks update --id X` falls back to every active session
     // (`selectedSessions` below) — so an unscoped clear could silently unpin a
     // same-named series in another group and report success. Exempting clears
@@ -1185,7 +1184,7 @@ async function repinSessions(args: Record<string, unknown>, ctx: CallerContext):
  * never fired — silently widening a scoped repin to fleet-wide.
  *
  * The rest of the class lives elsewhere, deliberately not duplicated here:
- *   `--group A --session <B's>` — fixed in `selectedSessions` (#567), which
+ *   `--group A --session <B's>` — fixed in `selectedSessions`, which
  *     every verb in this file inherits, this one included;
  *   `cancel --id X --all` — dropped the id and cancelled everything in scope;
  *     owned by its own single-purpose change;
@@ -1280,11 +1279,11 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
   //     both report zero matches, and the operator reads the second as the
   //     first and moves on.
   //   SEEN IN MORE THAN ONE SESSION — series ids are NOT globally unique. A
-  //     named task's id is `<slug>-<4hex>` (`src/modules/scheduling/create.ts:67`),
+  //     named task's id is `<slug>-<4hex>`,
   //     so two groups that both run a task by the same name collide on a
   //     1-in-65536 draw, and nothing anywhere prevents it — task-session lookup
-  //     scopes the id by agent group rather than assuming uniqueness
-  //     (`src/session-manager.ts:428`). Under `--all` a single `--series-id`
+  //     scopes the id by agent group rather than assuming uniqueness.
+  //     Under `--all` a single `--series-id`
   //     could therefore re-pin several series while the flag promised one.
   //     Refused below, before any write, rather than silently repinning both.
   const seriesSeenIn = new Set<string>();

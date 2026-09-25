@@ -329,7 +329,6 @@ registerResource({
         // a local name it can address this chat by. Without this, the agent
         // generates a response, but delivery's ACL drops the outbound message
         // (no destination matches the target) and the reply is silently lost.
-        // See issue #2389.
         const colNames = Object.keys(values);
         const placeholders = colNames.map((c) => `@${c}`);
         // Guard inside one central transaction (BEGIN IMMEDIATE under the

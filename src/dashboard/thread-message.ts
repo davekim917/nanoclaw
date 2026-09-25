@@ -65,7 +65,7 @@ import type { AuthHandler, AuthedRequestContext } from './router.js';
 const json = (status: number, body: unknown): Response =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 
-/** `steer.ts:146`'s own cap. Everything this file composes must still fit inside it. */
+/** `steer.ts`'s own cap. Everything this file composes must still fit inside it. */
 const EXECUTOR_TEXT_LIMIT = 4000;
 
 /**
@@ -153,7 +153,7 @@ export function composeReleaseNote(opts: { who: string; newAgentName: string; cl
  * Both halves are ported from the surfaces this one replaces, and neither is
  * decoration:
  *
- * - **Attribution.** `assign.ts:113` requires the agent's first message to name
+ * - **Attribution.** `assign.ts` requires the agent's first message to name
  *   who sent it, so everyone in the room knows where an instruction came from
  *   without asking. Posting the operator's bare text loses that: the agent
  *   answers, and the room sees an agent that changed course for no visible
@@ -164,7 +164,7 @@ export function composeReleaseNote(opts: { who: string; newAgentName: string; cl
  *   blocks it; going quiet is not one of the options.
  *
  * The operator's own words are QUOTED verbatim and attributed to a named person,
- * exactly as `observatory-steer.ts:12-16` describes. Nothing here paraphrases,
+ * exactly as `observatory-steer.ts` describes. Nothing here paraphrases,
  * summarises or replaces them — the wrapper is around the text, never over it.
  */
 export function composeOperatorMessage(opts: { who: string; text: string; claimContext?: string }): string {

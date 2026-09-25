@@ -20,19 +20,18 @@
  * open because it carries no token material and answers the exact question an
  * agent hitting a 401 through its MCP bridge has ("is my integration expired,
  * or is this something else?"); `integrations` is not in
- * `GROUP_SCOPE_RESOURCES`, so a group-scoped agent is refused it anyway
- * (`src/cli/guard.ts:76`).
+ * `GROUP_SCOPE_RESOURCES`, so a group-scoped agent is refused it anyway.
  *
  * No `create`/`update`/`delete` generic verbs: a row here is only ever
  * meaningful alongside its OAuth bundle and its OneCLI secret, and a hand-written
  * row would be a registry entry with no credential behind it.
  *
  * FLAG NAMES ARE snake_case, ALWAYS. Every command parser runs `normalizeArgs`
- * before `validateArgs` (`src/cli/crud.ts:474,646`), so `--authorize-param`
+ * before `validateArgs` (`src/cli/crud.ts`), so `--authorize-param`
  * reaches validation as the key `authorize_param`; a ColumnDef declaring
  * `authorize-param` therefore matches nothing and the flag is rejected as
  * `unknown flag --authorize-param`. Help and error text hyphenate for display
- * (`flagName`, `src/cli/help-render.ts:16-18`), so the operator-facing syntax
+ * (`flagName` in `src/cli/help-render.ts`), so the operator-facing syntax
  * stays `--authorize-param` either way. `src/cli/flag-name-normalization.test.ts`
  * enforces this across every registered resource.
  */

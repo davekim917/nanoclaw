@@ -29,7 +29,7 @@ import type { AuthHandler } from './router.js';
 const json = (status: number, body: unknown): Response =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 
-export interface IssueBrief {
+interface IssueBrief {
   state: string;
   labels: string[];
   /** Issue/PR body, truncated server-side. */

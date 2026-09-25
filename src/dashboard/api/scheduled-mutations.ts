@@ -352,8 +352,8 @@ function afterMutation(agentGroupId: string, sessionId: string): void {
  *
  * A cron edit or a resume recomputes `process_after` straight in the session
  * DB, which the host sweep's quiet cache cannot see; without the invalidation a
- * quiet session sleeps past its new due time, and since S2-PR15 persists that
- * mark, across a restart too.
+ * quiet session sleeps past its new due time, and since that mark is
+ * persisted, across a restart too.
  *
  * FAIL-CLOSED (Codex round 2, H1): a central DB that refuses the invalidation —
  * including because no ACTIVE session row is there any more — gets a 503 and NO
@@ -388,7 +388,7 @@ function quietRefusal(sessionId: string, err: unknown): Response | null {
 
 /**
  * Next future cron occurrence (canonical parse — byte-identical to
- * recurrence.ts:31). `tz` is the OWNING group's effective timezone: the
+ * recurrence.ts). `tz` is the OWNING group's effective timezone: the
  * firing path re-arms in it, so a dashboard edit that armed the first fire on
  * the install grid would land the series one slot off until the next re-arm.
  */

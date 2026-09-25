@@ -22,9 +22,8 @@ import { dispatch } from '../cli/dispatch.js';
 import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
 import { buildNudgePrompt, NUDGE_TASK_QUIET_ARGS } from '../modules/claims/self-heal.js';
-import { canAssign } from './assign.js';
+import { refuseUnassignableInWorkgroup } from './assign.js';
 import { threadPermalink, threadPlatformId } from './api/observatory.js';
-import type { AgentGroup } from '../types.js';
 import type { AuthHandler } from './router.js';
 
 const json = (status: number, body: unknown): Response =>
@@ -51,15 +50,8 @@ export const observatoryNudgeHandler: AuthHandler = async (req, _params, ctx) =>
     return json(400, { error: 'workgroupId, claimSlug and agentGroupId are required' });
   }
 
-  const role = await canAssign(ctx.user.id, agentGroupId);
-  if (!role.ok) return json(role.reason === 'not_found' ? 404 : 403, { error: role.reason });
-
-  const agent = await getDb().get<AgentGroup>(
-    `SELECT * FROM agent_groups WHERE id = ? AND workgroup_id = ?`,
-    agentGroupId,
-    workgroupId,
-  );
-  if (!agent) return json(404, { error: 'agent_group_not_in_workgroup' });
+  const refusal = await refuseUnassignableInWorkgroup(ctx.user.id, agentGroupId, workgroupId);
+  if (refusal) return refusal;
 
   // Same read the board is rendered from, so "nudgeable" and "on the board"
   // agree by construction — including its classification of state/staleness.

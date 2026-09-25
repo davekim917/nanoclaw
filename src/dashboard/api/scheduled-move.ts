@@ -113,7 +113,7 @@ async function effectiveSecrets(agentGroupId: string, folder: string, groupsDir:
   return mergeWorkgroupAndGroupSecrets(workgroup, group);
 }
 
-export interface SecretDelta {
+interface SecretDelta {
   gains: string[];
   losses: string[];
   deltaHash: string;
@@ -162,7 +162,7 @@ export { computeSecretDelta };
 /**
  * Is `targetAgentGroupId` wired to `targetMessagingGroupId` via
  * messaging_group_agents? This is scheduleTask's destination-validation
- * predicate (scheduled-tasks.ts:158-165) run WITHOUT writing — fail-closed (C2):
+ * predicate (scheduled-tasks.ts) run WITHOUT writing — fail-closed (C2):
  * an unwired pair means the move would route output to a chat the target agent
  * isn't authorized for.
  */
@@ -713,7 +713,7 @@ async function executeMove(key: string, body: MoveBody, auth: MoveAuthorization)
               // The source was cancelled, then the target insert was AWAITED — a
               // sweep tick can land in that await, see a source with no live task
               // and mark it quiet. Restoring the pending row here puts due work
-              // back behind that mark, and S2-PR15 would carry it across a
+              // back behind that mark, and the persisted mark would carry it across a
               // restart. The central-DB invalidation is what clears it.
               //
               // Invalidate BEFORE the restore, in the same synchronous turn

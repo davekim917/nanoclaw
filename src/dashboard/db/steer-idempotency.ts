@@ -1,7 +1,7 @@
 import { getDb } from '../../db/connection.js';
 import { insertOrAdopt } from '../../db/insert-or-adopt.js';
 
-export type SteerTargetType = 'task' | 'session';
+type SteerTargetType = 'task' | 'session';
 
 export interface SteerTarget {
   type: SteerTargetType;

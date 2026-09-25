@@ -25,14 +25,14 @@ let stopPromise: Promise<void> | null = null;
 // Requests are refused with `not-ready` until markCliServerReady() is called.
 // The socket binds (and claims ownership) well before archive init, FS
 // reconciliation, the OneCLI preflight, container-config backfill, and
-// channel-adapter setup finish (PR #453 review) — early ownership and early
+// channel-adapter setup finish — early ownership and early
 // request-handling are different guarantees, and only the first is safe this
 // soon.
 let ready = false;
 
 const PROBE_TIMEOUT_MS = 1000;
 
-// Bounded retries for the bind race below (PR #453 review round 1): a
+// Bounded retries for the bind race below: a
 // concurrent second host process can win the gap between our probe and our
 // bind, so we must be able to re-probe and retry a few times rather than
 // assume our own stale verdict is still true by the time we act on it. This
@@ -201,7 +201,7 @@ async function bindWithRetry(socketPath: string): Promise<void> {
       // The path is occupied. Re-probe fresh on THIS attempt rather than
       // trusting an earlier verdict — the check-then-act gap between a
       // probe and an unlink is exactly where a concurrent second host
-      // process can win the race (PR #453 review, reproduced with two
+      // process can win the race (reproduced with two
       // Node processes racing this same sequence): treating the bind's own
       // EADDRINUSE as the trigger to re-probe, instead of unlinking once
       // up front and never looking again, is what closes that window. A
@@ -239,7 +239,7 @@ async function bindWithRetry(socketPath: string): Promise<void> {
 /**
  * Flip once startup has cleared every boot gate the socket does not wait
  * for: archive init, FS reconciliation, the OneCLI preflight, container-
- * config backfill, and channel-adapter setup (PR #453 review, round 2).
+ * config backfill, and channel-adapter setup.
  * Before this, `startCliServer` has already bound the socket and claimed
  * ownership — that part is intentionally early, see `claimOwnershipLock` —
  * but `handleFrame` refuses to call `dispatch()` until this is set, because

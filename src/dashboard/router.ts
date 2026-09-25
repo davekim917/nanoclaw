@@ -18,7 +18,7 @@ export type AuthHandler = (
   ctx: AuthedRequestContext,
 ) => Promise<Response | null>;
 
-export interface RequestContext {
+interface RequestContext {
   rawNodeReq: http.IncomingMessage;
   rawNodeRes?: http.ServerResponse;
 }
@@ -41,10 +41,6 @@ let cookieVerifier: CookieVerifier | null = null;
 
 export function registerCookieVerifier(fn: CookieVerifier): void {
   cookieVerifier = fn;
-}
-
-export function getCookieVerifier(): CookieVerifier | null {
-  return cookieVerifier;
 }
 
 export function clearCookieVerifier(): void {
@@ -117,6 +113,35 @@ function isLocalhostOrigin(origin: string): boolean {
   }
 }
 
+/** CSRF origin check: POST/PUT/DELETE with an Origin that doesn't match Host (localhost origins always pass). */
+export function checkOrigin(req: Request): Response | null {
+  const method = req.method;
+  if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
+    const origin = req.headers.get('origin') ?? undefined;
+    const host = req.headers.get('host') ?? '';
+    if (origin !== undefined) {
+      if (!isLocalhostOrigin(origin)) {
+        let originHost: string;
+        try {
+          originHost = new URL(origin).host;
+        } catch {
+          return new Response(JSON.stringify({ error: 'origin_mismatch' }), {
+            status: 403,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (originHost !== host) {
+          return new Response(JSON.stringify({ error: 'origin_mismatch' }), {
+            status: 403,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+    }
+  }
+  return null;
+}
+
 /**
  * HOF: wraps a handler with auth verification.
  * Checks spawn_board cookie via the registered CookieVerifier, enforces CSRF
@@ -124,33 +149,8 @@ function isLocalhostOrigin(origin: string): boolean {
  */
 export function requireAuth(handler: AuthHandler): Handler {
   return async (req, params, ctx) => {
-    const method = req.method as Method;
-    const origin = req.headers.get('origin') ?? undefined;
-    const host = req.headers.get('host') ?? '';
-
-    // CSRF origin check: POST/PUT/DELETE with an Origin that doesn't match Host
-    // (localhost origins always pass)
-    if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
-      if (origin !== undefined) {
-        if (!isLocalhostOrigin(origin)) {
-          let originHost: string;
-          try {
-            originHost = new URL(origin).host;
-          } catch {
-            return new Response(JSON.stringify({ error: 'origin_mismatch' }), {
-              status: 403,
-              headers: { 'Content-Type': 'application/json' },
-            });
-          }
-          if (originHost !== host) {
-            return new Response(JSON.stringify({ error: 'origin_mismatch' }), {
-              status: 403,
-              headers: { 'Content-Type': 'application/json' },
-            });
-          }
-        }
-      }
-    }
+    const originDeny = checkOrigin(req);
+    if (originDeny) return originDeny;
 
     // Verify cookie via injected verifier (B5 registers the real one)
     const cookieHeader = req.headers.get('cookie');

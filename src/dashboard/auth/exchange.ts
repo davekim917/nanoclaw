@@ -1,47 +1,8 @@
 import crypto from 'crypto';
 import { consumeDashboardToken } from '../db/dashboard-tokens.js';
 import { resolveServerKey, buildSetCookie } from './cookie.js';
-import { register } from '../router.js';
+import { checkOrigin, register } from '../router.js';
 import type { Handler } from '../router.js';
-
-const LOCALHOST_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
-
-function isLocalhostOrigin(origin: string): boolean {
-  try {
-    const { hostname } = new URL(origin);
-    return LOCALHOST_HOSTS.has(hostname);
-  } catch {
-    return false;
-  }
-}
-
-function checkOrigin(req: Request): Response | null {
-  const method = req.method;
-  if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
-    const origin = req.headers.get('origin') ?? undefined;
-    const host = req.headers.get('host') ?? '';
-    if (origin !== undefined) {
-      if (!isLocalhostOrigin(origin)) {
-        let originHost: string;
-        try {
-          originHost = new URL(origin).host;
-        } catch {
-          return new Response(JSON.stringify({ error: 'origin_mismatch' }), {
-            status: 403,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        if (originHost !== host) {
-          return new Response(JSON.stringify({ error: 'origin_mismatch' }), {
-            status: 403,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-      }
-    }
-  }
-  return null;
-}
 
 export const exchangeHandler: Handler = async (req) => {
   const originDeny = checkOrigin(req);

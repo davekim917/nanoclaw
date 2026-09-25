@@ -8,7 +8,7 @@
  * scheduling's `taskNameSlug`, which this fork does not have yet (the slug is
  * still inlined in `makeTaskId`), so the create path keeps preparing tasks with
  * `prepareScheduledTask` directly for now.
- * TODO(T5 PR 5): add `prepareTemplateTasks` here once the scheduling theme
+ * TODO: add `prepareTemplateTasks` here once the scheduling theme
  * lands `taskNameSlug`; restamp cannot match a live series without it.
  */
 import fs from 'fs';

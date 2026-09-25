@@ -71,10 +71,10 @@ const PR_ID = /^(.+)#(\d+)$/;
  * An earlier version of this check also accepted the loose `<prefix>-<n>-…`
  * shape, which matches any incidental number in any slug. Against the live
  * claims directory that shape fires on a marketing deck
- * (`…-proximo-1800-la` → PR #1800), a Jira ticket (`…-216-…` → PR #216) and a
- * channel id (`…-ch-902-01` → PR #902); against small PR numbers it is worse
+ * (`…-proximo-1800-la` → PR number 1800), a Jira ticket (`…-216-…` → PR number 216) and a
+ * channel id (`…-ch-902-01` → PR number 902); against small PR numbers it is worse
  * still — `sprint-1-planning`, `step-1-of-3` and `release-1-notes` would each
- * suppress PR #1.
+ * suppress PR number 1.
  *
  * The two error directions are not symmetric, and that asymmetry decides the
  * rule. A false negative shows one PR twice: annoying, VISIBLE, and it
@@ -89,7 +89,7 @@ const PR_ID = /^(.+)#(\d+)$/;
  * Everything the loose shape used to catch is now the NOTE's job: a claim on a
  * PR whose slug does not say `gh` has to name `#<n>` in its note to suppress.
  * On the live board that costs exactly one suppression and keeps every other
- * one, including the `gh-963` claim whose note covers #956.
+ * one, including a `gh-<n>` claim whose note covers a different PR number.
  */
 function claimCoversPr(claims: BoardClaim[], n: string): boolean {
   const slugRe = new RegExp(`(^|-)gh-${n}(-|$)`, 'i');

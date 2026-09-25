@@ -21,7 +21,7 @@ import { ALLOW, DENY, HOLD, type GuardedActionSpec, type GuardInput } from '../g
 import { GROUP_SCOPE_RESOURCES, type CommandDef } from './registry.js';
 
 /** Dotted catalog action name for a command. */
-export function commandGuardAction(cmd: Pick<CommandDef, 'name' | 'action'>): string {
+function commandGuardAction(cmd: Pick<CommandDef, 'name' | 'action'>): string {
   return cmd.action ?? `cli.${cmd.name}`;
 }
 

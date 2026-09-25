@@ -4,7 +4,7 @@
  * The `cli_request` delivery action runs the command and then writes the
  * response row. A failure of that WRITE re-dispatches the outbound row, which
  * before this ledger re-ran the command — up to `MAX_DELIVERY_ATTEMPTS` (3)
- * executions of a single `ncl tasks create` (issue #273).
+ * executions of a single `ncl tasks create`.
  *
  * The claim is taken before dispatch and completed with the response frame
  * after it, so the retry replays a stored result instead of executing again.

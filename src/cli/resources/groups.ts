@@ -44,6 +44,46 @@ import { createAgentFromTemplate } from '../../templates/create-agent.js';
 import type { AgentGroup, ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
 
+async function requireConfiguredGroup(id: string): Promise<AgentGroup> {
+  const group = await getAgentGroup(id);
+  if (!group) throw new Error(`No agent group: ${id}`);
+  const row = await getContainerConfig(id);
+  if (!row) throw new Error(`No container config for group: ${id}`);
+  return group;
+}
+
+// Dual-write packages: file (canonical, survives backfill at host
+// restart) + DB (cache, read by buildAgentGroupImage at rebuild time).
+async function editPackages(
+  args: Record<string, unknown>,
+  edit: (list: string[], pkg: string) => string[],
+): Promise<{ apt: string | null; npm: string | null }> {
+  const id = args.id as string;
+  if (!id) throw new Error('--id is required');
+
+  const group = await requireConfiguredGroup(id);
+
+  const apt = args.apt as string | undefined;
+  const npm = args.npm as string | undefined;
+  if (!apt && !npm) throw new Error('Provide --apt <pkg> or --npm <pkg>');
+
+  const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
+    if (!cfg.packages) cfg.packages = { apt: [], npm: [] };
+    if (apt) cfg.packages.apt = edit(cfg.packages.apt, apt);
+    if (npm) cfg.packages.npm = edit(cfg.packages.npm, npm);
+  });
+  if (apt) await updateContainerConfigJson(id, 'packages_apt', fileConfig.packages.apt);
+  if (npm) await updateContainerConfigJson(id, 'packages_npm', fileConfig.packages.npm);
+  return { apt: apt || null, npm: npm || null };
+}
+
+function mountPathArgs(args: Record<string, unknown>): { hostPath: string; containerPath: string } {
+  const hostPath = (args.host ?? args['host-path']) as string | undefined;
+  const containerPath = (args.container ?? args['container-path']) as string | undefined;
+  if (!hostPath || !containerPath) throw new Error('Provide --host <host-path> and --container <container-path>');
+  return { hostPath, containerPath };
+}
+
 /**
  * Parse a --timezone flag: undefined = not passed, null = explicit clear
  * (empty string → follow the install default), otherwise the CANONICAL IANA
@@ -166,7 +206,7 @@ registerResource({
   // `create` and `delete` are custom (below): create needs a `--template`
   // branch, and the generic create inserts a bare agent_groups row but never
   // the container_config a working group needs; the generic single-table
-  // DELETE violates FK constraints (#2525).
+  // DELETE violates FK constraints.
   operations: { list: 'open', get: 'open', update: 'approval' },
   customOperations: {
     create: {
@@ -216,8 +256,7 @@ registerResource({
         // on-disk probe say the folder is genuinely absent — validating
         // earlier would refuse to reuse a LIVE group whose folder predates
         // the current grammar (accepted by an older bare-create path),
-        // breaking documented idempotence on --folder for it (github Codex
-        // review, PR #486). The template path validates through
+        // breaking documented idempotence on --folder for it. The template path validates through
         // createAgentFromTemplate; the bare path used to validate nowhere for
         // a truly fresh create, minting folders the runtime label grammar
         // refuses at every spawn.
@@ -240,7 +279,7 @@ registerResource({
         // `getContainerConfig` and the spawn path require. Without this, a
         // group created via `ncl groups create` would throw "Container config
         // not found" on first spawn and stay broken until the host restart
-        // backfill ran (#2415). The template branch above provisions its own
+        // backfill ran. The template branch above provisions its own
         // config + folder in `createAgentFromTemplate`; this covers the bare
         // path. Mirrors what `setup/register.ts` does after creating an agent
         // group via the setup flow.
@@ -282,7 +321,7 @@ registerResource({
         // The re-check inside the transaction below (immediately before any
         // DELETE) is what actually prevents the second caller from running a
         // full cascade over an already-deleted row and reporting success with
-        // every count at 0 (github Codex review, PR #437, groups.ts:218).
+        // every count at 0.
         const exists = await getDb().get('SELECT 1 FROM agent_groups WHERE id = ? LIMIT 1', id);
         if (!exists) throw new Error(`group not found: ${id}`);
 
@@ -674,7 +713,7 @@ registerResource({
         // read-mutate-write, so a concurrent spawn-time identity write can
         // neither be clobbered by this one nor clobber it.
         //
-        // THE FILE COMMITS FIRST, and the projection follows (#840). Either
+        // THE FILE COMMITS FIRST, and the projection follows. Either
         // write can fail, so one of the two disagreements has to be the one
         // this command can leave behind; file-ahead is the recoverable half.
         // The container boots what the operator asked for and the CLI's flag
@@ -803,10 +842,7 @@ registerResource({
           return { added: name, fleet: true, path: FLEET_MCP_SERVERS_PATH, servers };
         }
 
-        const group = await getAgentGroup(id);
-        if (!group) throw new Error(`No agent group: ${id}`);
-        const row = await getContainerConfig(id);
-        if (!row) throw new Error(`No container config for group: ${id}`);
+        const group = await requireConfiguredGroup(id);
 
         const newEntry: McpServerConfig = parseMcpServerEntry(args);
 
@@ -848,10 +884,7 @@ registerResource({
           return { removed: name, fleet: true, path: FLEET_MCP_SERVERS_PATH, servers };
         }
 
-        const group = await getAgentGroup(id);
-        if (!group) throw new Error(`No agent group: ${id}`);
-        const row = await getContainerConfig(id);
-        if (!row) throw new Error(`No container config for group: ${id}`);
+        const group = await requireConfiguredGroup(id);
 
         // Validate against the canonical file (DB cache may be stale post-
         // operator-edit; file is the source of truth).
@@ -872,33 +905,12 @@ registerResource({
       description:
         'Add a package to a group. Requires `ncl groups restart --rebuild` to take effect. Use --id <group-id> and --apt <pkg> or --npm <pkg>.',
       handler: async (args) => {
-        const id = args.id as string;
-        if (!id) throw new Error('--id is required');
-
-        const group = await getAgentGroup(id);
-        if (!group) throw new Error(`No agent group: ${id}`);
-        const row = await getContainerConfig(id);
-        if (!row) throw new Error(`No container config for group: ${id}`);
-
-        const apt = args.apt as string | undefined;
-        const npm = args.npm as string | undefined;
-        if (!apt && !npm) throw new Error('Provide --apt <pkg> or --npm <pkg>');
-
-        // Dual-write packages: file (canonical, survives backfill at host
-        // restart) + DB (cache, read by buildAgentGroupImage at rebuild time).
-        // Build path happens to read from DB too, so package-add WAS working
-        // pre-fix — but file would have drifted, leaving operators with stale
-        // container.json and a DB that gets clobbered by next backfill.
-        const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
-          if (!cfg.packages) cfg.packages = { apt: [], npm: [] };
-          if (apt && !cfg.packages.apt.includes(apt)) cfg.packages.apt.push(apt);
-          if (npm && !cfg.packages.npm.includes(npm)) cfg.packages.npm.push(npm);
+        const { apt, npm } = await editPackages(args, (list, pkg) => {
+          if (!list.includes(pkg)) list.push(pkg);
+          return list;
         });
-        if (apt) await updateContainerConfigJson(id, 'packages_apt', fileConfig.packages.apt);
-        if (npm) await updateContainerConfigJson(id, 'packages_npm', fileConfig.packages.npm);
-
         return {
-          added: { apt: apt || null, npm: npm || null },
+          added: { apt, npm },
           note: 'Image rebuild required for packages to take effect. Use install_packages from the agent or rebuild manually.',
         };
       },
@@ -908,28 +920,9 @@ registerResource({
       description:
         'Remove a package from a group. Requires `ncl groups restart --rebuild` to take effect. Use --id <group-id> and --apt <pkg> or --npm <pkg>.',
       handler: async (args) => {
-        const id = args.id as string;
-        if (!id) throw new Error('--id is required');
-
-        const group = await getAgentGroup(id);
-        if (!group) throw new Error(`No agent group: ${id}`);
-        const row = await getContainerConfig(id);
-        if (!row) throw new Error(`No container config for group: ${id}`);
-
-        const apt = args.apt as string | undefined;
-        const npm = args.npm as string | undefined;
-        if (!apt && !npm) throw new Error('Provide --apt <pkg> or --npm <pkg>');
-
-        const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
-          if (!cfg.packages) cfg.packages = { apt: [], npm: [] };
-          if (apt) cfg.packages.apt = cfg.packages.apt.filter((p) => p !== apt);
-          if (npm) cfg.packages.npm = cfg.packages.npm.filter((p) => p !== npm);
-        });
-        if (apt) await updateContainerConfigJson(id, 'packages_apt', fileConfig.packages.apt);
-        if (npm) await updateContainerConfigJson(id, 'packages_npm', fileConfig.packages.npm);
-
+        const { apt, npm } = await editPackages(args, (list, pkg) => list.filter((p) => p !== pkg));
         return {
-          removed: { apt: apt || null, npm: npm || null },
+          removed: { apt, npm },
           note: 'Image rebuild required for package changes to take effect.',
         };
       },
@@ -944,14 +937,9 @@ registerResource({
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
-        const hostPath = (args.host ?? args['host-path']) as string | undefined;
-        const containerPath = (args.container ?? args['container-path']) as string | undefined;
-        if (!hostPath || !containerPath) throw new Error('Provide --host <host-path> and --container <container-path>');
+        const { hostPath, containerPath } = mountPathArgs(args);
 
-        const group = await getAgentGroup(id);
-        if (!group) throw new Error(`No agent group: ${id}`);
-        const row = await getContainerConfig(id);
-        if (!row) throw new Error(`No container config for group: ${id}`);
+        const group = await requireConfiguredGroup(id);
 
         const mount: AdditionalMountConfig = {
           hostPath,
@@ -978,14 +966,9 @@ registerResource({
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
-        const hostPath = (args.host ?? args['host-path']) as string | undefined;
-        const containerPath = (args.container ?? args['container-path']) as string | undefined;
-        if (!hostPath || !containerPath) throw new Error('Provide --host <host-path> and --container <container-path>');
+        const { hostPath, containerPath } = mountPathArgs(args);
 
-        const group = await getAgentGroup(id);
-        if (!group) throw new Error(`No agent group: ${id}`);
-        const row = await getContainerConfig(id);
-        if (!row) throw new Error(`No container config for group: ${id}`);
+        const group = await requireConfiguredGroup(id);
 
         const fileConfig = await updateContainerConfig(group.folder, (cfg) => {
           cfg.additionalMounts = (cfg.additionalMounts ?? []).filter(

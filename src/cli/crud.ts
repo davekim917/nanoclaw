@@ -148,8 +148,8 @@ export interface ResourceDef {
    * The canonical case is live-refresh parity with `ncl destinations add`:
    * after `ncl wirings create` writes the companion `agent_destinations`
    * row, the change has to be projected into any running container's session
-   * DB or the agent won't see the new delivery target until its next spawn
-   * (#2389). Runs only if the transaction succeeds, so it never observes a
+   * DB or the agent won't see the new delivery target until its next spawn.
+   * Runs only if the transaction succeeds, so it never observes a
    * rolled-back row.
    */
   postCommit?: (row: Record<string, unknown>) => void | Promise<void>;
@@ -203,7 +203,7 @@ function coerceListFilter(column: ColumnDef, value: unknown): unknown {
 // `created_at` if present, else the first `_at` column — DESC with the id as
 // tiebreak. Fork-ahead: `created_at` is preferred because a nullable event
 // stamp declared earlier (messaging-groups' `denied_at`) would order ordinary
-// rows by random id and let a small LIMIT hide the newest row (Codex, #492).
+// rows by random id and let a small LIMIT hide the newest row.
 function listOrder(def: ResourceDef): string {
   if (def.listOrder) return def.listOrder;
   const timestamp =
@@ -292,8 +292,7 @@ function genericCreate(def: ResourceDef) {
     const colNames = Object.keys(values);
     const placeholders = colNames.map((c) => `@${c}`);
     // Single central transaction so a postCreate throw rolls back the parent
-    // INSERT — closes the partial-state class this PR exists to fix (#2415,
-    // #2389). `postCreate` is awaited inside the closure, so it is bound by
+    // INSERT, so no partial state survives. `postCreate` is awaited inside the closure, so it is bound by
     // the closure rule (plan §4.4): central-DB companion rows through the
     // driver, nothing else. Anything outside the central DB — filesystem,
     // session-DB projection — belongs in `postCommit`, which runs after the
@@ -385,8 +384,7 @@ function genericUpdate(def: ResourceDef) {
       // no longer one synchronous step, so two concurrent updates can each
       // read the same stale `current`, each individually pass validation,
       // and then both write — landing a combination neither update's own
-      // validation would have allowed on its own (github Codex review on
-      // #437, src/cli/crud.ts:336).
+      // validation would have allowed on its own.
       //
       // Fix: make the write conditional on the exact row state `preUpdate`
       // just validated (optimistic concurrency) rather than an unconditional
@@ -414,8 +412,7 @@ function genericUpdate(def: ResourceDef) {
         const checkParams: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(current)) checkParams[`__orig_${k}`] = v;
 
-        // `RETURNING` makes the write and the reload ONE statement — github
-        // Codex review, PR #437, src/cli/crud.ts:377: a separate `getDb().get`
+        // `RETURNING` makes the write and the reload ONE statement: a separate `getDb().get`
         // reload after the UPDATE is itself an awaited step, so a concurrent
         // delete of this same row in that gap made the reload find nothing
         // and the handler return `undefined` — an `{ ok: true }` response
@@ -445,8 +442,7 @@ function genericUpdate(def: ResourceDef) {
       .map((k) => `${k} = @${k}`)
       .join(', ');
     // Same RETURNING fold as the preUpdate branch above — a separate reload
-    // after the UPDATE would have the identical gap (github Codex review, PR
-    // #437, src/cli/crud.ts:377), just without a `preUpdate` validating it.
+    // after the UPDATE would have the identical gap, just without a `preUpdate` validating it.
     const updated = await getDb().get<Record<string, unknown>>(
       `UPDATE ${def.table} SET ${setClause} WHERE ${def.idColumn} = @_id RETURNING ${cols}`,
       { ...updates, _id: id },
