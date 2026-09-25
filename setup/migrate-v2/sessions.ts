@@ -38,31 +38,9 @@ import { resolveSession, writeSessionRouting } from '../../src/session-manager.j
 // registered an implementation and `withMailboxSession` would throw.
 import { outboundDbPath } from '../../src/mailbox/sqlite/paths.js';
 
+import { copyTree } from './shared.js';
+
 const SKIP_NAMES = new Set(['.DS_Store']);
-
-/** Recursively copy, never overwriting existing files. */
-function copyTree(src: string, dst: string): number {
-  let written = 0;
-  if (!fs.existsSync(src)) return 0;
-  fs.mkdirSync(dst, { recursive: true });
-
-  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
-    if (SKIP_NAMES.has(entry.name)) continue;
-    const s = path.join(src, entry.name);
-    const d = path.join(dst, entry.name);
-
-    if (entry.isDirectory()) {
-      written += copyTree(s, d);
-      continue;
-    }
-    // Skip dangling symlinks (e.g. v1's .claude/debug/latest pointer).
-    if (entry.isSymbolicLink() && !fs.existsSync(s)) continue;
-    if (fs.existsSync(d)) continue;
-    fs.copyFileSync(s, d);
-    written += 1;
-  }
-  return written;
-}
 
 async function main(): Promise<void> {
   const v1Path = process.argv[2];
@@ -140,7 +118,7 @@ async function main(): Promise<void> {
     const v1ClaudeDir = path.join(v1SessionsDir, folder, '.claude');
     if (fs.existsSync(v1ClaudeDir)) {
       const v2ClaudeDir = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared');
-      filesCopied += copyTree(v1ClaudeDir, v2ClaudeDir);
+      filesCopied += copyTree(v1ClaudeDir, v2ClaudeDir, SKIP_NAMES, 'follow');
 
       // v1 containers worked in /workspace/group, v2 works in /workspace/agent.
       // Claude Code stores sessions under projects/<hashed-cwd>/. Copy the v1
@@ -149,7 +127,7 @@ async function main(): Promise<void> {
       const v1ProjectDir = path.join(projectsDir, '-workspace-group');
       const v2ProjectDir = path.join(projectsDir, '-workspace-agent');
       if (fs.existsSync(v1ProjectDir) && !fs.existsSync(v2ProjectDir)) {
-        filesCopied += copyTree(v1ProjectDir, v2ProjectDir);
+        filesCopied += copyTree(v1ProjectDir, v2ProjectDir, SKIP_NAMES, 'follow');
       }
 
       // Write the v1 Claude Code session ID as the continuation in outbound.db

@@ -1,11 +1,57 @@
 /**
  * Shared helpers for the v1 → v2 migration steps.
  */
+import fs from 'fs';
+import path from 'path';
+
+// ── File copy ───────────────────────────────────────────────────────────
+
+/**
+ * Copy a directory tree, skipping entries named in `skipNames`. Never
+ * overwrites existing files.
+ *
+ * `symlinks: 'skip'` skips every symlink instead of following it: v1 group
+ * folders sometimes contain container-side paths like
+ * `.claude-shared.md → /app/CLAUDE.md` that don't resolve on the host, and
+ * following one with `fs.copyFileSync` would crash ENOENT and abort the rest
+ * of the traversal. `'follow'` copies a symlink's target and skips only a
+ * dangling one (e.g. v1's .claude/debug/latest pointer).
+ */
+export function copyTree(
+  src: string,
+  dst: string,
+  skipNames: ReadonlySet<string>,
+  symlinks: 'skip' | 'follow',
+): number {
+  let written = 0;
+  if (!fs.existsSync(src)) return 0;
+  fs.mkdirSync(dst, { recursive: true });
+
+  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    if (skipNames.has(entry.name)) continue;
+    const s = path.join(src, entry.name);
+    const d = path.join(dst, entry.name);
+
+    if (symlinks === 'skip' && entry.isSymbolicLink()) {
+      console.log(`SKIP:symlink ${path.relative(process.cwd(), s)}`);
+      continue;
+    }
+    if (entry.isDirectory()) {
+      written += copyTree(s, d, skipNames, symlinks);
+      continue;
+    }
+    if (entry.isSymbolicLink() && !fs.existsSync(s)) continue;
+    if (fs.existsSync(d)) continue;
+    fs.copyFileSync(s, d);
+    written += 1;
+  }
+  return written;
+}
 
 // ── JID parsing ─────────────────────────────────────────────────────────
 
 /** v1 JID prefix → v2 channel_type. Unknown prefixes pass through as-is. */
-export const JID_PREFIX_TO_CHANNEL: Record<string, string> = {
+const JID_PREFIX_TO_CHANNEL: Record<string, string> = {
   dc: 'discord',
   discord: 'discord',
   tg: 'telegram',

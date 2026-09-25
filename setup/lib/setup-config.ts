@@ -14,7 +14,7 @@
  *   'flag+ui'  — also shown in the advanced-settings screen
  */
 
-export type EntrySurface = 'flag' | 'flag+ui';
+type EntrySurface = 'flag' | 'flag+ui';
 
 interface BaseEntry {
   /** Canonical camelCase key. */

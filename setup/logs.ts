@@ -27,9 +27,6 @@ const LOGS_DIR = 'logs';
 const STEPS_DIR = path.join(LOGS_DIR, 'setup-steps');
 const PROGRESS_LOG = path.join(LOGS_DIR, 'setup.log');
 
-export const progressLogPath = PROGRESS_LOG;
-export const stepsDir = STEPS_DIR;
-
 // Track steps that finished cleanly in this run. Used by fail() to build
 // a NANOCLAW_SKIP list when re-executing after a Claude-assisted fix, so
 // the retry picks up at the failing step instead of redoing every step
@@ -51,7 +48,7 @@ export function reset(meta: Record<string, string>): void {
 }
 
 /** Append a run-start header to the progression log. Idempotent: creates the file if missing. */
-export function header(meta: Record<string, string>): void {
+function header(meta: Record<string, string>): void {
   fs.mkdirSync(LOGS_DIR, { recursive: true });
   const ts = new Date().toISOString();
   const lines = [`## ${ts} · setup:auto started`];

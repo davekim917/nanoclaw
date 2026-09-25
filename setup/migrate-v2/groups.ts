@@ -17,42 +17,9 @@ import path from 'path';
 
 import Database from 'better-sqlite3';
 
+import { copyTree } from './shared.js';
+
 const SKIP_NAMES = new Set(['CLAUDE.md', 'logs', '.git', '.DS_Store', 'node_modules']);
-
-/**
- * Copy a directory tree, skipping SKIP_NAMES. Never overwrites existing files.
- *
- * Symlinks are skipped, not followed: v1 group folders sometimes contain
- * container-side paths like `.claude-shared.md → /app/CLAUDE.md` that
- * don't resolve on the host. Following them with `fs.copyFileSync` would
- * crash ENOENT on a broken target and abort the rest of the traversal.
- * v2 uses composed CLAUDE.md fragments anyway — these v1 symlinks have no
- * v2 meaning and don't need to be carried forward.
- */
-function copyTree(src: string, dst: string): number {
-  let written = 0;
-  if (!fs.existsSync(src)) return 0;
-  fs.mkdirSync(dst, { recursive: true });
-
-  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
-    if (SKIP_NAMES.has(entry.name)) continue;
-    const s = path.join(src, entry.name);
-    const d = path.join(dst, entry.name);
-
-    if (entry.isSymbolicLink()) {
-      console.log(`SKIP:symlink ${path.relative(process.cwd(), s)}`);
-      continue;
-    }
-    if (entry.isDirectory()) {
-      written += copyTree(s, d);
-      continue;
-    }
-    if (fs.existsSync(d)) continue;
-    fs.copyFileSync(s, d);
-    written += 1;
-  }
-  return written;
-}
 
 function main(): void {
   const v1Path = process.argv[2];
@@ -126,7 +93,7 @@ function main(): void {
     }
 
     // Copy everything else
-    filesCopied += copyTree(v1Folder, v2Folder);
+    filesCopied += copyTree(v1Folder, v2Folder, SKIP_NAMES, 'skip');
     foldersCopied++;
   }
 

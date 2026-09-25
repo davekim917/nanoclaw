@@ -65,13 +65,18 @@ export async function run(args: string[]): Promise<void> {
       nonMainReadOnly: true,
     };
     fs.writeFileSync(configFile, JSON.stringify(emptyConfig, null, 2) + '\n');
-  } else if (json) {
+  } else {
+    let input = json;
+    if (!json) {
+      log.info('Reading mount allowlist from stdin');
+      input = fs.readFileSync(0, 'utf-8');
+    }
     // Validate JSON with JSON.parse (not piped through shell)
     let parsed: { allowedRoots?: unknown[]; nonMainReadOnly?: boolean };
     try {
-      parsed = JSON.parse(json);
+      parsed = JSON.parse(input);
     } catch {
-      log.error('Invalid JSON input');
+      log.error(json ? 'Invalid JSON input' : 'Invalid JSON from stdin');
       emitStatus('CONFIGURE_MOUNTS', {
         PATH: configFile,
         ALLOWED_ROOTS: 0,
@@ -82,32 +87,6 @@ export async function run(args: string[]): Promise<void> {
       });
       process.exit(4);
       return; // unreachable but satisfies TS
-    }
-
-    fs.writeFileSync(configFile, JSON.stringify(parsed, null, 2) + '\n');
-    allowedRoots = Array.isArray(parsed.allowedRoots)
-      ? parsed.allowedRoots.length
-      : 0;
-    nonMainReadOnly = parsed.nonMainReadOnly === false ? 'false' : 'true';
-  } else {
-    // Read from stdin
-    log.info('Reading mount allowlist from stdin');
-    const input = fs.readFileSync(0, 'utf-8');
-    let parsed: { allowedRoots?: unknown[]; nonMainReadOnly?: boolean };
-    try {
-      parsed = JSON.parse(input);
-    } catch {
-      log.error('Invalid JSON from stdin');
-      emitStatus('CONFIGURE_MOUNTS', {
-        PATH: configFile,
-        ALLOWED_ROOTS: 0,
-        NON_MAIN_READ_ONLY: 'unknown',
-        STATUS: 'failed',
-        ERROR: 'invalid_json',
-        LOG: 'logs/setup.log',
-      });
-      process.exit(4);
-      return;
     }
 
     fs.writeFileSync(configFile, JSON.stringify(parsed, null, 2) + '\n');

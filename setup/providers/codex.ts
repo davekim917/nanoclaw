@@ -31,7 +31,7 @@ import * as p from '@clack/prompts';
 import k from 'kleur';
 
 import { brightSelect } from '../lib/bright-select.js';
-import { type AssistContext, BIG_PICTURE_FILES, STEP_FILES } from '../lib/claude-assist.js';
+import { type AssistContext, failureReferences } from '../lib/claude-assist.js';
 import { brandBody, note } from '../lib/theme.js';
 import * as setupLog from '../logs.js';
 import { effectiveDockerArgBeforeFinalRun, finalDockerArg, hasDockerRunConsumer } from '../lib/dockerfile-version.js';
@@ -288,7 +288,7 @@ function runInherit(cmd: string, args: string[], extraEnv?: Record<string, strin
  * ~/.codex/auth.json exists (API-key-only installs keep the key in the
  * OneCLI vault, so the host-side CLI has nothing to authenticate with).
  */
-export function isCodexCliUsable(): boolean {
+function isCodexCliUsable(): boolean {
   const codexCheck = spawnSync('codex', ['--version'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
   if (codexCheck.status !== 0) return false;
   return fs.existsSync(path.join(os.homedir(), '.codex', 'auth.json'));
@@ -300,13 +300,7 @@ export function isCodexCliUsable(): boolean {
  * fix, be concise, exit when done"), and a de-duped file reference list.
  */
 export function buildCodexFailurePrompt(ctx: AssistContext, projectRoot: string): string {
-  const stepRefs = STEP_FILES[ctx.stepName] ?? [];
-  const references = [
-    ...BIG_PICTURE_FILES,
-    ...stepRefs,
-    'logs/setup.log',
-    ctx.rawLogPath ? path.relative(projectRoot, ctx.rawLogPath) : 'logs/setup-steps/',
-  ].filter((v, i, a) => a.indexOf(v) === i);
+  const references = failureReferences(ctx, projectRoot);
 
   const lines: string[] = [
     "The user is running NanoClaw's interactive setup flow and hit a failure.",
@@ -336,7 +330,7 @@ export function buildCodexFailurePrompt(ctx: AssistContext, projectRoot: string)
  * 'unavailable' when the CLI can't run here so the dispatcher can fall back
  * to its guarded Claude offer.
  */
-export async function offerCodexFailureAssist(ctx: AssistContext, projectRoot: string): Promise<FailureAssistResult> {
+async function offerCodexFailureAssist(ctx: AssistContext, projectRoot: string): Promise<FailureAssistResult> {
   if (!isCodexCliUsable()) return 'unavailable';
 
   const want = ensureAnswer(
@@ -420,7 +414,7 @@ export function verifyCodexInstall(root = process.cwd()): { ok: boolean; problem
   return { ok: problems.length === 0, problems };
 }
 
-export async function runCodexInstallCheck(): Promise<void> {
+async function runCodexInstallCheck(): Promise<void> {
   p.log.step(brandBody('Checking the Codex provider install…'));
   const { ok, problems } = verifyCodexInstall();
   if (ok) {

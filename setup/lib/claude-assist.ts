@@ -27,6 +27,7 @@ import path from 'path';
 import * as p from '@clack/prompts';
 import k from 'kleur';
 
+import { SHOW_CURSOR, clearActionWindow, drawActionWindow, openActionWindow } from './action-window.js';
 import { extractClaudeOAuthToken } from './captured-token.js';
 import { ensureAnswer } from './runner.js';
 import { brandBody, fitToWidth, fmtDuration, note } from './theme.js';
@@ -103,6 +104,17 @@ export const STEP_FILES: Record<string, string[]> = {
 };
 
 export const BIG_PICTURE_FILES = ['README.md', 'setup/auto.ts'];
+
+/** Files a failure-debugging prompt points the assistant at, de-duplicated. */
+export function failureReferences(ctx: AssistContext, projectRoot: string): string[] {
+  const stepRefs = STEP_FILES[ctx.stepName] ?? [];
+  return [
+    ...BIG_PICTURE_FILES,
+    ...stepRefs,
+    'logs/setup.log',
+    ctx.rawLogPath ? path.relative(projectRoot, ctx.rawLogPath) : 'logs/setup-steps/',
+  ].filter((v, i, a) => a.indexOf(v) === i);
+}
 
 /**
  * Returns `true` if the user ran a Claude-suggested fix command; callers
@@ -247,15 +259,7 @@ export async function ensureClaudeReady(projectRoot: string): Promise<boolean> {
 }
 
 function buildPrompt(ctx: AssistContext, projectRoot: string): string {
-  const stepRefs = STEP_FILES[ctx.stepName] ?? [];
-  const references = [
-    ...BIG_PICTURE_FILES,
-    ...stepRefs,
-    'logs/setup.log',
-    ctx.rawLogPath
-      ? path.relative(projectRoot, ctx.rawLogPath)
-      : 'logs/setup-steps/',
-  ].filter((v, i, a) => a.indexOf(v) === i);
+  const references = failureReferences(ctx, projectRoot);
 
   const hintLine = ctx.hint ? `Hint shown to the user: ${ctx.hint}\n` : '';
 
@@ -283,21 +287,10 @@ function buildPrompt(ctx: AssistContext, projectRoot: string): string {
 }
 
 /**
- * Fixed-height scrolling window for Claude's progress.
- *
- * Clack's spinner only owns one line, so long tool-use breadcrumbs wrap
- * and blow out the gutter. Instead we manage a 4-line window ourselves:
- * a spinner header + 3 lines showing the most recent tool actions. On
- * each update we use raw ANSI (cursor up, clear line) to redraw in
- * place. When the query finishes we clear the whole block and emit a
- * single `p.log.success` / `p.log.error` so the flow continues in
- * standard clack style.
+ * Claude's progress runs in an action window; when the query finishes we
+ * clear the block and emit a single `p.log.success` / `p.log.error` so the
+ * flow continues in standard clack style.
  */
-const WINDOW_SIZE = 3;
-const SPINNER_FRAMES = ['◒', '◐', '◓', '◑'];
-const HIDE_CURSOR = '\x1b[?25l';
-const SHOW_CURSOR = '\x1b[?25h';
-
 async function queryClaudeUnderSpinner(
   prompt: string,
   projectRoot: string,
@@ -308,40 +301,10 @@ async function queryClaudeUnderSpinner(
   let frameIdx = 0;
 
   const redraw = (): void => {
-    // Move cursor back to the start of the block (WINDOW_SIZE + 1 = header + window).
-    out.write(`\x1b[${WINDOW_SIZE + 1}A`);
-
-    const icon = SPINNER_FRAMES[frameIdx % SPINNER_FRAMES.length];
-    const suffix = ` (${fmtDuration(Date.now() - start)})`;
-    const header = fitToWidth('Asking Claude to diagnose…', suffix);
-    out.write(`\x1b[2K${k.cyan(icon)}  ${header}${k.dim(suffix)}\n`);
-
-    for (let i = 0; i < WINDOW_SIZE; i++) {
-      const idx = actions.length - WINDOW_SIZE + i;
-      const action = idx >= 0 ? actions[idx] : '';
-      out.write('\x1b[2K');
-      if (action) {
-        out.write(`${k.gray('│')}  ${k.dim(`▸ ${fitToWidth(action, '')}`)}`);
-      } else {
-        out.write(k.gray('│'));
-      }
-      out.write('\n');
-    }
+    drawActionWindow(out, 'Asking Claude to diagnose…', start, frameIdx, actions, '▸ ');
   };
 
-  const clearBlock = (): void => {
-    out.write(`\x1b[${WINDOW_SIZE + 1}A`);
-    for (let i = 0; i < WINDOW_SIZE + 1; i++) {
-      out.write('\x1b[2K\n');
-    }
-    out.write(`\x1b[${WINDOW_SIZE + 1}A`);
-  };
-
-  // Seed the block: move cursor to a fresh line, then write (header + window)
-  // blank lines so `redraw()`'s cursor-up math lands correctly. Hide the
-  // cursor for the duration so the redraw doesn't flicker.
-  out.write(HIDE_CURSOR);
-  for (let i = 0; i < WINDOW_SIZE + 1; i++) out.write('\n');
+  openActionWindow(out);
   redraw();
 
   // If the user Ctrl-C's during the query, we never reach `finish()` —
@@ -367,7 +330,7 @@ async function queryClaudeUnderSpinner(
       payload: string | null,
     ): void => {
       clearInterval(frameTick);
-      clearBlock();
+      clearActionWindow(out);
       out.write(SHOW_CURSOR);
       process.off('exit', restoreCursorOnExit);
       const suffix = ` (${fmtDuration(Date.now() - start)})`;

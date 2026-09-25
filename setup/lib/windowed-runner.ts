@@ -18,6 +18,7 @@
 import * as p from '@clack/prompts';
 import k from 'kleur';
 
+import { SHOW_CURSOR, clearActionWindow, drawActionWindow, openActionWindow } from './action-window.js';
 import { offerClaudeOnFailure } from './claude-handoff.js';
 import { emit as phEmit } from './diagnostics.js';
 import type { StepResult, SpinnerLabels } from './runner.js';
@@ -25,10 +26,6 @@ import { dumpTranscriptOnFailure, spawnStep, writeStepEntry } from './runner.js'
 import * as setupLog from '../logs.js';
 import { brandBody, fitToWidth, fmtDuration } from './theme.js';
 
-const WINDOW_SIZE = 3;
-const SPINNER_FRAMES = ['◒', '◐', '◓', '◑'];
-const HIDE_CURSOR = '\x1b[?25l';
-const SHOW_CURSOR = '\x1b[?25h';
 const STALL_THRESHOLD_MS = 60_000;
 
 /**
@@ -84,35 +81,10 @@ async function runUnderWindow(
 
   const redraw = (): void => {
     if (stallPromptActive) return;
-    out.write(`\x1b[${WINDOW_SIZE + 1}A`);
-    const icon = SPINNER_FRAMES[frameIdx % SPINNER_FRAMES.length];
-    const suffix = ` (${fmtDuration(Date.now() - start)})`;
-    const header = fitToWidth(labels.running, suffix);
-    out.write(`\x1b[2K${k.cyan(icon)}  ${header}${k.dim(suffix)}\n`);
-
-    for (let i = 0; i < WINDOW_SIZE; i++) {
-      const idx = actions.length - WINDOW_SIZE + i;
-      const action = idx >= 0 ? actions[idx] : '';
-      out.write('\x1b[2K');
-      if (action) {
-        out.write(`${k.gray('│')}  ${k.dim(fitToWidth(action, ''))}`);
-      } else {
-        out.write(k.gray('│'));
-      }
-      out.write('\n');
-    }
+    drawActionWindow(out, labels.running, start, frameIdx, actions);
   };
 
-  const clearBlock = (): void => {
-    out.write(`\x1b[${WINDOW_SIZE + 1}A`);
-    for (let i = 0; i < WINDOW_SIZE + 1; i++) {
-      out.write('\x1b[2K\n');
-    }
-    out.write(`\x1b[${WINDOW_SIZE + 1}A`);
-  };
-
-  out.write(HIDE_CURSOR);
-  for (let i = 0; i < WINDOW_SIZE + 1; i++) out.write('\n');
+  openActionWindow(out);
   redraw();
 
   const restoreCursorOnExit = (): void => {
@@ -132,12 +104,11 @@ async function runUnderWindow(
     void handleStall(stepName, rawLog, {
       pauseRender: () => {
         stallPromptActive = true;
-        clearBlock();
+        clearActionWindow(out);
         out.write(SHOW_CURSOR);
       },
       resumeRender: () => {
-        out.write(HIDE_CURSOR);
-        for (let i = 0; i < WINDOW_SIZE + 1; i++) out.write('\n');
+        openActionWindow(out);
         stallPromptActive = false;
         lastLineAt = Date.now();
         redraw();
@@ -159,7 +130,7 @@ async function runUnderWindow(
 
   clearInterval(frameTick);
   clearInterval(stallCheck);
-  clearBlock();
+  clearActionWindow(out);
   out.write(SHOW_CURSOR);
   process.off('exit', restoreCursorOnExit);
 

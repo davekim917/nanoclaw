@@ -165,14 +165,14 @@ export async function runChannelSkill(
     for (const t of res.agentTasks) {
       const lines = t.reason.split('\n').map((l) => l.trim()).filter(Boolean);
       const more = lines.length > 1 ? ` (+${lines.length - 1} more lines in ${rawLog})` : '';
-      // A protective refusal (copy owned-by-fork — #250) isn't a failure: the
+      // A protective refusal (copy owned-by-fork) isn't a failure: the
       // engine already did the safe, complete thing. Still worth telling the
       // operator, just not under the "needs an agent" banner that implies
       // something is broken.
       const label = t.protective ? 'Protected' : 'Needs an agent';
       p.log.warn(`${label} (${t.kind}): ${lines[0] ?? t.reason}${more}`);
     }
-    // A purely protective run (every bounce was a #250 refusal, nothing
+    // A purely protective run (every bounce was an owned-by-fork refusal, nothing
     // deferred) is NOT a failure — the skill did everything it safely could.
     // Aborting here would block credential collection/wiring on a customized
     // Slack/Discord install every time a sibling file needs a fresh copy.
