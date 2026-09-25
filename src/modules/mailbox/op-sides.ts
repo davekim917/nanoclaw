@@ -17,7 +17,8 @@
  *    classified by the handle identifiers its value expression REFERENCES:
  *    `inbound` for the inbound handle, `readableOutbound`/`writableOutbound`/
  *    `readOutbound` for the outbound ones. An op that touches both is INBOUND
- *    for this map's purpose — see `outboundOnlyOps`.
+ *    for this map's purpose, so `outbound` holds only ops that touch
+ *    outbound.db and nothing else.
  *
  * ## Why the compiler, and not a scanner
  *
@@ -217,7 +218,7 @@ function literalEntries(sf: ts.SourceFile, literal: ts.ObjectLiteralExpression, 
  *
  * Two shapes are understood, and both are the shapes the composition actually
  * uses: a call to a function declared in this file (`...composeOutboundOps(…)`,
- * which is how PR 4's outbound half is shared with the outbound-keyed funnel),
+ * which is how the outbound half is shared with the outbound-keyed funnel),
  * and a reference to a local object literal. Everything else throws rather
  * than contributing nothing — a spread whose ops are missing is exactly the
  * silent narrowing this module exists to prevent.
@@ -386,11 +387,6 @@ export function computeOpSides(): OpSides {
     }
   }
   return { inbound, outbound };
-}
-
-/** Ops that provably touch outbound.db and nothing else. */
-export function outboundOnlyOps(): Set<string> {
-  return computeOpSides().outbound;
 }
 
 /* ─── Outbound WRITES ─────────────────────────────────────────────────────── */

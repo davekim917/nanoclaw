@@ -180,18 +180,6 @@ export interface OutboundSessionRead {
   listOutboundTail(limit: number): MessageTailRow[];
 }
 
-export type {
-  ContainerState,
-  MessageTailRow,
-  OutboundSystemRow,
-  ProcessingClaim,
-  ScheduledTaskRow,
-  SessionTurnUsageRow,
-  TaskDeliveryRoute,
-  TaskFireRow,
-  TaskRoutingStamp,
-};
-
 /**
  * Resolve one side of a session's mailbox under `dataDir`, with the same
  * canonicalize-and-contain check the board's `:key` open site has always
@@ -208,7 +196,7 @@ function resolveReadPath(location: SessionReadLocation, side: 'inbound' | 'outbo
   // The containment check stays on the SESSION directory, which is the part
   // built from caller-supplied ids. The `.host` segment an inbound path may
   // carry is appended by our own resolver, never by an id — so a locator can
-  // no more escape through it than it could before (#749).
+  // no more escape through it than the session directory alone allows.
   return side === 'inbound' ? resolveInboundDbPath(resolved) : path.join(resolved, 'outbound.db');
 }
 

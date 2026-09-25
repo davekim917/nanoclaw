@@ -136,8 +136,7 @@ export function expireStalePending(db: Database.Database, maxAgeMs: number): num
  * The status set is exactly the one `sessionHasOpenWork` (src/storage-manager.ts)
  * counts, `('processing', 'pending')`, because that predicate is what these
  * rows pin: while any of them survives, reclaim refuses to archive the
- * directory and the session dir is stranded forever (#520 — 53 such sessions,
- * the oldest holding rows 43 days old).
+ * directory and the session dir is stranded forever.
  *
  * Unlike `expireStalePending` above this takes NO age cutoff and applies NO
  * recurrence or fence guard, and each omission is deliberate:
@@ -167,25 +166,6 @@ export function expireClosedSessionPending(db: Database.Database): number {
   migrateMessagesInTable(db);
   return db.prepare("UPDATE messages_in SET status = 'expired' WHERE status IN ('pending', 'processing')").run()
     .changes;
-}
-
-export function markMessageFailed(db: Database.Database, messageId: string): void {
-  db.prepare("UPDATE messages_in SET status = 'failed' WHERE id = ?").run(messageId);
-}
-
-export function retryWithBackoff(db: Database.Database, messageId: string, backoffSec: number): void {
-  const processAfter = new Date(Date.now() + backoffSec * 1000).toISOString();
-  db.prepare('UPDATE messages_in SET tries = tries + 1, process_after = ? WHERE id = ?').run(processAfter, messageId);
-}
-
-export function getMessageForRetry(
-  db: Database.Database,
-  messageId: string,
-  status: string,
-): { id: string; tries: number; processAfter: string | null } | undefined {
-  return db
-    .prepare('SELECT id, tries, process_after as processAfter FROM messages_in WHERE id = ? AND status = ?')
-    .get(messageId, status) as { id: string; tries: number; processAfter: string | null } | undefined;
 }
 
 /**
@@ -236,29 +216,26 @@ export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Data
 /**
  * Close every pending `recall-<X>` row whose target `<X>` is already terminal:
  * `completed`, `failed`, `expired`, or `cancelled` (an admitted task cancelled
- * before the runner claimed it keeps its recall, `cancelTask`,
- * src/mailbox/sqlite/tasks.ts:44-50; nothing revives a cancelled row).
+ * before the runner claimed it keeps its recall, `cancelTask` in
+ * src/mailbox/sqlite/tasks.ts; nothing revives a cancelled row).
  *
- * Admission writes the recall row beside its turn (`admitDueRow`,
- * src/modules/mailbox/ops/admission.ts:155-175) and a normal turn claims and
+ * Admission writes the recall row beside its turn (`admitDueRow`) and a normal turn claims and
  * acks both. A turn that ends without claiming its recall leaves it pending: a
  * script-gated or script-errored task fire, where the runner acks only the task
- * (`completed` or `script-skip:error`,
- * container/agent-runner/src/modules/mailbox/index.ts:279-292) and defers the
- * unclaimed rest (container/agent-runner/src/poll-loop.ts:724-740), or a /clear
- * completed inline. The runner already treats such a row as dead
- * (container/agent-runner/src/modules/mailbox/selection.ts:341-357), nothing
- * re-pairs it once its target is terminal (admission needs the target pending,
- * `DUE_PREDICATE`, admission.ts:90-102), and `expireStalePending` above expires
+ * (`completed` or `script-skip:error`) and defers the
+ * unclaimed rest, or a /clear
+ * completed inline. The runner's selection already treats such a row as dead,
+ * nothing re-pairs it once its target is terminal (admission needs the target pending,
+ * `DUE_PREDICATE`), and `expireStalePending` above expires
  * it 24 hours later anyway. This expires it on the same tick instead, so a
  * watcher on a 5-minute cadence stops carrying a day of dead recall payloads
  * through every poll's candidate windows.
  *
  * A row counts as a recall only by the runner's own test — `kind = 'system'`,
  * the `recall-` id prefix AND `subtype: 'recall_context'` content
- * (`recallTargetId`, container/agent-runner/src/modules/mailbox/selection.ts:95-103),
- * which both writers stamp (`src/session-manager.ts:788`, the admitted recall;
- * `src/modules/mailbox/ops/ingress.ts:134`, the deferred marker). A system row
+ * (`recallTargetId` in the runner's mailbox selection),
+ * which both writers stamp (the session manager for the admitted recall;
+ * ingress for the deferred marker). A system row
  * that merely shares the prefix is not ours to expire.
  *
  * `expired` is exactly the state `expireStalePending` would give it. The query
@@ -290,16 +267,14 @@ export function closeOrphanRecallRows(inDb: Database.Database): number {
  *
  * The runner drops a pending row from selection when `messages_out` holds a
  * non-status row with `in_reply_to` = its id, written at/after the row's
- * `process_after` (any time, for a row without one) — `isResponded`,
- * container/agent-runner/src/modules/mailbox/selection.ts:333-339, applied at
- * :356. `in_reply_to` is stamped from the CLAIMED batch
- * (container/agent-runner/src/poll-loop.ts:2767), so such a row was claimed
+ * `process_after` (any time, for a row without one) — `isResponded` in the
+ * runner's mailbox selection. `in_reply_to` is stamped from the CLAIMED batch
+ * by the runner's poll loop, so such a row was claimed
  * once. Normally the claim turns terminal and the sync above completes the
  * row. It does not when the turn ends without `markCompleted` — a batch
  * deferred to the fallback provider keeps its 'processing' claim
- * (poll-loop.ts:1499-1507) — and the next container's startup then deletes
- * every 'processing' claim (`clearStaleProcessingAcks`,
- * container/agent-runner/src/modules/mailbox/container-state.ts:168). What is
+ * — and the next container's startup then deletes
+ * every 'processing' claim (`clearStaleProcessingAcks`). What is
  * left is a row with no ack at all that the runner treats as handled and the
  * host still counts as due: the wake duty sees due work behind a running
  * container, the idle-task reap sees due work and declines, and a recurring
@@ -316,14 +291,14 @@ export function closeOrphanRecallRows(inDb: Database.Database): number {
  * and only the host moves `process_after` (synchronously, not under this
  * call). A row carrying ANY ack is left alone — a live claim belongs to the
  * container, a terminal one to the sync above, an orphan 'processing' one to
- * `resetStuckProcessingRows` (src/modules/sweep-session-core/index.ts:50).
+ * `resetStuckProcessingRows` in sweep-session-core.
  *
  * Writes inbound only. The due filter is `countDueMessages`' own, so the rows
  * considered are exactly the rows that hold a session "due".
  */
 /**
- * The runner's own timestamp reading, statement for statement (`parseDbUtc`,
- * container/agent-runner/src/modules/mailbox/selection.ts:31-35) — the two
+ * The runner's own timestamp reading, statement for statement (`parseDbUtc` in
+ * the runner's mailbox selection) — the two
  * package trees cannot share a module, and a looser or stricter parse here is
  * exactly how the host and the runner would come to disagree again.
  */
@@ -333,7 +308,7 @@ function parseRunnerUtc(value: string): number {
   return Date.parse(s);
 }
 
-/** `isResponded` (selection.ts:333-339): NaN on either side compares false → not answered. */
+/** Mirrors the runner's `isResponded`: NaN on either side compares false → not answered. */
 function answeredSinceDue(answeredAt: string, processAfter: string | null): boolean {
   if (processAfter === null) return true;
   return parseRunnerUtc(answeredAt) >= parseRunnerUtc(processAfter);
@@ -358,8 +333,8 @@ export function completeAnsweredPendingRows(inDb: Database.Database, outDb: Data
   // ONE grouped read per chunk, never one per due row: `messages_out.in_reply_to`
   // is unindexed, so each lookup is a scan of the session's whole outbound
   // history, and a backlog of due rows would multiply that inside the sweep's
-  // synchronous turn. Same statement shape as the runner's own read
-  // (selection.ts:311-322). Chunked under SQLite's bound-variable limit (999 on
+  // synchronous turn. Same statement shape as the runner's own read in its
+  // mailbox selection. Chunked under SQLite's bound-variable limit (999 on
   // older builds).
   const answeredAt = new Map<string, string>();
   for (let start = 0; start < due.length; start += ANSWERED_LOOKUP_CHUNK) {

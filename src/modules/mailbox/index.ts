@@ -37,7 +37,6 @@ import {
   SessionDbMissingError,
   openInboundDb,
   openOutboundDb,
-  openOutboundDbRw,
   openOutboundDbWritable,
   sessionDbPathIsGone,
 } from './openers.js';
@@ -277,7 +276,7 @@ export {
 export { sessionMailboxDir, sessionMailboxPath } from '../../mailbox/sqlite/paths.js';
 
 /**
- * Where the host keeps `inbound.db` since #749, and the spawn path's migration
+ * Where the host keeps `inbound.db`, and the spawn path's migration
  * onto it. The database itself is still reached through a mailbox session —
  * these are the layout and the one-time move, for the spawn path that has to
  * mount the host-owned directory read-only.
@@ -549,7 +548,7 @@ export interface NanoclawMailboxSession extends MailboxSession {
   /**
    * The newest LIVE (`pending`/`paused`) task row of a series.
    *
-   * The read-only funnels have carried this since PR 6; the WRITE session
+   * The read-only funnels carry this too; the WRITE session
    * needs it too, because a writer that approved a row before an await has to
    * re-prove that row is still the live one before it mutates. Same op, same
    * statement (invariant I-2) — the surface differs, the SQL does not.
@@ -656,15 +655,14 @@ export interface NanoclawMailboxSession extends MailboxSession {
  * is the half that is safe on any session, including one the host is only
  * inspecting: nothing here writes the container-owned file.
  *
- * Deliberately the SAME op vocabulary as PR 7's read-only `OutboundSessionRead`
+ * Deliberately the SAME op vocabulary as the read-only `OutboundSessionRead`
  * — same names, same signatures — so the two can be expressed in terms of each
  * other rather than maintained as parallel types. `getProcessingClaimRows`
  * matches it exactly; `getContainerState` returns `NanoclawContainerState`,
- * which extends `ops/sweep`'s `ContainerState` that PR 7 declares, so it is
- * assignable in that direction. PR 7's other reads (`listTurnUsageSince`,
- * `listOutboundTail`, `hasWorkContinuation`, …) live in `ops/reads.ts`, which
- * is PR 6's file and does not exist on this head; they join this vocabulary
- * when PR 6 merges down, and the union belongs in ONE of these two types then,
+ * which extends `ops/sweep`'s `ContainerState`, so it is
+ * assignable in that direction. The other reads (`listTurnUsageSince`,
+ * `listOutboundTail`, `hasWorkContinuation`, …) live in `ops/reads.ts`; if
+ * they join this vocabulary, the union belongs in ONE of these two types,
  * not in a third.
  */
 export type NanoclawOutboundRead = Pick<
@@ -686,7 +684,7 @@ export type NanoclawOutboundRead = Pick<
  *    the policy around it in `dashboard/thread-close.ts`).
  *  - `deleteOrphanProcessingClaims` — the same shape and the same policy: the
  *    sweep's orphan-claim clear after a container death, and the closed-session
- *    release (#520), which has to reach it on a session whose `inbound.db` is
+ *    release, which has to reach it on a session whose `inbound.db` is
  *    gone. Upstream binds this op too, so this exposes an existing op on the
  *    outbound-keyed surface rather than adding one.
  *  - `writeOutboundDirect` — the router's two notices (a command-gate denial,
@@ -802,17 +800,17 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
     // missing, which is what a fresh session needs; the SPAWN path is what
     // later hard-links it into `<session>/.host/`. On every later call that
     // link is still there, so upstream's existence check finds the file and
-    // creates nothing, and no upstream file has to change (#749).
+    // creates nothing, and no upstream file has to change.
     //
     // PROVISIONING DELIBERATELY DOES NOT MIGRATE, and that is a safety
     // property rather than an omission. A container's `/workspace` is a
     // read-WRITE bind of the session directory, fixed at spawn, and the
     // read-only `.host` overlay exists only in a mount set built at spawn
-    // (`hostInboundMounts`, `src/container-runner.ts:4471`). Migrating from
+    // (`hostInboundMounts`, called from `src/container-runner.ts`). Migrating from
     // here would create `.host/` UNDERNEATH a container that is already
     // running — inside its writable mount, with no overlay over it — handing
     // that container the host's journal path and the authoritative file
-    // itself. That is strictly worse than the pre-#749 state, where at least
+    // itself. That is strictly worse than the legacy layout, where at least
     // the file was overlaid read-only. And this runs live: `prepare()` is
     // reached on any in-session task create (`src/db/scheduled-tasks.ts`) and
     // from the documented-reset re-provision (`src/session-manager.ts`).
@@ -873,7 +871,7 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
     // outbound still reaches the opener and fails there.
     const outboundPresent = !sessionDbPathIsGone(outboundPath);
     const readableOutbound = () => (outbound ??= openOutboundDb(outboundPath));
-    const writableOutbound = () => (outboundWriter ??= openOutboundDbRw(outboundPath));
+    const writableOutbound = () => (outboundWriter ??= openOutboundDbWritable(outboundPath));
     try {
       if (!this.nanoclawMigrated.has(inboundPath)) {
         // Upstream's legacy migrations first, then the fork's. The fork's
@@ -1201,7 +1199,7 @@ function forkOps(
         // still ON its first poll when the host adopted it, and that is exactly
         // what a `processing_ack` read catches.
         //
-        // KNOWN WINDOW, deferred (fork issue #459): a survivor that has SELECTED
+        // KNOWN WINDOW, deferred: a survivor that has SELECTED
         // an `on_wake` row on its first poll but has not yet written the
         // `processing_ack` reads here as unclaimed, so the row can be converted
         // or withdrawn under it. Closing it needs a fence across the host/runner
