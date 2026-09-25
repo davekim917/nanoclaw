@@ -53,8 +53,10 @@ const INSTALLER_FILE = /\.(?:md|sh|[cm]?[jt]s)$/;
 const TEST_FILE = /\.test\.[cm]?[jt]s$/;
 const HARD_CODED_REGISTRY = [
   /\b(?:origin|upstream)\/(?:channels|providers):/,
-  /\bgit fetch (?:origin|upstream) (?:channels|providers)\b/,
+  // `git [-C <dir>] fetch [<options>] <remote> [<refspec>...]`: options may precede the remote.
+  /\bgit\b.*\bfetch\b(?:\s+-\S+)*\s+(?:origin|upstream)\s+(?:\S+\s+)*?(?:channels|providers)\b/,
 ];
+const hardCodes = (line: string) => HARD_CODED_REGISTRY.some((re) => re.test(line));
 
 /** Installer text under `rel`: skills, setup and scripts, without tests and without the resolver itself. */
 function installerFiles(rel: string): string[] {
@@ -105,14 +107,31 @@ describe('registry remote resolution', () => {
     expect(git(resolved, ['remote', 'get-url', 'upstream'])).toBe(REGISTRY);
   });
 
+  it('the hard-coded-remote patterns catch every fetch and show form', () => {
+    for (const line of [
+      'git fetch origin channels',
+      'git fetch --prune origin channels',
+      'git -C "$root" fetch --depth=1 upstream main providers',
+      'git show origin/channels:src/channels/github.ts > src/channels/github.ts',
+      'git show upstream/providers:src/providers/codex.ts',
+    ]) {
+      expect(hardCodes(line), line).toBe(true);
+    }
+    for (const line of [
+      'git fetch "$remote" channels',
+      'git show "$remote/channels:src/channels/x.ts"',
+      'git fetch origin main',
+    ]) {
+      expect(hardCodes(line), line).toBe(false);
+    }
+  });
+
   it('no installer hard-codes the remote a registry branch comes from', () => {
     const offenders = INSTALLER_ROOTS.flatMap(installerFiles).flatMap((rel) =>
       fs
         .readFileSync(path.join(REPO_ROOT, rel), 'utf8')
         .split('\n')
-        .flatMap((line, i) =>
-          HARD_CODED_REGISTRY.some((re) => re.test(line)) ? [`${rel}:${i + 1}: ${line.trim()}`] : [],
-        ),
+        .flatMap((line, i) => (hardCodes(line) ? [`${rel}:${i + 1}: ${line.trim()}`] : [])),
     );
     expect(offenders, 'resolve the remote with setup/lib/channels-remote.sh (resolve_channels_remote)').toEqual([]);
   });
