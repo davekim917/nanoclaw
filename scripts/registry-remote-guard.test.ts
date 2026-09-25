@@ -32,10 +32,11 @@ const PLACEHOLDER_FETCHED = /(?<=\s)<branch>(?=$|[\s'"`),;])/g;
 /**
  * What must directly precede a branch mention: a variable, the resolver call, or the `<remote>`
  * placeholder a skill binds to the resolver's answer, then `/` or whitespace (other branch names may
- * sit between).
+ * sit between). A variable that opens a single-quoted word is refused: the shell would not expand it.
+ * (A whole command inside `bash -c '…'` is fine, since the inner shell expands it.)
  */
 const REMOTE_FROM_VARIABLE =
-  /(?:\$\{?\w+\}?|\$\(resolve_channels_remote\)|<remote>)["']?(?:\/|(?:\s+(?:channels|providers|<[\w-]+>))*\s+)["']?$/;
+  /(?:(?<!')\$\{?\w+\}?|(?<!')\$\(resolve_channels_remote\)|<remote>)"?(?:\/|(?:\s+(?:channels|providers|<[\w-]+>))*\s+)"?$/;
 
 function hardCodesRegistryRemote(line: string): boolean {
   if (!RUNS_GIT.test(line)) return false;
@@ -83,6 +84,8 @@ describe('installers take the registry remote from the resolver', () => {
       'run its `git fetch origin <branch>`, write its files with `git show origin/<branch>:path > $WORKTREE/path`',
       'diff <(git show origin/<branch>:<path>) <path>',
       'git fetch upstream <branch>',
+      "git fetch '$remote' providers",
+      "git show '$remote/channels:src/channels/x.ts'",
     ]) {
       expect(hardCodesRegistryRemote(line), line).toBe(true);
     }
@@ -93,10 +96,10 @@ describe('installers take the registry remote from the resolver', () => {
       'git fetch "$remote" channels',
       'git fetch --depth 1 "$remote" channels',
       'git show "$remote/channels:src/channels/emacs.ts" > src/channels/emacs.ts',
-      "git fetch '$remote' providers",
       'git fetch ${remote} channels',
       'git show ${remote}/providers:src/providers/opencode.ts',
       'git fetch "$(resolve_channels_remote)" channels',
+      `bash -lc 'source setup/lib/channels-remote.sh; remote=$(resolve_channels_remote); git fetch "$remote" providers'`,
       'git fetch "$remote" channels providers --prune',
       'await exec(`git fetch ${remote} ${b}`);',
       'git add src/channels/index.ts src/providers/index.ts',
