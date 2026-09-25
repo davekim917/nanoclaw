@@ -72,7 +72,7 @@ export function getChannelAdapter(key: string): ChannelAdapter | undefined {
  *  null, setup failed, or a named instance is offline). Deliberately a throw
  *  rather than an `undefined` return: `undefined` is also what a successful
  *  adapter with no platform message id resolves to, and a normal return makes
- *  `drainSession` mark the row delivered even though nothing was sent (#2995).
+ *  `drainSession` mark the row delivered even though nothing was sent.
  *  Throwing routes the message into the delivery retry path, where it ends as
  *  `status='failed'` if the adapter never comes back. */
 export class MissingChannelAdapterError extends Error {

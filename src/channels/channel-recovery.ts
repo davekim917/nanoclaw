@@ -5,7 +5,7 @@ import { getActiveSessions } from '../db/sessions.js';
 import { log } from '../log.js';
 
 const MONITOR_INTERVAL_MS = 1_000;
-export const EVENT_LOOP_STALL_THRESHOLD_MS = 5_000;
+const EVENT_LOOP_STALL_THRESHOLD_MS = 5_000;
 
 // Stall-triggered catch-up is an amplifier when unthrottled: each pass fans
 // out REST scans across every adapter, whose response decompression alone can
@@ -269,7 +269,7 @@ export async function recoverAllChannelsAfterStartup(sinceMs: number): Promise<v
   );
 }
 
-export function observeEventLoopTick(nowMs: number, previousTickMs: number): number {
+function observeEventLoopTick(nowMs: number, previousTickMs: number): number {
   if (previousTickMs > 0) {
     const lagMs = nowMs - previousTickMs - MONITOR_INTERVAL_MS;
     if (lagMs >= EVENT_LOOP_STALL_THRESHOLD_MS) {

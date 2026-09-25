@@ -2,7 +2,7 @@
  * A card click, as the host turns it into a response payload.
  *
  * The channel seam hands a click to `ChannelSetup.onAction` as four values
- * (adapter.ts:29): the question id baked into the button, the chosen value,
+ * (adapter.ts): the question id baked into the button, the chosen value,
  * the clicker, and the platform id of the message the click was made on. This
  * is the one place they become a `ResponsePayload`, so every adapter's clicks
  * reach the handlers behind `dispatch` in the same shape.
@@ -20,7 +20,7 @@ import type { ResponsePayload } from '../response-registry.js';
 import type { ChannelSetup } from './adapter.js';
 
 /** The four values a click carries, as one payload. */
-export function actionResponsePayload(
+function actionResponsePayload(
   channelType: string,
   questionId: string,
   selectedOption: string,

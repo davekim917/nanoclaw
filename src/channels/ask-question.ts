@@ -15,7 +15,7 @@
  */
 export type OptionStyle = 'primary' | 'danger' | 'default';
 
-export interface OptionInput {
+interface OptionInput {
   label: string;
   selectedLabel?: string;
   value?: string;
@@ -46,12 +46,4 @@ export function normalizeOption(raw: RawOption): NormalizedOption {
 
 export function normalizeOptions(raws: RawOption[]): NormalizedOption[] {
   return raws.map(normalizeOption);
-}
-
-export interface AskQuestionPayload {
-  type: 'ask_question';
-  questionId: string;
-  title: string;
-  question: string;
-  options: NormalizedOption[];
 }

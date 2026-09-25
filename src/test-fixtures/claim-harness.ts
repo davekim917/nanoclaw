@@ -22,12 +22,12 @@ import { runMigrations } from '../db/index.js';
 import { getAgentMailbox } from '../mailbox/index.js';
 import type { Session } from '../types.js';
 
-export const CLAIM_HARNESS_STAMP = '2026-09-05T00:00:00.000Z';
+const CLAIM_HARNESS_STAMP = '2026-09-05T00:00:00.000Z';
 export const CLAIM_HARNESS_AGENT_GROUP_ID = 'ag-session-claim';
 // Deliberately a folder that does not exist under groups/: readContainerConfig
 // returns the empty config for it, so the spawn path runs end to end with no
 // disk fixture — the same lever src/container-runner.test.ts pulls.
-export const CLAIM_HARNESS_AGENT_GROUP_FOLDER = '__session-claim-test__';
+const CLAIM_HARNESS_AGENT_GROUP_FOLDER = '__session-claim-test__';
 
 /**
  * A real, fully migrated central DB on disk rather than a hand-rolled subset:
@@ -146,7 +146,7 @@ export async function containerStatusOf(sessionId: string): Promise<string | und
  * and under a loaded full-suite run that prelude takes seconds. A genuine hang
  * still fails, just later and with the same message.
  */
-export const WAIT_BUDGET_MS = 30_000;
+const WAIT_BUDGET_MS = 30_000;
 
 export async function until(done: () => boolean, describeFailure: string): Promise<void> {
   const deadline = Date.now() + WAIT_BUDGET_MS;

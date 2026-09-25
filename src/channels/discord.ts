@@ -94,7 +94,7 @@ function discordThreadTarget(root: ChannelRecoveryTarget, guildId: string, threa
  */
 const PERMANENT_DISCORD_RECOVERY_CODES = new Set([10003, 10004, 50001]); // Unknown Channel, Unknown Guild, Missing Access
 
-export function classifyDiscordRecoveryError(err: unknown): 'permanent' | 'transient' {
+function classifyDiscordRecoveryError(err: unknown): 'permanent' | 'transient' {
   const code = (err as { code?: unknown })?.code;
   if (typeof code === 'number' && PERMANENT_DISCORD_RECOVERY_CODES.has(code)) return 'permanent';
   const message = err instanceof Error ? err.message : '';
@@ -885,8 +885,8 @@ export async function openRecoveredMentionThread(
 
 function isDiscordUnknownChannelError(err: unknown): boolean {
   // @chat-adapter/discord@4.29.0 serialises HTTP failures into the message text, not a code field:
-  // `Discord API error: ${response.status} ${errorText}` (dist/index.js:1661, discordFetch) and
-  // `Failed to post message: ${response.status} ${error}` (dist/index.js:1255, postMessageWithFiles).
+  // `Discord API error: ${response.status} ${errorText}` (discordFetch) and
+  // `Failed to post message: ${response.status} ${error}` (postMessageWithFiles).
   // Pinned against the real adapter by the "real @chat-adapter/discord" test in discord.test.ts.
   const message = err instanceof Error ? err.message : String(err);
   return /\b404\b/.test(message) && new RegExp(`"code":\\s*${RESTJSONErrorCodes.UnknownChannel}\\b`).test(message);

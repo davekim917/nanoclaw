@@ -8,7 +8,7 @@
  * single write site) and the runner renders as `platform_msg_id`. A test can
  * only prove the CLI exclusion and the assignment itself by driving the
  * producer; poking `nativeId` into a hand-built event proves nothing about
- * either (review finding, PR #710).
+ * either.
  *
  * Two host-side stampings happen here and nowhere else:
  *

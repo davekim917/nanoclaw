@@ -81,7 +81,7 @@ function readHostRecord(file: string): string | null {
   }
 }
 
-export function readWikiPolicy(file = POLICY_FILE): { policy: WikiPolicy; digest: string } | null {
+function readWikiPolicy(file = POLICY_FILE): { policy: WikiPolicy; digest: string } | null {
   const raw = readHostRecord(file);
   return raw === null ? null : { policy: parsePolicy(JSON.parse(raw)), digest: digest(raw) };
 }

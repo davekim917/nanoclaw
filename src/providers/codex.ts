@@ -81,9 +81,8 @@ export function buildContainerCodexConfig(): string {
     // subagent runs at Codex's native default unless the spawn names a
     // `reasoning_effort` or its ROLE carries `model_reasoning_effort` — the
     // role is applied after the spawn argument and sets the effort
-    // unconditionally (codex-rs 0.154.0
-    // core/src/tools/handlers/multi_agents/spawn.rs:97-107,
-    // core/src/agent/role.rs:191-193), and `formatCodexAgentToml` writes that
+    // unconditionally (codex-rs 0.154.0 multi-agent spawn handler and agent
+    // role), and `formatCodexAgentToml` writes that
     // key for any agent `.md` with an `effort:` (src/claude-agent-md.ts), so
     // the five `/orchestrate` shims each pin their own level.
     // Kept byte-identical with CONTAINER_CODEX_CONFIG_BASE in

@@ -4,8 +4,7 @@
  *
  * Slack's small print is a Block Kit `context` block, and a message may carry
  * EITHER `markdown_text` OR `blocks`, never both ("markdown_text is mutually
- * exclusive with text and blocks" —
- * node_modules/@chat-adapter/slack/dist/index.js:388, matching
+ * exclusive with text and blocks" — @chat-adapter/slack, matching
  * https://docs.slack.dev/reference/block-kit/blocks/markdown-block/). So a
  * reply with a subtext has to move off the `markdown_text` field the adapter
  * normally uses and onto a blocks array — where Slack's `markdown` block
@@ -69,7 +68,7 @@ export function applySlackSubtext(args: SlackPostArgs, subtext: string | undefin
  * Exported for the bridge-side wrapper below and for tests; callers outside
  * this module should not need it.
  */
-export function withSlackSubtext<T>(subtext: string | undefined, fn: () => T): T {
+function withSlackSubtext<T>(subtext: string | undefined, fn: () => T): T {
   return subtext ? pendingSubtext.run(subtext, fn) : fn();
 }
 
@@ -118,7 +117,7 @@ export function installSlackSubtextBlocks(adapter: unknown): void {
   const originalChatPost = chat.postMessage.bind(chat);
   chat.postMessage = (args: SlackPostArgs) => originalChatPost(applySlackSubtext(args, pendingSubtext.getStore()));
 
-  // Edits (#1016). An agent correcting its own reply goes through the adapter's
+  // Edits. An agent correcting its own reply goes through the adapter's
   // editMessage, which builds the same `markdown_text` payload as a post
   // (toSlackPayload) and sends it with chat.update, so the same rewrite
   // applies. Wrapped separately so an adapter missing either seam still posts

@@ -39,6 +39,7 @@ import path from 'path';
 
 import { DATA_DIR } from '../config.js';
 import { log } from '../log.js';
+import { onSocketLines } from '../socket-lines.js';
 import type {
   ChannelAdapter,
   ChannelDefaults,
@@ -176,17 +177,7 @@ function createAdapter(): ChannelAdapter {
       log.info('CLI client connected');
     };
 
-    let buffer = '';
-    socket.on('data', (chunk) => {
-      buffer += chunk.toString('utf8');
-      let idx: number;
-      while ((idx = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, idx).trim();
-        buffer = buffer.slice(idx + 1);
-        if (!line) continue;
-        void handleLine(line, config, claimChatSlot);
-      }
-    });
+    onSocketLines(socket, (line) => void handleLine(line, config, claimChatSlot));
 
     socket.on('close', () => {
       if (client === socket) client = null;

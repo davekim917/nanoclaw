@@ -13,6 +13,7 @@ import net from 'node:net';
 import path from 'node:path';
 
 import { log } from '../log.js';
+import { onSocketLines } from '../socket-lines.js';
 import { dispatch } from './dispatch.js';
 import type { CallerContext, RequestFrame, ResponseFrame } from './frame.js';
 import { DEFAULT_SOCKET_PATH } from './socket-client.js';
@@ -282,17 +283,7 @@ async function stopCliServerInner(retainOwnership: boolean): Promise<void> {
 }
 
 function handleConnection(conn: net.Socket): void {
-  let buffer = '';
-  conn.on('data', (chunk) => {
-    buffer += chunk.toString('utf8');
-    let idx: number;
-    while ((idx = buffer.indexOf('\n')) >= 0) {
-      const line = buffer.slice(0, idx).trim();
-      buffer = buffer.slice(idx + 1);
-      if (!line) continue;
-      void handleFrame(conn, line);
-    }
-  });
+  onSocketLines(conn, (line) => void handleFrame(conn, line));
   conn.on('error', (err) => {
     log.warn('ncl CLI server connection error', { err });
   });

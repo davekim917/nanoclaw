@@ -155,7 +155,7 @@ function envSuffix(slug: string): string {
 }
 
 /**
- * ── FORK DELTA (T6 PR 1) ────────────────────────────────────────────────────
+ * ── FORK DELTA ──────────────────────────────────────────────────────────────
  * Everything above this line is a byte-copy of upstream's `src/channels/
  * slack-lib.ts` on the `channels` branch. Everything below is the fork's own
  * addition, and it exists because upstream and the fork key Slack adapters
@@ -183,7 +183,7 @@ function envSuffix(slug: string): string {
  */
 
 /** The default Slack channel type — the unsuffixed adapter. */
-export const DEFAULT_SLACK_CHANNEL_TYPE = 'slack';
+const DEFAULT_SLACK_CHANNEL_TYPE = 'slack';
 
 /**
  * slug → the fork's channel type.

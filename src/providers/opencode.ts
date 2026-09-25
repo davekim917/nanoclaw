@@ -50,7 +50,7 @@ import { registerProviderContainerConfig, type VolumeMount } from './provider-co
 // moves (2026-09-15: glm-5.3-flash → deepseek-v4.1-flash). This is the ONLY
 // place the default lives: the `provider_models` allowlist that once carried
 // an `is_default` row was dropped by migration 039
-// (`src/db/migrations/039-denied-models.ts:42`), so no DB row shadows it.
+// (`039-denied-models.ts`), so no DB row shadows it.
 // DeepSeek models on Go are China-hosted and the OpenCode workspace must have
 // opted in, or every request errors at the endpoint while `opencode models`
 // still lists the slug. The provider is derived from the model prefix at
@@ -100,7 +100,7 @@ const DEFAULT_OPENCODE_EFFORT = 'high';
  * plugin — while the bytes in the mirror are still the excluded one's. A
  * name-only comparison read that as "kept" and copied the excluded source
  * through. Comparing part of an identifier the producer guarantees unique in
- * full is the same mistake #826 r3 recorded for the composer's fragment keys.
+ * full is the same mistake once made for the composer's fragment keys.
  *
  * A name whose mirror copy IS the excluded source is therefore dropped even
  * when another plugin also provides it — the mirror holds the wrong one and
@@ -114,7 +114,7 @@ const DEFAULT_OPENCODE_EFFORT = 'high';
  * The population is the MIRROR'S, not one this reader derives: `discovered`
  * comes from `openCodeMirrorSkills`, the single walk the writer also uses
  * (`src/opencode-sync.ts`), and the spawn path passes the same array to this and
- * to `mirrorSourceRootsByName`. Deriving it here was #836: this walk denied only
+ * to `mirrorSourceRootsByName`. Deriving it here was a bug: this walk denied only
  * the code-level plugins while the mirror also denies every workgroup-scoped one,
  * so a scoped plugin that claimed a skill name ahead of an excluded sub-plugin
  * won HERE (not excluded → not dropped) while the mirror, having denied it,
@@ -130,7 +130,7 @@ const DEFAULT_OPENCODE_EFFORT = 'high';
  * record each entry's own SOURCE DIR beside the repository root it already
  * records (`MIRROR_SOURCE_ROOT_FILE`, `src/plugin-skill-discovery.ts`), since a
  * sub-path exclusion is about a path inside the repository and the root alone
- * cannot decide one — #852. Re-raise on a mirror left stale across a plugin
+ * cannot decide one. Re-raise on a mirror left stale across a plugin
  * rename, or on any new reader that walks for itself instead of taking this
  * population.
  *
@@ -185,7 +185,7 @@ export function excludedOpenCodeSkillNames(
  * and every skill of a repo records the same root. So a managed entry left stale
  * by a rename is still judged by the drop set against the path the CURRENT tree
  * publishes under its name rather than the one it holds. Closing that means
- * recording the entry's own source dir beside the root — #852, not made here.
+ * recording the entry's own source dir beside the root, not made here.
  */
 /**
  * The containment roots for one top-level entry of the mirror. See the ordering
@@ -385,7 +385,7 @@ export function copyOpenCodeSkills(source: string, target: string, options: Copy
  * column at all — `.env` is their only channel, and an unset var leaves
  * OpenCode's own behavior untouched.
  */
-export function resolveScopedOpenCodeEnv(
+function resolveScopedOpenCodeEnv(
   hostEnv: NodeJS.ProcessEnv,
   baseName: string,
   folder: string | undefined,
@@ -478,16 +478,16 @@ export const OPENCODE_XDG_CONTAINER_PATH = '/opencode-xdg';
  *
  * Non-OpenCode containers get these too (see `stageOpenCodeAuth`). Nothing else
  * in the image reads them: `gcloud` keys on `CLOUDSDK_CONFIG`
- * (`container/agent-runner/src/gcp-auth-setup.ts:36`), the design-review
+ * (`container/agent-runner/src/gcp-auth-setup.ts`), the design-review
  * Chromium sets its own per-run XDG dirs
- * (`container/agent-runner/src/mcp-tools/design-review/render.ts:134`), the
+ * (`container/agent-runner/src/mcp-tools/design-review/render.ts`), the
  * `hex` wrapper exports its own `XDG_DATA_HOME` per invocation
  * (`container/hex-wrapper.sh`), `gh` authenticates from `GH_TOKEN` via the
  * entrypoint shim rather than a config file (`container/entrypoint.sh`), and
  * git reads `$HOME/.gitconfig` or `GIT_CONFIG_GLOBAL` (same file).
  *
  * `XDG_CONFIG_HOME` here is in fact DEAD for the runner and every child it
- * spawns: `container/entrypoint.sh:37` exports `XDG_CONFIG_HOME=/tmp/.chromium`
+ * spawns: `container/entrypoint.sh` exports `XDG_CONFIG_HOME=/tmp/.chromium`
  * (a crashpad workaround) after Docker applies this env, so only
  * `XDG_DATA_HOME` survives. That is the one credential discovery needs —
  * `auth.json` lives under `$XDG_DATA_HOME/opencode/`. Both vars are still
@@ -496,8 +496,8 @@ export const OPENCODE_XDG_CONTAINER_PATH = '/opencode-xdg';
  * `OPENCODE_CONFIG` is what makes the staged default-model config
  * (`stagedOpenCodeConfig`, written beside `auth.json`) reach an agent shell:
  * with `XDG_CONFIG_HOME` clobbered, OpenCode's global-config lookup never
- * finds it (#887 — the #886 fix was verified from a `docker exec` shell, which
- * skips the entrypoint, and was dead for the runner's own children). The env
+ * finds it (a fix verified only from a `docker exec` shell, which
+ * skips the entrypoint, was dead for the runner's own children). The env
  * var names the file explicitly and survives the entrypoint, which re-exports
  * only `XDG_*`; OpenCode loads it as its "custom config" (opencode.ai/docs/config,
  * "Precedence order": 3 of 8, still below the inline `OPENCODE_CONFIG_CONTENT`
@@ -524,7 +524,7 @@ export interface StagedOpenCodeAuth {
  * first model by internal priority" across every provider it finds a credential
  * for — and in a Codex-group container, which also carries `OPENAI_API_KEY`,
  * that landed on an OpenAI model whose OpenCode OAuth entry on the host was
- * stale (#884, 2026-09-17: `Token refresh failed: 401`). The operator's rule:
+ * stale (2026-09-17: `Token refresh failed: 401`). The operator's rule:
  * headless OpenCode runs its default model unless asked for another.
  *
  * Safe for the OpenCode provider's own container: its full config travels as
@@ -533,7 +533,7 @@ export interface StagedOpenCodeAuth {
  * is 2 of 8, inline config is 6), and it sends its model per prompt besides.
  */
 export const OPENCODE_STAGED_CONFIG_FILE = 'opencode.json';
-export function stagedOpenCodeConfig(): string {
+function stagedOpenCodeConfig(): string {
   return JSON.stringify({ $schema: 'https://opencode.ai/config.json', model: DEFAULT_OPENCODE_MODEL }, null, 2) + '\n';
 }
 
@@ -632,7 +632,7 @@ registerProviderContainerConfig('opencode', async (ctx) => {
     // ONE walk, shared by both readers below. They answer different questions
     // about the same mirror — which names to withhold, and which repository each
     // name came from — and a population each derived for itself is how the two
-    // came to disagree (#836).
+    // came to disagree.
     const mirrorSkills = openCodeMirrorSkills(pluginsRoot);
     const dropNames = excludedOpenCodeSkillNames(
       pluginsRoot,
