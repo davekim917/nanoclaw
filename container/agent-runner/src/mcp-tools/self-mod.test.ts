@@ -4,16 +4,11 @@ import { _resetConfig, _setConfigForTest } from '../config.js';
 import { getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { getStickyEffort, getStickyModel } from '../modules/mailbox/index.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
-import type { McpToolDefinition } from './types.js';
 
 const registeredToolNames: string[][] = [];
-/** Every tool definition self-mod.ts has registered, by name — change_model and list_models are not exported. */
-const registeredTools = new Map<string, McpToolDefinition>();
 mock.module('./server.js', () => ({
-  registerTools: (tools: McpToolDefinition[]) => {
-    registeredToolNames.push(tools.map((tool) => tool.tool.name));
-    for (const tool of tools) registeredTools.set(tool.tool.name, tool);
-  },
+  registerTools: (tools: Array<{ tool: { name: string } }>) =>
+    registeredToolNames.push(tools.map((tool) => tool.tool.name)),
 }));
 
 // NOTE: do NOT mock.module('../db/messages-out.js') here. bun runs every test
@@ -21,8 +16,17 @@ mock.module('./server.js', () => ({
 // permanent, so stubbing writeMessageOut sends every later file's outbound
 // writes nowhere — see the same warning at the top of agents.test.ts. Assert
 // against the real in-memory session DB instead.
-const { unavailableModelInventory, registerProviderSpecificSelfModTools, addMcpServer, installPackages } =
-  await import('./self-mod.js');
+// The handlers are imported, not taken from the registerTools mock: bun shares
+// one module cache across files, so self-mod.js may already have registered its
+// tools against another suite's mock before this file's mock exists.
+const {
+  unavailableModelInventory,
+  registerProviderSpecificSelfModTools,
+  addMcpServer,
+  installPackages,
+  changeModel,
+  listModels,
+} = await import('./self-mod.js');
 
 /** The most recent system action add_mcp_server wrote to the outbound DB. */
 function lastSystemAction(): Record<string, unknown> | undefined {
@@ -142,13 +146,11 @@ describe('install_packages forwards the request for the host to validate', () =>
 });
 
 describe('change_model sets the session-sticky model like the -m flag', () => {
-  const changeModel = () => registeredTools.get('change_model')!;
-
   it('requires a slug and a known effort before touching session state', async () => {
     _setConfigForTest({ provider: 'claude' });
-    expect(text(await changeModel().handler({}))).toContain('slug is required');
-    expect(text(await changeModel().handler({ slug: '   ' }))).toContain('slug is required');
-    expect(text(await changeModel().handler({ slug: 'opus', effort: 'extreme' }))).toContain(
+    expect(text(await changeModel.handler({}))).toContain('slug is required');
+    expect(text(await changeModel.handler({ slug: '   ' }))).toContain('slug is required');
+    expect(text(await changeModel.handler({ slug: 'opus', effort: 'extreme' }))).toContain(
       'effort must be one of: low, medium, high, max',
     );
     expect(getStickyModel()).toBeUndefined();
@@ -158,7 +160,7 @@ describe('change_model sets the session-sticky model like the -m flag', () => {
   it('refuses an OpenCode slug without a provider prefix', async () => {
     _setConfigForTest({ provider: 'opencode' });
     for (const slug of ['kimi-k2.6', 'opencode-go/', '/kimi']) {
-      const result = await changeModel().handler({ slug });
+      const result = await changeModel.handler({ slug });
       expect(result.isError).toBe(true);
       expect(text(result)).toContain('is not a valid opencode model slug');
     }
@@ -167,7 +169,7 @@ describe('change_model sets the session-sticky model like the -m flag', () => {
 
   it('stores the trimmed slug and the effort for the next turn', async () => {
     _setConfigForTest({ provider: 'opencode' });
-    const result = await changeModel().handler({ slug: '  opencode-go/kimi-k2.6 ', effort: 'max' });
+    const result = await changeModel.handler({ slug: '  opencode-go/kimi-k2.6 ', effort: 'max' });
     expect(result.isError).toBeUndefined();
     expect(text(result)).toContain('Switched to `opencode-go/kimi-k2.6` (effort `max`)');
     expect(getStickyModel()).toBe('opencode-go/kimi-k2.6');
@@ -176,17 +178,14 @@ describe('change_model sets the session-sticky model like the -m flag', () => {
 
   it('leaves the effort alone when none is given, and does not apply the OpenCode slug rule elsewhere', async () => {
     _setConfigForTest({ provider: 'claude' });
-    await changeModel().handler({ slug: 'opus', effort: 'high' });
-    await changeModel().handler({ slug: 'sonnet' });
+    await changeModel.handler({ slug: 'opus', effort: 'high' });
+    await changeModel.handler({ slug: 'sonnet' });
     expect(getStickyModel()).toBe('sonnet');
     expect(getStickyEffort()).toBe('high');
   });
 });
 
 describe('list_models inventories OpenCode slugs', () => {
-  registerProviderSpecificSelfModTools('opencode');
-  const listModels = () => registeredTools.get('list_models')!;
-
   /** Stand in for `opencode models`; the suite never runs a real subprocess. */
   function fakeOpencode(stdout: string, exitCode = 0, stderr = '') {
     return spyOn(Bun, 'spawn').mockImplementation(
@@ -203,7 +202,7 @@ describe('list_models inventories OpenCode slugs', () => {
     _setConfigForTest({ provider: 'codex' });
     const spawn = fakeOpencode('');
     try {
-      expect(text(await listModels().handler({}))).toContain('codex model catalog');
+      expect(text(await listModels.handler({}))).toContain('codex model catalog');
       expect(spawn).not.toHaveBeenCalled();
     } finally {
       spawn.mockRestore();
@@ -216,7 +215,7 @@ describe('list_models inventories OpenCode slugs', () => {
       '# reachable models\nopencode-go/kimi-k2.6\n\nnvidia/deepseek-ai/deepseek-v4-pro\nopencode-go/glm-5\nbare\n',
     );
     try {
-      const inventory = JSON.parse(text(await listModels().handler({}))) as Record<string, unknown>;
+      const inventory = JSON.parse(text(await listModels.handler({}))) as Record<string, unknown>;
       expect(spawn.mock.calls[0]?.[0]).toEqual(['opencode', 'models']);
       expect(inventory.total).toBe(4);
       expect(inventory.denied).toBe(0);
@@ -234,7 +233,7 @@ describe('list_models inventories OpenCode slugs', () => {
     _setConfigForTest({ provider: 'opencode', agentGroupId: 'ag-1' });
     let spawn = fakeOpencode('', 2, 'not logged in\n');
     try {
-      const result = await listModels().handler({});
+      const result = await listModels.handler({});
       expect(result.isError).toBe(true);
       expect(text(result)).toContain('opencode models exited 2: not logged in');
     } finally {
@@ -244,7 +243,7 @@ describe('list_models inventories OpenCode slugs', () => {
       throw new Error('ENOENT');
     });
     try {
-      expect(text(await listModels().handler({}))).toContain('Failed to run opencode models: ENOENT');
+      expect(text(await listModels.handler({}))).toContain('Failed to run opencode models: ENOENT');
     } finally {
       spawn.mockRestore();
     }
@@ -254,7 +253,7 @@ describe('list_models inventories OpenCode slugs', () => {
     _setConfigForTest({ provider: 'opencode' });
     const spawn = fakeOpencode('opencode-go/kimi-k2.6\n');
     try {
-      expect(text(await listModels().handler({}))).toContain('No agent group ID');
+      expect(text(await listModels.handler({}))).toContain('No agent group ID');
     } finally {
       spawn.mockRestore();
     }
