@@ -46,11 +46,21 @@ describe('outcome wire contract', () => {
     expect(() => renderWorkOutcome('Done.', { requestId: 4, verified: 'Checked' }, a)).toThrow();
   });
   it('keeps host and separately packaged runner validation identical', () => {
-    // Each tree exports only what its own callers use, so `export` may differ;
-    // every other byte must match.
-    const body = (file: string) => fs.readFileSync(file, 'utf8').replace(/^export /gm, '');
-    expect(body('container/agent-runner/src/outcome-reporting-schema.ts')).toBe(
-      body('src/outcome-reporting-schema.ts'),
-    );
+    // Each tree exports only what its own callers use, so `export` may differ.
+    // RUNNER_ONLY names a one-line declaration the runner's tools use and the
+    // host never reads; the host omits it instead of carrying dead code. Every
+    // other byte must match, and the list must stay exact: each name has to be
+    // declared in the runner and absent from the host.
+    const RUNNER_ONLY = ['OUTCOME_PURPOSES'];
+    const declaration = (name: string) => new RegExp(`^(?:export )?const ${name}\\b.*\\n\\n`, 'm');
+    const runner = fs.readFileSync('container/agent-runner/src/outcome-reporting-schema.ts', 'utf8');
+    const host = fs.readFileSync('src/outcome-reporting-schema.ts', 'utf8');
+    for (const name of RUNNER_ONLY) {
+      expect(runner).toMatch(declaration(name));
+      expect(host).not.toMatch(new RegExp(`\\b${name}\\b`));
+    }
+    const body = (source: string) => source.replace(/^export /gm, '');
+    const runnerShared = RUNNER_ONLY.reduce((source, name) => source.replace(declaration(name), ''), runner);
+    expect(body(runnerShared)).toBe(body(host));
   });
 });
