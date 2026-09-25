@@ -129,6 +129,12 @@ const hooks = vi.hoisted(() => ({
    * before the lease block returns the child.
    */
   spawnErrorsInMicrotask: false,
+  /** `spawn()` hands back a child that stays up until the test emits its `close`. */
+  spawnHeld: false,
+  heldChildren: [] as Array<{
+    emit: (event: string, ...args: unknown[]) => boolean;
+    stderr: { emit: (event: string, ...args: unknown[]) => boolean };
+  }>,
   /** Fake `docker wait` observers handed to the adopter. */
   waiters: [] as Array<{ exitCode: number | null; emit: (event: string, ...args: unknown[]) => boolean }>,
   EventEmitter: null as null | typeof import('node:events').EventEmitter,
@@ -149,6 +155,8 @@ const hooks = vi.hoisted(() => ({
     this.releaseGates.clear();
     this.storageGate = null;
     this.spawnErrorsInMicrotask = false;
+    this.spawnHeld = false;
+    this.heldChildren = [];
   },
 }));
 
@@ -165,7 +173,7 @@ vi.mock('child_process', async (importOriginal) => {
   return {
     ...real,
     spawn: ((...spawnArgs: Parameters<typeof real.spawn>) => {
-      if (!hooks.spawnErrorsInMicrotask) return real.spawn(...spawnArgs);
+      if (!hooks.spawnErrorsInMicrotask && !hooks.spawnHeld) return real.spawn(...spawnArgs);
       const Emitter = hooks.EventEmitter as typeof import('node:events').EventEmitter;
       const child = new Emitter() as unknown as import('child_process').ChildProcess & {
         stdout: import('node:events').EventEmitter;
@@ -178,6 +186,10 @@ vi.mock('child_process', async (importOriginal) => {
         pid: undefined,
         kill: () => true,
       });
+      if (hooks.spawnHeld) {
+        hooks.heldChildren.push(child);
+        return child;
+      }
       queueMicrotask(() => {
         child.emit('error', Object.assign(new Error('spawn nanoclaw-absent ENOENT'), { code: 'ENOENT' }));
         child.emit('close', null);
@@ -812,6 +824,41 @@ describe('claim-first spawn', () => {
     expect(hooks.events).toContain('release:sess-early-error:1');
     // Not a host stop: the task list is settled as interrupted.
     await vi.waitFor(() => expect(settleTaskListOnKill).toHaveBeenCalledWith('sess-early-error', 'container-exit'));
+  });
+
+  it('a host stop that exits 143 is not logged as a non-zero exit', async () => {
+    await seedSession('sess-host-stop');
+    hooks.spawnHeld = true;
+    await wakeContainer(callerSnapshot('sess-host-stop'));
+    const child = hooks.heldChildren[0];
+    child.stderr.emit('data', Buffer.from('[poll-loop] Result: done\n'));
+
+    killContainer('sess-host-stop', 'scheduled-task-idle');
+    child.emit('close', 143);
+    await waitForFinalize('sess-host-stop');
+
+    expect(log.warn).not.toHaveBeenCalledWith('Container exited non-zero', expect.anything());
+    expect(log.info).toHaveBeenCalledWith(
+      'Container stopped by host',
+      expect.objectContaining({ sessionId: 'sess-host-stop', code: 143 }),
+    );
+    expect(settleTaskListOnKill).not.toHaveBeenCalledWith('sess-host-stop', 'container-exit');
+  });
+
+  it('a 143 exit the host did not ask for is still logged as non-zero', async () => {
+    await seedSession('sess-foreign-stop');
+    hooks.spawnHeld = true;
+    await wakeContainer(callerSnapshot('sess-foreign-stop'));
+    const child = hooks.heldChildren[0];
+    child.stderr.emit('data', Buffer.from('[poll-loop] Result: done\n'));
+
+    child.emit('close', 143);
+    await waitForFinalize('sess-foreign-stop');
+
+    expect(log.warn).toHaveBeenCalledWith(
+      'Container exited non-zero',
+      expect.objectContaining({ sessionId: 'sess-foreign-stop', code: 143 }),
+    );
   });
 
   it('a stale finish does not release a fresh claim', async () => {
