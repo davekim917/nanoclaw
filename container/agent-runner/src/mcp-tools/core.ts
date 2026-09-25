@@ -34,6 +34,7 @@ import { withStatusSubtext } from '../turn-status.js';
 import { resolveRequestCandidate } from '../modules/mailbox/session-state.js';
 import { getSessionRouting, getTaskSeriesId } from '../db/session-routing.js';
 import { registerTools } from './server.js';
+import { err, generateId, log, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
 import { CONTINUE_THREAD_DESCRIPTION, parseContinueThread } from './continue-thread.js';
 
@@ -69,22 +70,6 @@ export function isAllowedFilePath(p: string): boolean {
     const boundary = prefix.endsWith(path.sep) ? prefix : `${prefix}${path.sep}`;
     return p === prefix || p.startsWith(boundary);
   });
-}
-
-function log(msg: string): void {
-  console.error(`[mcp-tools] ${msg}`);
-}
-
-function generateId(): string {
-  return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
-
-function err(text: string) {
-  return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true };
 }
 
 function destinationList(): string {

@@ -23,9 +23,8 @@
  *
  * See `src/modules/channel-config/index.ts` for the host half.
  */
-import { writeMessageOut } from '../db/messages-out.js';
-import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
+import { emitSystemAction, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
 
 // The host validates the final value against the target provider. Keep the
@@ -33,26 +32,6 @@ import type { McpToolDefinition } from './types.js';
 // requests that are not valid for their provider are rejected host-side before
 // any DB mutation.
 const VALID_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
-
-function genId(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-async function emit(action: string, extra: Record<string, unknown> = {}): Promise<void> {
-  const r = getSessionRouting();
-  await writeMessageOut({
-    id: genId('chcfg'),
-    kind: 'system',
-    platform_id: r.platform_id,
-    channel_type: r.channel_type,
-    thread_id: r.thread_id,
-    content: JSON.stringify({ action, ...extra }),
-  });
-}
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
 
 const setChannelModelTool: McpToolDefinition = {
   tool: {
@@ -81,7 +60,7 @@ const setChannelModelTool: McpToolDefinition = {
     if (model === undefined) {
       return ok('Error: `model` is required. Pass a model id / alias, or null to clear.');
     }
-    await emit('set_channel_model', { channel, model });
+    await emitSystemAction('chcfg', 'set_channel_model', { channel, model });
     const action = model === null ? 'clear' : `set to ${model}`;
     return ok(
       `set_channel_model requested (channel=${channel ?? '(current)'}, action=${action}). Host will reply with the outcome.`,
@@ -122,7 +101,7 @@ const setChannelEffortTool: McpToolDefinition = {
         `Error: effort must be one of low, medium, high, xhigh, max, ultra (or null). Got ${JSON.stringify(args.effort)}.`,
       );
     }
-    await emit('set_channel_effort', { channel, effort });
+    await emitSystemAction('chcfg', 'set_channel_effort', { channel, effort });
     const action = effort === null ? 'clear' : `set to ${effort}`;
     return ok(
       `set_channel_effort requested (channel=${channel ?? '(current)'}, action=${action}). Host will reply with the outcome.`,

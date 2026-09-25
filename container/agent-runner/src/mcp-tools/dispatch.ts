@@ -19,17 +19,10 @@ import { writeMessageOut } from '../db/messages-out.js';
 import { getSessionId } from '../modules/mailbox/index.js';
 import { deriveSpawnTaskId } from '../dispatch/derive-task-id.js';
 import type { McpToolDefinition } from './types.js';
+import { err, ok } from './tool-helpers.js';
 
 function log(msg: string): void {
   console.error(`[spawn] ${msg}`);
-}
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
-
-function err(text: string) {
-  return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true as const };
 }
 
 function sysId(): string {

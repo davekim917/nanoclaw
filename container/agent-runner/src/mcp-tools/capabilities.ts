@@ -20,17 +20,10 @@
 import fs from 'fs';
 
 import { registerTools } from './server.js';
+import { err, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
 
 const CAPABILITIES_PATH = '/workspace/capabilities.json';
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
-
-function err(text: string) {
-  return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true };
-}
 
 interface SnapshotService extends Record<string, unknown> {
   name?: unknown;

@@ -11,6 +11,7 @@ import { writeMessageOut } from '../db/messages-out.js';
 import { getCurrentInReplyTo } from '../db/session-state.js';
 import { randomUUID } from 'node:crypto';
 import { registerTools } from './server.js';
+import { err, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
 
 const MAX_MINUTES = 7 * 24 * 60; // 7 days
@@ -19,14 +20,6 @@ const MIN_DELAY_MS = 1000;
 const ALLOWED_KEYS = new Set(['minutes', 'at', 'prompt', 'dedupe_key']);
 const DEDUPE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,199}$/;
 const ISO_WITH_ZONE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/;
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
-
-function err(text: string) {
-  return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true as const };
-}
 
 export const wait: McpToolDefinition = {
   tool: {

@@ -27,6 +27,7 @@ import { writeMessageOut } from '../db/messages-out.js';
 import { evaluateReviewChurnGate } from '../review-churn-gate.js';
 import { loadScanPolicyRepositoryNames } from './scan-policy-repos.js';
 import { registerTools } from './server.js';
+import { err, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
 
 const LOCK_EX_NB = 2 | 4;
@@ -60,14 +61,6 @@ type ToolResult = ReturnType<typeof ok> | ReturnType<typeof err>;
 
 function log(message: string): void {
   console.error(`[git-worktrees] ${message}`);
-}
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
-
-function err(text: string) {
-  return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true };
 }
 
 function validateSegment(value: string, label: string): string | null {

@@ -55,6 +55,7 @@ import { CodexTurnLiveness, isCodexTerminalTurnItem, normalizeCodexThreadStatus 
 import { CodexRateLimitTracker } from './codex-rate-limit-tracker.js';
 import type { CodexRateLimitPark } from './codex-rate-limits.js';
 import { attachTurnEffort } from './turn-effort.js';
+import { formatBlockquoteLabel, thinkingForwardingEnabled, truncate } from './thinking-labels.js';
 import { recordContextTokens, recordSubagent } from '../turn-status.js';
 
 /**
@@ -270,28 +271,6 @@ async function readCodexTurnSnapshotWithRetry(
     }
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
-}
-
-// Thinking-label helpers — mirror the Claude provider's truncate /
-// formatBlockquoteLabel / NANOCLAW_HIDE_THINKING semantics so Codex
-// reasoning surfaces with the same 💭 blockquote affordance.
-const LABEL_MAX = 2000;
-
-function truncate(s: string): string {
-  const trimmed = s.trim();
-  if (trimmed.length <= LABEL_MAX) return trimmed;
-  return trimmed.slice(0, LABEL_MAX - 1).replace(/\s+\S*$/, '') + '…';
-}
-
-function formatBlockquoteLabel(emoji: string, prose: string): string {
-  const lines = prose.split('\n');
-  lines[0] = `${emoji} ${lines[0]}`;
-  return lines.map((line) => `> ${line}`).join('\n');
-}
-
-function thinkingForwardingEnabled(): boolean {
-  const v = process.env.NANOCLAW_HIDE_THINKING;
-  return !v || v === '0' || v.toLowerCase() === 'false';
 }
 
 type ReasoningThreadItem = {
@@ -808,8 +787,14 @@ export function resolveCodexRestartTransition({
  * expected in this codex version).
  */
 export function findRolloutFile(threadId: string, codexHome: string): string | null {
+  for (const rollout of rolloutFilesFor(threadId, codexHome)) return rollout.path;
+  return null;
+}
+
+/** Every rollout file under one home's `sessions/` whose name embeds the thread id, in walk order. */
+function* rolloutFilesFor(threadId: string, codexHome: string): Generator<{ path: string; stat: fs.Stats }> {
   const sessionsRoot = path.join(codexHome, 'sessions');
-  if (!fs.existsSync(sessionsRoot)) return null;
+  if (!fs.existsSync(sessionsRoot)) return;
   const needle = threadId.toLowerCase();
   const stack: Array<{ dir: string; depth: number }> = [{ dir: sessionsRoot, depth: 0 }];
   while (stack.length > 0) {
@@ -833,10 +818,9 @@ export function findRolloutFile(threadId: string, codexHome: string): string | n
         continue;
       }
       if (!entry.endsWith('.jsonl')) continue;
-      if (entry.toLowerCase().includes(needle)) return full;
+      if (entry.toLowerCase().includes(needle)) yield { path: full, stat };
     }
   }
-  return null;
 }
 
 /**
@@ -962,37 +946,11 @@ export interface RolloutCandidate {
 }
 
 export function findNewestRolloutAcrossHomes(threadId: string, codexHomes: readonly string[]): RolloutCandidate | null {
-  const needle = threadId.toLowerCase();
   let best: RolloutCandidate | null = null;
   for (const home of codexHomes) {
-    const sessionsRoot = path.join(home, 'sessions');
-    if (!fs.existsSync(sessionsRoot)) continue;
-    const stack: Array<{ dir: string; depth: number }> = [{ dir: sessionsRoot, depth: 0 }];
-    while (stack.length > 0) {
-      const { dir, depth } = stack.pop()!;
-      let entries: string[];
-      try {
-        entries = fs.readdirSync(dir);
-      } catch {
-        continue;
-      }
-      for (const entry of entries) {
-        const full = path.join(dir, entry);
-        let stat: fs.Stats;
-        try {
-          stat = fs.statSync(full);
-        } catch {
-          continue;
-        }
-        if (stat.isDirectory()) {
-          if (depth < 3) stack.push({ dir: full, depth: depth + 1 });
-          continue;
-        }
-        if (!entry.endsWith('.jsonl')) continue;
-        if (!entry.toLowerCase().includes(needle)) continue;
-        if (best === null || stat.mtimeMs > best.mtimeMs || (stat.mtimeMs === best.mtimeMs && stat.size > best.size)) {
-          best = { home, path: full, mtimeMs: stat.mtimeMs, size: stat.size };
-        }
+    for (const { path: full, stat } of rolloutFilesFor(threadId, home)) {
+      if (best === null || stat.mtimeMs > best.mtimeMs || (stat.mtimeMs === best.mtimeMs && stat.size > best.size)) {
+        best = { home, path: full, mtimeMs: stat.mtimeMs, size: stat.size };
       }
     }
   }
@@ -1383,6 +1341,61 @@ export class CodexProvider implements AgentProvider {
           // each fallback home once. Do not add a shared attempt counter:
           // it can exhaust before a capped branch gets to surface its final
           // error, silently ending a logical user turn.
+          // Replace the app-server — on `nextHome` when rotating accounts — and
+          // resume this turn's thread on it. Each recovery branch announces
+          // itself before calling this.
+          const restartAppServer = async (nextHome?: string): Promise<void> => {
+            // Tear down the wedged app-server, switch identity, spawn fresh.
+            // CODEX_HOME on process.env is what the app-server reads at spawn.
+            turnTracker.server = null;
+            turnTracker.threadId = null;
+            turnTracker.currentTurnId = null;
+            killCodexAppServer(server);
+            if (nextHome) {
+              process.env.CODEX_HOME = nextHome;
+              currentCodexHome = nextHome;
+            }
+
+            // config.toml / hooks.json / agents/ all live under CODEX_HOME,
+            // so a new home needs all three. The writers honor CODEX_HOME
+            // (just switched above), so regenerating config + the guard hooks
+            // lands them in the fallback home — without this the rotated
+            // app-server runs UNGUARDED. agents/ is bind-mounted only at the
+            // primary, so mirror the role definitions across explicitly;
+            // the mirror is a no-op when the ring wraps back
+            // to the primary (`mirrorCodexAgentsToHome` returns on src == dst).
+            writeCodexMcpConfigToml(self.mcpServers);
+            writeCodexHooksAndTrust();
+            if (nextHome) mirrorCodexAgentsToHome(self.primaryCodexHome, nextHome);
+
+            server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
+            turnTracker.server = server;
+            attachCodexAutoApproval(server);
+            await initializeCodexAppServer(server);
+            // The guard chain must be proven live in the (possibly new) home.
+            await verifyCodexHookTrust(server, currentCodexHome);
+            await rateLimits.bind(server, currentCodexHome);
+
+            // Re-resume the thread. If it resumes, threadId stays the same and
+            // history continues. If not, startOrResume falls back to a fresh
+            // thread via STALE_THREAD_RE and returns a new id — re-emit init so
+            // the poll loop updates its continuation.
+            const previousThreadId: string | undefined = threadId;
+            threadId = await startOrResumeCodexThread(server, threadId, threadParams);
+            turnTracker.threadId = threadId ?? null;
+            const transition = resolveCodexRestartTransition({
+              previousThreadId,
+              nextThreadId: threadId,
+              originalText: text,
+              initYielded,
+            });
+            attemptText = transition.attemptText;
+            initYielded = transition.initYielded;
+            if (transition.resetThreadDedupe) {
+              resetCodexTurnAccumulatorThread(turnAccum);
+            }
+          };
+
           let rotateAndRetry = true;
           while (rotateAndRetry) {
             rotateAndRetry = false;
@@ -1476,35 +1489,7 @@ export class CodexProvider implements AgentProvider {
                     }
                   }
 
-                  turnTracker.server = null;
-                  turnTracker.threadId = null;
-                  turnTracker.currentTurnId = null;
-                  killCodexAppServer(server);
-
-                  writeCodexMcpConfigToml(self.mcpServers);
-                  writeCodexHooksAndTrust();
-                  server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
-                  turnTracker.server = server;
-                  attachCodexAutoApproval(server);
-                  await initializeCodexAppServer(server);
-                  await verifyCodexHookTrust(server, currentCodexHome);
-                  await rateLimits.bind(server, currentCodexHome);
-
-                  const previousThreadId: string | undefined = threadId;
-                  threadId = await startOrResumeCodexThread(server, threadId, threadParams);
-                  turnTracker.threadId = threadId ?? null;
-                  const transition = resolveCodexRestartTransition({
-                    previousThreadId,
-                    nextThreadId: threadId,
-                    originalText: text,
-                    initYielded,
-                  });
-                  attemptText = transition.attemptText;
-                  initYielded = transition.initYielded;
-                  if (transition.resetThreadDedupe) {
-                    resetCodexTurnAccumulatorThread(turnAccum);
-                  }
-
+                  await restartAppServer();
                   rotateAndRetry = true;
                   break;
                 }
@@ -1526,36 +1511,7 @@ export class CodexProvider implements AgentProvider {
                     ),
                   };
 
-                  turnTracker.server = null;
-                  turnTracker.threadId = null;
-                  turnTracker.currentTurnId = null;
-                  killCodexAppServer(server);
-
-                  writeCodexMcpConfigToml(self.mcpServers);
-                  writeCodexHooksAndTrust();
-
-                  server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
-                  turnTracker.server = server;
-                  attachCodexAutoApproval(server);
-                  await initializeCodexAppServer(server);
-                  await verifyCodexHookTrust(server, currentCodexHome);
-                  await rateLimits.bind(server, currentCodexHome);
-
-                  const previousThreadId: string | undefined = threadId;
-                  threadId = await startOrResumeCodexThread(server, threadId, threadParams);
-                  turnTracker.threadId = threadId ?? null;
-                  const transition = resolveCodexRestartTransition({
-                    previousThreadId,
-                    nextThreadId: threadId,
-                    originalText: text,
-                    initYielded,
-                  });
-                  attemptText = transition.attemptText;
-                  initYielded = transition.initYielded;
-                  if (transition.resetThreadDedupe) {
-                    resetCodexTurnAccumulatorThread(turnAccum);
-                  }
-
+                  await restartAppServer();
                   rotateAndRetry = true;
                   break;
                 }
@@ -1595,52 +1551,7 @@ export class CodexProvider implements AgentProvider {
                     ),
                   };
 
-                  // Tear down the wedged app-server, switch identity,
-                  // spawn fresh. CODEX_HOME on process.env is what the
-                  // app-server reads at spawn.
-                  turnTracker.server = null;
-                  turnTracker.threadId = null;
-                  turnTracker.currentTurnId = null;
-                  killCodexAppServer(server);
-                  process.env.CODEX_HOME = nextHome;
-                  currentCodexHome = nextHome;
-
-                  // config.toml / hooks.json / agents/ all live under CODEX_HOME,
-                  // so the new dir needs all three. The writers honor CODEX_HOME
-                  // (just switched above), so regenerating config + the guard hooks
-                  // lands them in the fallback home — without this the rotated
-                  // app-server runs UNGUARDED. agents/ is bind-mounted only at the
-                  // primary, so mirror the role definitions across explicitly;
-                  // the mirror is a no-op when the ring wraps back
-                  // to the primary (`mirrorCodexAgentsToHome` returns on src == dst).
-                  writeCodexMcpConfigToml(self.mcpServers);
-                  writeCodexHooksAndTrust();
-                  mirrorCodexAgentsToHome(self.primaryCodexHome, nextHome);
-
-                  server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
-                  turnTracker.server = server;
-                  attachCodexAutoApproval(server);
-                  await initializeCodexAppServer(server);
-                  // currentCodexHome was just switched to the fallback above;
-                  // the guard chain must be proven live in the NEW home too.
-                  await verifyCodexHookTrust(server, currentCodexHome);
-                  await rateLimits.bind(server, currentCodexHome);
-
-                  // Re-resume the thread on the new identity. If the
-                  // rollout copy succeeded, threadId stays the same and
-                  // history continues. If it didn't, startOrResume falls
-                  // back to a fresh thread via STALE_THREAD_RE and
-                  // returns a new id — re-emit init so the poll loop
-                  // updates its continuation.
-                  const previousThreadId: string | undefined = threadId;
-                  threadId = await startOrResumeCodexThread(server, threadId, threadParams);
-                  turnTracker.threadId = threadId ?? null;
-                  const transition = resolveCodexRestartTransition({
-                    previousThreadId,
-                    nextThreadId: threadId,
-                    originalText: text,
-                    initYielded,
-                  });
+                  await restartAppServer(nextHome);
                   // Credential rotation, specifically — unlike the
                   // control-plane-recovery and primary-auth-refresh
                   // branches above, this is the one where the PRIOR
@@ -1649,12 +1560,7 @@ export class CodexProvider implements AgentProvider {
                   // its own prior turn's "rate limited" narrative (if any
                   // survived into `attemptText`) as still describing this
                   // attempt.
-                  attemptText =
-                    `${transition.attemptText}\n\n` + formatCredentialRotationNotice({ position, ringSize });
-                  initYielded = transition.initYielded;
-                  if (transition.resetThreadDedupe) {
-                    resetCodexTurnAccumulatorThread(turnAccum);
-                  }
+                  attemptText += '\n\n' + formatCredentialRotationNotice({ position, ringSize });
 
                   rotateAndRetry = true;
                   break; // exit for-await; the outer rotation while re-runs

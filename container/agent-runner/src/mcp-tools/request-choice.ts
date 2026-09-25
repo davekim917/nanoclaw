@@ -15,19 +15,8 @@ import { writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting, getTaskSeriesId } from '../db/session-routing.js';
 import { findByName, getAllDestinations } from '../destinations.js';
 import { registerTools } from './server.js';
+import { err, log, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
-
-function log(msg: string): void {
-  console.error(`[mcp-tools] ${msg}`);
-}
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
-
-function err(text: string) {
-  return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true };
-}
 
 const MAX_CHOICE_OPTIONS = 10;
 const CHOICE_STYLES = new Set<unknown>(['primary', 'danger', 'default']);

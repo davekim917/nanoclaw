@@ -12,17 +12,10 @@
 import { writeMessageOut, type WriteMessageOut } from '../db/messages-out.js';
 import { getSessionSpawnTaskId } from '../modules/mailbox/index.js';
 import type { McpToolDefinition } from './types.js';
+import { err, ok } from './tool-helpers.js';
 
 function log(msg: string): void {
   console.error(`[spawn-child] ${msg}`);
-}
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
-
-function err(text: string) {
-  return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true as const };
 }
 
 function sysId(): string {

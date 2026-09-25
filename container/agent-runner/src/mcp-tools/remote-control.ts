@@ -8,30 +8,9 @@
  * status. The agent picks that up as normal inbound and relays to
  * the user.
  */
-import { writeMessageOut } from '../db/messages-out.js';
-import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
+import { emitSystemAction, ok } from './tool-helpers.js';
 import type { McpToolDefinition } from './types.js';
-
-function genId(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-async function emit(action: string, extra: Record<string, unknown> = {}): Promise<void> {
-  const r = getSessionRouting();
-  await writeMessageOut({
-    id: genId('rc'),
-    kind: 'system',
-    platform_id: r.platform_id,
-    channel_type: r.channel_type,
-    thread_id: r.thread_id,
-    content: JSON.stringify({ action, ...extra }),
-  });
-}
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
 
 const startRemoteControlTool: McpToolDefinition = {
   tool: {
@@ -49,7 +28,7 @@ const startRemoteControlTool: McpToolDefinition = {
   async handler(args) {
     const sender = (args.sender as string) || 'agent';
     const chatJid = (args.chatJid as string) || '';
-    await emit('start_remote_control', { sender, chatJid });
+    await emitSystemAction('rc', 'start_remote_control', { sender, chatJid });
     return ok('Starting Remote Control on the host. URL will arrive as a follow-up message in this chat.');
   },
 };
@@ -61,7 +40,7 @@ const stopRemoteControlTool: McpToolDefinition = {
     inputSchema: { type: 'object' as const, properties: {} },
   },
   async handler() {
-    await emit('stop_remote_control');
+    await emitSystemAction('rc', 'stop_remote_control');
     return ok('Requested Remote Control stop. Confirmation will arrive as a follow-up message.');
   },
 };
@@ -73,7 +52,7 @@ const getRemoteControlStatusTool: McpToolDefinition = {
     inputSchema: { type: 'object' as const, properties: {} },
   },
   async handler() {
-    await emit('get_remote_control_status');
+    await emitSystemAction('rc', 'get_remote_control_status');
     return ok('Asked host for Remote Control status. Response will arrive as a follow-up message.');
   },
 };
