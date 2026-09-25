@@ -38,6 +38,7 @@ const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-cli-group
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
 import { createSession } from '../../db/sessions.js';
 import { recordDeliveryAttempt } from '../../db/coordination.js';
+import { addDeniedModel } from '../../db/denied-models.js';
 import { dispatch } from '../dispatch.js';
 import { readContainerConfig } from '../../container-config.js';
 import { readFleetMcpServers } from '../../fleet-mcp-servers.js';
@@ -506,6 +507,31 @@ describe('groups CLI resource config', () => {
     const data = (response as { ok: true; data: Record<string, unknown> }).data;
     expect(data.security).toBeNull();
     expect(data.effective_security).toEqual({ capDrop: ['ALL'], capAdd: [], noNewPrivileges: true });
+  });
+
+  it('refuses a family name whose target is denied and names the matched denial', async () => {
+    const id = 'ag-deny-family';
+    const folder = 'deny-family';
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    getRawDb()
+      .prepare(
+        `INSERT INTO container_configs
+           (agent_group_id, provider, model, effort, image_tag, assistant_name, max_messages_per_prompt,
+            skills, mcp_servers, packages_apt, packages_npm, additional_mounts, cli_scope, updated_at)
+         VALUES (?, 'codex', NULL, NULL, NULL, NULL, NULL, '"all"', '{}', '[]', '[]', '[]', 'group', ?)`,
+      )
+      .run(id, now());
+    await addDeniedModel('codex', 'gpt-6-sol', 'no sol');
+
+    const response = await dispatch(
+      { id: 'req-deny-family', command: 'groups-config-update', args: { id, model: 'sol' } },
+      { caller: 'host' },
+    );
+
+    expect(response.ok).toBe(false);
+    const message = JSON.stringify(response);
+    expect(message).toContain('matches denied \\"gpt-6-sol\\"');
+    expect(message).toContain('--slug gpt-6-sol');
   });
 
   it('test_groups_config_update_mirrors_runtime_scalars_into_container_json', async () => {

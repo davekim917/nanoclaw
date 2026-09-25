@@ -614,9 +614,10 @@ registerResource({
           const denied = await getDenialFor(effectiveProvider, updates.model);
           if (denied) {
             throw new Error(
-              `Model "${updates.model}" is denied for provider "${effectiveProvider}".` +
+              `Model "${updates.model}" is denied for provider "${effectiveProvider}"` +
+                (denied.slug !== updates.model ? ` (matches denied "${denied.slug}").` : '.') +
                 (denied.reason ? ` Reason: ${denied.reason}` : '') +
-                `\n\nOperator can remove via: ncl denied-models remove --provider ${effectiveProvider} --slug ${updates.model}`,
+                `\n\nOperator can remove via: ncl denied-models remove --provider ${effectiveProvider} --slug ${denied.slug}`,
             );
           }
         }
