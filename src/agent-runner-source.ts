@@ -1,5 +1,5 @@
 /**
- * Agent-runner source activation (mailbox seam PR 0).
+ * Agent-runner source activation.
  *
  * `container-runner.ts` bind-mounts a directory at /app/src for every
  * container spawn. Mounting the live checkout directly meant `git pull`

@@ -163,11 +163,11 @@ export interface SessionServicesSnapshot {
      * Never evicted by a capability budget while any entry without it can be
      * evicted instead. For an entry whose absence makes the agent deny an
      * ability it has. Honoured through `evictCapability`
-     * (src/modules/memory/pre-turn-context.ts:1653) at all three host eviction
-     * sites — the service-count limit (:1666), the total budget
-     * (:1719) and `enforceFinalBound` (:1765) — and by the runner's
+     * (src/modules/memory/pre-turn-context.ts) at all three host eviction
+     * sites — the service-count limit, the total budget
+     * and `enforceFinalBound` — and by the runner's
      * fresh-context fallback through its own `evictCapability`
-     * (container/agent-runner/src/memory/bootstrap.ts:100, called at :127 and :154).
+     * (container/agent-runner/src/memory/bootstrap.ts).
      */
     retainUnderBudget?: boolean;
   }>;
@@ -229,7 +229,7 @@ export interface CapabilityRoster {
  * Cutting at a sentence end first keeps the common case readable; the
  * character cut is the backstop for a first sentence that runs long.
  */
-export function summarizeCapabilityText(text: string, limit = 96): string {
+function summarizeCapabilityText(text: string, limit = 96): string {
   const flat = text.replace(/\s+/g, ' ').trim();
   if (flat.length <= limit) return flat;
   const sentence = flat.slice(0, limit + 1).match(/^(.*?[.!?])\s/);
@@ -707,7 +707,7 @@ export function buildSessionServicesSnapshotFrom(
   // Where the derived MCP entries land. The five universals that moved into
   // the fleet file (exa, deepwiki, context7, pocket, granola) were pushed
   // exactly here, and both capability budgets evict from the END
-  // (`evictCapability`, src/modules/memory/pre-turn-context.ts:1653-1658), so
+  // (`evictCapability`, src/modules/memory/pre-turn-context.ts), so
   // appending them instead would have moved every one of them into the
   // eviction zone. The 19 -> 22 services / 8,954 -> 9,773 chars figure quoted
   // in `src/capabilities.test.ts` is that file's own hermetic wide-group
@@ -867,8 +867,8 @@ export function buildSessionServicesSnapshotFrom(
   //   - non-owner-safe session (anything else): the host spawns under the
   //     `-noslack` OneCLI identity with the Slack secret WITHHELD → no Slack
   //     access here, by design, so teammates can't extract the owner's Slack
-  //     through the agent. (isOwnerSafeSlackSession, slack-user-token-gate.ts:108;
-  //     the two-tier identity, src/container-runner.ts:6941.)
+  //     through the agent. (isOwnerSafeSlackSession in slack-user-token-gate.ts;
+  //     the two-tier identity in src/container-runner.ts.)
   //
   // The access itself is one surface: the Slack Web API through the OneCLI
   // proxy (`curl https://slack.com/api/<method>`, no auth header). There is no
@@ -880,7 +880,7 @@ export function buildSessionServicesSnapshotFrom(
   // `retainUnderBudget`: this entry is what stops the agent telling the owner
   // it can't read a Slack link, and it was the one the pre-turn capability
   // budget dropped (it sits late in this list and budget eviction pops from
-  // the end). See evictCapability, src/modules/memory/pre-turn-context.ts:1653.
+  // the end). See evictCapability in src/modules/memory/pre-turn-context.ts.
   const mergedSecrets = mergeWorkgroupAndGroupSecrets(central.workgroupSecrets, cfg?.onecliSecrets);
   const hasSlackSecret = slackUserTokenSecrets(mergedSecrets, cfg?.slack_user_token?.onecli_secret_names).length > 0;
   if (hasSlackSecret) {
@@ -1087,37 +1087,36 @@ export function buildSessionServicesSnapshotFrom(
   );
   // Fleet entries are the fleet-wide baseline every group inherits; a
   // group-specific server is the one a budget should give up first. Marking
-  // the baseline `retainUnderBudget` is the same mechanism #862 used for
+  // the baseline `retainUnderBudget` is the same mechanism used for
   // Slack, and for the same reason: an agent that loses the line stops
   // believing it has the tool. Keyed on the fleet REGISTRY, not on which copy
   // won the merge — a group that declares `littlebird` itself (all 24 do
   // today) holds the same capability. If every entry is retained the budget
-  // still terminates: `evictCapability` pops the last one outright
-  // (src/modules/memory/pre-turn-context.ts:1657).
+  // still terminates: `evictCapability` pops the last one outright.
   const fleetProvided = new Set(Object.keys(readFleetMcpServers()));
   const derived: SessionServicesSnapshot['services'] = [];
   for (const [name, server] of Object.entries(effectiveMcpServers(cfg))) {
     if (describedMcpServers.has(name)) continue;
     // A retired name still sitting in some group's container.json is deleted
     // from the merged map by the runner on every spawn
-    // (container/agent-runner/src/retired-mcp-servers.ts:13, applied at
-    // container/agent-runner/src/index.ts:255), so advertising it would
+    // (container/agent-runner/src/retired-mcp-servers.ts, applied in
+    // container/agent-runner/src/index.ts), so advertising it would
     // promise a tool that cannot exist — the exact failure docs/slack-user-token.md
     // documents. The entry stays in the spawn payload, where the runner logs
     // the drop for the operator; it just never reaches the agent's capability
     // list.
     if (RETIRED_MCP_SERVER_NAMES.has(name)) continue;
     // A hand-edited container.json can hold a malformed entry: the group file's
-    // `validateMcpServers` refuses only SSE (src/container-config.ts:573-590),
+    // `validateMcpServers` refuses only SSE (src/container-config.ts),
     // so `null` reaches here. One bad entry must not cost the whole snapshot —
     // an agent with no capability list is the worse failure by far.
     if (server === null || typeof server !== 'object') continue;
     // Every string this block reads off a stored server goes through
     // `storedString`. The type says these are strings, but a hand-edited
     // container.json is not type-checked on the way in: `validateMcpServers`
-    // refuses only SSE (src/container-config.ts:575), and
+    // refuses only SSE, and
     // `parseMcpServerConfig`, which DOES type-check `displayName` and
-    // `description` (src/container-config.ts:445-452), only runs on CLI
+    // `description`, only runs on CLI
     // intake. Untyped values reaching the string helpers here throw, and this
     // function's caller catches — so `buildPreTurnContext` degrades to an
     // empty roster and `writeCapabilitiesSnapshot` logs and writes nothing.
@@ -1192,9 +1191,8 @@ const PROVIDER_SECRET = /^(anthropic|openai|opencode)(-|$)/i;
  * spends those characters saying something useful instead.
  *
  * A URL is safe to print: `parseMcpServerConfig` refuses one carrying
- * credentials at intake (src/container-config.ts:477-501), and the agent reads
- * the same value in its own read-only container.json mount
- * (src/container-runner.ts:4879). `env` and `headers` are never rendered —
+ * credentials at intake (src/container-config.ts), and the agent reads
+ * the same value in its own read-only container.json mount. `env` and `headers` are never rendered —
  * those DO carry placeholder credentials.
  */
 function genericMcpUseFor(name: string, server: McpServerConfig): string {
@@ -1212,9 +1210,9 @@ function genericMcpUseFor(name: string, server: McpServerConfig): string {
  * genuine local subprocess still prints its command.
  *
  * Keyed on the PRESENCE of `url`, not on `type`. `HttpMcpServerConfig.type` is
- * required in the type (src/container-config.ts:109), but a hand-edited
+ * required in the type, but a hand-edited
  * container.json reaches here unvalidated for this field — `validateMcpServers`
- * refuses only SSE (src/container-config.ts:575) — and a `{ url }` entry with
+ * refuses only SSE — and a `{ url }` entry with
  * no `type` then narrowed to the stdio arm and printed `undefined`, because
  * stdio's `command` is absent on it. Same defensive reasoning as the
  * `server === null` skip above.

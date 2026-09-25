@@ -1377,12 +1377,12 @@ async function deliverMessage(
 
   // An agent's ask_question must never reuse a pending approval's id: its
   // buttons would carry that id, and a click on them would decode through the
-  // approval's own options (src/db/sessions.ts:819-824), leaving only the card
+  // approval's own options (src/db/sessions.ts), leaving only the card
   // binding in response-handler.ts between it and the approval.
   //
   // Compare the id a CLICK will decode, not the one that was written. Both
   // click parsers cut the question id out of `ncq:<questionId>:<index>` at the
-  // first ':' after the prefix (chat-sdk-bridge.ts:1146-1147, :2032-2036), so
+  // first ':' after the prefix (chat-sdk-bridge.ts), so
   // `appr-real:x` is stored whole, walks straight past an exact-match check,
   // and then reaches the handlers as `appr-real`. A suffixed id is unusable
   // for the agent's own card either way — pending_questions is keyed by the
@@ -1390,7 +1390,7 @@ async function deliverMessage(
   // why an ambiguous id is refused outright rather than only when it collides.
   //
   // ask_user_question mints its own id
-  // (container/agent-runner/src/mcp-tools/interactive.ts:89), so only a raw
+  // (container/agent-runner/src/mcp-tools/interactive.ts), so only a raw
   // outbound row can carry either shape. Refused whole: no card, no pending
   // question.
   if (
@@ -1461,20 +1461,18 @@ async function deliverMessage(
   // the only delivery path from a task session). Append to the series log,
   // never deliver. The caller marks it delivered so it isn't retried.
   if (msg.kind === 'task_log') {
-    // `taskSeriesId` (`src/db/sessions.ts:182`) rather than a raw slice: the bare `system:tasks` a
+    // `taskSeriesId` rather than a raw slice: the bare `system:tasks` a
     // pre-migration install may still hold is 12 characters, and slicing 13 off
     // it yielded an EMPTY series id.
     //
     // Where that landed is worth being exact about, because the two writes
     // below are protected differently. `appendRunLog` was never at risk: its
-    // charset guard (`/^[a-z0-9-]+$/`, `src/modules/scheduling/run-log.ts:24`)
+    // charset guard (`/^[a-z0-9-]+$/`)
     // requires at least one character, so `''` threw before any filesystem
     // write and the `catch` below turned it into a warning. Execution then
-    // continued to `recordTaskRunOutcome`
-    // (`src/db/task-run-outcomes.ts:47-61`), which is an unguarded
+    // continued to `recordTaskRunOutcome`, which is an unguarded
     // `INSERT OR IGNORE` — so the malformed series id reached the central
-    // ledger that T24 reads to decide escalations
-    // (`src/modules/sweep-task-escalation/index.ts:170-172`). The file was
+    // ledger that T24 reads to decide escalations. The file was
     // safe; the ledger was not.
     //
     // A session naming no series has no run log to append to and no series to
@@ -1608,7 +1606,7 @@ async function deliverMessage(
     // The task list and the platform's status line replace the 💭 stream. The
     // row stays in outbound.db (the dashboard's session view still reads it);
     // it just never posts. An agent-shared session (no messaging group, not a
-    // task session — session-manager.ts:371) has no conversation of its own
+    // task session) has no conversation of its own
     // to show a list in, and the runner refuses the tool there, so it keeps
     // its 💭 progress.
     const agentShared = session.messaging_group_id === null && !isTaskThread(session.thread_id);

@@ -7,7 +7,7 @@
  * privileged-approval queue leaves them out.
  *
  * Card editing is no longer what separates the two. The chat-sdk bridge edits
- * NO pending_approvals card on click (chat-sdk-bridge.ts:1176, :2079) — a
+ * NO pending_approvals card on click (chat-sdk-bridge.ts) — a
  * click reaches it before anyone has checked which card it was made on or
  * whether the clicker may decide it — so every approval card, answer cards
  * included, is edited by the host once a click is bound and authorized
@@ -15,7 +15,7 @@
  * own edit waits for its answer to be delivered, modules/approvals/choices.ts).
  *
  * Actions register at module import, like approval handlers. The dashboard
- * runs in the host process (src/main.ts:796), so it sees the registrations.
+ * runs in the host process (src/main.ts), so it sees the registrations.
  */
 const answerCardActions = new Set<string>();
 

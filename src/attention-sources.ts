@@ -281,7 +281,7 @@ export interface AttentionSourceEnv {
   dataRoot?: string;
 }
 
-export type AttentionProvider = (
+type AttentionProvider = (
   decl: AttentionSourceDecl,
   workgroupId: string,
   now: number,
@@ -328,7 +328,7 @@ const BRANCH_SHAPE = /^[\w./-]+$/;
  * `kind` and `channel_key`, and naming the broken source to its operator is
  * worth more than reporting fields in a tidy order.
  */
-export interface AttentionSourceDefect {
+interface AttentionSourceDefect {
   /**
    * Position in the declared array — `-1` when the COLUMN itself is unreadable
    * (not JSON, not an array), so there are no positions at all.
@@ -531,7 +531,7 @@ function parseOneDecl(
  * editing a declaration, and a console whose central DB is unreadable has
  * larger problems than this feed. It still warns.
  */
-export async function readAttentionSourceDecls(workgroupId: string): Promise<AttentionSourceParse> {
+async function readAttentionSourceDecls(workgroupId: string): Promise<AttentionSourceParse> {
   let row: { attention_sources: string | null } | undefined;
   try {
     row = await withCentralSync(

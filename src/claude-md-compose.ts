@@ -185,7 +185,7 @@ function readRulesetFile(dir: string, filename: string, repoRoot: string): strin
     // directory entry IS the file. So containment alone would compose the
     // secret. `nlink` is the property that actually differs, and this repo
     // already uses it for the same reason on the canonical-git sentinel
-    // (`docs/review-notes.md`, #739). A plugin's standing ruleset having a
+    // (`docs/review-notes.md`). A plugin's standing ruleset having a
     // second name is not a legitimate shape.
     if (st.nlink !== 1) {
       log.warn('Plugin ruleset has more than one hard link; not composing it', { file, nlink: st.nlink });
@@ -218,12 +218,12 @@ function readRulesetFile(dir: string, filename: string, repoRoot: string): strin
  * A directory is a sub-plugin when it declares itself one, which is the signal
  * both container-side walkers use: Claude asks only that
  * `.claude-plugin/plugin.json` EXIST (`hasManifest`,
- * `container/agent-runner/src/providers/claude.ts:1760`, applied to `<repo>/<sub>`
+ * `container/agent-runner/src/providers/claude.ts`, applied to `<repo>/<sub>`
  * and `<repo>/plugins/<sub>` alike), while Codex additionally requires the
  * manifest to PARSE and carry a non-empty `name`, since that name is what it
  * registers (`readCodexPluginEntryName`,
- * `container/agent-runner/src/codex-companion-setup.ts:804`, reached from
- * `findCodexSubPlugins` at `:853` for the same two layouts).
+ * `container/agent-runner/src/codex-companion-setup.ts`, reached from
+ * `findCodexSubPlugins` for the same two layouts).
  *
  * Each manifest is held to its OWN walker's rule rather than to one rule for
  * both: a broken `.codex-plugin/plugin.json` is not a plugin to Codex, so it
@@ -454,10 +454,10 @@ export async function composeGroupClaudeMd(
       // `.codex-plugin/plugin.json` declares them AND whose hook identity is
       // TRUSTED. That trust is not automatic: codex reports an unenrolled plugin
       // hook as `trustStatus: "untrusted"` and never dispatches it, which made
-      // this gate's premise FALSE until #827 installed container-side hook
-      // trust. #827 is merged and is in this branch, so the premise holds. The
+      // this gate's premise FALSE until container-side hook trust was
+      // installed. It now is, so the premise holds. The
       // ordering was the fix rather than the code — composing for Codex in the
-      // meantime would have delivered the text twice the day #827 landed.
+      // meantime would have delivered the text twice the day hook trust landed.
       // Re-check this gate if hook trust is removed, or if a plugin's manifest
       // stops declaring the hooks file it ships.
       if (provider !== 'opencode') continue;
@@ -499,7 +499,7 @@ export async function composeGroupClaudeMd(
         // written to two FIXED paths, `<groupDir>/CLAUDE.md` (:373) and
         // `<groupDir>/AGENTS.md` (:420). No key is ever a filename: the
         // `.claude-fragments/` directory that once made them one is gone along
-        // with the mount that backed it (`src/container-runner.ts:4845-4846`),
+        // with the mount that backed it,
         // and `removeStaleFragmentArtifacts` only deletes that legacy
         // directory — it never reads `desired`.
         desired.set(`plugin-${subPath}.md`, content);

@@ -36,7 +36,7 @@ export function readonlyMountArgs(hostPath: string, containerPath: string): stri
  * but they share the check so a name the runtime would reject never reaches
  * a subprocess at all.
  */
-export function assertContainerName(name: string): void {
+function assertContainerName(name: string): void {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
     throw new Error(`Invalid container name: ${name}`);
   }

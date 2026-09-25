@@ -55,7 +55,7 @@ export type McpServerConfig = StdioMcpServerConfig | HttpMcpServerConfig | SseMc
  */
 export type ParsedMcpServerConfig = StdioMcpServerConfig | HttpMcpServerConfig;
 
-export interface StdioMcpServerConfig {
+interface StdioMcpServerConfig {
   type?: 'stdio';
   command: string;
   args?: string[];
@@ -105,7 +105,7 @@ export interface StdioMcpServerConfig {
   description?: string;
 }
 
-export interface HttpMcpServerConfig {
+interface HttpMcpServerConfig {
   type: 'http';
   url: string;
   headers?: Record<string, string>;
@@ -129,7 +129,7 @@ export interface HttpMcpServerConfig {
   description?: string;
 }
 
-export interface SseMcpServerConfig {
+interface SseMcpServerConfig {
   type: 'sse';
   url: string;
   headers?: Record<string, string>;
@@ -170,7 +170,7 @@ const SECRET_QUERY_SUFFIX_RE = new RegExp(`(${CREDENTIAL_NOUNS})$`, 'i');
 const CAMEL_SPLIT_RE = /([a-z0-9])([A-Z])/g;
 
 /** Whether a query parameter NAME signals a credential. */
-export function isCredentialQueryKey(key: string): boolean {
+function isCredentialQueryKey(key: string): boolean {
   const normalized = key.replace(CAMEL_SPLIT_RE, '$1_$2');
   return SECRET_QUERY_WORD_RE.test(normalized) || SECRET_QUERY_SUFFIX_RE.test(normalized);
 }
@@ -315,7 +315,7 @@ function isKnownRawSecret(value: string): boolean {
  * recognize (`isKnownRawSecret`) and on credential-named headers and query
  * keys.
  */
-export function looksOpaque(value: string): boolean {
+function looksOpaque(value: string): boolean {
   if (value.length < 16) return false;
   const classes = [/[a-z]/, /[A-Z]/, /[0-9]/].filter((re) => re.test(value)).length;
   return classes >= 2 && !/[\s.]/.test(value);
@@ -655,7 +655,7 @@ function hasGitIdentityControlCharacter(value: string): boolean {
  * otherwise silently fall back to a repository or inherited identity, which
  * defeats the point of explicitly configuring attribution for an agent.
  */
-export function validateGitIdentity(value: unknown): GitIdentity | undefined {
+function validateGitIdentity(value: unknown): GitIdentity | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new Error('gitIdentity must be an object with non-empty name and email strings');
@@ -694,7 +694,7 @@ export const MIN_AUTO_COMPACT_WINDOW = 100_000;
  * rather than silently reading as the 1M default — a lowered window that
  * quietly reverts is a fail-open.
  */
-export function validateAutoCompactWindow(value: unknown): number | undefined {
+function validateAutoCompactWindow(value: unknown): number | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== 'number' || !Number.isInteger(value) || value < MIN_AUTO_COMPACT_WINDOW) {
     throw new Error(`autoCompactWindow must be an integer token count >= ${MIN_AUTO_COMPACT_WINDOW}`);
@@ -710,9 +710,7 @@ export function validateAutoCompactWindow(value: unknown): number | undefined {
  * implementation. Re-exported here because this module is where every host
  * consumer already reaches for container.json's schema.
  */
-export { splitExcludedPlugins, validateExcludePlugins, isExcludedPluginPath } from './plugin-exclusions.js';
-export type { ExcludedPlugins } from './plugin-exclusions.js';
-
+export { splitExcludedPlugins, validateExcludePlugins } from './plugin-exclusions.js';
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
   /** Structured reporting override. Absent is the fleet default; false is rollback. */
@@ -1122,7 +1120,7 @@ export interface ContainerConfig {
 }
 
 /** Per-agent Slack user-token scoping. The token never appears in this config. */
-export interface SlackUserTokenConfig {
+interface SlackUserTokenConfig {
   /**
    * RETIRED, accepted and ignored: it registered the removed Slack MCP. No
    * spawn or capability path reads it; sibling-parity still compares it.
@@ -1420,7 +1418,7 @@ export function effectiveOutcomeReporting(config: Pick<ContainerConfig, 'outcome
  * UNLOCKED, and the last step of a mutation rather than a mutation itself.
  * Every change to an EXISTING config must go through `updateContainerConfig`,
  * which holds the group's lock across read → mutate → write; calling this
- * directly on a live group races every other writer and is how #840 happened.
+ * directly on a live group races every other writer and silently loses writes.
  * It stays exported for seeding a config from whole cloth (tests, fixtures),
  * where there is nothing to lose.
  *
@@ -1478,22 +1476,22 @@ export function writeContainerConfig(folder: string, config: ContainerConfig): v
   // The rename is the textbook atomic write, and an earlier draft of this
   // change used it. It is wrong HERE, and the reason is a mount:
   // `groups/<folder>/` is bind-mounted read-WRITE into the agent container at
-  // `/workspace/agent` (`src/container-runner.ts:4677`), the container runs as
-  // the host's own uid (`:7134`), and the ONLY thing protecting this file is a
-  // nested read-only single-file mount of `container.json` itself
-  // (`:4809-4813`). An in-place write stays inside that protection. A sibling
+  // `/workspace/agent` (`src/container-runner.ts`), the container runs as
+  // the host's own uid, and the ONLY thing protecting this file is a
+  // nested read-only single-file mount of `container.json` itself.
+  // An in-place write stays inside that protection. A sibling
   // temp file gets none of it — an agent watching the directory can overwrite
   // the temp file between our close and our rename, and the host then installs
   // the agent's bytes as the authoritative config: `excludePlugins` emptied,
   // `onecliSecrets` widened, `mcpServers` rewritten, with nothing downstream
   // able to tell (`assertOverwritableContainerConfig` inspects only the file
-  // being replaced). That is a worse version of the very harm #840 is about.
+  // being replaced). That is a worse version of the very harm the lock prevents.
   //
   // What the rename would have bought is the torn-write case: a crash
   // mid-`writeFileSync` leaves `{"excludePlugins": ["…"],`, which the tolerant
   // reader answers "no exclusions" for. That case is already REFUSED rather
   // than silently repaired by `assertOverwritableContainerConfig` above, and it
-  // is unchanged by this PR. Serializing the writers is what #840 needs;
+  // is unchanged here. Serializing the writers is what the lost-write race needs;
   // atomicity against a crash is a separate question and does not justify
   // handing the agent a write it never had.
   fs.writeFileSync(p, JSON.stringify(config, null, 2) + '\n');
@@ -1564,7 +1562,7 @@ export function containerConfigLockPath(folder: string): string {
  * opt-out (`applyOptOut`, `scripts/enable-agent-plugin.ts`, a SEPARATE
  * process).
  *
- * WHAT IT FIXES (#840). All four were read-modify-write over the tolerant
+ * WHAT IT FIXES. All four were read-modify-write over the tolerant
  * `readContainerConfig` with no lock, version or compare-and-swap anywhere, so
  * process A's read, process B's whole write, then A's write silently discarded
  * B's change. `excludePlugins` is what made that more than a config annoyance:

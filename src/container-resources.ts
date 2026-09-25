@@ -7,7 +7,7 @@ import {
   CONTAINER_PIDS_LIMIT,
 } from './config.js';
 
-export interface ContainerMemoryResources {
+interface ContainerMemoryResources {
   requestMb?: number;
   limitMb?: number;
   /** Docker --memory-swap total (RAM + swap), not swap-only bytes. */
@@ -42,7 +42,7 @@ export interface ContainerResourceDefaults {
   pidsLimit: number;
 }
 
-export function installContainerResourceDefaults(): ContainerResourceDefaults {
+function installContainerResourceDefaults(): ContainerResourceDefaults {
   return {
     memoryLimit: CONTAINER_MEMORY_LIMIT,
     memoryReservation: CONTAINER_MEMORY_RESERVATION,

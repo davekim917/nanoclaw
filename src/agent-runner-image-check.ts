@@ -99,7 +99,7 @@ export interface DepsDriftCheck {
 export const LABEL_RETRY_DELAY_MS = 2_000;
 
 /** Raw `docker inspect` stdout producer — the one seam tests replace. */
-export type InspectRunner = (imageRef: string) => Promise<string>;
+type InspectRunner = (imageRef: string) => Promise<string>;
 
 export interface DriftCheckOptions {
   /** Test seam: stands in for the real `docker inspect`. */

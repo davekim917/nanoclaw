@@ -5,8 +5,8 @@
  * `worktree` strands no clone (§7 rollback).
  *
  * Read from `process.env` at first use, never at import: main.ts loads `.env`
- * into process.env inside main() (`loadEnvIntoProcess`, src/main.ts:226, called
- * at :602), after every module has been imported, so an import-time read would
+ * into process.env inside main() (`loadEnvIntoProcess` in src/main.ts), after
+ * every module has been imported, so an import-time read would
  * miss a value set only in `.env`. It is resolved at first use (the first
  * spawn), which WARNs once for a refused value, and is then fixed for the
  * process: changing it takes a restart.
@@ -26,7 +26,7 @@ export interface CheckoutModeDecision {
 /**
  * Unset -> `worktree`. Anything but the two exact names -> `worktree` with a
  * warning: a typo must never enable clones. `clone` also needs containers that
- * run as the host uid (`containerRunsAsHostUser`, src/github-token-file.ts:66-68):
+ * run as the host uid (`containerRunsAsHostUser`, src/github-token-file.ts):
  * the host creates every clone, and a container running as any other uid could
  * not write the files the host made (plan §5.2 preconditions).
  */

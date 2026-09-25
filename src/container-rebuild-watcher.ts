@@ -275,7 +275,7 @@ async function attemptRebuild(reason: string): Promise<void> {
   // CONTAINER_IMAGE is overridden (env var, custom install slug, etc.).
   //
   // Deliberately no `git pull` here: build.sh builds from the WORKING TREE
-  // while stamping NANOCLAW_COMMIT from `git rev-parse HEAD` (build.sh:73).
+  // while stamping NANOCLAW_COMMIT from `git rev-parse HEAD`.
   // Moving the operator's live checkout out from under them is out of scope
   // for an automated process, and a build against a dirty tree would produce
   // an image whose commit label misrepresents its actual contents anyway.

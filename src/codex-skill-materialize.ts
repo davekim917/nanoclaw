@@ -23,7 +23,7 @@ import os from 'os';
 import path from 'path';
 
 /** NanoClaw-owned, git-untracked skills root we materialize into. */
-export const CODEX_MATERIALIZED_ROOT = path.join('.nanoclaw', 'codex-skills');
+const CODEX_MATERIALIZED_ROOT = path.join('.nanoclaw', 'codex-skills');
 
 /** Skill-root layouts we know how to materialize from, in discovery preference order. */
 const SKILLS_ROOT_CANDIDATES = [path.join('.agents', 'skills'), 'skills', path.join('plugin', 'skills')];

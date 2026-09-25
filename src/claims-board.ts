@@ -39,7 +39,7 @@ import {
 import { formatLocalTime } from './timezone.js';
 
 /** Past its TTL but inside the grace window — not yet an alert, already worth seeing. */
-export type ClaimState = 'live' | 'expiring' | 'stale' | 'parked' | 'paused';
+type ClaimState = 'live' | 'expiring' | 'stale' | 'parked' | 'paused';
 
 export interface BoardClaim {
   slug: string;

@@ -22,33 +22,29 @@
  *
  * Why `model_reasoning_effort` is the key: a role file deserializes as
  * `RawAgentRoleFileToml`, whose non-role fields are `#[serde(flatten)]`ed into
- * `ConfigToml` (codex-rs 0.154.0 `agent-roles/src/agent_role_config.rs:20-28`)
- * — the same flatten that carries `developer_instructions`.
- * `model_reasoning_effort: Option<ReasoningEffort>` is a top-level `ConfigToml`
- * field (`config/src/config_toml.rs:371`), so it belongs at the top level of the
- * role TOML, beside the keys we already write, and `role.rs:83` is what reads it
- * back off the parsed role.
+ * `ConfigToml` (codex-rs 0.154.0) — the same flatten that carries
+ * `developer_instructions`. `model_reasoning_effort: Option<ReasoningEffort>`
+ * is a top-level `ConfigToml` field, so it belongs at the top level of the
+ * role TOML, beside the keys we already write, and codex's `role.rs` is what
+ * reads it back off the parsed role.
  *
  * The name had to be READ rather than guessed, because a wrong one fails the
  * WHOLE FILE, not just the key. `RawAgentRoleFileToml` carries
- * `#[serde(deny_unknown_fields)]` (`agent_role_config.rs:21`) and that IS
+ * `#[serde(deny_unknown_fields)]` and that IS
  * honoured next to the `flatten`: serde's derive detects the combination and
  * emits a leftover check that runs after the flattened `ConfigToml` has taken
  * what it recognises, erroring `unknown field ...` on anything still unclaimed
- * (serde 1.0.228 `serde_derive/src/de/struct_.rs:347-363`, and
- * `flat_map_take_entry` at `serde/src/private/de.rs:3430-3447`, which claims an
+ * (serde 1.0.228's struct derive, and `flat_map_take_entry`, which claims an
  * entry only when its key is in the inner struct's field list). `ConfigToml`
  * has no `flatten` of its own to swallow the remainder, and its
- * `#[schemars(deny_unknown_fields)]` (`config/src/config_toml.rs:153-155`)
- * constrains only the generated JSON schema. So a misspelling aborts the role
- * file's deserialize (`parse_agent_role_file_contents`,
- * `agent_role_config.rs:54-62`) — loud, but it takes the role's other keys with
- * it.
+ * `#[schemars(deny_unknown_fields)]` constrains only the generated JSON
+ * schema. So a misspelling aborts the role file's deserialize
+ * (`parse_agent_role_file_contents`) — loud, but it takes the role's other
+ * keys with it.
  *
  * `ReasoningEffort`'s `FromStr` maps the nine known spellings
  * (none/minimal/low/medium/high/xhigh/max/ultra/persistent) and turns any other
- * non-empty string into `Custom(String)` rather than an error
- * (`protocol/src/openai_models.rs:139-157`), so an unrecognised frontmatter
+ * non-empty string into `Custom(String)` rather than an error, so an unrecognised frontmatter
  * effort degrades to a value Codex carries, not a file it rejects. The empty
  * string is that impl's only hard error; `parseClaudeAgentMd` already folds a
  * blank `effort:` to absent, and the emitter re-checks before writing.
@@ -65,13 +61,11 @@
  *
  *   1. The role's effort BEATS the spawn call's. `spawn_agent` applies its own
  *      `reasoning_effort` argument first (`apply_requested_spawn_agent_model_-`
- *      `overrides`) and applies the role after
- *      (`core/src/tools/handlers/multi_agents/spawn.rs:97-107`, and the v2
- *      handler at `multi_agents_v2/spawn.rs:128-142`), where
- *      `build_next_config` sets the effort unconditionally
- *      (`core/src/agent/role.rs:191-193`). Codex states this to the model
+ *      `overrides`) and applies the role after (in both the v1 and v2
+ *      multi-agent spawn handlers), where `build_next_config` sets the effort
+ *      unconditionally. Codex states this to the model
  *      itself: the role list gains "This role's reasoning effort is set to
- *      `<x>` and cannot be changed" (`role.rs:311-327`). That is the point —
+ *      `<x>` and cannot be changed". That is the point —
  *      a shim named for a level must RUN at that level — but it means an
  *      orchestrator cannot dial a converted shim up or down per call.
  *   2. The effort now gets VALIDATED against the child model, and an
@@ -81,29 +75,25 @@
  *      and otherwise checks the effort against the model's
  *      `supported_reasoning_levels`, returning
  *      "Reasoning effort `x` is not supported for model `y`"
- *      (`core/src/tools/handlers/multi_agents_common.rs:355-393`, validator at
- *      `:422-442`). Which levels a model supports IS readable: the catalog is
- *      bundled into the binary (`models-manager/models.json`, compiled in by
- *      `models-manager/src/lib.rs:12-16`), and in 0.154.0 `max` is missing from
+ *      (`multi_agents_common.rs`). Which levels a model supports IS readable: the catalog is
+ *      bundled into the binary (`models-manager/models.json`), and in 0.154.0 `max` is missing from
  *      `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini` and `gpt-5.2`, while `gpt-5.6-sol`,
  *      `gpt-5.6-luna`, `gpt-5.6-terra` and `gpt-6-astra` all carry it. So the
  *      one shim this can bite is `worker-max`, and only when it is spawned onto
  *      a 5.5-or-older model: that spawn now fails where it previously ran at
  *      the global default. Accepted. The fleet default is `DEFAULT_CODEX_MODEL`
- *      = `gpt-6-sol` (`container/agent-runner/src/providers/codex.ts:420`).
+ *      = `gpt-6-sol` (`container/agent-runner/src/providers/codex.ts`).
  *      It is not in the bundled catalog, but under ChatGPT auth on codex-cli
  *      >= 0.155.1 the server catalog supplies it with low..ultra (`gpt-6-luna`:
  *      low..max), so the check applies normally. Source at tag rust-v0.156.0:
- *      the catalog is cached at `<codex_home>/models_cache.json`
- *      (`models-manager/src/manager.rs:282`), `get_model_info` resolves a model
- *      against those remote entries (`:229-237`), and a match sets
- *      `used_fallback_model_metadata: false` (`:789-794`). No Codex group pins an older model than 5.6, and a refusal
+ *      the catalog is cached at `<codex_home>/models_cache.json`,
+ *      `get_model_info` resolves a model against those remote entries, and a
+ *      match sets `used_fallback_model_metadata: false`. No Codex group pins an older model than 5.6, and a refusal
  *      naming the unsupported
  *      level beats a shim called `worker-max` silently running at `high`. The
  *      other four shims name `low`/`medium`/`high`/`xhigh`, which every model
  *      in the catalog supports. One more bound: validation is skipped outright
- *      when the model metadata came back as a fallback
- *      (`multi_agents_common.rs:384-386`).
+ *      when the model metadata came back as a fallback.
  *
  * Dropped (no Codex equivalent or runtime-specific):
  *   frontmatter.model       — Claude model names differ, and `inherit` (what
@@ -136,7 +126,7 @@ export interface ClaudeAgent {
  * `parseClaudeAgentMd` keeps — `model:` in particular, which no converter
  * writes.
  */
-export function splitClaudeAgentMd(content: string): { frontmatter: string; body: string } | null {
+function splitClaudeAgentMd(content: string): { frontmatter: string; body: string } | null {
   // Normalize line endings up front. The parser is line-oriented, and any
   // stray `\r` in a value or scalar key would otherwise fail the regex
   // matchers below and the trailing-`\r` in the frontmatter content would
@@ -189,7 +179,7 @@ export function parseClaudeAgentMd(content: string): ClaudeAgent | null {
  * care about. Returns the raw scalar with quotes unwrapped and escape
  * sequences resolved; null when the key is missing.
  */
-export function extractScalar(frontmatter: string, key: string): string | null {
+function extractScalar(frontmatter: string, key: string): string | null {
   const lines = frontmatter.split('\n');
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -279,7 +269,7 @@ export function formatCodexAgentToml(agent: ClaudeAgent): string {
   //
   // Both guards degrade to that same no-key state rather than throwing, and the
   // call site is why. `syncCodexSubagents` wraps neither this call nor the write
-  // that follows it (`src/codex-sync.ts:352-363`), so a throw here does not skip
+  // that follows it (`src/codex-sync.ts`), so a throw here does not skip
   // ONE malformed agent — it aborts the loop, leaving every role after it in the
   // directory unconverted and the prune below the loop unrun. A `.md` whose
   // `effort:` is unusable is exactly the pre-existing case: before this mapping

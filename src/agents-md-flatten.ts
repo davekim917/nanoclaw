@@ -185,13 +185,3 @@ export function flattenClaudeMd(filePath: string, options: FlattenOptions = {}):
   };
   return flattenInner(filePath, new Set(), 0, opts);
 }
-
-/**
- * Convenience wrapper for the global host case:
- * ~/.claude/CLAUDE.md → flat content with Codex-specific peer-header
- * prepended. Used by `scripts/sync-codex-agents-md.ts`.
- */
-export function flattenGlobalClaudeMd(): string {
-  const claudeMd = path.join(os.homedir(), '.claude', 'CLAUDE.md');
-  return flattenClaudeMd(claudeMd);
-}
