@@ -317,17 +317,35 @@ function supportStatements(ts, statements, file, scope, imports) {
     if (ts.isExportDeclaration(st) && !st.moduleSpecifier && st.exportClause) continue;
     const tests = testCalls(ts, st);
     if (ts.isExpressionStatement(st) && tests.has(st.expression)) continue;
-    out.push({ file, scope, name: statementName(ts, st), canon: canon(ts, st, tests), text: oneLine(st.getText()) });
+    const movable = ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st) || ts.isVariableStatement(st);
+    out.push({
+      file,
+      scope,
+      movable,
+      name: statementName(ts, st),
+      canon: canon(ts, st, tests),
+      text: oneLine(st.getText()),
+    });
   }
   return out;
 }
 
-const noImports = () => ({ bindings: new Map(), effects: [] });
+/** A file's import record, with every name it uses outside its imports. */
+function newImports(ts, sf) {
+  const used = new Set();
+  const visit = (n) => {
+    if (ts.isImportDeclaration(n) || ts.isImportEqualsDeclaration(n)) return;
+    if (ts.isIdentifier(n)) used.add(n.text);
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  return { bindings: new Map(), effects: [], used };
+}
 
 /** The units (cases and groups) and support statements of one parsed test file. */
 function testFile(ts, file, sf) {
   const units = [];
-  const imports = noImports();
+  const imports = newImports(ts, sf);
   const support = supportStatements(ts, sf.statements, file, '', imports);
   const seen = new Map();
   const visit = (n, scope, inherited) => {
@@ -472,10 +490,11 @@ function compareSupport(baseSupport, headSupport, headPathOf, findings) {
   for (const [k, list] of headScoped) if (!paired.has(k)) elsewhere.push(...list);
   const unmoved = new Set(
     missing(
-      gone.map((g) => g.s),
+      gone.map((g) => g.s).filter((s) => s.movable),
       elsewhere,
     ),
   );
+  for (const g of gone) if (!g.s.movable) unmoved.add(g.s);
   for (const { s, file, scope, headPath } of gone) {
     if (!unmoved.has(s)) continue;
     findings.push({
@@ -487,19 +506,27 @@ function compareSupport(baseSupport, headSupport, headPathOf, findings) {
   }
 }
 
-/** An import whose local name now binds something else, or a side-effect import that is gone. */
+/** An import whose local name now binds something else or nothing while still in use, or a side-effect import that is gone. */
 function compareImports(baseImports, headImports, headPathOf, findings) {
   for (const [file, before] of baseImports) {
     const after = headImports.get(headPathOf(file));
     if (!after) continue;
     for (const [name, target] of before.bindings) {
       const now = after.bindings.get(name);
+      const was = target.replace('#', ' › ');
       if (now !== undefined && now !== target)
         findings.push({
           file,
           case: `import ${name}`,
           kind: 'support-changed',
-          change: `now ${now.replace('#', ' › ')}, was ${target.replace('#', ' › ')}`,
+          change: `now ${now.replace('#', ' › ')}, was ${was}`,
+        });
+      else if (now === undefined && after.used.has(name))
+        findings.push({
+          file,
+          case: `import ${name}`,
+          kind: 'support-changed',
+          change: `no longer imported from ${was} but still used`,
         });
     }
     for (const effect of missing(before.effects, after.effects))
@@ -586,7 +613,7 @@ export async function analyze({ files, read, ts }) {
     if (!ts) throw new Error('the typescript package is not installed where this runs');
     const sf = parse(ts, file, t);
     if (cls === 'ast-test') return testFile(ts, file, sf);
-    const imports = noImports();
+    const imports = newImports(ts, sf);
     return { units: [], support: supportStatements(ts, sf.statements, file, '', imports), imports };
   };
 

@@ -232,6 +232,41 @@ describe("adder", () => {
     ]);
   });
 
+  it('flags a hook moved to another suite, and accepts a helper declaration moved to another file', async () => {
+    const suite = (name: string, hook: string) =>
+      `describe('${name}', () => {\n  ${hook}\n  it('x${name}', () => { expect(x()).toBe(1); });\n});\n`;
+    const hook = 'beforeEach(() => reset());';
+    const moved = await judge(
+      { 'src/d.test.ts': suite('a', hook) + suite('b', '') },
+      { 'src/d.test.ts': suite('a', '') + suite('b', hook) },
+    );
+    expect(moved.findings).toEqual([expect.objectContaining({ case: 'a › beforeEach', kind: 'support-changed' })]);
+
+    const helper = 'function makeRow() { return { id: 1 }; }\n';
+    const relocated = await judge(
+      { 'src/h.test.ts': `${helper}it('r', () => { expect(makeRow()).toBeTruthy(); });\n` },
+      {
+        'src/h.test.ts': `import { makeRow } from './rows';\nit('r', () => { expect(makeRow()).toBeTruthy(); });\n`,
+        'src/test-fixtures/rows.ts': helper,
+      },
+    );
+    expect(relocated.verdict).toBe('clean');
+  });
+
+  it('flags an imported name replaced by a local stand-in, and not an unused import dropped', async () => {
+    const before = `import { subject, unused } from './real.js';\nit('works', () => { expect(subject()).toBe(1); });\n`;
+    const result = await judge(
+      { 'src/i.test.ts': before },
+      { 'src/i.test.ts': before.replace("import { subject, unused } from './real.js';", 'const subject = () => 1;') },
+    );
+    expect(result.findings).toEqual([
+      expect.objectContaining({
+        case: 'import subject',
+        change: 'no longer imported from ./real.js › subject but still used',
+      }),
+    ]);
+  });
+
   it('flags a hook removed from one suite though an identical hook stays in another', async () => {
     const suite = (name: string, hook: string) =>
       `describe('${name}', () => {\n  ${hook}\n  it('x', () => { expect(x()).toBe(1); });\n});\n`;
