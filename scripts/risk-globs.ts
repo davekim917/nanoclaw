@@ -59,6 +59,9 @@ const KNOWN_NON_CODE_GLOBS: ReadonlySet<string> = new Set([
   '.husky/**',
   '.public-boundary-allowlist.json',
   'container/skills/pr-review-loop/**',
+  // Hygiene-check policy (knip and jscpd configuration); the checker itself is scripts/hygiene/**.
+  'knip.json',
+  '.jscpd.json',
   // The QA release gate (#1032). Bash and Python only -- no .ts/.js in the tree --
   // run by its own *.test.sh suites, which neither lane's coverage tool instruments.
   'container/skills/smoke-test/**',

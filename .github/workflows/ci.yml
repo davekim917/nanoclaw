@@ -16,11 +16,12 @@ permissions:
 # The full suite costs ~20 min on GitHub's 2-vCPU runner and this repo merges
 # ~25 PRs a day, which burned ~1,750 min/day in mid-September 2026 — parallelism
 # and dropping `--coverage` were both measured and did not help (PR #873,
-# vitest.config.ts). So this workflow, the pull_request lane, is typechecks
-# plus three seconds-long tests (~1.5 min): correctness before merge is the author's job — run the
-# tests for what you touched locally (CLAUDE.md, Development). The full suite
-# lives in ci-full.yml (nightly + on demand) under its own workflow name; see
-# that file for why the name matters to the merge gate.
+# vitest.config.ts). So this workflow, the pull_request lane, is typechecks, a
+# few seconds-long tests and the hygiene report: correctness before merge is
+# the author's job — run the tests for what you touched locally (CLAUDE.md,
+# Development). The full suite lives in ci-full.yml (nightly + on demand) under
+# its own workflow name; see that file for why the name matters to the merge
+# gate.
 #
 # The workflow name stays `CI`: merge-check's required-workflow check
 # (container/skills/pr-review-loop/scripts/codex-review.sh, `ci_verdict()`)
@@ -99,3 +100,14 @@ jobs:
       - name: Upstream ratchet is current
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm exec vitest run src/upstream-ratchet.test.ts --maxWorkers=1
+      # Dead code (knip, host and runner), duplication (jscpd) and prohibited
+      # comment forms over the whole tree. `--report` prints the findings and
+      # exits 0; enforcement drops the flag here, in host-ci.sh and in
+      # ci-full.yml once main reports zero. A check that cannot run fails the
+      # step in either mode.
+      - name: Hygiene checks
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && steps.bun_install.outcome == 'success' }}
+        run: pnpm exec tsx scripts/hygiene/run.ts --report
+      - name: Hygiene check fixtures
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm exec vitest run scripts/hygiene --maxWorkers=1

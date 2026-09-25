@@ -1,0 +1,20 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "entry": [
+    "src/mcp-tools/index.ts",
+    "src/cli/ncl.ts",
+    "src/cli/claude-review.ts",
+    "src/cli/enqueue-send.ts",
+    "src/compact-instructions.ts",
+    "src/memory/hook.ts",
+    "src/codex-hooks/cli.ts",
+    "src/remote-mcp-bridge.ts",
+    "src/granola-mcp-server.ts",
+    "src/managed-git-guard-opencode.ts",
+    "src/mcp-tools/memory-write-process-helper.ts"
+  ],
+  "project": ["src/**/*.ts", "scripts/**/*.ts"],
+  "ignoreFiles": ["src/codex-hooks/__test-fixtures__/**"],
+  "ignoreBinaries": ["codex", "gcloud", "opencode"],
+  "includeEntryExports": true
+}

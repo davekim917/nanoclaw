@@ -51,6 +51,8 @@
     "scripts/check-public-boundary.ts": 94.88,
     "scripts/check-remote-boundary.ts": 67.37,
     "scripts/check-risk-coverage.ts": 59.8,
+    "scripts/hygiene/comments.ts": 100,
+    "scripts/hygiene/run.ts": 72.15,
     "src/agent-runner-source.ts": 76.92,
     "src/claude-agent-md.ts": 93.33,
     "src/cli/dispatch.ts": 96.12,

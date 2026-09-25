@@ -10,7 +10,7 @@
 # What this cannot mirror is ci.yml's `uses:` toolchain setup: the runner's
 # node, pnpm and bun are whatever this machine has (ci.yml pins node 22 and
 # bun 1.3.14). `set -euo pipefail` must stay the first line of code: the test
-# refuses anything above it. Each vitest step is a single seconds-long file on
+# refuses anything above it. Each vitest step is a few seconds-long files on
 # one worker, so it runs without run-host-ci.sh's $HOST_CI_VITEST_LOCK (a flock
 # prefix here would no longer be ci.yml's line).
 set -euo pipefail
@@ -23,3 +23,5 @@ pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 pnpm exec vitest run scripts/host-ci-declaration.test.ts --maxWorkers=1
 pnpm exec vitest run scripts/review-notes.test.ts --maxWorkers=1
 pnpm exec vitest run src/upstream-ratchet.test.ts --maxWorkers=1
+pnpm exec tsx scripts/hygiene/run.ts --report
+pnpm exec vitest run scripts/hygiene --maxWorkers=1

@@ -164,6 +164,11 @@ risk:high:
     - 'scripts/check-remote-boundary.ts'
     - '.public-boundary-allowlist.json'
     - 'container/skills/pr-review-loop/**'
+    # The hygiene checker and the only files that may exempt anything from it
+    - 'scripts/hygiene/**'
+    - 'knip.json'
+    - 'container/agent-runner/knip.json'
+    - '.jscpd.json'
     # The QA release gate: its controller, gate, barrier and scaffold decide whether a
     # client build is certified GO. No PR-lane CI runs its suites, and a defect
     # publishes a verdict wrong on the merits (#2092: BLOCKED over a clean GO) or
@@ -331,6 +336,10 @@ risk:gates:
     - 'scripts/check-remote-boundary.ts'
     - '.public-boundary-allowlist.json'
     - 'container/skills/pr-review-loop/**'
+    - 'scripts/hygiene/**'
+    - 'knip.json'
+    - 'container/agent-runner/knip.json'
+    - '.jscpd.json'
     - 'container/skills/smoke-test/**'
     - 'docs/review-policy.md'
     - 'container/agents/**'
