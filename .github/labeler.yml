@@ -164,8 +164,7 @@ risk:high:
     - 'scripts/check-remote-boundary.ts'
     - '.public-boundary-allowlist.json'
     - 'container/skills/pr-review-loop/**'
-    # The hygiene checker and the only files that may exempt anything from it (the
-    # vendor map defines the vendored design-review files the checker skips)
+    # The hygiene checker and the only files that may exempt anything from it
     - 'scripts/hygiene/**'
     - 'knip.json'
     - 'container/agent-runner/knip.json'

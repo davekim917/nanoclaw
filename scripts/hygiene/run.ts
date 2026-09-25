@@ -1,11 +1,11 @@
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { vendoredEngineFiles } from '../../src/design-artifact-loop-vendor.js';
-import { hashFile, readManifest } from '../../src/upstream-ratchet.js';
 import { scanComments } from './comments.js';
 
 export interface Finding {
@@ -55,10 +55,19 @@ export interface Exempt {
   vendored: Set<string>;
 }
 
+/** Read and hashed here rather than through src/upstream-ratchet.ts, so what this exempts is decided in reviewed code. */
+function regularFileSha256(file: string): string | null {
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  return stat?.isFile() ? createHash('sha256').update(fs.readFileSync(file)).digest('hex') : null;
+}
+
 export function exemptFiles(root: string): Exempt {
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'src', 'upstream-ratchet.json'), 'utf8')) as {
+    files: Record<string, { diff: number; sha256: string | null }>;
+  };
   const upstream = new Set<string>();
-  for (const [file, entry] of Object.entries(readManifest(root).files)) {
-    if (entry.diff === 0 && entry.sha256 !== null && hashFile(path.join(root, file)) === entry.sha256) {
+  for (const [file, entry] of Object.entries(manifest.files)) {
+    if (entry.diff === 0 && entry.sha256 !== null && regularFileSha256(path.join(root, file)) === entry.sha256) {
       upstream.add(file);
     }
   }
