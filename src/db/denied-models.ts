@@ -36,15 +36,17 @@ export function getDeniedModel(provider: string, slug: string): Promise<DeniedMo
 
 /**
  * The deny-list row that blocks setting `model` on `provider`, matching the
- * value as typed OR the id it resolves to — so a family name (`sol`, `opus`)
- * is refused when its current target is denied. Checked at write only: a
+ * value as typed, its lowercase form (family names resolve case-insensitively,
+ * so a denied `astra` must also refuse `ASTRA`), or the id it resolves to — so
+ * a family name (`sol`, `opus`) is refused when its current target is denied. Checked at write only: a
  * later bump that moves a family onto a denied id is not caught here.
  */
 export async function getDenialFor(provider: string, model: string): Promise<DeniedModel | undefined> {
-  const literal = await getDeniedModel(provider, model);
-  if (literal) return literal;
-  const resolved = resolveEffectiveModel(model);
-  return resolved === model ? undefined : getDeniedModel(provider, resolved);
+  for (const candidate of new Set([model, model.toLowerCase(), resolveEffectiveModel(model)])) {
+    const row = await getDeniedModel(provider, candidate);
+    if (row) return row;
+  }
+  return undefined;
 }
 
 /** True when (provider, slug) is in the blocklist. */

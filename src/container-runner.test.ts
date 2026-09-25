@@ -2821,7 +2821,7 @@ describe('Codex family alias map at spawn', () => {
     // buildContainerArgs makes live onecli calls, so it cannot run here; this
     // pins the two call sites instead. The restricted wiki branch returns
     // early, and without its own call a Codex wiki actor's family pin falls
-    // back to the default (the #1142 round-1 finding).
+    // back to the default.
     const src = fs.readFileSync(new URL('./container-runner.ts', import.meta.url), 'utf8');
     expect(src.match(/args\.push\(\.\.\.codexFamilyAliasEnv\(\)\);/g)).toHaveLength(2);
     const wikiReturn = src.indexOf("args.push('--entrypoint', 'bash', CONTAINER_IMAGE");

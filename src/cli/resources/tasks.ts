@@ -1103,8 +1103,7 @@ interface RepinRejection {
  * Model resolution for MATCHING, in the vocabulary of the group whose task is
  * being matched. The vocabulary normalizes provider spellings first (a Codex
  * dot form like `gpt6-astra`, lowercasing), then `resolveEffectiveModel`
- * expands family names of either provider (`opus`, `fable`, `astra`,
- * src/flag-parser.ts:141), so `--from-model astra --match-resolved` also
+ * expands family names of either provider (`opus`, `fable`, `astra`), so `--from-model astra --match-resolved` also
  * finds a codex pin stored as `gpt-6-astra`.
  */
 function modelResolverFor(provider: string): (v: string) => string {

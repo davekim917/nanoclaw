@@ -69,6 +69,8 @@ describe('the denied-models blocklist on the async driver', () => {
     // A literal denial of the family word itself still holds.
     await addDeniedModel('codex', 'astra', 'no astra word');
     expect(await getDenialFor('codex', 'astra')).toMatchObject({ reason: 'no astra word' });
+    expect(await getDenialFor('codex', 'ASTRA')).toMatchObject({ reason: 'no astra word' });
+    expect(await getDenialFor('codex', 'SOL')).toMatchObject({ reason: 'no sol' });
   });
 
   it('is a miss, not an error, for a pair that was never denied', async () => {
