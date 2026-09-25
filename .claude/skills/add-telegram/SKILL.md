@@ -19,16 +19,14 @@ safe to re-run; anything a parser can't apply falls back to the prose beside it.
 
 ### 1. Copy the adapter, helpers, and tests
 
-Fetch the `channels` branch and copy the Telegram adapter, its pairing and
-markdown-sanitize helpers (with their tests), and the registration test into
-place (overwrite — the branch is canonical):
+Fetch the `channels` branch and copy the Telegram adapter, its pairing
+helper (with its test), and the registration test into place (overwrite —
+the branch is canonical):
 
 ```nc:copy from-branch:channels
 src/channels/telegram.ts
 src/channels/telegram-pairing.ts
 src/channels/telegram-pairing.test.ts
-src/channels/telegram-markdown-sanitize.ts
-src/channels/telegram-markdown-sanitize.test.ts
 src/channels/telegram-registration.test.ts
 ```
 

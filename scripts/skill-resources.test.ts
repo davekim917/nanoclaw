@@ -363,6 +363,8 @@ const hostInstalls = installs.filter(isHostCode);
 
 /** Per registry branch: the host code its copies install, and the lookup their imports resolve through. */
 const branchChecks: Array<{ ref: string; lookup: ReadonlyMap<string, Install>; installs: Install[] }> = [];
+/** Declared branch sources the resolved ref does not have; the install's `git show` fails on each. */
+const absentBranchSources: Array<{ copy: BranchCopy; ref: string }> = [];
 /** Branch copies that could not be read, with the reason. */
 const uncheckedBranchCopies: Array<{ skill: string; branch: string; reason: string }> = [];
 {
@@ -376,7 +378,11 @@ const uncheckedBranchCopies: Array<{ skill: string; branch: string; reason: stri
       }
       continue;
     }
-    const fromRef = onBranch.flatMap((copy) => installsFromRef(copy, found.ref));
+    const fromRef = onBranch.flatMap((copy) => {
+      const files = installsFromRef(copy, found.ref);
+      if (files.length === 0) absentBranchSources.push({ copy, ref: found.ref });
+      return files;
+    });
     const lookup = new Map([...installedAt, ...fromRef.map((i): [string, Install] => [i.dst, i])]);
     branchChecks.push({ ref: found.ref, lookup, installs: fromRef.filter(isHostCode) });
   }
@@ -434,6 +440,12 @@ describe('installable skill resources', () => {
         ).toEqual([]);
       });
     }
+  }
+
+  for (const { copy, ref } of absentBranchSources) {
+    it(`${copy.skill}: from-branch:${copy.branch} source ${copy.src} exists at ${ref}`, () => {
+      expect.fail(`${copy.skill} copies ${copy.src} from ${ref}, which has no such path`);
+    });
   }
 
   for (const { skill, branch, reason } of uncheckedBranchCopies) {

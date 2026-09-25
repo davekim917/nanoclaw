@@ -134,7 +134,7 @@
 ".claude/skills/add-teams/SKILL.md":{"diff":0,"mode":"100644","sha256":"7bfe7e1c3ec7d624d14d551f6a30c6f477fbba51604dbfe66ac23476fe76753c"},
 ".claude/skills/add-teams/apply-fixtures.json":{"diff":6,"mode":"100644","sha256":"1ca01dffd35ef09bf8259f211f95da63dab6311235327bae8e209ae4f72515b7"},
 ".claude/skills/add-telegram/REMOVE.md":{"diff":9,"mode":"100644","sha256":"d46db657bc77ed98f9845a29c171a054d711e131b50bea12c164d22aac800e6f"},
-".claude/skills/add-telegram/SKILL.md":{"diff":176,"mode":"100644","sha256":"11eec43d5e4a87193e06b22e036458874b6c9178e13bba98020bd8656bf47b86"},
+".claude/skills/add-telegram/SKILL.md":{"diff":174,"mode":"100644","sha256":"a31744fafb1de3d70c4b989400143e8ed7c66f98426c8df4f57614fa1cd7f2d1"},
 ".claude/skills/add-telegram/apply-fixtures.json":{"diff":26,"mode":"100644","sha256":"efba471e7a8051316bfe501f34855ace8df7f8d3b30e962d81a30b88c1f17cec"},
 ".claude/skills/add-vercel/REMOVE.md":{"diff":7,"mode":"100644","sha256":"2e9a0dd5c335442a7886f8067ca455d547f61a2377a13420280e74a8b07240ac"},
 ".claude/skills/add-vercel/SKILL.md":{"diff":35,"mode":"100644","sha256":"a955baed36c62935dfe1aeb3b1d31ef977c0a8ffc901e71347639c8d26ff1a0b"},
