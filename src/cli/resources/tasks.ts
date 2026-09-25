@@ -1101,10 +1101,11 @@ interface RepinRejection {
  */
 /**
  * Model resolution for MATCHING, in the vocabulary of the group whose task is
- * being matched. `resolveEffectiveModel` only expands Claude family aliases, so
- * using it everywhere meant `--from-model astra --match-resolved` found nothing
- * on a codex group whose pin is stored as `gpt-6-astra` — the alias resolves in
- * the codex vocabulary, not the claude one.
+ * being matched. The vocabulary normalizes provider spellings first (a Codex
+ * dot form like `gpt6-astra`, lowercasing), then `resolveEffectiveModel`
+ * expands family names of either provider (`opus`, `fable`, `astra`,
+ * src/flag-parser.ts:141), so `--from-model astra --match-resolved` also
+ * finds a codex pin stored as `gpt-6-astra`.
  */
 function modelResolverFor(provider: string): (v: string) => string {
   const vocab = vocabFor(provider);

@@ -1,3 +1,4 @@
+import { resolveEffectiveModel } from '../flag-parser.js';
 import { getDb } from './connection.js';
 
 /**
@@ -31,6 +32,19 @@ export function listDeniedModels(provider?: string): Promise<DeniedModel[]> {
 
 export function getDeniedModel(provider: string, slug: string): Promise<DeniedModel | undefined> {
   return getDb().get<DeniedModel>('SELECT * FROM denied_models WHERE provider = ? AND slug = ?', provider, slug);
+}
+
+/**
+ * The deny-list row that blocks setting `model` on `provider`, matching the
+ * value as typed OR the id it resolves to — so a family name (`sol`, `opus`)
+ * is refused when its current target is denied. Checked at write only: a
+ * later bump that moves a family onto a denied id is not caught here.
+ */
+export async function getDenialFor(provider: string, model: string): Promise<DeniedModel | undefined> {
+  const literal = await getDeniedModel(provider, model);
+  if (literal) return literal;
+  const resolved = resolveEffectiveModel(model);
+  return resolved === model ? undefined : getDeniedModel(provider, resolved);
 }
 
 /** True when (provider, slug) is in the blocklist. */

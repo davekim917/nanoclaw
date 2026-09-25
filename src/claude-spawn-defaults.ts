@@ -216,7 +216,7 @@ export function resolveClaudeSpawnDefaults(
  * `ANTHROPIC_DEFAULT_<FAMILY>_MODEL` is the SDK's alias short-circuit: the
  * string in it is what the CLI sends when anything — the agent, a subagent's
  * `model:` frontmatter, the `"model": "opus"` pin group-init writes into every
- * group's settings.json — uses that bare family word. All three are therefore
+ * group's settings.json — uses that bare family word. All four are therefore
  * install-wide constants emitted verbatim, so `opus` means Opus in every
  * group and `sonnet` means Sonnet in every group. Fable joined them on
  * 2026-09-24: without ANTHROPIC_DEFAULT_FABLE_MODEL a bare `fable` (a task

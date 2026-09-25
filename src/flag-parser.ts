@@ -134,9 +134,10 @@ export const CODEX_FAMILY_DEFAULTS: Readonly<Record<string, string>> = Object.fr
 
 /**
  * The concrete model a raw `-m` value / stored default actually runs as:
- * family alias → install default, pinned alias → its id, bare opus id → [1m].
- * Non-Claude values (codex `gpt-*`, opencode slugs) pass through untouched —
- * no family key collides with them.
+ * family alias of either provider (`opus`, `fable`, `sol`, …) → install
+ * default, pinned alias → its id, bare opus id → [1m]. Other non-Claude values
+ * (codex `gpt-*`, opencode slugs) pass through untouched — no family key
+ * collides with them.
  */
 export function resolveEffectiveModel(raw: string): string {
   const key = raw.toLowerCase();
@@ -282,7 +283,12 @@ export interface ProviderFlagVocab {
 }
 
 const CLAUDE_VOCAB: ProviderFlagVocab = {
-  resolveModel: (raw) => resolveModelAlias(raw),
+  // A family name is stored lowercase (`-m FABLE` → `fable`), as the Codex
+  // vocabulary already does; everything else resolves through the alias map.
+  resolveModel: (raw) => {
+    const key = raw.toLowerCase();
+    return Object.hasOwn(FAMILY_DEFAULTS, key) ? key : resolveModelAlias(raw);
+  },
   isValidModel: (resolved) => VALID_MODEL_RE.test(resolved),
   modelHint: '',
   validEfforts: VALID_EFFORT,

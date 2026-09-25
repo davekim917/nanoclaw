@@ -166,7 +166,9 @@ import {
   renderCapabilitiesSnapshot,
   resolveScanPolicyHooksMount,
   canonicalGitControlMounts,
+  codexFamilyAliasEnv,
 } from './container-runner.js';
+import { CODEX_FAMILY_DEFAULTS } from './flag-parser.js';
 import { effectiveMcpServers } from './fleet-mcp-servers.js';
 import { ForeignCanonicalCommondirError } from './canonical-git-commondir.js';
 import {
@@ -2803,5 +2805,27 @@ describe('canonicalGitControlMounts commondir sentinel (#669)', () => {
     // Refused before anything else was written into the .git or the state dir.
     expect(fs.existsSync(path.join(gitDir, 'objects', 'info', 'alternates'))).toBe(false);
     expect(fs.existsSync(stateDir)).toBe(false);
+  });
+});
+
+describe('Codex family alias map at spawn', () => {
+  it('carries the host map verbatim', () => {
+    const [flag, pair] = codexFamilyAliasEnv();
+    expect(flag).toBe('-e');
+    const [key, value] = [pair.slice(0, pair.indexOf('=')), pair.slice(pair.indexOf('=') + 1)];
+    expect(key).toBe('NANOCLAW_CODEX_MODEL_ALIASES');
+    expect(JSON.parse(value)).toEqual(CODEX_FAMILY_DEFAULTS);
+  });
+
+  it('is emitted by both spawn branches', () => {
+    // buildContainerArgs makes live onecli calls, so it cannot run here; this
+    // pins the two call sites instead. The restricted wiki branch returns
+    // early, and without its own call a Codex wiki actor's family pin falls
+    // back to the default (the #1142 round-1 finding).
+    const src = fs.readFileSync(new URL('./container-runner.ts', import.meta.url), 'utf8');
+    expect(src.match(/args\.push\(\.\.\.codexFamilyAliasEnv\(\)\);/g)).toHaveLength(2);
+    const wikiReturn = src.indexOf("args.push('--entrypoint', 'bash', CONTAINER_IMAGE");
+    expect(wikiReturn).toBeGreaterThan(-1);
+    expect(src.indexOf('args.push(...codexFamilyAliasEnv());')).toBeLessThan(wikiReturn);
   });
 });

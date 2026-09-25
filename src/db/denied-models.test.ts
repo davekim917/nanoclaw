@@ -17,7 +17,15 @@
 import type Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { addDeniedModel, getDeniedModel, isDeniedModel, listDeniedModels, removeDeniedModel } from './denied-models.js';
+import {
+  addDeniedModel,
+  getDenialFor,
+  getDeniedModel,
+  isDeniedModel,
+  listDeniedModels,
+  removeDeniedModel,
+} from './denied-models.js';
+import { CODEX_FAMILY_DEFAULTS, DEFAULT_FABLE_MODEL } from '../flag-parser.js';
 import { closeDb, getDb, initTestDb } from './index.js';
 import { migration039 } from './migrations/039-denied-models.js';
 
@@ -48,6 +56,19 @@ describe('the denied-models blocklist on the async driver', () => {
 
     expect(await getDeniedModel('claude', 'some-model')).toMatchObject({ reason: null });
     expect(await isDeniedModel('claude', 'some-model')).toBe(true);
+  });
+
+  it('getDenialFor refuses a family name whose current target is denied', async () => {
+    await addDeniedModel('codex', CODEX_FAMILY_DEFAULTS.sol, 'no sol');
+    await addDeniedModel('claude', DEFAULT_FABLE_MODEL, 'no fable');
+
+    expect(await getDenialFor('codex', 'sol')).toMatchObject({ reason: 'no sol' });
+    expect(await getDenialFor('claude', 'fable')).toMatchObject({ reason: 'no fable' });
+    expect(await getDenialFor('codex', CODEX_FAMILY_DEFAULTS.sol)).toMatchObject({ reason: 'no sol' });
+    expect(await getDenialFor('codex', 'luna')).toBeUndefined();
+    // A literal denial of the family word itself still holds.
+    await addDeniedModel('codex', 'astra', 'no astra word');
+    expect(await getDenialFor('codex', 'astra')).toMatchObject({ reason: 'no astra word' });
   });
 
   it('is a miss, not an error, for a pair that was never denied', async () => {

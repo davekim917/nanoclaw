@@ -279,7 +279,7 @@ const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY, timeout: 30
  * provider: a Claude-primary group can fall back to Codex, and its
  * providerFallback.model may name a family.
  */
-function codexFamilyAliasEnv(): string[] {
+export function codexFamilyAliasEnv(): string[] {
   return ['-e', `NANOCLAW_CODEX_MODEL_ALIASES=${JSON.stringify(CODEX_FAMILY_DEFAULTS)}`];
 }
 
@@ -6562,7 +6562,7 @@ async function buildContainerArgs(
   // The resolution above feeds NANOCLAW_CLAUDE_MODEL, NOT the SDK's alias
   // short-circuit. ANTHROPIC_DEFAULT_<FAMILY>_MODEL is that short-circuit —
   // whatever string is in it gets sent to the API verbatim when the agent or
-  // a subagent uses the bare family word — and all three carry install-wide
+  // a subagent uses the bare family word — and all four carry install-wide
   // constants, so `opus` means Opus in every group (claudeSpawnEnv).
   // ensureOpus1mSuffix is load-bearing here: a bare `claude-opus-*` reaching
   // the container as its model (e.g. via set_channel_model, which does not
@@ -6598,14 +6598,14 @@ async function buildContainerArgs(
   } else {
     // claudeSpawnEnv applies resolveEffectiveModel: family aliases first (so
     // `opus` keeps tracking DEFAULT_OPUS_MODEL rather than freezing), then
-    // pinned short aliases (`opus5`, `opus48`, `sonnet5`, `fable`), then
+    // pinned short aliases (`opus5`, `opus48`, `sonnet5`, `fable51`), then
     // ensureOpus1mSuffix on bare ids. The chat ack calls the same function, so
     // the confirmation the user sees is exactly what lands in
     // NANOCLAW_CLAUDE_MODEL.
     // Both the resolution and the `-e` strings themselves live in
     // claude-spawn-defaults.ts so they can be executed by a test;
     // buildContainerArgs cannot (live `onecli` shell calls). Emits
-    // NANOCLAW_CLAUDE_MODEL and the three constant
+    // NANOCLAW_CLAUDE_MODEL and the four constant
     // ANTHROPIC_DEFAULT_<FAMILY>_MODEL aliases always, and
     // NANOCLAW_EFFORT_OVERRIDE only when a channel wiring or the group's
     // container.json actually configures one — absent means the claude
