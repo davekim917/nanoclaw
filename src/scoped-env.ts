@@ -25,7 +25,7 @@ import { log } from './log.js';
  * separators, parent refs, shell metachars). Enforced inside
  * `extractToolScopes` — unsafe values are dropped with a warning.
  */
-export const SAFE_SCOPE_RE = /^[a-zA-Z0-9_-]+$/;
+const SAFE_SCOPE_RE = /^[a-zA-Z0-9_-]+$/;
 
 /**
  * Check whether a tool is enabled for a group, by bare name or by any scope.

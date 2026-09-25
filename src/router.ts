@@ -119,7 +119,7 @@ async function unanimousToneFor(agentGroupId: string, channelType: string): Prom
 
 /**
  * The workspace stopped having exactly one incumbent between the auto-wire
- * decision and its insert (#482).
+ * decision and its insert.
  *
  * Thrown so the refusal leaves through the caller's existing "could not
  * auto-wire" path — the operator approval gate — rather than duplicating that
@@ -358,10 +358,6 @@ export function setUnwiredChannelResolver(fn: UnwiredChannelResolverFn): void {
     log.warn('Unwired-channel resolver overwritten');
   }
   unwiredChannelResolver = fn;
-}
-
-export function getUnwiredChannelResolver(): UnwiredChannelResolverFn | null {
-  return unwiredChannelResolver;
 }
 
 /**
@@ -664,8 +660,8 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
         // leave NULL and let the group default in container.json answer.
         //
         // Tone ONLY: default_model / default_effort are per-channel pins, written only by `ncl wirings create/update`
-        // (src/cli/resources/wirings.ts:284, :199) and set_channel_model/_effort (src/modules/channel-config/index.ts:176,:250);
-        // spreading one channel's pin to every future channel is a worse bug than the one this fixes.
+        // and set_channel_model/_effort; spreading one channel's pin to every future channel is a worse bug than
+        // the one this fixes.
         const inheritedTone = await unanimousToneFor(inheritedAgent.id, mg.channel_type);
         const isGroup = event.message.isGroup ?? mg.is_group === 1;
         const wiring: MessagingGroupAgent = {
@@ -692,7 +688,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
           instructions_profile: null,
           created_at: new Date().toISOString(),
         };
-        // The uniqueness proof and the insert are ONE transaction (#482).
+        // The uniqueness proof and the insert are ONE transaction.
         //
         // `inheritedAgentGroupFor` refuses a workspace wired to more than one
         // agent group — that refusal is the whole reason a second tenant's
@@ -836,16 +832,14 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
   //
   //     Guard: require event.isDM === true explicitly (not just
   //     mg.is_group === 0). is_group=0 is not proof of a confirmed DM: the
-  //     messaging-group creation path (router.ts:599,608) only defaults
+  //     messaging-group creation path above only defaults
   //     is_group to 1 (group/mention-safe) when the adapter passes neither
   //     message.isGroup nor isDM, but is_group also defaults to 0 with NO
   //     adapter evidence at all on other paths — the CLI's `is_group`
-  //     field (src/cli/resources/messaging-groups.ts:102-106) and the
-  //     column itself (src/db/schema.ts:37) both default to 0. So
+  //     field and the column itself both default to 0. So
   //     "is_group happens to read 0" is a fact about that row's history,
   //     not this event's — caching a shared channel as a user's DM off a
   //     stale or coincidental read would poison subsequent DM resolution.
-  //     (Codex P2 catch on PR #108 follow-up.)
   if (userId !== null && event.isDM === true) {
     try {
       const { upsertUserDm } = await import('./modules/permissions/db/user-dms.js');
@@ -1467,7 +1461,7 @@ async function deliverToAgent(
     // the next host restart (see group-init.ts — the FK ordering note), but
     // the create flows do stamp the group row. Without this rung a fresh
     // codex sibling would parse flags with the claude vocabulary until the
-    // next restart (codex-review finding on PR #124).
+    // next restart.
     const provider = resolveProviderName(
       session.agent_provider,
       (await getContainerConfig(session.agent_group_id))?.provider ?? agentGroup.agent_provider,

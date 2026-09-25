@@ -42,10 +42,6 @@ export function getResponseHandlers(): readonly ResponseHandler[] {
 type ShutdownCallback = () => void | Promise<void>;
 const shutdownCallbacks: ShutdownCallback[] = [];
 
-export function onShutdown(cb: ShutdownCallback): void {
-  shutdownCallbacks.push(cb);
-}
-
 export function getShutdownCallbacks(): readonly ShutdownCallback[] {
   return shutdownCallbacks;
 }

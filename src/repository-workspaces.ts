@@ -18,7 +18,7 @@ import { safeGitArgs, safeGitEnv } from './safe-git.js';
 const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const TASK_THREAD_PREFIX = 'system:tasks:';
 
-export type RepositoryWorkUnitKind = 'thread' | 'conversation' | 'task' | 'session';
+type RepositoryWorkUnitKind = 'thread' | 'conversation' | 'task' | 'session';
 
 export interface RepositoryWorkUnit {
   workgroupId: string;
@@ -89,21 +89,6 @@ export function assertWorkgroupId(workgroupId: string): void {
 export function assertRepositoryName(repo: string): void {
   assertSegment(repo, 'repository name');
   if (repo === '.git') throw new Error(`Invalid repository name: ${repo}`);
-}
-
-/**
- * Non-throwing form of {@link assertRepositoryName}, for the directory roots
- * where non-repository entries legitimately live beside checkouts (a topic's
- * `worktrees/` root also holds `.nanoclaw-storage-active` leases and a
- * `.pnpm-store` cache). It is a name filter, never deletion authority.
- */
-export function isRepositoryName(repo: string): boolean {
-  try {
-    assertRepositoryName(repo);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 export function repositoriesRoot(dataDir: string = DATA_DIR): string {
@@ -336,12 +321,12 @@ export function writeTransferTombstone(
 }
 
 /** One canonical repository that cannot be served, and why. */
-export interface UnusableCanonicalRepository {
+interface UnusableCanonicalRepository {
   name: string;
   path: string;
   /** The message the throwing form raises, and what a caller logs when it skips this repository. */
   reason: string;
-  /** The cause is a `commondir` that is not the sentinel, or one that could not be read (#669). */
+  /** The cause is a `commondir` that is not the sentinel, or one that could not be read. */
   commondir: boolean;
 }
 
@@ -355,7 +340,7 @@ const describeError = (error: unknown): string => (error instanceof Error ? erro
 /**
  * Why `repoPath` cannot be served as a canonical, or null when it can.
  *
- * The `commondir` inspection comes BEFORE the Git probe on purpose (#669):
+ * The `commondir` inspection comes BEFORE the Git probe on purpose:
  * Git follows a `commondir` in any git dir, so probing a repository that
  * holds a foreign one either answers for another repository or, when it
  * names a missing directory, exits 128. Reading the file first keeps a
@@ -435,7 +420,7 @@ function containedNormalCloneProblem(repoPath: string, root: string): { reason: 
  * every repository under it, so there is nothing to serve. A problem with one
  * repository is that repository's alone: the caller decides between skipping
  * it and refusing everything. The spawn path skips it, so one tampered or
- * half-migrated canonical withholds only its own mounts (#669) instead of
+ * half-migrated canonical withholds only its own mounts instead of
  * stopping every container in the workgroup.
  */
 export function classifyCanonicalRepositories(
@@ -502,8 +487,8 @@ export function classifyCanonicalRepositories(
  *
  * Two callers depend on that and are deliberately left on it, because for them
  * a bad repository means the workgroup's answer is untrustworthy as a whole:
- * `migrateExistingCanonicalHooksPath` (managed-git-hooks.ts:407-415) and
- * `discoverCanonicalRefreshTargets` (repo-freshness.ts:47-52) both catch it
+ * `migrateExistingCanonicalHooksPath` (managed-git-hooks) and
+ * `discoverCanonicalRefreshTargets` (repo-freshness) both catch it
  * and skip the entire workgroup. The spawn path calls
  * classifyCanonicalRepositories instead.
  */
@@ -515,10 +500,9 @@ export function discoverCanonicalRepositories(workgroupId: string, dataDir: stri
 
 /**
  * A pin's identity in the one form every consumer compares: `github.com/<owner>/<repo>`,
- * lowercase. Repository activation stored the origin URL itself as the identity
- * (repository-activation.ts:544), while publication derives the github.com form
- * (modules/repository-workspaces/index.ts:152-168) and compares the two strictly, so
- * a re-publish of an activated repository was always refused (#697). Every pin read
+ * lowercase. Repository activation stores the origin URL itself as the identity,
+ * while publication derives the github.com form and compares the two strictly, so
+ * without this mapping a re-publish of an activated repository is refused. Every pin read
  * and write passes through validateOriginPin, so mapping the URL form here serves
  * every caller. Anything that is not an HTTPS github.com owner/repository URL is
  * returned unchanged.
@@ -711,16 +695,16 @@ function checkoutShape(checkoutPath: string): CheckoutShape {
 // filesystem, so a checkout exists only once it is fully initialized.
 //
 // Staging sits BESIDE `worktrees/`, never inside it. `worktrees/` is mounted
-// read-write into the topic's containers (container-runner.ts:4386), so an
+// read-write into the topic's containers, so an
 // agent can plant anything there, a symlink included, and the host's staging
 // mkdir and crash-residue removal would follow it into host data. The topic
 // state dir itself is not mounted, so nothing a container writes can steer
 // them, and no lister or sweep of `worktrees/` ever sees a half-built clone.
 
 const CHECKOUT_STAGING_DIRNAME = 'checkout-staging';
-export const CHECKOUT_METADATA_FILENAME = 'nanoclaw-checkout.json';
+const CHECKOUT_METADATA_FILENAME = 'nanoclaw-checkout.json';
 /** A staging entry this old, on a lane with no job running, is crash residue. */
-export const CHECKOUT_STAGING_STALE_MS = 60 * 60 * 1000;
+const CHECKOUT_STAGING_STALE_MS = 60 * 60 * 1000;
 
 export type CheckoutStartedFrom = 'canonical-local' | 'origin-branch' | 'origin-head' | 'local-head';
 
@@ -745,7 +729,7 @@ export function checkoutStagingRoot(topicWorktreesDir: string): string {
   return path.join(path.dirname(topicWorktreesDir), CHECKOUT_STAGING_DIRNAME);
 }
 
-export function checkoutMetadataPath(checkoutPath: string): string {
+function checkoutMetadataPath(checkoutPath: string): string {
   return path.join(checkoutPath, '.git', CHECKOUT_METADATA_FILENAME);
 }
 
@@ -798,7 +782,7 @@ export function writeCheckoutMetadata(checkoutPath: string, metadata: CheckoutMe
   }
 }
 
-// ── Inherited tags (#672) ─────────────────────────────────────────────────────
+// ── Inherited tags ─────────────────────────────────────────────────────
 //
 // A clone copies every canonical tag, and the clone disposability proof counts
 // every local ref's commits against origin, so one release tag off every origin

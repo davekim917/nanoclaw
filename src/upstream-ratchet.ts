@@ -89,7 +89,7 @@ import { fileURLToPath } from 'node:url';
  */
 export type GitMode = '100644' | '100755' | '120000';
 
-export const GIT_MODES: readonly GitMode[] = ['100644', '100755', '120000'];
+const GIT_MODES: readonly GitMode[] = ['100644', '100755', '120000'];
 
 export function isGitMode(value: string): value is GitMode {
   return (GIT_MODES as readonly string[]).includes(value);
@@ -103,7 +103,7 @@ export function isGitMode(value: string): value is GitMode {
 export const GITLINK_MODE = '160000';
 
 /** The repo this module was loaded from — a worktree when it is loaded from one. */
-export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /** Manifest location, relative to a repo root. */
 export const MANIFEST_REL = 'src/upstream-ratchet.json';
@@ -160,7 +160,7 @@ export interface UpstreamRatchetManifest {
   files: Record<string, UpstreamRatchetEntry>;
 }
 
-export type FindingKind =
+type FindingKind =
   /** The fork's bytes moved since `diff` was measured — `diff` is now unproven. */
   | 'changed'
   /** The fork's file mode moved since `diff` was measured. */
@@ -287,7 +287,7 @@ export function serializeManifest(manifest: UpstreamRatchetManifest): string {
 }
 
 /** The manifest with `files` in path order, so a regeneration produces a stable diff. */
-export function sortManifest(manifest: UpstreamRatchetManifest): UpstreamRatchetManifest {
+function sortManifest(manifest: UpstreamRatchetManifest): UpstreamRatchetManifest {
   const files: Record<string, UpstreamRatchetEntry> = {};
   for (const key of Object.keys(manifest.files).sort()) files[key] = manifest.files[key];
   return { upstream: manifest.upstream, paths: manifest.paths, files };
@@ -479,7 +479,7 @@ export interface TreeReader {
 }
 
 /** The default `TreeReader`: the local working tree under `repoRoot`. */
-export function fsTreeReader(repoRoot: string): TreeReader {
+function fsTreeReader(repoRoot: string): TreeReader {
   return {
     exists: (relPath) => pathExists(path.join(repoRoot, relPath)),
     modeOf: (relPath) => fileModeOf(path.join(repoRoot, relPath)),

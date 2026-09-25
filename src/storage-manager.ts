@@ -120,7 +120,7 @@ const DEFAULT_RESCUE_RETENTION_DAYS = 30;
 // 0 disables the count cap. Non-zero makes the oldest-idle sessions above the
 // cap eligible regardless of age.
 const DEFAULT_SESSION_ACTIVE_CAP = 0;
-export const THREAD_RESCUES_DIRNAME = 'thread-rescues';
+const THREAD_RESCUES_DIRNAME = 'thread-rescues';
 /** Append-only record of every completed archival; the restore/finish authority. */
 export const SESSION_RECLAIM_JOURNAL_FILENAME = 'reclaim-journal.jsonl';
 // Regenerable trees excluded from rescue archives — pure reinstallable weight.
@@ -196,9 +196,9 @@ let lastStorageMaintenanceMs = 0;
 let lastDockerPruneAttemptMs = 0;
 let lastEmergencyDockerAttemptMs = 0;
 
-export type StorageMode = 'dry-run' | 'apply';
-export type StoragePool = 'session-cache' | 'thread-cache' | 'topic-cache' | 'docker';
-export type StorageActionKind =
+type StorageMode = 'dry-run' | 'apply';
+type StoragePool = 'session-cache' | 'thread-cache' | 'topic-cache' | 'docker';
+type StorageActionKind =
   | 'delete-cache-dir'
   | 'delete-derived-file'
   | 'archive-thread-worktree'
@@ -263,7 +263,7 @@ export interface FilesystemUsage {
   usagePct: number;
 }
 
-export interface StorageActionReport {
+interface StorageActionReport {
   id: string;
   pool: StoragePool;
   kind: StorageActionKind;
@@ -285,7 +285,7 @@ export interface DockerImageInventory {
   labels: Record<string, string>;
 }
 
-export type DockerImageDisposition = 'protected' | 'eligible' | 'unmanaged';
+type DockerImageDisposition = 'protected' | 'eligible' | 'unmanaged';
 
 export interface DockerImageDispositionReport extends DockerImageInventory {
   disposition: DockerImageDisposition;
@@ -697,7 +697,7 @@ function parseDfOutput(output: string, targetPath: string): FilesystemUsage | nu
   };
 }
 
-export function getFilesystemUsage(targetPath: string): FilesystemUsage | null {
+function getFilesystemUsage(targetPath: string): FilesystemUsage | null {
   const probePath = fs.existsSync(targetPath) ? targetPath : process.cwd();
   try {
     const output = execFileSync('df', ['-Pk', probePath], {
@@ -756,7 +756,7 @@ export function dirSizeBytes(root: string): number {
   return total;
 }
 
-export function findPrunableArtifactDirs(root: string): string[] {
+function findPrunableArtifactDirs(root: string): string[] {
   const found: string[] = [];
   const stack: string[] = [root];
   while (stack.length > 0) {
@@ -889,7 +889,7 @@ function dbHasRows(dbPath: string, sql: string, params: unknown[] = []): boolean
  */
 export function sessionHasOpenWork(agentGroupId: string, sessionId: string, sessPath?: string): boolean | null {
   const inbound = dbHasRows(
-    // The RESOLVER, not the legacy name (#749). A container can still plant
+    // The RESOLVER, not the legacy name. A container can still plant
     // `<session>/inbound.db-journal` beside the legacy hard link, and a hot
     // journal makes every READ-ONLY open fail — `dbHasRows` catches and returns
     // `null`, which this function's callers treat exactly like `true`, so the
@@ -928,7 +928,7 @@ function sessionStateTableExists(dbPath: string): boolean {
   return isReadableSqliteDatabase(dbPath, 'session_state');
 }
 
-export function collectThreadWorktreeActivity(
+function collectThreadWorktreeActivity(
   isContainerRunning: (sessionId: string) => boolean,
 ): Map<string, ThreadWorktreeActivity> {
   const activity = new Map<string, ThreadWorktreeActivity>();
@@ -2173,10 +2173,10 @@ function findRegenerableTargets(root: string, recoveryDirs: string[] = []): stri
 /**
  * A topic's regenerable targets, walked checkout by checkout.
  *
- * `listTopicCheckouts` is the only enumerator of a topic's checkouts (plan
- * §5.1), so a branch clone at `<repo>@<slug>` is walked, shared and swept
+ * `listTopicCheckouts` is the only enumerator of a topic's checkouts, so a
+ * branch clone at `<repo>@<slug>` is walked, shared and swept
  * exactly like `<repo>`. What the lister skips is never walked: every
- * dot-prefixed name (repository-workspaces.ts:591). Nothing under one is
+ * dot-prefixed name. Nothing under one is
  * deleted, adopted, converted or recovered. repository_checkout builds its
  * clones outside `worktrees/` altogether (`checkoutStagingRoot`), so a
  * half-built clone is never here.
@@ -2189,7 +2189,7 @@ function findRegenerableTargets(root: string, recoveryDirs: string[] = []): stri
  * regenerable name.
  *
  * `null` when the worktrees root cannot be read: the lister returns [] only
- * for ENOENT and throws on anything else (repository-workspaces.ts:607-613),
+ * for ENOENT and throws on anything else,
  * so the caller counts the topic unreadable instead of sweeping it as empty.
  */
 function findTopicRegenerableTargets(worktreeRoot: string, recoveryDirs: string[]): string[] | null {
@@ -2416,7 +2416,7 @@ function topicIsUnmounted(topicDir: string, lookup: () => string[] | null): bool
  *     tree installed in June and read every day since still dates to June. It
  *     measures the last `npm ci`, not activity.
  *   - the topic dir's own mtime. Any bulk metadata touch on the parent bumps
- *     every topic at once (#203: 360 topic dirs sharing a 2-second window),
+ *     every topic at once,
  *     which here would make the whole fleet look fresh and silently disable
  *     the sweep.
  *   - `worktrees/`'s OWN mtime, which is what this used to read. A directory
@@ -3010,7 +3010,7 @@ function configuredImageProtection(): { images: Set<string>; readable: boolean }
         // Raw and synchronous on purpose: this pass runs inside the storage
         // maintenance worker thread and the synchronous reclaim executors,
         // and the image-removal action re-reads it immediately before `rmi`.
-        // Seam-3 plan §4.5 allowlists it; PR 6 wraps it in `withRawDb`.
+        // It is on the raw-DB allowlist (db/raw-db-ratchet.test).
         (getRawDb().prepare(CONTAINER_CONFIGS_ALL_SQL).all() as ContainerConfigRow[])
           .map((config) => config.image_tag?.trim())
           .filter((tag): tag is string => Boolean(tag)),

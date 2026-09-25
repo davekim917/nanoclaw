@@ -21,7 +21,7 @@ const GENERATED_DIRECTORIES = new Set([
   'target',
 ]);
 
-function sha256File(file: string): string {
+export function sha256File(file: string): string {
   const hash = createHash('sha256');
   const fd = fs.openSync(file, fs.constants.O_RDONLY);
   const buffer = Buffer.allocUnsafe(8 * 1024 * 1024);

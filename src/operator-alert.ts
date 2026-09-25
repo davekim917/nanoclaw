@@ -4,7 +4,7 @@
  * Two delivery paths exist in this install and only one of them works from
  * inside the host process:
  *
- *   - `data/cli.sock` with a `to:` payload. Condemned (#538/#541): a socket
+ *   - `data/cli.sock` with a `to:` payload. Condemned: a socket
  *     payload becomes an INBOUND event, so the router applies its unknown-sender
  *     gate, the synthetic `system:*` sender is not a known user, and an owner DM
  *     on `unknown_sender_policy = strict` DROPS it — while `sendall()` returns
@@ -40,9 +40,9 @@ import { scrubSecrets } from './secret-scrubber.js';
  * Every caller is a sweep duty awaiting this from inside a per-session or tick
  * window. An adapter promise that never settles would hold that window open for
  * good — the session stays in the driver's running set and every later tick
- * skips it (`sessionsRunning`, src/host-sweep.ts:1118) — and merely SLOW
+ * skips it (`sessionsRunning` in host-sweep) — and merely SLOW
  * recipients, tried one after another, could add up past the tick's own stall
- * ceiling (`SWEEP_TICK_STALL_MS`, 15 min, src/host-sweep.ts:941), at which
+ * ceiling (`SWEEP_TICK_STALL_MS`, 15 min), at which
  * point the driver abandons the tick. An alert is never worth the sweep.
  *
  * So the bound is on the CALL, not on the recipient count: one sweep interval
