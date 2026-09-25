@@ -93,18 +93,6 @@ const RUNTIME_CODEX_DIR = '/home/node/.codex-runtime';
 const FAILED_CODEX_HOME = '/nonexistent/codex-runtime-setup-failed';
 const CONTAINER_CLAUDE_SKILLS_DIR = '/home/node/.claude/skills';
 const CONTAINER_PLUGINS_DIR = '/workspace/plugins';
-/**
- * Plugins whose capability ships in-tree (vendored skill + an agent-runner MCP tool
- * rooted at /workspace/agent). `container-runner.ts` already omits these from the
- * /workspace/plugins mount, so in production they never reach this code — but we skip
- * them explicitly anyway. Registering one natively would double-deliver the skill
- * (in-tree copy + namespaced plugin copy) AND start the plugin's own MCP server rooted
- * at the plugin cache instead of /workspace/agent. That exact failure already happened
- * once via the host `~/.codex` cache; relying on a mount rule in a distant file to
- * prevent it is not a guarantee worth betting on. Keep in sync with
- * `IN_TREE_SHADOWED_PLUGINS` in src/container-runner.ts.
- */
-const IN_TREE_SHADOWED_PLUGINS = new Set(['design-artifact-loop', 'gitnexus']);
 // Runtime-agnostic skill discovery path. Codex auto-scans this in addition
 // to $CODEX_HOME/skills/ — verified empirically via `codex debug
 // prompt-input` (~/.agents/skills/ appears as discovery root `r1`).
@@ -351,7 +339,7 @@ function failClosed(what: string, err: unknown): string {
  * and its SessionStart role installer are silently inert in Codex containers.
  *
  * Keyed off `planCodexPluginRegistration`, so a plugin excluded from
- * registration (deny-sibling, in-tree-shadowed, no manifest) is never trusted.
+ * registration (deny-sibling, no manifest) is never trusted.
  */
 function pluginHookTrustEntries(pluginsRoot: string): CodexHookTrustEntry[] {
   if (!fs.existsSync(pluginsRoot)) return [];
@@ -879,12 +867,11 @@ export interface CodexPluginRegistrationPlan {
  * (deny-sibling routing, manifest presence, name resolution) is unit-testable
  * against a fake plugins root with no subprocess involved.
  *
- * A per-group `excludePlugins` TOP-LEVEL entry, and `IN_TREE_SHADOWED_PLUGINS`,
- * need no handling here — `container-runner.ts` omits those from the
+ * A per-group `excludePlugins` TOP-LEVEL entry, and the in-tree-shadowed
+ * plugins, need no handling here — `container-runner.ts` omits those from the
  * `/workspace/plugins` mount before the container ever starts, so they simply
- * never appear as entries in `pluginsRoot`. The top-level check below is
- * therefore belt-and-braces, and cheap: it costs one Set lookup and it is what
- * makes this walker's answer stand on its own rather than on the mount builder.
+ * never appear as entries in `pluginsRoot`. The top-level `excludePlugins`
+ * check below is belt-and-braces, and cheap: one Set lookup.
  *
  * A SUB-PLUGIN path entry IS handled here, because the host mounts the repo
  * whole and only this walker knows which sub-plugins it would have registered.
@@ -914,10 +901,6 @@ export function planCodexPluginRegistration(
     }
     if (!isDirectorySafe(dir)) {
       plans.push({ name, action: 'skip', reason: 'not-a-directory' });
-      continue;
-    }
-    if (IN_TREE_SHADOWED_PLUGINS.has(name)) {
-      plans.push({ name, action: 'skip', reason: 'in-tree-shadowed' });
       continue;
     }
     if (readPluginDenySiblings(dir).has('codex')) {

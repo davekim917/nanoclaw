@@ -182,8 +182,7 @@ export function isCredentialQueryKey(key: string): boolean {
  * [A-Za-z0-9_-] to `_` when forming MCP tool call prefixes
  * (`mcp__<name>__<tool>`) for permission matching — so unvalidated names
  * can collide. Allowlist the charset at every entry point so no downstream
- * writer has to defend. Mirrored in
- * `container/agent-runner/src/mcp-tools/self-mod.ts`; keep the two in sync.
+ * writer has to defend.
  */
 const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 /**
@@ -367,10 +366,6 @@ export function validateMcpServerName(name: string): void {
  *   `User-Agent: "测试"` passed a control-character-only check and then
  *   failed when the actual MCP connection tried to send it — the server was
  *   approved and restarted, then unusable.
- *
- * Mirrored as `normalizeMcpHeaders` in
- * `container/agent-runner/src/mcp-tools/self-mod.ts` — there are no shared
- * modules across the host/container boundary; keep the two in sync.
  */
 function normalizeMcpHeaders(raw: unknown): Record<string, string> {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
@@ -420,11 +415,8 @@ function normalizeMcpHeaders(raw: unknown): Record<string, string> {
 /**
  * Parse one CLI, template, or approval payload into the persisted MCP config
  * shape. Exactly one of `command` (local stdio subprocess) or `url` (remote
- * Streamable HTTP) is required.
- *
- * Duplicated in `container/agent-runner/src/mcp-tools/self-mod.ts`
- * (`parseMcpServerInput`) — there are no shared modules across the
- * host/container boundary; keep the two in sync.
+ * Streamable HTTP) is required. The only validator of an agent's
+ * `add_mcp_server` request: the container forwards raw fields.
  */
 export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpServerConfig {
   const declaredType = input.type === undefined ? undefined : String(input.type);
