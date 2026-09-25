@@ -7,11 +7,10 @@
  * `codex-review.sh push`, which is the only push path the skill sanctions.
  *
  * A container agent does not push through a shell. It calls the `git_push`
- * MCP tool, so for it the skill's push path is instruction-only — and
- * instruction-only is exactly what failed before: the advisory detector
- * reported CHURN for eight rounds of one PR while every round patched
- * another site. So the gate is hoisted to the primitive the container
- * actually routes through.
+ * MCP tool, so for it the skill's push path is instruction-only, and an
+ * advisory CHURN report does not stop an agent from patching one more site
+ * each round. So the gate is hoisted to the primitive the container actually
+ * routes through.
  *
  * The decision itself is NOT reimplemented here. This runs the one
  * implementation, `codex-review.sh gate`, out of the read-only skill mount —
