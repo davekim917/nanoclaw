@@ -635,9 +635,11 @@ replaces_state() {
   case "$status" in
     0)
       required=$(printf '%s' "$config" | jq -r '
-        if type != "object" then error("not a JSON object") else (.requireReplacesLine // false) end
-        | if type == "boolean" then (if . then "required" else "optional" end)
-          else error("requireReplacesLine is not a boolean") end') || return 1
+        if type != "object" then error("not a JSON object")
+        elif has("requireReplacesLine") | not then "optional"
+        elif .requireReplacesLine | type != "boolean" then error("requireReplacesLine is not a boolean")
+        elif .requireReplacesLine then "required"
+        else "optional" end') || return 1
       ;;
     3) required=optional ;;
     *) return 1 ;;

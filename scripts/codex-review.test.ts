@@ -2689,6 +2689,8 @@ describe('codex-review risk-scoped review requests', () => {
       ['is not JSON', `review-loop--${BASE_OID}.json`, 'requireReplacesLine: true\n'],
       ['is not an object', `review-loop--${BASE_OID}.json`, '[true]\n'],
       ['sets requireReplacesLine to a string', `review-loop--${BASE_OID}.json`, '{ "requireReplacesLine": "yes" }\n'],
+      ['sets requireReplacesLine to null', `review-loop--${BASE_OID}.json`, '{ "requireReplacesLine": null }\n'],
+      ['sets requireReplacesLine to a number', `review-loop--${BASE_OID}.json`, '{ "requireReplacesLine": 1 }\n'],
       ['is empty', `review-loop--${BASE_OID}.json`, ''],
     ])('gives no verdict, and never a pass, when the base opt-in %s', (_case, name, content) => {
       const root = tempRoot();
