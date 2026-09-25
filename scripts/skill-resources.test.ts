@@ -34,11 +34,6 @@ const SKILL_ONLY_EXPORTS: Record<string, unknown> = { getAllUsers };
 
 /** Skill code files no copy step installs, and why. */
 const NOT_INSTALLED: ReadonlyArray<{ prefix: string; reason: string }> = [
-  {
-    prefix: '.claude/skills/add-opencode/tests/opencode-dockerfile.test.ts',
-    reason:
-      'SKILL.md has no copy step for it (REMOVE.md deletes src/opencode-dockerfile.test.ts), so no install location to check',
-  },
   { prefix: '.claude/skills/add-whatsapp/scripts/', reason: 'run in place with pnpm exec tsx' },
   { prefix: '.claude/skills/add-wechat/scripts/', reason: 'run in place with pnpm exec tsx' },
   {
