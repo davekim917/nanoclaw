@@ -71,19 +71,15 @@ export function registerSlashCommandHandler(command: string, handler: SlashComma
   slashCommandHandlers.set(command, handler);
 }
 
-export function clearSlashCommandHandlers(): void {
-  slashCommandHandlers.clear();
-}
-
 /** Which dispatch an inboundFilter call is serving. */
-export interface InboundFilterContext {
+interface InboundFilterContext {
   /** True on the missed-message recovery scan, false on live dispatch. */
   recovered: boolean;
 }
 
 /** Extract reply context from a platform-specific raw message. Return null if no reply. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type ReplyContextExtractor = (raw: Record<string, any>) => ReplyContext | null;
+type ReplyContextExtractor = (raw: Record<string, any>) => ReplyContext | null;
 
 /**
  * Recover readable content a platform adapter left only in `message.raw`.
@@ -850,7 +846,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
    * Some adapters don't expose isDM (older plugin builds); returns undefined
    * so the router falls back to its own default — is_group=1
    * (group/mention-safe) when message.isGroup is also unset, rather than
-   * this function guessing (router.ts:599,608).
+   * this function guessing.
    */
   function adapterIsDM(a: typeof adapter, threadId: string): boolean | undefined {
     const fn = (a as unknown as { isDM?: (t: string) => boolean }).isDM;
@@ -1233,10 +1229,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         //
         // No edit is needed to acknowledge the click: the adapter acks the
         // platform event itself (Slack answers block_actions 200 before
-        // dispatch, @chat-adapter/slack dist/index.js:1408-1411).
+        // dispatch).
         //
         // `action` is set only on a pending_approvals render
-        // (db/sessions.ts:819-824), and it comes from the render read above,
+        // (db/sessions.ts), and it comes from the render read above,
         // not a second one: a row the winning click deletes in between would
         // otherwise read as "not an approval" and fall through to the edit.
         if (render?.action !== undefined) {
@@ -1399,7 +1395,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // delivery anyway, so visual truncation here is acceptable.
         // An agent correcting its own reply keeps the status line: the runner
         // stamps edit_message rows the same way it stamps the reply they
-        // replace (#1016). Status-bubble edits carry no subtext, so they are
+        // replace. Status-bubble edits carry no subtext, so they are
         // unaffected. Budget the footer before truncating, as the post path
         // does, so Discord's in-text rendering cannot push past the limit.
         const editSubtext =
@@ -2221,8 +2217,8 @@ export async function handleForwardedEvent(
           // An approval card, classified from the render read above (see the
           // Chat SDK path for why none is edited here): acknowledge without
           // touching the message (type 6, DEFERRED_UPDATE_MESSAGE —
-          // InteractionResponseType.DeferredMessageUpdate, discord-api-types
-          // payloads/v10/_interactions/responses.d.ts:66-69). The host edits
+          // InteractionResponseType.DeferredMessageUpdate in discord-api-types).
+          // The host edits
           // the card the row names, once the click is bound and authorized.
           try {
             await fetch(`https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`, {

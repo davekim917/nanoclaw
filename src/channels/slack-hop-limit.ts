@@ -71,13 +71,8 @@ function readMaxBotHops(): number {
   return cached.maxHops;
 }
 
-/** Reset the TTL cache. Tests only. */
-export function resetMaxBotHopsCache(): void {
-  cached = null;
-}
-
 /** The inbound facts the governor needs, projected off the Chat SDK message. */
-export interface HopInbound {
+interface HopInbound {
   /** Thread the message arrived in — the counter key. */
   threadId: string;
   /** Authored by one of OUR bots in this workspace. */

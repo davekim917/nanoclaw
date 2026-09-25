@@ -71,12 +71,12 @@ function normalizeName(name: string): string {
  * Markdown links, angle-bracket entities and bare URLs are consumed whole and
  * returned untouched, so a `#` inside them is never rewritten. A channel
  * reference is `#` + a name that starts with a letter or digit and is not
- * glued to a preceding word (`APP#2135`), path or URL fragment.
+ * glued to a preceding word (`APP#<n>`), path or URL fragment.
  */
 const TOKEN_RE =
   /\[[^\]\n]*\]\([^)\s]*\)|<[^>\n]*>|https?:\/\/[^\s)>\]]+|(?<![\w/:=?&#-])#([a-z0-9][a-z0-9_-]*)(?![\w-])/giu;
 
-export function linkChannelNames(text: string, resolve: (name: string) => string | null): string {
+function linkChannelNames(text: string, resolve: (name: string) => string | null): string {
   return transformOutsideProtectedRegions(text, (segment) =>
     segment.replace(TOKEN_RE, (match: string, name: string | undefined) => {
       if (name === undefined || /^\d+$/.test(name)) return match;

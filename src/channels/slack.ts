@@ -373,7 +373,7 @@ export async function discoverSlackRecoveryTargets(
  * keeps env-var names readable when an underscore appears (e.g.
  * SLACK_BOT_TOKEN_EXAMPLE_LABS_CODEX) while producing a channelType that
  * matches the existing dash-separated convention (slack-example-labs-codex).
- * The reverse direction at channel-auto-wire/index.ts:67 already maps
+ * The reverse direction in channel-auto-wire/index.ts already maps
  * `-` → `_` when building env-var lookups, so the round-trip is stable.
  */
 

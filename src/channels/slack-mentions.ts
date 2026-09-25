@@ -323,7 +323,7 @@ export function resolveSlackMentions(
   // Slack usernames allow `[a-z0-9._-]` per Slack's user-handle rules.
   // Composed as a base + optional `.SUFFIX` segments so a trailing
   // sentence-ending period ("Your turn, @helper-codex.") doesn't get
-  // gobbled into the capture — matches Discord's pattern in discord.ts:328.
+  // gobbled into the capture — matches Discord's pattern in discord.ts.
   //
   // Boundary: `(?<![\w/:])` keeps `user@domain.com` from parsing as
   // `@domain.com` AND skips `@`-after-URL-path/scheme cases like
@@ -586,7 +586,7 @@ export async function fetchSlackBotIdentity(client: SlackAuthTestClient): Promis
  * Fire-and-forget — call from the adapter factory with `void`. Channel
  * adapters init serially during host boot, so awaiting this would extend
  * boot latency by up to 5s per Slack workspace when Slack's profile API is
- * slow (codex P2 review on PR #111). Running it after `registerSlackBot` lets
+ * slow. Running it after `registerSlackBot` lets
  * the rewriter already resolve outbound mentions on the `username` key
  * while the profile call fans out in the background; once the profile
  * arrives, the registry entry gains `displayName` + `realName` aliases.
@@ -649,7 +649,7 @@ export async function upgradeSlackBotProfile(
  * Was a single regex — `` /(`{3,}[\s\S]*?`{3,}|``[\s\S]*?``|`[^`\n]+`)/g ``.
  * Its `` `{3,}…`{3,} `` alternative accepted ANY run of 3+ backticks as a
  * closer, so a longer fence wrapping content that itself contained a
- * shorter 3+ run closed early and leaked the rest as prose (#256, e.g.
+ * shorter 3+ run closed early and leaked the rest as prose (e.g.
  * ` ```` ```<@UBOT> ship ```` `). This scanner instead requires the closer
  * to be a run at least as long as the opener, which is what actually closes
  * a fence — the same rule CommonMark uses.

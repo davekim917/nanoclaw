@@ -260,7 +260,7 @@ export const UPDATE_CONTAINER_PROMPT = [
   '- bootstrap: Codex-synced files; these belong in a separate bootstrap-repository PR.',
   'Latest stable includes major versions. Show the exact item IDs and ask which IDs to update. This is the approval gate; do not clone, edit, branch, commit, push, or open a PR before the user answers.',
   '',
-  // Added after @onecli-sh/sdk ^0.5.0 -> ^2.8.0 (#135) took the whole fleet down
+  // Added after an @onecli-sh/sdk ^0.5.0 -> ^2.8.0 bump took the whole fleet down
   // on 2026-07-25. That bump passed every gate the prompt asked for: it touched
   // only package.json + pnpm-lock.yaml, build and tests were green, and the
   // method names the host calls were unchanged across both majors. Only the HTTP

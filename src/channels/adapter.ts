@@ -89,7 +89,7 @@ export interface InboundEvent {
    * message.isGroup also undefined means the adapter told us nothing —
    * router now defaults to is_group=1 (group/mention-safe) rather than
    * DM-style, since treating an actual group chat as a DM means
-   * always-engage on every message (router.ts:599,608).
+   * always-engage on every message.
    */
   isDM?: boolean;
   /** Internal replay marker identifying platform-history catch-up. */
@@ -159,7 +159,7 @@ export interface InboundMessage {
    * isGroup also undefined) means the adapter didn't tell us → router
    * defaults to is_group=1 (group/mention-safe): an adapter that never
    * reports either field and turns out to be a real group chat must not
-   * get always-engage treatment (router.ts:599,608).
+   * get always-engage treatment.
    */
   isDM?: boolean;
   /** Inverse of isDM. Kept alongside for upstream code paths that key off isGroup. */
@@ -463,7 +463,7 @@ export interface ChannelAdapter {
 }
 
 /** Factory function that creates a channel adapter (returns null if credentials missing). */
-export type ChannelAdapterFactory = () => ChannelAdapter | Promise<ChannelAdapter> | null;
+type ChannelAdapterFactory = () => ChannelAdapter | Promise<ChannelAdapter> | null;
 
 /** Registration entry for a channel adapter. */
 export interface ChannelRegistration {

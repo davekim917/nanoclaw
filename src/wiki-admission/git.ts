@@ -55,7 +55,7 @@ export class WikiGit {
     const command = safeGitArgs(args);
     if (remote) {
       // Override safeGitArgs' LOCAL inspection defaults. This trusted hook is
-      // mandatory for remote writes (managed-git-hooks.ts:333-364).
+      // mandatory for remote writes (managed-git-hooks.ts).
       command.splice(
         command.length - args.length,
         0,
