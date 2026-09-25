@@ -337,7 +337,7 @@
 "container/agent-runner/src/poll-loop.midturn-resultdoor.test.ts":{"diff":521,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/poll-loop.midturn.test.ts":{"diff":421,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/poll-loop.test.ts":{"diff":5889,"mode":"100644","sha256":"449264816c2aeb54403fbad57d779f8deb7d3ce4a0f9415a0f3c79e382fe8a8d"},
-"container/agent-runner/src/poll-loop.ts":{"diff":4270,"mode":"100644","sha256":"481336cdcb536b41c6948096afd9fedd655713fa4035f5939abbe5b8ab9b3a8e"},
+"container/agent-runner/src/poll-loop.ts":{"diff":4077,"mode":"100644","sha256":"3a0531515204c2d7c8b294066cf93a34789325f2abb5c1860cfbcc8d687071a8"},
 "container/agent-runner/src/providers/__fixtures__/sdk-midturn-recordings.json":{"diff":749,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/providers/claude.compact-boundary.test.ts":{"diff":0,"mode":"100644","sha256":"bcfc2f357b90380ecc261441e5f2fbdd063e023a78e0b9cbd9120a96f77bdb26"},
 "container/agent-runner/src/providers/claude.fast-mode.test.ts":{"diff":76,"mode":"100644","sha256":null,"deleted":true},
