@@ -42,7 +42,7 @@ export function workgroupSharedDir(workgroupId: string, dataDir: string = DATA_D
 export const WORKGROUP_CONTAINER_PATH = '/workspace/workgroup';
 export const WORKGROUP_MEMORY_CONTAINER_PATH = `${WORKGROUP_CONTAINER_PATH}/memory`;
 
-export interface InventoriedSource {
+interface InventoriedSource {
   groupId: string;
   folder: string;
   path: string;
@@ -648,18 +648,41 @@ export function sharedDirsReconcileWouldChange(
     moved.push(name);
   }
 
-  for (const sf of siblingFolders) {
-    const sdir = path.join(groupsDir, sf);
+  for (const link of siblingSharedLinks(groupsDir, siblingFolders, moved)) {
+    if (link.state === 'repoint') return true; // the repoint would fire
+  }
+  return false;
+}
+
+interface SiblingSharedLink {
+  sibling: string;
+  name: string;
+  linkPath: string;
+  lst: fs.Stats | null;
+  /** `current`: already points at the mount. `real`: the sibling owns a real entry — never clobbered. */
+  state: 'current' | 'real' | 'repoint';
+}
+
+function* siblingSharedLinks(
+  groupsDir: string,
+  siblingFolders: string[],
+  moved: string[],
+): Generator<SiblingSharedLink> {
+  for (const sibling of siblingFolders) {
+    const sdir = path.join(groupsDir, sibling);
     if (!fs.existsSync(sdir)) continue;
     for (const name of moved) {
       const linkPath = path.join(sdir, name);
       const lst = lstatOrNull(linkPath);
-      if (lst?.isSymbolicLink() && safeReadlink(linkPath) === `${WORKGROUP_CONTAINER_PATH}/${name}`) continue;
-      if (lst && !lst.isSymbolicLink()) continue; // sibling owns a real entry — never clobbered
-      return true; // the repoint would fire
+      const state =
+        lst?.isSymbolicLink() && safeReadlink(linkPath) === `${WORKGROUP_CONTAINER_PATH}/${name}`
+          ? 'current'
+          : lst && !lst.isSymbolicLink()
+            ? 'real'
+            : 'repoint';
+      yield { sibling, name, linkPath, lst, state };
     }
   }
-  return false;
 }
 
 function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: string, dataDir: string): void {
@@ -744,28 +767,21 @@ function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: str
   }
 
   // ── Repoint every sibling's old symlink to the shared mount ───────────────
-  for (const sf of siblingFolders) {
-    const sdir = path.join(groupsDir, sf);
-    if (!fs.existsSync(sdir)) continue;
-    for (const name of moved) {
-      const linkPath = path.join(sdir, name);
-      const lst = lstatOrNull(linkPath);
-      // Already pointing at the mount — nothing to do. Without this a re-run
-      // would unlink and re-create every sibling's every link on every boot.
-      if (lst?.isSymbolicLink() && safeReadlink(linkPath) === `${WORKGROUP_CONTAINER_PATH}/${name}`) continue;
-      if (lst && !lst.isSymbolicLink()) {
-        // Sibling has its OWN real entry at this name — never clobber it.
-        log.warn('reconcileWorkgroupSharedDirs: sibling has a real entry, not overlaying', {
-          workgroupId,
-          sibling: sf,
-          name,
-        });
-        continue;
-      }
-      if (lst) fs.unlinkSync(linkPath); // remove the now-broken relative symlink
-      fs.symlinkSync(`${WORKGROUP_CONTAINER_PATH}/${name}`, linkPath);
-      changed = true;
+  for (const { sibling, name, linkPath, lst, state } of siblingSharedLinks(groupsDir, siblingFolders, moved)) {
+    // Already pointing at the mount — nothing to do. Without this a re-run
+    // would unlink and re-create every sibling's every link on every boot.
+    if (state === 'current') continue;
+    if (state === 'real') {
+      log.warn('reconcileWorkgroupSharedDirs: sibling has a real entry, not overlaying', {
+        workgroupId,
+        sibling,
+        name,
+      });
+      continue;
     }
+    if (lst) fs.unlinkSync(linkPath); // remove the now-broken relative symlink
+    fs.symlinkSync(`${WORKGROUP_CONTAINER_PATH}/${name}`, linkPath);
+    changed = true;
   }
 
   if (!changed) return; // settled — re-run is a true no-op
@@ -1469,11 +1485,11 @@ function pruneOneWorkgroupCompatLinks(
       // dangling symlink — the opposite of what the listing decided. This can
       // only ever KEEP more links than the listing did.
       if (lstatOrNull(path.join(wgDir, entry.name))) continue;
-      // `reconcileWorkgroupSharedDirs` runs LATER in this same boot
-      // (main.ts:515) and re-derives the established shared set from exactly
-      // these links: a sibling symlink whose name the seed still holds as a
-      // real dir is unioned back in (the union at `:567`, gated on
-      // `isRealDir(seedEntry)` at `:582`; seed folder == workgroup id, `:542`).
+      // `reconcileWorkgroupSharedDirs` runs LATER in this same boot and
+      // re-derives the established shared set from exactly these links: a
+      // sibling symlink whose name the seed still holds as a real dir is
+      // unioned back in (`planWorkgroupSharedDirs`, gated on
+      // `isRealDir(seedEntry)`; seed folder == workgroup id).
       // Deleting one first would silently un-share that directory —
       // it falls into `candidates` and stays private to the seed, with no
       // warn. Keep the link and let the migrator re-point it; the empty

@@ -28,7 +28,7 @@
  * support issues idle for days awaiting an engineer reply, and the watchdog is
  * built to *reap* idle workers — the opposite of what a support thread needs.
  * It reuses only the low-level primitives (postParent → createThread →
- * resolveSession('per-thread') → seed → wake), mirroring dispatch.ts:311-405.
+ * resolveSession('per-thread') → seed → wake), mirroring orchestrator-dispatch.
  *
  * SECURITY: routing is derived from the CALLING session's own messaging group
  * or, for an isolated system task, its host-written messages_in routing
@@ -157,7 +157,7 @@ function announcementText(
  * email carries no area, and every number must already be in range. Anything
  * else drops the whole hint — the email still dispatches exactly as without it.
  */
-export interface SupportTriageView {
+interface SupportTriageView {
   product: string | null;
   areaType: 'feature' | 'process' | 'general';
   area: string | null;
@@ -190,7 +190,7 @@ function triageKey(v: unknown): string | null {
   return typeof v === 'string' && TRIAGE_KEY.test(v) ? v : null;
 }
 
-export function supportTriage(raw: unknown): SupportTriageView | null {
+function supportTriage(raw: unknown): SupportTriageView | null {
   if (!raw || typeof raw !== 'object') return null;
   const t = raw as Record<string, unknown>;
   const areaType = t.areaType;
@@ -223,7 +223,7 @@ function triageArea(t: SupportTriageView): string {
 }
 
 /** Agent-facing: every number, plus the reminder that it is a hint. */
-export function triageContextLine(t: SupportTriageView): string {
+function triageContextLine(t: SupportTriageView): string {
   return (
     `Automatic triage (fast classifier — a hint, not a verdict; the email below is authoritative): ` +
     `product ${t.product ?? 'unknown'} · area ${triageArea(t)} [${t.areaConfidence.toFixed(2)}] · ` +
@@ -470,7 +470,7 @@ async function dispatchSupportIssue(
     threadOpener(sender, date, content.bodyText, linearIssue, triage),
   );
   // chat-sdk needs the encoded thread id (`<platform_id>:<thread>`) for routing,
-  // mirroring orchestrator-dispatch (dispatch.ts:363-364).
+  // mirroring orchestrator-dispatch.
   const encodedThreadId = bareThreadId.includes(':') ? bareThreadId : `${mg.platform_id}:${bareThreadId}`;
 
   const { session: issueSession } = await resolveSession(session.agent_group_id, mg.id, encodedThreadId, 'per-thread');

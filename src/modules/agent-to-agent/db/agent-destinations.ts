@@ -91,22 +91,12 @@ export async function getDestinationByTarget(
 }
 
 /**
- * The `hasDestination` read as a constant: the `a2a.send` guard
+ * The destination-exists read as a constant: the `a2a.send` guard
  * (`../guard.ts`) is synchronous by design (§4.5 I-1) and executes this
  * statement through `withRawDb` inside its caller's lease block.
  */
 export const AGENT_DESTINATION_EXISTS_SQL =
   'SELECT 1 FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ? LIMIT 1';
-
-/** Permission check: can this agent send to this target? */
-export async function hasDestination(
-  agentGroupId: string,
-  targetType: 'channel' | 'agent',
-  targetId: string,
-): Promise<boolean> {
-  const row = await getDb().get(AGENT_DESTINATION_EXISTS_SQL, agentGroupId, targetType, targetId);
-  return row !== undefined;
-}
 
 /**
  * ⚠️  Caller responsibility: after this returns, call
@@ -134,8 +124,8 @@ export async function deleteDestination(agentGroupId: string, localName: string)
  *
  * ⚠️  Caller responsibility: not only does `agentGroupId`'s own session
  * projection need a refresh, but ALSO every OTHER agent group that had
- * `agentGroupId` as a destination target. Use `getDestinationReferencers`
- * below to find them BEFORE calling this (the rows are gone afterwards).
+ * `agentGroupId` as a destination target. Find them BEFORE calling this
+ * (the rows are gone afterwards).
  */
 export async function deleteAllDestinationsTouching(agentGroupId: string): Promise<void> {
   await getDb().run(
@@ -145,22 +135,6 @@ export async function deleteAllDestinationsTouching(agentGroupId: string): Promi
     agentGroupId,
   );
   await deletePoliciesTouching(agentGroupId);
-}
-
-/**
- * Return the list of agent_group_ids that currently have a destination
- * row pointing at `targetAgentGroupId`. Call this BEFORE
- * `deleteAllDestinationsTouching` if you need to know whose session
- * projections to refresh after the delete — the rows are gone once the
- * delete runs.
- */
-export async function getDestinationReferencers(targetAgentGroupId: string): Promise<string[]> {
-  const rows = await getDb().all<{ agent_group_id: string }>(
-    "SELECT DISTINCT agent_group_id FROM agent_destinations WHERE target_type = 'agent' AND target_id = ? AND agent_group_id != ?",
-    targetAgentGroupId,
-    targetAgentGroupId,
-  );
-  return rows.map((r) => r.agent_group_id);
 }
 
 /** Normalize a human-readable name into a lowercase, dash-separated identifier. */

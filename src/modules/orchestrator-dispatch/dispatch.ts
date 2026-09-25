@@ -99,8 +99,7 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
   // it IMMEDIATE (write lock from BEGIN) so the cap-count read holds the write
   // lock through the INSERT — prevents two parallel delivery drains from the
   // same orchestrator both reading the same count, both passing the cap check,
-  // and both succeeding INSERT (cap exceeded). Cycle-3 S3-C /
-  // Concurrency-reviewer #5. The closure is DB-only: every notification, wake
+  // and both succeeding INSERT (cap exceeded). The closure is DB-only: every notification, wake
   // and dashboard event below runs after commit, never after a rollback.
   let taskRow: Task | null = null;
   let replayResult: { message: string } | null = null;
@@ -108,7 +107,7 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
 
   await centralTransaction(async () => {
     // Step 0: Auth — the caller's agent_group must hold the orchestrator
-    // capability, read INSIDE the transaction (fork issue #452, site 1). Read
+    // capability, read INSIDE the transaction. Read
     // before the closure, the awaited check yields, and a `revokeCapability`
     // landing in that window admits one task after the revoke. Under BEGIN
     // IMMEDIATE the revoke either commits before this read (rejected here) or
@@ -317,7 +316,7 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
   const taskId = task.task_id;
 
   // Resolve adapter — if adapter no longer has createThread, mark failed immediately
-  // (adapter_unavailable does NOT consume retry budget — cycle-3 fix / Codex #43)
+  // (adapter_unavailable does NOT consume retry budget)
   const mg = task.parent_messaging_group_id ? await getMessagingGroup(task.parent_messaging_group_id) : undefined;
   if (!mg) {
     await transitionToTerminal(taskId, 'failed', {

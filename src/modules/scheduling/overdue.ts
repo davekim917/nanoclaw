@@ -38,8 +38,8 @@ import { parseSqliteUtc, sqliteUtcToIso } from '../mailbox/sqlite-utc.js';
  * that has no legitimate reason to last longer on a daily series than on a
  * 5-minute one. A spawn queue or a provider park that lasts an hour is itself
  * worth the DM. Sixty sweep ticks is also far past any retry backoff
- * (`BACKOFF_BASE_MS * 2 ** MAX_TRIES`, src/modules/sweep-session-core/index.ts:47-48,
- * tops out under 3 minutes).
+ * (`BACKOFF_BASE_MS * 2 ** MAX_TRIES` in sweep-session-core tops out under
+ * 3 minutes).
  */
 export const TASK_OVERDUE_ALERT_MS = 60 * 60 * 1000;
 
@@ -85,7 +85,7 @@ export function overdueCutoffMs(nowMs: number, hostUptimeMs: number): number | n
   return hostUptimeMs < TASK_OVERDUE_ALERT_MS ? null : nowMs - TASK_OVERDUE_ALERT_MS;
 }
 
-export function formatOverdueAlert(input: {
+function formatOverdueAlert(input: {
   seriesId: string;
   occurrenceId: string;
   groupName: string;
@@ -145,7 +145,7 @@ export async function escalateOverdueOccurrences(
     const context = { source: 'task-overdue', seriesId, occurrenceId: row.id, sessionId: session.id };
     // The OCCURRENCE is stamped only on a delivery that reached someone — same
     // rule, and same reason, as task-failure-escalation
-    // (src/modules/sweep-task-escalation/index.ts:152-155). A failed attempt
+    // (sweep-task-escalation). A failed attempt
     // leaves it owing, to be retried once the attempt gap has passed.
     if (await notifyOperators(text, context)) {
       const stamped = alerted.get(session.id) ?? new Set<string>();

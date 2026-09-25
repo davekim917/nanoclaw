@@ -4,11 +4,10 @@
  *
  * Self-heal (self-heal.ts) answers "this claim stopped moving, push it". This
  * answers the question that comes first and is cheaper to be certain about:
- * *did the work already land?* Live evidence for why it has to exist —
- * `proj-956-scope-guards` and `proj-smoke-pr941-fixes` both sat `parked` with the
- * note "waiting on <a human>: PR #956 mechanically ready", ~40h after #956
- * merged. Two rows in the Observatory's `needs_you` lane claiming a human owed
- * a decision on work that was already shipped. A false positive in the one lane
+ * *did the work already land?* Without it, claims sit `parked` with a note like
+ * "waiting on <a human>: PR <n> mechanically ready" long after that PR merged —
+ * rows in the Observatory's `needs_you` lane claiming a human owes a decision
+ * on work that already shipped. A false positive in the one lane
  * that has to be trustworthy, and no amount of nudging fixes it: the owner is
  * gone, the work is done, and only the claim file disagrees.
  *
@@ -36,7 +35,7 @@ import { log } from '../../log.js';
 import { claimsBaseDir } from './escalation.js';
 
 /** Scan cadence. Deliberately NOT the 60s host sweep — see `reconcileMergedClaims`. */
-export const RECONCILE_SCAN_INTERVAL_MS = 10 * 60 * 1000;
+const RECONCILE_SCAN_INTERVAL_MS = 10 * 60 * 1000;
 
 /** A hung GitHub call must not hold up the rest of the sweep. */
 const LOOKUP_TIMEOUT_MS = 10_000;
@@ -75,10 +74,10 @@ export function refKey(ref: GitHubRef): string {
 
 /**
  * Below this many digits a number found by INFERENCE is noise, not a reference.
- * With the leading-zero rejection it is what keeps `team-pr966-01-…` from
- * probing #1 — a real, long-since-merged pull request in any active repository.
+ * With the leading-zero rejection it is what keeps `team-pr<n>-01-…` from
+ * probing number 1 — a real, long-since-merged pull request in any active repository.
  *
- * It does not apply to a reference that named its own repository: `org/repo#5`
+ * It does not apply to a reference that named its own repository: `org/repo#<n>`
  * and a pull URL are never accidental, so there is nothing to filter.
  */
 const MIN_INFERRED_REF_DIGITS = 2;
@@ -99,14 +98,14 @@ function pushRef(
 }
 
 const PULL_URL = /https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/(?:pull|issues)\/(\d+)/g;
-/** `owner/repo#123`. The lookbehind stops it matching the tail of a URL or a path. */
+/** `owner/repo#<n>`. The lookbehind stops it matching the tail of a URL or a path. */
 const QUALIFIED = /(?<![\w./-])([\w.-]+)\/([\w.-]+)#(\d+)/g;
 
 /**
  * Every GitHub number a claim carries, from its slug AND its note.
  *
- * Both matter and neither is sufficient: `gh-963.json` encodes 963 in its slug
- * but its note is about #956, and the claim is only finished when #956 lands.
+ * Both matter and neither is sufficient: `gh-<a>.json` encodes <a> in its slug
+ * but its note may be about #<b>, and the claim is only finished when #<b> lands.
  *
  * `defaultRepo` (`owner/repo`) resolves bare numbers. A reference that names its
  * own repository — a URL, or `owner/repo#n` — always wins over it, so a note
@@ -114,8 +113,8 @@ const QUALIFIED = /(?<![\w./-])([\w.-]+)\/([\w.-]+)#(\d+)/g;
  * With no default and no qualified reference, bare numbers yield nothing and the
  * claim is simply left alone.
  *
- * Digit runs are matched whole (`\d+` is greedy), which is what makes `#9561`
- * yield 9561 and never 956.
+ * Digit runs are matched whole (`\d+` is greedy), so a four-digit reference
+ * never also yields its three-digit prefix.
  */
 export function parseGitHubRefs(slug: string, note: string, defaultRepo?: string): GitHubRef[] {
   const refs = new Map<string, GitHubRef>();
@@ -125,7 +124,7 @@ export function parseGitHubRefs(slug: string, note: string, defaultRepo?: string
   for (const m of note.matchAll(QUALIFIED)) pushRef(refs, m[1], m[2], m[3], true);
 
   // Bare `#n` — scanned over a note with the qualified forms blanked out, so
-  // `otherorg/repo#42` cannot also register as `<default-repo>#42`.
+  // `otherorg/repo#<n>` cannot also register as `<default-repo>#<n>`.
   const bare = note.replace(PULL_URL, ' ').replace(QUALIFIED, ' ');
   for (const m of bare.matchAll(/#(\d+)/g)) pushRef(refs, defOwner, defRepo, m[1]);
 
@@ -136,7 +135,7 @@ export function parseGitHubRefs(slug: string, note: string, defaultRepo?: string
   // A number deeper in the slug is not a reference, it is part of the name — in
   // a slug like `team-outreach-deck-brand-1800-x` the 1800 is a product name.
   // Probing those is not merely wasteful: today they 404, but once the
-  // repository reaches #1800 the same slug silently starts resolving to real,
+  // repository reaches that number the same slug silently starts resolving to real,
   // unrelated work and clearing a live claim.
   const tokens = slug.split('-');
   tokens.forEach((token, i) => {
@@ -158,21 +157,20 @@ export function parseGitHubRefs(slug: string, note: string, defaultRepo?: string
  *
  * The OPEN rule is the whole safety margin, and it is load-bearing rather than
  * defensive. Notes cite merged pull requests as CONTEXT for why work is stuck at
- * least as often as evidence that it finished. Three live claims on 2026-08-22
- * would have been wrongly deleted by "a merged PR is mentioned, therefore done":
+ * least as often as evidence that it finished. Real notes that "a merged PR is
+ * mentioned, therefore done" would have wrongly deleted:
  *
- *   gh-526  "PR #520 … found insufficient … wait for the ruling"  — #520 MERGED
- *   gh-723  "PR #737 fixed only the approval-linked door"          — #737 MERGED
- *   gh-522  "nothing for a fixer to do until QA re-verifies"       — #511 MERGED
+ *   "PR <n> … found insufficient … wait for the ruling"   — <n> MERGED
+ *   "PR <n> fixed only the approval-linked door"           — <n> MERGED
+ *   "nothing for a fixer to do until QA re-verifies"       — a cited PR MERGED
  *
- * In all three the merge is real and the work is not done — and GitHub already
+ * In each the merge is real and the work is not done — and GitHub already
  * knows, because a human reopened the issue the slug names. Asking about every
  * reference rather than only the pull requests is what lets that reopen speak.
  *
  * The mirror case is why this is not "every reference must be merged":
- * `proj-smoke-pr941-fixes` cites #941, a deliberately-never-merged
- * `[smoke freeze] do not merge` branch, alongside the #956 that actually
- * shipped. A closed-unmerged reference is a dead end, not pending work.
+ * a claim can cite a deliberately-never-merged `[smoke freeze] do not merge`
+ * PR alongside the PR that actually shipped. A closed-unmerged reference is a dead end, not pending work.
  */
 export function decideReconcile(states: RefState[]): 'clear' | 'keep' {
   if (states.includes('open')) return 'keep';
@@ -301,10 +299,10 @@ async function githubLookup(ref: GitHubRef, token: string): Promise<RefLookup> {
  * There is deliberately no inference here. A workgroup routinely has a dozen
  * canonical repositories, numbers are per-repo and collide densely across them,
  * so "try them all" would clear a claim on the strength of an unrelated
- * repository's #956. Unset means bare numbers resolve to nothing and only
+ * repository's same-numbered PR. Unset means bare numbers resolve to nothing and only
  * fully-qualified references reconcile — the honest answer, not a degraded one.
  */
-export function defaultRepoFor(workgroupId: string): string | undefined {
+function defaultRepoFor(workgroupId: string): string | undefined {
   const scoped = `CLAIMS_PR_REPO_${workgroupId.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
   const env = { ...readEnvFile([scoped, 'CLAIMS_PR_REPO']), ...process.env };
   const value = env[scoped] ?? env.CLAIMS_PR_REPO;
@@ -344,7 +342,7 @@ function listWorkgroupDirs(root: string): string[] {
 let lastRanAtMs = 0;
 
 /** Pure — throttle gate, mirroring the self-heal scan's. */
-export function shouldSkipReconcileScan(lastRan: number, now: number): boolean {
+function shouldSkipReconcileScan(lastRan: number, now: number): boolean {
   return now - lastRan < RECONCILE_SCAN_INTERVAL_MS;
 }
 

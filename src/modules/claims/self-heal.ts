@@ -97,7 +97,7 @@ export function isExplicitlyPaused(raw: { status?: unknown }): boolean {
 // ponytail: word count, not meaning. Upgrade path if junk notes get wordier is
 // the same one the board would need — a note-quality check the skill enforces
 // at write time, in claim.sh, not a classifier here.
-export const HANDOFF_NOTE_MIN_WORDS = 4;
+const HANDOFF_NOTE_MIN_WORDS = 4;
 
 /**
  * A park that told a successor what they need is a COMPLETED action, not a
@@ -117,7 +117,7 @@ export function isHandedOffPark(raw: { status?: unknown; note?: unknown }): bool
 }
 
 /** Ladder state, as stamped on the claim file. No new schema. */
-export interface SelfHealStamps {
+interface SelfHealStamps {
   claimed_at?: unknown;
   auto_nudged_at?: unknown;
   auto_nudge_count?: unknown;
@@ -126,9 +126,9 @@ export interface SelfHealStamps {
   auto_heal_unresolved_at?: unknown;
 }
 
-export type SelfHealAction = 'nudge' | 'takeover' | 'exhaust' | 'escalate-human';
+type SelfHealAction = 'nudge' | 'takeover' | 'exhaust' | 'escalate-human';
 
-export interface SelfHealDecision {
+interface SelfHealDecision {
   action: SelfHealAction | 'none';
   /** 1 or 2 for a nudge — which owner nudge this is. */
   nudge?: number;
@@ -231,7 +231,7 @@ function decideHumanBlocked(
  * board's `stale` state; the exclusions are re-checked here so the decision is
  * testable on its own and cannot be bypassed by a future second caller.
  */
-export function decideSelfHeal(
+function decideSelfHeal(
   claim: BoardClaim,
   raw: SelfHealStamps & { note?: unknown; status?: unknown },
   now: number,
@@ -277,8 +277,8 @@ function claimStateLine(claim: BoardClaim): string {
  * starts a second thread on the same topic, one the owning agent's session is not
  * reading. The link sends them back to the right thread. It is resolved host-side
  * because the agent cannot build it: a Slack thread id carries no workspace URL.
- * `slackPermalink` reads it from the bot identity (slack-mentions.ts:114), which
- * `auth.test` fills at adapter init (slack-mentions.ts:572). Null (no adapter
+ * `slackPermalink` reads it from the bot identity (slack-mentions.ts), which
+ * `auth.test` fills at adapter init. Null (no adapter
  * could build one) adds nothing, so the prompt reads as it did before links.
  */
 function threadLinkLine(threadUrl: string | null | undefined): string {
@@ -392,7 +392,7 @@ export function buildTakeoverPrompt(claim: BoardClaim, threadUrl?: string | null
  * ask has to reach someone. Either way this fires once — `applyDecision` stamps
  * `auto_heal_exhausted_at` on delivery, and the claim is then left red forever.
  */
-export function buildHumanEscalationPrompt(claim: BoardClaim, threadUrl?: string | null): string {
+function buildHumanEscalationPrompt(claim: BoardClaim, threadUrl?: string | null): string {
   const claimSh = 'bash /app/skills/work-claims/claim.sh';
   const hours = Math.max(0, Math.round(claim.staleMs / 3600000));
   const who = namedHuman(claim.note);
@@ -414,7 +414,7 @@ export function buildHumanEscalationPrompt(claim: BoardClaim, threadUrl?: string
 }
 
 /** An agent group wired to the claim's own thread channel. */
-export interface SelfHealTarget {
+interface SelfHealTarget {
   agentGroupId: string;
   messagingGroupId: string;
   /** Display name we matched on, for the log line. */
@@ -576,7 +576,7 @@ interface WiredCandidate {
  *      unaddressed reply is supposed to land (`ncl tasks` help: "Routing (where
  *      an unaddressed reply lands)"). It exists from task-definition time
  *      whether or not the series ever spoke, but the agent picks its real
- *      destination per fire via `send_message` (tasks.ts:715), so it is second
+ *      destination per fire via `send_message`, so it is second
  *      choice, never first.
  *   3. neither — no target. "Unrouted" is the honest answer; the backoff above
  *      is what keeps it from being a loud one.
@@ -667,11 +667,9 @@ async function seriesRoutingStamp(
     import('../mailbox/index.js'),
     import('../../db/connection.js'),
   ]);
-  // Both reads are read-only, so they no longer share a lease block: the stamp
+  // Both reads are read-only, so they do not share a lease block: the stamp
   // read is a synchronous session-DB open and the central lookup that follows
-  // it is one awaited SELECT. Holding the lease across a mailbox file open was
-  // the belt PR 6 needed while this leaf was synchronous, and nothing here
-  // writes, so a row changing between them costs at most one stale nudge
+  // it is one awaited SELECT. Nothing here writes, so a row changing between them costs at most one stale nudge
   // destination — which a later tick re-resolves.
   const stamp = readSessionInbound(
     { agentGroupId, sessionId },
@@ -730,7 +728,7 @@ export async function wiredCandidates(workgroupId: string, threadId: string): Pr
 }
 
 /**
- * `claim.owner` is `$NANOCLAW_ASSISTANT_NAME` (claim.sh:54) — the agent's
+ * `claim.owner` is `$NANOCLAW_ASSISTANT_NAME` (set by claim.sh) — the agent's
  * user-facing name, which varies per channel. So the match runs through the
  * same resolver the spawn path uses to produce that env var, against the
  * channel the claim's thread is in, and falls back to the structural group

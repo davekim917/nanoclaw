@@ -52,10 +52,10 @@ export function declaresItselfFinished(claim: { released_at?: unknown; status?: 
   const note = typeof claim.note === 'string' ? claim.note : '';
 
   // "Released" does NOT mean "done" in practice — agents use it for stepping
-  // OFF work, and say so in the same breath. Two live examples on 2026-08-13,
-  // both carrying released_at AND status:"released":
-  //   xzo-gh-522-618      "RELEASED, not done. … needs a QA re-verification run only"
-  //   xzo-gh-571-600      "RELEASED, HELD not done. PR #768 … 8 review threads open"
+  // OFF work, and say so in the same breath. Two real shapes, both carrying
+  // released_at AND status:"released":
+  //   "RELEASED, not done. … needs a QA re-verification run only"
+  //   "RELEASED, HELD not done. PR <n> … 8 review threads open"
   // The second is an open do-not-merge PR that nobody owns. Treating those as
   // finished filtered them off the board AND exempted them from escalation, so
   // the one state this whole system exists to surface — open work with no
