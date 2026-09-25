@@ -28,6 +28,7 @@ import { getOwners } from '../modules/permissions/db/user-roles.js';
 import { transformOutsideProtectedRegions } from '../text-styles.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
+import { linkDiscordChannelNames } from './channel-links.js';
 import type { ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
 
 interface DiscordRecoveryThread {
@@ -1062,7 +1063,7 @@ for (const ws of workspaces) {
         // to `<@id>` is then passed through rewriteDiscordLinks unchanged
         // (the link rewriter only touches markdown links and bare URLs, never
         // mention syntax).
-        transformOutboundMarkdown: (text) => rewriteDiscordLinks(resolveDiscordMentions(text)),
+        transformOutboundMarkdown: (text) => linkDiscordChannelNames(rewriteDiscordLinks(resolveDiscordMentions(text))),
         // Discord's own small-print syntax: `-# ` at the START of a line
         // renders that line smaller and grayed (subtext, added 2024, desktop
         // and mobile). It is ordinary message markdown, so unlike Slack this
