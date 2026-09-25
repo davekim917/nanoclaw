@@ -5,6 +5,10 @@ import path from 'node:path';
 
 import { afterAll, beforeEach } from 'vitest';
 
+import { stripInheritedGitEnv } from './test-git-env.js';
+
+stripInheritedGitEnv();
+
 const createdRoots: string[] = [];
 
 /**

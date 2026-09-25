@@ -204,3 +204,17 @@ describe('hermeticity tripwire', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 });
+
+describe('inherited GIT_* environment', () => {
+  test('is dropped by the preload before any test runs', () => {
+    expect(Object.keys(process.env).filter((key) => key.startsWith('GIT_'))).toEqual([]);
+  });
+
+  test('does not reach a child spawned without an explicit env', () => {
+    allowSubprocess(['env']);
+    const childEnv = execFileSync('env', { encoding: 'utf8' });
+    const direct = new TextDecoder().decode(Bun.spawnSync(['env']).stdout);
+    expect(childEnv.split('\n').filter((line) => line.startsWith('GIT_'))).toEqual([]);
+    expect(direct.split('\n').filter((line) => line.startsWith('GIT_'))).toEqual([]);
+  });
+});

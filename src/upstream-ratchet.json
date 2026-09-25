@@ -942,7 +942,7 @@
 "src/templates/restamp.ts":{"diff":546,"mode":"100644","sha256":null,"deleted":true},
 "src/templates/skills.ts":{"diff":0,"mode":"100644","sha256":"7b372c4582745f09ef714b00bb2b9d2e4c4b3929f657aab04c4c620a9d96b537"},
 "src/templates/tasks.ts":{"diff":52,"mode":"100644","sha256":"9c58cddef946bb3d944c8963d4e952bbb944fd22359bf507da37cf751db8937a"},
-"src/test-setup.ts":{"diff":46,"mode":"100644","sha256":"a22735f733e8c2ec2e3ad30adf7a34edeab6fab9f9794acf0f8da7c623acba69"},
+"src/test-setup.ts":{"diff":50,"mode":"100644","sha256":"c2464e632155cc424960abe43beae518c0f83351f840b9558c35f12fc711edf4"},
 "src/timezone.test.ts":{"diff":74,"mode":"100644","sha256":"05191c37fab238d037447f07c70d9ec4e32413601dbbddb7b838d5e3341728b8"},
 "src/timezone.ts":{"diff":126,"mode":"100644","sha256":"51dea034048d939ef1d3ad895e2d186f9f2e31637c116b85ac09316e7acac981"},
 "src/types.ts":{"diff":211,"mode":"100644","sha256":"88da90b6fbb85521aebfa12064a78d73cc48b1b93467946076156e022c6c7e58"},
