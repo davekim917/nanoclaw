@@ -50,7 +50,13 @@
     "scripts/jev-shadow/routing.ts",
     "scripts/jev-shadow/silent.ts",
     "scripts/jev-shadow/size.ts",
-    "scripts/jev-shadow/watcher.ts"
+    "scripts/jev-shadow/watcher.ts",
+    "scripts/lookback.ts",
+    "scripts/outcome-reporting-status.ts",
+    "scripts/bust-slack-profile-cache.ts",
+    "scripts/run-migrations.ts",
+    "scripts/seed-discord.ts",
+    "scripts/sanity-live-poll.ts"
   ],
   "project": ["src/**/*.ts", "setup/**/*.ts", "scripts/**/*.{ts,mjs}"],
   "ignoreFiles": ["src/db/transaction-fixtures/**"],
