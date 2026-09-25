@@ -1,5 +1,5 @@
 /**
- * Test hermeticity tripwire for the agent-runner suite (issue #305).
+ * Test hermeticity tripwire for the agent-runner suite.
  *
  * The host counterpart lives at `src/test-hermeticity.ts` and carries the full
  * rationale. Short version: unit tests must not shell out, hit the network, or

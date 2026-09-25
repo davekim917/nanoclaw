@@ -77,10 +77,8 @@ export function getInboundDb(): Database {
  * Under a test runner (bun sets NODE_ENV=test) a test that never called
  * initTestSessionDb() must not silently create the production-path session
  * DB. Every session_state / telemetry writer funnels through getOutboundDb —
- * `sqliteGetState`/`sqliteSetState` (mailbox/sqlite/operations.ts:230-247),
- * the session-state transactions (modules/mailbox/session-state.ts:96, :304,
- * :314) and `recordRateLimitSamples` (modules/mailbox/rate-limit-samples.ts:73)
- * — so this is the one place the invariant "tests never touch
+ * `sqliteGetState`/`sqliteSetState`, the session-state transactions and
+ * `recordRateLimitSamples` — so this is the one place the invariant "tests never touch
  * /workspace/outbound.db" is enforced, rather than re-discovered at each
  * caller (credential-slot persistence was found this way twice). A new
  * writer that opens its own Database handle bypasses it; grep for

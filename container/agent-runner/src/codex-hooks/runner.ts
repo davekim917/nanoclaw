@@ -89,9 +89,9 @@ export type HookEvent = 'PreToolUse' | 'PostToolUse' | 'PostToolUseFailure';
 // the plugin side is workflow-agents/hooks/codex-guard.ts.
 //
 // It was wired here because Codex did NOT fire plugin-provided hooks under
-// app-server or exec. That premise is GONE: #827 writes the `[hooks.state.*]`
-// trust entries that make codex dispatch plugin hooks, and #832 refuses the
-// spawn unless the generated chain reads back dispatchable. So in a Codex
+// app-server or exec. That premise is GONE: the spawn writes the `[hooks.state.*]`
+// trust entries that make codex dispatch plugin hooks, and refuses the spawn
+// unless the generated chain reads back dispatchable. So in a Codex
 // container BOTH adapters now run on every tool call — concurrently, with the
 // same `tool_use_id` (codex-rs 0.154.0 `hooks/src/engine/dispatcher.rs` pushes
 // every matched handler onto a `FuturesUnordered`; measured 0.7 ms apart).
@@ -170,7 +170,7 @@ async function loadGuardCore(): Promise<GuardCoreLoad> {
 /** A guard core's evaluateBashCommand may return garbage even when it passes
  *  the load-time export-type check. Every verdict — initial AND the post-approval
  *  skipGate re-checks — must be shape-validated; an unknown/missing action denies
- *  (fail-closed), never falls through to allow. QA codex re-pass #2. */
+ *  (fail-closed), never falls through to allow. */
 function wellFormedVerdict(v: unknown): v is { action: 'allow' | 'block' | 'gate'; reason?: string } {
   const action = (v as { action?: unknown } | null | undefined)?.action;
   return action === 'allow' || action === 'block' || action === 'gate';
@@ -223,7 +223,7 @@ async function runDestructiveGuard(
   // would otherwise fall through `verdict.action` access (the prior `.action`
   // read sat outside the try/catch and would throw, escaping to the CLI's
   // fail-open path). The SAME check is applied to the post-approval skipGate
-  // re-checks below (QA codex re-pass #2) — every evaluateBashCommand result is
+  // re-checks below — every evaluateBashCommand result is
   // shape-validated, never just the first.
   if (!wellFormedVerdict(verdict)) {
     return denyDecision(
@@ -238,13 +238,13 @@ async function runDestructiveGuard(
   try {
     // STRICT boolean: a malformed core could return a truthy non-boolean ({}, a
     // non-empty string) — only an exact `true` counts as "already approved".
-    // Anything else falls through to real gate staging (fail-closed). (codex #126 N1)
+    // Anything else falls through to real gate staging (fail-closed).
     if (core.consumeGateApproval(command) === true) {
       const post = core.evaluateBashCommand(command, { skipGate: true });
       if (!wellFormedVerdict(post))
         return denyDecision(`${reason} — malformed post-approval verdict, denying for safety.`);
       // Only an explicit `allow` passes. A repeated `gate` (a stale/malformed core
-      // that ignored skipGate) must NOT become an allow — deny it. (codex #126 N2)
+      // that ignored skipGate) must NOT become an allow — deny it.
       return post.action === 'allow' ? null : denyDecision(post.reason ?? reason);
     }
     if (core.IS_NANOCLAW) {
@@ -263,7 +263,7 @@ async function runDestructiveGuard(
         if (!wellFormedVerdict(post))
           return denyDecision(`${reason} — malformed post-approval verdict, denying for safety.`);
         // Only an explicit `allow` passes — a repeated `gate` after approval (stale
-        // core ignoring skipGate) must deny, not fall through to allow. (codex #126 N2)
+        // core ignoring skipGate) must deny, not fall through to allow.
         return post.action === 'allow' ? null : denyDecision(post.reason ?? reason);
       }
       const detail =
@@ -374,7 +374,7 @@ async function runFileProtection(
   // Contract: a non-empty string = protected (block); null = allowed. Anything
   // else (undefined/false/''/0/a non-string) is a malformed core result — for an
   // EDIT tool (we passed EDIT_TOOLS.has above) that means deny, never fall through
-  // to allow on a falsy-non-null. (codex #126 N3)
+  // to allow on a falsy-non-null.
   if (blocked === null) return null;
   if (typeof blocked === 'string' && blocked.length > 0) {
     return denyDecision(
@@ -502,7 +502,7 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
   // condition, and emitting `updatedInput` on every Bash call — rather than
   // only for the jest rewrite — would put unverified surface on every Codex
   // container for a hypothetical gain: whether codex honours the field, and
-  // under which key, is not established (docs/specs/claude-review-credential-rotation/run.md:11-12).
+  // under which key, is not established.
   // So this chain emits exactly what it did before: the jest rewrite, or nothing.
   // The Claude side applies the prefix at its own emit point — see
   // createBashCommandRewriteHook's INVARIANT in providers/claude.ts.

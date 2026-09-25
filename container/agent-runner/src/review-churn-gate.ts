@@ -9,7 +9,7 @@
  * A container agent does not push through a shell. It calls the `git_push`
  * MCP tool, so for it the skill's push path is instruction-only — and
  * instruction-only is exactly what failed before: the advisory detector
- * reported CHURN for eight rounds of PR #291 while every round patched
+ * reported CHURN for eight rounds of one PR while every round patched
  * another site. So the gate is hoisted to the primitive the container
  * actually routes through.
  *

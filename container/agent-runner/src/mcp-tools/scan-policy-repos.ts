@@ -1,6 +1,6 @@
 /**
  * Single source of truth, RUNNER side, for which repos are under host-managed
- * secret-scan policy (#666, #680 follow-up). git-worktrees.ts's own
+ * secret-scan policy. git-worktrees.ts's own
  * `isScanPolicyRepositoryName` reads this list rather than hardcoding a name
  * inline, so the list itself lives in exactly one place per side.
  *
@@ -17,8 +17,8 @@
  * host's own `SCAN_POLICY_REPOSITORY_NAMES` (src/managed-git-hooks.ts), so
  * the two lists can never silently drift apart.
  *
- * `loadScanPolicyRepositoryNames` is deliberately NOT invoked at module load
- * (#682 round 2 blocking fix). This module is pulled in transitively by
+ * `loadScanPolicyRepositoryNames` is deliberately NOT invoked at module load.
+ * This module is pulled in transitively by
  * every MCP tool (mcp-tools/index.ts -> git-worktrees.ts -> here), so an
  * eager `JSON.parse(fs.readFileSync(...))` at module scope meant a missing,
  * unreadable or malformed data file threw during import and took down the

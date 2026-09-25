@@ -588,8 +588,8 @@ export const editMessage: McpToolDefinition = {
       withStatusSubtext({
         id,
         kind: 'chat',
-        // The agent's own corrected text, stamped like the reply it replaces
-        // (#1016); the own-conversation gate still applies.
+        // The agent's own corrected text, stamped like the reply it replaces;
+        // the own-conversation gate still applies.
         agentReply: true,
         platform_id: routing.platform_id,
         channel_type: routing.channel_type,

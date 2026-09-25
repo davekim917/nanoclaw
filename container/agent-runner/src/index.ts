@@ -302,7 +302,7 @@ async function main(): Promise<void> {
   });
   provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
   // Session DB is open: mailbox.start above calls getOutboundDb while
-  // applying the schema (modules/mailbox/index.ts:261-264), so the provider
+  // applying the schema, so the provider
   // may now read the credential slot a previous container of this session
   // rotated onto.
   provider.restorePersistedCredentialSlot?.();

@@ -94,9 +94,9 @@ export function maxOutboundSeq(): number {
  * loosely and fails open:
  *
  *   - kind: `chat` (send_message, send_file, dispatched result blocks) and
- *     `chat-sdk` (send_card / ask_user_question, mcp-tools/interactive.ts:93,156).
+ *     `chat-sdk` (send_card / ask_user_question).
  *     One `system` action also counts: `request_choice` posts a card the
- *     person sees and returns without waiting (mcp-tools/request-choice.ts:208).
+ *     person sees and returns without waiting.
  *     With no `to` it targets the session's own conversation and its row
  *     carries no routing; with `to` the content names `channelType`/`platformId`.
  *     Every other `system` action is host-facing or goes elsewhere
@@ -105,12 +105,11 @@ export function maxOutboundSeq(): number {
  *   - where: the person's channel + platform. A row to a peer agent or another
  *     channel is `send_message(to: …)` delegating, not an answer.
  *   - NOT the thread, and NOT `threadKey`. No single authority decides the
- *     thread a reply lands in: the MCP tools stamp `getSessionRouting()`
- *     (mcp-tools/core.ts:224), final-text blocks stamp the channel's newest
+ *     thread a reply lands in: the MCP tools stamp `getSessionRouting()`,
+ *     final-text blocks stamp the channel's newest
  *     inbound row or the batch anchor (`sendToDestination`, poll-loop.ts), and
- *     delivery re-parents null-thread rows under the turn or key anchor
- *     (src/delivery.ts:1575-1588). Two review rounds each modelled that wrong
- *     and produced a false "no"; any row in the person's channel counts.
+ *     delivery re-parents null-thread rows under the turn or key anchor. Any
+ *     narrower rule produces a false "no"; any row in the person's channel counts.
  *
  * With no routing to match (legacy sessions), any non-agent row counts. An
  * unreadable DB answers `true`.
@@ -146,7 +145,7 @@ export function hasChatOutboundAfter(
 
 /**
  * Whether a `wait` wake is still pending and not yet due (host row
- * `schedule-wake-<id>`, src/modules/scheduled-wake/index.ts:96). Read through a
+ * `schedule-wake-<id>`). Read through a
  * fresh handle: the host writes messages_in continuously. bun:sqlite answers a
  * missing row with null, not undefined.
  */

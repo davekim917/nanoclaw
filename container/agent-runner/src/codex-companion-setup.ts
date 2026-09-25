@@ -927,9 +927,9 @@ export interface CodexPluginRegistrationPlan {
  * whole and only this walker knows which sub-plugins it would have registered.
  * An excluded sub-plugin is never `codex plugin add`ed — and so, since
  * `pluginHookTrustEntries` keys off this plan, never gains a hook trust entry
- * either. #826 removed the host-side mask precisely because the host cannot
- * predict what this walker will see; the list is honoured in the walker's own
- * namespace instead (`plugin-exclusions.ts`).
+ * either. There is no host-side mask because the host cannot predict what
+ * this walker will see; the list is honoured in the walker's own namespace
+ * instead (`plugin-exclusions.ts`).
  */
 export function planCodexPluginRegistration(
   pluginsRoot: string,

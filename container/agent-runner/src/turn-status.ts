@@ -193,8 +193,8 @@ export function isOwnConversation(channelType?: string | null, platformId?: stri
  * Is an outbound row a scheduled task's post to a platform?
  *
  * An isolated task session has no conversation of its own: its routing is a
- * `system:tasks:*` thread with no platform (db/session-routing.ts:28), and
- * send_message refuses to guess a target there (mcp-tools/core.ts:222). Every
+ * `system:tasks:*` thread with no platform, and
+ * send_message refuses to guess a target there. Every
  * chat row it writes is the task's output to a destination it named, so
  * without this the own-conversation gate leaves every scheduled post bare.
  * Agent-to-agent rows (`channel_type: 'agent'`) are not a platform post.
@@ -217,7 +217,7 @@ export function isTaskOutput(channelType?: string | null, platformId?: string | 
  *
  * The runner is two processes. poll-loop (and the provider inside it) sets the
  * turn's model, effort, context and conversation — but the `send_message` MCP
- * tool runs in a SEPARATE stdio subprocess (mcp-tools/server.ts:114) with its
+ * tool runs in a SEPARATE stdio subprocess (mcp-tools/server.ts) with its
  * own, empty copy of this module. It writes its chat row there, so an
  * in-memory-only store made `isOwnConversation` answer false for every reply
  * sent through the tool. That is the default reply path whenever outcome
@@ -272,8 +272,7 @@ function persist(): void {
     // No mailbox (unit tests) or a transient DB error: the in-memory store
     // still serves this process. Remember the failure, so the skip-if-unchanged
     // checks in the setters don't strand the snapshot on a value that never
-    // reached the DB — the next setter call writes again even if nothing moved
-    // (#1023).
+    // reached the DB — the next setter call writes again even if nothing moved.
     persistFailed = true;
   }
 }
@@ -314,7 +313,7 @@ export function hydrateTurnStatus(): boolean {
 }
 
 /**
- * FAIL CLOSED in a process that does not own the store (#1023).
+ * FAIL CLOSED in a process that does not own the store.
  *
  * The MCP subprocess is long-lived across turns. If a read of the snapshot
  * fails (e.g. SQLITE_BUSY while poll-loop is writing) and it kept what the
@@ -357,7 +356,7 @@ export function recordSubagent(
     effort: fields.effort ?? prior?.effort ?? null,
   };
   // Claude calls this once per worker frame, so a large fan-out would otherwise
-  // write thousands of identical snapshots. Persist only on a real change (#1028).
+  // write thousands of identical snapshots. Persist only on a real change.
   if (prior && prior.type === next.type && prior.model === next.model && prior.effort === next.effort && !persistFailed)
     return;
   subagents.set(key, next);
@@ -542,9 +541,9 @@ function statusSubtextEnabled(): boolean {
  *
  *   - `<message to="here">` envelopes, dispatched by sendToDestination.
  *   - The `send_message` MCP tool, which writes its own chat row directly
- *     (mcp-tools/core.ts:355). Outcome reporting — ON unless a group sets
- *     `outcomeReporting: false` (src/container-config.ts:1399) — instructs the
- *     agent to reply this way (destinations.ts:320), so on a default install
+ *     (mcp-tools/core.ts). Outcome reporting — ON unless a group sets
+ *     `outcomeReporting: false` — instructs the
+ *     agent to reply this way (destinations.ts), so on a default install
  *     this is THE reply path, not an alternative one.
  *
  * Stamping in either sender alone therefore covers roughly half the fleet

@@ -16,17 +16,16 @@ const GIT_IDENTITY_ENV_KEYS = [
  * Where GitHub credentials are FOUND, never the credentials themselves.
  *
  * - `GITHUB_TOKEN_FILE`: the host delivers the token as a read-only mounted
- *   file and sets only this path (src/github-token-file.ts:174; "a path, never
- *   a credential", :37). The git credential helper and the gh shim both resolve
- *   the token from it at call time (container/entrypoint.sh:91, :124-131) and
+ *   file and sets only this path (src/github-token-file.ts: "a path, never
+ *   a credential"). The git credential helper and the gh shim both resolve
+ *   the token from it at call time (container/entrypoint.sh) and
  *   have nothing else to read in file mode, so without it every git/gh network
  *   call made by an MCP tool fails with "could not read Username".
  * - `GIT_CONFIG_GLOBAL`: set only when $HOME is not writable, in which case the
- *   helper entry lives in that file instead of ~/.gitconfig
- *   (container/entrypoint.sh:154-159).
+ *   helper entry lives in that file instead of ~/.gitconfig.
  *
  * Nothing else is needed: Codex passes HOME and PATH to stdio MCP children by
- * default (openai/codex rust-v0.154.0, codex-rs/rmcp-client/src/utils.rs:163-175),
+ * default (openai/codex rust-v0.154.0, codex-rs/rmcp-client),
  * so ~/.gitconfig and the /tmp/bin gh shim are already reachable.
  *
  * `GH_TOKEN` / `GITHUB_TOKEN` are deliberately absent — this table is rendered

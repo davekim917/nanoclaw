@@ -342,8 +342,8 @@ export function selectPendingRows(
     // row `<X>` by the host's recall-injection (it strips the prefix to
     // pair). When `<X>` finishes (status='completed' in processing_ack, or
     // a messages_out row exists) but `recall-<X>` was never claimed —
-    // happens when X is a /clear command (handled+completed inline at
-    // poll-loop.ts:148) or a task gated by pre-task script — the orphan
+    // happens when X is a /clear command (handled+completed inline in
+    // poll-loop) or a task gated by pre-task script — the orphan
     // recall sits pending. Without this filter, the cold-start path's
     // accept-any-recall_context filter would later turn the orphan into a
     // standalone structured recall payload with no user message; the in-turn

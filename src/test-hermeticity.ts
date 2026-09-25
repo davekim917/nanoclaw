@@ -1,5 +1,5 @@
 /**
- * Repo-level test hermeticity tripwire (issue #305).
+ * Repo-level test hermeticity tripwire.
  *
  * Unit tests must not reach the world. Two escapes happened on 2026-09-03: a
  * fake-timer test advanced past the plugin updater's startup delay and ran a
@@ -46,7 +46,7 @@
  * commit would have blocked the tripwire from landing at all. The ratchet is
  * per file instead — a suite that is hermetic calls `enforceHermeticity()` in
  * its own body and can never regress, and `NANOCLAW_TEST_HERMETICITY=enforce`
- * runs the whole repo strictly once the backlog is worked off (issue #305).
+ * runs the whole repo strictly once the backlog is worked off.
  */
 import nodeOs from 'node:os';
 import nodePath from 'node:path';

@@ -95,7 +95,7 @@ export interface ControllerSendRowInput {
   /**
    * Writes the attachment bytes. Called inside the write transaction, before
    * the row exists, because the host reads `<outbox>/<id>/` when it delivers
-   * the row (mcp-tools/core.ts:386-391). A crash after staging leaves only a
+   * the row. A crash after staging leaves only a
    * directory the retry overwrites.
    */
   stageAttachments: () => void;
