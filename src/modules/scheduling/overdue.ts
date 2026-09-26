@@ -47,7 +47,7 @@ import { parseSqliteUtc, sqliteUtcToIso } from '../mailbox/sqlite-utc.js';
  * most one DM, and by the next attempt the rows its wakes reached have been
  * claimed and drop out.
  */
-export const TASK_OVERDUE_ALERT_MS = 60 * 60 * 1000;
+const TASK_OVERDUE_ALERT_MS = 60 * 60 * 1000;
 
 /**
  * Floor between two alert ATTEMPTS from this process — delivered or not.
