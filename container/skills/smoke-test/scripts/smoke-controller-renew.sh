@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Task-script: one tick of the claim RENEWER for the live PR smoke-campaign
 # controller. It is its own scheduled series, script-only, and it never wakes
-# an agent -- the last stdout line is always {"wakeAgent":false,"data":{...}}.
+# an agent -- the last stdout line is always {"wakeAgent":false,"observation":{...},"data":{...}}.
 #
 #   ncl tasks create --name smoke-controller-renew \
 #     --recurrence '*/5 * * * *' \
@@ -192,17 +192,30 @@ heartbeat() { # <status>
   return 0
 }
 
+# The declared observation (task-observation skill): the line every fire of
+# this series records. Nothing to renew is empty; a tick that could not read
+# its journal or its tools is unreadable; one that was refused its
+# configuration or its renewals is blocked. 30m is six ticks.
+OBS_HELPER="${SMOKE_OBSERVATION_HELPER:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)/task-observation/task_observation.py}"
+OBS_BOUND=30m
 final() { # <status> <detail-or-empty>
-  local status="$1" detail="${2:-}"
+  local status="$1" detail="${2:-}" data kind
   heartbeat "$status"
-  if ! jq -cn --arg tick "$NOW" --arg status "$status" --arg detail "$detail" \
+  case "$status" in
+    ok|idle|not-live|no-journal) kind=empty ;;
+    misconfigured|renew-failed) kind=blocked ;;
+    *) kind=unreadable ;;
+  esac
+  if ! data="$(jq -cn --arg tick "$NOW" --arg status "$status" --arg detail "$detail" \
       --argjson renewed "$RESULT_RENEWED" --argjson skipped "$RESULT_SKIPPED" \
-      '{wakeAgent:false,data:({tick:$tick,status:$status,renewed:$renewed,skipped:$skipped}
-        + (if $detail == "" then {} else {detail:$detail} end))}' >&3 2>/dev/null; then
-    # No jq, or jq refused. Still a well-formed, never-waking line.
-    printf '{"wakeAgent":false,"data":{"tick":"%s","status":"unrenderable"}}\n' "$NOW" >&3
+      '{tick:$tick,status:$status,renewed:$renewed,skipped:$skipped}
+        + (if $detail == "" then {} else {detail:$detail} end)' 2>/dev/null)" || [ -z "$data" ]; then
+    # No jq, or jq refused: the status slugs are fixed words, so this is safe JSON.
+    data="$(printf '{"tick":"%s","status":"%s"}' "$NOW" "$status")"
+    [ "$status" = no-jq ] || kind=unreadable
   fi
-  exit 0
+  python3 "$OBS_HELPER" --kind "$kind" --bound "$OBS_BOUND" --evidence-json "$data" --data "$data" >&3
+  exit $?
 }
 
 command -v jq >/dev/null 2>&1 || final no-jq "jq is unavailable; nothing renewed"

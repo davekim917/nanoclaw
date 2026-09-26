@@ -136,10 +136,17 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-b \
   SMOKE_GATE_FRONTEND_SERVICE=srv-f SMOKE_GATE_DEV_URL=https://dev.example.test \
   SMOKE_GATE_DEBOUNCE_SECONDS=0
 
-# 7. Settled new SHA: first poll debounces, second claims the run.
-bash "$GATE" poll | jq -e '
-  .wakeAgent == false and .data.trigger == "debouncing_candidate"
-' >/dev/null
+# 7. Settled new SHA: first poll debounces, second claims the run. The quiet
+# poll declares an empty observation (W2), a helper-valid one.
+DEBOUNCE_OUT="$(bash "$GATE" poll)"
+jq -e '
+  .wakeAgent == false and .data.trigger == "debouncing_candidate" and
+  .observation.kind == "empty" and .observation.bound == "2h" and
+  .observation.evidence.trigger == "debouncing_candidate"
+' <<<"$DEBOUNCE_OUT" >/dev/null
+python3 -c 'import json,sys; sys.path.insert(0, sys.argv[2]); import task_observation as t
+sys.exit(0 if t.observation_problem(json.loads(sys.argv[1])["observation"]) is None else 1)' \
+  "$DEBOUNCE_OUT" "$SCRIPT_DIR/../../task-observation"
 bash "$GATE" poll | jq -e --arg sha "$BUILD_SHA" '
   .wakeAgent == true and .data.trigger == "develop_build_settled" and
   .data.sourceSha == $sha and .data.recovery == false and
@@ -2155,5 +2162,17 @@ UNSAFE_DEV_OUT="$(bash "$GATE" claim ../escaped "$AUTO_DEV_SHA")"
 jq -e '.ok == false and (.error | test("unsafe"))' <<<"$UNSAFE_DEV_OUT" >/dev/null || {
   echo "60d: traversal-shaped develop run id reached shared storage: $UNSAFE_DEV_OUT" >&2; exit 1; }
 [ ! -e "$TEST_SHARED_ROOT/qa-coordinator/task-lease-escaped.lock" ]
+
+# W2: a poll that cannot read the branch is unreadable, never empty; a
+# non-poll verb's output is unchanged. Keys the gate already printed survive.
+W2_DIR="$(mktemp -d)"
+W2_OUT="$(SMOKE_GATE_STATE_DIR="$W2_DIR" STUB_SOURCE_SHA=not-a-sha bash "$GATE" poll)"
+jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_failed" and .ok == false and
+       .observation.kind == "unreadable" and .observation.bound == "2h"' <<<"$W2_OUT" >/dev/null || {
+  echo "W2: a failed fetch was not declared unreadable: $W2_OUT" >&2; exit 1; }
+W2_CHECK="$(SMOKE_GATE_STATE_DIR="$W2_DIR" STUB_SOURCE_SHA=not-a-sha bash "$GATE" check)"
+jq -e 'has("observation") | not' <<<"$W2_CHECK" >/dev/null || {
+  echo "W2: a non-poll verb grew an observation: $W2_CHECK" >&2; exit 1; }
+rm -rf "$W2_DIR"
 
 echo "smoke develop gate tests passed"

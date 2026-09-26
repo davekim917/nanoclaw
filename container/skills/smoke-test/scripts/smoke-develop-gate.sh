@@ -18,6 +18,28 @@ for _a in "$@"; do
 done
 set -- ${_ARGS[@]+"${_ARGS[@]}"}
 
+# The scheduled poll declares an observation on every line that does not wake
+# (task-observation skill, W2). The helper prints and validates it; its
+# observation is merged into the gate's own line, so every existing key stays.
+# Bound 2h: two hourly polls. A poll that could not read its sources is
+# unreadable; one refused its lock, its config, its preflight or its freeze
+# is blocked; a legitimate wait or a completed step is empty.
+GATE_VERB="${1:-poll}"
+OBS_HELPER="${SMOKE_OBSERVATION_HELPER:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)/task-observation/task_observation.py}"
+declare_quiet() { # <line> -- print it, with its observation when this is a quiet poll
+  local line="$1" kind obs
+  if [ "$GATE_VERB" != poll ] || [ "$(jq -r '.wakeAgent' <<<"$line" 2>/dev/null)" != false ]; then
+    printf '%s\n' "$line"; return 0
+  fi
+  case "$(jq -r '.data.trigger // empty' <<<"$line")" in
+    gate_fetch_failed) kind=unreadable ;;
+    gate_lock_busy|gate_misconfigured|preflight_failed|develop_freeze_failed) kind=blocked ;;
+    *) kind=empty ;;
+  esac
+  obs="$(python3 "$OBS_HELPER" --kind "$kind" --bound 2h --evidence-json "$(jq -c '.data' <<<"$line")")" || return 1
+  jq -c --argjson o "$obs" '. + {observation: $o.observation}' <<<"$line"
+}
+
 REPO="${SMOKE_GATE_REPO:-}"
 BRANCH="${SMOKE_GATE_BRANCH:-develop}"
 BACKEND_SERVICE="${SMOKE_GATE_BACKEND_SERVICE:-}"
@@ -450,14 +472,14 @@ task_binding_guard_absent_begin() {
 # take the lock has learned nothing worth spawning a coordinator for; the next
 # poll retries on its own cadence.
 emit_lock_busy() {
-  jq -cn --arg phase "$1" \
+  declare_quiet "$(jq -cn --arg phase "$1" \
     '{ok:false,
       retryable:true,
       error:("gate_lock_busy: another gate invocation held the state lock (" + $phase +
              ") — RETRY this same command in ~10s. This does NOT mean the run lost its slot; do not stop the campaign."),
       settled:false,
       wakeAgent:false,
-      data:{schemaVersion:1,trigger:"gate_lock_busy",phase:$phase}}'
+      data:{schemaVersion:1,trigger:"gate_lock_busy",phase:$phase}}')"
 }
 
 exec 9>"$LOCK_FILE"
@@ -1432,10 +1454,10 @@ if [ -n "$MISSING" ]; then
     STATE="$(jq -c --arg now "$(iso_now)" '.lastFailureWakeAt=$now' <<<"$STATE")"
   fi
   write_state "$STATE"
-  jq -cn --argjson wake "$WAKE" \
+  declare_quiet "$(jq -cn --argjson wake "$WAKE" \
     --argjson missing "$(printf '%s\n' $MISSING | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-    '{ok:false,settled:false,wakeAgent:$wake,data:{schemaVersion:1,trigger:"gate_misconfigured",settled:false,missing:$missing}}'
-  exit 0
+    '{ok:false,settled:false,wakeAgent:$wake,data:{schemaVersion:1,trigger:"gate_misconfigured",settled:false,missing:$missing}}')"
+  exit $?
 fi
 
 TMP_DIR="$(mktemp -d)"
@@ -1511,9 +1533,9 @@ if [ "$FETCH_OK" != true ]; then
     fi
   fi
   write_state "$STATE"
-  jq -cn --argjson wake "$WAKE" --argjson failures "$FAILURES" \
-    '{ok:false,settled:false,wakeAgent:$wake,data:{schemaVersion:1,trigger:"gate_fetch_failed",settled:false,consecutiveFailures:$failures}}'
-  exit 0
+  declare_quiet "$(jq -cn --argjson wake "$WAKE" --argjson failures "$FAILURES" \
+    '{ok:false,settled:false,wakeAgent:$wake,data:{schemaVersion:1,trigger:"gate_fetch_failed",settled:false,consecutiveFailures:$failures}}')"
+  exit $?
 fi
 
 NOW="$(iso_now)"
@@ -1618,14 +1640,14 @@ STATE="$(jq -c '.fetchFailures=0' <<<"$STATE")"
 emit_no_wake() {
   local trigger="$1" extra="${2:-null}"
   write_state "$STATE"
-  jq -cn \
+  declare_quiet "$(jq -cn \
     --arg trigger "$trigger" \
     --arg sha "$SOURCE_SHA" \
     --arg backend "$BACKEND_SHA" \
     --arg frontend "$FRONTEND_SHA" \
     --argjson checks "$CHECK_TOTAL" \
     --argjson extra "$extra" \
-    '{wakeAgent:false,data:({schemaVersion:1,trigger:$trigger,sourceSha:$sha,backendDeploySha:$backend,frontendDeploySha:$frontend,checkCount:$checks} + ($extra // {}))}'
+    '{wakeAgent:false,data:({schemaVersion:1,trigger:$trigger,sourceSha:$sha,backendDeploySha:$backend,frontendDeploySha:$frontend,checkCount:$checks} + ($extra // {}))}')"
 }
 
 # Classify an open handoff by the PR gate's own per-PR state. Read-only: never
@@ -2430,7 +2452,7 @@ if [ "$FREEZE_HANDOFF" = true ]; then
   # Condition cleared — a later recurrence is a new incident, not the acked one.
   drop_disposition develop_freeze_failed
   write_state "$STATE"
-  jq -cn \
+  declare_quiet "$(jq -cn \
     --arg repo "$REPO" --arg branch "$BRANCH" --arg sha "$SOURCE_SHA" --arg previous "$PREVIOUS_SHA" \
     --argjson pr "$FREEZE_PR_NUM" --arg freezeSha "$FREEZE_SHA_OUT" \
     '{wakeAgent:false,data:{
@@ -2438,8 +2460,8 @@ if [ "$FREEZE_HANDOFF" = true ]; then
       repo:$repo, branch:$branch, sourceSha:$sha,
       previousCompletedSha:(if $previous == "" then null else $previous end),
       freezePr:$pr, freezeSha:$freezeSha, targetSha:$sha
-    }}'
-  exit 0
+    }}')"
+  exit $?
 fi
 
 # Run ids are second-granular, so reclaiming an abandoned run on the SAME SHA

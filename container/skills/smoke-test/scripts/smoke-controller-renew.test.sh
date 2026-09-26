@@ -507,6 +507,7 @@ ok
 write_env live "export SMOKE_GATE_CLAIMANT='controller'"
 tick
 [ "$(field '.data.status')" = misconfigured ] || fail "SMOKE_GATE_CLAIMANT in the env file was not refused: $LAST"
+[ "$(field '.observation.kind')" = blocked ] || fail "a refused configuration must be declared blocked: $LAST"
 ok
 write_env live
 sed -i "s|export SMOKE_CONTROLLER_OUT_DIR=.*|export SMOKE_CONTROLLER_OUT_DIR=\"\$HOME/out\"|" "$C/env.sh"
@@ -616,6 +617,7 @@ ok
 printf '\n{"at":"2026-09-20T00:00:00Z","kind":"owner","slot":"x","state":"done","runId":"r","key":"k"}\n' >>"$JOURNAL"
 tick
 [ "$(field '.data.status')" = journal-unreadable ] || fail "a corrupt line must refuse the tick: $LAST"
+[ "$(field '.observation.kind')" = unreadable ] || fail "an unreadable journal must be declared unreadable: $LAST"
 [ "$(field '.data.renewed | length')" = 0 ] || fail "renewed against a corrupt journal"
 ok
 
@@ -697,6 +699,13 @@ for SETUP in ok not-live nojournal badrun; do
   tick
   [ "$(field '.wakeAgent')" = false ] || fail "$SETUP woke an agent: $LAST"
   [ "$(jq -e 'has("data")' <<<"$LAST" >/dev/null 2>&1; echo $?)" = 0 ] || fail "$SETUP printed no data"
+  # W2: the line declares its observation; nothing to renew is empty.
+  python3 -c 'import json,sys; sys.path.insert(0, sys.argv[2]); import task_observation as t
+sys.exit(0 if t.observation_problem(json.loads(sys.argv[1])["observation"]) is None else 1)' \
+    "$LAST" "$SCRIPT_DIR/../../task-observation" || fail "$SETUP declared no valid observation: $LAST"
+  case "$SETUP" in ok|not-live|nojournal) want=empty ;; *) want="$(field '.observation.kind')" ;; esac
+  [ "$(field '.observation.kind')" = "$want" ] && [ "$(field '.observation.bound')" = 30m ] \
+    || fail "$SETUP declared the wrong observation: $LAST"
 done
 ok
 # The traversal attempt above is refused by name, not sanitized.
