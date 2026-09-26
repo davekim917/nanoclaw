@@ -136,6 +136,7 @@ import {
   WORKGROUP_MEMORY_CONTAINER_PATH,
 } from './modules/workgroup/shared-dirs.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
+import { protectReadonlyHostPaths, readWorkgroupReadonlyPaths } from './workgroup-readonly-paths.js';
 import {
   assertWorkgroupReadAccessMountStable,
   isDuplicateWorkgroupReadAccessMount,
@@ -5913,7 +5914,7 @@ export async function buildMounts(
     mounts.push(...providerContribution.mounts);
   }
 
-  return mounts;
+  return protectReadonlyHostPaths(mounts, readWorkgroupReadonlyPaths());
 }
 
 export function resolveWorkgroupMemoryMount(workgroupId: string, dataDir: string = DATA_DIR): VolumeMount {
