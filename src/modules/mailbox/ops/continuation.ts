@@ -51,17 +51,19 @@ export function canAttemptContinuationRecovery(continuation: HostWorkContinuatio
 }
 
 /**
- * A capped record a runner already claimed. No runner picks up a queued record
- * that carries a `runner_id`, and the host authorizes no attempt past the cap,
- * so only real inbound — which arrives as a due row — can re-arm it. Holding a
- * container open for it waits out the absolute ceiling for nothing.
+ * A capped record a runner already claimed. No runner picks up a record that
+ * carries a `runner_id` (queued or running), and the host authorizes no attempt
+ * past the cap, so only real inbound — which arrives as a due row — can re-arm
+ * it. Holding a container open for it waits out the absolute ceiling for
+ * nothing.
+ *
+ * This is also true while a live runner executes the final authorized attempt
+ * (`running`, its own `runner_id`, at the cap). Callers that must not stop that
+ * turn rely on `provider_executing`, which the runner raises for every
+ * continuation turn, not on this record.
  */
 export function isContinuationParked(continuation: HostWorkContinuation): boolean {
-  return (
-    continuation.phase === 'queued' &&
-    continuation.runner_id !== undefined &&
-    !canAttemptContinuationRecovery(continuation)
-  );
+  return continuation.runner_id !== undefined && !canAttemptContinuationRecovery(continuation);
 }
 
 export function readWorkContinuation(outDb: Database.Database): HostWorkContinuation | null {
