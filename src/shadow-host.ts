@@ -32,6 +32,7 @@ import {
   REPO_ROOT,
 } from './config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
+import { ensureEgressNetwork } from './egress-lockdown.js';
 import { readEnvValue } from './env-file.js';
 import { getHostStartCallbacks, type HostStartContext } from './host-lifecycle.js';
 import { getContainerImageBase } from './install-slug.js';
@@ -169,11 +170,25 @@ export async function startShadowHostModules(ctx: HostStartContext): Promise<voi
 }
 
 /**
- * Null unless spawning under egress lockdown would change docker networking.
- * `ensureEgressNetwork` creates the network, and attaches the OneCLI gateway
- * container to it, when either is missing; both belong to production, so a
- * shadow only inspects, and refuses when they are not already in place.
+ * Whether a spawn runs under egress lockdown. Off a shadow this is
+ * `ensureEgressNetwork`, which creates the network and attaches the OneCLI
+ * gateway container when either is missing. A shadow never calls it — both
+ * belong to production, and an inspection followed by that call would still
+ * provision whatever changed in between — so it inspects once and, when
+ * admitted, joins production's network as it stands.
  */
+export function egressLockdownForSpawn(
+  provision: () => boolean = ensureEgressNetwork,
+  inspect?: (network: string) => string[] | null,
+  lockdown: boolean = EGRESS_LOCKDOWN,
+): boolean {
+  if (!isShadowHost()) return provision();
+  const refusal = shadowEgressViolation(inspect, lockdown);
+  if (refusal) throw new Error(refusal);
+  return lockdown;
+}
+
+/** Null unless a shadow spawning under egress lockdown finds production's network or gateway missing. */
 export function shadowEgressViolation(
   inspect: (network: string) => string[] | null = networkContainerNames,
   lockdown: boolean = EGRESS_LOCKDOWN,

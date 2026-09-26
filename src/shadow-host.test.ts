@@ -220,6 +220,23 @@ describe('shadowEgressViolation', () => {
   });
 });
 
+describe('egressLockdownForSpawn', () => {
+  it('provisions through ensureEgressNetwork when shadow mode is off', async () => {
+    const provision = vi.fn(() => true);
+    expect((await loadFresh(false)).egressLockdownForSpawn(provision, () => null, true)).toBe(true);
+    expect(provision).toHaveBeenCalledTimes(1);
+  });
+
+  it('on a shadow never provisions, whatever the network looks like', async () => {
+    const mod = await loadFresh(true);
+    const provision = vi.fn(() => true);
+    expect(mod.egressLockdownForSpawn(provision, () => ['onecli'], true)).toBe(true);
+    expect(mod.egressLockdownForSpawn(provision, () => null, false)).toBe(false);
+    expect(() => mod.egressLockdownForSpawn(provision, () => null, true)).toThrow(/never creates or attaches/);
+    expect(provision).not.toHaveBeenCalled();
+  });
+});
+
 describe('call sites', () => {
   const read = (file: string) => fs.readFileSync(path.resolve(file), 'utf8');
 
@@ -243,12 +260,10 @@ describe('call sites', () => {
     expect(driftCheck).toBeGreaterThan(refusal);
   });
 
-  it('spawn inspects egress networking on a shadow before ensureEgressNetwork can change it', () => {
+  it('spawn decides egress lockdown only through the shadow-aware helper', () => {
     const source = read('src/container-runner.ts');
-    const refusal = source.indexOf('if (shadowEgressRefusal) throw new Error(shadowEgressRefusal);');
-    const ensure = source.indexOf('if (ensureEgressNetwork()) {');
-    expect(refusal).toBeGreaterThan(-1);
-    expect(ensure).toBeGreaterThan(refusal);
+    expect(source).toContain('if (egressLockdownForSpawn()) {');
+    expect(source).not.toContain('ensureEgressNetwork');
   });
 
   it('spawn derives the OneCLI identity through the shadow-aware helper', () => {

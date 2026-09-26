@@ -76,7 +76,7 @@ import {
 } from './container-runtime.js';
 import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
 import { requestContainerRebuild } from './container-rebuild-watcher.js';
-import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
+import { EGRESS_NETWORK, egressNetworkArgs } from './egress-lockdown.js';
 import {
   assertRealDirectory,
   removeUntrustedPathEntry,
@@ -162,9 +162,9 @@ import { buildContainerCodexConfig } from './providers/codex.js';
 import { OPENCODE_XDG_CONTAINER_PATH, OPENCODE_XDG_ENV, stageOpenCodeAuth } from './providers/opencode.js';
 import { getSessionClaudeMounts } from './session-claude-mounts.js';
 import {
+  egressLockdownForSpawn,
   isShadowHost,
   onecliAgentIdentifier,
-  shadowEgressViolation,
   shadowProviderViolation,
   shadowSpawnImageViolation,
 } from './shadow-host.js';
@@ -7319,9 +7319,7 @@ async function buildContainerArgs(
 
   // Egress lockdown when enabled — throws if it can't be established, aborting
   // the spawn rather than running with open egress. Otherwise the host gateway.
-  const shadowEgressRefusal = shadowEgressViolation();
-  if (shadowEgressRefusal) throw new Error(shadowEgressRefusal);
-  if (ensureEgressNetwork()) {
+  if (egressLockdownForSpawn()) {
     args.push(...egressNetworkArgs());
     log.info('Egress lockdown active', { containerName, network: EGRESS_NETWORK });
   } else {
