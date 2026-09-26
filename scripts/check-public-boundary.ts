@@ -406,28 +406,15 @@ function repositoryNeutralEnv(): NodeJS.ProcessEnv {
   return Object.fromEntries(Object.entries(process.env).filter(([key]) => !REPOSITORY_SELECTION_ENV.test(key)));
 }
 
-/**
- * Every `key=value` entry of a git config, or a thrown Error when git cannot
- * list it. `--list` exits non-zero only for a config it cannot read or parse;
- * `--get` exits 1 both for a missing key and for an unreadable file.
- */
-function gitConfigList(source: string[], cwd: string): string[] {
-  const result = spawnSync('git', ['config', ...source, '--list'], {
-    cwd,
-    env: repositoryNeutralEnv(),
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'ignore'],
-  });
-  if (result.status !== 0 || typeof result.stdout !== 'string') throw new Error('git config could not be listed');
-  return result.stdout.split('\n').filter(Boolean);
-}
+type RemoteUrl = { kind: 'url'; url: string } | { kind: 'absent' } | { kind: 'unreadable' };
 
-/** Values of the config entries whose key matches, in file order. */
-function configValues(entries: string[], key: RegExp): string[] {
-  return entries.flatMap((entry) => {
-    const at = entry.indexOf('=');
-    return at > 0 && key.test(entry.slice(0, at)) ? [entry.slice(at + 1)] : [];
-  });
+// Git resolves its own config (include.path, includeIf, url.*.insteadOf);
+// discovery never parses it. Exit 2 is git's "no such remote"; anything else
+// (an unreadable config or include, a refused repository, a timeout) is unknown.
+function remoteUrl(dir: string, name: string, env: NodeJS.ProcessEnv): RemoteUrl {
+  const result = runGit(['remote', 'get-url', name], dir, env);
+  if (result.status === 0 && result.stdout.trim()) return { kind: 'url', url: result.stdout.trim() };
+  return result.status === 2 ? { kind: 'absent' } : { kind: 'unreadable' };
 }
 
 function repositoryKey(remote: RemoteRepository): string {
@@ -445,11 +432,13 @@ export interface PublicRemotes {
 // only exempts less, so a root that is not a readable checkout is skipped.
 export function publicRemotes(roots: string[]): PublicRemotes {
   const remotes: PublicRemotes = { owners: new Set(), repositories: new Set() };
+  const env = repositoryNeutralEnv();
   for (const root of roots) {
-    const entries = readSource(() => gitConfigList(['--local'], root));
-    if (!entries.ok) continue;
-    for (const url of configValues(entries.value, /^remote\..+\.url$/)) {
-      const parsed = remoteOwnerRepo(url);
+    const names = runGit(['remote'], root, env);
+    if (names.status !== 0) continue;
+    for (const name of names.stdout.split('\n').filter(Boolean)) {
+      const lookup = remoteUrl(root, name, env);
+      const parsed = lookup.kind === 'url' ? remoteOwnerRepo(lookup.url) : null;
       if (!parsed) continue;
       remotes.owners.add(parsed.owner.toLowerCase());
       remotes.repositories.add(repositoryKey(parsed));
@@ -535,25 +524,23 @@ export function loadInstallIdentifiers(dbPath: string, remotes: PublicRemotes, p
   const repositoriesDir = path.join(installRoot, 'data', 'repositories');
   for (const workgroup of listSource(repositoriesDir, problems, 'the repository store')) {
     for (const name of listSource(path.join(repositoriesDir, workgroup), problems, 'a repository directory')) {
-      const gitDir = path.join(repositoriesDir, workgroup, name, '.git');
-      const isClone = readSource(() => fs.lstatSync(gitDir));
+      const clone = path.join(repositoriesDir, workgroup, name);
+      const isClone = readSource(() => fs.lstatSync(path.join(clone, '.git')));
       if (!isClone.ok) {
         if (!isClone.absent) problems.push('a cloned repository could not be read');
         continue;
       }
-      // Once .git exists, every failure is unreadable, absence included: a
-      // gitdir pointer or a lost config still names a clone whose owner is unknown.
-      const config = path.join(gitDir, 'config');
-      const entries = readSource(() => {
-        fs.accessSync(config, fs.constants.R_OK);
-        return gitConfigList(['--file', config], repositoriesDir);
+      // Without the ceiling, git run in a clone whose .git vanished answers for
+      // the enclosing checkout instead.
+      const origin = remoteUrl(clone, 'origin', {
+        ...repositoryNeutralEnv(),
+        GIT_CEILING_DIRECTORIES: path.dirname(clone),
       });
-      if (!entries.ok) {
+      if (origin.kind === 'unreadable') {
         problems.push('a cloned repository configuration could not be read');
         continue;
       }
-      const [origin] = configValues(entries.value, /^remote\.origin\.url$/);
-      const parsed = origin ? remoteOwnerRepo(origin) : null;
+      const parsed = origin.kind === 'url' ? remoteOwnerRepo(origin.url) : null;
       // A local-only canonical (no origin, or one naming no owner/repo) is
       // still named by its canonical directory.
       if (!parsed) {
@@ -869,6 +856,9 @@ export function parseBaseline(text: string): Baseline {
   return { files: files as Record<string, number> };
 }
 
+// A killed git has status null, which every caller reads as a failure.
+const GIT_TIMEOUT_MS = 30_000;
+
 function runGit(args: string[], cwd: string, env: NodeJS.ProcessEnv): { status: number | null; stdout: string } {
   const result = spawnSync('git', args, {
     cwd,
@@ -876,6 +866,7 @@ function runGit(args: string[], cwd: string, env: NodeJS.ProcessEnv): { status: 
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
     maxBuffer: 32 * 1024 * 1024,
+    timeout: GIT_TIMEOUT_MS,
   });
   return { status: result.status, stdout: typeof result.stdout === 'string' ? result.stdout : '' };
 }

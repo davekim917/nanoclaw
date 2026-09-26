@@ -807,10 +807,24 @@ describe('identifiers derived from the install', () => {
     expect(main(['--root', root])).toBe(0);
   });
 
-  it('refuses every gate when a clone config cannot be read, though its directories can', () => {
+  it.each([
+    {
+      unreadable: 'its config',
+      lock: (clone: string) => fs.chmodSync(path.join(clone, '.git', 'config'), 0o000),
+    },
+    {
+      unreadable: 'a config it includes',
+      lock: (clone: string) => {
+        const included = path.join(path.dirname(clone), 'included.cfg');
+        fs.writeFileSync(included, '[core]\n\tbare = false\n');
+        execFileSync('git', ['config', 'include.path', included], { cwd: clone });
+        fs.chmodSync(included, 0o000);
+      },
+    },
+  ])('refuses every gate when a clone cannot resolve its origin because $unreadable is unreadable', ({ lock }) => {
     const root = initInstallRepo('Fictional Registry House', 'Fictional Local Team');
     addCanonical(path.join(root, 'data'), 'main-house', 'WIDGET', 'https://github.com/acme-co/WIDGET.git');
-    fs.chmodSync(path.join(root, 'data', 'repositories', 'main-house', 'WIDGET', '.git', 'config'), 0o000);
+    lock(path.join(root, 'data', 'repositories', 'main-house', 'WIDGET'));
     const baselineFile = path.join(root, '.public-boundary-baseline.json');
     fs.writeFileSync(baselineFile, '{"files":{"old.md":2}}\n');
     const message = path.join(root, 'MSG');
@@ -829,6 +843,26 @@ describe('identifiers derived from the install', () => {
       'requires every install identifier source',
     );
     expect(fs.readFileSync(baselineFile, 'utf8')).toBe('{"files":{"old.md":2}}\n');
+  });
+
+  it('derives an origin that git resolves through include.path or url.insteadOf', () => {
+    const dataDir = path.join(tempRoot(), 'data');
+    const dbPath = writeRegistry(dataDir);
+    execFileSync('git', ['init', '-q', path.join(dataDir, 'repositories', 'wg-fictional', 'included')]);
+    const included = path.join(dataDir, 'origin.cfg');
+    fs.writeFileSync(included, '[remote "origin"]\n\turl = https://github.com/acme-co/GADGET.git\n');
+    execFileSync('git', ['config', 'include.path', included], {
+      cwd: path.join(dataDir, 'repositories', 'wg-fictional', 'included'),
+    });
+    addCanonical(dataDir, 'wg-fictional', 'rewritten', 'fictional:SPROCKET.git');
+    execFileSync('git', ['config', 'url.https://github.com/other-co/.insteadOf', 'fictional:'], {
+      cwd: path.join(dataDir, 'repositories', 'wg-fictional', 'rewritten'),
+    });
+    const problems: string[] = [];
+    expect(loadInstallIdentifiers(dbPath, publicProject, problems)).toEqual(
+      new Set(['acme-co', 'GADGET', 'other-co', 'SPROCKET']),
+    );
+    expect(problems).toEqual([]);
   });
 
   it('records a clone whose .git is a pointer file rather than a directory', () => {
