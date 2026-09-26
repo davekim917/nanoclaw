@@ -92,6 +92,8 @@ const calls = vi.hoisted(() => ({
   admittedTasks: 0,
   admitImpl: null as null | ((session: unknown) => number),
   hostScriptFails: false,
+  /** What the host-gated script runner reports as unrecorded; S5 must hand it to admission. */
+  withheld: new Set<string>(),
   /** F-11.4 only: hold `killContainer`'s `onExit` instead of firing it inline. */
   deferKillExit: false,
   killExit: undefined as undefined | (() => void),
@@ -233,6 +235,7 @@ vi.mock('../scheduling/host-script.js', async (importOriginal) => ({
   runHostGatedTaskScripts: async (...args: unknown[]) => {
     calls.hostScripts.push(args);
     if (calls.hostScriptFails) throw new Error('host-gated script blew up');
+    return calls.withheld;
   },
 }));
 
@@ -458,6 +461,7 @@ beforeEach(async () => {
   calls.admittedTasks = 0;
   calls.admitImpl = null;
   calls.hostScriptFails = false;
+  calls.withheld = new Set(['task-unrecorded']);
   calls.deferKillExit = false;
   calls.killExit = undefined;
   spawns.length = 0;
@@ -767,10 +771,12 @@ describe('S2-PR11 scheduling + thread-close', () => {
     expect(calls.hostScripts).toHaveLength(1);
     expect(calls.hostScripts[0]![0]).toBe(mailbox);
     expect(calls.hostScripts[0]!.slice(1)).toEqual(['ag-test', 'sess-due']);
-    // The admission seam takes the window's own session (mailbox PR 7).
+    // The admission seam takes the window's own session (mailbox PR 7), and
+    // withholds exactly the rows whose host result was not recorded.
     expect(calls.admissions).toHaveLength(1);
     expect(calls.admissions[0]![0]).toBe(mailbox);
-    expect(calls.admissions[0]!.slice(1)).toEqual(['ag-test', 'sess-due']);
+    expect(calls.admissions[0]!.slice(1, 3)).toEqual(['ag-test', 'sess-due']);
+    expect(calls.admissions[0]![3]).toBe(calls.withheld);
     expect(ctx.plan.admittedTasks).toBe(1);
     expect(ctx.plan.dueCount).toBe(1);
     expect(ctx.plan.wakePriority).toBe('scheduled');
@@ -1207,7 +1213,7 @@ describe('S2-PR11 scheduling + thread-close', () => {
 
       const result = await _prepareDueWakeForTesting(mailbox, 'ag-test', 'sess-test');
 
-      expect(calls.admissions).toEqual([[mailbox, 'ag-test', 'sess-test']]);
+      expect(calls.admissions).toEqual([[mailbox, 'ag-test', 'sess-test', calls.withheld]]);
       expect(result).toEqual({ admittedTasks: 1, dueCount: 1, wakePriority: 'scheduled' });
     });
   });

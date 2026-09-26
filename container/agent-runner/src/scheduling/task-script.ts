@@ -6,6 +6,7 @@ import { touchHeartbeat } from '../heartbeat.js';
 import { beginProviderBusyScope, endProviderBusyScope } from '../modules/mailbox/index.js';
 import { evaluateManagedGitCommand } from '../managed-git-guard.js';
 import { MCP_HEADER_ONLY_SECRET_VARS } from '../providers/secret-env.js';
+import { writeGateRow } from './gate-row.js';
 
 // Pre-task scripts get 120s by default (env-overridable). The old flat 30s
 // killed a working 56s watcher script eight times in a row on 2026-08-22,
@@ -118,6 +119,7 @@ export async function runScript(
   script: string,
   taskId: string,
   timeoutMs: number = scriptTimeoutMs(),
+  onFailure?: (reason: string) => void,
 ): Promise<ScriptResult | null> {
   const scriptPath = path.join('/tmp', `task-script-${taskId}.sh`);
   fs.writeFileSync(scriptPath, script, { mode: 0o755 });
@@ -137,6 +139,11 @@ export async function runScript(
         if (stderr) {
           log(`[${taskId}] stderr: ${stderr.slice(0, 500)}`);
         }
+        const fail = (reason: string): void => {
+          log(`[${taskId}] ${reason}`);
+          onFailure?.(reason);
+          resolve(null);
+        };
 
         if (error) {
           // execFile kills on timeout, so a script that ran too long arrives
@@ -150,33 +157,25 @@ export async function runScript(
           // "error: Command failed" goes hunting for a bug in a script that is
           // merely slow, when the fix is NANOCLAW_TASK_SCRIPT_TIMEOUT_MS. Name
           // the timeout and the ceiling it hit.
-          if ((error as { killed?: boolean }).killed) {
-            log(
-              `[${taskId}] timed out after ${timeoutMs}ms and was killed; output discarded — raise NANOCLAW_TASK_SCRIPT_TIMEOUT_MS if the script is legitimately this slow`,
-            );
-          } else {
-            log(`[${taskId}] error: ${error.message}`);
-          }
-          return resolve(null);
+          return fail(
+            (error as { killed?: boolean }).killed
+              ? `timed out after ${timeoutMs}ms and was killed; output discarded — raise NANOCLAW_TASK_SCRIPT_TIMEOUT_MS if the script is legitimately this slow`
+              : `error: ${error.message}`,
+          );
         }
 
         const lines = stdout.trim().split('\n');
         const lastLine = lines[lines.length - 1];
-        if (!lastLine) {
-          log(`[${taskId}] no output`);
-          return resolve(null);
-        }
+        if (!lastLine) return fail('no output');
 
         try {
           const result = JSON.parse(lastLine);
           if (typeof result.wakeAgent !== 'boolean') {
-            log(`[${taskId}] output missing wakeAgent boolean: ${lastLine.slice(0, 200)}`);
-            return resolve(null);
+            return fail(`output missing wakeAgent boolean: ${lastLine.slice(0, 200)}`);
           }
           resolve(result as ScriptResult);
         } catch {
-          log(`[${taskId}] output is not valid JSON: ${lastLine.slice(0, 200)}`);
-          resolve(null);
+          fail(`output is not valid JSON: ${lastLine.slice(0, 200)}`);
         }
       },
     );
@@ -244,6 +243,8 @@ export async function applyPreTaskScripts(messages: MessageInRow[]): Promise<Tas
     const verdict = await classifyScript(script);
     if (!verdict.safe) {
       log(`task ${msg.id} BLOCKED: destructive pre-task script refused — ${verdict.reason}`);
+      if (!(await writeGateRow(msg.id, null, `refused by the destructive-command classifier: ${verdict.reason}`)))
+        continue;
       skipped.push({ id: msg.id, reason: 'blocked' });
       continue;
     }
@@ -262,12 +263,14 @@ export async function applyPreTaskScripts(messages: MessageInRow[]): Promise<Tas
     touchHeartbeat();
     beginProviderBusyScope();
     let result: ScriptResult | null;
+    let failure = 'script produced no result';
     try {
-      result = await runScript(script, msg.id);
+      result = await runScript(script, msg.id, undefined, (reason) => (failure = reason));
     } finally {
       endProviderBusyScope();
     }
     touchHeartbeat();
+    if (!(await writeGateRow(msg.id, result, failure))) continue;
 
     if (!result || !result.wakeAgent) {
       const reason: ScriptSkipReason = result ? 'gated' : 'error';

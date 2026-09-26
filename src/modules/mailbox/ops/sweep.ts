@@ -428,6 +428,85 @@ export function listOverdueRecurringRows(
   };
 }
 
+interface UndeliveredGateRow {
+  id: string;
+  occurrenceId: string | null;
+  seriesId: string | null;
+  writtenAt: string;
+}
+
+interface WithheldHostGatedRow {
+  id: string;
+  seriesId: string | null;
+  processAfter: string;
+}
+
+export interface StuckGateResults {
+  /** Container gate rows written before the cutoff that delivery has not recorded. */
+  undeliveredGateRows: UndeliveredGateRow[];
+  /** Host-gated occurrences due before the cutoff, still unadmitted and without a host result. */
+  withheldHostGatedRows: WithheldHostGatedRow[];
+}
+
+/**
+ * Gate-lane results that have not reached the ledger since before `cutoffIso`.
+ *
+ * Delivery retries an unrecorded gate row in place and never gives it up, so
+ * every later row of the session waits behind it; S5 withholds a host-gated
+ * occurrence whose result could not be recorded, so it neither runs nor
+ * completes. Both are correct and both are silent, which is why they are read
+ * here. A recorded host wake carries `scriptOutput` (JSON null included) and is
+ * not withheld.
+ */
+export function listStuckGateResults(
+  inDb: Database.Database,
+  outDb: Database.Database | null,
+  cutoffIso: string,
+): StuckGateResults {
+  migrateMessagesInTable(inDb);
+  const withheldHostGatedRows = inDb
+    .prepare(
+      `SELECT id, series_id AS seriesId, process_after AS processAfter FROM messages_in
+       WHERE kind = 'task'
+         AND status = 'pending'
+         AND trigger = 0
+         AND repo_fence_epoch IS NULL
+         AND process_after IS NOT NULL
+         AND datetime(process_after) <= datetime(?)
+         AND CASE WHEN json_valid(content) THEN json_extract(content, '$.scriptHost') END = 1
+         AND CASE WHEN json_valid(content) THEN json_type(content, '$.scriptOutput') END IS NULL
+       ORDER BY seq`,
+    )
+    .all(cutoffIso) as WithheldHostGatedRow[];
+  if (!outDb) return { undeliveredGateRows: [], withheldHostGatedRows };
+
+  const isDelivered = inDb.prepare('SELECT 1 FROM delivered WHERE message_out_id = ? LIMIT 1');
+  const seriesOf = inDb.prepare("SELECT series_id FROM messages_in WHERE id = ? AND kind = 'task'").pluck();
+  const candidates = outDb
+    .prepare(
+      `SELECT id, timestamp AS writtenAt,
+              CASE WHEN json_valid(content) THEN json_extract(content, '$.gate.occurrenceId') END AS occurrenceId
+         FROM messages_out
+        WHERE kind = 'task_log'
+          AND CASE WHEN json_valid(content) THEN json_type(content, '$.gate') END = 'object'
+          AND datetime(timestamp) <= datetime(?)
+        ORDER BY seq`,
+    )
+    .all(cutoffIso) as Array<{ id: string; writtenAt: string; occurrenceId: unknown }>;
+  const undeliveredGateRows = candidates
+    .filter((row) => isDelivered.get(row.id) === undefined)
+    .map((row) => {
+      const occurrenceId = typeof row.occurrenceId === 'string' ? row.occurrenceId : null;
+      return {
+        id: row.id,
+        writtenAt: row.writtenAt,
+        occurrenceId,
+        seriesId: occurrenceId === null ? null : ((seriesOf.get(occurrenceId) as string | null | undefined) ?? null),
+      };
+    });
+  return { undeliveredGateRows, withheldHostGatedRows };
+}
+
 /**
  * Has a container acknowledged this inbound message at all?
  *

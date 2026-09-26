@@ -18,15 +18,19 @@
  *
  * It complements `task-failure-escalation` (T24), which counts runs that
  * happened and failed; an occurrence that never runs leaves no outcome row for
- * T24 to count.
+ * T24 to count. For the same reason it also reports a pre-task result that has
+ * not reached T24's ledger for an hour (`listStuckGateResults`), through the
+ * same dedup and attempt gap.
  */
 import { resolveGroupTimezone } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
+import { taskSeriesId } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { notifyOperators } from '../../operator-alert.js';
 import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
 import type { NanoclawMailboxSession } from '../mailbox/index.js';
+import type { StuckGateResults } from '../mailbox/ops/sweep.js';
 import { parseSqliteUtc, sqliteUtcToIso } from '../mailbox/sqlite-utc.js';
 
 /**
@@ -66,12 +70,15 @@ const TASK_OVERDUE_ALERT_MS = 60 * 60 * 1000;
  */
 export const TASK_OVERDUE_ATTEMPT_MIN_GAP_MS = 5 * 60 * 1000;
 
-// One DELIVERED alert per occurrence per host process. In memory on purpose: a
-// still-stuck occurrence alerts once more from each new host process, so the
-// repeats are bounded by the number of restarts, and a restart loop cannot hide
-// a stuck row. An occurrence id is never reused (`task-<ms>-<rand>`,
-// recurrence.ts), so an entry is only ever stale, never wrong; stale ones are
-// dropped per session below.
+// One DELIVERED alert per stuck thing per host process: an unclaimed occurrence
+// (keyed by its id), a withheld one (`withheld:<id>`, so an occurrence that is
+// later admitted and then goes unclaimed alerts again), and an unrecorded gate
+// row (`gate-row:<outbound id>`). In memory on purpose: a still-stuck item
+// alerts once more from each new host process, so the repeats are bounded by
+// the number of restarts, and a restart loop cannot hide a stuck row. None of
+// those ids is ever reused (`task-<ms>-<rand>`, recurrence.ts; `gate-<uuid>`),
+// so an entry is only ever stale, never wrong; stale ones are dropped per
+// session below.
 const alerted = new Map<string, Set<string>>();
 let lastAttemptAtMs = 0;
 
@@ -113,56 +120,176 @@ function formatOverdueAlert(input: {
   ].join('\n');
 }
 
+function formatWithheldAlert(input: {
+  seriesId: string;
+  occurrenceId: string;
+  groupName: string;
+  dueAt: string;
+  overdueMinutes: number;
+}): string {
+  return [
+    `*Scheduled check result not recorded:* \`${input.seriesId}\` (group \`${input.groupName}\`)`,
+    `Occurrence \`${input.occurrenceId}\` has been due since ${input.dueAt} (${input.overdueMinutes} min) and its host-run ` +
+      'script has no recorded result, so it is held back: it neither wakes the agent nor completes, and the series ' +
+      'cannot advance. The script runs again every sweep tick until a result is recorded.',
+    '',
+    `Start with \`logs/nanoclaw.error.log\` ("Host-gated result could not be recorded"). This alert fires once per occurrence per host process.`,
+  ].join('\n');
+}
+
+function formatUndeliveredGateAlert(input: {
+  seriesId: string;
+  occurrenceId: string | null;
+  groupName: string;
+  sessionId: string;
+  writtenAt: string;
+  waitingMinutes: number;
+}): string {
+  const occurrence = input.occurrenceId === null ? 'an occurrence' : `occurrence \`${input.occurrenceId}\``;
+  return [
+    `*Scheduled check result not recorded:* \`${input.seriesId}\` (group \`${input.groupName}\`)`,
+    `The pre-task script result for ${occurrence}, written at ${input.writtenAt} (${input.waitingMinutes} min ago), ` +
+      `has not been recorded. Delivery retries it every poll and never gives it up, so every later message from ` +
+      `session \`${input.sessionId}\` is held behind it.`,
+    '',
+    `Start with \`logs/nanoclaw.error.log\` ("Gate result not recorded"). This alert fires once per result per host process.`,
+  ].join('\n');
+}
+
+/** One thing this pass may report, keyed for the `alerted` dedup. */
+interface PendingAlert {
+  key: string;
+  source: string;
+  seriesId: string;
+  occurrenceId: string | null;
+  sentLog: string;
+  unsentLog: string;
+  render(groupName: string, tz: string): string;
+}
+
+function pendingAlerts(
+  mailbox: NanoclawMailboxSession,
+  session: Session,
+  containerRunning: boolean,
+  nowMs: number,
+): PendingAlert[] {
+  const cutoffIso = new Date(nowMs - TASK_OVERDUE_ALERT_MS).toISOString();
+  const minutesSince = (stamp: string): number => Math.floor((nowMs - parseSqliteUtc(stamp)) / 60_000);
+  const { rows: overdue, queuedBehindActiveWork } = mailbox.listOverdueRecurringRows(cutoffIso);
+  let stuck: StuckGateResults = { undeliveredGateRows: [], withheldHostGatedRows: [] };
+  try {
+    stuck = mailbox.listStuckGateResults(cutoffIso);
+  } catch (err) {
+    log.warn('Stuck gate-result check failed — unclaimed occurrences are still checked', {
+      sessionId: session.id,
+      err,
+    });
+  }
+  const { undeliveredGateRows, withheldHostGatedRows } = stuck;
+
+  const unclaimed = overdue.map((row): PendingAlert => {
+    const seriesId = row.seriesId ?? row.id;
+    return {
+      key: row.id,
+      source: 'task-overdue',
+      seriesId,
+      occurrenceId: row.id,
+      sentLog: 'Escalated a due scheduled occurrence nothing is running',
+      unsentLog: 'Due scheduled occurrence nothing is running could NOT be escalated — nobody was told',
+      render: (groupName, tz) =>
+        formatOverdueAlert({
+          seriesId,
+          occurrenceId: row.id,
+          groupName,
+          sessionId: session.id,
+          dueAt: formatLocalTime(sqliteUtcToIso(row.processAfter), tz),
+          overdueMinutes: minutesSince(row.processAfter),
+          containerRunning,
+          queuedBehindActiveWork,
+        }),
+    };
+  });
+  const withheld = withheldHostGatedRows.map((row): PendingAlert => {
+    const seriesId = row.seriesId ?? row.id;
+    return {
+      key: `withheld:${row.id}`,
+      source: 'task-gate-withheld',
+      seriesId,
+      occurrenceId: row.id,
+      sentLog: 'Escalated a host-gated occurrence withheld without a recorded result',
+      unsentLog: 'Withheld host-gated occurrence could NOT be escalated — nobody was told',
+      render: (groupName, tz) =>
+        formatWithheldAlert({
+          seriesId,
+          occurrenceId: row.id,
+          groupName,
+          dueAt: formatLocalTime(sqliteUtcToIso(row.processAfter), tz),
+          overdueMinutes: minutesSince(row.processAfter),
+        }),
+    };
+  });
+  const unrecorded = undeliveredGateRows.map((row): PendingAlert => {
+    const seriesId = row.seriesId ?? taskSeriesId(session.thread_id) ?? row.occurrenceId ?? row.id;
+    return {
+      key: `gate-row:${row.id}`,
+      source: 'task-gate-unrecorded',
+      seriesId,
+      occurrenceId: row.occurrenceId,
+      sentLog: 'Escalated a pre-task result delivery has not recorded',
+      unsentLog: 'Unrecorded pre-task result could NOT be escalated — nobody was told',
+      render: (groupName, tz) =>
+        formatUndeliveredGateAlert({
+          seriesId,
+          occurrenceId: row.occurrenceId,
+          groupName,
+          sessionId: session.id,
+          writtenAt: formatLocalTime(sqliteUtcToIso(row.writtenAt), tz),
+          waitingMinutes: minutesSince(row.writtenAt),
+        }),
+    };
+  });
+  return [...unclaimed, ...withheld, ...unrecorded];
+}
+
 export async function escalateOverdueOccurrences(
   mailbox: NanoclawMailboxSession,
   session: Session,
   containerRunning: boolean,
   nowMs = Date.now(),
 ): Promise<void> {
-  const { rows: overdue, queuedBehindActiveWork } = mailbox.listOverdueRecurringRows(
-    new Date(nowMs - TASK_OVERDUE_ALERT_MS).toISOString(),
-  );
+  const pending = pendingAlerts(mailbox, session, containerRunning, nowMs);
   const seen = alerted.get(session.id);
-  if (overdue.length === 0) {
+  if (pending.length === 0) {
     if (seen) alerted.delete(session.id);
     return;
   }
 
-  for (const row of overdue) {
-    if (seen?.has(row.id)) continue;
+  for (const alert of pending) {
+    if (seen?.has(alert.key)) continue;
     if (nowMs - lastAttemptAtMs < TASK_OVERDUE_ATTEMPT_MIN_GAP_MS) return;
 
-    const seriesId = row.seriesId ?? row.id;
     const group = await getAgentGroup(session.agent_group_id);
     const tz = await resolveGroupTimezone(session.agent_group_id);
-    const text = formatOverdueAlert({
-      seriesId,
-      occurrenceId: row.id,
-      groupName: group?.name ?? session.agent_group_id,
-      sessionId: session.id,
-      dueAt: formatLocalTime(sqliteUtcToIso(row.processAfter), tz),
-      overdueMinutes: Math.floor((nowMs - parseSqliteUtc(row.processAfter)) / 60_000),
-      containerRunning,
-      queuedBehindActiveWork,
-    });
+    const text = alert.render(group?.name ?? session.agent_group_id, tz);
 
     // The attempt gap advances whatever happens next (see the constant).
     lastAttemptAtMs = nowMs;
-    const context = { source: 'task-overdue', seriesId, occurrenceId: row.id, sessionId: session.id };
-    // The OCCURRENCE is stamped only on a delivery that reached someone — same
-    // rule, and same reason, as task-failure-escalation
-    // (sweep-task-escalation). A failed attempt
-    // leaves it owing, to be retried once the attempt gap has passed.
+    const context = {
+      source: alert.source,
+      seriesId: alert.seriesId,
+      occurrenceId: alert.occurrenceId,
+      sessionId: session.id,
+    };
+    // Stamped only on a delivery that reached someone — same rule, and same
+    // reason, as task-failure-escalation (sweep-task-escalation). A failed
+    // attempt leaves it owing, to be retried once the attempt gap has passed.
     if (await notifyOperators(text, context)) {
       const stamped = alerted.get(session.id) ?? new Set<string>();
-      stamped.add(row.id);
+      stamped.add(alert.key);
       alerted.set(session.id, stamped);
-      log.warn('Escalated a due scheduled occurrence nothing is running', context);
+      log.warn(alert.sentLog, context);
     } else {
-      log.warn('Due scheduled occurrence nothing is running could NOT be escalated — nobody was told', {
-        ...context,
-        text,
-      });
+      log.warn(alert.unsentLog, { ...context, text });
     }
   }
 }

@@ -83,7 +83,7 @@ frequent checks where most runs have nothing for the agent to do.
 The script's last line of standard output must be JSON:
 
 ```json
-{ "wakeAgent": false }
+{ "wakeAgent": false, "observation": { "kind": "empty", "evidence": "no new alerts", "bound": "4h" } }
 ```
 
 or:
@@ -92,7 +92,8 @@ or:
 { "wakeAgent": true, "data": { "alerts": 2 } }
 ```
 
-- `wakeAgent: false` completes the run without calling the model.
+- `wakeAgent: false` completes the run without calling the model. Its
+  `observation` says what the script saw; see [Observations](#observations).
 - `wakeAgent: true` wakes the agent and adds `data` to its prompt.
 
 Scripts run with Bash, a 120-second default timeout (overridden by
@@ -109,9 +110,10 @@ identity, so later work remains pending even when an older marker was completed:
 ```bash
 marker=/workspace/agent/wake-next-task
 receipt=/workspace/agent/wake-next-task.completed
+observe=/app/skills/task-observation/task_observation.py
 
 if [ ! -f "$marker" ]; then
-  echo '{"wakeAgent": false}'
+  python3 "$observe" --kind empty --evidence "no marker" --bound 1h
   exit 0
 fi
 
@@ -139,7 +141,7 @@ if [ -r "$receipt" ]; then
 fi
 
 if [ "$receipt_id" = "$marker_id" ]; then
-  echo '{"wakeAgent": false}'
+  python3 "$observe" --kind empty --evidence "marker $marker_id already completed" --bound 1h
 else
   printf '{"wakeAgent": true, "data": {"reason": "marker pending", "markerId": "%s"}}\n' "$marker_id"
 fi
@@ -168,6 +170,42 @@ ncl tasks create \
 Store state that must survive between runs under `/workspace/agent`, the agent
 group workspace.
 
+## Observations
+
+A run that does not wake the agent declares what it observed:
+
+| `kind`       | Meaning                                                                  |
+| ------------ | ------------------------------------------------------------------------ |
+| `empty`      | Checked; nothing to do.                                                  |
+| `unreadable` | The source could not be read.                                            |
+| `blocked`    | The work could not be dispatched.                                        |
+| `unfinished` | Work is still open. `since` (ISO-8601 with a zone) says when it started. |
+
+Every observation carries `evidence` (a non-empty string, object or array) and
+a `bound` (`90m`, `4h`, `2d`, clamped to 15 minutes – 7 days). Print the line
+with the `task-observation` container skill's helper, which escapes the JSON
+and refuses an invalid observation:
+
+```bash
+python3 /app/skills/task-observation/task_observation.py --kind empty --evidence "no new alerts" --bound 4h
+```
+
+Each run's result is recorded against its occurrence before the occurrence is
+completed or the agent is woken. `empty` and a wake are successes. Every other
+result is not: `unreadable`, `blocked` and `unfinished`, a script error (with
+its reason), and an invalid observation. A run of consecutive unsuccessful
+results is one episode. Its deadline is its earliest start (its first result,
+or an earlier `since`) plus its smallest bound, so a later run can bring the
+deadline forward but never push it back. Once the deadline passes, the
+operators get one message for the episode, even if the task never runs again;
+the next `empty` or wake ends it. Errors and invalid observations use a 2-hour
+bound. A result that cannot be recorded holds its occurrence until it is, and
+the operators are told once it has waited an hour.
+
+A `wakeAgent: false` line with no observation is recorded as `undeclared`. It
+currently counts as a success; once every producer declares observations it
+will count as a failure.
+
 Avoid putting secrets directly in task scripts. Prefer runtime credential
 injection through OneCLI so credentials are not stored in the task definition.
 
@@ -194,8 +232,9 @@ reason to its run log. Fix the script, test it, then resume the task:
 ncl tasks resume <task-id> --group <agent-group-id>
 ```
 
-A valid `wakeAgent: false` decision is a successful run. It does not trigger
-failure backoff.
+Only script errors count toward this backoff. An observation that is not
+`empty` does not delay the series; it is held against its bound instead (see
+[Observations](#observations)).
 
 ## Template tasks
 

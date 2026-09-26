@@ -1630,8 +1630,10 @@ registerResource({
         `Workflow default: use --script for deterministic polling and observation; wake for meaningful changes or due unfinished/recovery work. Time-driven reasoning, requested reports and full campaigns may run directly; record why in the prompt. Check active tasks for overlapping owner, purpose and schedule before creating a series.\n\n` +
         `--script contract (pre-task gate, runs BEFORE the agent wakes):\n` +
         `  bash, 120s default timeout (NANOCLAW_TASK_SCRIPT_TIMEOUT_MS override), 1MB output cap. Its LAST stdout line must be JSON:\n` +
-        `    {"wakeAgent": <bool>, "data": {...}}\n` +
-        `  wakeAgent=false marks the run handled without waking the agent (zero tokens);\n` +
+        `    {"wakeAgent": false, "observation": {"kind": ..., "evidence": ..., "bound": "4h", "since"?: ...}, "data": {...}}\n` +
+        `    {"wakeAgent": true, "data": {...}}\n` +
+        `  wakeAgent=false handles the run without waking the agent (zero tokens) and declares what it saw: kind empty (nothing to do), unreadable, blocked, or unfinished (with since, ISO-8601, when the open work started); evidence is non-empty; bound (90m|4h|2d) is how long a result other than empty may stand before the operator is told.\n` +
+        `  Print that line with /app/skills/task-observation/task_observation.py (see the task-observation skill); it escapes the JSON and refuses an invalid observation.\n` +
         `  wakeAgent=true wakes the agent with data attached to the prompt.\n` +
         `  DO: print the JSON as the very last line, exit 0, keep data small (a summary, not a dump).\n` +
         `  DON'T: print anything after the JSON, prompt for input, or rely on an earlier process's memory or temporary files.\n` +
@@ -1642,7 +1644,7 @@ registerResource({
         `carries a --script gate (the script decides whether each fire needs you — a gated fire that\n` +
         `finds nothing costs zero tokens) or you pass --dangerously-override-recurrence-limit after\n` +
         `the user explicitly confirmed they want an ungated frequent task.\n\n` +
-        `Failure backoff: a script that ERRORS repeatedly backs the series off (2,4,8,…60 min between fires; each errored fire counts as a failed run); after 8 consecutive failures the series is auto-paused with a note in its run log — fix the script, then \`ncl tasks resume <id>\`. A deliberate wakeAgent=false is a normal run and never backs off. \`ncl tasks get <id>\` shows failed_runs and the run log.\n\n` +
+        `Failure backoff: a script that ERRORS repeatedly backs the series off (2,4,8,…60 min between fires; each errored fire counts as a failed run); after 8 consecutive failures the series is auto-paused with a note in its run log — fix the script, then \`ncl tasks resume <id>\`. A wakeAgent=false run never backs off, but only an empty observation (or a wake) is a success: consecutive unreadable/blocked/unfinished/error/invalid results past their bound page the operator once. \`ncl tasks get <id>\` shows failed_runs and the run log.\n\n` +
         `Routing (where an unaddressed reply lands): an agent caller stamps its own channel by default (thread null) — a normal reply with no explicit destination lands there; --thread also binds your own thread (falls back to channel if you aren't in a thread session); --isolated stamps no routing (unaddressed replies are discarded, only an explicit <message to=...> reaches anyone). --messaging-group/--thread-id are host-only raw stamps.`,
       args: [
         {

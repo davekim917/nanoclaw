@@ -71,8 +71,11 @@ async function prepareDueWake(
   // `agentGroupId` rides along because the callee resolves the GROUP's
   // timezone for its local-time gate: a session parameter identifies the
   // mailbox, not the group whose zone override applies.
-  await runHostGatedTaskScripts(mailbox, agentGroupId, sessionId);
-  const admittedTasks = await admitDueTaskContexts(mailbox, agentGroupId, sessionId);
+  //
+  // A row whose host result could not be recorded is withheld from admission:
+  // it must not run anywhere until an execution of it is on record.
+  const unrecorded = await runHostGatedTaskScripts(mailbox, agentGroupId, sessionId);
+  const admittedTasks = await admitDueTaskContexts(mailbox, agentGroupId, sessionId, unrecorded);
   const dueCount = mailbox.countDueMessages();
   return {
     admittedTasks,

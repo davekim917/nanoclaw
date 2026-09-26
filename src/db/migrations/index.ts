@@ -93,6 +93,7 @@ import { migration080 } from './080-choice-receipt-release-scope.js';
 import { migration081 } from './081-thread-key-anchors.js';
 import { migration082 } from './082-mcp-oauth-integrations.js';
 import { migration083 } from './083-work-outcome-receipts.js';
+import { migration084 } from './084-task-run-outcome-lanes.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -267,6 +268,7 @@ export const migrations: Migration[] = [
   migration081,
   migration082,
   migration083,
+  migration084,
   // Last on purpose: normalizes whatever naive timestamps every migration
   // above has left behind (016's messaging_groups recreate copies created_at
   // through as-is).
