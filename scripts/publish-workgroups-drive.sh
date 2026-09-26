@@ -3,7 +3,7 @@
 #
 # The tracked set IS the definition of "deliverable" — data/workgroups/.gitignore
 # is deny-by-default and the curation decision lives there, not here. This script
-# never invents its own filter, never writes to the host, and never deletes on
+# never invents its own filter, never writes to the tree, and never deletes on
 # Drive; a file that vanished locally is logged and dropped from state instead.
 #
 # PATH TRAP: workgroup content is read from data/workgroups/. Never from
@@ -23,19 +23,22 @@ STATE="${DRIVE_STATE_FILE:-/home/ubuntu/nanoclaw-v2/data/workgroups-drive-state.
 # (~/.config/gws/credentials.enc) is deliberately NOT used.
 export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE="${GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE:-/home/ubuntu/.config/gws/accounts/primary.json}"
 
-# gws refuses `--upload` for any path outside the current directory, so every
-# upload below is a path RELATIVE to the repo. Not optional — an absolute path
-# fails with a 400 "outside the current directory".
 cd "$REPO" || exit 1
 # Canonical repo path, for the per-file containment check below.
 REPO_REAL="$(pwd -P)"
+# Host-private staging dir: every upload is a snapshot taken here, never a
+# path inside the agent-writable tree. gws refuses `--upload` for any path
+# outside the current directory, so uploads run from here with a RELATIVE
+# name. Not optional — an absolute path fails with a 400 "outside the current
+# directory".
+STAGE="$(mktemp -d)" && mkdir "$STAGE/f" || exit 1
 
 TMP="$STATE.tmp.$$"
 ERRF="$STATE.err.$$"
 : > "$TMP"
 # Persist progress even on a crash: a partial state is still correct, just
 # smaller — a missing row falls back to the name-in-parent lookup below.
-trap 'mv -f "$TMP" "$STATE" 2>/dev/null; rm -f "$ERRF"' EXIT
+trap 'mv -f "$TMP" "$STATE" 2>/dev/null; rm -f "$ERRF"; rm -rf "$STAGE"' EXIT
 
 # Logs go to STDERR, never stdout. Helpers below return ids through stdout via
 # command substitution; a log line on stdout would be captured as the id.
@@ -63,6 +66,11 @@ if [[ -f "$STATE" ]]; then
 fi
 
 added=0 updated=0 skipped=0 failed=0 refused=0 folders_made=0
+
+refuse() {
+  log "ERROR REFUSED $1: not a regular file inside the tree (resolves to ${2:-nothing})"
+  refused=$((refused+1))
+}
 
 # find_child <name> <parentId> <folders|files> -> prints id or empty
 find_child() {
@@ -124,19 +132,25 @@ for d in "${DIRS[@]}"; do
 done
 
 for rel in "${TRACKED[@]}"; do
-  # relative on purpose — see the cd above
   src="$rel"
   if [[ ! -e "$src" && ! -L "$src" ]]; then log "SKIP missing $rel"; continue; fi
-  # The tree is writable from agent containers, and sha256sum and gws both
-  # follow symlinks: a tracked path (or any directory above it) swapped for a
-  # symlink would publish whatever host file it points at. Upload only a
-  # regular file whose canonical path is exactly this tracked path.
-  real="$(realpath -e -- "$src" 2>/dev/null)"
-  if [[ -L "$src" || ! -f "$src" || "$real" != "$REPO_REAL/$rel" ]]; then
-    log "ERROR REFUSED $rel: not a regular file inside the tree (resolves to ${real:-nothing})"
-    refused=$((refused+1)); continue
+  # The tree is writable from agent containers, and any open by pathname
+  # follows symlinks: a tracked path (or any directory above it) swapped for a
+  # symlink would publish whatever host file it points at, and a pathname
+  # check goes stale the moment it returns. So open once, confirm the
+  # descriptor is a regular file whose canonical path is exactly this tracked
+  # path, and hash and upload a snapshot read from that descriptor.
+  # The -L/-f pre-check keeps a FIFO or device from ever being opened.
+  if [[ -L "$src" || ! -f "$src" ]]; then refuse "$rel" "$(realpath -e -- "$src" 2>/dev/null)"; continue; fi
+  if ! exec 3<"$src"; then log "SKIP missing $rel"; continue; fi
+  opened="$(readlink -- /proc/self/fd/3)"
+  if [[ ! -f /proc/self/fd/3 || "$opened" != "$REPO_REAL/$rel" ]]; then
+    exec 3<&-; refuse "$rel" "$opened"; continue
   fi
-  sha="$(sha256sum "$src" | cut -d' ' -f1)"
+  snap="f/$(basename "$rel")"
+  cat <&3 > "$STAGE/$snap"; rc=$?; exec 3<&-
+  if [[ $rc -ne 0 ]]; then log "ERROR snapshot $rel"; failed=$((failed+1)); continue; fi
+  sha="$(sha256sum "$STAGE/$snap" | cut -d' ' -f1)"
   if [[ "${OLD_SHA[$rel]:-}" == "$sha" && -n "${OLD_ID[$rel]:-}" ]]; then
     printf 'F\t%s\t%s\t%s\n' "$rel" "$sha" "${OLD_ID[$rel]}" >> "$TMP"
     skipped=$((skipped+1)); continue
@@ -152,17 +166,17 @@ for rel in "${TRACKED[@]}"; do
   # stderr on every call, and a 2>&1 capture makes every successful upload look
   # like unparseable JSON. That failed 10 real uploads silently.
   if [[ -n "$id" ]]; then
-    out="$(gws drive files update --params "$(jq -cn --arg f "$id" '{fileId:$f,fields:"id"}')" \
-           --upload "$src" 2>"$ERRF")"
+    out="$(cd "$STAGE" && gws drive files update --params "$(jq -cn --arg f "$id" '{fileId:$f,fields:"id"}')" \
+           --upload "$snap" 2>"$ERRF")"
     if [[ -z "$(printf '%s' "$out" | jq -r '.id // empty' 2>/dev/null)" ]]; then
       log "ERROR update $rel: $(head -c 200 "$ERRF") | $(printf '%s' "$out" | head -c 200)"
       failed=$((failed+1)); continue
     fi
     updated=$((updated+1)); log "UPDATE $rel -> $id"
   else
-    out="$(gws drive files create --params '{"fields":"id"}' \
+    out="$(cd "$STAGE" && gws drive files create --params '{"fields":"id"}' \
            --json "$(jq -cn --arg n "$name" --arg p "$parent" '{name:$n,parents:[$p]}')" \
-           --upload "$src" 2>"$ERRF")"
+           --upload "$snap" 2>"$ERRF")"
     id="$(printf '%s' "$out" | jq -r '.id // empty' 2>/dev/null)"
     if [[ -z "$id" ]]; then
       log "ERROR create $rel: $(head -c 200 "$ERRF") | $(printf '%s' "$out" | head -c 200)"
