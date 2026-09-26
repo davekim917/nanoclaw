@@ -19,31 +19,40 @@ producers could migrate; this release enforces the contract. See
 
 ## Detect
 
-Run these before you deploy. Both are read-only.
+Run both steps before you deploy, and again immediately before the restart.
+Both are read-only.
 
 1. Series that printed an undeclared line since the previous release deployed:
 
    ```bash
-   pnpm exec tsx scripts/q.ts data/v2.db "SELECT agent_group_id, series_id, COUNT(*) AS fires, MAX(recorded_at) AS last FROM task_run_outcomes WHERE source = 'gate' AND observation = 'undeclared' GROUP BY 1, 2 ORDER BY last DESC"
+   pnpm exec tsx scripts/q.ts data/v2.db "SELECT u.agent_group_id, u.series_id, MAX(u.recorded_at) AS last_undeclared, (SELECT MAX(d.recorded_at) FROM task_run_outcomes d WHERE d.source = 'gate' AND d.series_id = u.series_id AND d.observation IN ('empty', 'unreadable', 'blocked', 'unfinished')) AS last_declared FROM task_run_outcomes u WHERE u.source = 'gate' AND u.observation = 'undeclared' GROUP BY 1, 2 ORDER BY 3 DESC"
    ```
 
-   A series whose `last` is older than its newest declared row has already
-   migrated. Check each remaining one with the query under Verify.
+   Every series listed printed a bare line on at least one path. Fix it unless
+   you have already changed its script since `last_undeclared`. A
+   `last_declared` value only shows that some other path already declares.
 
-2. Scripted series that have not fired since then, so the ledger cannot vouch
-   for them (weekly and monthly series are the usual ones):
+2. Scripted series whose no-wake path the ledger has never seen declared.
+   This includes series that have not fired since the previous release
+   (weekly and monthly ones, usually), and series that have only woken or
+   errored:
 
    ```bash
-   recorded=$(mktemp)
-   pnpm exec tsx scripts/q.ts data/v2.db "SELECT DISTINCT series_id FROM task_run_outcomes WHERE source = 'gate'" > "$recorded"
-   ncl tasks list --all --json | jq -r '.data[] | select(.has_script == 1) | "\(.agent_group_id) \(.series_id) \(.recurrence // "one-shot")"' |
-     awk 'NR == FNR { seen[$0] = 1; next } !($2 in seen)' "$recorded" -
+   declared=$(pnpm exec tsx scripts/q.ts data/v2.db "SELECT DISTINCT series_id FROM task_run_outcomes WHERE source = 'gate' AND observation IN ('empty', 'unreadable', 'blocked', 'unfinished')")
+   ncl tasks list --all --json | jq -r --arg declared "$declared" '
+     ($declared | split("\n")) as $seen
+     | [.data[] | select(.has_script == 1)]
+     | "scripted series listed: \(length)",
+       (.[] | select(.series_id | IN($seen[]) | not) | "\(.agent_group_id) \(.series_id) \(.recurrence // "one-shot")")'
    ```
 
-   `has_script` is `0` or `1`, and jq treats `0` as true, so compare it
-   explicitly. Read the script of each series this prints with
+   Read the script of each series this prints with
    `ncl tasks get --id <series> --group <group>`, and check every path that
-   prints `wakeAgent: false`.
+   prints `wakeAgent: false`. `has_script` is `0` or `1`, and jq treats `0` as
+   true, so the filter compares it explicitly. `ncl tasks list` shows only
+   pending and paused occurrences, so a series whose fire is running is
+   missing until it re-arms. If the `scripted series listed` count differs
+   between runs, run the step again after in-flight fires finish.
 
 ## Fix
 

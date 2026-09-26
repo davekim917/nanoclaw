@@ -1753,7 +1753,7 @@ registerResource({
       examples: [
         `# Recurring — --recurrence alone is enough; the first run comes off the cron grid:\nncl tasks create --name "sales briefing" --prompt "Send the weekday sales briefing" --recurrence "0 9 * * 1-5"`,
         `# One-shot — --process-after required (UTC, offset, or naive-local in the instance TZ):\nncl tasks create --name "ping" --prompt "Remind me to call Dana" --process-after "tomorrow 18:00"`,
-        `# Monitor — script gates the run; the agent wakes only when something matters:\nncl tasks create --name "alert watch" --recurrence "*/15 * * * *" \\\n  --prompt "Investigate the alerts in the script data and notify me if serious" \\\n  --script 'c=$(curl -sf https://example.com/api/alerts | jq length) || exit 0\necho "{\\"wakeAgent\\": $([ "$c" -gt 0 ] && echo true || echo false), \\"data\\": {\\"alerts\\": $c}}"'`,
+        `# Monitor — script gates the run; the agent wakes only when something matters:\nncl tasks create --name "alert watch" --recurrence "*/15 * * * *" \\\n  --prompt "Investigate the alerts in the script data and notify me if serious" \\\n  --script 'set -o pipefail\nH=/app/skills/task-observation/task_observation.py\nc=$(curl -sf https://example.com/api/alerts | jq -e length) || { python3 "$H" --kind unreadable --evidence "alerts API unreadable" --bound 1h; exit 0; }\nif [ "$c" -gt 0 ]; then python3 "$H" --wake --data "{\\"alerts\\": $c}"; else python3 "$H" --kind empty --evidence "0 alerts" --bound 1h; fi'`,
       ],
       handler: async (args, ctx) => createTask(args, ctx),
     },
