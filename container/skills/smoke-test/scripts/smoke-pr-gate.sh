@@ -1296,6 +1296,14 @@ task_lease_remove_fenced() {  # <runId>
 # `claim` now stamps a deadline and `challenger-timeout` converts an expired
 # one into a BLOCKED verdict — never into permission to synthesize.
 num_env CHALLENGER_TIMEOUT_SECONDS SMOKE_GATE_CHALLENGER_TIMEOUT_SECONDS 5400
+# The deadline `claim` stamps is provisional: the challenger only starts once
+# the root post goes out, typically 28-40 minutes after claim, so a claim
+# anchor spent that much of the challenger's window on intake. `challenger-start`
+# re-anchors it to the root post, once. The ceiling is the provisional deadline
+# plus this allowance, so re-anchoring can never push a deadline out without
+# bound, and a run whose root never goes out still times out at the
+# provisional deadline.
+num_env CHALLENGER_INTAKE_ALLOWANCE_SECONDS SMOKE_GATE_CHALLENGER_INTAKE_ALLOWANCE_SECONDS 3600
 # The skill's <qa-run-root> — the coordinator's evidence tree, which is where
 # the challenger actually writes. Unset means this deployment has not told the
 # gate where to look, and `challenger-timeout` REFUSES rather than reading a
@@ -1321,6 +1329,31 @@ contract_adoption_required() {  # <runId> -> true | false | null
     printf 'true'
   else
     printf 'false'
+  fi
+}
+# A same-run recovery (`poll`'s reclaim, or a `claim` that resumes the run id
+# it already published) rebinds the completion contract itself, through the
+# scaffold's own `adopt`. Before this, the gate handed the fresh token to
+# whoever read the wake and left the rebinding to them, so a recovered run
+# whose owner never ran `adopt` — or whose recovery happened in a container
+# that could not — sat with complete evidence it could not bank. Running
+# `adopt` as the token's issuer adds no authority: the verb takes the same
+# lifecycle and run-lease locks and refuses unless state, lease and authority
+# all name this token, so if anything re-owned the run since this caller
+# committed, the adoption is refused and the new owner keeps the run. Call it
+# only after the caller's own fences are released, because `adopt` takes the
+# same locks.
+# Prints the scaffold's JSON answer, or `null` when no contract needs moving.
+CONTRACT_SCAFFOLD="$SIZING_CLASSIFIER_DIR/smoke-run-scaffold.sh"
+adopt_resumed_contract() {  # <runId> <sourceSha> <owner>
+  local out
+  [ "$(contract_adoption_required "$1")" = true ] || { printf 'null'; return 0; }
+  out="$(SMOKE_LANE_ROLE=coordinator SMOKE_GATE_OWNER="$3" SMOKE_GATE_STATE_DIR="$STATE_DIR" \
+         bash "$CONTRACT_SCAFFOLD" adopt "$CHALLENGER_RUN_ROOT/$1" "$2" 2>/dev/null | tail -n 1)" || true
+  if jq -e 'type == "object" and (.ok | type) == "boolean"' >/dev/null 2>&1 <<<"$out"; then
+    printf '%s' "$out"
+  else
+    jq -cn '{ok:false,error:"contract adoption did not complete (no answer from the scaffold) — run smoke-run-scaffold.sh adopt with this wake'"'"'s token"}'
   fi
 }
 challenger_deadline_from_now() {
@@ -1388,6 +1421,7 @@ default_pr_state() {
     gateStatus: null,
     reconciliation: null,
     challengerDeadline: null,
+    challengerStartedAt: null,
     challengerDisposition: null,
     challengerTimedOutAt: null
   }'
@@ -3284,16 +3318,21 @@ if [ "$COMMAND" = "claim" ]; then
   # keeps its original deadline. Stamping a fresh one on every recovery
   # reclaim reset the clock hourly and made `challenger-timeout` unreachable
   # — pr1432 looped ~4h "stuck waiting on challenger" (2026-09-02).
+  CLAIM_RESUMED="$(jq -r --arg sha "$SHA" --arg run "$RUN_ID" \
+    'if (.activeSha == $sha and .challengerDisposition == null and .activeRunId == $run)
+     then "true" else "false" end' <<<"$STATE")"
   STATE="$(jq -c --arg sha "$SHA" --arg now "$NOW" --arg run "$RUN_ID" --arg owner "$OWNER" --arg took "$TOOK_OVER" \
     --arg deadline "$(challenger_deadline_from_now)" --arg claimant "$CLAIMANT" \
     '(if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
       then .challengerDeadline else $deadline end) as $dl |
+    (if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
+      then (.challengerStartedAt // null) else null end) as $started |
      .activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=$now |
      .activeLeaseOwner=$owner |
      .activeClaimant=(if $claimant == "" then null else $claimant end) |
      .displacedRunId=(if $took == "" then null else $took end) |
      .displacedAt=(if $took == "" then null else $now end) |
-     .challengerDeadline=$dl |
+     .challengerDeadline=$dl | .challengerStartedAt=$started |
      .challengerDisposition=null | .challengerTimedOutAt=null |
      .finishIntent=null' <<<"$STATE")"
   if ! write_pr_state "$PR" "$STATE"; then
@@ -3315,6 +3354,19 @@ if [ "$COMMAND" = "claim" ]; then
   fi
   lease_fence_end
   task_binding_lock_end
+  # Resuming the run id this PR already published moves its completion
+  # contract onto the claimant's token (adopt_resumed_contract), same as
+  # `poll`'s recovery. Reported only on a resume, so an ordinary claim's
+  # output is unchanged.
+  CLAIM_ADOPTION='{}'
+  if [ "$CLAIM_RESUMED" = true ]; then
+    CLAIM_ADOPTION_RESULT="$(adopt_resumed_contract "$RUN_ID" "$SHA" "$OWNER")"
+    CLAIM_ADOPTION="$(jq -c --arg required "$(contract_adoption_required "$RUN_ID")" '
+      {contractAdoption:(if . == null then null else del(.contract) end),
+       contractAdoptionRequired:(if (. != null and .ok == true) then false
+                                 elif $required == "null" then null else ($required == "true") end)}' \
+      <<<"$CLAIM_ADOPTION_RESULT")"
+  fi
   # A freeze claim carries what it admitted — the pinned range and journey
   # selection, the same objects `poll`'s settled wake carries — through
   # --slurpfile, never argv (range-sized; see the MAX_ARG_STRLEN note in
@@ -3322,10 +3374,12 @@ if [ "$COMMAND" = "claim" ]; then
   jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg sha "$SHA" --arg took "$TOOK_OVER" \
     --argjson lease "$(jq -c '.lease' <<<"$LEASE_RESULT")" \
     --arg deadline "$(jq -r '.challengerDeadline' <<<"$STATE")" \
+    --argjson adoption "$CLAIM_ADOPTION" \
     --slurpfile facts <(if [ "$CLAIM_FREEZE" = true ]; then cat "$TMP_DIR/claim-facts.json"; else printf '{}'; fi) \
     '{ok:true,runId:$run,pr:$pr,sha:$sha,
       tookOverFrom:(if $took == "" then null else $took end),
       lease:$lease,challengerDeadline:$deadline}
+     + $adoption
      + (if ($facts[0] | has("campaignRange")) then {campaignRange:$facts[0].campaignRange} else {} end)
      + (if ($facts[0] | has("journeys")) then {journeys:$facts[0].journeys} else {} end)'
   exit 0
@@ -3513,6 +3567,102 @@ if [ "$COMMAND" = "progress" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# challenger-start: the challenger's window begins at the root post, not at
+# claim. Called by whoever posts the root, just before it goes out. It sets
+# the deadline ONCE, to min(now + CHALLENGER_TIMEOUT_SECONDS, provisional
+# deadline + CHALLENGER_INTAKE_ALLOWANCE_SECONDS), and never moves it again: a
+# repeat answers with the deadline already set, and a same-SHA recovery keeps
+# it (claim/poll carry challengerStartedAt with the deadline). It refuses once
+# the provisional deadline has passed, so an expired window is never revived.
+# Refusal codes, keyed on by callers instead of the prose:
+#   no-deadline       structural: this run has no deadline to re-anchor
+#   deadline-passed   the provisional deadline already expired
+#   disposition-filed the challenger already filed or timed out
+if [ "$COMMAND" = "challenger-start" ]; then
+  RUN_ID="${2:-}"
+  OWNER="${3:-$DEFAULT_OWNER}"
+  if ! run_id_ok "$RUN_ID"; then
+    jq -cn --arg run "$RUN_ID" \
+      '{ok:false,error:"challenger-start requires a run id of 1-200 chars of [A-Za-z0-9._-]",runId:$run}'
+    exit 2
+  fi
+  PR="$(find_pr_for_run "$RUN_ID" || true)"
+  if [ -z "${PR:-}" ]; then
+    emit_not_active "$RUN_ID" "not the active run (reclaimed or finished) — nothing to start"
+    exit 0
+  fi
+  exec 9>"$(pr_lock_file "$PR")"
+  if ! flock -w "$LOCK_WAIT" 9; then
+    emit_lock_busy "$COMMAND" "$PR"
+    exit 0
+  fi
+  STATE="$(read_pr_state "$PR")"
+  if [ "$RUN_ID" != "$(jq -r '.activeRunId // empty' <<<"$STATE")" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
+      --arg active "$(jq -r '.activeRunId // empty' <<<"$STATE")" \
+      '{ok:false,error:"not the active run (reclaimed or finished) — nothing to start",
+        pr:$pr,runId:$run,activeRunId:(if $active == "" then null else $active end)}'
+    exit 0
+  fi
+  STORED_OWNER="$(jq -r '.activeLeaseOwner // empty' <<<"$STATE")"
+  if [ -z "$STORED_OWNER" ] || [ "$OWNER" != "$STORED_OWNER" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg owner "$OWNER" --arg stored "$STORED_OWNER" \
+      '{ok:false,error:"caller owner does not match the owner recorded by claim - challenger start refused",pr:$pr,runId:$run,requestedBy:$owner,claimedBy:(if $stored == "" then null else $stored end)}'
+    exit 0
+  fi
+  claimant_guard "$STATE" "$PR" "$RUN_ID" "$COMMAND"
+  DEADLINE="$(jq -r '.challengerDeadline // empty' <<<"$STATE")"
+  STARTED_AT="$(jq -r '.challengerStartedAt // empty' <<<"$STATE")"
+  if [ -n "$STARTED_AT" ] && [ -n "$DEADLINE" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg deadline "$DEADLINE" --arg started "$STARTED_AT" \
+      '{ok:true,runId:$run,pr:$pr,started:false,alreadyStarted:true,
+        challengerStartedAt:$started,challengerDeadline:$deadline}'
+    exit 0
+  fi
+  if [ -z "$DEADLINE" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
+      '{ok:false,refusal:"no-deadline",error:"this run has no challengerDeadline to re-anchor",pr:$pr,runId:$run}'
+    exit 0
+  fi
+  if [ "$(jq -r '.challengerDisposition // empty' <<<"$STATE")" != "" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
+      '{ok:false,refusal:"disposition-filed",error:"the challenger window is already closed for this run",pr:$pr,runId:$run}'
+    exit 0
+  fi
+  NOW_EPOCH="$(date -u +%s)"
+  DEADLINE_EPOCH="$(epoch_or_zero "$DEADLINE")"
+  if [ "$NOW_EPOCH" -ge "$DEADLINE_EPOCH" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg deadline "$DEADLINE" \
+      '{ok:false,refusal:"deadline-passed",error:"the provisional challenger deadline has passed — challenger-timeout applies; the window is not reopened",
+        pr:$pr,runId:$run,challengerDeadline:$deadline}'
+    exit 0
+  fi
+  NEXT_EPOCH="$(( NOW_EPOCH + CHALLENGER_TIMEOUT_SECONDS ))"
+  CEILING_EPOCH="$(( DEADLINE_EPOCH + CHALLENGER_INTAKE_ALLOWANCE_SECONDS ))"
+  [ "$NEXT_EPOCH" -le "$CEILING_EPOCH" ] || NEXT_EPOCH="$CEILING_EPOCH"
+  [ "$NEXT_EPOCH" -ge "$DEADLINE_EPOCH" ] || NEXT_EPOCH="$DEADLINE_EPOCH"
+  NEXT_DEADLINE="$(date -u -d "@$NEXT_EPOCH" +'%Y-%m-%dT%H:%M:%SZ')"
+  NOW="$(date -u -d "@$NOW_EPOCH" +'%Y-%m-%dT%H:%M:%SZ')"
+  if ! lease_fence_begin "$PR" "$RUN_ID" "$OWNER" "$COMMAND"; then
+    exit 0
+  fi
+  STATE="$(jq -c --arg now "$NOW" --arg deadline "$NEXT_DEADLINE" \
+    '.challengerStartedAt=$now | .challengerDeadline=$deadline' <<<"$STATE")"
+  if ! write_pr_state "$PR" "$STATE"; then
+    lease_fence_end
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
+      '{ok:false,error:"could not write challenger-start state - the provisional deadline stands",pr:$pr,runId:$run}'
+    exit 1
+  fi
+  lease_fence_end
+  jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg deadline "$NEXT_DEADLINE" --arg started "$NOW" \
+    --arg provisional "$DEADLINE" \
+    '{ok:true,runId:$run,pr:$pr,started:true,alreadyStarted:false,
+      challengerStartedAt:$started,challengerDeadline:$deadline,provisionalDeadline:$provisional}'
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
 if [ "$COMMAND" = "release" ]; then
   RUN_ID="${2:-}"
   OWNER="${3:-$DEFAULT_OWNER}"
@@ -3546,7 +3696,7 @@ if [ "$COMMAND" = "release" ]; then
     exit 0
   fi
   STATE="$(jq -c '.activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null |
-     .activeLeaseOwner=null | .activeClaimant=null | .challengerDeadline=null | .finishIntent=null' <<<"$STATE")"
+     .activeLeaseOwner=null | .activeClaimant=null | .challengerDeadline=null | .challengerStartedAt=null | .finishIntent=null' <<<"$STATE")"
   # Remove the PR binding and run lease together under the shared locks. Any
   # later failure restores both identities before releasing the fence.
   if ! remove_pr_authority_fenced "$PR" "$RUN_ID" "$OWNER"; then
@@ -4560,7 +4710,7 @@ if [ "$COMMAND" = "finish" ]; then
     '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
      .completedVerdictDigest=$digest | .finishIntent=null |
      .activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null |
-     .activeLeaseOwner=null | .activeClaimant=null | .challengerDeadline=null' <<<"$STATE")"
+     .activeLeaseOwner=null | .activeClaimant=null | .challengerDeadline=null | .challengerStartedAt=null' <<<"$STATE")"
   if ! write_pr_state "$PR" "$STATE"; then
     RESTORED=false
     if lease_restore_fenced "$RUN_ID" "$FENCED_LEASE_JSON" &&
@@ -4835,7 +4985,7 @@ stalled_run_alarm() {  # prints one wake and returns 0, or prints nothing and re
       completionContractExists:$contract, contractAdoptionRequired:$adopt,
       leaseLive:$leaseLive,
       notSettling:$why,
-      hint:"This run is still claimed but its coordinator stopped stamping progress, and its PR is no longer a settle candidate, so poll will never resume it. Nothing was reclaimed: no owner token, lease or authority changed. Decide: resume the SAME run id with `claim <runId> <pr> <sourceSha>` (allowed because progress is stale, once leaseLive is false; keeps the evidence and the challenger deadline), run `smoke-run-scaffold.sh adopt <run-dir> <sourceSha>` first when contractAdoptionRequired is true, and carry it to `finish`, or abandon it with `claim` then `release`. This alarm fires once per run id."}}'
+      hint:"This run is still claimed but its coordinator stopped stamping progress, and its PR is no longer a settle candidate, so poll will never resume it. Nothing was reclaimed: no owner token, lease or authority changed. Decide: resume the SAME run id with `claim <runId> <pr> <sourceSha>` (allowed because progress is stale, once leaseLive is false; keeps the evidence and the challenger deadline), which moves the completion contract onto your token itself (run `smoke-run-scaffold.sh adopt <run-dir> <sourceSha>` only if that claim still answers contractAdoptionRequired:true), and carry it to `finish`, or abandon it with `claim` then `release`. This alarm fires once per run id."}}'
   return 0
 }
 
@@ -4844,7 +4994,7 @@ if [ "$COMMAND" != "poll" ]; then
     '{ok:false,error:("unknown command: " + $command),
       commands:["poll","check","wait-settled","claim","release","progress","finish",
                 "lease-claim","lease-renew","lease-release","lease-status",
-                "challenger-timeout"]}'
+                "challenger-start","challenger-timeout"]}'
   exit 2
 fi
 
@@ -5398,10 +5548,12 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
     --arg deadline "$(challenger_deadline_from_now)" --arg claimant "$CLAIMANT" \
     '(if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
       then .challengerDeadline else $deadline end) as $dl |
+    (if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
+      then (.challengerStartedAt // null) else null end) as $started |
      .activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=null |
      .activeLeaseOwner=$owner |
      .activeClaimant=(if $claimant == "" then null else $claimant end) |
-     .challengerDeadline=$dl |
+     .challengerDeadline=$dl | .challengerStartedAt=$started |
      .challengerDisposition=null | .challengerTimedOutAt=null | .finishIntent=null' <<<"$STATE")"
   if ! write_pr_state "$W_PR" "$STATE"; then
     lease_fence_end
@@ -5418,17 +5570,24 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
   task_binding_lock_end
 
   # A resumed run id whose completion contract already exists is bound to the
-  # PREDECESSOR's token (see contract_adoption_required). Say so in the wake
-  # rather than leaving the successor to discover it from a refusal.
+  # PREDECESSOR's token (see contract_adoption_required); the gate moves it to
+  # the token it just minted (adopt_resumed_contract). The wake still says
+  # whether the successor has to adopt, which is now only when that failed.
   CONTRACT_ADOPTION_REQUIRED=false
+  CONTRACT_ADOPTION=null
   if [ "$RESUMED_RUN_ID" = true ]; then
     CONTRACT_ADOPTION_REQUIRED="$(contract_adoption_required "$RUN_ID")"
+    CONTRACT_ADOPTION="$(adopt_resumed_contract "$RUN_ID" "$HEAD_SHA" "$OWNER_TOKEN")"
+    if [ "$(jq -r '.ok // false' <<<"$CONTRACT_ADOPTION")" = true ]; then
+      CONTRACT_ADOPTION_REQUIRED=false
+    fi
   fi
 
   jq -cn \
     --arg repo "$REPO" --arg branch "$BRANCH" --argjson pr "$W_PR" --arg runId "$RUN_ID" \
     --arg ownerToken "$OWNER_TOKEN" \
     --argjson contractAdoptionRequired "$CONTRACT_ADOPTION_REQUIRED" \
+    --argjson contractAdoption "$(jq -c 'if . == null then null else del(.contract) end' <<<"$CONTRACT_ADOPTION")" \
     --slurpfile factsFile <(printf '%s' "$FACTS") --argjson recovery "$RECOVERY" \
     --arg abandoned "$ABANDONED" \
     --argjson resumedRunId "$RESUMED_RUN_ID" \
@@ -5437,6 +5596,7 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
       repo:$repo, branch:$branch, pr:$pr, runId:$runId, coordinatorOwnerToken:$ownerToken,
       resumedRunId:$resumedRunId,
       contractAdoptionRequired:$contractAdoptionRequired,
+      contractAdoption:$contractAdoption,
       sourceSha:$facts.headSha,
       previewUrl:$facts.backendPreviewUrl,
       frontendPreviewUrl:$facts.frontendPreviewUrl,

@@ -2341,6 +2341,86 @@ jq -e '.activeRunId == null and .completedRunId == "run-intake-dead" and .comple
   "$STATE_DIR/pr-68-state.json" >/dev/null || { echo "7d: the slot was not released BLOCKED" >&2; exit 1; }
 unset SMOKE_GATE_RUN_ROOT
 
+# --- 7e. challenger-start anchors the challenger's window to the root post ---
+# `claim` stamps a provisional deadline; the challenger only starts at the root
+# post. `challenger-start` moves the deadline ONCE, to min(now + timeout,
+# provisional + intake allowance). A repeat and a same-SHA recovery leave it
+# where it is, an expired provisional deadline is never revived, and a run
+# whose root never goes out still times out at the provisional deadline.
+START_SHA="$(sha 5)"
+stalled_fixture 69 "$START_SHA"
+pr69() { jq -c "$1" "$STATE_DIR/pr-69-state.json" > "$STATE_DIR/pr-69-state.tmp"; mv "$STATE_DIR/pr-69-state.tmp" "$STATE_DIR/pr-69-state.json"; }
+iso_at() { date -u -d "@$1" +'%Y-%m-%dT%H:%M:%SZ'; }
+bash "$GATE" claim run-start 69 "$START_SHA" owner-start | jq -e '.ok == true' >/dev/null
+jq -e '.challengerStartedAt == null and (.challengerDeadline | type == "string")' "$STATE_DIR/pr-69-state.json" >/dev/null
+# Intake took 40 minutes: the provisional deadline is that much closer.
+START_PROVISIONAL="$(iso_at $(( $(date -u +%s) + 5400 - 2400 )))"
+pr69 ".challengerDeadline=\"$START_PROVISIONAL\""
+# Only the run's own owner and claimant may start it; nothing moves otherwise.
+bash "$GATE" challenger-start run-start owner-other | jq -e '.ok == false and (.error | test("caller owner"))' >/dev/null
+bash "$GATE" challenger-start run-nope owner-start | jq -e '.ok == false and (.error | test("not the active run"))' >/dev/null
+SMOKE_GATE_CLAIMANT=controller bash "$GATE" challenger-start run-start owner-start |
+  jq -e '.ok == false and .claimantMismatch == true' >/dev/null
+jq -e --arg d "$START_PROVISIONAL" '.challengerDeadline == $d and .challengerStartedAt == null' "$STATE_DIR/pr-69-state.json" >/dev/null ||
+  { echo "7e: a refused challenger-start moved the deadline" >&2; exit 1; }
+START_BEFORE="$(date -u +%s)"
+START_OUT="$(bash "$GATE" challenger-start run-start owner-start)"
+START_AFTER="$(date -u +%s)"
+jq -e --arg p "$START_PROVISIONAL" '.ok == true and .started == true and .provisionalDeadline == $p' <<<"$START_OUT" >/dev/null ||
+  { echo "7e: challenger-start did not start: $START_OUT" >&2; exit 1; }
+START_DEADLINE="$(jq -r '.challengerDeadline' <<<"$START_OUT")"
+START_EPOCH="$(date -u -d "$START_DEADLINE" +%s)"
+[ "$START_EPOCH" -ge $(( START_BEFORE + 5400 )) ] && [ "$START_EPOCH" -le $(( START_AFTER + 5400 )) ] ||
+  { echo "7e: the challenger did not get its full window from the root post ($START_DEADLINE)" >&2; exit 1; }
+jq -e --arg d "$START_DEADLINE" --argjson o "$START_OUT" \
+  '.challengerDeadline == $d and .challengerStartedAt == $o.challengerStartedAt' "$STATE_DIR/pr-69-state.json" >/dev/null
+# Once only: a repeat answers with the deadline already set.
+bash "$GATE" challenger-start run-start owner-start | jq -e --arg d "$START_DEADLINE" '
+  .ok == true and .started == false and .alreadyStarted == true and .challengerDeadline == $d' >/dev/null
+# challenger-timeout keys on the re-anchored deadline.
+bash "$GATE" challenger-timeout run-start owner-start | jq -e '.ok == false and .refusal == "deadline-not-passed"' >/dev/null
+# A same-SHA recovery keeps the anchor, and cannot start the window again.
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-run-start.json"
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" claim run-start 69 "$START_SHA" owner-start-2 | jq -e '.ok == true' >/dev/null
+jq -e --arg d "$START_DEADLINE" --argjson o "$START_OUT" \
+  '.challengerDeadline == $d and .challengerStartedAt == $o.challengerStartedAt' "$STATE_DIR/pr-69-state.json" >/dev/null ||
+  { echo "7e: recovery reset the challenger anchor" >&2; exit 1; }
+bash "$GATE" challenger-start run-start owner-start-2 | jq -e --arg d "$START_DEADLINE" '.alreadyStarted == true and .challengerDeadline == $d' >/dev/null
+bash "$GATE" release run-start owner-start-2 | jq -e '.ok == true' >/dev/null
+jq -e '.challengerStartedAt == null and .challengerDeadline == null' "$STATE_DIR/pr-69-state.json" >/dev/null
+# The ceiling: an intake that ate most of the window gets the allowance, not a
+# full fresh window.
+bash "$GATE" claim run-slow 69 "$START_SHA" owner-slow | jq -e '.ok == true' >/dev/null
+jq -e '.challengerStartedAt == null' "$STATE_DIR/pr-69-state.json" >/dev/null ||
+  { echo "7e: a new campaign inherited the previous run's anchor" >&2; exit 1; }
+SLOW_PROVISIONAL_EPOCH="$(( $(date -u +%s) + 600 ))"
+pr69 ".challengerDeadline=\"$(iso_at "$SLOW_PROVISIONAL_EPOCH")\""
+bash "$GATE" challenger-start run-slow owner-slow | jq -e --arg d "$(iso_at $(( SLOW_PROVISIONAL_EPOCH + 3600 )))" '
+  .ok == true and .started == true and .challengerDeadline == $d' >/dev/null ||
+  { echo "7e: re-anchoring exceeded provisional + allowance" >&2; exit 1; }
+bash "$GATE" release run-slow owner-slow >/dev/null
+# Structural refusals, each with its code and nothing written.
+bash "$GATE" claim run-late 69 "$START_SHA" owner-late | jq -e '.ok == true' >/dev/null
+start_refusal() { # <code>
+  local before out
+  before="$(jq -c '[.challengerDeadline,.challengerStartedAt]' "$STATE_DIR/pr-69-state.json")"
+  out="$(bash "$GATE" challenger-start run-late owner-late)" || true
+  jq -e --arg c "$1" '.ok == false and .refusal == $c' <<<"$out" >/dev/null ||
+    { echo "7e: expected refusal $1, got: $out" >&2; exit 1; }
+  [ "$(jq -c '[.challengerDeadline,.challengerStartedAt]' "$STATE_DIR/pr-69-state.json")" = "$before" ] ||
+    { echo "7e: a $1 refusal wrote state" >&2; exit 1; }
+}
+pr69 '.challengerDeadline=""'
+start_refusal no-deadline
+pr69 '.challengerDeadline="2999-01-01T00:00:00Z" | .challengerDisposition="no-disposition"'
+start_refusal disposition-filed
+pr69 '.challengerDeadline="2000-01-01T00:00:00Z" | .challengerDisposition=null'
+start_refusal deadline-passed
+# A root that never went out: the provisional deadline still ends the run.
+bash "$GATE" challenger-timeout run-late owner-late | jq -e '.ok == true and .verdict == "BLOCKED"' >/dev/null ||
+  { echo "7e: a never-started challenger window did not time out at the provisional deadline" >&2; exit 1; }
+unset SMOKE_GATE_RUN_ROOT
+
 # --- 8. finish suspends the backend preview ---------------------------------
 fresh_state
 FINISH_SHA="$(sha 3)"
@@ -3273,17 +3353,22 @@ jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and (.data.coo
   exit 1
 }
 
-# --- Recovery owner adopts the predecessor's contract -----------------------
+# --- Same-run recovery adopts the predecessor's contract itself ------------
 # End to end through the real poll: claim -> contract -> marker -> container
 # dies (lease expires, progress goes stale) -> poll recovers the SAME run id
-# under a freshly minted token -> the successor adopts, finishes the missing
-# lane and finishes the run, with the predecessor's marker still counting.
+# under a freshly minted token AND rebinds the contract to it -> the successor
+# writes straight away, finishes the missing lane and finishes the run, with
+# the predecessor's marker still counting. A `claim` that resumes the run id
+# adopts the same way; an adoption that dies midway leaves the contract as it
+# was and the wake says the successor must adopt; a terminal run or a new SHA
+# adopts nothing.
 # Owner tokens are never echoed: every failure message below names the step.
 SCAFFOLD="$SCRIPT_DIR/smoke-run-scaffold.sh"
 BARRIER="$SCRIPT_DIR/smoke-evidence-barrier.sh"
 export SMOKE_GATE_RUN_ROOT="$STATE_DIR/run-root"
 mkdir -p "$SMOKE_GATE_RUN_ROOT"
-jq -e '.data.resumedRunId == false and .data.contractAdoptionRequired == false' <<<"$NEXT_POLL" >/dev/null
+jq -e '.data.resumedRunId == false and .data.contractAdoptionRequired == false and
+  .data.contractAdoption == null' <<<"$NEXT_POLL" >/dev/null
 ADOPT_RUN="$(jq -r '.data.runId' <<<"$NEXT_POLL")"
 ADOPT_T1="$(jq -r '.data.coordinatorOwnerToken' <<<"$NEXT_POLL")"
 ADOPT_DIR="$SMOKE_GATE_RUN_ROOT/$ADOPT_RUN"
@@ -3299,11 +3384,15 @@ bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for
 # The predecessor's container dies. A later deadline would be observable.
 expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$ADOPT_RUN.json"
 sleep 1
-# Two competing recoveries: exactly one poll wins the lease and is handed a
-# token; the other is refused by the shared authority and delivers none.
-SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll > "$STATE_DIR/recover-1.json" 2>/dev/null &
+# Two competing recoveries, each from a container with no owner identity of
+# its own: exactly one poll wins the lease, is handed a token, and rebinds the
+# contract to it; the other is refused by the shared authority and adopts
+# nothing.
+( unset SMOKE_GATE_OWNER; HOSTNAME=recovery-container-a SMOKE_GATE_PROGRESS_STALE_SECONDS=0 \
+    bash "$GATE" poll > "$STATE_DIR/recover-1.json" 2>/dev/null ) &
 RECOVER_PID_1=$!
-SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll > "$STATE_DIR/recover-2.json" 2>/dev/null &
+( unset SMOKE_GATE_OWNER; HOSTNAME=recovery-container-b SMOKE_GATE_PROGRESS_STALE_SECONDS=0 \
+    bash "$GATE" poll > "$STATE_DIR/recover-2.json" 2>/dev/null ) &
 RECOVER_PID_2=$!
 wait "$RECOVER_PID_1" || true
 wait "$RECOVER_PID_2" || true
@@ -3313,25 +3402,32 @@ wait "$RECOVER_PID_2" || true
 RECOVERED="$(jq -sc '[.[] | select(.data.trigger == "pr_build_settled")][0]' \
   "$STATE_DIR/recover-1.json" "$STATE_DIR/recover-2.json")"
 jq -e --arg run "$ADOPT_RUN" '.wakeAgent == true and .data.runId == $run and .data.resumedRunId == true and
-  .data.recovery == true and .data.contractAdoptionRequired == true' <<<"$RECOVERED" >/dev/null || {
-  echo "recovery wake did not resume the run id and flag the contract adoption" >&2; exit 1; }
+  .data.recovery == true and .data.contractAdoptionRequired == false and
+  .data.contractAdoption.ok == true and .data.contractAdoption.adopted == true and
+  .data.contractAdoption.adoptionCount == 1 and (.data.contractAdoption | has("contract") | not)' <<<"$RECOVERED" >/dev/null || {
+  echo "recovery wake did not resume the run id and report its own contract adoption" >&2; exit 1; }
 ADOPT_T2="$(jq -r '.data.coordinatorOwnerToken' <<<"$RECOVERED")"
 [ -n "$ADOPT_T2" ] && [ "$ADOPT_T2" != "$ADOPT_T1" ]
 jq -e --arg owner "$ADOPT_T2" '.activeLeaseOwner == $owner' "$STATE_DIR/pr-126-state.json" >/dev/null
+jq -e --arg owner "$ADOPT_T2" '.coordinatorOwnerToken == $owner and (.ownerAdoptions | length) == 1' \
+  "$ADOPT_DIR/completion-contract.json" >/dev/null || {
+  echo "the winning recovery did not rebind the contract to the token it minted (exactly once)" >&2; exit 1; }
 # No fresh time budget: the original challenger deadline survives recovery.
 [ "$(jq -r '.challengerDeadline' "$STATE_DIR/pr-126-state.json")" = "$ADOPT_DEADLINE" ] || {
   echo "recovery replaced the original challenger deadline" >&2; exit 1; }
-# Before adoption: the predecessor is fenced, the successor is refused by the
-# contract, and a caller that lost the recovery race cannot adopt at all.
+# The predecessor is fenced and a caller that lost the recovery race cannot
+# adopt; the successor needs no adopt of its own.
 OUT="$(scaffold_as "$ADOPT_T1" marker "$ADOPT_DIR" S1 fail stale 2>&1 || true)"
 jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null
-OUT="$(scaffold_as "$ADOPT_T2" marker "$ADOPT_DIR" S1 fail unadopted 2>&1 || true)"
-jq -e '.ok == false and (.error | test("different coordinator owner")) and (.error | test("adopt"))' <<<"$OUT" >/dev/null
 OUT="$(scaffold_as owner-lost-the-race adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" 2>&1 || true)"
 jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null
 [ ! -e "$ADOPT_DIR/markers/S1.json" ]
-scaffold_as "$ADOPT_T2" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" | jq -e '.ok == true and .adopted == true and .adoptionCount == 1' >/dev/null
-scaffold_as "$ADOPT_T2" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" | jq -e '.ok == true and .adopted == false and .adoptionCount == 1' >/dev/null
+# Exact retry: the successor's own `adopt` is a byte-identical no-op.
+ADOPT_CONTRACT_HASH="$(sha256sum "$ADOPT_DIR/completion-contract.json" | cut -d' ' -f1)"
+scaffold_as "$ADOPT_T2" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" |
+  jq -e '.ok == true and .adopted == false and .alreadyOwner == true and .adoptionCount == 1' >/dev/null
+[ "$(sha256sum "$ADOPT_DIR/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_CONTRACT_HASH" ] || {
+  echo "an exact adopt retry rewrote the contract" >&2; exit 1; }
 # After adoption the predecessor is still fenced on every scaffold verb and on
 # the gate's own terminal verb; its token is nowhere in the contract.
 for stale_verb in marker redispatch adopt; do
@@ -3353,10 +3449,39 @@ for leaked in "$ADOPT_T1" "$(printf '%s' "$ADOPT_T1" | sha256sum | cut -d' ' -f1
 done
 jq -e '.ownerAdoptions == [.ownerAdoptions[0]] and (.ownerAdoptions[0] | keys == ["adoptedAt","index"])' \
   "$ADOPT_DIR/completion-contract.json" >/dev/null
-# The successor finishes the missing lane; the predecessor's marker is the
-# same bytes at the same generation and still satisfies the barrier.
+# The successor finishes the missing lane with no adopt of its own; the
+# predecessor's marker is the same bytes at the same generation.
 scaffold_as "$ADOPT_T2" marker "$ADOPT_DIR" S1 completed 'by the recovery owner' | jq -e '.ok == true and .generation == 1' >/dev/null
 [ "$(sha256sum "$ADOPT_DIR/markers/B1.json" | cut -d' ' -f1)" = "$ADOPT_B1_HASH" ]
+# A coordinator-side `claim` that resumes the published run id adopts too.
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$ADOPT_RUN.json"
+ADOPT_T3=claim-resume-owner
+OUT="$(SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" claim "$ADOPT_RUN" 126 "$POLL_FAIL_SHA" "$ADOPT_T3")"
+jq -e --arg run "$ADOPT_RUN" '.ok == true and .runId == $run and .contractAdoptionRequired == false and
+  .contractAdoption.adopted == true and .contractAdoption.adoptionCount == 2' <<<"$OUT" >/dev/null || {
+  echo "a resuming claim did not adopt the contract: $(jq -c 'del(.lease)' <<<"$OUT")" >&2; exit 1; }
+jq -e --arg owner "$ADOPT_T3" '.coordinatorOwnerToken == $owner' "$ADOPT_DIR/completion-contract.json" >/dev/null
+[ "$(jq -r '.challengerDeadline' "$STATE_DIR/pr-126-state.json")" = "$ADOPT_DEADLINE" ]
+# A crash between the adoption's validation and its write: the recovery still
+# owns the run, the contract is exactly what it was, and the wake says the
+# successor must adopt. Its own adopt then completes the move.
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-$ADOPT_RUN.json"
+ADOPT_CONTRACT_HASH="$(sha256sum "$ADOPT_DIR/completion-contract.json" | cut -d' ' -f1)"
+CRASHED="$(SMOKE_SCAFFOLD_TEST_CRASH_BEFORE_ADOPT_COMMIT=1 SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll || true)"
+jq -e --arg run "$ADOPT_RUN" '.data.trigger == "pr_build_settled" and .data.runId == $run and
+  .data.resumedRunId == true and .data.contractAdoptionRequired == true and
+  .data.contractAdoption.ok == false' <<<"$CRASHED" >/dev/null || {
+  echo "a recovery whose adoption died did not say the successor must adopt" >&2; exit 1; }
+[ "$(sha256sum "$ADOPT_DIR/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_CONTRACT_HASH" ] || {
+  echo "a crashed adoption changed the contract" >&2; exit 1; }
+ADOPT_T4="$(jq -r '.data.coordinatorOwnerToken' <<<"$CRASHED")"
+[ -n "$ADOPT_T4" ] && [ "$ADOPT_T4" != "$ADOPT_T3" ]
+OUT="$(scaffold_as "$ADOPT_T3" marker "$ADOPT_DIR" S1 completed stale 2>&1 || true)"
+jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null
+OUT="$(scaffold_as "$ADOPT_T4" redispatch "$ADOPT_DIR" S1 2>&1 || true)"
+jq -e '.ok == false and (.error | test("different coordinator owner"))' <<<"$OUT" >/dev/null
+scaffold_as "$ADOPT_T4" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" |
+  jq -e '.ok == true and .adopted == true and .adoptionCount == 3' >/dev/null
 # The scaffold's pr contract also owes a pair-identity record before a barrier
 # phase passes (XZO #2092, covered by smoke-evidence-barrier.test.sh); seed a
 # clean one so this still asserts only what adoption leaves behind.
@@ -3371,11 +3496,27 @@ jq -c '.sourceSha as $s | {ok:true,freezeGeneration:1,history:[],expectedSourceS
 printf '{"label":"seed","verdict":"ok","freezeGeneration":1}\n' > "$ADOPT_DIR/coordinator/identity-checks.ndjson"
 bash "$BARRIER" "$ADOPT_DIR" lanes | jq -e '.ready == true' >/dev/null
 [ "$(jq -r '.challengerDeadline' "$STATE_DIR/pr-126-state.json")" = "$ADOPT_DEADLINE" ]
-OUT="$(bash "$GATE" finish "$POLL_FAIL_SHA" "$ADOPT_RUN" NO_GO "$ADOPT_T2" || true)"
+OUT="$(bash "$GATE" finish "$POLL_FAIL_SHA" "$ADOPT_RUN" NO_GO "$ADOPT_T4" || true)"
 jq -e '.ok == true' <<<"$OUT" >/dev/null || { echo "recovery owner could not finish the adopted run" >&2; exit 1; }
-# Already terminal: nothing holds the slot, so nothing can adopt into it.
-OUT="$(scaffold_as "$ADOPT_T2" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" 2>&1 || true)"
+# Already terminal: nothing holds the slot, so nothing can adopt into it, and
+# a later poll on the same build resumes nothing and adopts nothing.
+OUT="$(scaffold_as "$ADOPT_T4" adopt "$ADOPT_DIR" "$POLL_FAIL_SHA" 2>&1 || true)"
 jq -e '.ok == false and (.error | test("does not hold the gate"))' <<<"$OUT" >/dev/null
+ADOPT_CONTRACT_HASH="$(sha256sum "$ADOPT_DIR/completion-contract.json" | cut -d' ' -f1)"
+SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll | jq -e '.data.trigger != "pr_build_settled"' >/dev/null
+[ "$(sha256sum "$ADOPT_DIR/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_CONTRACT_HASH" ]
+# A different SHA is a different campaign: a new run id, and the old run's
+# contract is left alone.
+ADOPT_NEXT_SHA="$(sha a)"
+export STUB_PR_LIST="[{\"number\":126,\"headRefOid\":\"$ADOPT_NEXT_SHA\",\"headRefName\":\"feature/y\"}]"
+export STUB_RUN_LIST="[{\"headSha\":\"$ADOPT_NEXT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$ADOPT_NEXT_SHA\"}}]"
+NEW_SHA_POLL="$(SMOKE_GATE_PROGRESS_STALE_SECONDS=0 bash "$GATE" poll || true)"
+jq -e --arg run "$ADOPT_RUN" '.data.trigger == "pr_build_settled" and .data.runId != $run and
+  .data.resumedRunId == false and .data.contractAdoption == null and
+  .data.contractAdoptionRequired == false' <<<"$NEW_SHA_POLL" >/dev/null || {
+  echo "a new SHA resumed or adopted the old run" >&2; exit 1; }
+[ "$(sha256sum "$ADOPT_DIR/completion-contract.json" | cut -d' ' -f1)" = "$ADOPT_CONTRACT_HASH" ]
 unset SMOKE_GATE_RUN_ROOT
 
 # --- INVARIANT 3: num_env rejects the classes it was built to stop --------

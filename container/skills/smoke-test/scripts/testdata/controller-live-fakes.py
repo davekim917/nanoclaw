@@ -368,7 +368,7 @@ def gate(argv):
             json.dump(doc, fh)
         os.replace(p + ".tmp", p)
 
-    if verb in ("finish", "challenger-timeout", "progress"):
+    if verb in ("finish", "challenger-timeout", "progress", "challenger-start"):
         run = argv[2] if verb == "finish" else argv[1]
         token = argv[4] if verb == "finish" else argv[2]
         f = fault("gate:" + verb)
@@ -384,7 +384,7 @@ def gate(argv):
             return code, out({"ok": False, "refusal": code, "error": "injected refusal: " + code})
         resumed = None
         vfile = os.path.join(gs, "runs", run, "verdict.json")
-        if verb != "progress" and os.path.exists(vfile):
+        if verb in ("finish", "challenger-timeout") and os.path.exists(vfile):
             existing = json.load(open(vfile))
             want = argv[3] if verb == "finish" else "BLOCKED"
             if verb == "finish" and (existing.get("sha"), existing.get("verdict")) != (argv[1], want):
@@ -410,6 +410,38 @@ def gate(argv):
             st["activeProgressAt"] = now_iso()
             write(p, st)
             return "progress", out({"ok": True, "runId": run})
+        if verb == "challenger-start":
+            # The real verb's order and refusal codes (smoke-pr-gate.sh
+            # challenger-start): a repeat answers with the deadline already
+            # set, then no-deadline / disposition-filed / deadline-passed, then
+            # min(now + timeout, provisional + allowance), never earlier than
+            # the provisional deadline.
+            deadline = st.get("challengerDeadline") or ""
+            if st.get("challengerStartedAt") and deadline:
+                return "challenger-start", out({"ok": True, "started": False, "alreadyStarted": True,
+                                                "challengerStartedAt": st["challengerStartedAt"],
+                                                "challengerDeadline": deadline})
+            if not deadline:
+                return "no-deadline", out({"ok": False, "refusal": "no-deadline",
+                                           "error": "this run has no challengerDeadline to re-anchor"})
+            if st.get("challengerDisposition"):
+                return "disposition-filed", out({"ok": False, "refusal": "disposition-filed",
+                                                 "error": "the challenger window is already closed for this run"})
+            now_s = int(time.time())
+            provisional = epoch_or_zero(deadline)
+            if now_s >= provisional:
+                return "deadline-passed", out({"ok": False, "refusal": "deadline-passed",
+                                               "error": "the provisional challenger deadline has passed"})
+            timeout = int(os.environ.get("SMOKE_GATE_CHALLENGER_TIMEOUT_SECONDS") or 5400)
+            allowance = int(os.environ.get("SMOKE_GATE_CHALLENGER_INTAKE_ALLOWANCE_SECONDS") or 3600)
+            nxt = max(provisional, min(now_s + timeout, provisional + allowance))
+            st["challengerStartedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_s))
+            st["challengerDeadline"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(nxt))
+            write(p, st)
+            return "challenger-start", out({"ok": True, "started": True, "alreadyStarted": False,
+                                            "challengerStartedAt": st["challengerStartedAt"],
+                                            "challengerDeadline": st["challengerDeadline"],
+                                            "provisionalDeadline": deadline})
         if verb == "challenger-timeout":
             # The real verb's own preconditions, in its order
             # (smoke-pr-gate.sh:4634-4670), each with the SAME machine-readable

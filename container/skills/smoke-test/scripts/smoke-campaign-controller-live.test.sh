@@ -1952,4 +1952,25 @@ claim not-a-date
 SMOKE_GATE_CLAIMANT=controller python3 "$FAKES" gate challenger-timeout "$RUN" "$TOKEN" \
   | jq -e '.ok == true' >/dev/null || fail "fake gate: an unparsable deadline is treated as passed, as the real gate treats it"
 
+# c1) The challenger's window starts at the root post. A live run
+#     whose claim-time deadline is still ahead (on the gate's wall clock, as
+#     the real verb reads it) re-anchors it with `challenger-start` before the
+#     root's first attempt, exactly once, and the root post names the
+#     re-anchored deadline. Every other case's claim deadline is already past
+#     on that clock, so the fake answers `deadline-passed` there and the
+#     provisional deadline stands, silently.
+new_case challenger-start-at-root
+C1_DL="$(date -u -d "@$(( $(date -u +%s) + 1800 ))" +'%Y-%m-%dT%H:%M:%SZ')"
+claim "$C1_DL"; wake_json
+ticks 0 9
+[ "$(jq -s '[.[] | select(.tool=="gate" and .argv[0]=="challenger-start")] | length' "$FAKE_LOG")" = 1 ] \
+  || fail "c1: challenger-start runs once, before the root post: $(jq -sc '[.[]|select(.tool=="gate")|.argv[0]]' "$FAKE_LOG")"
+C1_NEW="$(jq -r '.challengerDeadline' "$C/state/pr-$PR-state.json")"
+[ "$(jq -r '.challengerStartedAt // empty' "$C/state/pr-$PR-state.json")" != "" ] && [[ "$C1_NEW" > "$C1_DL" ]] \
+  || fail "c1: the gate's deadline was not re-anchored past the claim-time one ($C1_DL -> $C1_NEW)" 
+C1_WHEN="$(python3 -c 'import datetime,sys; d=datetime.datetime.strptime(sys.argv[1],"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc); print(d.astimezone().strftime("%a %H:%M %Z"))' "$C1_NEW")"
+jq -e --arg w "Deadline $C1_WHEN." '[.messages[] | select(.text | startswith("**Smoke campaign started"))] | length == 1 and (.[0].text | contains($w))' \
+  "$C/fake/enqueue.json" >/dev/null || fail "c1: the root post does not name the re-anchored deadline ($C1_WHEN)"
+certified_go c1
+
 echo "smoke campaign controller live tests passed"
