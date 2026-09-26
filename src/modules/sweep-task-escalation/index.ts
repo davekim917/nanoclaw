@@ -21,6 +21,10 @@
  * script off the occurrence rows, and this duty escalates an erroring agent
  * turn off the outcome ledger. They answer different questions and neither
  * subsumes the other.
+ *
+ * The gate lane (migration 084) is escalated by deadline instead of count: a
+ * run of non-ok pre-task results is reported once it outlives its declared
+ * bound, evaluated every tick so the deadline passes with no further fire.
  */
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getContainerConfig, resolveProviderName } from '../../db/container-configs.js';
@@ -29,6 +33,8 @@ import {
   markEscalated,
   pruneTaskRunOutcomes,
   readFailureStreak,
+  readGateEpisode,
+  type GateEpisode,
   type TaskRunOutcomeRow,
 } from '../../db/task-run-outcomes.js';
 import { resolveGroupTimezone } from '../../container-config.js';
@@ -36,6 +42,7 @@ import { SWEEP_DUTY_INVENTORY, registerSweepDuty, registerSweepDutySource } from
 import { log } from '../../log.js';
 import { notifyOperators } from '../../operator-alert.js';
 import { formatLocalTime } from '../../timezone.js';
+import { FALLBACK_BOUND_MS } from '../scheduling/observation.js';
 
 /**
  * Consecutive failed runs before a human is told.
@@ -166,9 +173,81 @@ async function escalateSeries(
   }
 }
 
-export async function runTaskFailureEscalation(): Promise<void> {
-  for (const { agent_group_id: agentGroupId, series_id: seriesId } of await listSeriesWithFailures()) {
+/**
+ * When a gate episode becomes overdue: its earliest start (first row, or an
+ * earlier declared `since`) plus its smallest bound. Both are minima over the
+ * whole episode, so a later row can pull the deadline in but never push it out.
+ */
+export function gateEpisodeDeadlineMs(episode: Pick<GateEpisode, 'firstRecordedAt' | 'earliestSince' | 'boundMs'>): {
+  startMs: number;
+  deadlineMs: number;
+} {
+  const recordedMs = Date.parse(episode.firstRecordedAt);
+  const sinceMs = episode.earliestSince === null ? Number.NaN : Date.parse(episode.earliestSince);
+  const startMs = Number.isFinite(sinceMs) ? Math.min(recordedMs, sinceMs) : recordedMs;
+  return { startMs, deadlineMs: startMs + (episode.boundMs ?? FALLBACK_BOUND_MS) };
+}
+
+/** `7_200_000` → `2h`; the largest unit that divides the bound exactly. */
+function formatBound(ms: number): string {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes % (24 * 60) === 0) return `${minutes / (24 * 60)}d`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
+}
+
+export function formatGateEscalationAlert(input: {
+  seriesId: string;
+  groupName: string;
+  start: string;
+  boundMs: number;
+  rows: number;
+  observation: string | null;
+  observedAt: string;
+  detail: string | null;
+}): string {
+  return [
+    `*Scheduled check overdue:* \`${input.seriesId}\` (group \`${input.groupName}\`)`,
+    `Not ok since ${input.start}, past its ${formatBound(input.boundMs)} bound (${input.rows} consecutive non-ok result${input.rows === 1 ? '' : 's'}).`,
+    `Latest: \`${input.observation ?? 'unknown'}\` at ${input.observedAt}: ${input.detail ?? '(no evidence recorded)'}`,
+    '',
+    `This alert re-arms after the next \`empty\` result or wake.`,
+  ].join('\n');
+}
+
+async function escalateGateEpisode(agentGroupId: string, seriesId: string, nowMs: number): Promise<void> {
+  const episode = await readGateEpisode(agentGroupId, seriesId);
+  if (!episode || episode.escalated) return;
+  const { startMs, deadlineMs } = gateEpisodeDeadlineMs(episode);
+  if (nowMs < deadlineMs) return;
+
+  const group = await getAgentGroup(agentGroupId);
+  const tz = await resolveGroupTimezone(agentGroupId);
+  const text = formatGateEscalationAlert({
+    seriesId,
+    groupName: group?.name ?? agentGroupId,
+    start: formatLocalTime(new Date(startMs).toISOString(), tz),
+    boundMs: episode.boundMs ?? FALLBACK_BOUND_MS,
+    rows: episode.rows,
+    observation: episode.newest.observation,
+    observedAt: formatLocalTime(episode.newest.recorded_at, tz),
+    detail: episode.newest.detail,
+  });
+  if (await notifyOperators(text, { source: 'task-gate-escalation', seriesId, agentGroupId })) {
+    await markEscalated(episode.newest.id);
+    log.warn('Escalated an overdue scheduled check', { seriesId, agentGroupId, rows: episode.rows });
+  } else {
+    log.warn('Overdue scheduled check could NOT be escalated — nobody was told', { seriesId, agentGroupId, text });
+  }
+}
+
+export async function runTaskFailureEscalation(nowMs: number = Date.now()): Promise<void> {
+  for (const { agent_group_id: agentGroupId, series_id: seriesId, source } of await listSeriesWithFailures()) {
     try {
+      if (source === 'gate') {
+        await escalateGateEpisode(agentGroupId, seriesId, nowMs);
+        continue;
+      }
       const { streak, escalated, firstFailureAt, newest } = await readFailureStreak(agentGroupId, seriesId);
       if (newest && firstFailureAt && shouldEscalateTaskFailures(streak, escalated)) {
         await escalateSeries(agentGroupId, seriesId, streak, firstFailureAt, newest);

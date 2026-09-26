@@ -11,7 +11,10 @@ import {
   markEscalated,
   pruneTaskRunOutcomes,
   readFailureStreak,
+  readGateEpisode,
   recordTaskRunOutcome,
+  upsertGateOutcome,
+  type GateOutcomeUpsert,
 } from './task-run-outcomes.js';
 
 let n = 0;
@@ -91,9 +94,9 @@ describe('task run outcomes', () => {
     expect((await readFailureStreak('ag-1', 'watch-1')).streak).toBe(1);
     expect(await listSeriesWithFailures()).toEqual(
       expect.arrayContaining([
-        { agent_group_id: 'ag-1', series_id: 'watch-1' },
-        { agent_group_id: 'ag-1', series_id: 'watch-2' },
-        { agent_group_id: 'ag-2', series_id: 'watch-1' },
+        { agent_group_id: 'ag-1', series_id: 'watch-1', source: 'turn' },
+        { agent_group_id: 'ag-1', series_id: 'watch-2', source: 'turn' },
+        { agent_group_id: 'ag-2', series_id: 'watch-1', source: 'turn' },
       ]),
     );
   });
@@ -180,6 +183,106 @@ describe('task run outcomes', () => {
       "UPDATE task_run_outcomes SET recorded_at = '2020-01-01T00:00:00.000Z' WHERE outbound_id IN ('out-1','out-2')",
     );
     await record('failed'); // out-3, recent and live
+
+    expect(await pruneTaskRunOutcomes(30)).toBe(2);
+    expect((await readFailureStreak('ag-1', 'watch-1')).streak).toBe(1);
+  });
+});
+
+let occurrence = 0;
+async function gate(outcome: 'ok' | 'failed', over: Partial<GateOutcomeUpsert> = {}) {
+  occurrence += 1;
+  await upsertGateOutcome({
+    agentGroupId: 'ag-1',
+    sessionId: 'sess-1',
+    seriesId: 'watch-1',
+    occurrenceId: `occ-${occurrence}`,
+    observation: outcome === 'ok' ? 'empty' : 'unreadable',
+    outcome,
+    boundMs: 3_600_000,
+    since: null,
+    detail: outcome === 'ok' ? 'nothing new' : 'api 502',
+    ...over,
+  });
+}
+
+describe('gate lane', () => {
+  beforeEach(() => {
+    occurrence = 0;
+  });
+
+  it('keeps one row per occurrence: a re-execution replaces it and keeps the escalation stamp', async () => {
+    await gate('failed', { occurrenceId: 'occ-x', detail: 'first run' });
+    const [row] = await getDb().all<{ id: number }>('SELECT id FROM task_run_outcomes');
+    await markEscalated(row!.id);
+
+    await gate('failed', { occurrenceId: 'occ-x', observation: 'blocked', detail: 'second run', boundMs: 900_000 });
+
+    const rows = await getDb().all<Record<string, unknown>>(
+      'SELECT id, outbound_id, source, observation, outcome, detail, bound_ms, escalated_at FROM task_run_outcomes',
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      id: row!.id,
+      outbound_id: 'gate:occ-x',
+      source: 'gate',
+      observation: 'blocked',
+      outcome: 'failed',
+      detail: 'second run',
+      bound_ms: 900_000,
+    });
+    expect(rows[0]!.escalated_at).not.toBeNull();
+  });
+
+  it('lets a redelivered row leave exactly one record', async () => {
+    for (let i = 0; i < 3; i += 1) await gate('failed', { occurrenceId: 'occ-dup' });
+    expect((await readGateEpisode('ag-1', 'watch-1'))?.rows).toBe(1);
+  });
+
+  it('never lets a gate ok reset a turn streak, nor a turn ok end a gate episode', async () => {
+    await record('failed');
+    await record('failed');
+    await gate('failed');
+    await gate('ok');
+    await gate('ok');
+    await record('failed');
+
+    expect((await readFailureStreak('ag-1', 'watch-1')).streak).toBe(3);
+
+    await gate('failed');
+    await record('ok');
+    expect((await readGateEpisode('ag-1', 'watch-1'))?.rows).toBe(1);
+    expect(await listSeriesWithFailures()).toEqual([{ agent_group_id: 'ag-1', series_id: 'watch-1', source: 'gate' }]);
+  });
+
+  it('aggregates the open episode: earliest start and since, smallest bound, newest row', async () => {
+    await gate('failed', { boundMs: 14_400_000, since: '2026-09-26T08:00:00.000Z' });
+    await gate('failed', { boundMs: 5_400_000, since: '2026-09-26T09:00:00.000Z', detail: 'newest' });
+    await getDb().run("UPDATE task_run_outcomes SET recorded_at = '2026-09-26T10:00:00.000Z' WHERE id = 1");
+    await getDb().run("UPDATE task_run_outcomes SET recorded_at = '2026-09-26T10:30:00.000Z' WHERE id = 2");
+
+    expect(await readGateEpisode('ag-1', 'watch-1')).toEqual({
+      rows: 2,
+      escalated: false,
+      firstRecordedAt: '2026-09-26T10:00:00.000Z',
+      earliestSince: '2026-09-26T08:00:00.000Z',
+      boundMs: 5_400_000,
+      newest: { id: 2, observation: 'unreadable', detail: 'newest', recorded_at: '2026-09-26T10:30:00.000Z' },
+    });
+  });
+
+  it('has no episode once its newest row is ok', async () => {
+    await gate('failed');
+    await gate('ok');
+    expect(await readGateEpisode('ag-1', 'watch-1')).toBeNull();
+    expect(await listSeriesWithFailures()).toEqual([]);
+  });
+
+  it('prunes by lane: an old gate ok never releases an open turn episode', async () => {
+    await record('failed'); // turn episode, open
+    await gate('failed');
+    await gate('ok'); // closes only the gate episode
+    await getDb().run("UPDATE task_run_outcomes SET recorded_at = '2020-01-01T00:00:00.000Z'");
 
     expect(await pruneTaskRunOutcomes(30)).toBe(2);
     expect((await readFailureStreak('ag-1', 'watch-1')).streak).toBe(1);

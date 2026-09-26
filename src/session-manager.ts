@@ -1675,6 +1675,7 @@ export async function admitDueTaskContexts(
   mailbox: NanoclawMailboxSession,
   agentGroupId: string,
   sessionId: string,
+  withheld: ReadonlySet<string> = new Set(),
 ): Promise<number> {
   // The one central read a recall needs, taken BEFORE the first inbound read so
   // the admission itself is one synchronous pass: fence check, legacy
@@ -1683,7 +1684,7 @@ export async function admitDueTaskContexts(
   // Under the lease: the recall rows read one lease-only central fact each
   // (seam 3 §4.5); the dashboard's run-now caller already holds the lease.
   return withCentralSync(
-    () => admitDueTaskContextsFor(mailbox, agentGroupId, sessionId, central),
+    () => admitDueTaskContextsFor(mailbox, agentGroupId, sessionId, central, withheld),
     'admitDueTaskContexts',
   );
 }
@@ -1699,6 +1700,7 @@ export function admitDueTaskContextsFor(
   agentGroupId: string,
   sessionId: string,
   central: RecallCentral,
+  withheld: ReadonlySet<string> = new Set(),
 ): number {
   // An active repository ingress fence means this session must admit nothing:
   // the whole point is that no new turn starts while its mounts change. The
@@ -1715,6 +1717,7 @@ export function admitDueTaskContextsFor(
 
   let admitted = 0;
   for (const task of mailbox.listDueAdmissionRows()) {
+    if (withheld.has(task.id)) continue;
     let recall: MessageInsert;
     try {
       recall = buildRecallRow(

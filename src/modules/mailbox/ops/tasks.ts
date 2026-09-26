@@ -793,6 +793,7 @@ export function upsertTaskSeries(
 
 export interface HostGatedTaskRow {
   id: string;
+  series_id: string | null;
   content: string;
 }
 
@@ -806,16 +807,22 @@ export interface HostGatedTaskRow {
 export function listDueTaskRows(db: Database.Database): HostGatedTaskRow[] {
   return db
     .prepare(
-      `SELECT id, content FROM messages_in
+      `SELECT id, series_id, content FROM messages_in
         WHERE kind = 'task' AND status = 'pending' AND trigger = 0
           AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
     )
     .all() as HostGatedTaskRow[];
 }
 
-/** Host-owned equivalent of the container's processing_ack for a gated fire. */
+/**
+ * Host-owned equivalent of the container's processing_ack for a gated fire.
+ * Only an unadmitted row: once admitted, the container runs it and records it.
+ */
 export function resolvePendingTask(db: Database.Database, taskId: string, status: 'completed' | 'failed'): void {
-  db.prepare("UPDATE messages_in SET status = ? WHERE id = ? AND status = 'pending'").run(status, taskId);
+  db.prepare("UPDATE messages_in SET status = ? WHERE id = ? AND status = 'pending' AND trigger = 0").run(
+    status,
+    taskId,
+  );
 }
 
 /** Carry a host-run script's output into the row the container will execute. */

@@ -71,8 +71,11 @@ async function prepareDueWake(
   // `agentGroupId` rides along because the callee resolves the GROUP's
   // timezone for its local-time gate: a session parameter identifies the
   // mailbox, not the group whose zone override applies.
-  await runHostGatedTaskScripts(mailbox, agentGroupId, sessionId);
-  const admittedTasks = await admitDueTaskContexts(mailbox, agentGroupId, sessionId);
+  //
+  // A row whose host result could not be recorded is withheld from admission:
+  // it must not run anywhere until an execution of it is on record.
+  const unrecorded = await runHostGatedTaskScripts(mailbox, agentGroupId, sessionId);
+  const admittedTasks = await admitDueTaskContexts(mailbox, agentGroupId, sessionId, unrecorded);
   const dueCount = mailbox.countDueMessages();
   return {
     admittedTasks,
@@ -190,6 +193,15 @@ function registerSchedulingSweepDuties(): void {
         // one pays nothing.
         if (await hasUnresolvedMoveIntent(session.id)) {
           log.info('Kept a spent task session open — an unresolved move intent still names it', {
+            sessionId: session.id,
+            threadId: session.thread_id,
+          });
+          return;
+        }
+        // Delivery visits active sessions only: closed now, a pre-task result
+        // it has not recorded yet would never be recorded.
+        if (mailbox!.hasUnrecordedGateRows()) {
+          log.info('Kept a spent task session open — a pre-task result is not recorded yet', {
             sessionId: session.id,
             threadId: session.thread_id,
           });

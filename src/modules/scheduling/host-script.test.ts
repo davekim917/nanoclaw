@@ -11,9 +11,11 @@
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { TIMEZONE } from '../../config.js';
+import { closeDb, getDb } from '../../db/connection.js';
+import { initMigratedTestDb } from '../../db/index.js';
 import { openInboundDb } from '../mailbox/openers.js';
 import { ensureSchema } from '../mailbox/schema.js';
 import { composeNanoclawSession } from '../mailbox/index.js';
@@ -90,10 +92,57 @@ function rowContent(db: ReturnType<typeof openInboundDb>, id: string): Record<st
   );
 }
 
-afterEach(() => {
+beforeEach(async () => {
+  await initMigratedTestDb();
+});
+
+afterEach(async () => {
+  await closeDb();
   containerConfigState.timezone = null;
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
+
+interface GateRow {
+  id: number;
+  series_id: string;
+  outbound_id: string;
+  outcome: string;
+  observation: string;
+  bound_ms: number | null;
+  since: string | null;
+  detail: string | null;
+  escalated_at: string | null;
+}
+
+async function gateRows(): Promise<GateRow[]> {
+  return getDb().all<GateRow>(
+    `SELECT id, series_id, outbound_id, outcome, observation, bound_ms, since, detail, escalated_at
+       FROM task_run_outcomes WHERE source = 'gate' ORDER BY id`,
+  );
+}
+
+/** Make every ledger write fail the way a broken central DB does, without mocking the writer. */
+async function breakLedger(): Promise<void> {
+  await getDb().run('ALTER TABLE task_run_outcomes RENAME TO task_run_outcomes_unreachable');
+}
+
+async function repairLedger(): Promise<void> {
+  await getDb().run('ALTER TABLE task_run_outcomes_unreachable RENAME TO task_run_outcomes');
+}
+
+/** A script that prints each line of `outputs` on successive executions, then repeats the last. */
+function sequencedScript(name: string, outputs: string[]): string {
+  const counter = path.join(TEST_DIR, `${name}.count`);
+  const cases = outputs
+    .map((line, i) => `  ${i + 1}) echo '${line}' ;;`)
+    .concat([`  *) echo '${outputs[outputs.length - 1]}' ;;`])
+    .join('\n');
+  return `n=$(cat ${counter} 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > ${counter}\ncase $n in\n${cases}\nesac\n`;
+}
+
+const EMPTY = '{"wakeAgent":false,"observation":{"kind":"empty","evidence":"nothing new","bound":"1h"}}';
+const UNREADABLE = '{"wakeAgent":false,"observation":{"kind":"unreadable","evidence":"api 502","bound":"90m"}}';
+const WAKE = '{"wakeAgent":true,"data":{"alerts":1}}';
 
 describe('classifyForHostExecution', () => {
   it('allows an ordinary curl/jq monitor script', () => {
@@ -259,6 +308,213 @@ describe('runHostGatedTaskScripts', () => {
   });
 });
 
+describe('runHostGatedTaskScripts records, then acts', () => {
+  it('records each kind of result against its occurrence before resolving it', async () => {
+    const db = freshDb();
+    insertHostGatedTask(db, 't-empty', `echo '${EMPTY}'`);
+    insertHostGatedTask(db, 't-unreadable', `echo '${UNREADABLE}'`);
+    insertHostGatedTask(db, 't-error', 'echo boom >&2; exit 3');
+    insertHostGatedTask(db, 't-undeclared', `echo '{"wakeAgent":false}'`);
+    insertHostGatedTask(db, 't-invalid', `echo '{"wakeAgent":false,"observation":{"kind":"empty","bound":"1h"}}'`);
+    insertHostGatedTask(db, 't-wake', `echo '${WAKE}'`);
+
+    const unrecorded = await runHostGatedTaskScripts(sessionFor(db), TEST_GROUP_ID, SESS);
+
+    expect(unrecorded.size).toBe(0);
+    const byOccurrence = Object.fromEntries((await gateRows()).map((r) => [r.outbound_id, r]));
+    expect(byOccurrence['gate:t-empty']).toMatchObject({ observation: 'empty', outcome: 'ok', bound_ms: 3_600_000 });
+    expect(byOccurrence['gate:t-unreadable']).toMatchObject({
+      observation: 'unreadable',
+      outcome: 'failed',
+      bound_ms: 5_400_000,
+      detail: 'api 502',
+    });
+    expect(byOccurrence['gate:t-error']).toMatchObject({
+      observation: 'error',
+      outcome: 'failed',
+      bound_ms: 7_200_000,
+    });
+    expect(byOccurrence['gate:t-error']!.detail).toBe('exited with code 3; stderr: boom');
+    // Report mode: an undeclared result is recorded, and still counts as ok.
+    expect(byOccurrence['gate:t-undeclared']).toMatchObject({ observation: 'undeclared', outcome: 'ok' });
+    expect(byOccurrence['gate:t-invalid']).toMatchObject({ observation: 'invalid', outcome: 'failed' });
+    expect(byOccurrence['gate:t-wake']).toMatchObject({ observation: 'wake', outcome: 'ok', bound_ms: null });
+
+    // Occurrence status keeps its existing mapping: only a script error fails.
+    expect(rowStatus(db, 't-empty')).toBe('completed');
+    expect(rowStatus(db, 't-unreadable')).toBe('completed');
+    expect(rowStatus(db, 't-error')).toBe('failed');
+    expect(rowStatus(db, 't-undeclared')).toBe('completed');
+    expect(rowStatus(db, 't-invalid')).toBe('completed');
+    expect(rowStatus(db, 't-wake')).toBe('pending');
+    expect(rowContent(db, 't-wake').scriptOutput).toEqual({ alerts: 1 });
+    db.close();
+  });
+
+  it('a crash after the upsert and before the action re-runs, overwrites the record, then acts on it', async () => {
+    const db = freshDb();
+    insertHostGatedTask(db, 't-crash', sequencedScript('t-crash', [EMPTY, UNREADABLE]));
+    const crashing = {
+      ...sessionFor(db),
+      resolvePendingTask: () => {
+        throw new Error('host died here');
+      },
+    };
+
+    await expect(runHostGatedTaskScripts(crashing, TEST_GROUP_ID, SESS)).rejects.toThrow('host died here');
+    // Recorded, not acted on: the occurrence is still due.
+    expect((await gateRows()).map((r) => r.observation)).toEqual(['empty']);
+    expect(rowStatus(db, 't-crash')).toBe('pending');
+
+    // The next tick runs it again; this time the result changed.
+    await runHostGatedTaskScripts(sessionFor(db), TEST_GROUP_ID, SESS);
+
+    const rows = await gateRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ outbound_id: 'gate:t-crash', observation: 'unreadable', outcome: 'failed' });
+    expect(rowStatus(db, 't-crash')).toBe('completed');
+    db.close();
+  });
+
+  it('a result that could not be recorded is not acted on: withheld, re-run, handed on only once recorded', async () => {
+    const db = freshDb();
+    insertHostGatedTask(db, 't-wake-unrecorded', `echo '${WAKE}'`);
+    insertHostGatedTask(db, 't-empty-unrecorded', `echo '${EMPTY}'`);
+    await breakLedger();
+
+    const first = await runHostGatedTaskScripts(sessionFor(db), TEST_GROUP_ID, SESS);
+
+    expect([...first].sort()).toEqual(['t-empty-unrecorded', 't-wake-unrecorded']);
+    // Nothing moved: no status, no scriptOutput for the container to trust.
+    expect(rowStatus(db, 't-wake-unrecorded')).toBe('pending');
+    expect(rowContent(db, 't-wake-unrecorded').scriptOutput).toBeUndefined();
+    expect(rowStatus(db, 't-empty-unrecorded')).toBe('pending');
+
+    await repairLedger();
+    const second = await runHostGatedTaskScripts(sessionFor(db), TEST_GROUP_ID, SESS);
+
+    expect(second.size).toBe(0);
+    expect(rowContent(db, 't-wake-unrecorded').scriptOutput).toEqual({ alerts: 1 });
+    expect(rowStatus(db, 't-empty-unrecorded')).toBe('completed');
+    expect((await gateRows()).map((r) => [r.outbound_id, r.observation])).toEqual([
+      ['gate:t-wake-unrecorded', 'wake'],
+      ['gate:t-empty-unrecorded', 'empty'],
+    ]);
+    db.close();
+  });
+
+  it('successive occurrences each record their own result; nothing is inherited', async () => {
+    const db = freshDb();
+    const script = sequencedScript('series-a', [UNREADABLE, EMPTY]);
+    insertTaskRow(db, {
+      id: 'occ-1',
+      seriesId: 'series-a',
+      processAfter: new Date(Date.now() - 1_000).toISOString(),
+      recurrence: null,
+      content: JSON.stringify({ prompt: 'monitor', script, scriptHost: true }),
+    });
+    await runHostGatedTaskScripts(sessionFor(db), TEST_GROUP_ID, SESS);
+    insertTaskRow(db, {
+      id: 'occ-2',
+      seriesId: 'series-a',
+      processAfter: new Date(Date.now() - 1_000).toISOString(),
+      recurrence: null,
+      content: JSON.stringify({ prompt: 'monitor', script, scriptHost: true }),
+    });
+    await runHostGatedTaskScripts(sessionFor(db), TEST_GROUP_ID, SESS);
+
+    expect((await gateRows()).map((r) => [r.series_id, r.outbound_id, r.observation])).toEqual([
+      ['series-a', 'gate:occ-1', 'unreadable'],
+      ['series-a', 'gate:occ-2', 'empty'],
+    ]);
+    db.close();
+  });
+
+  it('a script edited between executions: the next execution wins and an escalation stamp survives', async () => {
+    const db = freshDb();
+    insertHostGatedTask(db, 't-edit', `echo '${UNREADABLE}'`);
+    const crashing = {
+      ...sessionFor(db),
+      resolvePendingTask: () => {
+        throw new Error('host died here');
+      },
+    };
+    await expect(runHostGatedTaskScripts(crashing, TEST_GROUP_ID, SESS)).rejects.toThrow('host died here');
+    await getDb().run("UPDATE task_run_outcomes SET escalated_at = '2026-09-26T00:00:00.000Z'");
+
+    db.prepare('UPDATE messages_in SET content = ? WHERE id = ?').run(
+      JSON.stringify({ prompt: 'monitor', script: `echo '${EMPTY}'`, scriptHost: true }),
+      't-edit',
+    );
+    await runHostGatedTaskScripts(sessionFor(db), TEST_GROUP_ID, SESS);
+
+    const rows = await gateRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      observation: 'empty',
+      outcome: 'ok',
+      escalated_at: '2026-09-26T00:00:00.000Z',
+    });
+    expect(rowStatus(db, 't-edit')).toBe('completed');
+    db.close();
+  });
+
+  it('never resolves an occurrence that was admitted meanwhile', async () => {
+    const db = freshDb();
+    insertHostGatedTask(db, 't-admitted', `echo '${EMPTY}'`);
+    const admitting = {
+      ...sessionFor(db),
+      resolvePendingTask: (taskId: string, status: 'completed' | 'failed') => {
+        // Another admission path (run-now) admitted the row while the script ran.
+        db.prepare('UPDATE messages_in SET trigger = 1 WHERE id = ?').run(taskId);
+        sessionFor(db).resolvePendingTask(taskId, status);
+      },
+    };
+
+    await runHostGatedTaskScripts(admitting, TEST_GROUP_ID, SESS);
+
+    expect(rowStatus(db, 't-admitted')).toBe('pending');
+    db.close();
+  });
+
+  it('records nothing for a script the classifier sends to the container', async () => {
+    const db = freshDb();
+    insertHostGatedTask(db, 't-unsafe', `rm -rf /workspace/agent/scratch\necho '${EMPTY}'`);
+
+    await runHostGatedTaskScripts(sessionFor(db), TEST_GROUP_ID, SESS);
+
+    expect(await gateRows()).toEqual([]);
+    expect(rowStatus(db, 't-unsafe')).toBe('pending');
+    db.close();
+  });
+
+  it('records a real timeout with its reason', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '500');
+    try {
+      const fresh = await import('../../db/index.js');
+      await fresh.initMigratedTestDb();
+      const { runHostGatedTaskScripts: run } = await import('./host-script.js');
+      const db = freshDb();
+      insertHostGatedTask(db, 't-slow', `sleep 5\necho '${EMPTY}'`);
+
+      await run(sessionFor(db), TEST_GROUP_ID, SESS);
+
+      const rows = await fresh
+        .getDb()
+        .all<GateRow>("SELECT observation, outcome, detail FROM task_run_outcomes WHERE source = 'gate'");
+      expect(rows).toEqual([
+        { observation: 'error', outcome: 'failed', detail: 'timed out after 500ms; output discarded' },
+      ]);
+      expect(rowStatus(db, 't-slow')).toBe('failed');
+      db.close();
+      await fresh.closeDb();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 15_000);
+});
+
 /** True once `pid` is gone. Polls, because a just-SIGKILLed process is briefly
  *  a zombie and still answers `kill(pid, 0)` until Node reaps it (~100ms). */
 async function gone(pid: number, withinMs = 2_000): Promise<boolean> {
@@ -299,7 +555,7 @@ describe('runHostScript hard deadline', () => {
       const result = await runHostScript("trap '' TERM\nsleep 60\n", 'deadline-test');
       const elapsed = Date.now() - started;
 
-      expect(result).toBeNull();
+      expect(result).toEqual({ error: expect.stringContaining('killed at the hard deadline') });
       // The load-bearing assertion: resolution came from the DEADLINE (~11s),
       // not from execFile's timeout (~1s). Delete the deadline and this fails
       // by hanging until the test timeout — which is the point.
@@ -363,8 +619,8 @@ describe('runHostScript hard deadline', () => {
       // deadline — that is what fails if the soft timer is made a no-op.
       expect(elapsed).toBeLessThan(5_000);
       expect(elapsed).toBeGreaterThanOrEqual(1_000);
-      // And its output is not a verdict.
-      expect(result).toBeNull();
+      // And its output is not a verdict: the run records the timeout instead.
+      expect(result).toEqual({ error: 'timed out after 1000ms; output discarded' });
     } finally {
       vi.unstubAllEnvs();
     }
@@ -432,7 +688,7 @@ describe('runHostScript hard deadline', () => {
         `s=$(printf '中%.0s' $(seq 1 1000))\nfor i in $(seq 1 400); do printf '%s' "$s"; done\nprintf '\\n{"wakeAgent":true}\\n'\n`,
         'utf8-cap-test',
       );
-      expect(result).toBeNull();
+      expect(result).toEqual({ error: 'output exceeded the 1048576-byte cap' });
     } finally {
       vi.unstubAllEnvs();
     }
@@ -456,7 +712,7 @@ describe('runHostScript hard deadline', () => {
       // times out on the next slow upstream day.
       const result = await runHostScript(`sleep 1.5\necho '{"wakeAgent":false}'\n`, 'budget-warn');
 
-      expect(result).toEqual({ wakeAgent: false });
+      expect(result).toEqual({ result: { wakeAgent: false } });
       const overBudget = warn.mock.calls.find(([msg]) => String(msg).includes('over budget'));
       expect(overBudget).toBeDefined();
       const fields = overBudget?.[1] as { pctOfCeiling: number; timedOut: boolean };
@@ -508,7 +764,8 @@ describe('runHostScript hard deadline', () => {
         'sec',
       );
 
-      const { dir, dmode, fmode } = result?.data as { dir: string; dmode: string; fmode: string };
+      if (!('result' in result)) throw new Error(`script failed: ${result.error}`);
+      const { dir, dmode, fmode } = result.result.data as { dir: string; dmode: string; fmode: string };
       // Private per-run directory, not the shared tmp root.
       expect(dir).not.toBe(os.tmpdir());
       expect(path.dirname(dir)).toBe(os.tmpdir());
@@ -543,7 +800,7 @@ describe('runHostScript hard deadline', () => {
       const result = await runHostScript(`trap '' TERM\nwhile :; do printf '%01000d' 0; done\n`, 'overflow-kill-test');
       const elapsed = Date.now() - started;
 
-      expect(result).toBeNull();
+      expect(result).toEqual({ error: 'output exceeded the 1048576-byte cap' });
       // Well inside the 10s timeout, so it died on the cap rather than a timer.
       expect(elapsed).toBeLessThan(8_000);
     } finally {

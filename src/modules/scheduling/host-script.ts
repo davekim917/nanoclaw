@@ -39,6 +39,7 @@ import { evaluateManagedGitCommand } from '../../managed-git-command-guard.js';
 import { TASK_SCRIPT_TIMEOUT_MS, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
 import type { NanoclawMailboxSession } from '../mailbox/index.js';
+import { recordGateResult } from './observation.js';
 
 // Same rationale as the container-side constant (task-script.ts): the flat
 // 30s default killed a working 56s watcher script into an auto-pause.
@@ -53,10 +54,14 @@ const SCRIPT_MAX_BUFFER = 1024 * 1024;
 // absorbing auto-pause (recurrence.ts SCRIPT_FAIL_PAUSE_CAP).
 const HOST_SCRIPT_BUDGET_WARN_RATIO = 0.5;
 
-export interface ScriptResult {
+interface ScriptResult {
   wakeAgent: boolean;
   data?: unknown;
+  observation?: unknown;
 }
+
+/** One execution: the parsed last stdout line, or why there is none. */
+export type HostScriptRun = { result: ScriptResult } | { error: string };
 
 // ── Classifier ──────────────────────────────────────────────────────────────
 //
@@ -121,6 +126,10 @@ export function classifyForHostExecution(script: string): ClassifyResult {
 }
 
 // ── Execution ────────────────────────────────────────────────────────────────
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 // Output contract mirrors container/agent-runner/src/scheduling/task-script.ts's
 // runScript; the hard deadline in runHostScript is host-only (see header).
 
@@ -142,7 +151,7 @@ function minimalEnv(tz: string): NodeJS.ProcessEnv {
   return env;
 }
 
-export function runHostScript(script: string, taskId: string, tz: string = TIMEZONE): Promise<ScriptResult | null> {
+export function runHostScript(script: string, taskId: string, tz: string = TIMEZONE): Promise<HostScriptRun> {
   // PRIVATE 0700 DIRECTORY, not a predictable name in shared /tmp.
   //
   // The old path was `${os.tmpdir()}/host-task-script-${taskId}-${Date.now()}.sh`
@@ -169,7 +178,7 @@ export function runHostScript(script: string, taskId: string, tz: string = TIMEZ
     // due rows. /tmp at ENOSPC or an unwritable TMPDIR is enough to trigger it,
     // and the row stays pending so every later tick retries identically.
     log.warn('Host task-script could not be written to disk', { taskId, err });
-    return Promise.resolve(null);
+    return Promise.resolve({ error: `script could not be written to disk: ${errorText(err)}` });
   }
   /** Remove the script and its private directory. */
   const cleanup = (): void => {
@@ -237,7 +246,7 @@ export function runHostScript(script: string, taskId: string, tz: string = TIMEZ
       // leaving the row pending to be retried identically on the next tick.
       cleanup();
       log.warn('Host task-script could not be spawned', { taskId, err });
-      return resolve(null);
+      return resolve({ error: `script could not be spawned: ${errorText(err)}` });
     }
 
     /**
@@ -261,7 +270,7 @@ export function runHostScript(script: string, taskId: string, tz: string = TIMEZ
       }
     };
 
-    const finish = (result: ScriptResult | null): void => {
+    const finish = (run: HostScriptRun): void => {
       if (settled) return;
       settled = true;
       clearTimeout(softTimeout);
@@ -308,7 +317,7 @@ export function runHostScript(script: string, taskId: string, tz: string = TIMEZ
         }
       }
       cleanup();
-      resolve(result);
+      resolve(run);
     };
 
     // Accumulate BYTES, not decoded strings, and decode once at the end.
@@ -358,13 +367,13 @@ export function runHostScript(script: string, taskId: string, tz: string = TIMEZ
     // resolve is the actual bound.
     const hardDeadline = setTimeout(() => {
       killTree('SIGKILL');
-      log.warn('Host task-script exceeded hard deadline — SIGKILL sent to process group, resolving null', { taskId });
-      finish(null);
+      log.warn('Host task-script exceeded hard deadline — SIGKILL sent to process group', { taskId });
+      finish({ error: `timed out after ${SCRIPT_TIMEOUT_MS}ms and ignored SIGTERM; killed at the hard deadline` });
     }, SCRIPT_TIMEOUT_MS + 10_000);
 
     child.on('error', (err) => {
       log.warn('Host task-script failed to spawn', { taskId, error: err.message });
-      finish(null);
+      finish({ error: `script failed to spawn: ${err.message}` });
     });
 
     child.on('close', (code, signal) => {
@@ -373,39 +382,47 @@ export function runHostScript(script: string, taskId: string, tz: string = TIMEZ
       const stdout = Buffer.concat(stdoutChunks).toString('utf8');
       if (stderr) log.debug('Host task-script stderr', { taskId, stderr: stderr.slice(0, 500) });
 
-      if (overflowed) return finish(null);
+      if (overflowed) return finish({ error: `output exceeded the ${SCRIPT_MAX_BUFFER}-byte cap` });
       // Past the soft deadline the script has already overrun its budget. Its
       // trap was allowed to run, but whatever it printed is not a verdict —
       // accepting it would mark the row completed and reset the recurrence
       // failure streak, so a series that times out every fire would never
       // reach the auto-pause that exists to stop exactly that.
       if (timedOut) {
-        log.warn('Host task-script exceeded timeout — output discarded, resolving null', { taskId, signal });
-        return finish(null);
+        log.warn('Host task-script exceeded timeout — output discarded', { taskId, signal });
+        return finish({ error: `timed out after ${SCRIPT_TIMEOUT_MS}ms; output discarded` });
       }
       if (code !== 0) {
         log.warn('Host task-script error', { taskId, code, signal });
-        return finish(null);
+        const tail = stderr.trim().slice(-300);
+        return finish({
+          error: `exited with ${signal ? `signal ${signal}` : `code ${code}`}${tail ? `; stderr: ${tail}` : ''}`,
+        });
       }
 
       const lines = stdout.trim().split('\n');
       const lastLine = lines[lines.length - 1];
       if (!lastLine) {
         log.warn('Host task-script produced no output', { taskId });
-        return finish(null);
+        return finish({ error: 'no output' });
       }
 
+      let result: unknown;
       try {
-        const result = JSON.parse(lastLine);
-        if (typeof result.wakeAgent !== 'boolean') {
-          log.warn('Host task-script output missing wakeAgent boolean', { taskId, lastLine: lastLine.slice(0, 200) });
-          return finish(null);
-        }
-        finish(result as ScriptResult);
+        result = JSON.parse(lastLine);
       } catch {
         log.warn('Host task-script output is not valid JSON', { taskId, lastLine: lastLine.slice(0, 200) });
-        finish(null);
+        return finish({ error: `last stdout line is not JSON: ${lastLine.slice(0, 200)}` });
       }
+      if (
+        result === null ||
+        typeof result !== 'object' ||
+        typeof (result as { wakeAgent?: unknown }).wakeAgent !== 'boolean'
+      ) {
+        log.warn('Host task-script output missing wakeAgent boolean', { taskId, lastLine: lastLine.slice(0, 200) });
+        return finish({ error: `last stdout line has no wakeAgent boolean: ${lastLine.slice(0, 200)}` });
+      }
+      finish({ result: result as ScriptResult });
     });
   });
 }
@@ -423,10 +440,15 @@ export function runHostScript(script: string, taskId: string, tz: string = TIMEZ
  * 'pending', trigger = 0, process_after due), narrowed to kind = 'task' since
  * only task rows carry a script.
  *
- * Outcomes mirror applyPreTaskScripts, written directly to messages_in.status
- * — the host-owned equivalent of the container's processing_ack ack (see
- * syncProcessingAcks in the mailbox module, which maps the same two outcomes
- * onto the same two statuses):
+ * Record, then act. Each execution's result is upserted into the gate lane
+ * of `task_run_outcomes` (keyed by occurrence) BEFORE the occurrence moves, so
+ * the ledger always holds the result the occurrence acted on. After a crash
+ * the row is still due, the script runs again, and the rerun overwrites the
+ * ledger and drives the action.
+ *
+ * Once recorded, outcomes mirror applyPreTaskScripts, written directly to
+ * messages_in.status — the host-owned equivalent of the container's
+ * processing_ack (see syncProcessingAcks in the mailbox module):
  *   - wakeAgent=false → status='completed' (gated; recurrence never backs off)
  *   - script error     → status='failed' (recurrence reads the trailing
  *     failed streak off occurrence rows for backoff, same as a container
@@ -437,12 +459,16 @@ export function runHostScript(script: string, taskId: string, tz: string = TIMEZ
  *     container-side applyPreTaskScripts to skip re-running the script.
  *   - classifier hit (hard-block or gated) → left untouched entirely; falls
  *     through to the existing, unchanged container-side script execution.
+ *
+ * Returns the ids whose result could not be recorded. They are left pending
+ * and untouched, and the caller must withhold them from admission this tick:
+ * admitted without a result, the container would run the script unrecorded.
  */
 export async function runHostGatedTaskScripts(
   mailbox: NanoclawMailboxSession,
   agentGroupId: string,
   sessionId: string,
-): Promise<void> {
+): Promise<Set<string>> {
   // The sweep's own session, passed down. `host-sweep.ts` is the only
   // production caller and already holds one for this key, so opening a second
   // here would trip the same-key nesting guard (invariant I-3). Taking the
@@ -456,8 +482,9 @@ export async function runHostGatedTaskScripts(
   // exactly what the pre-seam state already did by passing the sweep's open
   // inbound handle, so this is not a regression. Closing the session before
   // the scripts run is a host-sweep restructure, not this PR.
+  const unrecorded = new Set<string>();
   const due = mailbox.listDueTaskRows();
-  if (due.length === 0) return;
+  if (due.length === 0) return unrecorded;
 
   // Resolved once per sweep tick, not per row: every due row here belongs to
   // the same session and therefore the same group. Same value the container
@@ -487,9 +514,27 @@ export async function runHostGatedTaskScripts(
       continue;
     }
 
-    const result = await runHostScript(script, row.id, tz);
-    if (!result || !result.wakeAgent) {
-      const status = result ? 'completed' : 'failed';
+    const run = await runHostScript(script, row.id, tz);
+    try {
+      await recordGateResult({
+        agentGroupId,
+        sessionId,
+        seriesId: row.series_id ?? row.id,
+        occurrenceId: row.id,
+        raw: run,
+      });
+    } catch (err) {
+      unrecorded.add(row.id);
+      log.warn('Host-gated result could not be recorded — occurrence withheld, script re-runs next tick', {
+        sessionId,
+        taskId: row.id,
+        err,
+      });
+      continue;
+    }
+
+    if ('error' in run || !run.result.wakeAgent) {
+      const status = 'error' in run ? 'failed' : 'completed';
       mailbox.resolvePendingTask(row.id, status);
       log.info('Host-gated script handled task without spawning a container', {
         sessionId,
@@ -499,7 +544,8 @@ export async function runHostGatedTaskScripts(
       continue;
     }
 
-    content.scriptOutput = result.data ?? null;
+    content.scriptOutput = run.result.data ?? null;
     mailbox.setPendingTaskContent(row.id, JSON.stringify(content));
   }
+  return unrecorded;
 }
