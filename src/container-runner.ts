@@ -2048,7 +2048,7 @@ async function spawnContainer(
 
       child.on('close', (code) => {
         finalizeContainer();
-        settleUnexpectedExit(session.id, containerName);
+        const hostStopped = !settleUnexpectedExit(session.id, containerName);
         // code null = killed by signal (normal shutdown path), not a boot failure.
         if (code === 137) {
           log.warn('Container exited 137 — likely OOM kill or forced SIGKILL', {
@@ -2058,6 +2058,11 @@ async function spawnContainer(
             memoryLimitMb: effectiveResources.memory.limitMb,
             stderrTail,
           });
+        } else if (hostStopped) {
+          // A host stop exits 143 (SIGTERM) by design; logging it as non-zero
+          // makes the health sentinel's crash-loop vital fire on every
+          // short-interval scheduled task the reaper stops.
+          log.info('Container stopped by host', { sessionId: session.id, code, containerName });
         } else if (code !== 0 && code !== null && stderrTail.length > 0) {
           log.warn('Container exited non-zero', { sessionId: session.id, code, containerName, stderrTail });
         } else {
@@ -2280,11 +2285,13 @@ const hostStoppedContainers = new Set<string>();
  * Settle the session's task list after an exit the host did not ask for (a
  * crash, an OOM kill, a runner that quit). Exit codes are not consulted: an
  * adopted container's `docker wait` exits 0 whatever the container did, and a
- * list is stale once its container is gone either way.
+ * list is stale once its container is gone either way. Returns whether the
+ * exit was unexpected, i.e. false for a host stop.
  */
-function settleUnexpectedExit(sessionId: string, containerName: string): void {
-  if (hostStoppedContainers.delete(containerName)) return;
+function settleUnexpectedExit(sessionId: string, containerName: string): boolean {
+  if (hostStoppedContainers.delete(containerName)) return false;
   void import('./task-list-host.js').then((m) => m.settleTaskListOnKill(sessionId, 'container-exit'));
+  return true;
 }
 
 /** Stop a RUNNING container, attaching every exit callback before the stop. */

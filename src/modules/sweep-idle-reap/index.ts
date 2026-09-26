@@ -11,6 +11,7 @@
 import { isTaskThread } from '../../db/sessions.js';
 import { killContainer } from '../../container-runner.js';
 import { log } from '../../log.js';
+import { isContinuationParked, type HostWorkContinuation } from '../mailbox/index.js';
 import {
   registerSweepDuty,
   registerSweepDutySource,
@@ -22,6 +23,10 @@ import { shouldReapIdleTaskContainer } from './task-idle.js';
 export { shouldReapIdleTaskContainer } from './task-idle.js';
 
 const id = SWEEP_DUTY_INVENTORY;
+
+function holdsLiveContinuation(continuation: HostWorkContinuation | null): boolean {
+  return continuation !== null && !isContinuationParked(continuation);
+}
 
 /**
  * Chat/channel containers have an interactive follow-up window worth
@@ -99,7 +104,7 @@ function registerIdleReapSweepDuties(): void {
         ctx.plan.dueCount,
         ctx.observed!.processingClaimCount,
         ctx.observed!.containerState?.provider_executing === 1,
-        ctx.plan.workContinuation !== null,
+        holdsLiveContinuation(ctx.plan.workContinuation),
       ),
     run: (ctx) => {
       const { session } = ctx as SweepSessionContext;
@@ -118,7 +123,7 @@ function registerIdleReapSweepDuties(): void {
         ctx.plan.dueCount,
         ctx.observed!.processingClaimCount,
         ctx.observed!.containerState?.provider_executing === 1,
-        ctx.plan.workContinuation !== null,
+        holdsLiveContinuation(ctx.plan.workContinuation),
         ctx.observed!.lastOutboundAtMs,
         ctx.observed!.lastInboundAtMs,
         Date.now(),

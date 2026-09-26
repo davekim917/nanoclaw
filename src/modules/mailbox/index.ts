@@ -211,6 +211,7 @@ export { SessionDbMissingError, SessionDbUnopenableError } from './openers.js';
 export { parseSqliteUtc } from './sqlite-utc.js';
 export {
   canAttemptContinuationRecovery,
+  isContinuationParked,
   readWorkContinuation,
   WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
   WORK_CONTINUATION_TASK_MAX_CHARS,

@@ -376,7 +376,7 @@ describe('supervision channel', () => {
     expect(fakes.calls).toHaveLength(1);
     expect(fakes.calls[0]).toMatch(/^stop:nanoclaw-v2-/);
     expect(fakes.waiters).toEqual([]);
-    const exited = vi.mocked(log.info).mock.calls.find((call) => call[0] === 'Container exited');
+    const exited = vi.mocked(log.info).mock.calls.find((call) => call[0] === 'Container stopped by host');
     expect(exited?.[1]).toMatchObject({ sessionId: 'sess-spawned-kill', code: null });
   });
 
