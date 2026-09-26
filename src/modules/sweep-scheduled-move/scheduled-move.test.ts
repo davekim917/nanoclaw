@@ -122,7 +122,6 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
     // so only the spawning half is left, and it stays on the real predicate
     // because nothing here spawns one either.
     containerOwnsOutbound: (sessionId: string) => real.isContainerSpawning(sessionId),
-    hasContainerEverRun: () => false,
     getActiveContainerSessionIds: () => [],
     killContainer: () => undefined,
     wakeContainer: async () => true,
@@ -155,7 +154,6 @@ vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../orchestrator-dispatch/db/tasks.js')>();
   return {
     ...real,
-    getActiveTasks: () => [],
     getOrphanedTasks: () => [],
     autoArchiveCompletedBefore: () => 0,
     transitionToTerminal: () => false,
@@ -165,10 +163,6 @@ vi.mock('../orchestrator-dispatch/db/agent-group-capabilities.js', async (import
   ...(await importOriginal<typeof import('../orchestrator-dispatch/db/agent-group-capabilities.js')>()),
   getCapabilityConfig: async () => undefined,
 }));
-vi.mock('../orchestrator-dispatch/watchdog.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../orchestrator-dispatch/watchdog.js')>();
-  return { ...real, pendingTerminalSpawnOutboundSeenAt: () => null, decideTaskAction: () => ({ action: 'ok' }) };
-});
 vi.mock('../../storage-maintenance-worker.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../storage-maintenance-worker.js')>()),
   runStorageMaintenanceInBackground: async () => null,

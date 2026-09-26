@@ -109,7 +109,6 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
     // duty graph would silently bypass this mock. Same composition
     // src/host-sweep.test.ts uses.
     containerOwnsOutbound: (sessionId: string) => Boolean(calls.running) || real.isContainerSpawning(sessionId),
-    hasContainerEverRun: () => false,
     getActiveContainerSessionIds: () => [],
     getContainerSpawnedAt: () => 0,
     wakeContainer: async (session: { id: string }) => {
@@ -260,7 +259,7 @@ vi.mock('../scheduling/overdue.js', async (importOriginal) => ({
 
 vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../orchestrator-dispatch/db/tasks.js')>();
-  return { ...real, getActiveTasks: () => [], getOrphanedTasks: () => [] };
+  return { ...real, getOrphanedTasks: () => [] };
 });
 
 import { CLOSE_CONFIRM_WINDOW_MS } from '../../dashboard/thread-close.js';

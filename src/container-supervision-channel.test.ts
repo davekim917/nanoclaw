@@ -235,7 +235,6 @@ import {
   killContainer,
   wakeContainer,
   _resetAdoptionStateForTesting,
-  _resetEverSeenRunningForTest,
   type SupervisionChannel,
 } from './container-runner.js';
 import { closeDb } from './db/connection.js';
@@ -319,7 +318,6 @@ describe('supervision channel', () => {
     leases.released.length = 0;
     // A short re-arm backoff: the daemon-restart cases wait for the second waiter.
     _resetAdoptionStateForTesting({ waiterRearmMs: 5 });
-    _resetEverSeenRunningForTest();
     vi.mocked(log.warn).mockClear();
     vi.mocked(log.info).mockClear();
     vi.mocked(log.error).mockClear();

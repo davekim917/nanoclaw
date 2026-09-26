@@ -21,7 +21,7 @@ import { parseSqliteUtc } from '../sqlite-utc.js';
 export const WORK_CONTINUATION_RESUME_MAX_ATTEMPTS = 2;
 
 /** Longest task string a continuation record may carry before it is treated as absent. */
-export const WORK_CONTINUATION_TASK_MAX_CHARS = 500;
+const WORK_CONTINUATION_TASK_MAX_CHARS = 500;
 
 export interface HostWorkContinuation {
   id: string;

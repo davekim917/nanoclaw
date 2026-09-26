@@ -30,7 +30,7 @@ export function dispatchSeriesId(contextKey: string): string {
   return `dispatch-${createHash('sha256').update(contextKey).digest('hex')}`;
 }
 
-export function dispatchEventId(contextKey: string, eventKey: string): string {
+function dispatchEventId(contextKey: string, eventKey: string): string {
   validateDispatchKey(contextKey, 'context key');
   validateDispatchKey(eventKey, 'event key');
   return `event-${createHash('sha256')

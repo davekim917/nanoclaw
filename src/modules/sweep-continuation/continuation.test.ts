@@ -126,7 +126,6 @@ const mockKillContainer = vi.fn();
 const mockWakeContainer = vi.fn();
 const mockIsContainerRunning = vi.fn();
 const mockIsContainerSpawning = vi.fn();
-const mockHasContainerEverRun = vi.fn();
 const mockGetContainerSpawnedAt = vi.fn().mockReturnValue(0);
 const mockGetSession = vi.fn();
 const mockAdmitDueTaskContexts = vi.fn().mockReturnValue(0);
@@ -146,7 +145,6 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
     // src/host-sweep.test.ts uses.
     containerOwnsOutbound: (sessionId: string) =>
       Boolean(mockIsContainerRunning(sessionId)) || Boolean(mockIsContainerSpawning(sessionId)),
-    hasContainerEverRun: (...args: unknown[]) => mockHasContainerEverRun(...args),
     getContainerSpawnedAt: (...args: unknown[]) => mockGetContainerSpawnedAt(...args),
     wakeContainer: (...args: unknown[]) => mockWakeContainer(...args),
     killContainer: (...args: unknown[]) => mockKillContainer(...args),
@@ -174,7 +172,7 @@ vi.mock('../../dashboard/thread-close.js', async (importOriginal) => {
 
 vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../orchestrator-dispatch/db/tasks.js')>();
-  return { ...real, getActiveTasks: () => [], getOrphanedTasks: () => [], transitionToTerminal: () => false };
+  return { ...real, getOrphanedTasks: () => [], transitionToTerminal: () => false };
 });
 
 vi.mock('../orchestrator-dispatch/db/agent-group-capabilities.js', async (importOriginal) => ({
@@ -1034,7 +1032,6 @@ beforeEach(() => {
   mockWakeContainer.mockReset().mockResolvedValue(true);
   mockIsContainerRunning.mockReset().mockReturnValue(false);
   mockIsContainerSpawning.mockReset().mockReturnValue(false);
-  mockHasContainerEverRun.mockReset().mockReturnValue(true);
   mockGetContainerSpawnedAt.mockReset().mockReturnValue(0);
   mockGetSession.mockReset();
   mockAdmitDueTaskContexts.mockReset().mockReturnValue(0);

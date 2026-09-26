@@ -137,10 +137,8 @@ vi.mock('../../db/provider-health.js', async (importOriginal) => {
   };
 });
 
-const mockGetActiveTasks = vi.fn();
 const mockTransitionToTerminal = vi.fn();
 const mockGetCapabilityConfig = vi.fn();
-const mockPendingTerminalDispatchOutboundSeenAt = vi.fn();
 const mockWriteSessionMessage = vi.fn();
 const mockAdmitDueTaskContexts = vi.fn().mockReturnValue(0);
 const mockWakeContainer = vi.fn();
@@ -158,7 +156,6 @@ const mockIsContainerRunning = vi.fn();
  */
 const registry = vi.hoisted(() => ({ calls: 0, replaceAfterCall: Number.POSITIVE_INFINITY }));
 const mockIsContainerSpawning = vi.fn();
-const mockHasContainerEverRun = vi.fn();
 const mockGetSession = vi.fn();
 const mockRunReconcilerSweep = vi.fn();
 
@@ -166,7 +163,6 @@ vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../orchestrator-dispatch/db/tasks.js')>();
   return {
     ...real,
-    getActiveTasks: (...args: unknown[]) => mockGetActiveTasks(...args),
     transitionToTerminal: (...args: unknown[]) => mockTransitionToTerminal(...args),
     getOrphanedTasks: vi.fn().mockReturnValue([]),
   };
@@ -176,14 +172,6 @@ vi.mock('../orchestrator-dispatch/db/agent-group-capabilities.js', async (import
   ...(await importOriginal<typeof import('../orchestrator-dispatch/db/agent-group-capabilities.js')>()),
   getCapabilityConfig: (...args: unknown[]) => mockGetCapabilityConfig(...args),
 }));
-
-vi.mock('../orchestrator-dispatch/watchdog.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../orchestrator-dispatch/watchdog.js')>();
-  return {
-    ...real,
-    pendingTerminalSpawnOutboundSeenAt: (...args: unknown[]) => mockPendingTerminalDispatchOutboundSeenAt(...args),
-  };
-});
 
 vi.mock('../../session-manager.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../session-manager.js')>();
@@ -216,7 +204,6 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
         : { containerName: 'nanoclaw-group-folder-1', claimIncarnation: 1 };
     },
     isContainerSpawning: (...args: unknown[]) => mockIsContainerSpawning(...args),
-    hasContainerEverRun: (...args: unknown[]) => mockHasContainerEverRun(...args),
     wakeContainer: (...args: unknown[]) => mockWakeContainer(...args),
     killContainer: (...args: unknown[]) => mockKillContainer(...args),
   };
@@ -851,7 +838,6 @@ describe('observeProviderStatus — two-tick debounce', () => {
     _resetProviderHealTicksForTesting();
     mockKillContainer.mockReset();
     mockIsContainerRunning.mockReset().mockReturnValue(true);
-    mockHasContainerEverRun.mockReset().mockReturnValue(true);
     mockAdmitDueTaskContexts.mockReset().mockReturnValue(0);
 
     const session: Session = { ...fakeSession(), id: 'sess-debounce', agent_group_id: 'ag-debounce' };
@@ -1375,7 +1361,6 @@ describe('OOM and memory-pressure notices are written only on the SLA path, with
     armSelfHeal(false);
     mockKillContainer.mockReset();
     mockIsContainerRunning.mockReset().mockReturnValue(true);
-    mockHasContainerEverRun.mockReset().mockReturnValue(true);
     mockAdmitDueTaskContexts.mockReset().mockReturnValue(0);
 
     const session: Session = {
@@ -1441,7 +1426,6 @@ describe('OOM and memory-pressure notices are written only on the SLA path, with
     armSelfHeal(false);
     mockKillContainer.mockReset();
     mockIsContainerRunning.mockReset().mockReturnValue(true);
-    mockHasContainerEverRun.mockReset().mockReturnValue(true);
     mockAdmitDueTaskContexts.mockReset().mockReturnValue(0);
 
     const session: Session = { ...fakeSession(), id: 'sess-chat-reap', agent_group_id: 'ag-chat-reap' };
@@ -1533,7 +1517,6 @@ describe('provider self-heal claims the health phase and the later branches do n
     mockWakeContainer.mockReset();
     mockGetSession.mockReset();
     mockIsContainerRunning.mockReset().mockReturnValue(true);
-    mockHasContainerEverRun.mockReset().mockReturnValue(true);
     mockAdmitDueTaskContexts.mockReset().mockReturnValue(0);
     mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'codex' });
 
@@ -1914,7 +1897,6 @@ describe('post-kill writes yield to a replacement container', () => {
     mockKillContainer.mockReset().mockImplementation((_id: string, _reason: string, onExit?: () => void) => {
       postKillExit = onExit;
     });
-    mockHasContainerEverRun.mockReset().mockReturnValue(true);
     mockAdmitDueTaskContexts.mockReset().mockReturnValue(0);
     // Live all the way through: alive so the SLA branch runs at all, and STILL
     // alive after the kill because a wake replaced it in the gap. The mocked

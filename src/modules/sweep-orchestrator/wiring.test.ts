@@ -10,7 +10,7 @@
  * one, but the pattern is the established precedent). No `_listSweepDutySourcesForTesting`
  * accessor exists on `src/host-sweep.ts` (out of this family's ownership to
  * add — the registry internals belong to S2-PR2), so this asserts the
- * fallback: T6/T14/T18 present by name in the full registration list.
+ * fallback: T6/T14 present by name in the full registration list.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -19,7 +19,7 @@ beforeEach(() => {
 });
 
 describe('the production modules barrel registers the orchestrator duty source', () => {
-  it('importing ../index.js registers orchestrator-reconciler, task-watchdog and completed-task-auto-archive', async () => {
+  it('importing ../index.js registers orchestrator-reconciler and completed-task-auto-archive', async () => {
     // Production barrel — side-effect imports populate the sweep duty
     // registry, same pattern as src/main.test.ts's T-5 case importing
     // ./modules/index.js and src/guard/conformance.test.ts.
@@ -29,7 +29,6 @@ describe('the production modules barrel registers the orchestrator duty source',
     const names = new Set(_listSweepRegistrationsForTesting().duties.map((d) => d.name));
 
     expect(names).toContain(SWEEP_DUTY_INVENTORY.T6);
-    expect(names).toContain(SWEEP_DUTY_INVENTORY.T18);
     expect(names).toContain(SWEEP_DUTY_INVENTORY.T14);
   });
 });

@@ -30,7 +30,6 @@ import { applySpawnComplete } from './completion.js';
 import { applySpawnProgress } from './progress.js';
 import { applySpawnCancel } from './cancellation.js';
 import { runReconcilerSweep } from './reconciler.js';
-import { _sweepTaskWatchdogForTesting } from '../../host-sweep.js';
 import type { Session } from '../../types.js';
 
 // ── Mock side-effecting modules ──────────────────────────────────────────────
@@ -118,12 +117,6 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
     wakeContainer: vi.fn().mockResolvedValue(true),
     killContainer: vi.fn(),
     isContainerRunning: vi.fn().mockReturnValue(false),
-    // Sticky-flag: when isContainerRunning is false, this tells the watchdog
-    // whether the container ever ran. In this integration test the no-progress
-    // case wants `fail-no-progress` to fire — that requires the container to
-    // have been observed running (otherwise childContainerStatus is null and
-    // container-exit reap is suppressed, leaving only the no-progress timer).
-    hasContainerEverRun: vi.fn().mockReturnValue(true),
     getContainerSpawnedAt: vi.fn().mockReturnValue(null),
   };
 });
@@ -655,48 +648,6 @@ describe('F1: e2e cancel during running', () => {
     // No extra 'Task completed' notification sent to parent
     const completionNotifyCountAfter = getWrittenFor('sess-orch').filter((m) => m.includes('Task completed')).length;
     expect(completionNotifyCountAfter).toBe(completionNotifyCountBefore);
-  }, 10_000);
-});
-
-describe('F1: e2e watchdog terminates no-progress task', () => {
-  it('test_e2e_watchdog_terminates_no_progress: sweep reaps task with stale last_progress_at', async () => {
-    await setupDb();
-    const { orchSession } = await seedGroups({ withMg: false });
-
-    const { getChannelAdapter } = await import('../../channels/channel-registry.js');
-    vi.mocked(getChannelAdapter).mockReturnValue(undefined);
-
-    // Spawn + drain to get a running task
-    await applySpawnTask({ content: 'Stall forever', idempotency_key: 'k-watchdog' }, orchSession);
-    await drainImmediate();
-    await drainImmediate();
-
-    const taskId = deriveSpawnTaskId('sess-orch', 'k-watchdog');
-    let task = await getTaskById(taskId);
-    expect(task!.status).toBe('running');
-
-    // Set last_progress_at to 2 hours ago to trigger no-progress timeout
-    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-    getRawDb()
-      .prepare(`UPDATE tasks SET last_progress_at = ?, started_at = ? WHERE task_id = ?`)
-      .run(twoHoursAgo, twoHoursAgo, taskId);
-
-    // Ensure orchSession is retrievable for watchdog notification
-    sessionMap.set('sess-orch', orchSession);
-
-    // Trigger the watchdog sweep
-    await _sweepTaskWatchdogForTesting();
-
-    // Task should be failed with no_progress_timeout reason (design canonical enum)
-    task = await getTaskById(taskId);
-    expect(task!.status).toBe('failed');
-    expect(task!.fail_reason).toBe('no_progress_timeout');
-
-    // Parent received task-update notification (watchdog writes action: 'spawn_task_watchdog_fail')
-    const orchMessages = getWrittenFor('sess-orch');
-    expect(orchMessages.some((m) => m.includes('spawn_task_watchdog_fail') || m.includes('no_progress_timeout'))).toBe(
-      true,
-    );
   }, 10_000);
 });
 

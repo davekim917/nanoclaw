@@ -617,31 +617,6 @@ async function releaseClaimQuietly(sessionId: string, incarnation: number): Prom
 }
 
 /**
- * Sticky set: every session id whose container has *ever* been observed
- * running in this host process. Never cleared on container exit. Used by
- * the orchestrator-dispatch watchdog to distinguish "container has never
- * started yet" (still queued behind concurrency cap, or wake in flight)
- * from "container ran and exited" — only the latter is a legitimate
- * `container_exit` reap. Conflating them caused tasks to be terminally
- * marked `failed: container_exit` before their container had a chance to
- * spawn, then the container would actually run, complete, and the success
- * would never replace the stale terminal status.
- *
- * In-memory by design: a host restart kills all `--rm` containers anyway,
- * and the no-progress-timeout reaper covers tasks orphaned across a
- * restart, so persistence buys nothing here.
- */
-const everSeenRunningSessions = new Set<string>();
-
-export function hasContainerEverRun(sessionId: string): boolean {
-  return everSeenRunningSessions.has(sessionId);
-}
-
-export function _resetEverSeenRunningForTest(): void {
-  everSeenRunningSessions.clear();
-}
-
-/**
  * Wall-clock time the host spawned the container for this session, or 0 if
  * no container is tracked. Read by the host-sweep stuck-claim guard so a
  * fresh container gets a grace window to clear its own pre-existing
@@ -2019,7 +1994,6 @@ async function spawnContainer(
         storageActivity,
         claimIncarnation,
       });
-      everSeenRunningSessions.add(session.id);
 
       // Every child listener is attached HERE, in the same synchronous turn as
       // `spawn()`, before the block returns. A runtime that
@@ -2884,7 +2858,6 @@ async function registerAdoptedContainer(
     storageActivity,
     claimIncarnation,
   });
-  everSeenRunningSessions.add(session.id);
   armAdoptedWaiter(session.id, channel, containerName);
   // F1 hook: reconcileSurvivorWakeRows(session)
   await reconcileSurvivorWakeRows(session);

@@ -209,10 +209,6 @@ export async function getTaskByChildSession(childSessionId: string): Promise<Tas
   return (await getDb().get<Task>(`SELECT * FROM tasks WHERE child_session_id = ?`, childSessionId)) ?? null;
 }
 
-export function getActiveTasks(): Promise<Task[]> {
-  return getDb().all<Task>(`SELECT * FROM tasks WHERE status IN ('pending', 'running')`);
-}
-
 /**
  * Two-column auth for child→host action handlers (spawn_progress,
  * spawn_complete, spawn_failed, spawn_request_steer). Resolves task_id from

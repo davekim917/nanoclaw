@@ -59,7 +59,7 @@ export function countDueMessages(db: Database.Database): number {
  * MemoryAdmissionController.request), so a fresh message that then waits in
  * a full queue keeps its class.
  */
-export const INTERACTIVE_WAKE_MAX_AGE_MS = 15 * 60 * 1000;
+const INTERACTIVE_WAKE_MAX_AGE_MS = 15 * 60 * 1000;
 
 /**
  * Priority for a session wake based on the work that is due right now.
