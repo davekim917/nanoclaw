@@ -50,6 +50,7 @@ describe('unit-failure-alert.sh', () => {
     const out = path.join(outbox, OUT_NAME);
     expect(fs.lstatSync(out).isFile()).toBe(true);
     expect(fs.readFileSync(out, 'utf8')).toContain('unit status line');
+    expect(fs.statSync(out).mode & 0o777).toBe(0o644);
     expect(fs.readdirSync(outbox)).toEqual([OUT_NAME]);
     expect(fs.readdirSync(tmp)).toEqual([]);
   });

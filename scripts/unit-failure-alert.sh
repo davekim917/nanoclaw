@@ -33,7 +33,6 @@ OUT="$OUTBOX/${STAMP}-unitfail-${UNIT//[^A-Za-z0-9._-]/_}.md"
 # unlinks it and creates the file exclusively.
 TMP=$(mktemp "${TMPDIR:-/tmp}/unitfail.XXXXXX")
 trap 'rm -f "$TMP"' EXIT
-chmod 0644 "$TMP"
 
 {
   printf '*systemd unit failed:* `%s`\n_host: %s · %s UTC_\n\n' \
@@ -45,5 +44,6 @@ chmod 0644 "$TMP"
 } > "$TMP"
 
 [ -s "$TMP" ] || { echo "unit-failure-alert: wrote an empty alert for $UNIT" >&2; exit 1; }
+chmod 0644 "$TMP"
 mv -T "$TMP" "$OUT"
 echo "unit-failure-alert: queued $OUT"
